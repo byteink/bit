@@ -125,6 +125,41 @@ Doc snippets are gated: `tests/bit/docs.bit` typechecks every Bit-tagged fenced
 code block under `docs/`, and `tests/bit/stdlibdocs.bit` fails on an undocumented
 export. A doc that does not compile fails the build.
 
+**A gate whose printed count omits its denominator reads as coverage when it
+is not — that is itself a way this repo can report green while verifying
+nothing.** (Related but distinct: the "Two things a split can break" list
+under `## File size` below is about what a *file split* can silently break,
+not about scope.) Three measured instances, all re-measured on `main` at
+`c2a1eb27`:
+
+- **`test-filesize`** enforces the 800-line limit over `tests/bit/` only and
+  prints `filesize: ok — 77 file(s) scanned, 30 file(s) skipped as fixture
+  corpora, …` (`./bit-out/bin/bit run tests/bit/filesize.bit`). The tree holds
+  **1182** tracked `.bit` files (`git ls-files -- '*.bit' | wc -l`), so the
+  limit is enforced over 77 of 1182 (6.5%) and 1105 files are checked by
+  nothing. Its scoping is deliberate — the point is only that the line reads
+  as a whole-tree verdict.
+- **`test-fmt`** (`tools/build/gates.bit:217`) walks `stdlib/` and `examples/`
+  only — 173 of 1182 files (14.6%, `git ls-files -- 'stdlib/*.bit'
+  'examples/*.bit' | wc -l`). `compiler/`, `runtime/` and `tests/` — 997 of
+  1182 (84%, `git ls-files -- 'compiler/*.bit' 'runtime/*.bit' 'tests/*.bit' |
+  wc -l`) — are checked for fmt-canonicality by nothing, which is why four
+  genuine formatter bugs (#2878, #2879, #2880, #2140) sat unreported in the
+  directories it omits.
+- **#2570**: none of the **19** `scripts/selfhost-*.sh` differentials (every
+  `selfhost-*.sh` file except the shared `selfhost-diffdump.sh` driver behind
+  six of them) is invoked from `tools/build/**` — `grep -n "selfhost-"
+  tools/build/*.bit dist/release.sh` turns up only comments — so the
+  mandatory pre-push gate executes none of them.
+
+The tell is the same in all three and it is cheap: a gate that prints a count
+with no denominator cannot be read as coverage. A scoped gate should print
+both its scope and the size of what it excludes, so the ratio is visible in
+the log rather than reconstructible only by someone who goes looking. #2747
+gates E0200 (the same 800-line rule) over `compiler/**` and `runtime/**`,
+closing the gap instance 1 leaves outside `tests/bit/`; #2876 widens
+`test-fmt` itself, closing instance 2.
+
 ## File size
 
 Hard limit **800 lines per file**, target ~500. 800 is the default of the repo's
