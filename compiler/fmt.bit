@@ -325,16 +325,59 @@ fn fmtPrintCatchLhs(p: Printer, idx: int) {
 }
 
 // A comma-free, delimiter-free list (return values, assignment sides, `case`
-// expressions, constraint bounds): always flat.
+// expressions, constraint bounds). Width-aware (#2889): joins flat if that
+// fits under fmtMaxWidth and holds no comment, else renders one item per
+// line at one deeper indent, `sep` trailing the line before it (a single
+// item never benefits from wrapping, so it always stays flat).
 fn fmtPrintFlatList(p: Printer, items: []int, sep: string) {
-  let i = 0
-  while (i < len(items)) {
-    if (i > 0) {
-      fmtRaw(p, sep)
+  let tail = p.nextListTail
+  p.nextListTail = 0
+  if (len(items) <= 1) {
+    let i = 0
+    while (i < len(items)) {
+      fmtPrintNode(p, items[i])
+      i = i + 1
     }
-    fmtPrintNode(p, items[i])
-    i = i + 1
+    return
   }
+  let spanEnd = getNode(p.tree, items[len(items) - 1]).span.end
+  if (!fmtHasCommentBefore(p, spanEnd)) {
+    let colBefore = p.col
+    let savedOut = p.out
+    p.out = []byte(0)
+    let i = 0
+    while (i < len(items)) {
+      if (i > 0) {
+        fmtRaw(p, sep)
+      }
+      fmtPrintNode(p, items[i])
+      i = i + 1
+    }
+    let text = string(p.out)
+    p.out = savedOut
+    p.col = colBefore
+    if (!fmtHasNl(text) && colBefore + len(text) + tail <= fmtMaxWidth) {
+      fmtRaw(p, text)
+      return
+    }
+  }
+  let sepTrim = sep
+  if (len(sep) > 0 && sep[len(sep) - 1] == ' ') {
+    sepTrim = sep[0:len(sep) - 1]
+  }
+  p.indent = p.indent + 1
+  let j = 0
+  while (j < len(items)) {
+    if (j > 0) {
+      fmtGap(p, getNode(p.tree, items[j]).span.start, false)
+    }
+    fmtPrintNode(p, items[j])
+    if (j < len(items) - 1) {
+      fmtRaw(p, sepTrim)
+    }
+    j = j + 1
+  }
+  p.indent = p.indent - 1
 }
 
 // Whether any BETWEEN-ITEM gap, or the gap from the last item to `spanEnd`
@@ -685,6 +728,105 @@ fn fmtPrintBinarySide(p: Printer, idx: int, parentOp: int, isRhs: bool) {
   } else {
     fmtPrintNode(p, idx)
   }
+}
+
+// Whether a binary node with operator `childOp` belongs to the SAME
+// left-associative chain as a node whose operator is `parentOp`: exactly the
+// same precedence tier (a strictly higher-precedence child, e.g. `k == 1`
+// under a `||` parent, is a leaf operand of the chain, not another link in
+// it -- flattening past it would tear the leaf's own operator and operand
+// apart onto different lines) and not the bitwise/shift clarity-parens case
+// (#1266, see fmtIsBitOrShift). Every flattened link renders bare as an LHS
+// either way, since equal precedence never triggers fmtPrintBinarySide's
+// `childPrec < parentPrec` wrap test.
+fn fmtChainFlattens(childOp: int, parentOp: int): bool {
+  let sameTier = fmtPrec(childOp) == fmtPrec(parentOp)
+  let styleWrap = childOp != parentOp && (fmtIsBitOrShift(parentOp) || fmtIsBitOrShift(childOp))
+  return sameTier && !styleWrap
+}
+
+// A left-associative run of operands sharing one no-parens spine (#2889):
+// `atoms[0] ops[0] atoms[1] ops[1] atoms[2] ...`. `ops[i]` is always the
+// operator that decides atoms[i]'s own wrap -- as an LHS for i == 0, as an
+// RHS for i > 0 -- so printing re-derives every wrap decision through
+// fmtPrintBinarySide exactly as the un-flattened recursive printer did.
+struct BinaryChain {
+  atoms: []int,
+  ops: []int,
+}
+
+// The left spine below a node whose operator is `parentOp`: keeps
+// flattening while `idx` is a `Binary` node that renders bare under
+// `parentOp` (fmtChainFlattens); otherwise `idx` is the chain's next atom.
+fn fmtCollectChainSide(p: Printer, idx: int, parentOp: int): BinaryChain {
+  let n = getNode(p.tree, idx)
+  if (n.tag == Tag.Binary && fmtChainFlattens(n.main, parentOp)) {
+    let k = kidsOf(p.tree, idx)
+    let left = fmtCollectChainSide(p, k[0], n.main)
+    left.atoms = append(left.atoms, k[1])
+    left.ops = append(left.ops, n.main)
+    return left
+  }
+  return BinaryChain{ atoms: append([]int(0), idx), ops: []int(0) }
+}
+
+// The chain rooted at `idx`, a known `Binary` node.
+fn fmtCollectBinaryChain(p: Printer, idx: int): BinaryChain {
+  let n = getNode(p.tree, idx)
+  let k = kidsOf(p.tree, idx)
+  let left = fmtCollectChainSide(p, k[0], n.main)
+  left.atoms = append(left.atoms, k[1])
+  left.ops = append(left.ops, n.main)
+  return left
+}
+
+// One render of a collected chain: `wrapped` breaks to a fresh line (at the
+// caller's current indent) between an operator and the operand after it --
+// the same trailing-operator spelling this corpus already hand-wraps
+// `||`/`&&` chains in today -- via `fmtGap`, so a comment between two
+// operands is flushed (trailing the line it was adjacent to in the source,
+// per FMT.md §4) rather than left pending, which would otherwise misfire a
+// nested chain's OWN comment check (#2889).
+fn fmtPrintChain(p: Printer, chain: BinaryChain, wrapped: bool) {
+  fmtPrintBinarySide(p, chain.atoms[0], chain.ops[0], false)
+  let i = 1
+  while (i < len(chain.atoms)) {
+    fmtRaw(p, " ")
+    fmtRaw(p, opSymbol(chain.ops[i - 1]))
+    if (wrapped) {
+      fmtGap(p, getNode(p.tree, chain.atoms[i]).span.start, false)
+    } else {
+      fmtRaw(p, " ")
+    }
+    fmtPrintBinarySide(p, chain.atoms[i], chain.ops[i - 1], true)
+    i = i + 1
+  }
+}
+
+// Width-aware print for a `Binary` node (#2889): flattens its chain and
+// joins it on one line if that fits under fmtMaxWidth and holds no comment;
+// otherwise re-renders one operand per line at one deeper indent.
+fn fmtPrintBinaryChain(p: Printer, idx: int) {
+  let tail = p.nextListTail
+  p.nextListTail = 0
+  let chain = fmtCollectBinaryChain(p, idx)
+  let lastEnd = getNode(p.tree, chain.atoms[len(chain.atoms) - 1]).span.end
+  if (!fmtHasCommentBefore(p, lastEnd)) {
+    let colBefore = p.col
+    let savedOut = p.out
+    p.out = []byte(0)
+    fmtPrintChain(p, chain, false)
+    let text = string(p.out)
+    p.out = savedOut
+    p.col = colBefore
+    if (!fmtHasNl(text) && colBefore + len(text) + tail <= fmtMaxWidth) {
+      fmtRaw(p, text)
+      return
+    }
+  }
+  p.indent = p.indent + 1
+  fmtPrintChain(p, chain, true)
+  p.indent = p.indent - 1
 }
 
 // ---- public API ------------------------------------------------------------
