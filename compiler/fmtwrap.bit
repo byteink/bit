@@ -1,0 +1,342 @@
+// Self-host `bit fmt` (#1345): the width-aware wrap-decision machinery —
+// flat lists, bracketed comma lists, and binary/logical chain flattening
+// (#2889). All three share one shape: render flat into a scratch buffer,
+// keep it if that fits under fmtMaxWidth and holds no comment, else
+// re-render one item/operand per line at one deeper indent. Split out of
+// fmt.bit to keep each file within the size limit; a sibling .bit file is
+// the same module.
+
+// A comma-free, delimiter-free list (return values, assignment sides, `case`
+// expressions, constraint bounds). Width-aware (#2889): joins flat if that
+// fits under fmtMaxWidth and holds no comment, else renders one item per
+// line at one deeper indent, `sep` trailing the line before it (a single
+// item never benefits from wrapping, so it always stays flat).
+fn fmtPrintFlatList(p: Printer, items: []int, sep: string) {
+  let tail = p.nextListTail
+  p.nextListTail = 0
+  if (len(items) <= 1) {
+    let i = 0
+    while (i < len(items)) {
+      fmtPrintNode(p, items[i])
+      i = i + 1
+    }
+    return
+  }
+  let spanEnd = getNode(p.tree, items[len(items) - 1]).span.end
+  if (!fmtHasCommentBefore(p, spanEnd)) {
+    let colBefore = p.col
+    let savedOut = p.out
+    p.out = []byte(0)
+    let i = 0
+    while (i < len(items)) {
+      if (i > 0) {
+        fmtRaw(p, sep)
+      }
+      fmtPrintNode(p, items[i])
+      i = i + 1
+    }
+    let text = string(p.out)
+    p.out = savedOut
+    p.col = colBefore
+    if (!fmtHasNl(text) && colBefore + len(text) + tail <= fmtMaxWidth) {
+      fmtRaw(p, text)
+      return
+    }
+  }
+  let sepTrim = sep
+  if (len(sep) > 0 && sep[len(sep) - 1] == ' ') {
+    sepTrim = sep[0:len(sep) - 1]
+  }
+  p.indent = p.indent + 1
+  let j = 0
+  while (j < len(items)) {
+    if (j > 0) {
+      fmtGap(p, getNode(p.tree, items[j]).span.start, false)
+    }
+    fmtPrintNode(p, items[j])
+    if (j < len(items) - 1) {
+      fmtRaw(p, sepTrim)
+    }
+    j = j + 1
+  }
+  p.indent = p.indent - 1
+}
+
+// Whether any BETWEEN-ITEM gap, or the gap from the last item to `spanEnd`
+// (mirrors a trailing comma pushing the close onto its own line, where the
+// caller's span reaches that far — a plain call's Args node never does, see
+// fmtOpenBroken for the opening-side equivalent), carries a source newline.
+// Never a newline nested inside one item's own content: a gap that only
+// exists inside an item (e.g. a struct-literal argument the author
+// hand-wrapped) is not evidence the *list itself* was laid out across lines,
+// and treating it as such flips `grouped` between formatting passes as that
+// inner item's own wrap decision changes with the outer column budget — the
+// idempotence bug this scoping fixes.
+fn fmtAnyItemGapHasNewline(p: Printer, items: []int, spanEnd: int): bool {
+  let i = 1
+  while (i < len(items)) {
+    let prevEnd = getNode(p.tree, items[i - 1]).span.end
+    let start = getNode(p.tree, items[i]).span.start
+    if (newlinesBetween(p.source, prevEnd, start) > 0) {
+      return true
+    }
+    i = i + 1
+  }
+  let lastEnd = getNode(p.tree, items[len(items) - 1]).span.end
+  return newlinesBetween(p.source, lastEnd, spanEnd) > 0
+}
+
+// Whether the source already breaks this list right after its opening
+// delimiter, i.e. `firstStart` is not on the same source line as whatever
+// immediately precedes it. Deliberately does not use `p.srcPos`: that only
+// advances when a real sibling node or comment was printed immediately
+// before this list, which is untrue whenever the list is the first thing
+// printed in its own statement — a `let (a, b) = ...` binding's `TuplePat`,
+// or an `ImportGroup` right after the synthetic `"import "` text — where
+// `p.srcPos` is stale from the end of a wholly unrelated, earlier statement,
+// so a plain `newlinesBetween(p.source, p.srcPos, firstStart)` reports a
+// break that isn't there. Scanning back over pure whitespace instead needs
+// nothing but `firstStart` itself: the run of bytes strictly before it is
+// either whitespace only (an opening delimiter with nothing else between it
+// and the first item) or ends in a comment's own last byte, and either way a
+// '\n' inside that whitespace run means the item did not start on the same
+// line as whatever the run's non-whitespace end is.
+fn fmtOpenBroken(source: string, firstStart: int): bool {
+  let i = firstStart - 1
+  while (i >= 0) {
+    let ch = source[i]
+    if (ch == ' ' || ch == '\t' || ch == '\r') {
+      i = i - 1
+    } else if (ch == '\n') {
+      return true
+    } else {
+      return false
+    }
+  }
+  return false
+}
+
+// A bracketed comma list (params, args, struct fields, generics, ...). Greedy
+// width-aware wrapping: render flat into a scratch buffer; if the source
+// didn't already break the list, it has no comment, and it fits, keep it,
+// else re-render one item per line (preserving the author's grouping) with a
+// trailing comma. `{`/`}` pad with an inner space when flat.
+fn fmtPrintCommaList(p: Printer, items: []int, open: string, close: string, spanEnd: int) {
+  let tail = p.nextListTail
+  p.nextListTail = 0
+  fmtRaw(p, open)
+  let pad = len(open) == 1 && open == "{"
+
+  if (len(items) == 0) {
+    if (fmtHasCommentBefore(p, spanEnd)) {
+      p.indent = p.indent + 1
+      fmtGap(p, spanEnd, false)
+      p.indent = p.indent - 1
+    }
+    fmtRaw(p, close)
+    return
+  }
+
+  // The author's own line break is authoritative, at the list's own
+  // boundaries only (right after the opener, or between two adjacent items —
+  // the same two checks #2880's fixed-point fix already scoped `grouped` to,
+  // never a break inside one item's own content). A list the source already
+  // broke there is never a candidate for the flat/fits trial below, no
+  // matter how short the joined form would be: joining it is what silently
+  // deleted the wrapped import-list and struct-declaration spelling that
+  // SPEC §17.2 documents as the one that parses (#2140).
+  let firstStart = getNode(p.tree, items[0]).span.start
+  let authorBroke = fmtOpenBroken(p.source, firstStart) ||
+    fmtAnyItemGapHasNewline(p, items, spanEnd)
+
+  if (!authorBroke && !fmtHasCommentBefore(p, spanEnd)) {
+    let colBefore = p.col
+    let savedOut = p.out
+    p.out = []byte(0)
+    let i = 0
+    while (i < len(items)) {
+      if (i > 0) {
+        fmtRaw(p, ", ")
+      }
+      fmtPrintNode(p, items[i])
+      i = i + 1
+    }
+    let text = string(p.out)
+    p.out = savedOut
+    p.col = colBefore
+    let extra = 0
+    if (pad) {
+      extra = 2
+    }
+    // A single-element list stays flat even when over-width: wrapping a lone
+    // item never shortens the line meaningfully. Multi-element lists still wrap.
+    let fits = colBefore + extra + len(text) + len(close) + tail <= fmtMaxWidth
+    if (!fmtHasNl(text) && (len(items) == 1 || fits)) {
+      if (pad) {
+        fmtRaw(p, " ")
+      }
+      fmtRaw(p, text)
+      if (pad) {
+        fmtRaw(p, " ")
+      }
+      fmtRaw(p, close)
+      return
+    }
+  }
+
+  p.indent = p.indent + 1
+  // Preserve the author's grouping: same boundary check as `authorBroke`
+  // above, so two items stay on the same output line exactly where the
+  // source kept them on the same source line, and a hand-laid table is not
+  // exploded.
+  let grouped = authorBroke
+  let prevEnd = firstStart
+  let j = 0
+  while (j < len(items)) {
+    let it = items[j]
+    let start = getNode(p.tree, it).span.start
+    let sameLine = grouped && j > 0 &&
+      newlinesBetween(p.source, prevEnd, start) == 0 &&
+      !fmtHasCommentBefore(p, start)
+    if (sameLine) {
+      fmtRaw(p, " ")
+    } else {
+      fmtGap(p, start, false)
+    }
+    fmtPrintNode(p, it)
+    fmtRaw(p, ",")
+    prevEnd = getNode(p.tree, it).span.end
+    j = j + 1
+  }
+  fmtGap(p, spanEnd, false)
+  p.indent = p.indent - 1
+  fmtRaw(p, close)
+}
+
+// One side of a binary expression, re-parenthesized when precedence (with
+// left-associativity) or the bitwise/shift clarity rule requires it.
+fn fmtPrintBinarySide(p: Printer, idx: int, parentOp: int, isRhs: bool) {
+  let t = getNode(p.tree, idx).tag
+  let wrap = t == Tag.CatchDefault || t == Tag.CatchBind || t == Tag.ArrowFn
+  if (!wrap && t == Tag.Binary) {
+    let childOp = getNode(p.tree, idx).main
+    let parentPrec = fmtPrec(parentOp)
+    let childPrec = fmtPrec(childOp)
+    let precWrap = false
+    if (isRhs) {
+      precWrap = childPrec <= parentPrec
+    } else {
+      precWrap = childPrec < parentPrec
+    }
+    // A bitwise/shift expression mixing two different operators is always
+    // parenthesized for clarity, even where precedence makes it redundant.
+    let styleWrap = childOp != parentOp && (fmtIsBitOrShift(parentOp) || fmtIsBitOrShift(childOp))
+    wrap = precWrap || styleWrap
+  }
+  if (wrap) {
+    fmtRaw(p, "(")
+    fmtPrintNode(p, idx)
+    fmtRaw(p, ")")
+  } else {
+    fmtPrintNode(p, idx)
+  }
+}
+
+// Whether a binary node with operator `childOp` belongs to the SAME
+// left-associative chain as a node whose operator is `parentOp`: exactly the
+// same precedence tier (a strictly higher-precedence child, e.g. `k == 1`
+// under a `||` parent, is a leaf operand of the chain, not another link in
+// it -- flattening past it would tear the leaf's own operator and operand
+// apart onto different lines) and not the bitwise/shift clarity-parens case
+// (#1266, see fmtIsBitOrShift). Every flattened link renders bare as an LHS
+// either way, since equal precedence never triggers fmtPrintBinarySide's
+// `childPrec < parentPrec` wrap test.
+fn fmtChainFlattens(childOp: int, parentOp: int): bool {
+  let sameTier = fmtPrec(childOp) == fmtPrec(parentOp)
+  let styleWrap = childOp != parentOp && (fmtIsBitOrShift(parentOp) || fmtIsBitOrShift(childOp))
+  return sameTier && !styleWrap
+}
+
+// A left-associative run of operands sharing one no-parens spine (#2889):
+// `atoms[0] ops[0] atoms[1] ops[1] atoms[2] ...`. `ops[i]` is always the
+// operator that decides atoms[i]'s own wrap -- as an LHS for i == 0, as an
+// RHS for i > 0 -- so printing re-derives every wrap decision through
+// fmtPrintBinarySide exactly as the un-flattened recursive printer did.
+struct BinaryChain {
+  atoms: []int,
+  ops: []int,
+}
+
+// The left spine below a node whose operator is `parentOp`: keeps
+// flattening while `idx` is a `Binary` node that renders bare under
+// `parentOp` (fmtChainFlattens); otherwise `idx` is the chain's next atom.
+fn fmtCollectChainSide(p: Printer, idx: int, parentOp: int): BinaryChain {
+  let n = getNode(p.tree, idx)
+  if (n.tag == Tag.Binary && fmtChainFlattens(n.main, parentOp)) {
+    let k = kidsOf(p.tree, idx)
+    let left = fmtCollectChainSide(p, k[0], n.main)
+    left.atoms = append(left.atoms, k[1])
+    left.ops = append(left.ops, n.main)
+    return left
+  }
+  return BinaryChain{ atoms: append([]int(0), idx), ops: []int(0) }
+}
+
+// The chain rooted at `idx`, a known `Binary` node.
+fn fmtCollectBinaryChain(p: Printer, idx: int): BinaryChain {
+  let n = getNode(p.tree, idx)
+  let k = kidsOf(p.tree, idx)
+  let left = fmtCollectChainSide(p, k[0], n.main)
+  left.atoms = append(left.atoms, k[1])
+  left.ops = append(left.ops, n.main)
+  return left
+}
+
+// One render of a collected chain: `wrapped` breaks to a fresh line (at the
+// caller's current indent) between an operator and the operand after it --
+// the same trailing-operator spelling this corpus already hand-wraps
+// `||`/`&&` chains in today -- via `fmtGap`, so a comment between two
+// operands is flushed (trailing the line it was adjacent to in the source,
+// per FMT.md §4) rather than left pending, which would otherwise misfire a
+// nested chain's OWN comment check (#2889).
+fn fmtPrintChain(p: Printer, chain: BinaryChain, wrapped: bool) {
+  fmtPrintBinarySide(p, chain.atoms[0], chain.ops[0], false)
+  let i = 1
+  while (i < len(chain.atoms)) {
+    fmtRaw(p, " ")
+    fmtRaw(p, opSymbol(chain.ops[i - 1]))
+    if (wrapped) {
+      fmtGap(p, getNode(p.tree, chain.atoms[i]).span.start, false)
+    } else {
+      fmtRaw(p, " ")
+    }
+    fmtPrintBinarySide(p, chain.atoms[i], chain.ops[i - 1], true)
+    i = i + 1
+  }
+}
+
+// Width-aware print for a `Binary` node (#2889): flattens its chain and
+// joins it on one line if that fits under fmtMaxWidth and holds no comment;
+// otherwise re-renders one operand per line at one deeper indent.
+fn fmtPrintBinaryChain(p: Printer, idx: int) {
+  let tail = p.nextListTail
+  p.nextListTail = 0
+  let chain = fmtCollectBinaryChain(p, idx)
+  let lastEnd = getNode(p.tree, chain.atoms[len(chain.atoms) - 1]).span.end
+  if (!fmtHasCommentBefore(p, lastEnd)) {
+    let colBefore = p.col
+    let savedOut = p.out
+    p.out = []byte(0)
+    fmtPrintChain(p, chain, false)
+    let text = string(p.out)
+    p.out = savedOut
+    p.col = colBefore
+    if (!fmtHasNl(text) && colBefore + len(text) + tail <= fmtMaxWidth) {
+      fmtRaw(p, text)
+      return
+    }
+  }
+  p.indent = p.indent + 1
+  fmtPrintChain(p, chain, true)
+  p.indent = p.indent - 1
+}
