@@ -1,0 +1,440 @@
+// Self-host: validation of operators, return, calls and expression-statement
+// legality (#2906, split out of validatestmt.bit to keep both files under the
+// 800-line lint limit — see validatestmt.bit for the statement walk and
+// control-flow half). Binary/unary/inc-dec operands, `return` against the
+// declared result, `print`/`append`/call-value/free-call argument checks,
+// E0065/E0066 expression-statement legality, and arrow bodies.
+
+// ---- expressions -----------------------------------------------------------
+
+// A binary operator whose operands do not admit it (§14.2, E0053).
+//
+// Reported HERE and not in `checkBinary`, because `checkExprType` is a recompute
+// rather than a cache: the sweep runs it at every Binding/Call node and this walk
+// runs it again, so an emit down there would fire twice for one expression. The
+// seed can emit inline only because its single recursive walk visits each node
+// exactly once.
+//
+// The whole rule lives in check.bit (`joinOperandTypes` / `numericBinaryOk`) and
+// is asked, not restated — one operator rule, two callers: the type it yields and
+// the error it justifies must never disagree.
+fn vBinary(c: Checker, node: int) {
+  let n = getNode(c.tree, node)
+  let kids = kidsOf(c.tree, node)
+  let a = checkExprType(c, kids[0])
+  let b = checkExprType(c, kids[1])
+  // An operand that did not infer is bit2's gap, not the program's — and the
+  // seed suppresses here too (`if (lty == .invalid or rty == .invalid)`).
+  if (a == 0 || b == 0) { return }
+  if (vMentionsInvalid(c, a, 0) || vMentionsInvalid(c, b, 0)) { return }
+  // The six relational operators carry their own §14.6 rule (agreement,
+  // comparability, ordering) and `vCompare` owns it; `&&`/`||` are logical and
+  // still unchecked. The operand types are handed over rather than recomputed.
+  if (isComparisonOp(n.main)) {
+    vCompare(c, node, a, b)
+    return
+  }
+  if (n.main == int(Kind.Plus) && stringish(c, a) && stringish(c, b)) { return }
+  // Pointer arithmetic (§11.4): `p + n` / `p - n` advance a `*T` by
+  // `n * sizeOf(T)` bytes and yield a `*T`. Carved out before the numeric path,
+  // exactly as string concatenation is above.
+  if ((n.main == int(Kind.Plus) || n.main == int(Kind.Minus)) &&
+      c.ctx.types[a].kind == TypeKind.Ptr && isIntegerOperand(c, b)) { return }
+  let joined = joinOperandTypes(c, kids[0], kids[1], a, b)
+  if (numericBinaryOk(c, joined, isBitwiseOp(n.main))) { return }
+  let ln = typeName(c.ctx, a)
+  let rn = typeName(c.ctx, b)
+  reportNoHint(c.diags, ecInvalidOperand, vSpan(c, node),
+    "operator not defined for '${ln}' and '${rn}'")
+}
+
+// Unary arithmetic and bitwise (§12.4): `+x` and `-x` need a numeric operand,
+// `~x` an integer one. E0053, in the seed's singular wording (#1850).
+//
+// `+x` was checked by NOTHING, which is how `a + + b` over two strings — that is
+// `a + (+b)` — passed `bit check` with exit 0 and no output, while `bit build`
+// on the same file refused with "cannot lower 1 function(s)". A `check` that
+// reports success on a program `build` will not compile is a broken contract
+// whatever the program does.
+//
+// The other half of that gap is in the lowerer rather than here: `+x` had no
+// lowering at ALL, so even `+5` — which the §12 precedence table explicitly
+// admits — marked its function unlowerable. `lowerUnary` now treats it as the
+// identity it is. Both halves had the same root, no unary-plus handling below
+// the parser, and fixing only this one would have left a spec-legal program the
+// compiler still refuses.
+//
+// `!x`, `*p` and `<- ch` are Unary too and are governed elsewhere (bool
+// operands, §11.4 and §16.2 respectively), so the op guard leads.
+fn vUnary(c: Checker, node: int) {
+  let op = getNode(c.tree, node).main
+  if (op != int(Kind.Plus) && op != int(Kind.Minus) && op != int(Kind.Tilde)) {
+    return
+  }
+  let t = checkExprType(c, kidsOf(c.tree, node)[0])
+  // An operand that did not infer is this compiler's gap, not the program's —
+  // the same suppression vBinary makes, for the same reason.
+  if (t == 0 || vMentionsInvalid(c, t, 0)) {
+    return
+  }
+  if (numericBinaryOk(c, t, op == int(Kind.Tilde))) {
+    return
+  }
+  reportNoHint(c.diags, ecInvalidOperand, vSpan(c, node),
+    "operator not defined for '${typeName(c.ctx, t)}'")
+}
+
+// `++`/`--` need a numeric operand (§11.4 lists pointer arithmetic as `p + n`/
+// `p - n` only — increment/decrement is not among the raw-pointer operations,
+// so a `*T` is not numeric either). E0053, reusing vBinary's own
+// `numericBinaryOk` predicate rather than a second copy of the operator rule.
+//
+// `vHasTypeParam` guards the same gap every other arm in this file guards
+// against (#1556, see `vAppendCall` below): a generic body is checked ONCE
+// against its own rigid `T`, never re-walked per monomorphization, so an
+// operand still naming `T` cannot be judged here — `xs[i]++` inside
+// `fn step<T>(xs: []T, ...)` is exactly this shape (#2403's
+// `lv-generic-slice-incdec`). Judging it against the un-substituted `T` is
+// what regressed that fixture (#2556 landed without this guard). The
+// substituted-type check is `lowerIncDec` (`isNumericPrim`, #2557), which runs
+// per instantiation and is the layer that actually owns this operand's
+// numeric-ness once `T` is bound; a concrete non-numeric operand (`string`,
+// `bool`, ...) is never a type param and still hits the report below.
+fn vIncDec(c: Checker, node: int) {
+  let t = checkExprType(c, kidsOf(c.tree, node)[0])
+  if (t == 0 || vMentionsInvalid(c, t, 0) || vHasTypeParam(c, t, 0)) { return }
+  if (numericBinaryOk(c, t, false)) { return }
+  reportNoHint(c.diags, ecInvalidOperand, vSpan(c, node),
+    "'++'/'--' require a numeric operand, found '${typeName(c.ctx, t)}'")
+}
+
+// ---- return, call and print/append argument validation --------------------
+
+// `return` (§16.2) against the enclosing function's declared result.
+fn vReturn(c: Checker, result: int, node: int) {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) == 0) {
+    if (result != c.ctx.voidId && result != 0) {
+      reportNoHint(c.diags, ecTypeMismatch, vSpan(c, node),
+        "'return' needs a value: this function's result is not void")
+    }
+    return
+  }
+  if (len(kids) == 1) {
+    // vExpectExpr, not vExpect: `return [1,2]` from a `[]i32` result needs the
+    // declared element type pushed into the literal, or the defaulted `[]i64`
+    // is compared against `[]i32` and correct code is rejected.
+    vExpectExpr(c, kids[0], result)
+    return
+  }
+  // ponytail: `return a, b` builds a tuple result (§13.1), unvalidated. The seed
+  // interns the tuple to compare against; interning a type here would append ids
+  // the seed does not have at this point, and the id order is the fixed point's.
+}
+
+// Validates a call's argument COUNT against a plain free function's declared
+// parameter count (E0050). Deliberately permissive — the seed's full call check
+// also covers builtins, conversions, type constructors, variadics, and generic
+// arity, each with its own rule; porting only the common fixed-arity free-call
+// case keeps FALSEPOS at 0 by SKIPPING everything undecidable here:
+//   - a non-identifier callee (method/member/computed call);
+//   - a name that is not a known free function (builtin, constructor, or a
+//     local variable holding a function value — a call_value, not a decl);
+//   - a name shadowed by a local binding (the call targets the value, not the
+//     free function of the same name);
+//   - a generic function (kids[2] present) — the seed resolves its arity
+//     through instantiation, not a bare parameter count.
+// `print` (fd 1) and `eprint` (fd 2) share one signature: exactly one `string`
+// argument, void result (seed ~2659, ABI.md §12). This is the one
+// builtin arg-type check bit needs — the rest of vCall punts on builtins on
+// purpose. Guards on a bit2 inference gap (arg type 0 / mentions-invalid) so it
+// never becomes a false positive; the assignability itself is vExpect's, so
+// `print("x")` (untyped string) and interpolations pass while `print(x)` for a
+// non-string x is E0041 with the seed's exact text.
+fn vPrintCall(c: Checker, node: int, name: string) {
+  let args = kidsOf(c.tree, kidsOf(c.tree, node)[2])
+  let got = len(args)
+  if (got != 1) {
+    reportNoHint(c.diags, ecArgCount, vSpan(c, node),
+      "'${name}' takes exactly 1 argument, found ${got}")
+  }
+  if (got >= 1) {
+    let a = args[0]
+    if (getNode(c.tree, a).tag == Tag.Arg) { a = kidsOf(c.tree, a)[0] }
+    let t = checkExprType(c, a)
+    if (t == 0 || vMentionsInvalid(c, t, 0)) { return }
+    vExpect(c, a, t, primType(c.ctx, 11))
+  }
+}
+
+// A call through a function VALUE — a local binding holding a function (named
+// or arrow), a slice/map element, a returned function (#1529). vCall resolves a
+// DECLARATION and had no rule at all for these, so `let f = twice; f("x")`
+// built a binary that passed a string into an i32 slot: silent miscompile, and
+// the whole class, not just arrows.
+//
+// The signature is the CALLEE'S OWN TYPE, which is what #1523 made available:
+// it ported the seed's tail (type the callee, read `.func.result`) into
+// checkCall, so a value callee now types instead of yielding `<error>`. That
+// gave the RESULT; this gives the arguments, from the same `members`.
+//
+// `checkExprType` on an Ident prefers `declRefType` (the resolver's per-node
+// symbol), so the signature is the binding this call actually resolves to in
+// its scope, not whatever same-named binding the flat env last saw.
+//
+// Permissive on every shape whose rule is not ported, so it cannot become a
+// false positive: a variadic or generic signature, a spread argument, and any
+// type carrying an inference gap (all three guarded inside vCallAgainstFuncSig,
+// validateiface.bit).
+fn vCallValue(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [callee, generic_args, arg_list]
+  let callee = kids[0]
+  // A Member callee is a METHOD, a func-typed struct field (#2786), or a
+  // namespaced call — vMethodCall (validateiface.bit) separates the three and
+  // reports itself.
+  if (getNode(c.tree, callee).tag == Tag.Member) { vMethodCall(c, node, kidsOf(c.tree, callee)); return }
+  let ft = checkExprType(c, callee)
+  if (ft == 0) { return } // bit2 could not type the callee: not the program's gap
+  if (c.ctx.types[ft].kind != TypeKind.Func) { return } // not a call through a value at all
+  vCallAgainstFuncSig(c, node, ft)
+}
+
+// `append(x, ...)` (§16.1, E0054): the first argument must be a slice, exactly
+// as an index receiver must be — mirrors the seed's checkBuiltinCall append
+// arm, which rejects a fixed array (or anything else non-slice) via
+// notIndexable. Ponytail: only the receiver-kind check is ported, not the
+// element-type assignability of the remaining arguments (§16.1's other half),
+// since that is not the divergence #1623 found. Permissive on an inference
+// gap or unresolved type param, matching every other builtin-call rule here.
+fn vAppendCall(c: Checker, node: int) {
+  let args = kidsOf(c.tree, kidsOf(c.tree, node)[2])
+  if (len(args) == 0) { return }
+  let a = args[0]
+  if (getNode(c.tree, a).tag == Tag.Arg) { a = kidsOf(c.tree, a)[0] }
+  let st = checkExprType(c, a)
+  if (st == 0 || vMentionsInvalid(c, st, 0) || vHasTypeParam(c, st, 0)) { return }
+  if (c.ctx.types[st].kind != TypeKind.Slice) {
+    reportNoHint(c.diags, ecNotIndexable, vSpan(c, a), "'${typeName(c.ctx, st)}' cannot be indexed")
+  }
+}
+
+fn vCall(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [callee, generic_args, arg_list]
+  let callee = kids[0]
+  if (getNode(c.tree, callee).tag != Tag.Ident) { vCallValue(c, node); return }
+  let sp = getNode(c.tree, callee).span
+  let name = c.source[sp.start:sp.end]
+  // A local shadows the free function: the call targets the VALUE, so its
+  // arguments are judged against that value's signature, not a declaration's
+  // (#1529). The shadow test itself is the resolver's, not `envLookup`'s — a
+  // module-wide name match disabled this guard for every call site in the module
+  // (#1502).
+  if (shadowedByValue(c, callee, name)) { vCallValue(c, node); return }
+  // PRECEDENCE: a user declaration shadows the predeclared name (SPEC 17.5), so
+  // the declaration is consulted BEFORE the `print`/`eprint` arity+type rule.
+  // Checked the other way round, a program declaring its own `print(x: int)` was
+  // validated against the BUILTIN's `(string)` signature and rejected with a
+  // spurious E0041. Matches the precedence checkCall and lowerCall now use.
+  let fr = funcRefAt(c, callee, name)
+  let decl = fr.decl
+  if (decl == 0) {
+    if (name == "print" || name == "eprint") { vPrintCall(c, node, name); return }
+    if (name == "append") { vAppendCall(c, node); return }
+    return // builtin / constructor / not a free function
+  }
+  // The decl's params live in its OWNING module's tree (FuncRef), which is
+  // `c` itself for a local function and the exporter for an imported one.
+  let owner = fr.owner
+  // Reads the param list through declParamListNode so a §11.7 extern — three
+  // kids, params at 1 — is measured against its own shape rather than a
+  // FuncDecl's.
+  let plist = declParamListNode(owner, decl)
+  // A generic callee used to return here outright — "arity resolved by
+  // instantiation", which is not true of this checker: nothing downstream ever
+  // counts the arguments again. That `return` sat AHEAD of the spread, variadic
+  // and count rules as well as the type loop, so `second<T>(a: T, b: T): T`
+  // called as `second(7)` compiled, ran rc=0 and printed whatever was in the
+  // second parameter's register — a different garbage value on each of the three
+  // compilers (#2360).
+  //
+  // Arity needs no inference: a parameter list is the same length whatever its
+  // type params bind to, so the count is decidable here exactly as it is for a
+  // concrete callee. Only the per-argument TYPE check needs the call's inferred
+  // arguments substituted in, and that is #2243's half, below.
+  let generic = plist < 0
+  if (generic) {
+    plist = kidsOf(owner.tree, decl)[3] // FuncDecl params; an extern is never generic
+  }
+  let params = kidsOf(owner.tree, plist)
+  let want = len(params)
+  let args = kidsOf(c.tree, kids[2])
+  let got = len(args)
+  // A variadic `...xs: T` absorbs every argument past the fixed ones, so only
+  // the fixed prefix has an exact arity (§12.4). Mirrors the seed's three cases.
+  let variadic = want > 0 &&
+    getNode(owner.tree, params[want - 1]).tag == Tag.ParamRest
+  let fixed = want
+  if (variadic) {
+    fixed = want - 1
+  }
+  // `f(...xs)` spreads a slice into the variadic slot and must sit exactly after
+  // the fixed arguments; the spread itself is one argument, not a count of them.
+  // E0063 rejects a spread that is duplicated, aimed at a non-variadic callee,
+  // or not final — reported at the spread argument, as the seed does. A bad
+  // spread still falls through to the arity check below: the seed emits both.
+  let spreadAt = -1
+  let ai = 0
+  while (ai < got) {
+    if (getNode(c.tree, args[ai]).tag == Tag.ArgSpread) {
+      if (spreadAt >= 0 || !variadic || ai != got - 1) {
+        reportNoHint(c.diags, ecInvalidSpread, vSpan(c, args[ai]),
+          "'...' spread is only valid as the final argument of a variadic call")
+      }
+      spreadAt = ai
+    }
+    ai = ai + 1
+  }
+  if (spreadAt >= 0) {
+    if (spreadAt != fixed) {
+      reportNoHint(c.diags, ecArgCount, vSpan(c, node),
+        "expected ${fixed} argument(s) before '...', found ${spreadAt}")
+    }
+    return
+  }
+  if (variadic) {
+    if (got < fixed) {
+      reportNoHint(c.diags, ecArgCount, vSpan(c, node),
+        "expected at least ${fixed} argument(s), found ${got}")
+    }
+    return
+  }
+  if (want != got) {
+    reportNoHint(c.diags, ecArgCount, vSpan(c, node),
+      "expected ${want} argument(s), found ${got}")
+    return
+  }
+  // Argument TYPES, checked only here — at the one point this function has
+  // already proven the call decidable: a known, non-variadic, non-spread free
+  // function whose arity matches. Every undecidable shape (builtin, conversion,
+  // constructor, method, function value, variadic) returned above, which is what
+  // keeps FALSEPOS at 0.
+  //
+  // Part of the #1470 class: `f(p: [2]i32)` called with `1` was accepted, the
+  // same missing-vExpect hole as the annotated binding.
+  //
+  // The parameter's declared type is read from its OWNING module's tree
+  // (`owner`, via declOwner) — a cross-module call reads the exporter's nodes,
+  // never this module's. Type ids are interned in the shared ctx, so the id
+  // compared here is the same id either side would produce.
+  //
+  // A GENERIC callee is judged against its parameter types with THIS call's
+  // inferred type arguments substituted in (#2243). Judging the declared type
+  // raw would decide nothing — `vAssignable` accepts a bare type param on either
+  // side unchecked — which is why `eq(got: T, want: T, label: string)` accepted
+  // `eq(1, true, "x")`, reported `ok`, and made every assertion in the corpus
+  // unable to fail in the green direction. Substituting is what turns `want: T`
+  // into `want: i64` and lets the ordinary expectation answer.
+  //
+  // Bound by ID over the CHECKED parameter type, not by name over its node:
+  // `genericEnvOf` keys on the ids `registerGenerics` recorded for THIS decl,
+  // so a module declaring two generics that both spell a param `T` cannot bind
+  // one decl's body against the other's id. Same env and same `substType` that
+  // `validateInstantiations` uses one phase later.
+  let env = emptyTypeEnv()
+  if (generic) {
+    let targs = genericTypeArgs(c, name, node)
+    // THE SAFETY RULE. An un-inferred type param comes back as `void` from
+    // `genericTypeArgs`, and substituting that would manufacture
+    // `expected '()', found 'i64'` on code this validator has always accepted.
+    // An inference gap is undecidable, never a diagnostic — so bail on the whole
+    // call rather than report against a type nobody wrote.
+    for t of targs {
+      if (t == 0 || t == c.ctx.voidId) { return }
+    }
+    env = genericEnvOf(owner, decl, targs)
+    if (len(env.params) == 0) { return }
+  }
+  let i = 0
+  while (i < got) {
+    let a = args[i]
+    if (getNode(c.tree, a).tag == Tag.Arg) { a = kidsOf(c.tree, a)[0] }
+    let pty = typeFromNode(owner, kidsOf(owner.tree, params[i])[1])
+    if (generic) {
+      pty = substType(owner, pty, env, 0)
+      // Still open or still rigid after substitution: this parameter's type was
+      // not settled by inference, so it decides nothing. Same guard, same
+      // reason, as validateinst.bit's per-monomorphization pass.
+      if (pty != 0 && (vMentionsInvalid(c, pty, 0) || vHasTypeParam(c, pty, 0))) {
+        pty = 0
+      }
+    }
+    // An interface parameter belongs to vCallArgIface, which — unlike this
+    // narrow free-call path — also covers method, builtin and value calls.
+    // Answering here as well double-reported `take(7)` for `take(p: Any)`.
+    // (Contrast the binding path, where vBinding could supersede its Iface twin
+    // outright because the two had identical guards.)
+    if (pty != 0 && c.ctx.types[pty].kind != TypeKind.Interface) {
+      vExpectExpr(c, a, pty)
+    }
+    i = i + 1
+  }
+}
+
+// ---- E0065 invalid-expr-statement / E0066 expected-call-expr ---------------
+// Both are pure AST-SHAPE rules — they read only the statement's kid tag, never
+// a type — so neither can be confused by the flat env, and neither needs the
+// permissive escape hatch the type-directed checks carry.
+
+// A statement-position expression whose result may be discarded (§18.3).
+// `catch` is legal for the same reason a bare call is: at statement position it
+// is deliberate error handling, not an accidentally-unused value. Ported from
+// `checkExprStmt`; the list must stay in step with it.
+fn vLegalExprStmt(c: Checker, inner: int): bool {
+  let n = getNode(c.tree, inner)
+  if (n.tag == Tag.Call || n.tag == Tag.TryExpr || n.tag == Tag.CatchDefault ||
+    n.tag == Tag.CatchBind || n.tag == Tag.AsmStmt) {
+    return true
+  }
+  // A channel receive `<-c` is a unary whose operator is `<-`.
+  return n.tag == Tag.Unary && n.main == int(Kind.ArrowLeft)
+}
+
+fn vExprStmt(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) == 0 || kids[0] == 0) { return }
+  if (vLegalExprStmt(c, kids[0])) { return }
+  reportNoHint(c.diags, ecInvalidExprStatement, vSpan(c, node),
+    "expression result unused; only a call, channel receive, '?' chain, or 'catch' is a valid statement")
+}
+
+// An arrow's body under the ARROW's context, not the enclosing function's
+// (#1522). Skipping the subtree left every `return` inside a `=> { … }` checked
+// against nothing at all, so `(x: f32) => { return 4.5 }` written against a
+// `(f32) => i32` built a binary returning garbage instead of E0041 — a silent
+// miscompile, not a merely missing diagnostic.
+//
+// The result is the EXPECTED one (`arrowExpectedResult`), never the arrow's
+// final one. An arrow with no expectation INFERS its result from the first
+// `return` (#1488), and judging the later `return`s against that inference is a
+// rule the seed does not have — its `inner_fctx.result_ty` is `expected_result`
+// and stays `.invalid` when the source supplied none. Reading back the arrow's
+// own type instead made `(a: i32) => { if (a > 0) { return 1 } return "no" }` a
+// FALSE POSITIVE the seed accepts.
+//
+// `brk`/`loop` restart at 0 — a `break` inside an arrow nested in a loop does
+// not target that loop, and the seed reports E0056 for exactly this. `fallible`
+// restarts at false for the same reason: the seed's `inner_fctx.err_ty` is
+// unconditionally `.invalid`, so a `fail` inside any arrow is E0060.
+//
+// A fallible expected result is left UNDECIDED (0, permissive): the seed
+// compares against the raw `T!` while carrying no error context, and which side
+// of that a `return` lands on is not established here.
+fn vArrow(c: Checker, node: int) {
+  let result = arrowExpectedResult(c, node)
+  if (result != 0 && c.ctx.types[result].kind == TypeKind.Fallible) {
+    result = 0
+  }
+  for k of kidsOf(c.tree, node) {
+    vStmt(c, result, k, 0, 0, false)
+  }
+}
