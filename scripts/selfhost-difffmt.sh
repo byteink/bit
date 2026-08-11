@@ -53,6 +53,9 @@
 #
 # Usage: ./make selfhost && bash scripts/selfhost-difffmt.sh
 set -uo pipefail
+# shellcheck source=scripts/alarmrun.sh
+. "$(dirname -- "$0")/alarmrun.sh"
+
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
 # scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
@@ -130,7 +133,7 @@ for f in $(find $CORPUS -name '*.bit' | sort); do
   cp "$f" "$a/s.bit"
   cp "$f" "$b/s.bit"
 
-  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$ORACLE" fmt "$a/s.bit" >/dev/null 2>&1
+  alarmrun "$ORACLE" fmt "$a/s.bit" >/dev/null
   seed_rc=$?
   if [ "$seed_rc" -ge 128 ]; then
     echo "$f" >>"$work/oracletimeout"
@@ -144,7 +147,7 @@ for f in $(find $CORPUS -name '*.bit' | sort); do
     continue
   fi
 
-  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" fmt "$b/s.bit" >/dev/null 2>&1
+  alarmrun "$BIT2" fmt "$b/s.bit" >/dev/null
   rc=$?
   if [ "$rc" -ge 128 ]; then
     echo "$f" >>"$work/timeout"
@@ -187,8 +190,8 @@ if [ -s "$work/mismatch" ]; then
     a="$work/da"; b="$work/db"
     rm -rf "$a" "$b"; mkdir -p "$a" "$b"
     cp "$f" "$a/s.bit"; cp "$f" "$b/s.bit"
-    perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$ORACLE" fmt "$a/s.bit" >/dev/null 2>&1
-    perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" fmt "$b/s.bit" >/dev/null 2>&1
+    alarmrun "$ORACLE" fmt "$a/s.bit" >/dev/null
+    alarmrun "$BIT2" fmt "$b/s.bit" >/dev/null
     diff "$a/s.bit" "$b/s.bit" | head -12
   done
   status=1
