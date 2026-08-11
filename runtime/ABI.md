@@ -893,6 +893,7 @@ defined exactly once).
 | `bit_rt_string_from_int`   | `(v: i64) -> *const RtBytes` (§2, the signed prims i8..i64) |
 | `bit_rt_string_from_uint`  | `(v: u64) -> *const RtBytes` (§2, the unsigned prims u8..u64, zero-extended by the caller; #2011) |
 | `bit_rt_string_from_float` | `(v: f64) -> *const RtBytes` (§2)                  |
+| `bit_rt_parse_float`  | `(s: *const RtBytes) -> f64` (§2, correctly-rounded text->f64; the inverse of `bit_rt_string_from_float`) |
 | `bit_rt_string_from_bool`  | `(v: bool) -> *const RtBytes` (§2)                 |
 | `bit_rt_slice_new`    | `(len: usize, cap: usize, is_ref: usize) -> *SliceHeader` (§2) |
 | `bit_rt_slice_append` | `(h: *SliceHeader, word: u64, is_ref: usize) -> *SliceHeader` (§2, `is_ref` is the static element type's — a null `h` has no header to read it from, #1569) |
@@ -921,6 +922,8 @@ defined exactly once).
 | `bit_rt_ceil`         | `(x: f64) -> f64` (§17)                                |
 | `bit_rt_round`        | `(x: f64) -> f64` (§17)                                |
 | `bit_rt_trunc`        | `(x: f64) -> f64` (§17)                                |
+| `bit_rt_float_bits`   | `(v: f64) -> u64` (§17, IEEE-754 bit pattern, no conversion; unreached by generated code since #1442 — `floatBits` lowers to an inline bitcast) |
+| `bit_rt_float32_bits` | `(v: f32) -> u32` (§17, same, for f32/`float32Bits`)   |
 | `bit_rt_pow`          | `(x: f64, y: f64) -> f64` (§17)                        |
 | `bit_rt_atan2`        | `(y: f64, x: f64) -> f64` (§17)                        |
 | `bit_rt_log`          | `(x: f64) -> f64` (§17)                                |
@@ -1447,6 +1450,19 @@ silently-approximate stand-in.
 > notice the AArch64 mapping-symbol bug: a mis-atomized `.rodata` literal pool
 > shifted the lookup tables and these returned garbage while table-free fast
 > paths stayed exact. `tests/cases/run_math.bit` guards that.
+
+**`bit_rt_float_bits`/`bit_rt_float32_bits` are not math functions — they
+reinterpret an f64/f32's IEEE-754 bit pattern as a same-width unsigned integer
+with no value conversion** (`FMOV`/`movq` on both targets). They are the only
+way a Bit program can observe `-0.0` or distinguish two NaN payloads, since
+`==` reports `-0.0 == +0.0` as true and `NaN == NaN` as false either way.
+Since #1442 the compiler's own `floatBits`/`float32Bits` primitives lower to
+an inline `Op.Bitcast`, not an `ir.RtFn` call (`compiler/lowerprim.bit`), so
+neither pinned symbol is reached by generated code — `tests/bit/rootpins/`
+proves that (§9). The exports (`runtime/root/floats.bit:121-129`) remain
+because `tests/stress/rootfloat` links and calls them directly as ordinary
+`bit_rt_*` C ABI entry points, and because they are `runtime/root`'s port of
+the same-named symbols the pre-selfhost runtime shipped.
 
 ---
 
