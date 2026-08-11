@@ -1,0 +1,412 @@
+// ---------------------------------------------------------------------------
+// The M:N run loop
+// ---------------------------------------------------------------------------
+//
+// `runtime/sched/`'s `Worker.run`. One of these runs per OS thread; each drives green
+// tasks until `schedShutdown` is called and no work remains.
+//
+// THIS LOOP USED TO BE `@nosplit`, AND THAT CONSTRAINT SHAPED THE WHOLE POOL.
+// Codegen emits `bl bit_rt_safepoint` at every loop back-edge, and the safepoint
+// entry used to snapshot the caller's registers into one PROCESS-WIDE global
+// before running an unsynchronized stop-the-world collect. Two workers reaching
+// a safepoint together raced that frame and could collect concurrently, so a
+// worker loop had to reach no safepoint at all.
+//
+// That is fixed. #1429 made the snapshot per-thread (the shim reserves it below
+// the caller's `sp`) and made stop-the-world a real rendezvous; #1431 then fixed
+// the two defects that left the rendezvous unsound in practice — an allocating
+// thread that never registered as a mutator, and a parked thread that resumed
+// without re-checking the stop. The attribute is therefore GONE from this loop,
+// and `tests/stress/schedpool*` now reports a NON-ZERO collection count under
+// `BIT_GC=stress` where it previously reported zero (its safepoints were all
+// suppressed, so the stress run verified nothing extra — cf. #1409).
+//
+// OF THE THREE CONSEQUENCES, TWO ARE NOW DONE AND ONE REMAINS:
+//   1. TIMERS AND THE NETPOLLER ARE PORTED (#1364) — see `schedFindWorkIdle`.
+//      Both are driven from this loop's idle path through function values, and
+//      the poller is polled with timeout 0, so neither ever blocks this thread
+//      in a syscall where the collector could not stop it.
+//   2. THE IDLE WAIT STILL SPINS (see `spinBackoff`), so N idle workers still
+//      peg N cores. The spin now carries a WALL-CLOCK CEILING (#1649) — it used
+//      to convert the nanosecond backoff into an iteration count and nothing
+//      else, which made timer wake latency track instruction cost and cost a
+//      `sleep(50ms)` up to +11ms under emulation — but capped-and-hot is still
+//      hot, and the CPU half is unchanged. This is NO LONGER a `@nosplit`
+//      limitation, but
+//      neither is it a swap this module can make: `parkSleepNs` lives in a
+//      provider `runtime/sched` may not import and is not in `libbitrt.a`, so
+//      E0078 refuses an `extern` to it on Linux. The sleep belongs to whoever
+//      owns the `while` — `runtime/root/<os>`'s `workerBody`, which already
+//      imports `parkSleepNs`. `runtime/sched/` brackets
+//      its idle sleep with `bit_rt_gc_blocking_begin`/`_end` (ABI.md §5) and
+//      says why: without it "the collector would wait for a sleeping worker to
+//      reach a safepoint it will not reach until work arrives". This USED to be
+//      inexpressible: `extern function` was rejected outright for ELF targets.
+//      #1444 removed that blanket — E0078 now tests archive membership, and both
+//      symbols are defined in `libbitrt.a`, so they are declarable and callable
+//      on Linux today (SPEC §11.7). What remains is the scheduler-side work of
+//      actually bracketing the sleep, tracked on #1433; measured cost of the
+//      naive swap is on #1364. The LANGUAGE gap is closed.
+//   3. TASK BODIES ARE STILL `@nosplit` in every caller. Removing the attribute
+//      from a task body has not been tested, and a green task's stack is reached
+//      by the conservative scan rather than by a published safepoint frame, so
+//      that half needs its own verification before it is claimed.
+//
+// THE TRIP BOUND. `runtime/sched/` writes `while (true)`. A statically provable bound
+// is required here (Power of 10), so the loop carries one, exactly as
+// `runtime/thread`'s `threadJoin` does and for the same reason: `stopping` is
+// the operative exit in every real run, and the constant exists so that
+// termination is provable by READING the loop rather than by trusting that some
+// other thread will eventually set a flag. A worker that exhausts it returns,
+// which degrades a wedged scheduler into a finishing one instead of a hung one.
+//
+// Exported because the runtime's own boot path drives the loop itself — see
+// `schedWorkerStepNow` — and must carry the SAME bound rather than invent one.
+export const WORKER_MAX_STEPS: int = 1000000000
+
+// Put a runnable task back on a queue: this worker's local ring for locality,
+// spilling to the global queue when the ring is full. Both places the run loop
+// needs this — an ordinary yield and an owed wake delivered out of the arm/park
+// window — want the identical placement, so it is written once.
+@nosplit fn schedRequeue(s: *i64, w: *i64, addr: int) {
+  let queued = dqPushBottom(w + wkDeque, addr)
+  if (queued) {
+    // ORDINARY YIELD — DO NOT WAKE, AND DO NOT BUMP THE SEQ (#1902). The task
+    // went back on the ring of the worker about to run it, so there is nothing
+    // for a peer to take; bumping the seq here instead makes every parked
+    // worker's `parkWait` return EAGAIN at THIS worker's yield rate. The first
+    // version did wake here and the pool spun rather than slept: load 68.8 on
+    // 18 cores, `bit` typechecks blowing a 300s deadline, h3fetch timed out —
+    // worse than the polling this ticket removes. See sleep.bit's header.
+    return
+  }
+  // Spilled to the global queue: now it IS work another worker can take.
+  gqPush(s + scGlobal, addr)
+  schedWakeIdle(s)
+}
+
+// The value `schedWorkerStep` returns in place of a backoff to say "leave the
+// loop": shutdown has been signalled and no work remains. Distinguishable from
+// every real backoff because a backoff is always positive (`parkMinBackoffNs`).
+//
+// Exported for the same reason `WORKER_MAX_STEPS` is: `schedWorkerStepNow`'s
+// caller owns the loop and has to recognise the sentinel it returns.
+export const workerStepStop: int = -1
+
+// ONE TURN of the run loop, given the task `addr` the caller's find-work step
+// produced (0 = none) and the current `backoff`. Returns the next backoff, or
+// `workerStepStop` when the worker must return.
+//
+// Split out of `schedWorkerRun` so the two find-work seams — the function-value
+// one and `schedWorkerStepNow`'s poller-free one below — share this body
+// verbatim rather than keeping a copy each that could drift. Everything here is
+// independent of how `addr` was found.
+fn schedWorkerStep(w: *i64, s: *i64, addr: int, backoff: int): int {
+  // Cleared on every turn, set only in the `taskDone` branch below, so a
+  // caller that reads it right after this call never sees a stale task from
+  // an earlier turn (#2167).
+  *(w + wkLastDone) = 0
+  if (addr == 0) {
+    // No work. Stop if shutdown has been signalled, else back off and retry.
+    // Checked AFTER `findWork` so a worker never exits leaving queued work
+    // behind — `runtime/sched/`'s ordering, and the reason shutdown drains.
+    let stopping = atomicLoad(s + scStopping)
+    if (stopping != 0) {
+      return workerStepStop
+    }
+    spinBackoff(backoff)
+    return parkNextBackoff(backoff)
+  }
+
+  let t = taskAt(addr)
+  *(w + wkRunning) = addr
+
+  // The migration point. A task carries no worker affinity, so the worker
+  // that resumes it need not be the one it parked on, and this store is what
+  // makes `schedCurrentWorker` correct after a migration. `runtime/sched/` gets
+  // the same effect from its thread-local, which is why its `trampoline`
+  // must RE-FETCH the worker after the body returns.
+  *(t + taskWorker) = int(w)
+  *(t + taskState) = taskRunning
+
+  // Must be overwritten by the task before it switches back; the states
+  // below are the only three a task may leave in.
+  *(w + wkDisposition) = taskRunning
+  schedSwitch(w + wkCtx, t)
+  *(w + wkRunning) = 0
+  *(t + taskWorker) = 0
+
+  let disp = *(w + wkDisposition)
+  if (disp == taskRunnable) {
+    schedRequeue(s, w, addr)
+  }
+  if (disp == taskParked) {
+    // Safe only now: `t`'s context was just saved by this same thread, in
+    // program order, above. The atomic store is what lets another thread's
+    // later load see that write — `runtime/sched/` makes exactly this argument
+    // for its release store, and §11.5's sequential consistency is strictly
+    // stronger.
+    //
+    // THREE CASES, TRIED IN THIS ORDER, AND THE ORDER IS THE PROOF.
+    //
+    //  1. `taskParking -> taskParked`. The task armed (`schedParkArm`) and
+    //     no waker reached it: publish the park, and a later waker finds a
+    //     properly parked task. This is the common armed path.
+    //  2. `taskWakePending -> taskRunnable`. A waker reached the task inside
+    //     its arm/park window and handed the wake here rather than dropping
+    //     it. The task must NOT be left parked — nothing will wake it again,
+    //     because a one-shot poller registration has already been consumed
+    //     by the drain that failed to deliver. So the owed wake is delivered
+    //     by requeueing, which is exactly what `schedUnpark` would have done
+    //     had it been able to.
+    //  3. Neither: the state is `taskRunning`, i.e. an ordinary unarmed park
+    //     (`schedPark` alone — timers, channels, `schedYield`'s siblings).
+    //     A plain store is correct AND cannot lose a wake, because only the
+    //     task itself writes `taskParking` and it is suspended right now, so
+    //     no waker can be inside the armed protocol for it.
+    //
+    // Case 2 is checked BETWEEN 1 and 3 rather than after 3, because a waker
+    // may flip `taskParking -> taskWakePending` after 1's compare-exchange
+    // has already failed. Once 2 has failed as well the state is `taskRunning`
+    // and can no longer change under us, which is what makes 3's plain store
+    // safe rather than merely likely.
+    if (!atomicCmpxchg(t + taskState, taskParking, taskParked)) {
+      if (atomicCmpxchg(t + taskState, taskWakePending, taskRunnable)) {
+        schedRequeue(s, w, addr)
+      } else {
+        atomicStore(t + taskState, taskParked)
+      }
+    }
+  }
+  if (disp == taskDone) {
+    atomicStore(t + taskState, taskDone)
+    schedUnregister(s, addr)
+    // Published AFTER `schedUnregister`, so a caller that sees this non-zero
+    // is guaranteed the task is already gone from the collector's root set —
+    // safe to unmap its stack and task block (#2167).
+    *(w + wkLastDone) = addr
+  }
+  return parkMinBackoffNs
+}
+
+// `nowFn` and `pollFn` are the platform seam; see `schedFindWorkIdle` for what
+// each must do and why they are function values rather than imports.
+//
+// ---------------------------------------------------------------------------
+// THIS FUNCTION DOES NOT TOUCH THE MUTATOR REGISTRY, AND MUST NOT (#1671)
+// ---------------------------------------------------------------------------
+//
+// AN OS THREAD THAT ENTERS THIS LOOP AND THEN EXITS MUST RELEASE ITS MUTATOR
+// SLOT, and the call belongs in that thread's ENTRY function, not here. The
+// entry owns the thread's whole life; this function does not.
+//
+// The leak is real and was measured, not assumed. Two worker OS threads enter
+// this loop, drain their tasks, are joined, and the boot thread then allocates
+// in a 20,000-iteration loop under `BIT_GC=stress BIT_GC_STATS=1`. Against the
+// identical program with the two threads never brought up:
+//
+//   target          workers, no exit          no workers      workers + exit
+//   aarch64-macos   abandoned 20130 / coll 11 |  0 / 20134  |  0 / 20142
+//   aarch64-linux   abandoned 20275 / coll 263|  0 / 20134  |  0 / 20538
+//   x86_64-linux    abandoned 20165 / coll 113|  0 / 20134  |  0 / 20278
+//
+// i.e. once a worker thread has left this loop without releasing its slot,
+// essentially EVERY later collection is abandoned — the slot stays `mRunning`
+// forever and every rendezvous waits out `stwSpinBound` for a thread that no
+// longer exists. `../gc/gcworld.bit` states the consequence on `gcThreadExit`
+// itself: "a leaked slot stays `running` forever, which corrupts nothing but
+// makes every later rendezvous expire, i.e. collection quietly stops." This is
+// the same defect #1666 fixed in `runtime/root/<os>`'s `workerBody`, which is
+// the OTHER consumer of this loop and which drives `schedWorkerStepNow` in its
+// own `while` rather than calling this.
+//
+// WHY THE PAIR IS NOT PUT HERE, WHERE IT WOULD BE CONVENIENT. `runtime/sched/`'s
+// `Worker.run` — the oracle — does carry `gc_hooks.threadEnter()` plus
+// `defer gc_hooks.threadExit()`, but it is a PRIVATE `fn` reachable only as a
+// thread entry. This one is `export`ed and is predominantly NOT a thread entry:
+// of the nine in-tree call sites, six are a direct call from `main()` on the
+// BOOT thread (`tests/stress/`: `schedtimer`, `netpark`, `schedpolldarwin`,
+// `polloneshotdarwin`, `rootspawndarwin`, and `schedpool`, which calls it twice
+// in a row) and only three are an OS-thread entry. A `gcThreadExit()` in here
+// would therefore deregister the BOOT thread in the majority of uses while it
+// carries on running Bit code — every one of those six allocates afterwards, at
+// minimum in its closing interpolated `print`. That is the CORRUPTION direction:
+// a slot released too early lets a rendezvous proceed past a thread that is
+// still running and sweep its live roots, which is strictly worse than leaking
+// one, and it is the #1650/#1651 defect in a new place. Leaking is safe and
+// wasteful; releasing early is not safe at all.
+//
+// So the placement rule is #1666's, unchanged, and it is the ENTRY's to obey:
+// call the collector's exit door AFTER this function returns — no Bit code runs
+// on the thread again — and BEFORE the done store, whose tail is raw pointer
+// arithmetic holding no managed reference. Do not gate it on anything, and in
+// particular never on `schedCurrentTask() == 0` (#1639, deleted by #1650/#1651).
+//
+// The enter half is absent HERE for the same reason the exit half is: this
+// function is not reliably a thread entry (see above — six of nine in-tree
+// callers drive it from an already-running boot thread). It is NOT absent
+// from the tree. `#1677` falsified the "lazy registration alone is a
+// guarantee, not a fallback" reading of ABI.md §5 with a reproducer — a raw
+// OS thread whose first statements read a live reference out of shared state
+// before any allocation or loop back edge is invisible to the rendezvous, and
+// a concurrent collection swept it 20/20 runs. `#1699` closes that window at
+// the real thread-entry points: `runtime/root/<os>/boot.bit`'s `workerBody`
+// (the only production OS-thread entry that reaches this loop) now calls
+// `gcThreadEnter()` as its first statement, mirroring `gcThreadExit()`'s
+// placement at its last. Measured `abandoned` before/after on all three
+// targets is recorded on #1699.
+export fn schedWorkerRun(w: *i64, nowFn: () => int,
+                               pollFn: (int, int) => int) {
+  let s = taskAt(*(w + wkSched))
+  let backoff = parkMinBackoffNs
+  let n = 0
+  while (n < WORKER_MAX_STEPS) {
+    n = n + 1
+    backoff = schedWorkerStep(w, s, schedFindWorkIdle(w, nowFn, pollFn), backoff)
+    if (backoff == workerStepStop) {
+      return
+    }
+  }
+}
+
+// ONE WHOLE TURN of `schedWorkerRun` — find work, then run it — for a caller that
+// owns the `while` itself. Returns the next backoff, or `workerStepStop` when the
+// worker must leave the loop.
+//
+// It exists because a function VALUE is a `(code, env)` cell on the managed heap
+// (§11.10), so a module that builds one needs a `TypeInfo` descriptor and can no
+// longer be emitted `--freestanding` (§17.6) — and the runtime's own boot path
+// (`runtime/root/<os>`'s `workerBody`) is precisely a module that must be. The
+// seam-carrying form above stays for consumers that do drive I/O.
+//
+// THE CLOCK IS THE CALLER'S, AND IT IS NOT OPTIONAL. `now` must be the SAME
+// monotonic clock in nanoseconds that the consumer's `bit_rt_time_sleep_ns`
+// computes its deadlines against (`runtime/park`'s `parkMonoNs` for both boot
+// providers). This used to be a `schedWorkerRunBare` that folded the clock away
+// to a constant 0, which parked every sleeper forever — #1648. A caller that has
+// no clock at all and genuinely runs no timers still has `schedWorkerRun(w,
+// schedNoTimers, schedNoPoller)`; the runtime's boot path is not such a caller.
+//
+// `now` is read by the caller once per turn rather than lazily on the idle path
+// only. That is one extra clock read per task dispatch, which is nanoseconds
+// against a context switch, and it buys the property that no code path in this
+// file can invent a time — the shape the bug came in through.
+// THIS FORM DOES NOT POLL FOR I/O, AND ITS NAME DOES NOT SAY SO (#1673). It is
+// `schedFindWorkAt` — the three queue probes plus timers — fed to
+// `schedWorkerStepAt`, and nothing more. A consumer whose program does network
+// I/O must NOT drive its loop with this: a task parked on the netpoller is woken
+// only by a `pollDrain`, and no path from here reaches one, so the wake can never
+// be produced and the reader waits forever (or, in `netReadSock`'s unscheduled
+// fallback, spins out and reports an empty read). Compose the three-call form —
+// see `schedFindWorkAt` — as ../root/<os>'s `workerBody` now does. Kept because
+// the scheduler stress harnesses genuinely run no I/O and want exactly this.
+export @symbol("bit_rt_port_sched_worker_step_now") fn schedWorkerStepNow(w: *i64, now: int, backoff: int): int {
+  let s = taskAt(*(w + wkSched))
+  return schedWorkerStep(w, s, schedFindWorkAt(w, now), backoff)
+}
+
+// Run the task `addr` (0 = none found this turn) and return the next backoff, or
+// `workerStepStop` when the worker must leave the loop. `woke` is how many tasks
+// the caller's own netpoller drain unparked this turn (0 when it did not drain).
+//
+// The half of `schedWorkerStepNow` that comes AFTER work discovery, so a caller
+// that has to interleave its own platform probe — a netpoller drain — between
+// `schedFindWorkAt` and the step can do so without reimplementing the run/park/
+// requeue state machine `schedWorkerStep` owns. Everything in that body is
+// independent of how `addr` was found, which is what makes the split safe.
+//
+// `woke` IS A COUNT AND NOT A TASK, so that the pop stays on this side of the
+// seam. A drained task is unparked onto the GLOBAL queue — `schedPollUnpark` has
+// to use it, because the waker may be any thread — and `schedFindWorkIdle` pairs
+// its own `pollFn` with exactly this `gqPop` for that reason. Handing the caller
+// a `gqPop` instead would mean pinning `gqPop`, and a one-line wrapper round it
+// is small enough that the inliner folds it into the caller's object, which then
+// references the module-private `lockOf` under a mangled name `--freestanding`
+// refuses (SPEC §11.9). Keeping the pop here keeps the queue's internals in the
+// module that owns them; that is not a workaround, it is the same boundary
+// `schedFindWorkIdle` already draws.
+export @symbol("bit_rt_port_sched_worker_step_at") fn schedWorkerStepAt(w: *i64, addr: int, woke: int, backoff: int): int {
+  let s = taskAt(*(w + wkSched))
+  let picked = addr
+  if (picked == 0 && woke > 0) {
+    picked = gqPop(s + scGlobal)
+  }
+  return schedWorkerStep(w, s, picked, backoff)
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler control
+// ---------------------------------------------------------------------------
+
+// Queue a runnable task. Prefers the calling worker's local ring when the
+// caller is itself on a task (the fast path), and falls back to the global
+// queue otherwise — `runtime/sched/`'s `Scheduler.spawn` placement rule.
+//
+// Registration happens first, and before the task is visible to any queue, so a
+// collector can never observe a runnable task that is not on the registry.
+//
+// THE FAST PATH IS ONLY VALID WHEN THE RUNNING WORKER BELONGS TO `s`. This
+// function takes its scheduler explicitly and is documented safe from any
+// thread, so `schedRegister(s, ...)` and the enqueue must agree on which
+// scheduler owns the task. `schedCurrentWorker()` answers "which worker is this
+// STACK on" (task identity is derived from the stack pointer, `../sched.bit`'s
+// `schedCurrentTask`) and says nothing about which scheduler that worker serves
+// — so without the `wkSched` check a caller running as a green task of one
+// scheduler registers the task with `s` and queues it on a DIFFERENT one. The
+// task is then on no queue `s`'s workers ever read, and it simply never runs.
+//
+// Nothing could reach that case until G3 (#1584) made this the live runtime.
+// While `libbitrt.a` came from `runtime/root/`, the only live scheduler was
+// `runtime/sched/`'s, whose workers are invisible to this module, so
+// `schedCurrentWorker()` was 0 for precisely the callers that pass a private `s`
+// — every `tests/stress/sched*` program — and the fallback always ran. The
+// moment the Bit scheduler is the one running `main`, it stops being 0.
+// `tests/stress/schedpolldarwin` is the case that caught it: its two waiter
+// tasks were registered with its private scheduler and queued on the live one,
+// so its worker loop idled 200001 times against an empty queue while the
+// one-shot kqueue edge it had armed was consumed and dropped.
+export @nosplit @symbol("bit_rt_port_sched_spawn") fn schedSpawn(s: *i64, task: int) {
+  schedRegister(s, task)
+  let wAddr = schedCurrentWorker()
+  if (wAddr != 0 && *(taskAt(wAddr) + wkSched) == int(s)) {
+    let queued = dqPushBottom(taskAt(wAddr) + wkDeque, task)
+    if (queued) {
+      schedWakeIdle(s)
+      return
+    }
+  }
+  gqPush(s + scGlobal, task)
+  schedWakeIdle(s)
+}
+
+// Make a parked task runnable again, from any thread. Routes through the global
+// queue because the caller may not be a worker at all. `runtime/sched/`'s `unpark`.
+//
+// The compare-and-exchange both checks the precondition and performs the
+// transition, so a double unpark cannot race itself onto the queue twice.
+// Returns false when the task was not parked, rather than panicking as a
+// stricter contract
+// does: a panic is not available in a `@nosplit` body, and a caller that can see
+// the answer can react to it.
+export @nosplit @symbol("bit_rt_port_sched_unpark") fn schedUnpark(s: *i64, task: int): bool {
+  let t = taskAt(task)
+  if (!atomicCmpxchg(t + taskState, taskParked, taskRunnable)) {
+    return false
+  }
+  gqPush(s + scGlobal, task)
+  schedWakeIdle(s)
+  return true
+}
+
+// Signal every worker to stop once it next finds no work. `runtime/sched/`'s
+// `shutdown`. Joining the OS threads afterwards is `runtime/thread`'s
+// `threadJoin`, which the caller drives — this module creates no threads (see
+// the header) and so reaps none.
+export @nosplit fn schedShutdown(s: *i64) {
+  atomicStore(s + scStopping, 1)
+  // Parked workers check `scStopping` on waking, so shutdown has to wake them
+  // (#1902). Without this the join in `boot` waits out one `idleParkMaxNs` per
+  // parked worker before the process can exit — a 100ms tax on every run.
+  // The whole-pool variant, unlike every other wake site: all of them must go.
+  schedWakeIdleAll(s)
+}
