@@ -61,6 +61,9 @@
 #
 # Usage: ./make selfhost && bash scripts/selfhost-diffcheck.sh
 set -u
+# shellcheck source=scripts/alarmrun.sh
+. "$(dirname -- "$0")/alarmrun.sh"
+
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
 # scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
@@ -97,10 +100,11 @@ TIMEOUT_S=${TIMEOUT_S:-20}
 # 142 (128+SIGALRM) iff the run timed out TWICE.
 run() {
   local out rc
-  out=$(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT_S" "$@" 2>&1 >/dev/null)
+  local TIMEOUT="$TIMEOUT_S"
+  out=$(ALARMRUN_KEEP_STDERR=1 alarmrun "$@" 2>&1 >/dev/null)
   rc=$?
   if [ "$rc" -eq 142 ]; then
-    out=$(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT_S" "$@" 2>&1 >/dev/null)
+    out=$(ALARMRUN_KEEP_STDERR=1 alarmrun "$@" 2>&1 >/dev/null)
     rc=$?
   fi
   printf '%s' "$out"
