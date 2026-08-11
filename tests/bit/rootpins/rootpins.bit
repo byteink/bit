@@ -141,40 +141,19 @@
 // BOTH object formats must have been exercised, and the discovered module and
 // pin counts carry floors so the examined set cannot be quietly emptied.
 
-import { exists, isDir, readDir, readFile, writeFile } from "std/fs"
+import { exists, isDir, readDir, readFile } from "std/fs"
 import { envOr, exit } from "std/os"
 import { join } from "std/path"
 import { hasPrefix, indexOf, parseInt } from "std/strings"
 import { now } from "std/time"
-import { Obj, badObj, objFail, readElf, readMacho } from "../objread"
+import { Obj, atomEnd, badObj, objFail, readElf, readMacho } from "../objread"
+import { Cfg, maxScan, tLinux, tMacos, reportChild, runBounded, timeoutSeconds, trimLeadingSpace } from "../childrun"
 
 // The placeholder prefix the Stage-2 port pinned its ABI functions under, and
 // the real ABI prefix it became. Both are `bit_rt_` since #1369 landed, so
 // `renameOf` is the identity — see the header for why they are still two names.
 const placeholder: string = "bit_rt_"
 const real: string = "bit_rt_"
-
-// Per-child wall-clock limit, shared with every harness here. A hang is a failure,
-// not a stall (#1637/#1652); the compiler is a child here, so it is bounded.
-const defaultTimeoutS: int = 300
-const maxTimeoutS: int = 3600
-const timeoutEnvVar: string = "BIT_TEST_TIMEOUT_S"
-
-// `osRunBounded`'s result encoding (ABI.md §19).
-const rcSpawnFailed: int = -1
-const rcTimedOut: int = -2
-const rcSignalBase: int = -100
-
-// Upper bound on symbols/relocations walked in one object — every walk provably
-// bounded (Power of 10 rule 2), two orders of magnitude above today's counts.
-const maxScan: int = 1048576
-
-// Target names as `bit build --target` spells them. Mach-O carries the C leading
-// underscore verbatim and ELF does not, so the target also selects the symbol
-// prefix — normalising that is what keeps a Darwin module from silently matching
-// nothing, the vacuity the original read green on for months.
-const tMacos: string = "aarch64-macos"
-const tLinux: string = "x86_64-linux"
 
 // Where the runtime tree lives, and how deep the walk may go. `runtime/` is two
 // levels (`runtime/net/linux`), so 2 covers it with the recursion still provably
@@ -196,10 +175,6 @@ const commentMarker: string = "//"
 // one is a deliberate act that says the runtime shrank.
 const minModules: int = 24
 const minPins: int = 280
-
-// Where the compiler binary and the tree under test live, so no function has to
-// thread them one parameter at a time.
-struct Cfg { bin: string, repo: string, timeoutMs: int }
 
 // One runtime module: the directory relative to the repository root, and the
 // target its sources can be emitted for.
@@ -229,13 +204,8 @@ fn symPrefixFor(target: string): string {
   return ""
 }
 
-fn trimLeadingSpace(s: string): string {
-  let i = 0
-  while (i < len(s) && s[i:i + 1] == " ") {
-    i = i + 1
-  }
-  return s[i:len(s)]
-}
+// `trimLeadingSpace` moved to `../childrun` (#2902): byte-identical to
+// `tests/bit/stwwiring/`'s copy.
 
 // Every `bit_rt_*` name pinned by a line of `src` that is CODE. One pin per
 // line holds throughout this tree; a line whose first non-space characters are
@@ -318,21 +288,9 @@ fn discoverMods(repo: string): []Mod {
 // The pin-cycle check
 // ---------------------------------------------------------------------------
 
-// The end of the atom starting at (`sect`, `start`): the next defined symbol's
-// offset in the same section, or the section's size. `atomizeModule`'s rule —
-// span to the NEXT SYMBOL, never to a declared size, because any padding between
-// them still carries relocations that must belong to some atom.
-fn atomEnd(o: Obj, sect: int, start: int): int {
-  let end = o.secs[sect].size
-  let i = 0
-  while (i < len(o.syms)) {
-    if (o.syms[i].sect == sect && o.syms[i].value > start && o.syms[i].value < end) {
-      end = o.syms[i].value
-    }
-    i = i + 1
-  }
-  return end
-}
+// `atomEnd` moved to `../objread` (#2902): both harnesses call it only on an
+// `Obj` that module already parsed, so it belongs with the object model
+// rather than with either caller's own scaffolding.
 
 // `bit_rt_root_host_target` -> `<sp>bit_rt_host_target`, where `sp` is the
 // object format's symbol prefix (`_` on Mach-O). `bare` must already have that
@@ -441,9 +399,9 @@ fn loadObject(c: Cfg, m: Mod, idx: int): Obj {
   let obj = "${base}.o"
   let cmd = "exec \"${c.bin}\" build \"${dir}\" --emit-obj " +
     "--target ${m.target} -o \"${obj}\""
-  let rc = runBounded("${base}.sh", "${base}.log", cmd, c.timeoutMs)
+  let rc = runBounded("rootpins", "${base}.sh", "${base}.log", cmd, c.timeoutMs)
   if (rc != 0) {
-    reportChild("${m.path} (${m.target})", rc, "${base}.log")
+    reportChild("rootpins", "${m.path} (${m.target})", rc, "${base}.log")
     fsRemove(obj)
     return badObj()
   }
@@ -457,67 +415,9 @@ fn loadObject(c: Cfg, m: Mod, idx: int): Obj {
   return readElf("rootpins", []u8(raw))
 }
 
-// Writes `cmd` into an executable `/bin/sh` script and runs it under a deadline.
-// The script exists only because `osRunBounded` takes a path and NO argv
-// (ABI.md §19), so a command WITH arguments cannot be expressed directly.
-fn runBounded(script: string, log: string, cmd: string, timeoutMs: int): int {
-  writeFile(script, "#!/bin/sh\nexec >\"${log}\" 2>&1\n${cmd}\n") catch e {
-    eprint("rootpins: cannot write ${script}: ${e.message()}\n")
-    return rcSpawnFailed
-  }
-  if (fsChmod(script, 493) != 0) {
-    eprint("rootpins: cannot make ${script} executable\n")
-    fsRemove(script)
-    return rcSpawnFailed
-  }
-  let r = osRunBounded(script, timeoutMs)
-  fsRemove(script)
-  return r
-}
-
-// Names a failed child on stderr. A timeout and a crash are distinct outcomes:
-// scoring a segfault as a timeout sends the reader hunting the wrong bug.
-fn reportChild(what: string, r: int, log: string) {
-  if (r == rcTimedOut) {
-    eprint("rootpins: ${what}: TIMED OUT at the ${timeoutEnvVar} deadline\n")
-  } else if (r <= rcSignalBase) {
-    eprint("rootpins: ${what}: compiler CRASHED — ${signalName(0 - r + rcSignalBase)}\n")
-  } else if (r == rcSpawnFailed) {
-    eprint("rootpins: ${what}: could not spawn the compiler\n")
-  } else {
-    eprint("rootpins: ${what}: compiler exited with ${r}\n")
-  }
-  let text = readFile(log) catch _ {
-    ""
-  }
-  if (len(text) > 0) { eprint("--- ${what} ---\n${text}\n") }
-  fsRemove(log)
-}
-
-// The signal numbers worth naming; anything else reports its number.
-fn signalName(sig: int): string {
-  if (sig == 4) { return "SIGILL (4)" }
-  if (sig == 6) { return "SIGABRT (6)" }
-  if (sig == 8) { return "SIGFPE (8)" }
-  if (sig == 9) { return "SIGKILL (9)" }
-  if (sig == 10) { return "SIGBUS (10)" }
-  if (sig == 11) { return "SIGSEGV (11)" }
-  return "signal ${sig}"
-}
-
-// The per-child limit in seconds, clamped into [1, maxTimeoutS] so a typo can
-// neither disable the deadline nor make it useless.
-fn timeoutSeconds(): int {
-  let raw = envOr(timeoutEnvVar, "")
-  if (len(raw) == 0) { return defaultTimeoutS }
-  let n = parseInt(raw) catch _ {
-    eprint("rootpins: ${timeoutEnvVar}='${raw}' is not a number\n")
-    return defaultTimeoutS
-  }
-  if (n < 1) { return 1 }
-  if (n > maxTimeoutS) { return maxTimeoutS }
-  return n
-}
+// `runBounded`, `reportChild`, `signalName` and `timeoutSeconds` moved to
+// `../childrun` (#2902): byte-identical (modulo an eprint tag) to
+// `tests/bit/stwwiring/`'s copies.
 
 // ---------------------------------------------------------------------------
 
@@ -570,7 +470,7 @@ fn runMods(c: Cfg, mods: []Mod, pinned: map<string, bool>, counts: []int): int {
 
 fn main() {
   let c = Cfg{ bin: envOr("BIT", "bit-out/bin/bit"), repo: envOr("REPO", "."),
-    timeoutMs: timeoutSeconds() * 1000 }
+    timeoutMs: timeoutSeconds("rootpins") * 1000 }
   if (!exists(c.bin)) {
     eprint("rootpins: compiler not found: ${c.bin} (set BIT)\n")
     exit(1)
