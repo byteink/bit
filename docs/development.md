@@ -126,9 +126,11 @@ code block under `docs/`, and `tests/bit/stdlibdocs.bit` fails on an undocumente
 export. A doc that does not compile fails the build.
 
 **A gate whose printed count omits its denominator reads as coverage when it
-is not — a fifth way this repo can report green while verifying nothing**
-(`tests/bit/filesize.bit`'s own header already counts the other four). Three
-measured instances, all re-measured on `main` at `c2a1eb27`:
+is not — that is itself a way this repo can report green while verifying
+nothing.** (Related but distinct: the "Two things a split can break" list
+under `## File size` below is about what a *file split* can silently break,
+not about scope.) Three measured instances, all re-measured on `main` at
+`c2a1eb27`:
 
 - **`test-filesize`** enforces the 800-line limit over `tests/bit/` only and
   prints `filesize: ok — 77 file(s) scanned, 30 file(s) skipped as fixture
