@@ -18,6 +18,9 @@
 #   2  could not decide: a missing compiler, or a run timed out and was never
 #      compared. Not a pass — see #1524/#1525.
 set -u
+# shellcheck source=scripts/alarmrun.sh
+. "$(dirname -- "$0")/alarmrun.sh"
+
 # The oracle is the PINNED STAGE0: the previous release, i.e. an EARLIER VERSION
 # OF THIS SAME COMPILER — which is exactly what limits the claim below.
 # scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
@@ -52,10 +55,11 @@ TIMEOUT_S=${TIMEOUT_S:-60}
 # (128+SIGALRM) iff the run timed out twice.
 run() {
   local out rc
-  out=$( ( perl -e 'alarm shift; exec @ARGV' "$TIMEOUT_S" "$@" 2>/dev/null ) 2>/dev/null )
+  local TIMEOUT="$TIMEOUT_S"
+  out=$( ( alarmrun "$@" ) 2>/dev/null )
   rc=$?
   if [ "$rc" -eq 142 ]; then
-    out=$( ( perl -e 'alarm shift; exec @ARGV' "$TIMEOUT_S" "$@" 2>/dev/null ) 2>/dev/null )
+    out=$( ( alarmrun "$@" ) 2>/dev/null )
     rc=$?
   fi
   printf '%s' "$out"
