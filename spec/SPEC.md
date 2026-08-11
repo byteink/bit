@@ -120,12 +120,12 @@ assigned to but never read; it discards a value (e.g. `let (_, ok) = <-c`).
 Reserved; may not be used as identifiers:
 
 ```
-as       break     case      catch     chan      const
-continue default   defer     else      enum      export
-fail     false     fn        for       from      if
-import   in        interface let       map       match
-nil      of        return    select    spawn     struct
-switch   true      type      while
+as       asm       break     case      catch     chan
+const    continue  default   defer     else      enum
+export   fail      false     fn        for       from
+if       import    in        interface let       map
+match    nil       of        return    select    spawn
+struct   switch    true      type      while
 ```
 
 `assert` is *not* reserved: like `panic` and `len` it is a predeclared builtin
@@ -408,7 +408,7 @@ character is required.
 
 An implementer can produce the complete token enumeration directly from §5–§7:
 
-- **Keywords:** the 34 words in §5.2.
+- **Keywords:** the 35 words in §5.2.
 - **Literals:** `INT_LIT`, `FLOAT_LIT`, `STRING_LIT`, `RAW_STRING_LIT`,
   `RUNE_LIT`, `BOOL_LIT`, `NIL_LIT`.
 - **Identifier:** `IDENT`.
