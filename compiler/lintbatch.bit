@@ -1,0 +1,283 @@
+// `bit lint` diagnostic rendering and the `bit lint` command itself (#2470,
+// split out of compiler/lint.bit — 1362 lines against the 800-line limit).
+// compiler/lint.bit keeps the rule registry and the `// bit:lint` override
+// directive reader; compiler/lintapply.bit keeps the dispatcher and every
+// rule's own check function, which `lintCmd` here calls via `runLintRules`.
+//
+// Named to sort after both compiler/lint.bit and compiler/lintapply.bit, whose
+// types and functions it calls, and before compiler/lintcheck.bit, whose
+// self-checks call `parseLintArgs`, `lintRenderJson` and `lintSortDiags`
+// directly — module files concatenate in bytewise filename order
+// (compiler/project.bit:7).
+import { walk } from "std/fs"
+import { compare } from "std/strings"
+
+// One JSON string literal, escaping what RFC 8259 requires. Control bytes take
+// the `\u00XX` long form rather than the `\n`/`\t` shorthands — both are valid
+// and parse identically, and lint messages are generated ASCII, so the shorter
+// form would only buy bytes.
+fn lintJsonString(s: string): string {
+  let out = "\""
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == '"') {
+      out = out + "\\\""
+    } else if (c == '\\') {
+      out = out + "\\\\"
+    } else if (c < 32) {
+      out = out + "\\u00" + lintHexByte(c)
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "\""
+}
+
+fn lintHexByte(c: u8): string {
+  let digits = "0123456789abcdef"
+  let hi = int(c) / 16
+  let lo = int(c) - hi * 16
+  return digits[hi:hi + 1] + digits[lo:lo + 1]
+}
+
+// The diagnostics as the LSP-shaped array `bit check --json` already emits
+//: same keys, same 0-based line/character
+// range, so editors and CI parse one format for both tools.
+fn lintRenderJson(d: Diagnostics): string {
+  let out = "["
+  let i = 0
+  while (i < len(d.list)) {
+    if (i > 0) {
+      out = out + ","
+    }
+    let g = d.list[i]
+    let s = locate(d.sm, g.span.file, g.span.start)
+    let e = locate(d.sm, g.span.file, g.span.end)
+    out = out + "{\"code\":" + lintJsonString(codeString(g.code))
+    out = out + ",\"severity\":" + lintJsonString(severityLabel(g.severity))
+    out = out + ",\"file\":" + lintJsonString(filePath(d.sm, g.span.file))
+    out = out + ",\"range\":{\"start\":{\"line\":${s.line},\"character\":${s.column}}"
+    out = out + ",\"end\":{\"line\":${e.line},\"character\":${e.column}}}"
+    out = out + ",\"message\":" + lintJsonString(g.message)
+    if (g.hasHint) {
+      out = out + ",\"hint\":" + lintJsonString(g.hint)
+    }
+    out = out + "}"
+    i = i + 1
+  }
+  return out + "]"
+}
+
+// Orders findings by file path, then line, then code — the order golden tests
+// pin. Insertion sort: the list is one finding per rule per file, so it stays
+// small, and the sort is stable so equal keys keep discovery order.
+fn lintSortDiags(d: Diagnostics) {
+  let i = 1
+  while (i < len(d.list)) {
+    let j = i
+    while (j > 0 && lintDiagLess(d, d.list[j], d.list[j - 1])) {
+      let tmp = d.list[j - 1]
+      d.list[j - 1] = d.list[j]
+      d.list[j] = tmp
+      j = j - 1
+    }
+    i = i + 1
+  }
+}
+
+fn lintDiagLess(d: Diagnostics, a: Diagnostic, b: Diagnostic): bool {
+  let pa = filePath(d.sm, a.span.file)
+  let pb = filePath(d.sm, b.span.file)
+  if (pa != pb) {
+    return compare(pa, pb) < 0
+  }
+  let la = locate(d.sm, a.span.file, a.span.start).line
+  let lb = locate(d.sm, b.span.file, b.span.start).line
+  if (la != lb) {
+    return la < lb
+  }
+  return a.code < b.code
+}
+
+// ---- The `bit lint` command -------------------------------------------------
+
+// Parsed `bit lint` argv.
+struct LintArgs {
+  json: bool,
+  stats: bool,
+  paths: []string,
+  ok: bool,
+  badFlag: string,
+}
+
+// `a` is the whole argv; `a[1]` is `lint`. An unknown flag is a usage error.
+// Reports nothing itself — the caller owns stderr, so this stays a pure
+// function a self-check can call without polluting a green test run.
+fn parseLintArgs(a: []string): LintArgs {
+  let out = LintArgs{ json: false, stats: false, paths: []string(0), ok: true, badFlag: "" }
+  let i = 2
+  while (i < len(a)) {
+    if (a[i] == "--json") {
+      out.json = true
+    } else if (a[i] == "--stats") {
+      out.stats = true
+    } else if (len(a[i]) > 1 && a[i][0] == '-') {
+      out.ok = false
+      out.badFlag = a[i]
+      return out
+    } else {
+      out.paths = append(out.paths, a[i])
+    }
+    i = i + 1
+  }
+  if (len(out.paths) == 0) {
+    out.paths = append(out.paths, ".")
+  }
+  return out
+}
+
+// Every `.bit` file named by `paths`: a directory is walked recursively, a file
+// is taken as given (lint honours an explicit path even if it is not `.bit`).
+// Returns an empty slice and reports on an unreadable path — exit 2, because a
+// path the user named and lint could not read is a silent hole in the run.
+//
+// Each result records whether it came from a DIRECTORY walk or was named
+// explicitly (`LintFile.swept`, compiler/lintmodule.bit) — E0210's
+// module-scoping (#2284) needs that distinction: naming a directory sweeps in
+// every sibling `.bit` file's usage, naming a file does not, mirroring
+// `loadModuleAt`'s `only` parameter (compiler/project.bit).
+fn collectLintFiles(paths: []string): []LintFile! {
+  let out = []LintFile(0)
+  for p of paths {
+    if (fsIsDir(p)) {
+      let found = walk(p) catch e {
+        eprint("bit lint: ${p}: ${e.message()}\n")
+        fail newError("unreadable path")
+      }
+      for f of found {
+        if (lintHasSuffix(f, ".bit")) {
+          out = append(out, LintFile{ path: f, swept: true })
+        }
+      }
+      continue
+    }
+    if (!fsExists(p)) {
+      eprint("bit lint: ${p}: no such file or directory\n")
+      fail newError("unreadable path")
+    }
+    out = append(out, LintFile{ path: p, swept: false })
+  }
+  return lintSortFiles(out)
+}
+
+fn lintHasSuffix(s: string, suffix: string): bool {
+  if (len(suffix) > len(s)) {
+    return false
+  }
+  return s[len(s) - len(suffix):len(s)] == suffix
+}
+
+// `bit lint [--json] [--stats] [paths...]`. Returns the process exit code:
+// 0 no findings, 1 at least one finding, 2 usage error / unreadable path /
+// malformed directive (§2.1).
+fn lintCmd(a: []string): int {
+  let opts = parseLintArgs(a)
+  if (!opts.ok) {
+    eprint("bit lint: unknown flag '${opts.badFlag}'\n")
+    eprint("usage: bit lint [--json] [--stats] [paths...]\n")
+    return 2
+  }
+  let files = collectLintFiles(opts.paths) catch e {
+    return 2
+  }
+
+  let sm = newSourceManager()
+  // Two sinks, because they have different fates: a directive error is an
+  // error-severity diagnostic that aborts the run with exit 2, while a finding
+  // is a warning that must never bump `errorCount` (diagnostics.bit:93).
+  let errs = newDiagnostics(sm)
+  let findings = newDiagnostics(sm)
+  let overrides = 0
+  // Which files (by SourceManager id) came from a directory walk — #2284's
+  // module-scoping for E0210 only applies to those; a file named explicitly
+  // on argv is its own singleton module, exactly like `loadModuleAt`'s `only`.
+  let sweptFiles = map<int, bool>{}
+  let moduleCache = newLintModuleCache()
+
+  for lf of files {
+    let path = lf.path
+    let src = readFile(path) catch e {
+      eprint("bit lint: ${path}: ${e.message()}\n")
+      return 2
+    }
+    let file = addFile(sm, path, src)
+    if (lf.swept) {
+      sweptFiles[file] = true
+    }
+    let cfg = readLintDirectives(src, file, errs)
+    // Counted over EVERY file walked, not only files with findings (§2.2): the
+    // number exists to make a raised limit visible, and a raised limit is
+    // precisely a file that no longer has a finding.
+    overrides = overrides + lintOverrideCount(cfg)
+    if (hasErrors(errs)) {
+      continue // keep reading the rest, then report every bad directive at once
+    }
+    if (opts.stats) {
+      for note of lintOverrideNotes(cfg) {
+        print("${path}: ${note}\n")
+      }
+      continue
+    }
+    // The phase-1 rules need an AST (§4). A file `bit check` would reject
+    // parses into a recovered tree with holes a rule would read as real nodes
+    // — noise on top of the syntax errors that caused them, the same reason
+    // `checkFile` stops there (compiler/check.bit:1072). So a parse error is
+    // reported through the SAME sink and exit path as a directive error
+    // (§10 open question 2): it already carries an exact span and message,
+    // and a run with one is not asked to compute findings under it either.
+    let tree = parseSourceD(src, file, errs)
+    if (hasErrors(errs)) {
+      continue
+    }
+    runLintRules(src, file, tree, cfg, findings)
+  }
+  // #2284: an import a swept file's sibling uses is genuinely used — drop the
+  // E0210 findings runLintRules computed per-file-in-isolation for those.
+  lintDropModuleUsedImports(findings, moduleCache, sweptFiles)
+
+  // A malformed override or a file that does not parse is reported instead of
+  // findings, not alongside them: either one means the findings for that file
+  // were never computed, so reporting a finding set nobody asked for would be
+  // wrong.
+  if (hasErrors(errs)) {
+    lintSortDiags(errs)
+    if (opts.json) {
+      print(lintRenderJson(errs) + "\n")
+    } else {
+      eprint(renderDiags(errs))
+    }
+    eprint("lint: ${len(errs.list)} errors, ${overrides} overrides active\n")
+    return 2
+  }
+
+  lintSortDiags(findings)
+  let n = len(findings.list)
+  if (opts.json) {
+    print(lintRenderJson(findings) + "\n")
+  } else {
+    eprint(renderDiags(findings))
+  }
+  // Printed on EVERY run, clean ones included, and never suppressible: any
+  // limit can be raised by editing the source, so this count is what keeps that
+  // from happening quietly (§2.2).
+  eprint("lint: ${n} findings, ${overrides} overrides active\n")
+  if (opts.stats) {
+    return 0
+  }
+  if (n > 0) {
+    return 1
+  }
+  return 0
+}
