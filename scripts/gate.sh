@@ -178,15 +178,95 @@ noop_list=""
 # the caller would treat a perfectly ordinary fixture as unmapped, forcing
 # `full`. Prints nothing for any OTHER path that isn't named via `runArgs`;
 # the caller treats that empty result as ambiguous.
+#
+# SEVEN MORE EXCEPTIONS (#2903): six gates register a whole DIRECTORY in
+# `runArgs("tests/bit/<dir>")` rather than a single file, because the
+# directory is one Bit module and the gate runs it as one program — so no
+# path INSIDE that directory can ever match the exact-string grep below, and
+# every file in all six (abimembers, clicmd, rootabi, rootpins, stress,
+# stwwiring) was unmapped, forcing `full`, until this fix. One arm per
+# directory, matching the gate(s) gates.bit actually registers for it — for
+# tests/bit/stress that is the two `test`-reachable split gates
+# (test-stress-exclusive, test-stress-batch; #2564), NOT the redundant
+# unpartitioned `test-stress`, which runs the identical corpus a third time
+# and is deliberately excluded from the `runtime` bucket below for the same
+# reason (gates.bit's comment on `test-stress` is itself stale on this point
+# — it was written before that bucket was changed from `test-stress` to the
+# split pair in cc574965). `assert_dirgates_current`, defined and called
+# right after this function, PROBES this exact function for every
+# directory-target path gates.bit registers, rather than checking gates.bit
+# against a second hardcoded list — a separate list is the same bug this
+# ticket exists to fix, one level up: a maintainer told "add an arm" could
+# instead edit the second list, leaving the real case arm missing and the
+# guard green. Probing means the only way to turn the guard green is to make
+# this function actually resolve the path.
 gates_for_file() {
   case "$1" in
     tests/bit/checkercases/*) printf 'test-checker-diag\n'; return 0 ;;
     tests/bit/parsercases/*) printf 'test-parser\n'; return 0 ;;
     tests/imports/*) printf 'test-imports-bit\n'; return 0 ;;
+    tests/bit/objread/*)
+      # No gate of its own: a shared Mach-O/ELF relocation reader (#2877)
+      # reached only by relative `import { ... } from "../objread"` from two
+      # harnesses. That relationship lives in Bit `import` statements, not in
+      # gates.bit's `runArgs()` text, so it cannot be derived and is named
+      # here by hand — and `assert_dirgates_current` below cannot check it
+      # either, for the same reason: `tests/bit/objread` has no `runArgs()`
+      # entry anywhere in gates.bit, so it never appears in the list that
+      # guard probes.
+      printf 'test-stwwiring\ntest-rootpins\n'
+      return 0
+      ;;
+    tests/bit/abimembers/*) printf 'test-abimembers\n'; return 0 ;;
+    tests/bit/clicmd/*) printf 'test-clicmd\n'; return 0 ;;
+    tests/bit/rootabi/*) printf 'test-rootabi\n'; return 0 ;;
+    tests/bit/rootpins/*) printf 'test-rootpins\n'; return 0 ;;
+    tests/bit/stress/*) printf 'test-stress-exclusive\ntest-stress-batch\n'; return 0 ;;
+    tests/bit/stwwiring/*) printf 'test-stwwiring\n'; return 0 ;;
   esac
   grep -F "runArgs(\"$1\")" tools/build/gates.bit 2>/dev/null |
     sed -n 's/.*Gate{name: "\([^"]*\)".*/\1/p' || true
 }
+
+# Fails loudly, once, on every real invocation — before any file is
+# classified into a bucket, and regardless of whether this diff touches
+# tests/bit/** at all — if gates.bit registers a directory-target gate that
+# gates_for_file() above cannot actually resolve a file inside of (#2903).
+# PROBES THE MAPPER ITSELF: builds the directory list straight from
+# gates.bit (every `runArgs("tests/bit/<dir>")` with no `.bit` suffix, same
+# extraction gates_for_file()'s own case arms are hand-matched against), then
+# calls `gates_for_file "<dir>/probe.bit"` for each and fails if any comes
+# back empty. That is the whole point: nothing here is compared against a
+# second list a maintainer could "fix" by editing the wrong thing. The only
+# way to make this pass is to add a case arm that actually makes
+# gates_for_file() resolve the directory — which is the fix the failure
+# message asks for and the only fix that is possible.
+#
+# tests/bit/objread is out of scope for this loop, correctly and by
+# construction: it has zero `runArgs()` entries anywhere in gates.bit
+# (verified: `grep -n objread tools/build/gates.bit` is empty), so it never
+# appears in `dirs` below. It is a hand-maintained exception inside
+# gates_for_file() (see that case arm above) that no automated check can
+# cover, because the two-harness relationship it encodes lives only in Bit
+# `import` statements, not in gates.bit's text.
+assert_dirgates_current() {
+  local dirs dir probe result
+  dirs="$(grep -oE 'runArgs\("tests/bit/[^"]+"\)' tools/build/gates.bit |
+    sed -E 's/runArgs\("(.*)"\)/\1/' | sort -u)"
+  for dir in ${dirs}; do
+    case "${dir}" in
+      *.bit) continue ;;
+    esac
+    probe="${dir}/probe.bit"
+    result="$(gates_for_file "${probe}")"
+    if [ -z "${result}" ]; then
+      echo "gate: tools/build/gates.bit registers directory-target gate \"${dir}\" but gates_for_file() (scripts/gate.sh) cannot resolve a file inside it (probed \"${probe}\")" >&2
+      echo "gate: add a case arm to gates_for_file() that matches \"${dir}/*\", or files inside it will silently force bucket 'full'" >&2
+      exit 2
+    fi
+  done
+}
+assert_dirgates_current
 
 # Space-joined, de-duplicated union of `gates_for_file` over every path in
 # space-separated `$1`. Prints "" the moment ANY path fails to map to a gate —
