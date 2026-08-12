@@ -557,16 +557,67 @@ fn clearErr(fc: FnCtx) {
   setErr(fc, builderEmit(fc.b, nl))
 }
 
-// `err_get()` — read the pending error right after a fallible call.
+// Whether `errTy`'s runtime error-slot representation needs boxing (#2939):
+// the slot is a single machine word compared against `nil` (`neNil`), which is
+// only a sound "no error" sentinel when every representable `errTy` value is a
+// reachable pointer. That holds for every reference-shaped type (codegen.bit's
+// `isRefType` — `error`/any interface, any struct, a payload-carrying enum) but
+// not for a bare (unboxed) C-like enum: it is a plain tag word, so its
+// discriminant-0 variant IS a representable value and collides with nil.
+// `fail Kind.NotFound` (tag 0, the common first-declared variant) was silently
+// indistinguishable from "no error"; `fail Kind.Invalid` (tag 1) was not.
+fn errNeedsBox(fc: FnCtx, errTy: int): bool {
+  return !isRefType(fc.c.ctx, errTy)
+}
+
+// The type the raw `err_get`/`err_set` slot actually carries for `errTy`:
+// `errTy` itself when already reference-shaped (unchanged from before #2939),
+// or the one-element box cell's type when it needs boxing — always a pointer,
+// so `ConstNil` stays a sound sentinel and the slot's zero word can never
+// collide with a real error, for any current or future value-shaped error type.
+fn errSlotTy(fc: FnCtx, errTy: int): int {
+  if (errNeedsBox(fc, errTy)) {
+    return boxTypeFor(fc, errTy)
+  }
+  return errTy
+}
+
+// Boxes a freshly evaluated `fail`ed value of type `errTy` into the slot
+// representation `errSlotTy` describes, when needed (#2939). The propagate
+// path (`lowerTryExpr`) never calls this: the value it re-publishes came
+// straight out of `getErr` and is already in slot representation.
+fn boxErrForSlot(fc: FnCtx, val: int, errTy: int): int {
+  if (errNeedsBox(fc, errTy)) {
+    return buildTuple(fc, boxTypeFor(fc, errTy), [val])
+  }
+  return val
+}
+
+// Reverses `boxErrForSlot`: the plain `errTy` value out of a slot-representation
+// value (#2939). The one place that needs it is binding a `catch e { … }`
+// binder to the error's own value rather than its slot handle.
+fn unboxErrFromSlot(fc: FnCtx, raw: int, errTy: int): int {
+  if (errNeedsBox(fc, errTy)) {
+    return tupleElem(fc, boxTypeFor(fc, errTy), raw, 0)
+  }
+  return raw
+}
+
+// `err_get()` — read the pending error right after a fallible call. Typed at
+// the SLOT representation (#2939), not always `errTy`, so a boxed bare-enum
+// error's box pointer is tracked as a live GC reference across any call
+// between this read and its use (codegen.bit's `isRefType`-driven stack maps).
 fn getErr(fc: FnCtx, errTy: int): int {
-  let ins = mkInstr(Op.RtCall, errTy)
+  let ins = mkInstr(Op.RtCall, errSlotTy(fc, errTy))
   ins.name = "err_get"
   return emitRtCall(fc, ins)
 }
 
-// `err != nil` — the test that decides the `?`/`catch` error path.
-fn neNil(fc: FnCtx, errv: int, errTy: int): int {
-  let nl = mkInstr(Op.ConstNil, errTy)
+// `err != nil` — the test that decides the `?`/`catch` error path. `errv` and
+// `slotTy` must both already be in slot representation (`errSlotTy`) — see
+// callers.
+fn neNil(fc: FnCtx, errv: int, slotTy: int): int {
+  let nl = mkInstr(Op.ConstNil, slotTy)
   let ne = mkInstr(Op.ICmpNe, primType(fc.c.ctx, 10))
   ne.lhs = errv
   ne.rhs = builderEmit(fc.b, nl)
@@ -588,14 +639,15 @@ fn emitFallibleZeroRet(fc: FnCtx, span: Span) {
   fc.terminated = true
 }
 
-// `fail e` (§18.3): evaluate the error, run defers, publish it, return zero ok.
+// `fail e` (§18.3): evaluate the error, run defers, publish it (boxed into
+// slot representation when `fc.fallibleErr` needs it, #2939), return zero ok.
 fn lowerFail(fc: FnCtx, node: int) {
   let errv = lowerExprH(fc, kidsOf(fc.c.tree, node)[0], fc.fallibleErr)
   if (fc.failed) {
     return
   }
   runDefers(fc)
-  setErr(fc, errv)
+  setErr(fc, boxErrForSlot(fc, errv, fc.fallibleErr))
   emitFallibleZeroRet(fc, getNode(fc.c.tree, node).span)
 }
 
@@ -609,8 +661,10 @@ fn lowerTryExpr(fc: FnCtx, node: int): int {
   if (fc.failed) {
     return 0
   }
+  // `errv` is already in slot representation (boxed when `errTy` needs it,
+  // #2939) — `setErr` below re-publishes it as-is, no reboxing per `?` hop.
   let errv = getErr(fc, errTy)
-  let isErr = neNil(fc, errv, errTy)
+  let isErr = neNil(fc, errv, errSlotTy(fc, errTy))
   let prop = builderNewBlock(fc.b)
   let cont = builderNewBlock(fc.b)
   let br = mkInstr(Op.Br, fc.c.ctx.voidId)
@@ -663,8 +717,10 @@ fn lowerCatch(fc: FnCtx, node: int, bind: bool): int {
   if (fc.failed) {
     return 0
   }
+  // `errv` is in slot representation (boxed when `errTy` needs it, #2939) —
+  // unboxed below, only where a plain `errTy` value is actually needed.
   let errv = getErr(fc, errTy)
-  let isErr = neNil(fc, errv, errTy)
+  let isErr = neNil(fc, errv, errSlotTy(fc, errTy))
   let preLen = len(fc.env)
   let orig = snapshotValues(fc, preLen)
   let errBlk = builderNewBlock(fc.b)
@@ -687,7 +743,7 @@ fn lowerCatch(fc: FnCtx, node: int, bind: bool): int {
   if (bind) {
     let mark = len(fc.env)
     let en = getNode(fc.c.tree, k[1])
-    declareLocal(fc, fc.c.source[en.span.start:en.span.end], errv, errTy)
+    declareLocal(fc, fc.c.source[en.span.start:en.span.end], unboxErrFromSlot(fc, errv, errTy), errTy)
     rebindCheckerName(fc, k[1], errTy)
     let deferBase = deferMark(fc)
     handled = lowerCatchBlock(fc, k[2], okTy)
