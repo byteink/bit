@@ -60,7 +60,7 @@ BUILT_COMMIT="$(git rev-parse HEAD)"
 # --- preflight: confirm both smoke-test images exist BEFORE cross-building ---
 # (#2930). "the artifact is broken" and "the verifier is not provisioned" are
 # opposite conclusions. Without this, a missing image is discovered ~11 minutes
-# in, at the smoke step (:384, :415 below) — and the remote docker daemon's own
+# in, at the smoke step (:424, :455 below) — and the remote docker daemon's own
 # "Unable to find image ... locally" / "pull access denied" lines land in the
 # same log stream three lines above THIS script's failure message, reading as a
 # local defect in the release rather than an unprovisioned verifier. For an
@@ -80,8 +80,8 @@ docker image inspect "${GATE_IMAGE_LOCAL}" >/dev/null 2>&1 || {
 }
 
 # Resolved once, here, deliberately BEFORE the "no x86-64 host reachable" check
-# further down (:394-424) can be reached only after ~11 minutes of building —
-# that refusal is correct but too late to save the time.
+# further down (:434-465), which can be reached only after ~11 minutes of
+# building — that refusal is correct but too late to save the time.
 X64_HOST="$(sh scripts/x64host.sh 2>/dev/null | head -1 || true)"
 if [ -z "${X64_HOST}" ]; then
 	echo "release.sh: no x86-64 host reachable — cannot verify x86_64-linux" >&2
