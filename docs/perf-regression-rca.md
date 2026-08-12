@@ -41,15 +41,44 @@ consequence (compiler speed).
 | compile speed  | 1844 L/s | **287 L/s** |
 | binary size    | 118 KB | 276 KB |
 
-### Finding 1 — codegen regression (proven at subsystem level)
+### Finding 1 — runtime safepoint poll regression (proven at subsystem level; CORRECTED, #2921)
+
+**This finding originally attributed the regression to "loop / arithmetic
+codegen (instruction selection and register allocation)". That attribution is
+disproven — see #2921's engineer comment for the full measurement. Corrected
+here rather than left standing, since this document is what escalated the
+investigation.**
 
 `collatz` and `mandelbrot` **allocate nothing** — by construction they use only
 `i64`/`f64` locals, no `struct`, `slice`, or `append`. Their 4–5× slowdown
-therefore cannot involve the allocator or GC; it is entirely the quality of the
-machine code the compiler emits. `fib`, which is dominated by call overhead rather
-than loop body work, did **not** regress (1.04×). The regression is thus localized
-to **loop / arithmetic codegen** (instruction selection and register allocation),
-not the calling convention.
+therefore cannot involve the allocator or GC. It is also **not** instruction
+selection or register allocation: `@nosplit` on the benchmark function (SPEC
+§10.3.1) suppresses only the back-edge safepoint poll, leaving the same loop
+body, and the emitted loop body's cost is flat — 0.35s / 0.35s / 0.33s
+(`@nosplit collatz`) — across three commits spanning the whole 1470-commit
+range. `fib`, which is dominated by call overhead rather than a loop back edge
+(recursion has no back-edge poll), did **not** regress (1.04×), consistent with
+the loop body itself being unaffected.
+
+The actual regression is the **runtime safepoint poll's callee**. Every loop
+back edge emits an unconditional `bl bit_rt_safepoint` (both then and now); at
+the Zig seed (`182f9c9`) that call was one inlined check (`g_gc.safepoint`).
+Two runtime-only commits grew it into a 5-stack-frame Bit call chain — the
+naked snapshot shim, then `stwSafepoint` → `stwPoll` → `stwPollOn` →
+`currentMutatorOn`/`mutatorSlot` (`runtime/stw/stwpoll.bit`,
+`runtime/gc/gcworldsync.bit`) — three of which are pure argument forwarders
+kept `@symbol`-pinned across a module boundary and so never inlined:
+`09e862a2` (#1429, a real per-thread safepoint frame and STW handshake, 1.64×)
+and `6eaaad83` (#1583/#1584, G2/G3 porting `libbitrt.a` from Zig to Bit,
+2.10×), plus self-hosting adding two more forwarder frames (1.23×). Measured at
+13.3 ns/iteration (~53 cycles) for a fast path whose entire semantic content is
+"no stop pending, no collection due, return" — 83% of `collatz`'s runtime.
+
+Fixed by #2921: an inlined fast-path guard, `bit_rt_safepoint_needed` (a true
+leaf, no calls of its own), checked before the unconditional call — the common
+case is now one leaf call plus a branch, skipping the five-frame chain
+entirely, with the chain still reachable exactly when a stop is pending or a
+collection is due.
 
 Ruled out as the cause:
 - **Missing optimization flag.** `bit build` exposes no `-O` level
