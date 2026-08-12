@@ -193,8 +193,8 @@ the AST. The parser discards them and encodes grouping purely as tree shape
 via precedence, so the formatter cannot "keep the parens the author wrote" —
 there is no author-wrote-parens fact left by the time it runs. Instead it
 **re-derives** parens from a style rule and precedence alone
-(`fmtPrintBinarySide`, `compiler/fmt.bit:663-688`, using `fmtPrec` and
-`fmtIsBitOrShift`, `compiler/fmt.bit:109-136`):
+(`fmtPrintBinarySide`, `compiler/fmtwrap.bit:278-307`, using `fmtPrec`,
+`fmtIsBitOrShift` and `fmtIsBoolConn`, `compiler/fmt.bit:113-151`):
 
 1. **Precedence-required parens** — the ordinary case: a binary operand that
    would silently regroup under the *other* operator's precedence (with
@@ -204,7 +204,13 @@ there is no author-wrote-parens fact left by the time it runs. Instead it
    a *different* operator with a bitwise/shift operator (`&`, `|`, `^`, `<<`,
    `>>`) is always parenthesized, even where precedence alone would make it
    unambiguous. This reproduces `(a & b) ^ (a & c)` from an AST that carries
-   no paren nodes at all.
+   no paren nodes at all. The same rule applies to the boolean connectives:
+   a `&&` operand mixed with a `||` parent (or vice versa) is always
+   parenthesized too (`#2356`), so `a || b && c` formats to
+   `a || (b && c)`. It is scoped to both sides being `&&`/`||` — a
+   comparison leaf next to `||` (`a == b || c`) is unaffected, since
+   precedence alone is already unambiguous there and stripping it was never
+   the complaint.
 
 Rule 2 exists because rule 1 alone strips exactly this shape, and stripping
 it was ruled unacceptable (`#1266`, 2026-07-15): `a & b ^ a & c` is
@@ -219,8 +225,9 @@ sake, only a genuine operator mix at bitwise/shift precedence.
 **Check:** `a & b ^ a & c` (no source parens at all) formats to
 `(a & b) ^ (a & c)`; `a & b & c` (same operator) formats with no added
 parens; `(live * pct) / 100` (same-precedence arithmetic, redundant source
-parens) formats to `live * pct / 100`; re-formatting either output is a
-no-op (idempotent).
+parens) formats to `live * pct / 100`; `typ == 1 || typ == 2 && pass == 0`
+(no source parens) formats to `typ == 1 || (typ == 2 && pass == 0)`;
+re-formatting any of these outputs is a no-op (idempotent).
 
 ## 8. `asm` blocks
 
