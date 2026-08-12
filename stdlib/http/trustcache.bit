@@ -1,0 +1,432 @@
+// Bit standard library — http module: process-wide cache for the default TLS
+// trust store (#2298).
+//
+// systemRoots() parses the OS certificate bundle (X.509 + key material) fresh
+// on every call — ~170ms for the ~128 roots on a typical macOS system, paid
+// by every newClient() and every https:// get()/post()/request(), since those
+// have no long-lived Client to hold a parsed TlsConfig across calls.
+//
+// None of that parsed data can live in ordinary module state: Certificate and
+// TrustStore are reference types (they hold []byte/[]string slices), and a
+// module-level `let` accepts only UNTRACED values — an integer, float, bool,
+// raw pointer, or a fixed array of those (spec Sec 11.11). A struct at module
+// scope is a compile error (E0082: verified against this worktree's `bit
+// check`). A raw pointer at module scope would leave its pointee unrooted —
+// the collector never scans module state — so it can be freed by any
+// collection while the pointer in module state still "points" at it; that is
+// exactly the failure BIT_GC=stress exists to catch, not a corner case.
+//
+// The one storage class module state DOES allow is a fixed-size array of an
+// untraced element type (a `[N]u8` is not a reference — its value IS its own
+// base address, spec Sec 11.11). This file uses that: it flattens the parsed
+// roots into a bounded byte buffer with a hand-written, deterministic
+// encoding (below) and caches THAT. No GC pointer ever crosses into module
+// state, so there is nothing for the collector to invalidate, and the design
+// holds regardless of whether a future collector moves objects.
+//
+// Three correctness questions, answered:
+//
+//   1. Concurrency. Exactly one green thread ever becomes "the builder", via
+//      atomicCmpxchg on trustCacheState (0 -> 1). Every other caller either
+//      reads the finished cache (state == 2) or — if it lost the race and the
+//      builder has not published yet — does its own uncached parse for that
+//      one call; it never touches the shared buffer. The builder writes the
+//      buffer, THEN atomicStore(state, 2); Bit's atomics are sequentially
+//      consistent (spec Sec 11.5, the strongest ordering available), so any
+//      thread that observes state == 2 is guaranteed to see the fully written
+//      buffer, never a partial one.
+//   2. Failure. Only a *successful* systemRoots() parse is ever cached, and
+//      only after its encoding decodes back to itself byte-for-byte — a
+//      self-check on every population, not just in tests (tcTryPublish
+//      below). A parse failure, an oversized store, or a self-check mismatch
+//      resets the state to 0 and changes nothing durable: the next call tries
+//      again. bundled()'s 3-root fallback is NEVER cached, so a transient
+//      system-store read failure cannot permanently downgrade the process to
+//      the small bundle once the real store becomes readable again.
+//   3. Caller-supplied roots. This cache is reached only from
+//      client.bit's defaultRoots()/defaultClientConfig() — the DEFAULT path.
+//      newClientTls, requestTls, getTls, and postTls all take an explicit
+//      TlsConfig and never call defaultRoots() at all, so a caller's own
+//      trust store is never read from or written to this cache.
+
+// Generous headroom over the ~1-1.5MB a typical several-hundred-root system
+// bundle serializes to (each certificate stores its raw DER twice — `raw` and
+// the re-encoded `tbs` — plus every parsed field). A store that does not fit
+// is simply never cached (tcTryPublish returns false); it is never
+// truncated. Zero-valued BSS: a program that never makes an https:// request
+// never writes a byte of it, so it costs address space, not RAM.
+const trustCacheCap: int = 4194304
+
+let trustCacheBuf: [trustCacheCap]u8
+let trustCacheLen: i64 = 0
+let trustCacheState: i64 = 0 // 0 empty, 1 building, 2 ready
+
+// ---------------------------------------------------------------------------
+// Encoding: a flat, order-fixed, length-prefixed binary form of []Certificate.
+// Every field is written and read in the same fixed order, so decoding is
+// encoding's exact inverse — there is no tag, and nothing is optional.
+// ---------------------------------------------------------------------------
+
+fn tcPutU32(buf: []byte, v: int): []byte {
+  buf = append(buf, byte((v >> 24) & 0xff))
+  buf = append(buf, byte((v >> 16) & 0xff))
+  buf = append(buf, byte((v >> 8) & 0xff))
+  buf = append(buf, byte(v & 0xff))
+  return buf
+}
+
+fn tcPutI64(buf: []byte, v: int): []byte {
+  let i = 56
+  while (i >= 0) {
+    buf = append(buf, byte((v >> i) & 0xff))
+    i = i - 8
+  }
+  return buf
+}
+
+fn tcPutBool(buf: []byte, v: bool): []byte {
+  if (v) {
+    return append(buf, byte(1))
+  }
+  return append(buf, byte(0))
+}
+
+fn tcPutBytes(buf: []byte, b: []byte): []byte {
+  buf = tcPutU32(buf, len(b))
+  let i = 0
+  while (i < len(b)) {
+    buf = append(buf, b[i])
+    i = i + 1
+  }
+  return buf
+}
+
+fn tcPutString(buf: []byte, s: string): []byte {
+  return tcPutBytes(buf, []byte(s))
+}
+
+fn tcPutStringList(buf: []byte, list: []string): []byte {
+  buf = tcPutU32(buf, len(list))
+  let i = 0
+  while (i < len(list)) {
+    buf = tcPutString(buf, list[i])
+    i = i + 1
+  }
+  return buf
+}
+
+fn tcPutByteList(buf: []byte, list: [][]byte): []byte {
+  buf = tcPutU32(buf, len(list))
+  let i = 0
+  while (i < len(list)) {
+    buf = tcPutBytes(buf, list[i])
+    i = i + 1
+  }
+  return buf
+}
+
+fn tcEncodeCertificate(buf: []byte, c: Certificate): []byte {
+  buf = tcPutBytes(buf, c.raw)
+  buf = tcPutBytes(buf, c.tbs)
+  buf = tcPutI64(buf, c.version)
+  buf = tcPutBytes(buf, c.serial)
+  buf = tcPutString(buf, c.sigAlgOid)
+  buf = tcPutBytes(buf, c.sigAlgParams)
+  buf = tcPutString(buf, c.issuer)
+  buf = tcPutString(buf, c.subject)
+  buf = tcPutI64(buf, c.notBefore)
+  buf = tcPutI64(buf, c.notAfter)
+  buf = tcPutI64(buf, c.pubKeyAlg)
+  buf = tcPutBytes(buf, c.pubKeyBytes)
+  buf = tcPutString(buf, c.ecCurveOid)
+  buf = tcPutBytes(buf, c.signature)
+  buf = tcPutStringList(buf, c.dnsNames)
+  buf = tcPutByteList(buf, c.ipAddresses)
+  buf = tcPutBool(buf, c.isCa)
+  buf = tcPutBool(buf, c.hasBasicConstraints)
+  buf = tcPutI64(buf, c.maxPathLen)
+  buf = tcPutBool(buf, c.hasPathLen)
+  buf = tcPutI64(buf, c.keyUsage)
+  buf = tcPutBool(buf, c.hasKeyUsage)
+  buf = tcPutStringList(buf, c.extKeyUsageOids)
+  buf = tcPutBool(buf, c.hasExtKeyUsage)
+  buf = tcPutBytes(buf, c.subjectKeyId)
+  buf = tcPutBytes(buf, c.authorityKeyId)
+  buf = tcPutStringList(buf, c.unknownCriticalOids)
+  buf = tcPutBool(buf, c.hasNameConstraints)
+  buf = tcPutBool(buf, c.hasPermittedDns)
+  buf = tcPutStringList(buf, c.permittedDnsNames)
+  buf = tcPutStringList(buf, c.excludedDnsNames)
+  return buf
+}
+
+fn tcEncodeCertificates(roots: []Certificate): []byte {
+  let buf = []byte(0)
+  buf = tcPutU32(buf, len(roots))
+  let i = 0
+  while (i < len(roots)) {
+    buf = tcEncodeCertificate(buf, roots[i])
+    i = i + 1
+  }
+  return buf
+}
+
+// ---------------------------------------------------------------------------
+// Decoding
+// ---------------------------------------------------------------------------
+
+// A mutable read cursor over an already-decoded (heap) buffer copy — never
+// over trustCacheBuf directly, so it carries no module-state reference.
+//
+// The parameter below is named `rd`, not the more obvious `r`: a same-named
+// parameter on an unrelated function was found to corrupt arrow-function
+// parameter type inference elsewhere in this module (stdlib/http/h2.bit:83)
+// — filed as #2947, a checker bug, not something this file can fix. `rd`
+// sidesteps it; verified `bit check stdlib/http` is clean with this name.
+struct tcReader { buf: []byte, pos: int }
+
+fn tcReadU32(rd: tcReader): int! {
+  if (rd.pos + 4 > len(rd.buf)) {
+    fail newError("trustcache: truncated u32")
+  }
+  let v = (int(rd.buf[rd.pos]) << 24) | (int(rd.buf[rd.pos + 1]) << 16) | (int(rd.buf[rd.pos + 2]) << 8) | int(rd.buf[rd.pos + 3])
+  rd.pos = rd.pos + 4
+  return v
+}
+
+fn tcReadI64(rd: tcReader): int! {
+  if (rd.pos + 8 > len(rd.buf)) {
+    fail newError("trustcache: truncated i64")
+  }
+  let v = 0
+  let i = 0
+  while (i < 8) {
+    v = (v << 8) | int(rd.buf[rd.pos + i])
+    i = i + 1
+  }
+  rd.pos = rd.pos + 8
+  return v
+}
+
+fn tcReadBool(rd: tcReader): bool! {
+  if (rd.pos + 1 > len(rd.buf)) {
+    fail newError("trustcache: truncated bool")
+  }
+  let v = rd.buf[rd.pos] != 0
+  rd.pos = rd.pos + 1
+  return v
+}
+
+fn tcReadBytes(rd: tcReader): []byte! {
+  let n = tcReadU32(rd)?
+  if (n < 0 || rd.pos + n > len(rd.buf)) {
+    fail newError("trustcache: truncated bytes")
+  }
+  let out = rd.buf[rd.pos:rd.pos + n]
+  rd.pos = rd.pos + n
+  return out
+}
+
+fn tcReadString(rd: tcReader): string! {
+  return string(tcReadBytes(rd)?)
+}
+
+fn tcReadStringList(rd: tcReader): []string! {
+  let n = tcReadU32(rd)?
+  let out = []string(0)
+  let i = 0
+  while (i < n) {
+    out = append(out, tcReadString(rd)?)
+    i = i + 1
+  }
+  return out
+}
+
+fn tcReadByteList(rd: tcReader): [][]byte! {
+  let n = tcReadU32(rd)?
+  let out = [][]byte(0)
+  let i = 0
+  while (i < n) {
+    out = append(out, tcReadBytes(rd)?)
+    i = i + 1
+  }
+  return out
+}
+
+fn tcDecodeCertificate(rd: tcReader): Certificate! {
+  let raw = tcReadBytes(rd)?
+  let tbs = tcReadBytes(rd)?
+  let version = tcReadI64(rd)?
+  let serial = tcReadBytes(rd)?
+  let sigAlgOid = tcReadString(rd)?
+  let sigAlgParams = tcReadBytes(rd)?
+  let issuer = tcReadString(rd)?
+  let subject = tcReadString(rd)?
+  let notBefore = tcReadI64(rd)?
+  let notAfter = tcReadI64(rd)?
+  let pubKeyAlg = tcReadI64(rd)?
+  let pubKeyBytes = tcReadBytes(rd)?
+  let ecCurveOid = tcReadString(rd)?
+  let signature = tcReadBytes(rd)?
+  let dnsNames = tcReadStringList(rd)?
+  let ipAddresses = tcReadByteList(rd)?
+  let isCa = tcReadBool(rd)?
+  let hasBasicConstraints = tcReadBool(rd)?
+  let maxPathLen = tcReadI64(rd)?
+  let hasPathLen = tcReadBool(rd)?
+  let keyUsage = tcReadI64(rd)?
+  let hasKeyUsage = tcReadBool(rd)?
+  let extKeyUsageOids = tcReadStringList(rd)?
+  let hasExtKeyUsage = tcReadBool(rd)?
+  let subjectKeyId = tcReadBytes(rd)?
+  let authorityKeyId = tcReadBytes(rd)?
+  let unknownCriticalOids = tcReadStringList(rd)?
+  let hasNameConstraints = tcReadBool(rd)?
+  let hasPermittedDns = tcReadBool(rd)?
+  let permittedDnsNames = tcReadStringList(rd)?
+  let excludedDnsNames = tcReadStringList(rd)?
+  return Certificate{
+    raw: raw,
+    tbs: tbs,
+    version: version,
+    serial: serial,
+    sigAlgOid: sigAlgOid,
+    sigAlgParams: sigAlgParams,
+    issuer: issuer,
+    subject: subject,
+    notBefore: notBefore,
+    notAfter: notAfter,
+    pubKeyAlg: pubKeyAlg,
+    pubKeyBytes: pubKeyBytes,
+    ecCurveOid: ecCurveOid,
+    signature: signature,
+    dnsNames: dnsNames,
+    ipAddresses: ipAddresses,
+    isCa: isCa,
+    hasBasicConstraints: hasBasicConstraints,
+    maxPathLen: maxPathLen,
+    hasPathLen: hasPathLen,
+    keyUsage: keyUsage,
+    hasKeyUsage: hasKeyUsage,
+    extKeyUsageOids: extKeyUsageOids,
+    hasExtKeyUsage: hasExtKeyUsage,
+    subjectKeyId: subjectKeyId,
+    authorityKeyId: authorityKeyId,
+    unknownCriticalOids: unknownCriticalOids,
+    hasNameConstraints: hasNameConstraints,
+    hasPermittedDns: hasPermittedDns,
+    permittedDnsNames: permittedDnsNames,
+    excludedDnsNames: excludedDnsNames,
+  }
+}
+
+fn tcDecodeCertificates(buf: []byte): []Certificate! {
+  let rd = tcReader{ buf: buf, pos: 0 }
+  let n = tcReadU32(rd)?
+  let out = []Certificate(0)
+  let i = 0
+  while (i < n) {
+    out = append(out, tcDecodeCertificate(rd)?)
+    i = i + 1
+  }
+  if (rd.pos != len(buf)) {
+    fail newError("trustcache: trailing bytes after decode")
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// The cache itself
+// ---------------------------------------------------------------------------
+
+fn tcBytesEqual(a: []byte, b: []byte): bool {
+  if (len(a) != len(b)) {
+    return false
+  }
+  let i = 0
+  while (i < len(a)) {
+    if (a[i] != b[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Attempt to publish `roots` as the process-wide default trust-store cache.
+// Only ever called by the CAS winner (see defaultTrustRoots below), so there
+// is exactly one writer for the whole process. Encodes, self-checks the round
+// trip by decoding and re-encoding, and only THEN copies into the fixed
+// buffer and flips the ready flag — any failure along the way leaves the
+// buffer and length untouched; the caller resets state back to 0 so a later
+// call gets to try again.
+fn tcTryPublish(roots: []Certificate): bool {
+  let encoded = tcEncodeCertificates(roots)
+  if (len(encoded) > trustCacheCap) {
+    return false
+  }
+  let decoded = tcDecodeCertificates(encoded) catch e {
+    []Certificate(0)
+  }
+  if (len(decoded) == 0 && len(roots) != 0) {
+    return false
+  }
+  let reencoded = tcEncodeCertificates(decoded)
+  if (!tcBytesEqual(encoded, reencoded)) {
+    return false
+  }
+  let i = 0
+  while (i < len(encoded)) {
+    trustCacheBuf[i] = encoded[i]
+    i = i + 1
+  }
+  trustCacheLen = i64(len(encoded))
+  atomicStore(ptrOf(trustCacheState), 2)
+  return true
+}
+
+// The cached roots, valid only once trustCacheState == 2 (the caller checks
+// via atomicLoad before calling this).
+fn tcRead(): []Certificate! {
+  let n = int(trustCacheLen)
+  let out = []byte(n)
+  let i = 0
+  while (i < n) {
+    out[i] = trustCacheBuf[i]
+    i = i + 1
+  }
+  return tcDecodeCertificates(out)?
+}
+
+fn tcUncachedRoots(): []Certificate {
+  let sys = systemRoots() catch e {
+    return bundled().roots
+  }
+  return sys.roots
+}
+
+// The default trust anchors: served from the process-wide cache once
+// populated, else a fresh parse — which also makes exactly one attempt to
+// become the cache's builder. See the file header for the full
+// concurrency/failure argument.
+fn defaultTrustRoots(): []Certificate {
+  if (atomicLoad(ptrOf(trustCacheState)) == 2) {
+    let cached = tcRead() catch e {
+      return tcUncachedRoots()
+    }
+    return cached
+  }
+  if (atomicCmpxchg(ptrOf(trustCacheState), 0, 1)) {
+    let sys = systemRoots() catch e {
+      atomicStore(ptrOf(trustCacheState), 0)
+      return bundled().roots
+    }
+    if (!tcTryPublish(sys.roots)) {
+      atomicStore(ptrOf(trustCacheState), 0)
+    }
+    return sys.roots
+  }
+  // Another green thread is mid-build and has not published yet: do an
+  // independent, uncached parse for this one call rather than spin-waiting.
+  return tcUncachedRoots()
+}
