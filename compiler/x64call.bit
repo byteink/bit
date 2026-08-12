@@ -343,8 +343,15 @@ fn xIsBoolTy(ctx: TypeContext, ty: int): bool {
 
 // A direct `call`/`rt_call`: marshal, call, record the safepoint, reclaim, then
 // take the result. `hasRet` is false for a void callee (Bit has no optionals).
+// `isSafepoint` is false only for the back-edge poll-needed guard
+// (xEmitBackEdgeSafepointIfNeeded, #2926): that call never allocates and never
+// parks, so it can never be the frame a stopped world needs to scan, and
+// recording it would desync `nextSafepointIdx` from `built.safepoints`, which
+// has exactly one entry per back edge regardless of how many machine calls
+// this emits (compiler/codegen.bit buildIntervals). Every other caller passes
+// true, unchanged from before #2926.
 fn xEmitCallLike(cx: XCtx, symbol: string, args: []int, hasRet: bool, dst: int,
-    retTy: int) {
+    retTy: int, isSafepoint: bool) {
   let argReserve = xMarshalArgs(cx, args, 0, 0, 0)
   // Win64's 32-byte home space is reserved around just this call site rather than
   // baked into the frame: every other stack slot codegen touches is rbp-relative,
@@ -358,7 +365,9 @@ fn xEmitCallLike(cx: XCtx, symbol: string, args: []int, hasRet: bool, dst: int,
   // outgoing-arg teardown. Recording it after an `add rsp` pushes it past the
   // real return address and corrupts every stack-map lookup during a GC the
   // callee triggers.
-  xRecordSafepoint(cx)
+  if (isSafepoint) {
+    xRecordSafepoint(cx)
+  }
   if (cx.cc == XCallConv.Win64) {
     xRspAddSub(cx.buf, false, 32)
   }
@@ -535,12 +544,32 @@ fn xBindIncomingArgs(cx: XCtx) {
   xSequentializeAndEmit(cx, floatMoves, RegClass.Float)
 }
 
+// #2921 (arm64) / #2926 (x64): the naked shim's full chain (five stack frames,
+// see runtime/stw/stwpoll.bit) is only needed when a stop is pending or a
+// collection is due — both rare. Guard it behind `bit_rt_safepoint_needed`, a
+// true leaf with no frame of its own: call it, and skip the real poll when it
+// returns false (0 in rax). Mirrors compiler/arm64call.bit's
+// emitBackEdgeSafepointIfNeeded exactly, including the safepoint bookkeeping:
+// the guard call passes isSafepoint=false to xEmitCallLike and only the real
+// poll advances nextSafepointIdx — buildIntervals (compiler/codegen.bit)
+// records exactly one safepoint position per back edge, independent of how
+// many machine calls this emits.
+fn xEmitBackEdgeSafepointIfNeeded(cx: XCtx, curBlock: int, target: int) {
+  // §10.3.1: a @naked/@nosplit function polls no safepoint on its back-edges.
+  if (!isBackEdge(curBlock, target) || needsNoSafepoints(cx.f)) {
+    return
+  }
+  xEmitCallLike(cx, safepointNeededSymbol(), []int(0), false, 0, 0, false)
+  xTestRR(cx.buf, XReg64.Rax, XReg64.Rax)
+  let skipOff = xJccRel32Placeholder(cx, ccE()) // not needed -> skip the real poll
+  xEmitCallLike(cx, safepointSymbol(), []int(0), false, 0, 0, true)
+  xPatchRel32Here(cx, skipOff)
+}
+
 // A back-edge polls the collector BEFORE the edge moves: the poll is a call, and
 // the moves may leave a param mid-write.
 fn xEmitJump(cx: XCtx, target: int, args: []int) {
-  if (isBackEdge(cx.curBlock, target) && !needsNoSafepoints(cx.f)) {
-    xEmitCallLike(cx, safepointSymbol(), []int(0), false, 0, 0)
-  }
+  xEmitBackEdgeSafepointIfNeeded(cx, cx.curBlock, target)
   xEmitParamMoves(cx, target, args)
   xJmpRel32(cx, target)
 }
@@ -553,15 +582,11 @@ fn xEmitBr(cx: XCtx, cond: int, thenBlk: int, thenArgs: []int, elseBlk: int,
   // on their own side of this branch — emitting them before it would run the
   // then-edge's moves on the else path too.
   let skipOff = xJccRel32Placeholder(cx, ccE())
-  if (isBackEdge(cx.curBlock, thenBlk) && !needsNoSafepoints(cx.f)) {
-    xEmitCallLike(cx, safepointSymbol(), []int(0), false, 0, 0)
-  }
+  xEmitBackEdgeSafepointIfNeeded(cx, cx.curBlock, thenBlk)
   xEmitParamMoves(cx, thenBlk, thenArgs)
   xJmpRel32(cx, thenBlk)
   xPatchRel32Here(cx, skipOff)
-  if (isBackEdge(cx.curBlock, elseBlk) && !needsNoSafepoints(cx.f)) {
-    xEmitCallLike(cx, safepointSymbol(), []int(0), false, 0, 0)
-  }
+  xEmitBackEdgeSafepointIfNeeded(cx, cx.curBlock, elseBlk)
   xEmitParamMoves(cx, elseBlk, elseArgs)
   xJmpRel32(cx, elseBlk)
 }
