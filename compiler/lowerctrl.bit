@@ -407,6 +407,30 @@ fn lowerBinding(fc: FnCtx, node: int) {
   rebindCheckerName(fc, kids[0], declared)
 }
 
+// Captures one deferred call's operand as a hidden env local so a loop entered
+// between the `defer` statement and its replay threads it through the header
+// like any other live local (#2078) — `runDefers` reads the CURRENT value back
+// out of this slot rather than the value id captured here, which a loop's
+// back edge may have left outside the loop it now needs to be read inside
+// (compiler/verify.bit). Named "$defer": SPEC identifiers never start with
+// `$` (compiler/lexer.bit's isIdentStart), so this can never collide with a
+// source local — the same idiom `lowerForOf`'s "$iter"/"$idx" already use.
+fn deferSlot(fc: FnCtx, value: int): int {
+  declareLocal(fc, "$defer", value, fc.b.instrs[value].ty)
+  return len(fc.env) - 1
+}
+
+// `deferSlot` over a whole argument list, in order.
+fn deferSlots(fc: FnCtx, values: []int): []int {
+  let slots = []int(0)
+  let i = 0
+  while (i < len(values)) {
+    slots = append(slots, deferSlot(fc, values[i]))
+    i = i + 1
+  }
+  return slots
+}
+
 // A `defer <call>`: the call's arguments are evaluated now (lowered at the defer
 // site), but the call itself is emitted at every function exit, in reverse
 // (LIFO) order. Only print/direct-function-call deferrals for now.
@@ -442,10 +466,9 @@ fn lowerDefer(fc: FnCtx, node: int) {
     let mi = mkInstr(Op.Call, fc.c.ctx.voidId)
     if (fc.c.ctx.types[recvTy].kind == TypeKind.Interface) {
       mi = mkInstr(Op.CallIface, fc.c.ctx.voidId)
-      mi.lhs = recvV
       mi.ival = methodId(fc.lowerer, mname)
-      mi.args = a
-      fc.defers = append(fc.defers, mi)
+      let lhsSlot = deferSlot(fc, recvV)
+      fc.defers = append(fc.defers, DeferCall{ instr: mi, argSlots: deferSlots(fc, a), lhsSlot: lhsSlot })
       return
     }
     // A concrete receiver leads the argument list, as in a direct method call.
@@ -456,8 +479,7 @@ fn lowerDefer(fc: FnCtx, node: int) {
       j = j + 1
     }
     mi.name = methodSymbol(fc.lowerer, mname, recvTy)
-    mi.args = all
-    fc.defers = append(fc.defers, mi)
+    fc.defers = append(fc.defers, DeferCall{ instr: mi, argSlots: deferSlots(fc, all), lhsSlot: -1 })
     return
   }
   if (cn.tag != Tag.Ident) {
@@ -466,9 +488,10 @@ fn lowerDefer(fc: FnCtx, node: int) {
   }
   let name = fc.c.source[cn.span.start:cn.span.end]
   let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+  let a = []int(0)
   if (name == "print" || name == "eprint") {
     ins.name = name
-    ins.args = lowerArgs(fc, call, []int(0))
+    a = lowerArgs(fc, call, []int(0))
   } else {
     // The same resolution a direct call gets — module qualification AND generic
     // instantiation. Deriving the name from source text here emitted a bare `g`
@@ -480,19 +503,40 @@ fn lowerDefer(fc: FnCtx, node: int) {
     }
     ins = mkInstr(Op.Call, t.result)
     ins.name = t.symbol
-    ins.args = lowerArgsFor(fc, call, t.owner, t.decl, t.paramTypes)
+    a = lowerArgsFor(fc, call, t.owner, t.decl, t.paramTypes)
   }
   if (fc.failed) {
     return
   }
-  fc.defers = append(fc.defers, ins)
+  fc.defers = append(fc.defers, DeferCall{ instr: ins, argSlots: deferSlots(fc, a), lhsSlot: -1 })
 }
 
 // Emits the pending deferred calls in reverse (LIFO) order at a function exit.
+// Builds a FRESH IrInstr each replay from its captured env slots' CURRENT
+// value, rather than reusing the ids baked in when it was lowered (DeferCall) —
+// `IrInstr` is a reference type here, so mutating `dc.instr` in place would
+// retroactively corrupt every earlier exit's already-emitted copy of the same
+// object (#2078: two exits from one `defer` shared one instruction, and the
+// second exit's operands silently overwrote the first's).
 fn runDefers(fc: FnCtx) {
   let i = len(fc.defers) - 1
   while (i >= 0) {
-    builderEmit(fc.b, fc.defers[i])
+    let dc = fc.defers[i]
+    let t = dc.instr
+    let lhs = t.lhs
+    if (dc.lhsSlot >= 0) {
+      lhs = fc.env[dc.lhsSlot].value
+    }
+    let args = []int(0)
+    let j = 0
+    while (j < len(dc.argSlots)) {
+      args = append(args, fc.env[dc.argSlots[j]].value)
+      j = j + 1
+    }
+    let ins = IrInstr{ op: t.op, ty: t.ty, args: args, lhs: lhs, rhs: t.rhs,
+      ival: t.ival, ival2: t.ival2, fval: t.fval, bval: t.bval, sval: t.sval,
+      name: t.name, offsets: t.offsets, thenArgs: t.thenArgs, elseArgs: t.elseArgs }
+    builderEmit(fc.b, ins)
     i = i - 1
   }
 }
