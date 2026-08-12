@@ -45,10 +45,16 @@ a tag stored there, so the size is also the alignment unit and a stack cannot be
 larger than it. Raising or growing it is a change to how task identity works,
 not a constant edit.
 
-**Exceeding it is currently an undiagnosed crash.** The process dies with
-SIGSEGV - exit code 139 - and prints nothing at all on stdout or stderr. `bit
-run` reports `was killed by SIGSEGV (11)`; a built binary you ship says nothing.
-There is no environment variable or flag that changes the limit.
+**Exceeding it is now usually a diagnosed crash (#2246).** The runtime installs
+a SIGSEGV/SIGBUS handler that recognizes a fault immediately below a stack's
+base and exits 2 with `bit: stack overflow` (on `main`) or
+`bit: stack overflow in a spawned task` (inside `spawn`), on stderr, from a
+built binary as well as `bit run`. It is not guaranteed: the guard page below
+a stack is a variable width (tracked separately as #2433), so a deep enough
+single frame can occasionally corrupt the task's own bookkeeping before
+reaching it, which surfaces as a raw `SIGTRAP`/`SIGILL` instead - still no
+message, though attributable from a crash report by program counter. There is
+no environment variable or flag that changes the limit.
 
 ```bit
 fn down(n: int): int {
@@ -68,10 +74,10 @@ comment thread, a directory listing, a nested JSON document) is running on 64
 KiB, and roughly 1,300 frames is within reach of merely deep, not even hostile,
 input.
 
-Until that is fixed, write recursion that runs inside `spawn` with an explicit
-depth bound and reject input past it, or convert the walk to an explicit
-heap-allocated worklist. Both the missing growth and the missing diagnostic are
-tracked as **#2246**; nothing in this section is settled design.
+Until the stack grows on demand, write recursion that runs inside `spawn` with
+an explicit depth bound and reject input past it, or convert the walk to an
+explicit heap-allocated worklist. The fixed size itself is tracked as
+**#2613**; nothing in this section is settled design.
 
 ## Channels
 

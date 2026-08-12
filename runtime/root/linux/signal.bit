@@ -24,9 +24,11 @@
 // member until #1369, exactly like the write path.
 
 // `nr` (per-arch syscall selector via `hostTarget()`) is defined in ./io.bit and
-// `storeWord` is imported from ../../gc by ./os.bit; both are module-scoped
-// (siblings are one module), so they are reused here, not re-declared — a
-// redeclaration is E0042.
+// `storeWord`/`loadWord` are imported from ../../gc by ./os.bit; all are
+// module-scoped (siblings are one module), so they are reused here, not
+// re-declared — a redeclaration is E0042.
+
+import { onX64, sysSigaltstack } from "../../syscalls"
 
 // `rt_sigaction` (the per-arch syscall tables): 13 on x86_64, 134 on aarch64.
 // `rt_sigaction`, NOT the legacy `sigaction`: the kernel's real-time variant is
@@ -86,4 +88,209 @@ export @nosplit @symbol("bit_rt_ignore_sigpipe") fn ignoreSigpipe(): int {
   }
   storeWord(base, sigIgn)
   return int(syscall(sysRtSigaction(), i64(sigPipe), i64(base), i64(0), i64(sigSetSize)))
+}
+
+// ---------------------------------------------------------------------------
+// #2246: a diagnosable SIGSEGV/SIGBUS instead of a silent exit 139
+// ---------------------------------------------------------------------------
+//
+// KEPT FUNCTION-FOR-FUNCTION WITH ../darwin/signal.bit — see its header for
+// the two defects #2246 named and why this is only the second one (the
+// undiagnosed death, not the stack's fixed size, which is #2613's). The
+// differences here are exactly the ones the rest of this file already has:
+// raw `syscall`s instead of libSystem `extern function` calls, and the
+// kernel's struct layouts instead of Darwin's.
+
+// SIGSEGV = 11, SIGBUS = 7 on every non-MIPS/non-SPARC Linux ABI, x86_64 and
+// aarch64 included (include/uapi/asm-generic/signal.h, and confirmed neither
+// arch's own asm/signal.h overrides it) — NOT Darwin's SIGBUS (10,
+// ../darwin/signal.bit): the two are unrelated historical-Unix numberings
+// that happen to share SIGPIPE's number and nothing else nearby.
+const sigSegv: int = 11
+const sigBus: int = 7
+
+// SA_SIGINFO = 0x4, SA_ONSTACK = 0x08000000 (`include/uapi/asm-generic/
+// signal-defs.h`, included by both x86_64's and aarch64's `asm/signal.h`
+// unchanged — verified, not from memory). SA_SIGINFO selects the
+// three-argument `void (*)(int, siginfo_t *, void *)` handler form
+// `segvHandler` below is written to. SA_ONSTACK runs it on the alternate
+// stack `installAltStackForThisWorker` installs below — REQUIRED, not
+// optional: the fault this exists to catch is, most often, a green thread's
+// OWN stack having just run out, and a handler sharing that stack would fault
+// again before writing a single byte.
+const saSiginfo: int = 4
+const saOnstack: int = 134217728
+
+// `sigaltstack(2)`'s `stack_t` — `{ void *ss_sp; int ss_flags; size_t
+// ss_size; }`, 24 bytes. THE FIELD ORDER IS LINUX'S OWN: Darwin puts
+// `ss_size` second and `ss_flags` last (../darwin/signal.bit). Verified with
+// a cross-compiled `offsetof` against this kernel's own
+// `include/uapi/asm-generic/signal.h`, identical on x86_64 and aarch64, not
+// from memory. `installAltStackForThisWorker` below writes it directly (three
+// `storeWord`s, 24 bytes), so there is no separate word-count const to keep
+// in sync with the field layout comment.
+
+// `siginfo_t.si_addr` — the faulting address SA_SIGINFO hands the handler,
+// `segvHandler`'s second argument. Verified with a cross-compiled `offsetof`
+// against glibc's `<signal.h>`, identical on x86_64 and aarch64: offset 16,
+// `sizeof(siginfo_t)` = 128. This is the layout the KERNEL constructs on the
+// signal stack — glibc's typedef exists to match it exactly, which is what a
+// raw `rt_sigaction` handler (this file's whole reason to exist, see the
+// header) actually receives.
+const siAddrOffset: int = 16
+
+// The saved stack pointer inside the `ucontext_t` SA_SIGINFO hands the
+// handler as its third argument, unlike Darwin's `ucontext_t`
+// (../darwin/signal.bit) this is INLINE, not a second pointer to follow.
+// Verified with a cross-compiled `offsetof(ucontext_t, uc_mcontext.gregs[
+// REG_RSP])` / `offsetof(ucontext_t, uc_mcontext.sp)` against glibc's
+// `sys/ucontext.h` for each arch — NOT from memory, and the two differ enough
+// that guessing one from the other would be wrong: x86_64's `uc_mcontext` is
+// INLINE at offset 40 with `gregs[REG_RSP=15]` at 15*8=120 more (160 total);
+// aarch64's `sigcontext`-shaped `uc_mcontext` is 16-byte-aligned, which
+// inserts 8 bytes of padding the naive sum misses (176, not 168) before
+// `fault_address(8) + regs[31](248)` = 256 more (432 total).
+@nosplit fn ucontextSpOffset(): int {
+  if (onX64()) { return 160 }
+  return 432
+}
+
+// One alternate signal stack per worker OS thread, 64 KiB — comfortably above
+// `MINSIGSTKSZ` (2048 on x86_64, 5120 on aarch64 per each arch's own
+// `asm/signal.h`) and a round number matching the granule this runtime
+// already reasons in. `boot` maps `nworkers * sigAltStackBytes` once, before
+// any worker starts (`sigAltStackBase`, ./boot.bit); each worker OS thread
+// claims one slice for itself below, because `sigaltstack` is per-THREAD, not
+// per-process — two workers sharing one alternate stack would corrupt each
+// other's crash message if they ever overflowed at the same instant.
+const sigAltStackBytes: int = 65536
+
+// `installAltStackForThisWorker`'s claim table: 0 = free, 1 = claimed, sized
+// for `bootMaxWorkers` (../boot.bit) and never released — workers do not exit
+// before process teardown. Same claim-then-use shape as
+// `../../thread/linux/spawn.bit`'s per-slot claim: an atomic CAS per slot,
+// bounded, first-free wins.
+let sigAltStackClaimed: [32]i64
+
+// Per-slot scratch for the `stack_t` `sigaltstack` argument, three words per
+// worker (24 bytes) — NOT the shared `sigActBuf` module scratch that buffer's
+// own doc documents as single-writer, because MULTIPLE worker OS threads call
+// `installAltStackForThisWorker` concurrently at startup, and a shared buffer
+// would race. Each worker writes only its own `[claimedIndex*3,
+// claimedIndex*3+3)` slice, which no other worker's claimed index can ever
+// overlap.
+let sigAltStackScratch: [96]i64
+
+// The kernel `struct sigaction` buffer `installSegvHandlers` builds — same
+// 4-word shape `sigActBuf` uses (see its comment above), a separate buffer
+// because both are written once each, from `boot`, before any worker thread
+// exists.
+let segvActBuf: [4]i64
+
+// Claim a slot from the pool above and install THIS OS thread's slice of
+// `sigAltStackBase` as its alternate signal stack. A no-op if `boot` never
+// mapped one (`sigAltStackBase == 0` — a setup failure `boot` already treats
+// as fatal, so this is defensive, not an expected path) or if the pool is
+// exhausted (cannot happen: `boot` never starts more than `bootMaxWorkers`
+// workers, ../boot.bit). Call once, from the very top of `workerBody`, before
+// any task can run on this thread.
+@nosplit fn installAltStackForThisWorker() {
+  if (sigAltStackBase == 0) {
+    return
+  }
+  let tbl: *i64 = ptrOf(sigAltStackClaimed)
+  let scratch = int(ptrOf(sigAltStackScratch))
+  let i = 0
+  while (i < bootMaxWorkers) {
+    if (atomicCmpxchg(tbl + i, 0, 1)) {
+      let sp = scratch + i * 24
+      storeWord(sp, sigAltStackBase + i * sigAltStackBytes)
+      storeWord(sp + 8, 0)
+      storeWord(sp + 16, sigAltStackBytes)
+      syscall(sysSigaltstack(), i64(sp), i64(0))
+      return
+    }
+    i = i + 1
+  }
+}
+
+// The alternate-stack SIGSEGV/SIGBUS handler. See ../darwin/signal.bit's
+// `segvHandler` for the full reasoning (why `@nosplit`, the attribution and
+// its one direction of possible error, and why an unattributed fault gets a
+// plain message and a clean exit rather than a pass-through to the OS
+// default) — identical here except for the platform offsets above.
+@nosplit fn segvHandler(sig: i32, info: *u8, ctx: *u8) {
+  let faultAddr = loadWord(int(info) + siAddrOffset)
+  let sp = loadWord(int(ctx) + ucontextSpOffset())
+
+  let fromFault = alignUpStack(faultAddr)
+  let fromSp = alignUpStack(sp)
+  // The floor rules out a degenerate near-zero reading (e.g. both inputs
+  // landing on unmapped/zeroed memory) agreeing with itself; every real stack
+  // mapping on this platform sits far above it.
+  if (fromFault == fromSp && fromFault > 268435456) {
+    if (fromFault == mainStackBaseAddr) {
+      emitMainStackOverflow()
+    } else {
+      emitSpawnedStackOverflow()
+    }
+    return
+  }
+  emitFatalSignal(int(sig))
+}
+
+// "bit: stack overflow\n" — packed constants, computed not hand-derived, the
+// same technique every alloc-free panic message in ./io.bit uses.
+@nosplit fn emitMainStackOverflow() {
+  writeConst(stderrFd, 7022364301234301282, 8) // "bit: sta"
+  writeConst(stderrFd, 7382074298558606179, 8) // "ck overf"
+  writeConst(stderrFd, 175599468, 4)           // "low\n"
+  rootExit(2)
+}
+
+// "bit: stack overflow in a spawned task\n"
+@nosplit fn emitSpawnedStackOverflow() {
+  writeConst(stderrFd, 7022364301234301282, 8) // "bit: sta"
+  writeConst(stderrFd, 7382074298558606179, 8) // "ck overf"
+  writeConst(stderrFd, 6998715218729070444, 8) // "low in a"
+  writeConst(stderrFd, 7234309835455492896, 8) // " spawned"
+  writeConst(stderrFd, 11456613544992, 6)      // " task\n"
+  rootExit(2)
+}
+
+// "bit: fatal signal: segmentation fault\n" / "bit: fatal signal: bus error\n"
+// — the honest fallback when the fault cannot be placed on a stack boundary.
+@nosplit fn emitFatalSignal(sig: int) {
+  writeConst(stderrFd, 8386096269746268514, 8) // "bit: fat"
+  writeConst(stderrFd, 7020662571717913697, 8) // "al signa"
+  if (sig == sigSegv) {
+    writeConst(stderrFd, 7308611455713032812, 8) // "l: segme"
+    writeConst(stderrFd, 2336927755366659182, 8) // "ntation "
+    writeConst(stderrFd, 11495152116070, 6)      // "fault\n"
+  } else {
+    writeConst(stderrFd, 7286951145080109676, 8) // "l: bus e"
+    writeConst(stderrFd, 44869579378, 5)         // "rror\n"
+  }
+  rootExit(2)
+}
+
+// Register `segvHandler` for SIGSEGV and SIGBUS, process-wide, SA_SIGINFO |
+// SA_ONSTACK. Same 4-word kernel `struct sigaction` shape `ignoreSigpipe`
+// builds, in a separate buffer (`segvActBuf`) written once, from `boot`,
+// before any worker thread exists — call this before step 6 starts any
+// worker, so the disposition is live before the first task can run.
+//
+// `restorer` (word 2) IS LEFT NULL, deliberately, unlike a libc `sigaction`
+// call, which always sets one. A restorer is only ever consulted when a
+// handler RETURNS, to invoke `rt_sigreturn` — `segvHandler` never returns
+// (every path ends in `rootExit`, see its own comment), so there is nothing
+// for a restorer to do here. SA_RESTORER is correspondingly left OFF `flags`.
+@nosplit fn installSegvHandlers() {
+  let base = int(ptrOf(segvActBuf))
+  storeWord(base, int(entryOf(segvHandler)))
+  storeWord(base + 8, i64(saSiginfo | saOnstack))
+  storeWord(base + 16, 0)
+  storeWord(base + 24, 0)
+  syscall(sysRtSigaction(), i64(sigSegv), i64(base), i64(0), i64(sigSetSize))
+  syscall(sysRtSigaction(), i64(sigBus), i64(base), i64(0), i64(sigSetSize))
 }

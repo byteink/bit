@@ -77,3 +77,254 @@ export @nosplit @symbol("bit_rt_ignore_sigpipe") fn ignoreSigpipe(): int {
   let nilp: *u8 = nil
   return int(sigaction(i32(sigPipe), nilp + base, nilp))
 }
+
+// ---------------------------------------------------------------------------
+// #2246: a diagnosable SIGSEGV/SIGBUS instead of a silent exit 139
+// ---------------------------------------------------------------------------
+//
+// `mapGuardedStack` (../boot.bit) already turns a stack overflow into a real
+// hardware fault instead of silent corruption (#1843). What was still missing
+// is the OTHER half: nothing in this runtime installs a disposition for
+// SIGSEGV or SIGBUS, so that fault reaches the process default and a user
+// gets exit 139 with NOTHING on either stream — measured on a built binary,
+// not just `bit run`, which at least prints "killed by SIGSEGV" itself.
+//
+// THE TWO DEFECTS #2246 NAMED, AND WHICH ONE THIS IS. (1) a green thread's
+// stack is fixed and ~128x smaller than main's — that is `schedStackBytes`
+// (../../sched/sched.bit) and #2613's to raise; not touched here. (2) the
+// death is undiagnosed — this section, in full.
+//
+// WHY THIS CANNOT PROMISE THE FAULT REACHES ITS HANDLER AT ALL, ONLY THAT
+// WHEN IT DOES THE MESSAGE IS HONEST. `mapGuardedStack`'s guard hole is a
+// VARIABLE width (#2433 — `base - region`, whatever the allocator's alignment
+// carve happens to leave), so a frame larger than the hole can step clean
+// past it into unrelated memory before anything faults. That is #2433's
+// defect, not this one's, and fixing it would make the attribution below
+// MORE reliable, not required for it to be honest today.
+//
+// THE ALTERNATE STACK IS NOT OPTIONAL. The fault this exists to catch is,
+// most often, exactly a green thread's OWN 64 KiB stack running out — so the
+// handler cannot run on the stack that just overflowed; SA_ONSTACK plus a
+// per-OS-thread `sigaltstack` (below) is the only way a handler can reliably
+// get CPU time after that.
+
+// SIGSEGV = 11, SIGBUS = 10 (`<sys/signal.h>`). Darwin's SIGBUS number is NOT
+// Linux's (7, ../linux/signal.bit) — the two are BSD- and historical-Unix-
+// derived respectively and diverge here, unlike SIGPIPE (13 on both).
+const sigSegv: int = 11
+const sigBus: int = 10
+
+// SA_SIGINFO = 0x40, SA_ONSTACK = 0x1 (`<sys/signal.h>`). SA_SIGINFO selects
+// the three-argument `void (*)(int, siginfo_t *, void *)` handler form
+// `segvHandler` below is written to, over the one-argument SIG_IGN form
+// `ignoreSigpipe` installs. Verified with `offsetof`/a real build against this
+// SDK's headers (2026-08-13), not from memory.
+const saSiginfo: int = 64
+const saOnstack: int = 1
+
+// `int sigaltstack(const stack_t *ss, stack_t *oss)` (`<signal.h>`). `stack_t`
+// here is `{ void *ss_sp; size_t ss_size; int ss_flags; }` — 24 bytes, THREE
+// words, and the field ORDER is Darwin's own: Linux's `stack_t` puts
+// `ss_flags` second and `ss_size` last (../linux/signal.bit). Verified with
+// `offsetof` against this SDK's `<signal.h>`: ss_sp@0, ss_size@8, ss_flags@16.
+extern fn sigaltstack(ss: *u8, oss: *u8): i32
+
+// `siginfo_t.si_addr` — the faulting address SA_SIGINFO hands the handler,
+// `segvHandler`'s second argument. Verified with `offsetof` against this
+// SDK's `<signal.h>`, not from memory: offset 24, `sizeof(siginfo_t)` = 104.
+const siAddrOffset: int = 24
+
+// The `ucontext_t` this SDK's SA_SIGINFO handler receives as its third
+// argument is 56 bytes and carries `uc_mcontext` as a POINTER (not inline,
+// unlike Linux's) at offset 48 — verified with `offsetof`/`sizeof`, not from
+// memory. `*(ctx + 48)` is the live `mcontext_t` (really
+// `_STRUCT_MCONTEXT64*`): exception state first (16 bytes), then the thread
+// state (`__ss`) at offset 16, and inside THAT, `__sp` at offset 248 and
+// `__pc` at 256 (`offsetof(struct __darwin_arm_thread_state64, __sp/__pc)`).
+// So the saved stack pointer at the moment of the fault is
+// `*(*(ctx + 64bit ptr @ ucMcontextOffset) + mcontextSpOffset)`.
+const ucMcontextOffset: int = 48
+const mcontextSpOffset: int = 264
+
+// One alternate signal stack per worker OS thread, 64 KiB — comfortably above
+// `MINSIGSTKSZ` (32768 on this SDK, verified with `sizeof`/a real run, not
+// from memory) and a round number matching the granule this runtime already
+// reasons in. `boot` maps `nworkers * sigAltStackBytes` once, before any
+// worker starts (`sigAltStackBase`, ./boot.bit); each worker OS thread claims
+// one slice for itself below, because `sigaltstack` is per-THREAD, not
+// per-process — two workers sharing one alternate stack would corrupt each
+// other's crash message if they ever overflowed at the same instant.
+const sigAltStackBytes: int = 65536
+
+// `installAltStackForThisWorker`'s claim table: 0 = free, 1 = claimed, sized
+// for `bootMaxWorkers` (../boot.bit) and never released — workers do not exit
+// before process teardown. Same claim-then-use shape as
+// `../../thread/darwin/spawn.bit`'s `trampClaim`: an atomic CAS per slot,
+// bounded, first-free wins.
+let sigAltStackClaimed: [32]i64
+
+// Per-slot scratch for the `stack_t` `sigaltstack` argument, three words per
+// worker (24 bytes) — NOT the shared `sigActBuf`/`ioConstBuf` module
+// scratch those single-writer buffers document, because MULTIPLE worker OS
+// threads call `installAltStackForThisWorker` concurrently at startup, and a
+// shared buffer would race. Each worker writes only its own
+// `[claimedIndex*3, claimedIndex*3+3)` slice, which no other worker's claimed
+// index can ever overlap.
+let sigAltStackScratch: [96]i64
+
+// The `struct sigaction` buffer `installSegvHandlers` builds — separate from
+// `sigActBuf` even though both are 2 words, for clarity, and because both are
+// only ever written once each, from `boot`, before any worker thread exists
+// (the same "unlocked, sound under the single-worker contract" reasoning
+// `sigActBuf` itself already carries).
+let segvActBuf: [2]i64
+
+// Claim a slot from the pool above and install THIS OS thread's slice of
+// `sigAltStackBase` as its alternate signal stack. A no-op if `boot` never
+// mapped one (`sigAltStackBase == 0` — a setup failure `boot` already treats
+// as fatal, so this is defensive, not an expected path) or if the pool is
+// exhausted (cannot happen: `boot` never starts more than `bootMaxWorkers`
+// workers, ../boot.bit). Call once, from the very top of `workerBody`, before
+// any task can run on this thread.
+@nosplit fn installAltStackForThisWorker() {
+  if (sigAltStackBase == 0) {
+    return
+  }
+  let tbl: *i64 = ptrOf(sigAltStackClaimed)
+  let scratch = int(ptrOf(sigAltStackScratch))
+  let i = 0
+  while (i < bootMaxWorkers) {
+    if (atomicCmpxchg(tbl + i, 0, 1)) {
+      let sp = scratch + i * 24
+      storeWord(sp, sigAltStackBase + i * sigAltStackBytes)
+      storeWord(sp + 8, sigAltStackBytes)
+      storeWord(sp + 16, 0)
+      let nilp: *u8 = nil
+      sigaltstack(nilp + sp, nilp)
+      return
+    }
+    i = i + 1
+  }
+}
+
+// The alternate-stack SIGSEGV/SIGBUS handler — ABI `void (*)(int, siginfo_t
+// *, void *)`, matched by this function's own three-argument signature, which
+// is what SA_SIGINFO selects over the plain `void (*)(int)` `ignoreSigpipe`
+// installs.
+//
+// WHAT THIS CAN DO, AND WHY IT IS @nosplit. It runs on the alternate stack
+// `installAltStackForThisWorker` armed for this OS thread, at an arbitrary
+// point in whatever Bit code that thread was running when the fault
+// happened — which, for the fault this exists to catch, is a green thread
+// whose OWN stack has just run out. `@nosplit` is the same discipline every
+// panic path in ./io.bit already carries ("the one path that must work when
+// allocation is what failed cannot allocate"), for a stronger reason here:
+// this was not scheduled, it was DELIVERED, mid-instruction, by the kernel,
+// so there is no way to check what state the collector or the interrupted
+// task's own invariants are in.
+//
+// THE ATTRIBUTION, AND WHY IT CAN MISS IN ONE DIRECTION ONLY. Every stack
+// this runtime hands out — a green task's granule-sized stack and main's
+// oversized one alike — is mapped by `mapGuardedStack`, which always aligns
+// the base to `schedStackBytes` (#1843, ../../sched/sched.bit). So a fault
+// immediately below a `schedStackBytes`-ALIGNED address, at BOTH the
+// faulting address (`si_addr`) and the saved stack pointer at the instant of
+// the fault, is structurally consistent with "this thread's stack ran out
+// downward" — and nothing else this runtime does deliberately produces that
+// shape. It is not a proof: `../../sched/sched.bit`'s own doc on
+// `schedStackBytes` already states there is no registry of live green-thread
+// stack bases to check a candidate against (masked identity is the whole
+// point, #1843) — unlike `main`'s stack, which IS registered
+// (`mainStackBaseAddr`, ./boot.bit) and so gets an exact, not heuristic,
+// match. A coincidental 64 KiB-aligned fault in unrelated memory, with `sp`
+// also (coincidentally) sitting just below the same boundary, is the
+// false-positive this cannot rule out — and #2433 records the matching gap
+// on the OTHER side: the guard hole below that boundary is not a fixed width
+// either, so an overflow does not always reach it before running into
+// something else. Both are the cost of masked-identity stacks with no
+// registry, a design decision already made and documented elsewhere; fixing
+// either is not this ticket's.
+//
+// WHEN IT CANNOT ATTRIBUTE THE FAULT, IT DOES NOT GUESS. `emitFatalSignal`
+// names the raw signal and exits — it does not claim "stack overflow" for a
+// fault it cannot place on a stack boundary, because a fabricated diagnosis
+// is worse than a plain one. What it deliberately does NOT do is reset the
+// disposition to SIG_DFL and let the fault recur so the OS's own crash
+// reporter sees it: that pass-through needs this handler to RETURN through
+// the interrupted context, which needs machinery this file does not build.
+// Every path below calls `rootExit` directly and never returns. The cost,
+// stated rather than hidden: an unattributed SIGSEGV/SIGBUS now gets one
+// stderr line and a clean exit instead of the OS's own `.ips` crash report —
+// a real trade, made deliberately, in exchange for every fault getting SOME
+// message instead of most getting none.
+@nosplit fn segvHandler(sig: i32, info: *u8, ctx: *u8) {
+  let faultAddr = loadWord(int(info) + siAddrOffset)
+  let mcontextPtr = loadWord(int(ctx) + ucMcontextOffset)
+  let sp = loadWord(mcontextPtr + mcontextSpOffset)
+
+  let fromFault = alignUpStack(faultAddr)
+  let fromSp = alignUpStack(sp)
+  // The floor rules out a degenerate near-zero reading (e.g. both inputs
+  // landing on unmapped/zeroed memory) agreeing with itself; every real stack
+  // mapping on this platform sits far above it.
+  if (fromFault == fromSp && fromFault > 268435456) {
+    if (fromFault == mainStackBaseAddr) {
+      emitMainStackOverflow()
+    } else {
+      emitSpawnedStackOverflow()
+    }
+    return
+  }
+  emitFatalSignal(int(sig))
+}
+
+// "bit: stack overflow\n" — packed constants, computed not hand-derived, the
+// same technique every alloc-free panic message in ./io.bit uses.
+@nosplit fn emitMainStackOverflow() {
+  writeConst(stderrFd, 7022364301234301282, 8) // "bit: sta"
+  writeConst(stderrFd, 7382074298558606179, 8) // "ck overf"
+  writeConst(stderrFd, 175599468, 4)           // "low\n"
+  rootExit(2)
+}
+
+// "bit: stack overflow in a spawned task\n"
+@nosplit fn emitSpawnedStackOverflow() {
+  writeConst(stderrFd, 7022364301234301282, 8) // "bit: sta"
+  writeConst(stderrFd, 7382074298558606179, 8) // "ck overf"
+  writeConst(stderrFd, 6998715218729070444, 8) // "low in a"
+  writeConst(stderrFd, 7234309835455492896, 8) // " spawned"
+  writeConst(stderrFd, 11456613544992, 6)      // " task\n"
+  rootExit(2)
+}
+
+// "bit: fatal signal: segmentation fault\n" / "bit: fatal signal: bus error\n"
+// — the honest fallback when the fault cannot be placed on a stack boundary.
+@nosplit fn emitFatalSignal(sig: int) {
+  writeConst(stderrFd, 8386096269746268514, 8) // "bit: fat"
+  writeConst(stderrFd, 7020662571717913697, 8) // "al signa"
+  if (sig == sigSegv) {
+    writeConst(stderrFd, 7308611455713032812, 8) // "l: segme"
+    writeConst(stderrFd, 2336927755366659182, 8) // "ntation "
+    writeConst(stderrFd, 11495152116070, 6)      // "fault\n"
+  } else {
+    writeConst(stderrFd, 7286951145080109676, 8) // "l: bus e"
+    writeConst(stderrFd, 44869579378, 5)         // "rror\n"
+  }
+  rootExit(2)
+}
+
+// Register `segvHandler` for SIGSEGV and SIGBUS, process-wide, SA_SIGINFO |
+// SA_ONSTACK. Same 2-word `struct sigaction` shape `ignoreSigpipe` builds
+// (`sigActionWords`), in a separate buffer (`segvActBuf`) written once, from
+// `boot`, before any worker thread exists — call this before step 6 starts
+// any worker, so the disposition is live before the first task can run.
+@nosplit fn installSegvHandlers() {
+  let base = int(ptrOf(segvActBuf))
+  storeWord(base, int(entryOf(segvHandler)))
+  // mask (low 32 bits) = 0, flags (high 32 bits) = SA_SIGINFO | SA_ONSTACK —
+  // the same word layout `ignoreSigpipe`'s header documents for this SDK.
+  storeWord(base + 8, (saSiginfo | saOnstack) << 32)
+  let nilp: *u8 = nil
+  sigaction(i32(sigSegv), nilp + base, nilp)
+  sigaction(i32(sigBus), nilp + base, nilp)
+}
