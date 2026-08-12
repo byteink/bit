@@ -57,6 +57,46 @@ git diff --cached --quiet || { echo "release.sh: staged changes present" >&2; ex
 # cannot move it.
 BUILT_COMMIT="$(git rev-parse HEAD)"
 
+# --- preflight: confirm both smoke-test images exist BEFORE cross-building ---
+# (#2930). "the artifact is broken" and "the verifier is not provisioned" are
+# opposite conclusions. Without this, a missing image is discovered ~11 minutes
+# in, at the smoke step (:384, :415 below) — and the remote docker daemon's own
+# "Unable to find image ... locally" / "pull access denied" lines land in the
+# same log stream three lines above THIS script's failure message, reading as a
+# local defect in the release rather than an unprovisioned verifier. For an
+# x86-64 target that misreading is this repo's signature for an ABI-boundary
+# bug, the most expensive thing it could be mistaken for. So check now, while
+# nothing has been built yet, and name the host, the tag and the fix.
+GATE_IMAGE_LOCAL="bit-linux-gate:latest"
+GATE_IMAGE_REMOTE="bit-linux-gate-amd64:latest"
+
+command -v docker >/dev/null || { echo "release.sh: docker not found" >&2; exit 1; }
+
+docker image inspect "${GATE_IMAGE_LOCAL}" >/dev/null 2>&1 || {
+	echo "release.sh: image '${GATE_IMAGE_LOCAL}' not found locally (needed to smoke-test aarch64-linux)" >&2
+	echo "  build it:" >&2
+	echo "    docker build -t ${GATE_IMAGE_LOCAL} -f docker/linux-gate.Dockerfile ." >&2
+	exit 1
+}
+
+# Resolved once, here, deliberately BEFORE the "no x86-64 host reachable" check
+# further down (:394-424) can be reached only after ~11 minutes of building —
+# that refusal is correct but too late to save the time.
+X64_HOST="$(sh scripts/x64host.sh 2>/dev/null | head -1 || true)"
+if [ -z "${X64_HOST}" ]; then
+	echo "release.sh: no x86-64 host reachable — cannot verify x86_64-linux" >&2
+	echo "release.sh: refusing to publish an unverified release" >&2
+	exit 1
+fi
+ssh "${X64_HOST}" "docker image inspect ${GATE_IMAGE_REMOTE}" >/dev/null 2>&1 || {
+	echo "release.sh: image '${GATE_IMAGE_REMOTE}' not found on ${X64_HOST} (needed to smoke-test x86_64-linux)" >&2
+	echo "  provision it:" >&2
+	echo "    ssh ${X64_HOST} 'mkdir -p /tmp/bitgate && cd /tmp/bitgate && \\" >&2
+	echo "      docker build -t ${GATE_IMAGE_REMOTE} -f - .' < docker/linux-gate.Dockerfile" >&2
+	exit 1
+}
+echo "release.sh: gate images present (${GATE_IMAGE_LOCAL} local, ${GATE_IMAGE_REMOTE} on ${X64_HOST})"
+
 TARGETS=(x86_64-linux aarch64-linux aarch64-macos)
 
 echo "release.sh: building runtime archives for every target"
