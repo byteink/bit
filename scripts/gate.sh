@@ -217,6 +217,22 @@ gates_for_file() {
       printf 'test-stwwiring\ntest-rootpins\n'
       return 0
       ;;
+    tests/bit/childrun/*)
+      # Same shape as tests/bit/objread/* just above: a shared bounded-
+      # child-process harness (#2902) with no main() and no gate of its own,
+      # reached only by relative `import { ... } from "../childrun"` — here
+      # from exactly two harnesses (verified: `grep -rn 'from "\.\./childrun"'
+      # tests/bit/` matches only tests/bit/rootpins/rootpins.bit:150 and
+      # tests/bit/stwwiring/stwwiring.bit:136; tests/bit/objread/objread.bit
+      # only mentions "childrun" in prose comments, not an import). That
+      # relationship lives in Bit `import` statements, not in gates.bit's
+      # `runArgs()` text, so it cannot be derived and is named here by hand —
+      # and `assert_dirgates_current` below cannot check it either, for the
+      # same reason: `tests/bit/childrun` has no `runArgs()` entry anywhere
+      # in gates.bit, so it never appears in the list that guard probes.
+      printf 'test-stwwiring\ntest-rootpins\n'
+      return 0
+      ;;
     tests/bit/abimembers/*) printf 'test-abimembers\n'; return 0 ;;
     tests/bit/clicmd/*) printf 'test-clicmd\n'; return 0 ;;
     tests/bit/rootabi/*) printf 'test-rootabi\n'; return 0 ;;
@@ -242,13 +258,14 @@ gates_for_file() {
 # gates_for_file() resolve the directory — which is the fix the failure
 # message asks for and the only fix that is possible.
 #
-# tests/bit/objread is out of scope for this loop, correctly and by
-# construction: it has zero `runArgs()` entries anywhere in gates.bit
-# (verified: `grep -n objread tools/build/gates.bit` is empty), so it never
-# appears in `dirs` below. It is a hand-maintained exception inside
-# gates_for_file() (see that case arm above) that no automated check can
-# cover, because the two-harness relationship it encodes lives only in Bit
-# `import` statements, not in gates.bit's text.
+# tests/bit/objread and tests/bit/childrun are out of scope for this loop,
+# correctly and by construction: both have zero `runArgs()` entries anywhere
+# in gates.bit (verified: `grep -n 'objread\|childrun' tools/build/gates.bit`
+# is empty), so neither ever appears in `dirs` below. Each is a hand-
+# maintained exception inside gates_for_file() (see those case arms above)
+# that no automated check can cover, because the two-harness relationship
+# each encodes lives only in Bit `import` statements, not in gates.bit's
+# text.
 assert_dirgates_current() {
   local dirs dir probe result
   dirs="$(grep -oE 'runArgs\("tests/bit/[^"]+"\)' tools/build/gates.bit |
