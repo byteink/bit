@@ -1,0 +1,501 @@
+// tests/bit/shebangmode.bit — `./make test-shebang-mode` (#2357): a tracked
+// `*.sh` file whose first line begins `#!` must be committed at index mode
+// `100755`, or running it by the documented `./scripts/foo.sh` spelling
+// fails at rc 126. Six scripts shipped exactly that way until c4bf0665 fixed
+// their modes; nothing caught the regression before that, which is why this
+// gate exists.
+//
+// MODES ARE READ FROM THE INDEX, NEVER THE WORKING TREE
+// (`git ls-files -s -- '*.sh'`): a `core.fileMode=false` checkout reports the
+// working tree wrong, and what breaks for the next person to `git clone` this
+// repo is what is COMMITTED, not whatever happens to sit on this disk right
+// now. Content (used only to detect the `#!` first line and to decide the
+// exemption below) is read from the working tree, which carries no such
+// hazard — the executable BIT is the thing core.fileMode hides, not a file's
+// bytes.
+//
+// THE EXEMPTION. `scripts/alarmrun.sh` (#2866) is a SOURCED library —
+// `. "$(dirname -- "$0")/alarmrun.sh"` from four differentials — carrying a
+// shebang for editors/shellcheck only, committed 100644 on purpose: making it
+// 755 would advertise a `bash scripts/alarmrun.sh` invocation that does
+// nothing, since the file only defines a function. Decided by a PROPERTY of
+// the file, never a name list — the same reason tests/bit/filesize.bit's
+// fixture-corpus exclusion checks for a `.expected` file rather than naming
+// `checkercases/`/`parsercases/` (#2868): a file is a library, and exempt
+// from the executable-bit requirement, iff every top-level line outside
+// comments/blank lines is either the opening of a function definition or
+// lies inside one — i.e. sourcing it would execute nothing. A file with NO
+// function definitions at all is not a library either; the default is to
+// require the executable bit, and the exemption is earned, not assumed.
+// `isLibraryOnly` is a line-oriented heuristic (brace-depth tracking, not a
+// real shell parser) — good enough for this repo's own scripts, verified
+// against every tracked scripts/*.sh at the time this gate was written. The
+// next sourced helper is covered by the property; a script that fools the
+// heuristic fails closed (reported as a violation, not silently exempted),
+// so the failure mode is a human re-reading this header, not a silent gap.
+//
+// Run from the repository root: bit-out/bin/bit run tests/bit/shebangmode.bit
+
+import { mkdir, readFile, writeFile } from "std/fs"
+import { env, envOr } from "std/os"
+import { contains, hasPrefix, hasSuffix, indexOf, parseInt, split, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// Bounds — Power of 10 rule 2. The tracked corpus is 39 files today; these
+// are generous ceilings, not the expected count.
+const maxShFiles: int = 512
+const maxLsFilesBytes: int = 1048576
+const maxFileBytes: int = 4194304
+const maxLinesPerFile: int = 20000
+
+fn die(msg: string) {
+  eprint("shebangmode: SETUP FAILED: ${msg}\n")
+  osExit(1)
+}
+
+fn report(sc: ScanResult, msg: string) {
+  eprint("shebangmode: FAIL: ${msg}\n")
+  sc.failures = sc.failures + 1
+}
+
+// Set unconditionally by this gate's own `Gate{}` entry (tools/build/gates.bit)
+// — same reason as tests/bit/coldboot.bit's `repoRoot`: falling back to "."
+// on a miss would silently point `git -C` at whatever directory `bit`
+// happened to be invoked from instead of refusing.
+fn repoRoot(): string {
+  let r = env("BIT_REPO")
+  if (len(r) == 0) {
+    panic("shebangmode: BIT_REPO is not set — run this through `./make test-shebang-mode`")
+  }
+  return r
+}
+
+// A plain `git ls-files -s` is fast; this is a generous ceiling, not an
+// expected duration. `BIT_TEST_TIMEOUT_S` is the same override every other
+// harness in this family honours.
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "60")) catch _ { 60 }
+  if (s <= 0) {
+    return 60000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s own mechanism channel (ABI.md §19), never a program's
+// exit status, so each is a named panic — same convention as
+// tests/bit/coldboot.bit's `shell`.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700: owner rwx only
+    fail newError("shebangmode: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("shebangmode: TIMED OUT after ${ms}ms running `git ls-files` — a hang is a failure, not a stall")
+  }
+  if (code == -1) {
+    panic("shebangmode: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("shebangmode: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+// One tracked `*.sh` entry as `git ls-files -s` reports it: `mode` is the
+// INDEX mode (e.g. "100755"), `path` is repo-root-relative.
+struct Entry {
+  mode: string
+  path: string
+}
+
+// `git ls-files -s -- '*.sh'` output is `<mode> <sha1> <stage>\t<path>` per
+// line. Splitting on the TAB first (never on whitespace generally) is what
+// keeps a path containing a space intact.
+fn parseLsFiles(out: string): []Entry {
+  let entries = []Entry(0)
+  let lines = split(out, "\n")
+  let n = 0
+  for line of lines {
+    if (len(trimSpace(line)) == 0) {
+      continue
+    }
+    n = n + 1
+    if (n > maxShFiles) {
+      die("git ls-files -s -- '*.sh' listed over ${maxShFiles} files")
+    }
+    let tabAt = indexOf(line, "\t")
+    if (tabAt < 0) {
+      die("git ls-files -s output line has no TAB separator: '${line}'")
+    }
+    let meta = line[0:tabAt]
+    let path = line[tabAt + 1:]
+    let fields = split(meta, " ")
+    if (len(fields) < 1 || len(fields[0]) == 0) {
+      die("git ls-files -s output line has no mode field: '${line}'")
+    }
+    entries = append(entries, Entry{ mode: fields[0], path: path })
+  }
+  return entries
+}
+
+// True iff `t` (already trimmed, non-empty, not a comment) opens a shell
+// function definition: the common `name() {` / `name () {` form, or bash's
+// `function name {` keyword form.
+fn isFunctionOpen(t: string): bool {
+  if (!hasSuffix(t, "{")) {
+    return false
+  }
+  if (contains(t, "()")) {
+    return true
+  }
+  return hasPrefix(t, "function ")
+}
+
+// Net `{` minus `}` on one line — used only to find the matching close of a
+// function body already known to be open, not to parse shell in general.
+// Brace-balanced constructs on one line (e.g. `${VAR:-0}`, brace expansion)
+// net to zero and do not disturb the depth count.
+fn netBraceDelta(t: string): int {
+  let delta = 0
+  let i = 0
+  while (i < len(t)) {
+    if (t[i] == '{') {
+      delta = delta + 1
+    }
+    if (t[i] == '}') {
+      delta = delta - 1
+    }
+    i = i + 1
+  }
+  return delta
+}
+
+// The exemption's decision function, pure and independently testable (see
+// selfTestIsLibraryOnly below) — no top-level statement outside a function
+// definition, and at least one function definition. Fails CLOSED: a file
+// with unbalanced braces (a function that never closes) or with no function
+// at all is not a library.
+fn isLibraryOnly(src: string): bool {
+  let lines = split(src, "\n")
+  if (len(lines) > maxLinesPerFile) {
+    die("shebangmode: a script exceeds ${maxLinesPerFile} lines")
+  }
+  let insideFunc = false
+  let depth = 0
+  let sawFunctionDef = false
+  let sawTopLevelStatement = false
+  for line of lines {
+    let t = trimSpace(line)
+    if (len(t) == 0) {
+      continue
+    }
+    if (hasPrefix(t, "#")) {
+      continue
+    }
+    if (!insideFunc) {
+      if (isFunctionOpen(t)) {
+        insideFunc = true
+        depth = 1
+        sawFunctionDef = true
+        continue
+      }
+      sawTopLevelStatement = true
+      continue
+    }
+    depth = depth + netBraceDelta(t)
+    if (depth <= 0) {
+      insideFunc = false
+      depth = 0
+    }
+  }
+  return sawFunctionDef && !sawTopLevelStatement && !insideFunc
+}
+
+// One entry's verdict, computed with NO side effect — mirrors
+// tests/bit/filesize.bit's evaluateFile/checkFile split so selfTest can drive
+// this against synthetic input without also triggering `report`'s stderr
+// output. `applicable` is false for a tracked *.sh with no `#!` first line:
+// the rule this gate enforces does not reach it at all.
+struct Verdict {
+  applicable: bool
+  violates: bool
+  exempt: bool
+  msg: string
+}
+
+fn evaluateEntry(mode: string, path: string, content: string): Verdict {
+  if (!hasPrefix(content, "#!")) {
+    return Verdict{ applicable: false, violates: false, exempt: false, msg: "" }
+  }
+  if (mode == "100755") {
+    return Verdict{ applicable: true, violates: false, exempt: false, msg: "" }
+  }
+  if (mode != "100644") {
+    // No tracked *.sh in this repo is anything but a regular file today
+    // (100644/100755); a symlink (120000) or other mode is out of scope for
+    // this gate rather than silently accepted — flagged, not ignored.
+    return Verdict{
+      applicable: true, violates: true, exempt: false,
+      msg: "${path} carries a #! shebang and is committed mode ${mode}, neither 100644 nor 100755 — this gate does not know how to classify it",
+    }
+  }
+  if (isLibraryOnly(content)) {
+    return Verdict{ applicable: true, violates: false, exempt: true, msg: "" }
+  }
+  return Verdict{
+    applicable: true, violates: true, exempt: false,
+    msg: "${path} carries a #! shebang but is committed mode 100644 (want 100755) — it will fail rc 126 for anyone running it as documented; if this is meant to be a SOURCED library like scripts/alarmrun.sh, it must contain no top-level statement outside a function definition",
+  }
+}
+
+struct ScanResult {
+  shFilesTotal: int
+  shebangCount: int
+  exemptCount: int
+  failures: int
+}
+
+fn freshScan(): ScanResult {
+  return ScanResult{ shFilesTotal: 0, shebangCount: 0, exemptCount: 0, failures: 0 }
+}
+
+// The only caller of `report` in this file — selfTest drives `evaluateEntry`
+// directly instead, so it never prints.
+fn checkEntry(sc: ScanResult, mode: string, path: string, content: string) {
+  sc.shFilesTotal = sc.shFilesTotal + 1
+  let v = evaluateEntry(mode, path, content)
+  if (!v.applicable) {
+    return
+  }
+  sc.shebangCount = sc.shebangCount + 1
+  if (v.exempt) {
+    sc.exemptCount = sc.exemptCount + 1
+  }
+  if (v.violates) {
+    report(sc, v.msg)
+  }
+}
+
+// PRINT THE DENOMINATOR, unconditionally, on both the pass and fail path —
+// an empty violation set is indistinguishable from a filter that matched
+// nothing at all unless the count of what was actually inspected is right
+// next to it (#2357's own review comment on this gate makes exactly this
+// point).
+fn reportResult(sc: ScanResult) {
+  if (sc.failures > 0) {
+    eprint("shebangmode: FAILED — ${sc.failures} finding(s) over ${sc.shFilesTotal} tracked *.sh file(s) inspected, ${sc.shebangCount} carrying a #! shebang, ${sc.exemptCount} exempt as sourced libraries\n")
+    osExit(1)
+  }
+  print("shebangmode: ok — ${sc.shFilesTotal} tracked *.sh file(s) inspected, ${sc.shebangCount} carrying a #! shebang (all 100755 or exempt), ${sc.exemptCount} exempt as sourced libraries\n")
+}
+
+fn selfCheck(cond: bool, label: string): int {
+  if (cond) {
+    return 0
+  }
+  eprint("shebangmode: SELFTEST FAIL: ${label}\n")
+  return 1
+}
+
+fn selfTestParseLsFiles(): int {
+  let failed = 0
+  let sample = "100755 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0\tscripts/foo.sh\n" +
+    "100644 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 0\tscripts/bar.sh\n"
+  let parsed = parseLsFiles(sample)
+  failed = failed + selfCheck(len(parsed) == 2,
+    "parseLsFiles did not return exactly two entries for a two-line sample")
+  if (len(parsed) == 2) {
+    failed = failed + selfCheck(parsed[0].mode == "100755" && parsed[0].path == "scripts/foo.sh",
+      "parseLsFiles misparsed the first line")
+    failed = failed + selfCheck(parsed[1].mode == "100644" && parsed[1].path == "scripts/bar.sh",
+      "parseLsFiles misparsed the second line")
+  }
+
+  // git ls-files output ends with a trailing "\n", so split(out, "\n")
+  // yields one trailing empty string — must be skipped, not parsed as a
+  // third (malformed) entry.
+  let trailing = parseLsFiles(sample)
+  failed = failed + selfCheck(len(trailing) == 2,
+    "parseLsFiles did not skip the trailing blank line split(\"\\n\") produces")
+  return failed
+}
+
+fn selfTestIsLibraryOnly(): int {
+  let failed = 0
+
+  let library = "#!/usr/bin/env bash\n# a comment\nfoo() {\n  echo hi\n}\n"
+  failed = failed + selfCheck(isLibraryOnly(library),
+    "isLibraryOnly rejected a pure function-definitions-only file (the alarmrun.sh shape)")
+
+  let bracesInside = "#!/usr/bin/env bash\nfoo() {\n  if [ \"\${X:-0}\" = 1 ]; then\n    echo yes\n  fi\n}\n"
+  failed = failed + selfCheck(isLibraryOnly(bracesInside),
+    "isLibraryOnly was confused by a brace-balanced \${VAR:-default} expansion inside a function body")
+
+  let functionKeyword = "#!/usr/bin/env bash\nfunction foo {\n  echo hi\n}\n"
+  failed = failed + selfCheck(isLibraryOnly(functionKeyword),
+    "isLibraryOnly rejected bash's `function name {` keyword form")
+
+  let topLevel = "#!/usr/bin/env bash\nset -euo pipefail\nfoo() {\n  echo hi\n}\n"
+  failed = failed + selfCheck(!isLibraryOnly(topLevel),
+    "isLibraryOnly accepted a file with a top-level statement before its function")
+
+  let noFunctions = "#!/usr/bin/env bash\n# just a comment, no function at all\n"
+  failed = failed + selfCheck(!isLibraryOnly(noFunctions),
+    "isLibraryOnly accepted a file with no function definitions as a library")
+
+  let unbalanced = "#!/usr/bin/env bash\nfoo() {\n  echo hi\n"
+  failed = failed + selfCheck(!isLibraryOnly(unbalanced),
+    "isLibraryOnly accepted a file whose function never closes")
+
+  let hybrid = "#!/usr/bin/env bash\nfoo() {\n  echo hi\n}\necho done\n"
+  failed = failed + selfCheck(!isLibraryOnly(hybrid),
+    "isLibraryOnly accepted a file with a top-level statement AFTER its function closed")
+
+  return failed
+}
+
+fn selfTestEvaluateEntry(): int {
+  let failed = 0
+  let library = "#!/usr/bin/env bash\nfoo() {\n  echo hi\n}\n"
+  let script = "#!/usr/bin/env bash\nset -euo pipefail\necho hi\n"
+
+  let noShebang = evaluateEntry("100644", "scripts/notascript.sh", "echo hi\n")
+  failed = failed + selfCheck(!noShebang.applicable,
+    "evaluateEntry applied the rule to a file with no #! first line")
+
+  let ok755 = evaluateEntry("100755", "scripts/foo.sh", script)
+  failed = failed + selfCheck(ok755.applicable && !ok755.violates && !ok755.exempt,
+    "evaluateEntry flagged an ordinary 100755 shebang script")
+
+  let exempt644 = evaluateEntry("100644", "scripts/alarmrun.sh", library)
+  failed = failed + selfCheck(exempt644.applicable && !exempt644.violates && exempt644.exempt,
+    "evaluateEntry did not exempt a 100644 shebang file whose content is library-only")
+
+  let violation644 = evaluateEntry("100644", "scripts/foo.sh", script)
+  failed = failed + selfCheck(violation644.applicable && violation644.violates && !violation644.exempt,
+    "evaluateEntry did not flag a 100644 shebang script with real top-level statements")
+  failed = failed + selfCheck(contains(violation644.msg, "scripts/foo.sh"),
+    "evaluateEntry's violation message did not name the offending file")
+
+  return failed
+}
+
+fn selfTest(): int {
+  return selfTestParseLsFiles() + selfTestIsLibraryOnly() + selfTestEvaluateEntry()
+}
+
+// One `git ls-files -s -- '*.sh'` run against `root`, captured to a scratch
+// file so this program reads the command's OWN recorded exit code, never
+// infers it from output.
+fn runGitLsFiles(scratch: string, root: string, ms: int): string {
+  let outPath = "${scratch}/lsfiles.out"
+  let errPath = "${scratch}/lsfiles.err"
+  let codePath = "${scratch}/lsfiles.code"
+  let script = "#!/bin/sh\n" +
+    "cd '${root}' || exit 90\n" +
+    "command -v git > /dev/null 2>&1 || exit 91\n" +
+    "git ls-files -s -- '*.sh' > '${outPath}' 2>'${errPath}'\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let wrapperRc = shell("${scratch}/lsfiles.sh", script, ms) catch e {
+    panic("shebangmode: ${e.message()}")
+  }
+  if (wrapperRc == 90) {
+    panic("shebangmode: cannot cd into ${root}")
+  }
+  if (wrapperRc == 91) {
+    panic("shebangmode: git is not available on PATH — this gate cannot verify committed file modes without it")
+  }
+  if (wrapperRc != 0) {
+    panic("shebangmode: wrapper script exited ${wrapperRc}, which it never should")
+  }
+  let codeText = trimWs(readFile(codePath) catch e {
+    panic("shebangmode: cannot read ${codePath}: ${e.message()}")
+    ""
+  })
+  let code = parseInt(codeText) catch _ {
+    panic("shebangmode: ${codePath} did not contain a number: '${codeText}'")
+    0 - 1
+  }
+  if (code != 0) {
+    let errOut = readFile(errPath) catch ""
+    eprint(errOut)
+    panic("shebangmode: git ls-files -s -- '*.sh' exited ${code}, want 0")
+  }
+  let out = readFile(outPath) catch e {
+    panic("shebangmode: cannot read ${outPath}: ${e.message()}")
+    ""
+  }
+  if (len(out) > maxLsFilesBytes) {
+    die("shebangmode: git ls-files output is ${len(out)} bytes, over the ${maxLsFilesBytes} bound")
+  }
+  return out
+}
+
+// std/fs has no recursive remove, so the scratch tree goes the way it came —
+// same reason tests/bit/coldboot.bit's teardown does.
+fn teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ { return }
+}
+
+fn main() {
+  let selfFailed = selfTest()
+  if (selfFailed != 0) {
+    eprint("shebangmode: SELFTEST FAILED — ${selfFailed} case(s); aborting before the real scan\n")
+    osExit(1)
+  }
+
+  let ms = timeoutMs()
+  let root = repoRoot()
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-shebangmode-${uuidFormat(uuidV4())}"
+  mkdir(scratch) catch e {
+    panic("shebangmode: cannot create ${scratch}: ${e.message()}")
+  }
+  defer teardown(scratch, ms)
+
+  let out = runGitLsFiles(scratch, root, ms)
+  let entries = parseLsFiles(out)
+
+  let sc = freshScan()
+  for e of entries {
+    let content = readFile("${root}/${e.path}") catch err {
+      die("shebangmode: cannot read ${e.path}: ${err.message()}")
+      ""
+    }
+    if (len(content) > maxFileBytes) {
+      die("shebangmode: ${e.path} is ${len(content)} bytes, over the ${maxFileBytes} bound")
+    }
+    checkEntry(sc, e.mode, e.path, content)
+  }
+  reportResult(sc)
+}
+
+// std/strings' trimSpace strips only ASCII spaces and tabs, not newlines —
+// `echo $? > file` leaves a trailing "\n" it would not remove. Same helper
+// tests/bit/coldboot.bit and tests/bit/stdlibrebuild.bit use for exactly
+// this, to trim an exit-code file's content before parseInt sees it.
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}
