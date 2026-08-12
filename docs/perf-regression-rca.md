@@ -1,6 +1,7 @@
 # RCA: runtime + compile performance regression, Zig seed → self-hosted compiler
 
-**Status:** open — root-caused to subsystem, not yet to a commit (bisect pending).
+**Status:** Finding 2 (allocator/RSS) root-caused to a commit and FIXED (#2920).
+Finding 1 (codegen) remains open at subsystem level, bisect pending.
 **Severity:** high. Generated code is now 4–5× slower on compute and the allocator
 holds ~18× the memory on churn; the compiler itself is ~6× slower.
 **Measured:** on `bench/run.sh`, single idle host (Apple M5 Max, macOS 26.6.x).
@@ -9,20 +10,23 @@ holds ~18× the memory on churn; the compiler itself is ~6× slower.
 
 ## TL;DR
 
-The bootstrap from the Zig seed to the self-hosted compiler cost a large amount of
-performance across three independent axes:
+Three independent regressions, on two different timelines:
 
 1. **Codegen** — non-allocating compute regressed **4–5×** (`collatz` 0.43s → 2.07s,
    `mandelbrot` 0.78s → 3.32s). Pure emitted-code quality; `fib` (call-bound) was
-   unaffected, so the loss is in loop / arithmetic codegen, not calls.
-2. **Allocator reuse/return** — `alloc` peak RSS **8.6 MB → 154 MB** (~18×). The
-   collector still works; freed memory is not reused or returned, so RSS tracks
-   cumulative allocation instead of the live set.
+   unaffected, so the loss is in loop / arithmetic codegen, not calls. Still open;
+   not dated more precisely than "somewhere in the seed→self-host bootstrap".
+2. **Boot-time GC min-trigger default** — `alloc` peak RSS **8.6 MB → 154 MB**
+   (~18×). **Not a seed→self-host bootstrap cost**: v0.1.2, a released
+   *self-hosted* compiler, reproduces the healthy 8.56 MB figure exactly. The
+   regression is a single commit inside the self-hosted era (`6eaaad83`,
+   07-29), which put a boot.bit constant 64x below the documented default on
+   the shipping path. Root-caused and fixed by #2920; see Finding 2.
 3. **Compiler self-speed** — **1844 → 287 lines/sec** (~6× slower). A consequence
    of (1): the compiler is now Bit compiled by Bit, so weak codegen compounds.
 
-These are two distinct root causes (codegen, allocator) plus one downstream
-consequence (compiler speed).
+These are two distinct root causes (codegen, boot-time GC config) plus one
+downstream consequence (compiler speed).
 
 ## Evidence
 
@@ -88,7 +92,7 @@ Ruled out as the cause:
   (commit `d8368950`) but are otherwise identical; the Go/C references are
   untouched and still verify byte-for-byte (integer cases) against Bit.
 
-### Finding 2 — allocator reuse/return regression (proven at subsystem level)
+### Finding 2 — boot-time GC min-trigger default, 64x too low (ROOT-CAUSED AND FIXED, #2920)
 
 Running `alloc` with `BIT_GC_STATS=1` prints:
 
@@ -97,16 +101,31 @@ Running `alloc` with `BIT_GC_STATS=1` prints:
 ```
 
 The collector runs 1205 times, sweeps all ~10M allocated objects, and ends with
-only 15K live — so **marking and sweeping are correct**. Yet peak RSS is
-**154 MB ≈ the total bytes ever allocated** (10M × 16 B). The conclusion: swept
-objects are reclaimed by GC bookkeeping but the freed memory is **neither reused by
-the allocator nor released to the OS**, so process RSS grows to the cumulative
-allocation high-water mark rather than the (tiny) live set. The seed held the same
-program at 8.6 MB, so the reuse/return path — not the collector — regressed.
+only 15K live — so **marking and sweeping are correct**, and the allocator's
+reuse/return path was never the defect: an earlier draft of this finding blamed
+"allocator reuse/return" (`runtime/gc/gcalloc.bit` / `runtime/alloc/**`). That
+theory is wrong. The actual subsystem is **boot-time GC configuration**:
+`runtime/root/darwin/boot.bit:172` and `runtime/root/linux/boot.bit:251` each
+carried a private `const minTrigger: int = 65536`, 64x below
+`runtime/gc/gc.bit`'s exported `gcDefaultMinTrigger = 4194304` — the value
+`runtime/ABI.md` documents as the default. `gcInit` seeds the collector
+correctly with the real default; `boot`'s call to `rootConfigureFromEnv` then
+overwrote it with the stale 64 KiB value on every program, on both platforms,
+so the collector ran a cycle every ~64 KiB of churn instead of every 4 MiB.
 
-This is the allocator (`runtime/gc/gcalloc.bit` / `runtime/alloc/**`), separate
-from the mark/sweep collector (`runtime/gc/gcmark.bit`, `gccollect.bit`), which is
-demonstrably healthy.
+Setting `BIT_GC_MIN_KB=4096` (the documented default) on the exact same binary
+drops peak RSS **154 MB → 10.2 MB** and collections **1205 → 199** — the Zig
+runtime's own collection count on this program — while `swept` stays ~10M and
+`live` stays small in both runs: the fix does not work by collecting less, it
+works by collecting at the intended cadence. Fixed in #2920: `boot` now
+imports and passes `gcDefaultMinTrigger` directly instead of carrying a
+duplicate constant, so there is exactly one definition of the default.
+
+A genuinely separate, much smaller defect remains open: a per-allocation leak
+of ~21 bytes in certain size classes when the live set is small, tracked as
+#2922. It is unrelated to this finding (correcting the trigger makes it
+slightly *worse* in isolation) and does not explain the 154 MB figure, which
+#2920's fix resolves on its own.
 
 Ruled out: a **retention / marking bug** — `live=15023` and `swept=10014982` show
 the collector does identify the dropped batches as dead and reclaim them.
@@ -147,10 +166,19 @@ Historic seed numbers are in `bench/history.csv` under `git_sha=182f9c9`.
 
 ## Recommended next steps
 
-1. **Bisect the allocator RSS jump (Finding 2).** `alloc` peak RSS crossing from
-   ~8 MB to ~150 MB is a clean, binary signal and every intermediate commit is
-   buildable with the current pinned stage0 (Zig is gone, so no second toolchain
-   needed). ~11 builds. Owner: `bit-triage`.
+1. **DONE — Finding 2 is root-caused and fixed (#2920).** A commit-level bisect
+   was never run, and the plan to run one here was based on a false premise:
+   "every intermediate commit is buildable with the current pinned stage0" is
+   NOT true — each commit pins its OWN stage0 (`dist/stage0/SHA256SUMS` at
+   `189c3d01^` pins 0.1.5, not the 0.1.13 actually cached in `bit-out/stage0/`),
+   and crossing `09dbb53d`/#2773 (the lexer drops the `function` keyword) means
+   no locally-available stage0 can build the older trees at all. What actually
+   worked, and is the method to reuse for a future case like this: a
+   single-variable A/B on two *released* toolchains — extract v0.1.2 and v0.1.3,
+   swap `lib/<triple>/libbitrt.a` between them, rebuild the same benchmark with
+   each combination. The compiler binary never changes across the four runs, so
+   only the runtime archive can explain the result; no bisect and no Zig build
+   were required.
 2. **Bisect the loop-codegen slowdown (Finding 1).** Use `collatz` wall-clock as
    the signal (largest, allocation-free multiplier). ~11 builds. Owner:
    `bit-triage`. May share a commit with (1) or be independent.
