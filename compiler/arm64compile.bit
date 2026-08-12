@@ -310,6 +310,37 @@ struct FuncCode {
   frameSize: int,
 }
 
+// #2925: true iff `f` contains a loop back-edge that emits a real poll — the
+// exact condition emitBackEdgeSafepointIfNeeded gates on (isBackEdge and not
+// needsNoSafepoints). Mirrors codegen.bit's buildIntervals scan, which records
+// the identical edges into built.safepoints; kept as an independent scan
+// (rather than inspecting built.safepoints, which also holds plain-call
+// safepoints — fib has one of those and zero back-edges) because
+// compileFunction needs the answer before it lays out the frame.
+fn hasBackEdgeSafepoint(f: IrFunc): bool {
+  if (needsNoSafepoints(f)) {
+    return false
+  }
+  let bi = 0
+  while (bi < len(f.blocks)) {
+    let b = f.blocks[bi]
+    let idx = b.instsStart + b.paramCount
+    let end = b.instsStart + b.instsLen
+    while (idx < end) {
+      let ins = f.instrs[idx]
+      if (ins.op == Op.Jump && isBackEdge(bi, ins.ival)) {
+        return true
+      }
+      if (ins.op == Op.Br && (isBackEdge(bi, ins.ival) || isBackEdge(bi, ins.ival2))) {
+        return true
+      }
+      idx = idx + 1
+    }
+    bi = bi + 1
+  }
+  return false
+}
+
 // Compiles one function to ARM64 machine code.
 fn compileFunction(module: IrModule, f: IrFunc): FuncCode {
   let ctx = module.ctx
@@ -326,6 +357,21 @@ fn compileFunction(module: IrModule, f: IrFunc): FuncCode {
   let hasSafepoints = len(built.safepoints) > 0
   let intRegs = buildIntRegs(hasSafepoints)
   let floatRegs = buildFloatRegs(hasSafepoints)
+
+  // #2925: does `f` close at least one loop back-edge with a real poll (the
+  // exact predicate emitBackEdgeSafepointIfNeeded gates on)? Scanned ahead of
+  // frame layout, independently of `built.safepoints` (which also counts
+  // ordinary calls — fib has one of those and zero of these), so the
+  // poll-address cache slots can be sized before emitPrologue runs. Implies
+  // hasSafepoints: codegen.bit's own buildIntervals records the identical
+  // back-edge under the identical guard, so a function with one always has
+  // len(built.safepoints) > 0 already and is never frameless.
+  let hasBackEdgePoll = hasBackEdgeSafepoint(f)
+  let pollCacheSlots = 0
+  if (hasBackEdgePoll) {
+    pollCacheSlots = 2
+  }
+  assert(!hasBackEdgePoll || hasSafepoints)
 
   // Any physical register an `asm` block names (`input`/`result`/clobber) leaves
   // the allocatable file for the whole function, so no vreg can land in a
@@ -428,8 +474,8 @@ fn compileFunction(module: IrModule, f: IrFunc): FuncCode {
 
   let frameSize = 0
   if (!frameless) {
-    frameSize = alignFrame16(outgoingBytes + 16 + len(savedGpr) * 8 +
-      len(savedFpr) * 8 + result.numSpillSlots * 8)
+    frameSize = alignFrame16(outgoingBytes + 16 + pollCacheSlots * 8 +
+      len(savedGpr) * 8 + len(savedFpr) * 8 + result.numSpillSlots * 8)
     // Every access this backend emits into the frame uses the unsigned-imm12
     // form when it fits: 4095*8 bytes reaches any realistic frame. Larger
     // frames still work (via the register-offset fallback) but that path is
@@ -439,7 +485,7 @@ fn compileFunction(module: IrModule, f: IrFunc): FuncCode {
 
   let frame = FrameInfo{ savedGpr: savedGpr, savedFpr: savedFpr,
     numSpillSlots: result.numSpillSlots, outgoingBytes: outgoingBytes,
-    frameSize: frameSize, frameless: frameless }
+    pollCacheSlots: pollCacheSlots, frameSize: frameSize, frameless: frameless }
 
   // §10.3.1 @naked safety net: the prologue is suppressed, so a spill slot,
   // saved register, or outgoing-arg area would silently corrupt the caller.
@@ -479,6 +525,10 @@ fn compileFunction(module: IrModule, f: IrFunc): FuncCode {
     emitPrologue(cx)
   }
   bindIncomingArgs(cx)
+  // #2925: after incoming args are off the ABI registers and onto their real
+  // (callee-saved, since hasSafepoints) homes — otherwise these two calls'
+  // caller-saved clobber would destroy an argument still sitting in x0..x7.
+  emitPollCachePrefetch(cx)
 
   // Emit every block in its original (emission) order.
   let bi = 0
