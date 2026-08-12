@@ -1,0 +1,449 @@
+// Benchmark regression gate (#2931): builds and runs bench/cases/{collatz,
+// mandelbrot,fib,alloc} with the compiler under test and fails when either
+// peak RSS or user CPU time regresses past 1.5x a baseline recorded below.
+//
+// WHY THIS EXISTS. docs/perf-regression-rca.md records a 4-5x compute
+// regression and an 18x peak-RSS regression that shipped across many
+// releases with every gate in `./make test` staying green, because nothing
+// in the suite measured performance at all — both were only found by a human
+// running `bench/run.sh` by hand, 1470 commits after the fact (#2920,
+// #2921). This is the gate that would have caught them the day they landed.
+//
+// WHY NOT `bench/run.sh`. That script needs `go` and `cc` on PATH, runs 7
+// iterations per case per LANGUAGE (Bit, Go, C), and rewrites three tracked
+// files (README.md, bench/RESULTS.md, bench/history.csv) — a gate must not
+// mutate the tree, and 7x3 external-toolchain builds is not a suite cost.
+// This measures Bit only, against baselines recorded in this file rather
+// than read from bench/history.csv: its newest rows predate #2920 and still
+// encode the bug (`alloc` RSS = 161529856), which is exactly the number
+// #2920 fixed.
+//
+// WHY PEAK RSS AND USER CPU, NEVER WALL CLOCK. This repo already has three
+// open tickets (#2401, #2415, #2422) about absolute wall-clock deadlines
+// reddening the suite purely from host load. Peak RSS is a kernel-tracked
+// high-water mark, unaffected by what else the box is doing. User CPU time is
+// time actually spent executing on a core, not time spent waiting for one —
+// measured on this host while writing this gate, `user` stayed within 0.06s
+// across 7 runs of the same binary. `real` (wall clock) is never read below.
+//
+// WHY MINIMUM OF N, NOT MEAN. Contention and scheduling noise can only ever
+// make one run cost MORE than its true floor, never less, so the minimum of
+// `reps` independent runs is the statistic noise cannot inflate — the same
+// reasoning tests/bit/schedbench.bit's header gives for context-switch
+// timing.
+//
+// WHY 1.5x, AND WHY IT NEVER FIRES ON AN IMPROVEMENT. The regressions this
+// gate exists to catch were 4-5x and 18x — the bar only needs to clear gross
+// breakage, not police day-to-day noise. The check is a strict
+// greater-than against `baseline * 1.5`, so a benchmark that gets faster or
+// leaner can only pass more easily, never fail.
+//
+// WHY OUTPUTS ARE ASSERTED TOO. A benchmark that returns the wrong answer
+// quickly is exactly the failure mode a pure-timing gate cannot see, so
+// every run's stdout is compared byte-for-byte against the known-correct
+// value before its cost is even considered.
+//
+// SUBPROCESS MECHANICS, as tests/bit/golden.bit and tests/bit/lspcache.bit:
+// each case is built once with the compiler under test, then run `reps`
+// times through a generated `/bin/sh` wrapper via `osRunBounded` (no rusage
+// primitive is reachable from Bit itself). The wrapper is the only
+// platform-specific part: macOS's `/usr/bin/time -l` reports both user CPU
+// seconds and maximum resident set size (bytes) from ONE run; Linux has no
+// such tool guaranteed present, so it backgrounds the binary and polls
+// `/proc/<pid>/status` (`VmHWM`, itself a kernel-maintained high-water mark —
+// any read taken late in the run already reflects the true peak) and
+// `/proc/<pid>/stat` (utime+stime, the same two fields
+// tests/bit/fsblock.bit's `cpu()` helper already reads and was mutation-
+// tested for, #2207).
+//
+// Run from the repository root:
+//   ./bit-out/bin/bit run tests/bit/benchgate.bit
+// Needs BIT_BIN (the compiler under test), BIT_LIBBITRT (the runtime
+// archive to link against) and BIT_BENCH_DIR (bench/cases) — no defaults.
+
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, exists, mkdir } from "std/fs"
+import { trimSpace, parseInt, split } from "std/strings"
+
+// Independent timed runs per case; the MINIMUM of each series is compared to
+// baseline. 3 costs roughly one pass of the 4 cases' combined baseline CPU
+// (~4.6s) times 3, plus 4 one-time builds — under 20s measured, inside the
+// ~30s budget #2931 set (#2747's lint gate, at 21s, is the precedent for
+// what a suite addition may cost).
+const reps: int = 3
+
+// FAIL when measured > baseline * 3 / 2 (i.e. > 1.5x). Integer arithmetic
+// throughout so there is no float-rounding edge case in the comparison.
+fn ceiling(baseline: int): int {
+  return (baseline * 3) / 2
+}
+
+// Generous per-subprocess bound; every case finishes in under 3s and this
+// only matters if something hangs. `BIT_TEST_TIMEOUT_S` widens it the same
+// way every other harness in this suite honors it.
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "60")) catch _ { 60 }
+  if (s <= 0) {
+    return 60000
+  }
+  return s * 1000
+}
+
+struct Baseline {
+  name: string
+  expected: string
+  cpuCentis: int
+  rssBytes: int
+}
+
+// Measured fresh on `main` @ 368d654a (2026-08-12, after #2920 and #2921 both
+// landed), minimum of 7 runs each via `/usr/bin/time -l` on an idle host —
+// NOT read from bench/history.csv (see the file header for why). Re-measure
+// rather than hand-edit these if they drift:
+//   BIT_STDLIB=stdlib ./bit-out/bin/bit build bench/cases/<name>/<name>.bit -o /tmp/b
+//   /usr/bin/time -l /tmp/b   # repeat a few times; take the minimum `user` and RSS
+fn baselines(): []Baseline {
+  return [
+    Baseline{name: "collatz", expected: "524", cpuCentis: 83, rssBytes: 1949696},
+    Baseline{name: "mandelbrot", expected: "204866964", cpuCentis: 121, rssBytes: 1949696},
+    Baseline{name: "fib", expected: "102334155", cpuCentis: 29, rssBytes: 1949696},
+    Baseline{name: "alloc", expected: "59995000000", cpuCentis: 231, rssBytes: 10698752},
+  ]
+}
+
+// --- shell plumbing ----------------------------------------------------
+
+// Wraps `s` as exactly one POSIX `/bin/sh` word.
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+fn mkdirQuiet(path: string) {
+  mkdir(path) catch e { return }
+}
+
+// A scratch root whose path is already lexically canonical (the trailing-
+// slash hazard is tests/bit/lspcache.bit's #2410 — `TMPDIR` ends in `/` on
+// macOS, and a doubled separator has bitten a gate here before).
+fn scratchRoot(): string {
+  let base = envOr("TMPDIR", "/tmp")
+  while (len(base) > 1 && base[len(base) - 1] == '/') {
+    base = base[0:len(base) - 1]
+  }
+  return base + "/bit-benchgate-${timeUnixNs()}"
+}
+
+// `osRunBounded`'s three non-zero outcomes rendered as a message (ABI.md
+// §19), same encoding as tests/bit/stress/verify.bit's `runMsg`.
+fn runMsg(code: int): string {
+  if (code == 0) {
+    return ""
+  }
+  if (code == 0 - 1) {
+    return "SPAWN FAILED (fork/exec/wait error)"
+  }
+  if (code == 0 - 2) {
+    return "TIMED OUT after ${timeoutMs()}ms (raise BIT_TEST_TIMEOUT_S)"
+  }
+  if (code <= 0 - 100) {
+    return "CRASHED: killed by signal ${0 - code - 100}"
+  }
+  return "exited ${code}"
+}
+
+// --- build ---------------------------------------------------------------
+
+fn buildScript(bit: string, libbitrt: string, stdlib: string, srcPath: string,
+    binPath: string, outPath: string, errPath: string): string {
+  let s = "#!/bin/sh\n"
+  if (stdlib != "") {
+    s = s + "BIT_STDLIB=" + shQuote(stdlib) + "\nexport BIT_STDLIB\n"
+  }
+  if (libbitrt != "") {
+    s = s + "BIT_LIBBITRT=" + shQuote(libbitrt) + "\nexport BIT_LIBBITRT\n"
+  }
+  s = s + "exec " + shQuote(bit) + " build " + shQuote(srcPath) + " -o " + shQuote(binPath) +
+    " > " + shQuote(outPath) + " 2> " + shQuote(errPath) + "\n"
+  return s
+}
+
+// --- measure ---------------------------------------------------------------
+
+// One run's user-CPU-and-peak-RSS wrapper. Dispatches on `uname -s` so a
+// single generated script serves both gate platforms (macOS dev host, real
+// aarch64/x86_64 Linux via scripts/{arm64,x64}gate.sh) — see the file header
+// for why each branch works the way it does. The wrapper's own `exit`
+// re-raises the BENCHMARK's exit code, so `osRunBounded`'s return value is
+// the thing that failed, not "the wrapper script", and non-zero there is
+// treated as a hard failure by the caller.
+//
+// Result file format: one line, three space-separated decimals —
+// "<benchmark exit code> <user CPU centiseconds> <peak RSS bytes>" — with -1
+// standing in for "not measured" on either metric, never a silent 0 (the
+// same convention tests/bit/lspcache.bit's `intAfter` uses).
+fn measureScript(bin: string, outPath: string, resPath: string): string {
+  let rawPath = resPath + ".raw"
+  let s = "#!/bin/sh\n"
+  s = s + "case \"$(uname -s)\" in\n"
+  s = s + "  Darwin)\n"
+  s = s + "    /usr/bin/time -l " + shQuote(bin) + " >" + shQuote(outPath) + " 2>" + shQuote(rawPath) + "\n"
+  s = s + "    ec=$?\n"
+  // `/usr/bin/time -l`'s first line is fixed-format: "<real> real <user> user
+  // <sys> sys", so the user-seconds value is always field 3 of the line
+  // matching " user". `(u*100)+0.5` rounds to the nearest centisecond.
+  s = s + "    awk -v ec=$ec 'BEGIN{u=-1;r=-1} / user/{u=$3} " +
+    "/maximum resident set size/{r=$1} END{printf \"%d %d %d\\n\", ec, (u*100)+0.5, r}' " +
+    shQuote(rawPath) + " > " + shQuote(resPath) + "\n"
+  s = s + "    exit $ec\n"
+  s = s + "    ;;\n"
+  s = s + "  *)\n"
+  s = s + "    " + shQuote(bin) + " >" + shQuote(outPath) + " &\n"
+  s = s + "    pid=$!\n"
+  s = s + "    cpu=-1\n"
+  s = s + "    hwm=-1\n"
+  s = s + "    while kill -0 $pid 2>/dev/null; do\n"
+  s = s + "      if [ -r /proc/$pid/status ]; then\n"
+  s = s + "        v=$(awk '/VmHWM/{print $2}' /proc/$pid/status 2>/dev/null)\n"
+  s = s + "        case $v in\n"
+  s = s + "          '') ;;\n"
+  s = s + "          *) hwm=$v ;;\n"
+  s = s + "        esac\n"
+  s = s + "      fi\n"
+  // `sed 's/.*) //'` strips through the LAST ')' so a comm field containing
+  // its own parens cannot shift the column count; the remaining fields'
+  // 12th and 13th are utime+stime — tests/bit/fsblock.bit's `cpu()` reads
+  // the same two fields the same way, mutation-tested for #2207.
+  s = s + "      if [ -r /proc/$pid/stat ]; then\n"
+  s = s + "        c=$(sed 's/.*) //' /proc/$pid/stat 2>/dev/null | awk '{print $12+$13}')\n"
+  s = s + "        case $c in\n"
+  s = s + "          '') ;;\n"
+  s = s + "          *) cpu=$c ;;\n"
+  s = s + "        esac\n"
+  s = s + "      fi\n"
+  s = s + "      sleep 0.05\n"
+  s = s + "    done\n"
+  s = s + "    wait $pid\n"
+  s = s + "    ec=$?\n"
+  s = s + "    CLK=$(getconf CLK_TCK 2>/dev/null || echo 100)\n"
+  s = s + "    cpuCs=-1\n"
+  s = s + "    rssB=-1\n"
+  s = s + "    if [ $cpu -ge 0 ]; then cpuCs=$((cpu * 100 / CLK)); fi\n"
+  s = s + "    if [ $hwm -ge 0 ]; then rssB=$((hwm * 1024)); fi\n"
+  s = s + "    printf \"%d %d %d\\n\" $ec $cpuCs $rssB > " + shQuote(resPath) + "\n"
+  s = s + "    exit $ec\n"
+  s = s + "    ;;\n"
+  s = s + "esac\n"
+  return s
+}
+
+struct Measured {
+  ok: bool
+  exitCode: int
+  cpuCentis: int
+  rssBytes: int
+  out: string
+}
+
+// `trimSpace` (std/strings) only strips spaces and tabs, not newlines — the
+// result file's line always ends in the `\n` awk's/printf's own `%s\n`
+// emitted, so that has to go before `split` sees it or the last field keeps
+// a trailing `\n` and fails `parseInt`.
+fn trimTrailingNl(s: string): string {
+  let hi = len(s)
+  while (hi > 0 && (s[hi - 1] == '\n' || s[hi - 1] == '\r')) {
+    hi = hi - 1
+  }
+  return s[0:hi]
+}
+
+fn parseMeasured(resText: string, outText: string): Measured {
+  let parts = split(trimSpace(trimTrailingNl(resText)), " ")
+  if (len(parts) != 3) {
+    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, out: outText }
+  }
+  let ec = parseInt(parts[0]) catch _ { return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, out: outText } }
+  let cpu = parseInt(parts[1]) catch _ { return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, out: outText } }
+  let rss = parseInt(parts[2]) catch _ { return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, out: outText } }
+  return Measured{ ok: true, exitCode: ec, cpuCentis: cpu, rssBytes: rss, out: outText }
+}
+
+// --- tally -----------------------------------------------------------------
+
+struct Tally { checks: int, failures: int }
+
+fn markFail(t: Tally, msg: string) {
+  t.failures = t.failures + 1
+  eprint("FAIL benchgate: " + msg + "\n")
+}
+
+fn minInt(a: int, b: int): int {
+  if (a < b) {
+    return a
+  }
+  return b
+}
+
+// --- one case ----------------------------------------------------------
+
+fn runCase(bit: string, libbitrt: string, stdlib: string, benchDir: string,
+    scratch: string, b: Baseline, t: Tally) {
+  let caseScratch = scratch + "/" + b.name
+  mkdirQuiet(caseScratch)
+
+  let srcPath = benchDir + "/" + b.name + "/" + b.name + ".bit"
+  let binPath = caseScratch + "/bin"
+  let buildOut = caseScratch + "/build.out"
+  let buildErr = caseScratch + "/build.err"
+  let buildSh = caseScratch + "/build.sh"
+
+  writeFile(buildSh, buildScript(bit, libbitrt, stdlib, srcPath, binPath, buildOut, buildErr)) catch e {
+    markFail(t, "${b.name}: cannot write build script: " + e.message())
+    return
+  }
+  if (fsChmod(buildSh, 448) != 0) { // 0o700
+    markFail(t, "${b.name}: cannot chmod build script")
+    return
+  }
+  let buildCode = osRunBounded(buildSh, timeoutMs())
+  if (buildCode != 0) {
+    let berr = readFile(buildErr) catch e { "" }
+    markFail(t, "${b.name}: build failed (${runMsg(buildCode)}): ${berr}")
+    return
+  }
+  if (!exists(binPath)) {
+    markFail(t, "${b.name}: build reported success but ${binPath} does not exist")
+    return
+  }
+
+  // Sentinels above any measurement this gate could ever legitimately see —
+  // the check after the loop proves a real run replaced them, the same shape
+  // tests/bit/schedbench.bit's `benchTrials` uses.
+  let minCpu = 1000000000
+  let minRss = 1000000000
+  let sawOne = false
+
+  let rep = 0
+  while (rep < reps) {
+    let outPath = caseScratch + "/run${rep}.out"
+    let resPath = caseScratch + "/run${rep}.res"
+    let runSh = caseScratch + "/run${rep}.sh"
+    writeFile(runSh, measureScript(binPath, outPath, resPath)) catch e {
+      markFail(t, "${b.name} rep ${rep}: cannot write run script: " + e.message())
+      rep = rep + 1
+      continue
+    }
+    if (fsChmod(runSh, 448) != 0) {
+      markFail(t, "${b.name} rep ${rep}: cannot chmod run script")
+      rep = rep + 1
+      continue
+    }
+    // The wrapper's own exit re-raises the benchmark's exit code (see
+    // measureScript's header), so a non-zero, non-timeout, non-signal code
+    // here means the BENCHMARK itself failed, not the harness.
+    let code = osRunBounded(runSh, timeoutMs())
+    if (code == 0 - 2 || code == 0 - 1 || code <= 0 - 100) {
+      markFail(t, "${b.name} rep ${rep}: ${runMsg(code)}")
+      rep = rep + 1
+      continue
+    }
+    let resText = readFile(resPath) catch e { "" }
+    let outText = readFile(outPath) catch e { "" }
+    let m = parseMeasured(resText, outText)
+    if (!m.ok) {
+      markFail(t, "${b.name} rep ${rep}: no parseable result line (got '${resText}')")
+      rep = rep + 1
+      continue
+    }
+    if (m.exitCode != 0) {
+      markFail(t, "${b.name} rep ${rep}: benchmark exited ${m.exitCode}")
+      rep = rep + 1
+      continue
+    }
+    if (m.cpuCentis < 0 || m.rssBytes < 0) {
+      markFail(t, "${b.name} rep ${rep}: measurement unavailable (cpu=${m.cpuCentis} rss=${m.rssBytes})")
+      rep = rep + 1
+      continue
+    }
+    let got = trimSpace(trimTrailingNl(m.out))
+    if (got != b.expected) {
+      markFail(t, "${b.name} rep ${rep}: printed '${got}', want '${b.expected}' — wrong answer, cost not trusted")
+      rep = rep + 1
+      continue
+    }
+    minCpu = minInt(minCpu, m.cpuCentis)
+    minRss = minInt(minRss, m.rssBytes)
+    sawOne = true
+    rep = rep + 1
+  }
+
+  if (!sawOne) {
+    markFail(t, "${b.name}: no successful run out of ${reps}")
+    return
+  }
+
+  let cpuCeil = ceiling(b.cpuCentis)
+  let rssCeil = ceiling(b.rssBytes)
+  // Printed unconditionally, pass or fail, so a slow drift toward the
+  // ceiling is visible in the suite log before it ever trips (#2931).
+  print("benchgate: ${b.name} cpu=${minCpu}cs (baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs) " +
+    "rss=${minRss}B (baseline ${b.rssBytes}B, ceiling ${rssCeil}B)\n")
+
+  if (minCpu > cpuCeil) {
+    markFail(t, "${b.name} user CPU regressed: ${minCpu}cs (min of ${reps}), " +
+      "baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs (1.5x)")
+  }
+  if (minRss > rssCeil) {
+    markFail(t, "${b.name} peak RSS regressed: ${minRss}B (min of ${reps}), " +
+      "baseline ${b.rssBytes}B, ceiling ${rssCeil}B (1.5x)")
+  }
+  t.checks = t.checks + 1
+}
+
+// --- driver ------------------------------------------------------------
+
+fn main() {
+  let bit = envOr("BIT_BIN", "")
+  if (bit == "" || !exists(bit)) {
+    eprint("FAIL benchgate: BIT_BIN='${bit}' does not exist — refusing to guess\n")
+    exit(1)
+  }
+  let libbitrt = envOr("BIT_LIBBITRT", "")
+  if (libbitrt == "" || !exists(libbitrt)) {
+    eprint("FAIL benchgate: BIT_LIBBITRT='${libbitrt}' does not exist — refusing to guess\n")
+    exit(1)
+  }
+  let benchDir = envOr("BIT_BENCH_DIR", "")
+  if (benchDir == "" || !exists(benchDir)) {
+    eprint("FAIL benchgate: BIT_BENCH_DIR='${benchDir}' does not exist — refusing to guess\n")
+    exit(1)
+  }
+  let stdlib = env("BIT_STDLIB")
+
+  let root = scratchRoot()
+  mkdirQuiet(root)
+
+  let t = Tally{ checks: 0, failures: 0 }
+  for b of baselines() {
+    runCase(bit, libbitrt, stdlib, benchDir, root, b, t)
+  }
+
+  if (t.checks < 4) {
+    eprint("FAIL benchgate: only ${t.checks} of 4 cases completed\n")
+    t.failures = t.failures + 1
+  }
+  if (t.failures > 0) {
+    println("benchgate: FAIL — ${t.failures} problem(s) across ${t.checks} case(s)")
+    exit(1)
+  }
+  println("benchgate: PASS — ${t.checks} case(s) within 1.5x of baseline")
+}
