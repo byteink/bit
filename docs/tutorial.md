@@ -260,7 +260,7 @@ fn test_double() {
 $ bit test math.bit
 ok   test_double
 
-1 test: 1 passed, 0 failed
+discovered 1 test, ran 1: 1 passed, 0 failed
 ```
 
 A failing assertion prints the values it compared, not just that it failed.
