@@ -166,71 +166,6 @@ fn rejectExternForTarget(p: Project, target: BuildTarget, rtArchive: []u8, linki
   return found
 }
 
-// E0096 (#2958, SPEC §11.7): a root-module function's bare link name collides
-// with a symbol the linked runtime archive resolves externally. First free
-// code above E0095 (checkbind.bit's ecMethodReceiverKind).
-const ecRootNameCollision = 96
-
-// The runtime archive's OWN extern surface for `target` — every name some
-// member of `rtArchive` references without any member defining it, derived
-// straight from the archive bytes rather than a hand-picked list of libc
-// names. See machoArchiveExterns/elfArchiveExterns for the per-format read;
-// this only dispatches on target the same way externResolvable does.
-fn linkedExternNames(target: BuildTarget, rtArchive: []u8): map<string, bool> {
-  if (isMachoTarget(target)) {
-    return machoArchiveExterns(rtArchive)
-  }
-  return elfArchiveExterns(elfLinkTargetOf(target), rtArchive)
-}
-
-// §11.7 (#2958): the root module keeps every top-level function's link name
-// BARE — `modulePrefix`/`moduleQualified` return "" for the root so `main`
-// stays `main` and a single-module build stays byte-identical — which
-// `emit.bit`'s isPinnedName assumed made it disjoint from every resolvable
-// extern spelling ("disjoint by construction" via '$'). That is false for the
-// root: a root `fn listen` ALSO defines the bare symbol `_listen`, and on
-// Darwin's flat namespace the final link then binds the runtime's own extern
-// call (runtime/net/darwin/sock.bit's `extern fn listen`, ultimately
-// libSystem's listen(2)) to the user's function instead of to libSystem —
-// silently, and not always as a crash: a root `fn write` makes every
-// `println` print nothing, at exit 0.
-//
-// The comparison set (`linkedExternNames`) is derived from the actual linked
-// `rtArchive`, never a fixed list of libc names — a hand-picked list would
-// both miss a symbol this exact runtime calls and reject a name that cannot
-// collide with it, and a false rejection here is worse than the bug it
-// replaces. `linking` mirrors rejectExternForTarget: `--emit-obj` performs no
-// link, so nothing can collide yet.
-fn rejectRootNameCollision(root: Checker, target: BuildTarget, rtArchive: []u8,
-    linking: bool): bool {
-  if (!linking) { return false }
-  let externs = linkedExternNames(target, rtArchive)
-  if (len(externs) == 0) { return false }
-  let found = false
-  let before = len(root.diags.list)
-  for top of kidsOf(root.tree, root.tree.root) {
-    if (top == 0) { continue }
-    let inner = top
-    if (getNode(root.tree, top).tag == Tag.Export) {
-      inner = kidsOf(root.tree, top)[0]
-    }
-    if (getNode(root.tree, inner).tag != Tag.FuncDecl) { continue }
-    let kids = kidsOf(root.tree, inner) // [recv, name, generics, params, result, body]
-    if (kids[0] != 0) { continue } // a method: namespaced by its receiver type, never bare
-    if (isGenericFuncDecl(root, inner)) { continue } // never emitted bare; only its instances are
-    let nameNode = getNode(root.tree, kids[1])
-    let name = root.source[nameNode.span.start:nameNode.span.end]
-    let (_, collides) = externs[name]
-    if (!collides) { continue }
-    report(root.diags, ecRootNameCollision, getNode(root.tree, inner).span,
-      "function '${name}' has the same link name as a symbol the runtime resolves externally (SPEC §11.7)",
-      "the root module keeps bare link names, so this would also bind the runtime's own extern call; rename '${name}' to something that does not collide")
-    found = true
-  }
-  remapDiags(root.diags, before, root.files, root.fileStarts)
-  return found
-}
-
 // Whether the link this build is about to perform can resolve `symbol`, per
 // SPEC §11.7. One function so the two targets' answers cannot drift into two AST
 // walks: what differs between them is only where a symbol may legitimately come
@@ -348,7 +283,18 @@ fn noMainMessage(): string {
   return "no `main` in this module (an entry point is a top-level `fn main()`)"
 }
 
-fn buildIr(src: string, target: BuildTarget, freestanding: bool, rtArchive: []u8, linking: bool): IrModule! {
+// `testBuild` (#2985): `bit test` compiles the package under test AS ROOT too
+// — that is what lets `injectTestMain` (testgen.bit) discover the package's
+// own bare-named `test_*` functions (§19, "never in an imported one") — so a
+// root-level name that collides with a linked extern is exactly as real a
+// hazard here as it is for `bit build`/`bit run`. `testBuild` does not
+// exempt it: `rejectRootNameCollision`'s own scan (`collidingRootDecls`)
+// still runs, and the result still gets fixed rather than ignored — it is
+// handed to `demangleTestRootCollisions` (testgen.bit) AFTER lowering,
+// instead of being reported and refused. false for every other caller, which
+// keeps `bit build`/`bit run`/`bit check`/`--emit-obj` on the unchanged
+// reject-and-fail path.
+fn buildIr(src: string, target: BuildTarget, freestanding: bool, rtArchive: []u8, linking: bool, testBuild: bool): IrModule! {
   // Ahead of the loader, so a `main` that was never looked for is never reported
   // missing. See moduleRootProblem: `bit run mian.bit` used to say `NoMain`.
   let problem = moduleRootProblem(src)
@@ -396,14 +342,31 @@ fn buildIr(src: string, target: BuildTarget, freestanding: bool, rtArchive: []u8
   // check error rather than after a second, separate failure.
   rejectExternForTarget(p, target, rtArchive, linking)
   // Same sink, same reason (#2958): a root-module name that collides with a
-  // linked extern renders beside E0078 and every check error too.
-  rejectRootNameCollision(mods[p.root], target, rtArchive, linking)
+  // linked extern renders beside E0078 and every check error too — UNLESS
+  // this is `bit test`'s own build, where the collision is real but the fix
+  // is a rename (below) rather than a refusal (#2985).
+  let testCollisions = []string(0)
+  if (testBuild) {
+    let cols = collidingRootDecls(mods[p.root], target, rtArchive, linking)
+    for col of cols {
+      testCollisions = append(testCollisions, col.name)
+    }
+  } else {
+    rejectRootNameCollision(mods[p.root], target, rtArchive, linking)
+  }
   // Final gate: renders a warnings-only sink too (#2491), unlike the lex/parse
   // gate above.
   if (reportCheckDiagnostics(p.diags)) {
     fail newError("check failed")
   }
-  return lowerProject(mods, p.root)
+  let module = lowerProject(mods, p.root)
+  // Lowering has now given every function its real link name, so a collision
+  // this build tolerated can be renamed exactly once, everywhere it appears
+  // (demangleTestRootCollisions, testgen.bit).
+  if (len(testCollisions) > 0) {
+    demangleTestRootCollisions(module, testCollisions)
+  }
+  return module
 }
 
 // E0092: first free code above E0091 (validateloop.bit's ecForIn). Unlike
@@ -435,7 +398,7 @@ fn renderStubbed(module: IrModule) {
 // half of the toolchain that feeds `bit ar`. Returns false on any failure
 // (already reported).
 fn buildObjCmd(src: string, out: string, target: BuildTarget, freestanding: bool): bool {
-  let module = buildIr(src, target, freestanding, []u8(0), false) catch e {
+  let module = buildIr(src, target, freestanding, []u8(0), false, false) catch e {
     eprint("bit: ${src}: ${e.message()}\n")
     return false
   }
@@ -488,7 +451,7 @@ fn buildCmd(src: string, out: string, target: BuildTarget): bool {
     eprint("bit: runtime archive ${libbitrtPath(target)}: ${e.message()}\n")
     return false
   }
-  let module = buildIr(src, target, false, rt, true) catch e {
+  let module = buildIr(src, target, false, rt, true, false) catch e {
     eprint("bit: ${src}: ${e.message()}\n")
     return false
   }
