@@ -248,7 +248,14 @@ error.
 RAW_STRING_LIT = "`" { any_char_except_backtick } "`" .
 ```
 
-A raw string's bytes are taken verbatim (a `CR LF` inside is normalized to `LF`).
+A raw string's bytes are taken verbatim (a `CR LF` inside is normalized to `LF`);
+this is not changing. A raw string containing a well-formed `${` … `}` pair
+lints as a warning (`${` is literal text here, never interpolation — the
+inverse of the interpreted string above, and the exact syntax an author
+arriving from a language where backtick strings interpolate is likely to write
+by mistake), **E0098**. A bare `$`, a `$foo`-shaped reference, or an unmatched
+`${` do not warn — those are ordinary raw-string content (a shell snippet, a
+Makefile fragment, another language's template).
 
 ### 5.8 Boolean and Nil Literals
 
