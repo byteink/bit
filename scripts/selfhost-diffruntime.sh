@@ -97,6 +97,16 @@
 # whole surface this walk can reach. It happens to cost nothing: the walk
 # below skips zero files.
 #
+# ## Reading a STAGE0-PINLAG verdict (#2937)
+#
+# A named accept list, defined just above the object-byte comparison below,
+# lets a KNOWN and EXPECTED divergence exit 0 without exiting silently: a run
+# that hits it prints one `STAGE0-PINLAG: <module> ...` line per accepted
+# module and a `diffruntime: STAGE0-PINLAG —` (not `PASS —`) summary line, so
+# it cannot be mistaken for a clean run. Any module NOT on that list still
+# fails on any divergence, same as before this ticket. See the list itself
+# for what it covers and why, and delete it at the next stage0 repin.
+#
 # Usage: ./make selfhost && bash scripts/selfhost-diffruntime.sh
 set -uo pipefail
 # shellcheck source=scripts/alarmrun.sh
@@ -264,16 +274,55 @@ done
 # oracle succeeded is a mismatch), applied at module instead of file
 # granularity. `-c --freestanding -o` with no `--target` compiles for the
 # host, matching `PLAT` resolved above.
+
+# --- Stage0 pin-lag accept list (#2937) ---
+#
+# Relative to stage0 pin 0.1.15. #2929 (arm64 leaf-frame elision,
+# compiler/arm64compile.bit, landed c750df13) and #2925 (inlined back-edge
+# safepoint guard) are real backend codegen changes in THIS tree; the pinned
+# stage0 predates both, so the OBJECT BYTES these modules compile to now
+# legitimately diverge even though nothing here is wrong — the fix being
+# present is exactly what the divergence is. It clears itself at the next
+# stage0 repin and is not something a code change here can close (#2382's
+# "outpaced oracle" case, same shape as the diffir/diffiropt/difftypes
+# family's STAGE0-PINLAG pattern proposed in #2718/#2719/#2720).
+#
+# It is deliberately object-bytes-only, not per-file: the IR walk above
+# (`--dump-ir-pre`, pre-optimizer) still agrees byte for byte with the
+# oracle on every runtime file. Only the post-optimizer machine code that
+# #2929/#2925 change diverges, which is exactly what this module-level
+# comparison and not the file-level one is for.
+#
+# Named exactly, not by wildcard: an entry here is a specific module this
+# divergence is already known to touch. A module NOT listed below still
+# fails the run on any divergence, including one of these 21 gaining a
+# sibling for a new, unexamined reason.
+#
+# DELETE THIS LIST AT THE NEXT STAGE0 REPIN (0.1.15 -> whatever pin next
+# contains c750df13/#2929). A module that still diverges after that repin is
+# a real regression, not pin lag, and must be investigated rather than
+# re-added here.
+PINLAG_MODULES="runtime runtime/alloc runtime/alloc/darwin runtime/auxv runtime/chan runtime/cryptohw runtime/gc runtime/net runtime/net/darwin runtime/park runtime/park/darwin runtime/rand runtime/root runtime/root/darwin runtime/sched runtime/sched/darwin runtime/shims/scan runtime/stw runtime/syscalls runtime/thread runtime/thread/darwin"
+
+is_pinlag_module() {
+  m="$1"
+  for p in $PINLAG_MODULES; do
+    [ "$p" = "$m" ] && return 0
+  done
+  return 1
+}
+
 objdev="$work/obj_dev"
 objor="$work/obj_or"
 mkdir -p "$objdev" "$objor"
 
-modmatch=0 modskip=0
+modmatch=0 modskip=0 modpinlag=0
 : >"$work/mod_mismatch"
 : >"$work/mod_timeout"
 : >"$work/mod_oracletimeout"
 : >"$work/mod_oraclecrash"
 : >"$work/mod_compared"
+: >"$work/mod_pinlag"
 
 i=0
 while [ "$i" -lt "$NMOD" ]; do
@@ -318,6 +367,10 @@ while [ "$i" -lt "$NMOD" ]; do
   echo "$dir" >>"$work/mod_compared"
   if cmp -s "$devobj" "$orobj"; then
     modmatch=$((modmatch + 1))
+  elif is_pinlag_module "$dir"; then
+    modpinlag=$((modpinlag + 1))
+    echo "$dir" >>"$work/mod_pinlag"
+    echo "STAGE0-PINLAG: $dir (accepted until stage0 repin past #2929/c750df13, see #2937)"
   else
     echo "$dir" >>"$work/mod_mismatch"
   fi
@@ -418,4 +471,8 @@ fi
 
 [ "$bad" -ne 0 ] && exit 1
 
-echo "diffruntime: PASS — $match/$total runtime file(s) lower identically ($skip skipped); $modmatch/$NMOD runtime module(s) byte-identical ($modskip skipped, object)"
+if [ "$modpinlag" -gt 0 ]; then
+  echo "diffruntime: STAGE0-PINLAG — $match/$total runtime file(s) lower identically ($skip skipped); $modmatch/$NMOD runtime module(s) byte-identical, $modpinlag accepted as pin-lag ($modskip skipped, object)"
+else
+  echo "diffruntime: PASS — $match/$total runtime file(s) lower identically ($skip skipped); $modmatch/$NMOD runtime module(s) byte-identical ($modskip skipped, object)"
+fi
