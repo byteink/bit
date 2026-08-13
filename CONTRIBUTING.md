@@ -66,7 +66,9 @@ one, and do not "fix" a missing CI badge by wiring a workflow back up.
 Verification happens on machines that can actually prove things:
 
 - `scripts/gate.sh` reads your diff and runs only the steps it can affect,
-  falling back to the full `./make test` when the change is cross-cutting.
+  refusing (exit 3, nothing run) rather than falling back to the full
+  `./make test` when the change is cross-cutting - run `scripts/gate.sh --full`
+  or `./make test` directly to verify one of those yourself (#2872).
 - `scripts/arm64gate.sh` and `scripts/x64gate.sh` run the suite on real
   aarch64-linux and real x86-64 Linux. The x86-64 host is resolved by
   `scripts/x64host.sh` from a machine-local list, never hardcoded - an emulated

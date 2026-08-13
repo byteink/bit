@@ -47,22 +47,46 @@
 #      answer for someone with no integrator to hand it to.
 #
 # BUCKETS: a change confined to exactly one of compiler/, runtime/,
-# tests/cases/, examples/, stdlib/, or docs/**/*.md runs only that area's
-# minimal steps. A change touching any OTHER path (anything unlisted below),
-# or spanning MORE THAN ONE of those six areas, is ambiguous and always runs
-# the full `./make test` — never a partial skip.
+# tests/cases/, examples/, stdlib/, docs/**/*.md, or spec/SPEC.md runs only
+# that area's minimal steps. A change touching any OTHER path (anything
+# unlisted below), or spanning MORE THAN ONE of those seven areas, is
+# ambiguous and always runs the full `./make test` — never a partial skip.
+#
+# EVERY BUCKET RUNS EVERY GATE WHOSE OWN DECLARED FILE SET (its `argv` or an
+# `env` entry in tools/build/gates.bit) INTERSECTS THAT BUCKET'S PATHS, not
+# just the one gate the bucket was originally named after (#2962). Read each
+# `Gate{}`'s argv/env before assuming a bucket's step list is complete — a
+# gate's scope is not its name. Concretely: `stdlib` and `examples` both run
+# `test-fmt` (its argv literally names `${repoRoot()}/stdlib` and
+# `${repoRoot()}/examples`); `selfhost`, `runtime` and `stdlib` all run
+# `test-lint-filelines` (tests/bit/lintfilelines.bit's own `dirs = ["compiler",
+# "runtime", "stdlib"]`); `runtime` also runs `test-lint-runtime` (its own
+# comment in gates.bit: "points `bit lint` at `${BIT_REPO}/runtime`");
+# `selfhost` also runs `test-selfhostcheck` (argv literally
+# `["check", "${repoRoot()}/compiler"]`); `docs` also runs `test-stdlib-docs`
+# (BIT_DOCS_ROOT — it fails on a `docs/stdlib/<mod>.md` missing a heading, same
+# as it does on an undocumented stdlib export); `testcases` also runs
+# `test-fuzz` (BIT_FUZZ_CASES=`${repoRoot()}/tests/cases` — it mutates that
+# real corpus, not a synthetic one); every tests/bit/** file also runs
+# `test-filesize` (tests/bit/filesize.bit's own stated scope: "anywhere under
+# tests/bit/, RECURSIVELY", not just its own harness file). A gate whose file
+# set could not be determined this way (no path in its own argv/env, and no
+# gates.bit comment naming one — e.g. `test-selfcheck`, `test-version-cli`) is
+# deliberately left out rather than guessed at from its harness's full source.
 #
 # PROSE IS CLASSIFIED BY FILE TYPE, NOT PATH PREFIX (#2801): a markdown file
 # cannot change what any gate compiles or runs, so it must never select a
 # CODE bucket by riding a shared prefix (runtime/*.md is not runtime/*.bit).
-# docs/**/*.md gets its own bucket (test-docs compiles its code fences).
-# runtime/**/*.md, spec/**, bench/**/*.md, README.md, CONTRIBUTING.md, and
-# dist/README.md are known to have no gate at all — a diff confined to those
-# runs nothing and says so, distinct from a `full` PASS that implies
-# something ran. Mixed with a real bucket, they are silently ignored rather
-# than downgrading or widening that bucket's selection. Any OTHER path (spec
-# was JUST the two files above, not scripts or dist/stage0/SHA256SUMS, which
-# feeds the runtime rebuild fingerprint) still falls through to `full` —
+# docs/**/*.md gets its own bucket (test-docs compiles its code fences), and
+# spec/SPEC.md gets its own bucket too (test-spec, #2758, is a real gate over
+# it — it is NOT prose with no gate, unlike its sibling spec/LINT.md).
+# runtime/**/*.md, spec/LINT.md (and any other spec/* besides SPEC.md),
+# bench/**/*.md, README.md, CONTRIBUTING.md, and dist/README.md are known to
+# have no gate at all — a diff confined to those runs nothing and says so,
+# distinct from a `full` PASS that implies something ran. Mixed with a real
+# bucket, they are silently ignored rather than downgrading or widening that
+# bucket's selection. Any OTHER path (not scripts or dist/stage0/SHA256SUMS,
+# which feeds the runtime rebuild fingerprint) still falls through to `full` —
 # under-selection is the failure this script exists to prevent, so a prefix
 # only gets a prose exception once it's proven output-irrelevant.
 #
@@ -158,6 +182,7 @@ has_testcases=0
 has_examples=0
 has_stdlib=0
 has_docs=0
+has_spec=0
 has_testsbit=0
 has_other=0
 has_noop=0
@@ -165,6 +190,7 @@ other_list=""
 touched_list=""
 testsbit_list=""
 docs_list=""
+spec_list=""
 noop_list=""
 
 # Extracts the gate name(s) whose `Gate.argv` literally names path `$1`, by
@@ -233,6 +259,24 @@ gates_for_file() {
       printf 'test-stwwiring\ntest-rootpins\n'
       return 0
       ;;
+    tests/bit/docsrunner/*)
+      # Same shape as tests/bit/objread/* and tests/bit/childrun/* above: no
+      # gate of its own — #2969 split tests/bit/docs.bit's batch-runner into a
+      # sibling directory, reached only by relative
+      # `import { ... } from "./docsrunner"` from exactly one harness
+      # (verified: `grep -rln 'from "\./docsrunner"\|from "\.\./docsrunner"'
+      # tests/bit/*.bit tests/bit/*/*.bit` matches only tests/bit/docs.bit).
+      # That relationship lives in a Bit `import` statement, not in gates.bit's
+      # `runArgs()` text, so it cannot be derived and is named here by hand —
+      # and `assert_dirgates_current` below cannot check it either, for the
+      # same reason: `tests/bit/docsrunner` has no `runArgs()` entry anywhere
+      # in gates.bit, so it never appears in the list that guard probes.
+      # (#2975, folded into #2962's audit: a split that adds a sibling
+      # directory silently narrows a gate's mapping the same way a bucket
+      # omission silently narrows a bucket's.)
+      printf 'test-docs\n'
+      return 0
+      ;;
     tests/bit/abimembers/*) printf 'test-abimembers\n'; return 0 ;;
     tests/bit/clicmd/*) printf 'test-clicmd\n'; return 0 ;;
     tests/bit/rootabi/*) printf 'test-rootabi\n'; return 0 ;;
@@ -289,7 +333,7 @@ assert_dirgates_current
 # space-separated `$1`. Prints "" the moment ANY path fails to map to a gate —
 # a partial guess is worse than `full`, so one unmapped file poisons the set.
 testsbit_steps_for() {
-  local files="$1" out="" g gg
+  local files="$1" out="" g gg f
   for f in ${files}; do
     g="$(gates_for_file "${f}")"
     if [ -z "${g}" ]; then
@@ -302,6 +346,29 @@ testsbit_steps_for() {
         *) out="${out:+${out} }${gg}" ;;
       esac
     done
+  done
+  # test-filesize (#2962) scans EVERY .bit file recursively under tests/bit/
+  # (tests/bit/filesize.bit's own stated scope: "anywhere under tests/bit/,
+  # RECURSIVELY"), not just its own harness file (tests/bit/filesize.bit,
+  # which the loop above already maps via the plain runArgs() grep). So any
+  # tests/bit/** file can flip its verdict and must run it too — added here
+  # rather than inside gates_for_file() itself so assert_dirgates_current()
+  # above keeps probing the UNMODIFIED per-file mapping: folding this into
+  # gates_for_file() would make every probe return non-empty regardless of
+  # whether a real case arm exists, silently defeating that guard.
+  # tests/imports/** is a different tree filesize.bit never walks, so it is
+  # excluded here — this loop only ever reaches this point once every file in
+  # `files` mapped successfully (the empty-return above already covers a
+  # partial/unmapped set), so it is safe to unconditionally add.
+  for f in ${files}; do
+    case "${f}" in
+      tests/bit/*)
+        case " ${out} " in
+          *" test-filesize "*) ;;
+          *) out="${out:+${out} }test-filesize" ;;
+        esac
+        ;;
+    esac
   done
   printf '%s' "${out}"
 }
@@ -408,11 +475,26 @@ while IFS= read -r f; do
         docs_list="${f}"
       fi
       ;;
+    # spec/SPEC.md compiles nothing, but tests/bit/spec.bit (#2758's
+    # test-spec) DOES read it — a grammar-consistency check, not prose with no
+    # gate — so it gets a REAL bucket too (#2962), matched ahead of the
+    # `spec/*` no-gate arm below the same way docs/*.md is matched ahead of
+    # nothing-reads-this prose. spec/LINT.md and every other spec/* path still
+    # fall through to that arm unchanged.
+    spec/SPEC.md)
+      has_spec=1
+      if [ -n "${spec_list}" ]; then
+        spec_list="${spec_list}, ${f}"
+      else
+        spec_list="${f}"
+      fi
+      ;;
     # These paths are pure documentation that no gate reads: runtime/**/*.md
     # (the runtime CODE bucket below is for runtime/*.bit etc, not prose),
-    # spec/** (SPEC.md/LINT.md only, checked by no automated gate), bench/**/*.md
-    # (bench/**/*.bit and bench/run.sh still fall through to `full`, unproven
-    # output-irrelevant), and the three standalone READMEs nothing greps.
+    # spec/* other than SPEC.md (LINT.md and any future sibling — checked by
+    # no automated gate), bench/**/*.md (bench/**/*.bit and bench/run.sh still
+    # fall through to `full`, unproven output-irrelevant), and the three
+    # standalone READMEs nothing greps.
     # Deliberately NOT added to has_other, has_noop, or bucket_count: mixed
     # with a real bucket it must be silently ignored, never force `full` and
     # never downgrade the real bucket (constraint in #2801).
@@ -482,9 +564,12 @@ fi
 if [ "${has_docs}" -eq 1 ]; then
   if [ -n "${touched_list}" ]; then touched_list="${touched_list}, docs"; else touched_list="docs"; fi
 fi
+if [ "${has_spec}" -eq 1 ]; then
+  if [ -n "${touched_list}" ]; then touched_list="${touched_list}, spec"; else touched_list="spec"; fi
+fi
 
 # has_noop is deliberately excluded here — see its case arm above.
-bucket_count=$((has_selfhost + has_runtime + has_testcases + has_examples + has_stdlib + has_docs))
+bucket_count=$((has_selfhost + has_runtime + has_testcases + has_examples + has_stdlib + has_docs + has_spec))
 
 # Computed ONCE, ahead of bucket selection, regardless of whether one of the
 # five areas also fired (#2510). Two consequences fall out of computing it
@@ -511,7 +596,7 @@ if [ "${FULL}" -eq 1 ]; then
   REASON="--full forced the full suite"
 elif [ "${has_other}" -eq 1 ]; then
   BUCKET="full"
-  REASON="touches path(s) outside the five scoped buckets: ${other_list}"
+  REASON="touches path(s) outside the scoped buckets: ${other_list}"
 elif [ "${bucket_count}" -gt 1 ]; then
   BUCKET="full"
   REASON="spans more than one bucket: ${touched_list}"
@@ -536,6 +621,9 @@ elif [ "${has_stdlib}" -eq 1 ]; then
 elif [ "${has_docs}" -eq 1 ]; then
   BUCKET="docs"
   REASON="only docs/**/*.md changed (${docs_list})"
+elif [ "${has_spec}" -eq 1 ]; then
+  BUCKET="spec"
+  REASON="only spec/SPEC.md changed"
 elif [ "${has_testsbit}" -eq 1 ]; then
   BUCKET="testsbit"
   REASON="only tests/bit/** or tests/imports/** changed (gate(s): ${testsbit_steps})"
@@ -543,9 +631,9 @@ elif [ "${has_noop}" -eq 1 ]; then
   BUCKET="noop"
   REASON="matched only path(s) known to be pure documentation with no gate: ${noop_list}"
 else
-  # Nothing in the five buckets, docs/**/*.md, tests/bit/**, tests/imports/**,
-  # or a known no-gate prose path changed, has_other is 0, and CHANGED is
-  # non-empty — the only
+  # Nothing in the five buckets, docs/**/*.md, spec/SPEC.md, tests/bit/**,
+  # tests/imports/**, or a known no-gate prose path changed, has_other is 0,
+  # and CHANGED is non-empty — the only
   # way here is a purely-additive tools/build/defs.bit/gates.bit registration
   # with no accompanying harness or source change. Nothing to scope narrowly
   # against, so full.
@@ -621,6 +709,9 @@ bucket_scripts() {
     examples)
       BUCKET_POST="scripts/selfhost-diffexamples.sh"
       ;;
+    # spec (test-spec, tests/bit/spec.bit) has no differential script — same
+    # shape as testcases/stdlib/docs/testsbit above, which also fall through
+    # with both empty.
     full)
       # THE UNION OF EVERY BUCKET ABOVE, and it must stay that way — enforced
       # below, not merely intended.
@@ -635,7 +726,12 @@ case "${BUCKET}" in
     BUILD_STEPS=(test)
     ;;
   selfhost)
-    BUILD_STEPS=(test-imports-bit)
+    # test-lint-filelines (its own harness: dirs = ["compiler", "runtime",
+    # "stdlib"]) and test-selfhostcheck (argv literally
+    # ["check", "${repoRoot()}/compiler"]) both examine compiler/ content
+    # directly and were missing here (#2962) — a compiler/**-only change ran
+    # neither.
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did
@@ -643,19 +739,45 @@ case "${BUCKET}" in
     # testing anything. The check after this case block now catches that class
     # before a single step runs — a bucket naming a nonexistent step is a
     # bucket that silently tests less than it claims.
-    BUILD_STEPS=(test-stress-exclusive test-stress-batch test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree)
+    #
+    # test-lint-filelines (compiler/runtime/stdlib line-count scan) and
+    # test-lint-runtime (its own gates.bit comment: "points `bit lint` at
+    # `${BIT_REPO}/runtime`", E0211 unused-local) both examine runtime/
+    # content directly and were missing here too (#2962).
+    BUILD_STEPS=(test-stress-exclusive test-stress-batch test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime)
     ;;
   testcases)
-    BUILD_STEPS=(test-golden)
+    # test-fuzz mutates the real tests/cases corpus (BIT_FUZZ_CASES=
+    # ${repoRoot()}/tests/cases, not a synthetic one — tests/bit/fuzz.bit's own
+    # header: "measured ~22 inputs/second over the real tests/cases corpus"),
+    # so a tests/cases/**-only change ran test-golden but never the fuzzer
+    # against its own new/changed seeds (#2962). exclusive: true in gates.bit,
+    # same as this bucket's existing test-stress-exclusive, so mixing it in
+    # here is already a proven shape.
+    BUILD_STEPS=(test-golden test-fuzz)
     ;;
   examples)
-    BUILD_STEPS=(test-examples)
+    # test-fmt's argv literally includes "${repoRoot()}/examples" alongside
+    # stdlib — missing here was the same bug this ticket exists to fix (#2962).
+    BUILD_STEPS=(test-examples test-fmt)
     ;;
   stdlib)
-    BUILD_STEPS=(test-imports-bit test-stdlib-docs)
+    # test-fmt's argv literally includes "${repoRoot()}/stdlib" (#2962, the
+    # instance that opened this ticket — #2955 shipped unformatted
+    # stdlib/tls/server.bit and this bucket stayed green). test-lint-filelines
+    # scans stdlib/ too (dirs = ["compiler", "runtime", "stdlib"] in its own
+    # harness).
+    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines)
     ;;
   docs)
-    BUILD_STEPS=(test-docs)
+    # test-stdlib-docs reads docs/stdlib/*.md directly (BIT_DOCS_ROOT — it
+    # fails when a docs/stdlib/<mod>.md is missing a heading for an exported
+    # symbol, the same check it runs from the stdlib side), so a
+    # docs/stdlib/*.md-only edit ran test-docs but never it (#2962).
+    BUILD_STEPS=(test-docs test-stdlib-docs)
+    ;;
+  spec)
+    BUILD_STEPS=(test-spec)
     ;;
   testsbit)
     # Populated from `testsbit_steps`, which the bucket-selection above
@@ -708,7 +830,7 @@ esac
 # a renamed script is the #1593 class of silent hole.
 bucket_scripts full
 FULL_SCRIPTS=" ${BUCKET_PRE} ${BUCKET_POST} "
-for b in full selfhost runtime testcases examples stdlib docs testsbit; do
+for b in full selfhost runtime testcases examples stdlib docs spec testsbit; do
   bucket_scripts "${b}"
   for s in ${BUCKET_PRE} ${BUCKET_POST}; do
     [ -f "${s}" ] || {
