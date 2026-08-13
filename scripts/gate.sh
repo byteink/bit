@@ -259,6 +259,24 @@ gates_for_file() {
       printf 'test-stwwiring\ntest-rootpins\n'
       return 0
       ;;
+    tests/bit/docsrunner/*)
+      # Same shape as tests/bit/objread/* and tests/bit/childrun/* above: no
+      # gate of its own — #2969 split tests/bit/docs.bit's batch-runner into a
+      # sibling directory, reached only by relative
+      # `import { ... } from "./docsrunner"` from exactly one harness
+      # (verified: `grep -rln 'from "\./docsrunner"\|from "\.\./docsrunner"'
+      # tests/bit/*.bit tests/bit/*/*.bit` matches only tests/bit/docs.bit).
+      # That relationship lives in a Bit `import` statement, not in gates.bit's
+      # `runArgs()` text, so it cannot be derived and is named here by hand —
+      # and `assert_dirgates_current` below cannot check it either, for the
+      # same reason: `tests/bit/docsrunner` has no `runArgs()` entry anywhere
+      # in gates.bit, so it never appears in the list that guard probes.
+      # (#2975, folded into #2962's audit: a split that adds a sibling
+      # directory silently narrows a gate's mapping the same way a bucket
+      # omission silently narrows a bucket's.)
+      printf 'test-docs\n'
+      return 0
+      ;;
     tests/bit/abimembers/*) printf 'test-abimembers\n'; return 0 ;;
     tests/bit/clicmd/*) printf 'test-clicmd\n'; return 0 ;;
     tests/bit/rootabi/*) printf 'test-rootabi\n'; return 0 ;;
