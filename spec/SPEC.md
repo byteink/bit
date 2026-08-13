@@ -137,7 +137,12 @@ a call.
 ### 5.3 Predeclared Identifiers (not keywords)
 
 These are ordinary identifiers bound in the universe scope. They may be shadowed
-by user declarations (doing so is discouraged and lints as a warning):
+by user declarations (doing so is discouraged and lints as a warning, **E0048**)
+— with one exception: a **root-module** function whose bare name also names a
+symbol the linked runtime resolves externally is rejected outright (**E0096**,
+§11.7), because shadowing it there does not merely change name resolution, it
+changes what the linker binds the runtime's own call to. Every other module is
+unaffected, since only the root module's link names are left bare.
 
 - Types: `i8 i16 i32 i64  u8 u16 u32 u64  f32 f64  int uint  byte rune  bool string  error`
 - Constants: none beyond the `true`/`false`/`nil` literals.
@@ -1094,6 +1099,36 @@ both platforms still uses `extern fn` for Darwin and a raw syscall for
 Linux, not one source form. A **runtime** symbol (`bit_rt_*`) is the case this
 rule admits: it is present in the archive on every target, so one source form
 does work for it.
+
+**An ordinary function's name can collide with this same boundary, from the
+other side.** Every top-level declaration in the **root module** keeps its bare
+source name as its link-level symbol — `main` stays `main`, and a
+single-module build's object is byte-identical to what it would be without
+module numbering. Every other module's top-level names carry an `m<id>$`
+prefix so two modules' same-named declarations cannot collide in the object's
+flat symbol namespace (§17.1); only the root is exempt. A root-module
+function's bare name is therefore indistinguishable, at the symbol table, from
+an `extern fn`'s own verbatim name or a name the platform C library exports —
+and the final link resolves a still-undefined reference to *whichever*
+definition it finds, silently binding the runtime's own extern call to the
+user's function instead of to the library. This is not always a crash: a root
+`fn write` shadowing the runtime's own `extern fn write` used for stdout makes
+every `println` print nothing, at exit 0.
+
+**E0096** `root_name_collision` rejects a root-module function whose bare name
+matches any symbol the program's linked runtime archive resolves externally —
+derived from the archive's own actual undefined-symbol set for the build's
+target, never a fixed list of C names, so the check can neither miss a
+collision this exact runtime creates nor false-positive on a name that merely
+looks like a C function. The check only applies where a link actually happens:
+`bit build --emit-obj` performs no link and poses no membership question, the
+same carve-out §11.7 makes for E0078 above. This is a **hard error, not a
+warning**, and it is the one exception to §5.3's "predeclared names may be
+freely shadowed": a predeclared name that also names a linked extern (`close`,
+for instance — §16's `close(chan)` is also `runtime/root/darwin/fs.bit`'s
+`extern fn close`) may still be shadowed everywhere *except* by a bare
+root-module declaration, where E0096 fires instead of the ordinary
+`shadows_predeclared` warning (**E0048**, §5.3).
 
 ### 11.8 Raw Syscalls (unmanaged subset)
 
