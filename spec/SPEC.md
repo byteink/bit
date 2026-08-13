@@ -2981,7 +2981,12 @@ catch_expr = binary [ "catch" ( expression | IDENT block ) ] .
   - `expr catch e { ... }` — binds the err value to `e` in the block; the block
     must either produce a `T` (its final expression) or divert control
     (`return` / `fail` / `panic` / `break` / `continue`). This is the full-handling
-    form.
+    form. **Exception when `T` is `()`** (the operand is void-fallible, `()!`):
+    no expression can produce `()` (§11 makes a bare `()` a type only in result
+    position), so the block need not end in a value expression — falling off
+    the end, including an empty block, already yields `()`, the same way a
+    `=> block` arrow body with no value-returning `return` defaults to `()`
+    (§12.8). A non-void `T` still requires a value or diverted control.
 
 Example:
 
