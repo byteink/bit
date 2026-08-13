@@ -960,7 +960,7 @@ defined exactly once).
 | `bit_rt_os_env`       | `(name: *const RtBytes) -> *const RtBytes` (§19)       |
 | `bit_rt_os_self_exe`  | `() -> *const RtBytes` (§19)                           |
 | `bit_rt_os_exit`      | `(code: i64) -> noreturn` (§19)                        |
-| `bit_rt_os_run`       | `(path: *const RtBytes) -> i64` (§19)                  |
+| `bit_rt_os_run`       | `(path: *const RtBytes, argv: *const SliceHeader) -> i64` (§19) |
 | `bit_rt_os_run_test`  | `(path: *const RtBytes, idx: i64) -> i64` (§19)        |
 | `bit_rt_os_run_bounded` | `(path: *const RtBytes, timeout_ms: i64) -> i64` (§19) |
 | `bit_rt_os_run_test_bounded` | `(path: *const RtBytes, idx: i64, timeout_ms: i64) -> i64` (§19) |
@@ -1522,8 +1522,8 @@ bit_rt_os_arg_at(i)        -> *const RtBytes   // "" when out of range
 bit_rt_os_env(name)        -> *const RtBytes   // "" when unset
 bit_rt_os_self_exe()       -> *const RtBytes   // own path, symlinks resolved; "" if unknown
 bit_rt_os_exit(code)       -> noreturn         // deferred calls do not run
-bit_rt_os_run(path)        -> i64              // child exit code; -1 on failure, <= -100 signal-killed
-bit_rt_os_run_test(path, i) -> i64             // like os_run + BIT_TEST_INDEX=i
+bit_rt_os_run(path, argv)  -> i64              // child exit code; argv ([]string) appended after path; -1 on failure, <= -100 signal-killed
+bit_rt_os_run_test(path, i) -> i64             // like os_run + BIT_TEST_INDEX=i (no argv)
 bit_rt_os_run_bounded(path, timeout_ms)      -> i64  // os_run, killed if it outlives timeout_ms
 bit_rt_os_run_test_bounded(path, i, timeout_ms) -> i64  // os_run_test, same bound
 bit_rt_host_target()       -> i64              // host BuildTarget ordinal (0/1/2)
@@ -1534,11 +1534,15 @@ bit_rt_auxv()              -> i64              // ELF auxv address; 0 when none
 Linux path and the Darwin `machoMain` path; `boot` captures the environment block.
 Bit has no nil string, so an unset variable and one set to `""` both read empty.
 
-`bit_rt_os_run` runs the executable at `path` as a child process, inheriting the
-captured `envp`. It is `bit run`/`bit test`'s launcher — `fork` + immediate `execve`
-(Linux: raw syscalls; Darwin: libSystem), the only work between fork and exec, so
-it is safe with scheduler worker threads live. Result encoding, the same one the
-bounded pair below uses minus the `-2` case it has no deadline to produce (#2019):
+`bit_rt_os_run` runs the executable at `path` as a child process, with `argv` (a
+`[]string`, or a null `SliceHeader` for the empty/default slice) appended to the
+child's own argv after `path` — `arg(0)` is `path` itself, exactly as it is for a
+binary the caller execs directly. The child inherits the captured `envp`. It is
+`bit run`'s launcher (`bit test` uses the separate `bit_rt_os_run_test` below) —
+`fork` + immediate `execve` (Linux: raw syscalls; Darwin: libSystem), the only
+work between fork and exec, so it is safe with scheduler worker threads live.
+Result encoding, the same one the bounded pair below uses minus the `-2` case it
+has no deadline to produce (#2019):
 
 ```
  >= 0     child exited normally with this code (0-255)
@@ -1551,6 +1555,41 @@ The `<= -100` case used to collapse to `-1`, which made a program that ran and
 then crashed indistinguishable from one that never started — `bit run` reported
 every segfault as "could not run". A caller that only tests `code < 0` keeps its
 old behaviour; one that wants the distinction subtracts.
+
+**`bit_rt_os_run` gained `argv` in place (#2399, `bit run <src> [args...]`)
+rather than through a new symbol beside it.** A new symbol was tried first and
+reverted: `compiler/build.bit` — part of `compiler/`'s own self-hosting
+source — is what needed to call it, and `compiler/`'s own build (`./make
+selfhost`) is compiled by the PINNED stage0, a published release
+(`dist/stage0/SHA256SUMS`). Stage0 has no idea a brand-new predeclared name
+exists, so a call to one fails `E0040: undefined name` on every clean build
+until the next stage0 repin — which itself needs a published release first,
+a circular requirement a single commit cannot satisfy. Reusing the
+ALREADY-recognized `osRun` identifier sidesteps that entirely: this compiler
+validates no builtin call's arity (`compiler/validatecall.bit`'s `vCall`),
+so stage0 accepts a 2-argument call to a name it has always known, with
+nothing new required of its own predeclared-name table. Every caller was
+updated in the same commit instead: `compiler/build.bit`'s `runCmd`,
+`compiler/pmfetchtail.bit`'s `runGit`, and the fixtures that call the
+predeclared `osRun` builtin directly rather than through a `std/os` wrapper
+(none exists) — `tests/cases/fs_walk_symlink.bit`,
+`tests/imports/pmadd_e2e/main.bit`, `examples/staticserver/staticserver.bit`.
+
+`argv` is a `[]string` SliceHeader (§2), or a null header for the empty/default
+slice — the same content the old fixed `[path, NULL]` construction always
+sent. The child sees `[path, argv[0], ..., argv[n-1], NULL]`; `path` is
+`arg(0)` from the child's own `bit_rt_os_argc`/`bit_rt_os_arg_at`, exactly as
+it was before and as it is for a binary the caller execs directly.
+
+The runtime builds this argv vector into a FIXED buffer (Power of 10 rules
+2/3: no unbounded allocation, no unbounded loop), so it is capped at
+`osRunMaxArgv` (64) forwarded elements of at most `osRunMaxArgLen` (4096)
+bytes each (`runtime/root/os.bit`'s consts). Above either bound the call is
+REJECTED — `bit_rt_os_run` returns `-1`, the same sentinel a spawn failure
+uses — never truncated: a silently shortened argument would be the same
+class of bug #2023 closed for a silently dropped one. `compiler/build.bit`'s
+`runMaxForwardedArgs` mirrors the count so `bit run` itself reports a
+specific, named rejection before ever reaching the runtime's generic one.
 
 `bit_rt_host_target` returns the ordinal of the `BuildTarget` this binary's own
 host matches (0 `x86_64-linux`, 1 `aarch64-linux`, 2 `aarch64-macos` — the enum in
