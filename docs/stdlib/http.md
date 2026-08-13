@@ -79,8 +79,11 @@ fn accepts(req: Request): string {
 
 ## Server
 
-Drive the server with an `accept()` loop, spawning a green thread per exchange so
-a slow handler never delays the next accept.
+Drive the server with an `accept()` loop, spawning a green thread per exchange
+and calling `Exchange.read()` there. `accept()` only accepts — it returns as
+soon as a connection exists, before anything is read off it — so a slow or
+stalled client's read can only ever block its own exchange, never the next
+accept or another exchange's read.
 
 ### `Server`
 
@@ -88,7 +91,8 @@ A listening HTTP server.
 
 ### `Exchange`
 
-One accepted request (`request`) together with the connection to answer it on.
+One accepted connection, and the connection to answer it on. Call `read()` to
+get the request.
 
 ### `serve(host: string, port: int): Server!`
 
@@ -101,8 +105,18 @@ The port the server is bound to.
 
 ### `Server.accept(): Exchange!`
 
-Accepts the next connection and reads its request, parking until a client
-arrives.
+Accepts the next connection, parking until a client arrives. Returns
+immediately once the connection exists — it does not read anything off it;
+call `Exchange.read()` for that, on its own spawned green thread.
+
+### `Exchange.read(): Request!`
+
+Reads the request (headers and body) off this exchange's connection. Parks
+until the whole request arrives. Fails on a malformed request (bad framing, a
+Content-Length/Transfer-Encoding conflict, a control character in a header, or
+a header block over the 64 KiB cap) — answer 400 and drop the connection
+rather than pass the failure to a handler. Call this on its own green thread
+(spawned right after `accept()`), never inline in the accept loop.
 
 ### `Exchange.respond(res: Response): ()!`
 
@@ -137,8 +151,11 @@ fn main() {
   }
 }
 
-// Or drive the loop yourself for a kernel-chosen port or bounded serving:
+// Or drive the loop yourself for a kernel-chosen port or bounded serving.
+// `read()` runs on the spawned thread, not the accept loop, so one slow
+// client cannot delay anyone else's accept or read.
 fn handle(ex: Exchange): ()! {
+  let req = ex.read()?
   ex.respond(ok("hello from bit"))?
 }
 
