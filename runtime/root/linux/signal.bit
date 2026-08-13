@@ -132,6 +132,37 @@ const sigTrap: int = 5
 const saSiginfo: int = 4
 const saOnstack: int = 134217728
 
+// SA_RESTORER = 0x04000000 (`include/uapi/asm-generic/signal-defs.h`, same
+// header as SA_SIGINFO/SA_ONSTACK above). REQUIRED on x86_64, not optional
+// (#2988): `arch/x86/kernel/signal.c`'s `__setup_rt_frame` for a native
+// 64-bit process starts with
+//
+//     /* x86-64 should always use SA_RESTORER. */
+//     if (!(ksig->ka.sa.sa_flags & SA_RESTORER))
+//         return -EFAULT;
+//
+// and refuses BEFORE it ever writes `regs->ip = handler` — so a registration
+// missing this flag is accepted by `rt_sigaction` (which only validates the
+// arguments, not the eventual delivery) and then silently never fires: the
+// frame build fails, `force_sigsegv` resets the disposition to SIG_DFL and
+// re-raises, and the process dies with the ORIGINAL fault's `rip` still
+// showing, no handler ever entered, nothing on stderr. That is `bit: stack
+// overflow in a spawned task` never printing and exit 139 with empty stderr —
+// confirmed on real x86_64 hardware (`ssh hl-master`) with a core dump: the
+// crashed thread's `NT_PRSTATUS` showed `rip` still at the user program's own
+// faulting instruction, never having moved to `segvHandler`'s address, and
+// the second (fatal) SIGSEGV carried `si_code=SI_KERNEL si_addr=NULL` —
+// exactly `force_sigsegv`'s synthetic siginfo, not a real fault.
+//
+// The restorer this flag names is `sigReturnTrampoline` below. It is
+// EFFECTIVELY DEAD CODE for `segvHandler`/`trapHandler`, which never return —
+// every path ends in `rootExit` — so the kernel never actually jumps to it.
+// The flag and a VALID pointer must still be present at REGISTRATION time
+// regardless: the check above is unconditional on `sa_flags`, checked once
+// when the signal is delivered, with no dependency on whether the handler
+// later returns.
+const saRestorer: int = 67108864
+
 // `sigaltstack(2)`'s `stack_t` — `{ void *ss_sp; int ss_flags; size_t
 // ss_size; }`, 24 bytes. THE FIELD ORDER IS LINUX'S OWN: Darwin puts
 // `ss_size` second and `ss_flags` last (../darwin/signal.bit). Verified with
@@ -357,33 +388,49 @@ const overflowSpawned: int = 2
   rootExit(2)
 }
 
+// The `sa_restorer` `installFatalSignalHandlers` registers (#2988, see
+// `saRestorer` above for why a real one is mandatory on x86_64 even though
+// neither `segvHandler` nor `trapHandler` ever returns through it). Two
+// instructions, `mov $__NR_rt_sigreturn, %eax; syscall` on x64 — the classic
+// libc trampoline shape — `mov x8, #__NR_rt_sigreturn; svc #0` on arm64. Both
+// architectures' numbers are from the per-arch kernel syscall table, not from
+// memory: 15 on x86_64 (`arch/x86/entry/syscalls/syscall_64.tbl`), 139 on
+// aarch64 (`include/uapi/asm-generic/unistd.h`, `__NR_rt_sigreturn`).
+//
+// Provided on BOTH architectures even though the mandatory check above is
+// documented only for x86_64: a valid restorer is always correct to supply,
+// and #2988's hardware reproduction is x86_64-only (`ssh hl-master`) — this
+// aarch64-linux arm is unverified on real hardware and should be confirmed
+// there before being relied on.
+@nosplit fn sigReturnTrampoline() {
+  asm {
+    arm64 { 0xD2801168, 0xD4000001 } // mov x8, #139; svc #0
+    x64   { 0xB8, 0x0F, 0x00, 0x00, 0x00, 0x0F, 0x05 } // mov eax, 15; syscall
+  }
+}
+
 // Register `segvHandler` for SIGSEGV/SIGBUS and `trapHandler` for
-// SIGTRAP/SIGILL (#2946), process-wide, SA_SIGINFO | SA_ONSTACK. Same 4-word
-// kernel `struct sigaction` shape `ignoreSigpipe` builds, in two separate
-// buffers (`segvActBuf`/`trapActBuf`, one per handler entry) written once,
-// from `boot`, before any worker thread exists — call this before step 6
+// SIGTRAP/SIGILL (#2946), process-wide, SA_SIGINFO | SA_ONSTACK | SA_RESTORER.
+// Same 4-word kernel `struct sigaction` shape `ignoreSigpipe` builds, in two
+// separate buffers (`segvActBuf`/`trapActBuf`, one per handler entry) written
+// once, from `boot`, before any worker thread exists — call this before step 6
 // starts any worker, so both dispositions are live before the first task can
 // run.
-//
-// `restorer` (word 2) IS LEFT NULL in both, deliberately, unlike a libc
-// `sigaction` call, which always sets one. A restorer is only ever consulted
-// when a handler RETURNS, to invoke `rt_sigreturn` — neither `segvHandler`
-// nor `trapHandler` ever returns (every path ends in `rootExit`, see their
-// own comments), so there is nothing for a restorer to do here. SA_RESTORER
-// is correspondingly left OFF `flags` in both.
 @nosplit fn installFatalSignalHandlers() {
+  let restorer = int(entryOf(sigReturnTrampoline))
+
   let base = int(ptrOf(segvActBuf))
   storeWord(base, int(entryOf(segvHandler)))
-  storeWord(base + 8, i64(saSiginfo | saOnstack))
-  storeWord(base + 16, 0)
+  storeWord(base + 8, i64(saSiginfo | saOnstack | saRestorer))
+  storeWord(base + 16, restorer)
   storeWord(base + 24, 0)
   syscall(sysRtSigaction(), i64(sigSegv), i64(base), i64(0), i64(sigSetSize))
   syscall(sysRtSigaction(), i64(sigBus), i64(base), i64(0), i64(sigSetSize))
 
   let trapBase = int(ptrOf(trapActBuf))
   storeWord(trapBase, int(entryOf(trapHandler)))
-  storeWord(trapBase + 8, i64(saSiginfo | saOnstack))
-  storeWord(trapBase + 16, 0)
+  storeWord(trapBase + 8, i64(saSiginfo | saOnstack | saRestorer))
+  storeWord(trapBase + 16, restorer)
   storeWord(trapBase + 24, 0)
   syscall(sysRtSigaction(), i64(sigTrap), i64(trapBase), i64(0), i64(sigSetSize))
   syscall(sysRtSigaction(), i64(sigIll), i64(trapBase), i64(0), i64(sigSetSize))
