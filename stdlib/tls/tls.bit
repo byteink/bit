@@ -448,6 +448,18 @@ export fn dialDeadline(host: string, port: int, config: TlsConfig, deadlineNs: i
 // server flight, process it, send the produced record(s) (a resent ClientHello
 // on HelloRetryRequest, or the client Finished when done), and stop once done.
 // Bounded to the ClientHello, one retry, and the final flight.
+//
+// A certificate-rejection failure inside `processServerFlight` (bad chain,
+// hostname mismatch, bad CertificateVerify signature — #2320) is tagged
+// `tlsAlertFail` by `clientflight.bit`; every one of those sites runs only after
+// `clientProcessServerHello` has already derived `h.clientHsKeys` — Certificate,
+// CertificateVerify and Finished are always the server's second, AEAD-sealed
+// flight, never plaintext — so the alert this sends is always sealed under that
+// same key, continuing its sequence rather than restarting one at an
+// already-spent nonce. An untagged failure (a framing/negotiation error, which
+// can happen before any handshake key exists) sends no alert, unchanged from
+// before this fix: this ticket's scope is the certificate-rejection paths, not
+// every conceivable client-detected error.
 fn tlsapiDriveClient(f: tlsapiFramer, config: TlsClientConfig): TlsClientConn! {
   let h = tlsClientStart(config)?
   f.connWrite(string(h.hello))?
@@ -455,13 +467,38 @@ fn tlsapiDriveClient(f: tlsapiFramer, config: TlsClientConfig): TlsClientConn! {
   while (guard < 4) {
     guard = guard + 1
     let flight = tlsapiReadServerFlight(f)?
-    let step = h.processServerFlight(flight)?
+    let step = h.processServerFlight(flight) catch e {
+      tlsapiSendClientAlert(f, h, e)
+      fail e
+    }
     f.connWrite(string(step.outbound))?
     if (step.done) {
       return h.connection()?
     }
   }
   fail newError("tls: client handshake did not complete within the flight bound")
+}
+
+// Best-effort: if `e` is a `tlsAlertFail` (a certificate-rejection site in
+// `clientflight.bit` tagged it), send the peer the fatal alert it names before
+// the caller closes the socket (RFC 8446 §6.2: "both parties MUST immediately
+// close the connection" after transmitting or receiving one). An untagged `e`
+// sends nothing — see `tlsapiDriveClient`'s doc comment for why that is
+// deliberate, not a gap. Sealing can itself fail only if `h.clientHsKeys` rejects
+// the 2-byte alert body, which RFC 8446 §5.2's 2^14-byte cap never does; that
+// case, like a failed write, is swallowed rather than surfacing, for the same
+// reason `tlsapiSendAlert` swallows a write failure: this is a secondary,
+// best-effort send and must never replace or block the caller's own handshake
+// error.
+fn tlsapiSendClientAlert(f: tlsapiFramer, h: TlsClientHandshake, e: error) {
+  let (tagged, ok) = e.(tlsAlertFail)
+  if (!ok) {
+    return
+  }
+  let alert = tlsAlertSealedRecord(h.clientHsKeys, tagged.desc) catch e2 {
+    return
+  }
+  tlsapiSendAlert(f.conn, alert)
 }
 
 // Gather one complete server flight off the stream. The ServerHello is the first
