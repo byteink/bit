@@ -454,11 +454,46 @@ export @nosplit @symbol("bit_rt_fs_list_dir") fn rtFsListDir(path: int): int {
   return rtStringSlice(out, 0, got)
 }
 
+// Darwin errno for an interrupted syscall (`<sys/errno.h>`), shared by every
+// libSystem call in this runtime — see ../../net/darwin/sock.bit's identical
+// constant. `read()` sets thread-local `errno` and returns -1 on ANY failure;
+// `__error()` is `std.c._errno`'s `__error` symbol, the only way Bit code
+// reaches it (#2990's investigation — no accessor existed in this module).
+const eIntr: int = 4
+
+// A large but PROVABLY BOUNDED retry budget (Power of 10 rule 2) for a `read`
+// interrupted by a signal (`EINTR`): POSIX says retry, and under concurrent
+// process/signal load (#2980) more than a handful of interruptions across one
+// file's read is plausible, so this is generous rather than tight.
+const maxReadAllRetries: int = 1000
+
+extern fn __error(): *i32
+
+// The errno of the `read` that just failed. Read IMMEDIATELY after the call
+// that set it (`rtFsReadAll` does), before anything else touches libSystem.
+@nosplit fn readAllErrno(): int {
+  let p = __error()
+  return int(*p)
+}
+
 // `bit_rt_fs_read_all`: the whole file as a fresh string, sized by `lseek` to the
-// end and back. A seek error or empty file yields the empty string; a short read
-// leaves the tail zero-filled.
+// end and back. A seek error or empty file yields the empty string.
 //
-// BOUNDED (Power of 10 rule 2): `off` rises by at least 1 each iteration.
+// A short read NEVER fabricates content (#2990). `read` returning `n <= 0`
+// before `off` reaches `end` is one of three things: (a) `EINTR` — a signal
+// landed mid-call, not a failure, retried below; (b) `n == 0` — the file
+// shrank between the `lseek` probe and this read (a TOCTOU race, not this
+// runtime's error to report); (c) any other negative result — a genuine I/O
+// error. (b) and (c) both stop the read and return the string TRIMMED to the
+// `off` bytes actually verified read. The old code returned the full-length
+// string with its un-filled tail left as the zero bytes `rtStrAlloc` clears
+// memory to — indistinguishable from a file that genuinely contains NULs,
+// which made this silent corruption rather than an honest short read.
+//
+// BOUNDED (Power of 10 rule 2): every iteration that continues the loop
+// advances `off` by at least 1 (a successful partial read) OR advances
+// `retries` by 1 (an `EINTR` retry) — both counters are capped by the loop
+// condition itself, so the loop runs at most `end + maxReadAllRetries` times.
 export @nosplit @symbol("bit_rt_fs_read_all") fn rtFsReadAll(fd: int): int {
   let end = int(lseek(i32(fd), i64(0), i32(seekEnd)))
   if (end <= 0) {
@@ -471,12 +506,29 @@ export @nosplit @symbol("bit_rt_fs_read_all") fn rtFsReadAll(fd: int): int {
   }
   let base = strData(s)
   let off = 0
-  while (off < end) {
+  let retries = 0
+  while (off < end && retries < maxReadAllRetries) {
+    // Bracketed for the same reason `rtFsRead` above is (#2207, and #2990's
+    // investigation found this call was NOT bracketed): `fd` may be a pipe or
+    // a slow device, so this can block indefinitely, and `base` points into a
+    // live string held across the call, so `syscall`, not `blocked`.
+    gcSyscallBegin()
     let n = int(read(i32(fd), u8At(base + off), i64(end - off)))
-    if (n <= 0) {
-      return s
+    let err = 0
+    if (n < 0) {
+      err = readAllErrno()
     }
-    off = off + n
+    gcSyscallEnd()
+    if (n > 0) {
+      off = off + n
+    } else if (n < 0 && err == eIntr) {
+      retries = retries + 1
+    } else {
+      return rtStringSlice(s, 0, off)
+    }
+  }
+  if (off < end) {
+    return rtStringSlice(s, 0, off)
   }
   return s
 }
