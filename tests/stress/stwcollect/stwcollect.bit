@@ -75,6 +75,15 @@
 //       CONSERVATIVELY, which is what a raw `int` needs and what a stack map
 //       cannot give. Same synthetic-slot technique as E, with the payload
 //       placed where every other class is empty by construction.
+//   J — a thread parked in a `syscall` region (#1904, #2387): the class with
+//       no case here and, until this change, no entry in `stw.bit`'s header
+//       either — implemented and wired into `stwScanTasks` but enumerated
+//       nowhere, so the declared/covered comparison below agreed with itself
+//       while missing it entirely. Same `worldClaim` technique as E and I, but
+//       published as `mSyscall` with a stack pointer (`stwSyscallLo`'s half)
+//       rather than a frame, plus a second payload planted in the register
+//       block `worldSyscallRegs` returns (`stwScanSyscallRegs`'s half, #1742's
+//       gap over this state).
 //
 // ---------------------------------------------------------------------------
 // ONE CASE PER ROOT CLASS — THE RULE, AND WHY IT IS ENFORCED STATICALLY (#1683)
@@ -108,6 +117,7 @@ import { heapInit, heapWords } from "../../../runtime/alloc"
 import { gcInit, gcConfigure, gcAlloc, gcOwns, gcNumObjects, gcStatCollections } from "../../../runtime/gc"
 import { gcWords, gcBindMemory, storeWord, loadWord, loadByte, reserveWords } from "../../../runtime/gc"
 import { worldWords, worldClaim, worldRelease, maxMutators, mParked, muWords } from "../../../runtime/gc"
+import { mSyscall, worldSyscallRegs, worldSyscallRegWords } from "../../../runtime/gc"
 import { rtChanMake, chanBootBind, chanRegWords } from "../../../runtime/chan"
 import { stwPollOn, stwAbandonedCount, stwBadOffsetsOn } from "../../../runtime/stw"
 import { schedWords, scRegHead, taskWords, taskArg, taskState, taskParked } from "../../../runtime/sched"
@@ -172,6 +182,13 @@ const MI_BAD_OFFS = 21
 const MU_STATE = 0
 const MU_FRAME = 1
 const MU_ACKED = 2
+// Word 4 (`gcworld.bit`'s `const muSp = 4`): the caller's `sp` at entry to a
+// `syscall` region, published by `worldBeginSyscall` and read by class 9's
+// `stwSyscallLo`. Hardcoded for the same reason MU_STATE/MU_FRAME/MU_ACKED
+// are: a drift fails phase J loudly (the slot never reads as belonging to
+// the fake task, and `alive=false` for a payload that should have survived)
+// rather than silently skipping the class.
+const MU_SP = 4
 // The slot stride is `muWords`, imported rather than copied. It WAS a local
 // `const MU_WORDS = 4`, and #1904 making it 5 silently moved every slot this
 // file writes — the state landed in the wrong word, the slot never looked
@@ -216,6 +233,9 @@ const M_CLS8 = 1016
 const CLS8_COUNT = 16
 const M_CLS10 = 1017
 const M_CLS10_DEAD = 1018
+const M_SYSCALL = 1019
+const M_SYSCALL_REG = 1020
+const M_SYSCALL_DEAD = 1021
 
 // Phase I's stack, and the three slots in it. The geometry is what makes the
 // phase a test of class 10 ALONE, so each number is load-bearing:
@@ -243,6 +263,17 @@ const PARK_PAYLOAD_SLOT = 400
 // x19..x28 / rbx,r12..r15); this program never runs the task through a real
 // switch, so no slot is more "correct" than another.
 const CTX_SLOT = 6
+
+// Phase J's stack, and the two slots in it — the same geometry phase I uses,
+// for the same reason: 512 words is longer than the 265-word scratch area, so
+// class 6 covers only words 0..264 and both slots below sit outside it, and
+// `ctxSp` is set to the stack's own TOP so class 4's own contribution is
+// empty. The published `sp` sits at word 300 — inside the mapping, above the
+// scratch area — and the payload at word 400, between that `sp` and `ctxSp`,
+// so only class 9's lowering of the scan's low bound brings it into range.
+const SYSCALL_STACK_WORDS = 512
+const SYSCALL_SP_SLOT = 300
+const SYSCALL_PAYLOAD_SLOT = 400
 
 // ---------------------------------------------------------------------------
 // An INDEPENDENT decoder for the emitted stack-map table (ABI.md §4)
@@ -336,6 +367,10 @@ fn main() {
   // standing in — see PARK_STACK_WORDS for why the geometry is what it is.
   let parkStackTask = []i64(taskWords)
   let parkedStack = []i64(PARK_STACK_WORDS)
+  // Phase J's task and the stack a synthesized syscall-parked thread claims to
+  // be standing in — see SYSCALL_STACK_WORDS for the geometry.
+  let syscallTask = []i64(taskWords)
+  let syscallStack = []i64(SYSCALL_STACK_WORDS)
 
   // Phase D's task. Its stack is exactly `chanScratchWords` words, so the whole
   // scratch area is mapped and the scan's `min(chanScratchWords, stackBytes/8)`
@@ -857,6 +892,67 @@ fn main() {
   // spin to its bound and abandon.
   worldRelease(wb, slot10)
 
+  // ---- phase J: ROOT CLASS 9, a thread parked in a `syscall` region -------
+  //
+  // #1904's state for a thread blocked in the kernel while still holding live
+  // Bit references — a subprocess `waitpid`, `runtime/ABI.md` §5's "syscall"
+  // contract. Neither `blocked` (no live references, by contract) nor
+  // `running` (waited for) fits it, so the collector scans it where it stands
+  // instead: the lowest published `sp` (`stwSyscallLo`) plus the saved
+  // callee-saved register file (`stwScanSyscallRegs`, #1742's gap over this
+  // state). This is #2387 exactly: the class was implemented and wired into
+  // `stwScanTasks` without ever being added to `stw.bit`'s ROOT SET header, so
+  // the declared/covered comparison above agreed with itself while missing it
+  // — no case here could have existed for a class the header did not name.
+  //
+  // Same `worldClaim` technique as phases E and I, but published as
+  // `mSyscall` rather than `mParked`. That needs no epoch/`acked` bookkeeping
+  // at all: `worldStoppedFor` counts a `syscall` slot as stopped
+  // unconditionally (#1904), unlike a `parked` one.
+  //
+  // Geometry mirrors phase I's: `ctxSp` at the stack's own TOP empties class
+  // 4's own contribution, the published `sp` sits at word 300 — above the
+  // 265-word scratch area, so class 6 cannot reach it either — and the stack
+  // payload at word 400 sits strictly between that `sp` and `ctxSp`, so only
+  // class 9's lowering of the scan's low bound brings it into the scanned
+  // range. The register payload is reachable ONLY through
+  // `stwScanSyscallRegs`, which class 9's slot lookup runs whenever the
+  // published `sp` belongs to this task, regardless of where the resulting
+  // low bound ends up.
+  let pSysStack = gcAlloc(g, nodeInfo)
+  storeWord(pSysStack, M_SYSCALL)
+  let pSysReg = gcAlloc(g, nodeInfo)
+  storeWord(pSysReg, M_SYSCALL_REG)
+  let pSysDead = gcAlloc(g, nodeInfo)
+  storeWord(pSysDead, M_SYSCALL_DEAD)
+
+  let syscallBase = int(ptrOf(syscallStack))
+  syscallStack[SYSCALL_PAYLOAD_SLOT] = pSysStack
+
+  let st = ptrOf(syscallTask)
+  *(st + taskArg) = 0
+  *(st + taskState) = taskParked
+  *(st + taskStackBase) = syscallBase
+  *(st + taskStackBytes) = SYSCALL_STACK_WORDS * 8
+  *(st + ctxSp) = syscallBase + SYSCALL_STACK_WORDS * 8
+  *(st + taskRegNext) = 0
+  *(ptrOf(schedBlock) + scRegHead) = int(st)
+
+  let slotJ = worldClaim(wb)
+  worldBlock[slotJ * muWords + MU_SP] = syscallBase + SYSCALL_SP_SLOT * 8
+  worldBlock[slotJ * muWords + MU_STATE] = mSyscall
+  storeWord(worldSyscallRegs(slotJ), pSysReg)
+
+  storeWord(snap + 0, 0)
+  storeWord(snap + 8, 0)
+  let cJ = gcStatCollections(g)
+  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
+  print("J ran=${gcStatCollections(g) > cJ} other=${slotJ > 0} stack=${alive(g, pSysStack, M_SYSCALL)} regs=${alive(g, pSysReg, M_SYSCALL_REG)} missed=${gcOwns(g, pSysDead)} abandoned=${stwAbandonedCount()}\n")
+  // Released for the reason phases E and I's are: leaving the slot `syscall`
+  // would make every later rendezvous conservatively scan a stale sp and
+  // register block that no longer describes a live thread.
+  worldRelease(wb, slotJ)
+
   // Hold every backing slice to the end of `main`, so only raw untraced pointers
   // ever reach the collector under test and the LIVE (libbitrt) collector cannot
   // move the ground under it when the suite reruns under BIT_GC=stress.
@@ -864,4 +960,5 @@ fn main() {
   print("held ${len(worldBlock) + len(schedBlock) + len(chanReserve) + len(reserveDesc) + len(regBlock) + len(fakeTask) + len(fakeStack) + len(longTask) + len(longStack) + len(frameBuf) + len(snapBuf)}\n")
   print("held ${len(scratchTask) + len(scratchStack) + len(parkFrame) + len(parkSnap)}\n")
   print("held ${len(ctxTask) + len(ctxStack) + len(cls8Task) + len(parkStackTask) + len(parkedStack)}\n")
+  print("held ${len(syscallTask) + len(syscallStack)}\n")
 }
