@@ -134,6 +134,32 @@ and `#2880` together): the list flattens onto one line only if **both** hold —
 2. the flattened form fits under the 100-column budget (§1) — except a
    single-element list, which always stays flat.
 
+**Nested width decisions inside a single-element list (`#2894`).** Point 2's
+single-element override means the list's own accept/reject test never looks
+at fit — only at whether the rendered item's text holds a newline. A nested
+construct that DOES make its own independent, column-dependent wrap
+decision — today only the binary/logical chain flattener (§10,
+`fmtPrintBinaryChain`, `compiler/fmtwrap.bit`) — must not measure that
+decision against the real, inherited column while it is rendering as a
+single-element list's sole item (however many such lists deep): the
+ancestor was always going to keep the result flat regardless of overflow,
+so a wrap there only manufactures the newline that forces the ancestor, and
+every enclosing single-element list in turn, to explode for no shortening
+gain. Instead it measures as if starting a fresh line at the current indent
+(`Printer.speculativeFlat`, cleared the moment a genuinely multi-item list
+is entered, since that decision is never moot). A single unbreakable
+argument nested three or more single-item calls deep can therefore render
+well past the 100-column budget — this is the same exemption as point 2
+above, correctly propagated through nesting instead of re-triggering a
+spurious wrap at each level, not a new exception to §1.
+
+**Check:** `b.f(g(x + y)).f(g(h(u | (v & w))))` (nested single-argument
+calls three deep, the inner expression alone over budget only once the
+outer calls' real column is added in) formats to one unwrapped line; halving
+`fmtMaxWidth` in a scratch build wraps the SAME expression at a shallower
+nesting depth, confirming the exemption is about nesting depth being moot,
+not about the checker ignoring width entirely.
+
 Otherwise it explodes to one item per line, each with a trailing comma, at
 one deeper indent level, preserving the author's own item grouping (`grouped`,
 `compiler/fmt.bit:467-485`) — two items the source kept on the same line stay
@@ -259,6 +285,13 @@ function declaration, …) is never followed by `;` in the output; a statement
 ending in a bare expression, identifier, or literal is.
 
 ## 10. Explicitly unsettled — no rule stated, do not invent one
+
+**This section is stale about `#2889`/`#2894` and is tracked as `#2954`.**
+`#2889` landed and gave `fmtPrintBinaryChain` a real 100-column check (see
+§5's "Nested width decisions" note, `#2894`) — the paragraph below still
+describes it as unimplemented. Do not trust the "no width check at all"
+claim for the `Binary`-tag path without re-reading `compiler/fmtwrap.bit`
+directly; `#2954` owns rewriting this section to match.
 
 **Width budget for bare (non-bracketed) constructs.** Return values,
 assignment sides, `case` expression lists, constraint bounds
