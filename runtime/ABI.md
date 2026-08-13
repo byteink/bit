@@ -1299,6 +1299,7 @@ instant it reads it.
 bit_rt_fs_open(path, write: bool) -> i64        // fd, or -1
 bit_rt_fs_append(path)            -> i64        // fd opened O_APPEND, or -1
 bit_rt_fs_read_all(fd)            -> string     // whole file (regular files only)
+bit_rt_fs_read_all_failed()       -> bool       // #2994 below
 bit_rt_fs_read(fd, max: i64)      -> string     // up to max bytes; "" at EOF
 bit_rt_fs_write(fd, s)            -> i64        // bytes written, or -1
 bit_rt_fs_close(fd)               -> i64        // always 0
@@ -1312,16 +1313,45 @@ bit_rt_fs_list_dir(path)          -> string     // NUL-terminated entry names
 The low-level layer under `std/fs`. Deliberately plain (not fallible): failures
 surface as a `-1` fd/byte-count that the Bit `std/fs` wrappers turn into real
 errors (`fail newError(...)`), so all error *ergonomics* live in Bit, not the
-runtime. Backed by the raw per-platform syscalls in `runtime/sched/sched.bit` (`openFd`/
+runtime — with one out-of-band exception, `fs_read_all_failed` (#2994, directly
+below). Backed by the raw per-platform syscalls in `runtime/sched/sched.bit` (`openFd`/
 `readFd`/`writeFd`/`closeFd`/`fileSize`, dispatched `std.os.linux.*` on Linux,
 `std.c.*` on Darwin — no libc dependency on the hot path).
 
-- `fs_open` copies the (non-NUL-terminated) Bit path into a bounded stack buffer
-  before the syscall; `write=false` opens read-only, `write=true`
-  creates+truncates write-only (mode `0644`).
 - `fs_read_all` sizes the result with `lseek(SEEK_END)` then reads, so it targets
   regular files; a non-regular fd or stat error yields the empty string. A short
-  read leaves the tail zero-filled (v1 regular-file scope).
+  read **never** fabricates content (#2990: the result is always trimmed to the
+  bytes actually verified read, never zero-padded to the expected length) and
+  is one of two things: a genuine early EOF (the file shrank between the
+  `lseek` probe and the read — not an error, the file really is that length
+  now) or a genuine I/O error. The two are indistinguishable from the `string`
+  result alone; `fs_read_all_failed` (#2994) is how a caller tells them apart.
+- `fs_read_all_failed` is a **second, companion symbol beside `fs_read_all`**,
+  not a change to its signature or its existing contract. It publishes whether
+  the MOST RECENT `fs_read_all` call by this task stopped on a genuine I/O
+  error (`true`) rather than completing normally or hitting a genuine early
+  EOF (`false`); it is cleared at the *start* of every `fs_read_all` call, so a
+  prior call's outcome never leaks forward. Same mechanism as §11's
+  `chan_recv_ok` beside `chan_recv`: a dedicated word in the per-task scratch
+  block (`runtime/sched/scratch.bit`'s `scrFsReadFailed`, offset 265), written
+  by `runtime/root/{darwin,linux}/fs.bit`'s `rtFsReadAll` and read back by
+  `runtime/root/slots.bit`'s `rtFsReadAllFailed`. Must be read immediately
+  after `fs_read_all` returns, with no yield or another scratch-writing
+  operation between them — the same adjacency requirement §11 and §13 already
+  state for their own per-task flags. `stdlib/fs/fs.bit`'s `readAll()` reaches
+  it via a plain `extern fn` (SPEC §11.7), the same route `bit_rt_fs_is_symlink_w`
+  already uses, rather than through a compiler-recognized builtin name —
+  `fs_read_all` stays the single non-fallible builtin it always was.
+  Considered and rejected: routing through the general fallible-result error
+  slot (§13, `bit_rt_set_err`/`get_err`) instead of a new word — rejected
+  because that slot's non-null value must be a real `error`-interface object
+  pointer (§13: "the error value is an `error`-interface object pointer"),
+  which `runtime/root`'s freestanding, below-stdlib code has no way to
+  construct (no vtable/type-info access at that layer); reusing it with a
+  non-conforming sentinel would corrupt the NEXT unrelated `?`/`catch` in the
+  same task that reads the slot. A plain sentinel return on `fs_read_all`
+  itself was also rejected: it is the shape easiest to ignore at a call site,
+  which is the defect class #2990/#2994 exist to close.
 - `fs_close` reports success unconditionally (the raw wrapper swallows
   `EINTR`/`EBADF`).
 - `fs_read` reads once and returns what it got, so it is the primitive for
@@ -1952,6 +1982,12 @@ different OS thread — a per-OS-thread slot could not:**
   `bit_rt_chan_recv` on every receive path. Same file and mechanism as
   `pending_err` above; not the same mechanism as `udp_last_sender` below,
   despite the two being listed together before this audit.
+- `last_fs_read_all_failed` (§14, #2994) — `bit_rt_fs_read_all_failed`
+  (`slots.bit`'s `rtFsReadAllFailed`) reads `scrFsReadFailed`, word 265 of the
+  same per-task block (`scratch.bit`'s `scrFsReadFailed`), published by
+  `runtime/root/{darwin,linux}/fs.bit`'s `rtFsReadAll` on every call (cleared
+  at entry, set only on a genuine I/O error). Same file and mechanism as
+  `pending_err`/`last_recv_ok` above.
 
 **Per-OS-thread by design, each because nothing between the write and its
 matching read can cross a scheduling point — a green task migrates workers
