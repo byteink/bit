@@ -1,0 +1,313 @@
+// E0096's contract (#2958): a root-module function whose bare LINK name
+// collides with a symbol the linked runtime resolves externally must fail to
+// build, never link into a program that silently binds the runtime's own
+// extern call to the user's function.
+//
+// WHY THIS LIVES IN tests/bit/ AND NOT tests/bit/checkercases/. Every other
+// case under checkercases/ is driven through `bit check` (see
+// tests/bit/checkerdiag.bit's header: "a byte-for-byte comparison of `bit
+// check`'s rendered stderr against a pinned `.expected`"). E0096 cannot appear
+// there: `rejectRootNameCollision` (compiler/build.bit) runs from `buildIr`,
+// gated on `linking` exactly like the pre-existing E0078 extern-target check
+// it sits beside — and `checkCmd` (compiler/main.bit) never calls `buildIr` at
+// all, so `bit check` on the fixture below exits 0 with nothing printed. The
+// property under test is argv (`bit run`) in, exit code + stderr out, which a
+// `bit check` diff cannot express — same reasoning as tests/bit/clicmd's
+// header. Confirmed empirically before writing this file: `bit check` on
+// `collide.bit` below is silent and exits 0; `bit run` on the same file is
+// where E0096 fires.
+//
+// THE FALSE-POSITIVE HALF MATTERS MORE THAN THE POSITIVE ONE (the ticket's own
+// words). `std/net`'s and `std/tls`'s own top-level `listen` ARE real
+// collisions when either is built AS ROOT (checkNetAsRootCollides below,
+// matching the RCA's own item 10) — but `std/http`, which only IMPORTS
+// `listen` from `std/net`, must still build as root: its own `listen` symbol
+// is `m<id>$listen` (SPEC §17.6), never the bare name the check compares
+// against. checkHttpAsRootBuilds copies the real `stdlib/http` package rather
+// than a synthetic stand-in, so a future std/http change that accidentally
+// declares its own top-level `listen`/`write`/... would be caught here too.
+//
+// Run it from the repository root:
+//     ./bit-out/bin/bit run tests/bit/rootnamecollision.bit
+// `BIT_SELF_EXE` overrides which `bit` is exercised; unset, the compiler under
+// test is `<cwd>/bit-out/bin/bit`, resolved from a child's own `pwd`.
+import { env, envOr, exit } from "std/os"
+import { exists, mkdir, readFile, remove, writeFile } from "std/fs"
+import { contains, parseInt } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// One `bit run` invocation, as seen from outside it.
+struct Run { code: int, out: string, err: string }
+
+// Assertion accounting. A struct because Bit has no mutable module-level
+// state, and the count is the anti-vacuity marker: an empty run must not read
+// as pass.
+struct Tally { checks: int, failures: int }
+
+// A build of a ten-line program, or a `cp -R` of stdlib/http, is well under a
+// second; this only ever fires on a hang, and a hang is a failure.
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "300")) catch _ { 300 }
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s mechanism channel, never a program exit status, so
+// each one is a named panic rather than a value any assertion could consume.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("rootnamecollision: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("rootnamecollision: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("rootnamecollision: could not spawn ${scriptPath}")
+  }
+  if (code <= 0 - 100) {
+    panic("rootnamecollision: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+// This repository's own root, discovered the same way tests/bit/runcmd.bit
+// does: Bit has no getcwd primitive, so a child's own `pwd` is the only way
+// to recover the directory this program was launched from.
+fn resolveCwd(scratch: string, ms: int): string! {
+  let cwdFile = "${scratch}/cwd.txt"
+  let code = shell("${scratch}/pwd.sh", "#!/bin/sh\npwd > '${cwdFile}'\n", ms)?
+  if (code != 0) {
+    fail newError("rootnamecollision: could not read the working directory (exit ${code})")
+  }
+  return trimWs(readFile(cwdFile)?)
+}
+
+// The `bit` under test. `BIT_SELF_EXE` wins; otherwise `${cwd}/bit-out/bin/bit`
+// — never returns "": a compiler this cannot find is a hard stop, not a
+// skipped test.
+fn bitBinary(cwd: string): string! {
+  let explicit = env("BIT_SELF_EXE")
+  if (len(explicit) > 0) {
+    if (!exists(explicit)) {
+      fail newError("rootnamecollision: BIT_SELF_EXE=${explicit} does not exist")
+    }
+    return explicit
+  }
+  let candidate = "${cwd}/bit-out/bin/bit"
+  if (!exists(candidate)) {
+    fail newError("rootnamecollision: no compiler at ${candidate}; run this from the repository root or set BIT_SELF_EXE")
+  }
+  return candidate
+}
+
+// Runs `bit run <src>` with `root` as the working directory. `envPrefix` is
+// raw `/bin/sh` text prepended before the `cd` (e.g. an `export BIT_STDLIB=`
+// line) or "" when the fixture needs no stdlib.
+//
+// The script always exits 0 and writes the real status to `code.txt`, so a
+// missing `code.txt` is unmistakably "the run never happened" rather than a
+// status some assertion could mistake for success — mirrors
+// tests/bit/runcmd.bit's `runBit`.
+fn runBit(bit: string, envPrefix: string, root: string, capDir: string,
+    src: string, ms: int): Run! {
+  let outPath = "${capDir}/out.txt"
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  clear(outPath)
+  clear(errPath)
+  clear(codePath)
+
+  let script = "#!/bin/sh\n" + envPrefix +
+    "cd '${root}' || exit 0\n" +
+    "'${bit}' run '${src}' > '${outPath}' 2> '${errPath}'\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/run.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("rootnamecollision: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("rootnamecollision: no exit code was recorded for `bit run ${src}` — the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, out: readFile(outPath)?, err: readFile(errPath)? }
+}
+
+fn clear(path: string) {
+  if (exists(path)) {
+    remove(path) catch _ { return }
+  }
+}
+
+// Records one assertion. Failures are named and the run continues, so a
+// single invocation reports every broken expectation instead of only the
+// first.
+fn check(t: Tally, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    eprint("FAIL: ${label}\n")
+  }
+}
+
+// THE HEADLINE CASE, verbatim from the RCA's own reproducer: a root-module
+// `fn listen` that calls the predeclared `netListen` primitive. Builtin-only
+// (`netListen` needs no import — compiler/symbols.bit predeclares it), so no
+// stdlib is required.
+fn checkListenCollides(t: Tally, bit: string, root: string, capDir: string, ms: int): ()! {
+  writeFile("${root}/collide.bit",
+    "fn listen(host: string, port: int): int { return netListen(host, port) }\n" +
+    "fn main() { println(\"in\"); println(\"fd=\${listen(\"127.0.0.1\", 0)}\") }\n")?
+  let r = runBit(bit, "", root, capDir, "collide.bit", ms)?
+  check(t, r.code != 0, "listen: exit ${r.code}, want non-zero (must not build)")
+  check(t, contains(r.err, "error[E0096]"), "listen: no E0096 on stderr: ${r.err}")
+  check(t, contains(r.err, "listen"), "listen: the colliding name is not named: ${r.err}")
+}
+
+// The ONLY variable versus the case above is the function's name — proving
+// the rejection tracks the LINK name, not the body.
+fn checkRenamedBuilds(t: Tally, bit: string, root: string, capDir: string, ms: int): ()! {
+  writeFile("${root}/renamed.bit",
+    "fn listenX(host: string, port: int): int { return netListen(host, port) }\n" +
+    "fn main() { println(\"in\"); println(\"fd=\${listenX(\"127.0.0.1\", 0)}\") }\n")?
+  let r = runBit(bit, "", root, capDir, "renamed.bit", ms)?
+  check(t, r.code == 0, "renamed: exit ${r.code}, want 0")
+  check(t, contains(r.out, "fd="), "renamed: expected output missing: ${r.out}")
+  check(t, r.err == "", "renamed: expected no diagnostics, got: ${r.err}")
+}
+
+// The SILENT half of the bug class the RCA found: before the fix, a root
+// `fn write` made every `println` print NOTHING at exit 0 — the runtime's own
+// write(2) call was hijacked with no crash and no diagnostic. This asserts it
+// is now a compile-time refusal instead.
+fn checkWriteCollides(t: Tally, bit: string, root: string, capDir: string, ms: int): ()! {
+  writeFile("${root}/writecollide.bit",
+    "fn write(fd: int, buf: int, n: int): int { return 0 }\n" +
+    "fn main() { println(\"should never reach stdout silently\") }\n")?
+  let r = runBit(bit, "", root, capDir, "writecollide.bit", ms)?
+  check(t, r.code != 0, "write: exit ${r.code}, want non-zero (must not build)")
+  check(t, contains(r.err, "error[E0096]"), "write: no E0096 on stderr: ${r.err}")
+  check(t, contains(r.err, "write"), "write: the colliding name is not named: ${r.err}")
+}
+
+// THE FALSE-POSITIVE CHECK — the one that matters more than the positive
+// ones. `std/http` only IMPORTS `listen` from `std/net` (`import { listen }
+// from "std/net"` chained through its own wrapper), so as a root module its
+// own top-level names carry none of std/net's collisions and must build
+// clean. Uses the REAL package, copied into a scratch tree with one synthetic
+// `main` appended, so a future std/http edit that accidentally declares a
+// top-level `listen`/`write`/`socket`/... is caught here rather than shipped.
+fn checkHttpAsRootBuilds(t: Tally, bit: string, cwd: string, scratch: string,
+    capDir: string, ms: int): ()! {
+  let httpRoot = "${scratch}/httpcopy"
+  let cpScript = "#!/bin/sh\ncp -R '${cwd}/stdlib/http' '${httpRoot}'\n"
+  let cp = shell("${scratch}/cphttp.sh", cpScript, ms)?
+  if (cp != 0) {
+    fail newError("rootnamecollision: could not copy stdlib/http (exit ${cp})")
+  }
+  writeFile("${httpRoot}/zzmain.bit", "fn main() { println(\"http root builds\") }\n")?
+  let r = runBit(bit, "export BIT_STDLIB='${cwd}/stdlib'\n", scratch, capDir,
+    httpRoot, ms)?
+  check(t, r.code == 0, "http-root: exit ${r.code}, want 0 (false positive): ${r.err}")
+  check(t, contains(r.out, "http root builds"), "http-root: expected output missing: ${r.out}")
+}
+
+// #2958's RCA item 10, the mirror of the false-positive check: `std/net`
+// declares its OWN top-level `listen` (`export fn listen` in `net.bit`), so
+// building it AS ROOT is a real, pre-existing collision (nothing calls it as
+// a program today — nothing in this corpus does `bit run stdlib/net`), and it
+// must be rejected exactly like the synthetic case above.
+fn checkNetAsRootCollides(t: Tally, bit: string, cwd: string, scratch: string,
+    capDir: string, ms: int): ()! {
+  let netRoot = "${scratch}/netcopy"
+  let cpScript = "#!/bin/sh\ncp -R '${cwd}/stdlib/net' '${netRoot}'\n"
+  let cp = shell("${scratch}/cpnet.sh", cpScript, ms)?
+  if (cp != 0) {
+    fail newError("rootnamecollision: could not copy stdlib/net (exit ${cp})")
+  }
+  writeFile("${netRoot}/zzmain.bit", "fn main() { println(\"unreachable\") }\n")?
+  let r = runBit(bit, "export BIT_STDLIB='${cwd}/stdlib'\n", scratch, capDir,
+    netRoot, ms)?
+  check(t, r.code != 0, "net-root: exit ${r.code}, want non-zero (std/net's own listen collides)")
+  check(t, contains(r.err, "error[E0096]"), "net-root: no E0096 on stderr: ${r.err}")
+}
+
+fn runAll(t: Tally, scratch: string, ms: int) {
+  let root = "${scratch}/tree"
+  let capDir = "${scratch}/cap"
+  mkdir(root) catch e {
+    panic("rootnamecollision: cannot create ${root}: ${e.message()}")
+  }
+  mkdir(capDir) catch e {
+    panic("rootnamecollision: cannot create ${capDir}: ${e.message()}")
+  }
+  let cwd = resolveCwd(scratch, ms) catch e {
+    panic("rootnamecollision: ${e.message()}")
+  }
+  let bit = bitBinary(cwd) catch e {
+    panic("rootnamecollision: ${e.message()}")
+  }
+  checkListenCollides(t, bit, root, capDir, ms) catch e { panic("rootnamecollision: ${e.message()}") }
+  checkRenamedBuilds(t, bit, root, capDir, ms) catch e { panic("rootnamecollision: ${e.message()}") }
+  checkWriteCollides(t, bit, root, capDir, ms) catch e { panic("rootnamecollision: ${e.message()}") }
+  checkHttpAsRootBuilds(t, bit, cwd, scratch, capDir, ms) catch e { panic("rootnamecollision: ${e.message()}") }
+  checkNetAsRootCollides(t, bit, cwd, scratch, capDir, ms) catch e { panic("rootnamecollision: ${e.message()}") }
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-rootnamecollision-${uuidFormat(uuidV4())}"
+  let t = Tally{ checks: 0, failures: 0 }
+
+  mkdir(scratch) catch e {
+    panic("rootnamecollision: cannot create ${scratch}: ${e.message()}")
+  }
+  defer teardown(scratch, ms)
+  runAll(t, scratch, ms)
+
+  // The run marker: 12 is what the five cases above assert today; the floor
+  // only has to be tight enough that a whole case going missing trips it.
+  if (t.checks < 12) {
+    eprint("FAIL: only ${t.checks} checks ran, want at least 12\n")
+    t.failures = t.failures + 1
+  }
+  if (t.failures > 0) {
+    println("rootnamecollision: FAIL — ${t.failures} of ${t.checks} checks failed")
+    exit(1)
+  }
+  println("rootnamecollision: PASS — ${t.checks} checks")
+}
+
+// std/fs has no recursive remove, so the scratch tree goes the way it came.
+fn teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ { return }
+}
+
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}
