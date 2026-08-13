@@ -50,8 +50,9 @@ changes the spec **in the same commit**, not afterwards.
    (`scripts/selfhost-diff*.sh`). A divergence is a change that is not finished
    -- except a small number of exact, named STAGE0-PINLAG entries for a real
    behaviour change the pinned stage0 cannot yet reflect (e.g.
-   `selfhost-diffdiags.sh`'s BOM-stripping entry, `selfhost-diffruntime.sh`'s
-   `PINLAG_MODULES`); those are deleted at the next stage0 repin, not amended.
+   `selfhost-diffdiags.sh`'s and `selfhost-difftokens.sh`'s BOM-stripping
+   entries, `selfhost-diffruntime.sh`'s `PINLAG_MODULES`); those are deleted
+   at the next stage0 repin, not amended.
 4. **Files stay under 800 lines** (target ~500). Split by moving top-level
    blocks into sibling `.bit` files in the same directory - not into
    subdirectories, which would make a new module.
