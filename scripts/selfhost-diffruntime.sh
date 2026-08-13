@@ -278,31 +278,41 @@ done
 # --- Stage0 pin-lag accept list (#2937) ---
 #
 # Relative to stage0 pin 0.1.15. #2929 (arm64 leaf-frame elision,
-# compiler/arm64compile.bit, landed c750df13) and #2925 (inlined back-edge
-# safepoint guard) are real backend codegen changes in THIS tree; the pinned
-# stage0 predates both, so the OBJECT BYTES these modules compile to now
-# legitimately diverge even though nothing here is wrong — the fix being
-# present is exactly what the divergence is. It clears itself at the next
-# stage0 repin and is not something a code change here can close (#2382's
-# "outpaced oracle" case, same shape as the diffir/diffiropt/difftypes
-# family's STAGE0-PINLAG pattern proposed in #2718/#2719/#2720).
+# compiler/arm64compile.bit, landed c750df13), #2925 (inlined back-edge
+# safepoint guard) and #2934 (CFG-aware interval construction for
+# mutually-exclusive early-return branches, compiler/codegen.bit) are real
+# backend codegen changes in THIS tree; the pinned stage0 predates all three,
+# so the OBJECT BYTES these modules compile to now legitimately diverge even
+# though nothing here is wrong — the fix being present is exactly what the
+# divergence is. It clears itself at the next stage0 repin and is not
+# something a code change here can close (#2382's "outpaced oracle" case,
+# same shape as the diffir/diffiropt/difftypes family's STAGE0-PINLAG pattern
+# proposed in #2718/#2719/#2720).
 #
 # It is deliberately object-bytes-only, not per-file: the IR walk above
 # (`--dump-ir-pre`, pre-optimizer) still agrees byte for byte with the
 # oracle on every runtime file. Only the post-optimizer machine code that
-# #2929/#2925 change diverges, which is exactly what this module-level
+# #2929/#2925/#2934 change diverges, which is exactly what this module-level
 # comparison and not the file-level one is for.
 #
 # Named exactly, not by wildcard: an entry here is a specific module this
 # divergence is already known to touch. A module NOT listed below still
-# fails the run on any divergence, including one of these 21 gaining a
-# sibling for a new, unexamined reason.
+# fails the run on any divergence, including one of these gaining a sibling
+# for a new, unexamined reason.
+#
+# runtime/rand/darwin (#2934): randomBytesFill (runtime/rand/darwin/random.bit)
+# is a chain of "if (cond) { return X }" checks over values it derives from
+# each other — exactly the mutually-exclusive-early-return shape #2934 fixes.
+# Examined directly: oracle vs dev object bytes for this module differ ONLY in
+# which callee-saved GPRs get used (dev: x19-x25, 7 registers; oracle:
+# x19-x28, 10) and the control flow is identical instruction for instruction —
+# confirmed by disassembling both `_randomBytesFill` bodies side by side.
 #
 # DELETE THIS LIST AT THE NEXT STAGE0 REPIN (0.1.15 -> whatever pin next
-# contains c750df13/#2929). A module that still diverges after that repin is
-# a real regression, not pin lag, and must be investigated rather than
-# re-added here.
-PINLAG_MODULES="runtime runtime/alloc runtime/alloc/darwin runtime/auxv runtime/chan runtime/cryptohw runtime/gc runtime/net runtime/net/darwin runtime/park runtime/park/darwin runtime/rand runtime/root runtime/root/darwin runtime/sched runtime/sched/darwin runtime/shims/scan runtime/stw runtime/syscalls runtime/thread runtime/thread/darwin"
+# contains c750df13/#2929 and #2934). A module that still diverges after that
+# repin is a real regression, not pin lag, and must be investigated rather
+# than re-added here.
+PINLAG_MODULES="runtime runtime/alloc runtime/alloc/darwin runtime/auxv runtime/chan runtime/cryptohw runtime/gc runtime/net runtime/net/darwin runtime/park runtime/park/darwin runtime/rand runtime/rand/darwin runtime/root runtime/root/darwin runtime/sched runtime/sched/darwin runtime/shims/scan runtime/stw runtime/syscalls runtime/thread runtime/thread/darwin"
 
 is_pinlag_module() {
   m="$1"
