@@ -1312,16 +1312,28 @@ bit_rt_fs_list_dir(path)          -> string     // NUL-terminated entry names
 The low-level layer under `std/fs`. Deliberately plain (not fallible): failures
 surface as a `-1` fd/byte-count that the Bit `std/fs` wrappers turn into real
 errors (`fail newError(...)`), so all error *ergonomics* live in Bit, not the
-runtime. Backed by the raw per-platform syscalls in `runtime/sched/sched.bit` (`openFd`/
-`readFd`/`writeFd`/`closeFd`/`fileSize`, dispatched `std.os.linux.*` on Linux,
-`std.c.*` on Darwin — no libc dependency on the hot path).
+runtime. Backed by the per-platform `rtFs*` primitives in `runtime/root/linux/fs.bit`
+and `runtime/root/darwin/fs.bit`: Linux issues raw syscall numbers directly (no
+libc), Darwin calls the bare libc externs declared at the top of that file and
+goes through libSystem — Apple publishes no stable syscall numbers, so this side
+is NOT libc-free. Neither platform has a separate `fileSize` helper;
+`lseek(SEEK_END)` inline in `rtFsReadAll` computes it.
 
-- `fs_open` copies the (non-NUL-terminated) Bit path into a bounded stack buffer
-  before the syscall; `write=false` opens read-only, `write=true`
+- `fs_open` copies the (non-NUL-terminated) Bit path into a bounded
+  module-level scratch buffer (sound only under the single-worker contract,
+  §5) before the syscall; `write=false` opens read-only, `write=true`
   creates+truncates write-only (mode `0644`).
-- `fs_read_all` sizes the result with `lseek(SEEK_END)` then reads, so it targets
-  regular files; a non-regular fd or stat error yields the empty string. A short
-  read leaves the tail zero-filled (v1 regular-file scope).
+- `fs_read_all` sizes the result with `lseek(SEEK_END)` then reads, so it
+  targets regular files. An `lseek` failure, a genuine empty file, and an
+  allocation failure for a file already known non-empty all currently return
+  the empty string, and a caller cannot yet tell the three apart — `string`
+  has no nil sentinel, and the one attempt to add an out-of-band signal for it
+  (#2994, a `bit_rt_fs_read_all_failed` companion symbol) was reverted because
+  the pinned stage0's `libbitrt.a` predates the symbol (open on #2996, blocked
+  on a stage0 repin). A short read — EOF before `end`, or an I/O error partway
+  through — is NEVER zero-padded (#2990): the result is the string TRIMMED to
+  the bytes actually verified read, retrying on `EINTR` up to
+  `maxReadAllRetries` (1000) times.
 - `fs_close` reports success unconditionally (the raw wrapper swallows
   `EINTR`/`EBADF`).
 - `fs_read` reads once and returns what it got, so it is the primitive for
@@ -1330,9 +1342,12 @@ runtime. Backed by the raw per-platform syscalls in `runtime/sched/sched.bit` (`
   filename cannot contain (a newline can). `.` and `..` are omitted. An empty
   result means either an empty directory or an unreadable one; `std/fs` calls
   `is_dir` first to tell them apart.
-- `exists`/`is_dir` probe rather than `stat`: the two platforms disagree on
-  where the `Stat` struct lives. A directory answers `getdents64`, a regular
-  file answers `ENOTDIR`; Darwin's `opendir` makes the same distinction.
+- `exists` opens `path` rather than probing directory-ness — Darwin via
+  `access(F_OK)`, Linux via an `open` immediately closed again on success — so
+  a mode-000 file, or a directory hit by an fd-exhausted process, still
+  reports present; only `ENOENT`/`ENOTDIR` mean genuinely absent (#2114).
+  `is_dir` is the one that actually distinguishes a directory: Darwin's
+  `opendir` succeeding, Linux's `getdents64` succeeding on the opened fd.
 
 **These calls block their worker's OS thread for the syscall's duration, and
 that is not a netpoller gap.** POSIX has no non-blocking read of a regular file:
