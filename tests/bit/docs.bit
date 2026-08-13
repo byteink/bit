@@ -84,19 +84,40 @@
 // floors below are set just under the live corpus (271 blocks over 31 pages,
 // 219 invocations) so a structural regression in the extractor lands under them.
 
-import { readFile, writeFile, exists, isDir, mkdir, remove, walk } from "std/fs"
-import { contains, indexOf, hasSuffix, parseInt } from "std/strings"
-import { env, envOr } from "std/os"
+//
+// #2969: split across a sibling to stay under the 800-line lint limit. This
+// file owns the corpus — what a page is, what a block is, the extractor and
+// its own unit tests, the corpus walk, the floors, and `main`'s reporting
+// (including the #2422 `docs: INCONCLUSIVE` denominator line). The child-
+// process runner — the scratch tree, the copied compiler, the generated
+// fan-out script, and reading back each slot's verdict — moved to
+// `docsrunner/runner.bit`, a separate module this file imports from.
+
+import { walk } from "std/fs"
+import { contains, indexOf, hasSuffix } from "std/strings"
+import {
+  Cfg,
+  CheckResult,
+  die,
+  slurp,
+  jsonish,
+  repoRoot,
+  trimInfo,
+  timedOutCode,
+  maxJobs,
+  runBatch,
+  setup,
+  teardown,
+  plumbingSelfTest,
+} from "./docsrunner"
 
 // Bounds on the walk, so the traversal is provably finite (Power of 10).
 const maxFiles: int = 256
+
 const maxBlocksPerFile: int = 128
-// Ceilings on the queue and on the fan-out, so the run's resource use is
-// decided before it starts rather than by whatever the corpus grew into.
-const maxJobs: int = 512
-const maxFanout: int = 32
 
 const fenceTag: string = "```bit"
+
 const fenceClose: string = "\n```"
 
 // A page carrying this marker has its blocks checked one at a time, rather than
@@ -110,32 +131,14 @@ const minPagesWithBlocks: int = 25
 const minTotalBlocks: int = 250
 const minInvocations: int = 200
 
-// Everything a batch of checks needs. Resolved once, asserted once.
-struct Cfg {
-  bin: string        // the compiler under test, already copied into scratch
-  stdlibDir: string
-  docsDir: string
-  dir: string        // scratch root, and the runner's cwd
-  jobs: int          // workers, i.e. how many `bit check` run at once
-  script: string     // the generated runner, written once
-  countPath: string  // `n.txt`: how many slots this batch uses
-  timeoutMs: i64
-}
-
-// One check: the child's exit status, and whatever it printed.
-struct CheckResult {
-  code: i64
-  report: string
-}
-
 // One snippet queued for checking. `block` is the 1-based block number for a
 // per-block page, or 0 when the job is the page's blocks joined — the two cases
 // read differently in a failure message.
 struct Job {
-  page: string
-  block: int
-  blocks: int
-  src: string
+  page: string,
+  block: int,
+  blocks: int,
+  src: string,
 }
 
 // The corpus walk's output: what to check, and what was counted while deciding.
@@ -143,80 +146,9 @@ struct Plan { jobs: []Job, st: Stats }
 
 // One extractBlocks unit case.
 struct ExtractCase {
-  name: string
-  md: string
-  want: []string
-}
-
-// Setup failures are never a pass. Every one of them ends the process nonzero
-// rather than leaving work unrun — a skipped check is a green test, which is
-// exactly the vacuity this file exists to avoid.
-fn die(msg: string) {
-  eprint("docs: SETUP FAILED: ${msg}\n")
-  osExit(1)
-}
-
-fn slurp(path: string, what: string): string {
-  if (!exists(path)) {
-    die("${what}: missing: ${path}")
-  }
-  return readFile(path) catch e {
-    die("${what}: ${path}: ${e.message()}")
-    ""
-  }
-}
-
-fn spill(path: string, content: string, what: string) {
-  writeFile(path, content) catch e {
-    die("${what}: ${path}: ${e.message()}")
-  }
-}
-
-// 8 bytes of OS entropy, the same scheme compiler/build.bit uses for scratch
-// paths it writes and then execs. A timestamp is not enough: two processes CAN
-// read the same nanosecond, they cannot draw the same 64-bit nonce.
-fn nonce(): uint {
-  let b = []byte(cryptoRandomBytes(8))
-  let x: uint = 0
-  let i = 0
-  while (i < 8) {
-    x = (x << 8) | uint(b[i])
-    i = i + 1
-  }
-  return x
-}
-
-// The repo root: the nearest ancestor holding BOTH the built compiler and the
-// docs tree. Overridable with BIT_REPO. Not finding one is a hard failure, never
-// a skip — an empty corpus from a wrong cwd is the classic green no-op.
-fn repoRoot(): string {
-  let override = env("BIT_REPO")
-  if (len(override) > 0) {
-    return override
-  }
-  let candidates = [".", "..", "../..", "../../.."]
-  for c of candidates {
-    if (exists("${c}/bit-out/bin/bit") && isDir("${c}/docs")) {
-      return c
-    }
-  }
-  die("cannot locate the repo root from this cwd; set BIT_REPO")
-  return ""
-}
-
-// " \t\r" trimmed from both ends. NOT std/strings' trimSpace, which leaves `\r`
-// — a CRLF page would then have info string "\r", every block would test as
-// unchecked, and the whole page would silently contribute nothing.
-fn trimInfo(s: string): string {
-  let lo = 0
-  while (lo < len(s) && (s[lo] == ' ' || s[lo] == '\t' || s[lo] == '\r')) {
-    lo = lo + 1
-  }
-  let hi = len(s)
-  while (hi > lo && (s[hi - 1] == ' ' || s[hi - 1] == '\t' || s[hi - 1] == '\r')) {
-    hi = hi - 1
-  }
-  return s[lo:hi]
+  name: string,
+  md: string,
+  want: []string,
 }
 
 // The checkable `bit` blocks in `md`: those fenced exactly ```` ```bit ```` at
@@ -270,150 +202,6 @@ fn joinBlocks(blocks: []string): string {
     out = out + b + "\n\n"
   }
   return out
-}
-
-// Slot `i`'s paths: its module directory, its captured output, its exit status,
-// and the claim directory a worker `mkdir`s to take the job.
-fn slotDir(cfg: Cfg, i: int): string { return "${cfg.dir}/w${i}" }
-fn slotMain(cfg: Cfg, i: int): string { return "${cfg.dir}/w${i}/main.bit" }
-fn slotOut(cfg: Cfg, i: int): string { return "${cfg.dir}/o${i}" }
-fn slotStatus(cfg: Cfg, i: int): string { return "${cfg.dir}/s${i}" }
-fn slotClaim(cfg: Cfg, i: int): string { return "${cfg.dir}/c${i}" }
-
-// A leftover from an earlier batch is removed before the next one starts: a
-// child that never ran must not hand back stale output or a stale zero status.
-// A stale CLAIM is the nastier one — every worker would skip that job, which
-// `slotResult` then reads as the harness being broken.
-fn scrub(path: string) {
-  if (exists(path)) {
-    remove(path) catch e { die("cannot clear ${path}: ${e.message()}") }
-  }
-}
-
-// What slot `i` produced, once the runner has finished with it. Absent, empty
-// or non-numeric status all abort the run: a check whose result is unknown is
-// not a check, and there is no lenient reading of this file.
-fn slotResult(cfg: Cfg, i: int): CheckResult {
-  let p = slotStatus(cfg, i)
-  if (!exists(p)) {
-    die("no exit status at ${p}: the runner did not record slot ${i}, so its snippet is unchecked")
-  }
-  // trimInfo strips " \t\r" but not the newline `echo` writes, which is the
-  // last byte when present.
-  let raw = slurp(p, "check status")
-  let cut = raw
-  while (len(cut) > 0 && cut[len(cut) - 1] == '\n') { cut = cut[:len(cut) - 1] }
-  let code = parseInt(trimInfo(cut)) catch _ {
-    die("unreadable exit status in ${p}: ${jsonish(raw)}")
-    0
-  }
-  let outPath = slotOut(cfg, i)
-  if (!exists(outPath)) {
-    die("no output capture at ${outPath}: the runner script is not redirecting slot ${i}")
-  }
-  return CheckResult{ code: i64(code), report: slurp(outPath, "check output") }
-}
-
-// `collectBatch`'s sentinel for "the batch deadline elapsed before this slot
-// wrote a status". Never a real result: the runner's `echo $?` only ever
-// writes a POSIX exit code (0-255), so a caller can tell a genuine `bit check`
-// failure from an unjudged block by this code alone.
-const timedOutCode: i64 = -2
-
-// Typechecks `srcs` — one module per source — in ONE runner invocation, and
-// returns one result per source in the same order. The workers claim jobs
-// dynamically rather than being handed a fixed share, because the corpus is
-// wildly uneven and any static split leaves most workers idle behind the one
-// page that imports `std/http`. Measured here: 303s serially, 74s in fixed
-// rounds of 8, 48s pulled from one queue by 12.
-fn runBatch(cfg: Cfg, srcs: []string): []CheckResult {
-  let n = len(srcs)
-  assert(n > 0 && n <= maxJobs)
-  stageBatch(cfg, srcs)
-  let r = osRunBounded(cfg.script, cfg.timeoutMs)
-  assertRunnerRan(cfg, r, n)
-  return collectBatch(cfg, n, r)
-}
-
-// One module per source, plus the count the runner reads, plus a clean slate.
-fn stageBatch(cfg: Cfg, srcs: []string) {
-  let i = 0
-  while (i < len(srcs)) {
-    if (!exists(slotDir(cfg, i))) {
-      mkdir(slotDir(cfg, i)) catch e { die("mkdir ${slotDir(cfg, i)}: ${e.message()}") }
-    }
-    spill(slotMain(cfg, i), srcs[i], "scratch module")
-    scrub(slotOut(cfg, i))
-    scrub(slotStatus(cfg, i))
-    scrub(slotClaim(cfg, i))
-    i = i + 1
-  }
-  spill(cfg.countPath, "${len(srcs)}\n", "batch size")
-}
-
-// ABI.md §19 packs three outcomes into one i64, and here they are the RUNNER's,
-// not a compiler's. Only the timeout is a verdict about the docs; the rest mean
-// the harness is broken, and a broken harness must not be able to pass.
-// The runner exits 0 after `wait`; 111-113 are its own setup failures, and any
-// other positive status means it never reached the worker loop.
-fn assertRunnerRan(cfg: Cfg, r: i64, n: int) {
-  if (r == -1) { die("SPAWN FAILED (fork/exec/wait error) running ${cfg.script}") }
-  if (r <= -100) { die("runner ${cfg.script} killed by signal ${-r - 100}") }
-  if (r < 0 && r != timedOutCode) { die("unknown os_run_bounded result ${r} from ${cfg.script}") }
-  if (r > 0) { die("runner ${cfg.script} exited ${r} — it never ran the ${n} check(s) in this batch") }
-}
-
-// A hang is a failure, not a stall — and it is attributable: the jobs that
-// finished wrote a status, so a missing one names the snippet that hung instead
-// of condemning the whole batch.
-fn collectBatch(cfg: Cfg, n: int, r: i64): []CheckResult {
-  let out = []CheckResult(0)
-  let j = 0
-  while (j < n) {
-    if (r == timedOutCode && !exists(slotStatus(cfg, j))) {
-      out = append(out, CheckResult{ code: timedOutCode,
-        report: "TIMED OUT: still running when the batch deadline of ${cfg.timeoutMs}ms elapsed" })
-    } else {
-      out = append(out, slotResult(cfg, j))
-    }
-    j = j + 1
-  }
-  return out
-}
-
-// Runs BEFORE the corpus walk, and aborts it on any surprise.
-//
-// This is the countermeasure to the port's own failure mode: the harness reads
-// numbers a generated script wrote, and a script that cannot report failure
-// makes every page pass. So one snippet that must check clean and one that must
-// not are run through the exact same path the corpus uses. The good one also
-// imports `std/strings`, which proves BIT_STDLIB reached the child — without it
-// every std-importing page would fail for a reason unrelated to the docs.
-//
-// Running them as ONE two-job batch is deliberate: it also pins the slot mapping
-// the batch depends on. If every job were checking slot 0 the bad snippet would
-// come back clean; if every job were checking the last slot the good one would
-// fail. Either way this aborts, and no corpus page is ever judged by a runner
-// that confuses one snippet with another.
-fn plumbingSelfTest(cfg: Cfg) {
-  assert(cfg.jobs >= 2)
-  let rs = runBatch(cfg, [
-    "import { contains } from \"std/strings\"\n\nfn docsPlumbingOk(s: string): bool {\n  return contains(s, \"a\")\n}\n",
-    "let docsPlumbingBad: int = \"not an int\"\n",
-  ])
-  assert(len(rs) == 2)
-  let good = rs[0]
-  let bad = rs[1]
-
-  if (good.code != 0) {
-    die("plumbing: a known-good snippet did not check (status ${good.code}):\n${good.report}")
-  }
-  if (bad.code == 0) {
-    die("plumbing: a DELIBERATELY BROKEN snippet checked clean — the runner is not recording the compiler's exit status, so this gate cannot fail. Captured output:\n${bad.report}")
-  }
-  if (!contains(bad.report, "error[")) {
-    die("plumbing: the broken snippet failed (status ${bad.code}) but no diagnostics were captured — the output redirect is not wired. Captured:\n${bad.report}")
-  }
 }
 
 // The extractor's own tests, on literal pages rather than the corpus. The
@@ -488,171 +276,6 @@ fn runExtractTests(): int {
   return failed
 }
 
-// A one-line, newline-escaped rendering, so a diff of captured text stays on one
-// line and an empty value is visibly empty rather than invisible.
-fn jsonish(s: string): string {
-  let out = "\""
-  let i = 0
-  while (i < len(s)) {
-    let ch = s[i]
-    if (ch == byte(10)) {
-      out = out + "\\n"
-    } else if (ch == byte(13)) {
-      out = out + "\\r"
-    } else if (ch == byte(34)) {
-      out = out + "\\\""
-    } else {
-      out = out + string([]byte([ch]))
-    }
-    i = i + 1
-  }
-  return out + "\""
-}
-
-// The scratch tree, the compiler copy and the runner script. Built once.
-fn setup(root: string): Cfg {
-  let docsDir = envOr("BIT_DOCS", "${root}/docs")
-  if (!isDir(docsDir)) {
-    die("BIT_DOCS is not a directory: ${docsDir}")
-  }
-
-  let stdlibDir = envOr("BIT_STDLIB", "${root}/stdlib")
-  if (!isDir(stdlibDir)) {
-    die("stdlib is not a directory: ${stdlibDir} (set BIT_STDLIB)")
-  }
-
-  // The compiler under test is the one built in this tree, never PATH's `bit`
-  // — that is brew's release build, a different compiler entirely.
-  let src = envOr("BIT", "${root}/bit-out/bin/bit")
-  if (!exists(src)) {
-    die("compiler under test is missing: ${src} (set BIT)")
-  }
-
-  let dir = "/tmp/bit-docsgate-${nonce()}"
-  mkdir(dir) catch e {
-    die("mkdir ${dir}: ${e.message()}")
-  }
-
-  let bin = "${dir}/bit"
-  spill(bin, slurp(src, "compiler under test"), "compiler copy")
-  if (fsChmod(bin, 493) != 0) {
-    die("chmod ${bin}")
-  }
-
-  let cfg = Cfg{
-    bin: bin,
-    stdlibDir: stdlibDir,
-    docsDir: docsDir,
-    dir: dir,
-    jobs: fanout(),
-    script: "${dir}/run.sh",
-    countPath: "${dir}/n.txt",
-    timeoutMs: deadlineMs(),
-  }
-  writeRunner(cfg)
-  return cfg
-}
-
-// How many `bit check` run at once. 12 is where the measured curve flattens
-// (303s serial, 56s at 8, 48s at 12, 50s at 16 — beyond that they contend); a
-// fixed number rather than a core count because Bit cannot ask for one, with
-// `BIT_DOCS_JOBS` as the knob for a smaller host. Below 2 the plumbing
-// self-test's slot-mapping check has nothing to distinguish.
-fn fanout(): int {
-  let raw = envOr("BIT_DOCS_JOBS", "12")
-  let jobs = parseInt(raw) catch _ {
-    die("BIT_DOCS_JOBS is not an integer: ${jsonish(raw)}")
-    12
-  }
-  if (jobs < 2 || jobs > maxFanout) {
-    die("BIT_DOCS_JOBS must be between 2 and ${maxFanout}, got ${jobs}")
-  }
-  return jobs
-}
-
-// The bound on the one runner invocation. 0 disables the bound in the Zig
-// harnesses; ABI.md §19 has no "forever", so it maps to the one-hour clamp
-// rather than being silently treated as 0ms.
-fn deadlineMs(): i64 {
-  let raw = envOr("BIT_TEST_TIMEOUT_S", "300")
-  let timeoutS = parseInt(raw) catch _ {
-    die("BIT_TEST_TIMEOUT_S is not an integer: ${jsonish(raw)}")
-    300
-  }
-  if (timeoutS <= 0) {
-    return i64(3600000)
-  }
-  return i64(timeoutS) * 1000
-}
-
-// Written ONCE, then never touched again: rewriting a script between execs is
-// the ETXTBSY hazard. It reads its per-batch input (`n.txt`) rather than being
-// regenerated, and `echo $?` on its own line after the compiler is the
-// load-bearing token — that file IS the snippet's verdict, and `slotResult`
-// aborts rather than assume anything when it is missing.
-//
-// `mkdir` is the claim, because it is the one atomic test-and-set POSIX sh has:
-// exactly one worker can create `c$id`, so exactly one worker runs job `id` and
-// a loser moves straight on. That is what makes workers PULL work. `</dev/null`
-// stops the background workers sharing the shell's stdin, and `wait` with no
-// operand waits for all of them, so the runner cannot return while a check is
-// still writing its status.
-fn writeRunner(cfg: Cfg) {
-  spill(cfg.script,
-    "#!/bin/sh\n" +
-    "BIT_STDLIB='${cfg.stdlibDir}'\n" +
-    "export BIT_STDLIB\n" +
-    "cd '${cfg.dir}' || exit 111\n" +
-    "n=$(cat n.txt) || exit 112\n" +
-    "[ \"$n\" -ge 1 ] || exit 113\n" +
-    "w=0\n" +
-    "while [ \"$w\" -lt ${cfg.jobs} ]; do\n" +
-    "  (\n" +
-    "    id=0\n" +
-    "    while [ \"$id\" -lt \"$n\" ]; do\n" +
-    "      if mkdir \"c$id\" 2>/dev/null; then\n" +
-    "        '${cfg.bin}' check \"w$id\" >\"o$id\" 2>&1\n" +
-    "        echo $? >\"s$id\"\n" +
-    "      fi\n" +
-    "      id=$((id+1))\n" +
-    "    done\n" +
-    "  ) </dev/null &\n" +
-    "  w=$((w+1))\n" +
-    "done\n" +
-    "wait\n" +
-    "exit 0\n",
-    "runner script")
-  if (fsChmod(cfg.script, 493) != 0) {
-    die("chmod ${cfg.script}")
-  }
-}
-
-// std/fs has no recursive delete, so every leaf is named. Failures here are
-// reported, not fatal: the run's verdict is already decided.
-fn teardown(cfg: Cfg) {
-  for p of [cfg.script, cfg.countPath, cfg.bin] {
-    drop(p)
-  }
-  // Every slot the batch COULD have used, not just the ones it did: a bounded
-  // sweep is cheaper to trust than a second copy of the batch size.
-  let i = 0
-  while (i < maxJobs) {
-    drop(slotMain(cfg, i))
-    drop(slotOut(cfg, i))
-    drop(slotStatus(cfg, i))
-    drop(slotClaim(cfg, i))
-    drop(slotDir(cfg, i))
-    i = i + 1
-  }
-  drop(cfg.dir)
-}
-
-fn drop(path: string) {
-  if (exists(path)) {
-    remove(path) catch e { eprint("docs: warning: cannot remove ${path}: ${e.message()}\n") }
-  }
-}
-
 // Every .md file under `docsDir`, in walk order and bounded by maxFiles.
 fn docPages(docsDir: string): []string {
   let all = walk(docsDir) catch e {
@@ -681,14 +304,14 @@ fn docPages(docsDir: string): []string {
 // off before it wrote one". `failures` counts only among the judged — an
 // unjudged block is never scored as a content failure (#2422).
 struct Stats {
-  pages: int
-  pagesWithBlocks: int
-  pagesWithoutBlocks: int
-  totalBlocks: int
-  invocations: int
-  failures: int
-  judged: int
-  unjudged: int
+  pages: int,
+  pagesWithBlocks: int,
+  pagesWithoutBlocks: int,
+  totalBlocks: int,
+  invocations: int,
+  failures: int,
+  judged: int,
+  unjudged: int,
 }
 
 // One page's jobs: one per block for a per-block page, otherwise one for the
@@ -710,8 +333,10 @@ fn pageJobs(page: string, md: string, blocks: []string): []Job {
 // separated from execution so the runner gets one full queue — a per-page
 // fan-out would idle every worker on the 30 pages that yield a single job.
 fn planCorpus(pages: []string): Plan {
-  let st = Stats{ pages: len(pages), pagesWithBlocks: 0, pagesWithoutBlocks: 0,
-    totalBlocks: 0, invocations: 0, failures: 0, judged: 0, unjudged: 0 }
+  let st = Stats{
+    pages: len(pages), pagesWithBlocks: 0, pagesWithoutBlocks: 0,
+    totalBlocks: 0, invocations: 0, failures: 0, judged: 0, unjudged: 0,
+  }
   let jobs = []Job(0)
   for page of pages {
     let md = slurp(page, "doc page")
