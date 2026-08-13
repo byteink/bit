@@ -300,6 +300,7 @@ gates_for_file() {
       ;;
     tests/bit/abimembers/*) printf 'test-abimembers\n'; return 0 ;;
     tests/bit/clicmd/*) printf 'test-clicmd\n'; return 0 ;;
+    tests/bit/pollfree/*) printf 'test-pollfree\n'; return 0 ;;
     tests/bit/rootabi/*) printf 'test-rootabi\n'; return 0 ;;
     tests/bit/rootpins/*) printf 'test-rootpins\n'; return 0 ;;
     tests/bit/stress/*) printf 'test-stress-exclusive\ntest-stress-batch\n'; return 0 ;;
