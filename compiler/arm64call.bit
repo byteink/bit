@@ -303,22 +303,147 @@ fn emitCallIface(cx: A64Ctx, dst: int, dstTy: int, ifaceVal: int, methodId: int,
 // never yield to the collector.
 // #2921: the naked shim's full chain (five stack frames, see
 // runtime/stw/stwpoll.bit) is only needed when a stop is pending or a
-// collection is due — both rare. Guard it behind `bit_rt_safepoint_needed`, a
-// true leaf with no frame of its own: call it, and skip the real poll when it
-// returns false (0 in the return register). Neither call records a stack map
-// via `recordSafepoint` here except the real poll's own — buildIntervals
-// (compiler/codegen.bit) records exactly one safepoint position per back
-// edge, independent of how many machine calls this emits, and the guard call
-// itself is never a point the collector needs to scan (it never parks, so it
-// can never be the frame a stopped world is looking at).
+// collection is due — both rare. #2921 guarded it behind a call to
+// `bit_rt_safepoint_needed`; #2925 inlines that call's own condition instead
+// (emitInlinedPollGuard) — see the header there for why a call, even to a
+// true leaf, remained ~0.50s of collatz's 0.86s and could not be fixed by
+// #2929 (that leaf's own prologue/epilogue is baked into the pinned-stage0
+// libbitrt.a, out of this tree's reach).
 fn emitBackEdgeSafepointIfNeeded(cx: A64Ctx, curBlock: int, target: int) {
   // §10.3.1: a @naked/@nosplit function polls no safepoint on its back-edges.
   if (isBackEdge(curBlock, target) && !needsNoSafepoints(cx.f)) {
-    emitCall(cx, -1, 0, safepointNeededSymbol(), []int(0), false)
-    cmpZero(cx.code, retRegNum())
-    let fixup = emitLocalCondBranch(cx, condEq()) // not needed -> skip the real poll
-    emitCall(cx, -1, 0, safepointSymbol(), []int(0), true)
-    patchLocalCondBranch(cx, fixup)
+    emitInlinedPollGuard(cx)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// #2925: the poll guard's condition, inlined at the call site
+// ---------------------------------------------------------------------------
+//
+// MUST MIRROR `stwPollNeeded` (runtime/stw/stwpoll.bit) EXACTLY: same fields,
+// same order, same short-circuit semantics, so this is a safe (never narrower)
+// over-approximation of the real guard — see that function's own header for
+// why narrower is a silent correctness bug and wider is merely a wasted poll.
+// The six word offsets below (pgWorldStopWordWord/pgGcCfgStressWord/
+// pgGcCfgEnabledWord/pgGcHeapAddrWord/pgHeapLiveWordWord/pgGcNextBytesWord)
+// mirror the runtime's own exported consts by NUMBER, not by importing them —
+// this backend and the runtime are separate compilations (§17.6/§11.9: a
+// pinned name crosses that boundary only for a FUNCTION, never for module
+// state/data) — so a drift between the two is real and would silently read
+// the wrong word. tests/bit/pollguardoffsets.bit pins the numbers against the
+// runtime's real consts and fails loudly on drift.
+fn pgWorldStopWordWord(): int { return 1280 }  // runtime/gc/gcworld.bit worldStopWord (256*5 — its own comment says 1024, which is stale; #2938 tracks the doc fix)
+fn pgGcCfgStressWord(): int { return 10 }      // runtime/gc/gc.bit gcCfgStress
+fn pgGcCfgEnabledWord(): int { return 9 }      // runtime/gc/gc.bit gcCfgEnabled
+fn pgGcHeapAddrWord(): int { return 0 }        // runtime/gc/gc.bit gcHeapAddr
+fn pgHeapLiveWordWord(): int { return 0 }      // runtime/alloc/alloc.bit heapLiveWord
+fn pgGcNextBytesWord(): int { return 14 }      // runtime/gc/gc.bit gcNextBytes
+
+// Fetches (worldAddr, gcAddr) ONCE per function invocation and caches them in
+// this function's own frame (FrameInfo.pollCacheSlots), rather than once per
+// loop iteration. Safe because runtime/stw/stw.bit's stwBind runs exactly once
+// at boot — before any compiled Bit function's entry can execute — and never
+// unbinds (#2184): the two addresses are a per-process constant for the
+// entire lifetime of every function this backend compiles, so re-fetching
+// them on every iteration (what a per-iteration call would do) buys nothing.
+// Emitted right after bindIncomingArgs: the incoming args are already off
+// x0..x7 by then, so these calls' ordinary caller-saved clobber is harmless,
+// and every vreg in a hasSafepoints function is callee-saved-only already
+// (buildIntRegs), so neither call can clobber a live loop-carried value.
+// bit_rt_world_addr/bit_rt_gc_addr are themselves true leaves that never
+// allocate or park, so — like the #2921 guard call they replace at the call
+// site — neither is recorded as a safepoint.
+fn emitPollCachePrefetch(cx: A64Ctx) {
+  if (cx.frame.pollCacheSlots == 0) {
+    return
+  }
+  emitCallReloc(cx, "bit_rt_world_addr")
+  storeImm(cx.code, retRegNum(), regSp(), pollCacheOffset(cx.frame, 0), 8)
+  emitCallReloc(cx, "bit_rt_gc_addr")
+  storeImm(cx.code, retRegNum(), regSp(), pollCacheOffset(cx.frame, 1), 8)
+}
+
+// Loads the plain (non-atomic) i64 at word offset `wordOff` from the pointer
+// value in `baseReg`, into `dst`. Mirrors a bare `*(g + off)` deref.
+fn emitPollField(cx: A64Ctx, dst: int, baseReg: int, wordOff: int) {
+  loadImm(cx.code, dst, baseReg, wordOff * 8, 8, false)
+}
+
+// Atomically loads the i64 at word offset `wordOff` from the pointer value in
+// `baseReg`, overwriting `baseReg` with the loaded value. Mirrors a bare
+// `atomicLoad(p + off)`. LDAR has no immediate-offset form (arm64ctx.bit's
+// emitAddrOf note: no movabs/addressing-mode equivalent exists here either),
+// so a nonzero offset is materialized into the same register first.
+fn emitAtomicPollFieldInPlace(cx: A64Ctx, baseReg: int, wordOff: int) {
+  if (wordOff != 0) {
+    addSubImmWide(cx.code, false, baseReg, baseReg, wordOff * 8)
+  }
+  ldar(cx.code, 3, baseReg, baseReg)
+}
+
+// The inlined equivalent of:
+//
+//   fn stwPollNeeded(): bool {
+//     let waddr = worldAddr
+//     if (waddr == 0) { return true }
+//     if (atomicLoad(world + worldStopWord) != 0) { return true }
+//     let gA = gcAddr
+//     if (gA == 0) { return true }
+//     if (*(g + gcCfgStress) != 0) { return true }
+//     if (*(g + gcCfgEnabled) == 0) { return false }
+//     let hb = *(g + gcHeapAddr)
+//     return atomicLoad(hb + heapLiveWord) >= *(g + gcNextBytes)
+//   }
+//
+// `true` (poll needed) falls into the real `bl bit_rt_safepoint`; `false`
+// (skip) branches past it. Three scratch registers cover the whole ladder —
+// scratch1/scratch2 hold the cached worldAddr/gcAddr only until each is used
+// for the last time, then get reused as plain temporaries, exactly as the
+// rest of this backend already treats them (never live across an instruction
+// boundary by convention).
+fn emitInlinedPollGuard(cx: A64Ctx) {
+  let rWorld = scratch1()
+  let rGc = scratch2()
+  let rTmp = scratch3()
+  let pollFixups = []int(0)
+  let skipFixups = []int(0)
+
+  loadImm(cx.code, rWorld, regSp(), pollCacheOffset(cx.frame, 0), 8, false)
+  cmpZero(cx.code, rWorld)
+  pollFixups = append(pollFixups, emitLocalCondBranch(cx, condEq())) // waddr==0
+
+  emitAtomicPollFieldInPlace(cx, rWorld, pgWorldStopWordWord())
+  cmpZero(cx.code, rWorld)
+  pollFixups = append(pollFixups, emitLocalCondBranch(cx, condNe())) // stop pending
+
+  loadImm(cx.code, rGc, regSp(), pollCacheOffset(cx.frame, 1), 8, false)
+  cmpZero(cx.code, rGc)
+  pollFixups = append(pollFixups, emitLocalCondBranch(cx, condEq())) // gcAddr==0
+
+  emitPollField(cx, rTmp, rGc, pgGcCfgStressWord())
+  cmpZero(cx.code, rTmp)
+  pollFixups = append(pollFixups, emitLocalCondBranch(cx, condNe())) // stress mode
+
+  emitPollField(cx, rTmp, rGc, pgGcCfgEnabledWord())
+  cmpZero(cx.code, rTmp)
+  skipFixups = append(skipFixups, emitLocalCondBranch(cx, condEq())) // disabled -> skip
+
+  emitPollField(cx, rTmp, rGc, pgGcHeapAddrWord())          // rTmp = heap base addr
+  emitAtomicPollFieldInPlace(cx, rTmp, pgHeapLiveWordWord()) // rTmp = heap live bytes
+  emitPollField(cx, rGc, rGc, pgGcNextBytesWord())          // rGc = next trigger
+  cmpRR(cx.code, rTmp, rGc)
+  skipFixups = append(skipFixups, emitLocalCondBranch(cx, condLt())) // under trigger -> skip
+
+  let i = 0
+  while (i < len(pollFixups)) {
+    patchLocalCondBranch(cx, pollFixups[i])
+    i = i + 1
+  }
+  emitCall(cx, -1, 0, safepointSymbol(), []int(0), true)
+  i = 0
+  while (i < len(skipFixups)) {
+    patchLocalCondBranch(cx, skipFixups[i])
+    i = i + 1
   }
 }
 
