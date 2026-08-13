@@ -1538,6 +1538,16 @@ server's certificate chain and hostname against `config.roots` unless
 `config.insecureSkipVerify` is true. Fails on a connect, resolve, or
 handshake/verification error.
 
+### `dialDeadline(host: string, port: int, config: TlsConfig, deadlineNs: int): TlsConn!`
+
+Like `dial`, but the TCP connect AND the whole handshake AND every later
+`TlsConn.read`/`write` are bounded by one absolute monotonic `deadlineNs`
+(`std/time`'s `monotonic()` plus a budget, not a duration) instead of parking
+forever. [`std/net`](net.md)'s `dialDeadline` sets `deadlineNs` on the
+underlying `Conn`; the handshake and record-layer reads/writes reuse that same
+value automatically. A timeout fails with an error naming it (`"... timed
+out"`), distinct from every other connect/handshake/read/write failure.
+
 ### `listen(host: string, port: int, config: TlsConfig): TlsListener!`
 
 Bind a TLS listener on `host:port`. `config.certPem` and `config.keyPem` (the
