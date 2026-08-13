@@ -1,0 +1,645 @@
+// In-Bit self-checks for compiler/pmfetchresolve.bit's fetch/cache/vanity
+// logic (#1733, #2068; split off pmfetchcheck.bit by #2968 under the
+// 800-line limit, spec/LINT.md §4). Sibling of pmfetch.bit and
+// pmfetchresolve.bit (same module). `checkPmfetch()` (pmfetchcheck.bit)
+// calls into this file's checks alongside its own spec-grammar checks; a
+// failed `assert` anywhere in that chain panics with exit 2 under
+// `./make test`, same as every other `*check.bit` sibling in this directory.
+//
+// The git-backed fixture is a real `git init`'d repo built with the system
+// `git` binary under a scratch temp directory (never a network dependency:
+// everything is `file://` or a bare local path), covering: a fresh fetch
+// landing content keyed by commit sha, a second fetch of the same sha being
+// a no-op cache hit, `resolveDependencyRef` turning a branch name into that
+// same sha, an annotated-tag resolution, and a fetch against a git binary
+// that never returns timing out — and returning an error — within its
+// configured deadline instead of hanging the build. The vanity-resolution
+// checks below are pure functions over fixture strings instead (no network).
+
+import { monotonic, since } from "std/time"
+
+const pmCheckTimeoutMs: int = 20000
+
+// A fixture git repo with one commit, built via the same `runGit` pmfetch
+// itself uses (dogfooding the wrapper this whole file is here to guard).
+struct PmFixture { dir: string, sha: string }
+
+fn pmCheckScratchDir(): string {
+  return envOr("TMPDIR", "/tmp") + "/pmfetchcheck-" + uuidFormat(uuidV4())
+}
+
+// Dead value handed to the type checker after a `panic` call in a
+// `GitRun`-typed `catch` block. SPEC §14.7 lists `panic` alongside
+// `return`/`fail`/`break`/`continue` as a valid tail diversion for a `catch`
+// block, but this compiler still wants a value of the right type after it;
+// `panic` itself never returns, so this is never actually produced.
+fn pmDeadGitRun(): GitRun {
+  return GitRun{ exitCode: -1, timedOut: false, output: "" }
+}
+
+// Same as `pmDeadGitRun`, for a `FetchResult`-typed `catch` block.
+fn pmDeadFetchResult(): FetchResult {
+  return FetchResult{ dir: "", sha: "", cacheHit: false }
+}
+
+// Asserts a fixture `git` invocation succeeded, NAMING what failed (#1819).
+//
+// This replaces `assert(!r.timedOut && r.exitCode == 0)`, which threw away
+// everything needed to act on the failure. The case that made it matter: with no
+// `git` on PATH, `runGit` SUCCEEDS — the wrapper script runs fine and reports the
+// shell's own "git: not found" with exit 127 — so the `catch` never fires and the
+// bare assert was all the reader got. `panic: assertion failed`, exit 2, no tool
+// name, no exit code, while two other harnesses failed for the same reason and
+// only one of them said why.
+//
+// `r.output` is where the useful text lives (runGit captures stdout+stderr
+// combined), so it must be in the message; `exitCode` alone does not say 127 means
+// a missing binary.
+fn pmGitMustSucceed(what: string, r: GitRun) {
+  if (r.timedOut) {
+    panic("pmcheck: git ${what} timed out after ${pmCheckTimeoutMs}ms")
+  }
+  if (r.exitCode != 0) {
+    panic("pmcheck: git ${what} failed (exit ${r.exitCode}): ${pmTrim(r.output)}")
+  }
+}
+
+fn pmBuildFixture(root: string): PmFixture {
+  let dir = root + "/fixture.git"
+  let mkInit = runGit(defaultGitBin, ["init", "--quiet", "-b", "main", dir], pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: git init failed: " + e.message())
+    pmDeadGitRun()
+  }
+  pmGitMustSucceed("init", mkInit)
+
+  let cfgEmail = runGit(defaultGitBin, ["-C", dir, "config", "user.email", "pmfetchcheck@example.com"], pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: git config user.email failed: " + e.message())
+    pmDeadGitRun()
+  }
+  pmGitMustSucceed("config user.email", cfgEmail)
+
+  let cfgName = runGit(defaultGitBin, ["-C", dir, "config", "user.name", "pmfetchcheck"], pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: git config user.name failed: " + e.message())
+    pmDeadGitRun()
+  }
+  pmGitMustSucceed("config user.name", cfgName)
+
+  writeFile(dir + "/hello.txt", "hello from pmfetchcheck\n") catch e {
+    panic("pmfetchcheck: cannot write fixture file: " + e.message())
+  }
+
+  let add = runGit(defaultGitBin, ["-C", dir, "add", "hello.txt"], pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: git add failed: " + e.message())
+    pmDeadGitRun()
+  }
+  pmGitMustSucceed("add", add)
+
+  let commit = runGit(defaultGitBin, ["-C", dir, "commit", "--quiet", "-m", "pmfetchcheck fixture"], pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: git commit failed: " + e.message())
+    pmDeadGitRun()
+  }
+  pmGitMustSucceed("commit", commit)
+
+  let sha = revParseHead(defaultGitBin, dir, pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: cannot read fixture HEAD: " + e.message())
+    ""
+  }
+  return PmFixture{ dir: dir, sha: sha }
+}
+
+// Fresh fetch + cache-hit + resolveDependencyRef, all against one fixture.
+fn checkPmfetchFetchAndCacheHit() {
+  let root = pmCheckScratchDir()
+  mkdirAll(root) catch e { panic("pmfetchcheck: cannot create scratch dir: " + e.message()) }
+  let fx = pmBuildFixture(root)
+  let url = "file://" + fx.dir
+  let cacheRoot = root + "/cache"
+
+  let first = fetchSha(defaultGitBin, cacheRoot, "local", "pmfetchcheck", "fixture", url, fx.sha, pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: first fetchSha failed: " + e.message())
+    pmDeadFetchResult()
+  }
+  assert(!first.cacheHit)
+  assert(first.sha == fx.sha)
+  assert(first.dir == cacheRoot + "/local/pmfetchcheck/fixture/" + fx.sha)
+  assert(exists(first.dir + "/hello.txt"))
+
+  // A second fetch of the SAME sha must be a cache hit — no git subprocess
+  // beyond the local (no-network) integrity verify.
+  let second = fetchSha(defaultGitBin, cacheRoot, "local", "pmfetchcheck", "fixture", url, fx.sha, pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: second fetchSha failed: " + e.message())
+    pmDeadFetchResult()
+  }
+  assert(second.cacheHit)
+  assert(second.dir == first.dir)
+  assert(second.sha == fx.sha)
+
+  // resolveDependencyRef must turn the branch name into the same commit sha
+  // `git ls-remote` would report, without the caller ever naming it.
+  let resolved = resolveDependencyRef(defaultGitBin, url, "main", pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: resolveDependencyRef failed: " + e.message())
+    ""
+  }
+  assert(resolved == fx.sha)
+
+  // A bare sha ref resolves with no subprocess call at all.
+  let bare = resolveDependencyRef(defaultGitBin, url, fx.sha, pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: resolveDependencyRef(sha) failed: " + e.message())
+    ""
+  }
+  assert(bare == fx.sha)
+}
+
+// #2268: a ref that does not exist on the remote must fail with a message
+// naming the ref and the repository — never the bare "git ls-remote failed
+// (exit N) for ...: " with nothing after the colon. `git ls-remote <url>
+// <ref>` exits non-zero with EMPTY stdout+stderr when `ref` simply does not
+// exist (unlike an unreachable/not-found remote, which always writes to
+// stderr), so `resolveDependencyRef` needs its own branch for that case.
+fn checkPmfetchNoSuchRefMessage() {
+  let root = pmCheckScratchDir()
+  mkdirAll(root) catch e { panic("pmfetchcheck: cannot create scratch dir: " + e.message()) }
+  let fx = pmBuildFixture(root)
+  let url = "file://" + fx.dir
+
+  let failed = false
+  let errMsg = ""
+  let resolved = resolveDependencyRef(defaultGitBin, url, "v9.9.9", pmCheckTimeoutMs) catch e {
+    failed = true
+    errMsg = e.message()
+    ""
+  }
+  assert(failed)
+  assert(len(resolved) == 0)
+  // The exact regression: no bare trailing colon, or colon-space, with
+  // nothing after it.
+  assert(!hasSuffix(errMsg, ":"))
+  assert(!hasSuffix(errMsg, ": "))
+  assert(contains(errMsg, "v9.9.9"))
+  assert(contains(errMsg, url))
+}
+
+// A tampered cache entry (content present, but its checked-out HEAD does not
+// match the sha the directory claims to be) must fail loudly, never silently
+// re-resolve — SPEC'd in the ticket this file guards.
+fn checkPmfetchIntegrityMismatch() {
+  let root = pmCheckScratchDir()
+  mkdirAll(root) catch e { panic("pmfetchcheck: cannot create scratch dir: " + e.message()) }
+  let fx = pmBuildFixture(root)
+  let url = "file://" + fx.dir
+  let cacheRoot = root + "/cache"
+
+  let first = fetchSha(defaultGitBin, cacheRoot, "local", "pmfetchcheck", "tamper", url, fx.sha, pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: fetchSha failed: " + e.message())
+    pmDeadFetchResult()
+  }
+  assert(!first.cacheHit)
+
+  // Move the fixture's history forward, so the CACHED checkout (still at the
+  // old commit) now disagrees with what a fresh git rev-parse would report if
+  // this were silently re-resolved instead of verified.
+  writeFile(fx.dir + "/hello.txt", "changed\n") catch e { panic("pmfetchcheck: cannot rewrite fixture file: " + e.message()) }
+  let add = runGit(defaultGitBin, ["-C", fx.dir, "add", "hello.txt"], pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: git add (tamper) failed: " + e.message())
+    pmDeadGitRun()
+  }
+  pmGitMustSucceed("add", add)
+  let commit = runGit(defaultGitBin, ["-C", fx.dir, "commit", "--quiet", "-m", "moved"], pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: git commit (tamper) failed: " + e.message())
+    pmDeadGitRun()
+  }
+  pmGitMustSucceed("commit", commit)
+  let movedSha = revParseHead(defaultGitBin, fx.dir, pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: cannot read moved fixture HEAD: " + e.message())
+    ""
+  }
+  assert(movedSha != fx.sha)
+
+  // Overwrite the CACHED directory's own working file directly (simulating
+  // corruption/tampering of the cache itself, not a re-fetch) — its checked
+  // out HEAD is unchanged, so this must still verify fine and remain a hit.
+  let stillHit = fetchSha(defaultGitBin, cacheRoot, "local", "pmfetchcheck", "tamper", url, fx.sha, pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: fetchSha (unchanged cache) failed: " + e.message())
+    pmDeadFetchResult()
+  }
+  assert(stillHit.cacheHit)
+  assert(stillHit.sha == fx.sha)
+
+  // Now genuinely corrupt the cached checkout's recorded commit: fetch the
+  // moved commit into it and check it out directly (the cached checkout is
+  // detached at a single sha, not a branch, so there is no local "main" to
+  // switch to — its HEAD no longer equals the directory's own sha component
+  // once this lands, which fetchSha must catch and refuse, not paper over).
+  let fetchMoved = runGit(defaultGitBin, ["-C", stillHit.dir, "fetch", "--quiet", url, movedSha], pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: git fetch (corrupt) failed: " + e.message())
+    pmDeadGitRun()
+  }
+  pmGitMustSucceed("fetch", fetchMoved)
+  let reset = runGit(defaultGitBin, ["-C", stillHit.dir, "checkout", "--quiet", movedSha], pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: git checkout (corrupt) failed: " + e.message())
+    pmDeadGitRun()
+  }
+  pmGitMustSucceed("reset", reset)
+
+  let shouldFail = fetchSha(defaultGitBin, cacheRoot, "local", "pmfetchcheck", "tamper", url, fx.sha, pmCheckTimeoutMs) catch e { pmDeadFetchResult() }
+  assert(len(shouldFail.dir) == 0)
+}
+
+// The last hex digit of `sha` changed to a different valid hex digit — a
+// well-formed 40-hex commit sha (`isFullSha` still accepts it) that the
+// fixture repo genuinely does not have, so `git fetch <url> <sha>` fails for
+// a real reason rather than this test faking a subprocess error.
+fn pmFlipHexDigit(sha: string): string {
+  let last = sha[len(sha) - 1:len(sha)]
+  let flipped = "1"
+  if (last == "1") {
+    flipped = "2"
+  }
+  return sha[0:len(sha) - 1] + flipped
+}
+
+// #2257: a fetch that fails after the scratch directory would have been
+// created (a well-formed sha the remote does not have) must leave NOTHING at
+// `<cacheRoot>/<host>/<owner>/<repo>/<sha>` — before this, `fetchSha` built
+// directly at that final path, so a failed `git fetch`/`checkout` left a
+// half-fetched directory there, and every later attempt (even with the exact
+// same bad sha) failed a SECOND, different way: "cache integrity error",
+// forever, with no way in the tool to clear it. A corrected retry (the sha
+// that actually exists) must succeed on its own, proving there is no
+// leftover poisoned entry standing in its way.
+fn checkPmfetchFailedFetchLeavesNoDirectory() {
+  let root = pmCheckScratchDir()
+  mkdirAll(root) catch e { panic("pmfetchcheck: cannot create scratch dir: " + e.message()) }
+  let fx = pmBuildFixture(root)
+  let url = "file://" + fx.dir
+  let cacheRoot = root + "/cache"
+
+  let badSha = pmFlipHexDigit(fx.sha)
+  assert(isFullSha(badSha))
+  assert(badSha != fx.sha)
+
+  let finalDir = cacheRoot + "/local/pmfetchcheck/failedfetch/" + badSha
+
+  let failed = false
+  let errMsg = ""
+  let result = fetchSha(defaultGitBin, cacheRoot, "local", "pmfetchcheck", "failedfetch", url, badSha, pmCheckTimeoutMs) catch e {
+    failed = true
+    errMsg = e.message()
+    pmDeadFetchResult()
+  }
+  assert(failed)
+  assert(len(result.dir) == 0)
+  assert(!contains(errMsg, "cache integrity error"))
+  assert(!exists(finalDir))
+
+  // A second attempt with the identical bad sha must fail the SAME way, not
+  // with the "cache integrity error" a poisoned leftover directory would now
+  // produce — the whole point of the fix.
+  let failed2 = false
+  let errMsg2 = ""
+  let result2 = fetchSha(defaultGitBin, cacheRoot, "local", "pmfetchcheck", "failedfetch", url, badSha, pmCheckTimeoutMs) catch e {
+    failed2 = true
+    errMsg2 = e.message()
+    pmDeadFetchResult()
+  }
+  assert(failed2)
+  assert(len(result2.dir) == 0)
+  assert(!contains(errMsg2, "cache integrity error"))
+  assert(!exists(finalDir))
+
+  // A corrected retry, same cache root, with the sha that actually exists —
+  // succeeds on its own, no manual cleanup needed.
+  let fixed = fetchSha(defaultGitBin, cacheRoot, "local", "pmfetchcheck", "failedfetch", url, fx.sha, pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: corrected retry after a failed fetch failed: " + e.message())
+    pmDeadFetchResult()
+  }
+  assert(!fixed.cacheHit)
+  assert(fixed.sha == fx.sha)
+  assert(exists(fixed.dir + "/hello.txt"))
+}
+
+// #2257: the integrity-error message on a genuinely tampered cache entry now
+// names the exact directory AND states how to clear it, so a user reading it
+// has an action to take rather than a dead end.
+fn checkPmfetchIntegrityErrorNamesCleanup() {
+  let root = pmCheckScratchDir()
+  mkdirAll(root) catch e { panic("pmfetchcheck: cannot create scratch dir: " + e.message()) }
+  let fx = pmBuildFixture(root)
+  let url = "file://" + fx.dir
+  let cacheRoot = root + "/cache"
+
+  let first = fetchSha(defaultGitBin, cacheRoot, "local", "pmfetchcheck", "cleanupmsg", url, fx.sha, pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: fetchSha failed: " + e.message())
+    pmDeadFetchResult()
+  }
+  assert(!first.cacheHit)
+
+  // Tamper: point the cached checkout's own tracked file at a different
+  // commit than the directory's own sha component claims (same technique
+  // `checkPmfetchIntegrityMismatch` uses above).
+  writeFile(fx.dir + "/hello.txt", "changed again\n") catch e { panic("pmfetchcheck: cannot rewrite fixture file: " + e.message()) }
+  let add = runGit(defaultGitBin, ["-C", fx.dir, "add", "hello.txt"], pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: git add (tamper) failed: " + e.message())
+    pmDeadGitRun()
+  }
+  pmGitMustSucceed("add", add)
+  let commit = runGit(defaultGitBin, ["-C", fx.dir, "commit", "--quiet", "-m", "moved again"], pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: git commit (tamper) failed: " + e.message())
+    pmDeadGitRun()
+  }
+  pmGitMustSucceed("commit", commit)
+  let movedSha = revParseHead(defaultGitBin, fx.dir, pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: cannot read moved fixture HEAD: " + e.message())
+    ""
+  }
+  let fetchMoved = runGit(defaultGitBin, ["-C", first.dir, "fetch", "--quiet", url, movedSha], pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: git fetch (corrupt) failed: " + e.message())
+    pmDeadGitRun()
+  }
+  pmGitMustSucceed("fetch", fetchMoved)
+  let reset = runGit(defaultGitBin, ["-C", first.dir, "checkout", "--quiet", movedSha], pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: git checkout (corrupt) failed: " + e.message())
+    pmDeadGitRun()
+  }
+  pmGitMustSucceed("reset", reset)
+
+  let failed = false
+  let errMsg = ""
+  let shouldFail = fetchSha(defaultGitBin, cacheRoot, "local", "pmfetchcheck", "cleanupmsg", url, fx.sha, pmCheckTimeoutMs) catch e {
+    failed = true
+    errMsg = e.message()
+    pmDeadFetchResult()
+  }
+  assert(failed)
+  assert(len(shouldFail.dir) == 0)
+  assert(contains(errMsg, first.dir))
+  assert(contains(errMsg, "rm -rf ${first.dir}"))
+}
+
+// `git rev-parse <ref>` against a fixture repo, panicking loudly rather than
+// failing silently — a check fixture's own git calls are never expected to
+// error, so any failure here is this file's own setup bug, not the thing
+// under test.
+fn pmRevParse(dir: string, ref: string): string {
+  let run = runGit(defaultGitBin, ["-C", dir, "rev-parse", ref], pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: git rev-parse ${ref} failed: " + e.message())
+    pmDeadGitRun()
+  }
+  pmGitMustSucceed("rev-parse ${ref}", run)
+  return pmTrim(run.output)
+}
+
+// #2064: `resolveDependencyRef` must resolve an ANNOTATED tag to the
+// underlying COMMIT sha, not the tag OBJECT sha `git ls-remote` reports on
+// its un-peeled `refs/tags/<tag>` line — `git tag -a`/`-s` and every GitHub
+// Release produce an annotated tag, and this machine's own `tag.gpgsign
+// true` makes even a bare `git tag` here sign (still annotated), so a bare
+// `git tag` cannot build the lightweight contrast case: that leg uses
+// `git update-ref` directly instead.
+fn checkPmfetchAnnotatedTag() {
+  let root = pmCheckScratchDir()
+  mkdirAll(root) catch e { panic("pmfetchcheck: cannot create scratch dir: " + e.message()) }
+  let fx = pmBuildFixture(root)
+  let url = "file://" + fx.dir
+
+  let annTag = runGit(defaultGitBin, ["-C", fx.dir, "tag", "-a", "v1.0.0", "-m", "v1.0.0"], pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: git tag -a failed: " + e.message())
+    pmDeadGitRun()
+  }
+  pmGitMustSucceed("tag -a", annTag)
+
+  // Prove the fixture actually exercises the bug BEFORE trusting the
+  // resolution below: the tag object sha and the commit sha it points at
+  // must genuinely differ, or this check would pass vacuously the same way
+  // the branch-only fixture did before #2064.
+  let tagObjSha = pmRevParse(fx.dir, "refs/tags/v1.0.0")
+  let tagCommitSha = pmRevParse(fx.dir, "refs/tags/v1.0.0^{}")
+  assert(tagObjSha != tagCommitSha)
+  assert(tagCommitSha == fx.sha)
+
+  let resolved = resolveDependencyRef(defaultGitBin, url, "v1.0.0", pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: resolveDependencyRef(annotated tag) failed: " + e.message())
+    ""
+  }
+  assert(resolved == tagCommitSha)
+  assert(resolved != tagObjSha)
+
+  // Lightweight tag: no peeled line at all, so the plain line's sha was
+  // already correct — must keep resolving the same way it does today.
+  let lwTag = runGit(defaultGitBin, ["-C", fx.dir, "update-ref", "refs/tags/v1.0.0-lw", "HEAD"], pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: git update-ref failed: " + e.message())
+    pmDeadGitRun()
+  }
+  pmGitMustSucceed("update-ref", lwTag)
+
+  let resolvedLw = resolveDependencyRef(defaultGitBin, url, "v1.0.0-lw", pmCheckTimeoutMs) catch e {
+    panic("pmfetchcheck: resolveDependencyRef(lightweight tag) failed: " + e.message())
+    ""
+  }
+  assert(resolvedLw == fx.sha)
+}
+
+// #2068 acceptance: a fixture `bit-import:` document resolves a
+// `bitlang.org/pkg/<name>` spec to its git URL, and a document whose
+// declared name differs from the requested name fails with a named error.
+// Drives `checkAndParseVanityDoc` (the cap-then-parse sequence
+// `resolveVanityUrl` runs on a fetched body) directly against fixture
+// strings — no network involved, per this ticket's own constraint.
+fn checkPmfetchVanityDocResolves() {
+  let name = "bitlang.org/pkg/http"
+  let gitUrl = checkAndParseVanityDoc(name, "bit-import: ${name} git https://github.com/byteink/http.git\n") catch e {
+    panic("pmfetchcheck: checkAndParseVanityDoc rejected a valid bit-import document: " + e.message())
+    ""
+  }
+  assert(gitUrl == "https://github.com/byteink/http.git")
+
+  // Trailing fields after <gitURL> are the format's extension point and are
+  // ignored.
+  let gitUrlExtra = checkAndParseVanityDoc(name, "bit-import: ${name} git https://github.com/byteink/http.git sha256:deadbeef\n") catch e {
+    panic("pmfetchcheck: checkAndParseVanityDoc rejected a document with trailing fields: " + e.message())
+    ""
+  }
+  assert(gitUrlExtra == "https://github.com/byteink/http.git")
+
+  // No trailing newline (a server that doesn't add one) is still exactly one
+  // line.
+  let gitUrlNoNewline = checkAndParseVanityDoc(name, "bit-import: ${name} git https://github.com/byteink/http.git") catch e {
+    panic("pmfetchcheck: checkAndParseVanityDoc rejected a document with no trailing newline: " + e.message())
+    ""
+  }
+  assert(gitUrlNoNewline == "https://github.com/byteink/http.git")
+
+  // The declared name must be byte-for-byte identical to the requested name
+  // — SPEC §17.7's whole trust boundary — or resolution fails with a named
+  // error identifying both the requested and the claimed name.
+  let failed = false
+  let errMsg = ""
+  let mismatched = checkAndParseVanityDoc(name, "bit-import: bitlang.org/pkg/json git https://github.com/byteink/json.git\n") catch e {
+    failed = true
+    errMsg = e.message()
+    ""
+  }
+  assert(failed)
+  assert(len(mismatched) == 0)
+  assert(contains(errMsg, name))
+  assert(contains(errMsg, "bitlang.org/pkg/json"))
+
+  // Missing the literal "git" token, or no <gitURL> at all, is a resolution
+  // failure.
+  let noGitToken = checkAndParseVanityDoc(name, "bit-import: ${name} https://github.com/byteink/http.git\n") catch e { "" }
+  assert(len(noGitToken) == 0)
+  let noUrl = checkAndParseVanityDoc(name, "bit-import: ${name} git\n") catch e { "" }
+  assert(len(noUrl) == 0)
+  let notBitImport = checkAndParseVanityDoc(name, "hello world\n") catch e { "" }
+  assert(len(notBitImport) == 0)
+}
+
+// #2300: `vanityRequestUrl` (the request-URL builder `resolveVanityUrl`
+// factors its `BIT_VANITY_ORIGIN` handling through) is exercised directly
+// with an explicit override string — no real environment mutation, no
+// network — the same way `checkAndParseVanityDoc` above is driven with
+// fixture bodies instead of a real fetch.
+fn checkPmfetchVanityRequestUrlOverride() {
+  let name = "bitlang.org/pkg/http"
+
+  // Unset (empty override): byte-identical to the pre-#2300 behavior.
+  assert(vanityRequestUrl(name, "") == "https://" + name)
+
+  // Set: the override's base joined to the name's own path (from its first
+  // "/" onward), never the override alone and never the unmodified name.
+  assert(vanityRequestUrl(name, "http://127.0.0.1:8099") == "http://127.0.0.1:8099/pkg/http")
+
+  // A different origin (host, port, scheme) is honored verbatim as the base.
+  assert(vanityRequestUrl(name, "https://fixture.internal:9443") == "https://fixture.internal:9443/pkg/http")
+
+  // A name with no path segment at all (a bare host) maps to the override
+  // verbatim — there is nothing after the host to append.
+  assert(vanityRequestUrl("bitlang.org", "http://127.0.0.1:8099") == "http://127.0.0.1:8099")
+
+  // A deeper vanity path carries every segment after the host through.
+  assert(vanityRequestUrl("bitlang.org/pkg/http/client", "http://127.0.0.1:8099") == "http://127.0.0.1:8099/pkg/http/client")
+}
+
+// #2068 acceptance: both an oversized document and a non-https `<gitURL>`
+// scheme are refused, the oversized case BEFORE parsing.
+fn checkPmfetchVanityTransportRules() {
+  let name = "bitlang.org/pkg/http"
+
+  // A non-https gitURL — plaintext http:// or a file:// URL — is refused.
+  let httpUrl = checkAndParseVanityDoc(name, "bit-import: ${name} git http://github.com/byteink/http.git\n") catch e { "" }
+  assert(len(httpUrl) == 0)
+  let fileUrl = checkAndParseVanityDoc(name, "bit-import: ${name} git file:///etc/passwd\n") catch e { "" }
+  assert(len(fileUrl) == 0)
+
+  // An oversized document is refused BEFORE parsing: this body does not even
+  // start with the literal "bit-import:" token, so if the cap were checked
+  // AFTER (or not checked at all), the failure would instead — or also —
+  // name a parse error ("malformed bit-import document...", parseVanityDoc's
+  // own text). Asserting the byte-cap message appears and the parse-error
+  // text does not proves the cap fired first, not that this body merely also
+  // happens to be unparseable.
+  let oversized = pmRepeatByte('x', vanityMaxDocBytes + 1)
+  let failed = false
+  let errMsg = ""
+  let url = checkAndParseVanityDoc(name, oversized) catch e {
+    failed = true
+    errMsg = e.message()
+    ""
+  }
+  assert(failed)
+  assert(len(url) == 0)
+  assert(contains(errMsg, "${vanityMaxDocBytes}"))
+  assert(contains(errMsg, "cap"))
+  assert(!contains(errMsg, "malformed bit-import document"))
+
+  // The identical malformed shape, one byte UNDER the cap, reaches the
+  // parser instead and fails with ITS error — confirming the two checks are
+  // genuinely distinct steps, not one check that happens to cover both.
+  let underCap = pmRepeatByte('x', vanityMaxDocBytes - 1)
+  let failed2 = false
+  let errMsg2 = ""
+  let url2 = checkAndParseVanityDoc(name, underCap) catch e {
+    failed2 = true
+    errMsg2 = e.message()
+    ""
+  }
+  assert(failed2)
+  assert(len(url2) == 0)
+  assert(contains(errMsg2, "malformed bit-import document"))
+}
+
+// `n` copies of byte `c` as a string — used only to build an
+// over/under-the-cap fixture body; bounded by the caller's own constant.
+fn pmRepeatByte(c: byte, n: int): string {
+  let out = []byte(n)
+  let i = 0
+  while (i < n) {
+    out[i] = c
+    i = i + 1
+  }
+  return string(out)
+}
+
+// #2068 acceptance: a lock entry whose recorded URL differs from a freshly
+// resolved URL for the same name fails loudly naming both URLs — never a
+// silent switch.
+fn checkPmfetchResolvedUrlConflict() {
+  let recorded = "https://github.com/byteink/http.git"
+  let fresh = "https://github.com/someoneelse/http.git"
+
+  checkResolvedUrlMatches("http", "", fresh) catch e {
+    panic("pmfetchcheck: checkResolvedUrlMatches rejected a first-time resolution: " + e.message())
+  }
+  checkResolvedUrlMatches("http", recorded, recorded) catch e {
+    panic("pmfetchcheck: checkResolvedUrlMatches rejected an unchanged URL: " + e.message())
+  }
+
+  let (failed, errMsg) = pmCheckUrlConflict("http", recorded, fresh)
+  assert(failed)
+  assert(contains(errMsg, recorded))
+  assert(contains(errMsg, fresh))
+  assert(contains(errMsg, "http"))
+}
+
+// `checkResolvedUrlMatches` is `()!` — a void-fallible call — so a `catch`
+// block that needs to CAPTURE the error rather than diverge has nothing to
+// produce as its own tail value (`()` has no literal, SPEC §12.2). This
+// wrapper diverges inside the catch instead (`return`, always valid there)
+// and gives the caller an ordinary `(bool, string)` to assert against.
+fn pmCheckUrlConflict(name: string, existingUrl: string, freshUrl: string): (bool, string) {
+  checkResolvedUrlMatches(name, existingUrl, freshUrl) catch e {
+    return true, e.message()
+  }
+  return false, ""
+}
+
+// A subprocess that never returns must still return an error within the
+// configured deadline, never hang the caller. Points `resolveDependencyRef`
+// at a fake "git" that only sleeps, with a short deadline, and asserts the
+// call both fails and returns close to that deadline rather than at, say,
+// the default 30s (which would mean the mechanism silently degraded to a
+// plain blocking wait).
+fn checkPmfetchTimeout() {
+  let root = pmCheckScratchDir()
+  mkdirAll(root) catch e { panic("pmfetchcheck: cannot create scratch dir: " + e.message()) }
+  let fakeGit = root + "/fakegit.sh"
+  writeFile(fakeGit, "#!/bin/sh\nsleep 60\n") catch e { panic("pmfetchcheck: cannot write fake git: " + e.message()) }
+  if (fsChmod(fakeGit, 448) != 0) { // 0o700
+    panic("pmfetchcheck: cannot chmod fake git")
+  }
+
+  let deadlineMs = 2000
+  let start = monotonic()
+  let failed = false
+  let sha = resolveDependencyRef(fakeGit, "file:///nonexistent-remote", "main", deadlineMs) catch e {
+    failed = true
+    ""
+  }
+  let elapsedMs = since(start) / Millisecond
+  assert(failed)
+  assert(len(sha) == 0)
+  // Generous slack over the deadline itself: this only needs to rule out
+  // "fell back to blocking forever" / "waited the unrelated 30s default",
+  // not pin an exact wall-clock bound a slower CI host would flake on.
+  assert(elapsedMs < deadlineMs + 15000)
+}
