@@ -751,18 +751,21 @@ POSIX only in v1; Windows keeps the compiled defaults until the runtime adds
 
 **`bit` itself is a Bit program**, so every row above also configures `bit`'s
 own process, not only the program it is building or running (#2425). `bit
-build`/`check`/`test` compile in-process and simply run slower under
-`BIT_GC=stress` (the compiler's own heap, not the input program, pays the
-per-safepoint collection). `bit run` compiles in-process too, but then execs
-the compiled binary as a separate child that inherits the environment fresh —
-so under `BIT_GC=stress` it would never reach that exec: the compile alone
-does not finish in useful time (#2425 measured a six-line input still
-compiling after 60s, zero collections even logged). `bit run` therefore
-**refuses** `BIT_GC=stress` outright (`compiler/build.bit`'s
-`refuseRunUnderStressGc`) rather than appearing to hang; the diagnostic names
-the supported route, `bit build` followed by running the output binary
-directly under `BIT_GC=stress`, which is a single process and gets the policy
-that was actually intended.
+build`/`check` compile in-process and simply run slower under `BIT_GC=stress`
+(the compiler's own heap, not the input program, pays the per-safepoint
+collection) — no exec follows, so a slow compile is the whole story. `bit
+run` also compiles in-process, but then execs the compiled binary as a
+separate child that inherits the environment fresh — so under
+`BIT_GC=stress` it would never reach that exec: the compile alone does not
+finish in useful time (#2425 measured a six-line input still compiling after
+60s, zero collections even logged). `bit run` therefore **refuses**
+`BIT_GC=stress` outright (`compiler/build.bit`'s `refuseRunUnderStressGc`)
+rather than appearing to hang; the diagnostic names the supported route,
+`bit build` followed by running the output binary directly under
+`BIT_GC=stress`, which is a single process and gets the policy that was
+actually intended. `bit test` compiles then runs its test functions the same
+way `run` does and has the identical hang, still open as #2979 — it is not
+yet refused.
 
 ---
 
