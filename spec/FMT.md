@@ -160,6 +160,35 @@ outer calls' real column is added in) formats to one unwrapped line; halving
 nesting depth, confirming the exemption is about nesting depth being moot,
 not about the checker ignoring width entirely.
 
+**A trailing same-line comment is OUTSIDE the width budget (`#2899`).** No
+construct budgets for it: `fmtGap`'s comment flush runs after the code it
+follows is fully printed, with nothing tying the two widths together. A
+code-plus-comment combination whose code fits can therefore land over
+`fmtMaxWidth` once the comment is appended, and that output is canonical —
+`bit fmt` is a no-op on it.
+
+This is a decision, not the absence of one, and the reason it is not merely
+a missing check: making the code wrap to make room would require the
+construct printing it to measure against the real column, which is exactly
+the measurement the `#2894` exemption above exists to suppress. The two
+cannot both hold. Choosing the other way would also let a comment *cause* a
+wrap in the code it annotates, which this style rejects — the comment is not
+part of the expression.
+
+Note that no width rule can rescue the general case anyway: of the five
+instances in the tree, the comment text **alone** exceeds 100 columns in two
+of them — `compiler/arm64call.bit:335` and `compiler/project.bit:692` — so
+those lines are over budget with zero code on them. Re-measure rather than
+quoting a figure here; both are near enough to the limit that a reword moves
+them, and a stale number in this file has misled a reader before.
+
+**Check:** `tests/cases/fmt_comment_tail_budget.bit` — a single-item call
+with a binary-chain argument and a trailing `//` comment, over budget — has
+a `.expected` byte-identical to its input, so any future change that starts
+wrapping this shape reddens `test-golden` rather than drifting silently.
+Any gate that measures line width (`#2876`) must exempt the trailing
+comment to agree with this rule.
+
 Otherwise it explodes to one item per line, each with a trailing comma, at
 one deeper indent level, preserving the author's own item grouping (`grouped`,
 `compiler/fmt.bit:467-485`) — two items the source kept on the same line stay
