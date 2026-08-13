@@ -114,6 +114,17 @@ export @nosplit @symbol("bit_rt_ignore_sigpipe") fn ignoreSigpipe(): int {
 const sigSegv: int = 11
 const sigBus: int = 10
 
+// SIGILL = 4, SIGTRAP = 5 (`<sys/signal.h>`, verified against this SDK's
+// header, 2026-08-13) — UNLIKE SIGBUS these two are the same number on both
+// platforms (Linux `include/uapi/asm-generic/signal.h` agrees, already cited
+// by ../linux/signal.bit for SIGBUS/SIGSEGV/SIGPIPE): the classic low
+// signals 1-6 predate the BSD/SysV split that gave SIGBUS its two numbers.
+// #2946: the OTHER shape #2432's inline `brk #0` (arm64, this platform)/`ud2`
+// (x64) traps raise when `schedCurrentTask` returns 0 — see
+// `classifyOverflowTrap` below.
+const sigIll: int = 4
+const sigTrap: int = 5
+
 // SA_SIGINFO = 0x40, SA_ONSTACK = 0x1 (`<sys/signal.h>`). SA_SIGINFO selects
 // the three-argument `void (*)(int, siginfo_t *, void *)` handler form
 // `segvHandler` below is written to, over the one-argument SIG_IGN form
@@ -146,6 +157,15 @@ const siAddrOffset: int = 24
 const ucMcontextOffset: int = 48
 const mcontextSpOffset: int = 264
 
+// The floor both `segvHandler` and `classifyOverflowTrap` gate every
+// alignment match against: it rules out a degenerate near-zero reading (e.g.
+// both inputs landing on unmapped/zeroed memory) agreeing with itself, or an
+// uninitialized `mainStackBaseAddr` (0 before step 5 of `boot`) matching a
+// coincidentally-zero candidate. Every real stack mapping on this platform
+// sits far above it. Named rather than left as the two functions' own inline
+// literal so the two attribution paths cannot silently drift apart.
+const stackAddrFloor: int = 268435456
+
 // One alternate signal stack per worker OS thread, 64 KiB — comfortably above
 // `MINSIGSTKSZ` (32768 on this SDK, verified with `sizeof`/a real run, not
 // from memory) and a round number matching the granule this runtime already
@@ -172,12 +192,18 @@ let sigAltStackClaimed: [32]i64
 // index can ever overlap.
 let sigAltStackScratch: [96]i64
 
-// The `struct sigaction` buffer `installSegvHandlers` builds — separate from
-// `sigActBuf` even though both are 2 words, for clarity, and because both are
-// only ever written once each, from `boot`, before any worker thread exists
-// (the same "unlocked, sound under the single-worker contract" reasoning
-// `sigActBuf` itself already carries).
+// The `struct sigaction` buffer `installFatalSignalHandlers` builds for
+// SIGSEGV/SIGBUS — separate from `sigActBuf` even though both are 2 words,
+// for clarity, and because both are only ever written once each, from
+// `boot`, before any worker thread exists (the same "unlocked, sound under
+// the single-worker contract" reasoning `sigActBuf` itself already carries).
 let segvActBuf: [2]i64
+
+// The SAME shape, for SIGTRAP/SIGILL (#2946) — a separate buffer because it
+// carries a DIFFERENT handler entry (`entryOf(trapHandler)` vs
+// `entryOf(segvHandler)`), written once from the same call in
+// `installFatalSignalHandlers`.
+let trapActBuf: [2]i64
 
 // Claim a slot from the pool above and install THIS OS thread's slice of
 // `sigAltStackBase` as its alternate signal stack. A no-op if `boot` never
@@ -264,15 +290,124 @@ let segvActBuf: [2]i64
 
   let fromFault = alignUpStack(faultAddr)
   let fromSp = alignUpStack(sp)
-  // The floor rules out a degenerate near-zero reading (e.g. both inputs
-  // landing on unmapped/zeroed memory) agreeing with itself; every real stack
-  // mapping on this platform sits far above it.
-  if (fromFault == fromSp && fromFault > 268435456) {
+  if (fromFault == fromSp && fromFault > stackAddrFloor) {
     if (fromFault == mainStackBaseAddr) {
       emitMainStackOverflow()
     } else {
       emitSpawnedStackOverflow()
     }
+    return
+  }
+  emitFatalSignal(int(sig))
+}
+
+// ---------------------------------------------------------------------------
+// #2946: the OTHER undiagnosed shape — SIGTRAP (arm64)/SIGILL (x64) from
+// #2432's inline traps, not SIGSEGV/SIGBUS
+// ---------------------------------------------------------------------------
+//
+// `runtime/sched/task.bit`'s `schedYield`/`schedPark`/`schedTaskExit` and
+// `runtime/sched/timer.bit`'s `schedSleepUntil` each trap (inline `brk #0` on
+// arm64) when `schedCurrentTask()` returns 0 — which happens when a green
+// thread's stack overflow silently corrupts the self-pointer/tag words
+// `schedCurrentTask` reads at its own stack's BASE, landing exactly ON them
+// rather than crossing into the guard hole below (task.bit's own "A task
+// that reaches here" comment). Measured on merged main: #2246's own repro
+// hits this shape roughly 1 run in 5-20, as exit 133 (SIGTRAP) with ZERO
+// output — `segvHandler` above is never invoked for it, because nothing
+// faults; the trap is executed deliberately, on purpose, once
+// `schedCurrentTask` has already given up.
+//
+// THE TRADE-OFF THIS TICKET REQUIRES STATING EXPLICITLY, NOT SILENTLY
+// ACCEPTING. SIGTRAP is the signal both lldb and gdb use to stop a process at
+// a breakpoint or after a single step. Installing ANY process-wide SIGTRAP
+// disposition risks intercepting a debugger's own trap ahead of the
+// debugger seeing it, on whichever debugging path delivers breakpoints as an
+// ordinary Unix signal rather than intercepting them upstream. (On macOS,
+// `lldb` normally attaches via a Mach exception port, which gets first
+// refusal ahead of this `sigaction` disposition — EXC_BREAKPOINT is an
+// exception before it is ever converted to a Unix SIGTRAP — so an ordinary
+// interactive `lldb` session is not expected to lose its own breakpoints to
+// this handler. That is a property of the OS's exception delivery order,
+// though, not a guarantee this file can make for every debugging
+// configuration, e.g. a ptrace-style attach that does rely on the delivered
+// signal.) This runtime accepts that cost deliberately: the alternative is
+// every SIGTRAP-shaped overflow staying exit 133 with zero output for every
+// user who is NOT running under a debugger, which is the overwhelmingly
+// common case and the one #2246/#2432 exist to fix. SIGILL carries no such
+// conflict — nothing on this platform raises it deliberately except x64's
+// `ud2` twin of the same four sites (unreachable from arm64-macos code, but
+// installed anyway for a genuinely corrupted/illegal jump elsewhere, which
+// is worth diagnosing too) — so it is always safe to intercept.
+//
+// THE ATTRIBUTION NEEDS A DIFFERENT CHECK THAN `segvHandler`'s, because
+// `brk #0`/`ud2` do not fault on memory: there is no `si_addr` here that
+// means anything, only the saved `sp`. See `classifyOverflowTrap` for the
+// replacement, and the retired first attempt below it: `sp`'s DISTANCE from
+// the floor is not the discriminator it looks like, because by the time one
+// of these four sites runs, the corrupting call chain has usually already
+// UNWOUND — `schedTaskExit` fires once `down()` has returned all the way
+// back to `worker()`, with `sp` back near the TOP of the (still
+// single-granule, `schedStackBytes`-sized) spawned stack, not near the
+// bottom where the corruption happened. A "how close to the floor" gate
+// rejected roughly a quarter of #2432's own repro runs in testing here
+// (30-run distribution, 8/30 fell through to the honest-but-imprecise
+// `emitFatalSignal` fallback instead of `emitSpawnedStackOverflow`) for
+// exactly that reason, before being removed.
+//
+// WHAT ACTUALLY DISCRIMINATES: the corruption is a property of the MEMORY at
+// the stack's floor, not of `sp`'s instantaneous offset within the granule.
+// `schedTaskOnStack` (`../../sched`, already `@symbol`-pinned as
+// `bit_rt_port_sched_task_on_stack` — no new cross-module surface, this
+// calls the SAME check `schedCurrentTask` itself just made and failed) reads
+// the tag AT the floor, and a spawned task's whole stack fits inside ONE
+// `schedStackBytes` granule, so `alignDownStack(sp)` lands on that SAME
+// floor regardless of where in the granule `sp` currently sits. If the tag
+// is gone there, `schedCurrentTask` could not have succeeded from ANYWHERE
+// on this stack — including wherever `sp` is now — which is exactly why one
+// of the four sites trapped. If the tag is still intact, `schedCurrentTask`
+// would have succeeded and none of the four sites could have trapped at
+// all, so an intact tag here proves this SIGTRAP/SIGILL did not come from
+// one of them (the debugger-breakpoint case this file's header discusses)
+// and must not be reported as an overflow.
+//
+// `main`'s case needs neither the floor read nor the tag: `mainStackBaseAddr`
+// is REGISTERED (../boot.bit step 5), not guessed, so an exact match against
+// it is already as strong as `segvHandler`'s own main-stack check.
+const overflowNone: int = 0
+const overflowMain: int = 1
+const overflowSpawned: int = 2
+
+@nosplit fn classifyOverflowTrap(sp: int): int {
+  let floorBase = alignDownStack(sp)
+  if (floorBase <= stackAddrFloor) {
+    return overflowNone
+  }
+  if (floorBase == mainStackBaseAddr) {
+    return overflowMain
+  }
+  if (schedTaskOnStack(floorBase) != 0) {
+    return overflowNone
+  }
+  return overflowSpawned
+}
+
+// The alternate-stack SIGTRAP/SIGILL handler — same ABI shape as
+// `segvHandler` (SA_SIGINFO selects this three-argument form), same
+// `@nosplit` discipline for the same reason (this may run with the
+// collector or the interrupted task's own invariants in an unknown state).
+// See the section header above for the full attribution and debugger-
+// interference reasoning.
+@nosplit fn trapHandler(sig: i32, info: *u8, ctx: *u8) {
+  let mcontextPtr = loadWord(int(ctx) + ucMcontextOffset)
+  let sp = loadWord(mcontextPtr + mcontextSpOffset)
+  let verdict = classifyOverflowTrap(sp)
+  if (verdict == overflowMain) {
+    emitMainStackOverflow()
+    return
+  }
+  if (verdict == overflowSpawned) {
+    emitSpawnedStackOverflow()
     return
   }
   emitFatalSignal(int(sig))
@@ -298,7 +433,10 @@ let segvActBuf: [2]i64
 }
 
 // "bit: fatal signal: segmentation fault\n" / "bit: fatal signal: bus error\n"
-// — the honest fallback when the fault cannot be placed on a stack boundary.
+// / "bit: fatal signal: trace trap\n" / "bit: fatal signal: illegal
+// instruction\n" — the honest fallback when the signal cannot be placed on a
+// stack boundary. The last two are #2946's: a SIGTRAP/SIGILL that
+// `classifyOverflowTrap` could not attribute to one of #2432's four sites.
 @nosplit fn emitFatalSignal(sig: int) {
   writeConst(stderrFd, 8386096269746268514, 8) // "bit: fat"
   writeConst(stderrFd, 7020662571717913697, 8) // "al signa"
@@ -306,6 +444,13 @@ let segvActBuf: [2]i64
     writeConst(stderrFd, 7308611455713032812, 8) // "l: segme"
     writeConst(stderrFd, 2336927755366659182, 8) // "ntation "
     writeConst(stderrFd, 11495152116070, 6)      // "fault\n"
+  } else if (sig == sigTrap) {
+    writeConst(stderrFd, 7305790164727511660, 8) // "l: trace"
+    writeConst(stderrFd, 11477787505696, 6)      // " trap\n"
+  } else if (sig == sigIll) {
+    writeConst(stderrFd, 7450480371430341228, 8) // "l: illeg"
+    writeConst(stderrFd, 8247343735669550177, 8) // "al instr"
+    writeConst(stderrFd, 2936174556767093, 7)    // "uction\n"
   } else {
     writeConst(stderrFd, 7286951145080109676, 8) // "l: bus e"
     writeConst(stderrFd, 44869579378, 5)         // "rror\n"
@@ -313,12 +458,14 @@ let segvActBuf: [2]i64
   rootExit(2)
 }
 
-// Register `segvHandler` for SIGSEGV and SIGBUS, process-wide, SA_SIGINFO |
-// SA_ONSTACK. Same 2-word `struct sigaction` shape `ignoreSigpipe` builds
-// (`sigActionWords`), in a separate buffer (`segvActBuf`) written once, from
-// `boot`, before any worker thread exists — call this before step 6 starts
-// any worker, so the disposition is live before the first task can run.
-@nosplit fn installSegvHandlers() {
+// Register `segvHandler` for SIGSEGV/SIGBUS and `trapHandler` for
+// SIGTRAP/SIGILL (#2946), process-wide, SA_SIGINFO | SA_ONSTACK. Same 2-word
+// `struct sigaction` shape `ignoreSigpipe` builds (`sigActionWords`), in two
+// separate buffers (`segvActBuf`/`trapActBuf`, one per handler entry)
+// written once, from `boot`, before any worker thread exists — call this
+// before step 6 starts any worker, so both dispositions are live before the
+// first task can run.
+@nosplit fn installFatalSignalHandlers() {
   let base = int(ptrOf(segvActBuf))
   storeWord(base, int(entryOf(segvHandler)))
   // mask (low 32 bits) = 0, flags (high 32 bits) = SA_SIGINFO | SA_ONSTACK —
@@ -327,4 +474,10 @@ let segvActBuf: [2]i64
   let nilp: *u8 = nil
   sigaction(i32(sigSegv), nilp + base, nilp)
   sigaction(i32(sigBus), nilp + base, nilp)
+
+  let trapBase = int(ptrOf(trapActBuf))
+  storeWord(trapBase, int(entryOf(trapHandler)))
+  storeWord(trapBase + 8, (saSiginfo | saOnstack) << 32)
+  sigaction(i32(sigTrap), nilp + trapBase, nilp)
+  sigaction(i32(sigIll), nilp + trapBase, nilp)
 }
