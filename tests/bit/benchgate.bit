@@ -40,7 +40,10 @@
 // gate exists to catch were 4-5x and 18x — the bar only needs to clear gross
 // breakage, not police day-to-day noise. The check is a strict
 // greater-than against `baseline * 1.5`, so a benchmark that gets faster or
-// leaner can only pass more easily, never fail.
+// leaner can only pass more easily, never fail. CPU (not RSS) can override
+// this per case via Baseline.cpuCeilingPct — fib does (#2982), because its
+// baseline is small enough in absolute terms that 1.5x cannot absorb real
+// multi-agent scheduling noise; see fib's own baseline-table comment.
 //
 // WHY OUTPUTS ARE ASSERTED TOO. A benchmark that returns the wrong answer
 // quickly is exactly the failure mode a pure-timing gate cannot see, so
@@ -77,9 +80,25 @@ import { trimSpace, parseInt, split } from "std/strings"
 const reps: int = 3
 
 // FAIL when measured > baseline * 3 / 2 (i.e. > 1.5x). Integer arithmetic
-// throughout so there is no float-rounding edge case in the comparison.
+// throughout so there is no float-rounding edge case in the comparison. Used
+// for RSS on every case, and for CPU on every case except where
+// Baseline.cpuCeilingPct overrides it -- see cpuCeiling() below and #2982.
 fn ceiling(baseline: int): int {
   return baseline * 3 / 2
+}
+
+// CPU ceiling, per-case (#2982). `ceiling()` above is 150 (1.5x) for every
+// case; fib overrides Baseline.cpuCeilingPct to 190 on macOS/arm64 ONLY,
+// because its baseline there (29cs) is too small in absolute terms for 1.5x
+// to absorb real scheduling noise in this gate's actual operating
+// environment (a single unshared run, per the full-suite-owns-this-gate
+// note below). fib on Linux x64 keeps the blanket 150 deliberately — its
+// baseline there (101cs) gives 1.5x enough absolute headroom that the same
+// defect does not apply; see fib's own baseline-table comment in each
+// platform's table for the measurements. Integer arithmetic, same reasoning
+// as ceiling() above.
+fn cpuCeiling(b: Baseline): int {
+  return b.cpuCentis * b.cpuCeilingPct / 100
 }
 
 // Generous per-subprocess bound; every case finishes in under 3s and this
@@ -105,6 +124,11 @@ struct Baseline {
   // RSS does not silently drift if a future ticket changes the default
   // (#2920 already moved it once). See the "churn" case below (#2978).
   gcMinKb: int,
+  // CPU ceiling as a percentage of cpuCentis (150 = 1.5x, the file's blanket
+  // default -- see ceiling() above). RSS always uses the blanket 1.5x
+  // regardless of this field; only CPU reads it, via cpuCeiling(). fib
+  // overrides this to 190 (#2982) -- see its baseline-table comment.
+  cpuCeilingPct: int,
 }
 
 // Baselines are per-platform (#2933): a Skylake-class x86_64-linux box is
@@ -137,21 +161,91 @@ fn platformName(target: int): string {
 //   /usr/bin/time -l /tmp/b   # repeat a few times; take the minimum `user` and RSS
 fn baselinesMacosArm64(): []Baseline {
   return [
-    Baseline{ name: "collatz", expected: "524", cpuCentis: 83, rssBytes: 1949696, gcMinKb: 0 },
+    Baseline{
+      name: "collatz",
+      expected: "524",
+      cpuCentis: 83,
+      rssBytes: 1949696,
+      gcMinKb: 0,
+      cpuCeilingPct: 150,
+    },
     Baseline{
       name: "mandelbrot",
       expected: "204866964",
       cpuCentis: 121,
       rssBytes: 1949696,
       gcMinKb: 0,
+      cpuCeilingPct: 150,
     },
-    Baseline{ name: "fib", expected: "102334155", cpuCentis: 29, rssBytes: 1949696, gcMinKb: 0 },
+    // #2982: fib's baseline (29cs) is too small in absolute terms for the
+    // blanket 1.5x ceiling (43cs) to absorb real scheduling noise -- it was
+    // the reliable false-positive repro (FAIL at 45/54/47cs against 43cs).
+    //
+    // WHICH DATASET CALIBRATES THIS, AND WHY. `test-benchgate` is registered
+    // only as a `Gate{}` (this file's own registration in
+    // tools/build/gates.bit), reachable from `./make test` — it has no entry
+    // in any `scripts/gate.sh` bucket (verified: neither `bench` nor
+    // `benchgate` appears in that script except in the unrelated bench/*.md
+    // doc-only carve-out). So its real deployment is a single unshared
+    // full-suite run, per this repo's own rule that the full suite runs once
+    // per push with the box to itself -- NOT the heavy concurrent-agent
+    // scenario this ticket was first (wrongly) calibrated against. Load
+    // average 30-44 readings taken under 3 concurrent make-driver builds are
+    // real but unrepresentative of how this gate actually runs; they are
+    // recorded on #3017 instead (along with the sharper, genuinely new
+    // finding that user CPU itself, not just wall clock, is measurably noisy
+    // at that intensity -- a limit on the load-insensitivity the file header
+    // claims for this metric, but one that does not affect this gate in its
+    // designed environment).
+    //
+    // The relevant dataset is 16 consecutive `./make test-benchgate` runs at
+    // load average 5.1-10.8 (1-3 sibling make-driver builds; the ticket's own
+    // "at least 2 concurrent make-driver builds" scenario): fib's minCpu
+    // ranged 31-43cs (1.07-1.48x baseline), sitting AT the old 43cs ceiling
+    // once -- one scheduling hiccup from red. The same session also caught a
+    // real FAIL on alloc (347cs against its own untouched 346cs ceiling);
+    // alloc's ceiling is intentionally not touched here (see #3017).
+    //
+    // BASELINE, re-checked directly rather than inferred from the ticket's
+    // 31-32cs benchgate-mediated "quiet" readings (which were themselves
+    // taken under load 5-10, not truly idle): `BIT_STDLIB=stdlib
+    // ./bit-out/bin/bit build bench/cases/fib/fib.bit -o /tmp/b`, then 7
+    // direct `/usr/bin/time -l /tmp/b` runs with zero concurrent make-driver
+    // builds (load average ~5, background-agent noise only) read 29/29/29/
+    // 30/30/30/31cs -- minimum 29cs, exactly matching the recorded baseline.
+    // 29cs is confirmed correct; this is a ceiling fix, not a re-baseline.
+    //
+    // THE CEILING: cpuCeilingPct raises fib's CPU ceiling from 150 (1.5x =
+    // 43cs) to 190 (1.9x = 55cs on macOS/arm64), clearing the worst reading
+    // in the representative dataset (43cs) by 12cs/28% margin, while sitting
+    // 3cs below an exact 2x regression (58cs) so a genuine doubling clears
+    // the ceiling with room rather than landing on the boundary.
+    // Mutation-tested at load average 8.8-13.6 (2-3 sibling make-driver
+    // builds, matching the representative dataset above): temporarily made
+    // bench/cases/fib/fib.bit's `main` call `fib(40)` twice (exactly 2x the
+    // compute, output unchanged) -- measured 89cs, FAILed against the 55cs
+    // ceiling with a 34cs margin. Reverted (confirmed byte-identical via
+    // `git diff --stat`) and re-ran at the same load: 33cs, PASS. fib.bit
+    // itself is unchanged in this commit. Re-baselining fib's workload
+    // upward (bench/cases/fib/fib.bit, e.g. fib(41) or higher) was
+    // considered and rejected: it would change the case's `expected` output
+    // on every platform, invalidating baselinesLinuxX64's fib entry (real
+    // hardware, hl-master, not reachable from this session to re-measure).
+    Baseline{
+      name: "fib",
+      expected: "102334155",
+      cpuCentis: 29,
+      rssBytes: 1949696,
+      gcMinKb: 0,
+      cpuCeilingPct: 190,
+    },
     Baseline{
       name: "alloc",
       expected: "59995000000",
       cpuCentis: 231,
       rssBytes: 10698752,
       gcMinKb: 0,
+      cpuCeilingPct: 150,
     },
     // #2978. Regression guard for the GC address->object index leak
     // (#2756/#2922, fixed 32a4888d): bench/cases/churn/churn.bit holds a live
@@ -201,6 +295,7 @@ fn baselinesMacosArm64(): []Baseline {
       cpuCentis: 120,
       rssBytes: 1982464,
       gcMinKb: 64,
+      cpuCeilingPct: 150,
     },
   ]
 }
@@ -222,21 +317,53 @@ fn baselinesMacosArm64(): []Baseline {
 // macOS's `/usr/bin/time -l`), well under its own ceiling.
 fn baselinesLinuxX64(): []Baseline {
   return [
-    Baseline{ name: "collatz", expected: "524", cpuCentis: 327, rssBytes: 229376, gcMinKb: 0 },
+    Baseline{
+      name: "collatz",
+      expected: "524",
+      cpuCentis: 327,
+      rssBytes: 229376,
+      gcMinKb: 0,
+      cpuCeilingPct: 150,
+    },
     Baseline{
       name: "mandelbrot",
       expected: "204866964",
       cpuCentis: 559,
       rssBytes: 229376,
       gcMinKb: 0,
+      cpuCeilingPct: 150,
     },
-    Baseline{ name: "fib", expected: "102334155", cpuCentis: 101, rssBytes: 225280, gcMinKb: 0 },
+    // #2982's fib fix does NOT transfer here -- deliberately left at the
+    // blanket 150 (1.5x). The defect on macOS/arm64 is an ABSOLUTE-headroom
+    // problem: baseline 29cs, 1.5x ceiling 43cs, only 14cs of absolute
+    // headroom for scheduling noise that is itself roughly fixed in
+    // centiseconds, not proportional to the baseline -- that 14cs is what
+    // real contention filled. hl-master's fib baseline is 101cs (3.5x
+    // larger), so 1.5x already gives 151cs, i.e. 51cs of absolute headroom
+    // -- 3.5x the margin that broke on macOS/arm64. Raising this to 190
+    // would buy nothing against a mechanism this baseline is not exposed to,
+    // while costing real detection power: it would move the ceiling from
+    // 151cs to 191cs against a 2x regression at 202cs, shrinking the margin
+    // from 51cs to 11cs -- reintroducing the thin-boundary problem #2982
+    // fixed on macOS/arm64, on the one platform with no direct load
+    // measurement to justify it. If a false positive is ever observed on
+    // hl-master, that needs its own ticket with fresh measurements from that
+    // hardware, not a number inferred from this box.
+    Baseline{
+      name: "fib",
+      expected: "102334155",
+      cpuCentis: 101,
+      rssBytes: 225280,
+      gcMinKb: 0,
+      cpuCeilingPct: 150,
+    },
     Baseline{
       name: "alloc",
       expected: "59995000000",
       cpuCentis: 1144,
       rssBytes: 8749056,
       gcMinKb: 0,
+      cpuCeilingPct: 150,
     },
     // #2978's churn case has NOT been measured on this platform (no Linux
     // host in this session) -- omitted rather than guessed, matching
@@ -600,7 +727,9 @@ fn runCase(
     return
   }
 
-  let cpuCeil = ceiling(b.cpuCentis)
+  // CPU reads its own per-case ceiling (#2982); RSS always uses the blanket
+  // 1.5x — see cpuCeiling()'s and Baseline.cpuCeilingPct's comments above.
+  let cpuCeil = cpuCeiling(b)
   let rssCeil = ceiling(b.rssBytes)
   // Printed unconditionally, pass or fail, so a slow drift toward the
   // ceiling is visible in the suite log before it ever trips (#2931).
@@ -613,14 +742,14 @@ fn runCase(
     markFail(
       t,
         "${b.name} user CPU regressed: ${minCpu}cs (min of ${reps}), " +
-        "baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs (1.5x)",
+        "baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs (${b.cpuCeilingPct}%)",
     )
   }
   if (minRss > rssCeil) {
     markFail(
       t,
         "${b.name} peak RSS regressed: ${minRss}B (min of ${reps}), " +
-        "baseline ${b.rssBytes}B, ceiling ${rssCeil}B (1.5x)",
+        "baseline ${b.rssBytes}B, ceiling ${rssCeil}B (150%)",
     )
   }
   t.checks = t.checks + 1
