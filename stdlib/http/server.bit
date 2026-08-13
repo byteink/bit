@@ -4,12 +4,17 @@
 // Server
 // ---------------------------------------------------------------------------
 
-// A listening HTTP server. Drive it with an `accept()` loop, spawning a green
-// thread per exchange — a slow handler cannot delay the next accept.
+// A listening HTTP server. Drive it with an `accept()` loop: `accept()` only
+// accepts, so it returns as soon as a connection exists, before anything is
+// read off it. Spawn a green thread per exchange and call `Exchange.read()`
+// there to get the request — never inline in the loop, or a stalled or
+// malicious peer's read blocks every accept behind it, same as
+// `listenAndServe` already avoids doing since #2170.
 export struct Server { listener: Listener }
 
-// One accepted request and the connection to answer it on.
-export struct Exchange { conn: Conn, request: Request }
+// One accepted connection. `accept()` does not read; call `read()` — ideally
+// on its own spawned green thread — to get the request.
+export struct Exchange { conn: Conn }
 
 // Bind and start listening for HTTP on `host:port`. `port` 0 lets the kernel
 // choose one; read it back with `port()`.
@@ -23,22 +28,34 @@ export fn (s: Server) port(): int! {
   return s.listener.port()?
 }
 
-// Accept the next connection and read its request. Parks until a client
-// arrives; the returned `Exchange` carries the connection to respond on. A
-// connection whose request is malformed (bad framing, an unparsable
-// Content-Length, a control character in a header) is answered 400 and
-// closed here, then skipped — one bad client must not fail this call for
-// every accept behind it.
+// Accept the next connection. Parks until a client arrives, then returns
+// immediately — before anything is read off the wire. Call `Exchange.read()`
+// to get the request, on a freshly spawned green thread (see `Server`'s
+// comment above). This used to run `readMessage` here, on the caller's own
+// thread: a connection that declared a body and then stalled — or a peer
+// that connected and sent nothing at all — parked this call forever, so no
+// later connection was ever accepted (#2170's original bug, for this
+// direct-drive API; #2170 itself only fixed `listenAndServe`). Splitting the
+// read out of `accept()` fixes that for every caller of this API — it does
+// not bound how long any one connection's own read can take (`std/net` has
+// no read deadline yet — #2291), only that a slow one can no longer block
+// anyone else's accept or read.
 export fn (s: Server) accept(): Exchange! {
-  while (true) {
-    let c = s.listener.accept()?
-    let req = readMessage(netStream{ conn: c }) catch e {
-      answerBadRequest(netStream{ conn: c })
-      continue
-    }
-    return Exchange{ conn: c, request: req }
-  }
-  fail newError("unreachable")
+  let c = s.listener.accept()?
+  return Exchange{ conn: c }
+}
+
+// Reads this exchange's request off the wire: the request line, headers, and
+// body, framed the same way `readMessage` always has (see its own doc
+// comment for the exact failure cases, including the header-size cap). Fails
+// on a malformed or oversized request — the caller should answer 400
+// (`e.respond(respond(400, ""))`) and drop the connection rather than
+// propagate the failure to a handler. Parks until the whole request arrives;
+// call this on its own green thread (spawned from `accept()`, never inline
+// in the accept loop) so a stalled or silent peer can only ever block this
+// one exchange.
+export fn (e: Exchange) read(): Request! {
+  return readMessage(netStream{ conn: e.conn })?
 }
 
 // Answers a malformed request with `400 Bad Request` and closes the
@@ -71,14 +88,14 @@ export fn (s: Server) close() {
 //
 // The accept loop only accepts — it does not read. `readMessage` (headers and
 // body both) runs inside the spawned `serveOne`, on that connection's own
-// green thread, same as `serveTls` already does. Read this loop instead of
-// `Server.accept()` (which is documented, and still reads eagerly, for
-// existing direct callers of the `serve`/`accept`/`respond` API): a client
-// that opens a connection and stalls mid-body — declares a Content-Length and
-// then sends less, or nothing at all — used to park THIS loop forever, so no
-// other client already connected, or arriving after, was ever answered. Now
-// that connection's own read stalls on its own thread; every other accept and
-// every other read proceeds.
+// green thread, same as `serveTls` already does, and same as `Server.accept()`
+// plus `Exchange.read()` now does for direct callers of the
+// `serve`/`accept`/`respond` API. A client that opens a connection and stalls
+// mid-body — declares a Content-Length and then sends less, or nothing at
+// all — used to park THIS loop forever, so no other client already
+// connected, or arriving after, was ever answered. Now that connection's own
+// read stalls on its own thread; every other accept and every other read
+// proceeds.
 export fn listenAndServe(host: string, port: int, handler: (Request) => Response): ()! {
   let s = serve(host, port)?
   while (true) {
