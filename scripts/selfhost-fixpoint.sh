@@ -17,6 +17,20 @@
 # from the output FILENAME, so both stages must be named identically or the hash
 # differs for a spurious reason. The writer does NOT mkdir parents — mkdir -p.
 #
+# #2980: a single stageB != stageC observed while 2-3 OTHER worktrees were
+# concurrently self-building elsewhere on the box was reported as "FIXED POINT
+# BROKEN", and it was not — three isolated re-runs of the identical operation on
+# a quieter box converged on the SAME hash every time. `compiler/build.bit`'s own
+# `bit build` has no concurrency and no shared scratch path (unlike `bit run`,
+# which uses a nonce specifically to avoid this), so the corruption is upstream
+# of codegen — most likely a short/interrupted `read(2)` on a `.bit` source file
+# under load (`runtime/root/{darwin,linux}/fs.bit`'s `rtFsReadAll` returns
+# whatever it has on ANY `n <= 0`, silently zero-padding the tail instead of
+# distinguishing a real EOF from a transient one — see the follow-up filed
+# against that). A single comparison here cannot tell "the compiler is broken"
+# apart from "one of the two reads got clipped this one time", so a mismatch is
+# no longer trusted on its own: see the CONFIRMATION step below.
+#
 # Usage: ./make selfhost && bash scripts/selfhost-fixpoint.sh
 #        (or pass an explicit stageA binary: bash scripts/selfhost-fixpoint.sh path/to/bit)
 # Run from the repo root so the CWD-relative libbitrt lookup resolves.
@@ -24,7 +38,7 @@ set -eu
 STAGEA="${1:-bit-out/bin/bit}"
 WORK="$(pwd)/.fixpoint-work"
 rm -rf "$WORK"
-mkdir -p "$WORK/b" "$WORK/c"
+mkdir -p "$WORK/b" "$WORK/c" "$WORK/d"
 
 [ -x "$STAGEA" ] || { echo "fixpoint: missing $STAGEA — run: ./make selfhost" >&2; exit 2; }
 [ -d compiler ] || { echo "fixpoint: no compiler/ directory — run from the repo root" >&2; exit 2; }
@@ -62,6 +76,28 @@ if [ "$B" = "$C" ]; then
   rm -rf "$WORK"
   exit 0
 fi
-echo "FIXED POINT BROKEN — stageB != stageC. The self-hosted compiler is not self-reproducible."
+
+# CONFIRMATION (#2980): stageB != stageC decided nothing on its own — it is
+# exactly as consistent with "a read got clipped once, on either hop" as with
+# a real break, and this script cannot tell those apart from one comparison.
+# So ask the question the ticket's own manual repro asked: is stageC — the
+# side we have in hand — a fixed point OF ITSELF? Build stageD from stageC.
+# If stageC == stageD, stageC is self-stable and the anomaly was upstream of
+# it (the A->B hop); that is UNDECIDED, not BROKEN, exactly the shape
+# scripts/selfhost-diffcheck.sh uses for a timeout that decided nothing. Only
+# a SECOND, independent divergence (stageC != stageD too) is reproducible
+# enough to call a real, unstable fixed point.
+echo "fixpoint: stageB != stageC — confirming before calling it broken (building stageD from stageC)"
+stage stageD "$WORK/c/bit" "$WORK/d/bit"
+D=$(shasum -a 256 "$WORK/d/bit" | cut -d' ' -f1)
+echo "stageD (stageC built selfhost): $D"
+if [ "$C" = "$D" ]; then
+  echo "FIXED POINT UNDECIDED — stageB != stageC on the first hop, but stageC == stageD confirms stageC is stable."
+  echo "                        This is the shape of a load-induced glitch (#2980), not a proven compiler bug."
+  echo "                        Not a pass. Re-run when 'pgrep -fl make-driver' shows nothing else building."
+  echo "artifacts kept in $WORK for inspection"
+  exit 2
+fi
+echo "FIXED POINT BROKEN — stageB != stageC, and stageC != stageD on a second, independent build. The self-hosted compiler is not self-reproducible."
 echo "artifacts kept in $WORK for diffing"
 exit 1
