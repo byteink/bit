@@ -100,6 +100,53 @@ fn roundTrip(port: int, msg: string): string! {
 }
 ```
 
+## Deadlines
+
+A server that accepts and never answers parks `dial`/`read`/`write` forever -
+these give a caller a bound instead. `deadlineNs` is an ABSOLUTE monotonic
+nanosecond deadline (`std/time`'s `monotonic()` plus a budget), not a
+duration - resolve it once and it covers connect, write and read together,
+never restarting per call.
+
+### `dialDeadline(host: string, port: int, deadlineNs: int): Conn!`
+
+Like `dial`, but bounded by `deadlineNs` rather than parking forever. The
+returned `Conn` remembers `deadlineNs`, so `readDeadline`/`writeDeadline` on
+it reuse the same value automatically.
+
+### `Conn.setDeadline(deadlineNs: int)`
+
+Sets (or, with `0`, clears) the absolute deadline `readDeadline`/`writeDeadline`
+respect on this connection from now on. Does not reach back to bound a
+`dial`/`dialDeadline` connect already completed.
+
+### `Conn.readDeadline(max: int): string!`
+
+Like `read`, but bounded by the connection's deadline. An empty result is a
+clean close, exactly like `read` - an orderly end of stream, never an error.
+A timeout is a `fail` whose message names it, so the two are never
+confusable: a value back (even `""`) was never on the timeout path.
+
+### `Conn.writeDeadline(s: string): ()!`
+
+Like `write`, but bounded by the connection's deadline.
+
+```bit
+import { dialDeadline } from "std/net"
+import { monotonic } from "std/time"
+
+// One request, bounded to 500ms total for connect + write + read - a server
+// that accepts and never answers gets a `fail`, not an indefinite park.
+fn boundedRoundTrip(port: int, msg: string): string! {
+  let deadline = monotonic() + 500 * 1000000
+  let c = dialDeadline("127.0.0.1", port, deadline)?
+  c.writeDeadline(msg)?
+  let reply = c.readDeadline(4096)?
+  c.close()
+  return reply
+}
+```
+
 ## One green thread per connection
 
 `accept` in a loop, `spawn` a handler per connection: a slow client cannot delay
