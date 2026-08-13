@@ -507,6 +507,211 @@ fn checkPmfetchParseSpecVanity() {
   assert(len(traversal.vanityName) == 0)
 }
 
+fn pmDeadSpec(): DepSpec {
+  return DepSpec{ vanity: false, host: "", owner: "", repo: "", vanityName: "", ref: "", scheme: "", localPath: "", sshUser: "" }
+}
+
+// #2244: a GitLab-style nested-group spec (more than one segment between a
+// KNOWN git host and the repo) parses as a direct (non-vanity) spec, with
+// `owner` holding every middle segment rejoined by "/" — and the URL it
+// derives is exactly the nested-group clone URL GitLab itself expects.
+fn checkPmfetchParseSpecNestedGroup() {
+  let d = parseSpec("gitlab.com/group/subgroup/repo@v1.0.0") catch e {
+    panic("pmfetchcheck: parseSpec rejected a nested-group spec: " + e.message())
+    pmDeadSpec()
+  }
+  assert(!d.vanity)
+  assert(d.host == "gitlab.com")
+  assert(d.owner == "group/subgroup")
+  assert(d.repo == "repo")
+  assert(d.ref == "v1.0.0")
+  assert(defaultDepUrl(d.host, d.owner, d.repo) == "https://gitlab.com/group/subgroup/repo.git")
+
+  // Three levels of subgroup nests just as well — no fixed depth limit.
+  let deeper = parseSpec("gitlab.com/g1/g2/g3/repo@main") catch e {
+    panic("pmfetchcheck: parseSpec rejected a 3-deep nested-group spec: " + e.message())
+    pmDeadSpec()
+  }
+  assert(deeper.owner == "g1/g2/g3")
+  assert(deeper.repo == "repo")
+
+  // A traversal segment smuggled into a nested owner path is still rejected
+  // per-segment, exactly like the flat 3-segment case.
+  let traversal = parseSpec("gitlab.com/group/../repo@main") catch e { pmDeadSpec() }
+  assert(len(traversal.host) == 0)
+}
+
+// #2244: an explicit `ssh://[user@]host/owner/repo@ref` spec parses to the
+// same host/owner/repo shape a direct https spec has, `sshUser` capturing
+// the `user@` portion, and `sshDepUrl` reconstructs the exact URL `git`
+// fetches from and `bit.lock` records.
+fn checkPmfetchParseSpecSsh() {
+  let d = parseSpec("ssh://git@example.internal/owner/repo@v1") catch e {
+    panic("pmfetchcheck: parseSpec rejected an ssh spec: " + e.message())
+    pmDeadSpec()
+  }
+  assert(!d.vanity)
+  assert(d.scheme == "ssh")
+  assert(d.sshUser == "git")
+  assert(d.host == "example.internal")
+  assert(d.owner == "owner")
+  assert(d.repo == "repo")
+  assert(d.ref == "v1")
+  assert(sshDepUrl(d.sshUser, d.host, d.owner, d.repo) == "ssh://git@example.internal/owner/repo")
+
+  // No user@ portion at all — anonymous, ssh config decides the user.
+  let noUser = parseSpec("ssh://example.internal/owner/repo@v1") catch e {
+    panic("pmfetchcheck: parseSpec rejected a user-less ssh spec: " + e.message())
+    pmDeadSpec()
+  }
+  assert(len(noUser.sshUser) == 0)
+  assert(noUser.host == "example.internal")
+  assert(sshDepUrl(noUser.sshUser, noUser.host, noUser.owner, noUser.repo) == "ssh://example.internal/owner/repo")
+
+  // A nested-group owner works over ssh exactly as it does over https.
+  let nested = parseSpec("ssh://git@example.internal/group/subgroup/repo@v1") catch e {
+    panic("pmfetchcheck: parseSpec rejected a nested-group ssh spec: " + e.message())
+    pmDeadSpec()
+  }
+  assert(nested.owner == "group/subgroup")
+
+  // No @ref at all: `parseSpec` (unlike `parseAddSpec`, pmcli.bit) never
+  // defaults to HEAD — this is a hard parse failure, consistent with the
+  // non-ssh form.
+  let noRef = parseSpec("ssh://git@example.internal/owner/repo") catch e { pmDeadSpec() }
+  assert(len(noRef.host) == 0)
+}
+
+// #2244 SECURITY: an ssh dependency spec must not be able to inject an
+// argument into the `git`/`ssh` invocation it drives — the class of bug
+// CVE-2017-1000117 patched in `git` itself (a hostname/path segment
+// beginning with `-`, read by `ssh` as an option rather than a hostname,
+// e.g. `-oProxyCommand=...`). `validateSegment` (pmfetch.bit) rejects a
+// leading `-` on every segment (host, user, owner, repo) regardless of the
+// installed `git`/`ssh` version's own patch level.
+fn checkPmfetchSshInjectionRejected() {
+  // A malicious "user" segment: charset-legal (letters only) but for the
+  // leading '-', isolating `validateSegment`'s dash check from the ALSO
+  // rejected '='/'/' characters a real `-oProxyCommand=...;payload` string
+  // would additionally carry.
+  let userInjection = parseSpec("ssh://-oProxyCommand@evil.example/owner/repo@main") catch e { pmDeadSpec() }
+  assert(len(userInjection.host) == 0)
+
+  // A malicious "host" segment (no user given).
+  let hostInjection = parseSpec("ssh://-oProxyCommand/owner/repo@main") catch e { pmDeadSpec() }
+  assert(len(hostInjection.host) == 0)
+
+  // A malicious "owner" segment, deeper in a nested-group path.
+  let ownerInjection = parseSpec("ssh://git@example.internal/-oProxyCommand/repo@main") catch e { pmDeadSpec() }
+  assert(len(ownerInjection.host) == 0)
+
+  // The scp-like "user@host:owner/repo" shorthand is refused OUTRIGHT, at
+  // parse time, never silently reinterpreted as anything else: neither
+  // `isLocalSpecPrefix` nor `hasPrefix(spec, "ssh://")` recognizes it, so it
+  // falls to the generic direct/vanity parser, whose very first step
+  // (`validateSegment` on the leading path segment) rejects the embedded "@"
+  // and ":" characters outright — there is no path through which this
+  // shorthand is quietly treated as a vanity name or any other form.
+  // Documented in `parseSshSpec`'s own comment: the unambiguous "ssh://"
+  // scheme is required, deny by default.
+  let scpLike = parseSpec("git@github.com:byteink/quicwire@v1") catch e { pmDeadSpec() }
+  assert(!scpLike.vanity)
+  assert(len(scpLike.host) == 0)
+  assert(len(scpLike.vanityName) == 0)
+}
+
+// #2244 SECURITY: a plain leading `-` (the injection shape above) is
+// rejected on the DIRECT https form too, not just ssh — `validateSegment`'s
+// fix is unconditional, so this is the same guard exercised from the other
+// caller.
+fn checkPmfetchLeadingDashRejected() {
+  let d = parseSpec("github.com/-oProxyCommand/repo@main") catch e { pmDeadSpec() }
+  assert(len(d.host) == 0)
+}
+
+// #2244: a bare filesystem path ("/abs", "./rel", "../rel") and a
+// "file://" URL both parse to `scheme == "local"`, carry no ref at all
+// (an "@" inside the path is part of the path, never a ref separator), and
+// an "@" inside a bare-path spec never gets misread as a ref boundary.
+fn checkPmfetchParseSpecLocal() {
+  let rel = parseSpec("../textutil") catch e {
+    panic("pmfetchcheck: parseSpec rejected a relative local path: " + e.message())
+    pmDeadSpec()
+  }
+  assert(rel.scheme == "local")
+  assert(rel.localPath == "../textutil")
+  assert(len(rel.ref) == 0)
+  assert(!rel.vanity)
+
+  let dotRel = parseSpec("./sibling/textutil") catch e {
+    panic("pmfetchcheck: parseSpec rejected a './' local path: " + e.message())
+    pmDeadSpec()
+  }
+  assert(dotRel.scheme == "local")
+  assert(dotRel.localPath == "./sibling/textutil")
+
+  let abs = parseSpec("/var/tmp/textutil") catch e {
+    panic("pmfetchcheck: parseSpec rejected an absolute local path: " + e.message())
+    pmDeadSpec()
+  }
+  assert(abs.scheme == "local")
+  assert(abs.localPath == "/var/tmp/textutil")
+
+  let fileUrl = parseSpec("file:///var/tmp/textutil") catch e {
+    panic("pmfetchcheck: parseSpec rejected a file:// URL: " + e.message())
+    pmDeadSpec()
+  }
+  assert(fileUrl.scheme == "local")
+  assert(fileUrl.localPath == "/var/tmp/textutil")
+
+  // An "@" inside the path is part of the path, not a ref separator — a
+  // directory literally named "textutil@v2" is a legal (if unusual) POSIX
+  // name and must not be split.
+  let atInName = parseSpec("../textutil@v2") catch e {
+    panic("pmfetchcheck: parseSpec rejected a local path containing '@': " + e.message())
+    pmDeadSpec()
+  }
+  assert(atInName.localPath == "../textutil@v2")
+}
+
+// #2244 SECURITY: "file://" is only well-defined for an ABSOLUTE path — a
+// relative remainder is refused outright rather than silently anchored to
+// the process's cwd, and a ".." segment inside a path that claims to be
+// absolute is refused too (an absolute target never legitimately needs
+// one — see `checkNoDotDotSegment`'s own comment for why this is the
+// "must not point outside the intended tree" check named on #2244).
+fn checkPmfetchFileUrlTraversalRejected() {
+  // No leading "/" after "file://" at all — an ambiguous relative path.
+  let relative = parseSpec("file://../../../etc/passwd") catch e { pmDeadSpec() }
+  assert(len(relative.localPath) == 0)
+  assert(relative.scheme != "local")
+
+  let relative2 = parseSpec("file://etc/passwd") catch e { pmDeadSpec() }
+  assert(relative2.scheme != "local")
+
+  // Absolute, but with a ".." segment inside it.
+  let dotdot = parseSpec("file:///var/tmp/proj/../../../etc/passwd") catch e { pmDeadSpec() }
+  assert(dotdot.scheme != "local")
+
+  // A genuinely clean absolute path is unaffected.
+  let clean = parseSpec("file:///var/tmp/proj/textutil") catch e {
+    panic("pmfetchcheck: parseSpec rejected a clean absolute file:// URL: " + e.message())
+    pmDeadSpec()
+  }
+  assert(clean.scheme == "local")
+  assert(clean.localPath == "/var/tmp/proj/textutil")
+
+  // The explicitly-relative bare forms are UNAFFECTED by this check — ".."
+  // is their entire legitimate point (the sibling-directory case, #2244's
+  // own motivating scenario) and must keep working.
+  let sibling = parseSpec("../../siblings/textutil") catch e {
+    panic("pmfetchcheck: parseSpec rejected a legitimate '../' local path: " + e.message())
+    pmDeadSpec()
+  }
+  assert(sibling.scheme == "local")
+  assert(sibling.localPath == "../../siblings/textutil")
+}
+
 // #2068 acceptance: a fixture `bit-import:` document resolves a
 // `bitlang.org/pkg/<name>` spec to its git URL, and a document whose
 // declared name differs from the requested name fails with a named error.
@@ -716,6 +921,12 @@ fn checkPmfetch() {
   checkPmfetchParseSpec()
   checkPmfetchKnownHostDirect()
   checkPmfetchParseSpecVanity()
+  checkPmfetchParseSpecNestedGroup()
+  checkPmfetchParseSpecSsh()
+  checkPmfetchSshInjectionRejected()
+  checkPmfetchLeadingDashRejected()
+  checkPmfetchParseSpecLocal()
+  checkPmfetchFileUrlTraversalRejected()
   checkPmfetchVanityDocResolves()
   checkPmfetchVanityRequestUrlOverride()
   checkPmfetchVanityTransportRules()
