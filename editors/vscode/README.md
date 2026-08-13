@@ -6,9 +6,9 @@ TypeScript-flavored syntax and Go-like semantics.
 ## Features
 
 - Syntax highlighting and bracket/indent rules for `.bit` files.
-- Diagnostics, hover, goto-definition, completions, and document symbols via
-  the `bit lsp` language server.
-- Format-on-save using `bit fmt`.
+- Diagnostics, hover, goto-definition, completions, document symbols, and
+  Format Document via the `bit lsp` language server. Enable VS Code's own
+  `editor.formatOnSave` for format-on-save.
 
 ## Requirements
 
@@ -21,7 +21,6 @@ docs](https://github.com/byteink/bit#build).
 | Setting              | Default | Description                                    |
 |-----------------------|---------|-------------------------------------------------|
 | `bit.serverPath`      | `""`    | Path to `bit`. Empty auto-discovers it on PATH. |
-| `bit.formatOnSave`    | `true`  | Run `bit fmt` after saving a `.bit` file.       |
 | `bit.trace.server`    | `off`   | Trace LSP traffic for debugging.                 |
 
 ## Commands
