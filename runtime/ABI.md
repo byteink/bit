@@ -753,19 +753,24 @@ POSIX only in v1; Windows keeps the compiled defaults until the runtime adds
 own process, not only the program it is building or running (#2425). `bit
 build`/`check` compile in-process and simply run slower under `BIT_GC=stress`
 (the compiler's own heap, not the input program, pays the per-safepoint
-collection) — no exec follows, so a slow compile is the whole story. `bit
-run` also compiles in-process, but then execs the compiled binary as a
-separate child that inherits the environment fresh — so under
-`BIT_GC=stress` it would never reach that exec: the compile alone does not
-finish in useful time (#2425 measured a six-line input still compiling after
-60s, zero collections even logged). `bit run` therefore **refuses**
-`BIT_GC=stress` outright (`compiler/build.bit`'s `refuseRunUnderStressGc`)
-rather than appearing to hang; the diagnostic names the supported route,
-`bit build` followed by running the output binary directly under
-`BIT_GC=stress`, which is a single process and gets the policy that was
-actually intended. `bit test` compiles then runs its test functions the same
-way `run` does and has the identical hang, still open as #2979 — it is not
-yet refused.
+collection) — no exec follows, so a slow compile is the whole story.
+
+`bit run` and `bit test` both compile in-process and then exec a built binary
+as a separate child that inherits the environment fresh — `run` the program
+it just built, `test` a synthetic `BIT_TEST_INDEX`-dispatch binary
+(`compiler/testgen.bit`'s `injectTestMain`) — so under `BIT_GC=stress` neither
+would ever reach that exec: the compile alone does not finish in useful time
+(#2425 measured a six-line input still compiling after 60s, zero collections
+even logged). Both therefore **refuse** `BIT_GC=stress` outright
+(`compiler/build.bit`'s `refuseRunUnderStressGc`/`refuseTestUnderStressGc`,
+the latter called from `compiler/testrun.bit`'s `testCmd`, #2979) rather than
+appearing to hang.
+
+| Subcommand   | In-process compile? | Under `BIT_GC=stress` | Supported route to stress the subject |
+|--------------|----------------------|------------------------|----------------------------------------|
+| `bit build`/`check` | yes, no exec after | slow compile, honestly reported (`warnCompilerUnderStressGc`) | run the output binary directly under `BIT_GC=stress` |
+| `bit run`    | yes, execs the built binary | **refuses immediately** (#2425) | `bit build` the source, then run the output binary directly under `BIT_GC=stress` |
+| `bit test`   | yes, execs a synthetic test binary per `test_*` | **refuses immediately** (#2979) | no build-only step is exposed for the synthetic test binary; move the logic into a normal `fn main()`, `bit build` it, and run that directly under `BIT_GC=stress` |
 
 ---
 
