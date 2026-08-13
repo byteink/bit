@@ -54,6 +54,19 @@
 // for every other harness. A timeout is still attributable — jobs that finished
 // wrote a status, so the ones missing one are the snippets that hung.
 //
+// #2422: on a host running several concurrent `./make test`s, the whole batch
+// can miss that 300s deadline even though no single snippet is broken — the
+// deadline is measuring contention on the box, not the corpus. The old
+// rendering turned that into one `docs: FAIL ... does not typecheck` per
+// unjudged block, so a busy Mac reported 100-200 "broken" doc pages that were
+// never checked at all. A batch timeout is now ONE harness-level
+// `docs: INCONCLUSIVE` outcome naming how many blocks were judged out of how
+// many were queued — never per-block spam — and it still exits non-zero: an
+// unjudged corpus is not a pass, whether the cause is load or a genuine hang.
+// A block that DOES get judged (its status file exists) keeps failing by name
+// exactly as before; only the ones the deadline cut off change how they are
+// reported.
+//
 // WHY THE SCRIPT IS WRITTEN ONCE AND NEVER REWRITTEN. Rewriting an executable
 // while a previous exec of it may still be in flight is the ETXTBSY trap that
 // bit tests/harness.zig (74811a3). Only data changes: the slot modules
@@ -301,6 +314,12 @@ fn slotResult(cfg: Cfg, i: int): CheckResult {
   return CheckResult{ code: i64(code), report: slurp(outPath, "check output") }
 }
 
+// `collectBatch`'s sentinel for "the batch deadline elapsed before this slot
+// wrote a status". Never a real result: the runner's `echo $?` only ever
+// writes a POSIX exit code (0-255), so a caller can tell a genuine `bit check`
+// failure from an unjudged block by this code alone.
+const timedOutCode: i64 = -2
+
 // Typechecks `srcs` — one module per source — in ONE runner invocation, and
 // returns one result per source in the same order. The workers claim jobs
 // dynamically rather than being handed a fixed share, because the corpus is
@@ -340,7 +359,7 @@ fn stageBatch(cfg: Cfg, srcs: []string) {
 fn assertRunnerRan(cfg: Cfg, r: i64, n: int) {
   if (r == -1) { die("SPAWN FAILED (fork/exec/wait error) running ${cfg.script}") }
   if (r <= -100) { die("runner ${cfg.script} killed by signal ${-r - 100}") }
-  if (r < 0 && r != -2) { die("unknown os_run_bounded result ${r} from ${cfg.script}") }
+  if (r < 0 && r != timedOutCode) { die("unknown os_run_bounded result ${r} from ${cfg.script}") }
   if (r > 0) { die("runner ${cfg.script} exited ${r} — it never ran the ${n} check(s) in this batch") }
 }
 
@@ -351,8 +370,8 @@ fn collectBatch(cfg: Cfg, n: int, r: i64): []CheckResult {
   let out = []CheckResult(0)
   let j = 0
   while (j < n) {
-    if (r == -2 && !exists(slotStatus(cfg, j))) {
-      out = append(out, CheckResult{ code: r,
+    if (r == timedOutCode && !exists(slotStatus(cfg, j))) {
+      out = append(out, CheckResult{ code: timedOutCode,
         report: "TIMED OUT: still running when the batch deadline of ${cfg.timeoutMs}ms elapsed" })
     } else {
       out = append(out, slotResult(cfg, j))
@@ -656,6 +675,11 @@ fn docPages(docsDir: string): []string {
 
 // What the corpus walk observed. Every field is asserted afterwards; none is
 // merely reported.
+//
+// `judged` + `unjudged` always sum to `invocations`: every queued job lands in
+// exactly one of "got a real compiler verdict" or "the batch deadline cut it
+// off before it wrote one". `failures` counts only among the judged — an
+// unjudged block is never scored as a content failure (#2422).
 struct Stats {
   pages: int
   pagesWithBlocks: int
@@ -663,6 +687,8 @@ struct Stats {
   totalBlocks: int
   invocations: int
   failures: int
+  judged: int
+  unjudged: int
 }
 
 // One page's jobs: one per block for a per-block page, otherwise one for the
@@ -685,7 +711,7 @@ fn pageJobs(page: string, md: string, blocks: []string): []Job {
 // fan-out would idle every worker on the 30 pages that yield a single job.
 fn planCorpus(pages: []string): Plan {
   let st = Stats{ pages: len(pages), pagesWithBlocks: 0, pagesWithoutBlocks: 0,
-    totalBlocks: 0, invocations: 0, failures: 0 }
+    totalBlocks: 0, invocations: 0, failures: 0, judged: 0, unjudged: 0 }
   let jobs = []Job(0)
   for page of pages {
     let md = slurp(page, "doc page")
@@ -731,12 +757,21 @@ fn runJobs(cfg: Cfg, jobs: []Job, st: Stats): Stats {
   // A short result list would silently drop the tail of the corpus.
   assert(len(rs) == len(jobs))
 
+  // A block the batch deadline cut off before it wrote a status is unjudged,
+  // not failed: it is tallied and named once, in the harness-level
+  // `docs: INCONCLUSIVE` summary (#2422), never through `reportFailure` — that
+  // is what stops one elapsed deadline from becoming N per-block FAIL lines.
   let i = 0
   while (i < len(jobs)) {
     out.invocations = out.invocations + 1
-    if (rs[i].code != 0) {
-      out.failures = out.failures + 1
-      reportFailure(jobs[i], rs[i])
+    if (rs[i].code == timedOutCode) {
+      out.unjudged = out.unjudged + 1
+    } else {
+      out.judged = out.judged + 1
+      if (rs[i].code != 0) {
+        out.failures = out.failures + 1
+        reportFailure(jobs[i], rs[i])
+      }
     }
     i = i + 1
   }
@@ -791,10 +826,20 @@ fn main() {
   let st = runJobs(cfg, plan.jobs, plan.st)
   teardown(cfg)
 
+  // #2422: an elapsed batch deadline is ONE harness-level outcome, reported
+  // and exited on before floors are even evaluated — floor violations here
+  // would just be noise restating "the batch didn't finish", and this is the
+  // one place the whole fix exists to guarantee: never one FAIL per unjudged
+  // block, always exactly this one line, always with its denominator.
+  if (st.unjudged != 0) {
+    eprint("docs: INCONCLUSIVE — batch deadline of ${cfg.timeoutMs}ms elapsed with ${st.judged}/${st.invocations} block(s) judged (${st.unjudged} unjudged) over ${st.pages} page(s) in ${cfg.docsDir} — host load or a genuine hang, re-run to tell them apart\n")
+    osExit(1)
+  }
+
   let floored = checkFloors(st)
   if (st.failures != 0 || floored != 0) {
     eprint("docs: FAILED — ${st.failures} page/block failure(s), ${floored} floor violation(s) over ${st.pages} page(s) in ${cfg.docsDir}\n")
     osExit(1)
   }
-  print("docs: ok — ${st.totalBlocks} block(s) over ${st.pagesWithBlocks} page(s), ${st.invocations} check invocation(s), ${st.pages} .md file(s) in ${cfg.docsDir}\n")
+  print("docs: ok — ${st.totalBlocks} block(s) over ${st.pagesWithBlocks} page(s), ${st.judged}/${st.invocations} check(s) run, ${st.pages} .md file(s) in ${cfg.docsDir}\n")
 }
