@@ -64,10 +64,15 @@ before merging to main, or right after a stage0 repin.
 
 **Verify scoped changes with `scripts/gate.sh`, not the full suite.** It reads
 your `git diff` and runs only the steps that change can affect — a `compiler/**`
-edit runs the selfhost diffs plus `test-imports-bit`, a `tests/cases/**` edit
-runs `./make test-golden`. For a cross-cutting change (`tools/build/`,
-`runtime/`, `spec/`), a mixed change set, or anything else it cannot
-confidently scope, `gate.sh` (no flags) **refuses rather than guessing**: it
+edit runs the selfhost diffs plus `test-imports-bit`, `test-lint-filelines` and
+`test-selfhostcheck`, a `tests/cases/**` edit runs `./make test-golden test-fuzz`.
+Every bucket runs every gate whose OWN declared file set (its `argv`/`env` in
+`tools/build/gates.bit`) intersects that bucket's paths, not just the one gate
+the bucket was originally named after — see `scripts/gate.sh`'s own header
+comment for the full bucket→gate table (#2962). For a cross-cutting change
+(`tools/build/`), a mixed change set spanning more than one bucket, or anything
+else it cannot confidently scope, `gate.sh` (no flags) **refuses rather than
+guessing**: it
 prints the resolved bucket and the reason, runs nothing, and exits 3
 (`GATE_RESULT=FULL_REQUIRED`, #2872). Run `scripts/gate.sh --full` or
 `./make test` directly (every gate, **18-18.5 min** — measured four separate
