@@ -1,0 +1,405 @@
+// tests/bit/globalsbss.bit — #2949 regression gate: a zero-initialized
+// module-level array must land in a zero-fill section (Mach-O
+// __DATA,__bss / S_ZEROFILL; ELF .bss / SHT_NOBITS) — a size in the object's
+// headers and NO file bytes — rather than its full size written as literal
+// zero bytes into __data/.data.
+//
+// Two programs, identical except one extra module-level `let buf: [N]u8`
+// that is never given an initializer (§11.11's "zero-valued" case):
+//
+//   - on aarch64-macos (the host), both are linked to real executables.
+//     Checked: (a) the linked binary grows by far less than the array's own
+//     size — a size-only proxy a bug could pass by accident, so paired with
+//     (b) `otool -l` reporting a __DATA,__bss section at least as large as
+//     the array; and (c) the array reads as all-zero before the first write
+//     in TWO SEPARATE runs of the same already-linked binary — the "the
+//     loader actually zero-maps it" half of the claim, which (a) and (b)
+//     alone cannot prove (a section header can be lying).
+//   - on x86_64-linux and aarch64-linux, cross-compiled `--emit-obj` (no
+//     execution needed — a linker/ELF-loader concern, not a codegen one):
+//     checked by parsing the object's own ELF64 section headers for a
+//     SHT_NOBITS section at least as large as the array, and asserting no
+//     SHT_PROGBITS section is (the shape the bug produced: the array's full
+//     size as real file bytes in a PROGBITS `.data`).
+//
+// A minimal ELF64 section-header reader is written directly in this file
+// rather than importing tests/bit/objread's `readElf`: that reader's `Sec`
+// struct does not export the `kind` field this gate needs (only `size` is
+// `export`ed — SPEC §2574), and it is shared by two other gates
+// (tests/bit/stwwiring, tests/bit/rootpins) this ticket has no reason to
+// touch.
+//
+// Run from the repository root:
+//     bit-out/bin/bit run tests/bit/globalsbss.bit
+// BIT overrides the compiler under test (default bit-out/bin/bit);
+// BIT_TEST_TIMEOUT_S overrides the per-child deadline (default 300s).
+
+import { exists, readFile, writeFile, mkdir } from "std/fs"
+import { envOr, exit } from "std/os"
+import { hasPrefix, contains, split, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// The array size the ticket's own measured fact used (stdlib/http/
+// trustcache.bit's trustCacheCap): large enough that a literal-zero-bytes
+// regression is unmistakable, small enough this gate stays fast. Kept in
+// sync BY HAND with the digit literal in withbufSrc() below — a Bit string
+// literal cannot interpolate a module const of the file compiling the
+// interpolation, only of the file being GENERATED, so the two must agree as
+// plain text (see the trap noted in tests/bit/dupdeclnote.bit and
+// tests/bit/atomicwidth.bit).
+const bufLen: int = 4194304
+
+// A working fix costs at most a symbol-table entry and a few section-header
+// bytes; reject anything near the array's own size.
+const maxSizeDelta: int = 65536
+
+fn timeoutMs(): int {
+  let s = parseIntOr(envOr("BIT_TEST_TIMEOUT_S", "300"), 300)
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+fn parseIntOr(s: string, fallback: int): int {
+  let n = 0
+  let neg = false
+  let i = 0
+  if (len(s) > 0 && s[0] == '-') {
+    neg = true
+    i = 1
+  }
+  if (i >= len(s)) {
+    return fallback
+  }
+  while (i < len(s)) {
+    if (s[i] < '0' || s[i] > '9') {
+      return fallback
+    }
+    n = n * 10 + (int(s[i]) - int('0'))
+    i = i + 1
+  }
+  if (neg) {
+    return 0 - n
+  }
+  return n
+}
+
+struct Tally { checks: int, failures: int }
+
+fn check(t: Tally, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    eprint("FAIL: ${label}\n")
+  }
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Always exits 0
+// itself and records the real status in a file, so "no code file" is
+// unmistakably "the wrapper never ran" rather than a verdict a crash could be
+// mistaken for.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("globalsbss: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("globalsbss: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("globalsbss: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("globalsbss: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+// Runs `cmd` (already a complete shell command line) and returns its exit
+// code plus whatever it wrote to stdout+stderr combined.
+fn runCapture(scratch: string, tag: string, cmd: string, ms: int): (int, string)! {
+  let scriptPath = "${scratch}/${tag}.sh"
+  let logPath = "${scratch}/${tag}.log"
+  let script = "#!/bin/sh\nexec >'${logPath}' 2>&1\n${cmd}\n"
+  let code = shell(scriptPath, script, ms)?
+  let out = readFile(logPath) catch _ { "" }
+  return code, out
+}
+
+// The `bit` under test: `BIT` wins; otherwise the dev-tree artifact relative
+// to the directory this program was started in (matches tests/bit/stwwiring
+// and tests/bit/rootpins' convention).
+fn bitBinary(): string {
+  return envOr("BIT", "bit-out/bin/bit")
+}
+
+// ---- fixture sources --------------------------------------------------
+
+fn nobufSrc(): string {
+  return "fn main() {\n" +
+    "  print(\"ok\\n\")\n" +
+    "}\n"
+}
+
+// No `${` in the GENERATED program's own print calls: only a fixed "ok"/"bad"
+// string is printed, exactly as tests/bit/atomicwidth.bit's generated
+// fixtures do, for the same reason — a Bit string literal opens
+// interpolation against THIS file's scope on a bare `${`, not the generated
+// file's.
+//
+// Reads three points (start, middle, end) before writing anything, writes
+// three distinct values, reads back. A run's whole stdout is therefore one
+// of two fixed literal lines, so running the SAME already-linked binary a
+// second time and seeing "zero-ok\n" again proves a fresh process's .bss is
+// zero-mapped independent of what a PRIOR process last wrote there.
+fn withbufSrc(): string {
+  return "let buf: [4194304]u8\n" +
+    "fn main() {\n" +
+    "  if (buf[0] == 0 && buf[2000000] == 0 && buf[4194303] == 0) {\n" +
+    "    print(\"zero-ok\\n\")\n" +
+    "  } else {\n" +
+    "    print(\"zero-bad\\n\")\n" +
+    "  }\n" +
+    "  buf[0] = 200\n" +
+    "  buf[2000000] = 201\n" +
+    "  buf[4194303] = 202\n" +
+    "  if (buf[0] == 200 && buf[2000000] == 201 && buf[4194303] == 202) {\n" +
+    "    print(\"write-ok\\n\")\n" +
+    "  } else {\n" +
+    "    print(\"write-bad\\n\")\n" +
+    "  }\n" +
+    "}\n"
+}
+
+const wantStdout: string = "zero-ok\nwrite-ok\n"
+
+// ---- otool -l parsing (Mach-O, macOS host only) ------------------------
+
+fn isHexDigit(c: u8): bool {
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+fn hexDigitVal(c: u8): int {
+  if (c >= '0' && c <= '9') { return int(c) - int('0') }
+  if (c >= 'a' && c <= 'f') { return int(c) - int('a') + 10 }
+  return int(c) - int('A') + 10
+}
+
+// The integer value of the first "0x"-prefixed run on `line`, or -1 if none.
+fn firstHexOnLine(line: string): int {
+  let i = 0
+  let n = len(line)
+  while (i + 1 < n) {
+    if (line[i] == '0' && line[i + 1] == 'x') {
+      let j = i + 2
+      let v = 0
+      let saw = false
+      while (j < n && isHexDigit(line[j])) {
+        v = v * 16 + hexDigitVal(line[j])
+        j = j + 1
+        saw = true
+      }
+      if (saw) { return v }
+    }
+    i = i + 1
+  }
+  return 0 - 1
+}
+
+// The `size` field's hex value from the `otool -l` stanza whose `sectname`
+// is exactly `name`, or -1 if no such stanza appears. `size` sits a few
+// lines below `sectname` in every stanza otool or Apple's own linker
+// produces; scanned as a small fixed window rather than an assumed offset.
+fn otoolSectionSize(out: string, name: string): int {
+  let lines = split(out, "\n")
+  let want = "sectname " + name
+  let i = 0
+  while (i < len(lines)) {
+    if (contains(lines[i], want)) {
+      let j = i
+      let limit = i + 8
+      if (limit > len(lines)) { limit = len(lines) }
+      while (j < limit) {
+        if (hasPrefix(trimSpace(lines[j]), "size ")) {
+          return firstHexOnLine(lines[j])
+        }
+        j = j + 1
+      }
+      return 0 - 1
+    }
+    i = i + 1
+  }
+  return 0 - 1
+}
+
+// ---- ELF64 section-header reader (cross-target, no execution) ----------
+
+fn rdU16(b: []u8, off: int): int {
+  return int(b[off]) | (int(b[off + 1]) << 8)
+}
+
+fn rdU32(b: []u8, off: int): int {
+  return int(b[off]) | (int(b[off + 1]) << 8) | (int(b[off + 2]) << 16) | (int(b[off + 3]) << 24)
+}
+
+fn rdU64(b: []u8, off: int): int {
+  return rdU32(b, off) | (rdU32(b, off + 4) << 32)
+}
+
+struct ElfShdrInfo { shtype: int, size: int }
+
+// Upper bound on section headers walked — provably bounded (Power of 10 rule
+// 2), far above what a two-function test object ever has.
+const maxSections: int = 4096
+
+// sh_type (u32 @ +4) and sh_size (u64 @ +32) of every ELF64 section header,
+// in index order. SHT_PROGBITS = 1 (real file bytes); SHT_NOBITS = 8 (.bss:
+// a size, no file bytes).
+fn elfSectionHeaders(b: []u8): []ElfShdrInfo {
+  let out = []ElfShdrInfo(0)
+  if (len(b) < 64 || b[0] != u8(0x7f) || b[1] != u8(0x45) || b[2] != u8(0x4c) || b[3] != u8(0x46)) {
+    return out
+  }
+  let shoff = rdU64(b, 0x28)
+  let shentsize = rdU16(b, 0x3a)
+  let shnum = rdU16(b, 0x3c)
+  let i = 0
+  while (i < shnum && i < maxSections) {
+    let s = shoff + i * shentsize
+    out = append(out, ElfShdrInfo{ shtype: rdU32(b, s + 4), size: rdU64(b, s + 32) })
+    i = i + 1
+  }
+  return out
+}
+
+// ---- checks --------------------------------------------------------------
+
+fn checkMacos(t: Tally, scratch: string, bit: string, ms: int) {
+  let nobufSrcPath = "${scratch}/nobuf.bit"
+  let withbufSrcPath = "${scratch}/withbuf.bit"
+  let nobufOut = "${scratch}/nobuf"
+  let withbufOut = "${scratch}/withbuf"
+  writeFile(nobufSrcPath, nobufSrc()) catch e {
+    panic("globalsbss: cannot write ${nobufSrcPath}: ${e.message()}")
+  }
+  writeFile(withbufSrcPath, withbufSrc()) catch e {
+    panic("globalsbss: cannot write ${withbufSrcPath}: ${e.message()}")
+  }
+
+  let (c1, o1) = runCapture(scratch, "buildnobuf",
+    "'${bit}' build '${nobufSrcPath}' -o '${nobufOut}'", ms) catch e {
+    panic("globalsbss: ${e.message()}")
+  }
+  check(t, c1 == 0, "build nobuf.bit: exit ${c1} — ${o1}")
+
+  let (c2, o2) = runCapture(scratch, "buildwithbuf",
+    "'${bit}' build '${withbufSrcPath}' -o '${withbufOut}'", ms) catch e {
+    panic("globalsbss: ${e.message()}")
+  }
+  check(t, c2 == 0, "build withbuf.bit: exit ${c2} — ${o2}")
+  if (c1 != 0 || c2 != 0) {
+    return
+  }
+
+  // (a) size delta: the whole-file proxy.
+  let nobufBytes = readFile(nobufOut) catch e {
+    panic("globalsbss: cannot read ${nobufOut}: ${e.message()}")
+  }
+  let withbufBytes = readFile(withbufOut) catch e {
+    panic("globalsbss: cannot read ${withbufOut}: ${e.message()}")
+  }
+  let delta = len(withbufBytes) - len(nobufBytes)
+  check(t, delta >= 0 && delta < maxSizeDelta,
+    "aarch64-macos: withbuf is ${delta} bytes larger than nobuf, want < ${maxSizeDelta} (a ${bufLen}-byte array must not cost its own size in the binary)")
+
+  // (b) otool -l: the section-header proxy, independent of (a).
+  let (c3, otoolOut) = runCapture(scratch, "otool",
+    "otool -l '${withbufOut}'", ms) catch e {
+    panic("globalsbss: ${e.message()}")
+  }
+  check(t, c3 == 0, "otool -l ${withbufOut}: exit ${c3}")
+  let bssSize = otoolSectionSize(otoolOut, "__bss")
+  check(t, bssSize >= bufLen,
+    "aarch64-macos: __DATA,__bss reports size ${bssSize}, want >= ${bufLen} (otool -l ${withbufOut})")
+
+  // (c) the array is genuinely zero-mapped, in TWO separate process runs of
+  // the SAME linked binary — the correctness half (a)/(b) cannot prove.
+  let (c4, run1) = runCapture(scratch, "run1", "'${withbufOut}'", ms) catch e {
+    panic("globalsbss: ${e.message()}")
+  }
+  check(t, c4 == 0 && run1 == wantStdout,
+    "aarch64-macos: first run of withbuf printed '${run1}' (exit ${c4}), want '${wantStdout}'")
+  let (c5, run2) = runCapture(scratch, "run2", "'${withbufOut}'", ms) catch e {
+    panic("globalsbss: ${e.message()}")
+  }
+  check(t, c5 == 0 && run2 == wantStdout,
+    "aarch64-macos: second (fresh) run of withbuf printed '${run2}' (exit ${c5}), want '${wantStdout}' again")
+}
+
+fn checkElfTarget(t: Tally, scratch: string, bit: string, ms: int, target: string) {
+  let withbufSrcPath = "${scratch}/withbuf.bit"
+  let objOut = "${scratch}/withbuf-${target}.o"
+  let (c, out) = runCapture(scratch, "buildobj-${target}",
+    "'${bit}' build '${withbufSrcPath}' --emit-obj -o '${objOut}' --target ${target}", ms) catch e {
+    panic("globalsbss: ${e.message()}")
+  }
+  check(t, c == 0, "${target}: bit build --emit-obj: exit ${c} — ${out}")
+  if (c != 0) {
+    return
+  }
+  let raw = readFile(objOut) catch e {
+    panic("globalsbss: cannot read ${objOut}: ${e.message()}")
+  }
+  let secs = elfSectionHeaders([]u8(raw))
+  check(t, len(secs) > 0, "${target}: ${objOut} does not parse as an ELF64 object")
+  let foundBss = false
+  let bigProgbits = 0 - 1
+  let i = 0
+  while (i < len(secs)) {
+    if (secs[i].shtype == 8 && secs[i].size >= bufLen) {
+      foundBss = true
+    }
+    if (secs[i].shtype == 1 && secs[i].size >= bufLen) {
+      bigProgbits = secs[i].size
+    }
+    i = i + 1
+  }
+  check(t, foundBss,
+    "${target}: no SHT_NOBITS (.bss) section >= ${bufLen} bytes in ${objOut}")
+  check(t, bigProgbits < 0,
+    "${target}: a SHT_PROGBITS section is ${bigProgbits} bytes — the array is landing as real file bytes, not .bss")
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let bit = bitBinary()
+  if (!exists(bit)) {
+    eprint("globalsbss: compiler not found: ${bit} (set BIT)\n")
+    exit(1)
+    return
+  }
+  let tmp = envOr("TMPDIR", "/tmp")
+  let scratch = "${tmp}/bit-globalsbss-${uuidFormat(uuidV4())}"
+  mkdir(scratch) catch e {
+    panic("globalsbss: cannot create ${scratch}: ${e.message()}")
+  }
+
+  let t = Tally{ checks: 0, failures: 0 }
+  checkMacos(t, scratch, bit, ms)
+  // withbuf.bit is written by checkMacos above; both ELF targets reuse it.
+  checkElfTarget(t, scratch, bit, ms, "x86_64-linux")
+  checkElfTarget(t, scratch, bit, ms, "aarch64-linux")
+
+  if (t.checks < 10) {
+    eprint("FAIL: only ${t.checks} checks ran, want at least 10\n")
+    t.failures = t.failures + 1
+  }
+  if (t.failures > 0) {
+    println("globalsbss: FAIL — ${t.failures} of ${t.checks} checks failed")
+    exit(1)
+    return
+  }
+  println("globalsbss: PASS — ${t.checks} checks")
+}
