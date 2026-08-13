@@ -727,6 +727,7 @@ interface error { message(): string }
 
 ```
 type = type_name
+     | qual_type_name
      | slice_type
      | array_type
      | map_type
@@ -736,7 +737,8 @@ type = type_name
      | generic_inst
      | "(" type ")" .
 
-type_name    = IDENT .                          (* primitive, struct, interface, alias, or type param *)
+type_name     = IDENT .                         (* primitive, struct, interface, alias, or type param *)
+qual_type_name = IDENT "." IDENT .              (* a type exported by a namespace import, §17.2 *)
 slice_type   = "[" "]" type .                   (* []T   dynamic, reference *)
 array_type   = "[" const_expr "]" type .        (* [N]T  fixed, value *)
 const_expr   = expression .                     (* folded at compile time; see below *)
@@ -760,6 +762,28 @@ and making it conditionally a constructor would make the meaning of parentheses
 depend on their contents. A tuple value is produced by a multi-value `return`
 (§13.1), which is the use case tuples exist for; anything that wants a named,
 constructible, mutable aggregate wants a struct.
+
+A `qual_type_name` (`io.Writer`) names a type exported by a namespace-imported
+module (`import io from "std/io"`, §17.2) — the same `ns.member` spelling already
+used in expression position (`io.stdout()`), extended to type position:
+
+```
+import io from "std/io"
+
+fn emit(w: io.Writer) {
+  w.writeLine("hi")
+}
+```
+
+The qualifier must name a bound namespace import, and the member must be a type
+**exported** (§17.3) by that module; naming a type that does not exist, or one
+that exists but is not exported, is rejected the same way an unexported *value*
+import is (`E0046`). A `qual_type_name` cannot itself take generic arguments
+(`io.Box<T>` is not valid syntax) — the receiver type of a method (§10.4) and an
+interface bound's `constraint` (§11.3) are also unaffected, since both still take
+a bare `type_name`, not this production: a method may only be declared on a
+locally-declared type regardless, and a generic bound naming an imported
+interface is a separate extension this section does not make.
 
 ### 11.1 Primitive Types
 
@@ -2565,7 +2589,8 @@ The string is a **module path**: `"std/io"`, `"std/net/http"` for standard-libra
 modules, or a relative path `"./util"`, `"../shared"` for project-local modules.
 
 - `import io from "std/io"` binds the namespace `io`; members accessed as
-  `io.println(...)`.
+  `io.println(...)` in expression position, or `io.Writer` in type position
+  (`qual_type_name`, §11).
 - `import * as io from "std/io"` is the explicit spelling of the same.
 - `import { println, printf } from "std/io"` binds the named members directly.
 - `import { println as say } from "std/io"` renames on import.
@@ -3253,9 +3278,10 @@ generic_params= "<" generic_param { "," generic_param } ">" .
 generic_param = IDENT [ ":" constraint ] .
 constraint    = type_name { "&" type_name } .
 
-type          = type_name | slice_type | array_type | map_type | tuple_type
-              | func_type | chan_type | generic_inst | "(" type ")" .
+type          = type_name | qual_type_name | slice_type | array_type | map_type
+              | tuple_type | func_type | chan_type | generic_inst | "(" type ")" .
 type_name     = IDENT .
+qual_type_name = IDENT "." IDENT .
 slice_type    = "[" "]" type .
 array_type    = "[" const_expr "]" type .
 const_expr    = expression .
