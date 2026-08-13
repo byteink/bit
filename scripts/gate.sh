@@ -299,6 +299,7 @@ gates_for_file() {
       return 0
       ;;
     tests/bit/abimembers/*) printf 'test-abimembers\n'; return 0 ;;
+    tests/bit/benchgate/*) printf 'test-benchgate\n'; return 0 ;;
     tests/bit/clicmd/*) printf 'test-clicmd\n'; return 0 ;;
     tests/bit/pollfree/*) printf 'test-pollfree\n'; return 0 ;;
     tests/bit/rootabi/*) printf 'test-rootabi\n'; return 0 ;;
