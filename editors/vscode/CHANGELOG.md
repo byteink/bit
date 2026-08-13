@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Removed `bit.formatOnSave`. `bit lsp` now advertises
+  `documentFormattingProvider` and serves `textDocument/formatting` itself
+  (#3007), so Format Document works in VS Code without the extension having
+  to shell out to `bit fmt` after every save — which raced the editor's own
+  buffer, since the rewrite landed on disk asynchronously and unawaited.
+  Use VS Code's own `editor.formatOnSave` for format-on-save; it now works
+  per-language and composes with everything else VS Code offers (format
+  selection, format-on-type, an unsaved buffer).
+
 ## 0.1.1
 
 - Syntax highlighting no longer treats `function` as a declaration keyword.
