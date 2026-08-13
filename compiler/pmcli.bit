@@ -69,10 +69,33 @@ fn addCmd(a: []string): int {
     return 2
   }
 
-  let hadRef = lastIndexByte(specArg, '@') >= 0
+  let hadRef = hasExplicitRef(specArg)
   let d = parseAddSpec(specArg) catch e {
     eprint("bit add: ${e.message()}\n")
     return 2
+  }
+
+  // A local filesystem / "file://" dependency (#2244) never fetches at all —
+  // no cache root, no `git`, no network — so it is dispatched before either
+  // is even resolved.
+  if (d.scheme == "local") {
+    if (len(urlOverride) > 0) {
+      eprint("bit add: --url is not supported for a local path dependency\n")
+      return 2
+    }
+    let name = pmLocalDepName(d.localPath)
+    let cacheRoot = defaultCacheRoot() catch e {
+      eprint("bit add: ${e.message()}\n")
+      return 1
+    }
+    let result = addLocalDependency(
+      projectDir, cacheRoot, defaultGitBin, name, specArg, d.localPath, pmCliDefaultTimeoutMs,
+    ) catch e {
+      eprint("bit add: ${e.message()}\n")
+      return 1
+    }
+    print("bit add: ${result.name} -> ${result.specRef} (local path)\n")
+    return 0
   }
 
   let cacheRoot = defaultCacheRoot() catch e {
@@ -93,6 +116,28 @@ fn addCmd(a: []string): int {
     let name = pmLastSegment(d.vanityName)
     let result = addVanityDependency(
       projectDir, cacheRoot, defaultGitBin, name, d.vanityName, d.ref, hadRef, pmCliDefaultTimeoutMs,
+    ) catch e {
+      eprint("bit add: ${e.message()}\n")
+      return 1
+    }
+    print("bit add: ${result.name} -> ${result.specRef} (${result.commit})\n")
+    return 0
+  }
+
+  // An explicit ssh:// spec (#2244) shares `addDependency` unchanged with the
+  // https direct form below — `fetchSha`/`resolveDependencyRef` pass `url`
+  // straight to `git`, which handles an `ssh://` remote identically to an
+  // `https://` one, so only the URL this branch constructs differs.
+  if (d.scheme == "ssh") {
+    let url = sshDepUrl(d.sshUser, d.host, d.owner, d.repo)
+    let fetchUrl = url
+    if (len(urlOverride) > 0) {
+      fetchUrl = urlOverride
+    }
+    let result = addDependency(
+      projectDir, cacheRoot, defaultGitBin,
+      d.host, d.owner, d.repo, d.ref, hadRef, url, fetchUrl,
+      pmCliDefaultTimeoutMs,
     ) catch e {
       eprint("bit add: ${e.message()}\n")
       return 1
@@ -130,6 +175,19 @@ fn pmLastSegment(path: string): string {
     return path[slash + 1:len(path)]
   }
   return path
+}
+
+// The `bit.json`/`bit.lock` key a local-path `bit add` stores a dependency
+// under (#2244): the final path component, mirroring how a direct spec keys
+// by `repo` and a vanity spec keys by its trailing segment (`pmLastSegment`,
+// above). A trailing "/" is stripped first so "../textutil/" and
+// "../textutil" name the same key.
+fn pmLocalDepName(path: string): string {
+  let p = path
+  if (len(p) > 1 && p[len(p) - 1] == '/') {
+    p = p[0:len(p) - 1]
+  }
+  return pmLastSegment(p)
 }
 
 // `bit up [name] [--dir <path>]` / `bit update [name] [--dir <path>]` —
@@ -246,8 +304,20 @@ fn parseAddFlags(a: []string, start: int): (string, string, string, bool) {
 // branch HEAD). `resolveDependencyRef` already knows how to resolve the
 // pseudo-ref `"HEAD"` (`git ls-remote <url> HEAD`), so this is a thin wrapper
 // around `parseSpec`, not a fork of its validation.
+//
+// A local spec (#2244, `isLocalSpecPrefix`) is checked FIRST and never gets
+// "@HEAD" appended: it has no ref concept at all (`parseLocalSpec`'s own
+// comment), and blindly appending would corrupt the path itself (a real
+// directory named "…@HEAD" is not what the user typed). For every other
+// form, "already has a ref" is `hasExplicitRef` (pmfetch.bit) rather than a
+// bare `lastIndexByte(spec, '@') >= 0` check — an `ssh://user@host/...` spec
+// with NO ref contains an "@" too (the user separator), which the bare check
+// would misread as "ref already given" and leave unresolved to "HEAD".
 fn parseAddSpec(spec: string): DepSpec! {
-  if (lastIndexByte(spec, '@') >= 0) {
+  if (isLocalSpecPrefix(spec)) {
+    return parseSpec(spec)?
+  }
+  if (hasExplicitRef(spec)) {
     return parseSpec(spec)?
   }
   return parseSpec(spec + "@HEAD")?
@@ -314,7 +384,7 @@ export fn addDependency(
   // it from whatever bit.json says. The reverse order would risk bit.json
   // claiming a dependency bit.lock never recorded, a silent mismatch with no
   // rollback.
-  let updated = upsertLockEntry(entries, name, entry.url, entry.commit, entry.requires, "")
+  let updated = upsertLockEntry(entries, name, entry.url, entry.commit, entry.requires, "", "")
   let resolved = resolveTransitiveDeps(cacheRoot, gitBin, updated, flattenRequires(updated), timeoutMs)?
   writeLock(lockPath, resolved)?
 
@@ -350,7 +420,7 @@ export fn addVanityDependency(
   // for the same reason: bit.lock is fully machine-owned and self-healing on
   // the next run, so a failure right after this write never leaves bit.json
   // claiming a dependency bit.lock does not record.
-  let updated = upsertLockEntry(entries, name, entry.url, entry.commit, entry.requires, entry.vanity)
+  let updated = upsertLockEntry(entries, name, entry.url, entry.commit, entry.requires, entry.vanity, entry.localPath)
   let resolved = resolveTransitiveDeps(cacheRoot, gitBin, updated, flattenRequires(updated), timeoutMs)?
   writeLock(lockPath, resolved)?
 
@@ -358,6 +428,40 @@ export fn addVanityDependency(
   rewriteManifest(projectDir, name, specRef)?
 
   return AddResult{ name: name, specRef: specRef, url: entry.url, commit: entry.commit }
+}
+
+// `bit add`'s local-filesystem counterpart to `addDependency` (#2244):
+// verifies `localPath` exists (`resolveLocalDependency`, pmz.bit) and reads
+// its own `bit.json` requirements, but never fetches — there is no git
+// remote and no commit to resolve. `rawSpec` is recorded in `bit.json`
+// VERBATIM (exactly what the user typed: a bare path or a `file://` URL),
+// so it round-trips through `parseSpec` unchanged on the next `bit up`.
+//
+// `entry.requires` still feeds `resolveTransitiveDeps` exactly like a
+// git-backed add: a local dependency's OWN `bit.json` may name ordinary
+// git-host/vanity/ssh dependencies of its own, and those resolve normally.
+// What it may NOT name is ANOTHER local/file dependency of its own — see
+// `resolveTransitiveSpec` (pmz.bit) for that check and why: a local/file
+// spec is only ever trusted directly from the project's OWN bit.json, never
+// from something reached by walking a dependency's manifest.
+export fn addLocalDependency(
+  projectDir: string, cacheRoot: string, gitBin: string,
+  name: string, rawSpec: string, localPath: string, timeoutMs: int,
+): AddResult! {
+  // #2751: same precondition, checked first, as addDependency above.
+  checkManifestExists(projectDir)?
+  let lockPath = pmJoin(projectDir, "bit.lock")
+  let entries = readLock(lockPath)?
+  let entry = resolveLocalDependency(projectDir, name, localPath)?
+
+  // Same bit.lock-first, bit.json-second ordering as `addDependency`.
+  let updated = upsertLockEntry(entries, name, entry.url, entry.commit, entry.requires, "", entry.localPath)
+  let resolved = resolveTransitiveDeps(cacheRoot, gitBin, updated, flattenRequires(updated), timeoutMs)?
+  writeLock(lockPath, resolved)?
+
+  rewriteManifest(projectDir, name, rawSpec)?
+
+  return AddResult{ name: name, specRef: rawSpec, url: "", commit: "" }
 }
 
 // ---- bit.json / bit.lock writes -----------------------------------------
@@ -471,7 +575,9 @@ fn pmAppendGapSlot(gaps: []Option<string>): []Option<string> {
 
 // `entries` with `name`'s entry replaced (or appended, if absent) by a fresh
 // one built from this run's fetch — bit.lock is fully machine-owned, so the
-// whole entry is regenerated rather than patched field-by-field.
+// whole entry is regenerated rather than patched field-by-field. `localPath`
+// (#2244) is "" for every git-backed (direct/vanity/ssh) entry; non-empty
+// only for a local filesystem dependency (`addLocalDependency`, below).
 fn upsertLockEntry(
   entries: []LockEntry,
   name: string,
@@ -479,13 +585,14 @@ fn upsertLockEntry(
   commit: string,
   requires: []LockRequire,
   vanity: string,
+  localPath: string,
 ): []LockEntry {
   let out = []LockEntry(0)
   let replaced = false
   let i = 0
   while (i < len(entries)) {
     if (entries[i].name == name) {
-      out = append(out, LockEntry{ name: name, url: url, commit: commit, requires: requires, vanity: vanity })
+      out = append(out, LockEntry{ name: name, url: url, commit: commit, requires: requires, vanity: vanity, localPath: localPath })
       replaced = true
     } else {
       out = append(out, entries[i])
@@ -493,7 +600,7 @@ fn upsertLockEntry(
     i = i + 1
   }
   if (!replaced) {
-    out = append(out, LockEntry{ name: name, url: url, commit: commit, requires: requires, vanity: vanity })
+    out = append(out, LockEntry{ name: name, url: url, commit: commit, requires: requires, vanity: vanity, localPath: localPath })
   }
   return out
 }
@@ -598,16 +705,34 @@ export fn upDependencies(
   let i = 0
   while (i < len(deps)) {
     let d = deps[i]
-    if (d.spec.vanity) {
+    if (d.spec.scheme == "local") {
+      // No re-resolution possible or needed: `resolveLocalDependency`
+      // re-verifies the path still exists and re-reads its own `bit.json`
+      // requirements, matching what `bit up` does for every other form
+      // (pick up anything the dependency's own manifest grew) — but there is
+      // no ref, commit or URL to refresh.
+      let entry = resolveLocalDependency(projectDir, d.name, d.spec.localPath)?
+      entries = upsertLockEntry(entries, d.name, entry.url, entry.commit, entry.requires, "", entry.localPath)
+      out = append(out, UpResult{ name: d.name, ref: d.spec.localPath, url: "", commit: "local" })
+    } else if (d.spec.vanity) {
       // A vanity name always re-resolves its `bit-import:` document (there is
       // no non-network way to "refresh" it); `resolveVanityDependency` is
       // what refuses a resolution that disagrees with the URL bit.lock
       // already records for this name.
       let entry = resolveVanityDependency(cacheRoot, gitBin, d.name, d.spec.vanityName, d.spec.ref, entries, timeoutMs)?
-      entries = upsertLockEntry(entries, d.name, entry.url, entry.commit, entry.requires, entry.vanity)
+      entries = upsertLockEntry(entries, d.name, entry.url, entry.commit, entry.requires, entry.vanity, entry.localPath)
       out = append(out, UpResult{ name: d.name, ref: d.spec.ref, url: entry.url, commit: entry.commit })
     } else {
+      // `d.spec.scheme == "ssh"` needs its OWN fallback URL: `defaultDepUrl`
+      // always derives `https://`, which is wrong for a dependency that was
+      // never fetched over https in the first place (#2244). This only
+      // matters when bit.lock has no entry yet at all (`existingUrlFor`'s own
+      // fallback path) — a dependency already locked reuses its recorded
+      // `url` unchanged, exactly as before.
       let fallbackUrl = defaultDepUrl(d.spec.host, d.spec.owner, d.spec.repo)
+      if (d.spec.scheme == "ssh") {
+        fallbackUrl = sshDepUrl(d.spec.sshUser, d.spec.host, d.spec.owner, d.spec.repo)
+      }
       let url = existingUrlFor(entries, d.name, fallbackUrl)
       // `bit up` has no `--url` escape hatch: it refreshes what bit.lock
       // already records, so the fetch reaches the same url it will write back.
@@ -615,7 +740,7 @@ export fn upDependencies(
         cacheRoot, gitBin, d.name, d.spec.host, d.spec.owner, d.spec.repo, d.spec.ref, url,
         url, entries, timeoutMs,
       )?
-      entries = upsertLockEntry(entries, d.name, entry.url, entry.commit, entry.requires, "")
+      entries = upsertLockEntry(entries, d.name, entry.url, entry.commit, entry.requires, "", "")
       out = append(out, UpResult{ name: d.name, ref: d.spec.ref, url: entry.url, commit: entry.commit })
     }
     i = i + 1

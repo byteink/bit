@@ -69,15 +69,39 @@ export const maxManifestBytes: int = 1048576
 
 export const defaultGitBin: string = "git"
 
-// One resolved dependency spec, SPEC §17.7. A DIRECT spec (`vanity` false)
-// is `gitHost/owner/repo@ref`, with `host`/`owner`/`repo` set and
-// `vanityName` "". A VANITY spec (`vanity` true) is any other leading path
-// segment: `host`/`owner`/`repo` are "" (there is nothing to derive a URL
-// from until the name is resolved over HTTPS) and `vanityName` holds the
-// full path exactly as written, e.g. `"bitlang.org/pkg/http"`. Which of the
-// two a spec is depends only on the FIRST path segment against
-// `isKnownGitHost`'s fixed list, never on how many segments the path has.
-export struct DepSpec { vanity: bool, host: string, owner: string, repo: string, vanityName: string, ref: string }
+// One resolved dependency spec, SPEC §17.7. A DIRECT spec (`vanity` false,
+// `scheme` "") is `gitHost/owner/repo@ref` (`owner` may itself be a
+// "/"-joined multi-segment path — a GitLab-style nested subgroup — when
+// `host` is a known git host with more than 3 total segments; #2244), with
+// `host`/`owner`/`repo` set and `vanityName` "". A VANITY spec (`vanity`
+// true) is any other leading path segment: `host`/`owner`/`repo` are "" and
+// `vanityName` holds the full path exactly as written, e.g.
+// `"bitlang.org/pkg/http"`. Which of the two a spec is depends only on the
+// FIRST path segment against `isKnownGitHost`'s fixed list, never on how
+// many segments the path has.
+//
+// Two more forms (#2244), each its own `scheme`:
+//   - `scheme == "ssh"`: an explicit `ssh://[user@]host/owner/repo[/...]@ref`
+//     spec (`parseSshSpec`). `host`/`owner`/`repo` are set exactly as for a
+//     direct spec; `sshUser` holds the `user@` portion, or "" if none was
+//     given. The scp-like `user@host:owner/repo` shorthand git also accepts
+//     is deliberately NOT supported — see `parseSshSpec`'s own comment.
+//   - `scheme == "local"`: a bare filesystem path ("/abs", "./rel", "../rel")
+//     or a "file://" URL (`parseLocalSpec`). `localPath` holds the decoded
+//     path; every other field is its zero value. A local spec has no `ref`
+//     at all — see `parseLocalSpec`'s own comment for why — so `ref` is
+//     always "" here, never a placeholder.
+export struct DepSpec {
+  vanity: bool,
+  host: string,
+  owner: string,
+  repo: string,
+  vanityName: string,
+  ref: string,
+  scheme: string,
+  localPath: string,
+  sshUser: string,
+}
 
 // The fixed git-host list SPEC §17.7 names. Checked against a spec's FIRST
 // path segment only — this is the entire direct-vs-vanity decision
@@ -104,11 +128,33 @@ struct GitRun { exitCode: int, timedOut: bool, output: string }
 // vanity name resolves to a git URL that is used exactly as a direct spec's
 // derived URL would be (`parseGitRemoteUrl`, below).
 //
-// The first path segment decides direct vs. vanity (`isKnownGitHost`); a
-// known host still requires exactly 3 segments (`host/owner/repo`, unchanged
-// from before this spec grew vanity resolution) — anything else is a vanity
-// name and may have any number of segments.
+// Three prefix-recognized forms are checked FIRST, before any `@ref` split —
+// each is unambiguous from its leading bytes alone, and two of them (local,
+// ssh) have a DIFFERENT ref rule than the git-host/vanity form below, so
+// dispatching on prefix first (rather than trying the generic split and
+// falling back) never risks misreading one form's content as another's
+// syntax (#2244):
+//   - a local filesystem path or "file://" URL (`isLocalSpecPrefix`) ->
+//     `parseLocalSpec`. No git host, no network, no ref at all.
+//   - an explicit "ssh://" URL -> `parseSshSpec`. Its own `user@host` portion
+//     contains an "@" that is NOT the ref separator; parsing this generically
+//     alongside the git-host form below would misread it.
+//
+// Neither ever falls through to the logic below: each returns a fully valid
+// `DepSpec` or fails with its own diagnostic. What remains below is
+// unchanged in shape from before #2244: the first path segment decides
+// direct vs. vanity (`isKnownGitHost`); a known host requires AT LEAST 3
+// segments (`host/owner/repo`, or `host/group/.../subgroup/repo` for a
+// GitLab-style nested group — #2244 relaxed this from exactly 3) — anything
+// else is a vanity name and may have any number of segments.
 export fn parseSpec(spec: string): DepSpec! {
+  if (isLocalSpecPrefix(spec)) {
+    return parseLocalSpec(spec)?
+  }
+  if (hasPrefix(spec, "ssh://")) {
+    return parseSshSpec(spec)?
+  }
+
   let at = lastIndexByte(spec, '@')
   if (at < 0) {
     fail newError("pmfetch: dependency spec has no @ref: ${spec}")
@@ -125,12 +171,11 @@ export fn parseSpec(spec: string): DepSpec! {
   validateSegment(parts[0])?
 
   if (isKnownGitHost(parts[0])) {
-    if (len(parts) != 3) {
+    let (host, owner, repo, ok) = splitHostOwnerRepo(path)
+    if (!ok) {
       fail newError("pmfetch: dependency spec must be gitHost/owner/repo@ref: ${spec}")
     }
-    validateSegment(parts[1])?
-    validateSegment(parts[2])?
-    return DepSpec{ vanity: false, host: parts[0], owner: parts[1], repo: parts[2], vanityName: "", ref: ref }
+    return DepSpec{ vanity: false, host: host, owner: owner, repo: repo, vanityName: "", ref: ref, scheme: "", localPath: "", sshUser: "" }
   }
 
   let i = 1
@@ -138,7 +183,7 @@ export fn parseSpec(spec: string): DepSpec! {
     validateSegment(parts[i])?
     i = i + 1
   }
-  return DepSpec{ vanity: true, host: "", owner: "", repo: "", vanityName: path, ref: ref }
+  return DepSpec{ vanity: true, host: "", owner: "", repo: "", vanityName: path, ref: ref, scheme: "", localPath: "", sshUser: "" }
 }
 
 fn lastIndexByte(s: string, c: u8): int {
@@ -152,13 +197,33 @@ fn lastIndexByte(s: string, c: u8): int {
   return -1
 }
 
+// True when `spec` already names an explicit "@ref", checked by looking for
+// an "@" AFTER the last "/" rather than anywhere in the string. An ssh
+// spec's "user@host" portion (before the first "/") also contains an "@",
+// which is never a ref separator — `parseAddSpec`'s (pmcli.bit) "no ref
+// given, default to HEAD" logic must not confuse the two (#2244).
+fn hasExplicitRef(spec: string): bool {
+  let slash = lastIndexByte(spec, '/')
+  let at = lastIndexByte(spec, '@')
+  return at > slash
+}
+
 // A safe single path component: non-empty, not `.`/`..`, and drawn from a
 // charset that can never introduce a `/` or a traversal segment — `host`,
 // `owner`, and `repo` all become cache directory names, so this is the one
 // gate keeping a hostile dependency spec from writing outside `cacheRoot`.
+// Also rejects a leading `-` (#2244): every validated segment ends up as an
+// argument to `git` (directly, or embedded in a `ssh://`/`https://` URL that
+// is), and a value git or its `ssh` transport reads as an OPTION rather than
+// a hostname/path is exactly the shape of CVE-2017-1000117's argument-
+// injection class (`-oProxyCommand=...` etc.) — denied here regardless of
+// what version of `git` happens to be on `PATH`.
 fn validateSegment(s: string): ()! {
   if (len(s) == 0 || s == "." || s == "..") {
     fail newError("pmfetch: invalid path segment in dependency spec: '${s}'")
+  }
+  if (s[0] == '-') {
+    fail newError("pmfetch: dependency spec segment must not start with '-': '${s}'")
   }
   let i = 0
   while (i < len(s)) {
@@ -170,6 +235,183 @@ fn validateSegment(s: string): ()! {
     }
     i = i + 1
   }
+}
+
+// `validateSegment`, as a plain predicate rather than a `fail` — needed by
+// `splitHostOwnerRepo` (below), which reports one combined `ok` rather than
+// propagating any one segment's specific error message. Reuses
+// `validateSegment` itself as the single source of truth for the charset
+// rather than repeating it.
+fn validateSegmentOk(s: string): bool {
+  validateSegment(s) catch e { return false }
+  return true
+}
+
+// Splits a scheme-stripped, ".git"-suffix-stripped path into (host, owner,
+// repo, ok) — the shared decomposition every git-host-derived form uses: a
+// plain 3-segment direct spec, a GitLab-style nested-group path (more than
+// one segment between host and repo, #2244), an `ssh://` spec's path
+// portion (`parseSshSpec`), a resolved vanity document's `<gitURL>` path
+// portion (`parseGitRemoteUrl`), and a `bit.lock` entry's own `url` decoded
+// back at build time (`project.bit`'s `pkgUrlHostOwnerRepo`). Requires at
+// least 3 segments; `owner` is every segment between the first (host) and
+// the last (repo), rejoined with "/" — so a 4-or-more segment path nests one
+// level deeper in the cache (`fetchSha`'s `<cacheRoot>/<host>/<owner>/<repo>`,
+// where `owner` may itself now contain "/"). Every segment, including each
+// piece of a multi-segment owner, is validated INDIVIDUALLY
+// (`validateSegmentOk`) — never as one joined string, since `validateSegment`'s
+// charset has no "/" in it and would reject a real owner path outright.
+fn splitHostOwnerRepo(rest: string): (string, string, string, bool) {
+  let parts = split(rest, "/")
+  if (len(parts) < 3) {
+    return "", "", "", false
+  }
+  let i = 0
+  while (i < len(parts)) {
+    if (!validateSegmentOk(parts[i])) {
+      return "", "", "", false
+    }
+    i = i + 1
+  }
+  let host = parts[0]
+  let repo = parts[len(parts) - 1]
+  let owner = joinPathSegments(parts[1:len(parts) - 1])
+  return host, owner, repo, true
+}
+
+// `parts` rejoined with "/" — the inverse of `split(s, "/")`, used to
+// reassemble a multi-segment owner path (`splitHostOwnerRepo`, above).
+fn joinPathSegments(parts: []string): string {
+  let out = ""
+  let i = 0
+  while (i < len(parts)) {
+    if (i > 0) {
+      out = out + "/"
+    }
+    out = out + parts[i]
+    i = i + 1
+  }
+  return out
+}
+
+// --- local filesystem / file:// dependency specs (#2244) -----------------
+
+// True when `spec` is shaped like a local filesystem dependency: an
+// absolute path, an explicitly relative path, or a "file://" URL. Checked
+// against the spec's leading bytes ONLY, before any other parsing, so a
+// local form is never confused with a git-host or vanity name — none of
+// those three prefixes can start a legal `host/owner/repo` or vanity path
+// segment (`validateSegment` already rejects a leading "/" or ".").
+fn isLocalSpecPrefix(spec: string): bool {
+  return hasPrefix(spec, "file://") || hasPrefix(spec, "./") || hasPrefix(spec, "../") || hasPrefix(spec, "/")
+}
+
+// Parses a local-filesystem dependency spec (#2244): a bare path ("/abs",
+// "./rel", "../rel") or a "file://" URL. A local/file dependency has NO ref
+// at all — SPEC §17.7's three ref forms (tag/branch/bare sha) each name an
+// immutable point in a git history, and a plain directory on disk has none
+// of those — so, unlike every git-backed form, the ENTIRE remainder after
+// the recognized prefix is the path. An "@" byte inside it (a legal, if
+// unusual, POSIX filename character) is never treated as a ref separator;
+// `bit.json`/`bit.lock` record no ref for this form (`pmcli.bit`'s
+// `addLocalDependency`), matching that there is nothing immutable to lock.
+fn parseLocalSpec(spec: string): DepSpec! {
+  if (hasPrefix(spec, "file://")) {
+    let rest = spec[7:len(spec)]
+    // file:// is only well-defined for an ABSOLUTE path (RFC 8089):
+    // requiring the leading "/" here means "file://etc/passwd" (a RELATIVE
+    // remainder, silently anchored to whatever the process's cwd happens to
+    // be at resolve time) is refused outright rather than resolved against
+    // an ambient, non-reproducible base.
+    if (!hasPrefix(rest, "/")) {
+      fail newError("pmfetch: file:// dependency spec must be an absolute path (file:///...): ${spec}")
+    }
+    checkNoDotDotSegment(spec, rest)?
+    return DepSpec{ vanity: false, host: "", owner: "", repo: "", vanityName: "", ref: "", scheme: "local", localPath: rest, sshUser: "" }
+  }
+  if (hasPrefix(spec, "/")) {
+    // A bare absolute path claims to already be exact, the same reasoning as
+    // the file:// case above — see `checkNoDotDotSegment`'s own comment.
+    checkNoDotDotSegment(spec, spec)?
+    return DepSpec{ vanity: false, host: "", owner: "", repo: "", vanityName: "", ref: "", scheme: "local", localPath: spec, sshUser: "" }
+  }
+  // "./" or "../": an explicitly RELATIVE path, where ".." is exactly the
+  // sibling-directory reference this form exists for (`bit add ../textutil`)
+  // — never restricted the way an absolute-claiming path is above.
+  return DepSpec{ vanity: false, host: "", owner: "", repo: "", vanityName: "", ref: "", scheme: "local", localPath: spec, sshUser: "" }
+}
+
+// Rejects `path` (already known to claim an ABSOLUTE location — a bare "/…"
+// spec, or "file://"'s own absolute remainder) if any "/"-separated segment
+// is exactly "..". A path claiming to be absolute has no legitimate reason
+// to need one — any such target can already be written fully normalized —
+// so a ".." inside it reads as an attempt to walk the resolved path
+// somewhere the literal prefix does not show: the "must not escape the
+// intended tree" concern named on #2244, for the one form where deny-by-
+// default costs nothing (the explicitly-relative "./"/"../" forms are
+// exempt from this check because ".." IS their entire, legitimate point —
+// see `parseLocalSpec` above).
+fn checkNoDotDotSegment(origSpec: string, path: string): ()! {
+  let parts = split(path, "/")
+  let i = 0
+  while (i < len(parts)) {
+    if (parts[i] == "..") {
+      fail newError("pmfetch: local path dependency spec must not contain a '..' path segment: ${origSpec}")
+    }
+    i = i + 1
+  }
+}
+
+// --- explicit ssh:// dependency specs (#2244) -----------------------------
+
+// Parses an explicit "ssh://[user@]host/owner/repo[/...]@ref" spec — the
+// same host/owner/repo shape a direct git-host spec has (including a
+// nested-group owner, `splitHostOwnerRepo`), reached over `ssh://` instead
+// of derived as `https://`.
+//
+// The scp-like "user@host:owner/repo" shorthand `git` itself also accepts is
+// deliberately NOT supported: it is inherently ambiguous with a bare
+// "host:port/path" reading, tools have historically disagreed on where the
+// host ends and the path begins, and normalizing it correctly buys nothing
+// an explicit "ssh://" URL does not already say more plainly. Deny by
+// default (#2244) — the unambiguous spelling is required.
+fn parseSshSpec(spec: string): DepSpec! {
+  let at = lastIndexByte(spec, '@')
+  let slash = lastIndexByte(spec, '/')
+  if (at < 0 || at <= slash) {
+    fail newError("pmfetch: ssh dependency spec has no @ref: ${spec}")
+  }
+  let ref = spec[at + 1:len(spec)]
+  if (len(ref) == 0) {
+    fail newError("pmfetch: ssh dependency spec has an empty ref: ${spec}")
+  }
+  let withoutScheme = spec[6:at] // strip "ssh://", keep up to the ref's own "@"
+  let user = ""
+  let hostAndPath = withoutScheme
+  let userAt = indexOf(withoutScheme, "@")
+  if (userAt >= 0) {
+    user = withoutScheme[0:userAt]
+    hostAndPath = withoutScheme[userAt + 1:len(withoutScheme)]
+    validateSegment(user)?
+  }
+  let (host, owner, repo, ok) = splitHostOwnerRepo(hostAndPath)
+  if (!ok) {
+    fail newError("pmfetch: ssh dependency spec must be ssh://[user@]host/owner/repo[/...]@ref: ${spec}")
+  }
+  return DepSpec{ vanity: false, host: host, owner: owner, repo: repo, vanityName: "", ref: ref, scheme: "ssh", localPath: "", sshUser: user }
+}
+
+// The `ssh://` URL a `scheme == "ssh"` `DepSpec` fetches from and records in
+// `bit.lock` — the ssh counterpart to `defaultDepUrl`. Reconstructed from
+// the parsed, VALIDATED parts rather than any raw substring of the original
+// spec, so the URL `git` actually receives can never carry anything
+// `validateSegment` did not already approve.
+export fn sshDepUrl(user: string, host: string, owner: string, repo: string): string {
+  let userPrefix = ""
+  if (len(user) > 0) {
+    userPrefix = user + "@"
+  }
+  return "ssh://" + userPrefix + host + "/" + owner + "/" + repo
 }
 
 fn isFullSha(s: string): bool {
@@ -303,7 +545,7 @@ export fn fetchSha(
     fail newError("pmfetch: fetchSha needs an already-resolved commit sha, got: ${sha}")
   }
   validateSegment(host)?
-  validateSegment(owner)?
+  validateOwnerPath(owner)?
   validateSegment(repo)?
 
   let finalDir = cacheRoot + "/" + host + "/" + owner + "/" + repo + "/" + sha
@@ -433,6 +675,22 @@ fn pmTrim(s: string): string {
   return s[lo:hi]
 }
 
+// Validates `owner` as a "/"-joined path of one or more safe segments — the
+// same relaxation `splitHostOwnerRepo` applies at parse time for a
+// GitLab-style nested group (#2244): `owner` becomes part of the cache
+// directory (`<cacheRoot>/<host>/<owner>/<repo>`), which may now be several
+// directories deep, so it can no longer be validated as a single
+// `validateSegment` call — that charset has no "/" in it and would reject a
+// real multi-segment owner outright.
+fn validateOwnerPath(owner: string): ()! {
+  let parts = split(owner, "/")
+  let i = 0
+  while (i < len(parts)) {
+    validateSegment(parts[i])?
+    i = i + 1
+  }
+}
+
 // mkdir -p, iteratively (Power of 10 rule 2: bounded by the path's own
 // segment count, no recursion). `std/fs.mkdir` fails if the parent is
 // missing, so every prefix is created in order.
@@ -525,10 +783,10 @@ struct GitRemoteRepo { host: string, owner: string, repo: string }
 // spec's own derived URL already has by construction. SPEC §17.7 says a
 // vanity document's `<gitURL>` is "used exactly as a direct spec's derived
 // URL would be", so requiring the same shape here is not a new limitation;
-// it is the existing one (`parseSpec` already requires exactly 3 segments
-// for a direct spec's owner/repo), just applied to a resolved URL instead of
-// a written-out spec. A deeper path (a GitLab subgroup, say) fails loudly
-// rather than being guessed at.
+// it is the existing one (`parseSpec`/`splitHostOwnerRepo` require at least
+// 3 segments for a direct spec's owner/repo, #2244 relaxed from exactly 3 to
+// allow a GitLab-style nested group), just applied to a resolved URL instead
+// of a written-out spec.
 fn parseGitRemoteUrl(url: string): GitRemoteRepo! {
   if (!hasPrefix(url, "https://")) {
     fail newError("pmfetch: resolved git URL is not https: ${url}")
@@ -537,14 +795,11 @@ fn parseGitRemoteUrl(url: string): GitRemoteRepo! {
   if (hasSuffix(rest, ".git")) {
     rest = rest[0:len(rest) - 4]
   }
-  let parts = split(rest, "/")
-  if (len(parts) != 3) {
+  let (host, owner, repo, ok) = splitHostOwnerRepo(rest)
+  if (!ok) {
     fail newError("pmfetch: resolved git URL is not host/owner/repo shaped: ${url}")
   }
-  validateSegment(parts[0])?
-  validateSegment(parts[1])?
-  validateSegment(parts[2])?
-  return GitRemoteRepo{ host: parts[0], owner: parts[1], repo: parts[2] }
+  return GitRemoteRepo{ host: host, owner: owner, repo: repo }
 }
 
 // A later resolution of dependency `name` producing a DIFFERENT git URL than
