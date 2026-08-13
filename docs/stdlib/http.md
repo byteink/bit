@@ -187,6 +187,25 @@ GETs `url`.
 
 POSTs `body` to `url`.
 
+### `requestTimeout(method: string, url: string, body: string, timeoutMs: int): Response!`
+
+Like `request`, but bounded by a whole-request `timeoutMs` - connect, send and
+read of headers and body all share ONE deadline, resolved once before dial
+rather than restarted per read. A server that accepts and never answers gets
+you a `fail` instead of an indefinite park. `http://` only for now - an
+`https://`/`https+h3://` URL fails outright, since neither TLS nor HTTP/3 runs
+over `std/net`'s `Conn` and so does not inherit a deadline from it. There is no
+default on `request`/`get`/`post` themselves: a caller downloading a large
+file over a bare `get` is unaffected by this change.
+
+### `getTimeout(url: string, timeoutMs: int): Response!`
+
+GETs `url` (`http://` only), bounded by a whole-request `timeoutMs`.
+
+### `postTimeout(url: string, body: string, timeoutMs: int): Response!`
+
+POSTs `body` to `url` (`http://` only), bounded by a whole-request `timeoutMs`.
+
 ```bit
 import { get, post, request, Response } from "std/http"
 
@@ -448,6 +467,22 @@ GETs `url` through this client (HTTP/3 when discovered, else TLS or cleartext).
 ### `Client.post(url: string, body: string): Response!`
 
 POSTs `body` to `url` through this client.
+
+### `Client.requestTimeout(method: string, url: string, body: string, timeoutMs: int): Response!`
+
+Like the package-level `requestTimeout`: a whole-request deadline, `http://`
+only for now. Does not consult this client's Alt-Svc cache or TLS config -
+those apply only to the https/h3 paths this does not cover yet.
+
+### `Client.getTimeout(url: string, timeoutMs: int): Response!`
+
+GETs `url` through this client (`http://` only), bounded by a whole-request
+`timeoutMs`.
+
+### `Client.postTimeout(url: string, body: string, timeoutMs: int): Response!`
+
+POSTs `body` to `url` through this client (`http://` only), bounded by a
+whole-request `timeoutMs`.
 
 ```bit
 import { newClient, newClientTls, Client, Response } from "std/http"

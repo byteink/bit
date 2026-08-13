@@ -15,8 +15,13 @@
 // A listening socket. Not a `Conn`: the only thing you can do with it is accept.
 export struct Listener { fd: i64 }
 
-// One end of an established connection.
-export struct Conn { fd: i64 }
+// One end of an established connection. `deadlineNs` is an ABSOLUTE monotonic
+// nanosecond deadline (`std/time`'s `monotonic()` plus a budget) that
+// `readDeadline`/`writeDeadline` respect; `0`, the zero value every `Conn` not
+// built by `dialDeadline` gets, means "no deadline" — `read`/`write` never
+// consult it at all, so an existing `dial()`-then-`read()` caller is
+// unaffected (#2291).
+export struct Conn { fd: i64, deadlineNs: i64 }
 
 // Listen for TCP connections on `host:port`.
 //
@@ -178,4 +183,108 @@ export fn resolve(host: string): string! {
     fail newError("could not resolve ${host}")
   }
   return ip
+}
+
+// ---------------------------------------------------------------------------
+// Deadline-bounded operations (#2291)
+// ---------------------------------------------------------------------------
+//
+// A server that completes the handshake (or accepts a connection) and then
+// never writes parks `dial`/`read` forever — nothing above bounds the wait.
+// These give a caller a way to defend itself: an ABSOLUTE monotonic deadline
+// (`std/time`'s `monotonic()` plus a budget), resolved ONCE and carried by
+// the `Conn` it produces, so a whole request's connect, write and read can
+// share the SAME deadline without restarting it per operation — the pattern
+// `runtime/ABI.md` §19's `osForkExecWaitBounded` documents. A timeout is a
+// `fail`; a clean close is `Ok("")` from `readDeadline`, exactly as `read`
+// reports it — the two are never confusable by a caller checking which one
+// it got.
+//
+// Reached through a plain `extern fn`, not a compiler-recognized builtin
+// (SPEC §11.7 admits no `string` across that boundary), so `host`/the body
+// cross as a packed `[]byte` and a length — the same shape `std/fs`'s
+// `bit_rt_fs_is_symlink_w` uses.
+extern fn bit_rt_net_dial_deadline_w(host: *byte, hostLen: int, port: int, deadlineNs: i64): i64
+extern fn bit_rt_net_read_deadline_w(fd: i64, out: *byte, cap: int, deadlineNs: i64): i64
+extern fn bit_rt_net_write_deadline_w(fd: i64, data: *byte, n: int, deadlineNs: i64): i64
+
+// Connect to `host:port`, bounded by `deadlineNs` (an absolute monotonic
+// nanosecond deadline, not a duration — `monotonic() + budget`) rather than
+// parking forever. The returned `Conn` remembers `deadlineNs` and
+// `readDeadline`/`writeDeadline` on it reuse the SAME value automatically, so
+// a caller does not have to re-derive or re-pass it per operation.
+export fn dialDeadline(host: string, port: int, deadlineNs: int): Conn! {
+  let n = len(host)
+  if (n == 0 || n > 255) {
+    fail newError("dial ${host}:${port} failed")
+  }
+  let w = []byte(n)
+  let i = 0
+  while (i < n) {
+    w[i] = host[i]
+    i = i + 1
+  }
+  let fd = bit_rt_net_dial_deadline_w(ptrOf(w), n, port, deadlineNs)
+  if (fd == 0 - 2) {
+    fail newError("dial ${host}:${port} timed out")
+  }
+  if (fd < 0) {
+    fail newError("dial ${host}:${port} failed")
+  }
+  return Conn{ fd: fd, deadlineNs: deadlineNs }
+}
+
+// Set (or, with `0`, clear) the absolute monotonic deadline `readDeadline`/
+// `writeDeadline` respect on this connection from now on. Does not reach back
+// to bound a `dial`/`dialDeadline` connect already completed.
+export fn (c: Conn) setDeadline(deadlineNs: int) {
+  c.deadlineNs = deadlineNs
+}
+
+// Up to `max` bytes, bounded by the connection's deadline (`dialDeadline`/
+// `setDeadline`; the zero value blocks like `read` — at most one hour, the
+// same ceiling `runtime/ABI.md` §19's `os_run_bounded_max_ms` clamps a
+// forgotten timeout to). An empty result is a CLEAN CLOSE, exactly as `read`
+// reports it — an orderly end of stream, never an error. A timeout is a
+// `fail` whose message names it, so a caller distinguishes the two by
+// which one it got: a value back (even `""`) was never on the timeout path.
+export fn (c: Conn) readDeadline(max: int): string! {
+  if (max <= 0) {
+    return ""
+  }
+  let w = []byte(max)
+  let n = bit_rt_net_read_deadline_w(c.fd, ptrOf(w), max, c.deadlineNs)
+  if (n == 0 - 2) {
+    fail newError("read timed out")
+  }
+  if (n < 0) {
+    fail newError("read failed")
+  }
+  if (n == 0) {
+    return ""
+  }
+  return string(w[0:n])
+}
+
+// Write all of `s`, bounded by the connection's deadline. `()!` already, so
+// no new distinguishing shape is needed: a plain error is a hard I/O
+// failure, an error naming the timeout is the deadline elapsing first.
+export fn (c: Conn) writeDeadline(s: string): ()! {
+  let n = len(s)
+  if (n == 0) {
+    return
+  }
+  let w = []byte(n)
+  let i = 0
+  while (i < n) {
+    w[i] = s[i]
+    i = i + 1
+  }
+  let wrote = bit_rt_net_write_deadline_w(c.fd, ptrOf(w), n, c.deadlineNs)
+  if (wrote == 0 - 2) {
+    fail newError("write timed out")
+  }
+  if (wrote < 0) {
+    fail newError("write failed")
+  }
 }

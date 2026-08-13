@@ -2,6 +2,14 @@
 // Sibling file, so the same module: the syscall numbers, kernel-struct
 // constants, scratch buffers, `sysRc`/`lastErr` and `netAwaitReady` it uses all
 // live there and need no import in either direction.
+//
+// `schedSleepUntil` and `parkMonoNs` are the two names sock.bit does not
+// already bring into the module — see the "Deadline-bounded connect/read/write"
+// section below (#2291) for what they are for. Byte-for-byte mirror of
+// ../darwin/tcp.bit's own section save the platform glue (raw `syscall()`
+// here, libSystem `extern fn` there, and `parkMonoNs`'s scratch argument).
+import { schedSleepUntil } from "../../sched"
+import { parkMonoNs } from "../../park/linux"
 
 // ---------------------------------------------------------------------------
 // TCP
@@ -245,4 +253,221 @@ export @symbol("bit_rt_port_net_write_sock") fn netWriteSock(fd: int, buf: *u8, 
     return 0 - 1
   }
   return off
+}
+
+// ---------------------------------------------------------------------------
+// Deadline-bounded connect/read/write (#2291)
+// ---------------------------------------------------------------------------
+//
+// A server that completes the handshake (or accepts) and then never writes
+// parks `netReadSock`/`netDialTcp` above forever — nothing bounds
+// `netAwaitReady`'s park. These siblings bound the wait instead, resolving
+// ONE absolute monotonic deadline before the first poll and never restarting
+// it — the same shape `runtime/root/*/os.bit`'s `osForkExecWaitBounded`
+// documents at ABI.md §19. Byte-for-byte mirror of ../darwin/tcp.bit's
+// section of the same name; see there for the full rationale, including why
+// this does not touch `runtime/sched/**` to add a poll/timer race primitive.
+//
+// NO GC BRACKET, for the same reason as the Darwin twin: every syscall here
+// (`read`/`write`/`connect`) runs on the non-blocking sockets this provider
+// always creates (`SOCK_NONBLOCK` at `netSysSocket`/`accept4`), so each
+// returns immediately rather than holding the OS thread in the kernel. The
+// actual wait is `schedSleepUntil`, a cooperative park.
+
+// timespec scratch `netClockNowNs` reads `parkMonoNs` into — module-level and
+// unlocked, the same single-worker-per-call sharing contract `../../park/linux`'s
+// own scratch buffers document. A scalar array, never scanned (rule 1).
+let netClockScratch: [2]i64
+
+// Poll interval while waiting for readiness or the deadline, whichever comes
+// first: 2ms, the same value `runtime/root/*/os.bit`'s `osPollNs` uses for an
+// analogous bounded wait.
+const netDeadlinePollNs: int = 2000000
+
+// Ceiling on how far past "now" a deadline is honoured: one hour, matching
+// `os_run_bounded_max_ms` (ABI.md §19) — a caller typo (nanoseconds where
+// milliseconds was meant, say) must not reinstate an unbounded wait.
+const netDeadlineMaxWaitNs: int = 3600000000000
+
+// Worst-case iterations of the retry loops below: the wait ceiling divided by
+// the poll interval, plus slack (Power of 10 rule 2, no `while (true)`) — the
+// monotonic-deadline check inside each loop is what actually ends every real
+// call, well before this bound is reached.
+const netDeadlineMaxPolls: int = netDeadlineMaxWaitNs / netDeadlinePollNs + 16
+
+// The deadline elapsed before the operation completed — `osForkExecWaitBounded`'s
+// `-2` "timed out" sentinel, reused here for the same reason: one convention
+// for "a bounded wait gave up" across the runtime.
+const netDeadlineTimedOut: int = 0 - 2
+
+// The monotonic clock these deadlines are measured against — `runtime/park/linux`'s
+// `parkMonoNs`, the same clock `std/time`'s `monotonic()` reaches.
+fn netClockNowNs(): int {
+  return parkMonoNs(ptrOf(netClockScratch))
+}
+
+// The deadline a bounded call actually waits against: `deadlineNs <= 0` is
+// `std/net`'s "no deadline" sentinel (a `Conn`'s zero value) and clamps to
+// `netDeadlineMaxWaitNs` from now rather than truly forever, for the same
+// reason `os_run_bounded_max_ms` clamps a caller's `timeoutMs`. A deadline
+// already in the past clamps up to `now`, so the very first check reports the
+// timeout instead of the loop spinning on a negative budget.
+fn netClampDeadline(deadlineNs: int, now: int): int {
+  let cap = now + netDeadlineMaxWaitNs
+  if (deadlineNs <= 0 || deadlineNs > cap) {
+    return cap
+  }
+  if (deadlineNs < now) {
+    return now
+  }
+  return deadlineNs
+}
+
+// Wait a short, bounded slice toward `deadlineNs`, or report there was nobody
+// to wait on — mirrors `netAwaitReady`'s `false` contract for an unscheduled
+// caller (a driver program the scheduler is not running), so that caller's
+// own `polls` bound below still protects it; there is no cooperative sleep
+// without a scheduler to drive `schedTimerExpire`; retrying tightly is thus
+// the correct fallback, and it can never run past `deadlineNs` because the
+// caller checks the clock again on every iteration.
+fn netAwaitDeadlineTick(deadlineNs: int): bool {
+  let taskAddr = schedCurrentTask()
+  if (taskAddr == 0) {
+    return false
+  }
+  let now = netClockNowNs()
+  let wake = now + netDeadlinePollNs
+  if (wake > deadlineNs) {
+    wake = deadlineNs
+  }
+  schedSleepUntil(wake)
+  return true
+}
+
+// Read up to `cap` bytes into `buf`, bounded by `deadlineNs` (absolute
+// monotonic ns) rather than parking forever. Same three-way result shape as
+// `osForkExecWaitBounded`: `n >= 0` bytes read (`0` — the peer closed, an
+// orderly end of stream, exactly as `netReadSock` reports it), `-1` a hard
+// I/O error, `-2` (`netDeadlineTimedOut`) the deadline elapsed first.
+export @symbol("bit_rt_port_net_read_sock_deadline") fn netReadSockDeadline(fd: int, buf: *u8, cap: int, deadlineNs: int): int {
+  let deadline = netClampDeadline(deadlineNs, netClockNowNs())
+  let polls = 0
+  while (polls < netDeadlineMaxPolls) {
+    polls = polls + 1
+    let n = sysRc(int(syscall(sysRead(), i64(fd), i64(int(buf)), i64(cap))))
+    if (n >= 0) {
+      return n
+    }
+    let e = lastErr()
+    if (e == eAgain()) {
+      if (netClockNowNs() >= deadline) {
+        return netDeadlineTimedOut
+      }
+      let _ = netAwaitDeadlineTick(deadline)
+    } else if (e == eIntr()) {
+      // Interrupted; retry immediately, same as `netReadSock`.
+    } else if (e == eConnReset()) {
+      return 0
+    } else {
+      return 0 - 1
+    }
+  }
+  if (netClockNowNs() >= deadline) {
+    return netDeadlineTimedOut
+  }
+  return 0 - 1
+}
+
+// Write all `n` bytes of `buf`, bounded by `deadlineNs`. Same result shape as
+// `netReadSockDeadline`: `>= 0` bytes written (always `n` on success — a
+// short write is retried internally, exactly as `netWriteSock` does), `-1` a
+// hard error, `-2` the deadline elapsed first.
+export @symbol("bit_rt_port_net_write_sock_deadline") fn netWriteSockDeadline(fd: int, buf: *u8, n: int, deadlineNs: int): int {
+  let deadline = netClampDeadline(deadlineNs, netClockNowNs())
+  let off = 0
+  let polls = 0
+  while (off < n && polls < netDeadlineMaxPolls) {
+    polls = polls + 1
+    let wrote = sysRc(int(syscall(sysWrite(), i64(fd), i64(int(buf + off)), i64(n - off))))
+    if (wrote > 0) {
+      off = off + wrote
+    } else if (wrote == 0) {
+      return 0 - 1
+    } else {
+      let e = lastErr()
+      if (e == eAgain()) {
+        if (netClockNowNs() >= deadline) {
+          return netDeadlineTimedOut
+        }
+        let _ = netAwaitDeadlineTick(deadline)
+      } else if (e != eIntr()) {
+        return 0 - 1
+      }
+    }
+  }
+  if (off < n) {
+    if (netClockNowNs() >= deadline) {
+      return netDeadlineTimedOut
+    }
+    return 0 - 1
+  }
+  return off
+}
+
+// Connect to `host:port`, bounded by `deadlineNs`. Same shape as
+// `netDialTcp` above (SO_ERROR read back only once the handshake has
+// completed one way or the other — see that function's comment for why),
+// with the unbounded spin loop there replaced by a deadline check.
+export @symbol("bit_rt_port_net_dial_tcp_deadline") fn netDialTcpDeadline(host: *u8, hostLen: int, port: int, deadlineNs: int): int {
+  let deadline = netClampDeadline(deadlineNs, netClockNowNs())
+  let ip = ipBytes()
+  if (!netParseIpv4(host, hostLen, ip)) {
+    return 0 - 1
+  }
+  let fd = netSysSocket(false)
+  if (fd < 0) {
+    return 0 - 1
+  }
+  netFillSockAddr(saBytes(), ip, port)
+  let rc = sysRc(int(syscall(sysConnect(), i64(fd), i64(int(saBytes())), i64(saLen))))
+  if (rc >= 0) {
+    return fd
+  }
+  let e = lastErr()
+  if (e != eInProgress() && e != eAgain() && e != eIntr()) {
+    netClose(fd)
+    return 0 - 1
+  }
+  let polls = 0
+  while (polls < netDeadlineMaxPolls) {
+    polls = polls + 1
+    if (netClockNowNs() >= deadline) {
+      netClose(fd)
+      return netDeadlineTimedOut
+    }
+    let _ = netAwaitDeadlineTick(deadline)
+    // THE ADDRESS IS REBUILT EVERY ATTEMPT — see `netDialTcp`'s identical
+    // comment; `netAwaitDeadlineTick` parks, so another task can leave its own
+    // address in the shared `saBytes()`/`ipBytes()` scratch meanwhile.
+    if (!netParseIpv4(host, hostLen, ip)) {
+      netClose(fd)
+      return 0 - 1
+    }
+    netFillSockAddr(saBytes(), ip, port)
+    let rc2 = sysRc(int(syscall(sysConnect(), i64(fd), i64(int(saBytes())), i64(saLen))))
+    let ce = lastErr()
+    if (rc2 >= 0 || ce == eIsConn()) {
+      if (netSocketError(fd) != 0) {
+        netClose(fd)
+        return 0 - 1
+      }
+      return fd
+    }
+    if (ce != eAlready() && ce != eInProgress() && ce != eIntr()) {
+      netClose(fd)
+      return 0 - 1
+    }
+  }
+  netClose(fd)
+  return 0 - 1
 }
