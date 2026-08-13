@@ -156,6 +156,13 @@ export struct TlsServerHandshake {
   chs: []byte,
   shs: []byte,
   serverReadKeys: RecordKeys,
+  // The record-write keys under `shs`, set for real by `srvSendServerFlight`
+  // the moment it actually seals the auth flight with them — placeholder
+  // `dummy` (same as `serverReadKeys`/`earlyReadKeys`) until then. A
+  // post-flight fail-and-close alert (#2955) reuses this SAME object rather
+  // than re-deriving one from `shs`, so its sequence number continues from
+  // the auth flight's rather than restarting at an already-spent nonce.
+  hsWriteKeys: RecordKeys,
   master: []byte,
   sapSecret: []byte,
   capSecret: []byte,
@@ -206,6 +213,7 @@ export fn tlsServerStartExts(config: TlsServerConfig, extraExts: []Extension): T
     chs: []byte(0),
     shs: []byte(0),
     serverReadKeys: dummy,
+    hsWriteKeys: dummy,
     master: []byte(0),
     sapSecret: []byte(0),
     capSecret: []byte(0),
@@ -235,10 +243,13 @@ fn srvClientHelloIndex(records: [][]byte): int! {
     idx = idx + 1
   }
   if (idx >= len(records)) {
-    fail newError("tls server: client flight has no ClientHello")
+    fail tlsAlertFail{ desc: alertUnexpectedMessage, msg: "tls server: client flight has no ClientHello" }
   }
   if (tlsWireRecordType(records[idx]) != recordHandshake) {
-    fail newError("tls server: expected a plaintext handshake record for ClientHello")
+    fail tlsAlertFail{
+      desc: alertUnexpectedMessage,
+      msg: "tls server: expected a plaintext handshake record for ClientHello",
+    }
   }
   return idx
 }
@@ -267,7 +278,10 @@ fn (s: TlsServerHandshake) srvNegotiate(chMsg: []byte): srvNegotiation! {
   let shared = srvSelectShared(s.config.groups, shares)
   if (!shared.ok) {
     if (s.usedHrr) {
-      fail newError("tls server: client did not share an acceptable group after HelloRetryRequest")
+      fail tlsAlertFail{
+        desc: alertHandshakeFailure,
+        msg: "tls server: client did not share an acceptable group after HelloRetryRequest",
+      }
     }
     return srvNegotiation{ retry: true, supported: supported, ch: ch, sel: shared }
   }
@@ -319,10 +333,13 @@ fn srvCheckTls13(ch: ClientHello): ()! {
           return
         }
       }
-      fail newError("tls server: client does not offer TLS 1.3")
+      fail tlsAlertFail{ desc: alertProtocolVersion, msg: "tls server: client does not offer TLS 1.3" }
     }
   }
-  fail newError("tls server: ClientHello has no supported_versions extension")
+  fail tlsAlertFail{
+    desc: alertProtocolVersion,
+    msg: "tls server: ClientHello has no supported_versions extension",
+  }
 }
 
 // The first server-preferred suite in `pref` that the client offered.
@@ -334,7 +351,7 @@ fn srvNegotiateSuite(pref: []int, offered: []int): CipherSuite! {
       }
     }
   }
-  fail newError("tls server: no cipher suite in common with the client")
+  fail tlsAlertFail{ desc: alertHandshakeFailure, msg: "tls server: no cipher suite in common with the client" }
 }
 
 // The client's key_share entries.
@@ -344,7 +361,7 @@ fn srvClientKeyShares(ch: ClientHello): []KeyShareEntry! {
       return parseKeyShareClient(e)?
     }
   }
-  fail newError("tls server: ClientHello has no key_share extension")
+  fail tlsAlertFail{ desc: alertMissingExtension, msg: "tls server: ClientHello has no key_share extension" }
 }
 
 // The group codepoints the client advertised in supported_groups.
@@ -354,7 +371,10 @@ fn srvClientGroups(ch: ClientHello): []int! {
       return parseSupportedGroups(e)?
     }
   }
-  fail newError("tls server: ClientHello has no supported_groups extension")
+  fail tlsAlertFail{
+    desc: alertMissingExtension,
+    msg: "tls server: ClientHello has no supported_groups extension",
+  }
 }
 
 // The outcome of group selection: whether a shared group was found, and if so the
@@ -392,7 +412,10 @@ fn (s: TlsServerHandshake) srvBuildHelloRetry(chMsg: []byte, supported: []int): 
     }
   }
   if (target < 0) {
-    fail newError("tls server: no key-exchange group in common with the client")
+    fail tlsAlertFail{
+      desc: alertHandshakeFailure,
+      msg: "tls server: no key-exchange group in common with the client",
+    }
   }
 
   let ksData = tlsHsPutU16([]byte(0), target)
@@ -520,6 +543,7 @@ fn (s: TlsServerHandshake) srvSendServerFlight(
 ): TlsServerStep! {
   let fl = s.srvBuildServerFlight(ch, sel)?
   let writeKeys = newRecordKeys(s.suite, s.shs)?
+  s.hsWriteKeys = writeKeys
   let sealed = writeKeys.seal(fl.authFlight, recordHandshake)?
   let outbound = tlsHsPutBytes(tlsWirePlaintextRecord(recordHandshake, fl.serverHello), sealed)
   return TlsServerStep{ retry: false, outbound: outbound }
@@ -553,9 +577,11 @@ fn (s: TlsServerHandshake) srvEncryptedExtensions(ch: ClientHello): []byte! {
 // failure: RFC 7301 §3.2 says the server SHALL abort with a fatal
 // `no_application_protocol` alert. Returning "" there instead would silently
 // downgrade the connection to the fallback protocol and serve the client anyway
-// — which is exactly the bug this closes. This stack aborts a handshake by
-// failing (it sends no outbound alerts); the load-bearing guarantee is that a
-// disjoint offer never completes the handshake.
+// — which is exactly the bug this closes. Failing here tags the error with
+// that AlertDescription (`tlsAlertFail`, `alert.bit`); `tlsapiDriveServer`
+// (`tls.bit`) sends it as a real plaintext Alert record before the socket
+// closes (#2955) — the load-bearing guarantee is that a disjoint offer never
+// completes the handshake, on the wire as well as locally.
 fn (s: TlsServerHandshake) srvSelectAlpn(ch: ClientHello): string! {
   // A server that advertises no ALPN protocols does not negotiate ALPN at all:
   // it ignores the client's extension and proceeds. RFC 7301's abort applies
@@ -573,7 +599,10 @@ fn (s: TlsServerHandshake) srvSelectAlpn(ch: ClientHello): string! {
           }
         }
       }
-      fail newError("tls server: no application protocol in common (RFC 7301 no_application_protocol)")
+      fail tlsAlertFail{
+        desc: alertNoApplicationProtocol,
+        msg: "tls server: no application protocol in common (RFC 7301 no_application_protocol)",
+      }
     }
   }
   // No ALPN extension from the client: nothing to negotiate, proceed.
@@ -617,7 +646,7 @@ fn (s: TlsServerHandshake) srvFinishFromMessage(finMsg: []byte): TlsServerConn! 
   // EndOfEarlyData here when 0-RTT was accepted (#1209).
   let expected = finishedMac(mk, s.chs, s.srvTh())
   if (!ctEq(fin.verifyData, expected)) {
-    fail newError("tls server: client Finished MAC is invalid")
+    fail tlsAlertFail{ desc: alertDecryptError, msg: "tls server: client Finished MAC is invalid" }
   }
 
   s.transcript = tlsHsPutBytes(s.transcript, finMsg)
@@ -655,15 +684,23 @@ export fn (s: TlsServerHandshake) processClientFinished(flight: []byte): TlsServ
     if (tlsWireRecordType(rec) == tlsCcsType) {
       continue
     }
-    let pt = s.serverReadKeys.open(rec)?
+    let pt = s.serverReadKeys.open(rec) catch e {
+      fail tlsAlertFail{
+        desc: alertBadRecordMac,
+        msg: "tls server: client Finished record failed authentication: ${e.message()}",
+      }
+    }
     if (pt.contentType != recordHandshake) {
-      fail newError("tls server: expected a handshake record for the client Finished")
+      fail tlsAlertFail{
+        desc: alertUnexpectedMessage,
+        msg: "tls server: expected a handshake record for the client Finished",
+      }
     }
     finMsg = pt.content
     got = true
   }
   if (!got) {
-    fail newError("tls server: client flight has no Finished record")
+    fail tlsAlertFail{ desc: alertUnexpectedMessage, msg: "tls server: client flight has no Finished record" }
   }
   return s.srvFinishFromMessage(finMsg)?
 }
