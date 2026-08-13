@@ -1,6 +1,5 @@
 import * as path from "path";
 import * as fs from "fs";
-import { execFile } from "child_process";
 import * as vscode from "vscode";
 import {
   ExecutableOptions,
@@ -64,16 +63,6 @@ function startClient(bitPath: string): LanguageClient {
   return c;
 }
 
-/** Runs `bit fmt <file>` on disk, then lets VS Code's file watcher pick up the rewrite. */
-function formatOnSave(bitPath: string, doc: vscode.TextDocument): void {
-  if (doc.languageId !== "bit") return;
-  if (!vscode.workspace.getConfiguration("bit").get<boolean>("formatOnSave", true)) return;
-
-  execFile(bitPath, ["fmt", doc.uri.fsPath], (err: Error | null, _stdout: string, stderr: string) => {
-    if (err) output?.appendLine(`bit fmt failed for ${doc.uri.fsPath}: ${stderr || err.message}`);
-  });
-}
-
 export function activate(context: vscode.ExtensionContext): void {
   output = vscode.window.createOutputChannel("Bit Language Server", { log: true });
   context.subscriptions.push(output);
@@ -88,10 +77,6 @@ export function activate(context: vscode.ExtensionContext): void {
 
   client = startClient(bitPath);
   context.subscriptions.push({ dispose: () => void client?.stop() });
-
-  context.subscriptions.push(
-    vscode.workspace.onDidSaveTextDocument((doc) => formatOnSave(bitPath, doc)),
-  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("bit.restartServer", async () => {
