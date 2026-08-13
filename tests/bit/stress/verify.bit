@@ -24,13 +24,31 @@ struct Text { ok: bool, body: string }
 struct Marker { present: bool, reason: string }
 
 // One execution's verdict. `statsOk` is separate from `collections` for the
-// reason the header gives: absent and zero are different answers.
-struct Outcome { ok: bool, statsOk: bool, collections: int, abandoned: int }
+// reason the header gives: absent and zero are different answers. `timedOut`
+// is separate from `ok` for the reason #2401 exists: a program the deadline
+// (even load-scaled) could not judge is not the same claim as a program that
+// ran and was wrong, and `checkProgram` must not fold them into one bucket.
+struct Outcome { ok: bool, statsOk: bool, collections: int, abandoned: int, timedOut: bool }
+
+// The build step's own verdict, symmetric with `Outcome` for the same reason:
+// a compile can miss the (load-scaled) deadline exactly as a run can.
+struct BuildResult { ok: bool, timedOut: bool }
 
 // One program's verdict. `oracled` marks a program the collection oracle applies
 // to at all; `proved` marks one whose stress count cleared `stressRatio`, which
-// is what `main`'s corpus-wide plumbing assertion counts.
-struct Verdict { failed: int, oracled: bool, proved: bool }
+// is what `main`'s corpus-wide plumbing assertion counts. `inconclusive` (#2401)
+// marks a program the deadline could not judge at all, even after load-scaling —
+// counted separately from `failed` in `main`'s denominator so a busy-host
+// timeout never reads as the same claim as a wrong answer.
+struct Verdict { failed: int, inconclusive: int, oracled: bool, proved: bool }
+
+// The shared "this program's verdict is bad" constructor for every early-return
+// site in `checkProgram`: `timedOut` routes the outcome to `inconclusive`
+// instead of `failed` (#2401) — every other failure reason is unchanged.
+fn badVerdict(timedOut: bool): Verdict {
+  if (timedOut) { return Verdict{ failed: 0, inconclusive: 1, oracled: false, proved: false } }
+  return Verdict{ failed: 1, inconclusive: 0, oracled: false, proved: false }
+}
 
 // --- files ------------------------------------------------------------------
 
@@ -106,11 +124,108 @@ fn runMsg(r: int): string {
   return "exited " + num(r)
 }
 
-// Write `body` as an executable `/bin/sh` script and run it under the deadline.
+// --- load-scaled deadline (#2401) -------------------------------------------
+//
+// `cx.timeoutMs` is a wall picked against an idle host. Under concurrent load
+// the same work takes proportionally longer, and a program can be entirely
+// correct yet still miss a fixed wall: #2401 measured `quicwire` at 485s
+// against the 300s default with six agents building (load average 39.48),
+// output byte-identical to `.expected` when re-run alone. Raising the constant
+// only moves the same failure to a higher load; it does not remove it.
+//
+// So the DEADLINE ITSELF scales with observed load, sampled fresh before every
+// bounded subprocess. `loadProbe` shells out to `uptime`/`getconf` (the same
+// idiom `scripts/arm64gate.sh` already uses for its own load reading) and turns
+// load-average-over-core-count into an integer multiplier, capped at
+// `loadScaleCap` so the bound stays a bound rather than becoming unbounded. At
+// an idle-relative load (at or under the core count) the multiplier is 1 and
+// the wall is exactly what it always was — this is a SCALE, not a raise: a
+// program whose own baseline runtime already exceeds the wall on a quiet host
+// (tracked separately, #2210) is not rescued by this, and must not be — that
+// is a different defect with a different, already-decided fix (a per-program
+// override, #2695/#2696), not something this ticket may paper over.
+const loadScaleCap: int = 8
+
+// The probe is local and near-instant (`uptime`, `getconf`, one `awk`); it gets
+// a small FIXED bound of its own, never `cx.timeoutMs` — a probe that could
+// itself hang would defeat the exact thing it exists to protect.
+const loadProbeTimeoutMs: int = 5000
+
+// One load sample: the multiplier `runScript` applies to the base deadline, and
+// the raw load-average text for the TIMED OUT message. Never fatal to obtain —
+// any failure of the probe (missing `uptime`/`getconf`, malformed output, the
+// probe itself timing out) falls back to `scale: 1`, exactly the pre-#2401
+// fixed wall, so a broken PROBE can only ever fail closed to the old behaviour,
+// never open into an unbounded one.
+struct LoadProbe { scale: int, text: string }
+
+// A strict unsigned-decimal parse: any non-digit, or an empty string, is -1
+// rather than a partial value silently accepted — a load probe that starts
+// returning garbage must fall back to scale 1, not misparse into a wild one.
+fn parseIntStrict(s: string): int {
+  if (len(s) == 0) { return -1 }
+  let v = 0
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] < 48 || s[i] > 57) { return -1 }
+    v = v * 10 + int(s[i]) - 48
+    i = i + 1
+  }
+  return v
+}
+
+fn loadProbe(cx: Ctx): LoadProbe {
+  let fallback = LoadProbe{ scale: 1, text: "unknown" }
+  let outPath = cx.scratch + "/loadprobe.out"
+  let scriptPath = cx.scratch + "/loadprobe.sh"
+  // `getconf _NPROCESSORS_ONLN` and `uptime`'s load-average field are both
+  // POSIX-portable across macOS and Linux; `load averages*:` (zero or more
+  // literal 's') matches macOS's plural "averages:" and Linux's singular
+  // "average:" in one pattern, and the `[ ,]+` field split absorbs Linux's
+  // comma-separated triple so the first field never carries a trailing comma.
+  // Any parse failure on either side falls back to a safe default (1 core, 0
+  // load) rather than aborting - a mangled reading must scale DOWN toward the
+  // old fixed behaviour, never up into something unverifiable.
+  let body = "#!/bin/sh\n" +
+    "cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null)\n" +
+    "case \"$cores\" in ''|*[!0-9]*) cores=1 ;; esac\n" +
+    "load=$(uptime 2>/dev/null | sed -n 's/.*load averages*: *//p' | awk -F'[ ,]+' '{print $1}')\n" +
+    "case \"$load\" in ''|*[!0-9.]*) load=0 ;; esac\n" +
+    "awk -v l=\"$load\" -v c=\"$cores\" -v cap=" + num(loadScaleCap) +
+    " 'BEGIN{r=l/c; s=int(r); if(r>s)s++; if(s<1)s=1; if(s>cap)s=cap; printf \"%d %s\\n\", s, l}' > " +
+    shQuote(outPath) + "\n"
+  if (!writeText(scriptPath, body)) { return fallback }
+  if (fsChmod(scriptPath, 493) != 0) { return fallback }
+  if (osRunBounded(scriptPath, loadProbeTimeoutMs) != 0) { return fallback }
+  let t = readText(outPath)
+  if (!t.ok) { return fallback }
+  let line = trim(t.body)
+  let sp = indexOfAt(line, " ", 0)
+  if (sp < 0) { return fallback }
+  let scale = parseIntStrict(line[0:sp])
+  if (scale < 1) { return fallback }
+  let text = trim(line[sp + 1:])
+  if (len(text) == 0) { text = "unknown" }
+  return LoadProbe{ scale: scale, text: text }
+}
+
+// Write `body` as an executable `/bin/sh` script and run it under a deadline
+// scaled by CURRENTLY observed host load (#2401). A timeout is reported here,
+// once, with the scale and the load average that produced the deadline - every
+// caller's own "TIMED OUT" message (via `runMsg`) still separately names the
+// program and the phase, unchanged.
 fn runScript(cx: Ctx, path: string, body: string): int {
   if (!writeText(path, body)) { die("cannot write wrapper script " + path) }
   if (fsChmod(path, 493) != 0) { die("cannot chmod wrapper script " + path) }
-  return osRunBounded(path, cx.timeoutMs)
+  let probe = loadProbe(cx)
+  let effMs = cx.timeoutMs * probe.scale
+  if (effMs > clampTimeoutMs) { effMs = clampTimeoutMs }
+  let r = osRunBounded(path, effMs)
+  if (r == -2) {
+    say("stress: TIMED OUT after " + num(effMs / 1000) + "s (base " + num(cx.timeoutMs / 1000) +
+      "s x" + num(probe.scale) + " load scale; host load average " + probe.text + " at launch)")
+  }
+  return r
 }
 
 // --- one program ------------------------------------------------------------
@@ -119,7 +234,7 @@ fn runScript(cx: Ctx, path: string, body: string): int {
 // archive and stdlib so the harness is independent of its working directory, and
 // a whole-PROJECT build (not a single module) is what `tests/stress/spinlock`
 // needs: it imports the lock under test straight out of `runtime/`.
-fn buildProgram(cx: Ctx, name: string, dir: string, bin: string): bool {
+fn buildProgram(cx: Ctx, name: string, dir: string, bin: string): BuildResult {
   let base = cx.scratch + "/" + name
   let errPath = base + ".berr"
   let body = "#!/bin/sh\n" +
@@ -128,11 +243,11 @@ fn buildProgram(cx: Ctx, name: string, dir: string, bin: string): bool {
     " exec " + shQuote(cx.compiler) + " build " + shQuote(dir) + " -o " + shQuote(bin) +
     " >" + shQuote(base + ".bout") + " 2>" + shQuote(errPath) + "\n"
   let r = runScript(cx, base + ".build.sh", body)
-  if (r == 0) { return true }
+  if (r == 0) { return BuildResult{ ok: true, timedOut: false } }
   say("stress '" + name + "' [compile]: " + runMsg(r))
   let e = readText(errPath)
   if (e.ok) { say(trim(e.body)) }
-  return false
+  return BuildResult{ ok: false, timedOut: r == -2 }
 }
 
 // One execution. `envLine` is the environment prefix the wrapper applies; it is
@@ -150,29 +265,30 @@ fn runOnce(cx: Ctx, name: string, bin: string, slot: string, label: string, envL
     envLine + " exec " + shQuote(bin) +
     " >" + shQuote(outPath) + " 2>" + shQuote(errPath) + "\n"
   let r = runScript(cx, base + ".run.sh", body)
+  let timedOut = r == -2
 
   let errText = readText(errPath)
   if (!errText.ok) {
     say("stress '" + name + "' [" + label + "]: could not read captured stderr " + errPath +
       " - the wrapper never ran, so nothing about this program was verified")
-    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
+    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: timedOut }
   }
   if (r != 0) {
     say("stress '" + name + "' [" + label + "]: " + runMsg(r))
     say("stderr: " + trim(errText.body))
-    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
+    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: timedOut }
   }
 
   let outText = readText(outPath)
   if (!outText.ok) {
     say("stress '" + name + "' [" + label + "]: could not read captured stdout " + outPath)
-    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
+    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: false }
   }
   if (outText.body != expected) {
     say("stress '" + name + "' [" + label + "]: output mismatch")
     say("  expected: " + trim(expected))
     say("  got:      " + trim(outText.body))
-    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
+    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: false }
   }
 
   // Both runs carry `BIT_GC_STATS=1`, so the aggregate line must be there in
@@ -187,29 +303,28 @@ fn runOnce(cx: Ctx, name: string, bin: string, slot: string, label: string, envL
       say("  environment never reached the child or the capture is broken. Either way")
       say("  the collector oracle below would read every field as absent. A program that")
       say("  replaces the runtime's own exit path declares that with a 'no-stats' file.")
-      return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
+      return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: false }
     }
-    return Outcome{ ok: true, statsOk: false, collections: -1, abandoned: -1 }
+    return Outcome{ ok: true, statsOk: false, collections: -1, abandoned: -1, timedOut: false }
   }
   let collections = statsField(errText.body, "collections=")
   let abandoned = statsField(errText.body, "abandoned=")
   if (collections < 0 || abandoned < 0) {
     say("stress '" + name + "' [" + label + "]: malformed stats line in " + errPath)
-    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
+    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: false }
   }
-  return Outcome{ ok: true, statsOk: true, collections: collections, abandoned: abandoned }
+  return Outcome{ ok: true, statsOk: true, collections: collections, abandoned: abandoned, timedOut: false }
 }
 
 // Both policies for one program, plus the oracles the second run must satisfy.
 // Returns 1 on failure, 0 on success.
 fn checkProgram(cx: Ctx, name: string, dir: string): Verdict {
-  let bad = Verdict{ failed: 1, oracled: false, proved: false }
   let expected = readText(dir + "/" + name + ".expected")
   if (!expected.ok) {
     // A hard error, never a skip: a rename would otherwise delete a program from
     // the corpus in silence.
     say("stress '" + name + "': cannot read " + dir + "/" + name + ".expected")
-    return bad
+    return badVerdict(false)
   }
 
   let noCollect = readMarker(name, dir, "no-collect")
@@ -223,11 +338,12 @@ fn checkProgram(cx: Ctx, name: string, dir: string): Verdict {
   let noStats = readMarker(name, dir, "no-stats")
 
   let bin = cx.scratch + "/bin-" + name
-  if (!buildProgram(cx, name, dir, bin)) { return bad }
+  let build = buildProgram(cx, name, dir, bin)
+  if (!build.ok) { return badVerdict(build.timedOut) }
 
   let base = "default"
   let first = runOnce(cx, name, bin, "a", base, "BIT_GC_STATS=1", expected.body, !noStats.present)
-  if (!first.ok) { fsRemove(bin); return bad }
+  if (!first.ok) { fsRemove(bin); return badVerdict(first.timedOut) }
 
   let label = "BIT_GC=stress"
   let envLine = "BIT_GC=stress BIT_GC_STATS=1"
@@ -241,8 +357,8 @@ fn checkProgram(cx: Ctx, name: string, dir: string): Verdict {
   }
   let second = runOnce(cx, name, bin, "b", label, envLine, expected.body, !noStats.present)
   fsRemove(bin)
-  if (!second.ok) { return bad }
-  if (!second.statsOk) { return Verdict{ failed: 0, oracled: false, proved: false } }
+  if (!second.ok) { return badVerdict(second.timedOut) }
+  if (!second.statsOk) { return Verdict{ failed: 0, inconclusive: 0, oracled: false, proved: false } }
 
   // `BIT_GC=off` collects nothing BY DEFINITION, so a non-zero count here means
   // the policy in the wrapper is not the policy the child ran under. The waived
@@ -251,9 +367,9 @@ fn checkProgram(cx: Ctx, name: string, dir: string): Verdict {
     if (second.collections != 0) {
       say("stress '" + name + "' [" + label + "]: " + num(second.collections) +
         " collections under BIT_GC=off. The policy in the wrapper did not reach the child.")
-      return bad
+      return badVerdict(false)
     }
-    return Verdict{ failed: 0, oracled: false, proved: false }
+    return Verdict{ failed: 0, inconclusive: 0, oracled: false, proved: false }
   }
 
   let oracled = !noCollect.present
@@ -264,7 +380,7 @@ fn checkProgram(cx: Ctx, name: string, dir: string): Verdict {
       say("  nothing about rooting. Give the program a loop where the roots it cares about are")
       say("  live, or - if it proves something about emission or linking rather than rooting -")
       say("  add a 'no-collect' file to its directory stating why.")
-      return bad
+      return badVerdict(false)
     }
     // The policy differential, and the reason it is reported rather than
     // enforced HERE. Allocation-driven programs clear `stressRatio` by two to
@@ -292,7 +408,7 @@ fn checkProgram(cx: Ctx, name: string, dir: string): Verdict {
     say("  program's 'no-abandon' marker says none may be. Something stayed in the mutator")
     say("  registry as 'running' that should not have - usually an OS thread that exited")
     say("  without its slot being released (ABI.md §6).")
-    return bad
+    return badVerdict(false)
   }
-  return Verdict{ failed: 0, oracled: oracled, proved: proved }
+  return Verdict{ failed: 0, inconclusive: 0, oracled: oracled, proved: proved }
 }
