@@ -1588,10 +1588,17 @@ Same fork+exec as `os_run`, but the parent polls `waitpid(WNOHANG)` on a
 clock (`sched.monoNs`, ABI.md §18's layer) against a deadline resolved from
 `timeout_ms` once, before the first poll — the same "one absolute deadline,
 not a per-iteration timeout" shape the harnesses use, so a chatty or
-CPU-bound child cannot restart the clock. If the deadline elapses before the
-child exits, the parent `SIGKILL`s it and reaps it before returning, so a timed-
-out call never leaves a zombie or a stray process. Result encoding (three
-outcomes in one `i64`, no separate signal channel):
+CPU-bound child cannot restart the clock. The child is placed in its own
+process group (`setpgid`, both sides, immediately after fork — the standard
+race-free idiom) with pgid equal to its own pid, so anything it or a wrapper
+it execs (e.g. a harness's `/bin/sh` script) later forks inherits that same
+group unless it detaches on its own. **If the deadline elapses before the
+child exits, the parent `SIGKILL`s the whole group, not just the direct
+child, and reaps the direct child before returning** (#2986: a single-pid
+kill left a grandchild — a compile the direct child's wrapper shell had
+spawned — running indefinitely, reparented to pid 1, after the timeout had
+already been reported). Result encoding (three outcomes in one `i64`, no
+separate signal channel):
 
 ```
  >= 0     child exited normally with this code (0-255)
