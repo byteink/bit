@@ -510,21 +510,68 @@ export fn (l: TlsListener) close() {
   l.ln.close()
 }
 
+// The AlertDescription (RFC 8446 §6.2) a caught handshake error carries, if
+// one of `server.bit`'s own fail-and-close sites tagged it (`tlsAlertFail`,
+// `alert.bit`); otherwise `handshake_failure` — the generic "could not
+// negotiate an acceptable set of parameters" alert (RFC 8446 §4.1.1), the
+// safe default for a failure this driver did not itself originate (e.g. a
+// parse or crypto error surfacing from a shared helper) and so has no
+// business naming more precisely.
+fn tlsapiAlertDescOf(e: error): int {
+  let (tagged, ok) = e.(tlsAlertFail)
+  if (ok) {
+    return tagged.desc
+  }
+  return alertHandshakeFailure
+}
+
+// Best-effort: write one already-framed Alert record to `conn` and return,
+// never failing the caller. One write, no retry, no loop — the same bound
+// every other record this module writes to the same peer already has
+// (`std/net` has no write deadline; a peer that could wedge this write could
+// already wedge the ServerHello write on the handshake's success path). A
+// failed write is swallowed here, not surfaced: the caller's own handshake
+// error is what must reach `accept()`'s caller, and a secondary transport
+// error from this best-effort send must never replace or block it.
+fn tlsapiSendAlert(conn: NetConn, rec: []byte) {
+  conn.write(string(rec)) catch e {
+    return
+  }
+}
+
 // Drive the server handshake: read the ClientHello flight, answer it (a
 // HelloRetryRequest loops back for the next ClientHello), then read and verify
 // the client Finished flight. Bounded to the ClientHello, one retry, and the
 // Finished.
+//
+// A failure while processing the ClientHello (negotiation, ALPN, signing —
+// #2955) happens before this endpoint's own flight has reached the wire, so
+// the peer holds no handshake traffic key yet: the alert is sent plaintext.
+// A failure while processing the client Finished happens after the sealed
+// auth flight was already written below, so the peer already derived the
+// handshake-traffic keys from it: the alert is sealed under the very same
+// `RecordKeys` (`s.hsWriteKeys`) that sealed that flight, continuing its
+// sequence rather than restarting one at an already-spent nonce.
 fn tlsapiDriveServer(f: tlsapiFramer, config: TlsServerConfig): TlsServerConn! {
   let s = tlsServerStart(config)?
   let guard = 0
   while (guard < 4) {
     guard = guard + 1
     let chFlight = tlsapiReadMessageFlight(f)?
-    let step = s.processClientHello(chFlight)?
+    let step = s.processClientHello(chFlight) catch e {
+      tlsapiSendAlert(f.conn, tlsAlertPlaintextRecord(tlsapiAlertDescOf(e)))
+      fail e
+    }
     f.conn.write(string(step.outbound))?
     if (!step.retry) {
       let finFlight = tlsapiReadMessageFlight(f)?
-      return s.processClientFinished(finFlight)?
+      return s.processClientFinished(finFlight) catch e {
+        let alert = tlsAlertSealedRecord(s.hsWriteKeys, tlsapiAlertDescOf(e)) catch e2 {
+          fail e
+        }
+        tlsapiSendAlert(f.conn, alert)
+        fail e
+      }
     }
   }
   fail newError("tls: server handshake did not complete within the flight bound")
