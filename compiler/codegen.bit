@@ -346,15 +346,19 @@ fn extendUses(intervals: []LiveInterval, usePos: int, ins: IrInstr) {
     op == Op.FuncAddr || op == Op.GlobalAddr || op == Op.StackMapsAddr) {
     return // no value operands
   }
-  if (op == Op.Jump || op == Op.Ret || op == Op.Call || op == Op.RtCall ||
-    op == Op.Asm) {
+  // #2934: Jump/Br's block-param ARGUMENTS are extended separately, by
+  // extendForwardArgs, gated on whether the receiving param is genuinely live
+  // rather than unconditionally — see computeParamTrueLive's header. Br's own
+  // CONDITION is still an unconditional real read.
+  if (op == Op.Jump) {
+    return
+  }
+  if (op == Op.Ret || op == Op.Call || op == Op.RtCall || op == Op.Asm) {
     extendList(intervals, usePos, ins.args)
     return
   }
   if (op == Op.Br) {
     extendOne(intervals, usePos, ins.lhs)
-    extendList(intervals, usePos, ins.thenArgs)
-    extendList(intervals, usePos, ins.elseArgs)
     return
   }
   if (op == Op.CallValue || op == Op.CallIface) {
@@ -487,6 +491,106 @@ fn extendParamsToPreds(intervals: []LiveInterval, f: IrFunc) {
   }
 }
 
+// #2934: the CFG-obliviousness fix. A chain of "if (cond) { return X }" checks
+// threads every local through EVERY subsequent block's params via the Jump/Br
+// argument list, regardless of whether anything downstream ever reads it
+// again — opt.bit's DCE keeps every block param structurally live because
+// trimming one means rewriting every predecessor's arg list too (its own
+// `computeLive` unconditionally marks Op.BlockParam live for exactly that
+// reason). Left alone, a value already dead after its first branch keeps a
+// register reserved — and gets re-copied at every later block's edge move —
+// all the way to the function's last block, which is what inflated
+// bit_rt_safepoint_needed to 14 distinct GPRs for a true 2-value peak.
+//
+// This computes, for every instruction slot, whether it is "genuinely" live:
+// read directly by something other than a block-forwarding argument, or
+// forwarded to a param that is (recursively) genuinely live. Two stages:
+//
+// Stage 1 finds every direct (non-forwarding) use exactly the way extendUses
+// already does — reusing it unmodified on a throwaway interval array, since
+// extendUses' own Op.Jump/Op.Br handling no longer touches forwarded args.
+//
+// Stage 2 walks blocks in DESCENDING order propagating liveness backward
+// across FORWARD edges only: a forward branch always targets a LATER block
+// (isBackEdge), so by the time this walk reaches a block's own terminator,
+// every block it can jump forward to has already been fully processed —
+// including THAT block's own Stage 2 contribution — so its params' liveness
+// is completely final. A BACK edge's target has not been visited yet in a
+// single descending pass, so those arguments stay conservatively live,
+// unchanged from today: under-approximating deadness there would shrink a
+// genuinely live loop-carried value's interval and hand its register away
+// early, which is a miscompile, not a missed optimization.
+fn computeParamTrueLive(f: IrFunc): []bool {
+  let n = len(f.instrs)
+  let temp = []LiveInterval(0)
+  let i = 0
+  while (i < n) {
+    temp = append(temp, LiveInterval{ vreg: i, class: RegClass.Int, start: i, end: i, isRef: false })
+    i = i + 1
+  }
+  i = 0
+  while (i < n) {
+    extendUses(temp, i, f.instrs[i])
+    i = i + 1
+  }
+  let live = []bool(0)
+  i = 0
+  while (i < n) {
+    live = append(live, temp[i].end > temp[i].start)
+    i = i + 1
+  }
+
+  let bi = len(f.blocks)
+  while (bi > 0) {
+    bi = bi - 1
+    let b = f.blocks[bi]
+    if (b.instsLen > 0) {
+      let termPos = b.instsStart + b.instsLen - 1
+      let ins = f.instrs[termPos]
+      if (ins.op == Op.Jump) {
+        markForwardLiveArgs(f, live, bi, ins.ival, ins.args)
+      }
+      if (ins.op == Op.Br) {
+        markForwardLiveArgs(f, live, bi, ins.ival, ins.thenArgs)
+        markForwardLiveArgs(f, live, bi, ins.ival2, ins.elseArgs)
+      }
+    }
+  }
+  return live
+}
+
+// Shared by computeParamTrueLive's own backward propagation and
+// extendForwardArgs' interval extension: argument `k` of a jump from
+// `curBlock` to `target` is worth treating as a genuine use iff the edge is a
+// back edge (always conservative, same as extendUses used to be
+// unconditionally) or the receiving param (`target`'s k-th) is itself live.
+fn argFeedsLiveTarget(f: IrFunc, live: []bool, curBlock: int, target: int, k: int): bool {
+  return isBackEdge(curBlock, target) || live[f.blocks[target].instsStart + k]
+}
+
+fn markForwardLiveArgs(f: IrFunc, live: []bool, curBlock: int, target: int, args: []int) {
+  let k = 0
+  while (k < len(args)) {
+    if (argFeedsLiveTarget(f, live, curBlock, target, k)) {
+      live[args[k]] = true
+    }
+    k = k + 1
+  }
+}
+
+// buildIntervals' replacement for extendUses' old unconditional Jump/Br
+// argument handling: only extends a forwarded value's interval when
+// argFeedsLiveTarget says the edge is worth it (#2934).
+fn extendForwardArgs(intervals: []LiveInterval, f: IrFunc, live: []bool, usePos: int, curBlock: int, target: int, args: []int) {
+  let k = 0
+  while (k < len(args)) {
+    if (argFeedsLiveTarget(f, live, curBlock, target, k)) {
+      extendOne(intervals, usePos, args[k])
+    }
+    k = k + 1
+  }
+}
+
 fn isSafepointOp(op: Op): bool {
   return op == Op.Call || op == Op.RtCall || op == Op.GcAlloc ||
     op == Op.MakeClosure || op == Op.CallValue || op == Op.CallIface
@@ -518,6 +622,8 @@ fn buildIntervals(ctx: TypeContext, f: IrFunc): IntervalBuild {
     i = i + 1
   }
 
+  let paramLive = computeParamTrueLive(f)
+
   let bi = 0
   while (bi < len(f.blocks)) {
     let b = f.blocks[bi]
@@ -529,6 +635,13 @@ fn buildIntervals(ctx: TypeContext, f: IrFunc): IntervalBuild {
         safepoints = append(safepoints, idx)
       }
       extendUses(intervals, idx, ins)
+      if (ins.op == Op.Jump) {
+        extendForwardArgs(intervals, f, paramLive, idx, bi, ins.ival, ins.args)
+      }
+      if (ins.op == Op.Br) {
+        extendForwardArgs(intervals, f, paramLive, idx, bi, ins.ival, ins.thenArgs)
+        extendForwardArgs(intervals, f, paramLive, idx, bi, ins.ival2, ins.elseArgs)
+      }
       // Back-edge safepoints are suppressed for @naked/@nosplit — gate recording
       // on the same predicate as emission so positions stay in lockstep (§10.3.1).
       if (ins.op == Op.Jump && isBackEdge(bi, ins.ival) && !needsNoSafepoints(f)) {
