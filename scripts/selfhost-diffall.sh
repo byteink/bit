@@ -99,7 +99,8 @@ set -uo pipefail
 
 DIR=${DIFFALL_DIR:-scripts}
 MIN=${DIFFALL_MIN:-15}
-# A hang guard, not a perf budget: fixpoint builds the compiler twice and
+# A hang guard, not a perf budget: fixpoint builds the compiler twice (three
+# times if the first two disagree and it has to confirm, #2980) and
 # diffexamples builds 44 examples twice, so the honest ceiling is minutes.
 TIMEOUT=${DIFFALL_TIMEOUT:-3600}
 ABSENT_SET=${DIFFALL_ABSENT:-scripts/selfhost-diffall.absent}
