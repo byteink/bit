@@ -97,6 +97,9 @@ NAME="${1:?usage: selfhost-diffdump.sh <ast|tokens|diags|types|ir|iropt>}"
 # Usage: ./make selfhost && bash scripts/selfhost-difftokens.sh
 # Exits non-zero (printing the first divergence) on any mismatch.
 #
+# EXCEPT the small, named STAGE0-PINLAG accept list below (#2993) — see that
+# comment block for the one entry it currently holds and why.
+#
 # --- from scripts/selfhost-diffdiags.sh ---
 # Self-host front-end diagnostic differential (#1335/#363): run every corpus
 # `.bit` file through both compilers' `--dump-diags` (lexer + parser diagnostics
@@ -216,7 +219,8 @@ NAME="${1:?usage: selfhost-diffdump.sh <ast|tokens|diags|types|ir|iropt>}"
 PINLAG_FILES=""
 case "$NAME" in
   ast)    FLAG=--dump-ast;    LABEL="AST";           SKIPLABEL="parse-err";       VERB="";         KIND=basic; TIMEOUT="${DIFFAST_TIMEOUT:-20}" ;;
-  tokens) FLAG=--dump-tokens; LABEL="token";         SKIPLABEL="lex-err";         VERB="";         KIND=basic; TIMEOUT="${DIFFTOKENS_TIMEOUT:-20}" ;;
+  tokens) FLAG=--dump-tokens; LABEL="token";         SKIPLABEL="lex-err";         VERB="";         KIND=basic; TIMEOUT="${DIFFTOKENS_TIMEOUT:-20}"
+          PINLAG_FILES="tests/imports/bomstrip/main.bit" ;;
   diags)  FLAG=--dump-diags;  LABEL="diag";          SKIPLABEL="";                VERB="";         KIND=basic; TIMEOUT="${DIFFDIAGS_TIMEOUT:-20}"
           PINLAG_FILES="tests/imports/bomstrip/main.bit" ;;
   types)  FLAG=--dump-types;  LABEL="type";          SKIPLABEL="check-err";       VERB="";         KIND=types; TIMEOUT="${DIFFTYPES_TIMEOUT:-20}" ;;
@@ -226,7 +230,7 @@ case "$NAME" in
 esac
 PREFIX="diff${NAME}"
 
-# --- diags-only stage0 pin-lag accept list (#2992) ---
+# --- tokens/diags-only stage0 pin-lag accept list (#2992, #2993) ---
 #
 # tests/imports/bomstrip/main.bit's first three bytes are a UTF-8 BOM (#2976,
 # compiler/lexer.bit's stripBom(), called at every production entry point).
@@ -235,6 +239,26 @@ PREFIX="diff${NAME}"
 # emits E0021 while this tree strips it and compiles clean. This is a real,
 # permanent front-end behaviour change this tree made ON PURPOSE -- the
 # fixture exists specifically to prove it -- not a bug on either side.
+#
+# Two DIFFERENT rows carry this entry because the same root cause surfaces at
+# two different pipeline stages (#2993 confirmed both on unmodified main
+# before adding the tokens entry, rather than assuming diags' reasoning
+# transfers):
+#   - diags (#2992): the oracle's LEXER accepts the raw BOM bytes as a token,
+#     rc=0 -- lexing does not fail -- and it is the PARSER that then rejects
+#     that bogus leading token with E0021. --dump-diags sees the E0021.
+#   - tokens (#2993): --dump-tokens is the raw lex-level view, one level
+#     BELOW where diags diverges. The oracle's lexer emits a garbage `ident`
+#     token for the raw BOM bytes at offset 0..3 (confirmed: running the
+#     oracle directly with --dump-tokens on this file exits 0, so
+#     SKIPLABEL="lex-err" never fires -- the lexer does not consider this an
+#     error at all, it just tokenizes differently), and every token after it
+#     is offset-shifted against this tree's stripped stream, so the whole
+#     file's token stream mismatches from position 0 onward. --dump-ast is
+#     unaffected (selfhost-diffast.sh: MATCH=760 MISMATCH=0 on this same
+#     file) because the parser recovers past the bad leading token to an
+#     identical tree either way -- only the raw diagnostic and token views
+#     see the divergence, not the AST.
 #
 # This is NOT the class of expected-mismatch list #1883 deleted and the
 # "outpaced oracle" header above (types/ir/iropt) refuses to re-admit. That
