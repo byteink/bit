@@ -41,12 +41,56 @@ export const maxJobs: int = 512
 
 const maxFanout: int = 32
 
+// The scratch root of the run currently in flight, so `die()` can reclaim it on
+// ANY failure exit — a setup failure, a plumbing self-test timeout, a corrupt
+// slot status — not just the three call sites in `docs.bit`'s `main` that
+// already bracket their own `teardown(cfg.dir)`. A module-level `let` may only
+// hold untraced state (§11.11: no `string`, which is GC-traced), so the path
+// lives in a fixed byte buffer plus a length rather than a `string`. 64 bytes
+// comfortably covers "/tmp/bit-docsgate-" (19 bytes) plus a `uint` nonce (<=20
+// decimal digits). Length 0 means "no active scratch dir to reclaim" — true
+// before `setup()` has `mkdir`ed one, and again once `teardown()` has swept it.
+let activeScratchBuf: [64]byte
+let activeScratchLen: int = 0
+
+fn setActiveScratch(dir: string) {
+  assert(len(dir) <= 64)
+  let i = 0
+  while (i < len(dir)) {
+    activeScratchBuf[i] = dir[i]
+    i = i + 1
+  }
+  activeScratchLen = len(dir)
+}
+
+fn activeScratch(): string {
+  let out = []byte(activeScratchLen)
+  let i = 0
+  while (i < activeScratchLen) {
+    out[i] = activeScratchBuf[i]
+    i = i + 1
+  }
+  return string(out)
+}
+
 // Setup failures are never a pass. Every one of them ends the process nonzero
 // rather than leaving work unrun — a skipped check is a green test, which is
 // exactly the vacuity this file exists to avoid.
 export fn die(msg: string) {
   eprint("docs: SETUP FAILED: ${msg}\n")
+  reclaimScratch()
   osExit(1)
+}
+
+// `die()`'s half of `teardown()`: the same sweep, run against whatever scratch
+// root `setup()` most recently created, reached from a bare `dir` string since
+// most `die()` call sites have no `Cfg` in scope (they fire mid-`setup`, before
+// one exists, or from deep inside a helper that was only ever handed a path).
+fn reclaimScratch() {
+  if (activeScratchLen == 0) {
+    return
+  }
+  teardown(activeScratch())
 }
 
 export fn slurp(path: string, what: string): string {
@@ -113,12 +157,21 @@ export fn trimInfo(s: string): string {
 }
 
 // Slot `i`'s paths: its module directory, its captured output, its exit status,
-// and the claim directory a worker `mkdir`s to take the job.
-fn slotDir(cfg: Cfg, i: int): string { return "${cfg.dir}/w${i}" }
-fn slotMain(cfg: Cfg, i: int): string { return "${cfg.dir}/w${i}/main.bit" }
-fn slotOut(cfg: Cfg, i: int): string { return "${cfg.dir}/o${i}" }
-fn slotStatus(cfg: Cfg, i: int): string { return "${cfg.dir}/s${i}" }
-fn slotClaim(cfg: Cfg, i: int): string { return "${cfg.dir}/c${i}" }
+// and the claim directory a worker `mkdir`s to take the job. Take the scratch
+// root as a bare string, not a `Cfg`, so `teardown` can run from just a path —
+// which is all `die()` has when it fires before a `Cfg` exists (#2951).
+fn slotDir(dir: string, i: int): string { return "${dir}/w${i}" }
+fn slotMain(dir: string, i: int): string { return "${dir}/w${i}/main.bit" }
+fn slotOut(dir: string, i: int): string { return "${dir}/o${i}" }
+fn slotStatus(dir: string, i: int): string { return "${dir}/s${i}" }
+fn slotClaim(dir: string, i: int): string { return "${dir}/c${i}" }
+
+// The scratch root's own top-level files, named the same way `setup` builds
+// them into `Cfg` — kept as functions of `dir` alone so both `setup` and
+// `teardown` share one spelling of the convention (#2951).
+fn scriptFile(dir: string): string { return "${dir}/run.sh" }
+fn countFile(dir: string): string { return "${dir}/n.txt" }
+fn binFile(dir: string): string { return "${dir}/bit" }
 
 // A leftover from an earlier batch is removed before the next one starts: a
 // child that never ran must not hand back stale output or a stale zero status.
@@ -136,7 +189,7 @@ fn scrub(path: string) {
 // or non-numeric status all abort the run: a check whose result is unknown is
 // not a check, and there is no lenient reading of this file.
 fn slotResult(cfg: Cfg, i: int): CheckResult {
-  let p = slotStatus(cfg, i)
+  let p = slotStatus(cfg.dir, i)
   if (!exists(p)) {
     die("no exit status at ${p}: the runner did not record slot ${i}, so its snippet is unchecked")
   }
@@ -151,7 +204,7 @@ fn slotResult(cfg: Cfg, i: int): CheckResult {
     die("unreadable exit status in ${p}: ${jsonish(raw)}")
     0
   }
-  let outPath = slotOut(cfg, i)
+  let outPath = slotOut(cfg.dir, i)
   if (!exists(outPath)) {
     die("no output capture at ${outPath}: the runner script is not redirecting slot ${i}")
   }
@@ -183,15 +236,15 @@ export fn runBatch(cfg: Cfg, srcs: []string): []CheckResult {
 fn stageBatch(cfg: Cfg, srcs: []string) {
   let i = 0
   while (i < len(srcs)) {
-    if (!exists(slotDir(cfg, i))) {
-      mkdir(slotDir(cfg, i)) catch e {
-        die("mkdir ${slotDir(cfg, i)}: ${e.message()}")
+    if (!exists(slotDir(cfg.dir, i))) {
+      mkdir(slotDir(cfg.dir, i)) catch e {
+        die("mkdir ${slotDir(cfg.dir, i)}: ${e.message()}")
       }
     }
-    spill(slotMain(cfg, i), srcs[i], "scratch module")
-    scrub(slotOut(cfg, i))
-    scrub(slotStatus(cfg, i))
-    scrub(slotClaim(cfg, i))
+    spill(slotMain(cfg.dir, i), srcs[i], "scratch module")
+    scrub(slotOut(cfg.dir, i))
+    scrub(slotStatus(cfg.dir, i))
+    scrub(slotClaim(cfg.dir, i))
     i = i + 1
   }
   spill(cfg.countPath, "${len(srcs)}\n", "batch size")
@@ -224,7 +277,7 @@ fn collectBatch(cfg: Cfg, n: int, r: i64): []CheckResult {
   let out = []CheckResult(0)
   let j = 0
   while (j < n) {
-    if (r == timedOutCode && !exists(slotStatus(cfg, j))) {
+    if (r == timedOutCode && !exists(slotStatus(cfg.dir, j))) {
       out = append(
         out,
         CheckResult{
@@ -322,8 +375,12 @@ export fn setup(root: string): Cfg {
   mkdir(dir) catch e {
     die("mkdir ${dir}: ${e.message()}")
   }
+  // From here on, ANY `die()` — this function's own chmod/fanout/deadline
+  // checks below, or one reached later from `docs.bit`'s corpus walk or batch
+  // run — must reclaim this directory rather than leak it (#2951).
+  setActiveScratch(dir)
 
-  let bin = "${dir}/bit"
+  let bin = binFile(dir)
   spill(bin, slurp(src, "compiler under test"), "compiler copy")
   if (fsChmod(bin, 493) != 0) {
     die("chmod ${bin}")
@@ -335,8 +392,8 @@ export fn setup(root: string): Cfg {
     docsDir: docsDir,
     dir: dir,
     jobs: fanout(),
-    script: "${dir}/run.sh",
-    countPath: "${dir}/n.txt",
+    script: scriptFile(dir),
+    countPath: countFile(dir),
     timeoutMs: deadlineMs(),
   }
   writeRunner(cfg)
@@ -420,23 +477,31 @@ fn writeRunner(cfg: Cfg) {
 }
 
 // std/fs has no recursive delete, so every leaf is named. Failures here are
-// reported, not fatal: the run's verdict is already decided.
-export fn teardown(cfg: Cfg) {
-  for p of [cfg.script, cfg.countPath, cfg.bin] {
+// reported, not fatal: the run's verdict is already decided (or, when reached
+// through `die()`'s `reclaimScratch`, IS the failure being reported).
+//
+// Takes the scratch root as a bare `dir`, not a `Cfg`: `die()` may fire before
+// a `Cfg` exists (a `setup()` validation failure) with only the directory it
+// already `mkdir`ed, so `teardown` must be callable from that alone (#2951).
+export fn teardown(dir: string) {
+  for p of [scriptFile(dir), countFile(dir), binFile(dir)] {
     drop(p)
   }
   // Every slot the batch COULD have used, not just the ones it did: a bounded
   // sweep is cheaper to trust than a second copy of the batch size.
   let i = 0
   while (i < maxJobs) {
-    drop(slotMain(cfg, i))
-    drop(slotOut(cfg, i))
-    drop(slotStatus(cfg, i))
-    drop(slotClaim(cfg, i))
-    drop(slotDir(cfg, i))
+    drop(slotMain(dir, i))
+    drop(slotOut(dir, i))
+    drop(slotStatus(dir, i))
+    drop(slotClaim(dir, i))
+    drop(slotDir(dir, i))
     i = i + 1
   }
-  drop(cfg.dir)
+  drop(dir)
+  // Only one scratch root is ever live per run (`setup()` is called once from
+  // `main`), so an unconditional clear is correct: nothing left to reclaim.
+  activeScratchLen = 0
 }
 
 fn drop(path: string) {
