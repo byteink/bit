@@ -1538,6 +1538,11 @@ bit_rt_time_unix_ns()      -> i64   // wall clock, ns since the Unix epoch; may 
 bit_rt_time_sleep_ns(ns)   -> void  // park this green thread for >= ns
 ```
 
+`bit_rt_time_sleep_ns` converts the relative `ns` to an absolute monotonic
+deadline (`bit_rt_time_mono_ns() + ns`) and clamps that deadline to `i64max`
+nanoseconds rather than let the addition overflow and wrap negative, so a
+duration near `i64max` never wakes early.
+
 `sleep` records a deadline on the `Task`, then `park`s with a `ParkFn` that
 links it onto the scheduler's `TimerQueue` — the same "register only after the
 context is safely saved" point the netpoller uses (§11), which is what
