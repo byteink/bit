@@ -750,6 +750,21 @@ observed it, THEN close. Getting the order wrong deadlocks - waiting on this
 after a bare close hangs forever, since nothing produced the wakeup the
 parked read is waiting for.
 
+### `Conn.waitWriterDone()`
+
+Block until the writer green thread spawned by `connect`/`accept` has stopped
+touching the transport. Unlike the reader, the writer is normally parked on an
+empty command channel rather than a transport read, so closing or shutting
+down the transport does not wake it by itself - only the connection's own
+teardown handling queues the stop message that releases it, once it has
+observed (via `waitReaderDone()`) that the connection is tearing down.
+
+Call this AFTER `waitReaderDone()` and BEFORE reusing anything the transport
+owned, for the identical use-after-close reason `waitReaderDone()` documents -
+the writer's last queued write is a real transport write, and closing out from
+under it is the same fd-reuse hazard a stale reader creates. NOT idempotent -
+call it exactly once per `Conn`, from a single teardown path.
+
 ### `Conn.close()`
 
 Begin a graceful shutdown by sending GOAWAY: the peer starts no new streams and
