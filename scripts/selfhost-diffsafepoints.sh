@@ -24,6 +24,12 @@
 # this script indefinitely — the same shape selfhost-diffcheck.sh's header
 # warns about ("the seed side had no bound at all, so a hung ORACLE wedged the
 # whole gate indefinitely").
+#
+# PHASE 3 (#3070) is a different kind of check bolted onto this file rather
+# than a new one, per that ticket's own constraint: it needs the same
+# --emit-obj + relocation-table mechanics phases 1-2 already have, but no
+# ORACLE and no diff — it asserts a property of BIT2's own output. See the
+# PHASE 3 header below for why.
 set -u
 # shellcheck source=scripts/alarmrun.sh
 . "$(dirname -- "$0")/alarmrun.sh"
@@ -326,4 +332,88 @@ if [ "$exe_match" -lt 1 ]; then
   exit 2
 fi
 
-[ "$mismatch" -eq 0 ] && [ "$timeout" -eq 0 ] && [ "$exe_mismatch" -eq 0 ] && [ "$exe_timeout" -eq 0 ]
+# =============================================================================
+# PHASE 3 — instantiation-target check (#3070)
+# =============================================================================
+#
+# WHY THIS EXISTS. #3068 fixed `resolveCallTarget` (compiler/lowerprim.bit) to
+# substitute a generic call's type args through `fc.genEnv` before looking up
+# which instantiation it targets. Nothing re-runs the bug once fixed: the
+# golden fixture #3068 added for it (tests/cases/run_generic_call_via_param.bit)
+# compares stdout, and the degenerate, mistyped instance still computes the
+# right VALUE (#2379) — with the fix reverted, `./make test-golden` still
+# exits 0, 465/465. Every dump-based differential (diffcheck/diffir/diffiropt/
+# difftypes) is also blind, for the reasons #3069 catalogued: they either
+# never run the resolver at all, or compare diagnostics/IR text, never which
+# instantiation index a call's codegen actually targets.
+#
+# WHAT IS CHECKED, AND WHY NO ORACLE. Unlike phases 1-2, this needs no second
+# compiler: the fixed behaviour is a property of what THIS compiler's own
+# resolver+lowerer decide for one fixture, not a diff against last release.
+# That makes it immune to the pin-lag every ORACLE-based differential in this
+# family carries (see the header note above `ORACLE=`) — #3069 demonstrated
+# the exact same object-level divergence by hand (otool -r relocations
+# resolved against nm -pa's symbol order); this automates that procedure.
+#
+# Build the pinned fixture to an object and read its __text relocation table:
+# the call site inside `main` (`build(5)` inlines, so `main` calls `f1`
+# directly) must target the CONCRETE instantiation, never the degenerate
+# template instance the checker's initial, unsubstituted sweep records.
+#
+# The degenerate entry's symbol is deterministically `_f1$0` for this exact
+# fixture: `checkModule`'s initial sweep records a generic call's
+# instantiation the first time it visits that Call node, arena order, once,
+# regardless of the bug — and `f1(x)` inside `build`'s body is the first
+# generic call in the file (`build(5)` inside `main` is swept second). So
+# `_f1$0` is always the raw, unbound-`<T>` ledger entry; the bug is only
+# which entry CODEGEN's call instruction is made to target. A `BRANCH`
+# relocation naming `_f1$0` in __text is therefore the exact, deterministic
+# signature of the reverted bug for this fixture — not a heuristic.
+instcheck() { # $1=compiler $2=outobj -> prints verdict; sets $INSTCHECK_RC (0 pass, 1 fail, 2 could-not-decide)
+  local fixture="tests/cases/run_generic_call_via_param.bit" calls rc
+  rm -f "$2"
+  alarmrun "$1" build "$fixture" --emit-obj -o "$2" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -eq 142 ]; then
+    echo "instcheck: build timed out after ${TIMEOUT}s: $fixture" >&2
+    INSTCHECK_RC=2
+    return
+  fi
+  if [ ! -f "$2" ]; then
+    echo "instcheck: $1 did not produce $2 building $fixture (build rc=$rc)" >&2
+    INSTCHECK_RC=2
+    return
+  fi
+  calls=$(objdump -r "$2" 2>/dev/null | awk '
+    /RELOCATION RECORDS FOR \[__text\]/ { intext=1; next }
+    /RELOCATION RECORDS FOR/            { intext=0 }
+    intext && /BRANCH/ && $NF ~ /^_f1\$[0-9]+$/ { print $NF }
+  ')
+  if [ -z "$calls" ]; then
+    echo "instcheck: found no call to any f1\$N instance in $fixture's object — the check observed nothing" >&2
+    INSTCHECK_RC=2
+    return
+  fi
+  if printf '%s\n' "$calls" | grep -qxF '_f1$0'; then
+    echo "INSTANTIATION TARGET DIVERGENCE: main calls the DEGENERATE instance _f1\$0"
+    echo "  (resolveCallTarget did not substitute genericTypeArgs through fc.genEnv — #3068)"
+    echo "  call target(s) found in __text: $(printf '%s ' $calls)"
+    INSTCHECK_RC=1
+    return
+  fi
+  echo "instcheck: main targets the concrete instance ($(printf '%s ' $calls)), not the degenerate _f1\$0"
+  INSTCHECK_RC=0
+}
+
+echo
+instcheck_start=$SECONDS
+instcheck "$BIT2" "$tmp/instcheck.o"
+instcheck_elapsed=$((SECONDS - instcheck_start))
+echo "instantiation-target check: rc=$INSTCHECK_RC (${instcheck_elapsed}s)"
+if [ "$INSTCHECK_RC" -eq 2 ]; then
+  echo "FATAL: the instantiation-target check could not decide — see above." >&2
+  exit 2
+fi
+
+[ "$mismatch" -eq 0 ] && [ "$timeout" -eq 0 ] && [ "$exe_mismatch" -eq 0 ] && [ "$exe_timeout" -eq 0 ] &&
+  [ "$INSTCHECK_RC" -eq 0 ]
