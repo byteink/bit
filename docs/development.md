@@ -69,8 +69,19 @@ edit runs the selfhost diffs plus `test-imports-bit`, `test-lint-filelines` and
 Every bucket runs every gate whose OWN declared file set (its `argv`/`env` in
 `tools/build/gates.bit`) intersects that bucket's paths, not just the one gate
 the bucket was originally named after — see `scripts/gate.sh`'s own header
-comment for the full bucket→gate table (#2962). For a cross-cutting change
-(`tools/build/`), a mixed change set spanning more than one bucket, or anything
+comment for the full bucket→gate table (#2962). One narrow exception to "a mix
+of areas forces full" (#3055): `tests/bit/stdlibdocs.bit` makes a
+`docs/stdlib/<mod>.md` page mandatory for every exported stdlib symbol, so an
+ordinary stdlib-export change is structurally required to touch both the
+`stdlib` and `docs` buckets in the same diff — resolving that to `full` would
+mean no stdlib-export ticket could ever use the scoped gate. A diff touching
+only `stdlib/<mod>/**` and its own paired `docs/stdlib/<mod>.md` (plus,
+optionally, `docs/stdlib/README.md`) resolves to bucket `stdlibdocs` instead,
+the union of the `stdlib` and `docs` buckets' own steps. Any other pairing —
+`stdlib/**` with a *different* module's doc page, or with any bucket besides
+`docs` — still spans more than one bucket and still forces `full`. For a
+cross-cutting change (`tools/build/`), a mixed change set spanning more than
+one bucket that isn't that narrow pairing, or anything
 else it cannot confidently scope, `gate.sh` (no flags) **refuses rather than
 guessing**: it
 prints the resolved bucket and the reason, runs nothing, and exits 3
