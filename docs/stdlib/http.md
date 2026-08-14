@@ -482,9 +482,12 @@ POSTs `body` to `url` through this client.
 
 Like the package-level `requestTimeout`: a whole-request deadline covering
 `http://`, `https://`, and `https+h3://`. Does not consult this client's
-Alt-Svc cache or TLS config - an `https://` URL always dials with the default
-TLS config, not `c.tls`, so a `Client` built with `newClientTls` does not get
-its custom config applied here.
+Alt-Svc cache - an `https+h3://` URL is still the only way to reach the h3
+path here, same as `Client.request` - but DOES use its TLS config for
+`http://`/`https://`: an `https://` URL dials with `c.tls`, so a `Client`
+built with `newClientTls` (pinned roots, a fixed `serverName`,
+`insecureSkipVerify`) gets that config applied here, the same as
+`Client.request`/`requestTls` already do.
 
 ### `Client.getTimeout(url: string, timeoutMs: int): Response!`
 
