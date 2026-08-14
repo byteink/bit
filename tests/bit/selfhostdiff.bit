@@ -1,0 +1,168 @@
+// `./make test-differentials` (#2570): the whole self-host differential
+// family, `scripts/selfhost-diffall.sh`, run from the build driver.
+//
+// Every `scripts/selfhost-diff*.sh` — 15 of them, plus `selfhost-fixpoint.sh`
+// and `selfhost-fuzzdiff.sh` (17 total, `selfhost-diffall.sh`'s own
+// discovery floor) — was reachable from exactly one place before this:
+// `scripts/gate.sh`'s diff-scoped buckets, which only fire when a change
+// happens to land in its "selfhost", "runtime" or "full" bucket. `./make
+// test` runs `gateNames()` only, and none of the family was in it, so a
+// runtime-codegen divergence between the self-hosted compiler and the
+// pinned stage0 oracle could ship through the documented, mandatory
+// pre-push gate (`rm -rf bit-out && ./make && ./make test`) with nothing
+// checking it — #2569's divergence did exactly that, live on `main`,
+// through two green pre-push suites.
+//
+// `selfhost-diffall.sh` already exists to be the single command that
+// "cannot be under-run" (its own header, #1568) — it discovers every
+// constituent by glob rather than a hand-maintained list, so a differential
+// added later is covered automatically. This harness is what makes the
+// build driver run it, the same way `tests/bit/coldboot.bit` makes the
+// driver run a clean-tree rebuild.
+//
+// NOT part of the default `./make test`: `tools/build/defs.bit` registers
+// this Step in `coreSteps()`, not `gateSteps()`, so `gateNames()` never
+// names it. Measured 2026-08-15 on this tree: `selfhost-diffcheck.sh` alone
+// is ~524s, and the full family — with `selfhost-fixpoint.sh`'s ~400s and
+// `selfhost-fuzzdiff.sh`'s ~271s (both timed in #2382) on top — runs into
+// the tens of minutes, so folding it into `test` would roughly double the
+// ~19-minute pre-push suite. Run it explicitly before a push, alongside
+// `./make test` — `bitlang-ws/CLAUDE.md`'s pre-push checklist names it.
+import { env, envOr, exit } from "std/os"
+import { exists, mkdir, readFile, writeFile } from "std/fs"
+import { parseInt } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// Generous: the family rebuilds the compiler inside `selfhost-fixpoint.sh`
+// and diffs 44 examples twice inside `selfhost-diffexamples.sh`, on top of
+// every per-file corpus walk each constituent does. `s <= 0` does not mean
+// "block forever" — a hang here is exactly the failure this gate exists to
+// tell apart from a genuine divergence (#1637), same convention as
+// `tests/bit/coldboot.bit`'s `timeoutMs`.
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "3600")) catch _ { 3600 }
+  if (s <= 0) {
+    return 3600000
+  }
+  return s * 1000
+}
+
+// BIT_REPO is set unconditionally by this gate's own `Gate{}` entry
+// (`tools/build/gates.bit`) — falling back to "." on a miss would silently
+// run the family against whatever directory `bit` happened to be invoked
+// from instead of refusing. See `tests/bit/coldboot.bit`'s identical helper.
+fn repoRoot(): string {
+  let r = env("BIT_REPO")
+  if (len(r) == 0) {
+    panic("selfhostdiff: BIT_REPO is not set — run this through `./make test-differentials`")
+  }
+  return r
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s own mechanism channel, never a program's exit status
+// (ABI.md §19), so each is a named panic rather than a value any assertion
+// could mistake for the thing under test.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700: owner rwx only
+    fail newError("selfhostdiff: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("selfhostdiff: TIMED OUT after ${ms}ms running the differential family — a hang is a failure, not a stall")
+  }
+  if (code == -1) {
+    panic("selfhostdiff: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("selfhostdiff: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let root = repoRoot()
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-selfhostdiff-${uuidFormat(uuidV4())}"
+  mkdir(scratch) catch e {
+    panic("selfhostdiff: cannot create ${scratch}: ${e.message()}")
+  }
+  defer teardown(scratch, ms)
+
+  let outPath = "${scratch}/out.txt"
+  let codePath = "${scratch}/code.txt"
+
+  // The wrapper always exits 0 on its own account, except the one setup
+  // failure named 90 — the verdict under test is `selfhost-diffall.sh`'s OWN
+  // exit code, recorded to `codePath` so it can never be confused with the
+  // wrapper's.
+  let script = "#!/bin/sh\n" +
+    "cd '${root}' || exit 90\n" +
+    "bash scripts/selfhost-diffall.sh > '${outPath}' 2>&1\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let wrapperRc = shell("${scratch}/selfhostdiff.sh", script, ms) catch e {
+    panic("selfhostdiff: ${e.message()}")
+  }
+  if (wrapperRc == 90) {
+    panic("selfhostdiff: cannot cd into ${root}")
+  }
+  if (wrapperRc != 0) {
+    panic("selfhostdiff: wrapper script exited ${wrapperRc}, which it never should")
+  }
+
+  if (!exists(codePath)) {
+    panic("selfhostdiff: no exit code was recorded for scripts/selfhost-diffall.sh — it never ran")
+  }
+  let codeText = trimWs(readFile(codePath) catch e {
+    panic("selfhostdiff: cannot read ${codePath}: ${e.message()}")
+    ""
+  })
+  let code = parseInt(codeText) catch _ {
+    panic("selfhostdiff: ${codePath} did not contain a number: '${codeText}'")
+    0 - 1
+  }
+  let out = readFile(outPath) catch ""
+  eprint(out)
+
+  // `selfhost-diffall.sh`'s own contract (its header, #1568): 0 is PASS,
+  // anything else is not a clean run — 1 is a real divergence, 2 is "could
+  // not decide" (also not a pass), and its own alarm wraps every
+  // constituent so a hang there cannot escape as this gate's own timeout.
+  if (code != 0) {
+    println("selfhostdiff: FAIL — scripts/selfhost-diffall.sh exited ${code}, want 0")
+    exit(1)
+  }
+  println("selfhostdiff: PASS — the whole self-host differential family agrees with the pinned stage0")
+}
+
+// std/fs has no recursive remove, so the scratch tree goes the way it came —
+// same reason `tests/bit/coldboot.bit`'s teardown does.
+fn teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ { return }
+}
+
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}
