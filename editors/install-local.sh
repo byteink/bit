@@ -16,10 +16,11 @@
 # there is nothing left for a local install to feed. Use the full path when you
 # want the dev build; that way which one you are running is never ambiguous.
 #
-# Host hygiene: the compiler build runs the Mac's already-installed native zig
-# (required — see below); npm work for the extension happens in a throwaway
-# Docker container, so only the .vsix touches the Mac. Requires `zig`, `docker`,
-# and the VS Code `code` CLI.
+# Host hygiene: the compiler build uses the pinned stage0 `bit` (a previous
+# release, resolved from dist/stage0/) to compile itself — no toolchain install
+# needed. npm work for the extension happens in a throwaway Docker container,
+# so only the .vsix touches the Mac. Requires `docker` and the VS Code `code`
+# CLI.
 set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
@@ -29,8 +30,8 @@ echo "==> Building native arm64 bit (compiler + LSP) ..."
 # NATIVE, not Docker: `bit` (fmt/doc/lsp/lint all self-hosted) is built by RUNNING
 # the pinned stage0 over compiler/ (the driver's host-triple check), which only works
 # when that compiler targets the build host. A Linux-container cross build cannot
-# produce a runnable host `bit` at all. This Mac's zig (brew, kept local on
-# purpose — see the toolchain note) already targets its own host, aarch64-macos,
+# produce a runnable host `bit` at all. The pinned stage0 (dist/stage0/, a
+# previous `bit` release) already targets this Mac's own host, aarch64-macos,
 # so a plain `./make` here is both correct and simpler than a container that
 # could not do the job anyway.
 #
