@@ -112,6 +112,42 @@ a bug present in both.**
 `docs/release/bootstrap.md` §5 records this as the accepted loss; do not read a
 green differential as the stronger claim.
 
+**A second, separate limit: `diffir`/`diffiropt`/`difftypes` never run the
+resolver, so they cannot see a bug that only exists on the resolver-active
+path.** `--dump-ir-pre`/`--dump-ir`/`--dump-types` all reach `checkModule`
+through `lowerSourceModule`/`checkSourceDump` (`compiler/lowerdriver.bit:312`,
+`compiler/checkmodule.bit:480`) and never call `resolveModule`.
+`compiler/check.bit:163`'s own field comment says so: `nodeSymbols` is "[e]mpty
+on the bare dump entry points ... checkExprType falls back to the flat env
+there." `bit build`/`run`/`test`/`check`/`doc` all resolve first
+(`compiler/checkproject.bit:115`, `resolveModule(..., true)`) and only then
+check — a different branch inside `checkExprType`, with different staleness
+behaviour, so the two paths can disagree on the same source.
+
+Demonstrated on `tests/cases/run_generic_let_chain.bit` (#3069, the #3068
+degenerate-generic-instance repro, live in the corpus): `--dump-ir-pre` and
+`--dump-ir` both show `f1(x)` inside `build<T>` targeting the CONCRETE
+`f1$3`. A real `bit build --emit-obj` of the same file, disassembled
+(`otool -tvV`/`otool -r`, relocation symbolnum resolved against `nm -pa`'s
+symbol-table order), shows `main` — after inlining — calling `_f1$0`, the
+DEGENERATE unbound-type-param instance, with the scalar `5`. Same source, same
+lowering/optimizer code, different call target, because only one of the two
+paths ran the resolver before lowering.
+
+`diffcheck`/`diffverdict`/`diffexamples(-x64)`/`difftests`/`diffsafepoints`/
+`diffdoc` and `diffruntime`'s module-level (object-byte) half all run
+`check`/`build`/`doc`/`test`, so they ARE resolver-active — this specific
+class is not invisible to the whole family, only to the three dump-based
+differentials plus `diffruntime`'s file-level (`--dump-ir-pre`) half. None of
+those resolver-active differentials would have caught *this particular* bug
+either, but each for an unrelated reason (verdict-only, stdout-only, or an
+unrelated codegen property) — none of them compares instantiation targeting or
+emitted call symbols, which is the level this bug lives at. Full per-differential
+table on #3069. No new differential was added; the gap is accepted and
+documented here rather than fixed, because fixing it means changing what the
+dump commands' entry points do, which is a compiler change with its own
+sequencing (see #3069).
+
 **Both sides of a differential must read THIS tree's stdlib and runtime.** The
 stage0 tarball ships its own `stdlib/` and `libbitrt.a`, and `bit` resolves them
 relative to the binary — so an unpinned oracle compares two stdlibs instead of
