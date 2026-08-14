@@ -1599,6 +1599,16 @@ building a higher-level connection on top of a `TlsConn` (`std/http2`'s
 `connect`/`accept`) can thread the same deadline through a wait that sits
 below any one socket read, instead of inventing a second one.
 
+### `TlsConn.readTimedOut(): bool`
+
+Whether the most recent `read()` that returned no bytes ended because this
+side's own read deadline (`dialDeadline`/`setDeadline`) elapsed while waiting
+for a record, rather than the peer closing cleanly or a framing/protocol
+failure. The empty `read()` result is identical either way; this is the side
+channel a caller layered on top of a `TlsConn` (`std/http`'s HTTP/2 glue)
+uses to tell a self-inflicted timeout from a genuine peer close. Meaningless
+before any read; every subsequent read outcome overwrites it.
+
 ### `TlsConn.alpnProtocol(): string`
 
 The ALPN protocol negotiated during the handshake, or `""` if none.
