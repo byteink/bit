@@ -1591,6 +1591,14 @@ reading this connection wakes up. Unlike `close`, it does not mark the
 `TlsConn` closed or stop later reads/writes/closes on it; call it to unblock a
 parked reader, then `close` for real once that reader has returned.
 
+### `TlsConn.deadlineNs(): int`
+
+The absolute monotonic nanosecond deadline this connection's reads and writes
+are bounded by, or `0` if none - see `dialDeadline`. Exposed so a caller
+building a higher-level connection on top of a `TlsConn` (`std/http2`'s
+`connect`/`accept`) can thread the same deadline through a wait that sits
+below any one socket read, instead of inventing a second one.
+
 ### `TlsConn.alpnProtocol(): string`
 
 The ALPN protocol negotiated during the handshake, or `""` if none.
