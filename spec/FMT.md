@@ -25,11 +25,13 @@ settled rule but the corpus (`#2874`'s inventory) also found a *bug* the rule
 does not yet hold to in every case, that bug is out of scope here — a bug is
 fixed, not codified — and is named as open work instead.
 
-The dispatch lives in three files, one module: `compiler/fmt.bit` (the printer
+The dispatch lives in four files, one module: `compiler/fmt.bit` (the printer
 substrate — comment collection, the `Printer` state, the list/sequence/block
-helpers), `compiler/fmtdispatch.bit` (declarations and statements), and
-`compiler/fmtexpr.bit` (expressions and types). Citations below name the
-function and file; line numbers are as of `bbe3c4c5`.
+helpers), `compiler/fmtwrap.bit` (`#2896`; the width-aware wrap-decision
+machinery split out of `fmt.bit` — flat lists, bracketed comma lists, and
+binary/logical chain flattening), `compiler/fmtdispatch.bit` (declarations and
+statements), and `compiler/fmtexpr.bit` (expressions and types). Citations
+below name the function and file; line numbers are as of `2a915257`.
 
 ## 1. Line width
 
@@ -60,9 +62,9 @@ is left unsettled; there is currently no construct with zero width check.
 
 ## 2. Indentation
 
-**Rule.** 2 spaces per nesting level (`fmtIndentWidth`, `compiler/fmt.bit:23`),
+**Rule.** 2 spaces per nesting level (`fmtIndentWidth`, `compiler/fmt.bit:29`),
 written lazily at the first real content of each line (`fmtRaw`,
-`compiler/fmt.bit:205-222`) as `p.indent * fmtIndentWidth` spaces. No tabs.
+`compiler/fmt.bit:226-243`) as `p.indent * fmtIndentWidth` spaces. No tabs.
 
 **Check:** `fmtIndentWidth` in `compiler/fmt.bit` reads `2`; every output
 line's leading-space count equals `2 × ` its brace/block nesting depth.
@@ -71,18 +73,18 @@ line's leading-space count equals `2 × ` its brace/block nesting depth.
 
 **Rule.** Any run of one or more blank source lines between two adjacent
 items collapses to **exactly one** blank output line (`fmtGap`'s `allowBlank`
-branch, `compiler/fmt.bit:247-249, 261-263`); zero blank lines in the source
+branch, `compiler/fmt.bit:268-270, 282-284`); zero blank lines in the source
 stays zero. This applies between top-level declarations and between
-statements inside a block (`fmtPrintSeq`, `compiler/fmt.bit:632-642`), and to a
+statements inside a block (`fmtPrintSeq`, `compiler/fmt.bit:503-513`), and to a
 blank line preserved immediately before a block's own closing `}`
 (`fmtPrintBlock`'s trailing `fmtGap(p, n.span.end, true)`,
-`compiler/fmt.bit:656`).
+`compiler/fmt.bit:527`).
 
 **Two constructions never get a leading blank line, by the printer's own
 design, not as a separate policy:**
 - The first statement inside a block, or the first clause of a `switch`,
   `match`, or `select` body, never has a blank line before it even if the
-  source had one — `fmtPrintNoLeadBlank` (`compiler/fmt.bit:618-628`) passes
+  source had one — `fmtPrintNoLeadBlank` (`compiler/fmt.bit:489-499`) passes
   `allowBlank = false` for the first item, `true` after.
 - The very top of a *file* is the one place a leading blank line before the
   first item **is** kept — `Program`'s use of `fmtPrintSeq`
@@ -92,7 +94,7 @@ design, not as a separate policy:**
   generics, composite literals, imports, tuples — no blank line is ever
   preserved between items or before the closing delimiter, regardless of the
   source (`fmtPrintCommaList`'s per-item and trailing `fmtGap` calls both pass
-  `allowBlank = false`, `compiler/fmt.bit:479, 486`).
+  `allowBlank = false`, `compiler/fmtwrap.bit:267, 294`).
 
 **Check:** for any two adjacent statements/declarations in the same sequence,
 0 source blank lines yields 0 output blank lines and ≥1 yields exactly 1;
@@ -102,12 +104,12 @@ between two items of a bracketed list.
 ## 4. Comments
 
 **Rule.** A comment is re-derived from the source by re-lexing and scanning
-the trivia gap between tokens (`collectComments`, `compiler/fmt.bit:41-56`),
+the trivia gap between tokens (`collectComments`, `compiler/fmt.bit:47-62`),
 then replayed in strict source order: it either trails the current output
 line (if nothing but whitespace — no newline — separated it from whatever
 precedes it in the source) or starts its own new output line immediately
 before whichever node begins next in source order (`fmtGap`,
-`compiler/fmt.bit:237-264`). **The formatter never reassigns a comment to a
+`compiler/fmt.bit:258-285`). **The formatter never reassigns a comment to a
 different statement, list item, or clause than the one it was adjacent to in
 the source.** Line comments (`//`) force a newline after themselves; block
 comments (`/* */`) do not.
@@ -118,7 +120,7 @@ order** that did not match the order the programmer wrote them in, so a
 clause printed ahead of its true source position swept up a neighboring
 clause's still-unconsumed comment. The fix — sort the populated clauses by
 their own `span.start` before printing, then explicitly flush the gap before
-each clause (`fmtAsmStmt`, `compiler/fmtdispatch.bit:631-682`) — is what makes
+each clause (`fmtAsmStmt`, `compiler/fmtdispatch.bit:662-713`) — is what makes
 "attached to the same node it was attached to in the source" hold universally
 rather than for every node kind except `asm`.
 
@@ -130,13 +132,13 @@ comparator used, generalized to any node kind.
 
 ## 5. Bracketed comma lists (params, args, struct/field/variant lists, generics, composite literals, imports, tuples)
 
-**Rule** (`fmtPrintCommaList`, `compiler/fmt.bit:399-489`, settled by `#2140`
+**Rule** (`fmtPrintCommaList`, `compiler/fmtwrap.bit:158-297`, settled by `#2140`
 and `#2880` together): the list flattens onto one line only if **both** hold —
 
 1. the source did not already break the list at one of the list's own
    boundaries: right after the opening delimiter (`fmtOpenBroken`,
-   `compiler/fmt.bit:379-392`), or between two adjacent items
-   (`fmtAnyItemGapHasNewline`, `compiler/fmt.bit:350-362` — deliberately never
+   `compiler/fmtwrap.bit:138-151`), or between two adjacent items
+   (`fmtAnyItemGapHasNewline`, `compiler/fmtwrap.bit:109-121` — deliberately never
    a break nested *inside* one item's own content, which is what made the
    naive version non-idempotent, `#2880`); and
 2. the flattened form fits under the 100-column budget (§1) — except a
@@ -199,7 +201,7 @@ comment to agree with this rule.
 
 Otherwise it explodes to one item per line, each with a trailing comma, at
 one deeper indent level, preserving the author's own item grouping (`grouped`,
-`compiler/fmt.bit:467-485`) — two items the source kept on the same line stay
+`compiler/fmtwrap.bit:255-283`) — two items the source kept on the same line stay
 on the same output line when the list is already exploding for some other
 item's sake. `{`/`}` pad with an inner space when the whole thing renders
 flat (`Point{x: 0}` → `Point{ x: 0 }`).
@@ -214,7 +216,7 @@ twice produces byte-identical output on every comma-list-containing file
 ## 6. Inline vs. stacked bodies — settled, and reversed once (`#1266`)
 
 **Current rule**, two different answers for two different constructs
-(`fmtPrintBodyBlock`, `compiler/fmt.bit:572-588`):
+(`fmtPrintBodyBlock`, `compiler/fmt.bit:443-459`):
 
 - **A function body** inlines as `{ stmt }` **if and only if the source wrote
   it that way** — a single simple statement, no comment, no nested block or
@@ -226,7 +228,7 @@ twice produces byte-identical output on every comma-list-containing file
 - **A `match` arm's body** always collapses to `{ stmt }` whenever it
   qualifies (same single-simple-statement, no-comment test), **regardless of
   how the source wrote it** (`preserveSource = false`, called from
-  `MatchArm`, `compiler/fmtdispatch.bit:540`).
+  `MatchArm`, `compiler/fmtdispatch.bit:571`).
 
 **This reversed once, and the direction matters for the next reader.** Before
 `#1266` (2026-07-14), the rule was "always collapse a one-statement body,"
@@ -256,8 +258,8 @@ the AST. The parser discards them and encodes grouping purely as tree shape
 via precedence, so the formatter cannot "keep the parens the author wrote" —
 there is no author-wrote-parens fact left by the time it runs. Instead it
 **re-derives** parens from a style rule and precedence alone
-(`fmtPrintBinarySide`, `compiler/fmtwrap.bit:278-307`, using `fmtPrec`,
-`fmtIsBitOrShift` and `fmtIsBoolConn`, `compiler/fmt.bit:113-151`):
+(`fmtPrintBinarySide`, `compiler/fmtwrap.bit:302-332`, using `fmtPrec`,
+`fmtIsBitOrShift` and `fmtIsBoolConn`, `compiler/fmt.bit:113-152`):
 
 1. **Precedence-required parens** — the ordinary case: a binary operand that
    would silently regroup under the *other* operator's precedence (with
@@ -297,7 +299,7 @@ re-formatting any of these outputs is a no-op (idempotent).
 **Rule.** An `asm` block's interior statement order and each statement's
 attached comment are preserved exactly as the source wrote them — the
 formatter may re-indent the block (see §2) but never reorders its clauses
-(`fmtAsmStmt`, `compiler/fmtdispatch.bit:631-682`, see §4 for why this needed
+(`fmtAsmStmt`, `compiler/fmtdispatch.bit:662-713`, see §4 for why this needed
 a fix rather than being true by default). A block with no comment inside it
 still renders on one line, unchanged from before `#2879`.
 
@@ -313,8 +315,8 @@ and after — `#2879`'s comparator, run over all 17 `asm`-containing files (25
 gets an explicit trailing `;` in the output **only if** its canonical
 rendering's last token is not itself one that Bit's automatic-semicolon-
 insertion (SPEC §7) already terminates on (`fmtEndsInBlock`,
-`compiler/fmt.bit:494-507`, and `fmtEndsInTerminator`,
-`compiler/fmt.bit:512-530` — anything ending in a block's closing `}`, or
+`compiler/fmt.bit:365-378`, and `fmtEndsInTerminator`,
+`compiler/fmt.bit:383-401` — anything ending in a block's closing `}`, or
 whose last real token is already a terminator, gets no `;`).
 
 **Check:** a statement whose canonical form ends in `}` (an `if`, a `for`, a
