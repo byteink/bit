@@ -725,6 +725,21 @@ Accept inbound requests and dispatch each to `handler` on its own green thread,
 until the connection closes. A handler that returns a `Response` with status 0
 aborts that stream with RST_STREAM (CANCEL).
 
+### `Conn.waitReaderDone()`
+
+Block until the reader green thread spawned by `connect`/`accept` has noticed
+the transport is gone and returned. The reader signals right before it
+returns, and that signal is the only way anything outside that thread can know
+it has stopped touching the transport - this runtime has no way to interrupt a
+green thread parked in a transport read from outside.
+
+Needed because a bare `close()` on the transport does not wake a reader
+already parked in a read on it. The required teardown order is: shut the
+transport down (the real wakeup), call this to block until the reader has
+observed it, THEN close. Getting the order wrong deadlocks - waiting on this
+after a bare close hangs forever, since nothing produced the wakeup the
+parked read is waiting for.
+
 ### `Conn.close()`
 
 Begin a graceful shutdown by sending GOAWAY: the peer starts no new streams and

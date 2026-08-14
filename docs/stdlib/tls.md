@@ -1583,6 +1583,14 @@ Write all of `b` as one or more `application_data` records, splitting at the
 
 Close the underlying socket. Idempotent. No `close_notify` alert is sent.
 
+### `TlsConn.shutdown()`
+
+The TLS-layer passthrough of `std/net`'s `Conn.shutdown` - shuts the underlying
+socket down without releasing it, so a green thread of yours already parked
+reading this connection wakes up. Unlike `close`, it does not mark the
+`TlsConn` closed or stop later reads/writes/closes on it; call it to unblock a
+parked reader, then `close` for real once that reader has returned.
+
 ### `TlsConn.alpnProtocol(): string`
 
 The ALPN protocol negotiated during the handshake, or `""` if none.
