@@ -306,6 +306,10 @@ gates_for_file() {
     tests/bit/rootpins/*) printf 'test-rootpins\n'; return 0 ;;
     tests/bit/stress/*) printf 'test-stress-exclusive\ntest-stress-batch\n'; return 0 ;;
     tests/bit/stwwiring/*) printf 'test-stwwiring\n'; return 0 ;;
+    # #3039. Not `runArgs()`-registered — it is a plain data file the
+    # harness reads at runtime, not Bit source — so the generic grep below
+    # can never find it; named by hand, same shape as tests/bit/checkercases/*.
+    tests/bit/releasesurface.allowlist) printf 'test-release-surface\n'; return 0 ;;
   esac
   grep -F "runArgs(\"$1\")" tools/build/gates.bit 2>/dev/null |
     sed -n 's/.*Gate{name: "\([^"]*\)".*/\1/p' || true
