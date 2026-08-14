@@ -192,24 +192,29 @@ POSTs `body` to `url`.
 Like `request`, but bounded by a whole-request `timeoutMs` - connect, send and
 read of headers and body all share ONE deadline, resolved once before dial
 rather than restarted per read. A server that accepts and never answers gets
-you a `fail` instead of an indefinite park. Covers `http://` and `https://` -
-an `https://` URL dials through [`std/tls`](tls.md)'s `dialDeadline`, whose
-`TlsConn` inherits the same deadline for the handshake and every later
-record-layer read/write. `https+h3://` fails outright: HTTP/3 runs over its
-own QUIC transport, with its own timers, and does not inherit a deadline from
-`std/net`'s `Conn`. There is no default on `request`/`get`/`post` themselves: a
-caller downloading a large file over a bare `get` is unaffected by this
-change.
+you a `fail` instead of an indefinite park. Covers `http://`, `https://` and
+`https+h3://` - an `https://` URL dials through [`std/tls`](tls.md)'s
+`dialDeadline`, whose `TlsConn` inherits the same deadline for the handshake
+and every later record-layer read/write. `https+h3://` runs over its own QUIC
+transport ([`std/http3`](http3.md)'s `h3DialDeadline`), which has no
+per-operation deadline primitive; instead the deadline lowers the QUIC
+connection's own RFC 9000 idle timeout, so a peer that accepts the handshake
+and never answers is torn down within the deadline. Two gaps relative to
+http/https: the QUIC handshake itself is still bounded by a fixed internal 5s
+abandon timer rather than by `timeoutMs`, and the idle timer resets on any
+received datagram rather than tracking request progress specifically. There
+is no default on `request`/`get`/`post` themselves: a caller downloading a
+large file over a bare `get` is unaffected by this change.
 
 ### `getTimeout(url: string, timeoutMs: int): Response!`
 
-GETs `url` (`http://` or `https://`, not `https+h3://`), bounded by a
+GETs `url` (`http://`, `https://`, or `https+h3://`), bounded by a
 whole-request `timeoutMs`.
 
 ### `postTimeout(url: string, body: string, timeoutMs: int): Response!`
 
-POSTs `body` to `url` (`http://` or `https://`, not `https+h3://`), bounded by
-a whole-request `timeoutMs`.
+POSTs `body` to `url` (`http://`, `https://`, or `https+h3://`), bounded by a
+whole-request `timeoutMs`.
 
 ```bit
 import { get, post, request, Response } from "std/http"
@@ -476,19 +481,19 @@ POSTs `body` to `url` through this client.
 ### `Client.requestTimeout(method: string, url: string, body: string, timeoutMs: int): Response!`
 
 Like the package-level `requestTimeout`: a whole-request deadline covering
-`http://` and `https://`, not `https+h3://`. Does not consult this client's
+`http://`, `https://`, and `https+h3://`. Does not consult this client's
 Alt-Svc cache or TLS config - an `https://` URL always dials with the default
 TLS config, not `c.tls`, so a `Client` built with `newClientTls` does not get
 its custom config applied here.
 
 ### `Client.getTimeout(url: string, timeoutMs: int): Response!`
 
-GETs `url` through this client (`http://` or `https://`, not `https+h3://`),
+GETs `url` through this client (`http://`, `https://`, or `https+h3://`),
 bounded by a whole-request `timeoutMs`.
 
 ### `Client.postTimeout(url: string, body: string, timeoutMs: int): Response!`
 
-POSTs `body` to `url` through this client (`http://` or `https://`, not
+POSTs `body` to `url` through this client (`http://`, `https://`, or
 `https+h3://`), bounded by a whole-request `timeoutMs`.
 
 ```bit
