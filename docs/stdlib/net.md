@@ -100,6 +100,22 @@ fn roundTrip(port: int, msg: string): string! {
 }
 ```
 
+### `Conn.shutdown()`
+
+Shuts both directions of the connection down without releasing the fd, so the
+number cannot be reused by a later `dial`/`listen`/`accept` until `close`
+follows. Idempotent.
+
+Use this, not `close`, to unblock a green thread of yours already parked in a
+`read` on this same `Conn` from another thread. Closing the fd does not wake a
+parked read - nothing in this runtime lets one thread interrupt another's
+blocked read, and closing tears the descriptor down without notifying the
+read's wait registration. Shutting the socket down instead is a real state
+transition on the still-open descriptor, which the kernel reports as newly
+readable - the wakeup a bare `close` does not produce. Call this, then wait for
+the parked reader to observe the resulting empty read/error and return, and
+only then call `close`.
+
 ## Deadlines
 
 A server that accepts and never answers parks `dial`/`read`/`write` forever -
