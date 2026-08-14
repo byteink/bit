@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stage and compress one release artifact.
 #
-#   dist/package.sh <version> <target> <outdir>
+#   dist/package.sh <version> <target> <outdir> [archivedir]
 #
 # <target> is a compiler target triple as `bit --target` spells it
 # (x86_64-linux | aarch64-linux | aarch64-macos). <version> is the tag without
@@ -10,17 +10,30 @@
 # self-hosted `bit` means EXECING the seed and only the workflow knows which
 # host it is on (see tools/build/artifacts.bit's hostTriple note).
 #
+# [archivedir] is where the three runtime archives (<triple>/libbitrt.a) are
+# read from, defaulting to `bit-out/lib` — the tree `./make libbitrt` writes,
+# so every existing caller is unaffected. `dist/release.sh` (#3034) passes its
+# own scratch directory instead: its shipped archives are built by THIS tree's
+# own compiler, not stage0, and writing them into `bit-out/lib` would make
+# `./make libbitrt`'s own staleness check blind to it — the fingerprint covers
+# runtime/** SOURCE, not which compiler last produced the archive on disk, so a
+# second run in the same tree would see "up to date" over an archive that is
+# actually a previous run's output, silently breaking release.sh's own
+# idempotency (and #3035's reproducibility check, which relies on a fresh
+# tree's `bit-out/lib` staying genuinely stage0-built).
+#
 # Emits <outdir>/bit-<version>-<os>-<arch>.tar.xz. The artifact contract this
 # implements — layout, naming, the BIT_STDLIB/BIT_LIBBITRT env requirement — is
 # specified in dist/README.md and consumed by the brew formula (#359), the
 # curl|sh installer (#360) and the winget package (#361). Change it there first.
 set -euo pipefail
 
-VERSION="${1:?usage: package.sh <version> <target> <outdir>}"
-TARGET="${2:?usage: package.sh <version> <target> <outdir>}"
-OUTDIR="${3:?usage: package.sh <version> <target> <outdir>}"
+VERSION="${1:?usage: package.sh <version> <target> <outdir> [archivedir]}"
+TARGET="${2:?usage: package.sh <version> <target> <outdir> [archivedir]}"
+OUTDIR="${3:?usage: package.sh <version> <target> <outdir> [archivedir]}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ARCHIVE_DIR="${4:-${ROOT}/bit-out/lib}"
 
 case "${TARGET}" in
   x86_64-linux)   OS=linux;  ARCH=x86_64 ;;
@@ -42,8 +55,8 @@ STAGE="${OUTDIR}/stage"
 [ -x "${STAGE}/bin/bit" ] || { echo "package.sh: missing ${STAGE}/bin/bit" >&2; exit 1; }
 
 for triple in ${RUNTIME_TRIPLES}; do
-  src="${ROOT}/bit-out/lib/${triple}/libbitrt.a"
-  [ -f "${src}" ] || { echo "package.sh: missing ${src} (run './make libbitrt')" >&2; exit 1; }
+  src="${ARCHIVE_DIR}/${triple}/libbitrt.a"
+  [ -f "${src}" ] || { echo "package.sh: missing ${src} (run './make libbitrt', or pass the right [archivedir])" >&2; exit 1; }
   mkdir -p "${STAGE}/lib/${triple}"
   cp "${src}" "${STAGE}/lib/${triple}/libbitrt.a"
 done

@@ -10,10 +10,14 @@
 # translation of it — a workflow can assume a clean runner per job, and this
 # cannot, so every step that mattered there is done here explicitly:
 #
-#   1. runtime archives for every target (the shipped compiler carries all three
-#      so one install can cross-compile)
-#   2. one self-hosted `bit` per target, cross-produced by the PINNED STAGE0
-#      (the previous release) — never by the compiler built from this tree
+#   1. bootstrap a native host `bit1` off the PINNED STAGE0 — compiler/ built by
+#      stage0, linking a stage0-built runtime archive. That is stage0's only
+#      role below (#3034)
+#   2. bit1 builds the SHIPPED runtime archive and the SHIPPED `bit`, for every
+#      target (the packaged compiler carries all three runtime archives so one
+#      install can cross-compile) — this tree's own codegen, not stage0's; for
+#      the host triple, the shipped `bit` must reproducibly build itself before
+#      anything is packaged
 #   3. dist/package.sh per target
 #   4. smoke-test each UNPACKED artifact by compiling and running a program, on
 #      hardware that matches it. Not the staging tree: the bytes that ship are
@@ -99,7 +103,7 @@ echo "release.sh: gate images present (${GATE_IMAGE_LOCAL} local, ${GATE_IMAGE_R
 
 TARGETS=(x86_64-linux aarch64-linux aarch64-macos)
 
-echo "release.sh: building runtime archives for every target"
+echo "release.sh: building the bootstrap runtime archives (L0, stage0-built)"
 ./make libbitrt
 
 echo "release.sh: resolving the pinned stage0"
@@ -112,7 +116,28 @@ echo "release.sh: stage0 = ${STAGE0}"
 # is — the same one scripts/stage0.sh already verified the digest of.
 STAGE0_VERSION="$("${STAGE0}" version | awk '{print $2}')"
 echo "release.sh: stage0 version = ${STAGE0_VERSION}"
+
+# C1 (#3034): stage0 builds compiler/ AS IT SITS ON DISK (unstamped — the
+# version stamp below is for the STAGED copy the shipped binaries come from),
+# for the HOST triple only, linking the L0 archive `./make libbitrt` just
+# built. This is stage0's entire job in this script: bit1 is a native host
+# binary exactly like stage0 itself, so it can cross-produce every shipped
+# target below the same way stage0 always has. `./make` is `install`, which
+# depends on `selfhost` which depends on `libbitrt` — both already satisfied
+# or cheaply re-verified by the call above.
+echo "release.sh: bootstrapping the host self-hosted compiler with stage0 (bit1)"
 ./make
+BIT1="${ROOT}/bit-out/bin/bit"
+[ -x "${BIT1}" ] || { echo "release.sh: ./make did not produce ${BIT1}" >&2; exit 1; }
+# `stepSelfhost` (tools/build/artifacts.bit) writes this on every `./make`
+# call, unconditionally, before its own up-to-date check — so it is reliably
+# fresh here without release.sh reimplementing the uname table.
+HOST_TRIPLE="$(cat "${ROOT}/bit-out/make/host.triple" 2>/dev/null || true)"
+[ -n "${HOST_TRIPLE}" ] || {
+	echo "release.sh: could not read bit-out/make/host.triple after ./make" >&2
+	exit 1
+}
+echo "release.sh: bit1 = ${BIT1} (host triple ${HOST_TRIPLE})"
 
 rm -rf "${OUT}"
 mkdir -p "${OUT}"
@@ -150,48 +175,92 @@ real="$(find compiler -maxdepth 1 -name '*.bit' | wc -l | tr -d ' ')"
 	exit 1
 }
 
+# L1 (#3034): bit1 — this tree's own codegen, not stage0's — compiles
+# runtime/ for every target. This is the half that reaches every user program
+# (#2213), so from here on it is built by THIS tree, not stage0.
+#
+# WRITTEN UNDER ${OUT}, NEVER INTO THE SHARED `bit-out/lib/` — a real defect
+# found by measurement, not review, in this ticket's first pass: `bit-out/lib`
+# is the same path `./make libbitrt` writes and staleness-checks by a
+# fingerprint over runtime/** SOURCE, not over which compiler produced the
+# archive on disk. Writing L1 there made a SECOND `release.sh` run in the same
+# tree see "up to date" over an archive that was actually the FIRST run's L1
+# output — silently turning "rooted at stage0" false on the second run, and
+# blind to it. Building here, all three up front (mirroring how `./make
+# libbitrt` builds all three before anything reads them, since `package.sh`
+# below embeds all three archives in every target's tarball regardless of
+# which target it is packaging), keeps `bit-out/` untouched by this script and
+# `./make libbitrt` genuinely idempotent.
+LIB1="${OUT}/lib1"
+for t in "${TARGETS[@]}"; do
+	echo "release.sh: L1 ${t}"
+	l1scratch="$(mktemp -d)"
+	BIT="${BIT1}" bash scripts/g2archive.sh "${t}" "${l1scratch}/libbitrt.a"
+	mkdir -p "${LIB1}/${t}"
+	cp "${l1scratch}/libbitrt.a" "${LIB1}/${t}/libbitrt.a"
+	rm -rf "${l1scratch}"
+done
+
 for t in "${TARGETS[@]}"; do
 	echo "release.sh: ${t}"
 	rm -rf "${OUT}/stage"
 	mkdir -p "${OUT}/stage/bin"
-	# The PINNED STAGE0 cross-produces the self-hosted compiler, from the STAGED
-	# source. This was the seed until #1593 deleted it; stage0 is a native binary
-	# for this host by construction, so it cross-compiles every target from one
-	# invocation exactly as the seed did.
+
+	archive="${LIB1}/${t}/libbitrt.a"
+
+	# C2 (#3034): bit1 builds the STAGED, version-stamped compiler/ for ${t},
+	# linking L1 — this IS the shipped `bin/bit`. Not stage0: a release is no
+	# longer produced by the previous release now that this tree's own
+	# compiler is proven, once below, to reliably build itself.
 	#
-	# NOT `bit-out/bin/bit`: that is built FROM this tree, and a release must be
-	# produced by the previous release, so a compiler bug introduced here cannot
-	# silently compile itself into the artifact. Same reason the differentials
-	# use stage0 as their oracle.
-	#
-	# BIT_LIBBITRT IS LOAD-BEARING — LINK THE TREE'S RUNTIME, NOT STAGE0'S (#2213).
-	# stage0 is an INSTALLED toolchain and resolves `libbitrt.a` relative to
-	# itself, so without this the shipped `bin/bit` carries the PREVIOUS
-	# RELEASE's runtime and every `runtime/` change is invisible in the compiler
-	# binary — while `lib/<triple>/libbitrt.a` packaged beside it IS current, so
-	# user programs get the fix and `bit` itself does not. That asymmetry is what
-	# it looks like when this line is missing.
-	#
-	# This is #1857 in the release path. `tools/build/artifacts.bit`'s
-	# `stepSelfhost` has carried the same export since then, for the same reason,
-	# and its comment records the original symptom: a fixed `bit_rt_parse_float`
-	# that had no effect on `bit`. 0.1.7 shipped without it and did not deliver
-	# the very GC fix it was cut for.
-	#
-	# It self-heals a release later — release N's runtime reaches the compiler in
-	# N+1, once the pin moves — which is exactly why it went unnoticed until a
-	# release was cut to fix the compiler's own runtime.
-	archive="${ROOT}/bit-out/lib/${t}/libbitrt.a"
-	# REFUSE rather than fall back: an absent archive silently reinstates the
-	# stage0 runtime, which is the defect itself.
+	# BIT_LIBBITRT IS STILL LOAD-BEARING (#2213, unchanged by #3034): bit1
+	# resolves `libbitrt.a` relative to itself absent an override, which is
+	# `bit-out/lib/${t}/libbitrt.a` (the L0 archive) — never ${archive}, since
+	# L1 now lives entirely under ${OUT} and bit1's sibling `lib/` cannot see
+	# it. Without this override the build would silently link L0 (stage0's
+	# codegen) instead of L1, defeating the whole point of this pass.
 	[ -f "${archive}" ] || {
-		echo "release.sh: missing ${archive} (run './make libbitrt')" >&2
+		echo "release.sh: missing ${archive} (the L1 build above should have written it)" >&2
 		exit 1
 	}
 	BIT_LIBBITRT="${archive}" \
-		"${STAGE0}" build "${STAGE_SRC}" --target "${t}" -o "${OUT}/stage/bin/bit"
+		"${BIT1}" build "${STAGE_SRC}" --target "${t}" -o "${OUT}/stage/bin/bit"
 	chmod +x "${OUT}/stage/bin/bit"
-	bash dist/package.sh "${VERSION}" "${t}" "${OUT}"
+
+	if [ "${t}" = "${HOST_TRIPLE}" ]; then
+		# C3, HOST TRIPLE ONLY (#3034): the shipped `bit` (bit2) must
+		# reproducibly build itself (bit3) from the same staged source and the
+		# same L1 archive, before anything is packaged. This is the standard
+		# fixed-point mitigation for a compiler that now compiles itself into
+		# what ships — reusing scripts/selfhost-fixpoint.sh's rule rather than
+		# re-deriving it: the Mach-O codesign identifier derives from the
+		# output FILENAME, so bit2 and bit3 are written to the SAME basename
+		# ("bit") in DIFFERENT directories, or the hashes differ for a reason
+		# that has nothing to do with codegen.
+		#
+		# HOST-ONLY, DELIBERATELY: a bit2 built for x86_64-linux or
+		# aarch64-linux cannot run on this Mac to build a bit3 of its own, so
+		# this proves nothing about those two targets' self-reproducibility —
+		# only that bit1 cross-produced them, the same guarantee stage0's
+		# cross-production always carried.
+		echo "release.sh: fixed-point check for ${t} — bit2 must reproducibly build bit3"
+		mkdir -p "${OUT}/fixpoint/bin"
+		BIT_LIBBITRT="${archive}" \
+			"${OUT}/stage/bin/bit" build "${STAGE_SRC}" --target "${t}" -o "${OUT}/fixpoint/bin/bit"
+		bit2Sha="$(shasum -a 256 "${OUT}/stage/bin/bit" | cut -d' ' -f1)"
+		bit3Sha="$(shasum -a 256 "${OUT}/fixpoint/bin/bit" | cut -d' ' -f1)"
+		echo "release.sh: bit2 sha256 = ${bit2Sha}"
+		echo "release.sh: bit3 sha256 = ${bit3Sha}"
+		rm -rf "${OUT}/fixpoint"
+		[ "${bit2Sha}" = "${bit3Sha}" ] || {
+			echo "release.sh: FIXED POINT BROKEN for ${t} — bit2 != bit3. This tree's compiler" >&2
+			echo "  does not reliably build itself, so shipping it as bin/bit is unsafe. Refusing." >&2
+			exit 1
+		}
+		echo "release.sh: FIXED POINT OK for ${t} — bit2 == bit3"
+	fi
+
+	bash dist/package.sh "${VERSION}" "${t}" "${OUT}" "${LIB1}"
 done
 
 # --- packaged-runtime atomic-width probe (#2742, #2744) ---------------------
@@ -209,14 +278,16 @@ done
 # aarch64's w/x split does, so there is no equivalent single-mnemonic check
 # for x86_64-linux. Skipped on purpose, not an oversight.
 #
-# THE LAG THIS CANNOT CLOSE, BY DESIGN (#1857): `./make libbitrt` compiles
-# runtime/ with the PINNED STAGE0 — the previous release's compiler — never
-# with the compiler built from this tree (see `stepLibbitrt` in
-# tools/build/artifacts.bit), so a codegen fix landing in THIS tree does not
-# reach the packaged libbitrt.a until the pin moves past the release that
-# carries the fix. This assertion exists only to say that out loud, in exit
-# status, at release time — not to let a fixed compiler be mistaken for a
-# fixed runtime, which is exactly what shipped unnoticed in 0.1.11.
+# A HIT HERE IS NOW A REAL DEFECT (#3034), not a known, tolerated lag. Before
+# #3034 the packaged runtime came from `./make libbitrt`'s PINNED STAGE0 build
+# (see `stepLibbitrt` in tools/build/artifacts.bit) and a codegen fix landing
+# in this tree could not reach it until the stage0 pin moved past the release
+# carrying the fix — 0.1.11 shipped the #2742 bug unnoticed exactly that way.
+# `stepLibbitrt` is unchanged (#3034's constraint: the L0 archive it produces
+# is still stage0-built, and still only bootstraps bit1 above), but the
+# archive this probe actually reads is packaged from L1 — bit1's own codegen —
+# so a failure here means THIS TREE'S compiler still emits the 64-bit form,
+# not that the fix is waiting on a pin.
 
 # <archive> <symbol-spelling-as-it-appears-in-the-object> <triple>
 # <bit_rt-name-for-messages>. Returns 0 clean, 1 a 64-bit hit, 2 this spelling
@@ -305,10 +376,10 @@ for pair in "${OUT}/bit-${VERSION}-macos-aarch64.tar.xz aarch64-macos" \
 	rm -rf "${work}"
 done
 if [ "${atomicBad}" -eq 1 ]; then
-	echo "release.sh: this is the pinned-stage0 lag by design (#1857), not a new bug —" >&2
-	echo "  the packaged runtime is built by the PREVIOUS release's compiler, so a" >&2
-	echo "  codegen fix landed in this tree (commit ${BUILT_COMMIT}) does not reach" >&2
-	echo "  libbitrt.a until the pin moves past the release that carries it. See #2742." >&2
+	echo "release.sh: THIS TREE's own compiler (commit ${BUILT_COMMIT}) emits a 64-bit" >&2
+	echo "  atomic through what runtime/spinlock.bit declares *i32 — a real codegen" >&2
+	echo "  defect, not the pinned-stage0 lag: the packaged libbitrt.a is built by bit1" >&2
+	echo "  (#3034), so this is not waiting on a stage0 repin. See #2742." >&2
 	exit 1
 fi
 echo "release.sh: aarch64 libbitrt.a atomic widths OK"
@@ -361,7 +432,7 @@ smoke() { # <tarball> <target> <runner...>
 	#
 	# So probe the compiler's OWN runtime, using the cheapest property that
 	# distinguishes them: #2207 made a thread blocked in `fsRead` stop burning
-	# CPU. `bit lsp --stdio` blocks on stdin by design, so launch it with stdin
+	# CPU. `bit lsp --stdio` deliberately blocks on stdin, so launch it with stdin
 	# held open, send nothing, and measure. A stale runtime spins a whole core;
 	# a current one is idle. CPU time is read rather than wall-clock %, so a
 	# loaded machine cannot fake either verdict.
