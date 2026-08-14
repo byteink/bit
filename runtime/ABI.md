@@ -291,6 +291,17 @@ caller's `sp`/`rsp` and passes its address to the poll body as the first C
 argument — so every thread that polls has its own snapshot with no thread-local
 storage, no registration, and no shared global. The walk starts there.
 
+**Invariant a caller must preserve.** The frame MUST be reserved on the
+publishing thread's own stack, at an address strictly below that thread's
+stack pointer at the moment of the call — never a static buffer or a
+per-thread heap block. The collector uses the published address itself as a
+conservative lower bound for that thread's live stack (`runtime/stw/stw.bit`,
+root class 10, `stwParkedLo`), not merely as a pointer to the fields above.
+This is load-bearing, not incidental: a shim that ever built this frame
+anywhere else would make class 10 silently inert — `stwTaskHoldsSp` would be
+false for every task, no bound would ever lower, and a stopped mutator's live
+stack would go unscanned again with no error and no red gate (#1834).
+
 The snapshot's `regs` array is **not** zeroed (the shim runs at every loop
 back-edge; clearing 32 words per poll is not free). Only the callee-saved file is
 written. That is sound in both directions: the register file restriction above
@@ -940,6 +951,7 @@ defined exactly once).
 | `bit_rt_fs_mkdir`     | `(path: *const RtBytes) -> i64` (§14)                   |
 | `bit_rt_fs_remove`    | `(path: *const RtBytes) -> i64` (§14)                   |
 | `bit_rt_fs_list_dir`  | `(path: *const RtBytes) -> *const RtBytes` (§14)        |
+| `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing at ONE i64 WORD PER BYTE — not a packed C string, not `RtBytes`; the only `bit_rt_fs_*` entry point shaped this way) |
 | `bit_rt_test_index`   | `() -> i64` (§16)                                      |
 | `bit_rt_floor`        | `(x: f64) -> f64` (§17)                                |
 | `bit_rt_ceil`         | `(x: f64) -> f64` (§17)                                |
@@ -1307,6 +1319,7 @@ bit_rt_fs_is_dir(path)            -> bool
 bit_rt_fs_mkdir(path)             -> i64        // 0, or -1
 bit_rt_fs_remove(path)            -> i64        // file or empty dir; 0, or -1
 bit_rt_fs_list_dir(path)          -> string     // NUL-terminated entry names
+bit_rt_fs_is_symlink_w(words, n)  -> bool        // path is a symlink itself (readlink-based)
 ```
 
 The low-level layer under `std/fs`. Deliberately plain (not fallible): failures
@@ -1348,6 +1361,19 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   reports present; only `ENOENT`/`ENOTDIR` mean genuinely absent (#2114).
   `is_dir` is the one that actually distinguishes a directory: Darwin's
   `opendir` succeeding, Linux's `getdents64` succeeding on the opened fd.
+- `is_symlink_w` is the only `bit_rt_fs_*` entry point that does not take a Bit
+  `string`. Its caller is `std/fs`, which can reach a runtime symbol only
+  through an `extern function` (SPEC §11.7), and §11.7 admits no `string`
+  across that boundary — so `words` is the raw backing store of a Bit
+  `[]byte` instead, `n` elements at **one 8-byte word each** (SPEC §11.8:
+  `ptrOf` on a `[]u8` does not address packed bytes), not a packed C string
+  and not an `RtBytes`. The provider unpacks the words into its own
+  NUL-terminated buffer before probing it, applying the same `max_path` and
+  embedded-NUL rejections every other path-taking entry point applies
+  (#2146). It answers with `readlink`, not `lstat` + `S_IFLNK`: `readlink`
+  succeeds only on a symbolic link and needs no `struct stat` layout, so a
+  dangling link still answers `true` — the link exists whether its target
+  does or not.
 
 **These calls block their worker's OS thread for the syscall's duration, and
 that is not a netpoller gap.** POSIX has no non-blocking read of a regular file:
@@ -1511,6 +1537,11 @@ bit_rt_time_mono_ns()      -> i64   // monotonic; the only clock that measures e
 bit_rt_time_unix_ns()      -> i64   // wall clock, ns since the Unix epoch; may jump
 bit_rt_time_sleep_ns(ns)   -> void  // park this green thread for >= ns
 ```
+
+`bit_rt_time_sleep_ns` converts the relative `ns` to an absolute monotonic
+deadline (`bit_rt_time_mono_ns() + ns`) and clamps that deadline to `i64max`
+nanoseconds rather than let the addition overflow and wrap negative, so a
+duration near `i64max` never wakes early.
 
 `sleep` records a deadline on the `Task`, then `park`s with a `ParkFn` that
 links it onto the scheduler's `TimerQueue` — the same "register only after the

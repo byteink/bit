@@ -83,7 +83,10 @@ fn timed(label: string) {
 
 ### `sleep(d: int)`
 
-Parks the calling green thread for at least `d` nanoseconds.
+Parks the calling green thread for at least `d` nanoseconds. The deadline is
+absolute, so the runtime clamps it to `i64max` nanoseconds; a duration of
+`i64max` parks the thread for about 292 years and never returns early. A
+duration of `0` or less yields the calling green thread and returns at once.
 
 A sleeping green thread does not hold an OS thread: the scheduler runs others on
 it and wakes this one when the deadline passes. A thousand threads sleeping 50 ms
