@@ -68,7 +68,7 @@
 // `./mem.bit` is a SIBLING file, so it is the same module as this one and needs
 // no import — its functions are already in scope.
 import { spinAcquire, spinRelease } from "../"
-import { allocClassify, allocLargeLen, allocSpanBytes, allocSpanNext, heapTakeSmallLocked, heapGiveSmallLocked, heapRefillLocked, heapReclaimSpansLocked, heapLargeAllocLocked, heapLargeFreeLocked, heapLiveBytes, heapMappedBytes, heapSpansReleasedLocked, heapCheckSpansLocked, heapSpanViolations } from "../alloc"
+import { allocClassify, allocLargeLen, allocSpanBytes, allocSpanNext, heapTakeSmallLocked, heapGiveSmallLocked, heapRefillLocked, heapReclaimSpansLocked, heapLargeAllocLocked, heapLargeFreeLocked, heapLiveBytes, heapMappedBytes, heapSpansReleasedLocked, heapCheckSpansLocked, heapSpanViolations, heapSpanCachePushLocked, heapSpanCacheTakeLocked } from "../alloc"
 
 // ---------------------------------------------------------------------------
 // ABI constants (runtime/ABI.md §1, §2) — frozen, shared with codegen.
@@ -348,20 +348,34 @@ export @nosplit @symbol("bit_rt_port_gc_bind_memory") fn gcBindMemory(g: *i64, s
       spinRelease(heapLock(g))
       return addr
     }
-    // Class empty: carve a fresh span out of the reserve and retry, which is
-    // `allocSmall`'s `refill` path. `reserveGrow` maps a fresh chunk when the
-    // reserve is spent, so this fails only when the OS is out — `refill`'s
-    // `mapPages(span_bytes) orelse return false` exactly (#1638).
-    let span = reserveGrow(g + gcSpanRes, allocSpanBytes)
+    // Class empty: try the #3045 span cache before the reserve. A reclaimed
+    // span sitting there is address space that is already ours — resident,
+    // owned, and unlinked from every class — so reusing it costs nothing the
+    // reserve would otherwise have to map fresh (#2803: the reserve is a pure
+    // bump allocator with no free list, so every miss here is a chunk that
+    // never comes back).
+    let span = heapSpanCacheTakeLocked(heapBlock(g))
+    let owned = true
     if (span == 0) {
-      spinRelease(heapLock(g))
-      return 0
+      // Cache empty: carve a fresh span out of the reserve and retry, which is
+      // `allocSmall`'s `refill` path. `reserveGrow` maps a fresh chunk when the
+      // reserve is spent, so this fails only when the OS is out — `refill`'s
+      // `mapPages(span_bytes) orelse return false` exactly (#1638).
+      span = reserveGrow(g + gcSpanRes, allocSpanBytes)
+      if (span == 0) {
+        spinRelease(heapLock(g))
+        return 0
+      }
+      // Whether this span may ever be given back to the OS is decided HERE and
+      // recorded on the span, because this is the only place that knows: a span out
+      // of a chunk the reserve mapped is releasable, one out of the arena the
+      // CALLER bound is not (#2375, see `reserveHeadOwns`).
+      owned = reserveHeadOwns(g + gcSpanRes, span, allocSpanBytes)
     }
-    // Whether this span may ever be given back to the OS is decided HERE and
-    // recorded on the span, because this is the only place that knows: a span out
-    // of a chunk the reserve mapped is releasable, one out of the arena the
-    // CALLER bound is not (#2375, see `reserveHeadOwns`).
-    heapRefillLocked(heapBlock(g), idx, span, reserveHeadOwns(g + gcSpanRes, span, allocSpanBytes))
+    // A cached span is always releasable: `heapSpanCachePushLocked` only ever
+    // receives spans `heapReclaimSpansLocked` marked doomed, and that pass
+    // only takes spans with `spanOwned != 0` to begin with.
+    heapRefillLocked(heapBlock(g), idx, span, owned)
     if (*(g + gcCfgStress) != 0) {
       let _ = heapCheckSpansLocked(heapBlock(g))
     }
@@ -426,8 +440,17 @@ export @nosplit @symbol("bit_rt_port_gc_bind_memory") fn gcBindMemory(g: *i64, s
       // Bounded: `heapReclaimSpansLocked` builds the chain in a bounded walk of
       // one class's span list, and every span on it is off both lists.
       while (chain != 0) {
-        let nxt = allocSpanNext(chain)     // read BEFORE the pages go away
-        memUnmapPages(chain, allocSpanBytes)
+        // Read BEFORE the span is cached or unmapped: caching overwrites the
+        // span's own first word (#3045), and unmapping makes it unreadable.
+        let nxt = allocSpanNext(chain)
+        // Try the #3045 cache first; only unmap when it reports full. Either
+        // way the span leaves `heapMappedBytes`' count here — a cache hit
+        // stays resident but is no longer "mapped" in the accounting sense
+        // until a later refill adds it back, exactly as an unmapped span's
+        // bytes leave the count now and return only via a fresh refill.
+        if (heapSpanCachePushLocked(heapBlock(g), chain) == 0) {
+          memUnmapPages(chain, allocSpanBytes)
+        }
         heapSpansReleasedLocked(heapBlock(g), allocSpanBytes)
         chain = nxt
       }
