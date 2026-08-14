@@ -2596,11 +2596,11 @@ The string is a **module path**: `"std/io"`, `"std/net/http"` for standard-libra
 modules, or a relative path `"./util"`, `"../shared"` for project-local modules.
 
 - `import io from "std/io"` binds the namespace `io`; members accessed as
-  `io.println(...)` in expression position, or `io.Writer` in type position
+  `io.stdout()` in expression position, or `io.Writer` in type position
   (`qual_type_name`, §11).
 - `import * as io from "std/io"` is the explicit spelling of the same.
-- `import { println, printf } from "std/io"` binds the named members directly.
-- `import { println as say } from "std/io"` renames on import.
+- `import { stdout, writer } from "std/io"` binds the named members directly.
+- `import { stdout as out } from "std/io"` renames on import.
 
 Only **exported** members (§17.3) are importable. Import cycles are rejected.
 
@@ -3150,8 +3150,8 @@ Richer assertions with value diffs live in `std/testing`, layered on this runner
 A complete, conforming program exercising the major features:
 
 ```
-import { println } from "std/io"
-import { readAll } from "std/fs"
+import { readFile } from "std/fs"
+import { parseInt } from "std/strings"
 
 interface Shape { area(): f64 }
 
@@ -3172,7 +3172,7 @@ fn totalArea<T: Shape>(shapes: []T): f64 {
 
 // Fallible: parse an f64 count from a file, default to a computed value on error.
 fn loadCount(path: string): int! {
-  let text = readAll(path)?           // propagate fs errors
+  let text = readFile(path)?          // propagate fs errors
   return parseInt(text)?              // propagate parse errors
 }
 
