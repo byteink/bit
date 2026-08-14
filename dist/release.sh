@@ -175,27 +175,38 @@ real="$(find compiler -maxdepth 1 -name '*.bit' | wc -l | tr -d ' ')"
 	exit 1
 }
 
+# L1 (#3034): bit1 — this tree's own codegen, not stage0's — compiles
+# runtime/ for every target. This is the half that reaches every user program
+# (#2213), so from here on it is built by THIS tree, not stage0.
+#
+# WRITTEN UNDER ${OUT}, NEVER INTO THE SHARED `bit-out/lib/` — a real defect
+# found by measurement, not review, in this ticket's first pass: `bit-out/lib`
+# is the same path `./make libbitrt` writes and staleness-checks by a
+# fingerprint over runtime/** SOURCE, not over which compiler produced the
+# archive on disk. Writing L1 there made a SECOND `release.sh` run in the same
+# tree see "up to date" over an archive that was actually the FIRST run's L1
+# output — silently turning "rooted at stage0" false on the second run, and
+# blind to it. Building here, all three up front (mirroring how `./make
+# libbitrt` builds all three before anything reads them, since `package.sh`
+# below embeds all three archives in every target's tarball regardless of
+# which target it is packaging), keeps `bit-out/` untouched by this script and
+# `./make libbitrt` genuinely idempotent.
+LIB1="${OUT}/lib1"
+for t in "${TARGETS[@]}"; do
+	echo "release.sh: L1 ${t}"
+	l1scratch="$(mktemp -d)"
+	BIT="${BIT1}" bash scripts/g2archive.sh "${t}" "${l1scratch}/libbitrt.a"
+	mkdir -p "${LIB1}/${t}"
+	cp "${l1scratch}/libbitrt.a" "${LIB1}/${t}/libbitrt.a"
+	rm -rf "${l1scratch}"
+done
+
 for t in "${TARGETS[@]}"; do
 	echo "release.sh: ${t}"
 	rm -rf "${OUT}/stage"
 	mkdir -p "${OUT}/stage/bin"
 
-	# L1 (#3034): bit1 — this tree's own codegen, not stage0's — compiles
-	# runtime/ for ${t}, replacing the L0 archive `./make libbitrt` produced
-	# above at the same shared path. This is the half that reaches every user
-	# program (#2213), so from here on it is built by THIS tree.
-	#
-	# `scripts/g2archive.sh` refuses to write the shared path directly (it is
-	# read by peers), so build to a scratch archive and copy it into place —
-	# the same two-step `stepLibbitrt` (tools/build/artifacts.bit) already
-	# uses; that step itself is left untouched (#3034's constraint), the L1
-	# pass is a second, later write to the same destination.
-	archive="${ROOT}/bit-out/lib/${t}/libbitrt.a"
-	l1scratch="$(mktemp -d)"
-	BIT="${BIT1}" bash scripts/g2archive.sh "${t}" "${l1scratch}/libbitrt.a"
-	mkdir -p "$(dirname "${archive}")"
-	cp "${l1scratch}/libbitrt.a" "${archive}"
-	rm -rf "${l1scratch}"
+	archive="${LIB1}/${t}/libbitrt.a"
 
 	# C2 (#3034): bit1 builds the STAGED, version-stamped compiler/ for ${t},
 	# linking L1 — this IS the shipped `bin/bit`. Not stage0: a release is no
@@ -203,12 +214,11 @@ for t in "${TARGETS[@]}"; do
 	# compiler is proven, once below, to reliably build itself.
 	#
 	# BIT_LIBBITRT IS STILL LOAD-BEARING (#2213, unchanged by #3034): bit1
-	# resolves `libbitrt.a` relative to itself absent an override, and its own
-	# sibling `lib/` does not (yet) hold ${t}'s L1 archive, so without this the
-	# build would fall through to `bit-out/lib/${t}/libbitrt.a` by the CWD
-	# default — which happens to be correct today only because that is exactly
-	# where the L1 copy above just landed. Pass it explicitly rather than rely
-	# on that coincidence.
+	# resolves `libbitrt.a` relative to itself absent an override, which is
+	# `bit-out/lib/${t}/libbitrt.a` (the L0 archive) — never ${archive}, since
+	# L1 now lives entirely under ${OUT} and bit1's sibling `lib/` cannot see
+	# it. Without this override the build would silently link L0 (stage0's
+	# codegen) instead of L1, defeating the whole point of this pass.
 	[ -f "${archive}" ] || {
 		echo "release.sh: missing ${archive} (the L1 build above should have written it)" >&2
 		exit 1
@@ -250,7 +260,7 @@ for t in "${TARGETS[@]}"; do
 		echo "release.sh: FIXED POINT OK for ${t} — bit2 == bit3"
 	fi
 
-	bash dist/package.sh "${VERSION}" "${t}" "${OUT}"
+	bash dist/package.sh "${VERSION}" "${t}" "${OUT}" "${LIB1}"
 done
 
 # --- packaged-runtime atomic-width probe (#2742, #2744) ---------------------
