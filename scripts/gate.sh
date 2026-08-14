@@ -304,6 +304,7 @@ gates_for_file() {
     tests/bit/pollfree/*) printf 'test-pollfree\n'; return 0 ;;
     tests/bit/rootabi/*) printf 'test-rootabi\n'; return 0 ;;
     tests/bit/rootpins/*) printf 'test-rootpins\n'; return 0 ;;
+    tests/bit/spec/*) printf 'test-spec\n'; return 0 ;;
     tests/bit/stress/*) printf 'test-stress-exclusive\ntest-stress-batch\n'; return 0 ;;
     tests/bit/stwwiring/*) printf 'test-stwwiring\n'; return 0 ;;
     # #3039. Not `runArgs()`-registered — it is a plain data file the
@@ -502,7 +503,7 @@ while IFS= read -r f; do
         docs_list="${f}"
       fi
       ;;
-    # spec/SPEC.md compiles nothing, but tests/bit/spec.bit (#2758's
+    # spec/SPEC.md compiles nothing, but tests/bit/spec/ (#2758's
     # test-spec) DOES read it — a grammar-consistency check, not prose with no
     # gate — so it gets a REAL bucket too (#2962), matched ahead of the
     # `spec/*` no-gate arm below the same way docs/*.md is matched ahead of
@@ -737,7 +738,7 @@ bucket_scripts() {
     examples)
       BUCKET_POST="scripts/selfhost-diffexamples.sh"
       ;;
-    # spec (test-spec, tests/bit/spec.bit) has no differential script — same
+    # spec (test-spec, tests/bit/spec/) has no differential script — same
     # shape as testcases/stdlib/docs/testsbit above, which also fall through
     # with both empty.
     full)
