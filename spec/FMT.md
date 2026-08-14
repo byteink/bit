@@ -33,22 +33,30 @@ function and file; line numbers are as of `bbe3c4c5`.
 
 ## 1. Line width
 
-**Rule.** The budget is 100 columns (`fmtMaxWidth`, `compiler/fmt.bit:21`). A
-bracketed comma list (see §5) that does not already fit renders one item per
-line instead of overflowing. A single-item list stays on one line even over
-budget — wrapping a lone item never shortens anything.
+**Rule.** The budget is 100 columns (`fmtMaxWidth`, `compiler/fmt.bit:27`). A
+bracketed comma list (see §5), a flat unbracketed list — return values,
+assignment sides, `case` expression lists, constraint bounds
+(`fmtPrintFlatList`, `compiler/fmtwrap.bit:14-97`) — and a bare
+binary/logical/string-concat chain (`fmtPrintBinaryChain`,
+`compiler/fmtwrap.bit:410-454`, dispatched from the `Binary`-tag case,
+`compiler/fmtexpr.bit:78-81`) each render flat only if that fits; otherwise
+one item/operand per line at one deeper indent. A single-item list stays on
+one line even over budget — wrapping a lone item never shortens anything (§5).
 
-**Check:** `fmtMaxWidth` in `compiler/fmt.bit` reads `100`; no emitted line
-inside a bracketed list's flattened form exceeds 100 columns.
+**Check:** `fmtMaxWidth` in `compiler/fmt.bit` reads `100`; no emitted line in
+a bracketed list's, a flat list's, or a binary chain's flattened form exceeds
+100 columns.
 
-**Not settled for every construct — see §10.** The 100-column budget is only
-enforced on the bracketed-list path (`fmtPrintCommaList`). Return values,
-assignment sides, `case` expression lists, and bare binary/logical chains
-(`fmtPrintFlatList`, and the `Binary`-tag printer in `fmtexpr.bit`) have **no**
-width check at all today — `#2874` measured lines up to 1716 characters on that
-path, and `#2889` (open, not yet fixed) is the ticket for it. Do not read
-"the budget is 100 columns" as true everywhere; it is true only where §5 below
-says it is.
+**Settled for every construct that renders as a list or a chain (`#2889`,
+`#2894`).** This was a real gap once — `#2874`'s corpus inventory measured
+lines up to 1716 characters on the flat-list and bare-chain paths, because
+`fmtPrintFlatList` and `fmtPrintBinaryChain` had no width check at all.
+`#2889` gave both the same flat-then-fits-or-wrap shape `fmtPrintCommaList`
+already had (all three share one implementation pattern,
+`compiler/fmtwrap.bit:1-7`), and `#2894` closed the one remaining interaction
+between them (a binary chain nested as a bracketed list's sole item — see
+§5). §10 records that history and the exemptions that are the whole of what
+is left unsettled; there is currently no construct with zero width check.
 
 ## 2. Indentation
 
@@ -313,28 +321,34 @@ whose last real token is already a terminator, gets no `;`).
 function declaration, …) is never followed by `;` in the output; a statement
 ending in a bare expression, identifier, or literal is.
 
-## 10. Explicitly unsettled — no rule stated, do not invent one
+## 10. Width budget for bare (non-bracketed) constructs — settled (`#2889`, `#2894`)
 
-**This section is stale about `#2889`/`#2894` and is tracked as `#2954`.**
-`#2889` landed and gave `fmtPrintBinaryChain` a real 100-column check (see
-§5's "Nested width decisions" note, `#2894`) — the paragraph below still
-describes it as unimplemented. Do not trust the "no width check at all"
-claim for the `Binary`-tag path without re-reading `compiler/fmtwrap.bit`
-directly; `#2954` owns rewriting this section to match.
+**Rule.** Return values, assignment sides, `case` expression lists,
+constraint bounds (`fmtPrintFlatList`, `compiler/fmtwrap.bit:14-97`, shares
+the flat-then-fits-or-wrap shape §5's bracketed lists use) and bare
+binary/logical/string-concat chains (`fmtPrintBinaryChain`,
+`compiler/fmtwrap.bit:410-454`, dispatched from the `Binary`-tag case,
+`compiler/fmtexpr.bit:78-81`) render flat if that fits under the §1 budget
+and holds no comment, else one item/operand per line at one deeper indent —
+the same rule §1 and §5 state, extended by `#2889` to every construct that
+had none. `#2894` is the one interaction the extension needed: a chain
+nested as a single-element bracketed list's sole item (§5's "Nested width
+decisions") measures against the indent baseline rather than the real column,
+because the enclosing single-element list was always going to stay flat
+regardless, and measuring for real would only manufacture a wrap that forces
+every enclosing single-element list to explode for no shortening gain.
 
-**Width budget for bare (non-bracketed) constructs.** Return values,
-assignment sides, `case` expression lists, constraint bounds
-(`fmtPrintFlatList`, `compiler/fmt.bit:329-338`, "always flat" per its own
-header) and bare binary/logical/string-concat chains (the `Binary`-tag
-printer, `compiler/fmtexpr.bit:71-80`) have **no width check at all** —
-`#2874`'s inventory measured lines up to 1716 characters on this path, and it
-is `#2889`, open at the time of writing, not yet fixed. §1's 100-column
-budget is settled *only* for the bracketed-list path (§5); it is not yet a
-rule for anything else, and this document states none until `#2889` lands
-and settles what the wrap point is (there is no comma or bracket to wrap
-after in a bare `||` chain, so the rule cannot simply be "reuse §5").
-`#2876`'s gate must not require this path to be canonical until it is fixed,
-or the gate enshrines `#2889`'s bug.
+**Check:** `return aVeryLongIdentifier1 + aVeryLongIdentifier2 + ...` (a bare
+`+` chain as a sole return value, over 100 columns) wraps one operand per
+line; `return a, b` (a flat two-item list) wraps to one item per line when
+the joined form is over budget and stays joined when it is not.
+
+This section used to be titled "Explicitly unsettled" and named this exact
+gap: `#2874`'s inventory measured lines up to 1716 characters on the
+flat-list and bare-chain paths before `#2889`/`#2894` landed. It is kept as
+its own section, rather than folded into §1, because it is where a reader
+checking whether a *specific* non-bracketed construct is covered should
+look first — nothing here is exempt from §1 any longer.
 
 No other category named in this ticket was found unsettled: indentation
 (§2), the blank-line policy between declarations (§3), and whether the
