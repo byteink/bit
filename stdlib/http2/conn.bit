@@ -125,12 +125,18 @@ export fn getHeader(headers: []HeaderField, name: string): string {
 // channel. Create one with `connect` (client) or `accept` (server).
 // `readerDone`/`writerDone` are not exported (no field is) — reach them only
 // through `waitReaderDone()`/`waitWriterDone()`.
+//
+// `deadlineNs` is the same absolute monotonic deadline `connect`/`accept`
+// received (0 = no bound), kept here so `roundTrip` can bound its own wait
+// on `replyCh` the same way `h2connAwaitReady` bounds the SETTINGS wait
+// (#3036).
 export struct Conn {
   isClient: bool,
   cmdCh: chan<h2connCmd>,
   acceptCh: chan<h2connAccept>,
   readerDone: chan<int>,
   writerDone: chan<int>,
+  deadlineNs: int,
 }
 
 // --- connection setup --------------------------------------------------------
@@ -233,6 +239,7 @@ fn h2connStart(
     acceptCh: acceptCh,
     readerDone: readerDoneCh,
     writerDone: writerDoneCh,
+    deadlineNs: deadlineNs,
   }
 }
 
@@ -300,6 +307,37 @@ fn h2connArmDeadline(deadlineNs: int, timeoutCh: chan<int>) {
     sleep(remaining)
   }
   timeoutCh <- 1
+}
+
+// Block until `replyCh` delivers a stream's outcome, or `deadlineNs` elapses
+// first (0 = no bound) — the same race `h2connAwaitReady` runs for the
+// SETTINGS wait, and needed for the identical reason: a channel receive has
+// no timer of its own, and no deadline on the transport's own reads can
+// reach it.
+//
+// This closes a real gap, not a hypothetical one: `h2connLoop`'s
+// `while (st.running)` (loop.bit) stops as soon as an inbound `eof` flips
+// `st.running`, WITHOUT draining anything still queued in `cmdCh` — so a
+// `h2cmdOpen` that reaches `cmdCh` around the same moment the reader's `eof`
+// reaches `inCh` can lose the race and sit there forever: the loop thread
+// has already returned, nothing will ever read it, and nothing will ever
+// send on the `replyCh` `roundTrip` is waiting on (#3036). Draining `cmdCh`
+// in the `eof` branch would not fully close this — a command sent AFTER the
+// loop has already left its `select` cannot be drained by a handler that
+// thread will never run again — so `roundTrip` bounds its own wait instead,
+// exactly as `h2connAwaitReady` already does for the symmetric case one step
+// earlier in the connection's lifecycle.
+fn h2connAwaitReply(replyCh: chan<h2connMsg>, deadlineNs: int): h2connMsg! {
+  let timeoutCh = chan<int>(1)
+  if (deadlineNs != 0) {
+    spawn h2connArmDeadline(deadlineNs, timeoutCh)
+  }
+  select {
+    case reply = <- replyCh:
+      return reply
+    case tick = <- timeoutCh:
+      fail newError("http2: timed out waiting for response")
+  }
 }
 
 // The first stream id this endpoint allocates: clients use odd ids from 1, and a
@@ -539,7 +577,8 @@ fn h2connAtoi(s: string): int {
 
 // Send `req` on a fresh stream and block until its full response arrives. Safe to
 // call from many green threads at once — each request rides its own stream,
-// multiplexed over the one connection.
+// multiplexed over the one connection. Bounded by the same deadline
+// `connect`/`accept` received (0 = no bound) — see `h2connAwaitReply` (#3036).
 export fn (c: Conn) roundTrip(req: Request): Response! {
   let replyCh = chan<h2connMsg>(1)
   c.cmdCh <- h2connCmd{
@@ -550,7 +589,7 @@ export fn (c: Conn) roundTrip(req: Request): Response! {
     errorCode: 0,
     replyCh: replyCh,
   }
-  let msg = <- replyCh
+  let msg = h2connAwaitReply(replyCh, c.deadlineNs)?
   if (!msg.ok) {
     fail newError(msg.errMsg)
   }
