@@ -291,6 +291,17 @@ caller's `sp`/`rsp` and passes its address to the poll body as the first C
 argument — so every thread that polls has its own snapshot with no thread-local
 storage, no registration, and no shared global. The walk starts there.
 
+**Invariant a caller must preserve.** The frame MUST be reserved on the
+publishing thread's own stack, at an address strictly below that thread's
+stack pointer at the moment of the call — never a static buffer or a
+per-thread heap block. The collector uses the published address itself as a
+conservative lower bound for that thread's live stack (`runtime/stw/stw.bit`,
+root class 10, `stwParkedLo`), not merely as a pointer to the fields above.
+This is load-bearing, not incidental: a shim that ever built this frame
+anywhere else would make class 10 silently inert — `stwTaskHoldsSp` would be
+false for every task, no bound would ever lower, and a stopped mutator's live
+stack would go unscanned again with no error and no red gate (#1834).
+
 The snapshot's `regs` array is **not** zeroed (the shim runs at every loop
 back-edge; clearing 32 words per poll is not free). Only the callee-saved file is
 written. That is sound in both directions: the register file restriction above
