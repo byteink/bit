@@ -247,12 +247,15 @@ stdlib_files=""
 # `full`. Prints nothing for any OTHER path that isn't named via `runArgs`;
 # the caller treats that empty result as ambiguous.
 #
-# SEVEN MORE EXCEPTIONS (#2903): six gates register a whole DIRECTORY in
-# `runArgs("tests/bit/<dir>")` rather than a single file, because the
-# directory is one Bit module and the gate runs it as one program — so no
-# path INSIDE that directory can ever match the exact-string grep below, and
-# every file in all six (abimembers, clicmd, rootabi, rootpins, stress,
-# stwwiring) was unmapped, forcing `full`, until this fix. One arm per
+# NINE MORE EXCEPTIONS (#2903, recounted #3047 — recount from the case arms
+# below at fix time, not from this number, which has already drifted twice as
+# later tickets added arms without updating it): nine gates register a whole
+# DIRECTORY in `runArgs("tests/bit/<dir>")` rather than a single file,
+# because the directory is one Bit module and the gate runs it as one
+# program — so no path INSIDE that directory can ever match the exact-string
+# grep below, and every file in all nine (abimembers, benchgate, clicmd,
+# pollfree, rootabi, rootpins, spec, stress, stwwiring) was unmapped, forcing
+# `full`, until this fix. One arm per
 # directory, matching the gate(s) gates.bit actually registers for it — for
 # tests/bit/stress that is the two `test`-reachable split gates
 # (test-stress-exclusive, test-stress-batch; #2564), NOT the redundant
