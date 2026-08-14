@@ -49,10 +49,10 @@ changes the spec **in the same commit**, not afterwards.
    tree's compiler must produce byte-identical AST/type/IR dumps over the corpus
    (`scripts/selfhost-diff*.sh`). A divergence is a change that is not finished
    -- except a small number of exact, named STAGE0-PINLAG entries for a real
-   behaviour change the pinned stage0 cannot yet reflect (e.g.
-   `selfhost-diffdiags.sh`'s and `selfhost-difftokens.sh`'s BOM-stripping
-   entries, `selfhost-diffruntime.sh`'s `PINLAG_MODULES`); those are deleted
-   at the next stage0 repin, not amended.
+   behaviour change the pinned stage0 cannot yet reflect
+   (`selfhost-diffdump.sh`'s `PINLAG_FILES` and `selfhost-diffruntime.sh`'s
+   `PINLAG_MODULES`, both currently empty); those are deleted at the next
+   stage0 repin, not amended.
 4. **Files stay under 800 lines** (target ~500). Split by moving top-level
    blocks into sibling `.bit` files in the same directory - not into
    subdirectories, which would make a new module.

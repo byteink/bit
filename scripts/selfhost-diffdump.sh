@@ -97,9 +97,6 @@ NAME="${1:?usage: selfhost-diffdump.sh <ast|tokens|diags|types|ir|iropt>}"
 # Usage: ./make selfhost && bash scripts/selfhost-difftokens.sh
 # Exits non-zero (printing the first divergence) on any mismatch.
 #
-# EXCEPT the small, named STAGE0-PINLAG accept list below (#2993) — see that
-# comment block for the one entry it currently holds and why.
-#
 # --- from scripts/selfhost-diffdiags.sh ---
 # Self-host front-end diagnostic differential (#1335/#363): run every corpus
 # `.bit` file through both compilers' `--dump-diags` (lexer + parser diagnostics
@@ -111,9 +108,6 @@ NAME="${1:?usage: selfhost-diffdump.sh <ast|tokens|diags|types|ir|iropt>}"
 #
 # Usage: ./make selfhost && bash scripts/selfhost-diffdiags.sh
 # Exits non-zero (printing the first divergence) on any mismatch.
-#
-# EXCEPT the small, named STAGE0-PINLAG accept list below (#2992) — see that
-# comment block for the one entry it currently holds and why.
 #
 # --- from scripts/selfhost-difftypes.sh ---
 # Self-host type differential (#1337/#364): run every corpus `.bit` through both
@@ -216,129 +210,16 @@ NAME="${1:?usage: selfhost-diffdump.sh <ast|tokens|diags|types|ir|iropt>}"
 # Usage: ./make selfhost && bash scripts/selfhost-diffiropt.sh
 
 # name    | flag           | verdict label   | skip label        | verb (ir only) | kind  | timeout (env, default)
-PINLAG_FILES=""
 case "$NAME" in
-  ast)    FLAG=--dump-ast;    LABEL="AST";           SKIPLABEL="parse-err";       VERB="";         KIND=basic; TIMEOUT="${DIFFAST_TIMEOUT:-20}"
-          PINLAG_FILES="tests/imports/nsimporttype/main.bit" ;;
-  tokens) FLAG=--dump-tokens; LABEL="token";         SKIPLABEL="lex-err";         VERB="";         KIND=basic; TIMEOUT="${DIFFTOKENS_TIMEOUT:-20}"
-          PINLAG_FILES="tests/imports/bomstrip/main.bit" ;;
-  diags)  FLAG=--dump-diags;  LABEL="diag";          SKIPLABEL="";                VERB="";         KIND=basic; TIMEOUT="${DIFFDIAGS_TIMEOUT:-20}"
-          PINLAG_FILES="tests/imports/bomstrip/main.bit tests/cases/run_raw_string_dollar_brace_literal.bit tests/imports/nsimporttype/main.bit" ;;
+  ast)    FLAG=--dump-ast;    LABEL="AST";           SKIPLABEL="parse-err";       VERB="";         KIND=basic; TIMEOUT="${DIFFAST_TIMEOUT:-20}" ;;
+  tokens) FLAG=--dump-tokens; LABEL="token";         SKIPLABEL="lex-err";         VERB="";         KIND=basic; TIMEOUT="${DIFFTOKENS_TIMEOUT:-20}" ;;
+  diags)  FLAG=--dump-diags;  LABEL="diag";          SKIPLABEL="";                VERB="";         KIND=basic; TIMEOUT="${DIFFDIAGS_TIMEOUT:-20}" ;;
   types)  FLAG=--dump-types;  LABEL="type";          SKIPLABEL="check-err";       VERB="";         KIND=types; TIMEOUT="${DIFFTYPES_TIMEOUT:-20}" ;;
   ir)     FLAG=--dump-ir-pre; LABEL="IR (pre-opt)";  SKIPLABEL="lower/check-err"; VERB="pre-opt";  KIND=ir;    TIMEOUT="${DIFFIR_TIMEOUT:-300}" ;;
   iropt)  FLAG=--dump-ir;     LABEL="IR (post-opt)"; SKIPLABEL="lower/check-err"; VERB="post-opt"; KIND=ir;    TIMEOUT="${DIFFIROPT_TIMEOUT:-300}" ;;
   *) echo "selfhost-diffdump: unknown differential '${NAME}' (want ast|tokens|diags|types|ir|iropt)" >&2; exit 2 ;;
 esac
 PREFIX="diff${NAME}"
-
-# --- ast/tokens/diags stage0 pin-lag accept list (#2992, #2993, #3032) ---
-#
-# tests/imports/bomstrip/main.bit's first three bytes are a UTF-8 BOM (#2976,
-# compiler/lexer.bit's stripBom(), called at every production entry point).
-# The pinned stage0 (0.1.15) predates stripBom entirely and has no BOM
-# handling, so it lexes the raw EF BB BF as an unexpected top-level token and
-# emits E0021 while this tree strips it and compiles clean. This is a real,
-# permanent front-end behaviour change this tree made ON PURPOSE -- the
-# fixture exists specifically to prove it -- not a bug on either side.
-#
-# Two DIFFERENT rows carry this entry because the same root cause surfaces at
-# two different pipeline stages (#2993 confirmed both on unmodified main
-# before adding the tokens entry, rather than assuming diags' reasoning
-# transfers):
-#   - diags (#2992): the oracle's LEXER accepts the raw BOM bytes as a token,
-#     rc=0 -- lexing does not fail -- and it is the PARSER that then rejects
-#     that bogus leading token with E0021. --dump-diags sees the E0021.
-#   - tokens (#2993): --dump-tokens is the raw lex-level view, one level
-#     BELOW where diags diverges. The oracle's lexer emits a garbage `ident`
-#     token for the raw BOM bytes at offset 0..3 (confirmed: running the
-#     oracle directly with --dump-tokens on this file exits 0, so
-#     SKIPLABEL="lex-err" never fires -- the lexer does not consider this an
-#     error at all, it just tokenizes differently), and every token after it
-#     is offset-shifted against this tree's stripped stream, so the whole
-#     file's token stream mismatches from position 0 onward. --dump-ast is
-#     unaffected (selfhost-diffast.sh: MATCH=760 MISMATCH=0 on this same
-#     file) because the parser recovers past the bad leading token to an
-#     identical tree either way -- only the raw diagnostic and token views
-#     see the divergence, not the AST.
-#
-# A second entry, diags-only, added by #3032 for #3009's E0098 warning:
-# tests/cases/run_raw_string_dollar_brace_literal.bit contains a backtick
-# raw string with a well-formed `${...}` pair (`` `The sum is ${1 + 2}` ``).
-# #3009 (be62d9e1, compiler/lexstr.bit:187/236, ecRawStringInterpLooking)
-# made this tree emit `warning[E0098]: '${' in a raw string is literal
-# text, not interpolation` on that pair. The pinned stage0 (0.1.15) predates
-# the warning entirely (`git merge-base --is-ancestor be62d9e1 v0.1.15` is
-# false) and lexes the file with no diagnostic at all, so --dump-diags is
-# empty on the oracle side and one warning on this tree's side. Confirmed
-# diags-only, not assumed: selfhost-diffast.sh and selfhost-difftokens.sh
-# both report this file as MATCH -- the warning changes no token and no
-# parse tree, only the diagnostic stream, so only the diags row needs the
-# entry.
-#
-# A third entry, on BOTH the ast and diags rows, added by #3032 for #2118's
-# namespace-qualified type support: tests/imports/nsimporttype/main.bit
-# declares `out: io.Writer` and `fn emit(w: io.Writer, ...)`. Before #2118
-# (3ff0cf87, compiler/parsertype.bit's parseType adding a QualType node —
-# `IDENT "." IDENT` in type position), `io.Writer` in a type position was
-# four-plus cascading E0021s from the single '.' token; #2118 postdates
-# v0.1.15's cut (`git merge-base --is-ancestor 3ff0cf87 v0.1.15` is false),
-# so the pinned oracle still rejects this file outright. Confirmed on both
-# rows independently, not assumed to transfer (same discipline #2993 used
-# above): --dump-diags is five E0021s on the oracle side and empty on this
-# tree's; --dump-ast is not skipped (SKIP(parse-err)=0 — the oracle's
-# --dump-ast exits 0 despite the E0021s) but is a real mismatch: the
-# oracle's error-recovery parse of `io.Writer` diverges structurally from
-# this tree's `qual_type` node from the very first line, unlike the BOM
-# case above where the parser recovers to an IDENTICAL tree either side of
-# the bad token. tokens is unaffected
-# (selfhost-difftokens.sh: MATCH=770 MISMATCH=0 including this file) because
-# `io`, `.` and `Writer` tokenize identically either way; only the PARSER's
-# interpretation of that token sequence differs, and ast/diags are the only
-# two views downstream of parsing.
-#
-# This is NOT the class of expected-mismatch list #1883 deleted and the
-# "outpaced oracle" header above (types/ir/iropt) refuses to re-admit. That
-# class was KNOWN PORTING GAPS: the self-hosted checker had not caught up
-# with construct X yet, which is fixable by writing more compiler code, and a
-# list let that stay unfixed indefinitely. There is no code change in THIS
-# repo that makes the PUBLISHED, IMMUTABLE stage0 binary strip a BOM -- the
-# only thing that clears this is a new stage0 pin cut from a release
-# containing #2976, which cannot happen yet: the pinned release is 0.1.15,
-# the newest tag is v0.1.15, and #2976 is not in any published release.
-#
-# Named exactly, not by wildcard or by "looks like a BOM file" heuristic --
-# same discipline as selfhost-diffruntime.sh's PINLAG_MODULES (#2937): a
-# listed path is one SPECIFIC, EXPLAINED divergence. Any other file that
-# starts differing, including a second BOM fixture not on this list, still
-# fails the run (see is_pinlag_file below and its mutation test in the
-# commit that added this).
-#
-# The verdict line reads "MATCH=n MISMATCH=n" prefixed with "STAGE0-PINLAG —"
-# whenever this list has a hit, and every accepted file is named on every
-# run with its own "STAGE0-PINLAG:" line -- never a bare, unqualified
-# MISMATCH=0 that could be mistaken for "the two compilers agree on
-# everything".
-#
-# DELETE EACH ENTRY AT THE NEXT STAGE0 REPIN THAT CONTAINS ITS OWN FIX --
-# not all three necessarily clear at the same repin, since each depends on a
-# different commit landing in the release the pin moves to:
-#   - tests/imports/bomstrip/main.bit clears once the pin is cut from a tree
-#     containing #2976 (stripBom).
-#   - tests/cases/run_raw_string_dollar_brace_literal.bit clears once the
-#     pin is cut from a tree containing #3009 (be62d9e1, E0098).
-#   - tests/imports/nsimporttype/main.bit (both the ast and diags rows)
-#     clears once the pin is cut from a tree containing #2118 (3ff0cf87,
-#     QualType).
-# A file that still diverges after the repin containing its own fix is a
-# real regression, not pin lag, and must be investigated rather than
-# re-added here.
-is_pinlag_file() {
-  p="$1"
-  for e in $PINLAG_FILES; do
-    [ "$e" = "$p" ] && return 0
-  done
-  return 1
-}
 
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
@@ -376,7 +257,7 @@ whydied() {
 # both sides and a rejected one renders the same diagnostic on both, so nothing
 # is excluded; ast/tokens skip a file the oracle could not lex/parse.
 run_basic() {
-  match=0 mismatch=0 skip=0 pinlag=0 firstbad=""
+  match=0 mismatch=0 skip=0 firstbad=""
   for f in $(find $CORPUS -name '*.bit' | sort); do
     seed=$(alarmrun "$ORACLE" "$FLAG" "$f")
     rc=$?
@@ -387,26 +268,16 @@ run_basic() {
     b2=$(alarmrun "$BIT2" "$FLAG" "$f")
     if [ "$seed" = "$b2" ]; then
       match=$((match + 1))
-    elif is_pinlag_file "$f"; then
-      pinlag=$((pinlag + 1))
-      echo "STAGE0-PINLAG: $f (accepted until stage0 repin, see selfhost-diffdump.sh's accept-list header)"
     else
       mismatch=$((mismatch + 1))
       [ -z "$firstbad" ] && firstbad="$f"
     fi
   done
 
-  if [ "$pinlag" -gt 0 ]; then
-    VERDICT="STAGE0-PINLAG — "
-    SUFFIX=", $pinlag accepted as pin-lag"
-  else
-    VERDICT=""
-    SUFFIX=""
-  fi
   if [ -n "$SKIPLABEL" ]; then
-    echo "$LABEL differential: ${VERDICT}MATCH=$match MISMATCH=$mismatch${SUFFIX} SKIP($SKIPLABEL)=$skip"
+    echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch SKIP($SKIPLABEL)=$skip"
   else
-    echo "$LABEL differential: ${VERDICT}MATCH=$match MISMATCH=$mismatch${SUFFIX}"
+    echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch"
   fi
 
   # A phase that measured nothing must not pass (#1516). On an empty or unfindable
