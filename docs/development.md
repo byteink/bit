@@ -93,10 +93,11 @@ line-1 directive selects the mode — `// run` (execute, compare stdout),
 `// fmt` (canonicalization), `// types` (inferred-type dump), `// lint`.
 
 **What the differentials assert.** The fifteen `scripts/selfhost-diff*.sh` once
-diffed a Zig seed against the Bit compiler, so green meant "two independent
-implementations agree". The oracle is now the pinned stage0 — the same compiler
-one release back — so green means "this version did not change behaviour versus
-the last release". **That cannot catch a bug present in both.**
+diffed a separately-implemented bootstrap compiler against the Bit compiler, so
+green meant "two independent implementations agree". The oracle is now the
+pinned stage0 — the same compiler one release back — so green means "this
+version did not change behaviour versus the last release". **That cannot catch
+a bug present in both.**
 `docs/release/bootstrap.md` §5 records this as the accepted loss; do not read a
 green differential as the stronger claim.
 
@@ -205,10 +206,9 @@ Old notes and tickets will mislead you:
 - **`compiler/` was `selfhost/`** (#1841). The self-hosted compiler is *the*
   compiler; "selfhost" only carried information while a non-self-hosted one
   existed.
-- **`seed/` no longer exists** (#1593). The Zig seed compiler is deleted, and so
-  is `build.zig` (#1871) — the repo contains no Zig at all. `./make selfhost`
-  keeps its step name because fifteen `scripts/selfhost-diff*.sh` invoke it, but
-  it now means "run the pinned stage0 over `compiler/`".
+- **`seed/` no longer exists** (#1593). `./make selfhost` keeps its step name
+  because fifteen `scripts/selfhost-diff*.sh` invoke it, but it now means "run
+  the pinned stage0 over `compiler/`".
 
 ## Website
 
