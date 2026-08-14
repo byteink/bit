@@ -21,6 +21,25 @@
 # Usage: ./make selfhost && bash scripts/selfhost-diffdump.sh <name>
 #   name: ast | tokens | diags | types | ir | iropt
 #
+# --- types/ir/iropt never run the resolver (#3069) ---
+#
+# `--dump-types`/`--dump-ir-pre`/`--dump-ir` all reach `checkModule` through
+# `lowerSourceModule`/`checkSourceDump` (compiler/lowerdriver.bit:312,
+# compiler/checkmodule.bit:480) and never call `resolveModule`. A real
+# `bit build`/`run`/`test`/`check`/`doc` resolves first
+# (compiler/checkproject.bit:115) and only then checks -- a different branch
+# inside `checkExprType` (compiler/check.bit:163: nodeSymbols is "[e]mpty on
+# the bare dump entry points"), with different staleness behaviour. So a bug
+# that only exists on the resolver-active path is invisible to these three
+# rows, however MATCH they read. Demonstrated on
+# tests/cases/run_generic_let_chain.bit: this dump shows `f1(x)` inside
+# `build<T>` targeting the concrete `f1$3`, while a real `bit build` of the
+# same file emits a call to `f1$0`, the degenerate unbound-type-param
+# instance -- see docs/development.md "What the differentials assert" and
+# #3069 for the full per-differential table and the object-level evidence.
+# `ast`/`tokens`/`diags` never reach `checkModule` at all, so this does not
+# apply to them.
+#
 # --- Reading a red types/ir/iropt run: outpaced oracle vs. real regression (#2382) ---
 #
 # All three of these compare against the PINNED STAGE0 -- a fixed earlier
