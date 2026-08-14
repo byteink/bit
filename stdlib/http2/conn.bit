@@ -23,6 +23,10 @@
 // `hpack.bit` and `frames.bit`; every unexported helper here is prefixed
 // `h2conn` so the three files never collide.
 
+// `monotonic`/`sleep` bound the wait for the peer's opening SETTINGS
+// (`h2connAwaitReady`, #3019) — the module's only use of std/time.
+import { monotonic, sleep } from "std/time"
+
 // --- the byte transport ------------------------------------------------------
 
 // An abstract bidirectional byte stream. `read` returns up to `n` bytes and an
@@ -137,26 +141,41 @@ const h2connPreface: string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 // Dial: run the client side of the preface (magic + SETTINGS) over `t` and start
 // the connection. The returned `Conn` is ready for `roundTrip`.
-export fn connect(t: Transport, cfg: Config): Conn! {
+//
+// `deadlineNs` bounds the wait for the peer's opening SETTINGS — an absolute
+// monotonic nanosecond deadline (`std/time`'s `monotonic()` plus a budget,
+// the same convention `std/net`/`std/tls` use), or 0 for no bound. Pass the
+// SAME deadline the transport's own reads are bounded by (0 if none) — a
+// nonzero deadline over an unbounded transport can make setup fail here
+// while the transport itself waits out its own unrelated, unbounded read
+// (#3019).
+export fn connect(t: Transport, cfg: Config, deadlineNs: int): Conn! {
   t.write([]byte(h2connPreface))?
   let r = h2connNewFrameReader(t)
-  return h2connStart(t, cfg, true, r)?
+  return h2connStart(t, cfg, true, r, deadlineNs)?
 }
 
 // Answer: read and validate the client preface over `t`, then start the
-// connection. Drive the returned `Conn` with `serve`.
-export fn accept(t: Transport, cfg: Config): Conn! {
+// connection. Drive the returned `Conn` with `serve`. `deadlineNs` is as
+// `connect`'s.
+export fn accept(t: Transport, cfg: Config, deadlineNs: int): Conn! {
   let r = h2connNewFrameReader(t)
   let magic = h2connReadExact(r, len(h2connPreface))?
   if (!h2connBytesEqual(magic, []byte(h2connPreface))) {
     fail newError("http2: malformed client connection preface")
   }
-  return h2connStart(t, cfg, false, r)?
+  return h2connStart(t, cfg, false, r, deadlineNs)?
 }
 
 // Common startup: send our SETTINGS, allocate the channels, build the loop-owned
 // state, and spawn the reader, writer, and loop threads.
-fn h2connStart(t: Transport, cfg: Config, isClient: bool, r: h2connFrameReader): Conn! {
+fn h2connStart(
+  t: Transport,
+  cfg: Config,
+  isClient: bool,
+  r: h2connFrameReader,
+  deadlineNs: int,
+): Conn! {
   t.write(encodeSettings(h2connOurSettings(cfg))?)?
 
   let inCh = chan<h2connEvent>(64)
@@ -173,7 +192,7 @@ fn h2connStart(t: Transport, cfg: Config, isClient: bool, r: h2connFrameReader):
     writeCh: writeCh,
     acceptCh: acceptCh,
     readyCh: readyCh,
-    settingsSeen: false,
+    readySignaled: false,
     enc: newEncoderConfig(cfg.headerTableSize, true),
     dec: newDecoderConfig(cfg.headerTableSize),
     streams: map<int, h2connStream>(),
@@ -203,8 +222,66 @@ fn h2connStart(t: Transport, cfg: Config, isClient: bool, r: h2connFrameReader):
   // Complete the SETTINGS handshake before handing the connection back: block
   // until the loop has processed the peer's initial SETTINGS, so the peer's
   // window and frame-size limits are known before the first request is sent.
-  <- readyCh
+  // Bounded by `deadlineNs` and by the teardown path, not a bare receive —
+  // see `h2connAwaitReady` (#3019).
+  h2connAwaitReady(readyCh, readerDoneCh, deadlineNs)?
   return Conn{ isClient: isClient, cmdCh: cmdCh, acceptCh: acceptCh, readerDone: readerDoneCh }
+}
+
+// Block until the loop signals `readyCh` (1 for the peer's opening SETTINGS,
+// 0 for a teardown before that — events.bit's EOF handling) or until
+// `deadlineNs` elapses first (0 = no bound). A channel receive has no timer
+// of its own, unlike a socket read, so one is armed here explicitly for
+// exactly this wait: a green thread that sleeps for the remaining budget
+// then signals `timeoutCh`, raced against `readyCh` with `select`.
+//
+// On EITHER failure, drains `readerDoneCh` before failing so the reader
+// green thread `h2connStart` just spawned is provably done touching the
+// transport by the time this returns — required before whoever called
+// `connect`/`accept` can safely close the transport (the same
+// close-before-the-reader-is-done fd-reuse hazard #3016 fixed for a live
+// `Conn`, now guarded here for a `Conn` that never got created). This is
+// bounded, not a second unbounded wait: a torn-down connection's reader has
+// already hit the failure that triggered the teardown signal, and a timed-out
+// wait's reader is reading over the identical `deadlineNs` (see `connect`'s
+// doc), so either way the reader's own read fails at essentially the same
+// moment and `doneCh` follows immediately.
+fn h2connAwaitReady(readyCh: chan<int>, readerDoneCh: chan<int>, deadlineNs: int): ()! {
+  let timeoutCh = chan<int>(1)
+  if (deadlineNs != 0) {
+    spawn h2connArmDeadline(deadlineNs, timeoutCh)
+  }
+  let outcome = 0
+  select {
+    case sig = <- readyCh:
+      if (sig == 0) {
+        outcome = 1
+      }
+    case tick = <- timeoutCh:
+      outcome = 2
+  }
+  if (outcome == 0) {
+    return
+  }
+  <- readerDoneCh
+  if (outcome == 2) {
+    fail newError("http2: timed out waiting for peer SETTINGS")
+  }
+  fail newError("http2: connection closed before peer SETTINGS")
+}
+
+// Send once on `timeoutCh` once `deadlineNs` (an absolute monotonic
+// nanosecond deadline) has passed, or immediately if it already has. Its own
+// green thread so `h2connAwaitReady`'s `select` can race it against
+// `readyCh`; `timeoutCh` is buffered (capacity 1) so this send never blocks,
+// including when `readyCh` already won the race and nothing will ever
+// receive it.
+fn h2connArmDeadline(deadlineNs: int, timeoutCh: chan<int>) {
+  let remaining = deadlineNs - monotonic()
+  if (remaining > 0) {
+    sleep(remaining)
+  }
+  timeoutCh <- 1
 }
 
 // The first stream id this endpoint allocates: clients use odd ids from 1, and a

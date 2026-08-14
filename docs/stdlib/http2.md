@@ -626,15 +626,16 @@ fn echo(req: Request): Response {
 }
 
 // `client` and `server` are the two ends of one byte stream - a socket pair, or
-// an in-memory pipe in a test. Serve one end and fetch "/" from the other.
+// an in-memory pipe in a test. Serve one end and fetch "/" from the other. `0`
+// is "no deadline" - see `connect` below for a bounded wait.
 fn demo(client: Transport, server: Transport): Response! {
   spawn serveOn(server)
-  let conn = connect(client, defaultConfig())?
+  let conn = connect(client, defaultConfig(), 0)?
   return conn.roundTrip(newRequest("GET", "example.com", "/"))?
 }
 
 fn serveOn(t: Transport) {
-  let conn = accept(t, defaultConfig()) catch e {
+  let conn = accept(t, defaultConfig(), 0) catch e {
     return
   }
   conn.serve(echo) catch e2 {
@@ -694,17 +695,26 @@ A response with a status and a body and no extra headers.
 The value of the first header named `name` (case-sensitive - HTTP/2 field names
 are lower-case), or "" if absent.
 
-### `connect(t: Transport, cfg: Config): Conn!`
+### `connect(t: Transport, cfg: Config, deadlineNs: int): Conn!`
 
 Run the client side of the connection: send the preface and our SETTINGS over
 `t`, and return a `Conn` once the peer's SETTINGS is in effect. Drive it with
 `roundTrip`.
 
-### `accept(t: Transport, cfg: Config): Conn!`
+`deadlineNs` bounds the wait for the peer's opening SETTINGS - an absolute
+monotonic nanosecond deadline (`std/time`'s `monotonic()` plus a budget), or
+`0` for no bound. Fails if the connection tears down before SETTINGS arrives,
+or if the deadline elapses first - either way before this function returns, so
+there is never a `Conn` left half-built. Pass the same deadline `t`'s own
+reads are bounded by; a deadline over a transport whose reads are not bounded
+by it can make this wait time out while the read underneath it keeps blocking
+unrelated and unbounded.
+
+### `accept(t: Transport, cfg: Config, deadlineNs: int): Conn!`
 
 Run the server side: read and validate the client preface over `t`, exchange
 SETTINGS, and return a `Conn`. Fails on a malformed preface. Drive it with
-`serve`.
+`serve`. `deadlineNs` is as `connect`'s.
 
 ### `Conn`
 
