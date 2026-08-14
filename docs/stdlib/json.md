@@ -208,6 +208,16 @@ panic. An integral literal that fits `i64` - including `i64` MIN,
 duplicate object key keeps every entry - `jsonGet`'s last-key-wins policy is
 what resolves it.
 
+Every parse error's `message()` carries where it happened, not just what went
+wrong: `"json: expected ',' or '}' in object at byte 7 (line 1, column 8)"`.
+The byte offset is what a program slices or seeks with; line:column is what a
+human reads - 1-based, matching the compiler's own `--> file:LINE:COL`
+numbering. Both count bytes, not Unicode runes, so a column after a
+multi-byte UTF-8 character counts each of its bytes; a `\r\n` line ending
+counts as one line break. An error at end-of-input reports the position just
+past the last byte (never an out-of-range value or a silent zero) - the
+correct place to point at when there's no next character to blame.
+
 ### `jsonParse(source: string): Json!`
 
 Parses `source` as one JSON value, optionally surrounded by whitespace and
