@@ -59,25 +59,31 @@ fn h2glueWrite(conn: TlsConn, b: []byte) {
 // then tear the connection down (this module is one request per connection). A
 // setup or round-trip failure closes the socket and propagates.
 //
-// `h2connect` spawns a reader green thread (`stdlib/http2/conn.bit:193`) that
-// parks reading `conn` for the life of the connection, and this runtime has no
-// way to interrupt that park from outside. A bare `conn.close()` does not wake
-// it either — closing tears the fd down without notifying an already-parked
-// reader at all (`std/net`'s `Conn.shutdown` doc comment has the verified
-// mechanism) — so the reader is left retrying its read against whatever the OS
-// has since done with the same fd number once this function returns and its
-// caller opens the next connection: a later `dial()` in this same process, for
+// `h2connect` spawns reader AND writer green threads (`stdlib/http2/conn.bit:193`)
+// that park on the transport (reader) or an empty command channel (writer) for
+// the life of the connection, and this runtime has no way to interrupt either
+// park from outside. A bare `conn.close()` does not wake the reader — closing
+// tears the fd down without notifying an already-parked reader at all
+// (`std/net`'s `Conn.shutdown` doc comment has the verified mechanism) — so a
+// still-parked reader is left retrying its read against whatever the OS has
+// since done with the same fd number once this function returns and its caller
+// opens the next connection: a later `dial()` in this same process, for
 // instance, and the read can then return bytes that belong to that different
-// connection entirely (#3016). So teardown here is always the three steps in
+// connection entirely (#3016). The writer has the same fd-reuse exposure on
+// its own next queued write, but neither `close()` nor `shutdown()` wakes it —
+// it is parked on a channel, not the socket, and only the loop thread's own
+// `eof` handling releases it (#3026, `stdlib/http2/events.bit`) once the
+// reader's failure reaches the loop. So teardown here is always four steps in
 // order: `conn.shutdown()` (the real wakeup — an orderly EOF the reader's next
-// read observes), `hc.waitReaderDone()` (block until it has), THEN
-// `conn.close()` (now provably safe to let something else reuse the fd).
+// read observes), `hc.waitReaderDone()` (block until it has), `hc.waitWriterDone()`
+// (block until the writer has followed, released by the loop's eof handling),
+// THEN `conn.close()` (now provably safe to let something else reuse the fd).
 //
 // `h2connect`'s own failure path (a dead connection or an unresponsive peer
-// before the peer's opening SETTINGS, #3019) already drains its reader before
-// returning the error — see `h2connAwaitReady` — so `conn.close()` there is
-// just as safe as the three-step teardown above, without needing this
-// function to repeat that wait for a `Conn` it never received. `conn.deadlineNs()`
+// before the peer's opening SETTINGS, #3019) already drains its reader and
+// writer before returning the error — see `h2connAwaitReady` — so `conn.close()`
+// there is just as safe as the four-step teardown above, without needing this
+// function to repeat those waits for a `Conn` it never received. `conn.deadlineNs()`
 // carries `getTimeout`'s whole-request deadline down into that wait, so a dead
 // peer or one that never sends SETTINGS fails inside the caller's own
 // deadline instead of parking forever.
@@ -89,11 +95,13 @@ fn h2clientExchange(conn: TlsConn, method: string, u: Url, body: string): Respon
   let res = hc.roundTrip(h2glueRequestOf(method, u, body)) catch e {
     conn.shutdown()
     hc.waitReaderDone()
+    hc.waitWriterDone()
     conn.close()
     fail e
   }
   conn.shutdown()
   hc.waitReaderDone()
+  hc.waitWriterDone()
   conn.close()
   return h2glueResponse(res)
 }
@@ -111,11 +119,15 @@ fn h2clientExchange(conn: TlsConn, method: string, u: Url, body: string): Respon
 // connection early. So by the time `hc.serve()` returns, the reader has already
 // hit that same EOF and is done touching the transport (that is what woke the
 // loop in the first place) — `hc.waitReaderDone()` here is a bounded join, not a
-// fresh wait, matching `h2clientExchange`'s three-step teardown
-// (`conn.shutdown()` -> `hc.waitReaderDone()` -> `conn.close()`, #3016) even
-// though nothing here needs the `shutdown()` to wake anything: the socket was
-// never being closed at all before this fix (#3020), leaking one parked green
-// thread and one open fd per served connection forever.
+// fresh wait, matching `h2clientExchange`'s teardown (`conn.shutdown()` ->
+// `hc.waitReaderDone()` -> `hc.waitWriterDone()` -> `conn.close()`, #3016,
+// #3026) even though nothing here needs the `shutdown()` to wake anything: the
+// socket was never being closed at all before this fix (#3020), leaking one
+// parked green thread and one open fd per served connection forever.
+// `hc.waitWriterDone()` is bounded the same way `hc.waitReaderDone()` is: the
+// same eof handling that released `hc.serve()` (via `acceptCh`) also queues
+// the writer's stop (via `writeCh`), so both joins settle once the loop has
+// run, not on a fresh unbounded wait.
 fn h2glueServe(conn: TlsConn, handler: (Request) => Response, altPort: int) {
   // No deadline: `serveTls` gives its handler no per-connection timeout
   // budget to thread through today, so this stays unbounded exactly as
@@ -127,11 +139,13 @@ fn h2glueServe(conn: TlsConn, handler: (Request) => Response, altPort: int) {
   hc.serve((r) => h2glueResponseOutAlt(handler(h2glueRequestIn(r)), altPort)) catch e2 {
     conn.shutdown()
     hc.waitReaderDone()
+    hc.waitWriterDone()
     conn.close()
     return
   }
   conn.shutdown()
   hc.waitReaderDone()
+  hc.waitWriterDone()
   conn.close()
 }
 

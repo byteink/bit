@@ -123,13 +123,14 @@ export fn getHeader(headers: []HeaderField, name: string): string {
 // A live HTTP/2 connection. Opaque: the mutable protocol state lives entirely in
 // the loop thread, and every operation is a method that talks to it over a
 // channel. Create one with `connect` (client) or `accept` (server).
-// `readerDone` is not exported (no field is) — reach it only through
-// `waitReaderDone()`.
+// `readerDone`/`writerDone` are not exported (no field is) — reach them only
+// through `waitReaderDone()`/`waitWriterDone()`.
 export struct Conn {
   isClient: bool,
   cmdCh: chan<h2connCmd>,
   acceptCh: chan<h2connAccept>,
   readerDone: chan<int>,
+  writerDone: chan<int>,
 }
 
 // --- connection setup --------------------------------------------------------
@@ -184,6 +185,7 @@ fn h2connStart(
   let acceptCh = chan<h2connAccept>(256)
   let readyCh = chan<int>(1)
   let readerDoneCh = chan<int>(1)
+  let writerDoneCh = chan<int>(1)
 
   let st = h2connState{
     isClient: isClient,
@@ -216,7 +218,7 @@ fn h2connStart(
     activeStreams: 0,
   }
 
-  spawn h2connWriter(t, writeCh)
+  spawn h2connWriter(t, writeCh, writerDoneCh)
   spawn h2connReader(r, inCh, cfg.maxFrameSize, readerDoneCh)
   spawn h2connLoop(st)
   // Complete the SETTINGS handshake before handing the connection back: block
@@ -224,8 +226,14 @@ fn h2connStart(
   // window and frame-size limits are known before the first request is sent.
   // Bounded by `deadlineNs` and by the teardown path, not a bare receive —
   // see `h2connAwaitReady` (#3019).
-  h2connAwaitReady(readyCh, readerDoneCh, deadlineNs)?
-  return Conn{ isClient: isClient, cmdCh: cmdCh, acceptCh: acceptCh, readerDone: readerDoneCh }
+  h2connAwaitReady(readyCh, readerDoneCh, writerDoneCh, deadlineNs)?
+  return Conn{
+    isClient: isClient,
+    cmdCh: cmdCh,
+    acceptCh: acceptCh,
+    readerDone: readerDoneCh,
+    writerDone: writerDoneCh,
+  }
 }
 
 // Block until the loop signals `readyCh` (1 for the peer's opening SETTINGS,
@@ -235,18 +243,27 @@ fn h2connStart(
 // exactly this wait: a green thread that sleeps for the remaining budget
 // then signals `timeoutCh`, raced against `readyCh` with `select`.
 //
-// On EITHER failure, drains `readerDoneCh` before failing so the reader
-// green thread `h2connStart` just spawned is provably done touching the
-// transport by the time this returns — required before whoever called
-// `connect`/`accept` can safely close the transport (the same
-// close-before-the-reader-is-done fd-reuse hazard #3016 fixed for a live
-// `Conn`, now guarded here for a `Conn` that never got created). This is
-// bounded, not a second unbounded wait: a torn-down connection's reader has
-// already hit the failure that triggered the teardown signal, and a timed-out
-// wait's reader is reading over the identical `deadlineNs` (see `connect`'s
-// doc), so either way the reader's own read fails at essentially the same
-// moment and `doneCh` follows immediately.
-fn h2connAwaitReady(readyCh: chan<int>, readerDoneCh: chan<int>, deadlineNs: int): ()! {
+// On EITHER failure, drains `readerDoneCh` then `writerDoneCh` before failing
+// so the reader and writer green threads `h2connStart` just spawned are
+// provably done touching the transport by the time this returns — required
+// before whoever called `connect`/`accept` can safely close the transport
+// (the same close-before-done fd-reuse hazard #3016 fixed for a live `Conn`'s
+// reader, now guarded here — for both threads — for a `Conn` that never got
+// created). Reader first, writer second: the writer's release is caused by
+// the loop processing the reader's own eof event (`events.bit`), so draining
+// it first is what makes the writer's drain bounded rather than a guess.
+// This is bounded, not a second unbounded wait: a torn-down connection's
+// reader has already hit the failure that triggered the teardown signal, and
+// a timed-out wait's reader is reading over the identical `deadlineNs` (see
+// `connect`'s doc), so either way the reader's own read fails at essentially
+// the same moment, the loop's eof handling follows from that, and both
+// `doneCh`s follow in short order.
+fn h2connAwaitReady(
+  readyCh: chan<int>,
+  readerDoneCh: chan<int>,
+  writerDoneCh: chan<int>,
+  deadlineNs: int,
+): ()! {
   let timeoutCh = chan<int>(1)
   if (deadlineNs != 0) {
     spawn h2connArmDeadline(deadlineNs, timeoutCh)
@@ -264,6 +281,7 @@ fn h2connAwaitReady(readyCh: chan<int>, readerDoneCh: chan<int>, deadlineNs: int
     return
   }
   <- readerDoneCh
+  <- writerDoneCh
   if (outcome == 2) {
     fail newError("http2: timed out waiting for peer SETTINGS")
   }
@@ -586,6 +604,22 @@ fn h2connHandle(
 // first) by the time this is called.
 export fn (c: Conn) waitReaderDone() {
   <- c.readerDone
+}
+
+// Block until the writer green thread spawned by `connect`/`accept` has
+// stopped touching the transport. Unlike the reader, the writer is normally
+// parked on an empty command channel rather than a transport read, so
+// closing (or even shutting down) the transport does not wake it by itself —
+// only the loop thread's own `eof` handling (`events.bit`) queues the stop
+// message that lets it exit, once it has observed (via `waitReaderDone()`)
+// that the connection is tearing down. Call this AFTER `waitReaderDone()`
+// and BEFORE reusing anything the transport owned, for the identical
+// use-after-close reason `waitReaderDone()` documents — the writer's last
+// queued write is a real transport write, and closing out from under it is
+// the same fd-reuse hazard #3016 fixed for reads. NOT idempotent — call it
+// exactly once per `Conn`, from a single teardown path.
+export fn (c: Conn) waitWriterDone() {
+  <- c.writerDone
 }
 
 // Begin a graceful shutdown: emit GOAWAY so the peer starts no new streams.
