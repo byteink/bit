@@ -129,6 +129,57 @@ fn h3Exchange(u: Url, method: string, body: string): Response! {
   return h3glueResponse(res)
 }
 
+// As `h3Exchange`, bounded by `deadlineNs` — an absolute monotonic
+// nanosecond deadline resolved ONCE before dial, matching the shape
+// `requestTimeoutTls` (client.bit) already uses for `dialDeadline`/
+// `tlsDialDeadline` on the http/https path (#2995/#3004).
+//
+// Unlike that path, this deadline does not bound every read/write
+// individually: std/net's is a real syscall-level deadline
+// (`bit_rt_net_read_deadline_w`); QUIC is not built on a `std/net` `Conn` at
+// all and has no per-operation deadline primitive in this runtime. Instead
+// it rides `h3DialDeadline`'s lowered CONNECTION idle timeout (RFC 9000
+// §10.1) rather than adding a second, parallel timer: a peer that accepts
+// the handshake and then never answers stops producing any transport
+// traffic at all (this exchange's own HEADERS/FIN is the last thing that
+// gets a transport ACK), so the idle timer elapses close to `deadlineNs` and
+// tears the connection down, releasing `request()`.
+//
+// This IS a real, documented gap relative to the http/https path: QUIC's
+// idle timer resets on ANY received datagram, not on request progress
+// specifically (RFC 9000 §10.1 is a "peer is gone" detector, not a
+// wall-clock ceiling), so a peer that keeps the connection alive with
+// transport-level traffic while never answering at the application layer
+// could in principle outlast `deadlineNs`. Closing it needs a true
+// wall-clock check independent of `st.lastRecv`, which is out of this
+// ticket's scope (see `h3DialDeadline`'s doc for the matching handshake-side
+// gap). `h3Exchange` is one request per connection (this file's header), so
+// tearing the connection down on timeout can never strand a sibling request
+// the way it would on a server- or pool-side multiplexed connection.
+fn h3ExchangeDeadline(u: Url, method: string, body: string, deadlineNs: int): Response! {
+  let conn = h3DialDeadline(u.host, u.port, u.host, deadlineNs) catch e {
+    fail h3DeadlineRelabel(e, deadlineNs)
+  }
+  let res = conn.request(h3glueRequestOf(method, u, body)) catch e {
+    conn.close()
+    fail h3DeadlineRelabel(e, deadlineNs)
+  }
+  conn.close()
+  return h3glueResponse(res)
+}
+
+// Relabel `e` as a timeout only when `deadlineNs` had genuinely already
+// elapsed by the time of failure, so a real handshake or protocol error that
+// happens to land before the deadline is never misreported as one — the
+// same distinction std/net's `-2` read/write sentinel draws at the syscall
+// level, approximated here since QUIC has no equivalent signal to read.
+fn h3DeadlineRelabel(e: error, deadlineNs: int): error {
+  if (monotonic() >= deadlineNs) {
+    return newError("h3: request timed out (${e.message()})")
+  }
+  return e
+}
+
 // Serve one accepted HTTP/3 connection: accept each request, dispatch it through
 // the transport-agnostic `handler`, and answer on the same stream. Bounded so the
 // loop is provably finite; returns (closing the connection) when the peer stops.

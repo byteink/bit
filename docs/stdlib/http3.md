@@ -353,6 +353,18 @@ Dial an HTTP/3 server at `host:port` (validating its certificate for `serverName
 complete the QUIC handshake, and set up the control and QPACK streams. The returned
 `H3Conn` is ready for `request`. Fails if the connection or handshake fails.
 
+### `h3DialDeadline(host: string, port: int, serverName: string, deadlineNs: int): H3Conn!`
+
+As `h3Dial`, bounded by `deadlineNs` — an absolute monotonic nanosecond deadline
+(`monotonic() + budget`, not a duration), matching `std/net`'s and `std/tls`'s
+`dialDeadline`. The QUIC handshake itself is not shortened by `deadlineNs`: a
+stalled handshake still gives up after a fixed 5s regardless of the deadline
+passed here. Once the handshake succeeds, the connection's own idle timeout
+(RFC 9000 §10.1) is lowered to whatever budget remains, so a peer that
+completes the handshake and then never answers is torn down within
+`deadlineNs` instead of the default 30s. Fails immediately if `deadlineNs` has
+already elapsed by the time the handshake completes.
+
 ### `h3Accept(sock: UdpSocket, certChainPem: string, keyPem: string): H3Conn!`
 
 Accept one HTTP/3 connection on the bound UDP socket `sock`, using the PEM
