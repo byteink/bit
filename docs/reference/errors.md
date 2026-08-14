@@ -135,7 +135,7 @@ fn copyFile(src: string, dst: string): ()! {
   defer f.close()             // runs on every exit path below
   let g = create(dst)?
   defer g.close()
-  g.write(f.readAll())?
+  g.write(f.readAll()?)?
   return
 }
 ```

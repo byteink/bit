@@ -1311,7 +1311,7 @@ instant it reads it.
 bit_rt_fs_open(path, write: bool) -> i64        // fd, or -1
 bit_rt_fs_append(path)            -> i64        // fd opened O_APPEND, or -1
 bit_rt_fs_read_all(fd)            -> string     // whole file (regular files only)
-bit_rt_fs_read_all_failed()       -> bool       // #2994 below; not yet wired (#3065)
+bit_rt_fs_read_all_failed()       -> bool       // #2994/#3065/#2996 below
 bit_rt_fs_read(fd, max: i64)      -> string     // up to max bytes; "" at EOF
 bit_rt_fs_write(fd, s)            -> i64        // bytes written, or -1
 bit_rt_fs_close(fd)               -> i64        // always 0
@@ -1338,23 +1338,27 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   §5) before the syscall; `write=false` opens read-only, `write=true`
   creates+truncates write-only (mode `0644`).
 - `fs_read_all` sizes the result with `lseek(SEEK_END)` then reads, so it
-  targets regular files. An `lseek` failure, a genuine empty file, and an
-  allocation failure for a file already known non-empty all currently return
-  the empty string, and a caller cannot yet tell the three apart — `string`
-  has no nil sentinel. The one attempt to add an out-of-band signal for it
-  (#2994, a `bit_rt_fs_read_all_failed` companion symbol) was reverted because
-  the pinned stage0's `libbitrt.a` predated the symbol: `std/fs` referencing it
-  made the clean-tree driver build fail `E0078` against the OLD pinned
-  archive, and repinning to a release that predates the symbol cannot make it
-  appear (#2996) — a cycle, not a wait. **#3065 broke the cycle in two passes.**
-  Pass 1 (landed here) re-adds `bit_rt_fs_read_all_failed` and its setter
-  (`runtime/root/slots.bit`) with NO caller anywhere on the driver's import
-  path — `rtFsReadAll` below does not call the setter yet, so the accessor
-  always returns `false` and caller-visible behavior is unchanged. Once a
-  release contains this symbol, pass 2 wires the three `rtFsReadAll` branches
-  to the setter and `std/fs` to the getter, and this paragraph updates to
-  describe the working distinction. A short read — EOF before `end`, or an I/O
-  error partway through — is NEVER zero-padded (#2990): the result is the
+  targets regular files. An `lseek` failure and an allocation failure for a
+  file already known non-empty both report through the out-of-band companion
+  symbol `bit_rt_fs_read_all_failed()` (below); a genuine empty file (`lseek`
+  reports 0) never does — `string` has no nil sentinel to carry the
+  distinction in-band, which is why the flag exists at all. The one earlier
+  attempt to add this signal (#2994) was reverted because the pinned stage0's
+  `libbitrt.a` predated the symbol: `std/fs` referencing it made the
+  clean-tree driver build fail `E0078` against the OLD pinned archive, and
+  repinning to a release that predates the symbol cannot make it appear
+  (#2996) — a cycle, not a wait. **#3065 and #2996 broke the cycle in two
+  passes.** Pass 1 (#3065) re-added `bit_rt_fs_read_all_failed` and its setter
+  (`runtime/root/slots.bit`) with no caller anywhere on the driver's import
+  path, so the clean-tree build kept linking the OLD pinned archive without
+  complaint; that landed in `v0.1.17`. Once the stage0 pin moved to `v0.1.17`,
+  pass 2 (#2996) wired `rtFsReadAll`'s `end < 0` and `s == 0` branches to the
+  setter and `stdlib/fs/fs.bit`'s `File.readAll` to the getter — `fail
+  newError(...)` on a read failure, same as `open`/`create`/`write`. The read
+  loop's own I/O-error paths (an interrupted-but-failed read, or the retry
+  budget exhausted before EOF) are NOT wired to the flag; those still trim
+  silently to the bytes actually read. A short read — EOF before `end`, or an
+  I/O error partway through — is NEVER zero-padded (#2990): the result is the
   string TRIMMED to the bytes actually verified read, retrying on `EINTR` up
   to `maxReadAllRetries` (1000) times.
 - `fs_close` reports success unconditionally (the raw wrapper swallows
@@ -2050,11 +2054,12 @@ different OS thread — a per-OS-thread slot could not:**
 - `last_fs_read_all_failed` (§14, #2994) — `bit_rt_fs_read_all_failed`
   (`slots.bit`'s `rtFsReadAllFailed`) reads `scrFsReadFailed`, word 265 of the
   same per-task block (`scratch.bit`'s `scrFsReadFailed`). Same file and
-  mechanism as `pending_err`/`last_recv_ok` above, but not yet published by
-  anything: #3065 (pass 1 of #2996) re-added the word and the accessor pair
-  with no caller, so `runtime/root/{darwin,linux}/fs.bit`'s `rtFsReadAll` does
-  not write this word yet and the getter always reads `false` until pass 2
-  wires it.
+  mechanism as `pending_err`/`last_recv_ok` above. #3065 (pass 1 of #2996)
+  re-added the word and the accessor pair with no caller; #2996 (pass 2) wired
+  `runtime/root/{darwin,linux}/fs.bit`'s `rtFsReadAll` to publish it on its
+  `end < 0` and `s == 0` paths (cleared at entry, so a prior call's outcome on
+  this task never leaks into the next) and `stdlib/fs/fs.bit`'s
+  `File.readAll` to read it.
 
 **Per-OS-thread by design, each because nothing between the write and its
 matching read can cross a scheduling point — a green task migrates workers
