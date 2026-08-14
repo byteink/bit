@@ -41,10 +41,14 @@ changes the spec **in the same commit**, not afterwards.
 2. **`scripts/gate.sh` green.** It reads your diff and runs only the steps that
    diff can affect. A cross-cutting change (`tools/build/`, `runtime/`, a mix
    of areas, or anything else it cannot confidently scope) makes it refuse
-   instead of guessing - exit 3, nothing run, printing what to do next. Run
-   `scripts/gate.sh --full` or `./make test` directly (every gate, 18-18.5
-   min) to actually verify a change like that. Do not skip a red step - a
-   hang counts as a failure, not a stall.
+   instead of guessing - exit 3, nothing run, printing what to do next - except
+   a `stdlib/**` change paired only with its own mandatory
+   `docs/stdlib/<mod>.md` page, which stays scoped rather than forcing full
+   (#3055 - `tests/bit/stdlibdocs.bit` makes that page mandatory, so an
+   ordinary stdlib-export change always spans both). Run `scripts/gate.sh
+   --full` or `./make test` directly (every gate, 18-18.5 min) to actually
+   verify a change like that. Do not skip a red step - a hang counts as a
+   failure, not a stall.
 3. **The differentials agree.** The pinned previous release is the oracle: this
    tree's compiler must produce byte-identical AST/type/IR dumps over the corpus
    (`scripts/selfhost-diff*.sh`). A divergence is a change that is not finished
