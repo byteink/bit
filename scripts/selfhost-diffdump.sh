@@ -218,11 +218,12 @@ NAME="${1:?usage: selfhost-diffdump.sh <ast|tokens|diags|types|ir|iropt>}"
 # name    | flag           | verdict label   | skip label        | verb (ir only) | kind  | timeout (env, default)
 PINLAG_FILES=""
 case "$NAME" in
-  ast)    FLAG=--dump-ast;    LABEL="AST";           SKIPLABEL="parse-err";       VERB="";         KIND=basic; TIMEOUT="${DIFFAST_TIMEOUT:-20}" ;;
+  ast)    FLAG=--dump-ast;    LABEL="AST";           SKIPLABEL="parse-err";       VERB="";         KIND=basic; TIMEOUT="${DIFFAST_TIMEOUT:-20}"
+          PINLAG_FILES="tests/imports/nsimporttype/main.bit" ;;
   tokens) FLAG=--dump-tokens; LABEL="token";         SKIPLABEL="lex-err";         VERB="";         KIND=basic; TIMEOUT="${DIFFTOKENS_TIMEOUT:-20}"
           PINLAG_FILES="tests/imports/bomstrip/main.bit" ;;
   diags)  FLAG=--dump-diags;  LABEL="diag";          SKIPLABEL="";                VERB="";         KIND=basic; TIMEOUT="${DIFFDIAGS_TIMEOUT:-20}"
-          PINLAG_FILES="tests/imports/bomstrip/main.bit" ;;
+          PINLAG_FILES="tests/imports/bomstrip/main.bit tests/cases/run_raw_string_dollar_brace_literal.bit tests/imports/nsimporttype/main.bit" ;;
   types)  FLAG=--dump-types;  LABEL="type";          SKIPLABEL="check-err";       VERB="";         KIND=types; TIMEOUT="${DIFFTYPES_TIMEOUT:-20}" ;;
   ir)     FLAG=--dump-ir-pre; LABEL="IR (pre-opt)";  SKIPLABEL="lower/check-err"; VERB="pre-opt";  KIND=ir;    TIMEOUT="${DIFFIR_TIMEOUT:-300}" ;;
   iropt)  FLAG=--dump-ir;     LABEL="IR (post-opt)"; SKIPLABEL="lower/check-err"; VERB="post-opt"; KIND=ir;    TIMEOUT="${DIFFIROPT_TIMEOUT:-300}" ;;
@@ -230,7 +231,7 @@ case "$NAME" in
 esac
 PREFIX="diff${NAME}"
 
-# --- tokens/diags-only stage0 pin-lag accept list (#2992, #2993) ---
+# --- ast/tokens/diags stage0 pin-lag accept list (#2992, #2993, #3032) ---
 #
 # tests/imports/bomstrip/main.bit's first three bytes are a UTF-8 BOM (#2976,
 # compiler/lexer.bit's stripBom(), called at every production entry point).
@@ -260,6 +261,41 @@ PREFIX="diff${NAME}"
 #     identical tree either way -- only the raw diagnostic and token views
 #     see the divergence, not the AST.
 #
+# A second entry, diags-only, added by #3032 for #3009's E0098 warning:
+# tests/cases/run_raw_string_dollar_brace_literal.bit contains a backtick
+# raw string with a well-formed `${...}` pair (`` `The sum is ${1 + 2}` ``).
+# #3009 (be62d9e1, compiler/lexstr.bit:187/236, ecRawStringInterpLooking)
+# made this tree emit `warning[E0098]: '${' in a raw string is literal
+# text, not interpolation` on that pair. The pinned stage0 (0.1.15) predates
+# the warning entirely (`git merge-base --is-ancestor be62d9e1 v0.1.15` is
+# false) and lexes the file with no diagnostic at all, so --dump-diags is
+# empty on the oracle side and one warning on this tree's side. Confirmed
+# diags-only, not assumed: selfhost-diffast.sh and selfhost-difftokens.sh
+# both report this file as MATCH -- the warning changes no token and no
+# parse tree, only the diagnostic stream, so only the diags row needs the
+# entry.
+#
+# A third entry, on BOTH the ast and diags rows, added by #3032 for #2118's
+# namespace-qualified type support: tests/imports/nsimporttype/main.bit
+# declares `out: io.Writer` and `fn emit(w: io.Writer, ...)`. Before #2118
+# (3ff0cf87, compiler/parsertype.bit's parseType adding a QualType node —
+# `IDENT "." IDENT` in type position), `io.Writer` in a type position was
+# four-plus cascading E0021s from the single '.' token; #2118 postdates
+# v0.1.15's cut (`git merge-base --is-ancestor 3ff0cf87 v0.1.15` is false),
+# so the pinned oracle still rejects this file outright. Confirmed on both
+# rows independently, not assumed to transfer (same discipline #2993 used
+# above): --dump-diags is five E0021s on the oracle side and empty on this
+# tree's; --dump-ast is not skipped (SKIP(parse-err)=0 — the oracle's
+# --dump-ast exits 0 despite the E0021s) but is a real mismatch: the
+# oracle's error-recovery parse of `io.Writer` diverges structurally from
+# this tree's `qual_type` node from the very first line, unlike the BOM
+# case above where the parser recovers to an IDENTICAL tree either side of
+# the bad token. tokens is unaffected
+# (selfhost-difftokens.sh: MATCH=770 MISMATCH=0 including this file) because
+# `io`, `.` and `Writer` tokenize identically either way; only the PARSER's
+# interpretation of that token sequence differs, and ast/diags are the only
+# two views downstream of parsing.
+#
 # This is NOT the class of expected-mismatch list #1883 deleted and the
 # "outpaced oracle" header above (types/ir/iropt) refuses to re-admit. That
 # class was KNOWN PORTING GAPS: the self-hosted checker had not caught up
@@ -283,10 +319,19 @@ PREFIX="diff${NAME}"
 # MISMATCH=0 that could be mistaken for "the two compilers agree on
 # everything".
 #
-# DELETE THIS LIST AT THE NEXT STAGE0 REPIN (0.1.15 -> whatever pin next
-# contains #2976). A file that still diverges after that repin is a real
-# regression, not pin lag, and must be investigated rather than re-added
-# here.
+# DELETE EACH ENTRY AT THE NEXT STAGE0 REPIN THAT CONTAINS ITS OWN FIX --
+# not all three necessarily clear at the same repin, since each depends on a
+# different commit landing in the release the pin moves to:
+#   - tests/imports/bomstrip/main.bit clears once the pin is cut from a tree
+#     containing #2976 (stripBom).
+#   - tests/cases/run_raw_string_dollar_brace_literal.bit clears once the
+#     pin is cut from a tree containing #3009 (be62d9e1, E0098).
+#   - tests/imports/nsimporttype/main.bit (both the ast and diags rows)
+#     clears once the pin is cut from a tree containing #2118 (3ff0cf87,
+#     QualType).
+# A file that still diverges after the repin containing its own fix is a
+# real regression, not pin lag, and must be investigated rather than
+# re-added here.
 is_pinlag_file() {
   p="$1"
   for e in $PINLAG_FILES; do
