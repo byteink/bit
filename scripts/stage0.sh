@@ -6,6 +6,16 @@
 # Prints ONE line on stdout: the absolute path to the stage0 `bit` binary.
 # Everything else goes to stderr, so `ORACLE="$(sh scripts/stage0.sh)"` is safe.
 #
+# `sh scripts/stage0.sh --stdlib-root` prints a SECOND thing instead: the
+# absolute path to the pinned release's OWN `stdlib/` (unpacked from the same
+# tarball, fetched/verified exactly as above; no wrapper, no BIT_STDLIB
+# involved). test-release-surface (tests/bit/releasesurface.bit, #3039) is the
+# one consumer — it diffs the stdlib SOURCE across a version boundary, which
+# needs the previous release's own copy of `stdlib/http`, not the working
+# tree's. Every other consumer here wants compiler EQUIVALENCE on one shared
+# stdlib (the wrapper's whole reason to exist, per the comment on
+# `emit_wrapper` below) and must keep using the default, no-argument form.
+#
 # WHAT THIS REPLACES, AND HOW THE MEANING CHANGES
 #
 # Until #1593 the oracle was `bit-out/bin/bit-seed`: a compiler written in a
@@ -21,6 +31,14 @@
 # reports green for an assertion it never made. Every failure path here is a
 # non-zero exit with a message naming what to do.
 set -eu
+
+mode=bin
+if [ $# -gt 0 ]; then
+  case "$1" in
+    --stdlib-root) mode=stdlib ;;
+    *) printf 'stage0: unknown argument %s (only --stdlib-root is accepted)\n' "$1" >&2; exit 1 ;;
+  esac
+fi
 
 ROOT="$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)"
 SUMS="${ROOT}/dist/stage0/SHA256SUMS"
@@ -50,6 +68,11 @@ die() { printf 'stage0: %s\n' "$*" >&2; exit 1; }
 # arbitrary local binary against. That is the whole point, and it is why this is
 # an explicit opt-in that announces itself on stderr rather than a fallback.
 if [ -n "${BIT_STAGE0_BIN:-}" ]; then
+  # BIT_STAGE0_BIN names an arbitrary local binary, not an unpacked release
+  # tarball — there is no `stdlib/` snapshot that goes with it, so a caller
+  # asking for one is asking this script for something that does not exist
+  # in this mode.
+  [ "${mode}" = "bin" ] || die "--stdlib-root has no meaning under BIT_STAGE0_BIN=${BIT_STAGE0_BIN} (it names a binary, not an unpacked release)"
   [ -x "${BIT_STAGE0_BIN}" ] || die "BIT_STAGE0_BIN=${BIT_STAGE0_BIN} is not executable"
   printf 'stage0: OVERRIDDEN by BIT_STAGE0_BIN=%s (unverified; see scripts/stage0.sh)\n' \
     "${BIT_STAGE0_BIN}" >&2
@@ -128,13 +151,24 @@ WRAP
   mv -f "${tmp}" "${wrapper}"
 }
 
-# Already unpacked: say nothing, print the path, touch the network never. This
-# is the path every gate takes on every run after the first. The wrapper is
-# rewritten anyway — it is three lines, and a stale one that points at a moved
-# checkout is a far worse failure than regenerating it.
-if [ -x "${binary}" ]; then
+# Emits whatever `mode` asked for, once `${binary}` is known to exist
+# (unpacked, either already or freshly below).
+emit_result() {
+  if [ "${mode}" = "stdlib" ]; then
+    [ -d "${prefix}/stdlib" ] || die "unpacked ${artifact} but ${prefix}/stdlib is missing"
+    printf '%s\n' "${prefix}/stdlib"
+    return
+  fi
   emit_wrapper
   printf '%s\n' "${wrapper}"
+}
+
+# Already unpacked: say nothing, print the result, touch the network never.
+# This is the path every gate takes on every run after the first. The
+# wrapper (mode=bin) is rewritten anyway — it is three lines, and a stale one
+# that points at a moved checkout is a far worse failure than regenerating it.
+if [ -x "${binary}" ]; then
+  emit_result
   exit 0
 fi
 
@@ -162,5 +196,4 @@ rm -rf "${prefix}"
 tar xf "${tarball}" -C "${CACHE}"
 [ -x "${binary}" ] || die "unpacked ${artifact} but ${binary} is missing or not executable"
 
-emit_wrapper
-printf '%s\n' "${wrapper}"
+emit_result
