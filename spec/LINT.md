@@ -229,6 +229,7 @@ These need scope and symbol information and land after phase 1.
 | E0211 | `unused-local` | Same, at function scope. |
 | E0213 | `shadowed-local` | A `let` that hides a name from an enclosing scope. Later edits to either binding silently change which one is read. |
 | E0214 | `append-aliasing` | `append` on a slice parameter grows it in place and aliases the caller's backing array, so the caller sees writes it never made. |
+| E0215 | `unused-result` | A bare call whose non-void result is thrown away with no assignment at all — the one case E0211 cannot see because nothing was ever named. See §4.3. |
 
 (E0212 `unreachable-code` is numbered in this block but requires no resolver;
 see phase 1 above, where it is actually implemented.)
@@ -278,10 +279,8 @@ tokens alone, and lint says nothing.
 
 Recorded so they are not re-proposed.
 
-- **Discarded call result**, **empty or non-diverting `catch`.** Already errors
-  in `bit check` — E0065 and E0067 ([compiler/validateexpr.bit](../compiler/validateexpr.bit)).
-  In Go this is what `errcheck` exists for; here the checker got there first,
-  which removes what would otherwise be a linter's headline rule.
+- **Empty or non-diverting `catch`.** Already errors in `bit check` — E0067
+  ([compiler/validatestmt.bit](../compiler/validatestmt.bit)).
 - **`spawn` capturing a loop variable.** Go's classic bug. Bit closures capture
   by value, so the bug cannot occur — no rule for a defect the semantics
   already prevent.
@@ -289,6 +288,58 @@ Recorded so they are not re-proposed.
   of an error path. That is checker or verifier work. Lint reports only what is
   cheap and certain from the AST, because a rule that is occasionally wrong
   becomes a rule everyone silences, and a silenced rule reports nothing.
+
+**"Discarded call result" used to be listed here too, as "already errors in
+`bit check` — E0065".** That was wrong (#2117) and is corrected, not merely
+removed, because the mechanism is worth recording: E0065 `invalid-expr-statement`
+([compiler/validatecall.bit](../compiler/validatecall.bit)) governs which
+*shapes* of expression may stand alone as a statement — a bare `x + 1` is
+rejected, a bare call is not — and it accepts **every** call regardless of its
+declared result type (`vLegalExprStmt`'s `Tag.Call` arm has no type check at
+all). So `double(x)` beside `fn double(n: int): int` compiles, and `bit check`
+says nothing — confirmed empirically by the ticket's own repro before this
+bullet was corrected. §4.3 is the rule this repository actually needed.
+
+### 4.3 `unused-result` (E0215, #2117): why it is scoped to same-file calls
+
+The obvious reading — flag any statement-position call whose declared result is
+non-void — would also fire on a builder returning an updated copy of itself
+used for chaining, or a map-like `insert` returning the old value, both
+legitimate call-for-effect shapes. A narrower reading — fallible (`T!`) results
+only, or `Option`/`Result` only — was considered and **rejected**: it would not
+even catch this section's own motivating case, `fn double(n: int): int`
+(§4, table), which returns a plain `int`.
+
+The rule actually shipped is narrower in a different, cheaper way: it fires on
+**any** non-void result, but only for a call whose callee is a bare identifier
+resolving to a plain function (never a method) **declared in the same file**.
+This falls out of how every phase-2 rule here already works, not from a new
+restriction invented for this one — `bit lint` resolves one file at a time
+against synthetic stub import modules that carry only the imported *names*,
+never their signatures (§1: lint has no project-wide view), so a call into
+another module can never be typed here, and a method call cannot be resolved
+at all without the receiver's type, which is checker work lint does not do.
+The practical effect is that most of the noisy cases (a chained builder, a map
+insert) are already excluded by construction, because they are almost always
+either a method call or a call across a module boundary — so the "everything
+non-void" reading turns out to be affordable once the rule is this narrow, and
+restricting it further to fallible/`Option`/`Result` was not needed to keep it
+quiet. See the finding counts recorded against #2117 for the measurement that
+justifies this.
+
+The corollary, stated plainly so it is not rediscovered as a bug report: this
+rule does **not** catch `#2117`'s own headline example, `strings.Builder.write`
+returning a new `Builder` instead of mutating one, when called from outside
+the file that declares it — that is a method call, out of reach by the same
+constraint. Catching it needs `bit lint` to gain cross-file type information,
+which is a materially larger change than adding one AST-only rule.
+
+Escape hatch: bind the result to `_` — `let _ = f()` — the same idiom E0210
+and E0211's own hints already teach for "discard this on purpose" (§2.1's
+override machinery is unaffected; `_` never binds a real symbol, so the rule
+never visits a `LetDecl` written this way). The file-scoped `// bit:lint
+disable unused-result` directive (§5) is available too, for a file where the
+pattern is pervasive enough that call-by-call annotation is not worth it.
 
 ## 5. Overrides
 
