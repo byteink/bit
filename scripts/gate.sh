@@ -45,6 +45,18 @@
 #      contributors normally leave that run batched once per push for
 #      whoever integrates, but that is a convention, not this script's
 #      answer for someone with no integrator to hand it to.
+#   4  ran a bucket, no constituent FAILED, but at least one of
+#      scripts/selfhost-diffcheck.sh or scripts/selfhost-fixpoint.sh exited 2
+#      — that exit code is those two scripts' own documented "could not
+#      decide" verdict (a differential TIMEOUT, or #2980's fixed-point
+#      UNDECIDED), never a proven pass and never a proven divergence
+#      (GATE_RESULT=UNDECIDED, #2991). Chosen distinct from 0 for the same
+#      reason #2872 chose 3 for FULL_REQUIRED instead of reusing 0: a caller
+#      that reads "nothing decided" as "passed" is the same defect in a new
+#      place. A real exit-1 divergence anywhere still wins over an undecided
+#      sibling and reports GATE_RESULT=FAIL/exit 1 — re-run
+#      `scripts/gate.sh` (or the named script directly) when the machine is
+#      quieter.
 #
 # BUCKETS: a change confined to exactly one of compiler/, runtime/,
 # tests/cases/, examples/, stdlib/, docs/**/*.md, or spec/SPEC.md runs only
@@ -235,12 +247,15 @@ stdlib_files=""
 # `full`. Prints nothing for any OTHER path that isn't named via `runArgs`;
 # the caller treats that empty result as ambiguous.
 #
-# SEVEN MORE EXCEPTIONS (#2903): six gates register a whole DIRECTORY in
-# `runArgs("tests/bit/<dir>")` rather than a single file, because the
-# directory is one Bit module and the gate runs it as one program — so no
-# path INSIDE that directory can ever match the exact-string grep below, and
-# every file in all six (abimembers, clicmd, rootabi, rootpins, stress,
-# stwwiring) was unmapped, forcing `full`, until this fix. One arm per
+# NINE MORE EXCEPTIONS (#2903, recounted #3047 — recount from the case arms
+# below at fix time, not from this number, which has already drifted twice as
+# later tickets added arms without updating it): nine gates register a whole
+# DIRECTORY in `runArgs("tests/bit/<dir>")` rather than a single file,
+# because the directory is one Bit module and the gate runs it as one
+# program — so no path INSIDE that directory can ever match the exact-string
+# grep below, and every file in all nine (abimembers, benchgate, clicmd,
+# pollfree, rootabi, rootpins, spec, stress, stwwiring) was unmapped, forcing
+# `full`, until this fix. One arm per
 # directory, matching the gate(s) gates.bit actually registers for it — for
 # tests/bit/stress that is the two `test`-reachable split gates
 # (test-stress-exclusive, test-stress-batch; #2564), NOT the redundant
@@ -996,10 +1011,36 @@ if [ "${TARGET}" != "local" ]; then
 fi
 
 OVERALL_RC=0
+UNDECIDED_SEEN=0
+
+# The only two constituents whose OWN documented exit 2 means "could not
+# decide" rather than "usage/internal error" — see each script's own header
+# comment (selfhost-diffcheck.sh: "2  could not decide: a file timed out and
+# was never compared", selfhost-fixpoint.sh: "a non-zero build exits 2 (a
+# broken gate) rather than 1 (a broken compiler)", including its explicit
+# `exit 2` for "FIXED POINT UNDECIDED", #2980). No other constituent's exit 2
+# is given this meaning — a stale-step exit 2 from `./make` or from the
+# --x64/--arm64 wrappers must stay FAILED, unchanged.
+is_undecided_script() {
+  case "$1" in
+    scripts/selfhost-diffcheck.sh|scripts/selfhost-fixpoint.sh) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 run_step() {
   echo "gate: + $*"
-  if "$@"; then
+  local rc=0
+  "$@" || rc=$?
+  if [ "${rc}" -eq 0 ]; then
+    return 0
+  fi
+  # Only "bash <script>" invocations (PRE_SCRIPTS/POST_SCRIPTS) can match —
+  # the ./make and x64/arm64-wrapper invocations below have $1 = "./make" or
+  # "env", so they fall straight through to FAILED regardless of $2.
+  if [ "${rc}" -eq 2 ] && [ "$1" = "bash" ] && is_undecided_script "${2:-}"; then
+    echo "gate: UNDECIDED: $*" >&2
+    UNDECIDED_SEEN=1
     return 0
   fi
   echo "gate: FAILED: $*" >&2
@@ -1023,9 +1064,15 @@ esac
 
 for s in ${POST_SCRIPTS}; do run_step bash "${s}"; done
 
-if [ "${OVERALL_RC}" -eq 0 ]; then
-  echo "GATE_RESULT=PASS"
-else
+# A real FAILED constituent always wins, even alongside an undecided one — an
+# inconclusive sibling must never downgrade a proven divergence (#2991).
+if [ "${OVERALL_RC}" -ne 0 ]; then
   echo "GATE_RESULT=FAIL"
+  exit "${OVERALL_RC}"
 fi
-exit "${OVERALL_RC}"
+if [ "${UNDECIDED_SEEN}" -eq 1 ]; then
+  echo "GATE_RESULT=UNDECIDED"
+  exit 4
+fi
+echo "GATE_RESULT=PASS"
+exit 0
