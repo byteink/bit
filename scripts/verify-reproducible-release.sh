@@ -26,17 +26,34 @@
 # revise, once a real run against a published tag is green (recorded on
 # #2500, not assumed from this fix compiling).
 #
-# The rebuild loop now mirrors dist/release.sh's actual sequence instead of
-# the deleted seed: `./make libbitrt` for the runtime archives, `scripts/
-# stage0.sh` for the pinned stage0 compiler (never a compiler built from this
-# tree — see release.sh's own comment on why), a version-stamped staged copy
-# of compiler/ excluding compiler/version.bit, and BIT_LIBBITRT exported per
-# target before the build (#2213 — without it the rebuild would link
-# whichever runtime stage0 ships with, not this tree's). The staging logic
-# (below, "stage compiler/") is a DELIBERATE duplicate of dist/release.sh
-# lines ~89-104, not a shared helper: this script must not change what
-# release.sh itself does, so it re-derives the same staged tree independently
-# rather than risk coupling the two through a shared file.
+# #3035 (this fix): #3034 changed what dist/release.sh actually ships, so the
+# rebuild below now mirrors THAT sequence — three stages, not one:
+#   L0/C1 — `./make libbitrt` builds the bootstrap runtime archives, then the
+#     PINNED stage0 builds a native host compiler ("bit1", bit-out/bin/bit)
+#     linking the host L0 archive, exactly as `tools/build/artifacts.bit`'s
+#     `stepSelfhost` does for `install`. Stage0's role ends here: it never
+#     builds the artifact compared against the release, only the compiler
+#     that builds it.
+#   L1/C2 — bit1 (this tag's own codegen, not stage0's) builds the runtime
+#     archive and the shipped `bit` for every target via `scripts/
+#     g2archive.sh` and a direct `bit1 build`, exactly as release.sh's L1/C2
+#     steps do. C2's output is what gets packaged and compared below.
+# Both stage0 and bit1 are resolved/built INSIDE the tag's own worktree, so an
+# old tag rebuilds with the toolchain it was actually cut with (see the block
+# above the L1/C2 loop). The staged, version-stamped copy of compiler/
+# (below, "stage compiler/") is still a DELIBERATE duplicate of
+# dist/release.sh's staging lines, not a shared helper, for the same reason
+# as before: this script must not change what release.sh itself does, so it
+# re-derives the same staged tree independently rather than couple the two
+# through a shared file.
+#
+# A tag cut BEFORE #3034 (v0.1.15 and earlier) was built by the old chain —
+# the pinned stage0 built the compared artifact directly, with no bit1 stage
+# at all. Rebuilding one of those tags with this script is expected to print
+# CONTENT differs: that is a chain mismatch, not a reproducibility defect,
+# and this script does not attempt to detect or special-case it. Verify a
+# pre-#3034 tag with the git revision of this script from before #3035, or
+# accept that only tags cut with the new chain are checkable here.
 #
 # Usage:
 #   scripts/verify-reproducible-release.sh <tag> [published_dir]
@@ -86,7 +103,7 @@ fi
 
 git -C "${ROOT}" worktree add --detach "${WORK}/src" "${TAG}" >/dev/null
 
-echo "building libbitrt runtime archives at ${TAG}..."
+echo "L0: building bootstrap runtime archives at ${TAG}..."
 ( cd "${WORK}/src" && ./make libbitrt ) >"${WORK}/build.log" 2>&1 ||
   { echo "verify-reproducible-release.sh: ./make libbitrt failed, see ${WORK}/build.log" >&2; exit 1; }
 
@@ -97,10 +114,47 @@ echo "building libbitrt runtime archives at ${TAG}..."
 # worktree so it reads THAT COMMIT's dist/stage0/SHA256SUMS, not this
 # checkout's — the pin moves release to release, and a release must be
 # rebuilt with whatever it actually pinned at the time it was cut.
+#
+# Its job stops here (#3034/#3035): stage0 builds C1 — a native host compiler
+# ("bit1") — and nothing else. Everything compared against the release below
+# is built by bit1, not by stage0.
 echo "resolving the pinned stage0 at ${TAG}..."
 STAGE0="$(cd "${WORK}/src" && sh scripts/stage0.sh)" ||
   { echo "verify-reproducible-release.sh: stage0 resolution failed" >&2; exit 1; }
 echo "stage0 = ${STAGE0}"
+
+# C1: stage0 builds compiler/ AS IT SITS ON DISK (unstamped — the version
+# stamp is for C2's STAGED copy below) for the HOST triple, linking the L0
+# archive `./make libbitrt` just wrote. This is stage0's ENTIRE job in this
+# script: bit1 is a native host binary that can cross-produce every shipped
+# target below the same way stage0 always has, exactly as dist/release.sh's
+# own comment describes its C1 step.
+#
+# A DELIBERATE duplicate of `stepSelfhost` (tools/build/artifacts.bit:311-314)
+# rather than a call to `./make` — same reasoning as the STAGE_SRC staging
+# duplicate above: this script must not depend on the driver's own caching or
+# side effects (it writes bit-out/make/*.stamp, bit-out/make/host.triple), and
+# spelling the recipe out here keeps it auditable as the one thing stage0 is
+# still trusted to build.
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64)              HOST_TRIPLE=aarch64-macos ;;
+  Linux-aarch64|Linux-arm64) HOST_TRIPLE=aarch64-linux ;;
+  Linux-x86_64)              HOST_TRIPLE=x86_64-linux ;;
+  *) echo "verify-reproducible-release.sh: unsupported host $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+esac
+l0host="${WORK}/src/bit-out/lib/${HOST_TRIPLE}/libbitrt.a"
+[ -f "${l0host}" ] || {
+  echo "verify-reproducible-release.sh: missing ${l0host} (./make libbitrt did not produce it)" >&2
+  exit 1
+}
+echo "C1: bootstrapping the host self-hosted compiler with stage0 (bit1) at ${TAG}..."
+BIT1="${WORK}/src/bit-out/bin/bit"
+mkdir -p "$(dirname "${BIT1}")"
+( cd "${WORK}/src" && BIT_LIBBITRT="${l0host}" "${STAGE0}" build compiler -o "${BIT1}" ) \
+  >>"${WORK}/build.log" 2>&1 ||
+  { echo "verify-reproducible-release.sh: stage0 build of bit1 failed, see ${WORK}/build.log" >&2; exit 1; }
+chmod +x "${BIT1}"
+echo "bit1 = ${BIT1}"
 
 # Stamp the version into a staged copy of compiler/ — DELIBERATELY duplicating
 # dist/release.sh lines ~89-104 rather than sharing a helper (see this file's
@@ -123,6 +177,26 @@ real="$(find "${WORK}/src/compiler" -maxdepth 1 -name '*.bit' | wc -l | tr -d ' 
   echo "verify-reproducible-release.sh: staged ${staged} of ${real} compiler/ files — the copy lost some" >&2
   exit 1
 }
+
+# L1: bit1 — this tag's own codegen, not stage0's — builds the runtime
+# archive for every target, mirroring dist/release.sh's L1 step exactly
+# (including calling THAT TAG's own scripts/g2archive.sh, not this checkout's).
+#
+# WRITTEN TO SCRATCH, NEVER INTO "${WORK}/src/bit-out/lib/" — that path is the
+# L0 archive `./make libbitrt` already wrote above, and it is what C1 above
+# linked into bit1. Overwriting it here would make this script indistinguishable
+# from dist/release.sh's own first-pass defect (#3034): a fingerprint-based
+# staleness check over runtime/** SOURCE that is blind to which compiler last
+# produced the bytes on disk. All three built up front because dist/package.sh
+# embeds every target's archive into every target's tarball, regardless of
+# which one it is packaging.
+LIB1="${WORK}/lib1"
+for TARGET in x86_64-linux aarch64-linux aarch64-macos; do
+  echo "L1: building runtime archive for ${TARGET} with bit1..."
+  mkdir -p "${LIB1}/${TARGET}"
+  BIT="${BIT1}" bash "${WORK}/src/scripts/g2archive.sh" "${TARGET}" "${LIB1}/${TARGET}/libbitrt.a" ||
+    { echo "verify-reproducible-release.sh: L1 build failed for ${TARGET}" >&2; exit 1; }
+done
 
 FAIL=0
 for TARGET in x86_64-linux aarch64-linux aarch64-macos; do
@@ -155,19 +229,31 @@ for TARGET in x86_64-linux aarch64-linux aarch64-macos; do
   # REFUSE rather than fall back (mirrors dist/release.sh): an absent archive
   # would silently link whatever runtime stage0 ships with, which is the
   # exact defect BIT_LIBBITRT exists to prevent (#2213).
-  archive="${WORK}/src/bit-out/lib/${TARGET}/libbitrt.a"
+  archive="${LIB1}/${TARGET}/libbitrt.a"
   if [ ! -f "${archive}" ]; then
-    echo "verify-reproducible-release.sh: ${TARGET}: missing ${archive} (./make libbitrt did not produce it)" >&2
+    echo "verify-reproducible-release.sh: ${TARGET}: missing ${archive} (the L1 build above should have written it)" >&2
     FAIL=1
     continue
   fi
 
-  echo "rebuilding ${TARGET}..."
+  # C2: bit1 builds the STAGED, version-stamped compiler/, linking L1. This is
+  # the artifact dist/release.sh actually ships as bin/bit — not stage0, and
+  # not the STAGE0 variable resolved above, which built bit1 and nothing past
+  # it. BIT_LIBBITRT is still load-bearing (#2213, unchanged by #3034): bit1
+  # resolves libbitrt.a relative to itself absent an override, which is the L0
+  # archive under bit-out/lib, never ${archive} — L1 lives entirely under
+  # ${WORK} and bit1's sibling lib/ cannot see it.
+  echo "C2: rebuilding ${TARGET} with bit1..."
   mkdir -p "${WORK}/build-${TARGET}/stage/bin"
-  BIT_LIBBITRT="${archive}" "${STAGE0}" build "${STAGE_SRC}" --target "${TARGET}" \
+  BIT_LIBBITRT="${archive}" "${BIT1}" build "${STAGE_SRC}" --target "${TARGET}" \
     -o "${WORK}/build-${TARGET}/stage/bin/bit"
   chmod +x "${WORK}/build-${TARGET}/stage/bin/bit"
-  ( cd "${WORK}/src" && bash dist/package.sh "${VERSION}" "${TARGET}" "${WORK}/build-${TARGET}" ) >/dev/null
+  # [archivedir] passed EXPLICITLY as ${LIB1}, not left to package.sh's
+  # default `bit-out/lib` — that default resolves (relative to package.sh's
+  # own location inside ${WORK}/src) to the L0, stage0-built archive this
+  # script deliberately never packages. Passing nothing here would silently
+  # ship the wrong runtime family and compare against it.
+  ( cd "${WORK}/src" && bash dist/package.sh "${VERSION}" "${TARGET}" "${WORK}/build-${TARGET}" "${LIB1}" ) >/dev/null
   rebuilt_tar="${WORK}/build-${TARGET}/${NAME}.tar.xz"
 
   mkdir -p "${WORK}/extract-${TARGET}/published" "${WORK}/extract-${TARGET}/rebuilt"
