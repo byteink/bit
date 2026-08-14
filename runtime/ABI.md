@@ -1817,7 +1817,7 @@ entries above lower to, because §11.7 admits no `string` across an `extern`
 boundary: `host`/the written body cross as a raw word-strided pointer (a
 Bit `[]byte`'s backing) plus a length, and a read result is written into the
 caller's own such buffer rather than returned as a fresh string, the same
-shape §7's `bit_rt_fs_is_symlink_w` uses. `deadlineNs` is an absolute
+shape §14's `bit_rt_fs_is_symlink_w` uses. `deadlineNs` is an absolute
 monotonic nanosecond value on the same clock `bit_rt_time_mono_ns` reaches
 (§18); `<= 0` (a `Conn`'s zero value) or further out than the wait ceiling
 below both clamp to it — a caller typo must not reinstate an unbounded wait,
