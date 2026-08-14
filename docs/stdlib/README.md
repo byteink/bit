@@ -13,6 +13,7 @@ below is compiled by the test suite, so none of it can quietly rot.
 | [path](path.md) | `"std/path"` | Lexical path handling |
 | [strings](strings.md) | `"std/strings"` | Searching, building, UTF-8 runes |
 | [seq](seq.md) | `"std/seq"` | `mapped`, `filter`, `reduce` over slices |
+| [sort](sort.md) | `"std/sort"` | Stable comparator-based sorting over slices |
 | [math](math.md) | `"std/math"` | `f64` maths and integer helpers |
 | [time](time.md) | `"std/time"` | Clocks, durations, sleeping |
 | [os](os.md) | `"std/os"` | Arguments, environment, exit |
