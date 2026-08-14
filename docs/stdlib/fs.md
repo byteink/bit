@@ -58,9 +58,10 @@ Opens `path` for writing at the end, creating it if absent.
 Up to `max` bytes. A shorter result than `max` - including `""` - means end of
 file.
 
-### `File.readAll(): string`
+### `File.readAll(): string!`
 
-Everything left in the file.
+Everything left in the file, or fails on a read error. A genuinely empty file
+returns `""` with no error.
 
 ### `File.write(s: string): ()!`
 
