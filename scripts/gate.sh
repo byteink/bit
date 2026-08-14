@@ -50,7 +50,9 @@
 # tests/cases/, examples/, stdlib/, docs/**/*.md, or spec/SPEC.md runs only
 # that area's minimal steps. A change touching any OTHER path (anything
 # unlisted below), or spanning MORE THAN ONE of those seven areas, is
-# ambiguous and always runs the full `./make test` — never a partial skip.
+# ambiguous and always runs the full `./make test` — never a partial skip —
+# EXCEPT the narrow stdlib+docs pairing bucket `stdlibdocs` (#3055, see the
+# "THREE NARROW EXCEPTIONS" block below).
 #
 # EVERY BUCKET RUNS EVERY GATE WHOSE OWN DECLARED FILE SET (its `argv` or an
 # `env` entry in tools/build/gates.bit) INTERSECTS THAT BUCKET'S PATHS, not
@@ -90,8 +92,9 @@
 # under-selection is the failure this script exists to prevent, so a prefix
 # only gets a prose exception once it's proven output-irrelevant.
 #
-# TWO NARROW EXCEPTIONS (#2435), because registering a gate is mandatory in
-# this repo and otherwise forces `full` on every single ticket that adds one:
+# THREE NARROW EXCEPTIONS (#2435, #3055), because registering a gate is
+# mandatory in this repo and otherwise forces `full` on every single ticket
+# that adds one:
 #   - tests/bit/**, tests/imports/**, and tests/stress/** (#2825 added the
 #     second — a new fixture directory under tests/imports/ used to fall
 #     through to the catch-all below and force `full` on its own; #2977 added
@@ -113,6 +116,23 @@
 #     `is_additive_registration` below for exactly what that means. Any other
 #     tools/build/** file, or any non-additive change to these two, still
 #     forces `full` — that code is the driver every step runs under.
+#   - stdlib/** paired ONLY with its own mandatory docs/stdlib/**.md page
+#     (#3055): tests/bit/stdlibdocs.bit fails the build on any exported
+#     stdlib symbol whose module lacks a docs/stdlib/<mod>.md heading, so an
+#     ordinary stdlib-export ticket is structurally required to touch both
+#     the `stdlib` and `docs` buckets in the same diff — the `bucket_count
+#     -gt 1` rule below would otherwise force `full` on every single one of
+#     them, which is exactly the cost this script exists to avoid paying on
+#     every ticket (#2704's std/sort hit this and could not use the scoped
+#     gate at all). Resolves to bucket `stdlibdocs` — the union of the
+#     `stdlib` and `docs` buckets' own steps — only when stdlib and docs are
+#     the ONLY two buckets touched (no selfhost/runtime/testcases/examples/
+#     spec) and every changed docs/**/*.md file is either
+#     docs/stdlib/README.md (carries no gate of its own) or
+#     docs/stdlib/<mod>.md for a <mod> that also has a stdlib/<mod>/** change
+#     in the same diff. See `stdlib_docs_pairing_ok` below for the exact
+#     check. Any docs/*.md outside docs/stdlib/, or a docs/stdlib/<mod>.md
+#     with no matching stdlib/<mod>/** change, still forces `full`.
 #
 # selfhost and examples pull in a non-`./make` diff script
 # (selfhost-diffcheck.sh/selfhost-fixpoint.sh, selfhost-diffexamples.sh).
@@ -197,6 +217,11 @@ testsbit_list=""
 docs_list=""
 spec_list=""
 noop_list=""
+# Space-separated (never comma-joined, unlike docs_list/other_list above,
+# which exist only for human-readable REASON text): stdlib_docs_pairing_ok
+# above word-splits these, so a comma in the string would corrupt the match.
+docs_files=""
+stdlib_files=""
 
 # Extracts the gate name(s) whose `Gate.argv` literally names path `$1`, by
 # grepping the source rather than building anything — `runArgs("<path>")` is
@@ -486,6 +511,34 @@ EOF
   return 0
 }
 
+# THIRD NARROW EXCEPTION (#3055), same shape as `is_additive_registration`
+# just above: true only when every docs/**/*.md file in `docs_files` (a
+# space-separated list, populated by the classification loop below) is
+# either docs/stdlib/README.md, which test-stdlib-docs does not read as a
+# per-module page and so carries no gate of its own, or docs/stdlib/<mod>.md
+# for a <mod> that also has a stdlib/<mod>/** change in `stdlib_files` (same
+# loop). Called only when bucket_count already says stdlib and docs are the
+# only two of the seven areas touched — callers still must confirm that,
+# this function does not repeat it.
+stdlib_docs_pairing_ok() {
+  local f mod
+  for f in ${docs_files}; do
+    case "${f}" in
+      docs/stdlib/README.md) continue ;;
+      docs/stdlib/*.md)
+        mod="${f#docs/stdlib/}"
+        mod="${mod%.md}"
+        case " ${stdlib_files} " in
+          *" stdlib/${mod}/"*) continue ;;
+          *) return 1 ;;
+        esac
+        ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
 while IFS= read -r f; do
   case "${f}" in
     # PROSE, CLASSIFIED BY FILE TYPE, NOT JUST PATH PREFIX (#2801). Placed
@@ -502,6 +555,7 @@ while IFS= read -r f; do
       else
         docs_list="${f}"
       fi
+      docs_files="${docs_files:+${docs_files} }${f}"
       ;;
     # spec/SPEC.md compiles nothing, but tests/bit/spec/ (#2758's
     # test-spec) DOES read it — a grammar-consistency check, not prose with no
@@ -538,7 +592,10 @@ while IFS= read -r f; do
     runtime/*) has_runtime=1 ;;
     tests/cases/*) has_testcases=1 ;;
     examples/*) has_examples=1 ;;
-    stdlib/*) has_stdlib=1 ;;
+    stdlib/*)
+      has_stdlib=1
+      stdlib_files="${stdlib_files:+${stdlib_files} }${f}"
+      ;;
     # tests/imports/** joins tests/bit/** here (#2825), and tests/stress/**
     # joins both (#2977): all three are fixture-only paths whose gate is known
     # by name, never by path prefix, so they share has_testsbit/testsbit_list
@@ -626,6 +683,15 @@ if [ "${FULL}" -eq 1 ]; then
 elif [ "${has_other}" -eq 1 ]; then
   BUCKET="full"
   REASON="touches path(s) outside the scoped buckets: ${other_list}"
+elif [ "${bucket_count}" -eq 2 ] && [ "${has_stdlib}" -eq 1 ] && [ "${has_docs}" -eq 1 ] &&
+  [ "${testsbit_unmapped}" -eq 0 ] && stdlib_docs_pairing_ok; then
+  # THIRD NARROW EXCEPTION (#3055) — see the header comment block above and
+  # stdlib_docs_pairing_ok() for what this requires. Guarded by
+  # testsbit_unmapped here (rather than only in the elif below) so an
+  # unmapped tests/bit/** file riding alongside stdlib+docs still forces
+  # `full` exactly as it did before this exception existed.
+  BUCKET="stdlibdocs"
+  REASON="only stdlib/** and its paired docs/stdlib/**.md changed (${touched_list})"
 elif [ "${bucket_count}" -gt 1 ]; then
   BUCKET="full"
   REASON="spans more than one bucket: ${touched_list}"
@@ -805,6 +871,13 @@ case "${BUCKET}" in
     # docs/stdlib/*.md-only edit ran test-docs but never it (#2962).
     BUILD_STEPS=(test-docs test-stdlib-docs)
     ;;
+  stdlibdocs)
+    # The union of the `stdlib` and `docs` buckets' own steps just above
+    # (#3055) — a stdlib export's page can be wrong in either direction (a
+    # stale heading, or a missing one) and both buckets' own checks are
+    # needed to catch either.
+    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-docs)
+    ;;
   spec)
     BUILD_STEPS=(test-spec)
     ;;
@@ -859,7 +932,7 @@ esac
 # a renamed script is the #1593 class of silent hole.
 bucket_scripts full
 FULL_SCRIPTS=" ${BUCKET_PRE} ${BUCKET_POST} "
-for b in full selfhost runtime testcases examples stdlib docs spec testsbit; do
+for b in full selfhost runtime testcases examples stdlib docs stdlibdocs spec testsbit; do
   bucket_scripts "${b}"
   for s in ${BUCKET_PRE} ${BUCKET_POST}; do
     [ -f "${s}" ] || {
