@@ -1,0 +1,211 @@
+// ARM64 instruction selectors for memory access: const_string address
+// materialization, slice/field header reads and writes, the atomics (§11.5)
+// and array element indexing — split out of compiler/arm64select.bit (#3114),
+// which was 805 lines against the 800-line limit. compiler/arm64select.bit
+// keeps the operand fetch/store helpers (getInt/putInt/destInt/... used here
+// too, same module) and the arithmetic/logic/compare/convert/constant
+// selectors.
+//
+// Named to sort after compiler/arm64select.bit — module files concatenate in
+// bytewise filename order (compiler/project.bit:7).
+
+// A const_string value is the address of its static {ptr,len} header
+// (__bitstr_N, materialized by the object writer + linker into .rodata); loads
+// that address into the destination via the ADRP/ADD pair.
+fn emitConstString(cx: A64Ctx, dst: int, poolIdx: int) {
+  let d = destInt(cx, dst, scratch1())
+  emitAddrOf(cx, d, "__bitstr_${poolIdx}")
+  putInt(cx, dst, d)
+}
+
+// slice_len reads the `len` word from a slice or string header. A []T header is
+// {ptr, len, cap, is_ref} and a string header is {ptr, len} (ABI.md §2) — both
+// keep `len` at offset 8, so one load serves both. `len` on a static [N]T array
+// folds to a const_int in lowering, and dynamic slice indexing goes through the
+// slice_get/_set runtime calls, so this op only ever loads a header length.
+// Loads a slice/string header word at `disp`, reading a NULL header as 0 (#1564).
+//
+// A struct zero-value is one gc_alloc of zeroed memory (SPEC §13.4), so a slice
+// or string FIELD of a zeroed struct holds the null word rather than an empty
+// header. `xs == nil` is not spellable for either type (E0053), so null and
+// empty are indistinguishable to a program — only the fault was observable.
+// Both header readers that are inline rather than runtime calls (`len` at +8,
+// `cap` at +24) come through here, so the guard leaves every IR dump untouched.
+// scratch1 is never allocatable, so it cannot alias baseReg — zeroing it before
+// the null test reads baseReg is safe.
+fn emitHeaderWordOrZero(cx: A64Ctx, baseReg: int, disp: int) {
+  movImm64(cx.code, scratch1(), 0)
+  cbz(cx.code, baseReg, 2) // null header -> skip the single-word load
+  loadImm(cx.code, scratch1(), baseReg, disp, 8, false)
+}
+
+fn emitSliceLen(cx: A64Ctx, dst: int, base: int) {
+  let baseReg = getInt(cx, vregOf(cx, base), scratch2())
+  emitHeaderWordOrZero(cx, baseReg, 8)
+  putInt(cx, dst, scratch1())
+}
+
+// `isSliceBase` comes from the dispatcher for the same reason as the x86-64
+// selector's: the selector must not reach back into `cx.f.instrs`, which a stub
+// self-check context leaves empty.
+fn emitFieldGet(cx: A64Ctx, dst: int, base: int, offset: int, ty: int, isSliceBase: bool) {
+  let baseReg = getInt(cx, vregOf(cx, base), scratch2())
+  // A fixed-size array field is inline storage: its value is the interior address
+  // base + offset (an ADD-immediate), not a loaded word.
+  if (cx.module.ctx.types[ty].kind == TypeKind.Array) {
+    // `addSubImmWide` reads `rn` only in its first ADD, then chains off its own
+    // destination, so `d` aliasing `baseReg` is safe.
+    let d = destInt(cx, dst, scratch1())
+    addSubImmWide(cx.code, false, d, baseReg, offset)
+    putInt(cx, dst, d)
+    return
+  }
+  // cap(s) lowers to a field_get [24] on the slice HEADER itself, so a null
+  // header must read as 0 here exactly as it does for len (#1564). Keyed on the
+  // base's own type, so a struct field read is untouched and pays nothing.
+  if (isSliceBase) {
+    emitHeaderWordOrZero(cx, baseReg, offset)
+    putInt(cx, dst, scratch1())
+    return
+  }
+  // A far offset materializes into scratch3 first, so both load forms still read
+  // `baseReg` before they write `d`.
+  let w = widthOf(cx.module.ctx, ty)
+  if (w.class == RegClass.Int) {
+    let d = destInt(cx, dst, scratch1())
+    loadImm(cx.code, d, baseReg, offset, w.bytes, w.signed)
+    putInt(cx, dst, d)
+    return
+  }
+  let d = destFloat(cx, dst, fscratch1())
+  loadImmF(cx.code, d, baseReg, offset, w.bytes)
+  putFloat(cx, dst, d)
+}
+
+// ponytail: no write barrier — the runtime's write-barrier contract is not
+// settled yet (the collector is stop-the-world, so nothing needs one today). Add
+// when the GC goes incremental; same deferral as the x86-64 backend's field_set.
+fn emitFieldSet(cx: A64Ctx, base: int, offset: int, value: int, ty: int) {
+  let w = widthOf(cx.module.ctx, ty)
+  let baseReg = getInt(cx, vregOf(cx, base), scratch2())
+  if (w.class == RegClass.Int) {
+    storeImm(cx.code, getInt(cx, vregOf(cx, value), scratch1()), baseReg, offset, w.bytes)
+    return
+  }
+  storeImmF(cx.code, getFloat(cx, vregOf(cx, value), fscratch1()), baseReg, offset, w.bytes)
+}
+
+// ---- atomics (§11.5) -------------------------------------------------------
+// `*T` is an int-classed word; every sequence is call-free (never a safepoint)
+// and uses only the codegen scratch GPRs plus ascratch1/ascratch2.
+
+fn emitAtomicLoad(cx: A64Ctx, dst: int, ptr: int, ty: int) {
+  let w = widthOf(cx.module.ctx, ty)
+  let base = getInt(cx, vregOf(cx, ptr), ascratch1())
+  // One LDAR, no retry loop: it consumes `base` as it writes, so unlike the
+  // LL/SC sequences below this one can land straight in the destination.
+  let d = destInt(cx, dst, scratch1())
+  ldar(cx.code, atomicSize(w.bytes), base, d)
+  canonNarrow(cx.code, d, w)
+  putInt(cx, dst, d)
+}
+
+fn emitAtomicStore(cx: A64Ctx, ptr: int, value: int, ty: int) {
+  let w = widthOf(cx.module.ctx, ty)
+  let base = getInt(cx, vregOf(cx, ptr), ascratch1())
+  let val = getInt(cx, vregOf(cx, value), scratch1())
+  stlr(cx.code, atomicSize(w.bytes), base, val)
+}
+
+// LL/SC retry loop; returns the pre-op (old) value. scratch1=old,
+// scratch2=computed, scratch3=STLXR status, ascratch1=base, ascratch2=operand.
+fn emitAtomicRmw(cx: A64Ctx, op: Op, dst: int, ptr: int, operand: int, ty: int) {
+  let w = widthOf(cx.module.ctx, ty)
+  let size = atomicSize(w.bytes)
+  let base = getInt(cx, vregOf(cx, ptr), ascratch1())
+  let oper = getInt(cx, vregOf(cx, operand), ascratch2())
+  let retryOff = codeLen(cx)
+  ldaxr(cx.code, size, base, scratch1())
+  if (op == Op.AtomicRmwAdd) {
+    addRR(cx.code, scratch2(), scratch1(), oper)
+  } else if (op == Op.AtomicRmwSub) {
+    subRR(cx.code, scratch2(), scratch1(), oper)
+  } else if (op == Op.AtomicRmwAnd) {
+    logicalRR(cx.code, 0, scratch2(), scratch1(), oper)
+  } else if (op == Op.AtomicRmwOr) {
+    logicalRR(cx.code, 1, scratch2(), scratch1(), oper)
+  } else {
+    movRR(cx.code, scratch2(), oper)
+  }
+  stlxr(cx.code, size, scratch3(), base, scratch2())
+  let cbnzOff = codeLen(cx)
+  emitCbnz(cx.code, scratch3(), (retryOff - cbnzOff) / 4)
+  canonNarrow(cx.code, scratch1(), w)
+  putInt(cx, dst, scratch1())
+}
+
+// Go-style CAS: swaps `desired` in iff [ptr]==expected; result is the bool "did
+// it swap". scratch1=old, scratch2=desired, scratch3=status, ascratch1=base,
+// ascratch2=expected.
+fn emitAtomicCmpxchg(cx: A64Ctx, dst: int, ptr: int, expected: int, desired: int) {
+  let w = widthOf(cx.module.ctx, cx.f.instrs[expected].ty)
+  let size = atomicSize(w.bytes)
+  let base = getInt(cx, vregOf(cx, ptr), ascratch1())
+  let exp = getInt(cx, vregOf(cx, expected), ascratch2())
+  let des = getInt(cx, vregOf(cx, desired), scratch2())
+  let retryOff = codeLen(cx)
+  ldaxr(cx.code, size, base, scratch1())
+  canonNarrow(cx.code, scratch1(), w) // match `expected`'s canonical form before the compare
+  cmpRR(cx.code, scratch1(), exp)
+  let bneFixup = emitLocalCondBranch(cx, condNe())
+  stlxr(cx.code, size, scratch3(), base, des)
+  let cbnzOff = codeLen(cx)
+  emitCbnz(cx.code, scratch3(), (retryOff - cbnzOff) / 4)
+  patchLocalCondBranch(cx, bneFixup) // success fall-through and mismatch converge here
+  cset(cx.code, scratch1(), condEq()) // Z from the last CMP: set iff old == expected
+  putInt(cx, dst, scratch1())
+}
+
+// Array element access — lower.bit only ever emits index_get/index_set against a
+// static array base, so `base` is always a direct data pointer with no header to
+// skip.
+fn emitIndexGet(cx: A64Ctx, dst: int, base: int, index: int, ty: int) {
+  let w = widthOf(cx.module.ctx, ty)
+  let baseReg = getInt(cx, vregOf(cx, base), scratch2())
+  let idxReg = getInt(cx, vregOf(cx, index), scratch3())
+  if (w.class == RegClass.Int) {
+    let d = destInt(cx, dst, scratch1())
+    loadIndexed(cx.code, d, baseReg, idxReg, w.bytes, w.signed)
+    putInt(cx, dst, d)
+    return
+  }
+  // Float arrays index the same way ints do (register-offset, scaled); no
+  // distinct float indexed-load opcode is needed since the addressing mode is
+  // class-independent.
+  let d = destFloat(cx, dst, fscratch1())
+  loadStoreRegOffset(cx.code, fpRegOffSize(w.bytes), true, 1, idxReg, w.bytes != 1,
+    baseReg, d)
+  putFloat(cx, dst, d)
+}
+
+fn emitIndexSet(cx: A64Ctx, base: int, index: int, value: int, ty: int) {
+  let w = widthOf(cx.module.ctx, ty)
+  let baseReg = getInt(cx, vregOf(cx, base), scratch2())
+  let idxReg = getInt(cx, vregOf(cx, index), scratch3())
+  if (w.class == RegClass.Int) {
+    storeIndexed(cx.code, getInt(cx, vregOf(cx, value), scratch1()), baseReg, idxReg, w.bytes)
+    return
+  }
+  let v = getFloat(cx, vregOf(cx, value), fscratch1())
+  loadStoreRegOffset(cx.code, fpRegOffSize(w.bytes), true, 0, idxReg, w.bytes != 1, baseReg, v)
+}
+
+// The size field for a float register-offset access: 0b11 for a double, 0b10 for
+// a single. (A float is never 1 or 2 bytes wide, so the GP size table's narrow
+// rows have no float counterpart.)
+fn fpRegOffSize(width: int): int {
+  if (width == 8) {
+    return 3
+  }
+  return 2
+}
