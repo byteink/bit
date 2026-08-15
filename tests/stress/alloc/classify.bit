@@ -1,0 +1,141 @@
+// Property (m), #3100's `allocClassify` fast path. Sibling of `./alloc.bit`,
+// same module (SPEC §17.1) — everything `./alloc.bit` imports (`allocClassify`,
+// `allocClassSize`, `allocAlignUp`, `allocNumClasses`, `allocMaxSmall`) is
+// visible here with no import, the same arrangement `./spancache.bit` uses.
+//
+// WHY THIS IS NOT PROPERTY (c). (c) checks `allocClassify` against its
+// SPECIFICATION — "the smallest class that both fits and divides" — over a
+// matrix of sampled sizes (`sz = sz * 3 + 1`) and ten alignments. That is the
+// right check for the contract and the wrong one for #3100, which replaced a
+// linear scan with a closed-form shortcut for classes 0-3. A shortcut wrong for
+// ONE size in 16384 would slip through a sample and does not slip through here:
+// this property runs the ORIGINAL scan, kept verbatim below, and the shipped
+// function over EVERY (size, alignment) pair in the domain, and requires them
+// to agree on every single one.
+//
+// The check is possible at all because `allocClassify` is a pure function of
+// two ints — no heap, no lock, no state to set up — which is why #3100 moved it
+// and the rest of that pure half into `runtime/alloc/classify.bit`.
+//
+// WHAT A DISAGREEMENT WOULD MEAN, so the cost of a red here is not
+// underestimated: `allocClassify` decides which size class an object lands in,
+// on every allocation AND every free. Answer a different class on free than on
+// alloc and a slot goes back onto the wrong free list — silent heap corruption,
+// discovered much later somewhere else. This property is the reason the
+// shortcut is allowed to exist.
+//
+// EVERY SWEEP IS `@nosplit`, AND THAT IS LOAD-BEARING, NOT TIDINESS. The sweep
+// is ~1.2M iterations with a ~37-iteration scan inside it: ~13M loop back
+// edges. This program runs under `BIT_GC=stress`, which collects at EVERY
+// safepoint, and a back edge is a safepoint — so as ordinary code the property
+// took the whole program from 6s to past the stress gate's 300s deadline
+// (measured: `test-stress-batch` reported `stress 'alloc' [BIT_GC=stress]:
+// TIMED OUT`). `@nosplit` emits no poll at all, so the sweeps cost the same
+// under every GC policy, and the ~70-iteration driver loop below is the only
+// part that polls. The whole call tree is already `@nosplit` — `allocClassify`,
+// `allocClassSize` and `allocAlignUp` all are — so nothing had to be weakened
+// to get it, and E0075 enforces that it stays that way.
+//
+// THE DOMAIN, and why it is drawn this way:
+//   - alignment 1..CLS_MAX_ALIGN, EVERY value and not just the powers of two.
+//     3, 5, 6 and 7 are the load-bearing ones and they are the reason the
+//     shipped guard tests for a power of two rather than just `alignment <= 8`:
+//     8 % 6 != 0 while 48 % 6 == 0, so the scan answers class 3 for a 48-byte
+//     request at alignment 6 where a bare `<= 8` shortcut answers class 0.
+//     No caller passes a non-power-of-two alignment and `allocAlignUp` is a
+//     power-of-two mask, so both answers are nonsense — but the two halves must
+//     produce the SAME nonsense, or the change is a behaviour change wearing an
+//     optimization's clothes. Dropping that half of the guard turns this
+//     property red (`clsfast=0/1184328`), which is how it was checked.
+//   - alignment 0 IS EXCLUDED, by necessity rather than convenience: the scan
+//     evaluates `cs % alignment`, which traps on zero. It traps today and must
+//     keep trapping, which is what the shipped guard's `alignment > 0` is for;
+//     a property cannot observe a trap without dying with it.
+//   - every power-of-two alignment from CLS_MAX_ALIGN*2 up to `allocMaxSmall`,
+//     so the whole range where the fast path must NEVER fire is covered too.
+//   - size 0..CLS_MAX_SIZE, which runs 64 bytes past `allocMaxSmall` so the
+//     direct-mapped (-1) answers on the far side of the boundary are included.
+//
+// `fired` in the output is the denominator that makes this non-vacuous: the
+// number of pairs on which the fast path actually produced the answer. It is
+// 196 — alignments 1, 2, 4 and 8 crossed with the 49 sizes 0..48 — which is
+// small because the fast path's whole reachable input set is small, and that is
+// the point: it is covered completely, not sampled. A refactor that made the
+// guard unreachable would leave the agreement check trivially green, so the
+// count is printed and a zero is failed outright.
+const CLS_MAX_ALIGN = 64
+const CLS_MAX_SIZE = 16448              // allocMaxSmall + 64
+
+// `allocClassify`'s body as it stood before #3100, verbatim, as the oracle.
+// It must not be "kept in sync" with the shipped one — the entire value of this
+// property is that it is an INDEPENDENT copy of the behaviour being preserved.
+// If a future change to the size classes makes the two diverge, that is this
+// property doing its job, not a stale duplicate.
+@nosplit fn classifyScan(size: int, alignment: int): int {
+  let needed = allocAlignUp(size, alignment)
+  if (needed > allocMaxSmall) { return -1 }
+  let i = 0
+  while (i < allocNumClasses) {         // bounded: <= allocNumClasses iterations
+    let cs = allocClassSize(i)
+    if (cs >= needed && cs % alignment == 0) { return i }
+    i = i + 1
+  }
+  return -1
+}
+
+// Pairs at one alignment on which the shipped function and the scan AGREE.
+// Counting agreements rather than disagreements is what makes the caller's
+// `agree == pairs` test double as the vacuity check: a sweep that silently ran
+// zero iterations reports 0, not "no disagreements found".
+@nosplit fn classifyAgreeAt(alignment: int): int {
+  let agree = 0
+  let sz = 0
+  while (sz <= CLS_MAX_SIZE) {          // bounded: CLS_MAX_SIZE + 1 iterations
+    if (allocClassify(sz, alignment) == classifyScan(sz, alignment)) {
+      agree = agree + 1
+    }
+    sz = sz + 1
+  }
+  return agree
+}
+
+// Pairs at one alignment the fast path actually answers: the shipped guard
+// restated, so `fired` counts what the shortcut answered rather than what it
+// was merely offered.
+@nosplit fn classifyFiredAt(alignment: int): int {
+  let fired = 0
+  let sz = 0
+  while (sz <= CLS_MAX_SIZE) {          // bounded: CLS_MAX_SIZE + 1 iterations
+    if (alignment > 0 && alignment <= 8 && (alignment & (alignment - 1)) == 0) {
+      if (allocAlignUp(sz, alignment) <= 48) { fired = fired + 1 }
+    }
+    sz = sz + 1
+  }
+  return fired
+}
+
+fn classifyRun() {
+  let pairs = 0
+  let agree = 0
+  let fired = 0
+
+  let a = 1                             // 0 excluded: `cs % 0` traps
+  while (a <= CLS_MAX_ALIGN) {          // bounded: CLS_MAX_ALIGN iterations
+    pairs = pairs + CLS_MAX_SIZE + 1
+    agree = agree + classifyAgreeAt(a)
+    fired = fired + classifyFiredAt(a)
+    a = a + 1
+  }
+
+  let p = CLS_MAX_ALIGN * 2
+  while (p <= allocMaxSmall) {          // bounded: log2(allocMaxSmall) iterations
+    pairs = pairs + CLS_MAX_SIZE + 1
+    agree = agree + classifyAgreeAt(p)
+    fired = fired + classifyFiredAt(p)
+    p = p * 2
+  }
+
+  let ok = 0
+  if (pairs > 0 && agree == pairs && fired > 0) { ok = 1 }
+  print("clsfast=${ok}/${pairs} fired=${fired}\n")
+}
