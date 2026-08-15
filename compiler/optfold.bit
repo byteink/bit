@@ -379,3 +379,304 @@ fn opIsCompare(op: Op): bool {
 fn opIsArith(op: Op): bool {
   return int(op) >= int(Op.Add) && int(op) <= int(Op.LShr)
 }
+
+// ---------------------------------------------------------------------------
+// Algebraic identities (#3164)
+//
+// `analyzeConsts` folds a binary op only when BOTH operands are known, so an op
+// against a literal 0, 1 or -1 survives to codegen as a materialized constant
+// plus a real instruction. `runtime/gc/mem.bit`'s `wordAt` is the canonical
+// case: `let n: *i64 = nil` then `n + (addr / 8)` emitted `mov x1, #0x0`
+// followed by `add x2, x1, x0`. The rules below cover the one-operand-known
+// case, and `const_nil` reads as the constant 0 (see `constView`) so the `nil`
+// half of that pair participates.
+//
+// Two result shapes, neither of which deletes an instruction — opt.bit's
+// file-level invariant is that an instruction's index IS its value id, so
+// removing one in place would silently renumber every later operand:
+//
+//   - the op YIELDS AN OPERAND (`add x, 0` -> `x`): every later read of the op
+//     is rewritten to read that operand instead, leaving the op itself unread.
+//     `deadCodeElim`, the very next step of the pipeline, drops it.
+//   - the op YIELDS A CONSTANT (`mul x, 0` -> `0`): recorded in the caller's
+//     `known` table, which `rebuild` already renders as a `const_int`.
+//
+// Dropping the USE of an operand is always legal here: the operand's defining
+// instruction stays put, and only `deadCodeElim` may remove it — which it does
+// solely for ops `isSideEffecting` says are pure. A call, a division or an
+// `index_get` behind a folded `mul x, 0` is therefore still executed.
+//
+// No rule depends on signed overflow behavior. Every result is either an
+// operand the unfolded code already computed or a constant inside the type's
+// range, so no rule can introduce an overflow, a trap or a division the
+// original did not have. §13.5 leaves a trapping debug mode open and
+// `foldAddSubMul` above is written not to rely on it either.
+// ---------------------------------------------------------------------------
+
+// The outcome of one identity test. Bit has no tagged union, so the two flags
+// discriminate: `isCopy` means the op yields the existing value `copyOf`,
+// `cval.known` means it yields that constant, and neither set means no identity
+// applies.
+struct IdentFold {
+  isCopy: bool,
+  copyOf: int,
+  cval: ConstVal,
+}
+
+fn noIdent(): IdentFold {
+  return IdentFold{ isCopy: false, copyOf: 0, cval: noConst() }
+}
+
+fn copyIdent(v: int): IdentFold {
+  return IdentFold{ isCopy: true, copyOf: v, cval: noConst() }
+}
+
+fn constIdent(v: ConstVal): IdentFold {
+  return IdentFold{ isCopy: false, copyOf: 0, cval: v }
+}
+
+// The compile-time value of `v`, widened with the one fact `analyzeConsts` does
+// not record: `const_nil` IS the integer 0. It is deliberately not added to
+// `known` itself — that table drives `emitTranslated`, which would then replace
+// every `const_nil` with a `const_int 0` at a pointer type, changing what
+// codegen and the GC's pointer maps see for no gain. Here it only ever feeds an
+// identity test, so the nil operand disappears and the surviving operand keeps
+// its own type.
+fn constView(known: []ConstVal, f: IrFunc, v: int): ConstVal {
+  if (known[v].known) {
+    return known[v]
+  }
+  if (f.instrs[v].op == Op.ConstNil) {
+    return intConst(0)
+  }
+  return noConst()
+}
+
+// The width to read value `v`'s raw constant bits under: its own type's, or 64
+// when it is not a primitive (a `const_nil`'s pointer type, where the value is
+// exactly 0 at any width).
+fn constBitsOf(ctx: TypeContext, f: IrFunc, v: int): int {
+  let p = primOfType(ctx, f.instrs[v].ty)
+  if (p < 0) {
+    return 64
+  }
+  return primBits(p)
+}
+
+// Whether `cv` is an integer constant equal to `want` in `v`'s own width. Bool
+// and float constants never match: `false`/`0.0` are not integer zeros, and
+// `x + 0.0` is not `x` when `x` is `-0.0`.
+fn constIsInt(ctx: TypeContext, known: []ConstVal, f: IrFunc, v: int, want: int): bool {
+  let cv = constView(known, f, v)
+  if (!cv.known || cv.isFloat || cv.isBool) {
+    return false
+  }
+  let bits = constBitsOf(ctx, f, v)
+  return maskTo(cv.ival, bits) == maskTo(want, bits)
+}
+
+// Whether the shift COUNT `v` is a constant that shifts by nothing. §13.5 takes
+// the count modulo the operand width, so 64 on an i64 is as much a no-op as 0.
+// Uses `foldShift`'s exact expression so the both-known and one-known paths can
+// never disagree about which counts are no-ops.
+fn shiftCountIsNoop(known: []ConstVal, f: IrFunc, v: int, bits: int): bool {
+  let cv = constView(known, f, v)
+  if (!cv.known || cv.isFloat || cv.isBool) {
+    return false
+  }
+  return i64(u64(cv.ival) % u64(bits)) == 0
+}
+
+// The all-ones constant for a `bits`-wide value of the given signedness — `-1`
+// signed, `2^bits - 1` unsigned — already canonical per `canon`.
+fn allOnesConst(bits: int, signed: bool): ConstVal {
+  return intConst(canon(maskTo(-1, bits), bits, signed))
+}
+
+// `add`/`sub`/`mul` identities. `sub(0, x)` is deliberately absent: it is a
+// negation, which needs an instruction this pass cannot create and which traps
+// on MIN under the specified debug mode.
+fn identAddSubMul(ctx: TypeContext, known: []ConstVal, f: IrFunc, ins: IrInstr,
+  bits: int, signed: bool): IdentFold {
+  let lZero = constIsInt(ctx, known, f, ins.lhs, 0)
+  let rZero = constIsInt(ctx, known, f, ins.rhs, 0)
+  if (ins.op == Op.Add) {
+    if (rZero) { return copyIdent(ins.lhs) }
+    if (lZero) { return copyIdent(ins.rhs) }
+    return noIdent()
+  }
+  if (ins.op == Op.Sub) {
+    if (rZero) { return copyIdent(ins.lhs) }
+    return noIdent()
+  }
+  if (lZero || rZero) {
+    return constIdent(intConst(canon(0, bits, signed)))
+  }
+  if (constIsInt(ctx, known, f, ins.rhs, 1)) { return copyIdent(ins.lhs) }
+  if (constIsInt(ctx, known, f, ins.lhs, 1)) { return copyIdent(ins.rhs) }
+  return noIdent()
+}
+
+// `and`/`or`/`xor` identities. Always total — a bitwise op can neither trap nor
+// overflow at any width.
+fn identBitwise(ctx: TypeContext, known: []ConstVal, f: IrFunc, ins: IrInstr,
+  bits: int, signed: bool): IdentFold {
+  let lZero = constIsInt(ctx, known, f, ins.lhs, 0)
+  let rZero = constIsInt(ctx, known, f, ins.rhs, 0)
+  let lOnes = constIsInt(ctx, known, f, ins.lhs, -1)
+  let rOnes = constIsInt(ctx, known, f, ins.rhs, -1)
+  if (ins.op == Op.BAnd) {
+    if (rOnes) { return copyIdent(ins.lhs) }
+    if (lOnes) { return copyIdent(ins.rhs) }
+    if (lZero || rZero) { return constIdent(intConst(canon(0, bits, signed))) }
+    return noIdent()
+  }
+  if (ins.op == Op.BOr) {
+    if (rZero) { return copyIdent(ins.lhs) }
+    if (lZero) { return copyIdent(ins.rhs) }
+    if (lOnes || rOnes) { return constIdent(allOnesConst(bits, signed)) }
+    return noIdent()
+  }
+  if (rZero) { return copyIdent(ins.lhs) }
+  if (lZero) { return copyIdent(ins.rhs) }
+  return noIdent()
+}
+
+// `shl`/`lshr`/`ashr` identities: a no-op count yields the shifted value, and
+// shifting zero yields zero under every direction and every count.
+fn identShift(ctx: TypeContext, known: []ConstVal, f: IrFunc, ins: IrInstr,
+  bits: int, signed: bool): IdentFold {
+  if (shiftCountIsNoop(known, f, ins.rhs, bits)) {
+    return copyIdent(ins.lhs)
+  }
+  if (constIsInt(ctx, known, f, ins.lhs, 0)) {
+    return constIdent(intConst(canon(0, bits, signed)))
+  }
+  return noIdent()
+}
+
+// The identity `ins` obeys, if any. Float ops fall through: `x + 0.0` is not
+// `x` for `-0.0`, and `x * 1.0` quiets a signaling NaN, so IEEE-754 arithmetic
+// gets no rules here. A non-primitive result type (pointer arithmetic, where
+// `wordAt`'s `add *i64` lives) is allowed a copy identity but never a constant
+// one, since there is no width to canonicalize a constant to.
+fn identityOf(ctx: TypeContext, known: []ConstVal, f: IrFunc, id: int): IdentFold {
+  let ins = f.instrs[id]
+  let op = ins.op
+  let p = primOfType(ctx, ins.ty)
+  let isInt = p >= 0 && isIntPrim(p)
+  let bits = 64
+  let signed = false
+  if (isInt) {
+    bits = primBits(p)
+    signed = isSignedPrim(p)
+  } else if (p >= 0) {
+    // A float or bool result: nothing below applies to either.
+    return noIdent()
+  }
+  let r = noIdent()
+  if (op == Op.Add || op == Op.Sub || op == Op.Mul) {
+    r = identAddSubMul(ctx, known, f, ins, bits, signed)
+  } else if (op == Op.BAnd || op == Op.BOr || op == Op.BXor) {
+    r = identBitwise(ctx, known, f, ins, bits, signed)
+  } else if (op == Op.Shl || op == Op.LShr || op == Op.AShr) {
+    r = identShift(ctx, known, f, ins, bits, signed)
+  }
+  if (r.cval.known && !isInt) {
+    return noIdent()
+  }
+  // THE TYPE MUST NOT CHANGE. A copy identity replaces reads of `id` with reads
+  // of an operand, so anything that consumed `id` at `ins.ty` now consumes the
+  // operand at ITS type — a silent retype of a live value, which codegen and
+  // the GC's pointer maps both trust. Refusing the fold is always safe.
+  if (r.isCopy && f.instrs[r.copyOf].ty != ins.ty) {
+    return noIdent()
+  }
+  return r
+}
+
+// `ids` with every entry replaced by its representative. Returns the ORIGINAL
+// slice when nothing changed, and otherwise a fresh one — an IR operand list
+// can be shared between instructions, so mutating one in place would rewrite
+// operands this pass never examined.
+fn mapIds(alias: []int, ids: []int): []int {
+  let i = 0
+  while (i < len(ids)) {
+    if (alias[ids[i]] != ids[i]) {
+      let out = []int(0)
+      let j = 0
+      while (j < len(ids)) {
+        out = append(out, alias[ids[j]])
+        j = j + 1
+      }
+      return out
+    }
+    i = i + 1
+  }
+  return ids
+}
+
+// Points every value id instruction `id` reads at its representative. Mirrors
+// `emitTranslated`'s own field discipline exactly — `lhs`/`rhs` only where
+// `opUsesLhs`/`opUsesRhs` say they hold a value, `ival` only for the two ops
+// whose immediate is one, and `br`'s edge argument lists separately — because a
+// second, disagreeing operand table is how a pass comes to rewrite an offset as
+// if it were a value id.
+fn rewriteOperandIds(f: IrFunc, alias: []int, id: int) {
+  let ins = f.instrs[id]
+  let op = ins.op
+  if (op == Op.Br) {
+    ins.lhs = alias[ins.lhs]
+    ins.thenArgs = mapIds(alias, ins.thenArgs)
+    ins.elseArgs = mapIds(alias, ins.elseArgs)
+    return
+  }
+  if (opUsesLhs(op)) {
+    ins.lhs = alias[ins.lhs]
+  }
+  if (opUsesRhs(op)) {
+    ins.rhs = alias[ins.rhs]
+  }
+  if (op == Op.IndexSet || op == Op.AtomicCmpxchg) {
+    ins.ival = alias[ins.ival]
+  }
+  ins.args = mapIds(alias, ins.args)
+}
+
+// One forward sweep applying every identity above, in place. Runs after
+// `analyzeConsts` and before the rebuild, so a constant it discovers still
+// reaches `computeReachable` and `rebuild` through the same `known` table.
+//
+// Bounded and non-recursive: one pass over an array of known size, and each
+// step reads only `alias` entries strictly below `i`. Operands are repointed
+// BEFORE `i`'s own identity is tested, so an identity's surviving value is
+// already a representative and `alias` never needs chasing — one lookup is
+// always final. That is also what makes a cascade (`add x, (mul y, 0)`) resolve
+// in this single pass.
+//
+// Mutating `f` in place is safe here in a way deleting an instruction would not
+// be: no index moves, so every value id stays valid. `f`'s `IrInstr` records
+// are its own — every producer of an `IrFunc` (`rebuild`, `inlineCalls`,
+// lowering) builds fresh records through `mkInstr`, and `spliceCallee` copies
+// rather than sharing — so no other function can observe these writes.
+fn foldIdentities(ctx: TypeContext, f: IrFunc, known: []ConstVal) {
+  let alias = []int(0)
+  let i = 0
+  while (i < len(f.instrs)) {
+    alias = append(alias, i)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(f.instrs)) {
+    rewriteOperandIds(f, alias, i)
+    if (!known[i].known && opIsArith(f.instrs[i].op)) {
+      let r = identityOf(ctx, known, f, i)
+      if (r.isCopy) {
+        alias[i] = r.copyOf
+      } else if (r.cval.known) {
+        known[i] = r.cval
+      }
+    }
+    i = i + 1
+  }
+}
