@@ -20,6 +20,180 @@
 // `index_alloc = std.heap.page_allocator`. Index bytes must not count toward
 // `liveBytes`, or they would perturb the growth trigger.
 
+// ---------------------------------------------------------------------------
+// THE PLANNED REPLACEMENT (#3147): a per-span allocated-slot bitmap
+// ---------------------------------------------------------------------------
+//
+// #3147 measured this table at 24 bytes per slot at peak capacity (three
+// tables resident at once — live, spare, and every smaller table ever
+// abandoned into the bump-only `gcIdxRes`): 30% of the `alloc` bench's RSS,
+// 208 MiB on `json`. This is #3175's design for the fix — DESIGN ONLY, no
+// code below this comment changed. #3176 adds the bitmap write-only, #3177
+// rewires `gcOwns` to read it, #3178 stops `idxInsert`/`idxRemove` for
+// span-backed objects, #3179 unmaps what is left of `gcIdxRes`.
+//
+// 1. WHERE IT LIVES: AN EXTENSION OF THE SPAN HEADER, PER CLASS, NOT A TABLE
+// ---------------------------------------------------------------------------
+// Since #2374 a span (`runtime/alloc/alloc.bit`) is self-describing and
+// aligned to its own size (`allocSpanBytes` = 131072, `allocSpanOf` a mask),
+// so the bitmap belongs INSIDE the span it describes: immediately after the
+// existing 10 fixed header words (`allocSpanHdrWords`, alloc.bit:244) and
+// before the first carved slot — an extension of the reserved PREFIX
+// `spanSkip` already computes (alloc.bit:269-273: "Slots ... the header
+// consumes at the span base. Rounded UP to a whole slot"), not a change to
+// the fixed 10-word block's own offsets (spanClass..spanEmpty keep their
+// exact positions).
+//
+// NOT a side table: a side table reintroduces exactly the disease this epic
+// is curing — a structure that must grow, rehash and outlive what it
+// describes, when the span already needs no such table for its OWN
+// bookkeeping (alloc.bit:9-12: "no address->span lookup table ... a span is
+// aligned to its own size"). Embedding it also means the bitmap needs no
+// reclaim step of its own — see the #3179 note below.
+//
+// SIZING, AVOIDING THE CIRCULARITY. The bitmap must hold at least
+// `allocSpanSlots(idx)` bits, but that count already SUBTRACTS the skip the
+// bitmap is part of, so sizing off the final slot count is circular. Size it
+// instead off the slot count BEFORE any prefix is removed — `naive(idx) =
+// allocSpanBytes / allocClassSize(idx)` — a safe upper bound
+// (`allocSpanSlots(idx) < naive(idx)` always, removing a nonzero prefix only
+// shrinks the usable count): `bitmapWords(idx) = (naive(idx) + 63) / 64`.
+// The reserved prefix becomes `ceil((allocSpanHdrWords*8 + bitmapWords(idx)*8)
+// / cs)` slots — the same "round up to a whole slot" shape `spanSkip` already
+// has, fed a larger byte count. Comptime per class, so it costs nothing at
+// carve time beyond what `spanSkip` already costs.
+//
+// COST: worst case is class 0 (8-byte slots, `naive` = 16384) at 256 words =
+// 2048 bytes, ~1.6% of a 131072-byte span. Every larger class costs
+// proportionally less. This is a FIXED, comptime, per-class overhead —
+// unlike the table's `24 x cap`, it does not scale with how many objects the
+// GC trigger has let accumulate.
+//
+// THIS DOES NOT WIDEN `gcWords` (37) OR `heapWords` (41) — both are
+// unrelated word-block sizes (the `Gc` struct, the heap-state block); this
+// changes only `allocSpanHdrWords`'s per-class SKIP, which already varies by
+// class today (`spanSkip(cs)`) and is not one of the two boot-pinned totals.
+//
+// 2. THE SEMANTICS gcOwns MUST MATCH, BIT FOR BIT
+// ---------------------------------------------------------------------------
+// Today (gcalloc.bit:174-193): `gcOwns(g, body)` is `idxContains` — or, index
+// disabled, `gcOwnsLinear`, the oracle — and `gcOwnsLinear` answers true iff
+// `body` equals `bodyFromHeader(o)` for some `o` CURRENTLY LINKED on `gcAll`.
+// "Currently linked" is populated at exactly two call sites: `linkObject`
+// (gcalloc.bit:23-35, inserts) and `sweep` + `freeObject` (gcmark.bit:142-179,
+// unlinks then removes). The cases the ticket asks for, matched exactly by
+// list membership today:
+//   - EXACT BASE of a linked object: true (the list holds exactly this).
+//   - INTERIOR (any nonzero offset into a live object's body): the list
+//     holds unique object bases, so an interior address never equals one —
+//     false, with no special-casing in the linear scan.
+//   - FREED (post-sweep, back on the allocator's free list): unlinked from
+//     `gcAll` before `freeObject` runs — false.
+//   - FOREIGN (never came from this heap): never linked — false.
+//
+// A DIVISION-BASED BITMAP LOOKUP DOES NOT GET "INTERIOR" RIGHT FOR FREE, AND
+// THAT IS THE SHARPEST CORRECTNESS POINT HERE. Given a candidate `ref`, the
+// arithmetic is `raw = ref - gcHeaderSize` (gc.bit:79, the header sits before
+// the body), `span = allocSpanOf(raw)`, `carveStart = span + spanSkip*cs`
+// (the address of slot 0), `n = (raw - carveStart) / cs` (floored). Floor
+// division maps EVERY address inside a slot's `cs` bytes to the SAME `n` as
+// the slot's own base — an interior `ref` and its slot's base alias to one
+// bit, so the bit alone cannot tell them apart. The base check must be
+// separate and explicit — `(raw - carveStart) % cs == 0` AND `0 <= n <
+// spanTotal` — BEFORE the bitmap is consulted; only then does testing bit
+// `n` answer the "exact base" question `gcOwnsLinear`'s exact-equality scan
+// answers for free. Skipping the remainder check is a live false positive —
+// "scan garbage as if it were a pointer" — for every nonzero offset into a
+// live object's body a conservative root scan (ABI.md §5) or a
+// reference-array trace (gcmark.bit:74-85) could present.
+//
+// THE BIT MUST BE SET/CLEARED AT THE SAME CALL SITES `idxInsert`/`idxRemove`
+// ARE TODAY — `linkObject`/`freeObject` — NOT inside `runtime/alloc/`'s
+// `heapTakeSmallLocked`/`heapGiveSmallLocked`. This corrects how #3176 was
+// scoped, not a preference: `gcHeapAlloc`/`gcHeapFree` have a THIRD caller
+// besides `gcAlloc`/`gcAllocRaw` — `gcInit`'s mark worklist (gc.bit:202-274,
+// freed at gc.bit:506-509) — which allocates and frees straight through the
+// heap WITHOUT ever calling `linkObject`, exactly so the worklist is never
+// treated as a traced object. `gcOwns` on the worklist's own body address is
+// FALSE today (it is never linked), and that address IS reachable to
+// `gcMarkRoot` in practice — `noteBody` (gcalloc.bit:10-17) is skipped for it
+// too, so `[gcLoAddr, gcHiAddr)` does not exclude it once other objects in
+// the same span widen the bounds around it. A bitmap set at ALLOCATOR
+// take-time (what `heapTakeSmallLocked`/`heapGiveSmallLocked` see) cannot
+// make this distinction: `runtime/alloc/` is deliberately GC-oblivious
+// (module header: "no imports at all", "this file compiles unchanged for
+// every target") and has no way to know a given take is the worklist rather
+// than a real object. Setting the bit at `linkObject`/`freeObject` instead —
+// which already have exactly the "is this a real, tracked object" context
+// `idxInsert`/`idxRemove` use — keeps the worklist's slot bit permanently 0,
+// matching `gcOwnsLinear` exactly. `runtime/alloc/` should only be asked for
+// the pure addressing primitive (span + slot index from an address,
+// mirroring `allocSpanOf`); the DECISION of when to flip a bit stays in
+// `runtime/gc/`, the same layering `idxInsert`/`idxRemove` already have.
+//
+// THE TIMING GAP THIS OPENS IS SAFE, AND WHY, EXPLICITLY, SO IT IS NOT
+// "FIXED" LATER BY MOVING A SAFEPOINT INTO IT: `linkObject` runs strictly
+// after `gcHeapAlloc` returns (gcalloc.bit:129-142), so between a slot
+// leaving the allocator's free list and the bit actually being set there is
+// a window with no GC-visible record of the object at all — the SAME window
+// that exists today between `heapTakeSmallLocked` returning and `idxInsert`
+// running. It is unobservable by a concurrent mark pass only because nothing
+// in that window is `@nosplit`-legal to interrupt at a safepoint (§10.3) and
+// `registerAllocator` (gcalloc.bit:54-84) has already registered this thread,
+// so a stop rendezvous BLOCKS on it rather than proceeding without a stack
+// map. Do not add a safepoint poll between `gcHeapAlloc` and `linkObject`
+// without re-deriving this.
+//
+// 3. LARGE OBJECTS: NOT SPAN-BACKED, SO THE HASH INDEX SURVIVES FOR THEM
+// ---------------------------------------------------------------------------
+// `heapLargeAllocLocked`/`heapLargeFreeLocked` (alloc.bit:734-747) carry NO
+// per-object metadata at all — pure byte counters over a direct
+// `memMapPages` region (gc.bit:386-399). There is no span to mask to and
+// nowhere to embed a bitmap; `allocClassify` returns -1 for exactly this
+// population (classify.bit:74: `needed > allocMaxSmall`, i.e. > 16384 bytes,
+// or an alignment wider than a page). So the bitmap answers ONLY span-backed
+// addresses; a large object's `gcOwns` must keep going through
+// `idxContains`/`gcOwnsLinear` exactly as today, scoped down to large
+// objects once #3178 stops calling `idxInsert`/`idxRemove` for span-backed
+// ones. THE HASH INDEX DOES NOT RETIRE. #3177 must dispatch on
+// span-backed-ness (an owning span found) before falling to the hash path,
+// and #3178's `idxInsert`/`idxRemove` removal is scoped to that same
+// span-backed case only.
+//
+// #3178'S "idxbytes=0" TARGET, AS WRITTEN, IS NOT REACHABLE ON
+// `bench/cases/alloc/alloc.bit`, AND THE TICKET'S OWN PREMISE THAT IT HAS "no
+// large allocations" IS WRONG (flagged there directly, #3175's comment, not
+// a silent edit). Its `batch` slice grows by doubling
+// (`runtime/root/slices.bit:218`, `newcap = vcap * 2`) from 1 toward `per` =
+// 5000 backing WORDS — every slice, including `[]Node`, stores one 8-byte
+// handle per element regardless of element width, and `Node` is itself
+// boxed, a separate 48-byte class-3 object (`fieldLayoutFor`,
+// lowercall.bit:406-441: "string/slice/map/chan/tuple/struct/... are 8-byte
+// handles"). The doubling sequence crosses `allocMaxSmall` (16384 bytes =
+// 2048 words) once length passes 2048, so for roughly the back half of every
+// 5000-element batch the LIVE `batch` backing buffer is a large,
+// direct-mapped allocation — 2000 times over the run, one per batch. Worse,
+// `reserveGrow`'s minimum unit is a full `reserveChunkBytes` = 4194304
+// (mem.bit:299,351) regardless of how small the request is, so the FIRST
+// large allocation of the run maps one whole 4 MiB chunk that a bump reserve
+// (`gcIdxRes`, no free list) never releases on its own — which is exactly
+// today's baseline (#3146: `idxchunks=1 idxbytes=4194304`) and will very
+// likely read UNCHANGED immediately after #3178, not zero. Only #3179's
+// ownership-walk unmap can move that number, and only once the chunk holds
+// no live large entry at unmap time. #3178 should restate its acceptance
+// around a MEASURED post-fix number — expect it to stay near 4194304 until
+// #3179 lands, not to reach zero at #3178 alone.
+//
+// WHAT THIS MEANS FOR #3179's OWNERSHIP WALK: the bitmap itself adds NO new
+// reclaim work — it dies with its span under the EXISTING `spanOwned`-gated
+// path (#2375, `heapReclaimSpansLocked`), unchanged by any of this. #3179's
+// walk stays scoped to `gcIdxRes`'s own chunks exactly as filed, but per the
+// paragraph above it must not assume `gcIdxRes` is retirable wholesale after
+// #3178 — the shrunk, large-object-only table is still LIVE in it, so the
+// walk must distinguish "an orphaned chunk" from "the chunk the live (now
+// much smaller) table still occupies," the same distinction `spanOwned`
+// already draws for spans.
+
 // splitmix64's finalizer. Computed in `u64` because it relies on modular
 // multiplication; `i64` overflow only wraps in v0.1 -- a debug build mode
 // that traps instead is specified but not yet implemented (§11.1, #3076).
