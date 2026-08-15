@@ -17,7 +17,7 @@ static void bufPush(Buf *b, char c) {
 }
 
 int main(void) {
-  long n = 200000;
+  long n = 3000000;
   Buf b;
   b.cap = 1 << 16;
   b.len = 0;

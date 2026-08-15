@@ -170,7 +170,7 @@ static JVal *jget(JVal *obj, const char *key) {
 }
 
 int main(void) {
-  long recs = 30000;
+  long recs = 150000;
   size_t cap = 1 << 21;
   char *buf = malloc(cap);
   size_t n = 0;

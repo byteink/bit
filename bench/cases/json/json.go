@@ -17,7 +17,7 @@ type Record struct {
 }
 
 func main() {
-	recs := 30000
+	recs := 150000
 	var sb strings.Builder
 	sb.WriteByte('[')
 	for i := 0; i < recs; i++ {

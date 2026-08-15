@@ -10,7 +10,7 @@ import (
 func mix(i int64) int64 { return ((i + 1) * 2654435761) % 2147483647 }
 
 func main() {
-	n := int64(200000)
+	n := int64(3000000)
 	var b strings.Builder
 	for i := int64(0); i < n; i++ {
 		tokLen := 3 + mix(i)%12
