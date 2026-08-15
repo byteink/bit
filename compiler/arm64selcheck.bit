@@ -18,14 +18,21 @@ fn selCtx(): A64Ctx {
   cx.floatRegs = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
   let locs = []RegLoc(0)
   let ivs = []int(0)
+  let instrs = []IrInstr(0)
   let i = 0
   while (i < 12) {
     locs = append(locs, RegLoc{ isSpill: false, index: i })
     ivs = append(ivs, i)
+    // A real (non-const) value at every slot, so constIntOf's `f.instrs[v]`
+    // lookup (the #1853 add/sub-immediate fold) reads a genuine block param
+    // instead of indexing the empty instrs testA64Ctx() defaults `f` to. A
+    // check that needs the fold path overwrites a slot with a real const_int.
+    instrs = append(instrs, mkInstr(Op.BlockParam, 0))
     i = i + 1
   }
   cx.result = RegAllocResult{ locations: locs, numSpillSlots: 0, stackMaps: []StackMapEntry(0) }
   cx.instToVreg = ivs
+  cx.f.instrs = instrs
   return cx
 }
 
@@ -45,52 +52,93 @@ fn wantNilOrZeroCheck(want: ByteBuf, reg: int) {
 }
 
 fn checkArm64Selectors() {
-  // add x9, x1, x2 ; mov x0, x9 — operands read from their registers, the result
-  // computed in scratch1, then written out.
+  // add x0, x1, x2 — dst (vreg 0, x0) is already a register, so #1852's
+  // destination-driven selection computes straight into it; the old
+  // "compute in scratch1, then mov x0, x9" rename is gone (destInt returns
+  // the dest's own register, and movRR/fmovFF drop a dst==src self-move).
   let cx = selCtx()
   emitBinaryInt(cx, Op.Add, 0, 1, 2, w64())
   let want = newByteBuf()
-  addRR(want, scratch1(), 1, 2)
-  movRR(want, 0, scratch1())
+  addRR(want, 0, 1, 2)
   assertSameBytes(cx.code, want)
 
-  // A narrow add can overflow its width, so it re-narrows; a narrow bitwise op
-  // takes canonical operands to a canonical result, so it must NOT.
+  // A narrow add can overflow its width, so it re-narrows in place on the
+  // destination register; a narrow bitwise op takes canonical operands to a
+  // canonical result, so it must NOT.
   cx = selCtx()
   emitBinaryInt(cx, Op.Add, 0, 1, 2, w8s())
   want = newByteBuf()
-  addRR(want, scratch1(), 1, 2)
-  extendRegA(want, scratch1(), scratch1(), 1, true)
-  movRR(want, 0, scratch1())
+  addRR(want, 0, 1, 2)
+  extendRegA(want, 0, 0, 1, true)
   assertSameBytes(cx.code, want)
 
   cx = selCtx()
   emitBinaryInt(cx, Op.BAnd, 0, 1, 2, w8s())
   want = newByteBuf()
-  logicalRR(want, logicalOpc(LogicOp.And), scratch1(), 1, 2)
-  movRR(want, 0, scratch1())
+  logicalRR(want, logicalOpc(LogicOp.And), 0, 1, 2)
+  assertSameBytes(cx.code, want)
+
+  // #1853: a constant rhs that fits the ADD/SUB-immediate encoding folds
+  // directly into a single instruction -- no materializing mov at all, not
+  // even into scratch. Overwrites vreg 2's fixture slot (normally a
+  // BlockParam) with a real const_int so constIntOf reads genuine IR rather
+  // than a fixture stand-in that could never be const -- the vacuous-guard
+  // trap: with #1853 fully reverted, a fixture that never carries a
+  // const_int would still pass every check above without ever exercising
+  // the fold.
+  cx = selCtx()
+  cx.f.instrs[2] = mkInstr(Op.ConstInt, 0)
+  cx.f.instrs[2].ival = 5
+  emitBinaryInt(cx, Op.Add, 0, 1, 2, w64())
+  want = newByteBuf()
+  addSubImmediate(want, false, 0, 1, 5, false)
+  assertSameBytes(cx.code, want)
+
+  // A constant that fits neither add/sub-immediate form (not in [0,4095], not
+  // a shifted multiple of 4096) must still materialize through the same
+  // register+register path as an ordinary (non-const) operand.
+  cx = selCtx()
+  cx.f.instrs[2] = mkInstr(Op.ConstInt, 0)
+  cx.f.instrs[2].ival = 5000
+  emitBinaryInt(cx, Op.Add, 0, 1, 2, w64())
+  want = newByteBuf()
+  addRR(want, 0, 1, 2)
+  assertSameBytes(cx.code, want)
+
+  // Sub is NOT commutative (`k - x` != `x - k`), so only its rhs is ever
+  // checked for the fold -- a constant lhs must still take the full
+  // register+register path.
+  cx = selCtx()
+  cx.f.instrs[1] = mkInstr(Op.ConstInt, 0)
+  cx.f.instrs[1].ival = 5
+  emitBinaryInt(cx, Op.Sub, 0, 1, 2, w64())
+  want = newByteBuf()
+  subRR(want, 0, 1, 2)
   assertSameBytes(cx.code, want)
 
   // #2016: every div/rem selector now opens with a zero-divisor check (cmp
   // rhs,#0; b.ne past a call to bit_rt_panic_div_zero) before the real
   // divide — `wantNilOrZeroCheck` below replicates it byte-for-byte so the
   // three `want` buffers can still assert the REST of the sequence exactly.
+  //
+  // rem still divides into scratch3 (never `d`): `msub` reads `l` after the
+  // divide, and `l` aliases scratch1 whenever it was reloaded from a spill,
+  // so the quotient cannot land in a register `l` might still need. Only the
+  // final `msub`'s destination is dest-driven now.
   cx = selCtx()
   emitDivInt(cx, Op.SRem, 0, 1, 2, w64())
   want = newByteBuf()
   wantNilOrZeroCheck(want, 2)
   sdivRR(want, scratch3(), 1, 2)
-  msubRR(want, scratch1(), scratch3(), 2, 1)
-  movRR(want, 0, scratch1())
+  msubRR(want, 0, scratch3(), 2, 1)
   assertSameBytes(cx.code, want)
 
-  // A plain divide has no later use of `l`, so it keeps its quotient in scratch1.
+  // A plain divide has no later use of `l`, so it divides straight into `d`.
   cx = selCtx()
   emitDivInt(cx, Op.UDiv, 0, 1, 2, w64())
   want = newByteBuf()
   wantNilOrZeroCheck(want, 2)
-  udivRR(want, scratch1(), 1, 2)
-  movRR(want, 0, scratch1())
+  udivRR(want, 0, 1, 2)
   assertSameBytes(cx.code, want)
 
   // Narrow signed div re-narrows: this is the INT_MIN/-1 hole (#2263) — a
@@ -101,9 +149,8 @@ fn checkArm64Selectors() {
   emitDivInt(cx, Op.SDiv, 0, 1, 2, w8s())
   want = newByteBuf()
   wantNilOrZeroCheck(want, 2)
-  sdivRR(want, scratch1(), 1, 2)
-  extendRegA(want, scratch1(), scratch1(), 1, true)
-  movRR(want, 0, scratch1())
+  sdivRR(want, 0, 1, 2)
+  extendRegA(want, 0, 0, 1, true)
   assertSameBytes(cx.code, want)
 
   // A const_int shift amount folds into the immediate form; anything else reads a
@@ -114,8 +161,7 @@ fn checkArm64Selectors() {
   cx.f.instrs[2].ival = 5
   emitShiftInt(cx, Op.Shl, 0, 1, 2, w64())
   want = newByteBuf()
-  lslImm(want, scratch1(), 1, 5)
-  movRR(want, 0, scratch1())
+  lslImm(want, 0, 1, 5)
   assertSameBytes(cx.code, want)
 
   cx = selCtx()
@@ -123,8 +169,7 @@ fn checkArm64Selectors() {
     mkInstr(Op.BlockParam, 0)]
   emitShiftInt(cx, Op.AShr, 0, 1, 2, w64())
   want = newByteBuf()
-  asrvRR(want, scratch1(), 1, 2)
-  movRR(want, 0, scratch1())
+  asrvRR(want, 0, 1, 2)
   assertSameBytes(cx.code, want)
 
   // Only shl pushes bits past the width.
@@ -133,26 +178,26 @@ fn checkArm64Selectors() {
     mkInstr(Op.BlockParam, 0)]
   emitShiftInt(cx, Op.LShr, 0, 1, 2, w8s())
   want = newByteBuf()
-  lsrvRR(want, scratch1(), 1, 2)
-  movRR(want, 0, scratch1())
+  lsrvRR(want, 0, 1, 2)
   assertSameBytes(cx.code, want)
 
-  // cmp + cset materializes a bool.
+  // cmp + cset materializes a bool. `cset` reads only NZCV, and the `cmp`
+  // that sets them has already consumed both operands, so writing the
+  // destination here cannot clobber a live read.
   cx = selCtx()
   emitIcmp(cx, Op.ICmpSlt, 0, 1, 2)
   want = newByteBuf()
   cmpRR(want, 1, 2)
-  cset(want, scratch1(), condLt())
-  movRR(want, 0, scratch1())
+  cset(want, 0, condLt())
   assertSameBytes(cx.code, want)
 
-  // A float compare produces an INT result (the bool) from FLOAT operands.
+  // A float compare produces an INT result (the bool) from FLOAT operands, so
+  // there is no aliasing between the destination and the float compare inputs.
   cx = selCtx()
   emitFcmp(cx, Op.FCmpLt, 0, 1, 2, 8)
   want = newByteBuf()
   fcmp(want, 1, 2, 8)
-  cset(want, scratch1(), condMi())
-  movRR(want, 0, scratch1())
+  cset(want, 0, condMi())
   assertSameBytes(cx.code, want)
 }
 
@@ -697,20 +742,22 @@ fn checkFloatBits() {
   assert(float32Bits(f32(0.1)) == u32(1036831949))       // 0x3DCCCCCD
 
   // A double constant loads its 64-bit pattern into a GPR and fmovs it across; a
-  // single uses the 32-bit form of both.
+  // single uses the 32-bit form of both. Dst (vreg 0, d0) is already a float
+  // register, so #1852's destination-driven selection fmovs straight into it —
+  // the trailing "fmov d0, fscratch1" rename is gone (fmovFF drops a
+  // dst==src self-move). The bit pattern itself still stages through the INT
+  // scratch: `d` is a float register and cannot hold it.
   let cx = selCtx()
   emitConstFloat(cx, 0, 1.0, 8)
   let want = newByteBuf()
   movImm64(want, scratch1(), i64(u64(4607182418800017408)))
-  fmovToFp(want, fscratch1(), scratch1(), 8)
-  fmovFF(want, 0, fscratch1(), 8)
+  fmovToFp(want, 0, scratch1(), 8)
   assertSameBytes(cx.code, want)
 
   cx = selCtx()
   emitConstFloat(cx, 0, 1.0, 4)
   want = newByteBuf()
   movImm64(want, scratch1(), 1065353216)
-  fmovToFp(want, fscratch1(), scratch1(), 4)
-  fmovFF(want, 0, fscratch1(), 8)
+  fmovToFp(want, 0, scratch1(), 4)
   assertSameBytes(cx.code, want)
 }
