@@ -110,12 +110,46 @@
 # instruction-selection content, so it does not vary by target ISA at all.
 #
 # COST PER LANDING, as this ticket names up front: a future lowering change
-# that alters IR shape (#3108 is next) needs its OWN signature added to
-# `explainMismatch` below, derived the same way — diff the real branch
-# against the pinned oracle, aggregate every nonzero opcode delta across
-# every diverging file, and solve for the coefficients. A signature that only
-# explains the one file its author happened to look at is not a signature; it
-# is a scoped allowlist wearing a disguise, and #1883 is why that is rejected.
+# that alters IR shape needs its OWN signature added to `explainMismatch`
+# below, derived the same way — diff the real branch against the pinned
+# oracle, aggregate every nonzero opcode delta across every diverging file,
+# and solve for the coefficients. A signature that only explains the one file
+# its author happened to look at is not a signature; it is a scoped allowlist
+# wearing a disguise, and #1883 is why that is rejected.
+#
+# --- #3108 PAID THAT COST, and it did NOT need a second signature ---
+#
+# #3108 inlines the WRITE (`xs[i] = v`: `rt_call slice_set` -> an inline
+# bounds-checked store, the same compiler/loweraccess.bit). It is not an
+# independent transform: since #3108 the read and the write share
+# `emitInlineSliceElem`, so every inlined access of either kind contributes
+# exactly ONE bounds-check prologue and they differ only in the final
+# `index_get` vs `index_set`. The identity generalises rather than forking:
+#
+#   Ng = -delta(rt_call:slice_get)   reads inlined  (>= 0)
+#   Ns = -delta(rt_call:slice_set)   stores inlined (>= 0)
+#   N  = Ng + Ns                     total accesses (> 0)
+#   Nn = delta(field_get) - 2N       narrow-prim READS (>= 0)
+#
+#   delta(slice_len)=delta(icmp_ult)=delta(br)=N
+#   delta(const_string)=delta(rt_call:panic)=delta(unreachable)=N
+#   delta(add)=N+Nn   delta(shl)=Nn   delta(const_int)=Nn
+#   delta(index_get)=Ng-Nn   delta(index_set)=Ns
+#   every OTHER opcode: delta==0 (pre-opt only)
+#
+# Nn is READ-ONLY on purpose and that is a property of the change, not an
+# approximation: #3108 inlines a store only when the element is exactly 8
+# bytes, because `rtSliceSet` writes a whole word and a narrow store does not
+# (it would leave the other seven bytes, which `rtSliceGet` still returns
+# whole). So no store ever takes the shl/const_int arm.
+#
+# Setting Ns=0 recovers #3107's identity character for character, which is why
+# a read-only delta still prints `3107-slice-read-inline` and that self-check
+# below passes untouched. Derived the same empirical way — 153 diverging files
+# on this tree, 153/153 EXPLAINED at pre-opt, 35 of them carrying a store
+# delta, every coefficient an independent equation. Scoring `index_set` at all
+# required the recognizer line inside `opcode()`; before it, all 35 of those
+# files scored delta(index_set)=0 and the store was invisible.
 
 # explainMismatch <oracle_ir_text> <bit2_ir_text> <kind: ir|iropt>
 # Prints the name of the registered signature that explains the divergence
@@ -136,6 +170,23 @@ explainMismatch() {
       }
       if (line ~ /^[[:space:]]*br /) { return "br" }
       if (line ~ /^[[:space:]]*unreachable/) { return "unreachable" }
+      # It is the RENDERING that decides what the two matches above can see, not
+      # whether the op returns a value: a void `rt_call` still prints as
+      # `%5 = rt_call slice_set(%2, %4, %3) void` and scores fine. `index_set`
+      # prints as `index_set %32[%34] = %25` — its `=` is followed by a `%`, not
+      # by an opcode name — so it scores as NOTHING, the same way `br` and
+      # `unreachable` do, which is why those two already have their own lines.
+      #
+      # #3108 emits one `index_set` per inlined store, so without this line the
+      # store half of the identity below cannot be constrained at all: measured
+      # on this tree, all 35 store-bearing corpus files reported
+      # delta(index_set)=0 while really gaining one per store. The self-check
+      # pins it — a store whose `index_set` went missing must NOT be explained.
+      #
+      # `field_set` and the other `dst[i] = v`-shaped ops stay unscored. Nothing
+      # declared here moves them, and widening the recognizer further changes
+      # the delta set every existing signature is checked against at once.
+      if (line ~ /^[[:space:]]*index_set /) { return "index_set" }
       return ""
     }
     side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
@@ -149,12 +200,24 @@ explainMismatch() {
         if (d != 0) delta[op] = d
       }
 
-      # --- #3107: `xs[i]` slice-read inline lowering (see the block comment
-      # above this function for how these coefficients were derived) ---
-      split("slice_get slice_len icmp_ult br const_string panic unreachable field_get add shl const_int index_get bitcast", corelist, " ")
+      # --- #3107 + #3108: inline slice element ACCESS lowering (see the block
+      # comment above this function for how these coefficients were derived) ---
+      #
+      # ONE identity covers both directions because both are the same transform:
+      # since #3108 the read and the write share `emitInlineSliceElem`, so each
+      # inlined access — read or write — contributes exactly one bounds-check
+      # prologue (slice_len, icmp_ult, br, const_string, panic, unreachable, two
+      # field_gets and one add) and they differ only in the final index_get vs
+      # index_set. So the prologue coefficients key on the TOTAL N = Ng + Ns,
+      # and only the last two equations separate the halves. With Ns = 0 this is
+      # the #3107 identity unchanged, which is why that name is still printed
+      # for a read-only delta and why its self-check below passes verbatim.
+      split("slice_get slice_set slice_len icmp_ult br const_string panic unreachable field_get add shl const_int index_get index_set bitcast", corelist, " ")
       for (i in corelist) core[corelist[i]] = 1
-      N = -delta["rt_call:slice_get"]
-      ok = (N > 0)
+      Ng = -delta["rt_call:slice_get"]
+      Ns = -delta["rt_call:slice_set"]
+      N = Ng + Ns
+      ok = (N > 0 && Ng >= 0 && Ns >= 0)
 
       if (kind == "ir") {
         # Pre-opt: the exact linear identity, every coefficient an
@@ -171,7 +234,12 @@ explainMismatch() {
         if (delta["add"] != N + Nn)       ok = 0
         if (delta["shl"] != Nn)           ok = 0
         if (delta["const_int"] != Nn)     ok = 0
-        if (delta["index_get"] != N - Nn) ok = 0
+        # The narrow-prim arm (Nn) is READ-ONLY: #3108 inlines a store only when
+        # the element is exactly 8 bytes, because `rtSliceSet` writes a whole
+        # word and a narrow store does not. So every inlined store contributes
+        # an index_set and the wide reads alone account for index_get.
+        if (delta["index_get"] != Ng - Nn) ok = 0
+        if (delta["index_set"] != Ns)      ok = 0
         Nf = -delta["bitcast"]
         if (Nf < 0)                       ok = 0
         for (op in delta) {
@@ -194,7 +262,10 @@ explainMismatch() {
         }
       }
 
-      if (ok) { print "3107-slice-read-inline"; exit 0 }
+      if (ok) {
+        if (Ns > 0) { print "3108-slice-store-inline" } else { print "3107-slice-read-inline" }
+        exit 0
+      }
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
@@ -228,6 +299,40 @@ unreachable
   rc=$?
   if [ "$rc" -ne 0 ] || [ "$sig" != "3107-slice-read-inline" ]; then
     echo "FAIL: a #3107-shaped delta was not explained (rc=$rc sig='$sig')"
+    fail=1
+  fi
+
+  # The #3108 half: one inlined `xs[i] = v` STORE, no reads. Ng = 0, Ns = 1,
+  # Nn = 0. Same prologue as the read (the two share `emitInlineSliceElem`),
+  # ending in `index_set` instead of `index_get` — and `index_set` is a void op,
+  # so this also pins the recognizer line that makes it visible at all.
+  oracle_store='%1 = rt_call slice_set(%0, %i, %v) void'
+  bit2_store='%1 = slice_len(%0)
+%2 = icmp_ult %i, %1
+br %2, bb1, bb2
+%3 = const_string "index out of range"
+%4 = rt_call panic(%3)
+unreachable
+%5 = field_get %0, 0
+%6 = field_get %0, 0
+%7 = add %5, %6
+index_set %0[%7] = %v'
+
+  sigs=$(explainMismatch "$oracle_store" "$bit2_store" ir)
+  rcs=$?
+  if [ "$rcs" -ne 0 ] || [ "$sigs" != "3108-slice-store-inline" ]; then
+    echo "FAIL: a #3108-shaped delta was not explained (rc=$rcs sig='$sigs')"
+    fail=1
+  fi
+
+  # A store delta whose `index_set` did NOT appear must be REJECTED: that is the
+  # shape of a store that lost its write, and before the recognizer line above
+  # it scored identically to a correct one.
+  bit2_store_lost=$(printf '%s\n' "$bit2_store" | grep -v '^index_set ')
+  sigl=$(explainMismatch "$oracle_store" "$bit2_store_lost" ir)
+  rcl=$?
+  if [ "$rcl" -eq 0 ] || [ -n "$sigl" ]; then
+    echo "FAIL: a store with no index_set was wrongly explained (rc=$rcl sig='$sigl')"
     fail=1
   fi
 
