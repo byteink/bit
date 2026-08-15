@@ -1,0 +1,557 @@
+// tests/bit/fmtcitations.bit — spec/FMT.md citation-drift gate (#3072).
+//
+// `spec/FMT.md` cites specific `compiler/fmt*.bit:NNN` file:line ranges
+// throughout its ten sections, and nothing in the repo ever read them:
+// `test-docs` (tests/bit/docs.bit) walks `${root}/docs` only, `test-spec`
+// (tests/bit/spec/) checks `spec/SPEC.md`'s grammar only, and
+// `scripts/gate.sh` classifies a `spec/FMT.md`-only diff as `bucket: noop`
+// with no gate name at all. The citations went stale twice (#2954, #3052),
+// each time caught only by a human reading the file closely.
+//
+// WHAT THIS CHECKS, IN TWO TIERS:
+//
+// TIER 1 — BOUNDS. Every `compiler/fmt*.bit:N` or `:N-M` (comma-separated
+// segments allowed, e.g. `268-270, 282-284`) citation: the named file exists
+// under the repo root, and every line number in every segment is within
+// `[1, that file's current line count]`. This alone would have caught most
+// of #3052's findings (a citation pointing past the end of a file that
+// shrank under it).
+//
+// TIER 2 — SYMBOL IDENTITY, mechanical but best-effort. When a citation is
+// DIRECTLY preceded in the prose by a single backtick-quoted bare identifier
+// — connected by nothing but a comma or an open-paren, e.g. `` `fmtGap`,
+// `compiler/fmt.bit:258-285` `` or `` `fmtFoo` (`compiler/fmt.bit:5-9`) ``
+// — and that identifier names a top-level `fn`/`const` actually declared in
+// the cited file, this checks that the declaration's line falls inside one
+// of the cited segments. This is the "the cited range still contains the
+// named function or constant" check and is what actually catches a citation
+// silently drifting off its target after an unrelated edit shifts the file.
+//
+// WHAT THIS DELIBERATELY DOES NOT CHECK, so a green run is not misread:
+//   - the PROSE CLAIM. A citation can point at the exact right function and
+//     still describe stale behaviour; verifying that requires reading intent,
+//     which this file does not attempt.
+//   - a citation whose preceding text is not a bare identifier directly
+//     connected by "," or "(" — a possessive ("`fmtGap`'s `allowBlank`
+//     branch, ..."), a call expression ("`fmtGap(p, true)`, ..."), or a
+//     Tag/type name that is not itself declared in the cited file (`Binary`,
+//     `FuncDecl`, `MatchArm`) all fall back to TIER 1 only. This is
+//     deliberately conservative: a heuristic that guessed the "intended"
+//     symbol from surrounding prose would risk a false PASS on a real drift,
+//     which is worse than no check at all (see this repo's own CLAUDE.md on
+//     a gate that overstates its coverage).
+//   - a citation naming a symbol with no line spec at all (a bare
+//     `` `compiler/fmt.bit` `` module mention) gets only a file-existence
+//     check, tallied separately as a "bare mention", never counted toward
+//     the citation/verified totals below.
+//
+// The summary line prints both denominators every run — citations found and
+// citations symbol-verified — never just a verdict, so this cannot regress
+// into a gate that scans nothing and prints PASS.
+//
+// Run from the repository root: bit-out/bin/bit run tests/bit/fmtcitations.bit
+// `BIT_REPO` overrides the repository root (default: search . / .. / ../.. /
+// ../../..), matching tests/bit/spec/spec.bit's own convention.
+
+import { exists, readFile } from "std/fs"
+import { env } from "std/os"
+import { hasPrefix, indexOf, split } from "std/strings"
+
+// Bounds — every walk below is over a handful of small files, but each is
+// still capped explicitly (Power of 10 rule 2).
+const maxDocBytes: int = 262144
+const maxCitations: int = 256
+const maxLineSpecLen: int = 64
+const maxSegmentsPerCitation: int = 8
+const maxIdentLen: int = 64
+const maxBackScan: int = 200
+const maxCitedFileBytes: int = 1048576
+const maxCitedFileLines: int = 8192
+const maxDeclsPerFile: int = 512
+
+// Floors, not exact counts — a pinned exact count merges cleanly across two
+// branches that each touch spec/FMT.md and is exactly the trap this repo's
+// own CLAUDE.md documents (a clean merge of two correct edits landing on a
+// wrong total). Set well under today's real count (31 line citations, 21
+// symbol-verified) so a scanner regression toward zero still fails loudly.
+const minCitationsFloor: int = 20
+const minVerifiedFloor: int = 10
+
+const fmtPrefix: string = "compiler/fmt"
+const bitSuffix: string = ".bit"
+
+struct Citation {
+  file: string        // e.g. "compiler/fmtwrap.bit"
+  lineSpecRaw: string  // e.g. "268-270, 282-284"; empty for a bare mention
+  hasSpec: bool
+  docLine: int         // 1-based line in spec/FMT.md where the citation starts
+  startOffset: int      // byte offset of the citation's file name in the doc text
+}
+
+struct Segment { start: int, end: int, ok: bool }
+struct Decl { name: string, line: int }
+struct Scan { citations: int, boundsChecked: int, verified: int, bareMentions: int, failures: int }
+
+fn die(msg: string) {
+  eprint("fmtcitations: SETUP FAILED: ${msg}\n")
+  osExit(1)
+}
+
+fn report(sc: Scan, msg: string) {
+  eprint("fmtcitations: FAIL: ${msg}\n")
+  sc.failures = sc.failures + 1
+}
+
+// The repo root: the nearest ancestor holding `spec/FMT.md`. BIT_REPO wins.
+fn repoRoot(): string {
+  let override = env("BIT_REPO")
+  if (len(override) > 0) {
+    return override
+  }
+  let candidates = [".", "..", "../..", "../../.."]
+  for c of candidates {
+    if (exists("${c}/spec/FMT.md")) {
+      return c
+    }
+  }
+  die("cannot locate spec/FMT.md from this cwd; set BIT_REPO")
+  return ""
+}
+
+fn isAsciiLetter(c: u8): bool {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+fn isIdentStartCh(c: u8): bool {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+fn isIdentContCh(c: u8): bool {
+  return isIdentStartCh(c) || (c >= '0' && c <= '9')
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn isLineSpecChar(c: u8): bool {
+  return (c >= '0' && c <= '9') || c == '-' || c == ',' || c == ' '
+}
+
+// `s` with leading and trailing space/tab/newline/CR removed — std/strings'
+// trimSpace only strips space and tab, and a citation's connector routinely
+// crosses a markdown line-wrap.
+fn trimWs(s: string): string {
+  let lo = 0
+  let hi = len(s)
+  while (lo < hi && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isBareIdentifier(s: string): bool {
+  let n = len(s)
+  if (n == 0 || n > maxIdentLen) {
+    return false
+  }
+  if (!isIdentStartCh(s[0])) {
+    return false
+  }
+  let i = 1
+  while (i < n) {
+    if (!isIdentContCh(s[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn docLineFor(text: string, offset: int): int {
+  return len(split(text[0:offset], "\n"))
+}
+
+// Every `compiler/fmt<letters>.bit` occurrence in `text`, whether or not it
+// carries a `:N[-M][, N[-M]...]` line spec. Bounded scan: `i` only ever
+// advances, so this terminates in at most `len(text)` steps regardless of
+// how many candidates fail the `.bit` check.
+fn extractCitations(text: string): []Citation {
+  let out = []Citation(0)
+  let n = len(text)
+  let i = 0
+  while (i < n && len(out) < maxCitations) {
+    let relRaw = indexOf(text[i:n], fmtPrefix)
+    if (relRaw < 0) {
+      break
+    }
+    let start = i + int(relRaw)
+    let p = start + len(fmtPrefix)
+    let sufStart = p
+    while (p < n && isAsciiLetter(text[p])) {
+      p = p + 1
+    }
+    if (p + len(bitSuffix) > n || text[p:p + len(bitSuffix)] != bitSuffix) {
+      i = start + 1
+      continue
+    }
+    let fileName = "compiler/fmt${text[sufStart:p]}${bitSuffix}"
+    let afterBit = p + len(bitSuffix)
+    let hasSpec = false
+    let lineSpecRaw = ""
+    let endOffset = afterBit
+    if (afterBit < n && text[afterBit] == ':') {
+      let specStart = afterBit + 1
+      let q = specStart
+      while (q < n && (q - specStart) < maxLineSpecLen && isLineSpecChar(text[q])) {
+        q = q + 1
+      }
+      let raw = trimWs(text[specStart:q])
+      if (len(raw) > 0) {
+        hasSpec = true
+        lineSpecRaw = raw
+        endOffset = q
+      }
+    }
+    out = append(out, Citation{file: fileName, lineSpecRaw: lineSpecRaw, hasSpec: hasSpec,
+      docLine: docLineFor(text, start), startOffset: start})
+    i = endOffset
+  }
+  return out
+}
+
+// If the citation starting at `citStartOffset` is immediately preceded (only
+// a comma or an open-paren, plus whitespace, in between) by a single
+// backtick-quoted bare identifier, returns it; otherwise "". Deliberately
+// conservative — see the file header's TIER 2 scope note for why a weaker
+// match is not attempted.
+fn findAssociatedSymbol(text: string, citStartOffset: int): string {
+  if (citStartOffset < 1 || text[citStartOffset - 1] != '`') {
+    return ""
+  }
+  let scanFloor = citStartOffset - 1 - maxBackScan
+  if (scanFloor < 0) {
+    scanFloor = 0
+  }
+  let k = citStartOffset - 2
+  while (k >= scanFloor && text[k] != '`') {
+    k = k - 1
+  }
+  if (k < scanFloor || text[k] != '`') {
+    return ""
+  }
+  let connector = trimWs(text[k + 1:citStartOffset - 1])
+  if (connector != "," && connector != "(") {
+    return ""
+  }
+  let nameEnd = k
+  let nameFloor = k - 1 - maxIdentLen
+  if (nameFloor < 0) {
+    nameFloor = 0
+  }
+  let m = k - 1
+  while (m >= nameFloor && text[m] != '`') {
+    m = m - 1
+  }
+  if (m < nameFloor || text[m] != '`') {
+    return ""
+  }
+  let candidate = text[m + 1:nameEnd]
+  if (!isBareIdentifier(candidate)) {
+    return ""
+  }
+  return candidate
+}
+
+// The bare name after `kw` (e.g. "fn " or "const ") at the very start of
+// `line`, or "" if `line` does not begin with `kw` followed by an identifier.
+fn declName(line: string, kw: string): string {
+  if (!hasPrefix(line, kw)) {
+    return ""
+  }
+  let rest = line[len(kw):len(line)]
+  if (len(rest) == 0 || !isIdentStartCh(rest[0])) {
+    return ""
+  }
+  let n = len(rest)
+  let j = 1
+  while (j < n && isIdentContCh(rest[j])) {
+    j = j + 1
+  }
+  return rest[0:j]
+}
+
+// Every top-level `fn NAME` / `const NAME` declared in `lines`, in order.
+fn extractDecls(lines: []string): []Decl {
+  let out = []Decl(0)
+  let n = len(lines)
+  let i = 0
+  while (i < n && len(out) < maxDeclsPerFile) {
+    let name = declName(lines[i], "fn ")
+    if (len(name) == 0) {
+      name = declName(lines[i], "const ")
+    }
+    if (len(name) > 0) {
+      out = append(out, Decl{name: name, line: i + 1})
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn lookupDecl(decls: []Decl, name: string): int {
+  for d of decls {
+    if (d.name == name) {
+      return d.line
+    }
+  }
+  return 0
+}
+
+fn parseIntSimple(s: string): (int, bool) {
+  let n = len(s)
+  if (n == 0 || n > 6) {
+    return 0, false
+  }
+  let v = 0
+  let i = 0
+  while (i < n) {
+    let c = s[i]
+    if (c < '0' || c > '9') {
+      return 0, false
+    }
+    v = v * 10 + (int(c) - 48)
+    i = i + 1
+  }
+  return v, true
+}
+
+fn parseOneSegment(raw: string): Segment {
+  let t = trimWs(raw)
+  if (len(t) == 0) {
+    return Segment{start: 0, end: 0, ok: false}
+  }
+  let dashRaw = indexOf(t, "-")
+  if (dashRaw < 0) {
+    let (v, ok) = parseIntSimple(t)
+    return Segment{start: v, end: v, ok: ok}
+  }
+  let dash = int(dashRaw)
+  let a = trimWs(t[0:dash])
+  let b = trimWs(t[dash + 1:len(t)])
+  let (va, oka) = parseIntSimple(a)
+  let (vb, okb) = parseIntSimple(b)
+  return Segment{start: va, end: vb, ok: oka && okb && vb >= va}
+}
+
+// `spec` split on "," into segments, each either "N" (start==end) or "N-M".
+// An empty result (or any unparseable segment) is reported by the caller,
+// never treated as vacuously in-bounds.
+fn parseSegments(spec: string): []Segment {
+  let out = []Segment(0)
+  let parts = split(spec, ",")
+  if (len(parts) == 0 || len(parts) > maxSegmentsPerCitation) {
+    return []Segment(0)
+  }
+  for part of parts {
+    out = append(out, parseOneSegment(part))
+  }
+  return out
+}
+
+fn checkCitation(sc: Scan, root: string, docText: string, cit: Citation) {
+  if (!cit.hasSpec) {
+    sc.bareMentions = sc.bareMentions + 1
+    if (!exists("${root}/${cit.file}")) {
+      report(sc, "spec/FMT.md:${cit.docLine}: names ${cit.file}, which does not exist under the repo root")
+    }
+    return
+  }
+  sc.citations = sc.citations + 1
+  let full = "${root}/${cit.file}"
+  if (!exists(full)) {
+    report(sc, "spec/FMT.md:${cit.docLine}: cites ${cit.file}:${cit.lineSpecRaw}, but ${cit.file} does not exist under the repo root")
+    return
+  }
+  let text = readFile(full) catch e {
+    report(sc, "spec/FMT.md:${cit.docLine}: cites ${cit.file}:${cit.lineSpecRaw}, but it could not be read: ${e.message()}")
+    return
+  }
+  if (len(text) > maxCitedFileBytes) {
+    die("${cit.file} is ${len(text)} bytes, over the ${maxCitedFileBytes} bound")
+  }
+  let lines = split(text, "\n")
+  if (len(lines) > maxCitedFileLines) {
+    die("${cit.file} has ${len(lines)} lines, over the ${maxCitedFileLines} bound")
+  }
+  let lineCount = len(lines)
+  let segs = parseSegments(cit.lineSpecRaw)
+  if (len(segs) == 0) {
+    report(sc, "spec/FMT.md:${cit.docLine}: cites ${cit.file}:${cit.lineSpecRaw}, which has an unparseable line spec")
+    return
+  }
+  let boundsOk = true
+  for seg of segs {
+    if (!seg.ok || seg.start < 1 || seg.end > lineCount) {
+      boundsOk = false
+    }
+  }
+  if (!boundsOk) {
+    report(sc, "spec/FMT.md:${cit.docLine}: cites ${cit.file}:${cit.lineSpecRaw}, out of bounds (${cit.file} has ${lineCount} line(s))")
+    return
+  }
+  sc.boundsChecked = sc.boundsChecked + 1
+
+  let symbolName = findAssociatedSymbol(docText, cit.startOffset)
+  if (len(symbolName) == 0) {
+    return
+  }
+  let declLine = lookupDecl(extractDecls(lines), symbolName)
+  if (declLine < 1) {
+    return
+  }
+  let inRange = false
+  for seg of segs {
+    if (declLine >= seg.start && declLine <= seg.end) {
+      inRange = true
+    }
+  }
+  if (inRange) {
+    sc.verified = sc.verified + 1
+  } else {
+    report(sc, "spec/FMT.md:${cit.docLine}: `${symbolName}` is declared at ${cit.file}:${declLine}, outside the cited range ${cit.file}:${cit.lineSpecRaw}")
+  }
+}
+
+fn selfCheck(cond: bool, label: string): int {
+  if (cond) {
+    return 0
+  }
+  eprint("fmtcitations: SELFTEST FAIL: ${label}\n")
+  return 1
+}
+
+fn selfTestExtract(): int {
+  let failed = 0
+  let text = "See `myFn`, `compiler/fmt.bit:5-9` and bare `compiler/fmtwrap.bit` mention, then `other`, `compiler/fmtdispatch.bit:20, 30-31`."
+  let cits = extractCitations(text)
+  failed = failed + selfCheck(len(cits) == 3, "extractCitations did not find exactly 3 citations in synthetic text")
+  if (len(cits) == 3) {
+    failed = failed + selfCheck(cits[0].file == "compiler/fmt.bit" && cits[0].hasSpec && cits[0].lineSpecRaw == "5-9",
+      "extractCitations misparsed the first ranged citation")
+    failed = failed + selfCheck(cits[1].file == "compiler/fmtwrap.bit" && !cits[1].hasSpec,
+      "extractCitations misparsed the bare file mention")
+    failed = failed + selfCheck(cits[2].file == "compiler/fmtdispatch.bit" && cits[2].lineSpecRaw == "20, 30-31",
+      "extractCitations misparsed the multi-segment citation")
+  }
+  return failed
+}
+
+fn selfTestAssociation(): int {
+  let failed = 0
+  let t1 = "rule (`fmtFoo`, `compiler/fmt.bit:5-9`) applies"
+  let c1 = extractCitations(t1)
+  failed = failed + selfCheck(len(c1) == 1, "setup: expected 1 citation in t1")
+  if (len(c1) == 1) {
+    failed = failed + selfCheck(findAssociatedSymbol(t1, c1[0].startOffset) == "fmtFoo",
+      "findAssociatedSymbol did not associate a direct comma-connected name")
+  }
+  let t2 = "call `fmtFoo` (`compiler/fmt.bit:5-9`) applies"
+  let c2 = extractCitations(t2)
+  failed = failed + selfCheck(len(c2) == 1, "setup: expected 1 citation in t2")
+  if (len(c2) == 1) {
+    failed = failed + selfCheck(findAssociatedSymbol(t2, c2[0].startOffset) == "fmtFoo",
+      "findAssociatedSymbol did not associate a paren-connected name")
+  }
+  let t3 = "`fmtFoo`'s own branch, `compiler/fmt.bit:5-9` applies"
+  let c3 = extractCitations(t3)
+  failed = failed + selfCheck(len(c3) == 1, "setup: expected 1 citation in t3")
+  if (len(c3) == 1) {
+    failed = failed + selfCheck(findAssociatedSymbol(t3, c3[0].startOffset) == "",
+      "findAssociatedSymbol wrongly associated across a possessive/prose connector")
+  }
+  let t4 = "the `fmtGap(p, true)`, `compiler/fmt.bit:5-9` call"
+  let c4 = extractCitations(t4)
+  failed = failed + selfCheck(len(c4) == 1, "setup: expected 1 citation in t4")
+  if (len(c4) == 1) {
+    failed = failed + selfCheck(findAssociatedSymbol(t4, c4[0].startOffset) == "",
+      "findAssociatedSymbol wrongly associated a call expression as a bare identifier")
+  }
+  return failed
+}
+
+fn selfTestDecls(): int {
+  let failed = 0
+  let lines = ["// header", "const fmtMaxWidth = 100", "", "fn fmtFoo(p: Printer) {", "  return 1", "}"]
+  let decls = extractDecls(lines)
+  failed = failed + selfCheck(len(decls) == 2, "extractDecls did not find both declarations")
+  if (len(decls) == 2) {
+    failed = failed + selfCheck(decls[0].name == "fmtMaxWidth" && decls[0].line == 2,
+      "extractDecls misparsed the const declaration")
+    failed = failed + selfCheck(decls[1].name == "fmtFoo" && decls[1].line == 4,
+      "extractDecls misparsed the fn declaration")
+  }
+  return failed
+}
+
+fn selfTestSegments(): int {
+  let failed = 0
+  let segs1 = parseSegments("5-9")
+  failed = failed + selfCheck(len(segs1) == 1 && segs1[0].ok && segs1[0].start == 5 && segs1[0].end == 9,
+    "parseSegments misparsed a single range")
+  let segs2 = parseSegments("267, 294")
+  failed = failed + selfCheck(len(segs2) == 2 && segs2[0].start == 267 && segs2[0].end == 267 &&
+    segs2[1].start == 294 && segs2[1].end == 294,
+    "parseSegments misparsed a two-value list")
+  let segs3 = parseSegments("12-x")
+  failed = failed + selfCheck(len(segs3) == 1 && !segs3[0].ok,
+    "parseSegments accepted a non-numeric range end")
+  return failed
+}
+
+// Runs BEFORE the real scan, on synthetic text, so a scanner bug is caught
+// before it silently mis-scores spec/FMT.md — mirrors tests/bit/spec/
+// specgrammar.bit's own selfTest in spirit and in structure.
+fn selfTest(): int {
+  return selfTestExtract() + selfTestAssociation() + selfTestDecls() + selfTestSegments()
+}
+
+fn main() {
+  let selfFailed = selfTest()
+  if (selfFailed != 0) {
+    eprint("fmtcitations: SELFTEST FAILED — ${selfFailed} case(s); aborting before the real scan\n")
+    osExit(1)
+  }
+
+  let root = repoRoot()
+  let docPath = "${root}/spec/FMT.md"
+  let docText = readFile(docPath) catch e {
+    die("cannot read ${docPath}: ${e.message()}")
+    ""
+  }
+  if (len(docText) > maxDocBytes) {
+    die("${docPath} is ${len(docText)} bytes, over the ${maxDocBytes} bound")
+  }
+
+  let citations = extractCitations(docText)
+  let sc = Scan{citations: 0, boundsChecked: 0, verified: 0, bareMentions: 0, failures: 0}
+  for cit of citations {
+    checkCitation(sc, root, docText, cit)
+  }
+
+  if (sc.citations < minCitationsFloor) {
+    report(sc, "only ${sc.citations} file:line citation(s) found in spec/FMT.md, want >= ${minCitationsFloor} — the scanner regressed or the doc lost its citations")
+  }
+  if (sc.verified < minVerifiedFloor) {
+    report(sc, "only ${sc.verified} citation(s) symbol-verified, want >= ${minVerifiedFloor} — the association heuristic regressed")
+  }
+
+  if (sc.failures > 0) {
+    eprint("fmtcitations: FAILED — ${sc.failures} finding(s) over ${sc.citations} citation(s) (${sc.boundsChecked} bounds-checked, ${sc.verified} symbol-verified, ${sc.bareMentions} bare file mention(s))\n")
+    osExit(1)
+  }
+  print("fmtcitations: ok — ${sc.citations} citation(s) found, ${sc.boundsChecked} bounds-checked, ${sc.verified} symbol-verified (function/const declaration confirmed inside cited range), ${sc.bareMentions} bare file mention(s), 0 failure(s)\n")
+}
