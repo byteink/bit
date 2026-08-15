@@ -14,7 +14,7 @@
 //
 // `lex` itself stays strict RFC 8259 (no comment handling). The JSONC
 // extension (#1479, stdlib/json/parse.bit) reuses this same scanner with
-// comment-skipping switched on via `lexImpl`'s `allowComments` flag, so the
+// comment-skipping switched on via the `allowComments` flag, so the
 // grammar lives in exactly one place instead of a forked copy. The CST layer
 // (#1723, stdlib/json/cst_parse.bit) needs the comments themselves, not just
 // a place that skips them, so `lexImpl` takes a second flag, `emitComments`:
@@ -22,6 +22,15 @@
 // span, delimiters included) instead of being consumed as whitespace —
 // same scanner, same grammar, one more observable outcome.
 
+// TWO ENTRY POINTS, ONE GRAMMAR (#2293). `lex`/`lexCst` materialize the whole
+// stream as `[]Token`, which is what a caller wanting random access (the CST
+// layer, the lexer tests) needs. `jsonParse`/`jsoncParse` never look backwards,
+// so they drive `lexNext` directly and read the current token off `Lexer`'s own
+// `kind`/`start`/`end` fields — a struct is a heap object in Bit, so a
+// materialized `Token` per token is a `gc_alloc` per token, and a 9 MB document
+// is 3.6M of them held live for the entire parse. `scanToken` below is the only
+// place a `Token` is built, so the two entry points cannot drift apart.
+//
 // The lexical categories a JSON token can be.
 export enum TokenKind {
   LBrace,
@@ -74,7 +83,18 @@ export struct Token { kind: TokenKind, start: int, end: int }
 // roughly 3x too high and walks straight back into #2345.
 export const jsonMaxDepth = 128
 
-struct Lexer { src: string, i: int, depth: int }
+// The scanner's state, plus the token it most recently produced
+// (`kind`/`start`/`end`). Carrying the current token in the state rather than
+// returning it is what lets `jsonParse` tokenize without allocating: see this
+// file's header.
+struct Lexer { src: string, i: int, depth: int, kind: TokenKind, start: int, end: int }
+
+// A scanner positioned before `source`'s first token. `kind` is `Eof` until the
+// first `lexNext`, which is the same thing an empty source would yield, so a
+// caller that reads the cursor without scanning sees "no token", never garbage.
+fn newLexer(source: string): Lexer {
+  return Lexer{ src: source, i: 0, depth: 0, kind: TokenKind.Eof, start: 0, end: 0 }
+}
 
 fn isDigit(c: u8): bool {
   return c >= '0' && c <= '9'
@@ -84,44 +104,53 @@ fn isLower(c: u8): bool {
   return c >= 'a' && c <= 'z'
 }
 
-// Advances the cursor by `n` and returns the token `[start, start+n)`.
-fn emit(lx: Lexer, start: int, n: int, k: TokenKind): Token {
-  lx.i = start + n
-  return Token{ kind: k, start: start, end: start + n }
+// Records `[start, end)` as the current token without touching the cursor.
+fn setTok(lx: Lexer, k: TokenKind, start: int, end: int) {
+  lx.kind = k
+  lx.start = start
+  lx.end = end
 }
 
-// `{`/`[`: enforces `jsonMaxDepth`, returning `Invalid` (without opening a new
+// Advances the cursor by `n` and records the token `[start, start+n)`.
+fn emit(lx: Lexer, start: int, n: int, k: TokenKind) {
+  lx.i = start + n
+  setTok(lx, k, start, start + n)
+}
+
+// `{`/`[`: enforces `jsonMaxDepth`, recording `Invalid` (without opening a new
 // level) once the counter already sits at the cap.
-fn scanOpen(lx: Lexer, k: TokenKind): Token {
+fn scanOpen(lx: Lexer, k: TokenKind) {
   let start = lx.i
   if (lx.depth >= jsonMaxDepth) {
-    return emit(lx, start, 1, TokenKind.Invalid)
+    emit(lx, start, 1, TokenKind.Invalid)
+    return
   }
   lx.depth = lx.depth + 1
-  return emit(lx, start, 1, k)
+  emit(lx, start, 1, k)
 }
 
 // `}`/`]`: pops one level; never goes negative on an unmatched closer.
-fn scanClose(lx: Lexer, k: TokenKind): Token {
+fn scanClose(lx: Lexer, k: TokenKind) {
   let start = lx.i
   if (lx.depth > 0) {
     lx.depth = lx.depth - 1
   }
-  return emit(lx, start, 1, k)
+  emit(lx, start, 1, k)
 }
 
 // A `"`-delimited string span, quotes included, escapes left raw. A `\`
 // always protects the byte after it from ending the string (so an escaped
 // quote does not close it); an unterminated string consumes to EOF and
 // reports `Invalid` rather than looping past the source.
-fn scanString(lx: Lexer): Token {
+fn scanString(lx: Lexer) {
   let start = lx.i
   lx.i = lx.i + 1
   while (lx.i < len(lx.src)) {
     let c = lx.src[lx.i]
     if (c == '"') {
       lx.i = lx.i + 1
-      return Token{ kind: TokenKind.StringTok, start: start, end: lx.i }
+      setTok(lx, TokenKind.StringTok, start, lx.i)
+      return
     }
     if (c == '\\' && lx.i + 1 < len(lx.src)) {
       lx.i = lx.i + 2
@@ -129,14 +158,14 @@ fn scanString(lx: Lexer): Token {
       lx.i = lx.i + 1
     }
   }
-  return Token{ kind: TokenKind.Invalid, start: start, end: lx.i }
+  setTok(lx, TokenKind.Invalid, start, lx.i)
 }
 
 // A JSON number span (RFC 8259 §6: optional `-`, integer part, optional `.`
 // fraction, optional `e`/`E` exponent) captured verbatim. This layer scans
 // the shape; it does not reject a malformed literal — that check belongs to
 // the parser task consuming this stream.
-fn scanNumber(lx: Lexer): Token {
+fn scanNumber(lx: Lexer) {
   let start = lx.i
   if (lx.src[lx.i] == '-') {
     lx.i = lx.i + 1
@@ -159,27 +188,47 @@ fn scanNumber(lx: Lexer): Token {
       lx.i = lx.i + 1
     }
   }
-  return Token{ kind: TokenKind.NumberTok, start: start, end: lx.i }
+  setTok(lx, TokenKind.NumberTok, start, lx.i)
 }
 
 // `true`/`false`/`null`, or `Invalid` for any other lowercase run — JSON's
 // only bare-word literals are these three.
-fn scanWord(lx: Lexer): Token {
+// Span-compared (#2293) rather than materializing `lx.src[start:lx.i]`: a
+// substring is a fresh heap copy, and `true`/`false`/`null` are three of the
+// commonest tokens in real documents, so slicing here cost one allocation per
+// bare-word token to learn something four byte compares already know.
+fn spanIs(lx: Lexer, start: int, end: int, word: string): bool {
+  if (end - start != len(word)) {
+    return false
+  }
+  let k = 0
+  while (k < len(word)) {
+    if (lx.src[start + k] != word[k]) {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+fn scanWord(lx: Lexer) {
   let start = lx.i
   while (lx.i < len(lx.src) && isLower(lx.src[lx.i])) {
     lx.i = lx.i + 1
   }
-  let word = lx.src[start:lx.i]
-  if (word == "true") {
-    return Token{ kind: TokenKind.TrueTok, start: start, end: lx.i }
+  if (spanIs(lx, start, lx.i, "true")) {
+    setTok(lx, TokenKind.TrueTok, start, lx.i)
+    return
   }
-  if (word == "false") {
-    return Token{ kind: TokenKind.FalseTok, start: start, end: lx.i }
+  if (spanIs(lx, start, lx.i, "false")) {
+    setTok(lx, TokenKind.FalseTok, start, lx.i)
+    return
   }
-  if (word == "null") {
-    return Token{ kind: TokenKind.NullTok, start: start, end: lx.i }
+  if (spanIs(lx, start, lx.i, "null")) {
+    setTok(lx, TokenKind.NullTok, start, lx.i)
+    return
   }
-  return Token{ kind: TokenKind.Invalid, start: start, end: lx.i }
+  setTok(lx, TokenKind.Invalid, start, lx.i)
 }
 
 // Skips JSON whitespace (RFC 8259 §2: space, tab, CR, LF) and dispatches one
@@ -193,7 +242,7 @@ fn scanWord(lx: Lexer): Token {
 // `Invalid` immediately (span longer than one byte, so `describeInvalid` in
 // parse.bit can tell it apart from a lone stray `/`), regardless of
 // `emitComments` — a truncated comment is malformed input either way.
-fn scanToken(lx: Lexer, allowComments: bool, emitComments: bool): Token {
+fn lexNext(lx: Lexer, allowComments: bool, emitComments: bool) {
   while (lx.i < len(lx.src)) {
     let c = lx.src[lx.i]
     if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
@@ -205,7 +254,8 @@ fn scanToken(lx: Lexer, allowComments: bool, emitComments: bool): Token {
         lx.i = lx.i + 1
       }
       if (emitComments) {
-        return Token{ kind: TokenKind.Comment, start: start, end: lx.i }
+        setTok(lx, TokenKind.Comment, start, lx.i)
+        return
       }
     } else if (allowComments && c == '/' && lx.i + 1 < len(lx.src) && lx.src[lx.i + 1] == '*') {
       let start = lx.i
@@ -221,34 +271,54 @@ fn scanToken(lx: Lexer, allowComments: bool, emitComments: bool): Token {
       }
       if (!closed) {
         lx.i = len(lx.src)
-        return Token{ kind: TokenKind.Invalid, start: start, end: lx.i }
+        setTok(lx, TokenKind.Invalid, start, lx.i)
+        return
       }
       if (emitComments) {
-        return Token{ kind: TokenKind.Comment, start: start, end: lx.i }
+        setTok(lx, TokenKind.Comment, start, lx.i)
+        return
       }
     } else if (c == '{') {
-      return scanOpen(lx, TokenKind.LBrace)
+      scanOpen(lx, TokenKind.LBrace)
+      return
     } else if (c == '}') {
-      return scanClose(lx, TokenKind.RBrace)
+      scanClose(lx, TokenKind.RBrace)
+      return
     } else if (c == '[') {
-      return scanOpen(lx, TokenKind.LBracket)
+      scanOpen(lx, TokenKind.LBracket)
+      return
     } else if (c == ']') {
-      return scanClose(lx, TokenKind.RBracket)
+      scanClose(lx, TokenKind.RBracket)
+      return
     } else if (c == ':') {
-      return emit(lx, lx.i, 1, TokenKind.Colon)
+      emit(lx, lx.i, 1, TokenKind.Colon)
+      return
     } else if (c == ',') {
-      return emit(lx, lx.i, 1, TokenKind.Comma)
+      emit(lx, lx.i, 1, TokenKind.Comma)
+      return
     } else if (c == '"') {
-      return scanString(lx)
+      scanString(lx)
+      return
     } else if (isDigit(c) || c == '-') {
-      return scanNumber(lx)
+      scanNumber(lx)
+      return
     } else if (isLower(c)) {
-      return scanWord(lx)
+      scanWord(lx)
+      return
     } else {
-      return emit(lx, lx.i, 1, TokenKind.Invalid)
+      emit(lx, lx.i, 1, TokenKind.Invalid)
+      return
     }
   }
-  return Token{ kind: TokenKind.Eof, start: lx.i, end: lx.i }
+  setTok(lx, TokenKind.Eof, lx.i, lx.i)
+}
+
+// The only place a `Token` is materialized. `lexImpl` (the `[]Token` API) needs
+// one per token; `jsonParse` reads `lx.kind`/`lx.start`/`lx.end` instead and
+// never calls this.
+fn scanToken(lx: Lexer, allowComments: bool, emitComments: bool): Token {
+  lexNext(lx, allowComments, emitComments)
+  return Token{ kind: lx.kind, start: lx.start, end: lx.end }
 }
 
 // The full token stream for `source`, ending with one `Eof`. Bounded by twice
@@ -259,7 +329,7 @@ fn scanToken(lx: Lexer, allowComments: bool, emitComments: bool): Token {
 // unterminated `/* */` (JSONC) pins `lx.i` at EOF, so the next call yields
 // `Eof` and the loop ends the same way it always has.
 fn lexImpl(source: string, allowComments: bool, emitComments: bool): []Token {
-  let lx = Lexer{ src: source, i: 0, depth: 0 }
+  let lx = newLexer(source)
   let toks = []Token(0)
   let guard = 0
   let bound = len(source) * 2 + 2
@@ -277,13 +347,6 @@ fn lexImpl(source: string, allowComments: bool, emitComments: bool): []Token {
 // The full token stream for `source`, strict RFC 8259 (no comments).
 export fn lex(source: string): []Token {
   return lexImpl(source, false, false)
-}
-
-// The full token stream for `source`, JSONC's comment-tolerant lexing
-// (#1479, stdlib/json/parse.bit's `jsoncParse`): `//` and `/* */` comments
-// are skipped as whitespace instead of erroring.
-fn lexJsonc(source: string): []Token {
-  return lexImpl(source, true, false)
 }
 
 // The full token stream for `source`, JSONC grammar, with every `//`/`/* */`
