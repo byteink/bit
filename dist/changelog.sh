@@ -153,22 +153,30 @@ TAGGED="$(awk -F'\t' '
   }
 ' <(printf '%s\n' "${CLASSIFICATION}") <(printf '%s\n' "${REMAINING}"))"
 
-by_category() {
-  local cat="$1"
-  BODY="$(printf '%s\n' "${TAGGED}" | awk -F'\t' -v cat="${cat}" '$1==cat{print $2}')"
-  [ -n "${BODY}" ] || return 0
-  REMAINING="$(printf '%s\n' "${REMAINING}" | grep -vxF -e "${BODY}" || true)"
+# Claim and emit as ONE step, unlike `take`/`emit` above. If claiming were
+# split from emitting, a category whose emit call went missing would still
+# have its commits silently stripped out of REMAINING by the classification
+# step, so the accounting guard below would catch the shortfall but could
+# no longer name which commits caused it — the exact failure mode the guard
+# exists to rule out. Deleting one `emit_category` call must leave that
+# category's commits sitting in REMAINING, not vanished.
+emit_category() {
+  local cat="$1" body
+  body="$(printf '%s\n' "${TAGGED}" | awk -F'\t' -v cat="${cat}" '$1==cat{print $2}')"
+  [ -n "${body}" ] || return 0
+  REMAINING="$(printf '%s\n' "${REMAINING}" | grep -vxF -e "${body}" || true)"
+  emit "${cat}" "${body}"
 }
 
-by_category 'Compiler'           ; emit 'Compiler'           "${BODY}"
-by_category 'Runtime'            ; emit 'Runtime'            "${BODY}"
-by_category 'Standard library'   ; emit 'Standard library'   "${BODY}"
-by_category 'Tests'              ; emit 'Tests'              "${BODY}"
-by_category 'Documentation'      ; emit 'Documentation'      "${BODY}"
-by_category 'Build and tooling'  ; emit 'Build and tooling'  "${BODY}"
-by_category 'Benchmarks'         ; emit 'Benchmarks'         "${BODY}"
-by_category 'Editor support'     ; emit 'Editor support'     "${BODY}"
-by_category 'Examples'           ; emit 'Examples'           "${BODY}"
+emit_category 'Compiler'
+emit_category 'Runtime'
+emit_category 'Standard library'
+emit_category 'Tests'
+emit_category 'Documentation'
+emit_category 'Build and tooling'
+emit_category 'Benchmarks'
+emit_category 'Editor support'
+emit_category 'Examples'
 
 # THE POINT OF THE ACCOUNTING. Every commit in the range must appear exactly
 # once: `take` claims, so a duplicate is impossible and a shortfall means a
