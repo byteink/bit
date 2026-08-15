@@ -27,8 +27,16 @@ starting from `init`.
 
 A new slice with the elements in the opposite order.
 
+### `clone(xs: []T): []T`
+
+A copy of `xs` with its own backing array. `append` grows its argument in
+place and aliases the original's storage, so a slice handed to a callee that
+appends can have the caller's own view mutated underneath it; `clone` takes an
+independent snapshot before that happens. Appending to (or writing into) the
+clone never affects `xs`, and vice versa.
+
 ```bit
-import { mapped, filter, reduce } from "std/seq"
+import { mapped, filter, reduce, clone } from "std/seq"
 
 fn sum(xs: []int): int {
   return reduce(xs, 0, (acc: int, x: int) => acc + x)
@@ -37,6 +45,11 @@ fn sum(xs: []int): int {
 fn evenSquares(xs: []int): []int {
   let evens = filter(xs, (x: int) => x % 2 == 0)
   return mapped(evens, (x: int) => x * x)
+}
+
+fn independentCopy(xs: []int): []int {
+  let snapshot = clone(xs)
+  return append(snapshot, 0)
 }
 ```
 
