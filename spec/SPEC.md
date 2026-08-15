@@ -2073,10 +2073,15 @@ them stay omittable and `let p: Inner` above is still valid.
 ### 13.5 Arithmetic and Overflow
 
 - Unsigned integer arithmetic is modular (wraps).
-- Signed integer overflow **traps (panics) in debug builds** and **wraps with
-  two's-complement semantics in release builds**. The build mode is a compiler
-  flag; the default `bit build` is release, `bit build --debug` is debug. This
-  makes overflow deterministic and testable rather than undefined.
+- Signed integer overflow **wraps with two's-complement semantics** in v0.1;
+  `bit build` has one behavior and there is no build-mode flag.
+  A **debug build mode that instead traps (panics) on signed overflow** is the
+  long-term design — `bit build --debug` would select it, making overflow
+  deterministic and testable rather than undefined — but it is **specified
+  and not yet implemented**: there is no `--debug` flag, no debug build mode,
+  and no overflow-trap codegen on either backend. The flag, the runtime trap,
+  and the codegen are tracked as task #3076 (a decomposed epic); do not rely
+  on either behavior existing until it lands.
 - Integer division or remainder by zero **panics**.
 - Float arithmetic follows IEEE-754; division by zero yields ±∞ or NaN (no panic).
 - Shifts: the shift count is taken modulo the operand bit width.
