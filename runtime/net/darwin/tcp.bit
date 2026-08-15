@@ -14,6 +14,20 @@ import { parkMonoNs } from "../../park/darwin"
 
 // A listening socket bound to `host:port`. `port == 0` lets the kernel pick one;
 // recover it with `netLocalPort`. Returns a negative value on failure.
+//
+// #2343: A FAILURE AFTER A SYSCALL RETURNS `0 - lastErr()`, not a flat `-1` —
+// so a caller can tell EADDRINUSE from EACCES from ECONNREFUSED. `lastErr()`
+// is read IMMEDIATELY on the failing branch, before `netClose` runs (same
+// discipline `runtime/root/darwin/fs.bit`'s `readAllErrno` documents: "read
+// immediately after the call that set it, before anything else touches
+// libSystem") — `netClose` itself does not reach `__error()` on this
+// platform's success path, but capturing first costs nothing and removes the
+// question. `netParseIpv4` rejecting the host is NOT a kernel errno, so that
+// branch keeps the fixed `-1` sentinel — the one case where this collides
+// with a real errno is EPERM (1 on both platforms), a pre-existing ambiguity
+// #2314 owns, not introduced here: every existing caller of this primitive
+// only tests `fd < 0`, never `fd == -1`, so the collision changes no
+// behaviour today.
 export @symbol("bit_rt_port_net_listen_tcp") @nosplit fn netListenTcp(host: *u8, hostLen: int, port: int, backlog: int): int {
   let ip = ipBytes()
   if (!netParseIpv4(host, hostLen, ip)) {
@@ -21,20 +35,23 @@ export @symbol("bit_rt_port_net_listen_tcp") @nosplit fn netListenTcp(host: *u8,
   }
   let fd = netSysSocket(false)
   if (fd < 0) {
-    return 0 - 1
+    return 0 - lastErr()
   }
   if (!netSetReuseAddr(fd)) {
+    let e = lastErr()
     netClose(fd)
-    return 0 - 1
+    return 0 - e
   }
   netFillSockAddr(saBytes(), ip, port)
   if (!netSysBind(fd, saBytes())) {
+    let e = lastErr()
     netClose(fd)
-    return 0 - 1
+    return 0 - e
   }
   if (!netSysListen(fd, backlog)) {
+    let e = lastErr()
     netClose(fd)
-    return 0 - 1
+    return 0 - e
   }
   return fd
 }
@@ -98,7 +115,7 @@ export @symbol("bit_rt_port_net_dial_tcp") fn netDialTcp(host: *u8, hostLen: int
   }
   let fd = netSysSocket(false)
   if (fd < 0) {
-    return 0 - 1
+    return 0 - lastErr()
   }
   netFillSockAddr(saBytes(), ip, port)
   let rc = int(connect(i32(fd), saBytes(), i32(saLen)))
@@ -108,7 +125,7 @@ export @symbol("bit_rt_port_net_dial_tcp") fn netDialTcp(host: *u8, hostLen: int
   let e = lastErr()
   if (e != eInProgress() && e != eAgain() && e != eIntr()) {
     netClose(fd)
-    return 0 - 1
+    return 0 - e
   }
   let spins = 0
   // Bounded (Power of 10). One parked wait suffices when there is a scheduler;
@@ -157,18 +174,32 @@ export @symbol("bit_rt_port_net_dial_tcp") fn netDialTcp(host: *u8, hostLen: int
     let ce = lastErr()
     if (rc2 >= 0 || ce == eIsConn()) {
       // Connected as far as the handshake is concerned; SO_ERROR is now the
-      // authority on whether it succeeded.
-      if (netSocketError(fd) != 0) {
+      // authority on whether it succeeded. `netSocketError` returns the
+      // deferred connect's own errno directly (SO_ERROR IS an errno value,
+      // e.g. ECONNREFUSED) — that is a stronger signal than `lastErr()` here,
+      // since no syscall this thread made just failed. A negative
+      // `netSocketError` result is its OWN getsockopt call failing, in which
+      // case `lastErr()` (read immediately, no syscall in between) is the
+      // right source instead.
+      let soErr = netSocketError(fd)
+      if (soErr != 0) {
         netClose(fd)
-        return 0 - 1
+        if (soErr > 0) {
+          return 0 - soErr
+        }
+        return 0 - lastErr()
       }
       return fd
     }
     if (ce != eAlready() && ce != eInProgress() && ce != eIntr()) {
       netClose(fd)
-      return 0 - 1
+      return 0 - ce
     }
   }
+  // Spin bound exhausted with the handshake still pending (EALREADY/
+  // EINPROGRESS/EINTR every time): not a kernel-reported cause, so this stays
+  // the fixed `-1` sentinel rather than a stale errno from an attempt that
+  // never actually failed.
   netClose(fd)
   return 0 - 1
 }
