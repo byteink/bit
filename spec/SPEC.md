@@ -154,10 +154,25 @@ Sizes are fixed on every target for deterministic behavior (this is not Go's
 platform-dependent `int`).
 
 **`parseFloat(s: string) -> f64`** converts decimal or hexadecimal float text to
-the nearest `f64`. The accepted text is exactly `FLOAT_LIT` (§5.5) with an
-optional leading `+` or `-`, including `_` digit separators; the conversion is
-correctly rounded (round-to-nearest-even on the exact value, never an
-approximation), so a given text always denotes the same `f64` on every target.
+the nearest `f64`. The accepted text is an optional leading `+` or `-` followed
+by either `FLOAT_LIT` (§5.5) or a bare `DIGITS` sequence (§5.5) with no `.` and
+no exponent — `parseFloat` is a strict superset of the token grammar `FLOAT_LIT`
+itself defines, since a caller handing it arbitrary text (a config value, a JSON
+number, a form field) has no reason to spell an integer with a trailing `.0`
+first: `parseFloat("42") == 42.0`. Hex text is not loosened this way — the `p`
+exponent §5.5 makes mandatory for `HEX_FLOAT` is still mandatory here, so
+`parseFloat("0x1.8")` (no exponent) is a failed parse, not `1.5`.
+
+`_` digit separators are accepted throughout, but only exactly where §5.4
+allows them: between two digits of the group they separate, never leading,
+trailing, or doubled, checked independently for the integer part, the
+fraction, an exponent, and (hex) each side of the mantissa's `.` — so
+`parseFloat("4_2")` is `42.0`, but `parseFloat("1__0")`, `parseFloat("_1")`,
+and `parseFloat("1_")` are all failed parses (§5.4's three forbidden shapes,
+doubled/leading/trailing, applied to the one digit group each of those strings
+has). The conversion is correctly rounded (round-to-nearest-even on the exact
+value, never an approximation), so a given text always denotes the same `f64`
+on every target.
 
 **Text it cannot parse yields a quiet NaN**, so a failed conversion is
 distinguishable from every successful one — `parseFloat("nonsense")` is not
