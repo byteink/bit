@@ -50,6 +50,40 @@ fn putFloat(cx: A64Ctx, vreg: int, src: int) {
   fmovFF(cx.code, cx.floatRegs[loc.index], src, 8)
 }
 
+// The register a selector may compute its result directly into: the
+// destination's own allocated register when it has one, else `fallback` (a
+// scratch), since a spilled destination has to be stored out of some register
+// anyway. Computing there makes the trailing `putInt`/`putFloat` a self-move,
+// which `movRR`/`fmovFF` already drop — so the rename disappears with no
+// peephole over emitted bytes and no change to the IR (#1852).
+//
+// LEGAL ONLY when the sequence's FIRST write of the destination happens no
+// earlier than its LAST read of an operand. The allocator frees a destination's
+// register at its def point, so the only value that register can still hold is
+// an operand dying at this very instruction — which a read-then-write
+// instruction consumes before clobbering it. Two shapes violate that and keep
+// computing in scratch on purpose:
+//   * `emitHeaderWordOrZero` zeroes its target BEFORE the `cbz`/`ldr` pair reads
+//     `baseReg` (its own comment turns on scratch1 never aliasing baseReg), so
+//     slice_len and the cap(s) field_get stay as they were;
+//   * the atomic LL/SC loops re-read `base`/`oper` on every retry, after the
+//     loop body has written its result register.
+fn destInt(cx: A64Ctx, vreg: int, fallback: int): int {
+  let loc = regLocOf(cx, vreg)
+  if (loc.isSpill) {
+    return fallback
+  }
+  return cx.intRegs[loc.index]
+}
+
+fn destFloat(cx: A64Ctx, vreg: int, fallback: int): int {
+  let loc = regLocOf(cx, vreg)
+  if (loc.isSpill) {
+    return fallback
+  }
+  return cx.floatRegs[loc.index]
+}
+
 fn plocOf(cx: A64Ctx, vreg: int, class: RegClass): PLoc {
   let loc = regLocOf(cx, vreg)
   if (loc.isSpill) {
@@ -146,32 +180,34 @@ fn canonNarrow(code: ByteBuf, reg: int, w: Width) {
 fn emitBinaryInt(cx: A64Ctx, op: Op, dst: int, lhs: int, rhs: int, w: Width) {
   let l = getInt(cx, vregOf(cx, lhs), scratch1())
   let r = getInt(cx, vregOf(cx, rhs), scratch2())
+  let d = destInt(cx, dst, scratch1())
   if (op == Op.Add) {
-    addRR(cx.code, scratch1(), l, r)
+    addRR(cx.code, d, l, r)
   } else if (op == Op.Sub) {
-    subRR(cx.code, scratch1(), l, r)
+    subRR(cx.code, d, l, r)
   } else if (op == Op.BAnd) {
-    logicalRR(cx.code, logicalOpc(LogicOp.And), scratch1(), l, r)
+    logicalRR(cx.code, logicalOpc(LogicOp.And), d, l, r)
   } else if (op == Op.BOr) {
-    logicalRR(cx.code, logicalOpc(LogicOp.Orr), scratch1(), l, r)
+    logicalRR(cx.code, logicalOpc(LogicOp.Orr), d, l, r)
   } else {
     assert(op == Op.BXor)
-    logicalRR(cx.code, logicalOpc(LogicOp.Eor), scratch1(), l, r)
+    logicalRR(cx.code, logicalOpc(LogicOp.Eor), d, l, r)
   }
   // add/sub can overflow past the type width; the bitwise ops preserve canonical
   // operands, so they need no re-narrowing.
   if (op == Op.Add || op == Op.Sub) {
-    canonNarrow(cx.code, scratch1(), w)
+    canonNarrow(cx.code, d, w)
   }
-  putInt(cx, dst, scratch1())
+  putInt(cx, dst, d)
 }
 
 fn emitMulInt(cx: A64Ctx, dst: int, lhs: int, rhs: int, w: Width) {
   let l = getInt(cx, vregOf(cx, lhs), scratch1())
   let r = getInt(cx, vregOf(cx, rhs), scratch2())
-  mulRR(cx.code, scratch1(), l, r)
-  canonNarrow(cx.code, scratch1(), w)
-  putInt(cx, dst, scratch1())
+  let d = destInt(cx, dst, scratch1())
+  mulRR(cx.code, d, l, r)
+  canonNarrow(cx.code, d, w)
+  putInt(cx, dst, d)
 }
 
 // `w` is the RESULT width: signed division is the one narrow op division can
@@ -199,11 +235,14 @@ fn emitDivInt(cx: A64Ctx, op: Op, dst: int, lhs: int, rhs: int, w: Width) {
   let isRem = op == Op.SRem || op == Op.URem
   // `rem` recovers its result with `msub dst = l - q*r`, so it still needs `l`
   // (and `r`) after the divide. `l` aliases scratch1 whenever it was spilled and
-  // reloaded there, so writing the quotient to scratch1 would clobber `l` before
-  // msub reads it (yielding q*(1-r)). Divide into scratch3 — never allocatable,
-  // and unused on this path — so `l` survives. A plain divide has no later use of
-  // `l`, so it keeps the quotient in scratch1 as its result.
-  let q = scratch1()
+  // reloaded there, so writing the quotient to the result register would clobber
+  // `l` before msub reads it (yielding q*(1-r)) — a spilled destination makes
+  // `d` scratch1 too, so the hazard survives destination-driven selection.
+  // Divide into scratch3 — never allocatable, never `d`, and unused on this
+  // path — so `l` survives. A plain divide has no later use of `l`, so it
+  // divides straight into `d`.
+  let d = destInt(cx, dst, scratch1())
+  let q = d
   if (isRem) {
     q = scratch3()
   }
@@ -213,22 +252,23 @@ fn emitDivInt(cx: A64Ctx, op: Op, dst: int, lhs: int, rhs: int, w: Width) {
     udivRR(cx.code, q, l, r)
   }
   if (isRem) {
-    msubRR(cx.code, scratch1(), q, r, l)
+    msubRR(cx.code, d, q, r, l)
   }
-  canonNarrow(cx.code, scratch1(), w)
-  putInt(cx, dst, scratch1())
+  canonNarrow(cx.code, d, w)
+  putInt(cx, dst, d)
 }
 
 fn emitUnaryInt(cx: A64Ctx, op: Op, dst: int, operand: int, w: Width) {
   let v = getInt(cx, vregOf(cx, operand), scratch1())
+  let d = destInt(cx, dst, scratch1())
   if (op == Op.Neg) {
-    negR(cx.code, scratch1(), v) // two's-complement negate sets high bits
+    negR(cx.code, d, v) // two's-complement negate sets high bits
   } else {
     assert(op == Op.BNot)
-    mvnR(cx.code, scratch1(), v) // bitwise-not sets every bit above width
+    mvnR(cx.code, d, v) // bitwise-not sets every bit above width
   }
-  canonNarrow(cx.code, scratch1(), w)
-  putInt(cx, dst, scratch1())
+  canonNarrow(cx.code, d, w)
+  putInt(cx, dst, d)
 }
 
 // `T(x)` numeric conversion (SPEC §12.9). Int operands are canonicalized to their
@@ -241,33 +281,39 @@ fn emitConvert(cx: A64Ctx, dst: int, src: int, dstTy: int) {
   let dw = widthOf(cx.module.ctx, dstTy)
   if (sw.class == RegClass.Int && dw.class == RegClass.Int) {
     let r = getInt(cx, vregOf(cx, src), scratch1())
-    extendRegA(cx.code, scratch1(), r, sw.bytes, sw.signed)
-    extendRegA(cx.code, scratch1(), scratch1(), dw.bytes, dw.signed)
-    putInt(cx, dst, scratch1())
+    let d = destInt(cx, dst, scratch1())
+    extendRegA(cx.code, d, r, sw.bytes, sw.signed)
+    extendRegA(cx.code, d, d, dw.bytes, dw.signed)
+    putInt(cx, dst, d)
     return
   }
   if (sw.class == RegClass.Int && dw.class == RegClass.Float) {
+    // The widening stays in the INT scratch: `d` is a float register here, so it
+    // cannot hold the intermediate.
     let r = getInt(cx, vregOf(cx, src), scratch1())
+    let d = destFloat(cx, dst, fscratch1())
     extendRegA(cx.code, scratch1(), r, sw.bytes, sw.signed)
-    fpIntConv(cx.code, true, dw.bytes, 0, 2, scratch1(), fscratch1()) // SCVTF
-    putFloat(cx, dst, fscratch1())
+    fpIntConv(cx.code, true, dw.bytes, 0, 2, scratch1(), d) // SCVTF
+    putFloat(cx, dst, d)
     return
   }
   if (sw.class == RegClass.Float && dw.class == RegClass.Int) {
     let x = getFloat(cx, vregOf(cx, src), fscratch1())
-    fpIntConv(cx.code, true, sw.bytes, 3, 0, x, scratch1()) // FCVTZS
-    extendRegA(cx.code, scratch1(), scratch1(), dw.bytes, dw.signed)
-    putInt(cx, dst, scratch1())
+    let d = destInt(cx, dst, scratch1())
+    fpIntConv(cx.code, true, sw.bytes, 3, 0, x, d) // FCVTZS
+    extendRegA(cx.code, d, d, dw.bytes, dw.signed)
+    putInt(cx, dst, d)
     return
   }
   // float -> float, always differing widths (same-type is filtered in lowering).
   let x = getFloat(cx, vregOf(cx, src), fscratch1())
+  let d = destFloat(cx, dst, fscratch1())
   let opcode = 4 // FCVT to single
   if (dw.bytes == 8) {
     opcode = 5 // FCVT to double
   }
-  fp1Source(cx.code, opcode, sw.bytes, fscratch1(), x)
-  putFloat(cx, dst, fscratch1())
+  fp1Source(cx.code, opcode, sw.bytes, d, x)
+  putFloat(cx, dst, d)
 }
 
 // Peeks whether `v` is a const_int instruction, returning its value masked to a
@@ -283,32 +329,33 @@ fn constShiftAmount(f: IrFunc, v: int): int {
 fn emitShiftInt(cx: A64Ctx, op: Op, dst: int, lhs: int, rhs: int, w: Width) {
   let l = getInt(cx, vregOf(cx, lhs), scratch1())
   let amt = constShiftAmount(cx.f, rhs)
+  let d = destInt(cx, dst, scratch1())
   if (amt >= 0) {
     if (op == Op.Shl) {
-      lslImm(cx.code, scratch1(), l, amt)
+      lslImm(cx.code, d, l, amt)
     } else if (op == Op.LShr) {
-      lsrImm(cx.code, scratch1(), l, amt)
+      lsrImm(cx.code, d, l, amt)
     } else {
       assert(op == Op.AShr)
-      asrImm(cx.code, scratch1(), l, amt)
+      asrImm(cx.code, d, l, amt)
     }
   } else {
     let r = getInt(cx, vregOf(cx, rhs), scratch2())
     if (op == Op.Shl) {
-      lslvRR(cx.code, scratch1(), l, r)
+      lslvRR(cx.code, d, l, r)
     } else if (op == Op.LShr) {
-      lsrvRR(cx.code, scratch1(), l, r)
+      lsrvRR(cx.code, d, l, r)
     } else {
       assert(op == Op.AShr)
-      asrvRR(cx.code, scratch1(), l, r)
+      asrvRR(cx.code, d, l, r)
     }
   }
   // Only shl pushes bits past the type width; lshr/ashr keep a canonical operand
   // canonical, so a full-width right shift needs no re-narrowing.
   if (op == Op.Shl) {
-    canonNarrow(cx.code, scratch1(), w)
+    canonNarrow(cx.code, d, w)
   }
-  putInt(cx, dst, scratch1())
+  putInt(cx, dst, d)
 }
 
 fn icmpCond(op: Op): int {
@@ -328,9 +375,12 @@ fn icmpCond(op: Op): int {
 fn emitIcmp(cx: A64Ctx, op: Op, dst: int, lhs: int, rhs: int) {
   let l = getInt(cx, vregOf(cx, lhs), scratch1())
   let r = getInt(cx, vregOf(cx, rhs), scratch2())
+  // `cset` reads only NZCV, and the `cmp` that sets them has already consumed
+  // both operands, so writing the destination here cannot clobber a live read.
+  let d = destInt(cx, dst, scratch1())
   cmpRR(cx.code, l, r)
-  cset(cx.code, scratch1(), icmpCond(op))
-  putInt(cx, dst, scratch1())
+  cset(cx.code, d, icmpCond(op))
+  putInt(cx, dst, d)
 }
 
 // AArch64's FCMP sets NZCV such that the *plain* EQ/NE/GT/GE condition codes are
@@ -352,37 +402,44 @@ fn fcmpCond(op: Op): int {
 fn emitFcmp(cx: A64Ctx, op: Op, dst: int, lhs: int, rhs: int, width: int) {
   let l = getFloat(cx, vregOf(cx, lhs), fscratch1())
   let r = getFloat(cx, vregOf(cx, rhs), fscratch2())
+  // Int destination, float operands: no aliasing is even possible across the
+  // two register files, and `fcmp` has consumed both before `cset` writes.
+  let d = destInt(cx, dst, scratch1())
   fcmp(cx.code, l, r, width)
-  cset(cx.code, scratch1(), fcmpCond(op))
-  putInt(cx, dst, scratch1())
+  cset(cx.code, d, fcmpCond(op))
+  putInt(cx, dst, d)
 }
 
 fn emitBinaryFloat(cx: A64Ctx, op: FArithOp, dst: int, lhs: int, rhs: int, width: int) {
   let l = getFloat(cx, vregOf(cx, lhs), fscratch1())
   let r = getFloat(cx, vregOf(cx, rhs), fscratch2())
-  fArithRR(cx.code, fArithOpcode(op), fscratch1(), l, r, width)
-  putFloat(cx, dst, fscratch1())
+  let d = destFloat(cx, dst, fscratch1())
+  fArithRR(cx.code, fArithOpcode(op), d, l, r, width)
+  putFloat(cx, dst, d)
 }
 
 fn emitFneg(cx: A64Ctx, dst: int, operand: int, width: int) {
   let v = getFloat(cx, vregOf(cx, operand), fscratch1())
-  fnegF(cx.code, fscratch1(), v, width)
-  putFloat(cx, dst, fscratch1())
+  let d = destFloat(cx, dst, fscratch1())
+  fnegF(cx.code, d, v, width)
+  putFloat(cx, dst, d)
 }
 
 // `fsqrt(x)` — one instruction, no call.
 fn emitFsqrt(cx: A64Ctx, dst: int, operand: int, width: int) {
   let v = getFloat(cx, vregOf(cx, operand), fscratch1())
-  fsqrtF(cx.code, fscratch1(), v, width)
-  putFloat(cx, dst, fscratch1())
+  let d = destFloat(cx, dst, fscratch1())
+  fsqrtF(cx.code, d, v, width)
+  putFloat(cx, dst, d)
 }
 
 // `ffloor`/`fceil`/`ftrunc`/`fround` — one FRINT each. See `frintF` for why
 // `fround` is FRINTA and not FRINTN.
 fn emitFRound(cx: A64Ctx, dst: int, operand: int, width: int, opcode: int) {
   let v = getFloat(cx, vregOf(cx, operand), fscratch1())
-  frintF(cx.code, opcode, fscratch1(), v, width)
-  putFloat(cx, dst, fscratch1())
+  let d = destFloat(cx, dst, fscratch1())
+  frintF(cx.code, opcode, d, v, width)
+  putFloat(cx, dst, d)
 }
 
 // A register-class transfer, not a conversion: FMOV moves the bits verbatim in
@@ -394,18 +451,24 @@ fn emitFRound(cx: A64Ctx, dst: int, operand: int, width: int, opcode: int) {
 fn emitBitcast(cx: A64Ctx, dst: int, operand: int, width: int, dstIsFloat: bool) {
   if (dstIsFloat) {
     let iv = getInt(cx, vregOf(cx, operand), scratch1())
-    fmovToFp(cx.code, fscratch1(), iv, width)
-    putFloat(cx, dst, fscratch1())
+    let d = destFloat(cx, dst, fscratch1())
+    fmovToFp(cx.code, d, iv, width)
+    putFloat(cx, dst, d)
     return
   }
   let v = getFloat(cx, vregOf(cx, operand), fscratch1())
-  fmovFromFp(cx.code, scratch1(), v, width)
-  putInt(cx, dst, scratch1())
+  let d = destInt(cx, dst, scratch1())
+  fmovFromFp(cx.code, d, v, width)
+  putInt(cx, dst, d)
 }
 
+// The constant materializers have no operands at all, so the destination is
+// unconditionally safe to write into: `movImm64`'s MOVZ/MOVK chain only ever
+// writes its target.
 fn emitConstInt(cx: A64Ctx, dst: int, val: int) {
-  movImm64(cx.code, scratch1(), val)
-  putInt(cx, dst, scratch1())
+  let d = destInt(cx, dst, scratch1())
+  movImm64(cx.code, d, val)
+  putInt(cx, dst, d)
 }
 
 fn emitConstBool(cx: A64Ctx, dst: int, val: bool) {
@@ -413,13 +476,15 @@ fn emitConstBool(cx: A64Ctx, dst: int, val: bool) {
   if (val) {
     v = 1
   }
-  movImm64(cx.code, scratch1(), v)
-  putInt(cx, dst, scratch1())
+  let d = destInt(cx, dst, scratch1())
+  movImm64(cx.code, d, v)
+  putInt(cx, dst, d)
 }
 
 fn emitConstNil(cx: A64Ctx, dst: int) {
-  movImm64(cx.code, scratch1(), 0)
-  putInt(cx, dst, scratch1())
+  let d = destInt(cx, dst, scratch1())
+  movImm64(cx.code, d, 0)
+  putInt(cx, dst, d)
 }
 
 // A float constant has no wide-immediate form: materialize its bit pattern in a
@@ -428,22 +493,25 @@ fn emitConstNil(cx: A64Ctx, dst: int) {
 // truncate; float32Bits also does the f64 -> f32 rounding, which cannot be
 // derived from the f64 bits by arithmetic.
 fn emitConstFloat(cx: A64Ctx, dst: int, val: f64, width: int) {
+  // The bit pattern stays in the int scratch — `d` is a float register.
+  let d = destFloat(cx, dst, fscratch1())
   if (width == 8) {
     movImm64(cx.code, scratch1(), i64(floatBits(val)))
-    fmovToFp(cx.code, fscratch1(), scratch1(), 8)
+    fmovToFp(cx.code, d, scratch1(), 8)
   } else {
     movImm64(cx.code, scratch1(), i64(u64(float32Bits(f32(val)))))
-    fmovToFp(cx.code, fscratch1(), scratch1(), 4)
+    fmovToFp(cx.code, d, scratch1(), 4)
   }
-  putFloat(cx, dst, fscratch1())
+  putFloat(cx, dst, d)
 }
 
 // A const_string value is the address of its static {ptr,len} header
 // (__bitstr_N, materialized by the object writer + linker into .rodata); loads
 // that address into the destination via the ADRP/ADD pair.
 fn emitConstString(cx: A64Ctx, dst: int, poolIdx: int) {
-  emitAddrOf(cx, scratch1(), "__bitstr_${poolIdx}")
-  putInt(cx, dst, scratch1())
+  let d = destInt(cx, dst, scratch1())
+  emitAddrOf(cx, d, "__bitstr_${poolIdx}")
+  putInt(cx, dst, d)
 }
 
 // slice_len reads the `len` word from a slice or string header. A []T header is
@@ -481,8 +549,11 @@ fn emitFieldGet(cx: A64Ctx, dst: int, base: int, offset: int, ty: int, isSliceBa
   // A fixed-size array field is inline storage: its value is the interior address
   // base + offset (an ADD-immediate), not a loaded word.
   if (cx.module.ctx.types[ty].kind == TypeKind.Array) {
-    addSubImmWide(cx.code, false, scratch1(), baseReg, offset)
-    putInt(cx, dst, scratch1())
+    // `addSubImmWide` reads `rn` only in its first ADD, then chains off its own
+    // destination, so `d` aliasing `baseReg` is safe.
+    let d = destInt(cx, dst, scratch1())
+    addSubImmWide(cx.code, false, d, baseReg, offset)
+    putInt(cx, dst, d)
     return
   }
   // cap(s) lowers to a field_get [24] on the slice HEADER itself, so a null
@@ -493,14 +564,18 @@ fn emitFieldGet(cx: A64Ctx, dst: int, base: int, offset: int, ty: int, isSliceBa
     putInt(cx, dst, scratch1())
     return
   }
+  // A far offset materializes into scratch3 first, so both load forms still read
+  // `baseReg` before they write `d`.
   let w = widthOf(cx.module.ctx, ty)
   if (w.class == RegClass.Int) {
-    loadImm(cx.code, scratch1(), baseReg, offset, w.bytes, w.signed)
-    putInt(cx, dst, scratch1())
+    let d = destInt(cx, dst, scratch1())
+    loadImm(cx.code, d, baseReg, offset, w.bytes, w.signed)
+    putInt(cx, dst, d)
     return
   }
-  loadImmF(cx.code, fscratch1(), baseReg, offset, w.bytes)
-  putFloat(cx, dst, fscratch1())
+  let d = destFloat(cx, dst, fscratch1())
+  loadImmF(cx.code, d, baseReg, offset, w.bytes)
+  putFloat(cx, dst, d)
 }
 
 // ponytail: no write barrier — the runtime's write-barrier contract is not
@@ -523,9 +598,12 @@ fn emitFieldSet(cx: A64Ctx, base: int, offset: int, value: int, ty: int) {
 fn emitAtomicLoad(cx: A64Ctx, dst: int, ptr: int, ty: int) {
   let w = widthOf(cx.module.ctx, ty)
   let base = getInt(cx, vregOf(cx, ptr), ascratch1())
-  ldar(cx.code, atomicSize(w.bytes), base, scratch1())
-  canonNarrow(cx.code, scratch1(), w)
-  putInt(cx, dst, scratch1())
+  // One LDAR, no retry loop: it consumes `base` as it writes, so unlike the
+  // LL/SC sequences below this one can land straight in the destination.
+  let d = destInt(cx, dst, scratch1())
+  ldar(cx.code, atomicSize(w.bytes), base, d)
+  canonNarrow(cx.code, d, w)
+  putInt(cx, dst, d)
 }
 
 fn emitAtomicStore(cx: A64Ctx, ptr: int, value: int, ty: int) {
@@ -592,16 +670,18 @@ fn emitIndexGet(cx: A64Ctx, dst: int, base: int, index: int, ty: int) {
   let baseReg = getInt(cx, vregOf(cx, base), scratch2())
   let idxReg = getInt(cx, vregOf(cx, index), scratch3())
   if (w.class == RegClass.Int) {
-    loadIndexed(cx.code, scratch1(), baseReg, idxReg, w.bytes, w.signed)
-    putInt(cx, dst, scratch1())
+    let d = destInt(cx, dst, scratch1())
+    loadIndexed(cx.code, d, baseReg, idxReg, w.bytes, w.signed)
+    putInt(cx, dst, d)
     return
   }
   // Float arrays index the same way ints do (register-offset, scaled); no
   // distinct float indexed-load opcode is needed since the addressing mode is
   // class-independent.
+  let d = destFloat(cx, dst, fscratch1())
   loadStoreRegOffset(cx.code, fpRegOffSize(w.bytes), true, 1, idxReg, w.bytes != 1,
-    baseReg, fscratch1())
-  putFloat(cx, dst, fscratch1())
+    baseReg, d)
+  putFloat(cx, dst, d)
 }
 
 fn emitIndexSet(cx: A64Ctx, base: int, index: int, value: int, ty: int) {
