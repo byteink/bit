@@ -46,34 +46,92 @@
 # constant, which appears in it directly as `const_float f64 0.5`, and
 # catches it (#1857) at the file granularity a module build cannot isolate.
 #
-# ## Why object bytes were rejected once, and why that no longer holds
+# ## Why byte-for-byte identity against the pinned release stopped being a
+# ## valid invariant, and what replaced it (#3103)
 #
-# #1859 first proposed object bytes here. The measurement then was
-# seed-vs-selfhost: every module differed and the self-hosted output was
-# consistently larger (root 147941 vs 171069, gc 50661 vs 57173, sched 29813
-# vs 32309, chan 30736 vs 33856) — #1851's backend optimiser gap, not a
-# correctness difference — and the conclusion was "object bytes only mean
-# something between two builds of the SAME implementation."
+# #1859 first proposed object bytes here; the measurement then was
+# seed-vs-selfhost, every module differed (root 147941 vs 171069, gc 50661 vs
+# 57173, ...) — #1851's backend optimiser gap, not a correctness difference —
+# and the conclusion was "object bytes only mean something between two builds
+# of the SAME implementation." #2741 (measured on `main` at `948ec5fd`, 23/23
+# modules byte-identical) argued that since #1593 the pinned stage0 IS that
+# same implementation, one release back, so byte identity became meaningful.
 #
-# That sentence is the argument FOR doing it now: since #1593 the oracle IS
-# the same implementation one release back, not `bit-seed`. Measured on `main`
-# at `948ec5fd` against the pinned 0.1.11, host target, over the 23 modules
-# `scripts/g2archive.sh` builds into `libbitrt.a` (16 platform-free entries
-# including the bare `runtime/` dir, + 7 platform pairs — read from there
-# below, never copied, so the two lists cannot drift; note #2741's own filing
-# miscounted this population as 22):
+# It held only because no intentional codegen improvement had landed in that
+# window. #1852 closed #1851's own backend gap on aarch64 (`_scanObject` 120
+# movs -> 60) and reopened exactly the seed-vs-selfhost condition #1859
+# rejected: 22 of 23 modules diverge, every one SMALLER on this tree, none of
+# them a bug (`gc` 63528 -> 55184 bytes, `chan` 37345 -> 31393, measured
+# #3103). Byte identity cannot pass an optimisation that is doing its job, so
+# it is no longer the invariant on **aarch64** hosts (macOS and Linux share
+# the ISA). What must still hold, because it is what #2569 actually broke:
 #
-#     23/23 modules byte-identical, 0 diverging (post-#2569)
+# > no atomic memory access changes WIDTH between its source type and the
+# > instruction the backend emits.
 #
-# and it can fail: mutation-tested with `BIT_STAGE0_BIN` pointed at the
-# PREVIOUS pin, v0.1.10 — the exact release #2569 repinned away from because
-# it emitted a 64-bit atomic through a 32-bit pointer at 38 machine-code sites
-# in 6 modules. That run named all 6 by object bytes (runtime, chan, gc, root,
-# sched, stw) and exited non-zero; the per-file IR walk above, run in the same
-# pass, still named only the 2 files (spinlock.bit, root/maps.bit) it named
-# before this ticket — strictly less coverage of a divergence known to be
-# real, not "no coverage". Restoring the pinned 0.1.11 oracle returned both
-# surfaces to green. See the commit message for both full outputs.
+# v0.1.10 emitted a 64-bit `stlr x`/`ldaxr x` through a `*i32` pointer at 38
+# sites (34 stores + 4 RMW/CAS, zero loads — `assertAtomicOperandWidth` below
+# only has a value operand to mis-widen on those three op kinds) across 6
+# modules, corrupting the 4 adjacent bytes every time. Width is not a style
+# choice the way instruction selection is — it is fixed by the pointee's
+# declared type (§11.5) — so an optimisation pass has no reason to touch it.
+# Verified rather than assumed (#3103), on all 23 modules, #1852's tree
+# against the pinned 0.1.17: **0 atomic-signature mismatches where 22 of 23
+# byte-compares diverge.**
+#
+# So on aarch64 the module check below disassembles both objects, keeps only
+# the acquire/release-ordered mnemonics (`ldar*`/`ldax*`/`ldapr*`/`stlr*`/
+# `stlx*`/`cas*`), strips the register NUMBER (allocation legitimately moves)
+# but keeps the register CLASS — `w` (32-bit) vs `x` (64-bit) — sorts, and
+# requires the multiset to match. A width flip changes the `stlr w` vs
+# `stlr x` count in that multiset; a scheduling or instruction-count
+# improvement does not.
+#
+# Mutation-tested (#3103) against the real bug, not a synthetic stand-in:
+# `BIT_STAGE0_BIN` cannot point directly at v0.1.10 against TODAY's runtime
+# source any more — v0.1.10 predates the `function`->`fn` rename (#2760) and
+# cannot parse it (`E0021` on every `@nosplit fn`), which is itself worth
+# knowing and is filed separately (#3109). Rebuilt the actual v0.1.10 and
+# v0.1.11 (the real #2569 fix) release binaries against the runtime/ source
+# AS IT EXISTED the commit before the repin (32ce1ff3, still
+# `function`-keyword era): raw bytes AND the atomic signature both diverge on
+# all 6 named modules (runtime, chan, gc, root, sched, stw) — output below.
+#
+# What this deliberately no longer asserts, on aarch64: that instruction
+# COUNT, SCHEDULE or SELECTION for anything but atomic width matches the
+# pinned release. A backend bug that is not a width mismatch (wrong
+# arithmetic, a dropped instruction, a wrong branch) is not guaranteed to be
+# caught here — it never truly was, before #1852, except by the accident that
+# any difference at all was suspicious; #1852 broke that accident on purpose,
+# and un-breaking it would block every future codegen improvement, which
+# #3103's own ticket weighs and rejects (gating on pin currency is silently
+# vacuous between releases; informational-only is a check nobody fails; a
+# release-and-repin per change serialises all performance work). The per-file
+# IR walk above is unweakened by any of this — still exact-text.
+#
+# What was tried and rejected: comparing the tree's OWN runtime object output
+# across two `selfhost-fixpoint.sh`-style self-build generations, instead of
+# against the pinned release. Rejected on inspection, not on principle: `bit
+# build compiler -o X` links a PRE-BUILT `libbitrt.a` rather than recompiling
+# runtime/ from source (`compiler/build.bit`'s `libbitrtPath`), so a
+# self-build fixed point never touches runtime codegen at all; a from-scratch
+# two-generation runtime rebuild would only reconfirm what
+# `selfhost-fixpoint.sh` already proves (this tree reproduces itself), a
+# different property from "matches a known-good reference", and it would have
+# scored #2569 a MATCH — v0.1.10's bug was baked identically into every
+# self-build generation, so a same-tree comparison has nothing external to
+# diverge from by construction. Confirmed empirically (#3103): reverting the
+# exact #2569 fix commit on current HEAD does not even reach a silent byte
+# divergence any more — it now trips `assertAtomicOperandWidth`'s compile-time
+# panic (#2742, added after #2569), caught by the existing build-failure
+# branch below independent of anything in this section.
+#
+# x86-64 is UNCHANGED (still full byte identity), a known and accepted gap
+# rather than an oversight, tracked separately (#3110): no x86-64-targeting
+# codegen improvement has landed yet, x86-64's TSO model has no
+# per-instruction acquire/release width class to key off the way aarch64
+# does, and there is no local x86-64 host here to verify a
+# signature-extraction regex against.
 #
 # No Mach-O code-signature trap here (the family of bug where two
 # byte-identical compilers differ if built to different `-o` names): `-c
@@ -167,6 +225,53 @@ case "$(uname -s)" in
   *) echo "diffruntime: FAIL — unsupported host $(uname -s) for the object-byte check." >&2; exit 2 ;;
 esac
 
+# The invariant that survives #1852-style optimisation is atomic INSTRUCTION
+# WIDTH, not full bytes — see the header. Keyed off the CPU, not PLAT: an
+# aarch64-linux host gets the same treatment as this aarch64-macos one,
+# because it is the same ISA. x86-64 has no local host to verify a
+# signature-extraction regex against (header, #3110), so it keeps the old,
+# stricter, byte-identity check unconditionally — a known gap, not a silent one.
+case "$(uname -m)" in
+  arm64|aarch64) ATOMIC_ISA=aarch64 ;;
+  *)             ATOMIC_ISA=other ;;
+esac
+
+# The disassembler differs by OS, not by ISA: `otool -tV` on Darwin,
+# `objdump -d` on Linux (both understand aarch64 Mach-O/ELF relocatables and
+# print the same standard ARM mnemonics — `ldar`, `stlr`, register operand
+# `w9`/`x9` — so one extraction regex covers both).
+disasmText() { # <objfile>
+  case "$(uname -s)" in
+    Darwin) otool -tV "$1" 2>/dev/null ;;
+    Linux)  objdump -d "$1" 2>/dev/null ;;
+  esac
+}
+
+# Every acquire/release-ordered mnemonic this backend can emit for §11.5's
+# atomic builtins. CAS lowers to an ldaxr/stlxr load-linked/store-conditional
+# loop on this backend rather than a dedicated `casal`, confirmed by grepping
+# the corpus (#3103) — the cas* entries are kept anyway in case that changes;
+# an unmatched alternative costs nothing.
+ATOMIC_MNEMONICS='ldar|ldarb|ldarh|ldaxr|ldaxrb|ldaxrh|ldapr|ldaprb|ldaprh|ldaxp|stlr|stlrb|stlrh|stlxr|stlxrb|stlxrh|stlxp|cas|casa|casl|casal|casb|casab|caslb|casalb|cash|casah|caslh|casalh|casp|caspa|caspl|caspal'
+
+# Sorted, register-NUMBER-stripped, register-CLASS-preserved atomic mnemonic
+# list for one object — the signature two builds must agree on. Register
+# ALLOCATION (which number) legitimately varies with optimisation; register
+# CLASS (w=32-bit vs x=64-bit) is fixed by the pointee's declared type
+# (§11.5) and is exactly what #2569 got wrong.
+atomicSignature() { # <objfile>
+  disasmText "$1" | grep -oE "\\b(${ATOMIC_MNEMONICS})[[:space:]]+[wx][0-9]+" | sed -E 's/[0-9]+$//' | sort
+}
+
+# A count is not coverage (same principle as MIN_FILES/MIN_MODULES below): if
+# extraction silently breaks — otool/objdump missing, a mnemonic spelling
+# change, a moved tool — every module's signature would go empty on BOTH
+# sides and pass vacuously. 362 sites were extracted from the pinned oracle's
+# 23 modules when this floor was set (#3103); 300 is comfortably under that
+# while still catching an emptied extraction.
+MIN_ATOMIC_SITES=${DIFFRUNTIME_MIN_ATOMIC_SITES:-300}
+atomic_sites_seen=0
+
 # Same (rel, label) expansion g2archive.sh applies to the same two variables —
 # glue over the extracted data, not a second copy of the data itself.
 MOD_RELS=()
@@ -257,13 +362,14 @@ for f in $(find runtime -name '*.bit' | sort); do
   fi
 done
 
-# --- Whole-module object-byte comparison (#2741) ---
+# --- Whole-module object comparison (#2741, invariant narrowed by #3103) ---
 #
 # Same taxonomy as the per-file walk above (oracle hang is a FAIL, oracle
 # crash is a NOTE, dev hang/crash is a FAIL, dev build failure where the
 # oracle succeeded is a mismatch), applied at module instead of file
 # granularity. `-c --freestanding -o` with no `--target` compiles for the
-# host, matching `PLAT` resolved above.
+# host, matching `PLAT` resolved above. On aarch64 hosts "compare" means the
+# atomic-signature check (header); elsewhere it is still full byte identity.
 
 objdev="$work/obj_dev"
 objor="$work/obj_or"
@@ -317,7 +423,18 @@ while [ "$i" -lt "$NMOD" ]; do
   fi
 
   echo "$dir" >>"$work/mod_compared"
-  if cmp -s "$devobj" "$orobj"; then
+  if [ "$ATOMIC_ISA" = aarch64 ]; then
+    devsig="$work/sig_dev"
+    orsig="$work/sig_or"
+    atomicSignature "$devobj" >"$devsig"
+    atomicSignature "$orobj" >"$orsig"
+    atomic_sites_seen=$((atomic_sites_seen + $(wc -l <"$orsig")))
+    if cmp -s "$devsig" "$orsig"; then
+      modmatch=$((modmatch + 1))
+    else
+      echo "$dir" >>"$work/mod_mismatch"
+    fi
+  elif cmp -s "$devobj" "$orobj"; then
     modmatch=$((modmatch + 1))
   else
     echo "$dir" >>"$work/mod_mismatch"
@@ -391,6 +508,16 @@ if [ "$NMOD" -lt "$MIN_MODULES" ]; then
   bad=1
 fi
 
+# A count is not coverage (#3103, same principle as MIN_FILES/MIN_MODULES): if
+# disassembly extraction silently breaks, every module's atomic signature goes
+# empty on BOTH sides and the comparison below passes vacuously.
+if [ "$ATOMIC_ISA" = aarch64 ] && [ "$atomic_sites_seen" -lt "$MIN_ATOMIC_SITES" ]; then
+  echo "diffruntime: FAIL — extracted $atomic_sites_seen atomic-instruction site(s) from the oracle's objects, floor is $MIN_ATOMIC_SITES." >&2
+  echo "  An emptied atomic-signature extraction passes everything; check ATOMIC_MNEMONICS" >&2
+  echo "  and that otool/objdump are on PATH and can disassemble these objects." >&2
+  bad=1
+fi
+
 if [ -s "$work/mod_oracletimeout" ]; then
   echo "diffruntime: FAIL — the pinned stage0 HUNG building a runtime module (corpus reduced, not verified):" >&2
   sed 's/^/  /' "$work/mod_oracletimeout" >&2
@@ -411,12 +538,21 @@ fi
 sort -u "$work/mod_mismatch" >"$work/mod_mismatch.sorted"
 
 if [ -s "$work/mod_mismatch.sorted" ]; then
-  echo "diffruntime: FAIL — $(wc -l <"$work/mod_mismatch.sorted" | tr -d ' ') runtime module(s) diverge from the pinned stage0 (object bytes):" >&2
+  what="object bytes"
+  [ "$ATOMIC_ISA" = aarch64 ] && what="atomic-instruction width signature — see the header before assuming this is a real bug"
+  echo "diffruntime: FAIL — $(wc -l <"$work/mod_mismatch.sorted" | tr -d ' ') runtime module(s) diverge from the pinned stage0 ($what):" >&2
   sed 's/^/  /' "$work/mod_mismatch.sorted" >&2
-  echo "  Rebuild one with:  \"$ORACLE\" build MODULE -c --freestanding -o /tmp/or.o && $BIT2 build MODULE -c --freestanding -o /tmp/dev.o && cmp /tmp/or.o /tmp/dev.o" >&2
+  if [ "$ATOMIC_ISA" = aarch64 ]; then
+    dtool="otool -tV"; [ "$(uname -s)" = Linux ] && dtool="objdump -d"
+    echo "  Compare one with:  \"$ORACLE\" build MODULE -c --freestanding -o /tmp/or.o && $BIT2 build MODULE -c --freestanding -o /tmp/dev.o && diff <($dtool /tmp/or.o) <($dtool /tmp/dev.o)" >&2
+  else
+    echo "  Rebuild one with:  \"$ORACLE\" build MODULE -c --freestanding -o /tmp/or.o && $BIT2 build MODULE -c --freestanding -o /tmp/dev.o && cmp /tmp/or.o /tmp/dev.o" >&2
+  fi
   bad=1
 fi
 
 [ "$bad" -ne 0 ] && exit 1
 
-echo "diffruntime: PASS — $match/$total runtime file(s) lower identically ($skip skipped); $modmatch/$NMOD runtime module(s) byte-identical ($modskip skipped, object)"
+modwhat="byte-identical"
+[ "$ATOMIC_ISA" = aarch64 ] && modwhat="atomic-width-signature-identical"
+echo "diffruntime: PASS — $match/$total runtime file(s) lower identically ($skip skipped); $modmatch/$NMOD runtime module(s) $modwhat ($modskip skipped, object)"
