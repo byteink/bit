@@ -1,0 +1,323 @@
+// In-Bit self-checks for the AArch64 codegen driver: the string pool,
+// interval building over block params (including forced param interference
+// and dead forward chains), whole-function compilation, and float-constant
+// bit patterns — split out of compiler/arm64selcheck.bit (#3141), which was
+// 797 lines against the 800-line limit. compiler/arm64selcheck.bit keeps the
+// instruction-selection, call-marshalling and safepoint checks; both are the
+// same module as selfcheck.bit (#1503), so `selfcheck()` still calls these
+// directly.
+//
+// Named to sort after compiler/arm64selcheck.bit — module files concatenate
+// in bytewise filename order (compiler/project.bit:7).
+
+// Stage 3 (#1342 slice 4c) the driver: interval building, frame layout, and
+// whole-function emission.
+fn checkStringPool() {
+  // The pool dedups and numbers in intern order, and const_string carries its
+  // index. Interned during LOWERING (not codegen) so the optimizer deleting a
+  // literal cannot renumber every later one — nothing in the IR dump covers this,
+  // since the dump prints each literal's text inline.
+  let m = IrModule{ funcs: []IrFunc(0), ctx: newTypeContext(), stringPool: []string(0), sm: newSourceManager() }
+  assert(internString(m, "a") == 0)
+  assert(internString(m, "b") == 1)
+  assert(internString(m, "a") == 0) // identical literals share one header
+  assert(internString(m, "") == 2)
+  assert(len(m.stringPool) == 3)
+  assert(m.stringPool[0] == "a" && m.stringPool[1] == "b" && m.stringPool[2] == "")
+}
+
+// A block param is physically written by each predecessor's edge move, which runs
+// at the PREDECESSOR'S TERMINATOR — under RPO that is well before the param's own
+// instruction index. Its interval must start there, else a value that dies in the
+// gap is handed the param's register and the edge move silently clobbers it.
+fn checkIntervalParamsToPreds() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+
+  // Block 0: const %0, then `jump blk1(%0)` at position 1.
+  // Block 1: param %2 (written by that jump), then `ret %2`.
+  let ci = mkInstr(Op.ConstInt, i64t)
+  ci.ival = 7
+  let jump = mkInstr(Op.Jump, ctx.voidId)
+  jump.ival = 1 // forward edge to block 1
+  jump.args = [0]
+  let ret = mkInstr(Op.Ret, ctx.voidId)
+  ret.args = [2]
+  let f = IrFunc{ name: "f", paramTypes: []int(0), result: i64t,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 2 },
+      IrBlock{ instsStart: 2, paramCount: 1, instsLen: 2 }],
+    instrs: [ci, jump, mkInstr(Op.BlockParam, i64t), ret],
+    isFallible: false }
+  let b = buildIntervals(ctx, f)
+
+  // The param's own index is 2, but the jump that writes it sits at 1.
+  assert(b.intervals[2].start == 1)
+  assert(b.intervals[2].end == 3) // read by the ret
+  // The const is live [0,1]; the param now reaches 1 too, so they OVERLAP and
+  // cannot share a register. This overlap IS the fix — without it the param is
+  // [2,3], disjoint from the const, and both land in one register.
+  assert(b.intervals[0].end == 1)
+  assert(b.intervals[0].end >= b.intervals[2].start)
+
+  // A Br writes the params of BOTH targets from the same terminator, so both must
+  // be extended — covering only the then-target leaves the else-target's params
+  // starting at their own index, disjoint from anything live across the branch.
+  let bv = mkInstr(Op.ConstInt, i64t)
+  bv.ival = 3
+  let cond = mkInstr(Op.ConstBool, primType(ctx, 10))
+  let br = mkInstr(Op.Br, ctx.voidId)
+  br.lhs = 1
+  br.ival = 1  // then -> block 1
+  br.ival2 = 2 // else -> block 2
+  br.thenArgs = [0]
+  br.elseArgs = [0]
+  let rt1 = mkInstr(Op.Ret, ctx.voidId)
+  rt1.args = [3]
+  let rt2 = mkInstr(Op.Ret, ctx.voidId)
+  rt2.args = [5]
+  let fbr = IrFunc{ name: "fbr", paramTypes: []int(0), result: i64t,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 3 },
+      IrBlock{ instsStart: 3, paramCount: 1, instsLen: 2 },
+      IrBlock{ instsStart: 5, paramCount: 1, instsLen: 2 }],
+    instrs: [bv, cond, br, mkInstr(Op.BlockParam, i64t), rt1,
+      mkInstr(Op.BlockParam, i64t), rt2],
+    isFallible: false }
+  let bb = buildIntervals(ctx, fbr)
+  assert(bb.intervals[3].start == 2) // then-target param, written by the br at 2
+  assert(bb.intervals[5].start == 2) // else-target param, same terminator
+
+  // A BACK-edge predecessor sits at a higher position than the param it writes,
+  // so it must never lower the start (that would stretch the param backwards over
+  // the whole loop and force needless interference).
+  let ci2 = mkInstr(Op.ConstInt, i64t)
+  ci2.ival = 1
+  let back = mkInstr(Op.Jump, ctx.voidId)
+  back.ival = 0 // back-edge to block 0, whose param is at index 0
+  back.args = [1]
+  let f2 = IrFunc{ name: "f2", paramTypes: [i64t], result: ctx.voidId,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 1, instsLen: 3 }],
+    instrs: [mkInstr(Op.BlockParam, i64t), ci2, back],
+    isFallible: false }
+  let b2 = buildIntervals(ctx, f2)
+  assert(b2.intervals[0].start == 0) // NOT lowered — the edge is at 2, already later
+}
+
+fn checkArm64Intervals() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  let strt = primType(ctx, 11)
+
+  // A value's interval must reach its last READ, or the allocator hands its
+  // register away while it is still live. A string result is a GC reference; an
+  // i64 is not.
+  // Reads %0 twice, so the second param is read NOWHERE — exactly the case
+  // forceParamInterference exists for.
+  let add = mkInstr(Op.Add, i64t)
+  add.lhs = 0
+  add.rhs = 0
+  let f = IrFunc{ name: "f", paramTypes: [i64t, i64t], result: i64t,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 2, instsLen: 3 }],
+    instrs: [mkInstr(Op.BlockParam, i64t), mkInstr(Op.BlockParam, strt), add],
+    isFallible: false }
+  let built = buildIntervals(ctx, f)
+  assert(len(built.intervals) == 3)
+  assert(built.intervals[0].end == 2) // read by the add at position 2
+  assert(built.intervals[0].isRef == false)
+  assert(built.intervals[1].isRef == true) // string is a GC reference
+  assert(built.intervals[2].start == 2 && built.intervals[2].end == 2)
+  assert(built.intervals[1].end == 1)
+  assert(len(built.safepoints) == 0)
+
+  // Both params are live at once at block entry, so they must interfere. A param
+  // read NOWHERE would otherwise keep its empty [i,i] interval, free to be
+  // coalesced onto a live sibling param's register — and then the predecessor
+  // edge's parallel move clobbers one param with the other (a returned value
+  // coming back as some other incoming argument). forceParamInterference
+  // stretches every param to its block's last param position. Here NEITHER param
+  // is read, so param 0's interval must still be widened past its own slot.
+  let ci = mkInstr(Op.ConstInt, i64t)
+  ci.ival = 7
+  let ret = mkInstr(Op.Ret, ctx.voidId)
+  ret.args = [2]
+  let fp = IrFunc{ name: "fp", paramTypes: [i64t, i64t], result: i64t,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 2, instsLen: 4 }],
+    instrs: [mkInstr(Op.BlockParam, i64t), mkInstr(Op.BlockParam, i64t), ci, ret],
+    isFallible: false }
+  let pb = buildIntervals(ctx, fp)
+  assert(pb.intervals[0].end == 1) // widened from [0,0] to reach the last param
+  assert(pb.intervals[1].end == 1)
+
+  // A call is a safepoint; so is a back-edge, and they are collected in the order
+  // emission will re-encounter them.
+  let call = mkInstr(Op.Call, i64t)
+  call.name = "g"
+  let jump = mkInstr(Op.Jump, ctx.voidId)
+  jump.ival = 0 // back-edge: block 0 does not advance past itself
+  let f2 = IrFunc{ name: "f2", paramTypes: []int(0), result: ctx.voidId,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 2 }],
+    instrs: [call, jump], isFallible: false }
+  let b2 = buildIntervals(ctx, f2)
+  assert(len(b2.safepoints) == 2 && b2.safepoints[0] == 0 && b2.safepoints[1] == 1)
+
+  // Stack overflow accounting mirrors marshalArgs: independent banks, and the
+  // reserved x0 on the indirect paths pushes one more argument out.
+  let instrs = []IrInstr(0)
+  let args = []int(0)
+  let i = 0
+  while (i < 9) {
+    instrs = append(instrs, mkInstr(Op.BlockParam, i64t))
+    args = append(args, i)
+    i = i + 1
+  }
+  let f3 = IrFunc{ name: "f3", paramTypes: []int(0), result: ctx.voidId,
+    blocks: []IrBlock(0), instrs: instrs, isFallible: false }
+  assert(stackArgSlots(ctx, f3, args, 0, 0) == 1)
+  assert(stackArgSlots(ctx, f3, args, 1, 0) == 2) // x0 reserved
+  assert(stackArgSlots(ctx, f3, [0, 1], 0, 0) == 0)
+}
+
+// #2934: a value threaded through a forward chain of block params that
+// NOTHING ever reads must not have its interval extended past its own
+// definition. opt.bit's DCE keeps every block param structurally live
+// (trimming one means rewriting every predecessor's arg list), so before
+// this fix a fully-dead value stayed "live" — and kept a register reserved,
+// re-copied at every edge — all the way to the function's last block. This is
+// the mechanism that inflated runtime/stw/stwpoll.bit's bit_rt_safepoint_needed
+// (a chain of early-return checks) to 14 distinct GPRs for a true ~2-value
+// peak.
+fn checkIntervalDeadForwardChain() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+
+  // Block 0: const %0, `jump blk1(%0)` at 1.
+  // Block 1: param %2 (unread), `jump blk2(%2)` at 3.
+  // Block 2: param %4 (unread), `ret` (no args at all).
+  let ci = mkInstr(Op.ConstInt, i64t)
+  ci.ival = 7
+  let jump0 = mkInstr(Op.Jump, ctx.voidId)
+  jump0.ival = 1
+  jump0.args = [0]
+  let jump1 = mkInstr(Op.Jump, ctx.voidId)
+  jump1.ival = 2
+  jump1.args = [2]
+  let ret = mkInstr(Op.Ret, ctx.voidId)
+  let f = IrFunc{ name: "deadchain", paramTypes: []int(0), result: ctx.voidId,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 2 },
+      IrBlock{ instsStart: 2, paramCount: 1, instsLen: 2 },
+      IrBlock{ instsStart: 4, paramCount: 1, instsLen: 2 }],
+    instrs: [ci, jump0, mkInstr(Op.BlockParam, i64t), jump1,
+      mkInstr(Op.BlockParam, i64t), ret],
+    isFallible: false }
+  let b = buildIntervals(ctx, f)
+
+  // Before the fix, every hop's Jump arg was extended unconditionally and
+  // this chain reached intervals[0].end == 1, [2].end == 3 — spanning right
+  // through blocks that never read the value at all.
+  assert(b.intervals[0].end == 0)
+  assert(b.intervals[2].end == 2)
+  assert(b.intervals[4].end == 4)
+
+  // Same shape, but the last block's Ret genuinely reads the forwarded
+  // value — the fix must not over-trim a chain that IS truly live.
+  let ci2 = mkInstr(Op.ConstInt, i64t)
+  ci2.ival = 7
+  let jump0b = mkInstr(Op.Jump, ctx.voidId)
+  jump0b.ival = 1
+  jump0b.args = [0]
+  let jump1b = mkInstr(Op.Jump, ctx.voidId)
+  jump1b.ival = 2
+  jump1b.args = [2]
+  let ret2 = mkInstr(Op.Ret, ctx.voidId)
+  ret2.args = [4]
+  let f2 = IrFunc{ name: "livechain", paramTypes: []int(0), result: i64t,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 2 },
+      IrBlock{ instsStart: 2, paramCount: 1, instsLen: 2 },
+      IrBlock{ instsStart: 4, paramCount: 1, instsLen: 2 }],
+    instrs: [ci2, jump0b, mkInstr(Op.BlockParam, i64t), jump1b,
+      mkInstr(Op.BlockParam, i64t), ret2],
+    isFallible: false }
+  let b2 = buildIntervals(ctx, f2)
+  assert(b2.intervals[0].end == 1) // forwarded into block 1 (jump0b at pos 1)
+  assert(b2.intervals[2].end == 3) // forwarded into block 2 (jump1b at pos 3)
+  assert(b2.intervals[4].end == 5) // read directly by ret2 at pos 5
+}
+
+// A real regression this pins: an rt_call with no loop back-edge in
+// the same function used to record ZERO safepoints, even though buildIntervals
+// counted it and handed regalloc a stack map for it — a GC pausing at that call's
+// return address would find the table empty and scan nothing.
+fn checkCompileFunction() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  let strt = primType(ctx, 11)
+  let rt = mkInstr(Op.RtCall, strt)
+  rt.name = "string_from_int"
+  rt.args = [0]
+  let ret = mkInstr(Op.Ret, ctx.voidId)
+  ret.args = [1]
+  let f = IrFunc{ name: "f", paramTypes: [i64t], result: strt,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 1, instsLen: 3 }],
+    instrs: [mkInstr(Op.BlockParam, i64t), rt, ret], isFallible: false }
+  let m = IrModule{ funcs: [f], ctx: ctx, stringPool: []string(0), sm: newSourceManager() }
+
+  let fc = compileFunction(m, f)
+  assert(len(fc.safepoints) == 1)
+  assert(fc.name == "f")
+  // The rt_call resolves to its runtime symbol.
+  assert(len(fc.relocs) == 1 && fc.relocs[0].symbol == "bit_rt_string_from_int")
+  // This function has a safepoint, so every allocatable register is callee-saved
+  // — and whichever ones it used must be saved and reported frame-relative.
+  assert(len(fc.savedRegs) > 0)
+  assert(fc.savedRegs[0].reg >= 19 && fc.savedRegs[0].reg <= 28)
+  assert(fc.savedRegs[0].fpOff < 0) // below the frame record
+  // The frame is 16-byte aligned, and the code starts by lowering sp and ends in
+  // a ret.
+  assert(fc.frameSize % 16 == 0 && fc.frameSize > 0)
+  assert(len(fc.code) % 4 == 0 && len(fc.code) > 0)
+  assert(wordAt(ByteBuf{ bytes: fc.code }, len(fc.code) - 4) == 0xd65f03c0) // ret
+
+  // A leaf function with no safepoint draws from the full register file and needs
+  // no stack map at all.
+  let ret2 = mkInstr(Op.Ret, ctx.voidId)
+  ret2.args = [0]
+  let leaf = IrFunc{ name: "leaf", paramTypes: [i64t], result: i64t,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 1, instsLen: 2 }],
+    instrs: [mkInstr(Op.BlockParam, i64t), ret2], isFallible: false }
+  let lc = compileFunction(IrModule{ funcs: [leaf], ctx: ctx, stringPool: []string(0), sm: newSourceManager() }, leaf)
+  assert(len(lc.safepoints) == 0 && len(lc.relocs) == 0)
+  assert(len(lc.savedRegs) == 0) // nothing callee-saved was touched
+}
+
+// Float constants: the bit-pattern primitives, then the code that materializes
+// them. Expected patterns are IEEE-754, computed independently of the compiler.
+fn checkFloatBits() {
+  assert(floatBits(1.0) == u64(4607182418800017408))     // 0x3FF0000000000000
+  assert(floatBits(0.0) == u64(0))
+  assert(floatBits(0.0 - 2.0) == u64(13835058055282163712)) // 0xC000000000000000
+  assert(floatBits(3.14159) == u64(4614256650576692846))
+  assert(float32Bits(f32(1.0)) == u32(1065353216))       // 0x3F800000
+  assert(float32Bits(f32(0.0 - 2.0)) == u32(3221225472))  // 0xC0000000
+  // float32Bits rounds f64 -> f32 on the way; 0.1 is not representable exactly in
+  // either, and the f32 result is NOT the f64 pattern's high bits.
+  assert(float32Bits(f32(0.1)) == u32(1036831949))       // 0x3DCCCCCD
+
+  // A double constant loads its 64-bit pattern into a GPR and fmovs it across; a
+  // single uses the 32-bit form of both. Dst (vreg 0, d0) is already a float
+  // register, so #1852's destination-driven selection fmovs straight into it —
+  // the trailing "fmov d0, fscratch1" rename is gone (fmovFF drops a
+  // dst==src self-move). The bit pattern itself still stages through the INT
+  // scratch: `d` is a float register and cannot hold it.
+  let cx = selCtx()
+  emitConstFloat(cx, 0, 1.0, 8)
+  let want = newByteBuf()
+  movImm64(want, scratch1(), i64(u64(4607182418800017408)))
+  fmovToFp(want, 0, scratch1(), 8)
+  assertSameBytes(cx.code, want)
+
+  cx = selCtx()
+  emitConstFloat(cx, 0, 1.0, 4)
+  want = newByteBuf()
+  movImm64(want, scratch1(), 1065353216)
+  fmovToFp(want, 0, scratch1(), 4)
+  assertSameBytes(cx.code, want)
+}
