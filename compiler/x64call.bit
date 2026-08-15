@@ -582,24 +582,150 @@ fn xBindIncomingArgs(cx: XCtx) {
 
 // #2921 (arm64) / #2926 (x64): the naked shim's full chain (five stack frames,
 // see runtime/stw/stwpoll.bit) is only needed when a stop is pending or a
-// collection is due — both rare. Guard it behind `bit_rt_safepoint_needed`, a
-// true leaf with no frame of its own: call it, and skip the real poll when it
-// returns false (0 in rax). Mirrors compiler/arm64call.bit's
-// emitBackEdgeSafepointIfNeeded exactly, including the safepoint bookkeeping:
-// the guard call passes isSafepoint=false to xEmitCallLike and only the real
-// poll advances nextSafepointIdx — buildIntervals (compiler/codegen.bit)
-// records exactly one safepoint position per back edge, independent of how
-// many machine calls this emits.
+// collection is due — both rare. #2926 guarded it behind a call to
+// `bit_rt_safepoint_needed`; #3169 inlines that call's own condition instead
+// (xEmitInlinedPollGuard), porting what #2925 did on arm64 — see
+// compiler/arm64call.bit's header there for why a call, even to a true leaf,
+// remained ~0.50s of collatz's 0.86s. This file's comment claimed parity with
+// arm64 for the month between #2925 and #3169 and was false for all of it.
+//
+// The safepoint bookkeeping is unchanged by either move: only the real poll
+// passes isSafepoint=true to xEmitCallLike, so exactly one nextSafepointIdx
+// advance happens per back edge — which is what buildIntervals
+// (compiler/codegen.bit) recorded for that edge, independent of how many
+// machine instructions this emits.
 fn xEmitBackEdgeSafepointIfNeeded(cx: XCtx, curBlock: int, target: int) {
   // §10.3.1: a @naked/@nosplit function polls no safepoint on its back-edges.
   if (!isBackEdge(curBlock, target) || needsNoSafepoints(cx.f)) {
     return
   }
-  xEmitCallLike(cx, safepointNeededSymbol(), []int(0), false, 0, 0, false)
-  xTestRR(cx.buf, XReg64.Rax, XReg64.Rax)
-  let skipOff = xJccRel32Placeholder(cx, ccE()) // not needed -> skip the real poll
+  xEmitInlinedPollGuard(cx)
+}
+
+// ---------------------------------------------------------------------------
+// #3169: the poll guard's condition, inlined at the call site
+// ---------------------------------------------------------------------------
+
+// The two cached poll addresses sit at the TOP of the spill area, in the two
+// slots xCompileFunction carves ABOVE the ones the register allocator asked
+// for. Reusing the spill area rather than adding a frame region keeps
+// x64frame.bit's layout comment ("then spill slots, then saved XMMs") true as
+// written and needs no new XFrame field — and it keeps these two raw runtime
+// addresses out of every stack map, because xCompileFunction builds a
+// SafepointView's `slots` only from the indices the ALLOCATOR reports, which
+// never reach this high. A GC that walked them would try to trace the World
+// and GC module-state addresses as managed objects.
+fn xPollCacheOffset(f: XFrame, i: int): int {
+  // Sized by xCompileFunction on the same hasBackEdgeSafepoint predicate that
+  // gates every caller here, so a frame reaching this point always has the
+  // pair. Asserted rather than assumed: a silently negative index would
+  // address the CALLER's frame.
+  assert(f.numSpillSlots >= 2 && i >= 0 && i < 2)
+  return xSpillOffset(f, f.numSpillSlots - 2 + i)
+}
+
+// Fetches (worldAddr, gcAddr) ONCE per function invocation into that pair,
+// rather than once per loop iteration. Safe because runtime/stw/stw.bit's
+// stwBind runs exactly once at boot — before any compiled Bit function's entry
+// can execute — and never unbinds (#2184): the two addresses are a per-process
+// constant for the entire lifetime of every function this backend compiles, so
+// re-fetching them on every iteration (what a per-iteration call would do)
+// buys nothing.
+//
+// Emitted right after xBindIncomingArgs: the incoming args are already off
+// rdi..r9 by then, so these calls' ordinary caller-saved clobber is harmless,
+// and every vreg in a function that polls a back edge lives in a callee-saved
+// register or a spill slot already (xBuildIntRegs under hasSafepoints), so
+// neither call can clobber a live value. bit_rt_world_addr/bit_rt_gc_addr are
+// themselves true leaves that never allocate or park, so — like the #2926
+// guard call they replace at the call site — neither is recorded as a
+// safepoint.
+fn xEmitPollCachePrefetch(cx: XCtx) {
+  if (!hasBackEdgeSafepoint(cx.f)) {
+    return
+  }
+  xEmitCallLike(cx, worldAddrSymbol(), []int(0), false, 0, 0, false)
+  xMovStore(cx.buf, xMemB(XReg64.Rbp, xPollCacheOffset(cx.frame, 0)), XReg64.Rax, 8)
+  xEmitCallLike(cx, gcAddrSymbol(), []int(0), false, 0, 0, false)
+  xMovStore(cx.buf, xMemB(XReg64.Rbp, xPollCacheOffset(cx.frame, 1)), XReg64.Rax, 8)
+}
+
+// The inlined equivalent of `stwPollNeeded` (runtime/stw/stwpoll.bit):
+//
+//   fn stwPollNeeded(): bool {
+//     let waddr = worldAddr
+//     if (waddr == 0) { return true }
+//     if (atomicLoad(world + worldStopWord) != 0) { return true }
+//     let gA = gcAddr
+//     if (gA == 0) { return true }
+//     if (*(g + gcCfgStress) != 0) { return true }
+//     if (*(g + gcCfgEnabled) == 0) { return false }
+//     let hb = *(g + gcHeapAddr)
+//     return atomicLoad(hb + heapLiveWord) >= *(g + gcNextBytes)
+//   }
+//
+// `true` (poll needed) falls into the real `call bit_rt_safepoint`; `false`
+// (skip) branches past it. Each of the runtime's two `atomicLoad`s is a PLAIN
+// `mov` here and that is not a weakening: an ordinary x86-64 load already has
+// acquire semantics under TSO, which is the same fact xEmitAtomicLoad
+// (x64selectmem.bit) relies on for Op.AtomicLoad itself. arm64 needs `ldar`.
+//
+// Two scratch registers cover the whole ladder — r11 rotates through waddr and
+// then each loaded field, r10 holds the cached gcAddr from its load until the
+// final compare. Both are caller-saved in BOTH conventions and neither is an
+// argument register in either, and no vreg can live in them (they are outside
+// xMasterGprs), so nothing live across the back edge is at risk. r12
+// (xScratch3) is deliberately not used: it is callee-saved under SysV.
+fn xEmitInlinedPollGuard(cx: XCtx) {
+  let rTmp = xScratch1() // r11: waddr, then every loaded field in turn
+  let rGc = xScratch2()  // r10: the cached gcAddr, live to the last compare
+  let pollFixups = []int(0)
+  let skipFixups = []int(0)
+
+  // waddr == 0 -> poll
+  xMovLoad(cx.buf, rTmp, xMemB(XReg64.Rbp, xPollCacheOffset(cx.frame, 0)), 8, false)
+  xTestRR(cx.buf, rTmp, rTmp)
+  pollFixups = append(pollFixups, xJccRel32Placeholder(cx, ccE()))
+
+  // a stop is pending -> poll
+  xMovLoad(cx.buf, rTmp, xMemB(rTmp, pgWorldStopWordWord() * 8), 8, false)
+  xTestRR(cx.buf, rTmp, rTmp)
+  pollFixups = append(pollFixups, xJccRel32Placeholder(cx, ccNe()))
+
+  // gcAddr == 0 -> poll
+  xMovLoad(cx.buf, rGc, xMemB(XReg64.Rbp, xPollCacheOffset(cx.frame, 1)), 8, false)
+  xTestRR(cx.buf, rGc, rGc)
+  pollFixups = append(pollFixups, xJccRel32Placeholder(cx, ccE()))
+
+  // stress mode -> poll
+  xMovLoad(cx.buf, rTmp, xMemB(rGc, pgGcCfgStressWord() * 8), 8, false)
+  xTestRR(cx.buf, rTmp, rTmp)
+  pollFixups = append(pollFixups, xJccRel32Placeholder(cx, ccNe()))
+
+  // disabled -> skip (the one early-false; every exit above is early-true)
+  xMovLoad(cx.buf, rTmp, xMemB(rGc, pgGcCfgEnabledWord() * 8), 8, false)
+  xTestRR(cx.buf, rTmp, rTmp)
+  skipFixups = append(skipFixups, xJccRel32Placeholder(cx, ccE()))
+
+  // heapLive >= gcNextBytes -> poll, else skip. SIGNED, matching the runtime's
+  // own `>=` on two i64s.
+  xMovLoad(cx.buf, rTmp, xMemB(rGc, pgGcHeapAddrWord() * 8), 8, false)  // heap base
+  xMovLoad(cx.buf, rTmp, xMemB(rTmp, pgHeapLiveWordWord() * 8), 8, false) // live bytes
+  xMovLoad(cx.buf, rGc, xMemB(rGc, pgGcNextBytesWord() * 8), 8, false)  // trigger
+  xArithRR(cx.buf, XArith.Cmp, rTmp, rGc)
+  skipFixups = append(skipFixups, xJccRel32Placeholder(cx, ccL()))
+
+  let i = 0
+  while (i < len(pollFixups)) {
+    xPatchRel32Here(cx, pollFixups[i])
+    i = i + 1
+  }
   xEmitCallLike(cx, safepointSymbol(), []int(0), false, 0, 0, true)
-  xPatchRel32Here(cx, skipOff)
+  i = 0
+  while (i < len(skipFixups)) {
+    xPatchRel32Here(cx, skipFixups[i])
+    i = i + 1
+  }
 }
 
 // A back-edge polls the collector BEFORE the edge moves: the poll is a call, and
