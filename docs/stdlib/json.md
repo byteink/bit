@@ -357,6 +357,12 @@ Parses `source` as JSONC (same grammar as `jsoncParse`) into a trivia-carrying
 CST rather than a plain `Json` value. Malformed input is a parse error via the
 fallible return, never a panic.
 
+Like `jsonParse`/`jsoncParse` above, every `cstParse` error's `message()`
+carries where it happened: `"json: expected ',' or '}' in object at byte 7
+(line 1, column 8)"`. Same convention, same helper (`posError`/`jsonLocate`,
+shared across this module) - see `jsonParse` above for the full rules on byte
+vs. rune columns, `\r\n`, and end-of-input.
+
 ```bit
 import { cstParse, CstNode } from "std/json"
 
