@@ -809,8 +809,9 @@ interface is a separate extension this section does not make.
 
 ### 11.1 Primitive Types
 
-- Signed integers: `i8 i16 i32 i64` (two's complement, defined wrap on overflow in
-  release builds, trap in debug builds — see §13.5).
+- Signed integers: `i8 i16 i32 i64` (two's complement, wraps on overflow in
+  v0.1; a debug build mode that traps instead is specified but not yet
+  implemented — see §13.5, task #3076).
 - Unsigned integers: `u8 u16 u32 u64` (modular arithmetic).
 - Floats: `f32 f64` (IEEE-754 binary32 / binary64).
 - `bool` (`true` / `false`).
