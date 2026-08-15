@@ -7,12 +7,37 @@ fn maxInlineInsts(): int {
   return 8
 }
 
+// How many levels of callee body one call site may absorb (#3163). Level 1 is
+// the callee itself; level 2 is a call INSIDE that spliced body, and so on.
+//
+// This bound is what makes the pass terminate, and it is the only thing that
+// does: `optimizeModule` resolves every callee out of a PRE-INLINING snapshot,
+// so a recursive or mutually recursive cycle would otherwise splice forever —
+// a call graph with a cycle has no callee-first order and no fixpoint to reach.
+// A self-call is refused outright by inlineEligible's `calleeIdx == callerIdx`
+// test, which also covers every cycle that runs back through the original
+// caller; this bound covers the rest.
+//
+// 2 rather than 1: the runtime's collector reaches its word loads through
+// exactly one intermediate helper (`loadWord` -> `wordAt`), which is the shape
+// #3163 was filed for, and rather than 3 because the measured cost of the third
+// level is code growth with nothing left to collapse — see the size numbers on
+// that ticket. Growth is bounded by maxInlineInsts() per level, so the worst
+// case a call site can absorb is maxInlineInsts()^maxInlineDepth() instructions.
+fn maxInlineDepth(): int {
+  return 2
+}
+
 // The index of the function named `name`, or -1. The seed keys calls by FuncId;
 // selfhost resolves the callee name into `IrInstr.name`, so the lookup is here.
-fn funcIndexByName(m: IrModule, name: string): int {
+//
+// Takes the function list rather than the module because the inliner must read
+// callees out of a snapshot taken before this pass mutated anything (#3163),
+// never out of the module it is halfway through rewriting.
+fn funcIndexByName(funcs: []IrFunc, name: string): int {
   let i = 0
-  while (i < len(m.funcs)) {
-    if (m.funcs[i].name == name) {
+  while (i < len(funcs)) {
+    if (funcs[i].name == name) {
       return i
     }
     i = i + 1
@@ -54,12 +79,17 @@ fn funcIndexByName(m: IrModule, name: string): int {
 // introduces a poll into nosplit code nor removes one from a caller that keeps
 // its own back edges. Refusing it would also disable inlining across the whole
 // runtime, where §17.6 makes every function @nosplit.
-fn inlineEligible(m: IrModule, callerIdx: int, calleeIdx: int): bool {
+//
+// Both functions are read from `snap`, the pre-inlining snapshot (#3163): the
+// budget must be spent against the callee's ORIGINAL body, or eligibility would
+// depend on how much that callee had already absorbed by the time this caller
+// was reached — which is exactly the filename-ordering bug.
+fn inlineEligible(m: IrModule, snap: []IrFunc, callerIdx: int, calleeIdx: int): bool {
   if (calleeIdx < 0 || calleeIdx == callerIdx) {
     return false
   }
-  let g = m.funcs[calleeIdx]
-  let f = m.funcs[callerIdx]
+  let g = snap[calleeIdx]
+  let f = snap[callerIdx]
   if (g.isNaked || f.isNaked) {
     return false
   }
@@ -123,7 +153,20 @@ fn importsForeignState(m: IrModule, caller: IrFunc, callee: IrFunc): bool {
 // (no folding, no block retargeting — `g` has exactly one block and its only
 // terminator is the `ret`, which is read separately rather than spliced).
 // Returns the value the call site now yields.
-fn spliceCallee(b: IrBuilder, g: IrFunc, args: []int): int {
+//
+// `depth` is how many callee bodies deep this splice already is (1 for a call
+// written in the caller's own source). A `Call` inside `g` is spliced too, up
+// to maxInlineDepth() (#3163) — without that, the instructions this function
+// emits would never be re-examined by anyone: `inlineCalls` walks the OLD
+// function's instruction list, so a call carried in on a spliced body used to
+// survive to codegen no matter how trivial its callee was.
+//
+// `callerIdx` stays the ORIGINAL caller at every level, because that is who the
+// instructions end up belonging to: it is the function inlineEligible must test
+// for self-inlining and whose module identity importsForeignState must compare
+// a nested callee's globals against.
+fn spliceCallee(b: IrBuilder, m: IrModule, snap: []IrFunc, callerIdx: int,
+  g: IrFunc, args: []int, depth: int): int {
   let blk = g.blocks[0]
   let remap = []int(0)
   let noFold = []ConstVal(0)
@@ -146,7 +189,19 @@ fn spliceCallee(b: IrBuilder, g: IrFunc, args: []int): int {
   }
   let last = blk.instsStart + blk.instsLen - 1
   while (idx < last) {
-    emitTranslated(b, g, noFold, remap, dummyBlockMap, idx)
+    let ins = g.instrs[idx]
+    let spliced = false
+    if (ins.op == Op.Call && depth < maxInlineDepth()) {
+      let calleeIdx = funcIndexByName(snap, ins.name)
+      if (inlineEligible(m, snap, callerIdx, calleeIdx)) {
+        remap[idx] = spliceCallee(b, m, snap, callerIdx, snap[calleeIdx],
+          trList(remap, ins.args), depth + 1)
+        spliced = true
+      }
+    }
+    if (!spliced) {
+      emitTranslated(b, g, noFold, remap, dummyBlockMap, idx)
+    }
     idx = idx + 1
   }
   let ret = g.instrs[last]
@@ -159,8 +214,19 @@ fn spliceCallee(b: IrBuilder, g: IrFunc, args: []int): int {
 // Pass 3: simple size-budgeted inlining. Blocks are walked in id order, which is
 // emission order here — every preceding pass rebuilds with ids assigned in
 // ascending instsStart.
-fn inlineCalls(m: IrModule, fidx: int): IrFunc {
-  let f = m.funcs[fidx]
+//
+// `snap` is the whole module's functions as they stood before ANY of them was
+// inlined, and every callee — at this level and at every nested level — is read
+// out of it (#3163). Reading them out of `m` instead made the result depend on
+// the caller's and callee's relative INDEX, which is their file's position in
+// the module's bytewise-sorted file list (compiler/project.bit:7): a callee
+// whose file sorted earlier had already been flattened and handed the caller a
+// flat body, while a callee whose file sorted later still held its own calls,
+// which then survived to codegen. Identical source, renamed files, different
+// machine code — 30 un-inlined `wordAt` calls in the collector's mark and sweep
+// paths, purely because `gcmark.bit` sorts before `mem.bit`.
+fn inlineCalls(m: IrModule, snap: []IrFunc, fidx: int): IrFunc {
+  let f = snap[fidx]
   let n = len(f.blocks)
   let blockMap = []int(0)
   let remap = []int(0)
@@ -192,9 +258,10 @@ fn inlineCalls(m: IrModule, fidx: int): IrFunc {
       let ins = f.instrs[idx]
       let handled = false
       if (ins.op == Op.Call) {
-        let calleeIdx = funcIndexByName(m, ins.name)
-        if (inlineEligible(m, fidx, calleeIdx)) {
-          remap[idx] = spliceCallee(b, m.funcs[calleeIdx], trList(remap, ins.args))
+        let calleeIdx = funcIndexByName(snap, ins.name)
+        if (inlineEligible(m, snap, fidx, calleeIdx)) {
+          remap[idx] = spliceCallee(b, m, snap, fidx, snap[calleeIdx],
+            trList(remap, ins.args), 1)
           handled = true
         }
       }
