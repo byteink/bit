@@ -253,6 +253,190 @@ bit_rt_iface_assert(recv: ref, want: usize) -> ref    // panics on mismatch
 - `bit_rt_iface_assert` names both types in its panic message; the descriptors
   already carry them.
 
+### 2.3 `string` value, and shared-backing views (`s[lo:hi]`, DECIDED #3123)
+
+**v1 today.** A `string` is a pointer to a `gc_alloc`'d 16-byte header
+`{ptr, len}` (`runtime/root/root.bit`'s `strPtr`/`strLen`/`strHeaderSize`)
+immediately followed by its bytes, with `ptr` addressing those inline bytes.
+The object is a LEAF (`TypeInfo{ size = 0, ptr_offsets = [] }`, sized per
+allocation via `gcAllocRaw`) — `ptr` is an interior pointer into the object
+itself, never a separate reference, which is why `bit_rt_string_slice`
+(`s[lo:hi]`, SPEC §12.6) **copies**: a shared view's `ptr` would be an
+interior pointer into a *different* object with nothing in the view keeping
+that object alive. That copy is measured at 75.7% of the `strings` benchmark.
+This section decides the replacement layout; the code has not moved yet.
+
+**Decision: a three-word header, `{base, len, off}`, 24 bytes.**
+
+```
+string header {                  // TypeInfo{ size = 24, ptr_offsets = [0] }
+  base : ref     // +0   traced — the object that owns the inline bytes
+  len  : usize   // +8   this view's byte count (same offset v1 used)
+  off  : usize   // +16  byte offset of this view's first byte, from base's body
+}
+```
+
+- `base` is the **only** traced field (`ptr_offsets = [0]`) — the same offset
+  and the same "one traced backing reference" convention §2's dynamic slice
+  header already uses for `buf`. For a freshly built string (every
+  `allocString` call site below) `base` is the string's **own** address, so its
+  bytes stay inline immediately after the header exactly as v1 stored them —
+  nothing about a fresh string's memory shape changes except the header
+  growing by one word. For a view produced by `s[lo:hi]`, `base` is the ROOT
+  string that actually owns the bytes, **never an intermediate view**: `rtStringSlice`
+  reads `base(s)` (flattened, not `s` itself) so a chain `s[a:b][c:d]` still
+  costs the tracer one hop, not a chain of hops.
+- `len` stays at **+8**, unchanged from v1 and identical to the dynamic slice
+  header's `len` offset — the existing claim in §2 above ("`len(s)` reads the
+  header word directly ... shared with the `string` header") continues to
+  hold with no further change.
+- `off` at +16 is a **plain byte count, not a pointer**: the view's first byte
+  is at `base + strHeaderSize + off`, computed at the read call site exactly
+  the way a slice computes `buf + off*elem_size` (§2 above) — an address is
+  never stored, only ever derived in a register. `bit_rt_string_slice` becomes
+  a **header-only allocation** (`gcAlloc`, 24 fixed bytes, no byte copy) that
+  sets `base = base(s)`, `off = off(s) + lo`, `len = hi - lo` — field for
+  field the same shape `bit_rt_slice_slice` (`runtime/root/slices.bit`) already
+  uses for `buf`/`off`/`len`. Note the field layout is a literal prefix of the
+  slice header (`buf`/`len`/`off` at the same +0/+8/+16): `string` needs no
+  `cap` (never grows) and no `is_ref` (never holds references), so it stops at
+  three words where slice needs five.
+
+**Why `{base, len, off}` and not the `{ptr, len, base}` shape #3123's parent
+ticket named.** Both cost the same 24 bytes and the same one `gc_alloc` per
+reslice. The `{ptr, len, base}` shape stores a raw interior address in `ptr`
+and keeps it safe only by never listing `ptr` in `ptr_offsets` — correct, but
+it is one more fact a future editor of `allocString`/`rtStringSlice` has to
+keep re-deriving correctly at every write site. The `{base, len, off}` shape
+used here removes the interior pointer as a **stored value** entirely: nothing
+this object ever holds is an address into another object's middle, so there is
+no derived pointer for a future `ptr_offsets` edit to mis-list. See §3 below
+for how this changes (or rather, does not change) the interior-pointer rule.
+
+**No aliasing hazard, unlike `[]T`.** `[]T` sharing (§2 above) already accepts
+that a mutation through one view is visible through every other view of the
+same buffer. `string` has SPEC §13.3 read-only value semantics and no mutation
+path at all (§1.1 above makes the identical argument for tuples), so two views
+of the same backing bytes can never disagree — sharing costs nothing in
+observable behaviour here that `[]T` sharing did not already cost.
+
+**One accepted, un-mitigated cost, already priced in for `[]T`.** A tiny,
+long-lived view keeps its ENTIRE backing string alive: `s[0:1]` on a
+multi-megabyte `s` retains the whole megabyte for as long as the view is
+reachable. This is the identical shape `[]T` reslicing already accepts in §2
+and is not new here. No mitigation (a copy-below-some-threshold escape hatch)
+is adopted by this decision — see Option 2 below — a follow-up ticket that
+wants one should propose it against a working shared-backing baseline, not
+fold it into the ABI layout.
+
+**Alternatives named on the parent ticket, and why each was rejected:**
+
+- **Option 2 (inline small strings / copy below a size threshold).** Still
+  pays an O(n) copy for every substring **above** the threshold — exactly the
+  size range a benchmark slicing large buffers in a loop spends its time in —
+  so it lowers the constant without removing the cost class, while adding a
+  second on-disk string shape every one of the nine readers below would have
+  to branch on.
+- **Option 3 (keep `s[lo:hi]` copying; ship only non-allocating stdlib range
+  primitives).** Correct and by far the simplest, but leaves the operator SPEC
+  §12.6 and this ticket's own benchmark both name — `s[lo:hi]` written
+  directly — exactly as slow as today; it only helps call sites that happen to
+  route through a stdlib function instead of the slice syntax itself.
+
+**The six hand-built headers on the panic path never call `allocString`.**
+`@nosplit` forbids allocation (E0075), so five panic-message constructors and
+one deadlock constructor assemble a `{ptr, len}` header **by hand** in
+module-static scalar arrays and pass its address straight to `bit_rt_panic`:
+
+| File | Function | Static array |
+|---|---|---|
+| `runtime/root/slices.bit` | `panicBounds` | `boundsMsg: [6]i64` |
+| `runtime/root/maps.bit` | `panicNilMapWrite` | `nilMapMsg: [4]i64` |
+| `runtime/chan/chanwrap.bit` | `panicNilChanClose` | `nilChanCloseMsg: [5]i64` |
+| `runtime/chan/chanwrap.bit` | `panicClosedChanClose` | `closedChanCloseMsg: [5]i64` |
+| `runtime/chan/chanwrap.bit` | `panicSendClosed` | `sendClosedMsg: [5]i64` |
+| `runtime/sched/worker.bit` | `panicDeadlock` | `deadlockMsg: [6]i64` (own mirrored `deadlockStrHeaderSize`, not imported — `runtime/sched` cannot import `runtime/root`) |
+
+Under this layout each array grows by one word to carry `base`, and each
+constructor stores its **own** `ptrOf(...)` address into that word
+(self-referential, `off = 0`, exactly the "fresh string" convention above).
+That self-reference is inert to the collector for two independent reasons
+already load-bearing elsewhere in this document: these arrays are module
+state with no `TypeInfo`, so nothing ever scans them as an object with
+`ptr_offsets` in the first place (the same reasoning `runtime/root/root.bit`
+already gives for `gcState`/`heapBlock`/`infoBlock` being unscanned); and
+every function on this call path — `panicBounds`, `panicNilMapWrite`,
+`panicNilChanClose`, `panicClosedChanClose`, `panicSendClosed`,
+`panicDeadlock`, then `bit_rt_panic` → `panicWrite`/`strBytesOf` →
+`rootWriteAll` — is `@nosplit`, so no safepoint is ever reached and no stack
+map is ever asked to describe the local holding that address as live (§4). A
+foreign, non-`owns()` address in a nominally-traced slot that is never
+actually offered to a scanner is the same tolerated shape §4 already
+documents for a `chan` handle or bare-function value.
+
+**Implementation plan for follow-up tickets** (every `strBytes`/`strSize`
+reader found by grepping `runtime/` for `strBytes|strSize|strData|strLenOf|
+strPtr|strLen` — nine reader implementations across eight files, not an
+estimate):
+
+1. **Header constants + canonical funnel — `runtime/root/root.bit`.** Rename
+   `strPtr` (0) to `strBase` (0, unchanged offset); keep `strLen` at 8; add
+   `strOff: int = 16`; `strHeaderSize` 16 -> 24. Rewrite `strBytes`/`strSize`
+   (the two functions, ~line 591/599) for the new arithmetic (the `s == 0` null
+   guard is unchanged). `allocString` (~line 510) additionally stores
+   `body -> strBase` and `0 -> body + strOff` after computing `body`; its
+   `gcAllocRaw(strHeaderSize + nbytes, ...)` call needs no other change, and
+   because every OTHER fresh-string constructor in the tree (10 call sites:
+   `floats.bit:170`, `strings.bit:10,164,211,235,246,295,312`, `iface.bit:139`,
+   plus `strings.bit:305 rtStringFromBytes`) already funnels through
+   `allocString`, none of them need their own edit. Add a `riStringOffs` slot
+   to `infoBlock` (mirroring the existing `riSliceOffs`/`riMapOffs` slots,
+   `~line 257-265`), write `[0]` into it, and change the `riString` `writeInfo`
+   call (`~line 409`) from the current all-zero leaf entry to
+   `writeInfo(base, riString, strHeaderSize, base + riStringOffs*8, 1, 0, 0)`;
+   grow `riWords`/`infoBlock: [46]i64` by the one added word.
+2. **The view constructor — `runtime/root/strings.bit`, `rtStringSlice`
+   (~line 105-125).** Replace `allocString` + `copyBytes` with `gcAlloc(g, base
+   + riString*8)` (fixed 24-byte header) and the three `storeWord`s described
+   above, mirroring `runtime/root/slices.bit:326-345`'s `rtSliceSlice` exactly.
+   Range-check and null-header behaviour (panics via `oobStringRange`,
+   `#2014`) are unchanged.
+3. **Six module-private duplicate read funnels** — each is its own copy
+   because it lives in a module that cannot import `runtime/root`'s privates
+   (documented at each site) and each needs the identical two-line rewrite as
+   `strBytes`/`strSize`: `runtime/root/linux/io.bit` `strBytesOf`/`strSizeOf`
+   (~264/272), `runtime/root/darwin/io.bit` `strBytesOf`/`strSizeOf`
+   (~222/230), `runtime/net/linux/netabi.bit` `strData`/`strSizeOf`
+   (~123/127), `runtime/net/darwin/netabi.bit` `strData`/`strSizeOf`
+   (~112/116), `runtime/root/linux/fs.bit` `strData`/`strLenOf` (~119/120),
+   `runtime/root/darwin/fs.bit` `strData`/`strLenOf` (~128/129).
+4. **Two inline (non-funnel) readers.** `runtime/rand/linux/random.bit:83` and
+   `runtime/rand/darwin/random.bit:86` import `strPtr` directly and compute
+   `loadWord(s + strPtr)` inline; change the import to `strBase`/`strOff`/
+   `strHeaderSize` and the expression to
+   `loadWord(s + strBase) + strHeaderSize + loadWord(s + strOff)`. `s` here is
+   always the just-allocated result of `rtStrAlloc`, so this is provably `s +
+   strHeaderSize` today, but the general form is what stays correct once
+   `rtStrAlloc` can itself return the result of a call that later became a view
+   — write the general form, not the specialization.
+5. **Six hand-built pseudo-headers** (table above): widen each static array by
+   one `i64` word and add one `storeWord(base + strBase, base)` (or, for
+   `panicDeadlock`'s raw-pointer style, `*msg = base`) alongside the existing
+   `len`/text stores; `deadlockStrHeaderSize` in `runtime/sched/worker.bit`
+   moves 16 -> 24 in lockstep with `strHeaderSize` since it is a deliberate,
+   documented mirror rather than an import.
+6. **Verification the follow-up ticket owes, beyond its own gate.** Mutation
+   test `rtStringSlice`: force a collection (`BIT_GC=stress`) between
+   constructing a view and reading it, and between dropping every other
+   reference to the source string and reading the view, confirming the bytes
+   survive — the shape `tests/stress/gcworld` already exercises for the #1991
+   defect this section's `base` field is specifically designed to avoid
+   repeating. `string` layout is `runtime/**`, so per this workspace's standing
+   rule the proof artifact is `cmp` on `libbitrt-{aarch64-macos,aarch64-linux,
+   x86_64-linux}.a`, never `bin/bit`. Re-run `selfhost-diffruntime` (the
+   `runtime/**` corpus differential) since this changes emitted `.text` for
+   every listed function, not just data layout.
+
 ---
 
 ## 3. Reference contract
@@ -266,6 +450,22 @@ bit_rt_iface_assert(recv: ref, want: usize) -> ref    // panics on mismatch
 - The runtime exposes `Gc.owns(ptr)` which is true only for a live object's base
   pointer — interior and foreign pointers return false. It backs the debug/test
   check for this contract.
+- **Confirmed for a traced field beside untraced derived fields in the same
+  object (#3123).** A `TypeInfo` may list one field as a traced reference
+  (always a base pointer, per this section) while its neighbours in the same
+  object are plain integers a reader combines with that reference to *derive*
+  an address — this is not a new case, it is what the dynamic slice header
+  already does (`buf` traced via `ptr_offsets = [0]`; `off`/`len`/`cap`/
+  `is_ref` untraced integers, §2) and what §2.3's `string` header does
+  identically (`base` traced; `off`/`len` untraced integers). The rule above
+  is not weakened by this: no interior pointer is ever *stored* in either
+  header, so there is nothing for `ptr_offsets` to omit incorrectly. A design
+  that instead stores a derived interior address as its own field (the
+  `{ptr, len, base}` shape §2.3 considered and did not choose) would still
+  satisfy this section — but only if that field is never listed in
+  `ptr_offsets`, which is an invariant every future writer of the header has
+  to re-uphold rather than one this rule enforces structurally. §2.3 chose the
+  derive-on-read shape for exactly that reason.
 
 ---
 
