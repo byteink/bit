@@ -81,6 +81,18 @@ Every code point, in order.
 How many bytes a UTF-8 sequence starting with lead byte `b` occupies: 1 to 4, or
 1 for an invalid lead byte so a decoder always advances.
 
+### `padLeft(s: string, width: int): string`
+
+`s` left-padded with `U+0020` spaces until it is `width` **runes** — measured
+with `runeCount`, never `len` — so a multi-byte rune like `é` still counts as
+one column. Returns `s` unchanged, never truncated, when it is already
+`width` runes or longer or when `width` is `0` or less.
+
+### `padRight(s: string, width: int): string`
+
+`s` right-padded with `U+0020` spaces until it is `width` runes, by the same
+rules as `padLeft`.
+
 ```bit
 import { runeCount, runeAt, runes } from "std/strings"
 
