@@ -185,15 +185,35 @@ closure cell is scanned by the same `ptr_offsets` mechanism as any struct.
 A **dynamic slice value** (`[]T`) is a pointer to a `gc_alloc`'d 40-byte header
 `{ buf, len, off, cap, is_ref }` (`TypeInfo{ size = 40, ptr_offsets = [0] }`).
 `buf` at +0 points at a *separate* `gc_alloc`'d element buffer (the header's one
-traced reference); the slice views the `len` words at `buf[off .. off + len]`,
-with capacity `cap` counted from `off` (so `buf` holds `off + cap` words).
-`len`/`off`/`cap`/`is_ref` sit at +8/+16/+24/+32. Keeping `buf` a base pointer
-and carrying an `off` means a reslice `s[lo:hi]` shares the same `buf` and only
-bumps `off`/`len`/`cap` — **no interior pointer is ever stored as a GC
-reference** (§3). `is_ref` records whether each buffered word is itself a GC
-reference. Elements are **one word each** (the same word model channels use,
-§11): a `T` that fits in a word is stored by value, a wider `T` is boxed and its
-reference stored. The runtime owns construction/growth/bounds-checked
+traced reference); the slice views the `len` elements at `buf[off .. off + len]`,
+with capacity `cap` counted from `off` (so `buf` holds `off + cap` elements, each
+`elem_size` bytes wide — §9). `len`/`off`/`cap`/`is_ref` sit at +8/+16/+24/+32,
+counted in elements, never bytes — only the per-element stride the buffer is
+addressed with changes. Keeping `buf` a base pointer and carrying an `off` means
+a reslice `s[lo:hi]` shares the same `buf` and only bumps `off`/`len`/`cap` —
+**no interior pointer is ever stored as a GC reference** (§3). `is_ref` records
+whether each buffered element is itself a GC reference.
+
+**Element storage: word-per-element by default, byte-packed only for `[]u8`.**
+A GC reference is word-sized, and when `is_ref` the collector traces every word
+of the element buffer as a root (below) — so a reference-typed buffer can never
+pack: decoding packed scalar bytes as a reference would be a silent-wrongness
+bug, not a crash, and this invariant forbids it by construction. Packing is
+scoped narrower still: only `[]u8` (a non-ref, 1-byte element) packs to one
+byte per element (`elem_size = 1`, §9). Every other element type — every
+`is_ref == true` buffer, and every non-ref scalar 2 bytes or wider (`i16` and
+up, `f64`, boxed values) — stays word-per-element (`elem_size = 8`) exactly as
+before. Packing wider non-ref scalars (`i16`/`i32`/`bool`/...) is explicitly
+future work; this document does not authorize it.
+
+Channels (§11) and native maps (§15, `runtime/root/maps.bit`'s `allocBuf`
+callers) do **not** pack and stay word-per-element regardless of element type:
+a channel carries only a handful of in-flight values and a map's live entry
+count is bounded by its slot table, so neither reaches the scale — a byte
+slice can hold megabytes — where the 8x word-per-byte amplification that
+packing removes actually matters.
+
+The runtime owns construction/growth/bounds-checked
 access/reslicing via `bit_rt_slice_new/append/get/set/slice` (§9); `len(s)` reads
 the header word directly (`slice_len`, offset 8, shared with the `string`
 header). When `is_ref`, the element buffer carries the `ref_array_info`
@@ -929,11 +949,11 @@ defined exactly once).
 | `bit_rt_string_from_float` | `(v: f64) -> *const RtBytes` (§2)                  |
 | `bit_rt_parse_float`  | `(s: *const RtBytes) -> f64` (§2, correctly-rounded text->f64; the inverse of `bit_rt_string_from_float`) |
 | `bit_rt_string_from_bool`  | `(v: bool) -> *const RtBytes` (§2)                 |
-| `bit_rt_slice_new`    | `(len: usize, cap: usize, is_ref: usize) -> *SliceHeader` (§2) |
-| `bit_rt_slice_append` | `(h: *SliceHeader, word: u64, is_ref: usize) -> *SliceHeader` (§2, `is_ref` is the static element type's — a null `h` has no header to read it from, #1569) |
-| `bit_rt_slice_get`    | `(h: *const SliceHeader, index: usize) -> u64` (§2)     |
-| `bit_rt_slice_set`    | `(h: *SliceHeader, index: usize, word: u64) -> void` (§2) |
-| `bit_rt_slice_slice`  | `(h: *const SliceHeader, lo: usize, hi: usize) -> *SliceHeader` (§2) |
+| `bit_rt_slice_new`    | `(len: usize, cap: usize, is_ref: usize, elem_size: usize) -> *SliceHeader` (§2, `elem_size` in **bytes** — `1` for a packed `[]u8`, `8` for every other element type) |
+| `bit_rt_slice_append` | `(h: *SliceHeader, word: u64, is_ref: usize, elem_size: usize) -> *SliceHeader` (§2, `is_ref`/`elem_size` are the static element type's — a null `h` has no header to read them from, #1569) |
+| `bit_rt_slice_get`    | `(h: *const SliceHeader, index: usize, elem_size: usize) -> u64` (§2) |
+| `bit_rt_slice_set`    | `(h: *SliceHeader, index: usize, word: u64, elem_size: usize) -> void` (§2) |
+| `bit_rt_slice_slice`  | `(h: *const SliceHeader, lo: usize, hi: usize) -> *SliceHeader` (§2, unchanged — reslicing works in element counts already, `runtime/root/slices.bit` `rtSliceSlice`) |
 | `bit_rt_map_new`      | `(key_desc: usize, val_is_ref: usize) -> *MapHeader` (§15, §15.1) |
 | `bit_rt_map_set`      | `(m: ?*MapHeader, key: u64, val: u64) -> void` (§15)    |
 | `bit_rt_map_get`      | `(m: ?*MapHeader, key: u64) -> u64` (§15)               |
@@ -1866,7 +1886,7 @@ The low-level layer under `std/crypto`.
 
 ```
 bit_rt_random_bytes(len: i64)   -> string   // len CSPRNG bytes; "" for len <= 0; fatal on entropy failure
-bit_rt_secure_zero(h)           -> void     // wipe a []byte's element words, un-elidable
+bit_rt_secure_zero(h)           -> void     // wipe a []byte's len packed bytes, un-elidable
 ```
 
 **Entropy source is the OS CSPRNG, never a userspace PRNG and never a weak or
@@ -1889,9 +1909,15 @@ reason as `runtime/net/net.bit`):
 `random_bytes` returns the bytes as a fresh GC `string` (byte-exact, length
 `len`), the same return path as `fs_read_all`.
 
-`secure_zero` takes the `[]byte`'s `SliceHeader` and zeroes the `len` element
-words it views (`buf[off .. off+len]`). Because a `[]byte`'s word model stores
-one byte per 8-byte word (§2), wiping the word range clears every logical byte.
+`secure_zero` takes the `[]byte`'s `SliceHeader` and zeroes the `len` **packed
+bytes** it views (`buf[off .. off+len]`) — `len` bytes, never `len * 8`. A
+`[]byte`/`[]u8` is the packed, 1-byte-per-element case (§2): the wipe covers
+exactly the buffer's logical byte range, `off` and `len` both already counted
+in bytes. **Do not wipe `len * 8` bytes** — that was the correct byte count
+only under the old word-per-element model this document no longer describes
+for `[]u8`, and applied to a packed buffer it zeroes 7 bytes of *adjacent* heap
+past the buffer's end for every logical byte the buffer holds, a silent
+memory-corruption bug in code whose entire job is wiping key material safely.
 The wipe is `@memset` followed by a compiler memory barrier so dead-store
 elimination cannot drop it — the standard defense against a "cleared" key
 lingering in memory.
