@@ -27,8 +27,8 @@ COMMITS="$(git log --no-merges --reverse --pretty=format:'%s|%h' "${RANGE}" || t
 #
 # EVERY COMMIT IS CLAIMED, NOT COPIED. `take` moves the lines it matches out of
 # `REMAINING`, so a commit lands in exactly one section and the leftovers are
-# always exactly what nothing has explained yet. That is what lets the last
-# section be a catch-all and the guard below be a real assertion.
+# always exactly what nothing has explained yet. That is what makes the
+# accounting guard below a real assertion rather than a hope.
 REMAINING="${COMMITS}"
 EMITTED=0
 BODY=""
@@ -58,17 +58,113 @@ take '^[a-z][a-z0-9+-]*(\([^)]*\))?!:' ; emit 'Breaking changes' "${BODY}"
 take '^feat(\([^)]*\))?:'              ; emit 'Features'         "${BODY}"
 take '^fix(\([^)]*\))?:'               ; emit 'Fixes'            "${BODY}"
 take '^perf(\([^)]*\))?:'              ; emit 'Performance'      "${BODY}"
-# Everything else conventional-shaped, as a COMPLEMENT rather than a whitelist.
-# The whitelist this replaces named `seed` and `selfhost` — a directory deleted
-# in #1593 and one renamed to `compiler` in #1841 — and never named `compiler`
-# itself, so 41 of 0.1.5's 59 commits were reported nowhere and nothing said so
-# (#2061). A list of types has to be maintained against a repo that coins new
-# ones; a complement does not. The charset admits `zig-removal` and
-# `dist+website`, both of which appear in that range.
-take '^[a-z][a-z0-9+-]*(\([^)]*\))?:'  ; emit 'Other'            "${BODY}"
-# No conventional prefix at all. Listed rather than discarded — a subject nobody
-# formatted is still a change that shipped.
-emit 'Uncategorised' "${REMAINING}"
+
+# Everything else is classified by the FILES it touched, not its subject. A
+# subject prefix is optional evidence (and the repo's history shows most
+# commits carry none); the paths a commit changed are never absent. This
+# replaces a whitelist of conventional `type:` prefixes that had to be
+# maintained against a repo that coins new ones (it named `seed` and
+# `selfhost` — a directory deleted in #1593 and one renamed to `compiler` in
+# #1841 — and never named `compiler` itself, so 41 of 0.1.5's 59 commits were
+# reported nowhere and nothing said so, #2061) and a bare `Uncategorised`
+# catch-all that, on 0.1.17, swallowed 66 of 80 commits.
+#
+# ONE `git log --name-only` pass over the whole range builds sha->category,
+# so classifying costs one process rather than one per commit. A commit whose
+# paths are ALL `.md` is Documentation outright (a `docs(ABI):` commit that
+# only touches `runtime/ABI.md` must not be filed under Runtime because of its
+# directory). Otherwise each touched path maps to a top-level area and the
+# commit is filed under whichever area touched the most files; a repo-root
+# file or any unrecognised top-level directory maps to Documentation. Ties —
+# including an all-unrecognised commit, which ties at Documentation by
+# definition — are broken by the listed order below, so the result is a pure
+# function of the tree and is stable across reruns.
+CLASSIFICATION="$(git log --no-merges --reverse --name-only --pretty=format:'@@COMMIT@@%h' "${RANGE}" | awk '
+  BEGIN {
+    order[1] = "Compiler";           order[2] = "Runtime"
+    order[3] = "Standard library";   order[4] = "Tests"
+    order[5] = "Documentation";      order[6] = "Build and tooling"
+    order[7] = "Benchmarks";         order[8] = "Editor support"
+    order[9] = "Examples";           norder = 9
+
+    dirmap["compiler"] = "Compiler";   dirmap["runtime"]  = "Runtime"
+    dirmap["stdlib"]   = "Standard library"
+    dirmap["tests"]    = "Tests"
+    dirmap["spec"]     = "Documentation"; dirmap["docs"]  = "Documentation"
+    dirmap["scripts"]  = "Build and tooling"
+    dirmap["tools"]    = "Build and tooling"
+    dirmap["dist"]     = "Build and tooling"
+    dirmap["docker"]   = "Build and tooling"
+    dirmap["bench"]    = "Benchmarks"
+    dirmap["editors"]  = "Editor support"
+    dirmap["examples"] = "Examples"
+    sha = ""
+  }
+  function flush(   cat, best, bestn, i, c) {
+    if (sha == "") return
+    if (nfiles > 0 && allmd) {
+      cat = "Documentation"
+    } else {
+      best = "Documentation"; bestn = -1
+      for (i = 1; i <= norder; i++) {
+        c = order[i]
+        if ((c in cnt) && cnt[c] > bestn) { bestn = cnt[c]; best = c }
+      }
+      cat = best
+    }
+    print sha "\t" cat
+    delete cnt
+  }
+  /^@@COMMIT@@/ {
+    flush()
+    sha = $0
+    sub(/^@@COMMIT@@/, "", sha)
+    nfiles = 0
+    allmd = 1
+    next
+  }
+  /^$/ { next }
+  {
+    top = $0
+    sub(/\/.*/, "", top)
+    cnt[(top in dirmap) ? dirmap[top] : "Documentation"]++
+    nfiles++
+    if ($0 !~ /\.md$/) allmd = 0
+  }
+  END { flush() }
+')"
+
+# Tag each still-unclaimed commit with its path category in one pass over
+# CLASSIFICATION, then hand out one category at a time the same way `take`
+# does: BODY is claimed and removed from REMAINING, so a commit can only ever
+# land in the one section its file counts picked.
+TAGGED="$(printf '%s\n' "${REMAINING}" | awk -F'|' -v map="${CLASSIFICATION}" '
+  BEGIN {
+    n = split(map, lines, "\n")
+    for (i = 1; i <= n; i++) {
+      split(lines[i], kv, "\t")
+      sha2cat[kv[1]] = kv[2]
+    }
+  }
+  { print sha2cat[$NF] "\t" $0 }
+')"
+
+by_category() {
+  local cat="$1"
+  BODY="$(printf '%s\n' "${TAGGED}" | awk -F'\t' -v cat="${cat}" '$1==cat{print $2}')"
+  [ -n "${BODY}" ] || return 0
+  REMAINING="$(printf '%s\n' "${REMAINING}" | grep -vxF -e "${BODY}" || true)"
+}
+
+by_category 'Compiler'           ; emit 'Compiler'           "${BODY}"
+by_category 'Runtime'            ; emit 'Runtime'            "${BODY}"
+by_category 'Standard library'   ; emit 'Standard library'   "${BODY}"
+by_category 'Tests'              ; emit 'Tests'              "${BODY}"
+by_category 'Documentation'      ; emit 'Documentation'      "${BODY}"
+by_category 'Build and tooling'  ; emit 'Build and tooling'  "${BODY}"
+by_category 'Benchmarks'         ; emit 'Benchmarks'         "${BODY}"
+by_category 'Editor support'     ; emit 'Editor support'     "${BODY}"
+by_category 'Examples'           ; emit 'Examples'           "${BODY}"
 
 # THE POINT OF THE ACCOUNTING. Every commit in the range must appear exactly
 # once: `take` claims, so a duplicate is impossible and a shortfall means a
