@@ -12,7 +12,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."          # repo root
 BIT=./bit-out/bin/bit
-CASES="fib mandelbrot collatz alloc"
+CASES="fib mandelbrot collatz alloc strings map sort matrix json"
 RUNS=7                           # timed runs per case; median reported
 CRUNS=3                          # compile-time samples per case; median reported
 STARTUP_ITERS=200                # exec count for startup timing
