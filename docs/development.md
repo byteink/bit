@@ -212,6 +212,41 @@ there with the cache unaware of it is the same stale-archive shape
 decision is made, but nothing changes for it until the opt-in exists and #1927
 uses it.
 
+**Correct invocation: ONE command, not two (#3126).** `BIT_LIBBITRT_TREE=1`
+must be visible to the same process that runs `selfhost`, because
+`tools/build/defs.bit` declares `Step{name: "selfhost", deps: ["libbitrt"]}` —
+a bare `./make selfhost` re-invokes `stepLibbitrt` as its own dependency,
+inside `selfhost`'s own process. A shell scopes `VAR=1 cmd1 && cmd2` to `cmd1`
+only (plain POSIX behaviour, not a bug in either command), so:
+
+```sh
+BIT_LIBBITRT_TREE=1 ./make libbitrt && ./make selfhost   # WRONG — silently reverts
+BIT_LIBBITRT_TREE=1 ./make selfhost                       # correct — one process
+```
+
+The wrong form gives no error and no warning. The first `./make libbitrt`
+genuinely writes the tree-built archive; then the bare `./make selfhost`
+re-runs `stepLibbitrt` with the flag unset, which rebuilds and silently
+overwrites it with the stage0-built archive before `selfhost` links anything —
+and `stepSelfhost` itself then reports "up to date", because
+`bit-out/bin/bit`'s own stamp never changed. Measured on aarch64-macos at
+`7b79f38b`: the two-command form leaves `bit-out/lib/aarch64-macos/libbitrt.a`
+at 551848 bytes (the stage0-built size, byte-identical to a plain
+`./make libbitrt`'s output); the one-command form correctly produces 489626
+bytes (tree-built, smaller because it carries a real backend optimization the
+frozen stage0 does not). This is not a cosmetic footgun: the whole reason
+`BIT_LIBBITRT_TREE` exists is to measure whether a queued `compiler/**` codegen
+fix (question 3 above) would improve the runtime once repinned, and the wrong
+form silently hands back the stage0 archive while the person measuring
+believes they are looking at the tree build — producing a confidently wrong
+"no improvement" result rather than an error.
+
+To set it for a whole shell session instead of one command line:
+`export BIT_LIBBITRT_TREE=1`, then `unset BIT_LIBBITRT_TREE` (or open a new
+shell) to return to the default stage0-built path — an exported variable is
+visible to every subprocess `./make` spawns, so `./make libbitrt` followed by
+`./make selfhost` both see it and the two-command form works correctly too.
+
 ## Testing conventions
 
 **Verify scoped changes with `scripts/gate.sh`, not the full suite.** It reads
