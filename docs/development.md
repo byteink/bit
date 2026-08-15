@@ -366,6 +366,30 @@ gates E0200 (the same 800-line rule) over `compiler/**` and `runtime/**`,
 closing the gap instance 1 leaves outside `tests/bit/`; #2876 widens
 `test-fmt` itself, closing instance 2.
 
+**A benchmark win is not landed until its baseline moves down with it.**
+`tests/bit/benchgate/{benchgate,baselines}.bit` compares peak RSS and user CPU
+against a baseline at 1.5x — see that file's own header for the method
+(minimum of N runs, peak RSS and user CPU, never wall clock; not restated
+here). The reason worth stating, because it is not obvious from the gate's
+code: **the bar is one-directional on purpose, so the ratchet only tightens
+when a human tightens it.** A change that improves a `bench/cases/*`
+benchmark is not finished until the case's entry in
+`tests/bit/benchgate/baselines.bit` is re-recorded in the same commit. Run
+`./make test-benchgate` and read the `cpu=`/`rss=` line it prints for that
+case (`benchgate: <name> cpu=...cs (baseline ...cs, ceiling ...cs)
+rss=...B (baseline ...B, ceiling ...B)` — printed before the comparison
+even fires) to get the numbers to write into the table. Skip this and nothing
+fails today: the improved run just clears 1.5x more comfortably, and a later
+change that regresses the benchmark back toward the OLD, unlowered baseline
+still passes cleanly.
+
+Once #3130 lands, this is mechanically enforced for one metric: deterministic
+object counts get a two-sided band, so an unrecorded improvement there fails
+the gate on its own. Peak RSS and user CPU stay noisy by design — that
+noise is exactly why they need the 1.5x slack in the first place — so a
+two-sided band is not sound for either, and re-recording those two stays a
+written convention rather than something the gate checks for you.
+
 ## File size
 
 Hard limit **800 lines per file**, target ~500. 800 is the default of the repo's
