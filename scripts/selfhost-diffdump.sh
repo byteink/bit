@@ -517,34 +517,45 @@ explainMismatch() {
       for (i in corelist) core[corelist[i]] = 1
       N = -delta["rt_call:slice_get"]
       ok = (N > 0)
-      if (delta["slice_len"] != N)      ok = 0
-      if (delta["icmp_ult"] != N)       ok = 0
-      if (delta["br"] != N)             ok = 0
-      if (delta["const_string"] != N)   ok = 0
-      if (delta["rt_call:panic"] != N)  ok = 0
-      if (delta["unreachable"] != N)    ok = 0
-      Nn = delta["field_get"] - 2 * N
-      if (Nn < 0)                       ok = 0
-      if (delta["add"] != N + Nn)       ok = 0
-      if (delta["shl"] != Nn)           ok = 0
-      if (delta["const_int"] != Nn)     ok = 0
-      if (delta["index_get"] != N - Nn) ok = 0
-      Nf = -delta["bitcast"]
-      if (Nf < 0)                       ok = 0
-      # No opcode outside the declared 13 may move at pre-opt. At post-opt,
-      # the inliner may additionally move call/call_value/sub by any amount
-      # (see the block comment above) -- any other opcode still fails.
-      for (op in delta) {
-        opname = op
-        sub(/^rt_call:/, "", opname)
-        if (!(opname in core)) {
-          if (kind == "ir") {
-            ok = 0
-          } else if (opname != "call" && opname != "call_value" && opname != "sub") {
-            ok = 0
-          }
+
+      if (kind == "ir") {
+        # Pre-opt: the exact linear identity, every coefficient an
+        # independent equation, and no opcode outside the declared 13 may
+        # move at all.
+        if (delta["slice_len"] != N)      ok = 0
+        if (delta["icmp_ult"] != N)       ok = 0
+        if (delta["br"] != N)             ok = 0
+        if (delta["const_string"] != N)   ok = 0
+        if (delta["rt_call:panic"] != N)  ok = 0
+        if (delta["unreachable"] != N)    ok = 0
+        Nn = delta["field_get"] - 2 * N
+        if (Nn < 0)                       ok = 0
+        if (delta["add"] != N + Nn)       ok = 0
+        if (delta["shl"] != Nn)           ok = 0
+        if (delta["const_int"] != Nn)     ok = 0
+        if (delta["index_get"] != N - Nn) ok = 0
+        Nf = -delta["bitcast"]
+        if (Nf < 0)                       ok = 0
+        for (op in delta) {
+          opname = op
+          sub(/^rt_call:/, "", opname)
+          if (!(opname in core)) ok = 0
+        }
+      } else {
+        # Post-opt: opt.bit CSE/DCE can redistribute the SAME 13 opcodes
+        # counts (dedupe a repeated bounds check or address computation), so
+        # the exact pre-opt coefficients do not survive -- see the block
+        # comment above. What must still hold: every opcode with a nonzero
+        # delta is one of the declared 13, or one of the inliner call/
+        # call_value/sub (unconstrained magnitude, both documented above).
+        # Anything else still fails.
+        for (op in delta) {
+          opname = op
+          sub(/^rt_call:/, "", opname)
+          if (!(opname in core) && opname != "call" && opname != "call_value" && opname != "sub") ok = 0
         }
       }
+
       if (ok) { print "3107-slice-read-inline"; exit 0 }
       exit 1
     }
