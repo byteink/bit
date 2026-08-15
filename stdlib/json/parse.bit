@@ -26,9 +26,10 @@
 //   - Explicitly OUT OF SCOPE: unquoted object keys, single-quoted strings,
 //     hex numbers, `NaN`/`Infinity`, or any other JSON5 leniency.
 //
-// `jsoncParse` is this same grammar with comments (lex.bit's `lexJsonc`) and
-// one trailing comma (`Parser.allowTrailingComma`) switched on; `jsonParse`
-// stays strict RFC 8259 so a caller that wants to reject comments still can.
+// `jsoncParse` is this same grammar with comments (`Parser.allowComments`,
+// which lex.bit's scanner reads) and one trailing comma
+// (`Parser.allowTrailingComma`) switched on; `jsonParse` stays strict RFC 8259
+// so a caller that wants to reject comments still can.
 
 // `newBuilder` is already imported into this module by encode.bit — importing
 // it again here would collide (same module, same declaration). Deliberately
@@ -39,26 +40,63 @@
 // own digit accumulation so this module can accept the full i64 range.
 import { contains, Builder } from "std/strings"
 
-// A cursor over `lex`'s token stream, plus the original source (decoding a
-// string or number needs to slice raw bytes back out of it).
-// `allowTrailingComma` is JSONC-only (false for strict `jsonParse`): it lets
-// `parseObject`/`parseArray` accept one trailing `,` before the closer.
-struct Parser { src: string, toks: []Token, i: int, allowTrailingComma: bool }
+// Starting capacity for a `JsonObject`'s entries and a `JsonArray`'s items
+// (#2293). `append` doubles FROM 1 (runtime/root/slices.bit:185), so a
+// container built from an empty slice reallocates its backing at 1, 2 and 4 —
+// three extra `gc_alloc`s and three copies to hold four elements, and real
+// documents are overwhelmingly made of small objects and short arrays. Starting
+// at 4 holds the common case in the slice's first buffer and leaves the
+// doubling to take over unchanged above it. The cost is a 4-word buffer for an
+// empty `{}`/`[]` that would otherwise get a 0-word one; the 32-byte object
+// header (runtime/ABI.md §1) is paid either way, so that is 32 bytes, not a
+// class of waste.
+const jsonSmallCap = 4
 
-// The token under the cursor. `lex` always terminates with `Eof`, so this is
-// never out of bounds once `i` stops advancing past the last token.
-fn peek(p: Parser): Token {
-  return p.toks[p.i]
+// A cursor over the token stream, plus the original source (decoding a string
+// or number needs to slice raw bytes back out of it).
+// `allowTrailingComma` and `allowComments` are JSONC-only (both false for
+// strict `jsonParse`): the first lets `parseObject`/`parseArray` accept one
+// trailing `,` before the closer, the second switches on lex.bit's comment
+// handling.
+//
+// STREAMING (#2293), not a materialized `[]Token`. This parser is a pure
+// forward cursor — it peeks one token and never looks back — so the whole
+// stream never needed to exist at once. It used to: `lex(source)` built one
+// `Token` per token, and a struct is a heap object in Bit, so a 9 MB document
+// cost 3.6M `gc_alloc`s plus a 3.6M-word backing array, all of it LIVE for the
+// entire parse and therefore re-marked by every collection the parse triggers.
+// Driving `lexNext` directly and reading the current token off `p.lx`'s own
+// `kind`/`start`/`end` fields makes tokenization allocation-free.
+struct Parser { src: string, lx: Lexer, allowComments: bool, allowTrailingComma: bool }
+
+// A parser positioned on `source`'s first token. Priming here rather than
+// lazily keeps every `p.lx.kind` read below unconditional.
+fn newParser(source: string, allowComments: bool, allowTrailingComma: bool): Parser {
+  let p = Parser{
+    src: source,
+    lx: newLexer(source),
+    allowComments: allowComments,
+    allowTrailingComma: allowTrailingComma,
+  }
+  lexNext(p.lx, allowComments, false)
+  return p
 }
 
-// Returns the token under the cursor and moves past it, except at `Eof`
-// (the stream's fixed final token, which nothing should walk past).
-fn advance(p: Parser): Token {
-  let t = p.toks[p.i]
-  if (p.i < len(p.toks) - 1) {
-    p.i = p.i + 1
+// Moves past the token under the cursor. At `Eof` — the stream's fixed final
+// token — it stays put, so nothing walks past the end however many times a
+// caller asks.
+fn advance(p: Parser) {
+  if (p.lx.kind != TokenKind.Eof) {
+    lexNext(p.lx, p.allowComments, false)
   }
-  return t
+}
+
+// An upper bound on the tokens `p.src` can still yield: every token consumes at
+// least one source byte, plus the one `Eof`. Replaces the old `len(p.toks) + 1`
+// now that the stream is not materialized — same purpose (a statically provable
+// loop bound, never a real limit), same guarantee.
+fn tokenBound(p: Parser): int {
+  return len(p.src) + 1
 }
 
 // One value out of `p`'s token stream, optionally surrounded by whitespace
@@ -67,8 +105,8 @@ fn advance(p: Parser): Token {
 // whether a trailing comma is allowed), not in this top-level shape check.
 fn parseTopLevel(p: Parser): Json! {
   let v = parseValue(p)?
-  if (peek(p).kind != TokenKind.Eof) {
-    fail posError(p.src, "json: trailing garbage after value", peek(p).start)
+  if (p.lx.kind != TokenKind.Eof) {
+    fail posError(p.src, "json: trailing garbage after value", p.lx.start)
   }
   return v
 }
@@ -77,8 +115,7 @@ fn parseTopLevel(p: Parser): Json! {
 // surrounded by whitespace, and nothing else. No comments, no trailing
 // commas — see `jsoncParse` for the JSONC extension.
 export fn jsonParse(source: string): Json! {
-  let p = Parser{ src: source, toks: lex(source), i: 0, allowTrailingComma: false }
-  return parseTopLevel(p)?
+  return parseTopLevel(newParser(source, false, false))?
 }
 
 // Parses `source` as JSONC (this file's header comment documents the exact
@@ -86,8 +123,7 @@ export fn jsonParse(source: string): Json! {
 // comma before `}`/`]`. Everything else — number/string decoding, depth
 // limit, error-vs-panic behavior — is identical to `jsonParse`.
 export fn jsoncParse(source: string): Json! {
-  let p = Parser{ src: source, toks: lexJsonc(source), i: 0, allowTrailingComma: true }
-  return parseTopLevel(p)?
+  return parseTopLevel(newParser(source, true, true))?
 }
 
 // --- error positions -------------------------------------------------
@@ -147,133 +183,136 @@ fn posError(src: string, msg: string, offset: int): error {
 // the only path that marks a `"` byte `Invalid`, and an unterminated `/*`
 // is the only `Invalid` starting on `/` whose span is more than one byte (a
 // lone stray `/` is always a single-byte `Invalid`).
-fn describeInvalid(src: string, t: Token): string {
-  let c = src[t.start]
+fn describeInvalid(src: string, start: int, end: int): string {
+  let c = src[start]
   if (c == '{' || c == '[') {
     return "json: max nesting depth exceeded"
   }
   if (c == '"') {
     return "json: unterminated string"
   }
-  if (c == '/' && t.end - t.start > 1) {
+  if (c == '/' && end - start > 1) {
     return "json: unterminated block comment"
   }
   return "json: unexpected character in input"
 }
 
 fn parseValue(p: Parser): Json! {
-  let t = peek(p)
-  if (t.kind == TokenKind.LBrace) {
+  let kind = p.lx.kind
+  // Captured before `advance` overwrites the cursor: the span belongs to the
+  // token being consumed, not to the one after it.
+  let start = p.lx.start
+  let end = p.lx.end
+  if (kind == TokenKind.LBrace) {
     return parseObject(p)?
   }
-  if (t.kind == TokenKind.LBracket) {
+  if (kind == TokenKind.LBracket) {
     return parseArray(p)?
   }
-  if (t.kind == TokenKind.StringTok) {
+  if (kind == TokenKind.StringTok) {
     advance(p)
-    return Json.JsonString(decodeStringLiteral(p.src, t)?)
+    return Json.JsonString(decodeStringLiteral(p.src, start, end)?)
   }
-  if (t.kind == TokenKind.NumberTok) {
+  if (kind == TokenKind.NumberTok) {
     advance(p)
-    return decodeNumber(p.src, t)?
+    return decodeNumber(p.src, start, end)?
   }
-  if (t.kind == TokenKind.TrueTok) {
+  if (kind == TokenKind.TrueTok) {
     advance(p)
     return Json.JsonBool(true)
   }
-  if (t.kind == TokenKind.FalseTok) {
+  if (kind == TokenKind.FalseTok) {
     advance(p)
     return Json.JsonBool(false)
   }
-  if (t.kind == TokenKind.NullTok) {
+  if (kind == TokenKind.NullTok) {
     advance(p)
     return Json.JsonNull
   }
-  if (t.kind == TokenKind.Invalid) {
-    fail posError(p.src, describeInvalid(p.src, t), t.start)
+  if (kind == TokenKind.Invalid) {
+    fail posError(p.src, describeInvalid(p.src, start, end), start)
   }
-  fail posError(p.src, "json: unexpected token, expected a value", t.start)
+  fail posError(p.src, "json: unexpected token, expected a value", start)
 }
 
 // `{` was already peeked by the caller. Every entry is kept, including a
 // repeated key — see this file's header comment for why.
 fn parseObject(p: Parser): Json! {
   advance(p)
-  let entries = []JsonEntry(0)
-  if (peek(p).kind == TokenKind.RBrace) {
+  let entries = []JsonEntry(0, jsonSmallCap)
+  if (p.lx.kind == TokenKind.RBrace) {
     advance(p)
     return Json.JsonObject(entries)
   }
   // Bounded by the token count: each iteration consumes at least a key, a
   // colon, a value, and a comma, so the loop cannot outrun a finite stream.
   let guard = 0
-  let bound = len(p.toks) + 1
+  let bound = tokenBound(p)
   while (guard <= bound) {
-    let keyTok = peek(p)
-    if (keyTok.kind != TokenKind.StringTok) {
-      fail posError(p.src, "json: expected string key", keyTok.start)
+    if (p.lx.kind != TokenKind.StringTok) {
+      fail posError(p.src, "json: expected string key", p.lx.start)
     }
+    let keyStart = p.lx.start
+    let keyEnd = p.lx.end
     advance(p)
-    let key = decodeStringLiteral(p.src, keyTok)?
-    if (peek(p).kind != TokenKind.Colon) {
-      fail posError(p.src, "json: expected ':' after object key", peek(p).start)
+    let key = decodeStringLiteral(p.src, keyStart, keyEnd)?
+    if (p.lx.kind != TokenKind.Colon) {
+      fail posError(p.src, "json: expected ':' after object key", p.lx.start)
     }
     advance(p)
     let val = parseValue(p)?
     entries = append(entries, JsonEntry{ key: key, value: val })
-    let nxt = peek(p)
-    if (nxt.kind == TokenKind.RBrace) {
+    if (p.lx.kind == TokenKind.RBrace) {
       advance(p)
       return Json.JsonObject(entries)
     }
-    if (nxt.kind != TokenKind.Comma) {
-      fail posError(p.src, "json: expected ',' or '}' in object", nxt.start)
+    if (p.lx.kind != TokenKind.Comma) {
+      fail posError(p.src, "json: expected ',' or '}' in object", p.lx.start)
     }
     advance(p)
     // JSONC: a single trailing comma closes the object right here. A second
-    // one does not — `peek(p)` would be `Comma` again, so the loop falls
+    // one does not — the cursor would be `Comma` again, so the loop falls
     // through to "expected string key" on the next iteration.
-    if (p.allowTrailingComma && peek(p).kind == TokenKind.RBrace) {
+    if (p.allowTrailingComma && p.lx.kind == TokenKind.RBrace) {
       advance(p)
       return Json.JsonObject(entries)
     }
     guard = guard + 1
   }
-  fail posError(p.src, "json: object nesting exceeds token bound", peek(p).start)
+  fail posError(p.src, "json: object nesting exceeds token bound", p.lx.start)
 }
 
 // `[` was already peeked by the caller.
 fn parseArray(p: Parser): Json! {
   advance(p)
-  let items = []Json(0)
-  if (peek(p).kind == TokenKind.RBracket) {
+  let items = []Json(0, jsonSmallCap)
+  if (p.lx.kind == TokenKind.RBracket) {
     advance(p)
     return Json.JsonArray(items)
   }
   let guard = 0
-  let bound = len(p.toks) + 1
+  let bound = tokenBound(p)
   while (guard <= bound) {
     let v = parseValue(p)?
     items = append(items, v)
-    let nxt = peek(p)
-    if (nxt.kind == TokenKind.RBracket) {
+    if (p.lx.kind == TokenKind.RBracket) {
       advance(p)
       return Json.JsonArray(items)
     }
-    if (nxt.kind != TokenKind.Comma) {
-      fail posError(p.src, "json: expected ',' or ']' in array", nxt.start)
+    if (p.lx.kind != TokenKind.Comma) {
+      fail posError(p.src, "json: expected ',' or ']' in array", p.lx.start)
     }
     advance(p)
     // JSONC: a single trailing comma closes the array right here. A second
-    // one does not — `peek(p)` would be `Comma` again, so `parseValue` on the
+    // one does not — the cursor would be `Comma` again, so `parseValue` on the
     // next iteration rejects it ("unexpected token, expected a value").
-    if (p.allowTrailingComma && peek(p).kind == TokenKind.RBracket) {
+    if (p.allowTrailingComma && p.lx.kind == TokenKind.RBracket) {
       advance(p)
       return Json.JsonArray(items)
     }
     guard = guard + 1
   }
-  fail posError(p.src, "json: array nesting exceeds token bound", peek(p).start)
+  fail posError(p.src, "json: array nesting exceeds token bound", p.lx.start)
 }
 
 // --- numbers -----------------------------------------------------------
@@ -359,16 +398,16 @@ fn isValidJsonNumber(s: string): bool {
 // wider, or with a fraction/exponent, decodes to `JsonFloat` via the
 // runtime's own `parseFloat` primitive so it can never drift a ULP from the
 // canonical parse (#1479's number-handling decision).
-fn decodeNumber(src: string, t: Token): Json! {
-  let kind = classifyJsonNumber(src, t.start, t.end)
+fn decodeNumber(src: string, start: int, end: int): Json! {
+  let kind = classifyJsonNumber(src, start, end)
   if (kind == 0) {
-    fail posError(src, "json: invalid number literal", t.start)
+    fail posError(src, "json: invalid number literal", start)
   }
   if (kind == 2) {
-    return Json.JsonFloat(parseFloat(src[t.start:t.end]))
+    return Json.JsonFloat(parseFloat(src[start:end]))
   }
-  let iv = parseJsonIntSpan(src, t.start, t.end) catch e {
-    return Json.JsonFloat(parseFloat(src[t.start:t.end]))
+  let iv = parseJsonIntSpan(src, start, end) catch e {
+    return Json.JsonFloat(parseFloat(src[start:end]))
   }
   return Json.JsonInt(iv)
 }
@@ -482,9 +521,9 @@ fn writeUtf8(b: Builder, cp: i64): Builder {
 // escape-free string cost O(L^2). A string that does contain an escape still
 // goes through the byte-by-byte loop from that point on, batched from one
 // Builder call per escape-free run instead of one per byte.
-fn decodeStringLiteral(src: string, t: Token): string! {
-  let start = t.start + 1
-  let end = t.end - 1
+fn decodeStringLiteral(src: string, tokStart: int, tokEnd: int): string! {
+  let start = tokStart + 1
+  let end = tokEnd - 1
   let firstEscape = -1
   let j = start
   while (j < end) {
