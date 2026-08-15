@@ -155,10 +155,28 @@
 # whole surface this walk can reach. It happens to cost nothing: the walk
 # below skips zero files.
 #
+# ## Why a mismatch is checked against a declared-transform signature first (#3132)
+#
+# This IR walk has its OWN shell-out to `--dump-ir-pre` — it never routed
+# through scripts/selfhost-diffdump.sh — so #3125's fix (score a mismatch
+# against a table of declared lowering-transform signatures before calling it
+# a regression) never reached it. #3107's inline slice-index lowering
+# (compiler/loweraccess.bit) reddened this arm exactly the way it reddened
+# diffdump's ir/iropt rows before #3125: `runtime/park/darwin/wait.bit`,
+# `runtime/root/{floatbig,floatfmt,floatparse}.bit` and
+# `runtime/thread/darwin/spawn.bit` all index buffers and lower differently
+# by design. This sources `explainMismatch` from
+# scripts/selfhost-ir-signatures.sh — the same function selfhost-diffdump.sh
+# sources, not a second copy — and downgrades a mismatch to EXPLAINED only
+# when it satisfies the registered #3107 identity; anything else still fails
+# exactly as before.
+#
 # Usage: ./make selfhost && bash scripts/selfhost-diffruntime.sh
 set -uo pipefail
 # shellcheck source=scripts/alarmrun.sh
 . "$(dirname -- "$0")/alarmrun.sh"
+# shellcheck source=scripts/selfhost-ir-signatures.sh
+. "$(dirname -- "$0")/selfhost-ir-signatures.sh"
 
 # Oracle: the pinned stage0 (previous release), like every other differential
 # since #1593. scripts/stage0.sh downloads and DIGEST-VERIFIES it and refuses
@@ -310,6 +328,7 @@ trap 'rm -rf "$work"' EXIT
 
 match=0 skip=0 total=0
 : >"$work/mismatch"
+: >"$work/explained"
 : >"$work/timeout"
 : >"$work/oracletimeout"
 : >"$work/oraclecrash"
@@ -358,7 +377,15 @@ for f in $(find runtime -name '*.bit' | sort); do
   if [ "$a" = "$b" ]; then
     match=$((match + 1))
   else
-    echo "$f" >>"$work/mismatch"
+    # A raw mismatch is not automatically a regression (#3132, same fix as
+    # #3125 one level up): check it against the declared-transform-signature
+    # table before scoring it. Only an UNEXPLAINED divergence fails the gate.
+    sig=$(explainMismatch "$a" "$b" ir)
+    if [ -n "$sig" ]; then
+      echo "$f${sep}explained by declared signature '$sig'" >>"$work/explained"
+    else
+      echo "$f" >>"$work/mismatch"
+    fi
   fi
 done
 
@@ -483,20 +510,33 @@ if [ -s "$work/timeout" ]; then
   bad=1
 fi
 
-# NO DIVERGENCE IS PERMITTED. Any runtime file whose IR differs from the pinned
-# stage0's fails the run. There was an expected-mismatch list so a known
-# difference could be written down instead of fixed; its last entry closed and it
-# was deleted with its reader (#1883).
+# NO UNEXPLAINED DIVERGENCE IS PERMITTED. Any runtime file whose IR differs
+# from the pinned stage0's, and whose delta does not satisfy a registered
+# transform signature (explainMismatch, scripts/selfhost-ir-signatures.sh,
+# #3132/#3125), fails the run. There was an expected-mismatch FILE list so a
+# known difference could be written down instead of fixed; its last entry
+# closed and it was deleted with its reader (#1883) — a signature is not that
+# list reborn, see selfhost-ir-signatures.sh's header for why.
 #
 # The MIN_FILES floor and the REQUIRED list above are a SEPARATE property and
 # stay: they prove the run was not vacuous, which an exit code cannot (#1881).
 sort -u "$work/mismatch" >"$work/mismatch.sorted"
+sort -u "$work/explained" >"$work/explained.sorted"
 
 if [ -s "$work/mismatch.sorted" ]; then
   echo "diffruntime: FAIL — $(wc -l <"$work/mismatch.sorted" | tr -d ' ') file(s) diverge from the pinned stage0:" >&2
   sed 's/^/  /' "$work/mismatch.sorted" >&2
   echo "  Diff one with:  diff <(\"$ORACLE\" --dump-ir-pre FILE) <($BIT2 --dump-ir-pre FILE)" >&2
   bad=1
+fi
+
+# Informational, never fails the gate: each of these matched a declared
+# transform signature's identity exactly (explainMismatch), a stronger claim
+# than "this file is allowed to differ" — see selfhost-ir-signatures.sh's
+# header for why that distinction is load-bearing.
+if [ -s "$work/explained.sorted" ]; then
+  echo "diffruntime: EXPLAINED — $(wc -l <"$work/explained.sorted" | tr -d ' ') file(s) diverge from the pinned stage0 but match a declared lowering-transform signature (not a regression):"
+  sed 's/^/  /' "$work/explained.sorted"
 fi
 
 # --- Object-byte checks (#2741), mirroring the IR-walk checks above ---
@@ -555,4 +595,5 @@ fi
 
 modwhat="byte-identical"
 [ "$ATOMIC_ISA" = aarch64 ] && modwhat="atomic-width-signature-identical"
-echo "diffruntime: PASS — $match/$total runtime file(s) lower identically ($skip skipped); $modmatch/$NMOD runtime module(s) $modwhat ($modskip skipped, object)"
+explained=$(wc -l <"$work/explained.sorted" | tr -d ' ')
+echo "diffruntime: PASS — $match/$total runtime file(s) lower identically ($skip skipped, $explained explained); $modmatch/$NMOD runtime module(s) $modwhat ($modskip skipped, object)"
