@@ -191,7 +191,139 @@ fn emitMapGet(fc: FnCtx, valTy: int, m: int, key: int, onMiss: MapGetMiss): int 
   return builderAddParam(fc.b, valTy)
 }
 
-// Lowers an index read `a[i]`: a slice via `rt_call slice_get`, a map via
+// `xs[i]` on a slice, emitted INLINE instead of as `rt_call slice_get` (#3107).
+//
+// WHY. `bit_rt_slice_get` (runtime/root/slices.bit:252) is 190 instructions, 146
+// of them on the in-bounds path — 78 `mov`, 24 prologue/epilogue, and a
+// `runtime/gc/mem.bit` `wordAt` pointer round-trip — for what C does in two. It
+// is the hottest symbol in the language, and #3102 measured element access at
+// 90.4% of the matrix benchmark's runtime. This reproduces its semantics
+// verbatim at the call site; the runtime entry point stays exported (ABI.md §2)
+// for out-of-tree callers.
+//
+// THE SEMANTICS, from runtime/root/slices.bit:253-267:
+//
+//   h == 0                      -> panic "index out of range"
+//   index < 0 || index >= h.len -> panic "index out of range"
+//   result = load(h.buf + (h.off + index) * 8)
+//
+// THE NULL HEADER NEEDS NO SEPARATE TEST. A zeroed struct's slice field is the
+// null word (#1564), and `slice_len` already reads a null header as 0 — both
+// backends route it through `emitHeaderWordOrZero`. So a null receiver has
+// length 0, every index fails the bounds test, and control reaches the SAME
+// panic block. That is exactly the answer `rtSliceGet`'s explicit `h == 0` arm
+// gives, reached by one branch instead of two.
+//
+// ONE UNSIGNED COMPARE COVERS BOTH BOUNDS. `(u64)index < (u64)len` is false for
+// a negative index (which reads as a huge unsigned) and for `index >= len`, so
+// the check is one `cmp` + one conditional branch — the shape C and Go both
+// use. It is exact at every index width because this compiler keeps every
+// integer register width-canonical (arm64select.bit's `canonNarrow`: "every
+// value in a register is its true value sign/zero-extended to 64 bits") and
+// both backends' `icmp` is a full 64-bit compare, so a narrow negative index
+// arrives here already sign-extended.
+//
+// THE PANIC STAYS OUT OF LINE, in a block that ends in `unreachable`. #2014
+// measured what happens otherwise: materialising the message words inside the
+// hot function took the saved-register set from x29/x30 to x19-x27 and cost +8%
+// on a pure-index loop. The message text is `bit_rt_slice_get`'s own, so an
+// out-of-range read still exits 2 with `panic: index out of range`.
+//
+// THE GC HAZARD, AND WHY THIS IS SAFE. `buf` is a GC-managed pointer, and once
+// it lives in a vreg the collector can no longer find it through the header: it
+// is an `i64` here, so no stack map describes it (ABI.md §4). What makes that
+// sound is that `buf`'s LIVE RANGE CONTAINS NO SAFEPOINT — by construction, not
+// by luck. Every instruction between the load of `buf` and the load of the
+// element is arithmetic in ONE straight-line block: no call, no allocation, and
+// no back edge (`isBackEdge` is `target <= curBlock`, and both blocks minted
+// here have ids above the current one, so `emitBackEdgeSafepointIfNeeded` emits
+// nothing). Nor can a later pass open that window: `opt.bit` folds constants,
+// deletes dead values and prunes blocks, and has no code motion at all — no
+// LICM, no GVN — so nothing can be scheduled between the two loads. Anything
+// that later adds cross-block motion to the optimizer must keep this sequence
+// intact or describe `buf` in the stack map.
+fn emitInlineSliceGet(fc: FnCtx, recv: int, idx: int, ty: int): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let vlenIns = mkInstr(Op.SliceLen, i64ty)
+  vlenIns.lhs = recv
+  let cmp = mkInstr(Op.ICmpUlt, primType(fc.c.ctx, 10))
+  cmp.lhs = idx
+  cmp.rhs = builderEmit(fc.b, vlenIns)
+  let inBounds = builderEmit(fc.b, cmp)
+  // Minted in emission order, so the ids ascend with the linear schedule the
+  // x64 linear-scan allocator's interval numbering assumes.
+  let oob = builderNewBlock(fc.b)
+  let ok = builderNewBlock(fc.b)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = inBounds
+  br.ival = ok
+  br.ival2 = oob
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, oob)
+  let msg = mkInstr(Op.ConstString, primType(fc.c.ctx, 11))
+  msg.sval = "index out of range"
+  msg.ival = internPoolString(fc, msg.sval)
+  let pn = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+  pn.name = "panic"
+  pn.args = [builderEmit(fc.b, msg)]
+  emitRtCall(fc, pn)
+  builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, ok)
+  // Header words at ABI.md §2 offsets: `buf` 0, `off` 16. `off` is NOT always
+  // zero — a reslice `s[lo:hi]` carries a non-zero view offset — so it is
+  // loaded and added rather than assumed away. Both reads go through the
+  // null-safe header path (the base is still slice-typed), which costs two
+  // never-taken branches and is what `lowerPtrOf` already does.
+  let bufIns = mkInstr(Op.FieldGet, i64ty)
+  bufIns.lhs = recv
+  bufIns.ival = 0
+  let buf = builderEmit(fc.b, bufIns)
+  let offIns = mkInstr(Op.FieldGet, i64ty)
+  offIns.lhs = recv
+  offIns.ival = 16
+  let add = mkInstr(Op.Add, i64ty)
+  add.lhs = builderEmit(fc.b, offIns)
+  add.rhs = idx
+  let slot = builderEmit(fc.b, add)
+  // A slice buffer stores ONE 8-BYTE WORD PER ELEMENT whatever the element type
+  // is (`rtSliceAppend`: `storeWord(buf + (off + vlen) * 8, word)`), so the
+  // element stride is 8 and never the element's own width.
+  //
+  // `index_get` scales by that width, so it is the right op exactly when the
+  // width IS 8 — which covers every reference type (`widthOf` gives 8 to
+  // everything that is not a prim), plus i64/u64/int/f64. It folds the whole
+  // access into one scaled load on both backends. Narrow PRIMS — i8/i16/i32,
+  // u8/u16/u32, bool, f32 — would be scaled wrong, so they compute the byte
+  // address and load at offset 0 instead. Reading the low bytes of the stored
+  // word is exact for them for the same width-canonical reason the compare
+  // above is, and only prims reach that arm, so `field_get`'s fixed-array case
+  // (which yields an interior ADDRESS, not a load) is unreachable from here.
+  let w = widthOf(fc.c.ctx, ty)
+  if (w.bytes == 8) {
+    let ig = mkInstr(Op.IndexGet, ty)
+    ig.lhs = buf
+    ig.rhs = slot
+    return builderEmit(fc.b, ig)
+  }
+  let three = mkInstr(Op.ConstInt, i64ty)
+  three.ival = 3
+  let shl = mkInstr(Op.Shl, i64ty)
+  shl.lhs = slot
+  shl.rhs = builderEmit(fc.b, three)
+  let addr = mkInstr(Op.Add, i64ty)
+  addr.lhs = buf
+  addr.rhs = builderEmit(fc.b, shl)
+  let load = mkInstr(Op.FieldGet, ty)
+  load.lhs = builderEmit(fc.b, addr)
+  load.ival = 0
+  return builderEmit(fc.b, load)
+}
+
+// Lowers an index read `a[i]`: a slice inline (`emitInlineSliceGet`), a map via
 // `map_get`, a string via `string_byte`, a fixed array via the `index_get` op.
 //
 // The fixed-array arm is a TESTED arm, not a fallthrough (#2385). `index_get` is
@@ -213,6 +345,15 @@ fn lowerIndex(fc: FnCtx, node: int): int {
   }
   let rd = fc.c.ctx.types[recvTy]
   if (rd.kind == TypeKind.Slice) {
+    // A float-classed index reaches neither the inline compare nor the inline
+    // address arithmetic, both of which read an INTEGER register. Nothing
+    // rejects `xs[1.5]` today — the checker types the read and the validator
+    // only asks whether the RECEIVER is indexable — so keep that (already
+    // meaningless) program on the runtime call rather than emitting a sequence
+    // that reads a register the value was never placed in.
+    if (regClassOf(fc.c.ctx, fc.b.instrs[idx].ty) == RegClass.Int) {
+      return emitInlineSliceGet(fc, recv, idx, ty)
+    }
     let ins = mkInstr(Op.RtCall, ty)
     ins.name = "slice_get"
     ins.args = [recv, idx]
