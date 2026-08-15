@@ -216,8 +216,9 @@ uses it.
 
 **Verify scoped changes with `scripts/gate.sh`, not the full suite.** It reads
 your `git diff` and runs only the steps that change can affect — a `compiler/**`
-edit runs the selfhost diffs plus `test-imports-bit`, `test-lint-filelines` and
-`test-selfhostcheck`, a `tests/cases/**` edit runs `./make test-golden test-fuzz`.
+edit runs the selfhost diffs plus `test-imports-bit`, `test-lint-filelines`,
+`test-selfhostcheck` and `test-selfcheck`, a `tests/cases/**` edit runs
+`./make test-golden test-fuzz`.
 Every bucket runs every gate whose OWN declared file set (its `argv`/`env` in
 `tools/build/gates.bit`) intersects that bucket's paths, not just the one gate
 the bucket was originally named after — see `scripts/gate.sh`'s own header
