@@ -72,9 +72,16 @@
 # `Gate{}`'s argv/env before assuming a bucket's step list is complete — a
 # gate's scope is not its name. Concretely: `stdlib` and `examples` both run
 # `test-fmt` (its argv literally names `${repoRoot()}/stdlib` and
-# `${repoRoot()}/examples`); `selfhost`, `runtime` and `stdlib` all run
-# `test-lint-filelines` (tests/bit/lintfilelines.bit's own `dirs = ["compiler",
-# "runtime", "stdlib"]`); `runtime` also runs `test-lint-runtime` (its own
+# `${repoRoot()}/examples`); `selfhost`, `runtime`, `stdlib` and `examples` all
+# run `test-lint-filelines` (tests/bit/lintfilelines.bit's own `dirs =
+# ["compiler", "runtime", "stdlib", "tests/stress", "examples", "tests/bit",
+# "tests/imports"]` — seven directories, not three; #3128 wired up the fourth
+# bucket, `examples`, plus the three directories that never resolve to a
+# concrete bucket at all: `tests/bit/**`, `tests/imports/**`, and
+# `tests/stress/**` each run it too, added to the `testsbit_steps_for()`
+# special-case block next to test-filesize below rather than to a bucket,
+# since all three route through the shared `testsbit` bucket instead of one
+# of the five concrete areas); `runtime` also runs `test-lint-runtime` (its own
 # comment in gates.bit: "points `bit lint` at `${BIT_REPO}/runtime`");
 # `selfhost` also runs `test-selfhostcheck` (argv literally
 # `["check", "${repoRoot()}/compiler"]`); `docs` also runs `test-stdlib-docs`
@@ -446,6 +453,24 @@ testsbit_steps_for() {
         case " ${out} " in
           *" test-filesize "*) ;;
           *) out="${out:+${out} }test-filesize" ;;
+        esac
+        ;;
+    esac
+  done
+  # test-lint-filelines (#3128) scans tests/bit/, tests/imports/, and
+  # tests/stress/ too — tests/bit/lintfilelines.bit's own dirs list is
+  # ["compiler", "runtime", "stdlib", "tests/stress", "examples", "tests/bit",
+  # "tests/imports"], not just compiler/runtime/stdlib. Same shape as the
+  # test-filesize loop just above: added here rather than inside
+  # gates_for_file() so assert_dirgates_current() keeps probing the
+  # UNMODIFIED per-file mapping, and only after the loop above has already
+  # proven every file in `files` mapped successfully.
+  for f in ${files}; do
+    case "${f}" in
+      tests/bit/*|tests/imports/*|tests/stress/*)
+        case " ${out} " in
+          *" test-lint-filelines "*) ;;
+          *) out="${out:+${out} }test-lint-filelines" ;;
         esac
         ;;
     esac
@@ -849,7 +874,8 @@ case "${BUCKET}" in
     ;;
   selfhost)
     # test-lint-filelines (its own harness: dirs = ["compiler", "runtime",
-    # "stdlib"]) and test-selfhostcheck (argv literally
+    # "stdlib", "tests/stress", "examples", "tests/bit", "tests/imports"])
+    # and test-selfhostcheck (argv literally
     # ["check", "${repoRoot()}/compiler"]) both examine compiler/ content
     # directly and were missing here (#2962) — a compiler/**-only change ran
     # neither. test-selfcheck (argv literally ["selfcheck"]) was missed in
@@ -887,14 +913,16 @@ case "${BUCKET}" in
   examples)
     # test-fmt's argv literally includes "${repoRoot()}/examples" alongside
     # stdlib — missing here was the same bug this ticket exists to fix (#2962).
-    BUILD_STEPS=(test-examples test-fmt)
+    # test-lint-filelines scans examples/ too (tests/bit/lintfilelines.bit's own
+    # dirs list includes it) and was missing here the same way (#3128).
+    BUILD_STEPS=(test-examples test-fmt test-lint-filelines)
     ;;
   stdlib)
     # test-fmt's argv literally includes "${repoRoot()}/stdlib" (#2962, the
     # instance that opened this ticket — #2955 shipped unformatted
     # stdlib/tls/server.bit and this bucket stayed green). test-lint-filelines
-    # scans stdlib/ too (dirs = ["compiler", "runtime", "stdlib"] in its own
-    # harness).
+    # scans stdlib/ too (dirs = ["compiler", "runtime", "stdlib", "tests/stress",
+    # "examples", "tests/bit", "tests/imports"] in its own harness).
     BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines)
     ;;
   docs)
