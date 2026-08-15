@@ -60,6 +60,11 @@ changes the spec **in the same commit**, not afterwards.
 4. **Files stay under 800 lines** (target ~500). Split by moving top-level
    blocks into sibling `.bit` files in the same directory - not into
    subdirectories, which would make a new module.
+5. **A benchmark win keeps its baseline.** A change that improves a
+   `bench/cases/*` benchmark is not finished until the case's entry in
+   `tests/bit/benchgate/baselines.bit` is re-recorded in the same commit -
+   see [`docs/development.md`](docs/development.md)'s Testing conventions
+   section for the command and why the gate cannot do this for you.
 
 [`docs/development.md`](docs/development.md) documents the traps that a green
 build will not catch - silent line loss when splitting a file, inlining changes
