@@ -83,10 +83,22 @@
 # `test-fuzz` (BIT_FUZZ_CASES=`${repoRoot()}/tests/cases` — it mutates that
 # real corpus, not a synthetic one); every tests/bit/** file also runs
 # `test-filesize` (tests/bit/filesize.bit's own stated scope: "anywhere under
-# tests/bit/, RECURSIVELY", not just its own harness file). A gate whose file
-# set could not be determined this way (no path in its own argv/env, and no
-# gates.bit comment naming one — e.g. `test-selfcheck`, `test-version-cli`) is
-# deliberately left out rather than guessed at from its harness's full source.
+# tests/bit/, RECURSIVELY", not just its own harness file).
+#
+# `selfhost` ALSO runs `test-selfcheck` (#3127), but NOT by the argv/env rule
+# above — its argv is literally `["selfcheck"]`, no path at all, because it is
+# an in-Bit self-test compiled INTO the compiler binary from compiler/**'s own
+# backend modules (compiler/selfcheck.bit), not a harness that reads a
+# directory argument. Any compiler/** change recompiles it, so it belongs in
+# `selfhost` by construction. It was missing here for as long as #2962's own
+# audit, and #1852/#1853 both broke it — in compiler/**'s own backend
+# selectors, arm64 and x86-64 respectively — while this bucket stayed green.
+#
+# A gate whose file set could not be determined by argv/env intersection, and
+# is not (like test-selfcheck) inherently scoped to one of the five bucket
+# areas by what it compiles rather than what it reads (no gates.bit comment
+# naming a scope either — e.g. `test-version-cli`), is deliberately left out
+# rather than guessed at from its harness's full source.
 #
 # PROSE IS CLASSIFIED BY FILE TYPE, NOT PATH PREFIX (#2801): a markdown file
 # cannot change what any gate compiles or runs, so it must never select a
@@ -840,8 +852,14 @@ case "${BUCKET}" in
     # "stdlib"]) and test-selfhostcheck (argv literally
     # ["check", "${repoRoot()}/compiler"]) both examine compiler/ content
     # directly and were missing here (#2962) — a compiler/**-only change ran
-    # neither.
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck)
+    # neither. test-selfcheck (argv literally ["selfcheck"]) was missed in
+    # that same audit (#3127) — it is the compiler's own self-test over
+    # compiler/**'s backend modules, and #1852/#1853 both broke it while this
+    # bucket stayed green. The stale-name check below the case statement only
+    # rejects a listed step that no longer exists; it has no way to notice a
+    # relevant step that was never listed, which is how this stayed missing
+    # for as long as it did.
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did
