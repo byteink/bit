@@ -54,6 +54,14 @@ extern fn access(path: *u8, mode: i32): i32
 // resolves to, and it fails with `EINVAL` on everything that is not one. See
 // `rtFsIsSymlinkZ` for why that is preferred over `lstat` + `S_IFLNK`.
 extern fn readlink(path: *u8, buf: *u8, bufsize: i64): i64
+// `stat`/`lstat` (#2153): fill a `struct stat` at `buf`, following/not
+// following a trailing symlink. Both names are already admitted by the
+// compiler's libSystem membership table (`compiler/machosyms.bit`). A failed
+// call sets a POSITIVE errno reachable through `__error()` (declared further
+// down, reused by `fillStat` below via `readAllErrno()`) — unlike Linux's raw
+// syscall convention, whose failing return IS `-errno` directly.
+extern fn stat(path: *u8, buf: *u8): i32
+extern fn lstat(path: *u8, buf: *u8): i32
 
 // `close` GOES THROUGH libSystem HERE AND CARRIES A KNOWN #1436 HAZARD. Under the
 // SEED compiler (which builds this runtime today and links every user binary
@@ -111,6 +119,33 @@ let fsLinkPathBuf: [512]i64
 // rather than shared because this module cannot see it; it is `runtime/root/`'s
 // `max_path = 4096` and must move with it.
 const fsLinkMaxPath: int = 4096
+
+// The `stat`/`lstat` sink for `bit_rt_fs_stat_w`/`bit_rt_fs_lstat_w` (#2153).
+// `struct stat` on this Mac (aarch64-macos, `<sys/stat.h>`'s 64-bit-inode
+// form — the only Darwin target this runtime supports, so no `$INODE64` or
+// 32-bit-inode variant applies): `sizeof(struct stat) == 144`, measured with
+// `offsetof` via a native `clang -arch arm64` build on THIS machine, not
+// transcribed from a header by eye. 18 words = 144 bytes exactly. MODULE-LEVEL
+// and unlocked, same single-worker contract (ABI.md §5) as `fsLinkBuf` above,
+// and a scalar array so the collector never scans it (rule 1).
+let fsStatBuf: [18]i64
+const fsStatBufWords: int = 18
+
+// Field offsets inside `fsStatBuf`, from the same `offsetof` measurement:
+//   st_mode@4 (u16), st_size@96 (i64), st_mtimespec.tv_sec@48 (i64).
+// `st_mode` is the one field NOT 8-byte-aligned (a `u16` at a 4-byte
+// boundary), hence `loadU16LE` below rather than `loadWord`.
+const statModeOff: int = 4
+const statSizeOff: int = 96
+const statMtimeSecOff: int = 48
+
+// `S_IFMT`/`S_IFDIR`/`S_IFLNK` (`<sys/stat.h>`): POSIX-standard values,
+// confirmed identical on Darwin and Linux by the same measurement pass this
+// file's header describes — a real divergence between the two platform
+// copies of these three constants would be a genuine bug, not a style choice.
+const sIfmt: int = 61440 // 0o170000
+const sIfdir: int = 16384 // 0o040000
+const sIflnk: int = 40960 // 0o120000
 
 // ---------------------------------------------------------------------------
 // Pointer / string glue
@@ -404,6 +439,71 @@ export @nosplit @symbol("bit_rt_fs_is_symlink_w") fn rtFsIsSymlinkW(
     return false
   }
   return int(readlink(u8At(p), u8At(int(ptrOf(fsLinkBuf))), i64(fsLinkBufBytes))) >= 0
+}
+
+// The little-endian u16 at `addr` — `st_mode`'s width and the one `struct
+// stat` field this file reads that is not 8-byte aligned (offset 4). Same
+// byte-composition technique ../linux/fs.bit's `loadU16` uses for `dirent64`.
+@nosplit fn loadU16LE(addr: int): int {
+  return loadByte(addr) + loadByte(addr + 1) * 256
+}
+
+// Runs `stat(2)` (`follow == true`) or `lstat(2)` (`follow == false`) on the
+// already-copied C path `p`, filling `out` (5 words: size, mtime seconds,
+// mode, isDir, isSymlink — ABI.md §14) from `fsStatBuf`. Returns 0 on
+// success, or `-errno` on failure (#2153: the same "signed distance from
+// zero" convention #2343 gives the net primitives), so `std/fs` can tell a
+// missing path (`ENOENT`) from a permission error (`EACCES`) instead of a
+// flat `-1`.
+@nosplit fn fillStat(p: int, out: int, follow: bool): int {
+  let rc = 0
+  let buf = u8At(int(ptrOf(fsStatBuf)))
+  if (follow) {
+    rc = int(stat(u8At(p), buf))
+  } else {
+    rc = int(lstat(u8At(p), buf))
+  }
+  if (rc < 0) {
+    return 0 - readAllErrno()
+  }
+  let base = int(ptrOf(fsStatBuf))
+  let mode = loadU16LE(base + statModeOff)
+  storeWord(out, loadWord(base + statSizeOff))
+  storeWord(out + 8, loadWord(base + statMtimeSecOff))
+  storeWord(out + 16, mode & 4095) // low 12 bits: perm + setuid/setgid/sticky
+  let isDir = 0
+  if ((mode & sIfmt) == sIfdir) {
+    isDir = 1
+  }
+  storeWord(out + 24, isDir)
+  let isSymlink = 0
+  if ((mode & sIfmt) == sIflnk) {
+    isSymlink = 1
+  }
+  storeWord(out + 32, isSymlink)
+  return 0
+}
+
+// `bit_rt_fs_stat_w`: `stat(2)`-shaped — FOLLOWS a trailing symlink, so
+// `out`'s isSymlink word is always 0 (a followed link is indistinguishable
+// from its target). `words`/`n` are the symlink probe's word-per-byte path
+// encoding (see `rtFsIsSymlinkW` above); `out` is the caller's 5-word sink.
+export @nosplit @symbol("bit_rt_fs_stat_w") fn rtFsStatW(words: int, n: int, out: int): int {
+  let p = wordsPathZ(words, n)
+  if (p == 0) {
+    return 0 - 2 // ENOENT-shaped: same "rejected path reads as absent" contract checkedPathZ's callers already carry
+  }
+  return fillStat(p, out, true)
+}
+
+// `bit_rt_fs_lstat_w`: `lstat(2)`-shaped — does NOT follow a trailing
+// symlink, so `out`'s isSymlink word reflects `words` itself.
+export @nosplit @symbol("bit_rt_fs_lstat_w") fn rtFsLstatW(words: int, n: int, out: int): int {
+  let p = wordsPathZ(words, n)
+  if (p == 0) {
+    return 0 - 2
+  }
+  return fillStat(p, out, false)
 }
 
 // `bit_rt_fs_mkdir`: 0 on success, -1 on failure, mode 0o755.
