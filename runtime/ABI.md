@@ -1321,8 +1321,6 @@ bit_rt_fs_mkdir(path)             -> i64        // 0, or -1
 bit_rt_fs_remove(path)            -> i64        // file or empty dir; 0, or -1
 bit_rt_fs_list_dir(path)          -> string     // NUL-terminated entry names
 bit_rt_fs_is_symlink_w(words, n)  -> bool        // path is a symlink itself (readlink-based)
-bit_rt_fs_stat_w(words, n, out)   -> i64        // fills `out`, follows a trailing symlink; 0 or -errno (#2153)
-bit_rt_fs_lstat_w(words, n, out)  -> i64        // fills `out`, does not follow;             0 or -errno (#2153)
 ```
 
 The low-level layer under `std/fs`. Deliberately plain (not fallible): failures
@@ -1390,51 +1388,6 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   succeeds only on a symbolic link and needs no `struct stat` layout, so a
   dangling link still answers `true` — the link exists whether its target
   does or not.
-- `stat_w`/`lstat_w` (#2153) share `is_symlink_w`'s `words`/`n` path
-  encoding, for the identical reason — `std/fs`'s `stat`/`lstat` reach them
-  through `extern fn`, which admits no `string` (SPEC §11.7). `out` is a
-  caller-owned 5-word buffer (`ptrOf` on a Bit `[]i64(5)`) the provider fills
-  in fixed order: `size`, `mtime` (seconds since the Unix epoch), `mode` (the
-  low 12 permission bits), `isDir` (0/1), `isSymlink` (0/1). `stat_w` follows
-  a trailing symlink (`isSymlink` is therefore always 0 in its result — a
-  followed link is indistinguishable from its target); `lstat_w` does not,
-  and reports whether `words` itself is a link.
-
-  Unlike every other `bit_rt_fs_*` primitive above, a failure is **not** a
-  flat `-1`: the return is 0 on success or `-errno` on failure (`ENOENT`,
-  `EACCES`, ...), so `std/fs` can tell "no such file" from "permission
-  denied" — the convention #2343 gives the net primitives, adopted here so
-  the runtime does not grow two error-reporting styles. Darwin's `stat`/
-  `lstat` set a *positive* errno reachable through `__error()`; the provider
-  negates it. Linux's raw `syscall` already returns `-errno` directly on
-  failure (this ABI's Linux convention throughout — see `fs_exists`'s
-  `sysOpenErrno` above), so it is passed through unchanged.
-
-  **Every `struct stat` field offset was measured, not transcribed.**
-  `sizeof(struct stat)` and `offsetof` for `st_mode`/`st_size`/
-  `st_mtime(spec).tv_sec` were read with a real compiler against each
-  target's real headers rather than from memory:
-  - `aarch64-macos`: natively, `clang -arch arm64` on the build machine
-    itself (the only Darwin target this runtime supports, so no
-    `$INODE64`/32-bit-inode legacy applies) — `sizeof == 144`, `st_mode@4`
-    (`u16`, the one field not 8-byte aligned), `st_size@96`,
-    `st_mtimespec.tv_sec@48`.
-  - `x86_64-linux` / `aarch64-linux`: `docker run --rm [--platform
-    linux/amd64] gcc:latest`, since this runtime issues the raw kernel
-    syscall ABI directly (no libc), and glibc's `<sys/stat.h>` mirrors that
-    ABI exactly on both these arches (neither carries a 32-bit-inode
-    compat struct) — x86_64 `sizeof == 144`, `st_mode@24` (`u32`); aarch64
-    `sizeof == 128`, `st_mode@16` (`u32`); `st_size@48` and
-    `st_mtim.tv_sec@88` identical on both. One 144-byte buffer (the larger
-    of the two) is shared by both Linux targets' compiled objects, because
-    Bit has no arch-conditional compilation (§11.8) and both branches are
-    compiled into every Linux build regardless of which one a given binary
-    takes at run time.
-  - `S_IFMT`/`S_IFDIR`/`S_IFLNK` are POSIX-standard values, confirmed
-    identical across all three targets by the same measurement pass, and
-    the two runtime providers each carry their own copy (there is no shared
-    module between them to hold one) — a divergence between the copies
-    would be a real bug, not a style choice.
 
 **These calls block their worker's OS thread for the syscall's duration, and
 that is not a netpoller gap.** POSIX has no non-blocking read of a regular file:

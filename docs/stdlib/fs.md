@@ -129,43 +129,6 @@ fn kind(path: string): string {
 }
 ```
 
-### `FileInfo`
-
-File metadata: `size` (bytes), `mtime` (seconds since the Unix epoch), `mode`
-(the low 12 permission bits), `isDir`, `isSymlink`.
-
-### `stat(path: string): FileInfo!`
-
-Metadata for `path`, **following** a trailing symbolic link — like `isDir`
-above. The result's `isSymlink` is always `false`: a followed link is
-indistinguishable from its target. Fails if `path` does not exist or cannot
-be probed.
-
-### `lstat(path: string): FileInfo!`
-
-Metadata for `path` **itself**, not following a trailing symbolic link —
-`isSymlink`-shaped where `stat` is `isDir`-shaped. Unlike `stat`, the
-result's `isSymlink` reflects `path` itself.
-
-```bit
-import { stat, lstat, writeFile } from "std/fs"
-
-// The fast path every incremental tool needs: skip re-reading a file whose
-// size and mtime match what was recorded last time.
-fn changed(path: string, prevSize: i64, prevMtime: i64): bool! {
-  let info = stat(path)?
-  return info.size != prevSize || info.mtime != prevMtime
-}
-
-fn linkTarget(path: string): string! {
-  let info = lstat(path)?
-  if (info.isSymlink) {
-    return "symlink"
-  }
-  return "not a symlink"
-}
-```
-
 ## Directories
 
 ### `mkdir(path: string): ()!`

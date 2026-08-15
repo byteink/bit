@@ -47,12 +47,6 @@ import { fsPathZ, rtStrAlloc, rtStringSlice, rtFsReadAllFailedSet } from "../../
 // `gcSyscallBegin`/`gcSyscallEnd` are NOT imported here: ./os.bit already imports
 // them, and a sibling .bit file is the same module, so a second import is E0042.
 import { loadByte, storeByte } from "../../gc"
-// `sysStatX64`/`sysLstatX64`/`sysNewfstatatArm64` (#2153): NOT already carried
-// by ./io.bit's own large `../../syscalls` import (that list predates this
-// change), so a second import of the SAME MODULE for DIFFERENT names — the
-// same shape ../darwin/{fs,io,os}.bit already use against `../../root` — not
-// a re-import of a name already in scope, which is what E0042 actually forbids.
-import { sysStatX64, sysLstatX64, sysNewfstatatArm64 } from "../../syscalls"
 
 // `nr`, `nrWrite`, `strPtr`, `strLen` and `loadWord` are already imported/defined
 // by this module's sibling io.bit (imports and top-level decls are module-scoped
@@ -116,41 +110,6 @@ let fsLinkPathBuf: [512]i64
 // rather than shared because this module cannot see it; it is `runtime/root/`'s
 // `max_path = 4096` and must move with it.
 const fsLinkMaxPath: int = 4096
-
-// The `stat`/`lstat`/`newfstatat` sink for `bit_rt_fs_stat_w`/
-// `bit_rt_fs_lstat_w` (#2153). This is the KERNEL's `struct stat` (the raw
-// syscall ABI these calls fill directly — this file issues no libc), verified
-// via `offsetof` in a throwaway `gcc:latest` container rather than transcribed
-// from a header by eye:
-//   x86_64:  sizeof=144, st_mode@24 (u32), st_size@48, st_mtim.tv_sec@88
-//   aarch64: sizeof=128, st_mode@16 (u32), st_size@48, st_mtim.tv_sec@88
-// size/mtime offsets are identical on both arches; only `st_mode`'s offset and
-// the struct's total size differ. ONE buffer sized to the LARGER (x86_64's
-// 144 bytes) is safe on both: this file's own header rule is that the source
-// is shared between both Linux targets and each build carries the other
-// arch's branch as dead code, so the buffer must fit whichever branch a given
-// build actually takes. MODULE-LEVEL and unlocked, same single-worker
-// contract (ABI.md §5) as `fsLinkBuf`/`fsDirBuf` above, and a scalar array so
-// the collector never scans it (rule 1).
-let fsStatBuf: [18]i64
-const statSizeOff: int = 48
-const statMtimeSecOff: int = 88
-const statModeOffX64: int = 24
-const statModeOffArm64: int = 16
-
-// `AT_SYMLINK_NOFOLLOW` (`<linux/fcntl.h>`, identical on both arches): makes
-// `newfstatat` behave as `lstat` rather than `stat`. Read alongside
-// `SYS_newfstatat` in the same container pass this file's `sysNewfstatatArm64`
-// import documents.
-const atSymlinkNofollow: int = 256
-
-// `S_IFMT`/`S_IFDIR`/`S_IFLNK` (`<bits/stat.h>`): POSIX-standard values,
-// confirmed identical to ../darwin/fs.bit's copy by the same measurement pass
-// — a real divergence between the two platform copies would be a genuine bug,
-// not a style choice.
-const sIfmt: int = 61440 // 0o170000
-const sIfdir: int = 16384 // 0o040000
-const sIflnk: int = 40960 // 0o120000
 
 // ---------------------------------------------------------------------------
 // String glue: a string object's inline byte pointer and length (ABI.md §2).
@@ -521,78 +480,6 @@ export @nosplit @symbol("bit_rt_fs_is_symlink_w") fn rtFsIsSymlinkW(
     rc = int(syscall(sysReadlinkatArm64(), i64(atFdCwd), i64(p), i64(buf), i64(fsLinkBufBytes)))
   }
   return rc >= 0
-}
-
-// Runs `stat(2)`/`newfstatat` (`follow == true`) or `lstat(2)`/
-// `newfstatat(AT_SYMLINK_NOFOLLOW)` (`follow == false`) on the already-copied
-// C path `p`, filling `out` (5 words: size, mtime seconds, mode, isDir,
-// isSymlink — ABI.md §14) from `fsStatBuf`. x86_64 has bare `stat`/`lstat`;
-// aarch64 has neither and uses `newfstatat`, the file's standing per-arch
-// rule (`rtFsMkdir` etc. below already split the same way). Returns 0 on
-// success; a raw syscall failure on Linux IS `-errno` directly (this file's
-// header), so it is returned as-is — the same "signed distance from zero"
-// convention #2343 gives the net primitives (#2153), letting `std/fs` tell a
-// missing path (`ENOENT`) from a permission error (`EACCES`) apart.
-@nosplit fn fillStat(p: int, out: int, follow: bool): int {
-  let buf = int(ptrOf(fsStatBuf))
-  let rc = 0
-  if (isX64()) {
-    if (follow) {
-      rc = int(syscall(sysStatX64(), i64(p), i64(buf)))
-    } else {
-      rc = int(syscall(sysLstatX64(), i64(p), i64(buf)))
-    }
-  } else {
-    let flags = 0
-    if (!follow) {
-      flags = atSymlinkNofollow
-    }
-    rc = int(syscall(sysNewfstatatArm64(), i64(atFdCwd), i64(p), i64(buf), i64(flags)))
-  }
-  if (rc < 0) {
-    return rc
-  }
-  let modeOff = statModeOffX64
-  if (!isX64()) {
-    modeOff = statModeOffArm64
-  }
-  let mode = loadWord(buf + modeOff) & 4294967295 // low 32 bits: u32 st_mode
-  storeWord(out, loadWord(buf + statSizeOff))
-  storeWord(out + 8, loadWord(buf + statMtimeSecOff))
-  storeWord(out + 16, mode & 4095) // low 12 bits: perm + setuid/setgid/sticky
-  let isDir = 0
-  if ((mode & sIfmt) == sIfdir) {
-    isDir = 1
-  }
-  storeWord(out + 24, isDir)
-  let isSymlink = 0
-  if ((mode & sIfmt) == sIflnk) {
-    isSymlink = 1
-  }
-  storeWord(out + 32, isSymlink)
-  return 0
-}
-
-// `bit_rt_fs_stat_w`: `stat(2)`-shaped — FOLLOWS a trailing symlink, so
-// `out`'s isSymlink word is always 0 (a followed link is indistinguishable
-// from its target). `words`/`n` are the symlink probe's word-per-byte path
-// encoding (see `rtFsIsSymlinkW` above); `out` is the caller's 5-word sink.
-export @nosplit @symbol("bit_rt_fs_stat_w") fn rtFsStatW(words: int, n: int, out: int): int {
-  let p = wordsPathZ(words, n)
-  if (p == 0) {
-    return errnoNoEnt // rejected path (too long / embedded NUL) reads as absent, same contract checkedPathZ's callers already carry
-  }
-  return fillStat(p, out, true)
-}
-
-// `bit_rt_fs_lstat_w`: `lstat(2)`-shaped — does NOT follow a trailing
-// symlink, so `out`'s isSymlink word reflects `words` itself.
-export @nosplit @symbol("bit_rt_fs_lstat_w") fn rtFsLstatW(words: int, n: int, out: int): int {
-  let p = wordsPathZ(words, n)
-  if (p == 0) {
-    return errnoNoEnt
-  }
-  return fillStat(p, out, false)
 }
 
 // `bit_rt_fs_mkdir`: 0 on success, -1 on failure (including "already exists").
