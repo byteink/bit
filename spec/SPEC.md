@@ -2257,7 +2257,8 @@ each operation, not to the location as a whole.
 
 ```
 match_stmt  = "match" "(" expression ")" "{" { match_arm [ "," | ";" ] } "}" .
-match_arm   = variant_pat "=>" ( statement | expression ) .
+match_arm   = variant_pat "=>" ( statement | expression )
+            | "_" "=>" ( statement | expression ) .
 variant_pat = IDENT [ "(" IDENT { "," IDENT } ")" ] .   (* name + payload binders *)
 ```
 
@@ -2267,14 +2268,32 @@ body when the value is that variant. A payload variant's arm binds its payload:
 `Circle(r) => …` binds `r` to the `f64` inside; the binder count must match the
 variant's payload arity. A `match` is:
 
-- **Exhaustive** — every variant of the enum must have an arm; a missing variant
-  is a compile error (`E0071`). This is `match`'s central guarantee: adding a
-  variant to an enum turns every `match` that forgot it into a compile error.
+- **Exhaustive** — every variant of the enum must have an arm, or the arms
+  that do not name one are covered by a trailing `_` (below); a missing
+  variant with no `_` is a compile error (`E0071`). This is `match`'s central
+  guarantee: adding a variant to an enum turns every `match` that forgot it —
+  and did not write `_` — into a compile error.
 - **Non-overlapping** — a variant may appear in at most one arm (a duplicate is
   a compile error).
 
 Arms do not fall through. `break`/`continue` inside an arm target the enclosing
 loop, not the `match`.
+
+**Wildcard arm.** `_` matches any variant the earlier arms did not already
+name — the same escape from exhaustiveness `switch`'s `default` gives a
+`switch`, for a `match` over a wide enum that only cares about a few variants.
+It binds nothing: there is no payload to name, so `_(a, b)` is rejected the
+same way any other unknown variant is (`_` can never be a real variant name).
+Two rules keep it from weakening exhaustiveness for matches that do not need
+it:
+
+- It must be the **last** arm (`E0100`); it cannot be followed by a named
+  variant arm.
+- It is rejected when it discharges nothing — a `match` that already names
+  every variant (`E0101`). Accepting a no-op `_` there would silently disable
+  `E0071` for that `match` forever: the next variant added to the enum would
+  fall into the redundant `_` instead of raising a diagnostic. `_` trades
+  exhaustiveness only for the variants it actually covers, never for free.
 
 `match` is both a **statement** and an **expression**. In statement position each
 arm body is a statement (a block or a single statement). In expression position
@@ -3351,7 +3370,8 @@ switch_stmt   = "switch" [ "(" expression ")" ] "{" { switch_case } "}" .
 switch_case   = "case" expression { "," expression } ":" { statement ";" }
               | "default" ":" { statement ";" } .
 match_stmt    = "match" "(" expression ")" "{" { match_arm [ "," | ";" ] } "}" .
-match_arm     = variant_pat "=>" ( statement | expression ) .
+match_arm     = variant_pat "=>" ( statement | expression )
+              | "_" "=>" ( statement | expression ) .        (* §13.8 *)
 variant_pat   = IDENT [ "(" IDENT { "," IDENT } ")" ] .   (* name + payload binders; §13.8 *)
 select_stmt   = "select" "{" { comm_clause } "}" .
 comm_clause   = "case" ( send_stmt | recv_bind ) ":" { statement ";" }
