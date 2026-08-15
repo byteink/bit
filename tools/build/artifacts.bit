@@ -109,6 +109,14 @@ fn trimNewline(s: string): string {
 //
 // So both are folded in: the pin, and — when set — the bytes of the overriding
 // binary itself.
+//
+// A third input, `BIT_LIBBITRT_TREE` (#3054, #3117): when set, `libbitrt.a` is
+// compiled by THIS TREE's own self-hosted compiler rather than stage0, so
+// `compiler/**` now decides the archive's bytes too — the exact reason it is
+// otherwise excluded (see `compilerHash()` below) stops holding. Folding it in
+// only under the flag keeps the default fingerprint, and therefore the default
+// archive, byte-for-byte unchanged; this is the same stale-archive shape
+// `fingerprint()` already guards for `BIT_STAGE0_BIN` (#1863).
 fn fingerprint(): string {
   let h = newSha256()
   h.write(bytes("v1\n"))
@@ -118,6 +126,11 @@ fn fingerprint(): string {
   if (override != "") {
     h.write(bytes("override:" + override + "\n"))
     hashOne(h, override)
+  }
+  let tree = env("BIT_LIBBITRT_TREE")
+  if (tree != "") {
+    h.write(bytes("tree:" + tree + "\n"))
+    hashPathList(h, walkBit("compiler"))
   }
   return encodeHex(h.sum())
 }
@@ -259,6 +272,9 @@ fn stepLibbitrt(stage0: string): (int, bool) {
     print("make:   up to date (fingerprint ${fp[:12]})\n")
     return 0, false
   }
+  if (env("BIT_LIBBITRT_TREE") != "") {
+    return stepLibbitrtTree(stage0, fp)
+  }
   for t of targets() {
     print("make:   ${t}\n")
     let scratch = "bit-out/make/libbitrt-${t}.a"
@@ -272,6 +288,86 @@ fn stepLibbitrt(stage0: string): (int, bool) {
     let rc = runShell("libbitrt-${t}", script, buildTimeoutMs())
     if (rc != 0) {
       eprint("make: libbitrt ${t} failed (${rc})\n")
+      return 1, true
+    }
+  }
+  writeStamp(stampPath(), fp)
+  return 0, true
+}
+
+// BIT_LIBBITRT_TREE=1 opt-in (#3054, #3117): forces `libbitrt.a` to be
+// compiled by THIS TREE's own self-hosted compiler instead of the pinned
+// stage0, so a backend codegen fix (e.g. #1852/#1853/#3104/#3105/#3107)
+// reaches the GC/allocator/slice/string code the runtime benchmarks spend
+// most of their time in — normally frozen at whatever stage0 already emitted
+// (see docs/development.md's "Does ./make libbitrt build runtime/** with the
+// tree compiler?"). Note precisely what this does and does not change: a
+// *source* edit to runtime/** already takes effect under the default,
+// stage0-built path too, because stage0 re-reads the current tree's source
+// on every build. Only *codegen quality* — the machine code emitted for that
+// source — depends on which compiler built the archive.
+//
+// Mirrors dist/release.sh's L0/bit1/L1 shape (dist/release.sh:106-202) but
+// self-contained and scratch-only, never touching bit-out/bin/bit (the real
+// `./make selfhost` output) or performing any release packaging:
+//   L0   — one archive, HOST TRIPLE ONLY, built by stage0. All that's needed
+//          to link a host-native compiler; the non-host L0 archives release.sh
+//          builds are never consumed before being overwritten by L1, so this
+//          skips building them at all.
+//   bit1 — a throwaway host-native self-hosted compiler, built by stage0,
+//          linking L0.
+//   L1   — the real archive, all three targets, built by bit1 (this tree's
+//          own codegen) via the same scripts/g2archive.sh recipe stepLibbitrt
+//          already uses, written to the same bit-out/lib/<target>/libbitrt.a
+//          destination as the default path.
+//
+// If a tree-built archive cannot boot, `BIT_STAGE0_BIN` (docs/development.md,
+// #3118 tracks its own missing coverage) is the documented recovery: unset
+// BIT_LIBBITRT_TREE and rebuild to fall back to the pinned-stage0 archive.
+fn stepLibbitrtTree(stage0: string, fp: string): (int, bool) {
+  let host = hostTriple()
+  if (host == "unsupported") {
+    eprint("make: unsupported host for BIT_LIBBITRT_TREE\n")
+    return 1, true
+  }
+  print("make:   BIT_LIBBITRT_TREE=1 — bootstrapping libbitrt.a with the tree compiler\n")
+
+  print("make:   L0 ${host} (stage0-built, scratch)\n")
+  let l0 = "bit-out/make/libbitrt-tree-l0.a"
+  let l0Script = "set -e\n" +
+    "BIT=" + shQuote(stage0) + "\nexport BIT\n" +
+    "rm -f " + shQuote(l0) + "\n" +
+    "bash scripts/g2archive.sh " + shQuote(host) + " " + shQuote(l0) + "\n"
+  let rc0 = runShell("libbitrt-tree-l0", l0Script, buildTimeoutMs())
+  if (rc0 != 0) {
+    eprint("make: BIT_LIBBITRT_TREE L0 bootstrap failed (${rc0})\n")
+    return 1, true
+  }
+
+  print("make:   bit1 (throwaway host compiler, scratch)\n")
+  let bit1 = "bit-out/make/bit1-tree"
+  let bit1Script = "set -e\n" +
+    "BIT_LIBBITRT=" + shQuote(l0) + "\nexport BIT_LIBBITRT\n" +
+    shQuote(stage0) + " build compiler -o " + shQuote(bit1) + "\n"
+  let rc1 = runShell("libbitrt-tree-bit1", bit1Script, buildTimeoutMs())
+  if (rc1 != 0) {
+    eprint("make: BIT_LIBBITRT_TREE bit1 bootstrap failed (${rc1})\n")
+    return 1, true
+  }
+
+  for t of targets() {
+    print("make:   ${t} (tree-built, L1)\n")
+    let scratch = "bit-out/make/libbitrt-${t}.a"
+    let dest = "${outDir()}/lib/${t}"
+    let script = "set -e\n" +
+      "BIT=" + shQuote(bit1) + "\nexport BIT\n" +
+      "rm -f " + shQuote(scratch) + "\n" +
+      "bash scripts/g2archive.sh " + shQuote(t) + " " + shQuote(scratch) + "\n" +
+      "mkdir -p " + shQuote(dest) + "\n" +
+      "cp " + shQuote(scratch) + " " + shQuote(dest + "/libbitrt.a") + "\n"
+    let rc = runShell("libbitrt-${t}", script, buildTimeoutMs())
+    if (rc != 0) {
+      eprint("make: libbitrt ${t} (tree) failed (${rc})\n")
       return 1, true
     }
   }
