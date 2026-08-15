@@ -1,10 +1,11 @@
 // Benchmark regression gate (#2931): builds and runs bench/cases/{collatz,
-// mandelbrot,fib,alloc,churn} with the compiler under test and fails when
-// either peak RSS or user CPU time regresses past 1.5x a baseline recorded
-// below. "churn" (#2978) is a leak guard, not a speed benchmark: a live set
-// of one object allocated 4,000,000 times, run with BIT_GC_MIN_KB pinned via
-// Baseline.gcMinKb -- see runtime/gc/gcindex.bit's idxGrow (#2756/#2922) for
-// the bug this catches.
+// mandelbrot,fib,alloc,churn,json,map,matrix,sort,strings} with the compiler
+// under test and fails when peak RSS or user CPU time regresses past 1.5x a
+// baseline recorded below, OR when allocated object count leaves a TWO-SIDED
+// band (#3130, see "WHY OBJECT COUNT IS TWO-SIDED" below). "churn" (#2978) is
+// a leak guard, not a speed benchmark: a live set of one object allocated
+// 4,000,000 times, run with BIT_GC_MIN_KB pinned via Baseline.gcMinKb -- see
+// runtime/gc/gcindex.bit's idxGrow (#2756/#2922) for the bug this catches.
 //
 // WHY THIS EXISTS. docs/perf-regression-rca.md records a 4-5x compute
 // regression and an 18x peak-RSS regression that shipped across many
@@ -44,6 +45,29 @@
 // this per case via Baseline.cpuCeilingPct — fib does (#2982), because its
 // baseline is small enough in absolute terms that 1.5x cannot absorb real
 // multi-agent scheduling noise; see fib's own baseline-table comment.
+//
+// WHY OBJECT COUNT IS TWO-SIDED (#3130), UNLIKE RSS/CPU ABOVE. The 1.5x bar
+// above is deliberately one-directional because RSS and CPU are noisy: a
+// benchmark that gets faster or leaner can only pass more easily, and that
+// is correct, but it also means the gate protects yesterday's slow number
+// forever — a later regression back to it still passes. Allocated object
+// count (`swept+live` from `BIT_GC_STATS=1`, see measureScript's header
+// below) has no such noise: it is EXACTLY deterministic, the same binary
+// reporting the identical count on every run — verified 5x on every one of
+// this file's 10 macOS/arm64 cases (#3130's ticket comment has all 15+
+// readings). Determinism is what makes a TWO-SIDED band sound: failing past
+// 1.05x (objCeiling) catches a regression the same way 1.5x does above, and
+// failing below 0.5x (objFloor) catches an IMPROVEMENT that landed with no
+// baseline update, which is the ratchet's whole point — a benchmark that
+// gets leaner must have Baseline.objects re-recorded, not silently protect
+// the old, higher number. Gate on objects, never on `collections`: the
+// collection count depends on WHEN the trigger fires, which depends on live
+// bytes, which #2941 currently inflates 8x — gating on it would produce
+// exactly the flaky red that gets gates disabled. An absent or malformed
+// `BIT_GC_STATS` line is a hard FAIL, never a pass (runCase's `m.objects < 0`
+// check) — the line prints once, on the child's OWN stderr, only at a clean
+// exit, so killing the process or discarding its stderr both produce
+// nothing, and nothing must never parse as zero.
 //
 // WHY OUTPUTS ARE ASSERTED TOO. A benchmark that returns the wrong answer
 // quickly is exactly the failure mode a pure-timing gate cannot see, so
@@ -106,6 +130,32 @@ fn ceiling(baseline: int): int {
 // as ceiling() above.
 fn cpuCeiling(b: Baseline): int {
   return b.cpuCentis * b.cpuCeilingPct / 100
+}
+
+// Object-count band (#3130), TWO-SIDED unlike ceiling()/cpuCeiling() above.
+// Allocated object count (swept+live read from one BIT_GC_STATS=1 run, see
+// gcObjects() below) is EXACTLY deterministic — the same binary reports the
+// identical count on every run, verified 5x on every one of the 10
+// macOS/arm64 cases (pasted in #3130's ticket comment) — so this guard can
+// fail in BOTH directions. Past 1.05x (objCeiling) catches a regression the
+// same way ceiling() does; below 0.5x (objFloor) catches an IMPROVEMENT that
+// was never recorded as a new baseline, which is the reason #3130 exists: a
+// benchmark that gets leaner must have Baseline.objects updated, not
+// silently protect the old, slower number forever. Baseline.objects == -1
+// means "not measured on this platform" (see its field comment in
+// baselines.bit) — the band check is skipped for that case, but the GC
+// stats line itself is still required unconditionally; see runCase's use of
+// gcObjects() below for why a missing or malformed line is always a hard
+// fail regardless of whether a numeric baseline is on file.
+const objCeilPct: int = 105
+const objFloorPct: int = 50
+
+fn objCeiling(baseline: int): int {
+  return baseline * objCeilPct / 100
+}
+
+fn objFloor(baseline: int): int {
+  return baseline * objFloorPct / 100
 }
 
 // Generous per-subprocess bound; every case finishes in under 3s and this
@@ -211,21 +261,44 @@ fn buildScript(
 // the thing that failed, not "the wrapper script", and non-zero there is
 // treated as a hard failure by the caller.
 //
-// Result file format: one line, three space-separated decimals —
-// "<benchmark exit code> <user CPU centiseconds> <peak RSS bytes>" — with -1
-// standing in for "not measured" on either metric, never a silent 0 (the
-// same convention tests/bit/lspcache.bit's `intAfter` uses).
+// Result file format: one line, FOUR space-separated decimals —
+// "<benchmark exit code> <user CPU centiseconds> <peak RSS bytes> <allocated
+// objects>" — with -1 standing in for "not measured" on any of the three
+// metrics, never a silent 0 (the same convention tests/bit/lspcache.bit's
+// `intAfter` uses). The 4th field is `swept+live` parsed out of the child's
+// own `BIT_GC_STATS=1` exit-summary line (#3130) — see runtime/root's
+// `statsReport` for the line's exact grammar and
+// tests/bit/lspcache.bit's header for why `swept+live` is "every object the
+// run allocated" and `collections` is not what this gate reads (it depends
+// on when the trigger fires, which depends on live bytes — see #2941).
 fn measureScript(bin: string, outPath: string, resPath: string, gcMinKb: int): string {
   let rawPath = resPath + ".raw"
+  let gcPath = resPath + ".gcerr"
+  // `swept=`/`live=` extraction shared (as an awk fragment) by both platform
+  // branches below: scan every whitespace-separated field of a captured
+  // stream for the two `key=value` tokens (unambiguous — nothing else either
+  // platform captures produces a field starting with either prefix) and hold
+  // their sum in `obj`, or -1 if the line never arrived. `sub()`'s
+  // replacement is `""` so this needs no `[`/`]` escaping — no anchor on
+  // `[bit-gc]` itself is needed either.
+  let gcAwkBody = "sw=-1;lv=-1} /swept=/{for(i=1;i<=NF;i++){" +
+    "if($i~/^swept=/){t=$i;sub(/^swept=/,\"\",t);sw=t} " +
+    "if($i~/^live=/){t=$i;sub(/^live=/,\"\",t);lv=t}}} "
   let s = "#!/bin/sh\n"
   // Exported before the platform dispatch below so it reaches the benchmark
   // child on either branch. 0 means "leave BIT_GC_MIN_KB unset" (see the
-  // Baseline.gcMinKb field comment).
+  // Baseline.gcMinKb field comment). BIT_GC_STATS=1 is unconditional — every
+  // case needs an object-count reading now, not just churn's leak guard.
   if (gcMinKb > 0) {
     s = s + "BIT_GC_MIN_KB=${gcMinKb}\nexport BIT_GC_MIN_KB\n"
   }
+  s = s + "BIT_GC_STATS=1\nexport BIT_GC_STATS\n"
   s = s + "case \"$(uname -s)\" in\n"
   s = s + "  Darwin)\n"
+  // The child inherits fd 2 from this redirect, same as before #3130 — its
+  // own `[bit-gc] ...` line and `/usr/bin/time -l`'s summary both land in
+  // rawPath, in that order (the child exits and is reaped before `time`
+  // appends its own report), so no second capture file is needed here.
   s = s +
     "    /usr/bin/time -l " +
     shQuote(bin) +
@@ -237,10 +310,15 @@ fn measureScript(bin: string, outPath: string, resPath: string, gcMinKb: int): s
   s = s + "    ec=$?\n"
   // `/usr/bin/time -l`'s first line is fixed-format: "<real> real <user> user
   // <sys> sys", so the user-seconds value is always field 3 of the line
-  // matching " user". `(u*100)+0.5` rounds to the nearest centisecond.
+  // matching " user". `(u*100)+0.5` rounds to the nearest centisecond. The
+  // same pass folds in the `swept=`/`live=` scan above (rawPath already
+  // holds the child's own stderr ahead of `time`'s own report — see the
+  // comment on the redirect above) so ONE awk call produces all four fields.
   s = s +
-    "    awk -v ec=$ec 'BEGIN{u=-1;r=-1} / user/{u=$3} " +
-    "/maximum resident set size/{r=$1} END{printf \"%d %d %d\\n\", ec, (u*100)+0.5, r}' " +
+    "    awk -v ec=$ec 'BEGIN{u=-1;r=-1;" + gcAwkBody +
+    "/ user/{u=$3} /maximum resident set size/{r=$1} " +
+    "END{obj=-1; if (sw>=0 && lv>=0) obj=sw+lv; " +
+    "printf \"%d %d %d %d\\n\", ec, (u*100)+0.5, r, obj}' " +
     shQuote(rawPath) +
     " > " +
     shQuote(resPath) +
@@ -248,7 +326,7 @@ fn measureScript(bin: string, outPath: string, resPath: string, gcMinKb: int): s
   s = s + "    exit $ec\n"
   s = s + "    ;;\n"
   s = s + "  *)\n"
-  s = s + "    " + shQuote(bin) + " >" + shQuote(outPath) + " &\n"
+  s = s + "    " + shQuote(bin) + " >" + shQuote(outPath) + " 2>" + shQuote(gcPath) + " &\n"
   s = s + "    pid=$!\n"
   s = s + "    cpu=-1\n"
   s = s + "    hwm=-1\n"
@@ -280,7 +358,14 @@ fn measureScript(bin: string, outPath: string, resPath: string, gcMinKb: int): s
   s = s + "    rssB=-1\n"
   s = s + "    if [ $cpu -ge 0 ]; then cpuCs=$((cpu * 100 / CLK)); fi\n"
   s = s + "    if [ $hwm -ge 0 ]; then rssB=$((hwm * 1024)); fi\n"
-  s = s + "    printf \"%d %d %d\\n\" $ec $cpuCs $rssB > " + shQuote(resPath) + "\n"
+  // gcPath is the child's OWN stderr, captured separately above (Linux has no
+  // `/usr/bin/time -l` merging it in for us the way the Darwin branch gets
+  // for free) — same `swept=`/`live=` scan, different source file.
+  s = s +
+    "    obj=$(awk 'BEGIN{" + gcAwkBody +
+    "END{if (sw>=0 && lv>=0) print sw+lv; else print -1}' " +
+    shQuote(gcPath) + ")\n"
+  s = s + "    printf \"%d %d %d %d\\n\" $ec $cpuCs $rssB $obj > " + shQuote(resPath) + "\n"
   s = s + "    exit $ec\n"
   s = s + "    ;;\n"
   s = s + "esac\n"
@@ -292,6 +377,7 @@ struct Measured {
   exitCode: int,
   cpuCentis: int,
   rssBytes: int,
+  objects: int,
   out: string,
 }
 
@@ -309,19 +395,22 @@ fn trimTrailingNl(s: string): string {
 
 fn parseMeasured(resText: string, outText: string): Measured {
   let parts = split(trimSpace(trimTrailingNl(resText)), " ")
-  if (len(parts) != 3) {
-    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, out: outText }
+  if (len(parts) != 4) {
+    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, out: outText }
   }
   let ec = parseInt(parts[0]) catch _ {
-    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, out: outText }
+    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, out: outText }
   }
   let cpu = parseInt(parts[1]) catch _ {
-    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, out: outText }
+    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, out: outText }
   }
   let rss = parseInt(parts[2]) catch _ {
-    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, out: outText }
+    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, out: outText }
   }
-  return Measured{ ok: true, exitCode: ec, cpuCentis: cpu, rssBytes: rss, out: outText }
+  let obj = parseInt(parts[3]) catch _ {
+    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, out: outText }
+  }
+  return Measured{ ok: true, exitCode: ec, cpuCentis: cpu, rssBytes: rss, objects: obj, out: outText }
 }
 
 // --- tally -----------------------------------------------------------------
@@ -381,6 +470,7 @@ fn runCase(
   // tests/bit/schedbench.bit's `benchTrials` uses.
   let minCpu = 1000000000
   let minRss = 1000000000
+  let minObj = 1000000000
   let sawOne = false
 
   let rep = 0
@@ -424,10 +514,18 @@ fn runCase(
       rep = rep + 1
       continue
     }
-    if (m.cpuCentis < 0 || m.rssBytes < 0) {
+    // objects < 0 covers both a malformed result line AND a missing/absent
+    // `BIT_GC_STATS` line (measureScript's awk prints -1 in either case,
+    // never a silent 0) — this must be a hard fail unconditionally, even for
+    // a case whose Baseline.objects is itself -1 ("not measured on this
+    // platform"): a case with no recorded band still needs the underlying
+    // instrumentation working, or a future re-baseline would read garbage.
+    if (m.cpuCentis < 0 || m.rssBytes < 0 || m.objects < 0) {
       markFail(
         t,
-        "${b.name} rep ${rep}: measurement unavailable (cpu=${m.cpuCentis} rss=${m.rssBytes})",
+        "${b.name} rep ${rep}: measurement unavailable (cpu=${m.cpuCentis} " +
+        "rss=${m.rssBytes} obj=${m.objects}) — a -1 here can mean the " +
+        "BIT_GC_STATS line was missing or unparseable; never treat it as 0",
       )
       rep = rep + 1
       continue
@@ -443,6 +541,7 @@ fn runCase(
     }
     minCpu = minInt(minCpu, m.cpuCentis)
     minRss = minInt(minRss, m.rssBytes)
+    minObj = minInt(minObj, m.objects)
     sawOne = true
     rep = rep + 1
   }
@@ -456,11 +555,18 @@ fn runCase(
   // 1.5x — see cpuCeiling()'s and Baseline.cpuCeilingPct's comments above.
   let cpuCeil = cpuCeiling(b)
   let rssCeil = ceiling(b.rssBytes)
+  // objects is TWO-SIDED (#3130) — see objCeiling()/objFloor()'s comment
+  // above. Baseline.objects == -1 means "not measured on this platform"; the
+  // two checks below are then both skipped, but the -1 check earlier in
+  // this function already required the stats line to be present regardless.
+  let objCeil = objCeiling(b.objects)
+  let objFlr = objFloor(b.objects)
   // Printed unconditionally, pass or fail, so a slow drift toward the
   // ceiling is visible in the suite log before it ever trips (#2931).
   print(
       "benchgate: ${b.name} cpu=${minCpu}cs (baseline ${b.cpuCentis}cs, ceiling ${cpuCeil}cs) " +
-      "rss=${minRss}B (baseline ${b.rssBytes}B, ceiling ${rssCeil}B)\n",
+      "rss=${minRss}B (baseline ${b.rssBytes}B, ceiling ${rssCeil}B) " +
+      "obj=${minObj} (baseline ${b.objects}, floor ${objFlr}, ceiling ${objCeil})\n",
   )
 
   if (minCpu > cpuCeil) {
@@ -475,6 +581,22 @@ fn runCase(
       t,
         "${b.name} peak RSS regressed: ${minRss}B (min of ${reps}), " +
         "baseline ${b.rssBytes}B, ceiling ${rssCeil}B (150%)",
+    )
+  }
+  if (b.objects >= 0 && minObj > objCeil) {
+    markFail(
+      t,
+        "${b.name} object count regressed: ${minObj} (min of ${reps}), " +
+        "baseline ${b.objects}, ceiling ${objCeil} (${objCeilPct}%)",
+    )
+  }
+  if (b.objects >= 0 && minObj < objFlr) {
+    markFail(
+      t,
+        "${b.name} object count fell below floor — an unrecorded improvement: " +
+        "${minObj} (min of ${reps}), baseline ${b.objects}, floor ${objFlr} " +
+        "(${objFloorPct}%) — re-measure and update Baseline.objects in " +
+        "tests/bit/benchgate/baselines.bit if this is real",
     )
   }
   t.checks = t.checks + 1
@@ -530,5 +652,5 @@ fn main() {
     println("benchgate: FAIL — ${t.failures} problem(s) across ${t.checks} case(s)")
     exit(1)
   }
-  println("benchgate: PASS — ${t.checks} case(s) within 1.5x of baseline")
+  println("benchgate: PASS — ${t.checks} case(s) within their RSS/CPU/object baselines")
 }
