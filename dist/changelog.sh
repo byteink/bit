@@ -138,16 +138,20 @@ CLASSIFICATION="$(git log --no-merges --reverse --name-only --pretty=format:'@@C
 # CLASSIFICATION, then hand out one category at a time the same way `take`
 # does: BODY is claimed and removed from REMAINING, so a commit can only ever
 # land in the one section its file counts picked.
-TAGGED="$(printf '%s\n' "${REMAINING}" | awk -F'|' -v map="${CLASSIFICATION}" '
-  BEGIN {
-    n = split(map, lines, "\n")
-    for (i = 1; i <= n; i++) {
-      split(lines[i], kv, "\t")
-      sha2cat[kv[1]] = kv[2]
-    }
+#
+# CLASSIFICATION and REMAINING are joined as two FILES (via process
+# substitution), not by handing CLASSIFICATION to awk through `-v`: macOS's
+# /usr/bin/awk (the one-true-awk, not gawk) rejects a raw newline inside a
+# `-v` value with "newline in string ... at source line 1", and
+# CLASSIFICATION is exactly that — a multi-line sha->category table.
+TAGGED="$(awk -F'\t' '
+  FNR==NR { sha2cat[$1] = $2; next }
+  {
+    line = $0
+    if (match(line, /\|[^|]*$/)) { sha = substr(line, RSTART + 1) } else { sha = line }
+    print sha2cat[sha] "\t" line
   }
-  { print sha2cat[$NF] "\t" $0 }
-')"
+' <(printf '%s\n' "${CLASSIFICATION}") <(printf '%s\n' "${REMAINING}"))"
 
 by_category() {
   local cat="$1"
