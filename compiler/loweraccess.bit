@@ -191,21 +191,37 @@ fn emitMapGet(fc: FnCtx, valTy: int, m: int, key: int, onMiss: MapGetMiss): int 
   return builderAddParam(fc.b, valTy)
 }
 
-// `xs[i]` on a slice, emitted INLINE instead of as `rt_call slice_get` (#3107).
+// The element address of an inline `xs[i]`, once the bounds test has passed:
+// `buf` is the buffer base and `slot` the element's WORD INDEX within it
+// (`off + index`), so the element lives at `buf + slot * 8`.
+struct SliceElem {
+  buf: int,
+  slot: int,
+}
+
+// The shared front half of an inline slice element access — the bounds test, the
+// out-of-line panic, and the element address — for BOTH the read (#3107,
+// `emitInlineSliceGet`) and the write (#3108, `emitInlineSliceSet`). Each of
+// those is this plus one final load or store. It is one function on purpose: a
+// bounds test or an offset computation that drifted between the two paths would
+// be a memory-safety hole on whichever side lost it, and nothing downstream
+// would notice — `index_get`/`index_set` are raw word addressing.
 //
-// WHY. `bit_rt_slice_get` (runtime/root/slices.bit:252) is 190 instructions, 146
-// of them on the in-bounds path — 78 `mov`, 24 prologue/epilogue, and a
-// `runtime/gc/mem.bit` `wordAt` pointer round-trip — for what C does in two. It
-// is the hottest symbol in the language, and #3102 measured element access at
-// 90.4% of the matrix benchmark's runtime. This reproduces its semantics
-// verbatim at the call site; the runtime entry point stays exported (ABI.md §2)
-// for out-of-tree callers.
+// WHY INLINE AT ALL. `bit_rt_slice_get` (runtime/root/slices.bit:252) is 190
+// instructions, 146 of them on the in-bounds path — 78 `mov`, 24
+// prologue/epilogue, and a `runtime/gc/mem.bit` `wordAt` pointer round-trip —
+// for what C does in two, and `bit_rt_slice_set` is 193/151 for the same
+// reasons. They are the hottest symbols in the language, and #3102 measured
+// element access at 90.4% of the matrix benchmark's runtime. This reproduces
+// their semantics verbatim at the call site; both runtime entry points stay
+// exported (ABI.md §2) for out-of-tree callers.
 //
-// THE SEMANTICS, from runtime/root/slices.bit:253-267:
+// THE SEMANTICS, from runtime/root/slices.bit:253-267 (`rtSliceGet`) and
+// :296-309 (`rtSliceSet`), which differ only in the last line:
 //
 //   h == 0                      -> panic "index out of range"
 //   index < 0 || index >= h.len -> panic "index out of range"
-//   result = load(h.buf + (h.off + index) * 8)
+//   addr = h.buf + (h.off + index) * 8
 //
 // THE NULL HEADER NEEDS NO SEPARATE TEST. A zeroed struct's slice field is the
 // null word (#1564), and `slice_len` already reads a null header as 0 — both
@@ -226,23 +242,41 @@ fn emitMapGet(fc: FnCtx, valTy: int, m: int, key: int, onMiss: MapGetMiss): int 
 // THE PANIC STAYS OUT OF LINE, in a block that ends in `unreachable`. #2014
 // measured what happens otherwise: materialising the message words inside the
 // hot function took the saved-register set from x29/x30 to x19-x27 and cost +8%
-// on a pure-index loop. The message text is `bit_rt_slice_get`'s own, so an
-// out-of-range read still exits 2 with `panic: index out of range`.
+// on a pure-index loop. The message text is the runtime's own, so an
+// out-of-range access still exits 2 with `panic: index out of range`.
 //
 // THE GC HAZARD, AND WHY THIS IS SAFE. `buf` is a GC-managed pointer, and once
 // it lives in a vreg the collector can no longer find it through the header: it
 // is an `i64` here, so no stack map describes it (ABI.md §4). What makes that
 // sound is that `buf`'s LIVE RANGE CONTAINS NO SAFEPOINT — by construction, not
-// by luck. Every instruction between the load of `buf` and the load of the
-// element is arithmetic in ONE straight-line block: no call, no allocation, and
-// no back edge (`isBackEdge` is `target <= curBlock`, and both blocks minted
-// here have ids above the current one, so `emitBackEdgeSafepointIfNeeded` emits
-// nothing). Nor can a later pass open that window: `opt.bit` folds constants,
-// deletes dead values and prunes blocks, and has no code motion at all — no
-// LICM, no GVN — so nothing can be scheduled between the two loads. Anything
-// that later adds cross-block motion to the optimizer must keep this sequence
-// intact or describe `buf` in the stack map.
-fn emitInlineSliceGet(fc: FnCtx, recv: int, idx: int, ty: int): int {
+// by luck. Every instruction between the load of `buf` and the element access is
+// arithmetic in ONE straight-line block: no call, no allocation, and no back
+// edge (`isBackEdge` is `target <= curBlock`, and both blocks minted here have
+// ids above the current one, so `emitBackEdgeSafepointIfNeeded` emits nothing).
+// Nor can a later pass open that window: `opt.bit` folds constants, deletes dead
+// values and prunes blocks, and has no code motion at all — no LICM, no GVN — so
+// nothing can be scheduled between the load and the access. Anything that later
+// adds cross-block motion to the optimizer must keep this sequence intact or
+// describe `buf` in the stack map.
+//
+// THE STORED VALUE NEEDS NO WRITE BARRIER, and that is a fact about this
+// collector rather than an omission (#3108). `runtime/gc/gccollect.bit:53` is a
+// full STOP-THE-WORLD MARK-SWEEP: not generational, not incremental, not
+// concurrent, and non-moving. There is no barrier anywhere in the tree to drop —
+// `grep -rn -i barrier runtime/ compiler/` finds only memory fences — and the
+// ordinary reference-field store already emits a bare store on both backends by
+// the same reasoning (`arm64selectmem.bit:84`: "no write barrier — the runtime's
+// write-barrier contract is not settled yet (the collector is stop-the-world, so
+// nothing needs one today)"). `rtSliceSet` itself is a plain `storeWord`, so the
+// call this replaces was performing no barrier either. `slcIsRef` (offset 32) is
+// NOT what the collector reads: its three uses are all in
+// `runtime/root/slices.bit` (set at creation :181, read when growing to pick the
+// new buffer's descriptor :223, copied on reslice :348). Ref-ness is baked into
+// the buffer object's type-info descriptor at allocation — `allocBuf` picks
+// `riRefArray` over `riSliceBuf` (`runtime/root/root.bit:545`) — and a store into
+// the buffer cannot change that. When the GC goes incremental, the barrier is
+// owed here and at both backends' `field_set` together.
+fn emitInlineSliceElem(fc: FnCtx, recv: int, idx: int): SliceElem {
   let i64ty = primType(fc.c.ctx, 3)
   let vlenIns = mkInstr(Op.SliceLen, i64ty)
   vlenIns.lhs = recv
@@ -288,7 +322,16 @@ fn emitInlineSliceGet(fc: FnCtx, recv: int, idx: int, ty: int): int {
   let add = mkInstr(Op.Add, i64ty)
   add.lhs = builderEmit(fc.b, offIns)
   add.rhs = idx
-  let slot = builderEmit(fc.b, add)
+  return SliceElem{ buf: buf, slot: builderEmit(fc.b, add) }
+}
+
+// `xs[i]` on a slice, read INLINE instead of through `rt_call slice_get` (#3107).
+// The bounds test and the address are `emitInlineSliceElem`'s; this is the load.
+fn emitInlineSliceGet(fc: FnCtx, recv: int, idx: int, ty: int): int {
+  let e = emitInlineSliceElem(fc, recv, idx)
+  let buf = e.buf
+  let slot = e.slot
+  let i64ty = primType(fc.c.ctx, 3)
   // A slice buffer stores ONE 8-BYTE WORD PER ELEMENT whatever the element type
   // is (`rtSliceAppend`: `storeWord(buf + (off + vlen) * 8, word)`), so the
   // element stride is 8 and never the element's own width.
@@ -321,6 +364,60 @@ fn emitInlineSliceGet(fc: FnCtx, recv: int, idx: int, ty: int): int {
   load.lhs = builderEmit(fc.b, addr)
   load.ival = 0
   return builderEmit(fc.b, load)
+}
+
+// Whether `xs[i] = v` may be emitted inline (#3108). Two conditions, and both
+// are narrower than the read's, which is why this is a predicate the call sites
+// ask rather than a fallthrough inside the emitter.
+//
+// THE INDEX must be int-classed, for the reason `lowerIndex` gives: the compare
+// and the address arithmetic read an INTEGER register, and nothing rejects
+// `xs[1.5]` today.
+//
+// THE ELEMENT must be exactly 8 bytes wide — every reference type, plus
+// i64/u64/int/f64 — because `rtSliceSet` writes a WHOLE WORD (`storeWord`) and a
+// narrow store does not. This is NOT the asymmetry it looks like. #3107 could
+// give narrow prims an inline arm because a narrow LOAD of a whole word is exact:
+// the low bytes are the value. A narrow STORE leaves the other seven bytes of
+// that word holding whatever was there before, and the word is still read whole
+// by `rtSliceGet` — which `readLvalue` (lowerassign.bit) reaches for the read
+// half of `xs[i] += v`, typed as the narrow element. That value would arrive
+// non-canonical, and `xs[i] /= 2` on a `[]i8` holding -1 would divide 255
+// instead: a wrong answer, silent, in a program with no unsafe construct in it.
+// So narrow prims keep the runtime call, which is exactly today's behaviour,
+// byte for byte. Widening the stored value to a full word first would lift this,
+// and is a separate ticket — it needs `Op.Convert` on pairs (bool -> i64) that
+// no source program produces today, which is not a thing to smuggle into a
+// perf change.
+//
+// The VALUE's own IR type is checked as well as the declared element type,
+// because it is the value's type that both backends read for `index_set` — for
+// the store width AND for the index scale (`arm64compile.bit:179` passes
+// `cx.f.instrs[ins.ival].ty`). The two agree for every path that reaches here,
+// and if one ever stopped agreeing the mismatch would come out as a wrongly
+// scaled address rather than as a diagnostic.
+fn canInlineSliceStore(fc: FnCtx, ty: int, idx: int, val: int): bool {
+  return regClassOf(fc.c.ctx, fc.b.instrs[idx].ty) == RegClass.Int &&
+    widthOf(fc.c.ctx, ty).bytes == 8 &&
+    widthOf(fc.c.ctx, fc.b.instrs[val].ty).bytes == 8
+}
+
+// `xs[i] = v` on a slice, stored INLINE instead of through `rt_call slice_set`
+// (#3108) — the mirror of `emitInlineSliceGet`, sharing its bounds test and its
+// address. Only ever called when `canInlineSliceStore` holds, so the element is
+// 8 bytes and `index_set`'s scale-by-width IS the buffer's word stride: one
+// scaled store, writing the same whole word `rtSliceSet`'s `storeWord` writes.
+//
+// `recv`, `idx` and `val` must ALL be lowered before this runs. Evaluating the
+// stored value can allocate or call, and that is a safepoint; keeping it ahead of
+// the sequence is what leaves `buf`'s live range safepoint-free.
+fn emitInlineSliceSet(fc: FnCtx, recv: int, idx: int, val: int, ty: int) {
+  let e = emitInlineSliceElem(fc, recv, idx)
+  let is = mkInstr(Op.IndexSet, fc.c.ctx.voidId)
+  is.lhs = e.buf
+  is.rhs = e.slot
+  is.ival = val
+  builderEmit(fc.b, is)
 }
 
 // Lowers an index read `a[i]`: a slice inline (`emitInlineSliceGet`), a map via
