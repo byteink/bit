@@ -82,10 +82,14 @@
 # So on aarch64 the module check below disassembles both objects, keeps only
 # the acquire/release-ordered mnemonics (`ldar*`/`ldax*`/`ldapr*`/`stlr*`/
 # `stlx*`/`cas*`), strips the register NUMBER (allocation legitimately moves)
-# but keeps the register CLASS — `w` (32-bit) vs `x` (64-bit) — sorts, and
-# requires the multiset to match. A width flip changes the `stlr w` vs
-# `stlr x` count in that multiset; a scheduling or instruction-count
-# improvement does not.
+# but keeps the register CLASS — `w` (32-bit) vs `x` (64-bit) — sorts, dedupes
+# to a SET, and requires the sets to match. A width flip changes SET
+# membership (a `stlr w`/`stlr x` pair appears or disappears); an inlining
+# change that duplicates an already-emitted atomic, or a scheduling change,
+# does not (#3170 — an earlier `cmp` on the un-deduped, count-sensitive
+# multiset reddened this exact way when #3164's algebraic folding let
+# `trampRelease` inline into both its callers, doubling `_stlxr x`/`_ldaxr x`
+# without touching a single width).
 #
 # Mutation-tested (#3103) against the real bug, not a synthetic stand-in:
 # `BIT_STAGE0_BIN` cannot point directly at v0.1.10 against TODAY's runtime
@@ -583,8 +587,21 @@ while [ "$i" -lt "$NMOD" ]; do
     orsig="$work/sig_or"
     atomicSignature "$devobj" >"$devsig"
     atomicSignature "$orobj" >"$orsig"
+    # The floor below counts raw (non-deduped) sites — it exists to catch a
+    # broken extraction, not to weigh in on the equality check.
     atomic_sites_seen=$((atomic_sites_seen + $(wc -l <"$orsig")))
-    if cmp -s "$devsig" "$orsig"; then
+    # #3170: compare the SET of (mnemonic, register-class) pairs, not the
+    # multiset. The header above says this check "no longer asserts ...
+    # instruction COUNT" — the un-deduped `cmp` below it contradicted that:
+    # inlining the same atomic into an extra call site (#3164, a legitimate
+    # `wordsAt` fold that dropped `trampRelease` under the inline budget)
+    # duplicates a line in the sorted list without touching any width, and
+    # `cmp` on two differently-sized files always fails. `sort -u` collapses
+    # duplicate (mnemonic, class) lines on both sides first; a width flip
+    # still fails the comparison because it adds a class absent on the other
+    # side or removes the last remaining instance of one — see the ticket
+    # (#3170) for the mutation test that confirms the latter.
+    if cmp -s <(sort -u "$devsig") <(sort -u "$orsig"); then
       modmatch=$((modmatch + 1))
     else
       echo "$dir" >>"$work/mod_mismatch"
