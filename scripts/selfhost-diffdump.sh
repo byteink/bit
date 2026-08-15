@@ -97,6 +97,8 @@ CORPUS="stdlib examples tests/cases tests/imports"
 . "${ROOT}/scripts/selfhost-ir-canon.sh"
 # shellcheck source=scripts/alarmrun.sh
 . "${ROOT}/scripts/alarmrun.sh"
+# shellcheck source=scripts/selfhost-ir-signatures.sh
+. "${ROOT}/scripts/selfhost-ir-signatures.sh"
 
 NAME="${1:?usage: selfhost-diffdump.sh <ast|tokens|diags|types|ir|iropt>}"
 
@@ -380,187 +382,11 @@ run_types() {
   exit "$status"
 }
 
-# --- Declared-transform-signature escape valve (#3125, same shape as #3103) ---
-#
-# ir/iropt compared every corpus file's lowered IR TEXT against the pinned
-# stage0's, byte for byte (mod $t<id> canon), with NO divergence permitted at
-# all. That held only as long as no intentional lowering improvement had
-# landed since the pin — #3107 is the first that did (`xs[i]` on a slice:
-# `rt_call slice_get` -> an inline bounds-checked load,
-# compiler/loweraccess.bit), and it reddened both arms by construction:
-# MATCH 754->608, MISMATCH 0->149 on `task-3107-inlineindex` (8d80e0a9).
-# #3103 hit the identical shape one level down (object bytes vs. the pinned
-# release) and this is the same fix, one level up: a mismatch is no longer
-# automatically a REGRESSION. It is checked first against a small table of
-# DECLARED TRANSFORM SIGNATURES (`explainMismatch` below) — an exact
-# opcode-COUNT-delta identity, proven against the real branch that motivated
-# it, not eyeballed. Only a divergence that satisfies a registered signature
-# is downgraded to EXPLAINED (printed, not failed); anything else still fails
-# exactly as before.
-#
-# WHY NOT A PER-FILE ALLOWLIST INSTEAD. There was one — the expected-mismatch
-# list #1883 deleted, "so a known difference could be written down instead of
-# fixed." A signature is not that list reborn: an allowlist names a FILE and
-# accepts anything it does next; a signature names an IDENTITY the delta must
-# satisfy, checked fresh on every run, and a second, unrelated bug landing on
-# an already-explained file still fails it (proven below — the mutation is in
-# a file this signature already covers zero times, but the mechanism applies
-# per-file regardless of history).
-#
-# WHY NOT TREE-AGAINST-TREE (the other option this ticket weighed). #3103
-# rejected two self-build generations of the SAME tree because `bit build
-# compiler` links a pre-built libbitrt.a, so that comparison never touched
-# runtime codegen at all — vacuous by construction. That specific mechanism
-# does not apply here: `--dump-ir-pre`/`--dump-ir` lower one file standalone,
-# no link step. The DEEPER reason still does, though: two generations of ONE
-# tree share whatever lowering bug that tree has, so a bug baked into both
-# generations identically never diverges — the same self-reproducing-bug
-# blind spot, independent of why #3103 hit it. A signature checked against an
-# INDEPENDENT, unchanged oracle (the pinned release) does not have that blind
-# spot: a real bug fails the identity and is reported as a regression exactly
-# like any other divergence, which is what the mutation test below shows.
-#
-# THE #3107 SIGNATURE, derived empirically, not from the ticket's prose: diff
-# `stdlib examples tests/cases tests/imports` between the pinned oracle and
-# `task-3107-inlineindex` (8d80e0a9), and aggregate every per-opcode COUNT
-# delta over every file that diverges (145 on this tree's corpus count —
-# #3107's own report measured 149 against a slightly different corpus the day
-# before; the identity itself does not depend on the count). Solved as a
-# linear system, not guessed:
-#
-#   N  = number of `xs[i]` reads this file had inlined
-#        (= -delta(rt_call:slice_get); must be > 0)
-#   Nn = delta(field_get) - 2N   (the packed/byte-indexed subset of N; 0 for
-#                                  a plain element type)
-#   Nf = -delta(bitcast)         (a float-index read that no longer needs the
-#                                  word round-trip; 0 if none)
-#
-#   delta(slice_len)=N   delta(icmp_ult)=N   delta(br)=N
-#   delta(const_string)=N   delta(rt_call:panic)=N   delta(unreachable)=N
-#   delta(add)=N+Nn   delta(shl)=Nn   delta(const_int)=Nn
-#   delta(index_get)=N-Nn   Nn>=0   Nf>=0
-#   every OTHER opcode: delta==0 (pre-opt only — see POST-OPT below)
-#
-# 145/145 EXPLAINED, 0 UNEXPLAINED at pre-opt, with every coefficient an
-# independent equation — not vacuous. Mutation-tested against a real bug
-# (#3125): flipping `compiler/lower.bit`'s `binOpFor`, `Kind.Minus -> Op.Sub`
-# to `Op.Add` (a real lowering site, unrelated to slice indexing, so
-# `compiler/loweraccess.bit` — #3107's own file — is untouched), reddens both
-# arms with a REGRESSION this signature does not explain (recorded on the
-# ticket, not reproduced in this comment).
-#
-# POST-OPT (iropt) IS A LOOSER CHECK ON THE SAME 13 OPCODES, not the same
-# equations — a deliberate, evidence-based narrowing, not a shortcut. The
-# pre-opt formula's exact coefficients fail on 8/145 files under `--dump-ir`
-# (post `opt.bit`'s CSE/DCE/inlining): `field_get`/`index_get` counts shift
-# when the optimizer dedupes a repeated bounds check or address computation,
-# which a per-site multiple of N cannot express. What DOES hold on all 145:
-# every opcode with a nonzero delta is still one of the same 13, and on 7 of
-# those 145 the optimizer's INLINER additionally moves `call`/`call_value`/
-# `sub` by an amount this signature does not model — a downstream consequence
-# of the transform changing a function's instruction count and crossing an
-# inlining-cost threshold, not a second lowering bug. Those three are allowed
-# to move by ANY amount for iropt only; every other opcode outside the
-# declared 13 still fails the check on both arms. 145/145 EXPLAINED at
-# post-opt with this rule, 0/145 without the three (i.e. the allowance is
-# load-bearing, not decorative).
-#
-# WHICH HOSTS. Both arms apply on EVERY host (aarch64-macos, aarch64-linux,
-# x86_64-linux) — unlike #3103's diffruntime, which is aarch64-only because it
-# disassembles target MACHINE CODE. `--dump-ir-pre`/`--dump-ir` are
-# pre-codegen: the SSA text carries no register or instruction-selection
-# content, so it does not vary by target ISA at all.
-#
-# COST PER LANDING, as this ticket names up front: a future lowering change
-# that alters IR shape (#3108 is next) needs its OWN signature added to
-# `explainMismatch` below, derived the same way — diff the real branch
-# against the pinned oracle, aggregate every nonzero opcode delta across
-# every diverging file, and solve for the coefficients. A signature that only
-# explains the one file its author happened to look at is not a signature; it
-# is a scoped allowlist wearing a disguise, and #1883 is why that is rejected.
-
-# explainMismatch <oracle_ir_text> <bit2_ir_text> <kind: ir|iropt>
-# Prints the name of the registered signature that explains the divergence
-# and returns 0, or prints nothing and returns 1 if none does. Each call
-# forks one fresh awk process, so all state below is per-call — no cross-file
-# leakage between corpus files.
-explainMismatch() {
-  awk -v kind="$3" '
-    function opcode(line,    s) {
-      if (match(line, /= rt_call [A-Za-z_][A-Za-z0-9_]*\(/)) {
-        s = substr(line, RSTART, RLENGTH)
-        sub(/^= rt_call /, "", s)
-        sub(/\($/, "", s)
-        return "rt_call:" s
-      }
-      if (match(line, /= [a-zA-Z_][a-zA-Z0-9_]*/)) {
-        return substr(line, RSTART + 2, RLENGTH - 2)
-      }
-      if (line ~ /^[[:space:]]*br /) { return "br" }
-      if (line ~ /^[[:space:]]*unreachable/) { return "unreachable" }
-      return ""
-    }
-    side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
-    side == 0 { op = opcode($0); if (op != "") a[op]++; next }
-    { op = opcode($0); if (op != "") b[op]++ }
-    END {
-      for (op in a) allop[op] = 1
-      for (op in b) allop[op] = 1
-      for (op in allop) {
-        d = b[op] - a[op]
-        if (d != 0) delta[op] = d
-      }
-
-      # --- #3107: `xs[i]` slice-read inline lowering (see the block comment
-      # above this function for how these coefficients were derived) ---
-      split("slice_get slice_len icmp_ult br const_string panic unreachable field_get add shl const_int index_get bitcast", corelist, " ")
-      for (i in corelist) core[corelist[i]] = 1
-      N = -delta["rt_call:slice_get"]
-      ok = (N > 0)
-
-      if (kind == "ir") {
-        # Pre-opt: the exact linear identity, every coefficient an
-        # independent equation, and no opcode outside the declared 13 may
-        # move at all.
-        if (delta["slice_len"] != N)      ok = 0
-        if (delta["icmp_ult"] != N)       ok = 0
-        if (delta["br"] != N)             ok = 0
-        if (delta["const_string"] != N)   ok = 0
-        if (delta["rt_call:panic"] != N)  ok = 0
-        if (delta["unreachable"] != N)    ok = 0
-        Nn = delta["field_get"] - 2 * N
-        if (Nn < 0)                       ok = 0
-        if (delta["add"] != N + Nn)       ok = 0
-        if (delta["shl"] != Nn)           ok = 0
-        if (delta["const_int"] != Nn)     ok = 0
-        if (delta["index_get"] != N - Nn) ok = 0
-        Nf = -delta["bitcast"]
-        if (Nf < 0)                       ok = 0
-        for (op in delta) {
-          opname = op
-          sub(/^rt_call:/, "", opname)
-          if (!(opname in core)) ok = 0
-        }
-      } else {
-        # Post-opt: opt.bit CSE/DCE can redistribute the SAME 13 opcodes
-        # counts (dedupe a repeated bounds check or address computation), so
-        # the exact pre-opt coefficients do not survive -- see the block
-        # comment above. What must still hold: every opcode with a nonzero
-        # delta is one of the declared 13, or one of the inliner call/
-        # call_value/sub (unconstrained magnitude, both documented above).
-        # Anything else still fails.
-        for (op in delta) {
-          opname = op
-          sub(/^rt_call:/, "", opname)
-          if (!(opname in core) && opname != "call" && opname != "call_value" && opname != "sub") ok = 0
-        }
-      }
-
-      if (ok) { print "3107-slice-read-inline"; exit 0 }
-      exit 1
-    }
-  ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
-}
+# explainMismatch (the declared-transform-signature scoring used below) now
+# lives in scripts/selfhost-ir-signatures.sh (#3132), sourced above, so
+# scripts/selfhost-diffruntime.sh's separate per-file IR walk can reuse the
+# identical identity instead of re-implementing it. See that file's header
+# for the full rationale (#3125/#3103) and the #3107 signature derivation.
 
 # ir/iropt row bodies: every mismatching path is NAMED and any mismatch fails
 # the gate (#1469/#1478 — this used to print a count and name only the first
