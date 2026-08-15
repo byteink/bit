@@ -1,6 +1,7 @@
 # How `bit` bootstraps
 
-Status: DECIDED 2026-07-28 (#1840). Implementation is #1593.
+Status: DECIDED 2026-07-28 (#1840) and implemented in #1593 — `seed/` no longer
+exists.
 
 `bit` is compiled by `bit`. This document decides how that terminates, and it
 answers two questions at once:
@@ -10,14 +11,14 @@ answers two questions at once:
 
 ## The decision in one paragraph
 
-Stage0 becomes **the previous release's `bit` binary for the host triple**,
-fetched and verified against a digest **committed in this repo**. The
-differential gates are re-based from "seed vs self-hosted" to "release N-1 vs
-N". Self-consistency is proven by the existing byte-identical fixed point, which
-needs no seed and already exists. The capability genuinely lost is the
-independent second implementation: a bug present in both N-1 and N becomes
-invisible, and that is accepted, mitigated by diverse double-compiling at
-release time rather than pretended away.
+Stage0 is **the previous release's `bit` binary for the host triple**, fetched
+and verified against a digest **committed in this repo**. The differential
+gates are re-based from "seed vs self-hosted" to "release N-1 vs N".
+Self-consistency is proven by the byte-identical fixed point, which needs no
+seed. The capability genuinely lost is the independent second implementation: a
+bug present in both N-1 and N becomes invisible, and that is accepted,
+mitigated by diverse double-compiling at release time rather than pretended
+away.
 
 ## 1. Which artifact is stage0, where it comes from, how a clean checkout verifies it
 
@@ -90,12 +91,6 @@ new target is a porting job, and porting a self-hosted compiler to a target it
 cannot yet emit for requires a working compiler on some host by definition —
 that is a property of self-hosting, not of this decision.
 
-**The first release cut after `seed/` is deleted is special and must not be
-missed:** `dist/release.sh:102` builds the shipped `bit` by exec'ing
-`./bit-out/bin/bit-seed`. With the seed gone that line has no compiler. It must
-become the stage0 `bit`, and #1593 has to change it in the same commit that
-deletes `seed/`, or the first post-seed release cannot be cut at all.
-
 ## 3. How a compromised stage0 is detected
 
 A stage0 binary compiles the compiler, so a malicious stage0 can inject itself
@@ -112,11 +107,12 @@ stageB builds compiler/ -> stageC
 sha256(stageB) == sha256(stageC)
 ```
 
-Its own header already states why this is the post-seed property: "once it is
-gone there is no stage2 to compare against, so the meaningful property is
-self-reproducibility". A stage0 that injects a payload must make that payload
-survive into stageB and reproduce itself byte-identically in stageC, which is a
-far narrower attack than modifying a compiler.
+Its own header states why this is the right property: the binary the pinned
+stage0 produces is **not** required to be byte-identical to stageB — two
+compilers can emit different-but-equivalent code for the same source — what
+must hold is `bit == bit-built-by-bit`. A stage0 that injects a payload must
+make that payload survive into stageB and reproduce itself byte-identically in
+stageC, which is a far narrower attack than modifying a compiler.
 
 **Byte-identical self-reproduction alone does not detect it, though**, because a
 faithful self-reproducing backdoor is exactly what the classic attack builds. The
@@ -147,10 +143,10 @@ standard to aim at, and it is reachable only because the result is reproducible.
 `scripts/` rather than from the ticket, because an undercount here means gates
 silently retired.
 
-Every `selfhost-diff*.sh` today runs `bit-out/bin/bit-seed` against
-`bit-out/bin/bit` and diffs the output. The substitution is mechanical: the seed
-side becomes the pinned stage0 (release N-1) and the self-hosted side stays.
-"Re-based" below means exactly that and nothing more.
+Every `selfhost-diff*.sh` runs the pinned stage0 (release N-1) against
+`bit-out/bin/bit` and diffs the output. Before #1593 the same scripts ran
+`bit-out/bin/bit-seed`; "re-based" below names exactly that substitution and
+nothing more.
 
 | gate | compares | post-seed oracle |
 |---|---|---|
@@ -174,25 +170,26 @@ side becomes the pinned stage0 (release N-1) and the self-hosted side stays.
 
 Two consequences to plan for rather than discover:
 
-- **Every re-based gate changes meaning.** Today a diff is "the port disagrees
-  with an independent implementation". Afterwards it is "this version changed
-  behaviour versus the last release". Both are useful; they are not the same
-  assertion, and an intentional improvement will now redden a gate that used to
-  stay green. The gates need a way to record an accepted, reviewed difference.
-- **`selfhost-diffiropt.sh` and `selfhost-diffir.sh` already tolerate known
-  cosmetic differences** (`fixpoint.sh`'s header notes two monomorph
-  instance-ordering diffs between seed and `bit2`). Those specific waivers become
-  meaningless once the seed is gone and must be DELETED, not carried forward, or
-  they will mask a real N-1-to-N regression.
+- **A re-based gate's meaning changed.** Before #1593 a diff meant "the port
+  disagrees with an independent implementation"; now it means "this version
+  changed behaviour versus the last release". Both are useful; they are not the
+  same assertion, and an intentional improvement can redden a gate that used to
+  stay green for that reason. The gates need a way to record an accepted,
+  reviewed difference.
+- **`selfhost-diffiropt.sh` and `selfhost-diffir.sh` no longer carry a waiver
+  list.** They used to tolerate two known cosmetic monomorph instance-ordering
+  differences between the seed and the self-hosted output; those waivers became
+  meaningless once the seed was gone, and #1883 deleted the list along with its
+  reader. No mismatch is permitted now.
 
 ## 5. What is accepted as LOST
 
 Stated plainly, because a decision that only lists what it preserves is not a
 decision.
 
-**The independent second implementation.** This is the real loss. The seed is a
+**The independent second implementation.** This is the real loss. The seed was a
 compiler written by different code in a different language; agreement between it
-and the self-hosted compiler is evidence that both are right. Version-over-
+and the self-hosted compiler was evidence that both were right. Version-over-
 version comparison catches regressions introduced in one version, and cannot
 catch a bug present in both N-1 and N. Every shared blind spot becomes permanent
 and invisible. Nothing in this decision recovers that, and no amount of
