@@ -129,6 +129,7 @@ step over a meta-code.
 | Code | Meaning |
 |---|---|
 | E0200–E0289 | lint rules (§4) |
+| E0297 | per-finding `allow` override is malformed, ineligible, or its reason is too short (§5.5) |
 | E0298 | override directive names an unknown rule |
 | E0299 | override directive is malformed, or its reason is missing or empty |
 
@@ -346,9 +347,11 @@ pattern is pervasive enough that call-by-call annotation is not worth it.
 ### 5.1 Grammar
 
 ```
-LintDirective = "//" ws "bit:lint" ws ( Assignment | Disable ) ws "--" ws Reason .
+LintDirective = "//" ws "bit:lint" ws ( Assignment | Disable | Allow ) ws "--" ws Reason .
 Assignment    = RuleName "=" Integer .
 Disable       = "disable" ws RuleName .
+Allow         = "allow" ws Code .             // §5.5 — placement and scope differ
+Code          = "E" Digit Digit Digit Digit .
 RuleName      = lower { lower | "-" } .
 Reason        = { any character } .          // to end of line, non-empty
 ```
@@ -358,12 +361,20 @@ Examples:
 ```
 // bit:lint max-file-lines=7100 -- bootstrap oracle, split tracked in #1376
 // bit:lint disable max-nesting -- generated dispatch table
+// bit:lint allow E0214 -- the function owns this buffer, never returns it
 ```
 
 A `RuleName` must begin with a lowercase letter. Without that, `disable --
 reason` scans `--` as the rule name and is rejected as an *unknown rule* — a
 wrong diagnosis of a right rejection, and one that sends the reader looking for
 a rule they never wrote.
+
+`Allow` names its rule by diagnostic **code**, not `RuleName` — the string
+already printed on the finding it targets (`warning[E0214]: ...`), so it is
+copy-pasteable from the terminal rather than requiring a lookup from code to
+name. It is documented separately, in §5.5: its placement, its reason
+threshold, and what happens when it is malformed all differ from `Assignment`
+and `Disable`, which the rest of this section (§5.1-§5.4) describes.
 
 An `Integer` is a plain run of decimal digits, at most 1,000,000,000. The cap is
 not policy; it is what keeps `max-file-lines=99999999999999999999` from wrapping
@@ -454,6 +465,80 @@ known debt rather than deliberate exceptions.
 
 New files get the default and no grace.
 
+### 5.5 Per-finding overrides (`allow`, #2438)
+
+`// bit:lint allow <CODE> -- <reason>` silences exactly **one finding**: the
+one reported on the line directly below it. It exists for the rules §4 already
+documents as not always distinguishable from the AST — `append-aliasing`
+(E0214) is the motivating case, called out there as "the rule most likely to
+need overriding, since appending to a locally-owned copy is legitimate and not
+always distinguishable from the AST." Disabling that rule for a whole file
+(§5.2) would also blind it to every genuine aliasing bug elsewhere in the same
+file; `allow` silences only the call site the author actually reviewed.
+
+**Placement**, and why it does not follow §5.2. A file-scoped directive lives
+only in the leading comment block; `allow` is recognised **anywhere in the
+file**, on the line immediately above the finding it targets, one line below
+is not enough. `readLintDirectives` (compiler/lint.bit) skips a
+`// bit:lint allow ...` line entirely rather than routing it through the
+leading-block check — it is never a "misplaced directive" error (§5.2), it has
+its own placement rule, read by compiler/lintallow.bit.
+
+**Not available for a threshold rule.** `allow` only resolves to a rule with
+no numeric limit (`max-file-lines`, `max-fn-lines`, `max-params`,
+`max-nesting`, `max-complexity` are excluded). §5.2's file-scoped design is
+coarse **on purpose** — overriding `max-fn-lines` for one function costs
+exactly as much as disabling it for the whole file, and that cost is what
+makes splitting the function the cheaper path. A per-line escape hatch for
+those five rules would undo that on purpose. `allow` addresses a different
+problem — an AST that cannot always tell a true positive from a legitimate
+pattern — and does not reopen §5.2's decision.
+
+**Code, not rule name.** `Allow` names its target by the diagnostic code
+already printed on the finding (`E0214`), copy-pasteable from the terminal.
+The named code must equal the finding's own code; a directive that names a
+different (but otherwise valid, eligible) code, or that sits above a line with
+no matching finding at all, is silently inert — not an error. Detecting a
+*stale* `allow` that no longer matches anything is deliberately out of scope
+(open question, §10): lines move, findings get fixed elsewhere, and an
+`allow` two lines out of date is not the failure mode this override exists to
+prevent.
+
+**The reason threshold is stricter than §5.1's bare non-empty check: at
+least 10 characters after trimming.** `Assignment` and `Disable` are added
+rarely and reviewed individually; `allow` is meant to be stamped at the rate
+of roughly one per call site across a repository-wide sweep (#2440-#2442),
+which is exactly the setting where a placeholder like `"x"` or `"why not"`
+would otherwise go unnoticed. 10 characters forces a few real words without
+demanding a paragraph.
+
+**A defective `allow` — an ineligible or unregistered code, a missing `--`,
+or a reason under 10 characters — is reported as an ORDINARY finding, code
+E0297, not through §2.1's hard-error/exit-2 path.** This is a deliberate
+difference from every other directive error in this spec. §5.1's forms are
+one-per-file and a broken one invalidating the *entire file's* run (findings
+withheld, exit 2) is a proportionate cost. `allow` is one-per-call-site, and a
+sweep touching hundreds of them cannot have call site #200's typo blank out
+every finding call sites #1-#199 already fixed. The underlying finding an
+invalid `allow` was aimed at is **never suppressed** by the attempt — a
+broken override must not make its target silently vanish. A bare
+`// bit:lint allow` with no code following is not a directive at all: it
+suppresses nothing and is not a defect either (no E0297), a deliberate escape
+hatch distinct from `disable`'s stricter "a rule name is mandatory" rule,
+since a template or placeholder comment must not itself become a lint
+finding.
+
+**A valid, matching `allow` counts toward the `overrides active` summary
+(§2.2), the same as a file-scoped override in force** — the same
+transparency argument applies: a silenced finding must be visible in the
+run's own numbers even when the `allow` line itself is skimmed past in
+review. `--stats` (§2, `--stats` lists overrides without computing findings)
+does **not** enumerate individual `allow` directives or count them: it
+short-circuits before findings are ever computed for a file, so it has
+nothing to check `allow` against. This is a known scope boundary, not an
+oversight — `--stats`'s per-path listing stays scoped to the file-scoped
+`<rule>=<n>`/`disable` forms it always covered.
+
 ## 6. Output
 
 Human-readable output reuses the existing diagnostic renderer — same span,
@@ -513,12 +598,17 @@ Required coverage:
 - an unknown rule name in a directive, exit 2
 - a directive after the leading comment block, correctly ignored
 - a clean file, exit 0, with the summary line still printed
+- a per-finding `allow` (§5.5) with an adequate reason directly above a
+  matching finding: the finding is gone, exit 0
+- the identical `allow`, with an inadequate reason: `E0297` AND the original
+  finding are both reported, exit 1
 
 ## 9. Implementation surface
 
 | File | Change |
 |---|---|
 | `compiler/lint.bit` | new — registry, directive reader, runner, rule passes |
+| `compiler/lintallow.bit` | new — per-finding `allow` override (§5.5, #2438) |
 | `compiler/lintcheck.bit` | new — in-Bit self-checks, run by `selfcheck()` |
 | `compiler/main.bit` | `lint` subcommand dispatch |
 | `tests/bit/lintcmd.bit` | CLI contract: exit codes, walk, summary, `--json`, `--stats` |

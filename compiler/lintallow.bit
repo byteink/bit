@@ -1,0 +1,261 @@
+// Per-finding lint overrides (spec/LINT.md §5.5, #2438): `// bit:lint allow
+// <CODE> -- <reason>`, a second override form beside compiler/lint.bit's
+// file-scoped `<rule>=<n>` / `disable <rule>`. Where the file-scoped forms
+// silence a rule for an entire file, `allow` silences exactly ONE finding:
+// the one reported on the line directly below it. It exists for the rules
+// §4 documents as "not always distinguishable from the AST" — append-aliasing
+// is the motivating case — a class of false positive a file-wide `disable`
+// would also blind to every genuine hit elsewhere in the same file.
+//
+// Deliberately NOT available for a threshold rule (max-file-lines and its
+// four siblings): §5.2's file-scoped design is coarse ON PURPOSE, so that
+// overriding max-fn-lines for one function is exactly as expensive as
+// disabling it for the whole file — the pressure that makes splitting the
+// function the cheaper path. A per-line escape hatch for those rules would
+// undo that on purpose, so `allow` only resolves to a rule with
+// `hasLimit: false` (compiler/lint.bit's LintRule); see lintAllowEligible.
+//
+// Malformed forms are reported through the ORDINARY finding stream (E0297,
+// severity warning) rather than the file-scoped forms' hard-error/exit-2
+// path: a broken `allow` is expected at the rate of roughly one per call
+// site across a repo-wide sweep (#2440-#2442), and one bad line must not
+// blank out every other finding this run would otherwise report (§2.1's
+// exit-2 behaviour would do exactly that). The finding a broken `allow` was
+// aimed at is never suppressed either — a broken override must never
+// silently make its target vanish.
+//
+// Sorts after compiler/lint.bit (registry, LintRule, and the
+// lintSkipWs/lintAt/lintScanName/lintTrim helpers this file reuses) and
+// before compiler/lintapply.bit and compiler/lintbatch.bit, whose command
+// entry point calls `lintApplyAllows` right after `runLintRules` — module
+// files concatenate in bytewise filename order (compiler/project.bit:7).
+
+// Directive machinery, allocated downward from E0299 per spec/LINT.md §3;
+// E0298/E0299 are compiler/lint.bit's, this is the next one down.
+const ecLintAllowNoReason = 297
+
+// Minimum trimmed length of an `allow` directive's reason. Longer than the
+// file-scoped forms' bare non-empty check (compiler/lint.bit's own
+// `len(reason) == 0`): the file-scoped forms are added rarely and reviewed
+// individually, while `allow` is meant to be stamped at the rate of one per
+// call site, which is exactly the setting where "x" or "why not" would
+// otherwise pass unnoticed. 10 characters is enough to force a few real
+// words without demanding a paragraph.
+const lintAllowMinReasonLen = 10
+
+// One `// bit:lint allow <CODE> -- <reason>` line found anywhere in the
+// file. `line` is its own 1-based source line, so the caller can look up
+// "is there one directly above line N". `ok` is false for every way the
+// directive can be broken; `defect` is then the complete diagnostic message
+// (§ malformed forms above). A bare `allow` with nothing after it is not
+// represented here at all — lintScanAllows never appends one — spec/LINT.md
+// §5.5: it suppresses nothing and is not a defect either.
+struct LintAllow {
+  code: int,
+  ok: bool,
+  defect: string,
+  line: int,
+  span: Span,
+}
+
+// 1-based line number containing byte offset `offset`, counting `\n` bytes
+// strictly before it. Bounded by `offset`, which the caller never passes
+// past `len(src)`.
+fn lintLineOf(src: string, offset: int): int {
+  let n = 1
+  let i = 0
+  while (i < offset) {
+    if (src[i] == '\n') {
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return n
+}
+
+// The registered rule whose code is `code`, or -1.
+fn lintRuleIndexByCode(rules: []LintRule, code: int): int {
+  let i = 0
+  while (i < len(rules)) {
+    if (rules[i].code == code) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// True iff `rules[idx]` may be targeted by a per-finding `allow` — every
+// registered rule except a threshold rule (see file header).
+fn lintAllowEligible(rules: []LintRule, idx: int): bool {
+  return idx >= 0 && !rules[idx].hasLimit
+}
+
+const lintAllowHint = "form: `// bit:lint allow E#### -- <reason>`, placed on the line directly " +
+  "above the finding, naming one of the per-finding rules (append-aliasing and its siblings)"
+
+// Parses the `allow` directive body, `i0` positioned just past the `allow`
+// keyword and `eol` at the end of the line. `line` is the directive's own
+// source line. Returns `(LintAllow, true)` when something was found —
+// including a defective one — or `(_, false)` for a bare `allow` with
+// nothing after it, which is not a directive at all (spec/LINT.md §5.5).
+fn lintParseAllow(src: string, i0: int, eol: int, dirStart: int, file: int, line: int,
+  rules: []LintRule): (LintAllow, bool) {
+  let i = lintSkipWs(src, i0, eol)
+  let span = Span{ file: file, start: dirStart, end: eol }
+  if (i == eol) {
+    return LintAllow{ code: 0, ok: false, defect: "", line: line, span: span }, false
+  }
+  let codeStart = i
+  if (src[i] != 'E') {
+    let bad = lintTrim(src, codeStart, eol)
+    return LintAllow{ code: 0, ok: false,
+      defect: "lint override names '${bad}', not a diagnostic code (expected 'E' + 4 digits)",
+      line: line, span: span }, true
+  }
+  i = i + 1
+  let digitsStart = i
+  let code = 0
+  while (i < eol && src[i] >= '0' && src[i] <= '9') {
+    code = code * 10 + int(src[i] - '0')
+    i = i + 1
+  }
+  let ndigits = i - digitsStart
+  if (ndigits != 4 || (i < eol && !lintIsSpace(src[i]))) {
+    let bad = lintTrim(src, codeStart, eol)
+    return LintAllow{ code: 0, ok: false,
+      defect: "lint override names '${bad}', not a diagnostic code (expected 'E' + 4 digits)",
+      line: line, span: span }, true
+  }
+  let idx = lintRuleIndexByCode(rules, code)
+  if (idx < 0) {
+    return LintAllow{ code: code, ok: false,
+      defect: "lint override names '${codeString(code)}', which is not a registered lint rule",
+      line: line, span: span }, true
+  }
+  if (!lintAllowEligible(rules, idx)) {
+    return LintAllow{ code: code, ok: false,
+      defect: "lint override names '${codeString(code)}' (${rules[idx].name}), which cannot be " +
+        "overridden per finding — it is a whole-file rule",
+      line: line, span: span }, true
+  }
+  let j = lintSkipWs(src, i, eol)
+  if (!lintAt(src, j, eol, "--")) {
+    return LintAllow{ code: code, ok: false,
+      defect: "lint override 'allow ${codeString(code)}' has no reason: expected '-- <reason>'",
+      line: line, span: span }, true
+  }
+  let reason = lintTrim(src, j + 2, eol)
+  if (len(reason) < lintAllowMinReasonLen) {
+    return LintAllow{ code: code, ok: false,
+      defect: "lint override 'allow ${codeString(code)}' reason is ${len(reason)} character(s), " +
+        "need at least ${lintAllowMinReasonLen}",
+      line: line, span: span }, true
+  }
+  return LintAllow{ code: code, ok: true, defect: "", line: line, span: span }, true
+}
+
+// Every `allow` directive in `src`, in source order. Recognised ANYWHERE in
+// the file — not just the leading comment block (compiler/lint.bit §5.2) —
+// because its placement rule is different: the line directly above the
+// finding it targets, wherever that is. Bounded by the source length.
+fn lintScanAllows(src: string, file: int, rules: []LintRule): []LintAllow {
+  let out = []LintAllow(0)
+  let pos = 0
+  let lineNo = 1
+  while (pos < len(src)) {
+    let eol = pos
+    while (eol < len(src) && src[eol] != '\n') {
+      eol = eol + 1
+    }
+    let i = lintSkipWs(src, pos, eol)
+    if (i < eol && lintAt(src, i, eol, "//")) {
+      let j = lintSkipWs(src, i + 2, eol)
+      if (lintAt(src, j, eol, "bit:")) {
+        let dirStart = j
+        let ns = j + 4
+        let k = lintScanName(src, ns, eol)
+        if (src[ns:k] == "lint") {
+          let afterLint = lintSkipWs(src, k, eol)
+          let nameEnd = lintScanName(src, afterLint, eol)
+          if (src[afterLint:nameEnd] == "allow") {
+            let (entry, present) = lintParseAllow(src, nameEnd, eol, dirStart, file, lineNo, rules)
+            if (present) {
+              out = append(out, entry)
+            }
+          }
+        }
+      }
+    }
+    pos = eol + 1
+    lineNo = lineNo + 1
+  }
+  return out
+}
+
+// The `allow` entry whose own line is `want`, or `(_, false)`.
+fn lintAllowAtLine(allows: []LintAllow, want: int): (LintAllow, bool) {
+  let i = 0
+  while (i < len(allows)) {
+    if (allows[i].line == want) {
+      return allows[i], true
+    }
+    i = i + 1
+  }
+  return LintAllow{ code: 0, ok: false, defect: "", line: 0, span: pointSpan(0, 0) }, false
+}
+
+// Applies every `allow` directive found in `src` against `findings`' entries
+// for `file`: a valid one suppresses the matching finding directly below it;
+// a defective one is reported itself (E0297) and leaves whatever finding it
+// was aimed at standing. Mirrors compiler/lintmodule.bit's
+// `lintDropModuleUsedImports` — the same rebuild-the-list-by-filter shape,
+// applied to a different axis of "which findings actually apply".
+//
+// Returns how many findings a valid `allow` actually suppressed, so the
+// caller can fold it into the `overrides active` summary (§2.2): a raised
+// file-scoped limit is already counted there ("the change is visible in
+// review even when the override line itself is skimmed past"), and a
+// silenced per-finding override deserves the same visibility — otherwise the
+// summary would undercount exactly the overrides #2440-#2442's sweep adds
+// the most of.
+//
+// Called once per file, right after `runLintRules`, while `src` is still in
+// hand (compiler/lintbatch.bit). Bounded by the file's line and finding
+// counts.
+fn lintApplyAllows(src: string, file: int, findings: Diagnostics): int {
+  let rules = lintRules()
+  let allows = lintScanAllows(src, file, rules)
+  if (len(allows) == 0) {
+    return 0
+  }
+  let out = []Diagnostic(0)
+  let suppressed = 0
+  let i = 0
+  while (i < len(findings.list)) {
+    let g = findings.list[i]
+    if (g.span.file != file) {
+      out = append(out, g)
+      i = i + 1
+      continue
+    }
+    let line = lintLineOf(src, g.span.start)
+    let (entry, found) = lintAllowAtLine(allows, line - 1)
+    if (found && entry.ok && entry.code == g.code) {
+      suppressed = suppressed + 1
+      i = i + 1
+      continue // suppressed: a valid `allow` directly above names this code
+    }
+    out = append(out, g)
+    i = i + 1
+  }
+  findings.list = out
+  let j = 0
+  while (j < len(allows)) {
+    if (!allows[j].ok) {
+      warn(findings, ecLintAllowNoReason, allows[j].span, allows[j].defect, lintAllowHint)
+    }
+    j = j + 1
+  }
+  return suppressed
+}
