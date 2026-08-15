@@ -91,7 +91,14 @@ done
 sms() { awk -v l="$1" '$1==l{print $2}' "$WORK/start"; }
 
 # --- compile speed: total Bit source lines / total compile time ---
-srclines=$(wc -l bench/cases/*/*.bit | awk 'END{print $1}')
+# Sum only the $CASES directories the timed loop above actually compiled —
+# not every bench/cases/*/*.bit on disk (that glob also picks up churn/ and
+# startup/, which are never in $CASES and would inflate srclines without
+# inflating comp_n).
+srclines=0
+for c in $CASES; do
+  srclines=$(( srclines + $(wc -l < "bench/cases/$c/$c.bit") ))
+done
 lps=$(awk -v l="$srclines" -v t="$comp_total" 'BEGIN{printf "%.0f", l/t}')
 
 # ---------------- render ----------------
