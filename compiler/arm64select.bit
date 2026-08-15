@@ -177,7 +177,105 @@ fn canonNarrow(code: ByteBuf, reg: int, w: Width) {
   }
 }
 
+// Peeks whether `v` is a const_int, returning it as a `ConstVal` (opt.bit) so
+// the ADD/SUB-immediate fold below gets both the "is it known" flag and the
+// value from one call — sibling to `constShiftAmount` below, which exists for
+// the narrower non-negative shift-count case.
+fn constIntOf(f: IrFunc, v: int): ConstVal {
+  if (f.instrs[v].op != Op.ConstInt) {
+    return noConst()
+  }
+  return intConst(f.instrs[v].ival)
+}
+
+// AArch64 ADD/SUB (immediate) takes a 12-bit unsigned magnitude, optionally
+// shifted left by 12 (`addSubImmediate`'s two operand shapes, arm64.bit) —
+// an ISA fact, not a choice made here. `useSub` flips ADD<->SUB when the
+// constant is negative: `x + (-5)` and `x - 5` are the same instruction, and
+// the encoding has no negative form.
+struct AddSubImm {
+  fits: bool,
+  useSub: bool,
+  imm12: int,
+  shift12: bool,
+}
+
+fn noAddSubImm(): AddSubImm {
+  return AddSubImm{ fits: false, useSub: false, imm12: 0, shift12: false }
+}
+
+// Whether the already-sign-stripped magnitude `mag` fits either single-
+// instruction form: [0, 4095] directly, or an exact multiple of 4096 up to
+// 4095*4096 via the shifted form. Anything else must still be materialized.
+fn fitsAddSubMag(mag: int): AddSubImm {
+  if (mag >= 0 && mag <= 4095) {
+    return AddSubImm{ fits: true, useSub: false, imm12: mag, shift12: false }
+  }
+  if (mag > 4095 && mag <= 4095 * 4096 && (mag & 4095) == 0) {
+    return AddSubImm{ fits: true, useSub: false, imm12: mag >> 12, shift12: true }
+  }
+  return noAddSubImm()
+}
+
+// Resolves a constant operand's raw value for `op` (Add or Sub) to an
+// add/sub-immediate encoding. `minI64()` has no positive-magnitude
+// representation, so it is left to materialize rather than risk overflow.
+fn resolveAddSubImm(op: Op, val: int): AddSubImm {
+  if (val == minI64()) {
+    return noAddSubImm()
+  }
+  let mag = val
+  let flip = false
+  if (val < 0) {
+    mag = -val
+    flip = true
+  }
+  let r = fitsAddSubMag(mag)
+  if (!r.fits) {
+    return r
+  }
+  let useSub = op == Op.Sub
+  if (flip) {
+    useSub = !useSub
+  }
+  return AddSubImm{ fits: true, useSub: useSub, imm12: r.imm12, shift12: r.shift12 }
+}
+
+// Emits `dst = operand <op> imm` as a single ADD/SUB-immediate instruction —
+// the fold this file exists for (#1853): a constant operand that fits the
+// encoding needs no materializing `mov` at all, not even into scratch2.
+fn emitAddSubImmInt(cx: A64Ctx, imm: AddSubImm, dst: int, operand: int, w: Width) {
+  let o = getInt(cx, vregOf(cx, operand), scratch1())
+  let d = destInt(cx, dst, scratch1())
+  addSubImmediate(cx.code, imm.useSub, d, o, imm.imm12, imm.shift12)
+  canonNarrow(cx.code, d, w)
+  putInt(cx, dst, d)
+}
+
 fn emitBinaryInt(cx: A64Ctx, op: Op, dst: int, lhs: int, rhs: int, w: Width) {
+  if (op == Op.Add || op == Op.Sub) {
+    let rc = constIntOf(cx.f, rhs)
+    if (rc.known) {
+      let imm = resolveAddSubImm(op, rc.ival)
+      if (imm.fits) {
+        emitAddSubImmInt(cx, imm, dst, lhs, w)
+        return
+      }
+    }
+    // Add is commutative, so a leading literal (`32 + header`) folds the same
+    // way with the operands swapped; Sub is not (`k - x` is a different value
+    // from `x - k`), so only its rhs is ever checked.
+    if (op == Op.Add) {
+      let lc = constIntOf(cx.f, lhs)
+      if (lc.known) {
+        let imm = resolveAddSubImm(op, lc.ival)
+        if (imm.fits) {
+          emitAddSubImmInt(cx, imm, dst, rhs, w)
+          return
+        }
+      }
+    }
+  }
   let l = getInt(cx, vregOf(cx, lhs), scratch1())
   let r = getInt(cx, vregOf(cx, rhs), scratch2())
   let d = destInt(cx, dst, scratch1())
