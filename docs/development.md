@@ -60,6 +60,158 @@ bootstrap, including re-verifying and possibly re-fetching stage0, is the most
 expensive operation in this repo — so run it explicitly before a release,
 before merging to main, or right after a stage0 repin.
 
+## Does `./make libbitrt` build `runtime/**` with the tree compiler? (#3054)
+
+**No — it stays pinned-stage0-built by default.** The status quo is not free of
+risk either, though, so the fix is an opt-in, not silence. This is the decision
+recorded so it is not re-derived from scratch the next time it comes up.
+
+**The two paths, as of #3034.** `dist/release.sh:198` — the **shipped**
+`libbitrt.a` is compiled by `bit1`, this tree's own self-hosted compiler, not
+stage0. It gets there with a genuine two-pass bootstrap: `./make libbitrt`
+first builds a bootstrap archive (L0) with the pinned stage0, stage0 uses L0 to
+build a native `bit1` (`./make`'s own `selfhost` step), then `bit1` rebuilds
+the real, shipped archive (L1) for all three targets via
+`scripts/g2archive.sh`, and only L1 is packaged.
+`tools/build/artifacts.bit:267` — the **ordinary** `./make libbitrt` still
+compiles every `runtime/**` module with the pinned stage0. There is no L1 pass
+in the everyday build.
+
+**Why this is not a style choice: source vs. codegen.** A *source* edit to
+`runtime/**` takes effect immediately either way, because stage0 re-reads the
+current tree's source on every build. What the pinned-stage0 path freezes is
+*codegen* — the machine code stage0's own, already-built copy of
+`compiler/codegen.bit`/`emitmacho.bit`/`emitelf.bit` emits for `runtime/**`'s
+own functions. #1927 is exactly a codegen-freeze bug: it needs a writer change
+(`compiler/codegen.bit`, pad each stack-map entry to 8 bytes) and a reader
+change (the runtime's walk) to move together. The writer change reaches
+`bit-out/bin/bit` immediately — stage0 recompiles `compiler/**` from tree
+source on every `./make selfhost` — so every other compiled unit gets the new,
+padded format right away. But `libbitrt.a`'s own internal stack maps are
+emitted by stage0's frozen, pre-fix copy of the writer, so they stay unpadded
+until a release cut *after* the fix is pinned as the new stage0. There is no
+discriminator between the two formats in the merged table (`runtime/ABI.md`
+§4), so landing the reader half with no runtime-build change makes every dev
+build between "the fix lands" and "the next repin" silently misdecode
+`libbitrt.a`'s own stack maps. Waiting for the next repin does not avoid that
+window, it only bounds its length — and `dist/stage0/SHA256SUMS`'s `git log`
+shows recent repins landing roughly every 1-3 days, so the window is real, not
+theoretical. The same reasoning applies to any future writer/reader pair, not
+just #1927.
+
+**Also worth naming, because the top-priority performance work depends on
+getting this precise: same source-vs-codegen split, opposite direction.** A
+*source* fix in `compiler/**` (#1852/#1853, landed) improves the machine code
+the tree compiler emits for user programs immediately — the next
+`./make selfhost` recompiles `compiler/**` from source. It does **not** improve
+the machine code inside `libbitrt.a` itself, because that machine code was
+already emitted, once, by the frozen pinned stage0 — no amount of rebuilding
+re-emits it. #3113 measured `strings` at 137.4x C / 55.9x Go and found the time
+is spent in exactly that frozen code (GC, allocator, slice/string primitives).
+So `#1852`/`#1853`/queued `#3104`/`#3105`/`#3107` cannot move that number until
+either a repin happens or the opt-in below exists and is used.
+
+### The four questions
+
+**1. How likely is a tree compiler that miscompiles the runtime, given the
+fixed-point assert runs on every release?** The fixed-point assert
+(`scripts/selfhost-fixpoint.sh`: `stageB` built by `stageA`, `stageC` built by
+`stageB`, `sha256(stageB)==sha256(stageC)`) proves only that the compiler
+reliably *reproduces itself*. It says nothing about whether the compiler
+correctly compiles `runtime/**` — a deterministic miscompile (the same wrong
+bytes every time, exactly #2569's shape) passes a fixed-point check as cleanly
+as a correct compiler does. The actual backstop for runtime correctness is
+`scripts/selfhost-diffruntime.sh`, and both it and the fixed-point check run
+only via `./make test-differentials` (#2570, registered in `coreSteps()`, not
+`gateSteps()`) — once per push, not on every commit that touches codegen.
+Repins have landed roughly every 1-3 days recently (`git log` on
+`dist/stage0/SHA256SUMS`), so in practice a runtime-affecting codegen
+regression has a push-to-push window to surface, through a suite only the
+integrator runs.
+
+**2. Does `BIT_STAGE0_BIN` fully cover recovery, and is it exercised by
+anything?** No. `grep -rln STAGE0_BIN tests/` returns exactly one file,
+`tests/bit/coldboot.bit`, and its own comment says it deliberately does *not*
+use `BIT_STAGE0_BIN` — "using it here would defeat the point," since
+`test-coldboot`'s whole job is proving the pinned stage0 *alone* can
+bootstrap. No test anywhere sets `BIT_STAGE0_BIN` and asserts the resulting
+build is correct. `scripts/stage0.sh`'s own header calls the override
+"DELIBERATELY UNVERIFIED, unlike the pinned path... there is no digest to
+check an arbitrary local binary against." The escape hatch a switch would lean
+on more heavily has zero regression coverage today. Filed as #3118.
+
+**3. Do the selfhost differentials still mean what they mean if the runtime is
+tree-built?** Yes on aarch64, and non-obviously: they already exercise exactly
+that scenario, continuously, regardless of what `stepLibbitrt` does. #2741's
+module-level object comparison in `scripts/selfhost-diffruntime.sh` builds
+every `runtime/**` module *twice* purely for the comparison — once with the
+pinned oracle, once with `bit-out/bin/bit` (the tree's own self-hosted
+compiler) — into a scratch `mktemp -d`, never into `bit-out/lib/`. It never
+reads the archive `stepLibbitrt` actually writes. So "the tree compiler builds
+`runtime/**`" is already what this differential asserts about on every
+`test-differentials` run; switching `stepLibbitrt` changes which compiler
+produces the *shipped* archive, not what this gate has been checking.
+
+What did just change (#3103) is the invariant itself, and it happens to be
+exactly right for a tree-built world: byte-for-byte identity against the
+pinned oracle stopped being valid the moment a real backend optimization
+(#1852) landed, because an optimization is supposed to change bytes (22 of 23
+modules now diverge, all smaller, none a bug). On aarch64 hosts the check now
+disassembles both objects and compares only the acquire/release
+atomic-instruction *width* signature (mnemonic + register class, register
+number stripped) — the exact property #2569's bug broke, and nothing else.
+Mutation-tested against the real bug (#3103): 0/23 modules diverge by
+signature between #1852's tree and the pinned oracle, where 22/23 diverge by
+raw bytes; the real v0.1.10 #2569 defect diverges 6/6 by both. So the
+invariant tolerates the legitimate codegen improvement a tree-built archive
+would carry, while still catching the class of bug a switch actually risks.
+
+x86-64 is the one gap, and it predates this decision. The differential keeps
+strict byte identity there (no local x86-64 host to verify a
+signature-extraction regex against — tracked separately, #3110). No x86-64
+codegen improvement has landed yet, so this has not bitten anyone, but using a
+tree-built archive on x86_64-linux before #3110 closes would make that
+target's differential go red the moment one does, for a reason unrelated to
+correctness.
+
+**4. Is there a middle option?** Yes, and it is the right one right now: keep
+`./make libbitrt` stage0-built by default, add an opt-in that forces a
+tree-built archive — not the reverse. Tree-built-by-default was rejected
+because it would make the one recovery mechanism a switch leans on
+(`BIT_STAGE0_BIN`, question 2) the routine path for a codegen regression at
+exactly the moment its coverage is weakest, and it would change
+`bit-out/lib/*/libbitrt.a`'s bytes for every dev build on every platform, where
+only aarch64's invariant is proven tolerant of legitimate codegen change
+(question 3). Stage0-by-default preserves today's build cost and verified
+safety envelope for the common case, while giving #1927 — and any future
+writer/reader pair that must move together — a real, load-bearing mechanism
+instead of the purely-manual, unverified two-pass `BIT_STAGE0_BIN` dance
+`scripts/stage0.sh` currently documents.
+
+**What the opt-in requires, filed as #3117, not done here.**
+`tools/build/defs.bit` declares `selfhost`'s only dependency as `["libbitrt"]`,
+and `stepSelfhost` always resolves stage0 fresh via `runArtifact`
+(`main.bit:125`) — there is no path that reuses a previously-built
+`bit-out/bin/bit` as a builder for anything. An opt-in tree-built `libbitrt`
+therefore cannot just swap which `BIT=` `stepLibbitrt` passes to
+`scripts/g2archive.sh` — it needs its own internal two-pass bootstrap,
+mirroring `dist/release.sh`'s shape: build the L0 archive to a scratch path as
+today, use stage0 to build a throwaway host-native self-hosted compiler
+linking it, then use that compiler to build the real
+`bit-out/lib/<target>/libbitrt.a` for all three targets. `selfhost`'s existing
+dependency on `libbitrt` does not need to invert — it already runs after
+`libbitrt` and already links whatever `stepLibbitrt` leaves at
+`bit-out/lib/<host>/libbitrt.a`. `fingerprint()` (`artifacts.bit:112`) also
+needs to fold in `compiler/**` when the opt-in is active — today it
+deliberately excludes `compiler/**` because `compiler/**` cannot affect
+stage0-built bytes, but it would under a tree-built archive, and a fix landing
+there with the cache unaware of it is the same stale-archive shape
+`fingerprint()` already guards against for `BIT_STAGE0_BIN` (#1863).
+
+**#1927 stays blocked, now on #3117 rather than on #3054 directly** — the
+decision is made, but nothing changes for it until the opt-in exists and #1927
+uses it.
+
 ## Testing conventions
 
 **Verify scoped changes with `scripts/gate.sh`, not the full suite.** It reads
