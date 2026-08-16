@@ -94,12 +94,53 @@
 # Mutation-tested (#3103) against the real bug, not a synthetic stand-in:
 # `BIT_STAGE0_BIN` cannot point directly at v0.1.10 against TODAY's runtime
 # source any more — v0.1.10 predates the `function`->`fn` rename (#2760) and
-# cannot parse it (`E0021` on every `@nosplit fn`), which is itself worth
-# knowing and is filed separately (#3109). Rebuilt the actual v0.1.10 and
-# v0.1.11 (the real #2569 fix) release binaries against the runtime/ source
-# AS IT EXISTED the commit before the repin (32ce1ff3, still
-# `function`-keyword era): raw bytes AND the atomic signature both diverge on
-# all 6 named modules (runtime, chan, gc, root, sched, stw) — output below.
+# cannot parse it (`E0021` on every `@nosplit fn`). Filed separately as #3109,
+# which re-ran the ticket's own repro on 2026-08-16 (stage0 pinned to 0.1.19
+# by then) and reconfirmed it: `BIT_STDLIB="$PWD/stdlib"
+# <v0.1.10's bin/bit> build runtime/gc -c --freestanding -o /dev/null` still
+# fails, `error[E0021]: expected 'function' or 'let' after an attribute, found
+# an identifier` at `runtime/gc/gc.bit:177` (the first `@nosplit fn`). This is
+# not something a repin will ever fix — v0.1.10 is frozen at release time, so
+# the parse failure against current source is permanent.
+#
+# The historical #2569 divergence itself still reproduces, on ERA-MATCHED
+# source — v0.1.10/v0.1.11 never need to parse today's tree, only the tree as
+# it stood the commit before the repin. No fixture is committed for this: the
+# source is one `git archive` away and both release binaries are one `curl`
+# away (same GitHub-releases path `scripts/stage0.sh` fetches from), and a
+# frozen copy would only be a second thing to go stale the same way this
+# recipe did. Re-run and reconfirmed by #3109 for the `gc` module (the other 5
+# named below follow the identical shape — swap the path):
+#
+#   git archive 32ce1ff3 runtime | tar -x -C "$SCRATCH/era"
+#   for v in 0.1.10 0.1.11; do
+#     curl -fsSL -o "$SCRATCH/$v.tar.xz" \
+#       "https://github.com/byteink/bit/releases/download/v$v/bit-$v-<triple>.tar.xz"
+#     tar xf "$SCRATCH/$v.tar.xz" -C "$SCRATCH/$v"
+#   done
+#   cd "$SCRATCH/era"
+#   "$SCRATCH/0.1.10"/*/bin/bit build runtime/gc -c --freestanding -o gc10.o
+#   "$SCRATCH/0.1.11"/*/bin/bit build runtime/gc -c --freestanding -o gc11.o
+#   cmp gc10.o gc11.o
+#
+# (<triple> is macos-aarch64 / linux-aarch64 / linux-x86_64 — the same host
+# mapping scripts/stage0.sh uses.) #3109 ran exactly this: both binaries build
+# the era-matched `gc` module cleanly (exit 0 each, 98826 bytes each), then
+# `cmp` exits 1 at byte 145 — the raw-byte divergence #2569 actually shipped,
+# reproduced without reasoning about it. #3109 also re-ran the atomic-width
+# signature this file actually gates on (aarch64's `atomicSignature()` below,
+# lifted into a scratch script rather than re-derived by hand):
+# `gc10.o` (v0.1.10, the bug) yields `{ldar x, ldaxr x, stlr x, stlxr w}` —
+# missing `ldaxr w` and `stlr w` entirely; `gc11.o` (v0.1.11, the fix) yields
+# both the `w` and `x` forms of each. That is #2569 exactly: v0.1.10 never
+# emits the 32-bit acquire/release form at all, because it always widens to
+# `x` regardless of the pointee's declared type.
+#
+# This block demonstrates the invariant catches the real bug ONCE; it needs
+# re-running only if the invariant itself changes, not on every stage0 repin.
+# The routine, every-run oracle stays the CURRENT pin via `scripts/stage0.sh`
+# below — never a hardcoded version, which is what made the old recipe go
+# stale in the first place.
 #
 # What this deliberately no longer asserts, on aarch64: that instruction
 # COUNT, SCHEDULE or SELECTION for anything but atomic width matches the
