@@ -1,0 +1,305 @@
+// Guards the seam `stepSelfhost` sits on (#3152). `artifacts.bit:412` links
+// THIS TREE's `libbitrt.a` (built from current `runtime/**` source) against a
+// compiler produced by `artifacts.bit:420` compiling `compiler/**` with the
+// PINNED stage0 — a previous release that never saw the current source.
+//
+// Both compilers are internally correct for the ABI each was written against.
+// The break is that `Op.RtCall` lowering (the compiler backend's lowering for
+// slice/map/chan-literal syntax, e.g. `[]T(n)`) hardcodes its callee's
+// argument count into whichever compiler emits the call — a property of that
+// compiler's own already-compiled machine code, not something `stage0 build
+// compiler` re-derives from `runtime/**` source at build time. So when a
+// `runtime/**` change adds a trailing parameter to an exported `bit_rt_*`
+// symbol, stage0 keeps emitting calls at the OLD arity no matter what the
+// tree's own copy of that function now declares. The linker resolves a
+// symbol NAME, not a signature, so this links cleanly; the callee then reads
+// an argument register the caller never wrote. #3152's concrete case:
+// `runtime/root/slices.bit`'s `rtSliceNew` gained a trailing `elemSize`
+// parameter, and the resulting `bit-out/bin/bit` allocated 11.3 GB in 3
+// seconds compiling a 12-line program — `elemSize` arriving as whatever `x3`
+// happened to hold, multiplied into `gcAllocRaw`'s size argument at
+// `runtime/root/root.bit:555`.
+//
+// No dump-based differential can see this: every `selfhost-diff*.sh`
+// compares two compilers' OUTPUT over the SAME source, and both compilers
+// here are self-consistent, so there is nothing to diff. The check below
+// instead compares SOURCE, before any expensive or dangerous build runs:
+// every `@symbol("bit_rt_x")`-exported `runtime/**` function's declared
+// parameter count in the working tree, against the SAME symbol's arity in
+// the git tag stage0 was cut from (`dist/stage0/SHA256SUMS`).
+//
+// WHY THIS IS A SOUND PROXY FOR STAGE0'S OWN OPAQUE CALL-SITE TABLE, which we
+// cannot read directly (it is machine code inside an already-built binary):
+// a release only ships once its own selfhost build and full suite pass
+// against that exact runtime, so within any single released tree, the
+// compiler backend's hardcoded RtCall arity for a symbol and that symbol's
+// own declared parameter count are — by construction, checked at release
+// time — the same number. Comparing declared signatures across the two
+// trees is therefore equivalent to comparing the two compilers' actual
+// call-site behaviour, without needing to disassemble either one.
+//
+// Deliberately narrow: only symbols present in BOTH trees are compared. A
+// brand new `@symbol(...)` export (present only in the working tree) is not
+// a stage0 arity mismatch — it is an undefined symbol at link time, which
+// the linker already reports on its own, with its own clear diagnostic.
+//
+// Text-based, not a real parser — verified sufficient for this corpus, not
+// assumed: `grep -rhA2 '@symbol(' runtime --include='*.bit' | grep '^fn ' |
+// grep -v ')'` returns empty (2026-08-16), so no exported runtime function's
+// signature spans more than one line, and no exported signature contains a
+// generic `<...>` type argument (checked separately: no `map<` or `chan<`
+// parameter type appears on any `@symbol`-decorated function).
+//
+// See docs/development.md, "Landing a runtime ABI change", for the two-pass
+// `BIT_STAGE0_BIN` bootstrap this check exists to steer a real arity change
+// toward, and for why `BIT_STAGE0_BIN` itself must skip this check rather
+// than fail it.
+
+import { trimSpace, indexOf, contains, split } from "std/strings"
+
+struct AbiSymbol {
+  name: string
+  arity: int
+  file: string
+}
+
+struct AbiMismatch {
+  symbol: string
+  file: string
+  treeArity: int
+  stage0Arity: int
+}
+
+// Reads the pinned stage0's version straight out of the committed digest
+// file rather than trusting its prose comment — `dist/stage0/SHA256SUMS`'s
+// own tail comment says "EXACTLY ONE LINE PER TRIPLE", so any one data line
+// yields the same version every other data line would.
+fn stage0Version(): (string, bool) {
+  let text = readFile("dist/stage0/SHA256SUMS") catch _ { return "", false }
+  let suffixes = ["-linux-aarch64.tar.xz", "-linux-x86_64.tar.xz", "-macos-aarch64.tar.xz"]
+  for line of split(text, "\n") {
+    let trimmed = trimSpace(line)
+    if (len(trimmed) == 0 || trimmed[0] == '#') {
+      continue
+    }
+    let bitAt = indexOf(trimmed, "bit-")
+    if (bitAt < 0) {
+      continue
+    }
+    for suf of suffixes {
+      if (hasSuffix(trimmed, suf)) {
+        let start = bitAt + len("bit-")
+        let stop = len(trimmed) - len(suf)
+        if (stop > start) {
+          return trimmed[start:stop], true
+        }
+      }
+    }
+  }
+  return "", false
+}
+
+// Extracts `runtime/**` exactly as it existed at `tag` into a scratch
+// directory, via `git archive` — local and instant when `tag` already exists
+// (every release tag does, in a normal non-shallow clone of this repo), and
+// refuses cleanly (non-zero, caught by the caller) rather than guessing when
+// it does not.
+fn extractStage0Runtime(tag: string): (string, bool) {
+  let dest = "bit-out/make/abiarity-stage0-runtime"
+  let script = "set -e\n" +
+    "git rev-parse --verify " + shQuote(tag + "^{commit}") + " >/dev/null\n" +
+    "rm -rf " + shQuote(dest) + "\n" +
+    "mkdir -p " + shQuote(dest) + "\n" +
+    "git archive " + shQuote(tag) + " -- runtime | tar -x -C " + shQuote(dest) + "\n"
+  let rc = runShell("abiarity-stage0-runtime", script, buildTimeoutMs())
+  if (rc != 0) {
+    return "", false
+  }
+  return dest + "/runtime", true
+}
+
+// Every exported symbol under `root`, keyed by its `@symbol("...")` string.
+fn parseAbiSymbols(root: string): []AbiSymbol {
+  let out = []AbiSymbol(0)
+  for p of walkBit(root) {
+    let text = readFile(p) catch _ { continue }
+    for sym of parseAbiSymbolsInFile(p, text) {
+      out = append(out, sym)
+    }
+  }
+  return out
+}
+
+// Handles both shapes actually present in `runtime/**` (verified by the
+// header's grep, 2026-08-16): `@symbol("x") fn name(...)` on one line, or
+// `@symbol("x")` on its own line immediately above the `fn` line.
+fn parseAbiSymbolsInFile(path: string, text: string): []AbiSymbol {
+  let out = []AbiSymbol(0)
+  let lines = split(text, "\n")
+  let n = len(lines)
+  let i = 0
+  while (i < n) {
+    let line = lines[i]
+    let marker = "@symbol(\""
+    let at = indexOf(line, marker)
+    if (at < 0) {
+      i = i + 1
+      continue
+    }
+    let nameStart = at + len(marker)
+    let rest = line[nameStart:]
+    let closeAt = indexOf(rest, "\"")
+    if (closeAt < 0) {
+      i = i + 1
+      continue
+    }
+    let symName = rest[:closeAt]
+    // Search for `fn ` starting at the closing quote, never at the start of
+    // `line` — a symbol string containing the two characters "fn" would
+    // otherwise be found before the real `fn` keyword. (Checked separately:
+    // no symbol name in this tree contains "fn", but the search is
+    // structured to not depend on that staying true.)
+    let afterSymbol = rest[closeAt:]
+    let fnLine = ""
+    let found = false
+    if (contains(afterSymbol, "fn ")) {
+      fnLine = afterSymbol
+      found = true
+    } else {
+      let j = i + 1
+      let bound = i + 4
+      if (bound > n) {
+        bound = n
+      }
+      while (j < bound && !found) {
+        if (contains(lines[j], "fn ")) {
+          fnLine = lines[j]
+          found = true
+        }
+        j = j + 1
+      }
+    }
+    if (found) {
+      let (arity, ok) = parseArity(fnLine)
+      if (ok) {
+        out = append(out, AbiSymbol{name: symName, arity: arity, file: path})
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Counts top-level (paren-depth-1) commas between the first `(` after `fn `
+// and its matching `)`, tracking depth so a nested parameter (e.g. a
+// function-typed parameter) cannot be miscounted. Zero-argument parses as
+// arity 0, not 1.
+fn parseArity(fnLine: string): (int, bool) {
+  let fnAt = indexOf(fnLine, "fn ")
+  if (fnAt < 0) {
+    return 0, false
+  }
+  let tail = fnLine[fnAt:]
+  let openAt = indexOf(tail, "(")
+  if (openAt < 0) {
+    return 0, false
+  }
+  let depth = 0
+  let k = openAt
+  let bodyStart = openAt + 1
+  let bodyEnd = -1
+  while (k < len(tail)) {
+    let c = tail[k]
+    if (c == '(') {
+      depth = depth + 1
+    } else if (c == ')') {
+      depth = depth - 1
+      if (depth == 0) {
+        bodyEnd = k
+        break
+      }
+    }
+    k = k + 1
+  }
+  if (bodyEnd < 0) {
+    return 0, false
+  }
+  let body = trimSpace(tail[bodyStart:bodyEnd])
+  if (len(body) == 0) {
+    return 0, true
+  }
+  let commaDepth = 0
+  let commas = 0
+  let m = 0
+  while (m < len(body)) {
+    let c = body[m]
+    if (c == '(') {
+      commaDepth = commaDepth + 1
+    } else if (c == ')') {
+      commaDepth = commaDepth - 1
+    } else if (c == ',' && commaDepth == 0) {
+      commas = commas + 1
+    }
+    m = m + 1
+  }
+  return commas + 1, true
+}
+
+// The entry point `stepSelfhost` calls before linking. Returns false (and
+// has already printed the diagnostic) when the build must not proceed.
+//
+// Skips itself under `BIT_STAGE0_BIN`: that override is not the pinned
+// release, so there is no committed tag to diff its tree against — and it is
+// the DOCUMENTED two-pass path for landing an arity change (see
+// docs/development.md), not a mismatch to refuse. Skips itself (with a
+// warning, not a failure) when the pinned version or its tag cannot be
+// resolved, so an infrastructure hiccup unrelated to this bug class does not
+// turn into a new, unrelated build failure.
+fn checkRuntimeAbiArity(): bool {
+  if (env("BIT_STAGE0_BIN") != "") {
+    return true
+  }
+  let (version, vok) = stage0Version()
+  if (!vok) {
+    eprint("make: selfhost: cannot resolve pinned stage0 version from dist/stage0/SHA256SUMS; skipping the runtime ABI arity check\n")
+    return true
+  }
+  let tag = "v${version}"
+  let (stage0RuntimeDir, dok) = extractStage0Runtime(tag)
+  if (!dok) {
+    eprint("make: selfhost: cannot extract runtime/** at ${tag} (tag missing locally, or `git archive` failed); skipping the runtime ABI arity check\n")
+    return true
+  }
+  let treeSymbols = parseAbiSymbols("runtime")
+  let stage0Symbols = parseAbiSymbols(stage0RuntimeDir)
+  // A near-empty parse of the tag's own tree is a fact about the extraction,
+  // not about the ABI — proceeding would silently trust an all-clear that
+  // was never actually checked.
+  if (len(stage0Symbols) < 10) {
+    eprint("make: selfhost: parsed only ${len(stage0Symbols)} exported symbol(s) from ${tag}'s runtime/** — too few to trust; skipping the runtime ABI arity check\n")
+    return true
+  }
+  let stage0Arity = map<string, int>{}
+  for s of stage0Symbols {
+    stage0Arity[s.name] = s.arity
+  }
+  let mismatches = []AbiMismatch(0)
+  for s of treeSymbols {
+    let (oldArity, ok) = stage0Arity[s.name]
+    if (ok && oldArity != s.arity) {
+      mismatches = append(mismatches, AbiMismatch{symbol: s.name, file: s.file, treeArity: s.arity, stage0Arity: oldArity})
+    }
+  }
+  if (len(mismatches) == 0) {
+    return true
+  }
+  eprint("make: selfhost: refusing to link — runtime ABI arity mismatch against the pinned stage0 (${tag}):\n")
+  for m of mismatches {
+    eprint("make:   ${m.symbol} (${m.file}): stage0 (${tag}) emits calls for ${m.stage0Arity} arg(s); this tree's runtime/** now declares ${m.treeArity}\n")
+  }
+  eprint("make: stage0's call-site lowering for these symbols is baked into its own compiled machine code and does not re-read runtime/** — linking would succeed and the callee would read an unwritten argument register (#3152).\n")
+  eprint("make: land this with the two-pass BIT_STAGE0_BIN bootstrap instead (docs/development.md, \"Landing a runtime ABI change\"):\n")
+  eprint("make:   ./make                                       # pass 1: stage0 -> a compiler built from the new compiler/** source\n")
+  eprint("make:   BIT_STAGE0_BIN=\\$PWD/bit-out/bin/bit ./make   # pass 2: that compiler -> the correct runtime, linked correctly\n")
+  return false
+}
