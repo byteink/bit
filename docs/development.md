@@ -60,6 +60,82 @@ bootstrap, including re-verifying and possibly re-fetching stage0, is the most
 expensive operation in this repo — so run it explicitly before a release,
 before merging to main, or right after a stage0 repin.
 
+### Landing a runtime ABI change
+
+**Changing an exported `runtime/**` symbol's arity or parameter types needs
+the two-pass `BIT_STAGE0_BIN` bootstrap (#1857) — a single `./make selfhost`
+is not safe for it, and #3152 is why.** `stepSelfhost`
+(`tools/build/artifacts.bit:399`) links THIS TREE's `libbitrt.a` (line 412,
+built from current `runtime/**` source) against a compiler produced by
+compiling `compiler/**` with the PINNED stage0 (line 420) — a previous
+release that never saw the new signature. `Op.RtCall` lowering (the backend's
+lowering for slice/map/chan-literal syntax, e.g. `[]T(n)`) hardcodes its
+callee's argument count into whichever compiler emits the call, as a property
+of that compiler's own already-compiled machine code — not something `stage0
+build compiler` re-derives from `runtime/**` source. So stage0 keeps emitting
+calls at the OLD arity no matter what the tree's own copy of that function
+now declares. The linker resolves a symbol NAME, not a signature, so this
+links without error; the callee then reads an argument register the caller
+never wrote.
+
+#3152's concrete case: `runtime/root/slices.bit`'s `rtSliceNew` (and three
+neighbouring exports) gained a trailing `elemSize` parameter, and the
+resulting `bit-out/bin/bit` allocated 11.3 GB in 3 seconds compiling a
+12-line program — the COMPILER'S OWN internal slice allocations (not
+anything about the input program) read `elemSize` from whatever register
+`x3` happened to hold, multiplied into `gcAllocRaw`'s size argument at
+`runtime/root/root.bit:555`.
+
+**`./make selfhost` now refuses this class of change outright, before
+linking, with a diagnostic naming every mismatched symbol**
+(`tools/build/abiarity.bit`, `checkRuntimeAbiArity`, called from
+`stepSelfhost`). It diffs every `@symbol(...)`-exported `runtime/**`
+function's declared parameter count in the working tree against the same
+symbol's arity in the git tag stage0 was cut from
+(`dist/stage0/SHA256SUMS`) — a sound proxy for stage0's own opaque,
+unreadable call-site table, because a release only ships once its own
+selfhost build and full suite pass against that exact runtime, so within any
+single released tree the compiler backend's hardcoded arity for a symbol and
+that symbol's own declared signature are, by construction, the same number.
+The comparison is keyed by (file, symbol name), not symbol name alone — a
+name like `_start` or `bit_rt_port_park_mono_ns` is legitimately exported
+with a different arity from `runtime/root/darwin/` and `runtime/root/linux/`
+files, since only one platform's file compiles per target; a flat
+name-keyed map produced two false positives on an unmodified tree before
+this was fixed. See `tools/build/abiarity.bit`'s own header for the full
+reasoning and its documented narrow edge (a symbol renamed in the same
+change that also changes its arity is not caught).
+
+The check skips itself when `BIT_STAGE0_BIN` is set: that override is not
+the pinned release, so there is no committed tag to diff its tree against —
+and it is precisely the supported recovery path, not a mismatch to refuse.
+The fix, once the diagnostic fires, is the same two-pass bootstrap
+`scripts/stage0.sh`'s own header documents for #1857:
+
+```sh
+./make                                       # pass 1: stage0 -> a compiler built from the new compiler/** source
+BIT_STAGE0_BIN=$PWD/bit-out/bin/bit ./make   # pass 2: that compiler -> the correct runtime, linked correctly
+```
+
+Pass 1 builds `bit-out/bin/bit` from the new `compiler/**` source using the
+old stage0 and the still-consistent OLD runtime archive — safe, because only
+under-supply corrupts (an unread extra argument register is harmless) and
+pass 1 supplies exactly what the old runtime expects. Pass 2 rebuilds
+`libbitrt.a` from the new `runtime/**` and relinks with `BIT_STAGE0_BIN`
+pointed at pass 1's own output — a compiler built from the new
+`compiler/**` source, so it already emits the new arity. Once pass 2's
+result is released, repin `dist/stage0/SHA256SUMS` to it; a single pass is
+correct again after that, same as any other `BIT_STAGE0_BIN` recovery.
+
+**Regression coverage for the escape hatch itself is `./make
+test-stage0override`** (#3118, `tests/bit/stage0override.bit`): asserts
+`BIT_STAGE0_BIN` is actually honoured (not silently ignored) and that
+`fingerprint()`'s override-hashing invalidates the `libbitrt` cache when the
+override binary's content changes at a fixed path. It does not assert that a
+two-pass ABI-change bootstrap produces a *correct* runtime — that is a
+property of the specific change being landed — only that the mechanism
+itself works as documented.
+
 ## Does `./make libbitrt` build `runtime/**` with the tree compiler? (#3054)
 
 **No — it stays pinned-stage0-built by default.** The status quo is not free of
