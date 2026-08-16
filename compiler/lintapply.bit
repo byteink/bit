@@ -543,6 +543,15 @@ fn lintShadowedLocal(src: string, file: int, d: Diagnostics) {
 // actually reuses the slice afterward — that is the whole-program view this
 // rule avoids. A same-named local `let` shadowing the parameter is a false
 // positive this rule accepts rather than resolves (spec/LINT.md §4).
+//
+// One alias hop IS tracked (#3205): `let out = dst` makes `out` a direct copy
+// of a slice-typed parameter's value for the rest of the function, so
+// `append(out, ...)` carries the identical risk as `append(dst, ...)` and is
+// reported under `dst`'s name — otherwise this rule's own coverage silently
+// stops at the first assignment. Still one level only: `let b = out` (a copy
+// of a copy) is not chased, and neither is a slice expression or a call
+// result on the right-hand side. That remains general alias analysis, which
+// this rule declines to do.
 fn lintAppendAliasing(tree: Tree, src: string, file: int, d: Diagnostics) {
   let i = 1
   while (i < len(tree.nodes)) {
@@ -561,8 +570,9 @@ fn lintAppendAliasingFunc(tree: Tree, src: string, file: int, funcNode: int, d: 
   if (len(names) == 0) {
     return
   }
-  let protected = lintProtectedAppends(tree, src, k[5], []int(0))
-  lintFindAppendAliasing(tree, src, file, k[5], names, protected, d)
+  let protected = lintProtectedAppends(tree, src, k[5], names, []int(0))
+  let aliases = lintCollectAppendAliases(tree, src, k[5], names, []LintAppendAlias(0))
+  lintFindAppendAliasing(tree, src, file, k[5], names, aliases, protected, d)
 }
 
 // The names of `params`' slice-typed parameters (`param = [name, type]`,
@@ -611,13 +621,75 @@ fn lintAppendFirstArgName(tree: Tree, src: string, node: int): string {
   return src[expr.span.start:expr.span.end]
 }
 
+// A local's name paired with the slice-typed parameter it was bound from by
+// a direct `let <local> = <param>` (#3205) — one alias hop, tracked so
+// `append(<local>, ...)` can still be reported under the parameter's name.
+struct LintAppendAlias {
+  local: string,
+  param: string,
+}
+
+// Every `let <local> = <param>` in `node`'s subtree where `param` is a bare
+// identifier naming one of `names` (this function's slice-typed parameters).
+// Only a direct copy counts: a slicing expression, a call result, or a second
+// hop (`let b = out` where `out` is itself an alias) is not `Tag.Ident`-to-
+// `Tag.Ident` and is silently skipped, per the narrow scope above.
+fn lintCollectAppendAliases(tree: Tree, src: string, node: int, names: []string,
+  out: []LintAppendAlias): []LintAppendAlias {
+  if (node == 0) {
+    return out
+  }
+  let n = getNode(tree, node)
+  if (n.tag == Tag.LetDecl) {
+    for b of kidsOf(tree, node) {
+      let bk = kidsOf(tree, b)
+      let pat = getNode(tree, bk[0])
+      let init = bk[2]
+      if (pat.tag == Tag.Ident && init != 0 && getNode(tree, init).tag == Tag.Ident) {
+        let initNode = getNode(tree, init)
+        let paramName = src[initNode.span.start:initNode.span.end]
+        if (lintContainsString(names, paramName)) {
+          out = append(out, LintAppendAlias{
+            local: src[pat.span.start:pat.span.end],
+            param: paramName,
+          })
+        }
+      }
+    }
+  }
+  for kid of kidsOf(tree, node) {
+    out = lintCollectAppendAliases(tree, src, kid, names, out)
+  }
+  return out
+}
+
+// The parameter `name` aliases via `aliases`, or "" if `name` is not a
+// tracked alias.
+fn lintAppendAliasParam(aliases: []LintAppendAlias, name: string): string {
+  let i = 0
+  while (i < len(aliases)) {
+    if (aliases[i].local == name) {
+      return aliases[i].param
+    }
+    i = i + 1
+  }
+  return ""
+}
+
 // Every `append` call node, anywhere under `node`, whose result is assigned
 // straight back to the same name it was called on — `p = append(p, x)` — and
 // so must not be flagged. Only this exact shape counts: routing the result
 // through a temporary before reassigning is indistinguishable, from the AST,
 // from never reassigning it at all, so it is not specially recognised either
 // (accepted per spec/LINT.md — override, don't chase the flow).
-fn lintProtectedAppends(tree: Tree, src: string, node: int, out: []int): []int {
+//
+// `names` restricts this to `p` itself being one of the function's own
+// parameters (spec/LINT.md: "assigned back to that same parameter"). This
+// matters since #3205: `out = append(out, ...)` where `out` is a `let`-alias
+// of a parameter must NOT land here — reassigning the LOCAL does not make the
+// function the owner of the PARAMETER's backing array, so that call still
+// needs to reach lintFindAppendAliasing and be reported.
+fn lintProtectedAppends(tree: Tree, src: string, node: int, names: []string, out: []int): []int {
   if (node == 0) {
     return out
   }
@@ -631,7 +703,7 @@ fn lintProtectedAppends(tree: Tree, src: string, node: int, out: []int): []int {
       let lhsNode = getNode(tree, lhs[i])
       if (lhsNode.tag == Tag.Ident && lintIsAppendCall(tree, src, rhs[i])) {
         let lhsName = src[lhsNode.span.start:lhsNode.span.end]
-        if (lintAppendFirstArgName(tree, src, rhs[i]) == lhsName) {
+        if (lintContainsString(names, lhsName) && lintAppendFirstArgName(tree, src, rhs[i]) == lhsName) {
           out = append(out, rhs[i])
         }
       }
@@ -639,22 +711,29 @@ fn lintProtectedAppends(tree: Tree, src: string, node: int, out: []int): []int {
     }
   }
   for kid of kidsOf(tree, node) {
-    out = lintProtectedAppends(tree, src, kid, out)
+    out = lintProtectedAppends(tree, src, kid, names, out)
   }
   return out
 }
 
 // Reports every unprotected `append` call in `node`'s subtree whose first
-// argument is one of `names` (this function's slice-typed parameters).
+// argument is one of `names` (this function's slice-typed parameters) or a
+// local aliasing one of them via `let <local> = <param>` (#3205, `aliases`)
+// — reported under the PARAMETER's name either way, so the finding stays
+// actionable regardless of which spelling the call site used.
 fn lintFindAppendAliasing(tree: Tree, src: string, file: int, node: int,
-  names: []string, protected: []int, d: Diagnostics) {
+  names: []string, aliases: []LintAppendAlias, protected: []int, d: Diagnostics) {
   if (node == 0) {
     return
   }
   let n = getNode(tree, node)
   if (n.tag == Tag.Call && lintIsAppendCall(tree, src, node) && !lintContainsInt(protected, node)) {
     let argName = lintAppendFirstArgName(tree, src, node)
-    if (argName != "" && lintContainsString(names, argName)) {
+    let reportName = argName
+    if (argName != "" && !lintContainsString(names, argName)) {
+      reportName = lintAppendAliasParam(aliases, argName)
+    }
+    if (argName != "" && reportName != "") {
       // #3093: this rule read `n.span` verbatim and every node's `.file` was
       // always 0 (compiler/parser.bit's `leaf`/`spanOfKids`/`mkSpanNode`
       // hardcoded it, ignoring the real file threaded through `Parser.file`)
@@ -664,15 +743,15 @@ fn lintFindAppendAliasing(tree: Tree, src: string, file: int, node: int,
       // as the established, harmless pattern this file already uses
       // (`lintMaxParams`/`lintDeferInLoop` above do the same).
       warn(d, ecLintAppendAliasing, Span{ file: file, start: n.span.start, end: n.span.end },
-        "append on parameter '${argName}' may alias the caller's backing array",
-        "if '${argName}' is owned by this function, silence just this call with `// bit:lint allow " +
+        "append on parameter '${reportName}' may alias the caller's backing array",
+        "if '${reportName}' is owned by this function, silence just this call with `// bit:lint allow " +
           "E0214 -- <reason>` on the line above, or the whole file with `// bit:lint disable " +
           "append-aliasing -- <reason>` in the leading comment block; otherwise assign the result back: " +
-          "${argName} = append(${argName}, ...)")
+          "${reportName} = append(${reportName}, ...)")
     }
   }
   for kid of kidsOf(tree, node) {
-    lintFindAppendAliasing(tree, src, file, kid, names, protected, d)
+    lintFindAppendAliasing(tree, src, file, kid, names, aliases, protected, d)
   }
 }
 

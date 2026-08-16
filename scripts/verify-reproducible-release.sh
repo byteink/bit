@@ -75,6 +75,24 @@ PUBLISHED_DIR="${2:-}"
 VERSION="${TAG#v}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# #3195, hazard 2: scripts/stage0.sh honours BIT_STAGE0_BIN from the ambient
+# environment (stage0.sh:91) -- the documented two-pass override for landing
+# a runtime ABI change (tools/build/abiarity.bit's own printed
+# instructions). If a shell that just cut a release still has it exported
+# when this script runs, BOTH the L0 arity guard below and C1's stage0
+# invocation would silently use that override instead of the tag's OWN
+# pinned stage0, comparing a binary against itself and reporting every tag
+# reproducible. Refuse rather than inherit -- stage0.sh:98 only warns to
+# stderr, which is not a refusal, and this script must be the one place that
+# insists.
+EXIT_INHERITED_STAGE0=2
+if [ -n "${BIT_STAGE0_BIN:-}" ]; then
+  echo "verify-reproducible-release.sh: BIT_STAGE0_BIN=${BIT_STAGE0_BIN} is set in the calling environment; refusing to inherit it." >&2
+  echo "verify-reproducible-release.sh: this script must resolve each tag's OWN pinned stage0 to prove reproducibility -- an inherited override would silently compare a binary against itself." >&2
+  echo "verify-reproducible-release.sh: unset it and re-run: env -u BIT_STAGE0_BIN scripts/verify-reproducible-release.sh ${TAG} ..." >&2
+  exit "${EXIT_INHERITED_STAGE0}"
+fi
+
 git -C "${ROOT}" rev-parse --verify "${TAG}" >/dev/null 2>&1 || {
   echo "verify-reproducible-release.sh: tag '${TAG}' not found locally — git fetch --tags?" >&2
   exit 1
@@ -104,8 +122,31 @@ fi
 git -C "${ROOT}" worktree add --detach "${WORK}/src" "${TAG}" >/dev/null
 
 echo "L0: building bootstrap runtime archives at ${TAG}..."
-( cd "${WORK}/src" && ./make libbitrt ) >"${WORK}/build.log" 2>&1 ||
-  { echo "verify-reproducible-release.sh: ./make libbitrt failed, see ${WORK}/build.log" >&2; exit 1; }
+# #3195, hazard 1: this attempt is ALSO the seam detector. #3152's guard
+# (tools/build/abiarity.bit, wired into stepLibbitrt) refuses to link
+# whenever this tag's runtime/** ABI has moved past the pin its own
+# dist/stage0/SHA256SUMS records -- exactly the case a single-pass rebuild
+# can never satisfy (the pin that could build it is the release being cut).
+# Recognise that refusal by its own diagnostic text rather than
+# pattern-matching runtime/** ourselves, and give it a DISTINCT exit code
+# and an unswallowed message -- previously this failure looked identical to
+# every other build failure: buried in build.log, exit 1.
+EXIT_ABI_SEAM=3
+L0_RC=0
+( cd "${WORK}/src" && ./make libbitrt ) >"${WORK}/build.log" 2>&1 || L0_RC=$?
+if [ "${L0_RC}" -ne 0 ]; then
+  if grep -q 'runtime ABI arity mismatch against the pinned stage0' "${WORK}/build.log"; then
+    pinned_tag="$(grep -m1 'runtime ABI arity mismatch against the pinned stage0' "${WORK}/build.log" |
+      grep -oE '\(v[^)]*\)' | tr -d '()')"
+    echo "verify-reproducible-release.sh: ${TAG} cannot be verified by a single-pass build." >&2
+    echo "verify-reproducible-release.sh: its own dist/stage0/SHA256SUMS pins ${pinned_tag:-an earlier release}, whose runtime/** predates a runtime ABI change now present in ${TAG} -- #3152's guard correctly refuses to link the mismatched pair (unsafe, not merely unavailable)." >&2
+    echo "verify-reproducible-release.sh: reproducing ${TAG} needs the two-pass BIT_STAGE0_BIN bootstrap (docs/development.md, \"Landing a runtime ABI change\"); this script does not perform that rebuild. Guard output:" >&2
+    sed -n '/runtime ABI arity mismatch against the pinned stage0/,$p' "${WORK}/build.log" >&2
+    exit "${EXIT_ABI_SEAM}"
+  fi
+  echo "verify-reproducible-release.sh: ./make libbitrt failed, see ${WORK}/build.log" >&2
+  exit 1
+fi
 
 # THE PINNED STAGE0 AT THIS TAG, never a compiler built from this tree — same
 # reason dist/release.sh uses it and the differentials use it as their oracle:
@@ -136,6 +177,22 @@ echo "stage0 = ${STAGE0}"
 # side effects (it writes bit-out/make/*.stamp, bit-out/make/host.triple), and
 # spelling the recipe out here keeps it auditable as the one thing stage0 is
 # still trusted to build.
+#
+# #3195: because this is a raw stage0 invocation rather than a `./make` step,
+# it never calls checkRuntimeAbiArity() itself and would silently link a
+# mismatched pair if reached unguarded (the same 11.3 GB/3s defect #3152
+# exists to prevent). It is safe ONLY because L0 above already ran that exact
+# check (`./make libbitrt` -> stepLibbitrt) against this same ${WORK}/src
+# tree and did not exit — checkRuntimeAbiArity() is a pure function of (this
+# tree's runtime/**, the tag stage0 was cut from), and nothing between L0 and
+# here writes to runtime/**, so L0's verdict is authoritative here too.
+# Assert that invariant instead of trusting it silently, so a future reorder
+# that separates L0 from C1 trips a clear error instead of quietly
+# unguarding this call.
+[ "${L0_RC}" -eq 0 ] || {
+  echo "verify-reproducible-release.sh: internal error: reached C1 without L0's ABI arity guard having passed (L0_RC=${L0_RC})" >&2
+  exit 1
+}
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)              HOST_TRIPLE=aarch64-macos ;;
   Linux-aarch64|Linux-arm64) HOST_TRIPLE=aarch64-linux ;;
@@ -190,11 +247,42 @@ real="$(find "${WORK}/src/compiler" -maxdepth 1 -name '*.bit' | wc -l | tr -d ' 
 # produced the bytes on disk. All three built up front because dist/package.sh
 # embeds every target's archive into every target's tarball, regardless of
 # which one it is packaging.
+#
+# #3206: THE TAG'S OWN stdlib, set explicitly for every bit1 invocation below
+# that does not `cd "${WORK}/src"` first (L1 here, and C2 further down).
+# Unlike L0 (:136) and C1 (:210), neither loop changes directory, so absent
+# this override bit1's stdRootPath() (compiler/mainpaths.bit:73-82) falls
+# through BIT_STDLIB -> resolveNearExe("stdlib") -> the bare relative
+# "stdlib", which resolves against the CALLER's cwd, not the tag's tree.
+# bit1 lives at "${WORK}/src/bit-out/bin/bit" (a build-tree location —
+# mainpaths.bit:99-102 names this exact case), where resolveNearExe finds no
+# sibling stdlib/ either, so the fallthrough was total. No version stamp
+# applies to stdlib the way C2's STAGE_SRC stamps compiler/version.bit, so
+# the checked-out tree's stdlib/ IS the tag's stdlib as-is.
+#
+# The guard below is the fix, not a belt-and-braces extra: a silently wrong
+# stdlib is exactly how this bug shipped a false PASS (a tag whose stdlib
+# happens to match the caller's checkout compiles clean and compares clean).
+# Asserting the path is unconditionally inside ${WORK} makes a future
+# fallthrough here impossible to introduce silently, not merely unlikely.
+STDLIB1="${WORK}/src/stdlib"
+case "${STDLIB1}" in
+  "${WORK}"/*) : ;;
+  *)
+    echo "verify-reproducible-release.sh: internal error: resolved stdlib path ${STDLIB1} does not lie inside ${WORK}" >&2
+    exit 1
+    ;;
+esac
+[ -d "${STDLIB1}" ] || {
+  echo "verify-reproducible-release.sh: missing ${STDLIB1} (the ${TAG} worktree has no stdlib/?)" >&2
+  exit 1
+}
+
 LIB1="${WORK}/lib1"
 for TARGET in x86_64-linux aarch64-linux aarch64-macos; do
   echo "L1: building runtime archive for ${TARGET} with bit1..."
   mkdir -p "${LIB1}/${TARGET}"
-  BIT="${BIT1}" bash "${WORK}/src/scripts/g2archive.sh" "${TARGET}" "${LIB1}/${TARGET}/libbitrt.a" ||
+  BIT="${BIT1}" BIT_STDLIB="${STDLIB1}" bash "${WORK}/src/scripts/g2archive.sh" "${TARGET}" "${LIB1}/${TARGET}/libbitrt.a" ||
     { echo "verify-reproducible-release.sh: L1 build failed for ${TARGET}" >&2; exit 1; }
 done
 
@@ -243,9 +331,14 @@ for TARGET in x86_64-linux aarch64-linux aarch64-macos; do
   # resolves libbitrt.a relative to itself absent an override, which is the L0
   # archive under bit-out/lib, never ${archive} — L1 lives entirely under
   # ${WORK} and bit1's sibling lib/ cannot see it.
+  #
+  # BIT_STDLIB="${STDLIB1}" is the #3206 fix, load-bearing the same way: this
+  # step does not `cd "${WORK}/src"` either, so bit1 would otherwise resolve
+  # `import from "std/..."` in compiler/ (25 such imports, unlike runtime/'s
+  # zero) against whatever directory this script happened to be invoked from.
   echo "C2: rebuilding ${TARGET} with bit1..."
   mkdir -p "${WORK}/build-${TARGET}/stage/bin"
-  BIT_LIBBITRT="${archive}" "${BIT1}" build "${STAGE_SRC}" --target "${TARGET}" \
+  BIT_LIBBITRT="${archive}" BIT_STDLIB="${STDLIB1}" "${BIT1}" build "${STAGE_SRC}" --target "${TARGET}" \
     -o "${WORK}/build-${TARGET}/stage/bin/bit"
   chmod +x "${WORK}/build-${TARGET}/stage/bin/bit"
   # [archivedir] passed EXPLICITLY as ${LIB1}, not left to package.sh's
