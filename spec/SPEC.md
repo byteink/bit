@@ -3120,8 +3120,9 @@ it. `error` is a type name, so the constructor cannot itself be named `error`
 ### 18.4 Panics
 
 A **panic** is an immediate, unrecoverable abort of the program with a message and
-a stack trace to stderr, and a non-zero exit code. Panics are for programmer
-errors and broken invariants, never for expected failures. Sources of panic:
+a stack trace to stderr (§18.6), and a non-zero exit code. Panics are for
+programmer errors and broken invariants, never for expected failures. Sources of
+panic:
 
 - index/slice out of range; integer divide-by-zero; signed overflow in debug
   builds (§13.5);
@@ -3149,6 +3150,193 @@ must happen before the process can die — releasing a lock, deleting a temp fil
 has to run explicitly, before the call that may panic. Deferred call arguments are
 evaluated at the `defer` statement, not at execution time. `defer` gives
 deterministic resource release without finalizers on every path that returns.
+
+### 18.6 Caller Location and Stack Traces (#2905)
+
+No mechanism exists in v0.1 for a callee to learn its call site's `file:line`,
+and a panic today reports nothing beyond its message. **Decision: v1 will get
+caller location and full stack traces from debug info emitted by both object
+writers, read back by a runtime stack walk at panic time.** This entry records
+the decision and its cost; it does not implement it — parser, checker, IR,
+codegen, both object writers, and the runtime walker are all separate,
+follow-on tickets, and none of them lands here.
+
+**This reverses a documented v1 position, and says so rather than superseding
+it silently.** `runtime/ABI.md` §12 ("Panics") currently states, verbatim:
+*"There is no `recover` (SPEC.md §18.4) and v1 emits no stack trace — codegen
+has made no frame-pointer-chain promise this runtime could walk, and there is
+no debug-info format yet to symbolize one if it did."* Both halves of that
+sentence are now deliberately becoming false: codegen will make that promise,
+and a debug-info format will exist to symbolize a walk with. `runtime/ABI.md`
+itself is not edited here — this ticket's own constraints keep it out of
+`runtime/` — so that document still reads as it did until a follow-on ticket
+updates it; this entry is what authorizes that update. §18.4 above already
+claims "a message and a stack trace to stderr" for every panic; until this
+decision, that clause named no reachable implementation and flatly
+contradicted `runtime/ABI.md`'s own text. This is what commits to making it
+true.
+
+**What this costs**, stated up front because choosing this shape over the
+narrower ones requires saying so:
+
+- **A debug-info format** (DWARF, or a minimal custom format — left to the
+  implementation ticket) and its emission in **both** object writers
+  (`emitmacho.bit`, `emitelf.bit`). Bit already carries one bespoke,
+  non-strippable section pair for a structurally similar job — `.bit_gc` /
+  `__DATA,__bit_gc`, walked via `bit_stack_maps` / `bit_stack_maps_end`
+  (`runtime/ABI.md` §4) — the closest existing precedent for a second,
+  address-keyed side table, though nothing here mandates reusing that exact
+  format.
+- **Source-location tracking through IR that does not carry it today.**
+  `IrInstr` (`compiler/ir.bit:180-195`) has no span or line field on any of
+  its fields. Every instruction's originating source position is discarded
+  once lowering emits it (`cn.span` is read only for `fcFail` diagnostics in
+  `compiler/lowercall.bit`, e.g. lines 61/72/94, and never stored on the
+  `Op.RtCall` it emits for `panic`/`assert`); a debug-info emitter needs that
+  position recovered and carried through to codegen.
+- **A wider frame-pointer-chain promise from codegen than exists today** —
+  not a promise invented from nothing. Codegen already builds a frame-pointer
+  chain for the GC's stack-map walker: `runtime/ABI.md` §4 ("Frame chain")
+  states *"Both backends establish an identical frame record: `*(fp)` is the
+  caller's frame pointer and `*(fp+8)` is the return address."* But that
+  promise is not universal today. `#2929`'s `frameless` optimization
+  (`compiler/arm64compile.bit:506-525`) elides the frame record entirely for
+  any function that makes no call and closes no loop back-edge, and its own
+  comment says why that is sound *today*: "this backend's panic path never
+  walks a frame chain at all," quoting the `bit_rt_panic` doc comment
+  (`runtime/root/darwin/io.bit:281-282`, `runtime/root/linux/io.bit:323-324`:
+  *"No stack trace: codegen makes no frame-pointer-chain promise..."*). A
+  frameless leaf can still contain one of §12.1's backend-injected,
+  argument-free panics (`bit_rt_panic_div_zero`, `bit_rt_panic_nil_call`,
+  `bit_rt_panic_nil_iface`), which are deliberately excluded from
+  `hasSafepoints` on that same reasoning. Once a walk exists, the reasoning
+  is gone: this decision requires revisiting `#2929` for the panic-reachable
+  subset of frameless functions, which is a real codegen change, not a
+  no-op.
+- **Symbolization that still works on a binary a user has run `strip` on.**
+  Nothing in the current release pipeline strips (`dist/release.sh`,
+  `tools/build/` invoke no `strip`), so this is a forward design constraint,
+  not a fix to an existing gap: like `.bit_gc`, the new debug-info section
+  must not be ordinary native symbol-table data, or an end user's own `strip`
+  silently blinds the walker with no error and no diagnostic.
+- **Handling for inlined frames** — see below.
+
+**The four required questions:**
+
+1. **Across a non-inlined call boundary:** straightforward, and it is exactly
+   what the frame-pointer chain already exists to support. When
+   `bit_rt_panic` or `bit_rt_assert` runs, the runtime captures the return
+   address and frame pointer of the frame that called it — the same
+   "snapshot" shape `bit_rt_safepoint` already uses (`runtime/ABI.md` §4,
+   "Snapshot") — then steps `*(fp)` / `*(fp+8)` outward, converting each
+   return address to a `file:line` through the debug-info table, exactly as
+   the stack-map walker already converts a `pc` to a function's code range.
+   The walk ends where §4's already does: "`pc` leaving every function's
+   range ends the Bit portion of the stack."
+2. **Through two levels of helper:** this is where a stack walk is strictly
+   better than every rejected alternative. The trace names every physical
+   frame from the panic site outward — the failing assertion, the helper
+   that called it, the helper that called that, the test function, on to
+   `main` — with **no per-function annotation required anywhere in the
+   chain**. An implicit-parameter shape (`@caller_location`, rejected below)
+   only reaches as far as whichever function is explicitly marked; an
+   unmarked intermediate helper reports itself as the "caller" instead of
+   forwarding its own caller — the exact failure mode Rust's
+   `#[track_caller]` has, which is why Rust requires re-annotating every hop
+   to keep working through helpers. This design has no such failure mode: a
+   walk needs no per-function opt-in at all.
+3. **Check time versus runtime:** **runtime only.** There is no
+   constant-folded location anywhere in this design — the compiler cannot
+   know, at check time, which call chain will be live when a given function
+   panics, since the same function can be reached from many call sites. This
+   is a real difference from the rejected `@caller_location` shape, which
+   resolves per call site and could have been baked into the call as a
+   compile-time literal. Do not assume this decision gives that; it does
+   not. A Bit stack trace's contents are only knowable by running the
+   program to the point of failure.
+4. **Frozen ABI signatures: unchanged — confirmed by reading, not assumed.**
+   `bit_rt_panic(msg: *const RtBytes) -> noreturn` and
+   `bit_rt_assert(cond: bool, msg: *const RtBytes) -> void`
+   (`runtime/ABI.md` §12, table entries and detail rows; both `@nosplit` —
+   `runtime/root/darwin/io.bit:283,291`, `runtime/root/linux/io.bit:325,333`)
+   take no location parameter today and need none under this design: the
+   walk starts from the panic call's own frame, discovered by the runtime
+   from the stack it is already standing on when it runs, not passed in as
+   an argument. **This is not an ABI change.** If a future implementation
+   ticket ever needs to widen either signature after all, that is the moment
+   to say so explicitly in `runtime/ABI.md`, per that document's own rule
+   that a frozen signature never changes silently.
+
+**Inlined frames — the question this decision creates and must answer.**
+`maxInlineDepth()` is 2 and splicing is recursive (`compiler/optinline.bit:10-44`,
+#3163): level 1 splices the callee's body whole into the caller; level 2
+splices a call already inside that spliced body the same way. A call the
+source shows as two or three frames deep can exist as **one** physical frame
+at runtime, because the optimizer flattened it before codegen ever built a
+frame for it. A stack walk can only report frames that physically exist —
+**an inlined call contributes no frame of its own to the trace**, the same way
+an inlined function contributes no frame to a walked C stack trace. That is
+not a defect; it is what "the emitted code" means. What this decision commits
+to: the trace's *innermost* entry must still report the correct source
+`file:line` for the instruction that actually panicked, even when that
+instruction originated inside a callee whose call was inlined away — which
+requires the debug-info emitter to retain each spliced instruction's
+**original** source span rather than relabeling it with the splice site's
+span, a distinction that does not exist yet (`IrInstr` carries no span at all,
+spliced or otherwise — see cost above). Getting the leaf line right and
+getting one frame per syntactic call are different guarantees; this decision
+commits to the first and explicitly not to the second. A trace can therefore
+be shorter than the source's call nesting suggests, with nothing in the trace
+itself distinguishing "inlined away" from "never a separate call" — whether to
+add such a marker is left to the implementation ticket.
+
+**Rejected alternatives, and why:**
+
+- **A `@caller_location`-style implicit parameter** (Rust's `#[track_caller]`
+  shape). This needs less new machinery than the chosen shape — a parser
+  attribute, a checker rule (§10.3.1, Function Attributes), and lowering to
+  thread one implicit argument per attributed call — but it only ever reports
+  the immediate, explicitly marked caller (point 2 above), it requires every
+  function on a reporting path to opt in, and it would have served
+  `std/testing` alone rather than also giving every Bit program real stack
+  traces on any panic. The owner was shown both shapes and their costs and
+  chose the general one on purpose.
+- **A predeclared `__LINE__`/`__FILE__`-style identifier.** §5.3's
+  predeclared-identifier list is exhaustive (the primitive types, the
+  `true`/`false`/`nil` literals, the builtin functions, `parseFloat`) and
+  names nothing of the kind. There is no slot in the language for a token
+  whose value depends on where it is written, and even if there were, it
+  would report only its *own* location, not a caller's — it does not solve
+  this problem even in principle.
+- **Default arguments evaluated at the call site**, plus predeclared `file`/
+  `line` defaults (how Swift's `#file`/`#line` parameter defaults work). Bit
+  has **no default-argument feature at all**: §10.3's function-declaration
+  grammar (`param = [ "..." ] IDENT ":" type .`) has no default-value
+  production for any parameter, of any type. This route does not exist even
+  in principle without first shipping default arguments as their own,
+  unrelated, larger language feature — layering a whole feature onto the
+  back of one diagnostics fix was rejected as disproportionate.
+- **Passing a location down explicitly**, as an ordinary string argument. The
+  only option available to a library today with no compiler change at all,
+  and it fails on its own terms: with no `__LINE__` equivalent the caller
+  must hand-type `"foo_test.bit:11"`, and nothing enforces that the literal
+  matches the call site — it is wrong the moment a line moves. A confidently
+  wrong `file:line` is worse than today's honest absence of one, so this was
+  never a candidate worth shipping.
+- **Wontfix for v1.** Rejected: the owner explicitly preferred the general
+  mechanism over declaring this permanently out of scope. `std/testing`
+  assertion failures staying unlocatable, and every Bit panic staying
+  trace-free indefinitely, was judged an unacceptable permanent gap once a
+  real, general fix was on the table.
+
+**Consequence for #2252 and #2266.** Both stay blocked — this entry lands the
+decision, not the mechanism — but the shape of their eventual fix changes.
+Under the rejected `@caller_location` shape, `std/testing` would have received
+a location as an ordinary parameter threaded through its assertion helpers.
+Under this decision it instead asks the runtime for a trace once the walk and
+its symbolization exist. Whoever implements those tickets must build the
+runtime-trace consumer, not the parameter-passing version either ticket was
+filed expecting.
 
 ---
 
