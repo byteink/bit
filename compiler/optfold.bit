@@ -595,6 +595,83 @@ fn identityOf(ctx: TypeContext, known: []ConstVal, f: IrFunc, id: int): IdentFol
   return r
 }
 
+// ---------------------------------------------------------------------------
+// Constant propagation through `convert` (#3112)
+//
+// `analyzeConsts` folds arithmetic, compares and the three unary ops, but never
+// a `convert` — so a known constant that passes through one stops being known,
+// and every consumer that recognizes only a bare `const_int` declines. #1853's
+// ADD/SUB-immediate fold (`constIntOf`/`xConstIntOf`) is the one that costs
+// real code: `*T ± n` scales `n` and retypes the scaled offset with a no-op
+// `convert` to the pointer type (lowerexpr.bit, §11.4), so
+// `*(g + gcRefArrayInfo)` and its neighbours across `runtime/gc/**` reach
+// codegen as `const_int` + `convert` + register-register `add` where a single
+// `add xN, xM, #imm` encodes the whole thing.
+//
+// THE FOLD ONLY FIRES WHEN IT CANNOT CHANGE A SINGLE BIT, which is what keeps
+// it out of `Convert`'s real semantics. `emitConvert`/`xEmitConvert` are two
+// `extendRegA`s — canonicalize to the SOURCE type's width and signedness, then
+// to the DESTINATION's — and `canon` reproduces both exactly (`extendRegA` at
+// 8 bytes is a `mov`, at 1/2/4 an SBFM/UBFM, which is `signExtend`/`maskTo`).
+// The result is compared against the original pattern and the fold declines
+// unless they are equal, so a narrowing conversion that would genuinely drop
+// bits still evaluates through the real instruction. Int<->float and
+// float->float never reach here at all: `convWidthOf` accepts only an integer
+// primitive or a raw pointer.
+// ---------------------------------------------------------------------------
+
+// The width and signedness `emitConvert`'s `extendRegA` applies to a value of
+// type `ty`. `ok` is false for every type this fold refuses — a float, a bool,
+// a string, a GC reference, an enum — leaving those conversions alone.
+struct ConvWidth {
+  ok: bool,
+  bits: int,
+  signed: bool,
+}
+
+fn noConvWidth(): ConvWidth {
+  return ConvWidth{ ok: false, bits: 0, signed: false }
+}
+
+fn convWidthOf(ctx: TypeContext, ty: int): ConvWidth {
+  // A raw pointer `*T` (§11.4) is codegen's uniform 8-byte int-classed word and
+  // is never a GC reference (codegen.bit's `isRefType`), so folding one to a
+  // `const_int` AT THAT SAME POINTER TYPE moves nothing the collector reads —
+  // only the op changes, never the type. That is why `const_nil` is
+  // deliberately left alone by `constView` above and this is not: this rewrite
+  // keeps the value's own type, that one would have changed it.
+  if (ctx.types[ty].kind == TypeKind.Ptr) {
+    return ConvWidth{ ok: true, bits: 64, signed: false }
+  }
+  let p = primOfType(ctx, ty)
+  if (p < 0 || !isIntPrim(p)) {
+    return noConvWidth()
+  }
+  return ConvWidth{ ok: true, bits: primBits(p), signed: isSignedPrim(p) }
+}
+
+// The constant value of `convert`ing an already-known integer constant, or
+// unknown when the conversion is not a pure retype of these exact bits. Reads
+// `known` rather than `constView`: a `convert` of `const_nil` must keep its
+// pointer-typed nil, not become a `const_int 0`.
+fn foldConvert(ctx: TypeContext, known: []ConstVal, f: IrFunc, id: int): ConstVal {
+  let ins = f.instrs[id]
+  let src = known[ins.lhs]
+  if (!src.known || src.isFloat || src.isBool) {
+    return noConst()
+  }
+  let sw = convWidthOf(ctx, f.instrs[ins.lhs].ty)
+  let dw = convWidthOf(ctx, ins.ty)
+  if (!sw.ok || !dw.ok) {
+    return noConst()
+  }
+  let out = canon(canon(src.ival, sw.bits, sw.signed), dw.bits, dw.signed)
+  if (out != src.ival) {
+    return noConst()
+  }
+  return intConst(out)
+}
+
 // `ids` with every entry replaced by its representative. Returns the ORIGINAL
 // slice when nothing changed, and otherwise a fresh one — an IR operand list
 // can be shared between instructions, so mutating one in place would rewrite
@@ -643,9 +720,10 @@ fn rewriteOperandIds(f: IrFunc, alias: []int, id: int) {
   ins.args = mapIds(alias, ins.args)
 }
 
-// One forward sweep applying every identity above, in place. Runs after
-// `analyzeConsts` and before the rebuild, so a constant it discovers still
-// reaches `computeReachable` and `rebuild` through the same `known` table.
+// One forward sweep applying every identity above plus `foldConvert`, in
+// place. Runs after `analyzeConsts` and before the rebuild, so a constant it
+// discovers still reaches `computeReachable` and `rebuild` through the same
+// `known` table.
 //
 // Bounded and non-recursive: one pass over an array of known size, and each
 // step reads only `alias` entries strictly below `i`. Operands are repointed
@@ -669,12 +747,20 @@ fn foldIdentities(ctx: TypeContext, f: IrFunc, known: []ConstVal) {
   i = 0
   while (i < len(f.instrs)) {
     rewriteOperandIds(f, alias, i)
-    if (!known[i].known && opIsArith(f.instrs[i].op)) {
-      let r = identityOf(ctx, known, f, i)
-      if (r.isCopy) {
-        alias[i] = r.copyOf
-      } else if (r.cval.known) {
-        known[i] = r.cval
+    if (!known[i].known) {
+      let op = f.instrs[i].op
+      if (opIsArith(op)) {
+        let r = identityOf(ctx, known, f, i)
+        if (r.isCopy) {
+          alias[i] = r.copyOf
+        } else if (r.cval.known) {
+          known[i] = r.cval
+        }
+      } else if (op == Op.Convert) {
+        let cv = foldConvert(ctx, known, f, i)
+        if (cv.known) {
+          known[i] = cv
+        }
       }
     }
     i = i + 1
