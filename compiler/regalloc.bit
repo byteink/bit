@@ -93,7 +93,12 @@ struct RegAllocResult {
   // Indexed by vreg — see the dense-numbering note above.
   locations: []RegLoc,
   // Total distinct stack slots used; codegen sizes the spill area to
-  // numSpillSlots * slotWidth (slots are one flat, class-agnostic space).
+  // numSpillSlots * slotWidth. The offset FUNCTION stays class-agnostic
+  // (slot -> byte offset needs no class), but the slot NUMBER SPACE is
+  // partitioned by class (#3168): every int RegLoc.index is < the number of
+  // int spills, every float RegLoc.index is >= it. That partition, not the
+  // offset math, is what guarantees an int slot and a float slot can never
+  // share a byte address.
   numSpillSlots: int,
   // One entry per input safepoint, in the order given to `allocate`.
   stackMaps: []StackMapEntry,
@@ -183,13 +188,22 @@ struct SpillEntry {
   slot: int,
 }
 
-// Spill slots are one flat, class-agnostic stack space (both Int and Float
-// spills draw from the same numbering) — codegen already sizes every slot
-// uniformly (8 bytes covers i64/u64/f64/pointers per runtime/ABI.md §1's
-// alignment rules), so splitting the space per class would only fragment the
-// frame for no benefit. Mirrors ClassState's expire/insert shape, but slots are
-// reused via a free list rather than a fixed-capacity buffer — the frame has no
-// fixed size to allocate against up front.
+// One class's spill-slot numbering. `allocate` below owns one SpillPool per
+// register class (#3168) — an int SpillPool and a float SpillPool number their
+// slots independently from 0, and `allocate` shifts the float numbers past the
+// int ones afterward, so no int slot number and float slot number can ever
+// collide. They used to share a single pool (both classes drawing from one
+// flat numbering): that let a freed int slot be recycled for a live float
+// value, which is sound for the register allocator's own liveness model but
+// unsound at a block-edge parallel move, which is sequentialized once per
+// class (compiler/x64call.bit, compiler/arm64call.bit) and so cannot see a
+// same-address cross-class dependency (compiler/arm64ctx.bit's PLoc has no
+// class tag). Splitting the pool costs some stack space — a slot can no longer
+// be time-shared across classes — in exchange for making that collision
+// structurally impossible rather than merely rare. Mirrors ClassState's
+// expire/insert shape, but slots are reused via a free list rather than a
+// fixed-capacity buffer — the frame has no fixed size to allocate against up
+// front.
 struct SpillPool {
   active: []SpillEntry,
   freeSlots: []int,
@@ -317,7 +331,19 @@ fn allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int): R
 
   let intState = newClassState(target.intRegs)
   let floatState = newClassState(target.floatRegs)
-  let spills = newSpillPool()
+  // #3168: one SpillPool per class, not one shared flat pool. A block-edge
+  // parallel move is sequentialized once per class (sequentializeAndEmit is
+  // called separately for Int and Float moves), and PLoc carries no class tag
+  // (compiler/arm64ctx.bit's PLoc/anyReads), so a same-class-only
+  // cross-dependency scan cannot see an int move's destination colliding with
+  // a float move's source. Two independent pools plus the post-loop shift
+  // below make that collision structurally impossible: int and float spill
+  // slot NUMBERS occupy disjoint ranges, so the backends' offset functions
+  // (still class-agnostic on purpose — see the shift below) can never map an
+  // int slot and a float slot to the same stack address, regardless of how
+  // the two classes' moves are sequenced or ordered relative to each other.
+  let intSpills = newSpillPool()
+  let floatSpills = newSpillPool()
   let order = orderByStart(intervals)
 
   let oi = 0
@@ -325,8 +351,10 @@ fn allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int): R
     let idx = order[oi]
     let iv = intervals[idx]
     let state = floatState
+    let spills = floatSpills
     if (iv.class == RegClass.Int) {
       state = intState
+      spills = intSpills
     }
     expireClass(state, intervals, iv.start)
     expireSpills(spills, intervals, iv.start)
@@ -356,6 +384,21 @@ fn allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int): R
     oi = oi + 1
   }
 
+  // Shift every float spill slot number past the last int spill slot number,
+  // so the two classes' slot numbers never collide (#3168). Each pool numbered
+  // its own class from 0 independently above; this is the only place the two
+  // spaces are combined, and it happens exactly once, after both pools are
+  // finished growing.
+  let numIntSlots = intSpills.next
+  i = 0
+  while (i < n) {
+    let iv2 = intervals[i]
+    if (iv2.class == RegClass.Float && locations[iv2.vreg].isSpill) {
+      locations[iv2.vreg] = RegLoc{ isSpill: true, index: locations[iv2.vreg].index + numIntSlots }
+    }
+    i = i + 1
+  }
+
   // Bounded by len(safepoints) * len(intervals) — both function-local, finite.
   let stackMaps = []StackMapEntry(0)
   let si = 0
@@ -380,5 +423,5 @@ fn allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int): R
     si = si + 1
   }
 
-  return RegAllocResult{ locations: locations, numSpillSlots: spills.next, stackMaps: stackMaps }
+  return RegAllocResult{ locations: locations, numSpillSlots: numIntSlots + floatSpills.next, stackMaps: stackMaps }
 }

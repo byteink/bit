@@ -7,12 +7,52 @@ fn maxInlineInsts(): int {
   return 8
 }
 
+// How many levels of callee body one call site may absorb (#3163). Level 1 is
+// the callee itself; level 2 is a call INSIDE that spliced body, and so on.
+//
+// This bound is what makes the pass terminate, and it is the only thing that
+// does: `optimizeModule` resolves every callee out of a PRE-INLINING snapshot,
+// so a recursive or mutually recursive cycle would otherwise splice forever —
+// a call graph with a cycle has no callee-first order and no fixpoint to reach.
+// A self-call is refused outright by inlineEligible's `calleeIdx == callerIdx`
+// test, which also covers every cycle that runs back through the original
+// caller; this bound covers the rest.
+//
+// 2, measured rather than guessed (#3163), on the tree-built aarch64-macos
+// runtime archive and a whole-module `stdlib/crypto` object:
+//
+//        runtime_gc.o   bl / to wordAt    libbitrt.a    stdlib/crypto.o
+//   main   54472 bytes    222 /  29        487072 b      1237610 b / 10815 bl
+//   d=1    55265          239 /  61        496616        1235026   / 10772
+//   d=2    54761          171 /   0        496288        1238410   / 10827
+//   d=3    54761          171 /   0        497136        1238410   / 10827
+//
+// 1 is not enough and is WORSE than no fix at all on the case this exists for:
+// resolving callees from the snapshot stops the collector's `loadWord` from
+// arriving pre-flattened, so inlining it merely COPIES its `call wordAt` to
+// more sites — 29 -> 61. Only the second level collapses them, to 0.
+//
+// 3 buys nothing: `runtime_gc.o` and `stdlib/crypto.o` come out byte-identical
+// to d=2, and the archive grows 848 bytes. There is nothing left to collapse
+// because an eligible body is under maxInlineInsts() and the leaves are reached
+// at the second level.
+//
+// Growth is bounded by maxInlineInsts() per level, so the worst case a call
+// site can absorb is maxInlineInsts()^maxInlineDepth() instructions.
+fn maxInlineDepth(): int {
+  return 2
+}
+
 // The index of the function named `name`, or -1. The seed keys calls by FuncId;
 // selfhost resolves the callee name into `IrInstr.name`, so the lookup is here.
-fn funcIndexByName(m: IrModule, name: string): int {
+//
+// Takes the function list rather than the module because the inliner must read
+// callees out of a snapshot taken before this pass mutated anything (#3163),
+// never out of the module it is halfway through rewriting.
+fn funcIndexByName(funcs: []IrFunc, name: string): int {
   let i = 0
-  while (i < len(m.funcs)) {
-    if (m.funcs[i].name == name) {
+  while (i < len(funcs)) {
+    if (funcs[i].name == name) {
       return i
     }
     i = i + 1
@@ -54,12 +94,17 @@ fn funcIndexByName(m: IrModule, name: string): int {
 // introduces a poll into nosplit code nor removes one from a caller that keeps
 // its own back edges. Refusing it would also disable inlining across the whole
 // runtime, where §17.6 makes every function @nosplit.
-fn inlineEligible(m: IrModule, callerIdx: int, calleeIdx: int): bool {
+//
+// Both functions are read from `snap`, the pre-inlining snapshot (#3163): the
+// budget must be spent against the callee's ORIGINAL body, or eligibility would
+// depend on how much that callee had already absorbed by the time this caller
+// was reached — which is exactly the filename-ordering bug.
+fn inlineEligible(m: IrModule, snap: []IrFunc, callerIdx: int, calleeIdx: int): bool {
   if (calleeIdx < 0 || calleeIdx == callerIdx) {
     return false
   }
-  let g = m.funcs[calleeIdx]
-  let f = m.funcs[callerIdx]
+  let g = snap[calleeIdx]
+  let f = snap[callerIdx]
   if (g.isNaked || f.isNaked) {
     return false
   }
@@ -67,6 +112,9 @@ fn inlineEligible(m: IrModule, callerIdx: int, calleeIdx: int): bool {
     return false
   }
   if (importsForeignState(m, f, g)) {
+    return false
+  }
+  if (importsForeignCall(snap, f, g)) {
     return false
   }
   let b = g.blocks[0]
@@ -118,12 +166,93 @@ fn importsForeignState(m: IrModule, caller: IrFunc, callee: IrFunc): bool {
   return false
 }
 
+// True if splicing `callee` into `caller` would move a reference to a
+// module-PRIVATE FUNCTION across a module boundary (#3163). The call-graph
+// counterpart of importsForeignState, and refused for the same reason.
+//
+// §17.6 + §11.9: a freestanding object emits only the ROOT module's functions,
+// so an outbound reference is resolvable only under a name a sibling object can
+// define — a §11.9 pin, a bit_rt_* runtime symbol or a §11.7 extern, all of
+// which are '$'-free. An unpinned import is spelled `m<id>$f` with `<id>` an
+// ordinal THIS build assigned, and the sibling object that defines that function
+// emits it BARE, because it is the root there; the two spellings can never meet.
+// emit.bit's firstUnpinnedImport refuses exactly that, and this mirrors both its
+// op set (Call and FuncAddr are the references an object emits) and its
+// name-based pinned test.
+//
+// The inliner is the one pass that can manufacture such a reference from
+// correct input, and it is not hypothetical: `bit_rt_port_mem_load_byte` is
+// pinned, so calling it across a module is legal, but its BODY calls `byteAt`
+// (runtime/gc/mem.bit:143), which is private to runtime/gc. Splicing that body
+// into a caller in runtime/root/linux made that object reference `m11$byteAt`,
+// which nothing defines — `g2archive.sh` refused the emit for two of its 23
+// modules. Whether the old inliner tripped this was pure luck of file order,
+// which is the same accident #3163 is about: the callee had to have been
+// flattened past its own budget FIRST for the splice to be declined.
+//
+// The comparison is over inRootModule, matching importsForeignState, and is
+// coarse in the same way — two distinct imported modules both read "not root" —
+// and composes for the same reason: a splice into a non-root caller leaves a
+// non-root private reference behind, which this then refuses to carry into any
+// root caller.
+//
+// Refusing is always safe: the cost is one un-inlined call. Note it declines a
+// case a deeper splice would have made legal (the private call could itself be
+// inlined away), because that is only knowable after the recursion has run.
+//
+// #3181: Op.MakeClosure carries a callee name too (see emit.bit's
+// firstUnpinnedImport for where lowerStructMethodValue puts an unpinned
+// cross-module symbol there — an uncalled method VALUE `v.m`) and is
+// deliberately NOT added to this check's op set. Splicing a MakeClosure across
+// the root/non-root boundary is provably harmless: a managed (non-freestanding)
+// build links the whole program as one unit, so the mangled name resolves
+// regardless of which module "owns" it, and a --freestanding build can never
+// emit the spliced-in MakeClosure at all — emit.bit's refuseManagedMetadata
+// unconditionally refuses ANY MakeClosure in a root-emitted function, spliced
+// or hand-written, pinned or not, before refuseUnpinnedImport ever inspects it.
+// Verified with a mutation: a small pinned cross-module callee whose body takes
+// a same-module method value inlines here today (unblocked), and the
+// subsequent --freestanding build still correctly fails with "allocates on the
+// managed heap"; padding that same callee past maxInlineInsts() removes its
+// eligibility, the splice does not happen, and the identical build succeeds —
+// so the failure is attributable to the splice, and the splice is always
+// safety-netted downstream regardless of this function.
+fn importsForeignCall(snap: []IrFunc, caller: IrFunc, callee: IrFunc): bool {
+  let i = 0
+  while (i < len(callee.instrs)) {
+    let ins = callee.instrs[i]
+    if (ins.op == Op.Call || ins.op == Op.FuncAddr) {
+      if (!isPinnedName(ins.name)) {
+        let idx = funcIndexByName(snap, ins.name)
+        if (idx < 0 || snap[idx].inRootModule != caller.inRootModule) {
+          return true
+        }
+      }
+    }
+    i = i + 1
+  }
+  return false
+}
+
 // Splices `g`'s single block into `b`'s currently open block: `g`'s params bind
 // directly to the already-translated call `args`, its body is emitted in place
 // (no folding, no block retargeting — `g` has exactly one block and its only
 // terminator is the `ret`, which is read separately rather than spliced).
 // Returns the value the call site now yields.
-fn spliceCallee(b: IrBuilder, g: IrFunc, args: []int): int {
+//
+// `depth` is how many callee bodies deep this splice already is (1 for a call
+// written in the caller's own source). A `Call` inside `g` is spliced too, up
+// to maxInlineDepth() (#3163) — without that, the instructions this function
+// emits would never be re-examined by anyone: `inlineCalls` walks the OLD
+// function's instruction list, so a call carried in on a spliced body used to
+// survive to codegen no matter how trivial its callee was.
+//
+// `callerIdx` stays the ORIGINAL caller at every level, because that is who the
+// instructions end up belonging to: it is the function inlineEligible must test
+// for self-inlining and whose module identity importsForeignState must compare
+// a nested callee's globals against.
+fn spliceCallee(b: IrBuilder, m: IrModule, snap: []IrFunc, callerIdx: int,
+  g: IrFunc, args: []int, depth: int): int {
   let blk = g.blocks[0]
   let remap = []int(0)
   let noFold = []ConstVal(0)
@@ -146,7 +275,19 @@ fn spliceCallee(b: IrBuilder, g: IrFunc, args: []int): int {
   }
   let last = blk.instsStart + blk.instsLen - 1
   while (idx < last) {
-    emitTranslated(b, g, noFold, remap, dummyBlockMap, idx)
+    let ins = g.instrs[idx]
+    let spliced = false
+    if (ins.op == Op.Call && depth < maxInlineDepth()) {
+      let calleeIdx = funcIndexByName(snap, ins.name)
+      if (inlineEligible(m, snap, callerIdx, calleeIdx)) {
+        remap[idx] = spliceCallee(b, m, snap, callerIdx, snap[calleeIdx],
+          trList(remap, ins.args), depth + 1)
+        spliced = true
+      }
+    }
+    if (!spliced) {
+      emitTranslated(b, g, noFold, remap, dummyBlockMap, idx)
+    }
     idx = idx + 1
   }
   let ret = g.instrs[last]
@@ -159,8 +300,19 @@ fn spliceCallee(b: IrBuilder, g: IrFunc, args: []int): int {
 // Pass 3: simple size-budgeted inlining. Blocks are walked in id order, which is
 // emission order here — every preceding pass rebuilds with ids assigned in
 // ascending instsStart.
-fn inlineCalls(m: IrModule, fidx: int): IrFunc {
-  let f = m.funcs[fidx]
+//
+// `snap` is the whole module's functions as they stood before ANY of them was
+// inlined, and every callee — at this level and at every nested level — is read
+// out of it (#3163). Reading them out of `m` instead made the result depend on
+// the caller's and callee's relative INDEX, which is their file's position in
+// the module's bytewise-sorted file list (compiler/project.bit:7): a callee
+// whose file sorted earlier had already been flattened and handed the caller a
+// flat body, while a callee whose file sorted later still held its own calls,
+// which then survived to codegen. Identical source, renamed files, different
+// machine code — 30 un-inlined `wordAt` calls in the collector's mark and sweep
+// paths, purely because `gcmark.bit` sorts before `mem.bit`.
+fn inlineCalls(m: IrModule, snap: []IrFunc, fidx: int): IrFunc {
+  let f = snap[fidx]
   let n = len(f.blocks)
   let blockMap = []int(0)
   let remap = []int(0)
@@ -192,9 +344,10 @@ fn inlineCalls(m: IrModule, fidx: int): IrFunc {
       let ins = f.instrs[idx]
       let handled = false
       if (ins.op == Op.Call) {
-        let calleeIdx = funcIndexByName(m, ins.name)
-        if (inlineEligible(m, fidx, calleeIdx)) {
-          remap[idx] = spliceCallee(b, m.funcs[calleeIdx], trList(remap, ins.args))
+        let calleeIdx = funcIndexByName(snap, ins.name)
+        if (inlineEligible(m, snap, fidx, calleeIdx)) {
+          remap[idx] = spliceCallee(b, m, snap, fidx, snap[calleeIdx],
+            trList(remap, ins.args), 1)
           handled = true
         }
       }

@@ -1,5 +1,9 @@
 // Self-host Stage 3 (#1346): the x86-64 backend, per-value selectors.
 // Split out of compiler/x64.bit; same module, so nothing here is imported.
+//
+// compiler/x64selectmem.bit holds the memory-access selectors (field/array
+// access, the atomics) split out of this file at 796 lines against the
+// 800-line limit (#3141).
 
 // ---------------------------------------------------------------------------
 // Width canonicalization
@@ -131,12 +135,12 @@ fn xPutFloat(cx: XCtx, vreg: int, src: XmmReg) {
 fn xPlocOf(cx: XCtx, vreg: int, class: RegClass): PLoc {
   let loc = xRegLocOf(cx, vreg)
   if (loc.isSpill) {
-    return plocMem(xSpillOffset(cx.frame, loc.index))
+    return plocMem(xSpillOffset(cx.frame, loc.index), class)
   }
   if (class == RegClass.Int) {
-    return plocReg(xRegNum(cx.intRegs[loc.index]))
+    return plocReg(xRegNum(cx.intRegs[loc.index]), class)
   }
-  return plocReg(xmmNum(cx.floatRegs[loc.index]))
+  return plocReg(xmmNum(cx.floatRegs[loc.index]), class)
 }
 
 // ---------------------------------------------------------------------------
@@ -202,7 +206,31 @@ fn xEmitBinaryInt(cx: XCtx, op: XArith, dst: int, lhs: int, rhs: int, w: Width) 
   xPutInt(cx, dst, xScratch1())
 }
 
-fn xEmitMulInt(cx: XCtx, dst: int, lhs: int, rhs: int, w: Width) {
+// `dst = value * 2^k` as a single `shl` (#3105). No bias, no correction and no
+// width special-casing: `x * 2^k` and `x << k` agree on ALL 64 bits for every
+// input, so they agree on the low `bits` bits at every width, signed or
+// unsigned -- strictly simpler than xEmitPow2DivInt, which needs a bias only
+// because truncating division rounds toward zero.
+//
+// xCanonNarrow stays: a left shift pushes bits past a narrow type's width
+// exactly as the product it replaces does.
+fn xEmitPow2MulInt(cx: XCtx, dst: int, value: int, k: int, w: Width) {
+  let v = xGetInt(cx, value, xScratch1())
+  xMovRR(cx.buf, xScratch1(), v)
+  xShiftImm(cx.buf, XShift.Shl, xScratch1(), k)
+  xCanonNarrow(cx.buf, xScratch1(), w)
+  xPutInt(cx, dst, xScratch1())
+}
+
+// `factor` is xConstPow2Factor's verdict, precomputed by the caller
+// (xEmitInst) exactly as xEmitDivInt's `pow2K` is and for the same reason: it
+// needs the ORIGINAL IrFunc, which a unit test's fabricated XCtx does not
+// carry.
+fn xEmitMulInt(cx: XCtx, dst: int, lhs: int, rhs: int, factor: Pow2Factor, w: Width) {
+  if (factor.k >= 0) {
+    xEmitPow2MulInt(cx, dst, factor.value, factor.k, w)
+    return
+  }
   let l = xGetInt(cx, lhs, xScratch1())
   let r = xGetInt(cx, rhs, xScratch2())
   xMovRR(cx.buf, xScratch1(), l)
@@ -597,176 +625,3 @@ fn xEmitShiftInt(cx: XCtx, op: XShift, dst: int, lhs: int, rhs: int, constAmt: i
   }
   xPutInt(cx, dst, xScratch1())
 }
-
-// `dst = base.field`. `base` is already the GC body pointer (runtime/ABI.md §1:
-// codegen never sees the header), so `offset` is a plain byte offset with no
-// header adjustment.
-//
-// `isArray` marks a fixed-size array field, which is INLINE storage: its value
-// is the interior address `base + offset`, formed with lea — loading a word
-// there would read the array's first element as if it were the array itself.
-// `isSliceBase` is supplied by the dispatcher rather than read from the
-// instruction table here: the selector self-checks drive this with a stub
-// context whose instruction list is empty, so reaching back into `cx.f.instrs`
-// would fault in the very harness that is meant to pin the encoding.
-fn xEmitFieldGet(cx: XCtx, dst: int, base: int, offset: int, w: Width, isArray: bool, isSliceBase: bool) {
-  let baseReg = xGetInt(cx, base, xScratch2())
-  if (isArray) {
-    xLea(cx.buf, xScratch1(), baseReg, offset)
-    xPutInt(cx, dst, xScratch1())
-    return
-  }
-  // cap(s) lowers to a field_get [24] on the slice HEADER itself, so a null
-  // header must read as 0 here exactly as it does for len (#1564). Keyed on the
-  // base's own type, so a struct field read is untouched and pays nothing.
-  if (isSliceBase) {
-    xEmitHeaderWordOrZero(cx, baseReg, offset)
-    xPutInt(cx, dst, xScratch1())
-    return
-  }
-  if (w.class == RegClass.Int) {
-    xMovLoad(cx.buf, xScratch1(), xMemB(baseReg, offset), w.bytes, w.signed)
-    xPutInt(cx, dst, xScratch1())
-    return
-  }
-  xMovFLoad(cx.buf, xFScratch1(), xMemB(baseReg, offset), w.bytes)
-  xPutFloat(cx, dst, xFScratch1())
-}
-
-// `base.field = value`. The base is fetched into the SECONDARY scratch so the
-// primary stays free for the value — fetching both into the same scratch would
-// have the second overwrite the first.
-fn xEmitFieldSet(cx: XCtx, base: int, offset: int, value: int, w: Width) {
-  let baseReg = xGetInt(cx, base, xScratch2())
-  if (w.class == RegClass.Int) {
-    let v = xGetInt(cx, value, xScratch1())
-    xMovStore(cx.buf, xMemB(baseReg, offset), v, w.bytes)
-    return
-  }
-  let v = xGetFloat(cx, value, xFScratch1())
-  xMovFStore(cx.buf, xMemB(baseReg, offset), v, w.bytes)
-}
-
-// ---- atomics (§11.5) -------------------------------------------------------
-// `*T` is an int-classed word; every sequence is call-free (never a safepoint).
-// `lock`-prefixed forms are seq-cst regardless of the requested ordering.
-
-fn xEmitAtomicLoad(cx: XCtx, dst: int, ptr: int, w: Width) {
-  let base = xGetInt(cx, ptr, xScratch2())
-  xMovLoad(cx.buf, xScratch1(), xMemB(base, 0), w.bytes, w.signed) // plain load is acquire on x86-TSO
-  xPutInt(cx, dst, xScratch1())
-}
-
-fn xEmitAtomicStore(cx: XCtx, ptr: int, value: int, w: Width) {
-  let base = xGetInt(cx, ptr, xScratch2())
-  let val = xGetInt(cx, value, xScratch1())
-  xMovStore(cx.buf, xMemB(base, 0), val, w.bytes)
-  xMfence(cx.buf) // a seq-cst store needs a trailing full barrier on x86
-}
-
-// `rax` is pinned in this function (xScanFuncFlags sets needsRaxRdx), so
-// CMPXCHG's implicit accumulator is free to clobber. Result: the Go-style bool.
-fn xEmitAtomicCmpxchg(cx: XCtx, dst: int, ptr: int, expected: int, desired: int) {
-  let w = widthOf(cx.ctx, cx.f.instrs[expected].ty)
-  let base = xGetInt(cx, ptr, xScratch2())
-  let des = xGetInt(cx, desired, xScratch3())
-  let exp = xGetInt(cx, expected, xScratch1())
-  xMovRR(cx.buf, XReg64.Rax, exp)
-  xLockCmpxchgMem(cx.buf, des, base, w.bytes)
-  xSetcc(cx.buf, ccE(), xScratch1()) // ZF=1 => swapped
-  xMovzxb(cx.buf, xScratch1(), xScratch1())
-  xPutInt(cx, dst, xScratch1())
-}
-
-// Fetch-and-op; returns the pre-op value. add/sub/xchg are single implicit-lock
-// instructions; and/or have no native fetch form on x86 and use the CMPXCHG
-// retry loop (rax pinned).
-fn xEmitAtomicRmw(cx: XCtx, op: Op, dst: int, ptr: int, operand: int, w: Width) {
-  let base = xGetInt(cx, ptr, xScratch2())
-  if (op == Op.AtomicRmwAdd || op == Op.AtomicRmwSub || op == Op.AtomicRmwXchg) {
-    let oper = xGetInt(cx, operand, xScratch1())
-    xMovRR(cx.buf, xScratch1(), oper) // reg holds the source and receives the old value
-    if (op == Op.AtomicRmwAdd) {
-      xLockXaddMem(cx.buf, xScratch1(), base, w.bytes)
-    } else if (op == Op.AtomicRmwSub) {
-      xNegR(cx.buf, xScratch1()) // fetch-and-sub == fetch-and-add(-v)
-      xLockXaddMem(cx.buf, xScratch1(), base, w.bytes)
-    } else {
-      xXchgMem(cx.buf, xScratch1(), base, w.bytes)
-    }
-  } else {
-    let oper = xGetInt(cx, operand, xScratch3())
-    xMovLoad(cx.buf, XReg64.Rax, xMemB(base, 0), w.bytes, w.signed)
-    let retryOff = len(cx.buf.code)
-    xCanonNarrow(cx.buf, XReg64.Rax, w) // keep the comparand canonical each iteration
-    xMovRR(cx.buf, xScratch1(), XReg64.Rax)
-    if (op == Op.AtomicRmwAnd) {
-      xArithRR(cx.buf, XArith.And, xScratch1(), oper)
-    } else {
-      xArithRR(cx.buf, XArith.Or, xScratch1(), oper)
-    }
-    xLockCmpxchgMem(cx.buf, xScratch1(), base, w.bytes)
-    xJccToOffset(cx.buf, ccNe(), retryOff) // JNZ retry: reservation lost, rax reloaded
-    xMovRR(cx.buf, xScratch1(), XReg64.Rax) // rax holds the old (pre-op) value
-  }
-  xCanonNarrow(cx.buf, xScratch1(), w)
-  xPutInt(cx, dst, xScratch1())
-}
-
-// `dst = len(slice)` — the `len` word at offset 8 of a slice or string header
-// (runtime/ABI.md §2). Shared by both, which is why one selector covers them.
-// Loads a slice/string header word at `disp`, reading a NULL header as 0 (#1564).
-//
-// A struct zero-value is one gc_alloc of zeroed memory (SPEC §13.4), so a slice
-// or string FIELD of a zeroed struct holds the null word rather than an empty
-// header. `xs == nil` is not spellable for either type (E0053), so null and
-// empty are indistinguishable to a program — only the fault was observable.
-// Both header readers that are inline rather than runtime calls (`len` at +8,
-// `cap` at +24) come through here, so the guard leaves every IR dump untouched.
-// xScratch1 is never allocatable, so it cannot alias baseReg.
-fn xEmitHeaderWordOrZero(cx: XCtx, baseReg: XReg64, disp: int) {
-  xMovRI(cx.buf, xScratch1(), 0)
-  xTestRR(cx.buf, baseReg, baseReg)
-  xEmitByte(cx.buf, 116) // JZ rel8 -> past the load, leaving the 0
-  xEmitByte(cx.buf, 0)   // displacement backpatched once the load is sized
-  let afterJcc = len(cx.buf.code)
-  xMovLoad(cx.buf, xScratch1(), xMemB(baseReg, disp), 8, false)
-  cx.buf.code[afterJcc - 1] = u8(len(cx.buf.code) - afterJcc)
-}
-
-fn xEmitSliceLen(cx: XCtx, dst: int, base: int) {
-  let baseReg = xGetInt(cx, base, xScratch2())
-  xEmitHeaderWordOrZero(cx, baseReg, 8)
-  xPutInt(cx, dst, xScratch1())
-}
-
-// `dst = base[index]` for a STATIC array only. A dynamic slice carries a
-// header and goes through the bounds-checked slice_get runtime call instead, so
-// lower.bit never emits index_get against one. The address is
-// `base + index*width` — no header, a static length (lower.bit's array scheme).
-fn xEmitIndexGet(cx: XCtx, dst: int, base: int, index: int, w: Width) {
-  let baseReg = xGetInt(cx, base, xScratch2())
-  let idxReg = xGetInt(cx, index, xScratch3())
-  let m = xMemBI(baseReg, idxReg, w.bytes, 0)
-  if (w.class == RegClass.Int) {
-    xMovLoad(cx.buf, xScratch1(), m, w.bytes, w.signed)
-    xPutInt(cx, dst, xScratch1())
-    return
-  }
-  xMovFLoad(cx.buf, xFScratch1(), m, w.bytes)
-  xPutFloat(cx, dst, xFScratch1())
-}
-
-fn xEmitIndexSet(cx: XCtx, base: int, index: int, value: int, w: Width) {
-  let baseReg = xGetInt(cx, base, xScratch2())
-  let idxReg = xGetInt(cx, index, xScratch3())
-  let m = xMemBI(baseReg, idxReg, w.bytes, 0)
-  if (w.class == RegClass.Int) {
-    let v = xGetInt(cx, value, xScratch1())
-    xMovStore(cx.buf, m, v, w.bytes)
-    return
-  }
-  let v = xGetFloat(cx, value, xFScratch1())
-  xMovFStore(cx.buf, m, v, w.bytes)
-}
-

@@ -7,7 +7,8 @@ exists.
 answers two questions at once:
 
 1. how to build `bit` from a clean checkout with no `bit` already present
-2. what the differential oracle is that fifteen gates compare this tree against
+2. what the differential oracle is that the differential-gate family (§4)
+   compares this tree against
 
 ## The decision in one paragraph
 
@@ -139,9 +140,33 @@ standard to aim at, and it is reachable only because the result is reproducible.
 
 ## 4. What each differential gate compares after `seed/` is gone
 
-**#1840 said seven gates. There are fifteen.** The list below is derived from
-`scripts/` rather than from the ticket, because an undercount here means gates
-silently retired.
+**#1840 said seven gates. That count has already drifted once — #1859 added a
+sixteenth (`selfhost-diffruntime.sh`) after this table was first written, and
+it went unrecorded here for a release cycle.** Do not carry a number forward
+from this paragraph either; re-derive the row count from `scripts/` before
+trusting it, because an undercount here is exactly how a gate goes silently
+retired:
+
+```sh
+ls scripts/selfhost-diff*.sh scripts/selfhost-fixpoint.sh scripts/selfhost-fuzzdiff.sh \
+  | grep -v -e diffall.sh -e diffdump.sh
+```
+
+That excludes two kinds of file the naive `scripts/selfhost-*.sh` glob would
+otherwise sweep in, neither of which is a gate in its own right:
+
+- `scripts/selfhost-diffall.sh`, the family's own aggregator (it runs every
+  row below and reduces them to one verdict; itself listed as a row because
+  it is independently invocable, but it compares nothing on its own), and
+  `scripts/selfhost-diffdump.sh`, the shared table-driven driver behind six
+  of the rows below (`ast`/`tokens`/`diags`/`types`/`ir`/`iropt`) — it takes a
+  required mode argument and errors on a bare invocation, so it is not itself
+  a gate.
+- `scripts/selfhost-ir-canon.sh` and `scripts/selfhost-ir-signatures.sh`,
+  sourced-only helper functions shared by the IR-comparing rows (including
+  `diffruntime.sh`, below). Invoked directly they run only their own
+  self-check and exit in under a second; they walk no corpus and are not
+  differentials.
 
 Every `selfhost-diff*.sh` runs the pinned stage0 (release N-1) against
 `bit-out/bin/bit` and diffs the output. Before #1593 the same scripts ran
@@ -157,6 +182,7 @@ nothing more.
 | `selfhost-difftypes.sh` | inferred types | re-based on N-1 |
 | `selfhost-diffir.sh` | pre-opt IR | re-based on N-1 |
 | `selfhost-diffiropt.sh` | post-opt IR | re-based on N-1 |
+| `selfhost-diffruntime.sh` | runtime codegen IR — its own corpus, `runtime/**/*.bit`, not the shared stdlib/examples/tests/cases/tests/imports corpus every other row walks (#1859) | re-based on N-1 |
 | `selfhost-diffsafepoints.sh` | static safepoint counts | re-based on N-1 |
 | `selfhost-difffmt.sh` | formatter output | re-based on N-1 |
 | `selfhost-diffdoc.sh` | `bit doc` output | re-based on N-1 |
@@ -167,6 +193,15 @@ nothing more.
 | `selfhost-fuzzdiff.sh` | front-end on mutated corpus | re-based on N-1 |
 | `selfhost-fixpoint.sh` | stageB vs stageC | **UNCHANGED** — never used the seed |
 | `selfhost-diffall.sh` | aggregator | unchanged, runs the above |
+
+**None of the rows above run as part of `./make test`.** Since #2570 the whole
+family is reachable as `./make test-differentials` (`tools/build/defs.bit`'s
+`coreSteps()`, deliberately not `gateSteps()` — it runs into the tens of
+minutes, so folding it into `test` would roughly double the pre-push suite).
+It is the third step of the pre-push gate, run once over the whole batch
+immediately before `git push`, after `rm -rf bit-out && ./make` and
+`./make test`; neither `scripts/gate.sh` nor `./make test` on its own
+exercises it.
 
 Two consequences to plan for rather than discover:
 

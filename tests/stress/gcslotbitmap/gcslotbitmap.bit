@@ -1,0 +1,186 @@
+// The #3147/#3176 per-span occupied-slot bitmap, under a real alloc/free
+// churn through the GC layer (`runtime/gc/gcalloc.bit`'s `linkObject`,
+// `runtime/gc/gcmark.bit`'s `freeObject`).
+//
+// WHAT THIS PROVES, AND WHY IT IS THE RIGHT INVARIANT. The bitmap is a new
+// structure the allocator did not need before; the allocator's own
+// `spanFree`/`spanTotal` counters are the pre-existing, independently
+// maintained source of truth for the same fact ("how many of this span's
+// slots are occupied"). So for every span touched, `popcount(bitmap) ==
+// spanTotal - spanFree` ties the new structure to the old one — the two
+// cannot silently drift apart, because they are updated by entirely
+// different code paths (`heapTakeSmallLocked`/`heapGiveSmallLocked` for the
+// counters, `linkObject`/`freeObject` for the bitmap) that only agree if both
+// are correct.
+//
+// WHY A "KEEPER" PER SPAN, RATHER THAN FREEING EVERYTHING. Freeing an entire
+// span makes it a `heapReclaimSpansLocked` candidate, which UNMAPS it
+// (`memUnmapPages`) once the class's hysteresis fires (#2375) — after that
+// the span address is no longer valid memory, and reading its bitmap would be
+// undefined. So exactly one object per distinct span allocated here is never
+// freed, pinning `spanFree < spanTotal` for that span for the program's
+// whole lifetime and keeping every span address this test recorded valid
+// until `gcDeinit`.
+//
+// CLASS 28 (4096-byte slots, 31 slots/span — see `tests/stress/alloc/alloc.bit`'s
+// OCC_CLASS) is reused deliberately: it is the allocator's own corpus's proof
+// that this class carves the way the header says, so a span-count surprise
+// here would point at THIS file rather than at the allocator.
+//
+// Own private GC state (`gcBindMemory`/`gcInit`-bound arena), so this needs a
+// `no-collect` marker for the same reason `gcspanfree`'s does: none of the
+// assertions depend on the AMBIENT collector ever running.
+
+import { spinUnlocked } from "../../../runtime"
+import { heapInit, heapWords, allocSpanOf, allocSpanTotal, allocSpanFree,
+  allocSpanBitmapWord } from "../../../runtime/alloc"
+import { gcInit, gcConfigure, gcBindMemory, gcAlloc, gcCollectRoots,
+  gcLiveBytes, gcDeinit, gcWords, gcHeaderSize, gcSpanViolations } from "../../../runtime/gc"
+
+const ARENA_WORDS: int = 163840   // 10 spans' worth (allocSpanBytes/8 * 10)
+const INDEX_WORDS: int = 8192
+const META_WORDS: int = 8
+
+const BM_BODY_SIZE: int = 4064    // + gcHeaderSize(32) = 4096 total -> class 28
+const BM_OBJS: int = 200          // > 6 * 31 slots/span: forces >= 7 distinct spans
+const BM_MAX_SPANS: int = 32      // generous bound on distinct spans tracked
+
+// Popcount over a u64 word. Bounded: exactly 64 iterations regardless of the
+// bit pattern, so a word with the top bit set (a negative `int`) still
+// terminates — `int` is signed, but the conversion to `u64` reinterprets the
+// same 64 bits so `>>` shifts logically instead of sign-extending.
+fn popcountWord(v: int): int {
+  let x = u64(v)
+  let count = 0
+  let i = 0
+  while (i < 64) {           // bounded: 64 iterations
+    if (x & 1 == 1) { count = count + 1 }
+    x = x >> 1
+    i = i + 1
+  }
+  return count
+}
+
+fn main() {
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let heapBlock = []i64(heapWords)
+  let heapLock = []i32(1)
+  let lock = []i32(1)
+  let state = []i64(gcWords)
+  let meta = []i64(META_WORDS)
+  let roots = []i64(BM_OBJS)
+
+  let metaAddr = int(ptrOf(meta))
+  meta[0] = BM_BODY_SIZE
+  meta[1] = 0    // no pointer fields: a leaf, so this is pure allocator traffic
+  meta[2] = 0
+  meta[3] = 0
+  meta[4] = 0
+  meta[5] = 0
+  meta[6] = 0
+
+  let hp = ptrOf(heapBlock)
+  heapInit(hp)
+  let hlk = ptrOf(heapLock)
+  atomicStore(hlk, spinUnlocked)
+  let lp = ptrOf(lock)
+  atomicStore(lp, spinUnlocked)
+
+  let g = ptrOf(state)
+  let rootsAddr = int(ptrOf(roots))
+  gcBindMemory(g, int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
+  if (!gcInit(g, int(hp), int(hlk), int(lp), metaAddr, 256)) {
+    print("gcInit failed\n")
+    return
+  }
+  gcConfigure(g, true, true, 4096, 200, false)   // stress ON: arms the span-bookkeeping check
+
+  // Allocate the burst, recording the FIRST object seen in each distinct span
+  // as that span's keeper. Order within a span is an implementation detail
+  // (spans fill highest-address-first, #2374) this test does not depend on:
+  // any object seen first for a new span works as its keeper.
+  let spans = []i64(BM_MAX_SPANS)
+  let keeper = []i64(BM_MAX_SPANS)
+  let spanCount = 0
+  let allocOk = 1
+  let i = 0
+  while (i < BM_OBJS) {                          // bounded: BM_OBJS iterations
+    let p = gcAlloc(g, metaAddr)
+    if (p == 0) { allocOk = 0 }
+    roots[i] = p
+    let span = allocSpanOf(p - gcHeaderSize)
+    let found = -1
+    let si = 0
+    while (si < spanCount) {                     // bounded: BM_MAX_SPANS iterations
+      if (spans[si] == span) { found = si }
+      si = si + 1
+    }
+    if (found < 0 && spanCount < BM_MAX_SPANS) {
+      spans[spanCount] = span
+      keeper[spanCount] = p
+      spanCount = spanCount + 1
+    }
+    i = i + 1
+  }
+  gcCollectRoots(g, rootsAddr, BM_OBJS)   // everything still rooted: nothing swept yet
+
+  // Free every object except the keepers -- the CHURN BURST that exercises
+  // the bit-clear path (`freeObject` -> `clearSlotBit`) across every span at
+  // once, while never letting a span go fully free.
+  let d = 0
+  while (d < BM_OBJS) {                          // bounded: BM_OBJS iterations
+    let p = roots[d]
+    let isKeeper = 0
+    let ki = 0
+    while (ki < spanCount) {                     // bounded: BM_MAX_SPANS iterations
+      if (keeper[ki] == p) { isKeeper = 1 }
+      ki = ki + 1
+    }
+    if (isKeeper == 0) { roots[d] = 0 }
+    d = d + 1
+  }
+  gcCollectRoots(g, rootsAddr, BM_OBJS)   // sweeps every non-keeper
+
+  // THE ASSERTION: for every span this run touched, popcount(bitmap) ==
+  // spanTotal - spanFree.
+  let spansOk = 0
+  let mismatches = 0
+  let sj = 0
+  while (sj < spanCount) {                       // bounded: BM_MAX_SPANS iterations
+    let span = spans[sj]
+    let total = allocSpanTotal(span)
+    let free = allocSpanFree(span)
+    let want = total - free
+    let words = (total + 63) / 64
+    let got = 0
+    let wi = 0
+    while (wi < words) {                         // bounded: <= 1 word for class 28
+      got = got + popcountWord(allocSpanBitmapWord(span, wi))
+      wi = wi + 1
+    }
+    if (got == want) {
+      spansOk = spansOk + 1
+    } else {
+      mismatches = mismatches + 1
+    }
+    sj = sj + 1
+  }
+
+  // Read BEFORE `gcDeinit`: teardown frees every object, and a heap with no
+  // spans left has nowhere to keep the count.
+  let spanBad = gcSpanViolations(g)
+
+  gcDeinit(g)
+  let leaked = gcLiveBytes(g)
+
+  // `arena`/`indexArena`/`roots` are reached here so they stay rooted across
+  // every ambient collection above (every loop back-edge under
+  // `BIT_GC=stress`).
+  let rooted = 0
+  if (len(arena) == ARENA_WORDS && len(indexArena) == INDEX_WORDS && len(roots) == BM_OBJS) {
+    rooted = 1
+  }
+
+  print("gcslotbitmap ${allocOk} ${spanCount} ${spansOk} ${mismatches} ${spanBad} ${leaked} ${rooted}\n")
+}

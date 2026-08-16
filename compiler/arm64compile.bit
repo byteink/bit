@@ -6,14 +6,23 @@
 // Instruction dispatch
 // ===========================================================================
 
-// Which `const_int` definitions (#1853) an ADD/SUB-immediate fold consumes
+// Which `const_int` definitions (#1853) an ADD/SUB-immediate fold, a
+// power-of-two Mul (#3105) or a power-of-two SDiv/UDiv (#3104) consumes
 // entirely, indexed by instruction id. `instrOperands` (opt.bit) is the SAME
 // operand map DCE uses, so a constant with any use besides the one fold that
 // reads it as an immediate keeps `false` and still materializes normally —
 // this only marks a def whose sole structural use is that one fold. Mirrors
-// `emitBinaryInt`'s own rhs-then-lhs fold order exactly, so it never marks a
-// value skipped that `emitBinaryInt` actually reads as a register.
-fn computeSkipConstMaterialize(f: IrFunc): []bool {
+// `emitBinaryInt`/`emitMulInt`/`emitDivInt`'s own operand order exactly, so it
+// never marks a value skipped that the emitter actually reads as a register.
+//
+// SRem/URem are deliberately excluded from the divide case even though
+// `xConstPow2Divisor` accepts the same divisors: `emitDivInt` (arm64select.bit)
+// only takes the shift path for SDiv/UDiv (#3104's own doc comment — msub
+// still needs the real divisor register to recover a remainder), so marking
+// the divisor skipped for a Rem would leave `emitDivInt`'s general path
+// reading an unmaterialized register — the exact silent miscompile this
+// function's `useCount == 1` guard exists to prevent.
+fn computeSkipConstMaterialize(ctx: TypeContext, f: IrFunc): []bool {
   let n = len(f.instrs)
   let useCount = []int(0)
   let i = 0
@@ -40,17 +49,33 @@ fn computeSkipConstMaterialize(f: IrFunc): []bool {
   i = 0
   while (i < n) {
     let ins = f.instrs[i]
-    if (ins.op != Op.Add && ins.op != Op.Sub) {
-      i = i + 1
-      continue
-    }
-    let rc = constIntOf(f, ins.rhs)
-    if (rc.known && resolveAddSubImm(ins.op, rc.ival).fits && useCount[ins.rhs] == 1) {
-      skip[ins.rhs] = true
-    } else if (ins.op == Op.Add) {
-      let lc = constIntOf(f, ins.lhs)
-      if (lc.known && resolveAddSubImm(ins.op, lc.ival).fits && useCount[ins.lhs] == 1) {
-        skip[ins.lhs] = true
+    if (ins.op == Op.Add || ins.op == Op.Sub) {
+      let rc = constIntOf(f, ins.rhs)
+      if (rc.known && resolveAddSubImm(ins.op, rc.ival).fits && useCount[ins.rhs] == 1) {
+        skip[ins.rhs] = true
+      } else if (ins.op == Op.Add) {
+        let lc = constIntOf(f, ins.lhs)
+        if (lc.known && resolveAddSubImm(ins.op, lc.ival).fits && useCount[ins.lhs] == 1) {
+          skip[ins.lhs] = true
+        }
+      }
+    } else if (ins.op == Op.Mul) {
+      let w = widthOf(ctx, ins.ty)
+      let factor = xConstPow2Factor(f, ins.lhs, ins.rhs, w)
+      if (factor.k >= 0) {
+        let constOp = ins.lhs
+        if (factor.value == ins.lhs) {
+          constOp = ins.rhs
+        }
+        if (useCount[constOp] == 1) {
+          skip[constOp] = true
+        }
+      }
+    } else if (ins.op == Op.SDiv || ins.op == Op.UDiv) {
+      let w = widthOf(ctx, ins.ty)
+      let pk = xConstPow2Divisor(f, ins.rhs, w)
+      if (pk >= 0 && useCount[ins.rhs] == 1) {
+        skip[ins.rhs] = true
       }
     }
     i = i + 1
@@ -78,7 +103,10 @@ fn compileInst(cx: A64Ctx, curBlock: int, i: int) {
     emitBinaryInt(cx, op, i, ins.lhs, ins.rhs, iw)
     return
   }
-  if (op == Op.Mul) { emitMulInt(cx, i, ins.lhs, ins.rhs, iw); return }
+  if (op == Op.Mul) {
+    emitMulInt(cx, i, ins.lhs, ins.rhs, xConstPow2Factor(cx.f, ins.lhs, ins.rhs, iw), iw)
+    return
+  }
   if (op == Op.SDiv || op == Op.UDiv || op == Op.SRem || op == Op.URem) {
     emitDivInt(cx, op, i, ins.lhs, ins.rhs, xConstPow2Divisor(cx.f, ins.rhs, iw), iw)
     return
@@ -365,37 +393,6 @@ struct FuncCode {
   frameSize: int,
 }
 
-// #2925: true iff `f` contains a loop back-edge that emits a real poll — the
-// exact condition emitBackEdgeSafepointIfNeeded gates on (isBackEdge and not
-// needsNoSafepoints). Mirrors codegen.bit's buildIntervals scan, which records
-// the identical edges into built.safepoints; kept as an independent scan
-// (rather than inspecting built.safepoints, which also holds plain-call
-// safepoints — fib has one of those and zero back-edges) because
-// compileFunction needs the answer before it lays out the frame.
-fn hasBackEdgeSafepoint(f: IrFunc): bool {
-  if (needsNoSafepoints(f)) {
-    return false
-  }
-  let bi = 0
-  while (bi < len(f.blocks)) {
-    let b = f.blocks[bi]
-    let idx = b.instsStart + b.paramCount
-    let end = b.instsStart + b.instsLen
-    while (idx < end) {
-      let ins = f.instrs[idx]
-      if (ins.op == Op.Jump && isBackEdge(bi, ins.ival)) {
-        return true
-      }
-      if (ins.op == Op.Br && (isBackEdge(bi, ins.ival) || isBackEdge(bi, ins.ival2))) {
-        return true
-      }
-      idx = idx + 1
-    }
-    bi = bi + 1
-  }
-  return false
-}
-
 // Compiles one function to ARM64 machine code.
 fn compileFunction(module: IrModule, f: IrFunc): FuncCode {
   let ctx = module.ctx
@@ -572,7 +569,7 @@ fn compileFunction(module: IrModule, f: IrFunc): FuncCode {
     safepoints: []SafepointView(0),
     safepointPositions: built.safepoints,
     nextSafepointIdx: 0,
-    skipConst: computeSkipConstMaterialize(f),
+    skipConst: computeSkipConstMaterialize(ctx, f),
   }
 
   // §10.3.1 @naked: no prologue — the function runs on its caller's frame.
@@ -648,8 +645,8 @@ fn bindIncomingArgs(cx: A64Ctx) {
   let intOrd = 0
   let floatOrd = 0
   let stackIndex = 0
-  let intMoves = []PMove(0)
-  let floatMoves = []PMove(0)
+  // One parallel move covering both classes (#3182).
+  let moves = []PMove(0)
   let pi = 0
   while (pi < len(cx.f.paramTypes)) {
     let class = regClassOf(cx.module.ctx, cx.f.paramTypes[pi])
@@ -659,21 +656,19 @@ fn bindIncomingArgs(cx: A64Ctx) {
     }
     let dst = plocOf(cx, vregOf(cx, entry.instsStart + pi), class)
     let reg = argReg(class, ord)
-    let src = plocMem(incomingArgOffset(cx.frame, stackIndex))
+    let src = plocMem(incomingArgOffset(cx.frame, stackIndex), class)
     if (reg < 0) {
       stackIndex = stackIndex + 1
     } else {
-      src = plocReg(reg)
+      src = plocReg(reg, class)
     }
     if (class == RegClass.Int) {
       intOrd = intOrd + 1
-      intMoves = append(intMoves, PMove{ src: src, dst: dst })
     } else {
       floatOrd = floatOrd + 1
-      floatMoves = append(floatMoves, PMove{ src: src, dst: dst })
     }
+    moves = append(moves, PMove{ src: src, dst: dst })
     pi = pi + 1
   }
-  sequentializeAndEmit(cx, intMoves, RegClass.Int)
-  sequentializeAndEmit(cx, floatMoves, RegClass.Float)
+  sequentializeAndEmit(cx, moves)
 }
