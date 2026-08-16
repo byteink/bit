@@ -247,11 +247,42 @@ real="$(find "${WORK}/src/compiler" -maxdepth 1 -name '*.bit' | wc -l | tr -d ' 
 # produced the bytes on disk. All three built up front because dist/package.sh
 # embeds every target's archive into every target's tarball, regardless of
 # which one it is packaging.
+#
+# #3206: THE TAG'S OWN stdlib, set explicitly for every bit1 invocation below
+# that does not `cd "${WORK}/src"` first (L1 here, and C2 further down).
+# Unlike L0 (:136) and C1 (:210), neither loop changes directory, so absent
+# this override bit1's stdRootPath() (compiler/mainpaths.bit:73-82) falls
+# through BIT_STDLIB -> resolveNearExe("stdlib") -> the bare relative
+# "stdlib", which resolves against the CALLER's cwd, not the tag's tree.
+# bit1 lives at "${WORK}/src/bit-out/bin/bit" (a build-tree location —
+# mainpaths.bit:99-102 names this exact case), where resolveNearExe finds no
+# sibling stdlib/ either, so the fallthrough was total. No version stamp
+# applies to stdlib the way C2's STAGE_SRC stamps compiler/version.bit, so
+# the checked-out tree's stdlib/ IS the tag's stdlib as-is.
+#
+# The guard below is the fix, not a belt-and-braces extra: a silently wrong
+# stdlib is exactly how this bug shipped a false PASS (a tag whose stdlib
+# happens to match the caller's checkout compiles clean and compares clean).
+# Asserting the path is unconditionally inside ${WORK} makes a future
+# fallthrough here impossible to introduce silently, not merely unlikely.
+STDLIB1="${WORK}/src/stdlib"
+case "${STDLIB1}" in
+  "${WORK}"/*) : ;;
+  *)
+    echo "verify-reproducible-release.sh: internal error: resolved stdlib path ${STDLIB1} does not lie inside ${WORK}" >&2
+    exit 1
+    ;;
+esac
+[ -d "${STDLIB1}" ] || {
+  echo "verify-reproducible-release.sh: missing ${STDLIB1} (the ${TAG} worktree has no stdlib/?)" >&2
+  exit 1
+}
+
 LIB1="${WORK}/lib1"
 for TARGET in x86_64-linux aarch64-linux aarch64-macos; do
   echo "L1: building runtime archive for ${TARGET} with bit1..."
   mkdir -p "${LIB1}/${TARGET}"
-  BIT="${BIT1}" bash "${WORK}/src/scripts/g2archive.sh" "${TARGET}" "${LIB1}/${TARGET}/libbitrt.a" ||
+  BIT="${BIT1}" BIT_STDLIB="${STDLIB1}" bash "${WORK}/src/scripts/g2archive.sh" "${TARGET}" "${LIB1}/${TARGET}/libbitrt.a" ||
     { echo "verify-reproducible-release.sh: L1 build failed for ${TARGET}" >&2; exit 1; }
 done
 
@@ -300,9 +331,14 @@ for TARGET in x86_64-linux aarch64-linux aarch64-macos; do
   # resolves libbitrt.a relative to itself absent an override, which is the L0
   # archive under bit-out/lib, never ${archive} — L1 lives entirely under
   # ${WORK} and bit1's sibling lib/ cannot see it.
+  #
+  # BIT_STDLIB="${STDLIB1}" is the #3206 fix, load-bearing the same way: this
+  # step does not `cd "${WORK}/src"` either, so bit1 would otherwise resolve
+  # `import from "std/..."` in compiler/ (25 such imports, unlike runtime/'s
+  # zero) against whatever directory this script happened to be invoked from.
   echo "C2: rebuilding ${TARGET} with bit1..."
   mkdir -p "${WORK}/build-${TARGET}/stage/bin"
-  BIT_LIBBITRT="${archive}" "${BIT1}" build "${STAGE_SRC}" --target "${TARGET}" \
+  BIT_LIBBITRT="${archive}" BIT_STDLIB="${STDLIB1}" "${BIT1}" build "${STAGE_SRC}" --target "${TARGET}" \
     -o "${WORK}/build-${TARGET}/stage/bin/bit"
   chmod +x "${WORK}/build-${TARGET}/stage/bin/bit"
   # [archivedir] passed EXPLICITLY as ${LIB1}, not left to package.sh's
