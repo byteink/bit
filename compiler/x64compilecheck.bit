@@ -189,27 +189,36 @@ fn checkX64CompileLoop() {
   let fc = xCompileFunction(m, f, XCallConv.SysV)
 
   // push rbp; mov rsp,rbp; push rbx/r13/r14/r15 — the file is the callee-saved
-  // subset because the poll is a call, so all four are preserved. 11 bytes, so
-  // block 0 starts at 11.
-  // #2926: the guard call (test rax,rax; jz over the real poll) now precedes
-  // it, mirroring compiler/arm64call.bit's emitBackEdgeSafepointIfNeeded (#2921).
-  assert(hexOfBytes(fc.code) == "554889e553415541564157" +
-    "e800000000" +   // call bit_rt_safepoint_needed  (guard: no safepoint recorded)
-    "4885c0" +        // test %rax, %rax
-    "0f8405000000" +  // jz +5  (skip the real poll)
-    "e800000000" +   // call bit_rt_safepoint          (the real poll)
-    "e9e8ffffff")     // jmp back to block 0
-  // Two calls now, and only the SECOND is a safepoint.
-  assert(len(fc.relocs) == 2)
-  assert(fc.relocs[0].symbol == "bit_rt_safepoint_needed")
-  assert(fc.relocs[1].symbol == "bit_rt_safepoint")
-  // Its safepoint is the RETURN address of the REAL poll call (30), not the
-  // guard's (16) and not the guard call's own offset.
-  assert(len(fc.safepoints) == 1 && fc.safepoints[0].retOffset == 30)
+  // subset because the poll is a call, so all four are preserved — then
+  // `sub rsp, 16` for #3169's two poll-cache slots. 18 bytes of prologue.
+  let h = hexOfBytes(fc.code)
+  assert(len(h) > 36 && h[0:36] == "554889e5534155415641574881ec10000000")
+  // #3169: the entry prefetch fills the pair, then the back edge's inlined
+  // ladder replaces #2926's guard call. Three relocations, and only the LAST is
+  // a safepoint: the two prefetch leaves neither allocate nor park.
+  assert(len(fc.relocs) == 3)
+  assert(fc.relocs[0].symbol == "bit_rt_world_addr")
+  assert(fc.relocs[1].symbol == "bit_rt_gc_addr")
+  assert(fc.relocs[2].symbol == "bit_rt_safepoint")
+  // The guard call is GONE — that is the whole ticket, so assert its absence
+  // rather than inferring it from the count.
+  let ri = 0
+  while (ri < len(fc.relocs)) {
+    assert(fc.relocs[ri].symbol != "bit_rt_safepoint_needed")
+    ri = ri + 1
+  }
+  // Still exactly one safepoint for the edge, at the REAL poll's return
+  // address, matching the one position buildIntervals recorded.
+  assert(len(fc.safepoints) == 1)
   // The jmp's rel32 is measured from the END of its 4-byte field, so it must
   // resolve to block 0's real offset. A blockOffsets table left at zero would
-  // jump into the prologue instead.
-  assert(fc.frameSize == 0) // nothing spilled and no xmm saves to make room for
+  // jump into the prologue instead. It is the last 5 bytes emitted, and it
+  // targets block 0 — which starts after the prologue AND the prefetch, not at
+  // byte 0, so the displacement is not the whole code length.
+  assert(len(h) >= 10 && h[len(h) - 10:len(h) - 8] == "e9")
+  // Two poll-cache slots and no xmm saves: 16 bytes, already 16-aligned behind
+  // an even number of pushes.
+  assert(fc.frameSize == 16)
 }
 
 // End-to-end: the whole driver on the identity function `f(a: i64): i64 { a }`.
@@ -414,21 +423,71 @@ fn checkX64ControlFlow() {
   // A BACK-edge polls the collector before the edge moves, so an allocation-free
   // loop still yields. The poll is a call: running it after the moves would
   // observe a half-written param set.
-  // #2926: a guard call (test rax,rax; jz over) now precedes the real poll —
-  // mirrors compiler/arm64call.bit's emitBackEdgeSafepointIfNeeded (#2921).
+  // #3169: the fast path no longer calls anything. #2926's guard call is
+  // replaced by stwPollNeeded's own condition, inlined — so the only call left
+  // on this edge is the real poll, on the path that actually needs it.
   let cb = xFnCtx([i64t, i64t, i64t], blocks)
   cb.ctx = ctx
   cb.safepointCodeOffsets = [0]
   cb.curBlock = 1
   xEmitJump(cb, 1, [0]) // target == curBlock: a self-loop
   assert(cb.nextSafepointIdx == 1) // only the real poll is a safepoint
-  assert(len(cb.relocs) == 2)
-  assert(cb.relocs[0].symbol == "bit_rt_safepoint_needed")
-  assert(cb.relocs[1].symbol == "bit_rt_safepoint")
-  // The real poll precedes the jmp, and its safepoint sits at ITS return
-  // address (19: 5 guard call + 3 test + 6 jcc placeholder + 5 real call),
-  // not the guard's own offset (5) and not the end of the emitted edge.
-  assert(cb.safepointCodeOffsets[0] == 19)
+  assert(len(cb.relocs) == 1)
+  assert(cb.relocs[0].symbol == "bit_rt_safepoint")
+
+  // The ladder, rebuilt through the SAME emitters rather than as fixed hex, so
+  // a future change to an encoding cannot silently desync the two (#2927's
+  // concern on the arm64 side, carried forward). This is the load-bearing
+  // check: a wrong word offset or an inverted condition here is a poll that
+  // never fires or one that always does, and neither fails a build.
+  let want = xFnCtx([i64t, i64t, i64t], blocks)
+  want.ctx = ctx
+  want.safepointCodeOffsets = [0]
+  let rTmp = xScratch1()
+  let rGc = xScratch2()
+  let pollFx = []int(0)
+  let skipFx = []int(0)
+  xMovLoad(want.buf, rTmp, xMemB(XReg64.Rbp, xPollCacheOffset(want.frame, 0)), 8, false)
+  xTestRR(want.buf, rTmp, rTmp)
+  pollFx = append(pollFx, xJccRel32Placeholder(want, ccE()))   // waddr == 0
+  xMovLoad(want.buf, rTmp, xMemB(rTmp, pgWorldStopWordWord() * 8), 8, false)
+  xTestRR(want.buf, rTmp, rTmp)
+  pollFx = append(pollFx, xJccRel32Placeholder(want, ccNe()))  // stop pending
+  xMovLoad(want.buf, rGc, xMemB(XReg64.Rbp, xPollCacheOffset(want.frame, 1)), 8, false)
+  xTestRR(want.buf, rGc, rGc)
+  pollFx = append(pollFx, xJccRel32Placeholder(want, ccE()))   // gcAddr == 0
+  xMovLoad(want.buf, rTmp, xMemB(rGc, pgGcCfgStressWord() * 8), 8, false)
+  xTestRR(want.buf, rTmp, rTmp)
+  pollFx = append(pollFx, xJccRel32Placeholder(want, ccNe()))  // stress mode
+  xMovLoad(want.buf, rTmp, xMemB(rGc, pgGcCfgEnabledWord() * 8), 8, false)
+  xTestRR(want.buf, rTmp, rTmp)
+  skipFx = append(skipFx, xJccRel32Placeholder(want, ccE()))   // disabled -> skip
+  xMovLoad(want.buf, rTmp, xMemB(rGc, pgGcHeapAddrWord() * 8), 8, false)
+  xMovLoad(want.buf, rTmp, xMemB(rTmp, pgHeapLiveWordWord() * 8), 8, false)
+  xMovLoad(want.buf, rGc, xMemB(rGc, pgGcNextBytesWord() * 8), 8, false)
+  xArithRR(want.buf, XArith.Cmp, rTmp, rGc)
+  skipFx = append(skipFx, xJccRel32Placeholder(want, ccL()))   // under trigger -> skip
+  // Four exits converge on the real poll; two skip past it.
+  let pi = 0
+  while (pi < len(pollFx)) {
+    xPatchRel32Here(want, pollFx[pi])
+    pi = pi + 1
+  }
+  xEmitCallLike(want, safepointSymbol(), []int(0), false, 0, 0, true)
+  pi = 0
+  while (pi < len(skipFx)) {
+    xPatchRel32Here(want, skipFx[pi])
+    pi = pi + 1
+  }
+  // The edge's own moves come AFTER the poll — running them first would let the
+  // collector observe a half-written param set — then the jump itself.
+  xEmitParamMoves(want, 1, [0])
+  xJmpRel32(want, 1)
+  assert(xHex(cb.buf) == xHex(want.buf))
+  // The real poll's return address is where the one safepoint sits — not the
+  // end of the emitted edge, and not any point in the ladder.
+  assert(cb.safepointCodeOffsets[0] == want.safepointCodeOffsets[0])
+  assert(cb.safepointCodeOffsets[0] > 0)
 
   // A br tests the condition against ITSELF — `test r,r` sets ZF iff r is zero,
   // which is the whole condition; comparing against an immediate would need an
