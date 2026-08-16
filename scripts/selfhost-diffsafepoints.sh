@@ -356,9 +356,19 @@ fi
 # resolved against nm -pa's symbol order); this automates that procedure.
 #
 # Build the pinned fixture to an object and read its __text relocation table:
-# the call site inside `main` (`build(5)` inlines, so `main` calls `f1`
-# directly) must target the CONCRETE instantiation, never the degenerate
-# template instance the checker's initial, unsubstituted sweep records.
+# the call site `f1(x)` inside `build`'s body must target the CONCRETE
+# instantiation, never the degenerate template instance the checker's
+# initial, unsubstituted sweep records.
+#
+# #3186: `f1`'s body is deliberately two-or-more blocks (a `while` loop) so
+# `inlineEligible` (compiler/optinline.bit:63-70, exactly-one-block callees
+# only) never splices it away. Before #3163's bounded recursive inliner
+# (maxInlineDepth()==2), a single-block `f1` left `build(5)` inlined into
+# `main` while `f1$2` still stood as its own call — the premise this header
+# used to state. #3163 made that call site inlinable too, so the whole
+# `main -> build -> f1` chain folded to a constant and PHASE 3 observed
+# nothing (rc=2) in either direction; see #3186's bisection. The loop shape
+# is the fix: it survives whatever the inliner's depth bound is.
 #
 # The degenerate entry's symbol is deterministically `_f1$0` for this exact
 # fixture: `checkModule`'s initial sweep records a generic call's
