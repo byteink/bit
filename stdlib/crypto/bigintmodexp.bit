@@ -1,0 +1,251 @@
+// Bit standard library — crypto module, `Nat` modular exponentiation.
+//
+// Fixed-width Montgomery arithmetic and the two `base^exp mod mod` entry
+// points built on it. Sibling of `./bigint.bit`, same module (SPEC §17.1) —
+// `Nat`, `bigintMake`, `bigintMinInt`, `bigintFromU64`, `bigintIsZero`,
+// `bigintCmp`, `bigintMod`, `bigintMul`, `bigintSqr` and `bigintBitLen` are
+// all visible here with no import, the flat `std/crypto` arrangement this
+// module's other files use. Split out to keep `./bigint.bit` under
+// `tests/bit/lintfilelines.bit`'s 800-line gate (E0200); every declaration
+// below only calls earlier `bigint*` primitives, so there is no ordering
+// question, only a diagnostic-order one the differentials would catch.
+//
+// Montgomery code operates on limb slices of a fixed width `k = len(modulus)`,
+// which may carry high zero limbs (so it is deliberately *not* normalized). This
+// keeps every operation constant-width, a prerequisite for constant time.
+
+// `n`'s limbs zero-extended (or, where the caller guarantees it fits, truncated)
+// to exactly `k` limbs.
+fn bigintWiden(n: Nat, k: int): []u32 {
+  let out = []u32(k)
+  let src = bigintMinInt(len(n.limbs), k)
+  let i = 0
+  while (i < src) {
+    out[i] = n.limbs[i]
+    i = i + 1
+  }
+  return out
+}
+
+// The fixed-width representation of one: `[1, 0, ..., 0]` of length `k`.
+fn bigintOneWidth(k: int): []u32 {
+  let out = []u32(k)
+  out[0] = 1
+  return out
+}
+
+// Reduce the `(k+1)`-limb value `d`, known to be less than `2n`, to `d mod n` in
+// `k` limbs by at most one conditional subtraction of `n`. The subtraction is
+// always computed and then selected with a mask, so no branch depends on whether
+// it was needed — the constant-time core of Montgomery reduction. `d[k]` is the
+// single overflow bit (0 or 1).
+fn bigintReduceOnce(d: []u32, n: []u32): []u32 {
+  let k = len(n)
+  let diff = []u32(k)
+  let borrow: u64 = 0
+  let i = 0
+  while (i < k) {
+    let x = u64(d[i]) + 0x100000000 - u64(n[i]) - borrow
+    diff[i] = u32(x & 0xffffffff)
+    borrow = 1 - (x >> 32)
+    i = i + 1
+  }
+  // d >= n  iff  the overflow bit is set OR the subtraction did not borrow out.
+  let ge = d[k] | (1 - u32(borrow))
+  let mask = u32(0) - ge
+  let out = []u32(k)
+  i = 0
+  while (i < k) {
+    out[i] = (diff[i] & mask) | (d[i] & ~mask)
+    i = i + 1
+  }
+  return out
+}
+
+// The inverse of the odd word `a` modulo 2^32, by Newton's iteration: each step
+// doubles the number of correct low bits, so five steps from a one-bit seed
+// cover all 32 bits. All arithmetic is `u32`, i.e. modulo 2^32.
+fn bigintInvWord(a: u32): u32 {
+  let x: u32 = 1
+  let i = 0
+  while (i < 5) {
+    x = x * (2 - a * x)
+    i = i + 1
+  }
+  return x
+}
+
+// Montgomery multiplication (CIOS form, Koc et al. 1996): given `a, b < n` of
+// width `k`, the odd modulus `n`, and `n0inv = -n[0]^{-1} mod 2^32`, return
+// `a*b*R^{-1} mod n` where `R = 2^(32k)`. The interleaved multiply-and-reduce
+// keeps the accumulator `t` just `k+2` limbs wide; each `(carry, limb)` update
+// tops out at 2^64 - 1, so nothing overflows.
+fn bigintMontMul(a: []u32, b: []u32, n: []u32, n0inv: u32): []u32 {
+  let k = len(n)
+  let t = []u32(k + 2)
+  let i = 0
+  while (i < k) {
+    // t += a * b[i]
+    let c: u64 = 0
+    let j = 0
+    while (j < k) {
+      let uv = u64(t[j]) + u64(a[j]) * u64(b[i]) + c
+      t[j] = u32(uv & 0xffffffff)
+      c = uv >> 32
+      j = j + 1
+    }
+    let uv2 = u64(t[k]) + c
+    t[k] = u32(uv2 & 0xffffffff)
+    t[k + 1] = u32(uv2 >> 32)
+    // m = t[0] * n0inv mod 2^32; t += m*n makes the low limb zero, then shift.
+    let m = u32((u64(t[0]) * u64(n0inv)) & 0xffffffff)
+    let uv3 = u64(t[0]) + u64(m) * u64(n[0])
+    c = uv3 >> 32
+    j = 1
+    while (j < k) {
+      let uv = u64(t[j]) + u64(m) * u64(n[j]) + c
+      t[j - 1] = u32(uv & 0xffffffff)
+      c = uv >> 32
+      j = j + 1
+    }
+    let uv4 = u64(t[k]) + c
+    t[k - 1] = u32(uv4 & 0xffffffff)
+    c = uv4 >> 32
+    t[k] = u32(u64(t[k + 1]) + c)
+    i = i + 1
+  }
+  // Result is t[0..k] with overflow bit t[k]; one conditional subtraction of n.
+  let d = []u32(k + 1)
+  i = 0
+  while (i < k + 1) {
+    d[i] = t[i]
+    i = i + 1
+  }
+  return bigintReduceOnce(d, n)
+}
+
+// `2^(2*32*k) mod n` (that is `R^2 mod n`, the Montgomery conversion constant),
+// by doubling one modulo `n` a fixed `2*32*k` times. Setup only, so its cost is
+// paid once per exponentiation.
+fn bigintMontR2(n: []u32): []u32 {
+  let k = len(n)
+  let x = bigintOneWidth(k)
+  let total = 2 * 32 * k
+  let i = 0
+  while (i < total) {
+    // x = 2x mod n
+    let d = []u32(k + 1)
+    let carry: u32 = 0
+    let j = 0
+    while (j < k) {
+      d[j] = (x[j] << 1) | carry
+      carry = x[j] >> 31
+      j = j + 1
+    }
+    d[k] = carry
+    x = bigintReduceOnce(d, n)
+    i = i + 1
+  }
+  return x
+}
+
+// Constant-time conditional swap of the equal-length limb slices `a` and `b`:
+// swap their contents when `swap == 1`, leave them when `swap == 0`, touching
+// every limb either way so the memory-access pattern is independent of `swap`.
+fn bigintCswap(a: []u32, b: []u32, swap: u32) {
+  let mask = u32(0) - swap
+  let i = 0
+  while (i < len(a)) {
+    let t = mask & (a[i] ^ b[i])
+    a[i] = a[i] ^ t
+    b[i] = b[i] ^ t
+    i = i + 1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Modular exponentiation
+// ---------------------------------------------------------------------------
+
+// `base^exp mod mod` by a *constant-time* Montgomery powering ladder, for an odd
+// modulus. Every exponent bit drives one conditional swap plus one multiply and
+// one square, so the operation sequence — and thus the timing — is identical for
+// every exponent of a given bit length. This is the path secret exponents (RSA
+// `d`, ECDSA nonces) must take. `expBitLen` fixes how many bits are scanned.
+fn bigintModExpMont(baseReduced: Nat, exp: Nat, modN: Nat, expBitLen: int): Nat {
+  let n = bigintWiden(modN, len(modN.limbs))
+  let n0inv = u32(0) - bigintInvWord(n[0])
+  let r2 = bigintMontR2(n)
+  let one = bigintOneWidth(len(n))
+  // Convert into Montgomery form: r0 = R mod n (montgomery one), r1 = base*R mod n.
+  let r0 = bigintMontMul(one, r2, n, n0inv)
+  let r1 = bigintMontMul(bigintWiden(baseReduced, len(n)), r2, n, n0inv)
+
+  let bit = expBitLen - 1
+  while (bit >= 0) {
+    let b = (exp.limbs[bit / 32] >> u32(bit % 32)) & 1
+    bigintCswap(r0, r1, b)
+    r1 = bigintMontMul(r0, r1, n, n0inv)
+    r0 = bigintMontMul(r0, r0, n, n0inv)
+    bigintCswap(r0, r1, b)
+    bit = bit - 1
+  }
+  // Convert out of Montgomery form: r0 * 1 * R^{-1} = base^exp mod n.
+  return bigintMake(bigintMontMul(r0, one, n, n0inv))
+}
+
+// `base^exp mod mod` by variable-time square-and-multiply. Faster for small or
+// public exponents (e.g. the RSA public exponent 65537), but it branches on the
+// exponent bits, so it must never be used with a secret exponent. Also the
+// fallback for an even modulus, where Montgomery reduction does not apply.
+fn bigintModExpVartime(base: Nat, exp: Nat, modN: Nat): Nat! {
+  let result = bigintFromU64(1)
+  let b = bigintMod(base, modN)?
+  let bitLen = bigintBitLen(exp)
+  let i = 0
+  while (i < bitLen) {
+    if (((exp.limbs[i / 32] >> u32(i % 32)) & 1) == 1) {
+      result = bigintMod(bigintMul(result, b), modN)?
+    }
+    b = bigintMod(bigintSqr(b), modN)?
+    i = i + 1
+  }
+  return result
+}
+
+// `base^exp mod mod`, defaulting to the constant-time Montgomery ladder so it is
+// safe for secret exponents. Fails on a zero modulus. `mod == 1` gives 0 and a
+// zero exponent gives 1. An even modulus cannot use Montgomery reduction, so it
+// falls back to variable-time square-and-multiply (even moduli do not arise in
+// the public-key settings where exponent secrecy matters).
+export fn bigintModExp(base: Nat, exp: Nat, modN: Nat): Nat! {
+  if (bigintIsZero(modN)) {
+    fail newError("bigintModExp: zero modulus")
+  }
+  let one = bigintFromU64(1)
+  if (bigintCmp(modN, one) == 0) {
+    return bigintZero()
+  }
+  if (bigintIsZero(exp)) {
+    return one
+  }
+  let baseReduced = bigintMod(base, modN)?
+  if ((modN.limbs[0] & 1) == 0) {
+    return bigintModExpVartime(baseReduced, exp, modN)?
+  }
+  return bigintModExpMont(baseReduced, exp, modN, bigintBitLen(exp))
+}
+
+// `base^exp mod mod` optimized for a *public* exponent: variable-time
+// square-and-multiply, which does no multiply on a zero exponent bit. Use only
+// when the exponent is not secret (RSA verification/encryption). Fails on a zero
+// modulus.
+export fn bigintModExpPublic(base: Nat, exp: Nat, modN: Nat): Nat! {
+  if (bigintIsZero(modN)) {
+    fail newError("bigintModExpPublic: zero modulus")
+  }
+  if (bigintCmp(modN, bigintFromU64(1)) == 0) {
+    return bigintZero()
+  }
+  return bigintModExpVartime(base, exp, modN)?
+}
