@@ -548,12 +548,29 @@ per-object terminator is worse than useless: concatenation would give
 `[e1][T][e2][T]` and the walk would stop at the first `T`, silently losing every
 later member's frames. Entries are self-delimiting and the extent is the bound.
 
-Entry atoms are **1-aligned** so the linker inserts no padding between them —
-padding inside the extent would be decoded as an entry. On Mach-O the section is
-in `__DATA` so dyld rebases its absolute code pointers under PIE; on ELF it is
-read-only, since the image is non-PIE.
+Entry atoms are **8-aligned** (#1927): the writer follows every entry's fields
+with zero PADDING bytes out to a multiple of 8, and the section declares 8-byte
+alignment to match. Because every atom's *length* is already a multiple of 8,
+the linker never has to insert padding of its own to honor that alignment —
+whatever subset of atoms dead-stripping retains, the running byte count after
+each surviving atom is still a multiple of 8, so the next atom is already
+aligned. That is what keeps the walk sound with no count and no terminator: it
+still advances by decoding one entry's real fields, then rounds its cursor up
+to the same 8-byte boundary to skip that entry's own trailing pad — there is
+never a linker-inserted gap to mistake for an entry, because none is ever
+inserted. On Mach-O the section is in `__DATA` so dyld rebases its absolute
+code pointers under PIE; on ELF it is read-only, since the image is non-PIE.
 
-Little-endian, tightly packed (read with unaligned loads):
+Before #1927, entries were 1-aligned and tightly packed with no padding at
+all — equally safe against a linker-inserted gap (there was nothing to align,
+so nothing to pad), but it left every `__bitsm_N` atom's *declared* alignment
+truthfully at 1, and `ld` warns on that: the atom's leading `u64 code_addr` is
+a relocated pointer, and 1-byte declared alignment tells the linker it may be
+placed anywhere.
+
+Little-endian; the trailing pad is the only field not tightly packed against
+its neighbor (read with unaligned loads — nothing inside one entry is
+guaranteed 8-aligned, only the entry boundaries are):
 
 ```
 per function (repeated to the end of the extent):
@@ -570,6 +587,9 @@ per function (repeated to the end of the extent):
     i32 slot_fp_off[num_slots]   # live-reference stack slots, fp-relative
     u16 num_regs
     u16 reg[num_regs]            # physical registers holding a live reference
+  u8 pad[0..7]          # zero bytes bringing this entry's total length to a
+                         # multiple of 8; the walker recomputes the count by
+                         # rounding its cursor up, not by reading a length field
 ```
 
 The walk, per frame: find the function whose code range contains `pc`; at the
