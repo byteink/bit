@@ -75,6 +75,24 @@ PUBLISHED_DIR="${2:-}"
 VERSION="${TAG#v}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# #3195, hazard 2: scripts/stage0.sh honours BIT_STAGE0_BIN from the ambient
+# environment (stage0.sh:91) -- the documented two-pass override for landing
+# a runtime ABI change (tools/build/abiarity.bit's own printed
+# instructions). If a shell that just cut a release still has it exported
+# when this script runs, BOTH the L0 arity guard below and C1's stage0
+# invocation would silently use that override instead of the tag's OWN
+# pinned stage0, comparing a binary against itself and reporting every tag
+# reproducible. Refuse rather than inherit -- stage0.sh:98 only warns to
+# stderr, which is not a refusal, and this script must be the one place that
+# insists.
+EXIT_INHERITED_STAGE0=2
+if [ -n "${BIT_STAGE0_BIN:-}" ]; then
+  echo "verify-reproducible-release.sh: BIT_STAGE0_BIN=${BIT_STAGE0_BIN} is set in the calling environment; refusing to inherit it." >&2
+  echo "verify-reproducible-release.sh: this script must resolve each tag's OWN pinned stage0 to prove reproducibility -- an inherited override would silently compare a binary against itself." >&2
+  echo "verify-reproducible-release.sh: unset it and re-run: env -u BIT_STAGE0_BIN scripts/verify-reproducible-release.sh ${TAG} ..." >&2
+  exit "${EXIT_INHERITED_STAGE0}"
+fi
+
 git -C "${ROOT}" rev-parse --verify "${TAG}" >/dev/null 2>&1 || {
   echo "verify-reproducible-release.sh: tag '${TAG}' not found locally — git fetch --tags?" >&2
   exit 1
@@ -104,8 +122,31 @@ fi
 git -C "${ROOT}" worktree add --detach "${WORK}/src" "${TAG}" >/dev/null
 
 echo "L0: building bootstrap runtime archives at ${TAG}..."
-( cd "${WORK}/src" && ./make libbitrt ) >"${WORK}/build.log" 2>&1 ||
-  { echo "verify-reproducible-release.sh: ./make libbitrt failed, see ${WORK}/build.log" >&2; exit 1; }
+# #3195, hazard 1: this attempt is ALSO the seam detector. #3152's guard
+# (tools/build/abiarity.bit, wired into stepLibbitrt) refuses to link
+# whenever this tag's runtime/** ABI has moved past the pin its own
+# dist/stage0/SHA256SUMS records -- exactly the case a single-pass rebuild
+# can never satisfy (the pin that could build it is the release being cut).
+# Recognise that refusal by its own diagnostic text rather than
+# pattern-matching runtime/** ourselves, and give it a DISTINCT exit code
+# and an unswallowed message -- previously this failure looked identical to
+# every other build failure: buried in build.log, exit 1.
+EXIT_ABI_SEAM=3
+L0_RC=0
+( cd "${WORK}/src" && ./make libbitrt ) >"${WORK}/build.log" 2>&1 || L0_RC=$?
+if [ "${L0_RC}" -ne 0 ]; then
+  if grep -q 'runtime ABI arity mismatch against the pinned stage0' "${WORK}/build.log"; then
+    pinned_tag="$(grep -m1 'runtime ABI arity mismatch against the pinned stage0' "${WORK}/build.log" |
+      grep -oE '\(v[^)]*\)' | tr -d '()')"
+    echo "verify-reproducible-release.sh: ${TAG} cannot be verified by a single-pass build." >&2
+    echo "verify-reproducible-release.sh: its own dist/stage0/SHA256SUMS pins ${pinned_tag:-an earlier release}, whose runtime/** predates a runtime ABI change now present in ${TAG} -- #3152's guard correctly refuses to link the mismatched pair (unsafe, not merely unavailable)." >&2
+    echo "verify-reproducible-release.sh: reproducing ${TAG} needs the two-pass BIT_STAGE0_BIN bootstrap (docs/development.md, \"Landing a runtime ABI change\"); this script does not perform that rebuild. Guard output:" >&2
+    sed -n '/runtime ABI arity mismatch against the pinned stage0/,$p' "${WORK}/build.log" >&2
+    exit "${EXIT_ABI_SEAM}"
+  fi
+  echo "verify-reproducible-release.sh: ./make libbitrt failed, see ${WORK}/build.log" >&2
+  exit 1
+fi
 
 # THE PINNED STAGE0 AT THIS TAG, never a compiler built from this tree — same
 # reason dist/release.sh uses it and the differentials use it as their oracle:
@@ -136,6 +177,22 @@ echo "stage0 = ${STAGE0}"
 # side effects (it writes bit-out/make/*.stamp, bit-out/make/host.triple), and
 # spelling the recipe out here keeps it auditable as the one thing stage0 is
 # still trusted to build.
+#
+# #3195: because this is a raw stage0 invocation rather than a `./make` step,
+# it never calls checkRuntimeAbiArity() itself and would silently link a
+# mismatched pair if reached unguarded (the same 11.3 GB/3s defect #3152
+# exists to prevent). It is safe ONLY because L0 above already ran that exact
+# check (`./make libbitrt` -> stepLibbitrt) against this same ${WORK}/src
+# tree and did not exit — checkRuntimeAbiArity() is a pure function of (this
+# tree's runtime/**, the tag stage0 was cut from), and nothing between L0 and
+# here writes to runtime/**, so L0's verdict is authoritative here too.
+# Assert that invariant instead of trusting it silently, so a future reorder
+# that separates L0 from C1 trips a clear error instead of quietly
+# unguarding this call.
+[ "${L0_RC}" -eq 0 ] || {
+  echo "verify-reproducible-release.sh: internal error: reached C1 without L0's ABI arity guard having passed (L0_RC=${L0_RC})" >&2
+  exit 1
+}
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)              HOST_TRIPLE=aarch64-macos ;;
   Linux-aarch64|Linux-arm64) HOST_TRIPLE=aarch64-linux ;;
