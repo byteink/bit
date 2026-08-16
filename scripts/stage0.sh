@@ -64,6 +64,27 @@ die() { printf 'stage0: %s\n' "$*" >&2; exit 1; }
 # then cut a release from pass 2 and repin dist/stage0/SHA256SUMS, after which a
 # single pass is correct again and this variable goes back to being unused.
 #
+# THIS RECIPE COVERS A COMPILER-ONLY FIX. #1857's runtime was unchanged, so
+# pass 1's plain `./make` already builds against a runtime stage0 is
+# self-consistent with. It does NOT generalise to a runtime ABI or
+# wire-format change — there the working tree's `runtime/**` already carries
+# the NEW shape, so pass 1's plain `./make` is exactly the configuration
+# `tools/build/abiarity.bit`'s runtime ABI arity guard refuses, and running
+# the recipe above just reproduces the same refusal. For that case, pass 1
+# instead needs the OLD runtime checked out first:
+#
+#   rm -rf bit-out
+#   git checkout <commit before the runtime/** change> -- runtime/
+#   ./make                                       # pass 1: new compiler/**, linked against the OLD runtime
+#   cp bit-out/bin/bit "$TMPDIR/bit1"
+#   git checkout HEAD -- runtime/                # restore before anything else reads the tree
+#   BIT_STAGE0_BIN="$TMPDIR/bit1" ./make          # pass 2 -- do NOT rm -rf bit-out here
+#
+# See docs/development.md, "Landing a runtime ABI change", for why (the OLD
+# runtime is what stage0's frozen call-site arity still matches) and for the
+# two traps above (no rm -rf between passes; restore runtime/ on every exit
+# path, including failure).
+#
 # DELIBERATELY UNVERIFIED, unlike the pinned path: there is no digest to check an
 # arbitrary local binary against. That is the whole point, and it is why this is
 # an explicit opt-in that announces itself on stderr rather than a fallback.
