@@ -5,7 +5,7 @@
 // Sorts before `defs.bit` and `main.bit` so the inliner has already lowered
 // these by the time their callers are lowered (#1511).
 
-import { readFile, writeFile, exists, mkdir, walk } from "std/fs"
+import { readFile, writeFile, exists, mkdir, walk, remove } from "std/fs"
 import { env } from "std/os"
 import { newSha256, encodeHex, Hash } from "std/crypto"
 import { hasSuffix } from "std/strings"
@@ -253,6 +253,232 @@ fn hostTriple(): string {
   return trimNewline(t)
 }
 
+// --- stack-map padding (#3198) ----------------------------------------------
+//
+// #1927 split the stack-map entry format's writer and reader across two
+// build inputs that update on different schedules. The writer
+// (`padTo(out, 8)`, compiler/codegen.bit:277) is frozen inside whichever
+// compiler emitted this archive's objects; the reader (the `off % 8`
+// round-up, runtime/gc/stackmap.bit) is source, so it reaches every rebuild
+// immediately. When the host archive is built by a compiler that predates
+// #1927 (the pinned stage0, on an ordinary single-pass `./make`), every
+// emitted entry is tightly packed with no trailing pad, but the tree's
+// reader still rounds its cursor up to the next 8-byte boundary after each
+// one — the walk desyncs on the first entry whose own length was not
+// already a multiple of 8 and dereferences garbage on the first collection
+// (bus error). Measured (#3198): a plain single-pass build's `runtime_gc.o`
+// `__bit_gc` section was 5978 bytes (%8 = 2); a correct two-pass build's
+// was 6200 bytes (%8 = 0). `BIT_GC=off` on the broken binary runs fine —
+// the walk that dereferences garbage never executes.
+//
+// This inspects bytes already on disk after the archive is written, unlike
+// checkRuntimeAbiArity() above, which compares SOURCE before a single byte
+// is written — there is nothing to inspect until the archive exists. See
+// stepLibbitrt's call site for what a refusal does about that archive.
+//
+// Every `__bit_gc` (Mach-O) / `.bit_gc` (ELF) section across the archive's
+// member objects must be a multiple of 8 bytes. Read directly off the
+// platform's own object-inspection tool run against the WHOLE archive in
+// one invocation — both `otool -l` (macOS) and `objdump -h` (Linux/binutils)
+// walk every member of a `.a` and print its own section headers, so no
+// extraction step (`ar x`) is needed.
+
+struct StackMapSection { obj: string, sizeBytes: int }
+
+fn isHexDigit(c: u8): bool {
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+fn hexDigitVal(c: u8): int {
+  if (c >= '0' && c <= '9') { return int(c) - int('0') }
+  if (c >= 'a' && c <= 'f') { return int(c) - int('a') + 10 }
+  return int(c) - int('A') + 10
+}
+
+// The integer value of the first "0x"-prefixed hex run on `line`, or -1 —
+// otool -l's "size 0x00000000000005fa" field shape.
+fn firstHexOnLine(line: string): int {
+  let i = 0
+  let n = len(line)
+  while (i + 1 < n) {
+    if (line[i] == '0' && line[i + 1] == 'x') {
+      let j = i + 2
+      let v = 0
+      let saw = false
+      while (j < n && isHexDigit(line[j])) {
+        v = v * 16 + hexDigitVal(line[j])
+        j = j + 1
+        saw = true
+      }
+      if (saw) { return v }
+    }
+    i = i + 1
+  }
+  return 0 - 1
+}
+
+// The integer value of the (unprefixed) hex run starting at the first
+// non-space character at or after `start`, or -1 — objdump -h's "Size"
+// column ("00000cb8", no "0x"), read as the token immediately following the
+// matched section name rather than from the start of the line: ".bit_gc"
+// itself contains the hex digits 'b' and 'c', so scanning from the line's
+// start would misparse the section name as part of the number.
+fn hexRunAt(line: string, start: int): int {
+  let i = start
+  let n = len(line)
+  while (i < n && line[i] == ' ') {
+    i = i + 1
+  }
+  let v = 0
+  let saw = false
+  while (i < n && isHexDigit(line[i])) {
+    v = v * 16 + hexDigitVal(line[i])
+    i = i + 1
+    saw = true
+  }
+  if (!saw) { return 0 - 1 }
+  return v
+}
+
+// Parses combined multi-member `otool -l <archive>` text (macOS): a member
+// boundary is a line ending "(<member>.o):"; each `sectname __bit_gc` line
+// is followed, a few lines later, by its stanza's `size` field (otool's
+// fixed Section/sectname/segname/addr/size/... shape — the same window
+// tests/bit/globalsbss.bit's otoolSectionSize scans, generalized here to
+// walk every member instead of stopping at the first match).
+fn parseOtoolBitGc(text: string): []StackMapSection {
+  let out = []StackMapSection(0)
+  let lines = split(text, "\n")
+  let n = len(lines)
+  let curObj = ""
+  let i = 0
+  while (i < n) {
+    let line = lines[i]
+    let openAt = indexOf(line, "(")
+    if (openAt >= 0 && contains(line[openAt:], "):")) {
+      let closeAt = indexOf(line[openAt:], "):")
+      curObj = line[openAt + 1:openAt + closeAt]
+    } else if (contains(line, "sectname __bit_gc")) {
+      let j = i
+      let limit = i + 8
+      if (limit > n) { limit = n }
+      while (j < limit) {
+        if (hasPrefix(trimSpace(lines[j]), "size ")) {
+          out = append(out, StackMapSection{obj: curObj, sizeBytes: firstHexOnLine(lines[j])})
+          j = limit
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Parses combined multi-member `objdump -h <archive>` text (Linux hosts): a
+// member boundary is "<member>:     file format ...", and a section line
+// holds the section name immediately followed by its size as a bare hex
+// run — objdump -h's fixed Idx/Name/Size/VMA/LMA/File-off/Algn columns.
+fn parseObjdumpBitGc(text: string): []StackMapSection {
+  let out = []StackMapSection(0)
+  let lines = split(text, "\n")
+  let curObj = ""
+  for line of lines {
+    let ffAt = indexOf(line, ":     file format")
+    if (ffAt >= 0) {
+      curObj = line[:ffAt]
+      continue
+    }
+    let nameAt = indexOf(line, ".bit_gc")
+    if (nameAt >= 0) {
+      let size = hexRunAt(line, nameAt + len(".bit_gc"))
+      if (size >= 0) {
+        out = append(out, StackMapSection{obj: curObj, sizeBytes: size})
+      }
+    }
+  }
+  return out
+}
+
+// After stepLibbitrt writes the host archive, assert every __bit_gc/.bit_gc
+// section across its members is 8-aligned. Skips itself (with a warning,
+// not a failure) when the archive cannot be inspected at all — a missing
+// otool/objdump or a parse that finds zero stack-map sections in a
+// non-empty archive is an infrastructure gap, not evidence either way, and
+// must not manufacture a build failure unrelated to this bug class (mirrors
+// checkRuntimeAbiArity's own infra-hiccup skips above).
+fn checkStackMapPadding(host: string): bool {
+  let archive = "${outDir()}/lib/${host}/libbitrt.a"
+  if (!exists(archive)) {
+    return true
+  }
+  let outPath = "bit-out/make/stackmap-check.out"
+  let macos = contains(host, "macos")
+  let tool = "objdump -h"
+  if (macos) {
+    tool = "otool -l"
+  }
+  let script = tool + " " + shQuote(archive) + " > " + shQuote(outPath) + " 2>&1\n"
+  let rc = runShell("stackmap-check", script, buildTimeoutMs())
+  let text = readFile(outPath) catch _ { "" }
+  if (rc != 0 || len(text) == 0) {
+    eprint("make: libbitrt: cannot inspect ${archive} with '${tool}' for the stack-map padding check (rc=${rc}); skipping (#3198)\n")
+    return true
+  }
+  let sections = []StackMapSection(0)
+  if (macos) {
+    sections = parseOtoolBitGc(text)
+  } else {
+    sections = parseObjdumpBitGc(text)
+  }
+  if (len(sections) == 0) {
+    eprint("make: libbitrt: found no __bit_gc/.bit_gc section in ${archive}'s members; skipping the stack-map padding check (#3198)\n")
+    return true
+  }
+  let bad = []StackMapSection(0)
+  for s of sections {
+    if (s.sizeBytes >= 0 && s.sizeBytes % 8 != 0) {
+      bad = append(bad, s)
+    }
+  }
+  if (len(bad) == 0) {
+    return true
+  }
+  eprint("make: libbitrt: refusing — ${archive} carries stack-map entries that are NOT 8-aligned (#1927, runtime/ABI.md §4):\n")
+  for s of bad {
+    eprint("make:   ${s.obj}: __bit_gc/.bit_gc section is ${s.sizeBytes} bytes (% 8 = ${s.sizeBytes % 8})\n")
+  }
+  eprint("make: this archive's objects were built by a compiler that predates #1927's entry padding, while runtime/gc/stackmap.bit's reader (source, always current) rounds every entry up to 8 bytes regardless — the walk desyncs on the first unpadded entry and dereferences garbage on the first collection (#3198).\n")
+  eprint("make: land this with the two-pass BIT_STAGE0_BIN bootstrap instead (docs/development.md, \"Landing a runtime ABI change\"):\n")
+  eprint("make:   ./make                                       # pass 1: stage0 -> a compiler built from the new compiler/** source\n")
+  eprint("make:   BIT_STAGE0_BIN=\\$PWD/bit-out/bin/bit ./make   # pass 2: that compiler -> the correct runtime, linked correctly\n")
+  removeArchives()
+  return false
+}
+
+// Deletes every target's archive when checkStackMapPadding refuses, rather
+// than leaving them on disk for the next command to link. All three were
+// built by the same compiler in the same invocation (the loop in
+// stepLibbitrt / stepLibbitrtTree shares one `BIT`/`bit1` for every target),
+// so a bad host archive means all three are equally suspect. Mirrors #3197's
+// own reasoning for moving checkRuntimeAbiArity() before the write: a
+// refusal that leaves a previously-good archive overwritten by a bad one
+// reports failure while silently leaving the tree worse than it found it.
+// stepLibbitrt never reaches writeStamp() on this path, so a rebuild is
+// forced (and re-checked) on the very next invocation regardless of whether
+// the archive files themselves still exist — deleting them is about not
+// leaving a corrupt-but-looks-built artifact on disk, not about the
+// driver's own cache being fooled.
+fn removeArchives() {
+  for p of archivePaths() {
+    if (exists(p)) {
+      remove(p) catch _ {
+        eprint("make: warning: could not remove suspect archive ${p}; delete it by hand before the next build\n")
+      }
+    }
+  }
+}
+
 // --- steps -----------------------------------------------------------------
 
 // `scripts/g2archive.sh` is the ONE recipe for this archive and is called
@@ -301,6 +527,13 @@ fn stepLibbitrt(stage0: string): (int, bool) {
       eprint("make: libbitrt ${t} failed (${rc})\n")
       return 1, true
     }
+  }
+  // #3198: unlike checkRuntimeAbiArity above, this one can only run after
+  // the write — it inspects the archive's own bytes, which do not exist
+  // until here. See tools/build/artifacts.bit's "stack-map padding" section
+  // for what it guards and why a refusal also deletes what it just wrote.
+  if (!checkStackMapPadding(hostTriple())) {
+    return 1, true
   }
   writeStamp(stampPath(), fp)
   return 0, true
@@ -392,6 +625,12 @@ fn stepLibbitrtTree(stage0: string, fp: string): (int, bool) {
       return 1, true
     }
   }
+  // #3198: bit1 was compiled from this tree's own compiler/**, which always
+  // carries #1927's padding — expected to pass, checked anyway rather than
+  // assumed, for the same reason the class matters more than the instance.
+  if (!checkStackMapPadding(host)) {
+    return 1, true
+  }
   writeStamp(stampPath(), fp)
   return 0, true
 }
@@ -438,6 +677,13 @@ fn stepSelfhost(stage0: string): (int, bool) {
   // ran, so calling it unconditionally here costs nothing on the common path
   // and closes the one case `stepLibbitrt` cannot see.
   if (!checkRuntimeAbiArity()) {
+    return 1, true
+  }
+  // #3198: same short-circuit gap checkRuntimeAbiArity's second call closes
+  // above — `libbitrt`'s fast path never reaches checkStackMapPadding
+  // either, so a compiler-only change that only relinks here would
+  // otherwise never re-verify an archive built before this guard existed.
+  if (!checkStackMapPadding(host)) {
     return 1, true
   }
   let script = "set -e\n" +

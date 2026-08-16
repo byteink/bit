@@ -592,6 +592,30 @@ per function (repeated to the end of the extent):
                          # rounding its cursor up, not by reading a length field
 ```
 
+**The producer and the reader are separate build inputs, and this format's
+correctness depends on them agreeing (#3198).** The padding above is written by
+whichever compiler emitted an object (`compiler/codegen.bit`'s
+`writeStackMaps`) and read by whichever `runtime/gc/stackmap.bit` this tree
+currently has — two different build stages, not one. The default
+`./make libbitrt` path compiles `runtime/**` with the *pinned stage0*, a
+previous release's compiler frozen at build time, while the reader is always
+the working tree's current source. A stage0 built before #1927 landed emits
+unpadded, 1-aligned entries; the tree's post-#1927 reader unconditionally
+rounds every entry's cursor up to 8 regardless of what the writer did — the
+walk desyncs on the first entry whose own length is not already a multiple
+of 8 and dereferences garbage on the first collection. `BIT_GC=off` on such
+a binary runs fine, because the walk that dereferences garbage never
+executes.
+`tools/build/artifacts.bit`'s `checkStackMapPadding()` guards this after
+`stepLibbitrt` writes the host archive — the earliest point these bytes
+exist to inspect — asserting every member object's `__bit_gc` (Mach-O) /
+`.bit_gc` (ELF) section length is a multiple of 8, refusing and deleting the
+archive otherwise, and naming the two-pass `BIT_STAGE0_BIN` bootstrap
+(docs/development.md, "Landing a runtime ABI change") as the fix. It is a
+guard against this *class* of skew — any future change to this wire format
+that a stage0 repin has not yet caught up to — not a promise that today's
+exact field layout is what a mismatch would ever reproduce again.
+
 The walk, per frame: find the function whose code range contains `pc`; at the
 matching `ret_offset`, `markRoot` each `slot_fp_off` slot and each live register
 (read from the running snapshot for the innermost frame, or reconstructed from
