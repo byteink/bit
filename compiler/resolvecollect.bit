@@ -1,0 +1,192 @@
+// #3166: split out of resolve.bit to stay under the repo's 800-line E0200
+// limit (spec/LINT.md's max-file-lines). Pass 1 — collecting every top-level
+// symbol (including import declarations) into the module's flat scope. Pass
+// 2 and the resolver substrate live in resolvebody.bit / resolve.bit.
+
+// ---- pass 1: collect top-level symbols (order-independent, §9) -------------
+
+fn rCollectTopLevel(r: Resolver) {
+  let decls = kidsOf(r.tree, r.tree.root)
+  let i = 0
+  while (i < len(decls)) {
+    if (decls[i] != 0) {
+      rCollectTopDecl(r, decls[i], false)
+    }
+    i = i + 1
+  }
+}
+
+fn rNamedTopDecl(r: Resolver, idx: int, kind: SymbolKind, forcedExport: bool) {
+  let name = kidsOf(r.tree, idx)[0]
+  rInsertModuleSymbol(r, name, Symbol{ name: rIdentText(r, name), kind: kind, decl: idx, fileIdx: 0,
+    exported: forcedExport, importedFromModule: -1, importedFromSymbol: -1, namespaceModule: -1 })
+}
+
+fn rCollectTopDecl(r: Resolver, idx: int, forcedExport: bool) {
+  let tag = getNode(r.tree, idx).tag
+  if (tag == Tag.Export) {
+    rCollectTopDecl(r, kidsOf(r.tree, idx)[0], true)
+  } else if (tag == Tag.ImportDecl) {
+    rCollectImport(r, idx)
+  } else if (tag == Tag.LetDecl || tag == Tag.ConstDecl) {
+    let kind = SymbolKind.ConstBinding
+    if (tag == Tag.LetDecl) {
+      kind = SymbolKind.LetBinding
+    }
+    let bindings = kidsOf(r.tree, idx)
+    let i = 0
+    while (i < len(bindings)) {
+      rDeclarePattern(r, kidsOf(r.tree, bindings[i])[0], kind, forcedExport)
+      i = i + 1
+    }
+  } else if (tag == Tag.TypeAlias) {
+    rNamedTopDecl(r, idx, SymbolKind.TypeAlias, forcedExport)
+  } else if (tag == Tag.FuncDecl) {
+    // Methods (a receiver is present) do not join the flat namespace — different
+    // types may each declare a method with the same name (§10.4); they are
+    // reached via `recv.name(...)`, never a bare scope lookup.
+    let k = kidsOf(r.tree, idx) // [recv, name, generics, params, result, body]
+    if (k[0] == 0) {
+      rInsertModuleSymbol(r, k[1], Symbol{ name: rIdentText(r, k[1]), kind: SymbolKind.Func, decl: idx,
+        fileIdx: 0, exported: forcedExport, importedFromModule: -1, importedFromSymbol: -1,
+        namespaceModule: -1 })
+    }
+  } else if (tag == Tag.ExternFnDecl) {
+    // SPEC 11.7: an external symbol binding. It joins the flat namespace as an
+    // ordinary callable — only its lowering differs.
+    let ek = kidsOf(r.tree, idx) // [name, params, result]
+    rInsertModuleSymbol(r, ek[0], Symbol{ name: rIdentText(r, ek[0]), kind: SymbolKind.Func, decl: idx,
+      fileIdx: 0, exported: forcedExport, importedFromModule: -1, importedFromSymbol: -1,
+      namespaceModule: -1 })
+  } else if (tag == Tag.StructDecl) {
+    rNamedTopDecl(r, idx, SymbolKind.StructType, forcedExport)
+  } else if (tag == Tag.InterfaceDecl) {
+    rNamedTopDecl(r, idx, SymbolKind.InterfaceType, forcedExport)
+  } else if (tag == Tag.EnumDecl) {
+    rNamedTopDecl(r, idx, SymbolKind.EnumType, forcedExport)
+  }
+  // anything else: a poisoned decl from parser error recovery
+}
+
+fn rDeclarePattern(r: Resolver, patIdx: int, kind: SymbolKind, exported: bool) {
+  if (getNode(r.tree, patIdx).tag == Tag.TuplePat) {
+    let subs = kidsOf(r.tree, patIdx)
+    let i = 0
+    while (i < len(subs)) {
+      rDeclarePattern(r, subs[i], kind, exported)
+      i = i + 1
+    }
+    return
+  }
+  rInsertModuleSymbol(r, patIdx, Symbol{ name: rIdentText(r, patIdx), kind: kind, decl: patIdx,
+    fileIdx: 0, exported: exported, importedFromModule: -1, importedFromSymbol: -1,
+    namespaceModule: -1 })
+}
+
+fn rCollectImport(r: Resolver, idx: int) {
+  let k = kidsOf(r.tree, idx) // [body, path_string]
+  let body = k[0]
+  let pathNode = k[1]
+  let pathText = rStringLitText(r, pathNode)
+  // The loader owns the recursion stack, so it — not this pass — is what can tell
+  // a cycle from a miss; it reports the two apart via `modCycle`/`modNotFound`.
+  // An absent entry means the loader never saw the path at all (a poisoned import
+  // whose path literal failed to parse), which is a miss.
+  let (target, found) = r.importPaths[pathText]
+  if (!found) {
+    target = modNotFound
+  }
+  // A path the parser could not read is the `none` poison, which carries no span.
+  // The parser already said "expected a string literal", so a second error here
+  // is a cascade — and one that renders against whatever file happens to hold
+  // offset 0 (the prelude, in a project build), blaming a file the user never
+  // touched. Bind the names as unresolved and stay quiet.
+  if (pathNode == 0) {
+    target = modNotFound
+  } else if (target == modCycle) {
+    rErrorNoHint(r, pathNode, ecImportCycle, "import cycle: module \"${pathText}\" depends on itself")
+  } else if (target == modPkgFail) {
+    // No generic hint here: `detail` (a bit.lock/cache-specific reason, e.g.
+    // "run `bit add ...`" or a fetch error) already carries the actionable
+    // fix, and pairing it with the relative-path/std hint below would tell
+    // the user to do something that has nothing to do with why this failed.
+    let (detail, _) = r.importFailDetail[pathText]
+    rErrorNoHint(r, pathNode, ecImportNotFound, "cannot find module \"${pathText}\": ${detail}")
+  } else if (target == modSibling) {
+    // #2870: `pathText` names a `.bit` file beside this one, not a missing
+    // module — "cannot find" is false (the file exists) and "must start with
+    // './'" is false (it already does). §17.1 makes the two files one module,
+    // so the name is already bound; E0042 on the redeclaration below is the
+    // diagnostic that is actually true.
+    let sib = pathBase(pathText) + ".bit"
+    rError(r, pathNode, ecImportNotFound, "\"${pathText}\" is part of this module, not a separate one",
+      "${sib} sits beside this file and its declarations are already in scope; delete the import")
+  } else if (target < 0) {
+    // #2909: this arm used to give one hint for every remaining failure —
+    // "must start with './' or '../'; standard-library modules aren't
+    // available yet" — but by the time a path reaches here it has already
+    // survived the `modSibling`/`modPkgFail` triage above, so a relative path
+    // that lands here already satisfies the syntax rule the old hint recited,
+    // and std/ imports have worked since #1737. Name the real failure instead:
+    // a relative path names a directory that does not exist next to this
+    // file, and a std/ path names a stdlib module that is not there.
+    if (startsWith(pathText, "std/")) {
+      rError(r, pathNode, ecImportNotFound, "cannot find module \"${pathText}\"",
+        "no standard-library module named \"${pathText[4:len(pathText)]}\" exists")
+    } else if (isRelativeImportPath(pathText)) {
+      rError(r, pathNode, ecImportNotFound, "cannot find module \"${pathText}\"",
+        "no directory or file named \"${pathText}\" exists relative to this file")
+    } else {
+      // Unreachable today — `resolvePackageImport` always returns a non-empty
+      // `detail` for a bare name, which routes to `modPkgFail` above — but a
+      // sentinel this file collapses many failure shapes into deserves a
+      // message that is at least true if a future one ever lands here.
+      rError(r, pathNode, ecImportNotFound, "cannot find module \"${pathText}\"",
+        "check the spelling of the import path")
+    }
+  }
+  if (target < 0) {
+    target = modNotFound // one "no module" value downstream, whichever way it failed
+  }
+
+  let bodyTag = getNode(r.tree, body).tag
+  if (bodyTag == Tag.ImportNs || bodyTag == Tag.ImportStar) {
+    let nameNode = kidsOf(r.tree, body)[0]
+    rInsertModuleSymbol(r, nameNode, Symbol{ name: rIdentText(r, nameNode),
+      kind: SymbolKind.ImportNamespace, decl: nameNode, fileIdx: 0, exported: false,
+      importedFromModule: -1, importedFromSymbol: -1, namespaceModule: target })
+  } else if (bodyTag == Tag.ImportGroup) {
+    let items = kidsOf(r.tree, body)
+    let i = 0
+    while (i < len(items)) {
+      let ik = kidsOf(r.tree, items[i]) // [name, alias_or_none]
+      let bindNode = ik[0]
+      if (ik[1] != 0) {
+        bindNode = ik[1]
+      }
+      rDeclareImportItem(r, ik[0], bindNode, target)
+      i = i + 1
+    }
+  }
+}
+
+fn rDeclareImportItem(r: Resolver, srcNameNode: int, bindNameNode: int, target: int) {
+  let kind = SymbolKind.Poison
+  let fromSymbol = -1
+  let fromModule = -1
+  if (target >= 0 && target < len(r.allModules)) {
+    let srcName = rIdentText(r, srcNameNode)
+    let (targetId, exported) = r.allModules[target].exports[srcName]
+    if (exported) {
+      kind = SymbolKind.ImportItem
+      fromModule = target
+      fromSymbol = targetId
+    } else {
+      rError(r, srcNameNode, ecUnexportedName, "'${srcName}' is not exported by this module",
+        "add 'export' to its declaration in the source module, or check the spelling")
+    }
+  }
+  rInsertModuleSymbol(r, bindNameNode, Symbol{ name: rIdentText(r, bindNameNode), kind: kind,
+    decl: bindNameNode, fileIdx: 0, exported: false, importedFromModule: fromModule,
+    importedFromSymbol: fromSymbol, namespaceModule: -1 })
+}
