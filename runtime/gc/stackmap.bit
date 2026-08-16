@@ -104,6 +104,94 @@ let scanRegs: [32]i64
 }
 
 // ---------------------------------------------------------------------------
+// Bounds checking (#1839)
+// ---------------------------------------------------------------------------
+//
+// `scanFrame` used to check `off < tblLen` once per entry and then advance
+// `off` and read up to eleven more times using counts (`numSaved`, `numSps`,
+// `numSlots`, `numRegs`) read OUT OF the table it is walking. A truncated,
+// corrupt, or writer/reader-mismatched blob desynchronises one of those counts
+// and every read after it is unbounded — it reads whatever follows the table
+// in the process image. Every read below is checked against `inBlob` first,
+// not just the entry's first.
+
+// Whether `need` bytes starting at `off` are still inside `[0, tblLen)`. The
+// caller must check this before EVERY read, not only the first per entry —
+// `off` may already be corrupt by the time it gets here, having been advanced
+// by a count this same walk just read out of the table.
+//
+// A single comparison, deliberately not `off >= 0 && need >= 0 && ...`: every
+// call site below passes an `off` this same function has already proven `>= 0`
+// (0 at the first call, and only ever advanced by a `need` this check just
+// approved) and a `need` that is either a fixed non-negative literal or a u16
+// blob read (`blobU16` returns `loadByte | loadByte << 8`, always `[0,
+// 65535]`) times a small constant — never negative. `&&` compiles to a
+// multi-block short-circuit, which disqualifies a callee from
+// `compiler/optinline.bit`'s single-block inliner (confirmed: zero `bl
+// _inBlob` relocations into `scanFrame` with this single-comparison form,
+// against nonzero with the `&&` form).
+//
+// Even fully inlined, this is NOT free on `scanFrame`'s hot path: `#1839`'s
+// own measurement is `tests/bit/stress/quicwire` under `BIT_GC=stress` going
+// from ~182s (baseline, no bounds check) to ~420-450s wall / ~670s user CPU
+// with every read checked — a real ~2.4x, not contention noise (reproduced
+// across multiple runs, `user` CPU time from `time` rather than wall clock).
+// `BIT_GC=stress` collects at EVERY safepoint, so it multiplies this
+// function's per-entry cost by an amount no non-stress program pays; see
+// #1839's ticket comments for the full measurement and the open question of
+// whether `test-stress-batch`'s deadline should change for this mode.
+@nosplit fn inBlob(off: int, need: int, tblLen: int): bool {
+  return off + need <= tblLen
+}
+
+// The fixed message a failed `inBlob` check panics with: "gc: stack-map entry
+// runs past table extent" (42 bytes), packed little-endian exactly as
+// `runtime/root/slices.bit`'s `panicBounds` packs its three messages.
+const smBoundsMsgWord0: int = 7161132920306557799
+const smBoundsMsgWord1: int = 7954799983862820203
+const smBoundsMsgWord2: int = 8317714694831436404
+const smBoundsMsgWord3: int = 7022273403501506592
+const smBoundsMsgWord4: int = 7310600470859705442
+const smBoundsMsgWord5: int = 29806
+const smBoundsMsgLen: int = 42
+
+// `bit_rt_panic` (ABI.md §12), defined per-platform in `<os>/io.bit` and
+// reached here by symbol, the same door `runtime/root/slices.bit`,
+// `runtime/root/maps.bit`, `runtime/sched/worker.bit` and
+// `runtime/chan/chanwrap.bit` each already open with their own copy of this
+// same declaration. Legal inside `@nosplit` (SPEC §11.7, #1640): it takes an
+// already-built string header and never allocates.
+extern fn bit_rt_panic(msg: int)
+
+// The `{ptr, len}` string header (ABI.md §2) plus 6 inline text words: 48
+// bytes of text budget for the 42-byte message above, laid out exactly as
+// `slices.bit`'s `boundsMsg`. The header fields (`ptr` at +0, `len` at +8,
+// text at +16) are inlined as literals rather than imported from
+// `runtime/root/root.bit`'s `strPtr`/`strLen`/`strHeaderSize`: `runtime/root`
+// imports FROM `runtime/gc`, not the reverse, so importing here would invert
+// the module graph. MODULE STATE, not a local: `ptrOf` needs an addressable
+// object and `@nosplit` forbids allocating one per call (E0075).
+let smBoundsMsg: [8]i64
+
+// A failed bounds check: refuse the read rather than perform it. Per the
+// ticket's constraint, this must not silently skip the frame — a skip leaves
+// it unscanned, which is a missed GC root, strictly worse than the
+// out-of-bounds read this prevents. NEVER RETURNS.
+@nosplit fn panicStackMapBounds() {
+  let base = int(ptrOf(smBoundsMsg))
+  let text = base + 16
+  storeWord(base + 0, text)
+  storeWord(base + 8, smBoundsMsgLen)
+  storeWord(text + 0, smBoundsMsgWord0)
+  storeWord(text + 8, smBoundsMsgWord1)
+  storeWord(text + 16, smBoundsMsgWord2)
+  storeWord(text + 24, smBoundsMsgWord3)
+  storeWord(text + 32, smBoundsMsgWord4)
+  storeWord(text + 40, smBoundsMsgWord5)
+  bit_rt_panic(base)
+}
+
+// ---------------------------------------------------------------------------
 // One frame — `runtime/root/`'s `scanFrame`
 // ---------------------------------------------------------------------------
 //
@@ -119,6 +207,15 @@ let scanRegs: [32]i64
   let fi = 0
   // Bounded by the extent AND by `smMaxEntries`.
   while (off < tblLen && fi < smMaxEntries) {
+    // One check for the whole fixed-size entry header (codeAddr 8 + codeSize
+    // 4 + numSaved 2 = 14 bytes): none of these three offsets depends on a
+    // count read out of the table, so they cannot desync from each other —
+    // only from `tblLen` itself, which this single check already covers for
+    // all three reads below.
+    if (!inBlob(off, 14, tblLen)) {
+      panicStackMapBounds()
+      return false
+    }
     let codeAddr = blobU64(base, off)
     off = off + 8
     let codeSize = blobU32(base, off)
@@ -126,7 +223,19 @@ let scanRegs: [32]i64
     let numSaved = blobU16(base, off)
     off = off + 2
     let savedOff = off
+    // Checks the WHOLE saved-register table span at once (`numSaved * 6`
+    // bytes), before advancing past it: every per-element read of it below,
+    // at `savedOff + k * 6` for `k < numSaved`, then lands inside the span
+    // this already proved is in-bounds, with no per-element check needed.
+    if (!inBlob(savedOff, numSaved * 6, tblLen)) {
+      panicStackMapBounds()
+      return false
+    }
     off = off + numSaved * 6      // u16 reg + i32 fp_off
+    if (!inBlob(off, 2, tblLen)) {
+      panicStackMapBounds()
+      return false
+    }
     let numSps = blobU16(base, off)
     off = off + 2
 
@@ -136,15 +245,37 @@ let scanRegs: [32]i64
     // Bounded: this entry's safepoint count. The body must run even when this
     // is not the hit entry — it is what advances `off` past the entry.
     while (si < numSps) {
+      // Same reasoning as the entry header above: retOff (4) + numSlots (2)
+      // = 6 fixed bytes, one check covers both reads.
+      if (!inBlob(off, 6, tblLen)) {
+        panicStackMapBounds()
+        return false
+      }
       let retOff = blobU32(base, off)
       off = off + 4
       let numSlots = blobU16(base, off)
       off = off + 2
       let slotsOff = off
+      // Same whole-span check as the saved-register table above: covers
+      // every `blobI32(base, slotsOff + k * 4)` read under `hit` below.
+      if (!inBlob(slotsOff, numSlots * 4, tblLen)) {
+        panicStackMapBounds()
+        return false
+      }
       off = off + numSlots * 4
+      if (!inBlob(off, 2, tblLen)) {
+        panicStackMapBounds()
+        return false
+      }
       let numRegs = blobU16(base, off)
       off = off + 2
       let regsOff = off
+      // Same whole-span check, for every `blobU16(base, regsOff + k * 2)`
+      // read under `hit` below.
+      if (!inBlob(regsOff, numRegs * 2, tblLen)) {
+        panicStackMapBounds()
+        return false
+      }
       off = off + numRegs * 2
       if (hit && codeAddr + retOff == pc) {
         let k = 0
@@ -183,7 +314,9 @@ let scanRegs: [32]i64
 
     if (hit) {
       let k = 0
-      // Bounded: this entry's saved-register count.
+      // Bounded: this entry's saved-register count. Reads land inside the
+      // `savedOff` span the entry header already checked above; no
+      // per-element check needed here.
       while (k < numSaved) {
         let rn = blobU16(base, savedOff + k * 6)
         let foff = blobI32(base, savedOff + k * 6 + 2)
