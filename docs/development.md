@@ -109,23 +109,49 @@ change that also changes its arity is not caught).
 The check skips itself when `BIT_STAGE0_BIN` is set: that override is not
 the pinned release, so there is no committed tag to diff its tree against —
 and it is precisely the supported recovery path, not a mismatch to refuse.
-The fix, once the diagnostic fires, is the same two-pass bootstrap
-`scripts/stage0.sh`'s own header documents for #1857:
+
+**The fix is NOT the plain two-pass bootstrap `scripts/stage0.sh`'s own
+header documents for #1857.** That recipe's pass 1 is a bare `./make`, and
+#1857 was a compiler-only fix — the runtime was unchanged, so pass 1's
+`./make` already builds against a runtime stage0 is self-consistent with.
+Here the runtime is what changed: the working tree's `runtime/**` already
+carries the new arity, which is exactly what this guard just refused to link
+against stage0's old-arity call sites. Running the printed `./make` again
+reproduces the same refusal — it is the very command that just failed.
+
+Pass 1 instead needs the runtime **checked out at the commit before the
+change**, so the compiler it produces (built from the new `compiler/**`
+source, but linked against the OLD runtime archive) is internally
+consistent — old stage0 emits old-arity calls, and the OLD runtime is what
+still expects that arity:
 
 ```sh
-./make                                       # pass 1: stage0 -> a compiler built from the new compiler/** source
-BIT_STAGE0_BIN=$PWD/bit-out/bin/bit ./make   # pass 2: that compiler -> the correct runtime, linked correctly
+rm -rf bit-out
+git checkout <commit before this runtime/** change> -- runtime/
+./make                                        # pass 1: stage0 -> a compiler from the new compiler/** source, linked against the OLD runtime
+cp bit-out/bin/bit "$TMPDIR/bit1"
+git checkout HEAD -- runtime/                 # restore BEFORE anything else reads the tree
+BIT_STAGE0_BIN="$TMPDIR/bit1" ./make          # pass 2 — do NOT rm -rf bit-out here
 ```
 
-Pass 1 builds `bit-out/bin/bit` from the new `compiler/**` source using the
-old stage0 and the still-consistent OLD runtime archive — safe, because only
-under-supply corrupts (an unread extra argument register is harmless) and
-pass 1 supplies exactly what the old runtime expects. Pass 2 rebuilds
-`libbitrt.a` from the new `runtime/**` and relinks with `BIT_STAGE0_BIN`
-pointed at pass 1's own output — a compiler built from the new
-`compiler/**` source, so it already emits the new arity. Once pass 2's
-result is released, repin `dist/stage0/SHA256SUMS` to it; a single pass is
-correct again after that, same as any other `BIT_STAGE0_BIN` recovery.
+Pass 2 rebuilds `libbitrt.a` from the new `runtime/**` (now restored) and
+relinks with `BIT_STAGE0_BIN` pointed at pass 1's own output — a compiler
+already built from the new `compiler/**` source, so it emits the new arity
+against the new runtime. Once pass 2's result is released, repin
+`dist/stage0/SHA256SUMS` to it; a single pass is correct again after that,
+same as any other `BIT_STAGE0_BIN` recovery.
+
+Two traps, each cost a real run when skipped:
+
+- **Do not `rm -rf bit-out` between passes.** `./make` links its own build
+  driver against `bit-out/lib/<triple>/libbitrt.a`; wiping the directory
+  between pass 1 and pass 2 leaves the driver unbuildable —
+  `bit: runtime archive bit-out/lib/aarch64-macos/libbitrt.a: cannot open
+  file` then `make: cannot build the driver`, rc=2 in about a second.
+- **Restore `runtime/` on every exit path, including failure**, before
+  anything else reads the tree. A worktree left holding another commit's
+  `runtime/` makes every later measurement silently wrong — nothing signals
+  that it happened.
 
 **Regression coverage for the escape hatch itself is `./make
 test-stage0override`** (#3118, `tests/bit/stage0override.bit`): asserts
