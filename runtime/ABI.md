@@ -616,6 +616,30 @@ guard against this *class* of skew — any future change to this wire format
 that a stage0 repin has not yet caught up to — not a promise that today's
 exact field layout is what a mismatch would ever reproduce again.
 
+**#3189 (designed, not yet shipped): a per-entry format-version stamp.** The
+padding checker above is a build-time guard for one specific historical skew;
+it does not generalize to the *next* layout change, and #1927 reached
+production as a silent bus error before any guard existed for it at all. The
+designed fix is a `u16` version field placed right after `code_addr` (so the
+field the object writer's relocation logic depends on — `code_addr` sitting
+at each entry's offset 0 — is untouched, and neither `emitmacho.bit` nor
+`emitelf.bit` needs to change), checked by the reader before any
+count-driven field (`num_saved`, `num_safepoints`, ...) is trusted. A
+mismatch panics by name with both versions, using the same idiom as
+`panicStackMapBounds` above rather than a fixed literal message, since the
+two numbers are runtime values read off the blob. `runtime/gc/stackmap.bit`
+carries the reader half (`smFormatVersion`, `panicStackMapVersion`,
+`appendDecimal`) as of this note, proven against a synthetic blob through a
+temporary C-driver hook (#1839's technique) in both directions — match walks
+normally, mismatch refuses with `"gc: stack-map format version mismatch:
+expected <E>, found <F>"` — but is **not yet wired into `scanFrame`'s live
+parse**, because the writer half (`compiler/codegen.bit`'s `writeStackMaps`
+emitting the same stamp) has to land in the same change: this format's
+correctness already depends on the writer and reader agreeing (the paragraph
+above), so widening the reader's expected entry-header size without the
+writer emitting the new field would desync every entry of every program, not
+just a mismatched one. See #3189 for the exact writer diff.
+
 The walk, per frame: find the function whose code range contains `pc`; at the
 matching `ret_offset`, `markRoot` each `slot_fp_off` slot and each live register
 (read from the running snapshot for the innermost frame, or reconstructed from
