@@ -356,6 +356,154 @@ fn cloneChild(flags: int, stackTop: int, ctid: *i32,
   }
 }
 
+// ---------------------------------------------------------------------------
+// Publishing a thread's real stack top (#2647)
+// ---------------------------------------------------------------------------
+//
+// `threadStackTop()` takes no argument and must answer for WHICHEVER OS
+// thread calls it — including one this module never spawned: `../../gc/
+// gcworldsync.bit`'s claim path (#2649) calls it for every thread that
+// registers a mutator slot, and the initial process thread registers one
+// too. So the current stack pointer cannot be trusted for more than "is it
+// inside a range I already know about" — it moves with call depth (a
+// lazily-claiming thread, #1431, could be many frames past `threadStart`'s
+// own entry point), and MASKING it to find a landmark — the way `../../
+// sched/sched.bit`'s `schedCurrentTask` finds a task by masking `sp` to
+// `schedStackBytes` — needs every such stack ALIGNED TO ITS OWN SIZE.
+// `mapStack` below does not align its reservations that way, and the
+// initial thread's kernel-placed stack has no such alignment at all — so
+// masking ITS `sp` by `stackBytes()` (16 MiB) could land far outside its
+// real mapping, and reading a tag word there is exactly the "faulting
+// collector" the epic's own constraint forbids.
+//
+// So this is a small, BOUNDED table of ranges instead — the same shape, and
+// the same reason, as `../../sched/sched.bit`'s `schedBigStacks` (#1843): a
+// bounded RANGE COMPARISON never dereferences an address it has not
+// independently verified came from a real `mapStack()` call, so it stays
+// safe regardless of which thread asks. `threadStart` registers `[base,
+// base + reservationBytes())` -> `top` once the clone has actually
+// succeeded; `threadRelease` unregisters it once the mapping is gone. A
+// thread this module never spawned — including the initial one — simply
+// matches no row, and `threadStackTop()` answers 0 for it, which is the
+// only safe answer here anyway: Linux has no auxv key for a thread's stack
+// top (`atPhdr`/`atPhent`/`atPhnum`/`atPagesz` are the whole of what
+// `../../auxv` exposes), so there is nothing to derive the initial thread's
+// real top from even in principle.
+//
+// 256, matching `maxMutators` (`../../gc/gcworld.bit`): every OS thread this
+// runtime tracks eventually needs a mutator slot, so no more concurrent
+// threads than that will ever be usefully looked up here. A `threadStart`
+// that finds the table full is not refused — that one thread just never
+// gets a published stack top, degrading to the same 0 an unregistered
+// thread already gets.
+@nosplit fn stackTopMax(): int { return 256 }
+
+// Three words per row: base (the CAS-claimed field — 0 free, -1 claimed but
+// not yet published, > 0 a real reservation base), bytes, and the published
+// top. `-1` can never collide with a real `mapStack()` base: `mmap` never
+// returns a negative address on either target.
+let stackTopBase: [256]i64
+let stackTopBytes: [256]i64
+let stackTopVal: [256]i64
+
+// This thread's live stack pointer. Same one-instruction form as every other
+// copy in this tree (`../../sched/sched.bit`'s `readSp`, `../../gc/
+// gcworldsync.bit`'s `gcReadSp`, `../../stw/stw.bit`'s `stwReadSp`) —
+// duplicated rather than imported for the reason every one of those is:
+// each is module-private and the instruction, not the function, is the
+// contract.
+@nosplit fn stackTopReadSp(): int {
+  return asm {
+    arm64 { 0x910003E0 }              // mov x0, sp
+    x64   { 0x48, 0x89, 0xE0 }        // mov rax, rsp
+    result arm64 x0 x64 rax : int
+  }
+}
+
+// Claim a free row for `[rangeBase, rangeBase + rangeBytes)` -> `top`.
+// Called by the PARENT in `threadStart`, after the clone has already
+// succeeded — there is no reason to publish a row for a thread that was
+// never created. A SECOND, concurrent `threadStart` on another parent
+// thread is real (this door is exported), so claiming a row is a CAS: two
+// threads racing for the same free row must not both win it.
+//
+// Published in the same order `../../sched/sched.bit`'s
+// `schedRegisterBigStack` uses, and for the same reason: the discriminating
+// field goes last, so a concurrent reader can never observe a "claimed" row
+// whose bytes/top are not yet real. Here the claim itself has to write that
+// field — there is nothing else to CAS on — so it first writes a sentinel
+// that can never be mistaken for a real base, fills the row, then publishes
+// the real base.
+@nosplit fn stackTopRegister(rangeBase: int, rangeBytes: int, top: int) {
+  let tbl: *i64 = ptrOf(stackTopBase)
+  let bytesTbl: *i64 = ptrOf(stackTopBytes)
+  let valTbl: *i64 = ptrOf(stackTopVal)
+  let i = 0
+  while (i < stackTopMax()) {               // bounded: stackTopMax()
+    if (atomicCmpxchg(tbl + i, 0, 0 - 1)) {
+      *(bytesTbl + i) = rangeBytes
+      *(valTbl + i) = top
+      atomicStore(tbl + i, rangeBase)
+      return
+    }
+    i = i + 1
+  }
+  // Table full: this thread simply never gets a published stack top — the
+  // same 0 `threadStackTop()` already answers for any unregistered thread.
+}
+
+// Undo a `stackTopRegister(rangeBase, ...)`. A no-op if `rangeBase` names no
+// row, so a caller never needs to track whether it already released one.
+@nosplit fn stackTopUnregister(rangeBase: int) {
+  if (rangeBase <= 0) {
+    return
+  }
+  let tbl: *i64 = ptrOf(stackTopBase)
+  let bytesTbl: *i64 = ptrOf(stackTopBytes)
+  let valTbl: *i64 = ptrOf(stackTopVal)
+  let i = 0
+  while (i < stackTopMax()) {               // bounded: stackTopMax()
+    if (atomicLoad(tbl + i) == rangeBase) {
+      // Base FIRST: it is the validity flag `threadStackTop` tests, so
+      // clearing it before the other two words means a concurrent lookup
+      // can never see a live-looking row whose bytes/top were already
+      // cleared.
+      atomicStore(tbl + i, 0)
+      *(bytesTbl + i) = 0
+      *(valTbl + i) = 0
+      return
+    }
+    i = i + 1
+  }
+}
+
+// This thread's real stack top, or 0 when this module never published one —
+// including for a thread it never spawned. Never a fixed window above `sp`:
+// see the header above for why `sp` is used only to find the range that
+// contains it, never as a base to compute an offset from.
+//
+// Pinned like every other cross-module door in this file
+// (`bit_rt_port_thread_start`/`_release`/`_tls_area_bytes`/`_tls_prepare`):
+// its one intended caller, `../../gc/gcworldsync.bit`'s claim path (#2649),
+// is a different module, and an unpinned export there would be emitted as
+// `m<N>$threadStackTop`, a name no separately emitted object can define
+// (SPEC §11.9).
+export @nosplit @symbol("bit_rt_port_thread_stack_top") fn threadStackTop(): int {
+  let sp = stackTopReadSp()
+  let tbl: *i64 = ptrOf(stackTopBase)
+  let bytesTbl: *i64 = ptrOf(stackTopBytes)
+  let valTbl: *i64 = ptrOf(stackTopVal)
+  let i = 0
+  while (i < stackTopMax()) {               // bounded: stackTopMax()
+    let base = atomicLoad(tbl + i)
+    if (base > 0 && sp >= base && sp < base + *(bytesTbl + i)) {
+      return *(valTbl + i)
+    }
+    i = i + 1
+  }
+  return 0
+}
+
 // Start an OS thread running `entry(arg)`. Returns an opaque handle (> 0) for
 // `threadRelease`, or 0 on failure.
 //
@@ -426,6 +574,9 @@ export @symbol("bit_rt_port_thread_start") fn threadStart(entry: *byte, arg: *by
     let _ = int(syscall(sysMunmap(), i64(base), i64(reservationBytes())))
     return 0
   }
+  // Published only now that the child genuinely exists — see the header
+  // above `stackTopRegister` for the row shape and the safety argument.
+  stackTopRegister(base, reservationBytes(), top)
   return base
 }
 
@@ -462,5 +613,9 @@ export @symbol("bit_rt_port_thread_release") fn threadRelease(handle: int): bool
     }
     spins = spins + 1
   }
+  // Drop the stack-top row before the mapping itself goes: once unmapped,
+  // `handle`'s range describes nothing, and a lookup racing the unmap must
+  // not be able to find a row that still claims it does.
+  stackTopUnregister(handle)
   return int(syscall(sysMunmap(), i64(handle), i64(total))) == 0
 }
