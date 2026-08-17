@@ -93,6 +93,23 @@ one column. Returns `s` unchanged, never truncated, when it is already
 `s` right-padded with `U+0020` spaces until it is `width` runes, by the same
 rules as `padLeft`.
 
+### `padStart(s: string, width: int, pad: string): string`
+
+`s` left-padded with `pad`, repeated cyclically by code point (measured with
+`runeCount`, never `len`) until it is `width` runes long — matches JS's
+`String.prototype.padStart`, generalised from UTF-16 units to code points. If
+`s` is already `width` runes or longer, `width` is `0` or less, or `pad` is
+empty, returns `s` unchanged; this never truncates `s`. A multi-rune `pad`
+that does not divide the needed width evenly is cut short on its last cycle
+rather than repeated whole. Distinct from `padLeft`, which only ever pads
+with a single space.
+
+### `padEnd(s: string, width: int, pad: string): string`
+
+`s` right-padded with `pad`. Same rules as `padStart`, on the other end.
+Matches JS's `String.prototype.padEnd`. Distinct from `padRight`, which only
+ever pads with a single space.
+
 ```bit
 import { runeCount, runeAt, runes } from "std/strings"
 
@@ -136,6 +153,20 @@ Whether `s` ends with `suffix`.
 ### `indexOf(s: string, sub: string): i64`
 
 The **byte** offset of the first `sub` in `s`, or `-1`. An empty `sub` is at `0`.
+
+### `indexOfFrom(s: string, sub: string, at: i64): i64`
+
+Like `indexOf`, but the search starts at byte offset `at`. A negative `at`
+clamps to `0` rather than reading out of bounds. An `at` beyond `len(s)`
+finds nothing, even for an empty `sub` — but an empty `sub` at exactly
+`len(s)` does match, returning `at`.
+
+### `lastIndexOf(s: string, sub: string): i64`
+
+The **byte** offset of the *last* `sub` in `s`, or `-1`. An empty `sub`
+matches at `len(s)`. An overlapping candidate reports the rightmost start
+position — `lastIndexOf("aaa", "aa")` is `1`, not `0` — since the scan never
+skips past a candidate the way `count`'s non-overlapping scan does.
 
 ### `contains(s: string, sub: string): bool`
 
@@ -189,9 +220,42 @@ ASCII letters lowercased.
 yield empty parts (`split("a,,b,", ",")` is `["a", "", "b", ""]`); an empty `sep`
 yields `[s]`. The inverse of `join`.
 
+### `splitN(s: string, sep: string, n: i64): []string`
+
+`s` split on `sep`, keeping at most `n` parts: the first `n - 1` parts are
+split as `split` would, and the last part keeps everything remaining,
+unsplit — so a limit larger than the number of matches behaves exactly like
+`split`. `n == 0` yields no parts at all (an empty slice, not `[s]`); `n < 0`
+is unlimited, identical to `split`. An empty `sep` yields `[s]` for any
+`n != 0`, same convention as `split`.
+
+### `trimLeft(s: string, cutset: string): string`
+
+`s` with every leading byte that appears in `cutset` removed. Byte-level
+membership: a multi-byte rune in `cutset` matches only its individual
+encoded bytes, not the character as a whole. An empty `cutset` matches
+nothing, so `s` is returned unchanged.
+
+### `trimRight(s: string, cutset: string): string`
+
+`s` with every trailing byte that appears in `cutset` removed. Same
+byte-level cutset membership as `trimLeft`.
+
+### `trim(s: string, cutset: string): string`
+
+`s` trimmed on both ends against `cutset` — equivalent to
+`trimRight(trimLeft(s, cutset), cutset)`.
+
 ### `trimSpace(s: string): string`
 
 `s` with leading and trailing ASCII spaces and tabs removed.
+
+### `replace(s: string, old: string, repl: string): string`
+
+`s` with every non-overlapping occurrence of `old` replaced by `repl`,
+scanned left to right. An empty `old` is a no-op, returning `s` unchanged —
+unlike Go's `strings.ReplaceAll`, which instead inserts `repl` at every
+position including both ends.
 
 ### `parseInt(s: string): int!`
 
