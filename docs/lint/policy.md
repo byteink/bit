@@ -272,7 +272,7 @@ Sampling shows compiler's 112 findings are 111-of-112 concentrated in eight
 `pmfetchcheck.bit`, `pmclicheck.bit`, `pmzclicheck.bit`, `projectcheck.bit`,
 `pmclichecktail.bit`, `machoexeccheck.bit`), every one the same shape:
 
-```bit
+```bit ignore
 let x = someFallibleCall(...) catch e {
   panic("...")
   <dummy value of the tried expression's type>
