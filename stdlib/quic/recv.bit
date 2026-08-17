@@ -283,52 +283,29 @@ fn quicconnOnMaxStreams(st: quicconnState, bidi: bool, m: int) {
   }
 }
 
-// Fold an abrupt peer abort of their send side into our receive state (RFC 9000
-// §19.4): stop expecting the rest of the stream and wake a blocked `read` with a
-// distinguishable reset chunk instead of leaving it parked on a FIN that will
-// never arrive (the bug this function fixes). A reset for a stream whose clean
-// end was already delivered is a no-op — the application has already seen it
-// end, and re-announcing that is not useful.
+// Create stream `id` the first time ANY frame references it — RFC 9000 §2.1:
+// "receiving a frame for a stream ID that has not been opened ... implicitly
+// opens" it, not only a STREAM frame. Enqueues the new stream for
+// `acceptStream` exactly as `quicconnOnStream`'s own first-sight branch always
+// has, so RESET_STREAM/MAX_STREAM_DATA arriving before any STREAM frame for the
+// id creates and surfaces the stream instead of being silently dropped (#3232).
+// A stream already present — whether opened locally by `quicconnDoOpen` or seen
+// from the peer before — is returned unchanged.
 //
-// `st.present[id] == 0` is ALSO treated as a no-op here, and that half is a
-// known gap, not a considered choice: RFC 9000 §2.1 says receiving ANY frame
-// that references a stream id — not only STREAM — implicitly opens it (and
-// every lower-numbered stream of the same type), so a peer that resets a
-// stream before ever sending data on it is valid QUIC and this drops that
-// RESET_STREAM on the floor instead of surfacing it. Pre-existing and broader
-// than this arm alone — `quicconnOnMaxStreamData` has the identical
-// `st.present[id] == 0` early-return for the same reason, and `StreamDataBlocked`
-// would need it too were it not already a no-op — so it is a cross-cutting
-// "implicit stream creation" gap, not something #3229 introduces or is scoped
-// to fix. Filed separately (#3232).
-fn quicconnOnResetStream(st: quicconnState, id: int, code: int) {
-  if (st.present[id] == 0) {
-    return
-  }
-  let str = st.streams[id]
-  if (str.finDelivered) {
-    return
-  }
-  str.finDelivered = true
-  str.recvCh <- StreamChunk{ data: []byte(0), fin: true, reset: true, resetCode: code }
-}
-
-fn quicconnOnMaxStreamData(st: quicconnState, id: int, m: int) {
-  if (st.present[id] == 0) {
-    return
-  }
-  let s = st.streams[id]
-  if (m > s.peerMaxStreamData) {
-    s.peerMaxStreamData = m
-    s.blockedSignaled = false
-  }
-}
-
-// Accept a STREAM frame (RFC 9000 §19.8): create the stream on first sight,
-// enqueue it for `acceptStream`, reassemble the data, and deliver any newly
-// contiguous prefix.
-fn quicconnOnStream(st: quicconnState, s: StreamFrame): ()! {
-  let id = int(s.id)
+// Deliberately narrower than RFC 9000 §2.1 in full: it opens only the
+// referenced id, not every lower-numbered stream of the same type, and it does
+// not check this endpoint's own advertised initial_max_streams_bidi — neither
+// did the STREAM-frame branch this replaces, before or after this fix. Also not
+// wired into the `StopSending` arm (`quicconnAbortSend`'s identically-shaped
+// `st.present[id] == 0` early-return): STOP_SENDING can reference an id in this
+// endpoint's OWN locally-initiated space, where implicitly creating a stream
+// here without advancing `st.nextBidiId` risks a later real `openStream` id
+// collision — a distinct correctness question RESET_STREAM/MAX_STREAM_DATA (the
+// two arms actually reported and fixed here) don't raise, since either the
+// stream is already present or `isPeer: true` is uncontroversially correct for
+// it. All three gaps — the lower-numbered-streams semantics, the limit check,
+// and StopSending — are filed together, not fixed here (#3243).
+fn quicconnEnsureStream(st: quicconnState, id: int): quicconnStream {
   if (st.present[id] == 0) {
     let ns = quicconnNewStream(st, id, true)
     st.streams[id] = ns
@@ -340,7 +317,46 @@ fn quicconnOnStream(st: quicconnState, s: StreamFrame): ()! {
       st.acceptQueue = append(st.acceptQueue, id)
     }
   }
-  let str = st.streams[id]
+  return st.streams[id]
+}
+
+// Fold an abrupt peer abort of their send side into our receive state (RFC 9000
+// §19.4): stop expecting the rest of the stream and wake a blocked `read` with a
+// distinguishable reset chunk instead of leaving it parked on a FIN that will
+// never arrive (the bug this function fixes). A reset for a stream whose clean
+// end was already delivered is a no-op — the application has already seen it
+// end, and re-announcing that is not useful. `quicconnEnsureStream` covers the
+// case where this is the very first frame this endpoint has seen for `id`
+// (#3232) — a peer that resets a stream before ever sending data on it is valid
+// QUIC (RFC 9000 §2.1) and used to drop that RESET_STREAM on the floor instead
+// of surfacing it.
+fn quicconnOnResetStream(st: quicconnState, id: int, code: int) {
+  let str = quicconnEnsureStream(st, id)
+  if (str.finDelivered) {
+    return
+  }
+  str.finDelivered = true
+  str.recvCh <- StreamChunk{ data: []byte(0), fin: true, reset: true, resetCode: code }
+}
+
+// MAX_STREAM_DATA (RFC 9000 §19.10) raises the peer-granted send window for
+// `id`. `quicconnEnsureStream` covers a MAX_STREAM_DATA that arrives before any
+// STREAM frame for `id` (#3232), the same first-frame gap `quicconnOnResetStream`
+// had.
+fn quicconnOnMaxStreamData(st: quicconnState, id: int, m: int) {
+  let s = quicconnEnsureStream(st, id)
+  if (m > s.peerMaxStreamData) {
+    s.peerMaxStreamData = m
+    s.blockedSignaled = false
+  }
+}
+
+// Accept a STREAM frame (RFC 9000 §19.8): create the stream on first sight,
+// enqueue it for `acceptStream`, reassemble the data, and deliver any newly
+// contiguous prefix.
+fn quicconnOnStream(st: quicconnState, s: StreamFrame): ()! {
+  let id = int(s.id)
+  let str = quicconnEnsureStream(st, id)
   str.recvAsm.insert(s.offset, s.data)?
   if (s.fin) {
     str.recvFinalSize = int(s.offset) + len(s.data)
