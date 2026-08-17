@@ -18,6 +18,7 @@
 // already lowered (#1511).
 
 import { envOr } from "std/os"
+import { randomBytes } from "std/crypto"
 
 struct Gate {
   name: string
@@ -539,6 +540,36 @@ fn isExclusiveGate(name: string): bool {
 // read it back.
 fn batchDir(): string { return "bit-out/make/gatebatch" }
 
+// #3256. Every gate's rc file lives at ONE fixed path per worktree
+// (`batchDir()`), so a killed or aborted run's rc file survives on disk and
+// the next run cannot tell it apart from its own by looking at the path
+// alone — the orphan is also NEWER than any earlier good write, so mtime
+// cannot help either. `runGateBatch` calls this ONCE per invocation and
+// threads the result through every chunk it runs, so every rc file this
+// process writes carries the same identity: the tree's HEAD sha (an orphan
+// from a different commit is instantly recognisable) plus a fresh
+// `randomBytes` nonce (an orphan from an earlier run AT THE SAME sha —
+// exactly the "killed then relaunched immediately" case that motivated this
+// ticket — is recognisable too, since the nonce cannot repeat by chance).
+// `runGateChunk` refuses to trust any rc file whose stamp does not match
+// both fields exactly, including a pre-#3256 rc file with no stamp at all.
+fn currentGateStamp(): (string, string, bool) {
+  let outPath = "bit-out/make/gatebatch-headsha.out"
+  let rc = runShell("gatebatch-headsha",
+    "git -C " + shQuote(repoRoot()) + " rev-parse HEAD > " + shQuote(outPath) + "\n",
+    buildTimeoutMs())
+  if (rc != 0) {
+    eprint("make: cannot resolve HEAD sha for gate-batch stamping (git rev-parse HEAD exited ${rc})\n")
+    return "", "", false
+  }
+  let sha = trimNewline(readFile(outPath) catch "")
+  if (sha == "") {
+    eprint("make: git rev-parse HEAD produced no output; cannot stamp gate-batch rc files\n")
+    return "", "", false
+  }
+  return sha, encodeHex(randomBytes(8)), true
+}
+
 // No new runtime primitive (#2152's lesson applies here too): core count
 // comes from the shell, the same round-trip `hostTriple()` already uses.
 // `nproc` covers Linux; `sysctl -n hw.ncpu` is the Darwin fallback.
@@ -676,7 +707,10 @@ fn killTreeFnDef(): string {
     "}\n"
 }
 
-fn gateBatchUnit(g: Gate, dir: string, timeoutS: string): string {
+// `sha`/`runId` (from `currentGateStamp()`) are plain hex, so they are
+// embedded directly into the generated `echo` line the same way `timeoutS`
+// and `dir` already are — no shell metacharacters to escape.
+fn gateBatchUnit(g: Gate, dir: string, timeoutS: string, sha: string, runId: string): string {
   let outFile = shQuote(dir + "/" + g.name + ".out")
   let rcFile = shQuote(dir + "/" + g.name + ".rc")
   let toFile = shQuote(dir + "/" + g.name + ".timedout")
@@ -690,7 +724,7 @@ fn gateBatchUnit(g: Gate, dir: string, timeoutS: string): string {
     "RC=$?\n" +
     "kill \"$KPID\" 2>/dev/null\n" +
     "wait \"$KPID\" 2>/dev/null\n" +
-    "echo \"$RC\" > " + rcFile + "\n" +
+    "echo \"$RC " + sha + " " + runId + "\" > " + rcFile + "\n" +
     ") &\n"
 }
 
@@ -746,11 +780,11 @@ fn pgrepPreflightScript(): string {
 // once; every gate unit's subshell inherits the function (a POSIX subshell
 // inherits its parent's function definitions) and reads the same symlink
 // path.
-fn batchScript(chunk: []Gate, dir: string): string {
+fn batchScript(chunk: []Gate, dir: string, sha: string, runId: string): string {
   let timeoutS = "${gateTimeoutMs() / 1000}"
   let script = killTreeFnDef() + pgrepPreflightScript() + watchdogSetupScript(dir)
   for g of chunk {
-    script = script + gateBatchUnit(g, dir, timeoutS)
+    script = script + gateBatchUnit(g, dir, timeoutS, sha, runId)
   }
   return script + "wait\n"
 }
@@ -759,7 +793,7 @@ fn batchScript(chunk: []Gate, dir: string): string {
 // reports every one of them in `chunk` position, so output never interleaves
 // and a run's `make: FAILED:` line is deterministic regardless of which gate
 // actually finished first.
-fn runGateChunk(chunk: []Gate): []string {
+fn runGateChunk(chunk: []Gate, sha: string, runId: string): []string {
   let failed = []string(0)
   if (len(chunk) == 0) {
     return failed
@@ -778,7 +812,7 @@ fn runGateChunk(chunk: []Gate): []string {
     }
     return failed
   }
-  let outerRc = runShell("gatebatch", batchScript(chunk, dir), batchOuterTimeoutMs())
+  let outerRc = runShell("gatebatch", batchScript(chunk, dir, sha, runId), batchOuterTimeoutMs())
   for g of chunk {
     print("make: ${g.name}\n")
     let rcPath = "${dir}/${g.name}.rc"
@@ -800,7 +834,17 @@ fn runGateChunk(chunk: []Gate): []string {
       }
       continue
     }
-    let rc = parseIntOr(trimNewline(readFile(rcPath) catch ""), 0 - 1)
+    // #3256: `rcPath` is a fixed path, so a killed run's rc file (or a
+    // pre-#3256 rc with no stamp at all) can still be sitting there. Trust
+    // it only when it carries THIS run's exact stamp — a mismatch or a
+    // missing stamp means "did not run", never "passed".
+    let fields = split(trimNewline(readFile(rcPath) catch ""), " ")
+    if (len(fields) != 3 || fields[1] != sha || fields[2] != runId) {
+      eprint("make: ${g.name} rc is STALE — its stamp does not match this run (a killed or earlier run's leftover at the fixed path ${rcPath}); refusing to count it as a pass. Re-run: ./make ${g.name}\n")
+      failed = append(failed, g.name)
+      continue
+    }
+    let rc = parseIntOr(fields[0], 0 - 1)
     if (exists("${dir}/${g.name}.timedout")) {
       rc = 0 - 2
     }
@@ -818,6 +862,15 @@ fn runGateChunk(chunk: []Gate): []string {
 fn runGateBatch(names: []string): []string {
   let failed = []string(0)
   if (len(names) == 0) {
+    return failed
+  }
+  // One stamp for the whole flush: every chunk below writes rc files that
+  // read back as belonging to THIS invocation (#3256).
+  let (sha, runId, stampOk) = currentGateStamp()
+  if (!stampOk) {
+    for n of names {
+      failed = append(failed, n)
+    }
     return failed
   }
   let jobs = makeJobs()
@@ -839,7 +892,7 @@ fn runGateBatch(names: []string): []string {
       }
       j = j + 1
     }
-    for f of runGateChunk(chunk) {
+    for f of runGateChunk(chunk, sha, runId) {
       failed = append(failed, f)
     }
     i = end
