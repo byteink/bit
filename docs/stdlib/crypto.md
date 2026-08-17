@@ -23,7 +23,7 @@ the modern, safe choice; the alternatives exist for interop or legacy.
 | Sign (new protocol) | `ed25519` | `ecdsa` P-256 for interop; RSA-PSS only for legacy peers. |
 | Key agreement | `x25519` | `x448` for a higher security margin; NIST P-curves for interop. |
 | Post-quantum | `mlkem` (key encapsulation), `mldsa` (signatures) | Pair ML-KEM with X25519 as a hybrid until PQ is proven in the field. |
-| Encode bytes as text | `encodeHex` / `base64Encode` | Not encryption - just a wire representation. |
+| Encode bytes as text | `encodeHex` / `encodeBase64` | Not encryption - just a wire representation. |
 
 Rules of thumb: prefer an AEAD over a bare cipher; never use MD5 or SHA-1 for
 anything security-relevant (they are here only to read legacy data); and compare
@@ -492,47 +492,49 @@ SHA-256 and, on 64-bit hardware, outruns it.
 
 Base64 (RFC 4648) encodes arbitrary bytes as ASCII text, three input bytes per
 four output characters. Two variants are provided: the *standard* alphabet
-(`+`/`/`, `=`-padded) via `encode`/`decode`, and the *URL-safe* alphabet
-(`-`/`_`, no padding) via `encodeUrl`/`decodeUrl` - safe to drop into a URL or a
-filename. Each variant is self-inverse: `decode(encode(b))` and
-`decodeUrl(encodeUrl(b))` return the original bytes. Decoding is validating: an
-out-of-alphabet character or an impossible length is an error, not silent
-garbage.
+(`+`/`/`, `=`-padded) via `encodeBase64`/`decodeBase64`, and the *URL-safe*
+alphabet (`-`/`_`, no padding) via `encodeBase64Url`/`decodeBase64Url` - safe
+to drop into a URL or a filename. Standard, padded base64 is the default;
+URL-safe is a separate pair of functions, not a flag, so a caller cannot get
+the wrong alphabet by accident. Each variant is self-inverse:
+`decodeBase64(encodeBase64(b))` and `decodeBase64Url(encodeBase64Url(b))`
+return the original bytes. Decoding is validating: an out-of-alphabet
+character or an impossible length is an error, not silent garbage.
 
 ```bit
-import { encode, decode, encodeUrl, decodeUrl } from "std/crypto"
+import { encodeBase64, decodeBase64, encodeBase64Url, decodeBase64Url } from "std/crypto"
 
 // Standard base64 with '=' padding - round-trips any bytes.
 fn roundTrip(data: []byte): []byte! {
-  return decode(encode(data))?
+  return decodeBase64(encodeBase64(data))?
 }
 
 // URL-safe alphabet (-/_), no padding - for URLs, query strings, and filenames.
 fn tokenize(data: []byte): string {
-  return encodeUrl(data)
+  return encodeBase64Url(data)
 }
 
 fn detokenize(token: string): []byte! {
-  return decodeUrl(token)?
+  return decodeBase64Url(token)?
 }
 ```
 
-### `encode(b: []byte): string`
+### `encodeBase64(b: []byte): string`
 
 Encodes `b` with the standard alphabet and `=` padding. The result length is
 always a multiple of 4; empty input yields the empty string.
 
-### `decode(s: string): []byte!`
+### `decodeBase64(s: string): []byte!`
 
 Decodes a standard, `=`-padded base64 string. Fails on a character outside the
 standard alphabet or a length that is not a multiple of 4.
 
-### `encodeUrl(b: []byte): string`
+### `encodeBase64Url(b: []byte): string`
 
 Encodes `b` with the URL-safe alphabet (`-` and `_`) and no padding, so the
 result is safe inside a URL path, query, or filename.
 
-### `decodeUrl(s: string): []byte!`
+### `decodeBase64Url(s: string): []byte!`
 
 Decodes an unpadded URL-safe base64 string. Fails on a character outside the
 URL-safe alphabet - an `=` included, since URL-safe output is never padded - or a
