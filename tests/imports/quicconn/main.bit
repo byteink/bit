@@ -1,5 +1,5 @@
 // std/quic QUIC v1 transport core (#1220): a full connection over a local UDP
-// pair, driven by two green-thread endpoints (spawn + channels). Seven scenarios:
+// pair, driven by two green-thread endpoints (spawn + channels). Nine scenarios:
 //
 //   * direct — complete the QUIC-TLS handshake, open a client bidi stream,
 //     transfer a 96 KiB payload, and assert byte-identical delivery (the
@@ -36,6 +36,17 @@
 //     refused with a connection close, not grow an unbounded entry per id
 //     (#3247). The first 16 must still deliver normally, proving the check
 //     counts distinct ids in bounds rather than misfiring on legitimate traffic.
+//
+//   * stopsendingnodata — the client opens a stream and immediately asks the
+//     peer to stop sending on it, with zero prior writes, so STOP_SENDING is
+//     the very first frame the server ever sees for that stream id; the
+//     server's `acceptStream` must still return it instead of hanging until
+//     the idle timeout (#3243, the StopSending half of #3232's fix).
+//
+//   * lowerstreamopen — a reference to the 6th client-bidi stream, with the
+//     first 5 opened locally but never written to, must implicitly open all
+//     6 (RFC 9000 §2.1's "every lower-numbered stream of the same type"), not
+//     only the one actually referenced (#3243).
 //
 // Every printed line is a boolean, a byte count, a content hash, or a fixed
 // error string — nothing timing-dependent — so the golden is stable across
@@ -506,6 +517,97 @@ fn streamLimitInboundScenario(chain: string, keyp: string): ()! {
   println("streamlimitinbound_fast=${boolStr(elapsed < idleTimeoutNs)}")
 }
 
+// #3243: STOP_SENDING has the same `st.present[id] == 0` early-return
+// `quicconnAbortSend` shares with RESET_STREAM/MAX_STREAM_DATA, but wasn't
+// routed through `quicconnEnsureStream` when #3232 fixed those two — so a
+// STOP_SENDING referencing a stream id the server has never seen before used
+// to be silently dropped instead of implicitly opening the stream. Mirrors
+// `resetnodataScenario`'s "zero prior writes" shape (#3232), but there is
+// nothing for this accepted stream to `read` — `stopSending` only affects the
+// receiver's own send side, not what it receives — so this checks that
+// `acceptStream` itself returns fast rather than waiting out the idle
+// timeout.
+fn stopSendingNoDataServerRole(sock: UdpSocket, chain: string, keyp: string, resultCh: chan<string>) {
+  let conn = acceptQuic(sock, chain, keyp) catch e {
+    resultCh <- "handshake-failed"
+    return
+  }
+  conn.setIdleTimeout(idleTimeoutNs)
+  let start = monotonic()
+  let s = conn.acceptStream() catch e {
+    resultCh <- "accept-failed"
+    return
+  }
+  let elapsed = monotonic() - start
+  resultCh <- "accepted=true:id=${s.id()}:fast=${boolStr(elapsed < idleTimeoutNs)}"
+}
+
+fn stopSendingNoDataScenario(chain: string, keyp: string): ()! {
+  let srv = udpBind("127.0.0.1", 0)?
+  let srvPort = srv.port()?
+  let res = chan<string>(1)
+  spawn stopSendingNoDataServerRole(srv, chain, keyp, res)
+  let conn = dialQuic("127.0.0.1", srvPort, "localhost")?
+  let s = conn.openStream()?
+  s.stopSending(resetErrCode)?
+  let got = <- res
+  println("stopsendingnodata_result=${got}")
+  conn.close()
+}
+
+// #3243: a reference to stream ordinal 5 (id 20, the 6th client-bidi stream)
+// must implicitly open every lower-numbered stream of the same type (RFC 9000
+// §2.1), not only the one referenced. The client opens 6 streams locally but
+// only ever writes to the last one — ordinals 0-4 carry no traffic at all,
+// exactly like `streamLimitScenario`'s streams that "never carry data, so the
+// server never even learns they exist" — so before the fix the server only
+// ever learns about the referenced id; after it, all 6 must be visible via
+// `acceptStream`. Closing the connection right after the one real write
+// drains makes a still-broken build fail fast (the 2nd `acceptStream` call
+// errors out immediately once the close arrives) rather than waiting out the
+// idle timeout.
+const lowerStreamOpenCount: int = 6
+
+fn lowerStreamOpenServerRole(sock: UdpSocket, chain: string, keyp: string, resultCh: chan<string>) {
+  let conn = acceptQuic(sock, chain, keyp) catch e {
+    resultCh <- "handshake-failed"
+    return
+  }
+  conn.setIdleTimeout(idleTimeoutNs)
+  let count = 0
+  let idSum = 0
+  let i = 0
+  while (i < lowerStreamOpenCount) {
+    let s = conn.acceptStream() catch e {
+      i = lowerStreamOpenCount
+      continue
+    }
+    count = count + 1
+    idSum = idSum + s.id()
+    i = i + 1
+  }
+  resultCh <- "count=${count}:idsum=${idSum}"
+}
+
+fn lowerStreamOpenScenario(chain: string, keyp: string): ()! {
+  let srv = udpBind("127.0.0.1", 0)?
+  let srvPort = srv.port()?
+  let res = chan<string>(1)
+  spawn lowerStreamOpenServerRole(srv, chain, keyp, res)
+  let conn = dialQuic("127.0.0.1", srvPort, "localhost")?
+  let i = 0
+  while (i < lowerStreamOpenCount - 1) {
+    let discarded = conn.openStream()?
+    i = i + 1
+  }
+  let last = conn.openStream()?
+  last.write([]byte("x"))?
+  last.finish()?
+  conn.close()
+  let got = <- res
+  println("lowerstreamopen_result=${got}")
+}
+
 // One listener client: dial, open a stream, then wait for `go` before sending, so
 // the driver controls exactly when traffic has to cross the shared socket.
 fn listenerClient(port: int, msg: string, go: chan<int>, out: chan<string>) {
@@ -653,6 +755,14 @@ fn run(): ()! {
   // ids is refused with STREAM_LIMIT_ERROR instead of growing st.streams
   // without bound (#3247) ---
   streamLimitInboundScenario(chainPem(), keyPem())?
+
+  // --- stopsendingnodata: STOP_SENDING as the first frame for a stream id
+  // implicitly opens it instead of being silently dropped (#3243) ---
+  stopSendingNoDataScenario(chainPem(), keyPem())?
+
+  // --- lowerstreamopen: referencing stream ordinal 5 implicitly opens
+  // ordinals 0-4 too, not only the one referenced (#3243) ---
+  lowerStreamOpenScenario(chainPem(), keyPem())?
 }
 
 fn main() {
