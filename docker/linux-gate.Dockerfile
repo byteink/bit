@@ -12,7 +12,7 @@
 #   # on the x86-64 box:
 #   docker build -f docker/linux-gate.Dockerfile -t bit-linux-gate-amd64:latest .
 #
-# The tags carry no version, on purpose: the image installs four Debian packages
+# The tags carry no version, on purpose: the image installs five Debian packages
 # and nothing that pins a compiler, so there is no version for it to be OF. The
 # thing under test arrives with the tree (`git archive HEAD`) and the bootstrap
 # compiler is downloaded and digest-verified per run by scripts/stage0.sh.
@@ -31,8 +31,12 @@ FROM debian:bookworm
 # previous release over https and unpacks the .tar.xz. That is the ONLY
 # toolchain this image needs — the bootstrap compiler is a published bit binary,
 # not a second language.
+# procps: tools/build/gates.bit's killTreeFnDef() walks a killed gate's
+# descendants with `pgrep -P`. Without it, `pgrep` is missing, the walk
+# silently sees zero descendants (its stderr is redirected to /dev/null), and
+# only the direct child gets killed on timeout (#3230, a regression of #3066).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates curl xz-utils \
+ && apt-get install -y --no-install-recommends git ca-certificates curl xz-utils procps \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
