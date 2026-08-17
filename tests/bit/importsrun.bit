@@ -371,7 +371,11 @@ fn discover(cfg: Cfg, scratch: string): []Case {
 
 // --- phase A: write every script, fork nothing -----------------------------
 
-fn writeScripts(cfg: Cfg, cases: []Case) {
+fn writeScripts(cfg: Cfg, cases: []Case, scratch: string) {
+  // Where `driverScript`'s setup line symlinks `bit-gate-watchdog` onto the
+  // real `sleep` binary, once, before either fan-out wave starts. One path
+  // per run, read (never written) by every case's poll below.
+  let wdPath = "${scratch}/bit-gate-watchdog"
   let i = 0
   while (i < len(cases)) {
     let c = cases[i]
@@ -407,9 +411,36 @@ fn writeScripts(cfg: Cfg, cases: []Case) {
     // success path it notices `$p` is gone and exits within ~1s — normally
     // before `kill "$w"` below even runs — and even a lost race leaves only a
     // `sleep 1` behind, which finishes on its own within that same ~1s rather
-    // than `$T`. Each poll runs as `exec -a bit-gate-watchdog sleep 1` in its
-    // own subshell, so a straggler is attributable (`pgrep -fl
-    // bit-gate-watchdog`) instead of showing as an anonymous `sleep 1`.
+    // than `$T`.
+    //
+    // #3231: the poll used to be `( exec -a bit-gate-watchdog sleep 1 )`.
+    // `exec -a` (rename argv[0] before exec) is a bash/ksh extension; dash —
+    // Debian's `/bin/sh`, and therefore this project's own x64 gate image —
+    // rejects `-a` outright, so the subshell errored out INSTANTLY instead of
+    // sleeping, `n` raced through the whole timeout budget in a fraction of a
+    // real second, and every compile/run job here was killed almost
+    // immediately on any dash host — the exact bug #3227 had already fixed
+    // for `tools/build/gates.bit`'s batch watchdog, independently duplicated
+    // here. `driverScript` below now symlinks a `bit-gate-watchdog` name onto
+    // the real `sleep` binary ONCE, in `scratch`, before either fan-out wave
+    // starts (`wdPath`); every case's poll execs that shared symlink
+    // directly, which gives the poll's `sleep` process the same argv[0]
+    // rename through a plain, extension-free exec (POSIX: argv[0] is
+    // whatever name you invoke) with no shell-detection branch, and a
+    // `|| sleep 1` fallback keeps the poll correct even if the symlink is
+    // somehow missing.
+    //
+    // Kept as a SECOND COPY of #3227's mechanism rather than a shared
+    // definition: this file is a single-file `bit run` program with zero
+    // imports today, `tools/build/**` is the orchestrator that invokes it as
+    // a Gate (no `tests/bit/**` file imports `tools/build/**` anywhere in
+    // this repo — the ones that reach outside their own directory import
+    // `runtime/**`/`std/**`/sibling test-support dirs, never the tool that
+    // runs them), and pulling the whole 5-file build-driver module into this
+    // harness's compile graph would be a real, backwards coupling for reuse
+    // of three lines of shell. `killtree` just below is the same call: it is
+    // ALREADY a second copy of `tools/build/gates.bit`'s `killTreeFnDef`, for
+    // the same reason (see that comment).
     //
     // #3066: `kill -9 "$p"` on the deadline branch only killed `$p` itself.
     // `$p` here is `bit build`/the compiled test binary — either can fork
@@ -427,7 +458,7 @@ fn writeScripts(cfg: Cfg, cases: []Case) {
     // `compile`/`run` script here is a standalone `/bin/sh` process with no
     // common parent script to hold one shared definition.
     let killtree = "killtree() { root=\"$1\"; tree=\"\"; round=0; while [ \"$round\" -lt 3 ]; do frontier=\"$root\"; depth=0; while [ -n \"$frontier\" ] && [ \"$depth\" -lt 20 ]; do kids=$(pgrep -P \"$(printf '%s' \"$frontier\" | tr '\\n' ',')\" 2>/dev/null); if [ -z \"$kids\" ]; then break; fi; tree=\"$tree $kids\"; frontier=\"$kids\"; depth=$((depth + 1)); done; round=$((round + 1)); done; for kp in $root $tree; do kill -9 \"$kp\" 2>/dev/null; done; }"
-    let watchdog = "${killtree}\nn=0; while kill -0 \"$p\" 2>/dev/null; do if [ \"$n\" -ge ${cfg.timeoutMs / 1000} ]; then killtree \"$p\"; break; fi; ( exec -a bit-gate-watchdog sleep 1 ); n=$((n + 1)); done"
+    let watchdog = "${killtree}\nn=0; while kill -0 \"$p\" 2>/dev/null; do if [ \"$n\" -ge ${cfg.timeoutMs / 1000} ]; then killtree \"$p\"; break; fi; \"${wdPath}\" 1 || sleep 1; n=$((n + 1)); done"
     let compile = "#!/bin/sh\nexport BIT_STDLIB=\"${cfg.stdlib}\"\nexport BIT_LIBBITRT=\"${cfg.libbitrt}\"\n\"${cfg.bitExe}\" build \"${c.dir}\" -o \"${c.bin}\" >\"${c.log}\" 2>&1 &\np=$!\n( ${watchdog} ) </dev/null >/dev/null 2>&1 &\nw=$!\nwait \"$p\"\nrc=$?\nkill \"$w\" 2>/dev/null\nwait \"$w\" 2>/dev/null\necho \"$rc\" > \"${c.compileRc}\"\nexit \"$rc\"\n"
     // BIT_SELF_EXE is a real coupling, not decoration: tests/imports/pmadd_e2e
     // execs the compiler that built it (`bit add`) and panics without it. The
@@ -468,8 +499,18 @@ fn writeScripts(cfg: Cfg, cases: []Case) {
 // caller in `main` can read it back and, if `gradeCase` found NO failing case
 // at all despite `xargs` reporting one, treat that contradiction as its own
 // fatal error.
+//
+// #3231: the very first line symlinks `bit-gate-watchdog` onto the real
+// `sleep` binary, in `scratch`, before either `find | xargs -P` wave starts —
+// this line always runs first because it is the top of the one literal
+// script `main` hands to a single `osRunBounded` call, not concurrent text,
+// so every case's per-case poll (`wdPath` in `writeScripts`) can rely on the
+// symlink already existing by the time its own script forks. `2>/dev/null`
+// only swallows the vanishingly unlikely case where `sleep` itself is
+// missing from `$PATH`; each poll's own `|| sleep 1` fallback keeps it
+// correct (just unattributed) even then.
 fn driverScript(scratch: string): string {
-  return "#!/bin/sh\nN=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)\nfind \"${scratch}\" -maxdepth 1 -name '*.compile.sh' -print0 | xargs -0 -P \"$N\" -n1 sh -c 'exec \"$0\"'\nrc1=$?\nfind \"${scratch}\" -maxdepth 1 -name '*.run.sh' -print0 | xargs -0 -P \"$N\" -n1 sh -c 'exec \"$0\"'\nrc2=$?\nif [ \"$rc1\" -eq 0 ] && [ \"$rc2\" -eq 0 ]; then\n  exit 0\nfi\nexit 1\n"
+  return "#!/bin/sh\nln -sf \"$(command -v sleep)\" \"${scratch}/bit-gate-watchdog\" 2>/dev/null\nN=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)\nfind \"${scratch}\" -maxdepth 1 -name '*.compile.sh' -print0 | xargs -0 -P \"$N\" -n1 sh -c 'exec \"$0\"'\nrc1=$?\nfind \"${scratch}\" -maxdepth 1 -name '*.run.sh' -print0 | xargs -0 -P \"$N\" -n1 sh -c 'exec \"$0\"'\nrc2=$?\nif [ \"$rc1\" -eq 0 ] && [ \"$rc2\" -eq 0 ]; then\n  exit 0\nfi\nexit 1\n"
 }
 
 // ABI.md §19: `>= 0` exit code, `-1` spawn failure, `-2` deadline, `<= -100`
@@ -580,6 +621,11 @@ fn cleanup(scratch: string, cases: []Case, driverSh: string) {
     i = i + 1
   }
   fsRemove(driverSh)
+  // `fsRemove` on a directory is `rmdir` (empty dirs only, ABI.md §14) — the
+  // `bit-gate-watchdog` symlink `driverScript` creates in `scratch` must be
+  // unlinked explicitly first, or every run leaks one symlink into `$TMPDIR`
+  // forever (`fsRemove(scratch)` below would keep silently failing on it).
+  fsRemove("${scratch}/bit-gate-watchdog")
   fsRemove(scratch)
 }
 
@@ -667,7 +713,7 @@ fn main() {
   if (fsMkdir(scratch) < 0) {
     fatal("cannot create scratch directory ${scratch}")
   }
-  writeScripts(cfg, cases)
+  writeScripts(cfg, cases, scratch)
 
   let driver = runDriver(cfg, scratch, len(cases))
   let report = gradeAll(cases)
