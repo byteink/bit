@@ -1,5 +1,5 @@
 // std/quic QUIC v1 transport core (#1220): a full connection over a local UDP
-// pair, driven by two green-thread endpoints (spawn + channels). Six scenarios:
+// pair, driven by two green-thread endpoints (spawn + channels). Seven scenarios:
 //
 //   * direct — complete the QUIC-TLS handshake, open a client bidi stream,
 //     transfer a 96 KiB payload, and assert byte-identical delivery (the
@@ -30,6 +30,12 @@
 //   * streamlimit — open the peer's advertised 16-stream limit, then require the
 //     17th `openStream` to fail distinctly instead of the limit going
 //     unenforced (#3229).
+//
+//   * streamlimitinbound — the missing inbound half of `streamlimit`: a peer
+//     (the server here) referencing more than 16 distinct stream ids must be
+//     refused with a connection close, not grow an unbounded entry per id
+//     (#3247). The first 16 must still deliver normally, proving the check
+//     counts distinct ids in bounds rather than misfiring on legitimate traffic.
 //
 // Every printed line is a boolean, a byte count, a content hash, or a fixed
 // error string — nothing timing-dependent — so the golden is stable across
@@ -395,6 +401,111 @@ fn acceptOnly(sock: UdpSocket, chain: string, keyp: string) {
   conn.setIdleTimeout(listenerIdleNs)
 }
 
+// More than `quicconnLocalMaxStreamsBidi` (16): every one of these
+// server-initiated opens succeeds from the server's own perspective, because
+// `quicconnReadPeerParams` is client-only (handshake.bit) — a server-side
+// connection's `peerMaxStreamsBidi` never learns the real value, so its own
+// outbound gate (#3229) never fires here. That gap is exactly what makes this
+// scenario able to exercise the CLIENT's *inbound* enforcement (#3247) at all:
+// going through `Conn.openStream` on the client instead would hit the client's
+// own outbound gate first and never reach the wire.
+const streamLimitInboundTotal: int = 20
+
+// Open `streamLimitInboundTotal` server-initiated streams and put one acked
+// byte on each. `finish` (not a bare `write`) is required, not just tidier:
+// this runtime defaults to one scheduler worker OS thread (ABI.md §9), and a
+// tight loop of `openStream`+`write` calls that never blocks on the PEER
+// never yields it — the peer's own dial/accept/read green threads starved
+// completely in a from-scratch repro of this exact scenario, every single
+// time, until either a real cross-connection round trip (`finish`, which
+// cannot return until the client's own loop has processed and acked it) or a
+// second worker (`BIT_WORKERS=2`) was added. `tests/bit/importsrun.bit` runs
+// every `tests/imports/**` project under the default one-worker config, so
+// this scenario must yield for real rather than assume fairness.
+fn streamLimitInboundServerRole(sock: UdpSocket, chain: string, keyp: string) {
+  let conn = acceptQuic(sock, chain, keyp) catch e {
+    return
+  }
+  let i = 0
+  while (i < streamLimitInboundTotal) {
+    let s = conn.openStream() catch e {
+      return
+    }
+    s.write([]byte("x")) catch e {
+      return
+    }
+    s.finish() catch e {
+      return
+    }
+    i = i + 1
+  }
+}
+
+// #3247: the missing inbound half of `streamLimitScenario`. The server (see
+// `streamLimitInboundServerRole`) references 20 distinct stream ids; this
+// endpoint advertised room for only 16 (`quicconnLocalParams`), so the last 4
+// must be refused as a connection error (RFC 9000 §4.6 STREAM_LIMIT_ERROR)
+// instead of growing `st.streams`/`st.present` without bound.
+//
+// `first16Ok` accepts and reads exactly the first 16 — all within the
+// advertised limit — and requires every one to deliver its byte normally: the
+// acceptance requirement that a peer referencing streams that stay within the
+// limit is never wrongly refused, which a count of raw map entries (conflating
+// this endpoint's own id space, or type) could get wrong even when the
+// over-limit check itself is correct.
+//
+// `fast` is the same discriminator `resetServerRole` uses: a reverted fix
+// still ends the connection eventually — nothing else answers the peer past
+// this point, so the pre-existing idle timeout (`idleTimeoutNs`, set below)
+// fires regardless — but only a real fix ends it near-instantly, on the
+// violating reference itself, rather than after a 500ms timeout.
+fn streamLimitInboundScenario(chain: string, keyp: string): ()! {
+  let srv = udpBind("127.0.0.1", 0)?
+  let srvPort = srv.port()?
+  spawn streamLimitInboundServerRole(srv, chain, keyp)
+  let conn = dialQuic("127.0.0.1", srvPort, "localhost")?
+  conn.setIdleTimeout(idleTimeoutNs)
+
+  let first16Ok = true
+  let held = conn.acceptStream()?
+  let firstChunk = held.read()?
+  if (len(firstChunk.data) != 1) {
+    first16Ok = false
+  }
+  let j = 1
+  while (j < 16) {
+    let s = conn.acceptStream() catch e {
+      first16Ok = false
+      j = 16
+      continue
+    }
+    let chunk = s.read() catch e {
+      first16Ok = false
+      j = 16
+      continue
+    }
+    if (len(chunk.data) != 1) {
+      first16Ok = false
+    }
+    j = j + 1
+  }
+  println("streamlimitinbound_first16_ok=${boolStr(first16Ok)}")
+
+  let start = monotonic()
+  let closed = false
+  let guard = 0
+  while (!closed && guard < 100000) {
+    guard = guard + 1
+    let chunk2 = held.read() catch e {
+      closed = true
+      continue
+    }
+  }
+  let elapsed = monotonic() - start
+  println("streamlimitinbound_closed=${boolStr(closed)}")
+  println("streamlimitinbound_fast=${boolStr(elapsed < idleTimeoutNs)}")
+}
+
 // One listener client: dial, open a stream, then wait for `go` before sending, so
 // the driver controls exactly when traffic has to cross the shared socket.
 fn listenerClient(port: int, msg: string, go: chan<int>, out: chan<string>) {
@@ -537,6 +648,11 @@ fn run(): ()! {
 
   // --- streamlimit: MAX_STREAMS is enforced, not silently ignored (#3229) ---
   streamLimitScenario(chainPem(), keyPem())?
+
+  // --- streamlimitinbound: a peer referencing more than 16 distinct stream
+  // ids is refused with STREAM_LIMIT_ERROR instead of growing st.streams
+  // without bound (#3247) ---
+  streamLimitInboundScenario(chainPem(), keyPem())?
 }
 
 fn main() {

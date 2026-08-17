@@ -283,6 +283,18 @@ fn quicconnOnMaxStreams(st: quicconnState, bidi: bool, m: int) {
   }
 }
 
+// The 0-based ordinal `id` represents within its own four-way partition (RFC
+// 9000 §2.1: a stream id encodes index*4 in its top bits and a 2-bit
+// initiator/direction tag in the low 2 — client-bidi 0,4,8,…; server-bidi
+// 1,5,9,…; and so on for the two uni classes). Integer division recovers the
+// index without knowing which of the four classes `id` belongs to, since
+// exactly one id per class falls in each 4-wide bucket — the same arithmetic
+// `quicconnOpenedBidiCount` (loop.bit) already applies to this endpoint's own
+// outbound ids, applied here to whatever id the peer references.
+fn quicconnStreamIndex(id: int): int {
+  return id / 4
+}
+
 // Create stream `id` the first time ANY frame references it — RFC 9000 §2.1:
 // "receiving a frame for a stream ID that has not been opened ... implicitly
 // opens" it, not only a STREAM frame. Enqueues the new stream for
@@ -290,12 +302,19 @@ fn quicconnOnMaxStreams(st: quicconnState, bidi: bool, m: int) {
 // has, so RESET_STREAM/MAX_STREAM_DATA arriving before any STREAM frame for the
 // id creates and surfaces the stream instead of being silently dropped (#3232).
 // A stream already present — whether opened locally by `quicconnDoOpen` or seen
-// from the peer before — is returned unchanged.
+// from the peer before — is returned unchanged, and never re-checked against
+// the limit below: only a genuinely NEW entry can violate it.
+//
+// Returns `Option.None` when creating `id` would exceed this endpoint's own
+// advertised `quicconnLocalMaxStreamsBidi` (RFC 9000 §4.6) — a peer reference
+// to a stream ID beyond the limit it was told is a connection error of type
+// STREAM_LIMIT_ERROR, closed via `quicconnCloseWithError` instead of an entry
+// being allocated (#3247, the missing inbound half of #3229's outbound check).
+// Every caller must treat `None` as "stop — the connection is closing" and
+// touch nothing else on this frame.
 //
 // Deliberately narrower than RFC 9000 §2.1 in full: it opens only the
-// referenced id, not every lower-numbered stream of the same type, and it does
-// not check this endpoint's own advertised initial_max_streams_bidi — neither
-// did the STREAM-frame branch this replaces, before or after this fix. Also not
+// referenced id, not every lower-numbered stream of the same type. Also not
 // wired into the `StopSending` arm (`quicconnAbortSend`'s identically-shaped
 // `st.present[id] == 0` early-return): STOP_SENDING can reference an id in this
 // endpoint's OWN locally-initiated space, where implicitly creating a stream
@@ -303,10 +322,16 @@ fn quicconnOnMaxStreams(st: quicconnState, bidi: bool, m: int) {
 // collision — a distinct correctness question RESET_STREAM/MAX_STREAM_DATA (the
 // two arms actually reported and fixed here) don't raise, since either the
 // stream is already present or `isPeer: true` is uncontroversially correct for
-// it. All three gaps — the lower-numbered-streams semantics, the limit check,
-// and StopSending — are filed together, not fixed here (#3243).
-fn quicconnEnsureStream(st: quicconnState, id: int): quicconnStream {
+// it. Both the lower-numbered-streams semantics and StopSending need a per-type
+// highest-opened-id tracker `quicconnState` does not have; they are filed
+// together, not fixed here (#3243) — the limit check above needed no such
+// tracker, since a stream id carries its own ordinal.
+fn quicconnEnsureStream(st: quicconnState, id: int): Option<quicconnStream> {
   if (st.present[id] == 0) {
+    if (quicconnStreamIndex(id) >= quicconnLocalMaxStreamsBidi) {
+      quicconnCloseWithError(st, quicconnErrStreamLimit)
+      return Option.None
+    }
     let ns = quicconnNewStream(st, id, true)
     st.streams[id] = ns
     st.present[id] = 1
@@ -317,7 +342,7 @@ fn quicconnEnsureStream(st: quicconnState, id: int): quicconnStream {
       st.acceptQueue = append(st.acceptQueue, id)
     }
   }
-  return st.streams[id]
+  return Option.Some(st.streams[id])
 }
 
 // Fold an abrupt peer abort of their send side into our receive state (RFC 9000
@@ -331,12 +356,15 @@ fn quicconnEnsureStream(st: quicconnState, id: int): quicconnStream {
 // QUIC (RFC 9000 §2.1) and used to drop that RESET_STREAM on the floor instead
 // of surfacing it.
 fn quicconnOnResetStream(st: quicconnState, id: int, code: int) {
-  let str = quicconnEnsureStream(st, id)
-  if (str.finDelivered) {
-    return
+  match (quicconnEnsureStream(st, id)) {
+    None => {}
+    Some(str) => {
+      if (!str.finDelivered) {
+        str.finDelivered = true
+        str.recvCh <- StreamChunk{ data: []byte(0), fin: true, reset: true, resetCode: code }
+      }
+    }
   }
-  str.finDelivered = true
-  str.recvCh <- StreamChunk{ data: []byte(0), fin: true, reset: true, resetCode: code }
 }
 
 // MAX_STREAM_DATA (RFC 9000 §19.10) raises the peer-granted send window for
@@ -344,10 +372,14 @@ fn quicconnOnResetStream(st: quicconnState, id: int, code: int) {
 // STREAM frame for `id` (#3232), the same first-frame gap `quicconnOnResetStream`
 // had.
 fn quicconnOnMaxStreamData(st: quicconnState, id: int, m: int) {
-  let s = quicconnEnsureStream(st, id)
-  if (m > s.peerMaxStreamData) {
-    s.peerMaxStreamData = m
-    s.blockedSignaled = false
+  match (quicconnEnsureStream(st, id)) {
+    None => {}
+    Some(s) => {
+      if (m > s.peerMaxStreamData) {
+        s.peerMaxStreamData = m
+        s.blockedSignaled = false
+      }
+    }
   }
 }
 
@@ -356,12 +388,16 @@ fn quicconnOnMaxStreamData(st: quicconnState, id: int, m: int) {
 // contiguous prefix.
 fn quicconnOnStream(st: quicconnState, s: StreamFrame): ()! {
   let id = int(s.id)
-  let str = quicconnEnsureStream(st, id)
-  str.recvAsm.insert(s.offset, s.data)?
-  if (s.fin) {
-    str.recvFinalSize = int(s.offset) + len(s.data)
+  match (quicconnEnsureStream(st, id)) {
+    None => { return }
+    Some(str) => {
+      str.recvAsm.insert(s.offset, s.data)?
+      if (s.fin) {
+        str.recvFinalSize = int(s.offset) + len(s.data)
+      }
+      quicconnDeliverStream(st, str)
+    }
   }
-  quicconnDeliverStream(st, str)
 }
 
 // Hand any newly contiguous received bytes to the application and advance the
