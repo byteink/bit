@@ -189,13 +189,48 @@ fn quicconnDecodePn(largest: int, truncated: int, pnLen: int): int {
 }
 
 // Fold one received frame into connection state.
+//
+// Seven arms are deliberate no-ops, each for its own reason rather than one
+// blanket "not implemented" (#3229 — this match used to give no reason at all,
+// the same shape `quictlsFeed` in tls.bit documents for its own, narrower,
+// handshake-only match):
+//
+//   * `NewConnectionId`/`RetireConnectionId` (RFC 9000 §19.15/§19.16) — this
+//     module does one fixed connection id per direction for the connection's
+//     life (see `quicconnCidLen`'s doc comment); there is no CID pool to add to
+//     or retire from, and no path validation to rotate onto a spare one.
+//   * `PathResponse` (RFC 9000 §19.18, receive direction) — this endpoint only
+//     ever originates a PATH_CHALLENGE reactively, in the `PathChallenge` arm
+//     right below, to answer one from the peer; it never sends its own
+//     PATH_CHALLENGE (no connection migration), so a PATH_RESPONSE to us can
+//     never arrive for a challenge we actually issued.
+//   * `DataBlocked`/`StreamDataBlocked` (RFC 9000 §19.9/§19.12, receive
+//     direction) — advisory only. This endpoint already proactively re-extends
+//     both windows as consumption crosses the midpoint
+//     (`quicconnMaybeExtendWindows`), so hearing that the peer is blocked would
+//     at best make an already-scheduled MAX_DATA/MAX_STREAM_DATA update fire
+//     sooner; it cannot change what update gets sent. The send-side signal
+//     (telling the peer WE are blocked) is implemented, in
+//     `quicconnFillStreamFrames`.
+//   * `StreamsBlocked` (RFC 9000 §19.14, receive direction) — telling us the
+//     peer is blocked opening streams is only actionable if this endpoint can
+//     raise its OWN advertised initial_max_streams_bidi (send a fresh
+//     MAX_STREAMS), and nothing in this module does that today: `initial_max_
+//     streams_bidi` is a fixed 16 for the connection's life
+//     (`quicconnLocalParams`). Out of scope here; would need its own local-
+//     limit-tracking-and-relaxation mechanism, symmetric to the peer-limit one
+//     `peerMaxStreamsBidi` adds below for the *other* direction.
+//
+// The other two historically-empty arms, `ResetStream`/`StopSending` and
+// `MaxStreams`, are real fixes, not non-goals — see `quicconnOnResetStream`,
+// `quicconnAbortSend`, and `quicconnOnMaxStreams`.
 fn quicconnHandleFrame(st: quicconnState, levelIdx: int, f: Frame): ()! {
   match (f) {
     Padding(_) => {}
     Ping => {}
     Ack(a) => { quicconnProcessAck(st, levelIdx, a) }
-    ResetStream(_, _, _) => {}
-    StopSending(_, _) => {}
+    ResetStream(id, code, _) => { quicconnOnResetStream(st, int(id), int(code)) }
+    StopSending(id, code) => { quicconnAbortSend(st, int(id), int(code)) }
     Crypto(offset, cdata) => { quicconnLvl(st, levelIdx).crecv.insert(offset, cdata)? }
     NewToken(_) => {}
     Stream(s) => { quicconnOnStream(st, s)? }
@@ -206,7 +241,7 @@ fn quicconnHandleFrame(st: quicconnState, levelIdx: int, f: Frame): ()! {
       }
     }
     MaxStreamData(id, m) => { quicconnOnMaxStreamData(st, int(id), int(m)) }
-    MaxStreams(_, _) => {}
+    MaxStreams(bidi, m) => { quicconnOnMaxStreams(st, bidi, int(m)) }
     DataBlocked(_) => {}
     StreamDataBlocked(_, _) => {}
     StreamsBlocked(_, _) => {}
@@ -218,6 +253,50 @@ fn quicconnHandleFrame(st: quicconnState, levelIdx: int, f: Frame): ()! {
     ApplicationClose(_, _) => { st.running = false }
     HandshakeDone => { st.handshakeComplete = true }
   }
+}
+
+// Raise the peer's advertised bidirectional stream limit (RFC 9000 §19.11) so a
+// later `Conn.openStream` can use the extra room; a MAX_STREAMS that does not
+// advance the limit (reordered or duplicate) is a no-op. Uni-directional streams
+// are untouched: this module has no uni-stream open path at all (`quicconnDoOpen`
+// only ever allocates bidi ids), so a uni MAX_STREAMS has nothing to gate.
+fn quicconnOnMaxStreams(st: quicconnState, bidi: bool, m: int) {
+  if (!bidi) {
+    return
+  }
+  if (m > st.peerMaxStreamsBidi) {
+    st.peerMaxStreamsBidi = m
+  }
+}
+
+// Fold an abrupt peer abort of their send side into our receive state (RFC 9000
+// §19.4): stop expecting the rest of the stream and wake a blocked `read` with a
+// distinguishable reset chunk instead of leaving it parked on a FIN that will
+// never arrive (the bug this function fixes). A reset for a stream whose clean
+// end was already delivered is a no-op — the application has already seen it
+// end, and re-announcing that is not useful.
+//
+// `st.present[id] == 0` is ALSO treated as a no-op here, and that half is a
+// known gap, not a considered choice: RFC 9000 §2.1 says receiving ANY frame
+// that references a stream id — not only STREAM — implicitly opens it (and
+// every lower-numbered stream of the same type), so a peer that resets a
+// stream before ever sending data on it is valid QUIC and this drops that
+// RESET_STREAM on the floor instead of surfacing it. Pre-existing and broader
+// than this arm alone — `quicconnOnMaxStreamData` has the identical
+// `st.present[id] == 0` early-return for the same reason, and `StreamDataBlocked`
+// would need it too were it not already a no-op — so it is a cross-cutting
+// "implicit stream creation" gap, not something #3229 introduces or is scoped
+// to fix. Filed separately (#3232).
+fn quicconnOnResetStream(st: quicconnState, id: int, code: int) {
+  if (st.present[id] == 0) {
+    return
+  }
+  let str = st.streams[id]
+  if (str.finDelivered) {
+    return
+  }
+  str.finDelivered = true
+  str.recvCh <- StreamChunk{ data: []byte(0), fin: true, reset: true, resetCode: code }
 }
 
 fn quicconnOnMaxStreamData(st: quicconnState, id: int, m: int) {
@@ -269,7 +348,7 @@ fn quicconnDeliverStream(st: quicconnState, str: quicconnStream) {
     let isFin = str.recvFinalSize >= 0 && contig == str.recvFinalSize
     str.recvDelivered = contig
     st.dataConsumed = st.dataConsumed + n
-    str.recvCh <- StreamChunk{ data: chunk, fin: isFin }
+    str.recvCh <- StreamChunk{ data: chunk, fin: isFin, reset: false, resetCode: 0 }
     if (isFin) {
       str.finDelivered = true
     }
@@ -277,7 +356,7 @@ fn quicconnDeliverStream(st: quicconnState, str: quicconnStream) {
   }
   if (!str.finDelivered && str.recvFinalSize >= 0 && str.recvDelivered >= str.recvFinalSize) {
     str.finDelivered = true
-    str.recvCh <- StreamChunk{ data: []byte(0), fin: true }
+    str.recvCh <- StreamChunk{ data: []byte(0), fin: true, reset: false, resetCode: 0 }
   }
 }
 

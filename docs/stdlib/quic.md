@@ -875,7 +875,9 @@ a channel, so the connection has no directly-shared mutable state. Obtain one fr
 
 ### `Conn.openStream(): Stream!`
 
-Open a new client-initiated bidirectional stream (RFC 9000 §2.1).
+Open a new client-initiated bidirectional stream (RFC 9000 §2.1). Fails with a
+distinct message when the peer's advertised stream limit
+(initial_max_streams_bidi / MAX_STREAMS) is already reached.
 
 ### `Conn.acceptStream(): Stream!`
 
@@ -913,10 +915,28 @@ control and congestion control, retransmitting any losses.
 Mark the send half finished (FIN) and block until every queued byte has been
 acknowledged by the peer.
 
+### `Stream.reset(code: int): ()!`
+
+Abruptly terminate this stream's send side with RESET_STREAM (RFC 9000 §19.4):
+abandon any buffered-but-unsent data and tell the peer not to expect the rest,
+instead of `finish`'s clean FIN. Fire-and-forget, like `write` - there is nothing
+to wait for, since a reset send stream never drains. Do not call this after a
+`finish` on the same stream is already in flight.
+
+### `Stream.stopSending(code: int): ()!`
+
+Ask the peer to stop sending on this stream (RFC 9000 §19.5): data already in
+flight from them may still arrive until they process the request, and a
+well-behaved peer answers by resetting their send side, which then surfaces here
+as `read`'s `StreamChunk.reset`. Does not affect this endpoint's own send side -
+pair with `reset` if this side is also done sending.
+
 ### `Stream.read(): StreamChunk!`
 
-Read the next reassembled inbound chunk, blocking until data or the FIN arrives.
-The final chunk carries `fin = true`; read until then to consume the whole stream.
+Read the next reassembled inbound chunk, blocking until data, the FIN, or a peer
+RESET_STREAM arrives. The final chunk carries `fin = true`; read until then to
+consume the whole stream, or check `reset` to tell an abrupt peer abort apart
+from a clean end.
 
 ### `Stream.id(): int`
 
@@ -925,7 +945,10 @@ The stream's id (RFC 9000 §2.1).
 ### `StreamChunk`
 
 One contiguous run of received stream bytes delivered to the application, with
-`fin` set on the final run. Its fields are `data: []byte` and `fin: bool`.
+`fin` set on the final run. Its fields are `data: []byte` and `fin: bool`. `reset`
+is set instead of a normal end when the peer abruptly aborted with RESET_STREAM
+(RFC 9000 §19.4); `data` is then always empty and `resetCode` carries the peer's
+application error code.
 
 ```bit
 import { dialQuic, acceptQuic, Conn, Stream, StreamChunk } from "std/quic"

@@ -1,5 +1,5 @@
 // std/quic QUIC v1 transport core (#1220): a full connection over a local UDP
-// pair, driven by two green-thread endpoints (spawn + channels). Four scenarios:
+// pair, driven by two green-thread endpoints (spawn + channels). Six scenarios:
 //
 //   * direct — complete the QUIC-TLS handshake, open a client bidi stream,
 //     transfer a 96 KiB payload, and assert byte-identical delivery (the
@@ -18,8 +18,17 @@
 //   * idle — blackhole the peer after the handshake and require a thread parked
 //     in `finish` to come back with an error in bounded time (#1449/#1474).
 //
-// Every printed line is a boolean, a byte count, or a content hash — nothing
-// timing-dependent — so the golden is stable across targets and schedules.
+//   * reset — the client resets a freshly-opened stream; the server's first
+//     `read` on it must return a reset chunk promptly rather than hang on data
+//     that will never arrive (#3229).
+//
+//   * streamlimit — open the peer's advertised 16-stream limit, then require the
+//     17th `openStream` to fail distinctly instead of the limit going
+//     unenforced (#3229).
+//
+// Every printed line is a boolean, a byte count, a content hash, or a fixed
+// error string — nothing timing-dependent — so the golden is stable across
+// targets and schedules.
 //
 // This program is NOT run under `BIT_GC=stress`, and that hole is declared and
 // argued in tests/bit/stress/stress.bit rather than left to be inferred (#1475): a QUIC-TLS
@@ -248,6 +257,118 @@ fn idleScenario(chain: string, keyp: string): ()! {
   println("idle_bounded=${boolStr(elapsed < idleBoundNs)}")
 }
 
+const resetErrCode: int = 42
+
+// #3229: the server side of the reset scenario. A short idle timeout means an
+// unfixed regression (the `ResetStream` arm back to a no-op) does not hang the
+// whole suite: `read` would instead come back — slowly, via the pre-existing
+// #1449 idle-timeout path — with a generic connection-closed error once nothing
+// more arrives from the peer, rather than the reset chunk directly and
+// promptly. `fast` is the discriminator between "fixed" and "reverted"; the
+// read loop is bounded so a still-broken build fails this scenario instead of
+// wedging every scenario after it.
+//
+// Reads until a reset chunk arrives or the connection ends, accumulating any
+// data delivered first — the client writes a few bytes before resetting (see
+// `resetScenario`'s comment for why: the stream must exist server-side, via a
+// real STREAM frame, before RESET_STREAM references it; #3232).
+fn resetServerRole(sock: UdpSocket, chain: string, keyp: string, resultCh: chan<string>) {
+  let conn = acceptQuic(sock, chain, keyp) catch e {
+    resultCh <- "handshake-failed"
+    return
+  }
+  conn.setIdleTimeout(idleTimeoutNs)
+  let s = conn.acceptStream() catch e {
+    resultCh <- "accept-failed"
+    return
+  }
+  let start = monotonic()
+  let gotData = 0
+  let sawReset = false
+  let resetCode = -1
+  let guard = 0
+  while (!sawReset && guard < 1000) {
+    guard = guard + 1
+    let chunk = s.read() catch e {
+      resultCh <- "read-failed"
+      return
+    }
+    gotData = gotData + len(chunk.data)
+    if (chunk.reset) {
+      sawReset = true
+      resetCode = chunk.resetCode
+    }
+  }
+  let elapsed = monotonic() - start
+  resultCh <- "reset=${boolStr(sawReset)}:code=${resetCode}:predata=${gotData}:" +
+    "fast=${boolStr(elapsed < idleTimeoutNs)}"
+}
+
+// A `read()` on a stream the peer RESET_STREAM'd must return a distinguishable
+// reset chunk instead of waiting for data or a FIN that will now never arrive
+// (#3229's core finding). The client writes a few bytes first, so the server
+// learns the stream exists via a real STREAM frame before the reset — resetting
+// with zero prior writes hits a separate, pre-existing gap (#3232: no implicit
+// stream creation from a non-STREAM frame) that would hang `acceptStream`
+// rather than exercise the fix under test here.
+fn resetScenario(chain: string, keyp: string): ()! {
+  let srv = udpBind("127.0.0.1", 0)?
+  let srvPort = srv.port()?
+  let res = chan<string>(1)
+  spawn resetServerRole(srv, chain, keyp, res)
+  let conn = dialQuic("127.0.0.1", srvPort, "localhost")?
+  let s = conn.openStream()?
+  s.write([]byte("hi"))?
+  s.reset(resetErrCode)?
+  let got = <- res
+  println("reset_result=${got}")
+  conn.close()
+}
+
+// "" if `conn.openStream` succeeds, else the error it failed with. A separate
+// function because a `catch` block used as a statement must either produce a
+// `Stream` or divert control (`return`), the same constraint `keyRejected` in
+// tests/imports/cryptoaes/main.bit works around the same way.
+fn tryOpenStream(conn: Conn): string {
+  let s = conn.openStream() catch e { return e.message() }
+  return ""
+}
+
+// The peer only ever advertises `initialMaxStreamsBidi = 16`
+// (`quicconnLocalParams`); nothing gated `Conn.openStream` against it at all
+// before #3229. Open exactly that many, then require the next one to fail
+// distinctly (not hang, not fail with the generic "connection closed").
+fn streamLimitScenario(chain: string, keyp: string): ()! {
+  let srv = udpBind("127.0.0.1", 0)?
+  let srvPort = srv.port()?
+  spawn acceptOnly(srv, chain, keyp)
+  let conn = dialQuic("127.0.0.1", srvPort, "localhost")?
+  let opened = 0
+  let i = 0
+  while (i < 16) {
+    let s = conn.openStream()?
+    opened = opened + 1
+    i = i + 1
+  }
+  let msg = tryOpenStream(conn)
+  println("streamlimit_opened=${opened}")
+  println("streamlimit_17th_blocked=${boolStr(msg != "")}")
+  println("streamlimit_17th_message=${msg}")
+  conn.close()
+}
+
+// Complete the handshake and hold the connection open; `streamLimitScenario`
+// needs a live peer only to learn the peer's advertised transport parameters —
+// none of the streams it opens ever carry data, so the server never even learns
+// they exist (a STREAM frame is what creates a stream server-side, and no
+// `write` is ever called).
+fn acceptOnly(sock: UdpSocket, chain: string, keyp: string) {
+  let conn = acceptQuic(sock, chain, keyp) catch e {
+    return
+  }
+  conn.setIdleTimeout(listenerIdleNs)
+}
+
 // One listener client: dial, open a stream, then wait for `go` before sending, so
 // the driver controls exactly when traffic has to cross the shared socket.
 fn listenerClient(port: int, msg: string, go: chan<int>, out: chan<string>) {
@@ -380,6 +501,12 @@ fn run(): ()! {
 
   // --- idle: a vanished peer unparks `finish` in bounded time (#1449/#1474) ---
   idleScenario(chainPem(), keyPem())?
+
+  // --- reset: RESET_STREAM wakes a blocked `read` instead of hanging (#3229) ---
+  resetScenario(chainPem(), keyPem())?
+
+  // --- streamlimit: MAX_STREAMS is enforced, not silently ignored (#3229) ---
+  streamLimitScenario(chainPem(), keyPem())?
 }
 
 fn main() {
