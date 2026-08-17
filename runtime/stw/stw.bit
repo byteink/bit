@@ -197,16 +197,38 @@
 //      answer for itself has its bound published on its behalf, and the bound
 //      is only ever LOWERED, which class 4's header already argues is safe.
 //
-// STILL OPEN — the classes above cover a stack only when some REGISTERED TASK's
-// mapping contains it, because that mapping is the only source of the stack's
-// TOP. A collection taken on a thread's own OS-thread stack (a worker between
-// tasks, the bootstrap thread before the first task) belongs to no task, so
-// classes 8 and 10 both find nothing to lower and no range to scan. Measured on
-// this tree: 1353-1771 of ~40000 collections under `BIT_GC=stress`, 0 of 190
-// under the default policy (`stwUnheldCount` below). #1837 holds that; the
-// missing datum is a per-OS-thread stack top, which this runtime records
-// nowhere, and deriving one from the frame-pointer chain needs the stack-map
-// validation that lives in `../gc/stackmap.bit`.
+// CLASS 8b (#2650) — the classes above cover a stack only when some REGISTERED
+// TASK's mapping contains it, because that mapping is the only source of the
+// stack's TOP. A collection taken on a thread's own OS-thread stack (a worker
+// between tasks, the bootstrap thread before the first task) belongs to no
+// task, so classes 8 and 10 both find nothing to lower and no range to scan.
+// Measured on this tree: 1353-1771 of ~40000 collections under
+// `BIT_GC=stress`, 0 of 190 under the default policy (`stwUnheldCount` below)
+// — the SAME population `stwScanTasks` counts as `held == false`.
+//
+// `stwScanOwnStack` (below `stwScanTasks`) closes this the same way class 8
+// closes it for a task-held stack, keyed off a different source for the TOP:
+// `worldStackTop(world, slot)` (`../gc/gcworld.bit`, #2646) — the highest
+// address of `slot`'s owning OS thread's own stack, published once by that
+// thread itself, 0 when unknown. Called from `stwScanTasks` after the
+// registry walk, only when `held` stayed false, with the collector's own
+// slot threaded down from `stwCollect`'s `selfSlot`; it scans `[sp, top)`
+// exactly as `stwScanStackRange` does for every other class, and refuses —
+// scans nothing, touches nothing — when `top` is 0 or is not strictly above
+// `sp`, for the same reason class 8's header gives: past the real stack top
+// is unmapped, and a faulting collector is worse than the sweep it prevents.
+//
+// NOT YET POPULATED IN PRODUCTION. #2646 added `worldStackTop`'s STORAGE and
+// its plain-load/store doors; nothing calls `worldSetStackTop` yet — that is
+// #2649, blocked on #2647/#2648 publishing each platform's real
+// `threadStackTop()`. Until #2649 lands, `top` reads 0 for every slot on a
+// live boot, so `stwScanOwnStack` is correctly wired and correctly a no-op:
+// it runs on every unheld collection and scans nothing. The measured
+// population above is therefore still actually uncovered on a live runtime
+// today; what changed here is that the mechanism exists and is reachable,
+// not that the gap is closed. #1837 tracks that; deriving the datum from the
+// frame-pointer chain instead needs the stack-map validation that lives in
+// `../gc/stackmap.bit`, which #2646/#2649's explicit registry field avoids.
 //
 // Classes 4, 5, 7, 8 and 10 are reachable only when a scheduler block is bound;
 // class 1 only when a channel registry is. `stwBind` takes all three addresses TOGETHER
@@ -217,6 +239,7 @@
 
 import { worldPark, worldRendezvous, worldRestart } from "../gc"
 import { worldLockTry, worldLockRelease, worldParkedFrame } from "../gc"
+import { worldStackTop } from "../gc"
 import { worldSyscallSp, worldSyscallRegs, worldSyscallRegWords, worldHighWaterMark } from "../gc"
 import { worldEnsureSelfOn } from "../gc"
 import { worldEnsureSelf, maxMutators } from "../gc"
@@ -307,6 +330,15 @@ export @nosplit @symbol("bit_rt_port_stw_abandoned") fn stwAbandonedCount(): int
 // re-instrumentation away, and makes any fix for #1837 falsifiable by the same
 // reading. Measured here: 0 of 190 under the default policy, 1353-1771 of
 // ~40000 under `BIT_GC=stress`.
+//
+// EVERY `stwUnheld` INCREMENT NOW ALSO RUNS CLASS 8b (#2650): the increment
+// above and the call to `stwScanOwnStack` sit in the same `if (!held)` guard
+// in `stwScanTasks`, so the two counts can never drift apart by construction
+// — there is no separate "did class 8b actually run" question to ask. Whether
+// that run SCANS anything still depends on `worldStackTop` having a
+// published, above-`sp` value for this slot, which nothing writes yet (#2649,
+// blocked on #2647/#2648); until it lands, this population is exercised on
+// every collection it names and covered by none of them.
 let stwScans: i64 = 0
 let stwUnheld: i64 = 0
 
@@ -573,7 +605,28 @@ export @nosplit @symbol("bit_rt_port_stw_unheld") fn stwUnheldCount(): int {
   return lo
 }
 
-@nosplit fn stwScanTasks(g: *i64, world: *i64, sched: *i64) {
+// Class 8b (#2650): the collecting thread's OWN OS-thread stack, when the walk
+// above found no registered task whose mapping contains the live `sp` — a
+// worker between tasks, or the bootstrap thread before the first task exists.
+// See "CLASS 8b" in the ROOT SET header above for the full rationale.
+//
+// `top` is `slot`'s owning thread's published stack top (`worldStackTop`,
+// `../gc/gcworld.bit`, #2646) — 0 when that thread has never published one.
+// Refuses to scan on either open condition, deliberately in this order so
+// the second comparison never runs against an unpublished (0) top: past the
+// real stack top is unmapped, and a faulting collector is worse than the
+// sweep it prevents. No fixed window is substituted for a missing or
+// non-positive `top` — the whole point is that a guess here is unsafe, not
+// merely imprecise.
+@nosplit fn stwScanOwnStack(g: *i64, world: *i64, slot: int, sp: int) {
+  let top = worldStackTop(world, slot)
+  if (top <= 0 || top <= sp) {
+    return
+  }
+  stwScanStackRange(g, sp, top)
+}
+
+@nosplit fn stwScanTasks(g: *i64, world: *i64, sched: *i64, slot: int) {
   let sp = stwReadSp()
   let held = false
   stwScans = stwScans + 1
@@ -624,6 +677,9 @@ export @nosplit @symbol("bit_rt_port_stw_unheld") fn stwUnheldCount(): int {
   schedRegUnlock(sched)
   if (!held) {
     stwUnheld = stwUnheld + 1
+    // Class 8b (#2650): nothing registered above claims this stack — try the
+    // collector's own OS-thread stack top instead.
+    stwScanOwnStack(g, world, slot, sp)
   }
 }
 
@@ -657,8 +713,9 @@ export @nosplit @symbol("bit_rt_port_stw_unheld") fn stwUnheldCount(): int {
 
   // 4 + 5 + 9. Every other task's stack, conservatively, and every task's `arg`
   // — plus, for a task a syscall-parked thread is standing in, the bound and
-  // register file that thread published (#1904).
-  stwScanTasks(g, world, taskAt(sched))
+  // register file that thread published (#1904). Also covers class 8b
+  // (#2650) when none of them holds this thread's own live `sp`.
+  stwScanTasks(g, world, taskAt(sched), selfSlot)
 
   gcCollectFinish(g)
 }
