@@ -248,7 +248,8 @@ byte-level cutset membership as `trimLeft`.
 
 ### `trimSpace(s: string): string`
 
-`s` with leading and trailing ASCII spaces and tabs removed.
+`s` with leading and trailing ASCII whitespace removed: space, tab, newline,
+vertical tab, form feed, and carriage return.
 
 ### `replace(s: string, old: string, repl: string): string`
 
