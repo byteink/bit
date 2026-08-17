@@ -1239,7 +1239,7 @@ defined exactly once).
 | `bit_rt_fs_mkdir`     | `(path: *const RtBytes) -> i64` (§14)                   |
 | `bit_rt_fs_remove`    | `(path: *const RtBytes) -> i64` (§14)                   |
 | `bit_rt_fs_list_dir`  | `(path: *const RtBytes) -> *const RtBytes` (§14)        |
-| `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing at ONE i64 WORD PER BYTE — not a packed C string, not `RtBytes`; the only `bit_rt_fs_*` entry point shaped this way) |
+| `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not NUL-terminated, not `RtBytes`; the only `bit_rt_fs_*` entry point shaped this way) |
 | `bit_rt_test_index`   | `() -> i64` (§16)                                      |
 | `bit_rt_floor`        | `(x: f64) -> f64` (§17)                                |
 | `bit_rt_ceil`         | `(x: f64) -> f64` (§17)                                |
@@ -1667,9 +1667,8 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   `string`. Its caller is `std/fs`, which can reach a runtime symbol only
   through an `extern function` (SPEC §11.7), and §11.7 admits no `string`
   across that boundary — so `words` is the raw backing store of a Bit
-  `[]byte` instead, `n` elements at **one 8-byte word each** (SPEC §11.8:
-  `ptrOf` on a `[]u8` does not address packed bytes), not a packed C string
-  and not an `RtBytes`. The provider unpacks the words into its own
+  `[]byte` instead, `n` **packed** bytes (§2, #3121/#3226), not NUL-terminated
+  and not an `RtBytes`. The provider copies those bytes into its own
   NUL-terminated buffer before probing it, applying the same `max_path` and
   embedded-NUL rejections every other path-taking entry point applies
   (#2146). It answers with `readlink`, not `lstat` + `S_IFLNK`: `readlink`
@@ -2116,10 +2115,11 @@ first poll and never restarting it — the same "resolve once, never
 per-iteration" shape §19's `osForkExecWaitBounded` uses. They are reached
 through a plain `extern fn`, not the compiler-recognized builtins the four
 entries above lower to, because §11.7 admits no `string` across an `extern`
-boundary: `host`/the written body cross as a raw word-strided pointer (a
-Bit `[]byte`'s backing) plus a length, and a read result is written into the
-caller's own such buffer rather than returned as a fresh string, the same
-shape §14's `bit_rt_fs_is_symlink_w` uses. `deadlineNs` is an absolute
+boundary: `host`/the written body cross as a raw pointer into a packed Bit
+`[]byte`'s backing (§2, #3121/#3226) plus a length, and a read result is
+written into the caller's own such buffer rather than returned as a fresh
+string, the same shape §14's `bit_rt_fs_is_symlink_w` uses. `deadlineNs` is an
+absolute
 monotonic nanosecond value on the same clock `bit_rt_time_mono_ns` reaches
 (§18); `<= 0` (a `Conn`'s zero value) or further out than the wait ceiling
 below both clamp to it — a caller typo must not reinstate an unbounded wait,
