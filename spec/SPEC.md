@@ -1209,8 +1209,9 @@ syscall(nr, a0, a1, a2, a3, a4, a5)
   is unused: its effect belongs to the kernel, outside the compiler's view.
 - Pointer arguments are ordinary integers here. A raw pointer (§11.4) reaches
   one via `i64(p)`; `ptrOf` (§11.5) is the bridge from a slice to such a
-  pointer. Note that a slice stores one **8-byte word per element**, so
-  `ptrOf` on a `[]u8` does not address packed bytes.
+  pointer. A slice stores one **8-byte word per element**, except a `[]u8`,
+  which is byte-packed — so `ptrOf` on a `[]u8` addresses packed bytes, and
+  `ptrOf` on any other element type addresses word-strided ones.
 
 The compiler emits the kernel trap inline — never a call to a runtime symbol —
 using each platform's kernel ABI, which is **not** its C ABI:
