@@ -164,9 +164,13 @@ const oobStringRange: int = 2
 
 // `bit_rt_slice_new`: a fresh `[]T` of length `len`, capacity `max(len, cap)`,
 // elements zeroed. Backs slice literals (`len == cap == N`) and `[]T(n[, m])`.
-// `elemSize` is the static element type's byte stride (ABI.md §9, #3119/#3120);
-// always 8 in this ticket, so it changes nothing yet -- #3121 wires a real 1 for
-// packed `[]u8`.
+// `elemSize` is the static element type's byte stride (ABI.md §9, #3119/#3120)
+// and needs no change here: `allocBuf` already sizes the body as
+// `words * elemSize` (#3120), so a packed `[]u8`'s body is already the right
+// number of bytes the moment a caller passes `elemSize == 1` -- what still
+// addresses every element at a word stride regardless of `elemSize` is
+// `rtSliceGet`/`rtSliceSet`/`rtSliceAppend` below, and #3121 gives those a
+// packed arm. No compiled program reaches it yet (see `rtSliceGet`'s comment).
 export @nosplit @symbol("bit_rt_slice_new")
 fn rtSliceNew(want: int, capWant: int, isRef: int, elemSize: int): int {
   let c = capWant
@@ -213,12 +217,19 @@ fn rtSliceNew(want: int, capWant: int, isRef: int, elemSize: int): int {
 
 // `elemSize` travels alongside `isRef` for the same reason (#1569): a null `h`
 // has no header to read it from either.
+//
+// PACKED `[]u8` (elemSize == 1, non-ref, #3121): the grow-copy and the new
+// element both address byte-for-byte instead of the word stride. See
+// `rtSliceGet`'s comment for why every other combination is unreachable
+// today, and why this arm must not be exercised by any compiled program
+// until the compiler side is wired to match.
 export @nosplit @symbol("bit_rt_slice_append")
 fn rtSliceAppend(hIn: int, word: int, isRef: int, elemSize: int): int {
   let h = appendTarget(hIn, isRef, elemSize)
   let vlen = loadWord(h + slcLen)
   let vcap = loadWord(h + slcCap)
   let off = loadWord(h + slcOff)
+  let packed = elemSize == 1 && loadWord(h + slcIsRef) == 0
   if (vlen == vcap) {
     let newcap = vcap * 2
     if (vcap == 0) {
@@ -227,11 +238,15 @@ fn rtSliceAppend(hIn: int, word: int, isRef: int, elemSize: int): int {
     let bufIsRef = loadWord(h + slcIsRef)
     let nb = allocBuf(newcap, bufIsRef != 0, elemSize)
     let old = loadWord(h + slcBuf)
-    let i = 0
-    while (i < vlen) {
-      let w = loadWord(old + (off + i) * 8)
-      storeWord(nb + i * 8, w)
-      i = i + 1
+    if (packed) {
+      copyBytes(nb, old + off, vlen)
+    } else {
+      let i = 0
+      while (i < vlen) {
+        let w = loadWord(old + (off + i) * 8)
+        storeWord(nb + i * 8, w)
+        i = i + 1
+      }
     }
     storeWord(h + slcBuf, nb)
     storeWord(h + slcOff, 0)
@@ -239,7 +254,11 @@ fn rtSliceAppend(hIn: int, word: int, isRef: int, elemSize: int): int {
     off = 0
   }
   let buf = loadWord(h + slcBuf)
-  storeWord(buf + (off + vlen) * 8, word)
+  if (packed) {
+    storeByte(buf + off + vlen, word)
+  } else {
+    storeWord(buf + (off + vlen) * 8, word)
+  }
   storeWord(h + slcLen, vlen + 1)
   return h
 }
@@ -254,9 +273,20 @@ fn rtSliceAppend(hIn: int, word: int, isRef: int, elemSize: int): int {
 //
 // The `return 0` after each panic is unreachable: Bit has no `noreturn`, so the
 // type checker still wants a value on that path.
-// `elemSize` (ABI.md §9, #3119/#3120) is unused here: addressing stays the
-// literal `* 8` below for every type in this ticket -- a real per-element
-// stride is #3121's follow-up, once byte-packing exists to address.
+// PACKED `[]u8` (elemSize == 1, non-ref, #3121): addressed byte-for-byte
+// instead of the word stride below. Every other elemSize/isRef combination
+// takes the unchanged `* 8` path -- the compiler still emits the literal 8 at
+// every slice call site (#3120's plumbing), so the packed arm is unreachable
+// from any compiled program today. It stays DEAD, NOT ACTIVE, until a
+// follow-up wires the real per-element width through
+// compiler/lowerlit.bit, lowerassign.bit, loweraccess.bit and lowerprim.bit --
+// landing that flip before this addressing exists (or landing an addressing
+// change here that a stale runtime can already see, in either order other
+// than "runtime first, compiler second") corrupts the heap: a packed
+// allocation sized `n` read/written at a word stride walks off the end of the
+// buffer. Gated on isRef too: a ref buffer stays word-per-element
+// unconditionally regardless of elemSize (epic #2941's constraint), because
+// the collector's tracing loop walks it word by word.
 export @nosplit @symbol("bit_rt_slice_get")
 fn rtSliceGet(h: int, index: int, elemSize: int): int {
   if (h == 0) {
@@ -270,6 +300,9 @@ fn rtSliceGet(h: int, index: int, elemSize: int): int {
   }
   let off = loadWord(h + slcOff)
   let buf = loadWord(h + slcBuf)
+  if (elemSize == 1 && loadWord(h + slcIsRef) == 0) {
+    return loadByte(buf + off + index)
+  }
   let w = loadWord(buf + (off + index) * 8)
   return w
 }
@@ -300,8 +333,10 @@ fn rtSliceInBounds(h: int, index: int): bool {
 // has just replaced.
 //
 // Null is the length-0 case again: no index is writable, so every index panics.
-// `elemSize` (ABI.md §9, #3119/#3120) is unused here for the same reason
-// `rtSliceGet` leaves it unused: addressing stays the literal `* 8` below.
+// PACKED `[]u8` (elemSize == 1, non-ref, #3121): addressed byte-for-byte
+// instead of the word stride below. See `rtSliceGet`'s comment for why every
+// other combination is unreachable today and what still has to land, and in
+// what order, before this arm is ever taken.
 export @nosplit @symbol("bit_rt_slice_set")
 fn rtSliceSet(h: int, index: int, word: int, elemSize: int) {
   if (h == 0) {
@@ -315,6 +350,10 @@ fn rtSliceSet(h: int, index: int, word: int, elemSize: int) {
   }
   let off = loadWord(h + slcOff)
   let buf = loadWord(h + slcBuf)
+  if (elemSize == 1 && loadWord(h + slcIsRef) == 0) {
+    storeByte(buf + off + index, word)
+    return
+  }
   storeWord(buf + (off + index) * 8, word)
 }
 
