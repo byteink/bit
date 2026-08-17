@@ -345,6 +345,14 @@ fn quicconnOnCmd(st: quicconnState, cmd: quicconnCmd): ()! {
     quicconnDoFinish(st, cmd)?
     return
   }
+  if (cmd.kind == quicconnCmdReset) {
+    quicconnDoReset(st, cmd)?
+    return
+  }
+  if (cmd.kind == quicconnCmdStopSending) {
+    quicconnDoStopSending(st, cmd)?
+    return
+  }
   if (cmd.kind == quicconnCmdSetIdle) {
     quicconnDoSetIdle(st, cmd)
     return
@@ -355,7 +363,23 @@ fn quicconnOnCmd(st: quicconnState, cmd: quicconnCmd): ()! {
   }
 }
 
+// Client-initiated bidi stream ids are 0, 4, 8, … (RFC 9000 §2.1) — a server
+// opening its own uses the same step from 1, 5, 9, … — so the count already
+// opened is exactly the number of 4-id steps since the first one.
+fn quicconnOpenedBidiCount(st: quicconnState): int {
+  return (st.nextBidiId - quicconnFirstBidiId(st.isClient)) / 4
+}
+
+// `-2` distinguishes "blocked on the peer's stream limit" from the existing
+// `-1` ("connection closed") sentinel so `Conn.openStream` can report which one
+// happened (RFC 9000 §4.6: a sender MUST NOT open more streams than the peer's
+// initial_max_streams_bidi / MAX_STREAMS permits — `st.peerMaxStreamsBidi`,
+// populated in `quicconnReadPeerParams` and raised by `quicconnOnMaxStreams`).
 fn quicconnDoOpen(st: quicconnState, cmd: quicconnCmd) {
+  if (quicconnOpenedBidiCount(st) >= st.peerMaxStreamsBidi) {
+    cmd.replyOpen <- quicconnOpenReply{ id: -2, recvCh: chan<StreamChunk>(1) }
+    return
+  }
   let id = st.nextBidiId
   st.nextBidiId = st.nextBidiId + 4
   let s = quicconnNewStream(st, id, false)
@@ -381,6 +405,9 @@ fn quicconnDoWrite(st: quicconnState, cmd: quicconnCmd): ()! {
     return
   }
   let s = st.streams[cmd.id]
+  if (s.sendAborted) {
+    return
+  }
   if (len(s.sendBuf) == 0) {
     s.sendBuf = cmd.data
   } else {
@@ -398,11 +425,72 @@ fn quicconnDoFinish(st: quicconnState, cmd: quicconnCmd): ()! {
     return
   }
   let s = st.streams[cmd.id]
+  // A send already abandoned (`reset`, or STOP_SENDING from the peer) never
+  // drains — answer the same way as a nonexistent stream instead of parking
+  // the caller behind a FIN that `quicconnFillStreamFrames` will now never send.
+  if (s.sendAborted) {
+    cmd.replyInt <- -1
+    return
+  }
   s.finQueued = true
   s.drainCh = cmd.replyInt
   s.hasDrain = true
   quicconnFlush(st)?
   quicconnCheckDelivered(st)
+}
+
+// Decode the application error code `Stream.reset`/`Stream.stopSending` packed
+// into `cmd.data` as a varint — `quicconnCmd` has no second int field to carry
+// it alongside the stream id already in `cmd.id` — then flush immediately,
+// matching `quicconnDoWrite`/`quicconnDoFinish`: without this the queued
+// RESET_STREAM would only go out on the next tick (up to `quicconnTick`, 2ms,
+// later) instead of with the command that caused it.
+fn quicconnDoReset(st: quicconnState, cmd: quicconnCmd): ()! {
+  let code = decodeVarint(cmd.data)?
+  quicconnAbortSend(st, cmd.id, int(code))
+  quicconnFlush(st)?
+}
+
+// Ask the peer to stop sending on `cmd.id` (RFC 9000 §19.5). Only queues the
+// frame — this endpoint's own send side is untouched, since STOP_SENDING is
+// about what WE receive, not what we send; any effect on our sending happens
+// later, if the peer answers with its own RESET_STREAM (`quicconnAbortSend` via
+// the `StopSending` arm on their end, then `quicconnOnResetStream` back here).
+// Flushes immediately for the same reason `quicconnDoReset` does.
+fn quicconnDoStopSending(st: quicconnState, cmd: quicconnCmd): ()! {
+  if (st.present[cmd.id] == 0) {
+    return
+  }
+  let code = decodeVarint(cmd.data)?
+  st.aLevel.pending = append(st.aLevel.pending, Frame.StopSending(u64(cmd.id), code))
+  quicconnFlush(st)?
+}
+
+// Abandon the local send side of stream `id`: drop any not-yet-sent bytes,
+// unblock a concurrent `finish` (RFC 9000 §3.3 — an abandoned send stream never
+// drains, so a drain-waiter would otherwise wait forever), and queue
+// RESET_STREAM so the peer's `read` sees the abort too, rather than waiting on
+// data that will now never arrive. Shared by the app calling `Stream.reset`
+// directly and by receiving STOP_SENDING (RFC 9000 §19.5's MUST — an endpoint
+// told to stop sending answers with RESET_STREAM, copying the peer's error
+// code, which both callers already pass in as `code`). A stream already
+// aborted, or one whose FIN was already sent, is left alone.
+fn quicconnAbortSend(st: quicconnState, id: int, code: int) {
+  if (st.present[id] == 0) {
+    return
+  }
+  let s = st.streams[id]
+  if (s.sendAborted || s.finSent) {
+    return
+  }
+  s.sendAborted = true
+  if (s.hasDrain) {
+    s.hasDrain = false
+    s.drainCh <- -1
+  }
+  st.aLevel.pending = append(
+    st.aLevel.pending, Frame.ResetStream(u64(id), u64(code), u64(s.sendOff)),
+  )
 }
 
 // Apply a new idle timeout. `cmd.id` carries the nanosecond value; a value at or
