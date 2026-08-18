@@ -129,7 +129,9 @@ import {
   schedTaskExit, dqPushBottom, taskAt, taskWords, schedTaskOnStack,
   schedStackBytes, schedStackAligned, schedRegisterBigStack, wkDeque,
   schedSpawnTrampoline, taskSpawnEntry,
-  schedIdleArm, schedIdleDisarm, schedIdlePark, wkId, wkSleepReq,
+  schedIdleArm, schedIdleDisarm, schedIdlePark, idleSpinTurns, schedWorkPending,
+  schedFindWork,
+  wkId, wkSleepReq,
   wkLastDone, taskStackBase, taskStackBytes,
 } from "../../sched"
 // The netpoller provider (#1673). `runtime/sched` may not import it — epoll
@@ -451,6 +453,54 @@ const mainStackBytes: int = 8388608
   return base
 }
 
+// The idle worker's bounded userspace retry (#3260): up to `idleSpinTurns`
+// further find-work passes, returning the first task found, or 0 when the
+// budget runs out and the caller must go to the kernel. See "THE IDLE SPIN" in
+// `workerBody`'s comment below for why this exists and why it is sound; the
+// Darwin twin is identical, line for line.
+//
+// DECLARED ABOVE ITS CALLER ON PURPOSE: the inliner only splices a callee it has
+// already lowered, and lowering follows declaration order, so a definition below
+// `workerBody` would leave this as a real call on the idle path.
+//
+// The bound is the loop's own (Power of 10 rule 2): `idleSpinTurns` passes and
+// no more, whatever the scheduler is doing. It cannot lengthen `workerBody`'s
+// `WORKER_MAX_STEPS` budget either — the whole burst happens inside ONE turn of
+// that loop, so the trip count still advances once per turn exactly as before.
+//
+// `schedWorkPending` GATES EACH PASS, and it is not an optimisation — it is what
+// makes the spin worth having at all. A burst that called find-work
+// unconditionally took the global-queue spinlock, the timer lock and a CAS on
+// every peer's deque head on every turn, and measured 0.26s -> 0.45s at four
+// workers on the repro: the park syscalls went away and cache-line contention
+// with the worker that HAD the work replaced them. Reading first keeps a
+// spinning worker entirely in shared state until there is something to take.
+//
+// `@nosplit`, AND THAT IS THE SAFETY ARGUMENT, NOT A SPEED ONE (#1658). `addr`
+// here is a task address held as a raw `int` that no stack map names, so a
+// back-edge safepoint poll inside this loop is exactly the shape `test-pollfree`
+// exists to refuse — the collector would be free to run with that address live
+// and unreported. The annotation removes the poll mechanically instead of
+// claiming the property in a review list, and E0075 then proves every callee
+// has it too. It is what forces the callee below to be `schedFindWork` (the
+// `@nosplit` three-queue probe) rather than `schedFindWorkAt`, which is not
+// annotatable — no loss, since the timer expiry and the deadlock check it adds
+// are driven by the outer idle turn on both sides of this burst. It also costs
+// the burst its clock read, which a queue probe never needed.
+@nosplit fn spinForWork(w: *i64): int {
+  let k = 0
+  while (k < idleSpinTurns) {
+    k = k + 1
+    if (schedWorkPending(w)) {
+      let addr = schedFindWork(w)
+      if (addr != 0) {
+        return addr
+      }
+    }
+  }
+  return 0
+}
+
 // The worker OS-thread entry: unpack the {worker address, done-word address}
 // block `schedStart` armed, drive green tasks until shutdown, then clear the
 // done word so `joinWorker` observes the worker has left. TIMERS AND THE
@@ -517,6 +567,51 @@ const mainStackBytes: int = 8388608
 // `parkSleepNs` returns. `scStopping` is checked first and by hand, matching
 // `schedWorkerStep`'s own order, so a shutdown signalled while idle is still
 // seen within one backoff step rather than after a sleep starts.
+//
+// ---------------------------------------------------------------------------
+// THE IDLE SPIN (#3260) — kept identical in ../darwin/bootworker.bit
+// ---------------------------------------------------------------------------
+//
+// The loop below used to park after ONE failed find-work pass, and that is one
+// pass too few for the workload every blocking lock produces. `std/sync`'s
+// `Mutex.lock()` is `<- m.token` on a capacity-1 channel, so N green threads
+// serialise onto ONE runnable task: the instant a worker finishes a critical
+// section the runnable count is zero, and it is non-zero again microseconds
+// later when `unlock()` republishes the token. Parking into that gap charges
+// every handoff a full OS round trip — a `futex` wake from the releasing side, a
+// `futex` wait to re-park — so the cost per acquisition grew with the worker
+// count instead of staying flat (measured on the Darwin twin at 15.6 ns for one
+// worker, 406 ns for four, 1172 ns for eight, with 88% of thread time in
+// park/wake leaves; #2321).
+//
+// `spinForWork` above is the answer: one BOUNDED burst of extra find-work
+// passes, in userspace, before the kernel is involved at all. Three properties
+// make it safe rather than a return of the spin #1902 deleted:
+//
+//   - THE BUDGET IS RE-ARMED ONLY BY FOUND WORK, never by a park. A worker with
+//     nothing left to do spins exactly once and then sleeps, so an idle pool
+//     costs what it costs today — the measurement that pinned the worker
+//     default at 1 (`sleep(3s)` burning 0.84s of CPU at 18 workers) cannot come
+//     back through this path.
+//   - THE BURST DOES NOT `pollDrain`. That drain is an `epoll_wait` syscall, the
+//     very cost this is avoiding, and skipping it is already an outcome every
+//     caller handles: `schedPollTryEnter` admits one worker at a time, so
+//     "somebody else has it" is a normal return today. Worker 0 never parks and
+//     drains on every one of its own turns, so nothing stops being polled.
+//   - THE ARM STAYS SET THROUGH THE BURST, and no wake can be lost by it. A
+//     producer that claims a spinning worker spends its wake on a thread that is
+//     already awake and a `FUTEX_WAKE` with no waiter is a no-op — but the work
+//     was published BEFORE the claim (sleep.bit's arm order), so this worker's
+//     very next pass finds it without a syscall. If the burst runs out first,
+//     `schedIdlePark`'s own compare reads the claimed word as 0, not 1, and
+//     returns immediately rather than sleeping through the wake. The worst case
+//     is that a wake is absorbed by the worker that was going to take the task
+//     anyway.
+//
+// `schedCheckDeadlock` is reached through `schedFindWorkAt` here exactly as it
+// is on the outer turn, and its verdict cannot change with the number of passes:
+// it acts only at `nworkers == 1`, where the burst asks the same question the
+// outer turn just asked and gets the same answer.
 fn workerBody(arg: *byte): *byte {
   // ARM THIS THREAD'S CRASH DIAGNOSTIC FIRST (#2246, ./signal.bit): every
   // green task this worker will ever run executes below this line, so the
@@ -551,6 +646,10 @@ fn workerBody(arg: *byte): *byte {
   // keeps the netpoller and the timer queue driven with no new machinery, and
   // makes a wake this runtime forgets to send cost latency instead of a hang.
   let parks = *(w + wkId) != 0
+  // The spin budget (#3260, "THE IDLE SPIN" above). Starts false: a worker that
+  // has run nothing yet has no reason to believe work is moments away, and boot
+  // is exactly when N-1 workers find an empty scheduler.
+  let spin = false
   let n = 0
   while (n < WORKER_MAX_STEPS) {
     n = n + 1
@@ -570,21 +669,32 @@ fn workerBody(arg: *byte): *byte {
       if (atomicLoad(s + scStopping) != 0) {
         break
       }
-      gcBlockingBegin()
-      if (parks) {
-        schedIdlePark(s, w)
-      } else {
-        parkSleepNs(backoff, w + wkSleepReq)
+      // One bounded burst of userspace retries before the park — see "THE IDLE
+      // SPIN" above. Cleared FIRST, so the burst runs at most once per turn
+      // that found work, whichever way this turn ends.
+      if (spin && parks) {
+        spin = false
+        addr = spinForWork(w)
       }
-      gcBlockingEnd()
-      backoff = parkNextBackoff(backoff)
-      continue
+      if (addr == 0) {
+        gcBlockingBegin()
+        if (parks) {
+          schedIdlePark(s, w)
+        } else {
+          parkSleepNs(backoff, w + wkSleepReq)
+        }
+        gcBlockingEnd()
+        backoff = parkNextBackoff(backoff)
+        continue
+      }
     }
     // Running instead of parking: clear the arm so a producer does not spend
     // its one wake on a worker that is already busy.
     if (parks) {
       schedIdleDisarm(w)
     }
+    // Work found — re-arm the budget for the next idle stretch (#3260).
+    spin = true
     backoff = schedWorkerStepAt(w, addr, woke, backoff)
     // TEARDOWN (#2167). `schedWorkerStep`, inside `schedWorkerStepAt`, already
     // unregistered the retired task from the collector's root set before
