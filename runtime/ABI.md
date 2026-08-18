@@ -874,6 +874,21 @@ worker would hold up every collection for the length of its sleep. Calling it
 around a region that *does* hold references is a collector bug — the references
 are invisible and will be swept.
 
+**The boot thread (#1660; the ABI names confirmed by #2542, not duplicated).**
+The OS thread that runs `boot` is itself a registered mutator, not exempt from
+the rendezvous. Its wait for `main` to finish — an exponential-backoff
+`parkSleepNs` loop — must bracket the sleep, and only the sleep, with
+`bit_rt_gc_blocking_begin` immediately before it and `bit_rt_gc_blocking_end`
+immediately after: the same pair the `blocked` contract above already names, no
+separate boot-specific primitive exists or is needed. Across that bracket it
+must hold no live Bit reference in any frame, because the collector does not
+scan a blocked thread's stack — the precondition holds because `boot` allocates
+nothing on the managed heap before `main` starts, so everything live across the
+wait is a scalar or a raw pointer into module state, never a heap reference. The
+two call sites are `runtime/root/darwin/boot.bit`'s step-7 loop and, on Linux,
+`runtime/root/linux/boottail.bit`'s (the same loop, split out of
+`runtime/root/linux/boot.bit` by #2882).
+
 **The `syscall` contract (#1904).** `bit_rt_gc_syscall_begin` / `_end` bracket a
 region in which the calling thread blocks in the kernel **while still holding
 live Bit references**. It is the state `blocked` cannot express and `running`
