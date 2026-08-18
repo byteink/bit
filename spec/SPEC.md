@@ -3031,6 +3031,62 @@ and no field in `bit.json` that names one — a fetched manifest is never
 scanned for, or permitted to run, arbitrary code during `add`/`up`/`remove`
 or any other resolution step.
 
+### 17.8 Documentation
+
+`bit doc [--json] [--fields] <module-dir>` prints a module's exported surface,
+derived from the same export table and inferred signatures the checker builds —
+never from a hand-maintained page. The operand must be a **directory**; naming a
+single `.bit` file is rejected (`bit doc: not a module: <path>`, exit 1), unlike
+`bit build`/`bit run`, which accept the single-file module of §17.1. The module
+must resolve and typecheck cleanly before any symbol is printed: exit code is
+`0` on success; on failure `bit doc` prints diagnostics to stderr, exactly as
+`bit build`/`bit check` do, and prints no symbols at all.
+
+Only **exported** symbols (§17.3) appear — an exported type's unexported methods
+are omitted. Symbols are sorted by name, bytewise, in one global order: a
+method's name, for both sorting and printing, is `Recv.member`, so it
+interleaves with types, functions and consts rather than being grouped under
+its receiver.
+
+Each symbol's `kind` is one of `function`, `method`, `const`, `struct`, `enum`,
+`interface`, `type`. `params` is the symbol's own written generic parameter
+list — angle-bracketed, `", "`-separated (`<T>`, `<T, E>`) — or empty when it
+declares none; a method's `params` is always empty, since its receiver's own
+line already carries the receiver's parameters.
+
+**Plain form** (the default) prints one line per symbol. A named-type
+declaration (`struct`/`enum`/`interface`/`type`) prints `<kind> <name><params>`;
+every other symbol prints `<kind> <name><params> <type>`:
+
+```
+enum Option<T>
+struct Point
+function unwrapOr<T> (Option<T>, T) => T
+method Reader.readAll () => string
+const pi f64
+```
+
+**`--json`** prints a `[ ... ]` array, one object per line, with keys in this
+exact order: `name`, `kind`, `params`, `type`:
+
+```json
+[
+  {"name": "Option", "kind": "enum", "params": "<T>", "type": "Option<T>"},
+  {"name": "unwrapOr", "kind": "function", "params": "<T>", "type": "(Option<T>, T) => T"}
+]
+```
+
+`name` never carries the parameter list; it is the bare declared name or
+`Recv.member`, with `params` reported as its own key.
+
+**`--fields`** (off by default) additionally reports each exported struct's own
+fields, in declaration order, as the extra kind `field` with name `Recv.field`
+(for example `Point.x`); it changes neither form's shape for a module whose
+structs report no fields this way.
+
+Neither form prints documentation comments: a `//` line written directly above
+a declaration is source-only and is not part of `bit doc`'s output.
+
 ---
 
 ## 18. Error Handling
