@@ -560,6 +560,76 @@ Splitting can also make a test **vacuous rather than failing**: any gate that
 names a single source path will keep scanning the remnant. Point such gates at a
 directory and error on finding zero sources.
 
+## ARM64 crypto acceleration
+
+**There is no ARM64 crypto acceleration in this tree, and no `BIT_CRYPTO_HW`
+switch. Both were ticket premises that turned out false — verified against
+`runtime/`, `stdlib/`, `compiler/` and confirmed by running the KAT tests,
+not assumed.** Read this section as "what actually exists today", not as a
+description of an intention.
+
+**What the hardware-crypto ABI names actually are.** `runtime/ABI.md` §21b
+documents three probes and five compute primitives under the bare
+`bit_rt_crypto_*` ABI name (task #1223, extended by #1811):
+`bit_rt_crypto_{aes,ghash,sha256}_hw_available() -> bool` and
+`bit_rt_crypto_{aes_encrypt,aes_decrypt,aes_invert_schedule,ghash_mul,sha256_compress}_hw`.
+Their scope is **x86-64 AES-NI / PCLMULQDQ / SHA-NI**, gated at run time via
+`cpuid`/`xgetbv` — nothing ARMv8, nothing NEON. `stdlib/crypto/{aes,gcm,sha256}.bit`
+call the three `_hw_available` probes and branch on the result before taking
+either path.
+
+**The single implementation, `runtime/cryptohw/cryptohw.bit` (81 lines), backs
+every target identically and is explicit about being a stub:** its own header
+calls the bodies "ABI-MEMBERSHIP PLACEHOLDERS, not a port." The three
+`*_hw_available` providers are a hardcoded `return false`, unconditionally, with
+no `@target` gating — `x86_64-linux`, `aarch64-linux` and `aarch64-macos` all
+link the same false-returning function. The five compute providers each
+`panic()` immediately if called, which the dispatch above prevents from
+happening in practice, since every caller checks the (always-false) probe
+first.
+
+**Consequences for ARM64 specifically:** there is no ARMv8 crypto-extension
+code path anywhere in `runtime/` or `stdlib/crypto/`. Grepping the whole tree
+for `getauxval`, `AT_HWCAP`, `sysctlbyname`, `FEAT_AES` and `NEON` turns up
+nothing under `runtime/cryptohw/` or `stdlib/crypto/` — the handful of hits
+elsewhere (`runtime/auxv/`, `runtime/thread/linux/`, `compiler/machosyms.bit`)
+are unrelated auxv/TLS/symbol-table code, not crypto detection. So: no
+`getauxval(AT_HWCAP)` read on aarch64-linux, no
+`sysctlbyname("hw.optional.arm.FEAT_AES")` (or its siblings) on aarch64-macos.
+AES, GHASH and SHA-256 run through the constant-time software path on ARM64
+today, the same as on every other target.
+
+**There is no `BIT_CRYPTO_HW` anywhere — not in code, not in a comment, not
+even as a documented-but-unimplemented intention.** The nearest real thing is
+`BIT_CRYPTO_NO_HW`, named once, in `runtime/ABI.md` §21b's prose, as what the
+still-unbuilt x86-64 hardware path is *supposed* to read once it exists
+(`BIT_CRYPTO_NO_HW=1` forcing every `_hw_available` false for fallback
+testing). `BIT_CRYPTO_NO_HW` is not read by any `.bit` file either — the
+`_hw_available` providers ignore the environment entirely and always return
+`false`, so the variable currently has no effect regardless of value or name.
+
+**Verified by running the existing KAT suites, not by reading the source
+alone.** `tests/imports/{cryptoaes,cryptogcm,cryptosha256}` (which exercise
+`hwAvailableAes`/`hwAvailableGhash`/`hwAvailableSha256` directly) were run
+unset, `BIT_CRYPTO_HW=0`, `BIT_CRYPTO_HW=1`, and `BIT_CRYPTO_NO_HW=1` on
+aarch64-macos. Every run: `hwAvailable*() == false`, and stdout matched each
+suite's golden `expected` file byte-for-byte in all four cases — the switch is
+provably a no-op under every name and every value tried, not merely unlikely
+to matter.
+
+**Practical fallout, worth knowing before writing a "test both hardware
+settings" ticket:** since every setting drives the identical software-only
+branch, there is currently only one code path to test on any target. A KAT run
+"under both `BIT_CRYPTO_HW` settings" cannot exercise two different
+implementations until the x86-64 hardware path in #1223 is actually built
+(§21b's own header: "ABI-membership placeholders, not a port") — before that,
+running it twice proves the same branch twice.
+
+**ChaCha20 with NEON is not a deferred ARM64 item either.** §21b does mark
+"ChaCha20/Poly1305 SIMD acceleration" as an explicit follow-up, but scoped to
+the same x86-64 SIMD work as the rest of that section. There is no NEON
+anything — accelerated or deferred — anywhere in this codebase today.
+
 ## Two names that used to mean something else
 
 Old notes and tickets will mislead you:
