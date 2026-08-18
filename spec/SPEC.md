@@ -2829,6 +2829,17 @@ example:
   resolution time; or
 - a bare commit SHA (full 40-character hex), resolved to exactly that commit.
 
+**A branch pin is validated once, at resolution time.** Resolving a branch
+ref — the second form above — dereferences it to its current tip only during
+`bit add` or `bit up`; a subsequent build never repeats that step. `bit.lock`
+records only the resolved `commit` (below), never the branch name itself, so
+once resolution is over nothing on disk remembers the pin was a branch at
+all: `bit build`/`run`/`test`/`check` read that commit and never re-query the
+remote, and a branch that has moved since resolution is not reported. A
+project that wants a dependency to be reproducible, or its drift checkable,
+pins a version constraint or a bare commit SHA instead — either is fully
+determined by what `bit.lock` already records.
+
 **Version constraints.** A version constraint names a plain
 `MAJOR.MINOR.PATCH` — no `v` prefix — under exactly one of three forms:
 
