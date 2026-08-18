@@ -297,11 +297,14 @@ value `0`, distinguishable from every failure.
 overflow and underflow are correctly-rounded conversion results, not parse
 failures.
 
+A named `import { parseFloat }` warns with `E0048`, since `parseFloat` is also
+a predeclared identifier (SPEC §5.3); use the namespace form to avoid it.
+
 ```bit
-import { parseFloat } from "std/strings"
+import * as strings from "std/strings"
 
 // Parse a money column, rejecting anything that is not a real number.
 fn parseAmount(field: string): f64! {
-  return parseFloat(trimSpace(field))
+  return strings.parseFloat(strings.trimSpace(field))?
 }
 ```
