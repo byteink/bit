@@ -1253,6 +1253,7 @@ defined exactly once).
 | `bit_rt_fs_is_dir`    | `(path: *const RtBytes) -> bool` (§14)                  |
 | `bit_rt_fs_mkdir`     | `(path: *const RtBytes) -> i64` (§14)                   |
 | `bit_rt_fs_remove`    | `(path: *const RtBytes) -> i64` (§14)                   |
+| `bit_rt_fs_rename`    | `(oldPath: *const RtBytes, newPath: *const RtBytes) -> i64` (§14) |
 | `bit_rt_fs_list_dir`  | `(path: *const RtBytes) -> *const RtBytes` (§14)        |
 | `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not NUL-terminated, not `RtBytes`; the only `bit_rt_fs_*` entry point shaped this way) |
 | `bit_rt_test_index`   | `() -> i64` (§16)                                      |
@@ -1622,6 +1623,7 @@ bit_rt_fs_exists(path)            -> bool
 bit_rt_fs_is_dir(path)            -> bool
 bit_rt_fs_mkdir(path)             -> i64        // 0, or -1
 bit_rt_fs_remove(path)            -> i64        // file or empty dir; 0, or -1
+bit_rt_fs_rename(oldPath, newPath) -> i64       // 0, or -1
 bit_rt_fs_list_dir(path)          -> string     // NUL-terminated entry names
 bit_rt_fs_is_symlink_w(words, n)  -> bool        // path is a symlink itself (readlink-based)
 ```
