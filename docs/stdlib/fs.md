@@ -139,6 +139,12 @@ Creates a directory. Fails if the parent does not exist or the name is taken.
 
 Removes a file, or an **empty** directory.
 
+### `rename(oldPath: string, newPath: string): ()!`
+
+Renames (moves) `oldPath` to `newPath`. POSIX semantics: if `newPath`
+already exists it is replaced atomically — that is success, not a
+failure. Fails if `oldPath` does not exist.
+
 ### `readDir(path: string): []string!`
 
 The names directly inside `path`, without `.` or `..`, in no guaranteed order.
