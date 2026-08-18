@@ -1,0 +1,123 @@
+// Preemption state for the M:N scheduler (#1768's remaining half): a green
+// thread that never reaches a safepoint runs until it finishes and starves
+// every other task on its worker. This file holds the STATE and the PURE
+// LOGIC a safepoint check and a monitor thread need to fix that -- nothing
+// here is called yet.
+//
+// WHY NOTHING CALLS THIS YET, ON PURPOSE (#1768's remaining children):
+//   #2577 calls `maybePreempt` at the scheduler's existing safepoint check.
+//   #2578 calls `preemptStamp` on task dispatch.
+//   #2579 / #2580 boot the sysmon OS thread (darwin / linux) that drives
+//     `sysmonTick` off a real clock.
+// This ticket does none of that -- splitting it out this way means the clock
+// source, the safepoint wiring and the dispatch wiring can each be reviewed
+// and landed against a state module that is already fixed.
+//
+// NO OS CALLS HERE. `sysmonTick` takes `nowNs` as a parameter rather than
+// reading a clock itself, so this file makes no kernel trap and declares
+// nothing foreign.
+//
+// Base-pointer arithmetic and deref rather than `startNs[worker]`: indexing
+// is forbidden in a `@nosplit` body (E0075 -- see `queue.bit`'s comment on
+// the same trade), and every function here is `@nosplit` so a `@nosplit`
+// safepoint check can call `maybePreempt` directly once #2577 wires it in --
+// a `@nosplit` body may only call other `@nosplit` functions.
+
+// A task that has held its worker longer than this many nanoseconds gets a
+// preempt request the next time `sysmonTick` runs. 10ms.
+export const preemptBudgetNs: i64 = 10000000
+
+// This file's own array capacity -- the number this file actually trusts for
+// its own scan bound. MUST equal the literal length of `startNs`/`requested`
+// below, and cannot instead size those arrays directly (`let a: [N]i64`
+// requires `N` to be a literal, not a name -- E0021, the same constraint
+// `runtime/root/root.bit`'s `gcState`/`heapBlock` document for `gcWords` and
+// `heapWords`).
+//
+// Deliberately a SEPARATE constant from `sleep.bit`'s `schedMaxWorkers`
+// rather than reusing it, even though both are 32 today. `schedMaxWorkers` is
+// ADVISORY from this file's point of view: it says how many workers the
+// scheduler currently intends to run, not how many slots these arrays
+// actually have. If `schedMaxWorkers` is ever raised without these arrays
+// (and this constant) growing to match, `sysmonTick`'s loop below is bounded
+// by BOTH -- the same double-bound shape `sleep.bit`'s own `schedWakeIdle`
+// already uses to guard the identical class of drift between a live count
+// and a fixed array -- so it clamps to `preemptSlots` and simply stops
+// covering the extra workers rather than reading or writing past the arrays.
+// A missed preempt request on the un-covered workers, not a corrupted one:
+// every access here is raw `ptrOf(base) + worker` deref inside `@nosplit`
+// with no bounds check, so a loop bound that could ever exceed the arrays'
+// real size is the actual hazard, and this is what closes it.
+const preemptSlots: int = 32
+
+// `startNs[w]` is the `nowNs` value `preemptStamp` last recorded for worker
+// `w`, or 0 if `w` has no task in flight -- either it was never stamped, or a
+// later stamp cleared it. `requested[w]` is nonzero once `sysmonTick` has
+// observed `w` over budget, and stays set until `maybePreempt` clears it.
+// Fixed globals; nothing here is allocated at run time.
+let startNs: [32]i64
+let requested: [32]i64
+
+// `worker` must be `< preemptSlots` -- callers get that for free today
+// because the scheduler never hands out a worker id past `schedMaxWorkers`
+// (`sleep.bit`), which is in turn never above `preemptSlots` (see the
+// constant's own comment for what protects that). Not exported: used only
+// within this file, the same shape as `sleep.bit`'s own `workerParkAddr`.
+@nosplit fn slotAddr(base: *i64, worker: i64): *i64 {
+  return base + worker
+}
+
+// Record that `worker` just picked up a new task at `nowNs`, and drop any
+// preempt request left over from whatever ran on `worker` before it -- a
+// freshly dispatched task must not inherit a stale flag from its
+// predecessor.
+export @nosplit fn preemptStamp(worker: i64, nowNs: i64) {
+  atomicStore(slotAddr(ptrOf(startNs), worker), nowNs)
+  atomicStore(slotAddr(ptrOf(requested), worker), 0)
+}
+
+// Scan every worker slot and flag any that has held its task past
+// `preemptBudgetNs`. Bounded by `schedMaxWorkers` AND `preemptSlots` --
+// `preemptSlots` is the one that actually matters for safety here: it is
+// this file's own array capacity, so the scan can never run past
+// `startNs`/`requested` even if `schedMaxWorkers` (advisory only from this
+// file's point of view; see `preemptSlots`'s comment) drifts ahead of it.
+// Both are compile-time constants, so the loop's limit is provable from its
+// own body (Power of 10) regardless of either changing independently.
+//
+// A slot at 0 is skipped rather than read as "started at time zero" --
+// `preemptStamp` is the only writer of a nonzero value, so 0 means no task
+// is currently dispatched on that worker.
+//
+// Returns the number of workers that met the over-budget condition this
+// call, whether or not their flag was already set from an earlier tick.
+export @nosplit fn sysmonTick(nowNs: i64): i64 {
+  let count: i64 = 0
+  let w: i64 = 0
+  while (w < schedMaxWorkers && w < preemptSlots) {
+    let started = atomicLoad(slotAddr(ptrOf(startNs), w))
+    if (started != 0 && nowNs - started > preemptBudgetNs) {
+      atomicStore(slotAddr(ptrOf(requested), w), 1)
+      count = count + 1
+    }
+    w = w + 1
+  }
+  return count
+}
+
+// Read the flag without clearing it.
+export @nosplit fn preemptRequested(worker: i64): bool {
+  return atomicLoad(slotAddr(ptrOf(requested), worker)) != 0
+}
+
+// Report whether `worker` has a pending preempt request, and clear it in the
+// same call. This function only REPORTS -- it is the caller's job, at its own
+// safepoint, to actually yield to the scheduler. Nothing here touches a task,
+// a stack, or the collector's stop-the-world rendezvous.
+export @nosplit fn maybePreempt(worker: i64): bool {
+  if (atomicLoad(slotAddr(ptrOf(requested), worker)) == 0) {
+    return false
+  }
+  atomicStore(slotAddr(ptrOf(requested), worker), 0)
+  return true
+}
