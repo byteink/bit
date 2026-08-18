@@ -52,11 +52,10 @@ changes the spec **in the same commit**, not afterwards.
 3. **The differentials agree.** The pinned previous release is the oracle: this
    tree's compiler must produce byte-identical AST/type/IR dumps over the corpus
    (`scripts/selfhost-diff*.sh`). A divergence is a change that is not finished
-   -- except a small number of exact, named STAGE0-PINLAG entries for a real
-   behaviour change the pinned stage0 cannot yet reflect
-   (`selfhost-diffdump.sh`'s `PINLAG_FILES` and `selfhost-diffruntime.sh`'s
-   `PINLAG_MODULES`, both currently empty); those are deleted at the next
-   stage0 repin, not amended.
+   -- except when a real behaviour change outruns the pinned stage0: a
+   temporary, exact, named STAGE0-PINLAG accept list may be introduced for
+   it, and it is deleted at the next stage0 repin, not amended. There is no
+   live entry today; the mechanism exists for the next time this happens.
 4. **Files stay under 800 lines** (target ~500). Split by moving top-level
    blocks into sibling `.bit` files in the same directory - not into
    subdirectories, which would make a new module.
