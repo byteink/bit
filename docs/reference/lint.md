@@ -196,9 +196,63 @@ the override *is* the record, sitting next to the code it describes.
 
 Prefer fixing over stamping for `unused-import`/`unused-local`: a dead
 import or a leftover binding should be deleted, not excused with a comment.
-Reach for `disable` only for a rule like `append-aliasing`, which knowingly
-cannot always tell an owned slice from a borrowed one - there the judgement
-call is real and a stamped reason is the right way to record it.
+For `append-aliasing`, prefer the narrower per-finding `allow` below over a
+file-wide `disable` - it silences only the call site actually reviewed, not
+every genuine hit elsewhere in the file.
+
+### Per-finding overrides: `allow` (E0297)
+
+The forms above are file-scoped. A second, narrower form silences exactly
+**one finding**: `// bit:lint allow <CODE> -- <reason>`, placed on the line
+directly above the finding it targets.
+
+```bit
+fn leak(buf: []int, x: int): []int {
+  // bit:lint allow E0214 -- buf is owned entirely by this function, never returned
+  let r = append(buf, x)
+  return r
+}
+```
+
+It exists for rules that are not always distinguishable from the AST -
+`append-aliasing` (E0214) is the motivating case. Disabling that rule for a
+whole file would also blind it to every genuine aliasing bug elsewhere in the
+same file; `allow` silences only the one call site the author reviewed.
+
+It differs from the file-scoped forms in every dimension that matters:
+
+- **Placement.** Recognised anywhere in the file, not only the leading
+  comment block - on the line immediately *above* the finding. One line below
+  is not enough, and it is never reported as a misplaced directive (that
+  check is specific to the file-scoped forms).
+- **Target.** Named by diagnostic code (`E0214`), not rule name - the string
+  already printed on the finding, copy-pasteable from the terminal. The code
+  must match the finding directly below it exactly; a directive naming a
+  different (but otherwise valid) code, or sitting above a line with no
+  matching finding at all, is silently inert, not an error.
+- **Scope.** Only rules with no numeric limit accept `allow` - the five
+  threshold rules (`max-file-lines`, `max-fn-lines`, `max-params`,
+  `max-nesting`, `max-complexity`) are excluded. A per-line escape hatch
+  there would undo the reason those rules are file-scoped: the cost of a
+  file-wide override is what makes splitting the offending function or file
+  the cheaper path.
+- **Reason floor.** At least 10 characters after trimming - stricter than the
+  file-scoped forms' bare non-empty check, because `allow` is meant to be
+  stamped roughly once per call site across a sweep, exactly where a
+  placeholder like `"x"` would otherwise pass unnoticed.
+- **Malformed `allow`.** An ineligible or unregistered code, a missing `--`,
+  or a reason under 10 characters is reported as an ordinary finding, code
+  **E0297**, not through the exit-2 hard-error path the file-scoped forms
+  use - a broken `allow` in a hundred-site sweep must not blank out the other
+  ninety-nine findings. The finding a broken `allow` was aimed at is never
+  suppressed by the attempt. A bare `// bit:lint allow` with nothing after it
+  is not a directive at all: it suppresses nothing and is not itself a
+  finding.
+
+A valid, matching `allow` counts toward the `overrides active` summary the
+same as a file-scoped override in force. `--stats` does not enumerate
+individual `allow` directives - it stays scoped to the file-scoped `<rule>=<n>`
+/`disable` forms it always covered.
 
 ## Editor and CI integration
 
