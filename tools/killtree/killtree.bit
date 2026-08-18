@@ -1,0 +1,109 @@
+// The shared shell text for the "kill a timed-out child's whole descendant
+// tree" mechanism, factored out of `tools/build/gates.bit` and
+// `tests/bit/importsrun.bit` (#3238) after #3227/#3231 and #3236/#3237 each
+// fixed the SAME bug twice in one day — once in each of those two
+// independently-maintained copies, both found by luck rather than by any
+// mechanical check.
+//
+// WHY THIS IS ITS OWN DIRECTORY, importable from neither `tools/build/` nor
+// `tests/bit/`: a Bit import is per-MODULE, not per-file (SPEC §17.1 — a
+// module is a directory of `.bit` files sharing one namespace), so importing
+// a name FROM `tools/build/gates.bit` would drag in that whole module's
+// `import { envOr } from "std/os"` too. `tests/bit/importsrun.bit`'s own
+// header says why that is fatal for it: "this file deliberately uses only
+// universe builtins ... and no `std/*` import, so it runs under a bare
+// `bit run` with no BIT_STDLIB needed to compile the harness itself." A
+// nested `tests/bit/killtree/` (the shape `tests/bit/docsrunner/` already
+// uses for `docs.bit`) would dodge that specific poisoning — a subdirectory
+// is its own module, not swept into its parent's — but it would still read
+// as "the build driver depends on the test harness's own directory", the
+// same inverted-ownership objection #3231 raised against importing
+// `gates.bit` directly, just aimed the other way. This directory is a
+// SIBLING of both, owned by neither, and imports nothing itself — so nothing
+// that imports from here can inherit a transitive dependency it didn't
+// already have.
+//
+// Both call sites still choose their OWN emission granularity — this module
+// only supplies the text. `gates.bit` writes `killTreeFnDef()` once per
+// concurrent gate-batch chunk script, shared across every gate unit in it
+// (`batchScript`); `importsrun.bit` bakes it into every standalone per-case
+// `compile.sh`/`run.sh` script, since each of those is a separate `/bin/sh`
+// process with no common parent to hold one shared definition. Sharing the
+// producer function does not require sharing the insertion point.
+
+// #3066: a deadline-triggered `kill -9 "$pid"` only ever killed that one
+// PID — a command that forks a subtree (`test-imports-bit`'s own
+// `find | xargs -P` fan-out is the clearest case in this repo) left every
+// live descendant running orphaned, bounded only by ITS OWN deadline rather
+// than the one that fired. `killtree()` walks the target PID's descendants
+// by PPID via `pgrep -P` and kills each one individually, instead of
+// `kill`ing a process GROUP — process groups were tried and rejected:
+// giving a child its own group (`set -m`) is exactly what makes it
+// unreachable from the runtime's own process-group backstop
+// (`osForkExecWaitBounded`'s `osKillGroup`, `runtime/root/*/os.bit`, which
+// already puts every descendant of the whole calling script into one
+// shared group). A PPID walk touches no process group at all, so it cannot
+// narrow that backstop's reach.
+//
+// The walk snapshots BEFORE killing the root PID (a dead/reaped PID has no
+// queryable children — verified: querying after the kill returned an empty
+// tree while the real descendants were already reparented to pid 1), then
+// kills every discovered PID together. Depth is capped at 20 (Power of 10
+// rule 2); real trees here are a handful of levels deep.
+//
+// THREE full walks before any kill, not one: a continuously-respawning
+// `xargs -P` wave keeps starting a new child the instant an old one
+// finishes, so a child that begins mid-walk is invisible to a single pass —
+// verified directly, a live grandchild survived a one-pass version because
+// its own parent had already been killed by the time the pass discovered it
+// existed. Nothing is killed until every round is done, so the ancestor
+// chain stays intact for each re-walk and a late spawn is still reachable
+// from the root PID.
+export fn killTreeFnDef(): string {
+  return "killtree() {\n" +
+    "  root=\"$1\"\n" +
+    "  tree=\"\"\n" +
+    "  round=0\n" +
+    "  while [ \"$round\" -lt 3 ]; do\n" +
+    "    frontier=\"$root\"\n" +
+    "    depth=0\n" +
+    "    while [ -n \"$frontier\" ] && [ \"$depth\" -lt 20 ]; do\n" +
+    "      kids=$(pgrep -P \"$(printf '%s' \"$frontier\" | tr '\\n' ',')\" 2>/dev/null)\n" +
+    "      if [ -z \"$kids\" ]; then break; fi\n" +
+    "      tree=\"$tree $kids\"\n" +
+    "      frontier=\"$kids\"\n" +
+    "      depth=$((depth + 1))\n" +
+    "    done\n" +
+    "    round=$((round + 1))\n" +
+    "  done\n" +
+    "  for kp in $root $tree; do kill -9 \"$kp\" 2>/dev/null; done\n" +
+    "}\n"
+}
+
+// #3236: `killtree()`'s BFS loop (`kids=$(pgrep -P ... 2>/dev/null)`) cannot
+// tell "pgrep is not installed" (exit 127) apart from "no descendants" (exit
+// 1, also empty stdout) — both leave `kids` empty, so a host missing `pgrep`
+// silently degrades to killing only the deadline-triggered PID itself, not
+// its subtree (#3230 was exactly this, on the linux gate image before it
+// gained `procps`).
+//
+// Warn, not refuse: `killtree` firing is already the failure path (something
+// blew its own deadline), and whatever it fails to reap without `pgrep` is
+// still caught by the caller's own OUTER backstop — later than immediately,
+// but never orphaned forever. Refusing over a capability only the timeout
+// path needs would stop well-behaved work for no reason.
+//
+// `unitWord` names what timed out ("gate" in `tools/build/gates.bit`, "case"
+// in `tests/bit/importsrun.bit`); `boundWord` names the caller's own outer
+// backstop ("the outer batch timeout" there, "the outer run bound" here) —
+// the two callers' message text differed only in these two spots plus a
+// ticket-number suffix naming whichever of #3236/#3237 found the gap in that
+// copy, which is dropped here rather than parameterized: a shared function
+// citing one specific discovery ticket would be equally wrong for the other
+// caller, and neither ticket number is load-bearing for a reader acting on
+// the warning.
+export fn pgrepPreflightScript(unitWord: string, boundWord: string): string {
+  return "if ! command -v pgrep >/dev/null 2>&1; then\n" +
+    "  echo \"make: WARNING: pgrep not found on PATH -- killtree() can only kill a timed-out " + unitWord + "'s own PID, not its descendants, until " + boundWord + " reaps them (install procps or equivalent)\" >&2\n" +
+    "fi\n"
+}
