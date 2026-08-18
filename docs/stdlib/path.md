@@ -80,3 +80,22 @@ fn fileName(p: string): string {
   return base(p)
 }
 ```
+
+### `clean(p: string): string`
+
+`p`, normalized: runs of `/` collapse to one, `.` elements are dropped, and
+each inner `..` cancels the non-`..` element before it. A `..` that would
+climb above a rooted path's `/` is dropped instead. The result never ends in
+`/` unless it is the root, and an empty result becomes `"."`.
+
+```bit
+import { clean } from "std/path"
+
+fn normalize(p: string): string {
+  return clean(p)
+}
+
+fn sameLocation(a: string, b: string): bool {
+  return clean(a) == clean(b)
+}
+```
