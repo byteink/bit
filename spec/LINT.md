@@ -131,7 +131,7 @@ step over a meta-code.
 | E0200–E0289 | lint rules (§4) |
 | E0297 | per-finding `allow` override is malformed, ineligible, or its reason is too short (§5.5) |
 | E0298 | override directive names an unknown rule |
-| E0299 | override directive is malformed, or its reason is missing or empty |
+| E0299 | override directive is malformed, its reason is missing or empty, or it is well-formed but placed outside the leading comment block (§5.2) |
 
 ### 3.1 Why the `E` registry and not a distinct `L%04d` (settled, #1378)
 
@@ -234,6 +234,21 @@ These need scope and symbol information and land after phase 1.
 
 (E0212 `unreachable-code` is numbered in this block but requires no resolver;
 see phase 1 above, where it is actually implemented.)
+
+**`unused-import` (E0210) is scoped to the MODULE, not the file being linted**
+(#2284) — a directory of sibling `.bit` files sharing one flat import
+namespace, matching [compiler/project.bit](../compiler/project.bit)'s
+`SrcModule` contract: the same scope the binder already uses for cross-file
+name resolution, and the reason #2121's E0042 "already declared in this
+scope" fires across sibling files at all. An import used only by a sibling
+file in the same module is not reported — the finding's own suggested fix is
+"remove the import", and removing one a sibling genuinely needs would break
+the build. This module view applies only when the file was reached by a
+directory walk (§2); a file named directly on the command line is its own
+singleton module, so an import unused in that file is reported regardless of
+what any neighbour does. `unused-local` (E0211) needs none of this: a
+function-local `let`/`const` cannot be read from another file, so its scope
+was already correct at plain function scope, file boundaries notwithstanding.
 
 `shadowed-local` closes a real gap: the resolver warns on shadowing a
 *predeclared* name ([compiler/resolve.bit](../compiler/resolve.bit)) but says
@@ -412,6 +427,16 @@ directive naming an unknown rule is likewise an error — otherwise a renamed
 rule turns every existing override into a silent no-op, and files that were
 green because of an override would start failing for reasons no one can see
 in the diff.
+
+**A well-formed directive found after the leading block ends is not silently
+accepted as an ordinary comment either.** Every rule's own fix hint is
+rendered at the *offending construct's* span, the strongest possible signal of
+where the directive belongs — and outside the leading block is the one
+placement that never applies it. `bit lint` reports it as a hard error (exit
+2, `E0299` — the same code a malformed directive uses, §3), pointing at the
+misplaced `// bit:lint` line and naming the fix: move it into the leading
+block. The per-finding `// bit:lint allow ...` form (§5.5) is exempt from this
+check — it is recognised anywhere in the file and has its own placement rule.
 
 **"Unknown" means not registered, which includes not yet implemented.** A rule
 enters the registry with its check function, so an override for a rule that has
