@@ -261,67 +261,69 @@ grep -c '^warning\[E0204\]' "$LOG"   # must be 0
 # candidate raise: confirm the function is absent from this file's E0203 findings
 ```
 
-## E0212 `unreachable-code` — MOSTLY A CHECKER GAP: FILE IT, THEN `allow` UNTIL IT LANDS
+## E0212 `unreachable-code` — FIX (it is real dead code, not a checker gap)
 
 > `unreachable code`
 > hint: `line ${n} always diverts control; nothing after it in this block runs`
 
-**This finding set is not what it looks like. Investigated, not assumed.**
-Sampling shows compiler's 112 findings are 111-of-112 concentrated in eight
-`*check.bit` self-test files (`pmcliaddedgecheck.bit`, `pmfetchresolvecheck.bit`,
-`pmfetchcheck.bit`, `pmclicheck.bit`, `pmzclicheck.bit`, `projectcheck.bit`,
-`pmclichecktail.bit`, `machoexeccheck.bit`), every one the same shape:
+**#2439 documented this rule set under the wrong theory, and #3211 disproved it
+empirically rather than by argument.** The claim this section used to make was
+that two shapes were structurally forced on the author — the checker itself
+supposedly required a trailing filler statement that E0212 then flagged as
+dead, making this "mostly a checker gap" pending a rule change. That is false.
+Both shapes compile fine with the filler deleted, in the tree as it exists
+today. #3211 deleted the filler statements outright: 112 in `compiler/`
+(`b172585e`) and 12 in `stdlib/` (`c4e63d81`) — not because a rule changed, but
+because the code really was unreachable and always had been.
 
-```bit ignore
-let x = someFallibleCall(...) catch e {
-  panic("...")
-  <dummy value of the tried expression's type>
-}
-```
+**Why the two can never actually disagree.** E0212 is not a second,
+independently-invented divergence check — `lintUnreachableCode`
+(`compiler/lintapply.bit:388-399`) reuses the exact same `vDiverges`/
+`vBlockDiverges` analysis (`compiler/validatestmt.bit`) that `bit check` itself
+uses for E0055 missing-return and for catch-block completeness. The comment at
+the call site says why: *"A second, hand-rolled divergence check would
+disagree with the checker's on some construct and report a finding on code the
+checker itself considers fine."* Because both consumers run the identical
+predicate, nothing the checker treats as "control cannot fall through here" can
+ever be a case E0212 gets wrong — so a trailing statement after such a point is
+never checker-mandated. The two shapes:
 
-The trailing value is unreachable at runtime — `panic` never returns — but the
-`catch` block must still type as an expression yielding the tried call's
-type, so the author writes a filler value the checker requires and E0212's
-own (correctly stricter) divergence analysis then flags as dead. `stdlib`'s 12
-findings are the sibling shape: a trailing `return <dummy>` after a loop whose
-only exits are internal `return`s, needed because `bit check`'s own
-missing-return analysis (E0055) does not recognize that loop shape as
-exhaustive. Two of the twelve are self-documented in the source as exactly
-this (`stdlib/crypto/rand.bit:50 // unreachable: the loop exits only by
-returning`, `stdlib/io/io.bit:185 // unreachable; the loop only exits by
-returning`).
+- **`catch e { panic(...) ; <filler> }`.** `vCatchBind`
+  (`compiler/validatestmt.bit:71`) only requires the catch block's tail to
+  match the tried expression's type when that tail does *not* diverge:
+  `if (!unitOk && !vDiverges(c, last, true)) { vExpectExpr(...) }`. A bare
+  `panic(...)` as the last statement satisfies `vDiverges`'s own
+  `Tag.ExprStmt` case (`vIsPanicCall`, `validatestmt.bit:339`), so the type
+  check is skipped and no filler value is required. This exemption landed in
+  `4c32c6d5` and is proven by an existing golden case,
+  `tests/cases/run_parseint_intmin.bit`, which ships `catch e { panic("...") }`
+  with no filler and has always compiled.
+- **A trailing `return <dummy>` after an internally-exhaustive loop or an
+  all-arms-diverging `match`.** `vDiverges`'s `WhileStmt` case
+  (`compiler/validatestmt.bit:345-348`) already treats a break-less
+  `while (true)` as diverging, and its `MatchStmt` case
+  (`compiler/validatestmt.bit:367-375`) already treats a match whose every arm
+  diverges as diverging — both independent of anything written after them. So
+  E0055's missing-return check was already satisfied without the dummy
+  `return`, in every one of the twelve `stdlib` findings #3211 removed.
 
-**Changing lint or checker behaviour is out of this ticket's scope** (per
-#2439's own setup constraints), so this document does not propose a rule fix
-— it files the finding and gives the interim policy:
+**Policy: fix — delete the trailing statement. There is no `allow` path and no
+downstream ticket to file**, because there is no rule defect to track.
+Mechanically, for a live E0212 finding:
 
-1. **File a ticket** against the E0212/E0055 gap (structurally-mandatory dead
-   code after a diverging `catch` tail or after an internally-exhaustive
-   loop) so #2452 is not asked to silently work around a rule defect.
-2. **Until that lands, suppress per finding with `allow`** — E0212 is a
-   boolean rule, eligible for the per-finding form (spec/LINT.md §5.5;
-   `allow` is unavailable only for the five threshold rules). One `// bit:lint
-   allow E0212 -- <reason>` line directly above each finding (not one line
-   above — the directive matches at `line - 1` **exactly**; a blank line
-   between it and the target orphans it silently, no E0297), reason naming
-   which of the two shapes applies and the tracking ticket.
-3. **A finding that is neither shape is real dead code — fix it (delete the
-   statement).** The 1-of-112 `compiler/lspserver.bit` finding did not fit
-   either sampled pattern at a glance and needs individual review before
-   deciding fix vs. suppress.
-
-**The test that decides fix vs. suppress, mechanically:** read the statement
-immediately preceding the flagged one.
-- Preceding statement is `panic(...)` inside a `catch` block → checker-gap
-  shape 1 → `allow`.
-- Flagged statement is the sole trailing statement of a function whose
-  immediately preceding statement is a loop with no non-`return` exit →
-  checker-gap shape 2 → `allow`.
-- Neither → fix (delete).
+1. Read the statement immediately preceding the flagged one.
+2. If it is `panic(...)` as the last statement of a `catch` block, or the
+   block/function's only exit before the flagged statement is a break-less
+   `while (true)` loop or a `match` whose every arm diverges, delete
+   the flagged trailing statement. Verify with `bit check` on the containing
+   module: exit 0 expected, no new diagnostics.
+3. Anything else is real dead code from a stale edit, not one of the two
+   known shapes — delete it the same way; if it is not obviously dead, read
+   the surrounding control flow by hand before removing it.
 
 **Test:**
 ```sh
-grep -c '^warning\[E0212\]' "$LOG"   # must be 0 (via allow or fix, per the rule above)
+grep -c '^warning\[E0212\]' "$LOG"   # must be 0
 ```
 
 ## E0213 `shadowed-local` — FIX
