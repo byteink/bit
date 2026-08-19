@@ -1692,6 +1692,20 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   succeeds only on a symbolic link and needs no `struct stat` layout, so a
   dangling link still answers `true` — the link exists whether its target
   does or not.
+- `fs_rename` is the only `bit_rt_fs_*` entry point that needs two encoded
+  paths live at the same time, and that is why it is backed by two separate
+  scratch buffers instead of the one every other path-taking entry point
+  shares. `oldPath` still goes through `fsPathZ`/`checkedPathZ` into the usual
+  module-level `fsPathBuf`; `newPath` goes through a second, distinct pair —
+  `fsPathZ2`/`checkedPathZ2` into `fsPathBuf2` (`runtime/root/fs.bit`, #2712)
+  — so `rename(2)`/`sysRename` receives two pointers that can never alias.
+  Encoding `newPath` through the shared `fsPathBuf` a second time, the way
+  every single-path entry point does, would overwrite `oldPath`'s bytes
+  before the syscall ever reads them, handing it the same pointer twice.
+  Darwin dispatches to the libc `rename` extern; Linux has no libc and issues
+  the raw syscall itself — `rename` (nr 82) on x86_64, `renameat(AT_FDCWD,
+  old, AT_FDCWD, new)` (nr 38) on aarch64, which dropped the bare `rename`
+  syscall. 0 on success, -1 on failure — the same shape `fs_remove` returns.
 
 **These calls block their worker's OS thread for the syscall's duration, and
 that is not a netpoller gap.** POSIX has no non-blocking read of a regular file:
