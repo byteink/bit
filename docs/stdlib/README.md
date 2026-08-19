@@ -62,3 +62,10 @@ function dir (string) => string
 ```
 
 `bit doc --json` prints the same as JSON, for tooling.
+
+## Publishing
+
+Editing a page under `docs/` here publishes nothing by itself. bitlang.org is
+generated from a separate `bit-website` repo that vendors this one as a
+submodule - someone still has to bump the submodule pointer, regenerate the
+site, and commit the pointer and the generated pages together.

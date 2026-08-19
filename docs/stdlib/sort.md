@@ -40,3 +40,25 @@ fn isAscending(xs: []int): bool {
   return isSorted(xs, (a: int, b: int) => a < b)
 }
 ```
+
+## Printing a map reproducibly
+
+A `map<K,V>`'s iteration order is stable within one build of a program, but it
+is neither insertion order nor sorted order - printing a map directly can
+change every time the program is rebuilt. Sorting the keys is what makes the
+output reproducible:
+
+```bit
+import { sortInPlace } from "std/sort"
+
+fn printSorted(counts: map<string, int>) {
+  let keys: []string = []
+  for (k, _) of counts {
+    keys = append(keys, k)
+  }
+  sortInPlace(keys, (a: string, b: string) => a < b)
+  for k of keys {
+    println("${k}: ${counts[k]}")
+  }
+}
+```
