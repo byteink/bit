@@ -2108,16 +2108,31 @@ bit_rt_net_read(fd, max)        -> str   // up to max bytes; parks. "" at end of
 bit_rt_net_write(fd, s)         -> n     // all of s (retried internally). -1 on error
 ```
 
-**UDP** (connectionless). `recv` records the sender in per-OS module state —
-`udpSenderBuf`/`udpSenderValid` (`runtime/net/linux/netabi.bit:248-249`;
-`runtime/net/darwin/netabi.bit:237-238`) — read back by the two accessors
-with no intervening park. This is neither a threadlocal nor the §13 per-task
-scratch slot: the provider's own header says so outright ("THE LAST SENDER
-IS MODULE STATE, NOT A THREADLOCAL", `runtime/net/linux/netabi.bit:242`),
-and it is sound only because v1 pins the scheduler to one worker (§5/§9),
-not because of any per-thread or per-task isolation (§22's audit). A failed
-`recv` returns `""` with `sender_port` `-1`, which is how it is told from a
-legitimate zero-length datagram (whose sender port is `0..65535`).
+**UDP** (connectionless). `recv` records the sender in per-OS module state,
+**one `[4]i64` sockaddr and one valid flag PER WORKER** (fixed by #3272) —
+`udpSenderBuf`/`udpSenderValid` (`runtime/net/linux/netabi.bit:407-408`;
+`runtime/net/darwin/netabi.bit:396-397`), indexed by the calling task's own
+worker id (`wkId`, §9's `runtime/sched/worker.bit`) via `udpSenderSlot()`,
+double-bounded against `schedMaxWorkers` and the file's own array capacity —
+read back by the two accessors with no intervening park. This is neither a
+threadlocal nor the §13 per-task scratch slot: the provider's own header
+says so outright ("THE LAST SENDER IS PER-WORKER SCRATCH, NOT A
+THREADLOCAL", `runtime/net/linux/netabi.bit:355`).
+
+**Before #3272 this was a single SHARED slot for the whole process** — sound,
+the header used to claim, "only because v1 pins the scheduler to one worker
+(§5/§9)". That was false as soon as #1900 booted more than one worker: two
+green threads on two OS threads racing `recv` clobbered the shared flag —
+one succeeds and sets it, the other (a different worker) zeroes it, the
+first reads back "no sender" — and one such clobber on a listener socket
+wedged it permanently (`stdlib/quic/listener.bit`'s `catch _ { return }`,
+found via #1912). Per-worker slots fix the concurrent-task case; they remain
+sound under a single task's own migration between the two calls too,
+because `netRecvFrom`'s park is the only park in `udp_recv`, and the slot is
+chosen only AFTER that park returns — see the provider's own header comment
+for the full argument. A failed `recv` returns `""` with `sender_port` `-1`,
+which is how it is told from a legitimate zero-length datagram (whose
+sender port is `0..65535`).
 
 ```
 bit_rt_net_udp_bind(host, port)         -> fd    // datagram socket; port 0 = kernel picks. -1 on error
@@ -2393,13 +2408,32 @@ only at an explicit yield/park, never mid-expression:**
   `bit_rt_iface_as_ok`, which codegen always emits directly after the paired
   `bit_rt_iface_as`.
 - `runtime/net/{linux,darwin}/netabi.bit`: `udpSenderBuf`/`udpSenderValid`
-  (`linux/netabi.bit:248-249`; `darwin/netabi.bit:237-238`) — per-OS, not
-  `root.bit`, and NOT a `threadlocal` for a reason this file states outright:
-  "THE LAST SENDER IS MODULE STATE, NOT A THREADLOCAL... sound under the
-  ABI's single-worker contract" (`linux/netabi.bit:242-245`) — i.e. this one
-  is safe only because v1 pins the scheduler to one worker (§5/§9), not
-  because of any per-thread or per-task isolation the way the entries above
-  are.
+  (`linux/netabi.bit:407-408`; `darwin/netabi.bit:396-397`) — per-OS, not
+  `root.bit`, and NOT a `threadlocal` (Mach-O refuses one, §11.11).
+
+  **UNTIL #3272 this bullet described a SINGLE shared slot for the whole
+  process**, claimed sound "only because v1 pins the scheduler to one worker
+  (§5/§9)". That claim was false as soon as #1900 booted more than one
+  worker: two tasks on two OS threads racing `udp_recv` clobbered the one
+  shared flag, and #1912 traced a permanently wedged UDP listener to exactly
+  that. Fixed by giving each WORKER its own `[4]i64`/valid-flag slot, indexed
+  by the calling task's own worker id (`wkId`, `runtime/sched/worker.bit`)
+  via `udpSenderSlot()`, double-bounded against `schedMaxWorkers` and the
+  array's own literal capacity (the same shape `runtime/sched/preempt.bit`
+  uses for `startNs`/`requested`).
+
+  This is a WEAKER claim than `ifaceOk` below, and is stated precisely rather
+  than folded into the same sentence: `ifaceOk`'s write and read never cross
+  *any* scheduling point, so "migrates workers only at an explicit yield/park"
+  is enough on its own. `udp_recv` is different — it contains a real park
+  (`netRecvFrom`, on the same engine `netAbiRead` uses), so the task CAN
+  resume on a different worker mid-call. The slot is therefore chosen only
+  AFTER that park returns, from the worker id current at that point, and the
+  raw `recvfrom` output is held in a throwaway per-call scratch until then —
+  see the provider's own header comment (`linux/netabi.bit:355` /
+  `darwin/netabi.bit:343`) for the full argument. From the point the slot is
+  chosen to `udp_sender_host`/`_port`'s read, the ORIGINAL claim holds again:
+  nothing parks in between, so the two see the same slot.
 - `runtime/sched/sched.bit`: `Worker.tls` — re-derived on every read from the
   running task's own stack pointer (`sched.bit:490`'s `schedCurrentTask`),
   never cached across a call boundary, specifically because a parked task can
