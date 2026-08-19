@@ -247,9 +247,16 @@ bit_rt_iface_assert(recv: ref, want: usize) -> ref    // panics on mismatch
   typed `T`, so returning the receiver would let a caller that ignores `ok` read
   one concrete type as another. Null is `T`'s zero value.
 - `bit_rt_iface_as_ok` reports the `ok` of the `bit_rt_iface_as` **immediately
-  preceding it**, from a per-thread slot — the same adjacency contract as
-  `bit_rt_chan_recv_ok` (§11) and the fallible-call error slot (§13). Lowering
-  emits the pair back to back with nothing between them.
+  preceding it**, from a **process-wide** flag, not a per-thread one (Mach-O
+  refuses `@threadlocal` at emission, §11.11). Lowering emits the pair back to
+  back with nothing between them, which is enough to stop a *second assertion
+  on the same task* from landing in the window — it is NOT enough to stop a
+  second, genuinely concurrent OS thread from writing the same flag at the
+  same real time once `BIT_WORKERS>1` (§9). That is a live gap, unlike
+  `bit_rt_chan_recv_ok` (§11) and the fallible-call error slot (§13), which
+  read/write **per-task scratch** instead and are safe at any worker count for
+  that reason — see §22's audit and §5's note on what adjacency does and does
+  not buy. #3280 tracks moving this flag to per-task scratch to close the gap.
 - `bit_rt_iface_assert` names both types in its panic message; the descriptors
   already carry them.
 
@@ -960,6 +967,84 @@ back edge is ever reached (#1677's finding, stated there for the OS-thread
 registry rather than this one, applies identically here): the same "holds no
 live Bit references before its first door-touch" gap. #1699 tracks closing
 both with the same eager-registration fix.
+
+### 5.1 The adjacency contract: what it guarantees, and what it never did
+
+Several ABI entry points split what is logically a two-result operation into a
+pair of calls — `bit_rt_iface_as`/`bit_rt_iface_as_ok` (§2.2),
+`bit_rt_chan_recv`/`bit_rt_chan_recv_ok` (§11), and the fallible-call error
+slot's set/get pair (§13) — and rely on codegen emitting the pair back to
+back, with no safepoint poll and no yield between them. That property is the
+**adjacency contract**: the second call always observes exactly the outcome
+the first call just produced, because nothing can run on that same task in
+between.
+
+**What it guarantees.** Ordering of a call pair *on one task*, against an
+intervening park *of that same task*. A safepoint poll is the only place a
+task can be preempted (above); if codegen never emits one between the two
+calls, that task cannot park between them, so nothing else running on that
+task can observe or disturb the intermediate state. This remains true and
+useful at any worker count — it is not what the rest of this note corrects.
+
+**What it never guaranteed.** Anything about a *second task, on a second OS
+thread, running at the same real time*. Adjacency is a property of one task's
+own instruction stream; it says nothing about a different mutator
+concurrently reading or writing the same storage. A value read back purely by
+adjacency is safe from a **second caller** only when the runtime boots exactly
+one worker. **#1900 ended that.** Once `BIT_WORKERS>1`, a second worker's
+identical call pair is not interleaved with the first — it runs simultaneously
+on another core — and if both write the same process-wide or module-level
+word, one worker's result is whatever the other happened to leave there. This
+was read into the adjacency contract by every site that cited it as a safety
+argument for a *shared* buffer; adjacency was never that.
+
+**#3272** (`udpSenderBuf`/`udpSenderValid`, `runtime/net/{darwin,linux}/
+netabi.bit` — the root cause behind #1912, open six months across three wrong
+hypotheses before this was found) and **#3273** (`saBuf`/`saBuf2`/`optBuf`/
+`lenBuf`/`ipBuf`, `runtime/net/{darwin,linux}/sock.bit`, mutation-tested both
+directions, whose pre-fix fingerprint was `gotport == the other socket's
+port` — an outright swap) proved the distinction above the hard way: a
+comment reading "sound only under the single-worker contract" and a live
+cross-worker race were the same code, before and after `BIT_WORKERS>1` was
+actually exercised. §22 audits every remaining module-level cell in
+`runtime/**` against this distinction by name.
+
+**The replacement shape**, established by those two fixes:
+
+- If the value is naturally scoped to the calling **task** rather than the
+  calling worker — as §11's `scrRecvOk` and §13's error slot are, both being
+  the ABI's own outcome of a call the task itself just made — use **per-task
+  scratch**: a fixed word offset in the task's own scratch block
+  (`runtime/sched/scratch.bit`), read via `scratchOf(schedCurrentTask())`.
+  This is strictly *stronger* than a per-worker slot, because it survives the
+  M:N scheduler migrating the task to a different worker between the two
+  calls.
+- If the value is scoped to the calling **worker** instead — a buffer built
+  once per OS thread rather than per task, as `udpSenderBuf` and the
+  sockaddr scratch buffers are — use **per-worker slots** indexed by `wkId`,
+  double-bounded against both `schedMaxWorkers` and the array's own literal
+  capacity (`let a: [N]i64` needs a literal `N`), plus one fallback slot for a
+  caller with no current task.
+- If the span can **park**, decide the slot **after** the park returns, not
+  before it starts — `netAbiUdpRecv` (#3273) writes the raw result into
+  throwaway per-call scratch and only asks for its worker slot once
+  `netRecvFrom` has actually returned, because the task can resume on a
+  different worker mid-call.
+- Filling a buffer once outside a retry loop that can park is unsound under
+  per-worker slots even though it was harmless under one shared buffer — a
+  migrated task's next read lands on a different, unfilled slot (#3273 had to
+  move `netSendTo`'s fill inside its loop for exactly this reason).
+- **`@nosplit` does NOT mean "cannot park."** `schedPark`
+  (`runtime/sched/task.bit`) and `schedSwitch` (`runtime/sched/sched.bit`) are
+  themselves `@nosplit`, so E0075 permits calling them from a `@nosplit` body.
+  Prove a span cannot park by what it actually calls, never by inferring it
+  from the attribute alone.
+
+**A remaining gap.** §2.2's `bit_rt_iface_as_ok` flag is still the
+process-wide shape this note describes as unsound at `BIT_WORKERS>1` — it has
+not yet been moved to per-task scratch alongside its §11/§13 siblings. #3280
+tracks the conversion; until it lands, that one flag is a known, live
+exception to "the adjacency contract holds," not a second instance of it.
 
 ---
 
@@ -2403,10 +2488,8 @@ different OS thread — a per-OS-thread slot could not:**
 
 **Per-OS-thread by design, each because nothing between the write and its
 matching read can cross a scheduling point — a green task migrates workers
-only at an explicit yield/park, never mid-expression:**
-- `runtime/root/root.bit`: `ifaceOk` (`root.bit:285`) — read via
-  `bit_rt_iface_as_ok`, which codegen always emits directly after the paired
-  `bit_rt_iface_as`.
+only at an explicit yield/park, never mid-expression — AND each slot really is
+per-worker storage, not a single shared word (§5.1):**
 - `runtime/net/{linux,darwin}/netabi.bit`: `udpSenderBuf`/`udpSenderValid`
   (`linux/netabi.bit:407-408`; `darwin/netabi.bit:396-397`) — per-OS, not
   `root.bit`, and NOT a `threadlocal` (Mach-O refuses one, §11.11).
@@ -2420,20 +2503,18 @@ only at an explicit yield/park, never mid-expression:**
   by the calling task's own worker id (`wkId`, `runtime/sched/worker.bit`)
   via `udpSenderSlot()`, double-bounded against `schedMaxWorkers` and the
   array's own literal capacity (the same shape `runtime/sched/preempt.bit`
-  uses for `startNs`/`requested`).
+  uses for `startNs`/`requested`). It belongs in this category **now**, post-fix,
+  because there are genuinely `schedMaxWorkers` separate words, not one.
 
-  This is a WEAKER claim than `ifaceOk` below, and is stated precisely rather
-  than folded into the same sentence: `ifaceOk`'s write and read never cross
-  *any* scheduling point, so "migrates workers only at an explicit yield/park"
-  is enough on its own. `udp_recv` is different — it contains a real park
-  (`netRecvFrom`, on the same engine `netAbiRead` uses), so the task CAN
-  resume on a different worker mid-call. The slot is therefore chosen only
-  AFTER that park returns, from the worker id current at that point, and the
-  raw `recvfrom` output is held in a throwaway per-call scratch until then —
-  see the provider's own header comment (`linux/netabi.bit:355` /
-  `darwin/netabi.bit:343`) for the full argument. From the point the slot is
-  chosen to `udp_sender_host`/`_port`'s read, the ORIGINAL claim holds again:
-  nothing parks in between, so the two see the same slot.
+  `udp_recv` contains a real park (`netRecvFrom`, on the same engine
+  `netAbiRead` uses), so the task CAN resume on a different worker mid-call.
+  The slot is therefore chosen only AFTER that park returns, from the worker
+  id current at that point, and the raw `recvfrom` output is held in a
+  throwaway per-call scratch until then — see the provider's own header
+  comment (`linux/netabi.bit:355` / `darwin/netabi.bit:343`) for the full
+  argument. From the point the slot is chosen to `udp_sender_host`/`_port`'s
+  read, adjacency holds: nothing parks in between, so the two see the same
+  slot — and that slot is this task's worker's own, not shared with any other.
 - `runtime/sched/sched.bit`: `Worker.tls` — re-derived on every read from the
   running task's own stack pointer (`sched.bit:490`'s `schedCurrentTask`),
   never cached across a call boundary, specifically because a parked task can
@@ -2441,6 +2522,24 @@ only at an explicit yield/park, never mid-expression:**
   hand back the previous thread's stale `Worker`. No global backs this at
   all, in this file or any other — there is nothing to race because there is
   nothing stored.
+
+**NOT yet converted — a single process-wide word, unsound at
+`BIT_WORKERS>1` (a live gap, not a guarantee; §5.1):**
+- `runtime/root/root.bit`: `ifaceOk` (`root.bit:293`) — read via
+  `bit_rt_iface_as_ok`, written by `bit_rt_iface_as` (§2.2). Adjacency
+  (codegen always emits the read directly after the paired write, with no
+  yield between) stops a *second assertion on the same task* from landing in
+  the window between the two calls. It does nothing to stop a **different**
+  task, on a **different, concurrently running** OS thread, from writing this
+  same global word at the same real time once more than one worker exists
+  (#1900) — `ifaceOk` is one word, not `schedMaxWorkers` words, so it has none
+  of the per-worker isolation the bullet above now has. This entry used to sit
+  in the "Per-OS-thread by design" category above and drew the identical false
+  conclusion from adjacency that #3272 and #3273 disproved for their own
+  buffers; corrected here rather than left standing. #3280 tracks moving it to
+  per-task scratch, the shape §11's `scrRecvOk` and §13's error slot already
+  use, which closes the gap for the same migration-safety reason those two
+  were put there.
 
 **Global, mutated, but inert or already atomic: NOT FOUND.** Neither
 `scan_ctx` nor `select_seed_counter`, as this section previously described
