@@ -54,6 +54,10 @@
 // ever touches them — the same distinction io.bit draws between `bit_rt_panic`
 // and `bit_rt_port_root_io_write_all`.
 
+// `schedCurrentWorker`/`taskAt`/`wkId`/`schedMaxWorkers` for the per-worker
+// argv scratch below (#3289).
+import { schedCurrentWorker, taskAt, wkId, schedMaxWorkers } from "../sched"
+
 // Bounds on the two byte scans below, both statically fixed (Power of 10 rule 2).
 // `osMaxCstr` is Linux's `MAX_ARG_STRLEN` (128 KiB) — the kernel's own ceiling on
 // a single argv/env string, so no real entry is truncated. `osMaxEnvCount` bounds
@@ -189,16 +193,53 @@ fn osEnvp(): int {
 const osRunMaxArgv: int = 64
 const osRunMaxArgLen: int = 4096
 
+// PER-WORKER SLOT (#3289): #1900 booted more than one worker, so "a run
+// completes before another can begin" is false at BIT_WORKERS>1 -- nothing
+// serialises two concurrent `bit_rt_os_run` callers (reachable from the
+// predeclared `osRun` builtin, `compiler/build.bit`'s `runCmd`, and
+// `compiler/pmfetchtail.bit`'s `runGit`; grep found no lock anywhere near the
+// call sites), so two workers racing `osBuildRunArgv` can corrupt each
+// other's spawned child's argv. Double-bounded (`schedMaxWorkers` AND
+// `osRunArgvSlots`, since `let a: [N]i64` needs a literal `N`), the same
+// shape `runtime/net/darwin/sock.bit`'s `sockScratchSlot` (#3273) and
+// `../{linux,darwin}/os.bit`'s `osScratchSlot` (#3277) established.
+const osRunArgvSlots: int = 32
+
+@nosplit fn osRunArgvSlot(): int {
+  let w = schedCurrentWorker()
+  if (w == 0) {
+    return osRunArgvSlots
+  }
+  let id = *(taskAt(w) + wkId)
+  if (id < 0 || id >= schedMaxWorkers || id >= osRunArgvSlots) {
+    return osRunArgvSlots
+  }
+  return id
+}
+
 // `bit_rt_os_run`'s child argv scratch: one pointer slot per
 // `[path, forwarded[0..n), NULL]` (osRunMaxArgv + 2 words) and a flat
 // NUL-terminated byte arena, one osRunMaxArgLen-byte row per forwarded
-// argument. MODULE-LEVEL and unlocked, sound under the same single-worker
-// contract each platform os.bit's `osArgvBuf` documents (a `run` completes —
-// fork through wait — before another can begin, with no park in between).
+// argument, now PER-WORKER: (osRunArgvSlots + 1) slots, one per worker plus
+// the fallback for a caller with no current task. `osBuildRunArgv` resolves
+// the slot ONCE (`osRunArgvSlot`) and reuses it for the whole build: the
+// function calls nothing but `loadWord`/`storeWord`/`storeByte`/`strSize`/
+// `strBytes` -- no `schedPark`/`schedSwitch` anywhere in it -- and the
+// platform `rtOsRun`'s immediately-following fork+exec is also proven
+// park-free (../{linux,darwin}/os.bit's `osArgvBuf` comment), so the task
+// never migrates workers between the write here and the child's `execve`
+// read (fork's COW copy makes the child's view a snapshot at that instant).
+// Worst case footprint: (32+1) * 262144 bytes = ~8.06 MiB of BSS for
+// `osRunArgvBytes` (zero-fill, not resident until a worker actually calls
+// `osRun`) -- kept at the FULL per-worker shape rather than a smaller shared
+// cap, to stay consistent with every other buffer this epic converted and
+// because `osRunMaxArgv`/`osRunMaxArgLen` are unchanged (compiler/build.bit's
+// `runMaxForwardedArgs` mirrors `osRunMaxArgv`; shrinking either here without
+// a matching change there would silently change acceptance behaviour).
 // Never scanned by the collector (rule 1): both hold raw bytes and pointers
 // into themselves, never object references.
-let osRunArgvPtrs: [66]i64
-let osRunArgvBytes: [32768]i64
+let osRunArgvPtrs: [2178]i64        // (osRunArgvSlots+1) * 66
+let osRunArgvBytes: [1081344]i64    // (osRunArgvSlots+1) * 32768
 
 // Build `bit_rt_os_run`'s child argv vector: `[pathPtr, forwarded[0..n),
 // NULL]`, where `pathPtr` is the caller's own already-NUL-terminated path
@@ -228,7 +269,8 @@ export @nosplit @symbol("bit_rt_port_root_os_build_run_argv") fn osBuildRunArgv(
   if (n > osRunMaxArgv) {
     return 0
   }
-  let ptrs = int(ptrOf(osRunArgvPtrs))
+  let slot = osRunArgvSlot()
+  let ptrs = int(ptrOf(osRunArgvPtrs)) + slot * (osRunMaxArgv + 2) * 8
   storeWord(ptrs, pathPtr)
   if (n == 0) {
     storeWord(ptrs + 8, 0)
@@ -236,7 +278,7 @@ export @nosplit @symbol("bit_rt_port_root_os_build_run_argv") fn osBuildRunArgv(
   }
   let off = loadWord(argv + slcOff)
   let buf = loadWord(argv + slcBuf)
-  let arena = int(ptrOf(osRunArgvBytes))
+  let arena = int(ptrOf(osRunArgvBytes)) + slot * osRunMaxArgv * osRunMaxArgLen
   let i = 0
   while (i < n) {
     let s = loadWord(buf + (off + i) * 8)
