@@ -307,6 +307,129 @@ let ioConstBuf: [33]i64
   rootWriteAll(fd, addr, nbytes)
 }
 
+// ---------------------------------------------------------------------------
+// Whole-line assembly (#3295)
+// ---------------------------------------------------------------------------
+//
+// Every panic function below used to make 3-5 SEPARATE `writeConst`/
+// `rootWriteAll` calls (prefix, one-or-more message words, newline) with no
+// lock or ordering guarantee spanning them. Each call is content-safe on its
+// own (`ioConstBuf` above is per-worker), but with `BIT_WORKERS>1` two tasks
+// panicking on two different workers at close to the same real time can
+// interleave AT THE CALL BOUNDARY: A's prefix write, B's prefix write, A's
+// message write, ... land in the kernel in whatever order the two workers'
+// syscalls actually happen to reach it, splicing two complete, correctly-
+// formed messages into one unreadable line. Reproduced directly: BIT_WORKERS=
+// 4/8, ~400 tasks racing div-zero vs nil-call panics, spliced lines in 33-40%
+// of runs (0/155 at exactly BIT_WORKERS=2 in the same repro — the window
+// needs at least one OTHER worker already mid-panic-write, which is rarer
+// with only one other worker to race against).
+//
+// A LOCK spanning the write sequence is the obvious fix and the dangerous
+// one: a panic path that blocks on a lock already held by the panicking
+// worker itself, or by one mid-teardown, turns a diagnosable crash into a
+// hang. Assembling the WHOLE line into a per-worker buffer and issuing ONE
+// `rootWriteAll` needs no lock at all, and it is the identical shape
+// `ioConstBuf`/`ioConstScratchSlot` above already establishes and proves
+// sound — module state, one slot per worker, resolved once into a local used
+// for both every store and the final read, with no park anywhere in the span
+// (that block's comment carries the full argument; it applies unchanged
+// here, since nothing below calls `schedPark`/`schedSwitch` either).
+//
+// `ioLineCap` (128 bytes/slot) covers every FIXED panic message in this file
+// today with room to spare (the longest, nil-iface, assembles to 44 bytes)
+// plus `../slices.bit`'s three bounds messages (longest 26) and the
+// overwhelming majority of real `panic(msg)` literals, once routed through
+// `panicWrite` below. A message that does not fit falls back to the original
+// multi-syscall shape — this buffer never truncates, it only narrows the
+// race window for the case that fits.
+const ioLineCap: int = 128
+let ioLineBuf: [528]i64 // 33 slots (ioConstScratchSlots + 1) * 16 words (128B)
+
+@nosplit fn ioLineSlotAddr(): int {
+  return int(ptrOf(ioLineBuf)) + ioConstScratchSlot() * ioLineCap
+}
+
+// Appends the low `n` (<=8) little-endian bytes of `word` to `addr`, one byte
+// at a time. NOT `storeWord`: `../../gc`'s `wordAt` computes `addr / 8` to
+// index its `*i64` view, so an `addr` that is not 8-byte aligned silently
+// indexes the WRONG word rather than faulting — and every offset here after
+// the very first is unaligned by construction (`panicPrefixLen` is 7).
+// Bounded (Power of 10 rule 2): every caller below passes a literal `n <= 8`.
+@nosplit fn ioLineAppendWord(addr: int, word: int, n: int) {
+  let i = 0
+  while (i < n) {
+    storeByte(addr + i, (word >> (i * 8)) & 255)
+    i = i + 1
+  }
+}
+
+// Copies `n` bytes from `src` to `addr`, one at a time — the dynamic-length
+// counterpart of `ioLineAppendWord` above, for a message that already lives
+// in memory this buffer does not own. `runtime/root/root.bit`'s own
+// `copyBytes` does the identical thing but is a different module's private
+// (importing it would mean exporting it there, out of #3295's file scope),
+// so this is the same six lines rather than a cross-module reach.
+@nosplit fn ioLineCopyBytes(addr: int, src: int, n: int) {
+  let i = 0
+  while (i < n) {
+    storeByte(addr + i, loadByte(src + i))
+    i = i + 1
+  }
+}
+
+// Appends `word`'s low `min(remaining, 8)` bytes and returns how many it
+// wrote, so a caller can chain several without re-deriving the clamp.
+@nosplit fn ioLineAppendClamped(addr: int, word: int, remaining: int): int {
+  let n = remaining
+  if (n > 8) {
+    n = 8
+  }
+  ioLineAppendWord(addr, word, n)
+  return n
+}
+
+// Assembles "panic: " + up to 5 constant words (packed little-endian the same
+// way `panicPrefixWord`/`oomWord0`/etc. already are; `msgLen` is the exact
+// total byte count across w0..w4, and a short last word — e.g. nil-call's
+// `nilCallWord2`, 6 of its 8 bytes — is simply never reached, same contract
+// `writeConst`'s callers already relied on) + "\n" into this worker's line
+// slot, and sends it as ONE `rootWriteAll` call. Replaces what used to be up
+// to 7 separate `writeConst` calls (prefix + up to 5 message words +
+// newline) in each of the four constant-message panics below.
+@nosplit fn writeConstLine(fd: int, w0: int, w1: int, w2: int, w3: int, w4: int, msgLen: int) {
+  let addr = ioLineSlotAddr()
+  let off = panicPrefixLen
+  ioLineAppendWord(addr, panicPrefixWord, panicPrefixLen)
+  let remaining = msgLen
+  let n = ioLineAppendClamped(addr + off, w0, remaining)
+  off = off + n
+  remaining = remaining - n
+  if (remaining > 0) {
+    n = ioLineAppendClamped(addr + off, w1, remaining)
+    off = off + n
+    remaining = remaining - n
+  }
+  if (remaining > 0) {
+    n = ioLineAppendClamped(addr + off, w2, remaining)
+    off = off + n
+    remaining = remaining - n
+  }
+  if (remaining > 0) {
+    n = ioLineAppendClamped(addr + off, w3, remaining)
+    off = off + n
+    remaining = remaining - n
+  }
+  if (remaining > 0) {
+    n = ioLineAppendClamped(addr + off, w4, remaining)
+    off = off + n
+    remaining = remaining - n
+  }
+  ioLineAppendWord(addr + off, newlineWord, newlineLen)
+  off = off + newlineLen
+  rootWriteAll(fd, addr, off)
+}
+
 // The bytes of the port-heap `string` at `s` (ABI.md §2: a `{ptr, len}` header
 // whose `ptr` addresses the object's own inline bytes).
 //
@@ -334,11 +457,15 @@ let ioConstBuf: [33]i64
   return n
 }
 
-// `panic: <msg>\n` on `fd`. `runtime/root/`'s `panicWrite`, three writes and all.
+// `panic: <msg>\n` on `fd`. `runtime/root/`'s `panicWrite`.
 //
-// Three syscalls rather than one assembled buffer:
-// assembling would mean allocating on the panic path, which is the one path that
-// must work when allocation is what failed.
+// ONE syscall when `msg` fits in the shared per-worker line slot (`ioLineBuf`
+// above, #3295) — ALLOCATES NOTHING to get there, unlike assembling into a
+// fresh heap buffer would: the slot is module state, resolved and reused, not
+// a per-call allocation, so the panic path still works when allocation is
+// what failed. Falls back to the original three-syscall shape when `msg`
+// does not fit — never truncates, only narrows the race window for the
+// (overwhelmingly common) case that fits.
 //
 // TAKES THE FD rather than hardcoding stderr. That is the one deliberate
 // signature deviation in this file and it exists for testability: `rootPanic`
@@ -349,8 +476,18 @@ let ioConstBuf: [33]i64
 // two, since the one caller below still fixes it to stderr.
 export @nosplit @symbol("bit_rt_port_root_io_panic_write")
 fn panicWrite(fd: int, s: int) {
+  let msgAddr = strBytesOf(s)
+  let msgLen = strSizeOf(s)
+  if (msgLen <= ioLineCap - panicPrefixLen - newlineLen) {
+    let addr = ioLineSlotAddr()
+    ioLineAppendWord(addr, panicPrefixWord, panicPrefixLen)
+    ioLineCopyBytes(addr + panicPrefixLen, msgAddr, msgLen)
+    ioLineAppendWord(addr + panicPrefixLen + msgLen, newlineWord, newlineLen)
+    rootWriteAll(fd, addr, panicPrefixLen + msgLen + newlineLen)
+    return
+  }
   writeConst(fd, panicPrefixWord, panicPrefixLen)
-  rootWriteAll(fd, strBytesOf(s), strSizeOf(s))
+  rootWriteAll(fd, msgAddr, msgLen)
   writeConst(fd, newlineWord, newlineLen)
 }
 
@@ -424,10 +561,7 @@ export @nosplit @symbol("bit_rt_eprint") fn rootEprint(s: int) {
 // words carry 8 and 5 bytes, so 7 + 13 + 1 = the 21 bytes of
 // `panic: out of memory\n`.
 export @nosplit @symbol("bit_rt_oom") fn rootOom(): int {
-  writeConst(stderrFd, panicPrefixWord, panicPrefixLen)
-  writeConst(stderrFd, oomWord0, 8)
-  writeConst(stderrFd, oomWord1, 5)
-  writeConst(stderrFd, newlineWord, newlineLen)
+  writeConstLine(stderrFd, oomWord0, oomWord1, 0, 0, 0, 13)
   rootExit(2)
   return 0
 }
@@ -439,22 +573,14 @@ export @nosplit @symbol("bit_rt_oom") fn rootOom(): int {
 // message to report a broken invariant is itself something that must not be
 // able to fail on this path.
 export @nosplit @symbol("bit_rt_panic_div_zero") fn rootPanicDivZero() {
-  writeConst(stderrFd, panicPrefixWord, panicPrefixLen)
-  writeConst(stderrFd, divZeroWord0, 8)
-  writeConst(stderrFd, divZeroWord1, 8)
-  writeConst(stderrFd, divZeroWord2, 8)
-  writeConst(stderrFd, newlineWord, newlineLen)
+  writeConstLine(stderrFd, divZeroWord0, divZeroWord1, divZeroWord2, 0, 0, 24)
   rootExit(2)
 }
 
 // `bit_rt_panic_nil_call` (ABI.md §12.1, #2018): the sibling check for an
 // indirect call through a nil function value, same alloc-free shape.
 export @nosplit @symbol("bit_rt_panic_nil_call") fn rootPanicNilCall() {
-  writeConst(stderrFd, panicPrefixWord, panicPrefixLen)
-  writeConst(stderrFd, nilCallWord0, 8)
-  writeConst(stderrFd, nilCallWord1, 8)
-  writeConst(stderrFd, nilCallWord2, nilCallLen2)
-  writeConst(stderrFd, newlineWord, newlineLen)
+  writeConstLine(stderrFd, nilCallWord0, nilCallWord1, nilCallWord2, 0, 0, 22)
   rootExit(2)
 }
 
@@ -462,13 +588,7 @@ export @nosplit @symbol("bit_rt_panic_nil_call") fn rootPanicNilCall() {
 // method call dispatched through a nil interface value, same alloc-free
 // shape.
 export @nosplit @symbol("bit_rt_panic_nil_iface") fn rootPanicNilIface() {
-  writeConst(stderrFd, panicPrefixWord, panicPrefixLen)
-  writeConst(stderrFd, nilIfaceWord0, 8)
-  writeConst(stderrFd, nilIfaceWord1, 8)
-  writeConst(stderrFd, nilIfaceWord2, 8)
-  writeConst(stderrFd, nilIfaceWord3, 8)
-  writeConst(stderrFd, nilIfaceWord4, nilIfaceLen4)
-  writeConst(stderrFd, newlineWord, newlineLen)
+  writeConstLine(stderrFd, nilIfaceWord0, nilIfaceWord1, nilIfaceWord2, nilIfaceWord3, nilIfaceWord4, 36)
   rootExit(2)
 }
 
