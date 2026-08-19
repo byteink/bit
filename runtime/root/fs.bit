@@ -30,34 +30,79 @@
 // names no such symbol, so no rename ever touches it — the same distinction
 // io.bit draws between `bit_rt_panic` and `bit_rt_port_root_io_write_all`.
 
+// `schedCurrentWorker`/`wkId`/`schedMaxWorkers`/`taskAt`, for `fsScratchSlot`
+// below — see its own comment for why this module needs its own copy rather
+// than sharing `runtime/root/linux`'s or `runtime/root/darwin`'s (three
+// different modules; an import is per-module, not shared across them).
+import { schedCurrentWorker, wkId, schedMaxWorkers, taskAt } from "../sched"
+
 // `runtime/root/`'s `max_path = 4096`. A path at or over it is rejected, not
 // truncated, so a lie about the prefix never reaches the kernel.
 const fsMaxPath: int = 4096
 
-// The NUL-terminated path scratch. MODULE-LEVEL and NOT locked, sound only under
-// the ABI's single-worker contract (ABI.md §5: the scheduler starts with exactly
-// one worker OS thread, `nthreads = 1`): `fsPathZ` fills it and the syscall reads
-// it back within one fs call, with no park in between, so no second fs caller can
-// interleave. A multi-worker consumer would need it per-worker — the same note
-// net's `saBuf` carries, kept in the same shape deliberately. A scalar array is
-// never scanned by the collector (ABI.md §5, rule 1), which is required here: it
-// holds raw path bytes, not an object. 512 words = 4096 bytes = `max_path`, so
-// the longest accepted path (4095 bytes) plus its NUL fits exactly.
-let fsPathBuf: [512]i64
+// PER-WORKER SLOTS, NOT ONE SHARED REGION (#3274 — this comment used to claim
+// a single module-level buffer was sound "under the ABI's single-worker
+// contract"; #1900 booted more than one worker, and that claim is false at
+// BIT_WORKERS>1). Same shape as `runtime/net/{darwin,linux}/sock.bit`'s
+// `sockScratchSlot` (#3273): index by the CURRENT worker's `wkId`, double
+// bounded against `schedMaxWorkers` and this file's own literal slot count
+// (`let a: [N]i64` needs `N` to be a literal, E0021), plus a dedicated
+// fallback slot for a caller with no current task/worker.
+//
+// WHY THE OLD SHAPE BROKE: `fsPathZ` fills the buffer and the caller's
+// syscall (`sysOpen`, `mkdir`, …) reads it back with no park in between — true
+// FOR ONE WORKER, where a second fs caller could only run once this one
+// yielded. At BIT_WORKERS>1 a second worker's green thread runs on another
+// core AT THE SAME REAL TIME, so its `fsPathZ` call can overwrite this one's
+// bytes between the fill and the syscall — silently opening (or `stat`ing, or
+// removing) the OTHER caller's path. Confirmed by running readFile on two
+// distinct files concurrently at BIT_WORKERS=4/8: dense, correctly-shaped
+// cross-caller content mismatches, zero at BIT_WORKERS=1 (#3274).
+//
+// WHY PER-WORKER IS SOUND: every path-taking `bit_rt_fs_*` wrapper in
+// ../linux/fs.bit and ../darwin/fs.bit fills the slot via `fsPathZ`/`fsPathZ2`
+// and reads it back through the SAME resolved address with no explicit park
+// anywhere in that call chain (checked directly by grep for `schedPark`/
+// `schedSwitch` — never inferred from `@nosplit` alone, since `@nosplit` only
+// forbids an auto-inserted back-edge poll and does NOT forbid an explicit
+// park call; `schedPark`/`schedSwitch` are themselves `@nosplit`). None of
+// this module's callers retry across a park, so there is no #3273-style
+// "refill inside the loop" hazard here.
+const fsScratchSlots: int = 32
 
-// Copy the Bit `string` at `s` into `fsPathBuf`, NUL-terminated, and return the
-// buffer address — or 0 if the path is at/over `max_path` (rejected, not
-// truncated). `strSize`/`strBytes` are `runtime/root`'s own module-private string
-// accessors (root.bit), in scope because this file is their sibling;
-// `loadByte`/`storeByte` are the gc imports root.bit already brings into the
-// module. Bounded by the path length, itself bounded by the `< fsMaxPath` guard.
+@nosplit fn fsScratchSlot(): int {
+  let w = schedCurrentWorker()
+  if (w == 0) {
+    return fsScratchSlots
+  }
+  let id = *(taskAt(w) + wkId)
+  if (id < 0 || id >= schedMaxWorkers || id >= fsScratchSlots) {
+    return fsScratchSlots
+  }
+  return id
+}
+
+// The NUL-terminated path scratch. (`fsScratchSlots` + 1) slots of `fsMaxPath`
+// (4096) bytes = 512 words each: 33 * 512 = 16896 words, one region per
+// worker plus the fallback. A scalar array is never scanned by the collector
+// (ABI.md §5, rule 1), which is required here: it holds raw path bytes, not
+// an object.
+let fsPathBuf: [16896]i64
+
+// Copy the Bit `string` at `s` into the CURRENT worker's slot of `fsPathBuf`,
+// NUL-terminated, and return the slot's address — or 0 if the path is at/over
+// `max_path` (rejected, not truncated). `strSize`/`strBytes` are
+// `runtime/root`'s own module-private string accessors (root.bit), in scope
+// because this file is their sibling; `loadByte`/`storeByte` are the gc
+// imports root.bit already brings into the module. Bounded by the path
+// length, itself bounded by the `< fsMaxPath` guard.
 export @nosplit @symbol("bit_rt_port_root_fs_pathz") fn fsPathZ(s: int): int {
   let n = strSize(s)
   if (n >= fsMaxPath) {
     return 0
   }
   let src = strBytes(s)
-  let dst = int(ptrOf(fsPathBuf))
+  let dst = int(ptrOf(fsPathBuf)) + fsScratchSlot() * fsMaxPath
   let i = 0
   while (i < n) {
     storeByte(dst + i, loadByte(src + i))
@@ -67,16 +112,17 @@ export @nosplit @symbol("bit_rt_port_root_fs_pathz") fn fsPathZ(s: int): int {
   return dst
 }
 
-// A SECOND NUL-terminated path scratch (#2712), same size and shape as
-// `fsPathBuf`, for the one entry point that must have two encoded paths live
-// at once: `bit_rt_fs_rename(oldPath, newPath)`. `fsPathZ` above writes into
-// `fsPathBuf`, so calling it a second time to encode `newPath` would overwrite
-// `oldPath` before `rename(2)`/`sysRename` ever reads it, handing the syscall
-// the SAME pointer for both arguments. A distinct buffer, not a bigger one
-// (the ticket's own constraint): growing `fsPathBuf` would still alias the two
-// paths into one region. Same single-worker soundness argument as `fsPathBuf`
-// (ABI.md §5) and same scalar-array-never-scanned property (rule 1).
-let fsPathBuf2: [512]i64
+// A SECOND NUL-terminated path scratch (#2712), same size and per-worker
+// shape as `fsPathBuf`, for the one entry point that must have two encoded
+// paths live at once: `bit_rt_fs_rename(oldPath, newPath)`. `fsPathZ` above
+// writes into `fsPathBuf`, so calling it a second time to encode `newPath`
+// would overwrite `oldPath` before `rename(2)`/`sysRename` ever reads it,
+// handing the syscall the SAME pointer for both arguments. A distinct buffer,
+// not a bigger one (the ticket's own constraint): growing `fsPathBuf` would
+// still alias the two paths into one region. Same per-worker soundness
+// argument as `fsPathBuf` and same scalar-array-never-scanned property
+// (rule 1).
+let fsPathBuf2: [16896]i64
 
 // `fsPathZ`, encoding into `fsPathBuf2` instead of `fsPathBuf` — otherwise an
 // exact duplicate of `fsPathZ`'s body, deliberately, so `fsPathZ` itself keeps
@@ -89,7 +135,7 @@ export @nosplit @symbol("bit_rt_port_root_fs_pathz2") fn fsPathZ2(s: int): int {
     return 0
   }
   let src = strBytes(s)
-  let dst = int(ptrOf(fsPathBuf2))
+  let dst = int(ptrOf(fsPathBuf2)) + fsScratchSlot() * fsMaxPath
   let i = 0
   while (i < n) {
     storeByte(dst + i, loadByte(src + i))
