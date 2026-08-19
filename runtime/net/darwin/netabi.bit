@@ -97,6 +97,11 @@ import { loadWord, loadByte, storeByte, storeWord } from "../../gc"
 // re-importing them here is an E0042 redeclaration — only the two names sock.bit
 // does NOT bring in are imported.
 import { netFormatOctets, netFirstNameserver } from "../../net"
+// #3272: the per-worker UDP-sender slot below needs the calling task's own
+// worker (`schedCurrentWorker`), that worker's assigned index (`wkId`), and
+// the scheduler's advertised worker ceiling (`schedMaxWorkers`) to bound it.
+// `taskAt` is already imported by this module's sibling sock.bit.
+import { schedCurrentWorker, wkId, schedMaxWorkers } from "../../sched"
 
 // ---------------------------------------------------------------------------
 // Marshalling helpers
@@ -335,18 +340,102 @@ export @symbol("bit_rt_net_shutdown_sock_w") @nosplit fn netAbiShutdownSockW(fd:
 // UDP (ABI.md §20)
 // ---------------------------------------------------------------------------
 //
-// THE LAST SENDER IS MODULE STATE, NOT A THREADLOCAL. `runtime/root/` keeps it in a
-// `threadlocal`; Mach-O refuses `@threadlocal` (§11.11), so it lives in module
-// state here, sound under the ABI's single-worker contract (ABI.md §5) and the
-// adjacency the lowering gives `udp_recv` then `udp_sender_host`/`_port`. A scalar
-// array is never scanned by the collector (rule 1), required here: it holds a raw
-// `sockaddr`, not an object.
-let udpSenderBuf: [4]i64
-let udpSenderValid: i64 = 0
+// THE LAST SENDER IS PER-WORKER SCRATCH, NOT A THREADLOCAL (#3272 — this
+// comment used to claim a single MODULE-STATE slot was sound; it was not).
+// `runtime/root/` keeps the analogous state in a `threadlocal`; Mach-O
+// refuses `@threadlocal` (§11.11), so this stays module state — but now one
+// `[4]i64` sockaddr and one valid flag PER WORKER SLOT, indexed by
+// `../../sched/worker.bit`'s `wkId`, instead of one shared pair for the whole
+// process.
+//
+// WHY THE OLD SHAPE BROKE: the old comment claimed this was "sound under the
+// ABI's single-worker contract (ABI.md §5) and the adjacency the lowering
+// gives `udp_recv` then `udp_sender_host`/`_port`". #1900 booted more than one
+// worker and voided that — adjacency only protects a call pair on ONE worker
+// from an intervening park on the SAME task; it says nothing about a SECOND
+// task, on a SECOND OS thread, running `udp_recv` at the same real time. Two
+// green threads racing `netAbiUdpRecv` on two workers interleaved as: A's
+// `recvfrom` succeeds and sets the flag; B (a different worker) zeroes the
+// SAME shared flag; A reads 0 and reports "no sender". One clobber was enough
+// to permanently kill a UDP listener (`stdlib/quic/listener.bit`'s
+// `catch _ { return }` on the failing recv).
+//
+// WHY PER-WORKER IS SOUND EVEN THOUGH `netRecvFrom` PARKS: this task's own
+// worker id CAN change across this call — `netRecvFrom` parks (a real
+// safepoint, ABI.md §5), and the scheduler may resume the task on a different
+// worker. So the slot is decided AFTER, not before: `netAbiUdpRecv` writes the
+// raw `recvfrom` result into a throwaway per-call scratch (`peer`, not a
+// slot), and only once `netRecvFrom` returns — the one park in this whole path
+// already behind us — does it ask `udpSenderSlot()` for the CURRENT worker's
+// slot and copy into it. From that point to `netAbiUdpSenderHost`/`_port`'s
+// read there is no further park (`_port` is `@nosplit`, and
+// `stdlib/net/net.bit` calls the two back to back with nothing between), so
+// the slot picked here is the slot those two will see — the same adjacency
+// the old comment invoked, now scoped to one task's own worker rather than
+// assumed process-wide.
+//
+// The double bound in `udpSenderSlot` (`schedMaxWorkers` AND
+// `udpSenderSlots`) is the shape `runtime/sched/preempt.bit`'s `preemptSlots`
+// uses, for the same reason: `let a: [N]i64` requires `N` to be a literal
+// (E0021), so this file's own array capacity and the scheduler's advertised
+// worker count are two independent numbers with nothing tying them together,
+// and an unclamped worker id could walk off the end of `udpSenderBuf`/
+// `udpSenderValid` into neighbouring memory. Clamped, a worker past
+// `udpSenderSlots` silently gets no sender tracking instead.
+//
+// A scalar array is never scanned by the collector (rule 1), required here:
+// it holds raw `sockaddr` bytes, not an object.
 
-// The stored sender as a `*u8`, re-derived each call (module-state address).
-@nosplit fn udpSenderAddr(): *u8 {
-  return u8At(int(ptrOf(udpSenderBuf)))
+// This file's own array capacity for the per-worker scratch below — MUST
+// equal `udpSenderBuf`'s literal length / 4 and `udpSenderValid`'s literal
+// length. Independent from `schedMaxWorkers`; `udpSenderSlot` bounds by both.
+const udpSenderSlots: int = 32
+
+// One `[4]i64` sockaddr slot and one valid flag per worker, flattened: slot
+// `i`'s sockaddr is words `i*4 .. i*4+3` of `udpSenderBuf`. 128 = 32 * 4.
+let udpSenderBuf: [128]i64
+let udpSenderValid: [32]i64
+
+// The word address of slot `slot`'s sockaddr.
+@nosplit fn udpSenderWordAt(slot: int): *i64 {
+  return ptrOf(udpSenderBuf) + slot * 4
+}
+
+// Slot `slot`'s sockaddr as a `*u8`, for the socket-engine calls that read it.
+@nosplit fn udpSenderAddr(slot: int): *u8 {
+  return u8At(int(udpSenderWordAt(slot)))
+}
+
+// The word address of slot `slot`'s valid flag.
+@nosplit fn udpValidAt(slot: int): *i64 {
+  return ptrOf(udpSenderValid) + slot
+}
+
+// The calling task's own worker's slot index, or -1 if there is no current
+// task/worker (defensive only — every entry point below only ever runs as a
+// task; mirrors `../../root/darwin/time.bit`'s `timeScratch` `w == 0`
+// fallback). `wkId` is the index `schedInit` assigns each worker at boot
+// (`../../sched/worker.bit:149`), already exactly the "worker id" a
+// per-worker slot array needs — no new scheduler plumbing required.
+@nosplit fn udpSenderSlot(): int {
+  let w = schedCurrentWorker()
+  if (w == 0) {
+    return 0 - 1
+  }
+  let id = *(taskAt(w) + wkId)
+  if (id < 0 || id >= schedMaxWorkers || id >= udpSenderSlots) {
+    return 0 - 1
+  }
+  return id
+}
+
+// Copy a 4-word sockaddr. Unrolled rather than looped: four words, always —
+// no bound to prove (Power of 10 rule 2).
+@nosplit fn copySockAddrWords(src: *i64, dst: *i64) {
+  *(dst + 0) = *(src + 0)
+  *(dst + 1) = *(src + 1)
+  *(dst + 2) = *(src + 2)
+  *(dst + 3) = *(src + 3)
 }
 
 // `bit_rt_net_udp_bind`: a datagram socket bound to `host:port`, or -1.
@@ -367,42 +456,60 @@ export @symbol("bit_rt_net_udp_send") fn netAbiUdpSend(fd: int, host: int, port:
 }
 
 // `bit_rt_net_udp_recv`: up to `max` bytes of the next datagram on `fd`, parking
-// until one arrives. Records the sender for `udp_sender_host`/`_port`. On error
-// returns empty and marks the sender invalid; a zero-length datagram returns
-// empty with a valid sender (UDP has no end-of-stream).
+// until one arrives. Records the sender, in THIS TASK'S OWN worker's slot, for
+// `udp_sender_host`/`_port` — see the header comment above for why the slot is
+// decided only after `netRecvFrom` returns. On error returns empty and marks
+// that slot invalid; a zero-length datagram returns empty with a valid sender
+// (UDP has no end-of-stream).
 export @symbol("bit_rt_net_udp_recv") fn netAbiUdpRecv(fd: int, max: int): int {
-  udpSenderValid = 0
   if (max <= 0) {
     return emptyStr()
   }
-  // MANAGED scratch — see `netAbiRead`. `netRecvFrom` parks on the same engine.
+  // MANAGED scratch (#1668), both of them: `scratch` (the datagram) and `peer`
+  // (the raw sockaddr `netRecvFrom` fills) must be managed locals rather than
+  // raw addresses, because `netRecvFrom` parks on the same engine as
+  // `netAbiRead`. `peer` is deliberately NOT slot-indexed yet — see the header
+  // comment on why the slot can only be decided after the park is over.
   let scratch = []i64(scratchWords(max))
-  let n = netRecvFrom(fd, u8At(int(ptrOf(scratch))), max, udpSenderAddr())
+  let peer = []i64(4)
+  let n = netRecvFrom(fd, u8At(int(ptrOf(scratch))), max, u8At(int(ptrOf(peer))))
+
+  let slot = udpSenderSlot()
   if (n < 0) {
+    if (slot >= 0) {
+      *(udpValidAt(slot)) = 0
+    }
     return emptyStr()
   }
-  udpSenderValid = 1
+  if (slot >= 0) {
+    copySockAddrWords(ptrOf(peer), udpSenderWordAt(slot))
+    *(udpValidAt(slot)) = 1
+  }
   return strFromPacked(int(ptrOf(scratch)), n)
 }
 
-// `bit_rt_net_udp_sender_host`: dotted-quad of the last recv's sender, or "".
+// `bit_rt_net_udp_sender_host`: dotted-quad of the last recv's sender on THIS
+// task's own worker slot, or "".
 export @symbol("bit_rt_net_udp_sender_host") fn netAbiUdpSenderHost(): int {
-  if (udpSenderValid == 0) {
+  let slot = udpSenderSlot()
+  if (slot < 0 || *(udpValidAt(slot)) == 0) {
     return emptyStr()
   }
   // MANAGED scratch for the four octets (#1668): `octStr` used to be a raw
   // `rtStrAlloc` address held across `netSockAddrOctets`.
   let oct = []i64(1)
-  netSockAddrOctets(udpSenderAddr(), u8At(int(ptrOf(oct))))
+  netSockAddrOctets(udpSenderAddr(slot), u8At(int(ptrOf(oct))))
   return formatQuad(u8At(int(ptrOf(oct))))
 }
 
-// `bit_rt_net_udp_sender_port`: the last recv's sender port, or -1.
+// `bit_rt_net_udp_sender_port`: the last recv's sender port on THIS task's own
+// worker slot, or -1.
 export @symbol("bit_rt_net_udp_sender_port") @nosplit fn netAbiUdpSenderPort(): int {
-  if (udpSenderValid == 0) {
+  let slot = udpSenderSlot()
+  if (slot < 0 || *(udpValidAt(slot)) == 0) {
     return 0 - 1
   }
-  return netSockAddrPort(udpSenderAddr())
+  return netSockAddrPort(udpSenderAddr(slot))
 }
 
 // ---------------------------------------------------------------------------
