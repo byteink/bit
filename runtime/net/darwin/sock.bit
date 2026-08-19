@@ -25,6 +25,8 @@ import { netDnsTimeoutMs, netDnsRetries } from "../../net"
 import { taskAt, schedCurrentTask, taskWorker, wkSched, scPollFd } from "../../sched"
 import { schedParkArm, schedParkDisarm, schedPark, pollRead, pollWrite } from "../../sched"
 import { pollRegister } from "../../sched/darwin"
+// `schedCurrentWorker`, `wkId` and `schedMaxWorkers` are already imported by
+// ../netabi.bit (same module — an import is per-module, not per-file).
 
 // int socket(int, int, int); int bind(int, const struct sockaddr *, socklen_t);
 // int listen(int, int); int accept(int, struct sockaddr *, socklen_t *);
@@ -181,17 +183,76 @@ const tvUsecOff: int = 8
 
 // Scratch regions for the kernel structs.
 //
-// MODULE-LEVEL, AND NOT PROTECTED BY A LOCK — unlike the netpoller's drain
-// buffer, which is guarded by `schedPollTryEnter`. That is sound only because
-// each of these is written and read within a single call with no park in
-// between, and this runtime's green threads on one worker are not preemptive.
-// A multi-worker consumer calling these concurrently would need them per-worker;
-// the same note is on the Linux twin, deliberately, so the two stay in step.
-let saBuf: [2]i64
-let saBuf2: [2]i64
-let optBuf: [1]i64
-let lenBuf: [1]i64
-let ipBuf: [1]i64
+// PER-WORKER SLOTS, NOT ONE SHARED REGION (#3273 — this comment used to claim
+// a single module-level buffer was sound; it was not). Mach-O refuses
+// `@threadlocal` (SPEC §11.11), so this stays module state, same as ../netabi.bit's
+// `udpSenderBuf`/`udpSenderValid` (#3272), whose shape this copies: one slot
+// PER WORKER, indexed by `sockScratchSlot()`, instead of one region for the
+// whole process.
+//
+// WHY THE OLD SHAPE BROKE: the old comment claimed each buffer was "written
+// and read within a single call with no park in between, and this runtime's
+// green threads on one worker are not preemptive" — true for ONE worker, and
+// #1900 booted more than one. Two green threads on two OS threads calling
+// `netRecvFrom` on two different fds interleaved as: A's `recvfrom` fills the
+// SAME shared `saBuf` with A's peer; B's `recvfrom` (a different worker, at
+// the same real time) overwrites it with B's peer before A copies out; A
+// reports B's sender address for A's own datagram. Silent — no error, no
+// wedge, just a caller trusting the wrong address. Confirmed by running two
+// UDP sockets receiving concurrently at BIT_WORKERS=4: every corrupted
+// datagram's reported sender port was exactly the OTHER socket's client port.
+//
+// WHY PER-WORKER IS SOUND HERE: every accessor below (`saBytes()` etc.)
+// re-derives the CURRENT worker's slot on EVERY call — it is `@nosplit` and
+// reads only `schedCurrentWorker()`/`taskAt`/`wkId`, with no explicit park
+// anywhere in that chain (checked directly, not inferred from `@nosplit`
+// alone — `@nosplit` only forbids an auto-inserted back-edge poll, it does
+// NOT forbid an explicit `schedPark` call, and `schedPark`/`schedSwitch` are
+// themselves `@nosplit`). Every caller in this file writes through a syscall
+// and reads the result back with only `@nosplit` byte primitives between the
+// two — never a park — so the slot resolved for the write is the slot
+// resolved for the read, whichever worker that is. A caller whose retry loop
+// CAN park between attempts (`../udp.bit`'s `netSendTo`, `netRecvFrom`;
+// `tcp.bit`'s dial retries) re-derives and REFILLS the buffer fresh on every
+// iteration rather than reusing a value computed before the park — filling
+// once outside a loop that can park is unsound under per-worker slots even
+// though it was harmless under one shared slot, because a migrated task's
+// next read would land on a different (unfilled) slot.
+//
+// The double bound (`schedMaxWorkers` AND `sockScratchSlots`) is #3272's
+// `udpSenderSlot` shape: `let a: [N]i64` needs `N` to be a literal (E0021),
+// so this file's array capacity and the scheduler's advertised worker count
+// are two independent numbers with nothing tying them together.
+//
+// Slot `sockScratchSlots` (one past the last real worker slot) is the
+// FALLBACK for a caller with no current task/worker — mirrors
+// `../../root/darwin/time.bit`'s `timeScratch`, which needs the identical
+// fallback for the identical reason (a driver program, or code the ported
+// scheduler is not running, has no task to index by). Unlike `udpSenderSlot`,
+// which can report "no sender" and skip its write, every function in this
+// file needs a real buffer unconditionally, so there is no -1 case here.
+//
+// The same note is on the Linux twin, deliberately, so the two stay in step.
+const sockScratchSlots: int = 32
+
+@nosplit fn sockScratchSlot(): int {
+  let w = schedCurrentWorker()
+  if (w == 0) {
+    return sockScratchSlots
+  }
+  let id = *(taskAt(w) + wkId)
+  if (id < 0 || id >= schedMaxWorkers || id >= sockScratchSlots) {
+    return sockScratchSlots
+  }
+  return id
+}
+
+// (sockScratchSlots + 1) slots: one per worker plus the fallback.
+let saBuf: [66]i64
+let saBuf2: [66]i64
+let optBuf: [33]i64
+let lenBuf: [33]i64
+let ipBuf: [33]i64
 let tvBuf: [2]i64
 // TWO messages, not one: the query and the reply are both live across the same
 // `recvfrom`, so the region is 2 * netMaxDnsMsg = 1024 bytes = 128 words.
@@ -202,11 +263,11 @@ let dnsBuf: [128]i64
   return z + a
 }
 
-@nosplit fn saBytes(): *u8 { return bytesAt(int(ptrOf(saBuf))) }
-@nosplit fn saBytes2(): *u8 { return bytesAt(int(ptrOf(saBuf2))) }
-@nosplit fn optBytes(): *u8 { return bytesAt(int(ptrOf(optBuf))) }
-@nosplit fn lenBytes(): *u8 { return bytesAt(int(ptrOf(lenBuf))) }
-@nosplit fn ipBytes(): *u8 { return bytesAt(int(ptrOf(ipBuf))) }
+@nosplit fn saBytes(): *u8 { return bytesAt(int(ptrOf(saBuf)) + sockScratchSlot() * 16) }
+@nosplit fn saBytes2(): *u8 { return bytesAt(int(ptrOf(saBuf2)) + sockScratchSlot() * 16) }
+@nosplit fn optBytes(): *u8 { return bytesAt(int(ptrOf(optBuf)) + sockScratchSlot() * 8) }
+@nosplit fn lenBytes(): *u8 { return bytesAt(int(ptrOf(lenBuf)) + sockScratchSlot() * 8) }
+@nosplit fn ipBytes(): *u8 { return bytesAt(int(ptrOf(ipBuf)) + sockScratchSlot() * 8) }
 @nosplit fn tvBytes(): *u8 { return bytesAt(int(ptrOf(tvBuf))) }
 @nosplit fn dnsBytes(): *u8 { return bytesAt(int(ptrOf(dnsBuf))) }
 
