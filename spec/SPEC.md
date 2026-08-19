@@ -1769,6 +1769,18 @@ arrow_p    = IDENT [ ":" type ] .
   function when a `)` is immediately followed by `=>`. This is one token of
   lookahead after the matching `)`.
 
+**Scope.** Each parameter of an arrow function is a new binding in the arrow's
+own scope. The parameter hides any binding of the same name from an enclosing
+scope, for the whole body of the arrow:
+
+```bit
+const v = "hello"
+let g: (int) => int = v => v + 1
+```
+
+The arrow's `v` has the type `int`, inferred from `g`'s parameter type (§15.3);
+it is a distinct binding from the module-level `v` above and does not affect it.
+
 **Capture.** An arrow function may refer to variables declared in an enclosing
 function or block. Those variables are **shared** between the enclosing scope and
 every arrow function that refers to them, and they live as long as any of the
