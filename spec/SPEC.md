@@ -2970,8 +2970,23 @@ bit-import: <name> git <gitURL>
   the format's sole extension point: a future field is appended after the
   existing ones, and an older compiler still parses the line correctly by
   reading the first three tokens and discarding the rest.
+- One such field is defined today: `dir <path>`, naming the subdirectory of
+  the fetched repository that is the package's own root — for a package
+  that lives in a subfolder of a larger repository rather than at the
+  repository's own root (for example, a first-party package living at
+  `pkg/<name>/` inside the `bit` compiler repository itself). `<path>` is a
+  `/`-separated path relative to the repository root: each segment must be
+  non-empty and neither `.` nor `..`, and `<path>` itself must not begin
+  with `/`. It is recognized only immediately after `<gitURL>` — the
+  literal token `dir` as the fifth space-separated token, followed by a
+  sixth holding `<path>` — exactly the shape the extension point already
+  guarantees an older compiler skips harmlessly; any further content after
+  `<path>` is itself still the unconsumed extension point. A document
+  naming no `dir` field resolves the package at the repository root,
+  exactly as before this field existed.
 - A document that does not start with the literal `bit-import:` token, is
-  missing the literal `git` token, or has no `<gitURL>`, is a resolution
+  missing the literal `git` token, has no `<gitURL>`, or names a `dir`
+  field whose `<path>` fails the segment rule above, is a resolution
   failure.
 
 **No subpaths in v1.** A vanity name is matched exactly; there is no prefix
@@ -2996,6 +3011,26 @@ document, so the entry is fully self-describing:
   }
 }
 ```
+
+A dependency whose `bit-import:` document named a `dir` field records that
+field too, as `dir`, so the entry stays self-describing about where inside
+the fetched repository the package actually lives:
+
+```json
+{
+  "toml": {
+    "vanity": "bitlang.org/pkg/toml",
+    "url": "https://github.com/byteink/bit.git",
+    "dir": "pkg/toml",
+    "commit": "9f8e7d6c5b4a3928170695e4d3c2b1a0f9e8d7c",
+    "requires": {}
+  }
+}
+```
+
+A dependency resolved from a document with no `dir` field omits the `dir`
+key entirely, the same "omit rather than write empty" rule `vanity` already
+follows for a direct git-host entry.
 
 A direct git-host dependency's entry omits `vanity` entirely. If `bit up`
 (or any later resolution of the same vanity name) fetches a `bit-import:`
