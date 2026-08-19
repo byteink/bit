@@ -247,16 +247,17 @@ bit_rt_iface_assert(recv: ref, want: usize) -> ref    // panics on mismatch
   typed `T`, so returning the receiver would let a caller that ignores `ok` read
   one concrete type as another. Null is `T`'s zero value.
 - `bit_rt_iface_as_ok` reports the `ok` of the `bit_rt_iface_as` **immediately
-  preceding it**, from a **process-wide** flag, not a per-thread one (Mach-O
-  refuses `@threadlocal` at emission, §11.11). Lowering emits the pair back to
-  back with nothing between them, which is enough to stop a *second assertion
-  on the same task* from landing in the window — it is NOT enough to stop a
-  second, genuinely concurrent OS thread from writing the same flag at the
-  same real time once `BIT_WORKERS>1` (§9). That is a live gap, unlike
-  `bit_rt_chan_recv_ok` (§11) and the fallible-call error slot (§13), which
-  read/write **per-task scratch** instead and are safe at any worker count for
-  that reason — see §22's audit and §5's note on what adjacency does and does
-  not buy. #3280 tracks moving this flag to per-task scratch to close the gap.
+  preceding it**, from a **per-task scratch** slot (`scrIfaceOk`,
+  `runtime/sched/scratch.bit`), not a per-thread one (Mach-O refuses
+  `@threadlocal` at emission, §11.11). Lowering emits the pair back to back
+  with nothing between them, which stops a *second assertion on the same
+  task* from landing in the window; because the slot lives in per-task
+  scratch rather than a process-wide word, it is also safe against a second,
+  genuinely concurrent OS thread writing it at the same real time once
+  `BIT_WORKERS>1` (§9) — the same reason `bit_rt_chan_recv_ok` (§11) and the
+  fallible-call error slot (§13) are safe at any worker count. Until #3280
+  this was a single process-wide flag and that was a live gap; see §22's
+  audit and §5's note on what adjacency does and does not buy.
 - `bit_rt_iface_assert` names both types in its panic message; the descriptors
   already carry them.
 
@@ -1040,11 +1041,13 @@ actually exercised. §22 audits every remaining module-level cell in
   Prove a span cannot park by what it actually calls, never by inferring it
   from the attribute alone.
 
-**A remaining gap.** §2.2's `bit_rt_iface_as_ok` flag is still the
-process-wide shape this note describes as unsound at `BIT_WORKERS>1` — it has
-not yet been moved to per-task scratch alongside its §11/§13 siblings. #3280
-tracks the conversion; until it lands, that one flag is a known, live
-exception to "the adjacency contract holds," not a second instance of it.
+**A closed gap.** §2.2's `bit_rt_iface_as_ok` flag used to be the process-wide
+shape this note describes as unsound at `BIT_WORKERS>1`. #3280 converted it to
+per-task scratch (`scrIfaceOk`, `runtime/sched/scratch.bit`) alongside its
+§11/§13 siblings; `rtIfaceAs`/`rtIfaceAsOk` (`runtime/root/iface.bit`) now read
+and write that slot, and the module-level `ifaceOk` global is gone from
+`runtime/root/root.bit`. The adjacency contract now holds for this flag the
+same way it does for the rest of §5.1.
 
 ---
 
@@ -2485,6 +2488,18 @@ different OS thread — a per-OS-thread slot could not:**
   `end < 0` and `s == 0` paths (cleared at entry, so a prior call's outcome on
   this task never leaks into the next) and `stdlib/fs/fs.bit`'s
   `File.readAll` to read it.
+- `iface_as_ok` (§2.2, #3280) — `runtime/root/iface.bit`'s `rtIfaceAs`/
+  `rtIfaceAsOk` (`bit_rt_iface_as`/`bit_rt_iface_as_ok`) read/write
+  `scrIfaceOk`, word 266 of the same per-task block
+  (`runtime/sched/scratch.bit:98`). Same file and mechanism as the three
+  entries above. **Until #3280 this was a single process-wide word**
+  (`runtime/root/root.bit`'s `let ifaceOk: i64 = 0`, now removed), sound only
+  against a second assertion on the *same* task — adjacency does nothing to
+  stop a different, concurrently running OS thread from writing the same
+  global word once `BIT_WORKERS>1`, the identical false conclusion #3272 and
+  #3273 disproved for their own buffers. Reproduced and fixed by moving the
+  flag to per-task scratch, the same migration-safety reason `scrRecvOk` and
+  the error slot are shaped this way.
 
 **Per-OS-thread by design, each because nothing between the write and its
 matching read can cross a scheduling point — a green task migrates workers
@@ -2523,23 +2538,11 @@ per-worker storage, not a single shared word (§5.1):**
   all, in this file or any other — there is nothing to race because there is
   nothing stored.
 
-**NOT yet converted — a single process-wide word, unsound at
-`BIT_WORKERS>1` (a live gap, not a guarantee; §5.1):**
-- `runtime/root/root.bit`: `ifaceOk` (`root.bit:293`) — read via
-  `bit_rt_iface_as_ok`, written by `bit_rt_iface_as` (§2.2). Adjacency
-  (codegen always emits the read directly after the paired write, with no
-  yield between) stops a *second assertion on the same task* from landing in
-  the window between the two calls. It does nothing to stop a **different**
-  task, on a **different, concurrently running** OS thread, from writing this
-  same global word at the same real time once more than one worker exists
-  (#1900) — `ifaceOk` is one word, not `schedMaxWorkers` words, so it has none
-  of the per-worker isolation the bullet above now has. This entry used to sit
-  in the "Per-OS-thread by design" category above and drew the identical false
-  conclusion from adjacency that #3272 and #3273 disproved for their own
-  buffers; corrected here rather than left standing. #3280 tracks moving it to
-  per-task scratch, the shape §11's `scrRecvOk` and §13's error slot already
-  use, which closes the gap for the same migration-safety reason those two
-  were put there.
+**NOT yet converted: NOT FOUND.** This category held exactly one entry,
+`iface_as_ok`'s `ifaceOk` flag, and #3280 converted it to per-task scratch —
+see the "Per-task scratch" list above. Nothing in `runtime/**/*.bit` is
+currently a single process-wide word carrying a live cross-task race under
+`BIT_WORKERS>1`.
 
 **Global, mutated, but inert or already atomic: NOT FOUND.** Neither
 `scan_ctx` nor `select_seed_counter`, as this section previously described
