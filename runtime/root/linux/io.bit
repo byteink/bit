@@ -51,6 +51,9 @@
 import { strPtr, strLen, dynTypeOf } from "../../root"
 import { loadWord, gcTiNamePtr, gcTiNameLen } from "../../gc"
 import { sysChmodX64, sysClockGettime, sysClone, sysClose, sysExecve, sysExitGroup, sysFchmodatArm64, sysForkX64, sysGetdents64, sysKill, sysLseek, sysMkdirX64, sysMkdiratArm64, sysNanosleep, sysOpenX64, sysOpenatArm64, sysRead, sysReadlinkX64, sysReadlinkatArm64, sysRmdirX64, sysRtSigaction, sysSetpgid, sysUnlinkX64, sysUnlinkatArm64, sysWait4, sysWrite } from "../../syscalls"
+import { schedMaxWorkers } from "../../sched"
+// `taskAt`, `wkId` and `schedCurrentWorker` are already imported into this
+// module by ./boot.bit and ./time.bit (an import is per-module, not per-file).
 
 // Syscall numbers are per-architecture and Bit has no arch-conditional
 // compilation, so the number is selected at run time (§11.8). The ordinal is 0
@@ -223,10 +226,51 @@ fn rootWriteAll(fd: int, addr: int, n: int) {
 //
 // A scalar array is never scanned by the collector (ABI.md §5, rule 1). That is
 // required here and harmless: this holds a packed byte constant, never an object
-// address. Unlocked, sound under the ABI's single-worker contract (§5) on the
-// same terms as ../fs.bit's `fsPathBuf` — it is filled and written inside one
-// poll-free call, so no second caller can interleave.
-let ioConstBuf: [1]i64
+// address.
+//
+// PER-WORKER SLOTS, NOT ONE SHARED WORD (#3276 — this comment used to claim a
+// single module-level word was sound "under the ABI's single-worker contract
+// (§5)"; #1900 booted more than one worker and that contract no longer holds,
+// same class as #3272/#3273). Two panics on two different workers both calling
+// `writeConst` at the same real time can interleave on the SAME shared word: A
+// stores its byte(s), B's concurrent call overwrites them before A's
+// `rootWriteAll` reads the address back for the syscall, and A's stderr line
+// is spliced with B's bytes.
+//
+// WHY PER-WORKER IS SOUND HERE: `writeConst` below resolves its slot's address
+// ONCE into a local and uses that SAME address for both the store and the
+// read, and the whole span between them takes no park. `rootWriteAll` is
+// `@nosplit`, so it emits no back-edge safepoint poll (§10.3.1; ABI.md
+// already states this for this exact function: "`rootWriteAll` ... is
+// `@nosplit`, so no safepoint is ever reached"), and neither it nor
+// `writeConst` calls `schedPark`/`schedSwitch` — checked by reading the
+// callee chain, not inferred from `@nosplit` alone. So the slot resolved for
+// the write is the slot resolved for the read, whichever worker that is.
+//
+// The double bound (`schedMaxWorkers` AND `ioConstScratchSlots`) is #3272's
+// `udpSenderSlot` shape: `let a: [N]i64` needs `N` to be a literal (E0021), so
+// this file's array capacity and the scheduler's advertised worker count are
+// two independent numbers with nothing tying them together.
+const ioConstScratchSlots: int = 32
+
+@nosplit fn ioConstScratchSlot(): int {
+  let w = schedCurrentWorker()
+  if (w == 0) {
+    return ioConstScratchSlots
+  }
+  let id = *(taskAt(w) + wkId)
+  if (id < 0 || id >= schedMaxWorkers || id >= ioConstScratchSlots) {
+    return ioConstScratchSlots
+  }
+  return id
+}
+
+// (ioConstScratchSlots + 1) slots: one per worker plus a fallback slot for a
+// caller with no current task/worker — mirrors ./time.bit's `timeScratch`,
+// which needs the identical fallback for the identical reason (a driver
+// program, or code the ported scheduler is not running, has no task to index
+// by).
+let ioConstBuf: [33]i64
 
 // Write `nbytes` low bytes of the packed constant `word` to `fd`.
 //
@@ -246,8 +290,9 @@ let ioConstBuf: [1]i64
 // this function itself: the buffer below is module state, so the collector never
 // scans it, which is exactly why it must never hold an object address.
 @nosplit fn writeConst(fd: int, word: int, nbytes: int) {
-  storeWord(int(ptrOf(ioConstBuf)), word)
-  rootWriteAll(fd, int(ptrOf(ioConstBuf)), nbytes)
+  let addr = int(ptrOf(ioConstBuf)) + ioConstScratchSlot() * 8
+  storeWord(addr, word)
+  rootWriteAll(fd, addr, nbytes)
 }
 
 // The bytes of the port-heap `string` at `s` (ABI.md §2: a `{ptr, len}` header
