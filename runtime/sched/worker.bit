@@ -22,7 +22,8 @@
 //                        concurrently (a worker's idle path and the boot
 //                        thread's own poll-wait) never share a buffer.
 //   29       lastDone    the task retired THIS step, 0 if none (#2167)
-//   30..33   reserved
+//   30       runNext     the one-task next-run slot (#3264)
+//   31..33   reserved
 //   34..291  deque       this worker's local run queue (`dqWords`)
 export const wkCtx: int = 0
 export const wkId: int = 22
@@ -58,6 +59,16 @@ export const wkSleepReq: int = 27
 // it must release. One of the five words previously reserved above —
 // `workerWords` is unchanged.
 export const wkLastDone: int = 29
+
+// This worker's NEXT-RUN SLOT: one task handed to it by a wake that happened on
+// this very worker, so a lock handoff stays on the core that already owns the
+// cache lines (#3264). `queue.bit`'s `rnTake`/`rnPut`/`rnNonEmpty` own the
+// discipline — read that header for why a peer may reach this only from the slow
+// idle turn, and why `schedFindWork` consults it AFTER the ring rather than
+// before. One of the four words previously reserved above; `workerWords` is
+// unchanged, which `tests/stress/schedspawnowner` asserts (`workerWords == 292`).
+export const wkRunNext: int = 30
+
 export const wkDeque: int = 34
 export const workerWords: int = 292
 
@@ -151,6 +162,10 @@ export @nosplit @symbol("bit_rt_port_sched_init") fn schedInit(s: *i64, workersA
     *(w + wkRunning) = 0
     *(w + wkDisposition) = taskRunning
     *(w + wkSched) = int(s)
+    // The next-run slot starts empty (#3264). Explicit rather than relying on a
+    // zeroed block: every other field here is initialised too, and a stale
+    // address in this word would be dispatched as a task.
+    atomicStore(w + wkRunNext, 0)
     dqInit(w + wkDeque)
     i = i + 1
   }
@@ -292,6 +307,16 @@ export @nosplit @symbol("bit_rt_port_sched_find_work") fn schedFindWork(w: *i64)
   if (local != 0) {
     return local
   }
+  // THIS WORKER'S OWN NEXT-RUN SLOT (#3264), and its position is load-bearing:
+  // after the ring, before the global queue. See `rnTake`'s header — ahead of
+  // the ring an unbroken chain of wakes starves a task the ring already holds,
+  // which at `BIT_WORKERS=1` no thief can rescue; here the slot inherits exactly
+  // the global queue's existing starvation properties and adds no new class.
+  // Only the OWNER reaches it from this path, so nothing here is a steal.
+  let next = rnTake(w)
+  if (next != 0) {
+    return next
+  }
   let s = taskAt(*(w + wkSched))
   let spilled = gqPop(s + scGlobal)
   if (spilled != 0) {
@@ -338,6 +363,14 @@ export @nosplit @symbol("bit_rt_port_sched_find_work") fn schedFindWork(w: *i64)
 // name no archive member defines (see `sleep.bit`'s `lockOf` note).
 export @nosplit @symbol("bit_rt_port_sched_work_pending") fn schedWorkPending(w: *i64): bool {
   if (dqNonEmpty(w + wkDeque)) {
+    return true
+  }
+  // This worker's own next-run slot (#3264), for the same reason every other
+  // probe here is present: the answer must be exactly "could `schedFindWork`
+  // return something", and that path takes this slot. A PEER's slot is
+  // deliberately NOT probed — `schedFindWork` cannot take one, so reporting it
+  // would send the spin into find-work passes that provably come back 0.
+  if (rnNonEmpty(w)) {
     return true
   }
   let s = taskAt(*(w + wkSched))
@@ -462,7 +495,45 @@ export @symbol("bit_rt_port_sched_find_work_at") fn schedFindWorkAt(w: *i64, now
       return t
     }
   }
+  // THE NEXT-RUN SLOT'S SAFETY VALVE (#3264), and it is here — the slow idle
+  // turn — rather than in `schedFindWork` on purpose. A peer's slot holds a task
+  // its owner will run the moment it stops running the current one, so competing
+  // for it is the migration this ticket removes; but an owner that keeps running
+  // for a long time (a CPU-bound body, an unbracketed blocking syscall) would
+  // otherwise make a peer wait on it while cores sit idle. Reaching it only from
+  // here bounds that: this runs once per idle turn, never inside `spinForWork`'s
+  // burst, and worker 0 never parks, so an occupied slot is picked up within one
+  // `parkMaxBackoffNs` at worst. LAST, after the timer probe, because an expired
+  // timer is already-owed work.
+  let stolen = schedStealRunNext(w, s)
+  if (stolen != 0) {
+    return stolen
+  }
   schedCheckDeadlock(s)
+  return 0
+}
+
+// One bounded pass over the worker array, taking the first occupied next-run
+// slot that is not this worker's own (Power of 10: the trip count is the worker
+// count, which `threadMaxWorkers` caps at 1024). Own slot excluded because
+// `schedFindWork` has already emptied it on the path that reaches here.
+//
+// Cannot disturb `schedCheckDeadlock` below it: that check acts only at
+// `nworkers == 1`, where this loop's only candidate index is the caller's own
+// and it therefore returns 0 without touching a word.
+@nosplit fn schedStealRunNext(w: *i64, s: *i64): int {
+  let n = *(s + scNWorkers)
+  let me = *(w + wkId)
+  let i = 0
+  while (i < n) {
+    if (i != me) {
+      let t = rnTake(schedWorkerAt(s, i))
+      if (t != 0) {
+        return t
+      }
+    }
+    i = i + 1
+  }
   return 0
 }
 
