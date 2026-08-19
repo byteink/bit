@@ -57,10 +57,21 @@ const osWExitShift: int = 256
 // os_self_exe
 // ---------------------------------------------------------------------------
 
-// "/proc/self/exe" scratch, NUL-terminated. MODULE-LEVEL and unlocked, sound only
-// under the single-worker contract (ABI.md §5), exactly as ../fs.bit's `fsDirBuf`.
-// A scalar array is never scanned by the collector (rule 1). 16 bytes hold the
-// 14-byte literal plus its NUL.
+// "/proc/self/exe" scratch, NUL-terminated. MODULE-LEVEL AND SHARED, but SAFE
+// AT ANY WORKER COUNT for the same reason `runtime/rand/linux/entropy.bit`'s
+// `randPathBuf` is (#3277): the 15 bytes this buffer ever holds are a
+// COMPILE-TIME CONSTANT, "/proc/self/exe\0", written ONLY by the 15 hardcoded
+// `storeByte` calls in `osFillProcSelfExe` below and nothing else ever writes
+// it. Two callers racing `osFillProcSelfExe` on different workers write those
+// identical 15 bytes in either order -- the race is idempotent, there is no
+// value one caller could observe that the other did not also just write. NOT
+// a single-worker/adjacency argument (that contract no longer holds -- #1900,
+// ABI.md §5.1) and NOT a per-worker conversion either: content invariance is
+// what makes this one safe. Contrast ../darwin/os.bit's `osRawExe` et al,
+// which hold the SAME process-constant path but are filled by opaque
+// libSystem calls rather than hardcoded stores, so that side gets the
+// per-worker treatment instead. A scalar array is never scanned by the
+// collector (rule 1). 16 bytes hold the 14-byte literal plus its NUL.
 let osProcSelfExe: [2]i64
 
 // Fill `osProcSelfExe` with "/proc/self/exe\0" and return its address. Written
@@ -116,12 +127,46 @@ export @nosplit @symbol("bit_rt_os_self_exe") fn rtOsSelfExe(): int {
 // os_run / os_run_test — fork + execve + wait4
 // ---------------------------------------------------------------------------
 
-// child `argv` = [path, NULL] and the wait(2) status cell. Both MODULE-LEVEL and
-// unlocked, sound under the single-worker contract (ABI.md §5): a `run` fully
-// completes (fork through wait) before any other `run` can begin, with no park
-// between filling and reading. Scalars, never scanned (rule 1).
-let osArgvBuf: [2]i64
-let osStatusBuf: [1]i64
+// ---------------------------------------------------------------------------
+// Per-worker scratch slot (#3277): #1900 booted more than one worker, so every
+// buffer below that used to read "sound under the single-worker contract" is a
+// real race at BIT_WORKERS>1 -- two workers calling `bit_rt_os_run`/`_test`/
+// `_bounded` at the same real time clobber each other's scratch. Shared by
+// the run and clock scratch below, the same shape `runtime/net/darwin/sock.bit`'s
+// `sockScratchSlot` (#3273) and ./io.bit's `ioConstScratchSlot` (#3276)
+// established. Double-bounded (`schedMaxWorkers` AND `osScratchSlots`, since
+// `let a: [N]i64` needs a literal `N` -- the two numbers have nothing tying
+// them together).
+// ---------------------------------------------------------------------------
+const osScratchSlots: int = 32
+
+@nosplit fn osScratchSlot(): int {
+  let w = schedCurrentWorker()
+  if (w == 0) {
+    return osScratchSlots
+  }
+  let id = *(taskAt(w) + wkId)
+  if (id < 0 || id >= schedMaxWorkers || id >= osScratchSlots) {
+    return osScratchSlots
+  }
+  return id
+}
+
+// child `argv` = [path, NULL] and the wait(2) status cell. PER-WORKER (#3277):
+// nothing serialises `bit_rt_os_run`/`_test`/`_bounded` -- two workers can call
+// the predeclared `osRun` builtin (or `bit_rt_os_run_bounded`) at the same real
+// time, and "a run fully completes before another can begin" was asserted,
+// never enforced -- grep found no lock anywhere near these call sites. Each
+// caller resolves the slot ONCE (`osScratchSlot`) and reuses it through
+// fork/exec/wait: neither `osForkExecWait` nor `osForkExecWaitBounded` calls
+// `schedPark`/`schedSwitch` anywhere in their callee chain (`fork`/`clone`/
+// `execve`/`wait4` are raw syscall traps; the `gcSyscallBegin`/`gcSyscallEnd`
+// bracket around `wait4`/`nanosleep` only publishes this thread's registers
+// for a conservative scan -- traced into `worldBeginSyscall`/`worldEndSyscall`,
+// neither of which parks either), so the task never migrates workers
+// mid-call. Scalars, never scanned (rule 1).
+let osArgvBuf: [66]i64      // (osScratchSlots+1) * 2
+let osStatusBuf: [33]i64    // (osScratchSlots+1) * 1
 
 // child env for `os_run_test`: "BIT_TEST_INDEX=<idx>" prepended to the inherited
 // entries. `max_env` (runtime/root/) = 1024 inherited + the prepended var + the NULL
@@ -214,7 +259,7 @@ let osIdxBuf: [8]i64
     syscall(sysExecve(), i64(pathPtr), i64(argvPtr), i64(envpPtr))
     rootExit(127)
   }
-  let sb = int(ptrOf(osStatusBuf))
+  let sb = int(ptrOf(osStatusBuf)) + osScratchSlot() * 8
   storeWord(sb, 0)
   let tries = 0
   let ok = false
@@ -301,7 +346,7 @@ export @nosplit @symbol("bit_rt_os_run_test") fn rtOsRunTest(path: int, idx: int
   if (p == 0) {
     return 0 - 1
   }
-  let ab = int(ptrOf(osArgvBuf))
+  let ab = int(ptrOf(osArgvBuf)) + osScratchSlot() * 16
   storeWord(ab, p)
   storeWord(ab + 8, 0)
 
@@ -353,11 +398,13 @@ export @nosplit @symbol("bit_rt_os_run_test") fn rtOsRunTest(path: int, idx: int
 // raw `nanosleep` syscall rather than `rtTimeSleepNs` (../linux/time.bit) —
 // that call parks the green thread on the scheduler, which is NOT `@nosplit`.
 
-// timespec scratch for `osMonoNs`/`osPollSleep` — module-level and unlocked,
-// the same single-worker sharing contract as `osStatusBuf` above (a `run`
-// completes fully before another can begin). Scalars, never scanned (rule 1).
-let osClockBuf: [2]i64
-let osSleepReqBuf: [2]i64
+// timespec scratch for `osMonoNs`/`osPollSleep` -- PER-WORKER (#3277), the
+// same shape and the same no-park proof as `osStatusBuf` above (`osMonoNs` is
+// a plain `clock_gettime` syscall; `osPollSleep`'s `nanosleep` is bracketed by
+// `gcSyscallBegin`/`gcSyscallEnd`, which does not park). Scalars, never
+// scanned (rule 1).
+let osClockBuf: [66]i64      // (osScratchSlots+1) * 2
+let osSleepReqBuf: [66]i64   // (osScratchSlots+1) * 2
 
 // CLOCK_MONOTONIC = 1 (include/uapi/linux/time.h; `runtime/park/linux`'s clock, the
 // one `rtTimeMonoNs`/`parkMonoNs` read). Opened directly here rather than
@@ -369,7 +416,7 @@ const osClockMonotonic: int = 1
 const osNsPerSec: int = 1000000000
 
 @nosplit fn osMonoNs(): int {
-  let ts = int(ptrOf(osClockBuf))
+  let ts = int(ptrOf(osClockBuf)) + osScratchSlot() * 16
   let rc = int(syscall(sysClockGettime(), i64(osClockMonotonic), i64(ts)))
   if (rc != 0) {
     return 0
@@ -396,7 +443,7 @@ const osPollNs: int = 2000000
 // The bracket is around the SLEEP alone, so the shared `osStatusBuf` write in
 // the non-blocking `waitpid(WNOHANG)` stays on the `running` side of the state.
 @nosplit fn osPollSleep() {
-  let req = int(ptrOf(osSleepReqBuf))
+  let req = int(ptrOf(osSleepReqBuf)) + osScratchSlot() * 16
   storeWord(req, 0)
   storeWord(req + 8, osPollNs)
   gcSyscallBegin()
@@ -480,7 +527,7 @@ const osWnohang: int = 1
   // no-op — the child's own call already set it.
   syscall(sysSetpgid(), i64(forked), i64(forked))
 
-  let sb = int(ptrOf(osStatusBuf))
+  let sb = int(ptrOf(osStatusBuf)) + osScratchSlot() * 8
   let polls = 0
   let result = 0 - 1
   let done = false
@@ -536,7 +583,7 @@ export @nosplit @symbol("bit_rt_os_run_bounded") fn rtOsRunBounded(path: int, ti
   if (p == 0) {
     return 0 - 1
   }
-  let ab = int(ptrOf(osArgvBuf))
+  let ab = int(ptrOf(osArgvBuf)) + osScratchSlot() * 16
   storeWord(ab, p)
   storeWord(ab + 8, 0)
   return osForkExecWaitBounded(p, ab, osEnvp(), timeoutMs)
@@ -549,7 +596,7 @@ export @nosplit @symbol("bit_rt_os_run_test_bounded") fn rtOsRunTestBounded(path
   if (p == 0) {
     return 0 - 1
   }
-  let ab = int(ptrOf(osArgvBuf))
+  let ab = int(ptrOf(osArgvBuf)) + osScratchSlot() * 16
   storeWord(ab, p)
   storeWord(ab + 8, 0)
 
