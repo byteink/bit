@@ -181,6 +181,15 @@ fetched document names), and never applies to the git fetch of that resolved
 URL - only to the vanity document request itself. Unset, resolution is
 byte-identical to not having this variable at all.
 
+A `bit-import:` document may additionally name `dir <path>`, appended after
+`<gitURL>` on the same line (spec §17.7's vanity document extension point) -
+the subdirectory of the fetched repository that is the package's own root,
+for a package that lives in a subfolder of a larger repository rather than
+at its root (a first-party package under `bit/pkg/<name>/`, for example).
+`bit.lock` records it as `dir`, beside `vanity`; a document naming no `dir`
+field resolves the package at the repository root and the entry omits the
+key entirely, exactly as before this field existed.
+
 ## Importing a dependency
 
 A bare import name (anything that isn't `std/...` or a relative `./`/`../`
