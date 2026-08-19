@@ -4,6 +4,8 @@
 **Status:** Authoritative. Compiler, docs, TextMate grammar, and tests derive from this document. Any change discovered during implementation is made here first.
 **Date:** 2026-07-03
 
+<!-- doctest: per-block -->
+
 Bit is a systems programming language with TypeScript-flavored syntax and Go-like
 semantics. It compiles to a single static native binary with no runtime
 dependency for the end user. The primary design goal is **easy to write**:
@@ -1797,8 +1799,11 @@ fn counter(): () => int {
   let n = 0
   return () => { n = n + 1; return n }   // one n, shared with the closure
 }
-let c = counter()
-print("${c()} ${c()} ${c()}")            // 1 2 3
+
+fn main() {
+  let c = counter()
+  print("${c()} ${c()} ${c()}")            // 1 2 3
+}
 ```
 
 Sharing runs in both directions and between siblings. A write through one arrow
@@ -1807,10 +1812,12 @@ the same variable, and a write the enclosing scope makes **after** the arrow
 function was created is visible to it:
 
 ```bit
-let n = 0
-let peek = () => n
-n = 41
-print("${peek()}")                       // 41 — not the value at creation
+fn main() {
+  let n = 0
+  let peek = () => n
+  n = 41
+  print("${peek()}")                       // 41 — not the value at creation
+}
 ```
 
 Capture is not a copy, so §13.3's value/reference split does not apply to it: a
@@ -1959,24 +1966,28 @@ that moment. This is only observable through capture (§12.8), and it is what ma
 the common idiom mean what it reads as:
 
 ```bit
-let fs = []( () => int )(0)
-for (let i = 0; i < 3; i = i + 1) {
-  fs = append(fs, () => i)               // each closure keeps its OWN i
+fn main() {
+  let fs = []( () => int )(0)
+  for (let i = 0; i < 3; i = i + 1) {
+    fs = append(fs, () => i)               // each closure keeps its OWN i
+  }
+  print("${fs[0]()} ${fs[1]()} ${fs[2]()}")   // 0 1 2
 }
-print("${fs[0]()} ${fs[1]()} ${fs[2]()}")   // 0 1 2
 ```
 
 A `while` loop declares nothing, so a variable it counts is **one** variable and
 every closure over it shares that one:
 
 ```bit
-let gs = []( () => int )(0)
-let j = 0
-while (j < 3) {
-  gs = append(gs, () => j)
-  j = j + 1
+fn main() {
+  let gs = []( () => int )(0)
+  let j = 0
+  while (j < 3) {
+    gs = append(gs, () => j)
+    j = j + 1
+  }
+  print("${gs[0]()} ${gs[1]()} ${gs[2]()}")   // 3 3 3
 }
-print("${gs[0]()} ${gs[1]()} ${gs[2]()}")   // 3 3 3
 ```
 
 ### 13.2 Assignment vs Declaration
