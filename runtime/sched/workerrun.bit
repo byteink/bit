@@ -379,8 +379,7 @@ export @nosplit @symbol("bit_rt_port_sched_spawn") fn schedSpawn(s: *i64, task: 
   schedWakeIdle(s)
 }
 
-// Make a parked task runnable again, from any thread. Routes through the global
-// queue because the caller may not be a worker at all. `runtime/sched/`'s `unpark`.
+// Make a parked task runnable again, from any thread. `runtime/sched/`'s `unpark`.
 //
 // The compare-and-exchange both checks the precondition and performs the
 // transition, so a double unpark cannot race itself onto the queue twice.
@@ -388,10 +387,57 @@ export @nosplit @symbol("bit_rt_port_sched_spawn") fn schedSpawn(s: *i64, task: 
 // stricter contract
 // does: a panic is not available in a `@nosplit` body, and a caller that can see
 // the answer can react to it.
+//
+// ---------------------------------------------------------------------------
+// PLACEMENT (#3264): the waker's own next-run slot, not the global queue
+// ---------------------------------------------------------------------------
+//
+// This used to be an unconditional `gqPush` + `schedWakeIdle`, and for a
+// contended lock that is the worst possible placement. `Mutex.lock()` is
+// `<- m.token` on a capacity-1 channel, so N waiters serialise onto ONE runnable
+// task; publishing it globally and waking a peer hands that single task to a
+// DIFFERENT core on nearly every handoff, which pays a cache-line migration for
+// the lock word, the channel and the task record — measured on the unchanged
+// binary as 0.01s at one worker against 0.10s at two, before parking cost is
+// even in play. `queue.bit`'s next-run slot header has the full argument.
+//
+// The guard is `schedSpawn`'s, verbatim and for the identical reason: the fast
+// path is valid only when the running worker belongs to `s`. `schedCurrentWorker`
+// answers "which worker is this STACK on" and says nothing about which scheduler
+// that worker serves, so without the `wkSched` check a caller running as a green
+// task of one scheduler would hand the task to a worker that never reads `s`'s
+// queues, and it would simply never run (`tests/stress/schedpolldarwin` is the
+// program that caught that shape).
+//
+// NO `schedWakeIdle` ON THE SLOT PATH, and that is the syscall this removes
+// rather than an omission. The task is in the slot of a worker that is awake by
+// construction — this code is running ON it — and that worker takes it on its
+// very next find-work pass. Waking a peer instead spends a `__ulock_wake` on a
+// thread that cannot even see the slot. The `sleep.bit` test for a wake site is
+// "can a DIFFERENT worker now find work it could not find a moment ago", and on
+// this path the answer is no.
+//
+// A DISPLACED OCCUPANT IS NEVER DROPPED. Two wakes from the same worker with no
+// find-work between them (a `close` broadcasting, a select) evict the first,
+// which then goes somewhere every worker can reach — and it does get a wake,
+// because the `rnPut` that placed it issued none.
 export @nosplit @symbol("bit_rt_port_sched_unpark") fn schedUnpark(s: *i64, task: int): bool {
   let t = taskAt(task)
   if (!atomicCmpxchg(t + taskState, taskParked, taskRunnable)) {
     return false
+  }
+  let wAddr = schedCurrentWorker()
+  if (wAddr != 0 && *(taskAt(wAddr) + wkSched) == int(s)) {
+    let w = taskAt(wAddr)
+    let evicted = rnPut(w, task)
+    if (evicted == 0) {
+      return true
+    }
+    if (!dqPushBottom(w + wkDeque, evicted)) {
+      gqPush(s + scGlobal, evicted)
+    }
+    schedWakeIdle(s)
+    return true
   }
   gqPush(s + scGlobal, task)
   schedWakeIdle(s)

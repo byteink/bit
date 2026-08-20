@@ -105,6 +105,95 @@ export @nosplit fn dqNonEmpty(q: *i64): bool {
 }
 
 // ---------------------------------------------------------------------------
+// The next-run slot: one task the owning worker reaches before the queues (#3264)
+// ---------------------------------------------------------------------------
+//
+// Go's `p.runnext`, and it is here for one measured reason. A contended
+// `std/sync` lock is `<- m.token` on a capacity-1 channel, so N green threads
+// serialise onto exactly ONE runnable task and every `unlock()` republishes it.
+// `schedUnpark` pushed that task to the GLOBAL queue unconditionally, where any
+// worker may take it — and the ring above is popped by its owner from the same
+// end thieves steal from, so a peer very often wins the race. The one runnable
+// task therefore changed core on nearly every handoff, paying a cache-line
+// migration for the lock word, the channel and the task record. The unchanged
+// binary shows it as a 10x cliff between one worker (0.01s) and two (0.10s), at
+// the exact point migration first becomes possible and long before parking cost
+// dominates — which is why it is a separate defect from #3260's park/wake one
+// and why #3260's bounded idle spin did not move it.
+//
+// AT MOST ONE TASK, AND DELIBERATELY NOT PART OF THE RING. `dqSteal` cannot see
+// this word, so a spinning peer cannot take the task out from under the worker
+// that is about to run it. That invisibility IS the mechanism; it is not an
+// optimisation on top of one.
+//
+// STRANDING IS THE RISK, AND IT IS BOUNDED IN TWO PLACES RATHER THAN ARGUED
+// AWAY:
+//
+//   - The slot is filled by the thread that OWNS the worker, from task code
+//     (`schedUnpark`'s `schedCurrentWorker` guard), so that worker is awake by
+//     construction and takes it on its very next find-work pass. For a lock
+//     handoff that is microseconds later, because the waker's next act is to
+//     block on the lock itself.
+//   - When the waker instead keeps running for a long time — a CPU-bound loop,
+//     an unbracketed blocking syscall — the task would wait on it. So
+//     `schedFindWorkAt`, the SLOW idle turn and never the `@nosplit` spin, lets
+//     a peer steal an occupied slot as its last resort. Worker 0 never parks
+//     (see `sleep.bit`'s header), so that probe runs at least once per
+//     `parkMaxBackoffNs`, which makes the worst case the same "latency, not a
+//     deadlock" bound `sleep.bit` already accepts for a lost wake.
+//
+// A note on the ORDER this is consulted in, because it is load-bearing and the
+// obvious choice is the wrong one: `schedFindWork` takes the local ring FIRST
+// and only then this slot. Reversing them would let an unbroken chain of wakes
+// starve a task sitting on the ring — reachable at `BIT_WORKERS=1`, where there
+// is no thief to rescue it — and would also invert the ordering
+// `tests/stress/chan/props`' phase 8 pins ("`schedFindWork` prefers the LOCAL
+// ring over the global queue while `schedUnpark` routes to the GLOBAL queue"),
+// which is how that suite reaches `claim`'s winner-take-all rule at all. Placed
+// after the ring, this slot inherits exactly the global queue's existing
+// starvation properties and adds no new class.
+
+// Take `w`'s next-run slot, or 0. Safe from any thread: the compare-exchange is
+// what hands the task to exactly one taker, the same way `dqPopBottom`'s does.
+//
+// ONE ATTEMPT, NO RETRY LOOP (Power of 10 rule 2 — there is no loop to bound). A
+// lost exchange means another taker already has the task, and reporting empty is
+// then the correct answer rather than a lost task — the identical argument
+// `dqPopBottom` makes for exhausting its own bound.
+export @nosplit fn rnTake(w: *i64): int {
+  let addr = atomicLoad(w + wkRunNext)
+  if (addr == 0) {
+    return 0
+  }
+  if (atomicCmpxchg(w + wkRunNext, addr, 0)) {
+    return addr
+  }
+  return 0
+}
+
+// Put `task` in `w`'s next-run slot and return whatever it DISPLACED: 0 when the
+// slot was empty, the previous occupant when it was not, and `task` itself when
+// the exchange was lost to a concurrent taker.
+//
+// THE RETURNED TASK IS THE CALLER'S TO REQUEUE in both non-zero cases. Dropping
+// it loses a runnable task, which is a hang for whoever is waiting on it.
+//
+// Owner-only, exactly like `dqPushBottom`: the caller must be running on `w`.
+export @nosplit fn rnPut(w: *i64, task: int): int {
+  let old = atomicLoad(w + wkRunNext)
+  if (!atomicCmpxchg(w + wkRunNext, old, task)) {
+    return task
+  }
+  return old
+}
+
+// Is `w`'s next-run slot occupied? The read-only half, for `schedWorkPending` —
+// one plain load, no exchange, sound for the same reason `dqNonEmpty` is.
+export @nosplit fn rnNonEmpty(w: *i64): bool {
+  return atomicLoad(w + wkRunNext) != 0
+}
+
+// ---------------------------------------------------------------------------
 // Global overflow queue
 // ---------------------------------------------------------------------------
 //
