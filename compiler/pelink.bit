@@ -1,0 +1,674 @@
+// Self-host (#3329, epic #3322): the PE32+ static linker + executable writer
+// for x86_64-windows, mirroring elflink.bit's role and macholink.bit's shape.
+// The test box has no linker at all (no link.exe/lld-link/MSVC) — this is not
+// an alternative to a system linker, it is the only one.
+//
+// Pipeline mirrors elflink.bit:6-12: read every input into linkobj.bit's
+// generic object model (via pereader.bit / archive.bit), resolve the
+// whole-link global symbol table, walk from the entry root `_start`
+// collecting reachable atoms, lay the survivors into PE sections, apply every
+// relocation, then emit the DOS stub + PE headers + section table + bytes.
+//
+// Windows has no stable syscall ABI (unlike Linux's ELF), so — like Mach-O's
+// libSystem — a still-undefined global after the walk is a DLL IMPORT, not a
+// link error, exactly macholink.bit/machogot.bit's `undefinedIsImport` rule.
+// Ported from macholink.bit's shape (imports + stub thunks), not elflink.bit's
+// (no dynamic imports on Linux). pesyms.bit is the source of truth for which
+// DLL each import binds from; the import directory is built by grouping this
+// link's referenced imports by that DLL, not by assuming a single DLL — the
+// port reference (below) hardcoded "KERNEL32.dll" because #1103's scope
+// admitted only that one; this generalizes to N DLLs so a future ntdll.dll
+// entry in pesyms.bit needs no change here.
+//
+// THE ONE PLACE PE IS STRUCTURALLY UNLIKE ELF: SectionAlignment (0x1000) and
+// FileAlignment (0x200) differ, so — unlike elflink.bit:15-18's "file layout
+// mirrors memory layout" — a section's file offset is NOT its RVA minus a
+// fixed delta. Two independent cursors are threaded through this file: RVA
+// layout (rvaCursor, section_align-aligned) and file layout (fileCursor,
+// file_align-aligned). plFileOffsetOf is the one place that bridges them, and
+// pelinkcheck.bit's checkPeLinkAlignmentDiffers asserts they actually differ.
+//
+// DYNAMIC BASE + .reloc (not a fixed ImageBase with relocations stripped):
+// modern Windows toolchains always emit ASLR-relocatable images, so this
+// follows suit — DYNAMIC_BASE/HIGH_ENTROPY_VA/NX_COMPAT are set, and every
+// ABS64 field pointing at an internal atom gets a base-relocation entry (the
+// port reference's own choice; PE has no PC-relative-only escape hatch the
+// way a non-PIE ELF ET_EXEC does).
+//
+// SCOPE, matching the port reference's `obj/pe.zig`/pesyms.bit: x86_64 only
+// (aarch64-windows is out of scope for the whole epic), no Windows TLS (a
+// `.tls$` section is rejected by pereader.bit before it ever reaches here),
+// console subsystem. Only two relocation kinds ever reach this file — Pc32
+// and Abs64 — because pereader.bit itself refuses anything else at read time
+// (prRelocKind); the checks below are defense in depth, not the only guard.
+//
+// Port reference: `git show 4ffb5523^:seed/link/pe.zig` (971 Zig lines).
+// Ported, not resurrected: the DLL-grouping generalization above and the
+// ABI.md §4 merged GC stack-map group (elflink.bit/macholink.bit's mechanism)
+// are both additions the Zig seed predates.
+//
+// Split across three sibling files (docs/development.md's 800-line rule,
+// mirroring the macholink.bit/machogot.bit/machoreloc.bit/machocmds.bit
+// family's granularity): this file (the driver — reachability walk, layout,
+// relocation application, ingest); peimport.bit (DLL grouping, .idata,
+// .reloc); pehdr.bit (the RVA/file-offset bridge, PE header + section-table
+// emission). Both siblings sort bytewise before "pelink.bit" so the inliner
+// sees their functions before this file's calls into them.
+
+// ---- constants --------------------------------------------------------
+
+// MS linker's default preferred base for an x64 EXE (well above the null page
+// and any DLL's usual load range).
+fn plImageBase(): int { return 0x140000000 }
+fn plSectionAlign(): int { return 0x1000 }
+fn plFileAlign(): int { return 0x200 }
+// x64 COFF decorates no C symbol names (emitpe.bit's own module comment), so
+// this is unprefixed like elflink.bit's, unlike macholink.bit's "__start".
+fn plEntrySymbol(): string { return "_start" }
+// Offset of the PE signature from file start — fixed rather than "wherever
+// the DOS stub happens to end", matching every real toolchain's output.
+fn plLfanew(): int { return 0x80 }
+// `jmp qword ptr [rip+disp32]` — FF 25 <disp32>, 6 bytes.
+fn plStubWidth(): int { return 6 }
+
+// ---- link input ---------------------------------------------------------
+
+// One input to the link. Bit has no tagged union: `isArchive` selects whether
+// `bytes` is a single relocatable COFF object (the compiled Bit program) or
+// an ar archive (libbitrt.a) whose every member is read as its own module.
+struct PlLinkInput {
+  isArchive: bool,
+  bytes: []u8,
+}
+
+fn plObjectInput(bytes: []u8): PlLinkInput {
+  return PlLinkInput{ isArchive: false, bytes: bytes }
+}
+
+fn plArchiveInput(bytes: []u8): PlLinkInput {
+  return PlLinkInput{ isArchive: true, bytes: bytes }
+}
+
+// ---- atom placement -------------------------------------------------------
+
+// An atom assigned an RVA (relative to the image base — NOT a file offset;
+// see the module comment on why those differ here).
+struct PlPlaced {
+  id: int,
+  rva: int,
+}
+
+// Assigns each atom in `items` an RVA, honouring its own alignment, and
+// returns the cursor past the last one. Structs are reference types, so the
+// PlPlaced records are updated in place.
+fn plPlaceAtoms(modules: []LoModule, items: []PlPlaced, cursor: int): int {
+  let c = cursor
+  let i = 0
+  while (i < len(items)) {
+    let a = modules[atomKeyModule(items[i].id)].atoms[atomKeyAtom(items[i].id)]
+    c = alignForward(c, a.alignment)
+    items[i].rva = c
+    c = c + a.size
+    i = i + 1
+  }
+  return c
+}
+
+// The atoms of one output class, in module then declaration order.
+fn plCollect(modules: []LoModule, kept: map<int, bool>, kind: LoSectionKind): []PlPlaced {
+  let out = []PlPlaced(0)
+  let mi = 0
+  while (mi < len(modules)) {
+    let atoms = modules[mi].atoms
+    let ai = 0
+    while (ai < len(atoms)) {
+      let id = atomKey(mi, ai)
+      let (_, keep) = kept[id]
+      if (keep && atoms[ai].kind == kind) {
+        out = append(out, PlPlaced{ id: id, rva: 0 })
+      }
+      ai = ai + 1
+    }
+    mi = mi + 1
+  }
+  return out
+}
+
+// ---- reachability walk with DLL imports as leaves --------------------------
+
+// Whether an undefined global referenced from module `mi` is a legitimate
+// DLL import rather than a link error. Mirrors machogot.bit's
+// meUndefinedIsImport: an ARCHIVE member (libbitrt.a) is externally-linked
+// code whose undefined names ARE the Windows surface; the PROGRAM object is
+// emitted by us, so every name in it must resolve except a declared §11.7
+// `extern function` (exactly `allowedImports`).
+fn plUndefinedIsImport(mi: int, name: string, programModules: int,
+    allowedImports: []string): bool {
+  if (mi >= programModules) { return true }
+  for a of allowedImports {
+    if (a == name) { return true }
+  }
+  return false
+}
+
+struct PlLinkState {
+  kept: map<int, bool>,
+  // Undefined globals, in first-seen order — these become DLL imports. Order
+  // is load-bearing: stub placement and the IAT index into this (after
+  // DLL-grouping) both key off it.
+  importOrder: []string,
+}
+
+// Walks the reachability graph from `_start`. An undefined global is not
+// automatically an error — it may be a DLL import (plUndefinedIsImport
+// decides), and then it is a leaf. Only a Pc32 (call/lea rel32) reference may
+// target an import: this compiler never takes an extern function's address as
+// data, only ever calls it, so an Abs64 pointed at an import is refused
+// rather than guessed at (mirrors the port reference's `isBranch` gate).
+fn plDeadStripWithImports(modules: []LoModule, globals: map<string, int>,
+    programModules: int, allowedImports: []string): PlLinkState! {
+  let kept = map<int, bool>{}
+  let importOrder = []string(0)
+  let importSeen = map<string, bool>{}
+
+  let (entry, hasEntry) = globals[plEntrySymbol()]
+  if (!hasEntry) {
+    fail newError("pe: missing entry symbol ${plEntrySymbol()}")
+  }
+  kept[entry] = true
+  let stack = [entry]
+  while (len(stack) > 0) {
+    let id = stack[len(stack) - 1]
+    stack = stack[0:len(stack) - 1]
+    let atom = modules[atomKeyModule(id)].atoms[atomKeyAtom(id)]
+    let r = 0
+    while (r < len(atom.relocs)) {
+      let rel = atom.relocs[r]
+      if (rel.kind != LoRelocKind.Pc32 && rel.kind != LoRelocKind.Abs64) {
+        fail newError("pe: unsupported relocation kind")
+      }
+      if (!rel.target.isGlobal) {
+        let tid = atomKey(atomKeyModule(id), rel.target.local)
+        let (_, seen) = kept[tid]
+        if (!seen) {
+          kept[tid] = true
+          stack = append(stack, tid)
+        }
+      } else {
+        let (tid, defined) = globals[rel.target.name]
+        if (defined) {
+          let (_, seen) = kept[tid]
+          if (!seen) {
+            kept[tid] = true
+            stack = append(stack, tid)
+          }
+        } else {
+          if (!plUndefinedIsImport(atomKeyModule(id), rel.target.name, programModules, allowedImports)) {
+            fail newError("undefined symbol '${rel.target.name}', referenced from ${modules[atomKeyModule(id)].name}")
+          }
+          if (rel.kind != LoRelocKind.Pc32) {
+            fail newError("pe: unsupported non-call reference to import '${rel.target.name}'")
+          }
+          let (_, known) = importSeen[rel.target.name]
+          if (!known) {
+            importSeen[rel.target.name] = true
+            importOrder = append(importOrder, rel.target.name)
+          }
+        }
+      }
+      r = r + 1
+    }
+  }
+  return PlLinkState{ kept: kept, importOrder: importOrder }
+}
+
+// ---- the driver -------------------------------------------------------------
+
+// Links `inputModules` into a PE32+ executable, returned as owned bytes.
+// `programModules` is how many of the leading entries came from `.object`
+// inputs (the compiled Bit program) rather than archive members — see
+// plUndefinedIsImport.
+fn linkPeExecutable(inputModules: []LoModule, programModules: int,
+    allowedImports: []string): []u8! {
+  // ABI.md §4: the merged GC stack-map table's bounds are linker-defined, so
+  // the boundary symbols enter the link as a synthetic module. It goes in
+  // BEFORE resolution so the runtime's extern references resolve like any
+  // other global, last so its index is stable. "" prefix: x64 COFF decorates
+  // no C symbol names.
+  let modules = inputModules
+  let markerModuleIdx = len(modules)
+  modules = append(modules, markerModule(""))
+
+  let globals = resolveGlobals(modules)?
+  let st = plDeadStripWithImports(modules, globals, programModules, allowedImports)?
+  let kept = st.kept
+  // The boundary markers are kept unconditionally: the runtime's externs must
+  // resolve even for a program whose every stack-map entry was stripped.
+  kept[atomKey(markerModuleIdx, markerStartAtom())] = true
+  kept[atomKey(markerModuleIdx, markerEndAtom())] = true
+
+  // A split mutable global (-fdata-sections-style adjacent pieces) must stay
+  // contiguous in its original layout even if some pieces are otherwise
+  // unreferenced — same rule as elflink.bit's, and the port reference's own.
+  let mi = 0
+  while (mi < len(modules)) {
+    let atoms = modules[mi].atoms
+    let ai = 0
+    while (ai < len(atoms)) {
+      let k = atoms[ai].kind
+      if (k == LoSectionKind.Data || k == LoSectionKind.Bss) {
+        kept[atomKey(mi, ai)] = true
+      }
+      ai = ai + 1
+    }
+    mi = mi + 1
+  }
+
+  // ---- collect kept atoms, partitioned by output class -----------------------
+  let text = plCollect(modules, kept, LoSectionKind.Text)
+  let rdata = plCollect(modules, kept, LoSectionKind.Rodata)
+  let data = plCollect(modules, kept, LoSectionKind.Data)
+  let bss = plCollect(modules, kept, LoSectionKind.Bss)
+  // Windows TLS is out of scope (module comment); pereader.bit never
+  // classifies a section into any of these three, so a module this linker
+  // sees can never carry one — fail loud rather than silently drop it.
+  if (len(plCollect(modules, kept, LoSectionKind.TlsVars)) > 0 ||
+      len(plCollect(modules, kept, LoSectionKind.TlsData)) > 0 ||
+      len(plCollect(modules, kept, LoSectionKind.TlsBss)) > 0) {
+    fail newError("pe: tls section in a PE link")
+  }
+
+  // Merged GC stack-map group (ABI.md §4): appended to .rdata as one
+  // contiguous run BEFORE layout, so it lands between nothing else.
+  let gcGroup = mergedStackMapAtoms(modules, globals, kept, markerModuleIdx)?
+  let gcIdx = 0
+  while (gcIdx < len(gcGroup)) {
+    rdata = append(rdata, PlPlaced{ id: gcGroup[gcIdx], rva: 0 })
+    gcIdx = gcIdx + 1
+  }
+
+  // ---- layout: RVAs first (headers occupy their own leading page) -----------
+  let stubWidth = plStubWidth()
+  let nImports = len(st.importOrder)
+
+  let rvaCursor = plSectionAlign()
+  let textRva = rvaCursor
+  rvaCursor = plPlaceAtoms(modules, text, rvaCursor)
+  let stubsRva = alignForward(rvaCursor, 4)
+  rvaCursor = stubsRva + nImports * stubWidth
+  let textVsize = rvaCursor - textRva
+
+  rvaCursor = alignForward(rvaCursor, plSectionAlign())
+  let rdataRva = rvaCursor
+  rvaCursor = plPlaceAtoms(modules, rdata, rvaCursor)
+  let rdataVsize = rvaCursor - rdataRva
+  let hasRdata = rdataVsize > 0
+
+  rvaCursor = alignForward(rvaCursor, plSectionAlign())
+  let dataRva = rvaCursor
+  rvaCursor = plPlaceAtoms(modules, data, rvaCursor)
+  let dataVsize = rvaCursor - dataRva
+  let hasData = dataVsize > 0
+
+  // ---- address lookup for every placed atom ----------------------------------
+  let addrOf = map<int, int>{}
+  let placedGroups = [text, rdata, data]
+  let gi = 0
+  while (gi < len(placedGroups)) {
+    let g = placedGroups[gi]
+    let i = 0
+    while (i < len(g)) {
+      addrOf[g[i].id] = g[i].rva
+      i = i + 1
+    }
+    gi = gi + 1
+  }
+
+  let (entryId, hasEntryId) = globals[plEntrySymbol()]
+  if (!hasEntryId) {
+    fail newError("pe: missing entry symbol ${plEntrySymbol()}")
+  }
+  let (entryRva, hasEntryRva) = addrOf[entryId]
+  if (!hasEntryRva) {
+    fail newError("pe: entry symbol ${plEntrySymbol()} was stripped")
+  }
+
+  // ---- base-relocation collection: every internal ABS64 field ---------------
+  // An ABS64 pointed at an import is already impossible here (rejected during
+  // the reachability walk, since only Pc32 may target an import) — checked
+  // again defensively, matching the port reference's own redundancy.
+  let baseRelocs = []int(0)
+  mi = 0
+  while (mi < len(modules)) {
+    let atoms = modules[mi].atoms
+    let ai = 0
+    while (ai < len(atoms)) {
+      let id = atomKey(mi, ai)
+      let (_, keep) = kept[id]
+      if (keep) {
+        let relocs = atoms[ai].relocs
+        let r = 0
+        while (r < len(relocs)) {
+          if (relocs[r].kind == LoRelocKind.Abs64) {
+            let isImport = false
+            if (relocs[r].target.isGlobal) {
+              let (_, defined) = globals[relocs[r].target.name]
+              isImport = !defined
+            }
+            if (isImport) {
+              fail newError("pe: absolute reference to import '${relocs[r].target.name}' is not supported")
+            }
+            let (fa, hasFa) = addrOf[id]
+            if (!hasFa) {
+              fail newError("pe: internal error: unaddressed atom in base-reloc scan")
+            }
+            baseRelocs = append(baseRelocs, fa + relocs[r].offset)
+          }
+          r = r + 1
+        }
+      }
+      ai = ai + 1
+    }
+    mi = mi + 1
+  }
+  baseRelocs = plSortInts(baseRelocs)
+
+  // ---- .idata: import descriptors + ILT/IAT + hint/name + DLL names ---------
+  let hasImports = nImports > 0
+  let dllGroups = plGroupByDll(st.importOrder)?
+  let idataLayout = PlIdataLayout{ descriptorTableSize: 0, dllIltOff: []int(0),
+    dllIatOff: []int(0), dllNameOff: []int(0), namesOff: []int(0), totalSize: 0 }
+  rvaCursor = alignForward(rvaCursor, plSectionAlign())
+  let idataRva = rvaCursor
+  if (hasImports) {
+    idataLayout = plBuildIdataLayout(dllGroups)
+    rvaCursor = rvaCursor + idataLayout.totalSize
+  }
+
+  // ---- .bss (after .idata, matching the port reference's layout order) ------
+  rvaCursor = alignForward(rvaCursor, plSectionAlign())
+  let bssRva = rvaCursor
+  rvaCursor = plPlaceAtoms(modules, bss, rvaCursor)
+  let bssVsize = rvaCursor - bssRva
+  let hasBss = bssVsize > 0
+
+  // ---- .reloc -----------------------------------------------------------------
+  rvaCursor = alignForward(rvaCursor, plSectionAlign())
+  let relocRva = rvaCursor
+  let relocBytes = plBuildBaseRelocs(baseRelocs)
+  rvaCursor = rvaCursor + len(relocBytes)
+  let hasReloc = len(relocBytes) > 0
+
+  let sizeOfImage = alignForward(rvaCursor, plSectionAlign())
+
+  // ---- section count + header sizing -----------------------------------------
+  let nsections = 1 // .text always present (it holds _start)
+  if (hasRdata) { nsections = nsections + 1 }
+  if (hasData) { nsections = nsections + 1 }
+  if (hasImports) { nsections = nsections + 1 }
+  if (hasBss) { nsections = nsections + 1 }
+  if (hasReloc) { nsections = nsections + 1 }
+
+  let headersFileSize = alignForward(plHeadersRawSize(nsections), plFileAlign())
+
+  // ---- file-offset layout (parallel to the RVA layout; .bss has none) -------
+  let fileCursor = headersFileSize
+  let textFileOff = fileCursor
+  let textRawSize = alignForward(textVsize, plFileAlign())
+  fileCursor = fileCursor + textRawSize
+
+  let rdataFileOff = fileCursor
+  let rdataRawSize = 0
+  if (hasRdata) {
+    rdataRawSize = alignForward(rdataVsize, plFileAlign())
+  }
+  fileCursor = fileCursor + rdataRawSize
+
+  let dataFileOff = fileCursor
+  let dataRawSize = 0
+  if (hasData) {
+    dataRawSize = alignForward(dataVsize, plFileAlign())
+  }
+  fileCursor = fileCursor + dataRawSize
+
+  let idataFileOff = fileCursor
+  let idataRawSize = 0
+  if (hasImports) {
+    idataRawSize = alignForward(idataLayout.totalSize, plFileAlign())
+  }
+  fileCursor = fileCursor + idataRawSize
+
+  let relocFileOff = fileCursor
+  let relocRawSize = 0
+  if (hasReloc) {
+    relocRawSize = alignForward(len(relocBytes), plFileAlign())
+  }
+  fileCursor = fileCursor + relocRawSize
+
+  let totalFileSize = fileCursor
+
+  // ---- stub thunks + IAT addressing ------------------------------------------
+  let iatRvaOf = map<string, int>{}
+  let stubIndexOf = map<string, int>{}
+  let d = 0
+  while (d < len(dllGroups.dlls)) {
+    let k = 0
+    while (k < dllGroups.count[d]) {
+      let idx = dllGroups.start[d] + k
+      let name = dllGroups.names[idx]
+      iatRvaOf[name] = idataRva + idataLayout.dllIatOff[d] + k * 8
+      stubIndexOf[name] = idx
+      k = k + 1
+    }
+    d = d + 1
+  }
+
+  let stubBytes = []u8(nImports * stubWidth)
+  let si = 0
+  while (si < nImports) {
+    let name = dllGroups.names[si]
+    let stubVa = plImageBase() + stubsRva + si * stubWidth
+    let iatVa = plImageBase() + iatRvaOf[name]
+    let off = si * stubWidth
+    stubBytes[off] = u8(0xFF)
+    stubBytes[off + 1] = u8(0x25)
+    // jmp [rip+disp32]: disp is relative to the byte after this 6-byte
+    // instruction.
+    writePcRel32(stubBytes, off + 2, iatVa, stubVa + 6)?
+    si = si + 1
+  }
+
+  // ---- apply relocations into per-atom mutable copies ------------------------
+  // An atom's own bytes are never mutated: two atoms can share a backing
+  // slice, and only the patched copy reaches the file.
+  let patched = map<int, []u8>{}
+  mi = 0
+  while (mi < len(modules)) {
+    let atoms = modules[mi].atoms
+    let ai = 0
+    while (ai < len(atoms)) {
+      let id = atomKey(mi, ai)
+      let (_, keep) = kept[id]
+      if (keep && len(atoms[ai].data) > 0) {
+        let buf = []u8(0)
+        let b = 0
+        while (b < len(atoms[ai].data)) {
+          buf = append(buf, atoms[ai].data[b])
+          b = b + 1
+        }
+        let atomRva = 0
+        let (av, hasAv) = addrOf[id]
+        if (hasAv) {
+          atomRva = av
+        }
+        let relocs = atoms[ai].relocs
+        let r = 0
+        while (r < len(relocs)) {
+          let reloc = relocs[r]
+          let isImport = false
+          if (reloc.target.isGlobal) {
+            let (_, defined) = globals[reloc.target.name]
+            isImport = !defined
+          }
+          let targetRva = 0
+          if (isImport) {
+            let (stubIdx, hasStub) = stubIndexOf[reloc.target.name]
+            if (!hasStub) {
+              fail newError("pe: import stub missing for '${reloc.target.name}'")
+            }
+            targetRva = stubsRva + stubIdx * stubWidth
+          } else {
+            let tgt = resolveRef(globals, mi, reloc.target)?
+            let (ta, hasTa) = addrOf[tgt]
+            if (!hasTa) {
+              fail newError("pe: undefined symbol")
+            }
+            targetRva = ta
+          }
+          let v = noValues()
+          v.p = plImageBase() + atomRva + reloc.offset
+          v.s = plImageBase() + targetRva + reloc.addend
+          applyReloc(reloc.kind, buf, reloc.offset, v)?
+          r = r + 1
+        }
+        patched[id] = buf
+      }
+      ai = ai + 1
+    }
+    mi = mi + 1
+  }
+
+  // ---- .idata bytes -------------------------------------------------------
+  let idataBytes = []u8(0)
+  if (hasImports) {
+    idataBytes = plBuildIdataBytes(idataLayout, dllGroups, idataRva)
+  }
+
+  // ---- assemble the file ----------------------------------------------------
+  let file = []u8(totalFileSize)
+
+  let wgroups = [text, rdata, data]
+  gi = 0
+  while (gi < len(wgroups)) {
+    let g = wgroups[gi]
+    let i = 0
+    while (i < len(g)) {
+      let atom = modules[atomKeyModule(g[i].id)].atoms[atomKeyAtom(g[i].id)]
+      let bytes = atom.data
+      let (pb, hasPb) = patched[g[i].id]
+      if (hasPb) {
+        bytes = pb
+      }
+      let off = plFileOffsetOf(g[i].rva, textRva, textFileOff, rdataRva, rdataFileOff, dataRva, dataFileOff)
+      let b = 0
+      while (b < len(bytes)) {
+        file[off + b] = bytes[b]
+        b = b + 1
+      }
+      i = i + 1
+    }
+    gi = gi + 1
+  }
+
+  let stubFileOff = textFileOff + (stubsRva - textRva)
+  let sb = 0
+  while (sb < len(stubBytes)) {
+    file[stubFileOff + sb] = stubBytes[sb]
+    sb = sb + 1
+  }
+
+  if (hasImports) {
+    let ib = 0
+    while (ib < len(idataBytes)) {
+      file[idataFileOff + ib] = idataBytes[ib]
+      ib = ib + 1
+    }
+  }
+  if (hasReloc) {
+    let rb = 0
+    while (rb < len(relocBytes)) {
+      file[relocFileOff + rb] = relocBytes[rb]
+      rb = rb + 1
+    }
+  }
+
+  let iatDirRva = 0
+  let iatDirSize = 0
+  if (hasImports) {
+    iatDirRva = idataRva + idataLayout.dllIatOff[0]
+    iatDirSize = (nImports + len(dllGroups.dlls)) * 8
+  }
+
+  let hdr = plBuildHeaders(PlHeaderInfo{
+    nsections: nsections,
+    entryRva: entryRva,
+    sizeOfImage: sizeOfImage,
+    headersFileSize: headersFileSize,
+    text: PlSpan{ rva: textRva, vsize: textVsize, fileOff: textFileOff, rawSize: textRawSize },
+    hasRdata: hasRdata,
+    rdata: PlSpan{ rva: rdataRva, vsize: rdataVsize, fileOff: rdataFileOff, rawSize: rdataRawSize },
+    hasData: hasData,
+    data: PlSpan{ rva: dataRva, vsize: dataVsize, fileOff: dataFileOff, rawSize: dataRawSize },
+    hasImports: hasImports,
+    idata: PlSpan{ rva: idataRva, vsize: idataLayout.totalSize, fileOff: idataFileOff, rawSize: idataRawSize },
+    importDirSize: idataLayout.descriptorTableSize,
+    iatDirRva: iatDirRva,
+    iatDirSize: iatDirSize,
+    hasBss: hasBss,
+    bss: PlSpan{ rva: bssRva, vsize: bssVsize, fileOff: 0, rawSize: 0 },
+    hasReloc: hasReloc,
+    reloc: PlSpan{ rva: relocRva, vsize: len(relocBytes), fileOff: relocFileOff, rawSize: relocRawSize } })
+  assert(len(hdr) <= headersFileSize)
+  let hb = 0
+  while (hb < len(hdr)) {
+    file[hb] = hdr[hb]
+    hb = hb + 1
+  }
+
+  return file
+}
+
+// ---- entry point --------------------------------------------------------
+
+struct PlIngestResult {
+  modules: []LoModule,
+  programModules: int,
+}
+
+// Reads every input into the generic module model. Objects and archive
+// members are kept apart: an object is always a link input, a member only if
+// it satisfies a still-undefined symbol (selectArchiveMembers).
+fn plIngest(inputs: []PlLinkInput): PlIngestResult! {
+  let modules = []LoModule(0)
+  let members = []LoModule(0)
+  let programModules = 0
+  let i = 0
+  while (i < len(inputs)) {
+    if (inputs[i].isArchive) {
+      let entries = parseArchive(inputs[i].bytes)?
+      let m = 0
+      while (m < len(entries)) {
+        members = append(members, readCoffObject(entries[m].name, entries[m].data)?)
+        m = m + 1
+      }
+    } else {
+      modules = append(modules, readCoffObject("bit.o", inputs[i].bytes)?)
+      programModules = programModules + 1
+    }
+    i = i + 1
+  }
+  let picked = selectArchiveMembers(modules, members, [plEntrySymbol()])
+  let p = 0
+  while (p < len(picked)) {
+    modules = append(modules, picked[p])
+    p = p + 1
+  }
+  return PlIngestResult{ modules: modules, programModules: programModules }
+}
+
+// Reads `inputs` (the compiled Bit COFF object plus libbitrt.a) into the
+// generic object model and links them into a PE32+ executable.
+fn linkPe(inputs: []PlLinkInput, allowedImports: []string): []u8! {
+  let ing = plIngest(inputs)?
+  return linkPeExecutable(ing.modules, ing.programModules, allowedImports)?
+}
