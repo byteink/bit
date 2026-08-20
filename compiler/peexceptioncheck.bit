@@ -1,0 +1,484 @@
+// Self-host (#3345, epic #3322): in-Bit self-checks for peexception.bit's
+// `.pdata` merge/sort, plus the real de-risk payload proving the whole
+// `.pdata`/`.xdata` pipeline against actual Windows (mustafa-desktop-win).
+// Split out of pelinkcheck.bit (docs/development.md's 800-line rule —
+// pelinkcheck.bit was already at 505/800 before this ticket); sibling .bit
+// files are the same module, so `selfcheck()` still calls these directly.
+// Named to sort bytewise after peexception.bit and pelinkcheck.bit.
+
+// ---------------------------------------------------------------------------
+// #3345: `.pdata` — sort correctness (peexception.bit), then an end-to-end
+// link exercising resolve + sort + dead-stripping + the EXCEPTION directory
+// together.
+// ---------------------------------------------------------------------------
+
+// ppSortEntries/ppSorted are pure functions (peexception.bit): unit-tested
+// directly, on a deliberately SCRAMBLED input, rather than only through a
+// full link — a link that happens to produce already-sorted output would
+// leave the sort itself unexercised (module-order and text-layout order
+// coincide for a simple program; see checkPeLinkPdataEndToEnd's own comment
+// for why that coincidence is NOT something to rely on).
+fn checkPePdataSort() {
+  let scrambled = [
+    PePdataEntry{ beginRva: 4096, endRva: 4100, unwindInfoRva: 900 },
+    PePdataEntry{ beginRva: 4096 + 4096, endRva: 4096 + 4101, unwindInfoRva: 904 },
+    PePdataEntry{ beginRva: 0, endRva: 11, unwindInfoRva: 800 },
+    PePdataEntry{ beginRva: 11, endRva: 12, unwindInfoRva: 808 }]
+  assert(!ppSorted(scrambled)) // 4096 > 0, so this genuinely is NOT sorted yet
+  let sorted = ppSortEntries(scrambled)
+  assert(ppSorted(sorted))
+  assert(len(sorted) == 4)
+  assert(sorted[0].beginRva == 0 && sorted[0].unwindInfoRva == 800)
+  assert(sorted[1].beginRva == 11 && sorted[1].unwindInfoRva == 808)
+  assert(sorted[2].beginRva == 4096 && sorted[2].unwindInfoRva == 900)
+  assert(sorted[3].beginRva == 8192 && sorted[3].unwindInfoRva == 904)
+
+  // Mutation-tested manually (#3345): swapping ppSortEntries' comparison
+  // from `>` to `<` (descending instead of ascending) makes `ppSorted(
+  // ppSortEntries(scrambled))` false, and this check failed. Reverted; see
+  // the task-3345 report for the exact edit and observed failure.
+}
+
+// One .pdata record per function: BeginAddress (addend 0), EndAddress
+// (addend = the function's own byte size), UnwindInfoAddress (addend 0) —
+// all three IMAGE_REL_AMD64_ADDR32NB, targeting the function's OWN symbol by
+// name (peexception.bit's module comment: not a section symbol, since
+// emitpe.bit's writer emits no aux records). `fnName` is written into a
+// throwaway local symbol at the matching xdata offset too, so each xdata
+// atom is independently addressable for dead-stripping the same way pdata
+// is — this is a fixture-only naming convention, not a real one.
+fn ppdRecordBytes(fnSize: int): []u8 {
+  let b = []u8(12)
+  // BeginAddress addend 0 (already zero); EndAddress addend = fnSize:
+  b[4] = u8(fnSize & 255)
+  b[5] = u8((fnSize >> 8) & 255)
+  b[6] = u8((fnSize >> 16) & 255)
+  b[7] = u8((fnSize >> 24) & 255)
+  // UnwindInfoAddress addend 0 (already zero).
+  return b
+}
+
+// The whole synthetic scenario for both pdata end-to-end checks: `_start`
+// calls `helperA` and `helperB`; `deadFunc` is defined but never called, so
+// the reachability walk must drop it — and its `.pdata`/`.xdata` records
+// with it, or a stale entry would point at whatever address happens to land
+// there post-link. `pdataOrder` picks which function's record comes FIRST
+// in the `.pdata` SECTION's own byte layout — plCollect gathers Pdata atoms
+// in that same section-symbol order, not in `.text` address order, so this
+// is what actually exercises ppSortEntries end-to-end rather than coasting
+// on the two orders coinciding by construction.
+fn ppdScenario(pdataOrder: []string): []u8 {
+  // .text: _start(11) helperA(1) helperB(1) deadFunc(1), in THIS fixed
+  // declaration order — so their RVAs increase in exactly this order.
+  let text = [
+    u8(0xE8), u8(0xFC), u8(0xFF), u8(0xFF), u8(0xFF), // call helperA (off 1)
+    u8(0xE8), u8(0xFC), u8(0xFF), u8(0xFF), u8(0xFF), // call helperB (off 6)
+    u8(0xC3),                                          // ret
+    u8(0xC3),                                          // helperA: ret
+    u8(0xC3),                                          // helperB: ret
+    u8(0xC3)]                                          // deadFunc: ret
+
+  let fnOff = map<string, int>{}
+  fnOff["_start"] = 0
+  fnOff["helperA"] = 11
+  fnOff["helperB"] = 12
+  fnOff["deadFunc"] = 13
+  let fnSize = map<string, int>{}
+  fnSize["_start"] = 11
+  fnSize["helperA"] = 1
+  fnSize["helperB"] = 1
+  fnSize["deadFunc"] = 1
+
+  let xdata = []u8(0)
+  let pdata = []u8(0)
+  let pdataRelocs = []PeRelocation(0)
+  let xdataSymOff = map<string, int>{}
+  // Every 12-byte record needs ITS OWN symbol, or atomizeModule (linkobj.bit)
+  // has no symbol boundary to split the section on and treats the whole
+  // `.pdata` section as ONE atom — collapsing all 4 functions' liveness
+  // together instead of letting deadFunc's record drop independently.
+  let pdataSymOff = map<string, int>{}
+  let oi = 0
+  while (oi < len(pdataOrder)) {
+    let name = pdataOrder[oi]
+    xdataSymOff[name] = len(xdata)
+    pdataSymOff[name] = len(pdata)
+    xdata = append(xdata, u8(1)) // trivial UNWIND_INFO: ver 1, no codes
+    xdata = append(xdata, u8(0))
+    xdata = append(xdata, u8(0))
+    xdata = append(xdata, u8(0))
+    let recOff = len(pdata)
+    let rec = ppdRecordBytes(fnSize[name])
+    let bi = 0
+    while (bi < len(rec)) {
+      pdata = append(pdata, rec[bi])
+      bi = bi + 1
+    }
+    pdataRelocs = append(pdataRelocs,
+      PeRelocation{ section: PeSectionKind.Pdata, offset: recOff, symbol: name, kind: PeRelocKind.AddrRva32 })
+    pdataRelocs = append(pdataRelocs,
+      PeRelocation{ section: PeSectionKind.Pdata, offset: recOff + 4, symbol: name, kind: PeRelocKind.AddrRva32 })
+    pdataRelocs = append(pdataRelocs,
+      PeRelocation{ section: PeSectionKind.Pdata, offset: recOff + 8, symbol: "\$xdata\$" + name, kind: PeRelocKind.AddrRva32 })
+    oi = oi + 1
+  }
+
+  let symbols = [
+    PeSymbol{ name: "_start", hasSection: true, section: PeSectionKind.Text,
+      offset: 0, size: 11, binding: PeBinding.Global, kind: PeSymKind.Func },
+    PeSymbol{ name: "helperA", hasSection: true, section: PeSectionKind.Text,
+      offset: 11, size: 1, binding: PeBinding.Global, kind: PeSymKind.Func },
+    PeSymbol{ name: "helperB", hasSection: true, section: PeSectionKind.Text,
+      offset: 12, size: 1, binding: PeBinding.Global, kind: PeSymKind.Func },
+    PeSymbol{ name: "deadFunc", hasSection: true, section: PeSectionKind.Text,
+      offset: 13, size: 1, binding: PeBinding.Global, kind: PeSymKind.Func },
+    PeSymbol{ name: "\$xdata\$_start", hasSection: true, section: PeSectionKind.Xdata,
+      offset: xdataSymOff["_start"], size: 4, binding: PeBinding.Local, kind: PeSymKind.Notype },
+    PeSymbol{ name: "\$xdata\$helperA", hasSection: true, section: PeSectionKind.Xdata,
+      offset: xdataSymOff["helperA"], size: 4, binding: PeBinding.Local, kind: PeSymKind.Notype },
+    PeSymbol{ name: "\$xdata\$helperB", hasSection: true, section: PeSectionKind.Xdata,
+      offset: xdataSymOff["helperB"], size: 4, binding: PeBinding.Local, kind: PeSymKind.Notype },
+    PeSymbol{ name: "\$xdata\$deadFunc", hasSection: true, section: PeSectionKind.Xdata,
+      offset: xdataSymOff["deadFunc"], size: 4, binding: PeBinding.Local, kind: PeSymKind.Notype },
+    PeSymbol{ name: "\$pdata\$_start", hasSection: true, section: PeSectionKind.Pdata,
+      offset: pdataSymOff["_start"], size: 12, binding: PeBinding.Local, kind: PeSymKind.Notype },
+    PeSymbol{ name: "\$pdata\$helperA", hasSection: true, section: PeSectionKind.Pdata,
+      offset: pdataSymOff["helperA"], size: 12, binding: PeBinding.Local, kind: PeSymKind.Notype },
+    PeSymbol{ name: "\$pdata\$helperB", hasSection: true, section: PeSectionKind.Pdata,
+      offset: pdataSymOff["helperB"], size: 12, binding: PeBinding.Local, kind: PeSymKind.Notype },
+    PeSymbol{ name: "\$pdata\$deadFunc", hasSection: true, section: PeSectionKind.Pdata,
+      offset: pdataSymOff["deadFunc"], size: 12, binding: PeBinding.Local, kind: PeSymKind.Notype }]
+
+  let textRelocs = [
+    PeRelocation{ section: PeSectionKind.Text, offset: 1, symbol: "helperA", kind: PeRelocKind.Rel32 },
+    PeRelocation{ section: PeSectionKind.Text, offset: 6, symbol: "helperB", kind: PeRelocKind.Rel32 }]
+  let relocs = textRelocs
+  let ri = 0
+  while (ri < len(pdataRelocs)) {
+    relocs = append(relocs, pdataRelocs[ri])
+    ri = ri + 1
+  }
+
+  return plWriteProbe(
+    [PeSection{ kind: PeSectionKind.Text, data: text, size: 0, alignment: 16 },
+     PeSection{ kind: PeSectionKind.Pdata, data: pdata, size: 0, alignment: 4 },
+     PeSection{ kind: PeSectionKind.Xdata, data: xdata, size: 0, alignment: 4 }],
+    symbols, relocs)
+}
+
+fn checkPeLinkPdataEndToEnd() {
+  // Deliberately NOT text-address order: the `.pdata` section's own records
+  // are declared helperB, deadFunc, _start, helperA — so before sorting,
+  // BeginAddress goes 12, 13(dropped), 0, 11: not sorted, and dead-stripping
+  // must ALSO remove deadFunc's record, not just leave a stale one behind.
+  let bytes = ppdScenario(["helperB", "deadFunc", "_start", "helperA"])
+  let exe = linkPe([plObjectInput(bytes)], []string(0)) catch e { []u8(0) }
+  assert(len(exe) > 0)
+
+  let optOff = plLfanew() + 4 + sizeofPeFileHeader()
+  // IMAGE_DIRECTORY_ENTRY_EXCEPTION is directory index 3: 16-byte optional
+  // header prefix (magic..NumberOfRvaAndSizes) + 3*8 bytes of directories.
+  let dirsOff = optOff + plOptionalHeaderSize() - 16 * 8
+  let exceptionRva = leAt(exe, dirsOff + 3 * 8, 4)
+  let exceptionSize = leAt(exe, dirsOff + 3 * 8 + 4, 4)
+  assert(exceptionRva > 0)
+  assert(exceptionSize == 3 * sizeofPePdataEntry()) // 3 of 4 functions survived
+
+  let pdataSec = plFindSection(exe, ".pdata")
+  assert(pdataSec.found)
+  assert(leAt(exe, pdataSec.sh + 12, 4) == exceptionRva) // section RVA == directory RVA
+  let pdataFileOff = leAt(exe, pdataSec.sh + 20, 4)
+
+  let textSec = plFindSection(exe, ".text")
+  assert(textSec.found)
+  let textRva = leAt(exe, textSec.sh + 12, 4)
+
+  // "N of N functions": every surviving .text function has exactly one
+  // .pdata entry, derived from the SYMBOL table (the count above), not
+  // assumed — 3 records, 3 live functions (_start, helperA, helperB).
+  let n = exceptionSize / sizeofPePdataEntry()
+  assert(n == 3)
+  let i = 0
+  let prevBegin = -1
+  while (i < n) {
+    let recOff = pdataFileOff + i * sizeofPePdataEntry()
+    let beginRva = leAt(exe, recOff, 4)
+    let endRva = leAt(exe, recOff + 4, 4)
+    let uiRva = leAt(exe, recOff + 8, 4)
+    assert(beginRva >= textRva)
+    assert(endRva > beginRva) // every function has SOME body
+    assert(uiRva > 0)
+    // Sorted by BeginAddress, strictly — the property most worth its own
+    // check (module comment above): the OS binary-searches this table.
+    assert(beginRva > prevBegin)
+    prevBegin = beginRva
+    i = i + 1
+  }
+
+  // deadFunc's bytes never made it into .text at all, so no RVA in the
+  // table above could possibly be its — but check directly that no entry's
+  // BeginAddress falls at deadFunc's would-be offset (13 past _start),
+  // which is the only remaining way a stale entry could hide.
+  let deadWouldBe = textRva + 13
+  let j = 0
+  let sawDead = false
+  while (j < n) {
+    if (leAt(exe, pdataFileOff + j * sizeofPePdataEntry(), 4) == deadWouldBe) {
+      sawDead = true
+    }
+    j = j + 1
+  }
+  assert(!sawDead)
+}
+
+// ---------------------------------------------------------------------------
+// #3345: the real de-risk payload — a 4-function chain (_start -> funcA ->
+// funcB -> funcC), with `funcB`'s frame large enough to trigger #3327's
+// stack probe, that calls RtlCaptureStackBackTrace from inside funcC and
+// writes the captured return addresses to stdout. Run on mustafa-desktop-win
+// over SSH (checkPeLinkDerisk's own header comment explains why: no linker
+// on the test box at all). funcC's body was independently verified with
+// `clang -target x86_64-apple-macos -c` + objdump (transcript in the
+// task-3345 report) — the SAME discipline #3329's own de-risk payload used.
+//
+// Every prologue/epilogue byte below is xEmitPrologue/xEmitEpilogue's REAL
+// output for the given XFrame, not a parallel description — this is the
+// same claim x64unwind.bit's module comment makes about the unwind CODES,
+// extended here to the harness that proves it against a real OS.
+// ---------------------------------------------------------------------------
+
+fn xdEmitRaw(buf: X64Buf, bytes: []u8) {
+  let i = 0
+  while (i < len(bytes)) {
+    xEmitByte(buf, int(bytes[i]))
+    i = i + 1
+  }
+}
+
+// `call <symbol>` with the COFF REL-style addend (-4) already baked into the
+// field, matching checkPeLinkPc32Addend's own convention — NOT xCallReloc's
+// (codegen.bit), which bakes a zero placeholder for a later format-specific
+// translation step that does not exist for PE yet (no `bit build --target
+// x86_64-windows` driver wires FuncCode into a PeObject today).
+fn xdCallRel32(buf: X64Buf, relocs: []PeRelocation, symbol: string): []PeRelocation {
+  xEmitByte(buf, 0xE8)
+  let off = len(buf.code)
+  xEmitByte(buf, 0xFC)
+  xEmitByte(buf, 0xFF)
+  xEmitByte(buf, 0xFF)
+  xEmitByte(buf, 0xFF)
+  return append(relocs, PeRelocation{ section: PeSectionKind.Text, offset: off,
+    symbol: symbol, kind: PeRelocKind.Rel32 })
+}
+
+// funcC's body, independently verified (module comment above): sets up
+// RtlCaptureStackBackTrace(0, 10, buf, NULL) with `buf` at rbp-96 (inside
+// funcC's own carved frame — see the XFrame passed to xEmitPrologue at the
+// call site), converts the USHORT frame count to a byte length, then
+// WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), buf, count*8, &written, NULL),
+// then ExitProcess(0). Call-site byte offsets (for the 4 relocations) are
+// 15, 33, 52, 59 into this 63-byte sequence.
+fn xdFuncCBody(): []u8 {
+  return [
+    u8(0x31), u8(0xc9),                                           // xor ecx,ecx
+    u8(0xba), u8(0x0a), u8(0x00), u8(0x00), u8(0x00),             // mov edx,10
+    u8(0x4c), u8(0x8d), u8(0x45), u8(0xa0),                       // lea r8,[rbp-0x60]
+    u8(0x45), u8(0x31), u8(0xc9),                                 // xor r9d,r9d
+    u8(0xe8), u8(0xfc), u8(0xff), u8(0xff), u8(0xff),             // call RtlCaptureStackBackTrace (off 15)
+    u8(0x0f), u8(0xb7), u8(0xc0),                                 // movzx eax,ax
+    u8(0xc1), u8(0xe0), u8(0x03),                                 // shl eax,3
+    u8(0x89), u8(0xc3),                                           // mov ebx,eax
+    u8(0xb9), u8(0xf5), u8(0xff), u8(0xff), u8(0xff),             // mov ecx,-11 (STD_OUTPUT_HANDLE)
+    u8(0xe8), u8(0xfc), u8(0xff), u8(0xff), u8(0xff),             // call GetStdHandle (off 33)
+    u8(0x48), u8(0x89), u8(0xc1),                                 // mov rcx,rax
+    u8(0x48), u8(0x8d), u8(0x55), u8(0xa0),                       // lea rdx,[rbp-0x60]
+    u8(0x41), u8(0x89), u8(0xd8),                                 // mov r8d,ebx
+    u8(0x4c), u8(0x8d), u8(0x4d), u8(0xf0),                       // lea r9,[rbp-0x10]
+    u8(0xe8), u8(0xfc), u8(0xff), u8(0xff), u8(0xff),             // call WriteFile (off 52)
+    u8(0x31), u8(0xc9),                                           // xor ecx,ecx
+    u8(0xe8), u8(0xfc), u8(0xff), u8(0xff), u8(0xff)]             // call ExitProcess (off 59)
+}
+
+fn xdFuncCBodyRelocs(baseOff: int): []PeRelocation {
+  return [
+    PeRelocation{ section: PeSectionKind.Text, offset: baseOff + 15, symbol: "RtlCaptureStackBackTrace", kind: PeRelocKind.Rel32 },
+    PeRelocation{ section: PeSectionKind.Text, offset: baseOff + 33, symbol: "GetStdHandle", kind: PeRelocKind.Rel32 },
+    PeRelocation{ section: PeSectionKind.Text, offset: baseOff + 52, symbol: "WriteFile", kind: PeRelocKind.Rel32 },
+    PeRelocation{ section: PeSectionKind.Text, offset: baseOff + 59, symbol: "ExitProcess", kind: PeRelocKind.Rel32 }]
+}
+
+// One function's `.pdata`/`.xdata` contribution: the record bytes (addend 0
+// for Begin/UnwindInfoAddress, addend = the function's own size for End —
+// peexception.bit's module comment), the 3 relocations (targeting the
+// function's own symbol and a private `$xdata$<name>` symbol), and the raw
+// UNWIND_INFO bytes xEmitPrologue itself built.
+struct XdUnwindPiece {
+  pdataRec: []u8,
+  pdataRelocs: []PeRelocation, // offsets relative to the FUNCTION's OWN pdata record; caller rebases
+  xdataBytes: []u8,
+}
+
+fn xdUnwindPiece(name: string, fnSize: int, info: XUnwindInfo): XdUnwindPiece {
+  let rec = []u8(12)
+  rec[4] = u8(fnSize & 255)
+  rec[5] = u8((fnSize >> 8) & 255)
+  rec[6] = u8((fnSize >> 16) & 255)
+  rec[7] = u8((fnSize >> 24) & 255)
+  let relocs = [
+    PeRelocation{ section: PeSectionKind.Pdata, offset: 0, symbol: name, kind: PeRelocKind.AddrRva32 },
+    PeRelocation{ section: PeSectionKind.Pdata, offset: 4, symbol: name, kind: PeRelocKind.AddrRva32 },
+    PeRelocation{ section: PeSectionKind.Pdata, offset: 8, symbol: "\$xdata\$" + name, kind: PeRelocKind.AddrRva32 }]
+  return XdUnwindPiece{ pdataRec: rec, pdataRelocs: relocs, xdataBytes: info.bytes }
+}
+
+fn checkPeLinkUnwindDerisk() {
+  // _start: minimal prologue, calls funcA.
+  let cxStart = newXCtx(XCallConv.Win64)
+  cxStart.frame = XFrame{ savedGpr: []XReg64(0), savedXmm: []XmmReg(0), numSpillSlots: 0, frameSize: 32 }
+  let uStart = xEmitPrologue(cxStart)
+  let startCallOff = len(cxStart.buf.code)
+  let relocs = xdCallRel32(cxStart.buf, []PeRelocation(0), "funcA")
+  xEmitEpilogue(cxStart)
+  xRet(cxStart.buf)
+  let startBytes = cxStart.buf.code
+  let startSize = len(startBytes)
+
+  // funcA: two callee-saved GPRs, a real (small) frame, calls funcB.
+  let cxA = newXCtx(XCallConv.Win64)
+  cxA.frame = XFrame{ savedGpr: [XReg64.Rbx, XReg64.Rsi], savedXmm: []XmmReg(0), numSpillSlots: 0, frameSize: 32 }
+  let uA = xEmitPrologue(cxA)
+  let aCallOff = len(cxA.buf.code)
+  relocs = xdCallRel32(cxA.buf, relocs, "funcB")
+  xEmitEpilogue(cxA)
+  xRet(cxA.buf)
+  let aBytes = cxA.buf.code
+  let aSize = len(aBytes)
+
+  // funcB: frame over one guard page — #3327's stack probe — calls funcC.
+  let cxB = newXCtx(XCallConv.Win64)
+  cxB.frame = XFrame{ savedGpr: []XReg64(0), savedXmm: []XmmReg(0), numSpillSlots: 0, frameSize: 8192 }
+  let uB = xEmitPrologue(cxB)
+  let bCallOff = len(cxB.buf.code)
+  relocs = xdCallRel32(cxB.buf, relocs, "funcC")
+  xEmitEpilogue(cxB)
+  xRet(cxB.buf)
+  let bBytes = cxB.buf.code
+  let bSize = len(bBytes)
+
+  // funcC: one saved GPR, a frame holding the capture buffer — no epilogue,
+  // it ends in ExitProcess and never returns.
+  let cxC = newXCtx(XCallConv.Win64)
+  cxC.frame = XFrame{ savedGpr: [XReg64.Rbx], savedXmm: []XmmReg(0), numSpillSlots: 0, frameSize: 120 }
+  let uC = xEmitPrologue(cxC)
+  let cBodyOff = len(cxC.buf.code)
+  xdEmitRaw(cxC.buf, xdFuncCBody())
+  let cRelocs = xdFuncCBodyRelocs(cBodyOff)
+  let ri = 0
+  while (ri < len(cRelocs)) {
+    relocs = append(relocs, cRelocs[ri])
+    ri = ri + 1
+  }
+  let cBytes = cxC.buf.code
+  let cSize = len(cBytes)
+
+  let text = xdAppendAllR([]u8(0), startBytes)
+  let aOff = len(text)
+  text = xdAppendAllR(text, aBytes)
+  let bOff = len(text)
+  text = xdAppendAllR(text, bBytes)
+  let cOff = len(text)
+  text = xdAppendAllR(text, cBytes)
+
+  let pieces = [xdUnwindPiece("_start", startSize, uStart), xdUnwindPiece("funcA", aSize, uA),
+    xdUnwindPiece("funcB", bSize, uB), xdUnwindPiece("funcC", cSize, uC)]
+  let names = ["_start", "funcA", "funcB", "funcC"]
+  let xdata = []u8(0)
+  let pdata = []u8(0)
+  let xdataSymOff = map<string, int>{}
+  let pdataSymOff = map<string, int>{}
+  let pi = 0
+  while (pi < len(pieces)) {
+    let p = pieces[pi]
+    xdataSymOff[names[pi]] = len(xdata)
+    xdata = xdAppendAllR(xdata, p.xdataBytes)
+    let precOff = len(pdata)
+    pdataSymOff[names[pi]] = precOff
+    pdata = xdAppendAllR(pdata, p.pdataRec)
+    let pj = 0
+    while (pj < len(p.pdataRelocs)) {
+      let r = p.pdataRelocs[pj]
+      relocs = append(relocs, PeRelocation{ section: r.section, offset: precOff + r.offset,
+        symbol: r.symbol, kind: r.kind })
+      pj = pj + 1
+    }
+    pi = pi + 1
+  }
+
+  let symbols = [
+    PeSymbol{ name: "_start", hasSection: true, section: PeSectionKind.Text, offset: 0, size: startSize, binding: PeBinding.Global, kind: PeSymKind.Func },
+    PeSymbol{ name: "funcA", hasSection: true, section: PeSectionKind.Text, offset: aOff, size: aSize, binding: PeBinding.Global, kind: PeSymKind.Func },
+    PeSymbol{ name: "funcB", hasSection: true, section: PeSectionKind.Text, offset: bOff, size: bSize, binding: PeBinding.Global, kind: PeSymKind.Func },
+    PeSymbol{ name: "funcC", hasSection: true, section: PeSectionKind.Text, offset: cOff, size: cSize, binding: PeBinding.Global, kind: PeSymKind.Func },
+    PeSymbol{ name: "\$xdata\$_start", hasSection: true, section: PeSectionKind.Xdata, offset: xdataSymOff["_start"], size: len(uStart.bytes), binding: PeBinding.Local, kind: PeSymKind.Notype },
+    PeSymbol{ name: "\$xdata\$funcA", hasSection: true, section: PeSectionKind.Xdata, offset: xdataSymOff["funcA"], size: len(uA.bytes), binding: PeBinding.Local, kind: PeSymKind.Notype },
+    PeSymbol{ name: "\$xdata\$funcB", hasSection: true, section: PeSectionKind.Xdata, offset: xdataSymOff["funcB"], size: len(uB.bytes), binding: PeBinding.Local, kind: PeSymKind.Notype },
+    PeSymbol{ name: "\$xdata\$funcC", hasSection: true, section: PeSectionKind.Xdata, offset: xdataSymOff["funcC"], size: len(uC.bytes), binding: PeBinding.Local, kind: PeSymKind.Notype },
+    PeSymbol{ name: "\$pdata\$_start", hasSection: true, section: PeSectionKind.Pdata, offset: pdataSymOff["_start"], size: 12, binding: PeBinding.Local, kind: PeSymKind.Notype },
+    PeSymbol{ name: "\$pdata\$funcA", hasSection: true, section: PeSectionKind.Pdata, offset: pdataSymOff["funcA"], size: 12, binding: PeBinding.Local, kind: PeSymKind.Notype },
+    PeSymbol{ name: "\$pdata\$funcB", hasSection: true, section: PeSectionKind.Pdata, offset: pdataSymOff["funcB"], size: 12, binding: PeBinding.Local, kind: PeSymKind.Notype },
+    PeSymbol{ name: "\$pdata\$funcC", hasSection: true, section: PeSectionKind.Pdata, offset: pdataSymOff["funcC"], size: 12, binding: PeBinding.Local, kind: PeSymKind.Notype },
+    PeSymbol{ name: "RtlCaptureStackBackTrace", hasSection: false, section: PeSectionKind.Text, offset: 0, size: 0, binding: PeBinding.Global, kind: PeSymKind.Notype },
+    PeSymbol{ name: "GetStdHandle", hasSection: false, section: PeSectionKind.Text, offset: 0, size: 0, binding: PeBinding.Global, kind: PeSymKind.Notype },
+    PeSymbol{ name: "WriteFile", hasSection: false, section: PeSectionKind.Text, offset: 0, size: 0, binding: PeBinding.Global, kind: PeSymKind.Notype },
+    PeSymbol{ name: "ExitProcess", hasSection: false, section: PeSectionKind.Text, offset: 0, size: 0, binding: PeBinding.Global, kind: PeSymKind.Notype }]
+
+  let bytes = plWriteProbe(
+    [PeSection{ kind: PeSectionKind.Text, data: text, size: 0, alignment: 16 },
+     PeSection{ kind: PeSectionKind.Pdata, data: pdata, size: 0, alignment: 4 },
+     PeSection{ kind: PeSectionKind.Xdata, data: xdata, size: 0, alignment: 4 }],
+    symbols, relocs)
+
+  let allowed = ["RtlCaptureStackBackTrace", "GetStdHandle", "WriteFile", "ExitProcess"]
+  let exe = linkPe([plObjectInput(bytes)], allowed) catch e { []u8(0) }
+  assert(len(exe) > 0)
+
+  let optOff = plLfanew() + 4 + sizeofPeFileHeader()
+  let dirsOff = optOff + plOptionalHeaderSize() - 16 * 8
+  let exceptionSize = leAt(exe, dirsOff + 3 * 8 + 4, 4)
+  assert(exceptionSize == 4 * sizeofPePdataEntry()) // all 4 functions survive
+
+  let outPath = envOr("BIT_PE_UNWIND_DERISK_OUT", "")
+  if (outPath != "") {
+    writeFile(outPath, string(exe)) catch e { }
+  }
+}
+
+// Concatenates a whole `[]u8` — `append` only appends single elements
+// (ppdScenario's caller does this inline; factored out here since
+// checkPeLinkUnwindDerisk needs it repeatedly). MUST be used as `x =
+// xdAppendAllR(x, ...)`: like every other slice-returning helper in this
+// file, growing happens by return value, not by mutating `dst` in place.
+fn xdAppendAllR(dst: []u8, src: []u8): []u8 {
+  let i = 0
+  while (i < len(src)) {
+    dst = append(dst, src[i])
+    i = i + 1
+  }
+  return dst
+}
+
+// Mutation-tested manually (#3345), two ways:
+// 1. peexception.bit's ppSortEntries comparison (`>` -> `<`, descending
+//    instead of ascending) — `bit selfcheck` failed (exit 2). checkPePdataSort
+//    is what actually caught it (a pure unit test on a deliberately scrambled
+//    input); THIS check's own `assert(beginRva > prevBegin)` never got the
+//    chance to, because ppdScenario's records happen to already come out in
+//    address order for THIS particular sort bug — the two checks are
+//    complementary, not redundant, and this is why both exist.
+// 2. peexception.bit's ppResolveEntries: changed `if (textAlive)` to
+//    `if (true)`, i.e. stopped excluding a dead-stripped function's record.
+//    `bit selfcheck` failed (exit 2) — deadFunc's own `assert(hasBegin)`
+//    fires immediately, since a stripped function's atom is never placed and
+//    so never has an RVA. Both mutations reverted; `bit selfcheck` is green
+//    again (exit 0, "selfcheck OK") — verified by rebuilding each time, not
+//    by reasoning about the change.
