@@ -1,0 +1,192 @@
+// Self-host (#3329, epic #3322): PE header + section-table emission, and the
+// RVA-to-file-offset bridge the module comment in pelink.bit explains (PE's
+// SectionAlignment and FileAlignment differ, unlike ELF). Split out of
+// pelink.bit (docs/development.md's file-size rule); named to sort bytewise
+// before "pelink.bit" so the inliner sees plBuildHeaders before its only
+// caller, linkPeExecutable.
+
+// ---- file-offset bridging (see the module comment) --------------------------
+
+// Maps an RVA in the text/rdata/data range to its file offset. Valid only for
+// atoms actually placed in one of those three groups (idata/bss/reloc are
+// copied at their own already-known file offsets, never through this).
+fn plFileOffsetOf(rva: int, textRva: int, textOff: int, rdataRva: int, rdataOff: int,
+    dataRva: int, dataOff: int): int {
+  if (rva >= dataRva) {
+    return dataOff + (rva - dataRva)
+  }
+  if (rva >= rdataRva) {
+    return rdataOff + (rva - rdataRva)
+  }
+  return textOff + (rva - textRva)
+}
+
+// ---- header + section table emission ---------------------------------------
+
+// One section's RVA/file layout, or all-zero when the section is absent.
+struct PlSpan {
+  rva: int,
+  vsize: int,
+  fileOff: int,
+  rawSize: int,
+}
+
+struct PlHeaderInfo {
+  nsections: int,
+  entryRva: int,
+  sizeOfImage: int,
+  headersFileSize: int,
+  text: PlSpan,
+  hasRdata: bool,
+  rdata: PlSpan,
+  hasData: bool,
+  data: PlSpan,
+  hasImports: bool,
+  idata: PlSpan,
+  importDirSize: int,
+  iatDirRva: int,
+  iatDirSize: int,
+  hasBss: bool,
+  bss: PlSpan,
+  hasReloc: bool,
+  reloc: PlSpan,
+}
+
+fn plOptionalHeaderSize(): int {
+  return 112 + 16 * 8 // PE32+ standard+windows fields (112) + 16 data directories
+}
+
+fn plHeadersRawSize(nsections: int): int {
+  return plLfanew() + 4 + sizeofPeFileHeader() + plOptionalHeaderSize() +
+    nsections * sizeofPeSectionHeader()
+}
+
+fn plCodeFlags(): int { return 0x00000020 | 0x20000000 | 0x40000000 } // CNT_CODE|MEM_EXECUTE|MEM_READ
+fn plRodataFlags(): int { return 0x00000040 | 0x40000000 } // CNT_INITIALIZED_DATA|MEM_READ
+fn plRwFlags(): int { return 0x00000040 | 0x40000000 | 0x80000000 } // +MEM_WRITE
+fn plBssFlags(): int { return 0x00000080 | 0x40000000 | 0x80000000 } // CNT_UNINITIALIZED_DATA|MEM_READ|MEM_WRITE
+fn plRelocFlags(): int { return 0x00000040 | 0x40000000 | 0x02000000 } // +MEM_DISCARDABLE
+
+fn plAppendSectionHeader(buf: ByteBuf, name: string, span: PlSpan, flags: int) {
+  let nameBytes = []byte(name)
+  assert(len(nameBytes) <= 8)
+  appendBytes(buf, nameBytes)
+  appendZeros(buf, 8 - len(nameBytes))
+  appendU32(buf, span.vsize)  // VirtualSize
+  appendU32(buf, span.rva)    // VirtualAddress
+  appendU32(buf, span.rawSize) // SizeOfRawData
+  let ptrRaw = span.fileOff
+  if (span.rawSize == 0) {
+    ptrRaw = 0
+  }
+  appendU32(buf, ptrRaw)  // PointerToRawData
+  appendU32(buf, 0)       // PointerToRelocations
+  appendU32(buf, 0)       // PointerToLinenumbers
+  appendU16(buf, 0)       // NumberOfRelocations
+  appendU16(buf, 0)       // NumberOfLinenumbers
+  appendU32(buf, flags)   // Characteristics
+}
+
+// The canonical MS-DOS stub every real PE carries — never executed by the
+// Windows loader (it only reads e_lfanew to find the PE signature that
+// follows), but a real DOS/NTVDM host would run it and print this message.
+fn plDosStubCode(): []u8 {
+  return [u8(0x0E), u8(0x1F), u8(0xBA), u8(0x0E), u8(0x00), u8(0xB4), u8(0x09),
+    u8(0xCD), u8(0x21), u8(0xB8), u8(0x01), u8(0x4C), u8(0xCD), u8(0x21)]
+}
+
+fn plDosStubMsg(): string {
+  return "This program cannot be run in DOS mode.\r\r\n$"
+}
+
+fn plBuildHeaders(h: PlHeaderInfo): []u8 {
+  let out = newByteBuf()
+
+  // ---- DOS header + stub ---------------------------------------------------
+  appendBytes(out, []byte("MZ"))
+  appendZeros(out, 0x3C - len(out.bytes))
+  appendU32(out, plLfanew()) // e_lfanew at 0x3C
+  appendBytes(out, plDosStubCode())
+  appendBytes(out, []byte(plDosStubMsg()))
+  assert(len(out.bytes) <= plLfanew())
+  appendZeros(out, plLfanew() - len(out.bytes))
+
+  // ---- PE signature + COFF file header --------------------------------------
+  appendBytes(out, []byte("PE"))
+  appendZeros(out, 2)
+  appendU16(out, 0x8664) // IMAGE_FILE_MACHINE_AMD64
+  appendU16(out, h.nsections)
+  appendU32(out, 0) // TimeDateStamp: 0 for reproducible builds
+  appendU32(out, 0) // PointerToSymbolTable
+  appendU32(out, 0) // NumberOfSymbols
+  appendU16(out, plOptionalHeaderSize())
+  appendU16(out, 0x0022) // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+
+  // ---- PE32+ optional header -------------------------------------------------
+  let sizeOfCode = h.text.rawSize
+  let sizeOfInitData = h.rdata.rawSize + h.data.rawSize + h.idata.rawSize + h.reloc.rawSize
+  let sizeOfUninitData = h.bss.vsize
+
+  appendU16(out, 0x020B) // IMAGE_NT_OPTIONAL_HDR64_MAGIC (PE32+)
+  out.bytes = append(out.bytes, u8(1)) // MajorLinkerVersion
+  out.bytes = append(out.bytes, u8(0)) // MinorLinkerVersion
+  appendU32(out, sizeOfCode)
+  appendU32(out, sizeOfInitData)
+  appendU32(out, sizeOfUninitData)
+  appendU32(out, h.entryRva)
+  appendU32(out, h.text.rva) // BaseOfCode (PE32+ has no BaseOfData)
+  appendU64(out, plImageBase())
+  appendU32(out, plSectionAlign())
+  appendU32(out, plFileAlign())
+  appendU16(out, 6) // MajorOperatingSystemVersion
+  appendU16(out, 0) // MinorOperatingSystemVersion
+  appendU16(out, 0) // MajorImageVersion
+  appendU16(out, 0) // MinorImageVersion
+  appendU16(out, 6) // MajorSubsystemVersion
+  appendU16(out, 0) // MinorSubsystemVersion
+  appendU32(out, 0) // Win32VersionValue
+  appendU32(out, h.sizeOfImage)
+  appendU32(out, h.headersFileSize)
+  appendU32(out, 0) // CheckSum: not required for a console EXE
+  appendU16(out, 3) // IMAGE_SUBSYSTEM_WINDOWS_CUI
+  appendU16(out, 0x0160) // HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT
+  appendU64(out, 0x100000) // SizeOfStackReserve
+  appendU64(out, 0x1000)   // SizeOfStackCommit
+  appendU64(out, 0x100000) // SizeOfHeapReserve
+  appendU64(out, 0x1000)   // SizeOfHeapCommit
+  appendU32(out, 0)  // LoaderFlags
+  appendU32(out, 16) // NumberOfRvaAndSizes
+
+  // ---- data directories (16 entries, 8 bytes each) --------------------------
+  let d = 0
+  while (d < 16) {
+    let rva = 0
+    let size = 0
+    if (d == 1 && h.hasImports) { // IMAGE_DIRECTORY_ENTRY_IMPORT
+      rva = h.idata.rva
+      size = h.importDirSize
+    }
+    if (d == 5 && h.hasReloc) { // IMAGE_DIRECTORY_ENTRY_BASERELOC
+      rva = h.reloc.rva
+      size = h.reloc.vsize
+    }
+    if (d == 12 && h.hasImports) { // IMAGE_DIRECTORY_ENTRY_IAT
+      rva = h.iatDirRva
+      size = h.iatDirSize
+    }
+    appendU32(out, rva)
+    appendU32(out, size)
+    d = d + 1
+  }
+
+  // ---- section headers -------------------------------------------------------
+  plAppendSectionHeader(out, ".text", h.text, plCodeFlags())
+  if (h.hasRdata) { plAppendSectionHeader(out, ".rdata", h.rdata, plRodataFlags()) }
+  if (h.hasData) { plAppendSectionHeader(out, ".data", h.data, plRwFlags()) }
+  if (h.hasImports) { plAppendSectionHeader(out, ".idata", h.idata, plRwFlags()) }
+  if (h.hasBss) { plAppendSectionHeader(out, ".bss", h.bss, plBssFlags()) }
+  if (h.hasReloc) { plAppendSectionHeader(out, ".reloc", h.reloc, plRelocFlags()) }
+
+  return out.bytes
+}
+

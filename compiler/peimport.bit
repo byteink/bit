@@ -1,0 +1,241 @@
+// Self-host (#3329, epic #3322): PE import-table construction — DLL grouping
+// against pesyms.bit's admitted surface, .idata layout/bytes, and .reloc base
+// relocations. Split out of pelink.bit (docs/development.md's file-size rule)
+// so both files stay under 800 lines; sibling .bit files share one module, no
+// imports needed. Named to sort bytewise before "pelink.bit" so the inliner
+// (docs/development.md's file-split note) sees these callees before
+// linkPeExecutable, their only caller.
+
+// ---- DLL grouping: pesyms.bit is the source of truth -----------------------
+
+// This link's referenced imports, grouped so each DLL's entries are
+// contiguous — required because each DLL gets its own ILT/IAT chunk in
+// .idata, each independently null-terminated. `names` is `importOrder`
+// reordered into groups; `dlls[d]`/`start[d]`/`count[d]` describe group d.
+// DLL order is first-appearance order within `importOrder`, so the layout is
+// deterministic for a given link.
+struct PlDllGroups {
+  dlls: []string,
+  start: []int,
+  count: []int,
+  names: []string,
+}
+
+// Groups `importOrder` by DLL, looking each name up in pesyms.bit's admitted
+// table (the one source of truth for which DLL an import binds from — never
+// guessed at here). A name that reaches this far but is not in the table is a
+// linker bug (allowedImports let something through pesyms.bit does not
+// admit), so it fails loud rather than silently defaulting a DLL.
+fn plGroupByDll(importOrder: []string): PlDllGroups! {
+  let dlls = []string(0)
+  let dllOfName = []string(len(importOrder))
+  let dllIndex = map<string, int>{}
+  let count = []int(0)
+  let i = 0
+  while (i < len(importOrder)) {
+    let name = importOrder[i]
+    let (dll, ok) = windowsImportDll(name)
+    if (!ok) {
+      fail newError("pe: import '${name}' is not in the admitted Windows import surface")
+    }
+    dllOfName[i] = dll
+    let (di, seen) = dllIndex[dll]
+    if (!seen) {
+      di = len(dlls)
+      dllIndex[dll] = di
+      dlls = append(dlls, dll)
+      count = append(count, 0)
+    }
+    count[di] = count[di] + 1
+    i = i + 1
+  }
+
+  let start = []int(len(dlls))
+  let cursor = 0
+  let d = 0
+  while (d < len(dlls)) {
+    start[d] = cursor
+    cursor = cursor + count[d]
+    d = d + 1
+  }
+
+  let fill = []int(len(dlls))
+  d = 0
+  while (d < len(dlls)) {
+    fill[d] = start[d]
+    d = d + 1
+  }
+  let names = []string(len(importOrder))
+  i = 0
+  while (i < len(importOrder)) {
+    let (di, _) = dllIndex[dllOfName[i]]
+    names[fill[di]] = importOrder[i]
+    fill[di] = fill[di] + 1
+    i = i + 1
+  }
+  return PlDllGroups{ dlls: dlls, start: start, count: count, names: names }
+}
+
+// ---- .idata: import descriptors + ILT/IAT + hint/name + DLL names ---------
+
+struct PlIdataLayout {
+  descriptorTableSize: int,
+  dllIltOff: []int,
+  dllIatOff: []int,
+  dllNameOff: []int,
+  // Parallel to `PlDllGroups.names`: the hint/name entry offset per import.
+  namesOff: []int,
+  totalSize: int,
+}
+
+// Layout order: descriptor table (one real IMAGE_IMPORT_DESCRIPTOR per DLL
+// plus one null terminator), then every DLL's ILT contiguously, then every
+// DLL's IAT contiguously (so the whole IAT is one contiguous region — the
+// image's IAT data directory needs exactly that), then hint/name entries in
+// grouped order, then the DLL name strings.
+fn plBuildIdataLayout(g: PlDllGroups): PlIdataLayout {
+  let n = len(g.dlls)
+  let descriptorTableSize = (n + 1) * 20
+  let dllIltOff = []int(n)
+  let dllIatOff = []int(n)
+  let dllNameOff = []int(n)
+  let cursor = descriptorTableSize
+
+  let d = 0
+  while (d < n) {
+    dllIltOff[d] = cursor
+    cursor = cursor + (g.count[d] + 1) * 8
+    d = d + 1
+  }
+  d = 0
+  while (d < n) {
+    dllIatOff[d] = cursor
+    cursor = cursor + (g.count[d] + 1) * 8
+    d = d + 1
+  }
+
+  let namesOff = []int(len(g.names))
+  let i = 0
+  while (i < len(g.names)) {
+    namesOff[i] = cursor
+    let entryLen = 2 + len([]byte(g.names[i])) + 1 // hint(2) + name + NUL
+    if (entryLen % 2 != 0) {
+      entryLen = entryLen + 1 // pad to a 2-byte boundary
+    }
+    cursor = cursor + entryLen
+    i = i + 1
+  }
+
+  d = 0
+  while (d < n) {
+    dllNameOff[d] = cursor
+    cursor = cursor + len([]byte(g.dlls[d])) + 1
+    d = d + 1
+  }
+
+  return PlIdataLayout{ descriptorTableSize: descriptorTableSize, dllIltOff: dllIltOff,
+    dllIatOff: dllIatOff, dllNameOff: dllNameOff, namesOff: namesOff, totalSize: cursor }
+}
+
+fn plBuildIdataBytes(layout: PlIdataLayout, g: PlDllGroups, idataRva: int): []u8 {
+  let buf = []u8(layout.totalSize)
+  let n = len(g.dlls)
+
+  let d = 0
+  while (d < n) {
+    let descOff = d * 20
+    loWrU32(buf, descOff, idataRva + layout.dllIltOff[d])      // ImportLookupTableRVA
+    loWrU32(buf, descOff + 4, 0)                                // TimeDateStamp
+    loWrU32(buf, descOff + 8, 0)                                // ForwarderChain
+    loWrU32(buf, descOff + 12, idataRva + layout.dllNameOff[d]) // Name RVA
+    loWrU32(buf, descOff + 16, idataRva + layout.dllIatOff[d])  // ImportAddressTableRVA
+    d = d + 1
+  }
+  // buf[n*20 .. n*20+20] stays the zero null-terminator descriptor.
+
+  d = 0
+  while (d < n) {
+    let k = 0
+    while (k < g.count[d]) {
+      let idx = g.start[d] + k
+      // By-name import: bit 63 (ordinal flag) clear.
+      let thunk = idataRva + layout.namesOff[idx]
+      loWrU64(buf, layout.dllIltOff[d] + k * 8, thunk)
+      loWrU64(buf, layout.dllIatOff[d] + k * 8, thunk)
+      let nameBytes = []byte(g.names[idx])
+      let b = 0
+      while (b < len(nameBytes)) {
+        buf[layout.namesOff[idx] + 2 + b] = nameBytes[b] // hint(0) precedes; buf is zeroed
+        b = b + 1
+      }
+      k = k + 1
+    }
+    d = d + 1
+  }
+
+  d = 0
+  while (d < n) {
+    let nameBytes = []byte(g.dlls[d])
+    let b = 0
+    while (b < len(nameBytes)) {
+      buf[layout.dllNameOff[d] + b] = nameBytes[b]
+      b = b + 1
+    }
+    d = d + 1
+  }
+  return buf
+}
+
+// ---- .reloc (IMAGE_REL_BASED_DIR64 base relocations) -----------------------
+
+// Insertion sort (small N — the count of ABS64 fields in one program, bounded
+// by the source, not by anything this iterates unboundedly). Mirrors
+// linkobj.bit's loSortByOffset.
+fn plSortInts(items: []int): []int {
+  let i = 1
+  while (i < len(items)) {
+    let v = items[i]
+    let j = i - 1
+    while (j >= 0 && items[j] > v) {
+      items[j + 1] = items[j]
+      j = j - 1
+    }
+    items[j + 1] = v
+    i = i + 1
+  }
+  return items
+}
+
+fn plBuildBaseRelocs(fieldRvas: []int): []u8 {
+  let out = newByteBuf()
+  if (len(fieldRvas) == 0) {
+    return out.bytes
+  }
+  let i = 0
+  while (i < len(fieldRvas)) {
+    let page = fieldRvas[i] & ~0xFFF
+    let j = i
+    while (j < len(fieldRvas) && (fieldRvas[j] & ~0xFFF) == page) {
+      j = j + 1
+    }
+    let count = j - i
+    let oddPad = count % 2 != 0
+    let numEntries = count
+    if (oddPad) {
+      numEntries = numEntries + 1
+    }
+    appendU32(out, page)
+    appendU32(out, 8 + numEntries * 2)
+    let k = i
+    while (k < j) {
+      appendU16(out, (10 << 12) | (fieldRvas[k] & 0xFFF)) // IMAGE_REL_BASED_DIR64
+      k = k + 1
+    }
+    if (oddPad) {
+      appendU16(out, 0) // IMAGE_REL_BASED_ABSOLUTE: a no-op padding entry
+    }
+    i = j
+  }
+  return out.bytes
+}
+
