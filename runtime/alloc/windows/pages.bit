@@ -1,0 +1,120 @@
+// Windows page provider for the Stage-B port of runtime/alloc/ (#3330, epic
+// #3322). See ../alloc.bit for why the port is split by directory rather than
+// switching on the OS inside one file. This file exists because
+// runtime/root/windows/boot.bit needs it directly (mapPages for the heap and
+// every guarded stack) and no other Stage B ticket owns it — #3335
+// (runtime/thread/windows) and #3336 (runtime/park/windows) are the GREEN
+// THREAD context-switch and idle-wake primitives, a different concern from
+// raw page mapping.
+//
+// Windows publishes no stable syscall ABI (epic #3322's own framing), so this
+// goes through kernel32 `extern function` calls, the same shape
+// runtime/alloc/darwin/pages.bit uses for libSystem — not raw syscalls, which
+// is the Linux-only shape. VirtualAlloc/VirtualFree/VirtualProtect are all in
+// compiler/pesyms.bit's admitted kernel32 import surface (#3328).
+//
+// ---------------------------------------------------------------------------
+// unmapPages DOES NOT RELEASE ADDRESS SPACE ON WINDOWS, AND THAT IS DELIBERATE
+// ---------------------------------------------------------------------------
+//
+// POSIX munmap frees an arbitrary sub-range of an earlier mapping — exactly
+// what runtime/root/{linux,darwin}/boot.bit's mapGuardedStack does to trim the
+// unneeded slop around a stack's fixed guard hole. Win32's VirtualFree has no
+// such operation: MEM_RELEASE requires the EXACT base address VirtualAlloc
+// returned and a size of 0 (release the whole region); calling it on a
+// sub-range fails outright.
+//
+// MEM_DECOMMIT is the operation that actually matches the caller's intent
+// here. It accepts an arbitrary sub-range of a committed VirtualAlloc'd
+// region, and MSDN's own words for what happens to a decommitted range are the
+// point: "the pages are then in the reserved state" — inaccessible, exactly
+// like the PROT_NONE guard hole this runtime already relies on
+// (mapGuardedStack's head guard), AND never available to a later VirtualAlloc
+// call from this same reservation, which is the exact hazard #2433's guard
+// exists to prevent (a later mapPages first-fitting into a guard hole a
+// sibling call had just freed). The one difference from POSIX unmap is that
+// the address range is not returned to the process's general pool for an
+// UNRELATED VirtualAlloc to reuse — it stays reserved-but-uncommitted until
+// the whole original allocation is eventually released. That is a strictly
+// SAFER failure mode than POSIX's (an unmapped range CAN be reused by an
+// unrelated mapping; a decommitted Windows range cannot), and this runtime
+// already accepts an equivalent cost on every platform — ../../root/linux/
+// boot.bit's own comment notes its tail hole "is never touched, never shows
+// up as RSS, but still a live, counted VMA for as long as the process runs".
+// The cost here is the same shape: reserved virtual address space that is
+// never resident (decommitted pages are never faulted in) and only matters at
+// a scale (tens of thousands of live spawns) this port does not yet reach.
+
+const MEM_COMMIT: int = 0x1000
+const MEM_RESERVE: int = 0x2000
+const MEM_DECOMMIT: int = 0x4000
+const PAGE_READWRITE: int = 0x04
+const PAGE_NOACCESS: int = 0x01
+
+extern fn VirtualAlloc(addr: *byte, size: i64, allocType: i32, protect: i32): *byte
+extern fn VirtualFree(addr: *byte, size: i64, freeType: i32): i32
+extern fn VirtualProtect(addr: *byte, size: i64, newProtect: i32, oldProtect: *i32): i32
+
+// VirtualProtect's `lpflOldProtect` out-param: it must be a valid, non-null
+// address (a null pointer here is ERROR_INVALID_PARAMETER, not "don't care"),
+// but no caller of protectPages below ever reads the previous protection.
+// Module-level state (§11.11) rather than a local: `ptrOf` addresses module
+// cells, not locals. A shared scratch word is safe here even under concurrent
+// calls (protectPages is reachable from any worker's rtSpawn) because the
+// value written is discarded by every caller — the only thing that matters is
+// each call's own VirtualProtect return code, which is independent per call.
+let winOldProtectScratch: i32 = 0
+
+// The page size the allocator rounds direct-mapped requests up to. 4096 on
+// every x86/x86-64 Windows release (the OS's allocation GRANULARITY is 64KiB,
+// but the PAGE size VirtualAlloc/VirtualProtect operate on is 4096) — unlike
+// aarch64-macOS this needs no runtime query; x86_64-windows is the only
+// Windows target this toolchain supports (epic #3322), and 4096 is invariant
+// across it.
+export @nosplit fn pageSize(): int { return 4096 }
+
+// Map `nbytes` bytes of zeroed, writable, private memory. Returns the base
+// address, or 0 when the OS refuses — null as zero, matching both POSIX
+// providers' contract.
+//
+// One VirtualAlloc call does both RESERVE and COMMIT: unlike a guard region
+// carved out of an existing reservation (mapGuardedStack's own two-phase use
+// of protectPages/unmapPages below), a fresh allocation has no reason to
+// separate the two steps, and MEM_COMMIT|MEM_RESERVE is the direct Win32
+// equivalent of an anonymous mmap.
+export @nosplit @symbol("bit_rt_port_alloc_map_pages") fn mapPages(nbytes: int): int {
+  if (nbytes <= 0) {
+    return 0
+  }
+  let hint: *byte = nil
+  let p = VirtualAlloc(hint, i64(nbytes), i32(MEM_COMMIT | MEM_RESERVE), i32(PAGE_READWRITE))
+  return int(p)
+}
+
+// Make `nbytes` bytes at `addr` inaccessible without releasing the
+// reservation — see the header for why this is MEM_DECOMMIT, not
+// MEM_RELEASE. True on success.
+//
+// PINNED (matching both POSIX providers): `runtime/root/windows/boot.bit`'s
+// `bit_rt_unmap_pages` wrapper calls it across the module boundary, and -O1
+// splices this body into that caller, so the reference that survives into the
+// root object is THIS callee — an unpinned mangled callee is exactly what
+// `--freestanding` refuses (SPEC §11.9).
+export @nosplit @symbol("bit_rt_port_alloc_unmap_pages") fn unmapPages(addr: int, nbytes: int): bool {
+  if (addr == 0 || nbytes <= 0) {
+    return false
+  }
+  let base: *byte = nil
+  return VirtualFree(base + addr, i64(nbytes), i32(MEM_DECOMMIT)) != i32(0)
+}
+
+// Make `nbytes` bytes at `addr` inaccessible while keeping the mapping
+// committed and occupied — the fixed stack guard (#2433's header, ported
+// unchanged in mapGuardedStack below). True on success.
+export @nosplit @symbol("bit_rt_port_alloc_protect_pages") fn protectPages(addr: int, nbytes: int): bool {
+  if (addr == 0 || nbytes <= 0) {
+    return false
+  }
+  let base: *byte = nil
+  return VirtualProtect(base + addr, i64(nbytes), i32(PAGE_NOACCESS), ptrOf(winOldProtectScratch)) != i32(0)
+}

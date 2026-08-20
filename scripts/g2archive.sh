@@ -134,14 +134,30 @@ done
 # set of directories holding one. Anything present on disk but missing from the
 # list above is silently left out of the archive; anything in the list but absent
 # on disk is a typo that would abort the emit loop anyway, but is named here
-# because the message is clearer before 22 compiles than during them. The other
+# because the message is clearer before 22 compiles than during them. Every OTHER
 # platform's directories are excluded, not missing: only $PLAT's providers belong
 # in this target's archive.
-OTHER_PLAT=linux
-[ "$PLAT" = linux ] && OTHER_PLAT=darwin
+#
+# ALL_PLATS, not a single OTHER_PLAT (#3330): a two-way linux/darwin toggle
+# silently stopped excluding a THIRD platform's in-progress directories the
+# moment one existed on disk — runtime/root/windows and runtime/alloc/windows
+# (epic #3322 Stage B) landed while this script still only knew "linux" and
+# "darwin" exist, so building x86_64-linux or aarch64-macos saw them as
+# "on disk but not listed" and refused to archive ANYTHING, for every target,
+# not just the unbuilt one. Exclude every known platform name except $PLAT,
+# so an in-progress platform's directories stay legitimately excluded here
+# until its own tools/build wiring (x86_64-windows: #3341) adds it to
+# PLATFORM_PAIRS's targets and to this list.
+ALL_PLATS="linux darwin windows"
+OTHER_PLATS=""
+for p in $ALL_PLATS; do
+  [ "$p" = "$PLAT" ] && continue
+  OTHER_PLATS="$OTHER_PLATS $p"
+done
+OTHER_PLAT_RE=$(printf '%s\n' $OTHER_PLATS | paste -sd '|' -)
 
 on_disk=$(cd "$RT" && find . -name '*.bit' -exec dirname {} \; \
-  | sed 's|^\./||; s|^\.$|-|' | grep -v "/${OTHER_PLAT}\$" | sort -u)
+  | sed 's|^\./||; s|^\.$|-|' | grep -vE "/(${OTHER_PLAT_RE})\$" | sort -u)
 listed=$(printf '%s\n' "${REL_LIST[@]}" | sed 's|^$|-|' | sort -u)
 
 missing=$(comm -23 <(printf '%s\n' "$on_disk") <(printf '%s\n' "$listed"))
