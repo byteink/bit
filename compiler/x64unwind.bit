@@ -1,0 +1,160 @@
+// Self-host (#3345, epic #3322): Win64 UNWIND_INFO derivation. Split out of
+// compiler/x64call.bit (docs/development.md's 800-line rule; x64call.bit was
+// already at 777/800) — same module, so nothing here is imported. Named to
+// sort bytewise after "x64call.bit" so xEmitPrologue, its only caller, is
+// visible to the inliner before these.
+//
+// Every helper here does exactly one thing: build the XUnwindOp that
+// describes the instruction xEmitPrologue (compiler/x64call.bit) JUST
+// emitted. xEmitPrologue calls one of these immediately after each
+// RSP/RBP-affecting emission, in the SAME loop that walks cx.frame.savedGpr
+// — so a change to which registers get pushed, or to the loop bounds,
+// changes both the bytes and the codes together. That is the whole point:
+// two independent descriptions of one prologue drift, and the failure is a
+// wrong backtrace nobody notices (this ticket's own framing).
+//
+// Byte format verified against `clang -target x86_64-pc-windows-msvc -c`'s
+// own .xdata output for two independently-compiled probe functions — see
+// pelinkcheck.bit's oracle comment for the full transcript (opcode values,
+// slot counts, the FrameRegister/FrameOffset packing, and the array's
+// decreasing-CodeOffset order were all read back off that trace, not the MS
+// spec text alone).
+//
+// SCOPE: no UWOP_SAVE_XMM128 codes for cx.frame.savedXmm. Bit has no SEH and
+// never restores register VALUES during an unwind — only the RSP/RBP chain a
+// debugger or crash reporter needs to find the CALLER's frame, and an XMM
+// save (always emitted AFTER the frame-carving instructions this file does
+// describe, per xEmitPrologue's own comment) never changes RSP. Omitting
+// them is a deliberate, narrow, documented scope decision, not the two
+// descriptions drifting.
+
+// UWOP_* opcode values (Microsoft PE/COFF spec, cross-checked against the
+// clang trace above).
+fn xUwopPushNonvol(): int { return 0 }
+fn xUwopAllocLarge(): int { return 1 }
+fn xUwopSetFpreg(): int { return 3 }
+
+// One UNWIND_CODE before packing. `codeOffset` is the byte offset from
+// function start to the END of the instruction it describes — the
+// UNWIND_CODE contract, and exactly `len(cx.buf.code)` right after
+// xEmitPrologue emits that instruction. `operandSlots` is 0 (PUSH_NONVOL,
+// SET_FPREG: no extra slot) or 1 (ALLOC_LARGE with OpInfo 0: one 16-bit
+// scaled-by-8 slot, the only form this file emits — see xAllocLargeOp).
+struct XUnwindOp {
+  codeOffset: int,
+  op: int,
+  opInfo: int,
+  operandSlots: int,
+  operand: int,
+}
+
+fn xPushNonvolOp(codeOffset: int, r: XReg64): XUnwindOp {
+  return XUnwindOp{ codeOffset: codeOffset, op: xUwopPushNonvol(),
+    opInfo: xRegNum(r), operandSlots: 0, operand: 0 }
+}
+
+// xEmitPrologue always sets rbp = rsp immediately after pushing it (`mov
+// rbp, rsp`, before any further push or allocation), so FrameOffset is
+// always 0 — xPackUnwindInfo bakes that into the header directly rather than
+// threading it through here.
+fn xSetFpregOp(codeOffset: int): XUnwindOp {
+  return XUnwindOp{ codeOffset: codeOffset, op: xUwopSetFpreg(), opInfo: 0,
+    operandSlots: 0, operand: 0 }
+}
+
+// UWOP_ALLOC_LARGE. `frameSize` is a multiple of 8 by construction for every
+// REAL compiled function (XFrame's rawFrame is `8 * (numSlots +
+// len(savedXmm))`, and xAlignFrame only ever adds a further multiple of 8 —
+// compiler/x64frame.bit): OpInfo 0 (the size divided by 8, one 16-bit slot)
+// covers that case exactly. OpInfo 1 (the unscaled size, two 16-bit slots —
+// i.e. one raw 32-bit value) covers everything else: xEmitPrologue is also
+// called directly by low-level tests (checkX64WinStackProbe) with frame
+// sizes chosen to bracket the probe threshold at exact byte precision, not
+// to be realistic, so this cannot assume 8-alignment. Both forms are
+// spec-correct; which one is chosen changes nothing about the addition
+// xEmitWinStackProbe/xRspAddSub actually perform.
+fn xAllocLargeOp(codeOffset: int, frameSize: int): XUnwindOp {
+  assert(frameSize > 0)
+  if (frameSize % 8 == 0 && frameSize / 8 <= 65535) {
+    return XUnwindOp{ codeOffset: codeOffset, op: xUwopAllocLarge(), opInfo: 0,
+      operandSlots: 1, operand: frameSize / 8 }
+  }
+  assert(frameSize <= 0xFFFFFFFF)
+  return XUnwindOp{ codeOffset: codeOffset, op: xUwopAllocLarge(), opInfo: 1,
+    operandSlots: 2, operand: frameSize }
+}
+
+// The finished `.xdata` record for one function, plus its own prologue's
+// byte length (SizeOfProlog) — everything a `.pdata` UnwindInfoAddress field
+// points at needs. `bytes` is empty for a non-Win64 function (xEmitPrologue
+// never builds ops for SysV) — pelinkcheck.bit/pelink.bit never emit a
+// `.xdata` atom for one, so this is never serialized in that case.
+struct XUnwindInfo {
+  bytes: []u8,
+  prologueSize: int,
+}
+
+fn xEmptyUnwindInfo(): XUnwindInfo {
+  return XUnwindInfo{ bytes: []u8(0), prologueSize: 0 }
+}
+
+// Packs `ops` — in EMISSION order, earliest instruction first, exactly the
+// order xEmitPrologue appended them — into a complete UNWIND_INFO record.
+// Version 1, Flags 0 (no exception handler, no chained unwind info — Bit has
+// neither). FrameRegister is always RBP with FrameOffset 0 (xSetFpregOp's
+// comment); a function with an empty `ops` list (SysV, or the naked-function
+// skip in x64dispatch.bit) never reaches this, since xEmitPrologue only
+// calls it when cx.cc == Win64.
+//
+// The on-disk UNWIND_CODE array is stored in DEcreasing CodeOffset order —
+// the operation closest to the end of the prologue first, so RtlVirtualUnwind
+// walks it in the order it must UNDO them (confirmed against the clang trace:
+// four XMM saves, a SET_FPREG, an ALLOC_LARGE and a PUSH_NONVOL, printed in
+// exactly that order — highest CodeOffset first). `ops` arrives in the
+// opposite (chronological) order, so this reverses while packing.
+fn xPackUnwindInfo(ops: []XUnwindOp, prologueSize: int): XUnwindInfo {
+  assert(prologueSize >= 0 && prologueSize < 256) // SizeOfProlog is one byte
+  let codes = []u8(0)
+  let count = 0
+  let i = len(ops)
+  while (i > 0) {
+    i = i - 1
+    let o = ops[i]
+    assert(o.codeOffset >= 0 && o.codeOffset < 256) // CodeOffset is one byte
+    codes = append(codes, u8(o.codeOffset & 0xFF))
+    codes = append(codes, u8(((o.opInfo & 0xF) << 4) | (o.op & 0xF)))
+    count = count + 1
+    if (o.operandSlots == 1) {
+      codes = append(codes, u8(o.operand & 0xFF))
+      codes = append(codes, u8((o.operand >> 8) & 0xFF))
+      count = count + 1
+    } else if (o.operandSlots == 2) {
+      // The unscaled 32-bit ALLOC_LARGE operand, low 16 bits then high 16 —
+      // two consecutive UNWIND_CODE slots, each still little-endian.
+      codes = append(codes, u8(o.operand & 0xFF))
+      codes = append(codes, u8((o.operand >> 8) & 0xFF))
+      codes = append(codes, u8((o.operand >> 16) & 0xFF))
+      codes = append(codes, u8((o.operand >> 24) & 0xFF))
+      count = count + 2
+    }
+  }
+  assert(count < 256) // CountOfCodes is one byte
+  if (count % 2 != 0) {
+    // The spec pads the array to an even slot count so any trailing field
+    // (exception handler RVA, chained info) stays 4-byte aligned — matches
+    // the clang trace's second function (1 real slot, 1 zero slot).
+    codes = append(codes, u8(0))
+    codes = append(codes, u8(0))
+  }
+  let out = []u8(0)
+  out = append(out, u8(1)) // Version 1, Flags 0
+  out = append(out, u8(prologueSize & 0xFF))
+  out = append(out, u8(count & 0xFF))
+  out = append(out, u8(xRegNum(XReg64.Rbp) & 0xF)) // FrameRegister=RBP, FrameOffset=0
+  let ci = 0
+  while (ci < len(codes)) {
+    out = append(out, codes[ci])
+    ci = ci + 1
+  }
+  return XUnwindInfo{ bytes: out, prologueSize: prologueSize }
+}

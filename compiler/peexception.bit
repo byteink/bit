@@ -1,0 +1,142 @@
+// Self-host (#3345, epic #3322): pelink.bit's `.pdata` merge + sort — the
+// RUNTIME_FUNCTION table an OS/debugger/crash-reporter binary-searches to
+// walk a Bit stack. Split out the way peimport.bit hosts .idata/.reloc
+// synthesis (docs/development.md's 800-line rule and file-granularity
+// convention): this is the same shape (resolved addresses in, flat bytes
+// out), not the atom-placement + applyReloc route .text/.rdata/.data take,
+// because a RUNTIME_FUNCTION's three fields are RVAs that must already be
+// known and — the ticket's own "hardest requirement" — the WHOLE table must
+// be RE-SORTED by BeginAddress after every atom has one. The OS does not
+// verify the table is sorted; an unsorted one fails silently, not loudly.
+//
+// A Pdata atom is kept in the output iff its own function survived
+// dead-stripping. Nothing in .text ever points AT a Pdata/Xdata atom, so the
+// ordinary reachability walk (plDeadStripWithImports, pelink.bit) never
+// visits either kind and never marks them in `kept` — liveness here is
+// derived from the Pdata atom's own first relocation (BeginAddress -> the
+// owning text atom, always a LOCAL ref: emitpe.bit's writer only ever
+// targets a function's own symbol, never a section symbol) so a stripped
+// function's stale pdata/xdata bytes can never reach the linked image.
+//
+// Each Pdata atom carries exactly 3 relocations, in this fixed order (the
+// shape emitpe.bit's caller must build): BeginAddress (offset 0, target the
+// owning text atom, addend 0), EndAddress (offset 4, SAME target, addend the
+// function's byte size), UnwindInfoAddress (offset 8, target the matching
+// Xdata atom, addend 0). All three carry PeRelocKind.AddrRva32 /
+// LoRelocKind.AddrRva32 — an RVA, not a VA, is exactly what a
+// RUNTIME_FUNCTION field is.
+
+// One resolved RUNTIME_FUNCTION entry, before sorting.
+struct PePdataEntry {
+  beginRva: int,
+  endRva: int,
+  unwindInfoRva: int,
+}
+
+fn sizeofPePdataEntry(): int { return 12 }
+
+// The Xdata atom ids referenced by every LIVE Pdata atom — pelink.bit places
+// these into `.rdata` (alongside the GC stack-map group) before layout, so
+// their RVAs exist by the time ppResolveEntries needs them. `kept` is
+// linkPeExecutable's own post-walk map; `globals` resolves a function
+// symbol's target atom regardless of whether IT happens to be Local or
+// Global-bound — most real Bit functions are Global (cross-module calls
+// need it), so a target's own binding cannot be assumed either way.
+fn ppLiveXdataAtoms(modules: []LoModule, kept: map<int, bool>, globals: map<string, int>): []int! {
+  let out = []int(0)
+  let mi = 0
+  while (mi < len(modules)) {
+    let atoms = modules[mi].atoms
+    let ai = 0
+    while (ai < len(atoms)) {
+      if (atoms[ai].kind == LoSectionKind.Pdata) {
+        assert(len(atoms[ai].relocs) == 3) // begin, end, unwind-info
+        let textId = resolveRef(globals, mi, atoms[ai].relocs[0].target)?
+        let (_, textAlive) = kept[textId]
+        if (textAlive) {
+          let xdataId = resolveRef(globals, mi, atoms[ai].relocs[2].target)?
+          out = append(out, xdataId)
+        }
+      }
+      ai = ai + 1
+    }
+    mi = mi + 1
+  }
+  return out
+}
+
+// Every RUNTIME_FUNCTION entry for a surviving function, resolved against
+// `addrOf` (already populated for text AND rdata/xdata by the time
+// pelink.bit calls this) — NOT yet sorted; ppSortEntries does that
+// separately so resolving and sorting can each be tested on their own.
+fn ppResolveEntries(modules: []LoModule, kept: map<int, bool>, globals: map<string, int>,
+    addrOf: map<int, int>): []PePdataEntry! {
+  let out = []PePdataEntry(0)
+  let mi = 0
+  while (mi < len(modules)) {
+    let atoms = modules[mi].atoms
+    let ai = 0
+    while (ai < len(atoms)) {
+      if (atoms[ai].kind == LoSectionKind.Pdata) {
+        let textId = resolveRef(globals, mi, atoms[ai].relocs[0].target)?
+        let (_, textAlive) = kept[textId]
+        if (textAlive) {
+          let (beginRva, hasBegin) = addrOf[textId]
+          assert(hasBegin)
+          let endAddend = atoms[ai].relocs[1].addend
+          let xdataId = resolveRef(globals, mi, atoms[ai].relocs[2].target)?
+          let (uiRva, hasUi) = addrOf[xdataId]
+          assert(hasUi)
+          out = append(out, PePdataEntry{ beginRva: beginRva,
+            endRva: beginRva + endAddend, unwindInfoRva: uiRva })
+        }
+      }
+      ai = ai + 1
+    }
+    mi = mi + 1
+  }
+  return out
+}
+
+// Insertion sort by BeginAddress — small N (one entry per function), mirrors
+// linkobj.bit's loSortByOffset / peimport.bit's plSortInts.
+fn ppSortEntries(items: []PePdataEntry): []PePdataEntry {
+  let i = 1
+  while (i < len(items)) {
+    let v = items[i]
+    let j = i - 1
+    while (j >= 0 && items[j].beginRva > v.beginRva) {
+      items[j + 1] = items[j]
+      j = j - 1
+    }
+    items[j + 1] = v
+    i = i + 1
+  }
+  return items
+}
+
+// True iff `items` is sorted by BeginAddress — the property this ticket's
+// acceptance asserts programmatically over the LINKED output, not merely
+// trusted from ppSortEntries having run.
+fn ppSorted(items: []PePdataEntry): bool {
+  let i = 1
+  while (i < len(items)) {
+    if (items[i - 1].beginRva > items[i].beginRva) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn ppBuildBytes(sorted: []PePdataEntry): []u8 {
+  let out = newByteBuf()
+  let i = 0
+  while (i < len(sorted)) {
+    appendU32(out, sorted[i].beginRva)
+    appendU32(out, sorted[i].endRva)
+    appendU32(out, sorted[i].unwindInfoRva)
+    i = i + 1
+  }
+  return out.bytes
+}

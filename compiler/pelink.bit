@@ -38,22 +38,27 @@
 // SCOPE, matching the port reference's `obj/pe.zig`/pesyms.bit: x86_64 only
 // (aarch64-windows is out of scope for the whole epic), no Windows TLS (a
 // `.tls$` section is rejected by pereader.bit before it ever reaches here),
-// console subsystem. Only two relocation kinds ever reach this file — Pc32
-// and Abs64 — because pereader.bit itself refuses anything else at read time
-// (prRelocKind); the checks below are defense in depth, not the only guard.
+// console subsystem. Only two relocation kinds ever reach the reachability
+// walk below — Pc32 and Abs64 — because a Pdata atom (the only place
+// AddrRva32 appears, #3345) is never visited by it: nothing in .text ever
+// points AT a Pdata/Xdata atom, so peexception.bit resolves those three
+// fields itself, directly against `addrOf`, once layout is done. The checks
+// in the walk are defense in depth for the two kinds it does see, not the
+// only guard against something else reaching it.
 //
 // Port reference: `git show 4ffb5523^:seed/link/pe.zig` (971 Zig lines).
 // Ported, not resurrected: the DLL-grouping generalization above and the
 // ABI.md §4 merged GC stack-map group (elflink.bit/macholink.bit's mechanism)
 // are both additions the Zig seed predates.
 //
-// Split across three sibling files (docs/development.md's 800-line rule,
-// mirroring the macholink.bit/machogot.bit/machoreloc.bit/machocmds.bit
-// family's granularity): this file (the driver — reachability walk, layout,
+// Split across sibling files (docs/development.md's 800-line rule, mirroring
+// the macholink.bit/machogot.bit/machoreloc.bit/machocmds.bit family's
+// granularity): this file (the driver — reachability walk, layout,
 // relocation application, ingest); peimport.bit (DLL grouping, .idata,
 // .reloc); pehdr.bit (the RVA/file-offset bridge, PE header + section-table
-// emission). Both siblings sort bytewise before "pelink.bit" so the inliner
-// sees their functions before this file's calls into them.
+// emission); peexception.bit (#3345: `.pdata` merge, resolve and sort). All
+// three sort bytewise before "pelink.bit" so the inliner sees their
+// functions before this file's calls into them.
 
 // ---- constants --------------------------------------------------------
 
@@ -287,6 +292,20 @@ fn linkPeExecutable(inputModules: []LoModule, programModules: int,
     gcIdx = gcIdx + 1
   }
 
+  // #3345: every LIVE function's `.xdata` UNWIND_INFO record — appended to
+  // .rdata the same way (peexception.bit's own comment explains why a Pdata/
+  // Xdata atom is never itself reached by the walk above, so liveness is
+  // derived here rather than inherited from `kept`). Nothing besides a
+  // `.pdata` entry's RVA field ever points at one, so it needs no section of
+  // its own; `.pdata` below is the one output that DOES, since the OS reads
+  // it as a contiguous, sorted table.
+  let xdataAtoms = ppLiveXdataAtoms(modules, kept, globals)?
+  let xdIdx = 0
+  while (xdIdx < len(xdataAtoms)) {
+    rdata = append(rdata, PlPlaced{ id: xdataAtoms[xdIdx], rva: 0 })
+    xdIdx = xdIdx + 1
+  }
+
   // ---- layout: RVAs first (headers occupy their own leading page) -----------
   let stubWidth = plStubWidth()
   let nImports = len(st.importOrder)
@@ -333,6 +352,17 @@ fn linkPeExecutable(inputModules: []LoModule, programModules: int,
     fail newError("pe: entry symbol ${plEntrySymbol()} was stripped")
   }
 
+  // #3345: `.pdata` — resolved now, while every .text/.rdata atom's RVA is
+  // already known, then RE-SORTED by BeginAddress: the OS binary-searches
+  // this table at exception time and does NOT verify it is sorted, so an
+  // unsorted table fails silently rather than loudly (this ticket's own
+  // framing, and peexception.bit's header comment). `.pdata`'s own placement (an
+  // RVA for the SECTION itself) happens further down, alongside `.idata`;
+  // only the byte CONTENT is built here.
+  let pdataEntries = ppSortEntries(ppResolveEntries(modules, kept, globals, addrOf)?)
+  let pdataBytes = ppBuildBytes(pdataEntries)
+  let hasPdata = len(pdataBytes) > 0
+
   // ---- base-relocation collection: every internal ABS64 field ---------------
   // An ABS64 pointed at an import is already impossible here (rejected during
   // the reachability walk, since only Pc32 may target an import) — checked
@@ -373,6 +403,12 @@ fn linkPeExecutable(inputModules: []LoModule, programModules: int,
   }
   baseRelocs = plSortInts(baseRelocs)
 
+  // ---- .pdata (#3345): the sorted RUNTIME_FUNCTION table's own RVA ---------
+  rvaCursor = alignForward(rvaCursor, plSectionAlign())
+  let pdataRva = rvaCursor
+  rvaCursor = rvaCursor + len(pdataBytes)
+  let pdataVsize = len(pdataBytes)
+
   // ---- .idata: import descriptors + ILT/IAT + hint/name + DLL names ---------
   let hasImports = nImports > 0
   let dllGroups = plGroupByDll(st.importOrder)?
@@ -405,6 +441,7 @@ fn linkPeExecutable(inputModules: []LoModule, programModules: int,
   let nsections = 1 // .text always present (it holds _start)
   if (hasRdata) { nsections = nsections + 1 }
   if (hasData) { nsections = nsections + 1 }
+  if (hasPdata) { nsections = nsections + 1 }
   if (hasImports) { nsections = nsections + 1 }
   if (hasBss) { nsections = nsections + 1 }
   if (hasReloc) { nsections = nsections + 1 }
@@ -430,6 +467,13 @@ fn linkPeExecutable(inputModules: []LoModule, programModules: int,
     dataRawSize = alignForward(dataVsize, plFileAlign())
   }
   fileCursor = fileCursor + dataRawSize
+
+  let pdataFileOff = fileCursor
+  let pdataRawSize = 0
+  if (hasPdata) {
+    pdataRawSize = alignForward(len(pdataBytes), plFileAlign())
+  }
+  fileCursor = fileCursor + pdataRawSize
 
   let idataFileOff = fileCursor
   let idataRawSize = 0
@@ -577,6 +621,13 @@ fn linkPeExecutable(inputModules: []LoModule, programModules: int,
     sb = sb + 1
   }
 
+  if (hasPdata) {
+    let pb2 = 0
+    while (pb2 < len(pdataBytes)) {
+      file[pdataFileOff + pb2] = pdataBytes[pb2]
+      pb2 = pb2 + 1
+    }
+  }
   if (hasImports) {
     let ib = 0
     while (ib < len(idataBytes)) {
@@ -609,6 +660,8 @@ fn linkPeExecutable(inputModules: []LoModule, programModules: int,
     rdata: PlSpan{ rva: rdataRva, vsize: rdataVsize, fileOff: rdataFileOff, rawSize: rdataRawSize },
     hasData: hasData,
     data: PlSpan{ rva: dataRva, vsize: dataVsize, fileOff: dataFileOff, rawSize: dataRawSize },
+    hasPdata: hasPdata,
+    pdata: PlSpan{ rva: pdataRva, vsize: pdataVsize, fileOff: pdataFileOff, rawSize: pdataRawSize },
     hasImports: hasImports,
     idata: PlSpan{ rva: idataRva, vsize: idataLayout.totalSize, fileOff: idataFileOff, rawSize: idataRawSize },
     importDirSize: idataLayout.descriptorTableSize,
