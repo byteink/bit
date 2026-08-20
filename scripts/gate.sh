@@ -844,10 +844,35 @@ bucket_scripts() {
   BUCKET_POST=""
   case "$1" in
     selfhost)
-      BUCKET_PRE="scripts/selfhost-diffcheck.sh scripts/selfhost-fixpoint.sh"
+      # selfhost-diffcheck.sh and selfhost-fixpoint.sh are DELIBERATELY NOT
+      # BUCKET_PRE here (#3347). Measured standalone on a box with no
+      # make-driver competing: `selfhost-diffcheck.sh` 415s (808-file corpus,
+      # MATCH=808), `selfhost-fixpoint.sh` 153s (builds the compiler twice) —
+      # 568s together, before the bucket's own `./make` gates (275s standalone
+      # with selfhost warm) or a real selfhost rebuild (76s for a one-line
+      # compiler/** comment) even start. The full old bucket did not finish in
+      # 600s (killed at the ceiling still mid-`make: selfhost` rebuild),
+      # matching #3328's five failed attempts. Same defect class as #3309
+      # (test-stress-batch out of the runtime bucket): a single-file, no-
+      # concurrency serial loop over hundreds of corpus files that no batching
+      # can shrink.
+      #
+      # Coverage is NOT lost. Both scripts match `scripts/selfhost-*.sh` and
+      # are picked up by `scripts/selfhost-diffall.sh`'s discovery, which is
+      # what `./make test-differentials` (tools/build/defs.bit's
+      # `coreSteps()`, #2570) runs — already part of the mandatory three-
+      # command pre-push gate (CLAUDE.md "the verify loop"), and already the
+      # sanctioned home for this exact family precisely because it is too
+      # slow for `./make test` (defs.bit's own `test-differentials` comment:
+      # folding it in "would roughly double the ~19-minute pre-push suite").
+      # Only the diff-scoped working-loop gate stops paying for it a second
+      # time on every scoped run.
+      #
       # #1857 was a COMPILER bug (`parseFloat` had no hex-float branch) whose
       # only visible damage was in runtime codegen, and no differential walked
       # `runtime/`. A compiler/** change must be diffed against it (#1859).
+      # selfhost-diffruntime.sh stays here: measured standalone at 22s, it was
+      # never the problem.
       BUCKET_POST="scripts/selfhost-diffruntime.sh"
       ;;
     runtime)
