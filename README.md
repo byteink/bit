@@ -20,8 +20,11 @@ support guarantee. Read [the support policy](docs/release/SUPPORT.md) before
 depending on it.
 
 **Platforms.** Linux and macOS on x86-64 and ARM64. Windows is not supported yet:
-the PE/COFF object writer exists, but the CLI target and the Windows runtime port
-do not, so no Windows artifact is built.
+the self-hosted compiler has no PE/COFF object writer, no Windows CLI target and
+no Windows runtime port, so no Windows artifact is built. A PE/COFF writer and
+linker existed in the retired Zig seed (`seed/obj/pe.zig`, `seed/link/pe.zig`,
+recoverable at `4ffb5523^`) and are the port reference, not code still in the
+tree.
 
 ## Install
 
