@@ -44,14 +44,35 @@ export @nosplit fn chanInit(ch: *i64, bufAddr: int, capacity: int, isRef: bool, 
 // every function that can park and the honest equivalent of `runtime/chan/`'s
 // `sched.park` on a non-task thread.
 export @nosplit fn chanSend(ch: *i64, value: int): bool {
-  let s = taskAt(*(ch + chSched))
-  spinAcquire(spinCellAt(ch, chLock))
+  let cell = spinCellAt(ch, chLock)
+  spinAcquire(cell)
   if (*(ch + chClosed) != 0) {
-    spinRelease(spinCellAt(ch, chLock))
+    spinRelease(cell)
     return false
   }
+
+  // UNCONTENDED FAST PATH (#3318). Exactly `attemptSend`'s second arm, with the
+  // first arm's whole call chain skipped rather than reimplemented: when the
+  // receive queue is EMPTY, `tryHandoffToReceiver` can only pop nothing and
+  // return false, so `pushBuf` is what runs either way and the answer is
+  // identical by construction. The guard is deliberately stricter than
+  // "`tryHandoffToReceiver` would fail" — a queue holding only unclaimable
+  // (losing-select) waiters also fails, and that case correctly falls through to
+  // the general path below rather than being duplicated here.
+  //
+  // It buys three calls: `attemptSend`, `tryHandoffToReceiver` and its `wqPop`.
+  // The scheduler pointer moves down with them: `s` is used only by the arms
+  // that can wake a peer, so an uncontended send no longer loads `chSched` and
+  // converts it at all.
+  if (*(ch + chRecvHead) == 0 && *(ch + chCount) < *(ch + chCap)) {
+    pushBuf(ch, value)
+    spinRelease(cell)
+    return true
+  }
+
+  let s = taskAt(*(ch + chSched))
   if (attemptSend(ch, value, s)) {
-    spinRelease(spinCellAt(ch, chLock))
+    spinRelease(cell)
     return true
   }
 
@@ -72,7 +93,7 @@ export @nosplit fn chanSend(ch: *i64, value: int): bool {
 
   // Never hold a spinlock across the context switch: the holder stops running,
   // and every spinner is `@nosplit` and so cannot yield.
-  spinRelease(spinCellAt(ch, chLock))
+  spinRelease(cell)
   schedPark()
 
   let ok = *(scr + scrOk)
@@ -142,12 +163,30 @@ export @nosplit fn chanSend(ch: *i64, value: int): bool {
 // So the blocker is #1852 (copy-propagate SSA moves) and #1853 (fold small
 // constants into immediates), not this function — re-measure after those land.
 export @nosplit fn chanRecv(ch: *i64, valueOut: *i64): bool {
-  let s = taskAt(*(ch + chSched))
+  let cell = spinCellAt(ch, chLock)
+  spinAcquire(cell)
 
-  spinAcquire(spinCellAt(ch, chLock))
+  // UNCONTENDED FAST PATH (#3318). Exactly `attemptRecv`'s first arm, with the
+  // call chain skipped rather than reimplemented: when the send queue is EMPTY,
+  // `promoteQueuedSender` can only pop nothing and return, so a buffered value
+  // is delivered identically either way. The added `chSendHead == 0` test is
+  // what makes that equivalence hold by construction instead of by argument —
+  // a non-empty send queue falls through to the general path unchanged, which
+  // is also what preserves FIFO across the buffer.
+  //
+  // It buys three calls: `attemptRecv`, `promoteQueuedSender` and its `wqPop`.
+  // `s` moves to the slow path with them — the scheduler is only ever needed to
+  // wake a peer, and this arm wakes nobody.
+  if (*(ch + chCount) > 0 && *(ch + chSendHead) == 0) {
+    *valueOut = popBuf(ch)
+    spinRelease(cell)
+    return true
+  }
+
+  let s = taskAt(*(ch + chSched))
   let st = attemptRecv(ch, valueOut, s)
   if (st != rcvNone) {
-    spinRelease(spinCellAt(ch, chLock))
+    spinRelease(cell)
     return st == rcvValue
   }
 
@@ -163,7 +202,7 @@ export @nosplit fn chanRecv(ch: *i64, valueOut: *i64): bool {
   *(w + wSelect) = 0
   *(w + wCase) = 0
   wqPush(ch, chRecvHead, w)
-  spinRelease(spinCellAt(ch, chLock))
+  spinRelease(cell)
   schedPark()
 
   *valueOut = *(scr + scrElem)
