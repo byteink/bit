@@ -898,7 +898,24 @@ case "${BUCKET}" in
     # test-lint-runtime (its own gates.bit comment: "points `bit lint` at
     # `${BIT_REPO}/runtime`", E0211 unused-local) both examine runtime/
     # content directly and were missing here too (#2962).
-    BUILD_STEPS=(test-stress-exclusive test-stress-batch test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime)
+    #
+    # test-stress-batch is DELIBERATELY NOT in this bucket (#3309). Measured
+    # standalone on an idle box: `make: test-stress-batch — 11m0s` (65/65
+    # programs judged, PASS) — over the subagent Bash tool's 600s ceiling on
+    # its own, serially: tests/bit/stress/stress.bit's main loop calls
+    # checkProgram() once per eligible program with no concurrency, so there
+    # is no batching win available here the way the concurrent gate batch
+    # gives every OTHER step in this bucket. With it included, the same idle
+    # box measured the whole bucket at `./make ... — total 13m27s` plus
+    # scripts/selfhost-diffruntime.sh after it (839s / 13m59s end to end for
+    # `bash scripts/gate.sh`) — nine agents in one night could not complete
+    # this bucket because of it (#3280, #3294-3297, #3300, #3307, #3312,
+    # #3291). It stays exactly where it was in gateSteps() below (defs.bit),
+    # so `./make test` still runs it unchanged — only the diff-scoped
+    # working-loop gate stops paying for it. test-stress-exclusive (2
+    # programs, real elapsed-time asserts, 0m8s) stays here: it is fast and
+    # was never the problem.
+    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime)
     ;;
   testcases)
     # test-fuzz mutates the real tests/cases corpus (BIT_FUZZ_CASES=
