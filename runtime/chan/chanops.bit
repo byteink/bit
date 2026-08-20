@@ -88,6 +88,59 @@ export @nosplit fn chanSend(ch: *i64, value: int): bool {
 // returns both in a `RecvResult` struct; a two-word return is the shape ABI.md
 // §11 gives `bit_rt_chan_recv`, and splitting it into an out-parameter plus a
 // bool is how that lands on a `@nosplit` Bit signature without a struct return.
+//
+// ---------------------------------------------------------------------------
+// A FAILED RECEIVE PARKS IMMEDIATELY, AND A BOUNDED SPIN WAS MEASURED AND
+// REJECTED — #3320. DO NOT ADD ONE BACK WITHOUT REDOING THE MEASUREMENT.
+// ---------------------------------------------------------------------------
+//
+// The proposal was Go's `sync.Mutex` shape: `stdlib/sync`'s Mutex is `<- token`
+// on a capacity-1 channel, so every contended acquire pays a full park + wake
+// round trip, and a holder releases within a few hundred instructions. Measured
+// on f333d877, arm64/macOS, 64 green threads x 10000 acquisitions of one Mutex,
+// medians of 9, instructions retired: 2296 per acquisition contended against
+// 853 uncontended, flat in worker count, `sys` 0.00 throughout. The 1443
+// difference is the round trip.
+//
+// IT WAS BUILT AND IT LOST AT EVERY BUDGET. Release the lock (holding it across
+// a spin livelocks the sender), poll the channel words read-only, re-acquire,
+// re-attempt, then fall through to the park below. Instructions retired per
+// acquisition, 2-task case — the only shape where the spin is even eligible,
+// see the next paragraph:
+//
+//   no spin  2291   (1 turn x 1 poll)  2682   (1 x 4)  2805
+//                   (4 x 24)           7227   (8 x 64) 10591
+//
+// Strictly increasing. The cheapest possible spin — one re-attempt — already
+// costs 391 instructions and catches nothing, so there is no budget to tune
+// down to. Cycles agree with instructions (450 -> 1607 per acquisition at
+// 8 x 64), so this is not an artifact of counting instructions.
+//
+// WHY IT CANNOT CATCH, WHICH IS STRUCTURAL AND NOT A TUNING FAILURE. A spinner
+// has left the wait queue, and `attemptSend` tries `tryHandoffToReceiver`
+// BEFORE `pushBuf` — so while any receiver is queued, every send is consumed by
+// the queue and the buffer, the only route a spinner can win by, is never
+// reached. Above ~8 contending tasks the queue is never empty and the spin is
+// dead code. Below that the queue does empty, and the spin still loses: the
+// releasing task re-enters `chanRecv` and pops its own token back out of the
+// buffer before a polling peer can see it.
+//
+// THE RATIO THAT DECIDES IT, and it is the number to re-derive rather than this
+// verdict. Parking costs 1443 instructions to cover a 460-cycle wait — 3.1
+// instructions per cycle waited. Spinning was measured at 6.6 instructions per
+// cycle waited, so it is 2.1x the cost of parking per unit of wait and loses
+// even at a 100% catch rate on any wait over ~220 cycles; a Mutex handoff here
+// is 460.
+//
+// AND THAT RATIO IS A CODEGEN NUMBER, WHICH IS WHY THIS MAY BE WORTH REVISITING.
+// One poll iteration — three loads, three compares, a `yield` — assembles to
+// ~41 instructions (confirmed twice: by `objdump` on `runtime_chan.o`, and as
+// the slope between the 1-poll and 4-poll builds). Twelve of those are register
+// `mov`s, six are branches to the next address, and the loop bound is
+// re-materialised with `mov x0, #0x18` on every iteration. At the 4 instructions
+// clang emits for the same loop the ratio inverts and the spin wins outright.
+// So the blocker is #1852 (copy-propagate SSA moves) and #1853 (fold small
+// constants into immediates), not this function — re-measure after those land.
 export @nosplit fn chanRecv(ch: *i64, valueOut: *i64): bool {
   let s = taskAt(*(ch + chSched))
 
