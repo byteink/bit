@@ -276,20 +276,37 @@ stdlib_files=""
 # pollfree, rootabi, rootpins, spec, stress, stwwiring) was unmapped, forcing
 # `full`, until this fix. One arm per
 # directory, matching the gate(s) gates.bit actually registers for it — for
-# tests/bit/stress that is the two `test`-reachable split gates
-# (test-stress-exclusive, test-stress-batch; #2564), NOT the redundant
-# unpartitioned `test-stress`, which runs the identical corpus a third time
-# and is deliberately excluded from the `runtime` bucket below for the same
-# reason (gates.bit's comment on `test-stress` is itself stale on this point
-# — it was written before that bucket was changed from `test-stress` to the
-# split pair in cc574965). `assert_dirgates_current`, defined and called
-# right after this function, PROBES this exact function for every
-# directory-target path gates.bit registers, rather than checking gates.bit
-# against a second hardcoded list — a separate list is the same bug this
-# ticket exists to fix, one level up: a maintainer told "add an arm" could
-# instead edit the second list, leaving the real case arm missing and the
-# guard green. Probing means the only way to turn the guard green is to make
-# this function actually resolve the path.
+# tests/bit/stress that is `test-stress-exclusive` only (test-stress-batch
+# is DELIBERATELY EXCLUDED, #3319, same reason and same measurement as the
+# `runtime` bucket below: #3309 measured it standalone at 11m0s, over the
+# subagent Bash tool's 600s ceiling on its own, because
+# tests/bit/stress/stress.bit's main loop runs checkProgram() serially with
+# no concurrency available — no batching win, independent of which bucket
+# triggers it). NOT the redundant unpartitioned `test-stress` either, which
+# runs the identical corpus a third time and is deliberately excluded from
+# the `runtime` bucket below for the same reason (gates.bit's comment on
+# `test-stress` is itself stale on this point — it was written before that
+# bucket was changed from `test-stress` to the split pair in cc574965).
+# `assert_dirgates_current`, defined and called right after this function,
+# PROBES this exact function for every directory-target path gates.bit
+# registers, rather than checking gates.bit against a second hardcoded list —
+# a separate list is the same bug this ticket exists to fix, one level up: a
+# maintainer told "add an arm" could instead edit the second list, leaving
+# the real case arm missing and the guard green. Probing means the only way
+# to turn the guard green is to make this function actually resolve the
+# path — it only requires a NON-EMPTY result per directory, not the full set
+# of gates.bit's registered gates, so dropping test-stress-batch here does
+# not trip it (test-stress-exclusive alone keeps the probe non-empty).
+#
+# This also closes a gap the `runtime` bucket's #3309 fix did not: before
+# this change, a diff touching BOTH runtime/** and tests/bit/stress/** (or
+# tests/stress/**) resolved to bucket `runtime` (bucket_count counts only
+# the five concrete areas, not testsbit) and then the "riding alongside"
+# union below (search `has_testsbit` after the case statement) added
+# test-stress-batch straight back into runtime's BUILD_STEPS from
+# testsbit_steps, since gates_for_file() still emitted it for the stress
+# paths. Excluding it here, at the source, fixes both the `testsbit`
+# bucket directly and this union path in one change.
 gates_for_file() {
   case "$1" in
     tests/bit/checkercases/*) printf 'test-checker-diag\n'; return 0 ;;
@@ -344,7 +361,7 @@ gates_for_file() {
     tests/stress/*)
       # A different top-level directory from the harness that reads it
       # (tests/bit/stress/, matched by the `tests/bit/stress/*)` arm just
-      # below to the same two gates): this is the corpus itself —
+      # below to the same gate): this is the corpus itself —
       # tests/bit/stress/stress.bit:359-376 defaults to `root + "/tests/stress"`
       # (root = BIT_STRESSGATE_ROOT, defaulting to ".") — so no
       # `runArgs("tests/stress")` entry exists anywhere in gates.bit (only
@@ -354,7 +371,9 @@ gates_for_file() {
       # above. `assert_dirgates_current` below cannot check it either, for the
       # same reason: `tests/stress` has no `runArgs()` entry anywhere in
       # gates.bit, so it never appears in the list that guard probes. (#2977)
-      printf 'test-stress-exclusive\ntest-stress-batch\n'
+      # test-stress-batch deliberately excluded — see the header comment
+      # above `gates_for_file()` (#3319/#3309).
+      printf 'test-stress-exclusive\n'
       return 0
       ;;
     tests/bit/abimembers/*) printf 'test-abimembers\n'; return 0 ;;
@@ -364,7 +383,9 @@ gates_for_file() {
     tests/bit/rootabi/*) printf 'test-rootabi\n'; return 0 ;;
     tests/bit/rootpins/*) printf 'test-rootpins\n'; return 0 ;;
     tests/bit/spec/*) printf 'test-spec\n'; return 0 ;;
-    tests/bit/stress/*) printf 'test-stress-exclusive\ntest-stress-batch\n'; return 0 ;;
+    # test-stress-batch deliberately excluded — see the header comment above
+    # gates_for_file() (#3319/#3309).
+    tests/bit/stress/*) printf 'test-stress-exclusive\n'; return 0 ;;
     tests/bit/stwwiring/*) printf 'test-stwwiring\n'; return 0 ;;
     # #3039. Not `runArgs()`-registered — it is a plain data file the
     # harness reads at runtime, not Bit source — so the generic grep below
