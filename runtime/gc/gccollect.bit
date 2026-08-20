@@ -45,6 +45,34 @@ export @nosplit @symbol("bit_rt_port_gc_collect_finish") fn gcCollectFinish(g: *
   }
   *(g + gcNextBytes) = next
 
+  // The object-count trigger (#3292), paced identically off the SAME `pct`
+  // but off live OBJECTS instead of live bytes -- mark walks the live set and
+  // sweep walks `gcAll` end to end, so collection cost is per-object. Without
+  // this, a packing win that shrinks bytes/object without shrinking object
+  // count lowers `next` above while leaving the work per collection
+  // unchanged, raising collection frequency for no reason. Read post-sweep,
+  // like `live` above, so both triggers are computed from the SAME surviving
+  // set (`gcNumObjectsIdx` is already decremented for everything `sweep`
+  // just freed).
+  let liveObjects = *(g + gcNumObjectsIdx)
+  let objGrown = gcAddrMax
+  if (pct == 0 || liveObjects <= gcAddrMax / pct) {
+    objGrown = (liveObjects * pct) / 100
+  }
+  // Floored the same way the byte trigger is, in the same units: every real
+  // object is at least `gcHeaderSize` bytes, so `gcCfgMinTrigger /
+  // gcHeaderSize` is an upper bound on how many objects fit under that many
+  // bytes. That bound can only push this floor ABOVE what a real workload's
+  // object count would reach before the byte trigger already would have
+  // fired, never below -- which is what proves the AND in `gcShouldCollect`
+  // below cannot regress any workload the byte-only trigger already handled
+  // well (a heap that never crosses `gcCfgMinTrigger`, e.g. #3292's b1 case).
+  let objNext = *(g + gcCfgMinTrigger) / gcHeaderSize
+  if (objGrown > objNext) {
+    objNext = objGrown
+  }
+  *(g + gcNextObjects) = objNext
+
   *(g + gcStCollections) = *(g + gcStCollections) + 1
   *(g + gcStTotalSwept) = *(g + gcStTotalSwept) + swept
   *(g + gcStSurvivorsLast) = *(g + gcNumObjectsIdx)
@@ -64,45 +92,27 @@ export @nosplit fn gcCollectRoots(g: *i64, rootsAddr: int, n: int) {
   gcCollectFinish(g)
 }
 
-// Live objects the byte trigger (below) should require before it is honored.
-// Mark walks the live set and sweep walks `gcAll` end to end, so collection
-// cost is per-OBJECT (#3292) — a packing win that shrinks bytes/object
-// without shrinking object count must not raise collection frequency. Paced
-// exactly like the byte trigger — proportional growth off the survivor count
-// from the last collection (`gcStSurvivorsLast`) — so it reaches the same
-// object-count milestone regardless of how many bytes each object happens to
-// be, which is what makes two builds of the same object graph collect the
-// same number of times.
-//
-// Floored so a heap that has never crossed `gcCfgMinTrigger` in bytes cannot
-// be judged "due" in objects either: every real object is at least
-// `gcHeaderSize` bytes, so `gcCfgMinTrigger / gcHeaderSize` is an upper bound
-// on how many objects fit under that many bytes. That means this floor can
-// only make `gcObjectsDue` return false for LONGER than the byte trigger
-// already waits, never shorter — which is what makes `gcShouldCollect` below
-// unable to regress any workload the byte-only trigger already handled well
-// (a heap that stays under `gcCfgMinTrigger`, e.g. #3292's b1 case).
-@nosplit fn gcObjectsDue(g: *i64): bool {
-  let survivors = *(g + gcStSurvivorsLast)
-  let pct = *(g + gcCfgGrowthPct)
-  let grown = gcAddrMax
-  if (pct == 0 || survivors <= gcAddrMax / pct) {
-    grown = (survivors * pct) / 100
-  }
-  let floor = *(g + gcCfgMinTrigger) / gcHeaderSize
-  if (grown < floor) {
-    grown = floor
-  }
-  return *(g + gcNumObjectsIdx) >= grown
-}
-
 // Whether a poll right now should collect: the collector is enabled and
 // either stress mode is on, or the live heap has crossed the byte trigger AND
-// the live object count has caught up with it (`gcObjectsDue`, #3292) — or,
+// the live object count has caught up with the object trigger (#3292,
+// `gcNextObjects` — mark walks the live set and sweep walks `gcAll` end to
+// end, so collection cost is per-object, and requiring both is what stops a
+// packing win from raising collection frequency for the same graph) — or,
 // failing that, the byte trigger has been crossed by a full second growth
 // cycle regardless of object count, so a workload of few, huge, growing
 // objects (object count barely moving) still collects instead of growing
 // without bound (#2922 is the memory of what an unbounded policy costs).
+//
+// Both triggers are READ, never recomputed, here: `gcCollectFinish` is the
+// only place either is derived (division included), specifically so this
+// predicate stays the same handful of loads and compares it always was.
+// Recomputing them per call was tried and measured worse — a caller that has
+// crossed the byte trigger but not yet the object trigger gets asked this on
+// every subsequent safepoint until one of them clears, and `runtime/stw`'s
+// fast leaf (below) calls the mirror of this on every loop back edge, so
+// anything heavier than loads and compares here is not a fixed one-time
+// cost, it is paid once per back edge for the whole waiting window.
+//
 // `runtime/gc/`'s `shouldCollect`, and the SAME policy `gcSafepointRoots`
 // below now reads through — one copy, so the two paths can never drift.
 //
@@ -115,6 +125,12 @@ export @nosplit fn gcCollectRoots(g: *i64, rootsAddr: int, n: int) {
 // PINNED (ABI.md §9): `runtime/stw`'s poll is a separately-emitted object and
 // reaches this by its emitted symbol (SPEC §11.9), like every other cross-object
 // runtime call. `bit_rt_port_` is the placeholder prefix #1369 strips.
+//
+// MUST MIRROR (#3292, in addition to the existing byte-trigger contract):
+// `runtime/stw/stwpoll.bit`'s `stwPollNeeded` and the inlined check inside
+// `stwPollOn` both duplicate this predicate's object half for the same
+// hot-path reason they already duplicate the byte half. Drift between them
+// and this function reintroduces the exact cost this comment describes.
 export @nosplit @symbol("bit_rt_port_gc_should_collect") fn gcShouldCollect(g: *i64): bool {
   if (*(g + gcCfgEnabled) == 0) {
     return false
@@ -127,12 +143,12 @@ export @nosplit @symbol("bit_rt_port_gc_should_collect") fn gcShouldCollect(g: *
   if (liveBytes < nextBytes) {
     return false
   }
-  if (gcObjectsDue(g)) {
+  if (*(g + gcNumObjectsIdx) >= *(g + gcNextObjects)) {
     return true
   }
   let ceiling = gcAddrMax
-  if (nextBytes <= gcAddrMax / 2) {
-    ceiling = nextBytes * 2
+  if (nextBytes <= gcAddrMax - nextBytes) {
+    ceiling = nextBytes + nextBytes
   }
   return liveBytes >= ceiling
 }
