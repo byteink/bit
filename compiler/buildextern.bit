@@ -1,0 +1,185 @@
+// Split out of build.bit (#3349): SPEC §11.7's `extern function` admissibility
+// gate — rejectExternForTarget, externResolvable, collectPinnedSymbols. Pure
+// move, no behavior change (the 800-line rule, spec/LINT.md §4 E0200; build.bit
+// was already at the cap before this ticket's Windows wiring). A sibling .bit
+// file is the same module (build.bit's own header), so nothing else changes:
+// `buildIr` (build.bit) still calls rejectExternForTarget directly, with no
+// import.
+
+// Builds `src`'s IR. A directory and a lone file are both modules (SPEC §17.1),
+// so both take the same project pipeline and both get the stdlib and its
+// prelude; a file differs only in that its module holds exactly that one file,
+// never its siblings. Mirrors the seed's `runBuild` — building a lone file as a
+// self-contained module instead is what made `println` undefined there.
+// E0078 (§11.7): an `extern function` binds a Bit name to a raw external symbol.
+// On Mach-O that symbol is bound by dyld at load time, so the image has TWO
+// sources for it — the merged archive and libSystem — and admissible means "in
+// one of them", not "anything" (#1634). Bit's ELF output has no load-time
+// resolution at all — no interpreter, no dynamic symbol table, no libc — but
+// that is not the same as NO resolution: the static link already merges
+// libbitrt.a, and a symbol DEFINED INSIDE THAT ARCHIVE resolves through the very
+// same global symbol table as the runtime's own calls.
+//
+// So the predicate is where a symbol may come from, not the platform. A symbol
+// present in the archive is accepted; one that is absent is still rejected here,
+// with a real diagnostic naming it, rather than failing deep inside the linker.
+// An empty or malformed `rtArchive` in a LINKING build leaves membership
+// undecided, and an undecided case must REJECT — accepting on unknown would
+// trade a compile error for a link error or a silent crash.
+//
+// Darwin has a SECOND legitimate source and therefore a WIDER predicate, not no
+// predicate (#1634): the LC_LOAD_DYLIB libSystem every Mac carries, which is the
+// whole reason §11.7 exists. Its surface is libsystemSymbols(), so a Darwin
+// extern is admissible when the archive defines it OR libSystem exports it. A
+// name in NEITHER used to be accepted here and then aborted at dyld load.
+//
+// `linking` is false for `--emit-obj`, and the gate then does not apply at all
+// (#1645). Membership is a property of a LINK, and an object emit performs none:
+// the artifact is a relocatable, whose undefined symbols are normal and are
+// resolved by whatever link later consumes it — §17.6 already says an extern
+// call in a freestanding object "stays an undefined relocation, resolved at
+// link". Answering "absent" there is not conservatism, it is a category error:
+// the archive was never read, so the diagnostic's own stated precondition ("not
+// defined in the runtime archive") is false when it fires, and it fires for
+// EVERY extern including the `bit_rt_*` ones §11.7 exists to admit. Nothing is
+// weakened by skipping it, because both later gates remain: the linking build
+// re-runs this predicate against the real archive, and a static ELF link that
+// cannot resolve a reference fails outright (resolveGlobals -> undefined symbol).
+//
+// The gate lives here rather than in the checker because the checker is
+// deliberately target-independent (it runs once and its output feeds every
+// backend); this is the first point where the selected target and the AST are
+// both in hand, and the archive path is a pure function of the target. Mirrors
+// the seed's rejectExternForTarget.
+fn rejectExternForTarget(p: Project, target: BuildTarget, rtArchive: []u8, linking: bool): bool {
+  if (!linking) { return false }
+  // Project-wide, not per-module: a §11.9 pin in one module is what resolves an
+  // `extern` in another (tests/stress/pinsym is exactly that shape), and the
+  // link merges them all.
+  let pins = collectPinnedSymbols(p)
+  let found = false
+  let mi = 0
+  while (mi < len(p.mods)) {
+    let m = p.mods[mi]
+    // A module's files are concatenated, so every tree span is module-global.
+    // Mark the sink, report, then map this module's new spans back onto the file
+    // each one's text actually came from — exactly what the loader does.
+    let before = len(p.diags.list)
+    for top of kidsOf(m.tree, m.tree.root) {
+      if (top == 0) { continue }
+      let inner = top
+      if (getNode(m.tree, top).tag == Tag.Export) {
+        inner = kidsOf(m.tree, top)[0]
+      }
+      if (getNode(m.tree, inner).tag != Tag.ExternFnDecl) { continue }
+      // §11.7: an extern's Bit name IS the symbol, verbatim and never
+      // module-qualified, so the declaration's identifier is exactly what the
+      // linker will look for.
+      let nameNode = kidsOf(m.tree, inner)[0]
+      let nameSpan = getNode(m.tree, nameNode).span
+      let symbol = m.source[nameSpan.start:nameSpan.end]
+      // §10: `bit_main` is the process entry symbol, emitted per-program by the
+      // entry trampoline (emit.bit) and resolved at the FINAL program link — it
+      // is deliberately absent from libbitrt.a (`nm` shows `U bit_main`). The
+      // ported boot layer (#1608), itself a libbitrt-resident module,
+      // references it to spawn the user's `main`; every final link defines it,
+      // so admitting this one designated symbol is not a hole in the gate. The
+      // allowance is exactly this symbol — every other absent name is still
+      // rejected, because the guarantee is specific to the entry, not to
+      // externs at large.
+      if (symbol == "bit_main") { continue }
+      if (externResolvable(target, rtArchive, symbol, pins)) { continue }
+      let what = "is not defined in the runtime archive for target"
+      let note = "the Linux output is fully static: only a symbol already inside libbitrt.a can be resolved"
+      if (target == BuildTarget.Aarch64Macos) {
+        what = "is defined neither in the runtime archive nor by libSystem, for target"
+        note = "dyld would bind it to libSystem and abort at load: only a symbol inside libbitrt.a or exported by libSystem can be resolved"
+      } else if (target == BuildTarget.X86_64Windows) {
+        what = "is defined neither in the runtime archive nor by the admitted kernel32 import surface, for target"
+        note = "the loader would refuse to bind it: only a symbol inside libbitrt.a or admitted by pesyms.bit's windowsImportDefines can be resolved"
+      }
+      report(p.diags, ecExternUnsupportedTarget, getNode(m.tree, inner).span,
+        "'extern fn' ${symbol} ${what} ${buildTargetName(target)}", note)
+      found = true
+    }
+    remapDiags(p.diags, before, m.files, m.fileStarts)
+    mi = mi + 1
+  }
+  return found
+}
+
+// Whether the link this build is about to perform can resolve `symbol`, per
+// SPEC §11.7. One function so the two targets' answers cannot drift into two AST
+// walks: what differs between them is only where a symbol may legitimately come
+// from.
+//
+//   - Every target: a §11.9 pin one of this build's own modules defines
+//     (`pins`) — the final link resolves it out of the program's own object,
+//     exactly the way `bit_main` is resolved above.
+//   - Linux: otherwise the merged libbitrt.a, and nothing else — the image is
+//     static, with no interpreter and no dynamic symbol table.
+//   - Darwin: otherwise that same archive OR libSystem, which the Mach-O image
+//     loads as LC_LOAD_DYLIB and dyld binds at load.
+//   - Windows: otherwise that same archive (empty until #3341 builds it, so
+//     peArchiveDefines always answers false meanwhile) OR pesyms.bit's
+//     windowsImportDefines, which the loader binds via the PE import
+//     directory (pelink.bit's .idata).
+//
+// Undecidable inputs (an empty or malformed archive) answer false on both, so
+// the caller rejects — the sound direction, since accepting on unknown trades a
+// compile error for a crash. The pin lookup runs first because it is O(1) while
+// archiveDefines reparses every archive member, and a pinned name is by design
+// absent from the archive. Mirrors the seed's externResolvable.
+fn externResolvable(target: BuildTarget, rtArchive: []u8, symbol: string,
+    pins: map<string, bool>): bool {
+  let (_, pinned) = pins[symbol]
+  if (pinned) { return true }
+  if (target == BuildTarget.Aarch64Macos) {
+    if (machoArchiveDefines(rtArchive, symbol)) { return true }
+    return libsystemDefines(symbol)
+  }
+  if (target == BuildTarget.X86_64Windows) {
+    if (peArchiveDefines(rtArchive, symbol)) { return true }
+    return windowsImportDefines(symbol)
+  }
+  return archiveDefines(elfLinkTargetOf(target), rtArchive, symbol)
+}
+
+// Every §11.9 @symbol("...") on a top-level declaration of this build's modules.
+// An `extern` naming one is resolved by the final link out of the program's own
+// object, so it is admissible even though no archive defines it. Mirrors the
+// seed's collectPinnedSymbols.
+fn collectPinnedSymbols(p: Project): map<string, bool> {
+  let out = map<string, bool>{}
+  let mi = 0
+  while (mi < len(p.mods)) {
+    let m = p.mods[mi]
+    for top of kidsOf(m.tree, m.tree.root) {
+      if (top == 0) { continue }
+      let inner = top
+      if (getNode(m.tree, top).tag == Tag.Export) {
+        inner = kidsOf(m.tree, top)[0]
+      }
+      if (getNode(m.tree, inner).tag != Tag.FuncDecl) { continue }
+      for kid of kidsOf(m.tree, inner) {
+        if (kid == 0) { continue }
+        if (getNode(m.tree, kid).tag != Tag.AttrList) { continue }
+        for a of kidsOf(m.tree, kid) {
+          let ak = kidsOf(m.tree, a) // [nameIdent, argStringLit?]
+          if (len(ak) < 2) { continue }
+          if (ak[1] == 0) { continue }
+          let nameSpan = getNode(m.tree, ak[0]).span
+          if (m.source[nameSpan.start:nameSpan.end] != "symbol") { continue }
+          let argSpan = getNode(m.tree, ak[1]).span
+          let raw = m.source[argSpan.start:argSpan.end]
+          // The literal minus its quotes. §11.9 symbol names are C identifiers,
+          // so there is nothing to unescape.
+          if (len(raw) < 2) { continue }
+          out[raw[1:len(raw) - 1]] = true
+        }
+      }
+    }
+    mi = mi + 1
+  }
+  return out
+}
