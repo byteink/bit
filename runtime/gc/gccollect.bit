@@ -64,10 +64,47 @@ export @nosplit fn gcCollectRoots(g: *i64, rootsAddr: int, n: int) {
   gcCollectFinish(g)
 }
 
-// Whether a poll right now should collect: the collector is enabled and either
-// stress mode is on or the live heap has crossed the trigger. `runtime/gc/`'s
-// `shouldCollect`, and the SAME policy `gcSafepointRoots` below now reads
-// through — one copy, so the two paths can never drift.
+// Live objects the byte trigger (below) should require before it is honored.
+// Mark walks the live set and sweep walks `gcAll` end to end, so collection
+// cost is per-OBJECT (#3292) — a packing win that shrinks bytes/object
+// without shrinking object count must not raise collection frequency. Paced
+// exactly like the byte trigger — proportional growth off the survivor count
+// from the last collection (`gcStSurvivorsLast`) — so it reaches the same
+// object-count milestone regardless of how many bytes each object happens to
+// be, which is what makes two builds of the same object graph collect the
+// same number of times.
+//
+// Floored so a heap that has never crossed `gcCfgMinTrigger` in bytes cannot
+// be judged "due" in objects either: every real object is at least
+// `gcHeaderSize` bytes, so `gcCfgMinTrigger / gcHeaderSize` is an upper bound
+// on how many objects fit under that many bytes. That means this floor can
+// only make `gcObjectsDue` return false for LONGER than the byte trigger
+// already waits, never shorter — which is what makes `gcShouldCollect` below
+// unable to regress any workload the byte-only trigger already handled well
+// (a heap that stays under `gcCfgMinTrigger`, e.g. #3292's b1 case).
+@nosplit fn gcObjectsDue(g: *i64): bool {
+  let survivors = *(g + gcStSurvivorsLast)
+  let pct = *(g + gcCfgGrowthPct)
+  let grown = gcAddrMax
+  if (pct == 0 || survivors <= gcAddrMax / pct) {
+    grown = (survivors * pct) / 100
+  }
+  let floor = *(g + gcCfgMinTrigger) / gcHeaderSize
+  if (grown < floor) {
+    grown = floor
+  }
+  return *(g + gcNumObjectsIdx) >= grown
+}
+
+// Whether a poll right now should collect: the collector is enabled and
+// either stress mode is on, or the live heap has crossed the byte trigger AND
+// the live object count has caught up with it (`gcObjectsDue`, #3292) — or,
+// failing that, the byte trigger has been crossed by a full second growth
+// cycle regardless of object count, so a workload of few, huge, growing
+// objects (object count barely moving) still collects instead of growing
+// without bound (#2922 is the memory of what an unbounded policy costs).
+// `runtime/gc/`'s `shouldCollect`, and the SAME policy `gcSafepointRoots`
+// below now reads through — one copy, so the two paths can never drift.
 //
 // Split out for one reason: the multi-threaded poll
 // tests the trigger TWICE — once on the hot path, before paying for the
@@ -85,7 +122,19 @@ export @nosplit @symbol("bit_rt_port_gc_should_collect") fn gcShouldCollect(g: *
   if (*(g + gcCfgStress) != 0) {
     return true
   }
-  return heapLiveBytes(heapBlock(g)) >= *(g + gcNextBytes)
+  let liveBytes = heapLiveBytes(heapBlock(g))
+  let nextBytes = *(g + gcNextBytes)
+  if (liveBytes < nextBytes) {
+    return false
+  }
+  if (gcObjectsDue(g)) {
+    return true
+  }
+  let ceiling = gcAddrMax
+  if (nextBytes <= gcAddrMax / 2) {
+    ceiling = nextBytes * 2
+  }
+  return liveBytes >= ceiling
 }
 
 // Poll point for automatic collection. A mutator calls this where the stack
