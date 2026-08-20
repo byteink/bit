@@ -1,0 +1,515 @@
+// Self-host: PE/COFF relocatable object writer (#3325, port of the retired
+// seed/obj/pe.zig, generalized to the ELF/Mach-O shape by 6b22ac46 before the
+// seed was deleted). Emits a Windows `.obj` — the input a linker (#3329) or a
+// real toolchain (MSVC `link.exe`, LLVM `lld-link`) consumes.
+//
+// Mirrors elf.bit/macho.bit's public shape (Target, SectionKind,
+// canonicalOrder, Section, Symbol, RelocKind, Relocation, Object, write) so a
+// caller can treat every object-writer sibling uniformly. Deliberately
+// decoupled from the backends, same as its siblings: this file knows nothing
+// of the IR, physical registers, or instruction encoding — only the generic
+// shape every object file needs. Types carry a `Pe` prefix because selfhost is
+// one flat namespace (macho.bit's own comment explains why).
+//
+// Field layouts and machine/relocation-type numbers are transcribed from the
+// Microsoft PE/COFF spec, cross-checked against Zig 0.16's `std.coff`
+// (`/opt/homebrew/Cellar/zig/0.16.0_1/lib/zig/std/coff.zig` on this machine) —
+// the same library the seed's own tests round-tripped through.
+//
+// Two shape differences from elf.bit, both format-driven (seed's own doc
+// comment):
+//
+// - No stored addend. ELF x86-64 objects are RELA (an explicit signed addend
+//   rides in each relocation entry); COFF relocations carry no such field —
+//   every kind's "addend" is a fixed constant baked into its definition
+//   (IMAGE_REL_AMD64_REL32 is always S - (P + 4), the byte following the
+//   relocation; an AArch64 instruction-field kind is always relative to the
+//   instruction's own address). So PeRelocation has no addend field.
+// - Symbol table index == PeObject.symbols index, with no reordering. COFF has
+//   no sh_info-style local/global boundary the way ELF's SHT_SYMTAB does
+//   (elf.bit's locals-before-globals reordering exists only to satisfy that),
+//   and unlike ELF's mandatory null symbol at index 0, COFF has no reserved
+//   leading slot either. A relocation's SymbolTableIndex is therefore exactly
+//   its target's index in PeObject.symbols, and a symbol's SectionNumber is
+//   1-based directly into the emitted section table (0 means undefined).
+
+enum PeTarget {
+  X86_64,
+  Aarch64,
+}
+
+// IMAGE_FILE_MACHINE_AMD64 / IMAGE_FILE_MACHINE_ARM64.
+fn peMachine(t: PeTarget): int {
+  if (t == PeTarget.X86_64) {
+    return 0x8664
+  }
+  return 0xAA64
+}
+
+enum PeSectionKind {
+  Text,
+  Data,
+  Rodata,
+  Bss,
+  GcMeta,
+}
+
+fn peNumKinds(): int {
+  return 5
+}
+
+fn peKindIndex(k: PeSectionKind): int {
+  if (k == PeSectionKind.Text) { return 0 }
+  if (k == PeSectionKind.Data) { return 1 }
+  if (k == PeSectionKind.Rodata) { return 2 }
+  if (k == PeSectionKind.Bss) { return 3 }
+  return 4 // GcMeta
+}
+
+// Fixed emission order, spelled out rather than derived from declaration
+// order — mirrors elf.bit's elfCanonicalOrder, same rationale.
+fn peCanonicalOrder(): []PeSectionKind {
+  return [PeSectionKind.Text, PeSectionKind.Data, PeSectionKind.Rodata,
+    PeSectionKind.Bss, PeSectionKind.GcMeta]
+}
+
+// COFF/PE convention names the read-only data section `.rdata`, not
+// `.rodata` (as/lld-link/dumpbin all agree).
+fn peSectionName(k: PeSectionKind): string {
+  if (k == PeSectionKind.Text) { return ".text" }
+  if (k == PeSectionKind.Data) { return ".data" }
+  if (k == PeSectionKind.Rodata) { return ".rdata" }
+  if (k == PeSectionKind.Bss) { return ".bss" }
+  return ".bit_gc" // GcMeta
+}
+
+// IMAGE_SCN_* characteristics, minus the alignment nibble (added by the
+// writer via peAlignNibble, since it depends on PeSection.alignment).
+fn peBaseFlags(k: PeSectionKind): int {
+  let cntCode = 0x00000020
+  let cntInit = 0x00000040
+  let cntUninit = 0x00000080
+  let memExecute = 0x20000000
+  let memRead = 0x40000000
+  let memWrite = 0x80000000
+  if (k == PeSectionKind.Text) { return cntCode | memExecute | memRead }
+  if (k == PeSectionKind.Data) { return cntInit | memRead | memWrite }
+  if (k == PeSectionKind.Rodata) { return cntInit | memRead }
+  if (k == PeSectionKind.Bss) { return cntUninit | memRead | memWrite }
+  // GcMeta (ABI.md §4): allocated + readable, never written or executed —
+  // matches elf.bit's .bit_gc (SHF_ALLOC only).
+  return cntInit | memRead
+}
+
+// One section's content. Bss is the only kind with no file bytes: give it
+// `size` and leave `data` empty (its contents are implicitly zero).
+struct PeSection {
+  kind: PeSectionKind,
+  data: []u8,
+  size: int,
+  // 0 or a power of two, capped at COFF's largest encodable alignment (8192
+  // bytes); 0 normalizes to 1.
+  alignment: int,
+}
+
+fn peSectionBytes(s: PeSection): int {
+  if (s.kind == PeSectionKind.Bss) {
+    return s.size
+  }
+  return len(s.data)
+}
+
+enum PeBinding {
+  Local,
+  Global,
+}
+
+enum PeSymKind {
+  Notype,
+  Object,
+  Func,
+}
+
+// `hasSection == false` names an external symbol (a runtime `bit_rt_*`
+// export, a `kernel32` import, or another Bit module's function) the linker
+// must resolve — it carries no offset/size and must be Global: nothing else
+// can ever define an undefined local.
+struct PeSymbol {
+  name: string,
+  hasSection: bool,
+  section: PeSectionKind,
+  offset: int,
+  size: int,
+  binding: PeBinding,
+  kind: PeSymKind,
+}
+
+// The subset of codegen.bit's RelocKind this writer knows how to encode —
+// Branch and Abs64, split by target the same way elf.bit splits Branch into
+// Pc32/Call26. No Windows TLS kind: Windows TLS is a `.tls$` section plus a
+// `_tls_used` directory entry, a wholly different mechanism from ELF/Mach-O
+// thread-locals, and not yet in scope (matches the seed's own deferral).
+enum PeRelocKind {
+  // x86-64 `call rel32` / RIP-relative lea: IMAGE_REL_AMD64_REL32, a 4-byte
+  // field the linker sets to S - (P + 4).
+  Rel32,
+  // IMAGE_REL_AMD64_ADDR64 / IMAGE_REL_ARM64_ADDR64: an 8-byte absolute VA.
+  Addr64,
+  // ARM64 BL's 26-bit PC-relative immediate: IMAGE_REL_ARM64_BRANCH26.
+  Branch26,
+  // ARM64 ADRP's page immediate: IMAGE_REL_ARM64_PAGEBASE_REL21.
+  PageBaseRel21,
+  // ARM64 ADD (immediate) low-12-bits: IMAGE_REL_ARM64_PAGEOFFSET_12A.
+  PageOffset12A,
+}
+
+fn peRelocWidth(k: PeRelocKind): int {
+  if (k == PeRelocKind.Addr64) {
+    return 8
+  }
+  return 4
+}
+
+// The relocation Type field for this kind on this target, or -1 when the
+// kind has no encoding there. Values transcribed from std.coff's
+// IMAGE.REL.AMD64 / IMAGE.REL.ARM64 (see the header comment).
+fn peRelocType(k: PeRelocKind, t: PeTarget): int {
+  if (t == PeTarget.X86_64) {
+    if (k == PeRelocKind.Rel32) { return 0x0004 }  // IMAGE_REL_AMD64_REL32
+    if (k == PeRelocKind.Addr64) { return 0x0001 } // IMAGE_REL_AMD64_ADDR64
+    return -1
+  }
+  if (k == PeRelocKind.Addr64) { return 0x000E }        // IMAGE_REL_ARM64_ADDR64
+  if (k == PeRelocKind.Branch26) { return 0x0003 }       // IMAGE_REL_ARM64_BRANCH26
+  if (k == PeRelocKind.PageBaseRel21) { return 0x0004 }  // IMAGE_REL_ARM64_PAGEBASE_REL21
+  if (k == PeRelocKind.PageOffset12A) { return 0x0006 }  // IMAGE_REL_ARM64_PAGEOFFSET_12A
+  return -1
+}
+
+// No addend field (header comment): every kind's linker-time computation is a
+// fixed constant, not something this writer's caller supplies per site.
+struct PeRelocation {
+  section: PeSectionKind,
+  offset: int,
+  symbol: string,
+  kind: PeRelocKind,
+}
+
+struct PeObject {
+  sections: []PeSection,
+  symbols: []PeSymbol,
+  relocations: []PeRelocation,
+}
+
+fn sizeofPeFileHeader(): int { return 20 }
+fn sizeofPeSectionHeader(): int { return 40 }
+fn sizeofPeReloc(): int { return 10 }
+fn sizeofPeSymbol(): int { return 18 }
+
+// COFF's NumberOfRelocations is a u16 per section; a section needing more
+// than this requires the IMAGE_SCN_LNK_NRELOC_OVFL extended-count scheme,
+// which this writer doesn't implement (no real Bit module comes close).
+fn peMaxRelocsPerSection(): int { return 65535 }
+
+// The index into `syms` of the symbol named `name`, or -1. Mirrors
+// elfSymIndexOf/machoSymIndexOf's linear scan.
+fn peSymIndexOf(syms: []PeSymbol, name: string): int {
+  let i = 0
+  while (i < len(syms)) {
+    if (syms[i].name == name) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// 1-based index of `k` within `order` (the order the section table was
+// emitted in), or -1. `order` only ever holds present kinds, so a symbol
+// whose section is absent was already rejected as SectionNotPresent before
+// this is ever called.
+fn peSectionNumberOf(order: []PeSectionKind, k: PeSectionKind): int {
+  let i = 0
+  while (i < len(order)) {
+    if (order[i] == k) {
+      return i + 1
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Emits a complete COFF object for `obj`, targeting `target`.
+//
+// Every rejection the seed spells as a distinct error is a `fail` here with
+// the same meaning; validation happens entirely up front, before a byte is
+// written, so a malformed object can never produce a half-written file — the
+// same invariant elf.bit's writer keeps.
+fn writePeObject(target: PeTarget, obj: PeObject): []u8! {
+  // ---- validate sections: at most one per kind, sane alignment -----------
+  let present = []bool(0)
+  let byKind = []PeSection(0)
+  let ki = 0
+  while (ki < peNumKinds()) {
+    present = append(present, false)
+    byKind = append(byKind, PeSection{ kind: PeSectionKind.Text, data: []u8(0),
+      size: 0, alignment: 1 })
+    ki = ki + 1
+  }
+  let si = 0
+  while (si < len(obj.sections)) {
+    let s = obj.sections[si]
+    let idx = peKindIndex(s.kind)
+    if (present[idx]) {
+      fail newError("DuplicateSection")
+    }
+    if (s.alignment != 0 && (!isPowerOfTwo(s.alignment) || s.alignment > 8192)) {
+      fail newError("InvalidSectionAlignment")
+    }
+    present[idx] = true
+    byKind[idx] = s
+    si = si + 1
+  }
+
+  // ---- validate symbols: no reordering, index == obj.symbols index -------
+  let symIdx = map<string, int>{}
+  let yi = 0
+  while (yi < len(obj.symbols)) {
+    let sym = obj.symbols[yi]
+    if (!sym.hasSection && sym.binding == PeBinding.Local) {
+      fail newError("UndefinedLocalSymbol")
+    }
+    if (sym.hasSection) {
+      let kidx = peKindIndex(sym.section)
+      if (!present[kidx]) {
+        fail newError("SectionNotPresent")
+      }
+      if (sym.offset + sym.size > peSectionBytes(byKind[kidx])) {
+        fail newError("SymbolOutOfBounds")
+      }
+    }
+    let (_, dup) = symIdx[sym.name]
+    if (dup) {
+      fail newError("DuplicateSymbol")
+    }
+    symIdx[sym.name] = yi
+    yi = yi + 1
+  }
+
+  // ---- validate relocations, bucketed by target section -------------------
+  let relocCount = []int(0)
+  ki = 0
+  while (ki < peNumKinds()) {
+    relocCount = append(relocCount, 0)
+    ki = ki + 1
+  }
+  let ri = 0
+  while (ri < len(obj.relocations)) {
+    let r = obj.relocations[ri]
+    let kidx = peKindIndex(r.section)
+    if (!present[kidx]) {
+      fail newError("SectionNotPresent")
+    }
+    if (r.offset + peRelocWidth(r.kind) > peSectionBytes(byKind[kidx])) {
+      fail newError("RelocOutOfBounds")
+    }
+    if (peRelocType(r.kind, target) < 0) {
+      fail newError("RelocKindUnsupportedForTarget")
+    }
+    if (peSymIndexOf(obj.symbols, r.symbol) < 0) {
+      fail newError("UnknownSymbol")
+    }
+    relocCount[kidx] = relocCount[kidx] + 1
+    if (relocCount[kidx] > peMaxRelocsPerSection()) {
+      fail newError("TooManyRelocations")
+    }
+    ri = ri + 1
+  }
+
+  // ---- layout: header, section headers, raw data, relocs, symtab, strtab --
+  let ord = peCanonicalOrder()
+  let order = []PeSectionKind(0)
+  let ci = 0
+  while (ci < len(ord)) {
+    if (present[peKindIndex(ord[ci])]) {
+      order = append(order, ord[ci])
+    }
+    ci = ci + 1
+  }
+  let nsections = len(order)
+
+  let sectionFileOff = []int(0)
+  ki = 0
+  while (ki < peNumKinds()) {
+    sectionFileOff = append(sectionFileOff, 0)
+    ki = ki + 1
+  }
+  let cursor = sizeofPeFileHeader() + nsections * sizeofPeSectionHeader()
+  ci = 0
+  while (ci < len(order)) {
+    let kidx = peKindIndex(order[ci])
+    if (order[ci] != PeSectionKind.Bss) {
+      let alignment = byKind[kidx].alignment
+      if (alignment == 0) {
+        alignment = 1
+      }
+      cursor = alignForward(cursor, alignment)
+      sectionFileOff[kidx] = cursor
+      cursor = cursor + peSectionBytes(byKind[kidx])
+    }
+    ci = ci + 1
+  }
+  // Relocations follow immediately, one contiguous unaligned run per section
+  // (each entry is 10 bytes — COFF defines no alignment requirement here).
+  let relocFileOff = []int(0)
+  ki = 0
+  while (ki < peNumKinds()) {
+    relocFileOff = append(relocFileOff, 0)
+    ki = ki + 1
+  }
+  ci = 0
+  while (ci < len(order)) {
+    let kidx = peKindIndex(order[ci])
+    if (relocCount[kidx] > 0) {
+      relocFileOff[kidx] = cursor
+      cursor = cursor + relocCount[kidx] * sizeofPeReloc()
+    }
+    ci = ci + 1
+  }
+  let symtabStart = cursor
+  let symtabSize = len(obj.symbols) * sizeofPeSymbol()
+
+  // ---- string table: a leading 4-byte self-inclusive size, then NUL-
+  // terminated names for every symbol whose name is longer than 8 bytes.
+  // Offset 0 is reserved (never a valid string offset) so a short inline
+  // name — whose first 4 bytes are never all zero, except when they
+  // legitimately spell one — stays distinguishable from a long-name marker.
+  let strtab = newByteBuf()
+  appendU32(strtab, 0) // patched below, once the final length is known
+  let strOff = []int(0)
+  let oi = 0
+  while (oi < len(obj.symbols)) {
+    let nameBytes = []byte(obj.symbols[oi].name)
+    if (len(nameBytes) <= 8) {
+      strOff = append(strOff, 0)
+    } else {
+      strOff = append(strOff, len(strtab.bytes))
+      appendBytes(strtab, nameBytes)
+      strtab.bytes = append(strtab.bytes, u8(0))
+    }
+    oi = oi + 1
+  }
+  let strtabLen = len(strtab.bytes)
+  let pi = 0
+  while (pi < 4) {
+    strtab.bytes[pi] = u8((strtabLen >> (pi * 8)) & 255)
+    pi = pi + 1
+  }
+
+  // ---- emit: the whole layout is already known, so this is one forward
+  // pass with nothing to patch afterwards (unlike elf.bit's e_shoff, which
+  // depends on where the interleaved string tables land).
+  let out = newByteBuf()
+  appendU16(out, peMachine(target))
+  appendU16(out, nsections)
+  appendU32(out, 0) // TimeDateStamp: 0 for reproducible builds
+  if (len(obj.symbols) == 0) {
+    appendU32(out, 0)
+  } else {
+    appendU32(out, symtabStart)
+  }
+  appendU32(out, len(obj.symbols))
+  appendU16(out, 0) // SizeOfOptionalHeader: 0 for an object file
+  appendU16(out, 0) // Characteristics
+
+  ci = 0
+  while (ci < len(order)) {
+    let kidx = peKindIndex(order[ci])
+    let sec = byKind[kidx]
+    let alignment = sec.alignment
+    if (alignment == 0) {
+      alignment = 1
+    }
+    let nameBytes = []byte(peSectionName(order[ci]))
+    assert(len(nameBytes) <= 8)
+    appendBytes(out, nameBytes)
+    appendZeros(out, 8 - len(nameBytes))
+    appendU32(out, 0) // VirtualSize: unused in object files
+    appendU32(out, 0) // VirtualAddress: unused in object files
+    appendU32(out, peSectionBytes(sec))
+    appendU32(out, sectionFileOff[kidx])
+    appendU32(out, relocFileOff[kidx])
+    appendU32(out, 0) // PointerToLinenumbers: deprecated
+    appendU16(out, relocCount[kidx])
+    appendU16(out, 0) // NumberOfLinenumbers: deprecated
+    appendU32(out, peBaseFlags(order[ci]) | ((log2Int(alignment) + 1) << 20))
+    ci = ci + 1
+  }
+
+  ci = 0
+  while (ci < len(order)) {
+    if (order[ci] != PeSectionKind.Bss) {
+      let kidx = peKindIndex(order[ci])
+      assert(len(out.bytes) <= sectionFileOff[kidx])
+      appendZeros(out, sectionFileOff[kidx] - len(out.bytes))
+      appendBytes(out, byKind[kidx].data)
+    }
+    ci = ci + 1
+  }
+
+  ci = 0
+  while (ci < len(order)) {
+    let kidx = peKindIndex(order[ci])
+    if (relocCount[kidx] > 0) {
+      ri = 0
+      while (ri < len(obj.relocations)) {
+        let r = obj.relocations[ri]
+        if (peKindIndex(r.section) == kidx) {
+          let (sidx, ok) = symIdx[r.symbol]
+          if (!ok) {
+            fail newError("UnknownSymbol")
+          }
+          appendU32(out, r.offset)
+          appendU32(out, sidx)
+          appendU16(out, peRelocType(r.kind, target))
+        }
+        ri = ri + 1
+      }
+    }
+    ci = ci + 1
+  }
+
+  oi = 0
+  while (oi < len(obj.symbols)) {
+    let s = obj.symbols[oi]
+    let nameBytes = []byte(s.name)
+    if (len(nameBytes) <= 8) {
+      appendBytes(out, nameBytes)
+      appendZeros(out, 8 - len(nameBytes))
+    } else {
+      appendU32(out, 0)
+      appendU32(out, strOff[oi])
+    }
+    appendU32(out, s.offset) // Value
+    if (s.hasSection) {
+      appendU16(out, peSectionNumberOf(order, s.section))
+    } else {
+      appendU16(out, 0) // IMAGE_SYM_UNDEFINED
+    }
+    if (s.kind == PeSymKind.Func) {
+      appendU16(out, 0x0020) // complex type FUNCTION, base type NULL
+    } else {
+      appendU16(out, 0x0000) // IMAGE_SYM_TYPE_NULL
+    }
+    if (s.binding == PeBinding.Global) {
+      out.bytes = append(out.bytes, u8(2)) // IMAGE_SYM_CLASS_EXTERNAL
+    } else {
+      out.bytes = append(out.bytes, u8(3)) // IMAGE_SYM_CLASS_STATIC
+    }
+    out.bytes = append(out.bytes, u8(0)) // NumberOfAuxSymbols
+    oi = oi + 1
+  }
+
+  appendBytes(out, strtab.bytes)
+  return out.bytes
+}
