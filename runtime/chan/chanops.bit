@@ -80,6 +80,117 @@ export @nosplit fn chanSend(ch: *i64, value: int): bool {
 }
 
 // ---------------------------------------------------------------------------
+// The bounded receive spin (#3320)
+// ---------------------------------------------------------------------------
+//
+// A receive that finds nothing used to park immediately. `stdlib/sync`'s Mutex
+// is `<- token` on a capacity-1 channel, so every contended acquire paid a full
+// park + wake round trip: measured at 2296 instructions retired per acquisition
+// against 853 uncontended, on 64 green threads x 10000 acquisitions of one
+// Mutex, arm64/macOS, medians of 9 (#3317's table, reproduced on f333d877).
+// The ~1450-instruction difference is the round trip, and `sys` is 0.00, so all
+// of it is userspace.
+//
+// A lock handoff is the case a spin is built for: the holder is about to
+// release, and if it does so while we are still looking, `attemptSend` finds no
+// queued receiver, puts the value in the buffer, and our next attempt pops it —
+// no park, no unpark, no context switch.
+//
+// WHY A SPINNER CANNOT OVERTAKE A QUEUED RECEIVER, which is the whole reason
+// this does not change observable order. `attemptSend` tries
+// `tryHandoffToReceiver` FIRST and only reaches `pushBuf` when the receive
+// queue holds nothing claimable. So the buffer — the only route a spinner can
+// win by — is unreachable while anyone is queued ahead of it. Wait-queue FIFO
+// is preserved exactly; the spin only fills a gap where the queue is empty.
+//
+// WHY THE LOCK IS RELEASED FIRST. Spinning while holding `chLock` would block
+// the sender from taking the lock it needs to complete the very handoff being
+// waited for: a livelock, not a slow path. The spin therefore holds nothing,
+// and the loop re-acquires only to attempt.
+//
+// WHY IT IS TWO BOUNDS AND NOT ONE. Re-acquiring the lock costs an exclusive
+// compare-and-exchange, which takes the cache line away from every other core
+// INCLUDING THE HOLDER — the effect #2321 removed from `spinAcquire` itself by
+// making it test-and-test-and-set. Doing that on every turn would slow the
+// critical section down for everyone. So the outer bound counts lock
+// acquisitions and stays small, while the inner wait is a read-only poll of
+// words the sender writes; a plain load keeps the line shared and costs the
+// holder nothing.
+//
+// WHY THESE NUMBERS. 4 x 24 is Go's `sync.Mutex` shape (`active_spin` 4,
+// `procyield(30)` per turn) at the same order of magnitude, and it is what the
+// measurement supports here: the window between our failed attempt and the
+// token reaching the buffer is one critical section, ~100 cycles on this
+// machine, which 4 acquisitions spaced by 24 hint instructions covers with
+// room to spare. Larger budgets do not catch more — past the point where the
+// holder would have released, a spinner is waiting on a task that has to be
+// SCHEDULED first, which no bounded spin can cover — they only add waste, and
+// that waste is paid by every worker at once, so it is the term that would
+// reintroduce a scaling cost in worker count. Setting `chanRecvSpinTurns` to 0
+// restores the previous behaviour instruction for instruction: the loop below
+// then runs its body exactly once and never releases the lock.
+const chanRecvSpinTurns: int = 4
+const chanRecvSpinPolls: int = 24
+
+// PAUSE (x64) / YIELD (arm64), the spin-wait hint, pre-encoded per SPEC §11.6
+// exactly as `chanWake`'s loop in `./chan.bit` carries it. Signals the core and
+// touches no register or memory, so the block declares no input, result or
+// clobber.
+@nosplit fn chanSpinHint() {
+  asm volatile {
+    arm64 { 0xD503203F }
+    x64   { 0xF3, 0x90 }
+  }
+}
+
+// Read-only wait for the channel to look receivable, bounded by
+// `chanRecvSpinPolls`. Takes no lock and writes nothing, so it can be wrong in
+// both directions and neither is a race: a stale "not ready" costs one turn of
+// the outer loop, and a stale "ready" costs one failed `attemptRecv`. Exclusion
+// is still established solely by `chLock` in the caller.
+@nosplit fn chanRecvSpinWait(ch: *i64) {
+  let n = 0
+  while (n < chanRecvSpinPolls) {
+    if (*(ch + chCount) > 0 || *(ch + chSendHead) != 0 || *(ch + chClosed) != 0) {
+      return
+    }
+    chanSpinHint()
+    n = n + 1
+  }
+}
+
+// Whether a failed receive should spin before parking. The channel lock must be
+// held: the queue head is read under it.
+//
+// Two refusals, and both are necessary conditions for the spin to be able to
+// win at all rather than tuning knobs.
+//
+// NOT WITH ONE WORKER. A spin waits for another thread to make progress in
+// parallel; with a single worker the holder is a green thread on THIS thread,
+// which cannot run until we park, so the spin is guaranteed to fail and the
+// whole budget is pure loss. Go's `sync_runtime_canSpin` refuses on `ncpu <= 1`
+// for the same reason.
+//
+// NOT WITH A RECEIVER ALREADY QUEUED, which is the load-bearing one and was
+// measured, not reasoned. A spinner can only be served through the buffer, and
+// `attemptSend` reaches `pushBuf` only after `tryHandoffToReceiver` finds
+// nothing claimable — so while anyone is queued, every send is consumed by the
+// queue and the spin provably cannot be served. Without this test the 64-thread
+// single-Mutex workload (where the queue holds ~63 waiters at all times) went
+// from 2296 to 7417 instructions retired per acquisition, 3.2x WORSE: every
+// waiter burnt its whole budget, never won, and parked anyway — and the polling
+// loads land on the same cache line as `chLock`, so they also stole the line
+// back from the holder's compare-and-exchange, which is #2321's finding
+// arriving from the other direction. The queue emptiness test is what keeps the
+// spin to the case it was built for.
+@nosplit fn chanRecvMaySpin(ch: *i64, s: *i64): bool {
+  if (*(ch + chRecvHead) != 0) {
+    return false
+  }
+  return *(s + scNWorkers) > 1
+}
+
+// ---------------------------------------------------------------------------
 // Blocking receive
 // ---------------------------------------------------------------------------
 //
@@ -91,13 +202,38 @@ export @nosplit fn chanSend(ch: *i64, value: int): bool {
 export @nosplit fn chanRecv(ch: *i64, valueOut: *i64): bool {
   let s = taskAt(*(ch + chSched))
 
-  spinAcquire(spinCellAt(ch, chLock))
-  let st = attemptRecv(ch, valueOut, s)
-  if (st != rcvNone) {
-    spinRelease(spinCellAt(ch, chLock))
-    return st == rcvValue
+  // Attempt, then spin and re-attempt up to `chanRecvSpinTurns` times before
+  // giving up and parking — see the section above for why the lock is dropped
+  // across every wait and why a spinner can never overtake a queued receiver.
+  //
+  // Bounded by construction: `turns` only ever rises, so the body runs at most
+  // `chanRecvSpinTurns + 1` times. The eligibility test is re-read every turn
+  // rather than once, so a receiver that queues up while we are spinning ends
+  // the spin on the next attempt instead of letting us burn the rest of a
+  // budget we can no longer win.
+  let turns = 0
+  let st = rcvNone
+  while (turns <= chanRecvSpinTurns) {
+    spinAcquire(spinCellAt(ch, chLock))
+    st = attemptRecv(ch, valueOut, s)
+    if (st != rcvNone) {
+      spinRelease(spinCellAt(ch, chLock))
+      return st == rcvValue
+    }
+    if (turns < chanRecvSpinTurns && chanRecvMaySpin(ch, s)) {
+      spinRelease(spinCellAt(ch, chLock))
+      chanRecvSpinWait(ch)
+      turns = turns + 1
+    } else {
+      turns = chanRecvSpinTurns + 1
+    }
   }
 
+  // The loop falls out still HOLDING the lock, with `rcvNone` observed under
+  // that same acquisition. That adjacency is what removes the recheck the park
+  // race argument in `./chan.bit` would otherwise need, and it is why the last
+  // turn deliberately does not release.
+  //
   // Only the blocking path needs a task: the value slot moves to the per-task
   // scratch so that the waker has somewhere stable to write it, `valueOut`
   // being a caller frame that is about to be suspended.
