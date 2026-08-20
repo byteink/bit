@@ -73,9 +73,12 @@ bootstrap with no digest check.
 
 ## 2. What happens when no release exists for the host triple
 
-Bit ships **three** targets and no others. There is no Windows build (the
-PE/COFF writer landed; the CLI target and the Windows runtime port did not), and
-no 32-bit or big-endian target.
+Bit ships **three** targets and no others. There is no Windows build: the
+self-hosted compiler has no PE/COFF object writer, no CLI target and no Windows
+runtime port. A PE/COFF writer and linker existed in the retired Zig seed
+(`seed/obj/pe.zig`, `seed/link/pe.zig`, recoverable at `4ffb5523^`) and are the
+port reference, not code still in the tree. There is also no 32-bit or
+big-endian target.
 
 On a host outside those three there is no stage0 and **bootstrapping is not
 possible on that machine**. That is a deliberate statement, not a gap to be
