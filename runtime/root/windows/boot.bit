@@ -1,0 +1,617 @@
+// Windows process entry and boot sequence (#3330, epic #3322): the PE
+// `AddressOfEntryPoint` function, the main thread's identity token, and
+// `boot` — bring the collector and scheduler up, run the user's `bit_main`
+// as the first green thread, then exit with its status. The Bit form of
+// `../linux/boot.bit`'s and `../darwin/boot.bit`'s `boot`, for the shape this
+// header explains rather than repeats.
+//
+// ---------------------------------------------------------------------------
+// READ ../darwin/boot.bit's HEADER FIRST — this is the same shape, not linux's
+// ---------------------------------------------------------------------------
+//
+// Windows is the closer analogue to Darwin, not Linux: the loader has already
+// run and the process is initialized by the time `_start` (below) gets
+// control — there is no `_start`-style raw kernel stack to walk, no argc/
+// argv/envp handed in registers, and no auxiliary vector. Where Darwin's
+// entry differs from Linux's in exactly two places (the entry ABI and no
+// auxv/static-TLS install), Windows differs from BOTH platforms in a third:
+// there is no per-process argc/argv/envp AT ALL. A Windows program obtains
+// its command line via `GetCommandLineW` and its environment via
+// `GetEnvironmentStringsW` — both UTF-16, neither shaped like the C
+// `envp: [*:0]?[*:0]u8` array `../../root/os.bit`'s shared `osSetArgs`/
+// `gcEnvValuePtr` machinery already assumes.
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS FILE DOES NOT DO YET, AND WHY THAT IS SOUND RATHER THAN A GAP
+// ---------------------------------------------------------------------------
+//
+// Six sibling Stage B tickets (epic #3322) exist BECAUSE the pieces below are
+// real, separate modules this file cannot reach into — none of
+// `runtime/root/windows/io.bit` (#3331), `os.bit` (#3332), `time.bit` (#3333),
+// `runtime/thread/windows` (#3335), `runtime/park/windows` (#3336),
+// `runtime/root/windows/signal.bit` (#3337) exist on this branch. This file
+// is the gateway: it gets the collector and scheduler running with no
+// dependency on any of them, so those six can each land independently on top
+// of it, exactly as ../linux and ../darwin's own io/os/time/signal siblings
+// sit beside their boot.bit today.
+//
+//   - NO REAL ARGV/ENVP (#3332's job). `osSetArgs` below is called with a
+//     single, immediately-terminated EMPTY array — a valid, non-null envp per
+//     ../../root/os.bit's own contract ("all three are 0 until
+//     bit_rt_port_root_os_set_args runs... so a wrapper called before boot
+//     reports 'no args / empty env' rather than faulting"), so
+//     `rootConfigureFromEnv`/`rootEnvWorkers` see "no overrides set" and use
+//     their compiled-in defaults rather than crash. BIT_GC/BIT_WORKERS/etc are
+//     silently unavailable until #3332 does the real UTF-16 -> envp work.
+//   - NO FATAL SIGNAL / VECTORED EXCEPTION HANDLING (#3337's job). A fault
+//     during `bit_main` is raw SEH, not a Bit panic. `mainStackBaseAddr` and
+//     an alternate-fault-stack mapping exist on ../linux and ../darwin
+//     specifically to feed `./signal.bit`'s handler; there is no such
+//     consumer here yet, so this file tracks neither.
+//   - NO NETPOLLER (Stage C, #3339/#3340 — deliberately last in the epic: "the
+//     hardest piece... Windows is completion-based where kqueue/epoll are
+//     readiness-based"). `schedSetPollFd` is never called, so the scheduler's
+//     `scPollFd` stays its zero default. ../darwin/boot.bit's own comment
+//     states the fallback this produces: "a runtime with no poll descriptor
+//     still boots and still runs every non-networking program correctly, it
+//     just returns '' from any read that has to wait" — exactly the
+//     degradation this file accepts for a program that does not touch a
+//     socket, which is what Stage B is scoped to.
+//   - NO `BIT_GC_STATS` REPORT (step 9 on the other two platforms). That line
+//     is written through `../io.bit`'s `rootWriteAll`/`writeConst`, which do
+//     not exist here (#3331). Dead code with nothing to call is worse than an
+//     honest omission, so this file has no `statsReport` at all yet.
+//   - EXACTLY ONE WORKER, ALWAYS. `rootEnvWorkers(1)` is still called (so the
+//     shape matches the other two platforms and #3332 wiring a real
+//     BIT_WORKERS later needs no change here), but every worker this file
+//     could ever start — including a hypothetical worker 1..N-1 — runs the
+//     SAME always-polls loop below. The other platforms give worker 0 that
+//     role and park every other worker on a futex-like wait
+//     (`schedIdlePark`/`WaitOnAddress`, #3336's `runtime/park/windows`, not
+//     built yet). Busy-polling every worker is correct, just not efficient
+//     for a pool bigger than one — acceptable because #3332's absent env
+//     wiring means BIT_WORKERS cannot request more than the default 1 today
+//     regardless.
+//
+// ---------------------------------------------------------------------------
+// THE WIN64 ENTRY ABI
+// ---------------------------------------------------------------------------
+//
+// The PE loader calls `AddressOfEntryPoint` on the ordinary Win64 convention
+// (32-byte home space, RCX/RDX/R8/R9, RSI/RDI/XMM6-15 callee-saved —
+// `compiler/x64call.bit`'s `XCallConv.Win64`) with a valid, aligned frame
+// already set up, exactly as Darwin's `LC_MAIN` does — but with NO
+// parameters at all: there is no CRT here to have parsed argc/argv first, so
+// the entry is the bare `void WinMainCRTStartup(void)` shape. `winMain`
+// below takes none. The compiler is responsible for selecting Win64 as this
+// object's calling convention and for the prologue/epilogue that follows from
+// it — this file writes ordinary Bit, not hand-encoded frame setup, the same
+// division of labour ../darwin/boot.bit's `machoMain` already relies on.
+//
+// `compiler/pelink.bit:67`'s `plEntrySymbol()` names the PE entry point by
+// the literal symbol `_start` (the linker designates it BY NAME, exactly as
+// ABI.md §9 documents for Mach-O's `_start` pin), which is why `winMain`
+// below carries the same `@symbol("_start")` pin ../darwin/boot.bit's
+// `machoMain` does — one pinned name, two different platform objects, never
+// linked into the same program.
+//
+// ---------------------------------------------------------------------------
+// THE MAIN THREAD'S IDENTITY TOKEN — THE ONE PIECE THIS FILE MUST GET RIGHT
+// ---------------------------------------------------------------------------
+//
+// `runtime/gc/gcthread.bit`'s `gcThreadToken()` is platform-free and, on
+// x86-64, is an UNCONDITIONAL `movq %fs:0, %rax` — no `hostTarget()` branch,
+// no per-platform variant. Its own header explains why that is safe: "`fs:0`
+// is the variant-II ABI TCB's self-referential word, which
+// `../thread/linux/tls.bit`'s `tlsPrepare` writes itself... and which static
+// TLS writes identically, so the same load is the thread pointer under EITHER
+// RUNTIME" — i.e. the contract is "boot installs a self-referential word at
+// FS_BASE", not "boot installs Linux's ELF TLS format" — and this file's job
+// is to satisfy that contract on Windows, NOT to touch gcthread.bit.
+//
+// Windows x86-64 does not use FS for anything (GS holds the TEB); FS_BASE is
+// otherwise 0, so an untouched `fs:0` read would fault. `winInstallThreadToken`
+// below sets FS_BASE directly with the WRFSBASE instruction (Intel SDM, ring-3
+// executable once the OS has set CR4.FSGSBASE, which it must have for this to
+// work at all) to a self-referential word — verbatim the same convention
+// `tlsPrepare`'s `storeWord(tp, tp)` uses.
+//
+// EMPIRICALLY VERIFIED ON mustafa-desktop-win (Windows 11 Pro, AMD64,
+// 10.0.26200.9168), not assumed: a hand-linked PE (compiler/pelink.bit, the
+// same technique #3329 used) that runs `xor eax,eax; wrfsbase rax; call
+// ExitProcess(0)` exits 0 — WRFSBASE does not trap. A second hand-linked PE
+// that writes a self-referential word onto its own stack, WRFSBASE's it in,
+// then reads it back through `mov rcx, fs:[0]` — gcThreadToken()'s exact
+// x86-64 instruction sequence — also exits 0, and a deliberately mismatched
+// comparison target in the same payload exits 1, proving the probe
+// discriminates rather than passing vacuously. Both probes and the mutation
+// were scratch (compiler/pelinkcheck.bit, not committed); this comment is the
+// durable record.
+//
+// gcThreadToken() itself is UNCHANGED and UNTOUCHED by this file.
+
+import {
+  schedInit, schedTaskInit, schedRegister, schedSpawn, schedShutdown,
+  schedWorkerAt, taskAt, taskWords, schedStackBytes, schedStackAligned,
+  schedRegisterBigStack, wkDeque, schedTaskExit, dqPushBottom,
+  WORKER_MAX_STEPS, workerStepStop, scStopping, schedFindWorkAt,
+  schedWorkerStepAt, wkLastDone, taskStackBase, taskStackBytes,
+  schedSpawnTrampoline, taskSpawnEntry,
+} from "../../sched"
+import { threadStackBytes } from "../../thread"
+import { parkMinBackoffNs, parkNextBackoff } from "../../park"
+import { mapPages, unmapPages, protectPages } from "../../alloc/windows"
+import { rootBindMemory, rootInit, rootConfigureFromEnv, rootEnvMarkStack, rootEnvWorkers, osSetArgs } from "../../root"
+import { rootGcAddr, rootWorldAddr } from "../../root"
+import { chanBootBind } from "../../chan"
+import { gcBlockingBegin, gcBlockingEnd, gcThreadEnter, gcThreadExit, gcDefaultMinTrigger, gcDefaultMarkStack, gcDefaultGrowthPct } from "../../gc"
+import { stwBind } from "../../stw"
+
+// The per-program entry the compiled user object defines (ABI.md §10),
+// exactly as ../linux and ../darwin's own `extern fn bit_main` — resolved to
+// `U bit_main` at final program link.
+extern fn bit_main(): i32
+
+// ---------------------------------------------------------------------------
+// kernel32 imports (compiler/pesyms.bit's admitted surface, #3328) — every
+// name below is already in that table.
+// ---------------------------------------------------------------------------
+
+extern fn ExitProcess(code: i32)
+extern fn CreateThread(attrs: *byte, stackSize: i64, startAddr: *byte,
+    param: *byte, flags: i32, threadIdOut: *i32): *byte
+extern fn WaitForSingleObject(handle: *byte, timeoutMs: i32): i32
+extern fn GetCurrentProcess(): *byte
+extern fn CloseHandle(handle: *byte): i32
+extern fn QueryPerformanceCounter(count: *i64): i32
+extern fn QueryPerformanceFrequency(freq: *i64): i32
+
+// CreateThread's dwCreationFlags: interpret dwStackSize as the RESERVE size
+// (not the initial commit), so every worker gets the same 16MiB budget
+// ../../thread's `threadStackBytes` already names for the other platforms,
+// rather than whatever SizeOfStackReserve the PE header happens to carry.
+const STACK_SIZE_PARAM_IS_A_RESERVATION: i32 = 0x00010000
+
+// ---------------------------------------------------------------------------
+// Boot-time storage, sized for `bootMaxWorkers` — identical layout constants
+// to ../linux and ../darwin (see their comments for why the sizes are
+// literals, not derived: an array size must be a literal, so
+// `[workerWords * bootMaxWorkers]` does not parse).
+// ---------------------------------------------------------------------------
+let schedBlock: [16]i64
+let workerBlock: [9344]i64
+let mainTaskBlock: [32]i64
+
+// One CreateThread HANDLE per started worker — this file's own join state.
+// Unlike ../linux/../darwin's `startDones`/`startHandles` pair, there is no
+// separate "done word": WaitForSingleObject on the real OS thread handle
+// below IS the join, natively bounded by a timeout, so nothing here needs a
+// manually-polled completion flag.
+let startHandles: [32]i64
+
+// CreateThread's `lpThreadId` out-param: no caller reads it (the HANDLE, not
+// the id, is what `boot` joins on below), but the parameter must be a valid
+// address. Module state, not a local — `ptrOf` addresses a cell (§11.11).
+// Safe to share across the spawn loop's calls: each CreateThread overwrites
+// it before returning, and nothing reads it after.
+let winThreadIdScratch: i32 = 0
+
+let mainExitCode: int = 0
+let mainDone: i32 = 0
+
+let bootPollFd: int = 0   // never set (no netpoller yet); kept at 0 throughout.
+let gSched: int = 0
+
+let chanReserveDesc: [3]i64
+let chanRegBlock: [2]i64
+
+// A single zero word: a valid, immediately-terminated argv/envp array (see
+// the header's "NO REAL ARGV/ENVP" note). `osSetArgs` requires a non-null
+// pointer even for an empty environment.
+let emptyArgsBlock: [1]i64
+
+const arenaWords: int = 1048576
+const indexWords: int = 16384
+const pageSize: int = 4096
+const bootMaxWorkers: int = 32
+const joinTimeoutNs: int = 15000000000
+const chanReserveBytes: int = 1048576
+const mainStackBytes: int = 8388608
+
+// ---------------------------------------------------------------------------
+// Stack alignment + the guarded-stack allocator — identical algorithm to
+// ../linux and ../darwin's `mapGuardedStack` (#2433's header there is the
+// full argument for the two-granule reservation and the fixed head guard).
+// Only the underlying page-provider semantics differ: see
+// ../../alloc/windows/pages.bit's header for why `unmapPages` here is
+// MEM_DECOMMIT, not a true release.
+// ---------------------------------------------------------------------------
+
+@nosplit fn alignUpStack(addr: int): int {
+  let bumped = addr + schedStackBytes - 1
+  return bumped - bumped % schedStackBytes
+}
+
+@nosplit fn alignDownStack(addr: int): int {
+  return addr - addr % schedStackBytes
+}
+
+@nosplit fn mapGuardedStack(bytes: int): int {
+  if (bytes <= 0) {
+    return 0
+  }
+  let region = mapPages(bytes + 2 * schedStackBytes)
+  if (region == 0) {
+    return 0
+  }
+  let base = alignUpStack(region + schedStackBytes)
+  if (!schedStackAligned(base) || base < region + schedStackBytes || base - region >= 2 * schedStackBytes) {
+    return 0
+  }
+  if (!protectPages(base - schedStackBytes, schedStackBytes)) {
+    return 0
+  }
+  let headSlop = base - schedStackBytes - region
+  if (headSlop > 0) {
+    if (!unmapPages(region, headSlop)) {
+      return 0
+    }
+  }
+  let tailSlop = schedStackBytes - headSlop
+  if (tailSlop > 0) {
+    if (!unmapPages(base + bytes, tailSlop)) {
+      return 0
+    }
+  }
+  return base
+}
+
+// ---------------------------------------------------------------------------
+// The main thread's identity token — see the header section above.
+// ---------------------------------------------------------------------------
+
+// Install `tp` as this thread's FS_BASE via WRFSBASE (Intel SDM: `F3 REX.W 0F
+// AE /2`, ring-3 executable once CR4.FSGSBASE is set — verified live on
+// mustafa-desktop-win, see the header). `tp` must already be a
+// self-referential word (`*tp == tp`) for `gcThreadToken()`'s `mov reg,
+// fs:[0]` to read back the same value it was given — the caller's job, not
+// this function's; see `winInstallMainThreadToken` below.
+@nosplit fn winSetFsBase(tp: int) {
+  asm volatile {
+    x64   { 0xF3, 0x48, 0x0F, 0xAE, 0xD0 }   // wrfsbase rax
+    arm64 { 0xD51BD040 }                      // msr tpidr_el0, x0 (never reached:
+                                               // x86_64-windows is the only Windows
+                                               // target this toolchain builds; kept
+                                               // for parity with every other asm
+                                               // block in this tree, which the
+                                               // checker requires to carry both
+                                               // arches — SPEC §11.6).
+    input arm64 x0 x64 rax = tp
+    clobber x64 { memory }
+    clobber arm64 { memory }
+  }
+}
+
+// A one-word "TCB" for the main thread, self-referential per the variant-II
+// convention `gcThreadToken()` assumes. Module state (§11.11): `ptrOf`
+// addresses a cell, not a local, and this must outlive the call that installs
+// it (FS_BASE keeps pointing at it for the rest of the process).
+let mainThreadTcb: i64 = 0
+
+@nosplit fn winInstallMainThreadToken() {
+  let addr = int(ptrOf(mainThreadTcb))
+  mainThreadTcb = i64(addr)
+  winSetFsBase(addr)
+}
+
+// ---------------------------------------------------------------------------
+// The monotonic clock (QueryPerformanceCounter) and the worker's idle sleep
+// (WaitForSingleObject on a pseudo-handle that never signals — the standard
+// substitute for kernel32's `Sleep`, which is not in the admitted import
+// surface; GetCurrentProcess/WaitForSingleObject both are). Both are this
+// file's own minimal stand-ins for ../../park/windows (#3336) and
+// ../windows/time.bit (#3333), used ONLY by this file's own worker loop and
+// boot-thread wait below — nothing outside this file references them.
+// ---------------------------------------------------------------------------
+
+let winQpcFreq: i64 = 0
+let winQpcScratch: i64 = 0
+
+// Nanoseconds since an arbitrary epoch, monotonic for the process's lifetime.
+// Split into whole ticks and remainder before scaling by 1e9 so the
+// multiplication cannot overflow i64 even after hours of uptime — a naive
+// `ticks * 1_000_000_000 / freq` overflows within roughly two minutes at a
+// 10MHz QueryPerformanceFrequency (the common modern value), since
+// `ticks * 1e9` alone exceeds 2^63 well before that.
+@nosplit fn winMonoNs(): int {
+  if (winQpcFreq == i64(0)) {
+    QueryPerformanceFrequency(ptrOf(winQpcScratch))
+    winQpcFreq = winQpcScratch
+    if (winQpcFreq == i64(0)) {
+      winQpcFreq = i64(1)   // refuse a divide-by-zero; QPC is documented to
+                             // always succeed on XP+, so this is unreached.
+    }
+  }
+  QueryPerformanceCounter(ptrOf(winQpcScratch))
+  let ticks = winQpcScratch
+  let whole = ticks / winQpcFreq
+  let rem = ticks % winQpcFreq
+  return int(whole * i64(1000000000) + rem * i64(1000000000) / winQpcFreq)
+}
+
+// Block the calling thread for at least `ns`, rounded up to whole
+// milliseconds (1ms minimum — WaitForSingleObject takes no finer unit).
+// `GetCurrentProcess()` is a pseudo-handle constant, never actually shared or
+// signaled by anything this process does, so the wait always times out —
+// exactly a sleep, with no separate `Sleep` import needed.
+@nosplit fn winSleepNs(ns: int) {
+  let ms = ns / 1000000
+  if (ms < 1) {
+    ms = 1
+  }
+  WaitForSingleObject(GetCurrentProcess(), i32(ms))
+}
+
+// ---------------------------------------------------------------------------
+// The worker OS-thread entry. See the header's "EXACTLY ONE WORKER, ALWAYS"
+// note: every worker this file could start runs this same always-polls loop,
+// unlike ../linux/../darwin's worker-0-polls-the-rest-park split — there is
+// no ../../park/windows (#3336) idle-wake primitive to park on yet.
+//
+// `arg` is the worker's own address directly (`schedWorkerAt(sched, wi)`,
+// passed as CreateThread's `lpParameter`) — no {workerAddr, doneAddr} bundle
+// like the other platforms build via `schedStartArm`: this file's join is
+// WaitForSingleObject on the real CreateThread HANDLE in `boot` below, so
+// there is no manually-polled "done word" for this thread to clear.
+// ---------------------------------------------------------------------------
+fn workerBody(arg: *byte): *byte {
+  gcThreadEnter()
+
+  let w = taskAt(int(arg))
+  let backoff = parkMinBackoffNs
+  let n = 0
+  while (n < WORKER_MAX_STEPS) {
+    n = n + 1
+    let addr = schedFindWorkAt(w, winMonoNs())
+    if (addr == 0) {
+      if (atomicLoad(ptrOf(schedBlock) + scStopping) != 0) {
+        break
+      }
+      gcBlockingBegin()
+      winSleepNs(backoff)
+      gcBlockingEnd()
+      backoff = parkNextBackoff(backoff)
+      continue
+    }
+    backoff = schedWorkerStepAt(w, addr, 0, backoff)
+    let doneTask = *(w + wkLastDone)
+    if (doneTask != 0 && doneTask != int(ptrOf(mainTaskBlock))) {
+      let dt = taskAt(doneTask)
+      unmapPages(*(dt + taskStackBase), *(dt + taskStackBytes))
+      unmapPages(doneTask, (taskWords + 1) * 8)
+    }
+    if (backoff == workerStepStop) {
+      break
+    }
+  }
+
+  gcThreadExit()
+  return nil
+}
+
+// The first green thread: run the user's `bit_main`, publish its exit code,
+// leave the task. Identical to ../linux and ../darwin's `mainTrampoline`.
+fn mainTrampoline() {
+  mainExitCode = int(bit_main())
+  atomicStore(ptrOf(mainDone), i32(1))
+  schedTaskExit()
+}
+
+// ---------------------------------------------------------------------------
+// bit_rt_spawn / bit_rt_map_pages / bit_rt_unmap_pages — identical role and
+// shape to ../linux and ../darwin's own (see their comments for the pin
+// rationale: `runtime/gc/mem.bit` reaches these across the module boundary by
+// name, ABI.md §9).
+// ---------------------------------------------------------------------------
+
+export @nosplit fn spawnBindScheduler(schedAddr: int) {
+  gSched = schedAddr
+}
+
+// A fatal exit for `rtSpawn`'s own error paths ONLY — a live `spawn()` call
+// that cannot allocate a task stack or task block, mid-program. NOT
+// `bit_rt_os_exit` (ABI.md §19's pinned, stable `(code: i64) -> noreturn`
+// export every compiled panic/os.exit() path calls): that symbol belongs to
+// `runtime/root/windows/os.bit` (#3332), which owns real process-exit
+// semantics on Windows. Defining it here would collide with #3332's own
+// definition at final program link (E0042-shaped duplicate), so this stays
+// unpinned and unexported.
+@nosplit fn winSpawnFatal(code: int) {
+  ExitProcess(i32(code))
+}
+
+export @nosplit @symbol("bit_rt_spawn") fn rtSpawn(entry: *byte, arg: int) {
+  if (gSched == 0) {
+    winSpawnFatal(70)
+  }
+  let s = taskAt(gSched)
+  let stackBase = mapGuardedStack(schedStackBytes)
+  if (stackBase == 0) {
+    winSpawnFatal(70)
+  }
+  let taskAddr = mapPages((taskWords + 1) * 8)
+  if (taskAddr == 0) {
+    winSpawnFatal(70)
+  }
+  *(taskAt(taskAddr) + taskSpawnEntry) = int(entry)
+  schedTaskInit(taskAt(taskAddr), stackBase, schedStackBytes,
+                entryOf(schedSpawnTrampoline), arg)
+  schedSpawn(s, taskAddr)
+}
+
+export @nosplit @symbol("bit_rt_map_pages") fn rtMapPages(nbytes: int): int {
+  return mapPages(nbytes)
+}
+
+export @nosplit @symbol("bit_rt_unmap_pages") fn rtUnmapPages(addr: int, nbytes: int): int {
+  if (unmapPages(addr, nbytes)) {
+    return 1
+  }
+  return 0
+}
+
+// Boot the collector and scheduler, run `bit_main`, wait for it, tear down,
+// and return the process exit code. THE ORDER IS LOAD-BEARING, mirroring
+// ../linux and ../darwin's `boot` with the netpoller/alt-signal-stack/
+// BIT_GC_STATS steps removed (see the header) and step 6/7/8's thread
+// creation and join done through CreateThread/WaitForSingleObject directly.
+fn boot(): int {
+  // 1. The main thread's identity token (see the header section). Must run
+  //    before ANYTHING that can reach the collector — the very first
+  //    `gcThreadToken()` call anywhere (rootInit's own bring-up does not call
+  //    it, but the FIRST allocation on this thread, `bit_main`'s own on the
+  //    worker's stack, does not run on THIS thread at all — worker 0 runs it
+  //    on its own CreateThread'd thread, which never touches FS_BASE. This
+  //    call exists for the BOOT thread's own safepoint polls, which ordinary
+  //    Bit code (this function is not `@nosplit`) can reach on its loop back
+  //    edges below, same as ../linux/../darwin's boot thread.)
+  winInstallMainThreadToken()
+
+  // 2. Map and bind the heap, then start the collector and type descriptors.
+  let spanBytes = arenaWords * 8
+  let idxBytes = indexWords * 8
+  let span = mapPages(spanBytes)
+  let idx = mapPages(idxBytes)
+  if (span == 0 || idx == 0) {
+    return 70
+  }
+  rootBindMemory(span, spanBytes, idx, idxBytes, pageSize)
+  if (!rootInit(rootEnvMarkStack(gcDefaultMarkStack))) {
+    return 70
+  }
+
+  // 3. GC config from the environment — always "unset" here (empty envp, see
+  //    the header), so this leaves gcInit's compiled-in defaults untouched
+  //    until #3332 wires real argv/envp capture.
+  osSetArgs(0, int(ptrOf(emptyArgsBlock)), int(ptrOf(emptyArgsBlock)))
+  rootConfigureFromEnv(true, false, gcDefaultMinTrigger, gcDefaultGrowthPct, false)
+
+  // 4. Scheduler over the worker blocks.
+  let nworkers = rootEnvWorkers(1)
+  if (nworkers < 1) {
+    nworkers = 1
+  }
+  if (nworkers > bootMaxWorkers) {
+    nworkers = bootMaxWorkers
+  }
+  let sched: *i64 = ptrOf(schedBlock)
+  schedInit(sched, int(ptrOf(workerBlock)), nworkers)
+  spawnBindScheduler(int(sched))
+
+  // 4b. No netpoller yet (Stage C, #3339/#3340) — `bootPollFd`/`scPollFd`
+  //     stay 0. See the header for the accepted degradation.
+
+  // 4c. Channel reserve + registry for `bit_rt_chan_make`.
+  let chanMem = mapPages(chanReserveBytes)
+  if (chanMem == 0) {
+    return 70
+  }
+  chanBootBind(int(ptrOf(chanReserveDesc)), chanMem, chanReserveBytes,
+               int(ptrOf(chanRegBlock)), int(sched))
+
+  // 4d. Arm stop-the-world.
+  stwBind(rootGcAddr(), int(sched), int(ptrOf(chanRegBlock)), rootWorldAddr())
+
+  // 4e. No alternate fault stack yet (#3337 owns fault handling on Windows).
+
+  // 5. Place `bit_main`'s task on worker 0's deque; register before queueing.
+  let stackBase = mapGuardedStack(mainStackBytes)
+  if (stackBase == 0) {
+    return 70
+  }
+  let task = int(ptrOf(mainTaskBlock))
+  let t: *i64 = ptrOf(mainTaskBlock)
+  schedTaskInit(t, stackBase, mainStackBytes, entryOf(mainTrampoline), 0)
+  if (!schedRegisterBigStack(stackBase, mainStackBytes, task)) {
+    return 70
+  }
+  schedRegister(sched, task)
+  if (!dqPushBottom(schedWorkerAt(sched, 0) + wkDeque, task)) {
+    return 70
+  }
+
+  // 6. Bring the workers up on real OS threads via CreateThread directly —
+  //    this file's own minimal stand-in for ../../thread/windows (#3335),
+  //    which will own the full threadStart/threadRelease contract once it
+  //    lands. A failed spawn is not fatal past the first worker (matching
+  //    ../linux/../darwin): worker 0 must come up or nothing runs, but a
+  //    program should keep the workers it got beyond that.
+  let started = 0
+  let wi = 0
+  while (wi < nworkers) {
+    let workerAddr = int(schedWorkerAt(sched, wi))
+    let z: *byte = nil
+    let argPtr = z + workerAddr
+    let flags = STACK_SIZE_PARAM_IS_A_RESERVATION
+    let nullAttrs: *byte = nil
+    let handle = CreateThread(nullAttrs, i64(threadStackBytes),
+                               entryOf(workerBody), argPtr, flags, ptrOf(winThreadIdScratch))
+    *(ptrOf(startHandles) + wi) = int(handle)
+    if (int(handle) == 0) {
+      if (wi == 0) {
+        return 70
+      }
+      wi = nworkers
+    } else {
+      started = started + 1
+      wi = wi + 1
+    }
+  }
+
+  // 7. Wait for `main` — the `mainDone` poll-with-backoff, bracketed
+  //    `blocked` exactly as ../linux/../darwin's boot thread (see their
+  //    "THE BOOT THREAD AND THE RENDEZVOUS" header for the full safety
+  //    argument, which applies unchanged here: this function allocates
+  //    nothing on the managed heap at any point).
+  let backoff = 1000
+  while (atomicLoad(ptrOf(mainDone)) == i32(0)) {
+    gcBlockingBegin()
+    winSleepNs(backoff)
+    gcBlockingEnd()
+    backoff = backoff * 2
+    if (backoff > 1000000) {
+      backoff = 1000000
+    }
+  }
+
+  // 8. Signal shutdown, then join each started worker's real OS thread —
+  //    WaitForSingleObject on its CreateThread HANDLE, bounded by
+  //    `joinTimeoutNs`, natively OS-signaled rather than polled.
+  schedShutdown(sched)
+  let joinTimeoutMs = i32(joinTimeoutNs / 1000000)
+  let ji = 0
+  while (ji < started) {
+    let h = *(ptrOf(startHandles) + ji)
+    let hp: *byte = nil
+    WaitForSingleObject(hp + h, joinTimeoutMs)
+    CloseHandle(hp + h)
+    ji = ji + 1
+  }
+
+  // 9. No BIT_GC_STATS report yet (#3331 owns the write path). `rootEnvVerbose`
+  //    would always read false regardless (empty envp), so there is nothing
+  //    to gate here today.
+
+  return mainExitCode
+}
+
+// The Windows entry point. The PE loader calls this on the Win64 convention
+// with no arguments (see the header) once the loader has finished and the
+// process is initialized, and calls no epilogue for it — `winMain` itself
+// calls `ExitProcess` explicitly rather than returning, since a bare return
+// from a CRT-less entry has no defined caller to return into.
+export @symbol("_start") fn winMain(): i32 {
+  let code = boot()
+  ExitProcess(i32(code))
+  return i32(code)   // unreached: ExitProcess does not return.
+}
