@@ -1,0 +1,455 @@
+// Self-host (#3326, epic #3322): real COFF relocatable object reader for
+// x86_64-windows. Parses whatever `compiler/emitpe.bit` will eventually write
+// (and, later, whatever `./make libbitrt` produces for the Windows target) and
+// normalizes it into linkobj.bit's generic LoModule/LoAtom IR via
+// atomizeModule — the third format alongside elfreader.bit and
+// machoreader.bit.
+//
+// Scope is deliberately narrow, matching the two siblings: every field and
+// relocation type this file switches on is either required by the Microsoft
+// PE/COFF spec to be present in any object, or was confirmed present in a real
+// COFF object built by an INDEPENDENT toolchain (Apple's own clang/LLVM,
+// `clang -target x86_64-pc-windows-msvc -c`, entirely outside this project's
+// lineage) — not merely round-tripped through this project's own writer. See
+// pereadercheck.bit's header comment for exactly what was checked and how.
+// Anything else fails LOUDLY rather than silently mis-linking.
+//
+// Three ways COFF differs from ELF (which this reader must bridge):
+//  - No magic number. A raw .obj starts directly with IMAGE_FILE_HEADER; the
+//    only signature is a valid Machine field, so "wrong machine" and "not a
+//    COFF object at all" collapse into one check (UnsupportedCoff below).
+//  - REL-style relocations, like Mach-O: IMAGE_RELOCATION carries no explicit
+//    addend field. The addend lives in the field bytes at the relocation site
+//    and must be read out of the section's own data, sign-extended.
+//  - No per-symbol size (IMAGE_SYMBOL carries none) — same as Mach-O,
+//    atomizeModule infers an atom's extent from the NEXT symbol's offset.
+//
+// A fourth COFF-only wrinkle: TWO independent long-name encodings. A SECTION
+// header name over 8 bytes is the ASCII text "/<decimal>" (a string-table
+// offset written as digits); a SYMBOL name over 8 bytes is 4 zero bytes
+// followed by a BINARY little-endian u32 offset. Mixing these up silently
+// reads garbage names rather than failing, so they are two separate functions
+// below, not one shared with a flag.
+
+// ---- little-endian primitive reads ----------------------------------------
+//
+// Every read is unaligned-safe by construction: ar member data is only 2-byte
+// aligned at best.
+
+fn prU(b: []u8, off: int, n: int): int {
+  let v = 0
+  let i = 0
+  while (i < n) {
+    v = v | (int(b[off + i]) << (i * 8))
+    i = i + 1
+  }
+  return v
+}
+
+// SectionNumber is a SIGNED 16-bit field (0 = undefined, -1 = absolute,
+// -2 = debug).
+fn prI16(b: []u8, off: int): int {
+  let v = prU(b, off, 2)
+  if (v >= 0x8000) {
+    return v - 0x10000
+  }
+  return v
+}
+
+// A relocation's implicit addend, read straight from the field bytes at the
+// relocation site (REL-style, like Mach-O — COFF's IMAGE_RELOCATION has no
+// addend field of its own). `width` is 4 for a 32-bit field, 8 for a 64-bit
+// one; the caller has already bounds-checked the read.
+fn prI32(b: []u8, off: int): int {
+  let v = prU(b, off, 4)
+  if (v >= 0x80000000) {
+    return v - 0x100000000
+  }
+  return v
+}
+
+fn prReadImplicitAddend(data: []u8, off: int, width: int): int {
+  if (width == 8) {
+    // A plain 8-byte little-endian read into Bit's 64-bit int already IS the
+    // correct two's-complement signed reinterpretation — no separate
+    // sign-extension step needed (same reasoning elfreader.bit's erI64 relies
+    // on for R_X86_64_64's addend).
+    return prU(data, off, 8)
+  }
+  return prI32(data, off)
+}
+
+// ---- struct sizes, per the Microsoft PE/COFF spec (verified byte-for-byte
+// against a real object — see pereadercheck.bit) --------------------------
+
+fn prSizeofHeader(): int { return 20 } // IMAGE_FILE_HEADER
+fn prSizeofSection(): int { return 40 } // IMAGE_SECTION_HEADER
+fn prSizeofSymbol(): int { return 18 } // IMAGE_SYMBOL
+fn prSizeofReloc(): int { return 10 } // IMAGE_RELOCATION
+
+// The NUL-terminated string at `off` in the string table (which starts with
+// its own 4-byte total size, so `off` 0..3 addresses that size field rather
+// than user data — callers never construct such an offset, and nothing here
+// needs to forbid it specially since it still bounds-checks and terminates).
+fn prCstr(b: []u8, strOff: int, strSize: int, off: int): string! {
+  if (off >= strSize) {
+    fail newError("Malformed")
+  }
+  let out = []u8(0)
+  let i = strOff + off
+  let end = strOff + strSize
+  while (i < end && b[i] != u8(0)) {
+    out = append(out, b[i])
+    i = i + 1
+  }
+  if (i >= end) {
+    fail newError("Malformed") // unterminated
+  }
+  return string(out)
+}
+
+// A SECTION header's Name[8]: either a short inline name, or (if the first
+// byte is '/') ASCII decimal digits naming a string-table offset. Reuses
+// archive.bit's arParseDecimal — same module, same "unsigned decimal, no
+// silent 0 truncation" contract this needs.
+fn prSectionName(b: []u8, sh: int, strOff: int, strSize: int): string! {
+  if (b[sh] == u8(47)) { // '/'
+    let digits = []u8(0)
+    let i = 1
+    while (i < 8 && b[sh + i] != u8(0)) {
+      digits = append(digits, b[sh + i])
+      i = i + 1
+    }
+    let off = arParseDecimal(string(digits))
+    if (off < 0) {
+      fail newError("Malformed")
+    }
+    return prCstr(b, strOff, strSize, off)?
+  }
+  let out = []u8(0)
+  let i = 0
+  while (i < 8 && b[sh + i] != u8(0)) {
+    out = append(out, b[sh + i])
+    i = i + 1
+  }
+  return string(out)
+}
+
+// A SYMBOL table entry's Name[8]: a union of an 8-byte short name and a
+// {u32 zero; u32 offset} long-name pair. This is a BINARY encoding, unlike
+// the section header's ASCII "/<decimal>" form above — the two must not be
+// confused.
+fn prSymbolName(b: []u8, s: int, strOff: int, strSize: int): string! {
+  let zero = prU(b, s, 4)
+  if (zero == 0) {
+    let off = prU(b, s + 4, 4)
+    return prCstr(b, strOff, strSize, off)?
+  }
+  let out = []u8(0)
+  let i = 0
+  while (i < 8 && b[s + i] != u8(0)) {
+    out = append(out, b[s + i])
+    i = i + 1
+  }
+  return string(out)
+}
+
+// A section's byte alignment: bits 20-23 of Characteristics encode
+// IMAGE_SCN_ALIGN_*, value N means 2^(N-1) bytes; 0 means "unspecified",
+// floored to 1 like the other two readers do for a missing/zero alignment.
+fn prAlignOf(chars: int): int {
+  let raw = (chars >> 20) & 15
+  if (raw == 0) {
+    return 1
+  }
+  return 1 << (raw - 1)
+}
+
+// The LoSectionKind a section maps to, or `has: false` to DROP it — debug
+// info, linker-directive and COMDAT-helper sections, matching how
+// machoreader.bit drops __unwind_info/__eh_frame/__compact_unwind by name.
+// `.pdata`/`.xdata` (unwind data) are explicitly out of scope for THIS reader
+// (a separate ticket, #3345, owns emitting and consuming them) and are
+// dropped by name here rather than by flag, because real objects do NOT mark
+// them discardable — only their debug-info neighbors are.
+struct PrClass {
+  has: bool,
+  kind: LoSectionKind,
+}
+
+fn prClassify(name: string, chars: int): PrClass {
+  if (name == ".bit_gc") {
+    return PrClass{ has: true, kind: LoSectionKind.GcMeta }
+  }
+  if (name == ".pdata" || name == ".xdata") {
+    return PrClass{ has: false, kind: LoSectionKind.Data }
+  }
+  if ((chars & 0x02000000) != 0) { // IMAGE_SCN_MEM_DISCARDABLE: .debug$*, etc.
+    return PrClass{ has: false, kind: LoSectionKind.Data }
+  }
+  if ((chars & 0x00000200) != 0) { // IMAGE_SCN_LNK_INFO: .drectve and friends
+    return PrClass{ has: false, kind: LoSectionKind.Data }
+  }
+  if ((chars & 0x00000800) != 0) { // IMAGE_SCN_LNK_REMOVE
+    return PrClass{ has: false, kind: LoSectionKind.Data }
+  }
+  if ((chars & 0x00000080) != 0) { // IMAGE_SCN_CNT_UNINITIALIZED_DATA
+    return PrClass{ has: true, kind: LoSectionKind.Bss }
+  }
+  if ((chars & 0x00000020) != 0 && (chars & 0x20000000) != 0) {
+    // IMAGE_SCN_CNT_CODE + IMAGE_SCN_MEM_EXECUTE
+    return PrClass{ has: true, kind: LoSectionKind.Text }
+  }
+  if ((chars & 0x00000040) == 0) { // not IMAGE_SCN_CNT_INITIALIZED_DATA either
+    return PrClass{ has: false, kind: LoSectionKind.Data } // unrecognized content
+  }
+  if ((chars & 0x80000000) != 0) { // IMAGE_SCN_MEM_WRITE
+    return PrClass{ has: true, kind: LoSectionKind.Data }
+  }
+  return PrClass{ has: true, kind: LoSectionKind.Rodata }
+}
+
+// IMAGE_REL_AMD64_REL32 -> Pc32, IMAGE_REL_AMD64_ADDR64 -> Abs64. These are
+// the two the ticket names as the minimum; every other AMD64 relocation type
+// (REL32_1..5, SECREL, SECTION, ADDR32NB, ...) is real but has not been
+// observed in an object this linker needs to consume yet, so it fails loud
+// rather than being guessed at — exactly elfreader.bit's rule for an unknown
+// r_type.
+fn prRelocKind(rtype: int): LoRelocKind! {
+  if (rtype == 1) { return LoRelocKind.Abs64 } // IMAGE_REL_AMD64_ADDR64
+  if (rtype == 4) { return LoRelocKind.Pc32 } // IMAGE_REL_AMD64_REL32
+  fail newError("UnsupportedRelocation")
+}
+
+fn prRelocWidth(kind: LoRelocKind): int {
+  if (kind == LoRelocKind.Abs64) {
+    return 8
+  }
+  return 4 // Pc32 is the only other kind prRelocKind ever returns
+}
+
+// How a symbol-table entry participates in relocation — mirrors
+// elfreader.bit's ErSymInfo exactly (same four-way kind, same reasoning):
+//   0 Undefined — resolve by NAME at whole-link merge time.
+//   1 Section   — the section's own representative symbol; `idx` is our
+//                 rawSections index.
+//   2 Raw       — `idx` indexes rawSymbols.
+//   3 Ignored   — a FILE symbol, an aux record, or defined in a dropped
+//                 section. NEVER a valid relocation target.
+struct PrSymInfo {
+  kind: int,
+  idx: int,
+  name: string,
+}
+
+// Reads one COFF (IMAGE_FILE_HEADER-rooted) relocatable object into
+// linkobj.bit's generic module IR.
+fn readCoffObject(name: string, b: []u8): LoModule! {
+  if (len(b) < prSizeofHeader()) {
+    fail newError("Truncated")
+  }
+  let machine = prU(b, 0, 2)
+  if (machine != 0x8664) { // IMAGE_FILE_MACHINE_AMD64: the only Windows
+    // target this compiler supports (ARM64 Windows is out of scope for the
+    // whole epic). A file with a different Machine field, or one that is not
+    // COFF at all, is rejected the same way: COFF has no separate magic.
+    fail newError("UnsupportedCoff")
+  }
+  let numSections = prU(b, 2, 2)
+  let symtabOff = prU(b, 8, 4)
+  let numSymbols = prU(b, 12, 4)
+  let optHdrSize = prU(b, 16, 2)
+  if (optHdrSize != 0) {
+    // A nonzero SizeOfOptionalHeader means this is a full PE image (an .exe
+    // or .dll), not a relocatable .obj — the same distinction ELF makes with
+    // e_type, just via a different field.
+    fail newError("UnsupportedCoff")
+  }
+
+  let shoff = prSizeofHeader()
+  if (shoff + numSections * prSizeofSection() > len(b)) {
+    fail newError("Truncated")
+  }
+  if (numSymbols == 0) {
+    fail newError("Malformed")
+  }
+  if (symtabOff + numSymbols * prSizeofSymbol() > len(b)) {
+    fail newError("Truncated")
+  }
+  let strOff = symtabOff + numSymbols * prSizeofSymbol()
+  if (strOff + 4 > len(b)) {
+    fail newError("Truncated")
+  }
+  let strSize = prU(b, strOff, 4)
+  if (strSize < 4) {
+    fail newError("Malformed") // the size field counts itself
+  }
+  if (strOff + strSize > len(b)) {
+    fail newError("Truncated")
+  }
+
+  // ---- section headers: classify + keep ----------------------------------
+  let rawSections = []LoRawSection(0)
+  let sectionMap = []int(0) // per-file-section -> rawSections index, or -1
+  let secPtrRelocs = []int(0)
+  let secNumRelocs = []int(0)
+  let i = 0
+  while (i < numSections) {
+    let sh = shoff + i * prSizeofSection()
+    let secName = prSectionName(b, sh, strOff, strSize)?
+    if (len(secName) >= 5 && secName[0:5] == ".tls$") {
+      // Windows thread-locals use an entirely different model (an
+      // IMAGE_TLS_DIRECTORY, not a section flag) that nothing here has
+      // ported — fail loud rather than silently treat template data as an
+      // ordinary global.
+      fail newError("UnsupportedSection")
+    }
+    let sizeOfRaw = prU(b, sh + 16, 4)
+    let ptrRaw = prU(b, sh + 20, 4)
+    let ptrRelocs = prU(b, sh + 24, 4)
+    let numRelocs = prU(b, sh + 32, 2)
+    let chars = prU(b, sh + 36, 4)
+    if (ptrRaw != 0 && ptrRaw + sizeOfRaw > len(b)) {
+      fail newError("Truncated")
+    }
+    if ((chars & 0x01000000) != 0) { // IMAGE_SCN_LNK_NRELOC_OVFL
+      fail newError("UnsupportedSection") // >65535 relocations: not observed,
+      // and the escape form (count stashed in reloc[0]) is not implemented.
+    }
+    if (ptrRelocs != 0 && ptrRelocs + numRelocs * prSizeofReloc() > len(b)) {
+      fail newError("Truncated")
+    }
+
+    let cls = prClassify(secName, chars)
+    sectionMap = append(sectionMap, -1)
+    if (cls.has) {
+      let data = []u8(0)
+      if (!loIsBss(cls.kind) && ptrRaw != 0) {
+        data = b[ptrRaw:ptrRaw + sizeOfRaw]
+      }
+      sectionMap[i] = len(rawSections)
+      rawSections = append(rawSections, LoRawSection{ name: secName,
+        kind: cls.kind, data: data, size: sizeOfRaw, alignment: prAlignOf(chars) })
+    }
+    secPtrRelocs = append(secPtrRelocs, ptrRelocs)
+    secNumRelocs = append(secNumRelocs, numRelocs)
+    i = i + 1
+  }
+
+  // ---- one pass over the symbol table, skipping aux records --------------
+  let symInfos = []PrSymInfo(0)
+  let rawSymbols = []LoRawSymbol(0)
+  i = 0
+  while (i < numSymbols) {
+    let s = symtabOff + i * prSizeofSymbol()
+    let symName = prSymbolName(b, s, strOff, strSize)?
+    let value = prU(b, s + 8, 4)
+    let sectionNumber = prI16(b, s + 12)
+    let storageClass = prU(b, s + 16, 1)
+    let naux = prU(b, s + 17, 1)
+    if (i + 1 + naux > numSymbols) {
+      fail newError("Malformed")
+    }
+
+    if (storageClass == 103) { // IMAGE_SYM_CLASS_FILE — always checked before
+      // the undefined/absolute branches below, same ordering reason
+      // elfreader.bit checks STT_FILE before its SHN_ABS rejection.
+      symInfos = append(symInfos, PrSymInfo{ kind: 3, idx: 0, name: "" })
+    } else if (sectionNumber == 0) { // IMAGE_SYM_UNDEFINED
+      if (value != 0) {
+        // A COMMON (tentative) definition: StorageClass EXTERNAL, section
+        // UNDEFINED, Value = size. This linker has no allocator for one —
+        // same rule elfreader.bit applies to SHN_COMMON.
+        fail newError("UnsupportedSymbol")
+      }
+      symInfos = append(symInfos, PrSymInfo{ kind: 0, idx: 0, name: symName })
+    } else if (sectionNumber < 0) { // IMAGE_SYM_ABSOLUTE (-1) or _DEBUG (-2)
+      fail newError("UnsupportedSymbol")
+    } else if (sectionNumber > numSections) {
+      fail newError("Malformed")
+    } else {
+      let secIdx = sectionNumber - 1
+      if (sectionMap[secIdx] < 0) {
+        symInfos = append(symInfos, PrSymInfo{ kind: 3, idx: 0, name: "" })
+      } else if (storageClass == 3 && naux >= 1 &&
+        symName == rawSections[sectionMap[secIdx]].name) {
+        // The section's own representative symbol (IMAGE_AUX_SYMBOL_SECTION):
+        // COFF's analogue of ELF's STT_SECTION. A section name always starts
+        // with '.', which no Bit-emitted identifier can, so this can never
+        // false-positive on a real local variable.
+        symInfos = append(symInfos, PrSymInfo{ kind: 1, idx: sectionMap[secIdx], name: "" })
+      } else if (storageClass != 2 && storageClass != 3) {
+        // Only EXTERNAL and STATIC are trusted — LABEL, WEAK_EXTERNAL and
+        // anything else has not been observed in a real object this linker
+        // needs, so it fails loud rather than being guessed at.
+        fail newError("UnsupportedSymbol")
+      } else {
+        let binding = LoBinding.Local
+        if (storageClass == 2) { // IMAGE_SYM_CLASS_EXTERNAL
+          binding = LoBinding.Global
+        }
+        symInfos = append(symInfos, PrSymInfo{ kind: 2, idx: len(rawSymbols), name: symName })
+        rawSymbols = append(rawSymbols, LoRawSymbol{ name: symName,
+          section: sectionMap[secIdx], offset: value,
+          size: 0, // COFF carries no per-symbol size; atomize infers it
+          binding: binding, weak: false,
+          alignment: rawSections[sectionMap[secIdx]].alignment })
+      }
+    }
+    let a = 0
+    while (a < naux) {
+      symInfos = append(symInfos, PrSymInfo{ kind: 3, idx: 0, name: "" })
+      a = a + 1
+    }
+    i = i + 1 + naux
+  }
+
+  // ---- relocations: stored per-section (no separate reloc section) -------
+  let rawRelocs = []LoRawReloc(0)
+  i = 0
+  while (i < numSections) {
+    let owner = sectionMap[i]
+    if (owner >= 0 && secNumRelocs[i] > 0) {
+      let relocOff = secPtrRelocs[i]
+      let count = secNumRelocs[i]
+      let r = 0
+      while (r < count) {
+        let ro = relocOff + r * prSizeofReloc()
+        let rOffset = prU(b, ro, 4)
+        let symIndex = prU(b, ro + 4, 4)
+        let rtype = prU(b, ro + 8, 2)
+        if (symIndex >= numSymbols) {
+          fail newError("Malformed")
+        }
+        let kind = prRelocKind(rtype)?
+        let width = prRelocWidth(kind)
+        if (rOffset + width > len(rawSections[owner].data)) {
+          fail newError("Malformed")
+        }
+        let addend = prReadImplicitAddend(rawSections[owner].data, rOffset, width)
+        let info = symInfos[symIndex]
+        if (info.kind == 3) {
+          fail newError("Malformed") // never a valid relocation target
+        }
+        if (info.kind == 0) {
+          rawRelocs = append(rawRelocs, LoRawReloc{ section: owner, offset: rOffset,
+            kind: kind, target: loTargetGlobal(info.name), addend: addend })
+        } else if (info.kind == 1) {
+          rawRelocs = append(rawRelocs, LoRawReloc{ section: owner, offset: rOffset,
+            kind: kind, target: loTargetSectionOffset(info.idx, addend), addend: 0 })
+        } else {
+          let tgt = loTargetSymbol(info.idx)
+          if (rawSymbols[info.idx].binding == LoBinding.Global) {
+            tgt = loTargetGlobal(rawSymbols[info.idx].name)
+          }
+          rawRelocs = append(rawRelocs, LoRawReloc{ section: owner, offset: rOffset,
+            kind: kind, target: tgt, addend: addend })
+        }
+        r = r + 1
+      }
+    }
+    i = i + 1
+  }
+
+  return atomizeModule(name, rawSections, rawSymbols, rawRelocs)?
+}
