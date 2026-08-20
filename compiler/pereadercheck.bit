@@ -1,0 +1,530 @@
+// In-Bit self-checks for the COFF object reader (compiler/pereader.bit,
+// #3326). Split out the way elfreadercheck.bit/machoreadercheck.bit are;
+// sibling .bit files are the same module, so `selfcheck()` still calls these
+// directly.
+//
+// There is no compiler/pe.bit or compiler/emitpe.bit writer to round-trip
+// against yet (emitpe.bit is #3325, in flight in parallel), so this file
+// carries its own minimal, TEST-ONLY COFF byte builder (prFixBuild and
+// friends below) rather than depending on one — the same reason
+// machoreadercheck.bit's fixtures cannot use a writer that predates it.
+//
+// THE INDEPENDENT-ORACLE CHECK (per this ticket's own warning: a reader
+// tested only against its own project's writer proves agreement, not
+// correctness): every byte offset/field layout this file and pereader.bit
+// assume was verified during development against a REAL COFF object built by
+// an entirely independent toolchain — `clang -target x86_64-pc-windows-msvc
+// -c` (Apple's own LLVM, Xcode 21.0.0) — cross-checked against
+// `llvm-objdump -h -t -r` AND against a from-scratch Python re-implementation
+// of the field layout that decoded the same file byte-for-byte. Three such
+// objects were parsed this way (covering IMAGE_REL_AMD64_REL32,
+// IMAGE_REL_AMD64_ADDR64, a >8-byte symbol name in the /offset form, and
+// COFF's aux-record symbol-table skipping); readCoffObject was run against
+// them via a temporary CLI hook during development (not committed — selfcheck
+// does no file I/O, same convention machoreadercheck.bit documents for the
+// real libbitrt.a check). Results and the exact commands are recorded on
+// ticket #3326, not here.
+//
+// It caught a real bug on the first run, which is the whole reason this
+// check exists rather than trusting the synthetic fixtures below: every one
+// of the three real objects has an `@feat.00` symbol (StorageClass STATIC,
+// section ABSOLUTE — a SafeSEH/feature-flags marker every clang/MSVC object
+// emits), and the reader's first draft mirrored elfreader.bit's blanket
+// SHN_ABS rejection, so all three real objects failed to parse at all. Fixed
+// by treating ABSOLUTE/DEBUG as ignored rather than rejected (see
+// readCoffObject's comment); checkPeReaderCommonAbsDebugFile below now
+// covers exactly this shape.
+
+// ---- fixture types: enough of a COFF object to drive readCoffObject, with
+// no ambition beyond what THIS file's tests need -----------------------
+
+struct PrFixSection {
+  name: string,
+  chars: int,
+  data: []u8,
+  size: int, // SizeOfRawData; lets a BSS section report a size with no bytes
+  hasFileData: bool, // false => PointerToRawData is 0 (a BSS-shaped section)
+}
+
+// One raw 18-byte symbol-table slot: either a primary entry or an aux record
+// that must be skipped. Callers pick which fields are meaningful via `isAux`.
+struct PrFixSymbolRaw {
+  isAux: bool,
+  name: string,
+  value: int,
+  section: int, // 1-based, 0 = undefined, -1 = absolute, -2 = debug
+  storageClass: int,
+  naux: int,
+  auxScnLen: int,
+  auxNReloc: int,
+}
+
+struct PrFixReloc {
+  sectionIdx: int, // 0-based into the `sections` list
+  offset: int,
+  symRawIndex: int, // RAW index into the assembled symbol table
+  rtype: int,
+}
+
+struct PrFixBuilt {
+  bytes: []u8,
+  dataOff: []int,
+  relocOff: []int,
+  relocCount: []int,
+}
+
+fn prPutU16(b: []u8, v: int): []u8 {
+  b = append(b, u8(v & 255))
+  b = append(b, u8((v >> 8) & 255))
+  return b
+}
+
+fn prPutU32(b: []u8, v: int): []u8 {
+  b = append(b, u8(v & 255))
+  b = append(b, u8((v >> 8) & 255))
+  b = append(b, u8((v >> 16) & 255))
+  b = append(b, u8((v >> 24) & 255))
+  return b
+}
+
+fn prPutI16(b: []u8, v: int): []u8 {
+  let u = v
+  if (u < 0) {
+    u = u + 0x10000
+  }
+  return prPutU16(b, u)
+}
+
+fn prPutName8(b: []u8, name: string): []u8 {
+  let nb = []byte(name)
+  let k = 0
+  while (k < 8) {
+    if (k < len(nb)) {
+      b = append(b, nb[k])
+    } else {
+      b = append(b, u8(0))
+    }
+    k = k + 1
+  }
+  return b
+}
+
+// Assembles a well-formed COFF object from a flat description: header,
+// section table, section data, per-section relocations, symbol table, string
+// table, in that order. A single forward pass over precomputed offsets, so
+// there is no reserve-then-patch step to get wrong.
+fn prFixBuild(sections: []PrFixSection, symbols: []PrFixSymbolRaw, relocs: []PrFixReloc): PrFixBuilt {
+  let nsec = len(sections)
+  let cursor = prSizeofHeader() + nsec * prSizeofSection()
+
+  let dataOff = []int(0)
+  let i = 0
+  while (i < nsec) {
+    if (sections[i].hasFileData) {
+      dataOff = append(dataOff, cursor)
+      cursor = cursor + sections[i].size
+    } else {
+      dataOff = append(dataOff, 0)
+    }
+    i = i + 1
+  }
+
+  let relocOff = []int(0)
+  let relocCount = []int(0)
+  i = 0
+  while (i < nsec) {
+    let cnt = 0
+    let r = 0
+    while (r < len(relocs)) {
+      if (relocs[r].sectionIdx == i) {
+        cnt = cnt + 1
+      }
+      r = r + 1
+    }
+    relocCount = append(relocCount, cnt)
+    if (cnt > 0) {
+      relocOff = append(relocOff, cursor)
+      cursor = cursor + cnt * prSizeofReloc()
+    } else {
+      relocOff = append(relocOff, 0)
+    }
+    i = i + 1
+  }
+
+  let symtabOff = cursor
+
+  let out = []u8(0)
+  out = prPutU16(out, 0x8664)
+  out = prPutU16(out, nsec)
+  out = prPutU32(out, 0) // TimeDateStamp
+  out = prPutU32(out, symtabOff)
+  out = prPutU32(out, len(symbols))
+  out = prPutU16(out, 0) // SizeOfOptionalHeader
+  out = prPutU16(out, 0) // Characteristics
+
+  i = 0
+  while (i < nsec) {
+    let sec = sections[i]
+    out = prPutName8(out, sec.name)
+    out = prPutU32(out, 0) // VirtualSize
+    out = prPutU32(out, 0) // VirtualAddress
+    out = prPutU32(out, sec.size)
+    out = prPutU32(out, dataOff[i])
+    out = prPutU32(out, relocOff[i])
+    out = prPutU32(out, 0) // PointerToLinenumbers
+    out = prPutU16(out, relocCount[i])
+    out = prPutU16(out, 0) // NumberOfLinenumbers
+    out = prPutU32(out, sec.chars)
+    i = i + 1
+  }
+
+  i = 0
+  while (i < nsec) {
+    if (sections[i].hasFileData) {
+      let d = sections[i].data
+      let j = 0
+      while (j < len(d)) {
+        out = append(out, d[j])
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+
+  i = 0
+  while (i < nsec) {
+    let r = 0
+    while (r < len(relocs)) {
+      if (relocs[r].sectionIdx == i) {
+        out = prPutU32(out, relocs[r].offset)
+        out = prPutU32(out, relocs[r].symRawIndex)
+        out = prPutU16(out, relocs[r].rtype)
+      }
+      r = r + 1
+    }
+    i = i + 1
+  }
+
+  let strs = []u8(0)
+  i = 0
+  while (i < len(symbols)) {
+    let sm = symbols[i]
+    if (sm.isAux) {
+      out = prPutU32(out, sm.auxScnLen)
+      out = prPutU16(out, sm.auxNReloc)
+      out = prPutU16(out, 0) // NumberOfLinenumbers
+      out = prPutU32(out, 0) // CheckSum
+      out = prPutU16(out, 0) // Number
+      out = append(out, u8(0)) // Selection
+      out = append(out, u8(0))
+      out = append(out, u8(0))
+      out = append(out, u8(0)) // 3 bytes unused padding
+    } else {
+      let nb = []byte(sm.name)
+      if (len(nb) <= 8) {
+        out = prPutName8(out, sm.name)
+      } else {
+        out = prPutU32(out, 0)
+        out = prPutU32(out, 4 + len(strs))
+        let k = 0
+        while (k < len(nb)) {
+          strs = append(strs, nb[k])
+          k = k + 1
+        }
+        strs = append(strs, u8(0))
+      }
+      out = prPutU32(out, sm.value)
+      out = prPutI16(out, sm.section)
+      out = prPutU16(out, 0) // Type
+      out = append(out, u8(sm.storageClass))
+      out = append(out, u8(sm.naux))
+    }
+    i = i + 1
+  }
+
+  out = prPutU32(out, 4 + len(strs))
+  let j = 0
+  while (j < len(strs)) {
+    out = append(out, strs[j])
+    j = j + 1
+  }
+
+  return PrFixBuilt{ bytes: out, dataOff: dataOff, relocOff: relocOff, relocCount: relocCount }
+}
+
+fn prErr(b: []u8): string {
+  let msg = ""
+  let m = readCoffObject("t.o", b) catch e {
+    msg = e.message()
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  return msg
+}
+
+fn prAtomNamed(m: LoModule, name: string): int {
+  let i = 0
+  while (i < len(m.atoms)) {
+    if (m.atoms[i].name == name) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// The main shape: a Text section with two atoms (an EXTERNAL "main" and a
+// STATIC "helper"), a Rodata section with one local symbol, and a Bss section
+// with none. Three relocations exercise every target kind readCoffObject
+// produces: an undefined external (also a >8-byte name, forcing the /offset
+// long-name form), a local definition in the same object, and a DEFINED
+// GLOBAL that must still resolve by name (another module could override it).
+fn checkPeReaderRoundTrip() {
+  let sections = [
+    PrFixSection{ name: ".text", chars: 0x60500020, data: []u8(24), size: 24, hasFileData: true },
+    PrFixSection{ name: ".rdata", chars: 0x40300040, data: []byte("hi"), size: 2, hasFileData: true },
+    PrFixSection{ name: ".bss", chars: 0xc0300080, data: []u8(0), size: 16, hasFileData: false }]
+  let symbols = [
+    PrFixSymbolRaw{ isAux: false, name: "main", value: 0, section: 1, storageClass: 2, naux: 0, auxScnLen: 0, auxNReloc: 0 },
+    PrFixSymbolRaw{ isAux: false, name: "helper", value: 16, section: 1, storageClass: 3, naux: 0, auxScnLen: 0, auxNReloc: 0 },
+    // Over 8 bytes: forces the binary zero+offset long-name form.
+    PrFixSymbolRaw{ isAux: false, name: "bit_rt_win_alloc", value: 0, section: 0, storageClass: 2, naux: 0, auxScnLen: 0, auxNReloc: 0 },
+    PrFixSymbolRaw{ isAux: false, name: "msg", value: 0, section: 2, storageClass: 3, naux: 0, auxScnLen: 0, auxNReloc: 0 }]
+  let relocs = [
+    PrFixReloc{ sectionIdx: 0, offset: 0, symRawIndex: 2, rtype: 4 },  // REL32 -> bit_rt_win_alloc
+    PrFixReloc{ sectionIdx: 0, offset: 8, symRawIndex: 3, rtype: 1 },  // ADDR64 -> msg
+    PrFixReloc{ sectionIdx: 0, offset: 20, symRawIndex: 0, rtype: 4 }] // REL32 -> main (helper's atom)
+  let built = prFixBuild(sections, symbols, relocs)
+  assert(prErr(built.bytes) == "")
+  let m = readCoffObject("probe.obj", built.bytes) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  assert(m.name == "probe.obj")
+
+  // .text carried two symbols -> two atoms; .rdata and .bss one each.
+  assert(len(m.atoms) == 4)
+  let mi = prAtomNamed(m, "main")
+  assert(mi >= 0)
+  assert(m.atoms[mi].kind == LoSectionKind.Text)
+  assert(m.atoms[mi].binding == LoBinding.Global)
+  assert(len(m.atoms[mi].data) == 16)
+  let hi = prAtomNamed(m, "helper")
+  assert(hi >= 0)
+  assert(m.atoms[hi].binding == LoBinding.Local)
+  let msgi = prAtomNamed(m, "msg")
+  assert(msgi >= 0)
+  assert(m.atoms[msgi].kind == LoSectionKind.Rodata)
+  // An undefined symbol is not an atom — only ever a relocation target.
+  assert(prAtomNamed(m, "bit_rt_win_alloc") == -1)
+
+  assert(len(m.atoms[mi].relocs) == 2)
+  assert(m.atoms[mi].relocs[0].kind == LoRelocKind.Pc32)
+  assert(m.atoms[mi].relocs[0].target.isGlobal)
+  assert(m.atoms[mi].relocs[0].target.name == "bit_rt_win_alloc")
+  assert(m.atoms[mi].relocs[0].offset == 0)
+  // msg is STATIC (local), so the ADDR64 reloc resolves within this module,
+  // not by name.
+  assert(m.atoms[mi].relocs[1].kind == LoRelocKind.Abs64)
+  assert(m.atoms[mi].relocs[1].offset == 8)
+  assert(!m.atoms[mi].relocs[1].target.isGlobal)
+  assert(m.atoms[mi].relocs[1].target.local == msgi)
+
+  assert(len(m.atoms[hi].relocs) == 1)
+  assert(m.atoms[hi].relocs[0].offset == 4) // section offset 20, atom base 16
+  assert(m.atoms[hi].relocs[0].target.isGlobal)
+  assert(m.atoms[hi].relocs[0].target.name == "main")
+
+  let bi = prAtomNamed(m, ".bss")
+  assert(bi >= 0)
+  assert(m.atoms[bi].kind == LoSectionKind.Bss)
+  assert(m.atoms[bi].size == 16)
+  assert(len(m.atoms[bi].data) == 0)
+}
+
+// A relocation against a section's OWN representative symbol (COFF's
+// analogue of ELF's STT_SECTION) rather than a named symbol — common for a
+// reference to anonymous data with no symbol of its own. The implicit addend
+// (4, encoded in the .text field bytes) must pick the atom covering
+// .rdata+4, exactly like elfreader.bit's STT_SECTION handling.
+fn checkPeReaderSectionSymbolTarget() {
+  let sections = [
+    PrFixSection{ name: ".text", chars: 0x60500020,
+      data: [u8(4), u8(0), u8(0), u8(0), u8(0), u8(0), u8(0), u8(0)], size: 8, hasFileData: true },
+    PrFixSection{ name: ".rdata", chars: 0x40300040, data: []u8(8), size: 8, hasFileData: true }]
+  let symbols = [
+    PrFixSymbolRaw{ isAux: false, name: "f", value: 0, section: 1, storageClass: 2, naux: 0, auxScnLen: 0, auxNReloc: 0 },
+    PrFixSymbolRaw{ isAux: false, name: ".rdata", value: 0, section: 2, storageClass: 3, naux: 1, auxScnLen: 0, auxNReloc: 0 },
+    PrFixSymbolRaw{ isAux: true, name: "", value: 0, section: 0, storageClass: 0, naux: 0, auxScnLen: 8, auxNReloc: 0 }]
+  let relocs = [PrFixReloc{ sectionIdx: 0, offset: 0, symRawIndex: 1, rtype: 1 }] // ADDR64 -> .rdata section symbol
+  let built = prFixBuild(sections, symbols, relocs)
+  assert(prErr(built.bytes) == "")
+  let m = readCoffObject("s.obj", built.bytes) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  // The section symbol itself is never an atom.
+  assert(prAtomNamed(m, ".rdata") >= 0) // .rdata's own anonymous whole-section atom
+  let fi = prAtomNamed(m, "f")
+  assert(fi >= 0)
+  assert(len(m.atoms[fi].relocs) == 1)
+  assert(!m.atoms[fi].relocs[0].target.isGlobal) // resolved locally
+  assert(m.atoms[fi].relocs[0].target.local == prAtomNamed(m, ".rdata"))
+  // .rdata carries no symbol of its own, so it is ONE anonymous atom spanning
+  // the whole section at base 0 — the target offset (4) does not cancel
+  // against a symbol base the way it would if a real symbol sat at that
+  // offset, so the fold leaves addend at 4, not 0.
+  assert(m.atoms[fi].relocs[0].addend == 4)
+}
+
+// A tentative (COMMON) definition, an ABSOLUTE symbol, a DEBUG symbol, and a
+// FILE symbol.
+//
+// ABSOLUTE/DEBUG do NOT reject the way ELF's SHN_ABS/SHN_COMMON do — this was
+// corrected after the independent-oracle check (see this file's header)
+// found that EVERY real object emits `@feat.00` (a SafeSEH/feature-flags
+// marker) as StorageClass STATIC at section ABSOLUTE, and the reader's first
+// draft, which mirrored elfreader.bit's blanket SHN_ABS rejection, refused
+// to parse all three real objects because of it. ABSOLUTE/DEBUG are ignored
+// instead (never an atom, never a valid relocation target — a relocation
+// that DOES target one still fails as Malformed, so this stays as
+// protective as rejection, just deferred to reloc time). COMMON keeps the
+// original rejection: this linker genuinely has no allocator for a
+// tentative definition, matching elfreader.bit's SHN_COMMON handling exactly.
+fn checkPeReaderCommonAbsDebugFile() {
+  let baseSections = [PrFixSection{ name: ".text", chars: 0x60500020, data: []u8(4), size: 4, hasFileData: true }]
+  let fSym = PrFixSymbolRaw{ isAux: false, name: "f", value: 0, section: 1, storageClass: 2, naux: 0, auxScnLen: 0, auxNReloc: 0 }
+
+  // COMMON: section UNDEFINED (0), Value != 0 — this linker has no allocator
+  // for a tentative definition, matching elfreader.bit's SHN_COMMON rejection.
+  let common = [fSym, PrFixSymbolRaw{ isAux: false, name: "tentative", value: 64, section: 0, storageClass: 2, naux: 0, auxScnLen: 0, auxNReloc: 0 }]
+  assert(prErr(prFixBuild(baseSections, common, []PrFixReloc(0)).bytes) == "UnsupportedSymbol")
+
+  // ABSOLUTE (-1), shaped exactly like the real `@feat.00` marker every
+  // clang/MSVC object carries: StorageClass STATIC, no aux records. Parses
+  // clean, never becomes an atom, and a relocation aimed at it fails as
+  // Malformed rather than silently resolving to nothing.
+  let abs = [fSym, PrFixSymbolRaw{ isAux: false, name: "@feat.00", value: 0, section: -1, storageClass: 3, naux: 0, auxScnLen: 0, auxNReloc: 0 }]
+  let absBuilt = prFixBuild(baseSections, abs, []PrFixReloc(0))
+  assert(prErr(absBuilt.bytes) == "")
+  let absM = readCoffObject("abs.obj", absBuilt.bytes) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  assert(len(absM.atoms) == 1) // only "f" — @feat.00 is not an atom
+  assert(prAtomNamed(absM, "@feat.00") == -1)
+  // A relocation that targets the absolute symbol's raw index (1) must still
+  // fail: kind == 3 (Ignored) is never a valid relocation target.
+  let absRelocs = [PrFixReloc{ sectionIdx: 0, offset: 0, symRawIndex: 1, rtype: 4 }]
+  assert(prErr(prFixBuild(baseSections, abs, absRelocs).bytes) == "Malformed")
+
+  // DEBUG (-2), non-FILE storage class: also ignored, not rejected.
+  let dbg = [fSym, PrFixSymbolRaw{ isAux: false, name: "d", value: 0, section: -2, storageClass: 2, naux: 0, auxScnLen: 0, auxNReloc: 0 }]
+  assert(prErr(prFixBuild(baseSections, dbg, []PrFixReloc(0)).bytes) == "")
+
+  // FILE: always ignored, never an atom, never rejected — mirrors STT_FILE.
+  let filesyms = [fSym, PrFixSymbolRaw{ isAux: false, name: "a.c", value: 0, section: -2, storageClass: 103, naux: 1, auxScnLen: 0, auxNReloc: 0 },
+    PrFixSymbolRaw{ isAux: true, name: "", value: 0, section: 0, storageClass: 0, naux: 0, auxScnLen: 0, auxNReloc: 0 }]
+  let built = prFixBuild(baseSections, filesyms, []PrFixReloc(0))
+  assert(prErr(built.bytes) == "")
+  let m = readCoffObject("file.obj", built.bytes) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  assert(prAtomNamed(m, "a.c") == -1)
+  assert(prAtomNamed(m, "f") >= 0)
+}
+
+// Windows thread-locals (".tls$*") use a different model this reader has not
+// ported — must fail loud, never silently fold into ordinary Data.
+fn checkPeReaderTlsRejected() {
+  let sections = [PrFixSection{ name: ".tls$ZZZ", chars: 0xc0300040, data: []u8(8), size: 8, hasFileData: true }]
+  let symbols = [PrFixSymbolRaw{ isAux: false, name: "tv", value: 0, section: 1, storageClass: 2, naux: 0, auxScnLen: 0, auxNReloc: 0 }]
+  assert(prErr(prFixBuild(sections, symbols, []PrFixReloc(0)).bytes) == "UnsupportedSection")
+}
+
+// .pdata/.xdata (unwind data, out of scope — #3345) and a DISCARDABLE debug
+// section must both vanish rather than become atoms or break parsing —
+// mirrors machoreader.bit dropping __unwind_info/__eh_frame by name.
+fn checkPeReaderDropsUnwindAndDebug() {
+  let sections = [
+    PrFixSection{ name: ".text", chars: 0x60500020, data: []u8(4), size: 4, hasFileData: true },
+    PrFixSection{ name: ".pdata", chars: 0x40300040, data: []u8(12), size: 12, hasFileData: true },
+    PrFixSection{ name: ".xdata", chars: 0x40300040, data: []u8(8), size: 8, hasFileData: true },
+    PrFixSection{ name: ".debug$S", chars: 0x42300040, data: []u8(16), size: 16, hasFileData: true }]
+  let symbols = [PrFixSymbolRaw{ isAux: false, name: "f", value: 0, section: 1, storageClass: 2, naux: 0, auxScnLen: 0, auxNReloc: 0 }]
+  let built = prFixBuild(sections, symbols, []PrFixReloc(0))
+  assert(prErr(built.bytes) == "")
+  let m = readCoffObject("u.obj", built.bytes) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  assert(len(m.atoms) == 1)
+  assert(prAtomNamed(m, "f") >= 0)
+  assert(prAtomNamed(m, ".pdata") == -1)
+  assert(prAtomNamed(m, ".xdata") == -1)
+  assert(prAtomNamed(m, ".debug$S") == -1)
+}
+
+// Truncated header, wrong machine, a full PE image mistaken for an object,
+// a section's raw data past EOF, and — the required mutation test — a
+// relocation Type field perturbed to an unsupported value after a byte-exact
+// good parse, proving the check is load-bearing rather than vacuous.
+fn checkPeReaderRejects() {
+  let sections = [PrFixSection{ name: ".text", chars: 0x60500020, data: []u8(4), size: 4, hasFileData: true }]
+  let symbols = [PrFixSymbolRaw{ isAux: false, name: "f", value: 0, section: 1, storageClass: 2, naux: 0, auxScnLen: 0, auxNReloc: 0 }]
+  let relocSyms = [symbols[0], PrFixSymbolRaw{ isAux: false, name: "ext", value: 0, section: 0, storageClass: 2, naux: 0, auxScnLen: 0, auxNReloc: 0 }]
+  let relocs = [PrFixReloc{ sectionIdx: 0, offset: 0, symRawIndex: 1, rtype: 4 }]
+  let built = prFixBuild(sections, relocSyms, relocs)
+  let good = built.bytes
+  assert(prErr(good) == "")
+
+  // Too short to hold a header.
+  assert(prErr([u8(0x64), u8(0x86), u8(0), u8(0)]) == "Truncated")
+
+  // Wrong machine (0x14c = IMAGE_FILE_MACHINE_I386): COFF has no separate
+  // magic, so this is also how "not a COFF object at all" is caught.
+  let wm = []u8(0)
+  let i = 0
+  while (i < len(good)) {
+    wm = append(wm, good[i])
+    i = i + 1
+  }
+  wm[0] = u8(0x4c)
+  wm[1] = u8(0x01)
+  assert(prErr(wm) == "UnsupportedCoff")
+
+  // SizeOfOptionalHeader != 0: a full PE image, not a relocatable object.
+  let img = []u8(0)
+  i = 0
+  while (i < len(good)) {
+    img = append(img, good[i])
+    i = i + 1
+  }
+  img[16] = u8(0xf0)
+  assert(prErr(img) == "UnsupportedCoff")
+
+  // Section data past EOF: inflate .text's SizeOfRawData without extending
+  // the file.
+  let eof = []u8(0)
+  i = 0
+  while (i < len(good)) {
+    eof = append(eof, good[i])
+    i = i + 1
+  }
+  let sizeOff = prSizeofHeader() + 16 // .text's SizeOfRawData field
+  assert(leAt(eof, sizeOff, 4) == 4)
+  eof[sizeOff] = u8(255)
+  eof[sizeOff + 1] = u8(255)
+  assert(prErr(eof) == "Truncated")
+
+  // Mutation test: an unmutated object parses clean (asserted above via
+  // `good`); flipping the sole relocation's Type field from REL32 (4) to an
+  // unhandled value must now fail, proving prRelocKind's check actually runs.
+  let mut = []u8(0)
+  i = 0
+  while (i < len(good)) {
+    mut = append(mut, good[i])
+    i = i + 1
+  }
+  let relTypeOff = built.relocOff[0] + 8
+  assert(leAt(mut, relTypeOff, 2) == 4)
+  mut[relTypeOff] = u8(99)
+  assert(prErr(mut) == "UnsupportedRelocation")
+  mut[relTypeOff] = u8(4) // restore: confirms the fixture itself was sound
+  assert(prErr(mut) == "")
+}
