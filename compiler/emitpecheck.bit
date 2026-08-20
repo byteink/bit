@@ -1,0 +1,368 @@
+// In-Bit self-checks for the PE/COFF relocatable object writer (#3325).
+// Follows elfcheck.bit's pattern: parse the writer's own output back with
+// direct byte-offset reads, so a regression in the byte layout — not just in
+// whether `writePeObject` returns an error — fails the build.
+//
+// Helper names are prefixed `pec` (PE Check), distinct from whatever
+// pereader.bit (#3326, a real production COFF reader for the linker) ends up
+// calling its own helpers — both land in the same flat compiler module, and
+// these are private, throwaway byte-pokes for this file alone.
+
+// The message writePeObject failed with, or "" if it succeeded.
+fn pecErr(t: PeTarget, obj: PeObject): string {
+  let msg = ""
+  let b = writePeObject(t, obj) catch e {
+    msg = e.message()
+    []u8(0)
+  }
+  return msg
+}
+
+fn pecBytes(t: PeTarget, obj: PeObject): []u8 {
+  return writePeObject(t, obj) catch e { []u8(0) }
+}
+
+// The NUL-terminated (or full 8-byte) name in a symbol/section's inline Name
+// field.
+fn pecName8At(b: []u8, off: int): string {
+  let out = []u8(0)
+  let i = 0
+  while (i < 8 && b[off + i] != u8(0)) {
+    out = append(out, b[off + i])
+    i = i + 1
+  }
+  return string(out)
+}
+
+// Section header table entry `i`'s byte offset. Unlike ELF's e_shoff, this
+// is a fixed formula: COFF's section table always starts immediately after
+// the fixed-size file header, never patched or relocated.
+fn pecShdrAt(i: int): int {
+  return sizeofPeFileHeader() + i * sizeofPeSectionHeader()
+}
+
+// The index of the section header named `name`, or -1.
+fn pecFindSection(b: []u8, name: string): int {
+  let n = leAt(b, 2, 2)
+  let i = 0
+  while (i < n) {
+    if (pecName8At(b, pecShdrAt(i)) == name) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+fn checkPeMinimal() {
+  // push rbp; mov rbp,rsp; pop rbp; ret
+  let code = [u8(0x55), u8(0x48), u8(0x89), u8(0xE5), u8(0x5D), u8(0xC3)]
+  let obj = PeObject{
+    sections: [PeSection{ kind: PeSectionKind.Text, data: code, size: 0,
+      alignment: 16 }],
+    symbols: [PeSymbol{ name: "main", hasSection: true,
+      section: PeSectionKind.Text, offset: 0, size: len(code),
+      binding: PeBinding.Global, kind: PeSymKind.Func }],
+    relocations: []PeRelocation(0) }
+  assert(pecErr(PeTarget.X86_64, obj) == "") // a valid object is not rejected
+  let b = pecBytes(PeTarget.X86_64, obj)
+
+  assert(leAt(b, 0, 2) == 0x8664) // Machine: IMAGE_FILE_MACHINE_AMD64
+  assert(leAt(b, 2, 2) == 1)      // NumberOfSections
+  assert(leAt(b, 16, 2) == 0)     // SizeOfOptionalHeader: 0 for an object file
+  assert(leAt(b, 18, 2) == 0)     // Characteristics
+
+  let ti = pecFindSection(b, ".text")
+  assert(ti == 0)
+  let th = pecShdrAt(ti)
+  assert(leAt(b, th + 16, 4) == len(code)) // SizeOfRawData
+  assert(leAt(b, th + 36, 4) == (0x60000020 | (5 << 20))) // CODE|EXECUTE|READ, ALIGN_16BYTES
+  let off = leAt(b, th + 20, 4) // PointerToRawData
+  assert(off % 16 == 0)         // the writer honoured the alignment
+  let i = 0
+  while (i < len(code)) {
+    assert(b[off + i] == code[i])
+    i = i + 1
+  }
+
+  // .symtab: one entry, "main" as a global function symbol in section 1.
+  let symtabOff = leAt(b, 8, 4)  // PointerToSymbolTable
+  assert(symtabOff > 0)
+  assert(leAt(b, 12, 4) == 1)    // NumberOfSymbols
+  assert(pecName8At(b, symtabOff) == "main")
+  assert(leAt(b, symtabOff + 8, 4) == 0)     // Value
+  assert(leAt(b, symtabOff + 12, 2) == 1)    // SectionNumber: 1-based, .text is #1
+  assert(leAt(b, symtabOff + 14, 2) == 0x0020) // complex FUNCTION | base NULL
+  assert(b[symtabOff + 16] == u8(2))         // IMAGE_SYM_CLASS_EXTERNAL
+  assert(b[symtabOff + 17] == u8(0))         // NumberOfAuxSymbols
+}
+
+fn checkPeFull() {
+  // push rbp; mov rbp,rsp; call rel32 (placeholder); pop rbp; ret
+  let code = [u8(0x55), u8(0x48), u8(0x89), u8(0xE5), u8(0xE8), u8(0), u8(0),
+    u8(0), u8(0), u8(0x5D), u8(0xC3)]
+  let rodata = []byte("hello\n")
+  let dataPtr = []u8(8) // one 8-byte pointer slot in .data
+  // 12 bytes, not 8: leaves the write cursor 4 past an 8-boundary, so the
+  // relocation run that follows can only land where expected if the writer's
+  // layout pass is self-consistent with what it actually emits.
+  let gcMeta = []u8(12)
+  let longName = "a_very_long_bit_pe_function_name" // >8 bytes: /offset form
+  let obj = PeObject{
+    sections: [
+      PeSection{ kind: PeSectionKind.Text, data: code, size: 0, alignment: 16 },
+      PeSection{ kind: PeSectionKind.Data, data: dataPtr, size: 0, alignment: 8 },
+      PeSection{ kind: PeSectionKind.Rodata, data: rodata, size: 0, alignment: 1 },
+      // Stray data on a .bss section: the contract says a section with no
+      // file bytes has its size come from `size`, so the writer must ignore
+      // `data` outright — passing junk here is what makes that testable.
+      PeSection{ kind: PeSectionKind.Bss, data: []u8(32), size: 64, alignment: 8 },
+      PeSection{ kind: PeSectionKind.GcMeta, data: gcMeta, size: 0, alignment: 8 }],
+    symbols: [
+      PeSymbol{ name: longName, hasSection: true, section: PeSectionKind.Text,
+        offset: 0, size: len(code), binding: PeBinding.Global, kind: PeSymKind.Func },
+      PeSymbol{ name: "bit_rt_alloc", hasSection: false, section: PeSectionKind.Text,
+        offset: 0, size: 0, binding: PeBinding.Global, kind: PeSymKind.Notype },
+      PeSymbol{ name: "msg", hasSection: true, section: PeSectionKind.Rodata,
+        offset: 0, size: len(rodata), binding: PeBinding.Local, kind: PeSymKind.Object },
+      PeSymbol{ name: "vt", hasSection: true, section: PeSectionKind.Data,
+        offset: 0, size: 8, binding: PeBinding.Global, kind: PeSymKind.Object }],
+    relocations: [
+      PeRelocation{ section: PeSectionKind.Text, offset: 5, symbol: "bit_rt_alloc",
+        kind: PeRelocKind.Rel32 },
+      PeRelocation{ section: PeSectionKind.Data, offset: 0, symbol: "msg",
+        kind: PeRelocKind.Addr64 }] }
+  assert(pecErr(PeTarget.X86_64, obj) == "")
+  let b = pecBytes(PeTarget.X86_64, obj)
+  assert(leAt(b, 0, 2) == 0x8664)
+  assert(leAt(b, 2, 2) == 5) // 5 sections present
+
+  // Every real section is present with its expected characteristics.
+  let ti = pecFindSection(b, ".text")
+  let dii = pecFindSection(b, ".data")
+  let ri = pecFindSection(b, ".rdata")
+  let bi = pecFindSection(b, ".bss")
+  let gi = pecFindSection(b, ".bit_gc")
+  assert(ti >= 0 && dii >= 0 && ri >= 0 && bi >= 0 && gi >= 0)
+  assert((leAt(b, pecShdrAt(ti) + 36, 4) & 0x60000020) == 0x60000020) // text: CODE|EXECUTE|READ
+  assert((leAt(b, pecShdrAt(dii) + 36, 4) & 0xC0000040) == 0xC0000040) // data: INIT|READ|WRITE
+  assert((leAt(b, pecShdrAt(ri) + 36, 4) & 0x40000040) == 0x40000040) // rdata: INIT|READ, not WRITE
+  assert((leAt(b, pecShdrAt(ri) + 36, 4) & 0x80000000) == 0) // rdata is never writable
+  assert((leAt(b, pecShdrAt(bi) + 36, 4) & 0xC0000080) == 0xC0000080) // bss: UNINIT|READ|WRITE
+
+  // .bss occupies no file bytes: SizeOfRawData is honoured, PointerToRawData
+  // is untouched by its 64-byte size, and the following section (.bit_gc)
+  // was not shoved along by it.
+  let bh = pecShdrAt(bi)
+  assert(leAt(b, bh + 16, 4) == 64) // SizeOfRawData
+  let gh = pecShdrAt(gi)
+  assert(leAt(b, gh + 20, 4) - leAt(b, bh + 20, 4) < 8) // within one alignment step
+
+  // Every section's PointerToRawData is a multiple of its own alignment.
+  let n = leAt(b, 2, 2)
+  let sx = 0
+  while (sx < n) {
+    let hh = pecShdrAt(sx)
+    let chars = leAt(b, hh + 36, 4)
+    let nibble = (chars >> 20) & 15
+    if (nibble > 1) {
+      let alignment = 1 << (nibble - 1)
+      let poff = leAt(b, hh + 20, 4)
+      if (poff > 0) {
+        assert(poff % alignment == 0)
+      }
+    }
+    sx = sx + 1
+  }
+
+  // .text: one REL32 relocation against bit_rt_alloc.
+  let th = pecShdrAt(ti)
+  assert(leAt(b, th + 32, 2) == 1) // NumberOfRelocations
+  let trelOff = leAt(b, th + 24, 4)
+  assert(leAt(b, trelOff, 4) == 5)       // VirtualAddress: the reloc's own offset
+  assert(leAt(b, trelOff + 8, 2) == 0x0004) // IMAGE_REL_AMD64_REL32
+  let symtabOff = leAt(b, 8, 4)
+  let tsym = leAt(b, trelOff + 4, 4) // SymbolTableIndex
+  // "bit_rt_alloc" is 12 bytes, itself >8, so it too uses the long-name form.
+  assert(pecName8At(b, symtabOff + tsym * sizeofPeSymbol()) == "")
+  assert(leAt(b, symtabOff + tsym * sizeofPeSymbol() + 12, 2) == 0) // SHN_UNDEF
+
+  // .data: one ADDR64 relocation against msg.
+  let dh = pecShdrAt(dii)
+  assert(leAt(b, dh + 32, 2) == 1)
+  let drelOff = leAt(b, dh + 24, 4)
+  assert(leAt(b, drelOff + 8, 2) == 0x0001) // IMAGE_REL_AMD64_ADDR64
+  let dsym = leAt(b, drelOff + 4, 4)
+  assert(pecName8At(b, symtabOff + dsym * sizeofPeSymbol()) == "msg")
+
+  // Every symbol table entry is resolvable, including the long-name one via
+  // the string table's /offset form (COFF's binary variant: 4 zero bytes
+  // then a 4-byte offset, rather than a literal '/' + digits).
+  let nsyms = leAt(b, 12, 4)
+  let strtabOff = symtabOff + nsyms * sizeofPeSymbol()
+  let strtabLen = leAt(b, strtabOff, 4)
+  assert(strtabLen > 4) // at least one name spilled into it
+
+  // `longName` is symbols[0] by construction: check its long-name form
+  // directly, by known index, rather than scanning for "the" long-name
+  // entry — `bit_rt_alloc` is also >8 bytes and legitimately uses the same
+  // form, so more than one entry may.
+  let longOff = symtabOff // index 0
+  assert(leAt(b, longOff, 4) == 0) // the long-name marker: 4 zero bytes
+  let longStrOff = leAt(b, longOff + 4, 4)
+  assert(longStrOff >= 4 && longStrOff < strtabLen)
+  assert(pecStrAt(b, strtabOff, longStrOff) == longName)
+
+  let si = 0
+  while (si < nsyms) {
+    let sOff = symtabOff + si * sizeofPeSymbol()
+    let secNum = leAt(b, sOff + 12, 2)
+    // SHN_UNDEF (external) or a real 1-based section number within range —
+    // every symbol resolves to something the object actually defines.
+    assert(secNum == 0 || (secNum >= 1 && secNum <= n))
+    si = si + 1
+  }
+}
+
+// The NUL-terminated string at `strOff` within the string table starting at
+// `strtabOff`.
+fn pecStrAt(b: []u8, strtabOff: int, strOff: int): string {
+  let out = []u8(0)
+  let i = strtabOff + strOff
+  while (i < len(b) && b[i] != u8(0)) {
+    out = append(out, b[i])
+    i = i + 1
+  }
+  return string(out)
+}
+
+// ARM64 relocations: BRANCH26/PAGEBASE_REL21/PAGEOFFSET_12A/ADDR64 all
+// encode with the type numbers transcribed from std.coff's IMAGE.REL.ARM64.
+fn checkPeArm64() {
+  // adrp x1, msg ; add x1, x1, msg ; bl callee
+  let code = [u8(0x01), u8(0x00), u8(0x00), u8(0x90), u8(0x21), u8(0x00),
+    u8(0x00), u8(0x91), u8(0x00), u8(0x00), u8(0x00), u8(0x94)]
+  let ptr = []u8(8)
+  let obj = PeObject{
+    sections: [
+      PeSection{ kind: PeSectionKind.Text, data: code, size: 0, alignment: 4 },
+      PeSection{ kind: PeSectionKind.Data, data: ptr, size: 0, alignment: 8 },
+      PeSection{ kind: PeSectionKind.Rodata, data: []byte("msg1"), size: 0, alignment: 4 }],
+    symbols: [
+      PeSymbol{ name: "start", hasSection: true, section: PeSectionKind.Text,
+        offset: 0, size: len(code), binding: PeBinding.Global, kind: PeSymKind.Func },
+      PeSymbol{ name: "msg", hasSection: true, section: PeSectionKind.Rodata,
+        offset: 0, size: 4, binding: PeBinding.Local, kind: PeSymKind.Object },
+      PeSymbol{ name: "callee", hasSection: false, section: PeSectionKind.Text,
+        offset: 0, size: 0, binding: PeBinding.Global, kind: PeSymKind.Notype },
+      PeSymbol{ name: "vt", hasSection: true, section: PeSectionKind.Data,
+        offset: 0, size: 8, binding: PeBinding.Global, kind: PeSymKind.Object }],
+    relocations: [
+      PeRelocation{ section: PeSectionKind.Text, offset: 0, symbol: "msg",
+        kind: PeRelocKind.PageBaseRel21 },
+      PeRelocation{ section: PeSectionKind.Text, offset: 4, symbol: "msg",
+        kind: PeRelocKind.PageOffset12A },
+      PeRelocation{ section: PeSectionKind.Text, offset: 8, symbol: "callee",
+        kind: PeRelocKind.Branch26 },
+      PeRelocation{ section: PeSectionKind.Data, offset: 0, symbol: "msg",
+        kind: PeRelocKind.Addr64 }] }
+  assert(pecErr(PeTarget.Aarch64, obj) == "")
+  let b = pecBytes(PeTarget.Aarch64, obj)
+  assert(leAt(b, 0, 2) == 0xAA64) // IMAGE_FILE_MACHINE_ARM64
+
+  let ti = pecFindSection(b, ".text")
+  let th = pecShdrAt(ti)
+  assert(leAt(b, th + 32, 2) == 3) // NumberOfRelocations
+  let relOff = leAt(b, th + 24, 4)
+  assert(leAt(b, relOff + 8, 2) == 0x0004)               // PAGEBASE_REL21
+  assert(leAt(b, relOff + sizeofPeReloc() + 8, 2) == 0x0006)     // PAGEOFFSET_12A
+  assert(leAt(b, relOff + 2 * sizeofPeReloc() + 8, 2) == 0x0003) // BRANCH26
+
+  let symtabOff = leAt(b, 8, 4)
+  let calleeIdx = leAt(b, relOff + 2 * sizeofPeReloc() + 4, 4)
+  assert(pecName8At(b, symtabOff + calleeIdx * sizeofPeSymbol()) == "callee")
+  assert(leAt(b, symtabOff + calleeIdx * sizeofPeSymbol() + 12, 2) == 0) // SHN_UNDEF
+
+  let di = pecFindSection(b, ".data")
+  let dh = pecShdrAt(di)
+  assert(leAt(b, dh + 32, 2) == 1)
+  let drelOff = leAt(b, dh + 24, 4)
+  assert(leAt(b, drelOff + 8, 2) == 0x000E) // IMAGE_REL_ARM64_ADDR64
+}
+
+fn checkPeRejects() {
+  let code = [u8(0), u8(0), u8(0), u8(0)]
+  let text = PeSection{ kind: PeSectionKind.Text, data: code, size: 0, alignment: 1 }
+  let noRelocs = []PeRelocation(0)
+
+  assert(pecErr(PeTarget.X86_64, PeObject{
+    sections: [text, PeSection{ kind: PeSectionKind.Text, data: code, size: 0, alignment: 1 }],
+    symbols: []PeSymbol(0), relocations: noRelocs }) == "DuplicateSection")
+
+  assert(pecErr(PeTarget.X86_64, PeObject{
+    sections: [PeSection{ kind: PeSectionKind.Text, data: code, size: 0, alignment: 3 }],
+    symbols: []PeSymbol(0), relocations: noRelocs }) == "InvalidSectionAlignment")
+
+  // Above COFF's largest encodable section alignment (8192 bytes).
+  assert(pecErr(PeTarget.X86_64, PeObject{
+    sections: [PeSection{ kind: PeSectionKind.Text, data: code, size: 0, alignment: 16384 }],
+    symbols: []PeSymbol(0), relocations: noRelocs }) == "InvalidSectionAlignment")
+
+  // Nothing can ever define an undefined local, so the binding is meaningless.
+  assert(pecErr(PeTarget.X86_64, PeObject{
+    sections: []PeSection(0),
+    symbols: [PeSymbol{ name: "hidden", hasSection: false, section: PeSectionKind.Text,
+      offset: 0, size: 0, binding: PeBinding.Local, kind: PeSymKind.Notype }],
+    relocations: noRelocs }) == "UndefinedLocalSymbol")
+
+  // A symbol naming a section this object does not carry.
+  assert(pecErr(PeTarget.X86_64, PeObject{ sections: [text],
+    symbols: [PeSymbol{ name: "d", hasSection: true, section: PeSectionKind.Data,
+      offset: 0, size: 0, binding: PeBinding.Global, kind: PeSymKind.Object }],
+    relocations: noRelocs }) == "SectionNotPresent")
+
+  // offset + size must fit inside the section.
+  assert(pecErr(PeTarget.X86_64, PeObject{ sections: [text],
+    symbols: [PeSymbol{ name: "big", hasSection: true, section: PeSectionKind.Text,
+      offset: 0, size: 99, binding: PeBinding.Global, kind: PeSymKind.Func }],
+    relocations: noRelocs }) == "SymbolOutOfBounds")
+
+  let dup = PeSymbol{ name: "same", hasSection: true, section: PeSectionKind.Text,
+    offset: 0, size: 4, binding: PeBinding.Global, kind: PeSymKind.Func }
+  assert(pecErr(PeTarget.X86_64, PeObject{ sections: [text],
+    symbols: [dup, dup], relocations: noRelocs }) == "DuplicateSymbol")
+
+  assert(pecErr(PeTarget.X86_64, PeObject{ sections: [text],
+    symbols: []PeSymbol(0),
+    relocations: [PeRelocation{ section: PeSectionKind.Text, offset: 0,
+      symbol: "nope", kind: PeRelocKind.Rel32 }] }) == "UnknownSymbol")
+
+  // A 4-byte Rel32 at offset 2 needs [2..6) of a 4-byte section.
+  assert(pecErr(PeTarget.X86_64, PeObject{ sections: [text],
+    symbols: [dup],
+    relocations: [PeRelocation{ section: PeSectionKind.Text, offset: 2,
+      symbol: "same", kind: PeRelocKind.Rel32 }] }) == "RelocOutOfBounds")
+
+  // An 8-byte Addr64 at offset 0 does not fit a 4-byte section either — the
+  // width comes from the KIND, not the field's start.
+  assert(pecErr(PeTarget.X86_64, PeObject{ sections: [text],
+    symbols: [dup],
+    relocations: [PeRelocation{ section: PeSectionKind.Text, offset: 0,
+      symbol: "same", kind: PeRelocKind.Addr64 }] }) == "RelocOutOfBounds")
+
+  // Each ARM64-only kind has no x86-64 encoding, and Rel32 has no ARM64 one.
+  assert(pecErr(PeTarget.X86_64, PeObject{ sections: [text],
+    symbols: [dup],
+    relocations: [PeRelocation{ section: PeSectionKind.Text, offset: 0,
+      symbol: "same", kind: PeRelocKind.Branch26 }] }) == "RelocKindUnsupportedForTarget")
+  assert(pecErr(PeTarget.Aarch64, PeObject{ sections: [text],
+    symbols: [dup],
+    relocations: [PeRelocation{ section: PeSectionKind.Text, offset: 0,
+      symbol: "same", kind: PeRelocKind.Rel32 }] }) == "RelocKindUnsupportedForTarget")
+
+  // A valid object with a resolvable relocation reports no error.
+  assert(pecErr(PeTarget.X86_64, PeObject{ sections: [text],
+    symbols: [dup],
+    relocations: [PeRelocation{ section: PeSectionKind.Text, offset: 0,
+      symbol: "same", kind: PeRelocKind.Rel32 }] }) == "")
+}
