@@ -395,7 +395,7 @@ line-1 directive selects the mode — `// run` (execute, compare stdout),
 
 **What the differentials assert.** The fifteen `scripts/selfhost-diff*.sh` once
 diffed a separately-implemented bootstrap compiler against the Bit compiler, so
-green meant "two independent implementations agree". The oracle is now the
+a green diff meant the two disagreed on nothing. The oracle is now the
 pinned stage0 — the same compiler one release back — so green means "this
 version did not change behaviour versus the last release". **That cannot catch
 a bug present in both.**
