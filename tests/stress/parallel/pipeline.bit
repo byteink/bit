@@ -1,0 +1,173 @@
+// Three-stage producer/consumer pipeline (#2536, epic #1253): W producers ->
+// (channel A, capacity 32) -> W mappers -> (channel B, capacity 32) -> one
+// consumer. `STRESS_WORKERS` sizes W (default 8); the real parallelism knob
+// is the runtime's `BIT_WORKERS`, set by whoever runs this file.
+//
+// STAGE 2 IS DELIBERATELY THE SLOW STAGE. Each producer sends as fast as it
+// can (a bare `out <- v`); each mapper burns a fixed slice of CPU per item
+// before sending its result on. With W producers racing into a 32-slot
+// channel A and W mappers throttled below them, aggregate stage-2 throughput
+// sits under aggregate stage-1 throughput by construction, so A is driven to
+// capacity and every producer blocks on it at least once. Completing without
+// deadlocking under real backpressure is the property this program exists to
+// exercise — "it completed" alone would not distinguish this from a pipeline
+// with no backpressure handling at all.
+//
+// THE CHECK IS EXACTLY-ONCE, NOT JUST A CHECKSUM. The consumer inverts each
+// mapped value back to its producer-side original (`v = 2*orig+1`) and counts
+// how many times each of the `totalItems` originals was seen. A correct run
+// sees every original exactly once; a lost item leaves a zero, a duplicated
+// or corrupted one leaves something other than one. `total`/`count` (the
+// literal ticket acceptance: sum of `i*2+1` for i in 0..totalItems-1, which
+// is the closed form `totalItems^2`, the sum of the first `totalItems` odd
+// numbers) is kept as a second, independent check.
+//
+// SHUTDOWN: each stage stops on a closed channel via `let (v, ok) = <- c`
+// (SPEC §16.2), never on a counted loop — a receiver cannot know in advance
+// how many items its senders will produce. Only a sending side ever closes a
+// channel (SPEC §16.2), and channel A/B each have multiple concurrent
+// senders (the W producers, the W mappers), so neither can close its own
+// channel directly: a dedicated closer task waits on the corresponding
+// `WaitGroup` for every sender of that channel to finish, then closes it
+// once. That is what turns "N senders" into the one closer §16.2 requires.
+//
+// BOUNDED BY CONSTRUCTION: every loop below is bounded by `totalItems` or by
+// a worker count read once at startup, so a hang is a real defect, not this
+// program's expected behavior — nothing here is allowed to block forever.
+
+import { newWaitGroup, WaitGroup } from "std/sync"
+import { trimSpace, parseInt } from "std/strings"
+
+const totalItems: int = 200000
+const chanCap: int = 32
+const defaultWorkers: int = 8
+
+// Tuned to be cheap in aggregate (W mappers x totalItems/W items each) while
+// still dominating a bare channel send, so stage 2 is reliably the bottleneck.
+const mapSpin: int = 80
+
+struct PipeResult { count: int, total: int, bad: int }
+
+// A pure-looking loop the compiler cannot prove has no observable effect: `i`
+// is the loop's own live control value, so the iterations happen regardless
+// of what the optimizer does to `acc`.
+fn burn(n: int): int {
+  let acc = 0
+  let i = 0
+  while (i < n) {
+    acc = acc + i
+    i = i + 1
+  }
+  return acc
+}
+
+// Stage 1. `lo..hi` (half-open) is this producer's disjoint share of
+// `0..totalItems-1`; together all producers cover the whole range exactly
+// once.
+fn produce(lo: int, hi: int, out: chan<int>, wg: WaitGroup) {
+  let v = lo
+  while (v < hi) {
+    out <- v
+    v = v + 1
+  }
+  wg.done()
+}
+
+// Stage 2. Reads until `A` is closed and drained, maps `v -> v*2+1`, sends on
+// `B`. `burn` is the deliberate slow-down described above.
+fn mapStage(inCh: chan<int>, outCh: chan<int>, wg: WaitGroup) {
+  while (true) {
+    let (v, ok) = <- inCh
+    if (!ok) { break }
+    burn(mapSpin)
+    outCh <- v * 2 + 1
+  }
+  wg.done()
+}
+
+// One closer per fan-in channel: waits for every one of that channel's
+// senders to finish, then performs the single permitted close.
+fn closeWhenDone(wg: WaitGroup, ch: chan<int>) {
+  wg.wait()
+  close(ch)
+}
+
+// Stage 3, the single consumer. Reads until `B` is closed and drained,
+// inverts each mapped value back to its stage-1 original, and marks it seen
+// exactly once in `seen`. Single-threaded by construction (one consumer), so
+// `seen` needs no synchronization.
+fn consume(inCh: chan<int>, out: chan<PipeResult>) {
+  let seen = []int(totalItems)
+  let count = 0
+  let total = 0
+  let bad = 0
+  while (true) {
+    let (v, ok) = <- inCh
+    if (!ok) { break }
+    count = count + 1
+    total = total + v
+    let orig = (v - 1) / 2
+    if (orig < 0 || orig >= totalItems || v != orig * 2 + 1) {
+      bad = bad + 1
+    } else {
+      seen[orig] = seen[orig] + 1
+    }
+  }
+  let i = 0
+  while (i < totalItems) {
+    if (seen[i] != 1) { bad = bad + 1 }
+    i = i + 1
+  }
+  out <- PipeResult{ count: count, total: total, bad: bad }
+}
+
+fn reportFail(label: string, want: int, got: int) {
+  print("pipeline FAIL want=${want} got=${got} (${label})\n")
+  osExit(1)
+}
+
+fn main() {
+  let rawWorkers = trimSpace(osEnv("STRESS_WORKERS"))
+  let w = defaultWorkers
+  if (len(rawWorkers) > 0) {
+    w = parseInt(rawWorkers) catch e { -1 }
+    if (w <= 0) {
+      print("pipeline FAIL want=positive-int got=${rawWorkers} (STRESS_WORKERS)\n")
+      osExit(1)
+    }
+  }
+
+  let chanA = chan<int>(chanCap)
+  let chanB = chan<int>(chanCap)
+
+  let pwg = newWaitGroup()
+  pwg.add(i64(w))
+  let i = 0
+  while (i < w) {
+    let lo = (totalItems * i) / w
+    let hi = (totalItems * (i + 1)) / w
+    spawn produce(lo, hi, chanA, pwg)
+    i = i + 1
+  }
+  spawn closeWhenDone(pwg, chanA)
+
+  let mwg = newWaitGroup()
+  mwg.add(i64(w))
+  let j = 0
+  while (j < w) {
+    spawn mapStage(chanA, chanB, mwg)
+    j = j + 1
+  }
+  spawn closeWhenDone(mwg, chanB)
+
+  let resultCh = chan<PipeResult>(1)
+  spawn consume(chanB, resultCh)
+
+  let res = <- resultCh
+  if (res.count != totalItems) { reportFail("count", totalItems, res.count) }
+  let wantTotal = totalItems * totalItems
+  if (res.total != wantTotal) { reportFail("total", wantTotal, res.total) }
+  if (res.bad != 0) { reportFail("exactly-once", 0, res.bad) }
+
+  print("pipeline OK\n")
+}
