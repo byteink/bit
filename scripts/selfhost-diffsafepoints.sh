@@ -410,11 +410,10 @@ fi
 # signature of the reverted bug for this fixture — not a heuristic.
 instcheck() { # $1=compiler $2=outobj -> prints verdict; sets $INSTCHECK_RC (0 pass, 1 fail, 2 could-not-decide)
   local fixture="tests/cases/run_generic_call_via_param.bit" calls rc
-  rm -f "$2"
-  alarmrun "$1" build "$fixture" --emit-obj -o "$2" >/dev/null 2>&1
+  build_retried "$1" "$2" build "$fixture" --emit-obj -o "$2"
   rc=$?
   if [ "$rc" -eq 142 ]; then
-    echo "instcheck: build timed out after ${TIMEOUT}s: $fixture" >&2
+    echo "instcheck: build timed out after ${TIMEOUT}s: $fixture (twice)" >&2
     INSTCHECK_RC=2
     return
   fi
