@@ -271,6 +271,30 @@ discovered 1 test, ran 1: 1 passed, 0 failed
 
 A failing assertion prints the values it compared, not just that it failed.
 
+## What checks the compiler
+
+Bit's compiler is written in Bit and compiles itself. Every release is
+checked against the previous release of the same compiler by a suite of
+differential tests - not against a second, independently written
+implementation - so a green run means this release produced the same
+tokens, types and generated code as the last one, not that either is
+correct. That distinction is not theoretical: a miscompile once shipped
+silently in every release for months, on every platform, invisible to all
+of these differentials because the new compiler and the reference release
+shared the same bug; it was found only by comparing Bit's output against a
+C compiler on the same program. Reaching a 1.0 release needs an oracle that
+does not depend on comparing against a shared history, so the project's
+answer is fuzzing that checks the compiler's own invariants directly - for
+example, that two optimization levels or two target architectures agree on
+the same program's behavior. Separately, the project's build is designed
+to be reproducible: rebuilding a release from its published source should
+yield a bit-identical binary, and the maintainers already run that rebuild
+on separate machines they control as one check that the shipped binary
+matches the published source. That check proves the binary matches its
+source, not that the source is correct, and it does not catch a starting
+compiler that was compromised before publication, since every rebuild
+still starts from the same published binary.
+
 ## Where to next
 
 - [Language reference](reference/README.md) - types, functions, interfaces,
