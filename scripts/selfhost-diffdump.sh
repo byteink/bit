@@ -99,6 +99,8 @@ CORPUS="stdlib examples tests/cases tests/imports"
 . "${ROOT}/scripts/alarmrun.sh"
 # shellcheck source=scripts/selfhost-ir-signatures.sh
 . "${ROOT}/scripts/selfhost-ir-signatures.sh"
+# shellcheck source=scripts/diffexit.sh
+. "${ROOT}/scripts/diffexit.sh"
 
 NAME="${1:?usage: selfhost-diffdump.sh <ast|tokens|diags|types|ir|iropt>}"
 
@@ -347,20 +349,9 @@ run_basic() {
   if [ -n "$firstbad" ]; then
     echo "first divergence: $firstbad"
     diff <(alarmrun "$ORACLE" "$FLAG" "$firstbad") <(alarmrun "$BIT2" "$FLAG" "$firstbad") | head -20
-    exit 1
   fi
 
-  # A timeout decided nothing -- those files were never differentially
-  # compared, so the run cannot be called green, but it is not a divergence
-  # either. Exit 2 (could-not-decide) keeps it visible without claiming a
-  # divergence that was never observed.
-  if [ "$timeout" -gt 0 ]; then
-    echo "UNDECIDED: $timeout file(s) timed out after ${TIMEOUT}s on one side and were NOT compared."
-    echo "           This is not a pass. Re-run on a quieter host, or raise the timeout."
-    exit 2
-  fi
-
-  exit 0
+  diffexit "$LABEL" -f "$mismatch" -t "file(s)=$timeout"
 }
 
 # types row body: a timeout is not evidence — a bit killed by the alarm produced
@@ -413,7 +404,6 @@ run_types() {
   oracletimeouts=$(wc -l <"$work/oracletimeout" | tr -d ' ')
   echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeouts ORACLE-TIMEOUT=$oracletimeouts SKIP($SKIPLABEL)=$skip"
 
-  status=0
   if [ -s "$work/mismatch" ]; then
     echo
     # EVERY divergence, named. "first divergence" told you one file out of n and
@@ -425,20 +415,6 @@ run_types() {
       echo "--- diff (seed vs bit): $f"
       diff <(alarmrun "$ORACLE" "$FLAG" "$f") <(alarmrun "$BIT2" "$FLAG" "$f") | head -12
     done
-    status=1
-  fi
-
-  # A real divergence wins over an undecided count: any observed mismatch is
-  # evidence, regardless of how many files elsewhere also timed out (#3379,
-  # matches the family convention restored in selfhost-diffsafepoints.sh
-  # #3351 and selfhost-diffdump.sh's own run_basic() #3378). A PURE timeout —
-  # zero mismatches — decided nothing, so it is exit 2 (could-not-decide),
-  # not exit 1 (the same code a real MISMATCH uses).
-  if [ -s "$work/timeout" ]; then
-    echo
-    echo "INVALID: $timeouts file(s) timed out after ${TIMEOUT}s — no verdict, not a match:"
-    while read -r f; do echo "  timeout: $f"; done <"$work/timeout"
-    [ "$status" -eq 0 ] && status=2
   fi
 
   # Reported apart from BIT2's timeout because it means something different: the
@@ -448,18 +424,25 @@ run_types() {
     echo
     echo "INVALID: the pinned stage0 HUNG on $oracletimeouts file(s) — corpus reduced, not verified:"
     while read -r f; do echo "  $f"; done <"$work/oracletimeout"
-    [ "$status" -eq 0 ] && status=2
   fi
 
-  if [ "$status" -eq 0 ]; then
+  if [ -s "$work/timeout" ]; then
+    echo
+    echo "INVALID: $timeouts file(s) timed out after ${TIMEOUT}s — no verdict, not a match:"
+    while read -r f; do echo "  timeout: $f"; done <"$work/timeout"
+  fi
+
+  # A real divergence wins over an undecided count: any observed mismatch is
+  # evidence, regardless of how many files elsewhere also timed out (#3379,
+  # matches the family convention restored in selfhost-diffsafepoints.sh
+  # #3351 and selfhost-diffdump.sh's own run_basic() #3378). A PURE timeout —
+  # zero mismatches — decided nothing, so it is could-not-decide (2), not the
+  # same code a real MISMATCH uses (1).
+  if [ "$mismatch" -eq 0 ] && [ "$timeouts" -eq 0 ] && [ "$oracletimeouts" -eq 0 ]; then
     echo
     echo "$PREFIX: the two checkers agree on every compared file."
-  elif [ "$status" -eq 2 ]; then
-    echo
-    echo "UNDECIDED: $((timeouts + oracletimeouts)) file(s) timed out after ${TIMEOUT}s and were NOT compared."
-    echo "           This is not a pass. Re-run on a quieter host, or raise the timeout."
   fi
-  exit "$status"
+  diffexit "$LABEL" -f "$mismatch" -t "file(s)=$timeouts" "oracle file(s)=$oracletimeouts"
 }
 
 # explainMismatch (the declared-transform-signature scoring used below) now
@@ -572,8 +555,6 @@ run_ir() {
     exit 1
   fi
 
-  status=0
-
   # NO DIVERGENCE IS PERMITTED. There is no expected-mismatch list and no way to
   # add one (#1883): a file whose IR differs from the pinned stage0's fails the
   # run. The list existed so a known difference could be written down instead of
@@ -590,7 +571,6 @@ run_ir() {
       # oracle here would hang the failure report of a run that already failed.
       diff <(canon_ir_ids "$(alarmrun "$ORACLE" "$FLAG" "$f")") <(canon_ir_ids "$(alarmrun "$BIT2" "$FLAG" "$f")") | head -20
     done
-    status=1
   fi
 
   # Informational, never fails the gate: each of these matched a declared
@@ -610,7 +590,6 @@ run_ir() {
     echo
     echo "INVALID: $timeouts file(s) produced no verdict — not a match:"
     while read -r f; do echo "  $f"; done <"$work/timeout"
-    [ "$status" -eq 0 ] && status=2
   fi
 
   # Reported apart from ours because it means something different: the PINNED
@@ -621,7 +600,6 @@ run_ir() {
     echo
     echo "INVALID: the pinned stage0 HUNG on $oracletimeouts file(s) — corpus reduced, not verified:"
     while read -r f; do echo "  $f"; done <"$work/oracletimeout"
-    [ "$status" -eq 0 ] && status=2
   fi
 
   # AN ORACLE CRASH IS REPORTED BUT DOES NOT FAIL, and the asymmetry with the hang
@@ -643,19 +621,15 @@ run_ir() {
     while read -r f; do echo "  $f"; done <"$work/oraclecrash"
   fi
 
-  if [ "$status" -eq 0 ]; then
+  if [ "$mismatch" -eq 0 ] && [ "$timeouts" -eq 0 ] && [ "$oracletimeouts" -eq 0 ]; then
     echo
     if [ "$explained" -gt 0 ]; then
       echo "$PREFIX: every file's $VERB IR matches the pinned stage0's, or is explained by a declared transform signature ($explained explained)."
     else
       echo "$PREFIX: every file's $VERB IR is identical to the pinned stage0's."
     fi
-  elif [ "$status" -eq 2 ]; then
-    echo
-    echo "UNDECIDED: no regression was observed, but some file(s) timed out (see INVALID above) and were NOT compared."
-    echo "           This is not a pass. Re-run on a quieter host, or raise the timeout."
   fi
-  exit "$status"
+  diffexit "$LABEL" -f "$mismatch" -t "file(s)=$timeouts" "oracle file(s)=$oracletimeouts"
 }
 
 case "$KIND" in

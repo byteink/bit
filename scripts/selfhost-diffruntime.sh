@@ -275,6 +275,8 @@ set -uo pipefail
 . "$(dirname -- "$0")/alarmrun.sh"
 # shellcheck source=scripts/selfhost-ir-signatures.sh
 . "$(dirname -- "$0")/selfhost-ir-signatures.sh"
+# shellcheck source=scripts/diffexit.sh
+. "$(dirname -- "$0")/diffexit.sh"
 
 # Oracle: the pinned stage0 (previous release), like every other differential
 # since #1593. scripts/stage0.sh downloads and DIGEST-VERIFIES it and refuses
@@ -784,10 +786,16 @@ if [ -s "$work/mod_mismatch.sorted" ]; then
   bad=1
 fi
 
-[ "$bad" -ne 0 ] && exit 1
-[ "$timedout" -ne 0 ] && exit 2
+# $timedout is a 0/1 "did anything time out" flag (four sources feed it above);
+# the actual count named in diffexit's UNDECIDED line is summed separately so
+# the message is accurate when more than one source timed out.
+timedoutfiles=$(( $(wc -l <"$work/oracletimeout" | tr -d ' ') + $(wc -l <"$work/timeout" | tr -d ' ') +
+  $(wc -l <"$work/mod_oracletimeout" | tr -d ' ') + $(wc -l <"$work/mod_timeout" | tr -d ' ') ))
 
-modwhat="byte-identical"
-{ [ "$ATOMIC_ISA" = aarch64 ] || [ "$ATOMIC_ISA" = x86_64 ]; } && modwhat="atomic-width-signature-identical"
-explained=$(wc -l <"$work/explained.sorted" | tr -d ' ')
-echo "diffruntime: PASS — $match/$total runtime file(s) lower identically ($skip skipped, $explained explained); $modmatch/$NMOD runtime module(s) $modwhat ($modskip skipped, object)"
+if [ "$bad" -eq 0 ] && [ "$timedout" -eq 0 ]; then
+  modwhat="byte-identical"
+  { [ "$ATOMIC_ISA" = aarch64 ] || [ "$ATOMIC_ISA" = x86_64 ]; } && modwhat="atomic-width-signature-identical"
+  explained=$(wc -l <"$work/explained.sorted" | tr -d ' ')
+  echo "diffruntime: PASS — $match/$total runtime file(s) lower identically ($skip skipped, $explained explained); $modmatch/$NMOD runtime module(s) $modwhat ($modskip skipped, object)"
+fi
+diffexit "runtime" -f "$bad" -t "runtime file(s)=$timedoutfiles"

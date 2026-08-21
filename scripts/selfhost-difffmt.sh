@@ -55,6 +55,8 @@
 set -uo pipefail
 # shellcheck source=scripts/alarmrun.sh
 . "$(dirname -- "$0")/alarmrun.sh"
+# shellcheck source=scripts/diffexit.sh
+. "$(dirname -- "$0")/diffexit.sh"
 
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
@@ -181,8 +183,6 @@ timeouts=$(wc -l <"$work/timeout" | tr -d ' ')
 oracletimeouts=$(wc -l <"$work/oracletimeout" | tr -d ' ')
 echo "fmt differential ($ORACLE vs $BIT2): MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeouts ORACLE-TIMEOUT=$oracletimeouts SKIP(unformattable)=$skip"
 
-status=0
-
 # Corpus floor (#1516): comparing nothing is not agreement. If every file was
 # skipped or timed out there is no evidence either way, and a green here would
 # be a fabricated one.
@@ -208,14 +208,12 @@ if [ -s "$work/mismatch" ]; then
     alarmrun "$BIT2" fmt "$b/s.bit" >/dev/null
     diff "$a/s.bit" "$b/s.bit" | head -12
   done
-  status=1
 fi
 
 if [ -s "$work/timeout" ]; then
   echo
   echo "INVALID: $timeouts file(s) timed out after ${TIMEOUT}s — no verdict, not a match:"
   while read -r f; do echo "  timeout: $f"; done <"$work/timeout"
-  status=1
 fi
 
 # Reported apart from BIT2's timeout above because it means something
@@ -225,8 +223,11 @@ if [ -s "$work/oracletimeout" ]; then
   echo
   echo "INVALID: the pinned oracle timed out on $oracletimeouts file(s) after ${TIMEOUT}s — no verdict, not a match:"
   while read -r f; do echo "  oracle-timeout: $f"; done <"$work/oracletimeout"
-  status=1
 fi
 
-[ "$status" -eq 0 ] && { echo; echo "difffmt: the two formatters agree on every compared file."; }
-exit "$status"
+# A timeout on either side used to set the same status=1 a real mismatch does
+# (#3382 sibling finding, same shape as #3351/#3377/#3378/#3379/#3380):
+# diffexit restores the could-not-decide (2) distinction.
+[ "$mismatch" -eq 0 ] && [ "$timeouts" -eq 0 ] && [ "$oracletimeouts" -eq 0 ] &&
+  { echo; echo "difffmt: the two formatters agree on every compared file."; }
+diffexit "fmt" -f "$mismatch" -t "file(s)=$timeouts" "oracle file(s)=$oracletimeouts"

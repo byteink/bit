@@ -63,6 +63,8 @@
 set -u
 # shellcheck source=scripts/alarmrun.sh
 . "$(dirname -- "$0")/alarmrun.sh"
+# shellcheck source=scripts/diffexit.sh
+. "$(dirname -- "$0")/diffexit.sh"
 
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
@@ -193,17 +195,5 @@ if [ -n "$firstdiff" ]; then
 fi
 # Only a false positive is a build-breaking regression; MISSING shrinks as emit
 # sites land, and DIFF is dominated by cascades from unported root sites.
-if [ "$falsepos" -ne 0 ]; then
-  exit 1
-fi
-# A timeout decided nothing — neither a match nor a divergence. Exit 2
-# (could-not-decide) keeps it visible without claiming a result that was never
-# observed, and keeps it out of the pinned MISSING/FALSEPOS counts.
-if [ "$timeout" -gt 0 ]; then
-  echo "first timeout: $firsthang"
-  echo "UNDECIDED: $timeout file(s) timed out after ${TIMEOUT_S}s x2 and were NOT compared."
-  echo "           Not a pass. Re-run on a quieter host, or raise TIMEOUT_S."
-  echo "           If it reproduces on an idle host, that is a real hang in a compiler."
-  exit 2
-fi
-exit 0
+[ "$timeout" -gt 0 ] && echo "first timeout: $firsthang"
+diffexit "check" -f "$falsepos" -t "file(s)=$timeout"

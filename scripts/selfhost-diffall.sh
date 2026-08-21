@@ -96,6 +96,8 @@
 set -uo pipefail
 # shellcheck source=scripts/alarmrun.sh
 . "$(dirname -- "$0")/alarmrun.sh"
+# shellcheck source=scripts/diffexit.sh
+. "$(dirname -- "$0")/diffexit.sh"
 
 DIR=${DIFFALL_DIR:-scripts}
 MIN=${DIFFALL_MIN:-15}
@@ -251,11 +253,8 @@ fi
 
 if [ "$fail" -gt 0 ]; then
   echo "diffall: RED — $fail constituent(s) diverged."
-  exit 1
 fi
-if [ "$inconc" -gt 0 ] || [ "$timeout" -gt 0 ]; then
-  echo "diffall: COULD NOT DECIDE — $((inconc + timeout)) constituent(s) returned no verdict."
-  exit 2
+if [ "$fail" -eq 0 ] && [ "$inconc" -eq 0 ] && [ "$timeout" -eq 0 ]; then
+  echo "diffall: GREEN — every differential in the family agrees."
 fi
-echo "diffall: GREEN — every differential in the family agrees."
-exit 0
+diffexit "diffall" -f "$fail" -t "constituent(s)=$((inconc + timeout))"

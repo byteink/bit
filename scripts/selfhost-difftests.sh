@@ -22,6 +22,8 @@
 set -u
 # shellcheck source=scripts/alarmrun.sh
 . "$(dirname -- "$0")/alarmrun.sh"
+# shellcheck source=scripts/diffexit.sh
+. "$(dirname -- "$0")/diffexit.sh"
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
 # scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
@@ -41,24 +43,29 @@ trap 'rm -rf "$TMP"' EXIT
 # 12-20s.
 TIMEOUT=${DIFFTESTS_TIMEOUT:-20}
 
+oracletimeout=0 bit2timeout=0 mismatch=0
+
 ALARMRUN_KEEP_STDERR=1 alarmrun "$ORACLE" test "$PROJ" >"$TMP/seed" 2>&1
 se=$?
 if [ "$se" -eq 142 ]; then
   echo "ORACLE timed out after ${TIMEOUT}s running: $ORACLE test $PROJ"
-  exit 1
+  oracletimeout=1
+else
+  ALARMRUN_KEEP_STDERR=1 alarmrun "$BIT2" test "$PROJ" >"$TMP/b2" 2>&1
+  b2=$?
+  if [ "$b2" -eq 142 ]; then
+    echo "BIT2 timed out after ${TIMEOUT}s running: $BIT2 test $PROJ"
+    bit2timeout=1
+  elif [ "$se" != "$b2" ] || ! cmp -s "$TMP/seed" "$TMP/b2"; then
+    echo "DIFF $PROJ (exit seed=$se bit2=$b2)"
+    command diff "$TMP/seed" "$TMP/b2" | head -20
+    mismatch=1
+  else
+    echo "test-runner differential: MATCH $PROJ (exit=$se)"
+  fi
 fi
 
-ALARMRUN_KEEP_STDERR=1 alarmrun "$BIT2" test "$PROJ" >"$TMP/b2" 2>&1
-b2=$?
-if [ "$b2" -eq 142 ]; then
-  echo "BIT2 timed out after ${TIMEOUT}s running: $BIT2 test $PROJ"
-  exit 1
-fi
-
-if [ "$se" != "$b2" ] || ! cmp -s "$TMP/seed" "$TMP/b2"; then
-  echo "DIFF $PROJ (exit seed=$se bit2=$b2)"
-  command diff "$TMP/seed" "$TMP/b2" | head -20
-  exit 1
-fi
-echo "test-runner differential: MATCH $PROJ (exit=$se)"
-exit 0
+# A real divergence wins over an undecided run; either side timing out decided
+# nothing (#3382 -- this file used to fold a timeout into exit 1, same shape
+# as #3351/#3377/#3378/#3379/#3380).
+diffexit "tests" -f "$mismatch" -t "ORACLE run=$oracletimeout" "BIT2 run=$bit2timeout"

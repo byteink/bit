@@ -51,6 +51,8 @@
 set -u
 # shellcheck source=scripts/alarmrun.sh
 . "$(dirname -- "$0")/alarmrun.sh"
+# shellcheck source=scripts/diffexit.sh
+. "$(dirname -- "$0")/diffexit.sh"
 
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
@@ -313,22 +315,18 @@ echo "  MISSING  $missing   (seed rejects, selfhost accepts)"
 echo "  FALSEPOS $falsepos   (selfhost rejects, seed accepts)"
 echo "  TIMEOUT  $timeout   (never decided, NOT compared)"
 
-rc=0
 if [ "$missing" -ne 0 ]; then
   printf '\nMISSING — selfhost admits what the seed refuses:\n%s' "$missing_list"
-  rc=1
 fi
 if [ "$falsepos" -ne 0 ]; then
   printf '\nFALSEPOS — selfhost refuses what the seed admits:\n%s' "$falsepos_list"
-  rc=1
 fi
-# A timeout decided nothing — it is neither an agreement nor a divergence. It
-# gates at 2 (could-not-decide), below a real divergence but never a pass.
-if [ "$rc" -eq 0 ] && [ "$timeout" -ne 0 ]; then
-  printf '\nUNDECIDED — %d cell(s) timed out after %ss x2 and were NOT compared:\n%s' \
-    "$timeout" "$TIMEOUT_S" "$timeout_list"
-  echo "Not a pass. Re-run on a quieter host, or raise TIMEOUT_S."
-  exit 2
+# A timeout decided nothing — it is neither an agreement nor a divergence, and
+# only worth listing when it is the sole reason this run is not green.
+if [ "$missing" -eq 0 ] && [ "$falsepos" -eq 0 ] && [ "$timeout" -ne 0 ]; then
+  printf '\n%d cell(s) timed out after %ss x2, listed below:\n%s' "$timeout" "$TIMEOUT_S" "$timeout_list"
 fi
-[ "$rc" -eq 0 ] && echo "OK: the two checkers agree on every generated construct."
-exit $rc
+if [ "$missing" -eq 0 ] && [ "$falsepos" -eq 0 ] && [ "$timeout" -eq 0 ]; then
+  echo "OK: the two checkers agree on every generated construct."
+fi
+diffexit "verdict" -f "$missing" "$falsepos" -t "cell(s)=$timeout"
