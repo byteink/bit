@@ -114,25 +114,28 @@ fi
 PLATFORM_FREE_RELS="- alloc auxv chan cryptohw gc net park rand root sched shims shims/scan stw syscalls thread"
 PLATFORM_PAIRS="alloc net park rand root sched thread"
 
-# Windows is mid-port (epic #3322): only alloc, rand and root have a
-# runtime/<pair>/windows/ directory today (#3330, #3338, #3331). net and
-# thread's windows siblings are tracked (#3339, #3335); park's is tracked
-# and is the NEXT thing this list needs (#3336) — runtime/sched/sleep.bit
+# Windows is mid-port (epic #3322): alloc, park, rand and root have a
+# runtime/<pair>/windows/ directory today (#3330, #3336, #3338, #3331). net
+# and thread's windows siblings are tracked (#3339, #3335 — #3335's own
+# runtime/thread/windows exists but is not yet a full <pair> the way this
+# list means it: see its header on why rewiring boot.bit to consume it is
+# left for a later ticket). `park` landed #3336: runtime/sched/sleep.bit
 # (platform-free, always linked in) declares `extern fn
 # bit_rt_port_park_wake`/`bit_rt_port_park_wait`, which only
-# runtime/park/<os>/wait.bit provides, so this is the actual reason ANY
-# program fails to LINK for x86_64-windows today (verified 2026-08-21,
-# tests/bit/windowssmoke.bit's header). sched itself has no windows ticket
-# and, as far as this investigation went, may not need one: nothing in the
-# platform-free code references a per-platform sched symbol the way it
-# does for net/park/thread — reconfirm before assuming that stays true.
+# runtime/park/<os>/wait.bit provides, so this was the actual reason ANY
+# program failed to LINK for x86_64-windows before this landed (verified
+# 2026-08-21, tests/bit/windowssmoke.bit's header). sched itself has no
+# windows ticket and, as far as this investigation went, may not need one:
+# nothing in the platform-free code references a per-platform sched symbol
+# the way it does for net/park/thread — reconfirm before assuming that
+# stays true.
 # Hand-maintained rather than derived from `find`, on purpose: an
 # auto-detected list would also silently swallow a genuine accidental
 # deletion under linux/darwin, where all seven pairs must always be
 # present — this list only relaxes the requirement for the one platform
 # still being built out. As each pair's windows port lands, add its name
 # here in the same commit.
-WINDOWS_PAIRS="alloc rand root"
+WINDOWS_PAIRS="alloc park rand root"
 
 case "$PLAT" in
   windows) PAIRS_FOR_PLAT="$WINDOWS_PAIRS" ;;

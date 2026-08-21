@@ -1,0 +1,288 @@
+// Windows parking provider for the Stage B port of runtime/sched/'s idle path
+// (#3336, epic #3322). Sibling of ../linux/wait.bit and ../darwin/wait.bit —
+// see ../park.bit for why the port is split by directory rather than
+// switching on the OS inside one file, and for the wait/wake contract this
+// file implements.
+//
+// `WaitOnAddress`/`WakeByAddressSingle`/`WakeByAddressAll` are the futex
+// analogue Microsoft ships for exactly this purpose (`compiler/pesyms.bit`
+// already admits all three from kernel32.dll — its header explains why that
+// DLL is correct even though the primary MSDN "Library" line names the
+// api-ms-win-core-synch apiset forwarder), matching ../linux/wait.bit's
+// FUTEX_WAIT/FUTEX_WAKE and ../darwin/wait.bit's __ulock_wait/__ulock_wake.
+//
+// ---------------------------------------------------------------------------
+// THE ONE REAL SHAPE DIFFERENCE FROM FUTEX/__ulock: THE COMPARE VALUE
+// TRAVELS BY POINTER, NOT BY VALUE
+// ---------------------------------------------------------------------------
+//
+// FUTEX_WAIT and __ulock_wait both take `expected` as an immediate operand.
+// WaitOnAddress takes a `CompareAddress` POINTER to a buffer holding the
+// value and reads *through* it, so this provider needs somewhere to stash
+// `expected` before every call, unlike either sibling.
+//
+// A single shared module word looks tempting — `winQpcFreq` below gets away
+// with exactly that — and would be a genuine lost-wakeup-shaped bug here:
+// `bit_rt_port_park_wait` is called concurrently by every parked worker
+// (runtime/sched/sleep.bit: one park word per worker, so up to
+// `schedMaxWorkers - 1` callers can be mid-call at once, worker 0 never
+// parks). Two racing writers to ONE compare buffer would let thread A's
+// WaitOnAddress compare against thread B's `expected`, corrupting the exact
+// check this primitive exists to make atomic. So this needs a buffer PER
+// CONCURRENT CALLER, not one per provider.
+//
+// `parkScratchMax` duplicates `runtime/sched/sleep.bit`'s `schedMaxWorkers`
+// (32) rather than importing it — a provider stays a leaf with no imports,
+// the same convention ../linux/wait.bit's and ../darwin/wait.bit's own
+// duplicated status-code literals follow. Slots are claimed with the same
+// CAS-over-a-fixed-pool idiom ../../thread/windows/spawn.bit's `tokenPool`
+// uses and for the same reason: a leaf has no allocator to call, so a static
+// pool keeps this off the "no unbounded allocation after startup" list. A
+// claim failure (pool exhausted, which the bound above makes unreachable in
+// practice) reports `parkWaitReady` rather than blocking — a caller that
+// cannot get a scratch slot simply re-checks its condition on the next turn,
+// which the contract below always permits.
+
+extern fn WaitOnAddress(address: *byte, compareAddress: *byte, addressSize: i64, dwMilliseconds: i32): i32
+extern fn WakeByAddressSingle(address: *byte)
+extern fn WakeByAddressAll(address: *byte)
+extern fn GetLastError(): i32
+extern fn QueryPerformanceCounter(count: *i64): i32
+extern fn QueryPerformanceFrequency(freq: *i64): i32
+extern fn WaitForSingleObject(handle: *byte, timeoutMs: i32): i32
+extern fn GetCurrentProcess(): *byte
+
+// ERROR_TIMEOUT (winerror.h) — the one documented failure GetLastError can
+// report after a well-formed WaitOnAddress call returns FALSE. Any other
+// code reaching that branch is a programming error (a bad address, a bad
+// AddressSize), handled the same way ../linux/wait.bit's own comment
+// specifies for "any other negative errno": reported as `parkWaitReady` so
+// the caller re-checks rather than treating a bug as a timeout.
+fn errorTimeout(): int { return 1460 }
+
+// INFINITE (winbase.h) as the DWORD `dwMilliseconds` bit pattern —
+// 0xFFFFFFFF, which a plain i32 -1 already is at the ABI boundary (the same
+// "unsigned parameter, signed literal" move
+// ../../thread/windows/spawn.bit's `STACK_SIZE_PARAM_IS_A_RESERVATION` flag
+// makes).
+fn infiniteMs(): i32 { return i32(-1) }
+
+fn nsPerMs(): int { return 1000000 }
+
+// `*i32` -> `*byte`, matching every other pointer-boundary crossing in this
+// tree (../../thread/windows/spawn.bit's `bytesAt`).
+@nosplit fn bytesOfI32(p: *i32): *byte {
+  let z: *byte = nil
+  return z + int(p)
+}
+
+// ---------------------------------------------------------------------------
+// The compare-value scratch pool — see the header above.
+// ---------------------------------------------------------------------------
+
+const parkScratchMax: int = 32
+let parkScratchClaimed: [32]i64
+// One i64 cell per slot; only the low 4 bytes of each are ever read or
+// written (`WaitOnAddress`'s `AddressSize` below is 4, matching the `*i32`
+// word every caller compares) — the same "everything is `[]i64`, re-addressed
+// through a narrower cursor" idiom §11.8 documents and this tree uses
+// throughout (e.g. ../../thread/windows/spawn.bit's `trampCells`).
+let parkScratchCells: [32]i64
+
+fn parkScratchClaim(): int {
+  let flags: *i64 = ptrOf(parkScratchClaimed)
+  let i = 0
+  while (i < parkScratchMax) {
+    if (atomicCmpxchg(flags + i, 0, 1)) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+fn parkScratchRelease(i: int) {
+  let flags: *i64 = ptrOf(parkScratchClaimed)
+  atomicStore(flags + i, 0)
+}
+
+// The claimed cell's address, re-typed as `*i32` — the same re-addressing
+// ../../thread/windows/spawn.bit's `wordsAtI32` does for its `done` word.
+@nosplit fn parkScratchAt(slot: int): *i32 {
+  let cells: *i64 = ptrOf(parkScratchCells)
+  let z: *i32 = nil
+  return z + int(cells + slot) / 4
+}
+
+// ---------------------------------------------------------------------------
+// The monotonic clock — `runtime/sched/`'s `monoNs()` on the Windows branch.
+// ---------------------------------------------------------------------------
+//
+// QueryPerformanceCounter reports raw ticks through an OUT pointer — unlike
+// Darwin's `mach_absolute_time`, which returns the value directly in a
+// register, so this needs a caller-owned buffer for EVERY read, not just the
+// one-time frequency query. `scratch` is the same caller-owned-block pattern
+// ../linux/wait.bit's `parkMonoNs` uses, and for the identical reason: two
+// concurrent callers sharing one module-level word would race the tick read
+// itself, corrupting a caller's own interval — not merely the one-time init,
+// which IS safe to share (see `winQpcFreq` below).
+//
+// `winQpcFreq` is a per-MACHINE constant fixed at boot (QueryPerformanceFrequency
+// never changes for a running process), so caching it costs nothing and
+// racing initializers are harmless: every thread that queries it writes the
+// SAME value — the same argument ../darwin/wait.bit's `tbNumer`/`tbDenom`
+// comment makes for `mach_timebase_info`.
+//
+// Ticks are split into whole seconds and remainder before the multiply by
+// 1e9 so the intermediate cannot overflow i64: a naive
+// `ticks * 1_000_000_000 / freq` overflows within roughly two minutes at a
+// 10MHz QueryPerformanceFrequency (a common modern value), since
+// `ticks * 1e9` alone exceeds 2^63 well before that — the same guard
+// ../linux/wait.bit's `parkMonoNs` and ../darwin/wait.bit's own comment give.
+//
+// `@nosplit` (#3000): every step is arithmetic, module-state access, or a
+// call to an `extern fn` admitted by E0075 — no allocation, no park. Matches
+// ../darwin/wait.bit's `parkMonoNs`, which is `@nosplit` for the identical
+// reason and calls the identical shape of libSystem extern.
+let winQpcFreq: i64 = 0
+
+export @symbol("bit_rt_port_park_mono_ns") @nosplit fn parkMonoNs(scratch: *i64): int {
+  if (winQpcFreq == i64(0)) {
+    QueryPerformanceFrequency(scratch)
+    let f = *scratch
+    if (f != i64(0)) {
+      winQpcFreq = f
+    } else {
+      winQpcFreq = i64(1)   // refuse a divide-by-zero; QPC is documented to
+                             // always succeed on XP+, so this is unreached.
+    }
+  }
+  QueryPerformanceCounter(scratch)
+  let ticks = *scratch
+  let whole = ticks / winQpcFreq
+  let rem = ticks % winQpcFreq
+  return int(whole * i64(1000000000) + rem * i64(1000000000) / winQpcFreq)
+}
+
+// ---------------------------------------------------------------------------
+// Sleep the calling OS thread for at least `ns` nanoseconds — the current
+// park primitive worker 0 uses (`runtime/sched/`'s `sleepNs`; see
+// ../park.bit for the split between this and parkWait/parkWake).
+// ---------------------------------------------------------------------------
+//
+// `Sleep` itself is not in compiler/pesyms.bit's admitted surface (nothing in
+// Stage B calls it), so this uses the same substitute
+// `runtime/root/windows/boot.bit` used before this file existed:
+// WaitForSingleObject on `GetCurrentProcess()`'s pseudo-handle, which is
+// never signaled by anything this process does, so the wait always times
+// out — exactly a sleep, with no separate `Sleep` import needed. Rounded up
+// to whole milliseconds, 1ms minimum: WaitForSingleObject takes no finer
+// unit.
+//
+// `scratch` is unused here — Windows' sleep needs no timespec buffer, unlike
+// ../linux/wait.bit's `nanosleep` — but the parameter is kept so every
+// provider's `parkSleepNs` has the identical call-site shape
+// (`parkSleepNs(backoff, w + wkSleepReq)`), which is what lets
+// ../../root/windows/boot.bit's worker loop match ../linux and ../darwin's
+// line for line.
+export @symbol("bit_rt_port_park_sleep_ns") fn parkSleepNs(ns: int, scratch: *i64) {
+  if (ns <= 0) {
+    return
+  }
+  let ms = ns / nsPerMs()
+  if (ms < 1) {
+    ms = 1
+  }
+  WaitForSingleObject(GetCurrentProcess(), i32(ms))
+}
+
+// ---------------------------------------------------------------------------
+// Block while the 32-bit word at `p` still holds `expected`, for at most
+// `timeoutNs` (0 or negative means block indefinitely). Returns
+// `parkWaitReady` or `parkWaitTimedOut` (../park.bit).
+// ---------------------------------------------------------------------------
+//
+// SPURIOUS WAKEUPS ARE LEGAL, and WaitOnAddress does not tell the caller why
+// it returned — Microsoft's own documentation for this function notes the
+// wait can complete with no explicit WakeByAddress* call ever having been
+// made, exactly the futex/__ulock contract ../park.bit already specifies as
+// the intersection of what every platform can promise. That is why this
+// returns `parkWaitReady` — "you must re-check the word" — for every
+// non-timeout outcome, never "you were actually woken": a caller that
+// treated a bare TRUE return as a real wake would have a lost-wakeup-shaped
+// bug on the one platform whose own docs warn about it loudest.
+//
+// TIMEOUT ENCODING. `timeoutNs <= 0` maps to INFINITE — futex's null
+// timespec and __ulock's analogous convention, both "wait forever".
+// Otherwise the request is rounded UP to whole milliseconds (WaitOnAddress
+// takes no finer unit) and floored at 1ms rather than allowed to round down
+// to 0, which WaitOnAddress would read as "return immediately" — the same
+// deadlock ../darwin/wait.bit's own 1us floor exists to prevent for
+// __ulock's microsecond unit. The idle path's shortest wait is
+// `parkMinBackoffNs` = 1000ns, well above even a 1ms floor, so this bound is
+// generous rather than a live constraint. THE DEADLINE IS THIS SINGLE CALL'S
+// OWN `timeoutNs`, read once and converted once — there is no retry loop in
+// here to recompute it from a fresh clock read, so a run of spurious wakes
+// cannot extend it: each spurious return simply ends this call early with
+// `parkWaitReady`, and it is the CALLER's job (exactly as on Linux and
+// Darwin) to re-check and, if it still wants to wait, call this again.
+export @symbol("bit_rt_port_park_wait") fn parkWait(p: *i32, expected: i32, timeoutNs: int): int {
+  let slot = parkScratchClaim()
+  if (slot < 0) {
+    return 0   // parkWaitReady: no scratch slot free — re-check rather than block.
+  }
+  let cmp = parkScratchAt(slot)
+  *cmp = expected
+
+  let ms = infiniteMs()
+  if (timeoutNs > 0) {
+    let msVal = timeoutNs / nsPerMs()
+    if (msVal < 1) {
+      msVal = 1
+    }
+    if (msVal > 2147483647) {
+      msVal = 2147483647   // clamp: dwMilliseconds is a 32-bit DWORD. No
+                            // caller in this tree requests anywhere near this
+                            // (idleParkMaxNs is 100ms); kept for totality.
+    }
+    ms = i32(msVal)
+  }
+
+  let ok = int(WaitOnAddress(bytesOfI32(p), bytesOfI32(cmp), i64(4), ms))
+  parkScratchRelease(slot)
+
+  if (ok == 0) {
+    let err = int(GetLastError())
+    if (err == errorTimeout()) {
+      return 1   // parkWaitTimedOut
+    }
+  }
+  return 0   // parkWaitReady
+}
+
+// ---------------------------------------------------------------------------
+// Wake waiters blocked in `parkWait` on the word at `p` — see ../park.bit.
+// ---------------------------------------------------------------------------
+//
+// Unlike futex (a count argument) or __ulock (a flag on the operation),
+// Windows splits this into two ENTRY POINTS with no shared count parameter,
+// which is why the branch below is on which function to call rather than on
+// an operand.
+//
+// NEITHER FUNCTION REPORTS HOW MANY WAITERS IT RELEASED — both return VOID.
+// futex and __ulock can both report "0 woken" for the ordinary no-waiter
+// case (../linux and ../darwin's own comments); Windows cannot report this
+// at all, so 0 is returned unconditionally rather than guessed. Nothing in
+// this tree reads the count (`runtime/sched/sleep.bit` discards the return
+// value at every call site) — it exists only so this provider's export
+// matches the other two's `(p: *i32, all: bool): int` shape the shared ABI
+// (`runtime/sched/sleep.bit`'s `extern fn bit_rt_port_park_wake`) requires.
+export @symbol("bit_rt_port_park_wake") fn parkWake(p: *i32, all: bool): int {
+  let addr = bytesOfI32(p)
+  if (all) {
+    WakeByAddressAll(addr)
+  } else {
+    WakeByAddressSingle(addr)
+  }
+  return 0
+}
