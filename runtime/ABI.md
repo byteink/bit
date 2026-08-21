@@ -726,6 +726,134 @@ Two alternatives were weighed and rejected:
   model: `bit` links a *prebuilt* `libbitrt.a`, and this would require the
   runtime to be recompiled into every user program's object.
 
+### 4.2 Debug-info line table (designed, not yet emitted — #3281)
+
+Decided by #3281 (`spec/SPEC.md` §18.6.1: bespoke over DWARF, and why). The
+walker that symbolizes a panic (#3285) reads a second, independent side table,
+laid out like §4's stack maps because that shape is already proven against
+dead-stripping, cross-object merging, and reading with no allocation.
+
+**This is a second, fully independent table, not an extension of `.bit_gc`.**
+It duplicates `code_addr`/`code_size` per function rather than reusing the
+stack-map table's function index, so each table can be produced, consumed, or
+extended without the other's correctness depending on it — the two are merged
+by two unrelated linker passes with no guarantee their function order agrees
+after separate dead-stripping.
+
+**Section and extent symbols.** ELF `.bit_dbg`; Mach-O `__DATA,__bit_dbg` —
+`__DATA` because, like `.bit_gc`, entries hold absolute code and string
+pointers that dyld must rebase under PIE. Like `.bit_gc`, each object emits
+its own entries and the **linker** concatenates them, defining
+`bit_debug_lines` / `bit_debug_lines_end` (Mach-O: `_`-prefixed) at the merged
+extent's bounds. No object defines either symbol itself: two members defining
+one global name is a duplicate-definition error, and only the linker sees the
+whole link.
+
+**Wire format**, little-endian. Every field is fixed-width and both the
+per-function header (16 bytes) and each row (16 bytes) are already multiples
+of 8, so — unlike `.bit_gc`'s variable-length safepoint sub-arrays — no entry
+ever needs a trailing pad byte or a rounding step to reach the next one:
+
+```
+per function (repeated to the end of the extent):
+  u64 code_addr        # abs reloc -> the function's code symbol (the same
+                        # atom §4 relocates against; two independent
+                        # relocations, one per table, against one symbol)
+  u16 format_version   # checked before code_size/num_rows are trusted (below)
+  u32 code_size
+  u16 num_rows
+  per row (num_rows times):
+    u32 pc_offset        # code_addr + pc_offset is this row's start address;
+                          # rows sorted ascending; a row's span runs to the
+                          # next row's pc_offset, or to code_size for the last
+    u64 file_hdr_ptr      # abs reloc -> that source file's existing
+                          # string-pool header — the same {ptr,len} shape
+                          # already emitted for every string literal (§12's
+                          # RtBytes is that same shape) — not a new string
+                          # encoding
+    u32 line              # 1-based
+```
+
+Row 0 of every function **must** have `pc_offset == 0`: full coverage from
+the function's first instruction is mandatory, so a `pc` inside a found
+function's range can never fail to match some row — "no row covers this
+offset" is not a state the walker has to handle.
+
+**`format_version`, shipped from the first line, not retrofitted.** #3189
+designed (but has not yet shipped) a version stamp for `.bit_gc` after #1927
+reached production as a silent bus error with no guard at all — producer and
+reader are different build stages (`libbitrt`'s own entries come from the
+pinned stage0; every other entry in the same link comes from whatever
+compiler built it), and this table has the identical exposure. Rather than
+repeat that retrofit, the walker reads and compares `format_version` *before*
+trusting `code_size`, `num_rows`, or any row — placed immediately after
+`code_addr`, the same position #3189 chose, so the one field the relocation
+logic depends on sitting at offset 0 is undisturbed. A mismatch does **not**
+call `bit_rt_panic` (below): it is treated exactly like "no record."
+
+**File references reuse the existing string pool, interned per object.**
+`module.stringPool` (`compiler/ir.bit:410`) is not deduplicated today — every
+`append` adds a new entry regardless of content. A debug-info emitter that
+called that path once per row would emit the same file path hundreds of
+times. The emitter must intern each distinct source file path **once per
+object** (a small map from path to the string-pool header symbol already
+emitted for it), so every function's rows in the same file share one 16-byte
+header. This is required for the format's size to be what SPEC §18.6.1
+measures, not an optional optimization.
+
+**Lookup, at panic time, with no allocation.** Two nested searches, mirroring
+`runtime/gc/stackmap.bit`'s existing `blobU16`/`blobU32`/`blobU64`/`blobI32`
+raw-offset reads (no composite locals, `@nosplit`-legal per §10.3):
+
+1. Linear scan of the extent (bounded by `bit_debug_lines_end -
+   bit_debug_lines`, exactly as the stack-map walker already bounds its own
+   scan) for the function whose `[code_addr, code_addr + code_size)` contains
+   the target `pc`. Nothing here is sorted by address — link order is not
+   load-address order — so this is a linear scan, not a binary search,
+   matching the stack-map walker's own proven cost shape.
+2. Once the function is found, binary search its `num_rows` rows for the
+   greatest `pc_offset` not exceeding `pc - code_addr`. Rows *within one
+   function* are sorted by construction, since `code_size` and pc_offset
+   monotonicity depend only on that function's own final code layout,
+   decided by codegen when the entry is written — not on link order (unlike
+   step 1). **#3283 must not skip this**: if codegen reorders basic blocks
+   after IR emission (the x86-64 backend's RPO block ordering already does),
+   rows must be sorted by final `pc_offset` at the point the entry is
+   serialized, not emitted in source or IR order.
+
+**No record found — degrade, never abort.** A single unresolvable frame must
+not blank the rest of the trace:
+
+- `pc` matches no function's range at all (code outside every emitted
+  function — libc, or a function this table omits). Print the raw address
+  (`??? (0x<hex>)` — the convention `sample`'s own output already uses for an
+  unresolved frame) and continue to the next frame via the frame-pointer
+  chain.
+- `format_version` mismatch: the whole table is untrusted for this process,
+  every frame prints raw.
+- **The reader must never call `bit_rt_panic` on a malformed table**, unlike
+  `scanFrame`'s `panicStackMapBounds` (§4). That guard is sound for the GC
+  because it runs during ordinary execution — panicking mid-collection is the
+  right failure mode for a corrupt stack map. This table is read **from
+  inside `bit_rt_panic` itself**, after the process has already decided to
+  terminate; a hard panic here would recurse into a second panic reporting a
+  first one, which is worse than an incomplete trace. Any bounds violation
+  degrades that one frame to a raw address instead.
+
+**Retention.** Exactly §4's rule: an entry is kept exactly when the function
+it describes is kept — each entry relocates to that function's own code
+symbol, so it cannot be a dead-strip root (that would retain every function
+of every linked module) and cannot rely on ordinary reachability (nothing
+else references an entry). The linker decides retention in the same
+dead-strip pass §4 already runs.
+
+**`@nosplit` / freestanding is not a constraint here**, unlike §4.1's
+stack-map history. `.bit_gc` collided with `@nosplit` because an *absent* map
+had to be provably never consulted (no safepoint beneath a nosplit frame). A
+debug-info entry is consulted only during an already-terminating panic walk,
+never during ordinary execution, so a freestanding archive member emitting
+its own debug-info entries needs no companion restriction.
+
 ---
 
 ## 5. Safepoints and stop-the-world
