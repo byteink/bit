@@ -369,15 +369,32 @@ run_basic() {
 # zero mismatches is could-not-decide, not a divergence, so it exits 2 instead
 # of collapsing onto the same code as a real MISMATCH (#3379, matching the
 # split #3351/#3378 established for the rest of this family).
+#
+# ## The oracle side is bounded too (#2070/#3384)
+#
+# This row's ORACLE call used to run unbounded — the one call site in this file
+# the top-of-file header claimed was already alarm-guarded but was not. A hung
+# pinned stage0 wedged this row (and `./make test-differentials`'s difftypes
+# step) indefinitely, with no timeout message, the exact failure mode #2070
+# fixed for run_ir()/run_basic(). A skip means the oracle legitimately declined
+# the file (check-err, still expected here); a hang is a broken stage0 and is
+# reported separately in `$work/oracletimeout`, never folded into SKIP.
 run_types() {
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
   : >"$work/mismatch"
   : >"$work/timeout"
+  : >"$work/oracletimeout"
   match=0 skip=0
 
   for f in $(find $CORPUS -name '*.bit' | sort); do
-    seed=$("$ORACLE" "$FLAG" "$f" 2>/dev/null) || { skip=$((skip + 1)); continue; }
+    seed=$(alarmrun "$ORACLE" "$FLAG" "$f")
+    rc=$?
+    if [ "$rc" -eq 142 ]; then
+      echo "$f" >>"$work/oracletimeout"
+      continue
+    fi
+    [ "$rc" -ne 0 ] && { skip=$((skip + 1)); continue; }
     b2=$(alarmrun "$BIT2" "$FLAG" "$f")
     rc=$?
     if [ "$rc" -ge 128 ]; then
@@ -393,7 +410,8 @@ run_types() {
 
   mismatch=$(wc -l <"$work/mismatch" | tr -d ' ')
   timeouts=$(wc -l <"$work/timeout" | tr -d ' ')
-  echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeouts SKIP($SKIPLABEL)=$skip"
+  oracletimeouts=$(wc -l <"$work/oracletimeout" | tr -d ' ')
+  echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeouts ORACLE-TIMEOUT=$oracletimeouts SKIP($SKIPLABEL)=$skip"
 
   status=0
   if [ -s "$work/mismatch" ]; then
@@ -405,7 +423,7 @@ run_types() {
     head -3 "$work/mismatch" | while read -r f; do
       echo
       echo "--- diff (seed vs bit): $f"
-      diff <("$ORACLE" "$FLAG" "$f" 2>/dev/null) <(alarmrun "$BIT2" "$FLAG" "$f") | head -12
+      diff <(alarmrun "$ORACLE" "$FLAG" "$f") <(alarmrun "$BIT2" "$FLAG" "$f") | head -12
     done
     status=1
   fi
@@ -423,12 +441,22 @@ run_types() {
     [ "$status" -eq 0 ] && status=2
   fi
 
+  # Reported apart from BIT2's timeout because it means something different: the
+  # PINNED oracle hung, so the corpus shrank rather than this tree misbehaving
+  # (matches run_ir()'s oracletimeout handling, #2070).
+  if [ -s "$work/oracletimeout" ]; then
+    echo
+    echo "INVALID: the pinned stage0 HUNG on $oracletimeouts file(s) — corpus reduced, not verified:"
+    while read -r f; do echo "  $f"; done <"$work/oracletimeout"
+    [ "$status" -eq 0 ] && status=2
+  fi
+
   if [ "$status" -eq 0 ]; then
     echo
     echo "$PREFIX: the two checkers agree on every compared file."
   elif [ "$status" -eq 2 ]; then
     echo
-    echo "UNDECIDED: $timeouts file(s) timed out after ${TIMEOUT}s and were NOT compared."
+    echo "UNDECIDED: $((timeouts + oracletimeouts)) file(s) timed out after ${TIMEOUT}s and were NOT compared."
     echo "           This is not a pass. Re-run on a quieter host, or raise the timeout."
   fi
   exit "$status"
