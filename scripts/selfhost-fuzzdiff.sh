@@ -52,16 +52,15 @@ TIMEOUT_S=${TIMEOUT_S:-60}
 # Alarm-guarded run. The exit status is LOAD-BEARING — any harness copied from
 # this script that drops `$?` scores a timed-out run as a MISMATCH instead, which
 # produced two false "still broken" readings during #1515. Returns 142
-# (128+SIGALRM) iff the run timed out twice.
+# (128+SIGALRM) iff the run timed out twice. Retry-once-on-stall is
+# scripts/alarmrun.sh's alarmrun_retry (#3408); no persistent artifact to clean
+# between attempts here, so its outfile arg is "".
 run() {
-  local out rc
+  local out rc side
   local TIMEOUT="$TIMEOUT_S"
-  out=$( ( alarmrun "$@" ) 2>/dev/null )
+  [ "$1" = "$ORACLE" ] && side=ORACLE || side=BIT2
+  out=$( ( alarmrun_retry "$side" "" "$@" ) 2>/dev/null )
   rc=$?
-  if [ "$rc" -eq 142 ]; then
-    out=$( ( alarmrun "$@" ) 2>/dev/null )
-    rc=$?
-  fi
   printf '%s' "$out"
   return "$rc"
 }
