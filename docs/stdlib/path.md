@@ -107,6 +107,17 @@ lexically normalized with `clean`. Comparison is by whole path component, not
 by raw character prefix, so `contains("/a/b", "/a/bc")` is `false` even though
 the string `"/a/bc"` starts with `"/a/b"`. A path is always inside itself.
 
+This comparison is purely lexical — no filesystem access, so a `..` that only
+exists on disk (a symlink planted inside `root`, pointing back outside it) is
+not detected. `contains` alone is therefore not sufficient to decide whether
+serving a path is safe when the tree is attacker-writable.
+`examples/staticserver`'s `safePath` is the relevant contrast, and does a
+different job on purpose: it is a reject-list run on the untrusted request
+string itself, refusing any `..` substring outright, before the filesystem or
+`contains` ever enters the picture. `contains` is a general post-`clean`
+containment test; `safePath` is a narrower guard against untrusted input.
+Neither supersedes the other.
+
 ```bit
 import { contains } from "std/path"
 
