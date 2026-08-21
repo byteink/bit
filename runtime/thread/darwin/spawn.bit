@@ -93,6 +93,15 @@ extern fn bit_rt_gc_thread_exit()
   return z + addr
 }
 
+// `int` -> `*i32`, for reconstructing `done`'s address inside the child. A
+// `*i32` rather than `*i64` because `done` itself is `*i32` (../thread.bit's
+// `threadRunning` is a 32-bit word so `atomicLoad`'s poll in `threadJoin` can
+// use a 4-byte op). Same shape as ../linux/spawn.bit's `i32Ptr`.
+@nosplit fn i32PtrAt(addr: int): *i32 {
+  let z: *i32 = nil
+  return z + addr / 4
+}
+
 // Call the raw code address `entry` with `arg` in the first-argument register
 // (x0 / rdi) and return normally. A copy of ../../sched's `taskInvoke` for the
 // same reason and with the same encoding — `entry` is a bare code pointer, not a
@@ -111,27 +120,31 @@ extern fn bit_rt_gc_thread_exit()
 }
 
 // `pthread_create` carries ONE `void *` to the child, and the trampoline needs
-// two words — the real entry and the real argument. They come from a fixed pool
-// rather than an allocator: a provider is a leaf with no allocator to call, and a
-// static pool keeps this off the "no unbounded allocation after startup" list.
+// three words — the real entry, the real argument, and `done`'s address, which
+// the child must clear itself (see `threadStart`'s comment and ../thread.bit's
+// `threadRunning` — pthreads has no equivalent of Linux's `CLONE_CHILD_CLEARTID`,
+// so nothing else can). They come from a fixed pool rather than an allocator: a
+// provider is a leaf with no allocator to call, and a static pool keeps this off
+// the "no unbounded allocation after startup" list.
 //
-// Two words per cell, and WORD 0 IS THE CLAIM FLAG — a cell is free exactly when
-// its entry word is 0, which no real `entryOf` ever is. That removes the third
-// word an explicit in-use flag would need and makes claiming a single CAS.
+// Three words per cell, and WORD 0 IS THE CLAIM FLAG — a cell is free exactly
+// when its entry word is 0, which no real `entryOf` ever is. That removes the
+// fourth word an explicit in-use flag would need and makes claiming a single CAS.
 const trampMax: int = 64
-let trampCells: [128]i64
+let trampCells: [192]i64
 
-// Reserve a cell for `(start, arg)`, returning its address or 0 when the pool is
-// full. Bounded by `trampMax`.
-fn trampClaim(start: int, arg: int): int {
+// Reserve a cell for `(start, arg, done)`, returning its address or 0 when the
+// pool is full. Bounded by `trampMax`.
+fn trampClaim(start: int, arg: int, done: int): int {
   let p: *i64 = ptrOf(trampCells)
   let i = 0
   while (i < trampMax) {
-    if (atomicCmpxchg(p + i * 2, 0, start)) {
+    if (atomicCmpxchg(p + i * 3, 0, start)) {
       // Safe unsynchronised: the CAS above makes this cell ours until the child
       // releases it, and the child cannot run before `pthread_create`.
-      *(p + i * 2 + 1) = arg
-      return int(p) + i * 16
+      *(p + i * 3 + 1) = arg
+      *(p + i * 3 + 2) = done
+      return int(p) + i * 24
     }
     i = i + 1
   }
@@ -156,11 +169,19 @@ fn threadTrampoline(cell: *byte): *byte {
   let p = wordsAt(addr)
   let start = *p
   let arg = *(p + 1)
+  // `done`'s address is read into a local BEFORE the release below, because
+  // releasing the cell makes it eligible for a concurrent `trampClaim` to
+  // overwrite before this function reads it again.
+  let done = *(p + 2)
   trampRelease(addr, start)
   invokeRaw(start, arg)
-  // The last Bit code this thread runs. After this its slot is free, so a
-  // rendezvous no longer waits on a thread that has gone.
+  // Release this thread's mutator slot first, then clear `done` as the very
+  // last Bit code this thread runs — same order as ../linux/spawn.bit's
+  // epilogue-then-ctid-clear, so a joiner observing `done == 0` also observes
+  // (modulo the residual gap `threadRelease`'s comment names) a thread that
+  // has finished tearing itself down, not merely finished the caller's body.
   bit_rt_gc_thread_exit()
+  atomicStore(i32PtrAt(done), i32(0))
   let z: *byte = nil
   return z
 }
@@ -188,10 +209,10 @@ export @symbol("bit_rt_port_thread_start") fn threadStart(start: *byte, arg: *by
   // until its deadline.
   atomicStore(done, i32(runningSentinel()))
 
-  // The child enters `threadTrampoline`, which calls `start(arg)` and then
-  // releases this thread's mutator slot (#1846). A cell carries the pair through
-  // pthread's single `void *`.
-  let cell = trampClaim(int(start), int(arg))
+  // The child enters `threadTrampoline`, which calls `start(arg)`, releases
+  // this thread's mutator slot (#1846), and clears `done` (#3375). A cell
+  // carries the triple through pthread's single `void *`.
+  let cell = trampClaim(int(start), int(arg), int(done))
   if (cell == 0) {
     // Pool exhausted: `trampMax` starts are already in flight. Refused rather
     // than started unwrapped, because an unwrapped child leaks its slot and the
