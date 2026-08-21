@@ -395,7 +395,7 @@ estimate):
    `body -> strBase` and `0 -> body + strOff` after computing `body`; its
    `gcAllocRaw(strHeaderSize + nbytes, ...)` call needs no other change, and
    because every OTHER fresh-string constructor in the tree (10 call sites:
-   `floats.bit:170`, `strings.bit:10,164,211,235,246,295,312`, `iface.bit:139`,
+   `floats.bit:172`, `strings.bit:10,164,211,235,246,295,312`, `iface.bit:149`,
    plus `strings.bit:305 rtStringFromBytes`) already funnels through
    `allocString`, none of them need their own edit. Add a `riStringOffs` slot
    to `infoBlock` (mirroring the existing `riSliceOffs`/`riMapOffs` slots,
@@ -406,15 +406,15 @@ estimate):
 2. **The view constructor — `runtime/root/strings.bit`, `rtStringSlice`
    (~line 105-125).** Replace `allocString` + `copyBytes` with `gcAlloc(g, base
    + riString*8)` (fixed 24-byte header) and the three `storeWord`s described
-   above, mirroring `runtime/root/slices.bit:326-345`'s `rtSliceSlice` exactly.
+   above, mirroring `runtime/root/slices.bit:374-397`'s `rtSliceSlice` exactly.
    Range-check and null-header behaviour (panics via `oobStringRange`,
    `#2014`) are unchanged.
 3. **Six module-private duplicate read funnels** — each is its own copy
    because it lives in a module that cannot import `runtime/root`'s privates
    (documented at each site) and each needs the identical two-line rewrite as
    `strBytes`/`strSize`: `runtime/root/linux/io.bit` `strBytesOf`/`strSizeOf`
-   (~264/272), `runtime/root/darwin/io.bit` `strBytesOf`/`strSizeOf`
-   (~222/230), `runtime/net/linux/netabi.bit` `strData`/`strSizeOf`
+   (~444/452), `runtime/root/darwin/io.bit` `strBytesOf`/`strSizeOf`
+   (~392/400), `runtime/net/linux/netabi.bit` `strData`/`strSizeOf`
    (~123/127), `runtime/net/darwin/netabi.bit` `strData`/`strSizeOf`
    (~112/116), `runtime/root/linux/fs.bit` `strData`/`strLenOf` (~119/120),
    `runtime/root/darwin/fs.bit` `strData`/`strLenOf` (~128/129).
@@ -1499,7 +1499,7 @@ ChanRecvResult { value: u64, ok: bool }   // extern struct, 2-word return
   `bit_rt_chan_recv` immediately followed by `bit_rt_chan_recv_ok`, with no
   yield between them. The outcome lives in the same per-task scratch mechanism
   the error slot uses (§13), not a threadlocal: word `scrRecvOk`, offset 264
-  of the per-task scratch block (`runtime/sched/scratch.bit:73`), read by
+  of the per-task scratch block (`runtime/sched/scratch.bit:77`), read by
   `bit_rt_chan_recv_ok` (`runtime/root/slots.bit:78`). The adjacency is what
   keeps that word from being clobbered by another scratch-writing operation
   before the ABI wrapper reads it back. This matters because a *reference*
@@ -1666,7 +1666,7 @@ bit_rt_get_err()                -> ?*anyopaque   // read; non-null ⇒ failed
 
 `bit_rt_set_err`/`bit_rt_get_err` (`runtime/root/slots.bit:49`/`:57`) read and
 write `scrErr`, word 7 of the per-task scratch block at the base of the
-running task's own stack (`runtime/sched/scratch.bit:53`) — never a
+running task's own stack (`runtime/sched/scratch.bit:57`) — never a
 threadlocal: Mach-O refuses `@threadlocal` in the freestanding emit, and even
 where a threadlocal were available, a per-OS-thread slot would not survive the
 M:N scheduler migrating a goroutine to a different worker between the write
@@ -2421,29 +2421,29 @@ nothing was skipped.
 `rtStartMain` runs on the process's one and only thread before `boot` spawns
 the scheduler's worker pool (§9) — nothing below is ever written again once a
 second OS thread can observe it:
-- `runtime/root/os.bit`: `gArgc`, `gArgvPtr`, `gEnvpPtr` (`os.bit:70-72`) and
-  `gAuxv` (`os.bit:78`) — the four process-entry cells §19 documents.
+- `runtime/root/os.bit`: `gArgc`, `gArgvPtr`, `gEnvpPtr` (`os.bit:77-79`) and
+  `gAuxv` (`os.bit:85`) — the four process-entry cells §19 documents.
   Platform-free, not per-OS. `root.bit` declares none of them, and there is no
   separate `environ` cell: `gEnvpPtr` is the whole captured `envp` block.
   `runtime/shims/shims.bit` holds none of this either — its own header says
   the `setTable`/`getauxval`-table design was specified and then not needed,
   because `auxv()` (§19) can just read `gAuxv` back on demand: "No
   module-level state, so nothing to initialize and no ordering hazard between
-  a setter and its first reader" (`shims.bit:60-63`).
-- `runtime/root/root.bit`: `booted` (`root.bit:282`) — a single-boot guard
+  a setter and its first reader" (`shims.bit:63-64`).
+- `runtime/root/root.bit`: `booted` (`root.bit:300`) — a single-boot guard
   (asserted false on entry before it is set); the test-only reset to `false`
   between test bodies runs single-threaded, never racing a live scheduler.
 
 **Self-synchronized (a sibling spinlock cell, not an embedded struct field —
 this port has no `Heap`/`Gc`/`World`/`Scheduler` struct type anywhere):**
-- `runtime/root/root.bit`: `heapBlock` (`root.bit:240`) plus its two spinlock
-  cells `heapLockCell`/`listLockCell` (`root.bit:242-243`). `runtime/alloc/
+- `runtime/root/root.bit`: `heapBlock` (`root.bit:258`) plus its two spinlock
+  cells `heapLockCell`/`listLockCell` (`root.bit:260-261`). `runtime/alloc/
   alloc.bit`'s free-list functions take the block by pointer
-  (`root.bit:379`'s `ptrOf(heapBlock)`) — alloc.bit itself declares no module
+  (`root.bit:397`'s `ptrOf(heapBlock)`) — alloc.bit itself declares no module
   state (confirmed: it has no line matching `^let `). Has its own N-thread
   stress test.
-- `runtime/root/root.bit`: `gcState` (`root.bit:239`) — the collector's
-  `gcWords` block, likewise taken by pointer (`root.bit:376`) and handed to
+- `runtime/root/root.bit`: `gcState` (`root.bit:257`) — the collector's
+  `gcWords` block, likewise taken by pointer (`root.bit:383`) and handed to
   `runtime/gc/gc.bit`'s entry points. `gc.bit`'s own header says why it stays
   here rather than moving with the rest of gc: "the process-wide instance
   belongs to `runtime/root/`" (`gc.bit:12-17`); `gc.bit` declares no module
@@ -2455,7 +2455,7 @@ this port has no `Heap`/`Gc`/`World`/`Scheduler` struct type anywhere):**
   REGISTRY BLOCK IS `runtime/gc`'s OWN MODULE STATE... `gcworldsync.bit`
   declares `worldBlock`").
 - `runtime/root/{linux,darwin}/boot.bit`: `schedBlock`/`gSched`
-  (`linux/boot.bit:179,225`; `darwin/boot.bit:132,158`) — per-OS, the same
+  (`linux/boot.bit:189,254`; `darwin/boot.bit:143,187`) — per-OS, the same
   split §19's `host_target` has, and NOT `runtime/sched/sched.bit` either:
   `sched.bit` declares no scheduler-block singleton at all (no exported
   `schedWords`-style layout constant, no module state). `boot` owns the
@@ -2469,13 +2469,13 @@ base of the running task's own stack, so it survives the task migrating to a
 different OS thread — a per-OS-thread slot could not:**
 - `pending_err` (§13) — `runtime/root/slots.bit`'s `bit_rt_set_err`/
   `bit_rt_get_err` (`slots.bit:49`/`:57`) read/write `scrErr`, word 7 of the
-  per-task block (`runtime/sched/scratch.bit:53`). Never a threadlocal in
+  per-task block (`runtime/sched/scratch.bit:57`). Never a threadlocal in
   this file: Mach-O's freestanding emit refuses `@threadlocal` outright
   (`slots.bit:11-12`). The regression test this bullet used to cite by name
   no longer exists in the tree under that name; nothing currently guards this
   property with a dedicated stress test the way `worldBlock` above does.
 - `last_recv_ok` — `bit_rt_chan_recv_ok` (`slots.bit:78`) reads `scrRecvOk`,
-  word 264 of the same per-task block (`scratch.bit:73`), published by
+  word 264 of the same per-task block (`scratch.bit:77`), published by
   `bit_rt_chan_recv` on every receive path. Same file and mechanism as
   `pending_err` above; not the same mechanism as `udp_last_sender` below,
   despite the two being listed together before this audit.
@@ -2531,7 +2531,7 @@ per-worker storage, not a single shared word (§5.1):**
   read, adjacency holds: nothing parks in between, so the two see the same
   slot — and that slot is this task's worker's own, not shared with any other.
 - `runtime/sched/sched.bit`: `Worker.tls` — re-derived on every read from the
-  running task's own stack pointer (`sched.bit:490`'s `schedCurrentTask`),
+  running task's own stack pointer (`sched.bit:625`'s `schedCurrentTask`),
   never cached across a call boundary, specifically because a parked task can
   resume on a *different* OS thread (#1466): a cached thread pointer would
   hand back the previous thread's stale `Worker`. No global backs this at
@@ -2553,13 +2553,13 @@ them, exists in `runtime/**/*.bit` today:
   `@nosplit` rejects a call through a function value (E0075), so root
   scanning was inverted into a cursor the collector drives instead
   (`chanreg.bit:22-24`). A repo-wide search for `scan_ctx`/`ScanCtx` turns up
-  only the unrelated `stwScanCtx` (`runtime/stw/stw.bit:511`, a saved
+  only the unrelated `stwScanCtx` (`runtime/stw/stw.bit:485`, a saved
   register-context walk, not a sentinel).
 - `select_seed_counter` was designed but never built: `runtime/chan/
   chanselect.bit`'s own header says the atomic module-state counter "would
   need an atomic on module state, which needs `ptrOf`" and that design is
   "replaced by state that is per-task" (`chanselect.bit:19-24`) —
-  `scrCounter` (`runtime/sched/scratch.bit:43`), mixed with the task's own
+  `scrCounter` (`runtime/sched/scratch.bit:47`), mixed with the task's own
   address via splitmix64 (`chanselect.bit:36-40`). Per-task, so nothing to
   synchronize; not `runtime/chan`'s module state either, since chan declares
   none.
