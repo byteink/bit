@@ -1,0 +1,95 @@
+// Windows entropy source for the Stage-B port of runtime/rand/ (#3338, epic
+// #3322). See ../rand.bit for why the port is split by directory rather than
+// switching on the OS inside one file.
+//
+// ENTROPY POLICY IS DELIBERATELY STRICT, and is inherited verbatim from the
+// Linux and Darwin arms. Fill ONLY from the OS CSPRNG. Never a userspace
+// PRNG, never a weak or zero fallback. On failure report it and let the one
+// caller (`random.bit`'s `rtRandomBytes`) turn that into a fatal panic —
+// silently handing back predictable "random" bytes is a security defect far
+// worse than a crash. There is no fallback path in this file for the
+// underlying call being unavailable: `BCryptGenRandom` has shipped in every
+// Windows release since Vista SP1 / Server 2008, so "unavailable" cannot
+// happen on any Windows this compiler could plausibly target, and this file
+// does not add a branch to handle it — a dead branch that "handles" an
+// impossible case is exactly the kind of code that quietly becomes a live
+// fallback the day someone is wrong about the precondition.
+//
+// BCryptGenRandom, NOT RtlGenRandom/SystemFunction036 — ABI.md §21 already
+// names this exact call, `BCryptGenRandom(NULL, buf, len,
+// BCRYPT_USE_SYSTEM_PREFERRED_RNG)`, checking the NTSTATUS, so this file
+// implements a decision made there rather than making a new one. The
+// alternative, RtlGenRandom (exported under the undocumented name
+// SystemFunction036 from advapi32.dll), is the CryptoAPI-era route Microsoft's
+// own reference for it says to stop using: "New applications should use
+// BCryptGenRandom." Taking it would mean admitting a second DLL for a call
+// with no advantage over the documented one.
+//
+// bcrypt.dll IS a second DLL, though — a real one, distinct from kernel32.dll
+// — so this is not free. `compiler/peimport.bit`'s import-table builder
+// (`plGroupByDll`) already groups an arbitrary number of DLLs generically:
+// `PlDllGroups.dlls` is a `[]string` and every consumer of it
+// (`plBuildIdataLayout`, `plBuildIdataBytes`) loops `while (d < len(g.dlls))`
+// with no single-DLL assumption anywhere in that file — verified by reading
+// it, not assumed. So admitting bcrypt.dll needed no linker change, only
+// growing the admitted-surface table in `compiler/pesyms.bit` by one entry.
+extern fn BCryptGenRandom(hAlgorithm: *byte, pbBuffer: *u8, cbBuffer: i32, dwFlags: i32): i32
+
+// MSDN: BCRYPT_USE_SYSTEM_PREFERRED_RNG is 0x00000002, and REQUIRES
+// `hAlgorithm` to be NULL — passed as such below.
+const bcryptUseSystemPreferredRng: int = 0x00000002
+
+// BCryptGenRandom's `cbBuffer` is a 32-bit `ULONG` (MSDN's own signature),
+// while `n` here is a full-width `int` with no such bound. Casting an `n`
+// past 2^31 straight into `i32` would silently ask the OS for far fewer bytes
+// than the caller wanted while this function still reports success — exactly
+// the "returns zeros and everything works" failure shape this port exists to
+// rule out, just triggered by a width mismatch instead of a bad syscall. So
+// the fill is capped per call and loops, the Windows-specific counterpart of
+// the short-draw loop the Linux arm needs for a different reason (`getrandom`
+// itself can return fewer bytes than requested).
+//
+// BCryptGenRandom never partially fills on success — it either satisfies the
+// whole `cbBuffer` or returns a nonzero NTSTATUS — so unlike getrandom's
+// EINTR/short-draw retry, this loop only ever advances by a whole chunk or
+// aborts. 1 MiB is far under the 4 GiB `ULONG` ceiling and far above any
+// request this runtime issues in practice (key material and nonces, not bulk
+// data), so the cap is never observed in normal operation and exists purely
+// to keep every `i32(chunk)` conversion below provably safe.
+const bcryptMaxChunkBytes: int = 1048576
+
+// Fills the `n` packed bytes at `p` from the OS CSPRNG. Returns true on
+// success; false means the draw failed. The buffer is not guaranteed
+// untouched on failure — the caller aborts either way and never reads it.
+//
+// `@nosplit` (#1667), required for the same reason as the Linux and Darwin
+// arms: `p` is an interior pointer into the fresh `string`
+// `../windows/random.bit`'s `rtRandomBytes` just allocated and holds only as
+// a raw `int` (E0079 forbids the pin naming a managed type). ABI.md §5 walks
+// the running task's stack PRECISELY, so no stack map names that object;
+// without this annotation the `while` below carries a compiler-synthesized
+// `bl bit_rt_safepoint` at its back edge and a collection there sweeps the
+// buffer the OS is still filling (#1656).
+export @nosplit fn entropyFill(p: *u8, n: int): bool {
+  if (n <= 0) { // a zero-length fill is a no-op, not an error
+    return true
+  }
+  let nilHandle: *byte = nil
+  let off = 0
+  // Bounded by `n`: every iteration advances `off` by a positive chunk or
+  // returns.
+  while (off < n) {
+    let remain = n - off
+    let chunk = remain
+    if (chunk > bcryptMaxChunkBytes) {
+      chunk = bcryptMaxChunkBytes
+    }
+    // Any nonzero NTSTATUS is failure; STATUS_SUCCESS is 0 (MSDN).
+    let status = BCryptGenRandom(nilHandle, p + off, i32(chunk), i32(bcryptUseSystemPreferredRng))
+    if (status != 0) {
+      return false
+    }
+    off = off + chunk
+  }
+  return true
+}
