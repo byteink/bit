@@ -84,13 +84,27 @@ trap 'rm -rf "$work"' EXIT
 # subcommand exists at all. Exit status alone cannot tell "fmt refused this
 # file" from "there is no fmt", so the usage text is what distinguishes them —
 # it is the only signal that carries that difference.
+#
+# Bounded like every other call in this script (#3389): a probe run before the
+# main loop is still a call to an untrusted binary, and a hang here wedges the
+# script before the guarded loop is ever reached — the same shape
+# selfhost-diffcheck.sh's header warns about. A probe timeout is NOT evidence
+# of absence (a hang proves nothing about whether `fmt` exists), so it is
+# never folded into the "unknown subcommand" / ABSENT path below: it is its
+# own could-not-decide outcome, exit 2, same code the corpus-floor and ABSENT
+# checks already use in this file for "nothing was compared".
 probe_fmt() {
   local bin=$1 dir="$work/probe.$2"
   mkdir -p "$dir"
   printf 'fn main() {\n  print("hi\\n")\n}\n' >"$dir/p.bit"
   local out
-  out=$("$bin" fmt "$dir/p.bit" 2>&1)
+  out=$(ALARMRUN_KEEP_STDERR=1 alarmrun "$bin" fmt "$dir/p.bit" 2>&1)
   local rc=$?
+  if [ "$rc" -eq 142 ]; then
+    echo "difffmt: PROBE TIMEOUT — $bin hung on the capability probe after ${TIMEOUT}s" >&2
+    echo "difffmt: nothing was compared — a hung probe is not evidence of absence." >&2
+    exit 2
+  fi
   if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q 'unknown subcommand'; then
     return 1
   fi
