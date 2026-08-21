@@ -145,3 +145,23 @@ fn example() {
   describe(1 * Second + 500 * Millisecond)
 }
 ```
+
+## Formatting a duration
+
+### `formatDuration(d: int): string`
+
+Renders `d` nanoseconds the way a person reads it: `340ns`, `340us`, `340ms`
+below one second; `45s`, `2m5s`, `1h23m4s` at or above one second, each part
+truncated to a whole second. A negative `d` gets a leading `-`; `0` is `"0s"`.
+
+```bit
+import { formatDuration, Second, Millisecond } from "std/time"
+
+fn report(label: string, d: int) {
+  println("${label}: ${formatDuration(d)}")
+}
+
+fn example() {
+  report("timeout", 1 * Second + 500 * Millisecond)
+}
+```
