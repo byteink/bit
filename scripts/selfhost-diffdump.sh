@@ -338,9 +338,20 @@ run_basic() {
 
   # A phase that measured nothing must not pass (#1516). On an empty or unfindable
   # corpus the loop runs zero comparisons and MISMATCH is 0 for the wrong reason.
+  #
+  # exit 1, not 2, matching run_ir()'s floor in this same file (fixed by #3402,
+  # documented by #3393 as deliberate) per the reasoning #3380 established for
+  # selfhost-diffruntime.sh's four floors: selfhost-diffall.sh's ABSENT
+  # mechanism excuses exit 2 for a constituent listed in
+  # scripts/selfhost-diffall.absent, and ast/tokens/diags dumping has no
+  # "surface not implemented yet" case the way selfhost-difffmt.sh's or
+  # selfhost-diffdoc.sh's capability probes do -- a zero-comparison outcome
+  # here is always the harness broken (an unfindable corpus, or a stage0 that
+  # rejects every file), never a legitimate skip. Exit 2 would let a future
+  # ABSENT-list entry silently tolerate that; exit 1 cannot ever be excused.
   if [ "$match" -lt 1 ]; then
     echo "FATAL: the $LABEL differential compared nothing (MATCH=$match) — corpus walk found no .bit file." >&2
-    exit 2
+    exit 1
   fi
 
   # A real divergence wins over an undecided count: any observed mismatch is
