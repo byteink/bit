@@ -61,14 +61,42 @@ command -v objdump >/dev/null 2>&1 || {
 }
 [ -x "$ORACLE" ] && [ -x "$BIT2" ] || { echo "FATAL: build both compilers first (./make)" >&2; exit 2; }
 
-sites() { # $1=compiler $2=source $3=objfile -> safepoint count, "x" (did not build), "TIMEOUT" (build hung)
+# Alarm-guarded build with ONE retry (#3352): a trip is retried once before
+# being scored TIMEOUT, matching selfhost-fuzzdiff.sh's run() and
+# selfhost-diffexamples.sh's alarm_run() -- a hang is deterministic and trips
+# twice, ordinary load on a shared box does not. #3351's investigation found
+# five of six observed trips were on the ORACLE side (the pinned release
+# binary) under contention, not this tree -- exactly the flaky-infrastructure
+# signal a single retry is for.
+#
+# $1=compiler $2=outfile $3..=the build args after the compiler name.
+# -> rc: 0/nonzero from the build, or 142 iff BOTH attempts timed out.
+# Prints which side stalled on a first-attempt timeout even when the retry
+# recovers -- silence here would let a flaky oracle look healthy forever and
+# nobody would ever fix the real cause.
+build_retried() {
+  local compiler=$1 outfile=$2 rc side
+  shift 2
+  rm -f "$outfile"
+  alarmrun "$compiler" "$@" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -eq 142 ]; then
+    [ "$compiler" = "$ORACLE" ] && side=ORACLE || side=BIT2
+    echo "$side build stalled once (SIGALRM after ${TIMEOUT}s), retrying: $*" >&2
+    rm -f "$outfile"
+    alarmrun "$compiler" "$@" >/dev/null 2>&1
+    rc=$?
+  fi
+  return "$rc"
+}
+
+sites() { # $1=compiler $2=source $3=objfile -> safepoint count, "x" (did not build), "TIMEOUT" (build hung twice)
   local rc side
-  rm -f "$3"
-  alarmrun "$1" build "$2" --emit-obj -o "$3" >/dev/null 2>&1
+  build_retried "$1" "$3" build "$2" --emit-obj -o "$3"
   rc=$?
   if [ "$rc" -eq 142 ]; then
     [ "$1" = "$ORACLE" ] && side=ORACLE || side=BIT2
-    echo "$side timed out after ${TIMEOUT}s building: $2" >&2
+    echo "$side timed out after ${TIMEOUT}s building: $2 (twice)" >&2
     echo TIMEOUT
     return
   fi
@@ -165,14 +193,13 @@ echo "safepoint differential: MATCH=$match MISMATCH=$mismatch SKIP(does not buil
 # Counts must be equal: an extra safepoint is legal but wasteful, a missing one
 # starves the collector (ABI.md §5), and either is a real codegen divergence.
 
-exe_collections() { # $1=compiler $2=source $3=outbin -> collection count, "x" (did not build/link), "TIMEOUT" (build hung)
+exe_collections() { # $1=compiler $2=source $3=outbin -> collection count, "x" (did not build/link), "TIMEOUT" (build hung twice)
   local rc side
-  rm -f "$3"
-  alarmrun "$1" build "$2" -o "$3" >/dev/null 2>&1
+  build_retried "$1" "$3" build "$2" -o "$3"
   rc=$?
   if [ "$rc" -eq 142 ]; then
     [ "$1" = "$ORACLE" ] && side=ORACLE || side=BIT2
-    echo "$side timed out after ${TIMEOUT}s building: $2" >&2
+    echo "$side timed out after ${TIMEOUT}s building: $2 (twice)" >&2
     echo TIMEOUT
     return
   fi
