@@ -62,20 +62,16 @@
 //     is written through `../io.bit`'s `rootWriteAll`/`writeConst`, which do
 //     not exist here (#3331). Dead code with nothing to call is worse than an
 //     honest omission, so this file has no `statsReport` at all yet.
-//   - EXACTLY ONE WORKER BY DEFAULT, BUT BIT_WORKERS>1 NOW REACHABLE.
-//     `rootEnvWorkers(1)` is still called unchanged (so the shape matches the
-//     other two platforms — this file was written so #3332 wiring a real
-//     BIT_WORKERS needed no change HERE, and none was needed), but every
-//     worker this file could ever start — including a hypothetical worker
-//     1..N-1 — runs the SAME always-polls loop below. The other platforms
-//     give worker 0 that role and park every other worker on a futex-like
-//     wait (`schedIdlePark`/`WaitOnAddress`, #3336's `runtime/park/windows`,
-//     not built yet). Busy-polling every worker is CORRECT, just not
-//     efficient for a pool bigger than one — and with #3332 landed, a caller
-//     setting a real `BIT_WORKERS>1` can now actually reach that pool, not
-//     just this file's own hypothetical. Accepted as a known, already-
-//     tracked inefficiency (#3336's job to fix by parking), not a
-//     correctness gap.
+//   - EXACTLY ONE WORKER BY DEFAULT, BIT_WORKERS>1 NOW EFFICIENT: DONE
+//     (#3336). `rootEnvWorkers(1)` is still called unchanged, but
+//     `workerBody` below now matches ../linux and ../darwin's own split:
+//     worker 0 keeps polling (it drives the timer queue and, once Stage C
+//     lands, the netpoller), workers 1..N-1 arm and park on
+//     `schedIdlePark`/`WaitOnAddress` (`./../../park/windows`, #3336) instead
+//     of busy-waiting. `parkMonoNs`/`parkSleepNs` also moved here from this
+//     file's own placeholder `winMonoNs`/`winSleepNs`, which raced under a
+//     real multi-worker pool (see their old comments) — the park provider's
+//     caller-owned-scratch shape closes that.
 //
 // ---------------------------------------------------------------------------
 // THE WIN64 ENTRY ABI
@@ -140,10 +136,15 @@ import {
   schedRegisterBigStack, wkDeque, schedTaskExit, dqPushBottom,
   WORKER_MAX_STEPS, workerStepStop, scStopping, schedFindWorkAt,
   schedWorkerStepAt, wkLastDone, taskStackBase, taskStackBytes,
-  schedSpawnTrampoline, taskSpawnEntry,
+  schedSpawnTrampoline, taskSpawnEntry, wkSleepReq,
+  schedIdleArm, schedIdleDisarm, schedIdlePark,
 } from "../../sched"
+// `wkId`/`schedCurrentWorker`/`schedMaxWorkers` (from "../../sched") are
+// already imported into this module by ./io.bit — an import is per-MODULE,
+// not per-file, so a second import of any of them here would be E0042.
 import { threadStackBytes } from "../../thread"
 import { parkMinBackoffNs, parkNextBackoff } from "../../park"
+import { parkMonoNs, parkSleepNs } from "../../park/windows"
 import { mapPages, unmapPages, protectPages } from "../../alloc/windows"
 import { rootBindMemory, rootInit, rootConfigureFromEnv, rootEnvMarkStack, rootEnvWorkers } from "../../root"
 import { rootGcAddr, rootWorldAddr } from "../../root"
@@ -164,11 +165,13 @@ extern fn bit_main(): i32
 extern fn ExitProcess(code: i32)
 extern fn CreateThread(attrs: *byte, stackSize: i64, startAddr: *byte,
     param: *byte, flags: i32, threadIdOut: *i32): *byte
+// `WaitForSingleObject` here is ONLY for joining a worker's real CreateThread
+// HANDLE (step 8 below) — the monotonic-clock and idle-sleep declarations
+// this file used to carry (`QueryPerformanceCounter`/`_Frequency`,
+// `GetCurrentProcess`) moved to ../../park/windows/wait.bit (#3336) along
+// with the `winMonoNs`/`winSleepNs` bodies that used them.
 extern fn WaitForSingleObject(handle: *byte, timeoutMs: i32): i32
-extern fn GetCurrentProcess(): *byte
 extern fn CloseHandle(handle: *byte): i32
-extern fn QueryPerformanceCounter(count: *i64): i32
-extern fn QueryPerformanceFrequency(freq: *i64): i32
 
 // CreateThread's dwCreationFlags: interpret dwStackSize as the RESERVE size
 // (not the initial commit), so every worker gets the same 16MiB budget
@@ -310,64 +313,35 @@ let mainThreadTcb: i64 = 0
 }
 
 // ---------------------------------------------------------------------------
-// The monotonic clock (QueryPerformanceCounter) and the worker's idle sleep
-// (WaitForSingleObject on a pseudo-handle that never signals — the standard
-// substitute for kernel32's `Sleep`, which is not in the admitted import
-// surface; GetCurrentProcess/WaitForSingleObject both are). Both are this
-// file's own minimal stand-ins for ../../park/windows (#3336) and
-// ../windows/time.bit (#3333), used ONLY by this file's own worker loop and
-// boot-thread wait below — nothing outside this file references them.
+// The boot thread's own clock/sleep scratch — see ../linux/boot.bit's
+// identically-named `bootSleepReq`. The boot thread (this file's `boot()`,
+// step 7 below) is not a scheduler worker and so has no per-worker
+// `wkSleepReq` to reach; a dedicated module cell is safe because only this
+// one thread ever touches it (the same premise ../linux/boot.bit's own
+// `bootSleepReq` relies on).
 // ---------------------------------------------------------------------------
 
-let winQpcFreq: i64 = 0
-let winQpcScratch: i64 = 0
-
-// Nanoseconds since an arbitrary epoch, monotonic for the process's lifetime.
-// Split into whole ticks and remainder before scaling by 1e9 so the
-// multiplication cannot overflow i64 even after hours of uptime — a naive
-// `ticks * 1_000_000_000 / freq` overflows within roughly two minutes at a
-// 10MHz QueryPerformanceFrequency (the common modern value), since
-// `ticks * 1e9` alone exceeds 2^63 well before that.
-@nosplit fn winMonoNs(): int {
-  if (winQpcFreq == i64(0)) {
-    QueryPerformanceFrequency(ptrOf(winQpcScratch))
-    winQpcFreq = winQpcScratch
-    if (winQpcFreq == i64(0)) {
-      winQpcFreq = i64(1)   // refuse a divide-by-zero; QPC is documented to
-                             // always succeed on XP+, so this is unreached.
-    }
-  }
-  QueryPerformanceCounter(ptrOf(winQpcScratch))
-  let ticks = winQpcScratch
-  let whole = ticks / winQpcFreq
-  let rem = ticks % winQpcFreq
-  return int(whole * i64(1000000000) + rem * i64(1000000000) / winQpcFreq)
-}
-
-// Block the calling thread for at least `ns`, rounded up to whole
-// milliseconds (1ms minimum — WaitForSingleObject takes no finer unit).
-// `GetCurrentProcess()` is a pseudo-handle constant, never actually shared or
-// signaled by anything this process does, so the wait always times out —
-// exactly a sleep, with no separate `Sleep` import needed.
-@nosplit fn winSleepNs(ns: int) {
-  let ms = ns / 1000000
-  if (ms < 1) {
-    ms = 1
-  }
-  WaitForSingleObject(GetCurrentProcess(), i32(ms))
-}
+let bootSleepReq: [2]i64
 
 // ---------------------------------------------------------------------------
-// The worker OS-thread entry. See the header's "EXACTLY ONE WORKER, ALWAYS"
-// note: every worker this file could start runs this same always-polls loop,
-// unlike ../linux/../darwin's worker-0-polls-the-rest-park split — there is
-// no ../../park/windows (#3336) idle-wake primitive to park on yet.
+// The worker OS-thread entry — now the SAME worker-0-polls-the-rest-park
+// split ../linux and ../darwin's own `workerBody` uses (#3336). See
+// runtime/sched/sleep.bit's header for the full argument (a per-worker park
+// word, armed before the find-work pass, claimed by a producer with a CAS);
+// this function only wires that machinery in, it does not re-derive it.
 //
 // `arg` is the worker's own address directly (`schedWorkerAt(sched, wi)`,
 // passed as CreateThread's `lpParameter`) — no {workerAddr, doneAddr} bundle
 // like the other platforms build via `schedStartArm`: this file's join is
 // WaitForSingleObject on the real CreateThread HANDLE in `boot` below, so
 // there is no manually-polled "done word" for this thread to clear.
+//
+// NO USERSPACE SPIN (#3260/#3264): unlike ../linux and ../darwin, this loop
+// parks after exactly one failed find-work pass. Deliberately left out —
+// it is a pure latency/CPU-tradeoff optimisation on top of a correct park,
+// not something this ticket's acceptance (idle CPU, ticker accuracy, no
+// lost wakeup, no drift) requires, and adding it means also porting
+// `spinForWork`'s bookkeeping, which is a separate, later change.
 // ---------------------------------------------------------------------------
 fn workerBody(arg: *byte): *byte {
   gcThreadEnter()
@@ -377,20 +351,41 @@ fn workerBody(arg: *byte): *byte {
   winInstallStackGuarantee()
 
   let w = taskAt(int(arg))
+  let s: *i64 = ptrOf(schedBlock)
   let backoff = parkMinBackoffNs
+  // WORKER 0 POLLS, THE REST PARK (#1902 on ../linux/../darwin; #3336 here):
+  // worker 0 is the one that still drives the timer queue every turn (see
+  // `schedFindWorkAt`'s own comment on `schedTimerExpire`) and, once Stage C
+  // lands, the netpoller — leaving one worker awake keeps both driven with
+  // no separate wake-the-poller mechanism.
+  let parks = *(w + wkId) != 0
   let n = 0
   while (n < WORKER_MAX_STEPS) {
     n = n + 1
-    let addr = schedFindWorkAt(w, winMonoNs())
+    // ARM BEFORE LOOKING FOR WORK, never after — see runtime/sched/sleep.bit's
+    // header for why the order is the correctness argument.
+    if (parks) {
+      schedIdleArm(w)
+    }
+    let addr = schedFindWorkAt(w, parkMonoNs(w + wkSleepReq))
     if (addr == 0) {
-      if (atomicLoad(ptrOf(schedBlock) + scStopping) != 0) {
+      if (atomicLoad(s + scStopping) != 0) {
         break
       }
       gcBlockingBegin()
-      winSleepNs(backoff)
+      if (parks) {
+        schedIdlePark(s, w)
+      } else {
+        parkSleepNs(backoff, w + wkSleepReq)
+      }
       gcBlockingEnd()
       backoff = parkNextBackoff(backoff)
       continue
+    }
+    // Running instead of parking: clear the arm so a producer does not
+    // spend its one wake on a worker that is already busy.
+    if (parks) {
+      schedIdleDisarm(w)
     }
     backoff = schedWorkerStepAt(w, addr, 0, backoff)
     let doneTask = *(w + wkLastDone)
@@ -596,7 +591,7 @@ fn boot(): int {
   let backoff = 1000
   while (atomicLoad(ptrOf(mainDone)) == i32(0)) {
     gcBlockingBegin()
-    winSleepNs(backoff)
+    parkSleepNs(backoff, ptrOf(bootSleepReq))
     gcBlockingEnd()
     backoff = backoff * 2
     if (backoff > 1000000) {
