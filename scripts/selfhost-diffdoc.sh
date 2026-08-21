@@ -37,6 +37,8 @@
 set -uo pipefail
 # shellcheck source=scripts/alarmrun.sh
 . "$(dirname -- "$0")/alarmrun.sh"
+# shellcheck source=scripts/diffexit.sh
+. "$(dirname -- "$0")/diffexit.sh"
 
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
@@ -167,8 +169,6 @@ if [ "$compared" -eq 0 ]; then
   exit 2
 fi
 
-status=0
-
 if [ -s "$work/mismatch" ]; then
   echo
   # EVERY divergence, named — a "first divergence" report leaves the rest invisible.
@@ -185,15 +185,16 @@ if [ -s "$work/mismatch" ]; then
     alarmrun "$BIT2" doc "$dir" >"$work/db"
     diff "$work/da" "$work/db" | head -12
   done
-  status=1
 fi
 
 if [ -s "$work/timeout" ]; then
   echo
   echo "INVALID: $timeouts module(s) timed out after ${TIMEOUT}s — no verdict, not a match:"
   while read -r d; do echo "  $d"; done <"$work/timeout"
-  status=1
 fi
 
-[ "$status" -eq 0 ] && { echo; echo "diffdoc: the two doc surfaces agree on every compared module."; }
-exit "$status"
+# A timeout used to set the same status=1 a real mismatch does (#3382 sibling
+# finding, same shape as #3351/#3377/#3378/#3379/#3380): diffexit restores the
+# could-not-decide (2) distinction.
+[ "$mismatch" -eq 0 ] && [ "$timeouts" -eq 0 ] && { echo; echo "diffdoc: the two doc surfaces agree on every compared module."; }
+diffexit "doc" -f "$mismatch" -t "module(s)=$timeouts"

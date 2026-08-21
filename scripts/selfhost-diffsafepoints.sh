@@ -33,6 +33,8 @@
 set -u
 # shellcheck source=scripts/alarmrun.sh
 . "$(dirname -- "$0")/alarmrun.sh"
+# shellcheck source=scripts/diffexit.sh
+. "$(dirname -- "$0")/diffexit.sh"
 
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
@@ -427,17 +429,7 @@ fi
 
 # A real divergence wins over an undecided count: any observed mismatch is
 # evidence, regardless of how many builds elsewhere also timed out.
-if [ "$mismatch" -gt 0 ] || [ "$exe_mismatch" -gt 0 ] || [ "$INSTCHECK_RC" -eq 1 ]; then
-  exit 1
-fi
-# A timeout decided nothing — those builds were never differentially compared,
-# so the run cannot be called green, but it is not a divergence either. Exit 2
-# (could-not-decide) keeps it visible without claiming a divergence that was
-# never observed, matching the convention in x64gate.sh,
-# selfhost-fuzzdiff.sh and selfhost-diffexamples.sh.
-if [ "$timeout" -gt 0 ] || [ "$exe_timeout" -gt 0 ]; then
-  echo "UNDECIDED: $timeout safepoint-count build(s) and $exe_timeout linked-exe build(s) timed out after ${TIMEOUT}s and were NOT compared."
-  echo "           This is not a pass. Re-run on a quieter host, or raise DIFFSAFEPOINTS_TIMEOUT."
-  exit 2
-fi
-exit 0
+instcheckfail=0
+[ "$INSTCHECK_RC" -eq 1 ] && instcheckfail=1
+diffexit "safepoints" -f "$mismatch" "$exe_mismatch" "$instcheckfail" \
+  -t "safepoint-count build(s)=$timeout" "linked-exe build(s)=$exe_timeout"

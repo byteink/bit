@@ -38,6 +38,8 @@
 set -u
 # shellcheck source=scripts/alarmrun.sh
 . "$(dirname -- "$0")/alarmrun.sh"
+# shellcheck source=scripts/diffexit.sh
+. "$(dirname -- "$0")/diffexit.sh"
 
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
@@ -187,29 +189,18 @@ for d in examples/*/; do
 done
 
 echo "example differential: PASS=$pass DIFF=$diff TIMEOUT=$timedout REFUSED=$refused (pinned $EXPECTED_REFUSED) ORACLE-FAIL=$oraclefail SKIP(network)=$skipped"
-# A DIFF is a miscompile; a ORACLE-FAIL means the oracle itself did not build.
-if [ "$diff" -gt 0 ] || [ "$oraclefail" -gt 0 ]; then
-  exit 1
-fi
-# A TIMEOUT decided nothing: those examples were never differentially tested, so
-# the run cannot be called green. Exit 2 = could-not-decide, matching the
-# precondition/fatal convention of x64gate.sh and selfhost-diffsafepoints.sh and
-# staying distinct from exit 1 = real divergence.
-if [ "$timedout" -gt 0 ]; then
-  echo "UNDECIDED: $timedout example(s) timed out after ${TIMEOUT_S}s x2 and were NOT compared."
-  echo "           This is not a pass. Re-run on a quieter host, or raise TIMEOUT_S."
-  echo "           If it reproduces on an idle host, that is a real hang — investigate it."
-  exit 2
-fi
 # A REFUSED example is an honest "not ported yet" only while it matches the pin.
+refusedmismatch=0
 if [ "$refused" -gt "$EXPECTED_REFUSED" ]; then
   echo "FAIL: REFUSED rose $EXPECTED_REFUSED -> $refused. A construct that used to lower no longer does."
   echo "      Fix the regression, or raise EXPECTED_REFUSED in this script if the refusal is deliberate."
-  exit 1
-fi
-if [ "$refused" -lt "$EXPECTED_REFUSED" ]; then
+  refusedmismatch=1
+elif [ "$refused" -lt "$EXPECTED_REFUSED" ]; then
   echo "FAIL: REFUSED fell $EXPECTED_REFUSED -> $refused. Lower EXPECTED_REFUSED to $refused in this script,"
   echo "      otherwise the pin leaves $((EXPECTED_REFUSED - refused)) refusals of slack for a regression to hide in."
-  exit 1
+  refusedmismatch=1
 fi
-exit 0
+# A DIFF is a miscompile; an ORACLE-FAIL means the oracle itself did not build;
+# a REFUSED drift off the pin is a regression either direction. All three
+# always win over a concurrent TIMEOUT, which decided nothing.
+diffexit "examples" -f "$diff" "$oraclefail" "$refusedmismatch" -t "example(s)=$timedout"

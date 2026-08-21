@@ -18,6 +18,8 @@
 set -u
 # shellcheck source=scripts/alarmrun.sh
 . "$(dirname -- "$0")/alarmrun.sh"
+# shellcheck source=scripts/diffexit.sh
+. "$(dirname -- "$0")/diffexit.sh"
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
 # scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
@@ -100,17 +102,5 @@ fi
 
 # A real divergence wins over an undecided count: any observed mismatch or
 # failure is evidence, regardless of how many builds elsewhere also timed out.
-if [ "$diff" -gt 0 ] || [ "$oraclefail" -gt 0 ] || [ "$refused" -gt 0 ] || [ "$scpfail" -gt 0 ]; then
-  exit 1
-fi
-# A timeout decided nothing -- those builds were never differentially compared,
-# so the run cannot be called green, but it is not a divergence either. Exit 2
-# (could-not-decide) keeps it visible without claiming a divergence that was
-# never observed, matching the convention in x64gate.sh, selfhost-fuzzdiff.sh
-# and selfhost-diffsafepoints.sh.
-if [ "$oracletimeout" -gt 0 ] || [ "$bit2timeout" -gt 0 ]; then
-  echo "UNDECIDED: $oracletimeout ORACLE build(s) and $bit2timeout BIT2 build(s) timed out after ${TIMEOUT}s and were NOT compared."
-  echo "           This is not a pass. Re-run on a quieter host, or raise DIFFEXAMPLESX64_TIMEOUT."
-  exit 2
-fi
-exit 0
+diffexit "examples-x64" -f "$diff" "$oraclefail" "$refused" "$scpfail" \
+  -t "ORACLE build(s)=$oracletimeout" "BIT2 build(s)=$bit2timeout"
