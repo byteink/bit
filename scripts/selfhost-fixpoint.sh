@@ -35,6 +35,20 @@
 #        (or pass an explicit stageA binary: bash scripts/selfhost-fixpoint.sh path/to/bit)
 # Run from the repo root so the CWD-relative libbitrt lookup resolves.
 set -eu
+# shellcheck source=scripts/alarmrun.sh
+. "$(dirname -- "$0")/alarmrun.sh"
+
+# stage() is a FULL self-build (`bit build compiler -o ...`), not a
+# single-file dump or a corpus pass, so the family's 20s/300s conventions
+# (selfhost-diffdump.sh et al.) do not apply here — they would fire on an
+# ordinary contended box. Reuse the bound the build driver ITSELF already
+# uses for this exact operation: tools/build/artifacts.bit's
+# `buildTimeoutMs()` returns 1800000ms (30 min) and is what bounds the
+# driver's own "selfhost" step (`runShell("selfhost", script,
+# buildTimeoutMs())`, artifacts.bit:766). That is an already-agreed number
+# for the identical operation, not a new one invented for this script.
+# Override with FIXPOINT_TIMEOUT for a slower host.
+TIMEOUT=${FIXPOINT_TIMEOUT:-1800}
 STAGEA="${1:-bit-out/bin/bit}"
 WORK="$(pwd)/.fixpoint-work"
 rm -rf "$WORK"
@@ -52,9 +66,19 @@ mkdir -p "$WORK/b" "$WORK/c" "$WORK/d"
 # `selfhost` bucket ran it on every compiler/** change.
 #
 # So: the stage builds keep their own logs, and a non-zero build exits 2 (a
-# broken gate) rather than 1 (a broken compiler), naming the log.
+# broken gate) rather than 1 (a broken compiler), naming the log. A timed-out
+# build gets its own message for the same reason: a hung stageB/C/D disproves
+# nothing about the fixed point — it is could-not-decide, exit 2, same as a
+# build failure, not exit 1 (a proven non-fixed-point).
 stage() { # <label> <compiler> <out>
-  if ! "$2" build compiler -o "$3" >"$WORK/$1.log" 2>&1; then
+  local rc=0
+  ALARMRUN_KEEP_STDERR=1 alarmrun "$2" build compiler -o "$3" >"$WORK/$1.log" 2>&1 || rc=$?
+  if [ "$rc" -eq 142 ]; then
+    echo "fixpoint: $1 TIMED OUT after ${TIMEOUT}s — could not decide, not a broken fixed point" >&2
+    sed -n '1,20p' "$WORK/$1.log" >&2
+    exit 2
+  fi
+  if [ "$rc" -ne 0 ]; then
     echo "fixpoint: $1 FAILED TO BUILD — this is a broken gate, not a broken fixed point" >&2
     sed -n '1,20p' "$WORK/$1.log" >&2
     exit 2
