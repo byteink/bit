@@ -379,6 +379,41 @@ fn stackArgSlots(ctx: TypeContext, f: IrFunc, args: []int, baseIntOrd: int, base
   return slots
 }
 
+// #3284: does `f` contain a division/remainder instruction whose runtime
+// zero-check (#2016) reaches `emitCallReloc(cx, "bit_rt_panic_div_zero")`
+// (arm64select.bit's emitDivInt)? That call is invisible to hasSafepoints —
+// it isn't Op.Call/RtCall/CallValue/CallIface/GcAlloc/MakeClosure, so
+// isSafepointOp never sees it — which is exactly the gap #2929's frameless
+// optimization left open once a stack walker exists to be misled by it
+// (spec/SPEC.md §18.6). bit_rt_panic_nil_call/_nil_iface do NOT need an
+// equivalent check here: both are emitted only from emitCallValue/
+// emitCallIface (arm64call.bit), and Op.CallValue/Op.CallIface are already
+// in isSafepointOp, so any function containing either one already has
+// hasSafepoints == true and is disqualified from `frameless` before this
+// predicate would ever matter — hasSafepoints already covers them; it is
+// deliberately not reused here because it does NOT cover div/rem.
+//
+// Mirrors emitDivInt's own accept/decline exactly, so this predicate can
+// never disagree with what the emitter actually does: SDiv/UDiv skip the
+// check (and the call) only on a divisor xConstPow2Divisor proves a known,
+// positive power of two; SRem/URem are deliberately never reduced (#3104)
+// and always emit the check, regardless of the divisor.
+fn hasDivZeroGuard(ctx: TypeContext, f: IrFunc): bool {
+  let i = 0
+  while (i < len(f.instrs)) {
+    let ins = f.instrs[i]
+    if (ins.op == Op.SDiv || ins.op == Op.UDiv) {
+      if (xConstPow2Divisor(f, ins.rhs, widthOf(ctx, ins.ty)) < 0) {
+        return true
+      }
+    } else if (ins.op == Op.SRem || ins.op == Op.URem) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
 // One compiled function: its machine code plus everything an object writer needs
 // to place it.
 struct FuncCode {
@@ -512,17 +547,23 @@ fn compileFunction(module: IrModule, f: IrFunc): FuncCode {
   // address-of operator (spec/SPEC.md §13) — so nothing ever needs this
   // function's frame to be stable.
   //
-  // One call this backend emits is NOT in `hasSafepoints`: emitDivInt's inline
+  // #3284 (revisits #2929): one call this backend emits is NOT in
+  // `hasSafepoints` and used to be let through anyway — emitDivInt's inline
   // `bl bit_rt_panic_div_zero` guard (#2016), reachable from a bare SDiv/UDiv/
-  // SRem/URem with no other call in the function. Leaving it out of this
-  // decision is safe: it never returns (`bit_rt_panic_div_zero` calls
-  // `bit_rt_os_exit`, which never comes back) and this backend's panic path
-  // never walks a frame chain at all (runtime/root/darwin/io.bit's `bit_rt_panic`
-  // doc comment — "codegen makes no frame-pointer-chain promise"). A
-  // safepoint-bearing function (CallValue/CallIface's own nil-check panics)
-  // never reaches this branch, since those ops are already in `hasSafepoints`.
-  let frameless = !f.isNaked && !hasSafepoints && result.numSpillSlots == 0 &&
-    len(savedGpr) == 0 && len(savedFpr) == 0 && outgoingBytes == 0
+  // SRem/URem with no other call in the function. That was sound only as long
+  // as "this backend's panic path never walks a frame chain at all"
+  // (runtime/root/darwin/io.bit's `bit_rt_panic` doc comment) stayed true;
+  // spec/SPEC.md §18.6 commits to a runtime stack walker (#3285) that makes it
+  // false, so a div-zero panic inside an otherwise-frameless leaf must now
+  // establish a real frame record for that walker to find — `hasDivZeroGuard`
+  // (above) covers exactly this gap. A safepoint-bearing function
+  // (CallValue/CallIface's own nil-check panics) never needed this: those ops
+  // are already in `hasSafepoints`, which already excludes it from `frameless`
+  // — hasSafepoints is reused for that half and is NOT reused for div/rem,
+  // because it does not cover div/rem.
+  let panicReachable = hasDivZeroGuard(ctx, f)
+  let frameless = !f.isNaked && !hasSafepoints && !panicReachable &&
+    result.numSpillSlots == 0 && len(savedGpr) == 0 && len(savedFpr) == 0 && outgoingBytes == 0
 
   let frameSize = 0
   if (!frameless) {
