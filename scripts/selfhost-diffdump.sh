@@ -549,6 +549,20 @@ run_ir() {
   # The distinction from the count-vs-set argument in the header is that this is not
   # a threshold on how much matched. Zero is the one count that means the gate did
   # not run, so it is the one count worth asserting.
+  #
+  # exit 1, not 2, and this is now DELIBERATE rather than the undocumented
+  # divergence #3393 found it to be. run_basic()'s own floor, earlier in this
+  # file, uses 2 and was left that way (#3393 does not touch it; a fix for it
+  # is filed separately, #3402) -- but 2 is wrong for a floor like this one,
+  # per the reasoning #3380 established for selfhost-diffruntime.sh's four
+  # floors one day earlier: selfhost-diffall.sh's ABSENT mechanism excuses
+  # exit 2 for a constituent listed in scripts/selfhost-diffall.absent, and
+  # IR dumping has no "surface not implemented yet" case the way
+  # selfhost-difffmt.sh's or selfhost-diffdoc.sh's capability probes do --
+  # every zero-comparison outcome here IS the harness broken (an unfindable
+  # corpus, or a stage0 that rejects every file), never a legitimate skip.
+  # Exit 2 would let a future ABSENT-list entry silently tolerate that; exit 1
+  # cannot ever be excused, which is the point.
   if [ "$match" -eq 0 ]; then
     echo
     echo "INVALID: compared 0 files (skipped $skip) — the corpus or the oracle is broken. Nothing was verified." >&2
