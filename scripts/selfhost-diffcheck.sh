@@ -99,16 +99,15 @@ TIMEOUT_S=${TIMEOUT_S:-20}
 
 # Alarm-guarded run; captures diagnostics (stderr) and discards stdout.
 # The exit status is LOAD-BEARING and must be read by every caller: it returns
-# 142 (128+SIGALRM) iff the run timed out TWICE.
+# 142 (128+SIGALRM) iff the run timed out TWICE. Retry-once-on-stall is
+# scripts/alarmrun.sh's alarmrun_retry (#3408); no persistent artifact to clean
+# between attempts here, so its outfile arg is "".
 run() {
-  local out rc
+  local out rc side
   local TIMEOUT="$TIMEOUT_S"
-  out=$(ALARMRUN_KEEP_STDERR=1 alarmrun "$@" 2>&1 >/dev/null)
+  [ "$1" = "$ORACLE" ] && side=ORACLE || side=BIT2
+  out=$(ALARMRUN_KEEP_STDERR=1 alarmrun_retry "$side" "" "$@" 2>&1 >/dev/null)
   rc=$?
-  if [ "$rc" -eq 142 ]; then
-    out=$(ALARMRUN_KEEP_STDERR=1 alarmrun "$@" 2>&1 >/dev/null)
-    rc=$?
-  fi
   printf '%s' "$out"
   return "$rc"
 }

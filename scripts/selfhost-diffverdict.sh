@@ -86,16 +86,15 @@ TIMEOUT_S=${TIMEOUT_S:-20}
 # Verdict of one compiler on one program: prints "A" (accepted), "R" (rejected)
 # or "T" (timed out — NOT a verdict; see the header). `check` is used rather than
 # `build`: this asks a question about the CHECKER, and it keeps the sweep fast
-# enough to gate on.
+# enough to gate on. Retry-once-on-stall is scripts/alarmrun.sh's
+# alarmrun_retry (#3408); no persistent artifact to clean between attempts
+# here, so its outfile arg is "".
 verdict() {
-  local rc
+  local rc side
   local TIMEOUT="$TIMEOUT_S"
-  alarmrun "$1" check "$2" >/dev/null
+  [ "$1" = "$ORACLE" ] && side=ORACLE || side=BIT2
+  alarmrun_retry "$side" "" "$1" check "$2" >/dev/null
   rc=$?
-  if [ "$rc" -eq 142 ]; then
-    alarmrun "$1" check "$2" >/dev/null
-    rc=$?
-  fi
   if [ "$rc" -eq 142 ]; then
     printf 'T'
   elif [ "$rc" -eq 0 ]; then

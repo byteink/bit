@@ -76,24 +76,21 @@ BIT2=${BIT2:-bit-out/bin/bit}
 # budget with TIMEOUT_S for a slower host.
 TIMEOUT_S=${TIMEOUT_S:-60}
 
-# alarm_run <outfile> <cmd...> — returns 142 iff the run timed out twice.
+# alarm_run <side> <outfile> <cmd...> — returns 142 iff the run timed out twice.
 # `timeout` is not on macOS, perl is. alarm(2) survives exec, and exec resets
 # SIGALRM to its default (terminate), so the child dies even though the handler
 # does not carry over. Caveat: a child that deliberately exits 142 is
 # indistinguishable from a timeout — no example does, and the retry means such a
 # child would have to do it twice.
-# The subshell wrapper silences the shell's own "Alarm clock: 14" job message —
-# it also fires for a trip that RECOVERS on retry, so it would smear noise across
-# a green log and inflate any count of alarm lines. The TIMEOUT line below is the
-# reportable signal.
+# The subshell wrapper silences the shell's own "Alarm clock: 14" job message.
+# Retry-once-on-stall is scripts/alarmrun.sh's alarmrun_retry (#3408); <outfile>
+# here is the captured build/run log, already freshly truncated per attempt by
+# the `>"$out"` redirect below, so alarmrun_retry's own cleanup arg is "".
 alarm_run() {
-  local out=$1 rc
-  shift
+  local side=$1 out=$2 rc
+  shift 2
   local TIMEOUT="$TIMEOUT_S"
-  ( ALARMRUN_KEEP_STDERR=1 alarmrun "$@" >"$out" 2>&1 ) 2>/dev/null
-  rc=$?
-  [ "$rc" -ne 142 ] && return "$rc"
-  ( ALARMRUN_KEEP_STDERR=1 alarmrun "$@" >"$out" 2>&1 ) 2>/dev/null
+  ( ALARMRUN_KEEP_STDERR=1 alarmrun_retry "$side" "" "$@" >"$out" 2>&1 ) 2>/dev/null
   return $?
 }
 # The pin. Override only to explore locally; the committed value is the gate.
@@ -137,7 +134,7 @@ for d in examples/*/; do
   # The BUILDS are alarm-guarded too: a compiler that hangs while compiling was
   # previously unbounded by this script, and a hung bit2 build would have been
   # scored REFUSED ("not ported yet") rather than surfaced.
-  alarm_run "$TMP/bo_$n" "$ORACLE" build "$d" -o "$TMP/oracle_$n"
+  alarm_run ORACLE "$TMP/bo_$n" "$ORACLE" build "$d" -o "$TMP/oracle_$n"
   rc=$?
   if [ "$rc" -eq 142 ]; then
     echo "TIMEOUT   $n (oracle build, SIGALRM after ${TIMEOUT_S}s, twice)"
@@ -150,7 +147,7 @@ for d in examples/*/; do
     continue
   fi
 
-  alarm_run "$TMP/err_$n" "$BIT2" build "$d" -o "$TMP/b2_$n"
+  alarm_run BIT2 "$TMP/err_$n" "$BIT2" build "$d" -o "$TMP/b2_$n"
   rc=$?
   if [ "$rc" -eq 142 ]; then
     echo "TIMEOUT   $n (bit2 build, SIGALRM after ${TIMEOUT_S}s, twice)"
@@ -163,9 +160,9 @@ for d in examples/*/; do
     continue
   fi
 
-  alarm_run "$TMP/o_oracle_$n" "$TMP/oracle_$n"
+  alarm_run ORACLE "$TMP/o_oracle_$n" "$TMP/oracle_$n"
   se=$?
-  alarm_run "$TMP/o_b2_$n" "$TMP/b2_$n"
+  alarm_run BIT2 "$TMP/o_b2_$n" "$TMP/b2_$n"
   b2=$?
 
   # Undecided, not agreement: bail BEFORE the comparison so two absent results

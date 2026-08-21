@@ -61,41 +61,22 @@ command -v objdump >/dev/null 2>&1 || {
 }
 [ -x "$ORACLE" ] && [ -x "$BIT2" ] || { echo "FATAL: build both compilers first (./make)" >&2; exit 2; }
 
-# Alarm-guarded build with ONE retry (#3352): a trip is retried once before
-# being scored TIMEOUT, matching selfhost-fuzzdiff.sh's run() and
-# selfhost-diffexamples.sh's alarm_run() -- a hang is deterministic and trips
-# twice, ordinary load on a shared box does not. #3351's investigation found
-# five of six observed trips were on the ORACLE side (the pinned release
+# Alarm-guarded build with ONE retry (#3352), via scripts/alarmrun.sh's
+# alarmrun_retry (#3408: promoted here from four more differentials that had
+# each reimplemented this same retry loop under their own local helper name).
+# A trip is retried once before being scored TIMEOUT -- #3351's investigation
+# found five of six observed trips were on the ORACLE side (the pinned release
 # binary) under contention, not this tree -- exactly the flaky-infrastructure
-# signal a single retry is for.
-#
-# $1=compiler $2=outfile $3..=the build args after the compiler name.
-# -> rc: 0/nonzero from the build, or 142 iff BOTH attempts timed out.
-# Prints which side stalled on a first-attempt timeout even when the retry
-# recovers -- silence here would let a flaky oracle look healthy forever and
-# nobody would ever fix the real cause.
-build_retried() {
-  local compiler=$1 outfile=$2 rc side
-  shift 2
-  rm -f "$outfile"
-  alarmrun "$compiler" "$@" >/dev/null 2>&1
-  rc=$?
-  if [ "$rc" -eq 142 ]; then
-    [ "$compiler" = "$ORACLE" ] && side=ORACLE || side=BIT2
-    echo "$side build stalled once (SIGALRM after ${TIMEOUT}s), retrying: $*" >&2
-    rm -f "$outfile"
-    alarmrun "$compiler" "$@" >/dev/null 2>&1
-    rc=$?
-  fi
-  return "$rc"
-}
+# signal a single retry is for. alarmrun_retry removes <outfile> before each
+# attempt: a process killed mid-write can leave a partial object/binary that a
+# later `[ -f "$outfile" ]` check would misread as a completed build.
 
 sites() { # $1=compiler $2=source $3=objfile -> safepoint count, "x" (did not build), "TIMEOUT" (build hung twice)
   local rc side
-  build_retried "$1" "$3" build "$2" --emit-obj -o "$3"
+  [ "$1" = "$ORACLE" ] && side=ORACLE || side=BIT2
+  alarmrun_retry "$side" "$3" "$1" build "$2" --emit-obj -o "$3"
   rc=$?
   if [ "$rc" -eq 142 ]; then
-    [ "$1" = "$ORACLE" ] && side=ORACLE || side=BIT2
     echo "$side timed out after ${TIMEOUT}s building: $2 (twice)" >&2
     echo TIMEOUT
     return
@@ -195,10 +176,10 @@ echo "safepoint differential: MATCH=$match MISMATCH=$mismatch SKIP(does not buil
 
 exe_collections() { # $1=compiler $2=source $3=outbin -> collection count, "x" (did not build/link), "TIMEOUT" (build hung twice)
   local rc side
-  build_retried "$1" "$3" build "$2" -o "$3"
+  [ "$1" = "$ORACLE" ] && side=ORACLE || side=BIT2
+  alarmrun_retry "$side" "$3" "$1" build "$2" -o "$3"
   rc=$?
   if [ "$rc" -eq 142 ]; then
-    [ "$1" = "$ORACLE" ] && side=ORACLE || side=BIT2
     echo "$side timed out after ${TIMEOUT}s building: $2 (twice)" >&2
     echo TIMEOUT
     return
@@ -409,8 +390,9 @@ fi
 # relocation naming `_f1$0` in __text is therefore the exact, deterministic
 # signature of the reverted bug for this fixture — not a heuristic.
 instcheck() { # $1=compiler $2=outobj -> prints verdict; sets $INSTCHECK_RC (0 pass, 1 fail, 2 could-not-decide)
-  local fixture="tests/cases/run_generic_call_via_param.bit" calls rc
-  build_retried "$1" "$2" build "$fixture" --emit-obj -o "$2"
+  local fixture="tests/cases/run_generic_call_via_param.bit" calls rc side
+  [ "$1" = "$ORACLE" ] && side=ORACLE || side=BIT2
+  alarmrun_retry "$side" "$2" "$1" build "$fixture" --emit-obj -o "$2"
   rc=$?
   if [ "$rc" -eq 142 ]; then
     echo "instcheck: build timed out after ${TIMEOUT}s: $fixture (twice)" >&2
