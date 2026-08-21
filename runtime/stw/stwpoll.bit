@@ -12,6 +12,32 @@
 // 0.36s against a 1.0s acceptance bar, so this only needs to be cheap, not
 // branch-free.
 //
+// THE LEAF IS A MEASURED PROPERTY OF THE EMITTED CODE, NOT A STYLE NOTE, AND
+// IT HAS BEEN LOST ONCE ALREADY. #3292 appended the object trigger to the tail
+// below as an `if`-ladder with an overflow-guarded `nextBytes + nextBytes`
+// ceiling. Nothing about that is wrong as a predicate — but it put three more
+// values live across a branch, and this function is register-allocated with a
+// full block-parameter shuffle at EVERY edge, so each one added a `mov` to
+// every edge until the caller-saved budget ran out and x19/x20/x21 spilled.
+// The result was a `sub sp, sp, #0x30` prologue and a five-register reload at
+// every one of the seven returns — charged to the EARLY returns too, which are
+// the whole point of the function. 102 -> 230 instructions, and `matrix`'s
+// 805M back edges paid 168.5 G of them (#3359).
+//
+// So the tail is deliberately ONE `return` expression rather than an `if`
+// ladder: the same three comparisons written as an `if`/`return` chain
+// measured 190 and kept the frame, the single expression measured 125 without
+// one. That is a fact about this backend's block-parameter shuffle (#1852 is
+// the missing copy-propagation that would make the two forms equal), so
+// re-measure rather than assume if you rewrite it.
+//
+// THE CHECK, cheap enough to run on any change to this function:
+//
+//   otool -tvV bit-out/lib/aarch64-macos/libbitrt.a ... runtime_stw.o
+//     | sed -n '/^_bit_rt_safepoint_needed:/,/^_[a-zA-Z]/p' | grep 'sub.*sp, sp, #'
+//
+// Any output at all means the leaf is gone and the poll is no longer free.
+//
 // MUST BE A SAFE OVER-APPROXIMATION of `stwPollOn`'s early-return ladder
 // below: returning false here must be provably a no-op there, in EVERY state
 // including pre-boot and GC-disabled. Returning true more often than strictly
@@ -67,17 +93,21 @@ export @nosplit @symbol("bit_rt_safepoint_needed") fn stwPollNeeded(): bool {
   let hb = hNil + (*(g + gcHeapAddr) / 8)
   let liveBytes = atomicLoad(hb + heapLiveWord)
   let nextBytes = *(g + gcNextBytes)
-  if (liveBytes < nextBytes) {
-    return false
-  }
-  if (*(g + gcNumObjectsIdx) >= *(g + gcNextObjects)) {
-    return true
-  }
-  let ceiling = gcAddrMax
-  if (nextBytes <= gcAddrMax - nextBytes) {
-    ceiling = nextBytes + nextBytes
-  }
-  return liveBytes >= ceiling
+  // `liveBytes - nextBytes >= nextBytes` IS the second-growth-cycle ceiling
+  // `liveBytes >= nextBytes * 2`, exactly, for every non-negative pair — and
+  // it needs neither the overflow guard nor `gcAddrMax`, because the doubling
+  // was the only thing that could overflow and this does not double. It is
+  // also exact when the byte trigger is NOT crossed (`liveBytes - nextBytes`
+  // goes negative, which is < a non-negative `nextBytes`), so the `&&` is a
+  // short-circuit for speed, not a guard the subtraction depends on.
+  //
+  // The one state where this differs from #3292's saturating form is
+  // `liveBytes == gcAddrMax` with `nextBytes > gcAddrMax / 2`, where that form
+  // clamped the ceiling to `gcAddrMax` and so fired at exactly 2^63-1 live
+  // bytes. That is 8 EiB of live heap and it is unreachable; clamping meant
+  // "this arm cannot fire", and not firing is what this form encodes.
+  // `gcShouldCollect` and `stwPollOn` below carry the identical expression.
+  return liveBytes >= nextBytes && (liveBytes - nextBytes >= nextBytes || *(g + gcNumObjectsIdx) >= *(g + gcNextObjects))
 }
 
 // ---------------------------------------------------------------------------
@@ -199,14 +229,11 @@ fn stwPollOn(gcA: int, schedA: int, chanRegA: int, worldA: int, snap: int) {
     if (liveBytes < nextBytes) {
       return
     }
-    if (*(g + gcNumObjectsIdx) < *(g + gcNextObjects)) {
-      let ceiling = gcAddrMax
-      if (nextBytes <= gcAddrMax - nextBytes) {
-        ceiling = nextBytes + nextBytes
-      }
-      if (liveBytes < ceiling) {
-        return
-      }
+    // The de Morgan of `stwPollNeeded`'s tail above and `gcShouldCollect`'s,
+    // in the same overflow-free subtraction form (#3359): neither the second
+    // growth cycle nor the object trigger is due, so nothing to do.
+    if (liveBytes - nextBytes < nextBytes && *(g + gcNumObjectsIdx) < *(g + gcNextObjects)) {
+      return
     }
   }
 
