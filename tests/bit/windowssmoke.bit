@@ -1,0 +1,279 @@
+// `./make test-windows-smoke` (#3341, epic #3322): cross-build a Bit program
+// for x86_64-windows, ship it to the REAL Windows box over SSH, run it there,
+// and assert its output — the same shape dist/release.sh already uses for
+// x86_64-linux via X64_HOST (scp a build, ssh in, run, assert), adapted to a
+// bare SSH host instead of a released tarball + docker.
+//
+// NOT part of the default `./make test`: tools/build/defs.bit registers this
+// Step in `coreSteps()`, not `gateSteps()`, so `gateNames()` — the list
+// `test` depends on — never names it, and an unreachable remote host (or an
+// incomplete Windows runtime port, see below) can never fail the mandatory
+// suite. `./make test-windows-smoke` runs it explicitly.
+//
+// USE THE RIGHT ALIAS. `mustafa-desktop-win` (native Windows 11, PowerShell)
+// and `mustafa-desktop-wsl` (WSL2 Ubuntu, bash) are the SAME physical
+// machine, and WSL interop means a Windows .exe invoked over the WSL alias
+// can still run and exit 0 — through a translation layer, with a different
+// current directory and console. Two independent layers guard against the
+// wrong alias here:
+//   1. Every remote command below is PowerShell syntax. Sent to the WSL
+//      alias's default bash shell, it fails mechanically — verified
+//      2026-08-21: `ssh mustafa-desktop-wsl '$PWD.Path'` exits 127,
+//      "command not found", before any assertion below even runs.
+//   2. The smoke program itself prints argv[0] — the ABSOLUTE path this
+//      script invoked it with, resolved via PowerShell's own `$PWD.Path` at
+//      invocation time, not a bare relative reference — and this gate
+//      asserts it does not start with `\\`, the UNC-path signature WSL
+//      interop gives a Windows process's view of its own invocation.
+//
+// KNOWN CURRENT BLOCKER, verified 2026-08-21, do not remove this note until
+// it is fixed: `bit build --target x86_64-windows` for ANY program, however
+// trivial, fails at LINK with "import 'bit_rt_port_park_wake' is not in the
+// admitted Windows import surface". runtime/sched/sleep.bit (platform-free,
+// always linked in — the scheduler boots for every program) declares
+// `extern fn bit_rt_port_park_wake`/`bit_rt_port_park_wait`, and only
+// runtime/park/<os>/wait.bit provides them. runtime/park/windows does not
+// exist yet (#3336, itself blocked on #3335's thread/windows). This gate
+// still cross-builds the archive and the program on every run — real,
+// useful signal on its own — and fails cleanly, naming the missing piece,
+// rather than skip silently. It self-upgrades to a full pass the moment
+// #3336 lands, with no change needed here.
+import { env, envOr, exit } from "std/os"
+import { exists, mkdir, readFile, writeFile } from "std/fs"
+import { contains, hasPrefix, parseInt, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// Generous for a cross-build; the SSH round trips are seconds. A hang here
+// is a failure, not a stall (matches coldboot.bit's reasoning).
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "180")) catch _ { 180 }
+  if (s <= 0) {
+    return 180000
+  }
+  return s * 1000
+}
+
+// BIT_REPO IS REQUIRED, same reason as every other shell-out gate in this
+// repo (tests/bit/coldboot.bit's header): a silent "." default would build
+// and ship whatever directory `bit` happened to be invoked from.
+fn repoRoot(): string {
+  let r = env("BIT_REPO")
+  if (len(r) == 0) {
+    panic("windowssmoke: BIT_REPO is not set — run this through `./make test-windows-smoke`")
+  }
+  return r
+}
+
+// Overridable so this gate's OWN unreachable-host path is testable without a
+// network outage: `BIT_WINDOWS_HOST=nonexistent ./make test-windows-smoke`.
+fn windowsHost(): string {
+  return envOr("BIT_WINDOWS_HOST", "mustafa-desktop-win")
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}
+
+// Runs `script` through /bin/sh (this Mac's shell, not the remote one) and
+// returns its exit code. Same shape as coldboot.bit's `shell()`: negative
+// returns are osRunBounded's own channel (ABI.md §19), never a program's
+// exit status, so each is a named panic rather than a value an assertion
+// could mistake for the thing under test.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("windowssmoke: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("windowssmoke: TIMED OUT after ${ms}ms — a hang is a failure, not a stall")
+  }
+  if (code == -1) {
+    panic("windowssmoke: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("windowssmoke: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+// Runs `script`, recording ITS OWN command's exit code to `codePath` — never
+// the wrapper's — so a wrapper-level setup failure (90/91 below) can never
+// be confused with the command under test failing. Returns (exit code,
+// captured stdout+stderr).
+fn runCaptured(scratch: string, tag: string, script: string, ms: int): (int, string) {
+  let outPath = "${scratch}/${tag}.out"
+  let codePath = "${scratch}/${tag}.code"
+  let wrapped = "#!/bin/sh\n" + script + "\necho $? > '${codePath}'\nexit 0\n"
+  let wrapperRc = shell("${scratch}/${tag}.sh", wrapped, ms) catch e {
+    panic("windowssmoke: ${e.message()}")
+    0
+  }
+  if (wrapperRc != 0) {
+    panic("windowssmoke: ${tag} wrapper script exited ${wrapperRc}, which it never should")
+  }
+  if (!exists(codePath)) {
+    panic("windowssmoke: no exit code recorded for '${tag}' — it never ran")
+  }
+  let codeText = trimSpace(readFile(codePath) catch e {
+    panic("windowssmoke: cannot read ${codePath}: ${e.message()}")
+    ""
+  })
+  let code = parseInt(codeText) catch _ {
+    panic("windowssmoke: ${codePath} did not contain a number: '${codeText}'")
+    0 - 1
+  }
+  let out = readFile(outPath) catch ""
+  return code, out
+}
+
+fn failStage(stage: string, code: int, out: string) {
+  eprint(out)
+  println("windowssmoke: FAIL at '${stage}' (exit ${code})")
+  exit(1)
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let root = repoRoot()
+  let host = windowsHost()
+  let bitBin = "${root}/bit-out/bin/bit"
+  let runId = "wsmoke-" + uuidFormat(uuidV4())
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-windowssmoke-${uuidFormat(uuidV4())}"
+  mkdir(scratch) catch e {
+    panic("windowssmoke: cannot create ${scratch}: ${e.message()}")
+  }
+  defer teardown(scratch, host, runId, ms)
+
+  // --- Phase 0: is the box even reachable? Fail here with a diagnostic that
+  // names the host, cheaply, before any cross-build. ---
+  let (rc0, out0) = runCaptured(scratch, "reachable",
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 -o ConnectionAttempts=1 '${host}' 'exit 0'\n", ms)
+  if (rc0 != 0) {
+    eprint(out0)
+    println("windowssmoke: FAIL — ${host} is unreachable over SSH (exit ${rc0}); this does not fail `./make test`")
+    exit(1)
+  }
+
+  // --- Phase 1: cross-build (or refresh) libbitrt.a for x86_64-windows,
+  // using THIS TREE'S OWN compiler — the pinned stage0 does not know the
+  // target name at all (tools/build/artifacts.bit's targets() comment). ---
+  let archivePath = "${scratch}/libbitrt-x86_64-windows.a"
+  let (rc1, out1) = runCaptured(scratch, "archive",
+    "cd '${root}' || exit 90\n" +
+    "BIT='${bitBin}' bash scripts/g2archive.sh x86_64-windows '${archivePath}'\n", ms)
+  if (rc1 != 0) {
+    failStage("cross-build libbitrt-x86_64-windows.a", rc1, out1)
+  }
+
+  // --- Phase 2: cross-build the smoke program against that archive. ---
+  let progDir = "${scratch}/prog"
+  mkdir(progDir) catch e {
+    panic("windowssmoke: cannot create ${progDir}: ${e.message()}")
+  }
+  writeFile("${progDir}/main.bit",
+    "import { args } from \"std/os\"\n\n" +
+    "fn main() {\n" +
+    "  print(\"smoke ok\\n\")\n" +
+    "  print(\"argv0=\${args()[0]}\\n\")\n" +
+    "}\n") catch e {
+    panic("windowssmoke: cannot write ${progDir}/main.bit: ${e.message()}")
+  }
+  let exePath = "${scratch}/${runId}.exe"
+  let (rc2, out2) = runCaptured(scratch, "buildprog",
+    "cd '${root}' || exit 90\n" +
+    "BIT_LIBBITRT='${archivePath}' '${bitBin}' build '${progDir}' --target x86_64-windows -o '${exePath}'\n", ms)
+  if (rc2 != 0) {
+    println("windowssmoke: cross-build failed — this is the known blocker documented at the top of this file (runtime/park/windows, #3336, blocked on #3335), not a new regression, UNLESS the message below has changed:")
+    failStage("cross-build the smoke program", rc2, out2)
+  }
+
+  // --- Phase 3: ship it, run it natively, assert both the marker and the
+  // nativeness signal. Only reached once Phase 2 actually links — not
+  // exercised as of #3341's landing; see the header. ---
+  // A RELATIVE scp destination, deliberately: a Windows destination with a
+  // drive letter (`host:C:\Users\...`) breaks scp's `host:path` parsing on
+  // the drive letter's own colon (verified 2026-08-21 — `scp` reports "No
+  // such file or directory" against a path PowerShell itself just created).
+  // A bare relative name lands in the SSH server's default directory (the
+  // user's home) with no such ambiguity.
+  let remoteName = "${runId}.exe"
+  let (rc3, out3) = runCaptured(scratch, "ship",
+    "scp -q -o BatchMode=yes -o ConnectTimeout=8 '${exePath}' '${host}:${remoteName}'\n", ms)
+  if (rc3 != 0) {
+    failStage("scp the smoke program to ${host}", rc3, out3)
+  }
+
+  // `Join-Path $PWD.Path ...` resolves the ABSOLUTE invocation path
+  // server-side, at run time — never a bare `.\name.exe` reference, which
+  // would make argv[0] the literal relative string and defeat the
+  // nativeness check below.
+  let (rc4, out4) = runCaptured(scratch, "run",
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 '${host}' " +
+    "\"& (Join-Path \\$PWD.Path '${remoteName}')\"\n", ms)
+  // Best-effort cleanup regardless of the run's own result; teardown() also
+  // retries this, so a failure here is not itself fatal.
+  runCaptured(scratch, "cleanup",
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 '${host}' 'Remove-Item -Force ${remoteName}'\n", ms)
+  if (rc4 != 0) {
+    failStage("run the smoke program on ${host}", rc4, out4)
+  }
+  if (!contains(out4, "smoke ok")) {
+    println("windowssmoke: FAIL — ${host} did not print 'smoke ok':")
+    eprint(out4)
+    exit(1)
+  }
+  let argv0Line = extractArgv0(out4)
+  if (len(argv0Line) == 0) {
+    println("windowssmoke: FAIL — no argv0= line in the program's output:")
+    eprint(out4)
+    exit(1)
+  }
+  if (hasPrefix(argv0Line, "\\\\")) {
+    println("windowssmoke: FAIL — argv[0] is a UNC path ('${argv0Line}') — this ran through WSL interop, not natively. Check BIT_WINDOWS_HOST.")
+    exit(1)
+  }
+  println("windowssmoke: PASS — ${host}, argv0=${argv0Line}")
+}
+
+// Pulls the value out of the program's own "argv0=..." output line.
+fn extractArgv0(out: string): string {
+  let lines = splitLines(out)
+  for line of lines {
+    if (hasPrefix(line, "argv0=")) {
+      return trimSpace(line[6:])
+    }
+  }
+  return ""
+}
+
+fn splitLines(s: string): []string {
+  let lines = []string(0)
+  let start = 0
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == '\n') {
+      lines = append(lines, s[start:i])
+      start = i + 1
+    }
+    i = i + 1
+  }
+  if (start < len(s)) {
+    lines = append(lines, s[start:])
+  }
+  return lines
+}
+
+// std/fs has no recursive remove, so the scratch tree goes the way it came.
+// Also best-effort removes the remote copy, in case Phase 3's own cleanup
+// never ran (an earlier phase failed first).
+fn teardown(scratch: string, host: string, runId: string, ms: int) {
+  shell("${scratch}/cleanup-remote.sh",
+    "#!/bin/sh\nssh -o BatchMode=yes -o ConnectTimeout=5 '${host}' 'Remove-Item -Force ${runId}.exe' > /dev/null 2>&1\nexit 0\n",
+    ms) catch _ { 0 }
+  shell("${scratch}/cleanup-local.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ { 0 }
+}
