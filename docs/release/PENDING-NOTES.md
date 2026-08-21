@@ -18,13 +18,22 @@ shipped in 0.1.21.
 
 ## How to use this file
 
-**When cutting a release** (`dist/release.sh`, step 1 of the `bit-release`
-skill): after `dist/changelog.sh` writes `dist/out/NOTES.md` and before
-drafting the GitHub release, check this file. If it has entries, append each
-one to `dist/out/NOTES.md` under its own heading, then delete the entry from
-this file in the commit that records the release notes were published. An
-entry that has shipped in a release's notes must not still be sitting here
-afterward.
+**The fold-in half is automatic (#3392).** `dist/release.sh` reads this file
+right after `dist/changelog.sh` writes `dist/out/NOTES.md`, and if it finds
+any entries below the `---` separator, appends each one (heading demoted one
+level, under the version title) to `dist/out/NOTES.md` — on both a real run
+and `--dry-run`. It prints an unmissable reminder when it does this.
+
+**The clear-out half is deliberately still manual.** `dist/release.sh` only
+ever produces a **draft**; nothing it does is visible until a human presses
+publish, and a draft can be abandoned or re-cut. If clearing this file
+happened automatically at generation time, an abandoned draft would silently
+eat the disclosure with nothing left to fold into the release that actually
+ships it. So: once a release carrying a folded entry is **published**,
+delete that entry from this file (everything between `---` and the next
+entry, or the whole tail if it was the only one) in the commit that records
+the release notes were published. An entry that has shipped in a published
+release's notes must not still be sitting here afterward.
 
 **An entry must not start a line with `- ` or `* `.** The release skill's
 "check the generated notes are complete" step asserts that
@@ -33,13 +42,8 @@ the release range (`dist/release.sh`'s own accounting guard in
 `dist/changelog.sh` enforces the same thing for the generated bullets). A
 hand-written top-level bullet would inflate that count and read as though a
 real commit's bullet had been silently displaced. Use a heading and prose
-instead, as the entry below does.
-
-**This file is not yet wired into `dist/release.sh` or the `bit-release`
-skill — consuming it today is a manual step**, done by whoever cuts the next
-release. Automating the copy-and-clear step is separate, scoped follow-up
-work (touches `dist/release.sh` and needs a build/test cycle, so it does not
-belong in a markdown-only change).
+instead, as the entry below does. `dist/release.sh` refuses to fold an entry
+that violates this rather than let it corrupt the count silently.
 
 ---
 
