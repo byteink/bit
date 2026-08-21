@@ -255,6 +255,45 @@ was already correct at plain function scope, file boundaries notwithstanding.
 nothing when an inner `let` hides an outer local. Prelude names are already
 covered, so this rule must not double-report them.
 
+**That predeclared-name warning is `shadows_predeclared` (E0048) — a `bit
+check` diagnostic, not an E02xx lint rule** (it predates this registry and is
+numbered in the resolver's own 40s diagnostic-code block alongside
+`undefined_name`/`duplicate_declaration`/etc — see `compiler/resolve.bit` and
+spec/SPEC.md §5.3, which is where it is normatively defined). It is documented
+here rather than only in SPEC.md because it is the direct sibling of
+`shadowed-local` above and a reader comparing the two rules should not have
+to leave this file. It fires (as a warning, never blocking
+`bit check`) on any module-scope or local declaration whose name matches a
+predeclared identifier (SPEC §5.3) — with two exemptions, both **narrowing
+when the rule fires, never suppressing an individual finding** (#3383):
+
+- **An `extern fn` declaration is never reported.** Its bare declared name IS
+  the external symbol it binds (SPEC §11.7); there is no alternate spelling,
+  so the shadow is structurally forced. `runtime/root/darwin/fs.bit`'s
+  `extern fn close` is SPEC §11.7's own cited example.
+- **An `export`ed declaration named for one of SPEC §5.3's own documented
+  predeclared *functions* — `len cap append delete close panic assert
+  parseFloat` — is not reported**, on the grounds that reusing one of these
+  specific, spec-documented names for a public API is a deliberate interface
+  decision, not an accidental collision. `std/strings.parseFloat`
+  (stdlib/strings/strings.bit), a fallible wrapper deliberately sharing the
+  builtin's name, is the motivating case.
+
+**This second exemption is deliberately narrower than "any exported
+declaration."** The resolver also reserves a much wider set of ABI-boundary
+primitive names beyond SPEC §5.3's list (`netLocalPort`, `netResolve`,
+`fsOpen`, ... — `compiler/symbols.bit`'s `predeclaredFuncs()`), and an
+exported function accidentally reusing one of *those* still warns: #3353
+found and renamed exactly two such accidents in `runtime/net/**`
+(`netResolve`, `netLocalPort`, both `export`ed), and a broader exemption would
+silently stop warning if either recurred. Only the eight names SPEC §5.3
+itself documents are exempt when exported.
+
+A **local** shadowing a predeclared name (a `let`/`const`/parameter matching
+`len`, `close`, etc.) is unaffected by either exemption and still warns —
+only module-scope `extern fn` and `export` declarations are in scope for this
+narrowing.
+
 **Decided: a parameter (or receiver) shadowing an outer name is not reported,
 only a `let`/`const` is** (this includes a `for`/`catch`/`match` binder — they
 activate as the same kind as a block-local `let`). `fn f(count: int)`
