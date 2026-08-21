@@ -364,8 +364,11 @@ run_basic() {
 }
 
 # types row body: a timeout is not evidence — a bit killed by the alarm produced
-# no verdict, so it is reported separately and fails, rather than being scored
-# as a mismatch.
+# no verdict, so it is reported separately, rather than being scored as a
+# mismatch. A real MISMATCH always wins the exit code (1); a PURE timeout with
+# zero mismatches is could-not-decide, not a divergence, so it exits 2 instead
+# of collapsing onto the same code as a real MISMATCH (#3379, matching the
+# split #3351/#3378 established for the rest of this family).
 run_types() {
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
@@ -407,14 +410,27 @@ run_types() {
     status=1
   fi
 
+  # A real divergence wins over an undecided count: any observed mismatch is
+  # evidence, regardless of how many files elsewhere also timed out (#3379,
+  # matches the family convention restored in selfhost-diffsafepoints.sh
+  # #3351 and selfhost-diffdump.sh's own run_basic() #3378). A PURE timeout —
+  # zero mismatches — decided nothing, so it is exit 2 (could-not-decide),
+  # not exit 1 (the same code a real MISMATCH uses).
   if [ -s "$work/timeout" ]; then
     echo
     echo "INVALID: $timeouts file(s) timed out after ${TIMEOUT}s — no verdict, not a match:"
     while read -r f; do echo "  timeout: $f"; done <"$work/timeout"
-    status=1
+    [ "$status" -eq 0 ] && status=2
   fi
 
-  [ "$status" -eq 0 ] && { echo; echo "$PREFIX: the two checkers agree on every compared file."; }
+  if [ "$status" -eq 0 ]; then
+    echo
+    echo "$PREFIX: the two checkers agree on every compared file."
+  elif [ "$status" -eq 2 ]; then
+    echo
+    echo "UNDECIDED: $timeouts file(s) timed out after ${TIMEOUT}s and were NOT compared."
+    echo "           This is not a pass. Re-run on a quieter host, or raise the timeout."
+  fi
   exit "$status"
 }
 
@@ -432,6 +448,13 @@ run_types() {
 # interning-order artifacts, not structural. A raw/canon mismatch is then
 # checked against `explainMismatch`'s declared-signature table above before
 # being scored a regression.
+#
+# A timeout (either side) used to fail the gate with the SAME exit code (1) as
+# a real mismatch, indistinguishable from a genuine regression (#3379). A real
+# MISMATCH still always wins and exits 1; a PURE timeout with zero mismatches
+# decided nothing and exits 2 instead, matching the split #3351/#3378
+# established for the rest of this family. Explained and oraclecrash never
+# affect the exit code either way — unchanged.
 run_ir() {
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
@@ -552,11 +575,14 @@ run_ir() {
     sed 's/^/  /' "$work/explained"
   fi
 
+  # A real mismatch above already decided this run; a timeout here decided
+  # nothing extra, so it only downgrades a clean 0 to could-not-decide (2) and
+  # never overrides a mismatch's 1 (#3379, matches #3351/#3378).
   if [ -s "$work/timeout" ]; then
     echo
     echo "INVALID: $timeouts file(s) produced no verdict — not a match:"
     while read -r f; do echo "  $f"; done <"$work/timeout"
-    status=1
+    [ "$status" -eq 0 ] && status=2
   fi
 
   # Reported apart from ours because it means something different: the PINNED
@@ -567,7 +593,7 @@ run_ir() {
     echo
     echo "INVALID: the pinned stage0 HUNG on $oracletimeouts file(s) — corpus reduced, not verified:"
     while read -r f; do echo "  $f"; done <"$work/oracletimeout"
-    status=1
+    [ "$status" -eq 0 ] && status=2
   fi
 
   # AN ORACLE CRASH IS REPORTED BUT DOES NOT FAIL, and the asymmetry with the hang
@@ -575,7 +601,8 @@ run_ir() {
   # this tree can stop it faulting, so failing here would leave the gate red until
   # the next pin move — the "known-and-ignored red gets routed around" hazard
   # #1895 is about. A hang is different: it means the run could not complete in
-  # bounded time and may be masking anything, so it still fails.
+  # bounded time and may be masking anything, so it still moves the exit code
+  # off 0 (to 1 if a mismatch also fired, else 2 — #3379).
   #
   # What this is NOT is the expected-mismatch list #1883 deleted. That recorded
   # DIVERGENCES between the two compilers and let them be written down instead of
@@ -595,6 +622,10 @@ run_ir() {
     else
       echo "$PREFIX: every file's $VERB IR is identical to the pinned stage0's."
     fi
+  elif [ "$status" -eq 2 ]; then
+    echo
+    echo "UNDECIDED: no regression was observed, but some file(s) timed out (see INVALID above) and were NOT compared."
+    echo "           This is not a pass. Re-run on a quieter host, or raise the timeout."
   fi
   exit "$status"
 }
