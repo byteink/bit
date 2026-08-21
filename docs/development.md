@@ -527,6 +527,94 @@ noise is exactly why they need the 1.5x slack in the first place — so a
 two-sided band is not sound for either, and re-recording those two stays a
 written convention rather than something the gate checks for you.
 
+### Race detection
+
+Decided (#2537): whether an optional deeper race-detection gate — the
+`-fsanitize=thread` (ThreadSanitizer / TSan) style checker other compiled
+languages ship as a build mode — is feasible for this runtime.
+
+**Verdict: not feasible.** Two independent reasons, either sufficient on its
+own:
+
+1. **There is no C, C++, or LLVM-IR compiler input left to instrument.**
+   `runtime/` is 100% `.bit` source (`find runtime -type f` shows zero `.c`,
+   `.cc`, `.zig`), and `tools/build/artifacts.bit`'s `libbitrt` step compiles
+   it straight through `bit`'s own native backend — `scripts/g2archive.sh`
+   builds each runtime module to an object with `bit`, then packs the archive
+   with `bit ar`. No `cc`/`clang`/`gcc`/`zig` invocation exists anywhere under
+   `tools/build/**` or `scripts/**`, and linking is self-hosted too
+   (`compiler/elflink.bit`, `compiler/macholink.bit`, `compiler/pelink.bit`) —
+   there is no external `ld` either. `-fsanitize=thread` is a Clang/GCC
+   code-generation flag with no meaning outside that toolchain; Bit's own
+   aarch64/x86_64 backends (`compiler/codegen.bit`, `compiler/emitelf.bit`,
+   `compiler/emitmacho.bit`) have no pass that lowers a memory access to
+   `__tsan_read`/`__tsan_write`/`__tsan_func_entry`, and TSan's own runtime is
+   a C++ library this project would have to vendor and link with a linker
+   that does not exist in this toolchain. There is no seam to attach the flag
+   to.
+2. **Even granting a hypothetical future C/LLVM path, the scheduler defeats
+   TSan's threading model.** TSan's shadow state and vector clocks are keyed
+   to the OS thread it watches create/join, and to the pthread mutex/cond it
+   intercepts. Bit's scheduler is M:N (`runtime/ABI.md` §9, §23): a task
+   (green thread) moves between worker OS threads, and the move itself is
+   `schedSwitch` (`runtime/sched/sched.bit`) — a hand-written, `@nosplit`
+   register-file swap that saves and restores the callee-saved union
+   directly. It is not a pthread primitive, so TSan has no hook into it. A
+   task migrating mid-execution from one worker's OS thread to another's
+   would either read as an impossible same-memory access from two "threads"
+   with no synchronization TSan can see (false positives), or silently
+   attribute the access to whichever OS thread's shadow state happened to be
+   live, corrupting the vector clock for a real race on that worker. Green
+   threads turn "which thread touched this" from an OS-level question into a
+   scheduler-level one, and a detector built on the OS-thread abstraction is
+   answering the wrong question.
+
+Even setting both objections aside, the cost would not be affordable against
+this runtime's own numbers. Shadow-memory tracking is the classic approach
+(one shadow word or more per tracked word) and would multiply heap footprint
+on top of an allocator that already costs **628 cycles per object lifecycle
+against Go's 36 and C's 55**; happens-before tracking needs a vector clock per
+logical thread, and Bit spawns tasks precisely because they are meant to be
+cheap — a vector clock per task reintroduces the cost `spawn` exists to avoid.
+
+A detector would also have nothing to report a finding against today:
+`runtime/ABI.md` §4.2's debug-info line table (design landed #3281, wire
+format `.bit_dbg` / `bit_debug_lines`) is not yet emitted — nothing in
+`compiler/` or `runtime/` currently writes or reads `bit_debug_lines` — so the
+only thing any tool can currently name for a bad access is a raw code
+address, not a source line.
+
+**Cheaper substitute already in the suite — extend it instead of building a
+detector.** `tests/stress/` already combines the two ideas a real race
+detector would, at the program level instead of the instruction level:
+
+- `BIT_GC=stress` (`runtime/ABI.md` §7) collects at every safepoint, widening
+  the race window between two OS threads to whatever the collector's own walk
+  costs — the same "make the window huge" idea a detector uses, for free,
+  from an already-shipped knob.
+- A deterministic verdict checked after the run, not a live happens-before
+  graph during it: `tests/stress/chan/race/race.bit`'s `raceVerdict()` checks
+  a received-count, a checksum, and a closed-exit count against their
+  expected totals; `chanracedarwin`/`chanracelinux` drive two real OS threads
+  through it and fail on a stalled counter (`STALL_NS`) rather than a
+  wall-clock guess. This is a program-level happens-before check, sized to
+  the one race `runtime/ABI.md` §23 documents as this runtime's actual
+  memory-unsafety hazard — a torn, non-atomic write to a composite value
+  (slice, interface) racing a GC safepoint scan — not a general-purpose
+  detector.
+
+The substitute proves narrower than a real detector ("this invariant held
+under this stress run", not "no data race exists anywhere in this binary"),
+but it costs nothing beyond an ordinary test program, needs no special build,
+and directly exercises the composite-value race §23 names as the actual
+hazard. If more coverage is wanted, the next step is another `tests/stress/`
+program in the same shape — a counter/checksum verdict plus `BIT_GC=stress` —
+covering `std/sync`'s `Mutex`/`RWMutex`/`WaitGroup` (already chan-based,
+`stdlib/sync/`, so they already inherit the channel happens-before edge, §23
+edge 2) and its plain atomics (`stdlib/sync/atomic.bit`, sequentially
+consistent only today — §23 edge 9's Release/Acquire/Relaxed lowering is not
+yet built) — not a sanitizer.
+
 ## Fuzzing
 
 **Fuzzing is the one oracle here that does not depend on a second
