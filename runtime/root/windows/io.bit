@@ -1,0 +1,516 @@
+// Windows write/exit provider for the Stage-B port of runtime/root/ (#3331,
+// epic #3322): the bytes `panic`, `assert`, `print` and `eprint` put on a
+// console or file handle, and the alloc-free path every built-in panic
+// message goes through. The Windows sibling of ../linux/io.bit and
+// ../darwin/io.bit.
+//
+// See ../darwin/io.bit's own header for the shared reasoning this file does
+// not repeat: why the panic line's shape is duplicated across providers
+// rather than shared through the core, and the full PER-WORKER SCRATCH
+// argument (#3276) for why a shared scratch word is a real data race the
+// moment `BIT_WORKERS>1` — this file copies that shape exactly, not the
+// pre-#3276 one. `#1900` boots more than one worker at once, and every
+// scratch slot below is sized and indexed per worker for exactly that
+// reason.
+//
+// ---------------------------------------------------------------------------
+// THE MECHANISM DIFFERS FROM BOTH POSIX PROVIDERS, AND THAT IS THE ONLY THING
+// THAT DIFFERS
+// ---------------------------------------------------------------------------
+//
+// Windows has no file descriptors and no raw `write(2)`/`_exit(2)` — console
+// and file output both go through `WriteFile` on a HANDLE obtained from
+// `GetStdHandle` (ticket #3331's own framing), and process exit goes through
+// `ExitProcess`, not `_exit`. Both are in `compiler/pesyms.bit`'s admitted
+// kernel32 surface (#3328). `GetStdHandle` is a cheap, thread-safe lookup
+// against the process's own standard-handle table (Microsoft's own
+// documentation: it consults `RTL_USER_PROCESS_PARAMETERS`, never a syscall),
+// so resolving it fresh on every write costs nothing and needs no cache —
+// unlike a POSIX fd, which IS the numeric handle, `STD_OUTPUT_HANDLE`/
+// `STD_ERROR_HANDLE` (-11/-12) are the SELECTOR `GetStdHandle` takes, not a
+// usable write target by themselves. `stdoutFd`/`stderrFd` below carry that
+// selector, matching the two POSIX files' `int` fd type and every call site
+// that passes them, so the whole panic/print machinery below is
+// call-site-identical to ../linux and ../darwin — only `rootWriteAll`'s body
+// resolves a real HANDLE instead of already holding one.
+//
+// `WriteFile`'s success flag and its written-byte-count are two separate
+// out-values (BOOL return, `*i32` out-param) where POSIX `write` folds both
+// into one signed return. The retry loop below checks both, which is the
+// Windows-shaped version of the two POSIX files' "the two error conventions
+// differ and the check still coincides" note — here they do not fully
+// coincide (a call can report success with 0 bytes written), so both are
+// checked explicitly rather than collapsed into one.
+//
+// ---------------------------------------------------------------------------
+// `bit_rt_os_exit` BELONGS TO ./os.bit (#3332), NOT HERE — THE ONE REAL
+// DIVERGENCE FROM THE POSIX SHAPE
+// ---------------------------------------------------------------------------
+//
+// ../linux/io.bit and ../darwin/io.bit both define and pin `bit_rt_os_exit`
+// (ABI.md §19) locally, because on those platforms the exit syscall belongs
+// to the same provider as the write syscall. ./boot.bit's own header is
+// explicit that on Windows this is NOT this file's symbol to define: "that
+// symbol belongs to `runtime/root/windows/os.bit` (#3332)... Defining it here
+// would collide with #3332's own definition at final program link
+// (E0042-shaped duplicate)". `os.bit` does not exist on this branch yet
+// (epic #3322's Stage B siblings land independently), so this file cannot
+// import it either — same module, so no import would be needed once it
+// lands, but nothing to call yet regardless.
+//
+// `ioExitFatal` below is this file's OWN unpinned, unexported fatal-exit
+// helper for its panic paths ONLY — the identical shape and the identical
+// reasoning as ./boot.bit's own `winSpawnFatal` (scoped there to `rtSpawn`'s
+// error paths ONLY, by that function's own comment). Two small unpinned
+// wrappers around the same `ExitProcess` call, each scoped to its own file,
+// is simpler and safer than either file reaching into the other's private
+// helper or the module carrying a THIRD shared name for the same one-line
+// call.
+//
+// `ExitProcess` itself is declared `extern` exactly once in the module — in
+// ./boot.bit — and this file calls it directly with no import and no
+// re-declaration: an import is per-MODULE in Bit, not per-file (this
+// repository's own standing rule), and the same holds for an `extern fn`
+// declaration, which introduces a module-scope binding exactly like any
+// other top-level declaration. Re-declaring `extern fn ExitProcess` here
+// would itself be an E0042 duplicate in this scope.
+//
+// EVERY FUNCTION IN THIS FILE THAT TOUCHES THE WRITE OR EXIT PATH IS
+// `@nosplit`, for the identical reason ../darwin/io.bit's header gives:
+// `@nosplit` suppresses safepoint-poll emission outright (§10.3.1) and
+// E0075 makes that transitive over the whole callee subtree, so a
+// collection can never run mid-write holding a raw address the collector's
+// precise stack walk does not know how to name. Proved from the callee
+// chain, not inferred from the attribute: `GetStdHandle`/`WriteFile`/
+// `ExitProcess` are `extern` calls with no Bit body to recurse into, and
+// nothing below calls `schedPark`/`schedSwitch` (which are themselves
+// `@nosplit` and would not disqualify the caller even if they did) or
+// anything that allocates.
+
+import { strPtr, strLen, dynTypeOf } from "../../root"
+import { loadWord, storeWord, loadByte, storeByte, gcTiNamePtr, gcTiNameLen } from "../../gc"
+import { wkId, schedCurrentWorker, schedMaxWorkers } from "../../sched"
+// `taskAt` is already imported into this module by ./boot.bit — an import is
+// per-MODULE, not per-file, so a second one here is E0042.
+
+// kernel32 imports (compiler/pesyms.bit's admitted surface, #3328). HANDLE is
+// `*byte`, DWORD/BOOL are `i32`, LPDWORD is `*i32`, LPOVERLAPPED is `*byte` —
+// the same ABI mapping ./boot.bit's own kernel32 externs already use.
+extern fn GetStdHandle(stdHandle: i32): *byte
+extern fn WriteFile(handle: *byte, buf: *u8, n: i32, writtenOut: *i32, overlapped: *byte): i32
+
+// The two standard-handle SELECTORS this module writes to (WinBase.h) — NOT
+// usable HANDLEs by themselves; `rootWriteAll` below resolves the real HANDLE
+// from one of these via `GetStdHandle` on every call. `print` goes to stdout
+// so a program's real output can be piped; everything diagnostic goes to
+// stderr so it does not mix in (matching ../linux and ../darwin's own
+// stdoutFd/stderrFd doc comment).
+const stdoutFd: int = -11 // STD_OUTPUT_HANDLE
+const stderrFd: int = -12 // STD_ERROR_HANDLE
+
+// "panic: " / "out of memory" / "type assertion failed: " / " is not " /
+// "nil" / "integer division by zero" / "call of a nil function" / "method
+// call on a nil interface value", packed little-endian one word at a time —
+// BYTE-IDENTICAL to ../linux/io.bit and ../darwin/io.bit: ASCII packing is
+// platform-independent and x86_64-windows is little-endian like every other
+// target this toolchain builds. Computed, not hand-derived; see either POSIX
+// file's comments for the byte-by-byte derivation of each word.
+const panicPrefixWord: int = 9071397899755888
+const panicPrefixLen: int = 7
+const newlineWord: int = 10
+const newlineLen: int = 1
+const oomWord0: int = 7863397576860792175
+const oomWord1: int = 521610947941
+const taFailWord0: int = 8319099728452155764
+const taFailWord1: int = 7359003215913054821
+const taFailWord2: int = 9071402127485281
+const taFailLen2: int = 7
+const isNotWord: int = 2338616625293650208
+const isNotLen: int = 8
+const nilWord: int = 7104878
+const nilLen: int = 3
+const divZeroWord0: int = 2338042651316874857
+const divZeroWord1: int = 7957695010998479204
+const divZeroWord2: int = 8030592660760257056
+const nilCallWord0: int = 2334675641886859619
+const nilCallWord1: int = 8459484600059437153
+const nilCallWord2: int = 121424789660526
+const nilCallLen2: int = 6
+const nilIfaceWord0: int = 7142819438666212717
+const nilIfaceWord1: int = 6998715244498152545
+const nilIfaceWord2: int = 8389758743816531488
+const nilIfaceWord3: int = 8511914773240509029
+const nilIfaceWord4: int = 1702194273
+const nilIfaceLen4: int = 4
+
+// ---------------------------------------------------------------------------
+// The write path
+// ---------------------------------------------------------------------------
+
+// Write exactly `n` bytes from `addr` to the standard handle named by
+// selector `fd` (`stdoutFd`/`stderrFd` above), or give up. The Windows form of
+// ../darwin/io.bit's `rootWriteAll`.
+//
+// BEST-EFFORT BY CONTRACT, same as both POSIX providers: a short write is
+// retried from where it stopped, an outright failure gives up silently —
+// there is nowhere left to report a write failure to, since this IS the
+// reporting path.
+//
+// `writtenPtr` is resolved ONCE into a local before the loop, from a
+// PER-WORKER slot (`winWrittenScratch` below) — the call-site pattern this
+// module's `ioConstScratchSlot` establishes: resolve once, use the same
+// address for every store this call makes and every read back. Two workers
+// each inside their own `rootWriteAll` call at the same real time touch
+// different slots.
+//
+// BOUNDED (Power of 10 rule 2): `off` starts at 0, strictly increases by at
+// least 1 per iteration (`wrote <= 0` returns instead), and the loop exits at
+// `off >= n` — runs at most `n` times.
+export @nosplit @symbol("bit_rt_port_root_io_write_all")
+fn rootWriteAll(fd: int, addr: int, n: int) {
+  let handle = GetStdHandle(i32(fd))
+  let writtenPtr = ptrOf(winWrittenScratch) + ioConstScratchSlot()
+  let nilOverlapped: *byte = nil
+  let base: *u8 = nil
+  let off = 0
+  while (off < n) {
+    let ok = WriteFile(handle, base + addr + off, i32(n - off), writtenPtr, nilOverlapped)
+    let wrote = int(atomicLoad(writtenPtr))
+    if (ok == i32(0) || wrote <= 0) {
+      return
+    }
+    off = off + wrote
+  }
+}
+
+// The one-word scratch `writeConst` hands `WriteFile`. MODULE-LEVEL AND
+// SCALAR, not a per-call `[]int(1)` — identical reasoning to
+// ../darwin/io.bit's own `ioConstBuf` comment: `@nosplit` forbids allocation
+// outright (E0075), so a per-call GC slice cannot stay on the panic path, and
+// a scalar array is never scanned by the collector (ABI.md §5, rule 1),
+// which is required here since this holds a packed byte constant, never an
+// object address.
+//
+// PER-WORKER SLOTS, NOT ONE SHARED WORD (#3276's shape, carried over
+// verbatim): two panics on two different workers both calling `writeConst`
+// at the same real time must not be able to interleave on the SAME shared
+// word. `ioConstScratchSlot` below resolves its slot's address ONCE into a
+// local and uses that SAME address for both the store and the read, and the
+// whole span between them takes no park — `rootWriteAll` above is
+// `@nosplit`, so it emits no back-edge safepoint poll, and neither it nor
+// `writeConst` calls `schedPark`/`schedSwitch` (checked from the callee
+// chain, not inferred from `@nosplit` alone).
+//
+// The double bound (`schedMaxWorkers` AND `ioConstScratchSlots`) is the same
+// shape #3272's `udpSenderSlot` uses: `let a: [N]i64` needs `N` to be a
+// literal (E0021), so this file's array capacity and the scheduler's
+// advertised worker count are two independent numbers with nothing tying
+// them together, and both must be checked.
+const ioConstScratchSlots: int = 32
+
+@nosplit fn ioConstScratchSlot(): int {
+  let w = schedCurrentWorker()
+  if (w == 0) {
+    return ioConstScratchSlots
+  }
+  let id = *(taskAt(w) + wkId)
+  if (id < 0 || id >= schedMaxWorkers || id >= ioConstScratchSlots) {
+    return ioConstScratchSlots
+  }
+  return id
+}
+
+// (ioConstScratchSlots + 1) slots: one per worker plus a fallback slot for a
+// caller with no current task/worker — the boot thread itself, before any
+// worker is running.
+let ioConstBuf: [33]i64
+
+// `WriteFile`'s `lpNumberOfBytesWritten` out-param, one DWORD per worker slot
+// — PER-WORKER for the identical reason `ioConstBuf` above is: two workers
+// each mid-`rootWriteAll` at the same real time must not share the address
+// `WriteFile` writes the transferred count into, or one worker can read back
+// a count `WriteFile` wrote for the OTHER worker's call. Unlike
+// ../alloc/windows/pages.bit's `winOldProtectScratch` (a single shared word,
+// sound there ONLY because no caller ever reads the value back), this value
+// IS read back on every iteration to advance `off`, so it cannot be shared.
+let winWrittenScratch: [33]i32
+
+// Write `nbytes` low bytes of the packed constant `word` to the handle
+// selector `fd`.
+@nosplit fn writeConst(fd: int, word: int, nbytes: int) {
+  let addr = int(ptrOf(ioConstBuf)) + ioConstScratchSlot() * 8
+  storeWord(addr, word)
+  rootWriteAll(fd, addr, nbytes)
+}
+
+// ---------------------------------------------------------------------------
+// Whole-line assembly (matching ../darwin/io.bit's #3295/#3315 shape)
+// ---------------------------------------------------------------------------
+//
+// Assembling a whole panic line into a per-worker buffer and issuing ONE
+// `rootWriteAll` needs no lock: it is the identical shape `ioConstBuf` above
+// already establishes and proves sound — module state, one slot per worker,
+// resolved once into a local used for both every store and the final read,
+// with no park anywhere in the span.
+//
+// `ioLineCap` (128 bytes/slot) covers every FIXED panic message in this file
+// with room to spare, matching ../darwin/io.bit's own sizing.
+const ioLineCap: int = 128
+let ioLineBuf: [528]i64 // 33 slots (ioConstScratchSlots + 1) * 16 words (128B)
+
+@nosplit fn ioLineSlotAddr(): int {
+  return int(ptrOf(ioLineBuf)) + ioConstScratchSlot() * ioLineCap
+}
+
+// Appends the low `n` (<=8) little-endian bytes of `word` to `addr`, one byte
+// at a time — NOT `storeWord`, for the identical alignment reason
+// ../darwin/io.bit's own comment gives (`../../gc`'s `wordAt` indexes by
+// `addr / 8`, so an unaligned `addr` silently addresses the wrong word).
+// Bounded (Power of 10 rule 2): every caller below passes a literal `n <= 8`.
+@nosplit fn ioLineAppendWord(addr: int, word: int, n: int) {
+  let i = 0
+  while (i < n) {
+    storeByte(addr + i, (word >> (i * 8)) & 255)
+    i = i + 1
+  }
+}
+
+// Copies `n` bytes from `src` to `addr`, one at a time — the dynamic-length
+// counterpart of `ioLineAppendWord` above.
+@nosplit fn ioLineCopyBytes(addr: int, src: int, n: int) {
+  let i = 0
+  while (i < n) {
+    storeByte(addr + i, loadByte(src + i))
+    i = i + 1
+  }
+}
+
+// Appends `word`'s low `min(remaining, 8)` bytes and returns how many it
+// wrote, so a caller can chain several without re-deriving the clamp.
+@nosplit fn ioLineAppendClamped(addr: int, word: int, remaining: int): int {
+  let n = remaining
+  if (n > 8) {
+    n = 8
+  }
+  ioLineAppendWord(addr, word, n)
+  return n
+}
+
+// Assembles "panic: " + up to 5 constant words + "\n" into this worker's line
+// slot, and sends it as ONE `rootWriteAll` call — see ../darwin/io.bit's own
+// `writeConstLine` for the full shape this copies verbatim.
+@nosplit fn writeConstLine(fd: int, w0: int, w1: int, w2: int, w3: int, w4: int, msgLen: int) {
+  let addr = ioLineSlotAddr()
+  let off = panicPrefixLen
+  ioLineAppendWord(addr, panicPrefixWord, panicPrefixLen)
+  let remaining = msgLen
+  let n = ioLineAppendClamped(addr + off, w0, remaining)
+  off = off + n
+  remaining = remaining - n
+  if (remaining > 0) {
+    n = ioLineAppendClamped(addr + off, w1, remaining)
+    off = off + n
+    remaining = remaining - n
+  }
+  if (remaining > 0) {
+    n = ioLineAppendClamped(addr + off, w2, remaining)
+    off = off + n
+    remaining = remaining - n
+  }
+  if (remaining > 0) {
+    n = ioLineAppendClamped(addr + off, w3, remaining)
+    off = off + n
+    remaining = remaining - n
+  }
+  if (remaining > 0) {
+    n = ioLineAppendClamped(addr + off, w4, remaining)
+    off = off + n
+    remaining = remaining - n
+  }
+  ioLineAppendWord(addr + off, newlineWord, newlineLen)
+  off = off + newlineLen
+  rootWriteAll(fd, addr, off)
+}
+
+// The bytes of the port-heap `string` at `s`. A NULL HEADER READS AS `""`
+// (#1564/#1570) — matching ../darwin/io.bit's own `strBytesOf`/`strSizeOf`.
+@nosplit fn strBytesOf(s: int): int {
+  if (s == 0) {
+    return 0
+  }
+  let p = loadWord(s + strPtr)
+  return p
+}
+
+@nosplit fn strSizeOf(s: int): int {
+  if (s == 0) {
+    return 0
+  }
+  let n = loadWord(s + strLen)
+  return n
+}
+
+// `panic: <msg>\n` on the handle selector `fd`. ONE call when `msg` fits in
+// the per-worker line slot, ALLOCATING NOTHING to get there; falls back to
+// the original three-call shape when it does not fit — never truncates, only
+// narrows the race window for the (overwhelmingly common) case that fits.
+// TAKES THE FD rather than hardcoding stderr, for the identical testability
+// reason ../darwin/io.bit's own `panicWrite` gives.
+export @nosplit @symbol("bit_rt_port_root_io_panic_write")
+fn panicWrite(fd: int, s: int) {
+  let msgAddr = strBytesOf(s)
+  let msgLen = strSizeOf(s)
+  if (msgLen <= ioLineCap - panicPrefixLen - newlineLen) {
+    let addr = ioLineSlotAddr()
+    ioLineAppendWord(addr, panicPrefixWord, panicPrefixLen)
+    ioLineCopyBytes(addr + panicPrefixLen, msgAddr, msgLen)
+    ioLineAppendWord(addr + panicPrefixLen + msgLen, newlineWord, newlineLen)
+    rootWriteAll(fd, addr, panicPrefixLen + msgLen + newlineLen)
+    return
+  }
+  writeConst(fd, panicPrefixWord, panicPrefixLen)
+  rootWriteAll(fd, msgAddr, msgLen)
+  writeConst(fd, newlineWord, newlineLen)
+}
+
+// ---------------------------------------------------------------------------
+// The exported ABI surface (ABI.md §12) — EXCEPT `bit_rt_os_exit`; see the
+// header's "`bit_rt_os_exit` BELONGS TO ./os.bit" section. Every other pin
+// below carries the bare ABI name, matching ../linux and ../darwin.
+// ---------------------------------------------------------------------------
+
+// A fatal exit for THIS FILE'S OWN panic/oom/assert paths ONLY — NOT
+// `bit_rt_os_exit` (see the header). The identical shape and scope as
+// ./boot.bit's own `winSpawnFatal`, kept as a separate unpinned wrapper
+// rather than reused across files: each is scoped to its own error paths, and
+// a shared name for the same one-line call is not worth the cross-file
+// coupling.
+@nosplit fn ioExitFatal(code: int) {
+  ExitProcess(i32(code))
+}
+
+// `bit_rt_panic` (ABI.md §12): prints `panic: <msg>` and exits 2 (SPEC
+// §18.4). Backs the `panic` builtin and every implicit panic source.
+export @nosplit @symbol("bit_rt_panic") fn rootPanic(s: int) {
+  panicWrite(stderrFd, s)
+  ioExitFatal(2)
+}
+
+// `bit_rt_assert` (ABI.md §12): backs `assert(cond)` / `assert(cond, msg)`.
+export @nosplit @symbol("bit_rt_assert") fn rootAssert(cond: bool, s: int) {
+  if (cond) {
+    return
+  }
+  rootPanic(s)
+}
+
+// `bit_rt_print` (ABI.md §12): the `print` builtin — a string's bytes on
+// stdout, no trailing newline.
+export @nosplit @symbol("bit_rt_print") fn rootPrint(s: int) {
+  rootWriteAll(stdoutFd, strBytesOf(s), strSizeOf(s))
+}
+
+// `bit_rt_eprint` (ABI.md §12): `print`'s sibling on the stderr handle.
+export @nosplit @symbol("bit_rt_eprint") fn rootEprint(s: int) {
+  rootWriteAll(stderrFd, strBytesOf(s), strSizeOf(s))
+}
+
+// `bit_rt_oom` (#1642/#1662): the heap-exhaustion door `runtime/gc/mem.bit`
+// reaches through. NEVER RETURNS. NOT ROUTED THROUGH `rootPanic` — see
+// ../darwin/io.bit's own `rootOom` comment for why: `rootPanic` takes a
+// managed-heap string object, so reaching it here would mean allocating in
+// order to report that allocation failed.
+export @nosplit @symbol("bit_rt_oom") fn rootOom(): int {
+  writeConstLine(stderrFd, oomWord0, oomWord1, 0, 0, 0, 13)
+  ioExitFatal(2)
+  return 0
+}
+
+// `bit_rt_panic_div_zero` (ABI.md §12.1, #2016).
+export @nosplit @symbol("bit_rt_panic_div_zero") fn rootPanicDivZero() {
+  writeConstLine(stderrFd, divZeroWord0, divZeroWord1, divZeroWord2, 0, 0, 24)
+  ioExitFatal(2)
+}
+
+// `bit_rt_panic_nil_call` (ABI.md §12.1, #2018).
+export @nosplit @symbol("bit_rt_panic_nil_call") fn rootPanicNilCall() {
+  writeConstLine(stderrFd, nilCallWord0, nilCallWord1, nilCallWord2, 0, 0, 22)
+  ioExitFatal(2)
+}
+
+// `bit_rt_panic_nil_iface` (ABI.md §12.1, #2240).
+export @nosplit @symbol("bit_rt_panic_nil_iface") fn rootPanicNilIface() {
+  writeConstLine(stderrFd, nilIfaceWord0, nilIfaceWord1, nilIfaceWord2, nilIfaceWord3, nilIfaceWord4, 36)
+  ioExitFatal(2)
+}
+
+// The WRITE half of `bit_rt_iface_assert`, split fd-first the same way
+// `panicWrite` is split from `rootPanic` — matching ../darwin/io.bit's own
+// `ifaceAssertWrite` (#3315) verbatim in logic, only the underlying
+// `rootWriteAll` mechanism differs.
+export @nosplit @symbol("bit_rt_port_root_io_iface_assert_write")
+fn ifaceAssertWrite(fd: int, recv: int, want: int): int {
+  let info = dynTypeOf(recv)
+  if (info != 0 && info == want) {
+    return recv
+  }
+  let gotAddr = 0
+  let gotLen = nilLen
+  if (info != 0) {
+    gotAddr = loadWord(info + gcTiNamePtr)
+    gotLen = loadWord(info + gcTiNameLen)
+  }
+  let wantAddr = loadWord(want + gcTiNamePtr)
+  let wantLen = loadWord(want + gcTiNameLen)
+  let fixedLen = panicPrefixLen + 8 + 8 + taFailLen2 + isNotLen + newlineLen
+  if (fixedLen + gotLen + wantLen <= ioLineCap) {
+    let addr = ioLineSlotAddr()
+    let off = 0
+    ioLineAppendWord(addr, panicPrefixWord, panicPrefixLen)
+    off = off + panicPrefixLen
+    ioLineAppendWord(addr + off, taFailWord0, 8)
+    off = off + 8
+    ioLineAppendWord(addr + off, taFailWord1, 8)
+    off = off + 8
+    ioLineAppendWord(addr + off, taFailWord2, taFailLen2)
+    off = off + taFailLen2
+    if (info == 0) {
+      ioLineAppendWord(addr + off, nilWord, nilLen)
+    } else {
+      ioLineCopyBytes(addr + off, gotAddr, gotLen)
+    }
+    off = off + gotLen
+    ioLineAppendWord(addr + off, isNotWord, isNotLen)
+    off = off + isNotLen
+    ioLineCopyBytes(addr + off, wantAddr, wantLen)
+    off = off + wantLen
+    ioLineAppendWord(addr + off, newlineWord, newlineLen)
+    off = off + newlineLen
+    rootWriteAll(fd, addr, off)
+    return 0
+  }
+  writeConst(fd, panicPrefixWord, panicPrefixLen)
+  writeConst(fd, taFailWord0, 8)
+  writeConst(fd, taFailWord1, 8)
+  writeConst(fd, taFailWord2, taFailLen2)
+  if (info == 0) {
+    writeConst(fd, nilWord, nilLen)
+  } else {
+    rootWriteAll(fd, gotAddr, gotLen)
+  }
+  writeConst(fd, isNotWord, isNotLen)
+  rootWriteAll(fd, wantAddr, wantLen)
+  writeConst(fd, newlineWord, newlineLen)
+  return 0
+}
+
+// `bit_rt_iface_assert` (ABI.md §2.2): the one-result assertion `iface.(T)`
+// (SPEC §14.4), panicking on a mismatch (§18.4) (#1715).
+export @nosplit @symbol("bit_rt_iface_assert")
+fn rootIfaceAssert(recv: int, want: int): int {
+  let r = ifaceAssertWrite(stderrFd, recv, want)
+  if (r == 0) {
+    ioExitFatal(2)
+  }
+  return r
+}
