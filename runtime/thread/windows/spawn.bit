@@ -1,0 +1,347 @@
+// Windows OS-thread provider for the Stage-2 port of runtime/sched/'s worker
+// pool (#1403), and the per-thread identity token every worker needs to
+// reach the collector safely (#3335). See ../thread.bit for the shared
+// contract, the seam against #1364, and the three rules a child thread's
+// body must obey.
+//
+// `CreateThread` through kernel32 (§11.7's admitted Windows import surface,
+// `compiler/pesyms.bit`), the same shape ../darwin/spawn.bit uses
+// `pthread_create` for and for the same reason: there is no stable raw
+// syscall interface to encode against on Windows either.
+//
+// THIS PROVIDER MIRRORS ../darwin/spawn.bit's SHAPE — a fixed trampoline-cell
+// pool, no allocator, a claim/release CAS — because `CreateThread`, like
+// `pthread_create`, hands the child exactly ONE `void*`-shaped parameter and
+// allocates/guards the child's stack itself (`STACK_SIZE_PARAM_IS_A_RESERVATION`
+// in `runtime/root/windows/boot.bit` makes the same reservation-not-commit
+// choice this provider inherits). What Windows does NOT share with either
+// existing provider is covered below.
+//
+// This module is a LEAF with no imports, exactly as the other two providers
+// are — `../thread.bit`'s sentinel and this provider's own constants are
+// duplicated rather than imported, the same choice ../darwin/spawn.bit's
+// header explains.
+//
+// ---------------------------------------------------------------------------
+// THE PART NEITHER EXISTING PROVIDER NEEDS: A PER-THREAD IDENTITY TOKEN
+// ---------------------------------------------------------------------------
+//
+// `runtime/gc/gcthread.bit`'s `gcThreadToken()` is an unconditional `mov
+// reg, fs:[0]` on x86-64 — no per-OS branch — and its header states the
+// contract plainly: "fs:0 is the variant-II ABI TCB's self-referential word,
+// which `../thread/linux/tls.bit`'s `tlsPrepare` writes itself... so the
+// same load is the thread pointer under either runtime." Linux's kernel
+// installs FS_BASE via `CLONE_SETTLS`; Darwin's arm64 thread pointer
+// (`TPIDRRO_EL0`) is installed by the OS/pthreads automatically, needing no
+// action from that provider at all.
+//
+// Windows gives a NEW thread neither. Win64 does not use FS for anything
+// (GS holds the TEB), so FS_BASE starts at 0 on every `CreateThread`'d
+// thread — an untouched `gcThreadToken()` read there would decode a fault,
+// not merely a wrong answer, and if it did not fault it would read the SAME
+// 0 on every worker, reproducing #1650 (two threads sharing one identity,
+// invisible to the rendezvous, correctness-destroying rather than crashing).
+//
+// `runtime/root/windows/boot.bit` already solved this for the ONE thread it
+// owns directly (the boot thread) with `winInstallMainThreadToken`/
+// `winSetFsBase` — WRFSBASE-ing a self-referential word, empirically
+// verified not to trap on `mustafa-desktop-win` (that file's own header has
+// the hardware evidence). This provider generalises the SAME technique to
+// EVERY thread it starts, because boot.bit's own comment at its worker
+// bring-up says as much: "this file's own minimal stand-in for
+// ../../thread/windows (#3335), which will own the full
+// threadStart/threadRelease contract once it lands" — boot.bit's worker
+// loop currently starts threads with FS_BASE untouched, which is a real gap
+// this ticket closes for any FUTURE caller of `threadStart`, without editing
+// boot.bit itself (out of this ticket's scope — `runtime/root/**` is a
+// mandatory-full-suite area, and rewiring boot.bit to consume this module is
+// left for the ticket that does that rewiring).
+//
+// EACH THREAD NEEDS ITS OWN CELL, not a shared one. `winSetFsBase(tp)`
+// requires `*tp == tp` — a self-referential word — and that word must be
+// UNIQUE per thread: two threads sharing one cell would again reproduce
+// #1650, just via FS_BASE instead of an unset one. `tokenPool` below is a
+// fixed array of `tokenPoolMax` cells, CAS-claimed one per `threadStart`
+// call and held for that thread's entire life — never released, because
+// every consumer in this tree today (the scheduler's worker pool) runs its
+// threads for the life of the process. `tokenPoolMax` duplicates
+// `../thread.bit`'s `threadMaxWorkers` (1024) rather than importing it, the
+// same leaf-provider convention `runningSentinel()` below follows for
+// `threadRunning`; a caller that ever exceeds it gets a clean refusal (see
+// `threadStart`), not a silently shared token.
+
+extern fn CreateThread(attrs: *byte, stackSize: i64, startAddr: *byte,
+    param: *byte, flags: i32, threadIdOut: *i32): *byte
+extern fn CloseHandle(handle: *byte): i32
+
+// `dwCreationFlags`: interpret `stackSize` as the RESERVE size, not the
+// initial commit — matches `runtime/root/windows/boot.bit`'s own worker
+// bring-up exactly, so a thread started through this provider gets the same
+// budget as one started by boot.bit's own (soon to be replaced) inline loop.
+const STACK_SIZE_PARAM_IS_A_RESERVATION: i32 = 0x00010000
+
+// ../thread.bit's `threadStackBytes` (16MiB), duplicated per the leaf-provider
+// convention — matches ../linux/spawn.bit's actual worker budget; the mapping
+// is anonymous and reserved-not-committed on both platforms, so a worker
+// occupies address space rather than memory (../thread.bit's own comment on
+// the constant).
+const threadStackBytes: i64 = 16777216
+
+// `CreateThread`'s `lpThreadId` out-param: no caller ever reads it (the
+// HANDLE, not the id, is what a caller joins on), so ONE shared scratch word
+// is safe even across CONCURRENT `threadStart` calls — a race on its write is
+// harmless because nothing ever reads the result. Same reasoning
+// `runtime/root/windows/boot.bit`'s own `winThreadIdScratch` comment gives,
+// extended here from "safe across one loop's sequential calls" to "safe
+// across any number of concurrent callers", which holds for the identical
+// reason: the value is write-only from this module's perspective.
+let winThreadIdScratch: i32 = 0
+
+// See ../thread.bit's `threadRunning`. Duplicated, not imported — a
+// provider is a leaf.
+fn runningSentinel(): int { return 1 }
+
+extern fn bit_rt_gc_thread_exit()
+
+// `int` -> `*i64` and `int` -> `*byte`. A leaf may not import ../../sched's
+// `taskAt`, so both casts are spelled here — identical to ../darwin/spawn.bit's.
+@nosplit fn wordsAt(addr: int): *i64 {
+  let z: *i64 = nil
+  return z + addr / 8
+}
+
+@nosplit fn bytesAt(addr: int): *byte {
+  let z: *byte = nil
+  return z + addr
+}
+
+// Call the raw code address `entry` with `arg` in the first-argument
+// register (rdi on SysV, rcx on Win64 — `input` pins the value into rdi/rcx
+// regardless of which register the calling convention itself used to place
+// it, exactly the same mechanism `runtime/sched/sched.bit`'s header explains
+// at length for `schedSwitch`'s own `old`/`new` pins). A verbatim copy of
+// ../darwin/spawn.bit's `invokeRaw` — same encoding, same reason: `entry` is
+// a bare code pointer, not a `(code, env)` function value, so no
+// `call_value` reaches it.
+@nosplit fn invokeRaw(entry: int, arg: int) {
+  asm {
+    arm64 { 0xD63F0120 }        // blr x9 (unreached — x86_64-windows is the
+                                 // only Windows target this toolchain builds;
+                                 // kept for parity, SPEC §11.6 requires both
+                                 // arches in every asm block)
+    x64   { 0xFF, 0xD0 }        // call rax
+    input arm64 x9 x64 rax = entry
+    input arm64 x0 x64 rcx = arg
+    clobber arm64 { x30, memory }
+    clobber x64 { memory }
+  }
+}
+
+// Install `tp` as this thread's FS_BASE via WRFSBASE — byte-identical to
+// `runtime/root/windows/boot.bit`'s `winSetFsBase` (that file's header carries
+// the hardware verification on mustafa-desktop-win; duplicated here rather
+// than imported because a provider is a leaf and `boot.bit` imports FROM the
+// providers, never the reverse).
+@nosplit fn winSetFsBase(tp: int) {
+  asm volatile {
+    x64   { 0xF3, 0x48, 0x0F, 0xAE, 0xD0 }   // wrfsbase rax
+    arm64 { 0xD51BD040 }                      // msr tpidr_el0, x0 (unreached,
+                                               // see invokeRaw above)
+    input arm64 x0 x64 rax = tp
+    clobber x64 { memory }
+    clobber arm64 { memory }
+  }
+}
+
+// Claim one cell of `tokenPool` for a new thread's identity token, returning
+// its address, or 0 if every cell is already claimed. Bounded by
+// `tokenPoolMax`, mirroring `trampClaim` below.
+//
+// `tokenClaimed[i]` is the CAS gate (0 -> 1 = claimed); `tokenPool[i]` becomes
+// the winning cell's own self-referential value once `winInstallThreadToken`
+// runs. Two arrays rather than the trampoline pool's "word 0 IS the flag"
+// trick, because a token cell's final value (its own address) is not known
+// until AFTER it is claimed, so it cannot double as the claim flag itself.
+const tokenPoolMax: int = 1024
+let tokenClaimed: [1024]i64
+let tokenPool: [1024]i64
+
+fn tokenClaim(): int {
+  let flags: *i64 = ptrOf(tokenClaimed)
+  let cells: *i64 = ptrOf(tokenPool)
+  let i = 0
+  while (i < tokenPoolMax) {
+    if (atomicCmpxchg(flags + i, 0, 1)) {
+      return int(cells) + i * 8
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// Write `cellAddr`'s own address into itself (the self-referential word
+// `gcThreadToken()`'s `mov reg, fs:[0]` requires) and install it as this
+// thread's FS_BASE. Called ONCE, by the thread the cell belongs to, before
+// any code that could reach the collector.
+@nosplit fn winInstallThreadToken(cellAddr: int) {
+  *wordsAt(cellAddr) = i64(cellAddr)
+  winSetFsBase(cellAddr)
+}
+
+// `CreateThread` carries ONE `void *` to the child (`lpParameter`), and the
+// trampoline needs three words — the real entry, the real argument, and the
+// claimed token cell's address. A fixed pool, not an allocator, for the same
+// reason ../darwin/spawn.bit's `trampCells` is one: a provider is a leaf with
+// no allocator to call, and a static pool keeps this off the "no unbounded
+// allocation after startup" list.
+//
+// WORD 0 IS STILL THE CLAIM FLAG (`start`, which no real `entryOf` is ever
+// 0), exactly as ../darwin/spawn.bit's cells — only the stride changed, from
+// two words to three.
+// FOUR words per cell — start, arg, the claimed token cell's address, and
+// `done`'s address — `trampMax * 4 = 256`.
+const trampMax: int = 64
+let trampCells: [256]i64
+
+fn trampClaim(start: int, arg: int, tokenAddr: int, doneAddr: int): int {
+  let p: *i64 = ptrOf(trampCells)
+  let i = 0
+  while (i < trampMax) {
+    if (atomicCmpxchg(p + i * 4, 0, start)) {
+      // Safe unsynchronised: the CAS above makes this cell ours until the
+      // child releases it, and the child cannot run before `CreateThread`.
+      *(p + i * 4 + 1) = arg
+      *(p + i * 4 + 2) = tokenAddr
+      *(p + i * 4 + 3) = doneAddr
+      return int(p) + i * 32
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+fn trampRelease(cell: int, start: int) {
+  let p = wordsAt(cell)
+  atomicCmpxchg(p, start, 0)
+}
+
+// `*i64` -> `*i32` for the `done` word, the same re-addressing
+// `runtime/sched/sched.bit`'s `lockOf` uses for a lock cell: a `*i32` scales
+// by 4, so the byte address divided by 4 off the null pointer names the same
+// cell (§11.4, low half of the word — both targets are little-endian).
+@nosplit fn wordsAtI32(addr: int): *i32 {
+  let z: *i32 = nil
+  return z + addr / 4
+}
+
+// Every OS thread this provider starts enters here, not at the caller's body.
+//
+// ORDER IS LOAD-BEARING: the token installs BEFORE `invokeRaw`, so nothing
+// this thread runs — including whatever `start` itself does on its very
+// first instruction — can reach the collector with FS_BASE unset. Unlike
+// ../darwin/spawn.bit, this trampoline ALSO clears `done` once the body
+// returns (see the header's note on #3375: the Darwin provider promises this
+// in its own comment but the code has no path to deliver it, because its
+// cell carries no `done` pointer at all — this provider's does, precisely so
+// `../thread.bit`'s shared `threadJoin` works here without that gap).
+//
+// NOT `@nosplit`: that attribute forbids the `extern` call
+// (`bit_rt_gc_thread_exit`) this exists to make, the same reason
+// ../darwin/spawn.bit's own `threadTrampoline` is not `@nosplit` either.
+fn threadTrampoline(cell: *byte): *byte {
+  let addr = int(cell)
+  let p = wordsAt(addr)
+  let start = *p
+  let arg = *(p + 1)
+  let tokenAddr = *(p + 2)
+  let doneAddr = *(p + 3)
+  trampRelease(addr, start)
+
+  winInstallThreadToken(tokenAddr)
+  invokeRaw(start, arg)
+
+  // The last two things this thread does: publish that it is finished, then
+  // release its mutator slot so a rendezvous no longer waits on a thread
+  // that has gone. Order matches ../darwin/spawn.bit's own
+  // `bit_rt_gc_thread_exit()` placement (last Bit code the thread runs).
+  if (doneAddr != 0) {
+    atomicStore(wordsAtI32(doneAddr), i32(0))
+  }
+  bit_rt_gc_thread_exit()
+  let z: *byte = nil
+  return z
+}
+
+// Start an OS thread running `start(arg)`. Returns an opaque handle (> 0) for
+// `threadRelease`, or 0 on failure.
+//
+// `start` must be `entryOf(f)` for a named `function f(arg: *byte): *byte`
+// obeying the child rules in ../thread.bit. `done` is a caller-owned word
+// this function arms; the child clears it before returning (see
+// `threadTrampoline` above — this is the one place this provider's contract
+// is STRONGER than ../darwin/spawn.bit's identically-worded promise, per
+// #3375).
+//
+// The handle is the raw `HANDLE` `CreateThread` returns. That is what
+// actually has to be released on this platform — see ../thread.bit on why
+// the handle is opaque and why a caller must not read meaning into the
+// number.
+export @symbol("bit_rt_port_thread_start") fn threadStart(start: *byte, arg: *byte, done: *i32): int {
+  // Claimed BEFORE the thread exists, so a failure here refuses cleanly —
+  // exactly ../darwin/spawn.bit's "refused rather than started unwrapped"
+  // choice for its own trampoline pool, applied to the token pool too.
+  let tokenAddr = tokenClaim()
+  if (tokenAddr == 0) {
+    return 0
+  }
+
+  // Armed BEFORE the create, not after: the child can run to completion and
+  // clear this word before `CreateThread` has even returned. Arming it
+  // afterwards would overwrite the child's 0 with 1 and strand every joiner
+  // until its deadline — same ordering ../darwin/spawn.bit uses.
+  atomicStore(done, i32(runningSentinel()))
+
+  let cell = trampClaim(int(start), int(arg), tokenAddr, int(done))
+  if (cell == 0) {
+    // Pool exhausted: `trampMax` starts are already in flight. Refused
+    // rather than started unwrapped, same as ../darwin/spawn.bit. The
+    // token claim is left in place — see the note below on why a leaked
+    // token claim is the safe failure direction.
+    atomicStore(done, i32(0))
+    return 0
+  }
+
+  let nullAttrs: *byte = nil
+  let handle = CreateThread(nullAttrs, threadStackBytes, entryOf(threadTrampoline),
+                             bytesAt(cell), STACK_SIZE_PARAM_IS_A_RESERVATION, ptrOf(winThreadIdScratch))
+  if (int(handle) == 0) {
+    // No thread exists, so nothing will ever clear `done` or release the
+    // token cell's claim. Disarm `done` so a caller that joins anyway gets
+    // `threadJoinDone` immediately rather than waiting out a full deadline
+    // for a thread that was never created; release the trampoline cell so a
+    // later start can reuse it. The token cell is NOT released — a leaked
+    // token claim is inert (nothing ever reads it) rather than reused as a
+    // second thread's identity, which is the failure mode worth avoiding.
+    trampRelease(cell, int(start))
+    atomicStore(done, i32(0))
+    return 0
+  }
+  return int(handle)
+}
+
+// Release a finished thread's resources. Call only after `threadJoin` has
+// reported `threadJoinDone` (or after directly polling `done`/waiting on the
+// handle some other way).
+//
+// `CloseHandle` on a `CreateThread` handle does not block — unlike
+// `pthread_join`, which is why ../darwin/spawn.bit's analogous function
+// documents a residual wait. Nothing here can hang: by the time this is
+// called the thread has already published its completion (`threadTrampoline`
+// cleared `done` before returning), so reclaiming the handle is immediate.
+export @symbol("bit_rt_port_thread_release") fn threadRelease(handle: int): bool {
+  if (handle == 0) {
+    return false
+  }
+  let z: *byte = nil
+  return int(CloseHandle(z + handle)) != 0
+}
