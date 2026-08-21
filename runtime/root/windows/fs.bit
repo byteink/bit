@@ -1,0 +1,712 @@
+// Windows filesystem provider (#3334, epic #3322): the path-taking half of
+// the 14 `bit_rt_fs_*` ABI wrappers (ABI.md §14) — open, close, stat, mkdir,
+// remove, rename, and directory listing. `rtFsRead`/`rtFsReadAll`/`rtFsWrite`
+// (the three that instead take an already-open handle) live in
+// ./fsrw.bit — see its own header for why, matching ../linux/fs.bit's
+// #3274-established split with ../linux/fsrw.bit. Together the two files are
+// the Windows sibling of ../linux/{fs,fsrw}.bit and ../darwin/fs.bit, kept in
+// the same function-for-function SHAPE as both (see ../darwin/fs.bit's own
+// header for why: a divergence between providers should be a real platform
+// difference, never a stylistic one) — but the MECHANISM differs completely,
+// the same way ../io.bit's header already argues for the write path: Windows
+// has no file descriptors, no raw `open(2)`/`read(2)`/`write(2)`, and no
+// POSIX `errno`. Every call below goes through kernel32's
+// `CreateFileW`/`ReadFile`/`WriteFile`/`CloseHandle` and the matching
+// path-taking APIs, all already admitted in `compiler/pesyms.bit` (#3328) —
+// no addition needed for this ticket.
+//
+// ---------------------------------------------------------------------------
+// HANDLES ARE NOT FILE DESCRIPTORS
+// ---------------------------------------------------------------------------
+//
+// A Windows `HANDLE` is an opaque, per-process kernel-object reference — NOT
+// a small integer allocated from a dense table the way a POSIX fd is. This
+// file's ABI surface still returns/accepts a plain `int` (ABI.md §14's own
+// contract: `fd, or -1`), so every `HANDLE` is carried across that boundary
+// by REINTERPRETING its pointer bits as a 64-bit integer (`int(handle)`) and
+// back (`hAt(fd)`, this file's own pointer-reconstruction helper) — the
+// identical device `../boot.bit`'s `startHandles` array already uses for its
+// `CreateThread` HANDLEs. `fd < 0` (`std/fs`'s own error check) still works
+// as the failure test: `CreateFileW`'s failure sentinel is
+// `INVALID_HANDLE_VALUE`, defined by Microsoft as `(HANDLE)(LONG_PTR)-1` —
+// ALL 64 BITS SET, not just the low 32 — so `int(handle) == 0 - 1` is exact,
+// and every real handle kernel32 hands out is a small POSITIVE value, so it
+// can never collide with that sentinel.
+//
+// ---------------------------------------------------------------------------
+// THE UTF-16 / UTF-8 BOUNDARY — REUSED, NOT REIMPLEMENTED (#3332's own
+// constraint, and this ticket's)
+// ---------------------------------------------------------------------------
+//
+// `../os.bit`'s `winUtf8ToUtf16` (added by this ticket, beside the decoder
+// #3332 already wrote there) is the ONE encoder every path-taking call below
+// uses; `../os.bit`'s existing `winUtf16ToUtf8` is reused a second time, for
+// decoding `FindFirstFileW`/`FindNextFileW`'s returned `cFileName`. Neither
+// is redeclared here — same module, `../os.bit` is a sibling file, an import
+// is per-MODULE in Bit (this project's own standing rule), so both are
+// already in scope with no `import` line at all.
+//
+// ---------------------------------------------------------------------------
+// SCOPE DECISIONS THIS TICKET MAKES EXPLICITLY (per its own instruction to
+// "decide and say so")
+// ---------------------------------------------------------------------------
+//
+// - LONG PATHS (`\\?\` prefix) ARE OUT OF SCOPE. Every path buffer below is
+//   sized to Microsoft's own `MAX_PATH` (260 UTF-16 units, INCLUDING the
+//   terminating NUL — `fsWinPathUnits` below) and every encode REJECTS
+//   (returns 0, never truncates) a path that will not fit. A path needing
+//   the `\\?\` long-path opt-out is refused the same way an over-`fsMaxPath`
+//   POSIX path already is (`../darwin/fs.bit`'s `checkedPathZ`) — a distinct,
+//   documented capacity, not a bug.
+// - PATH SEPARATORS ARE PASSED THROUGH UNCHANGED. `std/path` (this repo's
+//   only path-joining code) is not platform-aware and always uses `/`
+//   (`stdlib/path/path.bit`), and this ticket does not touch it (out of
+//   scope — `Files: runtime/root/windows/fs.bit`). Win32's `CreateFileW`
+//   family has accepted `/` interchangeably with `\` since Windows NT
+//   (Microsoft's own documented behaviour for `CreateFile` and its siblings),
+//   so no separator translation is applied here.
+// - `rtFsRename` USES `MoveFileW`, WHICH DOES **NOT** OVERWRITE AN EXISTING
+//   DESTINATION — unlike POSIX `rename(2)`, which atomically replaces one.
+//   `MoveFileExW`'s `MOVEFILE_REPLACE_EXISTING` flag would close this gap,
+//   but `MoveFileExW` is not in `compiler/pesyms.bit`'s admitted surface and
+//   adding it is outside this ticket's file (`fs.bit` — plus `os.bit` for the
+//   encoder this ticket's own coordinating comment directs). Recorded here
+//   as a stated behavioural gap, not silently mismatched.
+// - `rtFsIsSymlinkW` ANSWERS FROM `FILE_ATTRIBUTE_REPARSE_POINT`, not a
+//   `DeviceIoControl(FSCTL_GET_REPARSE_POINT)` probe of the reparse tag. This
+//   reports true for ANY reparse point (a symlink, a junction, or any other
+//   filesystem filter's tag), a strict superset of "is a symlink" — the same
+//   direction of imprecision `../darwin/fs.bit`'s `readlink`-based probe has
+//   for a dangling link (answers true because the LINK exists). Precise
+//   reparse-tag discrimination needs `DeviceIoControl`, not in the admitted
+//   surface, out of scope for the same reason as `MoveFileExW` above.
+// - `rtFsChmod` MAPS ONLY THE OWNER-WRITE BIT (`mode & 0o200`) TO
+//   `FILE_ATTRIBUTE_READONLY`, Windows' only enforceable "you may not modify
+//   this file" bit reachable through `SetFileAttributesW`. There is no
+//   Windows equivalent of POSIX's separate read/execute permission bits, and
+//   this ticket does not invent one.
+// - `rtFsReadAll` HAS NO EINTR-STYLE RETRY LOOP, UNLIKE THE POSIX PROVIDERS.
+//   Windows synchronous `ReadFile` on a regular file has no signal-driven
+//   short-read analogue to POSIX's `EINTR` (Microsoft's own documented
+//   behaviour: a synchronous handle's `ReadFile` either completes, hits EOF,
+//   or fails outright) — the retry budget `../darwin/fs.bit`'s
+//   `maxReadAllRetries` exists for has no Windows counterpart to guard
+//   against.
+//
+// ---------------------------------------------------------------------------
+// PER-WORKER SCRATCH, NOT SHARED BUFFERS (#3274) — DUPLICATED PER FILE, ON
+// PURPOSE
+// ---------------------------------------------------------------------------
+//
+// Every buffer below is `(fsScratchSlots + 1)` slots — one per worker plus a
+// fallback for a caller with no current task — exactly `../darwin/fs.bit`'s
+// and `../linux/fs.bit`'s own `fsScratchSlot` shape, and `fsScratchSlot`
+// itself is duplicated here rather than reused from `./io.bit`'s
+// `ioConstScratchSlot` or `./os.bit`'s `osScratchSlot`, even though all three
+// live in this SAME module and could call across files with no `import`.
+// That is the ESTABLISHED shape in this module family, not an oversight:
+// `../darwin/os.bit`'s own `osScratchSlot` comment lists `./io.bit`'s
+// `ioConstScratchSlot` as a sibling it duplicates rather than calls, and
+// `../linux/fs.bit`/`../darwin/fs.bit` do the identical thing relative to
+// their own `io.bit`/`os.bit`. Each file owns its own scratch state privately
+// so a change to one file's slot count or layout can never silently
+// perturb another file's buffers.
+//
+// WHY PER-WORKER IS SOUND (mirrors `../darwin/fs.bit`'s own argument): every
+// path-taking function below fills its slot and reads it back with no park
+// in between — checked directly by grep for `schedPark`/`schedSwitch` in this
+// file (none), not inferred from `@nosplit` alone.
+//
+// ---------------------------------------------------------------------------
+// BRACKET EVERY BLOCKING CALL (#2207)
+// ---------------------------------------------------------------------------
+//
+// `ReadFile`/`WriteFile` on an arbitrary handle can block for the same
+// reasons `../darwin/fs.bit`'s `read`/`write` can (a pipe, a slow device, a
+// handle another process holds under a byte-range lock) — unbracketed, the
+// calling thread never reaches a safepoint and spins whichever thread
+// requests a stop-the-world for the whole duration (#2207, found on
+// `fsRead`). `gcSyscallBegin`/`gcSyscallEnd` bracket every one below, and
+// `syscall` (not `blocked`) because a live string reference (`big`/`s`) is
+// held across the call — the identical reasoning `../darwin/fs.bit`'s
+// `rtFsRead`/`rtFsReadAll`/`rtFsWrite` give for their own brackets.
+//
+// ---------------------------------------------------------------------------
+// RUNTIME VERIFICATION OWED
+// ---------------------------------------------------------------------------
+//
+// `libbitrt-x86_64-windows.a` does not exist yet (#3341: `tools/build` has no
+// x86_64-windows target support), so nothing in this file has executed on
+// real Windows. `bit check runtime/root/windows` (type-check only) is the
+// full verification this ticket could run directly. `winUtf8ToUtf16`
+// (`../os.bit`) and `fsScratchSlot`'s double-bound accessor below were each
+// mirrored in isolation (a throwaway Python script, and a direct mutation of
+// the bound logic) and checked before being written here — the technique
+// `../os.bit`'s own header already used for `winUtf16ToUtf8`/`winSplitArgs`.
+// The four acceptance scenarios (create/write/read-back/delete, a >=3-entry
+// directory listing, a non-ASCII path round-trip, three distinguishable
+// error paths, 300 concurrent listing iterations at BIT_WORKERS=8) all
+// remain to be run on `mustafa-desktop-win` once #3341 lands — not claimed
+// done here.
+
+import { rtStrAlloc, rtStringSlice, rtFsReadAllFailedSet } from "../../root"
+// `strPtr`/`strLen` (from "../../root") and `loadWord`/`storeWord`/
+// `loadByte`/`storeByte` (from "../../gc") are NOT imported here: ./io.bit
+// already imports all of them into this module — a second import of any of
+// those names would be E0042.
+import { gcSyscallBegin, gcSyscallEnd } from "../../gc"
+// `wkId`/`schedCurrentWorker`/`schedMaxWorkers` (from "../../sched") and
+// `taskAt` (from "../../sched", imported by ./boot.bit) are likewise already
+// in scope for `fsScratchSlot` below — not re-imported here.
+
+// kernel32 imports beyond what ./boot.bit and ./io.bit already declare in
+// this module (same rule: a second `extern fn CloseHandle`/`WriteFile` here
+// would be E0042). All of the names below are already admitted in
+// `compiler/pesyms.bit` (#3328) — no addition needed for this ticket.
+extern fn CreateFileW(path: *byte, access: i32, share: i32, secAttrs: *byte, disposition: i32, flagsAttrs: i32, templateFile: *byte): *byte
+extern fn ReadFile(handle: *byte, buf: *u8, n: i32, readOut: *i32, overlapped: *byte): i32
+extern fn DeleteFileW(path: *byte): i32
+extern fn CreateDirectoryW(path: *byte, secAttrs: *byte): i32
+extern fn RemoveDirectoryW(path: *byte): i32
+extern fn MoveFileW(oldPath: *byte, newPath: *byte): i32
+extern fn GetFileAttributesW(path: *byte): i32
+extern fn SetFileAttributesW(path: *byte, attrs: i32): i32
+extern fn GetFileSizeEx(handle: *byte, sizeOut: *i64): i32
+extern fn FindFirstFileW(path: *byte, findData: *byte): *byte
+extern fn FindNextFileW(handle: *byte, findData: *byte): i32
+extern fn FindClose(handle: *byte): i32
+
+// ---------------------------------------------------------------------------
+// Constants — every flag value read from Microsoft's own `winnt.h`/
+// `fileapi.h`/`minwinbase.h` documentation, not from memory.
+// ---------------------------------------------------------------------------
+
+// `CreateFileW`'s `dwDesiredAccess` (winnt.h). `GENERIC_READ` sets the sign
+// bit of a DWORD (0x80000000), which is why it is written here as the
+// positive 64-bit `int` and cast with `i32()` at the call site — the same
+// device `compiler/pehdr.bit`'s own `0x80000000`-valued PE section flags
+// use: `i32()` truncates to the low 32 bits, giving the correct bit pattern
+// regardless of sign.
+const winGenericRead: int = 2147483648   // 0x80000000
+const winGenericWrite: int = 1073741824  // 0x40000000
+// `FILE_APPEND_DATA` ALONE (no `FILE_WRITE_DATA`/`GENERIC_WRITE`) is
+// Microsoft's own documented device for atomic append: every write lands at
+// EOF regardless of the handle's current file pointer, no matter how many
+// other handles are writing concurrently — the Windows-native equivalent of
+// POSIX `O_APPEND`, and MORE faithful than seeking to end-of-file once at
+// open time (which is not atomic against a concurrent appender).
+const winFileAppendData: int = 4         // 0x00000004
+
+// `dwShareMode`: read+write+delete, matching POSIX's own default of never
+// locking a file against other opens.
+const winShareAll: int = 7               // FILE_SHARE_READ|WRITE|DELETE (1|2|4)
+
+// `dwCreationDisposition`.
+const winCreateAlways: int = 2   // create, truncating an existing file
+const winOpenExisting: int = 3   // fail if absent — read-only open's contract
+const winOpenAlways: int = 4     // create if absent, keep existing content — append's contract
+
+const winFileAttrNormal: int = 128   // FILE_ATTRIBUTE_NORMAL (0x80)
+const winInvalidHandle: int = 0 - 1  // INVALID_HANDLE_VALUE, all 64 bits set
+
+// `GetFileAttributesW`/`SetFileAttributesW` flags.
+const winInvalidFileAttributes: int = 0 - 1  // ((DWORD)-1), sign-extends correctly
+const winFileAttrDirectory: int = 16         // FILE_ATTRIBUTE_DIRECTORY (0x10)
+const winFileAttrReparsePoint: int = 1024    // FILE_ATTRIBUTE_REPARSE_POINT (0x400)
+const winFileAttrReadonly: int = 1           // FILE_ATTRIBUTE_READONLY (0x1)
+
+// POSIX owner-write bit (0o200), the one `rtFsChmod` below maps to
+// `FILE_ATTRIBUTE_READONLY` — see the header's chmod scope note.
+const winOwnerWriteBit: int = 128
+
+// `MAX_PATH` (`fileapi.h`'s own documented ceiling): 260 UTF-16 units,
+// INCLUDING the terminating NUL — so 259 content units maximum. See the
+// header's "long paths are out of scope" note.
+const fsWinPathUnits: int = 260
+const fsWinPathBytes: int = 520   // fsWinPathUnits * 2
+
+// `WIN32_FIND_DATAW` (`minwinbase.h`): dwFileAttributes(DWORD)@0,
+// ftCreationTime(FILETIME=2xDWORD)@4, ftLastAccessTime@12, ftLastWriteTime@20,
+// nFileSizeHigh(DWORD)@28, nFileSizeLow(DWORD)@32, dwReserved0@36,
+// dwReserved1@40, cFileName(WCHAR[260])@44, cAlternateFileName(WCHAR[14])@564.
+// Every field is naturally DWORD/WORD-aligned already (44 is divisible by 4),
+// so there is no compiler padding to account for. Total size 592 bytes.
+const fsFindDataBytes: int = 592
+const fsFindDataNameOff: int = 44
+
+// ---------------------------------------------------------------------------
+// Per-worker scratch (#3274 — see the header's "duplicated per file" note)
+// ---------------------------------------------------------------------------
+
+const fsScratchSlots: int = 32
+
+@nosplit fn fsScratchSlot(): int {
+  let w = schedCurrentWorker()
+  if (w == 0) {
+    return fsScratchSlots
+  }
+  let id = *(taskAt(w) + wkId)
+  if (id < 0 || id >= schedMaxWorkers || id >= fsScratchSlots) {
+    return fsScratchSlots
+  }
+  return id
+}
+
+// Two independent NUL-terminated UTF-16LE path scratch regions — TWO, not
+// one, for the identical reason `../darwin/fs.bit`'s `fsPathBuf`/`fsPathBuf2`
+// pair is: `rtFsRename` needs both its paths encoded and live at the same
+// time, and a single buffer would let encoding `newPath` overwrite `oldPath`
+// before `MoveFileW` ever reads it. (`fsScratchSlots` + 1) slots of
+// `fsWinPathBytes` (520) bytes = 65 words each: 33 * 65 = 2145 words, one
+// region per worker plus the fallback. Scalar arrays, never scanned by the
+// collector (ABI.md §5, rule 1) — they hold raw path bytes, not objects.
+let fsPathBufW: [2145]i64
+let fsPathBufW2: [2145]i64
+
+// The `WIN32_FIND_DATAW` scratch for `sysList` below. 33 * (592/8) = 33 * 74
+// = 2442 words, one struct per worker plus the fallback.
+let fsFindDataBuf: [2442]i64
+
+// A decoded-UTF-8-name scratch, one per worker plus the fallback, used only
+// to hold ONE directory entry's name between `winUtf16ToUtf8`-decoding it and
+// bounded-copying it into the caller's real output buffer (`sysList` below).
+// 1024 bytes/slot: `cFileName` is at most 259 UTF-16 content units, and the
+// worst-case single-unit UTF-8 expansion is 3 bytes (a BMP codepoint in
+// U+0800..U+FFFF) — 259*3 = 777, rounded up with headroom. 33 * 128 words =
+// 4224 words.
+const fsNameScratchBytes: int = 1024
+let fsNameBuf: [4224]i64
+
+// `ReadFile`/`WriteFile`'s shared `LPDWORD` out-param, one DWORD per worker
+// slot — PER-WORKER for the identical reason `../io.bit`'s own
+// `winWrittenScratch` is: two workers each mid-call at the same real time
+// must not share the address the OS writes the transferred count into.
+let fsIoWordScratch: [33]i32
+
+// `GetFileSizeEx`'s `LARGE_INTEGER` out-param, one i64 per worker slot.
+let fsSizeScratch: [33]i64
+
+// ---------------------------------------------------------------------------
+// Pointer / string glue
+// ---------------------------------------------------------------------------
+
+// Reconstitute a raw address as a `*byte` (HANDLE / UTF-16 buffer argument)
+// or a `*u8` (ReadFile/WriteFile buffer argument) — `base + addr` on a nil
+// pointer, the project idiom (`../darwin/io.bit`'s `rootWriteAll`,
+// `../darwin/fs.bit`'s `u8At`).
+@nosplit fn hAt(addr: int): *byte {
+  let base: *byte = nil
+  return base + addr
+}
+
+@nosplit fn u8At(addr: int): *u8 {
+  let base: *u8 = nil
+  return base + addr
+}
+
+// A string object's inline byte pointer and length (ABI.md §2). `strPtr`/
+// `strLen`/`loadWord` are ./io.bit's module-scoped imports, reused here.
+@nosplit fn strData(s: int): int { return loadWord(s + strPtr) }
+@nosplit fn strLenOf(s: int): int { return loadWord(s + strLen) }
+@nosplit fn emptyStr(): int { return rtStrAlloc(0) }
+
+// ---------------------------------------------------------------------------
+// Path encoding — the UTF-8 (Bit `string`) -> UTF-16LE (Win32) boundary
+// ---------------------------------------------------------------------------
+
+// Copy the Bit string `path`'s UTF-8 bytes into the CURRENT worker's slot of
+// `fsPathBufW`, encoded as NUL-terminated UTF-16LE via `../os.bit`'s
+// `winUtf8ToUtf16`, and return the slot's address — or 0 if the path carries
+// an embedded NUL (#2146's rule, mirrored for this boundary: the syscall
+// would stop early while every Bit-side check still saw the whole string) or
+// does not fit `fsWinPathUnits` (MAX_PATH; rejected, never truncated).
+//
+// BOUNDED (Power of 10 rule 2): the scan is bounded by the string's own
+// length, exactly as `../darwin/fs.bit`'s `checkedPathZ`'s copy loop is.
+@nosplit fn checkedPathW(path: int): int {
+  let n = strLenOf(path)
+  let src = strData(path)
+  let i = 0
+  while (i < n) {
+    if (loadByte(src + i) == 0) {
+      return 0
+    }
+    i = i + 1
+  }
+  let dst = int(ptrOf(fsPathBufW)) + fsScratchSlot() * fsWinPathBytes
+  let units = winUtf8ToUtf16(src, n, dst, fsWinPathUnits)
+  if (units < 0) {
+    return 0
+  }
+  return dst
+}
+
+// `checkedPathW`, encoding into `fsPathBufW2` instead of `fsPathBufW`
+// (#2712's device, mirrored) — the only caller is `rtFsRename`'s `newPath`,
+// so the two encoded paths can never alias.
+@nosplit fn checkedPathW2(path: int): int {
+  let n = strLenOf(path)
+  let src = strData(path)
+  let i = 0
+  while (i < n) {
+    if (loadByte(src + i) == 0) {
+      return 0
+    }
+    i = i + 1
+  }
+  let dst = int(ptrOf(fsPathBufW2)) + fsScratchSlot() * fsWinPathBytes
+  let units = winUtf8ToUtf16(src, n, dst, fsWinPathUnits)
+  if (units < 0) {
+    return 0
+  }
+  return dst
+}
+
+// `checkedPathW`'s body again, reserving 2 trailing UTF-16 units so a `\*`
+// search pattern can be appended in place for `FindFirstFileW` — a SEPARATE
+// function rather than a parameterized `checkedPathW(path, reserve)` because
+// this file otherwise keeps every path-taking entry's body plain, matching
+// `../darwin/fs.bit`'s own choice to duplicate `checkedPathZ`/`checkedPathZ2`
+// rather than parameterize them.
+//
+// BOUNDED: identical to `checkedPathW` above, plus the fixed 3-byte append.
+@nosplit fn buildListPattern(path: int): int {
+  let n = strLenOf(path)
+  let src = strData(path)
+  let i = 0
+  while (i < n) {
+    if (loadByte(src + i) == 0) {
+      return 0
+    }
+    i = i + 1
+  }
+  let dst = int(ptrOf(fsPathBufW)) + fsScratchSlot() * fsWinPathBytes
+  let units = winUtf8ToUtf16(src, n, dst, fsWinPathUnits - 2)
+  if (units < 0) {
+    return 0
+  }
+  storeByte(dst + units * 2, 92)       // '\'
+  storeByte(dst + units * 2 + 1, 0)
+  storeByte(dst + units * 2 + 2, 42)   // '*'
+  storeByte(dst + units * 2 + 3, 0)
+  storeByte(dst + units * 2 + 4, 0)    // NUL
+  storeByte(dst + units * 2 + 5, 0)
+  return dst
+}
+
+// The `rtFsIsSymlinkW` sink: `n` PACKED (non-NUL-terminated) UTF-8 path
+// bytes at raw address `words` (a Bit `[]byte`'s backing store, #3121/#3226)
+// -> the CURRENT worker's slot of `fsPathBufW`, NUL-terminated UTF-16LE.
+// Same rejection rules as `checkedPathW`: an embedded NUL or an oversized
+// path returns 0. This is `checkedPathW` for a caller with no Bit `string`
+// to offer — `../darwin/fs.bit`'s `wordsPathZ` is the POSIX analogue.
+@nosplit fn wordsPathW(words: int, n: int): int {
+  if (words == 0 || n <= 0) {
+    return 0
+  }
+  let i = 0
+  while (i < n) {
+    if (loadByte(words + i) == 0) {
+      return 0
+    }
+    i = i + 1
+  }
+  let dst = int(ptrOf(fsPathBufW)) + fsScratchSlot() * fsWinPathBytes
+  let units = winUtf8ToUtf16(words, n, dst, fsWinPathUnits)
+  if (units < 0) {
+    return 0
+  }
+  return dst
+}
+
+// ---------------------------------------------------------------------------
+// kernel32 calls (the runtime/sched/ helpers)
+// ---------------------------------------------------------------------------
+
+// Whether the already-encoded UTF-16 path `p` names a directory. `false` for
+// a missing path too — `GetFileAttributesW` fails identically for "absent"
+// and "inaccessible", the same conflation `../darwin/fs.bit`'s `isDirAtP`
+// documents for `opendir`.
+@nosplit fn isDirAtW(p: int): bool {
+  let attrs = int(GetFileAttributesW(hAt(p)))
+  if (attrs == winInvalidFileAttributes) {
+    return false
+  }
+  return (attrs & winFileAttrDirectory) != 0
+}
+
+// The length, in UTF-16 units, of the NUL-terminated name at `base`, capped
+// at 260 (`fsWinPathUnits`, matching `cFileName`'s own declared capacity) so
+// the scan is provably bounded (Power of 10 rule 2).
+@nosplit fn winNameLen(base: int): int {
+  let i = 0
+  while (i < fsWinPathUnits) {
+    if ((loadByte(base + i * 2) | (loadByte(base + i * 2 + 1) << 8)) == 0) {
+      return i
+    }
+    i = i + 1
+  }
+  return fsWinPathUnits
+}
+
+// `.` or `..`, encoded as UTF-16 — the two entries `list_dir` omits, matching
+// `../darwin/fs.bit`'s `isDotName`.
+@nosplit fn isDotNameW(base: int, nlen: int): bool {
+  if (nlen == 1 && loadByte(base) == 46 && loadByte(base + 1) == 0) {
+    return true
+  }
+  if (nlen == 2 && loadByte(base) == 46 && loadByte(base + 1) == 0 &&
+      loadByte(base + 2) == 46 && loadByte(base + 3) == 0) {
+    return true
+  }
+  return false
+}
+
+// List the directory named by the ALREADY-BUILT `\*` search pattern at
+// `patternPtr` (`buildListPattern`'s return), snprintf-shaped exactly like
+// `../darwin/fs.bit`'s `sysList`: write up to `cap` bytes of NUL-terminated
+// UTF-8 names (`.`/`..` omitted) to `outPtr` and return the TOTAL bytes
+// needed (a `cap == 0` call measures), or -1 if the directory cannot be
+// listed at all.
+//
+// `patternPtr` is resolved ONCE by the caller (`rtFsListDir` below) and
+// passed in rather than re-derived here, so the two-pass "measure, then
+// fill" call pair always searches the identical pattern — re-deriving it a
+// second time would re-run `winUtf8ToUtf16` and could, in principle, resolve
+// a DIFFERENT worker slot if a park happened in between (it cannot here, but
+// resolving once and reusing removes the question).
+//
+// BOUNDED: `FindFirstFileW`/`FindNextFileW` exhausts a directory's entries in
+// a `FindNextFileW` returning 0 (matching `../darwin/fs.bit`'s own "readdir
+// returns nil at end of directory (or on error, which callers treat
+// identically)" argument — a directory has finitely many entries).
+@nosplit fn sysList(patternPtr: int, outPtr: int, cap: int): int {
+  let findData = int(ptrOf(fsFindDataBuf)) + fsScratchSlot() * fsFindDataBytes
+  let handle = FindFirstFileW(hAt(patternPtr), hAt(findData))
+  if (int(handle) == winInvalidHandle) {
+    return 0 - 1
+  }
+  let total = 0
+  let more = true
+  while (more) {
+    let nameAddr = findData + fsFindDataNameOff
+    let nlen = winNameLen(nameAddr)
+    if (!isDotNameW(nameAddr, nlen)) {
+      let scratch = int(ptrOf(fsNameBuf)) + fsScratchSlot() * fsNameScratchBytes
+      let nb = winUtf16ToUtf8(nameAddr, nlen, scratch, fsNameScratchBytes)
+      if (nb >= 0) {
+        let j = 0
+        while (j < nb) {
+          if (total + j < cap) {
+            storeByte(outPtr + total + j, loadByte(scratch + j))
+          }
+          j = j + 1
+        }
+        if (total + nb < cap) {
+          storeByte(outPtr + total + nb, 0)
+        }
+        total = total + nb + 1
+      }
+    }
+    if (int(FindNextFileW(handle, hAt(findData))) == 0) {
+      more = false
+    }
+  }
+  FindClose(handle)
+  return total
+}
+
+// ---------------------------------------------------------------------------
+// The exported ABI surface (ABI.md §14) — bare `bit_rt_fs_*` pins, `rtFs*`
+// names to avoid shadowing the `fsOpen`/`fsRead`/… builtins. See
+// ../darwin/fs.bit / ../linux/fs.bit.
+// ---------------------------------------------------------------------------
+
+// `bit_rt_fs_open`: open `path` read-only or create+truncate write-only.
+// Handle (reinterpreted as `int`) or -1. Rejects a directory explicitly via
+// `isDirAtW`, the same #2149 guard `../darwin/fs.bit`'s `rtFsOpen` applies —
+// deliberately not relying on `CreateFileW`'s own undocumented-for-this-case
+// behaviour when `FILE_FLAG_BACKUP_SEMANTICS` is absent.
+export @nosplit @symbol("bit_rt_fs_open") fn rtFsOpen(path: int, write: bool): int {
+  let p = checkedPathW(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  if (isDirAtW(p)) {
+    return 0 - 1
+  }
+  let access = i32(winGenericRead)
+  let disposition = i32(winOpenExisting)
+  if (write) {
+    access = i32(winGenericWrite)
+    disposition = i32(winCreateAlways)
+  }
+  let nilSec: *byte = nil
+  let nilTemplate: *byte = nil
+  let handle = CreateFileW(hAt(p), access, i32(winShareAll), nilSec, disposition, i32(winFileAttrNormal), nilTemplate)
+  if (int(handle) == winInvalidHandle) {
+    return 0 - 1
+  }
+  return int(handle)
+}
+
+// `bit_rt_fs_append`: open `path` for atomic append (`FILE_APPEND_DATA`, see
+// the header note), creating it if absent. Handle or -1.
+export @nosplit @symbol("bit_rt_fs_append") fn rtFsAppend(path: int): int {
+  let p = checkedPathW(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  if (isDirAtW(p)) {
+    return 0 - 1
+  }
+  let nilSec: *byte = nil
+  let nilTemplate: *byte = nil
+  let handle = CreateFileW(hAt(p), i32(winFileAppendData), i32(winShareAll), nilSec, i32(winOpenAlways), i32(winFileAttrNormal), nilTemplate)
+  if (int(handle) == winInvalidHandle) {
+    return 0 - 1
+  }
+  return int(handle)
+}
+
+// `bit_rt_fs_exists`: whether `path` names anything at all.
+// `GetFileAttributesW` is the direct, cheap probe for exactly that question
+// — the Windows analogue of `../darwin/fs.bit`'s `access(F_OK)` choice.
+export @nosplit @symbol("bit_rt_fs_exists") fn rtFsExists(path: int): bool {
+  let p = checkedPathW(path)
+  if (p == 0) {
+    return false
+  }
+  return int(GetFileAttributesW(hAt(p))) != winInvalidFileAttributes
+}
+
+// `bit_rt_fs_is_dir`: false for a missing path or a non-directory.
+export @nosplit @symbol("bit_rt_fs_is_dir") fn rtFsIsDir(path: int): bool {
+  let p = checkedPathW(path)
+  if (p == 0) {
+    return false
+  }
+  return isDirAtW(p)
+}
+
+// `bit_rt_fs_is_symlink_w`: whether the `n` path bytes at `words` name a
+// reparse point (see the header's stated scope note: a superset of "is a
+// symlink"). `false` for a missing path and a path that cannot be probed.
+export @nosplit @symbol("bit_rt_fs_is_symlink_w") fn rtFsIsSymlinkW(words: int, n: int): bool {
+  let p = wordsPathW(words, n)
+  if (p == 0) {
+    return false
+  }
+  let attrs = int(GetFileAttributesW(hAt(p)))
+  if (attrs == winInvalidFileAttributes) {
+    return false
+  }
+  return (attrs & winFileAttrReparsePoint) != 0
+}
+
+// `bit_rt_fs_mkdir`: 0 on success, -1 on failure.
+export @nosplit @symbol("bit_rt_fs_mkdir") fn rtFsMkdir(path: int): int {
+  let p = checkedPathW(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  let nilSec: *byte = nil
+  if (int(CreateDirectoryW(hAt(p), nilSec)) != 0) {
+    return 0
+  }
+  return 0 - 1
+}
+
+// `bit_rt_fs_remove`: 0 on success, -1 on failure. `DeleteFileW` then
+// `RemoveDirectoryW`, matching `../darwin/fs.bit`'s `unlink`-then-`rmdir`
+// shape.
+export @nosplit @symbol("bit_rt_fs_remove") fn rtFsRemove(path: int): int {
+  let p = checkedPathW(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  if (int(DeleteFileW(hAt(p))) != 0) {
+    return 0
+  }
+  if (int(RemoveDirectoryW(hAt(p))) != 0) {
+    return 0
+  }
+  return 0 - 1
+}
+
+// `bit_rt_fs_rename`: rename `oldPath` to `newPath` via `MoveFileW` — see the
+// header's stated gap (does not replace an existing destination, unlike
+// POSIX `rename(2)`). 0 on success, -1 on failure. `oldPath`/`newPath` are
+// encoded into the two distinct buffers `checkedPathW`/`checkedPathW2` own,
+// so the pointers `MoveFileW` receives can never alias.
+export @nosplit @symbol("bit_rt_fs_rename") fn rtFsRename(oldPath: int, newPath: int): int {
+  let op = checkedPathW(oldPath)
+  if (op == 0) {
+    return 0 - 1
+  }
+  let np = checkedPathW2(newPath)
+  if (np == 0) {
+    return 0 - 1
+  }
+  if (int(MoveFileW(hAt(op), hAt(np))) != 0) {
+    return 0
+  }
+  return 0 - 1
+}
+
+// `bit_rt_fs_list_dir`: `path`'s entries, NUL-terminated, `.`/`..` omitted.
+// Empty when the directory is empty or unreadable. Two passes (measure, then
+// fill a string sized to it) against the SAME resolved search pattern — see
+// `sysList`'s own comment for why it is resolved once here rather than
+// inside `sysList`.
+export @nosplit @symbol("bit_rt_fs_list_dir") fn rtFsListDir(path: int): int {
+  let pattern = buildListPattern(path)
+  if (pattern == 0) {
+    return emptyStr()
+  }
+  let needed = sysList(pattern, 0, 0)
+  if (needed <= 0) {
+    return emptyStr()
+  }
+  let out = rtStrAlloc(needed)
+  if (out == 0) {
+    return emptyStr()
+  }
+  let got = sysList(pattern, strData(out), needed)
+  if (got <= 0) {
+    return emptyStr()
+  }
+  if (got > needed) {
+    got = needed
+  }
+  return rtStringSlice(out, 0, got)
+}
+
+// `bit_rt_fs_chmod`: see the header's scope note — maps only the POSIX
+// owner-write bit to `FILE_ATTRIBUTE_READONLY`. 0 on success, -1 on failure.
+export @nosplit @symbol("bit_rt_fs_chmod") fn rtFsChmod(path: int, mode: int): int {
+  let p = checkedPathW(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  let attrs = int(GetFileAttributesW(hAt(p)))
+  if (attrs == winInvalidFileAttributes) {
+    return 0 - 1
+  }
+  let newAttrs = attrs | winFileAttrReadonly
+  if ((mode & winOwnerWriteBit) != 0) {
+    newAttrs = attrs & ~winFileAttrReadonly
+  }
+  if (int(SetFileAttributesW(hAt(p), i32(newAttrs))) != 0) {
+    return 0
+  }
+  return 0 - 1
+}
+
+// `bit_rt_fs_close`: close `fd`. Always reports success, matching
+// `../darwin/fs.bit`'s `rtFsClose` contract (the raw wrapper swallows any
+// `CloseHandle` failure on an already-valid handle).
+export @nosplit @symbol("bit_rt_fs_close") fn rtFsClose(fd: int): int {
+  CloseHandle(hAt(fd))
+  return 0
+}

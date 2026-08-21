@@ -1,0 +1,134 @@
+// The byte-oriented half of the Windows filesystem provider (#3334, epic
+// #3322): `bit_rt_fs_read`, `bit_rt_fs_read_all` and `bit_rt_fs_write` — the
+// three `bit_rt_fs_*` ABI wrappers (ABI.md §14) that operate on an
+// already-open handle rather than a path. Split out of ./fs.bit at write
+// time (816 lines, `spec/LINT.md` §4's 800-line limit, E0200), matching
+// ../linux/fsrw.bit's own #3274 split exactly: path-taking operations (open,
+// exists, isDir, mkdir, remove, rename, listDir, the symlink probe) stay in
+// ./fs.bit; the three functions that instead take an already-open handle and
+// move bytes move here. A real, nameable seam, not an arbitrary line cut —
+// see ../linux/fsrw.bit's own header for why this is the established
+// criterion in this file family.
+//
+// Sibling of ./fs.bit in the same directory, so this is the SAME MODULE (an
+// import is per-module, not per-file) — nothing here needs a new import:
+// `emptyStr`, `hAt`, `u8At`, `strData`, `strLenOf`, `fsScratchSlot`,
+// `fsIoWordScratch`, `fsSizeScratch` are ./fs.bit's own module-scoped
+// declarations; `rtStrAlloc`/`rtStringSlice`/`rtFsReadAllFailedSet` and
+// `gcSyscallBegin`/`gcSyscallEnd` are ./fs.bit's own imports; `ReadFile`/
+// `GetFileSizeEx` are ./fs.bit's own `extern fn` declarations; `WriteFile` is
+// ./io.bit's. All already in scope with no `import` line here at all.
+//
+// See ./fs.bit's header for the full argument behind every device used
+// below: HANDLEs are not fds (reinterpreted as `int` via `hAt`/`int()`), the
+// `syscall`-not-`blocked` bracket choice (#2207), and why `rtFsReadAll` has
+// no `EINTR`-retry loop on Windows.
+
+// `bit_rt_fs_read`: up to `max` bytes from `fd` into a fresh string, trimmed
+// to what arrived (empty at EOF — `ReadFile` reports success with 0 bytes
+// transferred at end of file, unlike POSIX `read` returning 0 directly).
+export @nosplit @symbol("bit_rt_fs_read") fn rtFsRead(fd: int, max: int): int {
+  if (max <= 0) {
+    return emptyStr()
+  }
+  let big = rtStrAlloc(max)
+  if (big == 0) {
+    return emptyStr()
+  }
+  let handle = hAt(fd)
+  let readPtr = ptrOf(fsIoWordScratch) + fsScratchSlot()
+  let nilOverlapped: *byte = nil
+  // THE `syscall` BRACKET IS LOAD-BEARING (#2207) — see ./fs.bit's header.
+  // `big` is a live reference held across the call, so `syscall`, not
+  // `blocked`.
+  gcSyscallBegin()
+  let ok = ReadFile(handle, u8At(strData(big)), i32(max), readPtr, nilOverlapped)
+  let n = int(atomicLoad(readPtr))
+  gcSyscallEnd()
+  if (ok == i32(0) || n <= 0) {
+    return emptyStr()
+  }
+  return rtStringSlice(big, 0, n)
+}
+
+// `bit_rt_fs_read_all`: the whole file as a fresh string, sized by
+// `GetFileSizeEx` — simpler than the POSIX providers' `lseek(SEEK_END)` +
+// `lseek(SEEK_SET, 0)` pair, since `GetFileSizeEx` never moves the handle's
+// file pointer. Failure and allocation-exhaustion both report through the
+// out-of-band `bit_rt_fs_read_all_failed()` companion (`rtFsReadAllFailedSet`,
+// `runtime/root/slots.bit`), exactly as `../darwin/fs.bit`'s own
+// `rtFsReadAll` does — a genuine empty file never sets it.
+//
+// A short read (an I/O error partway through) is NEVER zero-padded (#2990):
+// the result is the string TRIMMED to the bytes actually verified read. No
+// `EINTR`-retry loop — see ./fs.bit's header scope note for why Windows
+// needs none here.
+//
+// BOUNDED (Power of 10 rule 2): `off` strictly increases by at least 1 each
+// iteration that continues the loop, capped by `end`.
+export @nosplit @symbol("bit_rt_fs_read_all") fn rtFsReadAll(fd: int): int {
+  rtFsReadAllFailedSet(false)
+  let handle = hAt(fd)
+  let sizePtr = ptrOf(fsSizeScratch) + fsScratchSlot()
+  let sizeOk = GetFileSizeEx(handle, sizePtr)
+  let end = int(atomicLoad(sizePtr))
+  if (sizeOk == i32(0)) {
+    rtFsReadAllFailedSet(true)
+    return emptyStr()
+  }
+  if (end == 0) {
+    return emptyStr()
+  }
+  let s = rtStrAlloc(end)
+  if (s == 0) {
+    rtFsReadAllFailedSet(true)
+    return emptyStr()
+  }
+  let base = strData(s)
+  let off = 0
+  let nilOverlapped: *byte = nil
+  while (off < end) {
+    let readPtr = ptrOf(fsIoWordScratch) + fsScratchSlot()
+    // Bracketed for the same reason `rtFsRead` above is (#2207): `base`
+    // points into a live string held across the call, so `syscall`.
+    gcSyscallBegin()
+    let ok = ReadFile(handle, u8At(base + off), i32(end - off), readPtr, nilOverlapped)
+    let n = int(atomicLoad(readPtr))
+    gcSyscallEnd()
+    if (ok != i32(0) && n > 0) {
+      off = off + n
+    } else {
+      return rtStringSlice(s, 0, off)
+    }
+  }
+  return s
+}
+
+// `bit_rt_fs_write`: write all of `s`'s bytes to `fd`. Byte count, or -1.
+//
+// BOUNDED (Power of 10 rule 2): `off` rises by at least 1 each iteration.
+export @nosplit @symbol("bit_rt_fs_write") fn rtFsWrite(fd: int, s: int): int {
+  let handle = hAt(fd)
+  let total = strLenOf(s)
+  let base = strData(s)
+  let off = 0
+  let nilOverlapped: *byte = nil
+  while (off < total) {
+    let writtenPtr = ptrOf(fsIoWordScratch) + fsScratchSlot()
+    // Bracketed for the same reason as `rtFsRead` above (#2207): a write to
+    // a full pipe or a slow device blocks, and `base` is a live reference
+    // held across the call, so `syscall`.
+    gcSyscallBegin()
+    let ok = WriteFile(handle, u8At(base + off), i32(total - off), writtenPtr, nilOverlapped)
+    let n = int(atomicLoad(writtenPtr))
+    gcSyscallEnd()
+    if (ok == i32(0)) {
+      return 0 - 1
+    }
+    if (n <= 0) {
+      return off
+    }
+    off = off + n
+  }
+  return off
+}
