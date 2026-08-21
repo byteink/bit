@@ -1,0 +1,475 @@
+// Windows netpoller provider for the Stage C port of runtime/sched/ (#3339,
+// epic #3322): `NetPoller` on IOCP. Sibling of ../linux/poll.bit (epoll) and
+// ../darwin/poll.bit (kqueue) — see ../sched.bit's netpoller section (now
+// split into ../timer.bit) for what stays in core and why the poller itself
+// cannot. Read both siblings first: the four-function contract they present
+// to the scheduler (`pollCreate`/`pollClose`/`pollRegister`/`pollDrain`) is
+// what this file must also present, not the syscalls behind it.
+//
+// ---------------------------------------------------------------------------
+// THE ARCHITECTURAL MISMATCH, AND THE CHOICE THIS TICKET MAKES
+// ---------------------------------------------------------------------------
+//
+// epoll and kqueue are READINESS models: `pollRegister` arms an fd, the
+// kernel later says "readable", and the CALLER then issues the read. IOCP is
+// a COMPLETION model: there is no "is it readable" call at all — you issue
+// the I/O first, with a buffer, and the port later says "that op finished".
+//
+// Two honest options, per this ticket's own text: translate completions into
+// readiness (a speculative op kept outstanding per handle), or widen
+// `runtime/net/net.bit` with a completion-shaped path Windows uses directly.
+// TRANSLATE IS CHOSEN, matching the ticket's own default. The alternative
+// (widening net.bit) would touch the two working, shipped epoll/kqueue ports
+// to add a second calling convention neither needs — translating costs
+// nothing in ../linux/** or ../darwin/**, which stay byte-for-byte unchanged
+// (verified by `git diff --stat` in this ticket's own evidence).
+//
+// THE COST, NAMED. Every `pollRegister` call posts a real zero-byte
+// `WSARecv`/`WSASend` — an OS round trip epoll_ctl/kevent's pure registration
+// call never pays, because there is no Windows verb that only arms a
+// notification without attempting an operation. And it needs a bounded
+// scratch pool (below) to keep each outstanding op's OVERLAPPED/WSABUF/task
+// triple alive across the async boundary — ~40KB of static memory for
+// `maxOutstanding` concurrent registrations, CAS-claimed exactly the way
+// ../../park/windows/wait.bit's compare-value pool is (same author, same
+// reason: WaitOnAddress's compare value and WSARecv/WSASend's OVERLAPPED both
+// travel BY POINTER into memory that must outlive the call, so a per-caller
+// slot is required, not a shared module word).
+//
+// THE READ-SIDE TRICK IS WELL-ESTABLISHED, THE WRITE-SIDE IS NOT — state this
+// precisely rather than sliding past it. A 0-length `WSARecv` on a handle
+// associated with an IOCP is a widely documented technique (used by
+// production IOCP servers precisely to defer buffer allocation until data is
+// known to be available): it stays pending with no data available and
+// completes, without consuming any bytes, the moment data arrives. THE
+// SYMMETRIC CLAIM FOR WRITE — that a 0-length `WSASend` stays pending until
+// the send buffer has room — is NOT backed by the same weight of documented
+// precedent; some stacks may complete a 0-length send immediately regardless
+// of backpressure. That failure mode is SAFE, not silent: a spurious
+// "writable" wake just means the caller's real write (#3340) may itself have
+// to park again, exactly the cost an epoll/kqueue false-positive already
+// costs a caller. Neither claim is verified on hardware in this ticket —
+// #3385/#3391 block every program from booting on mustafa-desktop-win — and
+// that is recorded as owed, not silently assumed away.
+//
+// ---------------------------------------------------------------------------
+// ASSOCIATION: ONCE PER HANDLE, TOLERATED ON EVERY CALL
+// ---------------------------------------------------------------------------
+//
+// `CreateIoCompletionPort` both CREATES a port (FileHandle = INVALID_HANDLE_
+// VALUE) and ASSOCIATES a handle with an existing one — and a handle may be
+// associated with a port exactly ONCE for its whole life; a second attempt
+// fails with ERROR_INVALID_PARAMETER. Rather than keep our own table of
+// "have I seen this fd before" (more unbounded state to maintain correctly),
+// `pollRegister` attempts the association on EVERY call and tolerates that
+// one specific failure — the same shape ../linux/poll.bit's `pollRegister`
+// already uses for EPOLL_CTL_ADD failing EEXIST and falling back to
+// EPOLL_CTL_MOD: the OS is the source of truth for "already registered", not
+// a cache this file would have to keep consistent.
+//
+// ---------------------------------------------------------------------------
+// TASK IDENTITY: BY OVERLAPPED-SLOT ADDRESS, NEVER BY fd NUMBER (#3305)
+// ---------------------------------------------------------------------------
+//
+// #3305's lesson: a parked reader must hold a HANDLE, not a NUMBER that can
+// be reused after close. This provider never recovers a task from `fd` at
+// drain time at all — epoll's `data` word and kqueue's `udata` word are a
+// value set AT REGISTRATION and returned VERBATIM at completion; the
+// equivalent here is the `lpOverlapped` pointer `GetQueuedCompletionStatusEx`
+// hands back, which is OUR OWN scratch slot's address, chosen and owned by
+// this file, never derived from `fd`. `slot = (overlappedAddr - ovBase) / 32`
+// recovers the slot directly from that pointer identity; `taskOf[slot]` (set
+// at registration, read once at drain, then the slot is released) is the
+// task. No numeric fd is ever used as a lookup key on the drain side, so a
+// closed-and-reused socket handle cannot misattribute a completion the way a
+// closed-and-reused fd NUMBER could.
+//
+// ---------------------------------------------------------------------------
+// WHY NO STATUS INSPECTION AT DRAIN TIME
+// ---------------------------------------------------------------------------
+//
+// A completion on the zero-byte probe can mean "data arrived", "peer closed
+// (EOF)", or "an error occurred on the socket" — and because the probe
+// requests ZERO bytes, "arrived" and "closed" both report 0 bytes
+// transferred, indistinguishable by that field alone. This provider does not
+// try to tell them apart: it wakes the task on ANY completion, success or
+// error alike, exactly as EPOLLIN/EVFILT_READ already fire on both EOF and
+// error on the other two platforms. The task's own real read (#3340) is what
+// discovers which of the three actually happened — this is precisely the
+// acceptance property "a connection closed by the peer mid-read wakes its
+// parked reader with a clean end-of-stream rather than hanging or reporting a
+// spurious error".
+//
+// ---------------------------------------------------------------------------
+// ONE PORT, NOT TWO — matching ../darwin/poll.bit, not ../linux/poll.bit
+// ---------------------------------------------------------------------------
+//
+// ../linux/poll.bit needs a SECOND epoll descriptor for write interest
+// because epoll keys a registration on the fd alone and EPOLL_CTL_MOD would
+// let a concurrent reader and writer on one socket evict each other (#1910).
+// IOCP has no such collision: any number of outstanding overlapped ops can
+// coexist on one handle, each with its own OVERLAPPED, so one completion port
+// suffices for both directions — the same property that lets kqueue (keyed
+// on `(fd, filter)`) get away with one descriptor too. Only `schedSetPollFd`
+// is called from `../../root/windows/boot.bit`; `scPollFdWrite` stays 0.
+//
+// ---------------------------------------------------------------------------
+// WINSOCK INITIALISATION
+// ---------------------------------------------------------------------------
+//
+// `WSAStartup` must run once per process before any socket call. `pollCreate`
+// calls it as its first action — the netpoller is created before any socket
+// exists, so this is the earliest and only place Stage C needs it, and
+// `#3340`'s socket layer inherits an already-initialised Winsock with no
+// wiring of its own. `WSAStartup` is documented safe to call more than once
+// (internally reference-counted), so a test harness that builds a second,
+// private poller pays nothing extra for calling it again.
+//
+// ---------------------------------------------------------------------------
+// DLL SOURCING — DOCUMENTED, NOT HARDWARE-PROBED (a named residual risk)
+// ---------------------------------------------------------------------------
+//
+// `CreateIoCompletionPort`/`GetQueuedCompletionStatusEx` are Kernel32.dll
+// (ioapiset.h) and `WSAStartup`/`WSARecv`/`WSASend`/`WSAGetLastError` are
+// Ws2_32.dll per Microsoft's own API reference — added to
+// `compiler/pesyms.bit`'s admitted surface in the same commit. UNLIKE
+// #3336's WaitOnAddress fix, these six are NOT empirically probed against a
+// real loader on mustafa-desktop-win in this ticket (no interactive hardware
+// access here) — they are among the most stable, universally-documented
+// Win32 names that exist (ws2_32.dll has named every Winsock function for
+// over two decades), which is a materially different confidence level than
+// WaitOnAddress's case (MSDN's own metadata was wrong there). Still: if a
+// future hardware run reports `STATUS_ENTRYPOINT_NOT_FOUND` for any of these
+// six, that is the first thing to check, exactly as #3336 found for its
+// three.
+
+import { taskAt, schedPollUnpark, scPollFd, pollRead } from "../../sched"
+import { schedPollTryEnter, schedPollLeave } from "../../sched"
+import { schedPollPendingInc, schedPollPendingDec } from "../../sched"
+
+// ---------------------------------------------------------------------------
+// kernel32.dll / ws2_32.dll imports — compiler/pesyms.bit's admitted surface.
+// ---------------------------------------------------------------------------
+
+extern fn CreateIoCompletionPort(fileHandle: *byte, existingPort: *byte, completionKey: i64, numberOfConcurrentThreads: i32): *byte
+extern fn GetQueuedCompletionStatusEx(port: *byte, entries: *byte, count: i32, numRemoved: *byte, timeoutMs: i32, alertable: i32): i32
+extern fn CloseHandle(handle: *byte): i32
+extern fn GetLastError(): i32
+
+extern fn WSAStartup(versionRequested: i32, wsaData: *byte): i32
+extern fn WSARecv(sock: i64, buffers: *byte, bufferCount: i32, bytesRecvd: *byte, flags: *byte, overlapped: *byte, completionRoutine: *byte): i32
+extern fn WSASend(sock: i64, buffers: *byte, bufferCount: i32, bytesSent: *byte, flags: i32, overlapped: *byte, completionRoutine: *byte): i32
+extern fn WSAGetLastError(): i32
+
+// ERROR_INVALID_PARAMETER (winerror.h) — CreateIoCompletionPort's documented
+// failure when the handle is already associated with a completion port.
+fn errorInvalidParameter(): int { return 87 }
+
+// WSA_IO_PENDING == ERROR_IO_PENDING (winerror.h / winsock2.h) — the expected
+// "queued, will complete via the port" outcome for a well-formed overlapped
+// WSARecv/WSASend.
+fn wsaIoPending(): int { return 997 }
+
+// INVALID_HANDLE_VALUE — `(HANDLE)(LONG_PTR)-1`, all 64 bits set. Same
+// convention as ../../root/windows/fs.bit's `winInvalidHandle`.
+const winInvalidHandle: int = 0 - 1
+
+// Reconstitute a raw address as a `*byte` HANDLE/buffer argument — the
+// project idiom (../../root/windows/fs.bit's `hAt`, ../../park/windows/
+// wait.bit's `bytesOfI32`), duplicated here rather than imported: a provider
+// stays a leaf with no cross-module imports beyond ../../sched, matching both
+// siblings.
+fn hAt(addr: int): *byte {
+  let base: *byte = nil
+  return base + addr
+}
+
+fn bytesOfI32(p: *i32): *byte {
+  let z: *byte = nil
+  return z + int(p)
+}
+
+// ---------------------------------------------------------------------------
+// Winsock bring-up
+// ---------------------------------------------------------------------------
+
+// WSADATA is ~408 bytes on x86-64 (wVersion/wHighVersion, iMaxSockets/
+// iMaxUdpDg, a pointer, then szDescription[257]+szSystemStatus[129]); 512
+// bytes is generous headroom. Contents are discarded — nothing here reads a
+// negotiated version or vendor string, matching `../../park/windows/
+// wait.bit`'s own discard convention for QueryPerformance*'s out-params.
+let wsaDataBuf: [64]i64
+
+fn wsaDataPtr(): *byte {
+  let z: *byte = nil
+  return z + int(ptrOf(wsaDataBuf))
+}
+
+fn winsockInit(): bool {
+  // MAKEWORD(2, 2): Winsock 2.2, the current and only meaningfully supported
+  // version since Windows XP. Low byte and high byte are both 2, so the
+  // "which byte is major/minor" question this repo's own header comments
+  // warn about elsewhere does not even arise here.
+  let versionRequested: i32 = 0x0202
+  return int(WSAStartup(versionRequested, wsaDataPtr())) == 0
+}
+
+// ---------------------------------------------------------------------------
+// The outstanding-operation scratch pool — see the header's cost section.
+// ---------------------------------------------------------------------------
+//
+// `maxOutstanding` = 512, generous headroom over this ticket's own tested
+// scale (100 concurrent connections, so at most ~200 simultaneous read+write
+// probes in the steady state). CAS-claimed over a fixed pool, the same idiom
+// ../../park/windows/wait.bit's `parkScratchClaim`/`parkScratchRelease` use
+// and for the identical reason: a leaf has no allocator to call, so a static
+// pool keeps this off the "no unbounded allocation after startup" list
+// (Power of 10). A claim failure (pool exhausted) reports `pollRegister`
+// false rather than blocking — the caller (`netAwaitReady`, once #3340 wires
+// it) disarms and does not park, exactly the contract a failed
+// EPOLL_CTL_ADD/EV_ADD already has.
+const maxOutstanding: int = 512
+
+let outstandingClaimed: [512]i64
+
+// One OVERLAPPED per slot (Internal/InternalHigh/Offset-union/hEvent — four
+// 8-byte fields on x86-64, so a plain word-per-field layout is EXACT with no
+// byte-level packing, unlike ../linux/poll.bit's epoll_event or
+// ../darwin/poll.bit's kevent, both of which mix narrower fields at
+// non-8-byte offsets). 512 * 4 = 2048.
+let ovWords: [2048]i64
+
+// One WSABUF{len: u32, pad: u32, buf: *byte} per slot — len and its padding
+// share word 0 (writing i64(0) zeros both at once), buf is word 1. 512 * 2 =
+// 1024. Always {0, nil}: a zero-length buffer is never dereferenced by the
+// kernel, so `buf` staying nil is exact, not a placeholder.
+let wsabufWords: [1024]i64
+
+// The task this slot's outstanding op will wake, set at `pollRegister` and
+// read once at `pollDrain` — see the header's "TASK IDENTITY" section for why
+// this, not `fd`, is the drain-side lookup key.
+let taskOf: [512]i64
+
+// WSARecv's `lpFlags` in/out scratch (0 in; discarded out) — per slot, not
+// shared, for the identical reason ../../park/windows/wait.bit's compare
+// buffer is per-caller: two concurrent registrations sharing one word would
+// race the flag write itself.
+let flagsScratch: [512]i64
+
+// WSARecv/WSASend's `lpNumberOfBytesRecvd`/`lpNumberOfBytesSent` out scratch.
+// Always 0 for a zero-length buffer; never read by this file (see the
+// header's "WHY NO STATUS INSPECTION" section — byte count cannot
+// distinguish "ready" from "closed" here regardless).
+let bytesXfer: [512]i64
+
+fn scratchClaim(): int {
+  let flags: *i64 = ptrOf(outstandingClaimed)
+  let i = 0
+  while (i < maxOutstanding) {
+    if (atomicCmpxchg(flags + i, 0, 1)) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+fn scratchRelease(slot: int) {
+  let flags: *i64 = ptrOf(outstandingClaimed)
+  atomicStore(flags + slot, 0)
+}
+
+// `*i64` pointer arithmetic scales by 8 (../../park/windows/wait.bit's
+// `parkScratchAt` establishes the convention this mirrors), so `cells + n`
+// already lands on the n-th 8-byte cell; only the final cast to `*byte` needs
+// the nil-based idiom.
+fn ovPtr(slot: int): *byte {
+  let cells: *i64 = ptrOf(ovWords)
+  let z: *byte = nil
+  return z + int(cells + slot * 4)
+}
+
+fn ovBase(): int {
+  let cells: *i64 = ptrOf(ovWords)
+  return int(cells)
+}
+
+fn wsabufPtr(slot: int): *byte {
+  let cells: *i64 = ptrOf(wsabufWords)
+  let z: *byte = nil
+  return z + int(cells + slot * 2)
+}
+
+fn flagsPtr(slot: int): *byte {
+  let cells: *i64 = ptrOf(flagsScratch)
+  let z: *byte = nil
+  return z + int(cells + slot)
+}
+
+fn bytesXferPtr(slot: int): *byte {
+  let cells: *i64 = ptrOf(bytesXfer)
+  let z: *byte = nil
+  return z + int(cells + slot)
+}
+
+// ---------------------------------------------------------------------------
+// The four-function contract — same names, same signatures as ../linux/
+// poll.bit and ../darwin/poll.bit, so ../../net/windows (#3340) can import
+// this module exactly the way ../../net/linux/sock.bit imports
+// ../../sched/linux and ../../net/darwin/sock.bit imports ../../sched/darwin.
+// ---------------------------------------------------------------------------
+
+// Create the completion port and bring up Winsock. Returns -1 on failure,
+// which the caller must check — matching both siblings' `pollCreate`
+// contract exactly (a descriptor/handle of 0 is also reported as failure,
+// since `../../sched/timer.bit`'s `scPollFd` spells "no poller bound" as 0).
+export @symbol("bit_rt_port_sched_poll_create") fn pollCreate(): int {
+  if (!winsockInit()) {
+    return 0 - 1
+  }
+  let none: *byte = nil
+  let port = CreateIoCompletionPort(hAt(winInvalidHandle), none, i64(0), i32(0))
+  let addr = int(port)
+  if (addr == 0) {
+    return 0 - 1
+  }
+  return addr
+}
+
+// Close it. A non-positive descriptor is "never created" — the same
+// precondition both siblings' `pollClose` enforce.
+export @symbol("bit_rt_port_sched_poll_close") fn pollClose(pollFd: int) {
+  if (pollFd <= 0) {
+    return
+  }
+  let _ = int(CloseHandle(hAt(pollFd)))
+}
+
+// Register `task` to be woken when `fd` becomes ready for `interest` — by
+// posting a zero-byte overlapped WSARecv (read) or WSASend (write). See the
+// header for the translation this implements, its cost, and why the
+// write-side claim is weaker than the read-side one.
+export @symbol("bit_rt_port_sched_poll_register") fn pollRegister(pollFd: int, fd: int, interest: int, task: int): bool {
+  let slot = scratchClaim()
+  if (slot < 0) {
+    return false
+  }
+
+  ovWords[slot * 4 + 0] = i64(0)
+  ovWords[slot * 4 + 1] = i64(0)
+  ovWords[slot * 4 + 2] = i64(0)
+  ovWords[slot * 4 + 3] = i64(0)
+  wsabufWords[slot * 2 + 0] = i64(0)
+  wsabufWords[slot * 2 + 1] = i64(0)
+  taskOf[slot] = i64(task)
+  flagsScratch[slot] = i64(0)
+  bytesXfer[slot] = i64(0)
+
+  // Associate every call, tolerating "already associated" — see the header.
+  let none: *byte = nil
+  let assoc = CreateIoCompletionPort(hAt(fd), hAt(pollFd), i64(fd), i32(0))
+  if (int(assoc) == 0) {
+    if (int(GetLastError()) != errorInvalidParameter()) {
+      scratchRelease(slot)
+      return false
+    }
+  }
+
+  let ov = ovPtr(slot)
+  let wb = wsabufPtr(slot)
+  let rc = 0
+  if (interest == pollRead) {
+    rc = int(WSARecv(i64(fd), wb, i32(1), bytesXferPtr(slot), flagsPtr(slot), ov, none))
+  } else {
+    rc = int(WSASend(i64(fd), wb, i32(1), bytesXferPtr(slot), i32(0), ov, none))
+  }
+  if (rc != 0 && int(WSAGetLastError()) != wsaIoPending()) {
+    scratchRelease(slot)
+    return false
+  }
+  // Either an immediate completion (rc == 0) or a genuinely pending one
+  // (WSA_IO_PENDING) still posts a completion packet to the port — Windows
+  // queues a completion for a synchronously-satisfied overlapped op too,
+  // unless SetFileCompletionNotificationModes(FILE_SKIP_COMPLETION_PORT_ON_
+  // SUCCESS) opted out, which this file never calls. So either outcome is
+  // exactly one `pollDrain` away — counted here as one live registration.
+  schedPollPendingInc()
+  return true
+}
+
+// Ready events drained per call — matches both siblings' `maxBatch`.
+const maxBatch: int = 64
+
+// The OVERLAPPED_ENTRY drain buffer: `lpCompletionKey`(8)/`lpOverlapped`(8)/
+// `Internal`(8)/`dwNumberOfBytesTransferred`(4)+pad(4) = 32 bytes, all four
+// fields 8-byte-sized or padded to it on x86-64 — so, like `ovWords` above,
+// this needs no byte cursor: word index `i*4 + 1` of a `[]i64` view IS
+// `lpOverlapped`. 64 * 4 = 256, matching ../darwin/poll.bit's own
+// 64-events-of-32-bytes sizing exactly.
+//
+// MODULE-LEVEL, SAFE ONLY BECAUSE OF THE TRY-LOCK — see both siblings' `evBuf`
+// for the full argument: `schedPollTryEnter` admits exactly one worker at a
+// time, which is what makes one shared buffer sound on the idle path.
+let evBuf: [256]i64
+
+// GetQueuedCompletionStatusEx's `ulNumEntriesRemoved` out-param scratch — safe
+// for the same try-lock reason as `evBuf`.
+let removedCount: i32 = 0
+
+// Drain ready completions and unpark the waiting task for each. Returns how
+// many were woken. `../../sched/timer.bit`'s `pollDrain` contract, unchanged.
+//
+// TIMEOUT 0 IN THE WORKER LOOP, matching both siblings: a worker never blocks
+// inside `GetQueuedCompletionStatusEx`, so it is never sitting in a syscall
+// where it cannot answer the collector's stop-the-world rendezvous.
+export @symbol("bit_rt_port_sched_poll_drain") fn pollDrain(schedAddr: int, timeoutMs: int): int {
+  let s = taskAt(schedAddr)
+  let pollFd = *(s + scPollFd)
+  if (pollFd == 0) {
+    return 0
+  }
+  if (!schedPollTryEnter(s)) {
+    return 0
+  }
+
+  let z: *byte = nil
+  let entries = z + int(ptrOf(evBuf))
+  removedCount = i32(0)
+  let ok = int(GetQueuedCompletionStatusEx(hAt(pollFd), entries, i32(maxBatch),
+                                            bytesOfI32(ptrOf(removedCount)), i32(timeoutMs), i32(0)))
+  let woken = 0
+  if (ok != 0) {
+    let n = int(removedCount)
+    // Bounded by the batch, not by the kernel's answer (Power of 10) — same
+    // guard both siblings apply to their own event count.
+    if (n > maxBatch) {
+      n = maxBatch
+    }
+    let base = ovBase()
+    let i = 0
+    while (i < n) {
+      let overlappedAddr = int(evBuf[i * 4 + 1])
+      let slot = (overlappedAddr - base) / 32
+      if (slot >= 0 && slot < maxOutstanding) {
+        let task = int(taskOf[slot])
+        scratchRelease(slot)
+        // The one-shot edge is consumed here regardless of what
+        // `schedPollUnpark` does with it below, matching both siblings.
+        schedPollPendingDec()
+        // ANY completion wakes the task — see the header's "WHY NO STATUS
+        // INSPECTION" section. `schedPollUnpark`, not a plain unpark: this
+        // registration's one-shot edge is already consumed, so a task caught
+        // between registering and parking must be handed the wake rather
+        // than have it dropped.
+        if (task != 0) {
+          if (schedPollUnpark(s, task)) {
+            woken = woken + 1
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  schedPollLeave(s)
+  return woken
+}

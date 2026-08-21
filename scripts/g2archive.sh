@@ -114,12 +114,12 @@ fi
 PLATFORM_FREE_RELS="- alloc auxv chan cryptohw gc net park rand root sched shims shims/scan stw syscalls thread"
 PLATFORM_PAIRS="alloc net park rand root sched thread"
 
-# Windows is mid-port (epic #3322): alloc, park, rand, root and thread have
-# a runtime/<pair>/windows/ directory today (#3330, #3336, #3338, #3331,
-# #3335). net's windows sibling is tracked (#3339) and not yet on disk, so
-# it correctly stays out of this list. `thread` (#3335) lands here on the
-# completeness check's own terms, not because anything consumes it yet:
-# `runtime/thread/windows/spawn.bit` exists and compiles cleanly for the
+# Windows is mid-port (epic #3322): alloc, park, rand, root, sched and thread
+# have a runtime/<pair>/windows/ directory today (#3330, #3336, #3338, #3331,
+# #3339, #3335). net's windows sibling is tracked (#3340, socket ops) and not
+# yet on disk, so it correctly stays out of this list. `thread` (#3335) lands
+# here on the completeness check's own terms, not because anything consumes it
+# yet: `runtime/thread/windows/spawn.bit` exists and compiles cleanly for the
 # target, but `runtime/root/windows/boot.bit` does not call
 # threadStart/threadRelease yet (that file's own header: "left for a later
 # ticket") — this list only asks "is the directory real and buildable",
@@ -129,18 +129,20 @@ PLATFORM_PAIRS="alloc net park rand root sched thread"
 # bit_rt_port_park_wake`/`bit_rt_port_park_wait`, which only
 # runtime/park/<os>/wait.bit provides, so this was the actual reason ANY
 # program failed to LINK for x86_64-windows before this landed (verified
-# 2026-08-21, tests/bit/windowssmoke.bit's header). sched itself has no
-# windows ticket and, as far as this investigation went, may not need one:
-# nothing in the platform-free code references a per-platform sched symbol
-# the way it does for net/park/thread — reconfirm before assuming that
-# stays true.
+# 2026-08-21, tests/bit/windowssmoke.bit's header). `sched` landed #3339 (the
+# IOCP netpoller, runtime/sched/windows/poll.bit) and IS both consumed and
+# wired: runtime/root/windows/boot.bit's step 4b/8b and `workerBody` call
+# `pollCreate`/`pollDrain`/`pollClose` from it, the same three points
+# ../linux/boot.bit and ../darwin/boot.bit call their own twins from —
+# correcting this comment's own prior claim that sched "may not need" a
+# windows pair at all.
 # Hand-maintained rather than derived from `find`, on purpose: an
 # auto-detected list would also silently swallow a genuine accidental
 # deletion under linux/darwin, where all seven pairs must always be
 # present — this list only relaxes the requirement for the one platform
 # still being built out. As each pair's windows port lands, add its name
 # here in the same commit.
-WINDOWS_PAIRS="alloc park rand root thread"
+WINDOWS_PAIRS="alloc park rand root sched thread"
 
 case "$PLAT" in
   windows) PAIRS_FOR_PLAT="$WINDOWS_PAIRS" ;;
