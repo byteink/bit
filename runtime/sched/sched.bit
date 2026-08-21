@@ -33,11 +33,93 @@
 //
 //   arm64  x19..x28 (`isCalleeSavedInt`), d8..d15 (`isCalleeSavedFloat`),
 //          x29 (frame), x30 (link), sp
-//   x64    rbx, r12..r15, rbp (frame), rsp; the return address lives on the
-//          stack, so there is no link register to save
+//   x64    rbx, r12..r15, rsi, rdi, rbp (frame), rsp, xmm6..xmm15; the return
+//          address lives on the stack, so there is no link register to save
 //
 // See compiler/arm64compile.bit `isCalleeSavedInt`/`isCalleeSavedFloat` and
-// compiler/x64value.bit's equivalents.
+// compiler/x64.bit's equivalents.
+//
+// ---------------------------------------------------------------------------
+// x64: THE SET IS THE UNION OF SysV AND Win64, NOT A PER-OS VARIANT (#3335)
+// ---------------------------------------------------------------------------
+//
+// `asm` carries one `x64` sub-block for every x64 target — SPEC §11.6: "Bit
+// has no arch-conditional compilation" and the directive names are `x64`/
+// `arm64` only, nothing finer. So this file cannot branch on x86_64-linux vs
+// x86_64-windows the way `runtime/root/**` branches by directory; the exact
+// same encoded bytes run on every x64 target there is.
+//
+// The two x64 calling conventions disagree about which GPRs and XMMs a callee
+// must preserve (`compiler/x64.bit`'s `xIsCalleeSavedInt`/`xIsCalleeSavedFloat`,
+// asserted at `compiler/x64check.bit:42-50`):
+//
+//   SysV   callee-saved: rbx, r12..r15, rbp, rsp.           No XMM at all.
+//   Win64  callee-saved: rbx, r12..r15, rbp, rsp, rsi, rdi. xmm6..xmm15.
+//
+// Win64's set is a strict SUPERSET of SysV's — every register SysV requires,
+// Win64 also requires, plus rsi/rdi/xmm6-15. So rather than a per-OS branch
+// this block always saves the UNION: rsi/rdi (GPR, full 64 bits) and
+// xmm6..xmm15 (scalar, low 64 bits only — see the width note below). That is
+// behaviourally safe under SysV, which is the exact precedent deviation 2
+// below already sets for arm64's d8..d15: preserving strictly MORE state than
+// a convention requires cannot change queue discipline, ordering or
+// liveness — it can only remove a corruption a narrower save would have.
+//
+// WHY SCALAR (8 bytes), NOT THE FULL 128-BIT XMM. The Win64 ABI technically
+// requires the full register preserved, in case a caller packed a SIMD value
+// into it. This backend never does: Bit has no vector/SIMD type, and every
+// XMM use in this compiler's own float codegen is a scalar f64 (see
+// `xFScratch1`/`xFScratch2` in compiler/x64.bit — "float accumulator", never
+// packed). `schedSwitch` only has to preserve what THIS backend's allocator
+// can put in a register, exactly the argument deviation 2 already makes for
+// d8..d15 on arm64. Saving 8 bytes instead of 16 also means every new slot
+// fits in the 14 words `ctxWords` already leaves unused on the x64 side (see
+// "Saved register context" below) — `ctxWords` does not grow, so no
+// `taskWords`/`workerWords`-sized array anywhere in the tree needed a size
+// bump for this.
+//
+// WHY `old`/`new` ARE PINNED TO rcx/rdx, NOT rdi/rsi AS BEFORE. This is the
+// part that is NOT just "add more saves" and is worth its own paragraph.
+// `input` pins a physical register for the WHOLE enclosing function — the
+// compiler emits ordinary MOVs, ahead of the hand-encoded bytes, to relocate
+// the argument's value into whatever register is pinned, regardless of which
+// register the calling convention itself used to pass it. Verified by
+// disassembling the CURRENT (pre-fix) `schedSwitch` compiled for
+// x86_64-linux: SysV already hands `old`/`new` to this function in
+// rdi/rsi, and the compiler STILL emits `mov rdi,rcx; mov rsi,rdx; mov
+// rcx,rdi; mov rdx,rsi` — a round trip through rcx/rdx before the pinned
+// rdi/rsi are reoccupied. That marshalling runs BEFORE this block's first
+// byte, and it is exactly where the bug would have been: under Win64, rsi and
+// rdi are callee-saved, so a CALLER may keep a live value in either register
+// across this call, trusting the callee to preserve it — but the `input`
+// marshalling overwrites rdi/rsi with `old`/`new` before this block's own
+// save sequence ever runs, so the caller's original value is already gone by
+// the time any hand-encoded instruction could have saved it. Naming rdi/rsi
+// as the argument registers and ALSO trying to preserve them is therefore
+// self-defeating on Win64, no matter what the byte payload does.
+//
+// The fix is the pins, not the payload: `old`/`new` now pin to rcx/rdx, which
+// are caller-saved under BOTH SysV and Win64 (`xIsCalleeSavedInt` is false
+// for both under either `XCallConv`), so no caller ever expects a value in
+// them to survive this call — the marshalling is free to clobber them, and
+// this block's own save sequence reads the CALLER's real rsi/rdi untouched.
+// `rsi`/`rdi` are added to the x64 `clobber` list for the same reason rbx and
+// r12..r15 already were: not because the switch fails to preserve them (it
+// does), but so the compiler's own argument-marshalling code is forbidden
+// from picking rsi/rdi as ITS scratch while relocating `old`/`new` into
+// rcx/rdx, which would corrupt the caller's value before this block's first
+// hand-encoded instruction runs — the exact same protection rbx/r12..r15
+// already had against being used as a marshalling temp.
+//
+// VERIFIED, not hand-derived: the exact byte sequence below (the extra
+// rsi/rdi/xmm6-15 saves+restores, the rcx/rdx-based addressing, and the
+// recomputed `lea` displacement) was assembled by `clang -c -target
+// x86_64-unknown-linux-gnu` from equivalent AT&T-syntax source and read back
+// with `llvm-objdump -d`, the same discipline this file's header already
+// requires ("checked against the system assembler's own bytes"). The `lea`
+// displacement was confirmed to land exactly on the instruction after `jmp
+// rax` by disassembling twice — once with a placeholder, once with the real
+// value — and diffing that only the `lea`'s own bytes changed.
 //
 // ---------------------------------------------------------------------------
 // THE x18 TRAP, AND WHY IT DOES NOT REACH THIS PORT
@@ -127,13 +209,28 @@ import { parkMinBackoffNs, parkNextBackoff } from "../park"
 
 // Words in a saved context. The layout is shared by both architectures; each
 // uses the prefix it needs, so one `Task` block shape compiles for either.
+// Word ranges are labelled by which architecture uses them; a word unused by
+// an architecture is simply never read or written by that architecture's
+// `asm` block, exactly as `4..13` already worked before this file used only
+// `4..7` of it for x64's r12..r15.
 //
 //   0        stack pointer
 //   1        resume address
 //   2        frame register   (x29 / rbp)
 //   3        link register    (x30) / rbx on x64
-//   4..13    x19..x28         (x64 uses 4..7 for r12..r15)
-//   14..21   d8..d15          (arm64 only)
+//   4..13    arm64: x19..x28
+//   4..7     x64:   r12..r15
+//   8..9     x64:   rsi, rdi                (Win64-only callee-saved GPRs —
+//                                           see the union-set note above
+//                                           `schedSwitch`)
+//   10..19   x64:   xmm6..xmm15, scalar (low 64 bits only — see the width
+//                                       note above `schedSwitch`)
+//   14..21   arm64: d8..d15
+//
+// x64 now uses words 0..19 (20 of the 22); words 20-21 are spare on every
+// target. arm64 still uses all 22 (0..3, 4..13, 14..21). Neither
+// architecture's total grew, so `ctxWords` did not move and no
+// `taskWords`/`workerWords`-sized array needed a size change for this.
 export const ctxWords: int = 22
 
 export const ctxSp: int = 0
@@ -181,11 +278,17 @@ const stackAlign: int = 16
 //
 // The arm64 `adr` displacement (+184 bytes = 46 words) is the distance from the
 // `adr` to the first word past `br`, hand-computed per §11.6 since there are no
-// block-local labels. The x64 `lea` displacement (+64) is measured from the end
-// of the `lea`. BOTH ARE POSITION-DEPENDENT ON THE INSTRUCTION COUNT: inserting
-// or removing any instruction in either block invalidates them silently — the
-// program branches into the middle of the block instead of resuming. There is
-// no check for this; tests/stress/sched is what catches it.
+// block-local labels. The x64 `lea` displacement (+220) is measured from the end
+// of the `lea` to the first byte past `jmp rax` — recomputed for the Win64
+// register additions below (#3335); confirmed by assembling the block with
+// `clang -c -target x86_64-unknown-linux-gnu` and diffing two disassemblies,
+// one with a placeholder displacement and one with 220, showing only the
+// `lea`'s own bytes differ and the effective target lands exactly on the
+// instruction after `jmp rax`. BOTH ARE POSITION-DEPENDENT ON THE INSTRUCTION
+// COUNT: inserting or removing any instruction in either block invalidates
+// them silently — the program branches into the middle of the block instead
+// of resuming. There is no check for this; tests/stress/sched is what catches
+// it.
 export @nosplit fn schedSwitch(old: *i64, new: *i64) {
   asm {
     arm64 {
@@ -210,30 +313,60 @@ export @nosplit fn schedSwitch(old: *i64, new: *i64) {
       0x9100005F,                                     // mov sp, x2
       0xD61F0060                                      // br x3
     }
+    // Every mov/movsd below was produced by `clang -c -target
+    // x86_64-unknown-linux-gnu` from the equivalent AT&T-syntax source and
+    // read back with `llvm-objdump -d` (#3335) — not hand-derived. `old` is
+    // pinned to rcx and `new` to rdx (not rdi/rsi — see the union-set note
+    // above `schedSwitch`'s header), so every `[rcx+N]`/`[rdx+N]` below reads
+    // as "old"/"new" respectively, exactly as `[rdi+N]`/`[rsi+N]` did before.
     x64 {
-      0x48, 0x8D, 0x05, 0x40, 0x00, 0x00, 0x00,       // lea rax, [rip+64]
-      0x48, 0x89, 0x47, 0x08,                         // mov [rdi+8], rax
-      0x48, 0x89, 0x27,                               // mov [rdi+0], rsp
-      0x48, 0x89, 0x6F, 0x10,                         // mov [rdi+16], rbp
-      0x48, 0x89, 0x5F, 0x18,                         // mov [rdi+24], rbx
-      0x4C, 0x89, 0x67, 0x20,                         // mov [rdi+32], r12
-      0x4C, 0x89, 0x6F, 0x28,                         // mov [rdi+40], r13
-      0x4C, 0x89, 0x77, 0x30,                         // mov [rdi+48], r14
-      0x4C, 0x89, 0x7F, 0x38,                         // mov [rdi+56], r15
-      0x48, 0x8B, 0x26,                               // mov rsp, [rsi+0]
-      0x48, 0x8B, 0x6E, 0x10,                         // mov rbp, [rsi+16]
-      0x48, 0x8B, 0x5E, 0x18,                         // mov rbx, [rsi+24]
-      0x4C, 0x8B, 0x66, 0x20,                         // mov r12, [rsi+32]
-      0x4C, 0x8B, 0x6E, 0x28,                         // mov r13, [rsi+40]
-      0x4C, 0x8B, 0x76, 0x30,                         // mov r14, [rsi+48]
-      0x4C, 0x8B, 0x7E, 0x38,                         // mov r15, [rsi+56]
-      0x48, 0x8B, 0x46, 0x08,                         // mov rax, [rsi+8]
+      0x48, 0x8D, 0x05, 0xDC, 0x00, 0x00, 0x00,       // lea rax, [rip+220]
+      0x48, 0x89, 0x41, 0x08,                         // mov [rcx+8], rax
+      0x48, 0x89, 0x21,                               // mov [rcx+0], rsp
+      0x48, 0x89, 0x69, 0x10,                         // mov [rcx+16], rbp
+      0x48, 0x89, 0x59, 0x18,                         // mov [rcx+24], rbx
+      0x4C, 0x89, 0x61, 0x20,                         // mov [rcx+32], r12
+      0x4C, 0x89, 0x69, 0x28,                         // mov [rcx+40], r13
+      0x4C, 0x89, 0x71, 0x30,                         // mov [rcx+48], r14
+      0x4C, 0x89, 0x79, 0x38,                         // mov [rcx+56], r15
+      0x48, 0x89, 0x71, 0x40,                         // mov [rcx+64], rsi
+      0x48, 0x89, 0x79, 0x48,                         // mov [rcx+72], rdi
+      0xF2, 0x0F, 0x11, 0x71, 0x50,                   // movsd [rcx+80], xmm6
+      0xF2, 0x0F, 0x11, 0x79, 0x58,                   // movsd [rcx+88], xmm7
+      0xF2, 0x44, 0x0F, 0x11, 0x41, 0x60,              // movsd [rcx+96], xmm8
+      0xF2, 0x44, 0x0F, 0x11, 0x49, 0x68,              // movsd [rcx+104], xmm9
+      0xF2, 0x44, 0x0F, 0x11, 0x51, 0x70,              // movsd [rcx+112], xmm10
+      0xF2, 0x44, 0x0F, 0x11, 0x59, 0x78,              // movsd [rcx+120], xmm11
+      0xF2, 0x44, 0x0F, 0x11, 0xA1, 0x80, 0x00, 0x00, 0x00, // movsd [rcx+128], xmm12
+      0xF2, 0x44, 0x0F, 0x11, 0xA9, 0x88, 0x00, 0x00, 0x00, // movsd [rcx+136], xmm13
+      0xF2, 0x44, 0x0F, 0x11, 0xB1, 0x90, 0x00, 0x00, 0x00, // movsd [rcx+144], xmm14
+      0xF2, 0x44, 0x0F, 0x11, 0xB9, 0x98, 0x00, 0x00, 0x00, // movsd [rcx+152], xmm15
+      0x48, 0x8B, 0x22,                               // mov rsp, [rdx+0]
+      0x48, 0x8B, 0x6A, 0x10,                         // mov rbp, [rdx+16]
+      0x48, 0x8B, 0x5A, 0x18,                         // mov rbx, [rdx+24]
+      0x4C, 0x8B, 0x62, 0x20,                         // mov r12, [rdx+32]
+      0x4C, 0x8B, 0x6A, 0x28,                         // mov r13, [rdx+40]
+      0x4C, 0x8B, 0x72, 0x30,                         // mov r14, [rdx+48]
+      0x4C, 0x8B, 0x7A, 0x38,                         // mov r15, [rdx+56]
+      0x48, 0x8B, 0x72, 0x40,                         // mov rsi, [rdx+64]
+      0x48, 0x8B, 0x7A, 0x48,                         // mov rdi, [rdx+72]
+      0xF2, 0x0F, 0x10, 0x72, 0x50,                   // movsd xmm6, [rdx+80]
+      0xF2, 0x0F, 0x10, 0x7A, 0x58,                   // movsd xmm7, [rdx+88]
+      0xF2, 0x44, 0x0F, 0x10, 0x42, 0x60,              // movsd xmm8, [rdx+96]
+      0xF2, 0x44, 0x0F, 0x10, 0x4A, 0x68,              // movsd xmm9, [rdx+104]
+      0xF2, 0x44, 0x0F, 0x10, 0x52, 0x70,              // movsd xmm10, [rdx+112]
+      0xF2, 0x44, 0x0F, 0x10, 0x5A, 0x78,              // movsd xmm11, [rdx+120]
+      0xF2, 0x44, 0x0F, 0x10, 0xA2, 0x80, 0x00, 0x00, 0x00, // movsd xmm12, [rdx+128]
+      0xF2, 0x44, 0x0F, 0x10, 0xAA, 0x88, 0x00, 0x00, 0x00, // movsd xmm13, [rdx+136]
+      0xF2, 0x44, 0x0F, 0x10, 0xB2, 0x90, 0x00, 0x00, 0x00, // movsd xmm14, [rdx+144]
+      0xF2, 0x44, 0x0F, 0x10, 0xBA, 0x98, 0x00, 0x00, 0x00, // movsd xmm15, [rdx+152]
+      0x48, 0x8B, 0x42, 0x08,                         // mov rax, [rdx+8]
       0xFF, 0xE0                                      // jmp rax
     }
-    input arm64 x0 x64 rdi = old
-    input arm64 x1 x64 rsi = new
+    input arm64 x0 x64 rcx = old
+    input arm64 x1 x64 rdx = new
     clobber arm64 { x2, x3, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x30, memory }
-    clobber x64 { rax, rbx, r12, r13, r14, r15, memory }
+    clobber x64 { rax, rbx, rsi, rdi, r12, r13, r14, r15, memory }
   }
 }
 
