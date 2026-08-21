@@ -1,0 +1,108 @@
+// The `bit_rt_random_bytes` ABI wrapper (ABI.md §21) over this directory's
+// Windows entropy source (#3338, epic #3322). Sibling of `entropy.bit`, so
+// `entropyFill` is a module-scoped call, not a cross-module reference.
+//
+// WHY THIS WRAPPER IS DUPLICATED PER PLATFORM rather than living once in the
+// portable `../rand.bit`. The wrapper's only platform-dependent part is which
+// `entropyFill` it reaches, and Bit has no OS-conditional compilation: a single
+// portable file would have to `import` one of `./linux`, `./darwin` or
+// `./windows` by a literal path, which is a compile-time choice it cannot
+// make. So the wrapper sits beside each entropy source, exactly the shape
+// SEAM 1 (#1600) settled on for the 12 `bit_rt_net_*` wrappers after the
+// `extern`-from-the-parent form failed the Linux emit. The twins live in
+// `../linux/random.bit` and `../darwin/random.bit` and are identical but for
+// this comment and the entropy source each compiles against.
+//
+// SORTS AFTER `entropy.bit`. Module files concatenate in bytewise filename
+// order and the inliner only inlines a callee it has already lowered (#1511),
+// so `random.bit` must sort after the file defining `entropyFill` — `e` < `r`.
+//
+// PIN CARRIES THE BARE ABI NAME: G2 (#1583) dropped the `_root` infix, so this
+// IS the real `bit_rt_random_bytes` symbol every caller links.
+//
+// `rtStrAlloc` is root's pinned string allocator (`bit_rt_port_root_str_alloc`)
+// and `strPtr` its object-layout constant (ABI.md §2); `loadWord` is `runtime/gc`'s
+// pinned raw-memory glue. All three are pinned/compile-time, so the freestanding
+// emit resolves them without an unpinned mangled reference (#1612).
+import { rtStrAlloc, strPtr } from "../../root"
+import { loadWord } from "../../gc"
+
+// `bit_rt_random_bytes` (ABI.md §21): a fresh `string` of `len`
+// cryptographically-secure bytes from the OS CSPRNG. `runtime/root/`'s
+// `bit_rt_random_bytes`, decision for decision.
+//
+// A non-positive `len` yields the empty string (mirroring `fs_read`), and an
+// entropy failure is FATAL — this never hands back weak or zero bytes, the
+// policy `entropy.bit` documents and the
+// `catch fatal("random_bytes: OS CSPRNG failed")` enforces. `fatal` is
+// `panicWrite` + exit 2 (`runtime/root/{linux,darwin}/io.bit`'s `rootPanic`), i.e.
+// exactly `bit_rt_panic`, which is what the `panic` builtin lowers to. That is
+// not a pin cycle: this module defines no `bit_rt_panic`, so no rename can make
+// the call self-referential (the property tests/bit/rootpins/ proves per
+// symbol).
+//
+// FILLS THE PACKED PAYLOAD, not a `[]u8`: the bytes of a `string` object are the
+// inline region `strPtr` addresses, and only a raw `*u8` can name it — a `[]u8`
+// is word-strided (one 8-byte word per element) and `entropyFill` writes packed
+// bytes straight from the OS.
+//
+// SPLIT IN TWO BY #1667, and the split is forced. The allocate-and-fill half
+// MUST be `@nosplit`: this is #1656's defect shape verbatim — `s` is a fresh GC
+// string held ONLY as a raw `int` (E0079 forbids a pin naming a managed type),
+// `p` is an interior pointer into it, and `entropyFill` loops. Unannotated,
+// that loop's back edge carries a compiler-synthesized `bl bit_rt_safepoint`;
+// ABI.md §5 walks the running task's stack PRECISELY so no root reaches `s`,
+// and the collector sweeps and re-zeroes the block while the OS is still
+// filling it. The caller then gets recycled memory that a later allocation
+// overwrites — for a CSPRNG, silently weak bytes.
+//
+// But `panic` is not `@nosplit`-callable (E0075), and the entropy-failure abort
+// is an ABI contract, not a nicety, so it cannot simply be dropped. Hence the
+// shape below: a poll-free core that reports failure as an out-of-band sentinel
+// and a straight-line outer wrapper that turns the sentinel into the panic. It
+// is the same move `runtime/root/floats.bit` makes for `rtStringFromFloat` —
+// push everything that touches a raw GC address into a `@nosplit` helper and
+// leave the outer body holding nothing the collector could sweep.
+
+/// Out-of-band failure code for `randomBytesFill`. NOT 0, which the
+/// `bit_rt_string_from_bytes` convention already reserves for heap exhaustion,
+/// and not a possible object address.
+const randEntropyFailed: int = -1
+
+// Allocate a `len`-byte string and fill it from the OS CSPRNG. Returns the
+// string, 0 on heap exhaustion, or `randEntropyFailed`.
+//
+// EVERY raw address in this whole subtree lives inside this `@nosplit` closure,
+// which is the property that makes the fix a fix. E0075 propagates it to
+// `entropyFill` below.
+@nosplit fn randomBytesFill(len: int): int {
+  let s = rtStrAlloc(len)
+  if (s == 0) {
+    return 0 // heap exhausted; the `bit_rt_string_from_bytes` convention
+  }
+  let nilb: *u8 = nil
+  let p = nilb + loadWord(s + strPtr)
+  if (!entropyFill(p, len)) {
+    return randEntropyFailed
+  }
+  return s
+}
+
+// NOT `@nosplit`, and on the poll-free gate's reviewed exception list with this
+// argument: safepoints are emitted at loop back edges and at call sites
+// (`compiler/arm64compile.bit and compiler/x64value.bit`), and this body contains NO loop at all. The
+// only call made while `s` holds an object address is `panic`, which is on the
+// `s == randEntropyFailed` branch — where `s` is the sentinel, not an object —
+// and which never returns. So no collection can occur between `randomBytesFill`
+// handing the address back and this function returning it to a caller whose
+// stack map does name it.
+export @symbol("bit_rt_random_bytes") fn rtRandomBytes(len: int): int {
+  if (len <= 0) {
+    return rtStrAlloc(0)
+  }
+  let s = randomBytesFill(len)
+  if (s == randEntropyFailed) {
+    panic("random_bytes: OS CSPRNG failed")
+  }
+  return s
+}
