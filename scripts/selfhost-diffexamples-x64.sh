@@ -95,9 +95,22 @@ echo "x86_64-linux example differential: PASS=$pass DIFF=$diff REFUSED=$refused 
 
 # A phase that measured nothing must not pass (#1514). On an empty corpus the
 # loop runs zero comparisons and every counter below is 0 for the wrong reason.
+#
+# exit 1, not 2: by the time this floor is reached, the no-host precondition
+# above (`[ -n "$HOST" ] || exit 127`) has already passed, so a reachable host
+# that still compared nothing means every build failed, every scp failed, or
+# the example corpus was empty -- the harness itself is broken, not a
+# legitimate skip. Per the reasoning #3380 established for
+# selfhost-diffruntime.sh's four floors (and #3402 applied to this file's
+# sibling, selfhost-diffdump.sh's run_basic()): selfhost-diffall.sh's ABSENT
+# mechanism excuses exit 2 for a constituent listed in
+# scripts/selfhost-diffall.absent, and this floor has no "surface not
+# implemented yet" case the way selfhost-difffmt.sh's or
+# selfhost-diffdoc.sh's capability probes do. Exit 2 would let a future
+# ABSENT-list entry silently tolerate that; exit 1 cannot ever be excused.
 if [ "$pass" -lt 1 ]; then
   echo "FATAL: the x86_64 example differential compared nothing (PASS=$pass)." >&2
-  exit 2
+  exit 1
 fi
 
 # A real divergence wins over an undecided count: any observed mismatch or
