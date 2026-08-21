@@ -68,6 +68,13 @@ repository: https://github.com/byteink/bit/security/advisories
 They are also cross-linked from [`docs/release/SUPPORT.md`](docs/release/SUPPORT.md)
 (landing via #1748, alongside this file).
 
+A security-relevant fix that also needs a plain-language mention in the next
+release's notes (affected versions, observable symptom) stages that text in
+[`docs/release/PENDING-NOTES.md`](docs/release/PENDING-NOTES.md) until the
+release that carries it is cut - `dist/out/NOTES.md` itself is generated
+fresh on every release and is not tracked, so nothing written directly into
+it survives past that one release.
+
 ## Supported versions
 
 Security fixes are backported only to release lines still under support.
