@@ -47,7 +47,7 @@ fn checkElfLinkRaw() {
   assert(leAt(b, 16, 2) == 2)  // ET_EXEC — not ET_REL, not ET_DYN
   assert(leAt(b, 18, 2) == 62) // EM_X86_64
   assert(leAt(b, 32, 8) == sizeofElfEhdr()) // e_phoff: phdrs follow the header
-  assert(leAt(b, 40, 8) == 0)  // e_shoff: an executable carries no section table
+  assert(leAt(b, 40, 8) > 0)   // e_shoff: a minimal .symtab table (#3395)
   assert(leAt(b, 54, 2) == sizeofElfPhdr())
   // No TLS in this link, so: 2 PT_LOAD + PT_GNU_STACK.
   assert(leAt(b, 56, 2) == 3)
@@ -87,9 +87,15 @@ fn checkElfLinkRaw() {
   assert(leAt(b, elPhdrAt(2), 4) == ptGnuStack())
   assert((leAt(b, elPhdrAt(2) + 4, 4) & pfX()) == 0)
 
-  // Every byte-backed region's file offset equals vaddr - load_base, so the
-  // file is exactly as long as the R-W segment's file part reaches.
-  assert(len(b) == leAt(b, elPhdrAt(1) + 8, 8) + leAt(b, elPhdrAt(1) + 32, 8))
+  // Every byte-backed region's file offset equals vaddr - load_base, so every
+  // PT_LOAD-covered byte ends exactly here; the appended .symtab/.strtab/
+  // .shstrtab/section-header table (#3395) follows, past every PT_LOAD, so the
+  // file is now strictly LONGER than this boundary, and ends exactly at the
+  // section-header table's own end.
+  let loadedEnd = leAt(b, elPhdrAt(1) + 8, 8) + leAt(b, elPhdrAt(1) + 32, 8)
+  assert(loadedEnd < len(b))
+  assert(leAt(b, 40, 8) >= loadedEnd) // e_shoff: at or after the loaded image
+  assert(len(b) == leAt(b, 40, 8) + 8 * sizeofElfShdr()) // ends at the shdr table
 
   // The same object links for aarch64 with only the machine changing.
   let a64 = [ElfLinkInput{ isArchive: false,
@@ -126,7 +132,9 @@ fn checkElfLinkBss() {
   let filesz = leAt(b, elPhdrAt(1) + 32, 8)
   let memsz = leAt(b, elPhdrAt(1) + 40, 8)
   assert(memsz >= filesz + 4096) // .bss is mapped but not stored
-  assert(len(b) == leAt(b, elPhdrAt(1) + 8, 8) + filesz)
+  // The appended section-header table (#3395) pushes the file strictly past
+  // the PT_LOAD-covered image.
+  assert(leAt(b, elPhdrAt(1) + 8, 8) + filesz < len(b))
 }
 
 fn checkElfLinkRejects() {
@@ -155,6 +163,73 @@ fn checkElfLinkRejects() {
   let ub = writeElfObject(ElfTarget.X86_64, obj) catch e { []u8(0) }
   assert(elErr(ElfLinkTarget.X86_64Linux,
     [ElfLinkInput{ isArchive: false, bytes: ub }]) != "")
+}
+
+// The minimal .symtab/.strtab/.shstrtab table (#3395): one STB_LOCAL/STT_FUNC
+// entry naming the kept "_start" atom, readable by an external tool without any
+// help from the runtime.
+fn checkElfLinkSymtab() {
+  let code = [u8(0xBF), u8(0x2A), u8(0x00), u8(0x00), u8(0x00), u8(0xB8), u8(0x3C),
+    u8(0x00), u8(0x00), u8(0x00), u8(0x0F), u8(0x05)]
+  let inputs = [ElfLinkInput{ isArchive: false,
+    bytes: elProbeObj(ElfLinkTarget.X86_64Linux, code, "_start") }]
+  let b = linkElfExecutable(ElfLinkTarget.X86_64Linux, inputs) catch e { []u8(0) }
+
+  let shoff = leAt(b, 40, 8)
+  assert(leAt(b, 58, 2) == sizeofElfShdr()) // e_shentsize
+  assert(leAt(b, 60, 2) == 8)               // e_shnum
+  assert(leAt(b, 62, 2) == 7)               // e_shstrndx: .shstrtab is shdrs[7]
+
+  // shdrs[1] is .text: SHT_PROGBITS(1), SHF_ALLOC|SHF_EXECINSTR(6), covering the
+  // entry code at its assigned vaddr.
+  let sh1 = shoff + 1 * sizeofElfShdr()
+  assert(leAt(b, sh1 + 4, 4) == 1) // sh_type
+  assert(leAt(b, sh1 + 8, 8) == 6) // sh_flags
+  let textAddr = leAt(b, sh1 + 16, 8)
+  let textOff = leAt(b, sh1 + 24, 8)
+  let textSize = leAt(b, sh1 + 32, 8)
+  let entry = leAt(b, 24, 8)
+  assert(textAddr == entry) // "_start" is the first and only kept .text atom
+  assert(textOff == textAddr - elLoadBase())
+  assert(textSize >= len(code))
+
+  // shdrs[2]/[3]/[4] (.rodata/.data/.bss) each claim their own PT_LOAD-covered
+  // byte range too — a table naming .text alone let `strip` on real Linux
+  // hardware conclude the OTHER bytes were unclaimed and drop them (#3395).
+  assert(leAt(b, shoff + 2 * sizeofElfShdr() + 4, 4) == 1) // .rodata: SHT_PROGBITS
+  assert(leAt(b, shoff + 3 * sizeofElfShdr() + 4, 4) == 1) // .data: SHT_PROGBITS
+  assert(leAt(b, shoff + 3 * sizeofElfShdr() + 8, 8) == 3) // .data: SHF_ALLOC|SHF_WRITE
+  assert(leAt(b, shoff + 4 * sizeofElfShdr() + 4, 4) == 8) // .bss: SHT_NOBITS
+
+  // shdrs[6] is .symtab: a null entry plus one local STB_LOCAL/STT_FUNC entry,
+  // sh_info one past it, sh_link naming shdrs[5] (.strtab).
+  let sh6 = shoff + 6 * sizeofElfShdr()
+  assert(leAt(b, sh6 + 4, 4) == 2) // SHT_SYMTAB
+  assert(leAt(b, sh6 + 40, 4) == 5) // sh_link: shdrs[5] is .strtab
+  assert(leAt(b, sh6 + 44, 4) == 2) // sh_info: one past the one local symbol
+  let symtabOff = leAt(b, sh6 + 24, 8)
+  let symtabSize = leAt(b, sh6 + 32, 8)
+  assert(symtabSize == 2 * sizeofElfSym()) // null + "_start"
+
+  // The one real Elf64_Sym: STB_LOCAL(0)<<4|STT_FUNC(2), shndx 1 (.text), value
+  // == the entry's own vaddr.
+  let sym1 = symtabOff + sizeofElfSym()
+  let nameOff = leAt(b, sym1, 4)
+  assert(leAt(b, sym1 + 4, 1) == 2) // st_info
+  assert(leAt(b, sym1 + 6, 2) == 1) // st_shndx: .text
+  assert(leAt(b, sym1 + 8, 8) == entry) // st_value
+
+  // .strtab (shdrs[5]) holds "_start" at that name offset, NUL-terminated.
+  let sh5 = shoff + 5 * sizeofElfShdr()
+  let strtabOff = leAt(b, sh5 + 24, 8)
+  let nameAt = strtabOff + nameOff
+  let want = []byte("_start")
+  let k = 0
+  while (k < len(want)) {
+    assert(b[nameAt + k] == want[k])
+    k = k + 1
+  }
+  assert(b[nameAt + len(want)] == u8(0))
 }
 
 // Variant I vs II: the two ABIs put the static TLS block on opposite sides of
