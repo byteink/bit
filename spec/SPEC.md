@@ -3469,6 +3469,169 @@ its symbolization exist. Whoever implements those tickets must build the
 runtime-trace consumer, not the parameter-passing version either ticket was
 filed expecting.
 
+### 18.6.1 Debug-info format: decision (#3281)
+
+**Decision: a bespoke, non-strippable, address-keyed side table — not
+DWARF.** Wire format: `runtime/ABI.md` §4.2. This entry is the *why*; it does
+not repeat the *what* ABI.md already states precisely enough for two
+independent object-writer implementations (`emitmacho.bit`, `emitelf.bit`) to
+converge without re-deciding anything.
+
+**The disqualifying constraint, confirmed rather than assumed.** Epic #1905:
+*"a static Bit binary with no libc must symbolize its own panic ... no
+external debugger, no external symbolization tool."* A DWARF
+`.debug_info`/`.debug_line` pair is, by definition and by every shipping
+`strip`'s default behavior, debug metadata: macOS `strip` and GNU/LLVM
+`strip` both specifically recognize and remove `__DWARF`/`.debug_*` sections
+with no flag telling them to. Choosing DWARF for the table `bit_rt_panic`
+itself must read means the one constraint the epic states as
+**non-negotiable** — surviving an end user's own `strip` — fails on the most
+ordinary invocation of that tool. This is not a matter of emitting DWARF
+carefully; it is disqualified by what the format *is*.
+
+**Verified, not merely argued: the bespoke shape already in this tree
+survives this way, for a reason worth stating precisely.** `.bit_gc`
+(`runtime/ABI.md` §4) is the existing precedent, and inspecting a real linked
+binary shows *why* it survives `strip` — the mechanism is stronger than "it
+isn't named a debug section":
+
+```
+$ otool -l bit-out/bin/bit | grep -c sectname
+6                    # __text __stubs __const __got __data __bss — no __bit_gc
+$ otool -l bit-out/bin/bit | grep -A5 LC_SYMTAB
+     cmd LC_SYMTAB
+   nsyms 49           # every one an undefined libc import (open, write, ...)
+```
+
+Bit's own final linker (`compiler/strip.bit`) resolves every internal
+cross-reference — including `bit_stack_maps` itself — to a concrete address
+at link time and writes **no symbol-table entry at all** for any internally
+defined name; the 49 entries in the shipped compiler's own `LC_SYMTAB` are
+exactly the libc imports dyld must still bind. `.bit_gc`'s bytes end up
+folded into ordinary `__data`, indistinguishable from any other global's
+storage, with nothing named `bit_stack_maps` for a generic `strip` invocation
+to find. A section a stripper cannot even locate cannot be a target of its
+default behavior — a structural consequence of how Bit links, not a naming
+convention this decision has to invent and hope holds. Reproduced identically
+against a `bit build`-compiled program (`examples/staticserver`), not just
+the compiler's own binary. The new debug-info table gets this survival
+property for free by using the identical mechanism (ABI.md §4.2): a second
+per-function side table referenced only by two extent symbols the runtime
+resolves internally, never surfaced to anything an external `strip`
+recognizes as debug data.
+
+**A related finding, filed separately rather than assumed away here
+(#3387):** the epic's second acceptance criterion — *"`sample <pid>` ...
+resolves frames to function names instead of raw offsets"* — is **not
+achievable by picking a debug-info format at all**, bespoke or DWARF, while
+the final linker emits zero local symbol-table entries (measured above:
+`nsyms 49`, all undefined). `sample`/`atos`/most profilers resolve a
+function's *name* primarily from `nlist` entries; DWARF's own DIEs can
+substitute in principle (a stripped-binary-plus-dSYM workflow works precisely
+because DWARF is address-range-keyed, not `nlist`-keyed), but nothing in this
+tree emits a DIE tree either, and whether `sample` specifically falls back to
+embedded DWARF with no `nlist` present was not tested here — #3387 owns
+settling it. Either way this is a **linker gap**, independent of and prior to
+this decision; the panic-trace mechanism this ticket specifies does not
+depend on it and is not blocked by it.
+
+**Measured size, against the real precedent, not asserted.** `.bit_gc` in the
+current `libbitrt-aarch64-macos.a` (`580c65e8`):
+
+```
+23 of the archive's object files carry a __bit_gc section
+total __bit_gc bytes:  59,384   (archive: 505,760 bytes -> 11.7%)
+total __text bytes (same 23 objects): 319,012   (.bit_gc / __text = 18.6%)
+824 __bitsm_ (one per function) local symbols across those objects
+```
+
+`bit-out/bin/bit`'s whole `__text` is 4,406,220 bytes. Extrapolating the
+runtime's own per-function averages (387 bytes code, 72 bytes stack-map data
+per function) to the whole binary gives roughly **11,400 functions**. The
+debug-info table's per-function cost is 16 bytes of header plus 16 bytes per
+line-table row (ABI.md §4.2); **the row count per function cannot be
+measured before #3283 exists** — there is no emitter to measure — so what
+follows is stated as an estimate, not a fact: at an assumed 8 rows/function
+(a function of the compiler's own average size, ~387 bytes, touching perhaps
+8-15 distinct source lines), the table costs roughly 144 bytes/function,
+**~1.6 MB total, ~25% of the current 6.5 MB dev binary**. #3283 should
+replace the 8-rows assumption with a measured figure the first time a real
+emitter exists, and revise this number rather than repeat it.
+
+**DWARF's cost, measured rather than remembered**, via `clang -g
+-gline-tables-only` (the closest DWARF mode to what this table carries — no
+type DIEs, no variable locations) against two synthetic `.c` files standing in
+for small and Bit-average-sized functions respectively (no DWARF emitter
+exists in Bit to measure directly):
+
+| functions | avg size | `__text` | line-tables-only DWARF | of which `__debug_line` alone |
+|---|---|---|---|---|
+| 2000 tiny | 26 B | 51,892 B | 121,166 B (**233%**) | 30,084 B (58%) |
+| 300 larger | 232 B | 69,600 B | 37,368 B (**54%**) | 23,484 B (34%) |
+
+Even in `-gline-tables-only` mode — the leanest DWARF gets — 20-38% of that
+overhead is `__debug_info`/`__debug_str`/`__debug_str_offs`/`__debug_addr`/
+`__debug_names`: DIE trees and a name index the runtime walker has no use for
+at all, since it only ever asks "what file:line is this address," never
+"list every function." A full `-g` build (types, variable locations) on the
+same tiny-function file balloons to **425%** of `__text`. The bespoke table's
+16-bytes/row is less compact than DWARF's delta-encoded opcode stream, but it
+carries none of DWARF's indexing/naming infrastructure and needs no decoder
+loop beyond fixed-offset reads — the trade this decision makes explicitly:
+give up DWARF's per-row density and its free `lldb`/`gdb`/external-tool
+support, in exchange for a format the panic path can read with zero
+allocation and that survives `strip` structurally rather than by convention.
+
+**Rejected: DWARF as the primary (or only) format.** Disqualified above by
+the strip-survival constraint alone; the ecosystem cost (no `lldb`, no `gdb`,
+no third-party profiler support) is accepted as the price, not hidden.
+
+**Rejected, for now: emit DWARF *in addition*, as a separate opt-in output
+for external tools** — the "third shape" this ticket was asked to weigh
+rather than assume away. Not disqualified in principle: DWARF's address-range
+keying means it does not need `nlist` either, so it is not blocked by #3387
+the way `sample`'s current failure mode is. Rejected from *this* ticket's
+scope because it is a materially different, larger feature: a `.debug_line`
+state-machine encoder, DIE emission, and a decision on whether it ships
+inside the binary (reintroducing the exact strip hazard this decision exists
+to avoid) or as a separate artifact (a dSYM-equivalent bundle, with its own
+distribution and `dist/release.sh` questions). Filing it as future work
+rather than deciding it here keeps this ticket's deliverable to what #1905
+actually requires: self-symbolization with no external tool. Whoever picks
+this up next should file it as its own ticket against #1905, not fold it
+into #3283.
+
+**Rejected: reusing `.bit_gc` itself rather than a second table.** Considered
+because it is the existing precedent and avoids a second section entirely.
+Rejected because the two tables answer different questions at different
+granularity (stack maps: per-safepoint register/slot liveness; line table:
+potentially several rows per function, keyed finer than any safepoint) and
+because independence is a real property worth keeping: a debug-info entry
+must carry an *inlined* callee's original span on rows spliced into a
+caller's list (below), which the stack-map table has no reason to ever do to
+its own per-safepoint entries. Coupling the two would make a future change to
+either format's cost model — retention, alignment, or a #3189-style version
+stamp — a change to both.
+
+**Inlined frames: this ticket does not reopen §18.6's decision above, and
+confirms the format satisfies it.** §18.6 already committed to *one physical
+frame, correct leaf `file:line`, not one frame per syntactic call* — an
+inlined call contributes no frame of its own, but the innermost row must
+still name the original callee's file and line. This format satisfies that
+by construction: each row's `(file_hdr_ptr, line)` is independent per `pc`
+range, so a splice that flattens a callee's body into its caller's code can
+still carry the callee's *original* source position on the rows that came
+from it, provided #3282 keeps that original span on the spliced `IrInstr`
+rather than relabeling it to the splice site (§18.6's own stated requirement
+on that ticket). Nothing here asks for a synthesized "logical" frame, and
+nothing here needs one.
+
+**Why not defer the whole decision.** A hedge here (leave DWARF-vs-bespoke
+open, let #3283 pick) is exactly the failure mode this ticket's acceptance
+guards against: #3283, #3284, and #3285 all need the same answer to converge
+independently, and "TBD" would mean the first implementer re-litigates this
+research under a code-review deadline instead of a design one.
+
 ---
 
 ## 19. Testing
