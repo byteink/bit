@@ -220,29 +220,91 @@ Two consequences to plan for rather than discover:
   meaningless once the seed was gone, and #1883 deleted the list along with its
   reader. No mismatch is permitted now.
 
-## 5. What is accepted as LOST
+## 5. What checks the compiler that compiles the compiler
 
-Stated plainly, because a decision that only lists what it preserves is not a
-decision.
+**(a) The current fact.** Every `selfhost-diff*.sh` gate in §4 compares this
+tree against the pinned stage0 — release N-1 of this same compiler. Stage0 is
+not an independent implementation; it is an earlier build of the same source
+lineage, produced by the same compiler design. It therefore shares every bug
+the current tree already has. When both sides agree, the gate reports MATCH
+whether they agree because they are both right or because they are both wrong
+in the same way — a bug present in N-1 and carried into N is structurally
+invisible to a comparison between them. This is not hypothetical: #1857's
+`parseFloat` had no hex-float branch, so every `0x1p-1` literal silently
+became `0.0` and shipped in every release for months. All fifteen
+differentials active at the time were green throughout, because the bug was
+already in stage0 by the time it was in the tree being checked. It was found
+only by comparing Bit's output against a C compiler on the same program — an
+oracle entirely outside the stage0-vs-tree chain.
 
-**The independent second implementation.** This is the real loss. The seed was a
-compiler written by different code in a different language; agreement between it
-and the self-hosted compiler was evidence that both were right. Version-over-
-version comparison catches regressions introduced in one version, and cannot
-catch a bug present in both N-1 and N. Every shared blind spot becomes permanent
-and invisible. Nothing in this decision recovers that, and no amount of
-version-over-version diffing substitutes for it.
+**(b) The candidates.**
 
-**From-source bootstrap with no prior binary.** After this, building `bit`
-requires a `bit`. The chain terminates at a published binary rather than at
-source. A committed-blob approach would preserve a source-only path at the cost
-of a binary in the tree; we do not take it, so this is given up.
+| candidate | catches a bug both compilers share | needs a second implementation | cost to keep alive |
+|---|---|---|---|
+| 1. Accept and document | No | No | Free — this document |
+| 2. Property-based and differential fuzzing (#1907) | Yes, for anything its oracles can express: `-O0` vs `-O1` disagreement, aarch64 vs x86-64 disagreement, a self-checking generated program computing the wrong answer. None of these compare against stage0, so a bug shared with N-1 is not hidden from them | No | Moderate, ongoing: a program generator plus three fuzz modes to build and keep working as the language grows |
+| 3. Reproducible builds from a published stage0, double-compiled independently by a third party | No, for a logic bug carried in the shared source — every rebuild starts from the same source and the same stage0 lineage, so it reproduces identically. Yes, for a backdoor injected into a published stage0 binary that has no source-level trace | No — it verifies existing binaries against each other and against source; it writes no second compiler | Real but partial today: `scripts/verify-reproducible-release.sh` was broken for the 0.1.9 and 0.1.10 releases and was fixed in #2500 (`1bf4881f`), and has not yet been run against a release cut after that fix |
+| 4. A small independent reference checker | Yes, for whatever it independently re-derives | Yes — that is what "independent" means here | High and permanent: a second implementation to design, write, and keep in sync with every language change, and one that still never checks codegen |
 
-**Bootstrapping on an unsupported host.** See section 2. Cross-compilation is the
-only path.
+### Decision
+
+For 1.0: **options 1, 2 and 3, together.** Option 4 is rejected.
+
+- **Accept and document (1).** This document states the trust model as it is,
+  not as a differential's MATCH count makes it look. A green
+  `selfhost-diff*.sh` run means "this version did not change behaviour versus
+  the last release," never "this version is correct."
+- **Fuzzing is the bug-finding oracle (2, #1907).** It does not compare
+  against stage0 at all, so it is not blind to a bug stage0 and the tree
+  share. Its three modes: `-O0` vs `-O1` differential over generated
+  programs, aarch64 vs x86-64 differential over the same programs, and
+  self-checking generated programs that compute a value and assert it
+  themselves. All three find a wrong answer without needing a second
+  implementation of the compiler.
+- **A reproducible, independently rebuildable stage0 is the trust oracle (3).**
+  It answers a different question than fuzzing — not "is the compiler's logic
+  correct" but "is the binary I am bootstrapping from the one the published
+  source actually produces" — and it is the answer to Thompson's
+  trusting-trust attack described in §3: diverse double-compiling at release
+  time, by machines the owner does not fully control, is what makes a
+  faithfully-self-reproducing backdoor detectable.
+- **Option 4 is rejected.** A small independent reference checker is a second
+  implementation under a different name: it costs the same ongoing
+  maintenance tax as the seed did, permanently, for the life of the language.
+  And even a complete one only checks what it re-derives — typing and
+  semantics — never codegen, which is where #1857 and the ABI-boundary bugs
+  actually live. Ruled out by the owner; the decision here comes from options
+  1–3 only.
+
+### What this does not fix
+
+#1859 (closed) added `selfhost-diffruntime.sh`, a differential with its own
+corpus (`runtime/**/*.bit`) — the one directory every other §4 differential's
+shared corpus excludes. Runtime codegen now participates in a stage0-vs-tree
+comparison instead of going unchecked. That narrows the blind spot described
+in (a) — a bug like #1857's, confined to `runtime/`, is now at least compared
+— but it does not make the oracle independent. `diffruntime` still compares
+stage0 (N-1) against this tree (N), the same lineage checking itself, so a
+bug both versions already share stays invisible whether or not `runtime/` is
+in the walked corpus. #1859 grew what gets compared; only fuzzing (2) and a
+genuinely external oracle change what "agreement" is evidence of.
+
+## 6. Other accepted losses from the stage0 decision
+
+The oracle weakness above is the significant loss from re-basing the
+differentials onto stage0. Three smaller, unrelated losses came from the same
+`seed/`-removal decision (#1593) and are recorded here rather than reopened:
+
+**From-source bootstrap with no prior binary.** Building `bit` now requires a
+`bit`. The chain terminates at a published binary rather than at source. A
+committed-blob approach would preserve a source-only path at the cost of a
+binary in the tree; we do not take it, so this is given up.
+
+**Bootstrapping on an unsupported host.** See §2. Cross-compilation from a
+machine that has a working `bit` is the only path.
 
 **Detection of a stage0 that backdoors itself faithfully**, except by diverse
-double-compiling at release time. A developer build does not check this.
+double-compiling at release time (§3). A developer build does not check this.
 
 ## What is NOT lost
 
