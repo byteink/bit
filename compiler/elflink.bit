@@ -276,6 +276,100 @@ fn elfArchiveExterns(target: ElfLinkTarget, bytes: []u8): map<string, bool> {
   return loArchiveExterns(modules)
 }
 
+// ---- .symtab / .strtab / .shstrtab (#3395) --------------------------------
+//
+// A minimal section-header table naming every surviving kept .text atom, for
+// external tools only — readelf/nm/perf/gdb. Nothing at runtime looks these
+// up: the compiler's own panic self-symbolization (epic #1905) never consults
+// a section header, and stays fully independent of this table. These bytes are
+// appended AFTER every PT_LOAD segment, exactly where a stripped binary's
+// tables would also sit — the kernel loader reads only Ehdr+Phdrs+segment
+// bytes and never consults e_shoff, so dropping this table is still a fully
+// valid, loadable ELF file.
+struct ElSymtab {
+  strtab: ByteBuf,
+  symtab: ByteBuf,
+  nLocal: int,
+}
+
+// One STB_LOCAL/STT_FUNC Elf64_Sym per surviving kept .text atom that carries a
+// name, address = its assigned vaddr. Mirrors machoreloc.bit's meBuildSymtab —
+// same shape, same "skip an empty name" guard, ELF's own on-disk format.
+fn elBuildSymtab(modules: []LoModule, text: []ElPlaced): ElSymtab {
+  let strtab = newByteBuf()
+  strtab.bytes = append(strtab.bytes, u8(0)) // offset 0 == ""
+  let symtab = newByteBuf()
+  appendElfSym(symtab, 0, 0, 0, 0, 0) // index 0: mandatory null symbol
+  let nLocal = 0
+  let i = 0
+  while (i < len(text)) {
+    let atom = modules[atomKeyModule(text[i].id)].atoms[atomKeyAtom(text[i].id)]
+    if (len(atom.name) > 0) {
+      let nameOff = elfInternString(strtab, atom.name)
+      appendElfSym(symtab, nameOff, elfSymInfo(ElfBinding.Local, ElfSymKind.Func),
+        1, text[i].vaddr, atom.size) // shndx 1: the lone .text section header
+      nLocal = nLocal + 1
+    }
+    i = i + 1
+  }
+  return ElSymtab{ strtab: strtab, symtab: symtab, nLocal: nLocal }
+}
+
+// The bytes to append after `fileSize` (the resulting e_shoff) plus those
+// bytes themselves: .strtab, .symtab, .shstrtab, then a 5-entry section-header
+// table (SHT_NULL, .text, .strtab, .symtab, .shstrtab).
+struct ElShTable {
+  bytes: []u8,
+  shoff: int,
+}
+
+fn elBuildSectionTable(fileSize: int, textStart: int, textEnd: int,
+    textAlign: int, st: ElSymtab): ElShTable {
+  let shstrtab = newByteBuf()
+  shstrtab.bytes = append(shstrtab.bytes, u8(0))
+  let textNameOff = elfInternString(shstrtab, ".text")
+  let strtabNameOff = elfInternString(shstrtab, ".strtab")
+  let symtabNameOff = elfInternString(shstrtab, ".symtab")
+  let shstrtabNameOff = elfInternString(shstrtab, ".shstrtab")
+
+  let tail = newByteBuf()
+  let strtabFileOff = fileSize + len(tail.bytes)
+  appendBytes(tail, st.strtab.bytes)
+  padTo(tail, 8)
+  let symtabFileOff = fileSize + len(tail.bytes)
+  appendBytes(tail, st.symtab.bytes)
+  let shstrtabFileOff = fileSize + len(tail.bytes)
+  appendBytes(tail, shstrtab.bytes)
+  padTo(tail, 8)
+  let shoff = fileSize + len(tail.bytes)
+
+  let shdrs = []ElfShdr(0)
+  shdrs = append(shdrs, ElfShdr{ name: 0, shtype: 0, flags: 0, addr: 0, offset: 0,
+    size: 0, link: 0, info: 0, addralign: 0, entsize: 0 }) // index 0: SHT_NULL
+  shdrs = append(shdrs, ElfShdr{ name: textNameOff, shtype: 1, // SHT_PROGBITS
+    flags: 6, // SHF_ALLOC | SHF_EXECINSTR
+    addr: textStart, offset: textStart - elLoadBase(), size: textEnd - textStart,
+    link: 0, info: 0, addralign: textAlign, entsize: 0 })
+  shdrs = append(shdrs, ElfShdr{ name: strtabNameOff, shtype: 3, // SHT_STRTAB
+    flags: 0, addr: 0, offset: strtabFileOff, size: len(st.strtab.bytes),
+    link: 0, info: 0, addralign: 1, entsize: 0 })
+  shdrs = append(shdrs, ElfShdr{ name: symtabNameOff, shtype: 2, // SHT_SYMTAB
+    flags: 0, addr: 0, offset: symtabFileOff, size: len(st.symtab.bytes),
+    link: 2, // .strtab's section index
+    info: st.nLocal + 1, // one past the last (and only) local symbol's index
+    addralign: 8, entsize: sizeofElfSym() })
+  shdrs = append(shdrs, ElfShdr{ name: shstrtabNameOff, shtype: 3, // SHT_STRTAB
+    flags: 0, addr: 0, offset: shstrtabFileOff, size: len(shstrtab.bytes),
+    link: 0, info: 0, addralign: 1, entsize: 0 })
+  assert(len(shdrs) == 5)
+  let sh = 0
+  while (sh < len(shdrs)) {
+    appendElfShdr(tail, shdrs[sh])
+    sh = sh + 1
+  }
+  return ElShTable{ bytes: tail.bytes, shoff: shoff }
+}
+
 // Links `inputs` into a standalone ELF executable.
 fn linkElfExecutable(target: ElfLinkTarget, inputs: []ElfLinkInput): []u8! {
   let modules = elIngest(target, inputs)?
@@ -351,6 +445,16 @@ fn linkElfExecutable(target: ElfLinkTarget, inputs: []ElfLinkInput): []u8! {
 
   let cursor = elLoadBase() + headersSize
   cursor = elPlaceAtoms(modules, text, cursor)
+  let textEnd = cursor
+  // The first kept .text atom's OWN vaddr, not the pre-alignment cursor above:
+  // elPlaceAtoms aligns the first atom forward from that cursor (elLoadBase() +
+  // headersSize is not generally 16-aligned), so the raw cursor undercounts
+  // whenever that alignment padding is nonzero — the .text section header must
+  // describe where the bytes actually landed.
+  let textStart = textEnd
+  if (len(text) > 0) {
+    textStart = text[0].vaddr
+  }
   cursor = elPlaceAtoms(modules, rodata, cursor)
   let rxEnd = cursor
 
@@ -542,6 +646,12 @@ fn linkElfExecutable(target: ElfLinkTarget, inputs: []ElfLinkInput): []u8! {
     gt = gt + 1
   }
 
+  // .symtab/.strtab/.shstrtab (#3395): computed here, before Ehdr, since
+  // e_shoff/e_shnum/e_shstrndx below depend on it.
+  let symtabData = elBuildSymtab(modules, text)
+  let shTable = elBuildSectionTable(fileSize, textStart, textEnd,
+    elMaxAlign(modules, text, 1), symtabData)
+
   // Ehdr.
   let hdr = newByteBuf()
   hdr.bytes = append(hdr.bytes, u8(127))
@@ -556,14 +666,14 @@ fn linkElfExecutable(target: ElfLinkTarget, inputs: []ElfLinkInput): []u8! {
   appendU32(hdr, 1)
   appendU64(hdr, entryVaddr)
   appendU64(hdr, sizeofElfEhdr()) // e_phoff: the phdrs follow the header
-  appendU64(hdr, 0)               // e_shoff: an executable needs no section table
+  appendU64(hdr, shTable.shoff)   // e_shoff
   appendU32(hdr, 0)
   appendU16(hdr, sizeofElfEhdr())
   appendU16(hdr, sizeofElfPhdr())
   appendU16(hdr, phnum)
-  appendU16(hdr, 0) // e_shentsize
-  appendU16(hdr, 0) // e_shnum
-  appendU16(hdr, 0) // e_shstrndx
+  appendU16(hdr, sizeofElfShdr()) // e_shentsize
+  appendU16(hdr, 5) // e_shnum: NULL, .text, .strtab, .symtab, .shstrtab
+  appendU16(hdr, 4) // e_shstrndx: .shstrtab is shdrs[4]
   let h = 0
   while (h < len(hdr.bytes)) {
     buf[h] = hdr.bytes[h]
@@ -591,5 +701,9 @@ fn linkElfExecutable(target: ElfLinkTarget, inputs: []ElfLinkInput): []u8! {
     p = p + 1
   }
 
-  return buf
+  // shTable.bytes sits past fileSize, outside every PT_LOAD — never loaded,
+  // never touched by the runtime.
+  let img = ByteBuf{ bytes: buf }
+  appendBytes(img, shTable.bytes)
+  return img.bytes
 }
