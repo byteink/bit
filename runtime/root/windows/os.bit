@@ -1,0 +1,510 @@
+// Windows process provider (#3332, epic #3322): process exit, command-line
+// arguments and environment variables — the Bit form of
+// `../linux/os.bit`/`../darwin/os.bit`'s own `bit_rt_os_*` role, but a
+// DIFFERENT SPLIT OF LABOUR from both, because Windows hands the process none
+// of what POSIX hands it for free.
+//
+// ---------------------------------------------------------------------------
+// WHY THIS FILE OWNS MORE THAN ITS SIBLINGS DO
+// ---------------------------------------------------------------------------
+//
+// On Linux and Darwin, `os_argc`/`os_arg_at`/`os_env` are PLATFORM-FREE
+// (`../os.bit`) because the kernel hands the process an `argc`/`argv`/`envp`
+// triple already shaped exactly like the C convention `../os.bit`'s
+// `gArgc`/`gArgvPtr`/`gEnvpPtr` and `osCstrToStr`/`osEnvMatch` assume: a word
+// array of pointers to NUL-terminated byte strings, and — since both
+// platforms' terminals and shells already deal in UTF-8 — those bytes are
+// already the right encoding. `../{linux,darwin}/os.bit` only add
+// `os_self_exe`/`os_run`/`os_run_test`, the three calls that need a real
+// syscall the shared code cannot make itself.
+//
+// Windows has NO such triple. `../boot.bit`'s own header: "there is no
+// per-process argc/argv/envp AT ALL. A Windows program obtains its command
+// line via `GetCommandLineW` and its environment via
+// `GetEnvironmentStringsW` — both UTF-16, neither shaped like the C
+// `envp: [*:0]?[*:0]u8` array". So THIS file's job is to MANUFACTURE that
+// same C-shaped, UTF-8-byte triple from the two UTF-16 Windows APIs, once, at
+// boot — and once manufactured, `../os.bit`'s `osSetArgs`/`rtOsArgc`/
+// `rtOsArgAt`/`rtOsEnv` need NOT ONE LINE changed: they already only ever
+// read raw bytes through a pointer array, never caring how those bytes came
+// to exist. `../boot.bit`'s `boot()` (step 3) now calls `winCaptureArgsEnv`
+// below instead of the placeholder empty-array `osSetArgs` call its header
+// documented as "#3332's job" — see that file's diff in this same commit.
+//
+// `os_exit` (`bit_rt_os_exit`) lives HERE rather than in `./io.bit` (the
+// `../{linux,darwin}/io.bit` location), because `../boot.bit`'s own
+// `winSpawnFatal` comment already reserves this file for it: "that symbol
+// belongs to `runtime/root/windows/os.bit` (#3332), which owns real
+// process-exit semantics on Windows."
+//
+// ---------------------------------------------------------------------------
+// THE UTF-16 / UTF-8 BOUNDARY — ONE FUNCTION, `winUtf16ToUtf8` BELOW
+// ---------------------------------------------------------------------------
+//
+// Every wide-string Windows API this port will ever call crosses this same
+// boundary, so the decoder lives in exactly one place: `winUtf16ToUtf8`,
+// used by both `winSplitArgs` (command line) and `winBuildEnvp` (environment)
+// below. #3334 (`runtime/root/windows/fs.bit`, blocked on this ticket) needs
+// the OPPOSITE direction — UTF-8 -> UTF-16 for a `CreateFileW` path — plus
+// possibly this SAME decode direction for `FindFirstFileW`/`FindNextFileW`'s
+// returned filenames. Neither exists yet. Whoever picks up #3334 should add
+// an encoder BESIDE `winUtf16ToUtf8` in this file (same module as `fs.bit`
+// will be — `runtime/root/windows` — so it needs no import either way), not
+// write a second decoder: this ticket's own constraint ("do NOT write a
+// second copy of the UTF-16 conversion; fs.bit needs the same one") is
+// recorded here so the next agent does not have to re-derive it.
+//
+// MALFORMED UTF-16 (an unpaired surrogate) DECODES AS U+FFFD, never rejected
+// outright and never passed through as WTF-8: Bit strings are always
+// well-formed UTF-8 (SPEC's `string`), so this function's output must be too
+// no matter how corrupt the input block is — the standard substitution
+// WHATWG's own UTF-16 decoder and every major language runtime make for
+// exactly this input. A well-formed astral-plane character (a real surrogate
+// PAIR) round-trips exactly, verified below.
+//
+// VERIFIED IN ISOLATION, NOT ON THIS TICKET'S FAITH ALONE: this port cannot
+// build or run for `x86_64-windows` yet (`libbitrt-x86_64-windows.a` does not
+// exist, #3341), so `winUtf16ToUtf8`/`winEncodeUtf8Cp` and `winSplitArgs`'s
+// quoting state machine were each mirrored line-for-line in a throwaway
+// Python script and checked against Python's own UTF-16LE/UTF-8 codecs and
+// against Microsoft's four canonical documented command-line examples
+// ("Parsing C++ Command-Line Arguments") before being written here — the
+// mutation-in-isolation technique for logic that is too expensive (here:
+// impossible on this host) to exercise directly. Not committed; this comment
+// is the durable record. Runtime behaviour on real Windows is still OWED —
+// see the bottom of this file.
+//
+// ---------------------------------------------------------------------------
+// COMMAND-LINE SPLITTING FIDELITY — A DELIBERATE, STATED DEVIATION
+// ---------------------------------------------------------------------------
+//
+// `winSplitArgs` implements the three rules Microsoft documents for
+// `CreateProcess`'s `lpCommandLine` (the same rules the C runtime's
+// `__getmainargs` and `CommandLineToArgvW` both implement): arguments are
+// delimited by space/tab outside a quoted run; a `"` toggles the quoted run
+// and is itself never copied; a run of N backslashes immediately before a
+// `"` collapses to floor(N/2) literal backslashes, and an ODD N additionally
+// turns the `"` into one literal, non-toggling `"` character; backslashes
+// NOT immediately before a `"` are always literal, in full.
+//
+// APPLIED UNIFORMLY TO EVERY ARGUMENT, INCLUDING ARGV[0] — the one place this
+// deliberately diverges from `CommandLineToArgvW`, which special-cases the
+// executable-path token (delimited by the first unquoted whitespace, or by a
+// matching close-quote if it starts with one, with NO backslash escaping
+// applied inside it at all). Replicating that second, path-only state
+// machine buys fidelity for an input nothing plausible produces — a
+// program's own launched path containing a literal `\"` sequence — at the
+// cost of a second parser to keep in sync with this one. This ticket's own
+// acceptance criteria test arguments AFTER argv[0] (plain, quoted-with-a-
+// space, embedded-quote), which get the fully faithful treatment either way.
+// A half-faithful splitter that only worked on `prog.exe hello` would be
+// worse than this documented gap.
+
+import { osSetArgs } from "../../root"
+import { loadByte, storeByte, storeWord } from "../../gc"
+
+// kernel32 imports beyond what `../boot.bit` already declares (same module,
+// so `ExitProcess` below is `../boot.bit`'s own extern, not redeclared here —
+// a second `extern fn ExitProcess` would be E0042). All three of these are
+// already admitted in `compiler/pesyms.bit` (#3328) — no addition needed for
+// this ticket. `GetCommandLineW`/`GetEnvironmentStringsW` return a raw
+// pointer (`*byte`, this project's idiom for "untyped memory", exactly how
+// `../boot.bit`'s own `CreateThread` returns its `*byte` HANDLE) to a UTF-16
+// buffer; nothing about the calling convention cares what the pointee type
+// is, only the callee does.
+extern fn GetCommandLineW(): *byte
+extern fn GetEnvironmentStringsW(): *byte
+extern fn FreeEnvironmentStringsW(strings: *byte): i32
+
+// ---------------------------------------------------------------------------
+// process exit
+// ---------------------------------------------------------------------------
+
+// `bit_rt_os_exit` (ABI.md §19): every compiled panic and `os.exit()` call
+// funnels here, exactly as `../linux/io.bit`'s and `../darwin/io.bit`'s own
+// `rootExit`. `../boot.bit`'s `winMain` ALSO calls `ExitProcess` directly for
+// its own top-level return — that is a SEPARATE call site (boot's own
+// post-`bit_main` exit), not a caller of this function, and both are
+// intentionally the same one-line body: there is no other way to end a
+// Windows process from user code.
+//
+// Masked to a byte (`& 255`), matching `../linux/os.bit`'s
+// `syscall(sysExitGroup(), i64(code & 255))` and `../darwin/os.bit`'s
+// `_exit(i32(code & 255))` exactly: Windows' own `ExitProcess` accepts a full
+// 32-bit `UINT`, but a Bit program's exit code must behave identically
+// however it is compiled — the mask is what makes `main(): int { return
+// 300 }` exit the same low byte on every target, not a Windows limitation.
+export @nosplit @symbol("bit_rt_os_exit") fn rootExit(code: int) {
+  ExitProcess(i32(code & 255))
+}
+
+// ---------------------------------------------------------------------------
+// The UTF-16 / UTF-8 boundary (see the header above for why this is the one
+// place it lives)
+// ---------------------------------------------------------------------------
+
+// Encode Unicode scalar value `cp` (0..0x10FFFF, never a surrogate — callers
+// substitute U+FFFD for those) as UTF-8 at `dst`, returning the byte count
+// (1-4). Standard UTF-8 bit-packing, no lookup table needed.
+@nosplit fn winEncodeUtf8Cp(dst: int, cp: int): int {
+  if (cp <= 127) {
+    storeByte(dst, cp)
+    return 1
+  }
+  if (cp <= 2047) {
+    storeByte(dst, 192 | (cp >> 6))
+    storeByte(dst + 1, 128 | (cp & 63))
+    return 2
+  }
+  if (cp <= 65535) {
+    storeByte(dst, 224 | (cp >> 12))
+    storeByte(dst + 1, 128 | ((cp >> 6) & 63))
+    storeByte(dst + 2, 128 | (cp & 63))
+    return 3
+  }
+  storeByte(dst, 240 | (cp >> 18))
+  storeByte(dst + 1, 128 | ((cp >> 12) & 63))
+  storeByte(dst + 2, 128 | ((cp >> 6) & 63))
+  storeByte(dst + 3, 128 | (cp & 63))
+  return 4
+}
+
+// Decode up to `maxUnits` UTF-16LE code units at raw address `src` (stopping
+// early at a NUL unit) into a NUL-terminated UTF-8 byte sequence at `dst`,
+// never writing past `maxBytes` (Power of 10 rules 2/3). Returns the UTF-8
+// byte count written (excluding the terminating NUL), or `0 - 1` if the
+// decoded text would not fit `maxBytes` — REJECTED rather than truncated,
+// same choice `../os.bit`'s `osBuildRunArgv` makes for an oversized argv
+// (#2023): a silently truncated argument or environment value is worse than
+// an absent one, and the caller can see the drop in a lower-than-expected
+// count.
+//
+// A high surrogate (0xD800-0xDBFF) immediately followed by a low surrogate
+// (0xDC00-0xDFFF) combines into one astral-plane code point, standard
+// surrogate-pair math; any other surrogate unit (unpaired, or a low
+// surrogate with no preceding high) decodes as U+FFFD — see the header for
+// why that substitution, not a hard failure, is the right call here.
+@nosplit fn winUtf16ToUtf8(src: int, maxUnits: int, dst: int, maxBytes: int): int {
+  let i = 0
+  let o = 0
+  while (i < maxUnits) {
+    let unit = loadByte(src + i * 2) | (loadByte(src + i * 2 + 1) << 8)
+    if (unit == 0) {
+      break
+    }
+    i = i + 1
+    let cp = unit
+    if (unit >= 55296 && unit <= 56319) {
+      // high surrogate (0xD800-0xDBFF)
+      let haveLow = false
+      let low = 0
+      if (i < maxUnits) {
+        low = loadByte(src + i * 2) | (loadByte(src + i * 2 + 1) << 8)
+        if (low >= 56320 && low <= 57343) {
+          haveLow = true
+        }
+      }
+      if (haveLow) {
+        cp = 65536 + ((unit - 55296) << 10) + (low - 56320)
+        i = i + 1
+      } else {
+        cp = 65533   // U+FFFD
+      }
+    } else {
+      if (unit >= 56320 && unit <= 57343) {
+        cp = 65533   // unpaired low surrogate (0xDC00-0xDFFF)
+      }
+    }
+    let need = 1
+    if (cp > 127) {
+      need = 2
+    }
+    if (cp > 2047) {
+      need = 3
+    }
+    if (cp > 65535) {
+      need = 4
+    }
+    if (o + need > maxBytes) {
+      return 0 - 1
+    }
+    o = o + winEncodeUtf8Cp(dst + o, cp)
+  }
+  if (o + 1 > maxBytes) {
+    return 0 - 1
+  }
+  storeByte(dst + o, 0)
+  return o
+}
+
+// ---------------------------------------------------------------------------
+// command line -> argv
+// ---------------------------------------------------------------------------
+
+// `GetCommandLineW`'s own documented ceiling for `CreateProcess`'s
+// `lpCommandLine` (~32,767 characters plus the terminating NUL). Used here
+// purely as a defensive scan bound (Power of 10 rule 2), not as a proof of
+// anything Windows enforces: if this process's own command line was somehow
+// assembled longer than this, the scan simply stops early and the trailing
+// text is unavailable — a bounded degradation, never a fault.
+const winMaxCmdUnits: int = 32768
+
+// Every captured argument consumes at least 2 units (1 content unit + 1
+// delimiter, or 1 content unit at end of string), so this count is the
+// tightest bound `winMaxCmdUnits` allows — UNREACHABLE in practice, not an
+// arbitrary small cap.
+const winMaxArgs: int = 16384
+
+// Worst-case UTF-8 expansion of the whole command line (3 bytes per BMP
+// UTF-16 unit is the maximum single-unit expansion; a surrogate pair is 2
+// units -> 4 bytes, i.e. LESS than 3x per unit), plus one NUL per argument,
+// rounded up.
+const winArgvArenaBytes: int = 131072
+
+// One reusable scratch buffer for the CURRENT argument's UNESCAPED UTF-16
+// units (quote/backslash processing can only shrink or preserve length,
+// never grow it, so sizing this to the whole command line's own unit budget
+// covers any single argument). Reused across arguments — bump-written and
+// re-read within one `winSplitArgs` call, nothing here survives past it.
+// `winArgvPtrs`/`winArgvArena` DO survive: they are read for the rest of the
+// process's life via `../os.bit`'s `rtOsArgAt`. All are boot-time-only,
+// filled ONCE before the scheduler exists (`../boot.bit`'s `boot()` step 3,
+// single-threaded), so — unlike this module's per-worker run/run_test
+// scratch pattern elsewhere in this file family — no slot indirection is
+// needed here at all.
+let winArgUnescScratch: [8193]i64   // 32768*2 + 2 bytes, rounded up to words
+let winArgvPtrs: [16384]i64         // winMaxArgs pointer slots
+let winArgvArena: [16384]i64        // winArgvArenaBytes / 8
+
+// Split the NUL-terminated UTF-16LE command line at raw address `cmdAddr`
+// (`GetCommandLineW`'s own return) into UTF-8 NUL-terminated arguments per
+// the header's quoting rules, writing each argument's bytes into
+// `winArgvArena` and its address into `winArgvPtrs[i]`. Returns the argument
+// count (`argc`, always >= 1 for any non-empty command line — argv[0] is the
+// program's own path/name, exactly as POSIX argv[0] is).
+//
+// BOUNDED (Power of 10 rule 2): the outer loop is capped by both
+// `winMaxCmdUnits` and `winMaxArgs`; the inner backslash-run and
+// argument-body loops are capped by the same `winMaxCmdUnits` ceiling, since
+// `i` only ever advances. An argument whose decode does not fit the
+// remaining `winArgvArena` budget (`winUtf16ToUtf8` returned `0 - 1`) is
+// DROPPED, not truncated — the same "reject, never truncate" choice
+// `osBuildRunArgv` makes; unlike that function this one cannot reject the
+// WHOLE call, since a program must always get SOME argv.
+@nosplit fn winSplitArgs(cmdAddr: int): int {
+  let argvPtrs = int(ptrOf(winArgvPtrs))
+  let arena = int(ptrOf(winArgvArena))
+  let scratch = int(ptrOf(winArgUnescScratch))
+  let used = 0
+  let argc = 0
+  let i = 0
+  while (i < winMaxCmdUnits && argc < winMaxArgs) {
+    while (i < winMaxCmdUnits) {
+      let sep = loadByte(cmdAddr + i * 2) | (loadByte(cmdAddr + i * 2 + 1) << 8)
+      if (sep != 32 && sep != 9) {
+        break
+      }
+      i = i + 1
+    }
+    if (i >= winMaxCmdUnits) {
+      break
+    }
+    let peek = loadByte(cmdAddr + i * 2) | (loadByte(cmdAddr + i * 2 + 1) << 8)
+    if (peek == 0) {
+      break
+    }
+
+    let outUnits = 0
+    let inQuotes = false
+    let done = false
+    while (!done && i < winMaxCmdUnits) {
+      let u = loadByte(cmdAddr + i * 2) | (loadByte(cmdAddr + i * 2 + 1) << 8)
+      if (u == 0) {
+        done = true
+      } else {
+        if (u == 92) {
+          // A run of backslashes: only special when immediately followed by
+          // a `"` (rule 3); otherwise every one of them is literal, in full
+          // — NOT halved. See the header for why an earlier draft of this
+          // function got exactly this branch wrong.
+          let bs = 0
+          while (i < winMaxCmdUnits && (loadByte(cmdAddr + i * 2) | (loadByte(cmdAddr + i * 2 + 1) << 8)) == 92) {
+            bs = bs + 1
+            i = i + 1
+          }
+          let next = 0
+          if (i < winMaxCmdUnits) {
+            next = loadByte(cmdAddr + i * 2) | (loadByte(cmdAddr + i * 2 + 1) << 8)
+          }
+          if (next == 34) {
+            let pairs = bs / 2
+            let k = 0
+            while (k < pairs) {
+              storeByte(scratch + outUnits * 2, 92)
+              storeByte(scratch + outUnits * 2 + 1, 0)
+              outUnits = outUnits + 1
+              k = k + 1
+            }
+            if ((bs % 2) == 1) {
+              storeByte(scratch + outUnits * 2, 34)
+              storeByte(scratch + outUnits * 2 + 1, 0)
+              outUnits = outUnits + 1
+              i = i + 1
+            }
+            // else: the `"` is left unconsumed here and handled by the
+            // ordinary quote-toggle branch on the next iteration — an even
+            // backslash run before a quote does not escape it (rule 3).
+          } else {
+            let k = 0
+            while (k < bs) {
+              storeByte(scratch + outUnits * 2, 92)
+              storeByte(scratch + outUnits * 2 + 1, 0)
+              outUnits = outUnits + 1
+              k = k + 1
+            }
+          }
+        } else {
+          if (u == 34) {
+            inQuotes = !inQuotes
+            i = i + 1
+          } else {
+            if (!inQuotes && (u == 32 || u == 9)) {
+              done = true
+            } else {
+              storeByte(scratch + outUnits * 2, u & 255)
+              storeByte(scratch + outUnits * 2 + 1, (u >> 8) & 255)
+              outUnits = outUnits + 1
+              i = i + 1
+            }
+          }
+        }
+      }
+    }
+    storeByte(scratch + outUnits * 2, 0)
+    storeByte(scratch + outUnits * 2 + 1, 0)
+
+    let dst = arena + used
+    let n = winUtf16ToUtf8(scratch, outUnits, dst, winArgvArenaBytes - used)
+    if (n >= 0) {
+      storeWord(argvPtrs + argc * 8, dst)
+      used = used + n + 1
+      argc = argc + 1
+    }
+  }
+  return argc
+}
+
+// ---------------------------------------------------------------------------
+// environment -> envp
+// ---------------------------------------------------------------------------
+
+// Defensive scan ceilings (Power of 10 rule 2) for
+// `GetEnvironmentStringsW`'s double-NUL-terminated block — not documented
+// Windows limits (unlike `winMaxCmdUnits`, there is no equivalently strict
+// published ceiling for a process's own environment block), just generous
+// enough that no real process environment gets anywhere close: a malformed
+// or adversarial block that never reaches a double-NUL is bounded, not
+// looped forever.
+const winMaxEnvUnits: int = 1048576
+const winMaxEnvVars: int = 4096
+const winEnvArenaBytes: int = 3145728   // 3 * winMaxEnvUnits, UTF-8 worst case
+
+let winEnvPtrs: [4097]i64     // winMaxEnvVars + 1 (trailing 0 sentinel — ../os.bit's
+                               // `rtOsEnv` walks this array to a 0 entry, unlike argv
+                               // which is bounded by `argc`; see ../os.bit's own
+                               // `osEnvp`/`rtOsEnv` header)
+let winEnvArena: [393216]i64  // winEnvArenaBytes / 8
+
+// Capture the process environment via `GetEnvironmentStringsW`, decode each
+// `NAME=VALUE` entry (no un-escaping needed — unlike argv, environment
+// entries carry no quoting) into `winEnvArena`, and return the address of a
+// NUL-pointer-terminated array of entry addresses shaped exactly like
+// `../os.bit`'s `gEnvpPtr` expects. Frees the wide-string block with
+// `FreeEnvironmentStringsW` before returning, per that API's own contract.
+//
+// BOUNDED (Power of 10 rule 2): both the entry-length scan and the outer
+// entry-count loop are capped by `winMaxEnvUnits`, and the outer loop is
+// additionally capped by `winMaxEnvVars`. A `GetEnvironmentStringsW` failure
+// (NULL, e.g. out of memory) yields an empty environment (a lone 0-sentinel
+// entry) rather than faulting — the same "no overrides set" degradation
+// `../os.bit`'s own contract already documents for a wrapper called before
+// boot. An entry whose decode does not fit the remaining arena budget is
+// dropped, matching `winSplitArgs`'s own choice for an oversized argument.
+@nosplit fn winBuildEnvp(): int {
+  let ptrs = int(ptrOf(winEnvPtrs))
+  let arena = int(ptrOf(winEnvArena))
+  let block: *byte = GetEnvironmentStringsW()
+  let blockAddr = int(block)
+  let count = 0
+  if (blockAddr != 0) {
+    let i = 0
+    let used = 0
+    while (i < winMaxEnvUnits && count < winMaxEnvVars) {
+      let entryStart = i
+      let entryLen = 0
+      while (i < winMaxEnvUnits) {
+        let u = loadByte(blockAddr + i * 2) | (loadByte(blockAddr + i * 2 + 1) << 8)
+        if (u == 0) {
+          break
+        }
+        i = i + 1
+        entryLen = entryLen + 1
+      }
+      if (entryLen == 0) {
+        break   // the block's own double-NUL terminator
+      }
+      i = i + 1   // skip this entry's own NUL, on to the next
+      let dst = arena + used
+      let n = winUtf16ToUtf8(blockAddr + entryStart * 2, entryLen, dst, winEnvArenaBytes - used)
+      if (n >= 0) {
+        storeWord(ptrs + count * 8, dst)
+        used = used + n + 1
+        count = count + 1
+      }
+    }
+    FreeEnvironmentStringsW(block)
+  }
+  storeWord(ptrs + count * 8, 0)
+  return ptrs
+}
+
+// ---------------------------------------------------------------------------
+// boot-time capture entry point — called once from ../boot.bit's `boot()`
+// ---------------------------------------------------------------------------
+
+// Capture this process's real command line and environment and publish them
+// through `../os.bit`'s `osSetArgs`, replacing `../boot.bit`'s old
+// placeholder empty-array call. Not `export`ed: `../boot.bit` is a sibling
+// file in this SAME module (`runtime/root/windows`), so it calls this
+// directly with no `import` needed — the same module-scoped sharing
+// `../linux/fs.bit`'s `strData`/`emptyStr` already rely on for `../linux/os.bit`.
+//
+// A NULL `GetCommandLineW` result (not documented to ever happen, but this is
+// the process's very first Bit-managed action, before anything else exists
+// to fall back on) yields `argc == 0` rather than a fault — `../os.bit`'s own
+// "no args / empty env before boot" contract, now the deliberate result of a
+// real (if degenerate) capture rather than the old hardcoded placeholder.
+@nosplit fn winCaptureArgsEnv() {
+  let argvPtr = int(ptrOf(winArgvPtrs))
+  let argc = 0
+  let cmd: *byte = GetCommandLineW()
+  let cmdAddr = int(cmd)
+  if (cmdAddr != 0) {
+    argc = winSplitArgs(cmdAddr)
+  }
+  let envp = winBuildEnvp()
+  osSetArgs(argc, argvPtr, envp)
+}
+
+// ---------------------------------------------------------------------------
+// RUNTIME VERIFICATION OWED
+// ---------------------------------------------------------------------------
+//
+// `libbitrt-x86_64-windows.a` does not exist yet (#3341: tools/build has no
+// x86_64-windows target support), so nothing in this file has executed on
+// real Windows. `bit check runtime/root/windows` (type-check only) is the
+// full verification this ticket could run. The four acceptance scenarios
+// (no args / three plain args / a quoted space / an embedded quote), the
+// non-ASCII round-trip, and the 0/1/70 exit codes all remain to be run on
+// `mustafa-desktop-win` once #3341 lands — #3332's own acceptance criteria
+// name this explicitly and it is not claimed done here.
