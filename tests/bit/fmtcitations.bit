@@ -1,66 +1,48 @@
-// tests/bit/fmtcitations.bit — spec/FMT.md citation-drift gate (#3072).
+// tests/bit/fmtcitations.bit — file:line citation-drift gate (#3072, #3381).
 //
-// `spec/FMT.md` cites specific `compiler/fmt*.bit:NNN` file:line ranges
-// throughout its ten sections, and nothing in the repo ever read them:
-// `test-docs` (tests/bit/docs.bit) walks `${root}/docs` only, `test-spec`
-// (tests/bit/spec/) checks `spec/SPEC.md`'s grammar only, and
-// `scripts/gate.sh` classifies a `spec/FMT.md`-only diff as `bucket: noop`
-// with no gate name at all. The citations went stale twice (#2954, #3052),
-// each time caught only by a human reading the file closely.
+// Table-driven (`docRows()`): spec/FMT.md cites `compiler/fmt*.bit:NNN`,
+// runtime/ABI.md cites `runtime/**/*.bit:NNN` — a third document is a table
+// row, never a new script or Gate{}. #3350's sweep of ABI.md found 23 of 55
+// citations wrong (44 exact `path:line`, 11 hedged `~line`); nothing had
+// ever checked either.
 //
-// WHAT THIS CHECKS, IN TWO TIERS:
+// TIER 1 (every row): the cited file exists and every line number in the
+// spec is within [1, its current line count]. A HEDGED citation (`~line N`
+// or a bare `(~N)`/`(~N/M)` right after "(", ABI.md's "approximately" idiom)
+// gets the same check against a file resolved from CONTEXT, not a token of
+// its own — no numeric tolerance added, just a different way of finding the
+// file, tallied separately (hedges/hedgesChecked).
 //
-// TIER 1 — BOUNDS. Every `compiler/fmt*.bit:N` or `:N-M` (comma-separated
-// segments allowed, e.g. `268-270, 282-284`) citation: the named file exists
-// under the repo root, and every line number in every segment is within
-// `[1, that file's current line count]`. This alone would have caught most
-// of #3052's findings (a citation pointing past the end of a file that
-// shrank under it).
+// TIER 2, opt-in per row (`verifySymbols`, spec/FMT.md only): a citation
+// preceded by a backtick bare identifier naming a declared top-level
+// fn/const gets that declaration checked against the cited range. ABI.md's
+// prose does not follow this shape and its content is out of scope
+// (#3381), so its row leaves this off.
 //
-// TIER 2 — SYMBOL IDENTITY, mechanical but best-effort. When a citation is
-// DIRECTLY preceded in the prose by a single backtick-quoted bare identifier
-// — connected by nothing but a comma or an open-paren, e.g. `` `fmtGap`,
-// `compiler/fmt.bit:258-285` `` or `` `fmtFoo` (`compiler/fmt.bit:5-9`) ``
-// — and that identifier names a top-level `fn`/`const` actually declared in
-// the cited file, this checks that the declaration's line falls inside one
-// of the cited segments. This is the "the cited range still contains the
-// named function or constant" check and is what actually catches a citation
-// silently drifting off its target after an unrelated edit shifts the file.
+// RESOLUTION (see `resolveToken`): ABI.md shortens a citation to a bare
+// basename or dir+basename once the full path was named earlier in the
+// paragraph, and a hedge names no file at all — both fall back to the most
+// recently resolved full path (`contextAt`) when the token alone is
+// ambiguous or absent. `requiredPrefix` (FMT.md: "compiler/fmt") keeps that
+// row scoped exactly as #3072 left it.
 //
-// WHAT THIS DELIBERATELY DOES NOT CHECK, so a green run is not misread:
-//   - the PROSE CLAIM. A citation can point at the exact right function and
-//     still describe stale behaviour; verifying that requires reading intent,
-//     which this file does not attempt.
-//   - a citation whose preceding text is not a bare identifier directly
-//     connected by "," or "(" — a possessive ("`fmtGap`'s `allowBlank`
-//     branch, ..."), a call expression ("`fmtGap(p, true)`, ..."), or a
-//     Tag/type name that is not itself declared in the cited file (`Binary`,
-//     `FuncDecl`, `MatchArm`) all fall back to TIER 1 only. This is
-//     deliberately conservative: a heuristic that guessed the "intended"
-//     symbol from surrounding prose would risk a false PASS on a real drift,
-//     which is worse than no check at all (see this repo's own CLAUDE.md on
-//     a gate that overstates its coverage).
-//   - a citation naming a symbol with no line spec at all (a bare
-//     `` `compiler/fmt.bit` `` module mention) gets only a file-existence
-//     check, tallied separately as a "bare mention", never counted toward
-//     the citation/verified totals below.
-//
-// The summary line prints both denominators every run — citations found and
-// citations symbol-verified — never just a verdict, so this cannot regress
-// into a gate that scans nothing and prints PASS.
+// The summary prints every denominator every run, per document and in
+// aggregate, so this cannot regress into scanning zero documents while
+// printing PASS.
 //
 // Run from the repository root: bit-out/bin/bit run tests/bit/fmtcitations.bit
-// `BIT_REPO` overrides the repository root (default: search . / .. / ../.. /
-// ../../..), matching tests/bit/spec/spec.bit's own convention.
+// `BIT_REPO` overrides the repository root, matching tests/bit/spec/spec.bit.
 
-import { exists, readFile } from "std/fs"
+import { exists, readFile, walk } from "std/fs"
 import { env } from "std/os"
-import { hasPrefix, indexOf, split } from "std/strings"
+import { contains, hasPrefix, hasSuffix, indexOf, join, replace, split } from "std/strings"
 
-// Bounds — every walk below is over a handful of small files, but each is
-// still capped explicitly (Power of 10 rule 2).
-const maxDocBytes: int = 262144
-const maxCitations: int = 256
+// Bounds — every walk below is over a handful of documents and a few
+// hundred source files, each still capped explicitly (Power of 10 rule 2).
+const maxDocBytes: int = 1048576
+const maxPathTokens: int = 512
+const maxHedges: int = 64
+const maxTokenLen: int = 128
 const maxLineSpecLen: int = 64
 const maxSegmentsPerCitation: int = 8
 const maxIdentLen: int = 64
@@ -68,29 +50,44 @@ const maxBackScan: int = 200
 const maxCitedFileBytes: int = 1048576
 const maxCitedFileLines: int = 8192
 const maxDeclsPerFile: int = 512
+const maxIndexFiles: int = 1024
 
-// Floors, not exact counts — a pinned exact count merges cleanly across two
-// branches that each touch spec/FMT.md and is exactly the trap this repo's
-// own CLAUDE.md documents (a clean merge of two correct edits landing on a
-// wrong total). Set well under today's real count (31 line citations, 21
-// symbol-verified) so a scanner regression toward zero still fails loudly.
-const minCitationsFloor: int = 20
+// Floors, not exact counts (a pinned count merges cleanly across two
+// branches touching the same document and lands on a wrong total). Set well
+// under each document's real count so a regression toward zero fails loudly.
 const minVerifiedFloor: int = 10
+const minTotalCitationsFloor: int = 51
 
-const fmtPrefix: string = "compiler/fmt"
 const bitSuffix: string = ".bit"
+const hedgeLineWord: string = "line "
 
-struct Citation {
-  file: string        // e.g. "compiler/fmtwrap.bit"
-  lineSpecRaw: string  // e.g. "268-270, 282-284"; empty for a bare mention
-  hasSpec: bool
-  docLine: int         // 1-based line in spec/FMT.md where the citation starts
-  startOffset: int      // byte offset of the citation's file name in the doc text
+// One row per document this gate covers.
+struct DocRow { docPath: string, searchRoot: string, requiredPrefix: string,
+  checkBareMentions: bool, verifySymbols: bool, minCitations: int }
+
+fn docRows(): []DocRow {
+  return [
+    DocRow{docPath: "spec/FMT.md", searchRoot: "compiler", requiredPrefix: "compiler/fmt",
+      checkBareMentions: true, verifySymbols: true, minCitations: 20},
+    DocRow{docPath: "runtime/ABI.md", searchRoot: "runtime", requiredPrefix: "",
+      checkBareMentions: false, verifySymbols: false, minCitations: 30},
+  ]
 }
+
+struct PathToken { file: string, lineSpecRaw: string, hasSpec: bool, docLine: int, startOffset: int }
+
+// "/" separates independent line numbers (unlike "-", not a range).
+struct Hedge { lineSpecRaw: string, docLine: int, startOffset: int }
+
+// A file resolved at a given offset, so a filename-less hedge can ask "what was established here".
+struct ContextEvent { offset: int, path: string }
 
 struct Segment { start: int, end: int, ok: bool }
 struct Decl { name: string, line: int }
-struct Scan { citations: int, boundsChecked: int, verified: int, bareMentions: int, failures: int }
+struct BoundsResult { ok: bool, lines: []string, segs: []Segment }
+
+struct Scan { citations: int, boundsChecked: int, verified: int, bareMentions: int,
+  hedges: int, hedgesChecked: int, failures: int }
 
 fn die(msg: string) {
   eprint("fmtcitations: SETUP FAILED: ${msg}\n")
@@ -118,10 +115,6 @@ fn repoRoot(): string {
   return ""
 }
 
-fn isAsciiLetter(c: u8): bool {
-  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-}
-
 fn isIdentStartCh(c: u8): bool {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
 }
@@ -138,8 +131,8 @@ fn isLineSpecChar(c: u8): bool {
   return (c >= '0' && c <= '9') || c == '-' || c == ',' || c == ' '
 }
 
-// `s` with leading and trailing space/tab/newline/CR removed — std/strings'
-// trimSpace only strips space and tab, and a citation's connector routinely
+// `s` trimmed of leading/trailing space/tab/newline/CR — std/strings'
+// trimSpace strips only space/tab, and a citation's connector routinely
 // crosses a markdown line-wrap.
 fn trimWs(s: string): string {
   let lo = 0
@@ -175,31 +168,49 @@ fn docLineFor(text: string, offset: int): int {
   return len(split(text[0:offset], "\n"))
 }
 
-// Every `compiler/fmt<letters>.bit` occurrence in `text`, whether or not it
-// carries a `:N[-M][, N[-M]...]` line spec. Bounded scan: `i` only ever
-// advances, so this terminates in at most `len(text)` steps regardless of
-// how many candidates fail the `.bit` check.
-fn extractCitations(text: string): []Citation {
-  let out = []Citation(0)
+// Every `<path>.bit` occurrence: find each literal ".bit", scan BACKWARD
+// over identifier/slash chars for the token's start, then optionally
+// forward over a `:N[-M][, N[-M]...]` spec. `requiredPrefix` (if set)
+// discards a token not containing that substring. `i` only ever advances.
+fn extractPathTokens(text: string, requiredPrefix: string): []PathToken {
+  let out = []PathToken(0)
   let n = len(text)
   let i = 0
-  while (i < n && len(out) < maxCitations) {
-    let relRaw = indexOf(text[i:n], fmtPrefix)
+  while (i < n && len(out) < maxPathTokens) {
+    let relRaw = indexOf(text[i:n], bitSuffix)
     if (relRaw < 0) {
       break
     }
-    let start = i + int(relRaw)
-    let p = start + len(fmtPrefix)
-    let sufStart = p
-    while (p < n && isAsciiLetter(text[p])) {
-      p = p + 1
-    }
-    if (p + len(bitSuffix) > n || text[p:p + len(bitSuffix)] != bitSuffix) {
-      i = start + 1
+    let bitStart = i + int(relRaw)
+    let afterBit = bitStart + len(bitSuffix)
+    if (afterBit < n && isIdentContCh(text[afterBit])) {
+      i = bitStart + 1
       continue
     }
-    let fileName = "compiler/fmt${text[sufStart:p]}${bitSuffix}"
-    let afterBit = p + len(bitSuffix)
+    let start = bitStart
+    let floor = bitStart - maxTokenLen
+    if (floor < 0) {
+      floor = 0
+    }
+    while (start > floor && (isIdentContCh(text[start - 1]) || text[start - 1] == '/')) {
+      start = start - 1
+    }
+    if (start == bitStart) {
+      i = afterBit  // nothing path-like precedes ".bit" (e.g. a glob) -- not a citation
+      continue
+    }
+    let fileName = text[start:bitStart] + bitSuffix
+    if (fileName[0] == '/') {
+      fileName = fileName[1:len(fileName)]  // brace-expansion leftover, e.g. "/boot.bit" -- treat as its bare basename
+    }
+    if (len(fileName) == 0 || !isIdentStartCh(fileName[0])) {
+      i = afterBit
+      continue
+    }
+    if (len(requiredPrefix) > 0 && !contains(fileName, requiredPrefix)) {
+      i = afterBit
+      continue
+    }
     let hasSpec = false
     let lineSpecRaw = ""
     let endOffset = afterBit
@@ -216,18 +227,55 @@ fn extractCitations(text: string): []Citation {
         endOffset = q
       }
     }
-    out = append(out, Citation{file: fileName, lineSpecRaw: lineSpecRaw, hasSpec: hasSpec,
+    out = append(out, PathToken{file: fileName, lineSpecRaw: lineSpecRaw, hasSpec: hasSpec,
       docLine: docLineFor(text, start), startOffset: start})
     i = endOffset
   }
   return out
 }
 
-// If the citation starting at `citStartOffset` is immediately preceded (only
-// a comma or an open-paren, plus whitespace, in between) by a single
-// backtick-quoted bare identifier, returns it; otherwise "". Deliberately
-// conservative — see the file header's TIER 2 scope note for why a weaker
-// match is not attempted.
+// Every hedge: `~line N[/M][-M]` or a bare `(~N[/M][-M])` right after "(" —
+// never a duration/count (`~75us`), which is why both require direct adjacency.
+fn extractHedges(text: string): []Hedge {
+  let out = []Hedge(0)
+  let n = len(text)
+  let i = 0
+  while (i < n && len(out) < maxHedges) {
+    let relRaw = indexOf(text[i:n], "~")
+    if (relRaw < 0) {
+      break
+    }
+    let tildeAt = i + int(relRaw)
+    let specStart = tildeAt + 1
+    let viaLineWord = specStart + len(hedgeLineWord) <= n &&
+      text[specStart:specStart + len(hedgeLineWord)] == hedgeLineWord
+    let viaParen = tildeAt > 0 && text[tildeAt - 1] == '('
+    if (!viaLineWord && !viaParen) {
+      i = tildeAt + 1
+      continue
+    }
+    if (viaLineWord) {
+      specStart = specStart + len(hedgeLineWord)
+    }
+    let q = specStart
+    while (q < n && (q - specStart) < maxLineSpecLen && ((text[q] >= '0' && text[q] <= '9') || text[q] == '-' || text[q] == '/' || text[q] == ',' || text[q] == ' ')) {
+      q = q + 1
+    }
+    let raw = trimWs(text[specStart:q])
+    if (len(raw) == 0 || !(raw[0] >= '0' && raw[0] <= '9')) {
+      i = tildeAt + 1
+      continue
+    }
+    out = append(out, Hedge{lineSpecRaw: raw, docLine: docLineFor(text, tildeAt), startOffset: tildeAt})
+    i = q
+  }
+  return out
+}
+
+// If the citation at `citStartOffset` is directly preceded (only a comma or
+// open-paren, plus whitespace, in between) by a single backtick-quoted bare
+// identifier, returns it; otherwise "". Deliberately conservative — see the
+// TIER 2 note above.
 fn findAssociatedSymbol(text: string, citStartOffset: int): string {
   if (citStartOffset < 1 || text[citStartOffset - 1] != '`') {
     return ""
@@ -347,9 +395,8 @@ fn parseOneSegment(raw: string): Segment {
   return Segment{start: va, end: vb, ok: oka && okb && vb >= va}
 }
 
-// `spec` split on "," into segments, each either "N" (start==end) or "N-M".
-// An empty result (or any unparseable segment) is reported by the caller,
-// never treated as vacuously in-bounds.
+// `spec` split on "," into segments, each "N" (start==end) or "N-M". A
+// hedge's "/"-separated form is normalized to "," by its caller first.
 fn parseSegments(spec: string): []Segment {
   let out = []Segment(0)
   let parts = split(spec, ",")
@@ -362,36 +409,129 @@ fn parseSegments(spec: string): []Segment {
   return out
 }
 
-fn checkCitation(sc: Scan, root: string, docText: string, cit: Citation) {
-  if (!cit.hasSpec) {
-    sc.bareMentions = sc.bareMentions + 1
-    if (!exists("${root}/${cit.file}")) {
-      report(sc, "spec/FMT.md:${cit.docLine}: names ${cit.file}, which does not exist under the repo root")
+// `p` split on "/" with empty components dropped.
+fn pathComponents(p: string): []string {
+  let parts = split(p, "/")
+  let out = []string(0)
+  for part of parts {
+    if (len(part) > 0) {
+      out = append(out, part)
     }
-    return
   }
-  sc.citations = sc.citations + 1
-  let full = "${root}/${cit.file}"
+  return out
+}
+
+// Whether `candidateComps`'s LAST `len(tokenComps)` components equal
+// `tokenComps` in order — e.g. candidate [runtime,root,linux,boot.bit]
+// matches token [linux,boot.bit] but not [darwin,boot.bit].
+fn suffixMatches(candidateComps: []string, tokenComps: []string): bool {
+  let n = len(tokenComps)
+  let m = len(candidateComps)
+  if (n == 0 || n > m) {
+    return false
+  }
+  let offset = m - n
+  let i = 0
+  while (i < n) {
+    if (candidateComps[offset + i] != tokenComps[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Every `.bit` file under `<root>/<searchRoot>`, as repo-relative paths.
+fn buildIndex(root: string, searchRoot: string): []string {
+  let walkArg = searchRoot
+  let strip = ""
+  if (root != ".") {
+    walkArg = "${root}/${searchRoot}"
+    strip = "${root}/"
+  }
+  let all = walk(walkArg) catch e {
+    die("cannot walk ${walkArg}: ${e.message()}")
+    []string(0)
+  }
+  if (len(all) > maxIndexFiles) {
+    die("${walkArg} holds ${len(all)} entries, over the maxIndexFiles bound of ${maxIndexFiles}")
+  }
+  let out = []string(0)
+  for p of all {
+    if (!hasSuffix(p, bitSuffix)) {
+      continue
+    }
+    let canon = p
+    if (len(strip) > 0 && hasPrefix(p, strip)) {
+      canon = p[len(strip):len(p)]
+    }
+    out = append(out, canon)
+  }
+  return out
+}
+
+// Resolves `token`: a direct hit, else a unique suffix match against
+// `index`, else a suffix-consistent fallback to `contextPath`, else unresolved.
+fn resolveToken(root: string, token: string, index: []string, contextPath: string): (string, bool) {
+  if (exists("${root}/${token}")) {
+    return token, true
+  }
+  let tokenComps = pathComponents(token)
+  if (len(tokenComps) == 0) {
+    return "", false
+  }
+  let matches = []string(0)
+  for cand of index {
+    if (suffixMatches(pathComponents(cand), tokenComps)) {
+      matches = append(matches, cand)
+    }
+  }
+  if (len(matches) == 1) {
+    return matches[0], true
+  }
+  if (len(contextPath) > 0 && suffixMatches(pathComponents(contextPath), tokenComps)) {
+    return contextPath, true
+  }
+  return "", false
+}
+
+// The most recently resolved file at or before `offset` (events is in order).
+fn contextAt(events: []ContextEvent, offset: int): string {
+  let result = ""
+  for e of events {
+    if (e.offset < offset) {
+      result = e.path
+    }
+  }
+  return result
+}
+
+// Tier-1 bounds check shared by an exact citation and a hedge: `resolved`
+// must exist and `parseSpec`'s segments must fall in [1, its line count].
+fn checkBoundsShared(sc: Scan, root: string, docPath: string, docLine: int, resolved: string,
+    parseSpec: string, displaySpec: string, verb: string): BoundsResult {
+  let failResult = BoundsResult{ok: false, lines: []string(0), segs: []Segment(0)}
+  let full = "${root}/${resolved}"
   if (!exists(full)) {
-    report(sc, "spec/FMT.md:${cit.docLine}: cites ${cit.file}:${cit.lineSpecRaw}, but ${cit.file} does not exist under the repo root")
-    return
+    report(sc, "${docPath}:${docLine}: ${verb} ${resolved}:${displaySpec}, but ${resolved} does not exist under the repo root")
+    return failResult
   }
   let text = readFile(full) catch e {
-    report(sc, "spec/FMT.md:${cit.docLine}: cites ${cit.file}:${cit.lineSpecRaw}, but it could not be read: ${e.message()}")
-    return
+    report(sc, "${docPath}:${docLine}: ${verb} ${resolved}:${displaySpec}, but it could not be read: ${e.message()}")
+    return failResult
   }
   if (len(text) > maxCitedFileBytes) {
-    die("${cit.file} is ${len(text)} bytes, over the ${maxCitedFileBytes} bound")
+    die("${resolved} is ${len(text)} bytes, over the ${maxCitedFileBytes} bound")
   }
   let lines = split(text, "\n")
   if (len(lines) > maxCitedFileLines) {
-    die("${cit.file} has ${len(lines)} lines, over the ${maxCitedFileLines} bound")
+    die("${resolved} has ${len(lines)} lines, over the ${maxCitedFileLines} bound")
   }
   let lineCount = len(lines)
-  let segs = parseSegments(cit.lineSpecRaw)
+  let segs = parseSegments(parseSpec)
   if (len(segs) == 0) {
-    report(sc, "spec/FMT.md:${cit.docLine}: cites ${cit.file}:${cit.lineSpecRaw}, which has an unparseable line spec")
-    return
+    report(sc, "${docPath}:${docLine}: ${verb} ${resolved}:${displaySpec}, which has an unparseable line spec")
+    return failResult
   }
   let boundsOk = true
   for seg of segs {
@@ -400,21 +540,32 @@ fn checkCitation(sc: Scan, root: string, docText: string, cit: Citation) {
     }
   }
   if (!boundsOk) {
-    report(sc, "spec/FMT.md:${cit.docLine}: cites ${cit.file}:${cit.lineSpecRaw}, out of bounds (${cit.file} has ${lineCount} line(s))")
+    report(sc, "${docPath}:${docLine}: ${verb} ${resolved}:${displaySpec}, out of bounds (${resolved} has ${lineCount} line(s))")
+    return failResult
+  }
+  return BoundsResult{ok: true, lines: lines, segs: segs}
+}
+
+// Tier-1 (+ Tier-2 when `row.verifySymbols`) for one already-resolved citation.
+fn checkExactCitationBody(sc: Scan, root: string, row: DocRow, docText: string, tok: PathToken, resolved: string) {
+  let res = checkBoundsShared(sc, root, row.docPath, tok.docLine, resolved, tok.lineSpecRaw, tok.lineSpecRaw, "cites")
+  if (!res.ok) {
     return
   }
   sc.boundsChecked = sc.boundsChecked + 1
-
-  let symbolName = findAssociatedSymbol(docText, cit.startOffset)
+  if (!row.verifySymbols) {
+    return
+  }
+  let symbolName = findAssociatedSymbol(docText, tok.startOffset)
   if (len(symbolName) == 0) {
     return
   }
-  let declLine = lookupDecl(extractDecls(lines), symbolName)
+  let declLine = lookupDecl(extractDecls(res.lines), symbolName)
   if (declLine < 1) {
     return
   }
   let inRange = false
-  for seg of segs {
+  for seg of res.segs {
     if (declLine >= seg.start && declLine <= seg.end) {
       inRange = true
     }
@@ -422,8 +573,74 @@ fn checkCitation(sc: Scan, root: string, docText: string, cit: Citation) {
   if (inRange) {
     sc.verified = sc.verified + 1
   } else {
-    report(sc, "spec/FMT.md:${cit.docLine}: `${symbolName}` is declared at ${cit.file}:${declLine}, outside the cited range ${cit.file}:${cit.lineSpecRaw}")
+    report(sc, "${row.docPath}:${tok.docLine}: `${symbolName}` is declared at ${resolved}:${declLine}, outside the cited range ${resolved}:${tok.lineSpecRaw}")
   }
+}
+
+// Tier-1 for one hedge, resolved against `resolvedContext`.
+fn checkHedge(sc: Scan, root: string, row: DocRow, resolvedContext: string, h: Hedge) {
+  sc.hedges = sc.hedges + 1
+  if (len(resolvedContext) == 0) {
+    report(sc, "${row.docPath}:${h.docLine}: hedges toward ~${h.lineSpecRaw}, but no preceding full-path file mention resolves it")
+    return
+  }
+  let normalized = replace(h.lineSpecRaw, "/", ",")
+  let res = checkBoundsShared(sc, root, row.docPath, h.docLine, resolvedContext, normalized, "~${h.lineSpecRaw}", "hedges toward")
+  if (!res.ok) {
+    return
+  }
+  sc.hedgesChecked = sc.hedgesChecked + 1
+}
+
+// Scans one document row end to end into `sc`; returns this row's own
+// (citations, hedges, failures) delta so a zero-scan row can't hide in the aggregate.
+fn checkDocument(sc: Scan, root: string, row: DocRow): (int, int, int) {
+  let beforeCitations = sc.citations
+  let beforeHedges = sc.hedges
+  let beforeFailures = sc.failures
+  let docFullPath = "${root}/${row.docPath}"
+  let docText = readFile(docFullPath) catch e {
+    die("cannot read ${docFullPath}: ${e.message()}")
+    ""
+  }
+  if (len(docText) > maxDocBytes) {
+    die("${docFullPath} is ${len(docText)} bytes, over the ${maxDocBytes} bound")
+  }
+  let index = buildIndex(root, row.searchRoot)
+  let tokens = extractPathTokens(docText, row.requiredPrefix)
+  let events = []ContextEvent(0)
+  let contextPath = ""
+  for tok of tokens {
+    let (resolved, ok) = resolveToken(root, tok.file, index, contextPath)
+    // Only a token that was ITSELF written as a path (contains "/") becomes
+    // the new context. A bare basename cited in passing (e.g. "floats.bit"
+    // inside a list of other funnels' call sites) resolves fine on its own
+    // merits but must not overwrite the paragraph's real subject file, or a
+    // LATER hedge in the same paragraph would resolve against the wrong file.
+    if (ok && contains(tok.file, "/")) {
+      contextPath = resolved
+      events = append(events, ContextEvent{offset: tok.startOffset, path: resolved})
+    }
+    if (tok.hasSpec) {
+      sc.citations = sc.citations + 1
+      if (!ok) {
+        report(sc, "${row.docPath}:${tok.docLine}: cites ${tok.file}:${tok.lineSpecRaw}, but ${tok.file} could not be resolved to a file under ${row.searchRoot}/")
+      } else {
+        checkExactCitationBody(sc, root, row, docText, tok, resolved)
+      }
+    } else if (row.checkBareMentions) {
+      sc.bareMentions = sc.bareMentions + 1
+      if (!ok) {
+        report(sc, "${row.docPath}:${tok.docLine}: names ${tok.file}, which does not exist under the repo root")
+      } else if (!exists("${root}/${resolved}")) {
+        report(sc, "${row.docPath}:${tok.docLine}: names ${resolved}, which does not exist under the repo root")
+      }
+    }
+  }
+  for h of extractHedges(docText) {
+    checkHedge(sc, root, row, contextAt(events, h.startOffset), h)
+  }
+  return sc.citations - beforeCitations, sc.hedges - beforeHedges, sc.failures - beforeFailures
 }
 
 fn selfCheck(cond: bool, label: string): int {
@@ -434,65 +651,54 @@ fn selfCheck(cond: bool, label: string): int {
   return 1
 }
 
-fn selfTestExtract(): int {
+fn selfTestPathTokens(): int {
   let failed = 0
   let text = "See `myFn`, `compiler/fmt.bit:5-9` and bare `compiler/fmtwrap.bit` mention, then `other`, `compiler/fmtdispatch.bit:20, 30-31`."
-  let cits = extractCitations(text)
-  failed = failed + selfCheck(len(cits) == 3, "extractCitations did not find exactly 3 citations in synthetic text")
-  if (len(cits) == 3) {
-    failed = failed + selfCheck(cits[0].file == "compiler/fmt.bit" && cits[0].hasSpec && cits[0].lineSpecRaw == "5-9",
-      "extractCitations misparsed the first ranged citation")
-    failed = failed + selfCheck(cits[1].file == "compiler/fmtwrap.bit" && !cits[1].hasSpec,
-      "extractCitations misparsed the bare file mention")
-    failed = failed + selfCheck(cits[2].file == "compiler/fmtdispatch.bit" && cits[2].lineSpecRaw == "20, 30-31",
-      "extractCitations misparsed the multi-segment citation")
+  let toks = extractPathTokens(text, "compiler/fmt")
+  failed = failed + selfCheck(len(toks) == 3, "did not find exactly 3 citations")
+  if (len(toks) == 3) {
+    failed = failed + selfCheck(toks[0].file == "compiler/fmt.bit" && toks[0].hasSpec && toks[0].lineSpecRaw == "5-9", "misparsed the ranged citation")
+    failed = failed + selfCheck(toks[1].file == "compiler/fmtwrap.bit" && !toks[1].hasSpec, "misparsed the bare mention")
+    failed = failed + selfCheck(toks[2].file == "compiler/fmtdispatch.bit" && toks[2].lineSpecRaw == "20, 30-31", "misparsed the multi-segment citation")
   }
+  // Unfiltered: full, partial (dir+basename), and bare-basename tokens all extract.
+  let toks2 = extractPathTokens("`runtime/root/floats.bit:172` then `linux/boot.bit:189,254` then bare `scratch.bit:77`.", "")
+  failed = failed + selfCheck(len(toks2) == 3, "unfiltered scan did not find exactly 3 tokens")
+  if (len(toks2) == 3) {
+    failed = failed + selfCheck(toks2[0].file == "runtime/root/floats.bit", "misparsed the full-path token")
+    failed = failed + selfCheck(toks2[1].file == "linux/boot.bit", "misparsed the partial-path token")
+    failed = failed + selfCheck(toks2[2].file == "scratch.bit", "misparsed the bare-basename token")
+  }
+  // A glob has no path char before ".bit" and must never be extracted.
+  failed = failed + selfCheck(len(extractPathTokens("matches under `runtime/**/*.bit` and nothing else", "")) == 0,
+    "wrongly extracted a token from a glob pattern")
   return failed
 }
 
 fn selfTestAssociation(): int {
   let failed = 0
   let t1 = "rule (`fmtFoo`, `compiler/fmt.bit:5-9`) applies"
-  let c1 = extractCitations(t1)
-  failed = failed + selfCheck(len(c1) == 1, "setup: expected 1 citation in t1")
-  if (len(c1) == 1) {
-    failed = failed + selfCheck(findAssociatedSymbol(t1, c1[0].startOffset) == "fmtFoo",
-      "findAssociatedSymbol did not associate a direct comma-connected name")
-  }
+  let c1 = extractPathTokens(t1, "")
+  failed = failed + selfCheck(len(c1) == 1 && findAssociatedSymbol(t1, c1[0].startOffset) == "fmtFoo", "did not associate a comma-connected name")
   let t2 = "call `fmtFoo` (`compiler/fmt.bit:5-9`) applies"
-  let c2 = extractCitations(t2)
-  failed = failed + selfCheck(len(c2) == 1, "setup: expected 1 citation in t2")
-  if (len(c2) == 1) {
-    failed = failed + selfCheck(findAssociatedSymbol(t2, c2[0].startOffset) == "fmtFoo",
-      "findAssociatedSymbol did not associate a paren-connected name")
-  }
+  let c2 = extractPathTokens(t2, "")
+  failed = failed + selfCheck(len(c2) == 1 && findAssociatedSymbol(t2, c2[0].startOffset) == "fmtFoo", "did not associate a paren-connected name")
   let t3 = "`fmtFoo`'s own branch, `compiler/fmt.bit:5-9` applies"
-  let c3 = extractCitations(t3)
-  failed = failed + selfCheck(len(c3) == 1, "setup: expected 1 citation in t3")
-  if (len(c3) == 1) {
-    failed = failed + selfCheck(findAssociatedSymbol(t3, c3[0].startOffset) == "",
-      "findAssociatedSymbol wrongly associated across a possessive/prose connector")
-  }
+  let c3 = extractPathTokens(t3, "")
+  failed = failed + selfCheck(len(c3) == 1 && findAssociatedSymbol(t3, c3[0].startOffset) == "", "wrongly associated across a possessive connector")
   let t4 = "the `fmtGap(p, true)`, `compiler/fmt.bit:5-9` call"
-  let c4 = extractCitations(t4)
-  failed = failed + selfCheck(len(c4) == 1, "setup: expected 1 citation in t4")
-  if (len(c4) == 1) {
-    failed = failed + selfCheck(findAssociatedSymbol(t4, c4[0].startOffset) == "",
-      "findAssociatedSymbol wrongly associated a call expression as a bare identifier")
-  }
+  let c4 = extractPathTokens(t4, "")
+  failed = failed + selfCheck(len(c4) == 1 && findAssociatedSymbol(t4, c4[0].startOffset) == "", "wrongly associated a call expression")
   return failed
 }
 
 fn selfTestDecls(): int {
   let failed = 0
-  let lines = ["// header", "const fmtMaxWidth = 100", "", "fn fmtFoo(p: Printer) {", "  return 1", "}"]
-  let decls = extractDecls(lines)
-  failed = failed + selfCheck(len(decls) == 2, "extractDecls did not find both declarations")
+  let decls = extractDecls(["// header", "const fmtMaxWidth = 100", "", "fn fmtFoo(p: Printer) {", "  return 1", "}"])
+  failed = failed + selfCheck(len(decls) == 2, "did not find both declarations")
   if (len(decls) == 2) {
-    failed = failed + selfCheck(decls[0].name == "fmtMaxWidth" && decls[0].line == 2,
-      "extractDecls misparsed the const declaration")
-    failed = failed + selfCheck(decls[1].name == "fmtFoo" && decls[1].line == 4,
-      "extractDecls misparsed the fn declaration")
+    failed = failed + selfCheck(decls[0].name == "fmtMaxWidth" && decls[0].line == 2, "misparsed the const declaration")
+    failed = failed + selfCheck(decls[1].name == "fmtFoo" && decls[1].line == 4, "misparsed the fn declaration")
   }
   return failed
 }
@@ -500,23 +706,53 @@ fn selfTestDecls(): int {
 fn selfTestSegments(): int {
   let failed = 0
   let segs1 = parseSegments("5-9")
-  failed = failed + selfCheck(len(segs1) == 1 && segs1[0].ok && segs1[0].start == 5 && segs1[0].end == 9,
-    "parseSegments misparsed a single range")
+  failed = failed + selfCheck(len(segs1) == 1 && segs1[0].ok && segs1[0].start == 5 && segs1[0].end == 9, "misparsed a single range")
   let segs2 = parseSegments("267, 294")
-  failed = failed + selfCheck(len(segs2) == 2 && segs2[0].start == 267 && segs2[0].end == 267 &&
-    segs2[1].start == 294 && segs2[1].end == 294,
-    "parseSegments misparsed a two-value list")
+  failed = failed + selfCheck(len(segs2) == 2 && segs2[0].start == 267 && segs2[1].start == 294, "misparsed a two-value list")
   let segs3 = parseSegments("12-x")
-  failed = failed + selfCheck(len(segs3) == 1 && !segs3[0].ok,
-    "parseSegments accepted a non-numeric range end")
+  failed = failed + selfCheck(len(segs3) == 1 && !segs3[0].ok, "accepted a non-numeric range end")
+  return failed
+}
+
+// index/context fixtures shared by every resolveToken case below.
+fn selfTestResolve(): int {
+  let failed = 0
+  let index = ["runtime/root/floats.bit", "runtime/root/os.bit", "runtime/root/linux/os.bit",
+    "runtime/root/darwin/os.bit", "runtime/net/linux/netabi.bit", "runtime/net/darwin/netabi.bit"]
+  let (r1, ok1) = resolveToken(".", "floats.bit", index, "")
+  failed = failed + selfCheck(ok1 && r1 == "runtime/root/floats.bit", "did not resolve a uniquely-suffixed bare basename")
+  let (r2, ok2) = resolveToken(".", "linux/netabi.bit", index, "")
+  failed = failed + selfCheck(ok2 && r2 == "runtime/net/linux/netabi.bit", "did not resolve a directory-qualified partial path")
+  let (r3, ok3) = resolveToken(".", "os.bit", index, "runtime/root/os.bit")
+  failed = failed + selfCheck(ok3 && r3 == "runtime/root/os.bit", "did not fall back to context for an ambiguous basename")
+  let (_r4, ok4) = resolveToken(".", "os.bit", index, "")
+  failed = failed + selfCheck(!ok4, "guessed at an ambiguous basename with no context")
+  let (_r5, ok5) = resolveToken(".", "os.bit", index, "runtime/root/floats.bit")
+  failed = failed + selfCheck(!ok5, "used a context inconsistent with the token's own basename")
+  return failed
+}
+
+fn selfTestHedges(): int {
+  let failed = 0
+  let text = "Rewrite it (the two functions, ~line 591/599) for the new arithmetic. `allocString` (~line 510) additionally. Six funnels (~444/452), (~392/400)."
+  let hs = extractHedges(text)
+  failed = failed + selfCheck(len(hs) == 4, "did not find exactly 4 hedge markers")
+  if (len(hs) == 4) {
+    failed = failed + selfCheck(hs[0].lineSpecRaw == "591/599", "misparsed a two-value ~line hedge")
+    failed = failed + selfCheck(hs[1].lineSpecRaw == "510", "misparsed a single-value ~line hedge")
+    failed = failed + selfCheck(hs[2].lineSpecRaw == "444/452", "misparsed a bare parenthesized hedge")
+    failed = failed + selfCheck(hs[3].lineSpecRaw == "392/400", "misparsed the second bare parenthesized hedge")
+  }
+  failed = failed + selfCheck(len(extractHedges("the kernel rounded a 1us sleep to ~75us and the shim reserves ~300 bytes")) == 0,
+    "wrongly treated a duration/count as a line hedge")
   return failed
 }
 
 // Runs BEFORE the real scan, on synthetic text, so a scanner bug is caught
-// before it silently mis-scores spec/FMT.md — mirrors tests/bit/spec/
-// specgrammar.bit's own selfTest in spirit and in structure.
+// before it silently mis-scores a real document.
 fn selfTest(): int {
-  return selfTestExtract() + selfTestAssociation() + selfTestDecls() + selfTestSegments()
+  return selfTestPathTokens() + selfTestAssociation() + selfTestDecls() + selfTestSegments() +
+    selfTestResolve() + selfTestHedges()
 }
 
 fn main() {
@@ -525,33 +761,29 @@ fn main() {
     eprint("fmtcitations: SELFTEST FAILED — ${selfFailed} case(s); aborting before the real scan\n")
     osExit(1)
   }
-
   let root = repoRoot()
-  let docPath = "${root}/spec/FMT.md"
-  let docText = readFile(docPath) catch e {
-    die("cannot read ${docPath}: ${e.message()}")
-    ""
+  let rows = docRows()
+  let sc = Scan{citations: 0, boundsChecked: 0, verified: 0, bareMentions: 0, hedges: 0, hedgesChecked: 0, failures: 0}
+  let perDocSummaries = []string(0)
+  for row of rows {
+    let (rowCitations, rowHedges, rowFailures) = checkDocument(sc, root, row)
+    if (rowCitations + rowHedges < row.minCitations) {
+      report(sc, "${row.docPath}: only ${rowCitations} citation(s) and ${rowHedges} hedge(s) found, want >= ${row.minCitations} — the scanner regressed or the doc lost its citations")
+    }
+    perDocSummaries = append(perDocSummaries,
+      "${row.docPath}: ${rowCitations} citation(s), ${rowHedges} hedge(s), ${rowFailures} failure(s)")
   }
-  if (len(docText) > maxDocBytes) {
-    die("${docPath} is ${len(docText)} bytes, over the ${maxDocBytes} bound")
-  }
-
-  let citations = extractCitations(docText)
-  let sc = Scan{citations: 0, boundsChecked: 0, verified: 0, bareMentions: 0, failures: 0}
-  for cit of citations {
-    checkCitation(sc, root, docText, cit)
-  }
-
-  if (sc.citations < minCitationsFloor) {
-    report(sc, "only ${sc.citations} file:line citation(s) found in spec/FMT.md, want >= ${minCitationsFloor} — the scanner regressed or the doc lost its citations")
+  let totalCitations = sc.citations + sc.hedges
+  if (totalCitations < minTotalCitationsFloor) {
+    report(sc, "only ${totalCitations} total citation(s) (exact + hedged) found across ${len(rows)} document(s), want >= ${minTotalCitationsFloor}")
   }
   if (sc.verified < minVerifiedFloor) {
     report(sc, "only ${sc.verified} citation(s) symbol-verified, want >= ${minVerifiedFloor} — the association heuristic regressed")
   }
-
+  let summary = join(perDocSummaries, "; ")
   if (sc.failures > 0) {
-    eprint("fmtcitations: FAILED — ${sc.failures} finding(s) over ${sc.citations} citation(s) (${sc.boundsChecked} bounds-checked, ${sc.verified} symbol-verified, ${sc.bareMentions} bare file mention(s))\n")
+    eprint("fmtcitations: FAILED — ${sc.failures} finding(s) over ${len(rows)} document(s) scanned, ${totalCitations} citation(s) total (${sc.citations} exact, ${sc.hedges} hedged, ${sc.boundsChecked} bounds-checked, ${sc.hedgesChecked} hedges-checked, ${sc.verified} symbol-verified, ${sc.bareMentions} bare mention(s)) — ${summary}\n")
     osExit(1)
   }
-  print("fmtcitations: ok — ${sc.citations} citation(s) found, ${sc.boundsChecked} bounds-checked, ${sc.verified} symbol-verified (function/const declaration confirmed inside cited range), ${sc.bareMentions} bare file mention(s), 0 failure(s)\n")
+  print("fmtcitations: ok — ${len(rows)} document(s) scanned, ${totalCitations} citation(s) total (${sc.citations} exact, ${sc.hedges} hedged, ${sc.boundsChecked} bounds-checked, ${sc.hedgesChecked} hedges-checked, ${sc.verified} symbol-verified, ${sc.bareMentions} bare mention(s)), 0 failure(s) — ${summary}\n")
 }
