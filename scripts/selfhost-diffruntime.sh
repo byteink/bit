@@ -655,6 +655,12 @@ while [ "$i" -lt "$NMOD" ]; do
 done
 
 bad=0
+# Real divergence and a broken-harness floor violation always win and exit 1.
+# A pure timeout decided nothing -- exit 2 (could-not-decide), tracked
+# separately from bad so it can never read as a divergence that was never
+# observed (family convention: x64gate.sh, diffverdict.sh,
+# selfhost-diffall.sh, #3351/#3377/#3380).
+timedout=0
 
 if [ "$total" -lt "$MIN_FILES" ]; then
   echo "diffruntime: FAIL — walked $total file(s), floor is $MIN_FILES." >&2
@@ -677,7 +683,7 @@ if [ -s "$work/oracletimeout" ]; then
   # skip count would hide that behind a number meaning "the oracle declined it".
   echo "diffruntime: FAIL — the pinned stage0 HUNG (corpus reduced, not verified):" >&2
   sed 's/^/  /' "$work/oracletimeout" >&2
-  bad=1
+  timedout=1
 fi
 
 # Reported, not failed — the oracle is a published immutable binary and no change
@@ -693,7 +699,7 @@ fi
 if [ -s "$work/timeout" ]; then
   echo "diffruntime: FAIL — no verdict (not a match):" >&2
   sed 's/^/  /' "$work/timeout" >&2
-  bad=1
+  timedout=1
 fi
 
 # NO UNEXPLAINED DIVERGENCE IS PERMITTED. Any runtime file whose IR differs
@@ -748,7 +754,7 @@ fi
 if [ -s "$work/mod_oracletimeout" ]; then
   echo "diffruntime: FAIL — the pinned stage0 HUNG building a runtime module (corpus reduced, not verified):" >&2
   sed 's/^/  /' "$work/mod_oracletimeout" >&2
-  bad=1
+  timedout=1
 fi
 
 if [ -s "$work/mod_oraclecrash" ]; then
@@ -759,7 +765,7 @@ fi
 if [ -s "$work/mod_timeout" ]; then
   echo "diffruntime: FAIL — no verdict building a runtime module (not a match):" >&2
   sed 's/^/  /' "$work/mod_timeout" >&2
-  bad=1
+  timedout=1
 fi
 
 sort -u "$work/mod_mismatch" >"$work/mod_mismatch.sorted"
@@ -779,6 +785,7 @@ if [ -s "$work/mod_mismatch.sorted" ]; then
 fi
 
 [ "$bad" -ne 0 ] && exit 1
+[ "$timedout" -ne 0 ] && exit 2
 
 modwhat="byte-identical"
 { [ "$ATOMIC_ISA" = aarch64 ] || [ "$ATOMIC_ISA" = x86_64 ]; } && modwhat="atomic-width-signature-identical"
