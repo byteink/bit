@@ -214,9 +214,24 @@
 
 // True if `addr` is present. Probes until an empty slot, which terminates
 // because the load factor is held below 100%. Bounded by `ncap` regardless.
+//
+// THE SENTINEL GUARD IS ABOUT THE QUERY, NOT THE ENTRIES, and that distinction
+// is the whole bug it fixes (found by #3177's enumerated differential, present
+// on every build before it). `idxEmpty`/`idxTombstone`'s own comment argues
+// that 0 and 1 "cannot collide with a real entry" — true, and irrelevant here:
+// `idxContains` is asked about ARBITRARY integers, not about entries. A query
+// for 1 walks the probe chain comparing `v == addr`, and the first TOMBSTONE it
+// meets stores exactly 1 — so `gcOwns(g, 1)` answered TRUE against a table that
+// had ever had a removal, disagreeing with `gcOwnsLinear`. `gcMarkRoot`'s
+// `[gcLoAddr, gcHiAddr)` gate hides it from the mark path, but
+// `runtime/root/iface.bit`'s `dynTypeOf` calls `gcOwns` with no bound at all
+// and would go on to read a header at `1 - gcHeaderSize`.
+//
+// Rejecting both values up front is exact rather than conservative: a real key
+// is a body or span address, 8-aligned and non-zero, so neither can be one.
 @nosplit fn idxContains(g: *i64, addr: int): bool {
   let ncap = *(g + gcIndexCap)
-  if (ncap == 0) {
+  if (ncap == 0 || addr == idxTombstone) {
     return false
   }
   let table = *(g + gcIndexAddr)
@@ -408,3 +423,62 @@
     probes = probes + 1
   }
 }
+
+// ---------------------------------------------------------------------------
+// #3147/#3177: WHY `gcOwns` STILL DOES NOT READ THE BITMAP — three findings
+// ---------------------------------------------------------------------------
+//
+// #3177 built the reader described above (mask to the span, find the span,
+// read the class and the occupied-slot bit) and it is REVERTED. The ANSWER was
+// right: an enumerated 9832-address differential against `gcOwnsLinear`
+// (`tests/stress/gcslotbitmap`) reported 0 mismatches, and a shadow-mode build
+// that computed both answers on `bench/cases/json` disagreed 0 times. What
+// defeated it was everything around the answer, and all three findings are
+// recorded here because each one will bite the next attempt.
+//
+// 1. THE MASK CANNOT DECIDE SPAN-BACKED-NESS, AND NOTHING ELSE IN THE RUNTIME
+// CAN EITHER. `gcOwns` takes ARBITRARY integers: the conservative stack scan
+// (ABI.md §5) pushes every raw machine word of a parked frame through
+// `gcMarkConservative`, and `gcMarkRoot`'s `[gcLoAddr, gcHiAddr)` gate is a
+// body-address hull, not a map of what is mapped — reclaimed spans are
+// `munmap`ped inside it (#2375), large blocks are separate mappings, and both
+// reserves' chunks sit between them. So masking to a span base and
+// DEREFERENCING it is a wild read in the collector. There is no O(1) structure
+// today that answers "is this address inside a currently-mapped span": the
+// reserve chunk list is O(chunks) (99 on `json`), and per-class span lists are
+// O(spans). A correct reader needs a real span-presence structure keyed on the
+// MAPPING's lifetime, which needs stored words — and `gcWords` (38) and
+// `heapWords` (41) are both full and boot-pinned.
+//
+// 2. A SPAN BASE IS A VALUE A LIVE OBJECT BODY CAN TAKE, so reusing this table
+// for presence keys must TAG them. "No body inside a span equals its base" is
+// true and is the wrong question: a body inside span S can equal the base of
+// span S+1. Solve `spanSkip(cs)*cs + k*cs + gcHeaderSize == allocSpanBytes` and
+// classes 0, 1 and 2 each have an in-range solution — class 0 at slot 16114 of
+// 16118, class 1 at 8121 of 8123, class 2 at 4076 of 4077. Untagged, the
+// presence probe hits those bodies and dereferences the NEXT span, which may be
+// unmapped. `key = base + 1` separates the populations by residue mod 8 (bodies
+// are `slotBase + gcHeaderSize`, both multiples of 8) and costs nothing.
+//
+// 3. THE MARK PATH HAS A STACK BUDGET, AND `bench/cases/json` IS ALREADY AT IT.
+// A task stack is `schedStackBytes` = 65536 bytes, fixed, non-growable, and the
+// task descriptor is found by MASKING the stack pointer to that boundary
+// (`runtime/sched/scratch.bit`, `runtime/sched/sched.bit`) — so an overflow does
+// not fault, it silently resolves to ANOTHER TASK's descriptor. The collector
+// runs at a safepoint on top of whatever user code was running, and json's
+// recursive-descent DOM parser is the deepest such stack in the bench suite.
+// The reverted reader added ~224 bytes to the deepest mark chain (`slotBitSet`
+// 0x50 + `allocSlotIndex` 0x60 + `allocSpanSlots` 0x30, measured with objdump on
+// `runtime_gc.o`/`runtime_alloc.o`) and json went from 12/12 clean on `main` to
+// crashing about half of all runs — with the ANSWER held at `main`'s, which is
+// what proves it is the frames and not the logic. Raising `schedStackBytes` to
+// 262144 as a diagnostic took it back to 7/8. Growing `idxGrow`'s 0x180 frame
+// into `gcHeapAlloc` (an earlier placement of the presence insert) reproduced
+// the same crash on the ALLOCATION path for the same reason.
+//
+// So the next attempt needs the stack budget addressed first, or a reader that
+// adds no frames at all — and it must not buy that by copying
+// `runtime/alloc/`'s span-layout arithmetic into this module, which is the
+// duplication `bitlang-ws/CLAUDE.md` records as having caused divergent safety
+// in `scripts/` ("a fix applied to a copy does not reach its siblings").
+
