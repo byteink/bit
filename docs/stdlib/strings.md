@@ -308,3 +308,26 @@ fn parseAmount(field: string): f64! {
   return strings.parseFloat(strings.trimSpace(field))?
 }
 ```
+
+## Formatting
+
+### `formatFloat(x: f64, decimals: int): string`
+
+`x` rendered to exactly `decimals` digits after the point, rounding half away
+from zero with carry (`formatFloat(9.999, 2)` is `"10.00"`). `decimals < 0` is
+treated as `0`, which omits the point entirely (`formatFloat(2.5, 0)` is
+`"3"`). The sign always comes from `x`, even when the rounded digits are all
+zero (`formatFloat(-0.004, 2)` is `"-0.00"`). `NaN` is `"NaN"`; the infinities
+are `"+Inf"` / `"-Inf"`. Never uses exponent notation.
+
+Works on the decimal text of `x`, not `x` scaled by a power of ten — scaling
+with binary floating-point loses digits (`i64(150.15 * 100.0)` is `15014`,
+not `15015`).
+
+```bit
+import { formatFloat } from "std/strings"
+
+fn priceLabel(cents: f64): string {
+  return "$" + formatFloat(cents, 2)
+}
+```
