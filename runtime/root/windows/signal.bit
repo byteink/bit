@@ -1,0 +1,347 @@
+// Windows fault-disposition provider for the SEAM 3 remainder (#3337, epic
+// #3322): mapping a hardware fault to the same Bit-visible panic ../linux and
+// ../darwin's SIGSEGV/SIGBUS/SIGTRAP/SIGILL dispositions produce, and a
+// native stack overflow to a diagnostic instead of a silent kill or a hang.
+//
+// ---------------------------------------------------------------------------
+// WINDOWS HAS NO SIGNALS — READ THIS BEFORE ../linux OR ../darwin's signal.bit
+// ---------------------------------------------------------------------------
+//
+// This is a genuine redesign, not a port, exactly as the ticket says. The
+// mechanism is `AddVectoredExceptionHandler`: a single, PROCESS-WIDE callback
+// invoked by the OS's exception dispatcher for EVERY structured exception in
+// the process (not filtered by exception code the way `sigaction` filters by
+// signal number), on the FAULTING THREAD, before any frame-based (SEH/C++)
+// handler gets a chance. `vehHandler` below therefore filters by
+// ExceptionCode itself and returns EXCEPTION_CONTINUE_SEARCH (0) for
+// anything it does not explicitly own — the same discipline ../darwin/
+// signal.bit's header argues for SIGTRAP (not stealing a debugger's own
+// breakpoint), generalised here to every exception code this file does not
+// name, since VEH has no per-code filter to lean on.
+//
+// NO ALTERNATE STACK, AND THAT IS NOT AN OVERSIGHT. `sigaltstack` exists
+// because a POSIX signal handler runs ON THE INTERRUPTED THREAD'S OWN
+// STACK by default, which is unusable when the fault IS that stack running
+// out. Windows' VEH callback ALSO runs on the faulting thread's own stack —
+// there is no OS-level alternate-stack primitive for it at all — but the
+// kernel reserves a small amount of extra, uncommitted stack specifically so
+// a stack-overflow handler has somewhere to run (MSDN's own description of
+// `SetThreadStackGuarantee`). `winInstallStackGuarantee` below asks for that
+// reserve explicitly, once per OS thread, before the thread can fault.
+// EMPIRICALLY VERIFIED end to end on mustafa-desktop-win (native Windows 11
+// Pro, AMD64, not WSL): a `SetThreadStackGuarantee(65536)` call followed by
+// unbounded recursion on the SAME thread reaches `AddVectoredExceptionHandler`'s
+// callback with `STATUS_STACK_OVERFLOW`, and the callback successfully runs
+// real code (an `fprintf`-class call, strictly more stack-hungry than this
+// file's `writeConst`) and calls `ExitProcess` — not a hang, not a silent
+// kill. See the per-function comments below for the exact probe.
+//
+// TWO WINDOWS EXCEPTION CODES, NOT DISTINGUISHED BY HEURISTIC LIKE THE OTHER
+// TWO PLATFORMS. ../darwin and ../linux get exactly ONE fault signal
+// (SIGSEGV, on BSD/Linux alike) for both "a green task's own guarded stack
+// ran out" and "an ordinary bad pointer", so their `segvHandler` has to
+// GUESS which one happened by comparing the faulting address and the saved
+// `sp` against a known stack floor. Windows hands this file the answer for
+// free in the ONE case that matters most: the kernel raises the DISTINCT
+// `STATUS_STACK_OVERFLOW` (0xC00000FD) — never `STATUS_ACCESS_VIOLATION`
+// (0xC0000005) — specifically when a thread writes into ITS OWN registered
+// guard page (the TEB-tracked native stack). EMPIRICALLY VERIFIED (see
+// `vehHandler`'s comment): a real overflow on a real thread delivered
+// `ExceptionCode == 0xC00000FD`, not `0xC0000005`.
+//
+// BUT A BIT GREEN TASK'S STACK IS NOT THE OS THREAD'S NATIVE STACK, SO THIS
+// FILE STILL NEEDS ../darwin's HEURISTIC FOR THAT CASE. Every green task
+// (including `bit_main`'s own task) runs on a separately `mapGuardedStack`'d
+// region (../boot.bit) whose guard hole is `VirtualProtect(..., PAGE_NOACCESS)`
+// (../../alloc/windows/pages.bit's `protectPages`) — an ordinary inaccessible
+// mapping the kernel has no notion is "a stack", NOT the special `PAGE_GUARD`
+// region tied to a thread's own TEB. So a green task overrunning ITS stack
+// raises the SAME generic `STATUS_ACCESS_VIOLATION` a bad pointer would, and
+// `vehHandler` classifies it exactly the way ../darwin's `segvHandler` does:
+// compare the faulting address and the saved `Rsp` against `mainStackBaseAddr`
+// / `schedTaskOnStack`, with the same accepted false-negative this runtime
+// already lives with on the other two platforms (#2433's guard-hole-width
+// gap; not this ticket's to fix). `STATUS_STACK_OVERFLOW` is therefore the
+// DEFENSIVE case here — the boot/worker OS thread's OWN native stack
+// (`threadStackBytes`, 16 MiB) running out before any task ever switches onto
+// it, e.g. a scheduler bug — not the path ordinary user recursion takes.
+// Both are handled, both point at the identical `classifyOverflowTrap`
+// (a straight port of ../darwin's, unchanged), because neither carries a
+// faulting address that means anything as a MEMORY location — `sp` is the
+// only useful signal either way, exactly ../darwin's `trapHandler`'s own
+// SIGTRAP/SIGILL case.
+//
+// EVERY STRUCT OFFSET AND EXCEPTION-CODE CONSTANT BELOW WAS READ OFF A REAL
+// RUN ON mustafa-desktop-win, NOT FROM MEMORY. This Mac has no Windows SDK to
+// `offsetof` against (../darwin/signal.bit's technique), so the verification
+// instead cross-compiled a probe with mingw-w64 (`x86_64-w64-mingw32-gcc`,
+// throwaway Docker container, removed after) against `<windows.h>`'s real
+// `CONTEXT`/`EXCEPTION_RECORD`/`EXCEPTION_POINTERS`, copied the .exe to the
+// box over SSH, and ran it natively:
+//
+//   sizeof(CONTEXT)=1232 offsetof(Rsp)=152 offsetof(Rip)=248 offsetof(ContextFlags)=48
+//   sizeof(EXCEPTION_RECORD)=152 ExceptionCode@0 ExceptionFlags@4 ExceptionAddress@16
+//     NumberParameters@24 ExceptionInformation@32
+//   sizeof(EXCEPTION_POINTERS)=16 ExceptionRecord@0 ContextRecord@8
+//   EXCEPTION_ACCESS_VIOLATION=0xC0000005 EXCEPTION_STACK_OVERFLOW=0xC00000FD
+//   EXCEPTION_ILLEGAL_INSTRUCTION=0xC000001D EXCEPTION_BREAKPOINT=0x80000003
+//
+// A second probe installed a real `AddVectoredExceptionHandler` callback and
+// triggered BOTH scenarios for real: a null-pointer write gave
+// `code=0xC0000005 rsp=0xAA8D9FFC90 addr=0x0` (the handler's own `Rsp` read
+// landed 36 bytes from a value captured immediately before the fault on the
+// same thread — the offset discriminates, not vacuous); unbounded recursion
+// (with `SetThreadStackGuarantee(65536)` called first) gave
+// `code=0xC00000FD rsp=0xEA0C811F70 addr=0xEA0C811F90` and the handler ran to
+// completion and called `ExitProcess` cleanly. Both probes, and the mutation
+// (a deliberately wrong expected-value check), were scratch, not committed;
+// this comment and the ticket's evidence are the durable record.
+//
+// WHAT THIS DOES AND DOES NOT DO IN THE HANDLER, PER THE TICKET'S CONSTRAINT.
+// `vehHandler` and everything it calls (`classifyOverflowTrap`, the `emit*`
+// functions) are `@nosplit`: no allocation, no lock this runtime might
+// already hold (no lock is taken anywhere below — unlike ../darwin/../linux,
+// there is no altstack claim table here, because VEH needs no altstack), and
+// every path terminates via `rootExit(2)` directly — nothing here ever
+// returns `EXCEPTION_CONTINUE_EXECUTION` or attempts to resume the faulting
+// code. The only per-thread state this file touches is `winStackGuaranteeScratch`
+// (see its own comment for why a single shared word is sound) and the
+// module-scoped read-only stack-boundary state ../boot.bit already publishes
+// (`mainStackBaseAddr`, `schedStackBytes` via `alignUpStack`/`alignDownStack`).
+//
+// Ctrl+C (SIGINT's nearest analogue, `SetConsoleCtrlHandler`) is
+// DELIBERATELY NOT installed here. Matching "whatever the existing ports do
+// for interrupt" literally: neither ../linux/signal.bit nor
+// ../darwin/signal.bit installs ANY SIGINT disposition — both leave it at
+// the OS default (terminate the process), verified by `git grep -n
+// 'sigint\|SIGINT' runtime/root/{linux,darwin}` returning nothing. Windows'
+// own default Ctrl+C behaviour is the same shape (terminate the process via
+// `STATUS_CONTROL_C_EXIT`), so installing nothing here reproduces that
+// default rather than diverging from it. Separately, `SetConsoleCtrlHandler`
+// is NOT in `compiler/pesyms.bit`'s admitted Windows import surface (#3328) —
+// checked directly, it is absent from `windowsImports()` — so a custom
+// handler could not be added from this file alone without a shared compiler
+// change, which is out of this ticket's scope; filed as #3376 if a FUTURE
+// ticket wants graceful-shutdown-on-Ctrl+C rather than the current
+// terminate-by-default parity.
+
+import { schedTaskOnStack } from "../../sched"
+
+// `LONG WINAPI VectoredHandler(PEXCEPTION_POINTERS ExceptionInfo)` (winnt.h)
+// — the Win64 ABI this compilation unit already selects for every function
+// (../boot.bit's header). `first: i32` is `AddVectoredExceptionHandler`'s
+// `FirstHandler` — 1 so this runs before any handler a later
+// `AddVectoredExceptionHandler` call might add (none exists in this runtime,
+// but first-registered-runs-first is the correct posture for the one
+// process-wide fault reporter). `SetThreadStackGuarantee` takes a `PULONG`
+// (in/out `*i32`) — see `winInstallStackGuarantee` for why only the IN side
+// is used here. Both are in `compiler/pesyms.bit`'s admitted surface (#3328).
+extern fn AddVectoredExceptionHandler(first: i32, handler: *byte): *byte
+extern fn SetThreadStackGuarantee(stackSizeInBytes: *i32): i32
+
+// EXCEPTION_POINTERS (winnt.h): two 8-byte pointers. VERIFIED (see header).
+const excPointersRecordOff: int = 0
+const excPointersContextOff: int = 8
+
+// EXCEPTION_RECORD (winnt.h): `ExceptionCode` is a DWORD at offset 0 —
+// `vehHandler` reads it via `loadWord` (8 bytes) and masks to the low 32
+// bits rather than a narrower load, exactly the way `loadWord` is already
+// used everywhere else in this tree for a field smaller than a word (the
+// x86-64 read is little-endian, so this is exact, not approximate). Windows
+// packs the general free-form fault information at `ExceptionInformation[]`
+// (offset 32, each entry 8 bytes); index 1 is the faulting virtual address
+// for BOTH `EXCEPTION_ACCESS_VIOLATION` and `EXCEPTION_STACK_OVERFLOW`
+// (index 0 is the read/write/DEP discriminator, unused here — VERIFIED live:
+// the access-violation probe's NumberParameters read back 2, matching this
+// layout).
+const excRecordCodeOff: int = 0
+const excRecordInfo1Off: int = 40 // ExceptionInformation[1] = 32 + 1*8
+
+// CONTEXT (winnt.h, AMD64): `Rsp` at offset 152. VERIFIED (see header).
+const ctxRspOff: int = 152
+
+// The three exception codes this file owns. VERIFIED (see header) — these
+// are NTSTATUS values, not signal numbers, hence the `0xC0000000`-class
+// magnitude; `int` (64-bit) holds them with no sign ambiguity, unlike
+// reading them back as a narrower signed type would.
+const excAccessViolation: int = 0xC0000005
+const excStackOverflow: int = 0xC00000FD
+const excIllegalInstruction: int = 0xC000001D // #2432/#2946's x64 `ud2` trap
+
+// `EXCEPTION_CONTINUE_SEARCH` — hand the exception to the next handler
+// (another VEH, an SEH frame, or the OS default action) unchanged. This file
+// never returns `EXCEPTION_CONTINUE_EXECUTION` (-1): every code it owns ends
+// in `rootExit`, and every code it does not own must be left for whatever
+// (if anything) is meant to see it — a debugger's own breakpoint, first-
+// chance handling, or the OS's own unhandled-exception report.
+const vehContinueSearch: i32 = 0
+
+// The floor every real stack mapping in this runtime sits above — identical
+// role and value to ../darwin/signal.bit's `stackAddrFloor` (same constant,
+// same purpose: reject a fault at a low, obviously-not-a-stack address
+// before it can coincidentally match an uninitialized `mainStackBaseAddr`
+// of 0 or a near-zero read).
+const stackAddrFloor: int = 268435456
+
+const overflowNone: int = 0
+const overflowMain: int = 1
+const overflowSpawned: int = 2
+
+// Reused for BOTH `EXCEPTION_STACK_OVERFLOW` and `EXCEPTION_ILLEGAL_INSTRUCTION`
+// — neither carries a faulting MEMORY address (a `ud2` does not fault on
+// memory, and `STATUS_STACK_OVERFLOW`'s own faulting address is already the
+// thread's own native guard page, not a Bit stack boundary), so `sp` alone is
+// the only useful signal — a straight port of ../darwin/signal.bit's
+// `classifyOverflowTrap`, unchanged algorithm: `alignDownStack(sp)` lands on
+// a spawned task's stack FLOOR regardless of where in the granule `sp`
+// currently sits (a spawned task's whole stack fits one `schedStackBytes`
+// granule), and `schedTaskOnStack` (../../sched, already `@symbol`-pinned as
+// `bit_rt_port_sched_task_on_stack`) reads the tag at that floor to tell a
+// live Bit stack from a coincidental address.
+@nosplit fn classifyOverflowTrap(sp: int): int {
+  let floorBase = alignDownStack(sp)
+  if (floorBase <= stackAddrFloor) {
+    return overflowNone
+  }
+  if (floorBase == mainStackBaseAddr) {
+    return overflowMain
+  }
+  if (schedTaskOnStack(floorBase) != 0) {
+    return overflowNone
+  }
+  return overflowSpawned
+}
+
+// "bit: stack overflow\n" — identical packed constants to ../darwin/
+// ../linux/signal.bit's own `emitMainStackOverflow`, reused verbatim: the
+// TEXT must match across all three platforms (the ticket's own acceptance
+// criterion), and it is platform-independent ASCII, so the same packed words
+// are correct here unchanged.
+@nosplit fn emitMainStackOverflow() {
+  writeConst(stderrFd, 7022364301234301282, 8) // "bit: sta"
+  writeConst(stderrFd, 7382074298558606179, 8) // "ck overf"
+  writeConst(stderrFd, 175599468, 4)           // "low\n"
+  rootExit(2)
+}
+
+// "bit: stack overflow in a spawned task\n" — same reuse as above.
+@nosplit fn emitSpawnedStackOverflow() {
+  writeConst(stderrFd, 7022364301234301282, 8) // "bit: sta"
+  writeConst(stderrFd, 7382074298558606179, 8) // "ck overf"
+  writeConst(stderrFd, 6998715218729070444, 8) // "low in a"
+  writeConst(stderrFd, 7234309835455492896, 8) // " spawned"
+  writeConst(stderrFd, 11456613544992, 6)      // " task\n"
+  rootExit(2)
+}
+
+// "bit: fatal signal: segmentation fault\n" / "bit: fatal signal: illegal
+// instruction\n" — the first two REUSE ../darwin/signal.bit's exact packed
+// constants (same text requirement as the overflow messages above). The
+// third, "bit: fatal signal: stack overflow\n", is NEW: Windows' distinct
+// `STATUS_STACK_OVERFLOW` code has no POSIX-signal equivalent for
+// ../darwin/../linux to have already named, and it is reached ONLY when
+// `classifyOverflowTrap` could not attribute the native-thread overflow to a
+// known Bit stack (see the header — the defensive case, not the common one).
+@nosplit fn emitFatalSignal(code: int) {
+  writeConst(stderrFd, 8386096269746268514, 8) // "bit: fat"
+  writeConst(stderrFd, 7020662571717913697, 8) // "al signa"
+  if (code == excAccessViolation) {
+    writeConst(stderrFd, 7308611455713032812, 8) // "l: segme"
+    writeConst(stderrFd, 2336927755366659182, 8) // "ntation "
+    writeConst(stderrFd, 11495152116070, 6)      // "fault\n"
+  } else if (code == excIllegalInstruction) {
+    writeConst(stderrFd, 7450480371430341228, 8) // "l: illeg"
+    writeConst(stderrFd, 8247343735669550177, 8) // "al instr"
+    writeConst(stderrFd, 2936174556767093, 7)    // "uction\n"
+  } else {
+    writeConst(stderrFd, 7738135737528236652, 8) // "l: stack"
+    writeConst(stderrFd, 8028904877209317152, 8) // " overflo"
+    writeConst(stderrFd, 2679, 2)                // "w\n"
+  }
+  rootExit(2)
+}
+
+// The vectored exception handler — see the header for the full contract.
+// BOUNDED (Power of 10 rule 2): every path is a fixed number of loads and
+// comparisons followed by a call that never returns; there is no loop.
+@nosplit fn vehHandler(info: *byte): i32 {
+  let recAddr = loadWord(int(info) + excPointersRecordOff)
+  let ctxAddr = loadWord(int(info) + excPointersContextOff)
+  let code = loadWord(recAddr + excRecordCodeOff) & 0xFFFFFFFF
+  let sp = loadWord(ctxAddr + ctxRspOff)
+
+  if (code == excAccessViolation) {
+    // The generic fault path — a green task's guarded stack (the common
+    // case) or an ordinary bad pointer. Same double-check as ../darwin's
+    // `segvHandler`: the faulting address AND the saved `sp` must both land
+    // on the same stack-granule boundary before this is trusted as an
+    // overflow rather than an unrelated fault that happens to be near one.
+    let faultAddr = loadWord(recAddr + excRecordInfo1Off)
+    let fromFault = alignUpStack(faultAddr)
+    let fromSp = alignUpStack(sp)
+    if (fromFault == fromSp && fromFault > stackAddrFloor) {
+      if (fromFault == mainStackBaseAddr) {
+        emitMainStackOverflow()
+      } else {
+        emitSpawnedStackOverflow()
+      }
+      return vehContinueSearch
+    }
+    emitFatalSignal(code)
+    return vehContinueSearch
+  }
+
+  if (code == excStackOverflow || code == excIllegalInstruction) {
+    let verdict = classifyOverflowTrap(sp)
+    if (verdict == overflowMain) {
+      emitMainStackOverflow()
+      return vehContinueSearch
+    }
+    if (verdict == overflowSpawned) {
+      emitSpawnedStackOverflow()
+      return vehContinueSearch
+    }
+    emitFatalSignal(code)
+    return vehContinueSearch
+  }
+
+  // Not ours — a debugger breakpoint (EXCEPTION_BREAKPOINT), a first-chance
+  // notification, or anything else. Hand it on unchanged.
+  return vehContinueSearch
+}
+
+// Install `vehHandler` process-wide. Call once, before any worker thread
+// exists (../boot.bit's step 1b) — matching where ../darwin/../linux install
+// their own fatal-signal dispositions, before anything that can allocate or
+// run user code.
+@nosplit fn installFatalSignalHandlers() {
+  AddVectoredExceptionHandler(i32(1), entryOf(vehHandler))
+}
+
+// `SetThreadStackGuarantee`'s `PULONG` in/out parameter, written once per
+// call with the SAME constant (`stackGuaranteeBytes`) by every caller — the
+// boot thread (../boot.bit step 1b) and every worker OS thread
+// (../boot.bit's `workerBody`, once each, since the guarantee is per-thread
+// and not inherited by a new `CreateThread`). MODULE STATE, NOT A LOCAL:
+// `ptrOf` addresses a module cell (§11.11), the same constraint
+// ../boot.bit's `winThreadIdScratch` documents. SAFE AS A SINGLE SHARED WORD
+// even under concurrent worker startup, unlike `winWrittenScratch` in
+// ./io.bit (which genuinely needs per-worker slots because its value is READ
+// BACK and differs per call): every writer here writes the IDENTICAL
+// constant, so two threads racing on this word can only ever produce that
+// same value — there is no interleaving that yields a wrong result.
+let winStackGuaranteeScratch: i32 = 0
+
+// 64 KiB — the exact value EMPIRICALLY VERIFIED sufficient on
+// mustafa-desktop-win for `vehHandler` (via `AddVectoredExceptionHandler`) to
+// run to completion and call `ExitProcess` after a real stack-overflow
+// exception on the same thread (see the header's probe). Matches
+// ../darwin/../linux/signal.bit's own `sigAltStackBytes` convention (same
+// granule, same reasoning: comfortably above what a minimal `@nosplit`
+// handler needs).
+const stackGuaranteeBytes: int = 65536
+
+@nosplit fn winInstallStackGuarantee() {
+  winStackGuaranteeScratch = i32(stackGuaranteeBytes)
+  SetThreadStackGuarantee(ptrOf(winStackGuaranteeScratch))
+}
