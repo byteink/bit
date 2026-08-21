@@ -289,16 +289,37 @@ whydied() {
 # reported. diags never skips (SKIPLABEL empty) — a valid file renders empty on
 # both sides and a rejected one renders the same diagnostic on both, so nothing
 # is excluded; ast/tokens skip a file the oracle could not lex/parse.
+#
+# A timeout on EITHER side is its own counter, checked before it can be
+# mislabeled (#3378). Two prior gaps: BIT2's exit code was never read at all,
+# so a BIT2 build killed by the alarm left $b2 holding partial/empty output
+# that was then compared as TEXT against $seed and scored a fabricated
+# MISMATCH; and for diags (SKIPLABEL="") an ORACLE timeout fell straight
+# through the skip check (which never fires when SKIPLABEL is empty) into the
+# same fake-MISMATCH path. rc==142 is alarmrun.sh's own contract for "the
+# alarm fired" (128+SIGALRM) -- see its header -- so it is checked first, on
+# both legs, before either the SKIPLABEL decline or the text comparison runs.
 run_basic() {
-  match=0 mismatch=0 skip=0 firstbad=""
+  match=0 mismatch=0 skip=0 timeout=0 firstbad=""
   for f in $(find $CORPUS -name '*.bit' | sort); do
     seed=$(alarmrun "$ORACLE" "$FLAG" "$f")
     rc=$?
+    if [ "$rc" -eq 142 ]; then
+      echo "$LABEL: ORACLE timed out after ${TIMEOUT}s on $f" >&2
+      timeout=$((timeout + 1))
+      continue
+    fi
     if [ -n "$SKIPLABEL" ] && [ "$rc" -ne 0 ]; then
       skip=$((skip + 1))
       continue
     fi
     b2=$(alarmrun "$BIT2" "$FLAG" "$f")
+    rc=$?
+    if [ "$rc" -eq 142 ]; then
+      echo "$LABEL: BIT2 timed out after ${TIMEOUT}s on $f" >&2
+      timeout=$((timeout + 1))
+      continue
+    fi
     if [ "$seed" = "$b2" ]; then
       match=$((match + 1))
     else
@@ -308,9 +329,9 @@ run_basic() {
   done
 
   if [ -n "$SKIPLABEL" ]; then
-    echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch SKIP($SKIPLABEL)=$skip"
+    echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch SKIP($SKIPLABEL)=$skip TIMEOUT=$timeout"
   else
-    echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch"
+    echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeout"
   fi
 
   # A phase that measured nothing must not pass (#1516). On an empty or unfindable
@@ -320,11 +341,26 @@ run_basic() {
     exit 2
   fi
 
+  # A real divergence wins over an undecided count: any observed mismatch is
+  # evidence, regardless of how many files elsewhere also timed out (matches
+  # the family convention restored in selfhost-diffsafepoints.sh, #3351).
   if [ -n "$firstbad" ]; then
     echo "first divergence: $firstbad"
     diff <(alarmrun "$ORACLE" "$FLAG" "$firstbad") <(alarmrun "$BIT2" "$FLAG" "$firstbad") | head -20
     exit 1
   fi
+
+  # A timeout decided nothing -- those files were never differentially
+  # compared, so the run cannot be called green, but it is not a divergence
+  # either. Exit 2 (could-not-decide) keeps it visible without claiming a
+  # divergence that was never observed.
+  if [ "$timeout" -gt 0 ]; then
+    echo "UNDECIDED: $timeout file(s) timed out after ${TIMEOUT}s on one side and were NOT compared."
+    echo "           This is not a pass. Re-run on a quieter host, or raise the timeout."
+    exit 2
+  fi
+
+  exit 0
 }
 
 # types row body: a timeout is not evidence — a bit killed by the alarm produced
