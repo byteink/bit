@@ -99,3 +99,22 @@ fn sameLocation(a: string, b: string): bool {
   return clean(a) == clean(b)
 }
 ```
+
+### `contains(root: string, p: string): bool`
+
+Whether `p` names a location inside (or equal to) `root`, after both are
+lexically normalized with `clean`. Comparison is by whole path component, not
+by raw character prefix, so `contains("/a/b", "/a/bc")` is `false` even though
+the string `"/a/bc"` starts with `"/a/b"`. A path is always inside itself.
+
+```bit
+import { contains } from "std/path"
+
+fn isUnderSiteRoot(root: string, requested: string): bool {
+  return contains(root, requested)
+}
+
+fn escapesRoot(root: string, requested: string): bool {
+  return !contains(root, requested)
+}
+```
