@@ -183,9 +183,9 @@ grep -B2 'max-nesting'  "$LOG" | grep -A1 'E0203\]' | grep '\-\->'
 ## E0202 `max-params` — FIX, OR RAISE PER-FUNCTION WITH A NAMED EXTERNAL CONTRACT
 
 > `function has ${n} params, limit is 5`
-> hint: `group them into a struct, or raise the limit with `// bit:lint max-params=${n} -- <reason>``
+> hint: `group them into a class, or raise the limit with `// bit:lint max-params=${n} -- <reason>``
 
-**Decision: fix by default — group the parameters into a struct, exactly as
+**Decision: fix by default — group the parameters into a class, exactly as
 the rule's own hint says.** Measured overage is modest (6–8 against a limit
 of 5; nothing pathological) and concentrated in codegen instruction
 selection/encoding (`arm64encode.bit`, `x64select.bit`, `arm64select.bit`,
@@ -198,7 +198,7 @@ For that shape, a file-scoped raise is defensible **only if the reason names
 the specific external document or spec section it mirrors** — "matches
 AAPCS64 §6.8.2, encoding table C4-4" is a real reason; "already has 7 params"
 or "hard to refactor" is not and must be rejected on review. If in doubt,
-default to fix: a params struct costs nothing at the ISA-encoder call sites
+default to fix: a params class costs nothing at the ISA-encoder call sites
 this repo already uses that pattern for elsewhere.
 
 **Test:**

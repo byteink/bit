@@ -54,7 +54,7 @@ fn drain<T: Reader & Closer>(src: T): string {
 Type parameters attach to structs, interfaces, and type aliases too.
 
 ```bit
-struct Box<T> {
+class Box<T> {
   export value: T
 }
 

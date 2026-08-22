@@ -16,7 +16,7 @@ Concatenating in a loop copies the whole string every time, which turns an
 
 ### `Builder`
 
-An append-only string buffer. A struct, so it is a reference type: its methods
+An append-only string buffer. A class, so it is a reference type: its methods
 mutate it in place, and they also return it so calls can chain.
 
 ### `newBuilder(): Builder`

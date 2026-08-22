@@ -54,7 +54,7 @@ already uses. `--stats` prints the overrides in force (`<path>: <rule>=<n>` or
 | --- | --- | --- | --- |
 | E0200 | `max-file-lines` | 800 | The file has stopped being one idea. |
 | E0201 | `max-fn-lines` | 80 | The function does not fit on a screen; it cannot be checked by eye. |
-| E0202 | `max-params` | 5 | The call site has stopped being readable; group the arguments into a struct. |
+| E0202 | `max-params` | 5 | The call site has stopped being readable; group the arguments into a class. |
 | E0203 | `max-nesting` | 4 | This is almost always a missing early return. |
 | E0204 | `max-complexity` | 10 | Cyclomatic complexity - too many independent paths through one function to reason about. |
 | E0205 | `defer-in-loop` | - | A `defer` lexically inside a `while`/`for` runs at function exit, not loop exit - it holds whatever it acquired for the rest of the function. |
@@ -123,7 +123,7 @@ These need the resolver's per-node symbol table, so they land after phase 1.
   meaning silently changes the way a mid-block `let` has.
 - **`append-aliasing`** fires when `append`'s first argument resolves to a
   slice-typed **parameter** and the result is not assigned straight back to
-  that same parameter. It is deliberately narrow: never a struct field or a
+  that same parameter. It is deliberately narrow: never a class field or a
   call result, and it never tries to prove the caller actually reuses the
   slice afterward - the one shape it accepts as "this function owns it" is
   the exact `p = append(p, x)` reassignment. This is the rule most likely to

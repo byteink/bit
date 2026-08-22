@@ -499,7 +499,7 @@ testsbit_steps_for() {
   printf '%s' "${out}"
 }
 
-# Trims a struct-literal-shaped diff hunk `$1` (one field's worth of added
+# Trims a class-literal-shaped diff hunk `$1` (one field's worth of added
 # lines, `+` already stripped, comment/blank lines allowed anywhere) down to
 # its first and last non-comment, non-blank line, and requires the first to
 # open a NEW entry (starts with `$2`, e.g. `Step{name:`) and the last to close

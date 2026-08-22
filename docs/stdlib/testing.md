@@ -137,7 +137,7 @@ together.
 ```bit
 import { checkEq, checkDone } from "std/testing"
 
-struct Case { name: string, got: int, want: int }
+class Case { name: string, got: int, want: int }
 
 fn test_table() {
   defer checkDone()
@@ -202,7 +202,7 @@ fails when it returns normally instead. No `ok`/`notOk`/`failNow` call is
 needed inside it; the panic itself is the assertion.
 
 ```bit
-struct Stack {
+class Stack {
   items: []i64
 }
 

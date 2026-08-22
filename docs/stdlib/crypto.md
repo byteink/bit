@@ -45,7 +45,7 @@ import { Hash, digest } from "std/crypto"
 
 // A stand-in "digest": it remembers how many bytes it saw and returns a fixed
 // 4-byte tag. A real SHA-256 satisfies `Hash` the same way - by its methods.
-struct ByteCounter {
+class ByteCounter {
   seen: int
 }
 
@@ -621,7 +621,7 @@ import { Aead } from "std/crypto"
 // A stand-in "cipher", NOT real encryption: it XORs each byte with a fixed pad
 // and appends a one-byte XOR-fold as the "tag". A real AES-GCM satisfies `Aead`
 // the same way - by its four methods.
-struct XorSeal {
+class XorSeal {
   pad: byte
 }
 
@@ -741,7 +741,7 @@ fn decryptBlockHex(key: []byte, block: []byte): string! {
 
 ### `AesCipher`
 
-A key-scheduled AES cipher. Build one with `newAes` rather than a struct
+A key-scheduled AES cipher. Build one with `newAes` rather than a class
 literal - the constructor validates the key length and expands the round-key
 schedule once, which every `encryptBlock`/`decryptBlock` call then reuses. One
 value ciphers any number of blocks.
@@ -1195,7 +1195,7 @@ fn protect(key: []byte, nonce: []byte, msg: []byte, aad: []byte): string! {
 
 ### `AesGcm`
 
-A keyed AES-GCM cipher. Build one with `newGcm`, not a struct literal - the
+A keyed AES-GCM cipher. Build one with `newGcm`, not a class literal - the
 constructor validates the key length and derives the GHASH subkey. One value
 seals and opens any number of messages; it satisfies the `Aead` interface.
 
@@ -1887,7 +1887,7 @@ fn signAndVerify(priv: RsaPrivateKey, pub: RsaPublicKey, msg: []byte): bool! {
 
 An RSA public key: the exported `Nat` fields `n` (modulus) and `e` (public
 exponent). Build one with `rsaParsePublicKey` / `rsaParsePkcs1PublicKey`, or the
-struct literal.
+class literal.
 
 ### `RsaPrivateKey`
 
@@ -1895,8 +1895,8 @@ An RSA private key: the exported `Nat` fields `n` (modulus), `e` (public
 exponent, used for blinding), `d` (private exponent), and the CRT parameters
 `p`, `q`, `dp`, `dq` and `qinv`.
 
-Build one with `rsaParsePrivateKey` / `rsaParsePkcs1PrivateKey`. A struct literal
-must name **all eight** fields: `Nat` is itself a struct, and a struct-typed
+Build one with `rsaParsePrivateKey` / `rsaParsePkcs1PrivateKey`. A class literal
+must name **all eight** fields: `Nat` is itself a class, and a class-typed
 field has no zero value, so leaving one out is `E0083` (spec §13.4). There is no
 `RsaPrivateKey{ n: ..., e: ..., d: ... }` short form.
 
@@ -2252,7 +2252,7 @@ fn signAndVerify(curve: Curve, scalar: []byte, digest: []byte): bool! {
 
 An ECDSA public key: the exported `curve: Curve` it lives on and the public point
 `q: Point` (`q = d*G`). Build one from a SEC 1 point encoding with `ecdsaPublicKey`,
-or from a private key's `q` field via the struct literal.
+or from a private key's `q` field via the class literal.
 
 ### `EcdsaPrivateKey`
 
@@ -2832,7 +2832,7 @@ fn streamed(head: []byte, tail: []byte): int {
 
 ### `Blake2b`
 
-The streaming state for BLAKE2b. Build one with `newBlake2b` rather than a struct
+The streaming state for BLAKE2b. Build one with `newBlake2b` rather than a class
 literal - the constructor installs the initial state for the chosen output length
 and key. It satisfies `Hash`, so it carries the five streaming methods below.
 
@@ -3090,7 +3090,7 @@ fn protectSiv(key: []byte, nonce: []byte, msg: []byte, aad: []byte): string! {
 
 ### `AesGcmSiv`
 
-A keyed AES-GCM-SIV cipher. Build one with `newAesGcmSiv`, not a struct literal -
+A keyed AES-GCM-SIV cipher. Build one with `newAesGcmSiv`, not a class literal -
 the constructor validates the key length and expands the key-generating schedule.
 One value seals and opens any number of messages; it satisfies the `Aead`
 interface.

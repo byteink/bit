@@ -90,7 +90,7 @@ design, not as a separate policy:**
   first item **is** kept — `Program`'s use of `fmtPrintSeq`
   (`compiler/fmtdispatch.bit:20-24`) gates every item including the first the
   same way it gates the rest.
-- Inside a bracketed comma list (§5) — params, args, struct/field lists,
+- Inside a bracketed comma list (§5) — params, args, class/field lists,
   generics, composite literals, imports, tuples — no blank line is ever
   preserved between items or before the closing delimiter, regardless of the
   source (`fmtPrintCommaList`'s per-item and trailing `fmtGap` calls both pass
@@ -130,7 +130,7 @@ adjacent (same statement/item/clause) to the same code it preceded or
 followed in the source — the technique `#2879`'s per-file `asm`-region
 comparator used, generalized to any node kind.
 
-## 5. Bracketed comma lists (params, args, struct/field/variant lists, generics, composite literals, imports, tuples)
+## 5. Bracketed comma lists (params, args, class/field/variant lists, generics, composite literals, imports, tuples)
 
 **Rule** (`fmtPrintCommaList`, `compiler/fmtwrap.bit:158-297`, settled by `#2140`
 and `#2880` together): the list flattens onto one line only if **both** hold —
