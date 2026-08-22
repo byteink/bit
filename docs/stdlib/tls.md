@@ -170,7 +170,7 @@ A TLS 1.3 cipher-suite descriptor: `id` (the IANA code point), `name` (its
 registered string), `keyLen`/`ivLen`/`tagLen` (the AEAD's key, fixed record
 nonce, and tag sizes), and `hashLen` (the suite's HKDF / transcript-hash digest
 length). Obtain one from `tlsSuiteById` or `tlsSuitePreference` rather than a
-struct literal, so every field stays consistent with the code point.
+class literal, so every field stays consistent with the code point.
 
 ### `TLS_AES_128_GCM_SHA256: int`
 
@@ -397,7 +397,7 @@ This is the byte layer the client and server halves of the protocol are built
 from - it does no cryptography and drives no connection, it only turns handshake
 messages to and from bytes.
 
-Each message maps to a struct with exported fields. `encode*` serializes one
+Each message maps to a class with exported fields. `encode*` serializes one
 into a complete Handshake-framed message (the one-byte type, the three-byte
 length, then the body); `parse*` is the strict inverse. Parsing is written for
 hostile input: every `parse*` returns `T!`, a declared length that runs past the
@@ -890,7 +890,7 @@ fn handshake(config: TlsClientConfig, send: ([]byte) => ()!, recv: () => []byte!
 The set of trusted root certificates a server chain is verified up to (RFC 8446
 §4.4.2). Its `roots` are parsed X.509 certificates (`std/crypto`'s `Certificate`);
 build one from a PEM bundle with `newTrustStore`, or from already-parsed roots via
-the struct literal.
+the class literal.
 
 ### `newTrustStore(rootsPem: string): TrustStore!`
 
@@ -1512,14 +1512,14 @@ by `listen`.
 **Security note.** `insecureSkipVerify` true DISABLES server authentication: the
 connection then proves only that the peer holds the CertificateVerify key and
 completes the Finished MAC, not that it is the host it claims to be. Its zero
-value is `false`, so an omitted field or a hand-built struct literal still
+value is `false`, so an omitted field or a hand-built class literal still
 verifies. Set `insecureSkipVerify: true` only for tests or pinned-key scenarios.
 
 ### `newTlsConfig(roots: TrustStore): TlsConfig`
 
 A `TlsConfig` that verifies servers against `roots`, secure by default:
 `insecureSkipVerify` is false and `minVersion` is TLS 1.3. The recommended
-constructor - a raw struct literal is just as safe now, since every omitted
+constructor - a raw class literal is just as safe now, since every omitted
 field defaults to its zero value and the zero value of `insecureSkipVerify` is
 "verify".
 

@@ -64,7 +64,7 @@ here rather than left standing, since this document is what escalated the
 investigation.**
 
 `collatz` and `mandelbrot` **allocate nothing** — by construction they use only
-`i64`/`f64` locals, no `struct`, `slice`, or `append`. Their 4–5× slowdown
+`i64`/`f64` locals, no `class`, `slice`, or `append`. Their 4–5× slowdown
 therefore cannot involve the allocator or GC. It is also **not** instruction
 selection or register allocation: `@nosplit` on the benchmark function (SPEC
 §10.3.1) suppresses only the back-edge safepoint poll, leaving the same loop

@@ -89,7 +89,7 @@ fn loadCount(path: string): int! {
   `fail`, `panic`, `break`, or `continue`.
 
 ```bit
-struct Config { export port: int }
+class Config { export port: int }
 
 fn defaults(): Config {
   return Config{ port: 8080 }

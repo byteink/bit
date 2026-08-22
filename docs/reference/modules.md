@@ -57,14 +57,14 @@ export fn publicApi(): int { return 42 }   // visible to importers
 
 fn helper(): int { return 1 }               // module-private
 
-export struct Config {
+export class Config {
   export name: string      // field visible outside the module
   secret: string           // field module-private
 }
 ```
 
 - `export` on a top-level declaration exports it.
-- `export` on a struct field makes that field readable and writable outside the
+- `export` on a class field makes that field readable and writable outside the
   module; an unexported field cannot appear in a foreign composite literal or be
   selected outside its module.
 - Export a method by placing `export` before its `fn` keyword:
@@ -118,8 +118,8 @@ fn builtins(xs: []int, m: map<string, int>) {
 ```bit
 interface Shape { area(): f64 }
 
-struct Circle { export r: f64 }
-struct Rect   { export w: f64; export h: f64 }
+class Circle { export r: f64 }
+class Rect   { export w: f64; export h: f64 }
 
 fn (c: Circle) area(): f64 { return 3.14159 * c.r * c.r }
 fn (r: Rect)   area(): f64 { return r.w * r.h }

@@ -51,7 +51,7 @@ to `string`. Any type implementing `interface Show { show(): string }` works, as
 do all primitives. Write `\$` for a literal dollar sign.
 
 There is no universal `toString`: interpolating anything else - a slice, a map, a
-channel, a function value, an `error`, or a struct/interface without `show` - is a
+channel, a function value, an `error`, or a class/interface without `show` - is a
 compile error (`E0073`). Interpolate a field, an element, or the result of a
 method instead, or give the type a `show(): string` method.
 
@@ -136,15 +136,15 @@ fn makeChan(): chan<int> {
 
 ## Structs
 
-A struct groups named fields. Structs are **reference types** (like TypeScript
+A class groups named fields. Structs are **reference types** (like TypeScript
 objects): assigning one copies the handle, and mutations are visible through
 both. Fields marked `export` are visible outside the module (see
 [Modules](modules.md)).
 
 ```bit
-struct Point { x: f64; y: f64 }
+class Point { x: f64; y: f64 }
 
-struct User {
+class User {
   export name: string    // visible to other modules
   age: int               // module-private
 }
@@ -157,45 +157,45 @@ fn structs() {
 }
 ```
 
-Reference semantics have one consequence worth knowing up front: a struct field
-whose own type is a struct **must** be given a value. It has no zero value,
+Reference semantics have one consequence worth knowing up front: a class field
+whose own type is a class **must** be given a value. It has no zero value,
 because zero bits in a reference field is a null, not a live instance.
 
 ```bit ignore
-struct Inner { xs: []u32 }
-struct Outer { a: int, b: Inner }
+class Inner { xs: []u32 }
+class Outer { a: int, b: Inner }
 
 let bad = Outer{ a: 1 }              // E0083 - `b` omitted
 let alsoBad: Outer                   // E0083 - no initializer
 let orThis = []Outer(2)              // E0083 - `[]T(n)` means n zero values
-let good = Outer{ a: 1, b: Inner{} } // fine; `Inner` has no struct-typed field
+let good = Outer{ a: 1, b: Inner{} } // fine; `Inner` has no class-typed field
 let empty = []Outer(0)               // fine; asks for no zero values
 ```
 
 Every other field type stays omittable, including an inline `[N]T`, because
 their zero value really is zero bits.
 
-The same fact rules out a **cycle** of struct-typed fields, at any length. There
+The same fact rules out a **cycle** of class-typed fields, at any length. There
 is no way to build one, because every step obliges another:
 
 ```bit ignore
-struct Node { v: int, next: Node }   // E0047 - one hop
-struct A { b: B }                    // E0047 - A -> B -> A
-struct B { a: A }
+class Node { v: int, next: Node }   // E0047 - one hop
+class A { b: B }                    // E0047 - A -> B -> A
+class B { a: A }
 ```
 
-The layout would be fine (a struct field is one handle, so nothing here is
+The layout would be fine (a class field is one handle, so nothing here is
 infinitely large). It is that no value of the type exists to write. Break the
 cycle with any type that has an empty or `nil` state - `Option<T>` is the
 idiomatic one:
 
 ```bit
-struct ListNode { v: int, next: Option<ListNode> }   // linked list
-struct TreeNode { v: int, kids: []TreeNode }         // a slice terminates too
-struct TrieNode { next: map<rune, TrieNode> }        // and so does a map
+class ListNode { v: int, next: Option<ListNode> }   // linked list
+class TreeNode { v: int, kids: []TreeNode }         // a slice terminates too
+class TrieNode { next: map<rune, TrieNode> }        // and so does a map
 ```
 
-A map whose value type is such a struct is still fine to build, insert into,
+A map whose value type is such a class is still fine to build, insert into,
 iterate and delete from. Only reading a **missing** key needs a zero value, so
 that one read panics - and the two-result form, which exists to ask whether a
 key is there, does not:
@@ -208,7 +208,7 @@ let (v, ok) = m[7]                 // fine - ok is false, do not read v
 let bad = m[7]                     // panics: 'Outer' has no zero value
 ```
 
-Methods attach behavior to a struct; see [Functions](functions.md#methods).
+Methods attach behavior to a class; see [Functions](functions.md#methods).
 
 ## Type aliases
 

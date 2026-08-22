@@ -47,17 +47,17 @@ Every binding without an initializer is deterministically zeroed (§13.4):
 - numbers → `0`, `bool` → `false`, `string` → `""`
 - arrays and tuples → each element zeroed
 - structs → a live instance with every field zeroed (structs are references but
-  a zeroed struct is usable, not `nil`)
+  a zeroed class is usable, not `nil`)
 - slices, maps, channels, functions, interfaces → `nil`
 
-One exception, and it is the only one: a struct that has a **struct-typed field**
+One exception, and it is the only one: a class that has a **class-typed field**
 has no zero value, so it cannot be declared without an initializer and a literal
-cannot leave that field out. Both are `E0083`. A struct is a reference, so zero
+cannot leave that field out. Both are `E0083`. A class is a reference, so zero
 bits in such a field would be a null rather than a live instance - see
 [Types](types.md#structs).
 
 ```bit
-struct Point { x: f64; y: f64 }
+class Point { x: f64; y: f64 }
 
 fn origin(): Point {
   let p: Point       // {x: 0.0, y: 0.0}, ready to use

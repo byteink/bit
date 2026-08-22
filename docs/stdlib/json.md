@@ -410,7 +410,7 @@ The path-based edit layer `bit add` (the package manager) calls
 to change `bit.json` without disturbing anything it didn't touch - the json
 epic's namesake "edit layer". A path is `[]string` of object keys only
 (array-index paths are out of scope; `bit.json`'s dependency map is
-object-keyed). Every function mutates and returns its `root` - struct and
+object-keyed). Every function mutates and returns its `root` - class and
 slice writes along the path are visible in place, but an append or a
 deletion changes a slice's length, and a `CstNode`'s payload can't be
 reassigned in place, so that one node is rebuilt and returned; always use

@@ -23,8 +23,8 @@ Any type with the required methods satisfies the interface. Satisfaction is
 checked where a value is used as the interface, not at declaration.
 
 ```bit
-struct Circle { export r: f64 }
-struct Rect   { export w: f64; export h: f64 }
+class Circle { export r: f64 }
+class Rect   { export w: f64; export h: f64 }
 
 fn (c: Circle) area(): f64      { return 3.14159 * c.r * c.r }
 fn (c: Circle) perimeter(): f64 { return 2.0 * 3.14159 * c.r }
@@ -86,7 +86,7 @@ fn mustCircle(s: Shape): Circle {
 The two-result form is valid only as the sole right-hand side of a declaration
 or assignment.
 
-The target must be a struct type - only structs carry methods, so only a struct
+The target must be a class type - only structs carry methods, so only a class
 can be the concrete type behind an interface value. Asserting a type that could
 never satisfy the interface is a compile-time error rather than a check that
 always fails.

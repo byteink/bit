@@ -23,7 +23,7 @@ import { newMutex, newWaitGroup, newRWMutex, newOnce, newAtomicI64 } from "std/s
 
 ### `Mutex`
 
-Mutual exclusion lock. A struct, so it is a reference type: every holder of the
+Mutual exclusion lock. A class, so it is a reference type: every holder of the
 same `Mutex` value contends for the same lock. The zero-valued `Mutex` (never
 constructed with `newMutex`) is not usable - always construct with
 `newMutex()`.
@@ -190,7 +190,7 @@ A single `i64` accessed only through sequentially-consistent atomic
 operations (SPEC §11.5 - the strongest ordering, and the only one v0.1
 exposes). Generic constraints (SPEC §11.3) are interface bounds only, so
 there is no single `Atomic<T>` to write against an "integer prim" bound -
-this offers one concrete struct per width in common use, the same shape as
+this offers one concrete class per width in common use, the same shape as
 Go's `sync/atomic.Int64`.
 
 ### `newAtomicI64(v: i64): AtomicI64`

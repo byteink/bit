@@ -181,7 +181,7 @@ information, so they can land first.
 |---|---|---|---|
 | E0200 | `max-file-lines` | 800 | A file past this has stopped being one idea. |
 | E0201 | `max-fn-lines` | 80 | A function that does not fit on a screen cannot be checked by eye. |
-| E0202 | `max-params` | 5 | Past five, the call site stops being readable and the arguments want to be a struct. |
+| E0202 | `max-params` | 5 | Past five, the call site stops being readable and the arguments want to be a class. |
 | E0203 | `max-nesting` | 4 | Deep nesting is nearly always a missing early return. |
 | E0204 | `max-complexity` | 10 | Independent paths through a function, the count a reader must hold at once. |
 | E0205 | `defer-in-loop` | — | Defers run at function exit, so one inside a loop holds every resource until the function returns. |

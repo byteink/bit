@@ -127,10 +127,10 @@ class    const     continue  default   defer     else
 enum     export    fail      false     fn        for
 from     if        import    in        interface let
 map      match     nil       of        return    select
-spawn    struct    switch    true      type      while
+spawn    class    switch    true      type      while
 ```
 
-`class` is accepted as a synonym for `struct` (§10.5) as of the phase-1 migration
+`class` is accepted as a synonym for `class` (§10.5) as of the phase-1 migration
 step (#3425); the two spellings are currently equivalent and neither is
 deprecated. A later phase settles on one spelling and reserves the other's
 diagnostic for it.
@@ -287,7 +287,7 @@ NIL_LIT  = "nil" .
 ```
 
 `nil` is the zero value of a reference type that has no live zero — a map,
-channel, function, or interface. `string`, `struct`, and `[]T` have usable zero
+channel, function, or interface. `string`, `class`, and `[]T` have usable zero
 values instead (§13.4).
 
 ---
@@ -364,7 +364,7 @@ Additionally:
 
 Because `>`/`>>` terminate, a declaration or field whose type ends in a generic
 close needs no explicit separator: `type Ids = map<string, int>`, a
-`headers: map<string, string>` struct field, and an interface method returning
+`headers: map<string, string>` class field, and an interface method returning
 `Opt<T>` all end their line naturally.
 
 **Consequence — line continuation.** A line that must continue onto the next line
@@ -693,7 +693,7 @@ declaration order. Green-thread stacks are fixed-size and guarded (§20), so
 
 ### 10.4 Method Declarations
 
-Methods attach a named function to a struct or type-alias target via an explicit
+Methods attach a named function to a class or type-alias target via an explicit
 receiver placed before the method name:
 
 ```
@@ -704,14 +704,14 @@ receiver    = IDENT ":" type_name .
 Example:
 
 ```
-struct Point { x: f64; y: f64 }
+class Point { x: f64; y: f64 }
 
 fn (p: Point) norm(): f64 {
   return sqrt(p.x * p.x + p.y * p.y)
 }
 ```
 
-- The receiver type must be a struct or type-alias declared in the **same
+- The receiver type must be a class or type-alias declared in the **same
   module**. Methods can only be declared for locally-declared types.
 - Because structs are **reference types** (§13.3), a method mutating a receiver
   field mutates the caller's value; no pointer receiver syntax is needed.
@@ -720,14 +720,14 @@ fn (p: Point) norm(): f64 {
 ### 10.5 Struct Declarations
 
 ```
-struct_decl = ( "struct" | "class" ) IDENT [ generic_params ] "{" [ field { ( ";" | "," ) field } [ ";" | "," ] ] "}" .
+struct_decl = ( "class" | "class" ) IDENT [ generic_params ] "{" [ field { ( ";" | "," ) field } [ ";" | "," ] ] "}" .
 field       = [ "export" ] IDENT ":" type .
 ```
 
-- `class` is accepted as a synonym for `struct` (§5.2); both spellings declare
+- `class` is accepted as a synonym for `class` (§5.2); both spellings declare
   the same construct and produce identical output. Neither is deprecated yet.
 - A field marked `export` is visible outside the module; otherwise it is
-  module-private (§17.3). The struct type itself is exported via the leading
+  module-private (§17.3). The class type itself is exported via the leading
   `export` on the declaration.
 - Fields are ordered; that order is the composite-literal positional order and the
   memory layout order (subject to the compiler's alignment padding).
@@ -768,7 +768,7 @@ type = type_name
      | generic_inst
      | "(" type ")" .
 
-type_name     = IDENT .                         (* primitive, struct, interface, alias, or type param *)
+type_name     = IDENT .                         (* primitive, class, interface, alias, or type param *)
 qual_type_name = IDENT "." IDENT .              (* a type exported by a namespace import, §17.2 *)
 slice_type   = "[" "]" type .                   (* []T   dynamic, reference *)
 array_type   = "[" const_expr "]" type .        (* [N]T  fixed, value *)
@@ -792,7 +792,7 @@ position is a syntax error, not a tuple — `"(" expression ")"` is grouping (§
 and making it conditionally a constructor would make the meaning of parentheses
 depend on their contents. A tuple value is produced by a multi-value `return`
 (§13.1), which is the use case tuples exist for; anything that wants a named,
-constructible, mutable aggregate wants a struct.
+constructible, mutable aggregate wants a class.
 
 A `qual_type_name` (`io.Writer`) names a type exported by a namespace-imported
 module (`import io from "std/io"`, §17.2) — the same `ns.member` spelling already
@@ -888,7 +888,7 @@ implementing type; it may appear in method signatures only.
 - **Raw pointer** `*T`: a single machine word holding the address of a `T`. It is
   a **reference type** (nilable; its zero value is the null pointer `nil`), but
   unlike every other reference type it is **not traced by the garbage collector** —
-  the collector never follows a `*T`, and a `*T`-typed struct field or slice
+  the collector never follows a `*T`, and a `*T`-typed class field or slice
   element is omitted from the object's pointer map. This is what makes it *unsafe*:
   the pointee's lifetime is not tracked, and dereferencing a dangling or
   fabricated pointer is undefined behavior.
@@ -1378,7 +1378,7 @@ these are the rules that make it sound:
 
 1. **The type must be untraced**: an integer, float, or bool; a raw pointer `*T`
    (§11.4); or a fixed array `[N]U` of those. Anything the collector would trace
-   — `string`, `[]T`, `map`, `chan`, a struct, an interface, a payload-carrying
+   — `string`, `[]T`, `map`, `chan`, a class, an interface, a payload-carrying
    enum, a function value — is a **compile error**, not a silent hazard.
 2. **The initializer must be a compile-time constant** (§15.4), or absent, in
    which case the cell is zero-valued (§13.4). An array-typed `let` takes no
@@ -1626,13 +1626,13 @@ map_entry     = expression ":" expression .
 type_args     = type { "," type } .
 ```
 
-A struct literal is **always** prefixed by its type name: `Point{ x: 1.0, y: 2.0 }`.
+A class literal is **always** prefixed by its type name: `Point{ x: 1.0, y: 2.0 }`.
 This is the rule that removes the block-versus-object-literal ambiguity — a bare
-`{` in statement position is **always** a block (§13.1), never a struct or map
+`{` in statement position is **always** a block (§13.1), never a class or map
 literal. Struct literals are keyed; any field omitted from the literal takes its
-zero value (§13.4). A field whose own type is a **struct** has no zero value and
+zero value (§13.4). A field whose own type is a **class** has no zero value and
 therefore may **not** be omitted — leaving it out is **E0083**. Fields not visible
-to the current module (unexported fields of a foreign struct) may not appear.
+to the current module (unexported fields of a foreign class) may not appear.
 
 ### 12.3 Slice, Array, and Map Literals
 
@@ -1698,14 +1698,14 @@ compile error.
 
 ### 12.5 Member Access
 
-`a.b` selects a struct field or a method value. `t.0`, `t.1`, … select tuple
+`a.b` selects a class field or a method value. `t.0`, `t.1`, … select tuple
 elements by index (the index is an `INT_LIT`, checked against the tuple arity).
 Method values are closures bound to their receiver.
 
 **Tuple elements are read-only.** `t.0` may be read but never assigned, so `t.0 =
 x` (and `t.0++`, `t.0 += x`) is a compile error. A tuple is a fixed group of
 values produced whole — by a multi-value `return` (§13.1) — and read whole or by
-element; to vary a member, build a new tuple or use a struct, which is what
+element; to vary a member, build a new tuple or use a class, which is what
 structs are for. This restriction is what lets tuples be a value type (§13.3)
 while being represented as a shared box.
 
@@ -1714,13 +1714,13 @@ while being represented as a shared box.
 - `s[i]` indexes a slice/array (`i` must be an integer; out-of-range **panics**,
   §18.4) or a string (yielding `byte`).
 - `m[k]` indexes a map; a missing key yields the zero value of the value type
-  (§13.4) — for a slice, string, or struct V that is a usable empty/zero object,
+  (§13.4) — for a slice, string, or class V that is a usable empty/zero object,
   never a null reference. The
   two-result form `let (v, ok) = m[k]` also reports presence (`ok: bool`). The
   two-result form is only valid as the sole right-hand side of a value declaration
   or assignment.
 
-  A value type with **no zero value** (a struct with a struct-typed field,
+  A value type with **no zero value** (a class with a class-typed field,
   §13.4) has nothing to yield on a miss, and the two forms differ there:
 
   - `m[k]` **panics** (§18.4), naming the type. There is no value to return
@@ -1828,7 +1828,7 @@ fn main() {
 ```
 
 Capture is not a copy, so §13.3's value/reference split does not apply to it: a
-captured `int` is shared exactly as a captured `struct` is. A parameter is a local
+captured `int` is shared exactly as a captured `class` is. A parameter is a local
 variable and is captured on the same terms. What each activation captures is its
 own variable, so two calls to the same function yield closures over separate
 variables.
@@ -1898,7 +1898,7 @@ block      = "{" { statement ";" } "}" .
 
 A statement list is a sequence of statements each terminated by `";"` (usually
 synthesized, §7). A bare `{ ... }` is a **block** and introduces a new lexical
-scope. Because struct/map literals are type-prefixed (§12.2), a leading `{` is
+scope. Because class/map literals are type-prefixed (§12.2), a leading `{` is
 never a literal.
 
 ```
@@ -1928,11 +1928,11 @@ defer_stmt    = "defer" postfix .                (* postfix must be a call *)
   result type. The tuple is built as a single value and returned as one (see
   `runtime/ABI.md` §1.1); the arity and element types must match the declared
   result type exactly.
-- A `member` lhs must select a **struct field**. A tuple element (`t.0`) is
+- A `member` lhs must select a **class field**. A tuple element (`t.0`) is
   read-only (§12.5) and is not a valid assignment target.
 - A `switch` with a subject runs the first case one of whose labels **compares
   equal to the subject with `==`** — the operator of §14.6, not an identity test.
-  So a `string` label matches by byte contents, a struct label field-wise, a
+  So a `string` label matches by byte contents, a class label field-wise, a
   tuple label element-wise, and a float label with float equality; the subject
   type must be comparable, and every label must be assignable to it. Cases are
   tested in source order and their labels left to right; a label is evaluated only
@@ -2010,7 +2010,7 @@ determines copy semantics and is fixed:
 | Category   | Types                                                        | Assignment / arg passing |
 | ---------- | ----------------------------------------------------------- | ------------------------ |
 | Value      | all numeric, `bool`, `[N]T` arrays, tuples                   | deep copy of the value   |
-| Reference  | `string`, `[]T` slices, `map<K,V>`, `struct`, `interface`, `chan<T>`, function values | copy of the reference (shared underlying data) |
+| Reference  | `string`, `[]T` slices, `map<K,V>`, `class`, `interface`, `chan<T>`, function values | copy of the reference (shared underlying data) |
 
 `string` is a reference type but is deeply immutable, so sharing is unobservable.
 The same argument covers tuples from the other side: a tuple is a value type, but
@@ -2018,31 +2018,31 @@ because its elements are read-only (§12.5) an implementation may share one heap
 box between copies without that being observable. The reference implementation
 does exactly that — see `runtime/ABI.md` §1.1, which also fixes the multi-value
 return ABI: `return a, b` builds one boxed tuple and returns a single handle.
-Structs are reference types (like TypeScript objects): assigning a struct copies
+Structs are reference types (like TypeScript objects): assigning a class copies
 the handle, and mutations through either handle are visible to both. To obtain an
 independent copy, define and call a `clone()` method. Zero values of reference
 types are given in §13.4: `nil` for a map, channel, function, or interface, and a
-live empty value for `string`, `struct`, and `[]T`.
+live empty value for `string`, `class`, and `[]T`.
 
 Rationale: making structs references removes the need for pointers, `&`/`*`, and
 value-vs-pointer receiver rules, which is a large ceremony saving (priority #1)
 while keeping the GC model simple.
 
-**A struct-typed field may not participate in a cycle of any length**, because a
-struct has no `nil` (§13.4): such a field can be neither omitted (`E0083`) nor
+**A class-typed field may not participate in a cycle of any length**, because a
+class has no `nil` (§13.4): such a field can be neither omitted (`E0083`) nor
 filled with nothing, so filling one obliges filling one more and the chain never
-terminates. `struct Node { next: Node }` and the equivalent `A → B → A` and
+terminates. `class Node { next: Node }` and the equivalent `A → B → A` and
 `P → Q → R → P` are all rejected at the declaration with `E0047`, naming the
-cycle. This is not a layout restriction — a struct field is a single handle, so
+cycle. This is not a layout restriction — a class field is a single handle, so
 the layout is finite either way — it is that no value of the type can be built.
 
 Break a cycle with any type that has an empty or `nil` state. `Option<T>` is the
 idiomatic one and gives the ordinary recursive structures:
 
 ```bit
-struct Node { v: int, next: Option<Node> }   // linked list
-struct Tree { v: int, kids: []Tree }         // slice also terminates
-struct Trie { next: map<rune, Trie> }        // so does a map
+class Node { v: int, next: Option<Node> }   // linked list
+class Tree { v: int, kids: []Tree }         // slice also terminates
+class Trie { next: map<rune, Trie> }        // so does a map
 ```
 
 A cycle passing through a generic instantiation is not diagnosed here, since
@@ -2055,9 +2055,9 @@ Every declared binding without an initializer is deterministically zero-valued:
 
 - numeric → `0`; `bool` → `false`; `string` → `""`.
 - `[N]T` array → all elements zero-valued; tuple → each element zero-valued.
-- `struct` → a live instance with each field zero-valued (structs are references,
+- `class` → a live instance with each field zero-valued (structs are references,
   so `let p: Point` yields a usable zeroed `Point`, not `nil`) — **provided every
-  field has a zero value**. A struct type with a **struct-typed field** has no
+  field has a zero value**. A class type with a **class-typed field** has no
   zero value at all: see below.
 - `[]T` slice → the **empty slice**: `len` and `cap` are `0`, `append` allocates,
   iteration yields nothing, and indexing panics (§18.4). A slice cannot be
@@ -2073,17 +2073,17 @@ Every context that produces a zero value produces the *same* zero value: a
 declaration without an initializer, a missing map key (§12.6), a receive from a
 closed channel (§16.2), and the ok-value of a failed fallible call (§18.2).
 
-**A struct type with a struct-typed field has no zero value and cannot be
+**A class type with a class-typed field has no zero value and cannot be
 default-constructed.** Both forms that would ask for one are **E0083**:
 
 ```
-struct Inner { xs: []u32 }
-struct Outer { a: int, b: Inner }
+class Inner { xs: []u32 }
+class Outer { a: int, b: Inner }
 
-let o = Outer{ a: 1 }          // E0083 — omits the struct-typed `b`
+let o = Outer{ a: 1 }          // E0083 — omits the class-typed `b`
 let p: Outer                   // E0083 — no initializer at all
 let s = []Outer(2)             // E0083 — `[]T(n)` means n zero values (§12.9)
-let q = Outer{ a: 1, b: Inner{} }   // ok; `Inner` has no struct-typed field
+let q = Outer{ a: 1, b: Inner{} }   // ok; `Inner` has no class-typed field
 let e = []Outer(0)             // ok; asks for no zero values at all
 ```
 
@@ -2095,16 +2095,16 @@ A `map<K,V>` whose `V` has no zero value stays legal, because inserting,
 iterating, deleting and `len` never need one. Only a read of a missing key does,
 and §12.6 gives the rule: `m[k]` panics, `let (v, ok) = m[k]` does not.
 
-The reason is that a struct is a *reference* (§13.3). Zero bits in a struct-typed
+The reason is that a class is a *reference* (§13.3). Zero bits in a class-typed
 field is a **null**, not a live instance, so the promise above cannot be kept for
 it: reading through such a field would fault, and a field left holding a
 plausible-looking address is a false root for the collector. Filling it with a
-fresh instance instead is not an option either, because struct types may form
+fresh instance instead is not an option either, because class types may form
 reference cycles and the fill would not terminate.
 
-Only a **struct-typed** field is affected. Scalars, `string`, slices, maps,
+Only a **class-typed** field is affected. Scalars, `string`, slices, maps,
 channels, functions and interfaces all have a zero value that is literally zero
-bits, and an inline `[N]T` field lives in the struct's own storage, so all of
+bits, and an inline `[N]T` field lives in the class's own storage, so all of
 them stay omittable and `let p: Inner` above is still valid.
 
 ### 13.5 Arithmetic and Overflow
@@ -2190,7 +2190,7 @@ buggy:
   actually stored there, never a fabricated bit pattern. *Which* writer's
   value a racing reader sees is unspecified — that is the race itself, and the
   fix is always one of the edges above, not this guarantee.
-- A racing access to a value **wider than one word** — a struct assigned as a
+- A racing access to a value **wider than one word** — a class assigned as a
   whole, a slice header `{ptr, len, cap}`, a `string` header `{ptr, len}`, an
   interface value `{type, data}`, or a multi-return tuple — **can tear**: a
   reader can observe a mix of words from different writes (e.g. one write's
@@ -2199,7 +2199,7 @@ buggy:
   field) — Bit's usual safety nets (bounds checks, `nil` checks) still run
   against whatever was actually read, so this alone does not corrupt memory.
 - The one exception: if a torn **GC-traced** multiword value (a slice, string,
-  interface, or reference-holding struct) is what a root scan observes live in
+  interface, or reference-holding class) is what a root scan observes live in
   a stack slot or register at a safepoint (ABI.md §5), the collector trusts
   that slot's declared shape — a `data` pointer paired with a mismatched
   `type` tag from a torn interface, or a `ptr` paired with a mismatched `len`,
@@ -2350,7 +2350,7 @@ Types are compared **structurally**, not by name. Two types are identical if:
 - they are the same primitive; or
 - both are `[]T` / `[N]T` / `map<K,V>` / `chan<T>` / tuple / function types with
   identical components (arrays also require equal `N`); or
-- both are struct types with the same ordered field list (same names, same field
+- both are class types with the same ordered field list (same names, same field
   types, same export visibility); or
 - both are interface types with the same method set (names + signatures); or
 - one is a type alias whose transparent target is identical to the other (aliases
@@ -2376,10 +2376,10 @@ A type `S` **satisfies** interface `I` if, for every method `m` in `I`, `S` has 
 method named `m` whose signature is identical to `I`'s (with `Self` bound to `S`).
 Method sets:
 
-- The method set of a struct/alias type is the set of methods declared with a
+- The method set of a class/alias type is the set of methods declared with a
   receiver of that type in its home module.
 - Interfaces may not declare fields; only method signatures.
-- `S` must be a **struct** type (or another interface, or `nil`). An interface
+- `S` must be a **class** type (or another interface, or `nil`). An interface
   value *is* the receiver's object pointer — there is no boxed scalar — so only a
   type that is already a reference (§13.3) can sit behind one. Storing anything
   else would leave a non-pointer in a word the collector traces as a root and a
@@ -2413,8 +2413,8 @@ type_assert = "." "(" type ")" .
 The two-result form is valid only as the sole right-hand side of a declaration or
 assignment (like the map/channel two-result forms).
 
-- The target must be a **struct** type. Only structs carry methods (§10.4), so
-  only a struct can be the dynamic type behind an interface value.
+- The target must be a **class** type. Only structs carry methods (§10.4), so
+  only a class can be the dynamic type behind an interface value.
 - A target that cannot satisfy the interface is a **compile-time error**: the
   assertion could never succeed, so it is rejected rather than left to report
   `false` forever.
@@ -2475,7 +2475,7 @@ let s = Shape.Rect(3.0, 4.0)   // payload variant: construct with arguments
   variants and binds a variant's payload in its arm. Enums are not ordered and not
   `==`-comparable in v0.1 — use `match`.
 - An enum may be **generic** (`enum Option<T> { Some(T), None }`), monomorphized
-  per instantiation like a generic struct (§14.1, §15). A construction's type
+  per instantiation like a generic class (§14.1, §15). A construction's type
   arguments are usually inferred: from the payload argument (`Option.Some(5)`
   gives `Option<i64>`), from the expected type when no argument constrains a
   parameter — a bare `None`, or the `E` in `Result.Ok(v)` (`let o: Option<i64> =
@@ -2714,7 +2714,7 @@ is the general form of it.
 Visibility is by the explicit `export` keyword, not by identifier casing:
 
 - A top-level declaration marked `export` is visible to importing modules.
-- A struct **field** marked `export` is readable/writable outside the module; an
+- A class **field** marked `export` is readable/writable outside the module; an
   unexported field is module-private (and may not appear in a foreign composite
   literal or be selected outside the module).
 - A method is exported by placing `export` before its `fn` keyword (§10.4);
@@ -3129,19 +3129,19 @@ method's name, for both sorting and printing, is `Recv.member`, so it
 interleaves with types, functions and consts rather than being grouped under
 its receiver.
 
-Each symbol's `kind` is one of `function`, `method`, `const`, `struct`, `enum`,
+Each symbol's `kind` is one of `function`, `method`, `const`, `class`, `enum`,
 `interface`, `type`. `params` is the symbol's own written generic parameter
 list — angle-bracketed, `", "`-separated (`<T>`, `<T, E>`) — or empty when it
 declares none; a method's `params` is always empty, since its receiver's own
 line already carries the receiver's parameters.
 
 **Plain form** (the default) prints one line per symbol. A named-type
-declaration (`struct`/`enum`/`interface`/`type`) prints `<kind> <name><params>`;
+declaration (`class`/`enum`/`interface`/`type`) prints `<kind> <name><params>`;
 every other symbol prints `<kind> <name><params> <type>`:
 
 ```
 enum Option<T>
-struct Point
+class Point
 function unwrapOr<T> (Option<T>, T) => T
 method Reader.readAll () => string
 const pi f64
@@ -3160,7 +3160,7 @@ exact order: `name`, `kind`, `params`, `type`:
 `name` never carries the parameter list; it is the bare declared name or
 `Recv.member`, with `params` reported as its own key.
 
-**`--fields`** (off by default) additionally reports each exported struct's own
+**`--fields`** (off by default) additionally reports each exported class's own
 fields, in declaration order, as the extra kind `field` with name `Recv.field`
 (for example `Point.x`); it changes neither form's shape for a module whose
 structs report no fields this way.
@@ -3693,8 +3693,8 @@ import { parseInt } from "std/strings"
 
 interface Shape { area(): f64 }
 
-struct Circle { export r: f64 }
-struct Rect   { export w: f64; export h: f64 }
+class Circle { export r: f64 }
+class Rect   { export w: f64; export h: f64 }
 
 fn (c: Circle) area(): f64 { return 3.14159265358979 * c.r * c.r }
 fn (r: Rect)   area(): f64 { return r.w * r.h }
@@ -3811,7 +3811,7 @@ params        = param { "," param } [ "," ] .
 param         = [ "..." ] IDENT ":" type .
 extern_fn_decl = "extern" "fn" IDENT signature .
 
-struct_decl   = ( "struct" | "class" ) IDENT [ generic_params ] "{" [ field { fsep field } [ fsep ] ] "}" .
+struct_decl   = ( "class" | "class" ) IDENT [ generic_params ] "{" [ field { fsep field } [ fsep ] ] "}" .
 field         = [ "export" ] IDENT ":" type .
 interface_decl= "interface" IDENT [ generic_params ] "{" [ method_sig { fsep method_sig } [ fsep ] ] "}" .
 method_sig    = IDENT signature .

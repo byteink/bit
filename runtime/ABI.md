@@ -57,12 +57,12 @@ offset  size  field
 ### 1.1 Aggregates and multi-value returns
 
 A **tuple is a boxed managed record**, laid out by exactly the same rules as a
-struct: elements in declaration order, each aligned to its own size, `[N]T`
+class: elements in declaration order, each aligned to its own size, `[N]T`
 elements inlined, body size rounded up to 8, and every element holding a GC
 reference listed in the type's `ptr_offsets` (§2). A tuple's `TypeInfo` is keyed
 by its `TypeId` like any other type, so two tuples with identical element types
 are the same type and share one descriptor. Codegen sees a tuple exactly as it
-sees a struct: one 8-byte traced handle.
+sees a class: one 8-byte traced handle.
 
 **A `ret` therefore carries at most one value.** `return a, b` in a function
 whose result type is `(A, B)` allocates a 2-element tuple record, stores the
@@ -75,12 +75,12 @@ would change the calling convention — the caller/callee register contract, the
 stack-map shape at call sites (§4), and every backend's prologue/epilogue — to
 buy nothing the boxed form does not already provide. The boxed form needs **zero
 calling-convention change**: it reuses `gc_alloc` + `field_set` / `field_get`,
-which are already exercised by every struct in the language, and it inherits
+which are already exercised by every class in the language, and it inherits
 correct GC tracing for free because the tuple's `ptr_offsets` describes its
-elements the same way a struct's does. A register pair would additionally need a
+elements the same way a class's does. A register pair would additionally need a
 rule for tuples wider than the return-register budget, reintroducing a spill path
 that the boxed form never has. The cost is one allocation per multi-value return;
-that is the same cost a struct return already pays, and it is the price of the
+that is the same cost a class return already pays, and it is the price of the
 uniform "every aggregate is one traced handle" model this ABI is built on.
 
 This is not a new constraint being imposed on codegen — it is the contract
@@ -104,7 +104,7 @@ The compiler emits one static `TypeInfo` per distinct (monomorphized) type and
 passes a pointer to it at each allocation site (`bit_rt_gc_alloc`, §6).
 
 ```
-TypeInfo {                       // extern struct, 56 bytes, 8-aligned
+TypeInfo {                       // extern class, 56 bytes, 8-aligned
     size            : usize      // body size in bytes, excluding the header
     ptr_offsets_ptr : [*]const usize  // -\ byte offsets of GC-ref fields
     ptr_offsets_len : usize           // -/ (ptr_offsets_ptr[0..ptr_offsets_len])
@@ -117,7 +117,7 @@ TypeInfo {                       // extern struct, 56 bytes, 8-aligned
 
 `extern`, and split into raw `ptr`/`len` pairs rather than a slice
 slices: codegen (a different compiler than the one building the runtime)
-writes this struct directly into an object file's `.rodata`, so its layout
+writes this class directly into an object file's `.rodata`, so its layout
 must be a frozen, language-neutral contract, not whichever in-memory shape
 happens to match a slice's layout today. `runtime/gc/gc.bit`'s `TypeInfo.of(size,
 ptr_offsets, name)` is the convenience constructor tests use;
@@ -125,8 +125,8 @@ codegen instead writes the raw fields directly.
 
 Because dispatch reads `methods` through the object's `info` pointer, a
 `TypeInfo` is now **per concrete type**, not per layout: two distinct types with
-identical `size`/`ptr_offsets` (e.g. `struct Circle { r: f64 }` and
-`struct Square { s: f64 }`) get separate `TypeInfo`s so their method sets stay
+identical `size`/`ptr_offsets` (e.g. `class Circle { r: f64 }` and
+`class Square { s: f64 }`) get separate `TypeInfo`s so their method sets stay
 distinct. Codegen keys the descriptor by the type's identity, not its layout.
 
 - `ptr_offsets` lists the byte offset, **within the body**, of every field that
@@ -147,7 +147,7 @@ entry and marking it. That is the entire precision contract for the heap.
 interface dispatch (SPEC §14). Each entry is:
 
 ```
-Method {                         // extern struct, 16 bytes, 8-aligned
+Method {                         // extern class, 16 bytes, 8-aligned
     id  : u64                    // global method id (§ below); 0-extended u32
     fn  : *const anyopaque       // the method's code address (.text)
 }
@@ -180,7 +180,7 @@ code pointer at +0 targets `.text` and is never a GC reference; the environment
 pointer at +8 is the cell's one ref field. Codegen calls a closure by loading
 both and calling `code_ptr(env_ptr, args...)` — the environment is threaded in
 as the callee's leading argument. Nothing new is required of the runtime: a
-closure cell is scanned by the same `ptr_offsets` mechanism as any struct.
+closure cell is scanned by the same `ptr_offsets` mechanism as any class.
 
 A **dynamic slice value** (`[]T`) is a pointer to a `gc_alloc`'d 40-byte header
 `{ buf, len, off, cap, is_ref }` (`TypeInfo{ size = 40, ptr_offsets = [0] }`).
@@ -1453,7 +1453,7 @@ TaskFn = *const fn (arg: ?*anyopaque) callconv(.c) void
 Fixed 2-arg native shape, matching `sched.TaskFn` exactly — spawn's arity does
 **not** grow with the spawned call's own argument count. For `spawn f(a, b, c)`
 codegen must pack `(a, b, c)` (and `f`'s captured environment, if any) into one
-`bit_rt_gc_alloc`'d struct and generate a small trampoline that unpacks it and
+`bit_rt_gc_alloc`'d class and generate a small trampoline that unpacks it and
 calls `f` with the real arguments; `fn_ptr`/`arg` here are that trampoline and
 its one packed-argument pointer, never `f` and its raw arguments directly.
 Never fails visibly: OOM is fatal here (SPEC.md §16.1's `spawn` has no
@@ -1693,7 +1693,7 @@ bit_rt_chan_recv(ch: ?*anyopaque)                -> ChanRecvResult
 bit_rt_chan_recv_ok()                            -> bool
 bit_rt_chan_close(ch: ?*anyopaque)                -> void
 
-ChanRecvResult { value: u64, ok: bool }   // extern struct, 2-word return
+ChanRecvResult { value: u64, ok: bool }   // extern class, 2-word return
 ```
 
 - `bit_rt_chan_recv_ok` returns the `ok` of the receive *just* performed by this
@@ -1781,7 +1781,7 @@ bit_rt_assert(cond: bool, msg: *const RtBytes) -> void
 bit_rt_print(s: *const RtBytes)            -> void   // fd 1
 bit_rt_eprint(s: *const RtBytes)           -> void   // fd 2
 
-RtBytes { ptr: *const u8, len: usize }   // extern struct — a transient,
+RtBytes { ptr: *const u8, len: usize }   // extern class — a transient,
                                           // non-owning byte view, never
                                           // GC-managed; not the (undecided)
                                           // `string` heap-object layout
@@ -1982,7 +1982,7 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   NUL-terminated buffer before probing it, applying the same `max_path` and
   embedded-NUL rejections every other path-taking entry point applies
   (#2146). It answers with `readlink`, not `lstat` + `S_IFLNK`: `readlink`
-  succeeds only on a symbolic link and needs no `struct stat` layout, so a
+  succeeds only on a symbolic link and needs no POSIX `stat` structure layout, so a
   dangling link still answers `true` — the link exists whether its target
   does or not.
 - `stat_w`/`lstat_w` (#2153) share `is_symlink_w`'s `words`/`n` path
@@ -2005,7 +2005,7 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   the `stdlib/` reference broke `./make`'s driver bootstrap with E0078 on
   every fresh clone. This landing is pass 1 of 2 (the #3065 pattern): the
   runtime primitives only, no consumer, so nothing on the driver's import
-  path references them. Pass 2 (the `FileInfo` struct and `stat`/`lstat`
+  path references them. Pass 2 (the `FileInfo` class and `stat`/`lstat`
   wrappers in `stdlib/fs/fs.bit`) is a follow-up ticket, gated on a release
   containing this commit and a stage0 repin to it.
 - `fs_rename` is the only `bit_rt_fs_*` entry point that needs two encoded
@@ -2084,13 +2084,13 @@ the handle of a string CONSTANT, which is static for the life of the process.
 |---|---|
 | `bit_rt_value_eq` | `(a: usize, b: usize, desc: *const RtBytes) -> bool` |
 
-SPEC §14.6 makes a struct comparable **field-wise** and a tuple **element-wise**.
+SPEC §14.6 makes a class comparable **field-wise** and a tuple **element-wise**.
 Both are one traced handle to a heap box (§1, §1.1), so comparing the word asks
 "same allocation?" — which is what `==` did, and what the map hashed keys by.
 
 **The runtime cannot recover the shape on its own.** A `TypeInfo` (§2) says which
 body words hold references but not what kind: a `string` field and a nested
-struct field are both one traced word. Worse, a string LITERAL is a static
+class field are both one traced word. Worse, a string LITERAL is a static
 `{ptr,len}` pair in `.data` with no GC header at all, so there is no descriptor
 to read off it. The compiler therefore emits a **descriptor program** — a string
 constant, one byte per body word — and passes it at the comparison site and to
@@ -2102,10 +2102,10 @@ constant, one byte per body word — and passes it at the comparison site and to
 's'             a `string` handle, compared and hashed BY ITS BYTES
 'r'             an opaque reference (slice, map, chan, func, interface, payload
                 enum), compared and hashed BY IDENTITY
-'{' ... '}'     a nested struct or tuple: dereferenced and walked
+'{' ... '}'     a nested class or tuple: dereferenced and walked
 ```
 
-`struct P { x: int, name: string }` is `{ws}`; `struct Q { p: P, n: int }` is
+`class P { x: int, name: string }` is `{ws}`; `class Q { p: P, n: int }` is
 `{{ws}w}`. The producer is `descProgram` in `compiler/lowerprim.bit`; the
 consumers are `descEqAgg` and `descHashAgg` in `runtime/root/maps.bit`.
 
@@ -2662,8 +2662,8 @@ second OS thread can observe it:
   (asserted false on entry before it is set); the test-only reset to `false`
   between test bodies runs single-threaded, never racing a live scheduler.
 
-**Self-synchronized (a sibling spinlock cell, not an embedded struct field —
-this port has no `Heap`/`Gc`/`World`/`Scheduler` struct type anywhere):**
+**Self-synchronized (a sibling spinlock cell, not an embedded class field —
+this port has no `Heap`/`Gc`/`World`/`Scheduler` class type anywhere):**
 - `runtime/root/root.bit`: `heapBlock` (`root.bit:258`) plus its two spinlock
   cells `heapLockCell`/`listLockCell` (`root.bit:260-261`). `runtime/alloc/
   alloc.bit`'s free-list functions take the block by pointer
@@ -2812,7 +2812,7 @@ happens-before edges actually hold for **Bit-level** (user heap) memory, once
 release/acquire pairing, never a plain (relaxed) load/store, because a plain
 access on most targets permits the reordering the edge exists to forbid:
 
-1. **`spawn` → first statement (§13.7 edge 1).** The packed-argument struct
+1. **`spawn` → first statement (§13.7 edge 1).** The packed-argument class
    (§9 Spawn) is fully written by the spawning thread before `bit_rt_spawn`
    hands the task off. `runtime/sched/sched.bit`'s per-worker `Deque` writes the task into
    its ring slot, then publishes it with a `.release`-ordered `tail` store
