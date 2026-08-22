@@ -1,0 +1,353 @@
+// Bit standard library — regex module, the Pike VM.
+//
+// Russ Cox's NFA-simulation algorithm (the technique behind RE2 and Go's
+// `regexp`): one left-to-right pass over the input, one rune at a time, two
+// thread lists (the current position's and the next's) swapped after each
+// step. No backtracking, so no input can make it slow — match time is
+// O(len(prog) x len(s)), full stop.
+//
+// THREAD-LIST DEDUPE, THE WHOLE REASON THIS IS LINEAR: `ThreadList` is a
+// classic sparse set (`PcSet` below) keyed by program counter, so a given pc
+// is added at most once per position. Skip it and a pattern like `(a*)*`
+// walks the same split arbitrarily many times per position, and "linear
+// time" becomes a lie every functional test still passes (see this file's
+// mutation-test note in the ticket this shipped under).
+//
+// ALLOCATION: both thread lists, their sparse sets, and the closure stack
+// are allocated exactly once per call to `runPike` — never per input
+// position, never per rune, and never stored on `Regex` (which stays
+// immutable and safe to share across any number of green threads; hanging
+// scratch state off it would make every spawned caller race on the same
+// buffer). A `ThreadList`'s `pcs` array holds plain `int`s, not a per-thread
+// class instance, so a busy position costs zero additional heap allocation
+// beyond the two lists built at the top of the call.
+//
+// CAPTURES: `Regex.matches` is a boolean predicate, so nothing here ever
+// reads a `Save` instruction's slot — but the instruction is still walked
+// like any other epsilon transition (`addThreadStep`'s `Op.Save` arm), so
+// #2029 can add per-thread capture slots without touching this file's
+// control flow, only its thread representation.
+
+// A per-position "already visited" set, keyed by program counter: the
+// classic sparse/dense pair. `pcSetHas`/`pcSetMark` are both O(1), and
+// `pcSetClear` is O(1) too — it only resets `count`, never scrubs `dense` or
+// `sparse`, which is safe because membership re-checks `dense[sparse[pc]] ==
+// pc`, so a stale leftover from a previous position can never read as
+// present.
+class PcSet { sparse: []int, dense: []int, count: int }
+
+fn newPcSet(numInsts: int): PcSet {
+  return PcSet{ sparse: []int(numInsts), dense: []int(numInsts), count: 0 }
+}
+
+fn pcSetHas(set: PcSet, pc: int): bool {
+  let idx = set.sparse[pc]
+  return idx < set.count && set.dense[idx] == pc
+}
+
+// Caller must already have checked `!pcSetHas(set, pc)`.
+fn pcSetMark(set: PcSet, pc: int) {
+  set.sparse[pc] = set.count
+  set.dense[set.count] = pc
+  set.count = set.count + 1
+}
+
+fn pcSetClear(set: PcSet) {
+  set.count = 0
+}
+
+// The threads live at one input position. `pcs[0:count]` are the "blocking"
+// instructions (Char/Class/Any/Match) this position's epsilon closure
+// reached, in priority order — index 0 is tried first, which is what makes
+// alternation and the greedy/lazy quantifiers resolve leftmost-first rather
+// than leftmost-longest (prog.bit's `Split` always offers its `x` arm
+// before its `y`). `visited` is the closure's dedupe set and covers every pc
+// walked this position, including the epsilon-only ones that never
+// themselves land in `pcs`.
+class ThreadList { pcs: []int, count: int, visited: PcSet }
+
+fn newThreadList(numInsts: int): ThreadList {
+  return ThreadList{ pcs: []int(numInsts), count: 0, visited: newPcSet(numInsts) }
+}
+
+fn threadListClear(tl: ThreadList) {
+  tl.count = 0
+  pcSetClear(tl.visited)
+}
+
+// `r`'s classification for `\b`/`\B`: `[0-9A-Za-z_]`, per the ticket's fixed
+// definition — not `charclass.bit`'s `ccWord()`, which re-normalizes (and so
+// re-allocates) a fresh `CharClass` on every call, exactly the per-position
+// allocation this file's header rules out.
+fn isWordRune(r: rune): bool {
+  return (r >= rune('0') && r <= rune('9')) ||
+    (r >= rune('A') && r <= rune('Z')) ||
+    (r >= rune('a') && r <= rune('z')) ||
+    r == rune('_')
+}
+
+// The sentinel "no rune here" value — before the start of the string, or
+// after its end. `rune` is `i32` (SPEC §5.4), so `-1` can never collide with
+// a real Unicode scalar value (always `>= 0`).
+const noRune: rune = -1
+
+// `before`/`after` are the runes immediately preceding/following the
+// position this assertion is evaluated at (`noRune` past either edge) —
+// `BeginText`/`BeginLine` are equivalent to "no rune before" and
+// `EndText`/`EndLine` to "no rune after" until #2030's multiline mode adds
+// `\n`-aware variants.
+fn assertHolds(kind: AnchorKind, before: rune, after: rune): bool {
+  if (kind == AnchorKind.BeginText || kind == AnchorKind.BeginLine) {
+    return before == noRune
+  }
+  if (kind == AnchorKind.EndText || kind == AnchorKind.EndLine) {
+    return after == noRune
+  }
+  let wordBefore = isWordRune(before)
+  let wordAfter = isWordRune(after)
+  if (kind == AnchorKind.WordBoundary) {
+    return wordBefore != wordAfter
+  }
+  return wordBefore == wordAfter // NoWordBoundary
+}
+
+// The explicit closure stack (`addThread` never recurses — a pattern nests
+// arbitrarily deep, and a recursive closure walk is a stack-overflow crash
+// on ordinary user input, not just a hostile one). `sp` lives on the class,
+// Pascal-style (mutated in place, like `RegexParser.pos` elsewhere in this
+// module), so the many small functions below that push/pop don't have to
+// thread it through as a return value on top of everything else they need
+// (keeping each at or under the five-parameter lint ceiling, E0202).
+class PcStack { pcs: []int, sp: int }
+
+fn newPcStack(capacity: int): PcStack {
+  return PcStack{ pcs: []int(capacity), sp: 0 }
+}
+
+// Pushes `pc`, asserting the stack (sized by `runPike` to the program's own
+// Split count, see its comment) never overflows — a bounded resource,
+// checked, per the Power-of-Ten rule this whole VM is built to satisfy.
+fn stackPush(stack: PcStack, pc: int) {
+  assert(stack.sp < len(stack.pcs), "regex: pike VM closure stack overflow")
+  stack.pcs[stack.sp] = pc
+  stack.sp = stack.sp + 1
+}
+
+// Caller must already have checked `stack.sp > 0`.
+fn stackPop(stack: PcStack): int {
+  stack.sp = stack.sp - 1
+  return stack.pcs[stack.sp]
+}
+
+// The values that stay fixed for every `addThread`/`addThreadStep` call
+// within one `runPike` invocation: the program being run and the closure
+// stack it shares across every call. Bundled so those functions stay at or
+// under the five-parameter ceiling without paying for a class instance per
+// input position — `ctx` is built exactly once per `runPike` call, same as
+// `stack` was before this existed.
+class PikeCtx { prog: Prog, stack: PcStack }
+
+// Resolves one program counter reached during the epsilon closure: pushes
+// its successor(s) for the epsilon ops (`Jump`, `Split`, `Save`, a satisfied
+// `Assert`), or records it as a real thread in `tl.pcs` for the rest
+// (`Char`/`Class`/`Any`/`Match`). `Split` pushes `y` before `x` so `x` pops
+// first — the priority order `prog.bit` promises.
+fn addThreadStep(tl: ThreadList, pc: int, before: rune, after: rune, ctx: PikeCtx) {
+  let inst = ctx.prog.insts[pc]
+  if (inst.op == Op.Jump) {
+    stackPush(ctx.stack, inst.x)
+    return
+  }
+  if (inst.op == Op.Split) {
+    stackPush(ctx.stack, inst.y)
+    stackPush(ctx.stack, inst.x)
+    return
+  }
+  if (inst.op == Op.Save) {
+    stackPush(ctx.stack, pc + 1)
+    return
+  }
+  if (inst.op == Op.Assert) {
+    if (assertHolds(inst.kind, before, after)) {
+      stackPush(ctx.stack, pc + 1)
+    }
+    return
+  }
+  tl.pcs[tl.count] = pc
+  tl.count = tl.count + 1
+}
+
+// Walks the epsilon closure of `startPc` into `tl`, iteratively via
+// `ctx.stack` — never recursively (see `PcStack`'s doc comment).
+fn addThread(tl: ThreadList, startPc: int, before: rune, after: rune, ctx: PikeCtx) {
+  stackPush(ctx.stack, startPc)
+  // Bounded: each iteration pops one entry, and a push only ever nets +1
+  // (a `Split`, the only op that pushes two) the FIRST time that pc is
+  // visited — every later pop of it is a dead end via `pcSetHas` below. So
+  // total growth is bounded by the program's own Split count.
+  while (ctx.stack.sp > 0) {
+    let pc = stackPop(ctx.stack)
+    if (pcSetHas(tl.visited, pc)) {
+      continue
+    }
+    pcSetMark(tl.visited, pc)
+    addThreadStep(tl, pc, before, after, ctx)
+  }
+}
+
+// Whether `inst` (one of `clist`'s recorded threads, so `Char`/`Class`/`Any`)
+// accepts rune `r`. `Any` is RE2/Go's default: any rune except `\n` — dotall
+// mode is #2030's job.
+fn instAccepts(inst: Inst, r: rune): bool {
+  if (inst.op == Op.Char) {
+    return inst.ch == r
+  }
+  if (inst.op == Op.Class) {
+    return ccContains(inst.cls, r)
+  }
+  return r != rune('\n') // Op.Any
+}
+
+// Scans `clist` (already-closed, priority order) against `r` (`noRune` past
+// the end of input), seeding `nlist` with every survivor via its own closure
+// walk (`addThread`, contextualized by `r`/`nextAfter` for the position
+// `nlist` belongs to). Returns true the instant a `Match` is reached: under
+// leftmost-first priority, no lower-index thread in `clist` can ever beat a
+// match a higher-priority one already reached, so scanning further here can
+// only waste work, never change the boolean answer.
+fn stepClist(clist: ThreadList, nlist: ThreadList, r: rune, nextAfter: rune, ctx: PikeCtx): bool {
+  let i = 0
+  // Bounded by `clist.count`, fixed at loop entry — filling `nlist` never
+  // changes it.
+  while (i < clist.count) {
+    let pc = clist.pcs[i]
+    let inst = ctx.prog.insts[pc]
+    if (inst.op == Op.Match) {
+      return true
+    }
+    if (r != noRune && instAccepts(inst, r)) {
+      addThread(nlist, pc + 1, r, nextAfter, ctx)
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Decodes the rune at byte `pos` of `s` and returns it with the number of
+// bytes it occupies — `(noRune, 1)` at or past `len(s)`.
+//
+// This duplicates `stdlib/strings/utf8.bit`'s private `decodeRune` byte for
+// byte rather than importing it, because it is not exported and this
+// ticket's only new export is `Regex.matches`. The duplication is not
+// cosmetic: the module's one exported width primitive, `runeSize`,
+// classifies the LEAD BYTE alone and actively disagrees with `runeAt`'s
+// real decode on a malformed lead byte (0xC0, 0xC1, 0xF5-0xFF) or a valid
+// lead byte followed by an invalid continuation byte — `runeAt` correctly
+// reports one-byte U+FFFD in both cases, but `runeSize` would still claim
+// 2-4 bytes, desyncing the VM's position from what it just matched and
+// silently skipping bytes it never examined. A follow-up ticket tracks
+// exporting a combined rune+width decode from std/strings so this
+// duplication can go away.
+fn stepRune(s: string, pos: int): (rune, int) {
+  let n = len(s)
+  if (pos >= n) {
+    return noRune, 1
+  }
+  let b0 = int(s[pos])
+  if (b0 < 0x80) {
+    return rune(b0), 1
+  }
+  let want = 0
+  let minCp = 0
+  let cp = 0
+  if (b0 >= 0xC2 && b0 <= 0xDF) {
+    want = 2
+    minCp = 0x80
+    cp = b0 & 0x1F
+  } else if (b0 >= 0xE0 && b0 <= 0xEF) {
+    want = 3
+    minCp = 0x800
+    cp = b0 & 0x0F
+  } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+    want = 4
+    minCp = 0x10000
+    cp = b0 & 0x07
+  } else {
+    return rune(0xFFFD), 1
+  }
+  if (pos + want > n) {
+    return rune(0xFFFD), 1
+  }
+  return decodeContinuation(s, pos, want, minCp, cp)
+}
+
+// The continuation-byte loop and final validity checks `stepRune` needs
+// once its lead byte says `want` more bytes should follow — split out to
+// keep `stepRune` itself under the complexity ceiling (E0204).
+fn decodeContinuation(s: string, pos: int, want: int, minCp: int, cpIn: int): (rune, int) {
+  let cp = cpIn
+  let j = 1
+  // Bounded by `want` (2-4), fixed by the caller's lead-byte classification.
+  while (j < want) {
+    let cb = int(s[pos + j])
+    if (cb < 0x80 || cb > 0xBF) {
+      return rune(0xFFFD), 1
+    }
+    cp = (cp << 6) | (cb & 0x3F)
+    j = j + 1
+  }
+  if (cp < minCp || (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF) {
+    return rune(0xFFFD), 1
+  }
+  return rune(cp), want
+}
+
+// Runs `prog` against `s` as an unanchored search — the standard `.*?`-prefix
+// trick: a fresh start thread (`pc 0`) is seeded at every position, at the
+// LOWEST priority (appended after whatever already-in-progress threads are
+// carried over), until a match is found. That priority ordering is what
+// makes the search leftmost: an already-started attempt always outranks one
+// that would start later. Once `stepClist` reports a match this returns
+// immediately, so a new start is never seeded after a match — the other half
+// of "leftmost".
+//
+// All VM scratch state is allocated exactly once here, per call (this
+// file's header). `ctx.stack` is sized `numInsts + 1`: `addThread`'s own
+// bound (its comment) shows the closure stack can never hold more than one
+// entry per Split instruction plus the one initial push.
+fn runPike(prog: Prog, s: string): bool {
+  let numInsts = len(prog.insts)
+  let n = len(s)
+  let clist = newThreadList(numInsts)
+  let nlist = newThreadList(numInsts)
+  let ctx = PikeCtx{ prog: prog, stack: newPcStack(numInsts + 1) }
+  let pos = 0
+  let before = noRune
+  // Bounded: `pos` strictly increases by the decoded rune's byte width
+  // (>= 1) every iteration, or the function returns — at most `n + 1`
+  // positions (`0` through `len(s)` inclusive) are ever visited.
+  while (pos <= n) {
+    let (after, width) = stepRune(s, pos)
+    addThread(clist, 0, before, after, ctx)
+    // The linearity invariant, once per input position (never per VM
+    // step): if the sparse-set dedupe above is ever removed, this is what
+    // catches it — the one refactor that silently turns this engine
+    // exponential while every functional test stays green.
+    assert(clist.count <= numInsts, "regex: pike VM thread count exceeded program size")
+    let nextPos = pos + width
+    let (nextAfter, _) = stepRune(s, nextPos)
+    if (stepClist(clist, nlist, after, nextAfter, ctx)) {
+      return true
+    }
+    if (after == noRune) {
+      return false
+    }
+    threadListClear(clist)
+    let tmp = clist
+    clist = nlist
+    nlist = tmp
+    before = after
+    pos = nextPos
+  }
+  return false
+}

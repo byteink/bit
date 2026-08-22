@@ -1,18 +1,21 @@
 # std/regex
 
 Regular expressions, RE2 syntax, matched by linear-time NFA simulation (a
-Pike VM, #2027) rather than backtracking. Backreferences and lookaround are
-never accepted, not merely unimplemented: both require backtracking to
-evaluate, and a backtracking matcher cannot give a statically bounded loop
-count for every pattern — which means a service that compiles a
-user-supplied pattern is one crafted input away from a denial of service.
-Trading that away is the whole point of this module: match time is
-`O(len(pattern) x len(input))`, however the pattern is shaped.
+Pike VM) rather than backtracking. Backreferences and lookaround are never
+accepted, not merely unimplemented: both require backtracking to evaluate,
+and a backtracking matcher cannot give a statically bounded loop count for
+every pattern — which means a service that compiles a user-supplied pattern
+is one crafted input away from a denial of service. Trading that away is
+the whole point of this module: match time is `O(len(input) x
+len(program))`, however the pattern is shaped — there is no input that can
+make it exponential, unlike a backtracking engine on a pattern such as
+`(a?){n}a{n}`.
 
-This first ticket parses a pattern into an AST and validates it — `compile`
-rejects anything malformed with a `regex: <reason> at offset <n>` error, at
-the exact byte the syntax breaks down. Matching (`Regex.matches`, `find`,
-capture groups) lands in later tickets; nothing here matches anything yet.
+`compile` rejects a malformed pattern with a `regex: <reason> at offset <n>`
+error, at the exact byte the syntax breaks down. `Regex.matches` runs the
+compiled program against a string, an unanchored search (like Go's
+`regexp.MatchString`). Match spans and capture groups (`find`, `Match`)
+land in later tickets.
 
 A compiled `Regex` is **immutable** and **safe to share across any number of
 green threads** — the natural usage is one `mustCompile` call, shared by
@@ -24,7 +27,7 @@ same pattern per request.
 ### `Regex`
 
 A compiled, validated regular expression. Opaque: its only public operations
-are `pattern()` and `groupCount()` below (plus matching, once #2027 lands).
+are `pattern()`, `groupCount()` and `matches()` below.
 
 ### `compile(pattern: string): Regex!`
 
@@ -71,3 +74,21 @@ fn wordGroupCount(): int {
 The number of capturing groups in `re`: `(...)`, `(?<name>...)` and
 `(?P<name>...)`, not counting the implicit whole-match group 0 and not
 counting a non-capturing `(?:...)`.
+
+### `Regex.matches(s: string): bool`
+
+Whether `re`'s pattern matches anywhere in `s` — an unanchored search, the
+same convention as Go's `regexp.MatchString`: anchor the pattern itself
+(`^`/`$`) for a whole-string match. Runs a Pike VM over `s`, one
+left-to-right pass, so this always finishes in `O(len(s) x len(program))`
+time; there is no backtracking, so no pattern and no input can make it
+exponential.
+
+```bit
+import { mustCompile } from "std/regex"
+
+fn isColor(s: string): bool {
+  let re = mustCompile("colou?r")
+  return re.matches(s)
+}
+```
