@@ -1506,6 +1506,7 @@ defined exactly once).
 | `bit_rt_select`       | `(descs: *SelectCaseDesc, n: usize, has_default: bool) -> usize` (§11) |
 | `bit_rt_panic`        | `(msg: *const RtBytes) -> noreturn` (§12)               |
 | `bit_rt_panic_div_zero` | `() -> noreturn` (§12.1)                              |
+| `bit_rt_panic_overflow` | `() -> noreturn` (§12.1, §13.5)                       |
 | `bit_rt_panic_nil_call` | `() -> noreturn` (§12.1)                              |
 | `bit_rt_panic_nil_iface` | `() -> noreturn` (§12.1)                             |
 | `bit_rt_assert`       | `(cond: bool, msg: *const RtBytes) -> void` (§12)       |
@@ -1814,15 +1815,16 @@ RtBytes { ptr: *const u8, len: usize }   // extern class — a transient,
   and the abort must already have run. The runtime only terminates the
   process; it does not itself walk or run deferred calls.
 
-### 12.1 Backend-injected, argument-free panics (#2016, #2018, #2240)
+### 12.1 Backend-injected, argument-free panics (#2016, #2018, #2240, #3078)
 
 ```
 bit_rt_panic_div_zero()  -> noreturn
+bit_rt_panic_overflow()  -> noreturn
 bit_rt_panic_nil_call()  -> noreturn
 bit_rt_panic_nil_iface() -> noreturn
 ```
 
-Three checks a backend inserts directly at the operation that would otherwise
+Checks a backend inserts directly at the operation that would otherwise
 fault, rather than through an `Op.RtCall`/lowering-built `RtBytes` message —
 the same "emitted directly, not through the `RtFn` table" class as
 `bit_rt_iface_lookup` (§2.1), and the same alloc-free-panic-path shape as
@@ -1837,6 +1839,15 @@ reporting a broken invariant.
   a non-zero divisor never reaches it. The compile-time-power-of-two fast path
   (`xEmitPow2DivInt`/`xEmitPow2RemInt`) needs no check — its divisor is proven
   non-zero at compile time by construction.
+- `bit_rt_panic_overflow` — a signed add, subtract, multiply or negate that
+  overflows its result width (SPEC.md §13.5: trap in debug builds, wrap in
+  release builds). One symbol covers all four operations, the same way
+  `bit_rt_panic_div_zero` covers both `/` and `%` — the message does not name
+  which operation trapped. Unlike the other panics in this section, the
+  backend's check here is gated on debug-mode codegen, not unconditional: in a
+  release build the operation wraps and this symbol is never called. Not yet
+  called from any codegen path (#3080-#3085 add the checked codegen; this
+  ticket, #3078, only adds the callable symbol).
 - `bit_rt_panic_nil_call` — an indirect call through a nil function value
   (SPEC.md §13.4, §18.4: "call of a `nil` function"). The backend tests the
   closure cell for null immediately before loading its `{code, env}` fields

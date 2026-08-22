@@ -101,6 +101,33 @@ ssh "${X64_HOST}" "docker image inspect ${GATE_IMAGE_REMOTE}" >/dev/null 2>&1 ||
 }
 echo "release.sh: gate images present (${GATE_IMAGE_LOCAL} local, ${GATE_IMAGE_REMOTE} on ${X64_HOST})"
 
+# --- preflight: SBOM venv reachability + hash integrity (#2802) -------------
+# dist/sbom.py needs cyclonedx-python-lib, which this Mac does not carry
+# system-wide (#2748). `pip install --require-hashes` against
+# dist/sbom-requirements.txt is the ONLY step in this whole release that
+# needs PyPI, and it used to run after the three cross-builds and their
+# on-hardware smoke tests — about 10 minutes in — so an unreachable PyPI or a
+# stale mirror cost the operator the whole run, discovered far too late to be
+# useful. Resolve it now, before anything is built. ${SBOM_VENV} stays alive
+# across the whole build; the actual `dist/sbom.py` invocation still happens
+# at its original site near the checksums, since its output path depends on
+# ${OUT} — this only moves WHEN reachability and hash integrity are checked,
+# never weakens --require-hashes, and never installs anything outside this
+# throwaway venv.
+echo "release.sh: preflighting the SBOM venv (dist/sbom-requirements.txt)"
+SBOM_VENV="$(mktemp -d)"
+python3 -m venv "${SBOM_VENV}"
+"${SBOM_VENV}/bin/pip" install --quiet --require-hashes -r dist/sbom-requirements.txt || {
+	echo "release.sh: could not install dist/sbom-requirements.txt into a throwaway venv" >&2
+	echo "  either PyPI is unreachable (check network / PIP_INDEX_URL) or a hash in" >&2
+	echo "  that file no longer matches the package it pins. Diagnose with:" >&2
+	echo "    python3 -m venv /tmp/sbomcheck && /tmp/sbomcheck/bin/pip install --require-hashes -r dist/sbom-requirements.txt -v; rm -rf /tmp/sbomcheck" >&2
+	echo "  then fix the network path or repin dist/sbom-requirements.txt and retry." >&2
+	rm -rf "${SBOM_VENV}"
+	exit 1
+}
+echo "release.sh: SBOM dependencies resolved"
+
 TARGETS=(x86_64-linux aarch64-linux aarch64-macos)
 
 echo "release.sh: building the bootstrap runtime archives (L0, stage0-built)"
@@ -538,17 +565,15 @@ fi
 #
 # dist/sbom.py needs cyclonedx-python-lib, which this Mac does not carry
 # system-wide (#2748: a fifth release artifact, dist/README.md's "## SBOM",
-# was never generated because nothing called the generator). A throwaway venv,
-# torn down right after, is the same isolation dist/sbom_test.py already uses —
-# pinned by the same dist/sbom-requirements.txt so the two never drift apart —
-# so this leaves no package installed on the host.
+# was never generated because nothing called the generator). The venv itself
+# and its `pip install --require-hashes` were preflighted at the top of this
+# script, before the cross-builds (#2802) — reachability and hash integrity
+# are already proven by the time we get here, so only the actual generation,
+# whose output path depends on ${OUT}, happens at this site.
 echo "release.sh: generating SBOM"
-sbomVenv="$(mktemp -d)"
-python3 -m venv "${sbomVenv}"
-"${sbomVenv}/bin/pip" install --quiet --require-hashes -r dist/sbom-requirements.txt
-"${sbomVenv}/bin/python3" dist/sbom.py "${VERSION}" "${STAGE0_VERSION}" \
+"${SBOM_VENV}/bin/python3" dist/sbom.py "${VERSION}" "${STAGE0_VERSION}" \
 	> "${OUT}/bit-${VERSION}.cdx.json"
-rm -rf "${sbomVenv}"
+rm -rf "${SBOM_VENV}"
 echo "release.sh: wrote ${OUT}/bit-${VERSION}.cdx.json"
 
 # --- checksums and notes ----------------------------------------------------

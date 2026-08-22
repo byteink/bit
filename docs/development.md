@@ -705,6 +705,19 @@ Splitting can also make a test **vacuous rather than failing**: any gate that
 names a single source path will keep scanning the remnant. Point such gates at a
 directory and error on finding zero sources.
 
+## Runtime core and OS providers
+
+`runtime/<mod>/<mod>.bit` holds every non-OS behavior. `runtime/<mod>/linux/`
+and `runtime/<mod>/darwin/` hold only OS primitives — a `syscall` on Linux, an
+`extern function` or libSystem call on Darwin. A reviewer rejects any change
+that adds the same non-OS function to both provider directories: a fix
+applied to a copy never reaches its sibling (`scripts/selfhost-diffcheck.sh:118`
+is the case study this repo already paid for). `scripts/provider-move-check.sh`
+proves a pull-up out of a provider is a pure move; it still misses two things a
+green build won't (see "File size" above): diagnostic order is normative (SPEC
+§14.8), and filename order drives inlining depth — check both directly, never
+by wall clock.
+
 ## ARM64 crypto acceleration
 
 **There is no ARM64 crypto acceleration in this tree, and no `BIT_CRYPTO_HW`
