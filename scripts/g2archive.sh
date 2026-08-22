@@ -112,11 +112,11 @@ fi
 # reference — a module nothing externs would simply have been absent, with
 # every gate green.
 PLATFORM_FREE_RELS="- alloc auxv chan cryptohw gc net park rand root sched shims shims/scan stw syscalls thread"
-PLATFORM_PAIRS="alloc net park rand root sched thread"
+PLATFORM_PAIRS="alloc gc net park rand root sched thread"
 
-# Windows is mid-port (epic #3322): alloc, park, rand, root, sched and thread
-# have a runtime/<pair>/windows/ directory today (#3330, #3336, #3338, #3331,
-# #3339, #3335). net's windows sibling is tracked (#3340, socket ops) and not
+# Windows is mid-port (epic #3322): alloc, gc, park, rand, root, sched and
+# thread have a runtime/<pair>/windows/ directory today (#3330, #3336, #3338,
+# #3331, #3339, #3335, #3420). net's windows sibling is tracked (#3340, socket ops) and not
 # yet on disk, so it correctly stays out of this list. `thread` (#3335) lands
 # here on the completeness check's own terms, not because anything consumes it
 # yet: `runtime/thread/windows/spawn.bit` exists and compiles cleanly for the
@@ -135,14 +135,19 @@ PLATFORM_PAIRS="alloc net park rand root sched thread"
 # `pollCreate`/`pollDrain`/`pollClose` from it, the same three points
 # ../linux/boot.bit and ../darwin/boot.bit call their own twins from —
 # correcting this comment's own prior claim that sched "may not need" a
-# windows pair at all.
+# windows pair at all. `gc` landed #3420: `gcThreadToken`'s token read is now
+# OS-specific (Windows reads the TEB self-pointer at gs:[0x30]; Linux/Darwin
+# still read fs:0/TPIDRRO_EL0 unchanged), the same "one x64 payload cannot
+# answer for every OS" problem `park` hit, fixed the same way — an `extern fn
+# bit_rt_port_gc_thread_token` in the platform-free runtime/gc/gcthread.bit,
+# implemented per OS in runtime/gc/{linux,darwin,windows}/gcthread.bit.
 # Hand-maintained rather than derived from `find`, on purpose: an
 # auto-detected list would also silently swallow a genuine accidental
-# deletion under linux/darwin, where all seven pairs must always be
+# deletion under linux/darwin, where all eight pairs must always be
 # present — this list only relaxes the requirement for the one platform
 # still being built out. As each pair's windows port lands, add its name
 # here in the same commit.
-WINDOWS_PAIRS="alloc park rand root sched thread"
+WINDOWS_PAIRS="alloc gc park rand root sched thread"
 
 case "$PLAT" in
   windows) PAIRS_FOR_PLAT="$WINDOWS_PAIRS" ;;
