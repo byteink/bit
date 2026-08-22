@@ -1,0 +1,254 @@
+// tests/bit/testtimeout/testtimeout.bit — regression gate for #2274: `bit
+// test --timeout <seconds>` bounds ONE test's own process rather than the
+// whole run, names it as timed out, keeps running the rest, and leaves no
+// orphaned child behind once it returns.
+//
+// NOT placed in tests/cases/ (golden.bit's corpus): the property under test
+// is `bit test` ITSELF (compiler/testrun.bit's per-test dispatch loop and
+// its use of `osRunTestBounded`), which golden.bit's single-file
+// build-then-run-the-binary convention never invokes — the same "route it
+// to tests/bit/ behind a registered gate" treatment tests/bit/testpanic.bit
+// (#2839) already uses for a fixture golden.bit is structurally unsuited to
+// run.
+//
+// THE HUNG FIXTURE IS WRITTEN TO SCRATCH AT RUN TIME, NEVER COMMITTED. A
+// permanently-hanging `.bit` source file living anywhere under `tests/`
+// would hang any harness that walks every directory with no allow-list —
+// `tests/bit/stress/` in particular, and `bit test`'s own recursive project
+// walk (compiler/testrun.bit) if ever pointed at a directory containing one.
+//
+// THE `--timeout` VALUE THIS GATE PASSES IS DELIBERATELY GENEROUS (20s, not
+// the ticket's own illustrative "--timeout 5"): a shared CI/dev box under
+// load can make even a trivial fork+exec take several real seconds — this
+// harness's own author measured 9.6s wall clock for one instantly-passing
+// test alone, at load 32-45 on an 18-core Mac (#2274's own dispatch). A
+// timeout gate that is itself flaky under load is worse than the bug it
+// tests: the CORRECTNESS assertions below (exit code, wording, orphan
+// absence) are not wall-clock sensitive at all, only the bound's own value
+// is, so 20s buys real headroom without materially lengthening the gate —
+// `test_b_hangs_forever` is the only fixture test that ever actually waits
+// for it.
+//
+// WIRED INTO `./make test` as `test-timeout` (tools/build/gates.bit,
+// tools/build/defs.bit).
+
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir } from "std/fs"
+import { parseInt, trimSpace, contains } from "std/strings"
+
+// The WRAPPER's own outer bound around one whole `bit test` invocation —
+// `osRunBounded`'s ceiling, a defense-in-depth backstop in case the fix
+// under test has a bug and the internal `--timeout` never fires at all.
+// Generous on purpose: worst case here is one build plus three dispatched
+// tests, one of which waits out `testFlagTimeoutS` below.
+const defaultWrapperTimeoutS: int = 120
+const maxTimeoutMs: int = 3600000
+
+// The value passed to `bit test ... --timeout <this>`, in SECONDS. See the
+// header for why 20, not the ticket's illustrative 5.
+const testFlagTimeoutS: int = 20
+
+fn requiredEnv(name: string): string {
+  let v = env(name)
+  if (v == "") {
+    eprint("testtimeout: ${name} is not set — refusing to guess.\n")
+    exit(2)
+  }
+  return v
+}
+
+fn wrapperTimeoutMs(): int {
+  let raw = trimSpace(envOr("BIT_TEST_TIMEOUT_S", ""))
+  if (raw == "") {
+    return defaultWrapperTimeoutS * 1000
+  }
+  let s = parseInt(raw) catch _ {
+    return defaultWrapperTimeoutS * 1000
+  }
+  if (s <= 0) {
+    return maxTimeoutMs
+  }
+  if (s * 1000 > maxTimeoutMs) {
+    return maxTimeoutMs
+  }
+  return s * 1000
+}
+
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+// Exactly the ticket's own repro (#2274): `test_a_runs_first` passes,
+// `test_b_hangs_forever` never terminates, `test_c_would_run_if_b_ever_finished`
+// proves the run continued past the hang. Named `timeoutfixture_hang` (not
+// just `hang`) so the spawned test binary's path — `/tmp/bit-test-<stem>-
+// <nonce>` (compiler/testrun.bit's `runModuleTests`) — is distinctive enough
+// for the orphan check's `pgrep -f` below to never false-match a sibling
+// agent's own scratch work (`$TMPDIR` is shared across every concurrent
+// agent in this workspace).
+const hangFixtureSrc: string =
+  "import { ok } from \"std/testing\"\n\n" +
+  "fn test_a_runs_first() { ok(true, \"fine\") }\n\n" +
+  "fn test_b_hangs_forever() {\n" +
+  "  let n = 0\n" +
+  "  for (; true; ) { n = n + 1 }\n" +
+  "  ok(n > 0, \"never reached\")\n" +
+  "}\n\n" +
+  "fn test_c_would_run_if_b_ever_finished() { ok(true, \"fine\") }\n"
+
+// The negative control: three tests that all pass immediately. Proves the
+// bound does not perturb a healthy run — without this, "the timeout works"
+// could equally mean "the timeout fires on everything" (#2274's dispatch).
+const fastFixtureSrc: string =
+  "import { ok } from \"std/testing\"\n\n" +
+  "fn test_one() { ok(true, \"one\") }\n" +
+  "fn test_two() { ok(true, \"two\") }\n" +
+  "fn test_three() { ok(true, \"three\") }\n"
+
+// Runs `bit test <srcPath> <extraArgv>` with BIT_STDLIB exported, capturing
+// stdout/stderr/exit code the same way tests/bit/testpanic.bit does: the
+// wrapper script always itself exits 0 and writes the real status to
+// `code.txt`, so a missing file is unmistakably "the run never happened"
+// rather than a status any assertion could mistake for success.
+fn runBitTest(bin: string, stdlib: string, dir: string, tag: string, srcPath: string, extraArgv: string): (int, string, string) {
+  let shPath = "${dir}/run_${tag}.sh"
+  let outPath = "${dir}/run_${tag}.out"
+  let errPath = "${dir}/run_${tag}.err"
+  let codePath = "${dir}/run_${tag}.code"
+  let script = "#!/bin/sh\n" +
+    "BIT_STDLIB=" + shQuote(stdlib) + "\nexport BIT_STDLIB\n" +
+    "exec " + shQuote(bin) + " test " + shQuote(srcPath) + " " + extraArgv +
+    " > " + shQuote(outPath) + " 2> " + shQuote(errPath) + "\n"
+  writeFile(shPath, script) catch e {
+    eprint("testtimeout: cannot write ${shPath}: ${e.message()}\n")
+    exit(2)
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    eprint("testtimeout: cannot chmod ${shPath}\n")
+    exit(2)
+  }
+  // The wrapper always reports 0 for ITSELF; the actual `bit test` status is
+  // read back from stdout/stderr captured above via its own process exit,
+  // observed here through `osRunBounded`'s return — a negative return is
+  // that primitive's OWN mechanism channel (spawn failure / timeout / signal
+  // death), never a `bit test` exit code, so each is a named panic rather
+  // than a value any assertion could consume as if it were one.
+  let code = osRunBounded(shPath, wrapperTimeoutMs())
+  if (code == -2) {
+    panic("testtimeout: the WRAPPER'S OWN ceiling (${wrapperTimeoutMs()}ms) elapsed running ${tag} — the fix under test did not bound the hang at all")
+  }
+  if (code == -1) {
+    panic("testtimeout: could not spawn ${shPath}")
+  }
+  if (code <= -100) {
+    panic("testtimeout: ${shPath} died on signal ${-100 - code}")
+  }
+  let out = readFile(outPath) catch _ { "" }
+  let err = readFile(errPath) catch _ { "" }
+  return code, out, err
+}
+
+// Whether any process matching `pattern` is alive — the orphan check.
+// `pgrep -f` exits 1 on no match (the GOOD outcome here) and 0 on a match,
+// so the shell script never reads that exit code as its own: it always
+// writes 0 and lets the caller inspect `orphanPath`'s captured lines
+// instead, exactly the `code.txt` discipline `runBitTest` above uses for
+// the same reason (a piped/inverted exit code is this repo's most common
+// verification trap).
+fn checkNoOrphan(dir: string, pattern: string): string {
+  let shPath = "${dir}/orphan.sh"
+  let orphanPath = "${dir}/orphan.txt"
+  let script = "#!/bin/sh\n" +
+    "pgrep -f " + shQuote(pattern) + " > " + shQuote(orphanPath) + " 2>/dev/null\n" +
+    "exit 0\n"
+  writeFile(shPath, script) catch e {
+    eprint("testtimeout: cannot write ${shPath}: ${e.message()}\n")
+    exit(2)
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    eprint("testtimeout: cannot chmod ${shPath}\n")
+    exit(2)
+  }
+  osRunBounded(shPath, 10000)
+  return readFile(orphanPath) catch _ { "" }
+}
+
+class Tally { checks: int, failures: int }
+
+fn check(t: Tally, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    eprint("FAIL: ${label}\n")
+  }
+}
+
+fn main() {
+  let bin = requiredEnv("BIT_SELF_EXE")
+  let stdlib = requiredEnv("BIT_STDLIB")
+  let t = Tally{ checks: 0, failures: 0 }
+
+  let scratch = envOr("TMPDIR", "/tmp") + "/bit-testtimeout-${timeUnixNs()}"
+  mkdir(scratch) catch e {
+    eprint("testtimeout: cannot create ${scratch}: ${e.message()}\n")
+    exit(2)
+  }
+
+  // --- the hang: bounded, named, and the run continues past it ---------
+  let hangSrc = "${scratch}/timeoutfixture_hang.bit"
+  writeFile(hangSrc, hangFixtureSrc) catch e {
+    eprint("testtimeout: cannot write ${hangSrc}: ${e.message()}\n")
+    exit(2)
+  }
+  let (hangCode, hangOut, hangErr) = runBitTest(bin, stdlib, scratch, "hang", hangSrc,
+    "--timeout ${testFlagTimeoutS}")
+  check(t, hangCode != 0, "bit test on the hang fixture must exit non-zero, got ${hangCode} (stderr: ${hangErr})")
+  check(t, contains(hangOut, "ok   test_a_runs_first"),
+    "the fast test before the hang must still pass: ${hangOut}")
+  check(t, contains(hangOut, "FAIL test_b_hangs_forever (timed out)"),
+    "the hung test must be reported FAILED and named as timed out: ${hangOut}")
+  check(t, contains(hangOut, "ok   test_c_would_run_if_b_ever_finished"),
+    "the test AFTER the hang must still run — one hung test must not cost the whole run: ${hangOut}")
+  check(t, contains(hangOut, "discovered 3 tests, ran 3"),
+    "all 3 discovered tests must have been RUN (not skipped after the hang): ${hangOut}")
+
+  // --- the orphan check: after `bit test` has returned on its own, the ---
+  // --- hung child's whole process group must already be gone -----------
+  let orphan = trimSpace(checkNoOrphan(scratch, "bit-test-timeoutfixture_hang-"))
+  check(t, orphan == "", "the hung test's child must not survive `bit test`'s own return; pgrep found: ${orphan}")
+
+  // --- negative control: a healthy run is byte-identical with and ------
+  // --- without an explicit --timeout (the bound must not perturb it) ---
+  let fastSrc = "${scratch}/timeoutfixture_fast.bit"
+  writeFile(fastSrc, fastFixtureSrc) catch e {
+    eprint("testtimeout: cannot write ${fastSrc}: ${e.message()}\n")
+    exit(2)
+  }
+  let (defCode, defOut, defErr) = runBitTest(bin, stdlib, scratch, "fast_default", fastSrc, "")
+  let (boundCode, boundOut, boundErr) = runBitTest(bin, stdlib, scratch, "fast_bounded", fastSrc,
+    "--timeout ${testFlagTimeoutS}")
+  check(t, defCode == 0, "the fast fixture with NO --timeout must pass: ${defErr}")
+  check(t, boundCode == 0, "the fast fixture WITH --timeout must still pass: ${boundErr}")
+  check(t, defOut == boundOut,
+    "an explicit --timeout must not change a healthy run's output:\n  default: ${defOut}\n  bounded: ${boundOut}")
+
+  if (t.checks < 8) {
+    eprint("testtimeout: only ${t.checks} checks ran, want at least 8\n")
+    t.failures = t.failures + 1
+  }
+  if (t.failures > 0) {
+    println("testtimeout: FAIL — ${t.failures} of ${t.checks} checks failed")
+    exit(1)
+  }
+  println("testtimeout: PASS — ${t.checks} checks")
+}
