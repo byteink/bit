@@ -97,12 +97,12 @@ if [ "$LEFT" != "0" ]; then
   exit 1
 fi
 
-# --- Module set: 15 platform-free dirs + 7 platform-specific pairs (22 total). ---
-# Matches tests/bit/rootpins/'s module split and the module set the G3 (#1584)
-# attempts converged on. Each entry is REL (module directory relative to $RT,
-# empty string for $RT itself) and LABEL (the archive-member-friendly name,
-# matching the "runtime_alloc.o" / "runtime_root_darwin.o" shape prior
-# sessions' `ar t` output showed).
+# --- Module set: 16 platform-free dirs + 9 platform-specific pairs (25 for a
+# linux/darwin build). Matches tests/bit/rootpins/'s module split and the
+# module set the G3 (#1584) attempts converged on. Each entry is REL (module
+# directory relative to $RT, empty string for $RT itself) and LABEL (the
+# archive-member-friendly name, matching the "runtime_alloc.o" /
+# "runtime_root_darwin.o" shape prior sessions' `ar t` output showed).
 #
 # This list is HAND-MAINTAINED and the completeness check below is why it is
 # safe to be: `runtime/cryptohw` was added to the tree after G3 was first
@@ -111,8 +111,13 @@ fi
 # stdlib/crypto declares those symbols `extern` and E0078 caught the dangling
 # reference — a module nothing externs would simply have been absent, with
 # every gate green.
+#
+# `cryptohw` joined PLATFORM_PAIRS (#2520): ARM64 crypto-capability detection
+# needs a real `getauxval` (linux) / `sysctlbyname` (darwin) provider per OS,
+# unlike the rest of ../cryptohw.bit, which is one placeholder file shared by
+# every target.
 PLATFORM_FREE_RELS="- alloc auxv chan cryptohw gc net park rand root sched shims shims/scan stw syscalls thread"
-PLATFORM_PAIRS="alloc gc net park rand root sched thread"
+PLATFORM_PAIRS="alloc cryptohw gc net park rand root sched thread"
 
 # Windows is mid-port (epic #3322): alloc, gc, park, rand, root, sched and
 # thread have a runtime/<pair>/windows/ directory today (#3330, #3336, #3338,
