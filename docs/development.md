@@ -471,7 +471,7 @@ default budget, `defaultTimeoutS` seconds (`stress.bit:166`), applied as its own
 wall-clock deadline to each of the program's three bounded subprocesses in
 turn — compile, the default-policy run, and the `BIT_GC=stress` run
 (`resolveTimeoutMs` folds the effective budget into a per-program `Ctx` at
-`stress.bit:608-624`, and `runScript`/`osRunBounded` re-apply it separately at
+`stress.bit:568-584`, and `runScript`/`osRunBounded` re-apply it separately at
 each phase, `verify.bit:221-233`, called from `buildProgram` at `verify.bit:249`
 and `runOnce` at `verify.bit:271`). `BIT_TEST_TIMEOUT_S` raises or lowers that
 default for the whole corpus. A program directory may instead hold a file
@@ -480,7 +480,7 @@ markers (`tests/stress/<name>/timeout-s`) — one line holding a single positive
 integer, the whole-program budget in seconds for that program only, trailing
 whitespace and a trailing newline both fine. Precedence is exactly:
 a valid `timeout-s` file wins over `BIT_TEST_TIMEOUT_S`, which wins over
-`defaultTimeoutS` (`timeoutSOverrideMs`/`resolveTimeoutMs`, `stress.bit:422-441`).
+`defaultTimeoutS` (`timeoutSOverrideMs`/`resolveTimeoutMs`, `stress.bit:381-401`).
 A present-but-unparsable file fails that one program outright rather than
 silently falling back to the default — a typo must not quietly disable the
 deadline it was meant to set.
@@ -491,18 +491,23 @@ delaying how fast a real hang anywhere else in the corpus is caught — the
 per-program file exists precisely so one program's cost does not become every
 program's risk.
 
-**No program holds a `timeout-s` file today.** The one that needs a wider
-budget, `tests/stress/quicwire`, gets it from an older and less discoverable
-route: `timeoutMsForProgram` (`stress.bit:401-406`) hardcodes `baseMs * 4` for
-the name `quicwire`, so it runs on 1200s while every other program runs on the
-300s default. That landed as #3210 and predates this file mechanism.
+**`tests/stress/quicwire/timeout-s` holds `1200`** — the one program in the
+corpus that needs a wider budget than the 300s default. It used to get that
+budget from a second, less discoverable mechanism instead: `timeoutMsForProgram`
+hardcoded `baseMs * 4` for the name `quicwire` (#3210, 2026-08-17, predating
+this file's mechanism). #2696 replaced the hardcode with the file and deleted
+`timeoutMsForProgram` outright — nothing else called it — so quicwire's budget
+is one mechanism now, not two.
 
-**The two do not layer — a valid file REPLACES the name-based hook**
-(`resolveTimeoutMs`, `stress.bit:436-441`: an absent file falls through to
-`timeoutMsForProgram`, a present one returns outright). So writing a
-`timeout-s` for quicwire with any value below 1200 *lowers* its budget, which
-is the opposite of what such a file usually intends. Anyone adding one must
-read the hardcode first, and the right end state is one mechanism, not two.
+**A valid file always wins outright; the two never layer**
+(`resolveTimeoutMs`, `stress.bit:396-401`: an absent file falls through to
+`cx.timeoutMs`, i.e. `defaultTimeoutS` scaled by `BIT_TEST_TIMEOUT_S`/host
+load; a present one returns instead of adding to it). That non-layering is why
+migrating quicwire off the hardcode had to land in the same commit as the
+file: writing a `timeout-s` file for a program still covered by a name-based
+hook replaces its budget rather than widening it — #2696 itself would have
+halved quicwire's from 1200s to 600s had it shipped the file alone without
+also removing the hook.
 
 Doc snippets are gated: `tests/bit/docs.bit` typechecks every Bit-tagged fenced
 code block under `docs/`, and `tests/bit/stdlibdocs.bit` fails on an undocumented
