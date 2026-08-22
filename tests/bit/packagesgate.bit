@@ -1,0 +1,245 @@
+// `./make test-packages` / `./make test-package-<name>` (#3271, epic:
+// first-party packages under `pkg/<name>/`).
+//
+// THE ASYMMETRY THIS GATE EXISTS FOR (bitlang-ws/CLAUDE.md, "First-party
+// packages"): nothing in compiler/**, runtime/**, or stdlib/** imports a
+// package — a package is a leaf, so a pkg/**-only diff can never break the
+// language, and scripts/gate.sh's `pkg` bucket runs ONLY this gate for one.
+// The language CAN break a package, so the selfhost/runtime/stdlib/full
+// buckets in that same script run this gate TOO, in addition to their own
+// steps — getting that backwards, running it only on a package diff, is
+// exactly how a compiler change would silently break every package at once.
+//
+// Registered in `coreSteps()` (tools/build/defs.bit), deliberately NOT
+// `gateSteps()`, the same reason `test-differentials` is: a package's own
+// compliance corpus (a future toml-test or yaml-test-suite) must never grow
+// the mandatory ~19-minute `./make test` suite.
+//
+// One package alone: `./make test-package-<name>` sets BIT_PACKAGE_FILTER,
+// which this harness only ever receives from tools/build/gates.bit's
+// filesystem-driven `packageGates()` — one Gate{} per `pkg/<name>/`
+// directory that exists when the driver runs, never typed by hand.
+//
+// Configure by environment, since `bit run` forwards no argv to a program:
+//   BIT_REPO             repo root, so pkg/ resolves regardless of cwd (required)
+//   BIT_BIN              compiler under test    (default bit-out/bin/bit)
+//   BIT_PACKAGE_FILTER   run exactly this package name only (default: all)
+//   BIT_TEST_TIMEOUT_S   per-package deadline, seconds (default 300, max 3600)
+//
+// Each package's tests are `bit test pkg/<name>` (SPEC §19): that subcommand
+// already builds the module and runs every top-level `fn test_<name>()`, so
+// there is no bespoke build+run pairing to make here the way
+// tests/bit/examplesgate.bit needs one for a plain showcase program.
+//
+// ZERO packages is not a failure: `pkg/` exists and is empty today (this
+// ticket's own deliverable, ahead of #1481/#1482 landing real ones), and a
+// gate that reddens on an empty, correctly-shaped input is worse than one
+// that has simply never been exercised yet.
+
+import { exists, isDir, readDir, readFile, writeFile } from "std/fs"
+import { env, envOr, exit } from "std/os"
+import { join } from "std/path"
+import { parseInt } from "std/strings"
+import { now } from "std/time"
+
+const defaultTimeoutS: int = 300
+const maxTimeoutS: int = 3600
+const timeoutEnvVar: string = "BIT_TEST_TIMEOUT_S"
+
+// `osRunBounded`'s result encoding (ABI.md §19). `<= rcSignalBase` means the
+// child died of signal `-(r) - 100`.
+const rcSpawnFailed: int = -1
+const rcTimedOut: int = -2
+const rcSignalBase: int = -100
+
+const outcomeOk: int = 0
+const outcomeFailed: int = 1
+const outcomeTimedOut: int = 2
+
+// BIT_REPO IS REQUIRED, same reason as tests/bit/coldboot.bit and
+// tests/bit/selfhostdiff.bit: falling back to "." would silently test
+// whatever directory `bit` happened to be invoked from instead of refusing.
+fn repoRoot(): string {
+  let r = env("BIT_REPO")
+  if (len(r) == 0) {
+    panic("packagesgate: BIT_REPO is not set — run this through `./make test-packages`")
+  }
+  return r
+}
+
+fn main() {
+  let bin = envOr("BIT_BIN", "bit-out/bin/bit")
+  let dir = "${repoRoot()}/pkg"
+
+  if (!exists(bin)) {
+    eprint("packagesgate: compiler not found: ${bin} (set BIT_BIN)\n")
+    exit(1)
+    return
+  }
+  if (!isDir(dir)) {
+    eprint("packagesgate: not a directory: ${dir}\n")
+    exit(1)
+    return
+  }
+
+  let all = discover(dir)
+  let filter = envOr("BIT_PACKAGE_FILTER", "")
+  let cases = filterCases(all, filter)
+  if (len(filter) > 0 && len(cases) == 0) {
+    eprint("packagesgate: no package named '${filter}' under ${dir}\n")
+    exit(1)
+    return
+  }
+  if (len(cases) == 0) {
+    print("packagesgate: 0 package(s) under ${dir} — nothing to test\n")
+    return
+  }
+  exit(runAll(bin, dir, cases, timeoutSeconds() * 1000))
+}
+
+// The package directory names under `dir`: one level, already sorted
+// (`readDir`), filtered to real subdirectories — dotfiles (and the tracked
+// `.gitkeep` that keeps this directory in git while it holds no package yet)
+// are excluded the same way compiler/testrun.bit's `testWalkSkipsDir` skips
+// them.
+fn discover(dir: string): []string {
+  let names = readDir(dir) catch _ {
+    eprint("packagesgate: cannot read ${dir}\n")
+    exit(1)
+    return []string(0)
+  }
+  let cases = []string(0)
+  for name of names {
+    if (len(name) > 0 && name[0] == '.') {
+      continue
+    }
+    if (isDir(join(dir, name))) {
+      cases = append(cases, name)
+    }
+  }
+  return cases
+}
+
+fn filterCases(all: []string, filter: string): []string {
+  if (len(filter) == 0) {
+    return all
+  }
+  let out = []string(0)
+  for name of all {
+    if (name == filter) {
+      out = append(out, name)
+    }
+  }
+  return out
+}
+
+// Runs every case and returns the process exit code: 0 all green, 1 a real
+// failure, 2 at least one TIMED OUT — matching
+// tests/bit/examplesgate.bit's convention: a hang decided nothing and is not
+// a pass, and a caller can tell the two apart.
+fn runAll(bin: string, dir: string, cases: []string, timeoutMs: int): int {
+  let failed = 0
+  let timedOut = 0
+  let i = 0
+  while (i < len(cases)) {
+    let r = runPackage(bin, dir, cases[i], i, timeoutMs)
+    if (r == outcomeTimedOut) {
+      timedOut = timedOut + 1
+    } else if (r == outcomeFailed) {
+      failed = failed + 1
+    } else {
+      print("ok ${cases[i]}\n")
+    }
+    i = i + 1
+  }
+  if (timedOut > 0) {
+    eprint("packagesgate: FAILED — ${timedOut} timed out, ${failed} failed\n")
+    return 2
+  }
+  if (failed > 0) {
+    eprint("packagesgate: FAILED — ${failed} of ${len(cases)} package(s)\n")
+    return 1
+  }
+  print("${len(cases)}/${len(cases)} package(s) passed \"bit test\"\n")
+  return 0
+}
+
+// Runs `bit test <dir>/<name>` as one bounded child. `bit test` (SPEC §19)
+// already builds the module and runs every `fn test_<name>()`, so there is
+// no separate build/run split to make here.
+fn runPackage(bin: string, dir: string, name: string, idx: int, timeoutMs: int): int {
+  let base = "/tmp/bit-packagesgate-${name}-${now()}-${idx}"
+  let log = "${base}.log"
+  let cmd = "exec \"${bin}\" test \"${join(dir, name)}\""
+  let r = runBounded("${base}.sh", log, cmd, timeoutMs)
+  if (r != 0) {
+    return report(name, r, log)
+  }
+  fsRemove(log)
+  return outcomeOk
+}
+
+// Writes `cmd` into an executable `/bin/sh` script and runs it under a
+// deadline, with the script's output captured in `log` — same shape as
+// tests/bit/examplesgate.bit's `runBounded`, since `osRunBounded` takes a
+// path and no argv (ABI.md §19).
+fn runBounded(script: string, log: string, cmd: string, timeoutMs: int): int {
+  writeFile(script, "#!/bin/sh\nexec >\"${log}\" 2>&1\n${cmd}\n") catch e {
+    eprint("packagesgate: cannot write ${script}: ${e.message()}\n")
+    return rcSpawnFailed
+  }
+  if (fsChmod(script, 493) != 0) {
+    eprint("packagesgate: cannot make ${script} executable\n")
+    fsRemove(script)
+    return rcSpawnFailed
+  }
+  let r = osRunBounded(script, timeoutMs)
+  fsRemove(script)
+  return r
+}
+
+fn report(name: string, r: int, log: string): int {
+  if (r == rcTimedOut) {
+    eprint("package '${name}': TIMED OUT\n")
+    eprint("  killed at the ${timeoutEnvVar} deadline; raise it on a slower host\n")
+    fsRemove(log)
+    return outcomeTimedOut
+  }
+  if (r <= rcSignalBase) {
+    eprint("package '${name}': CRASHED — signal ${0 - r + rcSignalBase}\n")
+  } else if (r == rcSpawnFailed) {
+    eprint("package '${name}': could not spawn \"bit test\"\n")
+  } else {
+    eprint("package '${name}': \"bit test\" exited ${r}\n")
+  }
+  let text = readFile(log) catch _ {
+    ""
+  }
+  if (len(text) > 0) {
+    eprint("--- ${name} output ---\n${text}\n")
+  }
+  fsRemove(log)
+  return outcomeFailed
+}
+
+// The per-package limit in seconds. An unset or unparsable value falls back
+// to the default rather than failing the run — this is a host knob, not a
+// property of the corpus — and any value is clamped into [1, maxTimeoutS] so
+// a typo can neither disable the deadline nor make it useless.
+fn timeoutSeconds(): int {
+  let raw = envOr(timeoutEnvVar, "")
+  if (len(raw) == 0) {
+    return defaultTimeoutS
+  }
+  let n = parseInt(raw) catch _ {
+    eprint("packagesgate: ${timeoutEnvVar}='${raw}' is not a number\n")
+    return defaultTimeoutS
+  }
+  if (n < 1) {
+    return 1
+  }
+  if (n > maxTimeoutS) {
+    return maxTimeoutS
+  }
+  return n
+}

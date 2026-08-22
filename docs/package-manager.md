@@ -223,3 +223,69 @@ adds an unlocked dependency itself.
   the JSON parser's existing nesting-depth guard - an oversized or
   maliciously deep manifest from a third-party remote is refused before any
   parsing happens.
+
+## First-party packages (`pkg/<name>/`)
+
+First-party packages live in `pkg/<name>/` - a subfolder of this repo, not a
+separate repo per package. One repo, one gate: each package is consumed by
+its vanity name, `bitlang.org/pkg/<name>` (SPEC §17.7, and the `dir <path>`
+extension a vanity document can carry, described above), so the git host is
+never written into any consumer's `bit.json` and a package could move to its
+own repo later with zero consumer churn if it ever needed to.
+
+**Releasing a package is a git tag and nothing else.** `bit add` clones the
+dependency's repo at a ref, so the artifact *is* the tag - there is no
+tarball, no ghcr image, no brew formula, and `dist/release.sh` (the
+compiler's own eight-surface release checklist) is not involved at all.
+Per-package tags are `<name>/vX.Y.Z` (e.g. `toml/v0.1.0`), independent of the
+compiler's own `v0.1.x` series; `dist/changelog.sh` matches `v*` only, so a
+package tag is never mistaken for a compiler release.
+
+And the compiler side of a package release comes free: a package tag names a
+commit already on `main`, and `main` is only ever pushed after this repo's
+own full gate, so the language is already proven green at that commit. The
+package release owes only its own gate, below.
+
+### Why a package release must not run the language's gate
+
+The whole reason packages live in this repo's own `pkg/` rather than in
+`~/.bit/pkg`-style external repos is convenience - one clone, one build, one
+CI-free workflow. That convenience is worthless if updating one package
+means paying the language's own ~62-minute pre-push gate
+(`rm -rf bit-out && ./make && ./make test && ./make test-differentials`) for
+a change that cannot possibly touch the compiler. So packages get their own
+gate, built on one asymmetry:
+
+- **A package cannot break the language.** Nothing in `compiler/**`,
+  `runtime/**`, `stdlib/**` or `tools/build/**` imports a package - a
+  package is a leaf. For a `pkg/**`-only diff, every one of this repo's
+  other gates is provably irrelevant, not merely expensive.
+- **The language can break a package.** So the dependency runs one way and
+  the gating must too - a compiler, runtime, stdlib, or build-driver change
+  must run the package gate too, or a language change could silently break
+  every package with nothing catching it.
+
+Concretely:
+
+| what the diff touches | what runs |
+|---|---|
+| `pkg/<name>/**` only | `./make test-packages` |
+| `compiler/`, `runtime/`, `stdlib/`, `tools/build/` | the language's own gate(s) **plus** `./make test-packages` |
+
+`./make test-packages` runs every package's own tests (`bit test pkg/<name>`,
+SPEC §19, against every directory `pkg/` currently holds) in one process.
+`./make test-package-<name>` runs exactly one, so releasing `toml` does not
+also run `yaml`'s compliance corpus. Both are generated from whatever `pkg/`
+holds at the moment `./make` runs - adding a package needs no registration
+edit anywhere.
+
+`test-packages` is registered as a `Step{}` in `tools/build/defs.bit`'s
+`coreSteps()`, deliberately **not** `gateSteps()` - the same place and the
+same reason `test-differentials` is: a package's own compliance corpus (a
+future `toml-test` or `yaml-test-suite`, hundreds of fixture files) must
+never grow the mandatory `./make test` suite, which stays fixed regardless
+of how many packages this repo ever holds. `scripts/gate.sh`'s `pkg` bucket
+is what a package-only change actually runs day to day; its `selfhost`,
+`runtime`, `stdlib`, `stdlibdocs` and `full` buckets each add
+`test-packages` to their own steps for the other half of the asymmetry
+above.
