@@ -123,12 +123,17 @@ Reserved; may not be used as identifiers:
 
 ```
 as       asm       break     case      catch     chan
-const    continue  default   defer     else      enum
-export   fail      false     fn        for       from
-if       import    in        interface let       map
-match    nil       of        return    select    spawn
-struct   switch    true      type      while
+class    const     continue  default   defer     else
+enum     export    fail      false     fn        for
+from     if        import    in        interface let
+map      match     nil       of        return    select
+spawn    struct    switch    true      type      while
 ```
+
+`class` is accepted as a synonym for `struct` (§10.5) as of the phase-1 migration
+step (#3425); the two spellings are currently equivalent and neither is
+deprecated. A later phase settles on one spelling and reserves the other's
+diagnostic for it.
 
 `assert` is *not* reserved: like `panic` and `len` it is a predeclared builtin
 function (§5.3, §16), so it must be an identifier for `assert(cond)` to parse as
@@ -437,7 +442,7 @@ character is required.
 
 An implementer can produce the complete token enumeration directly from §5–§7:
 
-- **Keywords:** the 35 words in §5.2.
+- **Keywords:** the 36 words in §5.2.
 - **Literals:** `INT_LIT`, `FLOAT_LIT`, `STRING_LIT`, `RAW_STRING_LIT`,
   `RUNE_LIT`, `BOOL_LIT`, `NIL_LIT`.
 - **Identifier:** `IDENT`.
@@ -715,10 +720,12 @@ fn (p: Point) norm(): f64 {
 ### 10.5 Struct Declarations
 
 ```
-struct_decl = "struct" IDENT [ generic_params ] "{" [ field { ( ";" | "," ) field } [ ";" | "," ] ] "}" .
+struct_decl = ( "struct" | "class" ) IDENT [ generic_params ] "{" [ field { ( ";" | "," ) field } [ ";" | "," ] ] "}" .
 field       = [ "export" ] IDENT ":" type .
 ```
 
+- `class` is accepted as a synonym for `struct` (§5.2); both spellings declare
+  the same construct and produce identical output. Neither is deprecated yet.
 - A field marked `export` is visible outside the module; otherwise it is
   module-private (§17.3). The struct type itself is exported via the leading
   `export` on the declaration.
