@@ -3811,7 +3811,7 @@ params        = param { "," param } [ "," ] .
 param         = [ "..." ] IDENT ":" type .
 extern_fn_decl = "extern" "fn" IDENT signature .
 
-struct_decl   = "struct" IDENT [ generic_params ] "{" [ field { fsep field } [ fsep ] ] "}" .
+struct_decl   = ( "struct" | "class" ) IDENT [ generic_params ] "{" [ field { fsep field } [ fsep ] ] "}" .
 field         = [ "export" ] IDENT ":" type .
 interface_decl= "interface" IDENT [ generic_params ] "{" [ method_sig { fsep method_sig } [ fsep ] ] "}" .
 method_sig    = IDENT signature .
