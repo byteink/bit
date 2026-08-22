@@ -77,6 +77,59 @@ fn accepts(req: Request): string {
 }
 ```
 
+## Query strings
+
+`Request.path` is the raw request target straight off the wire —
+`/todos?done=true&limit=10`, still percent-encoded — and stays that way for
+compatibility. These four functions are the parsing every handler and every
+client otherwise hand-rolls.
+
+### `splitTarget(target: string): (string, string)`
+
+Splits a request target at its first `?` into `(path, rawQuery)`. A target
+with no `?` returns the whole target as the path and `""` as the query.
+Neither half is decoded — decode the pieces `parseQuery`/`percentDecode`
+return, never `target` as a whole, or an encoded `?`/`&`/`=` inside a value
+can be mistaken for a real separator.
+
+### `parseQuery(raw: string): map<string, string>`
+
+Parses a raw (still percent-encoded) query string, as returned by
+`splitTarget`, into decoded key -> decoded value. Pairs split on `&`, each
+pair on its first `=` (a pair with no `=` maps to `""`); percent-decoding
+(which also turns `+` into a space) runs only after all splitting is done. A
+duplicate key is last-wins: `parseQuery("limit=1&limit=999")` yields
+`"999"`.
+
+### `percentDecode(s: string): string`
+
+Percent-decodes `s`: `%XX` becomes the byte `0xXX`, `+` becomes a space,
+everything else passes through unchanged. A malformed escape — a `%` not
+followed by two hex digits — is left exactly as it appears rather than
+failing, the same leniency mainstream HTTP servers apply.
+
+### `percentEncode(s: string): string`
+
+Percent-encodes every byte of `s` other than the RFC 3986 unreserved set
+(`A-Z a-z 0-9 - . _ ~`) as `%XX`, uppercase hex — the exact inverse of
+`percentDecode` for every byte 0-255, always emitting a space as `%20`
+rather than `+`. Escape any value interpolated into a query string with this
+before sending it — `std/http`'s own client has no other way to keep an
+unescaped value from corrupting the request line.
+
+```bit
+import { splitTarget, parseQuery, percentDecode, percentEncode } from "std/http"
+
+fn queryFor(target: string): map<string, string> {
+  let (_, rawQuery) = splitTarget(target)
+  return parseQuery(rawQuery)
+}
+
+fn searchUrl(base: string, term: string): string {
+  return "${base}?q=${percentEncode(term)}"
+}
+```
+
 ## Server
 
 Drive the server with an `accept()` loop, spawning a green thread per exchange
