@@ -1596,6 +1596,7 @@ defined exactly once).
 | `bit_rt_crypto_aes_invert_schedule_hw` | `(erk: *byte, nr: i64, out: *byte) -> void` (§21b) |
 | `bit_rt_crypto_ghash_mul_hw` | `(acc0, acc1, b0, b1, h0, h1: u64, outHi: *u64) -> u64` (§21b) |
 | `bit_rt_crypto_sha256_compress_hw` | `(state: *u32, block: *byte) -> void` (§21b) |
+| `bit_rt_crypto_hwcaps` | `() -> u64` (§21c) |
 
 **Narrow return values.** The C ABI returns a `bool` in `al`/`w0` and leaves the
 rest of the return register **unspecified**; the same is true of any sub-word
@@ -2645,6 +2646,44 @@ truncation, both applied outside `compress`).
 
 ---
 
+## 21c. ARM64 crypto hardware-capability detection (`runtime/cryptohw`, #2520, epic #1224)
+
+```
+bit_rt_crypto_hwcaps() -> u64   // bit 0 = AES, bit 1 = PMULL, bit 2 = SHA2
+```
+
+The ARM64 mirror of §21b's x86-64 probes, and unlike them, a real
+implementation rather than an ABI-membership placeholder: it is the feature
+*detector* epic #1224's remaining children build the AESE/PMULL/SHA256H
+primitives and stdlib routing on top of.
+
+**Per-target behavior**, split across `runtime/cryptohw/{linux,darwin}/cryptohw.bit`
+because each side calls something the other cannot even compile (§19's
+`syscall`/`extern function` split applies here too):
+
+- **aarch64-linux**: bit `i` is set when `getauxval(AT_HWCAP)` (`runtime/auxv`)
+  has the matching Linux `HWCAP_*` bit — `HWCAP_AES` (1<<3), `HWCAP_PMULL`
+  (1<<4), `HWCAP_SHA2` (1<<6) — set.
+- **aarch64-macos**: bit `i` is set when the matching `sysctlbyname` reads back
+  1 — `hw.optional.arm.FEAT_AES`, `hw.optional.arm.FEAT_PMULL`,
+  `hw.optional.arm.FEAT_SHA256`.
+- **x86_64-linux** (shares the `linux` archive member with aarch64-linux —
+  `scripts/g2archive.sh`'s target->PLAT mapping) **and every other target**:
+  always 0. An x86-64 `AT_HWCAP` value has no relationship to ARM crypto
+  extensions, so the linux provider gates on `onX64()` (`runtime/syscalls`)
+  before reading it at all, rather than testing bits that would coincidentally
+  sometimes be set.
+
+**Computed once, cached in a module-level variable** in whichever OS provider
+is actually linked — a fresh process reads its `AT_HWCAP` word or its three
+`sysctlbyname` results exactly once, and every later call returns the cached
+bitmask. Racing initializers on the first call are harmless: every racing OS
+thread reads the identical hardware state and would cache the identical
+value, the same argument `runtime/park/darwin/wait.bit`'s cached mach
+timebase makes.
+
+---
+
 ## 22. Shared mutable state audit (#1248)
 
 Every container-scope mutable in `runtime/**/*.bit` (grep: `^let ` at module
@@ -2809,7 +2848,18 @@ are compiler-emitted `const` data baked into the object at build time; nothing
 in the runtime ever mutates a `TypeInfo` or a dispatch table post-link, so they
 need no synchronization under any worker count.
 
-**Not found:** no interned-data table or memoization cache exists in
+**Racy-but-idempotent memoization caches (no lock, correct anyway because every
+racing writer computes the identical value):**
+- `runtime/cryptohw/{linux,darwin}/cryptohw.bit`: `hwcapsCache` (#2520) — the
+  `bit_rt_crypto_hwcaps` AES/PMULL/SHA2 bitmask, sentinel `-1` for "not yet
+  computed." Every racing OS thread reads the identical `AT_HWCAP` word (linux)
+  or the identical three `sysctlbyname` results (darwin) and therefore computes
+  and stores the identical bitmask, the same argument the next bullet's
+  `runtime/park/darwin/wait.bit` cache already relies on for its own (currently
+  undocumented here — see that file's own header) `tbNumer`/`tbDenom` mach
+  timebase cache.
+
+**Not found:** no OTHER interned-data table or memoization cache exists in
 `runtime/**/*.bit` outside the entries above (`runtime/rand/rand.bit` and
 `runtime/net/net.bit` declare no container-scope state at all — every random/network call
 is a stateless syscall wrapper).
