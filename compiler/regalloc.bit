@@ -38,6 +38,13 @@
 // which physical registers and which spill slots hold a live reference at that
 // position; codegen turns that into the per-callsite table the GC's root scanner
 // walks.
+//
+// That invariant is what lets #3171 hand out float registers across a function
+// with safepoints without touching the stack-map format at all: a StackMapEntry
+// describes only Int-class locations, so where a FLOAT value lives at a
+// safepoint is invisible to the collector by construction, and moving one from a
+// spill slot into an xmm register cannot hide a root. The float side is a pure
+// clobber question (does a call destroy the register), not a rooting one.
 
 // One physical register file (e.g. the target's GPRs or FPRs), fully abstract —
 // the allocator never hardcodes a real machine register name.
@@ -46,10 +53,16 @@ struct RegFile {
   // map indices to real registers and exclude any reserved register
   // (stack/frame pointer, etc.) by leaving it out of `count` entirely.
   count: int,
-  // Bit i set means register i is callee-saved. Informative only — this
-  // allocator runs no call-crossing preference pass; it is exposed so codegen
-  // can decide caller-save spill/reload policy around call sites independent of
-  // which vreg landed where.
+  // Bit i set means register i survives a clobber point — i.e. it is
+  // callee-saved under the target's convention.
+  //
+  // LOAD-BEARING as of #3171, where it used to be documented as informative
+  // only: an interval that is live across one of `allocate`'s `clobbers`
+  // positions may be given a register only if that register's bit is set here.
+  // A backend that under-reports here loses register quality; one that
+  // OVER-reports emits a value into a register a call destroys, which is a
+  // miscompile. It is read only when `clobbers` is non-empty, so a backend
+  // that passes no clobber positions is unaffected by its value.
   calleeSaved: int,
 }
 
@@ -169,18 +182,87 @@ fn insertActive(s: ClassState, intervals: []LiveInterval, entry: ActiveEntry) {
   s.len = s.len + 1
 }
 
-// Only called when len < count, so a free register always exists — the scan is
-// bounded by `count`.
-fn firstFreeReg(s: ClassState): int {
+// The all-registers-allowed mask for a file of `count` registers.
+fn fullRegMask(count: int): int {
+  let m = 0
+  let i = 0
+  while (i < count) {
+    m = m | 1 << i
+    i = i + 1
+  }
+  return m
+}
+
+// The lowest-numbered free register whose bit is set in `allowed`, or -1 when
+// the allowed subset is entirely taken. Bounded by `count`.
+//
+// With `allowed` = fullRegMask(count) this is exactly "the first free register,
+// or -1 iff every register is in use", because `s.len` is by construction the
+// number of set entries in `s.used`.
+fn firstFreeReg(s: ClassState, allowed: int): int {
   let r = 0
   while (r < len(s.used)) {
-    if (!s.used[r]) {
+    if (!s.used[r] && (allowed >> r) & 1 == 1) {
       return r
     }
     r = r + 1
   }
-  assert(false) // unreachable: the caller checked len < count
-  return 0
+  return -1
+}
+
+// The active entry with the furthest end whose register is in `allowed`, as an
+// index into active[0..len], or -1 when no active entry holds an allowed
+// register. active is sorted ascending by end, so scanning downward returns the
+// furthest match first — with `allowed` = fullRegMask this is always len-1,
+// which is the entry Poletto & Sarkar's SpillAtInterval considers.
+//
+// Under the current clobber model the result is len-1 in the restricted case
+// too, whenever the caller goes on to evict, and the argument is worth keeping
+// because it is not obvious: a restricted `iv` crosses some point p with
+// iv.start < p <= iv.end, and any active interval `a` whose end exceeds
+// iv.end started no later than iv did, so a.start <= iv.start < p and
+// a.end > iv.end >= p — which makes `a` restricted as well, hence a holder of
+// an allowed register. So every candidate worth evicting is already in the
+// allowed set. The general scan is kept rather than a bare `len - 1` so that a
+// future clobber model (a per-register clobber, say) cannot quietly turn a
+// wrong answer into a miscompile.
+fn furthestActiveIn(s: ClassState, allowed: int): int {
+  let k = s.len
+  while (k > 0) {
+    k = k - 1
+    if ((allowed >> s.active[k].reg) & 1 == 1) {
+      return k
+    }
+  }
+  return -1
+}
+
+// Drops active[k], preserving the ascending-by-end order. Bounded by `count`.
+// `used` is deliberately untouched: every caller hands the freed register
+// straight to the interval that displaced its occupant.
+fn removeActiveAt(s: ClassState, k: int) {
+  assert(k >= 0 && k < s.len)
+  let i = k
+  while (i + 1 < s.len) {
+    s.active[i] = s.active[i + 1]
+    i = i + 1
+  }
+  s.len = s.len - 1
+}
+
+// True iff `iv` is live across `p` in the sense that matters to a caller-saved
+// register: it was defined strictly before `p` and is still read at or after
+// it.
+//
+// The `end >= p` half rather than `end > p` is deliberate and is what makes
+// this correct for a BACK-EDGE safepoint, where the clobbering call is emitted
+// BEFORE the edge's parallel move (compiler/x64controlflow.bit's xEmitJump) —
+// so a value whose last read IS that edge is read after the clobber, not
+// before. For a plain call the same test is merely conservative: an argument
+// (end == p) is marshalled before the call and would in fact survive in a
+// register, so one interval per call argument is spilled that need not be.
+fn crossesPoint(iv: LiveInterval, p: int): bool {
+  return iv.start < p && iv.end >= p
 }
 
 struct SpillEntry {
@@ -303,7 +385,21 @@ fn orderByStart(intervals: []LiveInterval): []int {
 
 // Runs linear-scan register allocation over `intervals` for `target`, then
 // derives a GC stack map for each position in `safepoints`.
-fn allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int): RegAllocResult {
+//
+// `clobbers` (#3171) names every position at which the target's caller-saved
+// registers are destroyed. It is a SUPERSET of `safepoints`: a backend may emit
+// a runtime helper call the collector never sees — x64's poll-address prefetch
+// between the entry parameter binding and the first body instruction
+// (compiler/x64controlflow.bit's xEmitPollCachePrefetch) is one — and such a
+// call clobbers registers without producing a stack map. Only `safepoints`
+// yields StackMapEntries, and it does so one per element in the given order, so
+// the two lists must stay separate rather than being merged.
+//
+// An interval live across any clobber position is restricted to the registers
+// `RegFile.calleeSaved` marks; when that subset is empty for its class the
+// interval spills. An empty `clobbers` restores the plain Poletto & Sarkar
+// scan exactly, register for register.
+fn allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int, clobbers: []int): RegAllocResult {
   let n = len(intervals)
   // Validate the caller's dense-vreg contract — an internal-caller invariant,
   // asserted rather than surfaced as an error.
@@ -349,6 +445,26 @@ fn allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int): R
   let floatSpills = newSpillPool()
   let order = orderByStart(intervals)
 
+  // #3171: which intervals may not hold a caller-saved register. Indexed by
+  // interval array position (the main loop's `idx`), not by vreg. Bounded by
+  // n * len(clobbers), both function-local and finite — the same bound the
+  // stack-map loop below already carries.
+  let restricted = []bool(0)
+  i = 0
+  while (i < n) {
+    let crosses = false
+    let ci = 0
+    while (ci < len(clobbers)) {
+      if (crossesPoint(intervals[i], clobbers[ci])) {
+        crosses = true
+        break
+      }
+      ci = ci + 1
+    }
+    restricted = append(restricted, crosses)
+    i = i + 1
+  }
+
   let oi = 0
   while (oi < len(order)) {
     let idx = order[oi]
@@ -362,28 +478,43 @@ fn allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int): R
     expireClass(state, intervals, iv.start)
     expireSpills(spills, intervals, iv.start)
 
-    if (state.len < state.regFile.count) {
-      let reg = firstFreeReg(state)
+    // #3171: an interval live across a clobber point may only occupy a register
+    // the target preserves across one. With no clobbers (or an all-callee-saved
+    // file) `allowed` is the whole file and every branch below reduces to the
+    // plain Poletto & Sarkar scan.
+    let allowed = fullRegMask(state.regFile.count)
+    if (restricted[idx]) {
+      allowed = allowed & state.regFile.calleeSaved
+    }
+
+    let reg = firstFreeReg(state, allowed)
+    if (reg >= 0) {
       state.used[reg] = true
       locations[iv.vreg] = RegLoc{ isSpill: false, index: reg }
       insertActive(state, intervals, ActiveEntry{ idx: idx, reg: reg })
-    } else if (state.len == 0 || intervals[state.active[state.len - 1].idx].end <= iv.end) {
-      // Nothing active is worth evicting (either the class has no registers at
-      // all, or `iv` itself has the furthest end) — Poletto & Sarkar's
+      oi = oi + 1
+      continue
+    }
+    let victim = furthestActiveIn(state, allowed)
+    if (victim < 0 || intervals[state.active[victim].idx].end <= iv.end) {
+      // Nothing active is worth evicting (the allowed subset is empty, or `iv`
+      // itself has the furthest end among its holders) — Poletto & Sarkar's
       // SpillAtInterval "else" branch. `iv` is the interval being processed, so
       // its start is the scan frontier and recycling a freed slot is sound.
       locations[iv.vreg] = RegLoc{ isSpill: true, index: assignSpill(spills, intervals, idx, true) }
-    } else {
-      // Evict the active interval with the furthest end and hand its register to
-      // `iv` — SpillAtInterval's "if" branch. The evicted interval started before
-      // the frontier, so it must get a fresh slot, never a recycled one.
-      let evicted = state.active[state.len - 1]
-      state.len = state.len - 1
-      let slot = assignSpill(spills, intervals, evicted.idx, false)
-      locations[intervals[evicted.idx].vreg] = RegLoc{ isSpill: true, index: slot }
-      locations[iv.vreg] = RegLoc{ isSpill: false, index: evicted.reg }
-      insertActive(state, intervals, ActiveEntry{ idx: idx, reg: evicted.reg })
+      oi = oi + 1
+      continue
     }
+    // Evict the furthest-ending active interval holding an allowed register and
+    // hand that register to `iv` — SpillAtInterval's "if" branch. The evicted
+    // interval started before the frontier, so it must get a fresh slot, never a
+    // recycled one.
+    let evicted = state.active[victim]
+    removeActiveAt(state, victim)
+    let slot = assignSpill(spills, intervals, evicted.idx, false)
+    locations[intervals[evicted.idx].vreg] = RegLoc{ isSpill: true, index: slot }
+    locations[iv.vreg] = RegLoc{ isSpill: false, index: evicted.reg }
+    insertActive(state, intervals, ActiveEntry{ idx: idx, reg: evicted.reg })
     oi = oi + 1
   }
 
