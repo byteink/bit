@@ -1,0 +1,402 @@
+// compiler/lowerdefer.bit — split out of lower.bit/lowerctrl.bit/lowerflow.bit
+// (#2378). Sibling of lower.bit: same module, so this needs no imports and no
+// call-site changes.
+//
+// #2280 fixed the s0 half of `defer` scheduling: a `defer` inside a branch
+// that did not run no longer runs at the exit. #2378 is the other half: a
+// `defer` inside a conditional region whose control flow ESCAPES it (falls
+// through, or leaves via `break`/`continue`) used to be REFUSED (E0092)
+// rather than miscompiled, because replaying it unconditionally at a later
+// exit would run a call the program never scheduled, reading operands that
+// might not even be defined on the path that reached that exit.
+//
+// The fix (SPEC §18.5: LIFO, arguments captured at the `defer` site, on
+// every return/fail/`?` path, never on panic): give every `defer` STATEMENT
+// in the function a runtime bool flag plus one slot per captured
+// receiver/argument, all declared at FUNCTION ENTRY — before the body lowers
+// at all — so they are part of `preLen` for every construct that could ever
+// enclose them and thread through every later join (`addJoinParams`) exactly
+// like an ordinary local. `lowerDefer` writes into its own reserved slots
+// and sets its flag true; `runDefers` reads each flag and, guarded on it,
+// replays that one call. A defer inside a loop that runs on several
+// iterations fires ONCE at the function's exit, with its LAST iteration's
+// captured arguments — the flag records "ran at least once", not a count,
+// so this compiler has no per-execution defer stack. Nothing here needs a
+// "did this region's defers already replay" check any more: keeping a
+// registered-but-never-run entry around is harmless (its flag stays false),
+// so the scope-truncation `deferScopeEnd` used to do (and the E0092 refusal
+// it used to fall back to) is gone with it.
+
+// The resolved shape of one `defer <call>`'s callee — everything `lowerDefer`
+// needs to build its replay template and slot layout, computed WITHOUT
+// evaluating any operand (no lowerExpr/lowerArgs). That makes it safe to call
+// from `deferPreScan`, before the body's own env-mutating lowering
+// (`rebindCheckerName` et al.) has run for anything but this function's own
+// parameters: it resolves through the checker's per-node type cache (already
+// complete before ANY function's body lowers) and `fc.genEnv` (already bound
+// for this instantiation), neither of which depends on lowering order.
+//
+// `paramTypes` gives one type per operand slot `lowerDefer` will write, in
+// the order it writes them: the receiver first when there is one and
+// `isIface` is false (a concrete method prepends its receiver to the
+// argument list), separately via `recvTy`/`isIface` when there is one and it
+// IS false, or with no receiver at all. When `variadicFixed >= 0` the callee's
+// trailing parameter collects into one slice (§10.3): `paramTypes`'s LAST
+// entry is already that slice type (what `lowerArgsRest` actually produces
+// and what the reserved slot must hold), and `lowerDefer` must call
+// `lowerArgsRest`, not `lowerArgs`, passing these same two fields through.
+class DeferTarget {
+  ok: bool,
+  // Op/name/ty template (ival set for CallIface's dispatch id); meaningless
+  // when !ok.
+  instr: IrInstr,
+  // True: the receiver rides `instr.lhs` via its own slot (interface
+  // dispatch). False with `recvTy != 0`: a concrete method, receiver leads
+  // `paramTypes`. False with `recvTy == 0`: no receiver (print/eprint or a
+  // free function/generic instance).
+  isIface: bool,
+  recvTy: int,
+  paramTypes: []int,
+  // -1 for a non-variadic callee (every defer target but a plain function);
+  // else the index in `paramTypes` where the collected tail starts.
+  variadicFixed: int,
+  variadicElemTy: int,
+  span: Span,
+  reason: string,
+}
+
+fn deferTargetFail(span: Span, reason: string): DeferTarget {
+  return DeferTarget{ ok: false, instr: mkInstr(Op.Call, 0), isIface: false,
+    recvTy: 0, paramTypes: []int(0), variadicFixed: -1, variadicElemTy: 0,
+    span: span, reason: reason }
+}
+
+// Resolves `node` (a Tag.DeferStmt) to its callee shape. Mirrors the checks
+// `lowerDefer` used to make inline, before values existed to evaluate.
+fn resolveDeferTarget(fc: FnCtx, node: int): DeferTarget {
+  let call = kidsOf(fc.c.tree, node)[0]
+  let callN = getNode(fc.c.tree, call)
+  if (callN.tag != Tag.Call) {
+    return deferTargetFail(callN.span, "a `defer` whose argument is not a call expression")
+  }
+  let callee = kidsOf(fc.c.tree, call)[0]
+  let cn = getNode(fc.c.tree, callee)
+  if (cn.tag == Tag.Member) {
+    return resolveDeferMethodTarget(fc, callee, cn)
+  }
+  if (cn.tag != Tag.Ident) {
+    return deferTargetFail(cn.span, "a deferred call whose callee is not a name or a method access")
+  }
+  return resolveDeferCallTarget(fc, call, cn)
+}
+
+// `defer recv.method(...)` — the idiom every resource-releasing `defer` uses
+// (`defer f.close()`). The receiver's TYPE is resolved here; its VALUE is
+// read later, at the defer site (lowerDefer), per SPEC §18.5. `lowerArgs`
+// (not `lowerArgsFor`) is what a live method call already builds its
+// argument list with, so a variadic METHOD is out of scope here exactly as
+// it always has been — nothing new to refuse.
+fn resolveDeferMethodTarget(fc: FnCtx, callee: int, cn: Node): DeferTarget {
+  let mk = kidsOf(fc.c.tree, callee)
+  let recvTy = nodeType(fc, mk[0])
+  if (recvTy == 0) {
+    return deferTargetFail(getNode(fc.c.tree, mk[0]).span, "a deferred method call whose receiver type could not be resolved")
+  }
+  let mn = getNode(fc.c.tree, mk[1])
+  let mname = fc.c.source[mn.span.start:mn.span.end]
+  let paramTypes = methodParamTypes(fc, recvTy, mname)
+  if (fc.c.ctx.types[recvTy].kind == TypeKind.Interface) {
+    let mi = mkInstr(Op.CallIface, fc.c.ctx.voidId)
+    mi.ival = methodId(fc.lowerer, mname)
+    return DeferTarget{ ok: true, instr: mi, isIface: true, recvTy: recvTy,
+      paramTypes: paramTypes, variadicFixed: -1, variadicElemTy: 0, span: cn.span, reason: "" }
+  }
+  let mi = mkInstr(Op.Call, fc.c.ctx.voidId)
+  mi.name = methodSymbol(fc.lowerer, mname, recvTy)
+  return DeferTarget{ ok: true, instr: mi, isIface: false, recvTy: recvTy,
+    paramTypes: paramTypes, variadicFixed: -1, variadicElemTy: 0, span: cn.span, reason: "" }
+}
+
+// `defer print(...)/eprint(...)` (builtins, no declared signature to hint
+// with — each argument keeps its own default type) or `defer f(...)` (the
+// same resolution a direct call gets: module qualification AND generic
+// instantiation, via resolveCallTarget). A variadic free function's tail
+// collects into one slice, same as a live call (§10.3) — this used to build
+// fine unconditionally via `lowerArgsFor`, so refusing it here outright would
+// be a regression, not a new restriction.
+fn resolveDeferCallTarget(fc: FnCtx, call: int, cn: Node): DeferTarget {
+  let name = fc.c.source[cn.span.start:cn.span.end]
+  if (name == "print" || name == "eprint") {
+    let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+    ins.name = name
+    return DeferTarget{ ok: true, instr: ins, isIface: false, recvTy: 0,
+      paramTypes: deferPrintArgTypes(fc, call), variadicFixed: -1, variadicElemTy: 0, span: cn.span, reason: "" }
+  }
+  let t = resolveCallTarget(fc, name, call)
+  if (!t.ok) {
+    return deferTargetFail(cn.span, "a deferred call whose target could not be resolved")
+  }
+  let ins = mkInstr(Op.Call, t.result)
+  ins.name = t.symbol
+  let fixed = -1
+  let elemTy = 0
+  let paramTypes = t.paramTypes
+  if (t.decl != 0 && !isExternDecl(t.owner.tree, t.decl) && paramsAreVariadic(t.owner, kidsOf(t.owner.tree, t.decl)[3])) {
+    fixed = len(paramTypes) - 1
+    elemTy = paramTypes[fixed]
+    paramTypes = append(paramTypes[0:fixed], mkSlice(fc.c.ctx, elemTy))
+  }
+  return DeferTarget{ ok: true, instr: ins, isIface: false, recvTy: 0,
+    paramTypes: paramTypes, variadicFixed: fixed, variadicElemTy: elemTy, span: cn.span, reason: "" }
+}
+
+// Each `print`/`eprint` argument's own default type (no callee signature to
+// hint with — mirrors the empty paramTypes a live call passes to lowerArgs).
+fn deferPrintArgTypes(fc: FnCtx, call: int): []int {
+  let args = kidsOf(fc.c.tree, kidsOf(fc.c.tree, call)[2])
+  let types = []int(0)
+  let i = 0
+  while (i < len(args)) {
+    let a = args[i]
+    if (getNode(fc.c.tree, a).tag == Tag.Arg) {
+      a = kidsOf(fc.c.tree, a)[0]
+    }
+    types = append(types, defaultType(fc.c, nodeType(fc, a)))
+    i = i + 1
+  }
+  return types
+}
+
+// A deferred call scheduled to replay at a function exit (SPEC §18.5), guarded
+// by its own per-defer runtime flag (#2378). `flagSlot`, `argSlots` and
+// `lhsSlot` are fc.env indices allocated at FUNCTION ENTRY by
+// deferPreScan/deferPreDeclare, before the construct that might enclose this
+// defer starts lowering — so every later join (`addJoinParams`) threads them
+// like any other local, and `runDefers`'s read of their CURRENT value is
+// always a dominated one however many conditional regions sit between the
+// `defer` statement and the exit.
+//
+// `instr` is a template for the call's shape (op/name/ty, ival for a
+// CallIface dispatch id); `runDefers` fills in fresh `args`/`lhs` from
+// `argSlots`/`lhsSlot` at every replay rather than reusing the value ids
+// captured when `lowerDefer` first ran — `IrInstr` is a reference type, so
+// mutating `instr` in place would retroactively corrupt an earlier exit's
+// already-emitted copy of the same object (#2078).
+class DeferCall {
+  // This DeferStmt's AST node id, so `lowerDefer` can find its own
+  // pre-allocated entry (linear scan — a function's defer count is small).
+  node: int,
+  instr: IrInstr,
+  argSlots: []int,
+  // fc.env index feeding instr.lhs (a CallIface receiver), or -1 when this
+  // deferred call has none (the receiver leads argSlots instead, or there is
+  // no receiver at all).
+  lhsSlot: int,
+  flagSlot: int,
+}
+
+// A hidden "did this defer run" bool local, initialized false. Never looked
+// up by name (its env index is threaded directly through DeferCall), so its
+// name only needs to avoid colliding with a SPEC identifier — `$` never
+// starts one (compiler/lexer.bit's isIdentStart).
+fn declareBoolFlag(fc: FnCtx): int {
+  let boolTy = primType(fc.c.ctx, 10)
+  let f = mkInstr(Op.ConstBool, boolTy)
+  f.bval = false
+  declareLocal(fc, "$deferFlag", builderEmit(fc.b, f), boolTy)
+  return len(fc.env) - 1
+}
+
+// A hidden slot for one captured receiver/argument, zero-initialized so an
+// unrun defer's slot is a stable, dominating placeholder rather than reading
+// undefined memory if it is ever (mistakenly) read before it is written.
+fn declareDeferSlot(fc: FnCtx, ty: int): int {
+  declareLocal(fc, "$deferArg", deferZeroValue(fc, ty), ty)
+  return len(fc.env) - 1
+}
+
+// The placeholder value for a not-yet-run defer's operand slot. `zeroValue`'s
+// class branch allocates a real (zeroed, per ABI.md §1 — a fresh GC object's
+// pointer fields already read null) object; that is wasted work for a slot
+// read only after `lowerDefer` has overwritten it with the real captured
+// value, so a struct-typed slot gets a bare nil instead. Every other kind's
+// zero value is already a compile-time constant (ConstNil/ConstString/an
+// empty slice) with no allocation.
+fn deferZeroValue(fc: FnCtx, ty: int): int {
+  if (fc.c.ctx.types[ty].kind == TypeKind.Struct) {
+    return builderEmit(fc.b, mkInstr(Op.ConstNil, ty))
+  }
+  return zeroValue(fc, ty, pointSpan(0, 0))
+}
+
+// Finds every `defer` statement in `node`'s subtree (not crossing into a
+// nested function/arrow body, which lowers under its own separate FnCtx and
+// owns its own defers) and reserves this function's flag+operand slots for
+// each, in program order, BEFORE any of the body's own statements lower.
+fn deferPreScan(fc: FnCtx, node: int) {
+  if (node == 0) {
+    return
+  }
+  let t = getNode(fc.c.tree, node).tag
+  if (t == Tag.FuncDecl || t == Tag.ArrowFn) {
+    return
+  }
+  if (t == Tag.DeferStmt) {
+    deferPreDeclare(fc, node)
+  }
+  for k of kidsOf(fc.c.tree, node) {
+    deferPreScan(fc, k)
+  }
+}
+
+// Reserves one DeferStmt's slots. If resolution fails here, it is left with
+// no entry — `lowerDefer` repeats the identical resolution when it actually
+// reaches `node` (if it is ever reached) and reports the same failure there.
+fn deferPreDeclare(fc: FnCtx, node: int) {
+  let t = resolveDeferTarget(fc, node)
+  if (!t.ok) {
+    return
+  }
+  let flag = declareBoolFlag(fc)
+  let lhsSlot = -1
+  let argSlots = []int(0)
+  if (t.isIface) {
+    lhsSlot = declareDeferSlot(fc, t.recvTy)
+  } else if (t.recvTy != 0) {
+    argSlots = append(argSlots, declareDeferSlot(fc, t.recvTy))
+  }
+  let i = 0
+  while (i < len(t.paramTypes)) {
+    argSlots = append(argSlots, declareDeferSlot(fc, t.paramTypes[i]))
+    i = i + 1
+  }
+  fc.defers = append(fc.defers, DeferCall{ node: node, instr: t.instr,
+    argSlots: argSlots, lhsSlot: lhsSlot, flagSlot: flag })
+}
+
+// The pre-allocated entry for `node` (reserved by deferPreScan before the body
+// started lowering), or -1 if resolution failed there too.
+fn findDeferCall(fc: FnCtx, node: int): int {
+  let i = 0
+  while (i < len(fc.defers)) {
+    if (fc.defers[i].node == node) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+fn trueConst(fc: FnCtx): int {
+  let b = mkInstr(Op.ConstBool, primType(fc.c.ctx, 10))
+  b.bval = true
+  return builderEmit(fc.b, b)
+}
+
+// Writes one execution's captured receiver/arguments into the slots
+// deferPreScan reserved for this defer, and marks its flag true.
+fn writeDeferOperands(fc: FnCtx, dc: DeferCall, t: DeferTarget, recvV: int, a: []int) {
+  let slots = dc.argSlots
+  if (t.isIface) {
+    fc.env[dc.lhsSlot].value = recvV
+  } else if (t.recvTy != 0) {
+    fc.env[slots[0]].value = recvV
+    slots = slots[1:len(slots)]
+  }
+  let i = 0
+  while (i < len(a)) {
+    fc.env[slots[i]].value = a[i]
+    i = i + 1
+  }
+  fc.env[dc.flagSlot].value = trueConst(fc)
+}
+
+// A `defer <call>`: resolved identically to how deferPreScan resolved it
+// before the body started lowering (resolveDeferTarget), then the receiver
+// and arguments are evaluated HERE — at the defer site, per SPEC §18.5 — and
+// written into the slots already reserved for this exact node, and this
+// defer's flag is set true. The call itself replays at every function exit;
+// see runDefers.
+fn lowerDefer(fc: FnCtx, node: int) {
+  let t = resolveDeferTarget(fc, node)
+  if (!t.ok) {
+    fcFail(fc, t.span, t.reason)
+    return
+  }
+  let idx = findDeferCall(fc, node)
+  if (idx < 0) {
+    fcFail(fc, t.span, "a `defer` whose slots were not reserved")
+    return
+  }
+  let call = kidsOf(fc.c.tree, node)[0]
+  let recvV = 0
+  if (t.recvTy != 0) {
+    let callee = kidsOf(fc.c.tree, call)[0]
+    recvV = lowerExpr(fc, kidsOf(fc.c.tree, callee)[0])
+    if (fc.failed) {
+      return
+    }
+  }
+  let a = []int(0)
+  if (t.variadicFixed >= 0) {
+    a = lowerArgsRest(fc, call, t.paramTypes, t.variadicFixed, t.variadicElemTy)
+  } else {
+    a = lowerArgs(fc, call, t.paramTypes)
+  }
+  if (fc.failed) {
+    return
+  }
+  writeDeferOperands(fc, fc.defers[idx], t, recvV, a)
+}
+
+// Emits one guarded replay — `br flag -> call : skip` — reading the CURRENT
+// value of each of `dc`'s slots (never the ids captured when it was lowered;
+// see DeferCall) so a defer inside a loop replays with its LAST iteration's
+// arguments. `skip` is left open for the next defer (or the caller's own
+// terminator): neither edge changes any tracked local, so the merge needs no
+// join params, exactly like `lowerShortCircuit`'s side blocks.
+fn emitOneDefer(fc: FnCtx, dc: DeferCall) {
+  let callBlk = builderNewBlock(fc.b)
+  let skipBlk = builderNewBlock(fc.b)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = fc.env[dc.flagSlot].value
+  br.ival = callBlk
+  br.thenArgs = []int(0)
+  br.ival2 = skipBlk
+  br.elseArgs = []int(0)
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, callBlk)
+  let t = dc.instr
+  let lhs = t.lhs
+  if (dc.lhsSlot >= 0) {
+    lhs = fc.env[dc.lhsSlot].value
+  }
+  let args = []int(0)
+  let j = 0
+  while (j < len(dc.argSlots)) {
+    args = append(args, fc.env[dc.argSlots[j]].value)
+    j = j + 1
+  }
+  let ins = IrInstr{ op: t.op, ty: t.ty, args: args, lhs: lhs, rhs: t.rhs,
+    ival: t.ival, ival2: t.ival2, fval: t.fval, bval: t.bval, sval: t.sval,
+    name: t.name, offsets: t.offsets, thenArgs: t.thenArgs, elseArgs: t.elseArgs }
+  builderEmit(fc.b, ins)
+  emitJump(fc, skipBlk, []int(0))
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, skipBlk)
+}
+
+// Emits the pending deferred calls in reverse (LIFO) order at a function
+// exit, each guarded by its own flag (#2378) — a defer registered inside a
+// conditional region that never ran, or whose region was left before this
+// specific defer executed, correctly does nothing here.
+fn runDefers(fc: FnCtx) {
+  let i = len(fc.defers) - 1
+  while (i >= 0) {
+    emitOneDefer(fc, fc.defers[i])
+    i = i - 1
+  }
+}
