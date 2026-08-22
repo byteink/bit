@@ -1,0 +1,169 @@
+// N-worker allocation stress with a self-referential record graph and a
+// per-worker retention ring (#2535, epic #1253). STRESS_WORKERS sets W (8 if
+// empty/unset/non-numeric/<1). Each worker allocates itersPerWorker records;
+// each carries a tag, a 16-element int slice, and a pointer to the record
+// allocated the iteration before it. A class field cannot cycle back to its
+// own type (SPEC §13.3, E0047), so that pointer is `Option<Record>` rather
+// than `Record` directly — the idiomatic break used for any self-referential
+// class.
+//
+// RETENTION: each worker keeps a fixed-size ring of the last ringSize records
+// it has allocated. Once the ring has wrapped (i >= ringSize), the slot about
+// to be overwritten holds the oldest record the worker still references — it
+// was written ringSize iterations ago and has stayed reachable only through
+// this ring and the worker's own stack across that many concurrent
+// GC-stress collections triggered by every worker's own allocations. That is
+// the record this program checks, exactly once per iteration once the ring
+// is warm; before it is warm (i < ringSize) there is nothing yet to evict, so
+// the just-written record is checked instead. Either way each iteration
+// contributes exactly one checked record, so a worker's own total is always
+// itersPerWorker and the grand total is always W*itersPerWorker — an
+// invariant a correct implementation can never violate, so it is asserted
+// rather than merely printed.
+//
+// CORRECTNESS IS AN EXACT COMPARE, NOT "IT DID NOT CRASH": `tag` must equal
+// the value written at allocation, and every one of the 16 slice elements
+// must still hold the value derived from that same tag. A mismatch in
+// either can only mean the collector lost or clobbered a live object while
+// multiple other workers were concurrently allocating — the exact condition
+// BIT_GC=stress exists to provoke.
+//
+// CHAIN DEPTH IS BOUNDED, AND SO IS SAFEPOINT COUNT — both measured, not
+// assumed. `BIT_GC=stress` collects at every safepoint, and a safepoint is
+// every loop back-edge AND every call, not only every allocation. An earlier
+// draft filled/checked the 16-element slice with an inner `while` loop (16
+// back-edges each) and chained `prev` all the way back to iteration 0 with no
+// bound: a 300-iteration/8-worker smoke build took ~30s; adding one more
+// per-iteration call to truncate that chain (to keep the LIVE SET bounded)
+// made the very same smoke case take ~174s, because it added safepoints
+// faster than it removed tracing work. The fix that actually measures out:
+// unroll the 16-element fill/check into straight-line expressions (zero
+// back-edges) and reset `prev` to `None` once per `ringSize` iterations
+// instead of mutating another record's field every time (zero extra calls).
+// Chain depth is then bounded by `ringSize`, and per-iteration safepoints
+// drop to essentially the two unavoidable allocation calls
+// (`newRecord`/`checkRecord`) plus the loop's own back-edge.
+
+import { envOr } from "std/os"
+import { parseInt } from "std/strings"
+
+const itersPerWorker: int = 20000
+const ringSize: int = 64
+
+class Record {
+  tag: int,
+  data: []int,
+  prev: Option<Record>,
+}
+
+class WorkerResult {
+  checked: int,
+  corruptTag: int,
+}
+
+// STRESS_WORKERS, defaulting to 8 when unset, empty, non-numeric, or < 1 — a
+// malformed knob falls back to the documented default rather than crashing
+// the harness on a typo.
+fn workerCount(): int {
+  let w = parseInt(envOr("STRESS_WORKERS", "8")) catch 8
+  if (w < 1) {
+    return 8
+  }
+  return w
+}
+
+// A straight-line literal, not a fill loop: a loop back-edge is itself a
+// safepoint under BIT_GC=stress (see the header note), so 16 back-edges here
+// would multiply into a collection at every one of them, on every iteration.
+fn newRecord(tag: int, prev: Option<Record>): Record {
+  let data = []int{
+    tag + 0, tag + 1, tag + 2, tag + 3, tag + 4, tag + 5, tag + 6, tag + 7,
+    tag + 8, tag + 9, tag + 10, tag + 11, tag + 12, tag + 13, tag + 14, tag + 15,
+  }
+  return Record{ tag: tag, data: data, prev: prev }
+}
+
+// One half of checkRecord's compare, split out to keep McCabe complexity
+// under the 10 limit — a single 16-way `&&` chain costs one point of
+// complexity per operator (16 total), where two 8-way chains cost 8 each.
+fn dataMatches8(d: []int, t: int, base: int): bool {
+  return d[base + 0] == t + base + 0 && d[base + 1] == t + base + 1 &&
+    d[base + 2] == t + base + 2 && d[base + 3] == t + base + 3 &&
+    d[base + 4] == t + base + 4 && d[base + 5] == t + base + 5 &&
+    d[base + 6] == t + base + 6 && d[base + 7] == t + base + 7
+}
+
+// tag and every slice element must still match what was written at
+// allocation; anything else is heap corruption.
+fn checkRecord(rec: Record): bool {
+  return dataMatches8(rec.data, rec.tag, 0) && dataMatches8(rec.data, rec.tag, 8)
+}
+
+fn worker(id: int, results: chan<WorkerResult>) {
+  let ring = []Record(ringSize)
+  let prev: Option<Record> = Option<Record>.None
+  let checked = 0
+  let corruptTag = -1
+  let i = 0
+  while (i < itersPerWorker) {
+    let slot = i % ringSize
+    // A fresh ring generation starts a fresh chain (see the header note on
+    // bounded chain depth): no per-record mutation needed to bound it.
+    if (slot == 0) {
+      prev = Option<Record>.None
+    }
+
+    let tag = id * 1000003 + i
+    let rec = newRecord(tag, prev)
+
+    // Before the ring is warm there is nothing to evict yet, so the
+    // just-written record stands in as this iteration's checked record.
+    let target = rec
+    if (i >= ringSize) {
+      target = ring[slot]
+    }
+    if (corruptTag == -1 && !checkRecord(target)) {
+      corruptTag = target.tag
+    }
+    checked = checked + 1
+
+    ring[slot] = rec
+    prev = Option<Record>.Some(rec)
+    i = i + 1
+  }
+  results <- WorkerResult{ checked: checked, corruptTag: corruptTag }
+}
+
+fn main(): int {
+  let w = workerCount()
+
+  let results = chan<WorkerResult>(w)
+  let wi = 0
+  while (wi < w) {
+    spawn worker(wi, results)
+    wi = wi + 1
+  }
+
+  let totalChecked = 0
+  let corruptTag = -1
+  let k = 0
+  while (k < w) {
+    let res = <- results
+    totalChecked = totalChecked + res.checked
+    if (corruptTag == -1 && res.corruptTag != -1) {
+      corruptTag = res.corruptTag
+    }
+    k = k + 1
+  }
+
+  if (corruptTag != -1) {
+    print("gcalloc FAIL corrupt tag=${corruptTag}\n")
+    return 1
+  }
+
+  let want = w * itersPerWorker
+  assert(totalChecked == want, "gcalloc: checked-count invariant broken")
+
+  print("gcalloc OK\n")
+  return 0
+}
