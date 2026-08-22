@@ -1368,6 +1368,81 @@ calls `boot`, and exits the process with `boot`'s returned code.
 `boot` never runs twice in one process (single-boot guard) — there is no
 "reboot this runtime" operation.
 
+### Preemption: the sysmon monitor and the preempt request flag
+
+**Only half of this exists today.** Epic #1768 splits preemption into a
+state module plus four consumers; as of this writing only two of the five
+child tickets have landed (#2576, #2578 — #2577, #2579, #2580 are open).
+Every claim below was checked directly against the source with the greps
+shown, not against ticket text or a comment's stated intent.
+
+**The state module (`runtime/sched/preempt.bit`, #2576, landed).** No
+function in this file makes an OS call; every function takes its clock
+reading as a parameter instead of reading one itself
+(`runtime/sched/preempt.bit:16-18`). It defines:
+
+- `preemptBudgetNs: i64 = 10000000` (10 ms) — a task that has held its
+  worker longer than this is eligible for a preempt request
+  (`runtime/sched/preempt.bit:28`).
+- Two fixed-size, worker-indexed globals, `startNs` and `requested`, each
+  `[32]i64` (`runtime/sched/preempt.bit:58-59`), whose scan bound is this
+  file's own `preemptSlots: int = 32` (`runtime/sched/preempt.bit:51`) —
+  deliberately a separate constant from the scheduler's own worker-count
+  constant, which this file treats as advisory only, not as the real bound
+  on these arrays.
+- `preemptStamp(worker: i64, nowNs: i64)`, which sets `startNs[worker] =
+  nowNs` and clears `requested[worker]` (`runtime/sched/preempt.bit:74-77`).
+- `sysmonTick(nowNs: i64): i64`, which scans every worker slot — bounded by
+  both the scheduler's worker-count constant and `preemptSlots`
+  (`runtime/sched/preempt.bit:97`) — and sets `requested[w] = 1` for any
+  worker whose `startNs` is more than `preemptBudgetNs` in the past,
+  returning the count set this call (`runtime/sched/preempt.bit:94-106`).
+- `preemptRequested(worker: i64): bool`, which reads the flag without
+  clearing it (`runtime/sched/preempt.bit:109-111`).
+- `maybePreempt(worker: i64): bool`, which reports a pending request and
+  clears it in the same call. It only reports — the caller is responsible
+  for the actual yield (`runtime/sched/preempt.bit:117-123`).
+
+**Wired: the stamp on dispatch (#2578, landed).** `schedWorkerStep` calls
+`preemptStamp(*(w + wkId), monoNs())` once per task dispatch, immediately
+before `schedSwitch` hands control to the task
+(`runtime/sched/workerrun.bit:143`) — the only call site for `preemptStamp`
+in the tree (`git grep -n preemptStamp -- '*.bit'`).
+
+**Not wired: nothing ticks the monitor.** `sysmonTick` has no call site
+anywhere in the tree outside its own definition in `preempt.bit`
+(`git grep -n sysmonTick -- '*.bit'` finds the definition plus one comment
+in `runtime/sched/workerrun.bit` that names it, and nothing else). There is
+no `sysmonRun` function, and no monitor OS thread of any kind, anywhere in
+the repository (`git grep -n sysmonRun` — zero matches, including in
+`runtime/root/darwin/boot.bit` and `runtime/root/linux/boot.bit`). Neither
+platform starts a second OS thread next to the `BIT_WORKERS` worker boot
+sequence above. Booting that thread is #2579 (darwin) and #2580 (linux);
+both are open. Until one of them lands, `requested` can never become
+nonzero on any worker, because nothing ever calls `sysmonTick`.
+
+**Not wired: nothing consumes the flag.** `maybePreempt` and
+`preemptRequested` likewise have zero call sites anywhere in the tree
+outside their own definitions in `preempt.bit`
+(`git grep -n 'maybePreempt\|preemptRequested' -- '*.bit'` matches only
+`preempt.bit` itself) — no safepoint check anywhere in `runtime/sched/` or
+`runtime/root/` reads either function today. Calling `maybePreempt` from the
+scheduler's safepoint check, and yielding when it returns true, is #2577,
+open.
+
+**Net effect today:** the flag is stamped into existence on every dispatch
+but never set by a tick (no monitor exists to tick it) and never consumed at
+a safepoint (nothing calls `maybePreempt`). Once #2577/#2579/#2580 land, a
+task with no safepoint is still not preemptible even though `sysmonTick` may
+have set its flag: the flag is only ever acted on where `maybePreempt` is
+called, and a task that never reaches that call point keeps running
+regardless of `requested`'s value.
+
+**No separate preemption knob.** `preemptBudgetNs` is a compile-time
+constant, read from no environment variable. The only worker-related
+environment knob is `BIT_WORKERS`, above; nothing else in the environment
+controls worker count or preemption.
+
 ### Spawn
 
 ```
