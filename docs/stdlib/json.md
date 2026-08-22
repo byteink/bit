@@ -80,6 +80,29 @@ data, never a crash.
 
 `Some` of the payload when `j` is a `JsonArray`, else `None`.
 
+### `jsonAsObject(j: Json): Option<[]JsonEntry>`
+
+`Some` of the payload when `j` is a `JsonObject`, else `None`. The returned
+slice is the object's own entries, in source order, with duplicate keys kept
+- the same shape `JsonObject` stores internally, not a copy. Use this to
+enumerate an object's keys; `jsonGet` only answers one known key at a time.
+
+```bit
+import { Json, JsonEntry, jsonAsObject } from "std/json"
+
+// Two entries named "a": jsonAsObject keeps both, in source order.
+fn countKeys(): int {
+  let obj = Json.JsonObject([]JsonEntry{
+    JsonEntry{ key: "a", value: Json.JsonInt(1) },
+    JsonEntry{ key: "a", value: Json.JsonInt(2) },
+  })
+  match (jsonAsObject(obj)) {
+    Some(entries) => return len(entries)
+    None => return -1
+  }
+}
+```
+
 ### `jsonGet(o: Json, key: string): Option<Json>`
 
 Looks up `key` in `o`. `None` when `o` is not a `JsonObject` or `key` is
