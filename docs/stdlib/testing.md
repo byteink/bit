@@ -5,7 +5,9 @@ Assertions for `bit test`. A test is any top-level function named `test_...`;
 
 A failing assertion panics, which is why each test gets its own process - one
 failure cannot take the rest of the run down with it. It also means the first
-failure in a test is the last thing that test does.
+failure in a test is the last thing that test does - unless you use the
+non-fatal `checkX` twins below, which report every bad row in a table-driven
+test instead of only the first.
 
 Every assertion takes a `label` as its final argument. It is printed on failure,
 so make it say which case failed, not which function.
@@ -114,6 +116,82 @@ fn test_mapped() {
   eqSlice<i64>(doubled, [2, 4, 6], "each element doubled")
 }
 ```
+
+## Non-fatal checks
+
+Every assertion above is fatal: it panics on the first bad value, so a
+table-driven test with several bad rows reports only the first - fixing it and
+re-running is the only way to see the second. Each has a non-fatal twin, named
+with a `check` prefix, that prints the failure and *returns* instead of
+panicking, so a loop can keep going and report every bad row in one run.
+
+A non-fatal check does not fail the test by itself: v0.1 has no `recover`
+(SPEC.md §18.4), and `bit test` runs a test function and returns, with no
+automatic "did anything fail" step afterward. Call `checkDone()` to turn any
+failures the `checkX` calls recorded into a real test failure - normally
+`defer checkDone()` at the top of the function, so it runs on every return
+path. **A test that calls a `checkX` and never calls `checkDone()` silently
+passes** - the one sharp edge of this pair, and the reason to always write them
+together.
+
+```bit
+import { checkEq, checkDone } from "std/testing"
+
+struct Case { name: string, got: int, want: int }
+
+fn test_table() {
+  defer checkDone()
+  let cases = [
+    Case{ name: "a", got: 1, want: 1 },
+    Case{ name: "b", got: 2, want: 20 },
+    Case{ name: "c", got: 3, want: 30 },
+  ]
+  for (let i = 0; i < len(cases); i++) {
+    checkEq(cases[i].got, cases[i].want, "case ${cases[i].name}")
+  }
+}
+```
+
+```
+$ bit test table.bit
+check failed: case b: got 2, want 20
+check failed: case c: got 3, want 30
+panic: one or more checks failed above
+FAIL test_table
+
+discovered 1 test, ran 1: 0 passed, 1 failed
+```
+
+### `checkDone()`
+
+Fails the test if any `checkX` call below has recorded a failure. Normally
+called as `defer checkDone()`. A no-op when nothing failed.
+
+### `checkOk(cond: bool, label: string)`
+
+The non-fatal twin of `ok`: records the failure and returns instead of
+panicking. Needs a paired `checkDone()` to actually fail the test.
+
+### `checkNotOk(cond: bool, label: string)`
+
+The non-fatal twin of `notOk`.
+
+### `checkEq(got: T, want: T, label: string)`
+
+The non-fatal twin of `eq`.
+
+### `checkNeq(got: T, unwanted: T, label: string)`
+
+The non-fatal twin of `neq`.
+
+### `checkNear(got: f64, want: f64, eps: f64, label: string)`
+
+The non-fatal twin of `near`.
+
+### `checkEqSlice(got: []T, want: []T, label: string)`
+
+The non-fatal twin of `eqSlice`: same "first index that differs" report,
+recorded rather than panicked.
 
 ## Expected panics
 
