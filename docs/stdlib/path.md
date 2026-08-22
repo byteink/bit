@@ -107,6 +107,12 @@ lexically normalized with `clean`. Comparison is by whole path component, not
 by raw character prefix, so `contains("/a/b", "/a/bc")` is `false` even though
 the string `"/a/bc"` starts with `"/a/b"`. A path is always inside itself.
 
+`root == "."` and `root == ""` both mean "the current directory" (`""` cleans
+to `"."`, so an unset config field defaults to it). Every relative `p` that
+does not climb above it with a leading `..` is inside — `contains(".", "a/b")`
+is `true` — and an absolute `p` never is, since a relative root cannot contain
+an absolute path.
+
 This comparison is purely lexical — no filesystem access, so a `..` that only
 exists on disk (a symlink planted inside `root`, pointing back outside it) is
 not detected. `contains` alone is therefore not sufficient to decide whether
