@@ -742,9 +742,8 @@ if [ "$NMOD" -lt "$MIN_MODULES" ]; then
   bad=1
 fi
 
-# A count is not coverage (#3103, same principle as MIN_FILES/MIN_MODULES): if
-# disassembly extraction silently breaks, every module's atomic signature goes
-# empty on BOTH sides and the comparison below passes vacuously.
+# Same "count is not coverage" floor defined (with the full rationale) at
+# MIN_ATOMIC_SITES_DEFAULT above — not restated here.
 if { [ "$ATOMIC_ISA" = aarch64 ] || [ "$ATOMIC_ISA" = x86_64 ]; } && [ "$atomic_sites_seen" -lt "$MIN_ATOMIC_SITES" ]; then
   echo "diffruntime: FAIL — extracted $atomic_sites_seen atomic-instruction site(s) from the oracle's objects, floor is $MIN_ATOMIC_SITES." >&2
   echo "  An emptied atomic-signature extraction passes everything; check ATOMIC_MNEMONICS" >&2
