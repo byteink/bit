@@ -3266,6 +3266,17 @@ panic:
 There is **no `recover`** in v0.1: panics are fatal by design, keeping control flow
 free of hidden unwinding. Recoverable conditions must use the Result model.
 
+A test may still assert that a panic happens, without `recover`. `bit test` (§19)
+is specified to treat a top-level function named with the `testpanic_` prefix as
+expected to panic: it discovers `testpanic_` functions alongside `test_` ones,
+runs each in its own child process the same way, passes it when that process
+dies by a panic, and fails it when the process returns normally instead. This is
+a convention owned by the test runner, not a language feature — `panic` itself
+is unchanged and `recover` remains absent from the language. **Not yet
+implemented**: as of this writing `bit test` discovers only the `test_` prefix
+(§19); a function named `testpanic_...` is not discovered as a test at all and
+is treated like any other unreferenced function.
+
 ### 18.5 Deferred Cleanup
 
 ```
