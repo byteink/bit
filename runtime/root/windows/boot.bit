@@ -98,39 +98,35 @@
 // linked into the same program.
 //
 // ---------------------------------------------------------------------------
-// THE MAIN THREAD'S IDENTITY TOKEN — THE ONE PIECE THIS FILE MUST GET RIGHT
+// THE MAIN THREAD'S IDENTITY TOKEN — NOW A NON-ISSUE, AND HERE IS WHY (#3412)
 // ---------------------------------------------------------------------------
 //
-// `runtime/gc/gcthread.bit`'s `gcThreadToken()` is platform-free and, on
-// x86-64, is an UNCONDITIONAL `movq %fs:0, %rax` — no `hostTarget()` branch,
-// no per-platform variant. Its own header explains why that is safe: "`fs:0`
-// is the variant-II ABI TCB's self-referential word, which
-// `../thread/linux/tls.bit`'s `tlsPrepare` writes itself... and which static
-// TLS writes identically, so the same load is the thread pointer under EITHER
-// RUNTIME" — i.e. the contract is "boot installs a self-referential word at
-// FS_BASE", not "boot installs Linux's ELF TLS format" — and this file's job
-// is to satisfy that contract on Windows, NOT to touch gcthread.bit.
+// This file used to install a per-thread token itself: `gcThreadToken()` was
+// platform-free, an unconditional `movq %fs:0, %rax`, and Windows starts every
+// thread — the main one included — with FS_BASE at 0, so this file WRFSBASE'd
+// a self-referential word onto FS_BASE before anything could reach the
+// collector. #3410/#3391 then measured, on real hardware, that a
+// WRFSBASE-installed FS_BASE does NOT survive a Windows context switch
+// (non-zero immediately before a deschedule, `0000000000000000` after) — so
+// that install was never actually safe past a worker's first park, only past
+// its first few instructions.
 //
-// Windows x86-64 does not use FS for anything (GS holds the TEB); FS_BASE is
-// otherwise 0, so an untouched `fs:0` read would fault. `winInstallThreadToken`
-// below sets FS_BASE directly with the WRFSBASE instruction (Intel SDM, ring-3
-// executable once the OS has set CR4.FSGSBASE, which it must have for this to
-// work at all) to a self-referential word — verbatim the same convention
-// `tlsPrepare`'s `storeWord(tp, tp)` uses.
+// #3420 removed the need for any install at all: `runtime/gc/gcthread.bit`
+// now declares `gcThreadToken()`'s body as a per-OS extern
+// (`bit_rt_port_gc_thread_token`), and `runtime/gc/windows/gcthread.bit`'s
+// implementation reads the TEB self-pointer at `gs:[0x30]` (`NT_TIB.Self`)
+// instead of `fs:0`. That value is OS-allocated before a thread's first
+// instruction runs and is restored by Windows itself on every context switch
+// — the same guarantee `GetLastError`/SEH/FLS/TLS already depend on — so it
+// needs no install call, for the main thread or any `CreateThread`'d worker.
+// See that file's header for the full decision record and the hardware
+// measurements behind it.
 //
-// EMPIRICALLY VERIFIED ON mustafa-desktop-win (Windows 11 Pro, AMD64,
-// 10.0.26200.9168), not assumed: a hand-linked PE (compiler/pelink.bit, the
-// same technique #3329 used) that runs `xor eax,eax; wrfsbase rax; call
-// ExitProcess(0)` exits 0 — WRFSBASE does not trap. A second hand-linked PE
-// that writes a self-referential word onto its own stack, WRFSBASE's it in,
-// then reads it back through `mov rcx, fs:[0]` — gcThreadToken()'s exact
-// x86-64 instruction sequence — also exits 0, and a deliberately mismatched
-// comparison target in the same payload exits 1, proving the probe
-// discriminates rather than passing vacuously. Both probes and the mutation
-// were scratch (compiler/pelinkcheck.bit, not committed); this comment is the
-// durable record.
-//
-// gcThreadToken() itself is UNCHANGED and UNTOUCHED by this file.
+// So this file has NOTHING left to do for thread identity. What used to be
+// `winInstallMainThreadToken`/`winSetFsBase` here is deleted, not kept as a
+// second, unused path documenting the disproven WRFSBASE design — see
+// ../../thread/windows/spawn.bit's header for the worker-side half of the
+// same cleanup.
 
 import {
   schedInit, schedTaskInit, schedRegister, schedSpawn, schedShutdown,
@@ -283,44 +279,6 @@ const mainStackBytes: int = 8388608
     }
   }
   return base
-}
-
-// ---------------------------------------------------------------------------
-// The main thread's identity token — see the header section above.
-// ---------------------------------------------------------------------------
-
-// Install `tp` as this thread's FS_BASE via WRFSBASE (Intel SDM: `F3 REX.W 0F
-// AE /2`, ring-3 executable once CR4.FSGSBASE is set — verified live on
-// mustafa-desktop-win, see the header). `tp` must already be a
-// self-referential word (`*tp == tp`) for `gcThreadToken()`'s `mov reg,
-// fs:[0]` to read back the same value it was given — the caller's job, not
-// this function's; see `winInstallMainThreadToken` below.
-@nosplit fn winSetFsBase(tp: int) {
-  asm volatile {
-    x64   { 0xF3, 0x48, 0x0F, 0xAE, 0xD0 }   // wrfsbase rax
-    arm64 { 0xD51BD040 }                      // msr tpidr_el0, x0 (never reached:
-                                               // x86_64-windows is the only Windows
-                                               // target this toolchain builds; kept
-                                               // for parity with every other asm
-                                               // block in this tree, which the
-                                               // checker requires to carry both
-                                               // arches — SPEC §11.6).
-    input arm64 x0 x64 rax = tp
-    clobber x64 { memory }
-    clobber arm64 { memory }
-  }
-}
-
-// A one-word "TCB" for the main thread, self-referential per the variant-II
-// convention `gcThreadToken()` assumes. Module state (§11.11): `ptrOf`
-// addresses a cell, not a local, and this must outlive the call that installs
-// it (FS_BASE keeps pointing at it for the rest of the process).
-let mainThreadTcb: i64 = 0
-
-@nosplit fn winInstallMainThreadToken() {
-  let addr = int(ptrOf(mainThreadTcb))
-  mainThreadTcb = i64(addr)
-  winSetFsBase(addr)
 }
 
 // ---------------------------------------------------------------------------
@@ -491,25 +449,14 @@ export @nosplit @symbol("bit_rt_unmap_pages") fn rtUnmapPages(addr: int, nbytes:
 // BIT_GC_STATS steps removed (see the header) and step 6/7/8's thread
 // creation and join done through CreateThread/WaitForSingleObject directly.
 fn boot(): int {
-  // 1. The main thread's identity token (see the header section). Must run
-  //    before ANYTHING that can reach the collector — the very first
-  //    `gcThreadToken()` call anywhere (rootInit's own bring-up does not call
-  //    it, but the FIRST allocation on this thread, `bit_main`'s own on the
-  //    worker's stack, does not run on THIS thread at all — worker 0 runs it
-  //    on its own CreateThread'd thread, which never touches FS_BASE. This
-  //    call exists for the BOOT thread's own safepoint polls, which ordinary
-  //    Bit code (this function is not `@nosplit`) can reach on its loop back
-  //    edges below, same as ../linux/../darwin's boot thread.)
-  winInstallMainThreadToken()
-
-  // 1b. Fault handling (#3337, ./signal.bit): a process-wide vectored
-  //     exception handler, plus this (boot) thread's own stack-overflow
-  //     guarantee. Before anything else that can allocate or run user code,
-  //     matching where ../linux and ../darwin install their SIGSEGV/SIGBUS
-  //     dispositions. No alternate stack to map here (unlike sigaltstack on
-  //     the other two platforms) — AddVectoredExceptionHandler runs the
-  //     handler on the FAULTING thread's own stack; SetThreadStackGuarantee
-  //     is what reserves the headroom it needs (./signal.bit's header).
+  // 1. Fault handling (#3337, ./signal.bit): a process-wide vectored
+  //    exception handler, plus this (boot) thread's own stack-overflow
+  //    guarantee. Before anything else that can allocate or run user code,
+  //    matching where ../linux and ../darwin install their SIGSEGV/SIGBUS
+  //    dispositions. No alternate stack to map here (unlike sigaltstack on
+  //    the other two platforms) — AddVectoredExceptionHandler runs the
+  //    handler on the FAULTING thread's own stack; SetThreadStackGuarantee
+  //    is what reserves the headroom it needs (./signal.bit's header).
   winInstallStackGuarantee()
   installFatalSignalHandlers()
 

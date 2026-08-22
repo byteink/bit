@@ -1,8 +1,6 @@
 // Windows OS-thread provider for the Stage-2 port of runtime/sched/'s worker
-// pool (#1403), and the per-thread identity token every worker needs to
-// reach the collector safely (#3335). See ../thread.bit for the shared
-// contract, the seam against #1364, and the three rules a child thread's
-// body must obey.
+// pool (#1403). See ../thread.bit for the shared contract, the seam against
+// #1364, and the three rules a child thread's body must obey.
 //
 // `CreateThread` through kernel32 (§11.7's admitted Windows import surface,
 // `compiler/pesyms.bit`), the same shape ../darwin/spawn.bit uses
@@ -14,8 +12,7 @@
 // `pthread_create`, hands the child exactly ONE `void*`-shaped parameter and
 // allocates/guards the child's stack itself (`STACK_SIZE_PARAM_IS_A_RESERVATION`
 // in `runtime/root/windows/boot.bit` makes the same reservation-not-commit
-// choice this provider inherits). What Windows does NOT share with either
-// existing provider is covered below.
+// choice this provider inherits).
 //
 // This module is a LEAF with no imports, exactly as the other two providers
 // are — `../thread.bit`'s sentinel and this provider's own constants are
@@ -23,52 +20,33 @@
 // header explains.
 //
 // ---------------------------------------------------------------------------
-// THE PART NEITHER EXISTING PROVIDER NEEDS: A PER-THREAD IDENTITY TOKEN
+// THE PER-THREAD IDENTITY TOKEN — NO LONGER THIS PROVIDER'S PROBLEM (#3412)
 // ---------------------------------------------------------------------------
 //
-// `runtime/gc/gcthread.bit`'s `gcThreadToken()` is an unconditional `mov
-// reg, fs:[0]` on x86-64 — no per-OS branch — and its header states the
-// contract plainly: "fs:0 is the variant-II ABI TCB's self-referential word,
-// which `../thread/linux/tls.bit`'s `tlsPrepare` writes itself... so the
-// same load is the thread pointer under either runtime." Linux's kernel
-// installs FS_BASE via `CLONE_SETTLS`; Darwin's arm64 thread pointer
-// (`TPIDRRO_EL0`) is installed by the OS/pthreads automatically, needing no
-// action from that provider at all.
+// A worker OS thread this provider starts needs a valid `gcThreadToken()`
+// before it can reach the collector (#1650: two threads sharing one identity
+// is invisible to the rendezvous and correctness-destroying, not merely a
+// crash). This provider used to solve that itself, claiming a cell from a
+// `tokenPool` and WRFSBASE-ing a self-referential word into FS_BASE at
+// thread entry — mirroring `runtime/root/windows/boot.bit`'s equivalent
+// install for the main thread.
 //
-// Windows gives a NEW thread neither. Win64 does not use FS for anything
-// (GS holds the TEB), so FS_BASE starts at 0 on every `CreateThread`'d
-// thread — an untouched `gcThreadToken()` read there would decode a fault,
-// not merely a wrong answer, and if it did not fault it would read the SAME
-// 0 on every worker, reproducing #1650 (two threads sharing one identity,
-// invisible to the rendezvous, correctness-destroying rather than crashing).
+// #3410/#3391 then measured, on real hardware, that a WRFSBASE-installed
+// FS_BASE does NOT survive a Windows context switch (non-zero immediately
+// before a deschedule, `0000000000000000` after) — so that install was
+// never actually safe past a worker's first park, which is the common case,
+// not an edge case, for a worker in this scheduler.
 //
-// `runtime/root/windows/boot.bit` already solved this for the ONE thread it
-// owns directly (the boot thread) with `winInstallMainThreadToken`/
-// `winSetFsBase` — WRFSBASE-ing a self-referential word, empirically
-// verified not to trap on `mustafa-desktop-win` (that file's own header has
-// the hardware evidence). This provider generalises the SAME technique to
-// EVERY thread it starts, because boot.bit's own comment at its worker
-// bring-up says as much: "this file's own minimal stand-in for
-// ../../thread/windows (#3335), which will own the full
-// threadStart/threadRelease contract once it lands" — boot.bit's worker
-// loop currently starts threads with FS_BASE untouched, which is a real gap
-// this ticket closes for any FUTURE caller of `threadStart`, without editing
-// boot.bit itself (out of this ticket's scope — `runtime/root/**` is a
-// mandatory-full-suite area, and rewiring boot.bit to consume this module is
-// left for the ticket that does that rewiring).
-//
-// EACH THREAD NEEDS ITS OWN CELL, not a shared one. `winSetFsBase(tp)`
-// requires `*tp == tp` — a self-referential word — and that word must be
-// UNIQUE per thread: two threads sharing one cell would again reproduce
-// #1650, just via FS_BASE instead of an unset one. `tokenPool` below is a
-// fixed array of `tokenPoolMax` cells, CAS-claimed one per `threadStart`
-// call and held for that thread's entire life — never released, because
-// every consumer in this tree today (the scheduler's worker pool) runs its
-// threads for the life of the process. `tokenPoolMax` duplicates
-// `../thread.bit`'s `threadMaxWorkers` (1024) rather than importing it, the
-// same leaf-provider convention `runningSentinel()` below follows for
-// `threadRunning`; a caller that ever exceeds it gets a clean refusal (see
-// `threadStart`), not a silently shared token.
+// #3420 fixed it at the source instead: `gcThreadToken()`'s Windows body
+// (`runtime/gc/windows/gcthread.bit`) now reads the TEB self-pointer at
+// `gs:[0x30]` (`NT_TIB.Self`), which is OS-allocated before a thread's first
+// instruction runs and is restored by Windows on every context switch by
+// construction — the same guarantee `GetLastError`/SEH/FLS/TLS already rest
+// on. That answers the question for EVERY thread, including ones this
+// provider starts, with no install call at all. So the `tokenPool`/
+// `tokenClaim`/`winInstallThreadToken`/`winSetFsBase` machinery that used to
+// live here is deleted — a second, unused path documenting a disproven
+// design is worse than no path.
 
 extern fn CreateThread(attrs: *byte, stackSize: i64, startAddr: *byte,
     param: *byte, flags: i32, threadIdOut: *i32): *byte
@@ -137,83 +115,29 @@ extern fn bit_rt_gc_thread_exit()
   }
 }
 
-// Install `tp` as this thread's FS_BASE via WRFSBASE — byte-identical to
-// `runtime/root/windows/boot.bit`'s `winSetFsBase` (that file's header carries
-// the hardware verification on mustafa-desktop-win; duplicated here rather
-// than imported because a provider is a leaf and `boot.bit` imports FROM the
-// providers, never the reverse).
-@nosplit fn winSetFsBase(tp: int) {
-  asm volatile {
-    x64   { 0xF3, 0x48, 0x0F, 0xAE, 0xD0 }   // wrfsbase rax
-    arm64 { 0xD51BD040 }                      // msr tpidr_el0, x0 (unreached,
-                                               // see invokeRaw above)
-    input arm64 x0 x64 rax = tp
-    clobber x64 { memory }
-    clobber arm64 { memory }
-  }
-}
-
-// Claim one cell of `tokenPool` for a new thread's identity token, returning
-// its address, or 0 if every cell is already claimed. Bounded by
-// `tokenPoolMax`, mirroring `trampClaim` below.
-//
-// `tokenClaimed[i]` is the CAS gate (0 -> 1 = claimed); `tokenPool[i]` becomes
-// the winning cell's own self-referential value once `winInstallThreadToken`
-// runs. Two arrays rather than the trampoline pool's "word 0 IS the flag"
-// trick, because a token cell's final value (its own address) is not known
-// until AFTER it is claimed, so it cannot double as the claim flag itself.
-const tokenPoolMax: int = 1024
-let tokenClaimed: [1024]i64
-let tokenPool: [1024]i64
-
-fn tokenClaim(): int {
-  let flags: *i64 = ptrOf(tokenClaimed)
-  let cells: *i64 = ptrOf(tokenPool)
-  let i = 0
-  while (i < tokenPoolMax) {
-    if (atomicCmpxchg(flags + i, 0, 1)) {
-      return int(cells) + i * 8
-    }
-    i = i + 1
-  }
-  return 0
-}
-
-// Write `cellAddr`'s own address into itself (the self-referential word
-// `gcThreadToken()`'s `mov reg, fs:[0]` requires) and install it as this
-// thread's FS_BASE. Called ONCE, by the thread the cell belongs to, before
-// any code that could reach the collector.
-@nosplit fn winInstallThreadToken(cellAddr: int) {
-  *wordsAt(cellAddr) = i64(cellAddr)
-  winSetFsBase(cellAddr)
-}
-
 // `CreateThread` carries ONE `void *` to the child (`lpParameter`), and the
-// trampoline needs three words — the real entry, the real argument, and the
-// claimed token cell's address. A fixed pool, not an allocator, for the same
-// reason ../darwin/spawn.bit's `trampCells` is one: a provider is a leaf with
-// no allocator to call, and a static pool keeps this off the "no unbounded
+// trampoline needs three words — the real entry, the real argument, and
+// `done`'s address. A fixed pool, not an allocator, for the same reason
+// ../darwin/spawn.bit's `trampCells` is one: a provider is a leaf with no
+// allocator to call, and a static pool keeps this off the "no unbounded
 // allocation after startup" list.
 //
 // WORD 0 IS STILL THE CLAIM FLAG (`start`, which no real `entryOf` is ever
-// 0), exactly as ../darwin/spawn.bit's cells — only the stride changed, from
-// two words to three.
-// FOUR words per cell — start, arg, the claimed token cell's address, and
-// `done`'s address — `trampMax * 4 = 256`.
+// 0), exactly as ../darwin/spawn.bit's cells — same three-word stride,
+// `trampMax * 3 = 192`.
 const trampMax: int = 64
-let trampCells: [256]i64
+let trampCells: [192]i64
 
-fn trampClaim(start: int, arg: int, tokenAddr: int, doneAddr: int): int {
+fn trampClaim(start: int, arg: int, doneAddr: int): int {
   let p: *i64 = ptrOf(trampCells)
   let i = 0
   while (i < trampMax) {
-    if (atomicCmpxchg(p + i * 4, 0, start)) {
+    if (atomicCmpxchg(p + i * 3, 0, start)) {
       // Safe unsynchronised: the CAS above makes this cell ours until the
       // child releases it, and the child cannot run before `CreateThread`.
-      *(p + i * 4 + 1) = arg
-      *(p + i * 4 + 2) = tokenAddr
-      *(p + i * 4 + 3) = doneAddr
-      return int(p) + i * 32
+      *(p + i * 3 + 1) = arg
+      *(p + i * 3 + 2) = doneAddr
+      return int(p) + i * 24
     }
     i = i + 1
   }
@@ -235,10 +159,9 @@ fn trampRelease(cell: int, start: int) {
 }
 
 // Every OS thread this provider starts enters here, not at the caller's body.
-//
-// ORDER IS LOAD-BEARING: the token installs BEFORE `invokeRaw`, so nothing
-// this thread runs — including whatever `start` itself does on its very
-// first instruction — can reach the collector with FS_BASE unset. Unlike
+// No token install runs before `invokeRaw` — `gcThreadToken()`'s Windows
+// body (#3420, `gs:[0x30]`) is valid from this thread's first instruction
+// with no action from this provider at all (see the header). Unlike
 // ../darwin/spawn.bit, this trampoline ALSO clears `done` once the body
 // returns (see the header's note on #3375: the Darwin provider promises this
 // in its own comment but the code has no path to deliver it, because its
@@ -253,11 +176,9 @@ fn threadTrampoline(cell: *byte): *byte {
   let p = wordsAt(addr)
   let start = *p
   let arg = *(p + 1)
-  let tokenAddr = *(p + 2)
-  let doneAddr = *(p + 3)
+  let doneAddr = *(p + 2)
   trampRelease(addr, start)
 
-  winInstallThreadToken(tokenAddr)
   invokeRaw(start, arg)
 
   // The last two things this thread does: publish that it is finished, then
@@ -287,26 +208,16 @@ fn threadTrampoline(cell: *byte): *byte {
 // the handle is opaque and why a caller must not read meaning into the
 // number.
 export @symbol("bit_rt_port_thread_start") fn threadStart(start: *byte, arg: *byte, done: *i32): int {
-  // Claimed BEFORE the thread exists, so a failure here refuses cleanly —
-  // exactly ../darwin/spawn.bit's "refused rather than started unwrapped"
-  // choice for its own trampoline pool, applied to the token pool too.
-  let tokenAddr = tokenClaim()
-  if (tokenAddr == 0) {
-    return 0
-  }
-
   // Armed BEFORE the create, not after: the child can run to completion and
   // clear this word before `CreateThread` has even returned. Arming it
   // afterwards would overwrite the child's 0 with 1 and strand every joiner
   // until its deadline — same ordering ../darwin/spawn.bit uses.
   atomicStore(done, i32(runningSentinel()))
 
-  let cell = trampClaim(int(start), int(arg), tokenAddr, int(done))
+  let cell = trampClaim(int(start), int(arg), int(done))
   if (cell == 0) {
     // Pool exhausted: `trampMax` starts are already in flight. Refused
-    // rather than started unwrapped, same as ../darwin/spawn.bit. The
-    // token claim is left in place — see the note below on why a leaked
-    // token claim is the safe failure direction.
+    // rather than started unwrapped, same as ../darwin/spawn.bit.
     atomicStore(done, i32(0))
     return 0
   }
@@ -315,13 +226,10 @@ export @symbol("bit_rt_port_thread_start") fn threadStart(start: *byte, arg: *by
   let handle = CreateThread(nullAttrs, threadStackBytes, entryOf(threadTrampoline),
                              bytesAt(cell), STACK_SIZE_PARAM_IS_A_RESERVATION, ptrOf(winThreadIdScratch))
   if (int(handle) == 0) {
-    // No thread exists, so nothing will ever clear `done` or release the
-    // token cell's claim. Disarm `done` so a caller that joins anyway gets
-    // `threadJoinDone` immediately rather than waiting out a full deadline
-    // for a thread that was never created; release the trampoline cell so a
-    // later start can reuse it. The token cell is NOT released — a leaked
-    // token claim is inert (nothing ever reads it) rather than reused as a
-    // second thread's identity, which is the failure mode worth avoiding.
+    // No thread exists, so nothing will ever clear `done`. Disarm it so a
+    // caller that joins anyway gets `threadJoinDone` immediately rather than
+    // waiting out a full deadline for a thread that was never created;
+    // release the trampoline cell so a later start can reuse it.
     trampRelease(cell, int(start))
     atomicStore(done, i32(0))
     return 0
