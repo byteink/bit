@@ -1,0 +1,680 @@
+// tools/fuzz/genprog.bit — a seeded, self-checking Bit program generator.
+//
+// #2605 (epic #1907, #1908). Every `selfhost-diff*` gate compares this
+// compiler against a PREVIOUS release of itself, so a wrong-answer bug
+// present in both is structurally invisible to all of them (#1857's
+// `parseFloat` silently mapping every `0x1p-1` to `0.0` shipped in every
+// release for months because of exactly this). This generator is not another
+// differential: it writes a Bit program that carries its own oracle, so
+// running it once is a pass/fail with no second compiler involved.
+//
+// Run: `bit run tools/fuzz/genprog.bit -- --seed <n>`. Writes a complete Bit
+// program to stdout and exits 0. Nothing else goes to stdout. A missing or
+// non-numeric seed exits 2 with `usage: genprog --seed <n>` on stderr.
+//
+// HOW THE EXPECTED VALUE IS DERIVED, AND WHY IT DOES NOT DEPEND ON THIS
+// COMPILER'S ARITHMETIC OR ITS FLOAT PARSER:
+//
+// Every float value this generator uses is a "dyadic" (`mantissa * 2^shift`,
+// §Dyadic below) tracked as a pair of plain integers. The exact numeric value,
+// the exact decimal literal text, and the exact hex-float literal text are all
+// three derived from that SAME (mantissa, shift) pair by integer arithmetic
+// (multiply/divide by powers of 2 and 5, never a float-to-string routine and
+// never this compiler's own float lexer). So a check that embeds a hex float
+// literal and asserts it against a DECIMAL "want" (or vice versa) is
+// independent of the compiler's hex-float parser in the same way #1857's bug
+// would have been caught: the expected value never passes through the code
+// path under test. `dyadicLess` similarly orders two dyadics via integer
+// comparison, never the compiler's own `f64` `<`. The four float arithmetic
+// operators (+ - * /) are also resolved this way — `dyadicAddSub`/`dyadicMul`/
+// `dyadicDivByPow2` compute the "want" side by integer mantissa/shift
+// bookkeeping, never by asking this compiler's own `f64` +/-/*// to evaluate
+// it — so a codegen bug in float arithmetic cannot land identically on both
+// sides of the comparison.
+//
+// Int arithmetic does not have this luxury: signed 64-bit +, -, *, /, % have
+// no cheaper independent evaluator here than the operators themselves, so
+// each int-arithmetic check's "want" is computed with this compiler's own
+// int operators, same as the generated program's "got". That is a REAL,
+// residual gap: a bug that is wrong identically everywhere a given int
+// operator appears would not be caught by this generator alone. What IS
+// caught, for both int and float arithmetic, is any CONTEXT-sensitive bug —
+// one that only fires under register pressure, after inlining, or in a
+// specific operand shape — because every operand here is read out of a
+// freshly heap-allocated slice (`p<id>`/`q<id>`, never a bare literal), which
+// this compiler's own constant folder (`compiler/optfold.bit`) cannot see
+// through: a `let c = 17 + 42` is folded to a single immediate at compile
+// time (verified empirically against this build before writing this file —
+// disassembly showed `mov x19, #0x3b`, no add), but reading two values back
+// out of a `[]int`/`[]f64` populated by prior assignment statements is not,
+// so the generated program's arithmetic genuinely reaches runtime codegen.
+// The int-operator gap above is exactly why epic #1907 also names `-O0` vs
+// `-O1` and aarch64-vs-x86_64 differential fuzzing as separate, complementary
+// modes — not stacked into this ticket.
+//
+// CONSTRUCT SET EMITTED (start small, and this is the honest whole list):
+//   - int arithmetic:   + - * / %   (divisor forced non-zero for / and %)
+//   - float arithmetic: + - * /     (divisor is always a signed power of two,
+//                                    so the quotient of two dyadics stays
+//                                    exactly representable)
+//   - float literals, decimal and hex form, cross-checked against the OTHER
+//     form of the same value (at least one hex float literal is forced into
+//     every generated program, check 0)
+//   - int -> float and float -> int casts (truncate toward zero), and `<`
+//     comparisons over both int and float operands
+// NOT covered here: loops, function calls, structs, strings, control flow,
+// bitwise ops, unsigned/narrow int widths. A real deliverable is one that
+// says plainly what it does not exercise yet.
+//
+// DETERMINISM: the only entropy is `--seed`, consumed by one xorshift64
+// instance. No clock, no environment, no random device — the same seed
+// always produces byte-identical output, forever.
+
+import { args, exit } from "std/os"
+import { parseInt, Builder, newBuilder } from "std/strings"
+
+// Power of 10 rule 2: every loop below is bounded by one of these, or by a
+// value drawn from a range bounded by one of these.
+const totalChecks: int = 200
+const dyadicMantissaMax: int = 4095
+const arithShiftMin: int = -6
+const arithShiftMax: int = 6
+const literalShiftMin: int = -14
+const literalShiftMax: int = 14
+const divisorShiftMin: int = -4
+const divisorShiftMax: int = 4
+
+// --- PRNG: xorshift64, the same algorithm tests/bit/fuzz.bit uses ----------
+// State lives in a one-element slice so a callee can mutate shared state
+// (Bit `class` values are copied on assignment the same as any other value
+// unless boxed; a slice element is the shortest thing a callee can write
+// through).
+
+fn nextU64(st: []u64): u64 {
+  let x = st[0]
+  x = x ^ (x << 13)
+  x = x ^ (x >> 7)
+  x = x ^ (x << 17)
+  st[0] = x
+  return x
+}
+
+fn nextBelow(st: []u64, n: int): int {
+  if (n <= 1) {
+    return 0
+  }
+  return int(nextU64(st) % u64(n))
+}
+
+fn nextRange(st: []u64, lo: int, hi: int): int {
+  return lo + nextBelow(st, hi - lo + 1)
+}
+
+fn coinFlip(st: []u64): bool {
+  return nextBelow(st, 2) == 1
+}
+
+// A zero seed is a xorshift64 fixed point (it would yield 0 forever), so it
+// is replaced; the replacement is a fixed constant, so determinism holds.
+fn normalizeSeed(seed: u64): u64 {
+  if (seed == u64(0)) {
+    return u64(88172645463325252)
+  }
+  return seed
+}
+
+// --- Dyadic: mantissa * 2^shift, tracked as plain integers -----------------
+// See the file header for why every float value here is one of these rather
+// than a bare f64 the generator computed by running this compiler's own
+// float arithmetic.
+
+class Dyadic {
+  mantissa: int
+  shift: int
+  neg: bool
+}
+
+fn pickDyadicIn(st: []u64, shiftLo: int, shiftHi: int): Dyadic {
+  let m = nextRange(st, 1, dyadicMantissaMax)
+  let s = nextRange(st, shiftLo, shiftHi)
+  let n = coinFlip(st)
+  return Dyadic{ mantissa: m, shift: s, neg: n }
+}
+
+// Bounded so a MUL of two of these, or an ADD/SUB scaled to a common shift,
+// stays well inside i64 when later rendered to an exact decimal (see
+// dyadicDecimalText): worst case mantissa ~4095*4095 and shift magnitude
+// ~12, both checked against pow5/pow2Int's own bounds below.
+fn pickDyadicNarrow(st: []u64): Dyadic {
+  return pickDyadicIn(st, arithShiftMin, arithShiftMax)
+}
+
+// Wider shift range for a literal that is never combined arithmetically —
+// only ever printed and compared against its own other-form text.
+fn pickDyadicWide(st: []u64): Dyadic {
+  return pickDyadicIn(st, literalShiftMin, literalShiftMax)
+}
+
+// A divisor guaranteed to divide any Dyadic exactly: a signed power of two.
+fn pickPow2Divisor(st: []u64): Dyadic {
+  let s = nextRange(st, divisorShiftMin, divisorShiftMax)
+  let n = coinFlip(st)
+  return Dyadic{ mantissa: 1, shift: s, neg: n }
+}
+
+fn absInt(v: int): int {
+  if (v < 0) {
+    return 0 - v
+  }
+  return v
+}
+
+fn pow2Int(k: int): int {
+  let r = 1
+  let i = 0
+  while (i < k) {
+    r = r * 2
+    i = i + 1
+  }
+  return r
+}
+
+fn pow5(k: int): int {
+  let r = 1
+  let i = 0
+  while (i < k) {
+    r = r * 5
+    i = i + 1
+  }
+  return r
+}
+
+fn pow16(k: int): int {
+  let r = 1
+  let i = 0
+  while (i < k) {
+    r = r * 16
+    i = i + 1
+  }
+  return r
+}
+
+// The exact f64 value. Used only to seed the CHECK's own numeric bookkeeping
+// where a float value is genuinely needed (never to derive a "want" text —
+// that always goes through the integer paths below).
+fn scaleByPow2(v: f64, shift: int): f64 {
+  let out = v
+  let s = shift
+  while (s > 0) {
+    out = out * 2.0
+    s = s - 1
+  }
+  while (s < 0) {
+    out = out / 2.0
+    s = s + 1
+  }
+  return out
+}
+
+// --- Dyadic arithmetic, by integer mantissa/shift bookkeeping --------------
+// None of these touch this compiler's own f64 +, -, *, or / — see the file
+// header. All three keep well inside i64 given pickDyadicNarrow's bounds.
+
+fn dyadicAddSub(a: Dyadic, b: Dyadic, sub: bool): Dyadic {
+  let resultShift = a.shift
+  if (b.shift < resultShift) {
+    resultShift = b.shift
+  }
+  let av = a.mantissa * pow2Int(a.shift - resultShift)
+  if (a.neg) {
+    av = 0 - av
+  }
+  let bv = b.mantissa * pow2Int(b.shift - resultShift)
+  if (b.neg) {
+    bv = 0 - bv
+  }
+  let combined = av + bv
+  if (sub) {
+    combined = av - bv
+  }
+  let neg = combined < 0
+  let mag = combined
+  if (neg) {
+    mag = 0 - mag
+  }
+  return Dyadic{ mantissa: mag, shift: resultShift, neg: neg }
+}
+
+fn dyadicMul(a: Dyadic, b: Dyadic): Dyadic {
+  return Dyadic{ mantissa: a.mantissa * b.mantissa, shift: a.shift + b.shift, neg: a.neg != b.neg }
+}
+
+fn dyadicDivByPow2(a: Dyadic, divisor: Dyadic): Dyadic {
+  return Dyadic{ mantissa: a.mantissa, shift: a.shift - divisor.shift, neg: a.neg != divisor.neg }
+}
+
+// Pure-integer ordering, independent of this compiler's own f64 `<`.
+fn dyadicLess(a: Dyadic, b: Dyadic): bool {
+  let commonShift = a.shift
+  if (b.shift < commonShift) {
+    commonShift = b.shift
+  }
+  let av = a.mantissa * pow2Int(a.shift - commonShift)
+  if (a.neg) {
+    av = 0 - av
+  }
+  let bv = b.mantissa * pow2Int(b.shift - commonShift)
+  if (b.neg) {
+    bv = 0 - bv
+  }
+  return av < bv
+}
+
+// float -> int truncates toward zero (spec §12.9): truncate the magnitude,
+// then reapply sign. Correct for a negative dyadic too — e.g. -3.75 truncates
+// to -3, not -4.
+fn truncatedIntText(d: Dyadic): string {
+  let mag = d.mantissa
+  if (d.shift < 0) {
+    mag = d.mantissa / pow2Int(0 - d.shift)
+  } else {
+    mag = d.mantissa * pow2Int(d.shift)
+  }
+  if (d.neg) {
+    mag = 0 - mag
+  }
+  return "${mag}"
+}
+
+// --- Text rendering: decimal and hex-float, both derived from (mantissa,
+// shift) by integer arithmetic only — never a float-to-string routine. ------
+
+fn hexDigitByte(nibble: int): u8 {
+  const digits = "0123456789abcdef"
+  return digits[nibble]
+}
+
+// Minimal (no leading zeros, "0" for zero) hex digits of a non-negative int.
+fn hexDigitsMin(v: int, out: Builder) {
+  if (v == 0) {
+    out.writeByte('0')
+    return
+  }
+  let tmp: []u8 = []u8(0)
+  let x = v
+  while (x > 0) {
+    tmp = append(tmp, hexDigitByte(x % 16))
+    x = x / 16
+  }
+  let i = len(tmp) - 1
+  while (i >= 0) {
+    out.writeByte(tmp[i])
+    i = i - 1
+  }
+}
+
+// Exactly `width` hex digits, zero-padded on the left.
+fn hexDigitsPadded(v: int, width: int, out: Builder) {
+  let i = width - 1
+  while (i >= 0) {
+    let nib = (v / pow16(i)) % 16
+    out.writeByte(hexDigitByte(nib))
+    i = i - 1
+  }
+}
+
+fn padLeftZeros(s: string, minLen: int): string {
+  let out = s
+  while (len(out) < minLen) {
+    out = "0" + out
+  }
+  return out
+}
+
+// `mantissa` split at a `fracNibbles`-hex-digit boundary into whole.frac,
+// with the exponent adjusted so the value is unchanged (spec §5.5 HEX_FLOAT:
+// digits before the point are mandatory and unrestricted, the "." and its
+// digits are optional together).
+fn dyadicHexText(d: Dyadic, fracNibbles: int): string {
+  let divisor = pow16(fracNibbles)
+  let whole = d.mantissa / divisor
+  let frac = d.mantissa % divisor
+  let hexExp = d.shift + 4 * fracNibbles
+  let bld = newBuilder()
+  if (d.neg) {
+    bld.writeByte('-')
+  }
+  bld.write("0x")
+  hexDigitsMin(whole, bld)
+  if (fracNibbles > 0) {
+    bld.writeByte('.')
+    hexDigitsPadded(frac, fracNibbles, bld)
+  }
+  bld.writeByte('p')
+  if (hexExp < 0) {
+    bld.write("-${0 - hexExp}")
+  } else {
+    bld.write("${hexExp}")
+  }
+  return bld.toString()
+}
+
+// The exact decimal text of mantissa*2^shift. Any dyadic (denominator a power
+// of two) has a finite exact decimal expansion: for shift < 0, multiplying
+// mantissa by 5^-shift turns the division by 2^-shift into a division by
+// 10^-shift, i.e. a decimal point placed -shift digits from the right.
+fn dyadicDecimalText(d: Dyadic): string {
+  let bld = newBuilder()
+  if (d.neg) {
+    bld.writeByte('-')
+  }
+  if (d.shift >= 0) {
+    let iv = d.mantissa * pow2Int(d.shift)
+    bld.write("${iv}")
+    bld.write(".0")
+    return bld.toString()
+  }
+  let k = 0 - d.shift
+  let numerator = d.mantissa * pow5(k)
+  let digitsText = padLeftZeros("${numerator}", k + 1)
+  let pointPos = len(digitsText) - k
+  bld.write(digitsText[0:pointPos])
+  bld.writeByte('.')
+  bld.write(digitsText[pointPos:len(digitsText)])
+  return bld.toString()
+}
+
+// Either textual form, chosen at random — this is what guarantees the
+// generated program's arithmetic operands are a mix of decimal and hex float
+// literals across a run, per the construct set in the file header.
+fn randomFloatText(st: []u64, d: Dyadic): string {
+  if (coinFlip(st)) {
+    let fracNibbles = nextBelow(st, 3)
+    return dyadicHexText(d, fracNibbles)
+  }
+  return dyadicDecimalText(d)
+}
+
+// --- Emission -----------------------------------------------------------
+
+// Literal `${name}` in the GENERATED program's own source, for its OWN
+// runtime interpolation — built by concatenation (an escaped `\$` plus a
+// plain `{`) rather than this generator's own `${...}` syntax, so nothing
+// here is interpolated at generation time by mistake.
+fn interpRef(name: string): string {
+  return "\$" + "{" + name + "}"
+}
+
+// The one FUZZFAIL shape every check uses (ticket #2605): `wantText` is both
+// the comparison operand and the printed "want", so the two can never
+// disagree with each other.
+fn emitFail(b: Builder, id: int, varName: string, wantText: string) {
+  b.write("  if (" + varName + " != " + wantText + ") {\n")
+  b.write("    eprint(\"FUZZFAIL ${id} got=" + interpRef(varName) + " want=" + wantText + "\\n\")\n")
+  b.write("    exit(3)\n")
+  b.write("  }\n")
+}
+
+fn intOpApply(opKind: int, lhs: int, rhs: int): int {
+  if (opKind == 0) {
+    return lhs + rhs
+  }
+  if (opKind == 1) {
+    return lhs - rhs
+  }
+  if (opKind == 2) {
+    return lhs * rhs
+  }
+  if (opKind == 3) {
+    return lhs / rhs
+  }
+  return lhs % rhs
+}
+
+fn intOpSymbol(opKind: int): string {
+  if (opKind == 0) {
+    return "+"
+  }
+  if (opKind == 1) {
+    return "-"
+  }
+  if (opKind == 2) {
+    return "*"
+  }
+  if (opKind == 3) {
+    return "/"
+  }
+  return "%"
+}
+
+// / and % need a non-zero divisor; the other three take any fresh operand.
+fn pickIntRhs(st: []u64, opKind: int): int {
+  let isDivOrMod = opKind == 3 || opKind == 4
+  if (isDivOrMod) {
+    let mag = nextRange(st, 1, 50)
+    if (coinFlip(st)) {
+      return 0 - mag
+    }
+    return mag
+  }
+  return nextRange(st, -1000, 1000)
+}
+
+fn emitIntArith(b: Builder, st: []u64, id: int) {
+  let opKind = nextBelow(st, 5)
+  let lhs = nextRange(st, -1000, 1000)
+  let rhs = pickIntRhs(st, opKind)
+  let want = intOpApply(opKind, lhs, rhs)
+  let sym = intOpSymbol(opKind)
+  let varName = "iv${id}"
+  b.write("  let p${id}: []int = []int(2)\n")
+  b.write("  p${id}[0] = ${lhs}\n")
+  b.write("  p${id}[1] = ${rhs}\n")
+  b.write("  let " + varName + ": int = p${id}[0] " + sym + " p${id}[1]\n")
+  emitFail(b, id, varName, "${want}")
+}
+
+fn floatOpSymbol(opKind: int): string {
+  if (opKind == 0) {
+    return "+"
+  }
+  if (opKind == 1) {
+    return "-"
+  }
+  if (opKind == 2) {
+    return "*"
+  }
+  return "/"
+}
+
+fn floatDyadicResult(opKind: int, lhsD: Dyadic, rhsD: Dyadic): Dyadic {
+  if (opKind == 0) {
+    return dyadicAddSub(lhsD, rhsD, false)
+  }
+  if (opKind == 1) {
+    return dyadicAddSub(lhsD, rhsD, true)
+  }
+  if (opKind == 2) {
+    return dyadicMul(lhsD, rhsD)
+  }
+  return dyadicDivByPow2(lhsD, rhsD)
+}
+
+fn pickFloatRhs(st: []u64, opKind: int): Dyadic {
+  if (opKind == 3) {
+    return pickPow2Divisor(st)
+  }
+  return pickDyadicNarrow(st)
+}
+
+fn emitFloatArith(b: Builder, st: []u64, id: int) {
+  let opKind = nextBelow(st, 4)
+  let lhsD = pickDyadicNarrow(st)
+  let rhsD = pickFloatRhs(st, opKind)
+  let resultD = floatDyadicResult(opKind, lhsD, rhsD)
+  let sym = floatOpSymbol(opKind)
+  let lhsText = randomFloatText(st, lhsD)
+  let rhsText = randomFloatText(st, rhsD)
+  let wantText = dyadicDecimalText(resultD)
+  let varName = "fv${id}"
+  b.write("  let q${id}: []f64 = []f64(2)\n")
+  b.write("  q${id}[0] = " + lhsText + "\n")
+  b.write("  q${id}[1] = " + rhsText + "\n")
+  b.write("  let " + varName + ": f64 = q${id}[0] " + sym + " q${id}[1]\n")
+  emitFail(b, id, varName, wantText)
+}
+
+// A literal-only check: the value under test is expressed in ONE form
+// (decimal or hex) and cross-checked against the SAME value expressed in the
+// OTHER form, so a broken hex-float lexer cannot agree with itself (#1857).
+fn emitFloatLiteral(b: Builder, st: []u64, id: int, forceHex: bool) {
+  let d = pickDyadicWide(st)
+  let useHex = forceHex
+  if (!forceHex) {
+    useHex = coinFlip(st)
+  }
+  let text = dyadicDecimalText(d)
+  if (useHex) {
+    text = dyadicHexText(d, nextBelow(st, 3))
+  }
+  let wantText = dyadicHexText(d, nextBelow(st, 3))
+  if (useHex) {
+    wantText = dyadicDecimalText(d)
+  }
+  let varName = "lv${id}"
+  b.write("  let " + varName + ": f64 = " + text + "\n")
+  emitFail(b, id, varName, wantText)
+}
+
+fn emitIntToFloatCast(b: Builder, st: []u64, id: int) {
+  let v = nextRange(st, -100000, 100000)
+  let want = dyadicDecimalText(Dyadic{ mantissa: absInt(v), shift: 0, neg: v < 0 })
+  let varName = "cv${id}"
+  b.write("  let p${id}: []int = []int(1)\n")
+  b.write("  p${id}[0] = ${v}\n")
+  b.write("  let " + varName + ": f64 = f64(p${id}[0])\n")
+  emitFail(b, id, varName, want)
+}
+
+fn emitFloatToIntCast(b: Builder, st: []u64, id: int) {
+  let d = pickDyadicNarrow(st)
+  let text = randomFloatText(st, d)
+  let want = truncatedIntText(d)
+  let varName = "cv${id}"
+  b.write("  let q${id}: []f64 = []f64(1)\n")
+  b.write("  q${id}[0] = " + text + "\n")
+  b.write("  let " + varName + ": int = i64(q${id}[0])\n")
+  emitFail(b, id, varName, want)
+}
+
+fn boolText(v: bool): string {
+  if (v) {
+    return "true"
+  }
+  return "false"
+}
+
+fn emitIntComparison(b: Builder, st: []u64, id: int) {
+  let lhs = nextRange(st, -1000, 1000)
+  let rhs = nextRange(st, -1000, 1000)
+  let want = boolText(lhs < rhs)
+  let varName = "bv${id}"
+  b.write("  let p${id}: []int = []int(2)\n")
+  b.write("  p${id}[0] = ${lhs}\n")
+  b.write("  p${id}[1] = ${rhs}\n")
+  b.write("  let " + varName + ": bool = p${id}[0] < p${id}[1]\n")
+  emitFail(b, id, varName, want)
+}
+
+fn emitFloatComparison(b: Builder, st: []u64, id: int) {
+  let lhsD = pickDyadicNarrow(st)
+  let rhsD = pickDyadicNarrow(st)
+  let want = boolText(dyadicLess(lhsD, rhsD))
+  let lhsText = randomFloatText(st, lhsD)
+  let rhsText = randomFloatText(st, rhsD)
+  let varName = "bv${id}"
+  b.write("  let q${id}: []f64 = []f64(2)\n")
+  b.write("  q${id}[0] = " + lhsText + "\n")
+  b.write("  q${id}[1] = " + rhsText + "\n")
+  b.write("  let " + varName + ": bool = q${id}[0] < q${id}[1]\n")
+  emitFail(b, id, varName, want)
+}
+
+fn emitComparison(b: Builder, st: []u64, id: int) {
+  if (coinFlip(st)) {
+    emitFloatComparison(b, st, id)
+    return
+  }
+  emitIntComparison(b, st, id)
+}
+
+fn emitCastOrCompare(b: Builder, st: []u64, id: int) {
+  let kind = nextBelow(st, 3)
+  if (kind == 0) {
+    emitIntToFloatCast(b, st, id)
+    return
+  }
+  if (kind == 1) {
+    emitFloatToIntCast(b, st, id)
+    return
+  }
+  emitComparison(b, st, id)
+}
+
+// `forceHex` guarantees at least one hex float literal appears regardless of
+// seed (check 0 always takes this branch) — the acceptance test's
+// `grep -q '0x1'` does not have to get lucky.
+fn emitCheck(b: Builder, st: []u64, id: int, forceHex: bool) {
+  if (forceHex) {
+    emitFloatLiteral(b, st, id, true)
+    return
+  }
+  let kind = nextBelow(st, 4)
+  if (kind == 0) {
+    emitIntArith(b, st, id)
+    return
+  }
+  if (kind == 1) {
+    emitFloatArith(b, st, id)
+    return
+  }
+  if (kind == 2) {
+    emitFloatLiteral(b, st, id, false)
+    return
+  }
+  emitCastOrCompare(b, st, id)
+}
+
+fn genProgram(seed: u64): string {
+  let st = []u64(1)
+  st[0] = normalizeSeed(seed)
+  let b = newBuilder()
+  b.write("import { exit } from \"std/os\"\n\n")
+  b.write("fn main() {\n")
+  let id = 0
+  while (id < totalChecks) {
+    emitCheck(b, st, id, id == 0)
+    id = id + 1
+  }
+  b.write("  print(\"OK ${totalChecks}\\n\")\n")
+  b.write("}\n")
+  return b.toString()
+}
+
+fn usageFail() {
+  eprint("usage: genprog --seed <n>\n")
+  exit(2)
+}
+
+fn main() {
+  let a = args()
+  if (len(a) < 3 || a[1] != "--seed") {
+    usageFail()
+    return
+  }
+  let n = parseInt(a[2]) catch _ {
+    usageFail()
+    0
+  }
+  print(genProgram(u64(n)))
+}
