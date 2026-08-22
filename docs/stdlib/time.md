@@ -165,3 +165,44 @@ fn example() {
   report("timeout", 1 * Second + 500 * Millisecond)
 }
 ```
+
+## Calendar
+
+### `Civil`
+
+A broken-down UTC date and time: `year`, `month` (1..12), `day` (1..days in
+that month), `hour` (0..23), `minute` (0..59), `second` (0..59), `nanosecond`
+(0..999999999), `weekday` (0 for Sunday up to 6 for Saturday), and `yearDay`
+(1 for January 1).
+
+### `civilFromUnix(ns: int): Civil`
+
+`ns` nanoseconds since the Unix epoch, broken down into a UTC `Civil`. Exact
+for any instant, including before 1970 — the day/time split floors instead of
+truncating, so a negative `ns` still lands on the correct calendar day.
+
+```bit
+import { civilFromUnix } from "std/time"
+
+fn describe(ns: int) {
+  let c = civilFromUnix(ns)
+  println("${c.year}-${c.month}-${c.day} ${c.hour}:${c.minute}:${c.second}")
+}
+```
+
+### `unixFromCivil(c: Civil): int!`
+
+The inverse of `civilFromUnix`: nanoseconds since the Unix epoch for a UTC
+`Civil`. Fails when `month`, `day`, `hour`, `minute`, `second`, or
+`nanosecond` is out of range — `day` is checked against the actual length of
+`month` in `year`, leap years included. Ignores `weekday` and `yearDay`.
+
+```bit
+import { Civil, unixFromCivil } from "std/time"
+
+fn leapDaySeconds(): int! {
+  let c = Civil{ year: 2024, month: 2, day: 29, hour: 0, minute: 0, second: 0,
+    nanosecond: 0, weekday: 0, yearDay: 0 }
+  return unixFromCivil(c)?
+}
+```
