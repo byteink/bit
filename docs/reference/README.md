@@ -14,7 +14,7 @@ single static native binary. The guiding goal is **easy to write**.
 | Chapter | Covers |
 | ------- | ------ |
 | [Variables](variables.md) | `let`/`const`, mutability, zero values, destructuring, assignment, comments, semicolons |
-| [Types](types.md) | primitives, literals, slices, arrays, maps, tuples, structs, aliases, conversions, operators |
+| [Types](types.md) | primitives, literals, slices, arrays, maps, tuples, classes, aliases, conversions, operators |
 | [Functions](functions.md) | functions, methods, parameters, variadics, arrow functions, control flow |
 | [Interfaces](interfaces.md) | structural interfaces, satisfaction, `error`, type assertions |
 | [Generics](generics.md) | type parameters, constraints, inference, monomorphization |
@@ -50,7 +50,7 @@ left without a reference page:
 | §4–§7 lexical, literals, semicolons | Variables, Types |
 | §10.1 value declarations | Variables |
 | §10.2 type aliases | Types |
-| §10.3–§10.5 functions, methods, structs | Functions, Types |
+| §10.3–§10.5 functions, methods, classes | Functions, Types |
 | §10.6 interfaces | Interfaces |
 | §11 types | Types |
 | §11.3 generics | Generics |

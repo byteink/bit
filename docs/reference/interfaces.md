@@ -86,7 +86,7 @@ fn mustCircle(s: Shape): Circle {
 The two-result form is valid only as the sole right-hand side of a declaration
 or assignment.
 
-The target must be a class type - only structs carry methods, so only a class
+The target must be a class type - only classes carry methods, so only a class
 can be the concrete type behind an interface value. Asserting a type that could
 never satisfy the interface is a compile-time error rather than a check that
 always fails.

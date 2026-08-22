@@ -41,7 +41,7 @@ handle with `catch`. See [errors](../reference/errors.md).
 **Slices have no methods.** Operations on them are free functions taking the
 slice first: `filter(xs, pred)`, never `xs.filter(pred)`.
 
-**Structs are reference types**, so a method mutates the receiver in place. This
+**Classes are reference types**, so a method mutates the receiver in place. This
 is why `w.write(s)` needs no reassignment, and why an unflushed `Writer` loses
 data.
 
