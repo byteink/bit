@@ -83,6 +83,43 @@ fn computeSkipConstMaterialize(ctx: TypeContext, f: IrFunc): []bool {
   return skip
 }
 
+// #3101: does `compileInst` write instruction `i`'s own allocated register?
+//
+// Mirrors the dispatch below, and DEFAULTS TO TRUE so the mirror can only ever
+// fail safe: a new op, or one this list forgets, is treated as writing its
+// register and is saved as before. Only the reverse — claiming a write does not
+// happen when it does — could drop a live callee-saved value, so nothing goes in
+// the false list without a `compileInst` arm that provably binds no destination:
+//
+//   * Jump/Br/Ret/Unreachable/FieldSet/IndexSet/AtomicStore pass no `i` to their
+//     emitter at all; they only read operands.
+//   * Call/CallValue/CallIface/RtCall/Asm route their destination through
+//     `dstOrNone`, which answers -1 for a void result, and `emitCall`/`emitAsm`
+//     each guard on that (arm64call.bit's `dst < 0`, emitAsm's `dst >= 0`).
+//   * a `const_int` in `skipConst` is the one arm that materializes nothing;
+//     `computeSkipConstMaterialize` above already proves its sole use reads it as
+//     an immediate, never as a register, so nothing loads it either.
+//
+// block_param is deliberately absent: `moveBlockArgs` writes a param's register
+// on every incoming edge, so it is a real definition even though `compileInst`
+// never sees one.
+fn arm64WritesResult(ctx: TypeContext, f: IrFunc, skipConst: []bool, i: int): bool {
+  let ins = f.instrs[i]
+  let op = ins.op
+  if (op == Op.Jump || op == Op.Br || op == Op.Ret || op == Op.Unreachable ||
+    op == Op.FieldSet || op == Op.IndexSet || op == Op.AtomicStore) {
+    return false
+  }
+  if (op == Op.ConstInt) {
+    return !skipConst[i]
+  }
+  if (op == Op.Call || op == Op.CallValue || op == Op.CallIface ||
+    op == Op.RtCall || op == Op.Asm) {
+    return ins.ty != ctx.voidId
+  }
+  return true
+}
+
 // Emits one instruction. `curBlock` is only needed to classify an edge as a
 // back-edge.
 fn compileInst(cx: A64Ctx, curBlock: int, i: int) {
@@ -482,16 +519,28 @@ fn compileFunction(module: IrModule, f: IrFunc): FuncCode {
     floatRegs: RegFile{ count: len(floatRegs), calleeSaved: 0 },
   }, intervals, built.safepoints)
 
+  let skipConst = computeSkipConstMaterialize(ctx, f)
+
   // Which callee-saved physical registers this allocation actually touched — only
   // those need saving. Scanned per-vreg (rather than over the locations alone)
   // since a bare register index is ambiguous between the int and float files
   // without its own class.
+  //
+  // #3101: an interval whose instruction WRITES no register is skipped. The
+  // allocator hands out a location for every one of `buildIntervals`' dense
+  // slots, including the ones its own doc comment calls "trivial, never-
+  // referenced [i,i] interval; harmless filler" (terminators, field_set/
+  // index_set, a void-typed call) — plus the `const_int` defs #1853/#3104/#3105
+  // fold whole into an immediate and never materialize. Counting those as used
+  // saved a register the body provably never writes, which made the prologue's
+  // str/ldr pair a pure no-op and, when it was the only entry, kept an otherwise
+  // frameless function paying a full frame record.
   let gprUsed = []bool(len(intRegs))
   let fprUsed = []bool(len(floatRegs))
   let vi = 0
   while (vi < len(intervals)) {
     let loc = result.locations[vi]
-    if (!loc.isSpill) {
+    if (!loc.isSpill && arm64WritesResult(ctx, f, skipConst, vi)) {
       if (intervals[vi].regClass == RegClass.Int) {
         gprUsed[loc.index] = true
       } else {
@@ -610,7 +659,9 @@ fn compileFunction(module: IrModule, f: IrFunc): FuncCode {
     safepoints: []SafepointView(0),
     safepointPositions: built.safepoints,
     nextSafepointIdx: 0,
-    skipConst: computeSkipConstMaterialize(ctx, f),
+    skipConst: skipConst,
+    wroteInt: []bool(32),
+    wroteFloat: []bool(32),
   }
 
   // §10.3.1 @naked: no prologue — the function runs on its caller's frame.
@@ -637,6 +688,16 @@ fn compileFunction(module: IrModule, f: IrFunc): FuncCode {
     bi = bi + 1
   }
   patchJumpFixups(cx)
+
+  // #3101: emission is finished, so `cx.wroteInt`/`cx.wroteFloat` now hold every
+  // physical register a vreg actually resolved to. Every callee-saved one must be
+  // in the save set the frame was laid out from — otherwise this function
+  // clobbers a register its caller expects back, which no test can see until the
+  // caller's value happens to matter. A @naked function saves nothing by
+  // contract (§10.3.1) and owns the whole file itself, so it is exempt.
+  if (!f.isNaked) {
+    assertSavedCoversWrites(cx)
+  }
 
   // Register-recovery slots: the prologue saves savedGpr[i] at gprSaveOffset(i)
   // from sp; convert to x29-relative (fp = sp + frameSize - 16) so the runtime
