@@ -206,3 +206,35 @@ fn leapDaySeconds(): int! {
   return unixFromCivil(c)?
 }
 ```
+
+### `formatUnix(ns: int, layout: string): string`
+
+Renders the UTC instant `ns` (nanoseconds since the Unix epoch) with a
+strftime subset. Every character in `layout` is copied through unchanged
+except: `%Y` the year (at least four digits, zero padded); `%m` the month
+(two digits); `%d` the day (two digits); `%H` the hour (two digits); `%M` the
+minute (two digits); `%S` the second (two digits); `%%` a literal `%`. Any
+other `%x` pair, and a trailing lone `%`, are copied through unchanged.
+
+```bit
+import { formatUnix } from "std/time"
+
+fn describe(ns: int) {
+  println(formatUnix(ns, "%Y-%m-%d %H:%M:%S"))
+}
+```
+
+### `formatRfc3339(ns: int): string`
+
+Renders the UTC instant `ns` as RFC 3339: `2026-08-02T14:03:11Z` when the
+nanosecond field is `0`. When it is not `0`, a `.` and exactly nine
+zero-padded digits are inserted before the `Z` — 500 nanoseconds prints
+`2026-08-02T14:03:11.000000500Z`, never `.5`.
+
+```bit
+import { formatRfc3339 } from "std/time"
+
+fn logLine(ns: int, msg: string) {
+  println("${formatRfc3339(ns)} ${msg}")
+}
+```
