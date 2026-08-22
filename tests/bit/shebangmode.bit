@@ -23,10 +23,26 @@
 // fixture-corpus exclusion checks for a `.expected` file rather than naming
 // `checkercases/`/`parsercases/` (#2868): a file is a library, and exempt
 // from the executable-bit requirement, iff every top-level line outside
-// comments/blank lines is either the opening of a function definition or
-// lies inside one — i.e. sourcing it would execute nothing. A file with NO
-// function definitions at all is not a library either; the default is to
-// require the executable bit, and the exemption is earned, not assumed.
+// comments/blank lines is either the opening of a function definition, lies
+// inside one, or is a BARE fd-duplication `exec` statement (`exec N>&M` /
+// `exec N<&M`, no command word) — i.e. sourcing it would run no command. A
+// file with NO function definitions at all is not a library either; the
+// default is to require the executable bit, and the exemption is earned,
+// not assumed.
+//
+// THE THIRD CASE (#3428) exists for `scripts/alarmrun.sh:43`'s
+// `exec 9>&2`. Bash's own documented semantics: `exec` with no simple
+// command applies its redirections to the CURRENT shell and returns 0
+// WITHOUT running anything — no subprocess, no program executed — so it is
+// not a "statement" in the sense the property above cares about; it only
+// mutates this shell's own descriptor table once, at source time, which is
+// the only place `alarmrun_retry`'s stall note (written to fd 9) can be
+// guaranteed to still reach the caller's REAL stderr before that caller
+// locally rebinds fd 2 to capture a child's own diagnostics as comparison
+// text. `isFdDupToken` is deliberately narrow — a token must be all digits,
+// then `>&`/`<&`, then all digits, nothing else — so `exec 3>/tmp/log`
+// (opens a file: a real side effect) and `exec somecmd` (runs a command)
+// both still count as a top-level statement and still fail this gate.
 // `isLibraryOnly` is a line-oriented heuristic (brace-depth tracking, not a
 // real shell parser) — good enough for this repo's own scripts, verified
 // against every tracked scripts/*.sh at the time this gate was written. The
@@ -172,11 +188,85 @@ fn netBraceDelta(t: string): int {
   return delta
 }
 
+// True iff `s` is non-empty and every byte is an ASCII digit — used only to
+// validate the fd numbers on either side of a dup operator below.
+fn isAllDigits(s: string): bool {
+  if (len(s) == 0) {
+    return false
+  }
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c < '0' || c > '9') {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// True iff `tok` is exactly a bare fd-duplication operand: digits, then
+// `>&` or `<&`, then digits — e.g. `9>&2`. The fd before the operator may be
+// omitted (bash defaults it to 1 for `>&` and 0 for `<&`), matching plain
+// `>&2`; the fd after it may not, since a bare `exec N>&` with nothing on
+// the right is a syntax error, not a valid redirection. Anything else
+// (a bareword, a path, a pipe) fails, which is what keeps `exec 3>/tmp/log`
+// (opens a file — a real side effect) and `exec somecmd` (runs a command)
+// out of this exemption.
+fn isFdDupToken(tok: string): bool {
+  let opAt = indexOf(tok, ">&")
+  if (opAt < 0) {
+    opAt = indexOf(tok, "<&")
+  }
+  if (opAt < 0) {
+    return false
+  }
+  let left = tok[0:opAt]
+  let right = tok[opAt + 2:]
+  if (!isAllDigits(right)) {
+    return false
+  }
+  if (len(left) > 0 && !isAllDigits(left)) {
+    return false
+  }
+  return true
+}
+
+// True iff `t` (already trimmed, non-empty, not a comment) is a bare
+// fd-duplication `exec` statement — `exec` followed by one or more
+// whitespace-separated fd-dup tokens and NOTHING else. Per bash's
+// documented semantics, `exec` with no simple command name applies its
+// redirections to the current shell and returns 0 without running
+// anything, so this line executes no command when the file is sourced —
+// see the header comment above for why `scripts/alarmrun.sh` needs exactly
+// this shape at source time.
+fn isBareExecFdRedirect(t: string): bool {
+  if (!hasPrefix(t, "exec ")) {
+    return false
+  }
+  let rest = trimSpace(t[5:])
+  if (len(rest) == 0) {
+    return false
+  }
+  let tokens = split(rest, " ")
+  let sawToken = false
+  for tok of tokens {
+    if (len(tok) == 0) {
+      continue
+    }
+    if (!isFdDupToken(tok)) {
+      return false
+    }
+    sawToken = true
+  }
+  return sawToken
+}
+
 // The exemption's decision function, pure and independently testable (see
 // selfTestIsLibraryOnly below) — no top-level statement outside a function
-// definition, and at least one function definition. Fails CLOSED: a file
-// with unbalanced braces (a function that never closes) or with no function
-// at all is not a library.
+// definition or a bare fd-duplication `exec` line, and at least one
+// function definition. Fails CLOSED: a file with unbalanced braces (a
+// function that never closes) or with no function at all is not a library.
 fn isLibraryOnly(src: string): bool {
   let lines = split(src, "\n")
   if (len(lines) > maxLinesPerFile) {
@@ -199,6 +289,9 @@ fn isLibraryOnly(src: string): bool {
         insideFunc = true
         depth = 1
         sawFunctionDef = true
+        continue
+      }
+      if (isBareExecFdRedirect(t)) {
         continue
       }
       sawTopLevelStatement = true
@@ -246,7 +339,7 @@ fn evaluateEntry(mode: string, path: string, content: string): Verdict {
   }
   return Verdict{
     applicable: true, violates: true, exempt: false,
-    msg: "${path} carries a #! shebang but is committed mode 100644 (want 100755) — it will fail rc 126 for anyone running it as documented; if this is meant to be a SOURCED library like scripts/alarmrun.sh, it must contain no top-level statement outside a function definition",
+    msg: "${path} carries a #! shebang but is committed mode 100644 (want 100755) — it will fail rc 126 for anyone running it as documented; if this is meant to be a SOURCED library like scripts/alarmrun.sh, it must contain no top-level statement outside a function definition (a bare fd-duplication `exec N>&M` is allowed)",
   }
 }
 
@@ -352,6 +445,26 @@ fn selfTestIsLibraryOnly(): int {
   let hybrid = "#!/usr/bin/env bash\nfoo() {\n  echo hi\n}\necho done\n"
   failed = failed + selfCheck(!isLibraryOnly(hybrid),
     "isLibraryOnly accepted a file with a top-level statement AFTER its function closed")
+
+  // #3428: scripts/alarmrun.sh's actual shape — a bare fd-duplication
+  // `exec 9>&2` between two function definitions, needed so
+  // alarmrun_retry's stall note reaches the caller's real stderr even after
+  // that caller locally rebinds fd 2 to capture a child's diagnostics.
+  let fdDupLibrary = "#!/usr/bin/env bash\nalarmrun() {\n  echo hi\n}\nexec 9>&2\nalarmrun_retry() {\n  echo bye\n}\n"
+  failed = failed + selfCheck(isLibraryOnly(fdDupLibrary),
+    "isLibraryOnly rejected the alarmrun.sh shape: a bare 'exec 9>&2' between two function definitions")
+
+  let fdDupNoDigitLeft = "#!/usr/bin/env bash\nexec >&2\nfoo() {\n  echo hi\n}\n"
+  failed = failed + selfCheck(isLibraryOnly(fdDupNoDigitLeft),
+    "isLibraryOnly rejected 'exec >&2' (fd defaulted on the left of the operator)")
+
+  let execRealCommand = "#!/usr/bin/env bash\nexec somecmd --flag\nfoo() {\n  echo hi\n}\n"
+  failed = failed + selfCheck(!isLibraryOnly(execRealCommand),
+    "isLibraryOnly exempted 'exec somecmd --flag' — that RUNS a command, not a bare fd redirection")
+
+  let execFileOpen = "#!/usr/bin/env bash\nexec 3>/tmp/log\nfoo() {\n  echo hi\n}\n"
+  failed = failed + selfCheck(!isLibraryOnly(execFileOpen),
+    "isLibraryOnly exempted 'exec 3>/tmp/log' — that opens a file, a real side effect")
 
   return failed
 }
