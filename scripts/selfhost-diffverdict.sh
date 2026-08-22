@@ -181,14 +181,14 @@ done
 # rather than by reading any code.
 # ---------------------------------------------------------------------------
 for e in $EXPRS; do
-  # Struct-literal FIELD types. Held out until #1476: validating them needs a
+  # Class-literal FIELD types. Held out until #1476: validating them needs a
   # checkExprType recompute on the field value, which panicked ("index out of
   # range") on every multi-module file reaching stdlib/http. That was a real
   # compiler bug (a cross-module decl node read against the wrong module's tree),
   # it is fixed, and these cells are live again — this was the last unchecked
   # declared-type slot in the language.
-  cell "struct field S{ v: f32 } = $e" \
-"struct S {
+  cell "class field S{ v: f32 } = $e" \
+"class S {
   v: f32,
 }
 fn main() {

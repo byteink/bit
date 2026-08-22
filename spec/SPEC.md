@@ -717,7 +717,7 @@ fn (p: Point) norm(): f64 {
   field mutates the caller's value; no pointer receiver syntax is needed.
 - Methods participate in structural interface satisfaction (§14.3).
 
-### 10.5 Struct Declarations
+### 10.5 Class Declarations
 
 ```
 struct_decl = ( "class" | "class" ) IDENT [ generic_params ] "{" [ field { ( ";" | "," ) field } [ ";" | "," ] ] "}" .
@@ -1612,7 +1612,7 @@ primary      = literal
 An `IDENT` in expression position resolves to a value binding, function, or a type
 used as a constructor/converter (§12.9). Literals are as in §5.
 
-### 12.2 Struct Composite Literals
+### 12.2 Class Composite Literals
 
 ```
 composite_lit = type_name [ "<" type_args ">" ] "{" [ field_inits ] "}"
@@ -1629,7 +1629,7 @@ type_args     = type { "," type } .
 A class literal is **always** prefixed by its type name: `Point{ x: 1.0, y: 2.0 }`.
 This is the rule that removes the block-versus-object-literal ambiguity — a bare
 `{` in statement position is **always** a block (§13.1), never a class or map
-literal. Struct literals are keyed; any field omitted from the literal takes its
+literal. Class literals are keyed; any field omitted from the literal takes its
 zero value (§13.4). A field whose own type is a **class** has no zero value and
 therefore may **not** be omitted — leaving it out is **E0083**. Fields not visible
 to the current module (unexported fields of a foreign class) may not appear.
