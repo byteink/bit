@@ -31,6 +31,7 @@ below is compiled by the test suite, so none of it can quietly rot.
 | [http3](http3.md) | `"std/http3"` | QPACK field compression |
 | [testing](testing.md) | `"std/testing"` | Assertions for `bit test` |
 | [sync](sync.md) | `"std/sync"` | `Mutex`, `RWMutex`, `WaitGroup`, `Once`, atomics |
+| [prof](prof.md) | `"std/prof"` | In-process CPU sampling profiler (aarch64-macos only) |
 
 ## Conventions
 

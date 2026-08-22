@@ -1,0 +1,174 @@
+// CPU sampling profiler, aarch64-macos only (#1906). Darwin's SIGPROF via
+// `setitimer(ITIMER_PROF, ...)`, in the same `@nosplit` signal-handler style
+// as ./signal.bit's SIGSEGV/SIGBUS/SIGTRAP handlers — same buffer shapes, same
+// ucontext offsets (verified with `offsetof` against this SDK's headers,
+// 2026-08-23, not from memory: `ucMcontextOffset`/`mcontextSpOffset` are
+// ./signal.bit's own constants, reused rather than re-declared since this file
+// is a sibling in the same module).
+//
+// SCOPE, STATED EXPLICITLY: this is a leaf-PC sampler, not a full stack
+// walker — every tick records ONLY the interrupted instruction's address, not
+// a call chain. That is enough to answer "which function is hot" (this
+// ticket's acceptance line), not "who called it". A full frame-pointer walk
+// from signal context is future work (the same chain ../gc/stackmap.bit
+// already walks from a safepoint snapshot, not from an arbitrary interrupt).
+//
+// SCOPE, ALSO EXPLICIT: this profiles ONE OS thread — whichever one is
+// running when `startCpu` installs the handler (BSD/XNU deliver a
+// process-directed itimer's signal to an arbitrary unblocked thread, so with
+// `BIT_WORKERS=1` — this file's only validated configuration — that is
+// always the sole worker). A multi-worker build may see samples cluster on
+// whichever thread the kernel happens to pick; per-thread coverage (a
+// per-worker `timer_create`-equivalent) is not attempted here. Say so rather
+// than claim a coverage this does not have.
+//
+// WHY A RING BUFFER OF RAW ADDRESSES, NOT NAMES, NOT A HISTOGRAM: naming a
+// sample means walking a symbol table, which is IO/allocation-shaped work
+// this `@nosplit` handler cannot do (the same reason ../signal.bit's
+// SIGSEGV handler only classifies, it does not print or allocate). Recording
+// is the cheapest correct thing the handler can do; symbolizing an address ->
+// function name happens later, out of the signal handler, against the
+// binary's own already-emitted Mach-O local symbol table (proven present with
+// a real build: `nm` resolves every surviving function, including a
+// user program's own — see tools/prof/render.bit).
+//
+// ASLR: this binary is PIE (../ABI.md's stack-map section: "dyld must rebase
+// absolute code pointers under PIE"). A raw PC read from the signal context
+// is a RUNTIME (slid) address; the symbol table `nm`/the renderer reads is
+// FILE (unslid) addresses. `profSlide`, captured once at `startCpu` via
+// `_dyld_get_image_vmaddr_slide(0)`, is subtracted before a sample is stored,
+// so every stored address is already file-relative and directly comparable to
+// the binary's own symbol table with no further correction at render time.
+
+// `sigaction`, `sigActionWords`, `saSiginfo`, `ucMcontextOffset`,
+// `mcontextSpOffset` are ./signal.bit's (module-scoped, not re-declared here —
+// a redeclaration is E0042).
+
+// libSystem `int setitimer(int which, const struct itimerval *new, struct
+// itimerval *old)` (`<sys/time.h>`). `struct itimerval` is two back-to-back
+// `struct timeval { time_t tv_sec; suseconds_t tv_usec; }` (16 bytes each,
+// `tv_usec` padded to 8) = 32 bytes = 4 words: `[interval.sec, interval.usec,
+// value.sec, value.usec]`. Verified with `sizeof`/`offsetof` against this
+// SDK's `<sys/time.h>`, 2026-08-23: `sizeof(itimerval)=32`,
+// `offsetof(it_interval)=0`, `offsetof(it_value)=16`,
+// `offsetof(timeval,tv_usec)=8`.
+extern fn setitimer(which: i32, newVal: *u8, oldVal: *u8): i32
+
+// `intptr_t _dyld_get_image_vmaddr_slide(uint32_t image_index)` — image 0 is
+// always the main executable (dyld(3)). Returns the runtime-minus-file
+// address delta for that image; 0 on a non-PIE load (never observed for a
+// Bit-built binary here, but the arithmetic is correct either way).
+extern fn _dyld_get_image_vmaddr_slide(imageIndex: u32): i64
+
+// ITIMER_PROF = 2 (`<sys/time.h>`); SIGPROF = 27 (`<sys/signal.h>`). Both
+// verified against this SDK's headers, 2026-08-23, not from memory.
+const itimerProf: i32 = 2
+const sigProf: int = 27
+
+// Sample cap: 8192 raw addresses, 64 KiB, allocated once as module state
+// (Power of 10 rule 3 — no allocation after startup, and this is never
+// grown). `profCount` is an unbounded fetch-and-add counter (rule 2 still
+// holds: the STORAGE it counts into is bounded, only the counter's own value
+// grows) — so a run with more than 8192 ticks reports its true total sample
+// count and simply stops storing past the cap; `profStop` clamps its return
+// value to the cap, and the renderer's denominator names both numbers rather
+// than silently truncating.
+const profCap: int = 8192
+let profPcs: [8192]i64
+let profCount: [1]i64
+let profSlide: [1]i64
+let profActBuf: [2]i64
+let profTimerBuf: [4]i64
+let profZeroBuf: [4]i64
+
+// The SIGPROF handler: read the interrupted PC, subtract the recorded ASLR
+// slide, and store it in the next free ring slot (dropping the sample if the
+// ring is already full — never blocking, never allocating). SA_SIGINFO
+// three-argument shape, matching ../signal.bit's `segvHandler`/`trapHandler`.
+@nosplit fn cpuProfHandler(sig: i32, info: *u8, ctx: *u8) {
+  let mcontextPtr = loadWord(int(ctx) + ucMcontextOffset)
+  let pc = loadWord(mcontextPtr + mcontextPcOffset)
+  let slot = atomicAdd(ptrOf(profCount), 1)
+  if (slot < profCap) {
+    let slide = loadWord(int(ptrOf(profSlide)))
+    storeWord(int(ptrOf(profPcs)) + slot * 8, pc - slide)
+  }
+}
+
+// `mcontextPcOffset`: `__pc` sits at offset 256 *within* `__ss`
+// (`class __darwin_arm_thread_state64`), and `__ss` itself starts at offset
+// 16 within `mcontext_t` — the same layout ../signal.bit's `mcontextSpOffset`
+// (264 = 16 + 248, `__sp`) already documents; this is that constant's sibling
+// field, 16 + 256 = 272. Verified with the same `offsetof` pass, 2026-08-23.
+const mcontextPcOffset: int = 272
+
+// `bit_rt_prof_start`: arm SIGPROF + `ITIMER_PROF` at `intervalMicros`, after
+// resetting the ring. Returns 0 on success, -1 if either libSystem call
+// failed (disposition and timer are both attempted regardless; a caller that
+// gets -1 should not trust any samples this run collects).
+export @nosplit @symbol("bit_rt_prof_start") fn profStart(intervalMicros: int): int {
+  storeWord(int(ptrOf(profCount)), 0)
+  storeWord(int(ptrOf(profSlide)), int(_dyld_get_image_vmaddr_slide(u32(0))))
+
+  let actBase = int(ptrOf(profActBuf))
+  storeWord(actBase, int(entryOf(cpuProfHandler)))
+  storeWord(actBase + 8, saSiginfo << 32)
+  let nilp: *u8 = nil
+  let sigRc = sigaction(i32(sigProf), nilp + actBase, nilp)
+
+  let timerBase = int(ptrOf(profTimerBuf))
+  storeWord(timerBase, 0)
+  storeWord(timerBase + 8, intervalMicros)
+  storeWord(timerBase + 16, 0)
+  storeWord(timerBase + 24, intervalMicros)
+  let timerRc = setitimer(itimerProf, nilp + timerBase, nilp)
+
+  if (sigRc != 0 || timerRc != 0) {
+    return -1
+  }
+  return 0
+}
+
+// `bit_rt_prof_stop`: disarm the timer, restore SIGPROF to `SIG_DFL`, and
+// return the number of samples actually stored — `min(profCount, profCap)`,
+// never the raw (possibly larger) tick count, since only the first `profCap`
+// were written.
+export @nosplit @symbol("bit_rt_prof_stop") fn profStop(): int {
+  let timerBase = int(ptrOf(profZeroBuf))
+  storeWord(timerBase, 0)
+  storeWord(timerBase + 8, 0)
+  storeWord(timerBase + 16, 0)
+  storeWord(timerBase + 24, 0)
+  let nilp: *u8 = nil
+  let _ = setitimer(itimerProf, nilp + timerBase, nilp)
+
+  let actBase = int(ptrOf(profActBuf))
+  storeWord(actBase, 0) // SIG_DFL
+  storeWord(actBase + 8, 0)
+  let _ = sigaction(i32(sigProf), nilp + actBase, nilp)
+
+  let n = int(loadWord(int(ptrOf(profCount))))
+  if (n > profCap) {
+    return profCap
+  }
+  return n
+}
+
+// `bit_rt_prof_sample`: the file-relative (already slide-corrected) address
+// recorded at ring index `i`, or -1 if `i` is out of `[0, profStop()'s
+// return)`. Ordinary (non-`@nosplit`) — called from userland code after
+// profiling has stopped, not from the handler.
+export @symbol("bit_rt_prof_sample") fn profSample(i: int): int {
+  if (i < 0 || i >= profCap) {
+    return -1
+  }
+  let n = int(loadWord(int(ptrOf(profCount))))
+  let stored = n
+  if (stored > profCap) {
+    stored = profCap
+  }
+  if (i >= stored) {
+    return -1
+  }
+  return int(loadWord(int(ptrOf(profPcs)) + i * 8))
+}
