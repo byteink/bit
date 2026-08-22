@@ -3,7 +3,7 @@
 Buffered streams over file descriptors. `println` (from the prelude) issues one
 write syscall per line; a `Writer` batches many writes into one.
 
-A `Writer` and a `Reader` are structs, so they are reference types: their methods
+A `Writer` and a `Reader` are classes, so they are reference types: their methods
 mutate the stream in place. **Nothing flushes for you** - a `Writer` that goes
 out of scope unflushed loses whatever it still holds.
 

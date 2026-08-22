@@ -49,9 +49,9 @@ fn drain<T: Reader & Closer>(src: T): string {
 }
 ```
 
-## Generic structs and interfaces
+## Generic classes and interfaces
 
-Type parameters attach to structs, interfaces, and type aliases too.
+Type parameters attach to classes, interfaces, and type aliases too.
 
 ```bit
 class Box<T> {

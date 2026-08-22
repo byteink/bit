@@ -122,18 +122,18 @@ assigned to but never read; it discards a value (e.g. `let (_, ok) = <-c`).
 Reserved; may not be used as identifiers:
 
 ```
-as       asm       break     case      catch     chan
-class    const     continue  default   defer     else
-enum     export    fail      false     fn        for
-from     if        import    in        interface let
-map      match     nil       of        return    select
-spawn    class    switch    true      type      while
+as     asm     break     case     catch      chan
+class  const   continue  default  defer      else
+enum   export  fail      false    fn         for
+from   if      import    in       interface  let
+map    match   nil       of       return     select
+spawn  switch  true      type     while
 ```
 
-`class` is accepted as a synonym for `class` (§10.5) as of the phase-1 migration
-step (#3425); the two spellings are currently equivalent and neither is
-deprecated. A later phase settles on one spelling and reserves the other's
-diagnostic for it.
+`struct` is not a keyword. Pre-0.1.24 code that declared types with `struct` is
+rejected with `error[E0102]: 'struct' is not a keyword`, naming `class` as the
+replacement (§10.5). The rename (#3425) is mechanical: only the keyword changes
+— field access, method syntax, and reference semantics are identical either way.
 
 `assert` is *not* reserved: like `panic` and `len` it is a predeclared builtin
 function (§5.3, §16), so it must be an identifier for `assert(cond)` to parse as
@@ -462,7 +462,7 @@ program      = { ";" } { top_decl ";" } EOF .
 top_decl     = import_decl
              | [ "export" ] value_decl
              | [ "export" ] func_decl
-             | [ "export" ] struct_decl
+             | [ "export" ] class_decl
              | [ "export" ] interface_decl
              | [ "export" ] enum_decl
              | [ "export" ] type_alias
@@ -713,25 +713,26 @@ fn (p: Point) norm(): f64 {
 
 - The receiver type must be a class or type-alias declared in the **same
   module**. Methods can only be declared for locally-declared types.
-- Because structs are **reference types** (§13.3), a method mutating a receiver
+- Because classes are **reference types** (§13.3), a method mutating a receiver
   field mutates the caller's value; no pointer receiver syntax is needed.
 - Methods participate in structural interface satisfaction (§14.3).
 
 ### 10.5 Class Declarations
 
 ```
-struct_decl = ( "class" | "class" ) IDENT [ generic_params ] "{" [ field { ( ";" | "," ) field } [ ";" | "," ] ] "}" .
+class_decl  = "class" IDENT [ generic_params ] "{" [ field { ( ";" | "," ) field } [ ";" | "," ] ] "}" .
 field       = [ "export" ] IDENT ":" type .
 ```
 
-- `class` is accepted as a synonym for `class` (§5.2); both spellings declare
-  the same construct and produce identical output. Neither is deprecated yet.
+- `struct` is not a keyword (§5.2): the compiler rejects it with `E0102`,
+  naming `class`. Pre-0.1.24 code needs only the keyword replaced — nothing
+  else about the declaration changes.
 - A field marked `export` is visible outside the module; otherwise it is
   module-private (§17.3). The class type itself is exported via the leading
   `export` on the declaration.
 - Fields are ordered; that order is the composite-literal positional order and the
   memory layout order (subject to the compiler's alignment padding).
-- Structs are reference types with reference semantics on assignment (§13.3).
+- Classes are reference types with reference semantics on assignment (§13.3).
 
 ### 10.6 Interface Declarations
 
@@ -896,7 +897,7 @@ implementing type; it may appear in method signatures only.
   including the garbage collector's own metadata) that must manage memory it
   deliberately keeps outside the managed heap, so the collector must not walk it.
   It is not needed by, and should be avoided in, ordinary code: slices, maps, and
-  structs are the safe, traced references (§11.2).
+  classes are the safe, traced references (§11.2).
 - Operations:
   - **Dereference** `*p` — loads the pointee (`T`). `*p = x` stores `x` through it.
     The operand must be a `*T`.
@@ -1706,7 +1707,7 @@ Method values are closures bound to their receiver.
 x` (and `t.0++`, `t.0 += x`) is a compile error. A tuple is a fixed group of
 values produced whole — by a multi-value `return` (§13.1) — and read whole or by
 element; to vary a member, build a new tuple or use a class, which is what
-structs are for. This restriction is what lets tuples be a value type (§13.3)
+classes are for. This restriction is what lets tuples be a value type (§13.3)
 while being represented as a shared box.
 
 ### 12.6 Index and Slice
@@ -2018,13 +2019,13 @@ because its elements are read-only (§12.5) an implementation may share one heap
 box between copies without that being observable. The reference implementation
 does exactly that — see `runtime/ABI.md` §1.1, which also fixes the multi-value
 return ABI: `return a, b` builds one boxed tuple and returns a single handle.
-Structs are reference types (like TypeScript objects): assigning a class copies
+Classes are reference types (like TypeScript objects): assigning a class copies
 the handle, and mutations through either handle are visible to both. To obtain an
 independent copy, define and call a `clone()` method. Zero values of reference
 types are given in §13.4: `nil` for a map, channel, function, or interface, and a
 live empty value for `string`, `class`, and `[]T`.
 
-Rationale: making structs references removes the need for pointers, `&`/`*`, and
+Rationale: making classes references removes the need for pointers, `&`/`*`, and
 value-vs-pointer receiver rules, which is a large ceremony saving (priority #1)
 while keeping the GC model simple.
 
@@ -2055,7 +2056,7 @@ Every declared binding without an initializer is deterministically zero-valued:
 
 - numeric → `0`; `bool` → `false`; `string` → `""`.
 - `[N]T` array → all elements zero-valued; tuple → each element zero-valued.
-- `class` → a live instance with each field zero-valued (structs are references,
+- `class` → a live instance with each field zero-valued (classes are references,
   so `let p: Point` yields a usable zeroed `Point`, not `nil`) — **provided every
   field has a zero value**. A class type with a **class-typed field** has no
   zero value at all: see below.
@@ -2413,7 +2414,7 @@ type_assert = "." "(" type ")" .
 The two-result form is valid only as the sole right-hand side of a declaration or
 assignment (like the map/channel two-result forms).
 
-- The target must be a **class** type. Only structs carry methods (§10.4), so
+- The target must be a **class** type. Only classes carry methods (§10.4), so
   only a class can be the dynamic type behind an interface value.
 - A target that cannot satisfy the interface is a **compile-time error**: the
   assertion could never succeed, so it is rejected rather than left to report
@@ -2438,7 +2439,7 @@ See §15.4.
   empty string is less than every other string, and a NUL byte is an ordinary
   byte with no terminating meaning. Because Bit strings are UTF-8 (§5.6), this
   byte order is also code-point order.
-- Arrays and tuples are comparable if their element types are; structs are
+- Arrays and tuples are comparable if their element types are; classes are
   comparable if all fields are comparable (field-wise).
 - A C-like enum (all variants payload-free) compares with `==`/`!=` by tag, and
   may be a map key. A payload-carrying enum is not comparable — use `match`.
@@ -2464,7 +2465,7 @@ enum Shape { Circle(f64), Rect(f64, f64), Unit }
 let s = Shape.Rect(3.0, 4.0)   // payload variant: construct with arguments
 ```
 
-- **Nominal identity** (unlike structs/interfaces, §14.1): two enums with the same
+- **Nominal identity** (unlike classes/interfaces, §14.1): two enums with the same
   variant names are still distinct types. A bare `Color` is a type, not a value;
   a value is written `Color.Variant`.
 - A variant may carry an ordered **payload** (`Circle(f64)`), making the enum a
@@ -3163,7 +3164,7 @@ exact order: `name`, `kind`, `params`, `type`:
 **`--fields`** (off by default) additionally reports each exported class's own
 fields, in declaration order, as the extra kind `field` with name `Recv.field`
 (for example `Point.x`); it changes neither form's shape for a module whose
-structs report no fields this way.
+classes report no fields this way.
 
 Neither form prints documentation comments: a `//` line written directly above
 a declaration is source-only and is not part of `bit doc`'s output.
@@ -3782,7 +3783,7 @@ program       = { ";" } { top_decl ";" } EOF .
 top_decl      = import_decl
               | [ "export" ] value_decl
               | [ "export" ] func_decl
-              | [ "export" ] struct_decl
+              | [ "export" ] class_decl
               | [ "export" ] interface_decl
               | [ "export" ] enum_decl
               | [ "export" ] type_alias
@@ -3811,7 +3812,7 @@ params        = param { "," param } [ "," ] .
 param         = [ "..." ] IDENT ":" type .
 extern_fn_decl = "extern" "fn" IDENT signature .
 
-struct_decl   = ( "class" | "class" ) IDENT [ generic_params ] "{" [ field { fsep field } [ fsep ] ] "}" .
+class_decl    = "class" IDENT [ generic_params ] "{" [ field { fsep field } [ fsep ] ] "}" .
 field         = [ "export" ] IDENT ":" type .
 interface_decl= "interface" IDENT [ generic_params ] "{" [ method_sig { fsep method_sig } [ fsep ] ] "}" .
 method_sig    = IDENT signature .

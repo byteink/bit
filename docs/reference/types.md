@@ -2,7 +2,7 @@
 
 Bit is statically typed with strong inference. Types are compared
 **structurally**, not by name: two types are identical when their shape matches
-(§14.1). This chapter covers the built-in types, literals, composites, structs,
+(§14.1). This chapter covers the built-in types, literals, composites, classes,
 conversions, and operators. (Spec: §5.4–§5.8, §11, §12.2–§12.9, §13.3, §14.)
 
 ## Primitive types
@@ -134,9 +134,9 @@ fn makeChan(): chan<int> {
 }
 ```
 
-## Structs
+## Classes
 
-A class groups named fields. Structs are **reference types** (like TypeScript
+A class groups named fields. Classes are **reference types** (like TypeScript
 objects): assigning one copies the handle, and mutations are visible through
 both. Fields marked `export` are visible outside the module (see
 [Modules](modules.md)).
@@ -149,7 +149,7 @@ class User {
   age: int               // module-private
 }
 
-fn structs() {
+fn classes() {
   let p = Point{ x: 1.0, y: 2.0 }   // keyed literal, always type-prefixed
   let q = Point{ x: 3.0 }           // y omitted -> zero value 0.0
   let shared = p                    // copies the handle
@@ -288,7 +288,7 @@ fn operators(a: int, b: int): int {
 | Category | Types | On assignment / passing |
 | -------- | ----- | ----------------------- |
 | Value | numbers, `bool`, arrays `[N]T`, tuples | deep copy |
-| Reference | `string`, slices `[]T`, `map<K,V>`, structs, interfaces, `chan<T>`, functions | copy of the reference (shared data) |
+| Reference | `string`, slices `[]T`, `map<K,V>`, classes, interfaces, `chan<T>`, functions | copy of the reference (shared data) |
 
 `string` is a reference type but deeply immutable, so sharing is unobservable.
 The zero value of every reference type is `nil`.
@@ -307,6 +307,6 @@ object's lifetime. There are no finalizers in v0.1 - use `defer` (see
 
 - Numbers, `bool`, `string`, `rune` compare with `==`/`!=`; numbers and strings
   also order with `< <= > >=`.
-- Arrays, tuples, and structs are comparable if all their elements/fields are.
+- Arrays, tuples, and classes are comparable if all their elements/fields are.
 - Slices, maps, and functions compare only against `nil`.
 - Map keys must be a comparable type, or it is a compile error.

@@ -61,7 +61,7 @@ fn callers() {
 ## Methods {#methods}
 
 A method is a function with a receiver written before its name. The receiver
-type must be a class or type alias declared in the same module. Because structs
+type must be a class or type alias declared in the same module. Because classes
 are reference types, a method that mutates a field mutates the caller's value -
 no pointer receivers needed.
 
