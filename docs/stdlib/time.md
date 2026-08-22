@@ -4,7 +4,10 @@ Durations are plain `int` nanoseconds. There is no `Duration` type, so a duratio
 is built by multiplying a count by a unit constant: `500 * Millisecond`.
 
 Two clocks, for two different jobs. `now` tells you *when*; `monotonic` tells you
-*how long*, and never jumps when the system clock is adjusted.
+*how long*, and never jumps when the system clock is adjusted. Each returns its
+own nominal record — `Instant` from `now`, `Mono` from `monotonic` — so a
+reading from one clock can never be passed to the other clock's API by
+accident; `.ns` gives the raw nanoseconds when a caller genuinely needs an int.
 
 <!-- doctest: per-block -->
 
@@ -50,17 +53,30 @@ fn retryDelay(attempt: int): int {
 
 ## Clocks
 
-### `now(): int`
+### `Instant`
+
+A wall-clock reading, nanoseconds since the Unix epoch, returned by `now`.
+`.ns` gives the raw nanoseconds. Never pass one to `since` — an `Instant` can
+jump backwards (NTP, an operator setting the clock), so it cannot measure an
+interval; use a `Mono` from `monotonic` instead.
+
+### `Mono`
+
+A monotonic reading, returned by `monotonic`. Only differences between two
+`Mono` readings are meaningful; pass one to `since` to get the elapsed
+nanoseconds. `.ns` gives the raw nanoseconds.
+
+### `now(): Instant`
 
 Nanoseconds since the Unix epoch. Follows the system clock, so it can jump
 backwards. Use it to stamp an event, never to measure an interval.
 
-### `monotonic(): int`
+### `monotonic(): Mono`
 
 Nanoseconds from an unspecified fixed origin. Only differences are meaningful,
 and they never go backwards. This is the one to time things with.
 
-### `since(start: int): int`
+### `since(start: Mono): int`
 
 Nanoseconds elapsed since `start`, which must have come from `monotonic()`.
 
