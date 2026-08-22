@@ -92,9 +92,9 @@
 //                             produce. Unaffected if BIT_SURFACE_BASELINE is also
 //                             set — that override is checked first and still works.
 
-import { readDir, isDir, readFile, writeFile, exists, mkdir } from "std/fs"
+import { readDir, isDir, readFile, writeFile, exists, mkdir, walk } from "std/fs"
 import { env, envOr, exit } from "std/os"
-import { hasPrefix, split, parseInt, trimSpace } from "std/strings"
+import { hasPrefix, hasSuffix, split, parseInt, trimSpace } from "std/strings"
 import { uuidV4, format as uuidFormat } from "std/uuid"
 
 // std/strings exports no trimSuffix; tests/bit/constoverflow.bit carries the
@@ -261,6 +261,85 @@ fn baselineRoot(repo: string, scratch: string, ms: int): string! {
     fail newError("scripts/stage0.sh --stdlib-root printed a non-directory: ${root}")
   }
   return root
+}
+
+// Whether `c` is an identifier character — the boundary `rewriteStructKeyword`
+// uses to tell the keyword `struct` apart from an occurrence inside a longer
+// identifier (`structural`, `SomeStruct`).
+fn isWordChar(c: u8): bool {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// Whole-word `struct` -> `class`, the exact transform #3427's own sweep
+// applied to this repository (commit ed1e95c1's own verification:
+// `git grep -nw struct -- '*.bit' '*.md'` -> 0 lines afterward). Runs of
+// non-matching text are copied by slice, not appended one byte at a time, so
+// cost is proportional to the (small) number of matches, not the file length
+// squared.
+fn rewriteStructKeyword(text: string): string {
+  let n = len(text)
+  let needle = "struct"
+  let needleLen = len(needle)
+  let out = ""
+  let runStart = 0
+  let i = 0
+  while (i < n) {
+    if (i + needleLen <= n && text[i:i + needleLen] == needle) {
+      let beforeOk = i == 0 || !isWordChar(text[i - 1])
+      let afterOk = i + needleLen == n || !isWordChar(text[i + needleLen])
+      if (beforeOk && afterOk) {
+        out = out + text[runStart:i] + "class"
+        i = i + needleLen
+        runStart = i
+        continue
+      }
+    }
+    i = i + 1
+  }
+  return out + text[runStart:n]
+}
+
+// THE BASELINE'S OWN struct -> class MIGRATION (#3441). The pinned stage0
+// release (0.1.23) shipped `class` only as an accepted lexer SYNONYM
+// (#3425) -- its own stdlib source still spells every record declaration
+// `struct Foo { ... }`. #3427 (landed after that pin) removes `struct` from
+// the lexer entirely and rejects it with E0102, so documenting the baseline
+// verbatim would make every struct-bearing baseline module fail to parse
+// under the compiler this gate runs, collapsing `compared` toward zero --
+// exactly the silent coverage loss this gate exists to catch.
+//
+// Fix: copy the baseline into a PRIVATE scratch tree and rewrite the
+// keyword there, never in place. `baseline` may be the cached stage0
+// unpack (read by other differentials concurrently) or an explicit
+// `BIT_SURFACE_BASELINE` override (a caller-owned fixture) -- neither is
+// ours to mutate. The rewrite is purely mechanical and semantics-preserving
+// (see `rewriteStructKeyword`'s own note), so a baseline module that
+// documented cleanly before #3427 documents identically after this rewrite.
+//
+// SELF-RETIRING: once `dist/stage0/SHA256SUMS` is repinned to a release
+// whose own shipped stdlib source already spells `class`, `rewriteStructKeyword`
+// matches nothing, every file is copied byte-for-byte, and this function is a
+// no-op wrapped around a directory copy. There is nothing to remove here when
+// that day comes; it can simply stay.
+fn rewriteBaselineKeyword(scratch: string, baseline: string, ms: int): string! {
+  let copyRoot = "${scratch}/baseline-class"
+  let script = "#!/bin/sh\n" +
+    "rm -rf \"" + copyRoot + "\" && cp -R \"" + baseline + "\" \"" + copyRoot + "\"\n"
+  let code = shell("${scratch}/copybaseline.sh", script, ms)?
+  if (code != 0) {
+    fail newError("could not copy baseline stdlib ${baseline} to ${copyRoot} for keyword rewrite (exit ${code})")
+  }
+  for p of walk(copyRoot)? {
+    if (!hasSuffix(p, ".bit")) {
+      continue
+    }
+    let text = readFile(p)?
+    let rewritten = rewriteStructKeyword(text)
+    if (rewritten != text) {
+      writeFile(p, rewritten)?
+    }
+  }
+  return copyRoot
 }
 
 // The per-module directory list. `readDir` returns bare names, so `isDir` is
@@ -469,40 +548,59 @@ fn compareModule(mod: string, old: []Symbol, cur: []Symbol): []Finding {
   return out
 }
 
-fn main() {
+// Everything main() needs to resolve before it can start comparing modules.
+// Pulled out of main() itself so the four `catch { panic }` resolution steps
+// don't count against main()'s own complexity budget (E0204).
+class Setup {
+  ms: int
+  scratch: string
+  bin: string
+  baseline: string
+  baselineDoc: string
+  curStdlib: string
+  allowPath: string
+  allow: []AllowEntry
+}
+
+fn setup(): Setup {
   let ms = timeoutMs()
   let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
   let scratch = "${tmp}/bit-releasesurface-${uuidFormat(uuidV4())}"
   mkdir(scratch) catch e {
     panic("releasesurface: cannot create ${scratch}: ${e.message()}")
   }
-  defer teardown(scratch, ms)
-
   let repo = repoRoot()
   let bin = bitBinary(scratch, ms) catch e { panic("releasesurface: ${e.message()}") }
   let baseline = baselineRoot(repo, scratch, ms) catch e { panic("releasesurface: ${e.message()}") }
+  // Never documented directly -- see rewriteBaselineKeyword's own header.
+  let baselineDoc = rewriteBaselineKeyword(scratch, baseline, ms) catch e { panic("releasesurface: ${e.message()}") }
   let allowPath = envOr("BIT_SURFACE_ALLOWLIST", "${repo}/tests/bit/releasesurface.allowlist")
-  let allow = loadAllowlist(allowPath)
-
-  let oldMods = moduleList(baseline)
-  if (len(oldMods) < minModules) {
-    eprint("FAIL releasesurface: found ${len(oldMods)} module(s) under ${baseline}, expected at least ${minModules}\n")
-    exit(1)
+  return Setup{
+    ms: ms, scratch: scratch, bin: bin, baseline: baseline, baselineDoc: baselineDoc,
+    curStdlib: "${repo}/stdlib", allowPath: allowPath, allow: loadAllowlist(allowPath),
   }
+}
 
-  let curStdlib = "${repo}/stdlib"
-  let compared = 0
-  let skipped = 0
-  let findings = 0
-  let allowed = 0
+// Tallies from comparing every baseline module against its working-tree
+// counterpart. Pulled out of main() for the same reason as `Setup`: the
+// per-module loop and its nested checks are the bulk of main()'s old
+// complexity.
+class CompareStats {
+  compared: int
+  skipped: int
+  findings: int
+  allowed: int
+}
 
+fn compareModules(s: Setup, oldMods: []string): CompareStats {
+  let stats = CompareStats{ compared: 0, skipped: 0, findings: 0, allowed: 0 }
   for m of oldMods {
-    let oldDir = "${baseline}/${m}"
-    let newDir = "${curStdlib}/${m}"
+    let oldDir = "${s.baselineDoc}/${m}"
+    let newDir = "${s.curStdlib}/${m}"
 
-    let (oldText, oldOk) = docModule(bin, baseline, oldDir, scratch, "old-${m}", ms)
+    let (oldText, oldOk) = docModule(s.bin, s.baselineDoc, oldDir, s.scratch, "old-${m}", s.ms)
     if (!oldOk) {
-      skipped = skipped + 1
+      stats.skipped = stats.skipped + 1
       continue
     }
     let oldSyms = parseSymbols(oldText)
@@ -512,7 +610,7 @@ fn main() {
 
     let curSyms = []Symbol(0)
     if (isDir(newDir)) {
-      let (curText, curOk) = docModule(bin, curStdlib, newDir, scratch, "cur-${m}", ms)
+      let (curText, curOk) = docModule(s.bin, s.curStdlib, newDir, s.scratch, "cur-${m}", s.ms)
       // The CURRENT tree must always document cleanly — test-stdlib-docs and
       // test-selfhostcheck already assume it does. A failure here is a
       // harness/build problem, not a surface regression to skip past.
@@ -522,33 +620,46 @@ fn main() {
       curSyms = parseSymbols(curText)
     }
 
-    compared = compared + 1
-    let mname = "std/${m}"
-    let diffs = compareModule(mname, oldSyms, curSyms)
+    stats.compared = stats.compared + 1
+    let diffs = compareModule("std/${m}", oldSyms, curSyms)
     for f of diffs {
-      if (isAllowed(allow, f.module, f.name, f.change)) {
-        allowed = allowed + 1
+      if (isAllowed(s.allow, f.module, f.name, f.change)) {
+        stats.allowed = stats.allowed + 1
         continue
       }
-      findings = findings + 1
+      stats.findings = stats.findings + 1
       eprint("releasesurface: BREAKING ${f.module} ${f.name} ${f.change}\n" +
         "  before: ${f.before}\n" +
         "  after:  ${f.after}\n" +
-        "  to allow an intentional break, add \"${f.module} ${f.name} ${f.change} #<ticket>\" to ${allowPath}\n")
+        "  to allow an intentional break, add \"${f.module} ${f.name} ${f.change} #<ticket>\" to ${s.allowPath}\n")
     }
   }
+  return stats
+}
 
-  if (compared == 0) {
-    eprint("FAIL releasesurface: zero modules were compared against ${baseline} — no evidence this gate checked anything\n")
+fn main() {
+  let s = setup()
+  defer teardown(s.scratch, s.ms)
+
+  let oldMods = moduleList(s.baselineDoc)
+  if (len(oldMods) < minModules) {
+    eprint("FAIL releasesurface: found ${len(oldMods)} module(s) under ${s.baseline}, expected at least ${minModules}\n")
     exit(1)
   }
 
-  if (findings > 0) {
-    eprint("FAIL releasesurface: ${findings} unallowlisted breaking change(s) across ${compared} compared module(s) (${skipped} skipped, ${allowed} allowlisted)\n")
+  let stats = compareModules(s, oldMods)
+
+  if (stats.compared == 0) {
+    eprint("FAIL releasesurface: zero modules were compared against ${s.baseline} — no evidence this gate checked anything\n")
     exit(1)
   }
 
-  println("PASS releasesurface: ${compared} module(s) compared against ${baseline}, 0 unallowlisted breaking change(s) (${allowed} allowlisted, ${skipped} skipped)")
+  if (stats.findings > 0) {
+    eprint("FAIL releasesurface: ${stats.findings} unallowlisted breaking change(s) across ${stats.compared} compared module(s) (${stats.skipped} skipped, ${stats.allowed} allowlisted)\n")
+    exit(1)
+  }
+
+  println("PASS releasesurface: ${stats.compared} module(s) compared against ${s.baseline}, 0 unallowlisted breaking change(s) (${stats.allowed} allowlisted, ${stats.skipped} skipped)")
 }
 
 // std/fs has no recursive remove, so the scratch tree goes the way it came —
