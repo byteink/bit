@@ -1,0 +1,265 @@
+// Bit standard library — regex module, character classes.
+//
+// A normalized character class is a sorted, non-overlapping, non-adjacent list
+// of inclusive rune ranges. Every builder here — and the parser,
+// stdlib/regex/parseclass.bit — works with ranges rather than a full
+// 0x110000-entry bitmap: the classes typical patterns use (`\d`, `\w`, POSIX
+// names, small literal sets like `[aeiou]`) hold in a handful of ranges, so
+// `ccContains` binary-searches that handful instead of scanning a bitmap.
+//
+// Nothing in this file is exported (#2026's constraint): `Regex` is the only
+// public surface this ticket adds, and `Ast.Class` is the only place a
+// `CharClass` value escapes this module — internally, across files in
+// stdlib/regex.
+
+import { clone } from "std/seq"
+import { sortInPlace } from "std/sort"
+
+// One inclusive rune range, `lo..hi`.
+class RuneRange { lo: rune, hi: rune }
+
+// A normalized set of rune ranges. `negated` records whether this class was
+// built by `ccNegate` — bookkeeping for later tickets (#2033's case folding
+// must fold BEFORE negating, not after, to get the fold right at the
+// boundary), not something `ccContains` consults: `ranges` always holds the
+// actual accepted set, complement already applied where relevant.
+class CharClass { ranges: []RuneRange, negated: bool }
+
+// The highest valid Unicode scalar value.
+const maxRune: rune = 0x10FFFF
+
+// The surrogate block: never a valid rune, so `ccNegate` must not claim it.
+const surrogateLo: rune = 0xD800
+const surrogateHi: rune = 0xDFFF
+
+// A class with no members. `ccContains` is false for every rune until ranges
+// are added.
+fn ccEmpty(): CharClass {
+  return CharClass{ ranges: []RuneRange(0), negated: false }
+}
+
+// `cc` plus the inclusive range `lo..hi`. Does not normalize — call
+// `ccNormalize` once after a class is fully built, not after every add, so
+// building an N-member class stays O(N) appends rather than O(N^2) re-sorts.
+fn ccAddRange(cc: CharClass, lo: rune, hi: rune): CharClass {
+  return CharClass{ ranges: append(cc.ranges, RuneRange{ lo: lo, hi: hi }), negated: cc.negated }
+}
+
+// `cc` plus the single rune `r`.
+fn ccAddRune(cc: CharClass, r: rune): CharClass {
+  return ccAddRange(cc, r, r)
+}
+
+// The union of `a` and `b`'s ranges (unnormalized — callers normalize once,
+// at the end of building).
+fn ccUnion(a: CharClass, b: CharClass): CharClass {
+  let out = a
+  let i = 0
+  // Bounded by `b.ranges`'s length, fixed before the loop starts.
+  while (i < len(b.ranges)) {
+    out = ccAddRange(out, b.ranges[i].lo, b.ranges[i].hi)
+    i = i + 1
+  }
+  return out
+}
+
+// `cc.ranges` sorted by `lo` and with overlapping or adjacent runs merged, so
+// `ccContains` can binary-search it. Idempotent: normalizing an already
+// normalized class returns an equal class.
+fn ccNormalize(cc: CharClass): CharClass {
+  let sorted = clone(cc.ranges)
+  sortInPlace(sorted, ccRangeLess)
+  let merged: []RuneRange = []RuneRange(0)
+  let i = 0
+  // Bounded by `sorted`'s length, fixed before the loop starts.
+  while (i < len(sorted)) {
+    merged = ccMergeOne(merged, sorted[i])
+    i = i + 1
+  }
+  return CharClass{ ranges: merged, negated: cc.negated }
+}
+
+// Appends `r` to `merged`, extending `merged`'s last run in place when `r`
+// overlaps or directly abuts it (`lo <= lastHi + 1`) rather than starting a
+// new one. `merged` must already be sorted by `lo` — `ccNormalize`'s only
+// caller guarantees that by sorting first.
+fn ccMergeOne(merged: []RuneRange, r: RuneRange): []RuneRange {
+  let n = len(merged)
+  if (n == 0) {
+    merged = append(merged, r)
+    return merged
+  }
+  let last = merged[n - 1]
+  if (int(r.lo) > int(last.hi) + 1) {
+    merged = append(merged, r)
+    return merged
+  }
+  if (r.hi > last.hi) {
+    merged[n - 1] = RuneRange{ lo: last.lo, hi: r.hi }
+  }
+  return merged
+}
+
+// Ordering for `sortInPlace`: by `lo`, ties broken by `hi` (irrelevant to
+// correctness, but makes the sort's output deterministic for a fixed input).
+fn ccRangeLess(a: RuneRange, b: RuneRange): bool {
+  if (a.lo != b.lo) {
+    return a.lo < b.lo
+  }
+  return a.hi < b.hi
+}
+
+// The complement of `cc` over the full scalar range `0..maxRune`, excluding
+// the surrogate block: a rune is in the result iff it is a valid Unicode
+// scalar value AND not in `cc`. `cc` is normalized first, so the sweep below
+// only ever sees sorted, non-overlapping runs.
+fn ccNegate(cc: CharClass): CharClass {
+  let n = ccNormalize(cc)
+  let out: []RuneRange = []RuneRange(0)
+  let next = rune(0)
+  let i = 0
+  // Bounded by `n.ranges`'s length, fixed before the loop starts.
+  while (i < len(n.ranges)) {
+    let r = n.ranges[i]
+    if (r.lo > next) {
+      out = ccAppendGap(out, next, rune(int(r.lo) - 1))
+    }
+    if (int(r.hi) + 1 > int(next)) {
+      next = rune(int(r.hi) + 1)
+    }
+    i = i + 1
+  }
+  if (next <= maxRune) {
+    out = ccAppendGap(out, next, maxRune)
+  }
+  return CharClass{ ranges: out, negated: !n.negated }
+}
+
+// Appends `lo..hi` to `out`, splitting it around the surrogate block
+// (`0xD800..0xDFFF`) when the gap crosses it, so no emitted range ever
+// contains a surrogate code point.
+fn ccAppendGap(out: []RuneRange, lo: rune, hi: rune): []RuneRange {
+  if (hi < surrogateLo || lo > surrogateHi) {
+    out = append(out, RuneRange{ lo: lo, hi: hi })
+    return out
+  }
+  if (lo < surrogateLo) {
+    out = append(out, RuneRange{ lo: lo, hi: rune(int(surrogateLo) - 1) })
+  }
+  if (hi > surrogateHi) {
+    out = append(out, RuneRange{ lo: rune(int(surrogateHi) + 1), hi: hi })
+  }
+  return out
+}
+
+// Whether `r` falls in one of `cc`'s ranges. `cc` must already be normalized
+// (`ccNormalize` or `ccNegate`, both of which the parser calls exactly once
+// per finished class) — this does a binary search over sorted, disjoint
+// runs, not a linear scan.
+fn ccContains(cc: CharClass, r: rune): bool {
+  let lo = 0
+  let hi = len(cc.ranges) - 1
+  // Bounded: `hi - lo` strictly shrinks every iteration.
+  while (lo <= hi) {
+    let mid = lo + (hi - lo) / 2
+    let run = cc.ranges[mid]
+    if (r < run.lo) {
+      hi = mid - 1
+    } else if (r > run.hi) {
+      lo = mid + 1
+    } else {
+      return true
+    }
+  }
+  return false
+}
+
+// --- Perl shorthand and POSIX named classes -------------------------------
+
+// One POSIX bracket-expression name (e.g. `alpha` in `[[:alpha:]]`) and its
+// ASCII ranges.
+class posixSpec { name: string, ranges: []RuneRange }
+
+// The thirteen POSIX names usable inside `[...]`. A table scanned by
+// `ccPosixByName`, rather than a branch per name: adding or checking a name
+// costs one loop and one string compare, not another `if` — which keeps this
+// file's function count in reasonable shape without a 13-arm dispatch anywhere.
+fn posixTable(): []posixSpec {
+  return []posixSpec{
+    posixSpec{ name: "alnum", ranges: []RuneRange{
+      RuneRange{ lo: rune('0'), hi: rune('9') },
+      RuneRange{ lo: rune('A'), hi: rune('Z') },
+      RuneRange{ lo: rune('a'), hi: rune('z') },
+    } },
+    posixSpec{ name: "alpha", ranges: []RuneRange{
+      RuneRange{ lo: rune('A'), hi: rune('Z') },
+      RuneRange{ lo: rune('a'), hi: rune('z') },
+    } },
+    posixSpec{ name: "ascii", ranges: []RuneRange{ RuneRange{ lo: rune(0x00), hi: rune(0x7F) } } },
+    posixSpec{ name: "blank", ranges: []RuneRange{
+      RuneRange{ lo: rune('\t'), hi: rune('\t') },
+      RuneRange{ lo: rune(' '), hi: rune(' ') },
+    } },
+    posixSpec{ name: "cntrl", ranges: []RuneRange{
+      RuneRange{ lo: rune(0x00), hi: rune(0x1F) },
+      RuneRange{ lo: rune(0x7F), hi: rune(0x7F) },
+    } },
+    posixSpec{ name: "digit", ranges: []RuneRange{ RuneRange{ lo: rune('0'), hi: rune('9') } } },
+    posixSpec{ name: "graph", ranges: []RuneRange{ RuneRange{ lo: rune(0x21), hi: rune(0x7E) } } },
+    posixSpec{ name: "lower", ranges: []RuneRange{ RuneRange{ lo: rune('a'), hi: rune('z') } } },
+    posixSpec{ name: "print", ranges: []RuneRange{ RuneRange{ lo: rune(0x20), hi: rune(0x7E) } } },
+    posixSpec{ name: "punct", ranges: []RuneRange{
+      RuneRange{ lo: rune(0x21), hi: rune(0x2F) },
+      RuneRange{ lo: rune(0x3A), hi: rune(0x40) },
+      RuneRange{ lo: rune(0x5B), hi: rune(0x60) },
+      RuneRange{ lo: rune(0x7B), hi: rune(0x7E) },
+    } },
+    posixSpec{ name: "space", ranges: []RuneRange{
+      RuneRange{ lo: rune(0x09), hi: rune(0x0D) },
+      RuneRange{ lo: rune(' '), hi: rune(' ') },
+    } },
+    posixSpec{ name: "upper", ranges: []RuneRange{ RuneRange{ lo: rune('A'), hi: rune('Z') } } },
+    posixSpec{ name: "word", ranges: []RuneRange{
+      RuneRange{ lo: rune('0'), hi: rune('9') },
+      RuneRange{ lo: rune('A'), hi: rune('Z') },
+      RuneRange{ lo: rune('a'), hi: rune('z') },
+      RuneRange{ lo: rune('_'), hi: rune('_') },
+    } },
+    posixSpec{ name: "xdigit", ranges: []RuneRange{
+      RuneRange{ lo: rune('0'), hi: rune('9') },
+      RuneRange{ lo: rune('A'), hi: rune('F') },
+      RuneRange{ lo: rune('a'), hi: rune('f') },
+    } },
+  }
+}
+
+// `Some` of the normalized class named `name` (without the `[:`/`:]`
+// wrapper — the parser strips that before calling this), or `None` when
+// `name` is not one of the thirteen POSIX names above.
+fn ccPosixByName(name: string): Option<CharClass> {
+  let table = posixTable()
+  let i = 0
+  // Bounded by `table`'s length, fixed (13) before the loop starts.
+  while (i < len(table)) {
+    if (table[i].name == name) {
+      return Option.Some(ccNormalize(CharClass{ ranges: table[i].ranges, negated: false }))
+    }
+    i = i + 1
+  }
+  return Option.None
+}
+
+// `\d`: ASCII digits `0-9`.
+fn ccDigit(): CharClass {
+  return unwrap(ccPosixByName("digit"))
+}
+
+// `\s`: ASCII whitespace — `\t \n \v \f \r` and space.
+fn ccSpace(): CharClass {
+  return unwrap(ccPosixByName("space"))
+}
+
+// `\w`: ASCII word characters — `0-9A-Za-z_`.
+fn ccWord(): CharClass {
+  return unwrap(ccPosixByName("word"))
+}

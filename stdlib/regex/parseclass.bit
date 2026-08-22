@@ -1,0 +1,191 @@
+// Bit standard library — regex module, `[...]` bracket-expression parsing.
+//
+// A class body is a run of members — a single rune, a `lo-hi` range, a `\d`
+// -style shorthand, or a `[:name:]` POSIX name — until an unescaped `]`.
+// Following the POSIX bracket-expression convention Go's `regexp/syntax`
+// also honors: a `]` that is the very FIRST member (right after `[` or
+// `[^]`) is a literal `]`, not the closer — so `[]a]` matches `]` or `a`, and
+// `[]` alone is `regex: missing closing ]` (the lone `]` was consumed as a
+// literal, and nothing then closes the class).
+//
+// `\b` inside a class is treated the same as any other unrecognized
+// alphanumeric escape (`regex: invalid escape sequence`), NOT as a backspace
+// literal the way Perl/PCRE read it — deliberately narrower than those
+// engines rather than guessing at a meaning nothing in #2026 pins down.
+
+// One member of a class body, not yet folded into the accumulator:
+// `isSingle` says whether it is a single rune usable as a range endpoint
+// (`r`), or a multi-range contribution that is not (`contributed` — a `\d`
+// shorthand or a `[:name:]` POSIX class, which `mergeClassItem` unions in
+// directly rather than ever treating as one side of a `lo-hi` range).
+class classItem { isSingle: bool, r: rune, contributed: CharClass }
+
+// `[`, already known present; parses through the matching `]`.
+fn parseClass(p: RegexParser): Ast! {
+  let openPos = p.pos
+  advanceByte(p)
+  let negated = false
+  if (!atEnd(p) && curByte(p) == '^') {
+    negated = true
+    advanceByte(p)
+  }
+  let acc = parseClassBody(p, openPos)?
+  let cc = ccNormalize(acc)
+  if (negated) {
+    cc = ccNegate(cc)
+  }
+  return Ast.Class(cc)
+}
+
+// The members between `[`/`[^` and the closing `]`, unioned together
+// (unnormalized — `parseClass` normalizes once, at the end).
+fn parseClassBody(p: RegexParser, openPos: int): CharClass! {
+  let acc = ccEmpty()
+  let first = true
+  // Bounded: `parseClassMember` always consumes >= 1 byte.
+  while (!classBodyDone(p, first)) {
+    acc = parseClassMember(p, acc, first, openPos)?
+    first = false
+  }
+  if (atEnd(p)) {
+    fail parseErr(errMissingCloseBracket, openPos)
+  }
+  advanceByte(p)
+  return acc
+}
+
+// Whether the class body loop should stop: at end of input (the caller
+// reports the missing `]`), or on an unescaped `]` that is not the very
+// first member (the POSIX first-`]`-is-literal rule above).
+fn classBodyDone(p: RegexParser, first: bool): bool {
+  if (atEnd(p)) {
+    return true
+  }
+  return curByte(p) == ']' && !first
+}
+
+// One member: the POSIX first-`]`-literal special case, a `[:name:]` POSIX
+// class, or an ordinary item (`parseClassItem`, folded in by
+// `mergeClassItem`, which also handles `-` ranges).
+fn parseClassMember(p: RegexParser, acc: CharClass, first: bool, openPos: int): CharClass! {
+  if (first && curByte(p) == ']') {
+    advanceByte(p)
+    return ccAddRune(acc, rune(']'))
+  }
+  if (isPosixClassStart(p)) {
+    let contributed = parsePosixClass(p, openPos)?
+    return ccUnion(acc, contributed)
+  }
+  let item = parseClassItem(p, openPos)?
+  return mergeClassItem(p, acc, item, openPos)?
+}
+
+fn isPosixClassStart(p: RegexParser): bool {
+  return curByte(p) == '[' && peekByte(p, 1) == ':'
+}
+
+// `[:name:]` — consumes it whole and looks `name` up in `ccPosixByName`
+// (charclass.bit). Any shape mismatch (no letters, no closing `:]`) or an
+// unrecognized name is `regex: invalid POSIX class name`.
+fn parsePosixClass(p: RegexParser, openPos: int): CharClass! {
+  advanceByte(p)
+  advanceByte(p)
+  let start = p.pos
+  // Bounded: each iteration consumes one byte.
+  while (!atEnd(p) && isAsciiLetter(curByte(p))) {
+    advanceByte(p)
+  }
+  let name = p.src[start:p.pos]
+  if (len(name) == 0 || atEnd(p) || curByte(p) != ':' || peekByte(p, 1) != ']') {
+    fail parseErr(errInvalidPosixClass, openPos)
+  }
+  advanceByte(p)
+  advanceByte(p)
+  let found = ccPosixByName(name)
+  if (isNone(found)) {
+    fail parseErr(errInvalidPosixClass, openPos)
+  }
+  return unwrap(found)
+}
+
+// One item: an escape (`parseClassEscape`) or a literal rune (possibly
+// multi-byte UTF-8). Callers reach here only when `!atEnd(p)`
+// (`classBodyDone`'s check, or `mergeClassItem`'s own guard before the
+// second call for a range's end) — except this is also called right after
+// consuming a range's `-`, where nothing upstream re-checks, so it checks
+// for itself.
+fn parseClassItem(p: RegexParser, openPos: int): classItem! {
+  if (atEnd(p)) {
+    fail parseErr(errMissingCloseBracket, openPos)
+  }
+  if (curByte(p) == '\\') {
+    return parseClassEscape(p, openPos)?
+  }
+  let r = advanceRune(p)
+  return classItem{ isSingle: true, r: r, contributed: ccEmpty() }
+}
+
+// `\` inside a class: a Perl shorthand (`\d` etc — not a range endpoint, so
+// `isSingle: false`), a control character (`\n` etc — a range endpoint), or
+// a literal escape of any other non-alphanumeric byte.
+fn parseClassEscape(p: RegexParser, openPos: int): classItem! {
+  let backslashPos = p.pos
+  advanceByte(p)
+  if (atEnd(p)) {
+    fail parseErr(errTrailingBackslash, backslashPos)
+  }
+  let b = curByte(p)
+  let shorthand = escapeClassFor(b)
+  if (isSome(shorthand)) {
+    advanceByte(p)
+    return classItem{ isSingle: false, r: rune(0), contributed: classOfAst(unwrap(shorthand)) }
+  }
+  let ctrl = classControlByte(b)
+  if (isSome(ctrl)) {
+    advanceByte(p)
+    return classItem{ isSingle: true, r: unwrap(ctrl), contributed: ccEmpty() }
+  }
+  if (isAsciiAlnum(b)) {
+    fail parseErr(errInvalidEscape, backslashPos)
+  }
+  advanceByte(p)
+  return classItem{ isSingle: true, r: rune(b), contributed: ccEmpty() }
+}
+
+// Unwraps the `CharClass` `escapeClassFor` always wraps as `Ast.Class` — an
+// internal invariant of this file, never a real branch a caller can hit.
+fn classOfAst(a: Ast): CharClass {
+  match (a) {
+    Class(cc) => return cc
+    _ => panic("regex: internal: escapeClassFor produced a non-Class Ast")
+  }
+}
+
+// Folds `item` into `acc`: as one side of a `lo-hi` range when `item` is
+// immediately followed by `-` and then another item (`[z-a]`, backwards, and
+// `[\d-z]`/`[a-\d]`, a shorthand on either side, are all still
+// `regex: invalid character class range` — only a single rune can be a range
+// endpoint); otherwise as a plain member.
+fn mergeClassItem(p: RegexParser, acc: CharClass, item: classItem, openPos: int): CharClass! {
+  if (!atEnd(p) && curByte(p) == '-' && !classDashIsLiteral(p)) {
+    if (!item.isSingle) {
+      fail parseErr(errInvalidClassRange, openPos)
+    }
+    advanceByte(p)
+    let endItem = parseClassItem(p, openPos)?
+    if (!endItem.isSingle || endItem.r < item.r) {
+      fail parseErr(errInvalidClassRange, openPos)
+    }
+    return ccAddRange(acc, item.r, endItem.r)
+  }
+  if (item.isSingle) {
+    return ccAddRune(acc, item.r)
+  }
+  return ccUnion(acc, item.contributed)
+}
+
+// A `-` right before the closing `]` is a literal dash, not a range
+// separator (`[a-]` matches `a` or `-`).
+fn classDashIsLiteral(p: RegexParser): bool {
+  return peekByte(p, 1) == ']'
+}

@@ -1,0 +1,171 @@
+// Bit standard library — regex module, the parser's cursor and shared
+// escape tables.
+//
+// `RegexParser` is a forward-only byte cursor over the pattern text, mutated
+// in place by every `parse*` function across this module (the same shape as
+// `stdlib/json/lex.bit`'s `Lexer`) — no file here re-imports it, since
+// unexported declarations are visible module-wide. `pos` only ever advances,
+// so any loop bounded by "consumes at least one byte per iteration" is
+// bounded by `len(pattern) - pos`, a statically finite quantity.
+//
+// The three escape-lookup tables (`escapeClassFor`, `escapeAnchorFor`,
+// `classControlByte`) are shared by the atom-position escape parser
+// (parseescape.bit, e.g. `\d` as a whole atom) and the class-body escape
+// parser (parseclass.bit, e.g. `\d` inside `[...]`) — both recognize the same
+// letters, so the table lives once, here.
+
+import { runeAt, runeSize } from "std/strings"
+
+// A forward cursor over `src`. `groupCount` is the number of capturing groups
+// opened so far, used to assign each `(...)`/`(?<name>...)` its 1-based
+// index as it is parsed left to right.
+class RegexParser { src: string, pos: int, n: int, groupCount: int }
+
+// A parser positioned at the start of `pattern`.
+fn newRegexParser(pattern: string): RegexParser {
+  return RegexParser{ src: pattern, pos: 0, n: len(pattern), groupCount: 0 }
+}
+
+// Whether the cursor has consumed all of `p.src`.
+fn atEnd(p: RegexParser): bool {
+  return p.pos >= p.n
+}
+
+// The byte under the cursor. Callers must check `!atEnd(p)` first.
+fn curByte(p: RegexParser): u8 {
+  return p.src[p.pos]
+}
+
+// The byte `offset` positions ahead of the cursor, or `0` past the end of
+// `p.src` — a sentinel that never equals a real pattern byte we compare it
+// against, so callers can peek without a separate bounds check.
+fn peekByte(p: RegexParser, offset: int): u8 {
+  let at = p.pos + offset
+  if (at >= p.n) {
+    return u8(0)
+  }
+  return p.src[at]
+}
+
+// Moves the cursor forward one byte.
+fn advanceByte(p: RegexParser) {
+  p.pos = p.pos + 1
+}
+
+// Decodes the rune at the cursor and advances past it (one or more bytes for
+// a multi-byte UTF-8 sequence). Callers must check `!atEnd(p)` first.
+fn advanceRune(p: RegexParser): rune {
+  let r = runeAt(p.src, p.pos)
+  p.pos = p.pos + runeSize(int(p.src[p.pos]))
+  return r
+}
+
+// --- errors ----------------------------------------------------------------
+
+const errMissingCloseParen: string = "regex: missing closing )"
+const errUnexpectedCloseParen: string = "regex: unexpected )"
+const errMissingCloseBracket: string = "regex: missing closing ]"
+const errInvalidClassRange: string = "regex: invalid character class range"
+const errTrailingBackslash: string = "regex: trailing backslash"
+const errInvalidEscape: string = "regex: invalid escape sequence"
+const errNothingToRepeat: string = "regex: nothing to repeat"
+const errInvalidNamedGroup: string = "regex: invalid named group"
+const errInvalidPosixClass: string = "regex: invalid POSIX class name"
+const errCountedRepUnsupported: string = "regex: {n,m} is not supported yet"
+const errInlineFlagsUnsupported: string = "regex: inline flags are not supported yet"
+
+// Builds the `error` a parse failure fails with: `msg` plus the byte offset
+// it occurred at, in the exact `"<msg> at offset <n>"` shape #2026 pins.
+fn parseErr(msg: string, offset: int): error {
+  return newError("${msg} at offset ${offset}")
+}
+
+// --- shared escape tables ----------------------------------------------
+
+// `\d \D \w \W \s \S` — the three Perl classes and their negations, valid
+// both as a whole atom and inside `[...]`.
+fn escapeClassFor(b: u8): Option<Ast> {
+  if (b == 'd') {
+    return Option.Some(Ast.Class(ccDigit()))
+  }
+  if (b == 'D') {
+    return Option.Some(Ast.Class(ccNegate(ccDigit())))
+  }
+  if (b == 'w') {
+    return Option.Some(Ast.Class(ccWord()))
+  }
+  if (b == 'W') {
+    return Option.Some(Ast.Class(ccNegate(ccWord())))
+  }
+  if (b == 's') {
+    return Option.Some(Ast.Class(ccSpace()))
+  }
+  if (b == 'S') {
+    return Option.Some(Ast.Class(ccNegate(ccSpace())))
+  }
+  return Option.None
+}
+
+// `\A \z \b \B` — the four escape-form anchors. Atom position only: inside
+// `[...]` these letters are not recognized as anchors (see parseclass.bit).
+fn escapeAnchorFor(b: u8): Option<Ast> {
+  if (b == 'A') {
+    return Option.Some(Ast.Anchor(AnchorKind.BeginText))
+  }
+  if (b == 'z') {
+    return Option.Some(Ast.Anchor(AnchorKind.EndText))
+  }
+  if (b == 'b') {
+    return Option.Some(Ast.Anchor(AnchorKind.WordBoundary))
+  }
+  if (b == 'B') {
+    return Option.Some(Ast.Anchor(AnchorKind.NoWordBoundary))
+  }
+  return Option.None
+}
+
+// `\n \t \r \f \v` — the five control-character escapes, valid both as a
+// whole atom and inside `[...]`. Bit's own rune-literal grammar (SPEC §5.6)
+// has no `\f`/`\v` escape, so those two are written as explicit code points.
+fn classControlByte(b: u8): Option<rune> {
+  if (b == 'n') {
+    return Option.Some(rune('\n'))
+  }
+  if (b == 't') {
+    return Option.Some(rune('\t'))
+  }
+  if (b == 'r') {
+    return Option.Some(rune('\r'))
+  }
+  if (b == 'f') {
+    return Option.Some(rune(0x0C))
+  }
+  if (b == 'v') {
+    return Option.Some(rune(0x0B))
+  }
+  return Option.None
+}
+
+// `classControlByte`, wrapped as the `Ast.Literal` an atom-position escape
+// produces.
+fn escapeControlFor(b: u8): Option<Ast> {
+  let ctrl = classControlByte(b)
+  if (isSome(ctrl)) {
+    return Option.Some(Ast.Literal(unwrap(ctrl)))
+  }
+  return Option.None
+}
+
+// --- byte classification -----------------------------------------------
+
+fn isAsciiLetter(b: u8): bool {
+  return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
+fn isAsciiDigit(b: u8): bool {
+  return b >= '0' && b <= '9'
+}
+
+fn isAsciiAlnum(b: u8): bool {
+  return isAsciiLetter(b) || isAsciiDigit(b)
+}
