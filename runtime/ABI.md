@@ -1548,6 +1548,7 @@ defined exactly once).
 | `bit_rt_fs_rename`    | `(oldPath: *const RtBytes, newPath: *const RtBytes) -> i64` (§14) |
 | `bit_rt_fs_list_dir`  | `(path: *const RtBytes) -> *const RtBytes` (§14)        |
 | `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not NUL-terminated, not `RtBytes`; the only `bit_rt_fs_*` entry point shaped this way) |
+| `bit_rt_fs_sync`      | `(fd: i64) -> i64` (§14, `0` on success, `-1` on failure; Darwin uses `F_FULLFSYNC`, falling back to bare `fsync` only on `ENOTSUP` — bare `fsync` alone does not flush the drive's write cache on that platform) |
 | `bit_rt_test_index`   | `() -> i64` (§16)                                      |
 | `bit_rt_floor`        | `(x: f64) -> f64` (§17)                                |
 | `bit_rt_ceil`         | `(x: f64) -> f64` (§17)                                |
@@ -1920,6 +1921,7 @@ bit_rt_fs_read_all(fd)            -> string     // whole file (regular files onl
 bit_rt_fs_read_all_failed()       -> bool       // #2994/#3065/#2996 below
 bit_rt_fs_read(fd, max: i64)      -> string     // up to max bytes; "" at EOF
 bit_rt_fs_write(fd, s)            -> i64        // bytes written, or -1
+bit_rt_fs_sync(fd)                -> i64        // 0, or -1 (#3462)
 bit_rt_fs_close(fd)               -> i64        // always 0
 bit_rt_fs_exists(path)            -> bool
 bit_rt_fs_is_dir(path)            -> bool
@@ -1972,6 +1974,28 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   to `maxReadAllRetries` (1000) times.
 - `fs_close` reports success unconditionally (the raw wrapper swallows
   `EINTR`/`EBADF`).
+- `fs_sync` (#3462) flushes `fd`'s already-written bytes to stable storage,
+  0 on success, -1 on any failure — a successful `fs_write` only reaches the
+  OS page cache, and pulling power before `fs_sync` returns can still lose
+  it. **Bare `fsync(2)` is not durable on Darwin**: it stops at the drive's
+  write cache. Apple documents `fcntl(fd, F_FULLFSYNC, 0)` (`man 2 fsync`'s
+  CAVEATS section) as the call that actually forces the platter, so Darwin's
+  provider calls that first and falls back to bare `fsync` only when it
+  returns `ENOTSUP` (some older exFAT/SMB mounts reject `F_FULLFSYNC`
+  outright); any other failure is reported as-is, never silently downgraded
+  to the weaker call. Linux's raw `fsync` syscall is already the durable
+  call, no fallback needed. Windows' provider calls `FlushFileBuffers`,
+  which per MSDN forces the OS cache and any intermediate hardware cache to
+  the physical device. **No `stdlib/` caller exists yet** — the same
+  `tools/build/` bootstrap cycle #2153's `stat_w`/`lstat_w` bullet describes
+  below applies here too: `tools/build/artifacts.bit` imports `std/fs`, which
+  the PINNED stage0 compiles against its own frozen `libbitrt.a`, so a
+  `stdlib/fs/fs.bit` reference to this symbol breaks the driver bootstrap
+  with E0078 on every fresh clone until a release ships this commit and the
+  pin moves. This landing is pass 1 of 2 (the #3065 pattern): the runtime
+  primitives only, no consumer. Pass 2 (a `File.sync()` method in
+  `stdlib/fs/fs.bit`) is a follow-up ticket, gated on a release containing
+  this commit and a stage0 repin to it.
 - `fs_read` reads once and returns what it got, so it is the primitive for
   pipes, sockets, and stdin — none of which have a size to seek to.
 - `fs_list_dir` separates entries with a **NUL** byte, the one byte a POSIX

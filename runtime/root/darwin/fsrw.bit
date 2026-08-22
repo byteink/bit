@@ -1,0 +1,221 @@
+// The byte-oriented half of the Darwin filesystem provider (SEAM 3, #1606):
+// `bit_rt_fs_read`, `bit_rt_fs_read_all`, `bit_rt_fs_write` and
+// `bit_rt_fs_sync` — the four `bit_rt_fs_*` ABI wrappers (ABI.md §14) that
+// operate on an already-open fd rather than a path. Split out of ./fs.bit by
+// #3462, which pushed that file to 799 lines with no room left for the new
+// `bit_rt_fs_sync` export (spec/LINT.md §4's 800-line limit, E0200): the three
+// pre-existing functions are a PURE MOVE, no logic changed, verified with
+// `comm -23` against the concatenation of both halves before landing. Matches
+// ../linux/fsrw.bit's own #3274 split and ../windows/fsrw.bit's #3334 split
+// exactly: path-taking operations (open, exists, isDir, mkdir, remove,
+// rename, listDir, the symlink probe) stay in ./fs.bit; the functions that
+// instead take an already-open fd and move bytes (or flush them) move here.
+//
+// Sibling of ./fs.bit in the same directory, so this is the SAME MODULE (an
+// import is per-module, not per-file) — nothing here needs a new import:
+// `emptyStr`, `u8At`, `strData`, `strLenOf`, `rtStrAlloc`, `rtStringSlice`,
+// `rtFsReadAllFailedSet`, `readAllErrno` and `gcSyscallBegin`/`gcSyscallEnd`
+// are all ./fs.bit's own declarations or imports, already in scope.
+
+// Darwin errno for an interrupted syscall (`<sys/errno.h>`), shared by every
+// libSystem call in this runtime — see ../../net/darwin/sock.bit's identical
+// constant. `read()` sets thread-local `errno` and returns -1 on ANY failure;
+// `__error()` is `std.c._errno`'s `__error` symbol, the only way Bit code
+// reaches it (#2990's investigation — no accessor existed in this module).
+const eIntr: int = 4
+
+// A large but PROVABLY BOUNDED retry budget (Power of 10 rule 2) for a `read`
+// interrupted by a signal (`EINTR`): POSIX says retry, and under concurrent
+// process/signal load (#2980) more than a handful of interruptions across one
+// file's read is plausible, so this is generous rather than tight.
+const maxReadAllRetries: int = 1000
+
+// `bit_rt_fs_read`: up to `max` bytes from `fd` into a fresh string, trimmed to
+// what arrived (empty at EOF).
+export @nosplit @symbol("bit_rt_fs_read") fn rtFsRead(fd: int, max: int): int {
+  if (max <= 0) {
+    return emptyStr()
+  }
+  let big = rtStrAlloc(max)
+  if (big == 0) {
+    return emptyStr()
+  }
+  // THE `syscall` BRACKET IS LOAD-BEARING (#2207), for the same reason
+  // ../os.bit's `waitpid` has one. `fd` may be a pipe, a tty or a socket, so
+  // this `read` blocks until somebody writes — indefinitely, for a server or an
+  // LSP sitting on stdin. Unbracketed, the reading thread never reaches a
+  // safepoint, so a thread that requests a stop-the-world spins in its wait loop
+  // for the whole duration: measured at ~77% of a core, continuously, in
+  // `bit lsp --stdio`.
+  //
+  // `syscall` and NOT `blocked`: `big` is a live reference held across this
+  // call, and `blocked` would let it be swept. `syscall` publishes the stack
+  // bound and register file so it is scanned in place.
+  gcSyscallBegin()
+  let n = int(read(i32(fd), u8At(strData(big)), i64(max)))
+  gcSyscallEnd()
+  if (n <= 0) {
+    return emptyStr()
+  }
+  return rtStringSlice(big, 0, n)
+}
+
+// `bit_rt_fs_read_all`: the whole file as a fresh string, sized by `lseek` to the
+// end and back. `bit_rt_fs_read_all` itself stays a single non-fallible,
+// `string`-returning primitive (ABI.md §14) -- a seek error and an allocation
+// failure are now reported through the out-of-band companion symbol
+// `bit_rt_fs_read_all_failed()` instead (wired here, #2996 pass 2), which is
+// what lets a caller tell them apart from a genuine empty file, which never
+// reports a failure (see the `end < 0` / `end == 0` / `s == 0` branches'
+// comments below). The read loop's own I/O-error paths further down are NOT
+// wired to the flag -- out of this ticket's scope; a short read they produce
+// still trims to the bytes actually verified read (#2990) and is silent about
+// why it stopped short, same as before.
+//
+// A short read NEVER fabricates content (#2990). `read` returning `n <= 0`
+// before `off` reaches `end` is one of three things: (a) `EINTR` — a signal
+// landed mid-call, not a failure, retried below; (b) `n == 0` — the file
+// shrank between the `lseek` probe and this read (a TOCTOU race, not this
+// runtime's error to report); (c) any other negative result — a genuine I/O
+// error. (b) and (c) both stop the read and return the string TRIMMED to the
+// `off` bytes actually verified read. The old code returned the full-length
+// string with its un-filled tail left as the zero bytes `rtStrAlloc` clears
+// memory to — indistinguishable from a file that genuinely contains NULs,
+// which made this silent corruption rather than an honest short read.
+//
+// BOUNDED (Power of 10 rule 2): every iteration that continues the loop
+// advances `off` by at least 1 (a successful partial read) OR advances
+// `retries` by 1 (an `EINTR` retry) — both counters are capped by the loop
+// condition itself, so the loop runs at most `end + maxReadAllRetries` times.
+export @nosplit @symbol("bit_rt_fs_read_all") fn rtFsReadAll(fd: int): int {
+  // Cleared at entry so a PRIOR call's outcome (on this task) never leaks
+  // into this one -- `bit_rt_fs_read_all_failed` must reflect only the read
+  // this call just performed.
+  rtFsReadAllFailedSet(false)
+  let end = int(lseek(i32(fd), i64(0), i32(seekEnd)))
+  if (end < 0) {
+    // `lseek` FAILED (fd is a pipe, a closed descriptor, etc.) -- a genuine
+    // I/O error, unambiguous: lseek's own failure return is negative and a
+    // file's size never is (#2996). Distinguishable from the `end == 0`
+    // branch below via the out-of-band flag, because `bit_rt_fs_read_all`
+    // returns `string`, and `string` has no nil sentinel to carry the
+    // difference in-band (SPEC SS5.7/SS13.4: `string`'s zero value is the
+    // empty string, not `nil` -- unlike the reference types that do have one).
+    rtFsReadAllFailedSet(true)
+    return emptyStr()
+  }
+  if (end == 0) {
+    // `lseek` succeeded and reported 0: a genuinely empty file. Unambiguous,
+    // and this is the correct, safe result -- `string`'s zero value IS the
+    // empty string (SPEC SS13.4), so no sentinel is needed or possible here.
+    // The flag stays `false` from the entry-clear above: a genuinely empty
+    // file must never be reported as a read failure (#2996's own
+    // constraint).
+    return emptyStr()
+  }
+  lseek(i32(fd), i64(0), i32(seekSet))
+  let s = rtStrAlloc(end)
+  if (s == 0) {
+    // Allocation failed for a file we already know is non-empty (`end > 0`
+    // above). A genuine failure, distinct in cause from the `end < 0` branch
+    // above but reported the identical way.
+    rtFsReadAllFailedSet(true)
+    return emptyStr()
+  }
+  let base = strData(s)
+  let off = 0
+  let retries = 0
+  while (off < end && retries < maxReadAllRetries) {
+    // Bracketed for the same reason `rtFsRead` above is (#2207, and #2990's
+    // investigation found this call was NOT bracketed): `fd` may be a pipe or
+    // a slow device, so this can block indefinitely, and `base` points into a
+    // live string held across the call, so `syscall`, not `blocked`.
+    gcSyscallBegin()
+    let n = int(read(i32(fd), u8At(base + off), i64(end - off)))
+    let err = 0
+    if (n < 0) {
+      err = readAllErrno()
+    }
+    gcSyscallEnd()
+    if (n > 0) {
+      off = off + n
+    } else if (n < 0 && err == eIntr) {
+      retries = retries + 1
+    } else {
+      return rtStringSlice(s, 0, off)
+    }
+  }
+  if (off < end) {
+    return rtStringSlice(s, 0, off)
+  }
+  return s
+}
+
+// `bit_rt_fs_write`: write all of `s`'s bytes to `fd`. Byte count, or -1.
+// `write` is ../darwin/io.bit's module-scoped extern.
+//
+// BOUNDED (Power of 10 rule 2): `off` rises by at least 1 each iteration.
+export @nosplit @symbol("bit_rt_fs_write") fn rtFsWrite(fd: int, s: int): int {
+  let total = strLenOf(s)
+  let base = strData(s)
+  let off = 0
+  while (off < total) {
+    // Bracketed for the same reason as `rtFsRead` above (#2207): a write to a
+    // full pipe or a slow tty blocks until the far end drains, and an
+    // unbracketed block spins whichever thread wants a stop-the-world. `base`
+    // points into a live string held across the call, so `syscall`, not
+    // `blocked`.
+    gcSyscallBegin()
+    let n = int(write(i32(fd), u8At(base + off), i64(total - off)))
+    gcSyscallEnd()
+    if (n < 0) {
+      return 0 - 1
+    }
+    if (n == 0) {
+      return off
+    }
+    off = off + n
+  }
+  return off
+}
+
+// ENOTSUP (`<sys/errno.h>`) = 45: some filesystems (older exFAT/SMB mounts)
+// reject F_FULLFSYNC outright. This is the only errno that falls back to
+// bare `fsync`; any other failure is reported as a genuine I/O error rather
+// than silently downgraded to the weaker call.
+const eNotSup: int = 45
+
+// F_FULLFSYNC (`<sys/fcntl.h>`) = 51. BARE `fsync(2)` IS NOT DURABLE ON
+// DARWIN: it only reaches the drive's write cache. Apple documents
+// `fcntl(fd, F_FULLFSYNC, 0)` as the call that actually flushes the drive
+// itself -- see `man 2 fsync`'s CAVEATS section. Getting this wrong makes
+// `bit_rt_fs_sync`'s durability claim false, so this is the primary path and
+// `fsync` below is only the ENOTSUP fallback.
+const fFullfsync: int = 51
+
+extern fn fsync(fd: i32): i32
+// THE ONE OTHER VARIADIC C FUNCTION THIS RUNTIME CALLS, ALONGSIDE
+// ../../net/darwin/sock.bit's `fcntl` (#1462, see there for the full
+// account): Apple ARM64 passes every variadic argument on the STACK
+// regardless of a fixed-arity declaration's third parameter, so `arg` is
+// passed twice -- once in the register slot a variadic callee never reads on
+// this platform, once in the first stack slot it does. SysV x86-64 reads the
+// register slot instead, so both are live and this is correct on either
+// Darwin architecture.
+extern fn fcntl(fd: i32, cmd: i32, argReg: i64, pad3: i64, pad4: i64, pad5: i64, pad6: i64, pad7: i64, argStack: i64): i32
+
+// `bit_rt_fs_sync`: flush `fd`'s already-written bytes to stable storage. 0
+// on success, -1 on any failure -- a caller must not treat a successful
+// `bit_rt_fs_write` as durable until this also returns 0.
+export @nosplit @symbol("bit_rt_fs_sync") fn rtFsSync(fd: int): int {
+  if (int(fcntl(i32(fd), i32(fFullfsync), 0, 0, 0, 0, 0, 0, 0)) == 0) {
+    return 0
+  }
+  if (readAllErrno() != eNotSup) {
+    return 0 - 1
+  }
+  if (int(fsync(i32(fd))) == 0) {
+    return 0
+  }
+  return 0 - 1
+}
