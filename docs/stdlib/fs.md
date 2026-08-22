@@ -129,6 +129,45 @@ fn kind(path: string): string {
 }
 ```
 
+### `FileInfo`
+
+`stat`/`lstat`'s result: `size` in bytes, `mtime` in seconds since the Unix
+epoch, `mode`'s low 12 bits (permission plus setuid/setgid/sticky), and
+`isDir`/`isSymlink` — computed from the same information `isDir(path)` and
+`isSymlink(path)` above answer, but without a second syscall.
+
+### `stat(path: string): FileInfo!`
+
+Metadata for `path`, **following** a trailing symbolic link — `stat(2)`-shaped,
+like `isDir` above. `isSymlink` in the result is always `false`: a followed
+link is indistinguishable from its target. Fails on a missing path.
+
+### `lstat(path: string): FileInfo!`
+
+Metadata for `path`, **without** following a trailing symbolic link —
+`lstat(2)`-shaped, like `isSymlink` above. `isSymlink` in the result reflects
+`path` itself. Fails on a missing path.
+
+```bit
+import { stat, lstat } from "std/fs"
+
+fn describe(path: string): string! {
+  let info = lstat(path)?
+  if (info.isSymlink) {
+    return "symlink"
+  }
+  if (info.isDir) {
+    return "directory, ${info.size} bytes"
+  }
+  return "file, ${info.size} bytes"
+}
+
+fn hasChanged(path: string, knownSize: i64, knownMtime: i64): bool! {
+  let info = stat(path)?
+  return info.size != knownSize || info.mtime != knownMtime
+}
+```
+
 ## Directories
 
 ### `mkdir(path: string): ()!`
