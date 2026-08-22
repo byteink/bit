@@ -40,7 +40,11 @@
 // the order it writes them: the receiver first when there is one and
 // `isIface` is false (a concrete method prepends its receiver to the
 // argument list), separately via `recvTy`/`isIface` when there is one and it
-// IS false, or with no receiver at all.
+// IS false, or with no receiver at all. When `variadicFixed >= 0` the callee's
+// trailing parameter collects into one slice (§10.3): `paramTypes`'s LAST
+// entry is already that slice type (what `lowerArgsRest` actually produces
+// and what the reserved slot must hold), and `lowerDefer` must call
+// `lowerArgsRest`, not `lowerArgs`, passing these same two fields through.
 class DeferTarget {
   ok: bool,
   // Op/name/ty template (ival set for CallIface's dispatch id); meaningless
@@ -53,13 +57,18 @@ class DeferTarget {
   isIface: bool,
   recvTy: int,
   paramTypes: []int,
+  // -1 for a non-variadic callee (every defer target but a plain function);
+  // else the index in `paramTypes` where the collected tail starts.
+  variadicFixed: int,
+  variadicElemTy: int,
   span: Span,
   reason: string,
 }
 
 fn deferTargetFail(span: Span, reason: string): DeferTarget {
   return DeferTarget{ ok: false, instr: mkInstr(Op.Call, 0), isIface: false,
-    recvTy: 0, paramTypes: []int(0), span: span, reason: reason }
+    recvTy: 0, paramTypes: []int(0), variadicFixed: -1, variadicElemTy: 0,
+    span: span, reason: reason }
 }
 
 // Resolves `node` (a Tag.DeferStmt) to its callee shape. Mirrors the checks
@@ -83,7 +92,10 @@ fn resolveDeferTarget(fc: FnCtx, node: int): DeferTarget {
 
 // `defer recv.method(...)` — the idiom every resource-releasing `defer` uses
 // (`defer f.close()`). The receiver's TYPE is resolved here; its VALUE is
-// read later, at the defer site (lowerDefer), per SPEC §18.5.
+// read later, at the defer site (lowerDefer), per SPEC §18.5. `lowerArgs`
+// (not `lowerArgsFor`) is what a live method call already builds its
+// argument list with, so a variadic METHOD is out of scope here exactly as
+// it always has been — nothing new to refuse.
 fn resolveDeferMethodTarget(fc: FnCtx, callee: int, cn: Node): DeferTarget {
   let mk = kidsOf(fc.c.tree, callee)
   let recvTy = nodeType(fc, mk[0])
@@ -97,39 +109,45 @@ fn resolveDeferMethodTarget(fc: FnCtx, callee: int, cn: Node): DeferTarget {
     let mi = mkInstr(Op.CallIface, fc.c.ctx.voidId)
     mi.ival = methodId(fc.lowerer, mname)
     return DeferTarget{ ok: true, instr: mi, isIface: true, recvTy: recvTy,
-      paramTypes: paramTypes, span: cn.span, reason: "" }
+      paramTypes: paramTypes, variadicFixed: -1, variadicElemTy: 0, span: cn.span, reason: "" }
   }
   let mi = mkInstr(Op.Call, fc.c.ctx.voidId)
   mi.name = methodSymbol(fc.lowerer, mname, recvTy)
   return DeferTarget{ ok: true, instr: mi, isIface: false, recvTy: recvTy,
-    paramTypes: paramTypes, span: cn.span, reason: "" }
+    paramTypes: paramTypes, variadicFixed: -1, variadicElemTy: 0, span: cn.span, reason: "" }
 }
 
 // `defer print(...)/eprint(...)` (builtins, no declared signature to hint
 // with — each argument keeps its own default type) or `defer f(...)` (the
 // same resolution a direct call gets: module qualification AND generic
-// instantiation, via resolveCallTarget). A variadic callee is refused: its
-// tail would need collecting into one slice slot the way lowerArgsFor does
-// for a live call, and nothing in the corpus defers one today.
+// instantiation, via resolveCallTarget). A variadic free function's tail
+// collects into one slice, same as a live call (§10.3) — this used to build
+// fine unconditionally via `lowerArgsFor`, so refusing it here outright would
+// be a regression, not a new restriction.
 fn resolveDeferCallTarget(fc: FnCtx, call: int, cn: Node): DeferTarget {
   let name = fc.c.source[cn.span.start:cn.span.end]
   if (name == "print" || name == "eprint") {
     let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
     ins.name = name
     return DeferTarget{ ok: true, instr: ins, isIface: false, recvTy: 0,
-      paramTypes: deferPrintArgTypes(fc, call), span: cn.span, reason: "" }
+      paramTypes: deferPrintArgTypes(fc, call), variadicFixed: -1, variadicElemTy: 0, span: cn.span, reason: "" }
   }
   let t = resolveCallTarget(fc, name, call)
   if (!t.ok) {
     return deferTargetFail(cn.span, "a deferred call whose target could not be resolved")
   }
-  if (t.decl != 0 && !isExternDecl(t.owner.tree, t.decl) && paramsAreVariadic(t.owner, kidsOf(t.owner.tree, t.decl)[3])) {
-    return deferTargetFail(cn.span, "a deferred call to a variadic function")
-  }
   let ins = mkInstr(Op.Call, t.result)
   ins.name = t.symbol
+  let fixed = -1
+  let elemTy = 0
+  let paramTypes = t.paramTypes
+  if (t.decl != 0 && !isExternDecl(t.owner.tree, t.decl) && paramsAreVariadic(t.owner, kidsOf(t.owner.tree, t.decl)[3])) {
+    fixed = len(paramTypes) - 1
+    elemTy = paramTypes[fixed]
+    paramTypes = append(paramTypes[0:fixed], mkSlice(fc.c.ctx, elemTy))
+  }
   return DeferTarget{ ok: true, instr: ins, isIface: false, recvTy: 0,
-    paramTypes: t.paramTypes, span: cn.span, reason: "" }
+    paramTypes: paramTypes, variadicFixed: fixed, variadicElemTy: elemTy, span: cn.span, reason: "" }
 }
 
 // Each `print`/`eprint` argument's own default type (no callee signature to
@@ -319,7 +337,12 @@ fn lowerDefer(fc: FnCtx, node: int) {
       return
     }
   }
-  let a = lowerArgs(fc, call, t.paramTypes)
+  let a = []int(0)
+  if (t.variadicFixed >= 0) {
+    a = lowerArgsRest(fc, call, t.paramTypes, t.variadicFixed, t.variadicElemTy)
+  } else {
+    a = lowerArgs(fc, call, t.paramTypes)
+  }
   if (fc.failed) {
     return
   }
