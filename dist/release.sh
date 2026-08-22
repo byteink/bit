@@ -156,7 +156,7 @@ echo "release.sh: bootstrapping the host self-hosted compiler with stage0 (bit1)
 ./make
 BIT1="${ROOT}/bit-out/bin/bit"
 [ -x "${BIT1}" ] || { echo "release.sh: ./make did not produce ${BIT1}" >&2; exit 1; }
-# `stepSelfhost` (tools/build/artifacts.bit) writes this on every `./make`
+# `stepSelfhost` (tools/build/artifactsteps.bit) writes this on every `./make`
 # call, unconditionally, before its own up-to-date check — so it is reliably
 # fresh here without release.sh reimplementing the uname table.
 HOST_TRIPLE="$(cat "${ROOT}/bit-out/make/host.triple" 2>/dev/null || true)"
@@ -307,7 +307,7 @@ done
 #
 # A HIT HERE IS NOW A REAL DEFECT (#3034), not a known, tolerated lag. Before
 # #3034 the packaged runtime came from `./make libbitrt`'s PINNED STAGE0 build
-# (see `stepLibbitrt` in tools/build/artifacts.bit) and a codegen fix landing
+# (see `stepLibbitrt` in tools/build/artifactsteps.bit) and a codegen fix landing
 # in this tree could not reach it until the stage0 pin moved past the release
 # carrying the fix — 0.1.11 shipped the #2742 bug unnoticed exactly that way.
 # `stepLibbitrt` is unchanged (#3034's constraint: the L0 archive it produces

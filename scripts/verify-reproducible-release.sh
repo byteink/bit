@@ -30,7 +30,7 @@
 # rebuild below now mirrors THAT sequence — three stages, not one:
 #   L0/C1 — `./make libbitrt` builds the bootstrap runtime archives, then the
 #     PINNED stage0 builds a native host compiler ("bit1", bit-out/bin/bit)
-#     linking the host L0 archive, exactly as `tools/build/artifacts.bit`'s
+#     linking the host L0 archive, exactly as `tools/build/artifactsteps.bit`'s
 #     `stepSelfhost` does for `install`. Stage0's role ends here: it never
 #     builds the artifact compared against the release, only the compiler
 #     that builds it.
@@ -171,7 +171,7 @@ echo "stage0 = ${STAGE0}"
 # target below the same way stage0 always has, exactly as dist/release.sh's
 # own comment describes its C1 step.
 #
-# A DELIBERATE duplicate of `stepSelfhost` (tools/build/artifacts.bit:311-314)
+# A DELIBERATE duplicate of `stepSelfhost` (tools/build/artifactsteps.bit:234-237)
 # rather than a call to `./make` — same reasoning as the STAGE_SRC staging
 # duplicate above: this script must not depend on the driver's own caching or
 # side effects (it writes bit-out/make/*.stamp, bit-out/make/host.triple), and

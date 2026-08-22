@@ -65,9 +65,9 @@ before merging to main, or right after a stage0 repin.
 **Changing an exported `runtime/**` symbol's arity or parameter types needs
 the two-pass `BIT_STAGE0_BIN` bootstrap (#1857) — a single `./make selfhost`
 is not safe for it, and #3152 is why.** `stepSelfhost`
-(`tools/build/artifacts.bit:399`) links THIS TREE's `libbitrt.a` (line 412,
-built from current `runtime/**` source) against a compiler produced by
-compiling `compiler/**` with the PINNED stage0 (line 420) — a previous
+(`tools/build/artifactsteps.bit`) links THIS TREE's `libbitrt.a` (built from
+current `runtime/**` source) against a compiler produced by compiling
+`compiler/**` with the PINNED stage0 — a previous
 release that never saw the new signature. `Op.RtCall` lowering (the backend's
 lowering for slice/map/chan-literal syntax, e.g. `[]T(n)`) hardcodes its
 callee's argument count into whichever compiler emits the call, as a property
@@ -175,9 +175,9 @@ first builds a bootstrap archive (L0) with the pinned stage0, stage0 uses L0 to
 build a native `bit1` (`./make`'s own `selfhost` step), then `bit1` rebuilds
 the real, shipped archive (L1) for all three targets via
 `scripts/g2archive.sh`, and only L1 is packaged.
-`tools/build/artifacts.bit:267` — the **ordinary** `./make libbitrt` still
-compiles every `runtime/**` module with the pinned stage0. There is no L1 pass
-in the everyday build.
+`stepLibbitrt` (`tools/build/artifactsteps.bit`) — the **ordinary**
+`./make libbitrt` still compiles every `runtime/**` module with the pinned
+stage0. There is no L1 pass in the everyday build.
 
 **Why this is not a style choice: source vs. codegen.** A *source* edit to
 `runtime/**` takes effect immediately either way, because stage0 re-reads the
@@ -482,7 +482,7 @@ not about scope.) Three measured instances, all re-measured on `main` at
   limit is enforced over 77 of 1182 (6.5%) and 1105 files are checked by
   nothing. Its scoping is deliberate — the point is only that the line reads
   as a whole-tree verdict.
-- **`test-fmt`** (`tools/build/gates.bit:217`) walks `stdlib/` and `examples/`
+- **`test-fmt`** (`tools/build/gates.bit`) walks `stdlib/` and `examples/`
   only — 173 of 1182 files (14.6%, `git ls-files -- 'stdlib/*.bit'
   'examples/*.bit' | wc -l`). `compiler/`, `runtime/` and `tests/` — 997 of
   1182 (84%, `git ls-files -- 'compiler/*.bit' 'runtime/*.bit' 'tests/*.bit' |
@@ -538,7 +538,7 @@ own:
 
 1. **There is no C, C++, or LLVM-IR compiler input left to instrument.**
    `runtime/` is 100% `.bit` source (`find runtime -type f` shows zero `.c`,
-   `.cc`, `.zig`), and `tools/build/artifacts.bit`'s `libbitrt` step compiles
+   `.cc`, `.zig`), and `tools/build/artifactsteps.bit`'s `libbitrt` step compiles
    it straight through `bit`'s own native backend — `scripts/g2archive.sh`
    builds each runtime module to an object with `bit`, then packs the archive
    with `bit ar`. No `cc`/`clang`/`gcc`/`zig` invocation exists anywhere under
