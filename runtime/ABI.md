@@ -1917,6 +1917,8 @@ bit_rt_fs_remove(path)            -> i64        // file or empty dir; 0, or -1
 bit_rt_fs_rename(oldPath, newPath) -> i64       // 0, or -1
 bit_rt_fs_list_dir(path)          -> string     // NUL-terminated entry names
 bit_rt_fs_is_symlink_w(words, n)  -> bool        // path is a symlink itself (readlink-based)
+bit_rt_fs_stat_w(words, n, out)   -> i64        // fills `out`, follows a trailing symlink; 0 or -errno (#2153)
+bit_rt_fs_lstat_w(words, n, out)  -> i64        // fills `out`, does not follow;             0 or -errno (#2153)
 ```
 
 The low-level layer under `std/fs`. Deliberately plain (not fallible): failures
@@ -1983,6 +1985,29 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   succeeds only on a symbolic link and needs no `struct stat` layout, so a
   dangling link still answers `true` — the link exists whether its target
   does or not.
+- `stat_w`/`lstat_w` (#2153) share `is_symlink_w`'s `words`/`n` path
+  encoding, for the identical reason — a `std/fs` caller can reach them only
+  through `extern fn`, which admits no `string` (SPEC §11.7). `out` is a
+  caller-owned 5-word buffer the provider fills in fixed order: `size`,
+  `mtime` (seconds since the Unix epoch), `mode` (the low 12 permission
+  bits), `isDir` (0/1), `isSymlink` (0/1). `stat_w` follows a trailing
+  symlink (`isSymlink` is therefore always 0 in its result); `lstat_w` does
+  not, and reports whether `words` itself is a link. Unlike every other
+  `bit_rt_fs_*` primitive above, a failure is **not** a flat `-1`: the return
+  is 0 on success or `-errno` on failure, the convention #2343 gives the net
+  primitives. Darwin's `stat`/`lstat` set a *positive* errno reachable
+  through `__error()`; the provider negates it. Linux's raw `syscall`
+  already returns `-errno` directly on failure, passed through unchanged.
+  **No `stdlib/` caller exists yet.** #2153 landed once before (`03cbbd41`)
+  wiring both the runtime and a `stdlib/fs` consumer in one commit, and was
+  reverted (`0dd25c35`): the pinned stage0 that compiles `tools/build/` links
+  its own frozen release runtime, which had never shipped these symbols, so
+  the `stdlib/` reference broke `./make`'s driver bootstrap with E0078 on
+  every fresh clone. This landing is pass 1 of 2 (the #3065 pattern): the
+  runtime primitives only, no consumer, so nothing on the driver's import
+  path references them. Pass 2 (the `FileInfo` struct and `stat`/`lstat`
+  wrappers in `stdlib/fs/fs.bit`) is a follow-up ticket, gated on a release
+  containing this commit and a stage0 repin to it.
 - `fs_rename` is the only `bit_rt_fs_*` entry point that needs two encoded
   paths live at the same time, and that is why it is backed by two separate
   scratch buffers instead of the one every other path-taking entry point

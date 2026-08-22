@@ -59,6 +59,21 @@ extern fn access(path: *u8, mode: i32): i32
 // resolves to, and it fails with `EINVAL` on everything that is not one. See
 // `rtFsIsSymlinkZ` for why that is preferred over `lstat` + `S_IFLNK`.
 extern fn readlink(path: *u8, buf: *u8, bufsize: i64): i64
+// `stat`/`lstat` (#2153): fill a `struct stat` at `buf`, following/not
+// following a trailing symlink. Both names are already admitted by the
+// compiler's libSystem membership table (`compiler/machosyms.bit`). A failed
+// call sets a POSITIVE errno reachable through `__error()` (declared further
+// down, reused by `fillStat` below via `readAllErrno()`) — unlike Linux's raw
+// syscall convention, whose failing return IS `-errno` directly.
+//
+// PASS 1 OF 2, NO `stdlib/` CONSUMER YET (the #3065 pattern): #2153 was
+// reverted at `0dd25c35` because the pinned stage0 that compiles
+// `tools/build/` links its OWN frozen release runtime, which has never
+// shipped these symbols — a `stdlib/` reference breaks the driver bootstrap
+// with E0078 on every fresh clone until a release ships this commit and the
+// pin moves. Verified against `bit-out/stage0/`'s bundled archive first.
+extern fn stat(path: *u8, buf: *u8): i32
+extern fn lstat(path: *u8, buf: *u8): i32
 
 // `close` GOES THROUGH libSystem HERE AND CARRIES A KNOWN #1436 HAZARD. Under the
 // SEED compiler (which builds this runtime today and links every user binary
@@ -145,6 +160,29 @@ let fsLinkPathBuf: [16896]i64
 // rather than shared because this module cannot see it; it is `runtime/root/`'s
 // `max_path = 4096` and must move with it.
 const fsLinkMaxPath: int = 4096
+
+// `stat`/`lstat` sink for `bit_rt_fs_stat_w`/`bit_rt_fs_lstat_w` (#2153).
+// `struct stat` on aarch64-macos (`<sys/stat.h>`'s 64-bit-inode form, the
+// only Darwin target this runtime supports): `sizeof == 144`, measured with
+// `offsetof` via native `clang -arch arm64` on this machine, not transcribed.
+// 18 words = 144 bytes. PER-WORKER SLOTS, same shape as `fsLinkBuf`/
+// `fsLinkPathBuf` above (#3274): (`fsScratchSlots` + 1) * 18 = 594 words, one
+// region per worker plus the fallback. Scalar array, never GC-scanned (rule 1).
+let fsStatBuf: [594]i64
+const fsStatSlotWords: int = 18
+
+// Field offsets inside ONE slot, same `offsetof` measurement: `st_mode@4`
+// (u16, the one field not 8-byte aligned — hence `loadU16LE` not `loadWord`),
+// `st_size@96`, `st_mtimespec.tv_sec@48`.
+const statModeOff: int = 4
+const statSizeOff: int = 96
+const statMtimeSecOff: int = 48
+
+// `S_IFMT`/`S_IFDIR`/`S_IFLNK` (`<sys/stat.h>`): POSIX-standard, confirmed
+// identical to ../linux/fs.bit's copy by the same measurement pass.
+const sIfmt: int = 61440 // 0o170000
+const sIfdir: int = 16384 // 0o040000
+const sIflnk: int = 40960 // 0o120000
 
 // ---------------------------------------------------------------------------
 // Pointer / string glue
@@ -462,6 +500,67 @@ export @nosplit @symbol("bit_rt_fs_is_symlink_w") fn rtFsIsSymlinkW(
   // kernel may write.
   let linkBuf = u8At(int(ptrOf(fsLinkBuf)) + fsScratchSlot() * 8)
   return int(readlink(u8At(p), linkBuf, i64(fsLinkBufBytes))) >= 0
+}
+
+// The little-endian u16 at `addr` (`st_mode`'s width, not 8-byte aligned).
+// Same technique ../linux/fs.bit's `loadU16` uses for `dirent64`.
+@nosplit fn loadU16LE(addr: int): int {
+  return loadByte(addr) + loadByte(addr + 1) * 256
+}
+
+// `stat(2)` (`follow`) or `lstat(2)` (`!follow`) on the already-copied C path
+// `p`, filling `out` (5 words: size, mtime seconds, mode, isDir, isSymlink —
+// ABI.md §14) from this worker's `fsStatBuf` slot. 0 on success, `-errno` on
+// failure (#2153, #2343's convention) — no `stdlib/` consumer yet, see above.
+@nosplit fn fillStat(p: int, out: int, follow: bool): int {
+  let rc = 0
+  let slotBase = int(ptrOf(fsStatBuf)) + fsScratchSlot() * fsStatSlotWords * 8
+  let buf = u8At(slotBase)
+  if (follow) {
+    rc = int(stat(u8At(p), buf))
+  } else {
+    rc = int(lstat(u8At(p), buf))
+  }
+  if (rc < 0) {
+    return 0 - readAllErrno()
+  }
+  let mode = loadU16LE(slotBase + statModeOff)
+  storeWord(out, loadWord(slotBase + statSizeOff))
+  storeWord(out + 8, loadWord(slotBase + statMtimeSecOff))
+  storeWord(out + 16, mode & 4095) // low 12 bits: perm + setuid/setgid/sticky
+  let isDir = 0
+  if ((mode & sIfmt) == sIfdir) {
+    isDir = 1
+  }
+  storeWord(out + 24, isDir)
+  let isSymlink = 0
+  if ((mode & sIfmt) == sIflnk) {
+    isSymlink = 1
+  }
+  storeWord(out + 32, isSymlink)
+  return 0
+}
+
+// `bit_rt_fs_stat_w`: `stat(2)`-shaped — FOLLOWS a trailing symlink, so
+// `out`'s isSymlink word is always 0. `words`/`n` are `wordsPathZ`'s
+// word-per-byte path encoding; `out` is the caller's 5-word sink. No
+// `stdlib/` caller yet — see the extern declarations' note above.
+export @nosplit @symbol("bit_rt_fs_stat_w") fn rtFsStatW(words: int, n: int, out: int): int {
+  let p = wordsPathZ(words, n)
+  if (p == 0) {
+    return 0 - 2 // ENOENT-shaped: same "rejected path reads as absent" contract checkedPathZ's callers already carry
+  }
+  return fillStat(p, out, true)
+}
+
+// `bit_rt_fs_lstat_w`: `lstat(2)`-shaped — does NOT follow a trailing
+// symlink, so `out`'s isSymlink word reflects `words` itself.
+export @nosplit @symbol("bit_rt_fs_lstat_w") fn rtFsLstatW(words: int, n: int, out: int): int {
+  let p = wordsPathZ(words, n)
+  if (p == 0) {
+    return 0 - 2
+  }
+  return fillStat(p, out, false)
 }
 
 // `bit_rt_fs_mkdir`: 0 on success, -1 on failure, mode 0o755.
