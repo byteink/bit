@@ -81,10 +81,19 @@ fn xCanonNarrow(b: X64Buf, reg: XReg64, w: Width) {
 //
 // Every selector materializes both operands into scratch registers, computes
 // there, and writes the result back through these. That is more `mov`s than
-// reusing an operand's own register would need, but it is uniform — and the
-// register file is already restricted enough (callee-saved-only across calls)
-// that the extra moves are not where the cost is.
-// ponytail: always route through scratch; tighten if a hot path measures.
+// reusing an operand's own register would need, but it is uniform.
+//
+// This used to add "and the register file is already restricted enough
+// (callee-saved-only across calls) that the extra moves are not where the cost
+// is", with a ponytail note to tighten it if a hot path measured. #3171 removed
+// that premise on the FLOAT side — a function with safepoints now allocates
+// xmm0..xmm13 — and it measured immediately: the round trip through xFScratch1
+// was 38 of the 47 register-to-register `movsd` left in mandelbrot's `main`. So
+// the float RESULT now goes straight into its own register where it has one
+// (xFloatAcc, below); operands are still fetched through the scratch pair, and
+// the integer selectors are untouched, since their file IS still restricted.
+// ponytail: int selectors still route through scratch; revisit if the int file
+// is ever widened the same way.
 
 fn xRegLocOf(cx: XCtx, vreg: int): RegLoc {
   assert(vreg >= 0 && vreg < len(cx.alloc.locations))
@@ -506,13 +515,48 @@ fn xEmitFcmp(cx: XCtx, op: XFCmp, dst: int, lhs: int, rhs: int, width: int) {
   xPutInt(cx, dst, xScratch1())
 }
 
+// The register a selector should compute `vreg`'s value INTO: its own when the
+// allocator gave it one, else `scratch`. Paired with xPutFloat, which then emits
+// nothing at all, since xMovFRR elides a self-move.
+//
+// Writing straight into the destination is safe once every operand has been
+// read, and the reason is worth stating because it is the whole licence for
+// this: the allocator cannot have given `vreg` a register that still holds a
+// live operand. An operand of instruction i has its interval end at or after i
+// (buildIntervals' extendUses), so it has not expired when i's own destination
+// is assigned, and expireClass only frees a register whose interval ended
+// STRICTLY before the frontier. An operand the allocator evicted instead is
+// read back out of xFScratch1/xFScratch2, which are outside the allocatable
+// file entirely (xMaxFloatRegs). So the destination register is never one of
+// the operand registers.
+fn xFloatAcc(cx: XCtx, vreg: int, scratch: XmmReg): XmmReg {
+  let loc = xRegLocOf(cx, vreg)
+  if (loc.isSpill) {
+    return scratch
+  }
+  return cx.floatRegs[loc.index]
+}
+
 // `dst = lhs <op> rhs` for floats.
+//
+// #3171: accumulate in `dst`'s own register when it has one. Routing every
+// result through xFScratch1 was uniform and, while the SysV float file was
+// empty in any function with a safepoint, free — the header above says so, and
+// invites tightening "if a hot path measures". It measured: this was 38 of the
+// 47 register-to-register `movsd` left in mandelbrot's `main`, in the shape
+// `movsd l,xmm14 / mulsd r,xmm14 / movsd xmm14,dst` where two instructions do,
+// or one when dst and l coincide.
 fn xEmitBinaryFloat(cx: XCtx, op: XFArith, dst: int, lhs: int, rhs: int, width: int) {
   let l = xGetFloat(cx, lhs, xFScratch1())
   let r = xGetFloat(cx, rhs, xFScratch2())
-  xMovFRR(cx.buf, xFScratch1(), l, width)
-  xFArithRR(cx.buf, op, xFScratch1(), r, width)
-  xPutFloat(cx, dst, xFScratch1())
+  let acc = xFloatAcc(cx, dst, xFScratch1())
+  // The one thing that would silently corrupt this: writing the accumulator
+  // before both operands have been read out of it. See xFloatAcc for why a
+  // destination register can never be an operand register.
+  assert(acc == xFScratch1() || acc != l && acc != r)
+  xMovFRR(cx.buf, acc, l, width)
+  xFArithRR(cx.buf, op, acc, r, width)
+  xPutFloat(cx, dst, acc)
 }
 
 // `T(x)` numeric conversion (SPEC §12.9). An int operand is first canonicalized
@@ -601,8 +645,11 @@ fn xEmitConstInt(cx: XCtx, dst: int, val: int) {
 // literal's exact IEEE encoding goes into a GPR and then across to an xmm.
 fn xEmitConstFloat(cx: XCtx, dst: int, bits: int, width: int) {
   xMovRI(cx.buf, xScratch1(), bits)
-  xMovXG(cx.buf, xFScratch1(), xScratch1(), width)
-  xPutFloat(cx, dst, xFScratch1())
+  // #3171: materialize into dst's own register when it has one — a constant has
+  // no float operand at all, so nothing can be sitting in it.
+  let acc = xFloatAcc(cx, dst, xFScratch1())
+  xMovXG(cx.buf, acc, xScratch1(), width)
+  xPutFloat(cx, dst, acc)
 }
 
 // `dst = lhs << rhs` / `>> rhs`. `constAmt >= 0` selects the immediate form;
