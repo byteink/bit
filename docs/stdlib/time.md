@@ -238,3 +238,50 @@ fn logLine(ns: int, msg: string) {
   println("${formatRfc3339(ns)} ${msg}")
 }
 ```
+
+## Calendar arithmetic
+
+Every function below takes and returns nanoseconds since the Unix epoch, and
+every operation is UTC.
+
+### `startOfDay(ns: int): int`
+
+The UTC midnight that starts the day containing `ns`. Floors rather than
+truncates, so a negative `ns` still lands on the calendar day it belongs to.
+
+```bit
+import { startOfDay, formatRfc3339 } from "std/time"
+
+fn describe(ns: int) {
+  println(formatRfc3339(startOfDay(ns)))
+}
+```
+
+### `addDays(ns: int, n: int): int`
+
+`ns` shifted by `n` days of exactly 86400000000000 nanoseconds each. `n` may
+be negative.
+
+```bit
+import { addDays } from "std/time"
+
+fn tomorrow(ns: int): int {
+  return addDays(ns, 1)
+}
+```
+
+### `addMonths(ns: int, n: int): int`
+
+`ns` shifted by `n` calendar months, keeping the time-of-day fields
+unchanged. `n` may be negative. The day is clamped to the last valid day of
+the target month rather than overflowing into the next one:
+2026-01-31 plus one month is 2026-02-28, not 2026-03-03 (contrast Go's
+`time.AddDate`, which normalizes and would give 2026-03-03).
+
+```bit
+import { addMonths } from "std/time"
+
+fn nextMonthClamped(ns: int): int {
+  return addMonths(ns, 1)
+}
+```
