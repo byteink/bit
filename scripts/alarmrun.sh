@@ -83,3 +83,54 @@ alarmrun_retry() {
   fi
   return "$rc"
 }
+
+# alarmrun_cap <capture> <cmd...> -- alarmrun that always merges the child's
+# stdout+stderr into <capture> (#3490). ALARMRUN_KEEP_STDERR does not apply
+# here: a capture file IS the case that flag exists to serve, so there is no
+# branch to honor it against.
+#
+# The redirect sits on the `perl` invocation itself (a simple command), not on
+# this function -- so it is performed in perl's forked child, and this shell's
+# own fd 2 is never bound to <capture>. That matters for alarmrun_retry_cap
+# below: when bash reaps a child killed by SIGALRM it writes its own
+# "Alarm clock: 14" job-status note to whatever fd 2 currently is, and a
+# function-scoped `>"$cap" 2>&1` would make that note land inside the
+# comparison payload even when the child emitted zero bytes (#3478).
+alarmrun_cap() {
+  local cap=$1
+  shift
+  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$@" >"$cap" 2>&1
+}
+
+# alarmrun_retry_cap <side> <outfile> <capture> <cmd...> -- alarmrun_retry's
+# sibling for a caller whose own external redirect used to be the sink for
+# BOTH attempts (#3490). Fixes: a stalled first attempt's partial bytes
+# surviving into the retry's compared payload, because the two attempts
+# shared one sink opened once by the caller (#3478).
+#
+# <capture>: truncated before EACH attempt (`>"$cap"` in alarmrun_cap), so the
+# caller reads exactly one attempt's bytes -- never attempt 1's partial output
+# followed by attempt 2's full output. This is the load-bearing half of the
+# fix; the redirect placement in alarmrun_cap is hardening on top of it.
+# <outfile>: same contract as alarmrun_retry -- a build-artifact path removed
+# before each attempt, distinct from <capture>. Pass "" when the command
+# writes no artifact of its own.
+#
+# Requires $TIMEOUT in the caller's scope, exactly like alarmrun_retry. Same
+# 142 contract (142 iff BOTH attempts stalled), same stall note on fd 9.
+#
+# -> rc: 0/nonzero from the command, or 142 iff BOTH attempts stalled.
+alarmrun_retry_cap() {
+  local side=$1 outfile=$2 cap=$3 rc
+  shift 3
+  [ -n "$outfile" ] && rm -f "$outfile"
+  alarmrun_cap "$cap" "$@"
+  rc=$?
+  if [ "$rc" -eq 142 ]; then
+    echo "$side build stalled once (SIGALRM after ${TIMEOUT}s), retrying: $*" >&9
+    [ -n "$outfile" ] && rm -f "$outfile"
+    alarmrun_cap "$cap" "$@"
+    rc=$?
+  fi
+  return "$rc"
+}
