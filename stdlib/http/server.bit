@@ -80,11 +80,18 @@ export fn (s: Server) close() {
   s.listener.close()
 }
 
-// Serve HTTP on `host:port` forever, dispatching every request to `handler` on
-// its own green thread — the idiomatic server. `handler` is an ordinary
-// function value: `listenAndServe("127.0.0.1", 8080, route)`. Returns only on a
-// bind or accept error. For a kernel-chosen port, or to serve a bounded number
-// of requests, drive the `Server`/`accept`/`respond` API yourself instead.
+// Serve HTTP forever on an already-bound `s`, dispatching every request to
+// `handler` on its own green thread. This is the loop `listenAndServe` runs
+// after binding; call it directly to learn the bound port before serving
+// starts — `serve(host, port)` and `listenAndServe(host, port, handler)` bind
+// and loop in one call, so a kernel-chosen port (`serve(host, 0)`) is
+// otherwise unreachable:
+//
+//   let s = serve(host, 0)?
+//   let boundPort = s.port()?   // hand this to a test's client
+//   listenAndServeOn(s, handler)?
+//
+// Returns only on an accept error.
 //
 // The accept loop only accepts — it does not read. `readMessage` (headers and
 // body both) runs inside the spawned `serveOne`, on that connection's own
@@ -96,12 +103,23 @@ export fn (s: Server) close() {
 // connected, or arriving after, was ever answered. Now that connection's own
 // read stalls on its own thread; every other accept and every other read
 // proceeds.
-export fn listenAndServe(host: string, port: int, handler: (Request) => Response): ()! {
-  let s = serve(host, port)?
+export fn listenAndServeOn(s: Server, handler: (Request) => Response): ()! {
   while (true) {
     let c = s.listener.accept()?
     spawn serveOne(netStream{ conn: c }, handler, 0)
   }
+}
+
+// Bind `host:port` and serve HTTP forever, dispatching every request to
+// `handler` on its own green thread — the idiomatic server. `handler` is an
+// ordinary function value: `listenAndServe("127.0.0.1", 8080, route)`. Returns
+// only on a bind or accept error. For a kernel-chosen port, or to serve a
+// bounded number of requests, use `serve` and `listenAndServeOn` instead — see
+// `listenAndServeOn`'s doc comment — or drive the `Server`/`accept`/`respond`
+// API yourself.
+export fn listenAndServe(host: string, port: int, handler: (Request) => Response): ()! {
+  let s = serve(host, port)?
+  listenAndServeOn(s, handler)?
 }
 
 // Read one request off `s`, answer it with `handler`, and close. On the calling
@@ -126,15 +144,44 @@ fn answer(s: byteStream, handler: (Request) => Response, altPort: int): ()! {
   s.shut()
 }
 
-// Serve HTTPS on `host:port` forever with the certificate chain `certPem` and
-// matching private key `keyPem` (both PEM), dispatching every request to
-// `handler` on its own green thread — the TLS mirror of `listenAndServe`. ALPN
-// offers `h2` then `http/1.1`, so a client that negotiates HTTP/2 is served over
-// the `std/http2` engine and any other over HTTP/1.1; `handler` is the same either
-// way. Every response also carries an `Alt-Svc: h3=":<port>"` header (RFC 7838)
-// advertising an HTTP/3 endpoint on the same port number over UDP, so a client can
-// discover it and upgrade a later request — pair `serveTls` with `serveH3` on the
-// same `port`. Returns only on a bind, accept, or handshake error.
+// Serve HTTPS forever on an already-bound `l`, dispatching every request to
+// `handler` on its own green thread. This is the loop `serveTls` runs after
+// binding; call it directly to learn the bound port before serving starts, the
+// same way `listenAndServeOn` composes with `serve`:
+//
+//   let l = listen(host, 0, cfg)?   // std/tls's listen, port 0 for a kernel-chosen one
+//   let boundPort = l.port()?
+//   serveTlsOn(l, handler)?
+//
+// Every response carries an `Alt-Svc: h3=":<port>"` header (RFC 7838)
+// advertising an HTTP/3 endpoint on `l`'s own bound port over UDP, so a client
+// can discover it and upgrade a later request — pair with `serveH3` on that
+// port. Returns only on an accept or handshake error.
+export fn serveTlsOn(l: TlsListener, handler: (Request) => Response): ()! {
+  let altPort = l.port()?
+  while (true) {
+    // A per-connection failure (a bad or rejected TLS handshake — e.g. a client
+    // whose ALPN offer shares nothing with ours, which RFC 7301 §3.2 makes us
+    // abort) must drop THAT connection, never the listener: propagating it would
+    // let one malformed client take down the whole server. This does not hot-spin
+    // — the next iteration blocks in the TCP accept until a real connection
+    // arrives. A genuinely dead listener socket is the one case this can't tell
+    // apart; that is a fatal, rare condition, tracked separately.
+    let conn = l.accept() catch _ {
+      continue
+    }
+    spawn serveTlsConn(conn, handler, altPort)
+  }
+}
+
+// Bind `host:port` and serve HTTPS forever with the certificate chain
+// `certPem` and matching private key `keyPem` (both PEM), dispatching every
+// request to `handler` on its own green thread — the TLS mirror of
+// `listenAndServe`. ALPN offers `h2` then `http/1.1`, so a client that
+// negotiates HTTP/2 is served over the `std/http2` engine and any other over
+// HTTP/1.1; `handler` is the same either way. Returns only on a bind, accept,
+// or handshake error. For a kernel-chosen port, use `std/tls`'s `listen` and
+// `serveTlsOn` instead — see `serveTlsOn`'s doc comment.
 export fn serveTls(
   host: string,
   port: int,
@@ -147,19 +194,7 @@ export fn serveTls(
   cfg.keyPem = keyPem
   cfg.alpn = ["h2", "http/1.1"]
   let l = tlsListen(host, port, cfg)?
-  while (true) {
-    // A per-connection failure (a bad or rejected TLS handshake — e.g. a client
-    // whose ALPN offer shares nothing with ours, which RFC 7301 §3.2 makes us
-    // abort) must drop THAT connection, never the listener: propagating it would
-    // let one malformed client take down the whole server. This does not hot-spin
-    // — the next iteration blocks in the TCP accept until a real connection
-    // arrives. A genuinely dead listener socket is the one case this can't tell
-    // apart; that is a fatal, rare condition, tracked separately.
-    let conn = l.accept() catch _ {
-      continue
-    }
-    spawn serveTlsConn(conn, handler, port)
-  }
+  serveTlsOn(l, handler)?
 }
 
 // The Alt-Svc advertisement (RFC 7838) a TLS server appends to every response:

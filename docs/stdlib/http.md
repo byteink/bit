@@ -128,13 +128,23 @@ Stops listening.
 
 ### `listenAndServe(host: string, port: int, handler: (Request) => Response): ()!`
 
-Serves HTTP on `host:port` forever, dispatching every request to `handler` on its
-own green thread - the idiomatic server. `handler` is an ordinary function value.
-Returns only on a bind or accept error. For a kernel-chosen port, or to serve a
-bounded number of requests, drive `serve`/`accept`/`respond` yourself.
+Binds `host:port` and serves HTTP forever, dispatching every request to
+`handler` on its own green thread - the idiomatic server. `handler` is an
+ordinary function value. Returns only on a bind or accept error. For a
+kernel-chosen port, use `serve` and `listenAndServeOn`; to serve a bounded
+number of requests, drive `serve`/`accept`/`respond` yourself.
+
+### `listenAndServeOn(s: Server, handler: (Request) => Response): ()!`
+
+Serves HTTP forever on an already-bound `s`, dispatching every request to
+`handler` on its own green thread. This is the loop `listenAndServe` runs
+after binding; call it directly to learn the bound port before serving
+starts - the only way to combine a kernel-chosen port (`serve(host, 0)`) with
+the idiomatic serve loop, which is what makes the server testable without a
+hardcoded port. Returns only on an accept error.
 
 ```bit
-import { serve, listenAndServe, ok, respond, Server, Exchange, Request, Response } from "std/http"
+import { serve, listenAndServe, listenAndServeOn, ok, respond, Server, Exchange, Request, Response } from "std/http"
 import { hasPrefix } from "std/strings"
 
 // A request handler is just a function value.
@@ -151,7 +161,22 @@ fn main() {
   }
 }
 
-// Or drive the loop yourself for a kernel-chosen port or bounded serving.
+// A kernel-chosen port, learned before the accept loop starts - the shape a
+// test uses to start a server and then connect to it, race-free.
+fn runOnEphemeralPort(): int! {
+  let s = serve("127.0.0.1", 0)?
+  let port = s.port()?
+  spawn serveForever(s)
+  return port
+}
+
+fn serveForever(s: Server) {
+  listenAndServeOn(s, route) catch e {
+    print("server failed: ${e.message()}\n")
+  }
+}
+
+// Or drive the loop yourself for bounded serving.
 // `read()` runs on the spawned thread, not the accept loop, so one slow
 // client cannot delay anyone else's accept or read.
 fn handle(ex: Exchange): ()! {
@@ -260,11 +285,22 @@ POST `body` to an https `url` with an explicit `std/tls` `TlsConfig`.
 
 ### `serveTls(host, port, certPem, keyPem, handler): ()!`
 
-The TLS mirror of `listenAndServe`: serves HTTPS on `host:port` forever with the
-certificate chain `certPem` and matching private key `keyPem` (both PEM),
-dispatching each request to `handler` on its own green thread. Returns only on a
-bind error; a single connection's failed or rejected handshake drops that
-connection and the server keeps serving.
+The TLS mirror of `listenAndServe`: binds `host:port` and serves HTTPS forever
+with the certificate chain `certPem` and matching private key `keyPem` (both
+PEM), dispatching each request to `handler` on its own green thread. Returns
+only on a bind error; a single connection's failed or rejected handshake drops
+that connection and the server keeps serving. For a kernel-chosen port, use
+`std/tls`'s `listen` and `serveTlsOn` instead.
+
+### `serveTlsOn(l: TlsListener, handler: (Request) => Response): ()!`
+
+The TLS mirror of `listenAndServeOn`: serves HTTPS forever on an already-bound
+`l` (`std/tls`'s `Listener`, from `listen(host, port, config)`), dispatching
+each request to `handler` on its own green thread. Call it directly to learn
+the bound port before serving starts, the same way `listenAndServeOn` composes
+with `serve`. Every response carries an `Alt-Svc: h3=":<port>"` header
+advertising `l`'s own bound port, so this stays correct for a kernel-chosen
+port too. Returns only on an accept error.
 
 This is also the HTTP/2 server: `serveTls` offers ALPN `["h2","http/1.1"]`, so a
 client that negotiates `h2` is served over HTTP/2 and everything else over
@@ -278,8 +314,8 @@ downgraded to HTTP/1.1 - so a client that offers only `h2` is either served over
 HTTP/2 or refused, never quietly served over something it did not ask for.
 
 ```bit
-import { get, getTls, serveTls, ok, respond, Request, Response } from "std/http"
-import { newTlsConfig, newTrustStore } from "std/tls"
+import { get, getTls, serveTls, serveTlsOn, ok, respond, Request, Response } from "std/http"
+import { newTlsConfig, newTrustStore, emptyTrustStore, TlsListener, listen as tlsListen } from "std/tls"
 
 // An https GET verified against the default (system/bundled) roots.
 fn fetchStatus(url: string): int! {
@@ -303,6 +339,24 @@ fn route(req: Request): Response {
 
 fn serveSecure(certPem: string, keyPem: string) {
   serveTls("127.0.0.1", 8443, certPem, keyPem, route) catch e {
+    print("server failed: ${e.message()}\n")
+  }
+}
+
+// A kernel-chosen HTTPS port, learned before the accept loop starts.
+fn runTlsOnEphemeralPort(certPem: string, keyPem: string): int! {
+  let cfg = newTlsConfig(emptyTrustStore())
+  cfg.certPem = certPem
+  cfg.keyPem = keyPem
+  cfg.alpn = ["h2", "http/1.1"]
+  let l = tlsListen("127.0.0.1", 0, cfg)?
+  let port = l.port()?
+  spawn serveTlsForever(l)
+  return port
+}
+
+fn serveTlsForever(l: TlsListener) {
+  serveTlsOn(l, route) catch e {
     print("server failed: ${e.message()}\n")
   }
 }
