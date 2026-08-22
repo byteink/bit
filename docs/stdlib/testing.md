@@ -201,10 +201,6 @@ but the assertion is inverted: it passes when that process dies by a panic and
 fails when it returns normally instead. No `ok`/`notOk`/`failNow` call is
 needed inside it; the panic itself is the assertion.
 
-**Not yet implemented.** `bit test` today discovers only the `test_` prefix; a
-`testpanic_...` function is not run as a test — it is treated like any other
-unreferenced function.
-
 ```bit
 struct Stack {
   items: []i64
