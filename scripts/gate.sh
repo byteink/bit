@@ -59,12 +59,25 @@
 #      quieter.
 #
 # BUCKETS: a change confined to exactly one of compiler/, runtime/,
-# tests/cases/, examples/, stdlib/, docs/**/*.md, or spec/SPEC.md runs only
-# that area's minimal steps. A change touching any OTHER path (anything
-# unlisted below), or spanning MORE THAN ONE of those seven areas, is
+# tests/cases/, examples/, stdlib/, pkg/, docs/**/*.md, or spec/SPEC.md runs
+# only that area's minimal steps. A change touching any OTHER path (anything
+# unlisted below), or spanning MORE THAN ONE of those eight areas, is
 # ambiguous and always runs the full `./make test` — never a partial skip —
 # EXCEPT the narrow stdlib+docs pairing bucket `stdlibdocs` (#3055, see the
 # "THREE NARROW EXCEPTIONS" block below).
+#
+# `pkg/` IS THE ONE BUCKET WHOSE STEP LIST IS NOT ARGV/ENV INTERSECTION
+# (#3271, epic: first-party packages under pkg/<name>/). `test-packages`'s own
+# argv is `runArgs("tests/bit/packagesgate.bit")` — no `pkg/` path anywhere in
+# gates.bit's table for it to intersect — so it is added to the `pkg`,
+# `selfhost`, `runtime`, `stdlib`, `stdlibdocs` and `full` buckets BY HAND,
+# for the asymmetry bitlang-ws/CLAUDE.md's "First-party packages" section
+# states as the whole design: nothing in compiler/**, runtime/**, stdlib/** or
+# tools/build/** imports a package, so a pkg/**-only diff can never break the
+# language and every OTHER bucket is provably irrelevant to it — but the
+# language CAN break a package, so any bucket that can change compiler/
+# runtime/stdlib behaviour must run this gate too, or a language change could
+# silently break every package with nothing here catching it.
 #
 # EVERY BUCKET RUNS EVERY GATE WHOSE OWN DECLARED FILE SET (its `argv` or an
 # `env` entry in tools/build/gates.bit) INTERSECTS THAT BUCKET'S PATHS, not
@@ -237,6 +250,7 @@ has_runtime=0
 has_testcases=0
 has_examples=0
 has_stdlib=0
+has_pkg=0
 has_docs=0
 has_spec=0
 has_testsbit=0
@@ -669,6 +683,11 @@ while IFS= read -r f; do
       has_stdlib=1
       stdlib_files="${stdlib_files:+${stdlib_files} }${f}"
       ;;
+    # First-party packages (#3271) — a leaf by design (bitlang-ws/CLAUDE.md,
+    # "First-party packages"): nothing in the other seven areas ever imports
+    # anything under pkg/, so a pkg/**-only diff can only ever need this
+    # bucket's own steps.
+    pkg/*) has_pkg=1 ;;
     # tests/imports/** joins tests/bit/** here (#2825), and tests/stress/**
     # joins both (#2977): all three are fixture-only paths whose gate is known
     # by name, never by path prefix, so they share has_testsbit/testsbit_list
@@ -720,6 +739,9 @@ fi
 if [ "${has_stdlib}" -eq 1 ]; then
   if [ -n "${touched_list}" ]; then touched_list="${touched_list}, stdlib"; else touched_list="stdlib"; fi
 fi
+if [ "${has_pkg}" -eq 1 ]; then
+  if [ -n "${touched_list}" ]; then touched_list="${touched_list}, pkg"; else touched_list="pkg"; fi
+fi
 if [ "${has_docs}" -eq 1 ]; then
   if [ -n "${touched_list}" ]; then touched_list="${touched_list}, docs"; else touched_list="docs"; fi
 fi
@@ -728,7 +750,7 @@ if [ "${has_spec}" -eq 1 ]; then
 fi
 
 # has_noop is deliberately excluded here — see its case arm above.
-bucket_count=$((has_selfhost + has_runtime + has_testcases + has_examples + has_stdlib + has_docs + has_spec))
+bucket_count=$((has_selfhost + has_runtime + has_testcases + has_examples + has_stdlib + has_pkg + has_docs + has_spec))
 
 # Computed ONCE, ahead of bucket selection, regardless of whether one of the
 # five areas also fired (#2510). Two consequences fall out of computing it
@@ -786,6 +808,9 @@ elif [ "${has_examples}" -eq 1 ]; then
 elif [ "${has_stdlib}" -eq 1 ]; then
   BUCKET="stdlib"
   REASON="only stdlib/** changed"
+elif [ "${has_pkg}" -eq 1 ]; then
+  BUCKET="pkg"
+  REASON="only pkg/** changed"
 elif [ "${has_docs}" -eq 1 ]; then
   BUCKET="docs"
   REASON="only docs/**/*.md changed (${docs_list})"
@@ -902,9 +927,10 @@ bucket_scripts() {
     examples)
       BUCKET_POST="scripts/selfhost-diffexamples.sh"
       ;;
-    # spec (test-spec, tests/bit/spec/) has no differential script — same
-    # shape as testcases/stdlib/docs/testsbit above, which also fall through
-    # with both empty.
+    # spec and pkg (test-spec/test-packages, tests/bit/spec//tests/bit/
+    # packagesgate.bit) have no differential script — same shape as
+    # testcases/stdlib/docs/testsbit above, which also fall through with
+    # both empty.
     full)
       # THE UNION OF EVERY BUCKET ABOVE, and it must stay that way — enforced
       # below, not merely intended.
@@ -916,7 +942,11 @@ bucket_scripts() {
 
 case "${BUCKET}" in
   full)
-    BUILD_STEPS=(test)
+    # test-packages (#3271) is added explicitly: it is registered in
+    # tools/build/defs.bit's `coreSteps()`, deliberately not `gateSteps()`
+    # (same reason as test-differentials beside it — see that Step{}'s own
+    # comment), so plain `test` never reaches it on its own.
+    BUILD_STEPS=(test test-packages)
     ;;
   selfhost)
     # test-lint-filelines (its own harness: dirs = ["compiler", "runtime",
@@ -931,7 +961,10 @@ case "${BUCKET}" in
     # rejects a listed step that no longer exists; it has no way to notice a
     # relevant step that was never listed, which is how this stayed missing
     # for as long as it did.
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck)
+    # test-packages (#3271) too: nothing under pkg/ imports compiler/**, but
+    # compiler/** can break every package, so a compiler/**-only change owes
+    # it the same way `full` above does.
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did
@@ -961,7 +994,9 @@ case "${BUCKET}" in
     # working-loop gate stops paying for it. test-stress-exclusive (2
     # programs, real elapsed-time asserts, 0m8s) stays here: it is fast and
     # was never the problem.
-    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime)
+    # test-packages (#3271) too, same reason as the selfhost bucket above:
+    # runtime/** can break every package even though no package imports it.
+    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages)
     ;;
   testcases)
     # test-fuzz mutates the real tests/cases corpus (BIT_FUZZ_CASES=
@@ -986,7 +1021,10 @@ case "${BUCKET}" in
     # stdlib/tls/server.bit and this bucket stayed green). test-lint-filelines
     # scans stdlib/ too (dirs = ["compiler", "runtime", "stdlib", "tests/stress",
     # "examples", "tests/bit", "tests/imports"] in its own harness).
-    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines)
+    # test-packages (#3271) too, same reason as the selfhost/runtime buckets
+    # above: stdlib/** can break every package even though no package
+    # imports it directly by name — every package still builds against it.
+    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages)
     ;;
   docs)
     # test-stdlib-docs reads docs/stdlib/*.md directly (BIT_DOCS_ROOT — it
@@ -999,8 +1037,18 @@ case "${BUCKET}" in
     # The union of the `stdlib` and `docs` buckets' own steps just above
     # (#3055) — a stdlib export's page can be wrong in either direction (a
     # stale heading, or a missing one) and both buckets' own checks are
-    # needed to catch either.
-    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-docs)
+    # needed to catch either. Carries `stdlib`'s own test-packages (#3271)
+    # forward for the same reason.
+    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-docs test-packages)
+    ;;
+  pkg)
+    # #3271. THE ONE BUCKET that runs test-packages and NOTHING else — see
+    # the header comment block's "pkg/ IS THE ONE BUCKET..." paragraph and
+    # tools/build/defs.bit's test-packages Step{} comment for the asymmetry
+    # this rests on: a pkg/**-only diff can never reach compiler/, runtime/
+    # or stdlib/, so every compiler gate is provably irrelevant here, not
+    # merely expensive.
+    BUILD_STEPS=(test-packages)
     ;;
   spec)
     BUILD_STEPS=(test-spec)
@@ -1056,7 +1104,7 @@ esac
 # a renamed script is the #1593 class of silent hole.
 bucket_scripts full
 FULL_SCRIPTS=" ${BUCKET_PRE} ${BUCKET_POST} "
-for b in full selfhost runtime testcases examples stdlib docs stdlibdocs spec testsbit; do
+for b in full selfhost runtime testcases examples stdlib pkg docs stdlibdocs spec testsbit; do
   bucket_scripts "${b}"
   for s in ${BUCKET_PRE} ${BUCKET_POST}; do
     [ -f "${s}" ] || {
