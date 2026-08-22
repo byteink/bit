@@ -10,7 +10,63 @@ so there is nothing separate to squat or reserve. A hosted registry is future
 scope layered on top of the same manifest and lock shape, not a prerequisite
 for using packages today.
 
-## `bit.json`: the `dependencies` field
+## `bit init`
+
+```
+bit init [name]
+```
+
+Writes a minimal `bit.json` in the current directory - `{"dependencies": {}}`,
+or, with `[name]`, `{"name": "<name>", "dependencies": {}}` - and exits 0.
+Fails, leaving the directory untouched, if a `bit.json` already exists there.
+
+```console
+$ bit init
+bit init: wrote bit.json
+$ bit init
+bit init: bit.json already exists — refusing to overwrite
+```
+
+**Bit's fs ABI has no `getcwd`** (`compiler/buildout.bit`'s own comment on
+`manifestProjectName`), so `bit init` has no way to read the directory it is
+running in and default `[name]` to it, the way `npm init -y` derives one from
+`path.basename(process.cwd())`. Omit `[name]` and the manifest simply carries
+no `"name"` key - see below for the one thing that key actually does.
+
+## `bit.json`
+
+`bit.json` is JSONC (comments and trailing commas allowed when read by `bit
+add`/`bit up`/`bit remove`; see the caveat below). Every key besides
+`dependencies` is optional, and an unrecognized key is accepted and ignored
+silently - nothing rejects a typo.
+
+### `name`
+
+A plain string, read in exactly one place: `bit build <dir>` (a
+project-directory build, not a single-file one) names its default output
+after it (`compiler/buildout.bit:81`, `manifestProjectName`). With no `name`
+key, that default falls back to the directory argument's own last path
+component instead. `bit init [name]` is the only way to set it from the CLI;
+`bit add`/`bit up`/`bit remove` never touch it.
+
+This is also the one field where the two JSON readers in this codebase
+disagree: `bit build`'s lookup goes through `readManifest`
+(`compiler/pmfetchresolve.bit:687`), which parses **strict** JSON, not JSONC -
+a `bit.json` with a `name` key that reads fine for `bit add`/`bit up` (JSONC,
+via `jsoncParse`) can still silently lose its `name` for `bit build`'s
+purposes if the file also carries a comment or a trailing comma, degrading to
+"no name" rather than failing loudly. `bit init` never writes either, so a
+manifest it created is immune to this; a hand-edited one carrying comments is
+not.
+
+There is no `version` field. Nothing in the compiler reads a `"version"` key
+anywhere in `bit.json` - it is not wired to anything, including the ref a
+dependency resolves to (that comes from the dependency *spec string* itself,
+`gitHost/owner/repo@ref`, not from any field named `version`). A `"version"`
+key some other tool's manifest convention might expect is accepted like any
+other unrecognized key: parsed, kept, never read.
+
+### `dependencies`
 
 ```
 dependency_map   = '"dependencies"' ':' '{' [ dependency_entry { ',' dependency_entry } ] '}' .
@@ -38,11 +94,26 @@ Each value is `gitHost/owner/repo@ref`, and `ref` is exactly one of:
 wildcard spelling are rejected at parse time - a dependency names one exact
 ref, never a range for a resolver to pick from.
 
-`bit.json` is JSONC (comments and trailing commas allowed); `bit add`/`bit
-up`/`bit remove` rewrite only the one entry that changed, through a
-comment-preserving edit layer, never a blind parse-and-reserialize. They add
-*to* an existing project - a bare `{}` is enough to start from - they do not
-scaffold a new `bit.json`.
+**The map key is the import name, not a label.** `import { Frame } from
+"quicwire"` resolves `"quicwire"` against `bit.lock`'s top-level entries
+(`compiler/projectpkg.bit`'s `resolvePackageImport`), and `bit.lock` is keyed
+by exactly this map's key - never by the repo name inside the value string,
+except that `bit add` always *picks* the key for you as the repo's (or
+vanity path's, or local path's) last segment
+(`compiler/pmcli.bit:322/117/87`), with no flag to override it. Hand-edit the
+key to something else and run `bit up` (which reads every key straight out of
+`bit.json`, `compiler/pmcliup.bit:174-202`'s three `upsertLockEntry(entries,
+d.name, ...)` call sites) and the new key is what locks and what your
+`import` must then name - it is not silently ignored, but `bit add` alone
+will never write it for you.
+
+`bit.json` is JSONC (comments and trailing commas allowed when read through
+`bit up`'s `jsoncParse` - see the `name` field's caveat above for the one
+reader that is stricter); `bit add`/`bit up`/`bit remove` rewrite only the one
+entry that changed, through a comment-preserving edit layer, never a blind
+parse-and-reserialize. They add *to* an existing project - a bare `{}` is
+enough to start from - they do not scaffold a new `bit.json`; `bit init`
+(above) does.
 
 ## `bit add`
 
