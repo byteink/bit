@@ -331,3 +331,24 @@ fn priceLabel(cents: f64): string {
   return "$" + formatFloat(cents, 2)
 }
 ```
+
+### `groupDigits(s: string, sep: string): string`
+
+Inserts `sep` between groups of three digits in the integer part of `s`
+(the text before the first `.`, or the whole string when there is none),
+counted from the right: `groupDigits("1234567", ",")` is `"1,234,567"`.
+Text at and after the `.` is copied unchanged.
+
+A leading `-` or `+` sign is kept out of the grouping
+(`groupDigits("-1234.50", ",")` is `"-1,234.50"`). An integer part of three
+digits or fewer, an empty `s`, or an empty `sep` is returned unchanged. If
+any character of the integer part after the sign is not an ASCII digit, `s`
+is returned unchanged rather than grouping a guess at digit boundaries.
+
+```bit
+import { formatFloat, groupDigits } from "std/strings"
+
+fn moneyLabel(cents: f64): string {
+  return "$" + groupDigits(formatFloat(cents, 2), ",")
+}
+```
