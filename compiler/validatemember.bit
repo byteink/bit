@@ -91,6 +91,89 @@ fn vClosestMethodName(c: Checker, recvTy: int, wanted: string): string {
   return best
 }
 
+// True for the six untyped-constant kinds a bare LITERAL receiver types as
+// (`1.5`, `"a"`, `(5)` — checkExprType maps each literal tag directly to one
+// of these, never to a concrete Prim). #2641's alias methods resolve onto the
+// underlying PRIM's own TypeId (`declTypeOf`), never onto this anonymous
+// untyped-constant one, so no method or field table entry can ever key
+// against it — admitting these kinds here can only ever REJECT, never
+// false-positive on a real member (#3444).
+fn vIsUntypedConstKind(kind: TypeKind): bool {
+  return kind == TypeKind.UntypedInt || kind == TypeKind.UntypedFloat ||
+    kind == TypeKind.UntypedRune || kind == TypeKind.UntypedBool ||
+    kind == TypeKind.UntypedString || kind == TypeKind.UntypedNil
+}
+
+// Is `kind` a shape `vMember` can safely judge by ABSENCE — Struct, Interface
+// or Prim (#2641), or a bare literal's own untyped-constant kind (#3444)?
+// Split out of `vMember` to keep that function's branch count under the
+// complexity limit; every other kind reaches its members exclusively through
+// BUILTIN methods the tables below do not model, so widening past these would
+// false-positive.
+fn vMemberJudgeableKind(kind: TypeKind): bool {
+  return kind == TypeKind.Struct || kind == TypeKind.Interface || kind == TypeKind.Prim ||
+    vIsUntypedConstKind(kind)
+}
+
+// Is `recv`'s base a bare TYPE NAME rather than a value — `Color` in
+// `Color.Red`? `checkMember` resolves that access separately; `vMember` must
+// not judge it as a field/method lookup. Split out to keep `vMember`'s branch
+// count under the complexity limit (#3444).
+fn vIsTypeNameRef(c: Checker, recv: int): bool {
+  return typeNodeName(c, recv) != "" && userTypeLookup(c, typeNodeName(c, recv)) != 0
+}
+
+// `fs.readFile` / `fs.bogus`: `recv` is a namespace-import alias, not a
+// value, so it is never judged as a field/method lookup — but unlike a type
+// name, a namespace has a concrete export table (every entry
+// `bindNamespaceImport` copied into `c.importedFrom` under "alias.name").
+// Presence there is exactly the test the resolver already runs for a bad
+// NAMED import (`import { bogus } from "std/fs"`, E0046) — a namespace
+// member is simply the same test deferred to its use site, since the
+// resolver cannot see which members a wildcard import will ever reach for.
+// Guarded on `qn != ""`: an import whose path itself failed to resolve never
+// populates `c.namespaces`, and that failure already has its own E0044/E0045
+// diagnostic — reporting E0046 on top would be a second, misleading error
+// about the same missing module. Split out of `vMember` to keep that
+// function's branch count under the complexity limit (#3444).
+fn vCheckNamespaceImportMember(c: Checker, node: int, kids: []int) {
+  let qn = nsQualifiedName(c, node)
+  if (qn == "") {
+    return
+  }
+  let (_, ok) = c.importedFrom[qn]
+  if (ok) {
+    return
+  }
+  let mn = getNode(c.tree, kids[1])
+  let mname = c.source[mn.span.start:mn.span.end]
+  report(c.diags, ecUnexportedName, vSpan(c, kids[1]),
+    "'${mname}' is not exported by this module",
+    "add 'export' to its declaration in the source module, or check the spelling")
+}
+
+// Are `structFields`/`methodResults`/`methodSigs` PRESENT for `key`, whatever
+// they map to? PRESENCE, not a non-zero type — a member whose own type failed
+// to resolve (`cipher: AesCipher` when the module declaring AesCipher is not
+// loaded, which is every single-file check of a multi-file stdlib module) is
+// recorded with type 0, which a `!= 0` lookup cannot tell apart from "no such
+// member". That read turned a cascade into 13 invented E0057s across
+// stdlib/crypto and tls. Split out of `vMember` to keep that function's
+// branch count under the complexity limit (#3444).
+fn vHasKnownMember(c: Checker, key: string): bool {
+  return vHasMember(c.ctx.structFields, key) || vHasMember(c.ctx.methodResults, key) ||
+    vHasMember(c.ctx.methodSigs, key)
+}
+
+// Is `rt` unresolved (0), mentioning `invalid`, or carrying an unbound type
+// param — a receiver type `vMember` must not judge at all, rather than reject?
+// The seed dispatches a type param through its constraint; a template body is
+// re-checked per monomorphization. Split out of `vMember` to keep that
+// function's branch count under the complexity limit (#3444).
+fn vRecvTypeUnjudgeable(c: Checker, rt: int): bool {
+  return rt == 0 || vMentionsInvalid(c, rt, 0) || vHasTypeParam(c, rt, 0)
+}
+
 // Emits E0057 when `recv.name` is neither a field of the receiver nor a method
 // on it.
 //
@@ -100,7 +183,7 @@ fn vClosestMethodName(c: Checker, recvTy: int, wanted: string): string {
 //   - an unresolved receiver (0), one mentioning `invalid`, or one carrying an
 //     unbound type param is skipped (the seed dispatches a type param through
 //     its constraint; a template body is re-checked per monomorphization);
-//   - a receiver that is an enum TYPE name is not a value at all —
+//   - a receiver that is a bare TYPE name is not a value at all —
 //     `Color.Red` is resolved elsewhere and carries its own diagnostic (E0057
 //     unknown variant);
 //   - a receiver that is a MODULE NAMESPACE (`fs` in `fs.readFile`) is judged
@@ -113,41 +196,19 @@ fn vClosestMethodName(c: Checker, recvTy: int, wanted: string): string {
 //     type-alias receiver (`type Meters = i64`, SPEC §10.4), which resolve
 //     transparently onto the primitive's own TypeId (declTypeOf) and land in
 //     the same tables `methodRecvType`/`vHasMember` already check below —
-//     #2641. Every other kind (slice, map, chan, fallible, func) still
+//     #2641. A bare LITERAL receiver (`1.5.zzz`, `"a".zzz`) reaches the same
+//     judgment through its own untyped-constant kind (`vIsUntypedConstKind`)
+//     — #3444. Every other kind (slice, map, chan, fallible, func) still
 //     reaches members exclusively through BUILTIN methods the tables do not
-//     model, so widening past Prim would false-positive.
+//     model, so widening further would false-positive.
 fn vMember(c: Checker, node: int) {
   let kids = kidsOf(c.tree, node) // [recv, name]
   let recv = kids[0]
-  // `Enum.Variant`: the base names a TYPE, not a value. `checkMember` resolves
-  // those separately.
-  if (typeNodeName(c, recv) != "" && userTypeLookup(c, typeNodeName(c, recv)) != 0) {
+  if (vIsTypeNameRef(c, recv)) {
     return
   }
-  // `fs.readFile` / `fs.bogus`: the base names a namespace import, not a
-  // value, so it is never judged as a field/method lookup below — but unlike
-  // a type name, a namespace has a concrete export table (every entry
-  // `bindNamespaceImport` copied into `c.importedFrom` under "alias.name").
-  // Presence there is exactly the test the resolver already runs for a bad
-  // NAMED import (`import { bogus } from "std/fs"`, E0046) — a namespace
-  // member is simply the same test deferred to its use site, since the
-  // resolver cannot see which members a wildcard import will ever reach for.
-  // Guarded on `qn != ""`: an import whose path itself failed to resolve
-  // never populates `c.namespaces`, and that failure already has its own
-  // E0044/E0045 diagnostic — reporting E0046 on top would be a second,
-  // misleading error about the same missing module.
   if (vIsNamespaceImportRef(c, recv)) {
-    let qn = nsQualifiedName(c, node)
-    if (qn != "") {
-      let (_, ok) = c.importedFrom[qn]
-      if (!ok) {
-        let mn = getNode(c.tree, kids[1])
-        let mname = c.source[mn.span.start:mn.span.end]
-        report(c.diags, ecUnexportedName, vSpan(c, kids[1]),
-          "'${mname}' is not exported by this module",
-          "add 'export' to its declaration in the source module, or check the spelling")
-      }
-    }
+    vCheckNamespaceImportMember(c, node, kids)
     return
   }
   if (vIsNamespaceRef(c, recv)) {
@@ -157,23 +218,17 @@ fn vMember(c: Checker, node: int) {
     return
   }
   let rt = checkExprType(c, recv)
-  if (rt == 0 || vMentionsInvalid(c, rt, 0) || vHasTypeParam(c, rt, 0)) {
+  if (vRecvTypeUnjudgeable(c, rt)) {
     return
   }
   let kind = c.ctx.types[rt].kind
-  if (kind != TypeKind.Struct && kind != TypeKind.Interface && kind != TypeKind.Prim) {
+  if (!vMemberJudgeableKind(kind)) {
     return
   }
   let mn = getNode(c.tree, kids[1])
   let mname = c.source[mn.span.start:mn.span.end]
   let key = "${methodRecvType(c, rt)}." + mname
-  // PRESENCE, not a non-zero type. A member whose own type failed to resolve —
-  // `cipher: AesCipher` when the module declaring AesCipher is not loaded, which
-  // is every single-file check of a multi-file stdlib module — is recorded with
-  // type 0, which a `!= 0` lookup cannot tell apart from "no such member". That
-  // read turned a cascade into 13 invented E0057s across stdlib/crypto and tls.
-  if (vHasMember(c.ctx.structFields, key) || vHasMember(c.ctx.methodResults, key) ||
-    vHasMember(c.ctx.methodSigs, key)) {
+  if (vHasKnownMember(c, key)) {
     return
   }
   let hint = vClosestMethodName(c, methodRecvType(c, rt), mname)
@@ -213,10 +268,26 @@ fn vDeclRooted(c: Checker, node: int, depth: int): bool {
   if (t == Tag.CompositeLit || t == Tag.TypeAssert) {
     return true
   }
-  if (t == Tag.Member || t == Tag.Index || t == Tag.Call || t == Tag.TryExpr) {
+  // A literal's type comes directly from its own tag (checkExprType), never
+  // through the flat-env fallback this guard exists to distrust — so it is
+  // always trustworthy as a receiver (#3444). `isLeafTag` (ast.bit) already
+  // enumerates exactly Ident plus every literal tag; Ident is unreachable
+  // here (handled above), so this admits only the literals.
+  if (isLeafTag(t)) {
+    return true
+  }
+  if (vChainReceiverTag(t)) {
     return vDeclRooted(c, kidsOf(c.tree, node)[0], depth + 1)
   }
   return false
+}
+
+// Is `t` a node kind whose validity as a receiver is decided by its OWN base
+// (element 0 of its kids) — a chained member/index/call/try — rather than by
+// its own tag? Split out of `vDeclRooted` to keep that function's branch
+// count under the complexity limit (#3444).
+fn vChainReceiverTag(t: Tag): bool {
+  return t == Tag.Member || t == Tag.Index || t == Tag.Call || t == Tag.TryExpr
 }
 
 // `node`'s resolved symbol kind, or `Poison` when it names none (not an
