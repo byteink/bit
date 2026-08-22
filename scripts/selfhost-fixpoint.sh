@@ -45,8 +45,9 @@ set -eu
 # uses for this exact operation: tools/build/artifacts.bit's
 # `buildTimeoutMs()` returns 1800000ms (30 min) and is what bounds the
 # driver's own "selfhost" step (`runShell("selfhost", script,
-# buildTimeoutMs())`, artifacts.bit:766). That is an already-agreed number
-# for the identical operation, not a new one invented for this script.
+# buildTimeoutMs())`, tools/build/artifactsteps.bit:238). That is an
+# already-agreed number for the identical operation, not a new one invented
+# for this script.
 # Override with FIXPOINT_TIMEOUT for a slower host.
 TIMEOUT=${FIXPOINT_TIMEOUT:-1800}
 STAGEA="${1:-bit-out/bin/bit}"

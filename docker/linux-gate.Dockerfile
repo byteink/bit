@@ -31,7 +31,7 @@ FROM debian:bookworm
 # previous release over https and unpacks the .tar.xz. That is the ONLY
 # toolchain this image needs — the bootstrap compiler is a published bit binary,
 # not a second language.
-# procps: tools/build/gates.bit's killTreeFnDef() walks a killed gate's
+# procps: tools/build/gatesexec.bit's killTreeFnDef() call walks a killed gate's
 # descendants with `pgrep -P`. Without it, `pgrep` is missing, the walk
 # silently sees zero descendants (its stderr is redirected to /dev/null), and
 # only the direct child gets killed on timeout (#3230, a regression of #3066).
