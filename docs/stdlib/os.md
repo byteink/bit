@@ -96,6 +96,29 @@ fn assetDir(): string {
 }
 ```
 
+## Running a child process
+
+### `run(path: string, args: []string): int`
+
+Runs `path` as a child process with `args` as its argument vector - the
+runtime supplies `argv[0]` itself, so `args` holds arguments only, never the
+program name. The child is always exec'd directly, never through a shell, so
+nothing in `args` is ever reinterpreted as shell syntax. It inherits this
+process's environment and this process's stdout/stderr. Returns the child's
+exit code, or `-1` if it could not be spawned.
+
+There is no way to capture the child's output through this function - only
+its exit status. Route output through a temp file and `readFile` until this
+module grows a capture variant.
+
+```bit
+import { run } from "std/os"
+
+fn buildStep(): bool {
+  return run("/usr/bin/make", ["-C", "vendor"]) == 0
+}
+```
+
 ## Exiting
 
 ### `exit(code: int)`
