@@ -238,3 +238,24 @@ fn logLine(ns: int, msg: string) {
   println("${formatRfc3339(ns)} ${msg}")
 }
 ```
+
+### `parseRfc3339(s: string): int!`
+
+The inverse of `formatRfc3339`: parses `YYYY-MM-DDTHH:MM:SS`, an optional `.`
+plus 1 to 9 fractional-second digits, then a zone (`Z`, or a signed `HH:MM`
+offset), into nanoseconds since the Unix epoch. Stricter than RFC 3339 in
+three ways: only uppercase `T` and `Z` are accepted; the zone offset always
+carries its `:` (`+HHMM` is rejected); and a leap-second `:60` is rejected,
+since `unixFromCivil` — which this function delegates every calendar range
+check to — rejects any second above 59. A fractional part shorter than nine
+digits is zero-padded on the right (`.5` is `500000000`); ten or more digits
+is a parse failure rather than a silent truncation.
+
+```bit
+import { parseRfc3339, formatRfc3339 } from "std/time"
+
+fn roundTrip(text: string): bool! {
+  let ns = parseRfc3339(text)?
+  return formatRfc3339(ns) == text
+}
+```

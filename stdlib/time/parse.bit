@@ -1,0 +1,197 @@
+// Bit standard library — time module, RFC 3339 parsing.
+//
+// The inverse of `formatRfc3339` (fmt.bit): `YYYY-MM-DDTHH:MM:SS`, an
+// optional `.` plus 1 to 9 fractional-second digits, then a zone — `Z`, or a
+// signed `HH:MM` offset — into nanoseconds since the Unix epoch. Sibling of
+// `civil.bit`, `fmt.bit`, and `time.bit` in `std/time`, and shares their flat
+// namespace with no import: every private helper here is prefixed `parse` to
+// stay out of it, matching `civilFloorDiv`/`fmtLayout`'s own convention.
+//
+// Delegates every calendar range check (month, day including leap years,
+// hour, minute, second, nanosecond) to `unixFromCivil` (civil.bit) rather
+// than duplicating it — this file only validates the grammar (separators,
+// digit runs, field widths) and the zone offset, which `unixFromCivil` knows
+// nothing about.
+//
+// Strict, not the looser ISO 8601 that RFC 3339 profiles:
+//
+//   - Only uppercase `T` and `Z`. A lowercase `t` or `z` is rejected, per
+//     RFC 3339 §5.6's grammar (which itself permits either case — this
+//     module is deliberately stricter, matching `formatRfc3339`'s own output).
+//   - A zone offset always carries its `:`. `+HH:MM` and `-HH:MM` are
+//     accepted; the colon-free `+HHMM` some ISO 8601 profiles allow is not —
+//     RFC 3339's `time-numoffset` production requires it.
+//   - A leap-second `:60` is rejected. `unixFromCivil` rejects any second
+//     above 59, and adding a special case for a field this module does not
+//     otherwise validate — for an event this runtime has no leap-second
+//     table for — would be a second civil-calendar rule living outside
+//     civil.bit. RFC 3339 permits `60`; this parser does not accept it.
+//   - A fractional-second run of 10 or more digits is rejected, not
+//     truncated. The accepted grammar is 1 to 9 digits (RFC 3339 allows more)
+//     and a short run is zero-padded on the right to nine digits, so `.5` is
+//     500000000 nanoseconds — the exact inverse of `formatRfc3339`, which
+//     always emits nine.
+
+// "YYYY-MM-DDTHH:MM:SSZ" — the shortest string this grammar accepts (no
+// fraction, the one-character `Z` zone).
+const parseMinLen: int = 20
+
+// The width `formatRfc3339` always pads or truncates a fractional-second
+// field to.
+const parseNsDigits: int = 9
+
+// The digit `s[i]` denotes, or a failure if it is not one.
+fn parseDigit(s: string, i: int): int! {
+  let c = s[i]
+  if (c < '0' || c > '9') {
+    fail newError("time: non-digit in numeric field")
+  }
+  return i64(c - '0')
+}
+
+// Exactly `n` decimal digits starting at `s[start]`, as a nonnegative int.
+// Fails on the first non-digit. Every caller has already checked
+// `start + n <= len(s)` via `parseMinLen` or an exact-length zone check, so
+// this never reads past the end of `s`.
+fn parseFixedDigits(s: string, start: int, n: int): int! {
+  let v = 0
+  let i = 0
+  while (i < n) {
+    v = v * 10 + parseDigit(s, start + i)?
+    i = i + 1
+  }
+  return v
+}
+
+// The length of the run of ASCII digits starting at `s[start]` (0 if
+// `start >= len(s)` or `s[start]` is not a digit). Never fails: an empty run
+// is a valid answer the caller checks against the grammar's 1-to-9 bound.
+fn parseDigitRunLen(s: string, start: int): int {
+  let n = len(s)
+  let i = start
+  while (i < n && s[i] >= '0' && s[i] <= '9') {
+    i = i + 1
+  }
+  return i - start
+}
+
+// 10^n for 0 <= n <= 9 — the right-padding factor for a fractional-second
+// field shorter than nine digits.
+fn parsePow10(n: int): int {
+  let v = 1
+  let i = 0
+  while (i < n) {
+    v = v * 10
+    i = i + 1
+  }
+  return v
+}
+
+// Parses the fixed-width `YYYY-MM-DDTHH:MM:SS` prefix (`s[0:19]`) into a
+// `Civil` with `nanosecond`, `weekday`, and `yearDay` left `0`. Checks only
+// separators and digit-ness; range checks (month 1-12, day-in-month, hour
+// 0-23, minute/second 0-59) are `unixFromCivil`'s job once the caller has
+// also filled in `nanosecond`.
+fn parseDateTime(s: string): Civil! {
+  let year = parseFixedDigits(s, 0, 4)?
+  if (s[4] != '-') {
+    fail newError("time: expected '-' after year")
+  }
+  let month = parseFixedDigits(s, 5, 2)?
+  if (s[7] != '-') {
+    fail newError("time: expected '-' after month")
+  }
+  let day = parseFixedDigits(s, 8, 2)?
+  if (s[10] != 'T') {
+    fail newError("time: expected 'T' between date and time")
+  }
+  let hour = parseFixedDigits(s, 11, 2)?
+  if (s[13] != ':') {
+    fail newError("time: expected ':' after hour")
+  }
+  let minute = parseFixedDigits(s, 14, 2)?
+  if (s[16] != ':') {
+    fail newError("time: expected ':' after minute")
+  }
+  let second = parseFixedDigits(s, 17, 2)?
+  return Civil{
+    year: year,
+    month: month,
+    day: day,
+    hour: hour,
+    minute: minute,
+    second: second,
+    nanosecond: 0,
+    weekday: 0,
+    yearDay: 0,
+  }
+}
+
+// The signed `+HH:MM` / `-HH:MM` offset starting at `s[i]`, required to
+// reach exactly the end of `s`. Returns the nanoseconds to SUBTRACT from the
+// local wall-clock reading to reach UTC (negative for a `-` zone) — the
+// caller does not see `oh`/`om` at all, only this one signed magnitude.
+fn parseZoneOffset(s: string, i: int): int! {
+  let sign = 1
+  if (s[i] == '-') {
+    sign = -1
+  } else if (s[i] != '+') {
+    fail newError("time: invalid zone")
+  }
+  if (i + 6 != len(s)) {
+    fail newError("time: invalid zone offset length")
+  }
+  let oh = parseFixedDigits(s, i + 1, 2)?
+  if (s[i + 3] != ':') {
+    fail newError("time: invalid zone offset separator")
+  }
+  let om = parseFixedDigits(s, i + 4, 2)?
+  if (oh > 23) {
+    fail newError("time: zone offset hour out of range")
+  }
+  if (om > 59) {
+    fail newError("time: zone offset minute out of range")
+  }
+  return sign * (oh * civilHourNs + om * civilMinuteNs)
+}
+
+// The zone starting at `s[i]` — `Z`, or a signed `HH:MM` offset — required
+// to reach exactly the end of `s`. Returns the nanoseconds to subtract from
+// the local wall-clock reading to reach UTC; `0` for `Z`.
+fn parseZone(s: string, i: int): int! {
+  if (i >= len(s)) {
+    fail newError("time: missing zone")
+  }
+  if (s[i] == 'Z') {
+    if (i + 1 != len(s)) {
+      fail newError("time: trailing characters after zone")
+    }
+    return 0
+  }
+  return parseZoneOffset(s, i)?
+}
+
+// The instant RFC 3339 text `s` denotes, as nanoseconds since the Unix
+// epoch. See the file header for the accepted grammar and where this parser
+// is stricter than RFC 3339 (uppercase-only `T`/`Z`, a colon-bearing zone
+// offset, no leap second) or narrower (a fractional-second run capped at
+// nine digits rather than RFC 3339's arbitrary length).
+export fn parseRfc3339(s: string): int! {
+  if (len(s) < parseMinLen) {
+    fail newError("time: input too short to be RFC 3339")
+  }
+  let c = parseDateTime(s)?
+  let i = 19
+  if (i < len(s) && s[i] == '.') {
+    let digits = parseDigitRunLen(s, i + 1)
+    if (digits < 1 || digits > parseNsDigits) {
+      fail newError("time: fractional seconds must be 1 to 9 digits")
+    }
+    let frac = parseFixedDigits(s, i + 1, digits)?
+    c.nanosecond = frac * parsePow10(parseNsDigits - digits)
+    i = i + 1 + digits
+  }
+  let zoneNs = parseZone(s, i)?
+  let localNs = unixFromCivil(c)?
+  return localNs - zoneNs
+}
