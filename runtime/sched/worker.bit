@@ -138,6 +138,26 @@ export @nosplit @symbol("bit_rt_port_sched_worker_at") fn schedWorkerAt(s: *i64,
   return taskAt(base + i * workerWords * 8)
 }
 
+// One worker block, reset to a fresh, idle, empty state. The per-index body
+// `schedInit`'s boot-time loop below and `schedStartWorker`'s post-boot growth
+// (#2592) share, so a worker started after boot is bit-for-bit the same shape
+// as one started at boot. `@nosplit` because `schedInit` is and may not call a
+// non-`@nosplit` Bit function (E0075); `schedStartWorker` is not `@nosplit`
+// itself but may still call this one.
+@nosplit fn schedInitWorkerSlot(s: *i64, i: int) {
+  let w = schedWorkerAt(s, i)
+  *(w + wkId) = i
+  atomicStore(lockOf(w, wkPark), 0)
+  *(w + wkRunning) = 0
+  *(w + wkDisposition) = taskRunning
+  *(w + wkSched) = int(s)
+  // The next-run slot starts empty (#3264). Explicit rather than relying on a
+  // zeroed block: every other field here is initialised too, and a stale
+  // address in this word would be dispatched as a task.
+  atomicStore(w + wkRunNext, 0)
+  dqInit(w + wkDeque)
+}
+
 // Prepare a scheduler over `nworkers` caller-owned worker blocks laid out
 // contiguously at `workersAddr`.
 export @nosplit @symbol("bit_rt_port_sched_init") fn schedInit(s: *i64, workersAddr: int, nworkers: int) {
@@ -156,19 +176,97 @@ export @nosplit @symbol("bit_rt_port_sched_init") fn schedInit(s: *i64, workersA
 
   let i = 0
   while (i < nworkers) {
-    let w = schedWorkerAt(s, i)
-    *(w + wkId) = i
-    atomicStore(lockOf(w, wkPark), 0)
-    *(w + wkRunning) = 0
-    *(w + wkDisposition) = taskRunning
-    *(w + wkSched) = int(s)
-    // The next-run slot starts empty (#3264). Explicit rather than relying on a
-    // zeroed block: every other field here is initialised too, and a stale
-    // address in this word would be dispatched as a task.
-    atomicStore(w + wkRunNext, 0)
-    dqInit(w + wkDeque)
+    schedInitWorkerSlot(s, i)
     i = i + 1
   }
+}
+
+// ---------------------------------------------------------------------------
+// Starting ONE worker after boot (#2592)
+// ---------------------------------------------------------------------------
+//
+// `schedInit`'s loop above brings up workers `[0, nworkers)` once, on the boot
+// thread, before any worker OS thread exists — the precondition
+// `runtime/thread/threadpool.bit`'s header calls "populate fully, then start".
+// This is the other case: a single additional worker, started at any later
+// point while `nworkers - 1` others may already be running green tasks,
+// parking or unparking concurrently. The grow-on-demand POLICY (when to call
+// this) is #2593's; this is only the mechanism, and it must be safe standing
+// alone.
+//
+// `scNWorkers` moves from "write-once at boot, plain reads forever after"
+// (ABI.md §22) to a field one thread may still be mutating while others read
+// it, so every read of it in this module — `schedFindWork`, `schedWorkPending`,
+// `schedStealRunNext` and `schedCheckDeadlock` below, and `schedWakeIdle`/
+// `schedWakeIdleAll` in `sleep.bit` — now goes through `atomicLoad`, matching
+// the `atomicStore` this function publishes through. A plain load paired with
+// an atomic store is not actually ordered on a weak memory model (ARM64):
+// the store is a release, and only an `atomicLoad` on the other side is a
+// matching acquire, which is what guarantees a reader that sees the new count
+// also sees this function's prior writes to that worker's block.
+//
+// LOCKING: the slot claim, the new worker's full initialization, and the
+// thread create all happen under `scRegLock` — reused rather than a new lock,
+// per the ticket. This is not a hot path (worker starts are rare relative to
+// task scheduling), so holding the lock across `startFn` is cheap, and it has
+// to span the whole sequence rather than just the claim: if the count were
+// published before the thread create is known to succeed, a second concurrent
+// caller could observe the bumped count and claim the next slot, and this
+// call's own failure path would then have no safe way to give its slot back —
+// decrementing could erase that second caller's legitimate claim. Publishing
+// only on success, under one lock held throughout, avoids that hole entirely:
+// on failure nothing is published and nothing needs unwinding.
+//
+// Sound against a concurrent stop-the-world for the same reason
+// `schedRegister`/`schedUnregister` already are: this function has no loop, so
+// it emits no safepoint poll (codegen emits one only at a loop back-edge) and
+// cannot be asked to park while holding the lock. The collector's own registry
+// walk takes this same lock only after every mutator — this one included — has
+// already reached ITS OWN next safepoint, which for a straight-line function is
+// the first one after it returns.
+//
+// `entry`/`argArea`/`doneArea`/`handleArea`/`startFn` are the same shapes
+// `runtime/thread/threadpool.bit`'s `schedStart`/`schedJoin` already use — this
+// module cannot import that composition (`runtime/thread` imports
+// `runtime/sched`; the reverse is circular, E0044), so the two-word
+// `{worker address, done-word address}` arm block is built here again, in the
+// same shape, rather than reused. Caller-owned arrays sized for at least
+// `schedMaxWorkers` entries each, exactly as `runtime/root/<os>`'s own
+// `startArgs`/`startDones`/`startHandles` already are.
+export fn schedStartWorker(s: *i64, entry: *byte, argArea: *i64, doneArea: *i32,
+                            handleArea: *i64,
+                            startFn: (*byte, *byte, *i32) => int): bool {
+  spinAcquire(lockOf(s, scRegLock))
+  let i = atomicLoad(s + scNWorkers)
+  if (i >= schedMaxWorkers) {
+    spinRelease(lockOf(s, scRegLock))
+    return false
+  }
+
+  schedInitWorkerSlot(s, i)
+
+  let block = argArea + i * 2
+  *block = int(schedWorkerAt(s, i))
+  let done = doneArea + i
+  *(block + 1) = int(done)
+  // 1 is `runtime/thread`'s `threadRunning` sentinel, mirrored rather than
+  // imported for the same reason the arg block shape is above. Armed before
+  // the thread can possibly clear it, so a join that later observes 0 always
+  // means the worker finished rather than never started — same requirement,
+  // same ordering, as `schedStartArm`.
+  atomicStore(done, i32(1))
+
+  let bp: *byte = nil
+  let h = startFn(entry, bp + int(block), done)
+  *(handleArea + i) = h
+  if (h == 0) {
+    spinRelease(lockOf(s, scRegLock))
+    return false
+  }
+
+  atomicStore(s + scNWorkers, i + 1)
+  spinRelease(lockOf(s, scRegLock))
+  return true
 }
 
 // ---------------------------------------------------------------------------
@@ -325,7 +423,7 @@ export @nosplit @symbol("bit_rt_port_sched_find_work") fn schedFindWork(w: *i64)
 
   // One bounded pass over the worker array (Power of 10: the trip count is the
   // worker count, which `threadMaxWorkers` caps at 1024).
-  let n = *(s + scNWorkers)
+  let n = atomicLoad(s + scNWorkers)
   let me = *(w + wkId)
   let i = 0
   while (i < n) {
@@ -379,7 +477,7 @@ export @nosplit @symbol("bit_rt_port_sched_work_pending") fn schedWorkPending(w:
   }
   // The same bounded pass over the worker array `schedFindWork` makes, minus the
   // steal itself (Power of 10: the trip count is the worker count).
-  let n = *(s + scNWorkers)
+  let n = atomicLoad(s + scNWorkers)
   let me = *(w + wkId)
   let i = 0
   while (i < n) {
@@ -522,7 +620,7 @@ export @symbol("bit_rt_port_sched_find_work_at") fn schedFindWorkAt(w: *i64, now
 // `nworkers == 1`, where this loop's only candidate index is the caller's own
 // and it therefore returns 0 without touching a word.
 @nosplit fn schedStealRunNext(w: *i64, s: *i64): int {
-  let n = *(s + scNWorkers)
+  let n = atomicLoad(s + scNWorkers)
   let me = *(w + wkId)
   let i = 0
   while (i < n) {
@@ -596,7 +694,7 @@ export @symbol("bit_rt_port_sched_find_work_at") fn schedFindWorkAt(w: *i64, now
 // message on stderr, exactly as a Go program does from `recover`'s absence
 // facing its own fatal errors.
 fn schedCheckDeadlock(s: *i64) {
-  if (*(s + scNWorkers) != 1) {
+  if (atomicLoad(s + scNWorkers) != 1) {
     return
   }
   if (atomicLoad(s + scStopping) != 0) {
