@@ -121,7 +121,7 @@ unescaped value from corrupting the request line.
 import { splitTarget, parseQuery, percentDecode, percentEncode } from "std/http"
 
 fn queryFor(target: string): map<string, string> {
-  let (path, rawQuery) = splitTarget(target)
+  let (_, rawQuery) = splitTarget(target)
   return parseQuery(rawQuery)
 }
 
