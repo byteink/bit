@@ -165,7 +165,9 @@ fn writeRunner(script: string, bin: string, root: string, mod: string, outPath: 
 // keeps `<kind> <name><params> <type...>`, e.g.
 // `function unwrapOr<T> (Option<T>, T) => T`. Either way the bare name is
 // whatever field carries it, cut at its first `<`: Bit identifiers hold no
-// `<`, so this is a no-op for a non-generic symbol.
+// `<`, so this is a no-op for a non-generic symbol. An enum's remainder also
+// carries its braced variant list after the name (#2279: `Json { JsonNull,
+// ... }`), so that field is cut at its first ` {` before the generics cut.
 class Symbol {
   kind: string
   name: string
@@ -195,6 +197,18 @@ fn cutAtGenerics(s: string): string {
   return s[0:at]
 }
 
+// An enum's name+params before its braced variant list (#2279): `s` up to
+// (not including) the first " {", or `s` unchanged when it holds none. Only
+// ever called on an enum's remainder, which always carries a brace — even a
+// variant-less enum renders "{}" (`docEnumBraces`, compiler/doc.bit).
+fn cutAtEnumBrace(s: string): string {
+  let at = indexOf(s, " {")
+  if (at < 0) {
+    return s
+  }
+  return s[0:at]
+}
+
 // Whether `line` appears in `text` as a WHOLE line, not merely a substring.
 // Bounding both sides with "\n" is what makes this exact rather than a prefix
 // or suffix match.
@@ -213,11 +227,33 @@ fn checkPinnedSignature(mod: string, text: string): bool {
   if (mod != "core") {
     return true
   }
-  if (hasExactLine(text, "enum Option<T>")) {
+  if (hasExactLine(text, "enum Option<T> { Some(T), None }")) {
     return true
   }
   eprint("FAIL stdlibdocs: stdlib/core's `bit doc` output has no exact " +
-    "`enum Option<T>` line — signature rendering regressed (#2724)\n")
+    "`enum Option<T> { Some(T), None }` line — signature rendering regressed (#2724)\n")
+  return false
+}
+
+// A pinned VARIANT check (#2279): `hasSection` below matches doc coverage by
+// NAME alone, so an enum whose variant list silently vanished from `bit doc`'s
+// output — reverting to the bare `enum Json` this ticket fixed — would still
+// read as fully documented; variants are the one thing #356's original
+// coverage check cannot see. This is the exact-text assertion that closes
+// that gap, pinned to `stdlib/json`'s `Json`, the ticket's own worked example
+// (JsonNull through JsonObject, all seven variants with their payload types).
+fn checkPinnedVariants(mod: string, text: string): bool {
+  if (mod != "json") {
+    return true
+  }
+  let want = "enum Json { JsonNull, JsonBool(bool), JsonInt(i64), JsonFloat(f64), " +
+    "JsonString(string), JsonArray([]Json), JsonObject([]JsonEntry) }"
+  if (hasExactLine(text, want)) {
+    return true
+  }
+  eprint("FAIL stdlibdocs: stdlib/json's `bit doc` output has no exact `enum Json` " +
+    "line with all seven variants and their payload types — variant rendering " +
+    "regressed or was dropped (#2279)\n")
   return false
 }
 
@@ -246,6 +282,11 @@ fn parseDoc(text: string): []Symbol {
       // and "E>") — rejoin before cutting at the first `<`.
       typeText = joinFrom(parts, 1)
       nameField = typeText
+      if (kind == "enum") {
+        // The remainder also carries the braced variant list (#2279); the
+        // bare name+params stops before it.
+        nameField = cutAtEnumBrace(nameField)
+      }
     }
     out = append(out, Symbol{kind: kind, name: cutAtGenerics(nameField), typeText: typeText})
   }
@@ -315,6 +356,169 @@ fn moduleList(stdRoot: string): []string {
   return mods
 }
 
+// Running totals across the whole module walk. A class (reference type,
+// SPEC §13.3) rather than a return tuple, so `walkModule` can mutate one
+// shared instance per module instead of `main` threading eight values
+// through every call.
+class DocWalkTally {
+  documented: int,
+  missing: int,
+  skipped: int,
+  broken: int,
+  sawCore: bool,
+  sigOk: bool,
+  sawJson: bool,
+  variantsOk: bool,
+}
+
+fn newTally(): DocWalkTally {
+  return DocWalkTally{documented: 0, missing: 0, skipped: 0, broken: 0,
+    sawCore: false, sigOk: true, sawJson: false, variantsOk: true}
+}
+
+// The per-run settings every module walk needs, bundled so `walkModule`
+// stays under the 5-parameter lint ceiling (E0202) instead of threading four
+// constants through individually.
+class DocWalkConfig {
+  bin: string,
+  root: string,
+  docsRoot: string,
+  ms: int,
+}
+
+// Runs `bit doc` for one module and returns its stdout, or ("", false) after
+// printing why (timeout, non-zero exit, or an unreadable output file).
+fn moduleDocText(mod: string, script: string, outPath: string, errPath: string, ms: int): (string, bool) {
+  let rc = osRunBounded(script, ms)
+  if (rc == -2) {
+    eprint("TIMED OUT: stdlib/" + mod + " after " + itoa(ms) + "ms\n")
+    return "", false
+  }
+  if (rc != 0) {
+    let why = readFile(errPath) catch e { "" }
+    eprint("stdlib/" + mod + " does not compile (rc=" + itoa(rc) + "):\n" + why + "\n")
+    return "", false
+  }
+  let text = readFile(outPath) catch e {
+    eprint("stdlib/" + mod + ": documented cleanly but " + outPath + " is unreadable: " + e.message() + "\n")
+    return "", false
+  }
+  return text, true
+}
+
+// The two pinned exact-text checks (#2724, #2279), each a no-op outside its
+// own module.
+fn applyPinnedChecks(t: DocWalkTally, mod: string, text: string) {
+  if (mod == "core") {
+    t.sawCore = true
+    if (!checkPinnedSignature(mod, text)) {
+      t.sigOk = false
+    }
+  }
+  if (mod == "json") {
+    t.sawJson = true
+    if (!checkPinnedVariants(mod, text)) {
+      t.variantsOk = false
+    }
+  }
+}
+
+// Tallies one module's symbols against its docs page, printing every miss —
+// a "first divergence" report would leave the rest invisible.
+fn tallyModuleSymbols(t: DocWalkTally, md: string, mod: string, syms: []Symbol) {
+  let j = 0
+  while (j < len(syms)) {
+    let s = syms[j]
+    if (hasSection(md, s.name)) {
+      t.documented = t.documented + 1
+    } else {
+      t.missing = t.missing + 1
+      eprint("docs/stdlib/" + mod + ".md: no `### `" + s.name + "`` section for the exported " +
+        s.kind + " `" + s.name + "` (" + s.typeText + ")\n")
+    }
+    j = j + 1
+  }
+}
+
+// One module's whole walk: run `bit doc`, run the pinned checks, then tally
+// its symbols against its docs page. Every early exit updates `t` and
+// returns rather than raising — a bad module must not stop the others.
+fn walkModule(t: DocWalkTally, cfg: DocWalkConfig, mod: string) {
+  let script = "/tmp/bit-stdlibdocs-" + mod + ".sh"
+  let outPath = "/tmp/bit-stdlibdocs-" + mod + ".out"
+  let errPath = "/tmp/bit-stdlibdocs-" + mod + ".err"
+  if (!writeRunner(script, cfg.bin, cfg.root, mod, outPath, errPath)) {
+    exit(1)
+  }
+
+  let (text, ok) = moduleDocText(mod, script, outPath, errPath, cfg.ms)
+  if (!ok) {
+    t.broken = t.broken + 1
+    return
+  }
+
+  applyPinnedChecks(t, mod, text)
+
+  let syms = parseDoc(text)
+  if (len(syms) == 0) {
+    t.skipped = t.skipped + 1 // an internal module with no exports
+    return
+  }
+
+  let page = cfg.docsRoot + "/" + mod + ".md"
+  let md = readFile(page) catch e {
+    eprint("stdlib/" + mod + " exports " + itoa(len(syms)) + " symbols but " + page +
+      " is unreadable: " + e.message() + "\n")
+    t.broken = t.broken + 1
+    return
+  }
+
+  tallyModuleSymbols(t, md, mod, syms)
+}
+
+// Every terminal failure condition over the finished tally. Anti-vacuity:
+// each pinned check above only ever runs inside its own `mod ==` branch, so a
+// module walk that silently stopped happening (a renamed directory, a moved
+// module) must fail exactly as loudly as a pinned check that ran and found
+// the wrong text.
+fn evaluateTally(t: DocWalkTally): bool {
+  let total = t.documented + t.missing
+  let failed = false
+
+  if (t.broken > 0) {
+    eprint("FAIL stdlibdocs: " + itoa(t.broken) + " module(s) could not be documented\n")
+    failed = true
+  }
+  if (t.documented == 0) {
+    eprint("FAIL stdlibdocs: the walk found no documented symbols at all\n")
+    failed = true
+  }
+  if (total < minSymbols) {
+    eprint("FAIL stdlibdocs: saw " + itoa(total) + " exported symbols, expected at least " +
+      itoa(minSymbols) + "\n")
+    failed = true
+  }
+  if (t.missing > 0) {
+    eprint("FAIL stdlibdocs: " + itoa(t.missing) + " exported symbol(s) have no docs section\n")
+    failed = true
+  }
+  if (!t.sawCore) {
+    eprint("FAIL stdlibdocs: stdlib/core was never walked, so the pinned signature check never ran\n")
+    failed = true
+  }
+  if (!t.sigOk) {
+    failed = true
+  }
+  if (!t.sawJson) {
+    eprint("FAIL stdlibdocs: stdlib/json was never walked, so the pinned variants check never ran\n")
+    failed = true
+  }
+  if (!t.variantsOk) {
+    failed = true
+  }
+  return failed
+}
+
 fn main() {
   if (!checkHasSection()) {
     eprint("FAIL stdlibdocs: the hasSection unit test did not pass\n")
@@ -342,109 +546,15 @@ fn main() {
     exit(1)
   }
 
-  let ms = timeoutMs()
-  let documented = 0
-  let missing = 0
-  let skipped = 0
-  let broken = 0
-  let sawCore = false
-  let sigOk = true
-
+  let cfg = DocWalkConfig{bin: bin, root: root, docsRoot: docsRoot, ms: timeoutMs()}
+  let t = newTally()
   for (let i = 0; i < len(mods); i = i + 1) {
-    let mod = mods[i]
-    let script = "/tmp/bit-stdlibdocs-" + mod + ".sh"
-    let outPath = "/tmp/bit-stdlibdocs-" + mod + ".out"
-    let errPath = "/tmp/bit-stdlibdocs-" + mod + ".err"
-    if (!writeRunner(script, bin, root, mod, outPath, errPath)) {
-      exit(1)
-    }
-
-    let rc = osRunBounded(script, ms)
-    if (rc == -2) {
-      eprint("TIMED OUT: stdlib/" + mod + " after " + itoa(ms) + "ms\n")
-      broken = broken + 1
-      continue
-    }
-    if (rc != 0) {
-      let why = readFile(errPath) catch e { "" }
-      eprint("stdlib/" + mod + " does not compile (rc=" + itoa(rc) + "):\n" + why + "\n")
-      broken = broken + 1
-      continue
-    }
-
-    let text = readFile(outPath) catch e {
-      eprint("stdlib/" + mod + ": documented cleanly but " + outPath + " is unreadable: " + e.message() + "\n")
-      broken = broken + 1
-      continue
-    }
-    if (mod == "core") {
-      sawCore = true
-      if (!checkPinnedSignature(mod, text)) {
-        sigOk = false
-      }
-    }
-
-    let syms = parseDoc(text)
-    if (len(syms) == 0) {
-      skipped = skipped + 1 // an internal module with no exports
-      continue
-    }
-
-    let page = docsRoot + "/" + mod + ".md"
-    let md = readFile(page) catch e {
-      eprint("stdlib/" + mod + " exports " + itoa(len(syms)) + " symbols but " + page +
-        " is unreadable: " + e.message() + "\n")
-      broken = broken + 1
-      continue
-    }
-
-    for (let j = 0; j < len(syms); j = j + 1) {
-      let s = syms[j]
-      if (hasSection(md, s.name)) {
-        documented = documented + 1
-        continue
-      }
-      missing = missing + 1
-      eprint("docs/stdlib/" + mod + ".md: no `### `" + s.name + "`` section for the exported " +
-        s.kind + " `" + s.name + "` (" + s.typeText + ")\n")
-    }
+    walkModule(t, cfg, mods[i])
   }
 
-  let total = documented + missing
-  let failed = false
-
-  if (broken > 0) {
-    eprint("FAIL stdlibdocs: " + itoa(broken) + " module(s) could not be documented\n")
-    failed = true
-  }
-  if (documented == 0) {
-    eprint("FAIL stdlibdocs: the walk found no documented symbols at all\n")
-    failed = true
-  }
-  if (total < minSymbols) {
-    eprint("FAIL stdlibdocs: saw " + itoa(total) + " exported symbols, expected at least " +
-      itoa(minSymbols) + "\n")
-    failed = true
-  }
-  if (missing > 0) {
-    eprint("FAIL stdlibdocs: " + itoa(missing) + " exported symbol(s) have no docs section\n")
-    failed = true
-  }
-  // Anti-vacuity: the pinned check above only ever runs inside the `mod ==
-  // "core"` branch, so a `stdlib/core` walk that silently stopped happening
-  // (a renamed directory, a moved module) must fail exactly as loudly as a
-  // pinned check that ran and found the wrong text.
-  if (!sawCore) {
-    eprint("FAIL stdlibdocs: stdlib/core was never walked, so the pinned signature check never ran\n")
-    failed = true
-  }
-  if (!sigOk) {
-    failed = true
-  }
-
-  if (failed) {
+  if (evaluateTally(t)) {
     exit(1)
   }
-  print("PASS stdlibdocs: " + itoa(documented) + " exported symbols documented across " +
-    itoa(len(mods)) + " modules (" + itoa(skipped) + " export nothing)\n")
+  print("PASS stdlibdocs: " + itoa(t.documented) + " exported symbols documented across " +
+    itoa(len(mods)) + " modules (" + itoa(t.skipped) + " export nothing)\n")
 }

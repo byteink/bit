@@ -11,12 +11,27 @@
 // type's rendered type IS its name), and both forms carry the symbol's own
 // generic parameter list, read from its declaration node rather than
 // reconstructed from source text.
-//   plain:   named type ("class"/"enum"/"interface"/"type"):
+//   plain:   named type ("class"/"interface"/"type"):
 //              "<kind> <name><params>\n"
+//            enum:
+//              "enum <name><params> { <variant>, <variant>(<payload, ...>), ... }\n"
 //            everything else:
 //              "<kind> <name><params> <type>\n"
 //   --json:  a `[ {...} ]` array, one object per line, with a "params" key
-//            between "kind" and "type", for tooling and humans.
+//            between "kind" and "type", for tooling and humans, and a
+//            "variants" key on every entry (empty for anything but an enum).
+//
+// An enum's variant list is its entire meaning (#2279): unlike a class, whose
+// shape a reader can at least infer from its methods, a bare `enum Json` name
+// gives no way to learn that a value is built `Json.JsonObject([]JsonEntry{...})`
+// rather than some other plausible spelling. So both forms report each
+// variant's name and its payload types (empty payload for a bare variant like
+// `JsonNull`), read the same way `resolveEnumPayloads` (checkbind.bit) built
+// them: from the EnumDecl's own `VariantList` for the ordered NAMES (every
+// variant, including payload-less ones, which never reach
+// `ctx.variantPayloads`), and from `ctx.variantPayloads` for the resolved
+// PAYLOAD TYPES, keyed under the same template TypeId `collectDoc` already
+// looks up for the enum's own entry.
 //
 // A method is reported against its receiver (`File.readAll`), because that is how
 // it is called and how a reader looks it up. A method set also holds a type's
@@ -49,6 +64,16 @@ class DocSymbol {
   // the receiver's parameters.
   params: string,
   typeText: string,
+  // Enum-only (#2279): every variant, in declaration order, with its
+  // resolved payload type names. Empty for every other kind.
+  variants: []DocVariant,
+}
+
+// One enum variant: its bare name, and its payload TYPE NAMES already
+// rendered by `typeName` (empty for a payload-less variant like `JsonNull`).
+class DocVariant {
+  name: string,
+  payload: []string,
 }
 
 // Upper bound on symbols reported for one module, so the walk is provably bounded
@@ -117,6 +142,45 @@ fn docGenericParamsText(tree: Tree, source: string, node: int): string {
 // the way there is for a function below.
 fn docTypeParamsText(c: Checker, declNode: int): string {
   return docGenericParamsText(c.tree, c.source, kidsOf(c.tree, declNode)[1])
+}
+
+// A variant's payload type names, resolved — `[]` for a payload-less variant.
+// `resolveEnumPayloads` (checkbind.bit) only interns `ctx.variantPayloads`
+// for a variant that HAS a payload, so a missing key means "no payload",
+// never "not yet resolved" (`declTypeOf` already ran `resolveEnumPayloads`
+// for every named type before `collectDoc`'s exports walk starts).
+fn docVariantPayload(c: Checker, enumTy: int, vname: string): []string {
+  let (ptypes, ok) = c.ctx.variantPayloads["${enumTy}." + vname]
+  let out = []string(0)
+  if (!ok) {
+    return out
+  }
+  let i = 0
+  while (i < len(ptypes)) {
+    out = append(out, typeName(c.ctx, ptypes[i]))
+    i = i + 1
+  }
+  return out
+}
+
+// An enum's own variant list, in declaration order, from its `EnumDecl`
+// node's `VariantList` slot (kid 2, `parseEnumDecl`/`parseVariant` in
+// parsertype.bit): every variant appears here, including payload-less ones
+// that `ctx.variantPayloads` never records. `enumTy` is the same template
+// TypeId `collectDoc` already looked up for the enum's own entry — the id
+// `resolveEnumPayloads` interned payloads under.
+fn docEnumVariants(c: Checker, declNode: int, enumTy: int): []DocVariant {
+  let vs = kidsOf(c.tree, kidsOf(c.tree, declNode)[2])
+  let out = []DocVariant(0)
+  let i = 0
+  while (i < len(vs)) {
+    let vk = kidsOf(c.tree, vs[i])
+    let vn = getNode(c.tree, vk[0])
+    let vname = c.source[vn.span.start:vn.span.end]
+    out = append(out, DocVariant{ name: vname, payload: docVariantPayload(c, enumTy, vname) })
+    i = i + 1
+  }
+  return out
 }
 
 // A free function's own generic parameter list, from its FuncDecl node's
@@ -218,16 +282,23 @@ fn collectDoc(c: Checker, withFields: bool): []DocSymbol {
     if (td != 0) {
       let id = userTypeLookup(c, n)
       let params = docTypeParamsText(c, td)
+      let kind = docTypeKind(c, td)
+      // An enum's variants ARE its meaning (#2279), so every enum entry
+      // carries them; every other kind gets the zero-value empty slice.
+      let variants = []DocVariant(0)
+      if (kind == "enum") {
+        variants = docEnumVariants(c, td, id)
+      }
       // typeText is deliberately `n + params`, not `typeName(c.ctx, id)`: the
       // latter renders the same "n" back (a named type's own id is never an
       // instantiation of itself), so the two were always identical — the
       // "enum Option Option" doubling this replaces (#2724).
-      out = append(out, DocSymbol{ kind: docTypeKind(c, td), name: n,
-        params: params, typeText: n + params })
+      out = append(out, DocSymbol{ kind: kind, name: n,
+        params: params, typeText: n + params, variants: variants })
       out = docAppendMethods(c, out, n, id)
       // Enum/interface/type-alias decl nodes do not share StructDecl's
       // shape (kid 2 is not a FieldList), so this is class-only.
-      if (withFields && docTypeKind(c, td) == "class") {
+      if (withFields && kind == "class") {
         out = docAppendFields(c, out, n, id, td)
       }
       continue
@@ -285,8 +356,38 @@ fn docJsonString(s: string): string {
   return out + "\""
 }
 
-// The `--json` form: a `[ {...} ]` array, one object per line, byte-identical to
-// the seed's `writeJson`.
+// One variant as a JSON object: `{"name": ..., "payload": [type, ...]}`
+// (#2279). `payload` is `[]` for a bare variant like `JsonNull`.
+fn docVariantJson(v: DocVariant): string {
+  let out = "{\"name\": " + docJsonString(v.name) + ", \"payload\": ["
+  let i = 0
+  while (i < len(v.payload)) {
+    if (i != 0) {
+      out = out + ", "
+    }
+    out = out + docJsonString(v.payload[i])
+    i = i + 1
+  }
+  return out + "]}"
+}
+
+// An enum symbol's variants as a JSON array (#2279); `[]` for every other
+// kind, so every entry carries the same set of keys.
+fn docVariantsJson(variants: []DocVariant): string {
+  let out = "["
+  let i = 0
+  while (i < len(variants)) {
+    if (i != 0) {
+      out = out + ", "
+    }
+    out = out + docVariantJson(variants[i])
+    i = i + 1
+  }
+  return out + "]"
+}
+
+// The `--json` form: a `[ {...} ]` array, one object per line, close to the
+// seed's `writeJson` plus a "variants" key (#2279 — the seed predates it).
 fn docJson(syms: []DocSymbol): string {
   let out = "[\n"
   let i = 0
@@ -295,7 +396,8 @@ fn docJson(syms: []DocSymbol): string {
     out = out + "  {\"name\": " + docJsonString(s.name) +
       ", \"kind\": " + docJsonString(s.kind) +
       ", \"params\": " + docJsonString(s.params) +
-      ", \"type\": " + docJsonString(s.typeText) + "}"
+      ", \"type\": " + docJsonString(s.typeText) +
+      ", \"variants\": " + docVariantsJson(s.variants) + "}"
     if (i + 1 < len(syms)) {
       out = out + ","
     }
@@ -311,16 +413,57 @@ fn docKindIsNamedType(kind: string): bool {
   return kind == "class" || kind == "enum" || kind == "interface" || kind == "type"
 }
 
-// The plain form, per symbol (#2724): a named type prints "<kind> <type>\n" —
-// `typeText` already holds `name + params`, so printing `name` too would
-// repeat it verbatim. Every other kind prints "<kind> <name><params>
+// A variant rendered the way its declaration reads: bare name, or
+// "name(type, ...)" when it carries a payload (#2279).
+fn docRenderVariant(v: DocVariant): string {
+  if (len(v.payload) == 0) {
+    return v.name
+  }
+  let out = v.name + "("
+  let i = 0
+  while (i < len(v.payload)) {
+    if (i != 0) {
+      out = out + ", "
+    }
+    out = out + v.payload[i]
+    i = i + 1
+  }
+  return out + ")"
+}
+
+// An enum's variant list, braced and comma-separated: "{ A, B(T) }", or
+// "{}" for a variant-less enum. `docPlain` folds this into the enum's own
+// line, following how the declaration reads (#2279).
+fn docEnumBraces(variants: []DocVariant): string {
+  if (len(variants) == 0) {
+    return "{}"
+  }
+  let out = "{ "
+  let i = 0
+  while (i < len(variants)) {
+    if (i != 0) {
+      out = out + ", "
+    }
+    out = out + docRenderVariant(variants[i])
+    i = i + 1
+  }
+  return out + " }"
+}
+
+// The plain form, per symbol (#2724, #2279): a named type prints "<kind>
+// <type>\n" — `typeText` already holds `name + params`, so printing `name`
+// too would repeat it verbatim. An enum is the one named type that instead
+// prints its own variant list, braced, because the variant list IS the
+// type's meaning (#2279). Every other kind prints "<kind> <name><params>
 // <type>\n".
 fn docPlain(syms: []DocSymbol): string {
   let out = ""
   let i = 0
   while (i < len(syms)) {
     let s = syms[i]
-    if (docKindIsNamedType(s.kind)) {
+    if (s.kind == "enum") {
+      out = out + "enum " + s.typeText + " " + docEnumBraces(s.variants) + "\n"
+    } else if (docKindIsNamedType(s.kind)) {
       out = out + s.kind + " " + s.typeText + "\n"
     } else {
       out = out + s.kind + " " + s.name + s.params + " " + s.typeText + "\n"
