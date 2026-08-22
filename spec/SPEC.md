@@ -3164,7 +3164,7 @@ exact order: `name`, `kind`, `params`, `type`:
 **`--fields`** (off by default) additionally reports each exported class's own
 fields, in declaration order, as the extra kind `field` with name `Recv.field`
 (for example `Point.x`); it changes neither form's shape for a module whose
-  classes report no fields this way.
+classes report no fields this way.
 
 Neither form prints documentation comments: a `//` line written directly above
 a declaration is source-only and is not part of `bit doc`'s output.
