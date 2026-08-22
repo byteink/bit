@@ -317,11 +317,13 @@ failed — the whole call comes back as one failure.
 ### `validateHeaderName(name: string): ()!`
 
 Fails unless `name` is a non-empty RFC 9110 `token` (`!#$%&'*+-.^_`|~`, a
-digit, or an ASCII letter, one or more).
+digit, or an ASCII letter, one or more) — the same check `Response.setHeader`
+runs on the response side, so a name is rejected identically either way.
 
 ### `validateHeaderValue(value: string): ()!`
 
-Fails if `value` contains a raw CR, LF or NUL.
+Fails if `value` contains a raw CR, LF or NUL — again the same check
+`Response.setHeader`/`addHeader` already run.
 
 ```bit
 import { Header, serializeHeaders } from "std/http"
