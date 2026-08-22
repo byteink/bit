@@ -304,7 +304,9 @@ whydied() {
 run_basic() {
   match=0 mismatch=0 skip=0 timeout=0 firstbad=""
   for f in $(find $CORPUS -name '*.bit' | sort); do
-    seed=$(alarmrun "$ORACLE" "$FLAG" "$f")
+    # Verdict-deciding (#3422): retry-once-on-stall via alarmrun_retry, so one
+    # transient SIGALRM does not turn a real comparison into a false TIMEOUT.
+    seed=$(alarmrun_retry ORACLE "" "$ORACLE" "$FLAG" "$f")
     rc=$?
     if [ "$rc" -eq 142 ]; then
       echo "$LABEL: ORACLE timed out after ${TIMEOUT}s on $f" >&2
@@ -315,7 +317,7 @@ run_basic() {
       skip=$((skip + 1))
       continue
     fi
-    b2=$(alarmrun "$BIT2" "$FLAG" "$f")
+    b2=$(alarmrun_retry BIT2 "" "$BIT2" "$FLAG" "$f")
     rc=$?
     if [ "$rc" -eq 142 ]; then
       echo "$LABEL: BIT2 timed out after ${TIMEOUT}s on $f" >&2
@@ -390,14 +392,15 @@ run_types() {
   match=0 skip=0
 
   for f in $(find $CORPUS -name '*.bit' | sort); do
-    seed=$(alarmrun "$ORACLE" "$FLAG" "$f")
+    # Verdict-deciding (#3422): see run_basic()'s identical retry above.
+    seed=$(alarmrun_retry ORACLE "" "$ORACLE" "$FLAG" "$f")
     rc=$?
     if [ "$rc" -eq 142 ]; then
       echo "$f" >>"$work/oracletimeout"
       continue
     fi
     [ "$rc" -ne 0 ] && { skip=$((skip + 1)); continue; }
-    b2=$(alarmrun "$BIT2" "$FLAG" "$f")
+    b2=$(alarmrun_retry BIT2 "" "$BIT2" "$FLAG" "$f")
     rc=$?
     if [ "$rc" -ge 128 ]; then
       echo "$f" >>"$work/timeout"
@@ -492,7 +495,8 @@ run_ir() {
     # The oracle is bounded too, and its timeout is NOT a skip: a skip means the
     # oracle could not lower or check the file, which is a real and expected
     # outcome, while a hang is a broken stage0 that must be named (#2070).
-    want=$(alarmrun "$ORACLE" "$FLAG" "$f")
+    # Verdict-deciding (#3422): retry-once-on-stall, same as run_basic() above.
+    want=$(alarmrun_retry ORACLE "" "$ORACLE" "$FLAG" "$f")
     rc=$?
     if [ "$rc" -eq 142 ]; then
       echo "$f${sep}$(whydied "$rc")" >>"$work/oracletimeout"
@@ -505,7 +509,7 @@ run_ir() {
     [ "$rc" -ne 0 ] && { skip=$((skip + 1)); continue; }
     [ -z "$want" ] && { skip=$((skip + 1)); continue; }
 
-    b2=$(alarmrun "$BIT2" "$FLAG" "$f")
+    b2=$(alarmrun_retry BIT2 "" "$BIT2" "$FLAG" "$f")
     rc=$?
     # >=128 is death by signal, and WHICH signal is not a detail. 142 is our own
     # SIGALRM — a timeout. Anything else is the compiler dying, and reporting a

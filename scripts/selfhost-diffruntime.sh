@@ -515,7 +515,7 @@ for f in $(find runtime -name '*.bit' | sort); do
   # The oracle is bounded too (#2070). Its timeout is NOT a skip: a skip means
   # the oracle could not lower the file, an expected outcome, while a hang is a
   # broken stage0 — and an unbounded oracle wedged this gate with no message.
-  a=$(alarmrun "$ORACLE" --dump-ir-pre "$f")
+  a=$(alarmrun_retry ORACLE "" "$ORACLE" --dump-ir-pre "$f")  # #3422: verdict-deciding retry
   arc=$?
   if [ "$arc" -eq 142 ]; then
     echo "$f${sep}$(whydied "$arc")" >>"$work/oracletimeout"
@@ -532,7 +532,7 @@ for f in $(find runtime -name '*.bit' | sort); do
     continue
   fi
 
-  b=$(alarmrun "$BIT2" --dump-ir-pre "$f")
+  b=$(alarmrun_retry BIT2 "" "$BIT2" --dump-ir-pre "$f")  # #3422: verdict-deciding retry
   rc=$?
   # >=128 is death by signal, and WHICH signal is not a detail: 142 is our own
   # alarm, anything else is the compiler crashing. Either way no verdict (#2070).
@@ -593,7 +593,7 @@ while [ "$i" -lt "$NMOD" ]; do
   devobj="$objdev/${label}.o"
   orobj="$objor/${label}.o"
 
-  alarmrun "$ORACLE" build "$dir" -c --freestanding -o "$orobj" >/dev/null
+  alarmrun_retry ORACLE "$orobj" "$ORACLE" build "$dir" -c --freestanding -o "$orobj" >/dev/null  # #3422
   orc=$?
   if [ "$orc" -eq 142 ]; then
     echo "$dir${sep}$(whydied "$orc")" >>"$work/mod_oracletimeout"
@@ -610,7 +610,7 @@ while [ "$i" -lt "$NMOD" ]; do
     continue
   fi
 
-  alarmrun "$BIT2" build "$dir" -c --freestanding -o "$devobj" >/dev/null
+  alarmrun_retry BIT2 "$devobj" "$BIT2" build "$dir" -c --freestanding -o "$devobj" >/dev/null  # #3422
   rc=$?
   if [ "$rc" -ge 128 ]; then
     echo "$dir${sep}$(whydied "$rc")" >>"$work/mod_timeout"

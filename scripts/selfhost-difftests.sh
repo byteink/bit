@@ -45,13 +45,15 @@ TIMEOUT=${DIFFTESTS_TIMEOUT:-20}
 
 oracletimeout=0 bit2timeout=0 mismatch=0
 
-ALARMRUN_KEEP_STDERR=1 alarmrun "$ORACLE" test "$PROJ" >"$TMP/seed" 2>&1
+# Verdict-deciding (#3422): the only comparison in this script, so a single
+# transient SIGALRM must not turn a real MATCH/DIFF into a false TIMEOUT.
+ALARMRUN_KEEP_STDERR=1 alarmrun_retry ORACLE "" "$ORACLE" test "$PROJ" >"$TMP/seed" 2>&1
 se=$?
 if [ "$se" -eq 142 ]; then
   echo "ORACLE timed out after ${TIMEOUT}s running: $ORACLE test $PROJ"
   oracletimeout=1
 else
-  ALARMRUN_KEEP_STDERR=1 alarmrun "$BIT2" test "$PROJ" >"$TMP/b2" 2>&1
+  ALARMRUN_KEEP_STDERR=1 alarmrun_retry BIT2 "" "$BIT2" test "$PROJ" >"$TMP/b2" 2>&1
   b2=$?
   if [ "$b2" -eq 142 ]; then
     echo "BIT2 timed out after ${TIMEOUT}s running: $BIT2 test $PROJ"

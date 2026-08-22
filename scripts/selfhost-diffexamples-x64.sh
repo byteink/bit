@@ -59,7 +59,11 @@ pass=0 diff=0 refused=0 oraclefail=0 skipped=0 scpfail=0 oracletimeout=0 bit2tim
 for d in examples/*/; do
   n=$(basename "$d")
   case " $SKIP " in *" $n "*) skipped=$((skipped + 1)); continue;; esac
-  ALARMRUN_KEEP_STDERR=1 alarmrun "$ORACLE" build "$d" -o "$TMP/oracle_$n" --target x86_64-linux >"$TMP/oerr_$n" 2>&1
+  # Verdict-deciding (#3422): the local build decides ORACLE-FAIL/REFUSED
+  # before anything reaches the remote host, so a single stall must not turn a
+  # real build into a false timeout. outfile is the compiler's own -o target
+  # (safe to rm-f between attempts, unlike the >"$TMP/oerr_$n" log capture).
+  ALARMRUN_KEEP_STDERR=1 alarmrun_retry ORACLE "$TMP/oracle_$n" "$ORACLE" build "$d" -o "$TMP/oracle_$n" --target x86_64-linux >"$TMP/oerr_$n" 2>&1
   rc=$?
   if [ "$rc" -eq 142 ]; then
     oracletimeout=$((oracletimeout + 1)); echo "ORACLE timed out after ${TIMEOUT}s: $n"; continue
@@ -67,7 +71,7 @@ for d in examples/*/; do
   if [ "$rc" -ne 0 ]; then
     oraclefail=$((oraclefail + 1)); echo "ORACLE-FAIL $n"; continue
   fi
-  ALARMRUN_KEEP_STDERR=1 alarmrun "$BIT2" build "$d" -o "$TMP/b2_$n" --target x86_64-linux >"$TMP/berr_$n" 2>&1
+  ALARMRUN_KEEP_STDERR=1 alarmrun_retry BIT2 "$TMP/b2_$n" "$BIT2" build "$d" -o "$TMP/b2_$n" --target x86_64-linux >"$TMP/berr_$n" 2>&1
   rc=$?
   if [ "$rc" -eq 142 ]; then
     bit2timeout=$((bit2timeout + 1)); echo "BIT2 timed out after ${TIMEOUT}s: $n"; continue
