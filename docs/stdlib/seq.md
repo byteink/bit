@@ -125,3 +125,116 @@ fn occurrences(xs: []int, target: int): i64 {
   return count(xs, target)
 }
 ```
+
+## Collections
+
+The other half of std/seq: pulling a slice out of a map, or changing a
+slice's shape (insert, remove, concat, unique) instead of transforming its
+elements in place.
+
+### `keys(m: map<K, V>): []K`
+
+`m`'s keys, as a slice. Iteration order is deterministic for a given build but
+is neither insertion order nor sorted — sort the result with `std/sort` if
+callers need a stable printed order.
+
+### `values(m: map<K, V>): []V`
+
+`m`'s values, as a slice, in the same order as `keys`.
+
+```bit
+import { keys, values } from "std/seq"
+
+fn scoreNames(scores: map<string, int>): []string {
+  return keys(scores)
+}
+
+fn scoreValues(scores: map<string, int>): []int {
+  return values(scores)
+}
+```
+
+### `concat(a: []T, b: []T): []T`
+
+A new slice holding `a`'s elements followed by `b`'s; both are left
+unmodified.
+
+### `insertAt(xs: []T, at: i64, v: T): []T`
+
+A new slice like `xs` with `v` inserted before index `at`; `xs` is left
+unmodified. `at <= 0` inserts at the front, `at >= len(xs)` appends at the
+end.
+
+### `removeAt(xs: []T, at: i64): []T`
+
+A new slice like `xs` with the element at index `at` removed; `xs` is left
+unmodified.
+
+```bit
+import { concat, insertAt, removeAt } from "std/seq"
+
+fn merged(a: []int, b: []int): []int {
+  return concat(a, b)
+}
+
+fn withInserted(xs: []int, at: i64, v: int): []int {
+  return insertAt(xs, at, v)
+}
+
+fn withRemoved(xs: []int, at: i64): []int {
+  return removeAt(xs, at)
+}
+```
+
+### `equal(a: []T, b: []T): bool`
+
+Whether `a` and `b` hold the same elements in the same order. A plain
+`a == b` is not this: a slice is not comparable. Element equality uses `==`,
+so `equal` over a slice of structs is only correct once #2105 (`==` on
+structs currently compares handles, not fields) lands.
+
+### `unique(xs: []T): []T`
+
+A new slice holding `xs`'s elements with duplicates removed, keeping the
+first occurrence of each and its original order. O(n^2): an unbounded type
+parameter cannot be the key of a `map<T, bool>` seen-set, so this is a scan
+comparing every kept element with `==`.
+
+```bit
+import { equal, unique } from "std/seq"
+
+fn sameElements(a: []int, b: []int): bool {
+  return equal(a, b)
+}
+
+fn dedup(xs: []int): []int {
+  return unique(xs)
+}
+```
+
+### `groupBy(xs: []T, key: (T) => K): map<K, []T>`
+
+Partitions `xs` into buckets keyed by `key`, preserving each bucket's
+relative order of insertion.
+
+### `indexBy(xs: []T, key: (T) => K): map<K, T>`
+
+Indexes `xs` by `key`; a later element with a key already seen overwrites the
+earlier one.
+
+```bit
+import { groupBy, indexBy } from "std/seq"
+
+class Item {
+  id: int,
+  category: string,
+}
+
+fn byCategory(items: []Item): map<string, []Item> {
+  return groupBy(items, (i: Item) => i.category)
+}
+
+fn byId(items: []Item): map<int, Item> {
+  return indexBy(items, (i: Item) => i.id)
+}
+```
