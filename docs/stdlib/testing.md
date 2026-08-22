@@ -215,3 +215,24 @@ fn testpanic_pop_on_empty() {
   s.pop()
 }
 ```
+
+## Running a subset of tests: `--run <pattern>`
+
+`bit test <file.bit|dir> --run <pattern>` is meant to run only the
+`test_...` functions whose name contains `<pattern>` as a **literal
+substring** — not a glob and not a regex, so nothing in `<pattern>` needs
+escaping and no `*`/`?`/`.` is special. `--run al` is meant to match
+`test_alpha` and nothing else. The match is meant to be case sensitive:
+`--run Alpha` would not match `test_alpha`. A pattern that matches no test
+is meant to be an error, exiting non-zero with
+`bit test: no test matched --run <pattern>`.
+
+**As shipped today, `--run` is parsed and validated but the filter is not
+yet applied (#2833).** Every `test_...` function still runs regardless of
+what pattern follows `--run`, including a pattern that matches no test
+name at all — the run exits 0 whenever those tests pass, not with the
+no-match error above. The one part of this that is already enforced is
+`--run` with nothing after it: that is rejected today, with
+`bit test: --run needs a pattern` on stderr and exit 2. #2834 is the ticket
+that makes the pattern actually narrow which tests run and turns a
+no-match into the error described above.
