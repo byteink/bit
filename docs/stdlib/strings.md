@@ -81,6 +81,26 @@ Every code point, in order.
 How many bytes a UTF-8 sequence starting with lead byte `b` occupies: 1 to 4, or
 1 for an invalid lead byte so a decoder always advances.
 
+### `isValidUtf8(s: string): bool`
+
+True if every byte of `s` belongs to a complete, minimal, in-range UTF-8
+encoding. `runeCount`/`runes` do **not** give you this: they decode a
+malformed byte as U+FFFD and keep going, so a check built on top of them
+cannot tell malformed input apart from input that genuinely contains the
+replacement character. This matters most for overlong encodings — the classic
+UTF-8 filter bypass, where a rune-level reader can see a different string
+than a byte-level one (`\xc0\xaf` overlong-encodes `/`).
+
+Rejects: a bad continuation-byte shape, any of the three overlong minimums
+(2/3/4-byte forms), an encoded surrogate half (U+D800-U+DFFF), a value above
+U+10FFFF, and truncation at end-of-input.
+
+### `toValidUtf8(s: string, replacement: string): string`
+
+`s` with every ill-formed byte sequence replaced by `replacement`;
+well-formed runs are copied through unchanged. Use this to sanitise input you
+intend to keep; use `isValidUtf8` to reject input you intend to refuse.
+
 ### `padLeft(s: string, width: int): string`
 
 `s` left-padded with `U+0020` spaces until it is `width` **runes** — measured
