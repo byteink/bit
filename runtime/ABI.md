@@ -1548,6 +1548,7 @@ defined exactly once).
 | `bit_rt_fs_rename`    | `(oldPath: *const RtBytes, newPath: *const RtBytes) -> i64` (§14) |
 | `bit_rt_fs_list_dir`  | `(path: *const RtBytes) -> *const RtBytes` (§14)        |
 | `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not NUL-terminated, not `RtBytes`; the only `bit_rt_fs_*` entry point shaped this way) |
+| `bit_rt_fs_sync`      | `(fd: i64) -> i64` (§14, `0` on success, `-1` on failure; Darwin uses `F_FULLFSYNC`, falling back to bare `fsync` only on `ENOTSUP` — bare `fsync` alone does not flush the drive's write cache on that platform) |
 | `bit_rt_test_index`   | `() -> i64` (§16)                                      |
 | `bit_rt_floor`        | `(x: f64) -> f64` (§17)                                |
 | `bit_rt_ceil`         | `(x: f64) -> f64` (§17)                                |
@@ -1596,6 +1597,7 @@ defined exactly once).
 | `bit_rt_crypto_aes_invert_schedule_hw` | `(erk: *byte, nr: i64, out: *byte) -> void` (§21b) |
 | `bit_rt_crypto_ghash_mul_hw` | `(acc0, acc1, b0, b1, h0, h1: u64, outHi: *u64) -> u64` (§21b) |
 | `bit_rt_crypto_sha256_compress_hw` | `(state: *u32, block: *byte) -> void` (§21b) |
+| `bit_rt_crypto_hwcaps` | `() -> u64` (§21c) |
 
 **Narrow return values.** The C ABI returns a `bool` in `al`/`w0` and leaves the
 rest of the return register **unspecified**; the same is true of any sub-word
@@ -1920,6 +1922,7 @@ bit_rt_fs_read_all(fd)            -> string     // whole file (regular files onl
 bit_rt_fs_read_all_failed()       -> bool       // #2994/#3065/#2996 below
 bit_rt_fs_read(fd, max: i64)      -> string     // up to max bytes; "" at EOF
 bit_rt_fs_write(fd, s)            -> i64        // bytes written, or -1
+bit_rt_fs_sync(fd)                -> i64        // 0, or -1 (#3462)
 bit_rt_fs_close(fd)               -> i64        // always 0
 bit_rt_fs_exists(path)            -> bool
 bit_rt_fs_is_dir(path)            -> bool
@@ -1972,6 +1975,28 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   to `maxReadAllRetries` (1000) times.
 - `fs_close` reports success unconditionally (the raw wrapper swallows
   `EINTR`/`EBADF`).
+- `fs_sync` (#3462) flushes `fd`'s already-written bytes to stable storage,
+  0 on success, -1 on any failure — a successful `fs_write` only reaches the
+  OS page cache, and pulling power before `fs_sync` returns can still lose
+  it. **Bare `fsync(2)` is not durable on Darwin**: it stops at the drive's
+  write cache. Apple documents `fcntl(fd, F_FULLFSYNC, 0)` (`man 2 fsync`'s
+  CAVEATS section) as the call that actually forces the platter, so Darwin's
+  provider calls that first and falls back to bare `fsync` only when it
+  returns `ENOTSUP` (some older exFAT/SMB mounts reject `F_FULLFSYNC`
+  outright); any other failure is reported as-is, never silently downgraded
+  to the weaker call. Linux's raw `fsync` syscall is already the durable
+  call, no fallback needed. Windows' provider calls `FlushFileBuffers`,
+  which per MSDN forces the OS cache and any intermediate hardware cache to
+  the physical device. **No `stdlib/` caller exists yet** — the same
+  `tools/build/` bootstrap cycle #2153's `stat_w`/`lstat_w` bullet describes
+  below applies here too: `tools/build/artifacts.bit` imports `std/fs`, which
+  the PINNED stage0 compiles against its own frozen `libbitrt.a`, so a
+  `stdlib/fs/fs.bit` reference to this symbol breaks the driver bootstrap
+  with E0078 on every fresh clone until a release ships this commit and the
+  pin moves. This landing is pass 1 of 2 (the #3065 pattern): the runtime
+  primitives only, no consumer. Pass 2 (a `File.sync()` method in
+  `stdlib/fs/fs.bit`) is a follow-up ticket, gated on a release containing
+  this commit and a stage0 repin to it.
 - `fs_read` reads once and returns what it got, so it is the primitive for
   pipes, sockets, and stdin — none of which have a size to seek to.
 - `fs_list_dir` separates entries with a **NUL** byte, the one byte a POSIX
@@ -2645,6 +2670,44 @@ truncation, both applied outside `compress`).
 
 ---
 
+## 21c. ARM64 crypto hardware-capability detection (`runtime/cryptohw`, #2520, epic #1224)
+
+```
+bit_rt_crypto_hwcaps() -> u64   // bit 0 = AES, bit 1 = PMULL, bit 2 = SHA2
+```
+
+The ARM64 mirror of §21b's x86-64 probes, and unlike them, a real
+implementation rather than an ABI-membership placeholder: it is the feature
+*detector* epic #1224's remaining children build the AESE/PMULL/SHA256H
+primitives and stdlib routing on top of.
+
+**Per-target behavior**, split across `runtime/cryptohw/{linux,darwin}/cryptohw.bit`
+because each side calls something the other cannot even compile (§19's
+`syscall`/`extern function` split applies here too):
+
+- **aarch64-linux**: bit `i` is set when `getauxval(AT_HWCAP)` (`runtime/auxv`)
+  has the matching Linux `HWCAP_*` bit — `HWCAP_AES` (1<<3), `HWCAP_PMULL`
+  (1<<4), `HWCAP_SHA2` (1<<6) — set.
+- **aarch64-macos**: bit `i` is set when the matching `sysctlbyname` reads back
+  1 — `hw.optional.arm.FEAT_AES`, `hw.optional.arm.FEAT_PMULL`,
+  `hw.optional.arm.FEAT_SHA256`.
+- **x86_64-linux** (shares the `linux` archive member with aarch64-linux —
+  `scripts/g2archive.sh`'s target->PLAT mapping) **and every other target**:
+  always 0. An x86-64 `AT_HWCAP` value has no relationship to ARM crypto
+  extensions, so the linux provider gates on `onX64()` (`runtime/syscalls`)
+  before reading it at all, rather than testing bits that would coincidentally
+  sometimes be set.
+
+**Computed once, cached in a module-level variable** in whichever OS provider
+is actually linked — a fresh process reads its `AT_HWCAP` word or its three
+`sysctlbyname` results exactly once, and every later call returns the cached
+bitmask. Racing initializers on the first call are harmless: every racing OS
+thread reads the identical hardware state and would cache the identical
+value, the same argument `runtime/park/darwin/wait.bit`'s cached mach
+timebase makes.
+
+---
+
 ## 22. Shared mutable state audit (#1248)
 
 Every container-scope mutable in `runtime/**/*.bit` (grep: `^let ` at module
@@ -2809,7 +2872,18 @@ are compiler-emitted `const` data baked into the object at build time; nothing
 in the runtime ever mutates a `TypeInfo` or a dispatch table post-link, so they
 need no synchronization under any worker count.
 
-**Not found:** no interned-data table or memoization cache exists in
+**Racy-but-idempotent memoization caches (no lock, correct anyway because every
+racing writer computes the identical value):**
+- `runtime/cryptohw/{linux,darwin}/cryptohw.bit`: `hwcapsCache` (#2520) — the
+  `bit_rt_crypto_hwcaps` AES/PMULL/SHA2 bitmask, sentinel `-1` for "not yet
+  computed." Every racing OS thread reads the identical `AT_HWCAP` word (linux)
+  or the identical three `sysctlbyname` results (darwin) and therefore computes
+  and stores the identical bitmask, the same argument the next bullet's
+  `runtime/park/darwin/wait.bit` cache already relies on for its own (currently
+  undocumented here — see that file's own header) `tbNumer`/`tbDenom` mach
+  timebase cache.
+
+**Not found:** no OTHER interned-data table or memoization cache exists in
 `runtime/**/*.bit` outside the entries above (`runtime/rand/rand.bit` and
 `runtime/net/net.bit` declare no container-scope state at all — every random/network call
 is a stateless syscall wrapper).

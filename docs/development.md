@@ -464,6 +464,46 @@ machine code no longer comes from an optimising backend. **Do not read a
 `TIMED OUT` as a hang until you have timed the program standalone**, and run
 `uptime` first — load above ~20 on an 18-core box makes every timing worthless.
 
+**A per-program `timeout-s` file overrides the stress budget for that program
+alone, and never the other way around.** The stress harness
+(`tests/bit/stress/stress.bit`) gives every program in `tests/stress/` the same
+default budget, `defaultTimeoutS` seconds (`stress.bit:166`), applied as its own
+wall-clock deadline to each of the program's three bounded subprocesses in
+turn — compile, the default-policy run, and the `BIT_GC=stress` run
+(`resolveTimeoutMs` folds the effective budget into a per-program `Ctx` at
+`stress.bit:608-624`, and `runScript`/`osRunBounded` re-apply it separately at
+each phase, `verify.bit:221-233`, called from `buildProgram` at `verify.bit:249`
+and `runOnce` at `verify.bit:271`). `BIT_TEST_TIMEOUT_S` raises or lowers that
+default for the whole corpus. A program directory may instead hold a file
+named `timeout-s`, sitting beside the existing `no-collect`/`stress-waived`
+markers (`tests/stress/<name>/timeout-s`) — one line holding a single positive
+integer, the whole-program budget in seconds for that program only, trailing
+whitespace and a trailing newline both fine. Precedence is exactly:
+a valid `timeout-s` file wins over `BIT_TEST_TIMEOUT_S`, which wins over
+`defaultTimeoutS` (`timeoutSOverrideMs`/`resolveTimeoutMs`, `stress.bit:422-441`).
+A present-but-unparsable file fails that one program outright rather than
+silently falling back to the default — a typo must not quietly disable the
+deadline it was meant to set.
+
+**Raise the one program's `timeout-s` file, never `defaultTimeoutS`.** Widening
+the global default buys every slow-by-design program its margin at the cost of
+delaying how fast a real hang anywhere else in the corpus is caught — the
+per-program file exists precisely so one program's cost does not become every
+program's risk.
+
+**No program holds a `timeout-s` file today.** The one that needs a wider
+budget, `tests/stress/quicwire`, gets it from an older and less discoverable
+route: `timeoutMsForProgram` (`stress.bit:401-406`) hardcodes `baseMs * 4` for
+the name `quicwire`, so it runs on 1200s while every other program runs on the
+300s default. That landed as #3210 and predates this file mechanism.
+
+**The two do not layer — a valid file REPLACES the name-based hook**
+(`resolveTimeoutMs`, `stress.bit:436-441`: an absent file falls through to
+`timeoutMsForProgram`, a present one returns outright). So writing a
+`timeout-s` for quicwire with any value below 1200 *lowers* its budget, which
+is the opposite of what such a file usually intends. Anyone adding one must
+read the hardcode first, and the right end state is one mechanism, not two.
+
 Doc snippets are gated: `tests/bit/docs.bit` typechecks every Bit-tagged fenced
 code block under `docs/`, and `tests/bit/stdlibdocs.bit` fails on an undocumented
 export. A doc that does not compile fails the build.

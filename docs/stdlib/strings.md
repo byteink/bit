@@ -156,9 +156,12 @@ so it is code-point order for valid UTF-8.
 
 ### `equalFold(a: string, b: string): bool`
 
-Whether `a` and `b` are equal under ASCII case folding (`A`-`Z` treated as
-`a`-`z`). Bytes outside ASCII compare exactly, unfolded — this is not full
-Unicode case folding, so `equalFold("ÉCOLE", "école")` is `false`.
+Whether `a` and `b` are equal under Unicode **simple** case folding: ASCII
+(`A`-`Z` treated as `a`-`z`) plus Latin-1 Supplement, Latin Extended-A/B,
+Greek and Coptic, and Cyrillic, so `equalFold("ÉCOLE", "école")` is `true`.
+Simple folding only, not full: it never expands a code point into more than
+one, so `equalFold("straße", "STRASSE")` stays `false` — `ß` has no simple
+fold partner. A code point outside the covered scripts folds to itself.
 
 ### `hasPrefix(s: string, prefix: string): bool`
 
@@ -228,11 +231,16 @@ fn firstSpace(s: string): i64 {
 
 ### `toUpper(s: string): string`
 
-ASCII letters uppercased. Bytes outside `a`–`z` are untouched.
+Every code point with a simple Unicode uppercase mapping is uppercased: ASCII
+plus Latin-1 Supplement, Latin Extended-A/B, Greek and Coptic, and Cyrillic.
+A code point outside those scripts is untouched.
 
 ### `toLower(s: string): string`
 
-ASCII letters lowercased.
+Every code point with a simple Unicode lowercase mapping is lowercased, same
+coverage as `toUpper`. Simple folding, not full: e.g. Greek final sigma (Σ at
+the end of a word) lowercases to plain σ, not the context-sensitive final
+form ς.
 
 ### `split(s: string, sep: string): []string`
 

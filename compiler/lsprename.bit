@@ -1,0 +1,439 @@
+// bit lsp (#2334) — textDocument/rename and textDocument/prepareRename.
+//
+// THE GAP THIS FILLS: renaming a class field or method needs every use site
+// that refers to that field/method, and Bit has no qualified names, so a
+// textual replace of the spelling is wrong on two counts at once — it misses
+// nothing the SAME name means elsewhere in the project (an unrelated
+// parameter, a same-named field on a different type), and it can corrupt a
+// spelling that is not even a reference (inside a string literal). A field
+// use site is not one shape, either: `recv.field` (a Tag.Member node, the
+// same shape hover/definition resolve via lspmember.bit), the KEY half of a
+// composite literal's `name: expr` (Tag.FieldInit — the VALUE half is a plain
+// expression and must never be touched even when it happens to read the same
+// spelling, e.g. `Task{ title: title }`), and the field's own declaration
+// (Tag.Field inside a class's Tag.FieldList). All three are gathered here;
+// none of them is in the resolver's `nodeSymbols` table (lspmember.bit's own
+// header explains why a member name never is).
+//
+// A bare identifier (a function, type, let/const, or parameter) needs none of
+// that: `nodeSymbols[node] == sid` already lists the declaration itself AND
+// every reference to it (resolve.bit's rInsertModuleSymbol/rActivateLocal set
+// the declaring NAME node's own entry to its own new symbol id), so walking
+// that one array finds every site.
+//
+// Renaming a symbol declared in ANOTHER module (imported, prelude, or a
+// builtin) is refused rather than attempted: `sym.decl == 0` for a builtin/
+// prelude symbol, and `sym.importedFromModule >= 0` for an import — this file
+// touches only the ROOT module's own tree, so it could never find and edit
+// the real declaration anyway. The same reasoning is why a field/method whose
+// owning type is declared in another module is refused too, structurally
+// rather than by a separate check: `lspFindMemberDecl` (lspmember.bit) only
+// ever scans the root module's tree, so a stdlib type's field returns 0 and
+// the rename is rejected as not-found.
+
+// What position-detection settled on: recvType>0 and name identify a
+// FIELD-OR-METHOD target (isMember); otherwise sid>0 identifies a bare
+// symbol. anchorNode is always the identifier node under the cursor, for
+// prepareRename's range/placeholder — never recomputed from recvType/name,
+// since a field can be found by name at more than one node.
+class LspRenameTarget {
+  ok: bool,
+  isMember: bool,
+  recvType: int,
+  name: string,
+  sid: int,
+  anchorNode: int,
+}
+
+fn lspNoRenameTarget(): LspRenameTarget {
+  return LspRenameTarget{ ok: false, isMember: false, recvType: 0, name: "", sid: 0, anchorNode: 0 }
+}
+
+// The nearest node in `path` (searched leaf-to-root) tagged `tag`, or -1.
+fn lspAncestorWithTag(tree: Tree, path: []int, tag: Tag): int {
+  let i = len(path) - 1
+  while (i >= 0) {
+    if (getNode(tree, path[i]).tag == tag) {
+      return path[i]
+    }
+    i = i - 1
+  }
+  return -1
+}
+
+// Cursor on the NAME half of `recv.NAME` (a usage) — lspmember.bit's own
+// detector, validated against a real field/method before being trusted.
+fn lspRenameFromMemberUse(c: Checker, path: []int): LspRenameTarget {
+  let mref = lspPathMemberName(c.tree, path)
+  if (!mref.isMemberName) {
+    return lspNoRenameTarget()
+  }
+  let recvType = checkExprType(c, kidsOf(c.tree, mref.memberNode)[0])
+  if (recvType <= 0) {
+    return lspNoRenameTarget()
+  }
+  let name = lspMemberNodeText(c, mref.nameNode)
+  if (lspFindMemberDecl(c, recvType, name) <= 0) {
+    return lspNoRenameTarget()
+  }
+  return LspRenameTarget{ ok: true, isMember: true, recvType: recvType, name: name,
+    sid: 0, anchorNode: mref.nameNode }
+}
+
+// Cursor on the KEY half of a composite literal's `name: expr` — never the
+// value half, which is an ordinary expression and may read the same spelling
+// by coincidence (`Task{ title: title }`'s second `title` is the parameter).
+fn lspRenameFromFieldInitKey(c: Checker, path: []int): LspRenameTarget {
+  if (len(path) < 2) {
+    return lspNoRenameTarget()
+  }
+  let leaf = path[len(path) - 1]
+  let parent = path[len(path) - 2]
+  if (getNode(c.tree, parent).tag != Tag.FieldInit || kidsOf(c.tree, parent)[0] != leaf) {
+    return lspNoRenameTarget()
+  }
+  let lit = lspAncestorWithTag(c.tree, path, Tag.CompositeLit)
+  if (lit < 0) {
+    return lspNoRenameTarget()
+  }
+  let recvType = typeFromNode(c, kidsOf(c.tree, lit)[0])
+  if (recvType <= 0) {
+    return lspNoRenameTarget()
+  }
+  let name = lspMemberNodeText(c, leaf)
+  if (lspFindMemberDecl(c, recvType, name) <= 0) {
+    return lspNoRenameTarget()
+  }
+  return LspRenameTarget{ ok: true, isMember: true, recvType: recvType, name: name,
+    sid: 0, anchorNode: leaf }
+}
+
+// Cursor on a class field's OWN declaration (`title: string,` inside a
+// `class Task { ... }`), found by climbing to the enclosing StructDecl for
+// its type rather than re-deriving "which class" any other way.
+fn lspRenameFromFieldDecl(c: Checker, path: []int): LspRenameTarget {
+  if (len(path) < 2) {
+    return lspNoRenameTarget()
+  }
+  let leaf = path[len(path) - 1]
+  let parent = path[len(path) - 2]
+  if (getNode(c.tree, parent).tag != Tag.Field || kidsOf(c.tree, parent)[0] != leaf) {
+    return lspNoRenameTarget()
+  }
+  let structDecl = lspAncestorWithTag(c.tree, path, Tag.StructDecl)
+  if (structDecl < 0) {
+    return lspNoRenameTarget()
+  }
+  let recvType = userTypeLookup(c, lspMemberNodeText(c, kidsOf(c.tree, structDecl)[0]))
+  if (recvType <= 0) {
+    return lspNoRenameTarget()
+  }
+  let name = lspMemberNodeText(c, leaf)
+  if (lspFindMemberDecl(c, recvType, name) <= 0) {
+    return lspNoRenameTarget()
+  }
+  return LspRenameTarget{ ok: true, isMember: true, recvType: recvType, name: name,
+    sid: 0, anchorNode: leaf }
+}
+
+// Cursor on a method's OWN declaration (`fn (t: Task) label() { ... }`'s
+// `label`) — the receiver type is read straight off this FuncDecl, no climb
+// needed.
+fn lspRenameFromMethodDecl(c: Checker, path: []int): LspRenameTarget {
+  if (len(path) < 2) {
+    return lspNoRenameTarget()
+  }
+  let leaf = path[len(path) - 1]
+  let parent = path[len(path) - 2]
+  if (getNode(c.tree, parent).tag != Tag.FuncDecl) {
+    return lspNoRenameTarget()
+  }
+  let k = kidsOf(c.tree, parent)
+  if (k[0] == 0 || k[1] != leaf) {
+    return lspNoRenameTarget()
+  }
+  let recvType = userTypeLookup(c, typeNodeName(c, kidsOf(c.tree, k[0])[1]))
+  if (recvType <= 0) {
+    return lspNoRenameTarget()
+  }
+  let name = lspMemberNodeText(c, leaf)
+  if (lspFindMemberDecl(c, recvType, name) <= 0) {
+    return lspNoRenameTarget()
+  }
+  return LspRenameTarget{ ok: true, isMember: true, recvType: recvType, name: name,
+    sid: 0, anchorNode: leaf }
+}
+
+// A bare identifier (function, type, let/const, parameter, receiver): renamed
+// only when it is declared in THIS module (`decl != 0`) and not reached
+// through an import (`importedFromModule < 0`) — a symbol declared elsewhere
+// has no tree here to find or edit its other sites in.
+fn lspRenameFromSymbol(c: Checker, node: int): LspRenameTarget {
+  if (node <= 0 || node >= len(c.nodeSymbols)) {
+    return lspNoRenameTarget()
+  }
+  let sid = c.nodeSymbols[node]
+  if (sid <= 0 || sid >= len(c.symbols)) {
+    return lspNoRenameTarget()
+  }
+  let sym = c.symbols[sid]
+  if (sym.decl == 0 || sym.importedFromModule >= 0) {
+    return lspNoRenameTarget()
+  }
+  return LspRenameTarget{ ok: true, isMember: false, recvType: 0, name: sym.name,
+    sid: sid, anchorNode: node }
+}
+
+// First match wins, member detectors before the bare-symbol fallback: a
+// member name is never itself in `nodeSymbols` (lspmember.bit), so the two
+// never compete for the same node — this order is about readability, not
+// precedence.
+fn lspRenameTargetAt(c: Checker, node: int, path: []int): LspRenameTarget {
+  let byUse = lspRenameFromMemberUse(c, path)
+  if (byUse.ok) {
+    return byUse
+  }
+  let byInit = lspRenameFromFieldInitKey(c, path)
+  if (byInit.ok) {
+    return byInit
+  }
+  let byField = lspRenameFromFieldDecl(c, path)
+  if (byField.ok) {
+    return byField
+  }
+  let byMethod = lspRenameFromMethodDecl(c, path)
+  if (byMethod.ok) {
+    return byMethod
+  }
+  return lspRenameFromSymbol(c, node)
+}
+
+// Every Tag.Member node whose name text matches `name` and whose receiver's
+// type resolves to `recvType` — a project-wide scan, not a single lookup,
+// because rename (unlike definition) needs every site, not the first one.
+fn lspMemberUsageSites(c: Checker, recvType: int, name: string): []int {
+  let sites = []int(0)
+  let m = 1
+  while (m < len(c.tree.nodes)) {
+    let node = m
+    m = m + 1
+    if (getNode(c.tree, node).tag != Tag.Member) {
+      continue
+    }
+    let k = kidsOf(c.tree, node)
+    if (lspMemberNodeText(c, k[1]) != name || checkExprType(c, k[0]) != recvType) {
+      continue
+    }
+    sites = append(sites, k[1])
+  }
+  return sites
+}
+
+// Every composite literal's field-init KEY (never its value) whose literal
+// type resolves to `recvType` and whose key text matches `name`.
+fn lspFieldInitSites(c: Checker, recvType: int, name: string): []int {
+  let sites = []int(0)
+  let m = 1
+  while (m < len(c.tree.nodes)) {
+    let node = m
+    m = m + 1
+    if (getNode(c.tree, node).tag != Tag.CompositeLit) {
+      continue
+    }
+    let k = kidsOf(c.tree, node)
+    if (typeFromNode(c, k[0]) != recvType) {
+      continue
+    }
+    let items = kidsOf(c.tree, k[1])
+    let ii = 0
+    while (ii < len(items)) {
+      let item = items[ii]
+      ii = ii + 1
+      if (getNode(c.tree, item).tag != Tag.FieldInit) {
+        continue
+      }
+      let fk = kidsOf(c.tree, item)
+      if (lspMemberNodeText(c, fk[0]) == name) {
+        sites = append(sites, fk[0])
+      }
+    }
+  }
+  return sites
+}
+
+// The declaration site plus every usage site — a field/method target's whole
+// edit set.
+fn lspMemberRenameSites(c: Checker, recvType: int, name: string): []int {
+  let sites = []int(0)
+  let declNode = lspFindMemberDecl(c, recvType, name)
+  if (declNode > 0) {
+    sites = append(sites, declNode)
+  }
+  let usages = lspMemberUsageSites(c, recvType, name)
+  let ui = 0
+  while (ui < len(usages)) {
+    sites = append(sites, usages[ui])
+    ui = ui + 1
+  }
+  let inits = lspFieldInitSites(c, recvType, name)
+  let fi = 0
+  while (fi < len(inits)) {
+    sites = append(sites, inits[fi])
+    fi = fi + 1
+  }
+  return sites
+}
+
+// Every node `nodeSymbols` binds to `sid` — the declaring name node and every
+// reference, since both are set to the symbol's own id (compiler/resolve.bit).
+fn lspSymbolRenameSites(c: Checker, sid: int): []int {
+  let sites = []int(0)
+  let i = 1
+  while (i < len(c.nodeSymbols)) {
+    let node = i
+    i = i + 1
+    if (c.nodeSymbols[node] == sid) {
+      sites = append(sites, node)
+    }
+  }
+  return sites
+}
+
+fn lspRenameSitesFor(c: Checker, target: LspRenameTarget): []int {
+  if (target.isMember) {
+    return lspMemberRenameSites(c, target.recvType, target.name)
+  }
+  return lspSymbolRenameSites(c, target.sid)
+}
+
+// One site's edit, plus the URI of the file it falls in — spans on the
+// module's concatenated tree are module-global (lspquery.bit's header), so
+// they are remapped to a per-file range the same way `lspModSpanLocationJson`
+// remaps a definition's target.
+fn lspRenameEditJson(p: Project, modIdx: int, span: Span, newName: string): (string, string) {
+  let m = p.mods[modIdx]
+  let fl = fileOf(m.fileStarts, span.start)
+  let src = fileSource(p.sm, m.files[fl.fileIdx])
+  let start = fl.offset
+  let end = fl.offset + (span.end - span.start)
+  let uri = lspPathToUri(m.dir + "/" + m.fileNames[fl.fileIdx])
+  let edit = "{\"range\":" + lspRangeJson(lspSpanToRange(src, start, end)) +
+    ",\"newText\":" + jsonEncodeString(newName) + "}"
+  return uri, edit
+}
+
+// The WorkspaceEdit `{"changes":{uri:[edit,...],...}}` for `sites`, grouped by
+// file. `order` keeps first-seen URI order so the reply is deterministic
+// across otherwise-identical requests, rather than a map's own order.
+fn lspBuildWorkspaceEdit(p: Project, modIdx: int, tree: Tree, sites: []int, newName: string): string {
+  let groups = map<string, []string>{}
+  let order = []string(0)
+  let i = 0
+  while (i < len(sites)) {
+    let span = getNode(tree, sites[i]).span
+    i = i + 1
+    let (uri, edit) = lspRenameEditJson(p, modIdx, span, newName)
+    let (cur, has) = groups[uri]
+    if (has) {
+      groups[uri] = append(cur, edit)
+    } else {
+      groups[uri] = [edit]
+      order = append(order, uri)
+    }
+  }
+  let parts = []string(0)
+  let oi = 0
+  while (oi < len(order)) {
+    let uri = order[oi]
+    oi = oi + 1
+    let (edits, _) = groups[uri]
+    parts = append(parts, jsonEncodeString(uri) + ":[" + lspJoinComma(edits) + "]")
+  }
+  return "{\"changes\":{" + lspJoinComma(parts) + "}}"
+}
+
+// The shared setup both handlers need: build the project, locate the cursor's
+// node, and classify it. `loc` is kept because prepareRename needs the
+// REQUESTING file's own text to render the anchor's range — the anchor is
+// always in that same file (it is the node the cursor's own offset landed on).
+class LspRenameCtx {
+  ok: bool,
+  lp: LspProject,
+  target: LspRenameTarget,
+  loc: LspFileLoc,
+}
+
+fn lspNoRenameCtx(): LspRenameCtx {
+  return LspRenameCtx{ ok: false, lp: LspProject{ p: emptyProject(), mods: []Checker(0), checkedOk: false },
+    target: lspNoRenameTarget(), loc: LspFileLoc{ found: false, fileIdx: 0, fileSrc: "", fileStart: 0 } }
+}
+
+fn lspResolveRenameTarget(server: LspServer, d: JsonDoc, params: int): LspRenameCtx {
+  let tdp = lspTextDocPosition(d, params)
+  if (!tdp.ok) {
+    return lspNoRenameCtx()
+  }
+  let path = lspUriToPath(tdp.uri)
+  if (path == "") {
+    return lspNoRenameCtx()
+  }
+  let lp = lspBuildProject(server, pathDir(path))
+  if (len(lp.mods) == 0 || !lp.checkedOk) {
+    return lspNoRenameCtx()
+  }
+  let loc = lspLocateFile(lp, path)
+  if (!loc.found) {
+    return lspNoRenameCtx()
+  }
+  let c = lp.mods[lp.p.root]
+  let offset = loc.fileStart + lspPosToByte(loc.fileSrc, tdp.pos)
+  let nodePath = lspNodePath(c.tree, offset)
+  let node = nodePath[len(nodePath) - 1]
+  if (node == 0) {
+    return lspNoRenameCtx()
+  }
+  let target = lspRenameTargetAt(c, node, nodePath)
+  if (!target.ok) {
+    return lspNoRenameCtx()
+  }
+  return LspRenameCtx{ ok: true, lp: lp, target: target, loc: loc }
+}
+
+// `null` for anything `lspRenameTargetAt` refused — a keyword, a literal, a
+// stdlib/builtin symbol, or a spot with no identifier at all — so the editor
+// declines cleanly (§ ticket #2334) instead of letting `textDocument/rename`
+// produce a partial edit.
+fn lspOnPrepareRename(server: LspServer, d: JsonDoc, params: int, idText: string) {
+  let rc = lspResolveRenameTarget(server, d, params)
+  if (!rc.ok) {
+    lspRespond(idText, "null")
+    return
+  }
+  let c = rc.lp.mods[rc.lp.p.root]
+  let sp = getNode(c.tree, rc.target.anchorNode).span
+  let start = sp.start - rc.loc.fileStart
+  let end = sp.end - rc.loc.fileStart
+  let range = lspSpanToRange(rc.loc.fileSrc, start, end)
+  lspRespond(idText, "{\"range\":" + lspRangeJson(range) +
+    ",\"placeholder\":" + jsonEncodeString(rc.loc.fileSrc[start:end]) + "}")
+}
+
+fn lspOnRename(server: LspServer, d: JsonDoc, params: int, idText: string) {
+  let newName = jsonStrOf(d, jsonGet(d, params, "newName"))
+  if (newName == "") {
+    lspRespond(idText, "null")
+    return
+  }
+  let rc = lspResolveRenameTarget(server, d, params)
+  if (!rc.ok) {
+    lspRespond(idText, "null")
+    return
+  }
+  let c = rc.lp.mods[rc.lp.p.root]
+  let sites = lspRenameSitesFor(c, rc.target)
+  if (len(sites) == 0) {
+    lspRespond(idText, "null")
+    return
+  }
+  lspRespond(idText, lspBuildWorkspaceEdit(rc.lp.p, rc.lp.p.root, c.tree, sites, newName))
+}

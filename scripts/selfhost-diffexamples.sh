@@ -82,10 +82,16 @@ TIMEOUT_S=${TIMEOUT_S:-60}
 # does not carry over. Caveat: a child that deliberately exits 142 is
 # indistinguishable from a timeout — no example does, and the retry means such a
 # child would have to do it twice.
-# The subshell wrapper silences the shell's own "Alarm clock: 14" job message.
-# Retry-once-on-stall is scripts/alarmrun.sh's alarmrun_retry (#3408); <outfile>
-# here is the captured build/run log, already freshly truncated per attempt by
-# the `>"$out"` redirect below, so alarmrun_retry's own cleanup arg is "".
+# The subshell wrapper does NOT silence the shell's own "Alarm clock: 14" job
+# message -- measured false on #3478: the note lands inside $out, because the
+# `>"$out" 2>&1` redirect is function-scoped, so this shell's own fd 2 IS the
+# capture while bash reaps the SIGALRM-killed child. Retry-once-on-stall is
+# scripts/alarmrun.sh's alarmrun_retry (#3408); <outfile> here is "" because
+# $out is a caller-owned redirect opened ONCE for both attempts, not a
+# per-attempt truncate -- so a stalled first attempt's partial bytes (and the
+# "Alarm clock" note) survive into the retry's compared payload (#3478). The
+# fix is scripts/alarmrun.sh's alarmrun_retry_cap (#3490); converting this call
+# site to it is separate follow-up work, not yet done.
 alarm_run() {
   local side=$1 out=$2 rc
   shift 2

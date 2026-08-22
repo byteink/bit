@@ -77,6 +77,36 @@ fn accepts(req: Request): string {
 }
 ```
 
+### `Response.setHeader(name: string, value: string): ()!`
+
+Sets header `name` to `value` on `r.headers`, replacing any existing field of
+the same name. Fails, leaving `r.headers` untouched, on a non-token byte in
+`name` or a CR, LF or NUL byte in `value` — the bytes that would otherwise let
+a value reflected from a request inject an extra header line into the
+response `serializeResponse` writes to the wire verbatim.
+
+### `Response.addHeader(name: string, value: string): ()!`
+
+Appends header `name: value` without removing any existing field of the same
+name — the spelling `Set-Cookie` needs, since a response can legitimately
+carry more than one. Same validation as `setHeader`.
+
+### `Response.getHeader(name: string): string`
+
+The value of header `name` already set on `r` (via `setHeader`, `addHeader`,
+or the raw `headers` field), matched case-insensitively, or `""` if absent. On
+a field set more than once via `addHeader`, returns the first occurrence.
+
+```bit
+import { Response, ok } from "std/http"
+
+fn withRequestId(rid: string): Response! {
+  let res = ok("hi")
+  res.setHeader("X-Request-Id", rid)?
+  return res
+}
+```
+
 ## Query strings
 
 `Request.path` is the raw request target straight off the wire —
