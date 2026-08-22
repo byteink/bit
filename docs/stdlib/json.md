@@ -42,6 +42,11 @@ Whether `j` is a `JsonInt`.
 
 Whether `j` is a `JsonFloat`.
 
+### `jsonIsNumber(j: Json): bool`
+
+Whether `j` is a `JsonInt` or a `JsonFloat` - JSON has one number type, so this
+is true for either spelling.
+
 ### `jsonIsString(j: Json): bool`
 
 Whether `j` is a `JsonString`.
@@ -71,6 +76,14 @@ data, never a crash.
 ### `jsonAsFloat(j: Json): Option<f64>`
 
 `Some` of the payload when `j` is a `JsonFloat`, else `None`.
+
+### `jsonAsNumber(j: Json): Option<f64>`
+
+`Some` of the payload widened to `f64` when `j` is a `JsonInt` or a
+`JsonFloat`, else `None`. JSON has one number type - `3` and `3.0` are the
+same document to every producer on the wire - so this is the accessor to use
+when decoding an `f64` field; `jsonAsFloat` alone rejects the integral
+spelling.
 
 ### `jsonAsString(j: Json): Option<string>`
 
