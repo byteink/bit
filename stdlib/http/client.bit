@@ -223,11 +223,16 @@ fn hostHeaderValue(u: Url): string {
 // The HTTP/1.1 request text for `method u.path` with `body`, asking the
 // server to close the connection so `readResponse` can fall back to
 // end-of-stream framing when neither Content-Length nor Transfer-Encoding is
-// present.
-fn buildRequest(method: string, u: Url, body: string): string {
+// present. `headerBlock` is extra request headers, already validated and
+// serialized by `serializeHeaders` (reqheader.bit, #2290) — inserted verbatim,
+// after the framing lines this function owns and before Content-Length, so a
+// caller can never override either by supplying a same-named header (those
+// names are rejected earlier, by `isReservedRequestHeader`).
+fn buildRequest(method: string, u: Url, headerBlock: string, body: string): string {
   let req = "${method} ${u.path} HTTP/1.1\r\n"
   req = req + "Host: ${hostHeaderValue(u)}\r\n"
   req = req + "Connection: close\r\n"
+  req = req + headerBlock
   if (len(body) > 0) {
     req = req + "Content-Length: ${itoa(len(body))}\r\n"
   }
@@ -266,6 +271,23 @@ fn defaultClientConfig(): TlsConfig {
   return cfg
 }
 
+// Shared by `request` and `requestWith`: run `method url` with `body` over
+// `http://`, `https://`, or `https+h3://`, appending `block` (already
+// validated and serialized by the caller — "" for none) as extra request
+// headers, and using `config` for the https leg's TLS. `request` is exactly
+// this with `block` always "", so a caller carrying no extra headers gets
+// byte-identical wire output to before #2290.
+fn requestBlock(method: string, url: string, block: string, body: string, config: TlsConfig): Response! {
+  let u = parseUrl(url)?
+  if (u.h3) {
+    return h3Exchange(u, method, body, block)?
+  }
+  if (u.https) {
+    return httpsExchange(tlsDial(u.host, u.port, config)?, method, u, body, block)?
+  }
+  return exchangeOn(netStream{ conn: dial(u.host, u.port)? }, buildRequest(method, u, block, body))?
+}
+
 // Send `method url` with an optional body and return the response. An `https://`
 // URL runs over TLS 1.3, verifying the server against the system/bundled roots;
 // if ALPN negotiates `h2` the exchange runs over the `std/http2` engine, else over
@@ -274,16 +296,21 @@ fn defaultClientConfig(): TlsConfig {
 // `readResponse`); the server is still asked to close the connection so a
 // response with neither framing header can fall back to end-of-stream.
 // For a custom TLS config (pinned roots, a fixed `serverName`,
-// `insecureSkipVerify`), use `requestTls`.
+// `insecureSkipVerify`), use `requestTls`. To attach request headers, use
+// `requestWith`.
 export fn request(method: string, url: string, body: string): Response! {
-  let u = parseUrl(url)?
-  if (u.h3) {
-    return h3Exchange(u, method, body)?
-  }
-  if (u.https) {
-    return httpsExchange(tlsDial(u.host, u.port, defaultClientConfig())?, method, u, body)?
-  }
-  return exchangeOn(netStream{ conn: dial(u.host, u.port)? }, buildRequest(method, u, body))?
+  return requestBlock(method, url, "", body, defaultClientConfig())?
+}
+
+// As `request`, but attaches `headers` (#2290) — each validated (a legal RFC
+// 9110 field name, a value with no raw CR/LF/NUL) and rejected outright, with
+// no partial send, if any entry is invalid or names a header this module
+// manages itself (`Host`, `Connection`, `Accept-Encoding`, ... — see
+// reqheader.bit's `isReservedRequestHeader` for the full set and why
+// `Accept-Encoding` is on it).
+export fn requestWith(method: string, url: string, headers: []Header, body: string): Response! {
+  let block = serializeHeaders(headers)?
+  return requestBlock(method, url, block, body, defaultClientConfig())?
 }
 
 // As `request`, but over https with an explicit TLS `config` (custom roots, a
@@ -299,7 +326,7 @@ export fn requestTls(method: string, url: string, body: string, config: TlsConfi
   if (len(cfg.alpn) == 0) {
     cfg.alpn = ["h2", "http/1.1"]
   }
-  return httpsExchange(tlsDial(u.host, u.port, cfg)?, method, u, body)?
+  return httpsExchange(tlsDial(u.host, u.port, cfg)?, method, u, body, "")?
 }
 
 // GET `url` (http or https).
@@ -378,17 +405,17 @@ fn requestTimeoutTls(
   let u = parseUrl(url)?
   let deadline = monotonic() + timeoutMs * 1000000
   if (u.h3) {
-    return h3ExchangeDeadline(u, method, body, deadline)?
+    return h3ExchangeDeadline(u, method, body, deadline, "")?
   }
   if (u.https) {
     let cfg = config
     if (len(cfg.alpn) == 0) {
       cfg.alpn = ["h2", "http/1.1"]
     }
-    return httpsExchange(tlsDialDeadline(u.host, u.port, cfg, deadline)?, method, u, body)?
+    return httpsExchange(tlsDialDeadline(u.host, u.port, cfg, deadline)?, method, u, body, "")?
   }
   let conn = dialDeadline(u.host, u.port, deadline)?
-  return exchangeOn(netStream{ conn: conn }, buildRequest(method, u, body))?
+  return exchangeOn(netStream{ conn: conn }, buildRequest(method, u, "", body))?
 }
 
 export fn requestTimeout(method: string, url: string, body: string, timeoutMs: int): Response! {
@@ -453,19 +480,45 @@ fn parseAltSvcH3Port(av: string): int {
 
 // An HTTP client that remembers the HTTP/3 endpoints servers advertise via
 // Alt-Svc, so a later request to the same authority upgrades to HTTP/3. It has no
-// global state: hold one across requests to reuse its cache.
-export class Client { tls: TlsConfig, h3Ports: map<string, int> }
+// global state: hold one across requests to reuse its cache. `headers` (#2290) is
+// this client's own per-client default request headers, set with `setHeader` and
+// sent with every `request`/`requestWith` call this client makes.
+export class Client { tls: TlsConfig, h3Ports: map<string, int>, headers: []Header }
 
 // A `Client` with secure-by-default TLS (verification on, system/bundled roots,
-// ALPN `h2` then `http/1.1`) and an empty Alt-Svc cache.
+// ALPN `h2` then `http/1.1`), an empty Alt-Svc cache, and no default headers.
 export fn newClient(): Client {
-  return Client{ tls: defaultClientConfig(), h3Ports: map<string, int>() }
+  return Client{ tls: defaultClientConfig(), h3Ports: map<string, int>(), headers: []Header(0) }
 }
 
 // A `Client` with an explicit `std/tls` config for its `https://` leg (pinned
-// roots, a fixed `serverName`, `insecureSkipVerify`) and an empty Alt-Svc cache.
+// roots, a fixed `serverName`, `insecureSkipVerify`), an empty Alt-Svc cache, and
+// no default headers.
 export fn newClientTls(config: TlsConfig): Client {
-  return Client{ tls: config, h3Ports: map<string, int>() }
+  return Client{ tls: config, h3Ports: map<string, int>(), headers: []Header(0) }
+}
+
+// Sets a per-client default header sent with every `Client.request`/
+// `Client.requestWith` call this client makes (NOT yet `Client.requestTimeout`/
+// `getTimeout`/`postTimeout` — see #3484, filed for that gap) — e.g. an
+// `Authorization` token used across a whole session. A later call with the same
+// `name` (case-insensitively) replaces the earlier value rather than adding a
+// second line. Fails exactly as `serializeHeaders` would on this one header: an
+// invalid name, a value with a raw CR/LF/NUL, or a name `isReservedRequestHeader`
+// reserves (reqheader.bit).
+export fn (c: Client) setHeader(name: string, value: string): ()! {
+  let h = Header{ name: name, value: value }
+  validateHeader(h)?
+  let lower = toLower(name)
+  let i = 0
+  while (i < len(c.headers)) {
+    if (toLower(c.headers[i].name) == lower) {
+      c.headers[i] = h
+      return
+    }
+    i = i + 1
+  }
+  c.headers = append(c.headers, h)
 }
 
 // Record any `h3=` Alt-Svc advertisement `res` carried for `authority`.
@@ -484,22 +537,40 @@ fn (c: Client) learnAltSvc(authority: string, res: Response) {
 // HTTP/3. An `https://` URL upgrades to HTTP/3 when this client has cached an
 // Alt-Svc endpoint for the authority from an earlier response; otherwise it runs
 // over TLS (HTTP/2 or HTTP/1.1 by ALPN) and learns any Alt-Svc the response
-// advertises. An `http://` URL runs over cleartext HTTP/1.1.
+// advertises. An `http://` URL runs over cleartext HTTP/1.1. To attach request
+// headers, use `requestWith`.
 export fn (c: Client) request(method: string, url: string, body: string): Response! {
+  return c.requestWith(method, url, []Header(0), body)?
+}
+
+// As `Client.request`, but attaches `headers` (#2290) layered onto this
+// client's own default headers (`setHeader`) — a header in `headers` sharing a
+// name with a default replaces it for this call only; the client's stored
+// default is untouched. Same validation as `requestWith`: an invalid name or
+// value, or a reserved header name, fails the whole call before anything is
+// sent.
+export fn (c: Client) requestWith(
+  method: string,
+  url: string,
+  headers: []Header,
+  body: string,
+): Response! {
+  let block = serializeHeaders(mergeHeaders(c.headers, headers))?
   let u = parseUrl(url)?
-  if (u.h3) {
-    return h3Exchange(u, method, body)?
-  }
-  if (!u.https) {
-    return request(method, url, body)?
+  if (u.h3 || !u.https) {
+    return requestBlock(method, url, block, body, c.tls)?
   }
   let key = h2glueAuthority(u)
   let cached = c.h3Ports[key]
   if (cached != 0) {
     let hu = Url{ host: u.host, port: cached, path: u.path, https: true, h3: true }
-    return h3Exchange(hu, method, body)?
+    return h3Exchange(hu, method, body, block)?
   }
-  let res = requestTls(method, url, body, c.tls)?
+  let cfg = c.tls
+  if (len(cfg.alpn) == 0) {
+    cfg.alpn = ["h2", "http/1.1"]
+  }
+  let res = httpsExchange(tlsDial(u.host, u.port, cfg)?, method, u, body, block)?
   c.learnAltSvc(key, res)
   return res
 }

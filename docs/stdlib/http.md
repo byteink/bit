@@ -248,6 +248,63 @@ fn runServer(s: Server, n: int): ()! {
 }
 ```
 
+## Request headers
+
+`header(block, name)` only ever *reads* a raw header block — nothing lets a
+caller *attach* one to an outgoing request. `Header` plus `requestWith` /
+`Client.setHeader` / `Client.requestWith` (below, under [Client](#client)) are
+the write side.
+
+### `Header`
+
+One request header: a caller-supplied `name` and `value`, validated before it
+ever reaches the wire.
+
+### `serializeHeaders(headers: []Header): string!`
+
+Validates every entry of `headers` and serializes them into one raw
+`"Name: value\r\n"`-per-line block — the exact wire form `header()` reads.
+Fails on the first invalid header — an empty name, a name with a byte outside
+RFC 9110 §5.6.2's `token` set, a value containing a raw CR, LF or NUL (the
+request-side twin of the response-header-injection check `header()`'s own
+callers already need), or a name this module manages itself and never lets a
+caller set: `Host`, `Connection`, `Content-Length`, `Transfer-Encoding`,
+`Keep-Alive`, `Proxy-Connection`, `Upgrade`, and `Accept-Encoding`.
+
+**`Accept-Encoding` is deliberately on that list.** There is no compression
+module anywhere in this stdlib — no `gzip`/`flate`/`zlib`/`compress` — so the
+client sends no `Accept-Encoding` and a conforming server never compresses;
+`Response.body` is always exactly what the server sent. Letting a caller write
+`Accept-Encoding: gzip` by hand would make a conforming server compress, and
+`Response.body` would silently become a gzip stream nothing here can inflate —
+a body-corruption bug, not a missing convenience. It stays rejected until a
+decoder exists.
+
+Because a `fail` here returns no value at all, a caller can never observe a
+partial block built from only the headers validated before the one that
+failed — the whole call comes back as one failure.
+
+### `validateHeaderName(name: string): ()!`
+
+Fails unless `name` is a non-empty RFC 9110 `token` (`!#$%&'*+-.^_`|~`, a
+digit, or an ASCII letter, one or more).
+
+### `validateHeaderValue(value: string): ()!`
+
+Fails if `value` contains a raw CR, LF or NUL.
+
+```bit
+import { Header, serializeHeaders } from "std/http"
+
+fn authHeaders(token: string): []Header {
+  return [Header{ name: "Authorization", value: "Bearer ${token}" }]
+}
+
+fn wireBlockFor(token: string): string! {
+  return serializeHeaders(authHeaders(token))?
+}
+```
+
 ## Client
 
 ### `request(method: string, url: string, body: string): Response!`
@@ -256,6 +313,15 @@ Sends `method url` with an optional body and returns the response. The request
 asks the server to close the connection, so the whole response is read to EOF. An
 `https://` URL runs over TLS 1.3, verifying the server's certificate chain and
 hostname against the default roots; an `http://` URL runs over cleartext TCP.
+
+### `requestWith(method: string, url: string, headers: []Header, body: string): Response!`
+
+As `request`, but attaches `headers` (see [Request headers](#request-headers))
+to the outgoing request — `Authorization`, `Content-Type`, `Accept`, or any
+custom header. Each is validated the same way `serializeHeaders` validates it;
+an invalid name or value, or a name this module manages itself (`Host`,
+`Accept-Encoding`, ...), fails the whole call before anything is sent. Covers
+`http://`, `https://`, and `https+h3://`, same as `request`.
 
 ### `get(url: string): Response!`
 
@@ -570,12 +636,28 @@ A `Client` with secure-by-default TLS (verification on, system/bundled roots, AL
 A `Client` with an explicit `std/tls` config for its `https://` leg - pinned roots,
 a fixed `serverName`, or `insecureSkipVerify` - and an empty Alt-Svc cache.
 
+### `Client.setHeader(name: string, value: string): ()!`
+
+Sets a per-client default header sent with every `Client.request`/
+`Client.requestWith` call this client makes (not yet `Client.requestTimeout`/
+`getTimeout`/`postTimeout` - tracked separately). A later call with the same
+`name` (case-insensitively) replaces the earlier value. Validated the same way
+`serializeHeaders` validates a header - an invalid name/value, or a reserved
+name, fails.
+
 ### `Client.request(method: string, url: string, body: string): Response!`
 
 Sends `method url` with an optional body. An `https+h3://` URL always uses HTTP/3;
 an `https://` URL upgrades to HTTP/3 when this client has cached an Alt-Svc endpoint
 for the authority (otherwise it runs over TLS and learns any Alt-Svc the response
 advertises); an `http://` URL runs over cleartext HTTP/1.1.
+
+### `Client.requestWith(method: string, url: string, headers: []Header, body: string): Response!`
+
+As `Client.request`, but attaches `headers` layered onto this client's own
+default headers (`setHeader`) - a header in `headers` sharing a name with a
+default replaces it for this call only; the stored default is untouched. Same
+validation as the package-level `requestWith`.
 
 ### `Client.get(url: string): Response!`
 
@@ -607,7 +689,7 @@ POSTs `body` to `url` through this client (`http://`, `https://`, or
 `https+h3://`), bounded by a whole-request `timeoutMs`.
 
 ```bit
-import { newClient, newClientTls, Client, Response } from "std/http"
+import { newClient, newClientTls, Client, Response, Header } from "std/http"
 import { newTlsConfig, newTrustStore } from "std/tls"
 
 // A client that auto-upgrades to HTTP/3 once a server advertises it via Alt-Svc.
@@ -631,5 +713,17 @@ fn browsePinned(caPem: string): Response! {
 
 fn fetchWith(c: Client, url: string): Response! {
   return c.get(url)?
+}
+
+// A client that authenticates every request with the same bearer token.
+fn authedClient(token: string): Client! {
+  let c = newClient()
+  c.setHeader("Authorization", "Bearer ${token}")?
+  return c
+}
+
+// One call with an extra header layered on top of the client's default.
+fn fetchWithTrace(c: Client, url: string, traceId: string): Response! {
+  return c.requestWith("GET", url, [Header{ name: "X-Request-Id", value: traceId }], "")?
 }
 ```
