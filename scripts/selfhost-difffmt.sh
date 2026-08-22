@@ -100,7 +100,10 @@ probe_fmt() {
   mkdir -p "$dir"
   printf 'fn main() {\n  print("hi\\n")\n}\n' >"$dir/p.bit"
   local out
-  out=$(ALARMRUN_KEEP_STDERR=1 alarmrun "$bin" fmt "$dir/p.bit" 2>&1)
+  # Verdict-deciding (#3422): a single stall aborts the WHOLE differential as
+  # could-not-decide, so it gets alarmrun_retry's one retry, same as the main
+  # loop below and unlike the two forbidden report-only sites in this file.
+  out=$(ALARMRUN_KEEP_STDERR=1 alarmrun_retry "$2" "" "$bin" fmt "$dir/p.bit" 2>&1)
   local rc=$?
   if [ "$rc" -eq 142 ]; then
     echo "difffmt: PROBE TIMEOUT — $bin hung on the capability probe after ${TIMEOUT}s" >&2
@@ -149,7 +152,9 @@ for f in $(find $CORPUS -name '*.bit' | sort); do
   cp "$f" "$a/s.bit"
   cp "$f" "$b/s.bit"
 
-  alarmrun "$ORACLE" fmt "$a/s.bit" >/dev/null
+  # Verdict-deciding (#3422): outfile "" — fmt rewrites its argument IN PLACE,
+  # so the target must survive a retry, unlike a build's -o artifact.
+  alarmrun_retry ORACLE "" "$ORACLE" fmt "$a/s.bit" >/dev/null
   seed_rc=$?
   if [ "$seed_rc" -ge 128 ]; then
     echo "$f" >>"$work/oracletimeout"
@@ -163,7 +168,7 @@ for f in $(find $CORPUS -name '*.bit' | sort); do
     continue
   fi
 
-  alarmrun "$BIT2" fmt "$b/s.bit" >/dev/null
+  alarmrun_retry BIT2 "" "$BIT2" fmt "$b/s.bit" >/dev/null
   rc=$?
   if [ "$rc" -ge 128 ]; then
     echo "$f" >>"$work/timeout"

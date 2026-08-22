@@ -73,7 +73,12 @@ mkdir -p "$WORK/b" "$WORK/c" "$WORK/d"
 # build failure, not exit 1 (a proven non-fixed-point).
 stage() { # <label> <compiler> <out>
   local rc=0
-  ALARMRUN_KEEP_STDERR=1 alarmrun "$2" build compiler -o "$3" >"$WORK/$1.log" 2>&1 || rc=$?
+  # Verdict-deciding (#3422): each stage is the whole build a fixed-point hop
+  # rests on, and this box regularly runs several agents' selfhost builds at
+  # once (#2980) -- exactly the transient-contention shape alarmrun_retry
+  # exists for. outfile is the compiler's own -o target, safe to rm-f between
+  # attempts (unlike the >"$WORK/$1.log" diagnostic capture).
+  ALARMRUN_KEEP_STDERR=1 alarmrun_retry "$1" "$3" "$2" build compiler -o "$3" >"$WORK/$1.log" 2>&1 || rc=$?
   if [ "$rc" -eq 142 ]; then
     echo "fixpoint: $1 TIMED OUT after ${TIMEOUT}s — could not decide, not a broken fixed point" >&2
     sed -n '1,20p' "$WORK/$1.log" >&2

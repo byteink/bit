@@ -81,7 +81,10 @@ probe_doc() {
   mkdir -p "$dir"
   printf 'export fn inc(n: i64): i64 {\n  return n + 1\n}\n' >"$dir/m.bit"
   local out
-  out=$(ALARMRUN_KEEP_STDERR=1 alarmrun "$bin" doc "$dir" 2>&1)
+  # Verdict-deciding (#3422): a single stall here aborts the WHOLE differential
+  # as could-not-decide, so it gets alarmrun_retry's one retry like the main
+  # loop below, not the bare alarmrun the two forbidden report sites keep.
+  out=$(ALARMRUN_KEEP_STDERR=1 alarmrun_retry "$2" "" "$bin" doc "$dir" 2>&1)
   local rc=$?
   if [ "$rc" -eq 142 ]; then
     echo "diffdoc: PROBE TIMEOUT — $bin hung on the capability probe after ${TIMEOUT}s" >&2
@@ -116,8 +119,10 @@ for d in stdlib/*/ examples/*/ tests/imports/*/; do
   # all, so a hung ORACLE wedged the whole gate indefinitely"). A timeout is
   # its own outcome, never folded into SKIP: SKIP means the oracle legitimately
   # declined the directory (not a module, or a module it cannot compile); a
-  # hang means it never reached a verdict at all.
-  alarmrun "$ORACLE" doc "$d" >"$work/seed.plain"
+  # hang means it never reached a verdict at all. Verdict-deciding (#3422):
+  # alarmrun_retry's one retry-on-stall, outfile "" since the redirect below
+  # already targets a fresh per-iteration path.
+  alarmrun_retry ORACLE "" "$ORACLE" doc "$d" >"$work/seed.plain"
   seed_rc=$?
   if [ "$seed_rc" -ge 128 ]; then
     echo "$d (ORACLE timed out after ${TIMEOUT}s, rc=$seed_rc)" >>"$work/timeout"
@@ -128,16 +133,16 @@ for d in stdlib/*/ examples/*/ tests/imports/*/; do
     skip=$((skip + 1))
     continue
   fi
-  alarmrun "$ORACLE" doc --json "$d" >"$work/seed.json"
+  alarmrun_retry ORACLE "" "$ORACLE" doc --json "$d" >"$work/seed.json"
   seed_json_rc=$?
   if [ "$seed_json_rc" -ge 128 ]; then
     echo "$d (ORACLE --json timed out after ${TIMEOUT}s, rc=$seed_json_rc)" >>"$work/timeout"
     continue
   fi
 
-  alarmrun "$BIT2" doc "$d" >"$work/bit.plain"
+  alarmrun_retry BIT2 "" "$BIT2" doc "$d" >"$work/bit.plain"
   bit_rc=$?
-  alarmrun "$BIT2" doc --json "$d" >"$work/bit.json"
+  alarmrun_retry BIT2 "" "$BIT2" doc --json "$d" >"$work/bit.json"
   bit_json_rc=$?
 
   if [ "$bit_rc" -ge 128 ] || [ "$bit_json_rc" -ge 128 ]; then
