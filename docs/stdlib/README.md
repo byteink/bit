@@ -20,6 +20,7 @@ below is compiled by the test suite, so none of it can quietly rot.
 | [net](net.md) | `"std/net"` | TCP, UDP, and DNS over green threads |
 | [http](http.md) | `"std/http"` | HTTP/1.1 server and client |
 | [crypto](crypto.md) | `"std/crypto"` | The `Hash` streaming digest contract |
+| [rand](rand.md) | `"std/rand"` | Seedable pseudo-random generation — NOT cryptographically secure |
 | [tls](tls.md) | `"std/tls"` | TLS 1.3 groups, cipher suites, key schedule, handshake, record |
 | [uuid](uuid.md) | `"std/uuid"` | UUID v4/v5/v7, parse/format |
 | [json](json.md) | `"std/json"` | JSON and JSONC parsing, encoding, and comment-preserving editing |
