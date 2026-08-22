@@ -489,13 +489,20 @@ deadline it was meant to set.
 the global default buys every slow-by-design program its margin at the cost of
 delaying how fast a real hang anywhere else in the corpus is caught — the
 per-program file exists precisely so one program's cost does not become every
-program's risk. `tests/stress/quicwire/timeout-s` holds `600`: its
-`BIT_GC=stress` run alone measures ~184s standalone, and `BIT_GC=stress`
-collecting at every safepoint is inherently much slower than the default
-policy, so the 300s corpus-wide default leaves no room once compile and the
-first (default-policy) run are added on top. 600s is roughly a 3x margin over
-that 184s figure, room for ordinary host variance without hiding an actual
-regression in how long this program's collector work takes.
+program's risk.
+
+**No program holds a `timeout-s` file today.** The one that needs a wider
+budget, `tests/stress/quicwire`, gets it from an older and less discoverable
+route: `timeoutMsForProgram` (`stress.bit:401-406`) hardcodes `baseMs * 4` for
+the name `quicwire`, so it runs on 1200s while every other program runs on the
+300s default. That landed as #3210 and predates this file mechanism.
+
+**The two do not layer — a valid file REPLACES the name-based hook**
+(`resolveTimeoutMs`, `stress.bit:436-441`: an absent file falls through to
+`timeoutMsForProgram`, a present one returns outright). So writing a
+`timeout-s` for quicwire with any value below 1200 *lowers* its budget, which
+is the opposite of what such a file usually intends. Anyone adding one must
+read the hardcode first, and the right end state is one mechanism, not two.
 
 Doc snippets are gated: `tests/bit/docs.bit` typechecks every Bit-tagged fenced
 code block under `docs/`, and `tests/bit/stdlibdocs.bit` fails on an undocumented
