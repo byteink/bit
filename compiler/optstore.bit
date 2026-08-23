@@ -1,0 +1,193 @@
+// Self-host Stage 2: BLOCK-LOCAL STORE-TO-LOAD FORWARDING for `field_set` /
+// `field_get` (#2426). Split out of opt.bit the way optparams.bit was — same
+// module, so nothing here needs an import.
+//
+// ## What it does
+//
+// `x.f = v` followed by a read of `x.f` kept both instructions, so
+// `n = n + 1; return n` on a heap cell paid a store and an immediate reload.
+// The captured-counter idiom is the visible case (#2128 made a captured
+// variable a one-word heap cell), but the same shape is every multi-value
+// return: lowering builds a tuple with `field_set` and destructures it with
+// `field_get` three instructions later. This pass points the load at the
+// stored value; DCE then drops the load.
+//
+// ## The invalidation rule, which IS the correctness argument
+//
+// A forward is legal only when nothing between the store and the load can have
+// written that slot. Three rules, each of which refuses rather than reasons
+// when it cannot prove disjointness.
+//
+// 1. ONE BASE AT A TIME. Every entry in the table belongs to a single SSA base
+//    value, and a store through any other base clears it. So this pass never
+//    has to answer "can these two SSA values point at the same object" — the
+//    question it would get wrong. Two distinct SSA values genuinely can alias:
+//    `append(s, x)` hands back the caller's own backing array, a `bitcast`
+//    renames a pointer, and any two references to one object are the same
+//    memory. There is no alias analysis here to tell them apart, so there is no
+//    case where this pass needs one.
+//
+// 2. WITHIN THAT ONE BASE, A DIFFERENT BYTE OFFSET IS A DIFFERENT SLOT. `ival`
+//    is the byte offset `structLayout` assigned (compiler/loweraccess.bit:66),
+//    and one SSA value has one static type, hence one layout, whose fields do
+//    not overlap. So `field_set B[8] = v` leaves an entry for `B[0]` intact,
+//    which is what lets the `(u8, i32, u8)` tuple in
+//    tests/cases/ir_tuple_layout.bit forward all three of its reads.
+//
+// 3. ANYTHING ELSE THAT COULD WRITE MEMORY CLEARS THE TABLE, and that list is
+//    NOT a new one. `isSideEffecting` (opt.bit) is already this compiler's
+//    answer to "can this op trap, allocate, or write observable state" — DCE
+//    deletes any instruction it does not name, so "writes memory => listed" is
+//    an invariant the tree already stakes correctness on. Reusing it means an
+//    op added later is a barrier here the day it lands rather than silently
+//    transparent, and there is no second table to drift out of step with the
+//    first. Exactly two members are excluded, both accounted for: `field_set`,
+//    which rules 1 and 2 invalidate precisely, and `index_get`, a LOAD whose
+//    only effect is a bounds-check panic, and a panic does not return.
+//
+// `gc_alloc` and `make_closure` are therefore barriers. That is stronger than
+// this pass strictly needs today: the collector is non-moving
+// (runtime/ABI.md:865), stops the world at the safepoint, and writes no user
+// field, so a collection cannot change what a slot holds. But that is a
+// RUNTIME property, and a pass that silently depends on it turns into a
+// miscompile the day the collector changes. Refusing costs one reload.
+//
+// ## What it deliberately does not do
+//
+// - No load-to-load forwarding (CSE of `field_get`). Sound under the same three
+//   rules, but a different transform and not this ticket's.
+// - Nothing across blocks. A predecessor's store is available only where it
+//   dominates, which needs a dominator walk this pass does not have.
+
+// The stores available for forwarding at the current point of one block. Every
+// entry belongs to `base`; `off[i]` is a byte offset and `val[i]` the SSA value
+// id last stored there. `base` is -1 when the table is empty — a value id is
+// never negative, so the sentinel cannot collide with a real base.
+class StoreTable {
+  base: int,
+  off: []int,
+  val: []int,
+}
+
+fn newStoreTable(): StoreTable {
+  return StoreTable{ base: -1, off: []int(0), val: []int(0) }
+}
+
+fn storeTableClear(t: StoreTable) {
+  t.base = -1
+  t.off = []int(0)
+  t.val = []int(0)
+}
+
+// The value id last stored at `base[off]`, or -1 when this pass cannot prove
+// one is still there.
+fn storeTableFind(t: StoreTable, base: int, off: int): int {
+  if (t.base != base) {
+    return -1
+  }
+  let i = 0
+  while (i < len(t.off)) {
+    if (t.off[i] == off) {
+      return t.val[i]
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Records `base[off] = val` and invalidates exactly what rules 1 and 2 permit:
+// a store through a DIFFERENT base drops every entry, a store through the same
+// base drops only the entry at that same offset. Bounded — the table gains at
+// most one entry per `field_set` in the block, and a block has statically many.
+fn storeTableStore(t: StoreTable, base: int, off: int, val: int) {
+  if (t.base != base) {
+    storeTableClear(t)
+    t.base = base
+  }
+  let i = 0
+  while (i < len(t.off)) {
+    if (t.off[i] == off) {
+      t.val[i] = val
+      return
+    }
+    i = i + 1
+  }
+  t.off = append(t.off, off)
+  t.val = append(t.val, val)
+}
+
+// Rule 3: the ops this pass refuses to look through. `isSideEffecting` minus
+// the two members it can account for exactly — see the header. Deriving it
+// rather than listing it is the point: a new op that writes memory must join
+// `isSideEffecting` or DCE would already delete it, and joining it makes it a
+// barrier here for free.
+fn opClobbersFieldSlots(op: Op): bool {
+  return isSideEffecting(op) && op != Op.FieldSet && op != Op.IndexGet
+}
+
+// Answers one `field_get` from the table when a preceding store proves the
+// value. THE TYPE GUARD IS LOAD-BEARING, not a formality: codegen takes a
+// store's width from its VALUE operand's type and a load's from its result type
+// (compiler/arm64compile.bit:232, compiler/x64dispatch.bit:358), so forwarding
+// an i64 store into an i32 read would silently widen what the program sees.
+fn forwardOneLoad(f: IrFunc, t: StoreTable, fwd: []int, idx: int) {
+  let ins = f.instrs[idx]
+  let src = storeTableFind(t, ins.lhs, ins.ival)
+  if (src < 0) {
+    return
+  }
+  if (f.instrs[src].ty != ins.ty) {
+    return
+  }
+  fwd[idx] = src
+}
+
+// One block, front to back. Block params are skipped: they read and write
+// nothing, and `rebuild` emits them ahead of this range anyway.
+fn forwardBlockStores(f: IrFunc, fwd: []int, bi: int) {
+  let blk = f.blocks[bi]
+  let t = newStoreTable()
+  let idx = blk.instsStart + blk.paramCount
+  let end = blk.instsStart + blk.instsLen
+  while (idx < end) {
+    let ins = f.instrs[idx]
+    if (ins.op == Op.FieldGet) {
+      forwardOneLoad(f, t, fwd, idx)
+    } else if (ins.op == Op.FieldSet) {
+      storeTableStore(t, ins.lhs, ins.ival, ins.rhs)
+    } else if (opClobbersFieldSlots(ins.op)) {
+      storeTableClear(t)
+    }
+    idx = idx + 1
+  }
+}
+
+// `n` entries of -1: "forward nothing", for the rebuilds that do no forwarding
+// (DCE, and the inliner's translate-and-copy).
+fn noForwarding(n: int): []int {
+  let fwd = []int(0)
+  let i = 0
+  while (i < n) {
+    fwd = append(fwd, -1)
+    i = i + 1
+  }
+  return fwd
+}
+
+// The forwarding map for `f`: `fwd[id]` is the value id that `id` is provably
+// equal to, or -1 for "emit it". `rebuild` (opt.bit) consults it and the DCE
+// pass behind it removes the loads this made dead.
+//
+// Block-local, so no dominance question arises — a forwarded load and the store
+// answering it sit in the same block, in that order, and `rebuild` walks blocks
+// in ascending `instsStart`, so the source's `remap` entry is always already
+// written when the load is reached.
+fn forwardFieldLoads(f: IrFunc): []int {
+  let fwd = noForwarding(len(f.instrs))
+  let b = 0
+  while (b < len(f.blocks)) {
+    forwardBlockStores(f, fwd, b)
+    b = b + 1
+  }
+  return fwd
+}
