@@ -21,6 +21,16 @@
 // needs a capture position), but the compiler always emits them for every
 // group and anchor — the instruction set already supports #2029's capture
 // slots; only the VM's thread representation stays capture-free until then.
+//
+// COUNTED REPETITION (#2031) compiles by literal expansion — `x{3}` becomes
+// three separate compiled copies of `x`'s own instructions, `x{2,4}` two
+// mandatory copies plus two nested-optional ones — never a native "repeat N
+// times" opcode. That is exponential in nesting (`((a{100}){100}){100}` is
+// 33 source bytes and a million instructions), so `Compiler.steps` bounds
+// it: `emitInst` and `chargeStep` both spend from the SAME budget,
+// `progInstCap`, checked before the work happens, never after — see their
+// doc comments below for why a single counter over "instructions actually
+// appended" cannot, by itself, be enough.
 
 // The nine instruction kinds a compiled program is built from. `AnyNL` is
 // `(?s)`'s dotall `.` (#2030): every rune including `\n`, versus `Any`'s
@@ -41,6 +51,59 @@ class Inst { op: Op, ch: rune, cls: CharClass, x: int, y: int, slot: int, kind: 
 // `numSlots == 2 * (numGroups + 1)` (one open/close pair per group, plus the
 // implicit whole-match group 0).
 class Prog { insts: []Inst, numSlots: int, numGroups: int }
+
+// The total number of `Inst`s a compiled program may ever contain — checked
+// DURING compilation (`emitInst`), not by building an oversized program and
+// measuring `len()` afterward: that would already have done the unbounded
+// allocation this cap exists to prevent.
+const progInstCap: int = 20000
+
+const errProgramTooComplex: string = "regex: pattern too complex (program exceeds 20000 instructions)"
+
+// The compiler's mutable state, threaded through every `compile*` function
+// below by reference (the same "class as a Pascal-style cursor" convention
+// `RegexParser`/`pike.bit`'s `PcStack` use). `steps` is a SECOND counter,
+// independent of `len(insts)`: see `chargeStep`'s doc comment for why
+// `emitInst` alone cannot bound a counted-repeat's expansion loop.
+class Compiler { insts: []Inst, steps: int }
+
+fn newCompiler(): Compiler {
+  return Compiler{ insts: []Inst(0), steps: 0 }
+}
+
+// Appends `inst`, failing `errProgramTooComplex` instead of growing past
+// `progInstCap` — checked BEFORE the append, so the program never actually
+// reaches `progInstCap + 1` instructions in memory.
+fn emitInst(c: Compiler, inst: Inst): ()! {
+  if (len(c.insts) >= progInstCap) {
+    fail newError(errProgramTooComplex)
+  }
+  c.insts = append(c.insts, inst)
+}
+
+// Spends one unit of the SAME budget `emitInst` spends from, without
+// appending anything — called once per copy `compileRepeatCounted`
+// attempts to compile, mandatory or optional, REGARDLESS of how many (if
+// any) real instructions that copy goes on to emit.
+//
+// `emitInst` alone cannot bound a counted-repeat's expansion loop: a
+// sub-pattern that compiles to zero real instructions (a repeated
+// non-capturing empty group, `(?:){1000}`) never grows `len(c.insts)` at
+// all, however many times it is unrolled — nested inside ANOTHER counted
+// repeat, `((?:){1000}){1000}`, the inner loop alone runs a million times,
+// and a third level of nesting is a billion, all while `c.insts` stays
+// empty and `emitInst`'s own check never fires. That is real, unbounded
+// compile-time WORK even though the final program is trivially small — the
+// Power-of-10 violation is in the loop count, not the allocation. Charging
+// per attempted copy, on the same budget, bounds that work to
+// `progInstCap` regardless of nesting shape, exactly like `emitInst` bounds
+// the program's size.
+fn chargeStep(c: Compiler): ()! {
+  if (c.steps >= progInstCap) {
+    fail newError(errProgramTooComplex)
+  }
+  c.steps = c.steps + 1
+}
 
 // --- instruction constructors ----------------------------------------------
 //
@@ -138,92 +201,75 @@ fn instMatch(): Inst {
 
 // Compiles `ast` into a full `Prog`: `Save 0`, the pattern's own
 // instructions, `Save 1`, `Match` — group 0 wrapping the whole thing, per
-// `Prog`'s own doc comment above.
-fn compileProg(ast: Ast, numGroups: int): Prog {
-  let insts: []Inst = []Inst(0)
-  insts = append(insts, instSave(0))
-  insts = compileAst(ast, insts)
-  insts = append(insts, instSave(1))
-  insts = append(insts, instMatch())
-  return Prog{ insts: insts, numSlots: 2 * (numGroups + 1), numGroups: numGroups }
+// `Prog`'s own doc comment above. Fails `errProgramTooComplex` (via
+// `emitInst`/`chargeStep`, propagated up through every `compile*` call)
+// instead of ever holding an oversized program in memory.
+fn compileProg(ast: Ast, numGroups: int): Prog! {
+  let c = newCompiler()
+  emitInst(c, instSave(0))?
+  compileAst(ast, c)?
+  emitInst(c, instSave(1))?
+  emitInst(c, instMatch())?
+  return Prog{ insts: c.insts, numSlots: 2 * (numGroups + 1), numGroups: numGroups }
 }
 
-// Appends `ast`'s instructions to `out` and returns the extended slice.
-// Every AST node compiles to a self-contained run of instructions that
-// falls through to `len(out)` (the next thing appended) on every path that
-// does not jump elsewhere on purpose — so concatenation is just "compile the
-// next node into the same `out`", with no separate linking step. The four
-// structural nodes dispatch to their own compiler; every leaf node (`Empty`
-// plus the five one-instruction `Ast` variants) shares the `_` arm and goes
-// to `compileLeaf` below — split out to keep both functions under the
-// complexity ceiling (E0204): one extra leaf variant, #2030's `AnyCharNL`,
-// was enough to push a single, unsplit `compileAst` over it.
-fn compileAst(ast: Ast, out: []Inst): []Inst {
+// Compiles `ast`'s instructions into `c`. Every AST node compiles to a
+// self-contained run of instructions that falls through to the position
+// right after it on every path that does not jump elsewhere on purpose — so
+// concatenation is just "compile the next node into the same `c`", with no
+// separate linking step. The four structural nodes dispatch to their own
+// compiler; every leaf node (`Empty` plus the five one-instruction `Ast`
+// variants) shares the `_` arm and goes to `compileLeaf` below — split out
+// to keep both functions under the complexity ceiling (E0204): one extra
+// leaf variant, #2030's `AnyCharNL`, was enough to push a single, unsplit
+// `compileAst` over it.
+fn compileAst(ast: Ast, c: Compiler): ()! {
   match (ast) {
-    Concat(items) => return compileConcat(items, out)
-    Alternate(items) => return compileAlternate(items, out)
-    Repeat(node) => return compileRepeat(node, out)
-    Group(node) => return compileGroup(node, out)
-    _ => return compileLeaf(ast, out)
+    Concat(items) => compileConcat(items, c)?
+    Alternate(items) => compileAlternate(items, c)?
+    Repeat(node) => compileRepeat(node, c)?
+    Group(node) => compileGroup(node, c)?
+    _ => compileLeaf(ast, c)?
   }
 }
 
 // The non-structural `Ast` nodes, each a single self-contained instruction
-// (or none, for `Empty`) appended to `out`. A statement-form `match` (rather
-// than `return match(...) {...}`) so each arm can reassign `out` before
-// returning it — `append` may or may not grow into a new backing array, and
-// the reassignment is what keeps that safe (E0214). The trailing `_` is
+// (or none, for `Empty`) appended via `emitInst`. The trailing `_` is
 // unreachable from `compileAst` (every structural node is handled there
 // first) but required for exhaustiveness; it panics rather than silently
 // mishandling a node this function was never meant to see.
-fn compileLeaf(ast: Ast, out: []Inst): []Inst {
+fn compileLeaf(ast: Ast, c: Compiler): ()! {
   match (ast) {
-    Empty => return out
-    Literal(r) => {
-      out = append(out, instChar(r))
-      return out
-    }
-    Class(cc) => {
-      out = append(out, instClass(cc))
-      return out
-    }
-    AnyChar => {
-      out = append(out, instAny())
-      return out
-    }
-    AnyCharNL => {
-      out = append(out, instAnyNL())
-      return out
-    }
-    Anchor(kind) => {
-      out = append(out, instAssert(kind))
-      return out
-    }
+    Empty => {}
+    Literal(r) => emitInst(c, instChar(r))?
+    Class(cc) => emitInst(c, instClass(cc))?
+    AnyChar => emitInst(c, instAny())?
+    AnyCharNL => emitInst(c, instAnyNL())?
+    Anchor(kind) => emitInst(c, instAssert(kind))?
     _ => panic("regex: internal: compileLeaf given a structural Ast node")
   }
 }
 
-fn compileConcat(items: []Ast, out: []Inst): []Inst {
+fn compileConcat(items: []Ast, c: Compiler): ()! {
   let i = 0
   // Bounded by `items`'s length, fixed before the loop starts.
   while (i < len(items)) {
-    out = compileAst(items[i], out)
+    compileAst(items[i], c)?
     i = i + 1
   }
-  return out
 }
 
 // Non-capturing groups (`node.index == 0`, `(?:...)`) compile to just their
 // body; a capturing group wraps it in the `Save` pair that records the
 // group's start/end slots (#2029 reads these; `Regex.matches` does not).
-fn compileGroup(node: GroupNode, out: []Inst): []Inst {
+fn compileGroup(node: GroupNode, c: Compiler): ()! {
   if (node.index == 0) {
-    return compileAst(node.sub, out)
+    compileAst(node.sub, c)?
+    return
   }
-  out = append(out, instSave(2 * node.index))
-  out = compileAst(node.sub, out)
-  out = append(out, instSave(2 * node.index + 1))
-  return out
+  emitInst(c, instSave(2 * node.index))?
+  compileAst(node.sub, c)?
+  emitInst(c, instSave(2 * node.index + 1))?
 }
 
 // `items[0] | items[1] | ... | items[n-1]`, an N-way chain of `Split`s
@@ -232,105 +278,162 @@ fn compileGroup(node: GroupNode, out: []Inst): []Inst {
 // before falling through to try the rest, and ends with a `Jump` past every
 // other branch to the shared exit; the last branch needs neither, since
 // falling off its end already reaches the exit.
-fn compileAlternate(items: []Ast, out: []Inst): []Inst {
+fn compileAlternate(items: []Ast, c: Compiler): ()! {
   let jumpIdxs = []int(0)
   let i = 0
   // Bounded: each iteration compiles one non-last branch, consuming one
   // entry of `items`.
   while (i < len(items) - 1) {
-    let splitIdx = len(out)
-    out = append(out, instSplit())
-    out[splitIdx].x = len(out)
-    out = compileAst(items[i], out)
-    let jumpIdx = len(out)
-    out = append(out, instJump())
+    let splitIdx = len(c.insts)
+    emitInst(c, instSplit())?
+    c.insts[splitIdx].x = len(c.insts)
+    compileAst(items[i], c)?
+    let jumpIdx = len(c.insts)
+    emitInst(c, instJump())?
     jumpIdxs = append(jumpIdxs, jumpIdx)
-    out[splitIdx].y = len(out)
+    c.insts[splitIdx].y = len(c.insts)
     i = i + 1
   }
-  out = compileAst(items[len(items) - 1], out)
-  let end = len(out)
+  compileAst(items[len(items) - 1], c)?
+  let end = len(c.insts)
   let j = 0
   // Bounded by `jumpIdxs`'s length, fixed above.
   while (j < len(jumpIdxs)) {
-    out[jumpIdxs[j]].x = end
+    c.insts[jumpIdxs[j]].x = end
     j = j + 1
   }
-  return out
 }
 
-// Dispatches a `Repeat` node to the one of three shapes the parser can ever
-// produce (`*` = min 0/max -1, `+` = min 1/max -1, `?` = min 0/max 1) —
-// counted repetition (`{n,m}`) is rejected at parse time (#2031), so no
-// other `(min, max)` pair can reach here; `min`/`max` are still carried on
-// `RepeatNode` and honoured by name so #2031 only has to widen the parser.
-fn compileRepeat(node: RepeatNode, out: []Inst): []Inst {
+// Dispatches a `Repeat` node. The three shapes `*`/`+`/`?` keep their own
+// named compilers unchanged (byte-for-byte the same instruction shape as
+// before #2031); everything else — every genuine `{n}`/`{n,}`/`{n,m}` — is
+// `compileRepeatCounted`.
+fn compileRepeat(node: RepeatNode, c: Compiler): ()! {
   if (node.min == 0 && node.max == -1) {
-    return compileStar(node, out)
+    compileStar(node, c)?
+    return
   }
   if (node.min == 1 && node.max == -1) {
-    return compilePlus(node, out)
+    compilePlus(node, c)?
+    return
   }
   if (node.min == 0 && node.max == 1) {
-    return compileQuest(node, out)
+    compileQuest(node, c)?
+    return
   }
-  panic("regex: unsupported repeat bounds min=${node.min} max=${node.max}")
+  compileRepeatCounted(node, c)?
 }
 
 // `*`: `L: Split body, exit` (greedy: `x`=body — tried first; lazy:
 // `y`=body), then the body, then `Jump L`. Zero repetitions is reaching
 // `exit` straight from `L` without ever entering the body.
-fn compileStar(node: RepeatNode, out: []Inst): []Inst {
-  let splitIdx = len(out)
-  out = append(out, instSplit())
-  setPreferredArm(out, splitIdx, node.greedy, len(out))
-  out = compileAst(node.sub, out)
-  out = append(out, instJump())
-  out[len(out) - 1].x = splitIdx
-  setFallbackArm(out, splitIdx, node.greedy, len(out))
-  return out
+fn compileStar(node: RepeatNode, c: Compiler): ()! {
+  let splitIdx = len(c.insts)
+  emitInst(c, instSplit())?
+  setPreferredArm(c.insts, splitIdx, node.greedy, len(c.insts))
+  compileAst(node.sub, c)?
+  emitInst(c, instJump())?
+  c.insts[len(c.insts) - 1].x = splitIdx
+  setFallbackArm(c.insts, splitIdx, node.greedy, len(c.insts))
 }
 
 // `+`: the body once (mandatory), then `Split body, exit` — greedy tries
 // looping back into the body again first; lazy tries the exit first.
-fn compilePlus(node: RepeatNode, out: []Inst): []Inst {
-  let bodyStart = len(out)
-  out = compileAst(node.sub, out)
-  let splitIdx = len(out)
-  out = append(out, instSplit())
-  setPreferredArm(out, splitIdx, node.greedy, bodyStart)
-  setFallbackArm(out, splitIdx, node.greedy, len(out))
-  return out
+fn compilePlus(node: RepeatNode, c: Compiler): ()! {
+  let bodyStart = len(c.insts)
+  compileAst(node.sub, c)?
+  let splitIdx = len(c.insts)
+  emitInst(c, instSplit())?
+  setPreferredArm(c.insts, splitIdx, node.greedy, bodyStart)
+  setFallbackArm(c.insts, splitIdx, node.greedy, len(c.insts))
 }
 
 // `?`: a single `Split body, exit` (greedy tries the body first; lazy tries
 // the exit first) with no loop-back.
-fn compileQuest(node: RepeatNode, out: []Inst): []Inst {
-  let splitIdx = len(out)
-  out = append(out, instSplit())
-  setPreferredArm(out, splitIdx, node.greedy, len(out))
-  out = compileAst(node.sub, out)
-  setFallbackArm(out, splitIdx, node.greedy, len(out))
-  return out
+fn compileQuest(node: RepeatNode, c: Compiler): ()! {
+  let splitIdx = len(c.insts)
+  emitInst(c, instSplit())?
+  setPreferredArm(c.insts, splitIdx, node.greedy, len(c.insts))
+  compileAst(node.sub, c)?
+  setFallbackArm(c.insts, splitIdx, node.greedy, len(c.insts))
+}
+
+// A genuine `{n}`/`{n,}`/`{n,m}` — the three special shapes above already
+// took every `(min, max)` that isn't one of these. `min` mandatory copies of
+// `node.sub`, each compiled fresh (Thompson construction has no shared
+// subroutine call, so N copies really do need N separate instruction runs —
+// the "expansion" #2031's ticket describes), followed by either a trailing
+// Kleene star (unbounded, `max == -1` — reusing `compileStar` unchanged: it
+// only reads `node.sub`/`node.greedy`, both already correct here) or
+// `max - min` further copies nested as optional (`compileOptionalChain`).
+// `chargeStep` is spent once per mandatory copy, for the reason its own doc
+// comment gives.
+fn compileRepeatCounted(node: RepeatNode, c: Compiler): ()! {
+  let i = 0
+  // Bounded: `node.min` was capped at parse time (parserepeat.bit's
+  // `maxRepeatCount`).
+  while (i < node.min) {
+    chargeStep(c)?
+    compileAst(node.sub, c)?
+    i = i + 1
+  }
+  if (node.max == -1) {
+    compileStar(RepeatNode{ min: 0, max: -1, greedy: node.greedy, sub: node.sub }, c)?
+    return
+  }
+  compileOptionalChain(node, node.max - node.min, c)?
+}
+
+// `extra` further optional copies of `node.sub`, nested `(x(x...)?)?`:
+// level 1's `Split` is emitted, then its body (one copy of `node.sub`) is
+// compiled immediately after, then level 2's `Split`, its body, and so on —
+// the same shape `compileQuest` uses for a single level, repeated `extra`
+// times. Every level's FALLBACK arm — the one taken when this copy and
+// every further one are skipped — targets the position after the LAST
+// level's body, not just past its own: skipping any level means every level
+// nested inside it is skipped too. That target is not known until the loop
+// finishes, so every level's split index is recorded and backpatched
+// together at the end, the same two-step shape `compileAlternate` already
+// uses for its own forward jumps.
+fn compileOptionalChain(node: RepeatNode, extra: int, c: Compiler): ()! {
+  let splitIdxs = []int(0)
+  let i = 0
+  // Bounded: `extra` is `max - min`, both parse-time-capped.
+  while (i < extra) {
+    chargeStep(c)?
+    let splitIdx = len(c.insts)
+    emitInst(c, instSplit())?
+    setPreferredArm(c.insts, splitIdx, node.greedy, len(c.insts))
+    compileAst(node.sub, c)?
+    splitIdxs = append(splitIdxs, splitIdx)
+    i = i + 1
+  }
+  let end = len(c.insts)
+  let j = 0
+  // Bounded by `splitIdxs`'s length, fixed above.
+  while (j < len(splitIdxs)) {
+    setFallbackArm(c.insts, splitIdxs[j], node.greedy, end)
+    j = j + 1
+  }
 }
 
 // Points the arm a greedy quantifier tries FIRST (`x`; lazy tries it via
 // `y`) at `target`. The other arm is `setFallbackArm`'s job — the two always
 // come in a pair, one call bracketing the body just compiled.
-fn setPreferredArm(out: []Inst, splitIdx: int, greedy: bool, target: int) {
+fn setPreferredArm(insts: []Inst, splitIdx: int, greedy: bool, target: int) {
   if (greedy) {
-    out[splitIdx].x = target
+    insts[splitIdx].x = target
   } else {
-    out[splitIdx].y = target
+    insts[splitIdx].y = target
   }
 }
 
 // The other arm of the same `Split` — greedy's fallback is `y`, lazy's is
 // `x`.
-fn setFallbackArm(out: []Inst, splitIdx: int, greedy: bool, target: int) {
+fn setFallbackArm(insts: []Inst, splitIdx: int, greedy: bool, target: int) {
   if (greedy) {
-    out[splitIdx].y = target
+    insts[splitIdx].y = target
   } else {
-    out[splitIdx].x = target
+    insts[splitIdx].x = target
   }
 }
