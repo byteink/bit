@@ -62,6 +62,12 @@ for triple in ${RUNTIME_TRIPLES}; do
 done
 
 cp -R "${ROOT}/stdlib" "${STAGE}/stdlib"
+# Shipped so README.md's relative docs/ links (tutorial, development,
+# release/SUPPORT, release/VERSIONING, ...) resolve inside the install
+# instead of 404ing (#3500). Whole tree, not an enumerated subset: an
+# enumerated list goes stale the next time a doc is added, silently, the
+# way this repo's release steps keep going stale when hand-maintained.
+cp -R "${ROOT}/docs" "${STAGE}/docs"
 cp "${ROOT}/LICENSE" "${ROOT}/README.md" "${STAGE}/"
 cp "${ROOT}/dist/README.md" "${STAGE}/ARTIFACT.md"
 

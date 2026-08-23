@@ -73,6 +73,10 @@ bit-<version>-<os>-<arch>/
   lib/aarch64-linux/libbitrt.a         #   can link, so a single install can
   lib/aarch64-macos/libbitrt.a         #   cross-produce the other targets
   stdlib/...                           # the Bit standard library source tree
+  docs/...                             # the docs/ tree, verbatim (#3500) — so
+                                        #   README.md's relative docs/ links
+                                        #   resolve inside the install instead
+                                        #   of 404ing
   LICENSE
   README.md
   ARTIFACT.md                          # this file
