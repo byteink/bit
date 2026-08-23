@@ -1,0 +1,528 @@
+// tools/fuzz/xtarget.bit — aarch64-macos vs x86_64-linux differential over
+// generated programs (#2608, epic #1907).
+//
+// Drives the generator at `tools/fuzz/genprog.bit` (#2605) exactly like its
+// sibling `tools/fuzz/selfcheck.bit` (#2606) does, but instead of asking "did
+// this ONE compiled program self-check correctly", it asks "do the SAME
+// current compiler's two independently-written backends (compiler/arm64.bit,
+// compiler/x64.bit) agree on the SAME source". Both sides are built by THIS
+// tree's own compiler — neither is the pinned stage0 nor a prior release — so
+// this needs no reference implementation, per epic #1907's constraint against
+// fuzzing against stage0 as a correctness oracle.
+//
+// WHAT THIS CATCHES THAT selfcheck.bit CANNOT: a codegen bug specific to one
+// backend shows up here as a cross-target disagreement even when the
+// generated program's own internal self-check would pass on BOTH targets
+// individually (e.g. a register-allocation bug that corrupts an unrelated
+// value without tripping the check it happens to run next to). This is how
+// this project's ABI-boundary bugs were originally found (bootstrap.md §3).
+//
+// WHAT THIS CANNOT CATCH, AND WHY: both targets are built from the exact same
+// parsed, checked, lowered and optimized IR — only the final instruction
+// selection and register allocation differ. A bug in the lexer, parser,
+// checker, lowerer or optimizer (anything ABOVE the arm64.bit/x64.bit split)
+// produces IDENTICALLY wrong IR fed to both backends, so both binaries agree
+// with each other while being equally wrong. #1857's hex-float parseFloat
+// bug is exactly this shape — it lived in the front end, so this differential
+// would have seen 0.0 == 0.0 and reported PASS. That gap is what
+// selfcheck.bit's self-checking oracle covers instead; the two modes are
+// complementary, not redundant.
+//
+// FALSE-POSITIVE AVOIDANCE (ticket item 6: legitimate cross-target
+// differences must not drown a real finding). genprog.bit's own construct
+// set (see its header) is int/float arithmetic, casts and comparisons over
+// values read back out of freshly heap-allocated slices — never a pointer
+// value, an address, a struct layout, or anything else whose bit pattern is
+// architecture-dependent. Its only stdout on success is the fixed line
+// `OK <totalChecks>\n`; its only stderr on an internal-check failure is
+// `FUZZFAIL <exprId> got=<value> want=<value>`, built from the same
+// architecture-independent arithmetic. So no generated program in this
+// corpus has any output that is EXPECTED to differ by target, and a mismatch
+// found here is presumptively a real backend divergence, not noise.
+//
+// Run: `bit run tools/fuzz/xtarget.bit -- --seed <n> --count <n>`.
+//
+//   --seed <n>   first seed to test     (default 1)
+//   --count <n>  how many seeds to test (default 20)
+//
+// For each seed: generate the program, cross-compile it for aarch64-macos
+// and for x86_64-linux, run the aarch64 binary locally, copy the x86_64
+// binary to the ssh alias `hl-master` and run it there, then compare stdout,
+// stderr and exit code of the two runs. On the first mismatch, prints to
+// stderr exactly:
+//
+//   FAIL seed=<n> arm64exit=<a> x64exit=<b> repro: bit run tools/fuzz/genprog.bit -- --seed <n>
+//
+// and exits 1. On full success: `PASS: <count> programs, 0 target mismatches
+// (seed=<start>)`, exit 0. If `ssh hl-master true` fails before any work
+// starts, prints `SKIP: hl-master unreachable` to stdout and exits 0 — a
+// missing remote box is not a red gate.
+//
+// Every subprocess here — local and remote — is bounded (Power of 10 rule
+// 2), via the same `osRunBounded`-over-a-generated-`#!/bin/sh`-wrapper shape
+// selfcheck.bit uses (ABI.md §19). A remote-side hang or a dropped
+// connection surfaces as a distinguishable exit-code sentinel fed straight
+// into the same comparison as a normal exit code, rather than being hidden
+// behind a harness abort — a backend that only hangs on one target is
+// exactly the kind of divergence this mode exists to find.
+//
+// Remote cleanup is best-effort: a failed `rm -rf` over a flaky ssh link
+// prints a warning but does not fail an otherwise-successful run. It is
+// attempted on every termination path that could have left the binary or
+// its output files on hl-master (both PASS and FAIL), so a fresh box is the
+// normal expectation, not a guarantee against a genuine network partition.
+//
+// Uses the compiler binary named by the `BIT` environment variable, falling
+// back to `./bit-out/bin/bit`. Every local artifact is written under
+// $TMPDIR; every remote artifact lives under a run-unique directory in the
+// remote /tmp, named for the same run id.
+
+import { args, envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir } from "std/fs"
+import { parseInt, hasPrefix, split } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// --- bounds (Power of 10 rule 2: every loop and every subprocess wait below
+// is statically bounded) -----------------------------------------------------
+
+const maxCount: int = 10000
+
+// Generating one program from the already-built genprog binary.
+const genTimeoutMs: int = 30000
+
+// Cross-compiling one program for one target.
+const compileTimeoutMs: int = 60000
+
+// Running the aarch64-macos binary locally.
+const localRunTimeoutMs: int = 30000
+
+// The one-time `ssh hl-master true` reachability probe.
+const sshCheckTimeoutMs: int = 15000
+
+// scp in, scp out: plumbing, not the program under test.
+const remoteOpTimeoutMs: int = 30000
+
+// ssh running the x86_64 binary remotely — generous headroom over
+// localRunTimeoutMs for network latency and the real-hardware box being
+// slower than this Mac (see docs cited in the project memory as ~3.5-5x).
+const remoteRunTimeoutMs: int = 45000
+
+// --- targets / host -----------------------------------------------------------
+
+const armTarget: string = "aarch64-macos"
+const x64Target: string = "x86_64-linux"
+const remoteHost: string = "hl-master"
+
+// --- failure -----------------------------------------------------------------
+
+fn die(msg: string) {
+  eprint("${msg}\n")
+  exit(1)
+}
+
+// The one message shape ticket item 5 specifies, verbatim.
+fn failMismatch(seed: int, armExit: int, x64Exit: int) {
+  eprint("FAIL seed=${seed} arm64exit=${armExit} x64exit=${x64Exit} repro: bit run tools/fuzz/genprog.bit -- --seed ${seed}\n")
+  exit(1)
+}
+
+// --- argv --------------------------------------------------------------------
+
+class Args {
+  seed: int,
+  count: int,
+}
+
+fn usageFail() {
+  eprint("usage: xtarget [--seed <n>] [--count <n>]\n")
+  exit(2)
+}
+
+fn parseIntArg(s: string, flag: string): int {
+  return parseInt(s) catch _ {
+    eprint("xtarget: ${flag} value '${s}' is not an integer\n")
+    exit(2)
+    0
+  }
+}
+
+fn nextArg(a: []string, i: int): int {
+  usageFail()
+  return i + 1
+}
+
+fn parseArgs(): Args {
+  let a = args()
+  let seed = 1
+  let count = 20
+  let i = 1
+  while (i < len(a)) {
+    if (a[i] == "--seed" && i + 1 < len(a)) {
+      seed = parseIntArg(a[i + 1], "--seed")
+      i = i + 2
+    } else if (a[i] == "--count" && i + 1 < len(a)) {
+      count = parseIntArg(a[i + 1], "--count")
+      i = i + 2
+    } else {
+      i = nextArg(a, i)
+    }
+  }
+  validateCount(count)
+  return Args{ seed: seed, count: count }
+}
+
+// A missing --count is a fine 0 to allow through argument parsing above, but
+// a green "PASS: 0 programs, 0 target mismatches" is the vacuous-report
+// shape this project refuses elsewhere — so it is validated here.
+fn validateCount(count: int) {
+  if (count <= 0) {
+    die("xtarget: --count must be > 0; 0 would report a green run of zero programs")
+  }
+  if (count > maxCount) {
+    die("xtarget: --count ${count} exceeds the ${maxCount} ceiling")
+  }
+}
+
+// --- subprocess plumbing ------------------------------------------------------
+//
+// `osRunBounded` execs a path directly with no argv of its own (ABI.md §19),
+// so every command line below is a generated `#!/bin/sh` wrapper, matching
+// selfcheck.bit's own shape — the only way to bound a wait AND redirect
+// stdout/stderr (or, for the remote calls, drive ssh/scp) at once.
+
+fn writeExecScript(path: string, cmdLine: string) {
+  writeFile(path, "#!/bin/sh\nexec ${cmdLine}\n") catch e {
+    die("xtarget: write ${path}: ${e.message()}")
+  }
+  if (fsChmod(path, 493) != 0) {
+    die("xtarget: chmod +x failed: ${path}")
+  }
+}
+
+// --- remote reachability -------------------------------------------------------
+
+// Ticket item: "When `ssh hl-master true` fails ... print SKIP ... and exit
+// 0." BatchMode/ConnectTimeout make the probe non-interactive and bounded
+// without changing what is being tested.
+fn remoteReachable(workDir: string): bool {
+  let script = "${workDir}/sshcheck.sh"
+  let log = "${workDir}/sshcheck.log"
+  writeExecScript(
+    script,
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 ${remoteHost} true >\"${log}\" 2>&1",
+  )
+  let rc = osRunBounded(script, sshCheckTimeoutMs)
+  return rc == 0
+}
+
+fn remoteMkdirOrDie(workDir: string, remoteDir: string) {
+  let script = "${workDir}/remote-mkdir.sh"
+  let log = "${workDir}/remote-mkdir.log"
+  writeExecScript(
+    script,
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 ${remoteHost} 'mkdir -p ${remoteDir}' >\"${log}\" 2>&1",
+  )
+  let rc = osRunBounded(script, remoteOpTimeoutMs)
+  if (rc != 0) {
+    die("xtarget: failed to create remote scratch dir ${remoteDir} on ${remoteHost} (rc=${rc}); see ${log}")
+  }
+}
+
+// --- paths ---------------------------------------------------------------------
+
+// Every path this run touches. The build/run/scp/ssh scripts are the same
+// shape for every seed (only the generated source's own content changes),
+// so they are written once in setupPaths rather than once per seed —
+// matching selfcheck.bit's compileScript/runScript reuse.
+class Paths {
+  workDir: string,
+  remoteDir: string,
+  genExe: string,
+  srcPath: string,
+  genScript: string,
+  genErr: string,
+  armExePath: string,
+  armBuildScript: string,
+  armBuildLog: string,
+  armRunScript: string,
+  armOutPath: string,
+  armErrPath: string,
+  x64ExePath: string,
+  x64BuildScript: string,
+  x64BuildLog: string,
+  x64OutPath: string,
+  x64ErrPath: string,
+  scpInScript: string,
+  scpInLog: string,
+  sshRunScript: string,
+  sshOutPath: string,
+  sshErrPath: string,
+  scpOutScript: string,
+  scpOutLog: string,
+}
+
+// Builds tools/fuzz/genprog.bit ONCE, so an N-seed run does not pay a
+// `bit build` of it per seed. A failure here is this harness's own setup
+// breaking, not a finding about the compiler under test.
+fn buildGenerator(bin: string, workDir: string): string {
+  let genExe = "${workDir}/genprog"
+  let buildLog = "${workDir}/genprog-build.log"
+  let script = "${workDir}/genprog-build.sh"
+  writeExecScript(
+    script,
+    "\"${bin}\" build tools/fuzz/genprog.bit -o \"${genExe}\" >\"${buildLog}\" 2>&1",
+  )
+  let rc = osRunBounded(script, compileTimeoutMs)
+  if (rc != 0) {
+    die("xtarget: failed to build tools/fuzz/genprog.bit (rc=${rc}); see ${buildLog}")
+  }
+  return genExe
+}
+
+fn setupPaths(bin: string, workDir: string, genExe: string, remoteDir: string): Paths {
+  let p = Paths{
+    workDir: workDir,
+    remoteDir: remoteDir,
+    genExe: genExe,
+    srcPath: "${workDir}/prog.bit",
+    genScript: "${workDir}/gen.sh",
+    genErr: "${workDir}/gen.err",
+    armExePath: "${workDir}/prog-arm64",
+    armBuildScript: "${workDir}/arm-build.sh",
+    armBuildLog: "${workDir}/arm-build.log",
+    armRunScript: "${workDir}/arm-run.sh",
+    armOutPath: "${workDir}/prog-arm64.out",
+    armErrPath: "${workDir}/prog-arm64.err",
+    x64ExePath: "${workDir}/prog-x64",
+    x64BuildScript: "${workDir}/x64-build.sh",
+    x64BuildLog: "${workDir}/x64-build.log",
+    x64OutPath: "${workDir}/prog.out",
+    x64ErrPath: "${workDir}/prog.err",
+    scpInScript: "${workDir}/scp-in.sh",
+    scpInLog: "${workDir}/scp-in.log",
+    sshRunScript: "${workDir}/ssh-run.sh",
+    sshOutPath: "${workDir}/ssh-run.out",
+    sshErrPath: "${workDir}/ssh-run.err",
+    scpOutScript: "${workDir}/scp-out.sh",
+    scpOutLog: "${workDir}/scp-out.log",
+  }
+  writeStaticScripts(bin, p)
+  return p
+}
+
+fn writeStaticScripts(bin: string, p: Paths) {
+  writeExecScript(
+    p.armBuildScript,
+    "\"${bin}\" build \"${p.srcPath}\" -o \"${p.armExePath}\" --target ${armTarget} >\"${p.armBuildLog}\" 2>&1",
+  )
+  writeExecScript(
+    p.x64BuildScript,
+    "\"${bin}\" build \"${p.srcPath}\" -o \"${p.x64ExePath}\" --target ${x64Target} >\"${p.x64BuildLog}\" 2>&1",
+  )
+  writeExecScript(p.armRunScript, "\"${p.armExePath}\" >\"${p.armOutPath}\" 2>\"${p.armErrPath}\"")
+  writeExecScript(
+    p.scpInScript,
+    "scp -o BatchMode=yes -o ConnectTimeout=8 \"${p.x64ExePath}\" ${remoteHost}:${p.remoteDir}/prog >\"${p.scpInLog}\" 2>&1",
+  )
+  // The remote command is one single-quoted argument to ssh so the LOCAL
+  // shell never touches its `$?` — that must be expanded by the REMOTE
+  // shell, after the target program has actually exited. Chaining with `;`
+  // (not `&&`) means the trailing `echo` always runs and ssh's own exit
+  // status becomes `echo`'s (always 0) rather than the target program's —
+  // which is exactly why the real exit code travels as the XTARGETEXIT
+  // marker in stdout instead of in ssh's process exit status.
+  let remoteCmd = "chmod +x ${p.remoteDir}/prog && ${p.remoteDir}/prog >${p.remoteDir}/prog.out 2>${p.remoteDir}/prog.err; echo \"XTARGETEXIT:$?\""
+  writeExecScript(
+    p.sshRunScript,
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 ${remoteHost} '${remoteCmd}' >\"${p.sshOutPath}\" 2>\"${p.sshErrPath}\"",
+  )
+  writeExecScript(
+    p.scpOutScript,
+    "scp -o BatchMode=yes -o ConnectTimeout=8 ${remoteHost}:${p.remoteDir}/prog.out ${remoteHost}:${p.remoteDir}/prog.err \"${p.workDir}/\" >\"${p.scpOutLog}\" 2>&1",
+  )
+}
+
+// Best-effort: a flaky `rm -rf` over ssh prints a warning but never fails an
+// otherwise-successful (or already-failing) run. Called on both the PASS
+// and the per-seed FAIL path, and from every per-seed harness failure once
+// the remote scratch dir exists — see dieSeed.
+fn remoteCleanupBestEffort(p: Paths) {
+  let script = "${p.workDir}/remote-cleanup.sh"
+  let log = "${p.workDir}/remote-cleanup.log"
+  writeExecScript(
+    script,
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 ${remoteHost} 'rm -rf ${p.remoteDir}' >\"${log}\" 2>&1",
+  )
+  let rc = osRunBounded(script, remoteOpTimeoutMs)
+  if (rc != 0) {
+    eprint("xtarget: warning: cleanup of ${p.remoteDir} on ${remoteHost} failed (rc=${rc}); see ${log}\n")
+  }
+}
+
+// die(), but for a per-seed harness failure discovered after the remote
+// scratch dir was created — attempts remote cleanup first so a mid-run
+// abort does not leave a binary on hl-master.
+fn dieSeed(p: Paths, msg: string) {
+  remoteCleanupBestEffort(p)
+  die(msg)
+}
+
+// --- per-seed check ------------------------------------------------------------
+
+fn generateSource(p: Paths, seed: int) {
+  writeExecScript(p.genScript, "\"${p.genExe}\" --seed ${seed} >\"${p.srcPath}\" 2>\"${p.genErr}\"")
+  let rc = osRunBounded(p.genScript, genTimeoutMs)
+  if (rc != 0) {
+    dieSeed(
+      p,
+      "xtarget: seed ${seed}: generating the program failed or timed out (rc=${rc}); see ${p.genErr}",
+    )
+  }
+}
+
+fn compileBoth(p: Paths, seed: int) {
+  let armRc = osRunBounded(p.armBuildScript, compileTimeoutMs)
+  if (armRc != 0) {
+    dieSeed(
+      p,
+      "xtarget: seed ${seed}: ${armTarget} compile failed (rc=${armRc}); see ${p.armBuildLog}",
+    )
+  }
+  let x64Rc = osRunBounded(p.x64BuildScript, compileTimeoutMs)
+  if (x64Rc != 0) {
+    dieSeed(
+      p,
+      "xtarget: seed ${seed}: ${x64Target} compile failed (rc=${x64Rc}); see ${p.x64BuildLog}",
+    )
+  }
+}
+
+fn runLocalArm(p: Paths): int {
+  return osRunBounded(p.armRunScript, localRunTimeoutMs)
+}
+
+// A transport-level ssh failure (the LOCAL sshRunScript's own rc, never the
+// target program's — see writeStaticScripts) leaves whatever the PREVIOUS
+// seed fetched sitting in p.x64OutPath/p.x64ErrPath. Blanking them stops a
+// coincidental exit-code collision with stale content from producing a
+// false PASS or a misleading FAIL.
+fn clearRemoteOutputs(p: Paths, seed: int) {
+  writeFile(p.x64OutPath, "") catch e {
+    dieSeed(p, "xtarget: seed ${seed}: clearing ${p.x64OutPath}: ${e.message()}")
+  }
+  writeFile(p.x64ErrPath, "") catch e {
+    dieSeed(p, "xtarget: seed ${seed}: clearing ${p.x64ErrPath}: ${e.message()}")
+  }
+}
+
+fn parseMarkerInt(p: Paths, seed: int, s: string): int {
+  return parseInt(s) catch _ {
+    dieSeed(p, "xtarget: seed ${seed}: bad XTARGETEXIT value '${s}'")
+    0
+  }
+}
+
+// genprog.bit's generated program never writes to stdout itself except its
+// own final OK/FUZZFAIL line, so the marker line ssh's own `echo` appended
+// is always present when the remote command genuinely ran to completion.
+fn parseRemoteExit(p: Paths, seed: int): int {
+  let text = readFile(p.sshOutPath) catch _ {
+    ""
+  }
+  let lines = split(text, "\n")
+  for l of lines {
+    if (hasPrefix(l, "XTARGETEXIT:")) {
+      let parts = split(l, ":")
+      return parseMarkerInt(p, seed, parts[1])
+    }
+  }
+  dieSeed(p, "xtarget: seed ${seed}: no XTARGETEXIT marker in ${p.sshOutPath}")
+  return -999
+}
+
+fn runRemoteX64(p: Paths, seed: int): int {
+  let scpInRc = osRunBounded(p.scpInScript, remoteOpTimeoutMs)
+  if (scpInRc != 0) {
+    dieSeed(
+      p,
+      "xtarget: seed ${seed}: scp to ${remoteHost} failed (rc=${scpInRc}); see ${p.scpInLog}",
+    )
+  }
+  let sshRc = osRunBounded(p.sshRunScript, remoteRunTimeoutMs)
+  if (sshRc != 0) {
+    clearRemoteOutputs(p, seed)
+    return sshRc
+  }
+  let x64Exit = parseRemoteExit(p, seed)
+  let scpOutRc = osRunBounded(p.scpOutScript, remoteOpTimeoutMs)
+  if (scpOutRc != 0) {
+    dieSeed(
+      p,
+      "xtarget: seed ${seed}: scp from ${remoteHost} failed (rc=${scpOutRc}); see ${p.scpOutLog}",
+    )
+  }
+  return x64Exit
+}
+
+fn compareResults(p: Paths, seed: int, armExit: int, x64Exit: int) {
+  let armOut = readFile(p.armOutPath) catch _ {
+    ""
+  }
+  let armErr = readFile(p.armErrPath) catch _ {
+    ""
+  }
+  let x64Out = readFile(p.x64OutPath) catch _ {
+    ""
+  }
+  let x64Err = readFile(p.x64ErrPath) catch _ {
+    ""
+  }
+  if (armExit != x64Exit || armOut != x64Out || armErr != x64Err) {
+    remoteCleanupBestEffort(p)
+    failMismatch(seed, armExit, x64Exit)
+  }
+}
+
+fn checkOneSeed(p: Paths, seed: int) {
+  generateSource(p, seed)
+  compileBoth(p, seed)
+  let armExit = runLocalArm(p)
+  let x64Exit = runRemoteX64(p, seed)
+  compareResults(p, seed, armExit, x64Exit)
+}
+
+// --- entry ---------------------------------------------------------------------
+
+fn main() {
+  let bin = envOr("BIT", "./bit-out/bin/bit")
+  let a = parseArgs()
+
+  let tmpBase = envOr("TMPDIR", "/tmp")
+  let runId = uuidFormat(uuidV4())
+  let workDir = "${tmpBase}/bit-xtarget-${runId}"
+  mkdir(workDir) catch e {
+    die("xtarget: mkdir ${workDir}: ${e.message()}")
+  }
+
+  if (!remoteReachable(workDir)) {
+    print("SKIP: hl-master unreachable\n")
+    exit(0)
+  }
+
+  let remoteDir = "/tmp/bit-xtarget-${runId}"
+  remoteMkdirOrDie(workDir, remoteDir)
+
+  let genExe = buildGenerator(bin, workDir)
+  let p = setupPaths(bin, workDir, genExe, remoteDir)
+
+  let seed = a.seed
+  let n = 0
+  while (n < a.count) {
+    checkOneSeed(p, seed)
+    seed = seed + 1
+    n = n + 1
+  }
+
+  remoteCleanupBestEffort(p)
+  print("PASS: ${a.count} programs, 0 target mismatches (seed=${a.seed})\n")
+}
