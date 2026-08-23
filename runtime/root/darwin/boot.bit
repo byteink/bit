@@ -108,6 +108,7 @@ import {
   schedFindWork,
   wkId, wkSleepReq,
   wkLastDone, taskStackBase, taskStackBytes,
+  sysmonTick,
 } from "../../sched"
 // The netpoller provider (#1673). `runtime/sched` may not import it — kqueue
 // against epoll is the platform split the parent module exists to stay clear of
@@ -115,10 +116,27 @@ import {
 // direct call to the three pinned entries. ../linux/boot.bit binds the epoll
 // twin at exactly the same three points.
 import { pollCreate, pollClose, pollDrain } from "../../sched/darwin"
-import { rootBindMemory, rootInit, rootConfigureFromEnv, rootEnvMarkStack, rootEnvVerbose, rootEnvWorkers, rootStatOom, osSetArgs } from "../../root"
+import {
+  rootBindMemory,
+  rootInit,
+  rootConfigureFromEnv,
+  rootEnvMarkStack,
+  rootEnvVerbose,
+  rootEnvWorkers,
+  rootStatOom,
+  osSetArgs,
+} from "../../root"
 import { rootGcAddr, rootWorldAddr } from "../../root"
 import { chanBootBind } from "../../chan"
-import { gcBlockingBegin, gcBlockingEnd, gcThreadEnter, gcThreadExit, gcDefaultMinTrigger, gcDefaultMarkStack, gcDefaultGrowthPct } from "../../gc"
+import {
+  gcBlockingBegin,
+  gcBlockingEnd,
+  gcThreadEnter,
+  gcThreadExit,
+  gcDefaultMinTrigger,
+  gcDefaultMarkStack,
+  gcDefaultGrowthPct,
+} from "../../gc"
 import { stwBind, stwCollections, stwSwept, stwLiveObjects, stwAbandonedCount } from "../../stw"
 import { stwBadOffsets } from "../../stw"
 import { stwSpanChunks, stwSpanChunkBytes } from "../../stw"
@@ -153,6 +171,15 @@ let startHandles: [32]i64
 // step 7's poll-wait below), which never run concurrently with each other or
 // with any worker.
 let bootSleepReq: [2]i64
+
+// Sysmon's own timespec scratch and `threadStart` `done` word (#2579) — never
+// an index into `startArgs`/`startDones`/`startHandles`: sysmon is not a
+// worker, is never joined in step 8, and its `done` is armed once at step 6b
+// and never read again. See `sysmonRun` below for why it needs its own,
+// unshared scratch rather than `bootSleepReq` or a per-worker slot: it runs
+// concurrently with both the boot thread's own step-7 sleep and every worker.
+let sysmonSleepReq: [2]i64
+let sysmonDone: [1]i32
 
 // The netpoller descriptor `boot` creates, kept so teardown can close it —
 // `runtime/sched/`'s `NetPoller.deinit`, which its `Scheduler.deinit` calls. Same
@@ -218,151 +245,6 @@ const joinTimeoutNs: int = 15000000000
 // process-lifetime, mapped once at boot (v1 has no channel-free primitive, §11).
 // Identical to ../linux/boot.bit.
 const chanReserveBytes: int = 1048576
-
-// Round `addr` up to the next `schedStackBytes` boundary (`schedStackAligned`).
-@nosplit fn alignUpStack(addr: int): int {
-  let bumped = addr + schedStackBytes - 1
-  return bumped - bumped % schedStackBytes
-}
-
-// Round `addr` down to the `schedStackBytes` boundary at or below it — the
-// complement of `alignUpStack` above. `./signal.bit`'s `classifyOverflowTrap`
-// uses this to find the candidate stack BASE below an arbitrary `sp` reading,
-// where `alignUpStack` would instead round UP past it: a SIGSEGV/SIGBUS fault
-// address sits BELOW a stack's base (in the guard hole), so rounding up lands
-// on the base, but `sp` at a #2432 inline-trap site sits AT OR ABOVE the base
-// (the corrupting frame lands ON the self-pointer/tag words, never past them —
-// see task.bit's "A task that reaches here"), so rounding up would overshoot
-// to the NEXT granule entirely.
-@nosplit fn alignDownStack(addr: int): int {
-  return addr - addr % schedStackBytes
-}
-
-// `main`'s own stack, and it is NOT `schedStackBytes` (#1843). `runtime/sched/` gives
-// `main` `main_stack_size` = 8 MiB against a goroutine's `stack_size`, because
-// `main` is where user code recurses; the port shipped it at 64KiB, which
-// `tests/stress/deeprecursion` caught by overflowing into neighbouring module
-// state and still printing the right answer. Too large for masked identity, so it
-// is named through `schedRegisterBigStack` instead. Identical to the sibling
-// platform's.
-const mainStackBytes: int = 8388608
-
-// One task stack, aligned as `schedStackAligned` requires and GUARDED BELOW.
-// Returns the base (lowest address, where the tag and the chan scratch live), or
-// 0 on failure. Identical to ../linux/boot.bit's.
-//
-// THE GUARD IS THE POINT, and it costs no extra syscall (#1843). The alignment
-// contract already forces mapping extra granules so a correctly-aligned window
-// can be carved out of them; that leaves slop BELOW the chosen base which was
-// previously left mapped and writable. PROT_NONE-ing it turns it into a hole, so a
-// stack that grows past its base faults instead of scribbling over whatever the
-// allocator put next. `runtime/root/` had this as `mapGuardedStack`; the port shipped
-// without it, and the difference is measurable rather than theoretical: with the
-// hole, a recursion past the limit dies at the boundary having printed NOTHING;
-// without it, the same program printed a plausible checksum and died later
-// (`tests/stress/deeprecursion`, mutation-tested both ways).
-//
-// #2433: THE HEAD HOLE IS `protectPages`'d, NOT `unmapPages`'d. It used to be
-// unmapped, which frees the address range back to the kernel's free list —
-// and `rtSpawn` (below) maps the task control block two statements after
-// calling this function. A first-fit `mmap` regularly landed inside the hole
-// it had just freed: measured on 40 live spawned tasks, 8 (20%) had NO guard
-// left at all, because the task block had consumed the entire hole. Making
-// the hole PROT_NONE instead keeps it a live, occupied mapping — still
-// inaccessible, so an overflow still faults exactly as before, but no later
-// `mapPages` can ever be handed the same address.
-//
-// #2433 (width, this change): the head hole above used to BE `base -
-// region` — a stated maximum of one granule, but no floor: whatever the
-// alignment carve left, which could be as little as a single OS page
-// (4 KiB on Linux/x86, 16 KiB on aarch64-macOS). One oversized frame is
-// then enough to step clean over the hole into whatever mapping follows it,
-// silently, instead of faulting. The head hole is now FLOORED to exactly
-// `schedStackBytes` (64 KiB) below `base`, every call, regardless of where
-// the allocator's alignment landed `region`. `schedStackBytes` is the floor
-// rather than an arbitrary new constant because it was already this hole's
-// observed MAXIMUM before this change — the alignment carve never left
-// more — so the floor never makes a guard narrower than the strongest case
-// this function already produced by luck, only removes the luck, and it
-// keeps every distance in this file in the one granule the masked-identity
-// scheme already uses. It costs 64 KiB of reserved, PROT_NONE VIRTUAL
-// ADDRESS SPACE per spawned task — never resident, since PROT_NONE pages
-// are never faulted in.
-//
-// To guarantee a full granule below `base` regardless of alignment, the
-// mapped region is now `bytes + 2 * schedStackBytes` (one granule wider
-// than before) and `base = alignUpStack(region + schedStackBytes)` rather
-// than `alignUpStack(region + 1)`, forcing `base` at least one whole
-// granule above `region` so `[base - schedStackBytes, base)` is always
-// entirely inside the mapping. The leftover below that fixed guard (0 to
-// `schedStackBytes - 1` bytes, still alignment-dependent) is freed via
-// `unmapPages`: safe, because it sits further from `base` than the guard,
-// so a downward overflow always reaches the fixed guard first, regardless
-// of what a later allocation does with the freed sliver.
-//
-// THE TAIL HOLE (#2167 follow-up) is unrelated to downward-overflow
-// detection — the stack grows DOWN from `base + bytes`
-// (`schedTaskContext`'s call site below) — but is sized off the same
-// mapping and moves with it: the freed head sliver plus the fixed head
-// guard together take `schedStackBytes` of the `bytes + 2 * schedStackBytes`
-// total (by construction), so what remains above `base` is `bytes` plus a
-// tail of `schedStackBytes - headSlop` bytes — never touched, never shows
-// up as RSS, but still a live, counted VMA for as long as the process runs,
-// one per call. `rtSpawn` calls this once per `spawn`, and Linux caps live
-// VMAs per process at `vm.max_map_count` (default 65530): left unmapped, a
-// long-running server would trade a slow OOM kill for an abrupt
-// `rootExit(70)` at roughly 65k live spawns, which is not this ticket's
-// fix, only a different failure mode for the same unbounded growth.
-@nosplit fn mapGuardedStack(bytes: int): int {
-  if (bytes <= 0) {
-    return 0
-  }
-  // `bytes + 2 * schedStackBytes`: one granule so an aligned base can always
-  // be carved (as before), a second so a FULL granule is always available
-  // below that base to dedicate as the guard, regardless of alignment
-  // (#2433 — see header). Aligning to the granule even for an oversized
-  // stack keeps one code path: masking will miss inside it either way (its
-  // interior boundaries hold ordinary frame data, not the tag), and the
-  // oversized-stack registry is what names it.
-  let region = mapPages(bytes + 2 * schedStackBytes)
-  if (region == 0) {
-    return 0
-  }
-  // `alignUpStack(region + schedStackBytes)` rather than `+ 1`: forces base
-  // at least one whole granule above region, so the fixed-width guard below
-  // it (immediately below) is always entirely inside the mapping.
-  let base = alignUpStack(region + schedStackBytes)
-  if (!schedStackAligned(base) || base < region + schedStackBytes || base - region >= 2 * schedStackBytes) {
-    return 0
-  }
-  // The head guard (#2433: floored to exactly one schedStackBytes granule,
-  // PROT_NONE, not unmapped — see the header). A failure here is not fatal
-  // — the stack above is intact and usable, it just has no guard — but it
-  // is never expected, so it is not silent.
-  if (!protectPages(base - schedStackBytes, schedStackBytes)) {
-    return 0
-  }
-  // The unneeded leftover below the fixed guard (0 to schedStackBytes - 1
-  // bytes, still alignment-dependent) is freed back — safe, since it sits
-  // further from base than the guard, so a downward overflow always
-  // reaches the guard first regardless of what reuses this sliver.
-  let headSlop = base - schedStackBytes - region
-  if (headSlop > 0) {
-    if (!unmapPages(region, headSlop)) {
-      return 0
-    }
-  }
-  // The tail hole. See the header: the freed head sliver plus the fixed
-  // head guard together take schedStackBytes of the mapping, so what
-  // remains above base is bytes plus this leftover tail.
-  let tailSlop = schedStackBytes - headSlop
-  if (tailSlop > 0) {
-    if (!unmapPages(base + bytes, tailSlop)) {
-      return 0
-    }
-  }
-  return base
-}
 
 // ---------------------------------------------------------------------------
 // The `BIT_GC_STATS` line (#1639) — kept identical in ../linux/boot.bit
@@ -447,24 +329,24 @@ import { osWriteDecimal } from "../../root"
 // only under `BIT_GC_STATS`. Called after `main` has finished and the worker
 // is reaped, so nothing can be collecting while it reads.
 @nosplit fn statsReport() {
-  let at = statsConst(0, 6729335713145905755, 8)   // "[bit-gc]"
-  at = statsConst(at, 8386658447444108064, 8)      // " collect"
-  at = statsConst(at, 263929622377, 5)             // "ions="
+  let at = statsConst(0, 6729335713145905755, 8) // "[bit-gc]"
+  at = statsConst(at, 8386658447444108064, 8) // " collect"
+  at = statsConst(at, 263929622377, 5) // "ions="
   at = statsNum(at, stwCollections())
-  at = statsConst(at, 17297999666836256, 7)        // " swept="
+  at = statsConst(at, 17297999666836256, 7) // " swept="
   at = statsNum(at, stwSwept())
-  at = statsConst(at, 67505987611680, 6)           // " live="
+  at = statsConst(at, 67505987611680, 6) // " live="
   at = statsNum(at, stwLiveObjects())
-  at = statsConst(at, 7957689491829973280, 8)      // " abandon"
-  at = statsConst(at, 4023397, 3)                  // "ed="
+  at = statsConst(at, 7957689491829973280, 8) // " abandon"
+  at = statsConst(at, 4023397, 3) // "ed="
   at = statsNum(at, stwAbandonedCount())
-  at = statsConst(at, 28448, 2)                    // " o"
-  at = statsConst(at, 4025711, 3)                  // "om="
+  at = statsConst(at, 28448, 2) // " o"
+  at = statsConst(at, 4025711, 3) // "om="
   at = statsNum(at, rootStatOom())
   // Pointer-map offsets the tracer refused and SKIPPED (#1682): a skipped field
   // is a reference never marked, and that degraded trace is indistinguishable
   // from a healthy one everywhere else.
-  at = statsConst(at, 263677108768, 5)             // " bad="
+  at = statsConst(at, 263677108768, 5) // " bad="
   at = statsNum(at, stwBadOffsets())
   // The span reserve's chunk count and total mapped bytes (#3046) — the
   // number that would have root-caused #2803's month-long RSS investigation
@@ -472,10 +354,10 @@ import { osWriteDecimal } from "../../root"
   // wrong way. `stwSpanChunks`/`stwSpanChunkBytes` are the same pinned
   // forwarders `runtime/gc/mem.bit`'s `reserveChunkCount`/
   // `reserveChunkBytesMapped` reach through `runtime/stw`.
-  at = statsConst(at, 4428000980795679520, 8)      // " chunks="
+  at = statsConst(at, 4428000980795679520, 8) // " chunks="
   at = statsNum(at, stwSpanChunks())
-  at = statsConst(at, 8746671548467274528, 8)      // " chunkby"
-  at = statsConst(at, 1030972788, 4)               // "tes="
+  at = statsConst(at, 8746671548467274528, 8) // " chunkby"
+  at = statsConst(at, 1030972788, 4) // "tes="
   at = statsNum(at, stwSpanChunkBytes())
   // The address->object index reserve (`gcIdxRes`) — the tables `idxGrow`
   // (`../gc/gcindex.bit`) allocates and never frees back to the OS (#3146).
@@ -483,13 +365,13 @@ import { osWriteDecimal } from "../../root"
   // one was invisible until now, and it is not small — measured at 30% of
   // peak RSS on the `alloc` benchmark. `stwIdxChunks`/`stwIdxChunkBytes` are
   // the same pinned-forwarder shape as the span pair above.
-  at = statsConst(at, 7959382692878117152, 8)      // " idxchun"
-  at = statsConst(at, 4027243, 3)                  // "ks="
+  at = statsConst(at, 7959382692878117152, 8) // " idxchun"
+  at = statsConst(at, 4027243, 3) // "ks="
   at = statsNum(at, stwIdxChunks())
-  at = statsConst(at, 7310601558962759968, 8)      // " idxbyte"
-  at = statsConst(at, 15731, 2)                    // "s="
+  at = statsConst(at, 7310601558962759968, 8) // " idxbyte"
+  at = statsConst(at, 15731, 2) // "s="
   at = statsNum(at, stwIdxChunkBytes())
-  at = statsConst(at, 10, 1)                       // "\n"
+  at = statsConst(at, 10, 1) // "\n"
   rootWriteAll(stderrFd, int(ptrOf(statsBuf)), at)
 }
 
@@ -526,6 +408,76 @@ export @nosplit @symbol("bit_rt_unmap_pages") fn rtUnmapPages(addr: int, nbytes:
     return 1
   }
   return 0
+}
+
+// ---------------------------------------------------------------------------
+// sysmon — the preemption monitor thread (#2579, #1768's remaining half)
+// ---------------------------------------------------------------------------
+//
+// An independent OS thread that drives `../../sched`'s `sysmonTick` off the
+// wall clock, so a green thread that never reaches a safepoint still gets
+// flagged as over budget (`preempt.bit`'s own header names #2577/#2578 as the
+// two callers that act on the flag this sets; this ticket adds the producer).
+// Started once, in `boot()` step 6b, next to the worker bring-up above it.
+//
+// THE MUTATOR-REGISTRY DECISION, READ AGAINST "THE BOOT THREAD AND THE
+// RENDEZVOUS" ABOVE: that section's fix registers the boot thread (ordinary,
+// non-`@nosplit` Bit code takes the codegen'd back-edge `bl bit_rt_safepoint`
+// automatically) and brackets its one blocking sleep with `blocked`. Sysmon
+// takes the OTHER branch that section names and rejects for the boot thread —
+// "do not register" — and it is sound here for exactly the reason it was
+// unsound there: the boot thread runs `bit_main`'s whole setup path and must
+// be visible to a rendezvous for as long as it can touch the heap, where
+// sysmon never touches the heap at all, on any path, ever. So:
+//
+//   - `@nosplit`, END TO END, including every callee (`sysmonTick`, sibling
+//     ./time.bit's `parkMonoNs` import, the bare `nanosleep` extern `os.bit`
+//     already declares). Codegen emits `bl bit_rt_safepoint` ONLY at a loop's
+//     back edge, and `@nosplit` is what suppresses exactly that call — so
+//     this loop never reaches a safepoint, never calls `currentMutator`, and
+//     never claims a World slot. `worldStoppedFor` (../../gc/gcworldstop.bit)
+//     already treats an unclaimed slot as stopped, so no rendezvous ever
+//     waits on this thread — there is nothing to bracket and nothing to wait
+//     for, which is a stronger guarantee than `blocked` gives a registered one.
+//   - `gcBlockingBegin`/`gcSyscallBegin` are DELIBERATELY NOT USED. Both call
+//     `currentMutator(0)` FIRST (../../gc/gcworldsync.bit) — "registers first,
+//     a thread may block before ever allocating" — which is precisely the
+//     registration this thread must never acquire. Bracketing this sleep with
+//     either would silently violate the ticket's own constraint.
+//   - The STW rendezvous is therefore neither weakened nor bypassed: sysmon
+//     is simply never a party to it, the same way a thread this runtime never
+//     started would be. `sysmonTick` itself touches only its own `@nosplit`
+//     atomic words (`preemptStamp`'s `startNs`/`requested`, per that file's
+//     own header — "NO OS CALLS HERE"), never the GC heap, so there is no
+//     live reference this thread could ever hold across the sleep for a
+//     bracket to protect in the first place.
+//
+// `nanosleep`/`u8At` are the same-module symbols `../os.bit`'s `osPollSleep`
+// already declares and `../fs.bit` already defines — sibling files, one
+// module, no import (see ./bootworker.bit's header for the same rule). Not
+// `osPollSleep` itself: it brackets with `gcSyscallBegin`, which registers.
+// THE CLOCK MUST BE `parkMonoNs`, NOT `../os.bit`'s `osMonoNs` — found by the
+// #2582 oracle going from "peer starved, rounds=1" to "rounds=2" under
+// `BIT_GC=stress` (which forces every poll live) rather than to "ok", which
+// pointed straight at the comparison itself. `../../sched`'s `preemptStamp`
+// (called at every dispatch, `workerrun.bit`) stamps with `monoNs()`, which
+// PINS `parkMonoNs` (mach_absolute_time, scaled) — see ./time.bit's own
+// `rtTimeMonoNs`. `osMonoNs` is a DIFFERENT clock (`clock_gettime`
+// `CLOCK_MONOTONIC`); `sysmonTick`'s `nowNs - started > preemptBudgetNs`
+// silently compares two unrelated epochs if the two sides disagree on which
+// one they read. `parkMonoNs` is already imported by sibling ./time.bit (see
+// the module-state comment above), so no new import is needed here either.
+@nosplit fn sysmonRun(arg: *byte): *byte {
+  let req = int(ptrOf(sysmonSleepReq))
+  let n = 0
+  while (n < WORKER_MAX_STEPS) {
+    storeWord(req, 0)
+    storeWord(req + 8, 2000000) // 2ms: sysmonTick's 10ms budget / 5
+    nanosleep(u8At(req), u8At(0))
+    let _ = sysmonTick(i64(parkMonoNs()))
+    n = n + 1
+  }
+  return nil
 }
 
 // Boot the collector and scheduler, run `bit_main` as the first green thread,
@@ -611,8 +563,10 @@ fn boot(): int {
   if (chanMem == 0) {
     return 70
   }
-  chanBootBind(int(ptrOf(chanReserveDesc)), chanMem, chanReserveBytes,
-               int(ptrOf(chanRegBlock)), int(sched))
+  chanBootBind(
+    int(ptrOf(chanReserveDesc)), chanMem, chanReserveBytes,
+    int(ptrOf(chanRegBlock)), int(sched),
+  )
 
   // 4d. Arm the STOP-THE-WORLD (#1639). `runtime/stw`'s poll — the body the
   //     `bit_rt_safepoint` shim every loop back edge calls hands its snapshot to
@@ -686,6 +640,18 @@ fn boot(): int {
       wi = wi + 1
     }
   }
+
+  // 6b. Start sysmon (#2579), next to the worker bring-up above. NOT FATAL
+  //     on failure — the same tolerance step 6 already gives every worker
+  //     beyond the first, since preemption is a best-effort protection
+  //     against a runaway task rather than a correctness requirement. Its
+  //     handle and `done` word are deliberately never used again: sysmon has
+  //     no green task, is not reaped in step 8's join loop, and simply
+  //     outlives the program — `machoMain`'s return hands the exit code to
+  //     dyld, which calls `exit()`, and the kernel reclaims every remaining
+  //     OS thread at that point the same way it would any other.
+  let sysmonArg: *byte = nil
+  let _ = threadStart(entryOf(sysmonRun), sysmonArg, ptrOf(sysmonDone))
 
   // 7. Poll-wait for `main` with bounded exponential backoff (not a worker).
   //    THE SLEEP IS BRACKETED `blocked` — see "THE BOOT THREAD AND THE
@@ -772,8 +738,10 @@ export @nosplit @symbol("bit_rt_spawn") fn rtSpawn(entry: *byte, arg: int) {
   }
 
   *(taskAt(taskAddr) + taskSpawnEntry) = int(entry)
-  schedTaskInit(taskAt(taskAddr), stackBase, schedStackBytes,
-                entryOf(schedSpawnTrampoline), arg)
+  schedTaskInit(
+    taskAt(taskAddr), stackBase, schedStackBytes,
+    entryOf(schedSpawnTrampoline), arg,
+  )
   schedSpawn(s, taskAddr)
 }
 

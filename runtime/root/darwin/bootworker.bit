@@ -7,6 +7,15 @@
 // bit_rt_map_pages/bit_rt_unmap_pages/bit_rt_spawn seams, and the process
 // entry (machoMain).
 //
+// #2579 MOVED THE GUARDED-STACK-MAPPING UTILITIES HERE (alignUpStack,
+// alignDownStack, mapGuardedStack, at the bottom of this file) for the exact
+// #2882 reason above: adding sysmonRun's definition to ./boot.bit — required
+// there by #2579's own acceptance test — left no room under 800 lines
+// otherwise. A pure move, verified by `comm -23` against the pre-move
+// concatenation of both files. Both of `mapGuardedStack`'s callers
+// (`boot()`'s step 5, `rtSpawn`) stay in ./boot.bit and reach it the same
+// order-independent, no-import way described below.
+//
 // Same module as every sibling here (module files share one scope), so
 // boot.bit's imports and module state — schedBlock, mainTaskBlock,
 // bootSleepReq, mainExitCode, mainDone — are visible below with no
@@ -337,5 +346,156 @@ fn mainTrampoline() {
   mainExitCode = int(bit_main())
   atomicStore(ptrOf(mainDone), i32(1))
   schedTaskExit()
+}
+
+// ---------------------------------------------------------------------------
+// Guarded stack mapping — moved from ./boot.bit by #2579 (see the header note
+// above). Unchanged verbatim.
+// ---------------------------------------------------------------------------
+// Round `addr` up to the next `schedStackBytes` boundary (`schedStackAligned`).
+@nosplit fn alignUpStack(addr: int): int {
+  let bumped = addr + schedStackBytes - 1
+  return bumped - bumped % schedStackBytes
+}
+
+// Round `addr` down to the `schedStackBytes` boundary at or below it — the
+// complement of `alignUpStack` above. `./signal.bit`'s `classifyOverflowTrap`
+// uses this to find the candidate stack BASE below an arbitrary `sp` reading,
+// where `alignUpStack` would instead round UP past it: a SIGSEGV/SIGBUS fault
+// address sits BELOW a stack's base (in the guard hole), so rounding up lands
+// on the base, but `sp` at a #2432 inline-trap site sits AT OR ABOVE the base
+// (the corrupting frame lands ON the self-pointer/tag words, never past them —
+// see task.bit's "A task that reaches here"), so rounding up would overshoot
+// to the NEXT granule entirely.
+@nosplit fn alignDownStack(addr: int): int {
+  return addr - addr % schedStackBytes
+}
+
+// `main`'s own stack, and it is NOT `schedStackBytes` (#1843). `runtime/sched/` gives
+// `main` `main_stack_size` = 8 MiB against a goroutine's `stack_size`, because
+// `main` is where user code recurses; the port shipped it at 64KiB, which
+// `tests/stress/deeprecursion` caught by overflowing into neighbouring module
+// state and still printing the right answer. Too large for masked identity, so it
+// is named through `schedRegisterBigStack` instead. Identical to the sibling
+// platform's.
+const mainStackBytes: int = 8388608
+
+// One task stack, aligned as `schedStackAligned` requires and GUARDED BELOW.
+// Returns the base (lowest address, where the tag and the chan scratch live), or
+// 0 on failure. Identical to ../linux/boot.bit's.
+//
+// THE GUARD IS THE POINT, and it costs no extra syscall (#1843). The alignment
+// contract already forces mapping extra granules so a correctly-aligned window
+// can be carved out of them; that leaves slop BELOW the chosen base which was
+// previously left mapped and writable. PROT_NONE-ing it turns it into a hole, so a
+// stack that grows past its base faults instead of scribbling over whatever the
+// allocator put next. `runtime/root/` had this as `mapGuardedStack`; the port shipped
+// without it, and the difference is measurable rather than theoretical: with the
+// hole, a recursion past the limit dies at the boundary having printed NOTHING;
+// without it, the same program printed a plausible checksum and died later
+// (`tests/stress/deeprecursion`, mutation-tested both ways).
+//
+// #2433: THE HEAD HOLE IS `protectPages`'d, NOT `unmapPages`'d. It used to be
+// unmapped, which frees the address range back to the kernel's free list —
+// and `rtSpawn` (below) maps the task control block two statements after
+// calling this function. A first-fit `mmap` regularly landed inside the hole
+// it had just freed: measured on 40 live spawned tasks, 8 (20%) had NO guard
+// left at all, because the task block had consumed the entire hole. Making
+// the hole PROT_NONE instead keeps it a live, occupied mapping — still
+// inaccessible, so an overflow still faults exactly as before, but no later
+// `mapPages` can ever be handed the same address.
+//
+// #2433 (width, this change): the head hole above used to BE `base -
+// region` — a stated maximum of one granule, but no floor: whatever the
+// alignment carve left, which could be as little as a single OS page
+// (4 KiB on Linux/x86, 16 KiB on aarch64-macOS). One oversized frame is
+// then enough to step clean over the hole into whatever mapping follows it,
+// silently, instead of faulting. The head hole is now FLOORED to exactly
+// `schedStackBytes` (64 KiB) below `base`, every call, regardless of where
+// the allocator's alignment landed `region`. `schedStackBytes` is the floor
+// rather than an arbitrary new constant because it was already this hole's
+// observed MAXIMUM before this change — the alignment carve never left
+// more — so the floor never makes a guard narrower than the strongest case
+// this function already produced by luck, only removes the luck, and it
+// keeps every distance in this file in the one granule the masked-identity
+// scheme already uses. It costs 64 KiB of reserved, PROT_NONE VIRTUAL
+// ADDRESS SPACE per spawned task — never resident, since PROT_NONE pages
+// are never faulted in.
+//
+// To guarantee a full granule below `base` regardless of alignment, the
+// mapped region is now `bytes + 2 * schedStackBytes` (one granule wider
+// than before) and `base = alignUpStack(region + schedStackBytes)` rather
+// than `alignUpStack(region + 1)`, forcing `base` at least one whole
+// granule above `region` so `[base - schedStackBytes, base)` is always
+// entirely inside the mapping. The leftover below that fixed guard (0 to
+// `schedStackBytes - 1` bytes, still alignment-dependent) is freed via
+// `unmapPages`: safe, because it sits further from `base` than the guard,
+// so a downward overflow always reaches the fixed guard first, regardless
+// of what a later allocation does with the freed sliver.
+//
+// THE TAIL HOLE (#2167 follow-up) is unrelated to downward-overflow
+// detection — the stack grows DOWN from `base + bytes`
+// (`schedTaskContext`'s call site below) — but is sized off the same
+// mapping and moves with it: the freed head sliver plus the fixed head
+// guard together take `schedStackBytes` of the `bytes + 2 * schedStackBytes`
+// total (by construction), so what remains above `base` is `bytes` plus a
+// tail of `schedStackBytes - headSlop` bytes — never touched, never shows
+// up as RSS, but still a live, counted VMA for as long as the process runs,
+// one per call. `rtSpawn` calls this once per `spawn`, and Linux caps live
+// VMAs per process at `vm.max_map_count` (default 65530): left unmapped, a
+// long-running server would trade a slow OOM kill for an abrupt
+// `rootExit(70)` at roughly 65k live spawns, which is not this ticket's
+// fix, only a different failure mode for the same unbounded growth.
+@nosplit fn mapGuardedStack(bytes: int): int {
+  if (bytes <= 0) {
+    return 0
+  }
+  // `bytes + 2 * schedStackBytes`: one granule so an aligned base can always
+  // be carved (as before), a second so a FULL granule is always available
+  // below that base to dedicate as the guard, regardless of alignment
+  // (#2433 — see header). Aligning to the granule even for an oversized
+  // stack keeps one code path: masking will miss inside it either way (its
+  // interior boundaries hold ordinary frame data, not the tag), and the
+  // oversized-stack registry is what names it.
+  let region = mapPages(bytes + 2 * schedStackBytes)
+  if (region == 0) {
+    return 0
+  }
+  // `alignUpStack(region + schedStackBytes)` rather than `+ 1`: forces base
+  // at least one whole granule above region, so the fixed-width guard below
+  // it (immediately below) is always entirely inside the mapping.
+  let base = alignUpStack(region + schedStackBytes)
+  if (!schedStackAligned(base) ||
+    base < region + schedStackBytes ||
+    base - region >= 2 * schedStackBytes) {
+    return 0
+  }
+  // The head guard (#2433: floored to exactly one schedStackBytes granule,
+  // PROT_NONE, not unmapped — see the header). A failure here is not fatal
+  // — the stack above is intact and usable, it just has no guard — but it
+  // is never expected, so it is not silent.
+  if (!protectPages(base - schedStackBytes, schedStackBytes)) {
+    return 0
+  }
+  // The unneeded leftover below the fixed guard (0 to schedStackBytes - 1
+  // bytes, still alignment-dependent) is freed back — safe, since it sits
+  // further from base than the guard, so a downward overflow always
+  // reaches the guard first regardless of what reuses this sliver.
+  let headSlop = base - schedStackBytes - region
+  if (headSlop > 0) {
+    if (!unmapPages(region, headSlop)) {
+      return 0
+    }
+  }
+  // The tail hole. See the header: the freed head sliver plus the fixed
+  // head guard together take schedStackBytes of the mapping, so what
+  // remains above base is bytes plus this leftover tail.
+  let tailSlop = schedStackBytes - headSlop
+  if (tailSlop > 0) {
+    if (!unmapPages(base + bytes, tailSlop)) {
+      return 0
+    }
+  }
+  return base
 }
 
