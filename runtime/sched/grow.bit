@@ -135,3 +135,145 @@ export fn schedMaybeGrow(s: *i64, entry: *byte, argArea: *i64,
   }
   return schedStartWorker(s, entry, argArea, doneArea, handleArea, startFn)
 }
+
+// ---------------------------------------------------------------------------
+// THE FREESTANDING-SAFE SPLIT (#3569)
+// ---------------------------------------------------------------------------
+//
+// `schedMaybeGrow` above is unusable from `runtime/root/<os>/boot.bit`'s
+// `workerBody` run loop for the reason this file's own header already proves
+// for the *test* caller's `startFn` argument: naming the platform
+// `threadStart` to fill that slot BUILDS a `(code, env)` closure, and
+// `boot.bit` emits `--freestanding` (SPEC §17.6) and may not build one either
+// — confirmed empirically, not assumed: wiring `schedMaybeGrow` straight into
+// `workerBody` fails `./make libbitrt` with "this module allocates on the
+// managed heap (a closure value)".
+//
+// `runtime/thread/threadpool.bit`'s `schedStartArm` solves the identical
+// problem for BOOT-TIME bring-up by splitting "arm the slot" from "start the
+// thread", so the freestanding caller supplies only a `*byte` and calls its
+// own platform `threadStart` directly. `schedGrowArm`/`schedGrowCommit` below
+// are that same split for POST-BOOT growth. They cannot simply CALL
+// `schedStartArm` — `runtime/sched` may not import `runtime/thread` (the
+// reverse import already exists, and the cycle is E0044) — so the two-word
+// `{worker address, done-word address}` block is built inline here, in the
+// same shape, exactly as `schedStartWorker` already does below for the same
+// reason (see its own header).
+//
+// LOCK DISCIPLINE — THE PART THIS TICKET CALLS OUT AS THE HARD PART.
+// `schedStartWorker` holds `scRegLock` across its ENTIRE claim-init-start
+// sequence, including the `startFn` call, releasing only after `scNWorkers`
+// is published — see its header for why: publishing the count only on
+// success, under one lock held throughout, is what stops two concurrent
+// growers from ever claiming the same slot. Splitting "arm" from "start"
+// into two separate Bit functions cannot copy that lock span verbatim (a
+// spinlock cannot be acquired in one function and released in another
+// safely UNLESS the two calls are known to run back-to-back on the same
+// thread with nothing but the platform `threadStart` call in between) — but
+// that is exactly the shape here: `workerBody` calls `schedGrowArm`, then
+// (only on a non-zero return) calls `threadStart` directly, then calls
+// `schedGrowCommit`, all on the SAME OS thread, with no other Bit call in
+// between. So the invariant `schedStartWorker` relies on is preserved
+// exactly: `scRegLock` is held from the moment a slot is claimed until the
+// moment the new worker count (or the abandonment of a failed start) is
+// published, it is just held ACROSS a module boundary instead of within one
+// function body. Two workers hitting the threshold concurrently still
+// serialise on this same lock, in the same order they would have inside
+// `schedStartWorker`: the second blocks in `schedGrowArm`'s `spinAcquire`
+// until the first's `schedGrowCommit` releases it, and by then `scNWorkers`
+// already reflects the first grower's outcome, so the second claims the
+// NEXT slot rather than the same one.
+//
+// `schedGrowArm` ALSO refuses once `scStopping` is set, checked under the
+// same lock as the ceiling: without this, a worker could still be mid-grow
+// (lock held, about to call `threadStart`) at the instant `schedShutdown`
+// runs on the boot thread, and the newly started worker would never be
+// reaped by `boot()`'s join loop (its `started` bound is read once, after
+// `schedShutdown`). Refusing under the lock means that by the time a
+// caller's `schedShutdown` has run, every `schedGrowArm` that has not yet
+// taken the lock will see `scStopping != 0` and decline, and any grow that
+// is already past the lock will finish publishing to `scNWorkers` before
+// `schedShutdown`'s caller can observe a stable count (see
+// `schedFinalWorkerCount` below, which reads `scNWorkers` under the
+// identical lock for exactly this reason).
+//
+// Never call `schedGrowCommit` except after a `schedGrowArm` call that
+// returned non-zero — doing so releases a lock this thread does not hold.
+
+// The arming half. On success, initializes and arms worker slot
+// `scNWorkers`, leaves `scRegLock` HELD, and returns the `*byte` argument a
+// platform `threadStart(entryOf(workerBody), arg, done)` call needs — the
+// same `{worker address, done-word address}` block `schedStartArm` builds
+// for boot-time bring-up, unpacked with `taskAt(int(arg))` exactly as
+// `workerBody` already unpacks its own start argument. Returns a genuine
+// nil `*byte` (address 0, never a live block address) and touches the lock
+// not at all, or only transiently, in every case that is NOT "go start a
+// worker": streak below threshold (lock never taken), pool already at
+// `schedMaxWorkers`, or shutdown already signalled (lock taken and released
+// before returning).
+export @symbol("bit_rt_port_sched_grow_arm")
+fn schedGrowArm(s: *i64, argArea: *i64, doneArea: *i32): *byte {
+  let bp: *byte = nil
+  if (atomicLoad(s + scGrowStreak) < growStreakThreshold) {
+    return bp
+  }
+  atomicStore(s + scGrowStreak, 0)
+
+  spinAcquire(lockOf(s, scRegLock))
+  let i = atomicLoad(s + scNWorkers)
+  if (i >= schedMaxWorkers || atomicLoad(s + scStopping) != 0) {
+    spinRelease(lockOf(s, scRegLock))
+    return bp
+  }
+
+  schedInitWorkerSlot(s, i)
+  let block = argArea + i * 2
+  *block = int(schedWorkerAt(s, i))
+  let done = doneArea + i
+  *(block + 1) = int(done)
+  // 1 is `runtime/thread`'s `threadRunning` sentinel, mirrored rather than
+  // imported — same reason as `schedStartWorker`'s identical line below.
+  atomicStore(done, i32(1))
+  return bp + int(block)
+}
+
+// The commit half. Must be called exactly once for every `schedGrowArm`
+// call that returned a non-zero `*byte`, with the `int` result of the
+// caller's own `threadStart(...)` call in between and nothing else. Stores
+// the handle and publishes the grown count on success; on failure
+// (`handle == 0`) abandons the slot without publishing. Either way releases
+// `scRegLock`, so `schedGrowArm`'s claim is always matched by exactly one
+// release.
+export @symbol("bit_rt_port_sched_grow_commit")
+fn schedGrowCommit(s: *i64, handleArea: *i64, handle: int): bool {
+  if (handle == 0) {
+    spinRelease(lockOf(s, scRegLock))
+    return false
+  }
+  let i = atomicLoad(s + scNWorkers)
+  *(handleArea + i) = handle
+  atomicStore(s + scNWorkers, i + 1)
+  spinRelease(lockOf(s, scRegLock))
+  return true
+}
+
+// A plain, racy `atomicLoad(s + scNWorkers)` is NOT enough for `boot()`'s own
+// reap-loop bound, and the gap is not cosmetic: `boot()` closes the netpoller
+// fd right after its join loop, specifically because a still-running worker's
+// `pollDrain` on a closed fd is a use-after-close, not a leak (see
+// `boottail.bit`'s step 8b). A worker `schedGrowArm` armed but had not yet
+// published to `scNWorkers` at the instant a racy read ran would be silently
+// left out of that reap loop and could still be mid-`pollDrain` when the fd
+// closes. Taking `scRegLock` here closes the gap: called ONLY after the
+// caller's `schedShutdown(s)`, any `schedGrowArm` that has not yet reached
+// the lock will see `scStopping != 0` there and decline (see `schedGrowArm`'s
+// header), and any grow already past the lock finishes publishing before
+// this can acquire it — either way, the count this returns is exactly the
+// set of workers `boot()` must join before it may close anything shared.
+export @symbol("bit_rt_port_sched_final_worker_count")
+fn schedFinalWorkerCount(s: *i64): int {
+  spinAcquire(lockOf(s, scRegLock))
+  let n = atomicLoad(s + scNWorkers)
+  spinRelease(lockOf(s, scRegLock))
+  return n
+}
