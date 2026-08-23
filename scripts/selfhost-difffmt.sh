@@ -130,6 +130,31 @@ fi
 : >"$work/oracletimeout"
 match=0 skip=0
 
+# fmt_retry <side> <target> <pristine> <bin> -- alarmrun_retry's own contract
+# (one retry on SIGALRM, 142 iff both attempts stall, stall note on fd 9) but
+# with the corpus file's pristine bytes copied into <target> before EVERY
+# attempt, not once per corpus file (#3487). `fmt` rewrites <target> IN PLACE
+# via truncate-then-write (compiler/fmtcmd.bit's writeFile), so an attempt
+# killed by SIGALRM between the truncate and the write leaves <target>
+# partial; alarmrun_retry's own outfile arg only ever REMOVES a target, which
+# is wrong here (fmt needs the file to exist), so a plain alarmrun_retry call
+# lets the retry format the previous attempt's corruption instead of the
+# original source. Restoring the pristine bytes first makes every attempt see
+# the same input.
+fmt_retry() {
+  local side=$1 target=$2 pristine=$3 bin=$4 rc
+  cp "$pristine" "$target"
+  alarmrun "$bin" fmt "$target" >/dev/null
+  rc=$?
+  if [ "$rc" -eq 142 ]; then
+    echo "$side fmt stalled once (SIGALRM after ${TIMEOUT}s), retrying: $bin fmt $target" >&9
+    cp "$pristine" "$target"
+    alarmrun "$bin" fmt "$target" >/dev/null
+    rc=$?
+  fi
+  return "$rc"
+}
+
 # `compiler`, not `selfhost` — the directory was renamed in #1841 and this line
 # was not. A missing root makes `find` complain on stderr and carry on with the
 # rest, so the gate kept passing while silently scanning 706 files instead of
@@ -149,12 +174,10 @@ done
 for f in $(find $CORPUS -name '*.bit' | sort); do
   a="$work/a"; b="$work/b"
   rm -rf "$a" "$b"; mkdir -p "$a" "$b"
-  cp "$f" "$a/s.bit"
-  cp "$f" "$b/s.bit"
 
-  # Verdict-deciding (#3422): outfile "" — fmt rewrites its argument IN PLACE,
-  # so the target must survive a retry, unlike a build's -o artifact.
-  alarmrun_retry ORACLE "" "$ORACLE" fmt "$a/s.bit" >/dev/null
+  # fmt_retry copies "$f" into the target itself, before EACH attempt (#3487)
+  # — do not pre-copy here, that copy would only cover the first attempt.
+  fmt_retry ORACLE "$a/s.bit" "$f" "$ORACLE"
   seed_rc=$?
   if [ "$seed_rc" -ge 128 ]; then
     echo "$f" >>"$work/oracletimeout"
@@ -168,7 +191,7 @@ for f in $(find $CORPUS -name '*.bit' | sort); do
     continue
   fi
 
-  alarmrun_retry BIT2 "" "$BIT2" fmt "$b/s.bit" >/dev/null
+  fmt_retry BIT2 "$b/s.bit" "$f" "$BIT2"
   rc=$?
   if [ "$rc" -ge 128 ]; then
     echo "$f" >>"$work/timeout"

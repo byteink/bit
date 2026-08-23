@@ -1,0 +1,203 @@
+// Self-host Stage 2: constant propagation across BLOCK PARAMS. Split out of
+// opt.bit the way optfold.bit was (#1503) — same module, so nothing here needs
+// an import.
+//
+// `sweepConsts` (opt.bit) is a single forward walk and is correct in one pass
+// only because an operand's def index is always below its use's. A block param
+// breaks that guarantee: its incoming arguments come from predecessor
+// TERMINATORS, which a loop back edge places arbitrarily far later in the flat
+// order. So a param that provably holds one constant on every incoming edge is
+// invisible to the sweep, and #2378's flag-guarded defer lowering made the cost
+// visible — the "defer already ran" flag is `const_bool true` in the entry
+// block, arrives at the guard through a block param, and a statically-true
+// `br` reached the backend (#3517).
+//
+// This pass adds no CFG surgery of its own. It only writes more entries into
+// the SAME `known` map that `computeReachable` and `emitTranslated` already
+// consult for a `br` condition, so a param proven constant collapses that `br`
+// to a `jump` and the existing dead-block pruning removes the untaken side.
+
+// The per-block-param agreement state over the predecessor edges seen so far.
+// One record rather than two loose slices so the edge walk stays inside the
+// parameter limit and the two arrays cannot be passed out of step.
+class ParamAgree {
+  // Per instruction index: 0 = no predecessor edge yet, 1 = every edge so far
+  // agreed on `cand[i]`, 2 = poisoned (an edge passed a non-constant, an edge
+  // disagreed, or the arity was wrong).
+  state: []int,
+  cand: []ConstVal,
+}
+
+// Whether any block other than the entry has parameters. A function with none
+// has nothing for `propagateBlockParams` to do, so it skips the two
+// per-instruction arrays that pass would otherwise allocate for every function
+// in the module.
+fn hasNonEntryParams(f: IrFunc): bool {
+  let b = 1
+  while (b < len(f.blocks)) {
+    if (f.blocks[b].paramCount > 0) {
+      return true
+    }
+    b = b + 1
+  }
+  return false
+}
+
+// Two constants are interchangeable only when the discriminators AND the
+// payload match.
+//
+// A FLOAT IS NEVER interchangeable here, deliberately: IEEE-754 says
+// `-0.0 == 0.0`, so an `==` on `fval` would call two values equal that
+// `1.0 / x` tells apart (+inf against -inf), and NaN compares unequal to itself
+// so a genuinely identical NaN would be rejected anyway. Callers treat a float
+// argument as unknown instead; the integer and bool cases are what the
+// flag-guarded defer lowering and every branch condition actually need.
+fn sameConst(a: ConstVal, b: ConstVal): bool {
+  return a.known && b.known && !a.isFloat && !b.isFloat &&
+    a.isBool == b.isBool && a.ival == b.ival && a.bval == b.bval
+}
+
+// EVERYTHING STARTS POISONED and only a real block param is opened up to 0.
+// State 0 must never be promoted: it means the block has NO predecessor, and
+// "every predecessor agrees" over an empty set is vacuously true — which would
+// declare an unreachable block's params constant on nothing at all.
+fn newParamAgree(f: IrFunc): ParamAgree {
+  let state = []int(0)
+  let cand = []ConstVal(0)
+  let i = 0
+  while (i < len(f.instrs)) {
+    state = append(state, 2)
+    cand = append(cand, noConst())
+    i = i + 1
+  }
+  // Block 0 is the entry (lowering opens it first). Its params are the
+  // FUNCTION's parameters and carry no predecessor edge, so they stay poisoned:
+  // treating them as constant would fold every caller's argument away.
+  let b = 1
+  while (b < len(f.blocks)) {
+    let blk = f.blocks[b]
+    let j = 0
+    while (j < blk.paramCount) {
+      state[blk.instsStart + j] = 0
+      j = j + 1
+    }
+    b = b + 1
+  }
+  return ParamAgree{ state: state, cand: cand }
+}
+
+// Folds one incoming argument into param slot `p`'s agreement state.
+fn updateParamState(v: ConstVal, ag: ParamAgree, p: int) {
+  if (ag.state[p] == 2) {
+    return
+  }
+  if (!v.known || v.isFloat) {
+    ag.state[p] = 2
+    return
+  }
+  if (ag.state[p] == 0) {
+    ag.state[p] = 1
+    ag.cand[p] = v
+    return
+  }
+  if (!sameConst(ag.cand[p], v)) {
+    ag.state[p] = 2
+  }
+}
+
+// Folds one CFG edge — `target` and the argument list that edge passes — into
+// the target block's param states.
+fn applyEdge(f: IrFunc, known: []ConstVal, ag: ParamAgree, target: int, args: []int) {
+  let blk = f.blocks[target]
+  let j = 0
+  while (j < blk.paramCount) {
+    let p = blk.instsStart + j
+    if (j < len(args)) {
+      updateParamState(known[args[j]], ag, p)
+    } else {
+      // An edge passing fewer arguments than the block declares is malformed IR
+      // (verify.bit rejects it). Poison rather than read past the end.
+      ag.state[p] = 2
+    }
+    j = j + 1
+  }
+}
+
+// Feeds block `b`'s outgoing edges into the param states. Reads the terminator
+// exactly the way `computeReachable` does, including the empty-block guard:
+// `instsStart + instsLen - 1` names the instruction BEFORE an empty block,
+// which is index -1 for block 0 (#2084).
+//
+// BOTH arms of a `br` are fed, even when the condition is already a known
+// constant and one of them is about to be pruned. That is conservative in the
+// safe direction — an extra edge can only make a param disagree and stay
+// unfolded, never make it agree wrongly — and `optimizeModule` runs this pass
+// twice, so the pruned edge is gone by the second run and the fold lands then.
+fn applyBlockEdges(f: IrFunc, known: []ConstVal, ag: ParamAgree, b: int) {
+  let blk = f.blocks[b]
+  if (blk.instsLen == 0) {
+    return
+  }
+  let term = f.instrs[blk.instsStart + blk.instsLen - 1]
+  if (term.op == Op.Jump) {
+    applyEdge(f, known, ag, term.ival, term.args)
+    return
+  }
+  if (term.op == Op.Br) {
+    applyEdge(f, known, ag, term.ival, term.thenArgs)
+    applyEdge(f, known, ag, term.ival2, term.elseArgs)
+  }
+}
+
+// One round: records a constant into every block param whose predecessor edges
+// all pass the same one. Returns whether anything new was marked.
+fn markConstParams(f: IrFunc, known: []ConstVal): bool {
+  let ag = newParamAgree(f)
+  let b = 0
+  while (b < len(f.blocks)) {
+    applyBlockEdges(f, known, ag, b)
+    b = b + 1
+  }
+  let changed = false
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (ag.state[i] == 1 && !known[i].known) {
+      known[i] = ag.cand[i]
+      changed = true
+    }
+    i = i + 1
+  }
+  return changed
+}
+
+// Propagates a constant into a block param when EVERY predecessor edge passes
+// the same one, then re-sweeps so the new fact cascades into the arithmetic and
+// the compares that read it. `computeReachable` and `emitTranslated` both read
+// `known[term.lhs]` for a `br`, so a param proven constant collapses that `br`
+// to a `jump` and prunes the untaken side — no CFG surgery here, just one more
+// source of constants for machinery that already existed.
+//
+// The rebuild never consults `known` for a param slot — `rebuild` emits params
+// through `builderAddParam` before the instruction loop — so marking one here
+// cannot change a block's arity or drop an edge's argument. It only unlocks
+// folding at the USES, which is what keeps this a pure refinement of the
+// existing pass rather than a new transform on the CFG.
+//
+// Bounded, not an open-ended fixpoint: `known` only ever gains entries,
+// `sweepConsts` never writes a param slot, so each productive round marks at
+// least one new param and there are strictly fewer params than instructions.
+// `len(f.instrs)` is therefore a statically provable ceiling; in practice the
+// `changed` early exit ends it after one or two rounds.
+fn propagateBlockParams(ctx: TypeContext, f: IrFunc, known: []ConstVal) {
+  if (!hasNonEntryParams(f)) {
+    return
+  }
+  let rounds = 0
+  while (rounds < len(f.instrs)) {
+    if (!markConstParams(f, known)) {
+      return
+    }
+    sweepConsts(ctx, f, known)
+    rounds = rounds + 1
+  }
+}
