@@ -25,6 +25,55 @@ same pattern per request.
 
 <!-- doctest: per-block -->
 
+### Flags
+
+Three inline flags, matching RE2/Go:
+
+- **`i`** — case-insensitive matching. **ASCII-only**: it folds `A-Z` and
+  `a-z` onto each other and nothing else. `(?i)café` does not match `CAFÉ` —
+  the `é`/`É` pair is outside the fold. Full Unicode case folding is a
+  separate module (a later ticket); this module never silently does more
+  than the ASCII fold it documents.
+- **`s`** — dot matches `\n` too. Without it, `.` matches every rune except
+  `\n` (a lone `\r` always matches `.`, with or without `s` — only `\n` is
+  ever excluded).
+- **`m`** — multiline: `^` and `$` also match right after/before a `\n`, not
+  only at the very start/end of the subject. **Without `m`**, `$` matches
+  ONLY at the true end of the subject — like `\z`, not like Perl's default
+  `$` — so `compile("a$").matches("a\n")` is `false`. `\A` and `\z` always
+  mean the absolute start/end and ignore `m` either way.
+
+Two syntactic forms:
+
+- **`(?flags)`** — sets flags from that point to the end of the enclosing
+  group, including any later `|` branch of that same group (`|` does not
+  close a group). `(?-i)` clears a flag the same way; `(?im-s)` sets `i` and
+  `m` and clears `s`, all in one.
+- **`(?flags:...)`** — a non-capturing group whose flags apply only inside
+  it; the outer state is restored, exactly, once its `)` closes — including
+  when nested, and independently in each branch of an alternation.
+
+```bit
+import { mustCompile } from "std/regex"
+
+fn isColorCI(s: string): bool {
+  let re = mustCompile("(?i)^(red|green|blue)$")
+  return re.matches(s)
+}
+
+fn firstSentence(s: string): string {
+  // (?s) so a paragraph spanning newlines still has `.` reach the terminator.
+  let re = mustCompile("(?s)^.*?[.!?]")
+  return match (re.find(s)) {
+    Some(m) => m.text(s)
+    None => s
+  }
+}
+```
+
+An unknown flag letter (`(?x)`) is `regex: unknown flag at offset N`; an
+empty flag list (`(?)`) is `regex: missing flags at offset N`.
+
 ### `Regex`
 
 A compiled, validated regular expression. Opaque: its only public operations
