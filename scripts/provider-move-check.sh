@@ -19,16 +19,25 @@
 #         source is platform-free), each provider only for the target(s) that
 #         actually link it.
 # Step 3: `cmp` each BASE/working-tree pair; print PASS/FAIL per pair.
-# Step 4: line-multiset check — concatenate the module's core files plus both
-#         provider directories, sort with a forced C locale, and `cmp` BASE
-#         against the working tree; this is the check that tolerates an
-#         actual cross-file move (same lines, different home file) as long as
-#         no line was gained or lost.
+# Step 4: declaration-set diff (#3537, replacing the retired line-multiset
+#         arm — see the comment at that step for why: a raw line multiset
+#         cannot pass for ANY real provider dedup, because collapsing N
+#         identical copies into 1 shared declaration changes the line count
+#         by construction, and the mandatory `export`/`import` plumbing
+#         changes it again). This arm dumps every top-level declaration in
+#         the module's core files plus both provider directories via
+#         `bit --dump-ast` (comments/whitespace-free, so it normalizes for
+#         free) and diffs the SET of declarations, after stripping the
+#         `import_decl` plumbing and the mandatory `export` wrapper a moved
+#         declaration gains. It still fails on a dropped declaration, a
+#         changed body, or a declaration now duplicated where it wasn't
+#         before (see the step's own comment for the exact invariant).
 #
 # Every FAIL prints an explanation; the script exits 1 if any check failed,
 # 0 if every check passed. Nothing under runtime/ is ever written — BASE's
 # source is read with `git archive` into $(mktemp -d), the working tree is
-# read in place, and cmp's own scratch objects live in the same mktemp dir.
+# read in place, and cmp's/perl's own scratch objects live in the same
+# mktemp dir.
 set -u
 
 usage() {
@@ -54,6 +63,130 @@ echo "provider-move-check: module=$MODULE base=$BASE"
 
 SCRATCH=$(mktemp -d) || exit 1
 trap 'rm -rf "$SCRATCH"' EXIT
+
+# Reads one `bit --dump-ast` s-expression (the whole "(program ...)" form)
+# from stdin, prints one NORMALIZED top-level declaration per output line as
+# "<name>\t<form>". Drops import_decl (plumbing, not content); strips an
+# outer (export ...) wrapper (a moved declaration crossing a module boundary
+# must gain this — it is not a content change); strips a func_decl's
+# trailing (attr_list ...) child (@nosplit/@symbol are linkage/codegen
+# hints, not content — this repo's own dedup methodology,
+# docs/development/provider-duplication.md, judges two copies the same
+# "signature excluded", and an actual @symbol change that breaks an
+# external caller is still caught by the --emit-obj build above).
+AST_SPLIT_PL="$SCRATCH/ast-split.pl"
+cat >"$AST_SPLIT_PL" <<'PERL_EOF'
+use strict;
+use warnings;
+
+# Splits "(tag c1 c2 ...)" into (tag, c1, c2, ...), respecting nested
+# parens and quoted strings, at depth-1 boundaries only.
+sub split_children {
+    my ($s) = @_;
+    die "not a parenthesized form: $s\n" unless $s =~ /^\((.*)\)$/s;
+    my $inner = $1;
+    my @out;
+    my $len = length($inner);
+    my $i = 0;
+    while ($i < $len) {
+        while ($i < $len && substr($inner, $i, 1) eq ' ') { $i++; }
+        last if $i >= $len;
+        my $c = substr($inner, $i, 1);
+        if ($c eq '(') {
+            my $start = $i;
+            my $depth = 0;
+            my $in_str = 0;
+            while ($i < $len) {
+                my $ch = substr($inner, $i, 1);
+                if ($in_str) {
+                    if ($ch eq '\\') { $i += 2; next; }
+                    $in_str = 0 if $ch eq '"';
+                } elsif ($ch eq '"') {
+                    $in_str = 1;
+                } elsif ($ch eq '(') {
+                    $depth++;
+                } elsif ($ch eq ')') {
+                    $depth--;
+                }
+                $i++;
+                last if $depth == 0;
+            }
+            push @out, substr($inner, $start, $i - $start);
+        } elsif ($c eq '"') {
+            my $start = $i;
+            $i++;
+            while ($i < $len) {
+                my $ch = substr($inner, $i, 1);
+                if ($ch eq '\\') { $i += 2; next; }
+                $i++;
+                last if $ch eq '"';
+            }
+            push @out, substr($inner, $start, $i - $start);
+        } else {
+            my $start = $i;
+            while ($i < $len && substr($inner, $i, 1) ne ' ') { $i++; }
+            push @out, substr($inner, $start, $i - $start);
+        }
+    }
+    return @out;
+}
+
+sub strip_attrs {
+    my ($form) = @_;
+    my @kids = split_children($form);
+    return $form if @kids < 2;
+    if ($kids[-1] =~ /^\(attr_list\b/) {
+        pop @kids;
+        return "(" . join(" ", @kids) . ")";
+    }
+    return $form;
+}
+
+my $text = do { local $/; <STDIN> };
+$text =~ s/^\s+|\s+$//g;
+exit 0 if $text eq '';
+
+my @top = split_children($text);
+shift @top; # the "program" tag itself
+
+for my $form (@top) {
+    next if $form =~ /^\(import_decl\b/;
+    if ($form =~ /^\(export /) {
+        my @k = split_children($form);
+        $form = $k[1];
+    }
+    $form = strip_attrs($form);
+    my $name = "?";
+    if ($form =~ /\(binding\s+([A-Za-z_][A-Za-z0-9_]*)/) {
+        $name = $1;
+    } elsif ($form =~ /^\(([a-z_]+)\s+(?:_\s+)?([A-Za-z_][A-Za-z0-9_]*)/) {
+        $name = $2;
+    }
+    print "$name\t$form\n";
+}
+PERL_EOF
+
+# $1 = directory to scan (maxdepth 1, *.bit), $2 = file to APPEND normalized
+# "<name>\t<form>" lines to. Sets DECLSET_DUMP_FAIL=1 and prints a FAIL line
+# if `--dump-ast` itself fails on any file (a real parse error, not a move
+# defect this arm can characterize further).
+ast_decls() {
+  local dir=$1 out=$2 f dump err rc
+  [ -d "$dir" ] || return 0
+  while IFS= read -r f; do
+    dump=$(mktemp "$SCRATCH/dump.XXXXXX") || exit 1
+    err=$(mktemp "$SCRATCH/dumperr.XXXXXX") || exit 1
+    "$BIT" --dump-ast "$f" >"$dump" 2>"$err"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "FAIL declset $MODULE (--dump-ast failed on $f, rc=$rc)"
+      sed 's/^/  /' "$err" >&2
+      DECLSET_DUMP_FAIL=1
+      continue
+    fi
+    perl "$AST_SPLIT_PL" <"$dump" >>"$out"
+  done < <(find "$dir" -maxdepth 1 -name '*.bit')
+}
 
 BASE_RT="$SCRATCH/base/runtime"
 mkdir -p "$SCRATCH/base"
@@ -122,11 +255,12 @@ while [ "$i" -lt "${#PAIR_RELS[@]}" ]; do
   fi
 done
 
-# --- Step 4: line-multiset over the core dir plus both providers. ---
-base_lines="$SCRATCH/${MODULE}_base_lines.txt"
-work_lines="$SCRATCH/${MODULE}_work_lines.txt"
-: >"$base_lines"
-: >"$work_lines"
+# --- Step 4: declaration-set diff over the core dir plus both providers. ---
+DECLSET_DUMP_FAIL=0
+base_decls="$SCRATCH/${MODULE}_base_decls.txt"
+work_decls="$SCRATCH/${MODULE}_work_decls.txt"
+: >"$base_decls"
+: >"$work_decls"
 for rel in "" linux darwin; do
   if [ -z "$rel" ]; then
     bdir="$BASE_RT/$MODULE"
@@ -135,35 +269,69 @@ for rel in "" linux darwin; do
     bdir="$BASE_RT/$MODULE/$rel"
     wdir="$WORK_RT/$MODULE/$rel"
   fi
-  [ -d "$bdir" ] && find "$bdir" -maxdepth 1 -name '*.bit' -exec cat {} + >>"$base_lines"
-  [ -d "$wdir" ] && find "$wdir" -maxdepth 1 -name '*.bit' -exec cat {} + >>"$work_lines"
+  ast_decls "$bdir" "$base_decls"
+  ast_decls "$wdir" "$work_decls"
 done
 
-base_sorted="$SCRATCH/${MODULE}_base_sorted.txt"
-work_sorted="$SCRATCH/${MODULE}_work_sorted.txt"
-LC_ALL=C sort "$base_lines" >"$base_sorted"
-LC_ALL=C sort "$work_lines" >"$work_sorted"
-
-MULTISET_PASS=1
-if cmp -s "$base_sorted" "$work_sorted"; then
-  echo "PASS line-multiset $MODULE"
-else
-  echo "FAIL line-multiset $MODULE"
+DECLSET_PASS=1
+if [ "$DECLSET_DUMP_FAIL" -eq 1 ]; then
   FAIL=1
-  MULTISET_PASS=0
+  DECLSET_PASS=0
+else
+  # One AWK pass: count occurrences of each normalized "<name>\t<form>" line
+  # on both sides, then apply the three-way invariant a correct provider
+  # dedup must satisfy:
+  #   - every distinct declaration in BASE must still exist in WORK
+  #     (MISSING — catches a dropped declaration, and a body edit: an
+  #     edited body no longer matches its old normalized form at all);
+  #   - every distinct declaration in WORK must have existed in BASE
+  #     (ADDED — catches an edited or fabricated body, the other half of
+  #     the body-edit case above: the new text is "added" content);
+  #   - no distinct declaration may occur MORE times in WORK than it did
+  #     in BASE (DUPLICATED — a correct N-copies-to-1 dedup only ever
+  #     REDUCES a form's count; an increase means the move left the
+  #     original behind instead of deleting it). Two providers legitimately
+  #     sharing an as-yet-undeduped duplicate is unaffected: it is counted
+  #     equally on both sides and never flagged.
+  diff_out="$SCRATCH/${MODULE}_declset_diff.txt"
+  LC_ALL=C awk -F'\t' '
+    FNR == NR { bc[$0]++; bn[$0] = $1; next }
+    { wc[$0]++; wn[$0] = $1 }
+    END {
+      for (k in bc) if (!(k in wc)) print "MISSING\t" bn[k] "\t" k
+      for (k in wc) if (!(k in bc)) print "ADDED\t" wn[k] "\t" k
+      for (k in bc) if ((k in wc) && wc[k] > bc[k]) {
+        print "DUPLICATED\t" bn[k] "\t" k " (was " bc[k] "x, now " wc[k] "x)"
+      }
+    }
+  ' "$base_decls" "$work_decls" | LC_ALL=C sort >"$diff_out"
+
+  if [ -s "$diff_out" ]; then
+    FAIL=1
+    DECLSET_PASS=0
+    while IFS=$'\t' read -r kind name _; do
+      case "$kind" in
+        MISSING) echo "FAIL declset $MODULE: declaration dropped: $name" ;;
+        ADDED) echo "FAIL declset $MODULE: declaration added or changed: $name" ;;
+        DUPLICATED) echo "FAIL declset $MODULE: declaration left behind at the old site: $name" ;;
+      esac
+    done <"$diff_out"
+  else
+    echo "PASS declset $MODULE"
+  fi
 fi
 
 # A cmp FAIL here does not by itself mean content changed: this compiler lays
 # functions out in source-declaration order (verified #2549 by disassembling
 # both sides of a pure reposition — the actual instructions were identical,
 # only their file offsets moved), so ANY reordering, including a legitimate
-# provider hoist, changes these raw object bytes. line-multiset is the
+# provider hoist, changes these raw object bytes. declset is the
 # authoritative "no content was gained or lost" signal; read a cmp FAIL
-# alongside a line-multiset PASS as "repositioned, not changed".
-if [ "$CMP_FAIL" -eq 1 ] && [ "$MULTISET_PASS" -eq 1 ]; then
-  echo "NOTE: cmp FAILed but line-multiset PASSed — the object's raw bytes" >&2
-  echo "  moved (declaration order shifted where code sits in the section)," >&2
-  echo "  but no source line was gained or lost. See this script's header." >&2
+# alongside a declset PASS as "repositioned, not changed".
+if [ "$CMP_FAIL" -eq 1 ] && [ "$DECLSET_PASS" -eq 1 ]; then
+  echo "NOTE: cmp FAILed but declset PASSed — the object's raw bytes moved" >&2
+  echo "  (declaration order shifted where code sits in the section), but no" >&2
+  echo "  declaration was gained, lost or altered. See this script's header." >&2
 fi
 
 exit "$FAIL"
