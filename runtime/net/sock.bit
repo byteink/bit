@@ -1,0 +1,181 @@
+// Core (platform-free) half of the socket-scratch/marshalling logic that used
+// to be duplicated byte-for-byte in runtime/net/{linux,darwin}/sock.bit
+// (#2552, #1710's provider-duplication sweep; see
+// docs/development/provider-duplication.md's `net` section for the full
+// inventory). Pulled up here: byte/wire-format marshalling (`getU*`/`putU*`),
+// the `sockaddr_in` fields that read the SAME on both platforms (port,
+// address octets, total length), the per-worker scratch-slot arithmetic, and
+// the scratch buffers themselves. All pure arithmetic and byte marshalling,
+// no OS call anywhere.
+//
+// `netSockAddrFamily` is DELIBERATELY NOT HERE, despite an identical function
+// body on both providers (#2550's audit listed it as a candidate on exactly
+// that basis) — Linux's `sin_family` sits at byte offset 0 of `sockaddr_in`,
+// Darwin's at byte offset 1 (`sin_len` occupies byte 0 there), so the
+// function reads a genuinely different `saFamilyOff` per platform (0 vs 1,
+// confirmed by diffing the two providers' `const saFamilyOff` directly). A
+// shared core copy would have to pick one value and would silently misread
+// the family byte on the other platform. It stays provider-local next to
+// `netFillSockAddr`, the sibling divergence #2550 already documented for the
+// same struct. See the #2552 ticket comment for the rest of the excluded set.
+
+// `schedCurrentWorker`, `wkId`, `schedMaxWorkers` and `taskAt` are already
+// imported from "../sched" by this module's sibling netabi.bit (imports are
+// module-scoped) — re-importing them here would be an E0042 redeclaration.
+
+// ---------------------------------------------------------------------------
+// Wire-format byte access
+// ---------------------------------------------------------------------------
+
+// AF_INET, SOCK_STREAM, SOCK_DGRAM — POSIX-standard values, identical on every
+// target this runtime supports (`<sys/socket.h>` on both Linux and Darwin).
+export @symbol("bit_rt_port_net_af_inet") @nosplit fn afInet(): int { return 2 }
+export @symbol("bit_rt_port_net_sock_stream") @nosplit fn sockStream(): int { return 1 }
+export @symbol("bit_rt_port_net_sock_dgram") @nosplit fn sockDgram(): int { return 2 }
+
+// F_GETFL / F_SETFL — POSIX fcntl commands, 3 and 4 on both platforms. (The
+// O_NONBLOCK VALUE they operate on differs per OS and stays provider-local.)
+export @symbol("bit_rt_port_net_f_get_fl") @nosplit fn fGetFl(): int { return 3 }
+export @symbol("bit_rt_port_net_f_set_fl") @nosplit fn fSetFl(): int { return 4 }
+
+// EINTR is 4 on both Linux and Darwin (low POSIX errno values are
+// cross-platform) — the one errno value in this family that is not
+// OS-specific; every sibling (EAGAIN, ECONNRESET, ...) genuinely differs and
+// correctly stays provider-local.
+export @symbol("bit_rt_port_net_e_intr") @nosplit fn eIntr(): int { return 4 }
+
+// `sockaddr_in` (POSIX) fields that read THE SAME on both platforms: total
+// length (16 bytes on both), the port at offset 2 (big-endian), and the
+// address octets at offset 4. Only `sin_family`'s offset differs (see this
+// file's header) — that field's accessor is provider-local.
+export const saLen: int = 16
+export const saPortOff: int = 2
+export const saAddrOff: int = 4
+
+// Per-worker scratch-buffer offset (#3273/#3296/#3307's per-worker-slot fix).
+// A caller off a green stack has no worker; `sockScratchSlots` is the
+// fallback slot past every real worker's index.
+const sockScratchSlots: int = 32
+
+export @symbol("bit_rt_port_net_sock_scratch_slot") @nosplit fn sockScratchSlot(): int {
+  let w = schedCurrentWorker()
+  if (w == 0) {
+    return sockScratchSlots
+  }
+  let id = *(taskAt(w) + wkId)
+  if (id < 0 || id >= schedMaxWorkers || id >= sockScratchSlots) {
+    return sockScratchSlots
+  }
+  return id
+}
+
+// (sockScratchSlots + 1) slots: one per worker plus the fallback. Identical
+// sizes on both providers because every struct these back (sockaddr_in,
+// `[u]int`-sized socket options, DNS messages) is the same size on both
+// platforms even where its internal layout is not.
+let saBuf: [66]i64
+let saBuf2: [66]i64
+let optBuf: [33]i64
+let lenBuf: [33]i64
+let ipBuf: [33]i64
+let tvBuf: [66]i64
+// TWO messages, not one: the query and the reply are both live across the
+// same `recvfrom`, so ONE instance is 2 * netMaxDnsMsg = 1024 bytes = 128
+// words; (sockScratchSlots + 1) slots of that.
+let dnsBuf: [4224]i64
+
+export @symbol("bit_rt_port_net_bytes_at") @nosplit fn bytesAt(a: int): *u8 {
+  let z: *u8 = nil
+  return z + a
+}
+
+export @symbol("bit_rt_port_net_sa_bytes") @nosplit fn saBytes(): *u8 { return bytesAt(int(ptrOf(saBuf)) + sockScratchSlot() * 16) }
+export @symbol("bit_rt_port_net_sa_bytes2") @nosplit fn saBytes2(): *u8 { return bytesAt(int(ptrOf(saBuf2)) + sockScratchSlot() * 16) }
+export @symbol("bit_rt_port_net_opt_bytes") @nosplit fn optBytes(): *u8 { return bytesAt(int(ptrOf(optBuf)) + sockScratchSlot() * 8) }
+export @symbol("bit_rt_port_net_len_bytes") @nosplit fn lenBytes(): *u8 { return bytesAt(int(ptrOf(lenBuf)) + sockScratchSlot() * 8) }
+export @symbol("bit_rt_port_net_ip_bytes") @nosplit fn ipBytes(): *u8 { return bytesAt(int(ptrOf(ipBuf)) + sockScratchSlot() * 8) }
+export @symbol("bit_rt_port_net_tv_bytes") @nosplit fn tvBytes(): *u8 { return bytesAt(int(ptrOf(tvBuf)) + sockScratchSlot() * 16) }
+export @symbol("bit_rt_port_net_dns_bytes") @nosplit fn dnsBytes(): *u8 { return bytesAt(int(ptrOf(dnsBuf)) + sockScratchSlot() * 1024) }
+
+export @symbol("bit_rt_port_net_put_u8") @nosplit fn putU8(base: *u8, off: int, v: int) {
+  let p = base + off
+  *p = u8(v % 256)
+}
+
+export @symbol("bit_rt_port_net_get_u8") @nosplit fn getU8(base: *u8, off: int): int {
+  let p = base + off
+  return int(*p)
+}
+
+// Big-endian, because `sin_port` is in network byte order. Written byte-wise
+// rather than through a wider pointer for the reason the whole runtime does
+// it: a Bit array is word-strided, so a kernel structure is only ever a byte
+// region.
+export @symbol("bit_rt_port_net_put_u16_be") @nosplit fn putU16Be(base: *u8, off: int, v: int) {
+  putU8(base, off, v / 256)
+  putU8(base, off + 1, v)
+}
+
+export @symbol("bit_rt_port_net_get_u16_be") @nosplit fn getU16Be(base: *u8, off: int): int {
+  return getU8(base, off) * 256 + getU8(base, off + 1)
+}
+
+export @symbol("bit_rt_port_net_put_u32_le") @nosplit fn putU32Le(base: *u8, off: int, v: int) {
+  let k = 0
+  while (k < 4) {
+    putU8(base, off + k, v / (1 << (8 * k)))
+    k = k + 1
+  }
+}
+
+export @symbol("bit_rt_port_net_get_u32_le") @nosplit fn getU32Le(base: *u8, off: int): int {
+  let v = 0
+  let k = 3
+  while (k >= 0) {
+    v = v * 256 + getU8(base, off + k)
+    k = k - 1
+  }
+  return v
+}
+
+export @symbol("bit_rt_port_net_get_u64_le") @nosplit fn getU64Le(base: *u8, off: int): int {
+  let v = 0
+  let k = 7
+  while (k >= 0) {
+    v = v * 256 + getU8(base, off + k)
+    k = k - 1
+  }
+  return v
+}
+
+export @symbol("bit_rt_port_net_put_u64_le") @nosplit fn putU64Le(base: *u8, off: int, v: int) {
+  let k = 0
+  while (k < 8) {
+    putU8(base, off + k, v / (1 << (8 * k)))
+    k = k + 1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Addresses (fields that read the same on both platforms — see this file's
+// header for the one field, `sin_family`, that does not)
+// ---------------------------------------------------------------------------
+
+// The kernel's `sockaddr_in` size — the `socklen_t` every call passes.
+export @symbol("bit_rt_port_net_sock_addr_len") @nosplit fn netSockAddrLen(): int {
+  return saLen
+}
+
+// The port of a `sockaddr_in`, host byte order.
+export @symbol("bit_rt_port_net_sock_addr_port") @nosplit fn netSockAddrPort(sa: *u8): int {
+  return getU16Be(sa, saPortOff)
+}
+
+// The four address octets of a `sockaddr_in`, in wire order, written to `out`.
+export @symbol("bit_rt_port_net_sock_addr_octets") @nosplit fn netSockAddrOctets(sa: *u8, out: *u8) {
+  let j = 0
+  while (j < 4) {
+    putU8(out, j, getU8(sa, saAddrOff + j))
+    j = j + 1
+  }
+}
