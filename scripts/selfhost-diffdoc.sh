@@ -108,7 +108,20 @@ fi
 
 : >"$work/mismatch"
 : >"$work/timeout"
-match=0 skip=0
+match=0 skip=0 nonempty=0
+
+# doc_surface_nonempty <json-file> -- true iff the ORACLE's `doc --json` array
+# in <json-file> has at least one entry (#3518). docJson (compiler/doc.bit)
+# renders each symbol as exactly ONE line, `  {"name": ...}`, and never
+# breaks a line inside an entry -- docVariantsJson's own "[...]" stays inline
+# on that same line, including a type string like "[]u8". So counting lines
+# with this fixed two-space-then-`{"name":` prefix cannot mistake a bracket
+# inside a type for a second entry, which is the trap that broke a naive
+# strip-and-count attempt at this ticket (false positives on `json`, `quic`).
+# An empty array is exactly the two lines `[` and `]`, so the count is 0.
+doc_surface_nonempty() {
+  [ "$(grep -c '^  {"name": ' "$1")" -gt 0 ]
+}
 
 for d in stdlib/*/ examples/*/ tests/imports/*/; do
   [ -d "$d" ] || continue
@@ -139,6 +152,12 @@ for d in stdlib/*/ examples/*/ tests/imports/*/; do
     echo "$d (ORACLE --json timed out after ${TIMEOUT}s, rc=$seed_json_rc)" >>"$work/timeout"
     continue
   fi
+  # Classified once, from the ORACLE side, as soon as its surface is known --
+  # counted into $nonempty below only on a path that also counts into
+  # $match/$mismatch, so the denominator always covers exactly the
+  # $compared set, never a BIT2-timeout or an oracle SKIP.
+  module_nonempty=0
+  doc_surface_nonempty "$work/seed.json" && module_nonempty=1
 
   alarmrun_retry BIT2 "" "$BIT2" doc "$d" >"$work/bit.plain"
   bit_rc=$?
@@ -152,6 +171,7 @@ for d in stdlib/*/ examples/*/ tests/imports/*/; do
 
   if [ "$bit_rc" -ne 0 ] || [ "$bit_json_rc" -ne 0 ]; then
     echo "$d (bit doc exit $bit_rc / --json exit $bit_json_rc, seed exit 0)" >>"$work/mismatch"
+    [ "$module_nonempty" -eq 1 ] && nonempty=$((nonempty + 1))
     continue
   fi
 
@@ -160,12 +180,13 @@ for d in stdlib/*/ examples/*/ tests/imports/*/; do
   else
     echo "$d" >>"$work/mismatch"
   fi
+  [ "$module_nonempty" -eq 1 ] && nonempty=$((nonempty + 1))
 done
 
 mismatch=$(wc -l <"$work/mismatch" | tr -d ' ')
 timeouts=$(wc -l <"$work/timeout" | tr -d ' ')
 compared=$((match + mismatch))
-echo "doc differential ($ORACLE vs $BIT2): MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeouts SKIP(not a module)=$skip"
+echo "doc differential ($ORACLE vs $BIT2): MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeouts SKIP(not a module)=$skip ($nonempty of $compared compared module(s) have a non-empty exported surface)"
 
 # Corpus floor (#1516): comparing nothing is not agreement.
 if [ "$compared" -eq 0 ]; then
