@@ -1,7 +1,8 @@
 # Package Manager
 
 Bit resolves third-party dependencies through `bit add`/`bit up`/`bit remove`,
-a `bit.json` manifest, and a machine-generated `bit.lock`. (Spec: §17.7.)
+a `bit.json` manifest, and a machine-generated `bit.lock`. `bit list` reads
+that graph back without opening either file by hand. (Spec: §17.7.)
 
 **v1 is git-URL only.** There is no hosted registry, no package name
 namespace, and no server. `bit add github.com/owner/repo@v1.2.3` clones that
@@ -183,6 +184,29 @@ $ bit remove quicwire
 bit remove: quicwire
 ```
 
+## `bit list`
+
+```
+bit list
+```
+
+Prints each of the project's *direct* dependencies - the ones declared in
+`bit.json` - one line each: name, the spec `bit.json` records for it, and
+the commit `bit.lock` resolved it to (#2271). A transitive dependency (one
+reachable only through another dependency's own `requires`) is not listed -
+it has no entry of its own in `bit.json`, only inside a direct dependency's
+`bit.lock` `requires` map.
+
+```console
+$ bit list
+quicwire -> github.com/byteink/quicwire@v1.4.2 (9f8e7d6c5b4a3928170695e4d3c2b1a0f9e8d7c)
+```
+
+Fails (exit 1) with no `bit.json` here, the same way `bit add`/`bit up` do
+outside a project; and fails the same way `bit doc`/`bit check`/`bit build`
+already do when `bit.json` and `bit.lock` disagree, rather than printing
+`bit.lock`'s possibly-stale answer as though it were still current.
+
 ## `bit.lock`
 
 ```json
@@ -273,6 +297,21 @@ import { Frame } from "quicwire"
 An import naming something absent from `bit.lock` fails with a hint to run
 `bit add`, rather than reaching for the network mid-build - `bit build` never
 adds an unlocked dependency itself.
+
+`bit doc <name>` (#2271) resolves the same way, so a dependency's exported
+surface is reachable by the name a program imports it by rather than the
+on-disk cache path it happens to be fetched to: a name declared in
+`bit.lock` first, then a `std/x` name against the standard library, and
+only then a literal filesystem path (the one form `bit doc` accepted before
+this).
+
+```console
+$ bit doc quicwire
+function frameLen (Frame) => i64
+$ bit doc std/strings
+function compare (string, string) => i64
+...
+```
 
 ## Security posture
 
