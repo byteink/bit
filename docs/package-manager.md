@@ -86,14 +86,19 @@ dependency_entry = STRING_LIT ':' STRING_LIT .   (* name : "gitHost/owner/repo@r
 
 Each value is `gitHost/owner/repo@ref`, and `ref` is exactly one of:
 
-- an exact tag `vMAJOR.MINOR.PATCH` (e.g. `v1.4.2`) - the only form the
-  resolver (below) treats as an ordered version;
+- a **version constraint** - `MAJOR.MINOR.PATCH` (exact), `^MAJOR.MINOR.PATCH`
+  (caret), or `~MAJOR.MINOR.PATCH` (tilde), resolved against the target
+  repository's git tags (§17.7's "Version constraints"/"Git tag matching");
 - a branch name (e.g. `main`), resolved to that branch's current tip; or
 - a bare 40-character commit SHA, resolved to exactly that commit.
 
-**No range operators.** `^`, `~`, `>=`, `<`, `x`, and every other range or
-wildcard spelling are rejected at parse time - a dependency names one exact
-ref, never a range for a resolver to pick from.
+**No `v` prefix, and no other operator.** A version constraint is always
+plain semver - `^1.2.0`, never `^v1.2.0` - `bit add` accepts either spelling
+on the command line and writes the `v`-less form; a `bit.json` containing a
+`v`-prefixed version is rejected at parse time. `>=`, `<`, `x`, `*`, `||`,
+hyphen ranges, and every other range/wildcard spelling beyond `^`/`~` are
+rejected too - a dependency names exactly one of the three forms above, never
+a broader range grammar to pick from.
 
 **The map key is the import name, not a label.** `import { Frame } from
 "quicwire"` resolves `"quicwire"` against `bit.lock`'s top-level entries
@@ -122,14 +127,24 @@ enough to start from - they do not scaffold a new `bit.json`; `bit init`
 bit add <gitHost/owner/repo>[@ref] [--dir <path>]
 ```
 
-Adds or updates one dependency. With no `@ref`, resolves the remote's default
-branch HEAD and records that commit's exact SHA (never the word `HEAD`) as
-the ref in `bit.json`. `--dir` runs against a project rooted somewhere other
-than the current directory.
+Adds or updates one dependency. `--dir` runs against a project rooted
+somewhere other than the current directory. What gets written into
+`bit.json` depends on what you name:
+
+- **no `@ref` at all** - resolves the newest available version tag (never a
+  branch tip or `HEAD`) and writes a **caret** constraint for it;
+- **`@1.2.3`** (or `@v1.2.3`, canonicalised) - naming an exact version means
+  you meant it: writes an **exact** pin, `"1.2.3"`, never a caret. This is a
+  deliberate departure from npm/cargo, which write a caret even when you name
+  a version and need a flag to pin - the explicit form was chosen because the
+  npm behaviour surprises people;
+- **`@^1.2.0`** / **`@~1.2.0`** - written back exactly as given.
 
 ```console
-$ bit add github.com/byteink/quicwire@v1.4.2
-bit add: quicwire -> github.com/byteink/quicwire@v1.4.2 (9f8e7d6c5b4a3928170695e4d3c2b1a0f9e8d7c)
+$ bit add github.com/byteink/quicwire
+bit add: quicwire -> github.com/byteink/quicwire@^1.4.2 (9f8e7d6c5b4a3928170695e4d3c2b1a0f9e8d7c)
+$ bit add github.com/byteink/quicwire@1.4.2
+bit add: quicwire -> github.com/byteink/quicwire@1.4.2 (9f8e7d6c5b4a3928170695e4d3c2b1a0f9e8d7c)
 ```
 
 The dependency's own `bit.json` is fetched and its transitive requirements
@@ -137,7 +152,8 @@ are checked against every already-locked dependency's own requirements with
 the PubGrub resolver (below) before anything is written: naming a version
 that conflicts with what another already-locked dependency transitively
 requires fails loudly, naming both requirers and both versions, rather than
-locking an inconsistent graph.
+locking an inconsistent graph - and `bit.json`/`bit.lock` are left exactly as
+they were.
 
 **Transitive dependencies are resolved too.** Every dependency named in the
 graph reachable from what was just added or refreshed - not only the direct
@@ -270,11 +286,12 @@ decision and retrying an older one - but it stays deterministic by
 construction (decisions are made in a fixed order over the graph's own
 package names), so the same graph always resolves to the same versions.
 
-Today the `dependencies` grammar above accepts only an exact tag, a branch,
-or a bare commit sha - no `^`/`~` syntax is written to or read from
-`bit.json` yet - so every constraint a real `bit add`/`bit up` run actually
-hands the resolver is an exact pin; `^`/`~` exist in the solver's own
-constraint model ahead of a grammar that can express them.
+`bit add` writes `^`/`~` and exact constraints per the rules above, so the
+solver's constraint model is no longer ahead of what a real `bit add`/`bit up`
+run can hand it: a bare `bit add` writes a caret against the newest available
+tag, naming a version writes an exact pin, and `@^`/`@~` are written back as
+given. A non-version ref (a branch or a bare commit sha) still has no
+ordering to arbitrate and is never compared against a tagged version.
 
 When no version satisfies every stated constraint, resolution fails naming
 every conflicting requirement rather than a bare "no version works": which
