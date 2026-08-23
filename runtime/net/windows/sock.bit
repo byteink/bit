@@ -1,0 +1,498 @@
+// Windows socket provider for the Stage-2 port of runtime/net/ (#3340, epic
+// #3322): AcceptEx/ConnectEx/WSARecv/WSASend on top of #3339's IOCP poller
+// (runtime/sched/windows/poll.bit). See ../net.bit for the platform-free
+// half and ../linux/sock.bit / ../darwin/sock.bit for the readiness-model
+// twins this file's shape borrows from where the completion model does not
+// force a difference.
+//
+// ---------------------------------------------------------------------------
+// THE FIVE WIN32 ASYNC-SOCKET TRAPS THIS FILE HANDLES (dispatch's own list)
+// ---------------------------------------------------------------------------
+//
+// 1. AcceptEx/ConnectEx are NOT ordinary exports — resolved via `WSAIoctl`
+//    with `SIO_GET_EXTENSION_FUNCTION_POINTER` and a GUID, never linked by
+//    name. See "GUID RESOLUTION" below. Consequence: they cannot go in
+//    compiler/pesyms.bit's static admitted-import table the way `socket`/
+//    `bind`/… do (#3340 admits those eight; AcceptEx/ConnectEx admit
+//    nothing there at all) — and a name obtained this way cannot be called
+//    through an ordinary `extern fn` either, since that path also resolves
+//    at LINK time. See "THE INDIRECT CALL" below for how it is actually
+//    invoked.
+// 2. ConnectEx requires the socket to be explicitly bound first — `netDialTcp`
+//    below binds to the wildcard address before resolving/calling ConnectEx.
+// 3. An AcceptEx'd socket does not inherit the listener's properties until
+//    `SO_UPDATE_ACCEPT_CONTEXT` is set — `netAcceptTcp` does this on every
+//    successful accept, before returning the socket to its caller.
+// 4. WSARecv/WSASend returning `SOCKET_ERROR` with `WSAGetLastError() ==
+//    WSA_IO_PENDING` is the SUCCESS path for an overlapped call, not a
+//    failure — every post site below treats `rc == 0 || err == wsaIoPending`
+//    as "the op is under way", and anything else as a hard failure.
+// 5. The OVERLAPPED (and, for WSARecv/WSASend, the WSABUF) must outlive the
+//    call. This file never allocates its own — it claims a slot from
+//    ../../sched/windows/poll.bit's fixed scratch pool (`pollClaimOp`), whose
+//    OVERLAPPED/WSABUF live at a STATIC address for the slot's whole claimed
+//    lifetime, and the slot is not released (`pollOpRelease`) until AFTER
+//    the woken caller has read its result back — spanning the entire async
+//    window, including a hard-failure abort path (`pollOpAbort`, called
+//    before any I/O the OS could reference was ever posted) and the
+//    ordinary completion path alike. See poll.bit's own "REAL-OP API"
+//    section for the pool-side half of this guarantee.
+//
+// ---------------------------------------------------------------------------
+// GUID RESOLUTION
+// ---------------------------------------------------------------------------
+//
+// `WSAIoctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, 16, &fnPtr, 8,
+// &bytesReturned, nil, nil)` on any connected-or-connectable socket returns a
+// pointer valid for the lifetime of the process on that Winsock provider —
+// resolved ONCE, lazily, on this module's first accept/dial call, and cached
+// in a module-level word (`acceptExPtr`/`connectExPtr`). `WSAIoctl` itself
+// IS an ordinary static import (ws2_32.dll, admitted in pesyms.bit) — only
+// the two function pointers it hands back are not.
+//
+// ---------------------------------------------------------------------------
+// THE INDIRECT CALL
+// ---------------------------------------------------------------------------
+//
+// A resolved AcceptEx/ConnectEx pointer is a raw code address with NO Bit
+// symbol — `extern fn` cannot reach it (§11.7 resolves at link time) and a
+// Bit closure cannot either (a `(code, env)` value, not a bare C pointer —
+// spec/SPEC.md §11.3). The only way to call it is an indirect `call` through
+// a register, which needs `asm` (§11.6). `acceptExCall`/`connectExCall`
+// below are that call, hand-encoded and verified against `objdump` on this
+// Mac (x86-64 machine code is architecture-, not OS-, specific, so a Mach-O
+// object assembled here proves the SAME bytes ARM/Intel would emit for the
+// identical instructions on Windows).
+//
+// EVERY REGISTER THIS ASSIGNS IS CHECKED AGAINST compiler/x64call.bit's
+// Win64 bank, not copied from the SysV shape #3503/#3554 got wrong twice:
+// arg1..arg4 in rcx/rdx/r8/r9, arg5+ on the stack at `[rsp+32]`, `[rsp+40]`,
+// … (verified directly against x64call.bit's own `xMarshalArgs`/
+// `xShadowSpace` — the compiler reserves 32 bytes of shadow space PER CALL
+// SITE, "reserved around just this call site" per its own comment, and
+// stack args land right above it). The trampolines use ONLY caller-saved
+// (volatile) Win64 registers — rax, rcx, rdx, r8, r9, r10, r11 — so no
+// callee-saved register (rbx, rsi, rdi, r12-r15) is ever touched and this
+// file never has to reason about whether this function's own prologue saves
+// one it pinned via `asm input` (it does not need to: nothing here is
+// pinned that Win64 requires this callee to preserve for ITS OWN caller).
+// The stack-passed arguments are shuttled through ONE scratch register
+// (r10) from a small caller-filled buffer (`argsPtr`) rather than each
+// getting its own dedicated register, for the identical reason: fewer
+// pinned registers, smaller risk surface. See tests/bit/threadtokenbytes.bit
+// for this project's established pattern of pinning a hand-encoded payload
+// byte-for-byte against a comment; no such pin exists here (this file has no
+// twin to diverge from), so the comment IS the check.
+//
+// ---------------------------------------------------------------------------
+// EVERY BUFFER CROSSES AS `*u8` PLUS A BYTE COUNT, never as a Bit slice
+// (§11.8: one 8-byte word per slice element, not packed bytes).
+// ---------------------------------------------------------------------------
+
+// `netParseIpv4`/`netMaxStalls`/`netMaxSpins`/`eIntr`/`saBytes`/`lenBytes`/
+// `ipBytes`/`netSockAddrPort`/`pollRead`/`pollWrite` are imported by
+// ../tcp.bit instead, the sibling file that actually uses them (imports are
+// module-scoped).
+import { afInet, sockStream, sockDgram, saLen, saPortOff, saAddrOff,
+         optBytes, putU8, getU8, putU16Be, putU32Le, getU32Le } from "../../net"
+import { taskAt, schedCurrentTask, taskWorker, wkSched, scPollFd } from "../../sched"
+import { schedParkArm, schedParkDisarm, schedPark } from "../../sched"
+import { schedCurrentWorker, wkId, schedMaxWorkers } from "../../sched"
+// The `pollClaimOp`/`pollOpOverlapped`/`pollOpWsabuf`/`pollOpCommit`/
+// `pollOpAbort`/`pollOpBytes`/`pollOpStatus`/`pollOpRelease` real-op API is
+// imported by ../tcp.bit instead, the sibling file that actually calls it
+// (imports are module-scoped, so this one `pollRegister` import already
+// covers this module's only OTHER use of ../../sched/windows).
+import { pollRegister } from "../../sched/windows"
+
+// int socket(int af, int type, int proto); SOCKET is a UINT_PTR on Win64, so
+// every call below carries it as `i64` — matching ../../sched/windows/
+// poll.bit's own `sock: i64` parameters exactly, since the same handles flow
+// into WSARecv/WSASend there.
+extern fn socket(af: i32, ty: i32, proto: i32): i64
+extern fn bind(s: i64, name: *u8, namelen: i32): i32
+extern fn listen(s: i64, backlog: i32): i32
+extern fn closesocket(s: i64): i32
+extern fn setsockopt(s: i64, level: i32, optname: i32, optval: *u8, optlen: i32): i32
+extern fn getsockopt(s: i64, level: i32, optname: i32, optval: *u8, optlen: *i32): i32
+extern fn shutdown(s: i64, how: i32): i32
+extern fn WSAIoctl(s: i64, code: i32, inBuf: *u8, inLen: i32, outBuf: *u8,
+    outLen: i32, bytesRet: *i32, overlapped: *byte, completion: *byte): i32
+extern fn WSARecv(sock: i64, buffers: *byte, bufferCount: i32, bytesRecvd: *byte,
+    flags: *byte, overlapped: *byte, completionRoutine: *byte): i32
+extern fn WSASend(sock: i64, buffers: *byte, bufferCount: i32, bytesSent: *byte,
+    flags: i32, overlapped: *byte, completionRoutine: *byte): i32
+extern fn WSAGetLastError(): i32
+
+// ---------------------------------------------------------------------------
+// Constants — every one read from Microsoft's own winsock2.h/mswsock.h, not
+// from memory (the same discipline ../linux/sock.bit's header states for
+// kernel UAPI numbers). SOL_SOCKET and SO_ERROR match ../darwin/sock.bit's
+// values exactly (both derive from the same BSD sockets heritage); Linux's
+// twin differs on both, which is exactly the kind of mismatch that stays
+// provider-local rather than core.
+// ---------------------------------------------------------------------------
+
+fn solSocket(): int { return 0xFFFF }
+fn soReuseAddr(): int { return 4 }
+fn soError(): int { return 0x1007 }
+// mswsock.h: the accepted/connected socket does not behave like a normal
+// one (trap #3) until this is set. `optval` for both is `*u8` pointing at
+// the listening/base socket handle's own bytes; Winsock ignores `optval`'s
+// content for SO_UPDATE_CONNECT_CONTEXT when nil is passed with length 0,
+// which `netDialTcp` below does since ConnectEx has no separate "listener".
+fn soUpdateAcceptContext(): int { return 0x700B }
+fn soUpdateConnectContext(): int { return 0x7010 }
+fn ipprotoTcp(): int { return 6 }
+fn ipprotoUdp(): int { return 17 }
+
+// WSA_IO_PENDING == ERROR_IO_PENDING (winerror.h) — trap #4: this is success
+// for an overlapped call, checked at every post site below.
+fn wsaIoPending(): int { return 997 }
+
+// SIO_GET_EXTENSION_FUNCTION_POINTER (mswsock.h) — `0xC8000006` as the DWORD
+// bit pattern WSAIoctl's `dwIoControlCode` expects; `i32()` truncates the
+// literal to that same bit pattern, which is what the ABI actually passes
+// (a DWORD and a signed i32 of equal bits are indistinguishable on the wire).
+fn sioGetExtensionFunctionPointer(): i32 { return i32(0xC8000006) }
+
+const saFamilyOff: int = 0
+
+// ---------------------------------------------------------------------------
+// Error scratch — PER WORKER, the identical #3307 hazard ../linux/sock.bit's
+// `errWordBuf` documents: `WSAGetLastError()` is thread-local at the OS
+// level, but a worker can run more than one task, and a concurrent SUCCESS
+// on another task's call must not appear to zero THIS task's just-recorded
+// error before it is read back.
+// ---------------------------------------------------------------------------
+
+let errWordBuf: [33]i64
+
+fn errWordAt(): *i64 {
+  return ptrOf(errWordBuf) + sockScratchSlot()
+}
+
+const sockScratchSlots: int = 32
+
+fn sockScratchSlot(): int {
+  let w = schedCurrentWorker()
+  if (w == 0) {
+    return sockScratchSlots
+  }
+  let id = *(taskAt(w) + wkId)
+  if (id < 0 || id >= schedMaxWorkers || id >= sockScratchSlots) {
+    return sockScratchSlots
+  }
+  return id
+}
+
+// Winsock convention: SOCKET_ERROR (-1) means "check WSAGetLastError()";
+// anything else (including a valid handle or 0) is success.
+fn wsaRc(rc: int): int {
+  if (rc < 0) {
+    *errWordAt() = i64(int(WSAGetLastError()))
+    return 0 - 1
+  }
+  *errWordAt() = 0
+  return rc
+}
+
+fn lastErr(): int {
+  return int(*errWordAt())
+}
+
+// ---------------------------------------------------------------------------
+// Addresses — `sockaddr_in` on Windows matches Linux's layout exactly (a
+// 16-bit `sin_family` at offset 0, not Darwin's 8-bit `sin_len`), verified
+// against Microsoft's own `ws2def.h`. So this is ../linux/sock.bit's
+// `netFillSockAddr`/`netSockAddrFamily` verbatim, not Darwin's.
+// ---------------------------------------------------------------------------
+
+@nosplit fn putU16Le(base: *u8, off: int, v: int) {
+  putU8(base, off, v)
+  putU8(base, off + 1, v / 256)
+}
+
+export @symbol("bit_rt_port_net_fill_sock_addr") @nosplit fn netFillSockAddr(sa: *u8, ip: *u8, port: int) {
+  let k = 0
+  while (k < saLen) {
+    putU8(sa, k, 0)
+    k = k + 1
+  }
+  putU16Le(sa, saFamilyOff, afInet())
+  putU16Be(sa, saPortOff, port)
+  let j = 0
+  while (j < 4) {
+    putU8(sa, saAddrOff + j, getU8(ip, j))
+    j = j + 1
+  }
+}
+
+export @symbol("bit_rt_port_net_sock_addr_family") @nosplit fn netSockAddrFamily(sa: *u8): int {
+  return getU8(sa, saFamilyOff)
+}
+
+// ---------------------------------------------------------------------------
+// Raw socket calls
+// ---------------------------------------------------------------------------
+
+export @symbol("bit_rt_port_net_sys_socket") fn netSysSocket(dgram: bool): int {
+  let ty = sockStream()
+  let proto = ipprotoTcp()
+  if (dgram) {
+    ty = sockDgram()
+    proto = ipprotoUdp()
+  }
+  let s = wsaRc(int(socket(i32(afInet()), i32(ty), i32(proto))))
+  if (s < 0) {
+    return 0 - 1
+  }
+  return s
+}
+
+export @symbol("bit_rt_port_net_close") @nosplit fn netClose(fd: int) {
+  let _ = int(closesocket(i64(fd)))
+}
+
+export @symbol("bit_rt_port_net_sys_bind") fn netSysBind(fd: int, sa: *u8): bool {
+  return wsaRc(int(bind(i64(fd), sa, i32(saLen)))) >= 0
+}
+
+export @symbol("bit_rt_port_net_sys_listen") fn netSysListen(fd: int, backlog: int): bool {
+  return wsaRc(int(listen(i64(fd), i32(backlog)))) >= 0
+}
+
+export @symbol("bit_rt_port_net_set_reuse_addr") fn netSetReuseAddr(fd: int): bool {
+  putU32Le(optBytes(), 0, 1)
+  return wsaRc(int(setsockopt(i64(fd), i32(solSocket()), i32(soReuseAddr()),
+                              optBytes(), i32(4)))) >= 0
+}
+
+// The pending error on a socket, as SO_ERROR — the ordinary (non-ConnectEx)
+// path never needs this on Windows (see ../tcp.bit's `netDialTcp`, which
+// reads the outcome off the completion status instead), kept for interface
+// parity with the Linux/Darwin twins' identically-named function in case a
+// future caller needs it.
+fn netSocketError(fd: int): int {
+  putU32Le(optBytes(), 0, 0)
+  // MANAGED scratch (#1668-style): a function-local scalar `let` has no
+  // guaranteed stable address (only a module-level one does, per SPEC
+  // §11.11) — a `[]i64` local is the project's own bridge to a stable,
+  // `ptrOf`-able address for an out-parameter.
+  let lenBuf = []i64(1)
+  lenBuf[0] = i64(4)
+  if (wsaRc(int(getsockopt(i64(fd), i32(solSocket()), i32(soError()),
+                           optBytes(), i32PtrAt(int(ptrOf(lenBuf)))))) < 0) {
+    return 0 - 1
+  }
+  return getU32Le(optBytes(), 0)
+}
+
+// Re-address a `*i64`-worth of scratch as a `*i32` — the low half, on this
+// little-endian target, matching ../../thread/windows/spawn.bit's
+// `wordsAtI32` idiom exactly (that file's own comment: "an `*i32` scales by
+// 4, so the byte address divided by 4 off the null pointer names the same
+// cell").
+fn i32PtrAt(addr: int): *i32 {
+  let z: *i32 = nil
+  return z + addr / 4
+}
+
+// ---------------------------------------------------------------------------
+// GUID resolution (trap #1) and the indirect call (see this file's header)
+// ---------------------------------------------------------------------------
+
+// `d4` packs the GUID's 8-byte `Data4` array into one int, most-significant
+// (document-order first) byte first — e.g. `{0x95,0xca,...,0x92}` is
+// `0x95ca...92` — so the whole GUID fits in 5 params, the lint's own ceiling.
+fn fillGuid(buf: *u8, d1: int, d2: int, d3: int, d4: int) {
+  putU32Le(buf, 0, d1)
+  putU16Le(buf, 4, d2)
+  putU16Le(buf, 6, d3)
+  let k = 0
+  while (k < 8) {
+    putU8(buf, 8 + k, (d4 / (1 << ((7 - k) * 8))) % 256)
+    k = k + 1
+  }
+}
+
+// WSAID_ACCEPTEX = {0xb5367df1,0xcbac,0x11cf,{0x95,0xca,0x00,0x80,0x5f,0x48,0xa1,0x92}}
+// (mswsock.h). 16-byte scratch, module-level: resolution happens once, under
+// `resolveLock`, so no per-worker slot is needed.
+let acceptExGuid: [2]i64
+let connectExGuid: [2]i64
+
+// The resolved pointers, 0 until first resolved. A plain (non-atomic) guard
+// is sufficient: `resolveExtensionFns` is idempotent (re-resolving twice is
+// harmless — WSAIoctl is safe to call repeatedly and returns the identical
+// address), so a benign race that resolves twice costs one extra syscall,
+// never a wrong value.
+let acceptExPtr: i64 = 0
+let connectExPtr: i64 = 0
+
+// Resolve both extension functions via `s`, if not already resolved. `s`
+// only needs to be a valid AF_INET/SOCK_STREAM socket of the same address
+// family — the returned pointer is valid process-wide on this provider, not
+// scoped to `s` itself (Microsoft's own documented behaviour for
+// SIO_GET_EXTENSION_FUNCTION_POINTER). Returns false if EITHER resolution
+// fails on a genuinely fresh attempt.
+fn resolveExtensionFns(s: int): bool {
+  if (acceptExPtr != 0 && connectExPtr != 0) {
+    return true
+  }
+  fillGuid(bytesAt(int(ptrOf(acceptExGuid))), 0xb5367df1, 0xcbac, 0x11cf, 0x95ca00805f48a192)
+  fillGuid(bytesAt(int(ptrOf(connectExGuid))), 0x25a207b9, 0xddf3, 0x4660, 0x8ee976e58c74063e)
+  // MANAGED `[]i64` scratch for every out-parameter below — see
+  // `netSocketError`'s identical comment: a function-local scalar `let` has
+  // no guaranteed address.
+  let outA = []i64(1)
+  let retA = []i64(1)
+  let rcA = wsaRc(int(WSAIoctl(i64(s), sioGetExtensionFunctionPointer(),
+    bytesAt(int(ptrOf(acceptExGuid))), i32(16), bytesAtI64(ptrOf(outA)), i32(8),
+    i32PtrAt(int(ptrOf(retA))), nilByte(), nilByte())))
+  if (rcA < 0) {
+    return false
+  }
+  let outC = []i64(1)
+  let retC = []i64(1)
+  let rcC = wsaRc(int(WSAIoctl(i64(s), sioGetExtensionFunctionPointer(),
+    bytesAt(int(ptrOf(connectExGuid))), i32(16), bytesAtI64(ptrOf(outC)), i32(8),
+    i32PtrAt(int(ptrOf(retC))), nilByte(), nilByte())))
+  if (rcC < 0) {
+    return false
+  }
+  acceptExPtr = outA[0]
+  connectExPtr = outC[0]
+  return true
+}
+
+fn bytesAt(a: int): *u8 {
+  let z: *u8 = nil
+  return z + a
+}
+
+fn bytesAtI64(p: *i64): *byte {
+  let z: *byte = nil
+  return z + int(p)
+}
+
+fn nilByte(): *byte {
+  let z: *byte = nil
+  return z
+}
+
+// The AcceptEx indirect call — see this file's header for the register
+// assignment and why every one of them is Win64-volatile. `argsPtr` points
+// at a 4-word buffer: [dwLocalAddressLength, dwRemoteAddressLength,
+// &bytesReceived, lpOverlapped] — AcceptEx's arguments 5..8. `dwReceiveData
+// Length` (arg4, r9) is a FIXED 0 baked into the payload rather than a
+// parameter — this file never wants AcceptEx to pre-receive data — which
+// also keeps the param count at 5, the lint's own ceiling. Returns the
+// zero-extended 32-bit BOOL result (nonzero == immediate success).
+@nosplit fn acceptExCall(fnPtr: int, sListen: int, sAccept: int, outBuf: int, argsPtr: int): int {
+  return asm {
+    x64 {
+      0x48, 0x83, 0xec, 0x40,             // sub rsp, 0x40
+      0x4d, 0x8b, 0x13,                   // mov r10, [r11+0]
+      0x4c, 0x89, 0x54, 0x24, 0x20,       // mov [rsp+0x20], r10
+      0x4d, 0x8b, 0x53, 0x08,             // mov r10, [r11+8]
+      0x4c, 0x89, 0x54, 0x24, 0x28,       // mov [rsp+0x28], r10
+      0x4d, 0x8b, 0x53, 0x10,             // mov r10, [r11+16]
+      0x4c, 0x89, 0x54, 0x24, 0x30,       // mov [rsp+0x30], r10
+      0x4d, 0x8b, 0x53, 0x18,             // mov r10, [r11+24]
+      0x4c, 0x89, 0x54, 0x24, 0x38,       // mov [rsp+0x38], r10
+      0xff, 0xd0,                         // call rax
+      0x89, 0xc0,                         // mov eax, eax  (zero-extend the BOOL)
+      0x48, 0x83, 0xc4, 0x40              // add rsp, 0x40
+    }
+    input arm64 x0 x64 rax = fnPtr
+    input arm64 x1 x64 rcx = sListen
+    input arm64 x2 x64 rdx = sAccept
+    input arm64 x3 x64 r8 = outBuf
+    input arm64 x4 x64 r9 = 0
+    input arm64 x5 x64 r11 = argsPtr
+    clobber x64 { r10, memory }
+    result arm64 x0 x64 rax : int
+  }
+}
+
+// The ConnectEx indirect call. `argsPtr` points at a 3-word buffer:
+// [dwSendDataLength, &bytesSent, lpOverlapped] — ConnectEx's arguments 5..7.
+@nosplit fn connectExCall(fnPtr: int, s: int, name: int, namelen: int, argsPtr: int): int {
+  return asm {
+    x64 {
+      0x48, 0x83, 0xec, 0x40,             // sub rsp, 0x40
+      0x4d, 0x8b, 0x13,                   // mov r10, [r11+0]
+      0x4c, 0x89, 0x54, 0x24, 0x20,       // mov [rsp+0x20], r10
+      0x4d, 0x8b, 0x53, 0x08,             // mov r10, [r11+8]
+      0x4c, 0x89, 0x54, 0x24, 0x28,       // mov [rsp+0x28], r10
+      0x4d, 0x8b, 0x53, 0x10,             // mov r10, [r11+16]
+      0x4c, 0x89, 0x54, 0x24, 0x30,       // mov [rsp+0x30], r10
+      0xff, 0xd0,                         // call rax
+      0x89, 0xc0,                         // mov eax, eax
+      0x48, 0x83, 0xc4, 0x40              // add rsp, 0x40
+    }
+    input arm64 x0 x64 rax = fnPtr
+    input arm64 x1 x64 rcx = s
+    input arm64 x2 x64 rdx = name
+    input arm64 x3 x64 r8 = namelen
+    input arm64 x4 x64 r11 = argsPtr
+    clobber x64 { r10, memory }
+    result arm64 x0 x64 rax : int
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Parking on the completion port — the same shape as ../darwin/sock.bit's
+// `netAwaitReady` (a single descriptor), used only by the zero-byte
+// readiness probe (`pollRegister`); the real ops below (accept/dial/read/
+// write) claim their own slot directly via `pollClaimOp` and never go
+// through this function.
+// ---------------------------------------------------------------------------
+
+export @symbol("bit_rt_port_net_await_ready") fn netAwaitReady(fd: int, interest: int): bool {
+  let taskAddr = schedCurrentTask()
+  if (taskAddr == 0) {
+    return false
+  }
+  let t = taskAt(taskAddr)
+  let wAddr = *(t + taskWorker)
+  if (wAddr == 0) {
+    return false
+  }
+  let s = taskAt(*(taskAt(wAddr) + wkSched))
+  let pollFd = *(s + scPollFd)
+  if (pollFd == 0) {
+    return false
+  }
+  if (!schedParkArm()) {
+    return false
+  }
+  if (!pollRegister(pollFd, fd, interest, taskAddr)) {
+    let _ = schedParkDisarm()
+    return false
+  }
+  schedPark()
+  return true
+}
+
+// The current task's poll-fd (completion port handle), or 0 if there is no
+// scheduler bound (an unscheduled caller) — the precondition every real-op
+// entry point in ../tcp.bit checks before claiming a slot.
+fn currentPollFd(): int {
+  let taskAddr = schedCurrentTask()
+  if (taskAddr == 0) {
+    return 0
+  }
+  let t = taskAt(taskAddr)
+  let wAddr = *(t + taskWorker)
+  if (wAddr == 0) {
+    return 0
+  }
+  let s = taskAt(*(taskAt(wAddr) + wkSched))
+  return *(s + scPollFd)
+}
+
+fn currentTaskAddr(): int {
+  return schedCurrentTask()
+}
