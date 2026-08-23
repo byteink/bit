@@ -18,9 +18,11 @@
 //   compile-time constant (propagating through folded arithmetic/compares);
 //   `propagateBlockParams` (optparams.bit) then adds the one fact that sweep
 //   cannot see, a block param whose every predecessor edge passes the same
-//   constant; a bounded BFS uses constant branch conditions to find the
-//   reachable blocks; the rebuild reserves only reachable blocks and turns a
-//   resolved `br` into a plain `jump`. Folding, propagation, and dead-branch/
+//   constant; `forwardFieldLoads` (optstore.bit) records which `field_get`
+//   reloads a slot a `field_set` just wrote in the same block; a bounded BFS
+//   uses constant branch conditions to find the reachable blocks; the rebuild
+//   reserves only reachable blocks and turns a resolved `br` into a plain
+//   `jump`. Folding, propagation, store-to-load forwarding, and dead-branch/
 //   dead-block pruning all fall out of the one rebuild.
 //
 // Every pass is one bounded walk over already-known-size arrays. The one
@@ -405,7 +407,13 @@ fn deadCodeElim(f: IrFunc): IrFunc {
     reachAll = append(reachAll, true)
     i = i + 1
   }
-  return rebuild(f, noFold, reachAll, computeLive(f))
+  return rebuild(
+    f,
+    RebuildPlan{
+      known: noFold, keep: computeLive(f),
+      fwd: noForwarding(len(f.instrs)), blockReachable: reachAll,
+    },
+  )
 }
 
 // Which ops read `lhs` / `rhs` as a value operand (rather than leaving them 0).
@@ -430,17 +438,93 @@ fn opUsesRhs(op: Op): bool {
     op == Op.AtomicStore || op == Op.AtomicCmpxchg || opIsAtomicRmw(op)
 }
 
-// Rebuilds `f`, keeping only blocks marked in `blockReachable` and, within each
-// kept block, only instructions marked in `instKeep` (block params are always
-// emitted; terminators survive because the liveness sweep always marks them).
-// Blocks are
-// visited in their original emission order (ascending `instsStart`), not block-id
-// order: lowering emits a valid linear schedule (an RPO) that the x64 linear-scan
-// allocator's interval numbering assumes, and a loop's exit block is ID'd before
-// the body's inner blocks but emitted after them — iterating by id would move it
-// back into the middle of the loop. `instsStart` is unique per block, so the
-// order is deterministic.
-fn rebuild(f: IrFunc, known: []ConstVal, blockReachable: []bool, instKeep: []bool): IrFunc {
+// The per-instruction facts a rebuild consults, in one record so the walk stays
+// inside the parameter limit. `known` is the constant map, `keep` the liveness
+// mask (DCE), `fwd` the store-to-load forwarding map (optstore.bit) and
+// `blockReachable` the dead-block mask. A pass that does not use one of them
+// passes the neutral value — `noConst()` entries, all-true, `noForwarding`,
+// all-true — never a special case inside the rebuild.
+class RebuildPlan {
+  known: []ConstVal,
+  keep: []bool,
+  fwd: []int,
+  blockReachable: []bool,
+}
+
+// The rebuild's own working state, likewise bundled: `remap` translates an old
+// value id to its new one and `blockMap` an old block id, and both are written
+// as the walk proceeds.
+class RebuildCtx {
+  b: IrBuilder,
+  f: IrFunc,
+  plan: RebuildPlan,
+  remap: []int,
+  blockMap: []int,
+}
+
+// Block ids in their original emission order (ascending `instsStart`), NOT
+// block-id order: lowering emits a valid linear schedule (an RPO) that the x64
+// linear-scan allocator's interval numbering assumes, and a loop's exit block is
+// ID'd before the body's inner blocks but emitted after them — iterating by id
+// would move it back into the middle of the loop. `instsStart` is unique per
+// block, so the order is deterministic. Insertion sort; the block count is
+// small and is the loop's static bound.
+fn blockEmissionOrder(f: IrFunc): []int {
+  let order = []int(0)
+  let i = 0
+  while (i < len(f.blocks)) {
+    let j = len(order)
+    order = append(order, i)
+    while (j > 0 && f.blocks[order[j - 1]].instsStart > f.blocks[i].instsStart) {
+      order[j] = order[j - 1]
+      order[j - 1] = i
+      j = j - 1
+    }
+    i = i + 1
+  }
+  return order
+}
+
+// Whether instruction `idx` can take another value's id instead of being
+// emitted. The `keep` half is not redundant: today's only forwarding caller
+// keeps everything, but a plan that both forwards and prunes would otherwise
+// hand a load the `remap` slot of an instruction that was never emitted, which
+// reads as value id 0 — a silently wrong value, not a crash. Refusing the
+// forward there just emits the load, which is always correct.
+fn canForward(plan: RebuildPlan, idx: int): bool {
+  return plan.fwd[idx] >= 0 && plan.keep[plan.fwd[idx]]
+}
+
+// Emits one kept block: its params first (always), then each instruction the
+// plan keeps. A forwarded instruction emits NOTHING and takes its source's new
+// id, which is what deletes the redundant reload — its source index is always
+// lower than its own and in the same block, so `remap` already holds the answer.
+fn rebuildBlock(rc: RebuildCtx, bi: int) {
+  let blk = rc.f.blocks[bi]
+  builderBeginBlock(rc.b, rc.blockMap[bi])
+  let idx = blk.instsStart
+  let paramsEnd = blk.instsStart + blk.paramCount
+  while (idx < paramsEnd) {
+    rc.remap[idx] = builderAddParam(rc.b, rc.f.instrs[idx].ty)
+    idx = idx + 1
+  }
+  let end = blk.instsStart + blk.instsLen
+  while (idx < end) {
+    if (canForward(rc.plan, idx)) {
+      rc.remap[idx] = rc.remap[rc.plan.fwd[idx]]
+    } else if (rc.plan.keep[idx]) {
+      emitTranslated(rc.b, rc.f, rc.plan.known, rc.remap, rc.blockMap, idx)
+    }
+    idx = idx + 1
+  }
+  builderEndBlock(rc.b)
+}
+
+// Rebuilds `f`, keeping only blocks marked in `plan.blockReachable` and, within
+// each kept block, only instructions marked in `plan.keep` (block params are
+// always emitted; terminators survive because the liveness sweep always marks
+// them).
+fn rebuild(f: IrFunc, plan: RebuildPlan): IrFunc {
   let n = len(f.blocks)
   let blockMap = []int(0)
   let remap = []int(0)
@@ -454,50 +538,21 @@ fn rebuild(f: IrFunc, known: []ConstVal, blockReachable: []bool, instKeep: []boo
     remap = append(remap, 0)
     i = i + 1
   }
-  // Insertion sort of block ids by ascending instsStart (n is small).
-  let order = []int(0)
-  i = 0
-  while (i < n) {
-    let j = len(order)
-    order = append(order, i)
-    while (j > 0 && f.blocks[order[j - 1]].instsStart > f.blocks[i].instsStart) {
-      order[j] = order[j - 1]
-      order[j - 1] = i
-      j = j - 1
-    }
-    i = i + 1
-  }
+  let order = blockEmissionOrder(f)
   let b = newBuilder()
   i = 0
   while (i < n) {
-    if (blockReachable[order[i]]) {
+    if (plan.blockReachable[order[i]]) {
       blockMap[order[i]] = builderNewBlock(b)
     }
     i = i + 1
   }
+  let rc = RebuildCtx{ b: b, f: f, plan: plan, remap: remap, blockMap: blockMap }
   i = 0
   while (i < n) {
-    let bi = order[i]
-    if (!blockReachable[bi]) {
-      i = i + 1
-      continue
+    if (plan.blockReachable[order[i]]) {
+      rebuildBlock(rc, order[i])
     }
-    let blk = f.blocks[bi]
-    builderBeginBlock(b, blockMap[bi])
-    let idx = blk.instsStart
-    let paramsEnd = blk.instsStart + blk.paramCount
-    while (idx < paramsEnd) {
-      remap[idx] = builderAddParam(b, f.instrs[idx].ty)
-      idx = idx + 1
-    }
-    let end = blk.instsStart + blk.instsLen
-    while (idx < end) {
-      if (instKeep[idx]) {
-        emitTranslated(b, f, known, remap, blockMap, idx)
-      }
-      idx = idx + 1
-    }
-    builderEndBlock(b)
     i = i + 1
   }
   return IrFunc{ name: f.name, paramTypes: f.paramTypes, result: f.result,
@@ -512,7 +567,11 @@ fn rebuild(f: IrFunc, known: []ConstVal, blockReachable: []bool, instKeep: []boo
     inRootModule: f.inRootModule, isPinned: f.isPinned }
 }
 
-// Pass 1: constant folding + propagation, dead-branch/dead-block pruning.
+// Pass 1: constant folding + propagation, block-local store-to-load forwarding,
+// dead-branch/dead-block pruning. Forwarding rides here rather than in its own
+// rebuild because the DCE pass that immediately follows is what actually
+// deletes the reloads it made dead, and `optimizeModule` runs the pair twice —
+// so a load exposed by inlining is forwarded on the second round.
 fn foldConstantsAndPrune(ctx: TypeContext, f: IrFunc): IrFunc {
   let known = analyzeConsts(ctx, f)
   foldIdentities(ctx, f, known)
@@ -522,7 +581,13 @@ fn foldConstantsAndPrune(ctx: TypeContext, f: IrFunc): IrFunc {
     keepAll = append(keepAll, true)
     i = i + 1
   }
-  return rebuild(f, known, computeReachable(f, known), keepAll)
+  return rebuild(
+    f,
+    RebuildPlan{
+      known: known, keep: keepAll,
+      fwd: forwardFieldLoads(f), blockReachable: computeReachable(f, known),
+    },
+  )
 }
 
 // Runs the optimizer over every function in `m`, in place. Mirrors the seed's
