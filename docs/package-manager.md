@@ -86,8 +86,8 @@ dependency_entry = STRING_LIT ':' STRING_LIT .   (* name : "gitHost/owner/repo@r
 
 Each value is `gitHost/owner/repo@ref`, and `ref` is exactly one of:
 
-- an exact tag `vMAJOR.MINOR.PATCH` (e.g. `v1.4.2`) - the only form Minimal
-  Version Selection (below) treats as an ordered version;
+- an exact tag `vMAJOR.MINOR.PATCH` (e.g. `v1.4.2`) - the only form the
+  resolver (below) treats as an ordered version;
 - a branch name (e.g. `main`), resolved to that branch's current tip; or
 - a bare 40-character commit SHA, resolved to exactly that commit.
 
@@ -133,19 +133,23 @@ bit add: quicwire -> github.com/byteink/quicwire@v1.4.2 (9f8e7d6c5b4a3928170695e
 ```
 
 The dependency's own `bit.json` is fetched and its transitive requirements
-are checked with Minimal Version Selection before anything is written: adding
-a version that undercuts what another already-locked dependency transitively
-requires fails loudly rather than locking an inconsistent graph.
+are checked against every already-locked dependency's own requirements with
+the PubGrub resolver (below) before anything is written: naming a version
+that conflicts with what another already-locked dependency transitively
+requires fails loudly, naming both requirers and both versions, rather than
+locking an inconsistent graph.
 
 **Transitive dependencies are resolved too.** Every dependency named in the
 graph reachable from what was just added or refreshed - not only the direct
 ones `bit.json` names - is fetched and given its own top-level `bit.lock`
 entry, the same direct-vs-vanity classification and fetch path a root
-dependency uses. When two different requirers name different versions of the
-same transitive dependency, Minimal Version Selection picks the maximum. A
-name `bit.lock` already has a top-level entry for is not reconsidered, even
-by `bit up`, if a newly discovered requirement would want a higher version -
-only names with no entry yet are filled in.
+dependency uses. When two different requirers name the same transitive
+dependency, the PubGrub resolver (below) intersects their constraints -
+today that always means two exact pinned versions, so two requirers naming
+a *different* one fails the whole add or update, naming both, rather than
+silently picking one. A name `bit.lock` already has a top-level entry for is
+not reconsidered, even by `bit up`, if a newly discovered requirement would
+want a higher version - only names with no entry yet are filled in.
 
 ## `bit up` / `bit update`
 
@@ -232,18 +236,54 @@ records:
   dereferenced to a commit before being recorded; `bit.lock` never stores a
   mutable ref.
 - `requires` - that dependency's own transitive `dependencies`, verbatim,
-  so Minimal Version Selection can re-run from the lockfile alone without
+  so the resolver (below) can re-run from the lockfile alone without
   re-fetching every transitive manifest.
 
-## Resolution: Minimal Version Selection
+## Resolution: PubGrub
 
-Bit resolves the dependency graph with Go-style MVS, not a SAT/range solver:
-for each module named anywhere in the transitive requirement graph, the
-resolver takes the **maximum** of every stated minimum version for it.
-Non-version refs (a branch or a bare SHA) are not compared against tagged
-versions. One pass over the graph, no backtracking, deterministic by
-construction - the resolved version is never lower than the highest of all
-requirements and never higher than some entry actually asked for.
+Bit resolves the dependency graph with a PubGrub solver
+(`compiler/pmresolve.bit`, `compiler/pmresolvesolve.bit`,
+`compiler/pmresolveexplain.bit`), not a one-pass "take the maximum" walk -
+that was Go-style Minimal Version Selection, retired by the same change that
+added this solver. MVS could never fail: every requirement was a bare
+minimum, and the max of stated minimums always produced an answer. Once a
+package must satisfy the *intersection* of every stated requirement, that
+intersection can be empty, so resolution genuinely fails now - and a solver
+that can only say "no version works" is not enough to debug that. PubGrub
+(Natalie Weizenbaum's writeup; Dart's `pub`, later Cargo's resolver) is unit
+propagation plus conflict-driven clause learning over version sets, and its
+failures come with a *derivation*: which requirements, stated by which
+requirers, cannot all hold at once - not just which package lost.
+
+Every requirement the resolver reasons about is a version set built from a
+`^X.Y.Z`, `~X.Y.Z`, or exact constraint (`compiler/pmversionset.bit`); the
+resolver keeps the running intersection of every constraint stated against a
+package as it works, computed exactly (set intersection, union and
+complement over disjoint version ranges), never approximately. A non-version
+ref (a branch or a bare commit sha) has no ordering to arbitrate and is
+never compared against a tagged version - SPEC §17.7's carve-out, unchanged
+by the algorithm swap. When several available versions satisfy the
+intersection, the resolved version is the **highest** of them - never the
+lowest, and never merely the max of stated minimums. The search can
+backtrack - trying a candidate version, finding it conflicts, undoing that
+decision and retrying an older one - but it stays deterministic by
+construction (decisions are made in a fixed order over the graph's own
+package names), so the same graph always resolves to the same versions.
+
+Today the `dependencies` grammar above accepts only an exact tag, a branch,
+or a bare commit sha - no `^`/`~` syntax is written to or read from
+`bit.json` yet - so every constraint a real `bit add`/`bit up` run actually
+hands the resolver is an exact pin; `^`/`~` exist in the solver's own
+constraint model ahead of a grammar that can express them.
+
+When no version satisfies every stated constraint, resolution fails naming
+every conflicting requirement rather than a bare "no version works": which
+package is disputed, which requirers stated a constraint on it, and what
+each constraint was. For example, if an already-locked dependency
+transitively requires `streambuf` at one exact version and a fresh `bit add`
+or a deeper transitive requirement names a different one, the failure names
+both requirers and both versions - not just that `streambuf` could not be
+resolved.
 
 ## The package cache: `~/.bit/pkg`
 
