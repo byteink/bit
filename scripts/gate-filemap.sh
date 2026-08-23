@@ -6,6 +6,63 @@
 # the repo root — every path below (tools/build/gates.bit) is relative to it,
 # matching gate.sh's own convention.
 #
+# WHY scripts/** HAS NO BUCKET OF ITS OWN (#2745) — gate.sh's header points
+# here rather than restating this, since gate.sh itself has no line budget
+# left to spend on it.
+#
+# A scripts/**-only diff — most often the selfhost-diff*.sh differential
+# family — falls to bucket `full` today, same as any other unmapped path
+# (gate.sh's "any other path" paragraph above the THREE NARROW EXCEPTIONS
+# block). Without --full that is a loud refusal (exit 3,
+# GATE_RESULT=FULL_REQUIRED, #2872), not a run of the 18-18.5 minute
+# `./make test` — the harm this ticket was originally filed against (an
+# 18-25 min suite run hidden behind a routine shell edit) is already gone.
+# What's left is only the inconvenience of no scoped, narrower-than-`full`
+# check, and #2745 decided that inconvenience is not worth fixing, because
+# both routes to a real bucket hit a wall that was checked, not assumed:
+#
+#   1. gate.sh sits at 797-798/800 lines, a hard ceiling (never raised, never
+#      suppressed — spec/LINT.md's E0200). A bucket needs a has_scripts
+#      declaration, a case arm, bucket_count wiring, an elif branch and
+#      terminal handling, matching the eight buckets already above — on the
+#      order of 25 lines even maximally delegated to this file, which this
+#      file's own few lines of headroom cannot absorb without cutting
+#      cross-referenced reasoning kept for exactly the reason this block
+#      exists: so the next person does not have to re-derive it.
+#   2. Wiring a bucket to actually RUN a differential (not just `bash -n` it)
+#      collides with assert_full_is_superset() in
+#      scripts/gate-buildsteps.sh:239-272 — an unconditional invariant that
+#      any script named in a bucket's BUCKET_PRE/BUCKET_POST must also be in
+#      `full`'s own script list (today: selfhost-diffcheck.sh,
+#      selfhost-fixpoint.sh, selfhost-diffruntime.sh,
+#      selfhost-diffexamples.sh — none of the diffdump family). It exists to
+#      stop the #2084 class of bug, where escalating to the "safe" fallback
+#      ran FEWER checks than the specific bucket would have. Naming e.g.
+#      selfhost-diffast.sh in a new bucket without also adding it to `full`
+#      fails this check before a single step runs; adding it to `full`
+#      instead makes every --full/pre-push run pay for it. Separately,
+#      selfhost-diffdump.sh (the shared driver behind six of the family's
+#      files — diffast/difftokens/diffdiags/difftypes/diffir/diffiropt) takes
+#      a `<name>` argument, and gate.sh's PRE/POST mechanism only runs a bare
+#      `bash <path>` with no argument passing — so only those six
+#      self-contained shims are even mechanically wireable this way, not the
+#      rest of the family (diffdoc ~753s, diffcheck ~531s,
+#      diffsafepoints ~437s among them, none of which is "narrower than
+#      full" in any useful sense).
+#
+# Frequency was checked, not assumed idle: 81 commits touched
+# scripts/selfhost-diff*.sh in the trailing 30 days (of this writing), and
+# every one of those 81 touched only scripts/** paths — so this is a
+# real, recurring cost, not a rare one, and still not worth the two walls
+# above.
+#
+# WHAT TO RUN INSTEAD of `--full` for a scripts/**-only change: `bash -n
+# <changed-script>` (catches a syntax error, which is most of what a bucket
+# here would have bought), then run that one changed differential directly,
+# e.g. `bash scripts/selfhost-diffast.sh`. That is strictly cheaper than
+# anything a bucket could add, and it is what #3553's agent was already
+# observed doing by hand.
+#
 # gates_for_file() answers one question: given a changed file path, which
 # gate(s) (by name, as registered in tools/build/gates.bit) does it belong to?
 # assert_dirgates_current() self-checks that mapping is complete for every
