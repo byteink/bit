@@ -1,0 +1,224 @@
+// tests/bit/stressparallel.bit — #2538 (epic #1253): run the five
+// tests/stress/parallel/*.bit programs, each built once and then executed
+// twice — BIT_WORKERS=8 and BIT_WORKERS=1, both with STRESS_WORKERS=8 named
+// explicitly (never relying on the runtime's own BIT_WORKERS default,
+// runtime/root/rootconfig.bit's rootEnvWorkers(1)) — with gcalloc.bit's two
+// executions also carrying BIT_GC=stress. Every build and every execution is
+// bounded to 300s.
+//
+// #2538 WAS WRITTEN AS "add scripts/stress-parallel.sh". That conflicts with
+// this repo's standing rule against growing scripts/ (bitlang-ws/CLAUDE.md,
+// "Do not bloat bit/scripts/"): rule 2 there says a verification step
+// belongs in tools/build/ as a Gate{}, in Bit, where `./make` actually runs
+// it — a check living in shell outside the build driver is a second
+// verification world nobody runs (#2570 found exactly that: none of 19
+// shell differentials was reachable from `tools/build/**`, so the mandatory
+// gate ran none of them). This file is that resolution: a Gate{}-registered
+// Bit harness, not a new script. See #2538's ticket comments for the full
+// rule-1/rule-2 write-up.
+//
+// TIMEOUT WITHOUT `timeout(1)`: `osRunBounded(path, timeout_ms)` (ABI.md
+// §19, `bit_rt_os_run_bounded`) is the runtime's own bounded-subprocess
+// primitive — it forks, execs, and SIGKILLs on the deadline, returning -2 on
+// timeout (tests/bit/stress/verify.bit's `runMsg`). That is a real answer to
+// "macOS has no timeout(1)", already built and already proven by every
+// tests/bit/stress/* harness, rather than a shell sleep+kill reimplementation.
+// It takes no argv and no environment, so a tiny generated /bin/sh wrapper
+// (written under scratch, chmod 0755) is the only way to hand a child its
+// env vars and keep its stdout — the same shape tests/bit/testpanic.bit and
+// tests/bit/stress/verify.bit use.
+//
+// BUILD ONCE, EXEC THE BINARY TWICE, NEVER `bit run`: `bit run` unconditionally
+// refuses `BIT_GC=stress` (compiler/build.bit's `refuseRunUnderStressGc`,
+// #2425/#2979 — it would stress the compiler's own compile of the source, not
+// the program), which is exactly what gcalloc.bit's two passes need (#3472).
+// Building once with `bit build` and executing the resulting binary directly
+// sidesteps the refusal for every program in the family with one code path
+// and no per-program special case.
+//
+// THIS IS NOT tests/stress/ PARALLELISM: epic #1899 forbids running the
+// tests/stress/ CORPUS concurrently ("several cases count scheduler passes or
+// collection ratios and would corrupt each other's verdicts under load").
+// This harness runs its five programs SEQUENTIALLY, one at a time, two passes
+// each — "parallel" in "tests/stress/parallel/" names what each program does
+// INTERNALLY (spawns N workers), not how this harness schedules the five of
+// them against each other.
+//
+// A NEW FILE, NOT AN EDIT TO tests/bit/stress/{stress,setup,verify}.bit: this
+// harness reads tests/stress/parallel/*.bit directly and calls osRunBounded
+// itself rather than importing that directory module's checkProgram, which is
+// shaped for the *.expected/no-collect/stress-waived legacy corpus this
+// family is deliberately excluded from (#3397).
+//
+// exclusive: false (tools/build/gates.bit) is a deliberate choice, not an
+// oversight: every program here verifies an exact-value checksum (a sum, a
+// count, a retained-record tag/slice comparison), never a scheduler-pass
+// count or a collection ratio, so co-scheduling this gate alongside others
+// cannot corrupt its verdict the way the `test-stress-exclusive` partition's
+// timing-sensitive programs can — the same reasoning `test-stress-batch`
+// already relies on for the rest of the corpus.
+//
+// WIRED INTO `./make` as `test-stress-parallel-programs` (tools/build/gates.bit,
+// tools/build/defs.bit) — deliberately NOT part of `./make test`
+// (`gateNames()`), same shape as `test-stress`/`test-differentials`/
+// `test-coldboot`: `./make test-stress-parallel-programs` runs it.
+
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir } from "std/fs"
+import { contains } from "std/strings"
+
+const perRunTimeoutMs: int = 300000
+
+fn programNames(): []string {
+  return ["chanhammer", "mutexcounter", "fanout", "gcalloc", "pipeline"]
+}
+
+class Ctx {
+  bin: string,
+  stdlib: string,
+  libbitrt: string,
+  repo: string,
+  scratch: string,
+}
+
+fn requiredEnv(name: string): string {
+  let v = env(name)
+  if (v == "") {
+    eprint("stress-parallel: ${name} is not set — refusing to guess.\n")
+    exit(2)
+  }
+  return v
+}
+
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+fn writeWrapper(path: string, body: string) {
+  writeFile(path, body) catch e {
+    eprint("stress-parallel: cannot write wrapper ${path}: ${e.message()}\n")
+    exit(2)
+  }
+  if (fsChmod(path, 493) != 0) { // 0o755
+    eprint("stress-parallel: cannot chmod wrapper ${path}\n")
+    exit(2)
+  }
+}
+
+// Build `name`.bit once into `outBin`. Bounded the same 300s a run gets: a
+// hung build is exactly the hang this ticket exists to catch.
+fn buildOne(cx: Ctx, name: string, outBin: string): int {
+  let srcPath = "${cx.repo}/tests/stress/parallel/${name}.bit"
+  let shPath = "${cx.scratch}/${name}.build.sh"
+  let errPath = "${cx.scratch}/${name}.build.err"
+  let script = "#!/bin/sh\n" +
+    "BIT_STDLIB=" + shQuote(cx.stdlib) + "\nexport BIT_STDLIB\n" +
+    "BIT_LIBBITRT=" + shQuote(cx.libbitrt) + "\nexport BIT_LIBBITRT\n" +
+    "exec " + shQuote(cx.bin) + " build " + shQuote(srcPath) + " -o " + shQuote(outBin) +
+    " >" + shQuote("${cx.scratch}/${name}.build.out") + " 2>" + shQuote(errPath) + "\n"
+  writeWrapper(shPath, script)
+  let code = osRunBounded(shPath, perRunTimeoutMs)
+  if (code != 0) {
+    let errText = readFile(errPath) catch _ { "" }
+    eprint("stress-parallel: BUILD FAIL ${name} rc=${code}\n${errText}")
+  }
+  return code
+}
+
+// The env prefix for one pass: BIT_WORKERS and STRESS_WORKERS are ALWAYS
+// named explicitly (never relying on the runtime's own default), and
+// gcalloc.bit additionally gets BIT_GC=stress on both passes (#3472).
+fn envLineFor(name: string, workers: int): string {
+  let line = "BIT_WORKERS=${workers}\nexport BIT_WORKERS\n" +
+    "STRESS_WORKERS=8\nexport STRESS_WORKERS\n"
+  if (name == "gcalloc") {
+    line = line + "BIT_GC=stress\nexport BIT_GC\n"
+  }
+  return line
+}
+
+// Run the already-built `binPath` for one pass, bounded to 300s. Returns the
+// exit code (-2 timeout, -1 spawn failure, osRunBounded's own encoding —
+// ABI.md §19) plus the captured stdout.
+fn runPass(cx: Ctx, name: string, workers: int, binPath: string): (int, string) {
+  let tag = "${name}-w${workers}"
+  let shPath = "${cx.scratch}/${tag}.run.sh"
+  let outPath = "${cx.scratch}/${tag}.run.out"
+  let script = "#!/bin/sh\n" + envLineFor(name, workers) +
+    "exec " + shQuote(binPath) + " >" + shQuote(outPath) + " 2>&1\n"
+  writeWrapper(shPath, script)
+  let code = osRunBounded(shPath, perRunTimeoutMs)
+  let out = readFile(outPath) catch _ { "" }
+  return code, out
+}
+
+// Print the required PASS/FAIL/TIMEOUT line for one run and report whether it
+// passed. A run that exits 0 without the program's own "<name> OK" marker in
+// stdout is still a failure — an exit code alone does not prove the internal
+// checksum ran, only that something returned 0.
+fn checkOutcome(name: string, workers: int, code: int, out: string): bool {
+  if (code == -2) {
+    print("TIMEOUT ${name} workers=${workers}\n")
+    return false
+  }
+  if (code != 0) {
+    print("FAIL ${name} workers=${workers} rc=${code}\n")
+    eprint(out)
+    return false
+  }
+  if (!contains(out, "${name} OK")) {
+    print("FAIL ${name} workers=${workers} rc=0\n")
+    eprint("stress-parallel: exit 0 but stdout missing '${name} OK':\n${out}")
+    return false
+  }
+  print("PASS ${name} workers=${workers}\n")
+  return true
+}
+
+// Build `name`.bit once, then run it at workers=8 and workers=1. Returns
+// false the moment any step fails — the caller stops the whole gate there.
+fn runProgram(cx: Ctx, name: string): bool {
+  let outBin = "${cx.scratch}/${name}.bin"
+  let buildCode = buildOne(cx, name, outBin)
+  if (buildCode != 0) {
+    return false
+  }
+  let (code8, out8) = runPass(cx, name, 8, outBin)
+  if (!checkOutcome(name, 8, code8, out8)) {
+    return false
+  }
+  let (code1, out1) = runPass(cx, name, 1, outBin)
+  return checkOutcome(name, 1, code1, out1)
+}
+
+fn main() {
+  let cx = Ctx{
+    bin: requiredEnv("BIT_BIN"),
+    stdlib: requiredEnv("BIT_STDLIB"),
+    libbitrt: requiredEnv("BIT_LIBBITRT"),
+    repo: requiredEnv("BIT_REPO"),
+    scratch: envOr("TMPDIR", "/tmp") + "/bit-stressparallel-${timeUnixNs()}",
+  }
+  mkdir(cx.scratch) catch e {
+    eprint("stress-parallel: cannot create scratch directory ${cx.scratch}: ${e.message()}\n")
+    exit(2)
+  }
+
+  for name of programNames() {
+    if (!runProgram(cx, name)) {
+      exit(1)
+    }
+  }
+
+  print("stress-parallel: all 10 runs passed\n")
+}
