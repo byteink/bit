@@ -1,0 +1,158 @@
+// pkg/redis/resp.bit — RESP2 (REdis Serialization Protocol) codec: encode a
+// command, decode a reply. No I/O of its own: `decodeReply` reads through a
+// caller-supplied `byteSource`, so the exact decoder `client.bit` runs over a
+// live `std/net.Conn` is exercised in `resptest.bit` against a plain captured
+// byte string, with no socket at all — the split stdlib/http/http.bit makes
+// between its `byteStream` interface and a live `netStream`/`tlsStream`.
+//
+// THE ONE BUG THIS FILE MUST NOT HAVE (#3466): a null bulk string (`$-1\r\n`)
+// and an empty bulk string (`$0\r\n\r\n`) both decode to `Reply.Bulk`, but to
+// DIFFERENT values — `Option.None` and `Option.Some("")` respectively. Same
+// for a null array (`*-1\r\n`, `Option.None`) vs an empty array (`*0\r\n`,
+// `Option.Some([]Reply(0))`). Conflating null with empty is the classic RESP
+// client defect this package exists to not repeat.
+
+import { indexOf, parseInt } from "std/strings"
+
+// A decoded RESP reply. `Bulk`/`Array` carry `Option` because RESP has a
+// distinct wire form for "no value" (a cache miss, a blocking pop that timed
+// out) that is not the same thing as an empty string or an empty array.
+export enum Reply {
+  Simple(string),
+  Err(string),
+  Int(i64),
+  Bulk(Option<string>),
+  Array(Option<[]Reply>),
+}
+
+// A source of bytes for the decoder to read from. `client.bit`'s `Client`
+// implements this directly over its live connection; `resptest.bit`'s
+// `fakeSource` wraps a fixed captured buffer, handing it back once and then
+// reporting EOF (an empty read) forever after, so a genuinely truncated
+// reply still fails loudly instead of looping.
+interface byteSource { readUp(n: int): string! }
+
+// Encodes `args` as a RESP "array of bulk strings" — the wire form every
+// real client sends a command as, regardless of that command's own reply
+// type. `["SET", "k", "v"]` becomes
+// `*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n`.
+export fn encodeCommand(args: []string): string {
+  let out = "*${len(args)}\r\n"
+  let i = 0
+  while (i < len(args)) {
+    out = out + "$${len(args[i])}\r\n${args[i]}\r\n"
+    i = i + 1
+  }
+  return out
+}
+
+// Reads from `s`, appending to `buf`, until `buf` contains "\r\n". Returns the
+// text before the delimiter and whatever leftover bytes followed it. Fails if
+// the source reports EOF before a delimiter ever appears.
+fn readLine(s: byteSource, buf: string): (string, string)! {
+  let b = buf
+  while (indexOf(b, "\r\n") < 0) {
+    let chunk = s.readUp(4096)?
+    if (len(chunk) == 0) {
+      fail newError("resp: connection closed mid-reply")
+    }
+    b = b + chunk
+  }
+  let at = indexOf(b, "\r\n")
+  return b[0:at], b[at + 2:len(b)]
+}
+
+// Reads exactly `n` bytes off `s`, appending to `buf` as needed. Returns
+// those `n` bytes and whatever leftover followed them.
+fn readN(s: byteSource, buf: string, n: int): (string, string)! {
+  let b = buf
+  while (len(b) < n) {
+    let chunk = s.readUp(4096)?
+    if (len(chunk) == 0) {
+      fail newError("resp: connection closed mid-reply")
+    }
+    b = b + chunk
+  }
+  return b[0:n], b[n:len(b)]
+}
+
+// Decodes exactly one reply off `s`, consuming from `buf` first and reading
+// more only as needed. Returns the reply and whatever bytes were read past
+// it — unconsumed leftover for the caller's next decode.
+export fn decodeReply(s: byteSource, buf: string): (Reply, string)! {
+  let (line, rest) = readLine(s, buf)?
+  if (len(line) == 0) {
+    fail newError("resp: empty reply header")
+  }
+  let tag = line[0]
+  let body = line[1:len(line)]
+  if (tag == '+') {
+    return Reply.Simple(body), rest
+  }
+  if (tag == '-') {
+    return Reply.Err(body), rest
+  }
+  if (tag == ':') {
+    let r = decodeInt(body)?
+    return r, rest
+  }
+  if (tag == '$') {
+    let (item, next) = decodeBulk(s, body, rest)?
+    return item, next
+  }
+  if (tag == '*') {
+    let (item, next) = decodeArray(s, body, rest)?
+    return item, next
+  }
+  fail newError("resp: unknown reply type byte '${tag}'")
+}
+
+fn decodeInt(body: string): Reply! {
+  let n = parseInt(body) catch _ {
+    fail newError("resp: bad integer '${body}'")
+  }
+  return Reply.Int(n)
+}
+
+// `$-1\r\n` is a null bulk string (a cache miss) and carries no data bytes at
+// all — `Option.None`, never an empty string. `$0\r\n\r\n` IS a real, present,
+// empty string — `Option.Some("")`. Any other non-negative length reads
+// exactly that many data bytes plus the trailing CRLF.
+fn decodeBulk(s: byteSource, body: string, buf: string): (Reply, string)! {
+  let n = parseInt(body) catch _ {
+    fail newError("resp: bad bulk length '${body}'")
+  }
+  if (n == -1) {
+    return Reply.Bulk(Option.None), buf
+  }
+  if (n < -1) {
+    fail newError("resp: negative bulk length ${n}")
+  }
+  let (data, rest) = readN(s, buf, n + 2)?
+  return Reply.Bulk(Option.Some(data[0:n])), rest
+}
+
+// `*-1\r\n` is a null array (e.g. a blocking pop that timed out) —
+// `Option.None`, never an empty array. `*0\r\n` is a real, present, empty
+// array — `Option.Some([]Reply(0))`.
+fn decodeArray(s: byteSource, body: string, buf: string): (Reply, string)! {
+  let n = parseInt(body) catch _ {
+    fail newError("resp: bad array length '${body}'")
+  }
+  if (n == -1) {
+    return Reply.Array(Option.None), buf
+  }
+  if (n < -1) {
+    fail newError("resp: negative array length ${n}")
+  }
+  let items = []Reply(0)
+  let rest = buf
+  let i = 0
+  while (i < n) {
+    let (item, next) = decodeReply(s, rest)?
+    items = append(items, item)
+    rest = next
+    i = i + 1
+  }
+  return Reply.Array(Option.Some(items)), rest
+}
