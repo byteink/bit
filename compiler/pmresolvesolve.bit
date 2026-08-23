@@ -1,0 +1,469 @@
+// compiler/pmresolvesolve.bit — the PubGrub solving loop itself: unit
+// propagation, decision-making, and conflict-driven backtracking (Natalie
+// Weizenbaum's "PubGrub: Next-Generation Version Solving"; Dart `pub`,
+// `pubgrub-rs`). Types and the Solver state live in pmresolve.bit; rendering
+// a failure into text lives in pmresolveexplain.bit — this file is only the
+// search.
+//
+// Every incompatibility PubGrub ever builds in this restricted (dependency
+// resolution, never an arbitrary clause) domain has a "controlling term":
+// the term, among an incompatibility's terms, whose most recent SATISFIER
+// (the assignment that first made it true) occurs latest in solving order.
+// Conflict resolution repeatedly eliminates that term by combining the
+// incompatibility with whatever incompatibility CAUSED its satisfier
+// (`resolveIncompat`), until either the combined incompatibility has no
+// terms left at all — meaning it is unconditionally false, independent of
+// any assignment, which is the final, minimal proof of unsatisfiability
+// (`buildFailure`, pmresolveexplain.bit) — or the controlling satisfier
+// turns out to be a genuine DECISION (a guess, not a forced fact), at which
+// point resolution stops, backtracks past that guess, and lets solving
+// retry with what it just learned.
+
+const pubgrubMaxSteps: int = 100000
+
+fn zeroResolveFailure(): ResolveFailure {
+  return ResolveFailure{ package: "", requirers: []ConflictRequirer(0), steps: []DerivationStep(0), message: "" }
+}
+
+fn zeroConstraint(): Constraint {
+  return Constraint{ op: ConstraintOp.Exact, version: versionZero() }
+}
+
+fn pointRange(v: Version): Range {
+  return Range{ min: v, max: versionNext(v), hasMax: true }
+}
+
+fn assignmentVersion(a: Assignment): Version {
+  return a.term.set[0].min
+}
+
+fn isDecided(s: Solver, name: string): bool {
+  let i = 0
+  while (i < len(s.solution)) {
+    if (s.solution[i].name == name && s.solution[i].isDecision) { return true }
+    i = i + 1
+  }
+  return false
+}
+
+// The intersection of every fact recorded about `name` so far — universe
+// (unconstrained) when `name` has never been mentioned.
+fn accumulatedPositiveSet(solution: []Assignment, name: string): []Range {
+  let acc = versionSetUniverse()
+  let i = 0
+  while (i < len(solution)) {
+    if (solution[i].name == name) {
+      acc = versionSetIntersect(acc, termPositiveSet(solution[i].term))
+    }
+    i = i + 1
+  }
+  return acc
+}
+
+enum Relation {
+  Satisfied,
+  Contradicted,
+  Inconclusive,
+}
+
+fn termRelationForSet(factSet: []Range, t: Term): Relation {
+  let tSet = termPositiveSet(t)
+  if (versionSetSubsetOf(factSet, tSet)) { return Relation.Satisfied }
+  if (versionSetIsEmpty(versionSetIntersect(factSet, tSet))) { return Relation.Contradicted }
+  return Relation.Inconclusive
+}
+
+enum IncompatRelation {
+  Satisfied,
+  Contradicted,
+  AlmostSatisfied,
+  Inconclusive,
+}
+
+// The whole-incompatibility relation against the current partial solution:
+// Satisfied when every term already holds (a conflict), Contradicted when
+// any one term is already false (irrelevant), AlmostSatisfied when all but
+// exactly one hold (the index of that one is returned, for unit propagation
+// to derive its negation), else Inconclusive.
+fn incompatRelation(s: Solver, ic: Incompatibility): (IncompatRelation, int) {
+  let unresolvedCount = 0
+  let unresolvedIdx = -1
+  let i = 0
+  while (i < len(ic.terms)) {
+    let factSet = accumulatedPositiveSet(s.solution, ic.terms[i].name)
+    let rel = termRelationForSet(factSet, ic.terms[i])
+    if (rel == Relation.Contradicted) { return IncompatRelation.Contradicted, -1 }
+    if (rel == Relation.Inconclusive) {
+      unresolvedCount = unresolvedCount + 1
+      unresolvedIdx = i
+    }
+    i = i + 1
+  }
+  if (unresolvedCount == 0) { return IncompatRelation.Satisfied, -1 }
+  if (unresolvedCount == 1) { return IncompatRelation.AlmostSatisfied, unresolvedIdx }
+  return IncompatRelation.Inconclusive, -1
+}
+
+// Scans every incompatibility mentioning `name`, deriving whatever new facts
+// unit propagation reveals (each appended to `s.solution` directly) and
+// collecting the further package names those derivations touch. Stops at
+// the first incompatibility found fully satisfied and reports it as a
+// conflict — which one is found first only changes how many extra
+// `resolveIncompat` rounds a later conflict needs, never soundness.
+fn propagateOne(s: Solver, name: string): ([]string, int, bool) {
+  let more = []string(0)
+  let i = 0
+  while (i < len(s.incompats)) {
+    let (_, mentions) = incompatTermFor(s.incompats[i], name)
+    if (!mentions) {
+      i = i + 1
+      continue
+    }
+    let (rel, idx) = incompatRelation(s, s.incompats[i])
+    if (rel == IncompatRelation.Satisfied) {
+      return more, i, true
+    }
+    if (rel == IncompatRelation.AlmostSatisfied) {
+      let derived = negateTerm(s.incompats[i].terms[idx])
+      s.solution = append(s.solution, Assignment{ name: derived.name, term: derived, isDecision: false, cause: i, level: s.level })
+      more = append(more, derived.name)
+    }
+    i = i + 1
+  }
+  return more, -1, false
+}
+
+fn appendAllStrings(dst: []string, src: []string): []string {
+  let out = dst
+  let i = 0
+  while (i < len(src)) {
+    out = append(out, src[i])
+    i = i + 1
+  }
+  return out
+}
+
+// Drains `seed` until the queue empties (returns `(_, true)`, meaning
+// "move on to decision-making") or a conflict resolves all the way back to
+// the graph's own facts (returns the failure, `false`). Bounded by
+// `pubgrubMaxSteps` — a safety net; the incompatibility DAG conflict
+// resolution walks is finite (every `Derived` incompatibility's causes have
+// a strictly smaller index than itself), so real graphs terminate well
+// inside it.
+fn unitPropagation(s: Solver, seed: []string): (ResolveFailure, bool) {
+  let changed = seed
+  let steps = 0
+  while (len(changed) > 0 && steps < pubgrubMaxSteps) {
+    steps = steps + 1
+    let name = changed[0]
+    changed = changed[1:len(changed)]
+    let (more, conflictIdx, hasConflict) = propagateOne(s, name)
+    changed = appendAllStrings(changed, more)
+    if (hasConflict) {
+      let (resumeName, failure, isFinal) = resolveConflict(s, conflictIdx)
+      if (isFinal) {
+        return failure, false
+      }
+      changed = [resumeName]
+    }
+  }
+  return zeroResolveFailure(), true
+}
+
+// The earliest index into `s.solution` at which the running intersection of
+// every fact about `t.name` up to and including that index already implies
+// `t` — the assignment that FIRST made `t` true. Only ever called on a term
+// already known Satisfied against the full solution, so a match always
+// exists.
+fn findSatisfierIndex(s: Solver, t: Term): int {
+  let acc = versionSetUniverse()
+  let i = 0
+  while (i < len(s.solution)) {
+    if (s.solution[i].name == t.name) {
+      acc = versionSetIntersect(acc, termPositiveSet(s.solution[i].term))
+      if (versionSetSubsetOf(acc, termPositiveSet(t))) {
+        return i
+      }
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// The term with the most recently determined satisfier — the "controlling"
+// term conflict resolution eliminates next — and that satisfier's own
+// index into `s.solution`.
+fn findControllingTerm(s: Solver, ic: Incompatibility): (int, int) {
+  let bestTermIdx = 0
+  let bestSatisfier = -1
+  let i = 0
+  while (i < len(ic.terms)) {
+    let sat = findSatisfierIndex(s, ic.terms[i])
+    if (sat > bestSatisfier) {
+      bestSatisfier = sat
+      bestTermIdx = i
+    }
+    i = i + 1
+  }
+  return bestTermIdx, bestSatisfier
+}
+
+// The highest decision level among every OTHER term's own satisfier — where
+// conflict resolution backtracks to when it stops. When there is no other
+// term to compare against, the default depends on what kind of assignment
+// the controlling satisfier itself is, and getting this wrong is a
+// non-termination bug, not just an imprecision, found and fixed while
+// building this ticket (`checkPubGrubTransitiveConflictThreeLevels` is the
+// regression test):
+//
+//   - a DERIVATION: default to the satisfier's OWN level, not 0. 0 would
+//     make the caller's `prevLevel < satisfier.level` test fire on a still-
+//     generalizable derivation (there is more to learn by resolving
+//     further with its cause), forcing a premature stop-and-backtrack whose
+//     learned incompatibility never mentions the package actually being
+//     retried — repeating the exact same wrong decision forever.
+//   - a DECISION: default to one level BELOW the satisfier's own level, not
+//     the satisfier's own level. The caller's stop condition fires
+//     unconditionally for a decision (there is no cause to resolve
+//     further with — a decision is a guess), so the backtrack that follows
+//     MUST land strictly before it or the decision survives its own
+//     "undo", the freshly re-added incompatibility is immediately
+//     satisfied again on the very next propagation, and conflict
+//     resolution loops on the identical package forever.
+fn previousSatisfierLevel(s: Solver, ic: Incompatibility, controllingTermIdx: int, controllingLevel: int, controllingIsDecision: bool): int {
+  let level = -1
+  let i = 0
+  while (i < len(ic.terms)) {
+    if (i != controllingTermIdx) {
+      let sat = findSatisfierIndex(s, ic.terms[i])
+      if (sat >= 0 && s.solution[sat].level > level) {
+        level = s.solution[sat].level
+      }
+    }
+    i = i + 1
+  }
+  if (level >= 0) { return level }
+  if (controllingIsDecision) { return controllingLevel - 1 }
+  return controllingLevel
+}
+
+fn backtrackTo(s: Solver, targetLevel: int) {
+  let keep = []Assignment(0)
+  let i = 0
+  while (i < len(s.solution)) {
+    if (s.solution[i].level <= targetLevel) {
+      keep = append(keep, s.solution[i])
+    }
+    i = i + 1
+  }
+  s.solution = keep
+  s.level = targetLevel
+}
+
+// Merges `t` into `terms`, intersecting when a term for the same package
+// already exists (an incompatibility carries at most one term per package —
+// this file's own header) rather than keeping two.
+fn mergeTerm(terms: []Term, t: Term): []Term {
+  let i = 0
+  while (i < len(terms)) {
+    if (terms[i].name == t.name) {
+      terms[i] = Term{ name: t.name, positive: true, set: versionSetIntersect(termPositiveSet(terms[i]), termPositiveSet(t)) }
+      return terms
+    }
+    i = i + 1
+  }
+  return append(terms, t)
+}
+
+// The resolvent of `s.incompats[aIdx]` and `s.incompats[bIdx]` on `pkg`:
+// standard clause resolution generalized to version sets — the combined
+// term for `pkg` is the UNION of the two incompatibilities' own terms for
+// it, kept unless that union is the universe, in which case `pkg` drops out
+// of the result entirely (exactly as SAT resolution eliminates a literal
+// once its clause is trivially satisfied either way).
+fn resolveIncompat(s: Solver, aIdx: int, bIdx: int, pkg: string): Incompatibility {
+  let a = s.incompats[aIdx]
+  let b = s.incompats[bIdx]
+  let (termA, _) = incompatTermFor(a, pkg)
+  let (termB, _) = incompatTermFor(b, pkg)
+  let unionSet = versionSetUnion(termPositiveSet(termA), termPositiveSet(termB))
+
+  let terms = []Term(0)
+  let i = 0
+  while (i < len(a.terms)) {
+    if (a.terms[i].name != pkg) { terms = mergeTerm(terms, a.terms[i]) }
+    i = i + 1
+  }
+  let j = 0
+  while (j < len(b.terms)) {
+    if (b.terms[j].name != pkg) { terms = mergeTerm(terms, b.terms[j]) }
+    j = j + 1
+  }
+  if (!versionSetIsUniverse(unionSet)) {
+    terms = mergeTerm(terms, Term{ name: pkg, positive: true, set: unionSet })
+  }
+
+  return Incompatibility{
+    terms: terms, kind: IncompatKind.Derived, causeA: aIdx, causeB: bIdx,
+    requirer: "", depVersion: versionZero(), reqName: "", reqConstraint: zeroConstraint(),
+  }
+}
+
+// Conflict-driven clause learning, starting from the incompatibility found
+// satisfied at `start`. Returns either the package to resume propagating
+// (backtracked, a new incompatibility learned, not final) or the final
+// derivation (`isFinal`, package name empty — see this file's own header).
+// Bounded the same way `unitPropagation` is; this always terminates well
+// inside the bound on any graph fed to it, since each resolve step strictly
+// consumes one earlier incompatibility from the finite, append-only DAG.
+fn resolveConflict(s: Solver, start: int): (string, ResolveFailure, bool) {
+  let idx = start
+  let lastControlling = ""
+  let steps = 0
+  while (steps < pubgrubMaxSteps) {
+    steps = steps + 1
+    if (len(s.incompats[idx].terms) == 0) {
+      return "", buildFailure(s, idx, lastControlling), true
+    }
+    let (controllingIdx, satisfierPos) = findControllingTerm(s, s.incompats[idx])
+    let controllingName = s.incompats[idx].terms[controllingIdx].name
+    lastControlling = controllingName
+    let satisfier = s.solution[satisfierPos]
+    let prevLevel = previousSatisfierLevel(s, s.incompats[idx], controllingIdx, satisfier.level, satisfier.isDecision)
+    if (satisfier.isDecision || prevLevel < satisfier.level) {
+      backtrackTo(s, prevLevel)
+      s.incompats = append(s.incompats, s.incompats[idx])
+      return controllingName, zeroResolveFailure(), false
+    }
+    let combined = resolveIncompat(s, idx, satisfier.cause, controllingName)
+    s.incompats = append(s.incompats, combined)
+    idx = len(s.incompats) - 1
+  }
+  panic("pmresolve: PubGrub conflict resolution exceeded its bounded step budget — algorithm defect, not a legitimate resolver failure")
+}
+
+// The next package awaiting a decision, in `s.allNames` order — the fixed
+// scan order that makes solving deterministic regardless of the graph's own
+// requirement order: a package qualifies once some derivation has
+// constrained it away from the universe and it has not been decided yet.
+fn nextUndecided(s: Solver): (string, bool) {
+  let i = 0
+  while (i < len(s.allNames)) {
+    let name = s.allNames[i]
+    i = i + 1
+    if (isDecided(s, name)) { continue }
+    if (versionSetIsUniverse(accumulatedPositiveSet(s.solution, name))) { continue }
+    return name, true
+  }
+  return "", false
+}
+
+// The highest version in `versions` that lies in `set`, or `(_, false)` when
+// none does — "several versions satisfy; pick the highest" is this
+// ticket's owner-decided selection rule (2026-08-09), applied here and
+// nowhere else.
+fn highestInSet(versions: []Version, set: []Range): (Version, bool) {
+  let best = versionZero()
+  let found = false
+  let i = 0
+  while (i < len(versions)) {
+    if (versionSetContainsVersion(set, versions[i])) {
+      if (!found || versionLess(best, versions[i])) {
+        best = versions[i]
+        found = true
+      }
+    }
+    i = i + 1
+  }
+  return best, found
+}
+
+// Decides `name`: picks the highest available candidate within its current
+// accumulated range and records it, creating one Dependency incompatibility
+// per that candidate's own manifest requirement; or, when no candidate
+// exists in range, records a NoVersions incompatibility instead — this
+// resolver's "a conflict caused by a version that does not exist at all"
+// case, handled by the SAME propagation/conflict-resolution machinery as
+// every other conflict, never a special case. Returns the names to
+// propagate next.
+fn decide(s: Solver, name: string): []string {
+  let acc = accumulatedPositiveSet(s.solution, name)
+  let (versions, _) = s.candidates[name]
+  let (chosen, found) = highestInSet(versions, acc)
+  if (!found) {
+    s.incompats = append(s.incompats, Incompatibility{
+      terms: [Term{ name: name, positive: true, set: acc }],
+      kind: IncompatKind.NoVersions, causeA: -1, causeB: -1,
+      requirer: "", depVersion: versionZero(), reqName: name, reqConstraint: zeroConstraint(),
+    })
+    return [name]
+  }
+  s.level = s.level + 1
+  s.solution = append(s.solution, Assignment{
+    name: name, term: Term{ name: name, positive: true, set: [pointRange(chosen)] },
+    isDecision: true, cause: -1, level: s.level,
+  })
+  let (requires, _) = s.manifests[manifestKey(name, chosen)]
+  let more = [name]
+  let i = 0
+  while (i < len(requires)) {
+    s.incompats = append(s.incompats, Incompatibility{
+      terms: [
+        Term{ name: name, positive: true, set: [pointRange(chosen)] },
+        Term{ name: requires[i].name, positive: false, set: versionSetFromConstraint(requires[i].constraint) },
+      ],
+      kind: IncompatKind.Dependency, causeA: -1, causeB: -1,
+      requirer: name, depVersion: chosen, reqName: requires[i].name, reqConstraint: requires[i].constraint,
+    })
+    more = append(more, requires[i].name)
+    i = i + 1
+  }
+  return more
+}
+
+fn collectSolution(s: Solver): map<string, Version> {
+  let out = map<string, Version>{}
+  let i = 0
+  while (i < len(s.solution)) {
+    if (s.solution[i].isDecision) {
+      out[s.solution[i].name] = assignmentVersion(s.solution[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Resolves `graph` by PubGrub: exactly one version per reachable package on
+// success, or a structured failure naming every conflicting requirement on
+// the unsatisfiable package (pmresolve.bit's own header; #2366's ticket for
+// why PubGrub specifically).
+fn resolvePubGrub(graph: ReqGraph): Result<map<string, Version>, ResolveFailure> {
+  let s = newSolver(graph)
+  let seed = []string(0)
+  let ri = 0
+  while (ri < len(graph.rootRequires)) {
+    let rr = graph.rootRequires[ri]
+    ri = ri + 1
+    s.incompats = append(s.incompats, Incompatibility{
+      terms: [Term{ name: rr.name, positive: false, set: versionSetFromConstraint(rr.constraint) }],
+      kind: IncompatKind.Root, causeA: -1, causeB: -1,
+      requirer: rr.requirer, depVersion: versionZero(), reqName: rr.name, reqConstraint: rr.constraint,
+    })
+    seed = append(seed, rr.name)
+  }
+
+  let steps = 0
+  while (steps < pubgrubMaxSteps) {
+    steps = steps + 1
+    let (failure, drained) = unitPropagation(s, seed)
+    if (!drained) {
+      return Result.Err(failure)
+    }
+    let (name, hasNext) = nextUndecided(s)
+    if (!hasNext) {
+      return Result.Ok(collectSolution(s))
+    }
+    seed = decide(s, name)
+  }
+  panic("pmresolve: PubGrub exceeded its bounded step budget — algorithm defect, not a legitimate resolver failure")
+}

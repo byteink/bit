@@ -15,8 +15,10 @@
 //     `readManifest`, `resolveVanityUrl`, `parseGitRemoteUrl`,
 //     `checkResolvedUrlMatches`, `defaultDepUrl`, `vanityTimeoutMs`.
 //   - compiler/pmlock.bit: `LockEntry`, `LockRequire`.
-//   - compiler/pmresolve.bit: `Requirement`, `ModuleReqs`, `ReqGraph`,
-//     `resolveMVS`, `Version`, `versionLess`.
+//   - compiler/pmresolve.bit: `Requirement`, `RootRequirement`, `ModuleReqs`,
+//     `ReqGraph`, `packageVersionsFromModules`, `Version`, `versionLess`.
+//   - compiler/pmresolvesolve.bit: `resolvePubGrub` (#2366, replacing MVS).
+//   - compiler/pmversion.bit: `Constraint`, `ConstraintOp`.
 // Named `pmz` rather than `pmclitail` so it sorts after every other `pm*`
 // file: module files concatenate in bytewise sorted filename order, and the
 // inliner only inlines a callee it has already lowered — this file calls
@@ -137,23 +139,27 @@ fn resolveLocalDependency(projectDir: string, name: string, localPath: string): 
 // SPEC §17.7 step 1: "the resolver walks the transitive requirement graph —
 // every dependency's own bit.json dependencies, recursively." Step 2: "for
 // each distinct module named anywhere in that graph, the resolver ...
-// selects the maximum" of every stated minimum version. `pmresolve.bit`'s
-// `resolveMVS` already implements steps 2/3 over a `ReqGraph` handed to it
-// as data — its own header says assembling that data from `bit.lock`/git is
-// a separate job. This is that job: walk every `requires` edge a locked
-// dependency's own `bit.json` names, fetching each newly discovered name
-// (through the identical direct-vs-vanity classification and fetch
-// machinery a root `bit add` uses — a transitive dependency's own
-// dependency can itself be a vanity name, #2068) and giving each surviving
-// module its own top-level `bit.lock` entry.
+// selects" the one version satisfying every stated constraint, highest
+// first when several do (owner decision, #2366, 2026-08-09), and fails
+// naming the conflict when none do. `pmresolve.bit`'s `resolvePubGrub`
+// (#2366, replacing #1731's MVS) already implements that step over a
+// `ReqGraph` handed to it as data — its own header says assembling that
+// data from `bit.lock`/git is a separate job. This is that job: walk every
+// `requires` edge a locked dependency's own `bit.json` names, fetching each
+// newly discovered name (through the identical direct-vs-vanity
+// classification and fetch machinery a root `bit add` uses — a transitive
+// dependency's own dependency can itself be a vanity name, #2068) and
+// giving each surviving module its own top-level `bit.lock` entry.
 //
 // Two disjoint kinds of requirement, per SPEC §17.7 point 2:
 //   - version-tagged (an exact `vMAJOR.MINOR.PATCH` ref): every DISTINCT
 //     (name, version) pair reachable is fetched once to learn ITS OWN
-//     requirements, feeding `resolveMVS`'s `ReqGraph`; the winning
-//     (max-selected) version per name is then the one actually locked,
-//     reusing the fetch already done during discovery rather than fetching
-//     a second time.
+//     requirements, feeding `resolvePubGrub`'s `ReqGraph` as an Exact
+//     constraint (#2366's pmz.bit adaptation — every constraint this walk
+//     ever builds is Exact, since a version-tagged ref is already a single
+//     pinned commit, never a range); the resolved version per name is then
+//     the one actually locked, reusing the fetch already done during
+//     discovery rather than fetching a second time.
 //   - non-version (a branch or bare commit SHA): SPEC's own carve-out — "a
 //     module reachable only through such a ref resolves to exactly that
 //     ref" — there is no ordering to arbitrate, so the first (and, since a
@@ -180,8 +186,8 @@ fn resolveLocalDependency(projectDir: string, name: string, localPath: string): 
 // not a bare ref). `fromRoot` marks a requirement that came directly from
 // `resolveTransitiveDeps`'s own `seed` (a "true" root of this resolver's own
 // graph) rather than from a deeper module's own requirements — only a root
-// requirement is fed to `resolveMVS` directly; every deeper edge is
-// re-derived by `resolveMVS`'s own internal walk over the `modules` this
+// requirement is fed to `resolvePubGrub` directly; every deeper edge is
+// re-derived by `resolvePubGrub`'s own internal walk over the `modules` this
 // file assembles, the same layering `checkVersionConflict` already uses.
 class PendingReq { name: string, spec: string, fromRoot: bool }
 
@@ -249,7 +255,7 @@ fn versionRequirementsOf(rs: []LockRequire): []Requirement {
   while (i < len(rs)) {
     let (v, ok) = pendingVersionTag(rs[i].ref)
     if (ok) {
-      out = append(out, Requirement{ name: rs[i].name, min: v })
+      out = append(out, Requirement{ name: rs[i].name, constraint: Constraint{ op: ConstraintOp.Exact, version: v } })
     }
     i = i + 1
   }
@@ -306,6 +312,24 @@ fn resolveTransitiveSpec(cacheRoot: string, gitBin: string, name: string, spec: 
   return LockEntry{ name: name, url: url, commit: sha, requires: manifestRequires(depManifest), vanity: "" }
 }
 
+// Runs `resolvePubGrub` (#2366) over `rootRequires`/`modules`, converting a
+// structured `ResolveFailure` into this file's own `fail`/`?` convention —
+// every OTHER function here already fails through that channel, and
+// `resolvePubGrub` deliberately does not (pmresolve.bit's own header: a
+// caller decides how to surface a conflict, this file surfaces it as a
+// normal `bit add`/`bit up` error). `available` is derived straight from
+// `modules`: every candidate this walk's callers ever try to decide is one
+// this file has ALREADY fetched (a version-tagged ref always resolves to
+// one concrete commit before it ever reaches the resolver), so there is no
+// separate range search here yet — that is #2367/#2368's job.
+fn pmResolveOrFail(rootRequires: []RootRequirement, modules: []ModuleReqs): map<string, Version>! {
+  let graph = ReqGraph{ rootRequires: rootRequires, modules: modules, available: packageVersionsFromModules(modules) }
+  match (resolvePubGrub(graph)) {
+    Ok(resolved) => { return resolved }
+    Err(f) => { fail newError(f.message) }
+  }
+}
+
 // Fetches every dependency reachable from `seed` (typically every
 // already-locked entry's own `requires`, flattened — `flattenRequires`,
 // below) that does not already have a top-level `bit.lock` entry, giving
@@ -322,8 +346,8 @@ fn resolveTransitiveSpec(cacheRoot: string, gitBin: string, name: string, spec: 
 // fetch (`visitedVersions`/`visitedNonVersion`) — so the total number of
 // fetches this performs is bounded by the number of distinct requirement
 // edges reachable across every `bit.json` this walk actually reads, the same
-// bound `resolveMVS`'s own worklist comment gives for its walk, and a cycle
-// or self-dependency cannot loop it forever for the identical reason.
+// bound `resolvePubGrub`'s own worklist comment gives for its walk, and a
+// cycle or self-dependency cannot loop it forever for the identical reason.
 export fn resolveTransitiveDeps(
   cacheRoot: string, gitBin: string, entries: []LockEntry, seed: []LockRequire, timeoutMs: int,
 ): []LockEntry! {
@@ -334,7 +358,7 @@ export fn resolveTransitiveDeps(
     i = i + 1
   }
 
-  let rootRequires = []Requirement(0)
+  let rootRequires = []RootRequirement(0)
   let modules = []ModuleReqs(0)
   let fetchedByVersion = map<string, LockEntry>{}
   let visitedVersions = map<string, bool>{}
@@ -365,7 +389,7 @@ export fn resolveTransitiveDeps(
     }
 
     if (req.fromRoot) {
-      rootRequires = append(rootRequires, Requirement{ name: req.name, min: ver })
+      rootRequires = append(rootRequires, RootRequirement{ requirer: "root", name: req.name, constraint: Constraint{ op: ConstraintOp.Exact, version: ver } })
     }
 
     let key = "${req.name}@${ver.major}.${ver.minor}.${ver.patch}"
@@ -380,7 +404,7 @@ export fn resolveTransitiveDeps(
     queue = enqueueRequires(queue, entry.requires)
   }
 
-  let resolved = resolveMVS(ReqGraph{ rootRequires: rootRequires, modules: modules })
+  let resolved = pmResolveOrFail(rootRequires, modules)?
 
   // Version-tagged winners first — the tie-break rule this resolver's own
   // module comment names.
@@ -398,7 +422,7 @@ export fn resolveTransitiveDeps(
     let winKey = "${name}@${winner.major}.${winner.minor}.${winner.patch}"
     let (entry, hasEntry) = fetchedByVersion[winKey]
     if (!hasEntry) {
-      fail newError("pmcli: internal error resolving transitive dependency ${name}: MVS chose v${winner.major}.${winner.minor}.${winner.patch}, which this resolver never fetched")
+      fail newError("pmcli: internal error resolving transitive dependency ${name}: PubGrub chose v${winner.major}.${winner.minor}.${winner.patch}, which this resolver never fetched")
     }
     entries = upsertLockEntry(entries, name, entry.url, entry.commit, entry.requires, entry.vanity, entry.localPath, entry.dir)
   }
@@ -515,15 +539,15 @@ fn pmScanUint(s: string, start: int): (int, int, bool) {
 // `parseVersionTag`'s `ref[0] == 'v'` check never matched — a full spec's
 // first byte is a host name, never `'v'`. This function's result was
 // therefore always empty, so `checkVersionConflict`, below, never had any
-// ALREADY-LOCKED transitive requirement to arbitrate against: the MVS
-// resolver itself (pmresolve.bit's `resolveMVS`, unchanged, still correct —
-// see its own checks) never fired for a real conflict, because it was never
-// handed one. `pendingVersionTag` (above) is the correct extraction — same
-// one `versionRequirementsOf` (above) already uses for a freshly-fetched
+// ALREADY-LOCKED transitive requirement to arbitrate against.
+// `pendingVersionTag` (above) is the correct extraction — same one
+// `versionRequirementsOf` (above) already uses for a freshly-fetched
 // module's own requirements — so this now shares it instead of repeating the
-// bug.
-fn pmExistingRequirementsFor(entries: []LockEntry, name: string): []Requirement {
-  let out = []Requirement(0)
+// bug. `requirer` names the ALREADY-LOCKED entry that stated each
+// requirement (#2366: PubGrub's conflict report needs the requirer's
+// identity, which the old `[]Requirement` shape had nowhere to carry).
+fn pmExistingRequirementsFor(entries: []LockEntry, name: string): []RootRequirement {
+  let out = []RootRequirement(0)
   let i = 0
   while (i < len(entries)) {
     let j = 0
@@ -532,7 +556,7 @@ fn pmExistingRequirementsFor(entries: []LockEntry, name: string): []Requirement 
       if (r.name == name) {
         let (v, ok) = pendingVersionTag(r.ref)
         if (ok) {
-          out = append(out, Requirement{ name: name, min: v })
+          out = append(out, RootRequirement{ requirer: entries[i].name, name: name, constraint: Constraint{ op: ConstraintOp.Exact, version: v } })
         }
       }
       j = j + 1
@@ -542,13 +566,31 @@ fn pmExistingRequirementsFor(entries: []LockEntry, name: string): []Requirement 
   return out
 }
 
+// `f`'s conflict, rendered for this file's own callers — narrower than
+// pmresolveexplain.bit's general renderer because every constraint
+// `checkVersionConflict` ever builds is Exact (a git version tag, #2366's
+// pmz.bit adaptation), so a "v"-prefixed exact version is always the right
+// spelling here (matching this file's existing convention throughout, e.g.
+// `parseVersionTag`), unlike the resolver's own `^`/`~`-aware text.
+fn pmVersionConflictMessage(f: ResolveFailure): string {
+  let msg = "pmcli: ${f.package} conflicts:"
+  let i = 0
+  while (i < len(f.requirers)) {
+    let r = f.requirers[i]
+    msg = msg + " ${r.requirer} requires v${r.constraint.version.major}.${r.constraint.version.minor}.${r.constraint.version.patch};"
+    i = i + 1
+  }
+  return msg
+}
+
 // Fails if some already-locked dependency's own transitive requirements
-// demand a HIGHER version of `name` than `ref` — MVS's rule (spec §17.7 point
-// 2: the resolved version is never lower than the highest of all
-// requirements). A non-version `ref` (branch/sha) has nothing for MVS to
-// arbitrate and always passes. Takes the project's already-read `[]LockEntry`
-// rather than a path, so `addDependency` reads bit.lock once per run instead
-// of once here and once again to build the upsert list.
+// name a DIFFERENT exact version of `name` than `ref` (owner decision,
+// #2366's ticket, 2026-08-09: an exact pin means exactly that version, not
+// "at least" — MVS's old max-of-minimums rule is gone with MVS itself). A
+// non-version `ref` (branch/sha) has nothing for PubGrub to arbitrate and
+// always passes. Takes the project's already-read `[]LockEntry` rather than
+// a path, so `addDependency` reads bit.lock once per run instead of once
+// here and once again to build the upsert list.
 fn checkVersionConflict(
   existing: []LockEntry,
   name: string,
@@ -560,20 +602,16 @@ fn checkVersionConflict(
     return
   }
   let transitive = pmExistingRequirementsFor(existing, name)
-
-  let graph = ReqGraph{
-    rootRequires: append(transitive, Requirement{ name: name, min: reqVersion }),
-    // `depRequires` is `LockRequire` (full-spec refs), the same shape
-    // `versionRequirementsOf` (above) already narrows for a freshly-fetched
-    // module during transitive resolution — reused here rather than a second,
-    // near-identical `pmToRequirements` (removed, #2250: it read the wrong
-    // string and never matched anything).
-    modules: [ModuleReqs{ name: name, version: reqVersion, requires: versionRequirementsOf(depRequires) }],
-  }
-  let resolved = resolveMVS(graph)
-  let (finalVer, found) = resolved[name]
-  if (found && versionLess(reqVersion, finalVer)) {
-    fail newError("pmcli: ${name}@${ref} conflicts with a higher transitive requirement (v${finalVer.major}.${finalVer.minor}.${finalVer.patch} needed) — pick that version instead")
+  let rootReqs = append(transitive, RootRequirement{ requirer: "root", name: name, constraint: Constraint{ op: ConstraintOp.Exact, version: reqVersion } })
+  // `depRequires` is `LockRequire` (full-spec refs), the same shape
+  // `versionRequirementsOf` (above) already narrows for a freshly-fetched
+  // module during transitive resolution — reused here rather than a second,
+  // near-identical extraction.
+  let modules = [ModuleReqs{ name: name, version: reqVersion, requires: versionRequirementsOf(depRequires) }]
+  let graph = ReqGraph{ rootRequires: rootReqs, modules: modules, available: packageVersionsFromModules(modules) }
+  match (resolvePubGrub(graph)) {
+    Ok(_) => { return }
+    Err(f) => { fail newError(pmVersionConflictMessage(f)) }
   }
 }
 

@@ -1,22 +1,43 @@
-// Minimal Version Selection over a dependency requirement graph (#1731).
-// Implements the rule spec/SPEC.md §17.7 records for `bit.lock` resolution:
-// for every module reachable from the root's requirements, pick the MAXIMUM
-// of all stated minimum versions for it. One worklist pass, no backtracking,
-// no SAT search — see the seed's `go.mod` analogue for the algorithm this
-// mirrors.
+// PubGrub constraint resolution over a dependency requirement graph (#2366,
+// replacing #1731's Minimal Version Selection). MVS could never fail — every
+// requirement was a bare minimum, and taking the max of stated minimums
+// always produces an answer. With `^`/`~` ranges (#2364) a package must
+// satisfy the INTERSECTION of every stated constraint, which can be empty, so
+// resolution now genuinely fails — and the reason PubGrub (Natalie
+// Weizenbaum's writeup; Dart `pub`, later Cargo) is the algorithm named for
+// this ticket rather than a plain backtracking search is that its failures
+// come with a derivation: which requirements, stated by which requirers,
+// cannot all hold at once. A naive solver can only say "no version works";
+// this file's whole reason to exist is the case where that is not enough.
 //
-// Scope: pure in-memory graph resolution. The requirement graph (root
-// requirements + every transitively-reached module's own requirement list) is
-// handed in as data — fetching it from `bit.lock`/git is compiler/pmfetch.bit's
-// job, a separate task. This file never touches the network or filesystem.
+// Scope, same as the MVS module it replaces: pure in-memory graph
+// resolution. The requirement graph is handed in as data — every candidate
+// version's own requirements (`ReqGraph.modules`) and every package's
+// available versions (`ReqGraph.available`) are the caller's job to have
+// already fetched (compiler/pmfetchresolve.bit's `listVersions`, #2365, for
+// the real CLI path). This file never touches the network, filesystem, or
+// git.
 //
-// Non-version refs (a branch or a bare commit SHA, per §17.7) are not ordered
-// versions and are out of scope here too: pmfetch resolves those to a commit
-// before a module ever reaches this resolver, so every version this file
-// compares is a real `MAJOR.MINOR.PATCH`.
+// Owner decision (2026-08-09, this ticket): when several available versions
+// satisfy every stated constraint on a package, the resolved version is the
+// HIGHEST of them — never the lowest, and never merely the max of stated
+// minimums (MVS's rule, gone with MVS itself).
+//
+// File layout: this file owns the data model (`Requirement`, `ModuleReqs`,
+// `ReqGraph`, the failure shape) and the PubGrub solver proper (terms,
+// incompatibilities, unit propagation, conflict-driven backtracking).
+// `compiler/pmresolveexplain.bit` owns turning a failure into readable text.
+// `compiler/pmversionset.bit` owns the version-set arithmetic (union,
+// intersection, complement) terms are built from — reused, not duplicated,
+// by both.
 
 // An exact `vMAJOR.MINOR.PATCH` version (§17.7). Bit has no tuple ordering
 // operator, so comparisons are field-by-field, most significant first.
+// Reused unchanged by compiler/pmversion.bit (#2364) and
+// compiler/pmfetchresolve.bit (#2365) — this is the one place `Version` and
+// its ordering are defined in this module; see those files' own headers for
+// why they must sort after this one used to matter (it no longer does,
+// #3163) and still do for readability.
 class Version {
   major: int,
   minor: int,
@@ -33,108 +54,266 @@ fn versionEq(a: Version, b: Version): bool {
   return a.major == b.major && a.minor == b.minor && a.patch == b.patch
 }
 
-fn versionMax(a: Version, b: Version): Version {
-  if (versionLess(a, b)) { return b }
-  return a
-}
-
-// One edge in the requirement graph: the requirer needs `name` at at least
-// `min`.
+// One edge in a module version's own manifest: it requires `name` matching
+// `constraint`. The requirer for every entry in a `ModuleReqs.requires` list
+// is that `ModuleReqs` itself — never carried per-`Requirement` — so there is
+// exactly one place a requirer name can drift from reality.
 class Requirement {
   name: string,
-  min: Version,
+  constraint: Constraint,
 }
 
-// One module version's own requirement list — a `bit.lock` transitive entry
-// (§17.7's `requires` field). Distinct versions of the same module can carry
-// distinct requirement lists, so identity is (name, version), not name alone.
+// One requirement stated directly against the graph's own root — the
+// project's `bit.json`, or (compiler/pmz.bit's `checkVersionConflict`) an
+// already-locked dependency's own transitive requirement being re-checked.
+// Unlike a `ModuleReqs.requires` entry, a root requirement's requirer is not
+// implied by anything else in the graph, so it is named explicitly.
+class RootRequirement {
+  requirer: string,
+  name: string,
+  constraint: Constraint,
+}
+
+// One (name, version) candidate's own requirements, as already-fetched
+// manifest data — the caller's job per this file's own header. Every
+// candidate this resolver might ever try to decide must have an entry here,
+// even if its `requires` is empty (a leaf package).
 class ModuleReqs {
   name: string,
   version: Version,
   requires: []Requirement,
 }
 
-// The full input: the root module's direct requirements plus every
-// transitively-reached module version's own requirements. pmfetch assembles
-// this from `bit.lock`; this resolver only ever reads it.
-class ReqGraph {
-  rootRequires: []Requirement,
-  modules: []ModuleReqs,
-}
-
-// The resolver's output for one module name: the maximum version required by
-// any requirer that reached it.
-class Resolved {
+// The versions available for one package name — the caller's candidate pool
+// (compiler/pmfetchresolve.bit's `listVersions`, or a literal list in a
+// test). A name absent from this list has no candidates at all: any
+// requirement on it fails as "no such version" (`buildNoVersionsFailure`,
+// pmresolveexplain.bit) the moment it is decided.
+class PackageVersions {
   name: string,
-  version: Version,
+  versions: []Version,
 }
 
-// The `graph.modules` entry for (name, version), or none via `ok`. Linear scan
-// bounded by `len(graph.modules)` — the graph is small (a project's dependency
-// count), and this runs once per worklist item, so the total work stays
-// bounded by (edges * modules), both fixed by the input.
-fn findModuleReqs(graph: ReqGraph, name: string, version: Version): (ModuleReqs, bool) {
+// The full input. `rootRequires` seeds the solve; `modules` and `available`
+// are the manifest/candidate database every decision consults.
+class ReqGraph {
+  rootRequires: []RootRequirement,
+  modules: []ModuleReqs,
+  available: []PackageVersions,
+}
+
+// One requirer's stated constraint, as it appears in a conflict explanation
+// — the ticket's own acceptance bar: "the returned derivation names BOTH
+// conflicting requirements and the package they disagree about", asserted
+// against structured data, not prose.
+class ConflictRequirer {
+  requirer: string,
+  name: string,
+  constraint: Constraint,
+}
+
+// One incompatibility on the path from the graph's own facts to the final
+// contradiction, oldest first — the ticket's "readable chain" (Dart pub's
+// numbered derivation steps). `requirers` is this step's own participants;
+// `text` a ready-to-print sentence (compiler/pmresolveexplain.bit).
+class DerivationStep {
+  text: string,
+  requirers: []ConflictRequirer,
+}
+
+// The structured failure PubGrub reports for an unsatisfiable graph.
+// `package` and `requirers` are the FINAL, minimal conflict — the two (or
+// more) requirements that, combined, no version can satisfy; `steps` is the
+// full derivation chain that reaches them; `message` is `steps` rendered as
+// prose, for a caller (a future `bit add`/`bit up`, #2367/#2368) that just
+// wants text.
+class ResolveFailure {
+  package: string,
+  requirers: []ConflictRequirer,
+  steps: []DerivationStep,
+  message: string,
+}
+
+// ---- PubGrub terms and incompatibilities --------------------------------
+//
+// A term states either "the package's resolved version is in `set`"
+// (`positive`) or "is not in `set`" (`!positive`) — pmversionset.bit's
+// `[]Range` is the set. An incompatibility is a small list of terms, at most
+// one per package name, meaning "these cannot all hold simultaneously" —
+// the standard PubGrub representation (Weizenbaum's writeup §"Incompatibilities";
+// Dart `pub`, `pubgrub-rs`). Every incompatibility this resolver ever builds
+// is one of exactly four shapes, tagged by `IncompatKind`:
+//
+//   Root       1 term  (name in constraint) — the project itself requires it
+//   Dependency 2 terms (depName@depVersion, name in constraint) — a decided
+//              candidate's own manifest requirement
+//   NoVersions 1 term  (name in its own currently-accumulated range) — no
+//              available candidate exists in the range other facts demand
+//   Derived    N terms — the resolvent of two earlier incompatibilities,
+//              produced during conflict resolution (`resolveIncompat`)
+//
+// This restriction to Horn-clause-shaped sources (never an arbitrary
+// hand-built incompatibility) is exactly what every real PubGrub
+// implementation also relies on — dependency resolution never needs a more
+// general clause than "this version of P requires Q in some range".
+class Term {
+  name: string,
+  positive: bool,
+  set: []Range,
+}
+
+fn termPositiveSet(t: Term): []Range {
+  if (t.positive) { return t.set }
+  return versionSetComplement(t.set)
+}
+
+fn negateTerm(t: Term): Term {
+  return Term{ name: t.name, positive: !t.positive, set: t.set }
+}
+
+enum IncompatKind {
+  Root,
+  Dependency,
+  NoVersions,
+  Derived,
+}
+
+// `requirer`/`depVersion`/`reqName`/`reqConstraint` are rendering context for
+// `Root` and `Dependency` incompatibilities only (pmresolveexplain.bit);
+// `causeA`/`causeB` are the parent incompatibilities' indices for `Derived`
+// (both -1 otherwise) — the pointers a derivation chain is walked from.
+class Incompatibility {
+  terms: []Term,
+  kind: IncompatKind,
+  causeA: int,
+  causeB: int,
+  requirer: string,
+  depVersion: Version,
+  reqName: string,
+  reqConstraint: Constraint,
+}
+
+fn incompatTermFor(ic: Incompatibility, name: string): (Term, bool) {
   let i = 0
-  while (i < len(graph.modules)) {
-    let m = graph.modules[i]
-    if (m.name == name && versionEq(m.version, version)) {
-      return m, true
-    }
+  while (i < len(ic.terms)) {
+    if (ic.terms[i].name == name) { return ic.terms[i], true }
     i = i + 1
   }
-  return ModuleReqs{ name: "", version: Version{ major: 0, minor: 0, patch: 0 },
-    requires: []Requirement(0) }, false
+  return Term{ name: name, positive: true, set: versionSetUniverse() }, false
 }
 
-// Resolves `graph` by Minimal Version Selection: every module reachable from
-// `rootRequires` maps to the maximum version any requirer stated for it.
-//
-// Algorithm: an iterative worklist of requirement edges, FIFO via a growing
-// array and a read cursor (no removal, so no shifting). Seed it with the
-// root's requirements; expanding a module version's own requirements enqueues
-// more edges. A `(name, version)` pair is expanded at most once — the
-// `visited` set both bounds the walk (total enqueues <= total edges in the
-// input graph, since every enqueue comes from a fixed requirement list read
-// at most once) and stops a cycle or self-dependency from looping forever.
-fn resolveMVS(graph: ReqGraph): map<string, Version> {
-  let resolved = map<string, Version>{}
-  let visited = map<string, bool>{}
-  let queue = []Requirement(0)
+// ---- partial solution -----------------------------------------------------
+
+// One fact in solving order: `isDecision` for a chosen candidate version,
+// otherwise a derivation forced by unit propagation, whose `cause` names the
+// incompatibility that forced it (-1 only for a decision). `level` is the
+// number of decisions made up to and including this assignment — the unit
+// conflict resolution backtracks by.
+class Assignment {
+  name: string,
+  term: Term,
+  isDecision: bool,
+  cause: int,
+  level: int,
+}
+
+// All mutable solver state, threaded through every helper below as the
+// first parameter (this module's existing house style — see
+// compiler/regalloc.bit's `ClassState` — rather than pointers/receivers).
+// `allNames` is the fixed universe of package names the graph can ever
+// mention (root requirements, module names, and every module's own
+// requirement targets), computed once so `nextUndecided` never needs a
+// mutable pending queue that backtracking would have to keep in sync — it
+// just rescans, which is cheap at this graph's size.
+class Solver {
+  incompats: []Incompatibility,
+  solution: []Assignment,
+  level: int,
+  allNames: []string,
+  candidates: map<string, []Version>,
+  manifests: map<string, []Requirement>,
+}
+
+fn manifestKey(name: string, v: Version): string {
+  return "${name}@${v.major}.${v.minor}.${v.patch}"
+}
+
+fn appendUnique(names: []string, seen: map<string, bool>, name: string): []string {
+  let (_, has) = seen[name]
+  if (has) { return names }
+  seen[name] = true
+  return append(names, name)
+}
+
+// Every package name the graph can ever produce a term for, first-seen
+// order: root requirements, then each module's own name and requirement
+// targets.
+fn collectAllNames(graph: ReqGraph): []string {
+  let seen = map<string, bool>{}
+  let names = []string(0)
   let i = 0
   while (i < len(graph.rootRequires)) {
-    queue = append(queue, graph.rootRequires[i])
+    names = appendUnique(names, seen, graph.rootRequires[i].name)
     i = i + 1
   }
-
-  let qi = 0
-  while (qi < len(queue)) {
-    let req = queue[qi]
-    qi = qi + 1
-
-    let (prior, hasPrior) = resolved[req.name]
-    if (hasPrior) {
-      resolved[req.name] = versionMax(prior, req.min)
-    } else {
-      resolved[req.name] = req.min
+  let j = 0
+  while (j < len(graph.modules)) {
+    names = appendUnique(names, seen, graph.modules[j].name)
+    let k = 0
+    while (k < len(graph.modules[j].requires)) {
+      names = appendUnique(names, seen, graph.modules[j].requires[k].name)
+      k = k + 1
     }
-
-    let key = "${req.name}@${req.min.major}.${req.min.minor}.${req.min.patch}"
-    let (_, seen) = visited[key]
-    if (seen) {
-      continue
-    }
-    visited[key] = true
-
-    let (mr, found) = findModuleReqs(graph, req.name, req.min)
-    if (!found) {
-      continue
-    }
-    let j = 0
-    while (j < len(mr.requires)) {
-      queue = append(queue, mr.requires[j])
-      j = j + 1
-    }
+    j = j + 1
   }
+  return names
+}
 
-  return resolved
+// Every distinct version of each name in `modules`, grouped into a
+// `ReqGraph.available` list — a caller that only ever fetches a version it
+// has already pinned to a specific tag (compiler/pmz.bit's transitive walk)
+// derives its candidate pool straight from what it fetched, rather than
+// tracking a second, parallel list that could drift from `modules`.
+fn packageVersionsFromModules(modules: []ModuleReqs): []PackageVersions {
+  let names = []string(0)
+  let seen = map<string, bool>{}
+  let byName = map<string, []Version>{}
+  let i = 0
+  while (i < len(modules)) {
+    let (_, has) = seen[modules[i].name]
+    if (!has) {
+      seen[modules[i].name] = true
+      names = append(names, modules[i].name)
+    }
+    let (existing, _) = byName[modules[i].name]
+    byName[modules[i].name] = append(existing, modules[i].version)
+    i = i + 1
+  }
+  let out = []PackageVersions(0)
+  let j = 0
+  while (j < len(names)) {
+    let (versions, _) = byName[names[j]]
+    out = append(out, PackageVersions{ name: names[j], versions: versions })
+    j = j + 1
+  }
+  return out
+}
+
+fn newSolver(graph: ReqGraph): Solver {
+  let candidates = map<string, []Version>{}
+  let i = 0
+  while (i < len(graph.available)) {
+    candidates[graph.available[i].name] = graph.available[i].versions
+    i = i + 1
+  }
+  let manifests = map<string, []Requirement>{}
+  let j = 0
+  while (j < len(graph.modules)) {
+    manifests[manifestKey(graph.modules[j].name, graph.modules[j].version)] = graph.modules[j].requires
+    j = j + 1
+  }
+  return Solver{
+    incompats: []Incompatibility(0), solution: []Assignment(0), level: 0,
+    allNames: collectAllNames(graph), candidates: candidates, manifests: manifests,
+  }
 }

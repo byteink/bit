@@ -1,0 +1,188 @@
+// compiler/pmresolveexplain.bit — turns the terminal (zero-term) conflict
+// `resolveConflict` (pmresolvesolve.bit) reaches into the structured
+// `ResolveFailure` this ticket exists for: a derivation chain of readable
+// steps plus the final, minimal list of conflicting requirements, not a
+// bare "no version satisfies these constraints" string.
+//
+// `resolveConflict` walks a DAG of incompatibilities via `causeA`/`causeB`;
+// every `Derived` incompatibility's causes have a strictly SMALLER index
+// than itself (append-only, always combining two already-existing entries),
+// so a plain ascending sweep over `0..terminalIdx` visits every cause before
+// the incompatibility that depends on it — no recursion, no separate
+// topological sort.
+
+fn versionText(v: Version): string {
+  return "${v.major}.${v.minor}.${v.patch}"
+}
+
+fn constraintText(c: Constraint): string {
+  let v = versionText(c.version)
+  if (c.op == ConstraintOp.Caret) { return "^" + v }
+  if (c.op == ConstraintOp.Tilde) { return "~" + v }
+  return v
+}
+
+// "root", or "<name> <version>" for a decided candidate's own dependency —
+// how a Root/Dependency incompatibility's origin reads in a sentence.
+fn requirerLabel(ic: Incompatibility): string {
+  if (ic.kind == IncompatKind.Root) { return ic.requirer }
+  return "${ic.requirer} ${versionText(ic.depVersion)}"
+}
+
+// The set of incompatibility indices reachable from `terminalIdx` via
+// `causeA`/`causeB`, inclusive — an explicit-stack walk bounded by
+// `terminalIdx + 2` (each index can only be pushed and popped once, since
+// `mark` gates re-visiting).
+fn relevantIndices(s: Solver, terminalIdx: int): []bool {
+  let mark = []bool(0)
+  let i = 0
+  while (i <= terminalIdx) {
+    mark = append(mark, false)
+    i = i + 1
+  }
+  let stack = [terminalIdx]
+  let steps = 0
+  while (len(stack) > 0 && steps < terminalIdx + 2) {
+    steps = steps + 1
+    let cur = stack[len(stack) - 1]
+    stack = stack[0:len(stack) - 1]
+    if (mark[cur]) { continue }
+    mark[cur] = true
+    if (s.incompats[cur].kind == IncompatKind.Derived) {
+      stack = append(stack, s.incompats[cur].causeA)
+      stack = append(stack, s.incompats[cur].causeB)
+    }
+  }
+  return mark
+}
+
+// Every Root/Dependency-kind incompatibility reachable from `terminalIdx` —
+// the leaves of the derivation DAG, and the ticket's own literal ask: "the
+// returned derivation names BOTH conflicting requirements and the package
+// they disagree about", as structured data. Same traversal shape as
+// `relevantIndices`, kept separate because this one also builds output.
+fn collectLeafRequirers(s: Solver, terminalIdx: int): []ConflictRequirer {
+  let out = []ConflictRequirer(0)
+  let visited = map<int, bool>{}
+  let stack = [terminalIdx]
+  let steps = 0
+  while (len(stack) > 0 && steps < terminalIdx + 2) {
+    steps = steps + 1
+    let cur = stack[len(stack) - 1]
+    stack = stack[0:len(stack) - 1]
+    let (_, seen) = visited[cur]
+    if (seen) { continue }
+    visited[cur] = true
+    let ic = s.incompats[cur]
+    if (ic.kind == IncompatKind.Derived) {
+      stack = append(stack, ic.causeA)
+      stack = append(stack, ic.causeB)
+      continue
+    }
+    if (ic.kind == IncompatKind.Root || ic.kind == IncompatKind.Dependency) {
+      out = append(out, ConflictRequirer{ requirer: requirerLabel(ic), name: ic.reqName, constraint: ic.reqConstraint })
+    }
+  }
+  return out
+}
+
+fn stepRequirers(ic: Incompatibility): []ConflictRequirer {
+  if (ic.kind == IncompatKind.Root || ic.kind == IncompatKind.Dependency) {
+    return [ConflictRequirer{ requirer: requirerLabel(ic), name: ic.reqName, constraint: ic.reqConstraint }]
+  }
+  return []ConflictRequirer(0)
+}
+
+fn constraintEq(a: Constraint, b: Constraint): bool {
+  return a.op == b.op && versionEq(a.version, b.version)
+}
+
+// The package two leaf requirers actually disagree about — the ticket's own
+// "the package they disagree about" — found by looking at the CONTENT of
+// the collected requirers rather than trusting whichever package conflict
+// resolution happened to eliminate last. The two are not the same thing:
+// resolution order (which package gets decided first) can walk back through
+// several packages that all individually agree with themselves before
+// reaching the one that does not, so "the last package resolved away" is not
+// reliably "the disputed one" — verified by
+// `checkPubGrubDiamondBothPathsIndividuallySatisfiable`, whose derivation
+// legitimately passes through `b` and `c` (which never conflict with
+// themselves) on the way to the real disagreement over `d`. Falls back to
+// `fallback` (`resolveConflict`'s own last-controlling-package tracking)
+// only when no two requirers share a name with differing constraints — the
+// missing-version case, where the second side of the conflict is
+// unavailable reality, not a second stated requirement.
+fn pickDisputedPackage(requirers: []ConflictRequirer, fallback: string): string {
+  let i = 0
+  while (i < len(requirers)) {
+    let j = i + 1
+    while (j < len(requirers)) {
+      if (requirers[i].name == requirers[j].name && !constraintEq(requirers[i].constraint, requirers[j].constraint)) {
+        return requirers[i].name
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return fallback
+}
+
+// `ic`'s own sentence. A `Derived` incompatibility's causes are always at a
+// smaller incompatibility index than `ic` itself (append-only DAG), so both
+// causes already have an assigned step NUMBER by the time
+// `renderIncompatText` is called on it, in the ascending sweep
+// `buildFailure` runs — referencing "(N)" rather than re-embedding a
+// cause's full text is what keeps a several-hop chain readable instead of
+// nesting "because because because ...".
+fn renderIncompatText(ic: Incompatibility, stepNumberOf: map<int, int>): string {
+  if (ic.kind == IncompatKind.Root) {
+    return "${ic.requirer} requires ${ic.reqName} ${constraintText(ic.reqConstraint)}"
+  }
+  if (ic.kind == IncompatKind.Dependency) {
+    return "${ic.requirer} ${versionText(ic.depVersion)} depends on ${ic.reqName} ${constraintText(ic.reqConstraint)}"
+  }
+  if (ic.kind == IncompatKind.NoVersions) {
+    return "no available version of ${ic.reqName} satisfies the versions required of it"
+  }
+  let (numA, _) = stepNumberOf[ic.causeA]
+  let (numB, _) = stepNumberOf[ic.causeB]
+  return "because (${numA}) and (${numB}), these requirements cannot all be satisfied"
+}
+
+fn renderMessage(pkg: string, steps: []DerivationStep): string {
+  let msg = "no version of ${pkg} satisfies every requirement:\n"
+  let i = 0
+  while (i < len(steps)) {
+    msg = msg + "  ${i + 1}. ${steps[i].text}\n"
+    i = i + 1
+  }
+  return msg
+}
+
+// The full structured failure for the terminal (zero-term) incompatibility
+// at `terminalIdx`. `package` is passed in explicitly rather than read off
+// `s.incompats[terminalIdx]`, which by definition has no terms left to read
+// it from — `resolveConflict` hands over the last package it was resolving
+// away just before reaching zero terms.
+fn buildFailure(s: Solver, terminalIdx: int, lastControlling: string): ResolveFailure {
+  let relevant = relevantIndices(s, terminalIdx)
+  let stepNumberOf = map<int, int>{}
+  let steps = []DerivationStep(0)
+  let j = 0
+  while (j <= terminalIdx) {
+    if (relevant[j]) {
+      let text = renderIncompatText(s.incompats[j], stepNumberOf)
+      steps = append(steps, DerivationStep{ text: text, requirers: stepRequirers(s.incompats[j]) })
+      stepNumberOf[j] = len(steps)
+    }
+    j = j + 1
+  }
+  let requirers = collectLeafRequirers(s, terminalIdx)
+  let package = pickDisputedPackage(requirers, lastControlling)
+  return ResolveFailure{
+    package: package,
+    requirers: requirers,
+    steps: steps,
+    message: renderMessage(package, steps),
+  }
+}
