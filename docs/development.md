@@ -293,7 +293,7 @@ instead of the purely-manual, unverified two-pass `BIT_STAGE0_BIN` dance
 **What the opt-in requires, filed as #3117, not done here.**
 `tools/build/defs.bit` declares `selfhost`'s only dependency as `["libbitrt"]`,
 and `stepSelfhost` always resolves stage0 fresh via `runArtifact`
-(`main.bit:125`) — there is no path that reuses a previously-built
+(`tools/build/main.bit:125`) — there is no path that reuses a previously-built
 `bit-out/bin/bit` as a builder for anything. An opt-in tree-built `libbitrt`
 therefore cannot just swap which `BIT=` `stepLibbitrt` passes to
 `scripts/g2archive.sh` — it needs its own internal two-pass bootstrap,
@@ -477,8 +477,9 @@ wall-clock deadline to each of the program's three bounded subprocesses in
 turn — compile, the default-policy run, and the `BIT_GC=stress` run
 (`resolveTimeoutMs` folds the effective budget into a per-program `Ctx` at
 `stress.bit:568-584`, and `runScript`/`osRunBounded` re-apply it separately at
-each phase, `verify.bit:221-233`, called from `buildProgram` at `verify.bit:249`
-and `runOnce` at `verify.bit:271`). `BIT_TEST_TIMEOUT_S` raises or lowers that
+each phase, `tests/bit/stress/verify.bit:221-233`, called from `buildProgram` at
+`tests/bit/stress/verify.bit:249` and `runOnce` at
+`tests/bit/stress/verify.bit:271`). `BIT_TEST_TIMEOUT_S` raises or lowers that
 default for the whole corpus. A program directory may instead hold a file
 named `timeout-s`, sitting beside the existing `no-collect`/`stress-waived`
 markers (`tests/stress/<name>/timeout-s`) — one line holding a single positive
@@ -747,7 +748,7 @@ Two things a split can break that a green build will **not** catch:
   order, and the inliner only inlines a callee it has already lowered. A new
   sibling that sorts *before* the file holding its helpers silently loses
   inlining — perfect text diff, different machine code. Name new files so they
-  sort after their helpers (for `sock.bit` the working order was
+  sort after their helpers (for `runtime/net/darwin/sock.bit` the working order was
   `sock < tcp < udp`), and confirm with `bit build <src> --emit-obj` byte-identical
   before vs after.
 

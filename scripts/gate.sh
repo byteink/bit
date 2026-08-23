@@ -393,6 +393,10 @@ gates_for_file() {
     tests/bit/abimembers/*) printf 'test-abimembers\n'; return 0 ;;
     tests/bit/benchgate/*) printf 'test-benchgate\n'; return 0 ;;
     tests/bit/clicmd/*) printf 'test-clicmd\n'; return 0 ;;
+    # #3458 moved this from a single file (tests/bit/fmtcitations.bit) to a
+    # directory module (its self-tests split into a sibling, over the
+    # 800-line limit) — the same shape as tests/bit/benchgate/* above.
+    tests/bit/fmtcitations/*) printf 'test-fmt-citations\n'; return 0 ;;
     tests/bit/pollfree/*) printf 'test-pollfree\n'; return 0 ;;
     tests/bit/rootabi/*) printf 'test-rootabi\n'; return 0 ;;
     tests/bit/rootpins/*) printf 'test-rootpins\n'; return 0 ;;
