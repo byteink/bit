@@ -3136,25 +3136,45 @@ list — angle-bracketed, `", "`-separated (`<T>`, `<T, E>`) — or empty when i
 declares none; a method's `params` is always empty, since its receiver's own
 line already carries the receiver's parameters.
 
-**Plain form** (the default) prints one line per symbol. A named-type
-declaration (`class`/`enum`/`interface`/`type`) prints `<kind> <name><params>`;
-every other symbol prints `<kind> <name><params> <type>`:
+A symbol's **doc comment** is the run of `//` line comments ending immediately
+above its declaration: each comment must stand alone on its own source line (a
+`/* */` block comment, or a `//` trailing a previous statement's code on that
+same line, is never part of the run), and at most one newline may separate a
+comment from the next one below it, or from the declaration itself — a blank
+line breaks the run, so a comment separated from its declaration by a blank
+line is attached to nothing. A symbol with no such run has no doc comment.
+
+**Plain form** (the default) prints one line per symbol, preceded — when the
+symbol has a doc comment — by that comment's lines, each printed verbatim
+(leading `//` and all) on its own line directly above. A named-type
+declaration (`class`/`interface`/`type`) prints `<kind> <name><params>`; an
+`enum` instead prints its own variant list, braced —
+`enum <name><params> { <variant>, <variant>(<payload>, ...), ... }` — since the
+variant list is the type's entire meaning; every other symbol prints
+`<kind> <name><params> <type>`:
 
 ```
-enum Option<T>
+// Option<T> is present (Some) or absent (None).
+enum Option<T> { Some(T), None }
 class Point
-function unwrapOr<T> (Option<T>, T) => T
+class Reader
 method Reader.readAll () => string
 const pi f64
+// unwrapOr returns the payload, or `d` when the option is None.
+function unwrapOr<T> (Option<T>, T) => T
 ```
 
 **`--json`** prints a `[ ... ]` array, one object per line, with keys in this
-exact order: `name`, `kind`, `params`, `type`:
+exact order: `name`, `kind`, `params`, `type`, `variants`, `doc`. `variants` is
+`[]` for every kind but `enum`, whose own entries carry that variant's `name`
+and its `payload` type list (`[]` for a payload-free variant). `doc` is the
+symbol's doc comment lines, `"\n"`-joined, or `""` when it has none:
 
 ```json
 [
-  {"name": "Option", "kind": "enum", "params": "<T>", "type": "Option<T>"},
-  {"name": "unwrapOr", "kind": "function", "params": "<T>", "type": "(Option<T>, T) => T"}
+  {"name": "Option", "kind": "enum", "params": "<T>", "type": "Option<T>", "variants": [{"name": "Some", "payload": ["T"]}, {"name": "None", "payload": []}], "doc": "// Option<T> is present (Some) or absent (None)."},
+  {"name": "Point", "kind": "class", "params": "", "type": "Point", "variants": [], "doc": ""},
+  {"name": "unwrapOr", "kind": "function", "params": "<T>", "type": "(Option<T>, T) => T", "variants": [], "doc": "// unwrapOr returns the payload, or `d` when the option is None."}
 ]
 ```
 
@@ -3165,9 +3185,6 @@ exact order: `name`, `kind`, `params`, `type`:
 fields, in declaration order, as the extra kind `field` with name `Recv.field`
 (for example `Point.x`); it changes neither form's shape for a module whose
 classes report no fields this way.
-
-Neither form prints documentation comments: a `//` line written directly above
-a declaration is source-only and is not part of `bit doc`'s output.
 
 ---
 
