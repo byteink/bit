@@ -1,0 +1,286 @@
+// Nothing ran the repo's own `E0200 max-file-lines` rule over `tools/` before
+// this gate (#2486). `test-lint-filelines` (tests/bit/lintfilelines.bit)
+// already sweeps `compiler/`, `runtime/`, `stdlib/`, `tests/stress/`,
+// `examples/`, `tests/bit/` and `tests/imports/` at zero E0200 — but not
+// `tools/`, and it tolerates a fixture corpus inside `tests/bit/`. This gate
+// is narrower and stricter on purpose:
+//
+//   - SCOPE IS PRODUCTION CODE ONLY: `runtime/`, `compiler/`, `stdlib/`,
+//     `tools/`. No test tree is swept, and that is a design decision, not an
+//     oversight (see the ticket's own investigation, #2486). `tests/cases/`
+//     holds E0200's own deliberate boundary fixtures
+//     (`lint_boundary_fail.bit`, 801 lines, and `lint_finding.bit`, whose
+//     `bit:lint` directive lowers its own limit to force a finding) and
+//     `tests/bit/checkercases/`+`parsercases/` hold deliberately malformed
+//     `.bit` files. `bit lint`'s error sink is all-or-nothing PER INVOCATION
+//     (compiler/lintbatch.bit:227): the first file that adds a parse or
+//     directive error blanks every finding already computed for every OTHER
+//     file in that same `bit lint <dirs...>` call, tree-wide, not just for
+//     its own directory (#3543, filed and not this gate's job to fix). A
+//     production-only scope sidesteps that defect entirely rather than
+//     working around it with an allowlist.
+//   - THE VERDICT IS A HARD ZERO, not "exactly one E0200 is expected". A
+//     hardcoded tolerance for a specific named fixture has gone stale three
+//     times in this repo's lint gates; production code has no reason to ever
+//     carry a deliberate E0200, so zero needs no such policy and cannot rot.
+//
+// Anti-vacuity is the file-count denominator, not a fixture line: each swept
+// directory must contain at least one `.bit` file (`countBitFiles` below), or
+// the run refuses rather than reporting a silent, contentless pass. The walk
+// is hand-rolled, independent of `bit lint`'s own file collector
+// (compiler/lintbatch.bit's `collectLintFiles`) and independent of
+// `tests/bit/lintfilelines.bit`'s copy of the same idea — sharing either would
+// make the denominator blind to exactly the bug class it exists to catch: if
+// the shared walk silently dropped a file, the count and the scan it polices
+// would shrink together and still agree.
+//
+// One `bit lint <dirs...>` invocation, matching the design `bit lint`'s own
+// cross-file rules (e.g. E0210, "used by a sibling") depend on: passing every
+// directory in a single call lets it see the whole set as it would in normal
+// use, rather than four isolated per-directory runs that could each look
+// clean while something only visible across directories does not.
+//
+// Exactly like tests/bit/lintfilelines.bit and lintruntime.bit, none of a
+// subprocess's exit code or stderr is observable from inside the linting
+// process, so this shells the real `bit lint` out through `/bin/sh` and reads
+// both back off disk.
+//
+// Run it from the repository root:
+//     ./bit-out/bin/bit run tests/bit/lintsweep.bit
+// BIT_SELF_EXE names the compiler under test; BIT_MAKE_ROOT names the repo
+// root the four swept directories hang off. Both are required — a missing one
+// is a hard stop, not a silently different (and silently green) set of
+// directories.
+import { env, envOr, exit } from "std/os"
+import { exists, isDir, mkdir, readDir, readFile, writeFile } from "std/fs"
+import { contains, hasPrefix, hasSuffix, parseInt, split } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// Power of 10 rule 2: the recursive walk below has a statically bounded
+// depth and a bounded per-directory fan-out, not merely a hope of
+// termination.
+const maxEntries: int = 4096
+const maxScanDepth: int = 16
+
+// Matches lintfilelines.bit's own 300s: a hang-detector, not a performance
+// budget. The four swept trees here are smaller than that gate's seven, so
+// this margin is if anything more generous in practice.
+const defaultTimeoutS: int = 300
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "${defaultTimeoutS}")) catch _ {
+    defaultTimeoutS
+  }
+  if (s <= 0) {
+    return defaultTimeoutS * 1000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s mechanism channel, never a program exit status, so
+// each one is a named panic rather than a value any assertion could consume.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("lintsweep: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("lintsweep: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("lintsweep: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("lintsweep: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+fn requiredEnv(name: string): string! {
+  let v = env(name)
+  if (len(v) == 0) {
+    fail newError("lintsweep: ${name} is required and was not set")
+  }
+  return v
+}
+
+// One `bit lint <dirs...>` invocation, as seen from outside it.
+class Run { code: int, err: string }
+
+fn quotedPaths(paths: []string): string {
+  let out = ""
+  for p of paths {
+    out = out + " '${p}'"
+  }
+  return out
+}
+
+fn runLint(bit: string, paths: []string, capDir: string, ms: int): Run! {
+  let outPath = "${capDir}/out.txt"
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  let script = "#!/bin/sh\n" + "'${bit}' lint" + quotedPaths(paths) + " > '${outPath}' 2> '${errPath}'\n" + "echo $? > '${codePath}'\n" + "exit 0\n"
+  let sh = shell("${capDir}/lint.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("lintsweep: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("lintsweep: no exit code was recorded — the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, err: readFile(errPath)? }
+}
+
+// `std/strings`'s `trimSpace` strips only space/tab, not the trailing `\n`
+// every captured `code.txt` carries.
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn isFindingHeader(line: string): bool {
+  return hasPrefix(line, "warning[E") || hasPrefix(line, "error[E")
+}
+
+// `r` is a usable observation of a real run, not silence mistaken for a clean
+// sheet. `bit lint` always prints a summary to stderr, clean or not
+// (compiler/lintbatch.bit's `lintCmd`), so an empty capture means the run
+// produced nothing trustworthy. Exit 2 is SPEC's own "could not be trusted"
+// verdict (usage error, unreadable path, malformed directive) — reading it as
+// a clean run would be exactly the kind of silent-green this repo keeps a
+// list of ways to accidentally build.
+fn assertTrustworthy(r: Run, label: string) {
+  if (len(r.err) == 0) {
+    panic("lintsweep: stderr is empty — `bit lint` produced no summary for ${label}")
+  }
+  if (r.code == 2) {
+    panic("lintsweep: `bit lint` exited 2 (untrusted run) over ${label}:\n${r.err}")
+  }
+  if (r.code != 0 && r.code != 1) {
+    panic("lintsweep: `bit lint` exited ${r.code} over ${label}, want 0 or 1")
+  }
+}
+
+fn countE0200(err: string): int {
+  let n = 0
+  for line of split(err, "\n") {
+    if (isFindingHeader(line) && contains(line, "[E0200]")) {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+// Prints every E0200 finding's header AND the file:line:col it names.
+// `renderOne` (compiler/diagnostics.bit) always emits the location as the
+// line immediately following the header, so an index-based loop — not a
+// `for..of` — is needed to look one line ahead.
+fn printE0200Findings(err: string) {
+  let lines = split(err, "\n")
+  let i = 0
+  while (i < len(lines)) {
+    if (contains(lines[i], "[E0200]")) {
+      eprint("  ${lines[i]}\n")
+      if (i + 1 < len(lines)) {
+        eprint("  ${lines[i + 1]}\n")
+      }
+    }
+    i = i + 1
+  }
+}
+
+// The count of `.bit` files anywhere beneath `dir`, via a walk this file owns
+// — see the header for why sharing a primitive with `bit lint`'s own file
+// collector would make the denominator blind to a bug in it.
+fn countBitFiles(dir: string, depth: int): int {
+  if (depth <= 0) {
+    panic("lintsweep: ${dir} nesting exceeds ${maxScanDepth} levels")
+  }
+  let names = readDir(dir) catch e {
+    panic("lintsweep: cannot list ${dir}: ${e.message()}")
+  }
+  if (len(names) > maxEntries) {
+    panic("lintsweep: ${dir} has ${len(names)} entries, over the ${maxEntries} bound")
+  }
+  let n = 0
+  for name of names {
+    let path = "${dir}/${name}"
+    if (isDir(path)) {
+      n = n + countBitFiles(path, depth - 1)
+    } else if (hasSuffix(name, ".bit")) {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+fn teardown(dir: string, ms: int) {
+  shell("${dir}/rm.sh", "#!/bin/sh\nrm -rf '${dir}'\n", ms) catch _ {
+    return
+  }
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let bit = requiredEnv("BIT_SELF_EXE") catch e {
+    panic("lintsweep: ${e.message()}")
+  }
+  let repo = requiredEnv("BIT_MAKE_ROOT") catch e {
+    panic("lintsweep: ${e.message()}")
+  }
+
+  let dirNames = ["runtime", "compiler", "stdlib", "tools"]
+  let paths = []string(0)
+  let totalFiles = 0
+  for d of dirNames {
+    let full = "${repo}/${d}"
+    if (!exists(full)) {
+      panic("lintsweep: no such directory: ${full}")
+    }
+    let n = countBitFiles(full, maxScanDepth)
+    if (n == 0) {
+      panic("lintsweep: ${full} contains zero .bit files — refusing a vacuous scan")
+    }
+    totalFiles = totalFiles + n
+    paths = append(paths, full)
+  }
+
+  let tmp = envOr("TMPDIR", "/tmp")
+  if (hasSuffix(tmp, "/")) {
+    tmp = tmp[:len(tmp) - 1]
+  }
+  let capDir = "${tmp}/bit-lintsweep-${uuidFormat(uuidV4())}"
+  mkdir(capDir) catch e {
+    panic("lintsweep: cannot create ${capDir}: ${e.message()}")
+  }
+  defer teardown(capDir, ms)
+
+  let r = runLint(bit, paths, capDir, ms) catch e {
+    panic("lintsweep: ${e.message()}")
+  }
+  assertTrustworthy(r, "runtime/ + compiler/ + stdlib/ + tools/")
+  let e0200 = countE0200(r.err)
+
+  if (e0200 > 0) {
+    eprint("FAIL: ${e0200} warning[E0200] finding(s) across runtime/ + compiler/ + stdlib/ + tools/ —\n")
+    eprint("each is a file over the 800-line limit (spec/LINT.md §4). Split the file; do not\n")
+    eprint("raise the limit. ${totalFiles} .bit file(s) were scanned.\n")
+    printE0200Findings(r.err)
+    exit(1)
+  }
+  println("lint-sweep: ${totalFiles} .bit file(s) scanned across runtime/ + compiler/ + stdlib/ + tools/, 0 E0200")
+  println("lint-sweep: PASS — production code only; tests/ is out of scope by design (see header)")
+}
