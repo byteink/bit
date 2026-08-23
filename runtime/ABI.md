@@ -2732,9 +2732,15 @@ Cryptographic Extension instructions (AESE/AESMC/AESD/AESIMC), so one source
 file is compiled once per TARGET (x86_64-linux, aarch64-linux, aarch64-macos)
 the same way `runtime/syscalls/syscalls.bit` already is. Every exported
 function starts `if (onX64()) return` — a no-op on x86_64, since Bit has no
-arch-conditional compilation (SPEC §11.8) and no ARM64 target lacks the
-extension this project supports (Apple Silicon and every aarch64-linux target
-this project builds for carry it).
+arch-conditional compilation (SPEC §11.8).
+
+**THE EXTENSION IS OPTIONAL ON AARCH64**, unlike NEON — a Cortex-A72 (the
+chip in a Raspberry Pi 3/4, and this project's own remote `mypi` fleet
+includes one) has no AES instructions, and issuing one is `SIGILL`. So every
+exported function also calls `aesRequireHwSupport`, which reads bit 0 (AES)
+of `bit_rt_crypto_hwcaps()` and panics with a clear message rather than
+letting the CPU fault — a diagnosable panic beats a raw illegal-instruction
+crash, which is worse than the alternative of simply being slower.
 
 **NO CALLER YET.** These three pins exist so #2526 (route `stdlib/crypto`'s
 AES through them) has something to call; wiring them up hits the same
