@@ -1,0 +1,210 @@
+// Self-host Stage 3 (#1342): ARM64 logical-immediate (bitmask) encoding — the
+// N:immr:imms scheme AND/ORR/EOR/ANDS use for a constant operand (#3495).
+// Sibling .bit file, same module: see arm64.bit for the backend overview.
+//
+// Not every 64-bit pattern is representable: the ISA only encodes a
+// contiguous run of 1 bits (optionally rotated) replicated at some power-of-
+// two element size (2,4,8,16,32,64). `fitsLogicalImm` is the single source of
+// truth for "is this constant encodable" and is ported field-for-field from
+// the classic derivation every mainstream AArch64 backend uses (LLVM's
+// `processLogicalImmediate`; binutils' and Go's assemblers compute the same
+// N/immr/imms the same way) — this is exactly the kind of bit-twiddling where
+// a self-derived encoder would only confirm its own misunderstanding, so
+// every golden word in arm64check.bit's `checkArm64LogicalImm` comes from
+// `clang -c` + `otool -t`, an oracle with no arithmetic in common with this
+// file.
+
+// The three fields the bitmask-immediate scheme packs into 13 bits (N at bit
+// 12, immr at bits 11:6, imms at bits 5:0). `fits` false means `val` has no
+// such encoding at all and the caller must fall back to materialize-then-
+// register-form.
+class LogicalImm {
+  fits: bool,
+  n: int,
+  immr: int,
+  imms: int,
+}
+
+fn noLogicalImm(): LogicalImm {
+  return LogicalImm{ fits: false, n: 0, immr: 0, imms: 0 }
+}
+
+// All 64 bits set, built by unsigned underflow rather than a `~` on `u64` —
+// `u64` is modular arithmetic (SPEC §11.1), so `0 - 1` wraps to
+// 0xFFFFFFFFFFFFFFFF exactly, and every "bitwise NOT" below reuses this same
+// identity (`allOnes - x == ~x` for any 64-bit `x`) instead of a unary op.
+fn allOnesU64(): u64 {
+  return u64(0) - u64(1)
+}
+
+// Index of the lowest set bit of a nonzero 64-bit pattern, scanning from bit
+// 0. Bounded at 64 iterations (a u64 has 64 bits), never more.
+fn ctz64(x: u64): int {
+  assert(x != u64(0))
+  let v = x
+  let n = 0
+  while (n < 64) {
+    if ((v & u64(1)) != u64(0)) {
+      return n
+    }
+    v = v >> u64(1)
+    n = n + 1
+  }
+  return 64
+}
+
+// Number of leading zero bits before the highest set bit of a nonzero 64-bit
+// pattern. Bounded at 64 iterations.
+fn clz64(x: u64): int {
+  assert(x != u64(0))
+  let v = x
+  let n = 0
+  while (n < 64) {
+    if ((v & (u64(1) << u64(63))) != u64(0)) {
+      return n
+    }
+    v = v << u64(1)
+    n = n + 1
+  }
+  return 64
+}
+
+// Trailing/leading run lengths of 1-bits: count the 0-run of the bitwise
+// complement, the standard identity rather than a separate scan.
+fn cto64(x: u64): int { return ctz64(allOnesU64() - x) }
+fn clo64(x: u64): int { return clz64(allOnesU64() - x) }
+
+// True when nonzero `v` is a single contiguous run of 1s with everything else
+// 0 (representable as 0^a 1^b 0^c, b>=1) — i.e. `v` is a MASK (a run of 1s
+// starting at bit 0) once shifted down by its own trailing zeros.
+fn isMask64(v: u64): bool {
+  return v != u64(0) && ((v + u64(1)) & v) == u64(0)
+}
+
+fn isShiftedMask64(v: u64): bool {
+  return v != u64(0) && isMask64((v - u64(1)) | v)
+}
+
+// The low `size` bits set, for size in [1,64]. `1 << 64` is undefined on
+// every ISA this backend targets, so size==64 (no narrower repeating element
+// found — the whole register is one element) is its own case, not a shift.
+fn maskLowBits(size: int): u64 {
+  if (size >= 64) {
+    return allOnesU64()
+  }
+  return (u64(1) << u64(size)) - u64(1)
+}
+
+// Smallest power-of-two element size (down to 2) whose low half equals its
+// high half all the way up to `regSize` — i.e. `v` replicates at that size.
+// Halves at least once unconditionally: an exact copy with no smaller period
+// is element size `regSize` itself, reached by doubling back on the first
+// mismatch. Split out of `fitsLogicalImm` to keep that function's own
+// complexity under the ceiling.
+fn logicalImmElementSize(regSize: int, v: u64): int {
+  let size = regSize
+  let searching = true
+  while (searching) {
+    size = size / 2
+    let m = maskLowBits(size)
+    if ((v & m) != ((v >> u64(size)) & m)) {
+      size = size * 2
+      searching = false
+    } else if (size <= 2) {
+      searching = false
+    }
+  }
+  return size
+}
+
+// The rotation `i` and trailing-ones run length `cto` for a `size`-bit
+// element (`fitsLogicalImm`'s minimal repeating unit), or `ok`=false if
+// `elem` is not some rotation of a single contiguous run of 1 bits at all —
+// genuinely not encodable. Split out of `fitsLogicalImm` for the same reason
+// as `logicalImmElementSize` above.
+class LogicalRunFields {
+  ok: bool,
+  i: int,
+  cto: int,
+}
+
+fn logicalImmRunFields(elem0: u64, size: int): LogicalRunFields {
+  let allOnes = allOnesU64()
+  let mask = maskLowBits(size)
+  if (isShiftedMask64(elem0)) {
+    let i = ctz64(elem0)
+    let cto = cto64(elem0 >> u64(i))
+    return LogicalRunFields{ ok: true, i: i, cto: cto }
+  }
+  // The run of 1s wraps past bit (size-1) back to bit 0: force every bit
+  // outside this element to 1 and look for the (now non-wrapping) run of 0s
+  // that complements it instead. If even that isn't a clean run, `elem`
+  // replicates but is not some rotation of a contiguous run of 1s at all.
+  let elem = elem0 | (allOnes - mask)
+  if (!isShiftedMask64(allOnes - elem)) {
+    return LogicalRunFields{ ok: false, i: 0, cto: 0 }
+  }
+  let clo = clo64(elem)
+  let i = 64 - clo
+  let cto = clo + cto64(elem) - (64 - size)
+  return LogicalRunFields{ ok: true, i: i, cto: cto }
+}
+
+// Whether `val` is representable as an AArch64 logical-immediate at register
+// width `regSize` (32 or 64), and its N/immr/imms fields if so. For
+// `regSize`==32, `val` must already be zero-extended (bits 63:32 clear) —
+// the natural representation of a 32-bit immediate this function never
+// receives from this backend's own callers (§ arm64.bit: every register is
+// always the 64-bit X form here), only from arm64check.bit's cross-check of
+// the derivation against a real `and w.., #imm` clang encoding.
+//
+// Every shift below operates on `u64` so it is LOGICAL regardless of `val`'s
+// sign, matching the ISA's own bit-pattern view of the immediate — the same
+// reason `movImm64` (arm64.bit) reads its input through `u64(val)`.
+fn fitsLogicalImm(regSize: int, val: int): LogicalImm {
+  assert(regSize == 32 || regSize == 64)
+  let allOnes = allOnesU64()
+  let v = u64(val)
+  if (regSize == 64) {
+    if (v == u64(0) || v == allOnes) {
+      return noLogicalImm()
+    }
+  } else {
+    let lo32Mask = u64(4294967295)
+    if (v != (v & lo32Mask) || v == u64(0) || v == lo32Mask) {
+      return noLogicalImm()
+    }
+  }
+
+  let size = logicalImmElementSize(regSize, v)
+  let mask = maskLowBits(size)
+  let fields = logicalImmRunFields(v & mask, size)
+  if (!fields.ok) {
+    return noLogicalImm()
+  }
+  // fields.cto is a run length within a `size`-bit element that is provably
+  // neither all-0 nor all-1 (either would make `v` itself all-0/all-1,
+  // already rejected above), so it is always >= 1 — guarding the `- 1` below
+  // from wrapping to allOnes on a would-be silent miscompile.
+  assert(fields.cto >= 1)
+
+  let immr = (size - fields.i) & (size - 1)
+  let nImms = (allOnes - u64(size - 1)) << u64(1)
+  nImms = nImms | (u64(fields.cto) - u64(1))
+  let nBit = i64((nImms >> u64(6)) & u64(1))
+  return LogicalImm{ fits: true, n: nBit ^ 1, immr: immr, imms: i64(nImms & u64(63)) }
+}
+
+// Packs N:immr:imms into the AND/ORR/EOR/ANDS(immediate) word —
+// `sf opc 100100 N immr imms Rn Rd`. `sf`=1 selects the 64-bit (X) form this
+// backend's production callers always use (`logicalImmediate`, arm64.bit,
+// mirroring `logicalShiftedReg`/`bitfieldImm`/`addSubImmediate`'s own
+// hardcoded sf=1); `sf`=0 (the 32-bit W form) exists here only so
+// arm64check.bit can cross-check `fitsLogicalImm`'s 32-bit-width derivation
+// against a real `and w.., #imm` clang encoding too, alongside the 64-bit
+// forms production code emits.
+fn logicalImmWord(sf: int, opc: int, imm: LogicalImm, rn: int, dst: int): int {
+  assert(imm.fits)
+  return (sf << 31) | (opc << 29) | (36 << 23) | (imm.n << 22) |
+    (imm.immr << 16) | (imm.imms << 10) | (rn << 5) | dst
+}
