@@ -54,7 +54,7 @@ One exception, and it is the only one: a class that has a **class-typed field**
 has no zero value, so it cannot be declared without an initializer and a literal
 cannot leave that field out. Both are `E0083`. A class is a reference, so zero
 bits in such a field would be a null rather than a live instance - see
-[Types](types.md#classes).
+[Classes](classes.md#reference-type).
 
 ```bit
 class Point { x: f64; y: f64 }
