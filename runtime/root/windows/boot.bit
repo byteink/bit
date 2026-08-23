@@ -134,15 +134,18 @@ import {
   schedRegisterBigStack, wkDeque, schedTaskExit, dqPushBottom,
   WORKER_MAX_STEPS, workerStepStop, scStopping, schedFindWorkAt,
   schedWorkerStepAt, wkLastDone, taskStackBase, taskStackBytes,
-  schedCurrentTask, taskSpawnEntry, taskArg, wkSleepReq,
+  taskSpawnEntry, wkSleepReq,
   schedIdleArm, schedIdleDisarm, schedIdlePark, schedSetPollFd,
 } from "../../sched"
-// The netpoller provider (#3339). `../../sched` may not import it — IOCP
-// against epoll/kqueue is the platform split the parent module exists to
-// stay clear of — so the binding is made here, in the leaf that is already
-// per-platform, exactly as ../linux/boot.bit and ../darwin/boot.bit bind
-// their own twins at the same three points.
-import { pollCreate, pollClose, pollDrain } from "../../sched/windows"
+// The netpoller provider (#3339) and the spawn trampoline (#3503). `../../sched`
+// may not import either: IOCP against epoll/kqueue is the platform split the
+// parent module exists to stay clear of, and the trampoline's Win64 argument
+// register is exactly the OS-conditional choice `../../sched/task.bit`'s own
+// header says its `asm` cannot express (see `../../sched/windows/spawn.bit`'s
+// header for the full argument). Both bindings are made here, in the leaf
+// that is already per-platform, exactly as ../linux/boot.bit and
+// ../darwin/boot.bit bind their own netpoller twins at the same three points.
+import { pollCreate, pollClose, pollDrain, winSpawnTrampoline } from "../../sched/windows"
 // `wkId`/`schedCurrentWorker`/`schedMaxWorkers` (from "../../sched") are
 // already imported into this module by ./io.bit — an import is per-MODULE,
 // not per-file, so a second import of any of them here would be E0042.
@@ -407,83 +410,17 @@ fn mainTrampoline() {
 // rationale: `runtime/gc/mem.bit` reaches these across the module boundary by
 // name, ABI.md §9).
 //
+// #3503: `rtSpawn` below points a spawned task's pc at
+// `../../sched/windows/spawn.bit`'s `winSpawnTrampoline`, NOT
+// `../../sched/task.bit`'s shared `schedSpawnTrampoline` — the shared one's
+// private `taskInvoke` hardcodes the SysV x64 argument register (`rdi`),
+// which is wrong for the Win64-compiled `spawn$trampoline$<fid>` it calls
+// into. See that file's header for the full root cause and why the fix lives
+// there rather than here: it holds the same raw GC-thunk-pointer-across-a-call
+// shape `../../sched/task.bit`'s own version does, which `runtime/sched/**`
+// is deliberately outside `tests/bit/pollfree`'s covered subtrees for (unlike
+// `runtime/root/**`, where this file lives).
 // ---------------------------------------------------------------------------
-// #3503: WHY THIS FILE HAS ITS OWN SPAWN TRAMPOLINE, NOT `../../sched`'s
-// ---------------------------------------------------------------------------
-//
-// `../../sched/task.bit`'s `schedSpawnTrampoline` calls its own private
-// `taskInvoke(entry, arg)`, which hand-places `arg` in `rdi` on x64
-// unconditionally (`input arm64 x0 x64 rdi = arg`) — correct for SysV, the
-// only x64 convention `compiler/emitelf.bit` ever selects (`XCallConv.SysV`,
-// line 227), but wrong here: `compiler/emitpecode.bit:112` compiles EVERY
-// x86_64-windows function, INCLUDING the compiler-synthesized
-// `spawn$trampoline$<fid>` `taskInvoke` calls into (`compiler/lowerfunc.bit`'s
-// `synthSpawnTrampoline`), with `XCallConv.Win64` — whose first integer
-// argument register is `rcx`, not `rdi` (`compiler/x64call.bit`'s `xArg0`,
-// asserted `compiler/x64compilecheck.bit:668-669`). `../../sched/` is
-// deliberately platform-free (its own header, "the core cannot contain
-// either") and Bit's `asm` has no OS-conditional form — only one `x64`
-// sub-block per block, arch- not OS-scoped (SPEC §11.6: "Bit has no
-// arch-conditional compilation") — so the register choice cannot be made
-// inside the shared trampoline at all. `runtime/thread/windows/spawn.bit`'s
-// `invokeRaw` already solves the identical problem for `CreateThread`'s own
-// child entry the same way this does: a leaf-local copy pinned to `rcx`,
-// exactly the pattern its own comment names ("A verbatim copy of
-// ../darwin/spawn.bit's invokeRaw — same encoding, same reason").
-//
-// ROOT CAUSE, MATCHING THE REPRO: a bare `spawn worker(1)` on
-// mustafa-desktop-win (native) printed "spawned" (bit_main's own print, which
-// never goes through `taskInvoke` — only a `spawn`'d task's own first run
-// does) then faulted with "bit: fatal signal: segmentation fault", never
-// reaching "worker 1". `spawn$trampoline$<fid>`'s Win64-compiled prologue
-// reads its one parameter (the packed-argument env pointer) out of `rcx`;
-// `taskInvoke` had just placed it in `rdi` instead. The trampoline therefore
-// treats whatever `rcx` happens to hold as the env pointer and dereferences
-// it — the exact shape of an access violation whose faulting address does
-// not correlate with the current stack (the generic "bad pointer" path in
-// `./signal.bit`'s `vehHandler`, not the stack-overflow one), which is what
-// was observed. `winSpawnTrampoline`/`winTaskInvoke` below fix this by
-// giving Windows the same leaf-local `rcx` path `invokeRaw` already
-// establishes, instead of the shared, SysV-only `taskInvoke`.
-// ---------------------------------------------------------------------------
-
-// Call the raw code address `entry` with `arg` in the Win64 first-argument
-// register, `rcx` — the leaf-local counterpart of
-// `../../thread/windows/spawn.bit`'s `invokeRaw` (same encoding, same
-// reasoning), kept here rather than imported because that function is
-// unexported and this file may not reach into a sibling leaf's private state
-// any more than `../../sched` may reach into this one's. `entry` is a bare
-// code pointer (`spawn$trampoline$<fid>`'s address, stashed by `rtSpawn` at
-// `taskSpawnEntry`), not a `(code, env)` function value, so no `call_value`
-// reaches it — the same constraint `../../sched/task.bit`'s `taskInvoke`
-// documents.
-@nosplit fn winTaskInvoke(entry: int, arg: int) {
-  asm {
-    arm64 { 0xD63F0120 }        // blr x9 (unreached — x86_64-windows is the
-                                 // only Windows target this toolchain builds;
-                                 // kept for parity, SPEC §11.6 requires both
-                                 // arches in every asm block)
-    x64   { 0xFF, 0xD0 }        // call rax
-    input arm64 x9 x64 rax = entry
-    input arm64 x0 x64 rcx = arg
-    clobber arm64 { x30, memory }
-    clobber x64 { memory }
-  }
-}
-
-// The fixed green-task trampoline for a compiler-emitted `spawn` (#1622,
-// mirrored from `../../sched/task.bit`'s `schedSpawnTrampoline`) — reached by
-// a direct branch (`rtSpawn` sets this task's pc to `entryOf` this function),
-// so it takes no argument and recovers `entry`/`arg` from the task block
-// itself, exactly as the shared version does. The only difference is the
-// `winTaskInvoke` call below, for the reason the header above gives.
-fn winSpawnTrampoline() {
-  let t = taskAt(schedCurrentTask())
-  let entry = *(t + taskSpawnEntry)
-  let arg = *(t + taskArg)
-  winTaskInvoke(entry, arg)
-  schedTaskExit()
-}
 
 export @nosplit fn spawnBindScheduler(schedAddr: int) {
   gSched = schedAddr
