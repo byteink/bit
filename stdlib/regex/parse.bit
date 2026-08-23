@@ -7,11 +7,22 @@
 // below is bounded by the pattern's length: each iteration consumes at least
 // one byte from `RegexParser.pos`, which only ever advances (parsecursor.bit).
 //
-// `{n,m}` counted repetition and `(?i)`/`(?s)`/`(?m)` inline flags are
-// deliberately not implemented (#2031, #2030) — `applyQuantifier` and
-// parsegroup.bit's `parseSpecialGroup` recognize their syntax only far enough
-// to fail with `regex: {n,m} is not supported yet` / `regex: inline flags are
-// not supported yet` rather than silently mis-parsing them as something else.
+// `{n,m}` counted repetition is deliberately not implemented (#2031) —
+// `applyQuantifier` recognizes its syntax only far enough to fail with
+// `regex: {n,m} is not supported yet` rather than silently mis-parsing it as
+// something else.
+//
+// #2030's inline flags (`(?i)`/`(?s)`/`(?m)`, scoped `(?i:...)`) are threaded
+// through this whole descent as a `RegexFlags` VALUE (`parseflags.bit`),
+// never mutated in place: `parseAlternate` and `parseConcat` each carry their
+// own `cur` and return whatever it became by the time they reach `|`/`)`/end
+// of input, so a caller that passed in flags `F` and gets back flags `F'`
+// simply keeps using `F` for anything after the call — that is the entire
+// "restore on leaving a scoped group" mechanism, with no separate save/restore
+// step anywhere. Only `(?flags)` (no colon) changes what a `parseConcat` call
+// carries forward; a real group (capturing, non-capturing, named, or scoped
+// `(?flags:...)`) always hands back its caller's own flags unchanged, since
+// whatever flags its body used are entirely internal to it.
 
 // Parses `pattern` into an `Ast`, or fails with a `regex: ... at offset N`
 // error naming the first place the grammar breaks down. The only thing that
@@ -20,7 +31,7 @@
 // turned into an error before this returns.
 fn parsePattern(pattern: string): Ast! {
   let p = newRegexParser(pattern)
-  let node = parseAlternate(p)?
+  let (node, _) = parseAlternate(p, defaultFlags())?
   if (!atEnd(p)) {
     fail parseErr(errUnexpectedCloseParen, p.pos)
   }
@@ -30,34 +41,48 @@ fn parsePattern(pattern: string): Ast! {
 // `concat ('|' concat)*` — one `Ast.Alternate` of however many `|`-separated
 // branches there are, or just the first branch's own node when there is
 // only one (no `Alternate` wrapper for a pattern with no `|` at all).
-fn parseAlternate(p: RegexParser): Ast! {
-  let first = parseConcat(p)?
+//
+// Flags set by `(?flags)` in one branch stay set for every later branch of
+// the SAME alternation — per RE2/Go, `(?flags)` takes effect "from that
+// point to the end of the enclosing group", and `|` does not close a group —
+// so `cur` threads across every `parseConcat` call here, not just within one.
+fn parseAlternate(p: RegexParser, flags: RegexFlags): (Ast, RegexFlags)! {
+  let (first, f1) = parseConcat(p, flags)?
+  let cur = f1
   if (atEnd(p) || curByte(p) != '|') {
-    return first
+    return first, cur
   }
   let branches: []Ast = []Ast(0)
   branches = append(branches, first)
   // Bounded: each iteration consumes at least the '|' byte.
   while (!atEnd(p) && curByte(p) == '|') {
     advanceByte(p)
-    let next = parseConcat(p)?
+    let (next, f2) = parseConcat(p, cur)?
+    cur = f2
     branches = append(branches, next)
   }
-  return Ast.Alternate(branches)
+  return Ast.Alternate(branches), cur
 }
 
 // A run of quantified terms, up to the next `|`, `)`, or end of input.
 // Zero terms is `Ast.Empty` (an empty alternation branch, e.g. the `b` in
 // `a|` — nothing, meaning "matches the empty string"); one term is that
-// term itself; more than one is `Ast.Concat`.
-fn parseConcat(p: RegexParser): Ast! {
+// term itself; more than one is `Ast.Concat`. A bare `(?flags)` setting
+// group contributes no term at all — `parseRepeat` returns `Option.None` for
+// it — only an updated `cur` carried into the rest of this loop.
+fn parseConcat(p: RegexParser, flags: RegexFlags): (Ast, RegexFlags)! {
   let items: []Ast = []Ast(0)
-  // Bounded: each iteration parses one term, which consumes >= 1 byte.
+  let cur = flags
+  // Bounded: each iteration parses one term or one flags-setting group,
+  // either of which consumes >= 1 byte.
   while (!atEnd(p) && !atConcatBoundary(p)) {
-    let term = parseRepeat(p)?
-    items = append(items, term)
+    let (maybeTerm, nextFlags) = parseRepeat(p, cur)?
+    cur = nextFlags
+    if (isSome(maybeTerm)) {
+      items = append(items, unwrap(maybeTerm))
+    }
   }
-  return foldConcat(items)
+  return foldConcat(items), cur
 }
 
 fn atConcatBoundary(p: RegexParser): bool {
@@ -75,10 +100,17 @@ fn foldConcat(items: []Ast): Ast {
   return Ast.Concat(items)
 }
 
-// An atom, plus at most one postfix quantifier.
-fn parseRepeat(p: RegexParser): Ast! {
-  let atom = parseAtom(p)?
-  return applyQuantifier(p, atom)?
+// An atom, plus at most one postfix quantifier — or, for a bare `(?flags)`
+// setting group, no atom at all (`Option.None`, `applyQuantifier` never
+// called): a quantifier right after one, e.g. `(?i)*`, then finds nothing to
+// apply to on the NEXT call and fails `errNothingToRepeat`, same as Go.
+fn parseRepeat(p: RegexParser, flags: RegexFlags): (Option<Ast>, RegexFlags)! {
+  let (maybeAtom, nextFlags) = parseAtom(p, flags)?
+  if (isNone(maybeAtom)) {
+    return Option.None, nextFlags
+  }
+  let term = applyQuantifier(p, unwrap(maybeAtom))?
+  return Option.Some(term), nextFlags
 }
 
 // `*`, `+`, `?`, each optionally followed by a lazy `?`. A `{` here is
@@ -119,50 +151,102 @@ fn finishRepeat(p: RegexParser, atom: Ast, min: int, max: int): Ast {
 }
 
 // One atom: a group, a character class, `.`, an escape, or an anchor/literal
-// (`parseAnchorOrLiteral`). Callers only reach here when `!atEnd(p)` and the
-// cursor is not on a concat boundary (`parseConcat`'s loop condition), so
-// there is always at least one byte to consume.
-fn parseAtom(p: RegexParser): Ast! {
+// (`parseAnchorOrLiteral`) — always `Option.Some`, except a bare `(?flags)`
+// setting group (`parsegroup.bit`'s `parseGroup`), which is `Option.None`
+// with an updated `flags` and no `Ast`. Callers only reach here when
+// `!atEnd(p)` and the cursor is not on a concat boundary (`parseConcat`'s
+// loop condition), so there is always at least one byte to consume.
+fn parseAtom(p: RegexParser, flags: RegexFlags): (Option<Ast>, RegexFlags)! {
   let b = curByte(p)
   if (b == '(') {
-    return parseGroup(p)?
+    return parseGroup(p, flags)?
   }
   if (b == '[') {
-    return parseClass(p)?
+    let cls = parseClass(p, flags)?
+    return Option.Some(cls), flags
   }
   if (b == '.') {
     advanceByte(p)
-    return Ast.AnyChar
+    return Option.Some(dotAst(flags)), flags
   }
   if (b == '\\') {
-    return parseEscapeAtom(p)?
+    let esc = parseEscapeAtom(p)?
+    return Option.Some(esc), flags
   }
   if (isQuantifierStartByte(b)) {
     fail parseErr(errNothingToRepeat, p.pos)
   }
-  return parseAnchorOrLiteral(p)
+  return Option.Some(parseAnchorOrLiteral(p, flags)), flags
 }
 
 fn isQuantifierStartByte(b: u8): bool {
   return b == '*' || b == '+' || b == '?'
 }
 
+// `.`: `AnyCharNL` (matches `\n` too) under `(?s)`, `AnyChar` (excludes
+// `\n`) otherwise — RE2/Go's default. Decided here, at parse time, exactly
+// like `(?i)` folding below, so `pike.bit` never needs to consult a flag: the
+// two `Ast`/`Op` variants alone carry the distinction forward.
+fn dotAst(flags: RegexFlags): Ast {
+  if (flags.s) {
+    return Ast.AnyCharNL
+  }
+  return Ast.AnyChar
+}
+
 // `^`, `$`, a literal `{` (only ever a literal here — see `applyQuantifier`),
-// or a literal rune (possibly multi-byte UTF-8).
-fn parseAnchorOrLiteral(p: RegexParser): Ast {
+// or a literal rune (possibly multi-byte UTF-8) — the latter two folded to
+// ASCII-both-cases under `(?i)` (`literalAst`).
+fn parseAnchorOrLiteral(p: RegexParser, flags: RegexFlags): Ast {
   let b = curByte(p)
   if (b == '^') {
     advanceByte(p)
-    return Ast.Anchor(AnchorKind.BeginText)
+    return Ast.Anchor(beginAnchorKind(flags))
   }
   if (b == '$') {
     advanceByte(p)
-    return Ast.Anchor(AnchorKind.EndText)
+    return Ast.Anchor(endAnchorKind(flags))
   }
   if (b == '{') {
     advanceByte(p)
-    return Ast.Literal(rune('{'))
+    return literalAst(rune('{'), flags)
   }
   let r = advanceRune(p)
+  return literalAst(r, flags)
+}
+
+// `^` under `(?m)` is `BeginLine` (holds at position 0 and after any `\n`,
+// `pike.bit`'s `assertHolds`); otherwise `BeginText` (position 0 only) —
+// decided here, positionally, using whatever `flags.m` is active at THIS
+// `^`, not a pattern-wide setting, so `a^(?m)^b` parses its first `^` as
+// `BeginText` and its second as `BeginLine`.
+fn beginAnchorKind(flags: RegexFlags): AnchorKind {
+  if (flags.m) {
+    return AnchorKind.BeginLine
+  }
+  return AnchorKind.BeginText
+}
+
+// `$` under `(?m)` is `EndLine` (holds at `len(s)` and before any `\n`);
+// otherwise `EndText` — which, per Go's regexp/syntax docs ("`$` ... like
+// `\z` not `\Z`"), matches ONLY at the true end of the subject and does NOT
+// match just before a trailing `\n`, unlike Perl's default `$`. `\z` (an
+// escape, `parsecursor.bit`'s `escapeAnchorFor`) is exactly this same
+// `EndText` case and always ignores `(?m)`.
+fn endAnchorKind(flags: RegexFlags): AnchorKind {
+  if (flags.m) {
+    return AnchorKind.EndLine
+  }
+  return AnchorKind.EndText
+}
+
+// `r` as a literal, or — under `(?i)` — as a `Class` holding both ASCII
+// cases (`charclass.bit`'s `ccFoldAscii`; a non-letter `r`, e.g. `{`, folds
+// to just itself, so this is safe to call unconditionally). ASCII-only:
+// full Unicode case folding is #2033, and the docs say so.
+fn literalAst(r: rune, flags: RegexFlags): Ast {
+  if (flags.i) {
+    return Ast.Class(ccFoldAscii(ccAddRune(ccEmpty(), r)))
+  }
   return Ast.Literal(r)
 }
