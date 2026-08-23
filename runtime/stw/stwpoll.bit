@@ -4,47 +4,81 @@
 // this same module. The actual `maybePreempt`/`schedYield` logic lives in
 // `../sched/preempt.bit` (see its own comment on why the split matters), so
 // this one pinned entry point is all `stwSafepoint` needs.
-import { schedMaybeYieldForPreempt } from "../sched"
+//
+// #3560 also reaches into `../sched` from `stwPollNeeded` itself, below, for
+// `schedCurrentWorker`/`preemptRequested`/`wkId` — see that clause's own
+// comment for why, and for the leaf cost it pays.
+import { schedMaybeYieldForPreempt, schedCurrentWorker, preemptRequested, wkId } from "../sched"
 
 // ---------------------------------------------------------------------------
-// `bit_rt_safepoint_needed` — the inlined fast-path guard (#2921)
+// `bit_rt_safepoint_needed` — the SPEC, not what compiled code runs (#2921, #2925/#3169)
 // ---------------------------------------------------------------------------
 //
-// The arm64 backend calls this before the unconditional `bl bit_rt_safepoint`
-// it used to emit at every loop back edge (compiler/arm64call.bit
-// `emitBackEdgeSafepointIfNeeded`), and skips the real poll — the naked
-// snapshot shim plus stwSafepoint/stwPoll/stwPollOn/currentMutatorOn, five
-// stack frames measured at ~53 cycles/iteration — when this returns false. A
-// TRUE LEAF (no calls of its own, so no stack frame at all): #2921's own
-// measurement is that removing the poll entirely gets collatz from 2.09s to
-// 0.36s against a 1.0s acceptance bar, so this only needs to be cheap, not
-// branch-free.
+// #2921 had the arm64 backend call this before the unconditional
+// `bl bit_rt_safepoint` it used to emit at every loop back edge. #2925
+// (arm64) and #3169 (x64) then INLINED this function's own condition
+// directly into each backend's codegen instead of calling it —
+// compiler/codegen.bit:322: "NO BACKEND EMITS `bit_rt_safepoint_needed` ANY
+// MORE". Confirmed empirically on #3560: `nm` on a compiled program with a
+// hot loop shows no `bit_rt_safepoint_needed` symbol at all (dead-stripped,
+// zero callers, zero relocations to it), and the same binary's only
+// safepoint call, at every back edge, is `bl _bit_rt_safepoint`.
 //
-// THE LEAF IS A MEASURED PROPERTY OF THE EMITTED CODE, NOT A STYLE NOTE, AND
-// IT HAS BEEN LOST ONCE ALREADY. #3292 appended the object trigger to the tail
-// below as an `if`-ladder with an overflow-guarded `nextBytes + nextBytes`
-// ceiling. Nothing about that is wrong as a predicate — but it put three more
-// values live across a branch, and this function is register-allocated with a
-// full block-parameter shuffle at EVERY edge, so each one added a `mov` to
-// every edge until the caller-saved budget ran out and x19/x20/x21 spilled.
-// The result was a `sub sp, sp, #0x30` prologue and a five-register reload at
-// every one of the seven returns — charged to the EARLY returns too, which are
-// the whole point of the function. 102 -> 230 instructions, and `matrix`'s
-// 805M back edges paid 168.5 G of them (#3359).
+// So THIS FUNCTION IS THE SPEC both backends' inlined ladders MUST MIRROR
+// EXACTLY (compiler/codegen.bit's header on the shared word-offset table),
+// not the code a compiled program executes. A change here changes nothing
+// about a running program until the two mirrors are updated to match —
+// #3560 found this the hard way: the preempt clause below, alone, does NOT
+// make cooperative preemption observable in a compiled program, because
+// nothing compiled calls this function. The two backends' own mirrors need
+// the identical clause; that is deliberately a separate ticket (bigger,
+// touches two architectures, its own #3359-style regression risk to
+// measure) rather than folded in here.
 //
-// So the tail is deliberately ONE `return` expression rather than an `if`
-// ladder: the same three comparisons written as an `if`/`return` chain
-// measured 190 and kept the frame, the single expression measured 125 without
-// one. That is a fact about this backend's block-parameter shuffle (#1852 is
-// the missing copy-propagation that would make the two forms equal), so
-// re-measure rather than assume if you rewrite it.
+// Every condition below except the preempt clause is still a TRUE LEAF (no
+// calls of its own, so no stack frame at all): #2921's own measurement is
+// that removing the poll entirely gets collatz from 2.09s to 0.36s against a
+// 1.0s acceptance bar, so a leaf guard only needs to be cheap, not
+// branch-free. THE PREEMPT CLAUSE IS NOT A LEAF — `schedCurrentWorker` and
+// `preemptRequested` are real cross-module calls into `../sched`
+// (`optimizeModule` only inlines within one module, compiler/opt.bit:612),
+// so the moment that clause exists in this function's body, the WHOLE
+// FUNCTION stops being a leaf: a function's prologue is emitted once at
+// entry and charged to every return, including the early ones that never
+// reach the call. See that clause's own comment for the measured cost.
 //
-// THE CHECK, cheap enough to run on any change to this function:
+// THE LEAF WAS ALSO LOST ONCE BEFORE FOR A DIFFERENT REASON, AND THE FIX WAS
+// TO STOP ADDING BRANCHES, NOT TO STOP ADDING CONDITIONS. #3292 appended the
+// object trigger to the tail below as an `if`-ladder with an
+// overflow-guarded `nextBytes + nextBytes` ceiling. Nothing about that was
+// wrong as a predicate — but it put three more values live across a branch,
+// and this function is register-allocated with a full block-parameter
+// shuffle at EVERY edge, so each one added a `mov` to every edge until the
+// caller-saved budget ran out and x19/x20/x21 spilled. The result was a
+// `sub sp, sp, #0x30` prologue and a five-register reload at every one of
+// the seven returns — charged to the EARLY returns too, which are the whole
+// point of the function. 102 -> 230 instructions, and `matrix`'s 805M back
+// edges paid 168.5 G of them (#3359). That regression was reachable WITHOUT
+// any call at all, purely from live-value pressure in an if-ladder — a
+// different mechanism than #3560's clause below, which loses the leaf via a
+// real call regardless of ladder-vs-single-expression form.
+//
+// So the byte/object trigger tail is deliberately ONE `return` expression
+// rather than an `if` ladder: the same three comparisons written as an
+// `if`/`return` chain measured 190 and kept the frame, the single expression
+// measured 125 without one. That is a fact about this backend's
+// block-parameter shuffle (#1852 is the missing copy-propagation that would
+// make the two forms equal), so re-measure rather than assume if you rewrite
+// it.
+//
+// THE CHECK, cheap enough to run on any change to this function — since
+// #3560 it is EXPECTED to show a prologue (`sub sp, sp, #N`), not absent
+// one; re-run this after any further change and compare the instruction
+// count and prologue size against #3560's own recorded numbers rather than
+// expecting zero output:
 //
 //   otool -tvV bit-out/lib/aarch64-macos/libbitrt.a ... runtime_stw.o
 //     | sed -n '/^_bit_rt_safepoint_needed:/,/^_[a-zA-Z]/p' | grep 'sub.*sp, sp, #'
-//
-// Any output at all means the leaf is gone and the poll is no longer free.
 //
 // MUST BE A SAFE OVER-APPROXIMATION of `stwPollOn`'s early-return ladder
 // below: returning false here must be provably a no-op there, in EVERY state
@@ -74,6 +108,26 @@ export @nosplit @symbol("bit_rt_safepoint_needed") fn stwPollNeeded(): bool {
   // same as there, because this is the fact the STW rendezvous depends on.
   if (atomicLoad(world + worldStopWord) != 0) {
     return true // a stop is pending
+  }
+  // #3560 -- clause 3: a preempt is pending for the WORKER RUNNING THIS
+  // CALL. Orthogonal to GC state entirely (a task must stay preemptible even
+  // with GC disabled), so this runs before the GC-specific checks below, not
+  // folded into their tail. `schedCurrentWorker()` returns 0 off-task (the
+  // worker's own idle loop, the boot thread -- see its own comment in
+  // ../sched/sched.bit), which this treats the same way
+  // `schedMaybeYieldForPreempt` (../sched/task.bit) already does: a no-op.
+  // `taskAt(w) + wkId` is inlined here as `wNil + (w >> 3) + wkId` rather
+  // than calling `taskAt` -- the same trade this file already makes for
+  // `world`/`g` above, and `taskAt`'s own comment (../sched/task.bit) is why
+  // `>> 3` and not `/ 8`: a shift is one instruction, a signed divide by a
+  // constant that must round toward zero is four.
+  let worker = schedCurrentWorker()
+  if (worker != 0) {
+    let wNil: *i64 = nil
+    let workerId = *(wNil + (worker >> 3) + wkId)
+    if (preemptRequested(workerId)) {
+      return true // a preempt is pending for this worker
+    }
   }
   let gA = gcAddr
   if (gA == 0) {
