@@ -1,0 +1,292 @@
+// Bit standard library — sql module: the database driver contract.
+//
+// This is a CONTRACT with no implementation. No database client ships from
+// here or ever will — drivers land later as packages under `bit/pkg/`
+// (settled direction: #3271, #3461). Shipping the contract from stdlib rather
+// than as a package is deliberate: a contract shipped as a package invites a
+// second, competing one, every driver picks a side, and the ecosystem splits.
+// Go's `database/sql` is the shape this follows.
+//
+// SECURITY: THE ONLY WAY TO SUPPLY A VALUE IS `params []Value`.
+// `query`/`exec` take `sqlText` (the literal the caller wrote) and `params`
+// (an ordered list of typed `Value`s) as two SEPARATE arguments. Nothing in
+// this module — and nothing a conforming driver may do — ever builds
+// `sqlText` by concatenating a `Value` into it: the caller's own SQL text and
+// the caller's own data can never touch as strings. This is the whole
+// injection defense, and it is structural: there is no function anywhere in
+// this file that accepts a pre-interpolated string with values already
+// substituted in, so there is nothing for a driver author to misuse into one.
+//
+// PLACEHOLDER SYNTAX IS NOT SPECIFIED HERE, ON PURPOSE. Postgres numbers its
+// placeholders (`$1`, `$2`, ...); MySQL and SQLite use a positional `?`. This
+// module picks neither: `sqlText` carries whatever placeholder marker the
+// caller and the target driver agree on, and rendering it into the driver's
+// own wire format — replacing `?` markers with `$1`, `$2`, ... or leaving
+// them alone — is entirely the driver's job, done from the ordered `params`
+// list it is given. Baking one database's spelling into this interface would
+// make every other driver fight it later.
+//
+// `exec` REPORTS AFFECTED ROWS, NEVER A ROW SET. Postgres's `RETURNING`
+// clause can turn an insert/update into a query with rows; MySQL has no
+// equivalent. Nothing here may assume an `exec` can return rows — that is
+// why it is typed `int!`, not `Rows!`. A driver that wants to expose
+// `RETURNING` does so through `query`, the same call any `SELECT` uses.
+//
+// WHY `register`/`open` ARE METHODS ON A `Registry` VALUE, NOT PACKAGE-LEVEL
+// GLOBALS. Go's `sql.Register`/`sql.Open` write into one process-wide map so
+// a program can name a driver by string without importing its package for
+// anything but the side effect of registering. Bit has no import-time init
+// hook to run that side effect, and — more fundamentally — module-level state
+// (SPEC §11.11) may only hold untraced scalars, never a `map` or an
+// `interface` value, so a real package-level singleton registry is not
+// expressible today. `Registry` is the ordinary alternative already used
+// elsewhere in stdlib for shared, mutable, driver-style state (see
+// `TlsTicketStore`, stdlib/tls/resume.bit): a program builds one with
+// `newRegistry()`, every driver's setup code calls `reg.register(name, d)`
+// on it, and `reg.open(name, dsn)` is the only thing that ever needs to know
+// which driver a name maps to.
+
+import { Mutex, newMutex } from "std/sync"
+
+// A wire value: the sum type every driver must be able to carry across the
+// boundary between Bit code and a database, in either direction. `Null` is
+// SQL NULL; `Int`/`Float`/`Text`/`Blob` cover every scalar column type a
+// driver maps its own types onto. There is no separate "typed getter" method
+// per variant on `Rows` — `Rows.value` returns a `Value` and the accessor
+// functions below (`asInt`, `asText`, ...) extract it, so a new column type
+// never grows the `Rows`/`Stmt` method set every driver must implement.
+export enum Value { Null, Int(int), Float(f64), Text(string), Blob([]byte) }
+
+// True if v is SQL NULL.
+export fn isNull(v: Value): bool {
+  match (v) {
+    Null => return true
+    _ => return false
+  }
+}
+
+// The typed accessor for an Int value. Fails if v holds any other variant —
+// callers that do not know a column's type ahead of time should `match (v)`
+// directly instead.
+export fn asInt(v: Value): int! {
+  match (v) {
+    Int(n) => return n
+    _ => fail newError("sql: value is not Int")
+  }
+}
+
+// The typed accessor for a Float value. Fails on any other variant.
+export fn asFloat(v: Value): f64! {
+  match (v) {
+    Float(f) => return f
+    _ => fail newError("sql: value is not Float")
+  }
+}
+
+// The typed accessor for a Text value. Fails on any other variant.
+export fn asText(v: Value): string! {
+  match (v) {
+    Text(s) => return s
+    _ => fail newError("sql: value is not Text")
+  }
+}
+
+// The typed accessor for a Blob value. Fails on any other variant.
+export fn asBlob(v: Value): []byte! {
+  match (v) {
+    Blob(b) => return b
+    _ => fail newError("sql: value is not Blob")
+  }
+}
+
+// A database driver: the one thing every concrete driver package implements.
+// `open` takes a driver-specific DSN string (host, credentials, database
+// name — the format is entirely the driver's own) and returns a live
+// connection, or fails with a driver-specific error.
+export interface Driver { open(dsn: string): Conn! }
+
+// A single logical database connection, as handed back by `Registry.open`.
+// Several green threads may hold and use the same `Conn` value at once — see
+// `newRegistry`'s doc comment for how that is made safe.
+//
+// `query` runs SQL expected to produce a row set (`SELECT` and friends);
+// `exec` runs SQL expected only to change rows and reports how many were
+// affected. Neither ever sees a pre-interpolated string — see this file's
+// header comment.
+export interface Conn {
+  query(sqlText: string, params: []Value): Rows!,
+  exec(sqlText: string, params: []Value): int!,
+  prepare(sqlText: string): Stmt!,
+  begin(): Tx!,
+  close(),
+}
+
+// A cursor over a result set. `next` advances to the next row, returning
+// `false` (not an error) once the set is exhausted; a driver-side read
+// failure mid-iteration is reported through the fallible result instead.
+// `columns` is the result set's column names in order; `value` reads column
+// `col` (0-based) of the current row.
+export interface Rows {
+  next(): bool!,
+  columns(): []string,
+  value(col: int): Value,
+  close(),
+}
+
+// A prepared statement, from `Conn.prepare`. `params` is positional, in the
+// same order as the placeholders in the `sqlText` it was prepared from.
+export interface Stmt {
+  query(params: []Value): Rows!,
+  exec(params: []Value): int!,
+  close(),
+}
+
+// An open transaction, from `Conn.begin`. `query`/`exec` behave exactly as
+// `Conn`'s do, scoped to this transaction; `commit`/`rollback` end it —
+// exactly one of the two must be called, and using the `Tx` afterward is a
+// caller bug, same as using a `Conn` after `close`.
+export interface Tx {
+  query(sqlText: string, params: []Value): Rows!,
+  exec(sqlText: string, params: []Value): int!,
+  commit(): ()!,
+  rollback(): ()!,
+}
+
+// The driver registry a program builds once and shares. `register` maps a
+// name to a `Driver`; `open` looks a name up and connects — the only two
+// places anything needs to import a concrete driver package are the call
+// that constructs it and the call that registers it, never the call sites
+// that use the resulting `Conn`.
+export class Registry { drivers: map<string, Driver>, mu: Mutex }
+
+// An empty Registry, ready for `register` calls.
+export fn newRegistry(): Registry {
+  return Registry{ drivers: map<string, Driver>(), mu: newMutex() }
+}
+
+// Adds d under name. Fails if name is already registered — silently
+// replacing one driver with another under a program's back is exactly the
+// kind of bug this registry exists to make loud instead.
+export fn (r: Registry) register(name: string, d: Driver): ()! {
+  r.mu.lock()
+  defer r.mu.unlock()
+  let (_, exists) = r.drivers[name]
+  if (exists) {
+    fail newError("sql: driver already registered: ${name}")
+  }
+  r.drivers[name] = d
+}
+
+// Looks up the driver registered as driverName and opens dsn with it,
+// returning a connection wrapped so that several green threads sharing it
+// never interleave calls on the one underlying socket it represents — see
+// the doc comment on `pooledConn` below. Fails if driverName was never
+// registered, or if the driver's own `open` fails.
+export fn (r: Registry) open(driverName: string, dsn: string): Conn! {
+  r.mu.lock()
+  let (d, ok) = r.drivers[driverName]
+  r.mu.unlock()
+  if (!ok) {
+    fail newError("sql: unknown driver: ${driverName}")
+  }
+  let inner = d.open(dsn)?
+  return pooledConn{ inner: inner, mu: newMutex() }
+}
+
+// pooledConn wraps a driver-supplied Conn with a single-slot Mutex (same
+// mechanism as `std/sync.Mutex`: a capacity-1 channel, so contention parks
+// the caller rather than spinning) so that concurrent callers sharing the
+// `Conn` `Registry.open` returned can never have two calls in flight on the
+// one physical connection at once. This is the connection pool the design
+// calls for, sized at exactly one physical connection per `open()` call —
+// the minimum that satisfies "must not let two green threads interleave on
+// one socket." A driver that wants true N-way concurrency pools several
+// physical connections internally and hands one out per `open`; this
+// wrapper still serializes access to whichever one it gets.
+class pooledConn { inner: Conn, mu: Mutex }
+
+fn (c: pooledConn) query(sqlText: string, params: []Value): Rows! {
+  c.mu.lock()
+  defer c.mu.unlock()
+  return c.inner.query(sqlText, params)?
+}
+
+fn (c: pooledConn) exec(sqlText: string, params: []Value): int! {
+  c.mu.lock()
+  defer c.mu.unlock()
+  return c.inner.exec(sqlText, params)?
+}
+
+fn (c: pooledConn) prepare(sqlText: string): Stmt! {
+  c.mu.lock()
+  defer c.mu.unlock()
+  let stmt = c.inner.prepare(sqlText)?
+  return pooledStmt{ inner: stmt, mu: c.mu }
+}
+
+// begin holds the lock for the whole transaction rather than just for this
+// call: unlike query/exec/prepare, a transaction genuinely needs exclusive
+// use of the connection until it ends, not only for the duration of one
+// call. pooledTx.commit/rollback release it.
+fn (c: pooledConn) begin(): Tx! {
+  c.mu.lock()
+  let tx = c.inner.begin() catch e {
+    c.mu.unlock()
+    fail e
+  }
+  return pooledTx{ inner: tx, mu: c.mu }
+}
+
+fn (c: pooledConn) close() {
+  c.mu.lock()
+  defer c.mu.unlock()
+  c.inner.close()
+}
+
+// pooledStmt shares its parent pooledConn's Mutex, so a statement prepared
+// from a pooled Conn keeps serializing on the same underlying socket as
+// every other call through that Conn — not just calls made through the
+// Stmt itself.
+class pooledStmt { inner: Stmt, mu: Mutex }
+
+fn (s: pooledStmt) query(params: []Value): Rows! {
+  s.mu.lock()
+  defer s.mu.unlock()
+  return s.inner.query(params)?
+}
+
+fn (s: pooledStmt) exec(params: []Value): int! {
+  s.mu.lock()
+  defer s.mu.unlock()
+  return s.inner.exec(params)?
+}
+
+fn (s: pooledStmt) close() {
+  s.mu.lock()
+  defer s.mu.unlock()
+  s.inner.close()
+}
+
+// pooledTx already holds its parent pooledConn's lock — acquired by
+// pooledConn.begin before this value was constructed — so its own
+// query/exec must not lock again; only commit/rollback release it, ending
+// the exclusive hold begin() started.
+class pooledTx { inner: Tx, mu: Mutex }
+
+fn (t: pooledTx) query(sqlText: string, params: []Value): Rows! {
+  return t.inner.query(sqlText, params)?
+}
+
+fn (t: pooledTx) exec(sqlText: string, params: []Value): int! {
+  return t.inner.exec(sqlText, params)?
+}
+
+fn (t: pooledTx) commit(): ()! {
+  defer t.mu.unlock()
+  t.inner.commit()?
+}
+
+fn (t: pooledTx) rollback(): ()! {
+  defer t.mu.unlock()
+  t.inner.rollback()?
+}
