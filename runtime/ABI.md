@@ -1551,6 +1551,7 @@ defined exactly once).
 | `bit_rt_fs_sync`      | `(fd: i64) -> i64` (§14, `0` on success, `-1` on failure; Darwin uses `F_FULLFSYNC`, falling back to bare `fsync` only on `ENOTSUP` — bare `fsync` alone does not flush the drive's write cache on that platform) |
 | `bit_rt_fs_pread_w`   | `(fd: i64, buf: usize, max: i64, off: i64) -> i64` (§14, #3463, positional read: `buf` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not `RtBytes`, not NUL-terminated, same convention `bit_rt_fs_is_symlink_w` uses; byte count transferred, or negative on any I/O error; a short count, including 0 at end of file, is NOT an error) |
 | `bit_rt_fs_pwrite_w`  | `(fd: i64, buf: usize, n: i64, off: i64) -> i64` (§14, #3463, positional write: same `buf` convention as `bit_rt_fs_pread_w`; byte count transferred, or negative on any I/O error; extends the file or leaves a zero-filled hole as POSIX `pwrite(2)` does) |
+| `bit_rt_fs_open_rw_w` | `(words: usize, n: i64) -> i64` (§14, #3533, read-write open: same packed-bytes `words`/`n` convention as `bit_rt_fs_is_symlink_w`; `O_RDWR\|O_CREAT`, deliberately WITHOUT `O_TRUNC` -- creates `path` if absent, never destroys existing content on open; fd, or -1. Darwin/Linux only -- windows deferred, see runtime/root/{darwin,linux}/fsopenrw.bit and fs.bit) |
 | `bit_rt_fs_cwd`       | `() -> *const RtBytes` (§14, the process's current working directory, or the empty string on any failure; #3501) |
 | `bit_rt_test_index`   | `() -> i64` (§16)                                      |
 | `bit_rt_floor`        | `(x: f64) -> f64` (§17)                                |
@@ -1930,6 +1931,7 @@ bit_rt_fs_read(fd, max: i64)      -> string     // up to max bytes; "" at EOF
 bit_rt_fs_write(fd, s)            -> i64        // bytes written, or -1
 bit_rt_fs_pread_w(fd, buf, max, off) -> i64     // positional read; count, or negative (#3463)
 bit_rt_fs_pwrite_w(fd, buf, n, off)  -> i64     // positional write; count, or negative (#3463)
+bit_rt_fs_open_rw_w(words, n)     -> i64        // O_RDWR|O_CREAT, no O_TRUNC; fd, or -1 (#3533)
 bit_rt_fs_sync(fd)                -> i64        // 0, or -1 (#3462)
 bit_rt_fs_cwd()                   -> string     // cwd, or "" on failure (#3501)
 bit_rt_fs_close(fd)               -> i64        // always 0
