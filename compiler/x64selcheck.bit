@@ -248,6 +248,110 @@ fn checkX64BinarySel() {
   assert(len(cxSubLhs.buf.code) == len(cx.buf.code))
 }
 
+// #3082: overflow-checked signed add/sub in debug builds. The JCC/CALL
+// sequence's rel32 is ALWAYS +5 regardless of where it sits in the buffer --
+// it jumps over exactly the 5-byte relocated `call`, nothing else -- so the
+// full byte sequence is a position-independent golden, not just a suffix
+// check like checkX64DivSel's div-by-zero sequence above.
+fn checkX64OverflowTrap() {
+  let w64 = mkWidth(8, RegClass.Int, true)
+  let w32u = mkWidth(4, RegClass.Int, false)
+  let w32s = mkWidth(4, RegClass.Int, true)
+
+  // Release (cx.debug == false, xTestCtx's default): byte-identical to the
+  // pre-#3082 sequence -- this IS the regression guard for the release path,
+  // since these hex strings predate this ticket and are unchanged by it.
+  let cxRel = xTestCtx()
+  xEmitBinaryInt(cxRel, XArith.Add, 0, 0, 1, w64)
+  assert(xHex(cxRel.buf) == "4c8b95f0ffffff4989c34d01d34c89d8")
+
+  // Debug, i64 (width 8): OF from the 64-bit add is authoritative, so the
+  // trap is JUST a jump-not-overflow over the call -- no narrowing needed.
+  // 0f 81 05000000  jno +5 (skip the 5-byte call)
+  // e8 00000000     call bit_rt_panic_overflow (relocated at link time)
+  let cxDbg = xTestCtx()
+  cxDbg.debug = true
+  xEmitBinaryInt(cxDbg, XArith.Add, 0, 0, 1, w64)
+  assert(xHex(cxDbg.buf) ==
+    "4c8b95f0ffffff4989c34d01d3" + "0f8105000000e800000000" + "4c89d8")
+  assert(len(cxDbg.relocs) == 1 && cxDbg.relocs[0].symbol == "bit_rt_panic_overflow")
+
+  // Debug, unsigned: SPEC section 13.5 -- unsigned always wraps, even in a
+  // debug build. Byte-identical to the release sequence above; cx.debug alone
+  // must never be enough to trigger the trap.
+  let cxUns = xTestCtx()
+  cxUns.debug = true
+  xEmitBinaryInt(cxUns, XArith.Add, 0, 0, 1, mkWidth(8, RegClass.Int, false))
+  assert(xHex(cxUns.buf) == xHex(cxRel.buf))
+
+  // Debug, i32 (width 4, signed): OF from the 64-bit add does not reflect a
+  // 32-bit overflow (operands live sign-extended in the full register), so
+  // this re-narrows a COPY (r12, xScratch3) and compares it against the
+  // pre-narrow value in r11 (xScratch1) before deciding whether to trap.
+  // 4d 89 dc          mov %r11, %r12
+  // 4d 63 e4          movslq %r12d, %r12   (canon-narrow the copy to i32)
+  // 4d 39 e3          cmp %r12, %r11       (pre-narrow vs re-narrowed)
+  // 0f 84 05000000    je +5 (equal -> no overflow -> skip the call)
+  // e8 00000000       call bit_rt_panic_overflow
+  let cxNarrow = xTestCtx()
+  cxNarrow.debug = true
+  xEmitBinaryInt(cxNarrow, XArith.Add, 0, 0, 1, w32s)
+  // The trailing "4d63db" is xEmitBinaryInt's OWN pre-existing xCanonNarrow
+  // call on xScratch1 (r11) -- unrelated to the trap, it always ran here
+  // (checkX64BinarySel's cx3 test above already covers it in isolation) and
+  // still runs AFTER the trap to finalize the width-canonical result.
+  assert(xHex(cxNarrow.buf) ==
+    "4c8b95f0ffffff4989c34d01d3" +
+    "4d89dc4d63e44d39e30f8405000000e800000000" +
+    "4d63db" +
+    "4c89d8")
+
+  // Debug, i32 UNSIGNED: still no trap at all -- the narrow-width path is
+  // ALSO gated on w.signed, not just w.bytes < 8. Compared against a RELEASE
+  // width-4-unsigned baseline (not cxRel, which is width 8) -- unsigned
+  // narrowing itself still emits bytes (checkX64BinarySel's cx3 above), so
+  // the only claim this makes is "cx.debug changes nothing for unsigned".
+  let cxNarrowUnsRel = xTestCtx()
+  xEmitBinaryInt(cxNarrowUnsRel, XArith.Add, 0, 0, 1, w32u)
+  let cxNarrowUns = xTestCtx()
+  cxNarrowUns.debug = true
+  xEmitBinaryInt(cxNarrowUns, XArith.Add, 0, 0, 1, w32u)
+  assert(xHex(cxNarrowUns.buf) == xHex(cxNarrowUnsRel.buf))
+
+  // Sub takes the identical trap shape as Add -- xMaybeOverflowTrap does not
+  // branch on the arithmetic op, only on cx.debug/w.signed/w.bytes.
+  let cxSub = xTestCtx()
+  cxSub.debug = true
+  xEmitBinaryInt(cxSub, XArith.Sub, 0, 0, 1, w64)
+  assert(len(cxSub.buf.code) == len(cxDbg.buf.code))
+
+  // The #1853 imm32 fold path (xEmitArithImmInt, reached via
+  // xTryAddSubImmFold) must ALSO trap in debug builds -- a constant operand
+  // (`x + 1`) is exactly the shape a hand-written overflow test uses, and it
+  // is a SEPARATE emitter from the register-register path above.
+  //
+  // xTryAddSubImmFold recomputes `w` itself from `cx.f.instrs[dst].ty`
+  // (widthOf) rather than trusting the `w` xEmitBinaryInt received -- so the
+  // dst instr's type must be a REAL signed i64, not xTestCtx's default
+  // BlockParam(ty=0), which is TypeKind.Invalid and widthOf's boxed-handle
+  // fallback (mkWidth(8, RegClass.Int, false), UNSIGNED) -- silently
+  // defeating the trap the same way the narrow-unsigned case legitimately
+  // does, but for the wrong reason. primType reads the SAME ctx xTestCtx
+  // already built (newXCtx -> newTypeContext registers every prim), so no
+  // second TypeContext is needed.
+  let cxFoldDbg = xTestCtx()
+  cxFoldDbg.debug = true
+  let i64Ty = primType(cxFoldDbg.ctx, 3) // 3 == i64 (widthOf's own prim table)
+  cxFoldDbg.f.instrs[0] = mkInstr(Op.BlockParam, i64Ty)
+  let cFold = mkInstr(Op.ConstInt, i64Ty)
+  cFold.ival = 5
+  cxFoldDbg.f.instrs[1] = cFold
+  xEmitBinaryInt(cxFoldDbg, XArith.Add, 0, 0, 1, w64)
+  // mov %rax,%r11 ; add $5,%r11 ; [trap] ; mov %r11,%rax
+  assert(xHex(cxFoldDbg.buf) ==
+    "4989c3" + "4981c305000000" + "0f8105000000e800000000" + "4c89d8")
+}
+
 fn checkX64DivSel() {
   let w64 = mkWidth(8, RegClass.Int, true)
 
