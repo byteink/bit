@@ -11,13 +11,7 @@
 # `full` IS A VERDICT, NOT AN ACTION, UNLESS YOU PASS --full (#2872). Without
 # --full, a diff that resolves to `full` prints the bucket and REASON and
 # exits 3 — it runs NOTHING, least of all the 18-18.5 minute `./make test`.
-# To actually verify a diff that lands here, run `scripts/gate.sh --full` or
-# `./make test` directly. In THIS repo's own workflow that full run is
-# batched once per push by whoever integrates (CLAUDE.md's verify-loop rule:
-# "the full suite runs once per push, and nobody else runs it at all") — but
-# that batching is a convention for this repo's own contributors, not a
-# substitute for verifying your own change if you have no integrator to
-# batch it for you.
+# See exit code 3 below for how to actually verify a diff that lands here.
 #
 # Usage:
 #   scripts/gate.sh                    # scope to `main...HEAD` PLUS the working tree
@@ -155,6 +149,13 @@
 # which feeds the runtime rebuild fingerprint) still falls through to `full` —
 # under-selection is the failure this script exists to prevent, so a prefix
 # only gets a prose exception once it's proven output-irrelevant.
+#
+# scripts/** IS DELIBERATELY IN THAT "any other" set (#2745), not a gap: a
+# scoped bucket was considered and rejected — this file's 800-line ceiling
+# and the assert_full_is_superset() invariant (gate-buildsteps.sh:239-272)
+# both block it. Run `bash -n <script>` plus the one changed differential
+# directly instead of `--full`; see gate-filemap.sh's header for the full
+# reasoning.
 #
 # THREE NARROW EXCEPTIONS (#2435, #3055), because registering a gate is
 # mandatory in this repo and otherwise forces `full` on every single ticket
