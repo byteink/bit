@@ -1,0 +1,317 @@
+// tools/fuzz/selfcheck.bit — run N generated self-checking Bit programs,
+// fail on the first one that does not terminate with `OK <n>` on stdout and
+// exit 0 (#2606, epic #1907).
+//
+// Drives tools/fuzz/genprog.bit (#2605), which writes a complete Bit program
+// to stdout for a given `--seed`. That program carries its own oracle: it
+// prints `OK <count>` and exits 0 when every internal check passes, or
+// `FUZZFAIL ...` to stderr and exits 3 on the first mismatch (see genprog.bit's
+// header for why that oracle needs no second compiler or prior release —
+// #1857's silent wrong-answer bug is exactly the shape this exists to catch,
+// per epic #1907's constraint against a crash-only oracle).
+//
+// Run: `bit run tools/fuzz/selfcheck.bit -- --seed <n> --count <n>`.
+//
+//   --seed <n>   first seed to test          (default 1)
+//   --count <n>  how many seeds to test       (default 100)
+//
+// For each seed from --seed to --seed+--count-1: generate the program,
+// compile it, run it. ANY of the following is a failure — compiler
+// non-zero exit, generated-program exit code other than 0, or a missing
+// `OK ` line on its stdout even when it exited 0 (constraint: never treat
+// "no crash" as a pass). On the first failure, prints exactly one line to
+// stderr:
+//
+//   FAIL seed=<n> reason=<compile|wrongvalue|hang> repro: bit run tools/fuzz/genprog.bit -- --seed <n>
+//
+// and exits 1. `reason=hang` is reserved for the RUN stage timing out
+// (Power of 10 rule 2: every subprocess here is bounded, never awaited
+// unboundedly) — a generated program that runs longer than 30s is killed and
+// counted as a hang, never silently retried. `reason=compile` covers both a
+// non-zero `bit build` exit and a compile that itself times out, plus the
+// (unreachable in a correct build) case where the compiled artifact could not
+// even be exec'd. `reason=wrongvalue` covers everything else that reaches the
+// RUN stage and is not right: a non-zero exit (including the generated
+// program's own `FUZZFAIL`/exit 3), a fatal signal, or a clean exit 0 with no
+// `OK ` line.
+//
+// On full success: `PASS: <count> programs, 0 failures (seed=<start>)`, exit 0.
+//
+// Uses the compiler binary named by the `BIT` environment variable, falling
+// back to `./bit-out/bin/bit`. Every generated program and every compiled
+// artifact is written under `$TMPDIR` (never inside the repo — a constraint
+// from the ticket), in a directory unique to this run so two concurrent
+// invocations cannot clobber each other's scratch files.
+
+import { args, envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir } from "std/fs"
+import { parseInt, hasPrefix, split } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// --- bounds (Power of 10 rule 2: every loop and every subprocess wait below
+// is statically bounded) -----------------------------------------------------
+
+// Ceiling on --count, so a typo cannot turn this into an unbounded loop.
+const maxCount: int = 10000
+
+// The RUN stage's ceiling — ticket item 4, verbatim: a generated program that
+// runs longer than this is killed and counted as a hang.
+const runTimeoutMs: int = 30000
+
+// The COMPILE stage's ceiling (both the one-time genprog.bit build and every
+// per-seed `bit build`). Generous: a real compile of either is well under a
+// second on this project's own hardware; this only bounds a genuine hang.
+const compileTimeoutMs: int = 60000
+
+// The GENERATE stage's ceiling (running the already-built genprog binary for
+// one seed). genprog.bit is pure, bounded arithmetic with no I/O beyond the
+// two small writes this harness redirects, so this is headroom, not a
+// realistic budget.
+const genTimeoutMs: int = 30000
+
+// --- failure -----------------------------------------------------------------
+
+fn die(msg: string) {
+  eprint("${msg}\n")
+  exit(1)
+}
+
+// The one message shape ticket item 5 specifies, verbatim. Reserved for a
+// classified per-seed finding — never used for a harness-level failure (a
+// broken genprog.bit build, a bad $TMPDIR): those go through `die` instead,
+// because "compile/wrongvalue/hang" describes the GENERATED program under
+// test, not this harness's own setup.
+fn failSeed(seed: int, reason: string) {
+  eprint("FAIL seed=${seed} reason=${reason} repro: bit run tools/fuzz/genprog.bit -- --seed ${seed}\n")
+  exit(1)
+}
+
+// --- argv --------------------------------------------------------------------
+
+class Args {
+  seed: int,
+  count: int,
+}
+
+fn usageFail() {
+  eprint("usage: selfcheck [--seed <n>] [--count <n>]\n")
+  exit(2)
+}
+
+fn parseIntArg(s: string, flag: string): int {
+  return parseInt(s) catch _ {
+    eprint("selfcheck: ${flag} value '${s}' is not an integer\n")
+    exit(2)
+    0
+  }
+}
+
+fn nextArg(a: []string, i: int): int {
+  usageFail()
+  return i + 1
+}
+
+fn parseArgs(): Args {
+  let a = args()
+  let seed = 1
+  let count = 100
+  let i = 1
+  while (i < len(a)) {
+    if (a[i] == "--seed" && i + 1 < len(a)) {
+      seed = parseIntArg(a[i + 1], "--seed")
+      i = i + 2
+    } else if (a[i] == "--count" && i + 1 < len(a)) {
+      count = parseIntArg(a[i + 1], "--count")
+      i = i + 2
+    } else {
+      i = nextArg(a, i)
+    }
+  }
+  validateCount(count)
+  return Args{ seed: seed, count: count }
+}
+
+// A missing --count is a fine 0 to allow through argument parsing above, but
+// a green "PASS: 0 programs, 0 failures" is exactly the vacuous-report shape
+// this project refuses elsewhere (tests/bit/fuzz.bit's own BIT_FUZZ_SECONDS
+// check) — so it is validated here, not merely defaulted.
+fn validateCount(count: int) {
+  if (count <= 0) {
+    die("selfcheck: --count must be > 0; 0 would report a green run of zero programs")
+  }
+  if (count > maxCount) {
+    die("selfcheck: --count ${count} exceeds the ${maxCount} ceiling")
+  }
+}
+
+// --- subprocess plumbing ------------------------------------------------------
+//
+// `osRunBounded` execs a path directly with no argv of its own (ABI.md §19),
+// so every command line below is a generated `#!/bin/sh` wrapper — the same
+// shape tests/bit/fuzz.bit's writeRunner uses, and the only way to bound a
+// wait AND redirect stdout/stderr to a file at once.
+
+fn writeExecScript(path: string, cmdLine: string) {
+  writeFile(path, "#!/bin/sh\nexec ${cmdLine}\n") catch e {
+    die("selfcheck: write ${path}: ${e.message()}")
+  }
+  if (fsChmod(path, 493) != 0) {
+    die("selfcheck: chmod +x failed: ${path}")
+  }
+}
+
+// Every path this run touches, all under one $TMPDIR scratch directory and
+// reused across seeds: each stage's script and output are overwritten before
+// the next seed starts, and every stage runs to completion — bounded —
+// before the next one is written, so there is never a race between seeds.
+class Paths {
+  genExe: string,
+  srcPath: string,
+  genScript: string,
+  genErr: string,
+  exePath: string,
+  compileScript: string,
+  compileLog: string,
+  runScript: string,
+  outPath: string,
+  errPath: string,
+}
+
+// Builds tools/fuzz/genprog.bit ONCE, so an N-seed run does not pay a
+// `bit build` of it per seed. A failure here is this harness's own setup
+// breaking, not a finding about the compiler under test — hence `die`, not
+// `failSeed`.
+fn buildGenerator(bin: string, workDir: string): string {
+  let genExe = "${workDir}/genprog"
+  let buildLog = "${workDir}/genprog-build.log"
+  let script = "${workDir}/genprog-build.sh"
+  writeExecScript(
+    script,
+    "\"${bin}\" build tools/fuzz/genprog.bit -o \"${genExe}\" >\"${buildLog}\" 2>&1",
+  )
+  let rc = osRunBounded(script, compileTimeoutMs)
+  if (rc != 0) {
+    die("selfcheck: failed to build tools/fuzz/genprog.bit (rc=${rc}); see ${buildLog}")
+  }
+  return genExe
+}
+
+// The COMPILE and RUN wrapper scripts are the same shape for every seed
+// (only the generated source's own content changes), so they are written
+// once here rather than once per seed.
+fn setupPaths(bin: string, workDir: string, genExe: string): Paths {
+  let srcPath = "${workDir}/prog.bit"
+  let exePath = "${workDir}/prog"
+  let outPath = "${workDir}/prog.out"
+  let errPath = "${workDir}/prog.err"
+  let compileLog = "${workDir}/compile.log"
+  let compileScript = "${workDir}/compile.sh"
+  let runScript = "${workDir}/run.sh"
+  writeExecScript(
+    compileScript,
+    "\"${bin}\" build \"${srcPath}\" -o \"${exePath}\" >\"${compileLog}\" 2>&1",
+  )
+  writeExecScript(runScript, "\"${exePath}\" >\"${outPath}\" 2>\"${errPath}\"")
+  return Paths{
+    genExe: genExe,
+    srcPath: srcPath,
+    genScript: "${workDir}/gen.sh",
+    genErr: "${workDir}/gen.err",
+    exePath: exePath,
+    compileScript: compileScript,
+    compileLog: compileLog,
+    runScript: runScript,
+    outPath: outPath,
+    errPath: errPath,
+  }
+}
+
+// --- per-seed check ------------------------------------------------------------
+
+// Regenerates `p.genScript` because it is the only stage whose command line
+// changes between seeds (it embeds the seed number). A non-zero or timed-out
+// generation is a harness failure, not a per-seed finding: genprog.bit is a
+// fixed, deterministic, pure-arithmetic generator (#2605) with nothing left
+// to discover about IT here.
+fn generateSource(p: Paths, seed: int) {
+  writeExecScript(p.genScript, "\"${p.genExe}\" --seed ${seed} >\"${p.srcPath}\" 2>\"${p.genErr}\"")
+  let rc = osRunBounded(p.genScript, genTimeoutMs)
+  if (rc != 0) {
+    die("selfcheck: seed ${seed}: generating the program failed or timed out (rc=${rc}); see ${p.genErr}")
+  }
+}
+
+// ABI.md §19's `osRunBounded` result codes, mapped onto this ticket's three
+// reasons. -2 is the RUN stage's own timeout (hang). -1/126/127 mean the
+// compiled artifact could not even be exec'd — a compile-stage defect from
+// the caller's point of view, even though it surfaces here. Everything else
+// that reached this stage compiled and launched, so it is a wrong answer: a
+// non-zero exit (including the generated program's own FUZZFAIL/exit 3) or a
+// fatal signal.
+fn classifyRunRc(rc: int): string {
+  if (rc == -2) {
+    return "hang"
+  }
+  if (rc == -1 || rc == 126 || rc == 127) {
+    return "compile"
+  }
+  return "wrongvalue"
+}
+
+// Constraint, verbatim: a missing `OK ` line is a failure even with no
+// crash. genprog.bit's only stdout write is `OK ${totalChecks}\n`, so a
+// present-and-correct run always has exactly one line with this prefix.
+fn hasOkLine(outPath: string): bool {
+  let text = readFile(outPath) catch _ {
+    ""
+  }
+  let lines = split(text, "\n")
+  for l of lines {
+    if (hasPrefix(l, "OK ")) {
+      return true
+    }
+  }
+  return false
+}
+
+fn checkOneSeed(p: Paths, seed: int) {
+  generateSource(p, seed)
+
+  let compileRc = osRunBounded(p.compileScript, compileTimeoutMs)
+  if (compileRc != 0) {
+    failSeed(seed, "compile")
+  }
+
+  let runRc = osRunBounded(p.runScript, runTimeoutMs)
+  if (runRc != 0) {
+    failSeed(seed, classifyRunRc(runRc))
+  }
+  if (!hasOkLine(p.outPath)) {
+    failSeed(seed, "wrongvalue")
+  }
+}
+
+// --- entry ---------------------------------------------------------------------
+
+fn main() {
+  let bin = envOr("BIT", "./bit-out/bin/bit")
+  let a = parseArgs()
+
+  let tmpBase = envOr("TMPDIR", "/tmp")
+  let workDir = "${tmpBase}/bit-selfcheck-${uuidFormat(uuidV4())}"
+  mkdir(workDir) catch e {
+    die("selfcheck: mkdir ${workDir}: ${e.message()}")
+  }
+
+  let genExe = buildGenerator(bin, workDir)
+  let p = setupPaths(bin, workDir, genExe)
+
+  let seed = a.seed
+  let n = 0
+  while (n < a.count) {
+    checkOneSeed(p, seed)
+    seed = seed + 1
+    n = n + 1
+  }
+  print("PASS: ${a.count} programs, 0 failures (seed=${a.seed})\n")
+}
