@@ -1,0 +1,187 @@
+// Core (platform-free) half of the `bit_rt_net_*` ABI marshalling that used to
+// be duplicated byte-for-byte in runtime/net/{linux,darwin}/netabi.bit (#2552,
+// #1710's provider-duplication sweep; see docs/development/provider-duplication.md's
+// `net` section for the full inventory). Pulled up here: string/byte-pointer
+// accessors over the managed `string` representation, and the per-worker UDP
+// last-sender scratch (state and its accessors). All pure arithmetic and byte
+// marshalling, no OS call anywhere.
+//
+// STILL split per provider, and correctly so: the ABI wrapper functions
+// (`netAbiAccept`, `netAbiListen`, `netAbiRead`, `netAbiUdpRecv`, ...) forward
+// to the socket ENGINE (`netAcceptTcp`, `netListenTcp`, `netReadSock`,
+// `netRecvFrom`, ...), which is genuinely OS-specific — a raw `syscall()` on
+// Linux, a libSystem `extern fn` on Darwin — and stays in each provider. Their
+// SOURCE TEXT is also byte-identical between the two providers, which is what
+// made #2550's audit list them as candidates, but a textual match is not
+// sufficient: a platform-free file cannot reach a provider-only symbol without
+// either an `extern fn` (which would need a call-site rename to the provider's
+// pinned `bit_rt_port_*` ABI name — a real body change, not a pure move) or
+// reintroducing the SEAM 1 architecture linux/netabi.bit's own header warns
+// against. See the #2552 ticket comment for the full 19-function list this
+// excludes and why.
+
+// `rtStrAlloc` is already imported from "../root" by this module's sibling
+// net.bit (imports are module-scoped, same rule ../linux/netabi.bit's own
+// header documents) — importing it again here would be an E0042 redeclaration.
+import { strPtr, strLen, rtStringSlice } from "../root"
+import { loadWord, loadByte, storeByte } from "../gc"
+import { schedCurrentWorker, wkId, schedMaxWorkers, taskAt } from "../sched"
+
+// ---------------------------------------------------------------------------
+// Marshalling helpers
+// ---------------------------------------------------------------------------
+
+// A raw byte pointer at `addr`. `base + addr` on a nil `*u8` is the project's
+// idiom for turning an address held as `int` back into a pointer.
+export @symbol("bit_rt_port_net_u8_at") @nosplit fn u8At(addr: int): *u8 {
+  let base: *u8 = nil
+  return base + addr
+}
+
+// A `string` object's inline byte pointer and its length (ABI.md §2: a
+// `{ptr, len}` header whose `ptr` addresses the object's own bytes).
+export @symbol("bit_rt_port_net_str_data") @nosplit fn strData(s: int): *u8 {
+  return u8At(loadWord(s + strPtr))
+}
+
+export @symbol("bit_rt_port_net_str_size_of") @nosplit fn strSizeOf(s: int): int {
+  return loadWord(s + strLen)
+}
+
+// `n` packed bytes at raw address `src`, copied into a fresh `string`. Returns 0
+// on heap exhaustion.
+//
+// `@nosplit`, and that is the whole point of the function existing (#1668): the
+// entire raw lifetime — allocate, take the interior pointer, fill — is inside
+// this one poll-free body, so no collection can happen between the allocation
+// and the last write to it. `src` must point into memory the CALLER keeps alive,
+// which for every caller here is a managed `[]i64` local. Same contract, and the
+// same reason, as `runtime/root/floats.bit`'s `packLowBytes`.
+export @symbol("bit_rt_port_net_str_from_packed") @nosplit fn strFromPacked(src: int, n: int): int {
+  let out = rtStrAlloc(n)
+  if (out == 0) {
+    return 0
+  }
+  let dst = loadWord(out + strPtr)
+  let i = 0
+  while (i < n) { // bounded by `n`; the body always advances `i`
+    storeByte(dst + i, loadByte(src + i))
+    i = i + 1
+  }
+  return out
+}
+
+// Words of `[]i64` scratch needed to hold `nbytes` packed bytes.
+export @symbol("bit_rt_port_net_scratch_words") @nosplit fn scratchWords(nbytes: int): int {
+  return (nbytes + 7) / 8
+}
+
+// A dotted quad from four packed octets, as a fresh string. `netFormatOctets`
+// writes at most 15 bytes into a scratch; the result is trimmed to its report.
+//
+// `@nosplit` (#1668): `fmt` is a fresh GC string held only as a raw `int` and
+// `strData(fmt)` is an interior pointer into it. `netFormatOctets` is pure
+// formatting over `*u8` — it never parks and never allocates — so the whole
+// sequence closes poll-free and the string cannot be swept mid-format.
+export @symbol("bit_rt_port_net_format_quad") @nosplit fn formatQuad(octets: *u8): int {
+  let fmt = rtStrAlloc(15)
+  if (fmt == 0) {
+    return emptyStr()
+  }
+  let flen = netFormatOctets(octets, strData(fmt))
+  return rtStringSlice(fmt, 0, flen)
+}
+
+// ---------------------------------------------------------------------------
+// UDP last-sender scratch (#3272, #2552)
+// ---------------------------------------------------------------------------
+//
+// One `[4]i64` sockaddr and one valid flag PER WORKER SLOT (indexed by
+// `wkId`), not a single shared pair — a second task on a second OS thread
+// racing `netAbiUdpRecv`/`netAbiUdpSend` (both still provider-local: they call
+// the OS-specific `netRecvFrom`/`netSendTo`) would otherwise clobber this
+// state. `netAbiUdpRecv` fills a slot only AFTER its `netRecvFrom` park
+// returns (the task's own worker id can change across a park), and
+// `netAbiUdpSenderHost`/`_port` below read it back with no further park in
+// between — the same adjacency guarantee, now scoped to one task's own worker
+// rather than assumed process-wide. Full history in the git blame of the
+// providers' old copy of this section.
+//
+// This state and its accessors are pure arithmetic/byte access with no OS
+// call, hence pulled up here; `netAbiUdpBind`/`Send`/`Recv` themselves stay
+// provider-local because they call the OS-specific socket engine.
+
+// This file's own array capacity for the per-worker scratch below — MUST
+// equal `udpSenderBuf`'s literal length / 4 and `udpSenderValid`'s literal
+// length. Independent from `schedMaxWorkers`; `udpSenderSlot` bounds by both.
+const udpSenderSlots: int = 32
+
+// One `[4]i64` sockaddr slot and one valid flag per worker, flattened: slot
+// `i`'s sockaddr is words `i*4 .. i*4+3` of `udpSenderBuf`. 128 = 32 * 4.
+let udpSenderBuf: [128]i64
+let udpSenderValid: [32]i64
+
+// The word address of slot `slot`'s sockaddr.
+export @symbol("bit_rt_port_net_udp_sender_word_at") @nosplit fn udpSenderWordAt(slot: int): *i64 {
+  return ptrOf(udpSenderBuf) + slot * 4
+}
+
+// Slot `slot`'s sockaddr as a `*u8`, for the socket-engine calls that read it.
+export @symbol("bit_rt_port_net_udp_sender_addr") @nosplit fn udpSenderAddr(slot: int): *u8 {
+  return u8At(int(udpSenderWordAt(slot)))
+}
+
+// The word address of slot `slot`'s valid flag.
+export @symbol("bit_rt_port_net_udp_valid_at") @nosplit fn udpValidAt(slot: int): *i64 {
+  return ptrOf(udpSenderValid) + slot
+}
+
+// The calling task's own worker's slot index, or -1 if there is no current
+// task/worker (defensive only — every caller only ever runs as a task; mirrors
+// `../root/darwin/time.bit`'s `timeScratch` `w == 0` fallback). `wkId` is the
+// index `schedInit` assigns each worker at boot (`../sched/worker.bit:149`),
+// already exactly the "worker id" a per-worker slot array needs.
+export @symbol("bit_rt_port_net_udp_sender_slot") @nosplit fn udpSenderSlot(): int {
+  let w = schedCurrentWorker()
+  if (w == 0) {
+    return 0 - 1
+  }
+  let id = *(taskAt(w) + wkId)
+  if (id < 0 || id >= schedMaxWorkers || id >= udpSenderSlots) {
+    return 0 - 1
+  }
+  return id
+}
+
+// Copy a 4-word sockaddr. Unrolled rather than looped: four words, always —
+// no bound to prove (Power of 10 rule 2).
+export @symbol("bit_rt_port_net_copy_sock_addr_words") @nosplit fn copySockAddrWords(src: *i64, dst: *i64) {
+  *(dst + 0) = *(src + 0)
+  *(dst + 1) = *(src + 1)
+  *(dst + 2) = *(src + 2)
+  *(dst + 3) = *(src + 3)
+}
+
+// `bit_rt_net_udp_sender_host`: dotted-quad of the last recv's sender on THIS
+// task's own worker slot, or "".
+export @symbol("bit_rt_net_udp_sender_host") fn netAbiUdpSenderHost(): int {
+  let slot = udpSenderSlot()
+  if (slot < 0 || *(udpValidAt(slot)) == 0) {
+    return emptyStr()
+  }
+  // MANAGED scratch for the four octets (#1668): `octStr` used to be a raw
+  // `rtStrAlloc` address held across `netSockAddrOctets`.
+  let oct = []i64(1)
+  netSockAddrOctets(udpSenderAddr(slot), u8At(int(ptrOf(oct))))
+  return formatQuad(u8At(int(ptrOf(oct))))
+}
+
+// `bit_rt_net_udp_sender_port`: the last recv's sender port on THIS task's own
+// worker slot, or -1.
+export @symbol("bit_rt_net_udp_sender_port") @nosplit fn netAbiUdpSenderPort(): int {
+  let slot = udpSenderSlot()
+  if (slot < 0 || *(udpValidAt(slot)) == 0) {
+    return 0 - 1
+  }
+  return netSockAddrPort(udpSenderAddr(slot))
+}
