@@ -18,15 +18,18 @@
 // position, never per rune, and never stored on `Regex` (which stays
 // immutable and safe to share across any number of green threads; hanging
 // scratch state off it would make every spawned caller race on the same
-// buffer). A `ThreadList`'s `pcs` array holds plain `int`s, not a per-thread
-// class instance, so a busy position costs zero additional heap allocation
-// beyond the two lists built at the top of the call.
+// buffer). The one exception, unavoidable once captures are tracked, is
+// `slots`: `Save` (below) copies its thread's slot array so that two threads
+// which forked at an earlier `Split` never alias the same backing array —
+// bounded by `numSlots` per copy and by the program's own instruction count
+// in total, same complexity class as everything else here.
 //
-// CAPTURES: `Regex.matches` is a boolean predicate, so nothing here ever
-// reads a `Save` instruction's slot — but the instruction is still walked
-// like any other epsilon transition (`addThreadStep`'s `Op.Save` arm), so
-// #2029 can add per-thread capture slots without touching this file's
-// control flow, only its thread representation.
+// CAPTURES: every thread now carries a `slots` array (`Thread` below)
+// alongside its program counter — `-1` in a slot no `Save` has reached yet.
+// `runPike` returns the winning thread's slots on a match, so `matches`,
+// `find` and `findAll` (regex.bit) all share this one function; `matches`
+// simply discards the slots and keeps the boolean.
+class Thread { pc: int, slots: []int }
 
 // A per-position "already visited" set, keyed by program counter: the
 // classic sparse/dense pair. `pcSetHas`/`pcSetMark` are both O(1), and
@@ -56,18 +59,18 @@ fn pcSetClear(set: PcSet) {
   set.count = 0
 }
 
-// The threads live at one input position. `pcs[0:count]` are the "blocking"
-// instructions (Char/Class/Any/Match) this position's epsilon closure
-// reached, in priority order — index 0 is tried first, which is what makes
-// alternation and the greedy/lazy quantifiers resolve leftmost-first rather
-// than leftmost-longest (prog.bit's `Split` always offers its `x` arm
-// before its `y`). `visited` is the closure's dedupe set and covers every pc
-// walked this position, including the epsilon-only ones that never
-// themselves land in `pcs`.
-class ThreadList { pcs: []int, count: int, visited: PcSet }
+// The threads live at one input position. `threads[0:count]` are the
+// "blocking" instructions (Char/Class/Any/Match) this position's epsilon
+// closure reached, in priority order — index 0 is tried first, which is
+// what makes alternation and the greedy/lazy quantifiers resolve
+// leftmost-first rather than leftmost-longest (prog.bit's `Split` always
+// offers its `x` arm before its `y`). `visited` is the closure's dedupe set
+// and covers every pc walked this position, including the epsilon-only ones
+// that never themselves land in `threads`.
+class ThreadList { threads: []Thread, count: int, visited: PcSet }
 
 fn newThreadList(numInsts: int): ThreadList {
-  return ThreadList{ pcs: []int(numInsts), count: 0, visited: newPcSet(numInsts) }
+  return ThreadList{ threads: []Thread(numInsts), count: 0, visited: newPcSet(numInsts) }
 }
 
 fn threadListClear(tl: ThreadList) {
@@ -111,87 +114,110 @@ fn assertHolds(kind: AnchorKind, before: rune, after: rune): bool {
   return wordBefore == wordAfter // NoWordBoundary
 }
 
+// A copy of `slots` with `slotIdx` set to `pos` — copy-on-write. `Split`
+// (`addThreadStep` below) pushes the SAME `slots` array reference for both
+// of its arms, since neither has written yet; only an actual `Save` needs a
+// fresh array, so that the other arm — and every earlier thread already
+// queued with the old array — never sees this write. Bounded by
+// `len(slots)`, which is `prog.numSlots`, fixed per pattern at compile time.
+fn saveSlot(slots: []int, slotIdx: int, pos: int): []int {
+  let out = []int(len(slots))
+  let i = 0
+  while (i < len(slots)) {
+    out[i] = slots[i]
+    i = i + 1
+  }
+  out[slotIdx] = pos
+  return out
+}
+
 // The explicit closure stack (`addThread` never recurses — a pattern nests
 // arbitrarily deep, and a recursive closure walk is a stack-overflow crash
 // on ordinary user input, not just a hostile one). `sp` lives on the class,
 // Pascal-style (mutated in place, like `RegexParser.pos` elsewhere in this
 // module), so the many small functions below that push/pop don't have to
 // thread it through as a return value on top of everything else they need
-// (keeping each at or under the five-parameter lint ceiling, E0202).
-class PcStack { pcs: []int, sp: int }
+// (keeping each at or under the five-parameter lint ceiling, E0202). Each
+// entry is a full `Thread` (pc + the slots in effect at that point in the
+// closure walk), not just a pc, so `Save` can hand a different slots array
+// to what it pushes without disturbing anything already on the stack.
+class PcStack { entries: []Thread, sp: int }
 
 fn newPcStack(capacity: int): PcStack {
-  return PcStack{ pcs: []int(capacity), sp: 0 }
+  return PcStack{ entries: []Thread(capacity), sp: 0 }
 }
 
-// Pushes `pc`, asserting the stack (sized by `runPike` to the program's own
-// Split count, see its comment) never overflows — a bounded resource,
-// checked, per the Power-of-Ten rule this whole VM is built to satisfy.
-fn stackPush(stack: PcStack, pc: int) {
-  assert(stack.sp < len(stack.pcs), "regex: pike VM closure stack overflow")
-  stack.pcs[stack.sp] = pc
+// Pushes `(pc, slots)`, asserting the stack (sized by `runPike` to the
+// program's own Split count, see its comment) never overflows — a bounded
+// resource, checked, per the Power-of-Ten rule this whole VM is built to
+// satisfy.
+fn stackPush(stack: PcStack, pc: int, slots: []int) {
+  assert(stack.sp < len(stack.entries), "regex: pike VM closure stack overflow")
+  stack.entries[stack.sp] = Thread{ pc: pc, slots: slots }
   stack.sp = stack.sp + 1
 }
 
 // Caller must already have checked `stack.sp > 0`.
-fn stackPop(stack: PcStack): int {
+fn stackPop(stack: PcStack): Thread {
   stack.sp = stack.sp - 1
-  return stack.pcs[stack.sp]
+  return stack.entries[stack.sp]
 }
 
 // The values that stay fixed for every `addThread`/`addThreadStep` call
-// within one `runPike` invocation: the program being run and the closure
-// stack it shares across every call. Bundled so those functions stay at or
-// under the five-parameter ceiling without paying for a class instance per
-// input position — `ctx` is built exactly once per `runPike` call, same as
-// `stack` was before this existed.
-class PikeCtx { prog: Prog, stack: PcStack }
+// within one `runPike` invocation, plus `pos`: the current byte offset a
+// `Save` reached this closure walk should record. `runPike` mutates `pos`
+// once per input position (before seeding a start thread) and once more
+// per position (before extending survivors into `nlist`), same Pascal-style
+// pattern as `PcStack.sp`. Bundled so those functions stay at or under the
+// five-parameter ceiling without paying for extra parameters per call.
+class PikeCtx { prog: Prog, stack: PcStack, pos: int }
 
-// Resolves one program counter reached during the epsilon closure: pushes
-// its successor(s) for the epsilon ops (`Jump`, `Split`, `Save`, a satisfied
-// `Assert`), or records it as a real thread in `tl.pcs` for the rest
+// Resolves one thread reached during the epsilon closure: pushes its
+// successor(s) for the epsilon ops (`Jump`, `Split`, `Save`, a satisfied
+// `Assert`), or records it as a real thread in `tl.threads` for the rest
 // (`Char`/`Class`/`Any`/`Match`). `Split` pushes `y` before `x` so `x` pops
-// first — the priority order `prog.bit` promises.
-fn addThreadStep(tl: ThreadList, pc: int, before: rune, after: rune, ctx: PikeCtx) {
-  let inst = ctx.prog.insts[pc]
+// first — the priority order `prog.bit` promises. `Save` writes `ctx.pos`
+// into `th.slots[inst.slot]` via `saveSlot`'s copy-on-write.
+fn addThreadStep(tl: ThreadList, th: Thread, before: rune, after: rune, ctx: PikeCtx) {
+  let inst = ctx.prog.insts[th.pc]
   if (inst.op == Op.Jump) {
-    stackPush(ctx.stack, inst.x)
+    stackPush(ctx.stack, inst.x, th.slots)
     return
   }
   if (inst.op == Op.Split) {
-    stackPush(ctx.stack, inst.y)
-    stackPush(ctx.stack, inst.x)
+    stackPush(ctx.stack, inst.y, th.slots)
+    stackPush(ctx.stack, inst.x, th.slots)
     return
   }
   if (inst.op == Op.Save) {
-    stackPush(ctx.stack, pc + 1)
+    stackPush(ctx.stack, th.pc + 1, saveSlot(th.slots, inst.slot, ctx.pos))
     return
   }
   if (inst.op == Op.Assert) {
     if (assertHolds(inst.kind, before, after)) {
-      stackPush(ctx.stack, pc + 1)
+      stackPush(ctx.stack, th.pc + 1, th.slots)
     }
     return
   }
-  tl.pcs[tl.count] = pc
+  tl.threads[tl.count] = th
   tl.count = tl.count + 1
 }
 
-// Walks the epsilon closure of `startPc` into `tl`, iteratively via
+// Walks the epsilon closure of `start` into `tl`, iteratively via
 // `ctx.stack` — never recursively (see `PcStack`'s doc comment).
-fn addThread(tl: ThreadList, startPc: int, before: rune, after: rune, ctx: PikeCtx) {
-  stackPush(ctx.stack, startPc)
+fn addThread(tl: ThreadList, start: Thread, before: rune, after: rune, ctx: PikeCtx) {
+  stackPush(ctx.stack, start.pc, start.slots)
   // Bounded: each iteration pops one entry, and a push only ever nets +1
   // (a `Split`, the only op that pushes two) the FIRST time that pc is
   // visited — every later pop of it is a dead end via `pcSetHas` below. So
   // total growth is bounded by the program's own Split count.
   while (ctx.stack.sp > 0) {
-    let pc = stackPop(ctx.stack)
-    if (pcSetHas(tl.visited, pc)) {
+    let th = stackPop(ctx.stack)
+    if (pcSetHas(tl.visited, th.pc)) {
       continue
     }
-    pcSetMark(tl.visited, pc)
-    addThreadStep(tl, pc, before, after, ctx)
+    pcSetMark(tl.visited, th.pc)
+    addThreadStep(tl, th, before, after, ctx)
   }
 }
 
@@ -211,26 +237,32 @@ fn instAccepts(inst: Inst, r: rune): bool {
 // Scans `clist` (already-closed, priority order) against `r` (`noRune` past
 // the end of input), seeding `nlist` with every survivor via its own closure
 // walk (`addThread`, contextualized by `r`/`nextAfter` for the position
-// `nlist` belongs to). Returns true the instant a `Match` is reached: under
-// leftmost-first priority, no lower-index thread in `clist` can ever beat a
-// match a higher-priority one already reached, so scanning further here can
-// only waste work, never change the boolean answer.
-fn stepClist(clist: ThreadList, nlist: ThreadList, r: rune, nextAfter: rune, ctx: PikeCtx): bool {
+// `nlist` belongs to). Returns `(true, slots)` the instant a `Match` is
+// reached: under leftmost-first priority, no lower-index thread in `clist`
+// can ever beat a match a higher-priority one already reached, so scanning
+// further here can only waste work, never change the answer.
+fn stepClist(
+  clist: ThreadList,
+  nlist: ThreadList,
+  r: rune,
+  nextAfter: rune,
+  ctx: PikeCtx,
+): (bool, []int) {
   let i = 0
   // Bounded by `clist.count`, fixed at loop entry — filling `nlist` never
   // changes it.
   while (i < clist.count) {
-    let pc = clist.pcs[i]
-    let inst = ctx.prog.insts[pc]
+    let th = clist.threads[i]
+    let inst = ctx.prog.insts[th.pc]
     if (inst.op == Op.Match) {
-      return true
+      return true, th.slots
     }
     if (r != noRune && instAccepts(inst, r)) {
-      addThread(nlist, pc + 1, r, nextAfter, ctx)
+      addThread(nlist, Thread{ pc: th.pc + 1, slots: th.slots }, r, nextAfter, ctx)
     }
     i = i + 1
   }
-  return false
+  return false, []int(0)
 }
 
 // Decodes the rune at byte `pos` of `s` and returns it with the number of
@@ -250,33 +282,99 @@ fn stepRune(s: string, pos: int): (rune, int) {
   return decodeRuneAt(s, pos)
 }
 
-// Runs `prog` against `s` as an unanchored search — the standard `.*?`-prefix
-// trick: a fresh start thread (`pc 0`) is seeded at every position, at the
-// LOWEST priority (appended after whatever already-in-progress threads are
-// carried over), until a match is found. That priority ordering is what
-// makes the search leftmost: an already-started attempt always outranks one
-// that would start later. Once `stepClist` reports a match this returns
-// immediately, so a new start is never seeded after a match — the other half
-// of "leftmost".
+// The rune immediately before byte offset `pos` in `s` — `noRune` when `pos
+// <= 0` (nothing precedes the start of the string). A fresh search (`find`,
+// `matches`, and `findAll`'s very first call) always starts at `pos == 0`
+// and never needs this; `findAll`'s later calls resume mid-string, where an
+// anchor like `^` or `\b` must see the REAL preceding character, not
+// "nothing yet". Scans backward at most 4 bytes — the longest a UTF-8
+// sequence can be (`decodeRune`'s own limit) — to find that rune's lead
+// byte (a lead byte's top two bits are never `10`, unlike a continuation
+// byte's), so this is O(1) per call, not a rescan of everything before
+// `pos`.
+fn runeBeforePos(s: string, pos: int): rune {
+  if (pos <= 0) {
+    return noRune
+  }
+  let start = pos - 1
+  let floor = 0
+  if (pos - 4 > floor) {
+    floor = pos - 4
+  }
+  // Bounded: at most 4 steps back from `pos`.
+  while (start > floor && (int(s[start]) & 0xC0) == 0x80) {
+    start = start - 1
+  }
+  let (r, _) = decodeRuneAt(s, start)
+  return r
+}
+
+// `numSlots` slots, all unset (`-1`) — the capture state a brand-new start
+// thread begins with, seeded fresh at every input position an unanchored
+// search tries starting from.
+fn freshSlots(numSlots: int): []int {
+  let out = []int(numSlots)
+  let i = 0
+  while (i < numSlots) {
+    out[i] = -1
+    i = i + 1
+  }
+  return out
+}
+
+// Runs `prog` against `s`, searching for the leftmost-first unanchored match
+// starting at or after byte offset `startAt` — the standard `.*?`-prefix trick:
+// a fresh start thread (`pc 0`) is seeded at every position from `startAt`
+// onward, at the LOWEST priority (appended after whatever already-in-progress
+// threads are carried over), UNTIL a match is found. That priority ordering
+// is what makes the search leftmost: an already-started attempt always
+// outranks one that would start later, and once matched, no new start is
+// ever seeded again — the other half of "leftmost".
+//
+// Reaching `Match` does NOT return immediately: `stepClist` cuts off only the
+// threads AFTER it in `clist` (strictly lower priority — they can never beat
+// a match already found), but anything already forwarded into `nlist` (from
+// indices BEFORE the match, so strictly HIGHER priority) is still alive and
+// may reach its own, better `Match` later — that is exactly how a greedy `a+`
+// keeps extending past its first, shortest possible match. `matchSlots` is
+// unconditionally overwritten on every later match found this way, which is
+// correct rather than arbitrary: every thread still in `nlist` when a match
+// is recorded was, by construction, of strictly higher priority than that
+// match's own thread, so a later match can only ever come from a
+// higher-priority lineage than the one it replaces. This is only safe to
+// stop early once `nlist` is empty — nothing left can possibly outrank the
+// recorded match — which is the `matched && nlist.count == 0` check below;
+// while unmatched, an empty `nlist` means nothing YET, not never, since a
+// fresh seed at the next position is still owed.
+//
+// Returns `(matched, slots)`. `matches`/`find` always pass `startAt: 0`;
+// `findAll` (regex.bit) passes the previous match's end (or one rune past
+// it, for an empty match) to find the next non-overlapping one — so this one
+// function is the whole VM entry point all three go through.
 //
 // All VM scratch state is allocated exactly once here, per call (this
 // file's header). `ctx.stack` is sized `numInsts + 1`: `addThread`'s own
 // bound (its comment) shows the closure stack can never hold more than one
 // entry per Split instruction plus the one initial push.
-fn runPike(prog: Prog, s: string): bool {
+fn runPike(prog: Prog, s: string, startAt: int): (bool, []int) {
   let numInsts = len(prog.insts)
   let n = len(s)
   let clist = newThreadList(numInsts)
   let nlist = newThreadList(numInsts)
-  let ctx = PikeCtx{ prog: prog, stack: newPcStack(numInsts + 1) }
-  let pos = 0
-  let before = noRune
+  let ctx = PikeCtx{ prog: prog, stack: newPcStack(numInsts + 1), pos: startAt }
+  let pos = startAt
+  let before = runeBeforePos(s, startAt)
+  let matched = false
+  let matchSlots: []int = []int(0)
   // Bounded: `pos` strictly increases by the decoded rune's byte width
-  // (>= 1) every iteration, or the function returns — at most `n + 1`
-  // positions (`0` through `len(s)` inclusive) are ever visited.
+  // (>= 1) every iteration that does not return — at most `n - startAt + 1`
+  // positions are ever visited.
   while (pos <= n) {
     let (after, width) = stepRune(s, pos)
-    addThread(clist, 0, before, after, ctx)
+    if (!matched) {
+      ctx.pos = pos
+      addThread(clist, Thread{ pc: 0, slots: freshSlots(prog.numSlots) }, before, after, ctx)
+    }
     // The linearity invariant, once per input position (never per VM
     // step): if the sparse-set dedupe above is ever removed, this is what
     // catches it — the one refactor that silently turns this engine
@@ -284,11 +382,17 @@ fn runPike(prog: Prog, s: string): bool {
     assert(clist.count <= numInsts, "regex: pike VM thread count exceeded program size")
     let nextPos = pos + width
     let (nextAfter, _) = stepRune(s, nextPos)
-    if (stepClist(clist, nlist, after, nextAfter, ctx)) {
-      return true
+    ctx.pos = nextPos
+    let (stepMatched, stepSlots) = stepClist(clist, nlist, after, nextAfter, ctx)
+    if (stepMatched) {
+      matched = true
+      matchSlots = stepSlots
+    }
+    if (matched && nlist.count == 0) {
+      return true, matchSlots
     }
     if (after == noRune) {
-      return false
+      return matched, matchSlots
     }
     threadListClear(clist)
     let tmp = clist
@@ -297,5 +401,5 @@ fn runPike(prog: Prog, s: string): bool {
     before = after
     pos = nextPos
   }
-  return false
+  return matched, matchSlots
 }
