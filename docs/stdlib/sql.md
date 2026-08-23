@@ -36,6 +36,8 @@ SQL NULL, `Int`/`Float`/`Text`/`Blob` cover every scalar column type a driver
 maps its own types onto.
 
 ```bit
+import { Value } from "std/sql"
+
 fn describe(v: Value): string {
   match (v) {
     Null => return "null"
