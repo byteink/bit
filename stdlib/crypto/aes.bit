@@ -38,6 +38,24 @@ extern fn bit_rt_crypto_aes_encrypt_hw(rk: *byte, nr: int, block: *byte, out: *b
 extern fn bit_rt_crypto_aes_decrypt_hw(drk: *byte, nr: int, block: *byte, out: *byte)
 extern fn bit_rt_crypto_aes_invert_schedule_hw(erk: *byte, nr: int, out: *byte)
 
+// ARM64 HARDWARE FAST PATH (#2526, epic #1224, over #2522's ARMv8
+// Cryptographic Extension primitives in `runtime/cryptohw/armaes.bit`).
+// Unlike the x86-64 path above, this one is decided ONCE, at cipher creation
+// (`aesNewCipher`), not per block: `AesCipher.hw` caches whether
+// `hwAes()` (`hw.bit`, itself reading `BIT_CRYPTO_HW`/`bit_rt_crypto_hwcaps`
+// exactly once and caching that too) was true for a key size the hardware
+// path supports. `bit_rt_aes_hw_expand_key` only accepts a 128- or 256-bit
+// key (AES-192 panics inside it — see `armaes.bit`'s header), so `aesNewCipher`
+// gates on `keyBits` as well as `hwAes()`; a 24-byte key always takes the
+// software schedule below regardless of hardware support. `hwAes()` is false
+// on every non-ARM64 target (`bit_rt_crypto_hwcaps` is hard-wired to 0 on
+// x86-64, ABI.md §21c), so `AesCipher.hw` is never true where
+// `bit_rt_aes_hw_encrypt_block`/`_decrypt_block` would no-op under their own
+// `onX64()` guard.
+extern fn bit_rt_aes_hw_expand_key(key: *byte, keyBits: int, roundKeys: *byte)
+extern fn bit_rt_aes_hw_encrypt_block(roundKeys: *byte, rounds: int, blockIn: *byte, out: *byte)
+extern fn bit_rt_aes_hw_decrypt_block(roundKeys: *byte, rounds: int, blockIn: *byte, out: *byte)
+
 // Branchless GF(2^8) multiply of `a` and `b` under the AES polynomial. Runs the
 // full 8-bit shift-and-add every call; the "add this partial product" and
 // "reduce after the shift" decisions are folded into all-ones/all-zeros masks
@@ -307,10 +325,30 @@ export fn hwAvailableAes(): bool {
 }
 
 // A key-scheduled AES cipher. `roundKeys` is the flattened schedule (16*(nr+1)
-// bytes) and `nr` the round count (10, 12, or 14). Build one with `newAes`, not
-// a class literal — the constructor validates the key length and expands the
-// schedule. One value ciphers any number of blocks.
-export class AesCipher { roundKeys: []byte, nr: int }
+// bytes) and `nr` the round count (10, 12, or 14). `hw` caches, once, whether
+// this cipher's block calls take the ARM64 hardware path (see the "ARM64
+// HARDWARE FAST PATH" comment above `bit_rt_aes_hw_expand_key`) — neither
+// field is exported, so this is invisible outside the module. Build one with
+// `newAes`, not a class literal — the constructor validates the key length,
+// picks the schedule path, and expands it. One value ciphers any number of
+// blocks.
+export class AesCipher { roundKeys: []byte, nr: int, hw: bool }
+
+// Expand `key` into a keyed cipher for the given (`nk` 32-bit words, `nr`
+// rounds, `keyBits` = 8*len(key)) variant, taking the ARM64 hardware key
+// schedule when `hwAes()` is true and `keyBits` is one `bit_rt_aes_hw_expand_key`
+// supports (128 or 256 — AES-192 always uses the software schedule). Shared by
+// `newAes` and `aesgcmsivCipher` (aesgcmsiv.bit) so the hardware/software
+// decision lives in exactly one place.
+fn aesNewCipher(key: []byte, nk: int, nr: int, keyBits: int): AesCipher {
+  if (hwAes() && (keyBits == 128 || keyBits == 256)) {
+    let total = 16 * (nr + 1)
+    let rk = []byte(total)
+    bit_rt_aes_hw_expand_key(ptrOf(key), keyBits, ptrOf(rk))
+    return AesCipher{ roundKeys: rk, nr: nr, hw: true }
+  }
+  return AesCipher{ roundKeys: expandKey(key, nk, nr), nr: nr, hw: false }
+}
 
 // Build an AES cipher from `key`, whose length selects the variant: 16 bytes
 // (AES-128), 24 (AES-192), or 32 (AES-256). Fails on any other length. The key
@@ -319,13 +357,13 @@ export class AesCipher { roundKeys: []byte, nr: int }
 export fn newAes(key: []byte): AesCipher! {
   let n = len(key)
   if (n == 16) {
-    return AesCipher{ roundKeys: expandKey(key, 4, 10), nr: 10 }
+    return aesNewCipher(key, 4, 10, 128)
   }
   if (n == 24) {
-    return AesCipher{ roundKeys: expandKey(key, 6, 12), nr: 12 }
+    return aesNewCipher(key, 6, 12, 192)
   }
   if (n == 32) {
-    return AesCipher{ roundKeys: expandKey(key, 8, 14), nr: 14 }
+    return aesNewCipher(key, 8, 14, 256)
   }
   fail newError("newAes: key must be 16, 24, or 32 bytes, got ${n}")
 }
@@ -345,6 +383,11 @@ export fn (c: AesCipher) encryptBlock(block: []byte): []byte {
 export fn (c: AesCipher) encryptBlockInto(dst: []byte, block: []byte) {
   assert(len(dst) == 16, "aes.encryptBlockInto: dst must be 16 bytes")
   assert(len(block) == 16, "aes.encryptBlockInto: block must be 16 bytes")
+
+  if (c.hw) {
+    bit_rt_aes_hw_encrypt_block(ptrOf(c.roundKeys), c.nr, ptrOf(block), ptrOf(dst))
+    return
+  }
 
   if (bit_rt_crypto_aes_hw_available()) {
     bit_rt_crypto_aes_encrypt_hw(ptrOf(c.roundKeys), c.nr, ptrOf(block), ptrOf(dst))
@@ -378,6 +421,15 @@ export fn (c: AesCipher) encryptBlockInto(dst: []byte, block: []byte) {
 export fn (c: AesCipher) decryptBlock(block: []byte): []byte {
   assert(len(block) == 16, "aes.decryptBlock: block must be 16 bytes")
   let s = []byte(16)
+
+  if (c.hw) {
+    // Unlike the AES-NI path below, `bit_rt_aes_hw_decrypt_block` takes the
+    // FORWARD schedule `c.roundKeys` directly and derives the inverse
+    // schedule itself, once per call (`armaes.bit`'s `decRoundKeySchedule`)
+    // — no separate invert-schedule step needed on this side.
+    bit_rt_aes_hw_decrypt_block(ptrOf(c.roundKeys), c.nr, ptrOf(block), ptrOf(s))
+    return s
+  }
 
   if (bit_rt_crypto_aes_hw_available()) {
     // AES-NI decrypt needs the AESIMC-transformed schedule, not the forward
