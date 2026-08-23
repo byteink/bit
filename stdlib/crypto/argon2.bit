@@ -390,40 +390,60 @@ fn argon2FillSegment(
 
   let i = start
   while (i < segLength) {
-    let col = slice * segLength + i
-    let prevCol = col - 1
-    if (col == 0) {
-      prevCol = laneLength - 1
-    }
-    let prevOff = (lane * laneLength + prevCol) * 128
-
-    let pseudo: u64 = 0
-    if (dataIndep) {
-      if (i % 128 == 0) {
-        argon2NextAddresses(ab)
-      }
-      pseudo = ab[256 + i % 128]
-    } else {
-      pseudo = mem[prevOff]
-    }
-
-    let refLane = int((pseudo >> 32) % u64(lanes))
-    if (pass == 0 && slice == 0) {
-      refLane = lane
-    }
-    let sameLane = refLane == lane
-    let refArea = argon2RefArea(pass, slice, i, laneLength, segLength, sameLane)
-    let segStart = 0
-    if (pass != 0 && slice != 3) {
-      segStart = (slice + 1) * segLength
-    }
-    let refCol = argon2RefColumn(pseudo & 0xffffffff, refArea, segStart, laneLength)
-    let refOff = (refLane * laneLength + refCol) * 128
-
-    let currOff = (lane * laneLength + col) * 128
-    argon2G(mem, prevOff, refOff, currOff, pass != 0)
+    argon2FillColumn(mem, ab, dataIndep, pass, slice, lane, laneLength, segLength, lanes, i)
     i = i + 1
   }
+}
+
+// Fill column `i` of the segment (RFC 9106 §3.4): derive the reference block
+// from either the address-block stream (data-independent) or the previous
+// block itself (data-dependent), then run G into the current block. Split out
+// of `argon2FillSegment` (#2448) to keep the per-segment setup and the
+// per-column body each under E0204's complexity ceiling.
+fn argon2FillColumn(
+  mem: []u64,
+  ab: []u64,
+  dataIndep: bool,
+  pass: int,
+  slice: int,
+  lane: int,
+  laneLength: int,
+  segLength: int,
+  lanes: int,
+  i: int,
+) {
+  let col = slice * segLength + i
+  let prevCol = col - 1
+  if (col == 0) {
+    prevCol = laneLength - 1
+  }
+  let prevOff = (lane * laneLength + prevCol) * 128
+
+  let pseudo: u64 = 0
+  if (dataIndep) {
+    if (i % 128 == 0) {
+      argon2NextAddresses(ab)
+    }
+    pseudo = ab[256 + i % 128]
+  } else {
+    pseudo = mem[prevOff]
+  }
+
+  let refLane = int((pseudo >> 32) % u64(lanes))
+  if (pass == 0 && slice == 0) {
+    refLane = lane
+  }
+  let sameLane = refLane == lane
+  let refArea = argon2RefArea(pass, slice, i, laneLength, segLength, sameLane)
+  let segStart = 0
+  if (pass != 0 && slice != 3) {
+    segStart = (slice + 1) * segLength
+  }
+  let refCol = argon2RefColumn(pseudo & 0xffffffff, refArea, segStart, laneLength)
+  let refOff = (refLane * laneLength + refCol) * 128
+
+  let currOff = (lane * laneLength + col) * 128
+  argon2G(mem, prevOff, refOff, currOff, pass != 0)
 }
 
 // The final tag (RFC 9106 §3.2): XOR the last column of every lane into one
@@ -634,6 +654,68 @@ export fn argon2Hash(password: []byte, salt: []byte, t: int, m: int, p: int, out
   return "$argon2id$v=19$m=${m},t=${t},p=${p}$${sb}$${hb}"
 }
 
+// The fields of a parsed PHC Argon2 string (`$argon2id$v=19$m=...,t=...,p=...$salt$tag`).
+class Argon2Fields {
+  typ: int,
+  m: int,
+  t: int,
+  p: int,
+  salt: []byte,
+  expected: []byte,
+}
+
+// The Argon2 type tag (`argon2d`/`argon2i`/`argon2id`) as `argon2Core`'s `typ`
+// parameter (0/1/2). Fails on any other tag.
+fn argon2ParseType(tag: string): int! {
+  if (tag == "argon2d") {
+    return 0
+  }
+  if (tag == "argon2i") {
+    return 1
+  }
+  if (tag == "argon2id") {
+    return 2
+  }
+  fail newError("argon2: unknown type")
+}
+
+// Parse and validate every field of a PHC Argon2 string, without computing the
+// tag. Split out of `argon2Verify` (#2448) so the parse — which fails on the
+// first malformed field, exactly like the original early-return chain — and
+// the constant-time compare are each their own function, under E0204's
+// complexity ceiling.
+fn argon2ParseEncoded(encoded: string): Argon2Fields! {
+  let parts = argon2Split(encoded, '$')
+  if (len(parts) != 6 || parts[0] != "") {
+    fail newError("argon2: bad field count")
+  }
+
+  let typ = argon2ParseType(parts[1])?
+  let ver = argon2FieldInt(parts[2], "v=")?
+  if (ver != 19) {
+    fail newError("argon2: unsupported version")
+  }
+
+  let params = argon2Split(parts[3], ',')
+  if (len(params) != 3) {
+    fail newError("argon2: bad param count")
+  }
+  let m = argon2FieldInt(params[0], "m=")?
+  let t = argon2FieldInt(params[1], "t=")?
+  let p = argon2FieldInt(params[2], "p=")?
+  if (m < 8 * p || t < 1 || p < 1) {
+    fail newError("argon2: bad params")
+  }
+
+  let salt = argon2B64Decode(parts[4])?
+  let expected = argon2B64Decode(parts[5])?
+  if (len(salt) < 8 || len(expected) < 4) {
+    fail newError("argon2: bad salt/tag length")
+  }
+
+  return Argon2Fields{ typ: typ, m: m, t: t, p: p, salt: salt, expected: expected }
+}
+
 // Report whether `password` matches the PHC Argon2 string `encoded`. Parses the
 // type, version, parameters, salt, and tag out of `encoded`, recomputes the tag,
 // and compares it in constant time (`ctEq`). Accepts `$argon2d`/`$argon2i`/
@@ -641,56 +723,19 @@ export fn argon2Hash(password: []byte, salt: []byte, t: int, m: int, p: int, out
 // wrong field count, unknown type, version other than 19, non-numeric parameter,
 // or an undecodable salt or tag.
 export fn argon2Verify(password: []byte, encoded: string): bool {
-  let parts = argon2Split(encoded, '$')
-  if (len(parts) != 6 || parts[0] != "") {
+  let f = argon2ParseEncoded(encoded) catch _ {
     return false
   }
-
-  let typ = 0
-  if (parts[1] == "argon2d") {
-    typ = 0
-  } else if (parts[1] == "argon2i") {
-    typ = 1
-  } else if (parts[1] == "argon2id") {
-    typ = 2
-  } else {
-    return false
-  }
-
-  let ver = argon2FieldInt(parts[2], "v=") catch _ {
-    return false
-  }
-  if (ver != 19) {
-    return false
-  }
-
-  let params = argon2Split(parts[3], ',')
-  if (len(params) != 3) {
-    return false
-  }
-  let m = argon2FieldInt(params[0], "m=") catch _ {
-    return false
-  }
-  let t = argon2FieldInt(params[1], "t=") catch _ {
-    return false
-  }
-  let p = argon2FieldInt(params[2], "p=") catch _ {
-    return false
-  }
-  if (m < 8 * p || t < 1 || p < 1) {
-    return false
-  }
-
-  let salt = argon2B64Decode(parts[4]) catch _ {
-    return false
-  }
-  let expected = argon2B64Decode(parts[5]) catch _ {
-    return false
-  }
-  if (len(salt) < 8 || len(expected) < 4) {
-    return false
-  }
-
-  let got = argon2Core(password, salt, []byte(0), []byte(0), t, m, p, len(expected), typ)
-  return ctEq(got, expected)
+  let got = argon2Core(
+    password,
+    f.salt,
+    []byte(0),
+    []byte(0),
+    f.t,
+    f.m,
+    f.p,
+    len(f.expected),
+    f.typ,
+  )
+  return ctEq(got, f.expected)
 }
