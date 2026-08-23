@@ -1,0 +1,406 @@
+// The TCP section of the Windows socket provider, split out of ./sock.bit
+// (#3340), mirroring ../linux/tcp.bit's own split. Sibling file, same
+// module: the raw calls, GUID-resolved AcceptEx/ConnectEx, the error shim
+// and the address layout all live in ./sock.bit and need no import here.
+//
+// EVERY REAL OP (accept/dial/read/write) FOLLOWS THE IDENTICAL FIVE-STEP
+// SHAPE, because it is the one correct way to keep an OVERLAPPED alive for
+// its whole async window (trap #5) while still being able to unwind
+// cleanly on every failure branch:
+//
+//   1. schedParkArm() — opens the window a completion cannot race past
+//      unnoticed (../linux/sock.bit's "THE ARM/REGISTER/PARK ORDER IS THE
+//      PROTOCOL" applies here identically, one layer up).
+//   2. pollClaimOp(pollFd, sock, task) — claims a slot from
+//      ../../sched/windows/poll.bit's pool; ITS OVERLAPPED now has a fixed
+//      address that will not move or be reused until step 5's
+//      pollOpRelease.
+//   3. Issue the real Win32 call (AcceptEx/ConnectEx/WSARecv/WSASend) with
+//      that OVERLAPPED. `rc == 0 || WSAGetLastError() == wsaIoPending()` is
+//      success (trap #4); anything else is a HARD failure that never
+//      reached the OS, so `pollOpAbort` (not `pollOpRelease`) is correct —
+//      the slot was never counted as outstanding.
+//   4. pollOpCommit(slot); schedPark() — sleep until the completion port
+//      wakes this task.
+//   5. pollOpBytes(slot) / pollOpStatus(slot) — read the result — THEN
+//      pollOpRelease(slot). Reading before releasing is what makes trap #5
+//      hold on the completion path: another claimer cannot reuse the slot
+//      while this task still owns its result.
+//
+// A hard failure at step 3 closes whatever socket it just created/claimed
+// itself; a completion-time failure (`pollOpStatus(slot) != 0`) is handled
+// by each entry point's own caller-visible contract, matching the sibling
+// providers' "an error reads as empty/failure" convention.
+
+import { netParseIpv4, netMaxStalls, netClampDeadline } from "../../net"
+import { saBytes, ipBytes, netSockAddrPort } from "../../net"
+import { pollClaimOp, pollOpOverlapped, pollOpWsabuf, pollOpCommit,
+         pollOpAbort, pollOpBytes, pollOpStatus, pollOpRelease } from "../../sched/windows"
+import { parkMonoNs } from "../../park/windows"
+
+// ---------------------------------------------------------------------------
+// TCP
+// ---------------------------------------------------------------------------
+
+export @symbol("bit_rt_port_net_listen_tcp") fn netListenTcp(host: *u8, hostLen: int, port: int, backlog: int): int {
+  let ip = ipBytes()
+  if (!netParseIpv4(host, hostLen, ip)) {
+    return 0 - 1
+  }
+  let fd = netSysSocket(false)
+  if (fd < 0) {
+    return 0 - lastErr()
+  }
+  if (!netSetReuseAddr(fd)) {
+    let e = lastErr()
+    netClose(fd)
+    return 0 - e
+  }
+  netFillSockAddr(saBytes(), ip, port)
+  if (!netSysBind(fd, saBytes())) {
+    let e = lastErr()
+    netClose(fd)
+    return 0 - e
+  }
+  if (!netSysListen(fd, backlog)) {
+    let e = lastErr()
+    netClose(fd)
+    return 0 - e
+  }
+  return fd
+}
+
+export @symbol("bit_rt_port_net_local_port") fn netSockLocalPort(fd: int): int {
+  let lenBuf = []i64(1)
+  lenBuf[0] = i64(saLenConst())
+  if (wsaRc(int(getsockname(i64(fd), saBytes(), i32PtrAt(int(ptrOf(lenBuf)))))) < 0) {
+    return 0 - 1
+  }
+  return netSockAddrPort(saBytes())
+}
+
+// `saLen` (../../net's core const) under a local name: ../net.bit's
+// `saLen` clashes with nothing here, but a fresh accessor avoids adding yet
+// another cross-module import for one constant only this function needs.
+fn saLenConst(): int { return 16 }
+
+// Claim a slot and arm the park for `sock` — the shared prefix of every
+// real-op entry point below (steps 1-2 of this file's header). Returns the
+// slot, or `-1` if EITHER step failed, in which case the park is already
+// correctly disarmed and nothing further should be attempted.
+fn armAndClaim(pollFd: int, sock: int, taskAddr: int): int {
+  if (!schedParkArm()) {
+    return 0 - 1
+  }
+  let slot = pollClaimOp(pollFd, sock, taskAddr)
+  if (slot < 0) {
+    let _ = schedParkDisarm()
+    return 0 - 1
+  }
+  return slot
+}
+
+// Accept one connection via AcceptEx, parking until it completes. Returns
+// the accepted socket, or a negative value on failure.
+export @symbol("bit_rt_port_net_accept_tcp") fn netAcceptTcp(lfd: int): int {
+  let pollFd = currentPollFd()
+  let taskAddr = currentTaskAddr()
+  if (pollFd == 0 || taskAddr == 0) {
+    return 0 - 1
+  }
+  if (!resolveExtensionFns(lfd)) {
+    return 0 - 1
+  }
+  let accSock = netSysSocket(false)
+  if (accSock < 0) {
+    return 0 - 1
+  }
+  // MANAGED scratch (#1668-style — see ../linux/sock.bit's "WHY THE BUFFERS
+  // HERE ARE MANAGED" for the general rule this file also follows): every
+  // buffer AcceptEx's OVERLAPPED op can still be writing to, or that the
+  // trampoline call still needs to read from, must survive the park below
+  // as a stack-map-visible local, not a raw address.
+  //
+  // AcceptEx's own output buffer: 2 * (sockaddr_in(16) + 16 slack) = 64
+  // bytes — required by AcceptEx even though this file never reads it (no
+  // caller here wants the pre-received-data or peer-address feature).
+  let outBuf = []i64(8)
+  let recvBytes = []i64(1)
+  let args = []i64(4)
+
+  let slot = armAndClaim(pollFd, accSock, taskAddr)
+  if (slot < 0) {
+    netClose(accSock)
+    return 0 - 1
+  }
+  args[0] = i64(32)
+  args[1] = i64(32)
+  args[2] = i64(int(bytesAtI64(ptrOf(recvBytes))))
+  args[3] = i64(int(pollOpOverlapped(slot)))
+  let rc = acceptExCall(int(acceptExPtr), lfd, accSock, int(ptrOf(outBuf)), int(ptrOf(args)))
+  if (rc == 0 && int(WSAGetLastError()) != wsaIoPending()) {
+    pollOpAbort(slot)
+    netClose(accSock)
+    return 0 - 1
+  }
+  pollOpCommit(slot)
+  schedPark()
+  let st = pollOpStatus(slot)
+  pollOpRelease(slot)
+  if (st != 0) {
+    netClose(accSock)
+    return 0 - 1
+  }
+  if (!netSetUpdateAcceptContext(accSock, lfd)) {
+    netClose(accSock)
+    return 0 - 1
+  }
+  return accSock
+}
+
+// Trap #2: bind the socket to the wildcard address before ConnectEx can be
+// resolved/called at all — split out of `netDialTcp` to keep its own
+// complexity under the lint ceiling.
+fn dialPrep(fd: int): bool {
+  let zero = []i64(2)
+  netFillSockAddr(bytesAtI64(ptrOf(zero)), zeroIp(), 0)
+  if (!netSysBind(fd, bytesAtI64(ptrOf(zero)))) {
+    return false
+  }
+  return resolveExtensionFns(fd)
+}
+
+// Issue ConnectEx and park for its completion (steps 2-5 of this file's
+// header), once `fd` is already bound. Returns `true` on a successful
+// handshake; the caller closes `fd` on `false`.
+fn dialConnect(pollFd: int, taskAddr: int, fd: int, ip: *u8, port: int): bool {
+  // MANAGED scratch, same reasoning as `netAcceptTcp`'s: `target` (the
+  // sockaddr ConnectEx connects to) is read by the OS for the whole async
+  // window, not just at the call.
+  let target = []i64(2)
+  netFillSockAddr(bytesAtI64(ptrOf(target)), ip, port)
+  let sentBytes = []i64(1)
+  let args = []i64(3)
+
+  let slot = armAndClaim(pollFd, fd, taskAddr)
+  if (slot < 0) {
+    return false
+  }
+  args[0] = i64(0)
+  args[1] = i64(int(bytesAtI64(ptrOf(sentBytes))))
+  args[2] = i64(int(pollOpOverlapped(slot)))
+  let rc = connectExCall(int(connectExPtr), fd, int(bytesAtI64(ptrOf(target))), 16, int(ptrOf(args)))
+  if (rc == 0 && int(WSAGetLastError()) != wsaIoPending()) {
+    pollOpAbort(slot)
+    return false
+  }
+  pollOpCommit(slot)
+  schedPark()
+  let st = pollOpStatus(slot)
+  pollOpRelease(slot)
+  return st == 0
+}
+
+// Connect to `host:port` via ConnectEx, parking until the handshake
+// finishes.
+export @symbol("bit_rt_port_net_dial_tcp") fn netDialTcp(host: *u8, hostLen: int, port: int): int {
+  let ip = ipBytes()
+  if (!netParseIpv4(host, hostLen, ip)) {
+    return 0 - 1
+  }
+  let pollFd = currentPollFd()
+  let taskAddr = currentTaskAddr()
+  if (pollFd == 0 || taskAddr == 0) {
+    return 0 - 1
+  }
+  let fd = netSysSocket(false)
+  if (fd < 0) {
+    return 0 - 1
+  }
+  if (!dialPrep(fd)) {
+    netClose(fd)
+    return 0 - 1
+  }
+  if (!dialConnect(pollFd, taskAddr, fd, ip, port)) {
+    netClose(fd)
+    return 0 - 1
+  }
+  let _ = netSetUpdateConnectContext(fd)
+  return fd
+}
+
+// Four zero octets — `netDialTcp`'s bind target is the wildcard address.
+fn zeroIp(): *u8 {
+  let z = []i64(1)
+  return bytesAtI64(ptrOf(z))
+}
+
+// Read up to `bufCap` bytes into `buf` via WSARecv, parking until some
+// arrive. `0` means the peer closed OR an I/O error occurred — this
+// provider does not distinguish them at the completion boundary (poll.bit's
+// own header: a zero-byte-transferred completion cannot tell "closed" from
+// "errored" apart either), matching every other provider's documented "an
+// I/O error reads as empty too" convention.
+export @symbol("bit_rt_port_net_read_sock") fn netReadSock(fd: int, buf: *u8, bufCap: int): int {
+  let pollFd = currentPollFd()
+  let taskAddr = currentTaskAddr()
+  if (pollFd == 0 || taskAddr == 0) {
+    return 0 - 1
+  }
+  let slot = armAndClaim(pollFd, fd, taskAddr)
+  if (slot < 0) {
+    return 0 - 1
+  }
+  fillWsabuf(pollOpWsabuf(slot), buf, bufCap)
+  let flags = []i64(1)
+  let bytesOut = []i64(1)
+  let rc = int(WSARecv(i64(fd), pollOpWsabuf(slot), i32(1), bytesAtI64(ptrOf(bytesOut)),
+                       bytesAtI64(ptrOf(flags)), pollOpOverlapped(slot), nilByte()))
+  if (rc != 0 && int(WSAGetLastError()) != wsaIoPending()) {
+    pollOpAbort(slot)
+    return 0 - 1
+  }
+  pollOpCommit(slot)
+  schedPark()
+  let n = pollOpBytes(slot)
+  let st = pollOpStatus(slot)
+  pollOpRelease(slot)
+  if (st != 0) {
+    return 0
+  }
+  return n
+}
+
+// Writes {len, buf} into the WSABUF at `wb` — a plain 16-byte struct
+// (`ULONG len; char *buf;`, matching ../../sched/windows/poll.bit's own
+// `wsabufWords` layout: word 0 is len+pad, word 1 is buf).
+fn fillWsabuf(wb: *byte, buf: *u8, n: int) {
+  let words = i64PtrAt(int(wb))
+  *words = i64(n)
+  *(words + 1) = i64(int(buf))
+}
+
+fn i64PtrAt(addr: int): *i64 {
+  let z: *i64 = nil
+  return z + addr / 8
+}
+
+// SHUT_BOTH (winsock2.h) — matches ../linux/tcp.bit's `netShutRdwr`, same
+// value (2) and the same reason: tearing down a connection always means
+// both directions.
+const netShutBoth: int = 2
+
+export @symbol("bit_rt_port_net_shutdown_sock") fn netShutdownSock(fd: int): bool {
+  return wsaRc(int(shutdown(i64(fd), i32(netShutBoth)))) >= 0
+}
+
+// Write all `n` bytes of `buf` via WSASend, parking whenever the send
+// buffer is full. A short completion is retried, mirroring
+// ../linux/tcp.bit's `netWriteSock` loop shape exactly, one overlapped op
+// per iteration instead of one non-blocking retry.
+export @symbol("bit_rt_port_net_write_sock") fn netWriteSock(fd: int, buf: *u8, n: int): int {
+  let pollFd = currentPollFd()
+  let taskAddr = currentTaskAddr()
+  if (pollFd == 0 || taskAddr == 0) {
+    return 0 - 1
+  }
+  let off = 0
+  let stalls = 0
+  while (off < n && stalls < netMaxStalls) {
+    let wrote = writeOnce(pollFd, taskAddr, fd, buf + off, n - off)
+    if (wrote <= 0) {
+      return 0 - 1
+    }
+    off = off + wrote
+    stalls = stalls + 1
+  }
+  if (off < n) {
+    return 0 - 1
+  }
+  return off
+}
+
+// One WSASend op, the five-step shape from this file's header. Returns the
+// bytes actually sent, or `-1` on any failure (post-time or completion-time).
+fn writeOnce(pollFd: int, taskAddr: int, fd: int, buf: *u8, want: int): int {
+  let slot = armAndClaim(pollFd, fd, taskAddr)
+  if (slot < 0) {
+    return 0 - 1
+  }
+  fillWsabuf(pollOpWsabuf(slot), buf, want)
+  let bytesOut = []i64(1)
+  let rc = int(WSASend(i64(fd), pollOpWsabuf(slot), i32(1), bytesAtI64(ptrOf(bytesOut)),
+                       i32(0), pollOpOverlapped(slot), nilByte()))
+  if (rc != 0 && int(WSAGetLastError()) != wsaIoPending()) {
+    pollOpAbort(slot)
+    return 0 - 1
+  }
+  pollOpCommit(slot)
+  schedPark()
+  let n = pollOpBytes(slot)
+  let st = pollOpStatus(slot)
+  pollOpRelease(slot)
+  if (st != 0) {
+    return 0 - 1
+  }
+  return n
+}
+
+// ---------------------------------------------------------------------------
+// Deadline-bounded dial/read/write (#2291) — INTERFACE-COMPLETE, NOT FULLY
+// EQUIVALENT to ../linux/tcp.bit's twin, and that gap is stated here rather
+// than hidden. ONLY implemented, not filed as a separate ticket, because
+// leaving these three ABI symbols entirely undefined would fail the whole
+// module to LINK on Windows (any `stdlib/net`/`stdlib/http2` program calling
+// `bit_rt_net_read_deadline_w` etc. would hit an unresolved symbol, the
+// #3538/#3550 "cold build extern reachability" shape) — so SOME definition
+// is required by this ticket's own "presenting whatever interface
+// runtime/net/net.bit already expects" scope, even though a fully-bounded
+// wait is out of scope (it needs a genuine timed-park primitive this
+// runtime does not have yet: `schedPark()` is unbounded and `schedSleepUntil`
+// is a SEPARATE timer-wheel wait with no way to race it against a completion
+// port wake without risking a double-wake on the scheduler's task state,
+// which is not something to invent inside a sockets-only ticket).
+//
+// What THIS DOES: the deadline is checked ONCE, before the op is issued —
+// so a caller who dials/reads/writes with an already-past deadline gets
+// `netDeadlineTimedOut` immediately, exactly as the other providers do for
+// that case. What THIS DOES NOT DO: bound an IN-FLIGHT async wait — once
+// ConnectEx/WSARecv/WSASend is posted, this file parks unbounded (the plain
+// entry points' own behaviour) rather than racing the deadline. A genuine
+// fix needs a real timed-wait primitive in runtime/sched/windows/**, which
+// is cross-cutting scheduler work, not a sockets change — filed separately
+// rather than attempted here.
+
+// The deadline elapsed before the operation completed — matches
+// ../linux/tcp.bit's `netDeadlineTimedOut` sentinel exactly.
+const netDeadlineTimedOut: int = 0 - 2
+
+fn netClockNowNs(): int {
+  let scratch = []i64(2)
+  return parkMonoNs(ptrOf(scratch))
+}
+
+export @symbol("bit_rt_port_net_dial_tcp_deadline") fn netDialTcpDeadline(host: *u8, hostLen: int, port: int, deadlineNs: int): int {
+  let deadline = netClampDeadline(deadlineNs, netClockNowNs())
+  if (netClockNowNs() >= deadline) {
+    return netDeadlineTimedOut
+  }
+  return netDialTcp(host, hostLen, port)
+}
+
+export @symbol("bit_rt_port_net_read_sock_deadline") fn netReadSockDeadline(fd: int, buf: *u8, bufCap: int, deadlineNs: int): int {
+  let deadline = netClampDeadline(deadlineNs, netClockNowNs())
+  if (netClockNowNs() >= deadline) {
+    return netDeadlineTimedOut
+  }
+  return netReadSock(fd, buf, bufCap)
+}
+
+export @symbol("bit_rt_port_net_write_sock_deadline") fn netWriteSockDeadline(fd: int, buf: *u8, n: int, deadlineNs: int): int {
+  let deadline = netClampDeadline(deadlineNs, netClockNowNs())
+  if (netClockNowNs() >= deadline) {
+    return netDeadlineTimedOut
+  }
+  return netWriteSock(fd, buf, n)
+}
