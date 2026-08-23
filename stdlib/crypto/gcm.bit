@@ -46,6 +46,23 @@ extern fn bit_rt_crypto_ghash_mul_hw(
   outHi: *uint,
 ): uint
 
+// ARM64 HARDWARE FAST PATH (#2527, epic #1224), separate from the x86-64 family
+// above: `bit_rt_ghash_hw_blocks`/`bit_rt_ghash_hw_mul` (`runtime/cryptohw/
+// armghash.bit`, #2523) run the ARMv8 Cryptographic Extension's PMULL/PMULL2
+// carry-less multiply, gated on `hwPmull()` (`hw.bit`) rather than on
+// `bit_rt_crypto_ghash_hw_available()` — a disjoint capability, disjoint
+// runtime primitive, checked once when `AesGcm` is constructed (`newGcm`) and
+// cached in `AesGcm.pmull`, the same "read once, not per block" contract
+// `AesCipher.hw` already uses for AES. `gcmGhashHw` below is the hardware
+// mirror of `gcmGhashSw`'s exact recurrence (`state = (state XOR block) * H`,
+// once per 16-byte block, AAD then ciphertext then the length block) and is
+// the oracle-checked alternative, never a replacement — `gcmGhashSw` is
+// unchanged and still runs whenever `hwPmull()` is false (including
+// `BIT_CRYPTO_HW=0` and every non-ARM64 target, where `hwPmull()` is always
+// false per `hw.bit`).
+extern fn bit_rt_ghash_hw_mul(h: *byte, x: *byte, out: *byte)
+extern fn bit_rt_ghash_hw_blocks(h: *byte, state: *byte, data: *byte, blocks: u64)
+
 // Load 8 bytes of `data` at `off` as a big-endian `u64`, treating any index past
 // the end as a zero byte (the zero-padding GHASH applies to a final short block).
 fn gcmLoadWord(data: []byte, off: int): u64 {
@@ -194,7 +211,7 @@ fn gcmAbsorb(acc: []u64, h0: u64, h1: u64, data: []byte) {
 // GHASH_H(aad, ct): fold the AAD blocks, then the ciphertext blocks, then a final
 // block carrying the two 64-bit bit-lengths, and return the 128-bit result as a
 // two-word element. This is GCM's authenticator input before the J0 mask.
-fn gcmGhash(h: []u64, aad: []byte, ct: []byte): []u64 {
+fn gcmGhashSw(h: []u64, aad: []byte, ct: []byte): []u64 {
   let acc = []u64(2)
   let h0 = h[0]
   let h1 = h[1]
@@ -202,6 +219,72 @@ fn gcmGhash(h: []u64, aad: []byte, ct: []byte): []u64 {
   gcmAbsorb(acc, h0, h1, ct)
   gcmMulHWords(acc, u64(len(aad)) * 8, u64(len(ct)) * 8, h0, h1)
   return acc
+}
+
+// Fold every full 16-byte block of `data` directly from the caller's buffer
+// into `state` via the ARM64 PMULL primitive, then zero-pad and fold any
+// trailing partial block the same way — the hardware mirror of `gcmAbsorb`,
+// one `state = (state XOR block) * H` step per block.
+fn gcmAbsorbHw(hPtr: *byte, state: []byte, data: []byte) {
+  let full = len(data) / 16
+  if (full > 0) {
+    bit_rt_ghash_hw_blocks(hPtr, ptrOf(state), ptrOf(data), u64(full))
+  }
+  let rem = len(data) - full * 16
+  if (rem > 0) {
+    let tail = []byte(16)
+    let i = 0
+    while (i < rem) {
+      tail[i] = data[full * 16 + i]
+      i = i + 1
+    }
+    bit_rt_ghash_hw_blocks(hPtr, ptrOf(state), ptrOf(tail), 1)
+  }
+}
+
+// GHASH_H(aad, ct), the ARM64 PMULL-accelerated mirror of `gcmGhashSw`: same
+// recurrence, checked against it by the differential in
+// tests/imports/cryptogcm. Folds AAD then the ciphertext (each independently
+// block-padded, per GCM's own definition) via `bit_rt_ghash_hw_blocks`, then
+// XORs in the final length block and folds it with one direct
+// `bit_rt_ghash_hw_mul` call — a single already-XORed block needs no
+// `bit_rt_ghash_hw_blocks` call of its own.
+fn gcmGhashHw(h: []u64, aad: []byte, ct: []byte): []u64 {
+  let hBytes = []byte(16)
+  gcmStoreWord(hBytes, 0, h[0])
+  gcmStoreWord(hBytes, 8, h[1])
+  let hPtr = ptrOf(hBytes)
+
+  let state = []byte(16)
+  gcmAbsorbHw(hPtr, state, aad)
+  gcmAbsorbHw(hPtr, state, ct)
+
+  let lenBlock = []byte(16)
+  gcmStoreWord(lenBlock, 0, u64(len(aad)) * 8)
+  gcmStoreWord(lenBlock, 8, u64(len(ct)) * 8)
+  let xored = []byte(16)
+  let i = 0
+  while (i < 16) {
+    xored[i] = state[i] ^ lenBlock[i]
+    i = i + 1
+  }
+  bit_rt_ghash_hw_mul(hPtr, ptrOf(xored), ptrOf(state))
+
+  let acc = []u64(2)
+  acc[0] = gcmLoadWord(state, 0)
+  acc[1] = gcmLoadWord(state, 8)
+  return acc
+}
+
+// GHASH_H(aad, ct): dispatches to the ARM64 PMULL hardware path when `pmull`
+// is true (read once at `AesGcm` construction, `AesGcm.pmull`), else the
+// constant-time software path. Both compute the identical NIST SP 800-38D
+// value; see `gcmGhashHw`'s header for the correctness argument.
+fn gcmGhash(h: []u64, pmull: bool, aad: []byte, ct: []byte): []u64 {
+  if (pmull) {
+    return gcmGhashHw(h, aad, ct)
+  }
+  return gcmGhashSw(h, aad, ct)
 }
 
 // The pre-counter block J0 for a 96-bit nonce: nonce ‖ 0x00000001.
@@ -349,8 +432,10 @@ export fn hwAvailableGhash(): bool {
 
 // A keyed AES-GCM cipher. `cipher` is the expanded AES schedule; `h` is the hash
 // subkey H = AES_K(0^128) as a two-word field element, derived once at
-// construction and reused by every `seal`/`open`. Build one with `newGcm`.
-export class AesGcm { cipher: AesCipher, h: []u64 }
+// construction and reused by every `seal`/`open`. `pmull` caches `hwPmull()`
+// (#2527) — whether GHASH should take the ARM64 PMULL hardware path — read
+// once here rather than once per block. Build one with `newGcm`.
+export class AesGcm { cipher: AesCipher, h: []u64, pmull: bool }
 
 // Key an AES-GCM cipher from `key` (16, 24, or 32 bytes — AES-128/192/256, the
 // GCM/TLS variants). Fails on any other key length. The hash subkey H is derived
@@ -360,7 +445,7 @@ export fn newGcm(key: []byte): AesGcm! {
   let cipher = newAes(key)?
   let zero = []byte(16)
   let hb = cipher.encryptBlock(zero)
-  return AesGcm{ cipher: cipher, h: gcmLoadBlock(hb, 0) }
+  return AesGcm{ cipher: cipher, h: gcmLoadBlock(hb, 0), pmull: hwPmull() }
 }
 
 // Seal: encrypt `plaintext` under the 12-byte `nonce` and authenticate both it
@@ -377,7 +462,7 @@ export fn (g: AesGcm) seal(nonce: []byte, plaintext: []byte, aad: []byte): []byt
   gcmInc32(counter0)
   let ct = gcmGctr(g.cipher, counter0, plaintext)
 
-  let tag = gcmTag(gcmGhash(g.h, aad, ct), ej0)
+  let tag = gcmTag(gcmGhash(g.h, g.pmull, aad, ct), ej0)
 
   let out = []byte(len(ct) + 16)
   let i = 0
@@ -409,7 +494,7 @@ export fn (g: AesGcm) open(nonce: []byte, ciphertext: []byte, aad: []byte): []by
 
   let j0 = gcmJ0(nonce)
   let ej0 = g.cipher.encryptBlock(j0)
-  let wantTag = gcmTag(gcmGhash(g.h, aad, ct), ej0)
+  let wantTag = gcmTag(gcmGhash(g.h, g.pmull, aad, ct), ej0)
   if (!ctEq(wantTag, recvTag)) {
     fail newError("gcm.open: authentication failed")
   }
