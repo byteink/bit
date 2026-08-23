@@ -185,23 +185,78 @@ fn xEmitArithImmInt(cx: XCtx, op: XArith, dst: int, operand: int, imm: int, w: W
   xPutInt(cx, dst, xScratch1())
 }
 
+// Same encoding shape as xEmitArithImmInt, for AND/OR/XOR (#3495), but
+// WITHOUT its trailing xCanonNarrow: bitwise ops map canonical inputs to a
+// canonical output (xEmitBinaryInt's own comment below), so re-narrowing an
+// already-canonical result would be a dead instruction at any width < 8.
+fn xEmitLogicalImmInt(cx: XCtx, op: XArith, dst: int, operand: int, imm: int) {
+  let o = xGetInt(cx, operand, xScratch1())
+  xMovRR(cx.buf, xScratch1(), o)
+  xArithImm32(cx.buf, op, xScratch1(), imm)
+  xPutInt(cx, dst, xScratch1())
+}
+
+// Tries the ADD/SUB-immediate fold (#1853); true if it emitted, in which case
+// the caller is done. Split out of xEmitBinaryInt so that function stays
+// under the complexity ceiling now that a second fold (#3495, below) joined
+// it — the two-way branch this used to be, plus a third op class, would not
+// fit in one function at limit 10. Recomputes `w` from `dst` (the result's
+// own instruction id) rather than taking it as a 6th parameter — `xEmitInst`'s
+// `dst` is always the instruction being compiled, so `cx.f.instrs[dst].ty` is
+// exactly the `w` the caller would otherwise have threaded through.
+fn xTryAddSubImmFold(cx: XCtx, op: XArith, dst: int, lhs: int, rhs: int): bool {
+  if (op != XArith.Add && op != XArith.Sub) {
+    return false
+  }
+  let w = widthOf(cx.ctx, cx.f.instrs[dst].ty)
+  let rc = xConstIntOf(cx.f, rhs)
+  if (rc.known && fitsXArithImm32(rc.ival)) {
+    xEmitArithImmInt(cx, op, dst, lhs, rc.ival, w)
+    return true
+  }
+  // Add is commutative, so a leading literal (`32 + header`) folds the same
+  // way with the operands swapped; Sub is not, so only its rhs is checked.
+  if (op == XArith.Add) {
+    let lc = xConstIntOf(cx.f, lhs)
+    if (lc.known && fitsXArithImm32(lc.ival)) {
+      xEmitArithImmInt(cx, op, dst, rhs, lc.ival, w)
+      return true
+    }
+  }
+  return false
+}
+
+// Tries the AND/OR/XOR-immediate fold (#3495); true if it emitted. And/Or/Xor
+// are all commutative (unlike Sub), so either side may carry the constant;
+// rhs is checked first, matching xLogicalConstSkip's own precedence
+// (x64dispatch.bit's xComputeSkipConstMaterialize relies on the two agreeing
+// exactly) — the group-1 `81 /digit id` form needs no NEW encoder, unlike
+// AArch64's bitmask scheme: any imm32-range value already fits, so this
+// reuses `xArithImm32`/`fitsXArithImm32` as-is.
+fn xTryLogicalImmFold(cx: XCtx, op: XArith, dst: int, lhs: int, rhs: int): bool {
+  if (op != XArith.And && op != XArith.Or && op != XArith.Xor) {
+    return false
+  }
+  let rc = xConstIntOf(cx.f, rhs)
+  if (rc.known && fitsXArithImm32(rc.ival)) {
+    xEmitLogicalImmInt(cx, op, dst, lhs, rc.ival)
+    return true
+  }
+  let lc = xConstIntOf(cx.f, lhs)
+  if (lc.known && fitsXArithImm32(lc.ival)) {
+    xEmitLogicalImmInt(cx, op, dst, rhs, lc.ival)
+    return true
+  }
+  return false
+}
+
 // `dst = lhs <op> rhs` for the group-1 ALU ops.
 fn xEmitBinaryInt(cx: XCtx, op: XArith, dst: int, lhs: int, rhs: int, w: Width) {
-  if (op == XArith.Add || op == XArith.Sub) {
-    let rc = xConstIntOf(cx.f, rhs)
-    if (rc.known && fitsXArithImm32(rc.ival)) {
-      xEmitArithImmInt(cx, op, dst, lhs, rc.ival, w)
-      return
-    }
-    // Add is commutative, so a leading literal (`32 + header`) folds the same
-    // way with the operands swapped; Sub is not, so only its rhs is checked.
-    if (op == XArith.Add) {
-      let lc = xConstIntOf(cx.f, lhs)
-      if (lc.known && fitsXArithImm32(lc.ival)) {
-        xEmitArithImmInt(cx, op, dst, rhs, lc.ival, w)
-        return
-      }
-    }
+  if (xTryAddSubImmFold(cx, op, dst, lhs, rhs)) {
+    return
+  }
+  if (xTryLogicalImmFold(cx, op, dst, lhs, rhs)) {
+    return
   }
   let l = xGetInt(cx, lhs, xScratch1())
   let r = xGetInt(cx, rhs, xScratch2())
@@ -213,6 +268,26 @@ fn xEmitBinaryInt(cx: XCtx, op: XArith, dst: int, lhs: int, rhs: int, w: Width) 
     xCanonNarrow(cx.buf, xScratch1(), w)
   }
   xPutInt(cx, dst, xScratch1())
+}
+
+// Which operand (if any) of a commutative And/Or/Xor is a known constant
+// within imm32 range — used by xComputeSkipConstMaterialize
+// (x64dispatch.bit) ONLY. It mirrors xEmitBinaryInt's own rhs-then-lhs
+// precedence exactly, which the two MUST agree on: a constant this marks
+// "skip materializing" that xEmitBinaryInt then reads as a register is a
+// silent miscompile, the same hazard the ADD/SUB fold's shared
+// `fitsXArithImm32` already avoids by having one definition, not two
+// hand-synced copies.
+fn xLogicalConstSkip(f: IrFunc, rhs: int, lhs: int): int {
+  let rc = xConstIntOf(f, rhs)
+  if (rc.known && fitsXArithImm32(rc.ival)) {
+    return rhs
+  }
+  let lc = xConstIntOf(f, lhs)
+  if (lc.known && fitsXArithImm32(lc.ival)) {
+    return lhs
+  }
+  return -1
 }
 
 // `dst = value * 2^k` as a single `shl` (#3105). No bias, no correction and no
