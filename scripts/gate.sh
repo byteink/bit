@@ -28,6 +28,26 @@
 #                                      # scripts/x64gate.sh (real x86_64 hardware)
 #   scripts/gate.sh --arm64            # route the computed build steps through
 #                                      # scripts/arm64gate.sh (native aarch64-linux)
+#   scripts/gate.sh --mark-green       # after a real full `./make test` pass
+#                                      # (or --full), record HEAD as the last
+#                                      # fully-green commit (#3257). Verifies
+#                                      # via #3256's own rc stamps — refuses
+#                                      # (exit 3) unless every gate `./make
+#                                      # test` runs shows an rc=0 stamped by
+#                                      # ONE shared flush; never a bare claim.
+#                                      # Also refuses on a dirty tree (exit 2).
+#   scripts/gate.sh --resume           # scope against the last-green commit
+#                                      # instead of `main`, re-running only
+#                                      # what could have broken since — for
+#                                      # re-proving a fix after a partial
+#                                      # `./make test` failure (#3257). No
+#                                      # baseline, a stale/foreign baseline, or
+#                                      # an unmappable diff all exit 3
+#                                      # (FULL_REQUIRED) like every other
+#                                      # "cannot scope" case here — never a
+#                                      # silent fallback, never a false pass.
+#                                      # A gate registered since the baseline
+#                                      # is always force-run.
 #
 # EXIT CODES:
 #   0  ran and PASSED — covers GATE_RESULT=PASS and the two distinct
@@ -188,18 +208,50 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 FULL=0
+RESUME=0
+MARK_GREEN=0
 TARGET=local
 for arg in "$@"; do
   case "$arg" in
     --full) FULL=1 ;;
+    --resume) RESUME=1 ;;
+    --mark-green) MARK_GREEN=1 ;;
     --x64) TARGET=x64 ;;
     --arm64) TARGET=arm64 ;;
     *)
-      echo "gate: unknown flag '${arg}' (expected --full, --x64, or --arm64)" >&2
+      echo "gate: unknown flag '${arg}' (expected --full, --resume, --mark-green, --x64, or --arm64)" >&2
       exit 2
       ;;
   esac
 done
+
+if [ "${RESUME}" -eq 1 ] && [ "${FULL}" -eq 1 ]; then
+  echo "gate: --resume and --full are mutually exclusive" >&2
+  exit 2
+fi
+if [ "${MARK_GREEN}" -eq 1 ] && { [ "${FULL}" -eq 1 ] || [ "${RESUME}" -eq 1 ]; }; then
+  echo "gate: --mark-green is exclusive of --full/--resume" >&2
+  exit 2
+fi
+
+# File-to-gate mapping AND the last-green-baseline helpers (#3257) are a
+# separate sourced module (#3480) — see scripts/gate-filemap.sh's own header.
+# Sourced here, ahead of RANGE, so --mark-green/--resume below can use it
+# before this script's own diff-scoping machinery needs it too.
+# shellcheck source=scripts/gate-filemap.sh
+. scripts/gate-filemap.sh
+
+if [ "${MARK_GREEN}" -eq 1 ]; then
+  gate_do_mark_green
+fi
+
+if [ "${RESUME}" -eq 1 ]; then
+  if [ -n "${RANGE:-}" ]; then
+    echo "gate: --resume computes its own scoping range from the last-green baseline; do not also set RANGE" >&2
+    exit 2
+  fi
+  gate_resume_set_range
+fi
 
 RANGE="${RANGE:-main...HEAD}"
 
@@ -268,14 +320,10 @@ noop_list=""
 docs_files=""
 stdlib_files=""
 
-# File-to-gate mapping is a separate sourced module (#3480) —
-# gates_for_file(), assert_dirgates_current() (which runs immediately below,
-# self-checking the mapping is complete before any file is classified) and
-# testsbit_steps_for() all live in scripts/gate-filemap.sh; see its header
-# comment for what each does. Pure move: nothing here changed behaviorally,
-# only its location.
-# shellcheck source=scripts/gate-filemap.sh
-. scripts/gate-filemap.sh
+# gates_for_file(), assert_dirgates_current() and testsbit_steps_for() are
+# defined in scripts/gate-filemap.sh, already sourced above (moved there by
+# #3257 so --mark-green/--resume can use that module's other helpers before
+# this point too); see that file's header for what each does.
 
 # Trims a class-literal-shaped diff hunk `$1` (one field's worth of added
 # lines, `+` already stripped, comment/blank lines allowed anywhere) down to
@@ -649,6 +697,9 @@ fi
 
 build_steps_for_bucket
 union_testsbit_steps
+if [ "${RESUME}" -eq 1 ]; then
+  gate_resume_inject_new_gates
+fi
 assert_full_is_superset
 
 bucket_scripts "${BUCKET}"
@@ -738,6 +789,9 @@ fi
 if [ "${UNDECIDED_SEEN}" -eq 1 ]; then
   echo "GATE_RESULT=UNDECIDED"
   exit 4
+fi
+if [ "${RESUME}" -eq 1 ]; then
+  gate_resume_report_push_ok
 fi
 echo "GATE_RESULT=PASS"
 exit 0
