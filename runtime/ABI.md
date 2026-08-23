@@ -1549,6 +1549,7 @@ defined exactly once).
 | `bit_rt_fs_list_dir`  | `(path: *const RtBytes) -> *const RtBytes` (§14)        |
 | `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not NUL-terminated, not `RtBytes`; the only `bit_rt_fs_*` entry point shaped this way) |
 | `bit_rt_fs_sync`      | `(fd: i64) -> i64` (§14, `0` on success, `-1` on failure; Darwin uses `F_FULLFSYNC`, falling back to bare `fsync` only on `ENOTSUP` — bare `fsync` alone does not flush the drive's write cache on that platform) |
+| `bit_rt_fs_cwd`       | `() -> *const RtBytes` (§14, the process's current working directory, or the empty string on any failure; #3501) |
 | `bit_rt_test_index`   | `() -> i64` (§16)                                      |
 | `bit_rt_floor`        | `(x: f64) -> f64` (§17)                                |
 | `bit_rt_ceil`         | `(x: f64) -> f64` (§17)                                |
@@ -1598,6 +1599,9 @@ defined exactly once).
 | `bit_rt_crypto_ghash_mul_hw` | `(acc0, acc1, b0, b1, h0, h1: u64, outHi: *u64) -> u64` (§21b) |
 | `bit_rt_crypto_sha256_compress_hw` | `(state: *u32, block: *byte) -> void` (§21b) |
 | `bit_rt_crypto_hwcaps` | `() -> u64` (§21c) |
+| `bit_rt_aes_hw_expand_key` | `(key: i64, keyBits: i64, roundKeys: i64) -> void` (§21d) |
+| `bit_rt_aes_hw_encrypt_block` | `(roundKeys: i64, rounds: i64, blockIn: i64, out: i64) -> void` (§21d) |
+| `bit_rt_aes_hw_decrypt_block` | `(roundKeys: i64, rounds: i64, blockIn: i64, out: i64) -> void` (§21d) |
 
 **Narrow return values.** The C ABI returns a `bool` in `al`/`w0` and leaves the
 rest of the return register **unspecified**; the same is true of any sub-word
@@ -1923,6 +1927,7 @@ bit_rt_fs_read_all_failed()       -> bool       // #2994/#3065/#2996 below
 bit_rt_fs_read(fd, max: i64)      -> string     // up to max bytes; "" at EOF
 bit_rt_fs_write(fd, s)            -> i64        // bytes written, or -1
 bit_rt_fs_sync(fd)                -> i64        // 0, or -1 (#3462)
+bit_rt_fs_cwd()                   -> string     // cwd, or "" on failure (#3501)
 bit_rt_fs_close(fd)               -> i64        // always 0
 bit_rt_fs_exists(path)            -> bool
 bit_rt_fs_is_dir(path)            -> bool
@@ -1997,6 +2002,28 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   primitives only, no consumer. Pass 2 (a `File.sync()` method in
   `stdlib/fs/fs.bit`) is a follow-up ticket, gated on a release containing
   this commit and a stage0 repin to it.
+- `fs_cwd` (#3501) is the only `bit_rt_fs_*` entry point that takes NO
+  argument — nothing to encode through `fsPathZ`/`checkedPathW`. Darwin and
+  Linux both call `getcwd` (libc on Darwin, the raw syscall on Linux — kernel
+  `fs/d_path.c`'s `SYSCALL_DEFINE2(getcwd, ...)` returns the byte count
+  INCLUDING the trailing NUL on success, unlike a `read`, so the wrapper trims
+  one byte off), sized to `max_path` (4096) and rejected — never truncated —
+  if the result would not fit. Windows calls `GetCurrentDirectoryW` into a
+  `MAX_PATH` (260-unit) UTF-16LE scratch buffer, then decodes through the same
+  `winUtf16ToUtf8` boundary every other Windows path-taking primitive uses.
+  Empty string on any failure (`getcwd` returning NULL/negative-errno,
+  `GetCurrentDirectoryW` returning 0, or either result not fitting its
+  platform's ceiling) — the same flat-failure shape `fs_open`/`fs_mkdir`
+  already use, no companion out-of-band flag. **No `stdlib/` caller exists
+  yet** — the identical `tools/build/` bootstrap cycle #2153's and #3462's own
+  bullets describe: `tools/build/artifacts.bit` imports `std/fs`, which the
+  PINNED stage0 compiles against its own frozen `libbitrt.a`, so a
+  `stdlib/fs/fs.bit` reference to `bit_rt_fs_cwd` breaks the driver bootstrap
+  with E0078 on every fresh clone until a release ships this commit and the
+  pin moves. This landing is pass 1 of 2 (the #3065 pattern): the runtime
+  primitive only, no consumer. Pass 2 (a `std/fs` function surfacing it) is a
+  follow-up ticket, gated on a release containing this commit and a stage0
+  repin to it.
 - `fs_read` reads once and returns what it got, so it is the primitive for
   pipes, sockets, and stdin — none of which have a size to seek to.
 - `fs_list_dir` separates entries with a **NUL** byte, the one byte a POSIX
@@ -2708,6 +2735,60 @@ timebase makes.
 
 ---
 
+## 21d. ARM64 AES block cipher and key schedule (`runtime/cryptohw/armaes.bit`, #2522, epic #1224)
+
+```
+bit_rt_aes_hw_expand_key(key, keyBits, roundKeys)          // FIPS-197 KeyExpansion
+bit_rt_aes_hw_encrypt_block(roundKeys, rounds, blockIn, out)
+bit_rt_aes_hw_decrypt_block(roundKeys, rounds, blockIn, out)
+```
+
+AES-128 and AES-256 only (`bit_rt_aes_hw_expand_key` panics on any other
+`keyBits`); AES-192 is not implemented. Every parameter is a raw address
+(`int`) — `key`/`blockIn`/`out` point at 16-byte buffers except `key` for
+AES-256 (32 bytes), and `roundKeys` points at `16*(rounds+1)` bytes (176 for
+AES-128, 240 for AES-256), the same flat forward-schedule layout
+`stdlib/crypto/aes.bit`'s own (untouched) `expandKey` already produces.
+
+**PLATFORM-FREE, not per-OS** — unlike §21c's `bit_rt_crypto_hwcaps`, this file
+needs no OS service (no syscall, no `sysctlbyname`), only the CPU's own ARMv8
+Cryptographic Extension instructions (AESE/AESMC/AESD/AESIMC), so one source
+file is compiled once per TARGET (x86_64-linux, aarch64-linux, aarch64-macos)
+the same way `runtime/syscalls/syscalls.bit` already is. Every exported
+function starts `if (onX64()) return` — a no-op on x86_64, since Bit has no
+arch-conditional compilation (SPEC §11.8).
+
+**THE EXTENSION IS OPTIONAL ON AARCH64**, unlike NEON — a Cortex-A72 (the
+chip in a Raspberry Pi 3/4, and this project's own remote `mypi` fleet
+includes one) has no AES instructions, and issuing one is `SIGILL`. So every
+exported function also calls `aesRequireHwSupport`, which reads bit 0 (AES)
+of `bit_rt_crypto_hwcaps()` and panics with a clear message rather than
+letting the CPU fault — a diagnosable panic beats a raw illegal-instruction
+crash, which is worse than the alternative of simply being slower.
+
+**NO CALLER YET.** These three pins exist so #2526 (route `stdlib/crypto`'s
+AES through them) has something to call; wiring them up hits the same
+stage0-bootstrap wall #2521 documented and needs its own release + repin.
+
+**Key schedule** is textbook FIPS-197 §5.2 KeyExpansion — RotWord, SubWord,
+Rcon every `Nk` words, plus one extra SubWord at word 4 of the core for
+256-bit keys — with SubWord computed via AESE against a zeroed round key
+rather than the software constant-time S-box: XOR-with-zero is a no-op, so
+AESE's SubBytes+ShiftRows over four IDENTICAL 32-bit lanes degenerates to
+SubBytes alone (ShiftRows permutes four equal values), giving a
+hardware-accelerated, position-preserving 4-byte S-box substitution in one
+instruction.
+
+**Block cipher** is the standard ARMv8 idiom: encrypt is `Nr-1` rounds of
+AESE+AESMC over round keys `w[0..Nr-2]`, one more AESE with `w[Nr-1]` (the
+last full round has no MixColumns), then a plain XOR with `w[Nr]`. Decrypt
+uses FIPS §5.3.5's "equivalent inverse cipher" — the same AESD+AESIMC shape,
+over an inverse schedule `dw[]` this primitive derives itself, once per call,
+from the FORWARD schedule it is handed: `dw[0] = w[Nr]`, `dw[Nr] = w[0]`
+unchanged, `dw[i] = AESIMC(w[Nr-i])` for the interior keys.
+
+---
+
 ## 22. Shared mutable state audit (#1248)
 
 Every container-scope mutable in `runtime/**/*.bit` (grep: `^let ` at module
@@ -2955,3 +3036,38 @@ single-word one — is the one way otherwise-safe Bit code can reach real
 memory-unsafety, and it is exactly why the audit in §22 above only needed to
 reason about *runtime*-internal state: user Bit code gets no such audit for
 free, which is the whole reason §13.7 and this section exist.
+
+## 24. CPU sampling profiler (`runtime/root/darwin/prof.bit`, #1906)
+
+```
+bit_rt_prof_start(intervalMicros: int) -> int   // 0 ok, -1 on a libSystem failure
+bit_rt_prof_stop()                     -> int   // samples stored (<= 8192)
+bit_rt_prof_sample(i: int)             -> int   // ring slot i, or -1 out of range
+```
+
+**aarch64-macos only.** Darwin `SIGPROF` (27) via `setitimer(ITIMER_PROF, ...)`
+(`<sys/time.h>`), a leaf-PC sampler in the same `@nosplit` handler style as
+§12's `segvHandler`/`trapHandler` (../root/darwin/signal.bit) — same ucontext
+offsets, reused rather than re-derived. Every tick records ONLY the
+interrupted instruction's address (no frame-pointer walk from signal
+context), into a fixed 8192-entry ring allocated once as module state (Power
+of 10 rule 3): a busier run than that reports its true tick count from
+`bit_rt_prof_stop` and simply drops samples past the cap, rather than
+growing.
+
+**Single-OS-thread scope, stated rather than hidden.** BSD/XNU deliver a
+process-directed itimer's signal to an arbitrary unblocked thread; this file
+attempts no per-worker distribution (no `timer_create`-equivalent), so
+coverage is validated only at `BIT_WORKERS=1`. A multi-worker build may see
+samples cluster on whichever OS thread the kernel happens to pick.
+
+**ASLR.** This binary is PIE (§4's stack-map section already notes dyld
+rebases `.bit_gc`'s absolute code pointers for the same reason). A signal
+context's `pc` is a runtime (slid) address; `bit_rt_prof_start` captures
+`_dyld_get_image_vmaddr_slide(0)` once and every stored sample has it
+subtracted, so recorded addresses are file-relative — directly comparable to
+the binary's own Mach-O local symbol table (`compiler/machoreloc.bit`: "one
+LOCAL entry per surviving `__text` function") with no further correction at
+render time. `std/prof` (userland API) and `tools/prof/render.bit`
+(symbolizing reader) are the two halves built on top of these three symbols;
+see their own file headers.

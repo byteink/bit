@@ -136,79 +136,9 @@ fn makeChan(): chan<int> {
 
 ## Classes
 
-A class groups named fields. Classes are **reference types** (like TypeScript
-objects): assigning one copies the handle, and mutations are visible through
-both. Fields marked `export` are visible outside the module (see
-[Modules](modules.md)).
-
-```bit
-class Point { x: f64; y: f64 }
-
-class User {
-  export name: string    // visible to other modules
-  age: int               // module-private
-}
-
-fn classes() {
-  let p = Point{ x: 1.0, y: 2.0 }   // keyed literal, always type-prefixed
-  let q = Point{ x: 3.0 }           // y omitted -> zero value 0.0
-  let shared = p                    // copies the handle
-  shared.x = 9.0                    // p.x is now 9.0 too (reference semantics)
-}
-```
-
-Reference semantics have one consequence worth knowing up front: a class field
-whose own type is a class **must** be given a value. It has no zero value,
-because zero bits in a reference field is a null, not a live instance.
-
-```bit ignore
-class Inner { xs: []u32 }
-class Outer { a: int, b: Inner }
-
-let bad = Outer{ a: 1 }              // E0083 - `b` omitted
-let alsoBad: Outer                   // E0083 - no initializer
-let orThis = []Outer(2)              // E0083 - `[]T(n)` means n zero values
-let good = Outer{ a: 1, b: Inner{} } // fine; `Inner` has no class-typed field
-let empty = []Outer(0)               // fine; asks for no zero values
-```
-
-Every other field type stays omittable, including an inline `[N]T`, because
-their zero value really is zero bits.
-
-The same fact rules out a **cycle** of class-typed fields, at any length. There
-is no way to build one, because every step obliges another:
-
-```bit ignore
-class Node { v: int, next: Node }   // E0047 - one hop
-class A { b: B }                    // E0047 - A -> B -> A
-class B { a: A }
-```
-
-The layout would be fine (a class field is one handle, so nothing here is
-infinitely large). It is that no value of the type exists to write. Break the
-cycle with any type that has an empty or `nil` state - `Option<T>` is the
-idiomatic one:
-
-```bit
-class ListNode { v: int, next: Option<ListNode> }   // linked list
-class TreeNode { v: int, kids: []TreeNode }         // a slice terminates too
-class TrieNode { next: map<rune, TrieNode> }        // and so does a map
-```
-
-A map whose value type is such a class is still fine to build, insert into,
-iterate and delete from. Only reading a **missing** key needs a zero value, so
-that one read panics - and the two-result form, which exists to ask whether a
-key is there, does not:
-
-```bit ignore
-let m = map<int, Outer>{}
-m[1] = Outer{ a: 1, b: Inner{} }   // fine
-let good = m[1]                    // fine - the key is there
-let (v, ok) = m[7]                 // fine - ok is false, do not read v
-let bad = m[7]                     // panics: 'Outer' has no zero value
-```
-
-Methods attach behavior to a class; see [Functions](functions.md#methods).
+Classes get their own chapter - declaration, fields and zero values, composite
+literals, reference semantics, methods, and comparability - see
+[Classes](classes.md).
 
 ## Type aliases
 

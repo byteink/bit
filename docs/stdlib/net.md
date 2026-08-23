@@ -120,7 +120,7 @@ only then call `close`.
 
 A server that accepts and never answers parks `dial`/`read`/`write` forever -
 these give a caller a bound instead. `deadlineNs` is an ABSOLUTE monotonic
-nanosecond deadline (`std/time`'s `monotonic()` plus a budget), not a
+nanosecond deadline (`std/time`'s `monotonic().ns` plus a budget), not a
 duration - resolve it once and it covers connect, write and read together,
 never restarting per call.
 
@@ -154,7 +154,7 @@ import { monotonic } from "std/time"
 // One request, bounded to 500ms total for connect + write + read - a server
 // that accepts and never answers gets a `fail`, not an indefinite park.
 fn boundedRoundTrip(port: int, msg: string): string! {
-  let deadline = monotonic() + 500 * 1000000
+  let deadline = monotonic().ns + 500 * 1000000
   let c = dialDeadline("127.0.0.1", port, deadline)?
   c.writeDeadline(msg)?
   let reply = c.readDeadline(4096)?

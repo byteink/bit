@@ -67,6 +67,12 @@ returns `""` with no error.
 
 Writes `s`.
 
+### `File.sync(): ()!`
+
+Flushes this file's written bytes to stable storage. Until this returns, a
+write that `write` already reported as successful can still be lost to a
+power failure.
+
 ### `File.close()`
 
 Releases the handle. Safe to call once; do not use the `File` afterwards.

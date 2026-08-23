@@ -1,9 +1,10 @@
 # Functions
 
-Functions are declared with `fn`, are first-class values, and attach to
-types as methods via an explicit receiver. This chapter also covers the control-
-flow statements that live in function bodies. (Spec: §10.3–§10.5, §12.4, §12.8,
-§13.1.)
+Functions are declared with `fn` and are first-class values. This chapter also
+covers the control-flow statements that live in function bodies. Attaching a
+function to a class as a method uses the same `fn` syntax with an explicit
+receiver - see [Methods](classes.md#methods) in the Classes chapter. (Spec:
+§10.3, §12.4, §12.8, §13.1.)
 
 ## Declaring functions
 
@@ -57,34 +58,6 @@ fn callers() {
   let b = sum(...nums)         // spread a slice
 }
 ```
-
-## Methods {#methods}
-
-A method is a function with a receiver written before its name. The receiver
-type must be a class or type alias declared in the same module. Because classes
-are reference types, a method that mutates a field mutates the caller's value -
-no pointer receivers needed.
-
-```bit
-class Counter { n: int }
-
-fn (c: Counter) increment() {
-  c.n += 1                     // mutates the caller's Counter
-}
-
-fn (c: Counter) value(): int {
-  return c.n
-}
-
-fn useCounter() {
-  let c = Counter{ n: 0 }
-  c.increment()
-  let v = c.value()            // 1
-}
-```
-
-Methods participate in structural interface satisfaction (see
-[Interfaces](interfaces.md)).
 
 ## First-class functions and arrow functions
 

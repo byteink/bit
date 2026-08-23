@@ -164,9 +164,7 @@ fn lowerForOf(fc: FnCtx, node: int) {
       rebindCheckerName(fc, k[0], elemTy)
     }
   }
-  let deferBase = deferMark(fc)
   lowerStmtList(fc, k[2])
-  deferScopeEnd(fc, deferBase, k[2])
   truncateEnv(fc, bodyMark)
   fc.loops = fc.loops[0:len(fc.loops) - 1]
   if (!fc.terminated) {
@@ -262,9 +260,7 @@ fn lowerForOfChan(fc: FnCtx, k: []int, chanTy: int, elemTy: int, binderNode: Nod
   let bodyMark = len(fc.env)
   declareLocal(fc, fc.c.source[binderNode.span.start:binderNode.span.end], elemV, elemTy)
   rebindCheckerName(fc, k[0], elemTy)
-  let deferBase = deferMark(fc)
   lowerStmtList(fc, k[2])
-  deferScopeEnd(fc, deferBase, k[2])
   truncateEnv(fc, bodyMark)
   fc.loops = fc.loops[0:len(fc.loops) - 1]
   if (!fc.terminated) {
@@ -330,9 +326,7 @@ fn lowerForC(fc: FnCtx, node: int) {
   builderBeginBlock(fc.b, bodyBlk)
   fc.terminated = false
   let bodyMark = len(fc.env)
-  let deferBase = deferMark(fc)
   lowerStmtList(fc, k[3])
-  deferScopeEnd(fc, deferBase, k[3])
   truncateEnv(fc, bodyMark)
   fc.loops = fc.loops[0:len(fc.loops) - 1]
   if (!fc.terminated) {
@@ -413,205 +407,13 @@ fn lowerBinding(fc: FnCtx, node: int) {
   rebindCheckerName(fc, kids[0], declared)
 }
 
-// Captures one deferred call's operand as a hidden env local so a loop entered
-// between the `defer` statement and its replay threads it through the header
-// like any other live local (#2078) — `runDefers` reads the CURRENT value back
-// out of this slot rather than the value id captured here, which a loop's
-// back edge may have left outside the loop it now needs to be read inside
-// (compiler/verify.bit). Named "$defer": SPEC identifiers never start with
-// `$` (compiler/lexer.bit's isIdentStart), so this can never collide with a
-// source local — the same idiom `lowerForOf`'s "$iter"/"$idx" already use.
-fn deferSlot(fc: FnCtx, value: int): int {
-  declareLocal(fc, "$defer", value, fc.b.instrs[value].ty)
-  return len(fc.env) - 1
-}
-
-// `deferSlot` over a whole argument list, in order.
-fn deferSlots(fc: FnCtx, values: []int): []int {
-  let slots = []int(0)
-  let i = 0
-  while (i < len(values)) {
-    slots = append(slots, deferSlot(fc, values[i]))
-    i = i + 1
-  }
-  return slots
-}
-
-// A `defer <call>`: the call's arguments are evaluated now (lowered at the defer
-// site), but the call itself is emitted at every function exit, in reverse
-// (LIFO) order. Only print/direct-function-call deferrals for now.
-fn lowerDefer(fc: FnCtx, node: int) {
-  let call = kidsOf(fc.c.tree, node)[0]
-  let callN = getNode(fc.c.tree, call)
-  if (callN.tag != Tag.Call) {
-    fcFail(fc, callN.span, "a `defer` whose argument is not a call expression")
-    return
-  }
-  let callee = kidsOf(fc.c.tree, call)[0]
-  let cn = getNode(fc.c.tree, callee)
-  // `defer recv.method(...)` — the idiom every resource-releasing `defer` uses
-  // (`defer f.close()`). Receiver and arguments are evaluated HERE, at the defer
-  // site; only the call itself is held back to the exit.
-  if (cn.tag == Tag.Member) {
-    let mk = kidsOf(fc.c.tree, callee)
-    let recvTy = nodeType(fc, mk[0])
-    if (recvTy == 0) {
-      fcFail(fc, getNode(fc.c.tree, mk[0]).span, "a deferred method call whose receiver type could not be resolved")
-      return
-    }
-    let mn = getNode(fc.c.tree, mk[1])
-    let mname = fc.c.source[mn.span.start:mn.span.end]
-    let recvV = lowerExpr(fc, mk[0])
-    // `defer` evaluates its arguments HERE but hands the stashed values to the
-    // callee at the exit, so a literal materialized at the wrong type is never
-    // corrected later — the same hint a direct method call gets (#1467).
-    let a = lowerArgs(fc, call, methodParamTypes(fc, recvTy, mname))
-    if (fc.failed) {
-      return
-    }
-    let mi = mkInstr(Op.Call, fc.c.ctx.voidId)
-    if (fc.c.ctx.types[recvTy].kind == TypeKind.Interface) {
-      mi = mkInstr(Op.CallIface, fc.c.ctx.voidId)
-      mi.ival = methodId(fc.lowerer, mname)
-      let lhsSlot = deferSlot(fc, recvV)
-      fc.defers = append(fc.defers, DeferCall{ instr: mi, argSlots: deferSlots(fc, a), lhsSlot: lhsSlot })
-      return
-    }
-    // A concrete receiver leads the argument list, as in a direct method call.
-    let all = [recvV]
-    let j = 0
-    while (j < len(a)) {
-      all = append(all, a[j])
-      j = j + 1
-    }
-    mi.name = methodSymbol(fc.lowerer, mname, recvTy)
-    fc.defers = append(fc.defers, DeferCall{ instr: mi, argSlots: deferSlots(fc, all), lhsSlot: -1 })
-    return
-  }
-  if (cn.tag != Tag.Ident) {
-    fcFail(fc, cn.span, "a deferred call whose callee is not a name or a method access")
-    return
-  }
-  let name = fc.c.source[cn.span.start:cn.span.end]
-  let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
-  let a = []int(0)
-  if (name == "print" || name == "eprint") {
-    ins.name = name
-    a = lowerArgs(fc, call, []int(0))
-  } else {
-    // The same resolution a direct call gets — module qualification AND generic
-    // instantiation. Deriving the name from source text here emitted a bare `g`
-    // for a deferred generic whose only definition was `g$0`.
-    let t = resolveCallTarget(fc, name, call)
-    if (!t.ok) {
-      fcFail(fc, cn.span, "a deferred call whose target could not be resolved")
-      return
-    }
-    ins = mkInstr(Op.Call, t.result)
-    ins.name = t.symbol
-    a = lowerArgsFor(fc, call, t.owner, t.decl, t.paramTypes)
-  }
-  if (fc.failed) {
-    return
-  }
-  fc.defers = append(fc.defers, DeferCall{ instr: ins, argSlots: deferSlots(fc, a), lhsSlot: -1 })
-}
-
-// Emits the pending deferred calls in reverse (LIFO) order at a function exit.
-// Builds a FRESH IrInstr each replay from its captured env slots' CURRENT
-// value, rather than reusing the ids baked in when it was lowered (DeferCall) —
-// `IrInstr` is a reference type here, so mutating `dc.instr` in place would
-// retroactively corrupt every earlier exit's already-emitted copy of the same
-// object (#2078: two exits from one `defer` shared one instruction, and the
-// second exit's operands silently overwrote the first's).
-fn runDefers(fc: FnCtx) {
-  let i = len(fc.defers) - 1
-  while (i >= 0) {
-    let dc = fc.defers[i]
-    let t = dc.instr
-    let lhs = t.lhs
-    if (dc.lhsSlot >= 0) {
-      lhs = fc.env[dc.lhsSlot].value
-    }
-    let args = []int(0)
-    let j = 0
-    while (j < len(dc.argSlots)) {
-      args = append(args, fc.env[dc.argSlots[j]].value)
-      j = j + 1
-    }
-    let ins = IrInstr{ op: t.op, ty: t.ty, args: args, lhs: lhs, rhs: t.rhs,
-      ival: t.ival, ival2: t.ival2, fval: t.fval, bval: t.bval, sval: t.sval,
-      name: t.name, offsets: t.offsets, thenArgs: t.thenArgs, elseArgs: t.elseArgs }
-    builderEmit(fc.b, ins)
-    i = i - 1
-  }
-}
-
-// A bare block `{ … }` as a statement (SPEC's plain block scoping) is
-// unconditional, unlike an if/while/for body: it always runs exactly once, so
-// #2378's E0092 refusal (deferScopeEnd) does not apply here — a `defer`
-// inside always replays at some later function exit, same as if it sat
-// directly in the enclosing scope. Two cases at the closing brace:
-//
-//   - the block always exits by return/fail with no break/continue escaping
-//     it (mirrors deferScopeEnd's terminated branch): every defer registered
-//     here already replayed at that exit and nothing after the block is
-//     reachable, so drop them.
-//   - otherwise (falls through, or escapes via break/continue to an
-//     enclosing loop/switch): those defers are still pending for a later
-//     exit, but their "$defer" operand slots (deferSlot) were pushed onto
-//     the SAME env the block's own locals used and are about to be
-//     truncated away with them — rehome each to a fresh slot below `mark`
-//     first, or `runDefers` later indexes past the truncated env (#3443).
+// A bare block `{ … }` as a statement (SPEC's plain block scoping): always
+// runs exactly once, so it introduces no conditional-region concern for
+// anything registered inside it — every defer's flag+slots already live at
+// function entry (#2378) regardless of which block they were written from.
+// Only the block's OWN locals need to go out of scope at the closing brace.
 fn lowerBareBlock(fc: FnCtx, node: int) {
   let mark = len(fc.env)
-  let defersMark = deferMark(fc)
   lowerStmtList(fc, node)
-  if (fc.terminated && !deferJumpEscapes(fc, node, 0, false, false)) {
-    fc.defers = fc.defers[0:defersMark]
-    truncateEnv(fc, mark)
-    return
-  }
-  closeBlockScope(fc, mark)
-}
-
-// Drops every env local at or beyond `mark` (a block's own scope), first
-// rehoming any pending defer's operand slot in that range to a fresh slot
-// below `mark` so its current value survives the truncation.
-fn closeBlockScope(fc: FnCtx, mark: int) {
-  let vals = []int(0)
-  let i = 0
-  while (i < len(fc.defers)) {
-    let dc = fc.defers[i]
-    if (dc.lhsSlot >= mark) {
-      vals = append(vals, fc.env[dc.lhsSlot].value)
-    }
-    let j = 0
-    while (j < len(dc.argSlots)) {
-      if (dc.argSlots[j] >= mark) {
-        vals = append(vals, fc.env[dc.argSlots[j]].value)
-      }
-      j = j + 1
-    }
-    i = i + 1
-  }
   truncateEnv(fc, mark)
-  let k = 0
-  i = 0
-  while (i < len(fc.defers)) {
-    let dc = fc.defers[i]
-    if (dc.lhsSlot >= mark) {
-      dc.lhsSlot = deferSlot(fc, vals[k])
-      k = k + 1
-    }
-    let j = 0
-    while (j < len(dc.argSlots)) {
-      if (dc.argSlots[j] >= mark) {
-        dc.argSlots[j] = deferSlot(fc, vals[k])
-        k = k + 1
-      }
-      j = j + 1
-    }
-    i = i + 1
-  }
 }

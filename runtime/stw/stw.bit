@@ -207,28 +207,38 @@
 // — the SAME population `stwScanTasks` counts as `held == false`.
 //
 // `stwScanOwnStack` (below `stwScanTasks`) closes this the same way class 8
-// closes it for a task-held stack, keyed off a different source for the TOP:
-// `worldStackTop(world, slot)` (`../gc/gcworld.bit`, #2646) — the highest
-// address of `slot`'s owning OS thread's own stack, published once by that
-// thread itself, 0 when unknown. Called from `stwScanTasks` after the
-// registry walk, only when `held` stayed false, with the collector's own
-// slot threaded down from `stwCollect`'s `selfSlot`; it scans `[sp, top)`
-// exactly as `stwScanStackRange` does for every other class, and refuses —
-// scans nothing, touches nothing — when `top` is 0 or is not strictly above
-// `sp`, for the same reason class 8's header gives: past the real stack top
-// is unmapped, and a faulting collector is worse than the sweep it prevents.
+// closes it for a task-held stack, keyed off `slot`'s owning OS thread's own
+// stack TOP and BASE (`worldStackTop`/`worldStackBase`, `../gc/gcworld.bit`,
+// #2646/#3516), both published once by that thread itself, 0 when unknown.
+// Called from `stwScanTasks` after the registry walk, only when `held`
+// stayed false, with the collector's own slot threaded down from
+// `stwCollect`'s `selfSlot`; it scans `[sp, top)` exactly as
+// `stwScanStackRange` does for every other class, and refuses — scans
+// nothing, touches nothing — unless `sp` is actually CONTAINED between
+// `base` and `top`, for the same reason class 8's header gives: past the
+// real stack top is unmapped, and a faulting collector is worse than the
+// sweep it prevents.
 //
-// NOT YET POPULATED IN PRODUCTION. #2646 added `worldStackTop`'s STORAGE and
-// its plain-load/store doors; nothing calls `worldSetStackTop` yet — that is
-// #2649, blocked on #2647/#2648 publishing each platform's real
-// `threadStackTop()`. Until #2649 lands, `top` reads 0 for every slot on a
-// live boot, so `stwScanOwnStack` is correctly wired and correctly a no-op:
-// it runs on every unheld collection and scans nothing. The measured
-// population above is therefore still actually uncovered on a live runtime
-// today; what changed here is that the mechanism exists and is reachable,
-// not that the gap is closed. #1837 tracks that; deriving the datum from the
-// frame-pointer chain instead needs the stack-map validation that lives in
-// `../gc/stackmap.bit`, which #2646/#2649's explicit registry field avoids.
+// POPULATED IN PRODUCTION SINCE #2649/03d15de3, AND THAT EXPOSED A REAL BUG
+// (#3514/#3516). #2646 added `worldStackTop`'s storage and doors with no
+// caller, so `top` read 0 for every slot and this class was correctly wired
+// but a permanent no-op — the measured population above was still actually
+// uncovered on a live runtime. #2649 gave it its only caller
+// (`../gc/gcworldsync.bit`'s `mutatorSlot`, on the claim), which made this
+// class live for the first time — but its guard back then was only `top <=
+// 0 || top <= sp`, an upper bound with no lower one. `sp` is the COLLECTING
+// thread's live stack pointer, which is not always on that thread's OWN
+// OS-thread stack — it may be on a runtime-allocated TASK stack instead
+// (`tests/stress/stwcollect`'s private-world design puts it there on
+// purpose) — and on macOS a task stack sits at a LOWER address than the
+// pthread stack, so `top <= sp` never caught the mismatch: the collector
+// conservatively scanned from the task stack's `sp` up to the OS thread's
+// `top`, across ~1.86 GB of unrelated mappings, and faulted. #3516 adds
+// `worldStackBase` alongside `worldStackTop`, published in the same call, so
+// the guard can require actual containment instead of an upper bound alone.
+// #1837 tracks the remaining precision gap (deriving `sp`'s frame from the
+// frame-pointer chain instead needs the stack-map validation in
+// `../gc/stackmap.bit`, which the explicit registry fields avoid).
 //
 // Classes 4, 5, 7, 8 and 10 are reachable only when a scheduler block is bound;
 // class 1 only when a channel registry is. `stwBind` takes all three addresses TOGETHER
@@ -239,7 +249,7 @@
 
 import { worldPark, worldRendezvous, worldRestart } from "../gc"
 import { worldLockTry, worldLockRelease, worldParkedFrame } from "../gc"
-import { worldStackTop } from "../gc"
+import { worldStackTop, worldStackBase } from "../gc"
 import { worldSyscallSp, worldSyscallRegs, worldSyscallRegWords, worldHighWaterMark } from "../gc"
 import { worldEnsureSelfOn } from "../gc"
 import { worldEnsureSelf, maxMutators } from "../gc"
@@ -630,17 +640,21 @@ export @nosplit @symbol("bit_rt_port_stw_unheld") fn stwUnheldCount(): int {
 // worker between tasks, or the bootstrap thread before the first task exists.
 // See "CLASS 8b" in the ROOT SET header above for the full rationale.
 //
-// `top` is `slot`'s owning thread's published stack top (`worldStackTop`,
-// `../gc/gcworld.bit`, #2646) — 0 when that thread has never published one.
-// Refuses to scan on either open condition, deliberately in this order so
-// the second comparison never runs against an unpublished (0) top: past the
-// real stack top is unmapped, and a faulting collector is worse than the
-// sweep it prevents. No fixed window is substituted for a missing or
-// non-positive `top` — the whole point is that a guess here is unsafe, not
-// merely imprecise.
+// `top`/`base` are `slot`'s owning thread's published stack top/base
+// (`worldStackTop`/`worldStackBase`, `../gc/gcworld.bit`, #2646/#3516) — 0
+// when that thread has never published one. Refuses to scan unless BOTH are
+// positive AND `sp` is actually CONTAINED between them (#3516): `sp` is the
+// COLLECTING thread's live stack pointer, which may be on a runtime task
+// stack rather than this slot's OS-thread stack — `top` alone (an upper
+// bound only) cannot tell those apart, and on macOS a task stack sits at a
+// LOWER address than the pthread stack, so `top <= sp` never caught it. A
+// faulting collector is worse than the sweep it prevents, so containment is
+// required outright rather than substituting a fixed window or a size
+// heuristic for a missing bound.
 @nosplit fn stwScanOwnStack(g: *i64, world: *i64, slot: int, sp: int) {
   let top = worldStackTop(world, slot)
-  if (top <= 0 || top <= sp) {
+  let base = worldStackBase(world, slot)
+  if (top <= 0 || base <= 0 || base > sp || sp >= top) {
     return
   }
   stwScanStackRange(g, sp, top)

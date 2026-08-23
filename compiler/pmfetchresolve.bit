@@ -200,31 +200,45 @@ fn versionGreater(a: Version, b: Version): bool {
 // means a failed fetch leaves nothing at `finalDir` at all: a corrected retry
 // (the right sha, a reachable host) succeeds on its own, no manual cleanup
 // needed.
+//
+// `target.pkgDir` is `bit.lock`'s `LockEntry.dir` (#3270): non-empty only for
+// a vanity dependency whose `bit-import:` document named a subdirectory of a
+// larger repository as the package's own root (SPEC §17.7, e.g. a
+// first-party package under `pkg/<name>/`). Passed straight to
+// `fetchGitInto`, which narrows the fetch/checkout to it (#3470) — empty
+// keeps today's whole-repository behaviour byte-for-byte, since a
+// whole-repo package has no subdirectory to narrow to.
+//
+// `remote` and `target` bundle what were 7 scalar params (E0202, #3481):
+// `remote` (`GitRemoteRepo`, below) is the cache-path identity
+// (`host`/`owner`/`repo`), `target` (`GitFetchTarget`, below) is
+// `fetchGitInto`'s own fetch target (`url`/`sha`/`pkgDir`) and is passed
+// straight through unwrapped rather than rebuilt.
 export fn fetchSha(
-  gitBin: string, cacheRoot: string, host: string, owner: string, repo: string,
-  url: string, sha: string, timeoutMs: int,
+  gitBin: string, cacheRoot: string, remote: GitRemoteRepo, target: GitFetchTarget,
+  timeoutMs: int,
 ): FetchResult! {
-  if (!isFullSha(sha)) {
-    fail newError("pmfetch: fetchSha needs an already-resolved commit sha, got: ${sha}")
+  if (!isFullSha(target.sha)) {
+    fail newError("pmfetch: fetchSha needs an already-resolved commit sha, got: ${target.sha}")
   }
-  validateSegment(host)?
-  validateOwnerPath(owner)?
-  validateSegment(repo)?
+  validateSegment(remote.host)?
+  validateOwnerPath(remote.owner)?
+  validateSegment(remote.repo)?
 
-  let finalDir = cacheRoot + "/" + host + "/" + owner + "/" + repo + "/" + sha
+  let finalDir = cacheRoot + "/" + remote.host + "/" + remote.owner + "/" + remote.repo + "/" + target.sha
 
   if (isDir(finalDir)) {
     let actual = revParseHead(gitBin, finalDir, timeoutMs)?
-    if (actual != sha) {
-      fail newError("pmfetch: cache integrity error at ${finalDir}: expected ${sha}, found ${actual} — remove it and retry: rm -rf ${finalDir}")
+    if (actual != target.sha) {
+      fail newError("pmfetch: cache integrity error at ${finalDir}: expected ${target.sha}, found ${actual} — remove it and retry: rm -rf ${finalDir}")
     }
-    return FetchResult{ dir: finalDir, sha: sha, cacheHit: true }
+    return FetchResult{ dir: finalDir, sha: target.sha, cacheHit: true }
   }
 
   mkdirAll(pathDir(finalDir))?
 
   let scratchDir = finalDir + ".tmp-" + uuidFormat(uuidV4())
-  fetchGitInto(gitBin, scratchDir, url, sha, timeoutMs) catch e {
+  fetchGitInto(gitBin, scratchDir, target, timeoutMs) catch e {
     removeTree(scratchDir, timeoutMs)
     fail e
   }
@@ -237,10 +251,10 @@ export fn fetchSha(
   if (isDir(finalDir)) {
     removeTree(scratchDir, timeoutMs)
     let actual = revParseHead(gitBin, finalDir, timeoutMs)?
-    if (actual != sha) {
-      fail newError("pmfetch: cache integrity error at ${finalDir}: expected ${sha}, found ${actual} — remove it and retry: rm -rf ${finalDir}")
+    if (actual != target.sha) {
+      fail newError("pmfetch: cache integrity error at ${finalDir}: expected ${target.sha}, found ${actual} — remove it and retry: rm -rf ${finalDir}")
     }
-    return FetchResult{ dir: finalDir, sha: sha, cacheHit: true }
+    return FetchResult{ dir: finalDir, sha: target.sha, cacheHit: true }
   }
 
   let mv = runGit("mv", [scratchDir, finalDir], timeoutMs) catch e {
@@ -256,14 +270,28 @@ export fn fetchSha(
     fail newError("pmfetch: moving the fetched checkout into place failed (exit ${mv.exitCode}) for ${finalDir}: ${pmTrim(mv.output)}")
   }
 
-  return FetchResult{ dir: finalDir, sha: sha, cacheHit: false }
+  return FetchResult{ dir: finalDir, sha: target.sha, cacheHit: false }
 }
+
+// `fetchGitInto`/`narrowFetchInto`'s own fetch target, bundled into one
+// value (spec/LINT.md's E0202 guidance: past five params "the arguments
+// want to be a class") rather than three more positional strings —
+// `pkgDir` empty means a whole-repo package, exactly like `LockEntry.dir`
+// and `VanityDoc.dir` it is read from.
+class GitFetchTarget { url: string, sha: string, pkgDir: string }
 
 // The init/fetch/checkout/verify sequence that used to run directly against
 // `fetchSha`'s `finalDir`, now run entirely inside a scratch directory so
 // `fetchSha` can clean up with one `removeTree` call on any failure instead
 // of repeating it after each of the four steps (#2257).
-fn fetchGitInto(gitBin: string, dir: string, url: string, sha: string, timeoutMs: int): ()! {
+//
+// `target.pkgDir` non-empty (#3470) narrows the fetch to that subdirectory
+// via `narrowFetchInto` instead of the plain whole-repository `git fetch`
+// below — see that function's own comment for why both steps (sparse-
+// checkout AND `--filter=blob:none`) are needed. Empty keeps the original
+// two-argument `git fetch --depth 1 <url> <sha>` unchanged, so a whole-repo
+// package's behaviour is untouched byte-for-byte.
+fn fetchGitInto(gitBin: string, dir: string, target: GitFetchTarget, timeoutMs: int): ()! {
   let init = runGit(gitBin, ["init", "--quiet", dir], timeoutMs)?
   if (init.timedOut) {
     fail newError("pmfetch: git init timed out after ${timeoutMs}ms: ${dir}")
@@ -272,25 +300,80 @@ fn fetchGitInto(gitBin: string, dir: string, url: string, sha: string, timeoutMs
     fail newError("pmfetch: git init failed (exit ${init.exitCode}) for ${dir}: ${pmTrim(init.output)}")
   }
 
-  let fetch = runGit(gitBin, ["-C", dir, "fetch", "--quiet", "--depth", "1", url, sha], timeoutMs)?
-  if (fetch.timedOut) {
-    fail newError("pmfetch: git fetch timed out after ${timeoutMs}ms: ${url}@${sha}")
-  }
-  if (fetch.exitCode != 0) {
-    fail newError("pmfetch: git fetch failed (exit ${fetch.exitCode}) for ${url}@${sha}: ${pmTrim(fetch.output)}")
+  if (len(target.pkgDir) > 0) {
+    narrowFetchInto(gitBin, dir, target, timeoutMs)?
+  } else {
+    let fetch = runGit(gitBin, ["-C", dir, "fetch", "--quiet", "--depth", "1", target.url, target.sha], timeoutMs)?
+    if (fetch.timedOut) {
+      fail newError("pmfetch: git fetch timed out after ${timeoutMs}ms: ${target.url}@${target.sha}")
+    }
+    if (fetch.exitCode != 0) {
+      fail newError("pmfetch: git fetch failed (exit ${fetch.exitCode}) for ${target.url}@${target.sha}: ${pmTrim(fetch.output)}")
+    }
   }
 
-  let checkout = runGit(gitBin, ["-C", dir, "checkout", "--quiet", sha], timeoutMs)?
+  let checkout = runGit(gitBin, ["-C", dir, "checkout", "--quiet", target.sha], timeoutMs)?
   if (checkout.timedOut) {
-    fail newError("pmfetch: git checkout timed out after ${timeoutMs}ms: ${sha} in ${dir}")
+    fail newError("pmfetch: git checkout timed out after ${timeoutMs}ms: ${target.sha} in ${dir}")
   }
   if (checkout.exitCode != 0) {
-    fail newError("pmfetch: git checkout failed (exit ${checkout.exitCode}) for ${sha} in ${dir}: ${pmTrim(checkout.output)}")
+    fail newError("pmfetch: git checkout failed (exit ${checkout.exitCode}) for ${target.sha} in ${dir}: ${pmTrim(checkout.output)}")
   }
 
   let actual = revParseHead(gitBin, dir, timeoutMs)?
-  if (actual != sha) {
-    fail newError("pmfetch: fetched content does not match requested sha (got ${actual}, want ${sha}) in ${dir}")
+  if (actual != target.sha) {
+    fail newError("pmfetch: fetched content does not match requested sha (got ${actual}, want ${target.sha}) in ${dir}")
+  }
+}
+
+// Narrows `dir`'s fetch to `pkgDir` rather than pulling every blob in the
+// repository at `sha` (#3470): a plain `git fetch <url> <sha>` has no
+// narrower unit than "everything reachable from this commit", so installing
+// one small first-party package under `pkg/<name>/` wrote the whole
+// compiler tree — measured at 20M across 2427 files for this repo.
+//
+// Two client-side mechanisms, both needed, neither alone sufficient:
+//   - `sparse-checkout set --no-cone <pkgDir>` restricts which paths are
+//     ever WRITTEN to the working tree. This alone still fetches every
+//     blob at `sha` into `.git/objects` — it only shrinks the checkout.
+//   - `--filter=blob:none` (partial clone) makes blobs lazy: combined with
+//     sparse-checkout, git only ever demands the blobs `pkgDir` needs, so
+//     the objects fetched shrink too. This needs the SERVER to advertise
+//     `uploadpack.allowFilter` — every real git host tested here (GitHub)
+//     does, by default; a bare `file://` remote does not unless its own
+//     `uploadpack.allowFilter` is explicitly set, in which case git prints
+//     "filtering not recognized by server, ignoring" to `fetch`'s captured
+//     output and silently fetches every blob anyway (still exit 0). That is
+//     git's own degradation, not a fallback this function adds — see
+//     `fetchGitInto`'s caller contract: any git failure here still fails the
+//     whole fetch outright, never retries wide.
+//
+// `remote add origin` is required before `sparse-checkout set`: a bare
+// `git fetch <url> <sha>` needs no configured remote, but `sparse-checkout`
+// and the subsequent `fetch origin <sha>` operate against one.
+fn narrowFetchInto(gitBin: string, dir: string, target: GitFetchTarget, timeoutMs: int): ()! {
+  let remoteAdd = runGit(gitBin, ["-C", dir, "remote", "add", "origin", target.url], timeoutMs)?
+  if (remoteAdd.timedOut) {
+    fail newError("pmfetch: git remote add timed out after ${timeoutMs}ms: ${dir}")
+  }
+  if (remoteAdd.exitCode != 0) {
+    fail newError("pmfetch: git remote add failed (exit ${remoteAdd.exitCode}) for ${dir}: ${pmTrim(remoteAdd.output)}")
+  }
+
+  let sparse = runGit(gitBin, ["-C", dir, "sparse-checkout", "set", "--no-cone", target.pkgDir], timeoutMs)?
+  if (sparse.timedOut) {
+    fail newError("pmfetch: git sparse-checkout timed out after ${timeoutMs}ms: ${dir}")
+  }
+  if (sparse.exitCode != 0) {
+    fail newError("pmfetch: git sparse-checkout failed (exit ${sparse.exitCode}) for ${dir}: ${pmTrim(sparse.output)}")
+  }
+
+  let fetch = runGit(gitBin, ["-C", dir, "fetch", "--quiet", "--depth", "1", "--filter=blob:none", "origin", target.sha], timeoutMs)?
+  if (fetch.timedOut) {
+    fail newError("pmfetch: git fetch timed out after ${timeoutMs}ms: ${target.url}@${target.sha}")
+  }
+  if (fetch.exitCode != 0) {
+    fail newError("pmfetch: git fetch failed (exit ${fetch.exitCode}) for ${target.url}@${target.sha}: ${pmTrim(fetch.output)}")
   }
 }
 
@@ -420,7 +503,8 @@ export fn fetchDependency(spec: string, timeoutMs: int): FetchResult! {
   let url = defaultDepUrl(d.host, d.owner, d.repo)
   let sha = resolveDependencyRef(defaultGitBin, url, d.ref, timeoutMs)?
   let root = defaultCacheRoot()?
-  return fetchSha(defaultGitBin, root, d.host, d.owner, d.repo, url, sha, timeoutMs)?
+  return fetchSha(defaultGitBin, root, GitRemoteRepo{ host: d.host, owner: d.owner, repo: d.repo },
+    GitFetchTarget{ url: url, sha: sha, pkgDir: "" }, timeoutMs)?
 }
 
 // --- vanity name resolution (SPEC §17.7) ---------------------------------

@@ -4,7 +4,10 @@ Durations are plain `int` nanoseconds. There is no `Duration` type, so a duratio
 is built by multiplying a count by a unit constant: `500 * Millisecond`.
 
 Two clocks, for two different jobs. `now` tells you *when*; `monotonic` tells you
-*how long*, and never jumps when the system clock is adjusted.
+*how long*, and never jumps when the system clock is adjusted. Each returns its
+own nominal record — `Instant` from `now`, `Mono` from `monotonic` — so a
+reading from one clock can never be passed to the other clock's API by
+accident; `.ns` gives the raw nanoseconds when a caller genuinely needs an int.
 
 <!-- doctest: per-block -->
 
@@ -50,17 +53,30 @@ fn retryDelay(attempt: int): int {
 
 ## Clocks
 
-### `now(): int`
+### `Instant`
+
+A wall-clock reading, nanoseconds since the Unix epoch, returned by `now`.
+`.ns` gives the raw nanoseconds. Never pass one to `since` — an `Instant` can
+jump backwards (NTP, an operator setting the clock), so it cannot measure an
+interval; use a `Mono` from `monotonic` instead.
+
+### `Mono`
+
+A monotonic reading, returned by `monotonic`. Only differences between two
+`Mono` readings are meaningful; pass one to `since` to get the elapsed
+nanoseconds. `.ns` gives the raw nanoseconds.
+
+### `now(): Instant`
 
 Nanoseconds since the Unix epoch. Follows the system clock, so it can jump
 backwards. Use it to stamp an event, never to measure an interval.
 
-### `monotonic(): int`
+### `monotonic(): Mono`
 
 Nanoseconds from an unspecified fixed origin. Only differences are meaningful,
 and they never go backwards. This is the one to time things with.
 
-### `since(start: int): int`
+### `since(start: Mono): int`
 
 Nanoseconds elapsed since `start`, which must have come from `monotonic()`.
 
@@ -304,5 +320,30 @@ import { parseRfc3339, formatRfc3339 } from "std/time"
 fn roundTrip(text: string): bool! {
   let ns = parseRfc3339(text)?
   return formatRfc3339(ns) == text
+}
+```
+
+## Local time zone
+
+### `utcOffset(ns: int): int`
+
+The host's offset from UTC, in seconds east of UTC, in effect at the instant
+`ns` (nanoseconds since the Unix epoch). Dubai returns `14400`, UTC returns
+`0`. Reads `/etc/localtime` — the version 1 (32-bit) block of the TZif format,
+RFC 8536 — directly: the path is the same on macOS and Linux, so there is no
+platform branch, and no copy of the tzdata database ships with this function.
+Returns `0`, rather than failing, when the file is missing, is a dangling
+symlink, is shorter than the header, or does not start with the TZif magic.
+
+Version 1's transition times are signed 32-bit seconds, which overflow in
+2038; an instant past then resolves against the last version 1 transition
+rather than the correct one. RFC 8536 §3.2's version 2 block, with 64-bit
+transition times, is the upgrade path.
+
+```bit
+import { utcOffset, now } from "std/time"
+
+fn localOffsetSeconds(): int {
+  return utcOffset(now().ns)
 }
 ```

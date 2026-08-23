@@ -1542,7 +1542,7 @@ handshake/verification error.
 
 Like `dial`, but the TCP connect AND the whole handshake AND every later
 `TlsConn.read`/`write` are bounded by one absolute monotonic `deadlineNs`
-(`std/time`'s `monotonic()` plus a budget, not a duration) instead of parking
+(`std/time`'s `monotonic().ns` plus a budget, not a duration) instead of parking
 forever. [`std/net`](net.md)'s `dialDeadline` sets `deadlineNs` on the
 underlying `Conn`; the handshake and record-layer reads/writes reuse that same
 value automatically. A timeout fails with an error naming it (`"... timed

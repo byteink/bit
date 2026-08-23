@@ -72,6 +72,15 @@ boundary. Malformed or out-of-range input decodes as U+FFFD rather than
 panicking. Not indexed by rune count — to visit each rune in order, use
 `runes` or `runeCount`.
 
+### `decodeRuneAt(s: string, i: int): (rune, int)`
+
+`runeAt`, plus the number of bytes actually consumed. Use this, not
+`runeAt` paired with `runeSize`, to step through a string rune by rune:
+`runeSize` classifies only the lead byte and does not validate
+continuation bytes, so on malformed input it can report a width the real
+decode did not consume, desyncing a caller's position from what it
+actually decoded.
+
 ### `runes(s: string): []rune`
 
 Every code point, in order.

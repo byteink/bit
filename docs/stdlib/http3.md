@@ -356,7 +356,7 @@ complete the QUIC handshake, and set up the control and QPACK streams. The retur
 ### `h3DialDeadline(host: string, port: int, serverName: string, deadlineNs: int): H3Conn!`
 
 As `h3Dial`, bounded by `deadlineNs` — an absolute monotonic nanosecond deadline
-(`monotonic() + budget`, not a duration), matching `std/net`'s and `std/tls`'s
+(`monotonic().ns + budget`, not a duration), matching `std/net`'s and `std/tls`'s
 `dialDeadline`. The QUIC handshake itself is not shortened by `deadlineNs`: a
 stalled handshake still gives up after a fixed 5s regardless of the deadline
 passed here. Once the handshake succeeds, the connection's own idle timeout
