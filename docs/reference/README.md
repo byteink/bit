@@ -14,8 +14,9 @@ single static native binary. The guiding goal is **easy to write**.
 | Chapter | Covers |
 | ------- | ------ |
 | [Variables](variables.md) | `let`/`const`, mutability, zero values, destructuring, assignment, comments, semicolons |
-| [Types](types.md) | primitives, literals, slices, arrays, maps, tuples, classes, aliases, conversions, operators |
-| [Functions](functions.md) | functions, methods, parameters, variadics, arrow functions, control flow |
+| [Types](types.md) | primitives, literals, slices, arrays, maps, tuples, aliases, conversions, operators, value vs reference semantics, comparability |
+| [Classes](classes.md) | declaring a class, fields and zero values, composite literals, reference semantics, methods, comparability |
+| [Functions](functions.md) | functions, parameters, variadics, arrow functions, control flow |
 | [Interfaces](interfaces.md) | structural interfaces, satisfaction, `error`, type assertions |
 | [Generics](generics.md) | type parameters, constraints, inference, monomorphization |
 | [Concurrency](concurrency.md) | `spawn`, channels, `select`, the memory model |
@@ -50,15 +51,17 @@ left without a reference page:
 | §4–§7 lexical, literals, semicolons | Variables, Types |
 | §10.1 value declarations | Variables |
 | §10.2 type aliases | Types |
-| §10.3–§10.5 functions, methods, classes | Functions, Types |
+| §10.3 functions | Functions |
+| §10.4–§10.5 methods, classes | Classes |
 | §10.6 interfaces | Interfaces |
 | §11 types | Types |
 | §11.3 generics | Generics |
 | §12 expressions, operators, conversions | Types, Functions |
-| §13.1–§13.5 statements, memory, arithmetic | Variables, Types, Functions |
+| §12.2 class composite literals | Classes |
+| §13.1–§13.5 statements, memory, arithmetic | Variables, Types, Functions, Classes |
 | §13.6 garbage collection | Types |
 | §13.7 concurrency memory model | Concurrency |
-| §14 type system, assertions, comparability | Types, Interfaces |
+| §14 type system, assertions, comparability | Types, Interfaces, Classes |
 | §15 type inference | Variables, Types, Generics |
 | §16 concurrency | Concurrency |
 | §17 modules and visibility | Modules |
