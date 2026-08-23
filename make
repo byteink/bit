@@ -35,18 +35,28 @@ mkdir -p "${CACHE}"
 # that actually matters (the libbitrt fingerprint) is #1869's problem, not this
 # file's.
 #
-# TWO inputs, not one (#2077): `tools/build/` is the source, and the PINNED
-# STAGE0 compiles it and supplies the `libbitrt.a` it links. Counting only the
-# first left the driver a week stale across the 0.1.4 -> 0.1.5 pin move, since
-# nothing under `tools/build/` had been touched. `SHA256SUMS` is the pin's
-# source of truth; resolving stage0 to compare the binary itself would put a
-# spawn and a digest check on the path this cache exists to keep free.
+# THREE inputs, not two (#2077, #3538). `tools/build/` is the source, the
+# PINNED STAGE0 compiles it and supplies the `libbitrt.a` it links, and
+# `stdlib/` is what `tools/build/*.bit` itself imports (std/fs, std/os,
+# std/strings, std/time, and — until #3538 — std/crypto). Missing the first
+# left the driver a week stale across the 0.1.4 -> 0.1.5 pin move; missing the
+# third is how #3538 hid all afternoon: a driver built before a stdlib change
+# added an extern the pinned stage0 could not resolve kept exec'ing on every
+# WARM tree (nothing under `tools/build/` had changed), and only a genuinely
+# cold `bit-out` — no driver to compare against at all — ever hit the
+# rejection. `SHA256SUMS` is the pin's source of truth; resolving stage0 to
+# compare the binary itself would put a spawn and a digest check on the path
+# this cache exists to keep free. Whole-directory, same as `tools/build/`
+# above: this is a developer convenience, not import-graph analysis, and a
+# false-positive rebuild costs seconds, not correctness.
 needs_build=0
 if [ ! -x "${DRIVER}" ]; then
   needs_build=1
 elif [ -n "$(find "${ROOT}/dist/stage0/SHA256SUMS" -newer "${DRIVER}" -print -quit 2>/dev/null)" ]; then
   needs_build=1
 elif [ -n "$(find "${SRC}" -name '*.bit' -newer "${DRIVER}" -print -quit 2>/dev/null)" ]; then
+  needs_build=1
+elif [ -n "$(find "${ROOT}/stdlib" -name '*.bit' -newer "${DRIVER}" -print -quit 2>/dev/null)" ]; then
   needs_build=1
 fi
 
