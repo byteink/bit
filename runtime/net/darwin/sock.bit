@@ -27,6 +27,16 @@ import { schedParkArm, schedParkDisarm, schedPark, pollRead, pollWrite } from ".
 import { pollRegister } from "../../sched/darwin"
 // `schedCurrentWorker`, `wkId` and `schedMaxWorkers` are already imported by
 // ../netabi.bit (same module — an import is per-module, not per-file).
+// Byte/wire-format marshalling and the sockaddr fields that read the same on
+// both platforms are core now (../sock.bit, #2552) — only `saLenOff`/
+// `saFamilyOff` (this file's own consts above) genuinely differ per OS.
+// Module-scoped, so this one import line also covers ../tcp.bit's and
+// ../udp.bit's uses of `ipBytes`/`saBytes2`/`saLen`/etc.
+import { afInet, sockStream, sockDgram, fGetFl, fSetFl, eIntr, saLen, saPortOff,
+         saAddrOff, sockScratchSlot, bytesAt, saBytes, saBytes2, optBytes,
+         lenBytes, ipBytes, tvBytes, dnsBytes, putU8, getU8, putU16Be, getU16Be,
+         putU32Le, getU32Le, getU64Le, putU64Le,
+         netSockAddrPort, netSockAddrOctets } from "../../net"
 
 // int socket(int, int, int); int bind(int, const sockaddr *, socklen_t);
 // int listen(int, int); int accept(int, sockaddr *, socklen_t *);
@@ -106,22 +116,17 @@ extern fn __error(): *i32
 // externs rather than routing everything through libbitrt.
 extern fn bit_rt_fs_close(fd: i64): i64
 
-// AF_INET, SOCK_STREAM, SOCK_DGRAM, from the macOS SDK `<sys/socket.h>`.
+// AF_INET, SOCK_STREAM, SOCK_DGRAM, F_GETFL/F_SETFL and EINTR are core now
+// (../sock.bit, #2552) — POSIX-standard values, identical on both platforms.
 //
 // Darwin has NO `SOCK_NONBLOCK` and NO `SOCK_CLOEXEC` creation flag, which the
 // Linux twin does use — so a socket here is created blocking and made
 // non-blocking by a second `fcntl` call, leaving a window the Linux side does
-// not have. The asymmetry is real rather
-// than an oversight in one of the two.
-@nosplit fn afInet(): int { return 2 }
-@nosplit fn sockStream(): int { return 1 }
-@nosplit fn sockDgram(): int { return 2 }
+// not have. The asymmetry is real rather than an oversight in one of the two.
 
-// F_GETFL / F_SETFL and O_NONBLOCK. O_NONBLOCK is bit 2 here (value 4) and bit
-// 11 on Linux (value 2048) — the same name, a different bit, and nothing about
-// the source spelling reveals it.
-@nosplit fn fGetFl(): int { return 3 }
-@nosplit fn fSetFl(): int { return 4 }
+// O_NONBLOCK. Bit 2 here (value 4) and bit 11 on Linux (value 2048) — the
+// same name, a different bit, and nothing about the source spelling reveals
+// it.
 @nosplit fn oNonBlock(): int { return 4 }
 
 // SOL_SOCKET IS 0xFFFF ON DARWIN, NOT 1. Linux uses 1. Passing Linux's value
@@ -139,11 +144,11 @@ extern fn bit_rt_fs_close(fd: i64): i64
 @nosplit fn soError(): int { return 4103 }
 @nosplit fn soRcvTimeo(): int { return 4102 }
 
-// errno values, from Darwin's `<sys/errno.h>`. ALL FIVE DIFFER FROM LINUX except
-// EINTR: EAGAIN is 35 here and 11 there, EINPROGRESS 36 vs 115, ECONNABORTED 53
-// vs 103, ECONNRESET 54 vs 104.
+// errno values, from Darwin's `<sys/errno.h>`. ALL FIVE DIFFER FROM LINUX.
+// (EINTR, the one POSIX errno that agrees with Linux, is core now —
+// ../sock.bit, #2552.) EAGAIN is 35 here and 11 there, EINPROGRESS 36 vs 115,
+// ECONNABORTED 53 vs 103, ECONNRESET 54 vs 104.
 @nosplit fn eAgain(): int { return 35 }
-@nosplit fn eIntr(): int { return 4 }
 @nosplit fn eInProgress(): int { return 36 }
 @nosplit fn eConnAborted(): int { return 53 }
 @nosplit fn eConnReset(): int { return 54 }
@@ -158,20 +163,19 @@ extern fn bit_rt_fs_close(fd: i64): i64
 //
 //     sin_len:    0   (u8)     <- DOES NOT EXIST ON LINUX
 //     sin_family: 1   (u8)     <- SIXTEEN BITS AT OFFSET 0 ON LINUX
-//     sin_port:   2   (u16, big-endian)
-//     sin_addr:   4   (u32, four octets in wire order)
+//     sin_port:   2   (u16, big-endian)  <- core now, ../sock.bit (#2552)
+//     sin_addr:   4   (u32, four octets in wire order)  <- core now, ../sock.bit
 //     sin_zero:   8   (8 bytes)
 //
-// Total 16 bytes on both systems, which is exactly what makes the difference
-// dangerous: a "portable" layout with a 16-bit family at offset 0 is the same
-// SIZE here and writes AF_INET into `sin_len`, leaving `sin_family` zero. The
-// kernel then reads family AF_UNSPEC and the bind fails — or worse, on a path
-// that does not check, it succeeds against the wrong address family.
-const saLen: int = 16
+// Total 16 bytes on both systems (`netSockAddrLen`, also core now), which is
+// exactly what makes the difference dangerous: a "portable" layout with a
+// 16-bit family at offset 0 is the same SIZE here and writes AF_INET into
+// `sin_len`, leaving `sin_family` zero. `saLenOff`/`saFamilyOff` are the two
+// fields of this struct that stay provider-local — Darwin has no `sin_len` on
+// Linux at all, and the family byte itself sits at a different offset (1 vs
+// 0), so a shared core copy would read/write the wrong byte on one platform.
 const saLenOff: int = 0
 const saFamilyOff: int = 1
-const saPortOff: int = 2
-const saAddrOff: int = 4
 
 // `timeval` (POSIX) ON DARWIN: `tv_sec` is 64 bits and `tv_usec` is 32
 // (`suseconds_t`), where Linux has 64 and 64. The structure is 16 bytes on both
@@ -180,171 +184,6 @@ const saAddrOff: int = 4
 const tvSize: int = 16
 const tvSecOff: int = 0
 const tvUsecOff: int = 8
-
-// Scratch regions for the kernel structs.
-//
-// PER-WORKER SLOTS, NOT ONE SHARED REGION (#3273 — this comment used to claim
-// a single module-level buffer was sound; it was not). Mach-O refuses
-// `@threadlocal` (SPEC §11.11), so this stays module state, same as ../netabi.bit's
-// `udpSenderBuf`/`udpSenderValid` (#3272), whose shape this copies: one slot
-// PER WORKER, indexed by `sockScratchSlot()`, instead of one region for the
-// whole process.
-//
-// WHY THE OLD SHAPE BROKE: the old comment claimed each buffer was "written
-// and read within a single call with no park in between, and this runtime's
-// green threads on one worker are not preemptive" — true for ONE worker, and
-// #1900 booted more than one. Two green threads on two OS threads calling
-// `netRecvFrom` on two different fds interleaved as: A's `recvfrom` fills the
-// SAME shared `saBuf` with A's peer; B's `recvfrom` (a different worker, at
-// the same real time) overwrites it with B's peer before A copies out; A
-// reports B's sender address for A's own datagram. Silent — no error, no
-// wedge, just a caller trusting the wrong address. Confirmed by running two
-// UDP sockets receiving concurrently at BIT_WORKERS=4: every corrupted
-// datagram's reported sender port was exactly the OTHER socket's client port.
-//
-// WHY PER-WORKER IS SOUND HERE: every accessor below (`saBytes()` etc.)
-// re-derives the CURRENT worker's slot on EVERY call — it is `@nosplit` and
-// reads only `schedCurrentWorker()`/`taskAt`/`wkId`, with no explicit park
-// anywhere in that chain (checked directly, not inferred from `@nosplit`
-// alone — `@nosplit` only forbids an auto-inserted back-edge poll, it does
-// NOT forbid an explicit `schedPark` call, and `schedPark`/`schedSwitch` are
-// themselves `@nosplit`). Every caller in this file writes through a syscall
-// and reads the result back with only `@nosplit` byte primitives between the
-// two — never a park — so the slot resolved for the write is the slot
-// resolved for the read, whichever worker that is. A caller whose retry loop
-// CAN park between attempts (`../udp.bit`'s `netSendTo`, `netRecvFrom`;
-// `tcp.bit`'s dial retries) re-derives and REFILLS the buffer fresh on every
-// iteration rather than reusing a value computed before the park — filling
-// once outside a loop that can park is unsound under per-worker slots even
-// though it was harmless under one shared slot, because a migrated task's
-// next read would land on a different (unfilled) slot.
-//
-// The double bound (`schedMaxWorkers` AND `sockScratchSlots`) is #3272's
-// `udpSenderSlot` shape: `let a: [N]i64` needs `N` to be a literal (E0021),
-// so this file's array capacity and the scheduler's advertised worker count
-// are two independent numbers with nothing tying them together.
-//
-// Slot `sockScratchSlots` (one past the last real worker slot) is the
-// FALLBACK for a caller with no current task/worker — mirrors
-// `../../root/darwin/time.bit`'s `timeScratch`, which needs the identical
-// fallback for the identical reason (a driver program, or code the ported
-// scheduler is not running, has no task to index by). Unlike `udpSenderSlot`,
-// which can report "no sender" and skip its write, every function in this
-// file needs a real buffer unconditionally, so there is no -1 case here.
-//
-// The same note is on the Linux twin, deliberately, so the two stay in step.
-const sockScratchSlots: int = 32
-
-@nosplit fn sockScratchSlot(): int {
-  let w = schedCurrentWorker()
-  if (w == 0) {
-    return sockScratchSlots
-  }
-  let id = *(taskAt(w) + wkId)
-  if (id < 0 || id >= schedMaxWorkers || id >= sockScratchSlots) {
-    return sockScratchSlots
-  }
-  return id
-}
-
-// (sockScratchSlots + 1) slots: one per worker plus the fallback.
-let saBuf: [66]i64
-let saBuf2: [66]i64
-let optBuf: [33]i64
-let lenBuf: [33]i64
-let ipBuf: [33]i64
-// PER-WORKER, LIKE saBuf ABOVE (#3296 — these two were missed by #3273's
-// conversion of the five buffers above them; the comment there used to claim
-// the whole file was converted, and it was not). `netDnsSocket`/`netResolveHost`
-// (../dns.bit on Darwin, this module's ../linux/udp.bit twin) fill and read
-// each of these with no park in between (checked directly: every callee in
-// that chain is `@nosplit` and none reaches `schedPark`/`schedSwitch`), so
-// per-worker is sound by the same argument as `saBytes()` etc. above —
-// re-verify that argument before reusing this shape for a caller whose span
-// CAN park; if it can, resolve the slot after the park and re-fill inside any
-// retry loop, same as `netSendTo`'s fix.
-//
-// Reproduced pre-fix with two concurrent `netResolveHost` calls against a local
-// UDP responder distinguishable by reply payload: BIT_WORKERS=1 zero
-// mismatches across 900 resolutions (3 runs); BIT_WORKERS=4/8 dense
-// corruption, every mismatch's received IP exactly the OTHER caller's
-// expected answer (the same swap fingerprint #3273 found for saBuf).
-let tvBuf: [66]i64
-// TWO messages, not one: the query and the reply are both live across the same
-// `recvfrom`, so ONE instance is 2 * netMaxDnsMsg = 1024 bytes = 128 words;
-// (sockScratchSlots + 1) slots of that.
-let dnsBuf: [4224]i64
-
-@nosplit fn bytesAt(a: int): *u8 {
-  let z: *u8 = nil
-  return z + a
-}
-
-@nosplit fn saBytes(): *u8 { return bytesAt(int(ptrOf(saBuf)) + sockScratchSlot() * 16) }
-@nosplit fn saBytes2(): *u8 { return bytesAt(int(ptrOf(saBuf2)) + sockScratchSlot() * 16) }
-@nosplit fn optBytes(): *u8 { return bytesAt(int(ptrOf(optBuf)) + sockScratchSlot() * 8) }
-@nosplit fn lenBytes(): *u8 { return bytesAt(int(ptrOf(lenBuf)) + sockScratchSlot() * 8) }
-@nosplit fn ipBytes(): *u8 { return bytesAt(int(ptrOf(ipBuf)) + sockScratchSlot() * 8) }
-@nosplit fn tvBytes(): *u8 { return bytesAt(int(ptrOf(tvBuf)) + sockScratchSlot() * 16) }
-@nosplit fn dnsBytes(): *u8 { return bytesAt(int(ptrOf(dnsBuf)) + sockScratchSlot() * 1024) }
-
-@nosplit fn putU8(base: *u8, off: int, v: int) {
-  let p = base + off
-  *p = u8(v % 256)
-}
-
-@nosplit fn getU8(base: *u8, off: int): int {
-  let p = base + off
-  return int(*p)
-}
-
-// Big-endian, because `sin_port` is in network byte order. Written byte-wise
-// rather than through a wider pointer for the reason the whole runtime does it:
-// a Bit array is word-strided, so a kernel structure is only ever a byte region.
-@nosplit fn putU16Be(base: *u8, off: int, v: int) {
-  putU8(base, off, v / 256)
-  putU8(base, off + 1, v)
-}
-
-@nosplit fn getU16Be(base: *u8, off: int): int {
-  return getU8(base, off) * 256 + getU8(base, off + 1)
-}
-
-@nosplit fn putU32Le(base: *u8, off: int, v: int) {
-  let k = 0
-  while (k < 4) {
-    putU8(base, off + k, v / (1 << (8 * k)))
-    k = k + 1
-  }
-}
-
-@nosplit fn getU32Le(base: *u8, off: int): int {
-  let v = 0
-  let k = 3
-  while (k >= 0) {
-    v = v * 256 + getU8(base, off + k)
-    k = k - 1
-  }
-  return v
-}
-
-@nosplit fn getU64Le(base: *u8, off: int): int {
-  let v = 0
-  let k = 7
-  while (k >= 0) {
-    v = v * 256 + getU8(base, off + k)
-    k = k - 1
-  }
-  return v
-}
-
-@nosplit fn putU64Le(base: *u8, off: int, v: int) {
-  let k = 0
-  while (k < 8) {
-    putU8(base, off + k, v / (1 << (8 * k)))
-    k = k + 1
-  }
-}
 
 // The errno of the call that just failed. Positive, matching the Linux twin's
 // convention, so the two providers' retry logic reads identically.
@@ -356,11 +195,6 @@ let dnsBuf: [4224]i64
 // ---------------------------------------------------------------------------
 // Addresses
 // ---------------------------------------------------------------------------
-
-// The kernel's `sockaddr_in` size — the `socklen_t` every call here passes.
-export @symbol("bit_rt_port_net_sock_addr_len") @nosplit fn netSockAddrLen(): int {
-  return saLen
-}
 
 // Lay out a `sockaddr_in` for `ip[0..4]` and `port` in the region at `sa`, which
 // must hold `netSockAddrLen()` bytes. `sin_zero` is cleared: the kernel does not
@@ -382,11 +216,6 @@ export @symbol("bit_rt_port_net_fill_sock_addr") @nosplit fn netFillSockAddr(sa:
   }
 }
 
-// The port of a `sockaddr_in`, host byte order.
-export @symbol("bit_rt_port_net_sock_addr_port") @nosplit fn netSockAddrPort(sa: *u8): int {
-  return getU16Be(sa, saPortOff)
-}
-
 // The address family of a `sockaddr_in`, read at THIS platform's offset.
 //
 // EXISTS TO MAKE THE ONE REAL LAYOUT DIFFERENCE OBSERVABLE, and it was added
@@ -403,15 +232,6 @@ export @symbol("bit_rt_port_net_sock_addr_port") @nosplit fn netSockAddrPort(sa:
 // the Linux-layout mutant it reads `sin_len` (16) instead and the test fails.
 export @symbol("bit_rt_port_net_sock_addr_family") @nosplit fn netSockAddrFamily(sa: *u8): int {
   return getU8(sa, saFamilyOff)
-}
-
-// The four address octets of a `sockaddr_in`, in wire order, written to `out`.
-export @symbol("bit_rt_port_net_sock_addr_octets") @nosplit fn netSockAddrOctets(sa: *u8, out: *u8) {
-  let j = 0
-  while (j < 4) {
-    putU8(out, j, getU8(sa, saAddrOff + j))
-    j = j + 1
-  }
 }
 
 // ---------------------------------------------------------------------------
