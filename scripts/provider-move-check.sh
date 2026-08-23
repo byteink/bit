@@ -34,10 +34,16 @@
 #         before (see the step's own comment for the exact invariant).
 #
 # Every FAIL prints an explanation; the script exits 1 if any check failed,
-# 0 if every check passed. Nothing under runtime/ is ever written — BASE's
-# source is read with `git archive` into $(mktemp -d), the working tree is
-# read in place, and cmp's/perl's own scratch objects live in the same
-# mktemp dir.
+# 0 if every check passed — with one documented exception (#3548): a `cmp`
+# mismatch caused ONLY by declaration reordering (the object's raw bytes
+# moved but declset still PASSes) does not by itself fail the exit code,
+# because it is the expected, correct shape of a real hoist — see the NOTE
+# printed near the end and the exit-code assembly right above it. A `cmp`
+# mismatch from a missing directory or a failed build is never excused this
+# way; those still fail unconditionally. Nothing under runtime/ is ever
+# written — BASE's source is read with `git archive` into $(mktemp -d), the
+# working tree is read in place, and cmp's/perl's own scratch objects live
+# in the same mktemp dir.
 set -u
 
 usage() {
@@ -249,8 +255,11 @@ while [ "$i" -lt "${#PAIR_RELS[@]}" ]; do
   if cmp -s "$base_obj" "$work_obj"; then
     echo "PASS cmp $label @ $target"
   else
+    # Do NOT set FAIL here: both builds succeeded, so this is either a pure
+    # declaration reorder (excused below iff declset PASSes) or a real
+    # content change (declset will independently FAIL and set FAIL=1 itself
+    # — see the exit-code assembly after Step 4).
     echo "FAIL cmp $label @ $target ($(cmp "$base_obj" "$work_obj" 2>&1))"
-    FAIL=1
     CMP_FAIL=1
   fi
 done
@@ -327,11 +336,19 @@ fi
 # only their file offsets moved), so ANY reordering, including a legitimate
 # provider hoist, changes these raw object bytes. declset is the
 # authoritative "no content was gained or lost" signal; read a cmp FAIL
-# alongside a declset PASS as "repositioned, not changed".
-if [ "$CMP_FAIL" -eq 1 ] && [ "$DECLSET_PASS" -eq 1 ]; then
-  echo "NOTE: cmp FAILed but declset PASSed — the object's raw bytes moved" >&2
-  echo "  (declaration order shifted where code sits in the section), but no" >&2
-  echo "  declaration was gained, lost or altered. See this script's header." >&2
+# alongside a declset PASS as "repositioned, not changed" — and (#3548) do
+# not fail the exit code for it: a byte-reorder-only cmp mismatch is the
+# expected, correct shape of a real hoist, not a defect. A cmp mismatch that
+# declset does NOT excuse (dropped/added/duplicated declaration) already set
+# FAIL=1 in Step 4 above.
+if [ "$CMP_FAIL" -eq 1 ]; then
+  if [ "$DECLSET_PASS" -eq 1 ]; then
+    echo "NOTE: cmp FAILed but declset PASSed — the object's raw bytes moved" >&2
+    echo "  (declaration order shifted where code sits in the section), but no" >&2
+    echo "  declaration was gained, lost or altered. See this script's header." >&2
+  else
+    FAIL=1
+  fi
 fi
 
 exit "$FAIL"
