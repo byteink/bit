@@ -199,89 +199,127 @@ fn lintCmd(a: []string): int {
   // Two sinks, because they have different fates: a directive error is an
   // error-severity diagnostic that aborts the run with exit 2, while a finding
   // is a warning that must never bump `errorCount` (diagnostics.bit:93).
-  let errs = newDiagnostics(sm)
-  let findings = newDiagnostics(sm)
+  let ctx = LintBatchCtx{
+    sm: sm,
+    opts: opts,
+    errs: newDiagnostics(sm),
+    findings: newDiagnostics(sm),
+    // Which files (by SourceManager id) came from a directory walk —
+    // #2284's module-scoping for E0210 only applies to those; a file named
+    // explicitly on argv is its own singleton module, exactly like
+    // `loadModuleAt`'s `only`.
+    sweptFiles: map<int, bool>{},
+  }
   let overrides = 0
-  // Which files (by SourceManager id) came from a directory walk — #2284's
-  // module-scoping for E0210 only applies to those; a file named explicitly
-  // on argv is its own singleton module, exactly like `loadModuleAt`'s `only`.
-  let sweptFiles = map<int, bool>{}
   let moduleCache = newLintModuleCache()
+  // Files lint could not even open. Isolated the same way as a bad directive
+  // or a parse error (#3543): there is no span to attach the failure to, so it
+  // never reaches `ctx.errs`, but it still forces exit 2 and is still reported.
+  let fileErrors = 0
 
   for lf of files {
-    let path = lf.path
-    let src = readFile(path) catch e {
-      eprint("bit lint: ${path}: ${e.message()}\n")
-      return 2
+    let src = readFile(lf.path) catch e {
+      eprint("bit lint: ${lf.path}: ${e.message()}\n")
+      fileErrors = fileErrors + 1
+      continue // per-file isolation (#3543): keep reading the rest
     }
-    src = stripBom(src)
-    let file = addFile(sm, path, src)
-    if (lf.swept) {
-      sweptFiles[file] = true
-    }
-    let cfg = readLintDirectives(src, file, errs)
-    // Counted over EVERY file walked, not only files with findings (§2.2): the
-    // number exists to make a raised limit visible, and a raised limit is
-    // precisely a file that no longer has a finding.
-    overrides = overrides + lintOverrideCount(cfg)
-    if (hasErrors(errs)) {
-      continue // keep reading the rest, then report every bad directive at once
-    }
-    if (opts.stats) {
-      for note of lintOverrideNotes(cfg) {
-        print("${path}: ${note}\n")
-      }
-      continue
-    }
-    // The phase-1 rules need an AST (§4). A file `bit check` would reject
-    // parses into a recovered tree with holes a rule would read as real nodes
-    // — noise on top of the syntax errors that caused them, the same reason
-    // `checkFile` stops there (compiler/check.bit:1072). So a parse error is
-    // reported through the SAME sink and exit path as a directive error
-    // (§10 open question 2): it already carries an exact span and message,
-    // and a run with one is not asked to compute findings under it either.
-    let tree = parseSourceD(src, file, errs)
-    if (hasErrors(errs)) {
-      continue
-    }
-    runLintRules(src, file, tree, cfg, findings)
-    // Per-finding `allow` overrides (spec/LINT.md §5.5, compiler/lintallow.bit)
-    // apply against exactly this file's just-computed findings, independent of
-    // `cfg`'s file-scoped disables above. Counted into the same `overrides`
-    // total for the same reason (§2.2): a silenced finding must show up in
-    // the summary even when the `allow` line itself is skimmed past.
-    overrides = overrides + lintApplyAllows(src, file, findings)
+    overrides = overrides + lintOneFile(lf, src, ctx)
   }
   // #2284: an import a swept file's sibling uses is genuinely used — drop the
   // E0210 findings runLintRules computed per-file-in-isolation for those.
-  lintDropModuleUsedImports(findings, moduleCache, sweptFiles)
+  lintDropModuleUsedImports(ctx.findings, moduleCache, ctx.sweptFiles)
 
-  // A malformed override or a file that does not parse is reported instead of
-  // findings, not alongside them: either one means the findings for that file
-  // were never computed, so reporting a finding set nobody asked for would be
-  // wrong.
-  if (hasErrors(errs)) {
-    lintSortDiags(errs)
-    if (opts.json) {
-      print(lintRenderJson(errs) + "\n")
-    } else {
-      eprint(renderDiags(errs))
-    }
-    eprint("lint: ${len(errs.list)} errors, ${overrides} overrides active\n")
-    return 2
+  return lintReport(opts, ctx.errs, ctx.findings, overrides, fileErrors)
+}
+
+// The state one `bit lint` invocation threads through every file: the shared
+// source manager and options, the two sinks `lintOneFile` reports into, and
+// which files came from a directory walk. Grouped into one struct so
+// `lintOneFile` takes 3 params instead of 7 (E0202).
+class LintBatchCtx {
+  sm: SourceManager,
+  opts: LintArgs,
+  errs: Diagnostics,
+  findings: Diagnostics,
+  sweptFiles: map<int, bool>,
+}
+
+// One file's worth of `lintCmd`'s loop body: directives, then (unless a
+// directive was bad) either the `--stats` notes or the parse-and-lint pass.
+// Isolated to THIS file (#3543): a bad directive or a parse error here stops
+// only this file's own findings from being computed and returns early — it
+// never touches `findings` for any file already processed, and the caller
+// keeps walking the rest of `files` regardless. Returns the override count
+// this file contributed (§2.2), 0 once it hits an error since no further
+// directive or `allow` line of this file is read past that point.
+fn lintOneFile(lf: LintFile, src0: string, ctx: LintBatchCtx): int {
+  let src = stripBom(src0)
+  let file = addFile(ctx.sm, lf.path, src)
+  if (lf.swept) {
+    ctx.sweptFiles[file] = true
   }
+  let errs = ctx.errs
+  let findings = ctx.findings
+  let opts = ctx.opts
+  let errsBefore = errs.errorCount
+  let cfg = readLintDirectives(src, file, errs)
+  // Counted over EVERY file walked, not only files with findings (§2.2): the
+  // number exists to make a raised limit visible, and a raised limit is
+  // precisely a file that no longer has a finding.
+  let overrides = lintOverrideCount(cfg)
+  if (errs.errorCount > errsBefore) {
+    return overrides // this file's directive is bad; its findings are never computed
+  }
+  if (opts.stats) {
+    for note of lintOverrideNotes(cfg) {
+      print("${lf.path}: ${note}\n")
+    }
+    return overrides
+  }
+  // The phase-1 rules need an AST (§4). A file `bit check` would reject
+  // parses into a recovered tree with holes a rule would read as real nodes
+  // — noise on top of the syntax errors that caused them, the same reason
+  // `checkFile` stops there (compiler/check.bit:1072). So a parse error is
+  // reported through the SAME sink and exit path as a directive error
+  // (§10 open question 2): it already carries an exact span and message,
+  // and this file is not asked to compute findings under it either.
+  let tree = parseSourceD(src, file, errs)
+  if (errs.errorCount > errsBefore) {
+    return overrides
+  }
+  runLintRules(src, file, tree, cfg, findings)
+  // Per-finding `allow` overrides (spec/LINT.md §5.5, compiler/lintallow.bit)
+  // apply against exactly this file's just-computed findings, independent of
+  // `cfg`'s file-scoped disables above. Counted into the same `overrides`
+  // total for the same reason (§2.2): a silenced finding must show up in
+  // the summary even when the `allow` line itself is skimmed past.
+  return overrides + lintApplyAllows(src, file, findings)
+}
 
-  lintSortDiags(findings)
+// Renders the run and picks the exit code. Errors (a malformed directive, an
+// unparseable file, a file lint could not read) are reported ALONGSIDE any
+// findings already computed for the OTHER files in this run (#3543), not
+// instead of them: only the broken files' own findings were never computed,
+// and every other file's findings still stand. The exit code stays 2
+// whenever any error occurred, so a caller checking only "did findings
+// appear" cannot mistake this for a clean run.
+fn lintReport(opts: LintArgs, errs: Diagnostics, findings: Diagnostics, overrides: int, fileErrors: int): int {
   let n = len(findings.list)
+  let errCount = errs.errorCount + fileErrors
+  let combined = lintMergeDiags(errs, findings)
+  lintSortDiags(combined)
   if (opts.json) {
-    print(lintRenderJson(findings) + "\n")
+    print(lintRenderJson(combined) + "\n")
   } else {
-    eprint(renderDiags(findings))
+    eprint(renderDiags(combined))
   }
   // Printed on EVERY run, clean ones included, and never suppressible: any
   // limit can be raised by editing the source, so this count is what keeps that
   // from happening quietly (§2.2).
-  eprint("lint: ${n} findings, ${overrides} overrides active\n")
+  eprint(lintSummaryLine(n, errCount, overrides))
+  if (errCount > 0) {
+    return 2
+  }
   if (opts.stats) {
     return 0
   }
@@ -289,4 +327,33 @@ fn lintCmd(a: []string): int {
     return 1
   }
   return 0
+}
+
+// The one stderr line every run prints, including clean ones (§2.2). Kept
+// byte-identical to the pre-#3543 text in the two cases that already had
+// goldens pinned to it (errors-only, findings-only); the third case --
+// errors alongside findings, only reachable now that files are isolated --
+// gets a new format that names both.
+fn lintSummaryLine(n: int, errCount: int, overrides: int): string {
+  if (errCount > 0 && n > 0) {
+    return "lint: ${n} findings, ${errCount} errors, ${overrides} overrides active\n"
+  }
+  if (errCount > 0) {
+    return "lint: ${errCount} errors, ${overrides} overrides active\n"
+  }
+  return "lint: ${n} findings, ${overrides} overrides active\n"
+}
+
+// Concatenates two Diagnostics' lists for a single sorted render/JSON pass
+// over both a run's errors and its findings (#3543). Bounded by the two
+// lists' combined length, which is one finding or error per rule per file.
+fn lintMergeDiags(a: Diagnostics, b: Diagnostics): Diagnostics {
+  let out = newDiagnostics(a.sm)
+  for d of a.list {
+    out.list = append(out.list, d)
+  }
+  for d of b.list {
+    out.list = append(out.list, d)
+  }
+  return out
 }
