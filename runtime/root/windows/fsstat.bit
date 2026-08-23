@@ -1,0 +1,166 @@
+// `bit_rt_fs_stat_w`/`bit_rt_fs_lstat_w` (#3549, epic #3322): the two
+// `bit_rt_fs_*` ABI wrappers (ABI.md §14, #2153) `./fs.bit` was missing —
+// any program importing ANY name from `std/time` pulls `std/fs` into the
+// module's transitive extern closure (`stdlib/time/tzlocal.bit:7`), and the
+// Windows admission check (E0078) validates every extern fn declared in
+// every included module file, so their absence broke `--target
+// x86_64-windows` for `std/time` alone. Split into its OWN file rather than
+// added to ./fs.bit: `./fs.bit` was already at 712 lines and this addition
+// (128 lines) would have pushed it to 840, past `spec/LINT.md` §4's 800-line
+// limit (E0200) — the identical reason `./fsrw.bit` was split out of
+// `./fs.bit` at write time (#3334's own header). Sibling of `./fs.bit` in
+// the same directory, so this is the SAME MODULE (an import is per-module,
+// not per-file): `loadByte`/`storeWord`/`ptrOf` (`../../gc`), `hAt`,
+// `wordsPathW`, `fsScratchSlot`, `fsFindDataBuf`, `fsFindDataBytes`,
+// `fsFindDataNameOff`, `winInvalidHandle`, `winFileAttrDirectory`,
+// `winFileAttrReadonly`, `winFileAttrReparsePoint`, and the `extern fn
+// FindFirstFileW`/`FindClose` declarations are all `./fs.bit`'s own —
+// nothing here needs an `import` line.
+//
+// MIRRORS ../darwin/fs.bit's AND ../linux/fs.bit's `fillStat` SHAPE (this
+// ticket's own constraint): one `fillStat(p, out, follow)`-equivalent
+// helper filling a shared 5-word `out` sink (size, mtime, mode, isDir,
+// isSymlink), called from two thin exported wrappers — but the MECHANISM
+// differs, because Windows offers no already-admitted API to open a
+// symlink's TARGET without a handle. See `fillStat`'s own comment below for
+// the resulting, explicitly documented scope decision: `stat` and `lstat`
+// share one body here.
+//
+// RUNTIME VERIFICATION OWED, same as ./fs.bit: `libbitrt-x86_64-windows.a`
+// has not executed on real Windows (#3341 tracks the target support gap).
+// `bit check runtime/root/windows` is the verification this ticket can run
+// directly; `filetimeToUnixSec`'s epoch arithmetic and `loadU32LE`/
+// `loadU64LE`'s byte composition were each checked against a throwaway
+// script before being written here, the same technique `../os.bit`'s own
+// header already used for `winUtf16ToUtf8`/`winSplitArgs`.
+
+// The little-endian u32 at `addr`, byte-composed rather than via `loadWord`:
+// `wordAt` (`runtime/gc/mem.bit`) is WORD-INDEXED (`addr / 8`, truncating),
+// not a raw unaligned byte load, and none of `WIN32_FIND_DATAW`'s DWORD
+// fields below sit at a `loadWord`-safe address — the same reason
+// `../darwin/fs.bit`'s `loadU16LE` exists for `st_mode`.
+@nosplit fn loadU32LE(addr: int): int {
+  return loadByte(addr) |
+    (loadByte(addr + 1) << 8) |
+    (loadByte(addr + 2) << 16) |
+    (loadByte(addr + 3) << 24)
+}
+
+// The little-endian u64 at `addr`, two `loadU32LE` halves — used only for
+// `ftLastWriteTime` (offset 20: 4-byte aligned, not 8-byte aligned).
+@nosplit fn loadU64LE(addr: int): int {
+  return loadU32LE(addr) | (loadU32LE(addr + 4) << 32)
+}
+
+// `WIN32_FIND_DATAW` field offsets `fillStat` reads, beyond
+// `fsFindDataNameOff` `./fs.bit` already declares — the same struct layout
+// comment above `./fs.bit`'s `fsFindDataBytes` documents in full:
+// dwFileAttributes(DWORD)@0, ftLastWriteTime(FILETIME=2xDWORD)@20,
+// nFileSizeHigh(DWORD)@28, nFileSizeLow(DWORD)@32.
+const fsFindDataAttrOff: int = 0
+const fsFindDataMtimeOff: int = 20
+const fsFindDataSizeHighOff: int = 28
+const fsFindDataSizeLowOff: int = 32
+
+// `FILETIME` is 100-nanosecond intervals since 1601-01-01 UTC (Microsoft's
+// own documented epoch); Unix time is seconds since 1970-01-01 UTC — the two
+// epochs are `filetimeUnixDeltaSec` seconds apart, a fixed constant.
+const filetimeTicksPerSec: int = 10000000
+const filetimeUnixDeltaSec: int = 11644473600
+
+@nosplit fn filetimeToUnixSec(ft: int): int {
+  return ft / filetimeTicksPerSec - filetimeUnixDeltaSec
+}
+
+// Windows has no POSIX permission bitmask to report, so `mode`'s low 12 bits
+// are SYNTHESIZED from the one enforceable bit (`FILE_ATTRIBUTE_READONLY`,
+// see `./fs.bit`'s `rtFsChmod` scope note) and the directory attribute —
+// 0o755/0o644 normally, 0o555/0o444 when read-only. The same synthesis Go's
+// `os.FileInfo.Mode()` performs on Windows, for the identical reason.
+const winModeDirRW: int = 493 // 0o755
+const winModeDirRO: int = 365 // 0o555
+const winModeFileRW: int = 420 // 0o644
+const winModeFileRO: int = 292 // 0o444
+
+@nosplit fn fsWinStatMode(attrs: int): int {
+  let isDir = (attrs & winFileAttrDirectory) != 0
+  let readonly = (attrs & winFileAttrReadonly) != 0
+  if (isDir) {
+    if (readonly) {
+      return winModeDirRO
+    }
+    return winModeDirRW
+  }
+  if (readonly) {
+    return winModeFileRO
+  }
+  return winModeFileRW
+}
+
+// `stat(2)`/`lstat(2)` sink for `bit_rt_fs_stat_w`/`bit_rt_fs_lstat_w`
+// (#3549): fills `out` (5 words: size, mtime, mode, isDir, isSymlink —
+// ABI.md §14) from `FindFirstFileW`'s `WIN32_FIND_DATAW` at the
+// already-encoded UTF-16 path `p`. 0 on success, `-errno`-shaped on failure
+// (the #2153/#2343 convention `../darwin/fs.bit`'s own `fillStat` already
+// documents) — ENOENT (2) when the path names nothing, matching
+// `./fs.bit`'s `checkedPathW` callers' existing "rejected path reads as
+// absent" contract.
+//
+// SCOPE DECISION: `FindFirstFileW` never follows a reparse point to its
+// target — it reports the LINK's own attributes, size and time, the same
+// direction of imprecision `./fs.bit`'s `rtFsIsSymlinkW` note documents.
+// This runtime has no already-admitted Win32 call that opens a symlink's
+// TARGET without a handle (`GetFileInformationByHandle`/
+// `GetFileAttributesExW` are NOT in `compiler/pesyms.bit`'s admitted
+// surface, and adding one is outside this ticket's file). So
+// `bit_rt_fs_stat_w` and `bit_rt_fs_lstat_w` share this identical body: for
+// an actual symlink, both report the link itself, matching POSIX `lstat`'s
+// promise and diverging from POSIX `stat`'s promise to report the resolved
+// target. Every non-symlink path — the overwhelming majority, and the only
+// case the repro program's `std/time` import chain can reach — is
+// unaffected: `stat`==`lstat` there on every platform already.
+@nosplit fn fillStat(p: int, out: int): int {
+  let findData = int(ptrOf(fsFindDataBuf)) + fsScratchSlot() * fsFindDataBytes
+  let handle = FindFirstFileW(hAt(p), hAt(findData))
+  if (int(handle) == winInvalidHandle) {
+    return 0 - 2
+  }
+  FindClose(handle)
+  let attrs = loadU32LE(findData + fsFindDataAttrOff)
+  let sizeHigh = loadU32LE(findData + fsFindDataSizeHighOff)
+  let sizeLow = loadU32LE(findData + fsFindDataSizeLowOff)
+  storeWord(out, (sizeHigh << 32) | sizeLow)
+  storeWord(out + 8, filetimeToUnixSec(loadU64LE(findData + fsFindDataMtimeOff)))
+  storeWord(out + 16, fsWinStatMode(attrs))
+  let isDir = 0
+  if ((attrs & winFileAttrDirectory) != 0) {
+    isDir = 1
+  }
+  storeWord(out + 24, isDir)
+  let isSymlink = 0
+  if ((attrs & winFileAttrReparsePoint) != 0) {
+    isSymlink = 1
+  }
+  storeWord(out + 32, isSymlink)
+  return 0
+}
+
+// `bit_rt_fs_stat_w`: `stat(2)`-shaped — see `fillStat`'s scope note above
+// for why this behaves as `lstat` for an actual reparse point on Windows.
+export @nosplit @symbol("bit_rt_fs_stat_w") fn rtFsStatW(words: int, n: int, out: int): int {
+  let p = wordsPathW(words, n)
+  if (p == 0) {
+    return 0 - 2
+  }
+  return fillStat(p, out)
+}
+
+// `bit_rt_fs_lstat_w`: `lstat(2)`-shaped — identical to `rtFsStatW` on
+// Windows; see `fillStat`'s scope note above.
+export @nosplit @symbol("bit_rt_fs_lstat_w") fn rtFsLstatW(words: int, n: int, out: int): int {
+  let p = wordsPathW(words, n)
+  if (p == 0) {
+    return 0 - 2
+  }
+  return fillStat(p, out)
+}
