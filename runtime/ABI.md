@@ -1549,6 +1549,8 @@ defined exactly once).
 | `bit_rt_fs_list_dir`  | `(path: *const RtBytes) -> *const RtBytes` (§14)        |
 | `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not NUL-terminated, not `RtBytes`; the only `bit_rt_fs_*` entry point shaped this way) |
 | `bit_rt_fs_sync`      | `(fd: i64) -> i64` (§14, `0` on success, `-1` on failure; Darwin uses `F_FULLFSYNC`, falling back to bare `fsync` only on `ENOTSUP` — bare `fsync` alone does not flush the drive's write cache on that platform) |
+| `bit_rt_fs_pread_w`   | `(fd: i64, buf: usize, max: i64, off: i64) -> i64` (§14, #3463, positional read: `buf` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not `RtBytes`, not NUL-terminated, same convention `bit_rt_fs_is_symlink_w` uses; byte count transferred, or negative on any I/O error; a short count, including 0 at end of file, is NOT an error) |
+| `bit_rt_fs_pwrite_w`  | `(fd: i64, buf: usize, n: i64, off: i64) -> i64` (§14, #3463, positional write: same `buf` convention as `bit_rt_fs_pread_w`; byte count transferred, or negative on any I/O error; extends the file or leaves a zero-filled hole as POSIX `pwrite(2)` does) |
 | `bit_rt_fs_cwd`       | `() -> *const RtBytes` (§14, the process's current working directory, or the empty string on any failure; #3501) |
 | `bit_rt_test_index`   | `() -> i64` (§16)                                      |
 | `bit_rt_floor`        | `(x: f64) -> f64` (§17)                                |
@@ -1926,6 +1928,8 @@ bit_rt_fs_read_all(fd)            -> string     // whole file (regular files onl
 bit_rt_fs_read_all_failed()       -> bool       // #2994/#3065/#2996 below
 bit_rt_fs_read(fd, max: i64)      -> string     // up to max bytes; "" at EOF
 bit_rt_fs_write(fd, s)            -> i64        // bytes written, or -1
+bit_rt_fs_pread_w(fd, buf, max, off) -> i64     // positional read; count, or negative (#3463)
+bit_rt_fs_pwrite_w(fd, buf, n, off)  -> i64     // positional write; count, or negative (#3463)
 bit_rt_fs_sync(fd)                -> i64        // 0, or -1 (#3462)
 bit_rt_fs_cwd()                   -> string     // cwd, or "" on failure (#3501)
 bit_rt_fs_close(fd)               -> i64        // always 0
@@ -1980,6 +1984,33 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   to `maxReadAllRetries` (1000) times.
 - `fs_close` reports success unconditionally (the raw wrapper swallows
   `EINTR`/`EBADF`).
+- `fs_pread_w`/`fs_pwrite_w` (#3463) transfer bytes at an EXPLICIT offset
+  instead of a shared file cursor, so several green threads may issue
+  positional calls on the same `fd` concurrently without racing over
+  position — the reason this pair exists rather than a stateful `seek`, which
+  a shared fd cannot safely carry across concurrent callers. `buf` is a
+  `[]byte`'s packed backing store (§2, #3121/#3226), the same convention
+  `bit_rt_fs_is_symlink_w` uses, not a Bit `string`. Darwin and Linux use
+  `pread(2)`/`pwrite(2)` — Linux issues the raw `pread64`/`pwrite64` syscall
+  numbers directly, no libc; Darwin calls the bare libc externs. Windows uses
+  `ReadFile`/`WriteFile` with a synchronous-mode `OVERLAPPED` carrying the
+  offset — MSDN documents that a handle opened WITHOUT
+  `FILE_FLAG_OVERLAPPED` still honors a non-NULL `lpOverlapped`'s byte
+  offset, performing the transfer synchronously without moving the handle's
+  own file position, which is the standard Win32 substitute for POSIX
+  `pread`/`pwrite`. All three return the byte count transferred, or a
+  negative value on any I/O error; a SHORT count — including 0 at end of
+  file — is never an error, exactly as `fs_read` above. **No `stdlib/`
+  caller exists yet** — the same `tools/build/` bootstrap cycle #2153's
+  `stat_w`/`lstat_w` bullet and #3462's `fs_sync` bullet both describe:
+  `tools/build/artifacts.bit` imports `std/fs`, which the PINNED stage0
+  compiles against its own frozen `libbitrt.a`, so a `stdlib/fs/fs.bit`
+  reference to either symbol breaks the driver bootstrap with E0078 on every
+  fresh clone until a release ships this commit and the pin moves. This
+  landing is pass 1 of 2 (the #3065/#3462/#3489 pattern): the runtime
+  primitives only, no consumer. Pass 2 (`File.readAt`/`File.writeAt` methods
+  in `stdlib/fs/fs.bit`) is a follow-up ticket, gated on a release containing
+  this commit and a stage0 repin to it.
 - `fs_sync` (#3462) flushes `fd`'s already-written bytes to stable storage,
   0 on success, -1 on any failure — a successful `fs_write` only reaches the
   OS page cache, and pulling power before `fs_sync` returns can still lose

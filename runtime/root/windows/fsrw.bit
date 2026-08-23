@@ -140,6 +140,99 @@ export @nosplit @symbol("bit_rt_fs_write") fn rtFsWrite(fd: int, s: int): int {
   return off
 }
 
+// `OVERLAPPED`'s scratch (#3463), one 32-byte (4-word) slot per worker plus
+// the fallback -- the identical PER-WORKER reasoning `fsIoWordScratch` above
+// carries: two workers each mid-positional-call at the same real time must
+// not share the struct the OS reads the requested offset from. 33 * 4 = 132
+// words.
+let fsOverlappedScratch: [132]i64
+
+// Fills a fresh synchronous-mode `OVERLAPPED` at this worker's slot with
+// `off` as the byte offset and every other field zeroed (`Internal`,
+// `InternalHigh`, `hEvent` -- all unused for a synchronous handle) and
+// returns its address. `Offset`/`OffsetHigh` are two adjacent little-endian
+// DWORDs starting at struct byte 16 -- on a little-endian target (this
+// runtime's only targets) that is exactly the low/high halves of one 64-bit
+// store, so `off` (never negative -- a real file offset) writes both in one
+// `storeWord`.
+//
+// A HANDLE OPENED WITHOUT `FILE_FLAG_OVERLAPPED` (`../fs.bit`'s single
+// `CreateFileW` call, this whole module) STILL HONORS a non-NULL
+// `lpOverlapped`'s offset: per MSDN's ReadFile/WriteFile remarks, passing
+// one on a synchronous handle performs the I/O at that byte offset without
+// moving the handle's own current file position, and still completes
+// synchronously -- the call blocks and reports its result through
+// `lpNumberOfBytesTransferred` directly, exactly like every other call in
+// this file already relies on. This is the standard Win32 substitute for
+// POSIX `pread`/`pwrite`; nothing here requires reopening the file.
+@nosplit fn overlappedAt(off: int): int {
+  let base = int(ptrOf(fsOverlappedScratch)) + fsScratchSlot() * 32
+  storeWord(base, 0)
+  storeWord(base + 8, 0)
+  storeWord(base + 16, off)
+  storeWord(base + 24, 0)
+  return base
+}
+
+// `bit_rt_fs_pread_w`: up to `max` bytes from `fd` at absolute offset `off`
+// into the caller-owned buffer at `buf` -- a `[]byte`'s packed backing store
+// (ABI.md §2, #3121/#3226), the same convention `../linux/fsrw.bit`'s
+// `bit_rt_fs_pread_w` uses. Byte count transferred, or -1 on any I/O error.
+// A SHORT count (including 0 at end of file, which `ReadFile` reports as
+// success with 0 bytes transferred rather than a POSIX-style negative/zero
+// return) is NOT an error.
+export @nosplit @symbol("bit_rt_fs_pread_w") fn rtFsPreadW(
+  fd: int,
+  buf: int,
+  max: int,
+  off: int,
+): int {
+  if (max <= 0) {
+    return 0
+  }
+  let handle = hAt(fd)
+  let readPtr = ptrOf(fsIoWordScratch) + fsScratchSlot()
+  let ov = overlappedAt(off)
+  // Bracketed for the same reason `rtFsRead` above is (#2207): `buf` is the
+  // live `[]byte` backing store the caller still holds a reference to across
+  // this call, so `syscall`, not `blocked`.
+  gcSyscallBegin()
+  let ok = ReadFile(handle, u8At(buf), i32(max), readPtr, hAt(ov))
+  let n = int(atomicLoad(readPtr))
+  gcSyscallEnd()
+  if (ok == i32(0)) {
+    return 0 - 1
+  }
+  return n
+}
+
+// `bit_rt_fs_pwrite_w`: write `n` bytes from `buf` (same packed-backing
+// convention as `bit_rt_fs_pread_w` above) to `fd` at absolute offset `off`.
+// Byte count transferred, or -1 on any I/O error.
+export @nosplit @symbol("bit_rt_fs_pwrite_w") fn rtFsPwriteW(
+  fd: int,
+  buf: int,
+  n: int,
+  off: int,
+): int {
+  if (n <= 0) {
+    return 0
+  }
+  let handle = hAt(fd)
+  let writtenPtr = ptrOf(fsIoWordScratch) + fsScratchSlot()
+  let ov = overlappedAt(off)
+  // Bracketed for the same reason as above: `buf` is a live reference held
+  // across the call.
+  gcSyscallBegin()
+  let ok = WriteFile(handle, u8At(buf), i32(n), writtenPtr, hAt(ov))
+  let written = int(atomicLoad(writtenPtr))
+  gcSyscallEnd()
+  if (ok == i32(0)) {
+    return 0 - 1
+  }
+  return written
+}
+
 // BOOL FlushFileBuffers(HANDLE hFile) -- the Win32 equivalent of POSIX
 // `fsync`/Darwin `F_FULLFSYNC`: per MSDN it forces the OS's file system
 // cache AND any intermediate hardware cache to the physical device.
