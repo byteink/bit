@@ -393,20 +393,20 @@ export fn postTls(url: string, body: string, config: TlsConfig): Response! {
 // `timeoutMs`, and the idle timer resets on any received datagram rather
 // than tracking request progress specifically.
 //
-// The two pieces of `requestTimeoutTls` shaping that come from the caller's
-// `Client` (or its absence) rather than from the individual call: the TLS
-// `config` for the https leg, and an already-validated, serialized extra
-// request-header `block` ("" for none). Grouped into one struct, rather than
-// two more parameters on `requestTimeoutTls`, to keep that function at the
-// 5-parameter lint ceiling (E0202).
-class TimeoutRequestExtras { config: TlsConfig, block: string }
+// The three pieces of `requestTimeoutTls` shaping that come from the
+// caller's `Client` (or its absence): the TLS `config`, an already-validated
+// serialized header `block` ("" for none), and `h3Ports`, this client's
+// Alt-Svc cache (fresh, empty for the package-level call, #3522). Grouped to
+// keep `requestTimeoutTls` at the 5-parameter lint ceiling (E0202).
+class TimeoutRequestExtras { config: TlsConfig, block: string, h3Ports: map<string, int> }
 
 // As `requestTimeout`, but over https with an explicit TLS config — the
 // timeout-path twin of `requestTls`. `extras.config.alpn` defaults to `h2`
 // then `http/1.1` when empty, same as `requestTls`. `extras.block` exists so
 // `Client.requestTimeout` (#3484) can pass this client's own default headers
-// (`setHeader`) through, the same as `Client.request`/`Client.requestWith`
-// already do — the package-level `requestTimeout` below always passes "".
+// (`setHeader`) through, same as `Client.request`/`requestWith` — the
+// package-level `requestTimeout` below always passes "" (and an inert,
+// always-empty `extras.h3Ports`, #3522).
 // Shared by the package-level `requestTimeout` below (called with
 // `defaultClientConfig()`) and `Client.requestTimeout` (called with `c.tls`,
 // #3005) so a `Client` built with `newClientTls` gets its custom TLS config —
@@ -427,18 +427,28 @@ fn requestTimeoutTls(
     return h3ExchangeDeadline(u, method, body, deadline, block)?
   }
   if (u.https) {
+    let key = h2glueAuthority(u)
+    let cached = cachedH3Port(extras.h3Ports, key)
+    if (cached != 0) {
+      let hu = Url{ host: u.host, port: cached, path: u.path, https: true, h3: true }
+      return h3ExchangeDeadline(hu, method, body, deadline, block)?
+    }
     let cfg = extras.config
     if (len(cfg.alpn) == 0) {
       cfg.alpn = ["h2", "http/1.1"]
     }
-    return httpsExchange(tlsDialDeadline(u.host, u.port, cfg, deadline)?, method, u, body, block)?
+    let tlsConn = tlsDialDeadline(u.host, u.port, cfg, deadline)?
+    let res = httpsExchange(tlsConn, method, u, body, block)?
+    learnAltSvcInto(extras.h3Ports, key, res)
+    return res
   }
   let conn = dialDeadline(u.host, u.port, deadline)?
   return exchangeOn(netStream{ conn: conn }, buildRequest(method, u, block, body))?
 }
 
 export fn requestTimeout(method: string, url: string, body: string, timeoutMs: int): Response! {
-  let extras = TimeoutRequestExtras{ config: defaultClientConfig(), block: "" }
+  let cfg = defaultClientConfig()
+  let extras = TimeoutRequestExtras{ config: cfg, block: "", h3Ports: map<string, int>() }
   return requestTimeoutTls(method, url, body, timeoutMs, extras)?
 }
 
@@ -541,16 +551,27 @@ export fn (c: Client) setHeader(name: string, value: string): ()! {
   c.headers = append(c.headers, h)
 }
 
-// Record any `h3=` Alt-Svc advertisement `res` carried for `authority`.
-fn (c: Client) learnAltSvc(authority: string, res: Response) {
+// Cached h3 port for `key`, or 0 — read side shared by `requestWith`/`requestTimeoutTls` (#3522).
+fn cachedH3Port(h3Ports: map<string, int>, key: string): int {
+  return h3Ports[key]
+}
+
+// Records any `h3=` Alt-Svc advertisement in `res` for `authority` into `h3Ports` — write side
+// shared by `learnAltSvc`/`requestTimeoutTls` (#3522).
+fn learnAltSvcInto(h3Ports: map<string, int>, authority: string, res: Response) {
   let av = header(res.headers, "alt-svc")
   if (len(av) == 0) {
     return
   }
   let p = parseAltSvcH3Port(av)
   if (p > 0) {
-    c.h3Ports[authority] = p
+    h3Ports[authority] = p
   }
+}
+
+// Record any `h3=` Alt-Svc advertisement `res` carried for `authority`.
+fn (c: Client) learnAltSvc(authority: string, res: Response) {
+  learnAltSvcInto(c.h3Ports, authority, res)
 }
 
 // Send `method url` with an optional body. An `https+h3://` URL always uses
@@ -581,7 +602,7 @@ export fn (c: Client) requestWith(
     return requestBlock(method, url, block, body, c.tls)?
   }
   let key = h2glueAuthority(u)
-  let cached = c.h3Ports[key]
+  let cached = cachedH3Port(c.h3Ports, key)
   if (cached != 0) {
     let hu = Url{ host: u.host, port: cached, path: u.path, https: true, h3: true }
     return h3Exchange(hu, method, body, block)?
@@ -606,14 +627,14 @@ export fn (c: Client) post(url: string, body: string): Response! {
 }
 
 // As the package-level `requestTimeout`: a whole-request deadline covering
-// `http://`, `https://`, and `https+h3://` (#2995, #3004). Does not consult
-// this client's Alt-Svc cache — an `https+h3://` URL is still the only way to
-// reach the h3 path here, same as `c.request` — but DOES use its TLS config
-// (#3005) and its own default headers (`setHeader`, #3484) for
-// `http://`/`https://`: an https `Url` dials with `c.tls` and sends
-// `c.headers`, so a `Client` built with `newClientTls` or carrying its own
-// `setHeader` defaults gets both applied here, the same as
-// `Client.request`/`requestTls` already do.
+// `http://`, `https://`, and `https+h3://` (#2995, #3004). Consults and
+// updates this client's Alt-Svc cache exactly as `Client.request`/
+// `requestWith` does (#3522) — upgrades to HTTP/3 when cached, learns any
+// `Alt-Svc` response header. Also uses its TLS config (#3005) and its own
+// default headers (`setHeader`, #3484) for `http://`/`https://`: an https
+// `Url` dials with `c.tls` and sends `c.headers`, so a `Client` built with
+// `newClientTls` or carrying its own `setHeader` defaults gets both applied
+// here, the same as `Client.request`/`requestTls` already do.
 export fn (c: Client) requestTimeout(
   method: string,
   url: string,
@@ -621,7 +642,7 @@ export fn (c: Client) requestTimeout(
   timeoutMs: int,
 ): Response! {
   let block = serializeHeaders(c.headers)?
-  let extras = TimeoutRequestExtras{ config: c.tls, block: block }
+  let extras = TimeoutRequestExtras{ config: c.tls, block: block, h3Ports: c.h3Ports }
   return requestTimeoutTls(method, url, body, timeoutMs, extras)?
 }
 
