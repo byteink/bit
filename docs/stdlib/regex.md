@@ -74,6 +74,61 @@ fn firstSentence(s: string): string {
 An unknown flag letter (`(?x)`) is `regex: unknown flag at offset N`; an
 empty flag list (`(?)`) is `regex: missing flags at offset N`.
 
+### Counted repetition
+
+`{n}` (exactly `n`), `{n,}` (`n` or more) and `{n,m}` (between `n` and `m`,
+inclusive) — each optionally followed by `?` for the lazy form, same as
+`*?`/`+?`/`??`. Greedy prefers more repetitions, lazy prefers fewer; both
+still find the leftmost match, they differ only in how much of the string
+that match covers. `{,m}` is **not** special — it is a literal five-byte
+sequence, matching RE2/Go — and any `{...}` that is not a well-formed count
+(a bare `{`, a non-numeric or empty count, an unterminated brace) is a
+literal `{`, never a syntax error, exactly like Go's `regexp`.
+
+```bit
+import { mustCompile } from "std/regex"
+
+fn isZipCode(s: string): bool {
+  let re = mustCompile("^[0-9]{5}(-[0-9]{4})?$")
+  return re.matches(s)
+}
+```
+
+### Limits
+
+Three hard caps, all enforced at compile time and reported as an ordinary
+`compile` error rather than a panic or a silent truncation. Patterns are
+frequently user-supplied — a search box, a validation rule, a router — so
+compiling one must stay cheap and bounded no matter how it is shaped:
+
+- **Pattern length**: 4096 bytes.
+  `regex: pattern too long (max 4096 bytes)`.
+- **A single repeat count** (`{n}`, or either bound of `{n,m}`): 1000.
+  `regex: repeat count too large (max 1000) at offset N`.
+- **Compiled program size**: 20000 instructions. Counted repetition compiles
+  by literal expansion — `x{100}` is 100 separate copies of `x`'s own
+  instructions — so nesting it is exponential in the source text:
+  `((a{100}){100}){100}` is 20 bytes and would expand to 1,000,000
+  instructions. This cap is enforced WHILE the program is being built, with
+  a running counter, never by building it in full and measuring afterward —
+  that would already have done the unbounded allocation the cap exists to
+  prevent. `regex: pattern too complex (program exceeds 20000 instructions)`.
+
+```bit
+import { compile } from "std/regex"
+
+fn compileUserPattern(pattern: string): string {
+  let re = compile(pattern) catch e {
+    return "rejected: ${e.message()}"
+  }
+  return "compiled: ${re.pattern()}"
+}
+```
+
+`n > m` in a `{n,m}` (e.g. `a{5,2}`) is a separate, ordinary syntax error,
+`regex: repeat count out of order at offset N` — not one of the three caps
+above.
+
 ### `Regex`
 
 A compiled, validated regular expression. Opaque: its only public operations
