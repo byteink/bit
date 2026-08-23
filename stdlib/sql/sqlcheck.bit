@@ -1,0 +1,358 @@
+// Bit standard library — sql module, in-process self-check.
+//
+// Everything below is module-private (no `export`): it is not part of
+// `std/sql`'s public surface, only the proof that the surface in sql.bit is
+// actually implementable. `fakeDriver`/`fakeConn`/`fakeRows` are a toy
+// in-memory database — one table, one string-keyed column — reached only
+// through the public `Driver`/`Conn`/`Rows` interfaces, exactly as a real
+// driver package would be. Per this ticket's constraint, this is the only
+// file in the module allowed to implement `Driver`.
+//
+// RUN DIRECTLY: `bit run stdlib/sql/sqlcheck.bit` (with `BIT_STDLIB` pointing
+// at a tree that includes this module). A library module may declare `main`
+// — SPEC §17.4 — and it is only ever an entry point when this directory is
+// the one passed to `bit run`/`bit build`, which normal `import "std/sql"`
+// never does. Every check below uses `assert`/`panic`, so any regression
+// aborts the process with a nonzero exit instead of printing a soft failure
+// a caller could miss.
+
+// fakeConn's `store` is a map<string, Value>, but that map lives on
+// fakeDriver (see below), not here — a map is a reference type, so every
+// Conn opened from the same fakeDriver shares one "database" through their
+// separate `store` fields, the same way a real pooled driver's connections
+// share one backing database.
+class fakeConn { store: map<string, Value>, driverName: string }
+
+fn (c: fakeConn) query(sqlText: string, params: []Value): Rows! {
+  if (sqlText == "SELECT driver_name FROM meta") {
+    return fakeRows{ vals: [Value.Text(c.driverName)], pos: -1 }
+  }
+  if (sqlText == "SELECT val FROM items WHERE id = ?") {
+    if (len(params) != 1) {
+      fail newError("fakeConn: query wants 1 param")
+    }
+    let key = asText(params[0])?
+    let (v, ok) = c.store[key]
+    if (!ok) {
+      return fakeRows{ vals: []Value(0), pos: -1 }
+    }
+    return fakeRows{ vals: [v], pos: -1 }
+  }
+  if (sqlText == "SELECT COUNT(*) FROM items") {
+    if (len(params) != 0) {
+      fail newError("fakeConn: count wants 0 params")
+    }
+    return fakeRows{ vals: [Value.Int(len(c.store))], pos: -1 }
+  }
+  fail newError("fakeConn: unsupported query: ${sqlText}")
+}
+
+fn (c: fakeConn) exec(sqlText: string, params: []Value): int! {
+  if (sqlText == "INSERT INTO items (id, val) VALUES (?, ?)") {
+    if (len(params) != 2) {
+      fail newError("fakeConn: exec wants 2 params")
+    }
+    let key = asText(params[0])?
+    c.store[key] = params[1]
+    return 1
+  }
+  fail newError("fakeConn: unsupported exec: ${sqlText}")
+}
+
+fn (c: fakeConn) prepare(sqlText: string): Stmt! {
+  fail newError("fakeConn: prepare not supported")
+}
+
+fn (c: fakeConn) begin(): Tx! {
+  fail newError("fakeConn: begin not supported")
+}
+
+fn (c: fakeConn) close() {}
+
+// A one-shot cursor: `vals` is the whole (tiny) result set, `pos` the index
+// of the current row, `-1` before the first `next()`.
+class fakeRows { vals: []Value, pos: int }
+
+fn (r: fakeRows) next(): bool! {
+  if (r.pos + 1 >= len(r.vals)) {
+    return false
+  }
+  r.pos = r.pos + 1
+  return true
+}
+
+fn (r: fakeRows) columns(): []string {
+  return ["val"]
+}
+
+fn (r: fakeRows) value(col: int): Value {
+  return r.vals[r.pos]
+}
+
+fn (r: fakeRows) close() {}
+
+// fakeDriver.store is the shared "database" every Conn it opens sees; `name`
+// is echoed back by "SELECT driver_name FROM meta" so a check can prove
+// Registry.open handed back a connection from the RIGHT driver, not merely
+// a driver.
+class fakeDriver { name: string, store: map<string, Value> }
+
+fn (d: fakeDriver) open(dsn: string): Conn! {
+  return fakeConn{ store: d.store, driverName: d.name }
+}
+
+// Renders sqlText's `?` placeholders as this driver's own spelling, `@p1`,
+// `@p2`, ... in order — proof that a driver is free to pick any spelling,
+// since nothing in sql.bit ever mentions one. Fails if the number of `?`
+// markers found does not match paramCount, the same sanity check a real
+// driver would want before it ever touches the wire.
+fn renderAtPlaceholders(sqlText: string, paramCount: int): string! {
+  let out = ""
+  let n = 0
+  let i = 0
+  while (i < len(sqlText)) {
+    if (sqlText[i] == '?') {
+      n = n + 1
+      out = out + "@p${n}"
+    } else {
+      out = out + sqlText[i:i + 1]
+    }
+    i = i + 1
+  }
+  if (n != paramCount) {
+    fail newError("fakeDriver: placeholder count ${n} does not match param count ${paramCount}")
+  }
+  return out
+}
+
+// Byte-for-byte slice equality — []T has no built-in `==` (SPEC §14.1 covers
+// type identity only), so Blob round-trips are checked this way.
+fn bytesEqual(a: []byte, b: []byte): bool {
+  if (len(a) != len(b)) {
+    return false
+  }
+  let i = 0
+  while (i < len(a)) {
+    if (a[i] != b[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Inserts (id, v) through the public interface and immediately reads it
+// back the same way — open, exec, query, next, value. Every check below
+// that needs one round trip shares this rather than repeating the five
+// calls.
+fn insertAndFetch(reg: Registry, id: string, v: Value): Value! {
+  let conn = reg.open("fake", "mem://check")?
+  conn.exec("INSERT INTO items (id, val) VALUES (?, ?)", [Value.Text(id), v])?
+  let rows = conn.query("SELECT val FROM items WHERE id = ?", [Value.Text(id)])?
+  let has = rows.next()?
+  if (!has) {
+    fail newError("insertAndFetch: no row for ${id}")
+  }
+  return rows.value(0)
+}
+
+fn countItems(reg: Registry): int! {
+  let conn = reg.open("fake", "mem://check")?
+  let rows = conn.query("SELECT COUNT(*) FROM items", []Value(0))?
+  rows.next()?
+  return asInt(rows.value(0))?
+}
+
+// open -> query -> Rows.next -> typed accessor, round-tripping one Text
+// value through the registered fake driver.
+fn checkRoundTrip(reg: Registry) {
+  let got = insertAndFetch(reg, "round-trip", Value.Text("hello world")) catch e {
+    panic("sqlcheck: round trip failed: " + e.message())
+  }
+  match (got) {
+    Text(s) => assert(s == "hello world", "sqlcheck: round trip value mismatch")
+    _ => panic("sqlcheck: round trip returned the wrong Value variant")
+  }
+}
+
+fn checkPlaceholderRendering() {
+  let rendered = renderAtPlaceholders("INSERT INTO items (id, val) VALUES (?, ?)", 2) catch e {
+    panic("sqlcheck: render failed: " + e.message())
+  }
+  assert(
+    rendered == "INSERT INTO items (id, val) VALUES (@p1, @p2)",
+    "sqlcheck: placeholder rendering mismatch: ${rendered}",
+  )
+}
+
+fn checkValueNull(reg: Registry): bool {
+  let got = insertAndFetch(reg, "case-null", Value.Null) catch _ {
+    return false
+  }
+  return isNull(got)
+}
+
+fn checkValueInt(reg: Registry): bool {
+  let got = insertAndFetch(reg, "case-int", Value.Int(42)) catch _ {
+    return false
+  }
+  match (got) {
+    Int(n) => return n == 42
+    _ => return false
+  }
+}
+
+fn checkValueFloat(reg: Registry): bool {
+  let got = insertAndFetch(reg, "case-float", Value.Float(3.5)) catch _ {
+    return false
+  }
+  match (got) {
+    Float(f) => return f == 3.5
+    _ => return false
+  }
+}
+
+fn checkValueText(reg: Registry): bool {
+  let got = insertAndFetch(reg, "case-text", Value.Text("hello")) catch _ {
+    return false
+  }
+  match (got) {
+    Text(s) => return s == "hello"
+    _ => return false
+  }
+}
+
+fn checkValueBlob(reg: Registry): bool {
+  let want = []byte("blob-bytes")
+  let got = insertAndFetch(reg, "case-blob", Value.Blob(want)) catch _ {
+    return false
+  }
+  match (got) {
+    Blob(b) => return bytesEqual(b, want)
+    _ => return false
+  }
+}
+
+// One case per Value variant, round-tripped through the registry and the
+// fake driver. Prints and asserts a PASS/TOTAL count, not just a boolean,
+// so a partial regression (say, only Blob breaks) is never silently folded
+// into "some things still pass".
+fn checkValueCaseTable(reg: Registry) {
+  let total = 5
+  let passed = 0
+  if (checkValueNull(reg)) {
+    passed = passed + 1
+  }
+  if (checkValueInt(reg)) {
+    passed = passed + 1
+  }
+  if (checkValueFloat(reg)) {
+    passed = passed + 1
+  }
+  if (checkValueText(reg)) {
+    passed = passed + 1
+  }
+  if (checkValueBlob(reg)) {
+    passed = passed + 1
+  }
+  println("sqlcheck: value case table ${passed}/${total}")
+  assert(passed == total, "sqlcheck: value case table incomplete: ${passed}/${total}")
+}
+
+// Binds SQL-metacharacter payloads as PARAMETER VALUES (never into sqlText)
+// and proves they cross the boundary as inert data: the row count grows by
+// exactly one insert (no "DROP TABLE"/"DELETE" text ever executes), and the
+// value read back is byte-for-byte the payload that went in.
+fn checkInjectionSafety(reg: Registry) {
+  let payload = "x'); DROP TABLE items; --"
+  let idPayload = "a'; DELETE FROM items WHERE '1'='1"
+  let before = countItems(reg) catch e {
+    panic("sqlcheck: count before failed: " + e.message())
+  }
+  let got = insertAndFetch(reg, idPayload, Value.Text(payload)) catch e {
+    panic("sqlcheck: injection insert failed: " + e.message())
+  }
+  let after = countItems(reg) catch e {
+    panic("sqlcheck: count after failed: " + e.message())
+  }
+  assert(
+    after == before + 1,
+    "sqlcheck: injection payload changed row count by ${after - before}, want 1",
+  )
+  match (got) {
+    Text(s) => assert(s == payload, "sqlcheck: injection payload was altered in transit")
+    _ => panic("sqlcheck: injection round trip returned the wrong Value variant")
+  }
+}
+
+// Proves Registry.open hands back a connection from the driver actually
+// named, not merely some driver: driverName's own identity is read back
+// through "SELECT driver_name FROM meta" and compared against want.
+fn checkDriverIdentity(reg: Registry, driverName: string, want: string) {
+  let conn = reg.open(driverName, "mem://check") catch e {
+    panic("sqlcheck: open ${driverName} failed: " + e.message())
+  }
+  let rows = conn.query("SELECT driver_name FROM meta", []Value(0)) catch e {
+    panic("sqlcheck: query meta (${driverName}) failed: " + e.message())
+  }
+  rows.next() catch e {
+    panic("sqlcheck: next meta (${driverName}) failed: " + e.message())
+  }
+  match (rows.value(0)) {
+    Text(s) => assert(s == want, "sqlcheck: open(\"${driverName}\", ...) returned driver ${s}")
+    _ => panic("sqlcheck: driver_name has the wrong Value variant")
+  }
+}
+
+// Two distinct fakeDriver instances are registered under two names; each
+// open() must see its OWN driver's identity, not the other's — the direct
+// test of "the registry returns the wrong driver".
+fn checkRegistryPicksCorrectDriver(reg: Registry) {
+  checkDriverIdentity(reg, "fake", "fake")
+  checkDriverIdentity(reg, "fake2", "fake2")
+}
+
+fn opensOk(r: Registry, name: string, dsn: string): bool {
+  let _ = r.open(name, dsn) catch _ {
+    return false
+  }
+  return true
+}
+
+fn registersOk(r: Registry, name: string, d: Driver): bool {
+  r.register(name, d) catch _ {
+    return false
+  }
+  return true
+}
+
+fn checkRegistryRejectsDuplicate() {
+  let r = newRegistry()
+  let ok1 = registersOk(r, "dup", fakeDriver{ name: "dup", store: map<string, Value>() })
+  assert(ok1, "sqlcheck: first registration under a fresh name should succeed")
+  let ok2 = registersOk(r, "dup", fakeDriver{ name: "dup", store: map<string, Value>() })
+  assert(!ok2, "sqlcheck: registering an already-used name should fail")
+}
+
+fn checkRegistryRejectsUnknown() {
+  let r = newRegistry()
+  let ok = opensOk(r, "does-not-exist", "mem://check")
+  assert(!ok, "sqlcheck: opening an unregistered driver name should fail")
+}
+
+fn main(): int! {
+  let reg = newRegistry()
+  reg.register("fake", fakeDriver{ name: "fake", store: map<string, Value>() })?
+  reg.register("fake2", fakeDriver{ name: "fake2", store: map<string, Value>() })?
+
+  checkRoundTrip(reg)
+  checkPlaceholderRendering()
+  checkValueCaseTable(reg)
+  checkInjectionSafety(reg)
+  checkRegistryPicksCorrectDriver(reg)
+  checkRegistryRejectsDuplicate()
+  checkRegistryRejectsUnknown()
+
+  println("sqlcheck: all checks passed")
+  return 0
+}
