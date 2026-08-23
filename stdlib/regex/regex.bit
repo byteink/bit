@@ -22,8 +22,10 @@
 // share across green threads (see above). `prog` is the instruction program
 // `matches` runs (`prog.bit`, `pike.bit`); it is built once, here, at
 // `compile` time, so a shared pattern is compiled once and matched many
-// times, never recompiled per call.
-export class Regex { source: string, ast: Ast, groups: int, prog: Prog }
+// times, never recompiled per call. `names` is `groupNames()`'s backing
+// array — one entry per capturing group, index order, `""` for an unnamed
+// one — built once here too, alongside `prog`.
+export class Regex { source: string, ast: Ast, groups: int, prog: Prog, names: []string }
 
 // Parses `pattern` and returns a validated `Regex`, or fails with a
 // `regex: <reason> at offset <n>` error naming the first place the syntax
@@ -33,7 +35,9 @@ export fn compile(pattern: string): Regex! {
   let ast = parsePattern(pattern)?
   let groups = countGroups(ast)
   let prog = compileProg(ast, groups)?
-  return Regex{ source: pattern, ast: ast, groups: groups, prog: prog }
+  let names = []string(groups)
+  collectGroupNames(ast, names)
+  return Regex{ source: pattern, ast: ast, groups: groups, prog: prog, names: names }
 }
 
 // `compile`, panicking on a malformed `pattern` instead of returning an
@@ -58,6 +62,24 @@ export fn (re: Regex) groupCount(): int {
   return re.groups
 }
 
+// One entry per capturing group in `re`'s pattern, in index order —
+// `groupNames()[0]` is group 1's name — `""` for a group with no name
+// (`(...)`); a non-capturing `(?:...)` never gets an entry, since it never
+// gets an index either. `len(re.groupNames()) == re.groupCount()` always
+// holds. Returns a fresh copy every call, never `re.names` itself: `re` is
+// immutable and shared across green threads (this file's header), so no
+// caller may ever be handed a reference it could mutate out from under a
+// concurrent one.
+export fn (re: Regex) groupNames(): []string {
+  let out = []string(len(re.names))
+  let i = 0
+  while (i < len(re.names)) {
+    out[i] = re.names[i]
+    i = i + 1
+  }
+  return out
+}
+
 // Whether `re`'s pattern matches anywhere in `s` — an unanchored search, the
 // same convention as Go's `regexp.MatchString`: use `^`/`$` in the pattern
 // itself for a whole-string match. Runs `re.prog` with a Pike VM
@@ -72,16 +94,56 @@ export fn (re: Regex) matches(s: string): bool {
 // A single match: `start`/`end` are byte offsets into the subject string —
 // never rune indices, so they are usable directly as `s[m.start:m.end]`
 // slice bounds. `slots` holds every capture group's start/end pair the
-// winning thread reached (`-1` for a group that never participated), and
-// stays module-private: no accessor reads it in this ticket, and #2029 adds
-// `Match.group`/`Match.named` over this same array without any VM change.
-export class Match { export start: int, export end: int, slots: []int }
+// winning thread reached (`-1` for a group that never participated);
+// `names` is the same `Regex.names` array `m` was produced from, carried
+// along so `named` can resolve a name without a separate `Regex` argument
+// (this ticket's `Match.named(name: string)` signature takes only a name).
+// Both stay module-private — `group`/`named` below are the only readers.
+export class Match { export start: int, export end: int, slots: []int, names: []string }
 
 // The substring of `s` this match covers, `s[m.start:m.end]`. `s` must be
 // the same string (or an identical copy) `find`/`findAll` matched against —
 // `m.start`/`m.end` are byte offsets into it, not into an arbitrary string.
 export fn (m: Match) text(s: string): string {
   return s[m.start:m.end]
+}
+
+// `m`'s `i`-th capturing group: `group(0)` is the whole match, always
+// `Option.Some` — it is how `m` itself was produced. `Option.None` for `i`
+// out of range (`i < 0`, or past the pattern's own group count), and
+// `Option.None` for a capturing group that took no part in this particular
+// match, e.g. the untaken branch of `(a)|(b)` — distinct from a group that
+// matched the empty string, which is `Option.Some` with `start == end`
+// (`m.slots` holds `-1` in both halves of a slot pair no `Save` reached;
+// `pike.bit`'s header). `2 * i + 1 >= len(m.slots)` catches both `i` too
+// large and (defensively) a negative `i` reaching this far, though the
+// explicit `i < 0` check above already rejects the latter.
+export fn (m: Match) group(i: int): Option<Match> {
+  if (i < 0 || 2 * i + 1 >= len(m.slots)) {
+    return Option.None
+  }
+  let start = m.slots[2 * i]
+  let end = m.slots[2 * i + 1]
+  if (start < 0 || end < 0) {
+    return Option.None
+  }
+  return Option.Some(Match{ start: start, end: end, slots: m.slots, names: m.names })
+}
+
+// `m.group(i)` for whichever `i` `m`'s pattern gave `name` to —
+// `Option.None` for a name the pattern never declared, same as an
+// out-of-range `group` index. Looks the name up in `m.names` (a copy of
+// `Regex.names`, carried on `m` since the ticket's signature takes no
+// separate `Regex` argument), bounded by `len(m.names) == groupCount()`.
+export fn (m: Match) named(name: string): Option<Match> {
+  let i = 0
+  while (i < len(m.names)) {
+    if (m.names[i] == name) {
+      return m.group(i + 1)
+    }
+    i = i + 1
+  }
+  return Option.None
 }
 
 // The leftmost-first match of `re`'s pattern anywhere in `s`, or
@@ -92,7 +154,7 @@ export fn (re: Regex) find(s: string): Option<Match> {
   if (!matched) {
     return Option.None
   }
-  return Option.Some(Match{ start: slots[0], end: slots[1], slots: slots })
+  return Option.Some(Match{ start: slots[0], end: slots[1], slots: slots, names: re.names })
 }
 
 // Successive non-overlapping matches of `re`'s pattern in `s`, scanning left
@@ -125,7 +187,7 @@ export fn (re: Regex) findAll(s: string, limit: int): []Match {
     if (!matched) {
       return out
     }
-    out = append(out, Match{ start: slots[0], end: slots[1], slots: slots })
+    out = append(out, Match{ start: slots[0], end: slots[1], slots: slots, names: re.names })
     pos = nextSearchPos(s, slots[0], slots[1])
     i = i + 1
   }
@@ -180,4 +242,40 @@ fn countGroupsIn(items: []Ast): int {
     i = i + 1
   }
   return total
+}
+
+// Fills `names[node.index - 1]` for every capturing `Group` node reached
+// walking `ast` — `countGroups`'s companion walk, run once at `compile`
+// time (into an array already sized `countGroups(ast)`) so `groupNames()`
+// is an O(1) copy rather than a fresh walk on every call. `names` is
+// mutated in place through the slice reference, the same convention
+// `prog.bit`'s `setPreferredArm`/`setFallbackArm` use for `c.insts`.
+fn collectGroupNames(ast: Ast, names: []string) {
+  match (ast) {
+    Concat(items) => collectGroupNamesIn(items, names)
+    Alternate(items) => collectGroupNamesIn(items, names)
+    Repeat(node) => collectGroupNames(node.sub, names)
+    Group(node) => collectGroupNamesInGroup(node, names)
+    _ => {}
+  }
+}
+
+// A capturing group (`index != 0`) records its own name before its body is
+// walked; a non-capturing `(?:...)` (`index == 0`) contributes nothing of
+// its own but still needs its body walked for any capturing groups nested
+// inside it.
+fn collectGroupNamesInGroup(node: GroupNode, names: []string) {
+  if (node.index != 0) {
+    names[node.index - 1] = node.name
+  }
+  collectGroupNames(node.sub, names)
+}
+
+fn collectGroupNamesIn(items: []Ast, names: []string) {
+  let i = 0
+  // Bounded by `items`'s length, fixed before the loop starts.
+  while (i < len(items)) {
+    collectGroupNames(items[i], names)
+    i = i + 1
+  }
 }
