@@ -1,0 +1,276 @@
+// #2593: the grow-on-demand POLICY (`runtime/sched/grow.bit`), on top of
+// #2592's already-proven mechanism (`schedStartWorker`,
+// `tests/stress/schedgrowdarwin`). Three schedulers, each isolating one
+// claim so a failure in one can't be misread as another:
+//
+//   s1 — a scheduler that never spawns a second task keeps `scNWorkers` at
+//        1 forever (the "never pays" half).
+//   s2 — five real `schedSpawn` calls, worker 0's OS thread deliberately
+//        NOT started until after all five land, so the streak
+//        `schedGrowObserve` builds is race-free and lands on an EXACT,
+//        checked value (4) rather than an inequality. `schedMaybeGrow` then
+//        starts a second worker, and both workers are proven to actually
+//        drain and complete all five queued tasks.
+//   s3 — `schedMaybeGrow` driven with the streak forced to threshold each
+//        time (deterministic, no real backlog needed), growing the pool
+//        from 1 to `schedMaxWorkers`(32), then proving the 33rd attempt is
+//        REFUSED and the count does not move past the ceiling.
+//
+// Darwin-only by construction, hence the sibling `darwin-only` marker: it
+// binds `runtime/thread/darwin` and `runtime/park/darwin`, `extern function`s
+// (SPEC §11.7) both Linux targets reject even when uncalled — the same
+// reason `tests/stress/schedgrowdarwin` is darwin-only.
+
+import { schedInit, schedWorkerAt, schedWorkerRun, schedNoTimers, schedNoPoller } from "../../../runtime/sched"
+import { schedShutdown, schedTaskInit, schedTaskExit } from "../../../runtime/sched"
+import { schedStackBytes, taskAt, scNWorkers } from "../../../runtime/sched"
+import { schedSpawn, schedMaybeGrow, growStreakThreshold, scGrowStreak, schedMaxWorkers } from "../../../runtime/sched"
+import { threadJoin, threadJoinDone, threadRunning } from "../../../runtime/thread"
+import { threadStart, threadRelease } from "../../../runtime/thread/darwin"
+import { parkSleepNs, parkMonoNs } from "../../../runtime/park/darwin"
+import { parkMinBackoffNs } from "../../../runtime/park"
+
+// `schedMaxWorkers`(32) * `workerWords`(292) — an array size must be an
+// integer literal (E0021), so this cannot be written as the product.
+const workerBlockWords: int = 9344
+
+const WAIT_NS: int = 5000000000
+const WAIT_MAX_POLLS: int = 100000
+
+let sleepScratch: [2]i64
+
+@nosplit fn alignUpStack(addr: int): int {
+  let bumped = addr + schedStackBytes - 1
+  return bumped - bumped % schedStackBytes
+}
+
+fn sleepAdapt(ns: int) {
+  parkSleepNs(ns, ptrOf(sleepScratch))
+}
+
+fn waitFlag(addr: *i64): bool {
+  let deadline = parkMonoNs() + WAIT_NS
+  let i = 0
+  while (i < WAIT_MAX_POLLS) {
+    if (atomicLoad(addr) != 0) {
+      return true
+    }
+    if (parkMonoNs() >= deadline) {
+      return false
+    }
+    sleepAdapt(parkMinBackoffNs)
+    i = i + 1
+  }
+  return false
+}
+
+extern fn bit_rt_gc_thread_exit()
+
+// The OS thread body every worker in this program runs, boot-shaped or
+// grown, exactly as `schedgrowdarwin`'s `growWorkerEntry`.
+fn growWorkerEntry(arg: *byte): *byte {
+  let block = taskAt(int(arg))
+  let workerAddr = *block
+  schedWorkerRun(taskAt(workerAddr), schedNoTimers, schedNoPoller)
+  bit_rt_gc_thread_exit()
+  let z: *i32 = nil
+  let doneAddr = *(block + 1)
+  atomicStore(z + doneAddr / 4, i32(0))
+  return nil
+}
+
+fn startWorker0(s: *i64, argArea: *i64, doneArea: *i32, handleArea: *i64): int {
+  let block = argArea
+  *block = int(schedWorkerAt(s, 0))
+  *(block + 1) = int(doneArea)
+  atomicStore(doneArea, i32(threadRunning))
+  let bp: *byte = nil
+  return threadStart(entryOf(growWorkerEntry), bp + int(block), doneArea)
+}
+
+// ---------------------------------------------------------------------------
+// s1: no second task ever spawned, `scNWorkers` never leaves 1.
+// ---------------------------------------------------------------------------
+let s1Block: [16]i64
+let s1Workers: [292]i64
+
+fn checkNoSpawnStaysOne(): bool {
+  let s = taskAt(int(ptrOf(s1Block)))
+  schedInit(s, int(ptrOf(s1Workers)), 1)
+  return atomicLoad(s + scNWorkers) == 1
+}
+
+// ---------------------------------------------------------------------------
+// s2: five real `schedSpawn` calls before worker 0's OS thread exists, so
+// the streak is race-free; then growth, then real completion.
+// ---------------------------------------------------------------------------
+let s2Block: [16]i64
+// Sized for TWO workers (2 * workerWords(292) = 584): `schedInit` brings up
+// only worker 0, but s2 grows to 2 via `schedMaybeGrow` below, and
+// `schedWorkerAt(s, 1)` computes its stride PAST a 1-worker array — reading
+// and writing adjacent module statics. Sized for 1 worker here first and
+// caught by exactly that corruption (`preemptStamp` writing through a
+// garbage `wkId` read off the wrong memory) before this comment existed.
+let s2Workers: [584]i64
+let s2ArgArea: [64]i64
+let s2DoneArea: [32]i32
+let s2HandleArea: [32]i64
+
+let s2Stack0: [16384]i64
+let s2Stack1: [16384]i64
+let s2Stack2: [16384]i64
+let s2Stack3: [16384]i64
+let s2Stack4: [16384]i64
+let s2Task0: [32]i64
+let s2Task1: [32]i64
+let s2Task2: [32]i64
+let s2Task3: [32]i64
+let s2Task4: [32]i64
+
+let s2Ran0: i64 = 0
+let s2Ran1: i64 = 0
+let s2Ran2: i64 = 0
+let s2Ran3: i64 = 0
+let s2Ran4: i64 = 0
+
+@nosplit fn s2Task0Body() {
+  atomicStore(ptrOf(s2Ran0), 1)
+  schedTaskExit()
+}
+@nosplit fn s2Task1Body() {
+  atomicStore(ptrOf(s2Ran1), 1)
+  schedTaskExit()
+}
+@nosplit fn s2Task2Body() {
+  atomicStore(ptrOf(s2Ran2), 1)
+  schedTaskExit()
+}
+@nosplit fn s2Task3Body() {
+  atomicStore(ptrOf(s2Ran3), 1)
+  schedTaskExit()
+}
+@nosplit fn s2Task4Body() {
+  atomicStore(ptrOf(s2Ran4), 1)
+  schedTaskExit()
+}
+
+fn spawnS2(s: *i64, taskAddr: int, stackBase: int, body: *byte) {
+  let t = taskAt(taskAddr)
+  schedTaskInit(t, stackBase, schedStackBytes, body, 0)
+  schedSpawn(s, taskAddr)
+}
+
+fn main() {
+  let noSpawnStaysOne = checkNoSpawnStaysOne()
+
+  let s2 = taskAt(int(ptrOf(s2Block)))
+  schedInit(s2, int(ptrOf(s2Workers)), 1)
+
+  // Five spawns, worker 0's real thread not started yet: nothing drains the
+  // global queue, so `schedGrowObserve`'s streak builds deterministically.
+  // schedSpawn #1 observes the queue EMPTY (streak -> 0), #2..#5 each
+  // observe the PRIOR pushes still sitting there (streak -> 1,2,3,4).
+  let base0 = alignUpStack(int(ptrOf(s2Stack0)))
+  let base1 = alignUpStack(int(ptrOf(s2Stack1)))
+  let base2 = alignUpStack(int(ptrOf(s2Stack2)))
+  let base3 = alignUpStack(int(ptrOf(s2Stack3)))
+  let base4 = alignUpStack(int(ptrOf(s2Stack4)))
+  spawnS2(s2, int(ptrOf(s2Task0)), base0, entryOf(s2Task0Body))
+  spawnS2(s2, int(ptrOf(s2Task1)), base1, entryOf(s2Task1Body))
+  spawnS2(s2, int(ptrOf(s2Task2)), base2, entryOf(s2Task2Body))
+  spawnS2(s2, int(ptrOf(s2Task3)), base3, entryOf(s2Task3Body))
+  spawnS2(s2, int(ptrOf(s2Task4)), base4, entryOf(s2Task4Body))
+  let streakAtThreshold = atomicLoad(s2 + scGrowStreak) == growStreakThreshold
+
+  // Growth itself: streak is at threshold and 1 < schedMaxWorkers, so this
+  // must succeed and reset the streak.
+  let grewFromSpawns = schedMaybeGrow(s2, entryOf(growWorkerEntry),
+                                       ptrOf(s2ArgArea), ptrOf(s2DoneArea),
+                                       ptrOf(s2HandleArea), threadStart)
+  let countAfterGrow = atomicLoad(s2 + scNWorkers)
+  let roseToTwo = countAfterGrow == 2
+  let streakResetAfterGrow = atomicLoad(s2 + scGrowStreak) == 0
+
+  // Now start worker 0 for real. Worker 1 (the grown one) is already a live
+  // OS thread from `schedMaybeGrow` above. Both drain the five queued tasks.
+  let h0 = startWorker0(s2, ptrOf(s2ArgArea), ptrOf(s2DoneArea), ptrOf(s2HandleArea))
+  let ran0 = waitFlag(ptrOf(s2Ran0))
+  let ran1 = waitFlag(ptrOf(s2Ran1))
+  let ran2 = waitFlag(ptrOf(s2Ran2))
+  let ran3 = waitFlag(ptrOf(s2Ran3))
+  let ran4 = waitFlag(ptrOf(s2Ran4))
+  let s2RanAll = ran0 && ran1 && ran2 && ran3 && ran4
+
+  schedShutdown(s2)
+  let s2Joined0 = threadJoin(ptrOf(s2DoneArea), WAIT_NS, sleepAdapt, parkMonoNs) == threadJoinDone
+  let s2Rel0 = threadRelease(h0)
+  let s2Joined1 = threadJoin(ptrOf(s2DoneArea) + 1, WAIT_NS, sleepAdapt, parkMonoNs) == threadJoinDone
+  let s2Rel1 = threadRelease(*(ptrOf(s2HandleArea) + 1))
+  let s2TeardownOk = s2Joined0 && s2Rel0 && s2Joined1 && s2Rel1
+
+  // ---- s3: the ceiling, forcing the streak so the loop is deterministic --
+  let s3 = growCeiling()
+
+  println("noSpawnStaysOne ${noSpawnStaysOne}")
+  println("streakAtThreshold ${streakAtThreshold}")
+  println("grewFromSpawns ${grewFromSpawns}")
+  println("roseToTwo ${roseToTwo}")
+  println("streakResetAfterGrow ${streakResetAfterGrow}")
+  println("s2RanAll ${s2RanAll}")
+  println("s2TeardownOk ${s2TeardownOk}")
+  println("ceilingOk ${s3}")
+}
+
+// ---------------------------------------------------------------------------
+// s3: grow to the ceiling, then prove one more attempt is refused.
+// ---------------------------------------------------------------------------
+let s3Block: [16]i64
+let s3Workers: [workerBlockWords]i64
+let s3ArgArea: [64]i64
+let s3DoneArea: [32]i32
+let s3HandleArea: [32]i64
+
+fn growCeiling(): bool {
+  let s = taskAt(int(ptrOf(s3Block)))
+  schedInit(s, int(ptrOf(s3Workers)), 1)
+
+  // Grow from 1 to `schedMaxWorkers`, forcing the streak each time so this
+  // loop's timing does not depend on any real backlog.
+  let grownAll = true
+  let n = 1
+  while (n < schedMaxWorkers) {
+    atomicStore(s + scGrowStreak, growStreakThreshold)
+    let ok = schedMaybeGrow(s, entryOf(growWorkerEntry), ptrOf(s3ArgArea),
+                             ptrOf(s3DoneArea), ptrOf(s3HandleArea), threadStart)
+    if (!ok) {
+      grownAll = false
+    }
+    n = n + 1
+  }
+  let atCeiling = atomicLoad(s + scNWorkers) == schedMaxWorkers
+
+  // One more: the pool is already at the ceiling, so this MUST be refused
+  // regardless of the streak.
+  atomicStore(s + scGrowStreak, growStreakThreshold)
+  let refused = !schedMaybeGrow(s, entryOf(growWorkerEntry), ptrOf(s3ArgArea),
+                                 ptrOf(s3DoneArea), ptrOf(s3HandleArea), threadStart)
+  let stillAtCeiling = atomicLoad(s + scNWorkers) == schedMaxWorkers
+
+  schedShutdown(s)
+  let joinedAll = true
+  // Starts at 1, not 0: worker 0's struct exists (`schedInit` counts it) but
+  // never got a real OS thread here — `s3DoneArea[0]`/`s3HandleArea[0]` were
+  // never armed, so there is nothing to join or release at that index.
+  let i = 1
+  while (i < schedMaxWorkers) {
+    if (threadJoin(ptrOf(s3DoneArea) + i, WAIT_NS, sleepAdapt, parkMonoNs) != threadJoinDone) {
+      joinedAll = false
+    }
+    if (!threadRelease(*(ptrOf(s3HandleArea) + i))) {
+      joinedAll = false
+    }
+    i = i + 1
+  }
+
+  return grownAll && atCeiling && refused && stillAtCeiling && joinedAll
+}

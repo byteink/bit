@@ -1,0 +1,137 @@
+// Grow-on-demand pool policy (#2593, epic #1911's chosen design —
+// `./pool-sizing.md`). Boot starts ONE worker; this file decides when a
+// second, third, ... becomes worth its own OS thread, so a program that
+// never has parallel work never pays for a pool it never uses.
+//
+// ---------------------------------------------------------------------------
+// THE HARD CEILING: `schedMaxWorkers` (`./sleep.bit`), THE SAME ONE
+// `schedStartWorker` (#2592, `./worker.bit`) ALREADY REFUSES PAST
+// ---------------------------------------------------------------------------
+//
+// This file never starts a worker `schedStartWorker` would not have started
+// anyway — `schedMaybeGrow` re-checks `scNWorkers < schedMaxWorkers` itself
+// only so a full pool skips the lock `schedStartWorker` would otherwise take
+// and immediately release; the ceiling is enforced exactly once, by
+// `schedStartWorker` itself (`worker.bit:241`), the load-bearing check.
+// Bounded resource allocation after startup (Power of 10 #3): the pool can
+// never exceed `schedMaxWorkers` (32) OS threads, full stop.
+//
+// ---------------------------------------------------------------------------
+// WHY `schedMaybeGrow` TAKES THE START RECIPE AS PARAMETERS, NOT AS STATE
+// ---------------------------------------------------------------------------
+//
+// `schedStartWorker` takes `entry`/`argArea`/`doneArea`/`handleArea`/
+// `startFn` — the platform thread-start recipe — as caller-supplied values,
+// and `schedMaybeGrow` forwards them unchanged rather than owning a copy,
+// for two independent reasons that both trace to `runtime/sched` building
+// `--freestanding` (SPEC §17.6, `tools/build/artifacts.bit`'s libbitrt
+// recipe):
+//
+//   1. A function value (`startFn`'s type) is a `(code, env)` cell that
+//      needs a `TypeInfo` descriptor to construct (SPEC §11.10) — "a module
+//      that builds one [...] can no longer be emitted --freestanding"
+//      (`./workerrun.bit`'s own header, verbatim, about the identical
+//      `nowFn`/`pollFn` seam `schedWorkerRun` takes). Referencing a named
+//      function to fill a function-typed slot is BUILDING one; this was
+//      proved empirically, not assumed — an earlier draft of this file that
+//      wrote `schedStartWorker(s, entryOf(growWorkerEntry), ..., someFn)`
+//      failed `./make libbitrt` with exactly that diagnostic
+//      ("this module allocates on the managed heap"), even though every
+//      function involved was a plain top-level one with no captured
+//      environment.
+//   2. Module-level state cannot HOLD a function value at all (SPEC §11.11,
+//      E0082: "only untraced types may live at module scope [...] never a
+//      reference") — so even a one-time-configure-then-cache design (the
+//      shape `runtime/root/<os>/boot.bit`'s `gSched` uses for the scheduler
+//      address) is unavailable here for `startFn` specifically, though it
+//      would work for the plain pointers (`entry`/`argArea`/`doneArea`/
+//      `handleArea`).
+//
+// So `schedMaybeGrow` only ever RECEIVES a recipe already built by a
+// non-freestanding caller — it builds nothing and stores nothing between
+// calls. `runtime/root/<os>/boot.bit`'s `workerBody` already builds the
+// identical recipe for the boot-time workers `schedInit` brings up; wiring
+// it to also call `schedMaybeGrow` with that same recipe is a follow-up
+// ticket, since `boot.bit` sits outside this ticket's file ownership.
+// `tests/stress/schedgrowdemand{darwin,linux}` supply their own recipe the
+// same way `tests/stress/schedgrowdarwin` already does for `schedStartWorker`
+// directly, proving the policy end-to-end with real OS threads.
+//
+// ---------------------------------------------------------------------------
+// WHY THE ENQUEUE PATH OBSERVES BUT CANNOT ITSELF START A WORKER
+// ---------------------------------------------------------------------------
+//
+// `schedSpawn` (`./workerrun.bit`) is the scheduler's only path for brand-new
+// work — production code reaches it exclusively through `bit_rt_spawn`, one
+// call site per OS in `runtime/root/<os>/boot.bit`'s `rtSpawn`, never
+// directly from generated code. Hooking the observation there means a
+// program that spawns nothing never advances the streak past 0, which is the
+// property the ticket asks for: "a program that never has parallel work
+// never pays". `schedUnpark`/`schedPollUnpark` also push onto the same
+// global queue when they wake a PARKED task, but that is existing work
+// resuming, not new work arriving, and is deliberately not observed here.
+//
+// `schedSpawn` is `@nosplit`, and that is not incidental — its only caller,
+// `rtSpawn`, must not be preempted mid-registration, and `@nosplit` is
+// transitive: a `@nosplit` function may call only other `@nosplit` functions
+// (SPEC §10.3.1). `schedMaybeGrow` cannot be one of those callees: it calls
+// `schedStartWorker`, whose body invokes the caller-supplied `startFn` — a
+// call THROUGH A VALUE, whose target is not knowable statically, which SPEC
+// §10.3.1 rules E0075 (`nosplit_calls_allocating`) unconditionally. So no
+// function that (transitively) starts a worker can be reached from
+// `schedSpawn` synchronously, and this is a property of `schedStartWorker`'s
+// existing, already-landed design (#2592), not something this file can
+// route around.
+//
+// The split this forces: `schedGrowObserve` below is the `@nosplit` half —
+// a plain counter, callable from `schedSpawn` — and `schedMaybeGrow` is the
+// other half, which cannot be `@nosplit`. This mirrors `./preempt.bit`'s own
+// precedent exactly: that file's header states its logic is
+// `@nosplit`-clean and still had to leave the actual call site to a later
+// ticket, for the identical reason (a `@nosplit` safepoint check may only
+// call another `@nosplit` function). Growth's logic cannot even clear that
+// first bar, because starting a thread is irreducibly not `@nosplit`.
+
+// Consecutive non-empty checks required before starting one more worker.
+// Small on purpose: the ceiling above is what bounds the pool, not this —
+// this only bounds how quickly it reacts once real backlog shows up.
+export const growStreakThreshold: int = 4
+
+// The `@nosplit` half: called from `schedSpawn`'s own body on every enqueue.
+// Plain integer compare, no allocation, no lock beyond the one `gqNonEmpty`
+// itself takes none of — it is a racy, lock-free peek by design (see
+// `queue.bit`'s own header) — so this never acquires a NEW lock at all,
+// which is the stronger form of "no lock beyond the one the enqueue path
+// already holds": it takes none.
+export @nosplit fn schedGrowObserve(s: *i64) {
+  if (!gqNonEmpty(s + scGlobal)) {
+    atomicStore(s + scGrowStreak, 0)
+    return
+  }
+  atomicStore(s + scGrowStreak, atomicLoad(s + scGrowStreak) + 1)
+}
+
+// The other half: starts at most one extra worker, only when the streak
+// `schedGrowObserve` has been building reached `growStreakThreshold` AND the
+// pool is still below `schedMaxWorkers`. Cannot be `@nosplit` — see the
+// header — so a caller outside `runtime/sched` (boot, or a test standing in
+// for boot) drives it, supplying the same platform thread-start recipe it
+// would give `schedStartWorker` directly.
+//
+// Resets the streak on every call that reaches the threshold, win or lose: a
+// failed `schedStartWorker` (pool already full, or the thread create itself
+// failed) must not be retried on literally the next call — the next
+// `growStreakThreshold` consecutive non-empty enqueues earn the next
+// attempt, exactly as a fresh streak would after a genuinely idle stretch.
+export fn schedMaybeGrow(s: *i64, entry: *byte, argArea: *i64,
+                          doneArea: *i32, handleArea: *i64,
+                          startFn: (*byte, *byte, *i32) => int): bool {
+  if (atomicLoad(s + scGrowStreak) < growStreakThreshold) {
+    return false
+  }
+  atomicStore(s + scGrowStreak, 0)
+  if (atomicLoad(s + scNWorkers) >= schedMaxWorkers) {
+    return false
+  }
+  return schedStartWorker(s, entry, argArea, doneArea, handleArea, startFn)
+}
