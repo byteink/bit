@@ -1549,6 +1549,7 @@ defined exactly once).
 | `bit_rt_fs_list_dir`  | `(path: *const RtBytes) -> *const RtBytes` (§14)        |
 | `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not NUL-terminated, not `RtBytes`; the only `bit_rt_fs_*` entry point shaped this way) |
 | `bit_rt_fs_sync`      | `(fd: i64) -> i64` (§14, `0` on success, `-1` on failure; Darwin uses `F_FULLFSYNC`, falling back to bare `fsync` only on `ENOTSUP` — bare `fsync` alone does not flush the drive's write cache on that platform) |
+| `bit_rt_fs_cwd`       | `() -> *const RtBytes` (§14, the process's current working directory, or the empty string on any failure; #3501) |
 | `bit_rt_test_index`   | `() -> i64` (§16)                                      |
 | `bit_rt_floor`        | `(x: f64) -> f64` (§17)                                |
 | `bit_rt_ceil`         | `(x: f64) -> f64` (§17)                                |
@@ -1923,6 +1924,7 @@ bit_rt_fs_read_all_failed()       -> bool       // #2994/#3065/#2996 below
 bit_rt_fs_read(fd, max: i64)      -> string     // up to max bytes; "" at EOF
 bit_rt_fs_write(fd, s)            -> i64        // bytes written, or -1
 bit_rt_fs_sync(fd)                -> i64        // 0, or -1 (#3462)
+bit_rt_fs_cwd()                   -> string     // cwd, or "" on failure (#3501)
 bit_rt_fs_close(fd)               -> i64        // always 0
 bit_rt_fs_exists(path)            -> bool
 bit_rt_fs_is_dir(path)            -> bool
@@ -1997,6 +1999,28 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   primitives only, no consumer. Pass 2 (a `File.sync()` method in
   `stdlib/fs/fs.bit`) is a follow-up ticket, gated on a release containing
   this commit and a stage0 repin to it.
+- `fs_cwd` (#3501) is the only `bit_rt_fs_*` entry point that takes NO
+  argument — nothing to encode through `fsPathZ`/`checkedPathW`. Darwin and
+  Linux both call `getcwd` (libc on Darwin, the raw syscall on Linux — kernel
+  `fs/d_path.c`'s `SYSCALL_DEFINE2(getcwd, ...)` returns the byte count
+  INCLUDING the trailing NUL on success, unlike a `read`, so the wrapper trims
+  one byte off), sized to `max_path` (4096) and rejected — never truncated —
+  if the result would not fit. Windows calls `GetCurrentDirectoryW` into a
+  `MAX_PATH` (260-unit) UTF-16LE scratch buffer, then decodes through the same
+  `winUtf16ToUtf8` boundary every other Windows path-taking primitive uses.
+  Empty string on any failure (`getcwd` returning NULL/negative-errno,
+  `GetCurrentDirectoryW` returning 0, or either result not fitting its
+  platform's ceiling) — the same flat-failure shape `fs_open`/`fs_mkdir`
+  already use, no companion out-of-band flag. **No `stdlib/` caller exists
+  yet** — the identical `tools/build/` bootstrap cycle #2153's and #3462's own
+  bullets describe: `tools/build/artifacts.bit` imports `std/fs`, which the
+  PINNED stage0 compiles against its own frozen `libbitrt.a`, so a
+  `stdlib/fs/fs.bit` reference to `bit_rt_fs_cwd` breaks the driver bootstrap
+  with E0078 on every fresh clone until a release ships this commit and the
+  pin moves. This landing is pass 1 of 2 (the #3065 pattern): the runtime
+  primitive only, no consumer. Pass 2 (a `std/fs` function surfacing it) is a
+  follow-up ticket, gated on a release containing this commit and a stage0
+  repin to it.
 - `fs_read` reads once and returns what it got, so it is the primitive for
   pipes, sockets, and stdin — none of which have a size to seek to.
 - `fs_list_dir` separates entries with a **NUL** byte, the one byte a POSIX
