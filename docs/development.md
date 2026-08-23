@@ -448,17 +448,22 @@ triple and the wrapper cannot know the target.
 **A hang is a failure, not a stall.** Every subprocess a harness spawns carries a
 wall-clock deadline. Exceeding it kills that child (by its own PID, never a name
 pattern), reports `TIMED OUT` naming the case, and reddens the suite. Default
-**900s**; override with `BIT_TEST_TIMEOUT_S=<seconds>` on a slower host, or `0`
-to block forever as before. A timeout is a distinct outcome from a crash: a child
-killed by SIGSEGV/SIGBUS/SIGABRT is reported as a crash naming the signal.
+**300s** (`defaultTimeoutS`, `tests/bit/stress/stress.bit:168` and
+`tests/bit/golden.bit:82`); override with `BIT_TEST_TIMEOUT_S=<seconds>` on a
+slower host, or `0` to block forever as before. A timeout is a distinct outcome
+from a crash: a child killed by SIGSEGV/SIGBUS/SIGABRT is reported as a crash
+naming the signal.
 
-The corpus's worst case is `tests/stress/quicwire` at 158s under `BIT_GC=stress`,
-so 900s is a 5.7x margin rather than a stopgap. Two counter-intuitive things
-about that number, worth knowing before re-measuring: `polloneshotdarwin` used to
-sit beside it at 122s and is now 2s, because it bounded a deliberately-never-
+`tests/stress/quicwire`'s `BIT_GC=stress` run measures ~176s standalone
+(`tests/stress/quicwire/quicwire.bit:38-44`), ~59% of the 300s default — but
+under `./make test`'s concurrency it can exceed that budget, which is why it
+now carries its own `timeout-s` override rather than leaning on the corpus
+default (documented below). Two counter-intuitive things about timing this
+corpus, worth knowing before re-measuring: `polloneshotdarwin` used to sit
+beside it at 122s and is now 2s, because it bounded a deliberately-never-
 satisfied wait in *idle scheduler passes* and an idle pass went from microseconds
 to up to 1ms — **any test that counts scheduler passes is measuring an
-implementation detail; bound it in wall clock instead.** And quicwire's 158s is
+implementation detail; bound it in wall clock instead.** And quicwire's cost is
 not a defect: `BIT_GC=off` runs it in ~1s, so the gap is that the collector's
 machine code no longer comes from an optimising backend. **Do not read a
 `TIMED OUT` as a hang until you have timed the program standalone**, and run
