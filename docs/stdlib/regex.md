@@ -14,8 +14,9 @@ make it exponential, unlike a backtracking engine on a pattern such as
 `compile` rejects a malformed pattern with a `regex: <reason> at offset <n>`
 error, at the exact byte the syntax breaks down. `Regex.matches` runs the
 compiled program against a string, an unanchored search (like Go's
-`regexp.MatchString`). Match spans and capture groups (`find`, `Match`)
-land in later tickets.
+`regexp.MatchString`). `Regex.find` and `Regex.findAll` report *where* a
+pattern matched, as byte-offset spans (`Match`). Capture groups and named
+groups land in a later ticket.
 
 A compiled `Regex` is **immutable** and **safe to share across any number of
 green threads** — the natural usage is one `mustCompile` call, shared by
@@ -90,5 +91,69 @@ import { mustCompile } from "std/regex"
 fn isColor(s: string): bool {
   let re = mustCompile("colou?r")
   return re.matches(s)
+}
+```
+
+### `Match`
+
+A single match: `start` and `end` are **byte offsets**, never rune indices,
+into the string `find`/`findAll` matched against — always safe to use
+directly as `s[m.start:m.end]` slice bounds. Which capture group each offset
+belongs to is not exposed yet; a later ticket adds `Match.group`/`.named`.
+
+### `Match.text(s: string): string`
+
+The substring of `s` this match covers, `s[m.start:m.end]`. `s` must be the
+same string (or an identical copy) the match came from.
+
+```bit
+import { mustCompile } from "std/regex"
+
+fn firstNumber(s: string): string {
+  let re = mustCompile("[0-9]+")
+  return match (re.find(s)) {
+    Some(m) => m.text(s)
+    None => ""
+  }
+}
+```
+
+### `Regex.find(s: string): Option<Match>`
+
+The leftmost-first match of `re`'s pattern anywhere in `s`, or
+`Option.None` when there is none — an unanchored search, the same
+convention as `matches`.
+
+```bit
+import { mustCompile } from "std/regex"
+
+fn idOf(s: string): string {
+  let re = mustCompile("id=([0-9]+)")
+  return match (re.find(s)) {
+    Some(m) => m.text(s)
+    None => "no id"
+  }
+}
+```
+
+### `Regex.findAll(s: string, limit: int): []Match`
+
+Successive non-overlapping matches of `re`'s pattern in `s`, scanning left
+to right. `limit < 0` means no limit; `limit == 0` returns an empty slice;
+otherwise at most `limit` matches.
+
+Offsets are **byte** offsets throughout, same as `Match`. After a match, the
+next search starts at its end offset — except when the match is empty
+(`start == end`), where the next search starts one **rune** later instead of
+one byte later, so a multi-byte character is never split. Without that rule
+`findAll("a*", "bb")` would never terminate; with it, `a*` over `"bb"`
+yields three empty matches, at byte offsets 0, 1 and 2.
+
+```bit
+import { mustCompile } from "std/regex"
+
+fn wordCount(s: string): int {
+  let re = mustCompile("[A-Za-z]+")
+  return len(re.findAll(s, -1))
 }
 ```
