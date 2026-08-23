@@ -3656,3 +3656,40 @@ the carry-less-multiply hardware path rather than shift-and-xor.
 
 Whether the SHA-256 compression function is taking the SHA-extensions hardware
 path rather than the 64-round software loop.
+
+## ARM64 hardware crypto detection
+
+A separate family from [Hardware acceleration](#hardware-acceleration) above:
+that section reports x86-64 AES-NI/PCLMULQDQ/SHA-extensions dispatch (always
+`false` today, since no x86-64 hardware path exists yet); this one reports the
+ARMv8 Cryptographic Extension the runtime actually detects on aarch64-macos
+and aarch64-linux. Same idea, disjoint hardware, disjoint runtime primitives -
+do not conflate the two.
+
+`hwAes`, `hwPmull` and `hwSha2` mirror the three independent bits of the
+runtime's capability bitmask; `hwAvailable` is a convenience true only when
+all three are set, which is what an accelerated AES-GCM path needs before it
+can skip the software fallback. Setting the environment variable
+`BIT_CRYPTO_HW` to the exact string `0` forces all four to report `false`,
+regardless of what the hardware actually has - a kill switch for benchmarking
+the software path or working around a hardware erratum, without recompiling.
+The environment is read once and cached; the answer cannot change mid-process.
+
+### `hwAes(): bool`
+
+Whether this CPU has the ARMv8 AES instruction set.
+
+### `hwPmull(): bool`
+
+Whether this CPU has the ARMv8 PMULL (carry-less multiply) instruction, used
+by GHASH.
+
+### `hwSha2(): bool`
+
+Whether this CPU has the ARMv8 SHA2 instruction set.
+
+### `hwAvailable(): bool`
+
+Whether AES, PMULL and SHA2 are all available - the full ARM64 crypto
+extension. `false` if any one of the three is missing, or if
+`BIT_CRYPTO_HW=0`.
