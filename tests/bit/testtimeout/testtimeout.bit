@@ -31,10 +31,17 @@
 //
 // WIRED INTO `./make test` as `test-timeout` (tools/build/gates.bit,
 // tools/build/defs.bit).
+//
+// #3507 EXTENDS THIS FILE rather than adding a new one: a SIGTERM/SIGINT
+// sent to the RUNNER process itself (not the `--timeout` bound above, which
+// only fires from CODE RUNNING INSIDE the runner's own poll loop) must also
+// not orphan the bounded child. `checkSignalNoOrphan` below reuses `hangSrc`
+// and the same `bit-test-timeoutfixture_hang-` marker the orphan check
+// above already established is collision-safe.
 
 import { env, envOr, exit } from "std/os"
 import { readFile, writeFile, mkdir } from "std/fs"
-import { parseInt, trimSpace, contains } from "std/strings"
+import { parseInt, trimSpace, contains, split } from "std/strings"
 
 // The WRAPPER's own outer bound around one whole `bit test` invocation —
 // `osRunBounded`'s ceiling, a defense-in-depth backstop in case the fix
@@ -96,8 +103,7 @@ fn shQuote(s: string): string {
 // for the orphan check's `pgrep -f` below to never false-match a sibling
 // agent's own scratch work (`$TMPDIR` is shared across every concurrent
 // agent in this workspace).
-const hangFixtureSrc: string =
-  "import { ok } from \"std/testing\"\n\n" +
+const hangFixtureSrc: string = "import { ok } from \"std/testing\"\n\n" +
   "fn test_a_runs_first() { ok(true, \"fine\") }\n\n" +
   "fn test_b_hangs_forever() {\n" +
   "  let n = 0\n" +
@@ -109,8 +115,7 @@ const hangFixtureSrc: string =
 // The negative control: three tests that all pass immediately. Proves the
 // bound does not perturb a healthy run — without this, "the timeout works"
 // could equally mean "the timeout fires on everything" (#2274's dispatch).
-const fastFixtureSrc: string =
-  "import { ok } from \"std/testing\"\n\n" +
+const fastFixtureSrc: string = "import { ok } from \"std/testing\"\n\n" +
   "fn test_one() { ok(true, \"one\") }\n" +
   "fn test_two() { ok(true, \"two\") }\n" +
   "fn test_three() { ok(true, \"three\") }\n"
@@ -121,14 +126,31 @@ class Harness { bin: string, stdlib: string }
 
 // Runs `bit test <srcPath> <extraArgv>` with BIT_STDLIB exported, capturing
 // stdout/stderr and the exit code via `osRunBounded`'s own return.
-fn runBitTest(h: Harness, dir: string, tag: string, srcPath: string, extraArgv: string): (int, string, string) {
+fn runBitTest(
+  h: Harness,
+  dir: string,
+  tag: string,
+  srcPath: string,
+  extraArgv: string,
+): (int, string, string) {
   let shPath = "${dir}/run_${tag}.sh"
   let outPath = "${dir}/run_${tag}.out"
   let errPath = "${dir}/run_${tag}.err"
   let script = "#!/bin/sh\n" +
-    "BIT_STDLIB=" + shQuote(h.stdlib) + "\nexport BIT_STDLIB\n" +
-    "exec " + shQuote(h.bin) + " test " + shQuote(srcPath) + " " + extraArgv +
-    " > " + shQuote(outPath) + " 2> " + shQuote(errPath) + "\n"
+    "BIT_STDLIB=" +
+    shQuote(h.stdlib) +
+    "\nexport BIT_STDLIB\n" +
+    "exec " +
+    shQuote(h.bin) +
+    " test " +
+    shQuote(srcPath) +
+    " " +
+    extraArgv +
+    " > " +
+    shQuote(outPath) +
+    " 2> " +
+    shQuote(errPath) +
+    "\n"
   writeFile(shPath, script) catch e {
     eprint("testtimeout: cannot write ${shPath}: ${e.message()}\n")
     exit(2)
@@ -153,8 +175,12 @@ fn runBitTest(h: Harness, dir: string, tag: string, srcPath: string, extraArgv: 
   if (code <= -100) {
     panic("testtimeout: ${shPath} died on signal ${-100 - code}")
   }
-  let out = readFile(outPath) catch _ { "" }
-  let err = readFile(errPath) catch _ { "" }
+  let out = readFile(outPath) catch _ {
+    ""
+  }
+  let err = readFile(errPath) catch _ {
+    ""
+  }
   return code, out, err
 }
 
@@ -169,7 +195,11 @@ fn checkNoOrphan(dir: string, pattern: string): string {
   let shPath = "${dir}/orphan.sh"
   let orphanPath = "${dir}/orphan.txt"
   let script = "#!/bin/sh\n" +
-    "pgrep -f " + shQuote(pattern) + " > " + shQuote(orphanPath) + " 2>/dev/null\n" +
+    "pgrep -f " +
+    shQuote(pattern) +
+    " > " +
+    shQuote(orphanPath) +
+    " 2>/dev/null\n" +
     "exit 0\n"
   writeFile(shPath, script) catch e {
     eprint("testtimeout: cannot write ${shPath}: ${e.message()}\n")
@@ -180,7 +210,80 @@ fn checkNoOrphan(dir: string, pattern: string): string {
     exit(2)
   }
   osRunBounded(shPath, 10000)
-  return readFile(orphanPath) catch _ { "" }
+  return readFile(orphanPath) catch _ {
+    ""
+  }
+}
+
+// #3507: background `bit test <srcPath> --timeout 300`, wait for its bounded
+// child to be confirmed running (the `before` pgrep snapshot), send `sig` to
+// the RUNNER (never the child directly — this is testing what the runner's
+// own signal handling does to it), wait again, and take the `after`
+// snapshot. Written as ONE shell script rather than composed from
+// `runBitTest`/`checkNoOrphan` above: the signal must land WHILE the run is
+// in progress, which `osRunBounded`'s wait-to-completion semantics cannot
+// express. Cleans up with `kill -KILL` on whatever `pgrep -f marker` still
+// finds afterward, by PID, never a pattern kill of anything this script did
+// not spawn itself. Returns (before, after) as raw pgrep -f output — empty
+// string means no match.
+// Groups the per-invocation bits of `checkSignalNoOrphan` below the same way
+// `Harness` above groups the compiler/stdlib pair — keeps that function at
+// the 5-param ceiling (E0202) rather than 6.
+class SignalCheck { tag: string, srcPath: string, marker: string, sig: string }
+
+fn checkSignalNoOrphan(h: Harness, dir: string, sc: SignalCheck): (string, string) {
+  let shPath = "${dir}/sig_${sc.tag}.sh"
+  let resultPath = "${dir}/sig_${sc.tag}.result"
+  let script = "#!/bin/sh\n" +
+    "BIT_STDLIB=" +
+    shQuote(h.stdlib) +
+    "\nexport BIT_STDLIB\n" +
+    shQuote(h.bin) +
+    " test " +
+    shQuote(sc.srcPath) +
+    " --timeout 300 > /dev/null 2>&1 &\n" +
+    "BITPID=$!\n" +
+    "sleep 6\n" +
+    "before=\"$(pgrep -f " +
+    shQuote(sc.marker) +
+    " 2>/dev/null)\"\n" +
+    "kill -" +
+    sc.sig +
+    " \"$BITPID\" 2>/dev/null\n" +
+    "sleep 3\n" +
+    "after=\"$(pgrep -f " +
+    shQuote(sc.marker) +
+    " 2>/dev/null)\"\n" +
+    "for p in $(pgrep -f " +
+    shQuote(sc.marker) +
+    " 2>/dev/null); do kill -KILL \"$p\" 2>/dev/null; done\n" +
+    "wait \"$BITPID\" 2>/dev/null\n" +
+    "{ printf 'BEFORE=%s\\n' \"$before\"; printf 'AFTER=%s\\n' \"$after\"; } > " +
+    shQuote(resultPath) +
+    "\n" +
+    "exit 0\n"
+  writeFile(shPath, script) catch e {
+    eprint("testtimeout: cannot write ${shPath}: ${e.message()}\n")
+    exit(2)
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    eprint("testtimeout: cannot chmod ${shPath}\n")
+    exit(2)
+  }
+  osRunBounded(shPath, 60000)
+  let result = readFile(resultPath) catch _ {
+    ""
+  }
+  let lines = split(result, "\n")
+  let before = ""
+  let after = ""
+  if (len(lines) > 0 && len(lines[0]) >= 7) {
+    before = lines[0][7:len(lines[0])]
+  }
+  if (len(lines) > 1 && len(lines[1]) >= 6) {
+    after = lines[1][6:len(lines[1])]
+  }
+  return before, after
 }
 
 class Tally { checks: int, failures: int }
@@ -193,6 +296,82 @@ fn check(t: Tally, cond: bool, label: string) {
   }
 }
 
+// #3507: SIGTERM/SIGINT sent to the RUNNER PROCESS ITSELF, while its
+// bounded child is still alive, must not orphan that child either. Reuses
+// `hangSrc`: a fresh `bit test` invocation on the same fixture, signalled
+// mid-flight rather than left to finish or time out. Split out of `main`
+// to keep that function under the 80-line ceiling (E0201).
+fn runSignalChecks(h: Harness, t: Tally, scratch: string, hangSrc: string) {
+  let marker3507 = "bit-test-timeoutfixture_hang-"
+
+  let (termBefore, termAfter) = checkSignalNoOrphan(
+    h, scratch,
+    SignalCheck{ tag: "term", srcPath: hangSrc, marker: marker3507, sig: "TERM" },
+  )
+  check(
+    t, trimSpace(termBefore) != "",
+    "SIGTERM check: the child was not confirmed running before the signal (no pgrep match) -- the box may be too slow; this run is inconclusive",
+  )
+  check(
+    t, trimSpace(termAfter) == "",
+    "SIGTERM to the runner must not leave its child behind; pgrep found: ${termAfter}",
+  )
+
+  let (intBefore, intAfter) = checkSignalNoOrphan(
+    h, scratch,
+    SignalCheck{ tag: "int", srcPath: hangSrc, marker: marker3507, sig: "INT" },
+  )
+  check(
+    t, trimSpace(intBefore) != "",
+    "SIGINT check: the child was not confirmed running before the signal (no pgrep match) -- the box may be too slow; this run is inconclusive",
+  )
+  check(
+    t, trimSpace(intAfter) == "",
+    "SIGINT to the runner must not leave its child behind; pgrep found: ${intAfter}",
+  )
+}
+
+// The original #2274 hang scenario: bounded, named, and the run continues
+// past it, with no orphan left once `bit test` has returned on its own.
+// Split out of `main` to keep that function under the 80-line ceiling
+// (E0201).
+fn runHangChecks(h: Harness, t: Tally, scratch: string, hangSrc: string) {
+  let (hangCode, hangOut, hangErr) = runBitTest(
+    h, scratch, "hang", hangSrc,
+    "--timeout ${testFlagTimeoutS}",
+  )
+  check(
+    t,
+    hangCode != 0,
+    "bit test on the hang fixture must exit non-zero, got ${hangCode} (stderr: ${hangErr})",
+  )
+  check(
+    t, contains(hangOut, "ok   test_a_runs_first"),
+    "the fast test before the hang must still pass: ${hangOut}",
+  )
+  check(
+    t, contains(hangOut, "FAIL test_b_hangs_forever (timed out)"),
+    "the hung test must be reported FAILED and named as timed out: ${hangOut}",
+  )
+  check(
+    t, contains(hangOut, "ok   test_c_would_run_if_b_ever_finished"),
+    "the test AFTER the hang must still run — one hung test must not cost the whole run: ${hangOut}",
+  )
+  check(
+    t, contains(hangOut, "discovered 3 tests, ran 3"),
+    "all 3 discovered tests must have been RUN (not skipped after the hang): ${hangOut}",
+  )
+
+  // the orphan check: after `bit test` has returned on its own, the hung
+  // child's whole process group must already be gone.
+  let orphan = trimSpace(checkNoOrphan(scratch, "bit-test-timeoutfixture_hang-"))
+  check(
+    t,
+    orphan == "",
+    "the hung test's child must not survive `bit test`'s own return; pgrep found: ${orphan}",
+  )
+}
+
 fn main() {
   let h = Harness{ bin: requiredEnv("BIT_SELF_EXE"), stdlib: requiredEnv("BIT_STDLIB") }
   let t = Tally{ checks: 0, failures: 0 }
@@ -203,28 +382,13 @@ fn main() {
     exit(2)
   }
 
-  // --- the hang: bounded, named, and the run continues past it ---------
   let hangSrc = "${scratch}/timeoutfixture_hang.bit"
   writeFile(hangSrc, hangFixtureSrc) catch e {
     eprint("testtimeout: cannot write ${hangSrc}: ${e.message()}\n")
     exit(2)
   }
-  let (hangCode, hangOut, hangErr) = runBitTest(h, scratch, "hang", hangSrc,
-    "--timeout ${testFlagTimeoutS}")
-  check(t, hangCode != 0, "bit test on the hang fixture must exit non-zero, got ${hangCode} (stderr: ${hangErr})")
-  check(t, contains(hangOut, "ok   test_a_runs_first"),
-    "the fast test before the hang must still pass: ${hangOut}")
-  check(t, contains(hangOut, "FAIL test_b_hangs_forever (timed out)"),
-    "the hung test must be reported FAILED and named as timed out: ${hangOut}")
-  check(t, contains(hangOut, "ok   test_c_would_run_if_b_ever_finished"),
-    "the test AFTER the hang must still run — one hung test must not cost the whole run: ${hangOut}")
-  check(t, contains(hangOut, "discovered 3 tests, ran 3"),
-    "all 3 discovered tests must have been RUN (not skipped after the hang): ${hangOut}")
-
-  // --- the orphan check: after `bit test` has returned on its own, the ---
-  // --- hung child's whole process group must already be gone -----------
-  let orphan = trimSpace(checkNoOrphan(scratch, "bit-test-timeoutfixture_hang-"))
-  check(t, orphan == "", "the hung test's child must not survive `bit test`'s own return; pgrep found: ${orphan}")
+  runHangChecks(h, t, scratch, hangSrc)
+  runSignalChecks(h, t, scratch, hangSrc)
 
   // --- negative control: a healthy run is byte-identical with and ------
   // --- without an explicit --timeout (the bound must not perturb it) ---
@@ -234,15 +398,19 @@ fn main() {
     exit(2)
   }
   let (defCode, defOut, defErr) = runBitTest(h, scratch, "fast_default", fastSrc, "")
-  let (boundCode, boundOut, boundErr) = runBitTest(h, scratch, "fast_bounded", fastSrc,
-    "--timeout ${testFlagTimeoutS}")
+  let (boundCode, boundOut, boundErr) = runBitTest(
+    h, scratch, "fast_bounded", fastSrc,
+    "--timeout ${testFlagTimeoutS}",
+  )
   check(t, defCode == 0, "the fast fixture with NO --timeout must pass: ${defErr}")
   check(t, boundCode == 0, "the fast fixture WITH --timeout must still pass: ${boundErr}")
-  check(t, defOut == boundOut,
-    "an explicit --timeout must not change a healthy run's output:\n  default: ${defOut}\n  bounded: ${boundOut}")
+  check(
+    t, defOut == boundOut,
+    "an explicit --timeout must not change a healthy run's output:\n  default: ${defOut}\n  bounded: ${boundOut}",
+  )
 
-  if (t.checks < 8) {
-    eprint("testtimeout: only ${t.checks} checks ran, want at least 8\n")
+  if (t.checks < 12) {
+    eprint("testtimeout: only ${t.checks} checks ran, want at least 12\n")
     t.failures = t.failures + 1
   }
   if (t.failures > 0) {
