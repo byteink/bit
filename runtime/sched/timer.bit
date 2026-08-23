@@ -287,3 +287,265 @@ export @nosplit @symbol("bit_rt_port_sched_sleep_until") fn schedSleepUntil(dead
   *(w + wkDisposition) = taskParked
   schedSwitch(t, w + wkCtx)
 }
+
+// ---------------------------------------------------------------------------
+// Channel timers — expiry SENDS on a channel instead of waking a task (#2665)
+// ---------------------------------------------------------------------------
+//
+// A second entry kind, deliberately NOT an addition to the `TimerQueue`
+// above: that queue is intrusive on `Task` fields (`taskTimerNext`,
+// `taskDeadline`) and a channel-timer entry has no task and no stack to be
+// intrusive INTO. It also cannot live on the `Scheduler` block itself —
+// `schedWords` (16) is asserted exactly by
+// `tests/stress/schedspawnowner.bit`'s `schedWords == 16 && workerWords ==
+// 292`, so growing it moves every caller's raw offset arithmetic. Storage is
+// instead a fixed, PROCESS-GLOBAL pool, the same shape `schedPollPending`
+// above already uses and for the same reason: there is one live scheduler
+// per production process, and a stress harness's private second one only
+// makes a stale entry MORE conservative (it just occupies a slot), never
+// wrong.
+//
+// A FIXED CAP, not a GC-backed growable list: `runtime/sched` cannot import
+// `runtime/gc`'s bump reserve either — `runtime/gc/gcmark.bit` imports
+// `schedStackHeadroom` from here, so the reverse is the identical E0044 cycle
+// `runtime/chan` hits (verified directly, the same way). `schedTimerChanArm`
+// RETURNS 0 ON EXHAUSTION rather than growing — see its own comment; that is
+// the documented contract, not a shortfall.
+//
+// THE ARM/CANCEL/RESET SPLIT ACROSS TWO MECHANISMS is deliberate, not
+// inconsistent: only `schedTimerChanArm` takes a `chan<T>` argument, and a
+// `chan<T>` value cannot cross a plain `extern fn` boundary at all (E0077 —
+// "the C ABI has no representation for a GC-managed Bit value"), so it has to
+// be a compiler-recognized builtin, reached the same way `close(c)` is
+// (`compiler/lowerprim.bit`'s `primRtName`). Cancel and reset take only
+// scalars and are reached the plain way `bit_rt_net_dial_deadline_w` is: an
+// `extern fn` declared wherever they are called.
+
+// One entry, `ctEntryWords` apart in `chanTimerPool`.
+const ctEntryWords: int = 6
+const ctState: int = 0    // 0 free, 1 pending
+const ctDeadline: int = 1
+const ctPeriod: int = 2
+const ctChan: int = 3     // raw channel handle (int), opaque here — never
+                           // dereferenced in this file, only forwarded to
+                           // `bit_rt_port_chan_try_send_drop`
+const ctGen: int = 4      // bumped on every arm; guards a cancel/reset call
+                           // against an id from a slot that has since been
+                           // cancelled and reused by a DIFFERENT timer
+const ctNext: int = 5     // free-list link while ctState == 0, 1-based (0 = end)
+
+// 32768 slots * 6 words: ~1.5 MB of zero-initialized process memory, reserved
+// once at link time rather than grown — comfortably above the epic's own
+// 20000-concurrent-timer measurement, and a slot is ~48 bytes against the
+// ~110 KB a spawned-thread timeout costs today.
+const ctCap: int = 32768
+let chanTimerPool: [196608]i64
+let chanTimerFreeHead: [1]i64
+let chanTimerHigh: [1]i64
+let chanTimerLockWord: [1]i64
+// How many slots are currently pending (state == 1). A dedicated counter
+// rather than a scan: `schedCheckDeadlock` (worker.bit) reads this on every
+// idle turn a single-worker program takes, the same frequency
+// `schedTimerCount`/`schedPollPendingCount` are already read at, so this
+// answers in O(1) rather than re-deriving it from `chanTimerHigh` each time.
+let chanTimerPendingCount: [1]i64
+
+@nosplit fn chanTimerPendingAddr(): *i64 {
+  return ptrOf(chanTimerPendingCount)
+}
+
+// A program parked ONLY on a channel timer (no task on the sleeping-task
+// list `schedTimerCount` sees, since a channel timer has no task) must not
+// read as deadlocked. `schedCheckDeadlock` checks this exactly where it
+// checks `schedTimerCount`/`schedPollPendingCount` — see its own header.
+export @nosplit @symbol("bit_rt_port_sched_timer_chan_count") fn schedTimerChanCount(): int {
+  return atomicLoad(chanTimerPendingAddr())
+}
+
+@nosplit fn chanTimerLockAddr(): *i32 {
+  return lockOf(ptrOf(chanTimerLockWord), 0)
+}
+
+@nosplit fn chanTimerFreeHeadAddr(): *i64 {
+  return ptrOf(chanTimerFreeHead)
+}
+
+@nosplit fn chanTimerHighAddr(): *i64 {
+  return ptrOf(chanTimerHigh)
+}
+
+@nosplit fn ctEntryAt(slot: int): *i64 {
+  return ptrOf(chanTimerPool) + slot * ctEntryWords
+}
+
+// Always > 0, so 0 stays the documented "arm failed" sentinel. Decodable back
+// to `(slot, gen)` by `ctLookupPending` without a lookup table.
+@nosplit fn ctMakeId(slot: int, gen: int): int {
+  return gen * ctCap + slot + 1
+}
+
+// Claim a free slot under `chanTimerLockAddr()`. Prefers the free list (O(1),
+// recycles a cancelled/fired slot) and falls back to extending the
+// never-shrinks high-water mark. -1 when the pool is exhausted.
+@nosplit fn chanTimerClaimSlot(): int {
+  let head = *chanTimerFreeHeadAddr()
+  if (head != 0) {
+    let slot = head - 1
+    *chanTimerFreeHeadAddr() = *(ctEntryAt(slot) + ctNext)
+    return slot
+  }
+  let high = atomicLoad(chanTimerHighAddr())
+  if (high >= ctCap) {
+    return -1
+  }
+  atomicStore(chanTimerHighAddr(), high + 1)
+  return high
+}
+
+// `runtime/sched/timer.bit`'s half of #2665: inserts a queue entry that, at
+// expiry, does a non-blocking send of `true` on `c` (dropped if `c` is full —
+// see `chanTrySendDrop`'s header, `runtime/chan/chanops.bit`). If `periodNs`
+// is positive the entry re-arms itself at `deadline + periodNs` on every
+// expiry instead of being freed (`schedTimerChanExpire` below); a
+// non-positive `periodNs` fires once and frees its slot. Returns a timer id
+// greater than 0, or 0 if the pool is exhausted (`ctCap` slots all pending).
+//
+// `c` is `int` here — the raw channel handle `compiler/lowercall.bit`'s
+// generic `primRtName` path hands an `Op.RtCall` argument as, exactly like
+// `chan_close`'s `cv`. This function is never called through an ordinary Bit
+// call expression (only the compiler's own lowering reaches it by this
+// symbol), so a `chan<bool>`-typed signature here would be misleading rather
+// than safe.
+export @nosplit @symbol("bit_rt_sched_timer_chan_arm") fn rtSchedTimerChanArm(deadlineNs: int, c: int, periodNs: int): int {
+  let cell = chanTimerLockAddr()
+  spinAcquire(cell)
+  let slot = chanTimerClaimSlot()
+  if (slot < 0) {
+    spinRelease(cell)
+    return 0
+  }
+  let e = ctEntryAt(slot)
+  let gen = *(e + ctGen) + 1
+  *(e + ctGen) = gen
+  *(e + ctState) = 1
+  *(e + ctDeadline) = deadlineNs
+  *(e + ctPeriod) = periodNs
+  *(e + ctChan) = c
+  atomicAdd(chanTimerPendingAddr(), 1)
+  spinRelease(cell)
+  return ctMakeId(slot, gen)
+}
+
+// The slot `id` names, iff it is still pending AND `id`'s generation matches
+// the slot's current occupant — -1 for an unknown id, an id whose slot has
+// since fired-and-freed-and-been-reused, or an id whose slot is still free.
+// MUST BE CALLED WITH `chanTimerLockAddr()` HELD: the generation/state check
+// and the caller's use of the result must be one atomic read, or a concurrent
+// cancel between the check and the use would race exactly the bug this
+// guards against.
+@nosplit fn ctLookupPending(id: int): int {
+  if (id <= 0) {
+    return -1
+  }
+  let idx = id - 1
+  let slot = idx % ctCap
+  let gen = idx / ctCap
+  let e = ctEntryAt(slot)
+  if (*(e + ctState) != 1 || *(e + ctGen) != gen) {
+    return -1
+  }
+  return slot
+}
+
+// Frees `slot` onto the head of the free list. Caller holds the lock.
+// Caller holds `chanTimerLockAddr()` and has already verified the slot was
+// PENDING (state == 1) — freeing an already-free slot would double-count the
+// decrement below against `schedTimerChanArm`'s single increment.
+@nosplit fn ctFreeSlot(slot: int) {
+  *(ctEntryAt(slot) + ctState) = 0
+  *(ctEntryAt(slot) + ctNext) = *chanTimerFreeHeadAddr()
+  *chanTimerFreeHeadAddr() = slot + 1
+  atomicSub(chanTimerPendingAddr(), 1)
+}
+
+// Removes the entry `id` names. Returns `true` when it was still pending
+// (and is now cancelled), `false` when it already fired or `id` is unknown —
+// exactly the race `cancel` racing `expire` must resolve one way or the
+// other, never both.
+export @nosplit @symbol("bit_rt_sched_timer_chan_cancel") fn schedTimerChanCancel(id: int): bool {
+  let cell = chanTimerLockAddr()
+  spinAcquire(cell)
+  let slot = ctLookupPending(id)
+  if (slot < 0) {
+    spinRelease(cell)
+    return false
+  }
+  ctFreeSlot(slot)
+  spinRelease(cell)
+  return true
+}
+
+// Moves a pending entry to a new absolute deadline. `false` when `id` is
+// unknown (already fired, or never valid) — the same lookup `cancel` uses, so
+// the two report unknown-ness identically.
+export @nosplit @symbol("bit_rt_sched_timer_chan_reset") fn schedTimerChanReset(id: int, deadlineNs: int): bool {
+  let cell = chanTimerLockAddr()
+  spinAcquire(cell)
+  let slot = ctLookupPending(id)
+  if (slot < 0) {
+    spinRelease(cell)
+    return false
+  }
+  *(ctEntryAt(slot) + ctDeadline) = deadlineNs
+  spinRelease(cell)
+  return true
+}
+
+// PINNED (ABI.md §9), reached the same way `bit_rt_panic` is from this
+// module (see `worker.bit`): `runtime/chan` already imports `runtime/sched`,
+// so the reverse `import` is the E0044 cycle this avoids by never taking one.
+extern fn bit_rt_port_chan_try_send_drop(ch: int, value: int): bool
+
+// One entry's worth of work, done under the pool lock only for the
+// state/deadline read and whatever mutation follows — the send itself runs
+// OUTSIDE the lock, matching `schedTimerExpire`'s own rule that unparking (an
+// operation that can wake a peer) never happens while a timer lock is held.
+// A one-shot entry (`period <= 0`) is freed before the send, not after: the
+// send cannot fail as far as this pool is concerned (`chanTrySendDrop` drops
+// rather than erroring), so there is no outcome that should leave it pending.
+@nosplit fn chanTimerExpireSlot(slot: int, now: int) {
+  let cell = chanTimerLockAddr()
+  spinAcquire(cell)
+  let e = ctEntryAt(slot)
+  if (*(e + ctState) != 1 || *(e + ctDeadline) > now) {
+    spinRelease(cell)
+    return
+  }
+  let c = *(e + ctChan)
+  let period = *(e + ctPeriod)
+  if (period > 0) {
+    *(e + ctDeadline) = now + period
+  } else {
+    ctFreeSlot(slot)
+  }
+  spinRelease(cell)
+  bit_rt_port_chan_try_send_drop(c, 1)
+}
+
+// Sweeps every slot ever claimed (`[0, chanTimerHigh)`) for one due, sends its
+// `true` and re-arms or frees it. Called from the same idle-path call sites
+// `schedTimerExpire` is (`schedFindWorkIdle`/`schedFindWorkAt`, worker.bit) —
+// it has no task to hand back, so unlike `schedTimerExpire` there is nothing
+// for the caller to `gqPop` afterward. Bounded by `ctCap` (Power of 10): a
+// corrupted `chanTimerHigh` cannot walk past the pool's own extent.
+export @nosplit @symbol("bit_rt_port_sched_timer_chan_expire") fn schedTimerChanExpire(now: int) {
+  let high = atomicLoad(chanTimerHighAddr())
+  if (high > ctCap) {
+    high = ctCap
+  }
+  let slot = 0
+  while (slot < high) {
+    chanTimerExpireSlot(slot, now)
+    slot = slot + 1
+  }
+}
