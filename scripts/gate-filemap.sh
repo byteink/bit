@@ -370,6 +370,18 @@ gatebatch_rc_stamp() {
   return 0
 }
 
+# True only for a well-formed rc=0 stamp (`$1..$4` = rc/sha/runid/extra, from
+# one `read` of a gatebatch_rc_stamp result) that also agrees with the
+# flush-in-progress's want-sha/want-run pair (`$5`/`$6`, empty until the
+# first gate sets them). Split out of verify_full_green_now purely to keep
+# that loop's own branching low, per this repo's complexity ceiling.
+gatebatch_stamp_matches() {
+  local rc="$1" sha="$2" runid="$3" extra="$4" want_sha="$5" want_run="$6"
+  [ -n "${sha}" ] && [ -n "${runid}" ] && [ -z "${extra}" ] && [ "${rc}" = "0" ] || return 1
+  [ -z "${want_sha}" ] && return 0
+  [ "${sha}" = "${want_sha}" ] && [ "${runid}" = "${want_run}" ]
+}
+
 # True full-suite-green proof, not a claim: every name in
 # registered_gate_names must have an rc=0 stamp, and all of them must share
 # the identical (sha, runId) — the same pair means the same single
@@ -388,12 +400,9 @@ verify_full_green_now() {
       continue
     fi
     read -r rc sha runid extra <<<"${stamp}"
-    if [ -z "${sha}" ] || [ -z "${runid}" ] || [ -n "${extra}" ] || [ "${rc}" != "0" ]; then
-      bad="${bad:+${bad} }${name}"
-    elif [ -z "${want_sha}" ]; then
-      want_sha="${sha}"
-      want_run="${runid}"
-    elif [ "${sha}" != "${want_sha}" ] || [ "${runid}" != "${want_run}" ]; then
+    if gatebatch_stamp_matches "${rc}" "${sha}" "${runid}" "${extra}" "${want_sha}" "${want_run}"; then
+      [ -z "${want_sha}" ] && want_sha="${sha}" && want_run="${runid}"
+    else
       bad="${bad:+${bad} }${name}"
     fi
   done
