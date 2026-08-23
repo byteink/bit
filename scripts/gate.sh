@@ -401,6 +401,7 @@ gates_for_file() {
     # gates_for_file() (#3319/#3309).
     tests/bit/stress/*) printf 'test-stress-exclusive\n'; return 0 ;;
     tests/bit/stwwiring/*) printf 'test-stwwiring\n'; return 0 ;;
+    tests/bit/testtimeout/*) printf 'test-timeout\n'; return 0 ;;
     # #3039. Not `runArgs()`-registered — it is a plain data file the
     # harness reads at runtime, not Bit source — so the generic grep below
     # can never find it; named by hand, same shape as tests/bit/checkercases/*.
