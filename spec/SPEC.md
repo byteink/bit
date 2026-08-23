@@ -2757,6 +2757,14 @@ encoding (BSD for Mach-O, GNU/System V for ELF). Neither command reads the
 runtime archive, and neither links. An object destined for an archive is
 normally emitted `--freestanding` (§17.6).
 
+`bit ar` is how the toolchain builds its own `libbitrt.a`; it is not a
+packaging mechanism for user code. Nothing consumes its output today —
+`bit build` has no link-input flag and `bit.json` has no field naming an
+archive to link — and an `extern fn` (§11.7)/`@symbol` (§11.9) pin would be
+needed to call into one even if it did, since every other Bit type is
+GC-managed and cannot cross that boundary. `bit add` (§17.7) — source, not a
+prebuilt archive — is the supported way to ship or consume Bit code.
+
 ### 17.5 Prelude
 
 Every module implicitly imports the exports of `std/core` — the **prelude** — as
