@@ -407,8 +407,20 @@ gates_for_file() {
     # can never find it; named by hand, same shape as tests/bit/checkercases/*.
     tests/bit/releasesurface.allowlist) printf 'test-release-surface\n'; return 0 ;;
   esac
+  # Excludes any extracted name containing a literal `${` — that is a
+  # per-instance template (e.g. tools/build/gates.bit's `packageGates()`
+  # loop emitting `Gate{name: "test-package-${p}", ...}` inside `for p of
+  # ...`), only meaningful once Bit interpolates it at runtime inside its
+  # own generator, never a literal invocable step name on its own. The
+  # plain-text grep above cannot tell a template apart from a real gate
+  # whose `runArgs()` argument happens to match, so both come back; without
+  # this filter a diff touching tests/bit/packagesgate.bit reports the
+  # un-interpolated template as a build step, which the STALE check below
+  # correctly (but unhelpfully) rejects, making the whole scoped gate exit 2
+  # and run nothing (#3496).
   grep -F "runArgs(\"$1\")" tools/build/gates.bit 2>/dev/null |
-    sed -n 's/.*Gate{name: "\([^"]*\)".*/\1/p' || true
+    sed -n 's/.*Gate{name: "\([^"]*\)".*/\1/p' |
+    grep -vF '${' || true
 }
 
 # Fails loudly, once, on every real invocation — before any file is
