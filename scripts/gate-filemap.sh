@@ -202,6 +202,11 @@ gates_for_file() {
     # directory module — its self-tests split into a sibling to stay under the
     # 800-line limit, the same shape as tests/bit/benchgate/* above.
     tests/bit/fmtcitations/*) printf 'test-fmt-citations\n'; return 0 ;;
+    # #3573 moved this from a single file (tests/bit/golden.bit) to a
+    # directory module — the directive-name/dispatch helpers split into a
+    # sibling to stay under the 800-line limit after `bit fmt`, the same
+    # shape as tests/bit/fmtcitations/* above.
+    tests/bit/golden/*) printf 'test-golden\n'; return 0 ;;
     tests/bit/pollfree/*) printf 'test-pollfree\n'; return 0 ;;
     tests/bit/rootabi/*) printf 'test-rootabi\n'; return 0 ;;
     tests/bit/rootpins/*) printf 'test-rootpins\n'; return 0 ;;
