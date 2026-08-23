@@ -2955,3 +2955,38 @@ single-word one — is the one way otherwise-safe Bit code can reach real
 memory-unsafety, and it is exactly why the audit in §22 above only needed to
 reason about *runtime*-internal state: user Bit code gets no such audit for
 free, which is the whole reason §13.7 and this section exist.
+
+## 24. CPU sampling profiler (`runtime/root/darwin/prof.bit`, #1906)
+
+```
+bit_rt_prof_start(intervalMicros: int) -> int   // 0 ok, -1 on a libSystem failure
+bit_rt_prof_stop()                     -> int   // samples stored (<= 8192)
+bit_rt_prof_sample(i: int)             -> int   // ring slot i, or -1 out of range
+```
+
+**aarch64-macos only.** Darwin `SIGPROF` (27) via `setitimer(ITIMER_PROF, ...)`
+(`<sys/time.h>`), a leaf-PC sampler in the same `@nosplit` handler style as
+§12's `segvHandler`/`trapHandler` (../root/darwin/signal.bit) — same ucontext
+offsets, reused rather than re-derived. Every tick records ONLY the
+interrupted instruction's address (no frame-pointer walk from signal
+context), into a fixed 8192-entry ring allocated once as module state (Power
+of 10 rule 3): a busier run than that reports its true tick count from
+`bit_rt_prof_stop` and simply drops samples past the cap, rather than
+growing.
+
+**Single-OS-thread scope, stated rather than hidden.** BSD/XNU deliver a
+process-directed itimer's signal to an arbitrary unblocked thread; this file
+attempts no per-worker distribution (no `timer_create`-equivalent), so
+coverage is validated only at `BIT_WORKERS=1`. A multi-worker build may see
+samples cluster on whichever OS thread the kernel happens to pick.
+
+**ASLR.** This binary is PIE (§4's stack-map section already notes dyld
+rebases `.bit_gc`'s absolute code pointers for the same reason). A signal
+context's `pc` is a runtime (slid) address; `bit_rt_prof_start` captures
+`_dyld_get_image_vmaddr_slide(0)` once and every stored sample has it
+subtracted, so recorded addresses are file-relative — directly comparable to
+the binary's own Mach-O local symbol table (`compiler/machoreloc.bit`: "one
+LOCAL entry per surviving `__text` function") with no further correction at
+render time. `std/prof` (userland API) and `tools/prof/render.bit`
+(symbolizing reader) are the two halves built on top of these three symbols;
+see their own file headers.

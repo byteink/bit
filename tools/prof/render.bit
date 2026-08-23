@@ -1,0 +1,206 @@
+// Renders a `std/prof` CPU profile (#1906): reads the `BITPROF1` text file
+// `std/prof`'s `stopCpu` writes and the profiled binary's own already-linked
+// Mach-O local symbol table (`compiler/machoreloc.bit`: "one LOCAL entry per
+// surviving __text function" — proven present with a real build, not
+// stripped by default), and prints each sampled function's share of ticks.
+//
+// A STANDALONE tool, not a compiler subcommand: it depends on nothing but
+// `std/fs`, `std/strings`, `std/os`, `std/seq` and `std/sort`, so it never
+// pulls the compiler itself in as a library. That also means the Mach-O
+// reader below is its own small parser rather than a reuse of
+// `compiler/machoreader.bit` (which targets relocatable `MH_OBJECT`s the
+// linker atomizes, a different problem: this file wants `LC_SYMTAB` out of
+// an already-linked `MH_EXECUTE`, with no relocation or atomization at all).
+//
+// Run: `bit run tools/prof <profile-file>`.
+
+import { readFile } from "std/fs"
+import { split, trimSpace, hasPrefix, parseInt } from "std/strings"
+import { formatFloat } from "std/strings"
+import { args } from "std/os"
+import { keys } from "std/seq"
+import { sortInPlace } from "std/sort"
+
+class Sym { addr: int, name: string }
+
+// Where the pieces `readMachoTextSymbols` needs live in the file, once the
+// load commands have been scanned once.
+class MachoLayout { textLo: int, textHi: int, symoff: int, nsyms: int, stroff: int }
+
+fn rdU32(s: string, off: int): int {
+  return int(s[off]) | (int(s[off + 1]) << 8) | (int(s[off + 2]) << 16) |
+    (int(s[off + 3]) << 24)
+}
+
+fn rdU64(s: string, off: int): int {
+  return rdU32(s, off) | (rdU32(s, off + 4) << 32)
+}
+
+// The bytes at `off` up to (not including) the first NUL, or `s`'s own end —
+// whichever comes first, since a fixed-width field like `segname` is not
+// always NUL-terminated when it exactly fills its 16 bytes.
+fn rdCStr(s: string, off: int, limit: int): string {
+  let end = off
+  while (end < limit && int(s[end]) != 0) {
+    end = end + 1
+  }
+  return s[off:end]
+}
+
+// Scan `s`'s load commands once, recording `__TEXT`'s address range (from its
+// `LC_SEGMENT_64`) and `LC_SYMTAB`'s three fields. Split out of
+// `readMachoTextSymbols` to keep each function's branch count under the
+// lint's complexity ceiling.
+fn findMachoLayout(s: string, ncmds: int): MachoLayout! {
+  let textLo = -1
+  let textHi = -1
+  let symoff = -1
+  let nsyms = 0
+  let stroff = -1
+  let off = 32
+  let i = 0
+  while (i < ncmds) {
+    let cmd = rdU32(s, off)
+    let cmdsize = rdU32(s, off + 4)
+    if (cmd == 0x19) { // LC_SEGMENT_64
+      if (rdCStr(s, off + 8, off + 24) == "__TEXT") {
+        textLo = rdU64(s, off + 24) // vmaddr
+        textHi = textLo + rdU64(s, off + 32) // + vmsize
+      }
+    } else if (cmd == 0x2) { // LC_SYMTAB
+      symoff = rdU32(s, off + 8)
+      nsyms = rdU32(s, off + 12)
+      stroff = rdU32(s, off + 16)
+    }
+    off = off + cmdsize
+    i = i + 1
+  }
+  if (symoff < 0) {
+    fail("no LC_SYMTAB")
+  }
+  if (textLo < 0) {
+    fail("no __TEXT segment")
+  }
+  return MachoLayout{ textLo: textLo, textHi: textHi, symoff: symoff, nsyms: nsyms, stroff: stroff }
+}
+
+// Walk `LC_SYMTAB`'s `nlist_64` entries, keeping only defined (`N_SECT`),
+// non-stab symbols inside `__TEXT`'s own address range — the linker's
+// surviving-function symbols, without needing per-section indices to
+// exclude `__DATA` symbols separately.
+fn collectTextSymbols(s: string, layout: MachoLayout): []Sym {
+  let out = []Sym(0)
+  let j = 0
+  while (j < layout.nsyms) {
+    let e = layout.symoff + j * 16
+    let nStrx = rdU32(s, e)
+    let nType = int(s[e + 4])
+    let nValue = rdU64(s, e + 8)
+    let defined = (nType & 0xe0) == 0 && (nType & 0x0e) == 0x0e
+    let inText = nValue >= layout.textLo && nValue < layout.textHi
+    if (defined && inText) {
+      out = append(out, Sym{ addr: nValue, name: rdCStr(s, layout.stroff + nStrx, len(s)) })
+    }
+    j = j + 1
+  }
+  return out
+}
+
+// Parse a Mach-O64 executable's `LC_SYMTAB` into its text-section symbols,
+// sorted ascending by address.
+fn readMachoTextSymbols(path: string): []Sym! {
+  let s = readFile(path)?
+  if (len(s) < 32) {
+    fail("not a Mach-O file: too short (${len(s)} bytes): ${path}")
+  }
+  let magic = rdU32(s, 0)
+  if (magic != 0xfeedfacf) {
+    fail("not a 64-bit little-endian Mach-O executable (magic=${magic}): ${path}")
+  }
+  let layout = findMachoLayout(s, rdU32(s, 16))?
+  let out = collectTextSymbols(s, layout)
+  sortInPlace(out, (a: Sym, b: Sym) => a.addr < b.addr)
+  return out
+}
+
+// The largest symbol whose address is <= `pc`, or a raw-address placeholder
+// if `pc` precedes every known symbol — the same "print the raw address and
+// keep going" convention ABI.md §4.2 documents for an unresolved frame.
+// Linear scan: a program's own text symbol count is in the hundreds here,
+// not large enough to need a binary search, and `syms` is sorted ascending.
+fn symbolFor(syms: []Sym, pc: int): string {
+  let name = "??? (0x${pc})"
+  let i = 0
+  while (i < len(syms)) {
+    if (syms[i].addr > pc) {
+      return name
+    }
+    name = syms[i].name
+    i = i + 1
+  }
+  return name
+}
+
+// `BITPROF1\nbinary <path>\nsamples <n> cap <cap>\n...` — the three-line
+// header `std/prof`'s `stopCpu` writes. Returns (binary path, sample count,
+// ring capacity) or fails naming the malformed line.
+fn parseProfileHeader(lines: []string, profilePath: string): (string, int, int)! {
+  if (len(lines) < 3 || lines[0] != "BITPROF1") {
+    fail("not a BITPROF1 profile: ${profilePath}")
+  }
+  if (!hasPrefix(lines[1], "binary ")) {
+    fail("malformed profile header (binary line): ${profilePath}")
+  }
+  let sampleLine = split(lines[2], " ")
+  if (len(sampleLine) != 4 || sampleLine[0] != "samples" || sampleLine[2] != "cap") {
+    fail("malformed profile header (samples line): ${profilePath}")
+  }
+  let n = parseInt(sampleLine[1])?
+  let ringCap = parseInt(sampleLine[3])?
+  return lines[1][7:], n, ringCap
+}
+
+// One raw address per line, starting at line 3 (0-indexed), symbolized and
+// tallied by function name.
+fn tallySamples(lines: []string, n: int, syms: []Sym): map<string, int>! {
+  let counts = map<string, int>()
+  let k = 0
+  while (k < n) {
+    let addr = parseInt(trimSpace(lines[3 + k]))?
+    let name = symbolFor(syms, addr)
+    counts[name] = counts[name] + 1
+    k = k + 1
+  }
+  return counts
+}
+
+fn printReport(n: int, ringCap: int, counts: map<string, int>) {
+  let names = keys(counts)
+  sortInPlace(names, (a: string, b: string) => counts[a] > counts[b])
+
+  print("profile: ${n} sample(s) of ${ringCap} ring capacity, ${len(names)} distinct function(s)\n")
+  if (n >= ringCap) {
+    print("WARNING: sample count reached the ring capacity — some ticks were dropped\n")
+  }
+  let m = 0
+  while (m < len(names)) {
+    let nm = names[m]
+    let c = counts[nm]
+    let pct = 100.0 * f64(c) / f64(n)
+    print("${c}\t${formatFloat(pct, 1)}%\t${nm}\n")
+    m = m + 1
+  }
+}
+
+fn main(): ()! {
+  let argv = args()
+  if (len(argv) < 2) {
+    print("usage: bit run tools/prof <profile-file>\n")
+    return
+  }
+  let lines = split(readFile(argv[1])?, "\n")
+  let (binPath, n, ringCap) = parseProfileHeader(lines, argv[1])?
+  let syms = readMachoTextSymbols(binPath)?
+  let counts = tallySamples(lines, n, syms)?
+  printReport(n, ringCap, counts)
+}
