@@ -35,7 +35,7 @@
 import { netParseIpv4, netMaxStalls, netClampDeadline } from "../../net"
 import { saBytes, ipBytes, netSockAddrPort } from "../../net"
 import { pollClaimOp, pollOpOverlapped, pollOpWsabuf, pollOpCommit,
-         pollOpAbort, pollOpBytes, pollOpStatus, pollOpRelease } from "../../sched/windows"
+         pollOpAbort, pollOpBytes, pollOpStatus, pollOpRelease, pollAssociate } from "../../sched/windows"
 import { parkMonoNs } from "../../park/windows"
 
 // ---------------------------------------------------------------------------
@@ -102,19 +102,10 @@ fn armAndClaim(pollFd: int, sock: int, taskAddr: int): int {
 
 // Accept one connection via AcceptEx, parking until it completes. Returns
 // the accepted socket, or a negative value on failure.
-export @symbol("bit_rt_port_net_accept_tcp") fn netAcceptTcp(lfd: int): int {
-  let pollFd = currentPollFd()
-  let taskAddr = currentTaskAddr()
-  if (pollFd == 0 || taskAddr == 0) {
-    return 0 - 1
-  }
-  if (!resolveExtensionFns(lfd)) {
-    return 0 - 1
-  }
-  let accSock = netSysSocket(false)
-  if (accSock < 0) {
-    return 0 - 1
-  }
+// Issue AcceptEx on `accSock` (already created, unbound) and park for its
+// completion — steps 2-5 of this file's header. Returns `0` on success, else
+// a negative diagnostic code; the caller closes `accSock` on any failure.
+fn acceptIssue(pollFd: int, taskAddr: int, lfd: int, accSock: int): int {
   // MANAGED scratch (#1668-style — see ../linux/sock.bit's "WHY THE BUFFERS
   // HERE ARE MANAGED" for the general rule this file also follows): every
   // buffer AcceptEx's OVERLAPPED op can still be writing to, or that the
@@ -130,8 +121,7 @@ export @symbol("bit_rt_port_net_accept_tcp") fn netAcceptTcp(lfd: int): int {
 
   let slot = armAndClaim(pollFd, accSock, taskAddr)
   if (slot < 0) {
-    netClose(accSock)
-    return 0 - 1
+    return 0 - 5
   }
   args[0] = i64(32)
   args[1] = i64(32)
@@ -139,21 +129,57 @@ export @symbol("bit_rt_port_net_accept_tcp") fn netAcceptTcp(lfd: int): int {
   args[3] = i64(int(pollOpOverlapped(slot)))
   let rc = acceptExCall(int(acceptExPtr), lfd, accSock, int(ptrOf(outBuf)), int(ptrOf(args)))
   if (rc == 0 && int(WSAGetLastError()) != wsaIoPending()) {
+    let we = int(WSAGetLastError())
     pollOpAbort(slot)
-    netClose(accSock)
-    return 0 - 1
+    return 0 - (6000 + we)
   }
   pollOpCommit(slot)
   schedPark()
   let st = pollOpStatus(slot)
   pollOpRelease(slot)
   if (st != 0) {
+    return 0 - (7000 + (st % 100000))
+  }
+  return 0
+}
+
+export @symbol("bit_rt_port_net_accept_tcp") fn netAcceptTcp(lfd: int): int {
+  let pollFd = currentPollFd()
+  let taskAddr = currentTaskAddr()
+  if (pollFd == 0 || taskAddr == 0) {
+    return 0 - 2
+  }
+  if (!resolveExtensionFns(lfd)) {
+    return 0 - (3000 + lastErr())
+  }
+  // AcceptEx's completion is posted via the LISTENING socket's own IOCP
+  // association, not the accept socket's — `pollClaimOp` (inside
+  // `acceptIssue`) associates ONLY `accSock` (correctly, for the read/write
+  // ops that come after a successful accept), so `lfd` needs its own,
+  // separate, idempotent association here. MUTATION-FOUND BUG, kept as a
+  // comment: without this call AcceptEx's OVERLAPPED never completes at
+  // all — `schedPark()` inside `acceptIssue` then hangs forever, because
+  // nothing was ever going to post to `pollFd` for `lfd`. Reproduced on
+  // real hardware (mustafa-desktop-win): the accept task parked
+  // indefinitely and the peer's own `ConnectEx` still completed (the
+  // kernel's SYN backlog needs no application-level accept to finish the
+  // handshake), so only the accept side visibly hung.
+  if (!pollAssociate(pollFd, lfd)) {
+    return 0 - (9000 + lastErr())
+  }
+  let accSock = netSysSocket(false)
+  if (accSock < 0) {
+    return 0 - (4000 + lastErr())
+  }
+  let issueRc = acceptIssue(pollFd, taskAddr, lfd, accSock)
+  if (issueRc != 0) {
     netClose(accSock)
-    return 0 - 1
+    return issueRc
   }
   if (!netSetUpdateAcceptContext(accSock, lfd)) {
+    let we = lastErr()
     netClose(accSock)
-    return 0 - 1
+    return 0 - (8000 + we)
   }
   return accSock
 }
@@ -161,19 +187,23 @@ export @symbol("bit_rt_port_net_accept_tcp") fn netAcceptTcp(lfd: int): int {
 // Trap #2: bind the socket to the wildcard address before ConnectEx can be
 // resolved/called at all — split out of `netDialTcp` to keep its own
 // complexity under the lint ceiling.
-fn dialPrep(fd: int): bool {
+fn dialPrep(fd: int): int {
   let zero = []i64(2)
   netFillSockAddr(bytesAtI64(ptrOf(zero)), zeroIp(), 0)
   if (!netSysBind(fd, bytesAtI64(ptrOf(zero)))) {
-    return false
+    return 0 - (1000 + lastErr())
   }
-  return resolveExtensionFns(fd)
+  if (!resolveExtensionFns(fd)) {
+    return 0 - (2000 + lastErr())
+  }
+  return 0
 }
 
 // Issue ConnectEx and park for its completion (steps 2-5 of this file's
-// header), once `fd` is already bound. Returns `true` on a successful
-// handshake; the caller closes `fd` on `false`.
-fn dialConnect(pollFd: int, taskAddr: int, fd: int, ip: *u8, port: int): bool {
+// header), once `fd` is already bound. Returns `0` on a successful
+// handshake, else a negative diagnostic code — the caller closes `fd`
+// either way.
+fn dialConnect(pollFd: int, taskAddr: int, fd: int, ip: *u8, port: int): int {
   // MANAGED scratch, same reasoning as `netAcceptTcp`'s: `target` (the
   // sockaddr ConnectEx connects to) is read by the OS for the whole async
   // window, not just at the call.
@@ -184,21 +214,25 @@ fn dialConnect(pollFd: int, taskAddr: int, fd: int, ip: *u8, port: int): bool {
 
   let slot = armAndClaim(pollFd, fd, taskAddr)
   if (slot < 0) {
-    return false
+    return 0 - 3
   }
   args[0] = i64(0)
   args[1] = i64(int(bytesAtI64(ptrOf(sentBytes))))
   args[2] = i64(int(pollOpOverlapped(slot)))
   let rc = connectExCall(int(connectExPtr), fd, int(bytesAtI64(ptrOf(target))), 16, int(ptrOf(args)))
   if (rc == 0 && int(WSAGetLastError()) != wsaIoPending()) {
+    let we = int(WSAGetLastError())
     pollOpAbort(slot)
-    return false
+    return 0 - (4000 + we)
   }
   pollOpCommit(slot)
   schedPark()
   let st = pollOpStatus(slot)
   pollOpRelease(slot)
-  return st == 0
+  if (st != 0) {
+    return 0 - (5000 + (st % 100000))
+  }
+  return 0
 }
 
 // Connect to `host:port` via ConnectEx, parking until the handshake
@@ -211,19 +245,21 @@ export @symbol("bit_rt_port_net_dial_tcp") fn netDialTcp(host: *u8, hostLen: int
   let pollFd = currentPollFd()
   let taskAddr = currentTaskAddr()
   if (pollFd == 0 || taskAddr == 0) {
-    return 0 - 1
+    return 0 - 2
   }
   let fd = netSysSocket(false)
   if (fd < 0) {
-    return 0 - 1
+    return 0 - (6000 + lastErr())
   }
-  if (!dialPrep(fd)) {
+  let prepRc = dialPrep(fd)
+  if (prepRc != 0) {
     netClose(fd)
-    return 0 - 1
+    return prepRc
   }
-  if (!dialConnect(pollFd, taskAddr, fd, ip, port)) {
+  let connectRc = dialConnect(pollFd, taskAddr, fd, ip, port)
+  if (connectRc != 0) {
     netClose(fd)
-    return 0 - 1
+    return connectRc
   }
   let _ = netSetUpdateConnectContext(fd)
   return fd
