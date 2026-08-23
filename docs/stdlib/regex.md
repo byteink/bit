@@ -15,8 +15,9 @@ make it exponential, unlike a backtracking engine on a pattern such as
 error, at the exact byte the syntax breaks down. `Regex.matches` runs the
 compiled program against a string, an unanchored search (like Go's
 `regexp.MatchString`). `Regex.find` and `Regex.findAll` report *where* a
-pattern matched, as byte-offset spans (`Match`). Capture groups and named
-groups land in a later ticket.
+pattern matched, as byte-offset spans (`Match`). `Match.group`/`.named` and
+`Regex.groupNames` read a match's capture groups back out (see Groups,
+below).
 
 A compiled `Regex` is **immutable** and **safe to share across any number of
 green threads** — the natural usage is one `mustCompile` call, shared by
@@ -91,6 +92,53 @@ import { mustCompile } from "std/regex"
 fn isZipCode(s: string): bool {
   let re = mustCompile("^[0-9]{5}(-[0-9]{4})?$")
   return re.matches(s)
+}
+```
+
+### Groups
+
+Four forms, `(?:...)` alone costing no capture slot at all:
+
+- **`(...)`** — capturing. Numbered by the position of its opening `(`,
+  left to right: in `((a)(b))` the outer group is 1, `(a)` is 2, `(b)` is 3.
+- **`(?:...)`** — non-capturing: groups for precedence or alternation
+  without allocating an index, so it never appears in `groupCount()`,
+  `groupNames()`, or as a `Match.group` slot.
+- **`(?<name>...)`** and **`(?P<name>...)`** — capturing and named, and
+  both spellings mean exactly the same thing: the first is the
+  JavaScript/TypeScript form, the second Go/Python/RE2's, so a pattern
+  pasted from either ecosystem's docs works unchanged. `name` is
+  `[A-Za-z_][A-Za-z0-9_]*`; anything else is
+  `regex: invalid named group at offset N`. A duplicate name — in either
+  spelling, including the same name written once each way — is
+  `regex: duplicate capture group name at offset N`.
+
+A capturing group that never took part in a match is distinct from one that
+matched the empty string: `Match.group`/`.named` return `Option.None` for
+the former, `Option.Some` with `start == end` for the latter. For example,
+`(a)|(b)` matched against `"b"` gives `group(1) == Option.None` (the first
+branch never ran) and `group(2)` a real span, `start: 0, end: 1`.
+
+A group inside a repeat — `(a)*`, `(a){3}` — reports only its **last**
+iteration's span; earlier iterations are simply overwritten, never
+accumulated.
+
+Backreferences (`\1`, `\k<name>`) are never accepted: reading a captured
+group back inside the pattern itself requires backtracking, which this
+engine's linear-time guarantee rules out.
+
+```bit
+import { mustCompile } from "std/regex"
+
+fn yearOf(s: string): string {
+  let re = mustCompile("(?<year>[0-9]{4})-[0-9]{2}-[0-9]{2}")
+  return match (re.find(s)) {
+    Some(m) => match (m.named("year")) {
+      Some(g) => g.text(s)
+      None => ""
+    }
+    None => ""
+  }
 }
 ```
 
@@ -180,6 +228,22 @@ The number of capturing groups in `re`: `(...)`, `(?<name>...)` and
 `(?P<name>...)`, not counting the implicit whole-match group 0 and not
 counting a non-capturing `(?:...)`.
 
+### `Regex.groupNames(): []string`
+
+One entry per capturing group in `re`'s pattern, in index order —
+`groupNames()[0]` is group 1's name — `""` for a group with no name.
+`len(re.groupNames()) == re.groupCount()` always holds; `(?:...)` never
+gets an entry, since it never gets an index either.
+
+```bit
+import { mustCompile } from "std/regex"
+
+fn dateFieldNames(): []string {
+  let re = mustCompile("(?<year>[0-9]{4})-(?P<month>[0-9]{2})-(?:[0-9]{2})")
+  return re.groupNames() // ["year", "month"] — the trailing (?:...) has no entry
+}
+```
+
 ### `Regex.matches(s: string): bool`
 
 Whether `re`'s pattern matches anywhere in `s` — an unanchored search, the
@@ -202,8 +266,8 @@ fn isColor(s: string): bool {
 
 A single match: `start` and `end` are **byte offsets**, never rune indices,
 into the string `find`/`findAll` matched against — always safe to use
-directly as `s[m.start:m.end]` slice bounds. Which capture group each offset
-belongs to is not exposed yet; a later ticket adds `Match.group`/`.named`.
+directly as `s[m.start:m.end]` slice bounds. `Match.group`/`.named` read a
+specific capture group's own span back out of `m`.
 
 ### `Match.text(s: string): string`
 
@@ -217,6 +281,50 @@ fn firstNumber(s: string): string {
   let re = mustCompile("[0-9]+")
   return match (re.find(s)) {
     Some(m) => m.text(s)
+    None => ""
+  }
+}
+```
+
+### `Match.group(i: int): Option<Match>`
+
+`m`'s `i`-th capturing group — `group(0)` is the whole match, always
+`Option.Some`. `Option.None` for `i` out of range, or for a capturing group
+that took no part in this particular match; distinct from a group that
+matched the empty string, which is `Option.Some` with `start == end` (see
+Groups, above).
+
+```bit
+import { mustCompile } from "std/regex"
+
+fn secondWord(s: string): string {
+  let re = mustCompile("([A-Za-z]+) ([A-Za-z]+)")
+  return match (re.find(s)) {
+    Some(m) => match (m.group(2)) {
+      Some(g) => g.text(s)
+      None => ""
+    }
+    None => ""
+  }
+}
+```
+
+### `Match.named(name: string): Option<Match>`
+
+`m.group(i)` for whichever `i` `m`'s pattern gave `name` to — `Option.None`
+for a name the pattern never declared, same as an out-of-range `group`
+index.
+
+```bit
+import { mustCompile } from "std/regex"
+
+fn yearOf(s: string): string {
+  let re = mustCompile("(?P<year>[0-9]{4})-[0-9]{2}-[0-9]{2}")
+  return match (re.find(s)) {
+    Some(m) => match (m.named("year")) {
+      Some(g) => g.text(s)
+      None => ""
+    }
     None => ""
   }
 }
