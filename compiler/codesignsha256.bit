@@ -1,0 +1,238 @@
+// A dependency-free, in-tree SHA-256 (FIPS 180-4) for `codesign.bit`'s own
+// use. Deliberately NOT `std/crypto` (#3550, following #3538's precedent).
+//
+// `compiler/**` is bootstrapped by the PINNED stage0 (`scripts/stage0.sh`) —
+// an old release whose bundled `libbitrt.a` is frozen at pin time. Bit modules
+// are per-DIRECTORY (SPEC §17.1): importing anything at all from `std/crypto`
+// pulls the WHOLE `stdlib/crypto/` directory into this module's checked
+// project, including every `extern fn` declared in ANY sibling file there —
+// not just the symbol actually named on the `import` line. `stdlib/crypto/
+// aes.bit`'s three ARM64 hardware-AES externs (#2526) postdate the 0.1.25
+// stage0 pin, so `rejectExternForTarget` (compiler/buildextern.bit) rejects
+// the whole `compiler` build before stage0 ever gets to produce a fresh
+// `libbitrt.a` that would satisfy them. #3538 proved (and this ticket
+// inherits the proof) that moving the offending externs to a nested
+// submodule does not help — anything that imports `std/crypto` at all pulls
+// the transitive closure in, regardless of which symbol was wanted. The only
+// fix immune to a FUTURE `std/crypto` addition (e.g. #2527's GCM/PMULL
+// externs) is for `compiler/**` to depend on nothing in it, ever.
+//
+// UNLIKE `tools/build/fphash.bit`'s FNV-1a, this one MUST be real,
+// standards-conformant SHA-256: `codesign.bit` embeds these digests as
+// CS_HASHTYPE_SHA256 page hashes in a Mach-O CodeDirectory, and the xnu
+// kernel independently recomputes SHA-256 over the same pages at exec time
+// and compares. A non-cryptographic substitute would produce a binary whose
+// embedded hash type claims SHA-256 but whose bytes are not — AMFI would
+// reject the signature and refuse to launch the binary. There is no
+// lower-strength substitute available here the way there is for a build-cache
+// fingerprint or a run-id nonce.
+//
+// This is software-only — no hardware-SHA dispatch, no `extern fn` at all —
+// unlike `stdlib/crypto/sha256.bit`, which calls out to
+// `bit_rt_crypto_sha256_hw_available`/`_compress_hw` for throughput. Hashing
+// one freshly built binary once per build is not a hot path, and every
+// `extern fn` here is exactly the kind of thing that can strand a cold
+// bootstrap the moment its own pin lags. `CsSha256` implements only what
+// `codesign.bit` calls: streaming `write`, and `sum` to finalize.
+
+// The 64 round constants: the first 32 bits of the fractional parts of the
+// cube roots of the first 64 primes (FIPS 180-4 §4.2.2).
+fn csShaRoundConstants(): []u32 {
+  return []u32{
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+  }
+}
+
+// SHA-256 initial state: the first 32 bits of the fractional parts of the
+// square roots of the first eight primes (FIPS 180-4 §5.3.3).
+fn csShaIv256(): []u32 {
+  return []u32{
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+  }
+}
+
+// Rotate the 32-bit word `x` right by `n` bits, `1 <= n <= 31`. The two
+// shifted halves cover disjoint bit positions, so the `|` reassembles the
+// rotation.
+fn csShaRotr32(x: u32, n: u32): u32 {
+  return (x >> n) | (x << (32 - n))
+}
+
+// Absorb one 64-byte `block` into `state` (the eight running words), running
+// the full message schedule and 64 compression rounds against round
+// constants `k`. Mutates `state` in place. Software-only (see file header).
+fn csShaCompress(state: []u32, block: []byte, k: []u32) {
+  let w = []u32(64)
+
+  // First 16 words are the block read big-endian; the rest extend the schedule.
+  let i = 0
+  while (i < 16) {
+    let j = i * 4
+    w[i] = (u32(block[j]) << 24) |
+      (u32(block[j + 1]) << 16) |
+      (u32(block[j + 2]) << 8) |
+      u32(block[j + 3])
+    i = i + 1
+  }
+  while (i < 64) {
+    let a = w[i - 15]
+    let s0 = csShaRotr32(a, 7) ^ csShaRotr32(a, 18) ^ (a >> 3)
+    let b = w[i - 2]
+    let s1 = csShaRotr32(b, 17) ^ csShaRotr32(b, 19) ^ (b >> 10)
+    w[i] = w[i - 16] + s0 + w[i - 7] + s1
+    i = i + 1
+  }
+
+  let a = state[0]
+  let b = state[1]
+  let c = state[2]
+  let d = state[3]
+  let e = state[4]
+  let f = state[5]
+  let g = state[6]
+  let hh = state[7]
+
+  let round = 0
+  while (round < 64) {
+    let s1 = csShaRotr32(e, 6) ^ csShaRotr32(e, 11) ^ csShaRotr32(e, 25)
+    let ch = (e & f) ^ (~e & g)
+    let temp1 = hh + s1 + ch + k[round] + w[round]
+    let s0 = csShaRotr32(a, 2) ^ csShaRotr32(a, 13) ^ csShaRotr32(a, 22)
+    let maj = (a & b) ^ (a & c) ^ (b & c)
+    let temp2 = s0 + maj
+    hh = g
+    g = f
+    f = e
+    e = d + temp1
+    d = c
+    c = b
+    b = a
+    a = temp1 + temp2
+    round = round + 1
+  }
+
+  state[0] = state[0] + a
+  state[1] = state[1] + b
+  state[2] = state[2] + c
+  state[3] = state[3] + d
+  state[4] = state[4] + e
+  state[5] = state[5] + f
+  state[6] = state[6] + g
+  state[7] = state[7] + hh
+}
+
+// Streaming SHA-256 state, `codesign.bit`-private. `state` holds the eight
+// running words; `buf`/`bufLen` accumulate a partial 64-byte block; `total`
+// is the byte count for the length field; `k` is the round-constant table,
+// built once at construction.
+class CsSha256 {
+  state: []u32,
+  buf: []byte,
+  bufLen: int,
+  total: uint,
+  k: []u32,
+}
+
+// A fresh SHA-256 hasher over the empty message.
+fn newCsSha256(): CsSha256 {
+  return CsSha256{
+    state: csShaIv256(),
+    buf: []byte(64),
+    bufLen: 0,
+    total: 0,
+    k: csShaRoundConstants(),
+  }
+}
+
+// Absorb `data`, buffering into 64-byte blocks and compressing each full one.
+fn (h: CsSha256) write(data: []byte) {
+  let i = 0
+  while (i < len(data)) {
+    h.buf[h.bufLen] = data[i]
+    h.bufLen = h.bufLen + 1
+    h.total = h.total + 1
+    if (h.bufLen == 64) {
+      csShaCompress(h.state, h.buf, h.k)
+      h.bufLen = 0
+    }
+    i = i + 1
+  }
+}
+
+// The 32-byte digest of everything written since construction. Finalizes on
+// a copy of the running state, so it neither consumes the hasher nor blocks
+// further `write`s. Padding is `0x80`, then zeros, then the 64-bit
+// big-endian bit length.
+fn (h: CsSha256) sum(): []byte {
+  // Snapshot the running state so finalization is non-destructive.
+  let s = []u32(8)
+  let i = 0
+  while (i < 8) {
+    s[i] = h.state[i]
+    i = i + 1
+  }
+
+  // Build the padded tail from the current partial block.
+  let pad = []byte(64)
+  i = 0
+  while (i < h.bufLen) {
+    pad[i] = h.buf[i]
+    i = i + 1
+  }
+  let n = h.bufLen
+  pad[n] = 0x80
+  n = n + 1
+
+  // The 8-byte length must fit in this block; if not, flush and start a
+  // fresh all-zero block for it.
+  if (n > 56) {
+    while (n < 64) {
+      pad[n] = 0
+      n = n + 1
+    }
+    csShaCompress(s, pad, h.k)
+    i = 0
+    while (i < 64) {
+      pad[i] = 0
+      i = i + 1
+    }
+    n = 0
+  }
+  while (n < 56) {
+    pad[n] = 0
+    n = n + 1
+  }
+
+  // 64-bit big-endian message length in bits.
+  let bitLen = h.total * 8
+  pad[56] = byte(bitLen >> 56)
+  pad[57] = byte(bitLen >> 48)
+  pad[58] = byte(bitLen >> 40)
+  pad[59] = byte(bitLen >> 32)
+  pad[60] = byte(bitLen >> 24)
+  pad[61] = byte(bitLen >> 16)
+  pad[62] = byte(bitLen >> 8)
+  pad[63] = byte(bitLen)
+  csShaCompress(s, pad, h.k)
+
+  // Serialize all eight state words, each big-endian: SHA-256's full 32-byte
+  // output (unlike stdlib's variant, this one never truncates to SHA-224).
+  let out = []byte(32)
+  i = 0
+  while (i < 8) {
+    let v = s[i]
+    out[i * 4] = byte(v >> 24)
+    out[i * 4 + 1] = byte(v >> 16)
+    out[i * 4 + 2] = byte(v >> 8)
+    out[i * 4 + 3] = byte(v)
+    i = i + 1
+  }
+  return out
+}
