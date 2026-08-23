@@ -322,3 +322,28 @@ fn roundTrip(text: string): bool! {
   return formatRfc3339(ns) == text
 }
 ```
+
+## Local time zone
+
+### `utcOffset(ns: int): int`
+
+The host's offset from UTC, in seconds east of UTC, in effect at the instant
+`ns` (nanoseconds since the Unix epoch). Dubai returns `14400`, UTC returns
+`0`. Reads `/etc/localtime` — the version 1 (32-bit) block of the TZif format,
+RFC 8536 — directly: the path is the same on macOS and Linux, so there is no
+platform branch, and no copy of the tzdata database ships with this function.
+Returns `0`, rather than failing, when the file is missing, is a dangling
+symlink, is shorter than the header, or does not start with the TZif magic.
+
+Version 1's transition times are signed 32-bit seconds, which overflow in
+2038; an instant past then resolves against the last version 1 transition
+rather than the correct one. RFC 8536 §3.2's version 2 block, with 64-bit
+transition times, is the upgrade path.
+
+```bit
+import { utcOffset, now } from "std/time"
+
+fn localOffsetSeconds(): int {
+  return utcOffset(now().ns)
+}
+```
