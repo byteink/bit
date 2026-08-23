@@ -2789,6 +2789,62 @@ unchanged, `dw[i] = AESIMC(w[Nr-i])` for the interior keys.
 
 ---
 
+## 21e. ARM64 GHASH (`runtime/cryptohw/armghash.bit`, #2523, epic #1224)
+
+```
+bit_rt_ghash_hw_mul(h, x, out)             // out = H*X in GF(2^128), GCM bit order
+bit_rt_ghash_hw_blocks(h, state, data, blocks)  // fold `blocks` 16-byte blocks into state
+```
+
+Every pointer is a raw address (`int`) except `blocks`, a `u64` count.
+`h`/`x`/`out`/`state` point at 16-byte buffers; `data` at `16*blocks` bytes.
+`bit_rt_ghash_hw_mul`'s `out` may alias `h` and/or `x` — both operands are
+fully read before `out` is written. `bit_rt_ghash_hw_blocks` implements the
+same recurrence `stdlib/crypto/gcm.bit`'s software `gcmAbsorb` does: `state =
+(state XOR block) * H`, once per block, in order.
+
+**PLATFORM-FREE**, same reasoning as §21d's AES pins — one source file per
+TARGET, every exported function starts `if (onX64()) return`, and every
+exported function also calls `ghashRequireHwSupport` (bit 1, PMULL, of
+`bit_rt_crypto_hwcaps()`) before issuing PMULL/PMULL2, for the same "optional
+extension, SIGILL otherwise" reason §21d documents for AES.
+
+**NO CALLER YET**, same as §21d — these pins exist for a later ticket to wire
+`stdlib/crypto/gcm.bit` through.
+
+**The algorithm.** PMULL always treats a 64-bit register as LSB-first (bit 0
+= coefficient of x^0); GHASH's own bit order (SP 800-38D §6.3) is MSB-first
+(bit 0 = the top bit of byte 0 = coefficient of alpha^0). `LD1` followed by
+`REV64` (byte-swap within each 64-bit lane) turns out to be an exact
+bit-for-bit reversal relative to GHASH's convention — not a coincidence, a
+direct consequence of LD1 placing each byte's own bits into the register the
+normal way while REV64 reverses which byte holds which lane. One more lane
+swap (`EXT #8`) reorders the two reversed halves into the FULL 128-bit
+reciprocal polynomial of the input block, which is exactly what makes an
+ordinary (non-reflected) PMULL/PMULL2 schoolbook multiply of two such loads
+compute the reciprocal of the true GF(2^128) product — a real field-theory
+identity (reciprocal-polynomial multiplication commutes with reflection),
+verified independently against a from-scratch, non-reflected schoolbook
+GF(2^128) reference over thousands of random 128-bit pairs plus every
+relevant edge case, not assumed from a remembered formula.
+
+The four cross terms (PS, QT, PT, QS) come from PMULL/PMULL2 against both the
+loaded X and a lane-swapped copy of it. Combining them into one 256-bit raw
+product needs a 1-bit left shift (with carry across all four 64-bit words)
+plus a whole-word reversal to land in the software's own MSB-first-per-word
+layout — the raw product is a 255-bit, not 256-bit, reflection, which is
+where the 1-bit shift comes from. Reduction then folds the high half
+(degrees 128-254) into the low half via the same relation the software path
+applies one bit at a time (`R = alpha^128 = alpha^7+alpha^2+alpha+1`, the
+0xe1 top byte every GHASH implementation in this tree shares), but applied to
+the whole high half at once via four shifted copies (128, 127, 126, 121
+bits). One round always leaves a small residue (degree up to 133); a second,
+identical round always finishes it — proved empirically (thousands of random
+trials, always exactly 0, 1 or 2 rounds, never 3), not derived from a
+citation.
+
+---
+
 ## 22. Shared mutable state audit (#1248)
 
 Every container-scope mutable in `runtime/**/*.bit` (grep: `^let ` at module
