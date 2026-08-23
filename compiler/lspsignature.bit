@@ -1,0 +1,394 @@
+// bit lsp (#2337) — textDocument/signatureHelp: parameter names and order,
+// visible while typing a call, updating as the cursor crosses commas.
+//
+// Reuses hover's own technique (compiler/lspquery.bit, lspmember.bit) for the
+// TYPE half — `checkExprType` on the callee expression gives the exact func
+// type hover already renders (`func newTask: (i64, string) => Task`,
+// `import join: ([]string, string) => string`), for both free/imported names
+// (Tag.Ident) and methods (Tag.Member, "an uncalled method value -> the
+// method's func type", compiler/checkbind.bit's checkMember). What hover's
+// string drops — parameter NAMES — has to come from the declaration's own
+// `Params` node, so this file separately resolves the callee to its FuncDecl:
+// `sym.decl` (following the import chain, compiler/lspquery.bit's
+// `lspResolveImportChain`, for a free/imported callee) or
+// `lspFindMethodFuncDecl` (compiler/lspmember.bit, for a method). Names and
+// types are zipped POSITIONALLY; a mismatch (arity drift between the decl and
+// the resolved func type — should not happen, but this is a JSON-RPC
+// boundary, never trust it silently) drops names rather than risk showing a
+// WRONG name beside a type.
+//
+// activeParameter is a raw TEXT scan (the ticket's own implementation note:
+// "activeParameter has to come from counting commas at the cursor within the
+// call expression"), not an AST walk — the AST's own recovery on an in-progress
+// edit ("f(g(", unclosed) is lenient but not something to build arithmetic on,
+// while a bracket-depth-aware comma count from the call's own '(' to the
+// cursor is exact and needs no parser cooperation past locating that '('.
+//
+// STATE: no cache, no per-request growth. Every call below re-derives its
+// answer from the snapshot `lspBuildProject` already serves (compiler/
+// lspbuild.bit's 2-slot LRU, shared with every other query) and returns plain
+// values; nothing here is retained past the one response.
+
+// The nearest enclosing `Tag.Call` in `nodePath` (root-to-leaf, e.g. from
+// `lspNodePath`) — the call whose argument list the cursor is inside, or the
+// call the cursor's leaf node happens to sit under even when the leaf itself
+// is deep inside one argument's own subtree (`f(g(x, y|`'s cursor lands on a
+// leaf under `g`'s Call node, several levels down; the OUTER `f` call is also
+// an ancestor, further from the leaf, so walking from the end finds the
+// INNERMOST one first — exactly the nested-call case this exists for).
+// Bounded by `len(nodePath)` (itself bounded to 256, `lspNodePath`).
+fn lspEnclosingCall(tree: Tree, nodePath: []int): int {
+  let i = len(nodePath) - 1
+  while (i >= 0) {
+    if (nodePath[i] != 0 && getNode(tree, nodePath[i]).tag == Tag.Call) {
+      return nodePath[i]
+    }
+    i = i - 1
+  }
+  return 0
+}
+
+// The byte offset of `callNode`'s own `(`, scanned forward from its callee (or
+// type-argument list, when present) through the call's own span — which
+// always reaches at least the `(` (parsePostfix's `rpEnd` is captured only
+// after advancing past it, compiler/parserexpr.bit). -1 only if the call node
+// is malformed in a way the parser cannot produce, kept as an explicit guard
+// rather than trusted away. Bounded by the call's own span width.
+fn lspCallOpenParen(tree: Tree, src: string, callNode: int): int {
+  let kids = kidsOf(tree, callNode)
+  let afterEnd = getNode(tree, kids[0]).span.end
+  if (kids[1] != 0) {
+    afterEnd = getNode(tree, kids[1]).span.end
+  }
+  let limit = getNode(tree, callNode).span.end
+  if (limit > len(src)) {
+    limit = len(src)
+  }
+  let i = afterEnd
+  while (i < limit) {
+    if (src[i] == u8('(')) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+fn lspIsQuoteByte(ch: u8): bool {
+  return ch == u8('"') || ch == u8('\'')
+}
+
+fn lspIsOpenBracket(ch: u8): bool {
+  return ch == u8('(') || ch == u8('[') || ch == u8('{')
+}
+
+fn lspIsCloseBracket(ch: u8): bool {
+  return ch == u8(')') || ch == u8(']') || ch == u8('}')
+}
+
+// The index just past the closing `quote` byte, scanning forward from `start`
+// (the byte right after the opening quote) and skipping `\`-escaped bytes so
+// an escaped quote does not end the literal early. Returns `bound` if the
+// literal is never closed within `[start, bound)` — an in-progress edit, not
+// an error here. Split out of `lspActiveParamFromCommas` to keep that
+// function's own complexity under the repo's E0204 limit (#2337).
+fn lspSkipQuoted(src: string, bound: int, start: int, quote: u8): int {
+  let i = start
+  while (i < bound && src[i] != quote) {
+    if (src[i] == u8('\\') && i + 1 < bound) {
+      i = i + 1
+    }
+    i = i + 1
+  }
+  return i
+}
+
+// The number of top-level commas between `openParen + 1` and `cursor` —
+// `activeParameter` before clamping to the signature's own arity. Tracks
+// bracket nesting so a nested call's/literal's own commas
+// (`f(a, g(x, y), b|`) do not count, and skips over string/char literals
+// (respecting `\`-escapes, `lspSkipQuoted`) so a comma inside one — including
+// inside a `${...}` interpolation, itself nested one level deeper — is never
+// mistaken for a call-level separator. Bounded by `cursor - openParen`.
+fn lspActiveParamFromCommas(src: string, openParen: int, cursor: int): int {
+  let bound = cursor
+  if (bound > len(src)) {
+    bound = len(src)
+  }
+  let i = openParen + 1
+  let depth = 0
+  let count = 0
+  while (i < bound) {
+    let ch = src[i]
+    if (lspIsQuoteByte(ch)) {
+      i = lspSkipQuoted(src, bound, i + 1, ch)
+    } else if (lspIsOpenBracket(ch)) {
+      depth = depth + 1
+    } else if (lspIsCloseBracket(ch)) {
+      if (depth > 0) {
+        depth = depth - 1
+      }
+    } else if (ch == u8(',') && depth == 0) {
+      count = count + 1
+    }
+    i = i + 1
+  }
+  return count
+}
+
+// The declaring FuncDecl node of a call's callee, resolved to whichever
+// module's tree actually owns it — a free function/import may live in a
+// different module than the call site (`lspResolveImportChain`), a method
+// (`Tag.Member`) is only ever looked up in the ROOT module's own tree
+// (`lspFindMethodFuncDecl`, same restriction as go-to-definition on a member).
+// `found: false` when the callee does not resolve to any FuncDecl at all —
+// an undefined name, a builtin, or an interface-only method signature — the
+// caller falls back to a types-only rendering rather than treating this as
+// fatal.
+class LspCalleeDecl {
+  found: bool,
+  tree: Tree,
+  src: string,
+  declNode: int,
+}
+
+// The `sym.importedFromModule >= 0` half of `lspCalleeDeclFromIdent`, split
+// out to keep that function's own complexity under the repo's E0204 limit
+// (#2337).
+fn lspCalleeDeclFromImportedSymbol(lp: LspProject, sym: Symbol): LspCalleeDecl {
+  let root = lp.mods[lp.p.root]
+  let none = LspCalleeDecl{ found: false, tree: root.tree, src: root.source, declNode: 0 }
+  let resolved = lspResolveImportChain(lp, lp.p.root, sym)
+  if (!resolved.found || resolved.sym.decl == 0) {
+    return none
+  }
+  let dtree = lp.mods[resolved.modIdx].tree
+  if (getNode(dtree, resolved.sym.decl).tag != Tag.FuncDecl) {
+    return none
+  }
+  return LspCalleeDecl{
+    found: true, tree: dtree, src: lp.mods[resolved.modIdx].source,
+    declNode: resolved.sym.decl,
+  }
+}
+
+fn lspCalleeDeclFromIdent(lp: LspProject, c: Checker, calleeNode: int): LspCalleeDecl {
+  let none = LspCalleeDecl{ found: false, tree: c.tree, src: c.source, declNode: 0 }
+  let sid = 0
+  if (calleeNode > 0 && calleeNode < len(c.nodeSymbols)) {
+    sid = c.nodeSymbols[calleeNode]
+  }
+  if (sid <= 0 || sid >= len(c.symbols)) {
+    return none
+  }
+  let sym = c.symbols[sid]
+  if (sym.importedFromModule >= 0) {
+    return lspCalleeDeclFromImportedSymbol(lp, sym)
+  }
+  if (sym.decl == 0 || getNode(c.tree, sym.decl).tag != Tag.FuncDecl) {
+    return none
+  }
+  return LspCalleeDecl{ found: true, tree: c.tree, src: c.source, declNode: sym.decl }
+}
+
+fn lspCalleeDeclFromMember(c: Checker, calleeNode: int): LspCalleeDecl {
+  let none = LspCalleeDecl{ found: false, tree: c.tree, src: c.source, declNode: 0 }
+  let mk = kidsOf(c.tree, calleeNode)
+  let recvType = checkExprType(c, mk[0])
+  if (recvType <= 0) {
+    return none
+  }
+  let name = lspMemberNodeText(c, mk[1])
+  let declNode = lspFindMethodFuncDecl(c, recvType, name)
+  if (declNode == 0) {
+    return none
+  }
+  return LspCalleeDecl{ found: true, tree: c.tree, src: c.source, declNode: declNode }
+}
+
+fn lspCalleeDecl(lp: LspProject, c: Checker, calleeNode: int): LspCalleeDecl {
+  let tag = getNode(c.tree, calleeNode).tag
+  if (tag == Tag.Ident) {
+    return lspCalleeDeclFromIdent(lp, c, calleeNode)
+  }
+  if (tag == Tag.Member) {
+    return lspCalleeDeclFromMember(c, calleeNode)
+  }
+  return LspCalleeDecl{ found: false, tree: c.tree, src: c.source, declNode: 0 }
+}
+
+// The parameter NAMES of a FuncDecl's `Params` kid (index 3: `[recv, name,
+// generics, params, result, body(, attrs)]`), in declaration order —
+// `Tag.Param`/`Tag.ParamRest` share the `[name, type]` kid shape, so no
+// separate rest-param case is needed here (a variadic's type already shows
+// its `[]` in `typeName`; this file does not re-mark it).
+fn lspFuncDeclParamNames(decl: LspCalleeDecl): []string {
+  let kids = kidsOf(decl.tree, decl.declNode)
+  let items = kidsOf(decl.tree, kids[3])
+  let out = []string(0)
+  let i = 0
+  while (i < len(items)) {
+    let nk = kidsOf(decl.tree, items[i])
+    let sp = getNode(decl.tree, nk[0]).span
+    out = append(out, decl.src[sp.start:sp.end])
+    i = i + 1
+  }
+  return out
+}
+
+// Joins `items` with `sep` between each — `lspJoinComma` (lspserver.bit)
+// hard-codes a bare `,`; a signature label wants `, ` to match `typeName`'s
+// own `joinTypeNames` (compiler/types.bit) rendering of a func type's
+// parameter list.
+fn lspJoinWithSep(items: []string, sep: string): string {
+  let out = ""
+  let i = 0
+  while (i < len(items)) {
+    if (i > 0) {
+      out = out + sep
+    }
+    out = out + items[i]
+    i = i + 1
+  }
+  return out
+}
+
+// One parameter's label: `name: type` when a same-arity name list is
+// available, the bare type otherwise (a builtin, or a decl this file could
+// not resolve — see `LspCalleeDecl`).
+fn lspSigParamLabels(ctx: TypeContext, paramNames: []string, paramTypes: []int): []string {
+  let useNames = len(paramNames) == len(paramTypes)
+  let out = []string(0)
+  let i = 0
+  while (i < len(paramTypes)) {
+    if (useNames) {
+      out = append(out, paramNames[i] + ": " + typeName(ctx, paramTypes[i]))
+    } else {
+      out = append(out, typeName(ctx, paramTypes[i]))
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// The callee's own display name for the signature label's prefix: the
+// identifier's text for a free/imported call, the method name for a member
+// call — never the receiver, matching the ticket's own `add(title: string):
+// Task` shape (no `Board.` / `b.` prefix).
+fn lspCalleeDisplayName(c: Checker, calleeNode: int): string {
+  let tag = getNode(c.tree, calleeNode).tag
+  if (tag == Tag.Member) {
+    return lspMemberNodeText(c, kidsOf(c.tree, calleeNode)[1])
+  }
+  let sp = getNode(c.tree, calleeNode).span
+  return c.source[sp.start:sp.end]
+}
+
+// One `SignatureInformation` JSON object.
+fn lspSignatureInfoJson(
+  name: string, ctx: TypeContext, paramNames: []string,
+  paramTypes: []int, resultTy: int,
+): string {
+  let labels = lspSigParamLabels(ctx, paramNames, paramTypes)
+  let label = name + "(" + lspJoinWithSep(labels, ", ") + "): " + typeName(ctx, resultTy)
+  let params = []string(0)
+  let i = 0
+  while (i < len(labels)) {
+    params = append(params, "{\"label\":" + jsonEncodeString(labels[i]) + "}")
+    i = i + 1
+  }
+  return "{\"label\":" + jsonEncodeString(label) + ",\"parameters\":[" + lspJoinComma(params) + "]}"
+}
+
+// `activeParameter`, clamped into `[0, paramCount - 1]` (or 0 for a
+// zero-parameter signature) — a trailing comma or extra typed argument past
+// the declared arity still highlights the LAST parameter rather than an
+// out-of-range index a client would have to guard against itself.
+fn lspClampActiveParam(raw: int, paramCount: int): int {
+  if (paramCount <= 0) {
+    return 0
+  }
+  if (raw >= paramCount) {
+    return paramCount - 1
+  }
+  return raw
+}
+
+// The enclosing call and its own `(` offset for a signatureHelp request at
+// `offset` — `ok: false` when the cursor is not inside any call's argument
+// list at all (no enclosing call), or is still on the callee before its own
+// `(` (`lspCallOpenParen` found one, but `offset` sits at or before it).
+// Split out of `lspOnSignatureHelp` to keep that function's own complexity
+// under the repo's E0204 limit (#2337).
+class LspSigCallSite {
+  ok: bool,
+  callNode: int,
+  openParen: int,
+}
+
+fn lspSigCallSite(c: Checker, offset: int): LspSigCallSite {
+  let none = LspSigCallSite{ ok: false, callNode: 0, openParen: 0 }
+  let nodePath = lspNodePath(c.tree, offset)
+  let callNode = lspEnclosingCall(c.tree, nodePath)
+  if (callNode == 0) {
+    return none
+  }
+  let openParen = lspCallOpenParen(c.tree, c.source, callNode)
+  if (openParen < 0 || offset <= openParen) {
+    return none
+  }
+  return LspSigCallSite{ ok: true, callNode: callNode, openParen: openParen }
+}
+
+fn lspOnSignatureHelp(server: LspServer, d: JsonDoc, params: int, idText: string) {
+  let tdp = lspTextDocPosition(d, params)
+  if (!tdp.ok) {
+    lspRespond(idText, "null")
+    return
+  }
+  let path = lspUriToPath(tdp.uri)
+  if (path == "") {
+    lspRespond(idText, "null")
+    return
+  }
+  let lp = lspBuildProject(server, pathDir(path))
+  if (len(lp.mods) == 0 || !lp.checkedOk) {
+    lspRespond(idText, "null")
+    return
+  }
+  let loc = lspLocateFile(lp, path)
+  if (!loc.found) {
+    lspRespond(idText, "null")
+    return
+  }
+  let c = lp.mods[lp.p.root]
+  let offset = loc.fileStart + lspPosToByte(loc.fileSrc, tdp.pos)
+  let site = lspSigCallSite(c, offset)
+  if (!site.ok) {
+    lspRespond(idText, "null") // no enclosing call, or cursor is on the callee
+    return
+  }
+  let calleeNode = kidsOf(c.tree, site.callNode)[0]
+  let funcTy = checkExprType(c, calleeNode)
+  if (funcTy <= 0 || c.ctx.types[funcTy].kind != TypeKind.Func) {
+    lspRespond(idText, "null") // unresolved callee, or not a callable value
+    return
+  }
+  let decl = lspCalleeDecl(lp, c, calleeNode)
+  let paramNames = []string(0)
+  if (decl.found) {
+    paramNames = lspFuncDeclParamNames(decl)
+  }
+  let ft = c.ctx.types[funcTy]
+  let activeParam = lspClampActiveParam(
+    lspActiveParamFromCommas(c.source, site.openParen, offset), len(ft.members),
+  )
+  let sig = lspSignatureInfoJson(
+    lspCalleeDisplayName(c, calleeNode), c.ctx, paramNames,
+    ft.members, ft.result,
+  )
+  lspRespond(
+    idText,
+    "{\"signatures\":[" + sig + "],\"activeSignature\":0," + "\"activeParameter\":${activeParam}}",
+  )
+}
