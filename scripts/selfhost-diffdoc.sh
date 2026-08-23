@@ -195,6 +195,26 @@ if [ "$compared" -eq 0 ]; then
   exit 2
 fi
 
+# Surface-collapse guard (#3553): a structural rule, not a hardcoded floor --
+# 25 non-empty stdlib modules is what the tree happens to hold today and WILL
+# go stale (this repo has had a hardcoded corpus count go stale three times:
+# expectedCases, the corpus MATCH baseline, the release asset count). What
+# never changes is that zero is always wrong: $compared > 0 with $nonempty
+# == 0 means every one of those comparisons was empty-vs-empty, so
+# MATCH=$match is a gate reporting it compared NOTHING, in the shape of a
+# pass -- the "measurement query must prove itself non-zero" trap, one level
+# deeper than #3518's denominator print. Printed unconditionally (not only
+# on the would-be-clean-pass path below) so it is visible even when a
+# mismatch or timeout report follows it.
+surface_collapsed=0
+if [ "$compared" -gt 0 ] && [ "$nonempty" -eq 0 ]; then
+  surface_collapsed=1
+  echo
+  echo "REFUSED: 0 of $compared compared module(s) have a non-empty exported surface."
+  echo "         Every comparison above is empty-vs-empty -- MATCH=$match proves nothing;"
+  echo "         this differential's entire discriminating power just vanished."
+fi
+
 if [ -s "$work/mismatch" ]; then
   echo
   # EVERY divergence, named — a "first divergence" report leaves the rest invisible.
@@ -222,5 +242,21 @@ fi
 # A timeout used to set the same status=1 a real mismatch does (#3382 sibling
 # finding, same shape as #3351/#3377/#3378/#3379/#3380): diffexit restores the
 # could-not-decide (2) distinction.
-[ "$mismatch" -eq 0 ] && [ "$timeouts" -eq 0 ] && { echo; echo "diffdoc: the two doc surfaces agree on every compared module."; }
+if [ "$mismatch" -eq 0 ] && [ "$timeouts" -eq 0 ]; then
+  if [ "$surface_collapsed" -eq 1 ]; then
+    # Would otherwise be the clean exit-0 "agree" path below -- refuse
+    # instead of printing it. A collapsed surface is not evidence of
+    # agreement, so a silent green here is exactly the false pass #3553
+    # exists to close. Exit 2 (could-not-decide), not 1: nothing diverged,
+    # so this is not the same claim a real MISMATCH makes, and not 0: a
+    # comparison of nothing is not a pass either (same reasoning as the
+    # compared==0 corpus floor above, distinct wording per #3553's own
+    # constraint not to reuse INVALID).
+    echo
+    echo "diffdoc: REFUSING to report agreement — see REFUSED above."
+    exit 2
+  fi
+  echo
+  echo "diffdoc: the two doc surfaces agree on every compared module."
+fi
 diffexit "doc" -f "$mismatch" -t "module(s)=$timeouts"
