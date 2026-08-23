@@ -315,7 +315,8 @@ fn measureScript(bin: string, outPath: string, resPath: string, gcMinKb: int): s
   // holds the child's own stderr ahead of `time`'s own report — see the
   // comment on the redirect above) so ONE awk call produces all four fields.
   s = s +
-    "    awk -v ec=$ec 'BEGIN{u=-1;r=-1;" + gcAwkBody +
+    "    awk -v ec=$ec 'BEGIN{u=-1;r=-1;" +
+    gcAwkBody +
     "/ user/{u=$3} /maximum resident set size/{r=$1} " +
     "END{obj=-1; if (sw>=0 && lv>=0) obj=sw+lv; " +
     "printf \"%d %d %d %d\\n\", ec, (u*100)+0.5, r, obj}' " +
@@ -362,9 +363,11 @@ fn measureScript(bin: string, outPath: string, resPath: string, gcMinKb: int): s
   // `/usr/bin/time -l` merging it in for us the way the Darwin branch gets
   // for free) — same `swept=`/`live=` scan, different source file.
   s = s +
-    "    obj=$(awk 'BEGIN{" + gcAwkBody +
+    "    obj=$(awk 'BEGIN{" +
+    gcAwkBody +
     "END{if (sw>=0 && lv>=0) print sw+lv; else print -1}' " +
-    shQuote(gcPath) + ")\n"
+    shQuote(gcPath) +
+    ")\n"
   s = s + "    printf \"%d %d %d %d\\n\" $ec $cpuCs $rssB $obj > " + shQuote(resPath) + "\n"
   s = s + "    exit $ec\n"
   s = s + "    ;;\n"
@@ -410,7 +413,14 @@ fn parseMeasured(resText: string, outText: string): Measured {
   let obj = parseInt(parts[3]) catch _ {
     return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, out: outText }
   }
-  return Measured{ ok: true, exitCode: ec, cpuCentis: cpu, rssBytes: rss, objects: obj, out: outText }
+  return Measured{
+    ok: true,
+    exitCode: ec,
+    cpuCentis: cpu,
+    rssBytes: rss,
+    objects: obj,
+    out: outText,
+  }
 }
 
 // --- tally -----------------------------------------------------------------
@@ -431,134 +441,146 @@ fn minInt(a: int, b: int): int {
 
 // --- one case ----------------------------------------------------------
 
-fn runCase(
-  bit: string, libbitrt: string, stdlib: string, benchDir: string,
-  scratch: string, b: Baseline, t: Tally,
-) {
-  let caseScratch = scratch + "/" + b.name
-  mkdirQuiet(caseScratch)
+// One case's build outcome. `binPath` is only meaningful when `ok` — see
+// BuildResult{ok: false} sites below, which all leave it "".
+class BuildResult { ok: bool, binPath: string }
 
-  let srcPath = benchDir + "/" + b.name + "/" + b.name + ".bit"
+// Derives this case's paths from `caseScratch`, then writes and runs its
+// build script, marking `t` on any failure along the way. Extracted from
+// runCase() (#3542) so the build phase carries its own complexity budget
+// instead of adding to the driver's; paths are derived here (rather than
+// passed in individually) to keep this at the same param count as
+// buildScript()/runCase() rather than adding a new E0202 finding.
+fn buildBenchCase(
+  bit: string, libbitrt: string, stdlib: string, benchDir: string,
+  caseScratch: string, name: string, t: Tally,
+): BuildResult {
+  let srcPath = benchDir + "/" + name + "/" + name + ".bit"
   let binPath = caseScratch + "/bin"
   let buildOut = caseScratch + "/build.out"
   let buildErr = caseScratch + "/build.err"
   let buildSh = caseScratch + "/build.sh"
 
   writeFile(buildSh, buildScript(bit, libbitrt, stdlib, srcPath, binPath, buildOut, buildErr)) catch e {
-    markFail(t, "${b.name}: cannot write build script: " + e.message())
-    return
+    markFail(t, "${name}: cannot write build script: " + e.message())
+    return BuildResult{ ok: false, binPath: "" }
   }
   if (fsChmod(buildSh, 448) != 0) { // 0o700
-    markFail(t, "${b.name}: cannot chmod build script")
-    return
+    markFail(t, "${name}: cannot chmod build script")
+    return BuildResult{ ok: false, binPath: "" }
   }
   let buildCode = osRunBounded(buildSh, timeoutMs())
   if (buildCode != 0) {
     let berr = readFile(buildErr) catch e {
       ""
     }
-    markFail(t, "${b.name}: build failed (${runMsg(buildCode)}): ${berr}")
-    return
+    markFail(t, "${name}: build failed (${runMsg(buildCode)}): ${berr}")
+    return BuildResult{ ok: false, binPath: "" }
   }
   if (!exists(binPath)) {
-    markFail(t, "${b.name}: build reported success but ${binPath} does not exist")
-    return
+    markFail(t, "${name}: build reported success but ${binPath} does not exist")
+    return BuildResult{ ok: false, binPath: "" }
   }
+  return BuildResult{ ok: true, binPath: binPath }
+}
 
-  // Sentinels above any measurement this gate could ever legitimately see —
-  // the check after the loop proves a real run replaced them, the same shape
-  // tests/bit/schedbench.bit's `benchTrials` uses.
-  let minCpu = 1000000000
-  let minRss = 1000000000
-  let minObj = 1000000000
-  let sawOne = false
+// One rep's launch outcome: the run script written, chmod'd and executed
+// through osRunBounded. `launched` is false only for a harness-side failure
+// (write/chmod/spawn/timeout/crash — see runMsg()), never for a benchmark
+// that ran and produced a bad result; that split is validateRep()'s job.
+class RepRun { launched: bool, msg: string, resText: string, outText: string }
 
-  let rep = 0
-  while (rep < reps) {
-    let outPath = caseScratch + "/run${rep}.out"
-    let resPath = caseScratch + "/run${rep}.res"
-    let runSh = caseScratch + "/run${rep}.sh"
-    writeFile(runSh, measureScript(binPath, outPath, resPath, b.gcMinKb)) catch e {
-      markFail(t, "${b.name} rep ${rep}: cannot write run script: " + e.message())
-      rep = rep + 1
-      continue
+// Extracted from runCase() (#3542): the filesystem/subprocess half of one
+// repetition, with none of the result parsing.
+fn runRepOnce(binPath: string, caseScratch: string, rep: int, gcMinKb: int): RepRun {
+  let outPath = caseScratch + "/run${rep}.out"
+  let resPath = caseScratch + "/run${rep}.res"
+  let runSh = caseScratch + "/run${rep}.sh"
+  writeFile(runSh, measureScript(binPath, outPath, resPath, gcMinKb)) catch e {
+    return RepRun{
+      launched: false,
+      msg: "cannot write run script: " + e.message(),
+      resText: "",
+      outText: "",
     }
-    if (fsChmod(runSh, 448) != 0) {
-      markFail(t, "${b.name} rep ${rep}: cannot chmod run script")
-      rep = rep + 1
-      continue
-    }
-    // The wrapper's own exit re-raises the benchmark's exit code (see
-    // measureScript's header), so a non-zero, non-timeout, non-signal code
-    // here means the BENCHMARK itself failed, not the harness.
-    let code = osRunBounded(runSh, timeoutMs())
-    if (code == 0 - 2 || code == 0 - 1 || code <= 0 - 100) {
-      markFail(t, "${b.name} rep ${rep}: ${runMsg(code)}")
-      rep = rep + 1
-      continue
-    }
-    let resText = readFile(resPath) catch e {
-      ""
-    }
-    let outText = readFile(outPath) catch e {
-      ""
-    }
-    let m = parseMeasured(resText, outText)
-    if (!m.ok) {
-      markFail(t, "${b.name} rep ${rep}: no parseable result line (got '${resText}')")
-      rep = rep + 1
-      continue
-    }
-    if (m.exitCode != 0) {
-      markFail(t, "${b.name} rep ${rep}: benchmark exited ${m.exitCode}")
-      rep = rep + 1
-      continue
-    }
-    // objects < 0 covers both a malformed result line AND a missing/absent
-    // `BIT_GC_STATS` line (measureScript's awk prints -1 in either case,
-    // never a silent 0) — this must be a hard fail unconditionally, even for
-    // a case whose Baseline.objects is itself -1 ("not measured on this
-    // platform"): a case with no recorded band still needs the underlying
-    // instrumentation working, or a future re-baseline would read garbage.
-    if (m.cpuCentis < 0 || m.rssBytes < 0 || m.objects < 0) {
-      markFail(
-        t,
-        "${b.name} rep ${rep}: measurement unavailable (cpu=${m.cpuCentis} " +
-        "rss=${m.rssBytes} obj=${m.objects}) — a -1 here can mean the " +
-        "BIT_GC_STATS line was missing or unparseable; never treat it as 0",
-      )
-      rep = rep + 1
-      continue
-    }
-    let got = trimSpace(trimTrailingNl(m.out))
-    if (got != b.expected) {
-      markFail(
-        t,
-        "${b.name} rep ${rep}: printed '${got}', want '${b.expected}' — wrong answer, cost not trusted",
-      )
-      rep = rep + 1
-      continue
-    }
-    minCpu = minInt(minCpu, m.cpuCentis)
-    minRss = minInt(minRss, m.rssBytes)
-    minObj = minInt(minObj, m.objects)
-    sawOne = true
-    rep = rep + 1
   }
-
-  if (!sawOne) {
-    markFail(t, "${b.name}: no successful run out of ${reps}")
-    return
+  if (fsChmod(runSh, 448) != 0) {
+    return RepRun{ launched: false, msg: "cannot chmod run script", resText: "", outText: "" }
   }
+  // The wrapper's own exit re-raises the benchmark's exit code (see
+  // measureScript's header), so a non-zero, non-timeout, non-signal code
+  // here means the BENCHMARK itself failed, not the harness — validateRep()
+  // below reads that case from the parsed result line instead.
+  let code = osRunBounded(runSh, timeoutMs())
+  if (code == 0 - 2 || code == 0 - 1 || code <= 0 - 100) {
+    return RepRun{ launched: false, msg: runMsg(code), resText: "", outText: "" }
+  }
+  let resText = readFile(resPath) catch e {
+    ""
+  }
+  let outText = readFile(outPath) catch e {
+    ""
+  }
+  return RepRun{ launched: true, msg: "", resText: resText, outText: outText }
+}
 
+// One rep's measured outcome, parsed and checked against `b`. Never touches
+// the filesystem or a subprocess — runRepOnce() above owns that half.
+// Extracted from runCase() (#3542).
+class RepCheck { ok: bool, msg: string, cpu: int, rss: int, obj: int }
+
+fn validateRep(resText: string, outText: string, b: Baseline): RepCheck {
+  let m = parseMeasured(resText, outText)
+  if (!m.ok) {
+    return RepCheck{
+      ok: false,
+      msg: "no parseable result line (got '${resText}')",
+      cpu: 0,
+      rss: 0,
+      obj: 0,
+    }
+  }
+  if (m.exitCode != 0) {
+    return RepCheck{ ok: false, msg: "benchmark exited ${m.exitCode}", cpu: 0, rss: 0, obj: 0 }
+  }
+  // objects < 0 covers both a malformed result line AND a missing/absent
+  // `BIT_GC_STATS` line (measureScript's awk prints -1 in either case, never
+  // a silent 0) — this must be a hard fail unconditionally, even for a case
+  // whose Baseline.objects is itself -1 ("not measured on this platform"): a
+  // case with no recorded band still needs the underlying instrumentation
+  // working, or a future re-baseline would read garbage.
+  if (m.cpuCentis < 0 || m.rssBytes < 0 || m.objects < 0) {
+    return RepCheck{
+      ok: false,
+      msg: "measurement unavailable (cpu=${m.cpuCentis} rss=${m.rssBytes} obj=${m.objects}) — " +
+        "a -1 here can mean the BIT_GC_STATS line was missing or unparseable; never treat it as 0",
+      cpu: 0, rss: 0, obj: 0,
+    }
+  }
+  let got = trimSpace(trimTrailingNl(m.out))
+  if (got != b.expected) {
+    return RepCheck{
+      ok: false,
+      msg: "printed '${got}', want '${b.expected}' — wrong answer, cost not trusted",
+      cpu: 0, rss: 0, obj: 0,
+    }
+  }
+  return RepCheck{ ok: true, msg: "", cpu: m.cpuCentis, rss: m.rssBytes, obj: m.objects }
+}
+
+// Prints the unconditional per-case summary line (#2931) and runs the four
+// CPU/RSS/object-count checks against `b`'s ceilings and floor, marking `t`
+// for each one that trips. Pure reporting/comparison — no filesystem, no
+// subprocess. Extracted from runCase() (#3542).
+fn reportAndCheck(b: Baseline, minCpu: int, minRss: int, minObj: int, t: Tally) {
   // CPU reads its own per-case ceiling (#2982); RSS always uses the blanket
   // 1.5x — see cpuCeiling()'s and Baseline.cpuCeilingPct's comments above.
   let cpuCeil = cpuCeiling(b)
   let rssCeil = ceiling(b.rssBytes)
   // objects is TWO-SIDED (#3130) — see objCeiling()/objFloor()'s comment
   // above. Baseline.objects == -1 means "not measured on this platform"; the
-  // two checks below are then both skipped, but the -1 check earlier in
-  // this function already required the stats line to be present regardless.
+  // two checks below are then both skipped, but validateRep() already
+  // required the stats line to be present regardless.
   let objCeil = objCeiling(b.objects)
   let objFlr = objFloor(b.objects)
   // Printed unconditionally, pass or fail, so a slow drift toward the
@@ -599,27 +621,84 @@ fn runCase(
         "tests/bit/benchgate/baselines.bit if this is real",
     )
   }
+}
+
+// Builds the case once, runs it `reps` times, and checks the minimum against
+// `b`'s baselines. Split for complexity (#3542) into buildBenchCase() (the
+// build), runRepOnce()+validateRep() (one repetition's launch and its
+// result), and reportAndCheck() (the ceiling/floor comparisons) — this
+// function is now only the sequencing between them.
+fn runCase(
+  bit: string, libbitrt: string, stdlib: string, benchDir: string,
+  scratch: string, b: Baseline, t: Tally,
+) {
+  let caseScratch = scratch + "/" + b.name
+  mkdirQuiet(caseScratch)
+
+  let built = buildBenchCase(bit, libbitrt, stdlib, benchDir, caseScratch, b.name, t)
+  if (!built.ok) {
+    return
+  }
+  let binPath = built.binPath
+
+  // Sentinels above any measurement this gate could ever legitimately see —
+  // the check after the loop proves a real run replaced them, the same shape
+  // tests/bit/schedbench.bit's `benchTrials` uses.
+  let minCpu = 1000000000
+  let minRss = 1000000000
+  let minObj = 1000000000
+  let sawOne = false
+
+  let rep = 0
+  while (rep < reps) {
+    let rr = runRepOnce(binPath, caseScratch, rep, b.gcMinKb)
+    if (!rr.launched) {
+      markFail(t, "${b.name} rep ${rep}: ${rr.msg}")
+      rep = rep + 1
+      continue
+    }
+    let rc = validateRep(rr.resText, rr.outText, b)
+    if (!rc.ok) {
+      markFail(t, "${b.name} rep ${rep}: ${rc.msg}")
+      rep = rep + 1
+      continue
+    }
+    minCpu = minInt(minCpu, rc.cpu)
+    minRss = minInt(minRss, rc.rss)
+    minObj = minInt(minObj, rc.obj)
+    sawOne = true
+    rep = rep + 1
+  }
+
+  if (!sawOne) {
+    markFail(t, "${b.name}: no successful run out of ${reps}")
+    return
+  }
+
+  reportAndCheck(b, minCpu, minRss, minObj, t)
   t.checks = t.checks + 1
 }
 
 // --- driver ------------------------------------------------------------
 
+// Fails the whole gate immediately (never returns) when `value` — expected
+// to be an existing path read from `label`'s env var — is empty or does not
+// exist. Extracted from main() (#3542): the three BIT_BIN/BIT_LIBBITRT/
+// BIT_BENCH_DIR checks each cost main() its own branch inline.
+fn requireEnvPath(label: string, value: string) {
+  if (value == "" || !exists(value)) {
+    eprint("FAIL benchgate: ${label}='${value}' does not exist — refusing to guess\n")
+    exit(1)
+  }
+}
+
 fn main() {
   let bit = envOr("BIT_BIN", "")
-  if (bit == "" || !exists(bit)) {
-    eprint("FAIL benchgate: BIT_BIN='${bit}' does not exist — refusing to guess\n")
-    exit(1)
-  }
+  requireEnvPath("BIT_BIN", bit)
   let libbitrt = envOr("BIT_LIBBITRT", "")
-  if (libbitrt == "" || !exists(libbitrt)) {
-    eprint("FAIL benchgate: BIT_LIBBITRT='${libbitrt}' does not exist — refusing to guess\n")
-    exit(1)
-  }
+  requireEnvPath("BIT_LIBBITRT", libbitrt)
   let benchDir = envOr("BIT_BENCH_DIR", "")
-  if (benchDir == "" || !exists(benchDir)) {
-    eprint("FAIL benchgate: BIT_BENCH_DIR='${benchDir}' does not exist — refusing to guess\n")
-    exit(1)
-  }
+  requireEnvPath("BIT_BENCH_DIR", benchDir)
   let stdlib = env("BIT_STDLIB")
 
   let target = hostTarget()
