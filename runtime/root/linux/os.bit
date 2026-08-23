@@ -513,6 +513,17 @@ let osOutstandingChildPid: [33]i64  // (osScratchSlots+1) * 1
   }
 }
 
+// Publish `pid` as this worker's outstanding bounded child (#3507) and
+// return the slot address, so `osForkExecWaitBounded` below can clear it
+// later with a single `storeWord` rather than recomputing the slot. Split
+// out purely to keep that function's own body under the house line limit
+// (E0201) — see `osOutstandingChildPid`'s comment for the safety argument.
+@nosplit fn osMarkChildOutstanding(pid: int): int {
+  let addr = int(ptrOf(osOutstandingChildPid)) + osScratchSlot() * 8
+  storeWord(addr, pid)
+  return addr
+}
+
 // Ceiling on `timeoutMs`: one hour. This is the `os_run_bounded_max_ms` clamp
 // ABI.md §19 specifies, and every harness clamps to match — a caller typo must
 // not reinstate an unbounded wait.
@@ -535,6 +546,22 @@ const osWnohang: int = 1
 //   -2       timed out: the deadline elapsed, so the child was SIGKILLed
 //   <= -100  child was killed by a signal seen during a poll;
 //            signal number = -(result) - 100
+// The forked CHILD's own branch: own process group, pgid == this process's
+// pid, BEFORE exec (#2986) — membership survives execve, so a wrapper shell
+// (e.g. runcmd.bit's `shell()`) and everything IT forks inherits this group
+// too, unless one of them detaches on its own. That is what makes
+// `osKillGroup` reach a grandchild, not just this direct child. `setpgid` is
+// on POSIX's async-signal-safe list, so it is sound between fork and exec.
+// Never returns — either `execve` replaces this process's image, or it
+// fails and `rootExit(127)` reports it the same way a shell reports a bad
+// exec. Split out purely to keep `osForkExecWaitBounded`'s own body under
+// the house line limit (E0201).
+@nosplit fn osExecChild(pathPtr: int, argvPtr: int, envpPtr: int) {
+  syscall(sysSetpgid(), i64(0), i64(0))
+  syscall(sysExecve(), i64(pathPtr), i64(argvPtr), i64(envpPtr))
+  rootExit(127)
+}
+
 @nosplit fn osForkExecWaitBounded(pathPtr: int, argvPtr: int, envpPtr: int, timeoutMs: int): int {
   let clamped = timeoutMs
   if (clamped < 0) {
@@ -555,15 +582,7 @@ const osWnohang: int = 1
     return 0 - 1
   }
   if (forked == 0) {
-    // Own process group, pgid == this process's pid, BEFORE exec (#2986):
-    // membership survives execve, so a wrapper shell (e.g. runcmd.bit's
-    // `shell()`) and everything IT forks inherits this group too, unless one
-    // of them detaches on its own. That is what makes `osKillGroup` below
-    // reach a grandchild, not just this direct child. `setpgid` is on
-    // POSIX's async-signal-safe list, so it is sound between fork and exec.
-    syscall(sysSetpgid(), i64(0), i64(0))
-    syscall(sysExecve(), i64(pathPtr), i64(argvPtr), i64(envpPtr))
-    rootExit(127)
+    osExecChild(pathPtr, argvPtr, envpPtr)
   }
   // Mirrors the child's own call above so the group exists no matter which
   // side runs first (the standard fork/setpgid race fix): once the child has
@@ -571,14 +590,8 @@ const osWnohang: int = 1
   // no-op — the child's own call already set it.
   syscall(sysSetpgid(), i64(forked), i64(forked))
 
-  // #3507: publish this pid as outstanding BEFORE the poll loop can block on
-  // anything, so a SIGTERM/SIGINT arriving at any point from here to the
-  // clear below finds it. Cleared right before every return below — reap,
-  // spawn/wait failure, and the deadline/fallback kill paths alike — so a
-  // slot never holds a pid whose process has already been waited on.
-  let outstanding = int(ptrOf(osOutstandingChildPid)) + osScratchSlot() * 8
-  storeWord(outstanding, forked)
-
+  // #3507, cleared before every return below — see `osMarkChildOutstanding`.
+  let outstanding = osMarkChildOutstanding(forked)
   let sb = int(ptrOf(osStatusBuf)) + osScratchSlot() * 8
   let polls = 0
   let result = 0 - 1
