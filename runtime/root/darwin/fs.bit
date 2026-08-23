@@ -19,14 +19,21 @@
 // different offset — a wrong constant is a silent wrong-behaviour, never a
 // compile error.
 
-import { fsPathZ, fsPathZ2, rtStrAlloc, rtStringSlice, rtFsReadAllFailedSet } from "../../root"
+// checkedPathZ/checkedPathZ2/cstrLen/emptyStr/fsScratchSlot/isDotName/strData/
+// strLenOf/wordsPathZ/fsLinkMaxPath pulled up to core (#2551,
+// docs/development/provider-duplication.md's `root` -> `fs.bit` section): no
+// OS call in any of their bodies.
+import {
+  fsPathZ, fsPathZ2, rtStrAlloc, rtStringSlice, rtFsReadAllFailedSet,
+  checkedPathZ, checkedPathZ2, cstrLen, emptyStr, fsScratchSlot, isDotName,
+  strData, strLenOf, wordsPathZ, fsLinkMaxPath,
+} from "../../root"
 // `gcSyscallBegin`/`gcSyscallEnd` are NOT imported here: ./os.bit already imports
 // them, and a sibling .bit file is the same module, so a second import is E0042.
 import { loadByte, storeByte } from "../../gc"
 // `taskAt`/`wkId`/`schedCurrentWorker` are NOT imported here: ./bootworker.bit
-// and ./time.bit already import them (same module). `schedMaxWorkers` is new —
-// for `fsScratchSlot`.
-import { schedMaxWorkers } from "../../sched"
+// and ./time.bit already import them (same module). `schedMaxWorkers` no
+// longer needed here: its only caller, `fsScratchSlot`, moved to core (#2551).
 
 // `write`, `strPtr`, `strLen` and `loadWord` are already declared/imported by this
 // module's sibling ../darwin/io.bit (module-scoped in Bit), so they are reused,
@@ -109,33 +116,6 @@ const fOk: int = 0
 // -inode layout directly (no `$INODE64` variant — that is x86_64 only).
 const direntNameOff: int = 21
 
-// PER-WORKER SLOTS, NOT ONE SHARED REGION (#3274 — this comment used to claim
-// module-level, unlocked buffers were sound "under the same single-worker
-// contract"; #1900 booted more than one worker, and that claim is false at
-// BIT_WORKERS>1). Same shape as `runtime/net/{darwin,linux}/sock.bit`'s
-// `sockScratchSlot` (#3273) and ../fs.bit's `fsScratchSlot`, duplicated here
-// because this is a DIFFERENT module (an import is per-module, not shared):
-// index by the CURRENT worker's `wkId`, double bounded against
-// `schedMaxWorkers` and this file's own literal slot count (`let a: [N]i64`
-// needs `N` to be a literal, E0021), plus a dedicated fallback slot for a
-// caller with no current task/worker. Every accessor below re-derives the
-// slot fresh; no path-taking wrapper in this file parks between filling a
-// slot and using it (checked directly by grep for `schedPark`/`schedSwitch`,
-// never inferred from `@nosplit` alone), so there is no #3273-style "refill
-// inside the loop" hazard here.
-const fsScratchSlots: int = 32
-
-@nosplit fn fsScratchSlot(): int {
-  let w = schedCurrentWorker()
-  if (w == 0) {
-    return fsScratchSlots
-  }
-  let id = *(taskAt(w) + wkId)
-  if (id < 0 || id >= schedMaxWorkers || id >= fsScratchSlots) {
-    return fsScratchSlots
-  }
-  return id
-}
 
 // The `readlink` sink for the symlink probe. ONE WORD PER SLOT, deliberately:
 // the probe reads only whether the call SUCCEEDED, never the target's text,
@@ -148,18 +128,6 @@ const fsScratchSlots: int = 32
 let fsLinkBuf: [33]i64
 const fsLinkBufBytes: int = 1
 
-// The packed NUL-terminated path for the symlink probe. A SECOND buffer rather
-// than ../fs.bit's `fsPathBuf`, which is a different module's private state and
-// is reachable here only through `fsPathZ`, whose argument is a Bit `string`
-// object — the one thing the probe's `extern` boundary cannot carry.
-// (`fsScratchSlots` + 1) slots of `fsLinkMaxPath` (4096) bytes = 512 words
-// each: 33 * 512 = 16896 words, one region per worker plus the fallback.
-let fsLinkPathBuf: [16896]i64
-
-// ../fs.bit's `fsMaxPath`, which is that module's private const. Mirrored here
-// rather than shared because this module cannot see it; it is `runtime/root/`'s
-// `max_path = 4096` and must move with it.
-const fsLinkMaxPath: int = 4096
 
 // `stat`/`lstat` sink for `bit_rt_fs_stat_w`/`bit_rt_fs_lstat_w` (#2153).
 // `stat` structure on aarch64-macos (`<sys/stat.h>`'s 64-bit-inode form, the
@@ -195,55 +163,6 @@ const sIflnk: int = 40960 // 0o120000
   return base + addr
 }
 
-// A string object's inline byte pointer and length (ABI.md §2). `strPtr`/`strLen`
-// and `loadWord` are io.bit's module-scoped decls.
-@nosplit fn strData(s: int): int { return loadWord(s + strPtr) }
-@nosplit fn strLenOf(s: int): int { return loadWord(s + strLen) }
-@nosplit fn emptyStr(): int { return rtStrAlloc(0) }
-
-// `fsPathZ` copies a Bit string's bytes verbatim and appends its own NUL
-// terminator (#2146): a string carrying an embedded NUL byte (legal per
-// SPEC §21) would let the copy stop early from the syscall's point of view
-// while every Bit-side check — `len`, `==`, `hasSuffix`, `ext` — still sees
-// the full string, so the syscall opens a different path than the one that
-// was validated. Reject up front, same "reject, not truncate" contract
-// `fsPathZ` already applies to `n >= fsMaxPath`. Every one of the 8
-// path-taking `bit_rt_fs_*` entry points below routes through this instead
-// of calling `fsPathZ` directly.
-//
-// BOUNDED (Power of 10 rule 2): the scan is bounded by the string's own
-// length, exactly as `fsPathZ`'s copy loop it precedes.
-@nosplit fn checkedPathZ(path: int): int {
-  let n = strLenOf(path)
-  let base = strData(path)
-  let i = 0
-  while (i < n) {
-    if (loadByte(base + i) == 0) {
-      return 0
-    }
-    i = i + 1
-  }
-  return fsPathZ(path)
-}
-
-// `checkedPathZ`, encoding into `fsPathZ2`'s buffer (`fsPathBuf2`) instead of
-// `fsPathZ`'s (#2712). The only caller today is `rtFsRename`'s `newPath`: a
-// rename needs both its paths encoded and live at the same time, and
-// `checkedPathZ` alone would overwrite `oldPath` with `newPath` before
-// `rename(2)` ever reads the first pointer. Same embedded-NUL and
-// `>= fsMaxPath` rejection rules as `checkedPathZ`, applied identically.
-@nosplit fn checkedPathZ2(path: int): int {
-  let n = strLenOf(path)
-  let base = strData(path)
-  let i = 0
-  while (i < n) {
-    if (loadByte(base + i) == 0) {
-      return 0
-    }
-    i = i + 1
-  }
-  return fsPathZ2(path)
-}
 
 // ---------------------------------------------------------------------------
 // libSystem calls (the runtime/sched/ helpers)
@@ -266,29 +185,6 @@ const sIflnk: int = 40960 // 0o120000
   return fd
 }
 
-// The length of the NUL-terminated name at `addr`, capped at NAME_MAX+1 (256) so
-// the scan is provably bounded (Power of 10 rule 2).
-@nosplit fn cstrLen(addr: int): int {
-  let i = 0
-  while (i < 256) {
-    if (loadByte(addr + i) == 0) {
-      return i
-    }
-    i = i + 1
-  }
-  return 256
-}
-
-// `.` or `..` — the two entries `list_dir` omits.
-@nosplit fn isDotName(addr: int, nlen: int): bool {
-  if (nlen == 1 && loadByte(addr) == 46) {
-    return true
-  }
-  if (nlen == 2 && loadByte(addr) == 46 && loadByte(addr + 1) == 46) {
-    return true
-  }
-  return false
-}
 
 // List `pathPtr`'s entries, snprintf-shaped: write up to `outCap` bytes of
 // NUL-terminated names (`.`/`..` omitted) to `outPtr` and return the TOTAL bytes
@@ -405,39 +301,6 @@ export @nosplit @symbol("bit_rt_fs_is_dir") fn rtFsIsDir(path: int): bool {
   return isDirAtP(p)
 }
 
-// Copy the `n` path bytes at `words` — a Bit `[]byte`'s backing store, PACKED
-// one byte per element (#3121/#3226) — into `fsLinkPathBuf`, NUL-terminated,
-// and return the buffer address. 0 when the path may not be handed to a
-// syscall at all.
-//
-// This is `checkedPathZ` for a caller that has no Bit `string` to offer, and it
-// applies the identical two rules, so `fsIsSymlinkW` refuses exactly the paths
-// every other entry point refuses:
-//   - at or over `max_path`: REJECTED, never truncated, so a lie about the
-//     prefix cannot reach the kernel.
-//   - an embedded NUL (legal in a Bit string, SPEC §21): REJECTED, because the
-//     syscall would stop early while every Bit-side check still saw the whole
-//     string — a different path probed than the one that was validated (#2146).
-//
-// BOUNDED (Power of 10 rule 2): by `n`, itself bounded by the `< fsLinkMaxPath`
-// guard above the loop.
-@nosplit fn wordsPathZ(words: int, n: int): int {
-  if (words == 0 || n <= 0 || n >= fsLinkMaxPath) {
-    return 0
-  }
-  let dst = int(ptrOf(fsLinkPathBuf)) + fsScratchSlot() * fsLinkMaxPath
-  let i = 0
-  while (i < n) {
-    let b = loadByte(words + i)
-    if (b == 0) {
-      return 0
-    }
-    storeByte(dst + i, b)
-    i = i + 1
-  }
-  storeByte(dst + n, 0)
-  return dst
-}
 
 // `bit_rt_fs_is_symlink_w`: whether the `n` path bytes at `words` name a
 // symbolic LINK itself, asked of the link and never of what it resolves to.

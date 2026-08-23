@@ -33,11 +33,21 @@
 // emission at all. That is a fallback, not the design — depending on `runtime/root/`
 // for the write path would defeat the point of porting it.
 
-import { strPtr, strLen, dynTypeOf } from "../../root"
+// `strPtr`/`strLen` no longer needed here: their only callers, `strBytesOf`/
+// `strSizeOf`, moved to core (#2551) along with `ioConstScratchSlot`,
+// `ioLineAppendClamped`, `ioLineAppendWord`, `ioLineCopyBytes`,
+// `ioLineSlotAddr` and the exported `ioLineCap` constant they, and this
+// file's remaining panic/print functions, still need.
+import {
+  dynTypeOf, ioConstScratchSlot, ioLineAppendClamped, ioLineAppendWord,
+  ioLineCopyBytes, ioLineSlotAddr, ioLineCap, strBytesOf, strSizeOf,
+} from "../../root"
 import { loadWord, gcTiNamePtr, gcTiNameLen } from "../../gc"
-// `taskAt`, `wkId` and `schedCurrentWorker` are already imported into this
-// module by ./boot.bit and ./time.bit, and `schedMaxWorkers` by ./fs.bit — an
+// `taskAt`/`wkId` are already imported into this module by ./boot.bit — an
 // import is per-MODULE, not per-file, so a second one here is E0042.
+// `schedCurrentWorker`/`schedMaxWorkers` are no longer imported anywhere in
+// this module: their only callers (`ioConstScratchSlot`, `fsScratchSlot`,
+// `osScratchSlot`, `timeScratch`) all moved to core (#2551).
 
 // write(2) and _exit(2) from libSystem. Only C-representable types cross the
 // boundary (§11.7), so the buffer travels as `*u8` and the count as `i64`.
@@ -202,52 +212,6 @@ fn rootWriteAll(fd: int, addr: int, n: int) {
   }
 }
 
-// The one-word scratch `writeConst` hands the kernel. MODULE-LEVEL AND SCALAR,
-// not a per-call `[]int(1)`, and that is what makes `writeConst` `@nosplit`-able
-// (#1658): `@nosplit` forbids allocation outright (E0075), so a per-call GC slice
-// cannot stay on the panic path. It is also the strictly safer shape for its own
-// sake — the panic path must work when allocation is what failed.
-//
-// A scalar array is never scanned by the collector (ABI.md §5, rule 1). That is
-// required here and harmless: this holds a packed byte constant, never an object
-// address.
-//
-// PER-WORKER SLOTS, NOT ONE SHARED WORD (#3276 — this comment used to claim a
-// single module-level word was sound "under the ABI's single-worker contract
-// (§5)"; #1900 booted more than one worker and that contract no longer holds,
-// same class as #3272/#3273). Two panics on two different workers both calling
-// `writeConst` at the same real time can interleave on the SAME shared word: A
-// stores its byte(s), B's concurrent call overwrites them before A's
-// `rootWriteAll` reads the address back for the syscall, and A's stderr line
-// is spliced with B's bytes.
-//
-// WHY PER-WORKER IS SOUND HERE: `writeConst` below resolves its slot's address
-// ONCE into a local and uses that SAME address for both the store and the
-// read, and the whole span between them takes no park. `rootWriteAll` is
-// `@nosplit`, so it emits no back-edge safepoint poll (§10.3.1; ABI.md
-// already states this for this exact function: "`rootWriteAll` ... is
-// `@nosplit`, so no safepoint is ever reached"), and neither it nor
-// `writeConst` calls `schedPark`/`schedSwitch` — checked by reading the
-// callee chain, not inferred from `@nosplit` alone. So the slot resolved for
-// the write is the slot resolved for the read, whichever worker that is.
-//
-// The double bound (`schedMaxWorkers` AND `ioConstScratchSlots`) is #3272's
-// `udpSenderSlot` shape: `let a: [N]i64` needs `N` to be a literal (E0021), so
-// this file's array capacity and the scheduler's advertised worker count are
-// two independent numbers with nothing tying them together.
-const ioConstScratchSlots: int = 32
-
-@nosplit fn ioConstScratchSlot(): int {
-  let w = schedCurrentWorker()
-  if (w == 0) {
-    return ioConstScratchSlots
-  }
-  let id = *(taskAt(w) + wkId)
-  if (id < 0 || id >= schedMaxWorkers || id >= ioConstScratchSlots) {
-    return ioConstScratchSlots
-  }
-  return id
-}
 
 // (ioConstScratchSlots + 1) slots: one per worker plus a fallback slot for a
 // caller with no current task/worker — mirrors ./time.bit's `timeScratch`,
@@ -279,87 +243,6 @@ let ioConstBuf: [33]i64
   rootWriteAll(fd, addr, nbytes)
 }
 
-// ---------------------------------------------------------------------------
-// Whole-line assembly (#3295)
-// ---------------------------------------------------------------------------
-//
-// Every panic function below used to make 3-5 SEPARATE `writeConst`/
-// `rootWriteAll` calls (prefix, one-or-more message words, newline) with no
-// lock or ordering guarantee spanning them. Each call is content-safe on its
-// own (`ioConstBuf` above is per-worker), but with `BIT_WORKERS>1` two tasks
-// panicking on two different workers at close to the same real time can
-// interleave AT THE CALL BOUNDARY: A's prefix write, B's prefix write, A's
-// message write, ... land in the kernel in whatever order the two workers'
-// syscalls actually happen to reach it, splicing two complete, correctly-
-// formed messages into one unreadable line. Reproduced directly: BIT_WORKERS=
-// 4/8, ~400 tasks racing div-zero vs nil-call panics, spliced lines in 33-40%
-// of runs (0/155 at exactly BIT_WORKERS=2 in the same repro — the window
-// needs at least one OTHER worker already mid-panic-write, which is rarer
-// with only one other worker to race against).
-//
-// A LOCK spanning the write sequence is the obvious fix and the dangerous
-// one: a panic path that blocks on a lock already held by the panicking
-// worker itself, or by one mid-teardown, turns a diagnosable crash into a
-// hang. Assembling the WHOLE line into a per-worker buffer and issuing ONE
-// `rootWriteAll` needs no lock at all, and it is the identical shape
-// `ioConstBuf`/`ioConstScratchSlot` above already establishes and proves
-// sound — module state, one slot per worker, resolved once into a local used
-// for both every store and the final read, with no park anywhere in the span
-// (that block's comment carries the full argument; it applies unchanged
-// here, since nothing below calls `schedPark`/`schedSwitch` either).
-//
-// `ioLineCap` (128 bytes/slot) covers every FIXED panic message in this file
-// today with room to spare (the longest, nil-iface, assembles to 44 bytes)
-// plus `../slices.bit`'s three bounds messages (longest 26) and the
-// overwhelming majority of real `panic(msg)` literals, once routed through
-// `panicWrite` below. A message that does not fit falls back to the original
-// multi-syscall shape — this buffer never truncates, it only narrows the
-// race window for the case that fits.
-const ioLineCap: int = 128
-let ioLineBuf: [528]i64 // 33 slots (ioConstScratchSlots + 1) * 16 words (128B)
-
-@nosplit fn ioLineSlotAddr(): int {
-  return int(ptrOf(ioLineBuf)) + ioConstScratchSlot() * ioLineCap
-}
-
-// Appends the low `n` (<=8) little-endian bytes of `word` to `addr`, one byte
-// at a time. NOT `storeWord`: `../../gc`'s `wordAt` computes `addr / 8` to
-// index its `*i64` view, so an `addr` that is not 8-byte aligned silently
-// indexes the WRONG word rather than faulting — and every offset here after
-// the very first is unaligned by construction (`panicPrefixLen` is 7).
-// Bounded (Power of 10 rule 2): every caller below passes a literal `n <= 8`.
-@nosplit fn ioLineAppendWord(addr: int, word: int, n: int) {
-  let i = 0
-  while (i < n) {
-    storeByte(addr + i, (word >> (i * 8)) & 255)
-    i = i + 1
-  }
-}
-
-// Copies `n` bytes from `src` to `addr`, one at a time — the dynamic-length
-// counterpart of `ioLineAppendWord` above, for a message that already lives
-// in memory this buffer does not own. `runtime/root/root.bit`'s own
-// `copyBytes` does the identical thing but is a different module's private
-// (importing it would mean exporting it there, out of #3295's file scope),
-// so this is the same six lines rather than a cross-module reach.
-@nosplit fn ioLineCopyBytes(addr: int, src: int, n: int) {
-  let i = 0
-  while (i < n) {
-    storeByte(addr + i, loadByte(src + i))
-    i = i + 1
-  }
-}
-
-// Appends `word`'s low `min(remaining, 8)` bytes and returns how many it
-// wrote, so a caller can chain several without re-deriving the clamp.
-@nosplit fn ioLineAppendClamped(addr: int, word: int, remaining: int): int {
-  let n = remaining
-  if (n > 8) {
-    n = 8
-  }
-  ioLineAppendWord(addr, word, n)
-  return n
-}
 
 // Assembles "panic: " + up to 5 constant words (packed little-endian the same
 // way `panicPrefixWord`/`oomWord0`/etc. already are; `msgLen` is the exact
@@ -402,32 +285,6 @@ let ioLineBuf: [528]i64 // 33 slots (ioConstScratchSlots + 1) * 16 words (128B)
   rootWriteAll(fd, addr, off)
 }
 
-// The bytes of the port-heap `string` at `s` (ABI.md §2: a `{ptr, len}` header
-// whose `ptr` addresses the object's own inline bytes).
-//
-// A NULL HEADER READS AS `""` (#1564/#1570). `runtime/root/` gives `bit_rt_print` and
-// `bit_rt_eprint` an OPTIONAL header and funnels both through its `strBytes`,
-// because a zeroed class's `string` field is the null word (SPEC §13.4) and
-// `print(z.label)` is ordinary Bit code. This pair is that funnel for this
-// module — `../root.bit`'s own `strBytes`/`strSize` are a different module's
-// privates and cannot be reached from here, so the guard is duplicated rather
-// than shared. Length 0 makes `rootWriteAll` write nothing at all, so the null
-// address is never handed to `write(2)`.
-@nosplit fn strBytesOf(s: int): int {
-  if (s == 0) {
-    return 0
-  }
-  let p = loadWord(s + strPtr)
-  return p
-}
-
-@nosplit fn strSizeOf(s: int): int {
-  if (s == 0) {
-    return 0
-  }
-  let n = loadWord(s + strLen)
-  return n
-}
 
 // `panic: <msg>\n` on `fd`. `runtime/root/`'s `panicWrite`.
 //

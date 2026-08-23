@@ -1,0 +1,130 @@
+// Core (platform-free) half of runtime/root/{linux,darwin}/io.bit's SEAM 3
+// write/exit provider (#2551, #1710's provider-duplication sweep; see
+// docs/development/provider-duplication.md's `root` -> `io.bit` section for
+// the full inventory). Pulled up here: the per-worker scratch-slot
+// arithmetic for the shared panic/print line buffer, the buffer's own
+// bookkeeping (append a word, copy bytes, compute a slot address), and the
+// managed-string byte/length accessors. All pure arithmetic and byte
+// marshalling, no OS call anywhere.
+//
+// STILL split per provider, and correctly so: every function that actually
+// puts a byte on a file descriptor or ends the process (`rootWriteAll`,
+// `rootExit`, `writeConst`, `writeConstLine`, `panicWrite`, `rootPanic`,
+// `rootPrint`, ...) forwards to a genuinely OS-specific primitive — a raw
+// `write`/`exit_group` syscall on Linux, a libSystem call on Darwin — and
+// stays in each provider. Their SOURCE TEXT is byte-identical between the
+// two providers too (which is what made #2550's audit list them as
+// candidates), but a textual match is not sufficient: a platform-free file
+// cannot reach `rootWriteAll`/`rootExit` without either an extern fn (which
+// would need a call-site rename to a raw pinned symbol — a real body change,
+// not a pure move) or reintroducing per-OS dispatch this split exists to
+// avoid. See ticket #2551 for the full excluded-function list and why.
+
+// No imports: `strPtr`/`strLen` (./root.bit), `loadWord`/`storeByte`
+// (./root.bit's own "../gc" import) and `schedCurrentWorker`/`wkId`/
+// `schedMaxWorkers`/`taskAt` (./fs.bit's own "../sched" import) are already
+// in scope — imports are module-scoped, and re-importing any of them here
+// would be an E0042 redeclaration.
+
+// ---------------------------------------------------------------------------
+// Per-worker scratch slot for the shared panic/print line buffer (#3272's
+// `udpSenderSlot` shape: double-bounded by `schedMaxWorkers` AND
+// `ioConstScratchSlots`, since `let a: [N]i64` needs `N` to be a literal,
+// E0021, so this file's array capacity and the scheduler's advertised
+// worker count are two independent numbers with nothing tying them
+// together).
+// ---------------------------------------------------------------------------
+const ioConstScratchSlots: int = 32
+
+export @nosplit @symbol("bit_rt_port_root_io_const_scratch_slot") fn ioConstScratchSlot(): int {
+  let w = schedCurrentWorker()
+  if (w == 0) {
+    return ioConstScratchSlots
+  }
+  let id = *(taskAt(w) + wkId)
+  if (id < 0 || id >= schedMaxWorkers || id >= ioConstScratchSlots) {
+    return ioConstScratchSlots
+  }
+  return id
+}
+
+// ---------------------------------------------------------------------------
+// Whole-line assembly (#3295): the shared per-worker line buffer every
+// provider's panic/assert/print path assembles into before issuing ONE
+// `rootWriteAll`, and the bookkeeping over it. `ioLineCap` (128 bytes/slot)
+// covers every FIXED panic message plus the overwhelming majority of real
+// `panic(msg)` literals; a message that does not fit falls back to a
+// multi-syscall shape in the caller — this buffer never truncates, it only
+// narrows the race window for the case that fits. Exported: providers read
+// `ioLineCap` directly (not through a function) to decide whether a message
+// fits before touching the buffer.
+// ---------------------------------------------------------------------------
+export const ioLineCap: int = 128
+let ioLineBuf: [528]i64 // 33 slots (ioConstScratchSlots + 1) * 16 words (128B)
+
+export @nosplit @symbol("bit_rt_port_root_io_line_slot_addr") fn ioLineSlotAddr(): int {
+  return int(ptrOf(ioLineBuf)) + ioConstScratchSlot() * ioLineCap
+}
+
+// Appends the low `n` (<=8) little-endian bytes of `word` to `addr`, one byte
+// at a time. NOT `storeWord`: `../gc`'s `wordAt` computes `addr / 8` to
+// index its `*i64` view, so an `addr` that is not 8-byte aligned silently
+// indexes the WRONG word rather than faulting — and every offset here after
+// the very first is unaligned by construction (the panic prefix is 7 bytes).
+// Bounded (Power of 10 rule 2): every caller passes a literal `n <= 8`.
+export @nosplit @symbol("bit_rt_port_root_io_line_append_word") fn ioLineAppendWord(addr: int, word: int, n: int) {
+  let i = 0
+  while (i < n) {
+    storeByte(addr + i, (word >> (i * 8)) & 255)
+    i = i + 1
+  }
+}
+
+// Appends `word`'s low `min(remaining, 8)` bytes and returns how many it
+// wrote, so a caller can chain several without re-deriving the clamp.
+export @nosplit @symbol("bit_rt_port_root_io_line_append_clamped") fn ioLineAppendClamped(addr: int, word: int, remaining: int): int {
+  let n = remaining
+  if (n > 8) {
+    n = 8
+  }
+  ioLineAppendWord(addr, word, n)
+  return n
+}
+
+// Copies `n` bytes from `src` to `addr`, one at a time — the dynamic-length
+// counterpart of `ioLineAppendWord` above, for a message that already lives
+// in memory this buffer does not own.
+export @nosplit @symbol("bit_rt_port_root_io_line_copy_bytes") fn ioLineCopyBytes(addr: int, src: int, n: int) {
+  let i = 0
+  while (i < n) {
+    storeByte(addr + i, loadByte(src + i))
+    i = i + 1
+  }
+}
+
+// The bytes of the port-heap `string` at `s` (ABI.md §2: a `{ptr, len}` header
+// whose `ptr` addresses the object's own inline bytes).
+//
+// A NULL HEADER READS AS `""` (#1564/#1570). `runtime/root/` gives `bit_rt_print` and
+// `bit_rt_eprint` an OPTIONAL header and funnels both through its `strBytes`,
+// because a zeroed class's `string` field is the null word (SPEC §13.4) and
+// `print(z.label)` is ordinary Bit code. This pair is that funnel for this
+// module — `../root.bit`'s own `strBytes`/`strSize` are a different module's
+// privates and cannot be reached from here, so the guard is duplicated rather
+// than shared. Length 0 makes `rootWriteAll` write nothing at all, so the null
+// address is never handed to the kernel.
+export @nosplit @symbol("bit_rt_port_root_io_str_bytes_of") fn strBytesOf(s: int): int {
+  if (s == 0) {
+    return 0
+  }
+  let p = loadWord(s + strPtr)
+  return p
+}
+
+export @nosplit @symbol("bit_rt_port_root_io_str_size_of") fn strSizeOf(s: int): int {
+  if (s == 0) {
+    return 0
+  }
+  let n = loadWord(s + strLen)
+  return n
+}
