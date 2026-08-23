@@ -1,0 +1,367 @@
+// ARM64 hardware AES via the ARMv8 Cryptographic Extension: AESE/AESMC (block
+// encrypt), AESD/AESIMC (block decrypt + inverse key schedule), and AESE with
+// a zero key (key-schedule SubWord). #2522, epic #1224.
+//
+// Three pins, matching the ticket's own signatures exactly:
+//
+//   bit_rt_aes_hw_expand_key(key: int, keyBits: int, roundKeys: int)
+//   bit_rt_aes_hw_encrypt_block(roundKeys: int, rounds: int, blockIn: int, out: int)
+//   bit_rt_aes_hw_decrypt_block(roundKeys: int, rounds: int, blockIn: int, out: int)
+//
+// AES-128 and AES-256 only (AES-192 panics out of expand_key — see below).
+// Every pointer is a raw address (`int`), the same convention `cryptohw.bit`'s
+// x86 family and every other pin in this tree already uses.
+//
+// NO CALLER YET, DELIBERATELY (ticket constraint). `stdlib/crypto` cannot
+// reach a runtime primitive added after the pinned stage0 release without
+// repeating #2521's bootstrap break (see that ticket) — wiring these up is
+// #2526's job, after a release + repin. This file only has to build and link
+// for all three targets.
+//
+// THIS FILE IS PLATFORM-FREE (`scripts/g2archive.sh`'s `PLATFORM_FREE_RELS`
+// already lists the bare `cryptohw` directory, so no registration edit is
+// needed there), meaning it is compiled once per TARGET, not once per OS:
+// x86_64-linux, aarch64-linux and aarch64-macos each get their own object
+// from this same source (SPEC §11.8 — the same shape `runtime/syscalls`'s
+// `onX64()` and `../linux/cryptohw.bit`'s `bit_rt_crypto_hwcaps` already use).
+// So a single `asm` block can carry real ARM64 crypto instructions with NO
+// x64 sub-block at all (the parser and codegen both treat a missing target
+// block as zero emitted bytes — verified by reading `compiler/parserasm.bit`
+// and `compiler/lowerexpr.bit`'s `asmCodeVals`) — GUARDED so it is simply
+// never reached on x64: every exported pin below starts `if (onX64()) return`,
+// which bakes to an unconditional early return on an x86_64 build and a no-op
+// check on an aarch64 build (`onX64`'s own header explains why this is a
+// compile-time constant spelled as a runtime `if`). "Returning without
+// action" (the ticket's own words) is exactly what that early return is.
+//
+// ENCODING PROVENANCE. There is no text assembler in this compiler (§11.6):
+// the payload is pre-encoded words, hand-verified against a disassembler.
+// Every word below was produced by assembling the intended AArch64 mnemonic
+// with this Mac's own native toolchain (`as -arch arm64`) and reading the
+// encoding back with `objdump -d --triple=arm64-apple-darwin` — not
+// transcribed from memory. Re-derivable from the mnemonics in each comment.
+//
+// REGISTER CHOICE. Every asm block below uses only v0-v2 for vector work.
+// AAPCS64 makes v0-v7 caller-saved (arguments/scratch, never preserved across
+// a call) and v8-v15 CALLEE-SAVED — since these blocks are inlined directly
+// into a function body rather than called as a subroutine, and none of these
+// functions declares a float/vector local of its own, v0-v2 never alias a
+// live Bit-level value. v8-v15 are deliberately avoided so this file never
+// needs to save/restore anything (`runtime/sched/sched.bit`'s `schedSwitch`
+// is the precedent for using d8-d15 at all, and only because it IS the
+// save/restore). None of `input`/`result`/`clobber` can name a vector
+// register (§11.6's grammar only knows `x0..x30`/`sp`/`xzr`), so this
+// reasoning is the whole safety argument, the same bargain every other
+// opaque-payload `asm` block in this tree already relies on.
+//
+// KEY-SCHEDULE ALGORITHM. Textbook FIPS-197 §5.2 KeyExpansion, word-oriented,
+// mirrors `stdlib/crypto/aes.bit`'s existing (untouched) `expandKey` byte for
+// byte — RotWord + SubWord + Rcon every Nk words, plus an extra SubWord at
+// word 4 of the core for 256-bit keys — with ONE substitution: SubWord runs
+// through `hwSubWord` (AESE with a zero round key) instead of the constant-
+// time software S-box, because SubBytes is what AESE computes after an
+// XOR-with-zero (a no-op XOR) — see `hwSubWord`'s own comment for the
+// ShiftRows-cancels-under-replication argument that makes this exact.
+// `rconNext` reimplements `aes.bit`'s `xtime`-based Rcon doubling (GF(2^8),
+// reduction byte 0x1B) rather than a transcribed 10-entry table, for the same
+// reason that file avoids one: Rcon is public data, so there is no timing
+// cost to computing it, and a doubling recurrence cannot be mistyped the way
+// a literal table can.
+//
+// BLOCK CIPHER ALGORITHM. The standard ARMv8 idiom (ARM's own Cryptography
+// Extensions documentation): encrypt is (Nr-1) rounds of AESE+AESMC over
+// round keys w[0..Nr-2], then one more AESE with w[Nr-1] (no MixColumns —
+// the last full round never has one), then a plain XOR with the final round
+// key w[Nr] — exactly the ticket's own description. Decrypt uses the FIPS
+// §5.3.5 "equivalent inverse cipher": AESD+AESIMC in the same shape, but over
+// an INVERSE key schedule dw[] built once per call (`decRoundKeySchedule`):
+// dw[0] = w[Nr] and dw[Nr] = w[0] unchanged, dw[i] = AESIMC(w[Nr-i]) for the
+// interior keys — "applies AESIMC to the inverse round keys", the ticket's
+// own phrase for this exact transform.
+
+import { onX64 } from "../syscalls"
+
+// One AES SubBytes, hardware-accelerated. `w`'s low 32 bits are replicated
+// into all four 32-bit lanes of a vector register (`dup.4s v0, w0`); AESE
+// with a zeroed key (`movi.16b v1, #0`) does an XOR-with-zero (a no-op) then
+// SubBytes then ShiftRows. Because every lane started IDENTICAL, ShiftRows —
+// a per-row rotation among the four lanes — has no observable effect (each
+// row's four entries were already equal), so what comes out is exactly
+// SubBytes applied independently to each of `w`'s four bytes, still
+// replicated across all lanes; `mov.s w0, v0[0]` (UMOV, zero-extending) reads
+// lane 0 back out. Byte i of the result (bits [8i+7:8i]) is the AES S-box of
+// byte i of the input, for i in 0..3 — position-preserving, so the caller's
+// packing convention for `w` does not matter as long as it is consistent
+// between pack and unpack (see the two call sites in `rtAesHwExpandKey`).
+//
+// Encoding, `as -arch arm64` + `objdump -d --triple=arm64-apple-darwin`:
+//   dup.4s   v0, w0        4e040c00
+//   movi.16b v1, #0x0      4f00e401
+//   aese.16b v0, v1        4e284820
+//   mov.s    w0, v0[0]     0e043c00
+fn hwSubWord(w: int): int {
+  return asm {
+    arm64 {
+      0x4e040c00,
+      0x4f00e401,
+      0x4e284820,
+      0x0e043c00
+    }
+    result arm64 x0 x64 rax : int
+    input  arm64 x0 x64 rax = w
+  }
+}
+
+// One AES encrypt round: load the 16-byte state at `state` and the 16-byte
+// round key at `key`, AESE (AddRoundKey + SubBytes + ShiftRows) then AESMC
+// (MixColumns), store back to `state`. Not the final round (no MixColumns
+// there — see `hwAesRoundFinal`).
+//   ld1.16b  {v0}, [x0]    4c407000
+//   ld1.16b  {v1}, [x1]    4c407021
+//   aese.16b v0, v1        4e284820
+//   aesmc.16b v0, v0       4e286800
+//   st1.16b  {v0}, [x0]    4c007000
+fn hwAesRound(state: int, key: int) {
+  asm volatile {
+    arm64 {
+      0x4c407000,
+      0x4c407021,
+      0x4e284820,
+      0x4e286800,
+      0x4c007000
+    }
+    input   arm64 x0 x64 rax = state
+    input   arm64 x1 x64 rcx = key
+    clobber arm64 { memory }
+  }
+}
+
+// The last encrypt round: AESE (no MixColumns) then a plain XOR with the
+// final round key `xorKey` (AES's last, MixColumns-less AddRoundKey).
+//   ld1.16b  {v0}, [x0]    4c407000
+//   ld1.16b  {v1}, [x1]    4c407021
+//   aese.16b v0, v1        4e284820
+//   ld1.16b  {v2}, [x2]    4c407042
+//   eor.16b  v0, v0, v2    6e221c00
+//   st1.16b  {v0}, [x0]    4c007000
+fn hwAesRoundFinal(state: int, key: int, xorKey: int) {
+  asm volatile {
+    arm64 {
+      0x4c407000,
+      0x4c407021,
+      0x4e284820,
+      0x4c407042,
+      0x6e221c00,
+      0x4c007000
+    }
+    input   arm64 x0 x64 rax = state
+    input   arm64 x1 x64 rcx = key
+    input   arm64 x2 x64 rdx = xorKey
+    clobber arm64 { memory }
+  }
+}
+
+// One AES decrypt round: AESD (AddRoundKey + InvSubBytes + InvShiftRows) then
+// AESIMC (InvMixColumns) — the decrypt mirror of `hwAesRound`, over the
+// INVERSE key schedule (`decRoundKeySchedule`), never the forward one.
+//   ld1.16b   {v0}, [x0]   4c407000
+//   ld1.16b   {v1}, [x1]   4c407021
+//   aesd.16b  v0, v1       4e285820
+//   aesimc.16b v0, v0      4e287800
+//   st1.16b   {v0}, [x0]   4c007000
+fn hwAesDecRound(state: int, key: int) {
+  asm volatile {
+    arm64 {
+      0x4c407000,
+      0x4c407021,
+      0x4e285820,
+      0x4e287800,
+      0x4c007000
+    }
+    input   arm64 x0 x64 rax = state
+    input   arm64 x1 x64 rcx = key
+    clobber arm64 { memory }
+  }
+}
+
+// The last decrypt round: AESD (no InvMixColumns) then a plain XOR with the
+// inverse schedule's final key `xorKey` (= the ORIGINAL first forward key,
+// w[0] — FIPS §5.3.5).
+//   ld1.16b  {v0}, [x0]    4c407000
+//   ld1.16b  {v1}, [x1]    4c407021
+//   aesd.16b v0, v1        4e285820
+//   ld1.16b  {v2}, [x2]    4c407042
+//   eor.16b  v0, v0, v2    6e221c00
+//   st1.16b  {v0}, [x0]    4c007000
+fn hwAesDecRoundFinal(state: int, key: int, xorKey: int) {
+  asm volatile {
+    arm64 {
+      0x4c407000,
+      0x4c407021,
+      0x4e285820,
+      0x4c407042,
+      0x6e221c00,
+      0x4c007000
+    }
+    input   arm64 x0 x64 rax = state
+    input   arm64 x1 x64 rcx = key
+    input   arm64 x2 x64 rdx = xorKey
+    clobber arm64 { memory }
+  }
+}
+
+// `dst` (16 bytes) = AESIMC(`src`) (16 bytes) — InvMixColumns over one whole
+// round key, the transform `decRoundKeySchedule` applies to every interior
+// forward round key to build the inverse schedule.
+//   ld1.16b    {v0}, [x1]  4c407020
+//   aesimc.16b v0, v0      4e287800
+//   st1.16b    {v0}, [x0]  4c007000
+fn hwAesInvMixColumn(dst: int, src: int) {
+  asm volatile {
+    arm64 {
+      0x4c407020,
+      0x4e287800,
+      0x4c007000
+    }
+    input   arm64 x0 x64 rax = dst
+    input   arm64 x1 x64 rcx = src
+    clobber arm64 { memory }
+  }
+}
+
+// A `*byte` at raw address `addr` — the same "nil plus byte offset" idiom
+// `runtime/sched/task.bit`'s `taskAt` uses for `*i64` (§11.4: pointer
+// arithmetic off `nil` is the documented inverse of `int(p)`), specialized to
+// `byte` so the offset needs no scaling (`sizeOf(byte) == 1`).
+fn aesByteAt(addr: int): *byte {
+  let z: *byte = nil
+  return z + addr
+}
+
+// Copies 16 bytes from `src` to `dst`. Bounded by a fixed literal, never a
+// caller-supplied length.
+fn aesCopyBlock(dst: int, src: int) {
+  let i = 0
+  while (i < 16) {
+    *aesByteAt(dst + i) = *aesByteAt(src + i)
+    i = i + 1
+  }
+}
+
+// The next AES round constant: RC[j] in GF(2^8), doubling with the AES
+// reduction byte 0x1B on overflow — `stdlib/crypto/aes.bit`'s `xtime`, kept
+// as its own copy per this file's own header (Rcon is public, so there is no
+// constant-time obligation to share the branchless form).
+fn aesRconNext(r: int): int {
+  let carry = (r >> 7) & 1
+  let shifted = (r << 1) & 0xff
+  if (carry == 1) {
+    return shifted ^ 0x1b
+  }
+  return shifted
+}
+
+// `bit_rt_aes_hw_expand_key(key, keyBits, roundKeys)`: FIPS-197 KeyExpansion
+// for a 128- or 256-bit key at `key` into `roundKeys` (16*(Nr+1) bytes: 176
+// for AES-128, 240 for AES-256). See the file header for the algorithm.
+export @symbol("bit_rt_aes_hw_expand_key") fn rtAesHwExpandKey(key: int, keyBits: int, roundKeys: int) {
+  if (onX64()) {
+    return
+  }
+  let nk = 4
+  if (keyBits == 256) {
+    nk = 8
+  } else if (keyBits != 128) {
+    panic("bit_rt_aes_hw_expand_key: keyBits must be 128 or 256")
+  }
+  let nr = nk + 6
+  let nk4 = nk * 4
+  let total = 16 * (nr + 1)
+
+  let i = 0
+  while (i < nk4) {
+    *aesByteAt(roundKeys + i) = *aesByteAt(key + i)
+    i = i + 1
+  }
+
+  let rcon = 1
+  let n = nk4
+  while (n < total) {
+    let t0 = int(*aesByteAt(roundKeys + n - 4))
+    let t1 = int(*aesByteAt(roundKeys + n - 3))
+    let t2 = int(*aesByteAt(roundKeys + n - 2))
+    let t3 = int(*aesByteAt(roundKeys + n - 1))
+
+    let pos = n % nk4
+    if (pos == 0) {
+      // RotWord([t0,t1,t2,t3]) = [t1,t2,t3,t0], then SubWord, then Rcon into
+      // the new word's first byte — one hwSubWord call substitutes all four.
+      let sw = hwSubWord(t1 | (t2 << 8) | (t3 << 16) | (t0 << 24))
+      t0 = (sw & 0xff) ^ rcon
+      t1 = (sw >> 8) & 0xff
+      t2 = (sw >> 16) & 0xff
+      t3 = (sw >> 24) & 0xff
+      rcon = aesRconNext(rcon)
+    } else if (nk > 6 && pos == 16) {
+      let sw = hwSubWord(t0 | (t1 << 8) | (t2 << 16) | (t3 << 24))
+      t0 = sw & 0xff
+      t1 = (sw >> 8) & 0xff
+      t2 = (sw >> 16) & 0xff
+      t3 = (sw >> 24) & 0xff
+    }
+
+    *aesByteAt(roundKeys + n) = byte(int(*aesByteAt(roundKeys + n - nk4)) ^ t0)
+    *aesByteAt(roundKeys + n + 1) = byte(int(*aesByteAt(roundKeys + n + 1 - nk4)) ^ t1)
+    *aesByteAt(roundKeys + n + 2) = byte(int(*aesByteAt(roundKeys + n + 2 - nk4)) ^ t2)
+    *aesByteAt(roundKeys + n + 3) = byte(int(*aesByteAt(roundKeys + n + 3 - nk4)) ^ t3)
+    n = n + 4
+  }
+}
+
+// `bit_rt_aes_hw_encrypt_block(roundKeys, rounds, blockIn, out)`: one 16-byte
+// block, forward cipher. `blockIn`/`out` may be the same address.
+export @symbol("bit_rt_aes_hw_encrypt_block") fn rtAesHwEncryptBlock(roundKeys: int, rounds: int, blockIn: int, out: int) {
+  if (onX64()) {
+    return
+  }
+  aesCopyBlock(out, blockIn)
+  let round = 0
+  while (round < rounds - 1) {
+    hwAesRound(out, roundKeys + round * 16)
+    round = round + 1
+  }
+  hwAesRoundFinal(out, roundKeys + (rounds - 1) * 16, roundKeys + rounds * 16)
+}
+
+// Builds the FIPS §5.3.5 equivalent-inverse-cipher key schedule at `dst`
+// (`rounds+1` round keys, 16 bytes each) from the forward schedule at `fwd`.
+fn decRoundKeySchedule(dst: int, fwd: int, rounds: int) {
+  aesCopyBlock(dst, fwd + rounds * 16)
+  let i = 1
+  while (i < rounds) {
+    hwAesInvMixColumn(dst + i * 16, fwd + (rounds - i) * 16)
+    i = i + 1
+  }
+  aesCopyBlock(dst + rounds * 16, fwd)
+}
+
+// `bit_rt_aes_hw_decrypt_block(roundKeys, rounds, blockIn, out)`: one 16-byte
+// block, inverse cipher. `roundKeys` is the FORWARD schedule (the same one
+// `bit_rt_aes_hw_encrypt_block` consumes) — this derives the inverse schedule
+// itself, once per call, via `decRoundKeySchedule`.
+export @symbol("bit_rt_aes_hw_decrypt_block") fn rtAesHwDecryptBlock(roundKeys: int, rounds: int, blockIn: int, out: int) {
+  if (onX64()) {
+    return
+  }
+  let invKeys = []byte(16 * (rounds + 1))
+  let invBase = int(ptrOf(invKeys))
+  decRoundKeySchedule(invBase, roundKeys, rounds)
+
+  aesCopyBlock(out, blockIn)
+  let round = 0
+  while (round < rounds - 1) {
+    hwAesDecRound(out, invBase + round * 16)
+    round = round + 1
+  }
+  hwAesDecRoundFinal(out, invBase + (rounds - 1) * 16, invBase + rounds * 16)
+}

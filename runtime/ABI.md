@@ -1598,6 +1598,9 @@ defined exactly once).
 | `bit_rt_crypto_ghash_mul_hw` | `(acc0, acc1, b0, b1, h0, h1: u64, outHi: *u64) -> u64` (§21b) |
 | `bit_rt_crypto_sha256_compress_hw` | `(state: *u32, block: *byte) -> void` (§21b) |
 | `bit_rt_crypto_hwcaps` | `() -> u64` (§21c) |
+| `bit_rt_aes_hw_expand_key` | `(key: i64, keyBits: i64, roundKeys: i64) -> void` (§21d) |
+| `bit_rt_aes_hw_encrypt_block` | `(roundKeys: i64, rounds: i64, blockIn: i64, out: i64) -> void` (§21d) |
+| `bit_rt_aes_hw_decrypt_block` | `(roundKeys: i64, rounds: i64, blockIn: i64, out: i64) -> void` (§21d) |
 
 **Narrow return values.** The C ABI returns a `bool` in `al`/`w0` and leaves the
 rest of the return register **unspecified**; the same is true of any sub-word
@@ -2705,6 +2708,54 @@ bitmask. Racing initializers on the first call are harmless: every racing OS
 thread reads the identical hardware state and would cache the identical
 value, the same argument `runtime/park/darwin/wait.bit`'s cached mach
 timebase makes.
+
+---
+
+## 21d. ARM64 AES block cipher and key schedule (`runtime/cryptohw/armaes.bit`, #2522, epic #1224)
+
+```
+bit_rt_aes_hw_expand_key(key, keyBits, roundKeys)          // FIPS-197 KeyExpansion
+bit_rt_aes_hw_encrypt_block(roundKeys, rounds, blockIn, out)
+bit_rt_aes_hw_decrypt_block(roundKeys, rounds, blockIn, out)
+```
+
+AES-128 and AES-256 only (`bit_rt_aes_hw_expand_key` panics on any other
+`keyBits`); AES-192 is not implemented. Every parameter is a raw address
+(`int`) — `key`/`blockIn`/`out` point at 16-byte buffers except `key` for
+AES-256 (32 bytes), and `roundKeys` points at `16*(rounds+1)` bytes (176 for
+AES-128, 240 for AES-256), the same flat forward-schedule layout
+`stdlib/crypto/aes.bit`'s own (untouched) `expandKey` already produces.
+
+**PLATFORM-FREE, not per-OS** — unlike §21c's `bit_rt_crypto_hwcaps`, this file
+needs no OS service (no syscall, no `sysctlbyname`), only the CPU's own ARMv8
+Cryptographic Extension instructions (AESE/AESMC/AESD/AESIMC), so one source
+file is compiled once per TARGET (x86_64-linux, aarch64-linux, aarch64-macos)
+the same way `runtime/syscalls/syscalls.bit` already is. Every exported
+function starts `if (onX64()) return` — a no-op on x86_64, since Bit has no
+arch-conditional compilation (SPEC §11.8) and no ARM64 target lacks the
+extension this project supports (Apple Silicon and every aarch64-linux target
+this project builds for carry it).
+
+**NO CALLER YET.** These three pins exist so #2526 (route `stdlib/crypto`'s
+AES through them) has something to call; wiring them up hits the same
+stage0-bootstrap wall #2521 documented and needs its own release + repin.
+
+**Key schedule** is textbook FIPS-197 §5.2 KeyExpansion — RotWord, SubWord,
+Rcon every `Nk` words, plus one extra SubWord at word 4 of the core for
+256-bit keys — with SubWord computed via AESE against a zeroed round key
+rather than the software constant-time S-box: XOR-with-zero is a no-op, so
+AESE's SubBytes+ShiftRows over four IDENTICAL 32-bit lanes degenerates to
+SubBytes alone (ShiftRows permutes four equal values), giving a
+hardware-accelerated, position-preserving 4-byte S-box substitution in one
+instruction.
+
+**Block cipher** is the standard ARMv8 idiom: encrypt is `Nr-1` rounds of
+AESE+AESMC over round keys `w[0..Nr-2]`, one more AESE with `w[Nr-1]` (the
+last full round has no MixColumns), then a plain XOR with `w[Nr]`. Decrypt
+uses FIPS §5.3.5's "equivalent inverse cipher" — the same AESD+AESIMC shape,
+over an inverse schedule `dw[]` this primitive derives itself, once per call,
+from the FORWARD schedule it is handed: `dw[0] = w[Nr]`, `dw[Nr] = w[0]`
+unchanged, `dw[i] = AESIMC(w[Nr-i])` for the interior keys.
 
 ---
 
