@@ -1,0 +1,616 @@
+// `bit lsp` textDocument/formatting gate (#2336): drives the REAL self-hosted
+// `bit lsp` binary as a subprocess and asserts on its raw JSON-RPC output, the
+// same mechanics as tests/bit/lspreferences.bit (see its header) and
+// tests/bit/lspresolve.bit/tests/bit/lsplifecycle.bit — each `bit run
+// tests/bit/*.bit` is a standalone single-file program, so the small harness
+// (frame/shQuote/runLsp/...) is duplicated here rather than imported.
+//
+// THE POINT OF #2336, IN ITS OWN TITLE: the editor must format the BUFFER and
+// get a TextEdit back over LSP, not have the server rewrite the file on disk
+// behind it. Every scenario below that has a tracked on-disk file re-reads
+// that file DIRECTLY off disk (never through the LSP connection) after the
+// request completes and asserts it is byte-for-byte the pre-request content —
+// the server touching disk anywhere is a failure of the ticket regardless of
+// what the JSON-RPC reply says.
+//
+// The oracle for "correct" formatted output is the real `bit fmt <path>`
+// subprocess (compiler/fmtcmd.bit), run against a SEPARATE scratch file the
+// LSP session under test never opens — never a hand-predicted rendering of
+// fmt's house style (spec/FMT.md), so this gate cannot rot if that style
+// changes and it directly matches the ticket's own acceptance wording
+// ("byte-identical to running `bit fmt` on the same file").
+//
+// Anti-vacuity: `checkAlreadyFormattedZeroEdits` pairs its zero-edit
+// assertion with a same-session POSITIVE CONTROL that must return a nonzero
+// edit, so an empty result is a fact about that one buffer, not about a
+// handler that always answers "[]". `checkBufferReflectsUnsavedBuffer` is the
+// ticket's actual point: the buffer (via didChange) and disk are made to
+// diverge in real content, not just incidental whitespace, and the returned
+// edit must match the BUFFER's oracle output, never disk's.
+//
+// WIRED INTO `./make test` as `test-lsp-formatting` (tools/build/gates.bit,
+// tools/build/defs.bit), registered in the same commit as this file so
+// scripts/gate.sh does not see it as an unmapped tests/bit/** path.
+
+import { envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir, exists } from "std/fs"
+import { parseInt } from "std/strings"
+import { Json, jsonParse, jsonAsArray, jsonAsInt, jsonAsString, jsonGet } from "std/json"
+
+const timeoutMs: int = 20000
+
+fn failCase(msg: string) {
+  eprint("FAIL lspformatting: " + msg + "\n")
+  exit(1)
+}
+
+fn frame(body: string): string {
+  return "Content-Length: ${len(body)}\r\n\r\n" + body
+}
+
+fn mkdirQuiet(path: string) {
+  mkdir(path) catch e {
+    return
+  }
+}
+
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+fn runLsp(bin: string, scratch: string, payload: string): (string, bool) {
+  mkdirQuiet(scratch)
+  let inPath = scratch + "/in"
+  let outPath = scratch + "/out"
+  let errPath = scratch + "/err"
+  let shPath = scratch + "/w.sh"
+  writeFile(inPath, payload) catch e {
+    failCase("cannot write input payload: " + e.message())
+    return "", false
+  }
+  let script = "#!/bin/sh\nexec " +
+    shQuote(bin) +
+    " lsp < " +
+    shQuote(inPath) +
+    " > " +
+    shQuote(outPath) +
+    " 2> " +
+    shQuote(errPath) +
+    "\n"
+  writeFile(shPath, script) catch e {
+    failCase("cannot write wrapper script: " + e.message())
+    return "", false
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    failCase("cannot chmod wrapper script")
+    return "", false
+  }
+  let code = osRunBounded(shPath, timeoutMs)
+  if (code == 0 - 2) {
+    failCase("TIMED OUT after ${timeoutMs}ms (raise BIT_TEST_TIMEOUT_S)")
+    return "", false
+  }
+  if (code == 0 - 1) {
+    failCase("cannot launch wrapper script (spawn/wait failure)")
+    return "", false
+  }
+  if (code <= 0 - 100) {
+    failCase("CRASHED: killed by signal ${0 - code - 100}")
+    return "", false
+  }
+  let out = readFile(outPath) catch e {
+    ""
+  }
+  return out, true
+}
+
+// Runs the real `bit fmt <path>` (never a hand-predicted rendering of the
+// house style) and returns the resulting file content — the oracle every
+// scenario below checks its LSP response against. `path` must be a scratch
+// file the LSP session under test never opens, so the two never share state.
+fn oracleFormat(bin: string, scratch: string, path: string, content: string): (string, bool) {
+  mkdirQuiet(scratch)
+  writeFile(path, content) catch e {
+    failCase("cannot write oracle source ${path}: " + e.message())
+    return "", false
+  }
+  let shPath = scratch + "/fmt.sh"
+  let script = "#!/bin/sh\nexec " + shQuote(bin) + " fmt " + shQuote(path) + "\n"
+  writeFile(shPath, script) catch e {
+    failCase("cannot write fmt wrapper script: " + e.message())
+    return "", false
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    failCase("cannot chmod fmt wrapper script")
+    return "", false
+  }
+  let code = osRunBounded(shPath, timeoutMs)
+  if (code != 0) {
+    failCase("oracle `bit fmt ${path}` exited ${code}, expected 0")
+    return "", false
+  }
+  let out = readFile(path) catch e {
+    failCase("cannot read oracle output ${path}: " + e.message())
+    return "", false
+  }
+  return out, true
+}
+
+fn contains(haystack: string, needle: string): bool {
+  let n = len(needle)
+  if (n == 0) {
+    return true
+  }
+  let i = 0
+  while (i + n <= len(haystack)) {
+    if (haystack[i:i + n] == needle) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Splits a JSON-RPC byte stream into its `Content-Length`-delimited message
+// bodies, reading the byte count from the header rather than scanning for the
+// next frame's boundary textually — each body must be handed whole to
+// `jsonParse`, unlike tests/bit/lspreferences.bit's `resultTail`, which only
+// needs a bounded substring for a textual search.
+// The `Content-Length` digits starting at `start`, and where they end —
+// `ok` is false on no digits or an unparseable number, in which case the
+// header match at this position was a false positive and the caller should
+// resume scanning one byte later rather than stop.
+fn readContentLength(out: string, start: int): (int, int, bool) {
+  let n = len(out)
+  let j = start
+  while (j < n && out[j] >= 48 && out[j] <= 57) {
+    j = j + 1
+  }
+  if (j == start) {
+    return j, 0, false
+  }
+  let clen = parseInt(out[start:j]) catch e {
+    return j, 0, false
+  }
+  return j, clen, true
+}
+
+// The frame body of `clen` bytes past the `\r\n\r\n` separator that must
+// follow `headerEnd` — `ok` is false when the separator or the body is not
+// yet fully present in `out`, meaning the caller should stop scanning
+// entirely (the stream is incomplete here, not malformed).
+fn readFrameBody(out: string, headerEnd: int, sep: string, clen: int): (int, string, bool) {
+  let n = len(out)
+  let slen = len(sep)
+  let sepAt = headerEnd
+  while (sepAt + slen <= n && out[sepAt:sepAt + slen] != sep) {
+    sepAt = sepAt + 1
+  }
+  if (sepAt + slen > n) {
+    return n, "", false
+  }
+  let bodyStart = sepAt + slen
+  let bodyEnd = bodyStart + clen
+  if (bodyEnd > n) {
+    return n, "", false
+  }
+  return bodyEnd, out[bodyStart:bodyEnd], true
+}
+
+fn splitFrames(out: string): []string {
+  let frames = []string(0)
+  let n = len(out)
+  let header = "Content-Length: "
+  let hlen = len(header)
+  let sep = "\r\n\r\n"
+  let i = 0
+  while (i + hlen <= n) {
+    if (out[i:i + hlen] != header) {
+      i = i + 1
+      continue
+    }
+    let (digitsEnd, clen, digitsOk) = readContentLength(out, i + hlen)
+    if (!digitsOk) {
+      i = i + 1
+      continue
+    }
+    let (bodyEnd, body, frameOk) = readFrameBody(out, digitsEnd, sep, clen)
+    if (!frameOk) {
+      break
+    }
+    frames = append(frames, body)
+    i = bodyEnd
+  }
+  return frames
+}
+
+// The parsed JSON-RPC response whose `"id"` equals `id` — never a
+// notification, which carries `"method"`/`"params"` and no `"id"` at all, so
+// a formatting reply is never confused with a `publishDiagnostics`
+// notification `didOpen`/`didChange` provoke alongside it.
+fn responseFor(frames: []string, id: int, out: string): Json {
+  let i = 0
+  while (i < len(frames)) {
+    let doc = jsonParse(frames[i]) catch e {
+      i = i + 1
+      continue
+    }
+    let idOpt = jsonGet(doc, "id")
+    if (isNone(idOpt)) {
+      i = i + 1
+      continue
+    }
+    let idValOpt = jsonAsInt(unwrap(idOpt))
+    if (isNone(idValOpt)) {
+      i = i + 1
+      continue
+    }
+    if (unwrap(idValOpt) == id) {
+      return doc
+    }
+    i = i + 1
+  }
+  failCase("no JSON-RPC response found for id ${id}\n" + out)
+  return Json.JsonNull
+}
+
+// The `"result"` array of a formatting response — fails loudly if `"result"`
+// is absent or not an array, rather than reading a missing field as "zero
+// edits" (that would make a crashed/errored handler indistinguishable from a
+// correct empty answer).
+fn resultEdits(doc: Json, out: string): []Json {
+  let resultOpt = jsonGet(doc, "result")
+  if (isNone(resultOpt)) {
+    failCase("response has no \"result\" field\n" + out)
+    return []Json(0)
+  }
+  let arrOpt = jsonAsArray(unwrap(resultOpt))
+  if (isNone(arrOpt)) {
+    failCase("\"result\" is not a JSON array\n" + out)
+    return []Json(0)
+  }
+  return unwrap(arrOpt)
+}
+
+fn editNewText(edit: Json, out: string): string {
+  let ntOpt = jsonGet(edit, "newText")
+  if (isNone(ntOpt)) {
+    failCase("edit has no \"newText\" field\n" + out)
+    return ""
+  }
+  let sOpt = jsonAsString(unwrap(ntOpt))
+  if (isNone(sOpt)) {
+    failCase("edit's \"newText\" is not a JSON string\n" + out)
+    return ""
+  }
+  return unwrap(sOpt)
+}
+
+fn initReq(): string {
+  return frame(
+      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"," +
+      "\"params\":{\"processId\":null,\"rootUri\":null,\"capabilities\":{}}}",
+  )
+}
+
+fn initNotif(): string {
+  return frame("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}")
+}
+
+// Escapes `s` for embedding as a JSON string literal's body — the only bytes
+// the fixtures below ever contain are '"', '\' and '\n'.
+fn jsonEscape(s: string): string {
+  let out = ""
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == u8('"')) {
+      out = out + "\\\""
+    } else if (c == u8('\\')) {
+      out = out + "\\\\"
+    } else if (c == u8('\n')) {
+      out = out + "\\n"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn didOpen(uri: string, text: string): string {
+  return frame(
+      "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+      "\"textDocument\":{\"uri\":\"${uri}\",\"languageId\":\"bit\",\"version\":1," +
+      "\"text\":\"" +
+      jsonEscape(text) +
+      "\"}}}",
+  )
+}
+
+// A whole-document `didChange` (full sync — `contentChanges[0]` carries no
+// `range`), the shape lspserver.bit's `lspOnDidChange` reads: it stores the
+// LAST change's `text` as the new overlay verbatim.
+fn didChange(uri: string, text: string, version: int): string {
+  return frame(
+      "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{" +
+      "\"textDocument\":{\"uri\":\"${uri}\",\"version\":${version}}," +
+      "\"contentChanges\":[{\"text\":\"" +
+      jsonEscape(text) +
+      "\"}]}}",
+  )
+}
+
+fn formattingReq(id: int, uri: string): string {
+  return frame(
+      "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"textDocument/formatting\"," +
+      "\"params\":{\"textDocument\":{\"uri\":\"${uri}\"}," +
+      "\"options\":{\"tabSize\":2,\"insertSpaces\":true}}}",
+  )
+}
+
+// The capability an editor's Shift+Alt+F / editor.formatOnSave gates on
+// (ticket #2336's own repro: absent -> `-32601 method not found`).
+fn checkFormattingCapability(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/cap"
+  let payload = initReq()
+  let (out, ok) = runLsp(bin, dir, payload)
+  if (!ok) {
+    return
+  }
+  if (!contains(out, "\"documentFormattingProvider\":true")) {
+    failCase("initialize result is missing documentFormattingProvider:true\n" + out)
+    return
+  }
+  print("PASS lspformatting: initialize advertises documentFormattingProvider\n")
+}
+
+fn simpleFixture(): string {
+  return "fn addOne(x: int): int {\n  return x + 1\n}\n"
+}
+
+// An already-canonical buffer must return ZERO edits (not a no-op
+// full-document replace with identical text), paired with a same-session
+// messy sibling as a positive control so the zero-edit reply cannot be a
+// handler that always answers "[]".
+fn checkAlreadyFormattedZeroEdits(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/zero-edits"
+  mkdirQuiet(dir)
+  let (canon, ok1) = oracleFormat(
+    bin,
+    dir + "/oracle-a",
+    dir + "/oracle-a/src.bit",
+    simpleFixture(),
+  )
+  if (!ok1) {
+    return
+  }
+  // A DIFFERENT function name than canon.bit's, deliberately — both files
+  // sit in the same scratch directory and are compiled as one project, so a
+  // shared name would collide (E0042) instead of exercising formatting.
+  let messy = "fn addOneMessy(x: int): int {\n\n\n    return x + 1\n}\n"
+  let canonUri = "file://" + dir + "/canon.bit"
+  let messyUri = "file://" + dir + "/messy.bit"
+  writeFile(dir + "/canon.bit", canon) catch e {
+    failCase("cannot write canon.bit: " + e.message())
+    return
+  }
+  writeFile(dir + "/messy.bit", messy) catch e {
+    failCase("cannot write messy.bit: " + e.message())
+    return
+  }
+  let payload = initReq() +
+    initNotif() +
+    didOpen(canonUri, canon) +
+    didOpen(messyUri, messy) +
+    formattingReq(2, canonUri) +
+    formattingReq(3, messyUri)
+  let (out, ok) = runLsp(bin, dir, payload)
+  if (!ok) {
+    return
+  }
+  let frames = splitFrames(out)
+  assertZeroEditsAndControl(bin, dir, frames, out, canon, messy)
+}
+
+// Split out of checkAlreadyFormattedZeroEdits to keep it under the repo's
+// max-fn-lines limit (E0201): the two response assertions plus the disk
+// untouched checks.
+fn assertZeroEditsAndControl(
+  bin: string,
+  dir: string,
+  frames: []string,
+  out: string,
+  canon: string,
+  messy: string,
+) {
+  let canonDoc = responseFor(frames, 2, out)
+  let canonEdits = resultEdits(canonDoc, out)
+  if (len(canonEdits) != 0) {
+    failCase("already-canonical buffer: expected 0 edits, got ${len(canonEdits)}\n" + out)
+    return
+  }
+  let messyDoc = responseFor(frames, 3, out)
+  let messyEdits = resultEdits(messyDoc, out)
+  if (len(messyEdits) != 1) {
+    failCase("messy buffer (positive control): expected 1 edit, got ${len(messyEdits)}\n" + out)
+    return
+  }
+  let (messyOracle, ok2) = oracleFormat(bin, dir + "/oracle-b", dir + "/oracle-b/src.bit", messy)
+  if (!ok2) {
+    return
+  }
+  let got = editNewText(messyEdits[0], out)
+  if (got != messyOracle) {
+    failCase("messy buffer's edit does not match the `bit fmt` oracle\n---got---\n${got}\n---oracle---\n${messyOracle}")
+    return
+  }
+  let diskCanon = readFile(dir + "/canon.bit") catch e {
+    failCase("cannot re-read canon.bit off disk: " + e.message())
+    return
+  }
+  let diskMessy = readFile(dir + "/messy.bit") catch e {
+    failCase("cannot re-read messy.bit off disk: " + e.message())
+    return
+  }
+  if (diskCanon != canon || diskMessy != messy) {
+    failCase("a tracked file changed on disk after a formatting request — the server wrote a file")
+    return
+  }
+  print("PASS lspformatting: an already-canonical buffer returns zero edits; a messy sibling returns one, byte-identical to `bit fmt`\n")
+}
+
+fn divergentFixtures(): (string, string) {
+  let onDisk = "fn addTwo(a: int, b: int): int {\n  return a + b\n}\n"
+  let inBuffer = "fn addTwo(a: int, b: int): int {\n\n\n    return a + b + 1\n}\n"
+  return onDisk, inBuffer
+}
+
+// THE POINT OF THIS TICKET: didChange diverges the buffer from disk in real
+// CONTENT (not just incidental whitespace fmt would eat either way), and the
+// returned edit must reflect the unsaved buffer, byte-identical to `bit fmt`
+// run on it — never the last-saved disk content, and disk must stay untouched
+// no matter what the reply says.
+fn checkBufferReflectsUnsavedBuffer(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/unsaved"
+  mkdirQuiet(dir)
+  let (onDiskRaw, inBuffer) = divergentFixtures()
+  let (onDisk, ok1) = oracleFormat(
+    bin,
+    dir + "/oracle-disk",
+    dir + "/oracle-disk/src.bit",
+    onDiskRaw,
+  )
+  if (!ok1) {
+    return
+  }
+  let path = dir + "/live.bit"
+  let uri = "file://" + path
+  writeFile(path, onDisk) catch e {
+    failCase("cannot write live.bit: " + e.message())
+    return
+  }
+  // didOpen mirrors disk exactly, as a real editor does on open; didChange
+  // then diverges the buffer from disk WITHOUT a save.
+  let payload = initReq() +
+    initNotif() +
+    didOpen(uri, onDisk) +
+    didChange(uri, inBuffer, 2) +
+    formattingReq(2, uri)
+  let (out, ok) = runLsp(bin, dir, payload)
+  if (!ok) {
+    return
+  }
+  let frames = splitFrames(out)
+  assertReflectsBuffer(bin, dir, frames, out, path, onDisk, inBuffer)
+}
+
+// Split out of checkBufferReflectsUnsavedBuffer to keep it under E0201.
+fn assertReflectsBuffer(
+  bin: string,
+  dir: string,
+  frames: []string,
+  out: string,
+  path: string,
+  onDisk: string,
+  inBuffer: string,
+) {
+  let doc = responseFor(frames, 2, out)
+  let edits = resultEdits(doc, out)
+  if (len(edits) != 1) {
+    failCase("expected exactly 1 edit reflecting the unsaved buffer, got ${len(edits)}\n" + out)
+    return
+  }
+  let (bufferOracle, ok2) = oracleFormat(
+    bin,
+    dir + "/oracle-buf",
+    dir + "/oracle-buf/src.bit",
+    inBuffer,
+  )
+  if (!ok2) {
+    return
+  }
+  if (bufferOracle == onDisk) {
+    failCase("fixture is not a discriminator: the buffer's canonical form equals disk's")
+    return
+  }
+  let got = editNewText(edits[0], out)
+  if (got != bufferOracle) {
+    failCase("returned edit does not match `bit fmt` on the UNSAVED BUFFER\n---got---\n${got}\n---want---\n${bufferOracle}")
+    return
+  }
+  if (got == onDisk) {
+    failCase("returned edit matches on-disk content instead of the unsaved buffer")
+    return
+  }
+  let diskNow = readFile(path) catch e {
+    failCase("cannot re-read live.bit off disk: " + e.message())
+    return
+  }
+  if (diskNow != onDisk) {
+    failCase("live.bit changed on disk after a formatting request — the server rewrote the file behind the editor\n---before---\n${onDisk}\n---after---\n${diskNow}")
+    return
+  }
+  print("PASS lspformatting: the returned edit reflects the unsaved BUFFER, byte-identical to `bit fmt` on it, and disk is never touched\n")
+}
+
+// A syntactically invalid buffer must decline to format (0 edits), never
+// return diagnostics text as if it were source, and must never touch disk.
+fn checkInvalidBufferDeclined(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/invalid"
+  mkdirQuiet(dir)
+  let valid = "fn keep(): int {\n  return 1\n}\n"
+  let broken = "fn broken() {\n  let x = 1\n" // unterminated block: parse error
+  let path = dir + "/live.bit"
+  let uri = "file://" + path
+  writeFile(path, valid) catch e {
+    failCase("cannot write live.bit: " + e.message())
+    return
+  }
+  let payload = initReq() + initNotif() + didOpen(uri, broken) + formattingReq(2, uri)
+  let (out, ok) = runLsp(bin, dir, payload)
+  if (!ok) {
+    return
+  }
+  let frames = splitFrames(out)
+  let doc = responseFor(frames, 2, out)
+  let edits = resultEdits(doc, out)
+  if (len(edits) != 0) {
+    failCase("a syntactically invalid buffer must decline (0 edits), got ${len(edits)}\n" + out)
+    return
+  }
+  let diskNow = readFile(path) catch e {
+    failCase("cannot re-read live.bit off disk: " + e.message())
+    return
+  }
+  if (diskNow != valid) {
+    failCase("live.bit changed on disk after formatting an invalid buffer — corruption risk\n---before---\n${valid}\n---after---\n${diskNow}")
+    return
+  }
+  print("PASS lspformatting: a syntactically invalid buffer declines to format (0 edits) and disk is untouched\n")
+}
+
+fn main() {
+  let bin = envOr("BIT", "bit-out/bin/bit")
+  if (!exists(bin)) {
+    failCase("BIT='${bin}' does not exist — refusing to guess")
+    return
+  }
+  let scratchRoot = envOr("TMPDIR", "/tmp") + "/bit-lspformatting-${timeUnixNs()}"
+  mkdirQuiet(scratchRoot)
+  checkFormattingCapability(bin, scratchRoot)
+  checkAlreadyFormattedZeroEdits(bin, scratchRoot)
+  checkBufferReflectsUnsavedBuffer(bin, scratchRoot)
+  checkInvalidBufferDeclined(bin, scratchRoot)
+  print("lspformatting: all scenarios passed\n")
+}
