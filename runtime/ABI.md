@@ -1605,6 +1605,7 @@ defined exactly once).
 | `bit_rt_aes_hw_expand_key` | `(key: i64, keyBits: i64, roundKeys: i64) -> void` (§21d) |
 | `bit_rt_aes_hw_encrypt_block` | `(roundKeys: i64, rounds: i64, blockIn: i64, out: i64) -> void` (§21d) |
 | `bit_rt_aes_hw_decrypt_block` | `(roundKeys: i64, rounds: i64, blockIn: i64, out: i64) -> void` (§21d) |
+| `bit_rt_sha256_hw_blocks` | `(state: i64, data: i64, blocks: u64) -> void` (§21f) |
 
 **Narrow return values.** The C ABI returns a `bool` in `al`/`w0` and leaves the
 rest of the return register **unspecified**; the same is true of any sub-word
@@ -2875,6 +2876,56 @@ bits). One round always leaves a small residue (degree up to 133); a second,
 identical round always finishes it — proved empirically (thousands of random
 trials, always exactly 0, 1 or 2 rounds, never 3), not derived from a
 citation.
+
+---
+
+## 21f. ARM64 SHA-256 compression (`runtime/cryptohw/armsha256.bit`, #2524, epic #1224)
+
+```
+bit_rt_sha256_hw_blocks(state, data, blocks)   // fold `blocks` 64-byte blocks into state
+```
+
+`state`/`data` are raw addresses (`int`); `blocks` a `u64` count. `state`
+points at 8 running `u32` words (a..h) in the SAME native machine-word layout
+`stdlib/crypto/sha256.bit`'s own `state: []u32` field already has — not a
+serialized byte order — updated in place. `data` points at `64*blocks` bytes
+of message, read big-endian per FIPS 180-4's own convention.
+`bit_rt_sha256_hw_blocks` implements the same recurrence
+`stdlib/crypto/sha256.bit`'s software `compress` does, once per 64-byte block,
+in order.
+
+**PLATFORM-FREE**, same reasoning as §21d/§21e — one source file per TARGET,
+the exported function starts `if (onX64()) return`, and it also calls
+`sha256RequireHwSupport` (bit 2, SHA2, of `bit_rt_crypto_hwcaps()`) before
+issuing SHA256H/SHA256H2/SHA256SU0/SHA256SU1, for the same "optional
+extension, SIGILL otherwise" reason §21d documents for AES — the SHA-2
+extension is a separate ARMv8 Cryptographic Extension feature bit from both
+AES and PMULL, and is likewise optional in the base architecture.
+
+**NO CALLER YET**, same as §21d/§21e — this pin exists for a later ticket to
+wire `stdlib/crypto/sha256.bit`'s `compress` through.
+
+**The algorithm** is the standard ARMv8 crypto-extension SHA-256 sequence:
+per 64-byte block, `REV32` the four loaded message words into big-endian
+32-bit words, then 16 "quad rounds" — `SHA256SU0`+`SHA256H`+`SHA256H2`+
+`SHA256SU1` for the first 12 quads (rounds 0-47, extending the message
+schedule from `W[16]` through `W[63]`), then `SHA256H`+`SHA256H2` alone for
+the last 3 quads (rounds 48-63, no further schedule words needed past
+`W[63]`) — finishing with the pre-block state fed back in
+(`state += saved_state`, FIPS 180-4 §6.2.2 step 4). `SHA256H` updates the
+`{a,b,c,d}` half of the working state from the OLD `{e,f,g,h}` half;
+`SHA256H2` updates `{e,f,g,h}` from the `{a,b,c,d}` half AS IT WAS BEFORE
+`SHA256H` ran, which is why each quad round saves a copy of the pre-round
+`{a,b,c,d}` register before calling `SHA256H` and hands that saved copy to
+`SHA256H2`. This was validated two independent ways before any hex word was
+hand-encoded: (1) the same instruction sequence expressed as ARM Neon C
+intrinsics (`vsha256hq_u32` etc.), compiled by this Mac's own clang and
+executed on this Mac's real SHA2-capable hardware, checked against
+`hashlib.sha256` (FIPS 180-4 test vectors plus block-boundary edge cases);
+(2) the hand-assembled `.s` translation of that identical sequence — the one
+transcribed into `armsha256.bit` — independently linked and run against the
+same vector set with the same result. Full harness and vector list on smash
+#2524.
 
 ---
 
