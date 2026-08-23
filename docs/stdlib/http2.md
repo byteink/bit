@@ -702,7 +702,7 @@ Run the client side of the connection: send the preface and our SETTINGS over
 `roundTrip`.
 
 `deadlineNs` bounds the wait for the peer's opening SETTINGS - an absolute
-monotonic nanosecond deadline (`std/time`'s `monotonic()` plus a budget), or
+monotonic nanosecond deadline (`std/time`'s `monotonic().ns` plus a budget), or
 `0` for no bound. Fails if the connection tears down before SETTINGS arrives,
 or if the deadline elapses first - either way before this function returns, so
 there is never a `Conn` left half-built. Pass the same deadline `t`'s own
