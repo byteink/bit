@@ -1,0 +1,225 @@
+// compiler/pmcliwhy.bit — `bit why <name>` (#3511): the path(s) from this
+// project's own bit.json to a dependency, walking `LockEntry.requires`
+// (compiler/pmlock.bit) — every already-locked package's own transitive
+// requirements, recorded verbatim at resolve time (#2251, #2366) so this
+// needs no re-fetch and no re-resolution, only bit.lock's own bytes.
+//
+// Deferred from #2271 (`bit list`/`bit doc <name>`), whose own "smallest
+// first" list left this for later: #2271's agent confirmed `LockEntry.requires`
+// already retains everything a real path needs, so this is an output
+// problem over already-resolved data, not a resolver change.
+//
+// Same module as pmclilist.bit/pmcliup.bit/pmcli.bit/projectpkg.bit:
+// `projectDeps`, `DepSpecNamed`, `checkManifestExists`, `loadLockEntries`,
+// `manifestLockProblem`, `pmIsHelpFlag`, `LockEntry`, `LockRequire` and
+// `pmListSortDeps` are all visible here unqualified — importing any of them
+// again would be `E0042 already declared in this scope`.
+//
+// TWO deliberately different failures: a name bit.lock has never heard of
+// at all (`printWhy`'s first branch) versus a name bit.lock DOES have an
+// entry for but that no chain from bit.json actually reaches (`printWhy`'s
+// second branch, an "orphan" entry — a hand-edited bit.lock, or one gone
+// stale). A single "not found" for both would be the kind of quiet lie
+// #3511's own ticket calls out.
+
+// `bit why [--help] <name>`. Returns the process exit code: 2 on a usage
+// error, 1 when there is no project here, bit.lock disagrees with bit.json,
+// `name` has no bit.lock entry at all, or it has one but no dependency
+// chain from bit.json reaches it; 0 on success, printing every path found.
+fn whyCmd(a: []string): int {
+  if (len(a) > 2 && pmIsHelpFlag(a[2])) {
+    print(pmWhyUsage)
+    return 0
+  }
+  if (len(a) < 3) {
+    eprint("bit why: missing package name\n")
+    eprint(pmWhyUsage)
+    return 2
+  }
+  if (len(a) > 3) {
+    eprint("bit why: unexpected argument '${a[3]}'\n")
+    eprint(pmWhyUsage)
+    return 2
+  }
+
+  let rootDir = "."
+  // The same refusal `bit add`/`bit up`/`bit remove`/`bit list` give
+  // outside a project (#2751, #2271): a package query with no bit.json to
+  // query is a usage error, not silent empty output — and, since nothing
+  // below this ever writes, never any debris either.
+  checkManifestExists(rootDir) catch e {
+    eprint("bit why: ${e.message()}\n")
+    return 1
+  }
+
+  let (lockEntries, lockErr) = loadLockEntries(rootDir)
+  if (lockErr != "") {
+    // `lockErr` (readLock, pmlock.bit) already reads "bit.lock: malformed
+    // JSON: <path>" — no second "bit.lock: " prefix here.
+    eprint("bit why: ${lockErr}\n")
+    return 1
+  }
+  let problem = manifestLockProblem(rootDir, lockEntries, lockErr)
+  if (problem != "") {
+    eprint("bit why: ${problem}\n")
+    return 1
+  }
+  let deps = projectDeps(rootDir) catch e {
+    eprint("bit why: ${e.message()}\n")
+    return 1
+  }
+
+  return printWhy(a[2], deps, lockEntries)
+}
+
+// Split out of `whyCmd` so the not-found/orphan/success three-way split has
+// its own small branch count rather than adding to the argument-parsing and
+// manifest-loading branches already counted there (E0204 max-complexity).
+fn printWhy(name: string, deps: []DepSpecNamed, lockEntries: map<string, LockEntry>): int {
+  let (_, locked) = lockEntries[name]
+  if (!locked) {
+    eprint("bit why: \"${name}\" is not a dependency of this project (no bit.lock entry)\n")
+    return 1
+  }
+
+  let paths = whyPaths(whyRootNames(pmListSortDeps(deps)), lockEntries, name)
+  if (len(paths) == 0) {
+    eprint("bit why: \"${name}\" is locked but unreachable from any dependency in bit.json — an orphan bit.lock entry; run `bit up` to relock\n")
+    return 1
+  }
+  let i = 0
+  while (i < len(paths)) {
+    print(pmWhyPathText(paths[i]) + "\n")
+    i = i + 1
+  }
+  return 0
+}
+
+fn whyRootNames(deps: []DepSpecNamed): []string {
+  let out = []string(0)
+  let i = 0
+  while (i < len(deps)) {
+    out = append(out, deps[i].name)
+    i = i + 1
+  }
+  return out
+}
+
+const pmWhyUsage = "usage: bit why <name>\n" +
+  "  Prints every path from this project's bit.json to <name>, walking\n" +
+  "  bit.lock's own recorded requirement graph. Fails if there is no\n" +
+  "  bit.json here, if bit.lock disagrees with it, if <name> has no\n" +
+  "  bit.lock entry at all, or if it has one but no dependency chain from\n" +
+  "  bit.json actually reaches it.\n"
+
+// One path from the project root down to (and including) the package `bit
+// why` was asked about, in order.
+class WhyPath {
+  names: []string,
+}
+
+// State threaded through `whyWalk` unchanged at every level — bundled into
+// one class rather than three more parameters, past which "the call site
+// stops being readable and the arguments want to be a class" (spec/LINT.md
+// E0202, max 5 params; `whyWalk` already has 4 without this).
+class WhyWalkCtx {
+  lockEntries: map<string, LockEntry>,
+  target: string,
+  // The hard ceiling on path length: every entry in bit.lock plus the root
+  // itself, the most distinct names a SIMPLE path can ever visit. `whyWalk`
+  // already refuses to revisit a name already on the current path, so a
+  // legal path can never reach this depth — this is a second, independent,
+  // statically-checked bound (Power of 10: every recursion carries a
+  // provable bound, not just an argument for why one should exist), the
+  // same shape `compiler/parser.bit`'s `maxParseDepth` and
+  // `compiler/optinline.bit`'s `maxInlineDepth` already use for their own
+  // recursions over data that can itself contain a cycle.
+  depthCap: int,
+}
+
+// Every path from one of `roots` (the project's own direct dependencies) to
+// `target`, walking `LockEntry.requires`. Depth-first; a name already on
+// the CURRENT path is never revisited (`whyWalk`'s `whyPathHas` check), so a
+// `requires` cycle cannot loop this forever — the search space is exactly
+// the simple paths through a graph of `len(lockEntries) + 1` names, both
+// finite and, per `WhyWalkCtx.depthCap`'s own comment, doubly bounded.
+fn whyPaths(roots: []string, lockEntries: map<string, LockEntry>, target: string): []WhyPath {
+  let ctx = WhyWalkCtx{ lockEntries: lockEntries, target: target, depthCap: len(lockEntries) + 1 }
+  let out = []WhyPath(0)
+  let i = 0
+  while (i < len(roots)) {
+    out = whyWalk(out, ctx, []string(0), roots[i])
+    i = i + 1
+  }
+  return out
+}
+
+// Extends `path` with `name`: if `name` is the target, records the
+// completed path into `out`; otherwise recurses into `name`'s own
+// `requires`, skipping any child already on `path` (cycle avoidance) and
+// refusing to extend past `ctx.depthCap` (the defensive ceiling this can
+// structurally never reach — see `WhyWalkCtx.depthCap`'s comment).
+fn whyWalk(out: []WhyPath, ctx: WhyWalkCtx, path: []string, name: string): []WhyPath {
+  if (len(path) >= ctx.depthCap) {
+    return out
+  }
+  let extended = whyPathAppend(path, name)
+  if (name == ctx.target) {
+    out = append(out, WhyPath{ names: extended })
+    return out
+  }
+  let (entry, found) = ctx.lockEntries[name]
+  if (!found) {
+    return out
+  }
+  let i = 0
+  while (i < len(entry.requires)) {
+    let child = entry.requires[i].name
+    if (!whyPathHas(extended, child)) {
+      out = whyWalk(out, ctx, extended, child)
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// A copy-then-append, never a plain `append(path, name)`: `path` is reused
+// across every sibling in `whyWalk`'s own loop above, and `append` aliases
+// its backing array when there is spare capacity — writing this element in
+// place would corrupt an already-recorded `WhyPath.names` sharing that same
+// backing array the moment a second child is appended (the exact trap
+// documented against `append` project-wide: never append onto a slice a
+// caller reuses).
+fn whyPathAppend(path: []string, name: string): []string {
+  let out = []string(0)
+  let i = 0
+  while (i < len(path)) {
+    out = append(out, path[i])
+    i = i + 1
+  }
+  return append(out, name)
+}
+
+fn whyPathHas(path: []string, name: string): bool {
+  let i = 0
+  while (i < len(path)) {
+    if (path[i] == name) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// "root -> libtop -> textutil" — the literal word "root" stands for the
+// project's own bit.json, never a real package name, so a chain always
+// reads as a path FROM the manifest rather than a bare list of names.
+fn pmWhyPathText(p: WhyPath): string {
+  let out = "root"
+  let i = 0
+  while (i < len(p.names)) {
+    out = out + " -> " + p.names[i]
+    i = i + 1
+  }
+  return out
+}

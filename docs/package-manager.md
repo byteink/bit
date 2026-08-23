@@ -1,8 +1,9 @@
 # Package Manager
 
 Bit resolves third-party dependencies through `bit add`/`bit up`/`bit remove`,
-a `bit.json` manifest, and a machine-generated `bit.lock`. `bit list` reads
-that graph back without opening either file by hand. (Spec: §17.7.)
+a `bit.json` manifest, and a machine-generated `bit.lock`. `bit list` and
+`bit why` read that graph back without opening either file by hand. (Spec:
+§17.7.)
 
 **v1 is git-URL only.** There is no hosted registry, no package name
 namespace, and no server. `bit add github.com/owner/repo@v1.2.3` clones that
@@ -226,6 +227,50 @@ Fails (exit 1) with no `bit.json` here, the same way `bit add`/`bit up` do
 outside a project; and fails the same way `bit doc`/`bit check`/`bit build`
 already do when `bit.json` and `bit.lock` disagree, rather than printing
 `bit.lock`'s possibly-stale answer as though it were still current.
+
+## `bit why`
+
+```
+bit why <name>
+```
+
+Prints every path from this project's `bit.json` to `<name>`, walking
+`bit.lock`'s own recorded `requires` graph - no re-resolution, no network,
+just the bytes `bit add`/`bit up` already wrote. If `<name>` is reachable
+more than one way, every path is printed, one per line: a diamond (two
+direct dependencies that both transitively require the same package) is
+exactly the case this command exists for.
+
+```console
+$ bit why streambuf
+root -> quicwire -> streambuf
+$ bit why quicwire
+root -> quicwire
+```
+
+`root` always stands for this project's own `bit.json`; it is never a real
+package name, so a chain always reads as a path *from* the manifest, not a
+bare list of names.
+
+Two different failures, each a distinct message and exit 1, worth telling
+apart:
+
+```console
+$ bit why nosuchpkg
+bit why: "nosuchpkg" is not a dependency of this project (no bit.lock entry)
+$ bit why orphanedpkg
+bit why: "orphanedpkg" is locked but unreachable from any dependency in bit.json — an orphan bit.lock entry; run `bit up` to relock
+```
+
+The first is a name `bit.lock` has never heard of. The second is a name
+`bit.lock` *does* have an entry for, but no chain from `bit.json` actually
+reaches it - an orphan entry, left behind by a hand-edited `bit.lock` or one
+gone stale relative to `bit.json`. A single "not found" answer for both
+would hide which fix applies: adding the dependency, versus running `bit up`
+to relock.
+
+Fails (exit 1) with no `bit.json` here, the same way `bit list` does outside
+a project, and the same way when `bit.json` and `bit.lock` disagree.
 
 ## `bit.lock`
 
