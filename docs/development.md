@@ -393,6 +393,27 @@ line-1 directive selects the mode — `// run` (execute, compare stdout),
 `// panic` (must exit 2, compare stderr), `// error` (expect diagnostics),
 `// fmt` (canonicalization), `// types` (inferred-type dump), `// lint`.
 
+**A `diffimports` guard (#1436, comparing the seed's and self-hosted compiler's
+undefined-symbol sets for an `extern fn` colliding with a predeclared builtin)
+was RETIRED, not ported, when the Zig seed was deleted (#2359).** The defect it
+caught — self-hosted `lowerCall`/`checkCall`/`vCall`/`vUnmanagedBuiltin`
+dispatching on a callee's raw source text before its resolved declaration, so a
+user's own `close`/`timeMonoNs`/`fsClose`/… silently lost to the ~70-name
+predeclared list — was fixed at all four sites (`3ca737c`) and is covered by
+`tests/cases/run_shadow_predeclared.bit` (part of `test-golden`, in the
+mandatory suite), which exercises one name per resolution site under the same
+precedence check. `extern fn` declarations are not an independent code path
+that could regress without also tripping that golden:
+`compiler/checkbind.bit`'s `collectExternFnDecl` records an extern's signature
+in the exact same `c.funcDecls`/`c.funcResults` maps `collectFuncDecl` uses for
+a regular function ("so call sites type-check through the ordinary path"), and
+`compiler/lowercall.bit`'s `lowerCall` resolves both through the identical
+`funcRefAt(...).decl != 0` / `resolveCallTarget` branch, above the builtin
+cascade. The two fixtures this guard used to build
+(`tests/importsets/{externbuiltin,externplain}/m.bit`) were deleted rather than
+left as an orphan nothing referenced — re-verified building and running
+correctly with a self-hosted `bit` before deletion.
+
 **What the differentials assert.** The fifteen `scripts/selfhost-diff*.sh` once
 diffed a separately-implemented bootstrap compiler against the Bit compiler, so
 a green diff meant the two disagreed on nothing. The oracle is now the
