@@ -1,0 +1,392 @@
+// tools/fuzz/odiff.bit — for each generated program, compile it once with
+// `--no-optimize` and once with the default optimizer, run both binaries,
+// and fail on ANY divergence between the two (#2607, epic #1907).
+//
+// FLAG SPELLING (checked live before writing this file, not read off the
+// ticket): there is no `-O0`/`-O1` — `./bit-out/bin/bit build --help` prints
+// `--no-optimize    skip the optimizer pass (raw lowering, unoptimized
+// codegen)` and nothing else that varies optimization level. `--no-optimize`
+// landed in #3535 (`06a20a66`, merged `fa12c0af`) specifically to unblock
+// this ticket: `compiler/build.bit:256`/`:344` both skip the single
+// `optimizeModule` call when it is set, otherwise run its full 5-pass
+// pipeline unconditionally. So the two sides of this differential are
+// "raw lowering" (`--no-optimize`, called "O0" below purely as a label to
+// match the ticket's required `O0exit=`/`O1exit=` output fields) and
+// "the optimizer's fixed pipeline" (default, called "O1") — neither
+// corresponds to an actual `-Ox` level; there is only one such level.
+//
+// CLASS OF BUG THIS DIFFERENTIAL CANNOT SEE: both sides share the same
+// front end, checker and lowerer — only whether `optimizeModule` runs at
+// all differs between them. A bug in parsing, type-checking, raw lowering,
+// or a codegen bug present identically at both levels (never introduced or
+// removed by any of the 5 optimizer passes) is invisible to this
+// differential, same as it would be to any A/B comparison where both sides
+// share the buggy component. `tools/fuzz/selfcheck.bit` (#2606) already
+// covers "is the DEFAULT build's answer right" via genprog.bit's own
+// self-checking oracle; this file covers a disjoint question — "do the two
+// optimization levels of THIS SAME COMPILER agree with each other" — which
+// catches a bug the optimizer introduces (or a bug raw lowering has that
+// optimization happens to paper over) even when neither single level's
+// answer can be independently verified as "correct" some other way.
+//
+// Drives tools/fuzz/genprog.bit (#2605) exactly as selfcheck.bit does: one
+// generated program per seed, written once to $TMPDIR and compiled twice.
+//
+// Run: `bit run tools/fuzz/odiff.bit -- --seed <n> --count <n>`.
+//
+//   --seed <n>   first seed to test     (default 1)
+//   --count <n>  how many seeds to test  (default 100)
+//
+// For each seed: generate the source once, build it with `--no-optimize`
+// to one path and with no flag to another, run both binaries (each bounded
+// at 30s — a run that outlives the bound is killed and its exit code reads
+// as -2, `osRunBounded`'s own timeout sentinel, ABI.md §19; a build that
+// itself fails or times out is folded into the same "exit" field using the
+// build's own exit code, since a build divergence between the two flag sets
+// is exactly the kind of bug this file exists to catch, not a harness
+// error). A mismatch is ANY of: stdout differs, stderr differs, exit code
+// differs, or either exit code is non-zero (never "no crash" as the pass
+// condition — epic #1907's constraint; #1857 was a silent wrong-answer bug
+// that a crash-only oracle would have missed). On the first mismatch,
+// prints exactly one line to stderr:
+//
+//   FAIL seed=<n> O0exit=<a> O1exit=<b> repro: bit run tools/fuzz/genprog.bit -- --seed <n>
+//
+// followed by the first differing line of combined stdout+stderr, prefixed
+// `O0: `/`O1: ` — or, in the corner case where a mismatch is triggered
+// purely by matching-but-nonzero exit codes with byte-identical output on
+// both sides (both sides hit the identical bug — not a divergence, but
+// still required to FAIL by the ticket's "either exits non-zero" rule),
+// the printed pair is each side's own `<exit=N>` marker instead, since no
+// line-level difference exists to show. Exits 1 on any mismatch.
+//
+// On full success: `PASS: <count> programs, 0 mismatches (seed=<start>)`,
+// exit 0.
+//
+// Uses the compiler binary named by the `BIT` environment variable, falling
+// back to `./bit-out/bin/bit`. Every generated program and every compiled
+// artifact is written under `$TMPDIR` (never inside the repo), in a
+// directory unique to this run.
+
+import { args, envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir } from "std/fs"
+import { parseInt, split } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// --- bounds (Power of 10 rule 2: every loop and every subprocess wait
+// below is statically bounded) -----------------------------------------
+
+const maxCount: int = 10000
+const runTimeoutMs: int = 30000
+const compileTimeoutMs: int = 60000
+const genTimeoutMs: int = 30000
+
+// osRunBounded's own timeout sentinel (ABI.md §19) — reused here as the
+// exit code recorded for a run that had to be killed, so a hang is visible
+// directly in O0exit=/O1exit= without a separate output field.
+const timeoutExitSentinel: int = -2
+
+// --- failure -------------------------------------------------------------
+
+fn die(msg: string) {
+  eprint("${msg}\n")
+  exit(1)
+}
+
+// --- argv ------------------------------------------------------------------
+
+class Args {
+  seed: int,
+  count: int,
+}
+
+fn usageFail() {
+  eprint("usage: odiff [--seed <n>] [--count <n>]\n")
+  exit(2)
+}
+
+fn parseIntArg(s: string, flag: string): int {
+  return parseInt(s) catch _ {
+    eprint("odiff: ${flag} value '${s}' is not an integer\n")
+    exit(2)
+    0
+  }
+}
+
+fn nextArg(a: []string, i: int): int {
+  usageFail()
+  return i + 1
+}
+
+fn parseArgs(): Args {
+  let a = args()
+  let seed = 1
+  let count = 100
+  let i = 1
+  while (i < len(a)) {
+    if (a[i] == "--seed" && i + 1 < len(a)) {
+      seed = parseIntArg(a[i + 1], "--seed")
+      i = i + 2
+    } else if (a[i] == "--count" && i + 1 < len(a)) {
+      count = parseIntArg(a[i + 1], "--count")
+      i = i + 2
+    } else {
+      i = nextArg(a, i)
+    }
+  }
+  validateCount(count)
+  return Args{ seed: seed, count: count }
+}
+
+// A missing --count is a fine 0 to allow through argument parsing above, but
+// a green "PASS: 0 programs, 0 mismatches" is exactly the vacuous-report
+// shape this project refuses elsewhere — validated here, not merely
+// defaulted.
+fn validateCount(count: int) {
+  if (count <= 0) {
+    die("odiff: --count must be > 0; 0 would report a green run of zero programs")
+  }
+  if (count > maxCount) {
+    die("odiff: --count ${count} exceeds the ${maxCount} ceiling")
+  }
+}
+
+// --- subprocess plumbing ----------------------------------------------------
+//
+// `osRunBounded` execs a path directly with no argv of its own (ABI.md
+// §19), so every command line below is a generated `#!/bin/sh` wrapper —
+// the only way to bound a wait AND redirect stdout/stderr to a file at
+// once.
+
+fn writeExecScript(path: string, cmdLine: string) {
+  writeFile(path, "#!/bin/sh\nexec ${cmdLine}\n") catch e {
+    die("odiff: write ${path}: ${e.message()}")
+  }
+  if (fsChmod(path, 493) != 0) {
+    die("odiff: chmod +x failed: ${path}")
+  }
+}
+
+// One optimization level's full set of scratch paths: its own binary, its
+// own build script/log, and its own run script/stdout/stderr — so the two
+// sides of a seed never share a path and cannot clobber each other.
+class SidePaths {
+  exePath: string,
+  compileScript: string,
+  compileLog: string,
+  runScript: string,
+  outPath: string,
+  errPath: string,
+}
+
+class Paths {
+  genExe: string,
+  srcPath: string,
+  genScript: string,
+  genErr: string,
+  o0: SidePaths,
+  o1: SidePaths,
+}
+
+class RunResult {
+  exitCode: int,
+  stdout: string,
+  stderr: string,
+}
+
+// Builds tools/fuzz/genprog.bit ONCE (always at the default optimization
+// level — genprog.bit itself is not under test here). A failure here is
+// this harness's own setup breaking, not a finding, hence `die`.
+fn buildGenerator(bin: string, workDir: string): string {
+  let genExe = "${workDir}/genprog"
+  let buildLog = "${workDir}/genprog-build.log"
+  let script = "${workDir}/genprog-build.sh"
+  writeExecScript(
+    script,
+    "\"${bin}\" build tools/fuzz/genprog.bit -o \"${genExe}\" >\"${buildLog}\" 2>&1",
+  )
+  let rc = osRunBounded(script, compileTimeoutMs)
+  if (rc != 0) {
+    die("odiff: failed to build tools/fuzz/genprog.bit (rc=${rc}); see ${buildLog}")
+  }
+  return genExe
+}
+
+fn setupSide(workDir: string, tag: string): SidePaths {
+  return SidePaths{
+    exePath: "${workDir}/prog-${tag}",
+    compileScript: "${workDir}/compile-${tag}.sh",
+    compileLog: "${workDir}/compile-${tag}.log",
+    runScript: "${workDir}/run-${tag}.sh",
+    outPath: "${workDir}/prog-${tag}.out",
+    errPath: "${workDir}/prog-${tag}.err",
+  }
+}
+
+fn setupPaths(workDir: string, genExe: string): Paths {
+  return Paths{
+    genExe: genExe,
+    srcPath: "${workDir}/prog.bit",
+    genScript: "${workDir}/gen.sh",
+    genErr: "${workDir}/gen.err",
+    o0: setupSide(workDir, "o0"),
+    o1: setupSide(workDir, "o1"),
+  }
+}
+
+// --- per-seed generate/build/run --------------------------------------------
+
+// genprog.bit is a fixed, deterministic, pure-arithmetic generator (#2605)
+// with nothing left to discover about IT here, so a failure to generate is
+// this harness's own setup breaking, not a per-seed finding.
+fn generateSource(p: Paths, seed: int) {
+  writeExecScript(p.genScript, "\"${p.genExe}\" --seed ${seed} >\"${p.srcPath}\" 2>\"${p.genErr}\"")
+  let rc = osRunBounded(p.genScript, genTimeoutMs)
+  if (rc != 0) {
+    die("odiff: seed ${seed}: generating the program failed or timed out (rc=${rc}); see ${p.genErr}")
+  }
+}
+
+fn readOrEmpty(path: string): string {
+  return readFile(path) catch _ {
+    ""
+  }
+}
+
+// Builds `p.srcPath` with `flag` (either "--no-optimize" or "" for the
+// default level) to `side.exePath`, then runs it. A build failure or
+// build-stage timeout is folded into the returned RunResult using the
+// build's own exit code as `exitCode` and the compile log as `stderr` —
+// deliberately not a `die`: a build that fails under one flag set and not
+// the other is itself a real divergence this differential exists to catch.
+fn buildAndRunSide(bin: string, side: SidePaths, src: string, flag: string): RunResult {
+  writeExecScript(
+    side.compileScript,
+    "\"${bin}\" build \"${src}\" ${flag} -o \"${side.exePath}\" >\"${side.compileLog}\" 2>&1",
+  )
+  let buildRc = osRunBounded(side.compileScript, compileTimeoutMs)
+  if (buildRc != 0) {
+    return RunResult{ exitCode: buildRc, stdout: "", stderr: readOrEmpty(side.compileLog) }
+  }
+  writeExecScript(side.runScript, "\"${side.exePath}\" >\"${side.outPath}\" 2>\"${side.errPath}\"")
+  let runRc = osRunBounded(side.runScript, runTimeoutMs)
+  let effectiveRc = runRc
+  if (runRc == -2) {
+    effectiveRc = timeoutExitSentinel
+  }
+  return RunResult{
+    exitCode: effectiveRc,
+    stdout: readOrEmpty(side.outPath),
+    stderr: readOrEmpty(side.errPath),
+  }
+}
+
+// --- comparison --------------------------------------------------------------
+
+fn combinedLines(r: RunResult): []string {
+  let out = split(r.stdout, "\n")
+  let err = split(r.stderr, "\n")
+  let combined = []string(len(out) + len(err))
+  let i = 0
+  while (i < len(out)) {
+    combined[i] = out[i]
+    i = i + 1
+  }
+  let j = 0
+  while (j < len(err)) {
+    combined[len(out) + j] = err[j]
+    j = j + 1
+  }
+  return combined
+}
+
+fn lineAt(lines: []string, i: int): string {
+  if (i < len(lines)) {
+    return lines[i]
+  }
+  return ""
+}
+
+// Returns the (O0 line, O1 line) pair to print for a mismatch: the first
+// index where the two sides' combined stdout+stderr lines diverge, or —
+// when no line-level difference exists (a mismatch triggered purely by a
+// shared nonzero exit code) — each side's own `<exit=N>` marker.
+fn firstDiffPair(o0: RunResult, o1: RunResult): []string {
+  let l0 = combinedLines(o0)
+  let l1 = combinedLines(o1)
+  let n = len(l0)
+  if (len(l1) > n) {
+    n = len(l1)
+  }
+  let i = 0
+  while (i < n) {
+    let a = lineAt(l0, i)
+    let b = lineAt(l1, i)
+    if (a != b) {
+      return [a, b]
+    }
+    i = i + 1
+  }
+  return ["<exit=${o0.exitCode}>", "<exit=${o1.exitCode}>"]
+}
+
+fn resultsMismatch(o0: RunResult, o1: RunResult): bool {
+  if (o0.exitCode != o1.exitCode) {
+    return true
+  }
+  if (o0.stdout != o1.stdout) {
+    return true
+  }
+  if (o0.stderr != o1.stderr) {
+    return true
+  }
+  if (o0.exitCode != 0) {
+    return true
+  }
+  if (o1.exitCode != 0) {
+    return true
+  }
+  return false
+}
+
+fn reportMismatch(seed: int, o0: RunResult, o1: RunResult) {
+  eprint("FAIL seed=${seed} O0exit=${o0.exitCode} O1exit=${o1.exitCode} repro: bit run tools/fuzz/genprog.bit -- --seed ${seed}\n")
+  let pair = firstDiffPair(o0, o1)
+  eprint("O0: ${pair[0]}\n")
+  eprint("O1: ${pair[1]}\n")
+  exit(1)
+}
+
+fn checkOneSeed(bin: string, p: Paths, seed: int) {
+  generateSource(p, seed)
+  let o0 = buildAndRunSide(bin, p.o0, p.srcPath, "--no-optimize")
+  let o1 = buildAndRunSide(bin, p.o1, p.srcPath, "")
+  if (resultsMismatch(o0, o1)) {
+    reportMismatch(seed, o0, o1)
+  }
+}
+
+// --- entry -------------------------------------------------------------------
+
+fn main() {
+  let bin = envOr("BIT", "./bit-out/bin/bit")
+  let a = parseArgs()
+
+  let tmpBase = envOr("TMPDIR", "/tmp")
+  let workDir = "${tmpBase}/bit-odiff-${uuidFormat(uuidV4())}"
+  mkdir(workDir) catch e {
+    die("odiff: mkdir ${workDir}: ${e.message()}")
+  }
+
+  let genExe = buildGenerator(bin, workDir)
+  let p = setupPaths(workDir, genExe)
+
+  let seed = a.seed
+  let n = 0
+  while (n < a.count) {
+    checkOneSeed(bin, p, seed)
+    seed = seed + 1
+    n = n + 1
+  }
+  print("PASS: ${a.count} programs, 0 mismatches (seed=${a.seed})\n")
+}
