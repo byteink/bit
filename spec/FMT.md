@@ -120,7 +120,7 @@ order** that did not match the order the programmer wrote them in, so a
 clause printed ahead of its true source position swept up a neighboring
 clause's still-unconsumed comment. The fix — sort the populated clauses by
 their own `span.start` before printing, then explicitly flush the gap before
-each clause (`fmtAsmStmt`, `compiler/fmtdispatch.bit:662-713`) — is what makes
+each clause (`fmtAsmStmt`, `compiler/fmtdispatch.bit:705-755`) — is what makes
 "attached to the same node it was attached to in the source" hold universally
 rather than for every node kind except `asm`.
 
@@ -299,15 +299,27 @@ re-formatting any of these outputs is a no-op (idempotent).
 **Rule.** An `asm` block's interior statement order and each statement's
 attached comment are preserved exactly as the source wrote them — the
 formatter may re-indent the block (see §2) but never reorders its clauses
-(`fmtAsmStmt`, `compiler/fmtdispatch.bit:662-713`, see §4 for why this needed
-a fix rather than being true by default). A block with no comment inside it
-still renders on one line, unchanged from before `#2879`.
+(`fmtAsmStmt`, `compiler/fmtdispatch.bit:705-755`, see §4 for why this needed
+a fix rather than being true by default). The block is width-aware like any
+other bracketed construct (§1): it renders on one line only if that fits
+under the 100-column budget and holds no comment (`fmtAsmFlatSlots`'s trial,
+`compiler/fmtdispatch.bit:694-703`); otherwise each clause — `x64 { ... }`,
+`arm64 { ... }`, `input ...`, etc. — gets its own line. Before `#3679` the
+flat form was assumed whenever the block held no comment, with no width
+check: a clause whose own content (e.g. a long byte-array code list) wrapped
+internally still got crammed onto the same line as its neighbors, corrupting
+the layout (never the assembled bytes — `AsmCode`'s items are a plain
+comma-separated integer list, parsed independent of line breaks) rather than
+just looking wrong.
 
 **Check:** format a copy of every file containing an `asm` block; reduce each
 block to its literal instruction/token sequence plus (literal run, trailing
 comment) pairs; confirm the sequence and every pairing is unchanged before
 and after — `#2879`'s comparator, run over all 17 `asm`-containing files (25
-`asm` statements) in the corpus at the time it landed.
+`asm` statements) in the corpus at the time it landed. `#3679` adds: for a
+block whose flat form doesn't fit, each clause lands on its own output line,
+with no clause's content sharing a line with a neighboring clause's opening
+or closing brace.
 
 ## 9. Semicolons
 
