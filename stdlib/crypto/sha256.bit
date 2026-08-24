@@ -30,6 +30,32 @@
 extern fn bit_rt_crypto_sha256_hw_available(): bool
 extern fn bit_rt_crypto_sha256_compress_hw(state: *u32, block: *byte)
 
+// ARM64 HARDWARE FAST PATH (task #2528, epic #1224), over #2524's
+// `bit_rt_sha256_hw_blocks` (SHA256H/SHA256H2/SHA256SU0/SHA256SU1). Disjoint
+// from the x86-64 SHA-NI dispatch above — disjoint hardware, disjoint runtime
+// primitive, disjoint capability query — exactly as `gcm.bit` keeps
+// `hwPmull()` and `bit_rt_crypto_ghash_hw_available()` apart. Gated on
+// `hwSha2()` (hw.bit), read ONCE per hasher into `Sha256.hw`, so
+// `BIT_CRYPTO_HW=0` forces every hasher built afterwards onto the software
+// path and the two are testable from one binary.
+//
+// The software compression below is the fallback and stays byte-for-byte the
+// authority: `absorb` picks a path, never a different digest. Neither the
+// choice nor anything inside either path branches on message bytes, so the
+// constant-time property is unchanged (§13.5).
+//
+// PACKED STATE, NOT `[]u32`. The primitive reads and writes eight u32 words
+// tightly packed into 32 bytes. A Bit `[]u32` is word-STRIDED — one 8-byte
+// word per element, only `[]byte` is byte-packed (SPEC §11.8) — so
+// `ptrOf(h.state)` is the wrong layout and the running state is marshalled
+// through a local 32-byte `[]byte` around each call. `data` needs no
+// marshalling: it is a `[]byte` already.
+//
+// ONE CALL PER RUN OF WHOLE BLOCKS, not one per block: the primitive rebuilds
+// its 256-byte round-constant table on every call, so `write` hands it every
+// aligned block it has in a single call and buffers only the ragged ends.
+extern fn bit_rt_sha256_hw_blocks(state: int, data: int, blocks: u64)
+
 // The 64 round constants: the first 32 bits of the fractional parts of the cube
 // roots of the first 64 primes (FIPS 180-4 §4.2.2).
 fn roundConstants(): []u32 {
@@ -67,12 +93,14 @@ fn rotr32(x: u32, n: u32): u32 {
   return (x >> n) | (x << (32 - n))
 }
 
-// Absorb one 64-byte `block` into `state` (the eight running words), running the
-// full message schedule and 64 compression rounds against round constants `k`.
-// Mutates `state` in place.
-fn compress(state: []u32, block: []byte, k: []u32) {
+// Absorb the 64-byte block at `block[off..off+63]` into `state` (the eight
+// running words), running the full message schedule and 64 compression rounds
+// against round constants `k`. Mutates `state` in place. `off` lets a caller
+// compress straight out of its own buffer without copying a block out first;
+// every existing caller passes 0.
+fn compress(state: []u32, block: []byte, off: int, k: []u32) {
   if (bit_rt_crypto_sha256_hw_available()) {
-    bit_rt_crypto_sha256_compress_hw(ptrOf(state), ptrOf(block))
+    bit_rt_crypto_sha256_compress_hw(ptrOf(state), ptrOf(block[off:off + 64]))
     return
   }
 
@@ -81,7 +109,7 @@ fn compress(state: []u32, block: []byte, k: []u32) {
   // First 16 words are the block read big-endian; the rest extend the schedule.
   let i = 0
   while (i < 16) {
-    let j = i * 4
+    let j = off + i * 4
     w[i] = (u32(block[j]) << 24) |
       (u32(block[j + 1]) << 16) |
       (u32(block[j + 2]) << 8) |
@@ -135,6 +163,38 @@ fn compress(state: []u32, block: []byte, k: []u32) {
   state[7] = state[7] + hh
 }
 
+// Write the eight running words of `state` into `out` as 32 tightly packed
+// bytes, four native-endian bytes per word — the layout
+// `bit_rt_sha256_hw_blocks` reads and writes, which a `[]u32` does not have
+// (see the header). `unpackState` is the exact inverse, so a round trip with
+// no call in between leaves `state` unchanged.
+fn packState(state: []u32, out: []byte) {
+  let i = 0
+  while (i < 8) {
+    let v = state[i]
+    let j = i * 4
+    out[j] = byte(v)
+    out[j + 1] = byte(v >> 8)
+    out[j + 2] = byte(v >> 16)
+    out[j + 3] = byte(v >> 24)
+    i = i + 1
+  }
+}
+
+// Read the 32 packed bytes of `buf` back into the eight running words of
+// `state`; the inverse of `packState`.
+fn unpackState(buf: []byte, state: []u32) {
+  let i = 0
+  while (i < 8) {
+    let j = i * 4
+    state[i] = u32(buf[j]) |
+      (u32(buf[j + 1]) << 8) |
+      (u32(buf[j + 2]) << 16) |
+      (u32(buf[j + 3]) << 24)
+    i = i + 1
+  }
+}
+
 // Whether `compress` is taking the SHA-NI hardware path on this host (task
 // #1223) rather than the 64-round software loop — a diagnostic query, like
 // `hwAvailableAes` (aes.bit); the dispatch itself is transparent.
@@ -146,7 +206,10 @@ export fn hwAvailableSha256(): bool {
 // words; `buf`/`bufLen` accumulate a partial 64-byte block; `total` is the byte
 // count for the length field; `sz` is the digest length (32 or 28); `iv` is the
 // variant's initial state (kept so `reset` can restore it); `k` is the shared
-// round-constant table. `iv` and `k` are built once at construction.
+// round-constant table. `hw` is `hwSha2()` sampled once here — the ARM64 SHA2
+// dispatch, read from the CPU exactly once per hasher. `iv`, `k` and `hw` are
+// all built once at construction and `reset` does not disturb them, so a hasher
+// never re-reads the CPU.
 export class Sha256 {
   state: []u32,
   buf: []byte,
@@ -155,6 +218,7 @@ export class Sha256 {
   sz: int,
   iv: []u32,
   k: []u32,
+  hw: bool,
 }
 
 // A fresh SHA-256 hasher over the empty message.
@@ -167,6 +231,7 @@ export fn newSha256(): Hash {
     sz: 32,
     iv: iv256(),
     k: roundConstants(),
+    hw: hwSha2(),
   }
   h.reset()
   return h
@@ -182,24 +247,87 @@ export fn newSha224(): Hash {
     sz: 28,
     iv: iv224(),
     k: roundConstants(),
+    hw: hwSha2(),
   }
   h.reset()
   return h
 }
 
+// Fold `blocks` whole 64-byte blocks, starting at `data[off]`, into `state` —
+// the one place either path is chosen. `state` is the caller's running state
+// (`h.state` while writing, the finalization copy in `sum`), never assumed to
+// be `h`'s own.
+fn (h: Sha256) absorb(state: []u32, data: []byte, off: int, blocks: int) {
+  if (!h.hw) {
+    let i = 0
+    while (i < blocks) {
+      compress(state, data, off + i * 64, h.k)
+      i = i + 1
+    }
+    return
+  }
+  // The 32-byte packed-state buffer is local, NOT a field on `h`: `sum`
+  // finalizes on a copy of the running state and must stay read-only with
+  // respect to the hasher, which a shared scratch field would quietly break for
+  // two concurrent `sum` calls. `absorb` runs at most twice per `write` and
+  // twice per `sum` — never once per block — so this is a per-run allocation,
+  // and it replaces the software path's own `[]u32(64)` schedule, which is 512
+  // bytes per BLOCK.
+  let packed = []byte(32)
+  packState(state, packed)
+  bit_rt_sha256_hw_blocks(int(ptrOf(packed)), int(ptrOf(data)) + off, u64(blocks))
+  unpackState(packed, state)
+
+  // GC KEEP-ALIVE, and the reason it is AFTER the call rather than before it.
+  // `data` reaches the primitive only as a raw address, and a raw `int` is not
+  // a stack-map slot while a `[]byte` local is (`runtime/root/floats.bit`'s
+  // `packLowBytes` header; `codegen.bit`'s `isRefType` excludes `*T`). Stack
+  // maps are live-range precise — `regalloc.bit` records an interval at a
+  // safepoint only while `start <= pos && end >= pos` — so a slice whose last
+  // use precedes the call is absent from that call's map. The primitive
+  // allocates (its round-constant table and its scratch block), so a
+  // collection CAN run inside it. This read is what holds `data`'s interval,
+  // and so its stack-map entry, open across the call above. It is also a real
+  // bounds invariant: every caller must have `blocks` whole blocks in hand.
+  if (len(data) < off + blocks * 64) {
+    panic("sha256: hardware block run extends past the end of the buffer")
+  }
+}
+
 // Absorb `data`, buffering into 64-byte blocks and compressing each full one.
+// Whole blocks that are already 64-byte aligned in the caller's own buffer are
+// handed to `absorb` in one run, so they are neither copied through `h.buf` nor
+// split into one primitive call each; only the ragged head and tail are
+// buffered. The block sequence, and so the digest, is identical either way.
 export fn (h: Sha256) write(data: []byte) {
+  let n = len(data)
   let i = 0
-  while (i < len(data)) {
+
+  // Head: top up a partial block, so the bulk run below starts block-aligned.
+  while (h.bufLen > 0 && i < n) {
     h.buf[h.bufLen] = data[i]
     h.bufLen = h.bufLen + 1
-    h.total = h.total + 1
+    i = i + 1
     if (h.bufLen == 64) {
-      compress(h.state, h.buf, h.k)
+      h.absorb(h.state, h.buf, 0, 1)
       h.bufLen = 0
     }
+  }
+
+  let blocks = (n - i) / 64
+  if (blocks > 0) {
+    h.absorb(h.state, data, i, blocks)
+    i = i + blocks * 64
+  }
+
+  // Tail: whatever is left cannot fill a block.
+  while (i < n) {
+    h.buf[h.bufLen] = data[i]
+    h.bufLen = h.bufLen + 1
     i = i + 1
   }
+
+  h.total = h.total + uint(n)
 }
 
 // The digest of everything written since the last reset. Finalizes on a copy of
@@ -232,7 +360,7 @@ export fn (h: Sha256) sum(): []byte {
       pad[n] = 0
       n = n + 1
     }
-    compress(s, pad, h.k)
+    h.absorb(s, pad, 0, 1)
     i = 0
     while (i < 64) {
       pad[i] = 0
@@ -255,7 +383,7 @@ export fn (h: Sha256) sum(): []byte {
   pad[61] = byte(bitLen >> 16)
   pad[62] = byte(bitLen >> 8)
   pad[63] = byte(bitLen)
-  compress(s, pad, h.k)
+  h.absorb(s, pad, 0, 1)
 
   // Serialize the first `sz` bytes of the state, each word big-endian.
   let out = []byte(h.sz)
