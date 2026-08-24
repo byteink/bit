@@ -293,7 +293,7 @@ instead of the purely-manual, unverified two-pass `BIT_STAGE0_BIN` dance
 **What the opt-in requires, filed as #3117, not done here.**
 `tools/build/defs.bit` declares `selfhost`'s only dependency as `["libbitrt"]`,
 and `stepSelfhost` always resolves stage0 fresh via `runArtifact`
-(`tools/build/main.bit:125`) — there is no path that reuses a previously-built
+(`tools/build/main.bit:128`) — there is no path that reuses a previously-built
 `bit-out/bin/bit` as a builder for anything. An opt-in tree-built `libbitrt`
 therefore cannot just swap which `BIT=` `stepLibbitrt` passes to
 `scripts/g2archive.sh` — it needs its own internal two-pass bootstrap,
@@ -469,7 +469,7 @@ triple and the wrapper cannot know the target.
 **A hang is a failure, not a stall.** Every subprocess a harness spawns carries a
 wall-clock deadline. Exceeding it kills that child (by its own PID, never a name
 pattern), reports `TIMED OUT` naming the case, and reddens the suite. Default
-**300s** (`defaultTimeoutS`, `tests/bit/stress/stress.bit:185` and
+**300s** (`defaultTimeoutS`, `tests/bit/stress/stress.bit:192` and
 `tests/bit/golden/golden.bit:84`); override with `BIT_TEST_TIMEOUT_S=<seconds>` on a
 slower host, or `0` to block forever as before. A timeout is a distinct outcome
 from a crash: a child killed by SIGSEGV/SIGBUS/SIGABRT is reported as a crash
