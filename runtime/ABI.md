@@ -2886,10 +2886,14 @@ bit_rt_sha256_hw_blocks(state, data, blocks)   // fold `blocks` 64-byte blocks i
 ```
 
 `state`/`data` are raw addresses (`int`); `blocks` a `u64` count. `state`
-points at 8 running `u32` words (a..h) in the SAME native machine-word layout
-`stdlib/crypto/sha256.bit`'s own `state: []u32` field already has — not a
-serialized byte order — updated in place. `data` points at `64*blocks` bytes
-of message, read big-endian per FIPS 180-4's own convention.
+points at a PACKED 32-byte buffer — 8 running `u32` words (a..h), native
+(little-endian on ARM64) byte order per word — updated in place. This is
+deliberately NOT the layout a Bit `[]u32` slice's own `ptrOf` addresses
+(SPEC §11.8: one 8-byte word per element, only `[]u8`/`[]byte` is
+byte-packed), so a caller holding `stdlib/crypto/sha256.bit`'s own
+`state: []u32` field must marshal into/out of a packed `[]byte(32)` around
+each call. `data` points at `64*blocks` PACKED bytes of message, read
+big-endian per FIPS 180-4's own convention.
 `bit_rt_sha256_hw_blocks` implements the same recurrence
 `stdlib/crypto/sha256.bit`'s software `compress` does, once per 64-byte block,
 in order.
