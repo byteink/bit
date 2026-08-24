@@ -205,6 +205,98 @@ fn quicconnAppendWindowUpdates(st: quicconnState, frames: []Frame): []Frame {
   return out
 }
 
+// The frames one stream contributed to a `quicconnFillStreamFrames` pass, and
+// the send-budget bytes it used.
+class StreamFillResult { frames: []Frame, used: int }
+
+// The `room > 0 && avail > 0` case: emit as much new STREAM data as flow
+// control allows, or DATA_BLOCKED / STREAM_DATA_BLOCKED if none is available
+// yet. Split out of `quicconnFillOneStream` (#2448).
+fn quicconnFillStreamData(
+  st: quicconnState,
+  id: int,
+  s: quicconnStream,
+  room: int,
+  avail: int,
+): StreamFillResult {
+  let out = []Frame(0)
+  let connCredit = st.peerMaxData - st.dataSent
+  let strCredit = s.peerMaxStreamData - s.sendOff
+  let can = quicconnMin(avail, quicconnMin(connCredit, quicconnMin(strCredit, room)))
+  if (can <= 0) {
+    if (strCredit <= 0 && !s.blockedSignaled) {
+      out = append(out, Frame.StreamDataBlocked(u64(id), u64(s.peerMaxStreamData)))
+      s.blockedSignaled = true
+    }
+    if (connCredit <= 0 && !st.dataBlockedSignaled) {
+      out = append(out, Frame.DataBlocked(u64(st.peerMaxData)))
+      st.dataBlockedSignaled = true
+    }
+    return StreamFillResult{ frames: out, used: 0 }
+  }
+  let chunk = s.sendBuf[s.sendOff:s.sendOff + can]
+  let fin = s.finQueued && s.sendOff + can == s.sendLen
+  out = append(
+    out, Frame.Stream(
+      StreamFrame{
+        id: u64(id),
+        offset: u64(s.sendOff),
+        data: chunk,
+        hasOffset: true,
+        hasLength: true,
+        fin: fin,
+      },
+    ),
+  )
+  s.sendOff = s.sendOff + can
+  st.dataSent = st.dataSent + can
+  if (fin) {
+    s.finSent = true
+  }
+  s.blockedSignaled = false
+  st.dataBlockedSignaled = false
+  return StreamFillResult{ frames: out, used: can + 24 }
+}
+
+// Fill up to `room` bytes of new STREAM data for one stream `s`: a FIN-only
+// frame when its buffer has drained and a FIN is queued, new data via
+// `quicconnFillStreamData`, or nothing if the stream aborted or `room` is
+// already spent. Split out of `quicconnFillStreamFrames` (#2448).
+fn quicconnFillOneStream(
+  st: quicconnState,
+  id: int,
+  s: quicconnStream,
+  room: int,
+): StreamFillResult {
+  let avail = s.sendLen - s.sendOff
+  if (s.sendAborted) {
+    // Nothing further to send: `quicconnAbortSend` already queued the
+    // RESET_STREAM that tells the peer so, on `aLevel.pending` rather than
+    // through this per-stream buffer.
+    return StreamFillResult{ frames: []Frame(0), used: 0 }
+  }
+  if (room > 0 && avail == 0 && s.finQueued && !s.finSent) {
+    let out = append(
+      []Frame(0), Frame.Stream(
+        StreamFrame{
+          id: u64(id),
+          offset: u64(s.sendOff),
+          data: []byte(0),
+          hasOffset: true,
+          hasLength: true,
+          fin: true,
+        },
+      ),
+    )
+    s.finSent = true
+    return StreamFillResult{ frames: out, used: 0 }
+  }
+  if (room > 0 && avail > 0) {
+    return quicconnFillStreamData(st, id, s, room, avail)
+  }
+  return StreamFillResult{ frames: []Frame(0), used: 0 }
+}
+
 // Fill up to `budget` bytes of new STREAM data from the send buffers, bounded by
 // per-stream and connection flow control (RFC 9000 §4.1). Emits a FIN on the
 // last frame of a finished stream and DATA_BLOCKED / STREAM_DATA_BLOCKED when a
@@ -217,63 +309,11 @@ fn quicconnFillStreamFrames(st: quicconnState, budget: int): []Frame {
   let used = 0
   for (id, s) of st.streams {
     let room = budget - used - 24
-    let avail = s.sendLen - s.sendOff
-    if (s.sendAborted) {
-      // Nothing further to send: `quicconnAbortSend` already queued the
-      // RESET_STREAM that tells the peer so, on `aLevel.pending` rather than
-      // through this per-stream buffer.
-    } else if (room > 0 && avail == 0 && s.finQueued && !s.finSent) {
-      out = append(
-        out, Frame.Stream(
-          StreamFrame{
-            id: u64(id),
-            offset: u64(s.sendOff),
-            data: []byte(0),
-            hasOffset: true,
-            hasLength: true,
-            fin: true,
-          },
-        ),
-      )
-      s.finSent = true
-    } else if (room > 0 && avail > 0) {
-      let connCredit = st.peerMaxData - st.dataSent
-      let strCredit = s.peerMaxStreamData - s.sendOff
-      let can = quicconnMin(avail, quicconnMin(connCredit, quicconnMin(strCredit, room)))
-      if (can <= 0) {
-        if (strCredit <= 0 && !s.blockedSignaled) {
-          out = append(out, Frame.StreamDataBlocked(u64(id), u64(s.peerMaxStreamData)))
-          s.blockedSignaled = true
-        }
-        if (connCredit <= 0 && !st.dataBlockedSignaled) {
-          out = append(out, Frame.DataBlocked(u64(st.peerMaxData)))
-          st.dataBlockedSignaled = true
-        }
-      } else {
-        let chunk = s.sendBuf[s.sendOff:s.sendOff + can]
-        let fin = s.finQueued && s.sendOff + can == s.sendLen
-        out = append(
-          out, Frame.Stream(
-            StreamFrame{
-              id: u64(id),
-              offset: u64(s.sendOff),
-              data: chunk,
-              hasOffset: true,
-              hasLength: true,
-              fin: fin,
-            },
-          ),
-        )
-        s.sendOff = s.sendOff + can
-        st.dataSent = st.dataSent + can
-        if (fin) {
-          s.finSent = true
-        }
-        s.blockedSignaled = false
-        st.dataBlockedSignaled = false
-        used = used + can + 24
-      }
+    let r = quicconnFillOneStream(st, id, s, room)
+    for f of r.frames {
+      out = append(out, f)
     }
+    used = used + r.used
   }
   return out
 }

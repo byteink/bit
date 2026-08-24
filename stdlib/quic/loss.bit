@@ -116,6 +116,51 @@ fn quicconnLossDelay(st: quicconnState): int {
   return delay
 }
 
+// Whether sent packet `sp` is declared lost under level `lvl`: by the packet
+// threshold (3 later packets acknowledged) or the time threshold (RFC 9002
+// §6.1). Split out of `quicconnDetectLoss` (#2448).
+fn quicconnPacketIsLost(sp: quicconnSent, lvl: quicconnLevel, lossDelay: int, now: int): bool {
+  let byPacket = sp.pn <= lvl.largestAcked - quicconnPacketThreshold
+  let byTime = sp.pn < lvl.largestAcked && now - sp.timeSent >= lossDelay
+  return byPacket || byTime
+}
+
+// The running accumulation of a lost-packet scan: every recovered frame
+// (`frames`) and the latest `timeSent` seen among the lost packets
+// (`lostTime`, used as the congestion-event timestamp).
+class LostAccum { frames: []Frame, lostTime: int }
+
+// Folds one lost packet `sp` into `acc`: debits its bytes from
+// `st.bytesInFlight` if it was ack-eliciting, and collects its frames.
+// Split out of `quicconnDetectLoss` (#2448).
+fn quicconnAccumulateLost(sp: quicconnSent, st: quicconnState, acc: LostAccum): LostAccum {
+  if (sp.ackEliciting) {
+    st.bytesInFlight = st.bytesInFlight - sp.size
+  }
+  let frames = acc.frames
+  for f of sp.frames {
+    frames = append(frames, f)
+  }
+  let lostTime = acc.lostTime
+  if (sp.timeSent > lostTime) {
+    lostTime = sp.timeSent
+  }
+  return LostAccum{ frames: frames, lostTime: lostTime }
+}
+
+// For a kept (not-yet-lost) packet `sp` still older than the largest
+// acknowledged packet, arms `lvl.lossTime` for the earliest moment it would
+// become lost by the time threshold, if that is sooner than what is already
+// armed. Split out of `quicconnDetectLoss` (#2448).
+fn quicconnArmLossTimer(sp: quicconnSent, lvl: quicconnLevel, lossDelay: int) {
+  if (sp.pn < lvl.largestAcked) {
+    let t = sp.timeSent + lossDelay
+    if (lvl.lossTime == 0 || t < lvl.lossTime) {
+      lvl.lossTime = t
+    }
+  }
+}
+
 // Declare packets in `levelIdx` lost by the packet threshold (3 later packets
 // acknowledged) or the time threshold (RFC 9002 §6.1), re-queue their
 // retransmittable frames, and signal a congestion event.
@@ -127,33 +172,19 @@ fn quicconnDetectLoss(st: quicconnState, levelIdx: int) {
   let now = monotonic().ns
   let lossDelay = quicconnLossDelay(st)
   let kept = []quicconnSent(0)
-  let lostFrames = []Frame(0)
-  let lostTime = -1
+  let acc = LostAccum{ frames: []Frame(0), lostTime: -1 }
   lvl.lossTime = 0
   for sp of lvl.sent {
-    let byPacket = sp.pn <= lvl.largestAcked - quicconnPacketThreshold
-    let byTime = sp.pn < lvl.largestAcked && now - sp.timeSent >= lossDelay
-    if (byPacket || byTime) {
-      if (sp.ackEliciting) {
-        st.bytesInFlight = st.bytesInFlight - sp.size
-      }
-      for f of sp.frames {
-        lostFrames = append(lostFrames, f)
-      }
-      if (sp.timeSent > lostTime) {
-        lostTime = sp.timeSent
-      }
+    if (quicconnPacketIsLost(sp, lvl, lossDelay, now)) {
+      acc = quicconnAccumulateLost(sp, st, acc)
     } else {
       kept = append(kept, sp)
-      if (sp.pn < lvl.largestAcked) {
-        let t = sp.timeSent + lossDelay
-        if (lvl.lossTime == 0 || t < lvl.lossTime) {
-          lvl.lossTime = t
-        }
-      }
+      quicconnArmLossTimer(sp, lvl, lossDelay)
     }
   }
   lvl.sent = kept
+  let lostFrames = acc.frames
+  let lostTime = acc.lostTime
   if (len(lostFrames) > 0) {
     for f of lostFrames {
       if (quicconnIsRetransmittable(f)) {

@@ -30,27 +30,39 @@ fn quicconnRecvDatagram(st: quicconnState, data: []byte): ()! {
   }
 }
 
-// Parse one long-header packet at `start`, decrypt and process it, and return
-// the offset of the next coalesced packet (RFC 9000 §17.2). A packet whose keys
-// are not yet installed, or that fails to decrypt, is skipped — the peer will
-// retransmit (RFC 9001 §5.4.1 / §5.5).
-fn quicconnRecvLong(st: quicconnState, data: []byte, start: int): int! {
+// The fields `quicconnParseLongHeader` recovers from a long-header packet
+// (RFC 9000 §17.2), before any decision about what to do with them.
+// `packetEnd < 0` means the header itself was truncated — split out of
+// `quicconnRecvLong` (#2448) to keep parsing and decision-making each under
+// E0204's complexity ceiling.
+class LongHeaderInfo { typ: int, dcid: []byte, scid: []byte, pnOffset: int, packetEnd: int }
+
+// A `LongHeaderInfo` reporting "packet is truncated, give up on it" — the
+// caller's cue to skip it and let the peer retransmit, same as the original
+// inline `return len(data)` guards this replaces.
+fn quicconnTruncatedHeader(): LongHeaderInfo {
+  return LongHeaderInfo{ typ: 0, dcid: []byte(0), scid: []byte(0), pnOffset: 0, packetEnd: -1 }
+}
+
+// Parse a long-header packet's DCID, SCID, Initial token, and Length fields
+// (RFC 9000 §17.2), stopping at the first sign of truncation.
+fn quicconnParseLongHeader(data: []byte, start: int): LongHeaderInfo! {
   if (start + 7 > len(data)) {
-    return len(data)
+    return quicconnTruncatedHeader()
   }
   let typ = int((data[start] >> 4) & 0x03)
   let p = start + 5
   let dcidLen = int(data[p])
   p = p + 1
   if (p + dcidLen + 1 > len(data)) {
-    return len(data)
+    return quicconnTruncatedHeader()
   }
   let dcid = data[p:p + dcidLen]
   p = p + dcidLen
   let scidLen = int(data[p])
   p = p + 1
   if (p + scidLen > len(data)) {
-    return len(data)
+    return quicconnTruncatedHeader()
   }
   let scid = data[p:p + scidLen]
   p = p + scidLen
@@ -59,7 +71,7 @@ fn quicconnRecvLong(st: quicconnState, data: []byte, start: int): int! {
     let tokLen = int(quicfrReadVarint(r)?)
     p = r.pos + tokLen
     if (p > len(data)) {
-      return len(data)
+      return quicconnTruncatedHeader()
     }
   }
   let r2 = quicfrReader{ data: data, pos: p }
@@ -67,29 +79,60 @@ fn quicconnRecvLong(st: quicconnState, data: []byte, start: int): int! {
   let pnOffset = r2.pos
   let packetEnd = pnOffset + length
   if (packetEnd > len(data)) {
+    return quicconnTruncatedHeader()
+  }
+  return LongHeaderInfo{
+    typ: typ,
+    dcid: dcid,
+    scid: scid,
+    pnOffset: pnOffset,
+    packetEnd: packetEnd,
+  }
+}
+
+// Whether the server must install Initial keys before processing this Initial
+// packet (RFC 9001 §5.2) — split out of `quicconnRecvLong` so its own `&&`
+// chain doesn't add to that function's E0204 count (#2448).
+fn quicconnNeedsServerInitKeys(st: quicconnState, levelIdx: int): bool {
+  return !st.isClient && levelIdx == quicconnLvlInitial && !st.iLevel.haveRecv
+}
+
+// Whether the client should adopt the server's chosen SCID as its outgoing
+// DCID (RFC 9000 §7.2) — same reason as `quicconnNeedsServerInitKeys`.
+fn quicconnShouldSwitchDcid(st: quicconnState, scidLen: int): bool {
+  return st.isClient && !st.dcidSwitched && scidLen > 0
+}
+
+// Parse one long-header packet at `start`, decrypt and process it, and return
+// the offset of the next coalesced packet (RFC 9000 §17.2). A packet whose keys
+// are not yet installed, or that fails to decrypt, is skipped — the peer will
+// retransmit (RFC 9001 §5.4.1 / §5.5).
+fn quicconnRecvLong(st: quicconnState, data: []byte, start: int): int! {
+  let h = quicconnParseLongHeader(data, start)?
+  if (h.packetEnd < 0) {
     return len(data)
   }
   let levelIdx = -1
-  if (typ == longInitial) {
+  if (h.typ == longInitial) {
     levelIdx = quicconnLvlInitial
-  } else if (typ == longHandshake) {
+  } else if (h.typ == longHandshake) {
     levelIdx = quicconnLvlHandshake
   } else {
-    return packetEnd
+    return h.packetEnd
   }
-  if (!st.isClient && levelIdx == quicconnLvlInitial && !st.iLevel.haveRecv) {
-    quicconnServerInitKeys(st, dcid, scid)
+  if (quicconnNeedsServerInitKeys(st, levelIdx)) {
+    quicconnServerInitKeys(st, h.dcid, h.scid)
   }
-  if (st.isClient && !st.dcidSwitched && scidLen > 0) {
-    st.dcid = quicconnCopyBytes(scid)
+  if (quicconnShouldSwitchDcid(st, len(h.scid))) {
+    st.dcid = quicconnCopyBytes(h.scid)
     st.dcidSwitched = true
   }
   let lvl = quicconnLvl(st, levelIdx)
   if (!lvl.haveRecv) {
-    return packetEnd
+    return h.packetEnd
   }
-  quicconnDecryptAndProcess(st, levelIdx, data, start, pnOffset, packetEnd)?
-  return packetEnd
+  quicconnDecryptAndProcess(st, levelIdx, data, start, h.pnOffset, h.packetEnd)?
+  return h.packetEnd
 }
 
 // Parse and process the trailing short-header (1-RTT) packet at `start` (RFC
@@ -238,6 +281,12 @@ fn quicconnDecodePn(largest: int, truncated: int, pnLen: int): int {
 // `quicconnAbortSend`, and `quicconnOnMaxStreams` respectively. 7 non-goals + 3
 // fixes accounts for all 10 arms this match originally left empty (#3229's
 // finding named 9; `NewToken` above is the 10th, found in review).
+//
+// Split into three chained matches (#2448, E0204): each arm is one Frame
+// variant with its own real handling, so the single 21-arm match already
+// scored above the complexity ceiling before counting `MaxData`'s own `if`. `_`
+// in each stage hands the still-unmatched `f` to the next one, exactly like
+// `quicfrParseOne`'s split in frames.bit.
 fn quicconnHandleFrame(st: quicconnState, levelIdx: int, f: Frame): ()! {
   match (f) {
     Padding(_) => {}
@@ -247,6 +296,14 @@ fn quicconnHandleFrame(st: quicconnState, levelIdx: int, f: Frame): ()! {
     StopSending(id, code) => { quicconnAbortSend(st, int(id), int(code)) }
     Crypto(offset, cdata) => { quicconnLvl(st, levelIdx).crecv.insert(offset, cdata)? }
     NewToken(_) => {}
+    _ => { quicconnHandleFrameMid(st, levelIdx, f)? }
+  }
+}
+
+// Middle third of `quicconnHandleFrame`'s dispatch (#2448): STREAM through
+// STREAMS_BLOCKED.
+fn quicconnHandleFrameMid(st: quicconnState, levelIdx: int, f: Frame): ()! {
+  match (f) {
     Stream(s) => { quicconnOnStream(st, s)? }
     MaxData(m) => {
       if (int(m) > st.peerMaxData) {
@@ -259,6 +316,16 @@ fn quicconnHandleFrame(st: quicconnState, levelIdx: int, f: Frame): ()! {
     DataBlocked(_) => {}
     StreamDataBlocked(_, _) => {}
     StreamsBlocked(_, _) => {}
+    _ => { quicconnHandleFrameTail(st, f) }
+  }
+}
+
+// Final third of `quicconnHandleFrame`'s dispatch (#2448): NEW_CONNECTION_ID
+// through HANDSHAKE_DONE. The trailing `_` is unreachable in practice — the
+// first two stages already returned for every other variant — but a `match`
+// over `Frame` must stay exhaustive by construction.
+fn quicconnHandleFrameTail(st: quicconnState, f: Frame) {
+  match (f) {
     NewConnectionId(_, _, _, _) => {}
     RetireConnectionId(_) => {}
     PathChallenge(d) => { st.aLevel.pending = append(st.aLevel.pending, Frame.PathResponse(d)) }
@@ -266,6 +333,9 @@ fn quicconnHandleFrame(st: quicconnState, levelIdx: int, f: Frame): ()! {
     ConnectionClose(_, _, _) => { st.running = false }
     ApplicationClose(_, _) => { st.running = false }
     HandshakeDone => { st.handshakeComplete = true }
+    _ => {
+      panic("quicconnHandleFrame: internal: quicconnHandleFrameTail given an earlier-stage variant")
+    }
   }
 }
 

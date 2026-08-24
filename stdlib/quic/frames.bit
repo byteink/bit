@@ -315,8 +315,34 @@ fn quicfrTypeVarint2(typ: int, a: u64, b: u64): []byte {
   return quicfrPutVarint(out, b)
 }
 
+// MAX_STREAMS (RFC 9000 §19.11) is type 0x12 for bidirectional, 0x13 for
+// unidirectional. Its own helper so the `bidi` branch doesn't add to
+// `encodeFrame`'s own E0204 count (#2448).
+fn quicfrEncodeMaxStreams(bidi: bool, max: u64): []byte {
+  if (bidi) {
+    return quicfrTypeVarint(0x12, max)
+  }
+  return quicfrTypeVarint(0x13, max)
+}
+
+// STREAMS_BLOCKED (RFC 9000 §19.14) is type 0x16 for bidirectional, 0x17 for
+// unidirectional. Same reason as `quicfrEncodeMaxStreams`.
+fn quicfrEncodeStreamsBlocked(bidi: bool, max: u64): []byte {
+  if (bidi) {
+    return quicfrTypeVarint(0x16, max)
+  }
+  return quicfrTypeVarint(0x17, max)
+}
+
 // The wire encoding of a single frame (RFC 9000 §19). `Padding(n)` becomes `n` zero
 // bytes; every other frame is its type byte followed by its type-specific fields.
+//
+// Split into three chained matches (#2448, E0204): each arm is one Frame variant,
+// so a single 21-arm match already scores above the complexity ceiling with no
+// branching beyond the dispatch itself. `_` in each stage hands the still-unmatched
+// `f` to the next stage; `quicfrEncodeFrameTail` is the only stage a caller outside
+// this file ever needs, since together the three cover every Frame variant exactly
+// once.
 export fn encodeFrame(f: Frame): []byte {
   match (f) {
     Padding(n) => { return []byte(n) }
@@ -337,6 +363,14 @@ export fn encodeFrame(f: Frame): []byte {
       out = quicfrPutVarint(out, u64(len(data)))
       return quicfrPutBytes(out, data)
     }
+    _ => { return quicfrEncodeFrameMid(f) }
+  }
+}
+
+// Middle third of `encodeFrame`'s dispatch (#2448): NEW_TOKEN through
+// STREAM_DATA_BLOCKED.
+fn quicfrEncodeFrameMid(f: Frame): []byte {
+  match (f) {
     NewToken(token) => {
       let out = []byte(0)
       out = append(out, 0x07)
@@ -346,20 +380,21 @@ export fn encodeFrame(f: Frame): []byte {
     Stream(s) => { return quicfrEncodeStream(s) }
     MaxData(max) => { return quicfrTypeVarint(0x10, max) }
     MaxStreamData(id, max) => { return quicfrTypeVarint2(0x11, id, max) }
-    MaxStreams(bidi, max) => {
-      if (bidi) {
-        return quicfrTypeVarint(0x12, max)
-      }
-      return quicfrTypeVarint(0x13, max)
-    }
+    MaxStreams(bidi, max) => { return quicfrEncodeMaxStreams(bidi, max) }
     DataBlocked(max) => { return quicfrTypeVarint(0x14, max) }
     StreamDataBlocked(id, max) => { return quicfrTypeVarint2(0x15, id, max) }
-    StreamsBlocked(bidi, max) => {
-      if (bidi) {
-        return quicfrTypeVarint(0x16, max)
-      }
-      return quicfrTypeVarint(0x17, max)
-    }
+    _ => { return quicfrEncodeFrameTail(f) }
+  }
+}
+
+// Final third of `encodeFrame`'s dispatch (#2448): STREAMS_BLOCKED through
+// HANDSHAKE_DONE. The trailing `_` is unreachable in practice — `quicfrEncodeFrameMid`
+// only delegates here once every other variant has already returned — but a `match`
+// over `Frame` must stay exhaustive by construction, so it panics rather than
+// silently returning nothing.
+fn quicfrEncodeFrameTail(f: Frame): []byte {
+  match (f) {
+    StreamsBlocked(bidi, max) => { return quicfrEncodeStreamsBlocked(bidi, max) }
     NewConnectionId(seq, retire, cid, token) => {
       return quicfrEncodeNewConnId(seq, retire, cid, token)
     }
@@ -379,6 +414,7 @@ export fn encodeFrame(f: Frame): []byte {
     }
     ApplicationClose(code, reason) => { return quicfrEncodeAppClose(code, reason) }
     HandshakeDone => { return []byte{ 0x1e } }
+    _ => { panic("encodeFrame: internal: quicfrEncodeFrameTail given an earlier-stage variant") }
   }
 }
 
@@ -482,6 +518,12 @@ fn quicfrParseNewConnId(r: quicfrReader): Frame! {
 
 // Parse one frame at the cursor (RFC 9000 §19), dispatching on the type varint.
 // Fails on an unknown type or any truncated field.
+//
+// Split into three chained stages (#2448, E0204): each `if` is one wire type, so
+// the flat 21-way dispatch already scores above the complexity ceiling with no
+// branching beyond the switch itself. Falling off the end of a stage (no `if`
+// needed for that) hands `ty` to the next one; `quicfrParseOneTail` owns the
+// final "unknown type" failure since it is the last stage.
 fn quicfrParseOne(r: quicfrReader): Frame! {
   let t = quicfrReadVarint(r)?
   let ty = int(t)
@@ -516,6 +558,12 @@ fn quicfrParseOne(r: quicfrReader): Frame! {
     let token = quicfrReadBytes(r, int(n))?
     return Frame.NewToken(token)
   }
+  return quicfrParseOneMid(r, ty)?
+}
+
+// Middle third of `quicfrParseOne`'s dispatch (#2448): the STREAM types through
+// STREAM_DATA_BLOCKED.
+fn quicfrParseOneMid(r: quicfrReader, ty: int): Frame! {
   if (ty >= 0x08 && ty <= 0x0f) {
     return quicfrParseStream(r, (ty & 0x04) != 0, (ty & 0x02) != 0, (ty & 0x01) != 0)?
   }
@@ -538,6 +586,13 @@ fn quicfrParseOne(r: quicfrReader): Frame! {
     let max = quicfrReadVarint(r)?
     return Frame.StreamDataBlocked(id, max)
   }
+  return quicfrParseOneTail(r, ty)?
+}
+
+// Final third of `quicfrParseOne`'s dispatch (#2448): STREAMS_BLOCKED through
+// HANDSHAKE_DONE, then the "unknown type" failure — this stage is the last, so
+// it owns the fallback instead of delegating further.
+fn quicfrParseOneTail(r: quicfrReader, ty: int): Frame! {
   if (ty == 0x16 || ty == 0x17) {
     return Frame.StreamsBlocked(ty == 0x16, quicfrReadVarint(r)?)
   }
