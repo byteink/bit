@@ -85,7 +85,8 @@ this ticket adding anything). One new rule code, **E0215
 after) and now accounts for 30 findings — see "Out of scope" below for why
 it is not dispositioned here.
 
-## Out of scope: E0215 `unused-result` (30 findings) — filed as its own ticket
+## Out of scope: E0215 `unused-result` — deliberately excluded from THIS
+document, dispositioned separately in #3618 (see below)
 
 **This is not a readability rule and does not belong in this document's risk
 class.** `spec/LINT.md:233` describes it as "the one case E0211 cannot see
@@ -97,12 +98,79 @@ discarded-result family, which already has its own gate
 distinguishes from "the discarded-result class E0211 is." Bundling 30
 E0215 sites into this document would guarantee exactly what #2515's own
 constraint warns against: reviewing a correctness-adjacent class alongside
-a purely cosmetic one so the correctness-adjacent ones get skimmed. Filed as
-a new ticket to re-derive and disposition E0215 in `runtime/` on its own,
-using #2515's `let _ = ...` pattern plus the fallible-result carve-out
-`docs/lint/policy.md`'s own E0215 section already states (route a
-discarded `T!`/`Option`/`Result` to whoever owns that call site's
-correctness, never rubber-stamp it).
+a purely cosmetic one so the correctness-adjacent ones get skimmed. Its own
+per-site disposition is below, kept in its own section rather than woven
+into the readability rules above it, for the same reason.
+
+## E0215 `unused-result` (30 findings, re-derived unchanged from #2567's count
+— see #3618) — FIX, per-site, with `let _ = ...`
+
+**Decision: fix all 30, no correctness routing needed.** Re-running
+`bit lint runtime` on `main` at the time #3618 was worked reproduced the
+exact same 30 findings, same file:line distribution as #2567's table above —
+`runtime/` churn since (#3592, #2613, #3595) touched none of these call
+sites. Every one is a raw syscall or Win32 API wrapper (`nanosleep`,
+`closedir`, `close`, `execve`, `kill`, `setpgid`, `waitpid`, `sigaltstack`,
+`sigaction`, `joinWorker`, `WaitForSingleObject`, `CloseHandle`,
+`FindClose`, `FreeEnvironmentStringsW`, `AddVectoredExceptionHandler`,
+`SetThreadStackGuarantee`, `bit_rt_port_park_wait`,
+`bit_rt_port_park_wake`, `bit_rt_port_chan_try_send_drop`), and every one
+returns a plain `i32`/`int`/`bool` — none is `T!`, `Option`, or `Result`,
+so `docs/lint/policy.md`'s fallible-result carve-out never applies here and
+there is no correctness question to route.
+
+**Read every call site before applying the mechanical fix, not just its
+type** — a plain `int`/`bool` return can still be a dropped error signal.
+Two are worth recording because a shallower read would have missed them:
+
+- `runtime/root/linux/boottail.bit:413` discards `joinWorker`'s
+  finished-in-time-vs-timed-out `bool`, then unconditionally calls
+  `threadRelease` on the same handle. That looked, on first read, like a
+  possible use-after-free (releasing a thread's stack while it might still
+  be running). It is not: `threadRelease`
+  (`runtime/thread/linux/spawn.bit:611`, #1801) does not take a timed-out
+  join at its word either — it spins on the child's own on-stack flag and,
+  if the child never leaves its stack, leaks the reservation and reports
+  `false` rather than unmapping live memory. A comment recording this is
+  now above the fix.
+- `runtime/root/windows/boot.bit:628-629` discards `WaitForSingleObject`
+  the same way, then unconditionally calls `CloseHandle`. Safe for a
+  different, platform-specific reason: unlike the POSIX providers,
+  `CloseHandle` never unmaps the thread's stack — Windows frees it itself
+  once the thread actually exits — so a timed-out wait does not make the
+  following close unsafe either. Also commented at the site.
+
+Every other site already carried, or sits beside, an explicit design
+comment establishing the discard is intentional and safe: `execve`/
+`setpgid` before an unconditional `rootExit(127)` or where a post-`fork`
+race is already documented as a benign no-op either way; `waitpid` calls
+that only reap (the result code is already decided before the call);
+`kill`/`sigaltstack`/`sigaction`/`AddVectoredExceptionHandler`/
+`SetThreadStackGuarantee` as boot-time or worker-start infrastructure setup
+with fixed, always-valid arguments, matching this document's own
+`@nosplit`/boot/ABI-boundary category; `closedir`/`close`/`FindClose`/
+`FreeEnvironmentStringsW` as end-of-enumeration cleanup; and
+`bit_rt_port_park_wait`/`bit_rt_port_park_wake`/
+`bit_rt_port_chan_try_send_drop`, each with a comment already stating the
+call is advisory or cannot fail in a way the caller could act on.
+
+**Fix applied:** `let _ = <call>` at all 30 sites — a `LetDecl`, never
+visited by this rule (the same idiom E0210/E0211/#2515 already use).
+Verified: `bit lint runtime 2>&1 | tail -1` moved from `lint: 114 findings,
+1 overrides active` to `lint: 84 findings, 1 overrides active` (84 = the
+18+18+7+41 already dispositioned above, unaffected); `grep -c '\[E0215\]'`
+on the same log moved 30 → 0. `bit check` on every touched submodule
+(`runtime/park/darwin`, `runtime/root/{darwin,linux,windows}`,
+`runtime/sched`, and the whole `runtime` tree) exits 0, and an actual
+program run (directory listing, a subprocess via `std/os.run`, and 8
+concurrent `spawn`ed workers rendezvousing over a channel, `BIT_WORKERS=4`)
+completed and exited 0 — the `runtime/root/**` boot invariant this
+document's own header requires before trusting a clean build.
+
+**Test:**
+```sh
+grep -c '\[E0215\]' "$LOG"   # target: 0
+```
 
 ## E0200 `max-file-lines` — NO FINDINGS, NO ACTION
 
