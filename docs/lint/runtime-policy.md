@@ -64,9 +64,13 @@ overrides active" denominator).
 | E0215 `unused-result` | 30 | 30 | **out of scope — filed separately, see below** |
 
 In-scope total (the 7 codes named in this ticket's acceptance):
-**115 → 114** findings after the one E0210 fix (`grep -cE
+**85 → 84** findings after the one E0210 fix (`grep -cE
 '\[(E0200|E0201|E0202|E0203|E0204|E0210|E0212)\]'` against a fresh
-`bit lint runtime 2>&1` log: was 85, now 84 — matches 18+18+7+41+0+0).
+`bit lint runtime 2>&1` log — matches 0+18+18+7+41+0+0). The linter's own
+overall total (all 8 codes it reports here, including out-of-scope E0215)
+moved **115 → 114** over the same fix, printed as `lint: 114 findings, 1
+overrides active` — the "1 overrides active" is the pre-existing
+`cryptohw.bit` override, unrelated to this ticket.
 
 **The ticket's "63" was measured 2026-08-08 and has drifted upward, not
 down, despite #2515's E0211 work and heavy runtime/ churn since (#3340
