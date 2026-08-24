@@ -398,105 +398,124 @@ fn discover(cfg: Cfg, scratch: string): []Case {
 
 // --- phase A: write every script, fork nothing -----------------------------
 
+// Builds the shell text a case's watchdog polls against. `wdPath` is the
+// `bit-gate-watchdog` symlink `driverScript` creates once, in `scratch`,
+// before either fan-out wave starts (read, never written, by every case's
+// poll). `budgetS` is the wall-clock deadline in seconds baked into the
+// script TEXT at generation time — not read at run time, so a script always
+// polls against whatever budget it was generated with. `retryTimedOut`
+// (`grading.bit`) calls this a second time with a LARGER `budgetS` to
+// regenerate a case's scripts for its one serialized retry: rerunning the
+// exact bytes phase A wrote would poll the identical threshold and die
+// identically under the same fleet contention that killed the first attempt
+// (#3665).
+//
+// Each script backgrounds its real work (`cmd &`) and captures that exact
+// child's pid in `$p`, then races it against a watchdog running as a
+// second background job (`$w`) — the per-job deadline a shared wave now
+// needs, since a whole wave of cases goes through one outer
+// `osRunBounded` call rather than one each. `wait "$p"` reports that
+// specific child's status (128+9=137 on our own SIGKILL, since nothing
+// else in this closed system sends it, which is what `decodeRc` below
+// reads back out of the `.rc` file). `kill "$w"` reaps the watchdog once
+// the real work is done so it does not outlive the script. No `exec`:
+// the backgrounded command is already the direct child (no wrapping
+// shell to hand status through), and control has to return to THIS
+// script afterward to write the `.rc` file.
+//
+// `$w`'s own stdio is detached (`</dev/null >/dev/null 2>&1`) rather than
+// left to inherit this script's — #2508's fanout runs one of these per
+// case, and on the success path the explicit `wait "$w"` right after
+// `kill "$w"` reaps it before this script exits, so bash never gets a
+// chance to report it later as an unsolicited "Terminated: 15" job (that
+// notice is what #2514 saw flooding a passing `test-imports-bit`'s own
+// output — a race between exit and bash's async job-status check, not
+// conditional on job-control/monitor mode).
+//
+// #2563: `$w` used to be one `sleep $T; kill -9`. `kill "$w"` on the
+// success path reaches only that subshell, not the `sleep` it forked (sh
+// cannot exec-replace into `sleep` here because a `kill -9` follows it),
+// so a SIGTERM'd subshell does not propagate to that child — `sleep`
+// reparented to pid 1 and ran out its own clock, up to `$T` later (224
+// measured after one `test-imports-bit` run, #2514's own count). `$w` now
+// POLLS instead of sleeping once: `kill -0 "$p"` every second, so on the
+// success path it notices `$p` is gone and exits within ~1s — normally
+// before `kill "$w"` below even runs — and even a lost race leaves only a
+// `sleep 1` behind, which finishes on its own within that same ~1s rather
+// than `$T`.
+//
+// #3231: the poll used to be `( exec -a bit-gate-watchdog sleep 1 )`.
+// `exec -a` (rename argv[0] before exec) is a bash/ksh extension; dash —
+// Debian's `/bin/sh`, and therefore this project's own x64 gate image —
+// rejects `-a` outright, so the subshell errored out INSTANTLY instead of
+// sleeping, `n` raced through the whole timeout budget in a fraction of a
+// real second, and every compile/run job here was killed almost
+// immediately on any dash host — the exact bug #3227 had already fixed
+// for `tools/build/gatesexec.bit`'s batch watchdog, independently duplicated
+// here. `driverScript` below now symlinks a `bit-gate-watchdog` name onto
+// the real `sleep` binary ONCE, in `scratch`, before either fan-out wave
+// starts (`wdPath`); every case's poll execs that shared symlink
+// directly, which gives the poll's `sleep` process the same argv[0]
+// rename through a plain, extension-free exec (POSIX: argv[0] is
+// whatever name you invoke) with no shell-detection branch, and a
+// `|| sleep 1` fallback keeps the poll correct even if the symlink is
+// somehow missing.
+//
+// Was kept as a SECOND COPY of #3227's mechanism through #3231/#3237, for
+// reasons that #3238 now supersedes: `tools/build/gates.bit` imports
+// `std/os`, and a Bit import is per-MODULE not per-file, so importing
+// anything FROM `gates.bit` would have dragged that whole `std/os`
+// dependency into this file — contradicting its own header comment ("no
+// `std/*` import, so it runs under a bare `bit run` with no BIT_STDLIB
+// needed to compile the harness itself"). #3238 resolved that by adding
+// a THIRD, zero-import leaf module (`tools/killtree/`, imported above)
+// holding just the shared shell-text producers, importable by both sides
+// without either depending on the other. `killTreeFnDef()` is called
+// here; each standalone per-case script still gets its own copy of the
+// shell TEXT baked in at generation time (there is no common parent
+// script here to hold one shared runtime definition, unlike
+// `tools/build/gatesexec.bit`'s batch script) — sharing the producer
+// function does not require sharing the emission granularity.
+//
+// #3066: `kill -9 "$p"` on the deadline branch only killed `$p` itself.
+// `$p` here is `bit build`/the compiled test binary — either can fork
+// its own children, which then ran on orphaned past this case's own
+// deadline. `killtree` walks `$p`'s descendants by PPID (`pgrep -P`,
+// Power-of-10-bounded to 20 levels), over THREE full walks before
+// killing anything (a late spawn is invisible to one pass and its own
+// ancestor may already be dead by the time a second pass looks — see
+// `killTreeFnDef`'s own comment in `tools/killtree/killtree.bit`,
+// verified there against `test-imports-bit`'s own continuously-
+// respawning `xargs -P` wave), then kills every discovered PID
+// individually — the same fix and the same reasoning as
+// `gateBatchUnit()` in `tools/build/gatesexec.bit` (read that comment for
+// why a process GROUP was tried and rejected).
+fn watchdogScript(wdPath: string, budgetS: int): string {
+  return killTreeFnDef() + "n=0; while kill -0 \"$p\" 2>/dev/null; do if [ \"$n\" -ge ${budgetS} ]; then killtree \"$p\"; break; fi; \"${wdPath}\" 1 || sleep 1; n=$((n + 1)); done"
+}
+
+fn compileScriptText(cfg: Cfg, c: Case, watchdog: string): string {
+  return "#!/bin/sh\nexport BIT_STDLIB=\"${cfg.stdlib}\"\nexport BIT_LIBBITRT=\"${cfg.libbitrt}\"\n\"${cfg.bitExe}\" build \"${c.dir}\" -o \"${c.bin}\" >\"${c.log}\" 2>&1 &\np=$!\n( ${watchdog} ) </dev/null >/dev/null 2>&1 &\nw=$!\nwait \"$p\"\nrc=$?\nkill \"$w\" 2>/dev/null\nwait \"$w\" 2>/dev/null\necho \"$rc\" > \"${c.compileRc}\"\nexit \"$rc\"\n"
+}
+
+// BIT_SELF_EXE is a real coupling, not decoration: tests/imports/pmadd_e2e
+// execs the compiler that built it (`bit add`) and panics without it. The
+// shell also hands the child the full inherited environment, which that
+// case's git/HOME/PATH usage needs.
+fn runScriptText(cfg: Cfg, c: Case, watchdog: string): string {
+  return "#!/bin/sh\nexport BIT_SELF_EXE=\"${cfg.bitExe}\"\n\"${c.bin}\" >\"${c.out}\" 2>\"${c.err}\" &\np=$!\n( ${watchdog} ) </dev/null >/dev/null 2>&1 &\nw=$!\nwait \"$p\"\nrc=$?\nkill \"$w\" 2>/dev/null\nwait \"$w\" 2>/dev/null\necho \"$rc\" > \"${c.runRc}\"\nexit \"$rc\"\n"
+}
+
 fn writeScripts(cfg: Cfg, cases: []Case, scratch: string) {
-  // Where `driverScript`'s setup line symlinks `bit-gate-watchdog` onto the
-  // real `sleep` binary, once, before either fan-out wave starts. One path
-  // per run, read (never written) by every case's poll below.
   let wdPath = "${scratch}/bit-gate-watchdog"
+  let watchdog = watchdogScript(wdPath, cfg.timeoutMs / 1000)
   let i = 0
   while (i < len(cases)) {
     let c = cases[i]
-    // Each script backgrounds its real work (`cmd &`) and captures that exact
-    // child's pid in `$p`, then races it against a watchdog running as a
-    // second background job (`$w`) — the per-job deadline a shared wave now
-    // needs, since a whole wave of cases goes through one outer
-    // `osRunBounded` call rather than one each. `wait "$p"` reports that
-    // specific child's status (128+9=137 on our own SIGKILL, since nothing
-    // else in this closed system sends it, which is what `decodeRc` below
-    // reads back out of the `.rc` file). `kill "$w"` reaps the watchdog once
-    // the real work is done so it does not outlive the script. No `exec`:
-    // the backgrounded command is already the direct child (no wrapping
-    // shell to hand status through), and control has to return to THIS
-    // script afterward to write the `.rc` file.
-    //
-    // `$w`'s own stdio is detached (`</dev/null >/dev/null 2>&1`) rather than
-    // left to inherit this script's — #2508's fanout runs one of these per
-    // case, and on the success path the explicit `wait "$w"` right after
-    // `kill "$w"` reaps it before this script exits, so bash never gets a
-    // chance to report it later as an unsolicited "Terminated: 15" job (that
-    // notice is what #2514 saw flooding a passing `test-imports-bit`'s own
-    // output — a race between exit and bash's async job-status check, not
-    // conditional on job-control/monitor mode).
-    //
-    // #2563: `$w` used to be one `sleep $T; kill -9`. `kill "$w"` on the
-    // success path reaches only that subshell, not the `sleep` it forked (sh
-    // cannot exec-replace into `sleep` here because a `kill -9` follows it),
-    // so a SIGTERM'd subshell does not propagate to that child — `sleep`
-    // reparented to pid 1 and ran out its own clock, up to `$T` later (224
-    // measured after one `test-imports-bit` run, #2514's own count). `$w` now
-    // POLLS instead of sleeping once: `kill -0 "$p"` every second, so on the
-    // success path it notices `$p` is gone and exits within ~1s — normally
-    // before `kill "$w"` below even runs — and even a lost race leaves only a
-    // `sleep 1` behind, which finishes on its own within that same ~1s rather
-    // than `$T`.
-    //
-    // #3231: the poll used to be `( exec -a bit-gate-watchdog sleep 1 )`.
-    // `exec -a` (rename argv[0] before exec) is a bash/ksh extension; dash —
-    // Debian's `/bin/sh`, and therefore this project's own x64 gate image —
-    // rejects `-a` outright, so the subshell errored out INSTANTLY instead of
-    // sleeping, `n` raced through the whole timeout budget in a fraction of a
-    // real second, and every compile/run job here was killed almost
-    // immediately on any dash host — the exact bug #3227 had already fixed
-    // for `tools/build/gatesexec.bit`'s batch watchdog, independently duplicated
-    // here. `driverScript` below now symlinks a `bit-gate-watchdog` name onto
-    // the real `sleep` binary ONCE, in `scratch`, before either fan-out wave
-    // starts (`wdPath`); every case's poll execs that shared symlink
-    // directly, which gives the poll's `sleep` process the same argv[0]
-    // rename through a plain, extension-free exec (POSIX: argv[0] is
-    // whatever name you invoke) with no shell-detection branch, and a
-    // `|| sleep 1` fallback keeps the poll correct even if the symlink is
-    // somehow missing.
-    //
-    // Was kept as a SECOND COPY of #3227's mechanism through #3231/#3237, for
-    // reasons that #3238 now supersedes: `tools/build/gates.bit` imports
-    // `std/os`, and a Bit import is per-MODULE not per-file, so importing
-    // anything FROM `gates.bit` would have dragged that whole `std/os`
-    // dependency into this file — contradicting its own header comment ("no
-    // `std/*` import, so it runs under a bare `bit run` with no BIT_STDLIB
-    // needed to compile the harness itself"). #3238 resolved that by adding
-    // a THIRD, zero-import leaf module (`tools/killtree/`, imported above)
-    // holding just the shared shell-text producers, importable by both sides
-    // without either depending on the other. `killTreeFnDef()` is called
-    // here; each standalone per-case script still gets its own copy of the
-    // shell TEXT baked in at generation time (there is no common parent
-    // script here to hold one shared runtime definition, unlike
-    // `tools/build/gatesexec.bit`'s batch script) — sharing the producer
-    // function does not require sharing the emission granularity.
-    //
-    // #3066: `kill -9 "$p"` on the deadline branch only killed `$p` itself.
-    // `$p` here is `bit build`/the compiled test binary — either can fork
-    // its own children, which then ran on orphaned past this case's own
-    // deadline. `killtree` walks `$p`'s descendants by PPID (`pgrep -P`,
-    // Power-of-10-bounded to 20 levels), over THREE full walks before
-    // killing anything (a late spawn is invisible to one pass and its own
-    // ancestor may already be dead by the time a second pass looks — see
-    // `killTreeFnDef`'s own comment in `tools/killtree/killtree.bit`,
-    // verified there against `test-imports-bit`'s own continuously-
-    // respawning `xargs -P` wave), then kills every discovered PID
-    // individually — the same fix and the same reasoning as
-    // `gateBatchUnit()` in `tools/build/gatesexec.bit` (read that comment for
-    // why a process GROUP was tried and rejected).
-    let watchdog = killTreeFnDef() + "n=0; while kill -0 \"$p\" 2>/dev/null; do if [ \"$n\" -ge ${cfg.timeoutMs / 1000} ]; then killtree \"$p\"; break; fi; \"${wdPath}\" 1 || sleep 1; n=$((n + 1)); done"
-    let compile = "#!/bin/sh\nexport BIT_STDLIB=\"${cfg.stdlib}\"\nexport BIT_LIBBITRT=\"${cfg.libbitrt}\"\n\"${cfg.bitExe}\" build \"${c.dir}\" -o \"${c.bin}\" >\"${c.log}\" 2>&1 &\np=$!\n( ${watchdog} ) </dev/null >/dev/null 2>&1 &\nw=$!\nwait \"$p\"\nrc=$?\nkill \"$w\" 2>/dev/null\nwait \"$w\" 2>/dev/null\necho \"$rc\" > \"${c.compileRc}\"\nexit \"$rc\"\n"
-    // BIT_SELF_EXE is a real coupling, not decoration: tests/imports/pmadd_e2e
-    // execs the compiler that built it (`bit add`) and panics without it. The
-    // shell also hands the child the full inherited environment, which that
-    // case's git/HOME/PATH usage needs.
-    let run = "#!/bin/sh\nexport BIT_SELF_EXE=\"${cfg.bitExe}\"\n\"${c.bin}\" >\"${c.out}\" 2>\"${c.err}\" &\np=$!\n( ${watchdog} ) </dev/null >/dev/null 2>&1 &\nw=$!\nwait \"$p\"\nrc=$?\nkill \"$w\" 2>/dev/null\nwait \"$w\" 2>/dev/null\necho \"$rc\" > \"${c.runRc}\"\nexit \"$rc\"\n"
-    if (!writeWhole(c.compileSh, compile) || fsChmod(c.compileSh, scriptMode) != 0) {
+    if (!writeWhole(c.compileSh, compileScriptText(cfg, c, watchdog)) || fsChmod(c.compileSh, scriptMode) != 0) {
       fatal("cannot write compile script for '${c.name}' at ${c.compileSh}")
     }
-    if (!writeWhole(c.runSh, run) || fsChmod(c.runSh, scriptMode) != 0) {
+    if (!writeWhole(c.runSh, runScriptText(cfg, c, watchdog)) || fsChmod(c.runSh, scriptMode) != 0) {
       fatal("cannot write run script for '${c.name}' at ${c.runSh}")
     }
     i = i + 1
@@ -666,6 +685,9 @@ fn main() {
   // `fatal` needs no unwinding of its own.
   let cases = discover(cfg, scratch)
   print("imports: discovered ${len(cases)} cases under ${cfg.corpus}\n")
+  // Printed so a `Killed: 9`/`TIMED OUT` in this gate's log can be read
+  // against the actual budget without opening the source (#3665 acceptance).
+  print("imports: per-case timeout budget ${cfg.timeoutMs / 1000}s, retry budget ${cfg.timeoutMs / 1000 * retryTimeoutMultiplier}s\n")
 
   if (fsMkdir(scratch) < 0) {
     fatal("cannot create scratch directory ${scratch}")
@@ -675,11 +697,15 @@ fn main() {
   let driver = runDriver(cfg, scratch, len(cases))
 
   // #3593: a case whose OWN watchdog fired (compile or run, SIGKILL/137) gets
-  // one retry, alone, before grading — see `grading.bit`'s header note on
-  // `retryTimedOut` for why serialized-not-bigger is the fix for a false
-  // TIMED OUT under this box's fleet contention, and how a genuine hang still
-  // gets caught (it times out again, identically, on the retry).
-  let retried = retryTimedOut(cfg, cases)
+  // one retry, alone, before grading. #3665: the retry regenerates that
+  // case's scripts with a LARGER budget (`retryTimeoutMultiplier`,
+  // `grading.bit`) rather than rerunning the same bytes under the same
+  // deadline — see `grading.bit`'s header note on `retryTimedOut` for why a
+  // fresh, bigger budget is the fix for a false TIMED OUT under this box's
+  // fleet contention, and how a genuine hang still gets caught (it times out
+  // again on the retry, just with more rope, worst case bounded at two
+  // budgets instead of one).
+  let retried = retryTimedOut(cfg, cases, scratch)
   if (retried != 0) {
     print("imports: ${retried} case(s) retried serialized after their own watchdog fired\n")
   }
