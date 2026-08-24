@@ -300,6 +300,135 @@ fn writeStackMaps(out: ByteBuf, funcs: []FuncStackMap): []int {
   return relocOffsets
 }
 
+// ===========================================================================
+// Debug-info line table (runtime/ABI.md §4.2, #3281/#3283)
+//
+// A second, independent side table laid out like the stack-map table above
+// (same per-member/linker-merged shape), mapping a return address back to a
+// source file:line for a runtime panic-time stack walk (#3285). Each
+// function's rows are built as its code is emitted, by comparing every
+// instruction's #3282 span against the last recorded row — see
+// appendDebugLineIfChanged below, called from arm64compile.bit's and
+// x64dispatch.bit's own per-instruction emission loops.
+// ===========================================================================
+
+// Format version stamped into every entry's header (mirrors smFormatVersion
+// above; ABI.md §4.2 chose the identical position and reasoning — a
+// producer/reader build-stage skew is the identical exposure #1927/#3189
+// already paid for once).
+const dbgFormatVersion = 1
+
+// One row of a function's debug-info line table: `pcOffset` is this row's
+// start offset within the function's own code, spanning to the next row's
+// pcOffset (or to the entry's codeSize for the last row). `file` is a
+// SourceManager FileId (resolved to a string-pool header by the object
+// writer, which is the only place that also holds the SourceManager); `line`
+// is already 1-based, resolved once when the row was created rather than
+// carried as a byte offset for a reader to re-resolve.
+class DebugLineRow {
+  pcOffset: int,
+  file: int,
+  line: int,
+}
+
+// One function's contribution to the module debug-info table. `rows` is
+// empty for a function with no source-mapped instruction at all (fully
+// synthetic) — writeDebugLines below skips such a function entirely rather
+// than emit a dishonest all-zero entry; the walker's linear scan then simply
+// never finds that function's range and prints a raw address, exactly the
+// "no record" contract ABI.md §4.2 already specifies for an unmapped pc.
+class FuncDebugLines {
+  codeSize: int,
+  rows: []DebugLineRow,
+}
+
+// Resolves `span` to the (file, 1-based line) a debug-info row records, or
+// `hasRow: false` for `unknownSpan()` (compiler/ir.bit) — a synthesized
+// instruction with no honest single source point contributes no row of its
+// own; the caller inherits whichever row most recently applied, which is an
+// honest "closest known" answer rather than a confidently wrong one.
+class DebugPos {
+  hasRow: bool,
+  file: int,
+  line: int,
+}
+
+fn debugPosOf(sm: SourceManager, span: Span): DebugPos {
+  if (span.file < 0) {
+    return DebugPos{ hasRow: false, file: -1, line: 0 }
+  }
+  return DebugPos{ hasRow: true, file: span.file,
+    line: locate(sm, span.file, span.start).line + 1 } // 0-based -> 1-based
+}
+
+// Appends a new row to `rows` when `pos` names a different (file, line) than
+// the last one — ABI.md §4.2's row-per-source-position compaction, which is
+// also what keeps rows sorted: the caller invokes this in final code-emission
+// order (see the note on ABI.md §4.2 about x86-64 RPO block reordering), so
+// rows come out already ascending by construction. A `!pos.hasRow` position
+// never starts a new row (see DebugPos above).
+fn appendDebugLineIfChanged(rows: []DebugLineRow, pos: DebugPos, codeOffset: int): []DebugLineRow {
+  if (!pos.hasRow) {
+    return rows
+  }
+  if (len(rows) > 0 && rows[len(rows) - 1].file == pos.file &&
+      rows[len(rows) - 1].line == pos.line) {
+    return rows
+  }
+  return append(rows, DebugLineRow{ pcOffset: codeOffset, file: pos.file, line: pos.line })
+}
+
+// Returned by writeDebugLines: for each entry actually written (a function
+// with zero rows contributes none — see FuncDebugLines), the byte offset
+// within `out` of that entry's 8-byte code_addr field, and which index into
+// the caller's `funcs` (hence its own `emittedNames`) it came from. The two
+// lists stay aligned to each other by construction, but a caller must look up
+// the owning function through `funcIndices`, not by position, since a
+// zero-row function leaves a gap `relocOffsets` never has an entry for.
+class DbgWriteResult {
+  relocOffsets: []int,
+  funcIndices: []int,
+}
+
+// Serializes the module debug-info table (ABI.md §4.2) by appending its blob
+// to `out`, mirroring writeStackMaps' shape and NO-leading-count rationale.
+//
+// Layout per function, little-endian: `u64 codeAddr` (reloc, filled by the
+// object writer), `u16 formatVersion` (dbgFormatVersion, checked by the
+// reader before code_size/num_rows are trusted — same position choice as
+// smFormatVersion, right after codeAddr, for the same reason), `u32
+// codeSize`, `u16 numRows`, then numRows x { `u32 pcOffset`, `u64
+// fileHdrPtr` (reloc, filled by the object writer against the interned
+// string-pool header for that row's file), `u32 line` }. The 16-byte header
+// and each 16-byte row are already multiples of 8 (ABI.md §4.2), so unlike
+// writeStackMaps this format needs no padding step at all.
+fn writeDebugLines(out: ByteBuf, funcs: []FuncDebugLines): DbgWriteResult {
+  let relocOffsets = []int(0)
+  let funcIndices = []int(0)
+  let fi = 0
+  while (fi < len(funcs)) {
+    let fd = funcs[fi]
+    if (len(fd.rows) > 0) {
+      let entryStart = len(out.bytes)
+      relocOffsets = append(relocOffsets, entryStart)
+      funcIndices = append(funcIndices, fi)
+      appendU64(out, 0) // codeAddr — filled by the reloc
+      appendU16(out, dbgFormatVersion)
+      appendU32(out, fd.codeSize)
+      appendU16(out, len(fd.rows))
+      let ri = 0
+      while (ri < len(fd.rows)) {
+        appendU32(out, fd.rows[ri].pcOffset)
+        appendU64(out, 0) // fileHdrPtr — filled by the caller's reloc
+        appendU32(out, fd.rows[ri].line)
+        ri = ri + 1
+      }
+    }
+    fi = fi + 1
+  }
+  return DbgWriteResult{ relocOffsets: relocOffsets, funcIndices: funcIndices }
+}
+
 // The runtime symbol implementing an rt_call. The IR names the primitive the way
 // the seed's RtFn tag does, and every runtime export is that tag prefixed with
 // `bit_rt_` — except the two error-slot accessors, whose symbols read
