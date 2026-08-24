@@ -1,0 +1,342 @@
+// ARM64 hardware SHA-256 via the ARMv8 Cryptographic Extension: SHA256H,
+// SHA256H2 (compression, four rounds per pair) and SHA256SU0, SHA256SU1
+// (message schedule extension). #2524, epic #1224, mirrors #2522's
+// armaes.bit and #2523's armghash.bit exactly: same extern-free module-scope
+// sharing of `bit_rt_crypto_hwcaps`/`onX64`, same asm-provenance methodology,
+// same hwcaps guard shape.
+//
+// One pin, matching the ticket's own signature exactly:
+//
+//   bit_rt_sha256_hw_blocks(state: int, data: int, blocks: u64)
+//
+// `state` points at a PACKED 32-byte buffer: 8 running u32 words (a..h),
+// each 4 bytes, native (little-endian on ARM64) byte order per word,
+// updated in place. This is deliberately NOT the same layout a Bit `[]u32`
+// slice's own `ptrOf` addresses — SPEC §11.8 states a slice stores one
+// 8-byte WORD per element (only `[]u8`/`[]byte` is byte-packed) — so a
+// future caller holding `stdlib/crypto/sha256.bit`'s `state: []u32` field
+// must marshal it into/out of a packed `[]byte(32)` around each call, the
+// same "pack for the extern boundary, unpack after" shape
+// `stdlib/crypto/gcm.bit`'s `gcmAbsorbHw` already uses for its own (already
+// byte-shaped) GHASH state. `data` points at `64 * blocks` PACKED bytes
+// (a `[]byte`, already the right layout), the raw message, read big-endian
+// per FIPS 180-4's own convention. Every pointer is a raw address (`int`),
+// the same convention every other pin in this tree uses.
+//
+// NO CALLER YET, DELIBERATELY (ticket constraint, same as #2522/#2523).
+// Wiring `stdlib/crypto/sha256.bit`'s `compress` through this is a later
+// ticket's job, same stage0-bootstrap reasoning #2521 documented.
+//
+// PLATFORM-FREE, same reasoning as armaes.bit/armghash.bit: no OS service is
+// needed, only the CPU's own SHA256H/SHA256H2/SHA256SU0/SHA256SU1, so this
+// file compiles once per TARGET and the exported function starts
+// `if (onX64()) return`.
+//
+// THE SHA-2 EXTENSION IS OPTIONAL IN THE ARMv8-A BASE, separate from AES and
+// PMULL (each its own ARMv8 Cryptographic Extension feature bit), so the
+// exported function also calls `sha256RequireHwSupport` — reads bit 2 (SHA2)
+// of `bit_rt_crypto_hwcaps()` and panics with a clear message instead of
+// letting an unsupported CPU fault on the first SHA256H. A binary built and
+// tested only on a chip that HAS the extension (this Mac included) will not
+// notice a missing guard locally; the guard is what stands between that and
+// SIGILL on, e.g., a Cortex-A72 (no SHA2 instructions).
+//
+// `bit_rt_crypto_hwcaps` and `onX64` are declared/imported by `armaes.bit`,
+// in this SAME module (`runtime/cryptohw/`) — a module is the import scope,
+// not a file — so this file calls both directly with no extern of its own.
+//
+// ENCODING PROVENANCE. As armaes.bit/armghash.bit: no text assembler in this
+// compiler (SPEC §11.6), so every word below was produced by assembling the
+// intended AArch64 mnemonics with this Mac's native toolchain (`as -arch
+// arm64`) and reading the encoding back with `objdump -d
+// --triple=arm64-apple-darwin`, not transcribed from memory.
+//
+// ALGORITHM PROVENANCE. The per-block instruction sequence (load state and
+// message, REV32 the message into big-endian words, 16 "quad rounds" of
+// SHA256SU0+SHA256H+SHA256H2+SHA256SU1 for rounds 0-47, three trailing quads
+// of SHA256H+SHA256H2 alone for rounds 48-63 since no further schedule words
+// are needed past W63, then add the saved pre-block state back in) is the
+// standard ARMv8 crypto-extension SHA-256 sequence every real-world
+// implementation of this instruction set uses (OpenSSL, BoringSSL, the Linux
+// kernel's `sha2-ce-core.S`). It was NOT hand-derived from the instructions'
+// bit-level pseudocode; it was validated two independent ways before any hex
+// word was written: (1) compiled from ARM Neon C intrinsics
+// (`vsha256hq_u32` etc.) via this Mac's own clang, executed on this Mac's
+// real SHA2-capable hardware, and checked against `hashlib.sha256` (FIPS
+// 180-4 test vectors plus the block-boundary edge cases below) — this
+// exercises the CPU's actual instruction semantics through a trusted
+// compiler, not a remembered formula; (2) the hand-assembled `.s`
+// translation of that same sequence was independently linked and run
+// against the identical vector set with the identical result. See smash
+// #2524 for the full harness and vector list.
+//
+// SPLIT IN TWO (`hwSha256RoundsA`/`hwSha256RoundsB`), at a natural quad
+// boundary (after round 31 of 63), to stay under this repo's own
+// `max-fn-lines` lint limit (E0201, 80): one straight-line 115-instruction
+// function scanned 142 source lines. The split is NOT free — one value is
+// genuinely LIVE across the boundary beyond the obvious running state
+// (`STATE0`/`STATE1`) and message words (`MSG0..MSG3`): the reference
+// algorithm computes each quad's `W+K` sum ONE STEP EARLY (pipelined), so
+// the sum for quad 8 is computed inside quad 7's own instruction block and
+// consumed only when quad 8 runs. Missing this on the first attempt produced
+// 28/28 WRONG digests; explicitly spilling it (`RoundsA`'s last three
+// instructions, `RoundsB`'s `v16` reload) is what the differential in the
+// paragraph above actually exercised before this shape was accepted. `RoundsA`
+// also consumes 36, not 32, of the 64 K-table words for the same
+// pipelining reason — `rtSha256HwBlocks` passes `RoundsB` a K pointer
+// pre-offset by 36 words, not 32.
+//
+// REGISTER CHOICE. v0-v7, v16-v18 and v20 are AAPCS64 caller-saved (never
+// preserved across a call) and neither function declares a float/vector
+// local of its own, so — as armghash.bit's header argues for its v0-v6 —
+// none of them ever alias a live Bit-level value; SPEC §11.6's register list
+// has no vector-register spelling in any case (only `x0`-`x30`/`sp`/`xzr`).
+// `x4` IS named in `clobber`: unlike the vector registers, it is a GPR the
+// asm block computes an address into (`ADD x4, x3/x1, #imm`) with no `input`
+// binding of its own, the same reason armghash.bit's `hwGhashRawProducts`
+// clobbers its own computed `x3`/`x4`/`x5`.
+//
+// K TABLE. `sha256KTable` returns the same 64 round constants (FIPS 180-4
+// §4.2.2) as `stdlib/crypto/sha256.bit`'s own `roundConstants`, PACKED into
+// 256 bytes (`putU32LE`, see its own header for why a `[]u32` cannot be
+// used here), built once per `bit_rt_sha256_hw_blocks` call (not once per
+// block) and read through a pointer the asm blocks index with
+// `LD1 ..., [x2], #16` (post-increment by one quad each of the 16 groups of
+// four constants a full block needs).
+
+fn sha256RequireHwSupport() {
+  if ((bit_rt_crypto_hwcaps() & 4) == 0) {
+    panic("bit_rt_sha256_hw: ARMv8 Cryptographic Extension (SHA2) not available on this CPU")
+  }
+}
+
+// Writes `v` as 4 native-endian (little-endian on ARM64) bytes at
+// `buf[off..off+3]` — the tightly packed layout `LD1` needs. A Bit `[]u32`
+// slice does NOT have this layout: SPEC §11.8 states a slice stores one
+// 8-byte WORD per element (only `[]u8`/`[]byte` is byte-packed), so
+// `ptrOf` on a `[]u32` does not address 4-byte-packed words at all — the
+// first version of this file passed `ptrOf` of a `[]u32` K-table straight
+// to `LD1` and read every 4th real word interleaved with 4 zero-padding
+// bytes, confirmed by probing a `[]u32`'s own raw byte layout. Every packed
+// buffer this file hands to asm (K table, and any `state`/`data` a caller
+// builds) must be a `[]byte`, populated through a helper like this one, not
+// a `[]u32`'s own `ptrOf`.
+fn putU32LE(buf: []byte, off: int, v: u32) {
+  buf[off] = byte(v)
+  buf[off + 1] = byte(v >> 8)
+  buf[off + 2] = byte(v >> 16)
+  buf[off + 3] = byte(v >> 24)
+}
+
+// The 64 round constants (FIPS 180-4 §4.2.2), the same values as
+// `stdlib/crypto/sha256.bit`'s `roundConstants` — kept as this file's own
+// copy per this tree's established convention (armghash.bit's header) of a
+// small, self-contained file over a cross-file reach — packed into 256
+// bytes (native-endian per word) for `LD1`, per `putU32LE`'s own header.
+fn sha256KTable(): []byte {
+  let vals = []u32{
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+  }
+  let buf = []byte(256)
+  let i = 0
+  while (i < 64) {
+    putU32LE(buf, i * 4, vals[i])
+    i = i + 1
+  }
+  return buf
+}
+
+// Rounds 0-31 (quads 0-7): loads state+message, REV32s the message, runs 8
+// quad rounds. Leaves the evolved STATE0/STATE1/MSG0..MSG3 AND the pending
+// quad-8 `W+K` sum (`v16`) spilled to `scratch` (112 bytes) for
+// `hwSha256RoundsB` — see the file header for why that last value must be
+// spilled too. `state` is read only here, never written (the pristine
+// pre-block state is still needed by `hwSha256RoundsB`'s feed-forward add).
+fn hwSha256RoundsA(state: int, block: int, ktable: int, scratch: int) {
+  asm volatile {
+    arm64 {
+      0x4c40a800, // ld1.4s { v0, v1 }, [x0]          STATE0=ABCD, STATE1=EFGH
+      0x4c402824, // ld1.4s { v4, v5, v6, v7 }, [x1]   MSG0..MSG3 = the 64-byte block
+      0x6e200884, // rev32.16b v4, v4                  big-endian bytes -> native words
+      0x6e2008a5, // rev32.16b v5, v5
+      0x6e2008c6, // rev32.16b v6, v6
+      0x6e2008e7, // rev32.16b v7, v7
+      0x4cdf7854, // ld1.4s { v20 }, [x2], #16          K[0..3]
+      0x4eb48490, // add.4s v16, v4, v20                pending WK for THIS quad
+      0x5e2828a4, // sha256su0.4s v4, v5
+      0x4ea01c12, // mov.16b v18, v0                    TMP2 = STATE0 (pre-round)
+      0x4cdf7854, // ld1.4s { v20 }, [x2], #16          K[4..7]
+      0x4eb484b1, // add.4s v17, v5, v20                pending WK for the NEXT quad
+      0x5e104020, // sha256h.4s q0, q1, v16
+      0x5e105241, // sha256h2.4s q1, q18, v16
+      0x5e0760c4, // sha256su1.4s v4, v6, v7
+      0x4cdf7854, // ld1.4s { v20 }, [x2], #16          K[8..11]
+      0x4eb484d0, // add.4s v16, v6, v20
+      0x5e2828c5, // sha256su0.4s v5, v6
+      0x4ea01c12, // mov.16b v18, v0
+      0x5e114020, // sha256h.4s q0, q1, v17
+      0x5e115241, // sha256h2.4s q1, q18, v17
+      0x5e0460e5, // sha256su1.4s v5, v7, v4
+      0x4cdf7854, // ld1.4s { v20 }, [x2], #16          K[12..15]
+      0x4eb484f1, // add.4s v17, v7, v20
+      0x5e2828e6, // sha256su0.4s v6, v7
+      0x4ea01c12, // mov.16b v18, v0
+      0x5e104020, // sha256h.4s q0, q1, v16
+      0x5e105241, // sha256h2.4s q1, q18, v16
+      0x5e056086, // sha256su1.4s v6, v4, v5
+      0x4cdf7854, // ld1.4s { v20 }, [x2], #16          K[16..19]
+      0x4eb48490, // add.4s v16, v4, v20
+      0x5e282887, // sha256su0.4s v7, v4
+      0x4ea01c12, // mov.16b v18, v0
+      0x5e114020, // sha256h.4s q0, q1, v17
+      0x5e115241, // sha256h2.4s q1, q18, v17
+      0x5e0660a7, // sha256su1.4s v7, v5, v6
+      0x4cdf7854, // ld1.4s { v20 }, [x2], #16          K[20..23]
+      0x4eb484b1, // add.4s v17, v5, v20
+      0x5e2828a4, // sha256su0.4s v4, v5
+      0x4ea01c12, // mov.16b v18, v0
+      0x5e104020, // sha256h.4s q0, q1, v16
+      0x5e105241, // sha256h2.4s q1, q18, v16
+      0x5e0760c4, // sha256su1.4s v4, v6, v7
+      0x4cdf7854, // ld1.4s { v20 }, [x2], #16          K[24..27]
+      0x4eb484d0, // add.4s v16, v6, v20
+      0x5e2828c5, // sha256su0.4s v5, v6
+      0x4ea01c12, // mov.16b v18, v0
+      0x5e114020, // sha256h.4s q0, q1, v17
+      0x5e115241, // sha256h2.4s q1, q18, v17
+      0x5e0460e5, // sha256su1.4s v5, v7, v4
+      0x4cdf7854, // ld1.4s { v20 }, [x2], #16          K[28..31]
+      0x4eb484f1, // add.4s v17, v7, v20
+      0x5e2828e6, // sha256su0.4s v6, v7
+      0x4ea01c12, // mov.16b v18, v0
+      0x5e104020, // sha256h.4s q0, q1, v16
+      0x5e105241, // sha256h2.4s q1, q18, v16
+      0x5e056086, // sha256su1.4s v6, v4, v5
+      0x4cdf7854, // ld1.4s { v20 }, [x2], #16          K[32..35]: quad 8's WK, consumed only in RoundsB
+      0x4eb48490, // add.4s v16, v4, v20                pending across the split boundary
+      0x5e282887, // sha256su0.4s v7, v4
+      0x4ea01c12, // mov.16b v18, v0
+      0x5e114020, // sha256h.4s q0, q1, v17
+      0x5e115241, // sha256h2.4s q1, q18, v17
+      0x5e0660a7, // sha256su1.4s v7, v5, v6
+      0x4c00a860, // st1.4s { v0, v1 }, [x3]            spill STATE0/STATE1
+      0x91008064, // add x4, x3, #0x20
+      0x4c002884, // st1.4s { v4, v5, v6, v7 }, [x4]    spill MSG0..MSG3
+      0x91018064, // add x4, x3, #0x60
+      0x4c007890, // st1.4s { v16 }, [x4]               spill the pending quad-8 WK
+    }
+    input arm64 x0 x64 rax = state
+    input arm64 x1 x64 rcx = block
+    input arm64 x2 x64 rdx = ktable
+    input arm64 x3 x64 rsi = scratch
+    clobber arm64 { memory, x4 }
+  }
+}
+
+// Rounds 32-63 (quads 8-15): reloads the state from `hwSha256RoundsA` via
+// `scratch`, reloads the pristine pre-block state from `state` for the
+// feed-forward add, runs the remaining 8 quad rounds (4 with message-schedule
+// extension, 4 without — W63 is the last schedule word needed), adds the
+// pre-block state back in, and writes the final 8-word state to `state`.
+fn hwSha256RoundsB(state: int, scratch: int, ktable: int) {
+  asm volatile {
+    arm64 {
+      0x4c40a820, // ld1.4s { v0, v1 }, [x1]            reload STATE0/STATE1
+      0x91008024, // add x4, x1, #0x20
+      0x4c402884, // ld1.4s { v4, v5, v6, v7 }, [x4]    reload MSG0..MSG3
+      0x91018024, // add x4, x1, #0x60
+      0x4c407890, // ld1.4s { v16 }, [x4]               reload the pending quad-8 WK RoundsA spilled
+      0x4c40a802, // ld1.4s { v2, v3 }, [x0]            ABCD_SAVE/EFGH_SAVE = pristine pre-block state
+      0x4cdf7854, // ld1.4s { v20 }, [x2], #16          K[36..39]
+      0x4eb484b1, // add.4s v17, v5, v20
+      0x5e2828a4, // sha256su0.4s v4, v5
+      0x4ea01c12, // mov.16b v18, v0
+      0x5e104020, // sha256h.4s q0, q1, v16
+      0x5e105241, // sha256h2.4s q1, q18, v16
+      0x5e0760c4, // sha256su1.4s v4, v6, v7
+      0x4cdf7854, // ld1.4s { v20 }, [x2], #16          K[40..43]
+      0x4eb484d0, // add.4s v16, v6, v20
+      0x5e2828c5, // sha256su0.4s v5, v6
+      0x4ea01c12, // mov.16b v18, v0
+      0x5e114020, // sha256h.4s q0, q1, v17
+      0x5e115241, // sha256h2.4s q1, q18, v17
+      0x5e0460e5, // sha256su1.4s v5, v7, v4
+      0x4cdf7854, // ld1.4s { v20 }, [x2], #16          K[44..47]
+      0x4eb484f1, // add.4s v17, v7, v20
+      0x5e2828e6, // sha256su0.4s v6, v7
+      0x4ea01c12, // mov.16b v18, v0
+      0x5e104020, // sha256h.4s q0, q1, v16
+      0x5e105241, // sha256h2.4s q1, q18, v16
+      0x5e056086, // sha256su1.4s v6, v4, v5
+      0x4cdf7854, // ld1.4s { v20 }, [x2], #16          K[48..51]
+      0x4eb48490, // add.4s v16, v4, v20
+      0x5e282887, // sha256su0.4s v7, v4
+      0x4ea01c12, // mov.16b v18, v0
+      0x5e114020, // sha256h.4s q0, q1, v17
+      0x5e115241, // sha256h2.4s q1, q18, v17
+      0x5e0660a7, // sha256su1.4s v7, v5, v6
+      0x4cdf7854, // ld1.4s { v20 }, [x2], #16          K[52..55] (no further schedule extension needed)
+      0x4eb484b1, // add.4s v17, v5, v20
+      0x4ea01c12, // mov.16b v18, v0
+      0x5e104020, // sha256h.4s q0, q1, v16
+      0x5e105241, // sha256h2.4s q1, q18, v16
+      0x4cdf7854, // ld1.4s { v20 }, [x2], #16          K[56..59]
+      0x4eb484d0, // add.4s v16, v6, v20
+      0x4ea01c12, // mov.16b v18, v0
+      0x5e114020, // sha256h.4s q0, q1, v17
+      0x5e115241, // sha256h2.4s q1, q18, v17
+      0x4cdf7854, // ld1.4s { v20 }, [x2], #16          K[60..63]
+      0x4eb484f1, // add.4s v17, v7, v20
+      0x4ea01c12, // mov.16b v18, v0
+      0x5e104020, // sha256h.4s q0, q1, v16
+      0x5e105241, // sha256h2.4s q1, q18, v16
+      0x4ea01c12, // mov.16b v18, v0
+      0x5e114020, // sha256h.4s q0, q1, v17
+      0x5e115241, // sha256h2.4s q1, q18, v17
+      // Feed-forward: state += the pre-block saved state.
+      0x4ea28400, // add.4s v0, v0, v2
+      0x4ea38421, // add.4s v1, v1, v3
+      0x4c00a800, // st1.4s { v0, v1 }, [x0]
+    }
+    input arm64 x0 x64 rax = state
+    input arm64 x1 x64 rcx = scratch
+    input arm64 x2 x64 rdx = ktable
+    clobber arm64 { memory, x4 }
+  }
+}
+
+// `bit_rt_sha256_hw_blocks(state, data, blocks)`: folds `blocks` 64-byte
+// blocks at `data` into the running 8-word SHA-256 state at `state` (native
+// u32 words, mutated in place), one `hwSha256RoundsA`+`hwSha256RoundsB` pair
+// per block, in order — the same recurrence `stdlib/crypto/sha256.bit`'s
+// software `compress` implements per block, called once per 64 bytes by its
+// own `write`/`sum`.
+export @symbol("bit_rt_sha256_hw_blocks") fn rtSha256HwBlocks(
+  state: int,
+  data: int,
+  blocks: u64,
+) {
+  if (onX64()) {
+    return
+  }
+  sha256RequireHwSupport()
+  let k = sha256KTable()
+  let kAddr = int(ptrOf(k))
+  let kAddrB = kAddr + 36 * 4
+  let scratch = []byte(112)
+  let scratchAddr = int(ptrOf(scratch))
+  let i: u64 = 0
+  while (i < blocks) {
+    let blockAddr = data + int(i) * 64
+    hwSha256RoundsA(state, blockAddr, kAddr, scratchAddr)
+    hwSha256RoundsB(state, scratchAddr, kAddrB)
+    i = i + 1
+  }
+}
