@@ -19,6 +19,10 @@
 //   BIT_LIBBITRT        absolute path to the target's libbitrt.a      required
 //   BIT_IMPORTS_FILTER  run one named project (must match exactly)    optional
 //   BIT_TEST_TIMEOUT_S  per-child wall clock, default 300             optional
+//                       (#3593: a case that misses this once, under
+//                       contention, gets one serialized retry before it is
+//                       graded as failed — see the design note below and
+//                       `grading.bit`'s `retryTimedOut`)
 //
 // WHY A SHELL WRAPPER. `osRunBounded` (ABI.md §19) is the only bounded child
 // wait Bit has, and it takes a path and nothing else — no argv, no env, no
@@ -74,6 +78,24 @@
 // every `.rc` file regardless of how either call returned, so an overrun
 // kills only the cases still in flight.
 //
+// A PER-CASE WATCHDOG FIRING IS NOT NECESSARILY A HANG (#3593). The 300s
+// per-case budget above has no contention allowance of its own, unlike this
+// wave-level bound — under real fleet load (this box runs ~20 agents; a
+// `boxlock` slot bounds concurrent BUILDS, not everything else running) a
+// correct case can be starved past its own watchdog's deadline with no bug
+// in the case at all. `grading.bit`'s `retryTimedOut` gives such a case one
+// retry, run ALONE rather than inside this wave's `xargs -P n` fan-out, so a
+// starved-not-hung case gets a fair shot without raising the budget (which
+// would only move the false-failure threshold, not remove it) — see that
+// file's header for why a genuine hang is still caught, unchanged.
+//
+// SPLIT ACROSS TWO FILES, SAME MODULE (#3593): this directory is the module
+// (`compiler/project.bit`'s "a module is a DIRECTORY" contract), so grading
+// and the retry live in the sibling `grading.bit` with no import needed —
+// purely to stay under the repo's 800-line file ceiling. #3163 made
+// cross-file inlining order-independent, so the split names by readability,
+// not load order (see `bitlang-ws/CLAUDE.md`'s splitting section).
+//
 // This file deliberately uses only universe builtins (ABI boundary primitives)
 // and no `std/*` import, so it runs under a bare `bit run` with no BIT_STDLIB
 // needed to compile the harness itself. The one import below is a relative,
@@ -81,7 +103,7 @@
 // dependency — verified with a real `bit run` under an unset BIT_STDLIB, not
 // just by reading its own imports (see that module's header for why it lives
 // in neither `tools/build/` nor `tests/bit/`).
-import { killTreeFnDef, pgrepPreflightScript } from "../../tools/killtree"
+import { killTreeFnDef, pgrepPreflightScript } from "../../../tools/killtree"
 
 // The corpus size this gate refuses to run below. The deleted harness had only an
 // UPPER bound (`scanned < max_programs`) and an explicit `if (cases.len == 0)
@@ -127,13 +149,6 @@ class Case {
   // carry this instead.
   compileRc: string
   runRc: string
-}
-
-// Per-case verdict. `reason` empty means the case passed; `detail` is the
-// evidence (compiler log, captured stderr, or the two sides of a mismatch).
-class Verdict {
-  reason: string
-  detail: string
 }
 
 class Text {
@@ -523,97 +538,6 @@ fn waveDriverScript(scratch: string, pattern: string, boundName: string): string
     "exit $?\n"
 }
 
-// ABI.md §19: `>= 0` exit code, `-1` spawn failure, `-2` deadline, `<= -100`
-// signalled with the number at `-(r) - 100`. Every negative sentinel passes a
-// naive `if (code > 0)`, so a hung or SIGSEGV'd case would read as a pass; each
-// gets its own named outcome instead. Called once per wave now (#3586), on
-// each wave's own outer `osRunBounded` call — per-case results still never
-// come from here, see `decodeRc`.
-fn decode(r: int, what: string): string {
-  if (r == 0) {
-    return ""
-  }
-  if (r > 0) {
-    return "${what} exited ${r}"
-  }
-  if (r == -1) {
-    return "${what} SPAWN FAILED"
-  }
-  if (r == -2) {
-    return "${what} TIMED OUT"
-  }
-  if (r <= -100) {
-    return "${what} KILLED by signal ${0 - r - 100}"
-  }
-  return "${what} unknown osRunBounded result ${r}"
-}
-
-// Reads a `.rc` file the way `wait "$p"; rc=$?` fills it: a POSIX wait status
-// in 0..255, where a process killed by signal N reads back as `128 + N` — so
-// `137` means SIGKILL, and 9 is the only signal anything in this harness ever
-// sends (the per-case watchdog in `writeScripts`). A missing, empty, or
-// unparsable file (the script never reached its own `echo`, or never ran at
-// all) composes into `parseNonNegInt`'s existing `-1` sentinel with no extra
-// branching: `readWhole` on a missing path already returns empty data.
-fn readRcFile(path: string): int {
-  let s = readWhole(path).data
-  if (len(s) != 0 && s[len(s) - 1] == 10) {
-    s = s[0:len(s) - 1]
-  }
-  return parseNonNegInt(s)
-}
-
-// Mirrors `decode` above but reads the `.rc`-file encoding instead of an
-// `osRunBounded` sentinel: there is no `-1`/`-2` here, because phase B no
-// longer makes a bounded call per case. A negative `rc` (from `readRcFile`)
-// means the file never got written at all, which this harness treats the same
-// as any other failure — never as a pass.
-fn decodeRc(rc: int, what: string): string {
-  if (rc == 0) {
-    return ""
-  }
-  if (rc < 0) {
-    return "${what} produced no exit status (script did not run to completion)"
-  }
-  if (rc == 137) {
-    return "${what} TIMED OUT"
-  }
-  if (rc > 128) {
-    return "${what} KILLED by signal ${rc - 128}"
-  }
-  return "${what} exited ${rc}"
-}
-
-// --- phase C: grade every case from its .rc files ---------------------------
-
-// Two separate `.rc` files, not one combined script, so a compile failure and
-// a run failure stay distinguishable exactly as they did when this read two
-// separate `osRunBounded` calls.
-fn gradeCase(c: Case): Verdict {
-  let cr = decodeRc(readRcFile(c.compileRc), "compile")
-  if (len(cr) != 0) {
-    return Verdict{ reason: cr, detail: readWhole(c.log).data }
-  }
-  if (!fsExists(c.bin)) {
-    return Verdict{ reason: "compile produced no binary", detail: readWhole(c.log).data }
-  }
-  let rr = decodeRc(readRcFile(c.runRc), "run")
-  if (len(rr) != 0) {
-    return Verdict{ reason: rr, detail: readWhole(c.err).data }
-  }
-  let got = readWhole(c.out)
-  if (!got.ok) {
-    // Both sides failing to read must never compare equal — that is how a
-    // harness that executed nothing reports every case as matching.
-    return Verdict{ reason: "no stdout captured", detail: "expected ${c.out} to exist" }
-  }
-  if (got.data != c.expected) {
-    return Verdict{ reason: "output mismatch",
-      detail: "  expected: ${c.expected}\n  got:      ${got.data}" }
-  }
-  return Verdict{ reason: "", detail: "" }
-}
-
 // --- cleanup + report ------------------------------------------------------
 
 fn cleanup(scratch: string, cases: []Case, compileSh: string, runSh: string) {
@@ -717,31 +641,6 @@ fn runDriver(cfg: Cfg, scratch: string, caseCount: int): DriverRun {
   return DriverRun{ compileSh: compileSh, runSh: runSh, compileResult: compileResult, runResult: runResult }
 }
 
-class Report {
-  failed: int
-  summary: string
-}
-
-// Phase C: grades every case and prints each failure as it is found.
-fn gradeAll(cases: []Case): Report {
-  let failed = 0
-  let summary = ""
-  let i = 0
-  while (i < len(cases)) {
-    let v = gradeCase(cases[i])
-    if (len(v.reason) != 0) {
-      failed = failed + 1
-      summary = "${summary} ${cases[i].name}(${v.reason})"
-      eprint("imports '${cases[i].name}': ${v.reason}\n")
-      if (len(v.detail) != 0) {
-        eprint("${v.detail}\n")
-      }
-    }
-    i = i + 1
-  }
-  return Report{ failed: failed, summary: summary }
-}
-
 // A plain exit of 1 (some case script itself failed) is not a driver-level
 // anomaly — `gradeAll` already named it — so only warn on the other `decode`
 // outcomes: spawn failure, timeout, or a signal.
@@ -774,6 +673,17 @@ fn main() {
   writeScripts(cfg, cases, scratch)
 
   let driver = runDriver(cfg, scratch, len(cases))
+
+  // #3593: a case whose OWN watchdog fired (compile or run, SIGKILL/137) gets
+  // one retry, alone, before grading — see `grading.bit`'s header note on
+  // `retryTimedOut` for why serialized-not-bigger is the fix for a false
+  // TIMED OUT under this box's fleet contention, and how a genuine hang still
+  // gets caught (it times out again, identically, on the retry).
+  let retried = retryTimedOut(cfg, cases)
+  if (retried != 0) {
+    print("imports: ${retried} case(s) retried serialized after their own watchdog fired\n")
+  }
+
   let report = gradeAll(cases)
 
   // `gradeAll` above already read every `.rc` file off disk, so a wave's own
@@ -784,7 +694,11 @@ fn main() {
   // Read rather than discarded: if either wave's `xargs` reported a failing
   // case (1) but every case graded clean, the `.rc` bookkeeping is broken —
   // worse than any single named failure, and must not report as 0 failed.
-  if (report.failed == 0 && (driver.compileResult == 1 || driver.runResult == 1)) {
+  // `retried != 0` is the one legitimate exception: a case the FIRST wave's
+  // `xargs` correctly reported as failing (its watchdog fired, script exited
+  // 137) can still grade clean here because the retry actually fixed it —
+  // that is the retry working as designed, not a bookkeeping bug.
+  if (retried == 0 && report.failed == 0 && (driver.compileResult == 1 || driver.runResult == 1)) {
     fatal("imports driver: xargs reported a failing case script, but no case graded as failed — the .rc bookkeeping is broken")
   }
 
