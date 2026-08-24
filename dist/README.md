@@ -159,6 +159,13 @@ cutting the release. `aarch64-linux` runs in a local Docker container;
 artifact is not a pass. No artifact is published without having executed at
 least once on hardware matching its target.
 
+Smoke-testing proves the shipped bytes run. It does not prove they are the
+bytes the published source actually produces — that is a separate claim, and
+**[`dist/REPRODUCIBLE.md`](REPRODUCIBLE.md)** is the document for it: a
+command sequence usable by a third party with no access to this repo's
+internal worktree or build-chain knowledge, starting from only a git clone at
+the release tag and the published `SHA256SUMS`.
+
 ## Container image
 
 `ghcr.io/byteink/bit` is built from the release artifacts by
