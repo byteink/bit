@@ -1,0 +1,176 @@
+// Self-host Stage 2: DEAD ALLOCATION ELIMINATION (#3622). Same module as
+// opt.bit, split out the way optstore.bit and optparams.bit were, so nothing
+// here needs an import.
+//
+// ## What it removes
+//
+// Lowering boxes every multi-value return (runtime/ABI.md §1.1), so
+// `let (a, b) = pair(7)` builds a two-word tuple, writes both halves, and reads
+// them back. Once the inliner has pasted `pair` in and optstore.bit's
+// store-to-load forwarding has answered both `field_get`s from the stored
+// values directly, the allocation and its two `field_set`s are left with no
+// reader at all — and the program still pays a `bl _bit_rt_gc_alloc`, two
+// stores, and the collector one more live object. Measured over the stub-free
+// single-file corpus: 63 of 936 allocations (6.7%), worst case 8 of 17 in
+// tests/cases/run_tuple_multi_return.bit.
+//
+// ## Why generic DCE cannot do it, and why that must stay true
+//
+// `isSideEffecting` (opt.bit) names `Op.GcAlloc` and `Op.FieldSet`, so DCE
+// keeps both unconditionally. That listing is NOT a conservatism to relax:
+// `opClobbersFieldSlots` (optstore.bit) derives its barrier set from the very
+// same predicate, and store-to-load forwarding is sound only because an
+// allocation stops it. Removing either member there would let a load move
+// across an allocation point — a miscompile, not a slower program. So this
+// pass proves the one fact DCE lacks, that THIS allocation is read by nothing,
+// and leaves the general rule alone.
+//
+// ## The proof obligation, and the refusal
+//
+// An allocation is dead when every instruction naming its value is a
+// `field_set` writing INTO it. A store into a fresh object no other
+// instruction can name is unobservable, so the stores die with the allocation.
+// Any other mention — a `field_get`, a call argument, a `ret`, a block
+// argument, or being the VALUE half of somebody else's `field_set` — is an
+// escape, and this pass then refuses outright.
+//
+// No alias analysis, and none is needed: the question here is never "can these
+// two values point at the same object", which is the one an alias analysis
+// answers and this compiler would get wrong. It is only "is this value named
+// anywhere else", which `instrOperands` (opt.bit) answers exactly — the same
+// per-opcode table DCE, the verifier and both backends' liveness already
+// depend on. Same conservative posture as optstore.bit, for the same reason.
+//
+// ## Two things it does NOT change
+//
+// - SAFEPOINTS. `Op.GcAlloc` is a safepoint op (`isSafepointOp`,
+//   compiler/codegenlive.bit:289), but a loop's back edge is recorded as one
+//   independently of what the body contains (codegenlive.bit:341), so a loop
+//   whose only allocation was dead stays preemptible.
+// - `Op.MakeClosure`, which also allocates. Its cell holds the captured
+//   environment and its value is what the closure IS, so the same shape does
+//   not arise; it is left alone rather than guessed at.
+
+// `n` falses: "nothing proven dead yet", and the neutral mask for a rebuild
+// that does no allocation elimination.
+fn noDeadAllocs(n: int): []bool {
+  let m = []bool(0)
+  let i = 0
+  while (i < n) {
+    m = append(m, false)
+    i = i + 1
+  }
+  return m
+}
+
+fn countGcAllocs(f: IrFunc): int {
+  let n = 0
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (f.instrs[i].op == Op.GcAlloc) {
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return n
+}
+
+// Adds instruction `i`'s ESCAPING uses to `esc`: every value it names, except
+// the base of a `field_set`, which is a destination address rather than a value
+// this pass has to keep alive. `field_set %v[k] = %v` stores the object into
+// itself, so `rhs` is counted unconditionally and that case refuses correctly.
+fn countEscapingUses(f: IrFunc, esc: []int, i: int) {
+  let ins = f.instrs[i]
+  if (ins.op == Op.FieldSet) {
+    esc[ins.rhs] = esc[ins.rhs] + 1
+    return
+  }
+  let ops = instrOperands(f, i)
+  let j = 0
+  while (j < len(ops)) {
+    esc[ops[j]] = esc[ops[j]] + 1
+    j = j + 1
+  }
+}
+
+// Per value id, how many instructions name it in a way this pass cannot see
+// through. A `gc_alloc` whose count is zero is written to and never read.
+fn escapingUseCounts(f: IrFunc): []int {
+  let esc = []int(0)
+  let i = 0
+  while (i < len(f.instrs)) {
+    esc = append(esc, 0)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(f.instrs)) {
+    countEscapingUses(f, esc, i)
+    i = i + 1
+  }
+  return esc
+}
+
+// A `field_set` that writes into an allocation already proven dead, and so dies
+// with it. The op guard on the base is not decoration: `dead` also marks the
+// `field_set`s themselves, and a base that happened to be one of their ids
+// would otherwise read as "its allocation is dead".
+fn isDeadAllocStore(f: IrFunc, dead: []bool, i: int): bool {
+  let ins = f.instrs[i]
+  return ins.op == Op.FieldSet && !dead[i] && f.instrs[ins.lhs].op == Op.GcAlloc && dead[ins.lhs]
+}
+
+// One round. Every `gc_alloc` with no escaping use joins `dead`, then every
+// store into one of them joins it too — and each such store releases one
+// escaping use of the value it was writing, which is what can free an
+// allocation held only by an outer object that just died. Reports whether
+// anything new was marked, so the caller stops as soon as a round is idle.
+fn markDeadAllocRound(f: IrFunc, dead: []bool, esc: []int): bool {
+  let found = false
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (f.instrs[i].op == Op.GcAlloc && !dead[i] && esc[i] == 0) {
+      dead[i] = true
+      found = true
+    }
+    i = i + 1
+  }
+  if (!found) {
+    return false
+  }
+  i = 0
+  while (i < len(f.instrs)) {
+    if (isDeadAllocStore(f, dead, i)) {
+      dead[i] = true
+      esc[f.instrs[i].rhs] = esc[f.instrs[i].rhs] - 1
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// The instructions `deadCodeElim` may drop because the allocation they belong
+// to is provably unobservable: the `gc_alloc`s themselves and the `field_set`s
+// writing into them.
+//
+// Bounded by the allocation count, which is fixed before the loop starts: a
+// productive round marks at least one more `gc_alloc` dead and never unmarks
+// one, so after that many rounds there is nothing left to find. A function
+// with no allocation skips the sweep entirely — that is most of them, and
+// `escapingUseCounts` is the only part of this pass that costs a walk of every
+// operand list.
+fn deadAllocs(f: IrFunc): []bool {
+  let dead = noDeadAllocs(len(f.instrs))
+  let rounds = countGcAllocs(f)
+  if (rounds == 0) {
+    return dead
+  }
+  let esc = escapingUseCounts(f)
+  let r = 0
+  while (r < rounds) {
+    if (!markDeadAllocRound(f, dead, esc)) {
+      return dead
+    }
+    r = r + 1
+  }
+  return dead
+}
