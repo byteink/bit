@@ -37,9 +37,9 @@
 // race on that shared state.
 //
 // So the concurrency lives in the SHELL instead, which this harness already
-// delegated env/argv/stdout capture to. This file now makes exactly ONE
-// `osRunBounded` call, for every case combined, on one generated driver
-// script — and the driver, not Bit green threads, is what fans out:
+// delegated env/argv/stdout capture to. This file makes one `osRunBounded`
+// call per WAVE (compile, then run) rather than one for the whole corpus —
+// the driver, not Bit green threads, is what fans out within each wave:
 // `find | xargs -P` does in the shell exactly what a re-entrant
 // `osRunBounded` would otherwise have had to do inside the runtime.
 //
@@ -48,21 +48,31 @@
 // inherits it, and a later `execve` of that inode fails with ETXTBSY — a
 // real, already-paid-for bug (74811a3). A serial harness has no such window;
 // a parallel one does, UNLESS every compile's write fd is closed before any
-// run forks at all. So the driver runs `find …compile.sh | xargs -P …` to
-// COMPLETION — `xargs` blocks until every parallel invocation it started has
-// exited — before it even starts the second `find …run.sh | xargs -P …`. One
-// script, two statements in sequence, is the whole barrier. Collapsing that
-// into a single wave (compile-then-run per job) would reopen exactly the
-// window 74811a3 closed.
+// run forks. So `runDriver` below runs the compile wave's `osRunBounded`
+// call to completion — its child reaped whether by a clean exit or by the
+// timeout/signal path's own `waitpid` (`osForkExecWaitBounded`,
+// runtime/root/*/os.bit) — before the run wave's call even starts. Two
+// sequential calls are the whole barrier now, same as two sequential
+// `find | xargs` lines inside one script used to be. Collapsing either wave
+// into the other would reopen the window 74811a3 closed.
 //
-// PER-CASE DEADLINES MOVE INTO THE GENERATED SCRIPTS THEMSELVES. The outer
-// `osRunBounded` bound is now GLOBAL — it covers the whole driver, both
-// waves, every case — so `BIT_TEST_TIMEOUT_S` can no longer be enforced by
-// `osRunBounded` per case. Each generated script instead backgrounds its own
-// work, races it against a `sleep $T; kill -9` watchdog, and reports the
-// result through a `.rc` file (`decodeRc`/`readRcFile`) rather than through
-// an `osRunBounded` return value — which now describes only the driver as a
-// whole (`decode`, called exactly once, on the single outer call).
+// PER-CASE DEADLINES MOVE INTO THE GENERATED SCRIPTS THEMSELVES: each backs
+// its work with a `sleep $T; kill -9` watchdog and reports through a `.rc`
+// file (`decodeRc`/`readRcFile`), not an `osRunBounded` return value.
+//
+// THE OUTER BOUND IS PER WAVE, NOT PER CORPUS (#3586). A single call over
+// both waves and every case used to be "generous rather than tight" by
+// design — but `osRunBounded` clamps any request over `osBoundedMaxMs` (1h,
+// `runtime/root/*/os.bit`) down to that value regardless of the request, so
+// the old "2x every case at once" claim was silently never honoured past a
+// few dozen cases at the default 300s budget: the harness computed ~24h, the
+// runtime gave it 1h, and under real fleet load that hour was not always
+// enough — with the same call the ONLY thing between "driver hung" and
+// "every case finished", the whole corpus died with no per-case attribution.
+// `runDriver` now bounds each wave separately (`waveTimeoutMs`, sized off
+// REAL `xargs -P` parallelism, not a serial worst case), and `main` grades
+// every `.rc` file regardless of how either call returned, so an overrun
+// kills only the cases still in flight.
 //
 // This file deliberately uses only universe builtins (ABI boundary primitives)
 // and no `std/*` import, so it runs under a bare `bit run` with no BIT_STDLIB
@@ -84,12 +94,9 @@ const maxEntries: int = 4096
 
 const defaultTimeoutS: int = 300
 
-// The outer `osRunBounded` call now spans the WHOLE driver (every case, both
-// waves) instead of one case, so its bound must be generous rather than
-// tight — the per-case watchdog each generated script carries is what stays
-// tight (`BIT_TEST_TIMEOUT_S`). `2 *` covers two full waves at the fully
-// serial worst case (parallelism only ever finishes sooner than that); this
-// slack absorbs `find`/`xargs`/process-startup overhead on top of it.
+// Per-wave slack on top of the round-count estimate (`waveTimeoutMs` below)
+// — covers `find`/`xargs`/process-startup overhead the round math itself
+// does not model. Shared by both waves; each gets this once, not doubled.
 const outerSlackMs: int = 60000
 
 // 0o755 — the scripts must be executable by the `fork`+`execve` in `xargs`
@@ -481,82 +488,47 @@ fn writeScripts(cfg: Cfg, cases: []Case, scratch: string) {
   }
 }
 
-// --- phase B: one shell driver, two barriered waves -------------------------
+// --- phase B: one shell driver PER WAVE, barriered by two sequential calls -
 
-// The whole fan-out. `-print0`/`-0` so a case name can never be split by
-// `xargs`'s default whitespace/newline delimiting (case names are validated
-// plain by `shSafe`, but that does not rule out a space). `sh -c 'exec "$0"'`
-// treats each found path as the command to run — the scripts phase A wrote
-// are directly executable, so this is the standard portable idiom for
-// "execute every file `find` names", and it works identically with `-P`
-// (parallel) on both GNU and BSD (macOS) `xargs`, unlike `-I`.
+// The whole fan-out for one wave. `-print0`/`-0` so a case name can never be
+// split by `xargs`'s default whitespace/newline delimiting (case names are
+// validated plain by `shSafe`, but that does not rule out a space).
+// `sh -c 'exec "$0"'` treats each found path as the command to run — the
+// scripts phase A wrote are directly executable, so this works identically
+// with `-P` (parallel) on both GNU and BSD (macOS) `xargs`, unlike `-I`. The
+// exit code returned is `xargs`'s own for THIS wave: nonzero means at least
+// one case's script itself exited nonzero, which `gradeCase` is what names
+// — `main` still reads it back and, if grading found NO failing case at all
+// despite `xargs` reporting one, treats that as its own fatal error.
 //
-// The barrier IS the ordering: the first `find | xargs -P` line runs to
-// completion — `xargs` does not return until every parallel invocation it
-// started has exited — before the second line's `find | xargs -P` starts a
-// single fork. See the header comment for why that barrier is the whole
-// ETXTBSY defense.
+// #3236: `killtree()`'s `pgrep -P` blind spot ("not installed" vs "no
+// descendants" both read as empty) is fixed once, in `tools/killtree/`
+// (imported above), and shared by `gatesexec.bit`'s own copy. Its preflight
+// (`pgrepPreflightScript`) runs once per wave here — twice total, harmless,
+// read-only — rather than once per case, since each wave's own script is a
+// common parent that runs once before its fan-out forks. Warn, not refuse:
+// a case only calls `killtree` after blowing `BIT_TEST_TIMEOUT_S`, and
+// whatever it fails to reap without `pgrep` is still bounded by that wave's
+// own `osRunBounded` deadline (`waveTimeoutMs`, `runDriver` below).
 //
-// `rc1`/`rc2` capture each wave's `xargs` exit status on its own line, not
-// discarded and not `||true`'d away: nonzero means at least one case's script
-// itself exited nonzero. That is expected and not fatal here — `gradeCase`
-// below is what names the specific case — but the driver still exits 1 in
-// that case (rather than swallowing it into an unconditional 0) so the
-// caller in `main` can read it back and, if `gradeCase` found NO failing case
-// at all despite `xargs` reporting one, treat that contradiction as its own
-// fatal error.
-//
-// #3236 found this same blind spot in `tools/build/gatesexec.bit`'s copy of
-// `killtree()`: `kids=$(pgrep -P ... 2>/dev/null)` cannot tell "pgrep is not
-// installed" (exit 127) from "no descendants" (exit 1, also empty stdout) —
-// both leave `kids` empty, so a host missing `pgrep` silently degrades every
-// timed-out case to killing only its own direct PID instead of the whole
-// subtree. `killtree` here carried the identical blind spot, unreached by
-// that fix, until #3237 ported it and #3238 made the fixed TEXT (imported
-// above, `tools/killtree/`) the one both files call — a fix to it now
-// reaches both by construction instead of by whoever notices the drift.
-//
-// Unlike `killtree` itself, the preflight does NOT need to be duplicated per
-// case: each case's `compile`/`run` script is its own standalone process
-// with no common parent, which is exactly why `killtree`'s TEXT still gets
-// baked into every one of them — but `driverScript` genuinely IS the one
-// common parent that already runs once, synchronously, before any case
-// script forks (the watchdog symlink line below is the existing precedent
-// for exactly that granularity). So this checks `pgrep` ONCE per run here,
-// mirroring `tools/build/gatesexec.bit`'s call to the same shared
-// `pgrepPreflightScript()` at the coarser granularity this file's
-// architecture actually has (before the per-unit fan-out, not #3236's
-// per-chunk one) — `"case"`/`"the outer run bound"` are this call site's
-// only difference from `gatesexec.bit`'s `"gate"`/`"the outer batch timeout"`.
-//
-// Warn, not refuse — same reasoning as #3236: a case only calls `killtree`
-// after it has already blown `BIT_TEST_TIMEOUT_S`, and whatever that case
-// fails to reap without `pgrep` is still bounded by the single outer
-// `osRunBounded` call's own deadline (`outerSlackMs` above), which kills the
-// whole driver's process group when it fires — later than immediately, but
-// never orphaned forever. Refusing the whole run over a capability only the
-// timeout path needs would fail every well-behaved corpus case for nothing.
-
-// #3231: the very first line symlinks `bit-gate-watchdog` onto the real
-// `sleep` binary, in `scratch`, before either `find | xargs -P` wave starts —
-// this line always runs first because it is the top of the one literal
-// script `main` hands to a single `osRunBounded` call, not concurrent text,
-// so every case's per-case poll (`wdPath` in `writeScripts`) can rely on the
-// symlink already existing by the time its own script forks. `2>/dev/null`
-// only swallows the vanishingly unlikely case where `sleep` itself is
-// missing from `$PATH`; each poll's own `|| sleep 1` fallback keeps it
-// correct (just unattributed) even then. The `pgrep` preflight above runs
-// even earlier, for the same "runs once, before any fork" reason.
-fn driverScript(scratch: string): string {
-  return "#!/bin/sh\n" + pgrepPreflightScript("case", "the outer run bound") + "ln -sf \"$(command -v sleep)\" \"${scratch}/bit-gate-watchdog\" 2>/dev/null\nN=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)\nfind \"${scratch}\" -maxdepth 1 -name '*.compile.sh' -print0 | xargs -0 -P \"$N\" -n1 sh -c 'exec \"$0\"'\nrc1=$?\nfind \"${scratch}\" -maxdepth 1 -name '*.run.sh' -print0 | xargs -0 -P \"$N\" -n1 sh -c 'exec \"$0\"'\nrc2=$?\nif [ \"$rc1\" -eq 0 ] && [ \"$rc2\" -eq 0 ]; then\n  exit 0\nfi\nexit 1\n"
+// The `bit-gate-watchdog` symlink is created fresh at the top of each wave's
+// script, before that wave's `find` runs — idempotent (`ln -sf`), so twice
+// (once per wave) is harmless; every case's poll (`wdPath` in
+// `writeScripts`) relies on it existing by the time its own script forks.
+fn waveDriverScript(scratch: string, pattern: string, boundName: string): string {
+  return "#!/bin/sh\n" + pgrepPreflightScript("case", boundName) +
+    "ln -sf \"$(command -v sleep)\" \"${scratch}/bit-gate-watchdog\" 2>/dev/null\n" +
+    "N=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)\n" +
+    "find \"${scratch}\" -maxdepth 1 -name '${pattern}' -print0 | xargs -0 -P \"$N\" -n1 sh -c 'exec \"$0\"'\n" +
+    "exit $?\n"
 }
 
 // ABI.md §19: `>= 0` exit code, `-1` spawn failure, `-2` deadline, `<= -100`
 // signalled with the number at `-(r) - 100`. Every negative sentinel passes a
 // naive `if (code > 0)`, so a hung or SIGSEGV'd case would read as a pass; each
-// gets its own named outcome instead. Used exactly once now, on the single
-// outer `osRunBounded` call over the whole driver script — per-case results no
-// longer come from here, see `decodeRc`.
+// gets its own named outcome instead. Called once per wave now (#3586), on
+// each wave's own outer `osRunBounded` call — per-case results still never
+// come from here, see `decodeRc`.
 fn decode(r: int, what: string): string {
   if (r == 0) {
     return ""
@@ -644,7 +616,7 @@ fn gradeCase(c: Case): Verdict {
 
 // --- cleanup + report ------------------------------------------------------
 
-fn cleanup(scratch: string, cases: []Case, driverSh: string) {
+fn cleanup(scratch: string, cases: []Case, compileSh: string, runSh: string) {
   let i = 0
   while (i < len(cases)) {
     let c = cases[i]
@@ -658,11 +630,13 @@ fn cleanup(scratch: string, cases: []Case, driverSh: string) {
     fsRemove(c.err)
     i = i + 1
   }
-  fsRemove(driverSh)
+  fsRemove(compileSh)
+  fsRemove(runSh)
   // `fsRemove` on a directory is `rmdir` (empty dirs only, ABI.md §14) — the
-  // `bit-gate-watchdog` symlink `driverScript` creates in `scratch` must be
-  // unlinked explicitly first, or every run leaks one symlink into `$TMPDIR`
-  // forever (`fsRemove(scratch)` below would keep silently failing on it).
+  // `bit-gate-watchdog` symlink `waveDriverScript` creates in `scratch` must
+  // be unlinked explicitly first, or every run leaks one symlink into
+  // `$TMPDIR` forever (`fsRemove(scratch)` below would keep silently failing
+  // on it).
   fsRemove("${scratch}/bit-gate-watchdog")
   fsRemove(scratch)
 }
@@ -679,34 +653,68 @@ fn scratchRoot(): string {
 }
 
 class DriverRun {
-  driverSh: string
-  result: int
+  compileSh: string
+  runSh: string
+  compileResult: int
+  runResult: int
 }
 
-// Phase B: writes the driver script and makes the ONE outer `osRunBounded`
-// call for the whole corpus — see the header comment for why the bound is
-// generous and why the barrier between its two waves must stay a barrier.
-// Each per-case script already carries its OWN `BIT_TEST_TIMEOUT_S` watchdog,
-// so this outer bound only exists to catch the driver itself getting stuck
-// (`find`, `xargs`, or the shell never returning at all); a case that merely
-// runs slowly, even every case at once, is exactly what `2 *` plus
-// `outerSlackMs` is sized to absorb. Fatal only for the driver's OWN
-// process-level failure — a plain exit of 1 means at least one case's script
-// itself returned nonzero, which `gradeAll`/`gradeCase` are what name; a
-// spawn failure, the outer deadline firing, or a signal has no single case to
-// attribute it to, because the driver never ran at all or got stuck as a
-// whole.
+fn detectParallelism(scratch: string): int {
+  // Real parallelism, not a guess: same `getconf`/`sysctl`/`nproc` chain
+  // `waveDriverScript` hands `xargs -P`, so `waveTimeoutMs` sizes each wave's
+  // bound off what `xargs` will actually use. Bounded at 10s — this call
+  // does not scale with caseCount.
+  let sh = "${scratch}/nproc.sh"
+  let out = "${scratch}/nproc.txt"
+  let script = "#!/bin/sh\n{ getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4; } > \"${out}\"\n"
+  if (!writeWhole(sh, script) || fsChmod(sh, scriptMode) != 0) {
+    fatal("cannot write nproc probe script at ${sh}")
+  }
+  osRunBounded(sh, 10000)
+  let raw = readWhole(out).data
+  if (len(raw) != 0 && raw[len(raw) - 1] == 10) {
+    raw = raw[0:len(raw) - 1]
+  }
+  fsRemove(sh)
+  fsRemove(out)
+  let n = parseNonNegInt(raw)
+  if (n < 1) {
+    return 4
+  }
+  return n
+}
+
+// Each wave's own bound: the round count `xargs -P` actually needs for THIS
+// corpus (`ceil(caseCount / n)`), not the fully-serial assumption the old
+// combined bound made — see the header comment (#3586) for why that
+// assumption was silently never honoured anyway. `outerSlackMs` covers
+// `find`/`xargs`/startup overhead the round math does not model.
+fn waveTimeoutMs(caseCount: int, cfg: Cfg, n: int): int {
+  let rounds = (caseCount + n - 1) / n
+  return rounds * cfg.timeoutMs + outerSlackMs
+}
+
+fn runOneWave(scratch: string, pattern: string, label: string, timeoutMs: int): (string, int) {
+  let sh = "${scratch}/driver-${label}.sh"
+  if (!writeWhole(sh, waveDriverScript(scratch, pattern, "the ${label} wave bound")) || fsChmod(sh, scriptMode) != 0) {
+    fatal("cannot write ${label} driver script at ${sh}")
+  }
+  return sh, osRunBounded(sh, timeoutMs)
+}
+
+// Phase B: one bounded `osRunBounded` call PER WAVE, not one for the whole
+// corpus (#3586). The two calls run strictly in sequence from this single-
+// threaded `main`, so the compile wave's call has fully returned — its
+// direct child reaped whether by a clean exit or by the timeout/signal
+// path's own `waitpid` (`osForkExecWaitBounded`, runtime/root/*/os.bit) —
+// before the run wave's `find` ever executes: the ETXTBSY barrier (header
+// comment) holds exactly as it did with one call.
 fn runDriver(cfg: Cfg, scratch: string, caseCount: int): DriverRun {
-  let driverSh = "${scratch}/driver.sh"
-  if (!writeWhole(driverSh, driverScript(scratch)) || fsChmod(driverSh, scriptMode) != 0) {
-    fatal("cannot write driver script at ${driverSh}")
-  }
-  let outerTimeoutMs = 2 * caseCount * cfg.timeoutMs + outerSlackMs
-  let result = osRunBounded(driverSh, outerTimeoutMs)
-  if (result != 0 && result != 1) {
-    fatal("imports driver: ${decode(result, "driver")}")
-  }
-  return DriverRun{ driverSh: driverSh, result: result }
+  let n = detectParallelism(scratch)
+  let t = waveTimeoutMs(caseCount, cfg, n)
+  let (compileSh, compileResult) = runOneWave(scratch, "*.compile.sh", "compile", t)
+  let (runSh, runResult) = runOneWave(scratch, "*.run.sh", "run", t)
+  return DriverRun{ compileSh: compileSh, runSh: runSh, compileResult: compileResult, runResult: runResult }
 }
 
 class Report {
@@ -734,6 +742,18 @@ fn gradeAll(cases: []Case): Report {
   return Report{ failed: failed, summary: summary }
 }
 
+// A plain exit of 1 (some case script itself failed) is not a driver-level
+// anomaly — `gradeAll` already named it — so only warn on the other `decode`
+// outcomes: spawn failure, timeout, or a signal.
+fn reportDriverWarnings(driver: DriverRun) {
+  if (driver.compileResult != 0 && driver.compileResult != 1) {
+    eprint("imports: WARNING ${decode(driver.compileResult, "compile driver")}\n")
+  }
+  if (driver.runResult != 0 && driver.runResult != 1) {
+    eprint("imports: WARNING ${decode(driver.runResult, "run driver")}\n")
+  }
+}
+
 fn main() {
   let cfg = loadConfig()
 
@@ -756,17 +776,19 @@ fn main() {
   let driver = runDriver(cfg, scratch, len(cases))
   let report = gradeAll(cases)
 
-  // `driver.result` is `xargs`'s own verdict, read here rather than
-  // discarded: if it reported a failing case (1) but every case above graded
-  // clean, the `.rc`-file bookkeeping itself is broken — some case's script
-  // failed by `xargs`'s own account with nothing in this harness able to say
-  // which one, which is worse than any single named failure and must not
-  // report as 0 failed.
-  if (report.failed == 0 && driver.result == 1) {
+  // `gradeAll` above already read every `.rc` file off disk, so a wave's own
+  // overrun (see `runDriver`) only costs the cases still in flight, reported
+  // by `decodeRc` as "no exit status" — never the whole corpus's attribution.
+  reportDriverWarnings(driver)
+
+  // Read rather than discarded: if either wave's `xargs` reported a failing
+  // case (1) but every case graded clean, the `.rc` bookkeeping is broken —
+  // worse than any single named failure, and must not report as 0 failed.
+  if (report.failed == 0 && (driver.compileResult == 1 || driver.runResult == 1)) {
     fatal("imports driver: xargs reported a failing case script, but no case graded as failed — the .rc bookkeeping is broken")
   }
 
-  cleanup(scratch, cases, driver.driverSh)
+  cleanup(scratch, cases, driver.compileSh, driver.runSh)
 
   print("imports: ${len(cases) - report.failed}/${len(cases)} OK\n")
   if (report.failed != 0) {
