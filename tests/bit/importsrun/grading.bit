@@ -1,0 +1,216 @@
+// Phase C (grading) plus the phase-B.5 retry, split out of `importsrun.bit`
+// (#3593) to stay under the repo's 800-line file ceiling. Same module (this
+// directory), so every name here is visible in `importsrun.bit` and back —
+// see `compiler/project.bit`'s "a module is a DIRECTORY" contract. This is a
+// pure move: nothing below changed shape when it moved, except the two new
+// declarations at the bottom (`timedOut`, `retryTimedOut`).
+
+// Per-case verdict. `reason` empty means the case passed; `detail` is the
+// evidence (compiler log, captured stderr, or the two sides of a mismatch).
+class Verdict {
+  reason: string
+  detail: string
+}
+
+// ABI.md §19: `>= 0` exit code, `-1` spawn failure, `-2` deadline, `<= -100`
+// signalled with the number at `-(r) - 100`. Every negative sentinel passes a
+// naive `if (code > 0)`, so a hung or SIGSEGV'd case would read as a pass; each
+// gets its own named outcome instead. Called once per wave now (#3586), on
+// each wave's own outer `osRunBounded` call — per-case results still never
+// come from here, see `decodeRc`.
+fn decode(r: int, what: string): string {
+  if (r == 0) {
+    return ""
+  }
+  if (r > 0) {
+    return "${what} exited ${r}"
+  }
+  if (r == -1) {
+    return "${what} SPAWN FAILED"
+  }
+  if (r == -2) {
+    return "${what} TIMED OUT"
+  }
+  if (r <= -100) {
+    return "${what} KILLED by signal ${0 - r - 100}"
+  }
+  return "${what} unknown osRunBounded result ${r}"
+}
+
+// Reads a `.rc` file the way `wait "$p"; rc=$?` fills it: a POSIX wait status
+// in 0..255, where a process killed by signal N reads back as `128 + N` — so
+// `137` means SIGKILL, and 9 is the only signal anything in this harness ever
+// sends (the per-case watchdog in `writeScripts`). A missing, empty, or
+// unparsable file (the script never reached its own `echo`, or never ran at
+// all) composes into `parseNonNegInt`'s existing `-1` sentinel with no extra
+// branching: `readWhole` on a missing path already returns empty data.
+fn readRcFile(path: string): int {
+  let s = readWhole(path).data
+  if (len(s) != 0 && s[len(s) - 1] == 10) {
+    s = s[0:len(s) - 1]
+  }
+  return parseNonNegInt(s)
+}
+
+// Mirrors `decode` above but reads the `.rc`-file encoding instead of an
+// `osRunBounded` sentinel: there is no `-1`/`-2` here, because phase B no
+// longer makes a bounded call per case. A negative `rc` (from `readRcFile`)
+// means the file never got written at all, which this harness treats the same
+// as any other failure — never as a pass.
+fn decodeRc(rc: int, what: string): string {
+  if (rc == 0) {
+    return ""
+  }
+  if (rc < 0) {
+    return "${what} produced no exit status (script did not run to completion)"
+  }
+  if (rc == 137) {
+    return "${what} TIMED OUT"
+  }
+  if (rc > 128) {
+    return "${what} KILLED by signal ${rc - 128}"
+  }
+  return "${what} exited ${rc}"
+}
+
+// --- phase C: grade every case from its .rc files ---------------------------
+
+// Two separate `.rc` files, not one combined script, so a compile failure and
+// a run failure stay distinguishable exactly as they did when this read two
+// separate `osRunBounded` calls.
+fn gradeCase(c: Case): Verdict {
+  let cr = decodeRc(readRcFile(c.compileRc), "compile")
+  if (len(cr) != 0) {
+    return Verdict{ reason: cr, detail: readWhole(c.log).data }
+  }
+  if (!fsExists(c.bin)) {
+    return Verdict{ reason: "compile produced no binary", detail: readWhole(c.log).data }
+  }
+  let rr = decodeRc(readRcFile(c.runRc), "run")
+  if (len(rr) != 0) {
+    return Verdict{ reason: rr, detail: readWhole(c.err).data }
+  }
+  let got = readWhole(c.out)
+  if (!got.ok) {
+    // Both sides failing to read must never compare equal — that is how a
+    // harness that executed nothing reports every case as matching.
+    return Verdict{ reason: "no stdout captured", detail: "expected ${c.out} to exist" }
+  }
+  if (got.data != c.expected) {
+    return Verdict{ reason: "output mismatch",
+      detail: "  expected: ${c.expected}\n  got:      ${got.data}" }
+  }
+  return Verdict{ reason: "", detail: "" }
+}
+
+// --- phase B.5: one serialized retry for a case whose OWN watchdog fired ---
+//
+// #3593. `defaultTimeoutS` (`importsrun.bit`) is a flat wall-clock budget
+// enforced by the per-case watchdog `writeScripts` bakes into every
+// `compileSh`/`runSh` — a poll of `kill -0 "$p"` once a second, unaware of
+// WHY `$p` is still alive. Under real fleet contention (this box runs ~20
+// agents; `boxlock` bounds concurrent BUILDS, not the box's other work) a
+// correct case can simply not get scheduled for most of a second — the poll
+// still counts that second toward the deadline, so a case that would finish
+// in seconds on a quiet box gets SIGKILLed on a busy one. `pmwhy_e2e` and
+// `pmtransitive_e2e` false-failed this way for five different agents in one
+// night, each spending time proving it was not their own regression.
+//
+// A LARGER flat budget is not a fix — the box has swung the same binary's
+// wall clock by double digits between quiet and saturated, so any fixed
+// number just moves the false-failure threshold rather than removing it
+// (see the header note in `importsrun.bit`). This harness cannot observe
+// external load and should not guess at it. What it CAN do is remove the
+// contention it causes ITSELF: each wave runs every case's script through
+// `xargs -P n` (`waveDriverScript`), so up to `n` of THIS corpus's own
+// cases compete for the same cores a moment a genuinely-correct case needed.
+// A case whose watchdog fired gets exactly one retry, run ALONE — no
+// sibling case from this harness competing with it — rather than a bigger
+// number stapled onto the same contended attempt.
+//
+// A GENUINE HANG IS STILL CAUGHT, not just given more rope: the retry reuses
+// the same `cfg.timeoutMs` budget and the same watchdog script, so a case
+// that is actually stuck (infinite loop, deadlock, wedged I/O) times out
+// again on the retry exactly as it did the first time — worst-case
+// detection latency grows from one `defaultTimeoutS` to two, a bounded,
+// stated cost, never an unbounded one. A retry that ALSO times out is
+// reported as a real failure, identically to today's single-attempt result.
+//
+// rc 137 is SIGKILL — this harness's own watchdog is the only sender, but an
+// OOM kill reads back identically (an existing ambiguity, not a new one from
+// this fix); serializing the retry also lowers memory pressure from this
+// harness's own concurrent cases, which is a reasonable mitigation for that
+// case too.
+fn timedOut(rc: int): bool {
+  return rc == 137
+}
+
+// One retry pass over every case, called once between `runDriver` and
+// `gradeAll`. Bounded exactly like every other loop here: `len(cases)`
+// iterations, at most one compile retry and one run retry each — not a
+// retry loop, a retry PASS. `outerSlackMs` is reused rather than a new
+// constant: the same "per-case budget plus overhead the round math does not
+// model" reasoning `waveTimeoutMs` already documents applies verbatim to a
+// single case's own outer `osRunBounded` bound.
+//
+// `c.compileSh`/`c.runSh` are the exact scripts `writeScripts` already wrote
+// and the first wave already ran once; calling `osRunBounded` on them again,
+// strictly sequentially from this single-threaded `main`, is the same
+// single-worker contract the two wave calls already rely on (see
+// `importsrun.bit`'s header note on `bit_rt_os_run_bounded` reentrancy). The
+// `bit-gate-watchdog` symlink `waveDriverScript` created still exists in
+// `scratch` (removed only by `cleanup`, called after this), so each script's
+// own internal poll keeps working unmodified.
+//
+// Returns how many cases got at least one retry, so `main` can tell a
+// legitimate "wave 1 said failure, retry fixed it" apart from the `.rc`
+// bookkeeping actually being broken.
+fn retryTimedOut(cfg: Cfg, cases: []Case): int {
+  let outerMs = cfg.timeoutMs + outerSlackMs
+  let retried = 0
+  let i = 0
+  while (i < len(cases)) {
+    let c = cases[i]
+    let compileTimedOut = timedOut(readRcFile(c.compileRc))
+    if (compileTimedOut) {
+      eprint("imports: '${c.name}' compile TIMED OUT under fleet contention; retrying serialized\n")
+      osRunBounded(c.compileSh, outerMs)
+      retried = retried + 1
+    }
+    let runNeedsRetry = compileTimedOut || timedOut(readRcFile(c.runRc))
+    if (runNeedsRetry && fsExists(c.bin)) {
+      if (!compileTimedOut) {
+        eprint("imports: '${c.name}' run TIMED OUT under fleet contention; retrying serialized\n")
+        retried = retried + 1
+      }
+      osRunBounded(c.runSh, outerMs)
+    }
+    i = i + 1
+  }
+  return retried
+}
+
+class Report {
+  failed: int
+  summary: string
+}
+
+// Phase C: grades every case and prints each failure as it is found.
+fn gradeAll(cases: []Case): Report {
+  let failed = 0
+  let summary = ""
+  let i = 0
+  while (i < len(cases)) {
+    let v = gradeCase(cases[i])
+    if (len(v.reason) != 0) {
+      failed = failed + 1
+      summary = "${summary} ${cases[i].name}(${v.reason})"
+      eprint("imports '${cases[i].name}': ${v.reason}\n")
+      if (len(v.detail) != 0) {
+        eprint("${v.detail}\n")
+      }
+    }
+    i = i + 1
+  }
+  return Report{ failed: failed, summary: summary }
+}

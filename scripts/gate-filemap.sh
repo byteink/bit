@@ -207,6 +207,11 @@ gates_for_file() {
     # sibling to stay under the 800-line limit after `bit fmt`, the same
     # shape as tests/bit/fmtcitations/* above.
     tests/bit/golden/*) printf 'test-golden\n'; return 0 ;;
+    # #3593 moved this from a single file (tests/bit/importsrun.bit) to a
+    # directory module — the phase-C grading plus a new retry helper split
+    # into a sibling to stay under the 800-line limit, the same shape as
+    # tests/bit/fmtcitations/* and tests/bit/golden/* above.
+    tests/bit/importsrun/*) printf 'test-imports-bit\n'; return 0 ;;
     tests/bit/pollfree/*) printf 'test-pollfree\n'; return 0 ;;
     tests/bit/rootabi/*) printf 'test-rootabi\n'; return 0 ;;
     tests/bit/rootpins/*) printf 'test-rootpins\n'; return 0 ;;
