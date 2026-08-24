@@ -171,21 +171,74 @@ want a higher version - only names with no entry yet are filled in.
 ## `bit up` / `bit update`
 
 ```
-bit up [name] [--dir <path>]
-bit update [name] [--dir <path>]
+bit up [name] [--dir <path>] [--latest]
+bit update [name] [--dir <path>] [--latest]
 ```
 
 `update` is an exact alias. With no `name`, re-resolves every dependency
-`bit.json` names against its *current* ref - picking up a moved branch tip or
-re-verifying a tag - and rewrites `bit.lock` with the refreshed commits and
-transitive requirements. With a `name`, restricts the refresh to that one
-dependency. Either way, `bit.json` itself is never touched: the ref an entry
-names only changes if you edit it by hand.
+`bit.json` names; with a `name`, restricts the refresh to that one
+dependency. `bit.lock`'s resolved commit, version and transitive
+requirements move; a branch ref picks up its tip's new HEAD, a bare-sha or
+exact pin re-verifies unchanged, and a `^`/`~` constraint moves to the
+**highest tag still satisfying that same constraint** - the newest version
+available WITHOUT changing what `bit.json` says. `bit.json` itself is never
+touched by plain `bit up`.
 
 ```console
 $ bit up quicwire
-bit up: quicwire -> v1.4.2 (a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2)
+bit up: quicwire -> ^1.2.0 (a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2)
 ```
+
+`--latest` additionally rewrites the moved dependency's `bit.json` constraint
+to `^<newest published version>` - crossing whatever ceiling the old
+constraint had. This is the only way to leave a range; it can break the
+build, so it is never implicit. An exactly-pinned dependency, which plain
+`bit up` never moves at all, is exactly the case `--latest` exists for:
+
+```console
+$ bit up quicwire --latest
+bit up: quicwire -> ^2.1.0 (f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1)
+```
+
+A local-path dependency and a branch/bare-sha ref have no version constraint
+to widen; `--latest` is a no-op for them beyond plain `bit up`'s own refresh.
+
+## `bit outdated`
+
+```
+bit outdated [--dir <path>]
+```
+
+Read-only report, one line per dependency `bit.json` names. Never rewrites
+`bit.json` or `bit.lock`, and never fetches into the cache. Exits 0 whether
+or not anything is outdated - it reports, it does not gate.
+
+Output format, tab-separated after the `bit outdated: ` prefix - stable and
+greppable, meant to be parsed by scripts:
+
+```
+bit outdated: <name>\t<locked>\t<wanted>\t<latest>
+```
+
+- `locked` - the version `bit.lock` currently records (or `local` for a
+  local-path dependency, or the raw ref for a branch/bare-sha dependency,
+  which has no version concept).
+- `wanted` - the newest version satisfying `bit.json`'s constraint - what a
+  plain `bit up` would move `bit.lock` to.
+- `latest` - the newest version published at all, even outside the current
+  constraint - what `bit up --latest` would move both files to.
+
+`-` in `wanted`/`latest` means "not applicable" (a local, branch, or
+bare-sha dependency has no versions to report).
+
+```console
+$ bit outdated
+bit outdated: quicwire	1.2.0	1.5.0	2.0.0
+bit outdated: httpkit	2.0.0	2.0.0	2.0.0
+```
+
+`quicwire` is pinned with a `^1.2.0` constraint and is one release behind
+what its own constraint already allows; `httpkit` is exactly current.
 
 ## `bit remove`
 
