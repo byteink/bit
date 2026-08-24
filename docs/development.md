@@ -409,10 +409,10 @@ in the exact same `c.funcDecls`/`c.funcResults` maps `collectFuncDecl` uses for
 a regular function ("so call sites type-check through the ordinary path"), and
 `compiler/lowercall.bit`'s `lowerCall` resolves both through the identical
 `funcRefAt(...).decl != 0` / `resolveCallTarget` branch, above the builtin
-cascade. The two fixtures this guard used to build
-(`tests/importsets/{externbuiltin,externplain}/m.bit`) were deleted rather than
-left as an orphan nothing referenced — re-verified building and running
-correctly with a self-hosted `bit` before deletion.
+cascade. The two fixtures this guard used to build, under the now-deleted
+`tests/importsets/externbuiltin/` and `tests/importsets/externplain/`, were
+deleted rather than left as an orphan nothing referenced — re-verified
+building and running correctly with a self-hosted `bit` before deletion.
 
 **What the differentials assert.** The fifteen `scripts/selfhost-diff*.sh` once
 diffed a separately-implemented bootstrap compiler against the Bit compiler, so
@@ -470,7 +470,7 @@ triple and the wrapper cannot know the target.
 wall-clock deadline. Exceeding it kills that child (by its own PID, never a name
 pattern), reports `TIMED OUT` naming the case, and reddens the suite. Default
 **300s** (`defaultTimeoutS`, `tests/bit/stress/stress.bit:168` and
-`tests/bit/golden.bit:82`); override with `BIT_TEST_TIMEOUT_S=<seconds>` on a
+`tests/bit/golden/golden.bit:84`); override with `BIT_TEST_TIMEOUT_S=<seconds>` on a
 slower host, or `0` to block forever as before. A timeout is a distinct outcome
 from a crash: a child killed by SIGSEGV/SIGBUS/SIGABRT is reported as a crash
 naming the signal.
