@@ -650,12 +650,16 @@ against Go's 36 and C's 55**; happens-before tracking needs a vector clock per
 logical thread, and Bit spawns tasks precisely because they are meant to be
 cheap — a vector clock per task reintroduces the cost `spawn` exists to avoid.
 
-A detector would also have nothing to report a finding against today:
-`runtime/ABI.md` §4.2's debug-info line table (design landed #3281, wire
-format `.bit_dbg` / `bit_debug_lines`) is not yet emitted — nothing in
-`compiler/` or `runtime/` currently writes or reads `bit_debug_lines` — so the
-only thing any tool can currently name for a bad access is a raw code
-address, not a source line.
+A detector would still have nothing to report a finding against today:
+`runtime/ABI.md` §4.2's debug-info line table (design landed #3281) is now
+emitted — both `compiler/emitelf.bit` and `compiler/emitmacho.bit` write the
+`.bit_dbg` / `__bit_dbg` section and its `bit_debug_lines` extent symbols
+(#3283, wired through the self-hosted linker by #3591) — but nothing on
+`main` reads it yet: the panic-time stack walker that would consume it is
+complete but held out of `main` pending a stage0 repin (#3285). (#3662,
+unmerged, adds a per-function name field to the wire format; this paragraph
+describes what's on `main` today.) So the only thing any tool can currently
+name for a bad access is still a raw code address, not a source line.
 
 **Cheaper substitute already in the suite — extend it instead of building a
 detector.** `tests/stress/` already combines the two ideas a real race
