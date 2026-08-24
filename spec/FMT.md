@@ -357,3 +357,64 @@ No other category named in this ticket was found unsettled: indentation
 formatter may move a comment (§4) each have a specific rule in the printer
 today, cited above, with nothing in `#2874`'s inventory or the four fix
 tickets contradicting it.
+
+## 11. Trailing-comment column alignment (`#3673`)
+
+> **Numbering note:** `#3671` is independently rewriting a `## 11` on branch
+> `task-3671` at the time this section was written (on branch `task-3673`,
+> from the same `main` tip). The two need reconciling at merge time —
+> renumber one of them rather than silently overwriting the other's
+> section 11.
+
+**Rule.** A *trailing-comment run* is a maximal sequence of consecutive
+output lines that each end in a same-line `//` comment: line `k+1`
+immediately follows line `k` with no blank line, no code line lacking a
+trailing comment, and no own-line comment between them (`fmtComputeAlignCols`,
+`compiler/fmtalign.bit`, keyed off `Printer.outLine`, an output line counter
+`fmtNewline` advances — fmt.bit). A run's comments all start at one shared
+column: one space past the widest code column (`Printer.col` at the moment
+`fmtGap`, fmt.bit, would otherwise have written a bare single space) among
+the run's members.
+
+A run also breaks — in addition to the three line-adjacency breaks above —
+before any member whose own code column would push the shared column past
+`fmtMaxWidth` (fmt.bit's existing 100-column budget, the same one §1, §5 and
+§10 already enforce). That member starts a fresh run of its own, at its own
+one-space column, rather than dragging every other member of the run out
+past the line-width limit to keep one shared column. A run of exactly one
+member — including such an isolated outlier — is left at exactly one space:
+there is nothing to align it with. This is a deliberate design choice for
+Bit, not a port of gofmt's own tabwriter-driven alignment, which has no such
+budget check and does push a whole aligned block out to match one long line.
+
+Only same-line **line** comments (`//`) participate. A same-line **block**
+comment (`/* */` immediately followed by more code rather than a newline) is
+left exactly as before — a bare single space — because it does not
+necessarily sit at the end of an output line at all, so "widest code column
+in this run" is not a well-formed question for it. Own-line comments are
+unaffected by this section; see §4.
+
+Alignment is applied once, as a post-pass over the fully-printed byte buffer
+(`fmtApplyAlignment`, `compiler/fmtalign.bit`, called once from
+`formatSource`, fmt.bit) rather than woven into the streaming printer: a
+run's shared column is only known once every member of the run has been
+printed, and the printer emits left to right, top to bottom, with no
+backtracking anywhere else in its design.
+
+**Idempotence.** Every `width` this section measures is the printer's own
+running output column (`Printer.col`) at the moment a candidate comment was
+about to be written — never a column read back out of source text, and
+never a column measured after alignment padding has already been inserted.
+Re-formatting an already-aligned file re-derives the identical code
+rendering on each line (alignment only ever inserts *whitespace between a
+line's code and its comment*, never a token, and never changes which output
+line anything lands on), so it recomputes the identical `width`, `line` and
+grouping values, and therefore the identical column, in one pass — this is
+a true fixed point, not merely eventual convergence over repeated runs.
+
+**Check:** format a file twice; the two outputs are byte-identical
+(`cmp` exit 0). Include a case where a line's own code is reformatted by the
+*first* pass in a way that changes its width (e.g. collapsed hand-spacing
+inside the code, not just the comment gap) — the second pass must still be a
+no-op, proving the run's column was computed from the first pass's own
+canonical rendering rather than from the input text's incidental spacing.
