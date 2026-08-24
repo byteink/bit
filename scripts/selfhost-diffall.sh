@@ -93,6 +93,16 @@
 #   DIFFALL_MIN=n       discovery floor (default 15)
 #   DIFFALL_DIR=path    constituent directory -- for mutation-testing this gate
 #   DIFFALL_KEEP=1      keep the per-constituent logs instead of deleting them
+#
+# A failing or undecided constituent's log is never window-truncated in the
+# report (#3678): a 40-line tail once hid 4 of 5 SAFEPOINT DIVERGENCE lines
+# because they sorted earlier in a corpus walk than the window covered, and
+# the only way to recover them was a standalone re-run. The raw log is also
+# copied out from under this script's own cleanup, to
+# $TMPDIR/selfhost-diffall-keep.<random>/, printed at the end of any run that
+# has something to keep -- DIFFALL_KEEP=1 is the stronger, pre-existing
+# option: it keeps EVERY constituent's log, passing ones included, at $work
+# itself.
 set -uo pipefail
 # shellcheck source=scripts/alarmrun.sh
 . "$(dirname -- "$0")/alarmrun.sh"
@@ -223,16 +233,47 @@ for s in "${scripts[@]}"; do
   printf '  %-12s %5ds  %-34s (exit %d)\n' "$verdict" "$elapsed" "$name" "$rc"
 done
 
-# Everything below is REPORTING. The verdicts are already decided above, so the
-# `tail` pipelines here cannot influence any status.
+# Everything below is REPORTING. The verdicts are already decided above, so
+# nothing below can influence any status.
+#
+# Full log, not a tail (#3678): the log was already captured whole at spawn
+# time (`>"$log" 2>&1` above has no bound), so this only stops throwing part
+# of it away. No marker string is grepped for -- each constituent reports a
+# divergence in its own vocabulary (SAFEPOINT DIVERGENCE, MISMATCH:, DIFF,
+# REGRESSION:, ...) and hardcoding any one of them here would special-case
+# that constituent over the other seventeen.
 for kind in failed undecided; do
   [ -s "$work/$kind" ] || continue
   while read -r name; do
+    lines=$(wc -l <"$work/$name.log" 2>/dev/null | tr -d '[:space:]')
     echo
-    echo "--- $name: last 40 lines ---"
-    tail -40 "$work/$name.log"
+    echo "--- $name: full log ($lines lines) ---"
+    cat "$work/$name.log"
   done <"$work/$kind"
 done
+
+# Copy the same logs somewhere that survives this script's own `rm -rf
+# "$work"` EXIT trap below, and print the path -- the full print above covers
+# a caller who redirected this script's own output, but not one running it
+# interactively with nothing captured. Bounded on both axes: only the logs
+# that need a second look are copied (not all $found), and a fresh KEEPDIR
+# per run is reaped after 24h so it cannot accumulate the way a fixed-name
+# scratch path would -- $TMPDIR is shared by every concurrent agent on this
+# box, so a per-run unique prefix is required, never a fixed name.
+if [ -s "$work/failed" ] || [ -s "$work/undecided" ]; then
+  tmproot=${TMPDIR:-/tmp}
+  find "$tmproot" -maxdepth 1 -name 'selfhost-diffall-keep.*' -type d -mmin +1440 \
+    -exec rm -rf {} + 2>/dev/null || true
+  keepdir=$(mktemp -d "$tmproot/selfhost-diffall-keep.XXXXXX")
+  for kind in failed undecided; do
+    [ -s "$work/$kind" ] || continue
+    while read -r name; do
+      cp "$work/$name.log" "$keepdir/$name.log" 2>/dev/null || true
+    done <"$work/$kind"
+  done
+  echo
+  echo "full logs for every failing/undecided constituent kept: $keepdir"
+fi
 
 echo
 echo "diffall: PASS=$pass FAIL=$fail INCONCLUSIVE=$inconc TIMEOUT=$timeout ABSENT=$absent (of $found)"
