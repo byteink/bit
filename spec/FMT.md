@@ -357,3 +357,88 @@ No other category named in this ticket was found unsettled: indentation
 formatter may move a comment (§4) each have a specific rule in the printer
 today, cited above, with nothing in `#2874`'s inventory or the four fix
 tickets contradicting it.
+
+
+## 11. `bit fmt` owns every file — there is no exemption class (`#3673`)
+
+**Rule.** `bit fmt` owns every tracked `.bit` file in the repository, with
+no opt-out: no ignore list, no per-file directive, no per-line pragma. If
+the formatter's canonical output is wrong for a file — if it destroys
+information a reader relies on — that is a bug in `bit fmt`, fixed in
+`bit fmt`. It is never grounds to stop running the formatter on that file.
+
+**Why an exclusion list is rejected outright, not merely deferred.** An
+earlier draft of this section proposed excluding six files whose
+hand-aligned trailing-comment tables `bit fmt` collapses (below), on the
+reasoning that the alignment was deliberate and the formatter had no
+opinion on it either way. That was overruled: an exclusion list is
+scaffolding around a bug, and a permanent one — nothing inside an excluded
+file marks it as excluded, so a reader sees ordinary source with no signal
+that any tool has stopped looking at it, while every gate built on top of
+`bit fmt --check` keeps reporting green regardless of what the file
+actually contains. Contrast a *ceiling* (`#3670`'s `test-fmt-ceiling`,
+ratcheting the trees `bit fmt` has not yet reached): a ceiling says "not
+yet," and the gate can only ever prove the count shrinks. An ignore list
+says "never," and nothing ever checks that claim again. The two read as
+similar and are not: **ignore means never, ceiling means not yet.**
+
+**The concrete instance that prompted this.** Six files in `runtime/`
+carry `asm` byte-array literals with each instruction's mnemonic in a
+trailing `//` comment, column-aligned so the encoding reads against the
+instruction it produces, e.g. (`runtime/sched/sched.bit:198`):
+
+```
+arm64 { 0xD2800000 }                    // mov x0, #0
+x64   { 0xB8, 0x08, 0x00, 0x00, 0x00 }  // mov eax, 8
+```
+
+`bit fmt` collapses every one of these to a single space before `//` —
+`fmtGap`'s same-line branch emits exactly one space and nothing more
+(`compiler/fmt.bit:265`, `fmtRaw(p, " ")`). There is no column-alignment
+logic anywhere in `compiler/fmt.bit`, `compiler/fmtcmd.bit`,
+`compiler/fmtdispatch.bit`, `compiler/fmtexpr.bit` or `compiler/fmtwrap.bit`
+— confirmed by grepping all five for `align`/`column`/`padTo`/`widest`; the
+only "column" hits are the §1/§5 wrap-budget tracking, an unrelated
+mechanism. This is an unimplemented feature, not a documented decision:
+`bit fmt` was never taught to align a run of trailing comments, the way
+gofmt has for years.
+
+**`#3673` is the fix, not an exception, and its verification set is exactly
+these six files:** `runtime/stw/stwpoll.bit`,
+`runtime/root/linux/boottail.bit`, `runtime/sched/sched.bit`,
+`runtime/sched/task.bit`, `runtime/sched/timer.bit`,
+`runtime/sched/windows/spawn.bit`. Once it lands, `bit fmt` produces the
+alignment these files were hand-maintaining, and they become ordinary
+formatted files with no special handling anywhere — the same six files that
+made this section necessary are the ones that make it unnecessary once
+the formatter can do the one thing it was missing.
+
+**A second, disjoint set of files was proposed alongside those six and does
+not belong here at all.** `runtime/sched/grow.bit`,
+`runtime/sched/queue.bit`, `runtime/sched/sleep.bit`,
+`runtime/sched/worker.bit`, `runtime/sched/workerrun.bit`,
+`runtime/sched/darwin/poll.bit`, `runtime/sched/linux/poll.bit` and
+`runtime/sched/windows/poll.bit` all fail `bit fmt --check` too, but
+diffing each under `bit fmt` and inspecting every changed line shows none
+of them contains an `asm` block, a byte array, or any column-aligned
+comment or `const` table anywhere in the file — their failure is ordinary
+over-length-signature wrapping, or in `sleep.bit`'s case a single
+double-blank-line collapse. That is the same class of drift as
+`tools/build/gates.bit`'s diff (463 of 626 lines, verified 2026-08-24,
+none of it a table) — real, but nothing for `#3673` to fix and nothing to
+exclude either. **The two groups were separated by measurement, not by
+assumption**: the first draft of this decision conflated them into one
+14-file list on the strength of "every file under `runtime/sched/` that
+fails `bit fmt --check`," which is exactly the category error this section
+exists to avoid repeating. These eight files, plus
+`runtime/root/linux/boot.bit` and `runtime/root/windows/boot.bit` (checked
+for the same reason, also ordinary import/signature/`if`-wrap drift), are
+tracked as ordinary, ungated debt by `#3670`'s `test-fmt-ceiling` ratchet,
+the same as any other file in `compiler/`, `runtime/` or `tools/` that has
+never been run through `bit fmt`.
+
+**Check:** `bit fmt --check` on the six files named above exits 1 today.
+`#3673`'s acceptance is that it exits 0 for exactly those six once the
+alignment logic lands, and that formatting each of the six twice produces
+byte-identical output — `bit fmt` must stay idempotent even once it starts
+computing a column from the widest line in a run.
