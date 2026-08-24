@@ -443,7 +443,8 @@ export @nosplit @symbol("bit_rt_port_stw_safepoint") fn stwSafepoint(snap: int) 
 // assembler in the toolchain (§11.6), and a wrong offset here does not fail a
 // build, it publishes the wrong register as a root.
 //
-//   x86-64 (rbx=3, r13=13, r14=14, r15=15 -> +40,+120,+128,+136):
+//   x86-64 (rbx=3, r13=13, r14=14, r15=15, rsi=6, rdi=7 ->
+//   +40,+120,+128,+136,+64,+72):
 //     48 81 EC 18 01 00 00        subq  $280, %rsp
 //     4C 8B 84 24 18 01 00 00     movq  280(%rsp), %r8    # the caller's ret addr
 //     4C 89 04 24                 movq  %r8, 0(%rsp)
@@ -452,17 +453,21 @@ export @nosplit @symbol("bit_rt_port_stw_safepoint") fn stwSafepoint(snap: int) 
 //     4C 89 6C 24 78              movq  %r13, 120(%rsp)
 //     4C 89 B4 24 80 00 00 00     movq  %r14, 128(%rsp)
 //     4C 89 BC 24 88 00 00 00     movq  %r15, 136(%rsp)
+//     48 89 74 24 40              movq  %rsi, 64(%rsp)
+//     48 89 7C 24 48              movq  %rdi, 72(%rsp)    # rdi's ORIGINAL value, before it is overwritten below
 //     48 89 E7                    movq  %rsp, %rdi        # arg 0 = the frame (SysV: RDI)
 //     48 89 E1                    movq  %rsp, %rcx        # arg 0 = the frame (Win64: RCX)
 //     FF D0                       call  *%rax
+//     48 8B 7C 24 48              movq  72(%rsp), %rdi    # restore rdi — see #3592 below
 //     48 81 C4 18 01 00 00        addq  $280, %rsp
 //     C3                          ret
 //   At entry `rsp % 16 == 8` (the caller's `call` pushed the return address), so
 //   subtracting 280 restores `rsp % 16 == 0` for the call while leaving the
 //   return address at 280(%rsp). `rbp` is still the caller's frame pointer — no
-//   prologue ran. `rdi`/`rcx`/`r8`/`rax` are all caller-saved under both x64
-//   conventions, so materializing them cannot destroy a callee-saved value
-//   before it is saved.
+//   prologue ran. `rcx`/`r8`/`rax` are caller-saved under both x64 conventions,
+//   so materializing them cannot destroy a callee-saved value before it is
+//   saved; `rdi` is NOT (#3592, below) and `rsi` is only ever read, never
+//   written, by this payload.
 //
 //   #3554: this shim is emitted identically for every x64 target (ELF, Mach-O
 //   AND PE), but SysV (ELF/Mach-O) and Win64 (PE) disagree on which register
@@ -482,6 +487,33 @@ export @nosplit @symbol("bit_rt_port_stw_safepoint") fn stwSafepoint(snap: int) 
 //   call-target materialization off RCX onto RAX (caller-saved and unused by
 //   either convention's argument bank), so the same bytes are correct under
 //   both ABIs with no target-OS branch needed.
+//
+//   #3592: a THIRD instance of the same SysV-assumption class, in this same
+//   payload, and #3554's own fix comment states the wrong premise —
+//   "rdi/rcx/r8/rax are all caller-saved under both x64 conventions" is true
+//   for rcx/r8/rax but false for rdi. Under Win64, `rdi` (and `rsi`) are
+//   CALLEE-SAVED (compiler/x64.bit's `xIsCalleeSavedInt`), so a Windows build
+//   of a function with a back-edge safepoint may allocate a live-across-the-poll
+//   GC reference into either — `compiler/x64frame.bit`'s `xBuildSavedGpr`
+//   derives the allocator's callee-saved file straight from `xIsCalleeSavedInt`,
+//   with no exemption for this call site. Before this fix the payload (a) wrote
+//   `%rsp` into `rdi` UNCONDITIONALLY, permanently destroying any live value a
+//   Windows caller had there regardless of whether a collection ever ran, and
+//   (b) never wrote regs[6]/regs[7] (rsi/rdi) into the snapshot at all, so even
+//   when rdi/rsi survived untouched, a collection reached from a NESTED call
+//   (`gc_alloc`, not this shim's own poll) would read `runtime/gc/stackmap.bit`
+//   `gcScanSnapshot`'s uninitialized regs[6]/regs[7] slots — leftover stack
+//   bytes, not the real pointer — and silently fail to root the object,
+//   letting it be freed and reused while a live Bit reference still pointed at
+//   it. Reproduced on real Windows hardware, `std/os`'s `args()` under
+//   `BIT_GC=stress` (`stdlib/os/os.bit`'s `append`-in-a-loop is exactly a
+//   back-edge safepoint with `out` live across it): `len(args())` printed a
+//   different garbage number every run (3/3), and `args()[0]` segfaulted
+//   (3/3). Fixed by saving rsi/rdi into the snapshot alongside the other four,
+//   and by saving rdi's ORIGINAL value before overwriting it and restoring it
+//   after the call returns — harmless extra work under SysV (where rdi was
+//   already volatile and a caller never expected it preserved), load-bearing
+//   under Win64.
 //
 //   AArch64 (x19..x28 -> +168..+240):
 //     D10483FF   sub  sp, sp, #288
@@ -525,9 +557,12 @@ fn safepointEntry() {
             0x4C, 0x89, 0x6C, 0x24, 0x78,
             0x4C, 0x89, 0xB4, 0x24, 0x80, 0x00, 0x00, 0x00,
             0x4C, 0x89, 0xBC, 0x24, 0x88, 0x00, 0x00, 0x00,
+            0x48, 0x89, 0x74, 0x24, 0x40,
+            0x48, 0x89, 0x7C, 0x24, 0x48,
             0x48, 0x89, 0xE7,
             0x48, 0x89, 0xE1,
             0xFF, 0xD0,
+            0x48, 0x8B, 0x7C, 0x24, 0x48,
             0x48, 0x81, 0xC4, 0x18, 0x01, 0x00, 0x00,
             0xC3 }
     arm64 { 0xD10483FF,
@@ -545,7 +580,10 @@ fn safepointEntry() {
             0x910483FF,
             0xD65F03C0 }
     input arm64 x1 x64 rax = entryOf(stwSafepoint)
-    clobber x64   { rdi, rcx, r8, memory }
+    // rdi is written mid-payload but RESTORED before `ret` (#3592) — its
+    // value at function exit equals its value at entry, so it is no longer
+    // listed here. rsi is only ever read (into the snapshot), never written.
+    clobber x64   { rcx, r8, memory }
     clobber arm64 { x0, memory }
   }
 }
