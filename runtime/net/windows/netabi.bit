@@ -1,0 +1,184 @@
+// SEAM 1 of the Windows runtime port (#3340, epic #3322): the `bit_rt_net_*`
+// ABI wrappers (ABI.md §20) over this provider's socket engine (./sock.bit,
+// ./tcp.bit, ./udp.bit). Byte-for-byte the same shape as
+// ../linux/netabi.bit and ../darwin/netabi.bit — see either for the full
+// rationale (why the wrappers live per-platform, why the buffers here are
+// managed `[]i64` rather than raw `rtStrAlloc` addresses across a park).
+// This file duplicates their marshalling body rather than sharing it, for
+// the identical reason: the only thing that differs between the three is
+// which socket engine the sibling names resolve to.
+
+import { loadByte, storeByte } from "../../gc"
+import { emptyStr, u8At, scratchWords, strData, strSizeOf,
+         strFromPacked, formatQuad, udpSenderSlot, udpValidAt, udpSenderWordAt,
+         copySockAddrWords } from "../../net"
+
+// ---------------------------------------------------------------------------
+// TCP (ABI.md §20)
+// ---------------------------------------------------------------------------
+
+export @symbol("bit_rt_net_listen") fn netAbiListen(host: int, port: int): int {
+  if (port < 0 || port > 65535) {
+    return 0 - 1
+  }
+  return netListenTcp(strData(host), strSizeOf(host), port, 512)
+}
+
+export @symbol("bit_rt_net_local_port") fn netAbiLocalPort(fd: int): int {
+  return netSockLocalPort(fd)
+}
+
+export @symbol("bit_rt_net_accept") fn netAbiAccept(fd: int): int {
+  return netAcceptTcp(fd)
+}
+
+export @symbol("bit_rt_net_dial") fn netAbiDial(host: int, port: int): int {
+  if (port < 0 || port > 65535) {
+    return 0 - 1
+  }
+  return netDialTcp(strData(host), strSizeOf(host), port)
+}
+
+export @symbol("bit_rt_net_read") fn netAbiRead(fd: int, max: int): int {
+  if (max <= 0) {
+    return emptyStr()
+  }
+  let scratch = []i64(scratchWords(max))
+  let n = netReadSock(fd, u8At(int(ptrOf(scratch))), max)
+  if (n <= 0) {
+    return emptyStr()
+  }
+  return strFromPacked(int(ptrOf(scratch)), n)
+}
+
+export @symbol("bit_rt_net_write") fn netAbiWrite(fd: int, s: int): int {
+  return netWriteSock(fd, strData(s), strSizeOf(s))
+}
+
+// ---------------------------------------------------------------------------
+// Deadline-bounded dial/read/write (#2291) — see ../tcp.bit's own header for
+// this provider's documented gap (pre-flight deadline check only, an
+// in-flight async wait is not bounded).
+// ---------------------------------------------------------------------------
+
+const netAbiMaxHost: int = 255
+const netAbiMaxBody: int = 67108864
+
+export @symbol("bit_rt_net_dial_deadline_w") fn netAbiDialDeadlineW(hostWords: int, hostLen: int, port: int, deadlineNs: int): int {
+  if (port < 0 || port > 65535) {
+    return 0 - 1
+  }
+  if (hostWords == 0 || hostLen <= 0 || hostLen > netAbiMaxHost) {
+    return 0 - 1
+  }
+  let scratch = []i64(scratchWords(hostLen))
+  let packed = int(ptrOf(scratch))
+  let i = 0
+  while (i < hostLen) {
+    storeByte(packed + i, loadByte(hostWords + i))
+    i = i + 1
+  }
+  return netDialTcpDeadline(u8At(packed), hostLen, port, deadlineNs)
+}
+
+export @symbol("bit_rt_net_read_deadline_w") fn netAbiReadDeadlineW(fd: int, outWords: int, bufCap: int, deadlineNs: int): int {
+  if (bufCap <= 0 || outWords == 0) {
+    return 0
+  }
+  let scratch = []i64(scratchWords(bufCap))
+  let packed = int(ptrOf(scratch))
+  let n = netReadSockDeadline(fd, u8At(packed), bufCap, deadlineNs)
+  if (n <= 0) {
+    return n
+  }
+  let i = 0
+  while (i < n) {
+    storeByte(outWords + i, loadByte(packed + i))
+    i = i + 1
+  }
+  return n
+}
+
+export @symbol("bit_rt_net_write_deadline_w") fn netAbiWriteDeadlineW(fd: int, words: int, n: int, deadlineNs: int): int {
+  if (n <= 0) {
+    return 0
+  }
+  if (words == 0 || n > netAbiMaxBody) {
+    return 0 - 1
+  }
+  let scratch = []i64(scratchWords(n))
+  let packed = int(ptrOf(scratch))
+  let i = 0
+  while (i < n) {
+    storeByte(packed + i, loadByte(words + i))
+    i = i + 1
+  }
+  return netWriteSockDeadline(fd, u8At(packed), n, deadlineNs)
+}
+
+export @symbol("bit_rt_net_shutdown_sock_w") fn netAbiShutdownSockW(fd: int): bool {
+  return netShutdownSock(fd)
+}
+
+// ---------------------------------------------------------------------------
+// UDP (ABI.md §20)
+// ---------------------------------------------------------------------------
+
+export @symbol("bit_rt_net_udp_bind") fn netAbiUdpBind(host: int, port: int): int {
+  if (port < 0 || port > 65535) {
+    return 0 - 1
+  }
+  return netBindUdp(strData(host), strSizeOf(host), port)
+}
+
+export @symbol("bit_rt_net_udp_send") fn netAbiUdpSend(fd: int, host: int, port: int, data: int): int {
+  if (port < 0 || port > 65535) {
+    return 0 - 1
+  }
+  return netSendTo(fd, strData(host), strSizeOf(host), port, strData(data), strSizeOf(data))
+}
+
+export @symbol("bit_rt_net_udp_recv") fn netAbiUdpRecv(fd: int, max: int): int {
+  if (max <= 0) {
+    return emptyStr()
+  }
+  let scratch = []i64(scratchWords(max))
+  let peer = []i64(4)
+  let n = netRecvFrom(fd, u8At(int(ptrOf(scratch))), max, u8At(int(ptrOf(peer))))
+
+  let slot = udpSenderSlot()
+  if (n < 0) {
+    if (slot >= 0) {
+      *(udpValidAt(slot)) = 0
+    }
+    return emptyStr()
+  }
+  if (slot >= 0) {
+    copySockAddrWords(ptrOf(peer), udpSenderWordAt(slot))
+    *(udpValidAt(slot)) = 1
+  }
+  return strFromPacked(int(ptrOf(scratch)), n)
+}
+
+// ---------------------------------------------------------------------------
+// DNS (ABI.md §20)
+// ---------------------------------------------------------------------------
+
+// Windows has no `/etc/resolv.conf`; DNS server discovery on this platform
+// is `GetAdaptersAddresses`/`GetNetworkParams` (iphlpapi.dll), which is
+// genuinely different plumbing, not a provider-local file-read swap — out of
+// THIS ticket's scope (sockets, not name resolution; filed as #3589). A
+// dotted-quad `host` still
+// resolves correctly (no file read needed for that path); anything else
+// fails closed rather than silently reading a Unix path that does not exist
+// on this OS.
+export @symbol("bit_rt_net_resolve") fn netAbiResolve(host: int): int {
+  let hostPtr = strData(host)
+  let hostLen = strSizeOf(host)
+  let outBuf = []i64(1)
+  let outPtr = u8At(int(ptrOf(outBuf)))
+  if (netParseIpv4(hostPtr, hostLen, outPtr)) {
+    return formatQuad(outPtr)
+  }
+  return emptyStr()
+}

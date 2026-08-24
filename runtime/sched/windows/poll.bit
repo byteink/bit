@@ -257,10 +257,32 @@ let taskOf: [512]i64
 let flagsScratch: [512]i64
 
 // WSARecv/WSASend's `lpNumberOfBytesRecvd`/`lpNumberOfBytesSent` out scratch.
-// Always 0 for a zero-length buffer; never read by this file (see the
-// header's "WHY NO STATUS INSPECTION" section — byte count cannot
-// distinguish "ready" from "closed" here regardless).
+// Always 0 for a zero-length buffer; never read by this file for a probe slot
+// (see the header's "WHY NO STATUS INSPECTION" section). For a REAL op slot
+// (`opKind[slot] == 1`, #3340) this is instead OVERWRITTEN at drain time from
+// the completion packet's own `dwNumberOfBytesTransferred`, which is the
+// authoritative count for an overlapped call per Microsoft's own guidance —
+// the out-param address passed to WSARecv/WSASend/AcceptEx is not reliably
+// updated when the call returns WSA_IO_PENDING.
 let bytesXfer: [512]i64
+
+// `opKind[slot]`: 0 (default, every slot starts and returns here) is this
+// file's OWN zero-byte readiness probe — `pollDrain` releases the slot and
+// wakes the task immediately, exactly as before #3340. 1 is a REAL op posted
+// by `../../net/windows` (#3340) through `pollClaimOp` below, carrying a real
+// buffer and a real byte count a caller must read AFTER being woken — so
+// `pollDrain` wakes the task but leaves the slot claimed, and only
+// `pollOpTake` (called by the net/windows caller once resumed) releases it.
+// This is the OVERLAPPED-lifetime guarantee #3340's ticket requires: the slot
+// (hence the OVERLAPPED backing it) stays alive from `pollClaimOp` through
+// `pollOpTake`, spanning the whole async op including its completion.
+let opKind: [512]i64
+
+// The real op's completion status (`Internal`, an NTSTATUS-shaped word — 0 is
+// STATUS_SUCCESS) — meaningful only when `opKind[slot] == 1`. Read by
+// `pollOpTake`; a probe slot never sets or reads this (see "WHY NO STATUS
+// INSPECTION" — a probe wakes on any completion, success or error alike).
+let slotStatus: [512]i64
 
 fn scratchClaim(): int {
   let flags: *i64 = ptrOf(outstandingClaimed)
@@ -345,6 +367,32 @@ export @symbol("bit_rt_port_sched_poll_close") fn pollClose(pollFd: int) {
   let _ = int(CloseHandle(hAt(pollFd)))
 }
 
+// Associate `fd` with `pollFd`, tolerating "already associated" (see the
+// header's "ASSOCIATION" section) — shared by `pollRegister` and
+// `pollClaimOp` (#3340), which both need the identical tolerate-EINVAL logic
+// and previously only the former had it.
+fn associateHandle(pollFd: int, fd: int): bool {
+  let assoc = CreateIoCompletionPort(hAt(fd), hAt(pollFd), i64(fd), i32(0))
+  if (int(assoc) == 0) {
+    if (int(GetLastError()) != errorInvalidParameter()) {
+      return false
+    }
+  }
+  return true
+}
+
+// Exported wrapper for `associateHandle` — `../../net/windows`'s AcceptEx
+// caller (#3340) needs to associate the LISTENING socket with the port
+// directly, separately from `pollClaimOp`'s own association of whatever
+// socket an op is actually posted through. AcceptEx's completion is
+// delivered via the listening socket's own association, not the accept
+// socket's — a real hang, reproduced on hardware, when only the accept
+// socket was associated (see ../../net/windows/tcp.bit's `netAcceptTcp` for
+// the full account).
+export @symbol("bit_rt_port_sched_poll_associate") fn pollAssociate(pollFd: int, fd: int): bool {
+  return associateHandle(pollFd, fd)
+}
+
 // Register `task` to be woken when `fd` becomes ready for `interest` — by
 // posting a zero-byte overlapped WSARecv (read) or WSASend (write). See the
 // header for the translation this implements, its cost, and why the
@@ -364,17 +412,15 @@ export @symbol("bit_rt_port_sched_poll_register") fn pollRegister(pollFd: int, f
   taskOf[slot] = i64(task)
   flagsScratch[slot] = i64(0)
   bytesXfer[slot] = i64(0)
+  opKind[slot] = i64(0)
+  slotStatus[slot] = i64(0)
 
-  // Associate every call, tolerating "already associated" — see the header.
-  let none: *byte = nil
-  let assoc = CreateIoCompletionPort(hAt(fd), hAt(pollFd), i64(fd), i32(0))
-  if (int(assoc) == 0) {
-    if (int(GetLastError()) != errorInvalidParameter()) {
-      scratchRelease(slot)
-      return false
-    }
+  if (!associateHandle(pollFd, fd)) {
+    scratchRelease(slot)
+    return false
   }
 
+  let none: *byte = nil
   let ov = ovPtr(slot)
   let wb = wsabufPtr(slot)
   let rc = 0
@@ -395,6 +441,98 @@ export @symbol("bit_rt_port_sched_poll_register") fn pollRegister(pollFd: int, f
   // exactly one `pollDrain` away — counted here as one live registration.
   schedPollPendingInc()
   return true
+}
+
+// ---------------------------------------------------------------------------
+// The REAL-OP API (#3340) — a second use of the exact same scratch pool
+// above, for `../../net/windows`'s AcceptEx/ConnectEx/WSARecv/WSASend calls,
+// which carry a REAL buffer and a REAL result rather than the zero-byte
+// probe's throwaway one. See `opKind`'s own doc comment for the lifetime
+// contract this implements: `pollClaimOp` through `pollOpTake` is the span
+// during which the OVERLAPPED this hands out must not be freed or reused —
+// exactly the constraint #3340's ticket names on the cancellation and error
+// paths, satisfied here by the slot staying claimed (`outstandingClaimed`)
+// until `pollOpTake` (or `pollOpAbort`, on a caller that never posts)
+// releases it.
+//
+// Callers issue the ACTUAL Win32 call themselves (this file has no knowledge
+// of AcceptEx/ConnectEx, which are not even statically linkable — see
+// ../../net/windows/sock.bit's header) using the OVERLAPPED/WSABUF pointers
+// below, then report the outcome back so this pool's bookkeeping
+// (`schedPollPendingInc`/`Dec`, which slot has a result pending) stays exactly
+// as accurate for a real op as it already is for a probe.
+
+// Claim a slot for a real op on `fd` and associate the handle, but issue
+// nothing. Returns the slot (`>= 0`), or `-1` on a claim or association
+// failure — the caller must not proceed to issue any I/O in that case.
+export @symbol("bit_rt_port_sched_poll_claim_op") fn pollClaimOp(pollFd: int, fd: int, task: int): int {
+  let slot = scratchClaim()
+  if (slot < 0) {
+    return 0 - 1
+  }
+  ovWords[slot * 4 + 0] = i64(0)
+  ovWords[slot * 4 + 1] = i64(0)
+  ovWords[slot * 4 + 2] = i64(0)
+  ovWords[slot * 4 + 3] = i64(0)
+  wsabufWords[slot * 2 + 0] = i64(0)
+  wsabufWords[slot * 2 + 1] = i64(0)
+  taskOf[slot] = i64(task)
+  flagsScratch[slot] = i64(0)
+  bytesXfer[slot] = i64(0)
+  opKind[slot] = i64(1)
+  slotStatus[slot] = i64(0)
+  if (!associateHandle(pollFd, fd)) {
+    scratchRelease(slot)
+    return 0 - 1
+  }
+  return slot
+}
+
+// `slot`'s OVERLAPPED, to pass as the real Win32 call's own `lpOverlapped`.
+export @symbol("bit_rt_port_sched_poll_op_overlapped") fn pollOpOverlapped(slot: int): *byte {
+  return ovPtr(slot)
+}
+
+// `slot`'s WSABUF{len, buf} — only WSARecv/WSASend use this; AcceptEx/
+// ConnectEx take a raw buffer pointer instead and ignore it.
+export @symbol("bit_rt_port_sched_poll_op_wsabuf") fn pollOpWsabuf(slot: int): *byte {
+  return wsabufPtr(slot)
+}
+
+// Call after the real Win32 call returned success or `WSA_IO_PENDING` (the
+// overlapped op is genuinely outstanding): counts the live registration the
+// same way `pollRegister` already does, so `pollDrain`'s per-op accounting
+// stays correct for a real op too.
+export @symbol("bit_rt_port_sched_poll_op_commit") fn pollOpCommit(slot: int) {
+  schedPollPendingInc()
+}
+
+// Call instead of `pollOpCommit` when the real Win32 call failed SYNCHRONOUSLY
+// (neither success nor `WSA_IO_PENDING`): releases the slot without ever
+// having counted it as outstanding, matching `pollRegister`'s own hard-failure
+// path.
+export @symbol("bit_rt_port_sched_poll_op_abort") fn pollOpAbort(slot: int) {
+  scratchRelease(slot)
+}
+
+// `slot`'s byte count, once woken. Read BEFORE `pollOpRelease` — a pinned
+// `@symbol` export may return only a scalar (ABI.md §9), so the (bytes,
+// status, release) triple `pollOpTake` would have been is three calls
+// instead of a tuple.
+export @symbol("bit_rt_port_sched_poll_op_bytes") fn pollOpBytes(slot: int): int {
+  return int(bytesXfer[slot])
+}
+
+// `slot`'s completion status, once woken. `0` is `STATUS_SUCCESS`. Read
+// BEFORE `pollOpRelease`, same ordering requirement as `pollOpBytes`.
+export @symbol("bit_rt_port_sched_poll_op_status") fn pollOpStatus(slot: int): int {
+  return int(slotStatus[slot])
+}
+
+// Release `slot` — the first point at which the OVERLAPPED backing it may be
+// reused. Call LAST, once `pollOpBytes`/`pollOpStatus` have both been read.
+export @symbol("bit_rt_port_sched_poll_op_release") fn pollOpRelease(slot: int) {
+  scratchRelease(slot)
 }
 
 // Ready events drained per call — matches both siblings' `maxBatch`.
@@ -422,6 +560,41 @@ let removedCount: i32 = 0
 // TIMEOUT 0 IN THE WORKER LOOP, matching both siblings: a worker never blocks
 // inside `GetQueuedCompletionStatusEx`, so it is never sitting in a syscall
 // where it cannot answer the collector's stop-the-world rendezvous.
+// One completed slot's worth of `pollDrain`'s work, pulled out (#3340) so the
+// new opKind branch does not push the loop over the complexity ceiling.
+// Returns 1 if a task was woken, else 0.
+//
+// PROBE (`opKind == 0`): unchanged from before #3340 — release the slot
+// immediately (its result is throwaway) and wake on ANY completion, success
+// or error alike (the header's "WHY NO STATUS INSPECTION" section).
+//
+// REAL OP (`opKind == 1`, #3340): the slot is NOT released here — its result
+// is real and the woken caller (`../../net/windows`) must read it via
+// `pollOpTake` first. This is the OVERLAPPED-lifetime guarantee: the slot
+// stays claimed from `pollClaimOp` through that read, spanning the whole
+// async op.
+fn pollFinishSlot(s: *i64, slot: int, byteCount: int, statusWord: int): int {
+  let task = int(taskOf[slot])
+  if (opKind[slot] == i64(1)) {
+    bytesXfer[slot] = i64(byteCount)
+    slotStatus[slot] = i64(statusWord)
+  } else {
+    scratchRelease(slot)
+  }
+  // The one-shot edge is consumed here regardless of what `schedPollUnpark`
+  // does with it below, matching both siblings.
+  schedPollPendingDec()
+  // `schedPollUnpark`, not a plain unpark: this registration's one-shot edge
+  // is already consumed, so a task caught between registering and parking
+  // must be handed the wake rather than have it dropped.
+  if (task != 0) {
+    if (schedPollUnpark(s, task)) {
+      return 1
+    }
+  }
+  return 0
+}
+
 export @symbol("bit_rt_port_sched_poll_drain") fn pollDrain(schedAddr: int, timeoutMs: int): int {
   let s = taskAt(schedAddr)
   let pollFd = *(s + scPollFd)
@@ -451,21 +624,9 @@ export @symbol("bit_rt_port_sched_poll_drain") fn pollDrain(schedAddr: int, time
       let overlappedAddr = int(evBuf[i * 4 + 1])
       let slot = (overlappedAddr - base) / 32
       if (slot >= 0 && slot < maxOutstanding) {
-        let task = int(taskOf[slot])
-        scratchRelease(slot)
-        // The one-shot edge is consumed here regardless of what
-        // `schedPollUnpark` does with it below, matching both siblings.
-        schedPollPendingDec()
-        // ANY completion wakes the task — see the header's "WHY NO STATUS
-        // INSPECTION" section. `schedPollUnpark`, not a plain unpark: this
-        // registration's one-shot edge is already consumed, so a task caught
-        // between registering and parking must be handed the wake rather
-        // than have it dropped.
-        if (task != 0) {
-          if (schedPollUnpark(s, task)) {
-            woken = woken + 1
-          }
-        }
+        let byteCount = int(evBuf[i * 4 + 3])
+        let statusWord = int(evBuf[i * 4 + 2])
+        woken = woken + pollFinishSlot(s, slot, byteCount, statusWord)
       }
       i = i + 1
     }

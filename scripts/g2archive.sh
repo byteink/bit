@@ -151,8 +151,11 @@ PLATFORM_PAIRS="alloc cryptohw gc net park rand root sched thread"
 # deletion under linux/darwin, where all eight pairs must always be
 # present — this list only relaxes the requirement for the one platform
 # still being built out. As each pair's windows port lands, add its name
-# here in the same commit.
-WINDOWS_PAIRS="alloc gc park rand root sched thread"
+# here in the same commit. `net` lands with #3340 (AcceptEx/ConnectEx/
+# WSARecv/WSASend on top of #3339's poller, runtime/net/windows/**) —
+# the #3386 failure mode this comment already documents, caught before it
+# bit this time.
+WINDOWS_PAIRS="alloc gc net park rand root sched thread"
 
 case "$PLAT" in
   windows) PAIRS_FOR_PLAT="$WINDOWS_PAIRS" ;;
