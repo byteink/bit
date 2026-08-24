@@ -151,6 +151,83 @@ fn xEmitPollCachePrefetch(cx: XCtx) {
   xMovStore(cx.buf, xMemB(XReg64.Rbp, xPollCacheOffset(cx.frame, 1)), XReg64.Rax, 8)
 }
 
+// ---------------------------------------------------------------------------
+// #3565: the worker-preempt clause, split out of xEmitInlinedPollGuard below
+// ---------------------------------------------------------------------------
+//
+// Mirrors stwPollNeeded's clause 3 (runtime/stw/stwpoll.bit, added by #3560):
+//   let worker = schedCurrentWorker()
+//   if (worker != 0) {
+//     let workerId = *(taskAt(worker) + wkId)
+//     if (preemptRequested(workerId)) { return true }
+//   }
+//
+// The word offset (wkId) and the two runtime symbol names below are kept
+// LOCAL to this file rather than joining pgWorldStopWordWord() etc. in
+// compiler/codegen.bit: that file and compiler/arm64call.bit (the arm64
+// mirror of this exact clause) were both being edited concurrently by #3564
+// at the time this landed, and adding to a file two in-flight branches would
+// both touch risks a same-module duplicate declaration neither branch can see
+// coming (E0042). Reported on #3565's ticket as a follow-up consolidation
+// once both land, not merged here.
+fn xPreemptWkIdWord(): int { return 22 } // runtime/sched/worker.bit wkId
+fn xSchedCurrentWorkerSymbol(): string { return "bit_rt_port_sched_current_worker" }
+fn xPreemptRequestedSymbol(): string { return "bit_rt_port_sched_preempt_requested" }
+
+// `schedCurrentWorker`/`preemptRequested` are real cross-module calls, not
+// leaves (schedCurrentWorker walks a stack-tag table), so this clause pays
+// two real `call`s where every other clause in the ladder is a plain
+// load+compare -- the cost stwPollNeeded's own header now documents for the
+// reference function this mirrors; this only reproduces it.
+//
+// `worker == 0` (off-task) and `!preemptRequested(...)` both just fall
+// through to the ladder's next clause, exactly like every other check here --
+// this clause can only ever COMMIT to "poll", appending to `pollFixups`,
+// never to "skip". `pollFixups` is threaded in and back out rather than
+// mutated in place: `append` may reallocate its backing array, so the
+// caller's own binding must be reassigned to the returned slice, the same
+// rule every other `pollFixups = append(...)` call in this file already
+// follows.
+//
+// The workerId load reads `[worker + wkId*8]` directly rather than
+// replaying the runtime's `taskAt` shift-then-add: `worker` is a
+// word-aligned raw address (taskAt's own comment, runtime/sched/task.bit), so
+// `(worker >> 3) * 8 == worker` exactly, and `[worker + wkId*8]` IS
+// `*(taskAt(worker) + wkId)` -- the same base+offset idiom every other field
+// load in this ladder already uses (e.g. pgWorldStopWordWord() above it).
+//
+// preemptRequested's argument is a raw computed value, not an IR value
+// xEmitCallLike's arg marshaller can see (xMarshalArgs indexes cx.f.instrs),
+// so it is moved into xArg0(cx.cc) by hand -- the same manual-argument
+// pattern xEmitCallValue (x64call.bit) already uses for its own indirect
+// call. xArg0 is the one function in this file that already knows Win64
+// (rcx) differs from SysV (rdi); using it here rather than a hardcoded
+// register is what keeps this correct on both, unlike #3503/#3554.
+fn xEmitPreemptClause(cx: XCtx, rTmp: XReg64, pollFixups: []int): []int {
+  xEmitCallLike(cx, xSchedCurrentWorkerSymbol(), []int(0), false, 0, 0, false)
+  xMovRR(cx.buf, rTmp, XReg64.Rax) // rTmp = worker (0 off-task)
+  xTestRR(cx.buf, rTmp, rTmp)
+  let workerSkip = xJccRel32Placeholder(cx, ccE())
+
+  xMovLoad(cx.buf, rTmp, xMemB(rTmp, xPreemptWkIdWord() * 8), 8, false) // rTmp = workerId
+  xMovRR(cx.buf, xArg0(cx.cc), rTmp) // workerId -> arg0
+  let shadow = xShadowSpace(cx.cc)
+  if (shadow > 0) {
+    xRspAddSub(cx.buf, true, shadow)
+  }
+  xCallReloc(cx, xPreemptRequestedSymbol())
+  if (shadow > 0) {
+    xRspAddSub(cx.buf, false, shadow)
+  }
+  // The C ABI leaves a bool return's upper bits unspecified (xTakeCallResult's
+  // own rule, x64call.bit) -- normalize before testing the full register.
+  xMovzxb(cx.buf, XReg64.Rax, XReg64.Rax)
+  xTestRR(cx.buf, XReg64.Rax, XReg64.Rax)
+  pollFixups = append(pollFixups, xJccRel32Placeholder(cx, ccNe()))
+  xPatchRel32Here(cx, workerSkip)
+  return pollFixups
+}
+
 // The inlined equivalent of `stwPollNeeded` (runtime/stw/stwpoll.bit), clause
 // for clause. compiler/arm64call.bit's emitInlinedPollGuard quotes that
 // predicate in full and holds the rationale for the object half (#3359, whose
@@ -169,6 +246,19 @@ fn xEmitPollCachePrefetch(cx: XCtx) {
 // argument register in either, and no vreg can live in them (they are outside
 // xMasterGprs), so nothing live across the back edge is at risk. r12
 // (xScratch3) is deliberately not used: it is callee-saved under SysV.
+//
+// #3565: the worker-preempt clause (stwPollNeeded's clause 3, added by #3560)
+// pays two real `call`s -- `schedCurrentWorker`/`preemptRequested` are not
+// leaves, unlike every other check in this ladder. That is SAFE against the
+// register file this function's caller (xBuildIntRegs, compiler/x64frame.bit)
+// already picked: any function with a back-edge safepoint restricts its WHOLE
+// int register file to the callee-saved subset for its entire body, not just
+// around the one call this ladder used to make, so no live vreg can ever
+// occupy a register either new call clobbers, exactly like the existing
+// scratch pair's own reasoning above. xClobberPoints (x64frame.bit) treats
+// this whole back-edge lowering as ONE clobber point for the float file too,
+// so the same holds for any xmm live across it. See xEmitPreemptClause for
+// the clause itself.
 fn xEmitInlinedPollGuard(cx: XCtx) {
   let rTmp = xScratch1() // r11: waddr, then every loaded field in turn
   let rGc = xScratch2()  // r10: the cached gcAddr, live to the last compare
@@ -184,6 +274,11 @@ fn xEmitInlinedPollGuard(cx: XCtx) {
   xMovLoad(cx.buf, rTmp, xMemB(rTmp, pgWorldStopWordWord() * 8), 8, false)
   xTestRR(cx.buf, rTmp, rTmp)
   pollFixups = append(pollFixups, xJccRel32Placeholder(cx, ccNe()))
+
+  // a preempt is pending for THIS worker -> poll (#3560's clause 3, mirrored;
+  // see xEmitPreemptClause). Before the GC-only checks below, same as the
+  // runtime function, since preemption must work even with GC disabled.
+  pollFixups = xEmitPreemptClause(cx, rTmp, pollFixups)
 
   // gcAddr == 0 -> poll
   xMovLoad(cx.buf, rGc, xMemB(XReg64.Rbp, xPollCacheOffset(cx.frame, 1)), 8, false)
