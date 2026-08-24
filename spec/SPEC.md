@@ -2823,7 +2823,10 @@ program's object does, since exactly one object per link may define each:
 
 - **no GC type descriptors.** Needing one means the module allocates on the
   managed heap, which the runtime — the code that *implements* that heap —
-  must not do. Refused, rather than emitted without the descriptor.
+  must not do. Refused, rather than emitted without the descriptor. A
+  multi-value `return` is therefore unavailable in a freestanding module:
+  §13.1 builds its tuple as a boxed managed record (`runtime/ABI.md` §1.1).
+  Return a class, or an encoded scalar, instead.
 - **no whole-program `bit_stack_maps` table** — but this is *not* a restriction
   on what the member's functions may do. Each member emits its **own** GC
   stack-map entries into a dedicated section, and the linker concatenates every
