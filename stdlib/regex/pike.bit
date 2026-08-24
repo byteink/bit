@@ -19,16 +19,38 @@
 // immutable and safe to share across any number of green threads; hanging
 // scratch state off it would make every spawned caller race on the same
 // buffer). The one exception, unavoidable once captures are tracked, is
-// `slots`: `Save` (below) copies its thread's slot array so that two threads
-// which forked at an earlier `Split` never alias the same backing array —
-// bounded by `numSlots` per copy and by the program's own instruction count
-// in total, same complexity class as everything else here.
+// `slots`: a thread RECORDED into a `ThreadList` gets its own snapshot
+// (`snapshotSlots`), because it has to outlive the closure walk that
+// produced it. The walk itself allocates nothing — see CAPTURES below.
 //
-// CAPTURES: every thread now carries a `slots` array (`Thread` below)
+// WHY THE WALK MUST NOT COPY PER `Save` (#3629). It used to: every `Save`
+// reached during the epsilon closure allocated a fresh `numSlots` array and
+// copied into it. A pattern of `d` nested capturing groups —
+// `(((...a...)))` — has `2d` `Save` instructions and `numSlots == 2(d+1)`,
+// so ONE closure walk did `2d` copies of a `2d+2` array: O(d^2) int copies
+// and O(d) allocations per input position, hence O(n*d^2) per search. A
+// 893-byte, 446-deep pattern took minutes on a 4 KiB subject — a
+// denial-of-service primitive for any caller that compiles and runs an
+// untrusted pattern, and a direct contradiction of the linear-time promise
+// at the top of this file, which bounds the walk by `len(prog)` alone.
+//
+// CAPTURES: every RECORDED thread carries a `slots` array (`Thread` below)
 // alongside its program counter — `-1` in a slot no `Save` has reached yet.
 // `runPike` returns the winning thread's slots on a match, so `matches`,
 // `find` and `findAll` (regex.bit) all share this one function; `matches`
 // simply discards the slots and keeps the boolean.
+//
+// DURING the closure walk there is no per-thread array at all: one scratch
+// array, `PikeCtx.cur`, holds the capture state at the walk's current point
+// and is mutated in place by `Save` and undone on the way back out (the
+// `undoSlot`/`undoVal` entries in `PcStack`). That is sound because the walk
+// is a depth-first traversal — the arms of a `Split` are explored one after
+// the other, never interleaved — so restoring the one slot a `Save` wrote,
+// after its subtree is drained, puts `cur` back exactly as the next arm must
+// see it. This is Go's `regexp` design (`exec.go`'s `add`, which sets
+// `t.cap[i.Arg]`, recurses, then writes `opos` back) done with an explicit
+// stack instead of recursion, so a deeply nested pattern still cannot
+// overflow the native stack.
 class Thread { pc: int, slots: []int }
 
 // A per-position "already visited" set, keyed by program counter: the
@@ -124,21 +146,35 @@ fn assertHolds(kind: AnchorKind, before: rune, after: rune): bool {
   return wordBefore == wordAfter // NoWordBoundary
 }
 
-// A copy of `slots` with `slotIdx` set to `pos` — copy-on-write. `Split`
-// (`addThreadStep` below) pushes the SAME `slots` array reference for both
-// of its arms, since neither has written yet; only an actual `Save` needs a
-// fresh array, so that the other arm — and every earlier thread already
-// queued with the old array — never sees this write. Bounded by
-// `len(slots)`, which is `prog.numSlots`, fixed per pattern at compile time.
-fn saveSlot(slots: []int, slotIdx: int, pos: int): []int {
+// An independent copy of `slots`, taken when a thread is RECORDED into a
+// `ThreadList` — the one place a capture state has to outlive the walk that
+// built it, since `PikeCtx.cur` keeps being mutated afterwards. Bounded by
+// `len(slots)`, which is `prog.numSlots`, fixed per pattern at compile time,
+// and taken at most once per recorded thread (so at most `len(prog)` times
+// per input position) — never once per `Save`, which is what made this
+// quadratic in nesting depth before #3629.
+fn snapshotSlots(slots: []int): []int {
   let out = []int(len(slots))
   let i = 0
+  // Bounded by `len(slots)` == `prog.numSlots`, fixed at compile time.
   while (i < len(slots)) {
     out[i] = slots[i]
     i = i + 1
   }
-  out[slotIdx] = pos
   return out
+}
+
+// Resets the walk's scratch capture state to `src` — `addThread`'s first
+// act, so each closure walk starts from exactly the capture state of the
+// thread that seeded it. `dst` is `PikeCtx.cur`, allocated once per
+// `runPike`; both are `prog.numSlots` long by construction.
+fn loadSlots(dst: []int, src: []int) {
+  let i = 0
+  // Bounded by `len(dst)` == `prog.numSlots`, fixed at compile time.
+  while (i < len(dst)) {
+    dst[i] = src[i]
+    i = i + 1
+  }
 }
 
 // The explicit closure stack (`addThread` never recurses — a pattern nests
@@ -147,30 +183,49 @@ fn saveSlot(slots: []int, slotIdx: int, pos: int): []int {
 // Pascal-style (mutated in place, like `RegexParser.pos` elsewhere in this
 // module), so the many small functions below that push/pop don't have to
 // thread it through as a return value on top of everything else they need
-// (keeping each at or under the five-parameter lint ceiling, E0202). Each
-// entry is a full `Thread` (pc + the slots in effect at that point in the
-// closure walk), not just a pc, so `Save` can hand a different slots array
-// to what it pushes without disturbing anything already on the stack.
-class PcStack { entries: []Thread, sp: int }
+// (keeping each at or under the five-parameter lint ceiling, E0202).
+//
+// THREE PARALLEL `[]int`s, not one `[]Thread`: an entry is either a pc to
+// visit (`undoSlot == noUndo`) or an UNDO record left behind by a `Save`
+// (`undoSlot >= 0`, meaning "put `undoVal` back into `PikeCtx.cur` at that
+// index"). Plain ints mean a push allocates nothing at all — the old
+// `[]Thread` form built one heap object per push, on top of the per-`Save`
+// array copy #3629 removed.
+class PcStack { pcs: []int, undoSlot: []int, undoVal: []int, sp: int }
+
+// `PcStack.undoSlot`'s "this entry is a pc to visit, not an undo record".
+// A real slot index is always `>= 0` (`prog.bit`'s `instSave`), so `-1`
+// cannot collide with one.
+const noUndo: int = -1
 
 fn newPcStack(capacity: int): PcStack {
-  return PcStack{ entries: []Thread(capacity), sp: 0 }
+  return PcStack{
+    pcs: []int(capacity),
+    undoSlot: []int(capacity),
+    undoVal: []int(capacity),
+    sp: 0,
+  }
 }
 
-// Pushes `(pc, slots)`, asserting the stack (sized by `runPike` to the
-// program's own Split count, see its comment) never overflows — a bounded
-// resource, checked, per the Power-of-Ten rule this whole VM is built to
-// satisfy.
-fn stackPush(stack: PcStack, pc: int, slots: []int) {
-  assert(stack.sp < len(stack.entries), "regex: pike VM closure stack overflow")
-  stack.entries[stack.sp] = Thread{ pc: pc, slots: slots }
+// Pushes "visit `pc`", asserting the stack (sized by `runPike`, see its
+// comment) never overflows — a bounded resource, checked, per the
+// Power-of-Ten rule this whole VM is built to satisfy.
+fn stackPush(stack: PcStack, pc: int) {
+  assert(stack.sp < len(stack.pcs), "regex: pike VM closure stack overflow")
+  stack.pcs[stack.sp] = pc
+  stack.undoSlot[stack.sp] = noUndo
   stack.sp = stack.sp + 1
 }
 
-// Caller must already have checked `stack.sp > 0`.
-fn stackPop(stack: PcStack): Thread {
-  stack.sp = stack.sp - 1
-  return stack.entries[stack.sp]
+// Pushes "restore `cur[slot]` to `val`". Pushed by `Save` BEFORE its
+// successor, so it pops LAST — after everything that successor's subtree
+// pushed on top of it has drained, which is exactly when the arm that wrote
+// `cur[slot]` is finished with it.
+fn stackPushUndo(stack: PcStack, slot: int, val: int) {
+  assert(stack.sp < len(stack.pcs), "regex: pike VM closure stack overflow")
+  stack.undoSlot[stack.sp] = slot
+  stack.undoVal[stack.sp] = val
+  stack.sp = stack.sp + 1
 }
 
 // The values that stay fixed for every `addThread`/`addThreadStep` call
@@ -180,54 +235,73 @@ fn stackPop(stack: PcStack): Thread {
 // per position (before extending survivors into `nlist`), same Pascal-style
 // pattern as `PcStack.sp`. Bundled so those functions stay at or under the
 // five-parameter ceiling without paying for extra parameters per call.
-class PikeCtx { prog: Prog, stack: PcStack, pos: int }
+//
+// `cur` is the walk's single scratch capture array (see CAPTURES at the top
+// of this file): `prog.numSlots` long, allocated once per `runPike`, reset
+// by `addThread` from whichever thread seeded the walk, mutated in place by
+// `Save` and undone by `PcStack`'s undo records. It is walk-local scratch,
+// never handed out — a recorded thread gets `snapshotSlots(cur)`.
+class PikeCtx { prog: Prog, stack: PcStack, pos: int, cur: []int }
 
-// Resolves one thread reached during the epsilon closure: pushes its
+// Resolves one pc reached during the epsilon closure: pushes its
 // successor(s) for the epsilon ops (`Jump`, `Split`, `Save`, a satisfied
 // `Assert`), or records it as a real thread in `tl.threads` for the rest
 // (`Char`/`Class`/`Any`/`Match`). `Split` pushes `y` before `x` so `x` pops
 // first — the priority order `prog.bit` promises. `Save` writes `ctx.pos`
-// into `th.slots[inst.slot]` via `saveSlot`'s copy-on-write.
-fn addThreadStep(tl: ThreadList, th: Thread, before: rune, after: rune, ctx: PikeCtx) {
-  let inst = ctx.prog.insts[th.pc]
+// into `ctx.cur[inst.slot]` in place, after pushing the undo record that
+// puts the old value back once its successor's subtree has drained.
+fn addThreadStep(tl: ThreadList, pc: int, before: rune, after: rune, ctx: PikeCtx) {
+  let inst = ctx.prog.insts[pc]
   if (inst.op == Op.Jump) {
-    stackPush(ctx.stack, inst.x, th.slots)
+    stackPush(ctx.stack, inst.x)
     return
   }
   if (inst.op == Op.Split) {
-    stackPush(ctx.stack, inst.y, th.slots)
-    stackPush(ctx.stack, inst.x, th.slots)
+    stackPush(ctx.stack, inst.y)
+    stackPush(ctx.stack, inst.x)
     return
   }
   if (inst.op == Op.Save) {
-    stackPush(ctx.stack, th.pc + 1, saveSlot(th.slots, inst.slot, ctx.pos))
+    stackPushUndo(ctx.stack, inst.slot, ctx.cur[inst.slot])
+    ctx.cur[inst.slot] = ctx.pos
+    stackPush(ctx.stack, pc + 1)
     return
   }
   if (inst.op == Op.Assert) {
     if (assertHolds(inst.kind, before, after)) {
-      stackPush(ctx.stack, th.pc + 1, th.slots)
+      stackPush(ctx.stack, pc + 1)
     }
     return
   }
-  tl.threads[tl.count] = th
+  tl.threads[tl.count] = Thread{ pc: pc, slots: snapshotSlots(ctx.cur) }
   tl.count = tl.count + 1
 }
 
 // Walks the epsilon closure of `start` into `tl`, iteratively via
 // `ctx.stack` — never recursively (see `PcStack`'s doc comment).
 fn addThread(tl: ThreadList, start: Thread, before: rune, after: rune, ctx: PikeCtx) {
-  stackPush(ctx.stack, start.pc, start.slots)
-  // Bounded: each iteration pops one entry, and a push only ever nets +1
-  // (a `Split`, the only op that pushes two) the FIRST time that pc is
-  // visited — every later pop of it is a dead end via `pcSetHas` below. So
-  // total growth is bounded by the program's own Split count.
+  loadSlots(ctx.cur, start.slots)
+  stackPush(ctx.stack, start.pc)
+  // Bounded: each iteration pops one entry, and a push only ever nets +1 —
+  // a `Split` (two successors) or a `Save` (an undo record plus its
+  // successor), and only the FIRST time that pc is visited, since every
+  // later pop of it is a dead end via `pcSetHas` below. So total growth is
+  // bounded by the program's own Split-plus-Save count, and an undo record
+  // pops without pushing anything at all.
   while (ctx.stack.sp > 0) {
-    let th = stackPop(ctx.stack)
-    if (pcSetHas(tl.visited, th.pc)) {
+    ctx.stack.sp = ctx.stack.sp - 1
+    let sp = ctx.stack.sp
+    let undo = ctx.stack.undoSlot[sp]
+    if (undo != noUndo) {
+      ctx.cur[undo] = ctx.stack.undoVal[sp]
       continue
     }
-    pcSetMark(tl.visited, th.pc)
-    addThreadStep(tl, th, before, after, ctx)
+    let pc = ctx.stack.pcs[sp]
+    if (pcSetHas(tl.visited, pc)) {
+      continue
+    }
+    pcSetMark(tl.visited, pc)
+    addThreadStep(tl, pc, before, after, ctx)
   }
 }
 
@@ -370,7 +444,8 @@ fn freshSlots(numSlots: int): []int {
 // All VM scratch state is allocated exactly once here, per call (this
 // file's header). `ctx.stack` is sized `numInsts + 1`: `addThread`'s own
 // bound (its comment) shows the closure stack can never hold more than one
-// entry per Split instruction plus the one initial push.
+// entry per Split-or-Save instruction plus the one initial push, and no
+// instruction is both.
 //
 // `pf` (`prefilter.bit`, #2052) gates only whether a FRESH start thread is
 // seeded at a given position — it never affects a thread already carried
@@ -384,7 +459,12 @@ fn runPike(prog: Prog, s: string, startAt: int, pf: Prefilter): (bool, []int) {
   let n = len(s)
   let clist = newThreadList(numInsts)
   let nlist = newThreadList(numInsts)
-  let ctx = PikeCtx{ prog: prog, stack: newPcStack(numInsts + 1), pos: startAt }
+  let ctx = PikeCtx{
+    prog: prog,
+    stack: newPcStack(numInsts + 1),
+    pos: startAt,
+    cur: []int(prog.numSlots),
+  }
   let pos = startAt
   let before = runeBeforePos(s, startAt)
   let matched = false
