@@ -302,15 +302,15 @@ formatter may re-indent the block (see §2) but never reorders its clauses
 (`fmtAsmStmt`, `compiler/fmtdispatch.bit:705-755`, see §4 for why this needed
 a fix rather than being true by default). The block is width-aware like any
 other bracketed construct (§1): it renders on one line only if that fits
-under the 100-column budget and holds no comment (`fmtAsmFlatSlots`'s trial,
-`compiler/fmtdispatch.bit:694-703`); otherwise each clause — `x64 { ... }`,
-`arm64 { ... }`, `input ...`, etc. — gets its own line. Before `#3679` the
-flat form was assumed whenever the block held no comment, with no width
-check: a clause whose own content (e.g. a long byte-array code list) wrapped
-internally still got crammed onto the same line as its neighbors, corrupting
-the layout (never the assembled bytes — `AsmCode`'s items are a plain
-comma-separated integer list, parsed independent of line breaks) rather than
-just looking wrong.
+under the 100-column budget and holds no comment, via a trial render
+(`fmtAsmFlatSlots`, `compiler/fmtdispatch.bit:694-703`); otherwise each
+clause — `x64 { ... }`, `arm64 { ... }`, `input ...`, etc. — gets its own
+line. Before `#3679` the flat form was assumed whenever the block held no
+comment, with no width check: a clause whose own content (e.g. a long
+byte-array code list) wrapped internally still got crammed onto the same
+line as its neighbors, corrupting the layout (never the assembled bytes —
+`AsmCode`'s items are a plain comma-separated integer list, parsed
+independent of line breaks) rather than just looking wrong.
 
 **Check:** format a copy of every file containing an `asm` block; reduce each
 block to its literal instruction/token sequence plus (literal run, trailing
