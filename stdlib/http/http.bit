@@ -325,40 +325,32 @@ export fn (r: Response) getHeader(name: string): string {
 // The reason phrase for a status code — a small, common set; anything else is
 // labelled generically, which is legal (clients key on the numeric status).
 fn reason(status: int): string {
-  if (status == 200) {
-    return "OK"
+  switch (status) {
+    case 200:
+      return "OK"
+    case 201:
+      return "Created"
+    case 204:
+      return "No Content"
+    case 301:
+      return "Moved Permanently"
+    case 302:
+      return "Found"
+    case 400:
+      return "Bad Request"
+    case 401:
+      return "Unauthorized"
+    case 403:
+      return "Forbidden"
+    case 404:
+      return "Not Found"
+    case 405:
+      return "Method Not Allowed"
+    case 500:
+      return "Internal Server Error"
+    default:
+      return "Status"
   }
-  if (status == 201) {
-    return "Created"
-  }
-  if (status == 204) {
-    return "No Content"
-  }
-  if (status == 301) {
-    return "Moved Permanently"
-  }
-  if (status == 302) {
-    return "Found"
-  }
-  if (status == 400) {
-    return "Bad Request"
-  }
-  if (status == 401) {
-    return "Unauthorized"
-  }
-  if (status == 403) {
-    return "Forbidden"
-  }
-  if (status == 404) {
-    return "Not Found"
-  }
-  if (status == 405) {
-    return "Method Not Allowed"
-  }
-  if (status == 500) {
-    return "Internal Server Error"
-  }
-  return "Status"
 }
 
 // The wire form of a response: status line, framing headers, a blank line, body.
@@ -549,7 +541,13 @@ const maxHeaderBytes = 65536
 // `maxHeaderBytes`. An empty method/path/headers/body `Request` (no failure)
 // means the peer closed before a complete header block arrived; the caller's
 // subsequent write will simply fail against the already-closed socket.
-fn readMessage(s: byteStream): Request! {
+// The result of reading up to the blank line that ends a message's headers:
+// the header block and whatever body bytes already arrived with it, or
+// `closed` if the peer went away before the headers were complete. Split out
+// of `readMessage` (#2448).
+class HeaderReadResult { headBlock: string, bodyStart: string, closed: bool }
+
+fn readHeaderBlock(s: byteStream): HeaderReadResult! {
   let buf = ""
   while (indexOf(buf, "\r\n\r\n") < 0) {
     if (len(buf) > maxHeaderBytes) {
@@ -557,14 +555,94 @@ fn readMessage(s: byteStream): Request! {
     }
     let chunk = s.readUp(4096)?
     if (len(chunk) == 0) {
-      // Peer closed mid-headers: return an empty request, the caller stops.
-      return Request{ method: "", path: "", headers: "", body: "" }
+      return HeaderReadResult{ headBlock: "", bodyStart: "", closed: true }
     }
     buf = buf + chunk
   }
   let sep = indexOf(buf, "\r\n\r\n")
-  let headBlock = buf[0:sep]
-  let bodyStart = buf[sep + 4:len(buf)]
+  return HeaderReadResult{ headBlock: buf[0:sep], bodyStart: buf[sep + 4:len(buf)], closed: false }
+}
+
+// The method and request-target off a request line ("GET /path HTTP/1.1"),
+// or both "" if there is no space to split on. Split out of `readMessage`
+// (#2448).
+class RequestLine { method: string, path: string }
+
+fn parseRequestLine(requestLine: string): RequestLine {
+  let sp1 = indexOf(requestLine, " ")
+  if (sp1 < 0) {
+    return RequestLine{ method: "", path: "" }
+  }
+  let method = requestLine[0:sp1]
+  let afterMethod = requestLine[sp1 + 1:len(requestLine)]
+  let sp2 = indexOf(afterMethod, " ")
+  let path = afterMethod
+  if (sp2 >= 0) {
+    path = afterMethod[0:sp2]
+  }
+  return RequestLine{ method: method, path: path }
+}
+
+// Reads the remaining `cl - len(initial)` bytes of a Content-Length-framed
+// request body onto `initial`. Unlike the response-side twin
+// (`readContentLengthBody`, client.bit), a peer closing early is tolerated
+// (`break`, not `fail`) — request framing has always been lenient here.
+// Split out of `readMessage` (#2448).
+fn readRequestContentLengthBody(s: byteStream, initial: string, cl: int): string! {
+  let body = initial
+  if (len(body) > cl) {
+    body = body[0:cl]
+  }
+  while (len(body) < cl) {
+    let chunk = s.readUp(4096)?
+    if (len(chunk) == 0) {
+      break
+    }
+    body = body + chunk
+    if (len(body) > cl) {
+      body = body[0:cl]
+    }
+  }
+  return body
+}
+
+// Frame the body per RFC 9112 §6. Content-Length and Transfer-Encoding
+// together is a request-smuggling-grade ambiguity — reject outright rather
+// than pick one. Chunked is decoded, never handed through as raw framing.
+// Neither header present means no body, regardless of what already arrived.
+// Split out of `readMessage` (#2448).
+fn readRequestBody(s: byteStream, bodyStart: string, headers: string): string! {
+  let clText = header(headers, "content-length")
+  let teText = toLower(header(headers, "transfer-encoding"))
+  let hasCl = len(clText) > 0
+  let hasTe = len(teText) > 0
+  if (hasCl && hasTe) {
+    fail newError("readMessage: Content-Length and Transfer-Encoding both present")
+  }
+  if (hasTe) {
+    if (teText != "chunked") {
+      fail newError("readMessage: unsupported Transfer-Encoding")
+    }
+    return decodeChunkedBody(s, bodyStart)?
+  }
+  if (hasCl) {
+    let cl = atoi(clText)
+    if (cl < 0) {
+      fail newError("readMessage: invalid Content-Length")
+    }
+    return readRequestContentLengthBody(s, bodyStart, cl)?
+  }
+  return ""
+}
+
+fn readMessage(s: byteStream): Request! {
+  let hdr = readHeaderBlock(s)?
+  if (hdr.closed) {
+    // Peer closed mid-headers: return an empty request, the caller stops.
+    return Request{ method: "", path: "", headers: "", body: "" }
+  }
+  let headBlock = hdr.headBlock
+  let bodyStart = hdr.bodyStart
   if (hasBareControlChar(headBlock)) {
     fail newError("readMessage: control character in header block")
   }
@@ -577,56 +655,7 @@ fn readMessage(s: byteStream): Request! {
     requestLine = headBlock[0:eol]
     headers = headBlock[eol + 2:len(headBlock)]
   }
-  let sp1 = indexOf(requestLine, " ")
-  let method = ""
-  let path = ""
-  if (sp1 >= 0) {
-    method = requestLine[0:sp1]
-    let afterMethod = requestLine[sp1 + 1:len(requestLine)]
-    let sp2 = indexOf(afterMethod, " ")
-    if (sp2 >= 0) {
-      path = afterMethod[0:sp2]
-    } else {
-      path = afterMethod
-    }
-  }
-
-  // Frame the body per RFC 9112 §6. Content-Length and Transfer-Encoding
-  // together is a request-smuggling-grade ambiguity — reject outright rather
-  // than pick one. Chunked is decoded, never handed through as raw framing.
-  // Neither header present means no body, regardless of what already arrived.
-  let clText = header(headers, "content-length")
-  let teText = toLower(header(headers, "transfer-encoding"))
-  let hasCl = len(clText) > 0
-  let hasTe = len(teText) > 0
-  if (hasCl && hasTe) {
-    fail newError("readMessage: Content-Length and Transfer-Encoding both present")
-  }
-  let body = ""
-  if (hasTe) {
-    if (teText != "chunked") {
-      fail newError("readMessage: unsupported Transfer-Encoding")
-    }
-    body = decodeChunkedBody(s, bodyStart)?
-  } else if (hasCl) {
-    let cl = atoi(clText)
-    if (cl < 0) {
-      fail newError("readMessage: invalid Content-Length")
-    }
-    body = bodyStart
-    if (len(body) > cl) {
-      body = body[0:cl]
-    }
-    while (len(body) < cl) {
-      let chunk = s.readUp(4096)?
-      if (len(chunk) == 0) {
-        break
-      }
-      body = body + chunk
-      if (len(body) > cl) {
-        body = body[0:cl]
-      }
-    }
-  }
-  return Request{ method: method, path: path, headers: headers, body: body }
+  let rl = parseRequestLine(requestLine)
+  let body = readRequestBody(s, bodyStart, headers)?
+  return Request{ method: rl.method, path: rl.path, headers: headers, body: body }
 }
