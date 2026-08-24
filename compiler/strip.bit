@@ -244,7 +244,18 @@ fn deadStrip(modules: []LoModule, globals: map<string, int>, roots: []string): m
     }
     i = i + 1
   }
+  closeKeptOverRelocs(modules, globals, kept, stack)?
+  return kept
+}
 
+// Drains a work stack of already-kept atoms, marking every atom transitively
+// reachable from it (via relocations) as kept too. Shared by deadStrip's
+// entry-root walk above and keepDebugLineTargets' string-target closure below
+// — both need the identical "spread reachability through relocs" step, seeded
+// differently. An explicit work stack (not recursion) keeps the traversal
+// bounded and stack-safe over libbitrt's large call graph.
+fn closeKeptOverRelocs(modules: []LoModule, globals: map<string, int>,
+    kept: map<int, bool>, stack: []int): ()! {
   while (len(stack) > 0) {
     let id = stack[len(stack) - 1]
     stack = stack[0:len(stack) - 1]
@@ -253,7 +264,7 @@ fn deadStrip(modules: []LoModule, globals: map<string, int>, roots: []string): m
     while (r < len(cur.relocs)) {
       let target = resolveRefFrom(globals, atomKeyModule(id), cur.relocs[r].target,
         modules[atomKeyModule(id)].name)?
-      let (seen, already) = kept[target]
+      let (_, already) = kept[target]
       if (!already) {
         kept[target] = true
         stack = append(stack, target)
@@ -261,7 +272,6 @@ fn deadStrip(modules: []LoModule, globals: map<string, int>, roots: []string): m
       r = r + 1
     }
   }
-  return kept
 }
 
 // ---- GC stack-map merge (ABI.md §4) ---------------------------------------
@@ -279,6 +289,17 @@ fn stackmapsEndSymbol(): string {
   return "bit_stack_maps_end"
 }
 
+// ABI.md §4.2: the debug-info line table's own extent symbols. Same
+// `symPrefix` rule as the stack-map pair above — a second, independent
+// table, so a second, independent pair of names.
+fn debugLinesStartSymbol(): string {
+  return "bit_debug_lines"
+}
+
+fn debugLinesEndSymbol(): string {
+  return "bit_debug_lines_end"
+}
+
 // Index of the boundary atoms within the marker module's atom slice.
 fn markerStartAtom(): int {
   return 0
@@ -288,9 +309,25 @@ fn markerEndAtom(): int {
   return 1
 }
 
-// Builds the synthetic module holding the two boundary atoms. Both are
+// Same as markerStartAtom/markerEndAtom above, for the debug-info line
+// table's own boundary atoms (indices 2/3 of the same synthetic module —
+// see markerModule).
+fn markerDbgStartAtom(): int {
+  return 2
+}
+
+fn markerDbgEndAtom(): int {
+  return 3
+}
+
+// Builds the synthetic module holding the four boundary atoms: the GC
+// stack-map pair (indices 0/1) and the debug-info line table pair (indices
+// 2/3). Housing both pairs in one LoModule is bookkeeping only — each atom
+// carries its own kind (GcMeta or DbgMeta) and name, so the two tables share
+// no symbol and no content, exactly as ABI.md §4.2 requires. All four are
 // zero-size and 1-aligned so they contribute no bytes and force no padding —
-// they exist only to be given addresses at the ends of the merged group.
+// they exist only to be given addresses at the ends of their own merged
+// group.
 //
 // `symPrefix` is the container's C symbol mangling ("" on ELF, "_" on Mach-O).
 // It is a parameter rather than a constant because these names must match the
@@ -298,9 +335,9 @@ fn markerEndAtom(): int {
 // fail at link — it falls through to a libSystem import and aborts at dyld
 // load, far from its cause.
 //
-// Always present, even when nothing carries stack maps: the runtime's extern
-// references must resolve, and an empty extent (start == end) is the right
-// answer for a program with no Bit frames to walk.
+// Always present, even when nothing carries stack maps or debug-info rows:
+// the runtime's extern references must resolve, and an empty extent
+// (start == end) is the right answer for a program with no entries.
 fn markerModule(symPrefix: string): LoModule {
   let atoms = []LoAtom(0)
   atoms = append(atoms, LoAtom{ name: "${symPrefix}${stackmapsStartSymbol()}",
@@ -308,6 +345,12 @@ fn markerModule(symPrefix: string): LoModule {
     size: 0, alignment: 1, weak: false, relocs: []LoReloc(0) })
   atoms = append(atoms, LoAtom{ name: "${symPrefix}${stackmapsEndSymbol()}",
     kind: LoSectionKind.GcMeta, binding: LoBinding.Global, data: []u8(0),
+    size: 0, alignment: 1, weak: false, relocs: []LoReloc(0) })
+  atoms = append(atoms, LoAtom{ name: "${symPrefix}${debugLinesStartSymbol()}",
+    kind: LoSectionKind.DbgMeta, binding: LoBinding.Global, data: []u8(0),
+    size: 0, alignment: 1, weak: false, relocs: []LoReloc(0) })
+  atoms = append(atoms, LoAtom{ name: "${symPrefix}${debugLinesEndSymbol()}",
+    kind: LoSectionKind.DbgMeta, binding: LoBinding.Global, data: []u8(0),
     size: 0, alignment: 1, weak: false, relocs: []LoReloc(0) })
   return LoModule{ name: "<gc stack maps>", atoms: atoms }
 }
@@ -368,6 +411,97 @@ fn mergedStackMapAtoms(modules: []LoModule, globals: map<string, int>,
     mi = mi + 1
   }
   out = append(out, atomKey(markerModuleIdx, markerEndAtom()))
+  return out
+}
+
+// ---- Debug-info line table merge (ABI.md §4.2) -----------------------------
+
+// A debug-info entry's retention follows exactly §4's rule (ABI.md §4.2,
+// "Retention"): kept exactly when the function it describes is kept. Unlike a
+// GcMeta entry, whose ONE relocation IS that check, a DbgMeta entry's later
+// relocations point at per-object interned source-file strings (the
+// {ptr,len} string-pool header emitted for each distinct file — see
+// internDebugFiles, compiler/emit.bit) that nothing in ordinary code ever
+// references. The entry-root walk (deadStrip/meDeadStripWithImports) never
+// reaches them, and mePartition/elCollect run their one pass over `kept`
+// BEFORE an entry's own retention is decided (mirroring mergedStackMapAtoms
+// above) — so a target only reachable through a debug-info row needs its own
+// closure, walked here, before that one partition pass runs.
+//
+// relocs[0] is always the entry's own codeAddr reloc (emitted before any
+// per-row file pointer — see emitMachoDebugLines/emitElfDebugLines), so
+// retention keys on it alone, not on whether any of the entry's several
+// relocation targets happens to already be live.
+fn keepDebugLineTargets(modules: []LoModule, globals: map<string, int>,
+    kept: map<int, bool>, markerModuleIdx: int): ()! {
+  let stack = []int(0)
+  let mi = 0
+  while (mi < len(modules)) {
+    if (mi != markerModuleIdx) {
+      let atoms = modules[mi].atoms
+      let ai = 0
+      while (ai < len(atoms)) {
+        let atom = atoms[ai]
+        if (atom.kind == LoSectionKind.DbgMeta && atom.binding != LoBinding.Global) {
+          let fnTarget = resolveRefFrom(globals, mi, atom.relocs[0].target,
+            modules[mi].name)?
+          let (_, fnLive) = kept[fnTarget]
+          if (fnLive) {
+            let r = 1
+            while (r < len(atom.relocs)) {
+              let target = resolveRefFrom(globals, mi, atom.relocs[r].target,
+                modules[mi].name)?
+              let (_, already) = kept[target]
+              if (!already) {
+                kept[target] = true
+                stack = append(stack, target)
+              }
+              r = r + 1
+            }
+          }
+        }
+        ai = ai + 1
+      }
+    }
+    mi = mi + 1
+  }
+  // A newly-kept target's own relocations (the string header's single
+  // pointer to its byte data — never deeper than that in practice, but
+  // walked generically rather than assuming a fixed chain length) need the
+  // same closure `deadStrip` already runs from its roots.
+  closeKeptOverRelocs(modules, globals, kept, stack)?
+}
+
+// The debug-info counterpart of mergedStackMapAtoms above: orders the merged
+// group (start marker, every retained entry, end marker) for one
+// uninterrupted append. Re-derives the same retention decision
+// keepDebugLineTargets already made (cheap: relocs[0] only) rather than
+// threading a list between the two calls.
+fn mergedDebugLineAtoms(modules: []LoModule, globals: map<string, int>,
+    kept: map<int, bool>, markerModuleIdx: int): []int! {
+  let out = []int(0)
+  out = append(out, atomKey(markerModuleIdx, markerDbgStartAtom()))
+  let mi = 0
+  while (mi < len(modules)) {
+    if (mi != markerModuleIdx) {
+      let atoms = modules[mi].atoms
+      let ai = 0
+      while (ai < len(atoms)) {
+        let atom = atoms[ai]
+        if (atom.kind == LoSectionKind.DbgMeta && atom.binding != LoBinding.Global) {
+          let target = resolveRef(globals, mi, atom.relocs[0].target)?
+          let (_, live) = kept[target]
+          if (live) {
+            kept[atomKey(mi, ai)] = true
+            out = append(out, atomKey(mi, ai))
+          }
+        }
+        ai = ai + 1
+      }
+    }
+    mi = mi + 1
+  }
+  out = append(out, atomKey(markerModuleIdx, markerDbgEndAtom()))
   return out
 }
 
