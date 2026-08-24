@@ -22,6 +22,32 @@ fn fieldIndexByName(c: Checker, fields: []int, name: string): int {
 // descriptor is the ref-field offsets) followed by a `field_set` per field, in
 // the literal's source order. ponytail: class bodies only — []T/[N]T/map<K,V>
 // composites and inline-array fields land next.
+// Whether `[]E(...)` is the `[]byte(s)` CONVERSION rather than a sized
+// allocation: exactly one argument, of type `string`. A string literal defaults
+// through `untyped_string`, so the argument's type is defaulted before the test.
+fn isBytesConversion(fc: FnCtx, args: []int, arg0: int): bool {
+  if (len(args) != 1) {
+    return false
+  }
+  let a0ty = defaultType(fc.c, nodeType(fc, arg0))
+  return fc.c.ctx.types[a0ty].kind == TypeKind.Prim && fc.c.ctx.types[a0ty].prim == 11
+}
+
+// `[]byte(s)` -> `rt_call bytes_from_string(s)`. Split out of `lowerSliceAlloc`
+// with its predicate above so that function stays inside E0204's complexity
+// ceiling (spec/LINT.md §max-complexity = 10); it was already over at 12 before
+// #3648 added its empty-slice arm.
+fn lowerBytesFromString(fc: FnCtx, sliceTy: int, arg0: int): int {
+  let sv = lowerExprH(fc, arg0, primType(fc.c.ctx, 11))
+  if (fc.failed) {
+    return 0
+  }
+  let bs = mkInstr(Op.RtCall, sliceTy)
+  bs.name = "bytes_from_string"
+  bs.args = [sv]
+  return emitRtCall(fc, bs)
+}
+
 // Lowers a slice-type callee `[]E(...)`. A single `string` argument is the
 // conversion `[]byte(s)` -> `bytes_from_string`. Otherwise it is a sized
 // allocation `[]E(n)` / `[]E(n, m)`: `slice_new(n, cap, is_ref)`, cap defaulting
@@ -35,18 +61,8 @@ fn lowerSliceAlloc(fc: FnCtx, node: int): int {
   if (getNode(fc.c.tree, arg0).tag == Tag.Arg) {
     arg0 = kidsOf(fc.c.tree, arg0)[0]
   }
-  // `[]byte(s)`: a lone string argument is the bytes-of-string conversion. A
-  // string literal defaults through `untyped_string`, so default the type first.
-  let a0ty = defaultType(fc.c, nodeType(fc, arg0))
-  if (len(args) == 1 && fc.c.ctx.types[a0ty].kind == TypeKind.Prim && fc.c.ctx.types[a0ty].prim == 11) {
-    let sv = lowerExprH(fc, arg0, primType(fc.c.ctx, 11))
-    if (fc.failed) {
-      return 0
-    }
-    let bs = mkInstr(Op.RtCall, sliceTy)
-    bs.name = "bytes_from_string"
-    bs.args = [sv]
-    return emitRtCall(fc, bs)
+  if (isBytesConversion(fc, args, arg0)) {
+    return lowerBytesFromString(fc, sliceTy, arg0)
   }
   let nV = lowerExprH(fc, arg0, primType(fc.c.ctx, 3))
   if (fc.failed) {
@@ -62,6 +78,12 @@ fn lowerSliceAlloc(fc: FnCtx, node: int): int {
     if (fc.failed) {
       return 0
     }
+  }
+  // `[]E(0)` / `[]E(0, 0)`: no header and no buffer (#3648). An explicit
+  // non-zero capacity (`[]E(0, 16)`) still allocates — that slice has a
+  // reserved buffer to hand back.
+  if (isStaticEmptyAlloc(fc.b, nV, capV)) {
+    return emptySliceValue(fc, sliceTy)
   }
   let refI = mkInstr(Op.ConstInt, primType(fc.c.ctx, 3))
   if (fieldLayoutFor(fc, elemTy).isPtr) {
@@ -84,10 +106,62 @@ fn lowerSliceAlloc(fc: FnCtx, node: int): int {
   return s
 }
 
+// A STATICALLY-EMPTY SLICE IS THE NULL HEADER, NOT AN ALLOCATION (#3648).
+//
+// `slice_new` costs TWO heap objects, and for a length-0 capacity-0 slice both
+// are pure overhead: the header (`gcAlloc(g, base + riSlice * 8)`,
+// runtime/root/slices.bit:181) and its element buffer (slices.bit:182 ->
+// `allocBuf` -> `gcAllocRaw(g, words * elemSize, info)`, runtime/root/root.bit).
+// Nothing can be read out of either — every bounds check rejects every index —
+// so the pair exists only to be collected.
+//
+// THE NULL WORD IS THE LANGUAGE'S OTHER SPELLING OF THE EMPTY SLICE, not a new
+// representation. A zeroed class's slice field already holds it (SPEC §13.4),
+// `nil` is unspellable for a slice (`xs == nil` is E0053), and every reader
+// already answers it as empty: `len` and `cap` through both backends'
+// `emitHeaderWordOrZero` (#1564), `xs[i]` through the inlined bounds check
+// (compiler/loweraccess.bit), `append` through `appendTarget`
+// (runtime/root/slices.bit), `xs[lo:hi]` through `rtSliceSlice`'s null arm, and
+// `for … of` through `slice_len`.
+//
+// AND IT SHARES NOTHING, which is what rules out the two candidate singletons.
+// A process-wide empty HEADER cannot work at all — `append` grows the header in
+// place, so the first append anywhere would corrupt it (#1557, recorded in
+// slices.bit's `rtSliceAppend` header) — and a shared empty BACKING would need
+// a proof that nothing ever writes through it, which `append`'s documented
+// aliasing (E0214) makes a convention rather than a guarantee. Null aliases
+// nothing: `append(null, x)` allocates a fresh header AND a fresh buffer, so no
+// two empty slices can ever reach the same memory.
+fn emptySliceValue(fc: FnCtx, sliceTy: int): int {
+  return builderEmit(fc.b, mkInstr(Op.ConstNil, sliceTy))
+}
+
+// True when `[]E(n[, m])`'s already-lowered length and capacity are both
+// literally `const_int 0`. A structural test on the lowered values, the same
+// shape and the same one-way conservatism as lower.bit's `isConstTrue`: it can
+// only under-report, and under-reporting costs the allocation this avoids
+// rather than correctness. The two dead `const_int 0`s it leaves behind are
+// `deadCodeElim`'s (compiler/opt.bit) and cost one `mov` each at -O0.
+fn isStaticEmptyAlloc(b: IrBuilder, nV: int, capV: int): bool {
+  return isConstZeroVal(b, nV) && isConstZeroVal(b, capV)
+}
+
+fn isConstZeroVal(b: IrBuilder, v: int): bool {
+  if (v < 0 || v >= len(b.instrs)) {
+    return false
+  }
+  return b.instrs[v].op == Op.ConstInt && b.instrs[v].ival == 0
+}
+
 // Lowers a `[]E{a, b, ...}` slice literal: allocate via `rt_call slice_new(len,
 // len, is_ref)`, then `slice_set` each element in order. `items` are the element
 // expression nodes (each possibly wrapped in an `arg`).
 fn lowerSliceElems(fc: FnCtx, sliceTy: int, items: []int): int {
+  // `[]E{}` — and, through `zeroValue` below, every slice zero value — is the
+  // null header rather than two heap objects (#3648). See `emptySliceValue`.
+  if (len(items) == 0) {
+    return emptySliceValue(fc, sliceTy)
+  }
   let elemTy = fc.c.ctx.types[sliceTy].elem
   let i64ty = primType(fc.c.ctx, 3)
   let lenI = mkInstr(Op.ConstInt, i64ty)
@@ -409,11 +483,14 @@ fn zeroValue(fc: FnCtx, ty: int, span: Span): int {
     ga.offsets = layout.ptrOffsets
     return builderEmit(fc.b, ga)
   }
-  // A slice zero-value is the EMPTY slice, not a null header (SPEC §13.4). A
-  // null header has no `len` word to load, so `len(xs)` on it faults; `nil` is
-  // unspellable for a slice (`xs == nil` is E0053), so an empty slice is
-  // indistinguishable from the `nil` the spec names — and unlike `nil` it is
-  // usable. Same shape as `string`'s zero above.
+  // A slice zero-value is the EMPTY slice (SPEC §13.4), which since #3648 is
+  // spelled as the null header — `lowerSliceElems` with no items.
+  //
+  // THIS COMMENT USED TO SAY THE OPPOSITE and its reason was stale: "a null
+  // header has no `len` word to load, so `len(xs)` on it faults". #1564 fixed
+  // that fault in both backends (`emitHeaderWordOrZero`), so null and empty are
+  // now indistinguishable to a program in every operation, not just in the
+  // `xs == nil` that E0053 already forbids.
   if (td.kind == TypeKind.Slice) {
     return lowerSliceElems(fc, ty, []int(0))
   }
