@@ -1,0 +1,117 @@
+// The `idle`/`idleslow` scenarios: a blackholed peer must unpark a thread
+// parked in `finish` within bounded time (RFC 9000 §10.1, #1449/#1474). Split
+// out of `main.bit` by #3557 to keep that file under the 800-line ceiling —
+// same module, so `boolStr`, `relay`, `serverRole`, `chainPem`/`keyPem`, the
+// `std/*` imports and `idleTimeoutNs`/`idleBoundNs` (main.bit:247-248, also
+// read by several other scenarios there) are visible here without
+// re-declaring.
+
+// A shared switch the driver flips to make the blackhole shim stop forwarding.
+class Switch { on: int }
+
+// A relay that forwards both directions until `sw.on` is set, then drops
+// everything. Stands in for a peer that vanishes: still reachable at the socket
+// layer, but never answering again — the case RFC 9000 §10.1's idle timeout
+// exists for, and the one a PTO series alone retransmits into forever (#1449).
+fn blackholeShim(sock: UdpSocket, srvHost: string, srvPort: int, sw: Switch) {
+  let cliHost = ""
+  let cliPort = 0
+  let haveCli = false
+  while (true) {
+    let d = sock.recv(2048) catch e {
+      return
+    }
+    let fromSrv = d.host == srvHost && d.port == srvPort
+    if (!fromSrv) {
+      cliHost = d.host
+      cliPort = d.port
+      haveCli = true
+    }
+    if (sw.on != 0) {
+      continue
+    }
+    if (fromSrv) {
+      if (haveCli) {
+        relay(sock, cliHost, cliPort, d.data)
+      }
+    } else {
+      relay(sock, srvHost, srvPort, d.data)
+    }
+  }
+}
+
+// True if the stream failed to drain — a separate function because a `catch`
+// block has to divert control, so it cannot just set a flag in place.
+fn finishFailed(s: Stream): bool {
+  s.finish() catch e {
+    return true
+  }
+  return false
+}
+
+// #1449 / #1474: with the peer blackholed, a thread parked in `finish` must come
+// back with an error once the idle timeout expires instead of waiting forever.
+// `setIdleTimeout` is what makes this assertable in-suite at all — at the 30s
+// default the same assertion costs ~31s of wall clock, which is why the original
+// fix shipped untested.
+fn idleScenario(chain: string, keyp: string): ()! {
+  let srv = udpBind("127.0.0.1", 0)?
+  let srvPort = srv.port()?
+  let shim = udpBind("127.0.0.1", 0)?
+  let shimPort = shim.port()?
+  let sw = Switch{ on: 0 }
+  spawn blackholeShim(shim, "127.0.0.1", srvPort, sw)
+  let res = chan<string>(1)
+  spawn serverRole(srv, chain, keyp, res)
+  let conn = dialQuic("127.0.0.1", shimPort, "localhost") catch e {
+    println("idle_handshake=false")
+    return
+  }
+  println("idle_handshake=true")
+  conn.setIdleTimeout(idleTimeoutNs)
+  // The peer vanishes here: after the handshake, before any stream byte is
+  // acknowledged, so `finish` has no way to ever make progress.
+  sw.on = 1
+  let s = conn.openStream()?
+  s.write([]byte("ping"))?
+  let start = monotonic()
+  let failed = finishFailed(s)
+  let elapsed = since(start)
+  println("idle_finish_failed=${boolStr(failed)}")
+  println("idle_bounded=${boolStr(elapsed < idleBoundNs)}")
+}
+
+const idleSlowTimeoutNs: int = 3000000000
+const idleSlowBoundNs: int = 4000000000
+
+// #3557: `idleScenario`'s 500 ms sits below the RFC 9002 §6.2 PTO backoff
+// ceiling: `quicconnPtoDuration` floors at `quicconnMinPto` (8 ms, conn.bit:106)
+// and `quicconnMaybePto` backs off `1 << st.ptoCount`, capped at 8
+// (loss.bit:194-201), so on loopback our own retransmits top out ~8ms*256=2048ms
+// apart — below that, a broken re-arm still fires close to schedule. 3 s clears
+// it. Bound: mutating send.bit's once-per-receive guard away gave 1.55x-2.72x
+// overshoot over six trials on a box loaded 15-54, vs ~1.001x stock; 4/3 sits
+// below every regressed trial and above stock — the obvious 2x bound measured
+// as low as 1.55x-1.97x and would have missed it.
+fn idleSlowScenario(chain: string, keyp: string): ()! {
+  let srv = udpBind("127.0.0.1", 0)?
+  let srvPort = srv.port()?
+  let shim = udpBind("127.0.0.1", 0)?
+  let shimPort = shim.port()?
+  let sw = Switch{ on: 0 }
+  spawn blackholeShim(shim, "127.0.0.1", srvPort, sw)
+  let res = chan<string>(1)
+  spawn serverRole(srv, chain, keyp, res)
+  let conn = dialQuic("127.0.0.1", shimPort, "localhost")?
+  conn.setIdleTimeout(idleSlowTimeoutNs)
+  // The peer vanishes here: after the handshake, before any stream byte is
+  // acknowledged, so `finish` has no way to ever make progress.
+  sw.on = 1
+  let s = conn.openStream()?
+  s.write([]byte("ping"))?
+  let start = monotonic()
+  let failed = finishFailed(s)
+  let elapsed = since(start)
+  println("idleslow_finish_failed=${boolStr(failed)}")
+  println("idleslow_bounded=${boolStr(elapsed < idleSlowBoundNs)}")
+}
