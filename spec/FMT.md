@@ -64,7 +64,7 @@ is left unsettled; there is currently no construct with zero width check.
 
 **Rule.** 2 spaces per nesting level (`fmtIndentWidth`, `compiler/fmt.bit:29`),
 written lazily at the first real content of each line (`fmtRaw`,
-`compiler/fmt.bit:226-243`) as `p.indent * fmtIndentWidth` spaces. No tabs.
+`compiler/fmt.bit:238-255`) as `p.indent * fmtIndentWidth` spaces. No tabs.
 
 **Check:** `fmtIndentWidth` in `compiler/fmt.bit` reads `2`; every output
 line's leading-space count equals `2 × ` its brace/block nesting depth.
@@ -73,18 +73,18 @@ line's leading-space count equals `2 × ` its brace/block nesting depth.
 
 **Rule.** Any run of one or more blank source lines between two adjacent
 items collapses to **exactly one** blank output line (`fmtGap`'s `allowBlank`
-branch, `compiler/fmt.bit:268-270, 282-284`); zero blank lines in the source
+branch, `compiler/fmt.bit:292-294, 306-308`); zero blank lines in the source
 stays zero. This applies between top-level declarations and between
-statements inside a block (`fmtPrintSeq`, `compiler/fmt.bit:503-513`), and to a
+statements inside a block (`fmtPrintSeq`, `compiler/fmt.bit:538-547`), and to a
 blank line preserved immediately before a block's own closing `}`
 (`fmtPrintBlock`'s trailing `fmtGap(p, n.span.end, true)`,
-`compiler/fmt.bit:527`).
+`compiler/fmt.bit:561`).
 
 **Two constructions never get a leading blank line, by the printer's own
 design, not as a separate policy:**
 - The first statement inside a block, or the first clause of a `switch`,
   `match`, or `select` body, never has a blank line before it even if the
-  source had one — `fmtPrintNoLeadBlank` (`compiler/fmt.bit:489-499`) passes
+  source had one — `fmtPrintNoLeadBlank` (`compiler/fmt.bit:524-534`) passes
   `allowBlank = false` for the first item, `true` after.
 - The very top of a *file* is the one place a leading blank line before the
   first item **is** kept — `Program`'s use of `fmtPrintSeq`
@@ -109,7 +109,7 @@ then replayed in strict source order: it either trails the current output
 line (if nothing but whitespace — no newline — separated it from whatever
 precedes it in the source) or starts its own new output line immediately
 before whichever node begins next in source order (`fmtGap`,
-`compiler/fmt.bit:258-285`). **The formatter never reassigns a comment to a
+`compiler/fmt.bit:271-308`). **The formatter never reassigns a comment to a
 different statement, list item, or clause than the one it was adjacent to in
 the source.** Line comments (`//`) force a newline after themselves; block
 comments (`/* */`) do not.
@@ -216,7 +216,7 @@ twice produces byte-identical output on every comma-list-containing file
 ## 6. Inline vs. stacked bodies — settled, and reversed once (`#1266`)
 
 **Current rule**, two different answers for two different constructs
-(`fmtPrintBodyBlock`, `compiler/fmt.bit:443-459`):
+(`fmtPrintBodyBlock`, `compiler/fmt.bit:478-493`):
 
 - **A function body** inlines as `{ stmt }` **if and only if the source wrote
   it that way** — a single simple statement, no comment, no nested block or
@@ -315,8 +315,8 @@ and after — `#2879`'s comparator, run over all 17 `asm`-containing files (25
 gets an explicit trailing `;` in the output **only if** its canonical
 rendering's last token is not itself one that Bit's automatic-semicolon-
 insertion (SPEC §7) already terminates on (`fmtEndsInBlock`,
-`compiler/fmt.bit:365-378`, and `fmtEndsInTerminator`,
-`compiler/fmt.bit:383-401` — anything ending in a block's closing `}`, or
+`compiler/fmt.bit:400-412`, and `fmtEndsInTerminator`,
+`compiler/fmt.bit:418-435` — anything ending in a block's closing `}`, or
 whose last real token is already a terminator, gets no `;`).
 
 **Check:** a statement whose canonical form ends in `}` (an `if`, a `for`, a
