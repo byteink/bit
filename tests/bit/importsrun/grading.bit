@@ -116,25 +116,34 @@ fn gradeCase(c: Case): Verdict {
 // `pmtransitive_e2e` false-failed this way for five different agents in one
 // night, each spending time proving it was not their own regression.
 //
-// A LARGER flat budget is not a fix — the box has swung the same binary's
-// wall clock by double digits between quiet and saturated, so any fixed
-// number just moves the false-failure threshold rather than removing it
-// (see the header note in `importsrun.bit`). This harness cannot observe
-// external load and should not guess at it. What it CAN do is remove the
-// contention it causes ITSELF: each wave runs every case's script through
-// `xargs -P n` (`waveDriverScript`), so up to `n` of THIS corpus's own
-// cases compete for the same cores a moment a genuinely-correct case needed.
-// A case whose watchdog fired gets exactly one retry, run ALONE — no
-// sibling case from this harness competing with it — rather than a bigger
-// number stapled onto the same contended attempt.
+// #3593 made the retry SERIALIZED (run ALONE, no sibling case from this
+// harness's own `xargs -P n` fan-out competing with it) but reused the exact
+// same `compileSh`/`runSh` bytes phase A wrote, so the retry's own watchdog
+// polled the identical `cfg.timeoutMs` threshold. Removing this harness's
+// OWN contention does nothing about the ~19 other agents still building
+// concurrently, so on a genuinely saturated box the retry died at the same
+// deadline for the same reason — a formality, not a second chance. That
+// recurred at least four more times after #3593 landed (#3623, #2857,
+// #3638, #3629), always the same two cases, always under heavy fleet load.
 //
-// A GENUINE HANG IS STILL CAUGHT, not just given more rope: the retry reuses
-// the same `cfg.timeoutMs` budget and the same watchdog script, so a case
-// that is actually stuck (infinite loop, deadlock, wedged I/O) times out
-// again on the retry exactly as it did the first time — worst-case
-// detection latency grows from one `defaultTimeoutS` to two, a bounded,
-// stated cost, never an unbounded one. A retry that ALSO times out is
-// reported as a real failure, identically to today's single-attempt result.
+// #3665: the retry now regenerates the case's scripts (`watchdogScript`/
+// `compileScriptText`/`runScriptText`, `importsrun.bit`) with a LARGER
+// budget — `retryTimeoutMultiplier` times the first attempt's — instead of
+// rerunning the first attempt's bytes. A flat/global increase is still not
+// the fix: the box's own wall clock swings by double digits between quiet
+// and saturated, so raising `BIT_TEST_TIMEOUT_S` itself just moves the
+// false-failure threshold for the FIRST attempt too, slowing detection of a
+// genuine hang on every case, not just the two that flake. Widening only the
+// retry costs nothing on that front, because a case only reaches the retry
+// after its first attempt already died once.
+//
+// A GENUINE HANG IS STILL CAUGHT, not just given more rope: a case that is
+// actually stuck (infinite loop, deadlock, wedged I/O) times out again on
+// the retry, at its own (larger) deadline — worst-case detection latency
+// grows from one `defaultTimeoutS` to `1 + retryTimeoutMultiplier` times
+// that, a bounded, stated cost, never an unbounded one. A retry that ALSO
+// times out is reported as a real failure, identically to today's
+// single-attempt result.
 //
 // rc 137 is SIGKILL — this harness's own watchdog is the only sender, but an
 // OOM kill reads back identically (an existing ambiguity, not a new one from
@@ -145,6 +154,13 @@ fn timedOut(rc: int): bool {
   return rc == 137
 }
 
+// How much bigger the retry's budget is than the first attempt's. 2x: large
+// enough that a case which only died to fleet contention (not a real hang)
+// gets a real second chance, small enough that a genuine hang's detection
+// latency stays a small bounded multiple of `defaultTimeoutS`, never
+// unbounded (constraint: do not fix this by removing the bound).
+const retryTimeoutMultiplier: int = 2
+
 // One retry pass over every case, called once between `runDriver` and
 // `gradeAll`. Bounded exactly like every other loop here: `len(cases)`
 // iterations, at most one compile retry and one run retry each — not a
@@ -153,35 +169,49 @@ fn timedOut(rc: int): bool {
 // model" reasoning `waveTimeoutMs` already documents applies verbatim to a
 // single case's own outer `osRunBounded` bound.
 //
-// `c.compileSh`/`c.runSh` are the exact scripts `writeScripts` already wrote
-// and the first wave already ran once; calling `osRunBounded` on them again,
-// strictly sequentially from this single-threaded `main`, is the same
-// single-worker contract the two wave calls already rely on (see
-// `importsrun.bit`'s header note on `bit_rt_os_run_bounded` reentrancy). The
-// `bit-gate-watchdog` symlink `waveDriverScript` created still exists in
-// `scratch` (removed only by `cleanup`, called after this), so each script's
-// own internal poll keeps working unmodified.
+// `c.compileSh`/`c.runSh` paths are the ones `writeScripts` already wrote and
+// the first wave already ran once, but the BYTES at those paths are
+// regenerated here, before use, with `retryTimeoutMultiplier` times the
+// budget — `watchdogScript`/`compileScriptText`/`runScriptText`
+// (`importsrun.bit`) are pure text producers, so calling them again with a
+// bigger `budgetS` is the whole fix: same case, same command, a fresh and
+// larger deadline baked into the watchdog poll rather than the one already
+// spent. `osRunBounded` on the regenerated script, strictly sequentially
+// from this single-threaded `main`, is the same single-worker contract the
+// two wave calls already rely on (see `importsrun.bit`'s header note on
+// `bit_rt_os_run_bounded` reentrancy). The `bit-gate-watchdog` symlink
+// `waveDriverScript` created still exists in `scratch` (removed only by
+// `cleanup`, called after this), so the regenerated script's own internal
+// poll finds it unmodified.
 //
 // Returns how many cases got at least one retry, so `main` can tell a
 // legitimate "wave 1 said failure, retry fixed it" apart from the `.rc`
 // bookkeeping actually being broken.
-fn retryTimedOut(cfg: Cfg, cases: []Case): int {
-  let outerMs = cfg.timeoutMs + outerSlackMs
+fn retryTimedOut(cfg: Cfg, cases: []Case, scratch: string): int {
+  let retryBudgetS = cfg.timeoutMs / 1000 * retryTimeoutMultiplier
+  let watchdog = watchdogScript("${scratch}/bit-gate-watchdog", retryBudgetS)
+  let outerMs = retryBudgetS * 1000 + outerSlackMs
   let retried = 0
   let i = 0
   while (i < len(cases)) {
     let c = cases[i]
     let compileTimedOut = timedOut(readRcFile(c.compileRc))
     if (compileTimedOut) {
-      eprint("imports: '${c.name}' compile TIMED OUT under fleet contention; retrying serialized\n")
+      eprint("imports: '${c.name}' compile TIMED OUT under fleet contention; retrying serialized with a ${retryBudgetS}s budget\n")
+      if (!writeWhole(c.compileSh, compileScriptText(cfg, c, watchdog)) || fsChmod(c.compileSh, scriptMode) != 0) {
+        fatal("cannot rewrite compile retry script for '${c.name}' at ${c.compileSh}")
+      }
       osRunBounded(c.compileSh, outerMs)
       retried = retried + 1
     }
     let runNeedsRetry = compileTimedOut || timedOut(readRcFile(c.runRc))
     if (runNeedsRetry && fsExists(c.bin)) {
       if (!compileTimedOut) {
-        eprint("imports: '${c.name}' run TIMED OUT under fleet contention; retrying serialized\n")
+        eprint("imports: '${c.name}' run TIMED OUT under fleet contention; retrying serialized with a ${retryBudgetS}s budget\n")
         retried = retried + 1
+      }
+      if (!writeWhole(c.runSh, runScriptText(cfg, c, watchdog)) || fsChmod(c.runSh, scriptMode) != 0) {
+        fatal("cannot rewrite run retry script for '${c.name}' at ${c.runSh}")
       }
       osRunBounded(c.runSh, outerMs)
     }
