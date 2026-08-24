@@ -1,0 +1,263 @@
+// Bit standard library — regex module, the required-literal / first-byte
+// prefilter (#2052, epic #2025).
+//
+// `pike.bit`'s unanchored search seeds a fresh VM thread at every input
+// position until something matches — wasted work at every position a
+// pattern cannot possibly start a match, which is the common case on a
+// miss-heavy subject. `derivePrefilter` below walks the SAME `Ast` the
+// compiler already builds (`litscan.bit`'s `fixedWidth`/`firstBytes`, plus
+// `prog.bit`'s `nullable`) to find one of three things, in order of value:
+//
+//   - a required literal run at a statically known offset from a match's
+//     start (backoff 0 is a required PREFIX; backoff > 0 is a required
+//     SUBSTRING reachable a fixed distance in) — `PrefilterKind.Literal`;
+//   - failing that, a small set of bytes a match could legally start with
+//     — `PrefilterKind.ByteSet`;
+//   - failing that, `PrefilterKind.None`, and `pike.bit` seeds every
+//     position exactly as it did before this ticket.
+//
+// CORRECTNESS, NOT SPEED, IS THE CONTRACT: every case below is proven safe
+// to skip only positions where a match is PROVABLY impossible (`litscan.bit`'s
+// header). Where the proof is unavailable — an unknown backoff, a bail from
+// `firstBytes` — this degrades to the next weaker option, down to `None`,
+// rather than guessing. `isCandidateStart(noPrefilter(), s, pos)` is `true`
+// for every `pos`, so the "off" path and the "on" path with `None` are the
+// exact same code, not two implementations that could drift apart.
+//
+// `Builder`/`newBuilder` (`std/strings`) are already imported by
+// `litscan.bit` — an import is per-MODULE in Bit, not per-file, and
+// re-importing the same name here would be `E0042 already declared in this
+// scope`.
+
+// The largest first-byte set worth using: bigger than this and the filter
+// admits so much of the byte space that the per-position check is not worth
+// its own cost. Chosen, not derived — a future ticket may tune it with a
+// real measurement; this ticket's job is correctness of the mechanism.
+const prefilterByteSetMax: int = 32
+
+enum PrefilterKind { None, Literal, ByteSet }
+
+// `literal`/`backoffKnown`/`backoff` are only meaningful when `kind ==
+// Literal`; `byteSet` only when `kind == ByteSet`. Immutable once built —
+// `derivePrefilter` runs once, at `compile()` time, and the result is never
+// mutated afterward (`Regex.prefilter`'s own doc comment).
+class Prefilter {
+  kind: PrefilterKind,
+  literal: string,
+  backoffKnown: bool,
+  backoff: int,
+  byteSet: []bool,
+}
+
+// The "off" prefilter: `isCandidateStart` is unconditionally `true` for
+// this value, so running with it is byte-for-byte the search this module
+// had before this ticket. Also `derivePrefilter`'s fallback whenever no
+// analysis below can prove a useful skip.
+fn noPrefilter(): Prefilter {
+  return Prefilter{
+    kind: PrefilterKind.None,
+    literal: "",
+    backoffKnown: false,
+    backoff: 0,
+    byteSet: []bool(0),
+  }
+}
+
+// Whether `pos` could possibly be where a match starts, per `pf`. `false`
+// here is a PROOF, not a guess — `pike.bit`'s seed loop treats it as
+// "skip," so every case must be backed by one of `litscan.bit`'s
+// over-approximation arguments.
+fn isCandidateStart(pf: Prefilter, s: string, pos: int): bool {
+  if (pf.kind == PrefilterKind.ByteSet) {
+    return pos < len(s) && pf.byteSet[int(s[pos])]
+  }
+  if (pf.kind != PrefilterKind.Literal) {
+    return true // None
+  }
+  if (!pf.backoffKnown) {
+    return true // ticket's own rule: unknown backoff falls back to full scan
+  }
+  let at = pos + pf.backoff
+  let litLen = len(pf.literal)
+  if (at < 0 || at + litLen > len(s)) {
+    return false
+  }
+  return s[at:at + litLen] == pf.literal
+}
+
+// Derives the best prefilter `ast` supports. Tries a required literal run
+// with a known backoff first (strictly the most selective option when one
+// exists); falls back to a first-byte set; falls back to `None`.
+fn derivePrefilter(ast: Ast): Prefilter {
+  let lit = bestLiteralRun(ast)
+  if (lit.found && lit.backoffKnown) {
+    return Prefilter{
+      kind: PrefilterKind.Literal,
+      literal: lit.literal,
+      backoffKnown: true,
+      backoff: lit.backoff,
+      byteSet: []bool(0),
+    }
+  }
+  return deriveByteSetPrefilter(ast)
+}
+
+// `ast` must be non-nullable for a byte-set filter to be safe at all — a
+// nullable pattern can match zero-width at ANY position, so no byte-set
+// (however permissive) could ever be a valid "this position is impossible"
+// proof.
+fn deriveByteSetPrefilter(ast: Ast): Prefilter {
+  if (nullable(ast)) {
+    return noPrefilter()
+  }
+  let (ok, set) = firstBytes(ast)
+  if (!ok || byteSetTrueCount(set) > prefilterByteSetMax) {
+    return noPrefilter()
+  }
+  return Prefilter{
+    kind: PrefilterKind.ByteSet,
+    literal: "",
+    backoffKnown: false,
+    backoff: 0,
+    byteSet: set,
+  }
+}
+
+// One maximal run of consecutive `Ast.Literal` items, plus what is known
+// about the run's own position. `found == false` is the "no run at all"
+// case (`noLiteralRun` below); a `found` run with `backoffKnown == false`
+// is a real literal the pattern requires SOMEWHERE, just not at a
+// statically known offset (`ast`'s doc comment's "required substring,
+// unknown backoff" case).
+class LiteralRun { found: bool, literal: string, backoffKnown: bool, backoff: int }
+
+fn noLiteralRun(): LiteralRun {
+  return LiteralRun{ found: false, literal: "", backoffKnown: false, backoff: 0 }
+}
+
+// The best run of consecutive `Ast.Literal` items directly in `ast`'s own
+// top-level item list (`ast` itself when it is not a `Concat`, else
+// `Concat`'s items — a literal nested one level deeper, e.g. inside a
+// non-capturing group with no quantifier, is not detected here; that only
+// costs a missed optimization, never a correctness gap). "Best" per
+// `preferLiteralRun`'s priority below.
+fn bestLiteralRun(ast: Ast): LiteralRun {
+  let items = topLevelItems(ast)
+  let best = noLiteralRun()
+  let i = 0
+  // Bounded by `items`'s length, fixed before the loop starts; each pass
+  // either enters a run (jumping `i` to the run's end) or advances by one.
+  while (i < len(items)) {
+    if (isLiteralItem(items[i])) {
+      let runEnd = literalRunEnd(items, i)
+      best = preferLiteralRun(best, buildLiteralRun(items, i, runEnd))
+      i = runEnd
+    } else {
+      i = i + 1
+    }
+  }
+  return best
+}
+
+fn topLevelItems(ast: Ast): []Ast {
+  match (ast) {
+    Concat(items) => return items
+    _ => return []Ast{ ast }
+  }
+}
+
+fn isLiteralItem(ast: Ast): bool {
+  match (ast) {
+    Literal(_) => return true
+    _ => return false
+  }
+}
+
+// The index just past the maximal run of `Ast.Literal` items starting at
+// `start` — caller has already checked `items[start]` is one.
+fn literalRunEnd(items: []Ast, start: int): int {
+  let j = start
+  // Bounded by `items`'s length, fixed before the loop starts.
+  while (j < len(items) && isLiteralItem(items[j])) {
+    j = j + 1
+  }
+  return j
+}
+
+// Concatenates `items[start:end]`'s runes' own UTF-8 bytes and pairs that
+// with the run's backoff (`literalRunBackoff` below).
+fn buildLiteralRun(items: []Ast, start: int, end: int): LiteralRun {
+  let b = newBuilder()
+  let i = start
+  // Bounded: `end - start`, fixed before the loop starts.
+  while (i < end) {
+    b = writeLiteralRune(b, items[i])
+    i = i + 1
+  }
+  let (backoffKnown, backoff) = literalRunBackoff(items, start)
+  return LiteralRun{
+    found: true,
+    literal: b.toString(),
+    backoffKnown: backoffKnown,
+    backoff: backoff,
+  }
+}
+
+fn writeLiteralRune(b: Builder, ast: Ast): Builder {
+  match (ast) {
+    Literal(r) => return encodeRuneUtf8(b, int(r))
+    _ => panic("regex: internal: writeLiteralRune given a non-literal Ast node")
+  }
+}
+
+// The backoff for a literal run starting at index `start`: `fixedWidth` of
+// every item before it in the same top-level list, when that total is
+// statically known. `items[0:start]` is empty when `start == 0` (the run
+// opens the pattern), and `fixedWidthConcat` of an empty list is `Some(0)`
+// — a required PREFIX is exactly a required SUBSTRING with backoff 0, no
+// separate case needed.
+fn literalRunBackoff(items: []Ast, start: int): (bool, int) {
+  let w = fixedWidthConcat(items[0:start])
+  if (isNone(w)) {
+    return false, 0
+  }
+  return true, unwrap(w)
+}
+
+// Picks the more useful of `best` (the running winner) and `candidate` (a
+// newly found run), by: (1) a KNOWN backoff always beats an unknown one,
+// regardless of length — an unknown-backoff run cannot skip anything at
+// all (`isCandidateStart`'s own fallback), so it is never better than a
+// known one, however short; (2) among two known-or-two-unknown runs, the
+// longer literal is more selective; (3) a tie on length prefers the
+// smaller backoff, which is checked (and so can reject) sooner in the
+// subject.
+fn preferLiteralRun(best: LiteralRun, candidate: LiteralRun): LiteralRun {
+  if (!best.found) {
+    return candidate
+  }
+  if (best.backoffKnown != candidate.backoffKnown) {
+    return preferKnownBackoff(best, candidate)
+  }
+  if (len(candidate.literal) != len(best.literal)) {
+    return preferLonger(best, candidate)
+  }
+  if (candidate.backoffKnown && candidate.backoff < best.backoff) {
+    return candidate
+  }
+  return best
+}
+
+fn preferKnownBackoff(best: LiteralRun, candidate: LiteralRun): LiteralRun {
+  if (candidate.backoffKnown) {
+    return candidate
+  }
+  return best
+}
+
+fn preferLonger(best: LiteralRun, candidate: LiteralRun): LiteralRun {
+  if (len(candidate.literal) > len(best.literal)) {
+    return candidate
+  }
+  return best
+}

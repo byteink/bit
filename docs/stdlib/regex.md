@@ -24,6 +24,17 @@ green threads** — the natural usage is one `mustCompile` call, shared by
 every request handler an HTTP server spawns, rather than recompiling the
 same pattern per request.
 
+When a pattern requires a specific literal to appear — a prefix (`foo.*bar`
+must start with `foo`) or a substring reachable at a fixed offset
+(`(cat|cow)food` must contain `food` right after the alternation) — `compile`
+derives that literal once and `matches`/`find`/`findAll` use it to skip
+straight to each candidate position instead of trying every byte of the
+subject. A pattern with no such literal but a small set of possible starting
+bytes (`[abc]xyz`) gets a byte-set skip instead; a pattern with neither (`.*`,
+or anything the analysis cannot prove safe to skip) searches every position,
+exactly as before. This is purely an internal speedup — it never changes
+which matches a pattern reports.
+
 <!-- doctest: per-block -->
 
 ### Flags

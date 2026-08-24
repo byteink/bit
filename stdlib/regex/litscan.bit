@@ -1,0 +1,322 @@
+// Bit standard library — regex module, prefilter analysis primitives
+// (#2052, epic #2025).
+//
+// Three structural walks over the same `Ast` `prog.bit`'s compiler already
+// walks, plus a small UTF-8 encoder — the building blocks `prefilter.bit`
+// combines into a required-literal or first-byte-set skip-ahead. Nothing
+// here mutates a pattern or allocates per search call; every function is a
+// pure read of the AST, run once at `compile()` time.
+//
+// Each walk is proven SAFE TO OVER-APPROXIMATE, never to under-approximate:
+// returning `Option.None` from `fixedWidth`, or bailing (`ok == false`) from
+// `firstBytes`, only costs a missed optimization. Only a wrong `Some`/`true`
+// answer could make `prefilter.bit` skip a position where a match is
+// possible, so every case below is conservative on purpose — see each
+// function's own comment for its correctness argument.
+
+import { Builder, newBuilder } from "std/strings"
+
+// Whether `ast` can match the empty string — `prog.bit`'s own `nullable`,
+// reused rather than re-derived: it already walks this exact `Ast` for
+// `compileStar`'s nullable-body case, and two structural walks answering
+// the same question would be exactly the "two code paths that disagree"
+// failure this module's callers are warned against.
+//
+// (No import needed: `nullable` lives in `prog.bit`, the same module.)
+
+// The number of bytes EVERY accepting derivation of `ast` consumes, or
+// `Option.None` when that count can vary (`.*`, a non-ASCII class, a
+// `{n,m}` with `n != m`, or anything containing one of those). Proven by
+// structural induction: each case returns `Some` only when every
+// alternative it walks is itself `Some` and they agree exactly, so a
+// `Some(w)` here means "always exactly `w` bytes," not "at least" or "at
+// most."
+fn fixedWidth(ast: Ast): Option<int> {
+  return match (ast) {
+    Concat(items) => fixedWidthConcat(items)
+    Alternate(items) => fixedWidthAlternate(items)
+    Repeat(node) => fixedWidthRepeat(node)
+    Group(node) => fixedWidth(node.sub)
+    _ => fixedWidthLeaf(ast)
+  }
+}
+
+// The non-structural `Ast` nodes `fixedWidth` doesn't handle directly, same
+// leaf/dispatcher split `prog.bit`'s `compileAst`/`compileLeaf` and
+// `nullable`/`nullableLeaf` already use for the same E0204 reason. The
+// trailing `_` is unreachable from `fixedWidth` but required for
+// exhaustiveness.
+fn fixedWidthLeaf(ast: Ast): Option<int> {
+  match (ast) {
+    Empty => return Option.Some(0)
+    Anchor(_) => return Option.Some(0)
+    Literal(r) => return Option.Some(len(runeUtf8Bytes(r)))
+    Class(cc) => return fixedWidthClass(cc)
+    AnyChar => return Option.None
+    AnyCharNL => return Option.None
+    _ => panic("regex: internal: fixedWidthLeaf given a structural Ast node")
+  }
+}
+
+// A class is fixed-width only when every member is ASCII: each ASCII rune
+// is exactly 1 UTF-8 byte, but a class spanning both ASCII and non-ASCII
+// runes (or only non-ASCII runes of differing encoded lengths) has no
+// single width every member shares.
+fn fixedWidthClass(cc: CharClass): Option<int> {
+  if (!classIsAsciiOnly(cc)) {
+    return Option.None
+  }
+  return Option.Some(1)
+}
+
+fn fixedWidthConcat(items: []Ast): Option<int> {
+  let total = 0
+  let i = 0
+  // Bounded by `items`'s length, fixed before the loop starts.
+  while (i < len(items)) {
+    let w = fixedWidth(items[i])
+    if (isNone(w)) {
+      return Option.None
+    }
+    total = total + unwrap(w)
+    i = i + 1
+  }
+  return Option.Some(total)
+}
+
+// Fixed-width only when every branch agrees on the SAME width — one branch
+// of a different length (or unknown width) makes the alternation's own
+// width unknowable, since which branch runs depends on the input.
+fn fixedWidthAlternate(items: []Ast): Option<int> {
+  if (len(items) == 0) {
+    return Option.Some(0)
+  }
+  let want = fixedWidth(items[0])
+  if (isNone(want)) {
+    return Option.None
+  }
+  let i = 1
+  // Bounded by `items`'s length, fixed before the loop starts.
+  while (i < len(items)) {
+    let w = fixedWidth(items[i])
+    if (isNone(w) || unwrap(w) != unwrap(want)) {
+      return Option.None
+    }
+    i = i + 1
+  }
+  return want
+}
+
+// `min == max == 0` is always exactly zero bytes REGARDLESS of `node.sub`'s
+// own width — zero repetitions never runs the body at all, so an unknown- or
+// variable-width body (e.g. `(?:a*){0}`) still contributes nothing. Every
+// other fixed case (`min == max > 0`) needs `node.sub` itself fixed-width;
+// `min != max`, or `max == -1` (unbounded), is never fixed.
+fn fixedWidthRepeat(node: RepeatNode): Option<int> {
+  if (node.min == 0 && node.max == 0) {
+    return Option.Some(0)
+  }
+  if (node.max == -1 || node.min != node.max) {
+    return Option.None
+  }
+  let w = fixedWidth(node.sub)
+  if (isNone(w)) {
+    return Option.None
+  }
+  return Option.Some(node.min * unwrap(w))
+}
+
+// The set of bytes a match beginning with `ast` could legally start with,
+// or `(false, _)` when that set is not safely computable (too broad, e.g.
+// `.`, or spans non-ASCII runes of differing lead bytes). Classic FIRST-set
+// construction: safe to OVER-approximate (include a byte no real match
+// starts with — costs a wasted VM seed, nothing more) but never to
+// under-approximate (omit one that a real match could start with — a
+// silent missed match, unacceptable). Every union below only ever ADDS
+// bytes, and bailing degrades to `(false, _)`, which `prefilter.bit` treats
+// as "give up," so nothing here can narrow the true set.
+fn firstBytes(ast: Ast): (bool, []bool) {
+  return match (ast) {
+    Concat(items) => firstBytesConcat(items)
+    Alternate(items) => firstBytesAlternate(items)
+    Repeat(node) => firstBytes(node.sub)
+    Group(node) => firstBytes(node.sub)
+    _ => firstBytesLeaf(ast)
+  }
+}
+
+fn firstBytesLeaf(ast: Ast): (bool, []bool) {
+  match (ast) {
+    Empty => { return true, newByteSet() }
+    Anchor(_) => { return true, newByteSet() }
+    Literal(r) => { return true, singletonByteSet(firstByteOf(r)) }
+    Class(cc) => return classFirstBytes(cc)
+    AnyChar => { return false, newByteSet() }
+    AnyCharNL => { return false, newByteSet() }
+    _ => panic("regex: internal: firstBytesLeaf given a structural Ast node")
+  }
+}
+
+// Same ASCII-only restriction as `fixedWidthClass`, for the same reason: a
+// non-ASCII member's lead byte cannot be read off the rune value directly
+// (UTF-8 encodes it as 2-4 bytes, not the rune's own low byte), so this
+// bails rather than computing a wrong lead byte.
+fn classFirstBytes(cc: CharClass): (bool, []bool) {
+  if (!classIsAsciiOnly(cc)) {
+    return false, newByteSet()
+  }
+  let set = newByteSet()
+  let i = 0
+  // Bounded by `cc.ranges`'s length, fixed before the loop starts.
+  while (i < len(cc.ranges)) {
+    set = addByteRange(set, cc.ranges[i])
+    i = i + 1
+  }
+  return true, set
+}
+
+// Walks `items` left to right, unioning each item's own `firstBytes` in —
+// safe even for a NULLABLE item (its own first-byte set is still a real
+// possibility whenever it does consume something) — and stops at the first
+// item that can NEVER match empty: every derivation of `items` must consume
+// that item's own first byte for its very first byte, so nothing after it
+// can ever be the concatenation's first byte. Bails immediately if any
+// visited item itself bails, since a bailed item's true first-byte set is
+// unknown and might not be a subset of anything already unioned in.
+fn firstBytesConcat(items: []Ast): (bool, []bool) {
+  let set = newByteSet()
+  let i = 0
+  // Bounded by `items`'s length, fixed before the loop starts.
+  while (i < len(items)) {
+    let (ok, itemSet) = firstBytes(items[i])
+    if (!ok) {
+      return false, newByteSet()
+    }
+    set = unionByteSet(set, itemSet)
+    if (!nullable(items[i])) {
+      return true, set
+    }
+    i = i + 1
+  }
+  return true, set
+}
+
+// Every branch of an alternation is a live possibility, so the result is
+// the union of all of them — bails if any one branch bails.
+fn firstBytesAlternate(items: []Ast): (bool, []bool) {
+  let set = newByteSet()
+  let i = 0
+  // Bounded by `items`'s length, fixed before the loop starts.
+  while (i < len(items)) {
+    let (ok, itemSet) = firstBytes(items[i])
+    if (!ok) {
+      return false, newByteSet()
+    }
+    set = unionByteSet(set, itemSet)
+    i = i + 1
+  }
+  return true, set
+}
+
+// --- shared byte-set / ASCII helpers ---------------------------------------
+
+// One entry per possible byte value (`s[i]` is a `u8`, 0-255) — indexable
+// directly by a subject byte with no further mapping.
+fn newByteSet(): []bool {
+  return []bool(256)
+}
+
+fn singletonByteSet(b: u8): []bool {
+  let set = newByteSet()
+  set[int(b)] = true
+  return set
+}
+
+fn unionByteSet(a: []bool, b: []bool): []bool {
+  let i = 0
+  // Bounded: exactly 256 entries in both.
+  while (i < 256) {
+    if (b[i]) {
+      a[i] = true
+    }
+    i = i + 1
+  }
+  return a
+}
+
+fn byteSetTrueCount(set: []bool): int {
+  let count = 0
+  let i = 0
+  // Bounded: exactly 256 entries.
+  while (i < 256) {
+    if (set[i]) {
+      count = count + 1
+    }
+    i = i + 1
+  }
+  return count
+}
+
+fn addByteRange(set: []bool, r: RuneRange): []bool {
+  let b = int(r.lo)
+  let hi = int(r.hi)
+  // Bounded: `classIsAsciiOnly` (every caller's own guard) already limits
+  // `hi` to 0x7F, so this is at most 128 iterations.
+  while (b <= hi) {
+    set[b] = true
+    b = b + 1
+  }
+  return set
+}
+
+fn classIsAsciiOnly(cc: CharClass): bool {
+  let i = 0
+  // Bounded by `cc.ranges`'s length, fixed before the loop starts.
+  while (i < len(cc.ranges)) {
+    if (int(cc.ranges[i].hi) > 0x7F) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// `r`'s own UTF-8 encoding, as a `string` of its raw bytes.
+fn runeUtf8Bytes(r: rune): string {
+  let b = newBuilder()
+  b = encodeRuneUtf8(b, int(r))
+  return b.toString()
+}
+
+// The first byte of `r`'s UTF-8 encoding — for a Literal leaf's own
+// first-byte set, always exactly one byte regardless of `r`'s width, since a
+// `Literal` names one specific rune, not a range.
+fn firstByteOf(r: rune): u8 {
+  let s = runeUtf8Bytes(r)
+  return s[0]
+}
+
+// Encodes Unicode scalar value `cp` as UTF-8 into `b`, returning `b`.
+// Mirrors `std/strings`'s own module-private `writeRuneUtf8` byte for byte —
+// that function is unreachable from here (`stdlib/regex` and `std/strings`
+// are separate modules, and it is not exported), so this is a small,
+// deliberate local copy rather than a new export whose only caller is this
+// ticket. Assumes `cp` is a valid Unicode scalar value: every caller here
+// passes a rune the parser already accepted, never a raw byte or a
+// surrogate.
+fn encodeRuneUtf8(b: Builder, cp: int): Builder {
+  if (cp < 0x80) {
+    return b.writeByte(u8(cp))
+  }
+  if (cp < 0x800) {
+    return b.writeByte(u8(0xC0 | (cp >> 6))).writeByte(u8(0x80 | (cp & 0x3F)))
+  }
+  if (cp < 0x10000) {
+    return b.writeByte(u8(0xE0 | (cp >> 12))).writeByte(u8(0x80 | ((cp >> 6) & 0x3F))).writeByte(
+      u8(0x80 | (cp & 0x3F)),
+    )
+  }
+  return b.writeByte(u8(0xF0 | (cp >> 18))).writeByte(u8(0x80 | ((cp >> 12) & 0x3F))).writeByte(
+    u8(0x80 | ((cp >> 6) & 0x3F)),
+  ).writeByte(u8(0x80 | (cp & 0x3F)))
+}
