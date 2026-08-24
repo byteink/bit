@@ -1,0 +1,413 @@
+// Panic-time stack walker and symbolizer (#3285): walks the frame-pointer
+// chain outward from `bit_rt_panic`'s own frame, symbolizing each return
+// address against the debug-info line table (ABI.md §4.2) #3283/#3591 emit
+// and link. Platform-free — sibling of ./root.bit, ./io.bit, ./slices.bit
+// (SPEC §17.1: same directory, same module) — imported by both
+// darwin/io.bit's and linux/io.bit's `rootPanic`.
+//
+// ---------------------------------------------------------------------------
+// REUSES THE GC WALKER'S SHAPE, NOT ITS CODE
+// ---------------------------------------------------------------------------
+//
+// #3285's own instructions say "read the existing walker before writing a
+// second one". `runtime/gc/stackmap.bit`'s `gcScanSnapshot`/`scanFrame` walk
+// the IDENTICAL frame-pointer chain (ABI.md §4, "Frame chain": `*(fp)` is the
+// caller's frame pointer, `*(fp+8)` is the return address) for the
+// collector's root scan. This is a genuinely different table (`.bit_dbg`, not
+// `.bit_gc`), a genuinely different per-frame payload (printable text, not GC
+// roots) and a genuinely different module (`runtime/gc` cannot be imported
+// from here without inverting the module graph — see stackmap.bit's own note
+// on `smBoundsMsg`), so the WALK LOOP is re-derived rather than shared; only
+// its shape is deliberately identical: bounded frame count, `inBlob`-style
+// bounds checks before every read, and the same monotonic frame-pointer
+// growth sanity check `gcScanSnapshot` uses (`nextFp <= fp` ends the walk).
+//
+// ---------------------------------------------------------------------------
+// THE HARD CONSTRAINTS (#3285)
+// ---------------------------------------------------------------------------
+//
+// NO ALLOCATION: every function below is `@nosplit`. No composite locals (no
+// class, no multi-value/tuple return — ABI.md §1.1 boxes those on the heap),
+// matching `runtime/gc/stackmap.bit`'s own module-state-over-locals shape.
+// Per-frame lookup results that are more than one scalar are stashed in
+// module state (`btRowFileAddr`/`btRowFileLen`/`btRowLine`), the same device
+// `scanRegs` is there for.
+//
+// NO RECURSIVE PANIC: ABI.md §4.2 states this explicitly for this exact
+// table — "The reader must never call bit_rt_panic on a malformed table...
+// this table is read from inside bit_rt_panic itself... a hard panic here
+// would recurse into a second panic reporting a first one." Every bounds
+// check below degrades (stops the walk, or reports one frame unresolved)
+// rather than panicking, unlike `runtime/gc/stackmap.bit`'s
+// `panicStackMapBounds`, which is sound there only because it runs during
+// ordinary execution, not inside an already-terminating panic.
+//
+// DEGRADE, NEVER FAIL SILENT: a frame with no matching debug-info record, a
+// `format_version` mismatch, or a corrupt frame pointer each stop cleanly —
+// the corrupt-frame case at the CURRENT frame (raw address still printed for
+// every frame walked so far), the other two at the current FRAME only,
+// falling back to a raw hex address exactly like ABI.md §4.2's own
+// convention (mirroring `sample`'s "??? (0x...)" for an unresolved sample).
+//
+// NOT FUNCTION NAMES — A MEASURED GAP, FILED SEPARATELY. ABI.md §4.2's wire
+// format carries `code_addr`/`format_version`/`code_size`/`num_rows` per
+// function and `pc_offset`/`file_hdr_ptr`/`line` per row — no name field
+// anywhere, on either the function header or the row. The function's LINK
+// symbol name exists at compile time (`emittedNames[owner]`,
+// compiler/emitelf.bit) but is never written into the table's bytes; it is
+// consumed by the relocation and discarded. So this walker prints
+// `file:line`, which the mutation test below can and does verify moves with
+// the source, and NOT a function name — printing one would require a new
+// field in an already-shipped, differential-verified wire format, which is
+// out of this ticket's file surface (compiler/emitmacho.bit,
+// compiler/emitelf.bit, runtime/ABI.md §4.2 — #3283/#3591's files, not
+// #3285's). Filed as #3651.
+
+// No imports: `loadWord`/`storeWord`/`loadByte`/`storeByte` (./root.bit's own
+// "../gc" import), `strPtr`/`strLen` (./root.bit), `ptrOf`/`debugLinesBegin`/
+// `debugLinesEnd` (language builtins) and `osEnvp`/`osMaxEnvCount`
+// (./os.bit) are already in scope — imports are module-scoped (SPEC §17.1),
+// and re-importing any of them here would be an E0042 redeclaration.
+
+// ---------------------------------------------------------------------------
+// Bounds (Power of 10 rule 2: every loop below is statically bounded)
+// ---------------------------------------------------------------------------
+
+// A runaway backstop far above any real panic call depth — `runtime/gc/
+// stackmap.bit`'s `smMaxFrames` is 65536 for the collector's exhaustive root
+// walk; a PRINTED trace has no use for that many lines, so this is deliberately
+// smaller, matching common trace-printer conventions (Go, Rust) rather than
+// the GC's own bound.
+const btMaxFrames: int = 64
+
+// Far above any real program's function count — mirrors `smMaxEntries`'s own
+// reasoning (stackmap.bit): entries are self-delimiting with no count, so the
+// walk is already bounded by the table extent; this is the belt-and-braces
+// static bound Power of 10 rule 2 wants regardless.
+const btMaxFuncs: int = 4194304
+
+// Binary search over a `u16 numRows` (max 65535): log2(65536) = 16 halvings,
+// rounded up with margin.
+const btMaxRowIters: int = 20
+
+// Matches `compiler/codegen.bit`'s `dbgFormatVersion`. A mismatch degrades
+// that one function's rows to "no record" (ABI.md §4.2) — never a panic.
+const btFormatVersion: int = 1
+
+// ---------------------------------------------------------------------------
+// Unaligned little-endian blob readers — duplicated from `runtime/gc/
+// stackmap.bit`'s `blobU16`/`blobU32`/`blobU64` rather than imported: they
+// are module-private there (`runtime/root` imports FROM `runtime/gc`, never
+// the reverse — see stackmap.bit's own `smBoundsMsg` note for why inverting
+// the graph is not an option), and widening that module's export surface for
+// one caller in a different module is exactly what `./io.bit`'s own
+// `strBytesOf`/`strSizeOf` header already declines to do for the same
+// boundary, for the same reason.
+// ---------------------------------------------------------------------------
+
+@nosplit fn btBlobU16(base: int, off: int): int {
+  return loadByte(base + off) | (loadByte(base + off + 1) << 8)
+}
+
+@nosplit fn btBlobU32(base: int, off: int): int {
+  return btBlobU16(base, off) | (btBlobU16(base, off + 2) << 16)
+}
+
+@nosplit fn btBlobU64(base: int, off: int): int {
+  return btBlobU32(base, off) | (btBlobU32(base, off + 4) << 32)
+}
+
+// Whether `need` bytes starting at `off` are still inside `[0, tblLen)` —
+// `runtime/gc/stackmap.bit`'s `inBlob`, duplicated for the same reason as the
+// blob readers above. Every read below is gated by this, not just the first
+// per entry, because `off` may already be corrupt by the time it gets here.
+@nosplit fn btInBlob(off: int, need: int, tblLen: int): bool {
+  return off + need <= tblLen
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame lookup result — module state, not a composite return (ABI.md
+// §1.1: a multi-value return boxes on the heap; a class return is a heap
+// object too — both are wrong on this path, per #3285's own constraint).
+// Written only by `btSearchRows`, read only by `btFormatFrame`, both called
+// strictly sequentially from `btPrintTrace`'s single-threaded walk.
+// ---------------------------------------------------------------------------
+let btRowFileAddr: [1]i64
+let btRowFileLen: [1]i64
+let btRowLine: [1]i64
+
+// Binary search `rowsOff`'s `numRows` rows (ABI.md §4.2: sorted ascending by
+// `pcOffset` within one function, by construction) for the greatest
+// `pcOffset` not exceeding `target`. Row 0 always has `pcOffset == 0`
+// (ABI.md §4.2), so a `target >= 0` always matches at least row 0 — this
+// never returns "not found" for a `pc` already proven inside the owning
+// function's range. Sets the module-state fields above and returns 1.
+@nosplit fn btSearchRows(dbgBase: int, rowsOff: int, numRows: int, target: int): int {
+  let lo = 0
+  let hi = numRows - 1
+  let bestIdx = 0
+  let iter = 0
+  while (lo <= hi && iter < btMaxRowIters) {
+    let mid = (lo + hi) / 2
+    let pcOff = btBlobU32(dbgBase, rowsOff + mid * 16)
+    if (pcOff <= target) {
+      bestIdx = mid
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+    iter = iter + 1
+  }
+  let rowOff = rowsOff + bestIdx * 16
+  let fileHdrPtr = btBlobU64(dbgBase, rowOff + 4)
+  storeWord(int(ptrOf(btRowFileAddr)), loadWord(fileHdrPtr + strPtr))
+  storeWord(int(ptrOf(btRowFileLen)), loadWord(fileHdrPtr + strLen))
+  storeWord(int(ptrOf(btRowLine)), btBlobU32(dbgBase, rowOff + 12))
+  return 1
+}
+
+// Linear scan of the `.bit_dbg` extent (ABI.md §4.2: link order is not load
+// order, so this cannot be a binary search, matching the stack-map walker's
+// own proven cost shape) for the function whose `[codeAddr, codeAddr +
+// codeSize)` contains `pc`. Returns 1 and leaves the module-state fields set
+// via `btSearchRows` on a match; returns 0 (no record — degrade to a raw
+// address, never abort) on any bounds failure, version mismatch, or when no
+// entry's range contains `pc` at all.
+@nosplit fn btLookup(dbgBase: int, dbgLen: int, pc: int): int {
+  let off = 0
+  let fi = 0
+  while (off < dbgLen && fi < btMaxFuncs) {
+    if (!btInBlob(off, 16, dbgLen)) {
+      return 0
+    }
+    let codeAddr = btBlobU64(dbgBase, off)
+    let version = btBlobU16(dbgBase, off + 8)
+    let codeSize = btBlobU32(dbgBase, off + 10)
+    let numRows = btBlobU16(dbgBase, off + 14)
+    let entryLen = 16 + numRows * 16
+    if (!btInBlob(off, entryLen, dbgLen)) {
+      return 0
+    }
+    let hit = version == btFormatVersion && pc >= codeAddr && pc < codeAddr + codeSize
+    if (hit) {
+      return btSearchRows(dbgBase, off + 16, numRows, pc - codeAddr)
+    }
+    off = off + entryLen
+    fi = fi + 1
+  }
+  return 0
+}
+
+// ---------------------------------------------------------------------------
+// Formatting — assembled into the shared per-worker line buffer (./io.bit's
+// `ioLineSlotAddr`/`ioLineCap`), the SAME scratch slot `panicWrite` already
+// uses. Safe to reuse: by the time a frame line is formatted, the panic
+// message line has already been written out (its own `rootWriteAll` call
+// already issued), so there is no live reader of the earlier contents.
+// ---------------------------------------------------------------------------
+
+// "  at " (5 bytes) and ":" (1 byte), packed little-endian exactly as
+// ./darwin/io.bit's `panicPrefixWord` — computed, not hand-derived.
+const btAtPrefixWord: int = 139391475744
+const btAtPrefixLen: int = 5
+const btColonWord: int = 58
+const btNewlineWord: int = 10
+const btNewlineLen: int = 1
+
+// Renders `v` as decimal ASCII into `buf` at `pos`, returning the position
+// just past the last digit. `line` is a `u32` (ABI.md §4.2), so this is
+// bounded at 10 divisor steps (10^9 down to 1) rather than
+// `runtime/gc/stackmap.bit`'s `appendDecimal`'s 5 (that one only ever reads a
+// `u16`). Always emits at least one digit.
+@nosplit fn btAppendDecimal(buf: int, pos: int, v: int): int {
+  let divisor = 1000000000
+  let started = false
+  let p = pos
+  while (divisor >= 1) {
+    let d = (v / divisor) % 10
+    if (d != 0 || started || divisor == 1) {
+      storeByte(buf + p, 48 + d)
+      p = p + 1
+      started = true
+    }
+    divisor = divisor / 10
+  }
+  return p
+}
+
+// Renders `v` as "0x" + 16 fixed hex digits into `buf` at `pos` — the
+// unresolved-frame fallback, ABI.md §4.2's own "??? (0x...)" convention.
+// Fixed width rather than `appendDecimal`'s trimmed form: an address benefits
+// from being visually distinguishable from a decimal line number at a
+// glance, and fixed width keeps this bounded at exactly 16 iterations with
+// no leading-zero special case to get wrong.
+@nosplit fn btAppendHex(buf: int, pos: int, v: int): int {
+  storeByte(buf + pos, 48) // '0'
+  storeByte(buf + pos + 1, 120) // 'x'
+  let p = pos + 2
+  let shift = 60
+  while (shift >= 0) {
+    let d = (v >> shift) & 15
+    let c = 48 + d
+    if (d > 9) {
+      c = 97 + (d - 10)
+    }
+    storeByte(buf + p, c)
+    p = p + 1
+    shift = shift - 4
+  }
+  return p
+}
+
+// Formats one frame line into `ioLineSlotAddr()` and returns its length:
+// "  at <file>:<line>\n" when `found` (from `btLookup`) is nonzero, or
+// "  at 0x<16 hex digits>\n" otherwise. The file path is clamped to what
+// fits alongside the fixed prefix, a colon, up to 10 decimal digits and the
+// newline within `ioLineCap` — this trace is diagnostic, so a silently
+// truncated (never overrun) long path is an acceptable degrade, matching the
+// "never truncates the common case, narrows the race window for the rest"
+// spirit `panicWrite` already established for the message line itself.
+@nosplit fn btFormatFrame(pc: int, found: int): int {
+  let addr = ioLineSlotAddr()
+  ioLineAppendWord(addr, btAtPrefixWord, btAtPrefixLen)
+  let off = btAtPrefixLen
+  if (found != 0) {
+    let fileAddr = loadWord(int(ptrOf(btRowFileAddr)))
+    let fileLen = loadWord(int(ptrOf(btRowFileLen)))
+    let maxFile = ioLineCap - btAtPrefixLen - 1 - 10 - btNewlineLen
+    if (fileLen > maxFile) {
+      fileLen = maxFile
+    }
+    ioLineCopyBytes(addr + off, fileAddr, fileLen)
+    off = off + fileLen
+    ioLineAppendWord(addr + off, btColonWord, 1)
+    off = off + 1
+    off = btAppendDecimal(addr, off, loadWord(int(ptrOf(btRowLine))))
+  } else {
+    off = btAppendHex(addr, off, pc)
+  }
+  ioLineAppendWord(addr + off, btNewlineWord, btNewlineLen)
+  return off + btNewlineLen
+}
+
+// ---------------------------------------------------------------------------
+// The walk — `runtime/gc/stackmap.bit`'s `gcScanSnapshot`, re-derived for a
+// printed trace instead of a GC root scan (see this file's header for why
+// the code is not shared).
+// ---------------------------------------------------------------------------
+
+// A frame pointer is trustworthy enough to dereference: nonzero and 8-byte
+// aligned. Combined with the monotonic-growth check in the walk below
+// (`nextFp <= fp` ends the walk, exactly as `gcScanSnapshot`'s own check
+// does), this is the same bar the collector's already-audited walker holds
+// itself to — not a guarantee against every possible wild pointer (no
+// alloc-free code can probe "is this address mapped" without risking the
+// exact fault it is trying to avoid), but it catches a null, a misaligned,
+// or a non-ascending (corrupted or cyclic) chain, which is what "stops
+// cleanly rather than looping or faulting" means for this class of bug.
+@nosplit fn btValidFp(fp: int): bool {
+  return fp != 0 && (fp % 8) == 0
+}
+
+// `bit_rt_port_root_io_write_all` (./darwin/io.bit, ./linux/io.bit): the
+// SAME cross-module door `runtime/root/slices.bit` already opens for
+// `bit_rt_panic` itself. Only one platform's provider is ever linked into a
+// given binary, so this resolves unambiguously at link time whichever target
+// is built.
+extern fn bit_rt_port_root_io_write_all(fd: int, addr: int, n: int)
+
+// Walks the frame-pointer chain starting at `ownFp` — `bit_rt_panic`'s OWN
+// frame pointer, read by the caller via inline `asm` (this function's own
+// callers, ./darwin/io.bit's and ./linux/io.bit's `rootPanic`, are what
+// place that read; it cannot happen here; see those files for why: reading
+// x29/rbp inside THIS function would read THIS function's own frame, one
+// level too deep). `*(ownFp)` is `bit_rt_panic`'s caller's frame pointer and
+// `*(ownFp+8)` is the return address INTO that caller (ABI.md §4, "Frame
+// chain") — exactly the panicking call site, which is frame 0 of the trace.
+// Bounded by `btMaxFrames` (Power of 10 rule 2); the real exit is `pc`
+// leaving the Bit portion of the stack, signalled the same way
+// `gcScanSnapshot` reads it: the frame-pointer chain stops growing.
+export @nosplit @symbol("bit_rt_port_root_bt_print_trace")
+fn btPrintTrace(fd: int, ownFp: int) {
+  let dbgBase = int(debugLinesBegin())
+  let dbgLen = int(debugLinesEnd()) - dbgBase
+  let fp = ownFp
+  let frame = 0
+  while (frame < btMaxFrames && btValidFp(fp)) {
+    let pc = loadWord(fp + 8)
+    let nextFp = loadWord(fp)
+    let found = btLookup(dbgBase, dbgLen, pc)
+    let n = btFormatFrame(pc, found)
+    bit_rt_port_root_io_write_all(fd, ioLineSlotAddr(), n)
+    if (nextFp <= fp) {
+      return
+    }
+    fp = nextFp
+    frame = frame + 1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in (#3285's hard constraint: `tests/cases/*.bit`'s `// panic` mode
+// compares stderr EXACTLY, so a new trace must land opt-in or every
+// `.expected` in the corpus updates in the same commit — hundreds of files
+// for a handful of lines of new runtime code is the wrong trade). Mirrors
+// `./rootconfig.bit`'s `BIT_GC_STATS` shape (`gcEnvValuePtr`/
+// `gcEnvKeyMatch`), duplicated rather than reused: that reader is not
+// `@nosplit` (called once at boot, before any safepoint machinery exists to
+// care), and an `@nosplit` caller may only call other `@nosplit` functions
+// (SPEC §10.3.1) — so a `BIT_BACKTRACE`-specific, `@nosplit`-legal reader is
+// written out here rather than widening `rootconfig.bit`'s attribute for one
+// caller on a different path with different constraints.
+// ---------------------------------------------------------------------------
+
+// "BIT_BACK" (8 bytes) + "TRACE" (5 bytes) = "BIT_BACKTRACE" (13 bytes),
+// packed little-endian, computed not hand-derived.
+const btEnvKeyWord0: int = 5423250129607215426
+const btEnvKeyWord1: int = 297481097812
+const btEnvKeyLen: int = 13
+
+// True if the `envp` entry at `entry` has key exactly `BIT_BACKTRACE`, i.e.
+// the 13 key bytes match and the byte right after is `=` (61) —
+// `./rootconfig.bit`'s `gcEnvKeyMatch`, but against a packed literal instead
+// of a `string` parameter (no `string` parameter may cross into `@nosplit`
+// code in this file; see this section's own header). Bounded by
+// `btEnvKeyLen`.
+@nosplit fn btEnvKeyMatch(entry: int): bool {
+  let i = 0
+  while (i < 8) {
+    if (loadByte(entry + i) != ((btEnvKeyWord0 >> (i * 8)) & 255)) {
+      return false
+    }
+    i = i + 1
+  }
+  while (i < btEnvKeyLen) {
+    if (loadByte(entry + i) != ((btEnvKeyWord1 >> ((i - 8) * 8)) & 255)) {
+      return false
+    }
+    i = i + 1
+  }
+  return loadByte(entry + btEnvKeyLen) == 61
+}
+
+// `BIT_BACKTRACE=1` enables the trace. Unset, or any other value, leaves it
+// off — the same "unset or unparsed leaves the default" rule
+// `./rootconfig.bit`'s header documents at length. Bounded by
+// `osMaxEnvCount`, the same cap `./os.bit`'s own env walks use.
+export @nosplit @symbol("bit_rt_port_root_bt_backtrace_enabled")
+fn btBacktraceEnabled(): bool {
+  let base = osEnvp()
+  let i = 0
+  while (i < osMaxEnvCount) {
+    let entry = loadWord(base + i * 8)
+    if (entry == 0) {
+      return false
+    }
+    if (btEnvKeyMatch(entry)) {
+      let vp = entry + btEnvKeyLen + 1
+      return loadByte(vp) == 49 && loadByte(vp + 1) == 0
+    }
+    i = i + 1
+  }
+  return false
+}
