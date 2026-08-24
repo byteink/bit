@@ -427,7 +427,7 @@ green differential as the stronger claim.
 resolver, so they cannot see a bug that only exists on the resolver-active
 path.** `--dump-ir-pre`/`--dump-ir`/`--dump-types` all reach `checkModule`
 through `lowerSourceModule`/`checkSourceDump` (`compiler/lowerdriver.bit:312`,
-`compiler/checkmodule.bit:480`) and never call `resolveModule`.
+`compiler/checkmodule.bit:490`) and never call `resolveModule`.
 `compiler/check.bit:163`'s own field comment says so: `nodeSymbols` is "[e]mpty
 on the bare dump entry points ... checkExprType falls back to the flat env
 there." `bit build`/`run`/`test`/`check`/`doc` all resolve first
@@ -497,17 +497,18 @@ default budget, `defaultTimeoutS` seconds (`stress.bit:185`), applied as its own
 wall-clock deadline to each of the program's three bounded subprocesses in
 turn — compile, the default-policy run, and the `BIT_GC=stress` run
 (`resolveTimeoutMs` folds the effective budget into a per-program `Ctx` at
-`stress.bit:568-584`, and `runScript`/`osRunBounded` re-apply it separately at
-each phase, `tests/bit/stress/verify.bit:221-233`, called from `buildProgram` at
-`tests/bit/stress/verify.bit:249` and `runOnce` at
-`tests/bit/stress/verify.bit:271`). `BIT_TEST_TIMEOUT_S` raises or lowers that
+`tests/bit/stress/stress.bit:479-495`, and `runScript`/`osRunBounded` re-apply it
+separately at each phase, `tests/bit/stress/verify.bit:263-289`, called from
+`buildProgram` at `tests/bit/stress/verify.bit:298` and `runOnce` at
+`tests/bit/stress/verify.bit:336`). `BIT_TEST_TIMEOUT_S` raises or lowers that
 default for the whole corpus. A program directory may instead hold a file
 named `timeout-s`, sitting beside the existing `no-collect`/`stress-waived`
 markers (`tests/stress/<name>/timeout-s`) — one line holding a single positive
 integer, the whole-program budget in seconds for that program only, trailing
 whitespace and a trailing newline both fine. Precedence is exactly:
 a valid `timeout-s` file wins over `BIT_TEST_TIMEOUT_S`, which wins over
-`defaultTimeoutS` (`timeoutSOverrideMs`/`resolveTimeoutMs`, `stress.bit:381-401`).
+`defaultTimeoutS` (`timeoutSOverrideMs`/`resolveTimeoutMs`,
+`tests/bit/stress/setup.bit:160-188`).
 A present-but-unparsable file fails that one program outright rather than
 silently falling back to the default — a typo must not quietly disable the
 deadline it was meant to set.
@@ -527,10 +528,10 @@ this file's mechanism). #2696 replaced the hardcode with the file and deleted
 is one mechanism now, not two.
 
 **A valid file always wins outright; the two never layer**
-(`resolveTimeoutMs`, `stress.bit:396-401`: an absent file falls through to
-`cx.timeoutMs`, i.e. `defaultTimeoutS` scaled by `BIT_TEST_TIMEOUT_S`/host
-load; a present one returns instead of adding to it). That non-layering is why
-migrating quicwire off the hardcode had to land in the same commit as the
+(`resolveTimeoutMs`, `tests/bit/stress/setup.bit:179-188`: an absent file falls
+through to `cx.timeoutMs`, i.e. `defaultTimeoutS` scaled by `BIT_TEST_TIMEOUT_S`/
+host load; a present one returns instead of adding to it). That non-layering is
+why migrating quicwire off the hardcode had to land in the same commit as the
 file: writing a `timeout-s` file for a program still covered by a name-based
 hook replaces its budget rather than widening it — #2696 itself would have
 halved quicwire's from 1200s to 600s had it shipped the file alone without
