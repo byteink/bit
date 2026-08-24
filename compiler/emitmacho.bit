@@ -41,10 +41,12 @@ fn emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool, debug:
   let rodata = newByteBuf()
   let data = newByteBuf()
   let gc = newByteBuf()
+  let dbg = newByteBuf()
   let symbols = []MachoSymbol(0)
   let relocs = []MachoRelocation(0)
   let defined = map<string, bool>{}
   let stackmaps = []FuncStackMap(0)
+  let debugLines = []FuncDebugLines(0)
   let emittedNames = []string(0)
   if (freestanding) {
     refuseManagedMetadata(module)?
@@ -111,6 +113,7 @@ fn emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool, debug:
       r = r + 1
     }
     stackmaps = append(stackmaps, emStackMapOf(fc))
+    debugLines = append(debugLines, emDebugLinesOf(fc))
     emittedNames = append(emittedNames, f.name)
     if (f.name == "main") {
       haveMain = true
@@ -144,6 +147,11 @@ fn emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool, debug:
       binding: MachoBinding.Global })
     defined["_bit_main"] = true
   }
+
+  // #3283: intern every distinct source file the debug-info rows below
+  // reference BEFORE the string-pool loop runs, so its headers cover them
+  // too — see internDebugFiles (compiler/emit.bit).
+  let dbgFileSyms = internDebugFiles(module, debugLines)
 
   // ---- string pool -> read-only bytes + a writable {ptr,len} header ------
   let si = 0
@@ -297,6 +305,16 @@ fn emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool, debug:
     smi = smi + 1
   }
 
+  // ---- Debug-info line table (runtime/ABI.md §4.2, #3283) -> __DATA,__bit_dbg
+  // Extracted to its own function (rather than inlined like the GcMeta block
+  // above) so this already-oversized function's own complexity doesn't grow
+  // further — see emitMachoDebugLines' own comment for the section itself.
+  let dbgOut = emitMachoDebugLines(dbg, debugLines, emittedNames, dbgFileSyms,
+    symbols, relocs, defined)
+  symbols = dbgOut.symbols
+  relocs = dbgOut.relocs
+  defined = dbgOut.defined
+
   // ---- module-level state (§11.11) -> writable __data / zero-fill __bss --
   // §11.11/§17.6 (#1630): a cell is never a pin, so a freestanding object keeps
   // its own module state LOCAL — no sibling may name it, and the mangled name
@@ -379,6 +397,12 @@ fn emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool, debug:
     sections = append(sections, MachoSection{ kind: MachoSectionKind.GcMeta,
       data: gc.bytes, size: 0, alignment: 8 })
   }
+  if (len(dbg.bytes) > 0) {
+    // 8-aligned: writeDebugLines' 16-byte header and 16-byte rows are already
+    // multiples of 8, so this needs no padding step either — see its comment.
+    sections = append(sections, MachoSection{ kind: MachoSectionKind.DbgMeta,
+      data: dbg.bytes, size: 0, alignment: 8 })
+  }
   if (len(rodata.bytes) > 0) {
     sections = append(sections, MachoSection{ kind: MachoSectionKind.Rodata,
       data: rodata.bytes, size: 0,
@@ -397,6 +421,58 @@ fn emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool, debug:
   }
   return writeMacho(MachoTarget.Aarch64, MachoObject{ sections: sections,
     symbols: symbols, relocations: relocs })?
+}
+
+// The mutated symbol/reloc/defined-set triple emitMachoDebugLines hands back
+// to emitMachoObject, since Bit gives a helper no way to mutate three of its
+// caller's locals in place across a call boundary — mirrors the shape
+// EmittedMethods/GlobalsSplit/ReadonlyPlacement already use in this file.
+class EmMachoDbgLines {
+  symbols: []MachoSymbol,
+  relocs: []MachoRelocation,
+  defined: map<string, bool>,
+}
+
+// Debug-info line table entries (runtime/ABI.md §4.2, #3283) -> __DATA,__bit_dbg.
+// A second, independent side table, same per-member/per-function-local-atom
+// shape as the GcMeta block in emitMachoObject (see writeDebugLines' own
+// comment) — never merged with it. A function with zero rows (emDebugLinesOf,
+// no source-mapped instruction at all) contributes no entry, so
+// dbgResult.funcIndices is not 1:1 with emittedNames by position; look the
+// owner up through it.
+fn emitMachoDebugLines(dbg: ByteBuf, debugLines: []FuncDebugLines,
+    emittedNames: []string, dbgFileSyms: map<int, int>, symbols: []MachoSymbol,
+    relocs: []MachoRelocation, defined: map<string, bool>): EmMachoDbgLines {
+  let dbgResult = writeDebugLines(dbg, debugLines)
+  let dbi = 0
+  while (dbi < len(dbgResult.relocOffsets)) {
+    let dbOff = dbgResult.relocOffsets[dbi]
+    let dbEnd = len(dbg.bytes)
+    if (dbi + 1 < len(dbgResult.relocOffsets)) {
+      dbEnd = dbgResult.relocOffsets[dbi + 1]
+    }
+    let dbName = emMac("__bitdbg_${dbi}")
+    symbols = append(symbols, MachoSymbol{ name: dbName, hasSection: true,
+      section: MachoSectionKind.DbgMeta, offset: dbOff, size: dbEnd - dbOff,
+      binding: MachoBinding.Local })
+    defined[dbName] = true
+    let owner = dbgResult.funcIndices[dbi]
+    relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.DbgMeta,
+      offset: dbOff, symbol: emMac(emittedNames[owner]),
+      kind: MachoRelocKind.Unsigned64 })
+    // Each row's file_hdr_ptr sits at (16-byte header) + rowIndex*(16-byte
+    // row) + 4 (past that row's own pcOffset field) — see writeDebugLines.
+    let rows = debugLines[owner].rows
+    let ri = 0
+    while (ri < len(rows)) {
+      relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.DbgMeta,
+        offset: dbOff + 20 + ri * 16, symbol: "___bitstr_${dbgFileSyms[rows[ri].file]}",
+        kind: MachoRelocKind.Unsigned64 })
+      ri = ri + 1
+    }
+    dbi = dbi + 1
+  }
+  return EmMachoDbgLines{ symbols: symbols, relocs: relocs, defined: defined }
 }
 
 // codegen's Reloc kinds map 1:1 onto the object writer's.
