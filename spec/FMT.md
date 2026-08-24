@@ -357,3 +357,105 @@ No other category named in this ticket was found unsettled: indentation
 formatter may move a comment (§4) each have a specific rule in the printer
 today, cited above, with nothing in `#2874`'s inventory or the four fix
 tickets contradicting it.
+
+## 11. Files `bit fmt` does not own — the exemption class (`#3654`, `#3670`, `#3671`)
+
+**Rule.** For any tracked `.bit` file, `bit fmt` either owns it entirely or
+the file is excluded from every `bit fmt --check`/`bit fmt` run used as a
+gate. There is no per-line skip pragma, so a file can never get a partial
+pass by hand-editing only the lines that would otherwise fail — quoting
+`#3654`'s own decision: "either `bit fmt` owns the file or it is excluded."
+A file earns exclusion only when its `bit fmt` diff genuinely **degrades**
+hand-built content that carries information — a column-aligned table a
+reader relies on — not merely because the file is large or has never been
+run through the formatter. `tools/build/gates.bit` is the standing
+counter-example: 463 of its 626 lines change under `bit fmt`, and none of it
+is a table — it is ordinary signature and struct-literal wrapping — so it is
+**not** exempt; it is tracked as ordinary, ungated debt by `#3670`'s
+`test-fmt-ceiling` ratchet instead, the same as every other file below that
+failed this bar.
+
+**The six exempt files** (verified 2026-08-24: `bit fmt --check` confirmed
+`rc=1` on the tracked file, then `bit fmt` run on a scratch copy and every
+changed line inspected).
+
+1. `runtime/stw/stwpoll.bit` — `safepointEntry`
+   (`runtime/stw/stwpoll.bit:563-564`)'s hand-encoded, disassembly-checked
+   x64/arm64 machine-code byte arrays. `bit fmt` reformats them from several
+   values per source line to one value per line, destroying the grouping the
+   file's own header describes as "hand-encoded and disassembly-checked."
+   `#3649`'s constraint on this file is stronger than a style preference —
+   "do not edit any byte array in `safepointEntry`" — so hand-running `bit
+   fmt -w` here is not an option even in principle, regardless of how the
+   rest of the file's diff reads.
+2. `runtime/root/linux/boottail.bit` — the `statsConst(...)` call chain that
+   builds the `[bit-gc]` startup line (`runtime/root/linux/boottail.bit:84`),
+   where each call's trailing `// "..."` comment is column-aligned so a
+   reader can see which packed string fragment lands where; `bit fmt`
+   collapses that alignment to a single space per call. The file also has a
+   hand-encoded byte array inside a `return asm volatile { ... }` boot
+   trampoline that `bit fmt` flattens the same way as `stwpoll.bit`'s.
+3. `runtime/sched/sched.bit` — `arm64 { ... }` / `x64 { ... }` byte-array
+   literals with a trailing mnemonic comment column-aligned across every
+   line of a block, e.g. `arm64 { 0xD2800000 }                    // mov x0,
+   #0` (`runtime/sched/sched.bit:198`); `bit fmt` collapses every one of them
+   to a single space before `//`. 110 of the file's 800 lines change.
+4. `runtime/sched/task.bit` — the same instruction-trap comment table,
+   repeated at three call sites (`runtime/sched/task.bit:223` is the first).
+5. `runtime/sched/timer.bit` — the same instruction-trap comment table, plus
+   a column-aligned `const` table (`runtime/sched/timer.bit:326-335`:
+   `ctState`/`ctChan`/`ctGen`/`ctNext`) whose multi-line comments continue
+   under the aligned comment column; `bit fmt` breaks each continuation line
+   out to its own `//` line at the base indent, losing the visual
+   continuation entirely.
+6. `runtime/sched/windows/spawn.bit` — one `arm64`/`x64` comment-aligned
+   pair with a wrapped continuation comment
+   (`runtime/sched/windows/spawn.bit:81`).
+
+**What this is not.** These six files are not "`runtime/` is exempt" —
+`runtime/` holds 134 `.bit` files, 95 of which currently fail `bit fmt
+--check` (verified 2026-08-24, `bit fmt --check runtime`), and only six of
+those 95 are excluded here. The other 89 are ordinary drift the ratchet must
+still catch, same as the 196 in `compiler/` and the 10 in `tools/`. It is
+also not a blanket pass for `runtime/sched/`: eight files initially proposed
+alongside these six were checked with the same bar and rejected, because
+none of them contains an `asm` block, a byte array, or any column-aligned
+comment/const table anywhere in the file — their `bit fmt --check` failure
+is ordinary over-length-signature wrapping (or, for one file, a single
+double-blank-line collapse) with nothing for the formatter to degrade:
+`runtime/sched/grow.bit`, `runtime/sched/queue.bit`,
+`runtime/sched/sleep.bit`, `runtime/sched/worker.bit`,
+`runtime/sched/workerrun.bit`, `runtime/sched/darwin/poll.bit`,
+`runtime/sched/linux/poll.bit`, `runtime/sched/windows/poll.bit`.
+`runtime/root/linux/boot.bit` and `runtime/root/windows/boot.bit` were
+checked for the same reason (both were proposed in an earlier draft of this
+list) and are ordinary import/signature/`if`-wrap drift too — not exempt.
+All ten of these are ordinary, ungated debt tracked by `#3670`'s
+`test-fmt-ceiling` ratchet like any other file in `compiler/`, `runtime/` or
+`tools/` that has never been run through `bit fmt`, and a future fix should
+run `bit fmt` on them normally rather than treat them as this section's
+exception.
+
+Nor is this exemption blanket permission to hand-format a *new* file outside
+`bit fmt`'s canonical style. A file earns exclusion only after the
+verification below, never by declaration up front, and never for a file
+that has not first been shown to fail `bit fmt --check` on its own merits.
+
+**Check:** `bit fmt --check` on each of the six files above exits 1 on the
+committed tree (by design — that is what makes exclusion necessary); none of
+the six is ever passed to `bit fmt --check` by `#3670`'s
+`test-fmt-ceiling` gate, which reads the exclusion set from
+`tools/build/fmt-exempt.txt` and skips exactly these paths.
+
+**Verification bar for adding another file to this list.** Diff the file
+under `bit fmt` on a scratch copy (`bit fmt <scratch-copy-path>`, not
+`--check`, which writes nothing) and confirm every changed line is
+column-alignment on an `asm`/byte-array/string-literal/`const` table that a
+reader relies on — not ordinary wrapping, not a stray whitespace collapse,
+not a redundant-paren removal (§7). A file with even one alignment-carrying
+line still needs the *whole* file excluded, since there is no per-line
+pass — but a file with zero such lines does not qualify no matter how large
+or how old its diff is. Record the check and the added path in the same
+commit that adds it to `tools/build/fmt-exempt.txt`, not a follow-up ticket —
+the pattern `#3654` closed out (`#3636`, `#3650`, `#3657`) was one ticket per
+file, and it does not scale.
