@@ -1,0 +1,279 @@
+// Shared two-wave shell-driver fan-out for a Bit test harness (#1901).
+//
+// `bit_rt_os_run_bounded` is NOT re-entrant: its child argv, wait-status cell
+// and timespec scratch are module-level globals with no lock
+// (`runtime/root/{linux,darwin}/os.bit`), sound only under the contract "a
+// `run` fully completes before any other `run` can begin"
+// (tests/bit/importsrun.bit's header explains this at length, having hit it
+// first under #2508). Booting N scheduler workers (#1900) does not change
+// this: two `spawn`ed tasks each calling `osRunBounded` would run on two
+// different OS threads and race on that shared state. So this process makes
+// exactly ONE `osRunBounded` call — one generated `/bin/sh` driver — and the
+// real concurrency lives entirely in the shell, via `xargs -P`. This module
+// factors that pattern out of `tests/bit/importsrun.bit` (which keeps its
+// own copy: it deliberately imports no `std/*`, see its header) so
+// `tests/bit/golden` and `tests/bit/examplesgate.bit` do not each re-derive
+// it — #2743/#2866 are the record of what three independently-maintained
+// copies of this exact shape already cost this repo once.
+//
+// A JOB is one subprocess invocation: an argv, a cwd, and a WAVE (1 or 2).
+// Every wave-1 job runs to completion — `xargs -P`, barriered — before any
+// wave-2 job starts. That barrier is the ETXTBSY defense importsrun.bit's
+// header documents: a write fd still open on a just-produced binary must be
+// closed before anything execs that inode. A harness with no compile->exec
+// dependency puts everything in wave 1 (golden's non-"run" directives,
+// every examplesgate build+run pair does need the split). Wave 2 exists for
+// exactly the "execute what wave 1 just compiled" case.
+//
+// Every job's scratch files are named from its caller-supplied UNIQUE key —
+// never a fixed path — so concurrent jobs cannot tear each other's output
+// (#3530: a fixed `/tmp` path did exactly that to a different harness).
+// `cleanupJob` removes every file a job could have created, on every exit
+// path; the caller calls it once grading is done, pass or fail.
+
+import { readFile, writeFile } from "std/fs"
+import { killTreeFnDef, pgrepPreflightScript } from "../../../tools/killtree"
+
+export const wave1: int = 1
+export const wave2: int = 2
+
+// One subprocess invocation to stage. `withEnv` controls whether the
+// generated wrapper exports BIT_STDLIB/BIT_LIBBITRT — false for executing a
+// case's OWN compiled binary, which must not inherit the compiler's env.
+export class Job {
+  key: string,
+  wave: int,
+  cwd: string,
+  argv: []string,
+  withEnv: bool,
+}
+
+// A graded result. `ran` is false only when the job's `.rc` file was never
+// written — the script never reached its own `echo … > rc`, which callers
+// must treat as a hard failure, never as empty output.
+export class JobResult {
+  ran: bool,
+  code: int,
+  out: string,
+  err: string,
+}
+
+// Everything `stageJob` needs beyond the job itself, grouped so the function
+// stays under the 5-param lint ceiling (E0202). `wdPath` is derived once so
+// every job's watchdog poll names the same shared symlink `runDriver` creates.
+export class FanCfg {
+  scratch: string,
+  wdPath: string,
+  timeoutMs: int,
+  stdlib: string,
+  libbitrt: string,
+}
+
+export fn newFanCfg(scratch: string, timeoutMs: int, stdlib: string, libbitrt: string): FanCfg {
+  return FanCfg{
+    scratch: scratch, wdPath: "${scratch}/bit-gate-watchdog",
+    timeoutMs: timeoutMs, stdlib: stdlib, libbitrt: libbitrt,
+  }
+}
+
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+fn jobBase(scratch: string, key: string): string { return "${scratch}/j-${key}" }
+fn outPath(scratch: string, key: string): string { return jobBase(scratch, key) + ".out" }
+fn errPath(scratch: string, key: string): string { return jobBase(scratch, key) + ".err" }
+fn rcPath(scratch: string, key: string): string { return jobBase(scratch, key) + ".rc" }
+fn shPath(scratch: string, key: string): string { return jobBase(scratch, key) + ".sh" }
+
+fn removeQuiet(path: string) {
+  fsRemove(path)
+}
+
+// Watchdog text: polls `kill -0 "$p"` once a second rather than sleeping the
+// whole budget once, so the success path notices `$p` is gone within ~1s
+// (importsrun.bit #2563/#3231's fix, reused verbatim in spirit). `wdPath` is
+// the shared `bit-gate-watchdog` symlink onto the real `sleep`, created once
+// by `driverPrelude` before any job forks — argv[0] must be that name for
+// the poll to survive a `/bin/sh` with no `exec -a` (dash rejects it,
+// #3231).
+fn watchdogText(wdPath: string, timeoutMs: int): string {
+  let secs = timeoutMs / 1000
+  return killTreeFnDef() +
+    "n=0; while kill -0 \"$p\" 2>/dev/null; do if [ \"$n\" -ge ${secs} ]; then killtree \"$p\"; break; fi; \"${wdPath}\" 1 || sleep 1; n=$((n + 1)); done"
+}
+
+// Writes ONE job's wrapper script: cd, export env if requested, background
+// the real command, race it against the watchdog, capture the wait status
+// (128+N on a signal death — the shell's own encoding) into `.rc`. Nothing
+// here executes anything; `runDriver` below makes the one real call.
+export fn stageJob(cfg: FanCfg, j: Job) {
+  let script = "#!/bin/sh\n"
+  if (j.cwd != "") {
+    script = script + "cd " + shQuote(j.cwd) + " || exit 125\n"
+  }
+  if (j.withEnv) {
+    if (cfg.stdlib != "") {
+      script = script + "export BIT_STDLIB=" + shQuote(cfg.stdlib) + "\n"
+    }
+    if (cfg.libbitrt != "") {
+      script = script + "export BIT_LIBBITRT=" + shQuote(cfg.libbitrt) + "\n"
+    }
+  }
+  let cmd = ""
+  let i = 0
+  while (i < len(j.argv)) {
+    cmd = cmd + shQuote(j.argv[i])
+    if (i < len(j.argv) - 1) {
+      cmd = cmd + " "
+    }
+    i = i + 1
+  }
+  let o = outPath(cfg.scratch, j.key)
+  let e = errPath(cfg.scratch, j.key)
+  let rc = rcPath(cfg.scratch, j.key)
+  script = script +
+    cmd +
+    " >" +
+    shQuote(o) +
+    " 2>" +
+    shQuote(e) +
+    " &\n" +
+    "p=$!\n( " +
+    watchdogText(cfg.wdPath, cfg.timeoutMs) +
+    " ) </dev/null >/dev/null 2>&1 &\n" +
+    "w=$!\nwait \"$p\"\nrc=$?\nkill \"$w\" 2>/dev/null\nwait \"$w\" 2>/dev/null\n" +
+    "echo \"$rc\" > ${shQuote(rc)}\nexit \"$rc\"\n"
+  writeFile(shPath(cfg.scratch, j.key), script) catch _ {
+    osExit(1)
+  }
+  fsChmod(shPath(cfg.scratch, j.key), 493) // 0o755
+}
+
+// Wave 1 then wave 2, each a barriered `find | xargs -P`: the second `find`
+// does not start a single fork until the first `xargs` has returned, which
+// is what keeps a wave-1 compile's write fd closed before any wave-2 exec.
+// One driver, one `osRunBounded` call for the WHOLE batch.
+fn driverScript(scratch: string, wdPath: string): string {
+  return "#!/bin/sh\n" +
+    pgrepPreflightScript("job", "the outer run bound") +
+    "ln -sf \"$(command -v sleep)\" " +
+    shQuote(wdPath) +
+    " 2>/dev/null\n" +
+    "N=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)\n" +
+    "find " +
+    shQuote(scratch) +
+    " -maxdepth 1 -name 'j-*.w1.sh' -print0 | xargs -0 -P \"$N\" -n1 sh -c 'exec \"$0\"'\n" +
+    "rc1=$?\n" +
+    "find " +
+    shQuote(scratch) +
+    " -maxdepth 1 -name 'j-*.w2.sh' -print0 | xargs -0 -P \"$N\" -n1 sh -c 'exec \"$0\"'\n" +
+    "rc2=$?\n" +
+    "if [ \"$rc1\" -eq 0 ] && [ \"$rc2\" -eq 0 ]; then exit 0; fi\nexit 1\n"
+}
+
+// `stageJob` writes every script at `j-<key>.sh`; the driver globs by wave
+// suffix, so this renames each staged script to carry its own wave in the
+// name. Kept as a separate, tiny step rather than baking the suffix into
+// `jobBase` so every other path helper (out/err/rc) stays wave-agnostic.
+export fn commitWave(scratch: string, key: string, wave: int) {
+  let src = shPath(scratch, key)
+  let suffix = ".w1.sh"
+  if (wave == wave2) {
+    suffix = ".w2.sh"
+  }
+  let dst = jobBase(scratch, key) + suffix
+  fsRename(src, dst)
+}
+
+// Runs the one outer `osRunBounded` call over the whole batch. `outerTimeoutMs`
+// must already be sized generously (both waves, worst-case serial) by the
+// caller — this function only executes what it is told to.
+export fn runDriver(scratch: string, outerTimeoutMs: int): int {
+  let wdPath = "${scratch}/bit-gate-watchdog"
+  let driverSh = "${scratch}/driver.sh"
+  writeFile(driverSh, driverScript(scratch, wdPath)) catch _ {
+    osExit(1)
+  }
+  fsChmod(driverSh, 493) // 0o755
+  let r = osRunBounded(driverSh, outerTimeoutMs)
+  fsRemove(driverSh)
+  fsRemove(wdPath)
+  return r
+}
+
+// Reads a job's `.rc`/`.out`/`.err` back and decodes the wait status into the
+// same sentinel convention `osRunBounded` itself uses (ABI.md §19), so a
+// caller ported from a direct `osRunBounded` call keeps its existing
+// branches: 0..255 a real exit, -2 the watchdog's own SIGKILL (137), <= -100
+// a signal death, and `ran: false` when no `.rc` file exists at all (the
+// script never got that far).
+export fn gradeJob(scratch: string, key: string): JobResult {
+  let rc = readWait(rcPath(scratch, key))
+  if (rc < 0) {
+    return JobResult{ ran: false, code: -1, out: "", err: "" }
+  }
+  let code = rc
+  if (rc == 137) {
+    code = 0 - 2
+  } else if (rc > 128) {
+    code = 0 - 100 - (rc - 128)
+  }
+  let o = readText(outPath(scratch, key))
+  let e = readText(errPath(scratch, key))
+  return JobResult{ ran: true, code: code, out: o, err: e }
+}
+
+fn readText(path: string): string {
+  return readFile(path) catch _ {
+    ""
+  }
+}
+
+// Parses a `.rc` file the way `echo "$rc" > file` writes it. Missing, empty
+// or unparsable composes into -1 with no separate branch — a job that never
+// ran is graded identically to one whose script wrote garbage.
+fn readWait(path: string): int {
+  let s = readFile(path) catch _ {
+    ""
+  }
+  if (len(s) == 0) {
+    return -1
+  }
+  if (s[len(s) - 1] == 10) {
+    s = s[0:len(s) - 1]
+  }
+  if (len(s) == 0 || len(s) > 4) {
+    return -1
+  }
+  let v = 0
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c < 48 || c > 57) {
+      return -1
+    }
+    v = v * 10 + int(c) - 48
+    i = i + 1
+  }
+  return v
+}
+
+// Removes every file a job could have produced, whichever wave it landed in.
+export fn cleanupJob(scratch: string, key: string) {
+  removeQuiet(jobBase(scratch, key) + ".w1.sh")
+  removeQuiet(jobBase(scratch, key) + ".w2.sh")
+  removeQuiet(outPath(scratch, key))
+  removeQuiet(errPath(scratch, key))
+  removeQuiet(rcPath(scratch, key))
+}

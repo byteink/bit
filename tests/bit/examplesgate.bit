@@ -5,7 +5,7 @@
 // that the binary it produces EXITS 0. There are no directives and no
 // `.expected` files: an example is a showcase, not an output oracle, so the
 // only contract is "the showcase does not rot as the language grows". Output
-// correctness stays the golden corpus's job (tests/bit/golden.bit).
+// correctness stays the golden corpus's job (tests/bit/golden).
 //
 // Run it: `bit run tests/bit/examplesgate.bit` from the repository root.
 // Configure it by environment, since `bit run` forwards no argv to the program:
@@ -31,14 +31,28 @@
 // A hang is a failure, not a stall (#1637/#1652): every child carries a
 // wall-clock deadline and a child killed by a signal is reported as a CRASH,
 // never as a timeout — scoring a segfault as a timeout sends the reader hunting
-// the wrong bug. Unlike the deleted harness, whose compile ran in-process, the
-// COMPILER is bounded here too.
+// the wrong bug.
+//
+// PARALLELISED (#1901) via tests/bit/gatefanout: build then run are two
+// barriered waves (`gatefanout.wave1`/`wave2`) fanned out in a single
+// generated shell driver, exactly the pattern #2508 landed for
+// tests/bit/importsrun.bit and for the identical reason — see that
+// module's header for why a `spawn`ed pool cannot safely call
+// `osRunBounded` itself. `runAll` below now has exactly THREE passes over
+// `cases` — stage, run the one driver, grade — instead of one interleaved
+// loop; every pass visits cases in the SAME discovery order, so the report
+// is byte-identical regardless of which build or run happened to finish
+// first inside the shell's `xargs -P`.
 
-import { exists, isDir, readDir, readFile, writeFile } from "std/fs"
+import { exists, isDir, readDir } from "std/fs"
 import { envOr, exit } from "std/os"
 import { join } from "std/path"
 import { parseInt } from "std/strings"
 import { now } from "std/time"
+import {
+  FanCfg, Job, JobResult, cleanupJob, commitWave, gradeJob,
+  newFanCfg, runDriver, stageJob, wave1, wave2,
+} from "./gatefanout"
 
 // Exactly how many example modules there must be. See the header: this is a
 // pin, not a bound.
@@ -51,8 +65,9 @@ const defaultTimeoutS: int = 300
 const maxTimeoutS: int = 3600
 const timeoutEnvVar: string = "BIT_TEST_TIMEOUT_S"
 
-// `osRunBounded`'s result encoding (ABI.md §19). `<= rcSignalBase` means the
-// child died of signal `-(r) - 100`.
+// `osRunBounded`'s result encoding (ABI.md §19), reused verbatim by
+// `gatefanout.gradeJob`. `<= rcSignalBase` means the child died of signal
+// `-(r) - 100`.
 const rcSpawnFailed: int = -1
 const rcTimedOut: int = -2
 const rcSignalBase: int = -100
@@ -107,25 +122,105 @@ fn discover(dir: string): []string {
   return cases
 }
 
-// Runs every example and returns the process exit code: 0 all green, 1 a real
-// failure, 2 at least one TIMED OUT. Exit 2 is "could not decide", matching
-// scripts/x64gate.sh and scripts/selfhost-diffexamples.sh — a hang decided
-// nothing and is not a pass, and a caller can tell the two apart.
+fn buildKey(idx: int): string { return "b${idx}" }
+fn runKey(idx: int): string { return "r${idx}" }
+fn binOutPath(scratch: string, idx: int): string { return "${scratch}/ex-${idx}.bin" }
+
+// Stages both jobs for every case: compile (wave 1) and, unconditionally,
+// execute the binary compile would produce (wave 2). A case whose compile
+// fails simply produces no binary — its run job then fails to exec and
+// `gradeExample` never even looks at that result, because it grades the
+// build outcome first and returns before touching the run outcome, same as
+// the pre-#1901 serial code did.
+fn stageExample(cfg: FanCfg, dir: string, bin: string, name: string, idx: int) {
+  let src = join(dir, name)
+  let out = binOutPath(cfg.scratch, idx)
+  stageJob(
+    cfg,
+    Job{
+      key: buildKey(idx), wave: wave1, cwd: "",
+      argv: [bin, "build", src, "-o", out], withEnv: true,
+    },
+  )
+  commitWave(cfg.scratch, buildKey(idx), wave1)
+  stageJob(
+    cfg,
+    Job{
+      key: runKey(idx), wave: wave2, cwd: "",
+      argv: [out], withEnv: false,
+    },
+  )
+  commitWave(cfg.scratch, runKey(idx), wave2)
+}
+
+// Grades one case from its two graded jobs and prints its verdict. Returns
+// one of the `outcome*` constants.
+fn gradeExample(scratch: string, name: string, idx: int): int {
+  let br = gradeExampleJob(scratch, buildKey(idx))
+  if (br != outcomeOk) {
+    let r = reportJob(name, "build", scratch, buildKey(idx))
+    cleanupJob(scratch, buildKey(idx))
+    cleanupJob(scratch, runKey(idx))
+    fsRemove(binOutPath(scratch, idx))
+    return r
+  }
+  cleanupJob(scratch, buildKey(idx))
+  let rr = gradeExampleJob(scratch, runKey(idx))
+  fsRemove(binOutPath(scratch, idx))
+  if (rr != outcomeOk) {
+    let r = reportJob(name, "run", scratch, runKey(idx))
+    cleanupJob(scratch, runKey(idx))
+    return r
+  }
+  cleanupJob(scratch, runKey(idx))
+  print("ok ${name}\n")
+  return outcomeOk
+}
+
+// outcomeOk if the job's raw exit code is 0; any other outcome is left to
+// `reportJob` to classify and print, so this stays a pure predicate.
+fn gradeExampleJob(scratch: string, key: string): int {
+  let jr = gradeJob(scratch, key)
+  if (jr.ran && jr.code == 0) {
+    return outcomeOk
+  }
+  return outcomeFailed
+}
+
+// Stages every case (wave 1 + wave 2 scripts on disk, nothing run yet), makes
+// the ONE outer `osRunBounded` call, then grades every case in discovery
+// order — so the report is deterministic no matter which case's shell job
+// happened to finish first.
 fn runAll(bin: string, dir: string, cases: []string, timeoutMs: int): int {
-  let failed = 0
-  let timedOut = 0
+  let scratch = scratchRoot()
+  if (fsMkdir(scratch) < 0) {
+    eprint("examplesgate: cannot create scratch directory ${scratch}\n")
+    exit(1)
+  }
+  let cfg = newFanCfg(scratch, timeoutMs, "", "")
   let i = 0
   while (i < len(cases)) {
-    let r = runExample(bin, dir, cases[i], i, timeoutMs)
+    stageExample(cfg, dir, bin, cases[i], i)
+    i = i + 1
+  }
+
+  let outerMs = 2 * len(cases) * timeoutMs + 60000
+  runDriver(scratch, outerMs)
+
+  let failed = 0
+  let timedOut = 0
+  i = 0
+  while (i < len(cases)) {
+    let r = gradeExample(scratch, cases[i], i)
     if (r == outcomeTimedOut) {
       timedOut = timedOut + 1
     } else if (r == outcomeFailed) {
       failed = failed + 1
-    } else {
-      print("ok ${cases[i]}\n")
     }
     i = i + 1
   }
+  fsRemove(scratch)
+
   if (timedOut > 0) {
     eprint("examplesgate: FAILED — ${timedOut} timed out, ${failed} failed\n")
     return 2
@@ -138,84 +233,38 @@ fn runAll(bin: string, dir: string, cases: []string, timeoutMs: int): int {
   return 0
 }
 
-// Builds `<dir>/<name>` and runs the binary, as two separately bounded
-// children so that compile-fail, hang, crash and non-zero-exit stay four
-// distinct outcomes. Returns one of the `outcome*` constants.
-fn runExample(bin: string, dir: string, name: string, idx: int, timeoutMs: int): int {
-  // A nonce per example: a FIXED /tmp name is the clobber/ETXTBSY shape #1459
-  // records, and concurrent agents running this gate is routine here. Mirrors
-  // the compiler's own `scratchNonce`.
-  let base = "/tmp/bit-exgate-${name}-${now().ns}-${idx}"
-  let out = "${base}.bin"
-  let src = join(dir, name)
-
-  let buildCmd = "exec \"${bin}\" build \"${src}\" -o \"${out}\""
-  let br = runBounded("${base}-build.sh", "${base}-build.log", buildCmd, timeoutMs)
-  if (br != 0) {
-    fsRemove(out)
-    return report(name, "build", br, "${base}-build.log")
-  }
-  fsRemove("${base}-build.log")
-
-  // `exec` in the script makes the shell BECOME the example binary, so the
-  // exit code and any fatal signal belong to the example itself; the
-  // redirection keeps 51 programs' output out of the report unless one fails.
-  let rr = runBounded("${base}-run.sh", "${base}-run.log", "exec \"${out}\"", timeoutMs)
-  fsRemove(out)
-  if (rr != 0) {
-    return report(name, "run", rr, "${base}-run.log")
-  }
-  fsRemove("${base}-run.log")
-  return outcomeOk
-}
-
-// Writes `cmd` into an executable `/bin/sh` script and runs it under a
-// deadline, with the script's output captured in `log`.
-//
-// The script exists only because `osRunBounded` takes a path and NO argv
-// (ABI.md §19), so a command WITH arguments cannot be expressed directly. An
-// argv-taking bounded-spawn primitive would delete this function and the POSIX
-// shell it puts on the path of a toolchain that otherwise needs none.
-fn runBounded(script: string, log: string, cmd: string, timeoutMs: int): int {
-  writeFile(script, "#!/bin/sh\nexec >\"${log}\" 2>&1\n${cmd}\n") catch e {
-    eprint("examplesgate: cannot write ${script}: ${e.message()}\n")
-    return rcSpawnFailed
-  }
-  if (fsChmod(script, 493) != 0) {
-    eprint("examplesgate: cannot make ${script} executable\n")
-    fsRemove(script)
-    return rcSpawnFailed
-  }
-  let r = osRunBounded(script, timeoutMs)
-  fsRemove(script)
-  return r
-}
-
 // Names one example's failure on stderr and classifies it. `phase` is "build"
 // or "run", so a compiler that refuses is never confused with a program that
 // exits non-zero.
-fn report(name: string, phase: string, r: int, log: string): int {
+fn reportJob(name: string, phase: string, scratch: string, key: string): int {
+  let jr = gradeJob(scratch, key)
+  if (!jr.ran) {
+    eprint("example '${name}': could not spawn ${phase}\n")
+    return outcomeFailed
+  }
+  let r = jr.code
   if (r == rcTimedOut) {
     eprint("example '${name}': TIMED OUT in ${phase}\n")
     eprint("  killed at the ${timeoutEnvVar} deadline; raise it on a slower host\n")
-    fsRemove(log)
     return outcomeTimedOut
   }
   if (r <= rcSignalBase) {
     eprint("example '${name}': CRASHED in ${phase} — ${signalName(0 - r + rcSignalBase)}\n")
-  } else if (r == rcSpawnFailed) {
-    eprint("example '${name}': could not spawn ${phase}\n")
   } else {
     eprint("example '${name}': ${phase} exited with ${r}\n")
   }
-  let text = readFile(log) catch _ {
-    ""
+  printJobOutput(name, phase, jr)
+  return outcomeFailed
+}
+
+fn printJobOutput(name: string, phase: string, jr: JobResult) {
+  let text = jr.err
+  if (len(jr.out) > 0) {
+    text = text + jr.out
   }
   if (len(text) > 0) {
     eprint("--- ${name} ${phase} output ---\n${text}\n")
   }
-  fsRemove(log)
-  return outcomeFailed
 }
 
 // The signal numbers worth naming. Anything else reports its number, which is
@@ -262,4 +311,12 @@ fn timeoutSeconds(): int {
     return maxTimeoutS
   }
   return n
+}
+
+fn scratchRoot(): string {
+  let base = envOr("TMPDIR", "/tmp")
+  if (base[len(base) - 1] == 47) {
+    base = base[0:len(base) - 1]
+  }
+  return "${base}/bit-examplesgate-${now().ns}"
 }
