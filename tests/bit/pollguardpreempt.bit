@@ -55,7 +55,7 @@ import { exit } from "std/os"
 import { newWaitGroup, WaitGroup } from "std/sync"
 import { monotonic, sleep, Millisecond, Second } from "std/time"
 import {
-  schedCurrentWorker, taskAt, wkId,
+  schedCurrentWorker, taskAt, wkId, schedMaxWorkers,
   preemptStamp, sysmonTick, preemptRequested, preemptBudgetNs,
 } from "../../runtime/sched"
 
@@ -98,6 +98,52 @@ fn waitForStart(started: []i64) {
   }
 }
 
+// Race-free setup proof by ELIMINATION (smash #3609): reset every OTHER
+// worker slot's clock immediately before stamping wid, so the caller's
+// flagged-count check is not satisfied by ambient noise, then deliberately
+// backdate wid's own clock and return sysmonTick's own return value -- the
+// only race-free signal available (see the caller's own comment on why a
+// direct preemptRequested(wid) read here is racy against the guard under
+// test). Bounded by schedMaxWorkers (32, a compile-time constant, Power of
+// 10). Stamping an idle slot (no task ever dispatched there — this program
+// spawns exactly one task besides main) is harmless: preempt.bit's only
+// other reader of startNs is the scheduler's own dispatch-time preemptStamp
+// call, which simply overwrites it again if that slot is ever really used.
+//
+// MUTATION-TESTED, two failure modes closed, one NOT (documented here
+// rather than silently narrowed, per this ticket):
+//   - CLOSED: preemptStamp given an insufficient backdate for wid itself
+//     (simulating broken preemptStamp/sysmonTick arithmetic) — 5/5 caught
+//     with this elimination loop, vs 2/3 with an earlier controller-only-
+//     reset revision, because the CALLING task's own waitForStart+settle-
+//     sleep stretch can independently put ITS OWN worker over
+//     preemptBudgetNs and mask the bug via ambient noise.
+//   - NOT CLOSED: preemptStamp given a WRONG (but valid, in-range) worker
+//     index instead of wid — false-PASSED 3/3 even with this elimination
+//     loop, because the wrongly-targeted slot's own artificial stamp
+//     satisfies `flagged >= 1` exactly like a correct one would. No
+//     aggregate count can distinguish "wid was flagged" from "some other
+//     single worker was flagged instead" — that needs either a race-free
+//     PER-WORKER read (no such accessor is exported from preempt.bit
+//     today) or reading preemptRequested(wid) directly, which is exactly
+//     the racy read this fix removes. This narrow class (a bug in the
+//     literal worker-index argument at this function's own preemptStamp(wid,
+//     ...) call, as opposed to a bug in preemptStamp/sysmonTick's own
+//     arithmetic) is left uncaught by this self-check.
+fn armPreemptFor(wid: i64): i64 {
+  let w = 0
+  while (w < schedMaxWorkers) {
+    if (w != wid) {
+      preemptStamp(w, monotonic().ns)
+    }
+    w = w + 1
+  }
+  // A second task (this one) sets the preempt flag directly, the same way
+  // sysmonTick's own OS thread would after preemptBudgetNs of real time.
+  preemptStamp(wid, monotonic().ns - preemptBudgetNs - 1)
+  return sysmonTick(monotonic().ns)
+}
+
 fn main() {
   let started = []i64(1)
   let testDone = []i64(1)
@@ -115,14 +161,20 @@ fn main() {
     exit(1)
   }
 
-  // A second task (this controller) sets the preempt flag directly, the same
-  // way sysmonTick's own OS thread would after preemptBudgetNs of real time.
-  preemptStamp(wid, monotonic().ns - preemptBudgetNs - 1)
-  let flagged = sysmonTick(monotonic().ns)
-  if (!preemptRequested(wid)) {
+  // `flagged` (sysmonTick's own return value, via armPreemptFor -- see its
+  // doc comment for the full race-freeness and mutation-testing rationale)
+  // is the setup-correctness signal here, deliberately NOT a direct read of
+  // preemptRequested(wid) (smash #3609: that used to be this check, and it
+  // false-failed once under heavy fleet contention, "setup broken ...
+  // preemptRequested(0) is false right after sysmonTick flagged 2
+  // worker(s)" -- a fast, CORRECT guard clearing the flag before this
+  // thread's next instruction runs). `flagged == 0` here can only mean
+  // sysmonTick's own scan is broken, never that the guard raced ahead.
+  let flagged = armPreemptFor(wid)
+  if (flagged == 0) {
     atomicStore(ptrOf(testDone), 1)
     wg.wait()
-    println("pollguardpreempt: FAIL — setup broken, not the guard under test: preemptRequested(${wid}) is false right after sysmonTick flagged ${flagged} worker(s)")
+    println("pollguardpreempt: FAIL — setup broken, not the guard under test: sysmonTick flagged 0 worker(s) despite worker ${wid} being deliberately backdated past preemptBudgetNs via preemptStamp")
     exit(1)
   }
 
@@ -130,7 +182,13 @@ fn main() {
   // uses) for the COMPILED guard to observe and clear it. Only
   // compiler/arm64call.bit's emitInlinedPreemptCheck reaching bit_rt_safepoint
   // -> schedMaybeYieldForPreempt -> maybePreempt can make this clear — that
-  // is the actual thing under test.
+  // is the actual thing under test. It is legitimate for `cleared` to go
+  // true on the very FIRST check below: the `flagged >= 1` proof above
+  // already establishes the flag really was set for wid specifically, and
+  // the only thing that clears requested[wid] while the mutator's task is
+  // still alive is that same guard's maybePreempt call — so an instant
+  // "already false" here means the guard won the race, not that setup was
+  // skipped.
   let deadline = monotonic().ns + 2 * Second
   let cleared = false
   while (!cleared && monotonic().ns < deadline) {
