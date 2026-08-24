@@ -154,8 +154,14 @@ PLATFORM_PAIRS="alloc cryptohw gc net park rand root sched thread"
 # here in the same commit. `net` lands with #3340 (AcceptEx/ConnectEx/
 # WSARecv/WSASend on top of #3339's poller, runtime/net/windows/**) —
 # the #3386 failure mode this comment already documents, caught before it
-# bit this time.
-WINDOWS_PAIRS="alloc gc net park rand root sched thread"
+# bit this time. `cryptohw` lands with #3588: `runtime/cryptohw/windows/`
+# implements `bit_rt_crypto_hwcaps` (reporting no hardware acceleration,
+# matching x86_64-linux's own actual answer — see that file's header), which
+# was the E0078 link failure blocking any `std/tls` program from building for
+# x86_64-windows at all (#3340's finding). The same #3386 failure mode this
+# comment already documents: the directory existing on disk is not enough,
+# it must be listed here too.
+WINDOWS_PAIRS="alloc cryptohw gc net park rand root sched thread"
 
 case "$PLAT" in
   windows) PAIRS_FOR_PLAT="$WINDOWS_PAIRS" ;;
