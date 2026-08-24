@@ -171,21 +171,37 @@ want a higher version - only names with no entry yet are filled in.
 ## `bit up` / `bit update`
 
 ```
-bit up [name] [--dir <path>]
-bit update [name] [--dir <path>]
+bit up [name] [--dir <path>] [--latest]
+bit update [name] [--dir <path>] [--latest]
 ```
 
 `update` is an exact alias. With no `name`, re-resolves every dependency
-`bit.json` names against its *current* ref - picking up a moved branch tip or
-re-verifying a tag - and rewrites `bit.lock` with the refreshed commits and
-transitive requirements. With a `name`, restricts the refresh to that one
-dependency. Either way, `bit.json` itself is never touched: the ref an entry
-names only changes if you edit it by hand.
+`bit.json` names; with a `name`, restricts the refresh to that one
+dependency. `bit.lock`'s resolved commit, version and transitive
+requirements move; a branch ref picks up its tip's new HEAD, a bare-sha or
+exact pin re-verifies unchanged, and a `^`/`~` constraint moves to the
+**highest tag still satisfying that same constraint** - the newest version
+available WITHOUT changing what `bit.json` says. `bit.json` itself is never
+touched by plain `bit up`.
 
 ```console
 $ bit up quicwire
-bit up: quicwire -> v1.4.2 (a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2)
+bit up: quicwire -> ^1.2.0 (a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2)
 ```
+
+`--latest` additionally rewrites the moved dependency's `bit.json` constraint
+to `^<newest published version>` - crossing whatever ceiling the old
+constraint had. This is the only way to leave a range; it can break the
+build, so it is never implicit. An exactly-pinned dependency, which plain
+`bit up` never moves at all, is exactly the case `--latest` exists for:
+
+```console
+$ bit up quicwire --latest
+bit up: quicwire -> ^2.1.0 (f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1)
+```
+
+A local-path dependency and a branch/bare-sha ref have no version constraint
+to widen; `--latest` is a no-op for them beyond plain `bit up`'s own refresh.
 
 ## `bit outdated`
 
