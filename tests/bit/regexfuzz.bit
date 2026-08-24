@@ -1,0 +1,577 @@
+// Mutation fuzzer + saved-crash replay for std/regex's pattern parser and
+// matcher (#2038, epic #2025).
+//
+// SAME MECHANISM AS tests/bit/fuzz.bit, PORTED, NOT SHARED. #2038's
+// constraint is "don't invent a second fuzzing mechanism", which this file
+// reads as: reuse the shape (seeded xorshift64 PRNG, byte-level mutation, an
+// osRunBounded-bounded child per candidate, the slow-vs-hung adjudication,
+// crash harvesting) rather than the code. bitlang-ws/CLAUDE.md's own
+// precedent for this is #3587's `stressparallel.bit`, whose commit message
+// says it explicitly: "port the mechanism ... rather than inventing a second
+// one". A single shared module was considered and rejected here: fuzz.bit's
+// `classify()` treats any non-crash exit as `ok` (a compiler's diagnostic
+// exit 1 is a pass), while this file's candidates have exactly one passing
+// exit code (0) and treat every other one as a finding (regexfuzzcase.bit's
+// header) — forcing that into one shared `classify` would have made the
+// compiler fuzzer's own semantics a parameter of a regex-specific decision,
+// which is the wrong direction to couple two independently-owned harnesses.
+//
+// THE CANDIDATE ITSELF NEVER RUNS IN THIS PROCESS. Each iteration writes a
+// pattern to `BIT_REGEXFUZZ_WORK`, then bounds a fresh `bit run
+// tests/bit/regexfuzzcase.bit <work>` subprocess with `osRunBounded`
+// (ABI.md §19). std/regex's `compile`/`matches`/`find`/`findAll` are
+// ordinary importable stdlib calls and could run in-process, but a real bug
+// in the Pike VM (pike.bit) is exactly what this campaign is hunting for,
+// and an in-process infinite loop or memory-safety crash would take the
+// whole fuzzer down with it, with no saved artifact and no adjudication.
+// Subprocess isolation is what turns "the fuzzer died" into "iteration N,
+// pattern in tests/fuzz/regexcrashes/<hash>.regex".
+//
+// PATTERN GENERATION (#2038 item 1). Half the iterations mutate a seed from
+// `BIT_REGEXFUZZ_CASES` with fuzz.bit's own byte flip/insert/delete
+// (`mutate`, ported verbatim — it is domain-agnostic, and a pattern's bytes
+// mutate the same way a program's do). The other half calls `genAdversarial`:
+// pure random bytes (including 0x80-0xFF, so invalid UTF-8 patterns are
+// generated directly, not just as match subjects), unbalanced brackets, deep
+// nesting, a long counted repeat, and — specifically for the compile-cap
+// invariant (#2038's last paragraph) — the exact pathological shape
+// `stdlib/regex/prog.bit`'s own header names as the worst case,
+// `((a{N}){M}){K}`, with N/M/K sized so the literal expansion is usually
+// deep in six-to-seven-figure instruction territory: `emitInst`
+// (prog.bit) must reject it before `progInstCap` (20000) is reached, every
+// time.
+//
+// THE COMPILE-CAP CHECK IS NECESSARILY INDIRECT for the instruction count
+// half of it. `Prog` (prog.bit) is not exported — regex.bit's header says so
+// on purpose, "Regex is this ticket's only public surface" — so nothing
+// outside stdlib/regex/ can read `re.prog`'s length, and this ticket's own
+// constraints forbid editing stdlib/regex/ to add an accessor (that is
+// #2052's territory tonight, and a fuzz ticket that also changes the
+// matcher's public surface is two tickets in one diff). What IS checked
+// directly (regexfuzzcase.bit): a pattern over the documented 4096-byte cap
+// must never compile. What is checked INDIRECTLY for the instruction cap: a
+// `((a{N}){M}){K})` pattern whose literal-expansion cost is far past 20000
+// must be REJECTED with a "regex: " error (regexfuzzcase.bit's item-2 check
+// already requires that of every rejection) — and if the cap were ever
+// bypassed and such a pattern compiled anyway, the resulting allocation is
+// large enough that this file's own hang/crash oracle is the backstop: a
+// genuine cap escape either overruns `hangMs` (reported as a hang) or
+// exhausts memory (a crash), both of which this file already treats as
+// findings. This is weaker than a direct instruction count and is reported
+// as such below, not silently assumed complete.
+//
+//   BIT_REGEXFUZZ_BIN        compiler under test        (default bit-out/bin/bit)
+//   BIT_REGEXFUZZ_CASE       the one-shot case runner   (default tests/bit/regexfuzzcase.bit)
+//   BIT_REGEXFUZZ_CASES      seed pattern corpus        (default tests/fuzz/regexcases)
+//   BIT_REGEXFUZZ_CRASHES    saved-crash corpus         (default tests/fuzz/regexcrashes)
+//   BIT_REGEXFUZZ_WORK       scratch directory          (default /tmp/bit-regexfuzz)
+//   BIT_REGEXFUZZ_SECONDS    wall-clock budget, > 0     (default 60)
+//   BIT_REGEXFUZZ_SEED       PRNG seed, for replay      (default the wall clock)
+//   BIT_REGEXFUZZ_TIMEOUT_MS per-input budget FLOOR     (default 10000)
+//   BIT_REGEXFUZZ_HANG_MS    non-termination ceiling    (default 120000)
+
+import { readFile, writeFile, walk, exists, isDir, mkdir } from "std/fs"
+import { envOr, exit } from "std/os"
+import { monotonic, now, Second, Millisecond, since } from "std/time"
+import { hasSuffix, parseInt, repeat } from "std/strings"
+
+// --- bounds (Power of 10 rule 2: every loop below is provably finite) -------
+
+const maxInputLen: int = 65536
+const maxMutationsPerInput: int = 8
+const maxIterations: int = 50000000
+const maxCorpusFiles: int = 4096
+const hangFactor: int = 8
+const defaultHangMs: int = 120000
+const slowCreditCapMs: int = 120000
+
+// --- failure ----------------------------------------------------------------
+
+fn die(msg: string) {
+  print("FAIL: ${msg}\n")
+  exit(1)
+}
+
+fn mustRead(path: string): string {
+  return readFile(path) catch e {
+    die("read ${path}: ${e.message()}")
+    ""
+  }
+}
+
+fn mustWrite(path: string, content: string) {
+  writeFile(path, content) catch e {
+    die("write ${path}: ${e.message()}")
+  }
+}
+
+fn mustInt(name: string, fallback: int): int {
+  let raw = envOr(name, "")
+  if (len(raw) == 0) {
+    return fallback
+  }
+  return parseInt(raw) catch e {
+    die("${name}=${raw} is not an integer: ${e.message()}")
+    0
+  }
+}
+
+// --- PRNG (fuzz.bit's xorshift64, ported verbatim) --------------------------
+
+fn nextU64(st: []u64): u64 {
+  let x = st[0]
+  x = x ^ (x << 13)
+  x = x ^ (x >> 7)
+  x = x ^ (x << 17)
+  st[0] = x
+  return x
+}
+
+fn nextBelow(st: []u64, n: int): int {
+  if (n <= 1) {
+    return 0
+  }
+  return int(nextU64(st) % u64(n))
+}
+
+fn nextByte(st: []u64): u8 {
+  return u8(int(nextU64(st) % u64(256)))
+}
+
+// --- hashing (fuzz.bit's fnv1a64/hex16, ported verbatim) --------------------
+
+fn fnv1a64(bytes: string): u64 {
+  let h = u64(14695981039346656037)
+  let i = 0
+  while (i < len(bytes)) {
+    h = h ^ u64(bytes[i])
+    h = h * u64(1099511628211)
+    i = i + 1
+  }
+  return h
+}
+
+fn hex16(v: u64): string {
+  const digits = "0123456789abcdef"
+  let out = []byte(0)
+  let i = 0
+  while (i < 16) {
+    let nib = int((v >> u64(60 - 4 * i)) & u64(15))
+    out = append(out, digits[nib])
+    i = i + 1
+  }
+  return string(out)
+}
+
+// --- mutation (fuzz.bit's byte flip/insert/delete, ported verbatim: it is
+// domain-agnostic, so it mutates a regex pattern's bytes exactly as it
+// mutates a program's) ------------------------------------------------------
+
+fn insertAt(b: []byte, pos: int, v: u8): []byte {
+  let out = []byte(0)
+  let i = 0
+  while (i < pos) {
+    out = append(out, b[i])
+    i = i + 1
+  }
+  out = append(out, v)
+  while (i < len(b)) {
+    out = append(out, b[i])
+    i = i + 1
+  }
+  return out
+}
+
+fn deleteAt(b: []byte, pos: int): []byte {
+  let out = []byte(0)
+  let i = 0
+  while (i < len(b)) {
+    if (i != pos) {
+      out = append(out, b[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn mutate(seed: string, st: []u64): string {
+  let b = []byte(0)
+  let i = 0
+  let n = len(seed)
+  if (n > maxInputLen) {
+    n = maxInputLen
+  }
+  while (i < n) {
+    b = append(b, u8(seed[i]))
+    i = i + 1
+  }
+  if (len(b) == 0) {
+    b = append(b, nextByte(st))
+  }
+
+  let rounds = 1 + nextBelow(st, maxMutationsPerInput)
+  let r = 0
+  while (r < rounds) {
+    let op = nextBelow(st, 3)
+    if (op == 0) {
+      b[nextBelow(st, len(b))] = nextByte(st)
+    } else if (op == 1) {
+      if (len(b) < maxInputLen) {
+        b = insertAt(b, nextBelow(st, len(b) + 1), nextByte(st))
+      }
+    } else {
+      if (len(b) > 1) {
+        b = deleteAt(b, nextBelow(st, len(b)))
+      }
+    }
+    r = r + 1
+  }
+  return string(b)
+}
+
+// --- adversarial generation (#2038 item 1's other half) ---------------------
+
+// Pure random bytes, including 0x80-0xFF: the direct source of invalid-UTF-8
+// PATTERNS (as opposed to invalid-UTF-8 match subjects, which
+// regexfuzzcase.bit supplies separately).
+fn genRandomBytes(st: []u64): string {
+  let n = 1 + nextBelow(st, 200)
+  let b = []byte(0)
+  let i = 0
+  while (i < n) {
+    b = append(b, nextByte(st))
+    i = i + 1
+  }
+  return string(b)
+}
+
+fn genUnbalancedBrackets(st: []u64): string {
+  const chars = "()[]{}"
+  let n = 1 + nextBelow(st, 64)
+  let b = []byte(0)
+  let i = 0
+  while (i < n) {
+    b = append(b, chars[nextBelow(st, len(chars))])
+    i = i + 1
+  }
+  return string(b)
+}
+
+// Deep nesting, half the time left deliberately unclosed.
+//
+// CAPPED AT 30, NOT 500: an early campaign in this worktree found that
+// nested-capturing-group compile time is superlinear in depth — a balanced
+// 446-deep pattern (893 bytes, well under the 4096-byte cap, a tiny compiled
+// program) measured 121s of marginal compile time in isolation (not fleet
+// load: a 100-deep pattern was 13s, 223-deep was 25s, 446-deep was 121s —
+// 2x the depth for ~4.8x the time). That is #3629, filed separately per this
+// file's coordination note (a fuzz ticket that also lands a matcher fix is
+// two tickets in one diff) rather than fixed here. Depth 30 stays well clear
+// of it (comfortably sub-second) so this generator keeps exercising deep
+// nesting without making every campaign rediscover and re-harvest the same
+// already-tracked bug.
+fn genDeepNesting(st: []u64): string {
+  let depth = 1 + nextBelow(st, 30)
+  let open = repeat("(", depth)
+  if (nextBelow(st, 2) == 0) {
+    return open
+  }
+  return open + "a" + repeat(")", depth)
+}
+
+// A single long counted repeat with a wide, random {lo,hi} — well over the
+// "thousands of characters" parserepeat.bit's own comment names as still
+// fitting the 4096-byte pattern cap.
+fn genLongCountedRepeat(st: []u64): string {
+  let lo = nextBelow(st, 1000000)
+  let hi = lo + nextBelow(st, 1000000)
+  return "a{${lo},${hi}}"
+}
+
+// The pathological shape prog.bit's own header names:
+// `((a{100}){100}){100}` is 33 source bytes and a million instructions. N/M/K
+// are randomized around and past that so the generator does not always probe
+// the exact hand-written example.
+fn genPathologicalNesting(st: []u64): string {
+  let n = 2 + nextBelow(st, 149)
+  let m = 2 + nextBelow(st, 149)
+  let k = 2 + nextBelow(st, 49)
+  return "((a{${n}}){${m}}){${k}}"
+}
+
+fn genAdversarial(st: []u64): string {
+  let strategy = nextBelow(st, 5)
+  if (strategy == 0) {
+    return genRandomBytes(st)
+  }
+  if (strategy == 1) {
+    return genUnbalancedBrackets(st)
+  }
+  if (strategy == 2) {
+    return genDeepNesting(st)
+  }
+  if (strategy == 3) {
+    return genLongCountedRepeat(st)
+  }
+  return genPathologicalNesting(st)
+}
+
+// --- corpus -----------------------------------------------------------------
+
+// Every file under `dir` (seed patterns and saved crashes are both flat
+// directories of whole-file patterns, no extension filtering needed — unlike
+// fuzz.bit's `bitFilesIn`, nothing else lives in either directory). A missing
+// directory is fatal, never an empty list, for the same reason fuzz.bit's
+// header gives: an empty corpus that reads as zero iterations must not also
+// read as a pass.
+fn filesIn(dir: string): []string {
+  if (!exists(dir) || !isDir(dir)) {
+    die("not a directory: ${dir}")
+  }
+  let all = walk(dir) catch e {
+    die("walk ${dir}: ${e.message()}")
+    []string(0)
+  }
+  let out = []string(0)
+  for p of all {
+    if (!hasSuffix(p, ".gitkeep")) {
+      if (len(out) >= maxCorpusFiles) {
+        die("corpus exceeds ${maxCorpusFiles} files: ${dir}")
+      }
+      out = append(out, p)
+    }
+  }
+  return out
+}
+
+// --- child (fuzz.bit's Runner/Attempt/Outcome/adjudicate shape, ported; see
+// this file's header for why it is not shared code) -------------------------
+
+fn writeRunner(path: string, bin: string, caseRunner: string, work: string) {
+  mustWrite(path, "#!/bin/sh\nexec \"${bin}\" run \"${caseRunner}\" \"${work}\" >\"${work}.log\" 2>&1\n")
+  if (fsChmod(path, 493) != 0) {
+    die("chmod +x failed: ${path}")
+  }
+}
+
+class Runner {
+  script: string
+  work: string
+  crashesDir: string
+  timeoutMs: int
+  hangMs: int
+}
+
+class Attempt {
+  rc: int
+  ms: int
+}
+
+fn (r: Runner) runFor(budgetMs: int): Attempt {
+  let start = monotonic()
+  let rc = osRunBounded(r.script, budgetMs)
+  return Attempt{ rc: rc, ms: since(start) / Millisecond }
+}
+
+fn (r: Runner) budgetFor(observedMs: int): int {
+  let b = observedMs * hangFactor
+  if (b < r.timeoutMs) {
+    b = r.timeoutMs
+  }
+  if (b > r.hangMs) {
+    b = r.hangMs
+  }
+  return b
+}
+
+class Slow {
+  hung: bool
+  rc: int
+  ms: int
+}
+
+fn (r: Runner) adjudicate(what: string, firstMs: int): Slow {
+  print("slow: ${what} did not finish in ${firstMs}ms; re-running once against the ${r.hangMs}ms non-termination ceiling\n")
+  let a = r.runFor(r.hangMs)
+  if (a.rc == -2) {
+    return Slow{ hung: true, rc: a.rc, ms: a.ms }
+  }
+  print("slow: ${what} terminated in ${a.ms}ms (rc=${a.rc}): slow, not hung - nothing saved\n")
+  return Slow{ hung: false, rc: a.rc, ms: a.ms }
+}
+
+class Outcome {
+  ok: bool
+  fatal: bool
+  label: string
+}
+
+// Regex-specific, deliberately NOT fuzz.bit's `classify`: regexfuzzcase.bit
+// has exactly one passing exit code (0, its own header). Every other exit —
+// including its own controlled 5/6/7 — is a finding here, never an "ok" the
+// way a compiler's diagnostic exit 1 is.
+fn classify(rc: int): Outcome {
+  if (rc == -1) {
+    return Outcome{ ok: false, fatal: true, label: "spawn failure (osRunBounded -1)" }
+  }
+  if (rc == -2) {
+    return Outcome{ ok: false, fatal: false, label: "over budget, unadjudicated" }
+  }
+  if (rc <= -100) {
+    return Outcome{ ok: false, fatal: false, label: "crash: signal ${-rc - 100}" }
+  }
+  if (rc == 126 || rc == 127) {
+    return Outcome{ ok: false, fatal: true, label: "runner could not exec the compiler (sh exit ${rc})" }
+  }
+  if (rc == 0) {
+    return Outcome{ ok: true, fatal: false, label: "pass" }
+  }
+  return Outcome{ ok: false, fatal: false, label: "bug: regexfuzzcase exit ${rc}" }
+}
+
+fn (r: Runner) harvest(prefix: string): string {
+  let bytes = mustRead(r.work)
+  let path = "${r.crashesDir}/${prefix}-${hex16(fnv1a64(bytes))}.regex"
+  mustWrite(path, bytes)
+  return path
+}
+
+// --- phases -------------------------------------------------------------
+
+fn (r: Runner) replayCrashes() {
+  let files = filesIn(r.crashesDir)
+  print("regress: replaying ${len(files)} saved crash(es) from ${r.crashesDir}\n")
+  for f of files {
+    mustWrite(r.work, mustRead(f))
+    let a = r.runFor(r.timeoutMs)
+    if (a.rc == -2) {
+      let s = r.adjudicate("regress ${f}", a.ms)
+      if (s.hung) {
+        die("regress: ${f}: hang - the ${r.hangMs}ms ceiling elapsed too")
+      }
+      a = Attempt{ rc: s.rc, ms: s.ms }
+    }
+    let o = classify(a.rc)
+    if (!o.ok) {
+      die("regress: ${f}: ${o.label}")
+    }
+  }
+}
+
+// A known-good pattern before any mutant, same reason as fuzz.bit's
+// preflight: without it a broken BIT_REGEXFUZZ_BIN or a wrong
+// BIT_REGEXFUZZ_CASE path is only visible through the 126/127 branch.
+fn (r: Runner) preflight() {
+  mustWrite(r.work, "a")
+  let a = r.runFor(r.hangMs)
+  if (a.rc != 0) {
+    die("preflight: the runner rejected a known-good pattern (rc=${a.rc} after ${a.ms}ms); the case runner is not reachable")
+  }
+}
+
+fn (r: Runner) fuzzLoop(seeds: []string, seed: u64, seconds: int): int {
+  let st = []u64(1)
+  st[0] = seed
+  let slowMs = []int(len(seeds))
+  let deadline = monotonic().ns + seconds * Second
+  let credited = 0
+  let iterations = 0
+  while (iterations < maxIterations && monotonic().ns < deadline) {
+    let idx = nextBelow(st, len(seeds))
+    let candidate = ""
+    if (nextBelow(st, 2) == 0) {
+      candidate = mutate(mustRead(seeds[idx]), st)
+    } else {
+      candidate = genAdversarial(st)
+    }
+    mustWrite(r.work, candidate)
+
+    let a = r.runFor(r.budgetFor(slowMs[idx]))
+    if (a.rc == -2) {
+      let s = r.adjudicate("iteration ${iterations} (seed ${seeds[idx]})", a.ms)
+      if (s.hung) {
+        let saved = r.harvest("hang")
+        die("iteration ${iterations}: hang - neither the budget nor the ${r.hangMs}ms ceiling saw it terminate; input saved as ${saved}")
+      }
+      if (s.ms > slowMs[idx]) {
+        slowMs[idx] = s.ms
+      }
+      if (credited < slowCreditCapMs) {
+        deadline = deadline + (a.ms + s.ms) * Millisecond
+        credited = credited + a.ms + s.ms
+      }
+      a = Attempt{ rc: s.rc, ms: s.ms }
+    }
+
+    let o = classify(a.rc)
+    if (o.fatal) {
+      die("iteration ${iterations}: ${o.label}")
+    }
+    if (!o.ok) {
+      let saved = r.harvest("bug")
+      die("iteration ${iterations}: ${o.label} - input saved as ${saved}")
+    }
+    iterations = iterations + 1
+  }
+  return iterations
+}
+
+// --- entry -------------------------------------------------------------
+
+fn main() {
+  let bin = envOr("BIT_REGEXFUZZ_BIN", "bit-out/bin/bit")
+  let caseRunner = envOr("BIT_REGEXFUZZ_CASE", "tests/bit/regexfuzzcase.bit")
+  let casesDir = envOr("BIT_REGEXFUZZ_CASES", "tests/fuzz/regexcases")
+  let crashesDir = envOr("BIT_REGEXFUZZ_CRASHES", "tests/fuzz/regexcrashes")
+  let workDir = envOr("BIT_REGEXFUZZ_WORK", "/tmp/bit-regexfuzz")
+  let seconds = mustInt("BIT_REGEXFUZZ_SECONDS", 60)
+  let timeoutMs = mustInt("BIT_REGEXFUZZ_TIMEOUT_MS", 10000)
+  let hangMs = mustInt("BIT_REGEXFUZZ_HANG_MS", defaultHangMs)
+
+  if (seconds <= 0) {
+    die("BIT_REGEXFUZZ_SECONDS must be > 0; ${seconds} would report a green run of zero iterations")
+  }
+  if (timeoutMs <= 0) {
+    die("BIT_REGEXFUZZ_TIMEOUT_MS must be > 0")
+  }
+  if (hangMs < timeoutMs) {
+    die("BIT_REGEXFUZZ_HANG_MS=${hangMs} is below BIT_REGEXFUZZ_TIMEOUT_MS=${timeoutMs}; the ceiling is a second opinion, not a tighter one")
+  }
+
+  let seed = u64(now().ns)
+  let rawSeed = envOr("BIT_REGEXFUZZ_SEED", "")
+  if (len(rawSeed) > 0) {
+    seed = u64(mustInt("BIT_REGEXFUZZ_SEED", 0))
+  }
+  if (seed == u64(0)) {
+    seed = u64(88172645463325252)
+  }
+
+  if (!exists(workDir)) {
+    mkdir(workDir) catch e {
+      die("mkdir ${workDir}: ${e.message()}")
+    }
+  }
+  let r = Runner{
+    script: "${workDir}/run.sh",
+    work: "${workDir}/work.regex",
+    crashesDir: crashesDir,
+    timeoutMs: timeoutMs,
+    hangMs: hangMs,
+  }
+  writeRunner(r.script, bin, caseRunner, r.work)
+
+  print("regexfuzz: compiler=${bin} case=${caseRunner} seed=${seed} seconds=${seconds} timeout_ms=${timeoutMs} hang_ms=${hangMs}\n")
+
+  r.replayCrashes()
+  r.preflight()
+
+  let seeds = filesIn(casesDir)
+  if (len(seeds) == 0) {
+    die("seed corpus ${casesDir} holds no files; a random-byte generator is not a fuzzer")
+  }
+  print("regexfuzz: ${len(seeds)} seed patterns from ${casesDir}\n")
+
+  let iterations = r.fuzzLoop(seeds, seed, seconds)
+  print("PASS: ${iterations} inputs, 0 crashes, 0 hangs, 0 cap escapes (seed=${seed}, replay with BIT_REGEXFUZZ_SEED=${seed})\n")
+}
