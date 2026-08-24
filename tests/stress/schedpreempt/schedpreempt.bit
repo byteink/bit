@@ -1,0 +1,111 @@
+// #1768's own gap: the runtime has no scheduler preemption. A green thread
+// that never crosses a safepoint runs until it finishes, so one compute-bound
+// task starves every other task on its worker. This program is the stress
+// proof: it MUST fail against today's binary and is expected to start passing
+// only once the epic's remaining children (#2579/#2580, booting the sysmon
+// monitor thread that actually sets the preempt request `sysmonTick`
+// observes) land.
+//
+// WHY TASK A IS AN ORDINARY FUNCTION, NOT `@nosplit`. Codegen inserts a
+// safepoint poll at every loop back-edge regardless of `@nosplit`
+// (`runtime/ABI.md` §4) — `@nosplit` suppresses exactly that poll
+// (spec/SPEC.md §10.3: "only the back-edge poll is suppressed by the
+// attribute"). The preemption mechanism this epic is building
+// (`runtime/sched/preempt.bit`'s `sysmonTick`/`maybePreempt`) hooks into that
+// SAME poll — `runtime/ABI.md`'s own preemption section says so explicitly:
+// "a task with no safepoint is still not preemptible even though `sysmonTick`
+// may have set its flag". So a `@nosplit` loop is not a stronger test here, it
+// is a test of a *permanent, documented, out-of-scope* limitation — it could
+// never pass even after every remaining child lands. `spinTask` below is
+// therefore a PLAIN loop (matching the epic's own reproduction snippet),
+// which does carry the per-iteration poll the fix hooks into.
+//
+// WHY THE LOOP MUST STILL AVOID ALLOCATION / CHANNEL OPS / SLEEP / PRINT. Each
+// of those is an EXISTING, unrelated way to voluntarily hand the worker to
+// another ready task (a blocking channel op or `sleep` parks outright; a
+// crossed GC trigger is a separate stop-the-world safepoint). Any of them
+// inside task A's loop would let task B run for a reason that has nothing to
+// do with the mechanism under test, and the failure this program exists to
+// prove would pass for the wrong reason. So the loop below is pure integer
+// arithmetic — nothing else.
+//
+// TASK B's YIELD is `sleep(0)` (`stdlib/time/time.bit`): "a duration of 0 or
+// less merely yields to the scheduler and returns at once" — an ordinary,
+// already-working voluntary yield, unrelated to the preemption fix. Using it
+// for B isolates the one variable this program measures: whether the
+// scheduler can also force A to give the worker back.
+//
+// CALIBRATION. Measured directly against this worktree's compiler
+// (aarch64-macos): a 2,000,000,000-iteration version of `spinTask`'s loop took
+// 1.77s user CPU time; a 10,000,000,000-iteration version took 11.42s — about
+// 1.14ns/iteration. `aIters` below (8,000,000,000) is chosen to run
+// comfortably longer than `waitBudgetNs` (5s) even on a faster host, so a
+// success can only mean B made real progress WHILE A was still going, not
+// merely after A finished early.
+//
+// WHY MAIN POLLS WITH `sleep(0)` RATHER THAN A FIXED DELAY. Every poll needs
+// to be a genuine yield point so B (and, once the fix lands, a preempted A)
+// get a turn between checks; `since(start)` bounds the wall-clock budget, and
+// `mainMaxPolls` is a purely defensive iteration cap (Power of 10 rule 2) that
+// is never approached in practice — pre-fix, main's own first checks execute
+// before A ever yields, so the loop runs only a handful of iterations total.
+
+import { monotonic, since, sleep, Second } from "std/time"
+
+const aIters: int = 8000000000
+const requiredRounds: int = 10
+const waitBudgetNs: int = 5 * Second
+const bMaxRounds: int = 50000000
+const mainMaxPolls: int = 100000000
+
+let shared: int = 0
+let bRounds: int = 0
+let aDone: bool = false
+
+// Task A: a tight compute loop reaching no safepoint-crossing operation of any
+// kind other than the compiler-inserted per-iteration poll itself.
+fn spinTask(n: int) {
+  let i = 0
+  while (i < n) {
+    i = i + 1
+  }
+  aDone = true
+}
+
+// Task B: makes cooperative progress and records how far it got.
+fn peerTask() {
+  let r = 0
+  while (r < bMaxRounds) {
+    shared = shared + 1
+    r = r + 1
+    bRounds = r
+    sleep(0)
+  }
+}
+
+fn main() {
+  spawn spinTask(aIters)
+  spawn peerTask()
+
+  let start = monotonic()
+  let p = 0
+  let ok = false
+  while (p < mainMaxPolls) {
+    if (bRounds >= requiredRounds && !aDone) {
+      ok = true
+      break
+    }
+    if (since(start) >= waitBudgetNs) {
+      break
+    }
+    sleep(0)
+    p = p + 1
+  }
+
+  if (ok) {
+    print("schedpreempt: ok\n")
+    return
+  }
+  print("schedpreempt: peer starved, rounds=${bRounds}\n")
+  osExit(1)
+}
