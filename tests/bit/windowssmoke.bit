@@ -26,21 +26,33 @@
 //      asserts it does not start with `\\`, the UNC-path signature WSL
 //      interop gives a Windows process's view of its own invocation.
 //
-// KNOWN CURRENT BLOCKER, verified 2026-08-21, do not remove this note until
-// it is fixed: this gate's own link stage now succeeds (#3336 landed
-// park/windows; #3385 fixed pelink.bit's `.bss` atoms never getting an RVA
-// folded into `addrOf`, which is what made EVERY program — any reference to
-// a zero-init global, e.g. runtime/chan/chanwrap.bit's chanReserveAddr via
-// chanBootBind, hit unconditionally at boot — fail at link with an unnamed
-// "pe: undefined symbol"). The wall moved: the shipped .exe now runs on
-// mustafa-desktop-win and crashes with "bit: fatal signal: segmentation
-// fault" before bit_main even executes — an empty `fn main() {}` crashes
-// identically to one that prints, so this is a boot()-sequence bug, not
-// corpus-specific (#3391, epic #3322, blocked on nothing further). This gate
-// still cross-builds and ships the archive + program every run — real,
-// useful signal on its own — and fails cleanly at the actual current wall
-// rather than skip silently. It self-upgrades to a full pass the moment
-// #3391 lands, with no change needed here.
+// HISTORY, kept because the mechanism recurs: this gate crossed FOUR real
+// link/boot walls, all on `main` now, before it could pass for the first
+// time (2026-08-24). #3385 (pelink.bit's `.bss` atoms never got an RVA
+// folded into `addrOf`, so any reference to a zero-init global — e.g.
+// runtime/chan/chanwrap.bit's chanReserveAddr via chanBootBind, hit by every
+// program at boot — failed to link with an unnamed "pe: undefined symbol").
+// #3391 (an empty `fn main() {}` crashed before bit_main ever ran). #3503
+// (`spawn()` segfaulted on real hardware: runtime/sched/task.bit's
+// `taskInvoke` hardcoded SysV's `rdi` for its one argument, but every
+// x86_64-windows function — including the compiler-synthesized spawn
+// trampoline — compiles `XCallConv.Win64`, whose first argument register is
+// `rcx`). #3554 (the `@naked bit_rt_safepoint` shim had the identical
+// rdi/rcx defect; only visible under `BIT_GC=stress`, which is the only path
+// that forces a poll at every back edge).
+//
+// THE PROGRAM BELOW NOW `spawn`S ONE TASK (see Phase 2), specifically so
+// this gate would have caught #3503 automatically — a smoke run that only
+// prints never reaches taskInvoke at all. It deliberately does NOT run
+// under `BIT_GC=stress`: while building this spawn check, `args()`'s own
+// returned slice turned out to be corrupted under stress on real Windows
+// hardware (garbage length, or a segfault on indexing — 3/3 reproducible,
+// gone the instant `BIT_GC=stress` is unset) — a new, distinct bug, filed
+// as #3592 rather than fixed here (out of this ticket's `tools/build/**`
+// scope). Wiring `BIT_GC=stress` into this gate would fail it on #3592, not
+// on anything `tools/build` owns. Once #3592 lands, add it here so this
+// gate would have caught #3554's class of bug the same way it now catches
+// #3503's.
 import { env, envOr, exit } from "std/os"
 import { exists, mkdir, readFile, writeFile } from "std/fs"
 import { contains, hasPrefix, parseInt, trimSpace } from "std/strings"
@@ -107,10 +119,26 @@ fn shell(scriptPath: string, script: string, ms: int): int! {
 // the wrapper's — so a wrapper-level setup failure (90/91 below) can never
 // be confused with the command under test failing. Returns (exit code,
 // captured stdout+stderr).
+//
+// `script` runs inside a `{ ...; }` group redirected to `outPath` — NOT
+// inherited from this process's own stdout/stderr. `osForkExecWaitBounded`
+// (runtime/root/{linux,darwin}/os.bit) does no fd redirection of its own; a
+// child simply inherits this process's fds. Without the explicit `{ } >
+// outPath 2>&1` wrapper here, `script`'s output would stream straight
+// through to `./make`'s own stdout and `outPath` would never be written,
+// making `readFile(outPath) catch ""` always return "" — silently turning
+// every content-based assertion below (`contains(out4, "smoke ok")`, the
+// nativeness check) into a check against an empty string that can never
+// pass, regardless of what the remote command actually printed. Found
+// 2026-08-24: the FIRST real end-to-end run (#3503/#3554 fixed by then)
+// printed "smoke ok" and a clean argv0 straight to the terminal — proof the
+// program ran correctly — while this gate still reported FAIL, because
+// `out4` was "" the whole time. `$?` right after the closing `}` still
+// reports the group's own last command, not this wrapper's.
 fn runCaptured(scratch: string, tag: string, script: string, ms: int): (int, string) {
   let outPath = "${scratch}/${tag}.out"
   let codePath = "${scratch}/${tag}.code"
-  let wrapped = "#!/bin/sh\n" + script + "\necho $? > '${codePath}'\nexit 0\n"
+  let wrapped = "#!/bin/sh\n{\n" + script + "\n} > '${outPath}' 2>&1\necho $? > '${codePath}'\nexit 0\n"
   let wrapperRc = shell("${scratch}/${tag}.sh", wrapped, ms) catch e {
     panic("windowssmoke: ${e.message()}")
     0
@@ -139,21 +167,9 @@ fn failStage(stage: string, code: int, out: string) {
   exit(1)
 }
 
-fn main() {
-  let ms = timeoutMs()
-  let root = repoRoot()
-  let host = windowsHost()
-  let bitBin = "${root}/bit-out/bin/bit"
-  let runId = "wsmoke-" + uuidFormat(uuidV4())
-  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
-  let scratch = "${tmp}/bit-windowssmoke-${uuidFormat(uuidV4())}"
-  mkdir(scratch) catch e {
-    panic("windowssmoke: cannot create ${scratch}: ${e.message()}")
-  }
-  defer teardown(scratch, host, runId, ms)
-
-  // --- Phase 0: is the box even reachable? Fail here with a diagnostic that
-  // names the host, cheaply, before any cross-build. ---
+// Phase 0: is the box even reachable? Fail here with a diagnostic that names
+// the host, cheaply, before any cross-build.
+fn checkReachable(scratch: string, host: string, ms: int) {
   let (rc0, out0) = runCaptured(scratch, "reachable",
     "ssh -o BatchMode=yes -o ConnectTimeout=8 -o ConnectionAttempts=1 '${host}' 'exit 0'\n", ms)
   if (rc0 != 0) {
@@ -161,10 +177,13 @@ fn main() {
     println("windowssmoke: FAIL — ${host} is unreachable over SSH (exit ${rc0}); this does not fail `./make test`")
     exit(1)
   }
+}
 
-  // --- Phase 1: cross-build (or refresh) libbitrt.a for x86_64-windows,
-  // using THIS TREE'S OWN compiler — the pinned stage0 does not know the
-  // target name at all (tools/build/artifacts.bit's targets() comment). ---
+// Phase 1: cross-build (or refresh) libbitrt.a for x86_64-windows, using
+// THIS TREE'S OWN compiler — the pinned stage0 does not know the target name
+// at all (tools/build/artifacts.bit's targets() comment). Returns the
+// archive path.
+fn buildArchive(scratch: string, root: string, bitBin: string, ms: int): string {
   let archivePath = "${scratch}/libbitrt-x86_64-windows.a"
   let (rc1, out1) = runCaptured(scratch, "archive",
     "cd '${root}' || exit 90\n" +
@@ -172,15 +191,45 @@ fn main() {
   if (rc1 != 0) {
     failStage("cross-build libbitrt-x86_64-windows.a", rc1, out1)
   }
+  return archivePath
+}
 
-  // --- Phase 2: cross-build the smoke program against that archive. ---
+// Phase 2: cross-build the smoke program against that archive. Returns the
+// built exe path.
+//
+// The program also `spawn`s one task and waits for it via a plain atomic
+// counter (spawnfireforget.bit's own shape) — exercising the exact path
+// #3503 broke (runtime/sched/task.bit's `taskInvoke` hardcoded SysV's `rdi`
+// for its one argument; every x86_64-windows function, including the
+// compiler-synthesized spawn trampoline, compiles `XCallConv.Win64`, whose
+// first argument register is `rcx`) and #3503's fix (landed,
+// runtime/sched/windows/spawn.bit) is meant to have closed. `timeSleepNs` is
+// a predeclared builtin (compiler/symbols.bit), not `std/time`'s `sleep` —
+// deliberately, so this program does not import `std/fs` transitively
+// through `std/time`'s tzlocal.bit while #3549 is open. Deliberately NOT run
+// under `BIT_GC=stress`: #3592 (found while building this gate, filed
+// separately) reproduces a real, unrelated corruption in `args()`'s
+// returned slice under stress mode on native Windows — adding stress here
+// would fail this gate on a bug this ticket does not own.
+fn buildProgram(scratch: string, root: string, bitBin: string, archivePath: string, runId: string, ms: int): string {
   let progDir = "${scratch}/prog"
   mkdir(progDir) catch e {
     panic("windowssmoke: cannot create ${progDir}: ${e.message()}")
   }
   writeFile("${progDir}/main.bit",
     "import { args } from \"std/os\"\n\n" +
+    "let spawnCounter: [1]i64\n\n" +
+    "fn spawnWorker() {\n" +
+    "  atomicAdd(ptrOf(spawnCounter), 1)\n" +
+    "}\n\n" +
     "fn main() {\n" +
+    "  spawn spawnWorker()\n" +
+    "  let polls = 0\n" +
+    "  while (int(atomicLoad(ptrOf(spawnCounter))) < 1 && polls < 20000) {\n" +
+    "    timeSleepNs(1000000)\n" +
+    "    polls = polls + 1\n" +
+    "  }\n" +
+    "  print(\"spawn ok \${int(atomicLoad(ptrOf(spawnCounter)))}\\n\")\n" +
     "  print(\"smoke ok\\n\")\n" +
     "  print(\"argv0=\${args()[0]}\\n\")\n" +
     "}\n") catch e {
@@ -191,19 +240,22 @@ fn main() {
     "cd '${root}' || exit 90\n" +
     "BIT_LIBBITRT='${archivePath}' '${bitBin}' build '${progDir}' --target x86_64-windows -o '${exePath}'\n", ms)
   if (rc2 != 0) {
-    println("windowssmoke: cross-build failed — this is the known blocker documented at the top of this file (runtime/park/windows, #3336, blocked on #3335), not a new regression, UNLESS the message below has changed:")
     failStage("cross-build the smoke program", rc2, out2)
   }
+  return exePath
+}
 
-  // --- Phase 3: ship it, run it natively, assert both the marker and the
-  // nativeness signal. Only reached once Phase 2 actually links — not
-  // exercised as of #3341's landing; see the header. ---
-  // A RELATIVE scp destination, deliberately: a Windows destination with a
-  // drive letter (`host:C:\Users\...`) breaks scp's `host:path` parsing on
-  // the drive letter's own colon (verified 2026-08-21 — `scp` reports "No
-  // such file or directory" against a path PowerShell itself just created).
-  // A bare relative name lands in the SSH server's default directory (the
-  // user's home) with no such ambiguity.
+// Phase 3: ship it, run it natively, assert the marker, the spawn check and
+// the nativeness signal (see the file header for what each catches and why
+// BIT_GC=stress is deliberately not used here).
+//
+// A RELATIVE scp destination, deliberately: a Windows destination with a
+// drive letter (`host:C:\Users\...`) breaks scp's `host:path` parsing on the
+// drive letter's own colon (verified 2026-08-21 — `scp` reports "No such
+// file or directory" against a path PowerShell itself just created). A bare
+// relative name lands in the SSH server's default directory (the user's
+// home) with no such ambiguity.
+fn shipAndRun(scratch: string, host: string, runId: string, exePath: string, ms: int) {
   let remoteName = "${runId}.exe"
   let (rc3, out3) = runCaptured(scratch, "ship",
     "scp -q -o BatchMode=yes -o ConnectTimeout=8 '${exePath}' '${host}:${remoteName}'\n", ms)
@@ -230,6 +282,11 @@ fn main() {
     eprint(out4)
     exit(1)
   }
+  if (!contains(out4, "spawn ok 1")) {
+    println("windowssmoke: FAIL — ${host} did not print 'spawn ok 1' (a spawn()'d task never ran or the counter was lost):")
+    eprint(out4)
+    exit(1)
+  }
   let argv0Line = extractArgv0(out4)
   if (len(argv0Line) == 0) {
     println("windowssmoke: FAIL — no argv0= line in the program's output:")
@@ -241,6 +298,25 @@ fn main() {
     exit(1)
   }
   println("windowssmoke: PASS — ${host}, argv0=${argv0Line}")
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let root = repoRoot()
+  let host = windowsHost()
+  let bitBin = "${root}/bit-out/bin/bit"
+  let runId = "wsmoke-" + uuidFormat(uuidV4())
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-windowssmoke-${uuidFormat(uuidV4())}"
+  mkdir(scratch) catch e {
+    panic("windowssmoke: cannot create ${scratch}: ${e.message()}")
+  }
+  defer teardown(scratch, host, runId, ms)
+
+  checkReachable(scratch, host, ms)
+  let archivePath = buildArchive(scratch, root, bitBin, ms)
+  let exePath = buildProgram(scratch, root, bitBin, archivePath, runId, ms)
+  shipAndRun(scratch, host, runId, exePath, ms)
 }
 
 // Pulls the value out of the program's own "argv0=..." output line.
