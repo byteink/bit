@@ -3101,6 +3101,7 @@ Per resolved dependency it records:
   "quicwire": {
     "url": "https://github.com/byteink/quicwire.git",
     "commit": "9f8e7d6c5b4a3928170695e4d3c2b1a0f9e8d7c",
+    "version": "1.7.0",
     "requires": {
       "streambuf": "github.com/byteink/streambuf@^0.9.0"
     }
@@ -3111,6 +3112,14 @@ Per resolved dependency it records:
 - `url` — the git URL the module was fetched from.
 - `commit` — the exact resolved commit SHA (a tag or branch ref is dereferenced
   to its commit before being recorded; `bit.lock` never stores a mutable ref).
+- `version` — the resolved `MAJOR.MINOR.PATCH`, no `v` prefix, present only
+  when the manifest's ref was a version constraint (bare, `^`, or `~`) and
+  resolution matched it to a git tag; omitted for a branch pin, a bare commit
+  SHA, or a local-path dependency. This is the version resolution actually
+  picked, never the constraint string `bit.json` records — a `^1.2.0`
+  constraint can resolve to `1.4.7`. Optional: a lock file written before
+  this field existed omits the key entirely, reads back as if unresolved, and
+  is rewritten unchanged on the next resolution — no error, no forced relock.
 - `requires` — that dependency's own transitive requirement list, verbatim
   from its `bit.json`, so resolution can re-run from the lockfile alone
   without re-fetching every transitive dependency's manifest.
