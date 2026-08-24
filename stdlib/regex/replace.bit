@@ -1,0 +1,305 @@
+// Bit standard library — regex module, `replaceAll`/`replaceFirst` and their
+// shared `$`-template expander (#2035).
+//
+// Both walk the same non-overlapping left-to-right scan `findAll`
+// (regex.bit) already uses, including its empty-match rules: after a
+// zero-width match the next search starts one RUNE later, never one byte
+// later, and a zero-width match found exactly where the immediately
+// preceding accepted match ended is skipped rather than substituted again
+// at the same position — otherwise `replaceAll(".*", "x")` over `"ab"`
+// would substitute a second, spurious empty match right after the first.
+// `replaceAll`'s own loop is bounded exactly the way `findAll`'s is: `pos`
+// strictly increases every pass, by at least one rune, for at most
+// `len(s) + 1` passes, so a bug in either rule can never hang a caller.
+//
+// TEMPLATE GRAMMAR — every rule here is a deliberate decision, not an
+// accident, and each is covered by tests/imports/regexreplace/:
+//
+//   $0 .. $9, $10, ...   capture group by index, ALL following digits
+//                        consumed greedily — "$12" is group twelve, never
+//                        group one followed by the literal digit "2".
+//   ${N}                 the same group-by-index reference, braced — the
+//                        ONLY way to write a group number immediately
+//                        followed by a literal digit: "${1}0" is group 1
+//                        then "0"; "$10" is group 10.
+//   ${name}              capture group by name.
+//   $$                   a literal "$".
+//   $ at end of template a literal "$" (there is no following character to
+//                        consume, so the "$ + anything else" rule below
+//                        cannot apply).
+//   $ + anything else    a literal "$" plus that byte, both unchanged —
+//                        covers "$ " a plain letter, a UTF-8 continuation
+//                        byte, whatever follows.
+//   ${...} unterminated,
+//   empty, or content
+//   that is neither all-
+//   digits nor a valid
+//   group-name shape      NOT a reference at all: the "$" alone is emitted
+//                        as a literal byte, and scanning resumes at the
+//                        "{" — which the caller's own loop then copies
+//                        byte by byte like any other literal text, the
+//                        same convention parserepeat.bit uses for a
+//                        malformed `{...}` repeat count (a literal brace,
+//                        never a hard error).
+//   non-participating
+//   group, or an out-of-
+//   range index/name      expands to the EMPTY STRING, never to the
+//                        literal template text — the single most common
+//                        bug in this feature across languages, and the
+//                        ticket's own headline constraint.
+//
+// Accumulated with `std/strings`' `Builder` throughout (already imported
+// into this module by litscan.bit — importing it again here would be
+// `E0042 already declared in this scope`), never repeated `+`: substituting
+// over a large subject is otherwise quadratic.
+
+// The leftmost non-overlapping matches of `re`'s pattern in `s`, each
+// replaced by `repl` with its own `$`-template expanded against that
+// match's capture groups (see the module doc comment above for the exact
+// grammar). Text between matches, and any text after the last one, is
+// copied through unchanged. A pattern that never matches returns `s`
+// itself, unchanged.
+export fn (re: Regex) replaceAll(s: string, repl: string): string {
+  let b = newBuilder()
+  let n = len(s)
+  let pos = 0
+  let written = 0
+  let prevMatchEnd = -1
+  let i = 0
+  // Bounded by len(s) + 1 iterations: `pos` strictly increases every pass,
+  // by at least one rune, whether or not the match found that pass is
+  // accepted — identical termination argument to `findAll` (regex.bit),
+  // which this loop otherwise mirrors exactly.
+  while (pos <= n && i <= n) {
+    let (matched, slots) = searchRegex(re, s, pos)
+    if (!matched) {
+      break
+    }
+    let start = slots[0]
+    let end = slots[1]
+    let accept = !(end == pos && start == prevMatchEnd)
+    if (accept) {
+      b = b.write(s[written:start])
+      let m = Match{ start: start, end: end, slots: slots, names: re.names }
+      b = expandTemplate(b, repl, m, s)
+      written = end
+    }
+    prevMatchEnd = end
+    pos = nextSearchPos(s, pos, end)
+    i = i + 1
+  }
+  b = b.write(s[written:n])
+  return b.toString()
+}
+
+// The leftmost match of `re`'s pattern in `s`, replaced by `repl` with its
+// `$`-template expanded against that match's capture groups. Every other
+// match, if any, is left untouched. Returns `s` unchanged when there is no
+// match at all.
+export fn (re: Regex) replaceFirst(s: string, repl: string): string {
+  return match (re.find(s)) {
+    Some(m) => buildReplaceFirst(s, repl, m)
+    None => s
+  }
+}
+
+// `replaceFirst`'s single-substitution body, split out so the exported
+// function above stays a one-line dispatch on `Option<Match>`.
+fn buildReplaceFirst(s: string, repl: string, m: Match): string {
+  let b = newBuilder()
+  b = b.write(s[0:m.start])
+  b = expandTemplate(b, repl, m, s)
+  b = b.write(s[m.end:len(s)])
+  return b.toString()
+}
+
+// Everything about one `expandTemplate` walk that stays fixed from one
+// `$`-reference to the next — bundled into one value purely so
+// `expandDollar`/`expandBraced`/`expandNumberedGroup` stay at or under the
+// five-parameter lint ceiling (E0202), the same reason `parserepeat.bit`
+// bundles its own scan result into `RepeatCount` rather than returning (or
+// threading) four separate values.
+class ExpandCtx { repl: string, n: int, m: Match, s: string }
+
+// Writes `repl` into `b`, expanding every `$`-reference against `m`'s own
+// capture slots — `s` is the subject `m` was matched in, needed for
+// `Match.text`/`Match.group(i).text`. See the module doc comment for the
+// full grammar.
+//
+// Bounded by `len(repl)`: the non-`$` branch always advances by exactly one
+// byte, and every `$`-handling path below returns an index strictly past
+// the `$` it consumed — copying a byte at a time is enough even for a
+// multi-byte rune following a `$`, since a UTF-8 continuation byte is never
+// `'$'` and falls through to the plain byte-copy branch on the very next
+// pass, so the full rune still reaches `b` in order.
+fn expandTemplate(b: Builder, repl: string, m: Match, s: string): Builder {
+  let ctx = ExpandCtx{ repl: repl, n: len(repl), m: m, s: s }
+  let i = 0
+  while (i < ctx.n) {
+    if (repl[i] != '$') {
+      b = b.writeByte(repl[i])
+      i = i + 1
+      continue
+    }
+    let (nb, next) = expandDollar(b, ctx, i)
+    b = nb
+    i = next
+  }
+  return b
+}
+
+// `ctx.repl[i] == '$'`. Returns the (possibly updated) builder and the
+// index to resume the outer scan from — always `> i`, so `expandTemplate`'s
+// loop always makes progress.
+fn expandDollar(b: Builder, ctx: ExpandCtx, i: int): (Builder, int) {
+  if (i + 1 >= ctx.n) {
+    return b.writeByte('$'), i + 1
+  }
+  let c = ctx.repl[i + 1]
+  if (c == '$') {
+    return b.writeByte('$'), i + 2
+  }
+  if (c == '{') {
+    return expandBraced(b, ctx, i)
+  }
+  if (isAsciiDigit(c)) {
+    return expandNumberedGroup(b, ctx, i + 1)
+  }
+  return b.writeByte('$').writeByte(c), i + 2
+}
+
+// `ctx.repl[start]` is already known to be a digit (the caller's own
+// check). Consumes the whole run of ASCII digits as one decimal group
+// index — "$12" is group twelve, never group one followed by "2" — and
+// writes that group's text (empty for out-of-range or non-participating,
+// per the module doc comment).
+fn expandNumberedGroup(b: Builder, ctx: ExpandCtx, start: int): (Builder, int) {
+  let (value, overflowed, endPos) = scanDecimal(ctx.repl, start, ctx.n)
+  return b.write(groupText(ctx, value, overflowed)), endPos
+}
+
+// `ctx.repl[i] == '$'`, `ctx.repl[i+1] == '{'`. Finds the matching `}`;
+// when found AND its content is either all-digit (a numbered group, same
+// as a bare `$N`) or a valid group-name shape, resolves and consumes
+// through the `}`. Any other shape — unterminated, empty, or content that
+// is neither — is not a reference at all (module doc comment).
+fn expandBraced(b: Builder, ctx: ExpandCtx, i: int): (Builder, int) {
+  let closeAt = findClosingBrace(ctx.repl, i + 2, ctx.n)
+  if (closeAt < 0) {
+    return b.writeByte('$'), i + 1
+  }
+  let (ok, text) = resolveBraceContent(ctx, ctx.repl[i + 2:closeAt])
+  if (!ok) {
+    return b.writeByte('$'), i + 1
+  }
+  return b.write(text), closeAt + 1
+}
+
+// The text `${content}` resolves to, and whether `content` was a
+// recognized reference shape at all — `ok == false` means "not a
+// reference", not "resolved to empty" (an out-of-range or non-participating
+// group IS `ok == true` with an empty `text`, per the module doc comment).
+fn resolveBraceContent(ctx: ExpandCtx, content: string): (bool, string) {
+  if (len(content) == 0) {
+    return false, ""
+  }
+  if (isAllDigits(content)) {
+    let (value, overflowed, _) = scanDecimal(content, 0, len(content))
+    return true, groupText(ctx, value, overflowed)
+  }
+  if (isValidGroupName(content)) {
+    return true,
+      match (ctx.m.named(content)) {
+        Some(g) => g.text(ctx.s)
+        None => ""
+      }
+  }
+  return false, ""
+}
+
+// The empty string for `overflowed` or an out-of-range/non-participating
+// `value`-th group (`Match.group` already returns `Option.None` for both —
+// see its own doc comment in regex.bit); that group's own matched text
+// otherwise.
+fn groupText(ctx: ExpandCtx, value: int, overflowed: bool): string {
+  if (overflowed) {
+    return ""
+  }
+  return match (ctx.m.group(value)) {
+    Some(g) => g.text(ctx.s)
+    None => ""
+  }
+}
+
+// Once a scanned decimal value would exceed this, further digits are still
+// consumed but `value` stops accumulating — comfortably above any real
+// pattern's group count, so a frozen value only ever needs to compare
+// unequal to a real one. Mirrors `parserepeat.bit`'s identical
+// `repeatCountOverflowGuard` (a distinct constant: that one bounds a `{n}`
+// repeat count, this one a template group index — different domains, same
+// module-wide name would be a real collision, so no import is needed and
+// none is taken).
+const groupIndexOverflowGuard: int = 1000000
+
+// Scans the decimal digit run starting at `start` (already known to be a
+// digit, by every caller) in `repl`, stopping at the first non-digit byte
+// or at `n`. Bounded by `n - start`: every pass consumes exactly one digit.
+fn scanDecimal(repl: string, start: int, n: int): (int, bool, int) {
+  let value = 0
+  let overflowed = false
+  let cur = start
+  while (cur < n && isAsciiDigit(repl[cur])) {
+    if (value > groupIndexOverflowGuard) {
+      overflowed = true
+    } else {
+      value = value * 10 + int(repl[cur] - '0')
+    }
+    cur = cur + 1
+  }
+  return value, overflowed, cur
+}
+
+// Whether every byte of `content` is an ASCII digit — `content` is never
+// empty here, the caller already checked. Bounded by `len(content)`.
+fn isAllDigits(content: string): bool {
+  let i = 0
+  let n = len(content)
+  while (i < n) {
+    if (!isAsciiDigit(content[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Whether `content` has the same shape a real pattern's group name must
+// (`isNameStartByte`/`isNameContByte`, parsegroup.bit, same module — no
+// import needed): `[A-Za-z_][A-Za-z0-9_]*`. Bounded by `len(content)`.
+fn isValidGroupName(content: string): bool {
+  if (!isNameStartByte(content[0])) {
+    return false
+  }
+  let i = 1
+  let n = len(content)
+  while (i < n) {
+    if (!isNameContByte(content[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// The index of the first `}` at or after `start` in `repl`, or `-1` if none
+// exists before `n`. Bounded by `n - start`.
+fn findClosingBrace(repl: string, start: int, n: int): int {
+  let i = start
+  while (i < n) {
+    if (repl[i] == '}') {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
