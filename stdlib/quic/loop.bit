@@ -250,63 +250,78 @@ fn quicconnOnDgram(st: quicconnState, ev: quicconnDgram): ()! {
   quicconnFlush(st)?
 }
 
+// A client whose handshake has stalled past the deadline gives up, so a dial
+// to an absent/silent server returns an error rather than hanging. A listener-
+// created server connection (`serverHsTimeout`) applies the same deadline: it
+// is born mid-handshake when an Initial arrives, so a peer that never finishes
+// is reaped instead of leaking a slot. The `acceptQuic` server, which binds
+// before any peer exists, keeps waiting indefinitely. Split out of
+// `quicconnCheckDeadlines` (#2448).
+fn quicconnHandshakeDeadlineExceeded(st: quicconnState): bool {
+  return (st.isClient || st.serverHsTimeout) &&
+    !st.established &&
+    monotonic().ns - st.handshakeStart > quicconnHandshakeTimeout
+}
+
+// Abandoned-handshake reap (#1709): a listener-created connection whose OWN
+// handshake did not finish until AFTER `quicconnHandshakeTimeout` had already
+// elapsed since it started is treated as almost certainly abandoned, and torn
+// down on a short grace period rather than the general idle timeout.
+//
+// Counting streams was tried first and does not work: an HTTP/3 client sends
+// its control/QPACK-encoder/QPACK-decoder streams as 0.5-RTT data in the same
+// flight as its request, so a connection can carry several streams and still
+// be one its own client already gave up on — `len(st.streams) == 0` was never
+// true for the connections that actually leaked (measured: every reaped
+// "abandoned" connection during a real collapse showed `streams=3`, not 0).
+//
+// What the client's own giving-up actually correlates with, measured on the
+// same trace, is establishment lateness: this server-side connection and its
+// client started their handshakes at essentially the same wall-clock moment
+// (the client's Initial IS what starts the server-side clock), so if OUR
+// establishment already took longer than the client's own patience budget,
+// the client has with very high confidence already hit ITS identical
+// `quicconnHandshakeTimeout` deadline and moved on to a fresh dial — this is
+// exactly the single-worker-congestion symptom #1709 diagnosed (a slow RSA
+// sign delays establishment past the deadline without ever tripping the
+// pre-established check above, because the sign itself is one uninterruptible
+// CPU burst that can carry the tick straight past its own deadline). Gated on
+// `serverHsTimeout` so `acceptQuic`'s single, socket-owning connection (which
+// binds before any peer exists, so has no "client" to have given up) is
+// unaffected; a connection that established WITHIN the deadline keeps the
+// normal RFC 9000 idle timeout, since its client was still within its own
+// patience budget and the connection is not presumed abandoned. Split out of
+// `quicconnCheckDeadlines` (#2448).
+fn quicconnAbandonedHandshakeExceeded(st: quicconnState): bool {
+  return st.serverHsTimeout &&
+    st.established &&
+    st.establishedAt - st.handshakeStart > quicconnHandshakeTimeout &&
+    monotonic().ns - st.establishedAt > quicconnAbandonTimeout
+}
+
+// Idle timeout (RFC 9000 §10.1): an established connection that has heard
+// nothing from its peer for `st.idleTimeout` is dead. Split out of
+// `quicconnCheckDeadlines` (#2448).
+fn quicconnIdleTimeoutExceeded(st: quicconnState): bool {
+  return st.established && monotonic().ns - st.lastRecv > st.idleTimeout
+}
+
 // Handshake, abandoned-handshake, and idle timeouts: wall-clock deadlines that
 // must be enforced even if a periodic tick never arrives (#1769 — see the call
 // in `quicconnLoop`). Returns true if the connection was just failed, so a
-// caller mid-tick-processing knows to stop there.
+// caller mid-tick-processing knows to stop there. Stopping the loop runs
+// `quicconnReleaseWaiters`, so `finish`/`read`/`acceptStream` fail instead of
+// parking forever behind a PTO that nobody will ever answer.
 fn quicconnCheckDeadlines(st: quicconnState): bool {
-  // A client whose handshake has stalled past the deadline gives up, so a dial
-  // to an absent/silent server returns an error rather than hanging. A listener-
-  // created server connection (`serverHsTimeout`) applies the same deadline: it
-  // is born mid-handshake when an Initial arrives, so a peer that never finishes
-  // is reaped instead of leaking a slot. The `acceptQuic` server, which binds
-  // before any peer exists, keeps waiting indefinitely.
-  if ((st.isClient || st.serverHsTimeout) &&
-    !st.established &&
-    monotonic().ns - st.handshakeStart > quicconnHandshakeTimeout) {
+  if (quicconnHandshakeDeadlineExceeded(st)) {
     quicconnFail(st)
     return true
   }
-  // Abandoned-handshake reap (#1709): a listener-created connection whose OWN
-  // handshake did not finish until AFTER `quicconnHandshakeTimeout` had already
-  // elapsed since it started is treated as almost certainly abandoned, and torn
-  // down on a short grace period rather than the general idle timeout.
-  //
-  // Counting streams was tried first and does not work: an HTTP/3 client sends
-  // its control/QPACK-encoder/QPACK-decoder streams as 0.5-RTT data in the same
-  // flight as its request, so a connection can carry several streams and still
-  // be one its own client already gave up on — `len(st.streams) == 0` was never
-  // true for the connections that actually leaked (measured: every reaped
-  // "abandoned" connection during a real collapse showed `streams=3`, not 0).
-  //
-  // What the client's own giving-up actually correlates with, measured on the
-  // same trace, is establishment lateness: this server-side connection and its
-  // client started their handshakes at essentially the same wall-clock moment
-  // (the client's Initial IS what starts the server-side clock), so if OUR
-  // establishment already took longer than the client's own patience budget,
-  // the client has with very high confidence already hit ITS identical
-  // `quicconnHandshakeTimeout` deadline and moved on to a fresh dial — this is
-  // exactly the single-worker-congestion symptom #1709 diagnosed (a slow RSA
-  // sign delays establishment past the deadline without ever tripping the
-  // pre-established check above, because the sign itself is one uninterruptible
-  // CPU burst that can carry the tick straight past its own deadline). Gated on
-  // `serverHsTimeout` so `acceptQuic`'s single, socket-owning connection (which
-  // binds before any peer exists, so has no "client" to have given up) is
-  // unaffected; a connection that established WITHIN the deadline keeps the
-  // normal RFC 9000 idle timeout, since its client was still within its own
-  // patience budget and the connection is not presumed abandoned.
-  if (st.serverHsTimeout &&
-    st.established &&
-    st.establishedAt - st.handshakeStart > quicconnHandshakeTimeout &&
-    monotonic().ns - st.establishedAt > quicconnAbandonTimeout) {
+  if (quicconnAbandonedHandshakeExceeded(st)) {
     quicconnFail(st)
     return true
   }
-  // Idle timeout (RFC 9000 §10.1): an established connection that has heard
-  // nothing from its peer for `st.idleTimeout` is dead. Stopping the loop
-  // runs `quicconnReleaseWaiters`, so `finish`/`read`/`acceptStream` fail
-  // instead of parking forever behind a PTO that nobody will ever answer.
-  if (st.established && monotonic().ns - st.lastRecv > st.idleTimeout) {
+  if (quicconnIdleTimeoutExceeded(st)) {
     quicconnFail(st)
     return true
   }
