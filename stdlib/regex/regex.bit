@@ -12,10 +12,20 @@
 // charclass.bit) are deliberately not exported: a `Regex` value is opaque,
 // and every one of #2026's fixed parse-error messages is produced by the
 // parser (parse.bit, parsegroup.bit, parseescape.bit, parseclass.bit), never
-// by this file. `matches`, `find` and `findAll` all run `re.prog` through
-// the Pike VM (`pike.bit`); `Match.slots` carries every capture pair the
-// winning thread reached, but stays module-private here — #2029 adds
-// `Match.group`/`named` over the same array without touching the VM again.
+// by this file. `matches`, `find` and `findAll` all funnel through
+// `searchRegex` below, which runs `re.prog` through the Pike VM
+// (`pike.bit`); `Match.slots` carries every capture pair the winning thread
+// reached, but stays module-private here — #2029 adds `Match.group`/`named`
+// over the same array without touching the VM again.
+//
+// `prefilter`/`selfCheck` are #2052's required-literal / first-byte
+// skip-ahead (`prefilter.bit`): both are derived ONCE here, at `compile`
+// time, from `ast` and from the process environment respectively, and never
+// change afterward — not the "mutable scratch state" the header above rules
+// out, which is about per-search working buffers, not compile-time-derived
+// immutable data.
+
+import { envOr } from "std/os"
 
 // A compiled, validated regular expression: RE2/Pike-VM syntax, linear-time
 // matching — no backreferences, no lookaround, ever. Immutable and safe to
@@ -25,7 +35,15 @@
 // times, never recompiled per call. `names` is `groupNames()`'s backing
 // array — one entry per capturing group, index order, `""` for an unnamed
 // one — built once here too, alongside `prog`.
-export class Regex { source: string, ast: Ast, groups: int, prog: Prog, names: []string }
+export class Regex {
+  source: string,
+  ast: Ast,
+  groups: int,
+  prog: Prog,
+  names: []string,
+  prefilter: Prefilter,
+  selfCheck: bool,
+}
 
 // Parses `pattern` and returns a validated `Regex`, or fails with a
 // `regex: <reason> at offset <n>` error naming the first place the syntax
@@ -37,7 +55,79 @@ export fn compile(pattern: string): Regex! {
   let prog = compileProg(ast, groups)?
   let names = []string(groups)
   collectGroupNames(ast, names)
-  return Regex{ source: pattern, ast: ast, groups: groups, prog: prog, names: names }
+  return Regex{
+    source: pattern,
+    ast: ast,
+    groups: groups,
+    prog: prog,
+    names: names,
+    prefilter: derivePrefilter(ast),
+    selfCheck: prefilterSelfCheckEnabled(),
+  }
+}
+
+// Whether #2052's agreement self-check is on for this process: read once,
+// here, per `compile()` call — never per search — so the hot (off) path
+// pays no per-call environment lookup. Undocumented and internal on
+// purpose (the ticket's own constraint: no public API to force the
+// prefilter off, including for this check) — `tests/imports/regexprefilter/`
+// is the only setter, and it can only reach this by re-executing itself
+// with the variable set (`std/os` has no `setEnv`), never by importing
+// anything from this module that isn't already exported.
+fn prefilterSelfCheckEnabled(): bool {
+  return len(envOr("BIT_REGEX_PREFILTER_SELFCHECK", "")) > 0
+}
+
+// Runs `re`'s program against `s` from `startAt` — the real,
+// prefilter-accelerated path every one of `matches`/`find`/`findAll`
+// funnels through. When `re.selfCheck` is on, ALSO runs the same program
+// with the prefilter forced off (`noPrefilter()`) and panics on any
+// disagreement (`assertPrefilterAgrees`), so every search this module
+// performs while the switch is set is checked, not just a hand-picked
+// sample.
+fn searchRegex(re: Regex, s: string, startAt: int): (bool, []int) {
+  let (matched, slots) = runPike(re.prog, s, startAt, re.prefilter)
+  if (re.selfCheck) {
+    let (refMatched, refSlots) = runPike(re.prog, s, startAt, noPrefilter())
+    assertPrefilterAgrees(re.source, matched, slots, refMatched, refSlots)
+  }
+  return matched, slots
+}
+
+// `matched`/`refMatched` disagreeing, or — when both matched — any slot
+// disagreeing, is a correctness bug in `prefilter.bit`'s derivation, not a
+// recoverable condition: panicking here is what makes the agreement test
+// in `tests/imports/regexprefilter/` fail loudly instead of silently
+// passing on a prefilter that skips a real match.
+fn assertPrefilterAgrees(
+  source: string,
+  matched: bool,
+  slots: []int,
+  refMatched: bool,
+  refSlots: []int,
+) {
+  if (matched != refMatched) {
+    panic("regex: prefilter disagreement on \"${source}\": matched=${matched}, reference matched=${refMatched}")
+  }
+  if (!matched) {
+    return
+  }
+  assertSlotsEqual(source, slots, refSlots)
+}
+
+fn assertSlotsEqual(source: string, slots: []int, refSlots: []int) {
+  if (len(slots) != len(refSlots)) {
+    panic("regex: prefilter disagreement on \"${source}\": slot count ${len(slots)} vs ${len(refSlots)}")
+  }
+  let i = 0
+  // Bounded by `slots`'s length, fixed before the loop starts (`re.prog`'s
+  // own `numSlots`, the same for both runs).
+  while (i < len(slots)) {
+    if (slots[i] != refSlots[i]) {
+      panic("regex: prefilter disagreement on \"${source}\": slot ${i} differs (${slots[i]} vs ${refSlots[i]})")
+    }
+    i = i + 1
+  }
 }
 
 // `compile`, panicking on a malformed `pattern` instead of returning an
@@ -87,7 +177,7 @@ export fn (re: Regex) groupNames(): []string {
 // finishes in O(len(s) x len(re's program)) time — there is no
 // backtracking, so no pattern and no input can make it exponential.
 export fn (re: Regex) matches(s: string): bool {
-  let (matched, _) = runPike(re.prog, s, 0)
+  let (matched, _) = searchRegex(re, s, 0)
   return matched
 }
 
@@ -150,7 +240,7 @@ export fn (m: Match) named(name: string): Option<Match> {
 // `Option.None` when there is none — an unanchored search, same convention
 // as `matches`.
 export fn (re: Regex) find(s: string): Option<Match> {
-  let (matched, slots) = runPike(re.prog, s, 0)
+  let (matched, slots) = searchRegex(re, s, 0)
   if (!matched) {
     return Option.None
   }
@@ -197,7 +287,7 @@ export fn (re: Regex) findAll(s: string, limit: int): []Match {
     if (limit > 0 && len(out) >= limit) {
       return out
     }
-    let (matched, slots) = runPike(re.prog, s, pos)
+    let (matched, slots) = searchRegex(re, s, pos)
     if (!matched) {
       return out
     }
