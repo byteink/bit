@@ -429,12 +429,95 @@ fn emitAtomicPollFieldInPlace(cx: A64Ctx, baseReg: int, wordOff: int) {
   ldar(cx.code, 3, baseReg, baseReg)
 }
 
+// ---------------------------------------------------------------------------
+// #3564: clause 3 (preempt pending) — NOT a leaf, unlike every arm above
+// ---------------------------------------------------------------------------
+//
+// The inlined equivalent of stwPollNeeded's #3560 clause, mirrored exactly:
+//
+//   let worker = schedCurrentWorker()
+//   if (worker != 0) {
+//     let workerId = *(taskAt(worker) + wkId)
+//     if (preemptRequested(workerId)) { return true }
+//   }
+//
+// Placed between the world-stop check and the gcAddr==0 check in the ladder
+// below, exactly as in stwPollNeeded — preemption must work even with GC
+// disabled, so this cannot be folded into the GC-only tail.
+//
+// UNLIKE the rest of this ladder, both `schedCurrentWorker`
+// (runtime/sched/sched.bit) and `preemptRequested` (runtime/sched/preempt.bit,
+// #3563's pin) are genuine cross-module calls, and this clause runs them on
+// EVERY guard evaluation, not only on the "poll needed" branch the way the
+// eventual `bl bit_rt_safepoint` below does. Neither answer can be cached the
+// way emitPollCachePrefetch caches worldAddr/gcAddr once per function entry:
+// those are per-process constants that never change; the current worker is
+// the current execution context, which this very guard can change out from
+// under a cached copy the moment it causes a yield (a preempted task may
+// resume on a different worker). So the fast/no-preempt path of this ladder
+// is no longer call-free once this clause is present — see #3564's own
+// ticket for the measured before/after instruction count and wall clock.
+//
+// A CALL-FREE INLINE WAS INVESTIGATED AND IS NOT POSSIBLE WITHIN THIS
+// TICKET'S CONSTRAINTS, not merely undone for lack of time. `preemptRequested`
+// reads one atomic word (runtime/sched/preempt.bit: "return
+// atomicLoad(slotAddr(ptrOf(requested), worker)) != 0"), which in principle
+// could be inlined the way pgWorldStopWordWord's clause is — BUT its backing
+// array (`requested`) carries no `@symbol` pin, and #3564's own constraints
+// forbid touching runtime/sched/preempt.bit to add one. So at least one real
+// call is unavoidable regardless of schedCurrentWorker. `schedCurrentWorker`
+// itself is architecturally O(1) in the common case (runtime/sched/task.bit's
+// own comment on schedMaybeYieldForPreempt: "not a scan, but not free"), so a
+// call-free inline of IT ALONE is conceivable — but only by adding a NEW
+// `@symbol`-pinned accessor to runtime/sched/sched.bit for its lookup table's
+// base address (module state has no cross-module pin today — see this file's
+// own header on the eight/nine pgWord offsets) and by hand-encoding
+// schedTaskOnStack's mask-and-index sequence identically in BOTH backends —
+// the same class of drift-prone duplication #3420's gcThreadTokenSymbol
+// comment describes and scopes as its own carefully-mirrored, test-pinned
+// unit, not something to improvise inline here. Since preemptRequested still
+// needs a real call either way, halving the call count would be a genuine
+// follow-up (a single new runtime accessor combining both checks, symbol-pinned
+// once) rather than an inline-without-a-call — reported, not attempted, in
+// #3564's own ticket comments.
+//
+// `emitCallReloc` directly, exactly like emitPollCachePrefetch's two calls
+// above, not the vreg-based emitCall/marshalArgs: neither call's argument nor
+// result corresponds to an IR vreg — both are pure codegen-internal scratch
+// values with no backing IR instruction.
+fn emitInlinedPreemptCheck(cx: A64Ctx, pollFixups: []int): []int {
+  emitCallReloc(cx, schedCurrentWorkerSymbol())
+  let rWorker = scratch1()
+  movRR(cx.code, rWorker, retRegNum())
+  cmpZero(cx.code, rWorker)
+  let offTaskFixup = emitLocalCondBranch(cx, condEq()) // worker==0: off-task, no-op
+
+  // workerId = *(taskAt(worker) + wkId): worker is a raw, word-aligned block
+  // address (never a small index — see task.bit's own note on this, which
+  // this mirrors), so a direct byte-offset immediate load is exactly
+  // `*(wNil + (worker >> 3) + wkId)` for any aligned address, the same
+  // reduction this file's other loads already make (emitPollField).
+  loadImm(cx.code, rWorker, rWorker, pgWkIdWord() * 8, 8, false)
+  movRR(cx.code, argReg(RegClass.Int, 0), rWorker)
+  emitCallReloc(cx, preemptRequestedSymbol())
+  // C-ABI bool: normalize before testing, same rule bindCallResult applies to
+  // every other call result (ABI.md: a narrow bool return leaves the upper
+  // bits of the register unspecified).
+  uxtb(cx.code, retRegNum())
+  cmpZero(cx.code, retRegNum())
+  pollFixups = append(pollFixups, emitLocalCondBranch(cx, condNe())) // preempt pending -> poll
+
+  patchLocalCondBranch(cx, offTaskFixup)
+  return pollFixups
+}
+
 // The inlined equivalent of:
 //
 //   fn stwPollNeeded(): bool {
 //     let waddr = worldAddr
 //     if (waddr == 0) { return true }
 //     if (atomicLoad(world + worldStopWord) != 0) { return true }
+//     // #3564's clause -- emitInlinedPreemptCheck above
 //     let gA = gcAddr
 //     if (gA == 0) { return true }
 //     if (*(g + gcCfgStress) != 0) { return true }
@@ -452,7 +535,8 @@ fn emitAtomicPollFieldInPlace(cx: A64Ctx, baseReg: int, wordOff: int) {
 // scratch1/scratch2 hold the cached worldAddr/gcAddr only until each is used
 // for the last time, then get reused as plain temporaries, exactly as the
 // rest of this backend already treats them (never live across an instruction
-// boundary by convention).
+// boundary by convention) — emitInlinedPreemptCheck follows the identical
+// convention for its own two calls.
 fn emitInlinedPollGuard(cx: A64Ctx) {
   let rWorld = scratch1()
   let rGc = scratch2()
@@ -467,6 +551,8 @@ fn emitInlinedPollGuard(cx: A64Ctx) {
   emitAtomicPollFieldInPlace(cx, rWorld, pgWorldStopWordWord())
   cmpZero(cx.code, rWorld)
   pollFixups = append(pollFixups, emitLocalCondBranch(cx, condNe())) // stop pending
+
+  pollFixups = emitInlinedPreemptCheck(cx, pollFixups) // #3564 clause 3
 
   loadImm(cx.code, rGc, regSp(), pollCacheOffset(cx.frame, 1), 8, false)
   cmpZero(cx.code, rGc)
