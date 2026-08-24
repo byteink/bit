@@ -196,9 +196,25 @@ export fn mldsaKeygenSeed(seed: []byte): MldsaKeypair {
   }
 
   // Split t into (t1, t0) and pack the public key.
+  let packed = mldsaBuildPublicKey(t, rho)
+
+  // sk = rho || K || tr || pack(s1) || pack(s2) || pack(t0).
+  let tr = mldsaShake256(packed.pk, 64)
+  let sk = mldsaBuildSecretKey(rho, kk, tr, MldsaSecretVecs{ s1: s1, s2: s2, t0: packed.t0 })
+  return MldsaKeypair{ pk: packed.pk, sk: sk }
+}
+
+// Public-key output of `mldsaBuildPublicKey`: the packed 1952-byte `pk`, and
+// the `t0` half of the split `t` that `mldsaBuildSecretKey` also needs.
+class MldsaPubkeySplit { pk: []byte, t0: []int }
+
+// FIPS 204 Algorithm 6 steps 8-9: split `t` into (t1, t0) via `Power2Round`,
+// then pack `rho || pack(t1)` into the 1952-byte public key. Split out of
+// `mldsaKeygenSeed` (#2448).
+fn mldsaBuildPublicKey(t: []int, rho: []byte): MldsaPubkeySplit {
   let t1 = []int(6 * 256)
   let t0 = []int(6 * 256)
-  i = 0
+  let i = 0
   while (i < 6 * 256) {
     mldsaPower2Round(t[i], t1, t0, i)
     i = i + 1
@@ -214,11 +230,20 @@ export fn mldsaKeygenSeed(seed: []byte): MldsaKeypair {
     mldsaPackT1(t1, p, pk, 32 + p * 320)
     p = p + 1
   }
+  return MldsaPubkeySplit{ pk: pk, t0: t0 }
+}
 
-  // sk = rho || K || tr || pack(s1) || pack(s2) || pack(t0).
-  let tr = mldsaShake256(pk, 64)
+// The three secret vectors `mldsaBuildSecretKey` packs: s1 (l=5 polys), s2
+// (k=6 polys), and the low half t0 (k=6 polys) of the split public t.
+class MldsaSecretVecs { s1: []int, s2: []int, t0: []int }
+
+// FIPS 204 Algorithm 6 steps 10-11: pack `rho || K || tr || pack(s1) ||
+// pack(s2) || pack(t0)` into the 4032-byte secret key. Split out of
+// `mldsaKeygenSeed` (#2448); `s1`/`s2`/`t0` are grouped into `MldsaSecretVecs`
+// to keep this under E0202's 5-parameter limit.
+fn mldsaBuildSecretKey(rho: []byte, kk: []byte, tr: []byte, sv: MldsaSecretVecs): []byte {
   let sk = []byte(4032)
-  i = 0
+  let i = 0
   while (i < 32) {
     sk[i] = rho[i]
     sk[32 + i] = kk[i]
@@ -229,28 +254,182 @@ export fn mldsaKeygenSeed(seed: []byte): MldsaKeypair {
     sk[64 + i] = tr[i]
     i = i + 1
   }
-  p = 0
+  let p = 0
   while (p < 5) {
-    mldsaPackS(s1, p, sk, 128 + p * 128)
+    mldsaPackS(sv.s1, p, sk, 128 + p * 128)
     p = p + 1
   }
   p = 0
   while (p < 6) {
-    mldsaPackS(s2, p, sk, 768 + p * 128)
+    mldsaPackS(sv.s2, p, sk, 768 + p * 128)
     p = p + 1
   }
   p = 0
   while (p < 6) {
-    mldsaPackT0(t0, p, sk, 1536 + p * 416)
+    mldsaPackT0(sv.t0, p, sk, 1536 + p * 416)
     p = p + 1
   }
-  return MldsaKeypair{ pk: pk, sk: sk }
+  return sk
 }
 
 // KeyGen (FIPS 204 Algorithm 1): generate a fresh key pair from 32 bytes of OS
 // cryptographic randomness. The seed is not retained.
 export fn mldsaKeygen(): MldsaKeypair {
   return mldsaKeygenSeed(randomBytes(32))
+}
+
+// Commitment vector w = A_hat . NTT(y) (FIPS 204 Algorithm 7 steps 11-12), for
+// mask index `kappa`. Split out of `mldsaSignInternal` (#2448).
+class MldsaCommitment { y: []int, w: []int }
+
+fn mldsaCommit(a: []int, rhoP: []byte, kappa: int, zetas: []int): MldsaCommitment {
+  let y = []int(5 * 256)
+  let i = 0
+  while (i < 5) {
+    mldsaExpandMask(rhoP, kappa + i, y, i * 256)
+    i = i + 1
+  }
+  let yh = []int(5 * 256)
+  i = 0
+  while (i < 5 * 256) {
+    yh[i] = y[i]
+    i = i + 1
+  }
+  mldsaNttVec(yh, 5, zetas)
+  let w = []int(6 * 256)
+  mldsaMatVec(a, 6, 5, yh, w)
+  mldsaInvNttVec(w, 6, zetas)
+  return MldsaCommitment{ y: y, w: w }
+}
+
+// Challenge c_tilde = H(mu || pack(HighBits(w))) and its NTT'd ring challenge
+// polynomial ch (FIPS 204 Algorithm 7 steps 13-16). Split out of
+// `mldsaSignInternal` (#2448).
+class MldsaChallenge { ctilde: []byte, ch: []int }
+
+fn mldsaChallenge(mu: []byte, w: []int, zetas: []int): MldsaChallenge {
+  let w1 = []byte(768)
+  let i = 0
+  while (i < 6) {
+    let poly = []int(256)
+    let n = 0
+    while (n < 256) {
+      poly[n] = mldsaHighBits(w[i * 256 + n])
+      n = n + 1
+    }
+    mldsaPackW1(poly, 0, w1, i * 128)
+    i = i + 1
+  }
+  let cs = newShake256()
+  cs.absorb(mu)
+  cs.absorb(w1)
+  let ctilde = cs.squeeze(48)
+  let c = []int(256)
+  mldsaSampleInBall(ctilde, c)
+  let ch = []int(256)
+  i = 0
+  while (i < 256) {
+    ch[i] = c[i]
+    i = i + 1
+  }
+  mldsaNtt(ch, zetas)
+  return MldsaChallenge{ ctilde: ctilde, ch: ch }
+}
+
+// z = y + c*s1, rejecting if any coefficient reaches gamma1 - beta (FIPS 204
+// Algorithm 7 step 17). Split out of `mldsaSignInternal` (#2448).
+class MldsaZResult { z: []int, ok: bool }
+
+fn mldsaComputeZ(s1: []int, ch: []int, y: []int, zetas: []int): MldsaZResult {
+  let z = []int(5 * 256)
+  mldsaScaleVec(s1, 5, ch, z)
+  mldsaInvNttVec(z, 5, zetas)
+  let i = 0
+  while (i < 5 * 256) {
+    z[i] = mldsaModQ(z[i] + y[i])
+    i = i + 1
+  }
+  if (mldsaVecNormExceeds(z, 5, 524092)) {
+    return MldsaZResult{ z: z, ok: false }
+  }
+  return MldsaZResult{ z: z, ok: true }
+}
+
+// r0 = LowBits(w - c*s2), rejecting if any coefficient reaches gamma2 - beta
+// (FIPS 204 Algorithm 7 step 19). Split out of `mldsaSignInternal` (#2448).
+class MldsaR0Result { wcs2: []int, ok: bool }
+
+fn mldsaComputeR0(s2: []int, ch: []int, w: []int, zetas: []int): MldsaR0Result {
+  let cs2 = []int(6 * 256)
+  mldsaScaleVec(s2, 6, ch, cs2)
+  mldsaInvNttVec(cs2, 6, zetas)
+  let wcs2 = []int(6 * 256)
+  let i = 0
+  while (i < 6 * 256) {
+    wcs2[i] = mldsaModQ(w[i] - cs2[i])
+    i = i + 1
+  }
+  let bad = false
+  i = 0
+  while (i < 6 * 256) {
+    // LowBits is centered; shift into [0,q) before the norm test.
+    if (mldsaNormExceeds(mldsaModQ(mldsaLowBits(wcs2[i])), 261692)) {
+      bad = true
+      break
+    }
+    i = i + 1
+  }
+  return MldsaR0Result{ wcs2: wcs2, ok: !bad }
+}
+
+// c*t0 and the hint h[n] = HighBits(w-c*s2+c*t0) != HighBits(w-c*s2), rejecting
+// if any c*t0 coefficient reaches gamma2 or the hint weight exceeds omega
+// (FIPS 204 Algorithm 7 steps 21-26). Split out of `mldsaSignInternal` (#2448).
+class MldsaHintResult { h: []int, ok: bool }
+
+fn mldsaComputeHint(t0: []int, ch: []int, wcs2: []int, zetas: []int): MldsaHintResult {
+  let ct0 = []int(6 * 256)
+  mldsaScaleVec(t0, 6, ch, ct0)
+  mldsaInvNttVec(ct0, 6, zetas)
+  if (mldsaVecNormExceeds(ct0, 6, 261888)) {
+    return MldsaHintResult{ h: []int(0), ok: false }
+  }
+  let h = []int(6 * 256)
+  let weight = 0
+  let i = 0
+  while (i < 6 * 256) {
+    let hi = mldsaHighBits(mldsaModQ(wcs2[i] + ct0[i]))
+    let lo = mldsaHighBits(wcs2[i])
+    if (hi != lo) {
+      h[i] = 1
+      weight = weight + 1
+    } else {
+      h[i] = 0
+    }
+    i = i + 1
+  }
+  if (weight > 55) {
+    return MldsaHintResult{ h: h, ok: false }
+  }
+  return MldsaHintResult{ h: h, ok: true }
+}
+
+// sig = c_tilde || pack(z) || pack(h) (FIPS 204 Algorithm 7 step 34). Split
+// out of `mldsaSignInternal` (#2448).
+fn mldsaPackSignature(ctilde: []byte, z: []int, h: []int): []byte {
+  let sig = []byte(3309)
+  let i = 0
+  while (i < 48) {
+    sig[i] = ctilde[i]
+    i = i + 1
+  }
+  let p = 0
+  while (p < 5) {
+    mldsaPackZ(z, p, sig, 48 + p * 640)
+    p = p + 1
+  }
+  mldsaPackHint(h, sig, 3248)
+  return sig
 }
 
 // Sign_internal (FIPS 204 Algorithm 7), deterministic (rnd = 0). Runs the
@@ -293,129 +472,27 @@ fn mldsaSignInternal(sk: []byte, tr: []byte, ctx: []byte, msg: []byte): []byte {
 
   let kappa = 0
   while (true) {
-    // Commitment: w = A_hat . NTT(y) in the coefficient domain.
-    let y = []int(5 * 256)
-    let i = 0
-    while (i < 5) {
-      mldsaExpandMask(rhoP, kappa + i, y, i * 256)
-      i = i + 1
-    }
+    let commit = mldsaCommit(a, rhoP, kappa, zetas)
     kappa = kappa + 5
-    let yh = []int(5 * 256)
-    i = 0
-    while (i < 5 * 256) {
-      yh[i] = y[i]
-      i = i + 1
-    }
-    mldsaNttVec(yh, 5, zetas)
-    let w = []int(6 * 256)
-    mldsaMatVec(a, 6, 5, yh, w)
-    mldsaInvNttVec(w, 6, zetas)
 
-    // Challenge c from c_tilde = H(mu || pack(HighBits(w))).
-    let w1 = []byte(768)
-    i = 0
-    while (i < 6) {
-      let poly = []int(256)
-      let n = 0
-      while (n < 256) {
-        poly[n] = mldsaHighBits(w[i * 256 + n])
-        n = n + 1
-      }
-      mldsaPackW1(poly, 0, w1, i * 128)
-      i = i + 1
-    }
-    let cs = newShake256()
-    cs.absorb(mu)
-    cs.absorb(w1)
-    let ctilde = cs.squeeze(48)
-    let c = []int(256)
-    mldsaSampleInBall(ctilde, c)
-    let ch = []int(256)
-    i = 0
-    while (i < 256) {
-      ch[i] = c[i]
-      i = i + 1
-    }
-    mldsaNtt(ch, zetas)
+    let chal = mldsaChallenge(mu, commit.w, zetas)
 
-    // z = y + c*s1; reject if any coefficient reaches gamma1 - beta.
-    let z = []int(5 * 256)
-    mldsaScaleVec(s1, 5, ch, z)
-    mldsaInvNttVec(z, 5, zetas)
-    i = 0
-    while (i < 5 * 256) {
-      z[i] = mldsaModQ(z[i] + y[i])
-      i = i + 1
-    }
-    if (mldsaVecNormExceeds(z, 5, 524092)) {
+    let zr = mldsaComputeZ(s1, chal.ch, commit.y, zetas)
+    if (!zr.ok) {
       continue
     }
 
-    // r0 = LowBits(w - c*s2); reject if it reaches gamma2 - beta.
-    let cs2 = []int(6 * 256)
-    mldsaScaleVec(s2, 6, ch, cs2)
-    mldsaInvNttVec(cs2, 6, zetas)
-    let wcs2 = []int(6 * 256)
-    i = 0
-    while (i < 6 * 256) {
-      wcs2[i] = mldsaModQ(w[i] - cs2[i])
-      i = i + 1
-    }
-    let bad = false
-    i = 0
-    while (i < 6 * 256) {
-      // LowBits is centered; shift into [0,q) before the norm test.
-      if (mldsaNormExceeds(mldsaModQ(mldsaLowBits(wcs2[i])), 261692)) {
-        bad = true
-        break
-      }
-      i = i + 1
-    }
-    if (bad) {
+    let r0 = mldsaComputeR0(s2, chal.ch, commit.w, zetas)
+    if (!r0.ok) {
       continue
     }
 
-    // c*t0: reject if any coefficient reaches gamma2, else build the hint.
-    let ct0 = []int(6 * 256)
-    mldsaScaleVec(t0, 6, ch, ct0)
-    mldsaInvNttVec(ct0, 6, zetas)
-    if (mldsaVecNormExceeds(ct0, 6, 261888)) {
-      continue
-    }
-    // h[n] = HighBits(w-c*s2+c*t0) != HighBits(w-c*s2).
-    let h = []int(6 * 256)
-    let weight = 0
-    i = 0
-    while (i < 6 * 256) {
-      let hi = mldsaHighBits(mldsaModQ(wcs2[i] + ct0[i]))
-      let lo = mldsaHighBits(wcs2[i])
-      if (hi != lo) {
-        h[i] = 1
-        weight = weight + 1
-      } else {
-        h[i] = 0
-      }
-      i = i + 1
-    }
-    if (weight > 55) {
+    let hint = mldsaComputeHint(t0, chal.ch, r0.wcs2, zetas)
+    if (!hint.ok) {
       continue
     }
 
-    // sig = c_tilde || pack(z) || pack(h).
-    let sig = []byte(3309)
-    i = 0
-    while (i < 48) {
-      sig[i] = ctilde[i]
-      i = i + 1
-    }
-    p = 0
-    while (p < 5) {
-      mldsaPackZ(z, p, sig, 48 + p * 640)
-      p = p + 1
-    }
-    mldsaPackHint(h, sig, 3248)
-    return sig
+    return mldsaPackSignature(chal.ctilde, zr.z, hint.h)
   }
 }
 
@@ -441,14 +518,12 @@ export fn mldsaSign(sk: []byte, msg: []byte): []byte {
   return mldsaSignCtx(sk, msg, []byte(0))
 }
 
-// Verify_internal (FIPS 204 Algorithm 8): recompute the commitment from the
-// signature and check its hash matches c_tilde. Returns false on any structural
-// or arithmetic failure.
-fn mldsaVerifyInternal(pk: []byte, tr: []byte, ctx: []byte, msg: []byte, sig: []byte): bool {
-  let zetas = mldsaZetas()
-  let rho = pk[0:32]
+// Unpack and range-check a signature (FIPS 204 Algorithm 8 steps 2-6): split
+// `sig` into c_tilde/z/h, rejecting a malformed hint or a z coefficient
+// reaching gamma1 - beta. Split out of `mldsaVerifyInternal` (#2448).
+class MldsaSigUnpack { ctilde: []byte, z: []int, h: []int, ok: bool }
 
-  // Unpack and range-check the signature.
+fn mldsaUnpackSignature(sig: []byte): MldsaSigUnpack {
   let ctilde = sig[0:48]
   let z = []int(5 * 256)
   let p = 0
@@ -458,14 +533,31 @@ fn mldsaVerifyInternal(pk: []byte, tr: []byte, ctx: []byte, msg: []byte, sig: []
   }
   let h = []int(6 * 256)
   if (!mldsaUnpackHint(sig, 3248, h)) {
-    return false
+    return MldsaSigUnpack{ ctilde: ctilde, z: z, h: h, ok: false }
   }
   if (mldsaVecNormExceeds(z, 5, 524092)) {
+    return MldsaSigUnpack{ ctilde: ctilde, z: z, h: h, ok: false }
+  }
+  return MldsaSigUnpack{ ctilde: ctilde, z: z, h: h, ok: true }
+}
+
+// Verify_internal (FIPS 204 Algorithm 8): recompute the commitment from the
+// signature and check its hash matches c_tilde. Returns false on any structural
+// or arithmetic failure.
+fn mldsaVerifyInternal(pk: []byte, tr: []byte, ctx: []byte, msg: []byte, sig: []byte): bool {
+  let zetas = mldsaZetas()
+  let rho = pk[0:32]
+
+  let unpacked = mldsaUnpackSignature(sig)
+  if (!unpacked.ok) {
     return false
   }
+  let ctilde = unpacked.ctilde
+  let z = unpacked.z
+  let h = unpacked.h
 
   let t1 = []int(6 * 256)
-  p = 0
+  let p = 0
   while (p < 6) {
     mldsaUnpackT1(pk, 32 + p * 320, t1, p)
     p = p + 1
