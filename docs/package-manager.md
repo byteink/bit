@@ -187,6 +187,43 @@ $ bit up quicwire
 bit up: quicwire -> v1.4.2 (a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2)
 ```
 
+## `bit outdated`
+
+```
+bit outdated [--dir <path>]
+```
+
+Read-only report, one line per dependency `bit.json` names. Never rewrites
+`bit.json` or `bit.lock`, and never fetches into the cache. Exits 0 whether
+or not anything is outdated - it reports, it does not gate.
+
+Output format, tab-separated after the `bit outdated: ` prefix - stable and
+greppable, meant to be parsed by scripts:
+
+```
+bit outdated: <name>\t<locked>\t<wanted>\t<latest>
+```
+
+- `locked` - the version `bit.lock` currently records (or `local` for a
+  local-path dependency, or the raw ref for a branch/bare-sha dependency,
+  which has no version concept).
+- `wanted` - the newest version satisfying `bit.json`'s constraint - what a
+  plain `bit up` would move `bit.lock` to.
+- `latest` - the newest version published at all, even outside the current
+  constraint - what `bit up --latest` would move both files to.
+
+`-` in `wanted`/`latest` means "not applicable" (a local, branch, or
+bare-sha dependency has no versions to report).
+
+```console
+$ bit outdated
+bit outdated: quicwire	1.2.0	1.5.0	2.0.0
+bit outdated: httpkit	2.0.0	2.0.0	2.0.0
+```
+
+`quicwire` is pinned with a `^1.2.0` constraint and is one release behind
+what its own constraint already allows; `httpkit` is exactly current.
+
 ## `bit remove`
 
 ```

@@ -1,0 +1,184 @@
+// compiler/pmclioutdated.bit — `bit outdated` (#2368), epic #2362. Same
+// module, sibling of pmcli.bit/pmcliup.bit: reuses pmcli.bit's
+// `resolveHighestSatisfying`/`resolveVersionRefSha`/`parseAddVersionRef`/
+// `pmCliDefaultTimeoutMs`/`parseDirFlag` and pmcliup.bit's `projectDeps`/
+// `DepSpecNamed` unqualified — an import is per-MODULE, not per-file, so
+// re-importing any of those names here would be `E0042 already declared in
+// this scope`.
+//
+// `bit outdated` is a READ-ONLY projection of the same resolver `bit add`/
+// `bit up` use (`resolveHighestSatisfying`, pmcli.bit) — never a second
+// constraint-satisfaction path, so it can never report a "newest satisfying
+// version" that disagrees with what `bit up` would actually move to. It
+// never fetches into the cache, never writes bit.lock, and never writes
+// bit.json: every git call below is a read (`git ls-remote`), and neither
+// `writeLock` nor `rewriteManifest` is ever called from this file — grepped,
+// confirmed absent.
+
+// `bit outdated [--dir <path>]`. Prints one line per dependency `bit.json`
+// names, in the stable, greppable format documented in
+// docs/package-manager.md (`bit outdated: <name>\t<locked>\t<wanted>\t
+// <latest>`). Exits 0 whether or not anything is outdated — this reports, it
+// does not gate (ticket #2368's own constraint) — 2 on a usage error, 1 on a
+// read/resolve failure (a missing bit.json, an unreachable remote).
+fn outdatedCmd(a: []string): int {
+  if (len(a) > 2 && pmIsHelpFlag(a[2])) {
+    print("usage: bit outdated [--dir <path>]\n")
+    return 0
+  }
+  let (projectDir, badArg, hasBadArg) = parseDirFlag(a, 2)
+  if (hasBadArg) {
+    eprint("bit outdated: unexpected argument '${badArg}'\n")
+    return 2
+  }
+
+  let rows = outdatedDependencies(projectDir, defaultGitBin, pmCliDefaultTimeoutMs) catch e {
+    eprint("bit outdated: ${e.message()}\n")
+    return 1
+  }
+
+  let i = 0
+  while (i < len(rows)) {
+    print("bit outdated: ${rows[i].name}\t${rows[i].locked}\t${rows[i].wanted}\t${rows[i].latest}\n")
+    i = i + 1
+  }
+  return 0
+}
+
+// ---- the outdated flow, independent of argv/exit codes ------------------
+
+// One `bit.json` dependency's report row: the version bit.lock currently
+// records, the newest version satisfying its bit.json constraint (what
+// plain `bit up` would move it to), and the newest version published at
+// all (what `bit up --latest` would move it to). "-" in any column means
+// "not applicable" — a local dependency (no remote, no versions) or a
+// branch/bare-sha ref (not a version constraint at all, SPEC §17.7's other
+// two ref forms `bit add`'s own resolver already passes through unresolved).
+class OutdatedRow { name: string, locked: string, wanted: string, latest: string }
+
+// `gitBin`/`url`/`timeoutMs` travel together through every resolver call
+// below (`resolveVersionRefSha`, `listVersions`) once a dependency's fetch
+// url is known — grouped into one class (per E0202) rather than threading
+// three positional parameters through every helper.
+class OutdatedFetch { gitBin: string, url: string, timeoutMs: int }
+
+// Every dependency `<projectDir>/bit.json` names, read-only: `projectDeps`
+// (pmcliup.bit) decodes bit.json exactly as `bit up` does, and bit.lock is
+// only ever read (`readLock`), never written. Fails the same way `bit up`
+// does on a missing/malformed bit.json or bit.lock.
+export fn outdatedDependencies(projectDir: string, gitBin: string, timeoutMs: int): []OutdatedRow! {
+  let deps = projectDeps(projectDir)?
+  let entries = readLock(pmJoin(projectDir, "bit.lock"))?
+
+  let out = []OutdatedRow(0)
+  let i = 0
+  while (i < len(deps)) {
+    out = append(out, outdatedRowFor(deps[i], entries, gitBin, timeoutMs)?)
+    i = i + 1
+  }
+  return out
+}
+
+// `entries[i].commit` for `name`, or "" if bit.lock has no entry yet (the
+// dependency was only just added to bit.json by hand, never `bit add`ed).
+fn lockedCommitFor(entries: []LockEntry, name: string): string {
+  let i = 0
+  while (i < len(entries)) {
+    if (entries[i].name == name) {
+      return entries[i].commit
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+// One dependency's row. A local-scheme dependency has no remote and no
+// versions at all — `locked: "local"`, both other columns "-", no git call.
+// Everything else derives the same `url` `upDependencies` (pmcliup.bit)
+// would fetch from, then defers entirely to `outdatedVersionRow` for a
+// version-shaped ref, or reports the raw ref unresolved for a branch/sha.
+fn outdatedRowFor(
+  d: DepSpecNamed,
+  entries: []LockEntry,
+  gitBin: string,
+  timeoutMs: int,
+): OutdatedRow! {
+  if (d.spec.scheme == "local") {
+    return OutdatedRow{ name: d.name, locked: "local", wanted: "-", latest: "-" }
+  }
+  let url = outdatedUrlFor(d, entries, timeoutMs)?
+  let (c, isVersion) = parseAddVersionRef(d.spec.ref)
+  if (!isVersion) {
+    // A branch name or bare commit sha: not a version constraint, matching
+    // `resolveAddRef`'s own passthrough rule (pmcli.bit) — reported as-is,
+    // no resolver call.
+    return OutdatedRow{ name: d.name, locked: d.spec.ref, wanted: "-", latest: "-" }
+  }
+  let fetch = OutdatedFetch{ gitBin: gitBin, url: url, timeoutMs: timeoutMs }
+  return outdatedVersionRow(d.name, c, lockedCommitFor(entries, d.name), fetch)?
+}
+
+// The url `outdatedRowFor` would fetch from — the vanity document's
+// `gitUrl`, or the same direct/ssh derivation `upDependencies` uses
+// (`existingUrlFor`'s bit.lock-recorded url, falling back to the derived
+// default for a dependency bit.lock has no entry for yet).
+fn outdatedUrlFor(d: DepSpecNamed, entries: []LockEntry, timeoutMs: int): string! {
+  if (d.spec.vanity) {
+    let doc = resolveVanityUrl(d.spec.vanityName, vanityTimeoutMs)?
+    return doc.gitUrl
+  }
+  let fallbackUrl = defaultDepUrl(d.spec.host, d.spec.owner, d.spec.repo)
+  if (d.spec.scheme == "ssh") {
+    fallbackUrl = sshDepUrl(d.spec.sshUser, d.spec.host, d.spec.owner, d.spec.repo)
+  }
+  return existingUrlFor(entries, d.name, fallbackUrl)
+}
+
+// The version-constrained case: lists `fetch.url`'s tags once, reused for
+// all three columns — `wanted` via `highestInSet` against `c`'s own range
+// (`resolveHighestSatisfying`'s own selection rule, pmcli.bit — reused, not
+// re-picked), `latest` as the highest tag overall (`listVersions` already
+// sorts descending), `locked` via `outdatedLockedVersion` mapping
+// `lockedCommit` back to whichever tag produced it.
+fn outdatedVersionRow(
+  name: string,
+  c: Constraint,
+  lockedCommit: string,
+  fetch: OutdatedFetch,
+): OutdatedRow! {
+  let versions = listVersions(fetch.gitBin, fetch.url, fetch.timeoutMs)?
+  let latest = "-"
+  if (len(versions) > 0) {
+    latest = formatConstraint(Constraint{ op: ConstraintOp.Exact, version: versions[0] })
+  }
+  let wanted = "-"
+  let (chosen, found) = highestInSet(versions, versionSetFromConstraint(c))
+  if (found) {
+    wanted = formatConstraint(Constraint{ op: ConstraintOp.Exact, version: chosen })
+  }
+  let locked = outdatedLockedVersion(versions, lockedCommit, fetch)?
+  return OutdatedRow{ name: name, locked: locked, wanted: wanted, latest: latest }
+}
+
+// `lockedCommit` mapped back to whichever published version resolves to it
+// — the reverse of `resolveHighestSatisfying`'s "pick a version, then find
+// its ref": here the commit is already known, so every candidate is tried
+// (`resolveVersionRefSha`, pmcli.bit, the identical v-prefixed-then-bare tag
+// rule) until one's sha matches. "" (nothing locked yet) and no match found
+// (bit.lock's commit predates the tag list, or was hand-edited to something
+// no tag names) both fall back to the commit's own short prefix, since
+// printing nothing would hide real information a user asked for.
+fn outdatedLockedVersion(versions: []Version, lockedCommit: string, fetch: OutdatedFetch): string! {
+  if (len(lockedCommit) == 0) {
+    return "-"
+  }
+  let i = 0
+  while (i < len(versions)) {
+    let (_, sha) = resolveVersionRefSha(fetch.gitBin, fetch.url, versions[i], fetch.timeoutMs)?
+    if (sha == lockedCommit) {
+      return formatConstraint(Constraint{ op: ConstraintOp.Exact, version: versions[i] })
+    }
+    i = i + 1
+  }
+  return lockedCommit[0:7]
+}
