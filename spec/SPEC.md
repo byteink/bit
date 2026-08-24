@@ -3602,13 +3602,14 @@ total __text bytes (same 23 objects): 319,012   (.bit_gc / __text = 18.6%)
 `bit-out/bin/bit`'s whole `__text` is 4,406,220 bytes. Extrapolating the
 runtime's own per-function averages (387 bytes code, 72 bytes stack-map data
 per function) to the whole binary gives roughly **11,400 functions**. The
-debug-info table's per-function cost is 16 bytes of header plus 16 bytes per
+debug-info table's per-function cost is 24 bytes of header (16 originally;
+#3662 added an 8-byte per-entry function-name field) plus 16 bytes per
 line-table row (ABI.md §4.2); **the row count per function cannot be
 measured before #3283 exists** — there is no emitter to measure — so what
 follows is stated as an estimate, not a fact: at an assumed 8 rows/function
 (a function of the compiler's own average size, ~387 bytes, touching perhaps
-8-15 distinct source lines), the table costs roughly 144 bytes/function,
-**~1.6 MB total, ~25% of the current 6.5 MB dev binary**. #3283 should
+8-15 distinct source lines), the table costs roughly 152 bytes/function,
+**~1.7 MB total, ~26% of the current 6.5 MB dev binary**. #3283 should
 replace the 8-rows assumption with a measured figure the first time a real
 emitter exists, and revise this number rather than repeat it.
 

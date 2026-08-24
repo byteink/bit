@@ -726,7 +726,7 @@ Two alternatives were weighed and rejected:
   model: `bit` links a *prebuilt* `libbitrt.a`, and this would require the
   runtime to be recompiled into every user program's object.
 
-### 4.2 Debug-info line table (designed, not yet emitted — #3281)
+### 4.2 Debug-info line table (emitted since #3283/#3591; function names since #3662)
 
 Decided by #3281 (`spec/SPEC.md` §18.6.1: bespoke over DWARF, and why). The
 walker that symbolizes a panic (#3285) reads a second, independent side table,
@@ -750,7 +750,7 @@ one global name is a duplicate-definition error, and only the linker sees the
 whole link.
 
 **Wire format**, little-endian. Every field is fixed-width and both the
-per-function header (16 bytes) and each row (16 bytes) are already multiples
+per-function header (24 bytes) and each row (16 bytes) are already multiples
 of 8, so — unlike `.bit_gc`'s variable-length safepoint sub-arrays — no entry
 ever needs a trailing pad byte or a rounding step to reach the next one:
 
@@ -762,6 +762,9 @@ per function (repeated to the end of the extent):
   u16 format_version   # checked before code_size/num_rows are trusted (below)
   u32 code_size
   u16 num_rows
+  u64 name_hdr_ptr      # abs reloc -> this FUNCTION's own display name's
+                         # string-pool header (#3662) — one per entry, not
+                         # one per row, unlike file_hdr_ptr below
   per row (num_rows times):
     u32 pc_offset        # code_addr + pc_offset is this row's start address;
                           # rows sorted ascending; a row's span runs to the
@@ -791,6 +794,12 @@ trusting `code_size`, `num_rows`, or any row — placed immediately after
 logic depends on sitting at offset 0 is undisturbed. A mismatch does **not**
 call `bit_rt_panic` (below): it is treated exactly like "no record."
 
+**`format_version` bumped 1 -> 2 by #3662**, the change that added
+`name_hdr_ptr` — a reader built against version 1's 16-byte header must not
+misinterpret version 2's 24-byte one as though the byte at old offset 16 were
+already the first row's `pc_offset`. Per the paragraph above, a mismatch
+degrades to "no record" rather than misreading bytes.
+
 **File references reuse the existing string pool, interned per object.**
 `module.stringPool` (`compiler/ir.bit:410`) is not deduplicated today — every
 `append` adds a new entry regardless of content. A debug-info emitter that
@@ -800,6 +809,14 @@ object** (a small map from path to the string-pool header symbol already
 emitted for it), so every function's rows in the same file share one 16-byte
 header. This is required for the format's size to be what SPEC §18.6.1
 measures, not an optional optimization.
+
+**Function names reuse the same string pool, interned per object, once per
+entry rather than once per row (#3662).** `name_hdr_ptr` points at the
+function's own display name — the same string codegen already names that
+function's `code_addr` relocation with — interned into `module.stringPool`
+exactly once per debug-info entry, mirroring the file-path interning above
+but keyed by function rather than by row, since a function's name does not
+vary row to row the way its rows' files can.
 
 **Lookup, at panic time, with no allocation.** Two nested searches, mirroring
 `runtime/gc/stackmap.bit`'s existing `blobU16`/`blobU32`/`blobU64`/`blobI32`
