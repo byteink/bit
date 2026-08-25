@@ -2806,8 +2806,12 @@ needs no OS service (no syscall, no `sysctlbyname`), only the CPU's own ARMv8
 Cryptographic Extension instructions (AESE/AESMC/AESD/AESIMC), so one source
 file is compiled once per TARGET (x86_64-linux, aarch64-linux, aarch64-macos)
 the same way `runtime/syscalls/syscalls.bit` already is. Every exported
-function starts `if (onX64()) return` — a no-op on x86_64, since Bit has no
-arch-conditional compilation (SPEC §11.8).
+function starts `if (onX64())`, which must COMPILE on x86_64 since Bit has no
+arch-conditional compilation (SPEC §11.8) — but reaching it there panics
+(#3669) rather than silently returning: nothing may legitimately call these
+pins on x86_64, so a call that gets there is the bug, and a silent no-op left
+the caller's buffer unmodified with no error, the worst failure mode a crypto
+primitive has.
 
 **THE EXTENSION IS OPTIONAL ON AARCH64**, unlike NEON — a Cortex-A72 (the
 chip in a Raspberry Pi 3/4, and this project's own remote `mypi` fleet
@@ -2855,8 +2859,9 @@ same recurrence `stdlib/crypto/gcm.bit`'s software `gcmAbsorb` does: `state =
 (state XOR block) * H`, once per block, in order.
 
 **PLATFORM-FREE**, same reasoning as §21d's AES pins — one source file per
-TARGET, every exported function starts `if (onX64()) return`, and every
-exported function also calls `ghashRequireHwSupport` (bit 1, PMULL, of
+TARGET, every exported function starts `if (onX64())` and panics if reached
+there rather than silently returning (#3669, same reasoning as §21d), and
+every exported function also calls `ghashRequireHwSupport` (bit 1, PMULL, of
 `bit_rt_crypto_hwcaps()`) before issuing PMULL/PMULL2, for the same "optional
 extension, SIGILL otherwise" reason §21d documents for AES.
 
@@ -2916,8 +2921,9 @@ big-endian per FIPS 180-4's own convention.
 in order.
 
 **PLATFORM-FREE**, same reasoning as §21d/§21e — one source file per TARGET,
-the exported function starts `if (onX64()) return`, and it also calls
-`sha256RequireHwSupport` (bit 2, SHA2, of `bit_rt_crypto_hwcaps()`) before
+the exported function starts `if (onX64())` and panics if reached there
+rather than silently returning (#3669, same reasoning as §21d), and it also
+calls `sha256RequireHwSupport` (bit 2, SHA2, of `bit_rt_crypto_hwcaps()`) before
 issuing SHA256H/SHA256H2/SHA256SU0/SHA256SU1, for the same "optional
 extension, SIGILL otherwise" reason §21d documents for AES — the SHA-2
 extension is a separate ARMv8 Cryptographic Extension feature bit from both
