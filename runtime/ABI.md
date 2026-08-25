@@ -2457,7 +2457,7 @@ separate signal channel):
 
 `-2` and `<= -100` stay distinct on purpose: `-2` means the *runtime* killed the
 child on a budget, `<= -100` means something else killed it first. `timeout_ms`
-is clamped to one hour (`os_run_bounded_max_ms`), matching the harnesses'
+is clamped to 80 minutes (`os_run_bounded_max_ms`), matching the harnesses'
 own `max_timeout_s` clamp, so a caller typo cannot reinstate an unbounded wait; the
 poll loop's iteration count is bounded by that clamp divided by the poll
 interval (Power of 10 rule 2) rather than an open-ended `while (true)` — the
@@ -2612,7 +2612,7 @@ Implemented as a poll-and-sleep loop (`runtime/net/{darwin,linux}/tcp.bit`'s
 poll/timer race to the scheduler: on each `EAGAIN` the deadline is checked,
 then the calling task sleeps a short, bounded slice (2ms, matching §19's
 `osPollNs`) via `schedSleepUntil` before retrying the syscall itself, capped
-at a one-hour wait ceiling (`os_run_bounded_max_ms`'s own clamp) expressed as
+at an 80-minute wait ceiling (`os_run_bounded_max_ms`'s own clamp) expressed as
 a worst-case poll count so the loop is statically bounded either way. No
 `gcSyscallBegin`/`gcSyscallEnd` bracket: every syscall this touches
 (`read`/`write`/`connect`) runs on this provider's always-non-blocking
