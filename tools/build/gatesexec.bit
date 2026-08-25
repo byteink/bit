@@ -24,6 +24,44 @@ fn gateTimeoutMs(): int {
   return parseIntOr(s, 5400) * 1000
 }
 
+// `osRunBounded`'s own ceiling (runtime/root/*/os.bit `osBoundedMaxMs`,
+// runtime/ABI.md §19). Every bound this driver hands to `osRunBounded` —
+// directly via `runShell`, or indirectly through the outer batch call in
+// `batchOuterTimeoutMs()` — is silently clamped to this by the runtime, so
+// this driver has to compute and report the SAME effective value rather
+// than the number it asked for (#3706). There is no shared symbol to import
+// across the compiler/runtime boundary (`osRunBounded` is a compiler
+// primitive lowered straight to `bit_rt_os_run_bounded`, not an ordinary
+// function this side could call into), so this mirrors the constant the way
+// every other caller in the repo already does — e.g.
+// tests/bit/golden/golden.bit's `maxTimeoutMs`, tests/bit/parsergate.bit's
+// `maxTimeoutMs`.
+const gateBoundedMaxMs: int = 3600000
+
+// The bound actually in effect once the runtime's ceiling applies. This is
+// the only number safe to print in a timeout message or compare against an
+// observed wall clock — `requestedMs` alone is what the caller ASKED for,
+// which `osRunBounded` may have silently reduced.
+fn effectiveTimeoutMs(requestedMs: int): int {
+  if (requestedMs > gateBoundedMaxMs) {
+    return gateBoundedMaxMs
+  }
+  return requestedMs
+}
+
+// A loud, distinct line the moment a requested bound gets silently reduced
+// by the runtime ceiling, printed right before the call that will be
+// clamped (#3706) — so the reduction is visible up front instead of only
+// inferable later from a timeout message that used to report the wrong
+// number.
+fn warnIfTimeoutReduced(label: string, requestedMs: int) {
+  let eff = effectiveTimeoutMs(requestedMs)
+  if (eff == requestedMs) {
+    return
+  }
+  eprint("make: WARNING: ${label} requested a ${requestedMs / 1000}s bound, reduced to ${eff / 1000}s by osRunBounded's one-hour ceiling (runtime/root/*/os.bit osBoundedMaxMs)\n")
+}
+
 fn parseIntOr(s: string, fallback: int): int {
   let n = 0
   let i = 0
@@ -97,8 +135,9 @@ fn runGate(name: string): int {
   if (!gatePrereqsReady()) {
     return 1
   }
+  warnIfTimeoutReduced("gate '${name}'", gateTimeoutMs())
   let rc = runShell(name, "set -e\n" + gateEnvExecScript(g), gateTimeoutMs())
-  return reportGate(name, rc)
+  return reportGate(name, rc, gateTimeoutMs())
 }
 
 // A child killed by a signal is a CRASH, and must not read as a plain non-zero
@@ -112,13 +151,13 @@ fn runGate(name: string): int {
 // 128+signo in the ordinary shell convention. Both are crashes; reporting only
 // one of them would let the common case — a segfaulting harness under an `exec`
 // that the shell reports numerically — read as a failed assertion.
-fn reportGate(name: string, rc: int): int {
+fn reportGate(name: string, rc: int, requestedMs: int): int {
   if (rc == 0 - 1) {
     eprint("make: ${name} could not be started (spawn/wait failed)\n")
     return 1
   }
   if (rc == 0 - 2) {
-    eprint("make: ${name} TIMED OUT after ${gateTimeoutMs() / 1000}s — this is a hang, not a failed assertion\n")
+    eprint("make: ${name} TIMED OUT after ${effectiveTimeoutMs(requestedMs) / 1000}s — this is a hang, not a failed assertion\n")
     return 1
   }
   if (rc <= 0 - 100) {
@@ -472,9 +511,9 @@ fn namesOf(chunk: []Gate): []string {
 // rc with a zero outerRc means the slot simply never reported, and that is a
 // failure on its own, not a silent pass. Returns true when the gate counts
 // as failed.
-fn reportMissingRc(name: string, outerRc: int): bool {
+fn reportMissingRc(name: string, outerRc: int, boundMs: int): bool {
   if (outerRc != 0) {
-    return reportGate(name, outerRc) != 0
+    return reportGate(name, outerRc, boundMs) != 0
   }
   eprint("make: ${name} DID NOT REPORT — no rc file written\n")
   return true
@@ -504,7 +543,7 @@ fn reportChunkVerdict(g: Gate, dir: string, sha: string, runId: string, rcPath: 
       rc = 0 - 2
     }
   }
-  return reportGate(g.name, rc) != 0
+  return reportGate(g.name, rc, gateTimeoutMs()) != 0
 }
 
 // #2562: reads back the `.dur` marker `gateBatchUnit` writes (whole seconds,
@@ -544,6 +583,7 @@ fn runGateChunk(chunk: []Gate, sha: string, runId: string): []string {
     eprint("make: cannot create ${dir}\n")
     return namesOf(chunk)
   }
+  warnIfTimeoutReduced("gate batch (${len(chunk)} gate(s))", batchOuterTimeoutMs())
   let outerRc = runShell("gatebatch", batchScript(chunk, dir, sha, runId), batchOuterTimeoutMs())
   for g of chunk {
     print("make: ${g.name}\n")
@@ -551,7 +591,7 @@ fn runGateChunk(chunk: []Gate, sha: string, runId: string): []string {
     print(readFile("${dir}/${g.name}.${runId}.out") catch "")
     let isFailed = false
     if (!exists(rcPath)) {
-      isFailed = reportMissingRc(g.name, outerRc)
+      isFailed = reportMissingRc(g.name, outerRc, batchOuterTimeoutMs())
     } else {
       isFailed = reportChunkVerdict(g, dir, sha, runId, rcPath)
     }
@@ -623,7 +663,8 @@ fn stepFuzz(extras: []string): int {
     script = script + " " + shQuote(a)
   }
   script = script + "\n"
-  return reportGate("fuzz", runShell("fuzz", script, gateTimeoutMs()))
+  warnIfTimeoutReduced("fuzz", gateTimeoutMs())
+  return reportGate("fuzz", runShell("fuzz", script, gateTimeoutMs()), gateTimeoutMs())
 }
 
 // `./make fuzz-regex [-- <seconds> [seed]]` — the open-ended std/regex
@@ -652,7 +693,8 @@ fn stepFuzzRegex(extras: []string): int {
     script = script + "export BIT_REGEXFUZZ_SEED=" + shQuote(extras[1]) + "\n"
   }
   script = script + "exec " + shQuote(bitBin()) + " run " + shQuote("${repoRoot()}/tests/bit/regexfuzz.bit") + "\n"
-  return reportGate("fuzz-regex", runShell("fuzz-regex", script, gateTimeoutMs()))
+  warnIfTimeoutReduced("fuzz-regex", gateTimeoutMs())
+  return reportGate("fuzz-regex", runShell("fuzz-regex", script, gateTimeoutMs()), gateTimeoutMs())
 }
 
 fn indexOfByte(s: string, c: byte): int {
