@@ -365,10 +365,67 @@ fn joinWorker(done: *i32, timeoutNs: int): bool {
   return false
 }
 
+// The boot thread's step-7 wait for `main` (`./boot.bit`), placed here because
+// the two halves of that rendezvous only make sense read together: this waits
+// on `mainDone`, and `mainTrampoline` below is its only writer.
+//
+// #3717: THIS WAS AN OPEN-CODED 1ms POLL AND IT COST A FIFTH OF A CORE FOREVER.
+// The loop ramped `parkSleepNs` from 1us and capped the ramp at
+// `parkMaxBackoffNs`, so after ~10 turns it saturated and this thread woke 1000
+// times a second for the whole life of the process, running a
+// `gcBlockingBegin`/`gcBlockingEnd` pair and a safepoint poll on every wake. A
+// 30-hour `bit lsp` had done roughly 108 million of them, with 8492 of 8508
+// `sample` hits inside the sleep.
+//
+// `parkWait` is the primitive the loop always wanted. It is a COMPARE-and-wait
+// (`__ulock_wait` here, `futex(FUTEX_WAIT)` on ../linux, `WaitOnAddress` on
+// ../windows), so the kernel re-reads `mainDone` under its own lock: a store
+// landing between this thread's own load and the wait is caught by that compare
+// and returns immediately instead of being missed. There is no separate
+// double-check to write. `mainTrampoline` issues the matching `parkWake`.
+//
+// THE TIMEOUT IS 0 — WAIT FOREVER — AND THAT IS NOT AN OVERSIGHT. A finite one
+// would be the obvious safety net, and `runtime/sched/sleep.bit`'s
+// `idleParkMaxNs` is exactly that for a parked worker, but it is unavailable
+// here: ../linux's `parkWait` builds its `timespec` as `[]i64(2)`, a HEAP
+// slice, and `gcBlockingBegin`'s precondition is that this thread holds no live
+// Bit reference for the whole bracketed region. Allocating inside the bracket
+// would hand the collector a reference on a stack it has been told not to scan.
+// The re-check below is the net instead.
+//
+// THAT RE-CHECK IS THE SPIN GUARD AND IT IS LOAD-BEARING. `parkWait` reports
+// "re-read the word" for a real wake, a spurious wake, a failed compare AND an
+// error — ../../park/park.bit's contract deliberately conflates them, and
+// ../windows additionally declines to block at all when its 32-slot scratch
+// pool is full. So a `parkWait` that returns without ever blocking would make
+// this a hot spin. One `parkMaxBackoffNs` sleep when `main` is still running
+// makes the worst case exactly the 1ms poll this replaced, and never worse.
+//
+// THE BRACKET STAYS (#2542, `runtime/gc/gcworldsync.bit`): the collector must
+// see this thread as `blocked` for the whole wait, or it spins on a thread that
+// will never reach a safepoint.
+fn bootWaitForMain() {
+  while (atomicLoad(ptrOf(mainDone)) == i32(0)) {
+    gcBlockingBegin()
+    let _ = parkWait(ptrOf(mainDone), i32(0), 0)
+    if (atomicLoad(ptrOf(mainDone)) == i32(0)) {
+      parkSleepNs(parkMaxBackoffNs, ptrOf(bootSleepReq))
+    }
+    gcBlockingEnd()
+  }
+}
+
 // The first green thread: run `bit_main`, publish its exit code, leave the task.
 fn mainTrampoline() {
   mainExitCode = int(bit_main())
   atomicStore(ptrOf(mainDone), i32(1))
+  // #3717: the boot thread is PARKED on this word in `bootWaitForMain` above,
+  // not polling it, so it needs waking. STRICTLY AFTER the store — `parkWait`'s
+  // compare is what closes the race, and it can only act on a value already
+  // published. `all` rather than one: the boot thread is the sole waiter today,
+  // a wake with no waiter is a no-op on every platform, so waking all costs the
+  // same and cannot silently miss a second observer if one is ever added.
+  let _ = parkWake(ptrOf(mainDone), true)
   schedTaskExit()
 }
 

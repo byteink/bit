@@ -150,8 +150,8 @@ import { pollCreate, pollClose, pollDrain, winSpawnTrampoline } from "../../sche
 // already imported into this module by ./io.bit — an import is per-MODULE,
 // not per-file, so a second import of any of them here would be E0042.
 import { threadStackBytes } from "../../thread"
-import { parkMinBackoffNs, parkNextBackoff } from "../../park"
-import { parkMonoNs, parkSleepNs } from "../../park/windows"
+import { parkMinBackoffNs, parkMaxBackoffNs, parkNextBackoff } from "../../park"
+import { parkMonoNs, parkSleepNs, parkWait, parkWake } from "../../park/windows"
 import { mapPages, unmapPages, protectPages } from "../../alloc/windows"
 import { rootBindMemory, rootInit, rootConfigureFromEnv, rootEnvMarkStack, rootEnvWorkers } from "../../root"
 import { rootGcAddr, rootWorldAddr } from "../../root"
@@ -399,11 +399,51 @@ fn workerBody(arg: *byte): *byte {
   return nil
 }
 
+// The boot thread's step-7 wait for `main`, placed here beside
+// `mainTrampoline`, the only writer of `mainDone`. See
+// ../darwin/bootworker.bit's twin for the full argument; the three points that
+// decide correctness are:
+//
+//   - #3717: this was an open-coded `parkSleepNs` ramp capped at
+//     `parkMaxBackoffNs`, so once it saturated the thread woke 1000 times a
+//     second for the life of the process. `parkWait` is a COMPARE-and-wait
+//     (`WaitOnAddress` here), so a store landing between this thread's own load
+//     and the wait is caught by the kernel's own compare, not missed.
+//   - THE TIMEOUT IS 0 — WAIT FOREVER — matching the other two platforms, where
+//     a finite one is barred by ../linux's heap-allocating `timespec` inside
+//     the `gcBlockingBegin` bracket. Here 0 maps to INFINITE.
+//   - THE RE-CHECK IS THE SPIN GUARD, and this is the platform that needs it
+//     most: ../../park/windows/wait.bit's `parkWait` returns `parkWaitReady`
+//     WITHOUT BLOCKING when its 32-slot scratch pool is full, and
+//     `WaitOnAddress` documents spurious returns outright. One
+//     `parkMaxBackoffNs` sleep makes the worst case the 1ms poll this replaced,
+//     and never worse.
+//
+// NOT VERIFIED ON WINDOWS (#3717): the change was written and gated on
+// aarch64-macos, where the darwin twin is measured and mutation-tested. This
+// copy compiles for x86_64-windows and is textually identical in shape, but no
+// Windows execution backs it.
+fn bootWaitForMain() {
+  while (atomicLoad(ptrOf(mainDone)) == i32(0)) {
+    gcBlockingBegin()
+    let _ = parkWait(ptrOf(mainDone), i32(0), 0)
+    if (atomicLoad(ptrOf(mainDone)) == i32(0)) {
+      parkSleepNs(parkMaxBackoffNs, ptrOf(bootSleepReq))
+    }
+    gcBlockingEnd()
+  }
+}
+
 // The first green thread: run the user's `bit_main`, publish its exit code,
 // leave the task. Identical to ../linux and ../darwin's `mainTrampoline`.
 fn mainTrampoline() {
   mainExitCode = int(bit_main())
   atomicStore(ptrOf(mainDone), i32(1))
+  // #3717: the boot thread is PARKED on this word in `bootWaitForMain` above,
+  // not polling it. STRICTLY AFTER the store — `parkWait`'s compare can only act
+  // on a value already published. `all` because a wake with no waiter is a
+  // no-op, so it costs the same and cannot miss a second observer.
+  let _ = parkWake(ptrOf(mainDone), true)
   schedTaskExit()
 }
 
@@ -603,21 +643,12 @@ fn boot(): int {
     }
   }
 
-  // 7. Wait for `main` — the `mainDone` poll-with-backoff, bracketed
-  //    `blocked` exactly as ../linux/../darwin's boot thread (see their
-  //    "THE BOOT THREAD AND THE RENDEZVOUS" header for the full safety
-  //    argument, which applies unchanged here: this function allocates
-  //    nothing on the managed heap at any point).
-  let backoff = 1000
-  while (atomicLoad(ptrOf(mainDone)) == i32(0)) {
-    gcBlockingBegin()
-    parkSleepNs(backoff, ptrOf(bootSleepReq))
-    gcBlockingEnd()
-    backoff = backoff * 2
-    if (backoff > 1000000) {
-      backoff = 1000000
-    }
-  }
+  // 7. Wait for `main` — `bootWaitForMain` below, bracketed `blocked` exactly
+  //    as ../linux/../darwin's boot thread (see their "THE BOOT THREAD AND THE
+  //    RENDEZVOUS" header for the full safety argument, which applies
+  //    unchanged here: this function allocates nothing on the managed heap at
+  //    any point). It was an open-coded 1ms poll here until #3717.
+  bootWaitForMain()
 
   // 8. Signal shutdown, then join each started worker's real OS thread —
   //    WaitForSingleObject on its CreateThread HANDLE, bounded by
