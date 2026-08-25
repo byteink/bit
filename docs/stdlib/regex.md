@@ -380,3 +380,62 @@ fn wordCount(s: string): int {
   return len(re.findAll(s, -1))
 }
 ```
+
+### `Regex.replaceAll(s: string, repl: string): string`
+
+Every leftmost, non-overlapping match of `re`'s pattern in `s`, replaced by
+`repl` with `repl`'s own `$`-template expanded against that match's capture
+groups. Text between matches, and any text after the last one, is copied
+through unchanged. A pattern that never matches returns `s` itself,
+unchanged.
+
+Uses the same non-overlapping scan as `findAll` (above), including its
+empty-match rule: a pattern that can match the empty string still
+terminates, and never substitutes twice at the same position — `a*` against
+`"bb"` yields three substitutions, at byte offsets 0, 1 and 2, never four.
+
+Template syntax:
+
+| Written in `repl` | Expands to |
+|---|---|
+| `$0` .. `$9`, `$10`, ... | Capture group by index — **every** following digit is consumed, so `$12` is group twelve, never group one followed by the literal digit "2". `$0` is the whole match. |
+| `${N}` | The same group-by-index reference, braced — the only way to write a group number immediately followed by a literal digit: `${1}0` is group 1 then `"0"`; `$10` is group 10. |
+| `${name}` | Capture group by name. |
+| `$$` | A literal `$`. |
+| `$` at the end of the template | A literal `$` — there is no following character to combine with. |
+| `$` followed by anything else | A literal `$` plus that character, both unchanged. |
+
+**A group that took no part in the match, an out-of-range index, or an
+unknown `${name}` all expand to the empty string — never to the literal
+template text.** This is the single most common bug in this feature across
+languages.
+
+An `${...}` that is unterminated, empty, or whose content is neither
+all-digit nor a valid group-name shape is not treated as a reference at
+all: the `$` is emitted as a literal byte and scanning resumes at the `{`,
+which is then copied like any other literal text.
+
+```bit
+import { mustCompile } from "std/regex"
+
+fn toMonthYear(s: string): string {
+  let re = mustCompile("(?<year>[0-9]{4})-(?<month>[0-9]{2})")
+  return re.replaceAll(s, "\${month}/\${year}")
+}
+```
+
+### `Regex.replaceFirst(s: string, repl: string): string`
+
+The leftmost match of `re`'s pattern in `s`, replaced by `repl` with the
+same `$`-template expansion `replaceAll` uses (above). Every other match,
+if any, is left untouched. Returns `s` unchanged when there is no match at
+all.
+
+```bit
+import { mustCompile } from "std/regex"
+
+fn maskFirstDigits(s: string): string {
+  let re = mustCompile("[0-9]+")
+  return re.replaceFirst(s, "***")
+}
+```
