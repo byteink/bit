@@ -467,6 +467,38 @@ column: one space past the widest code column (`Printer.col` at the moment
 `fmtGap`, fmt.bit, would otherwise have written a bare single space) among
 the run's members.
 
+**Own-line comments are a hard break, confirmed against gofmt rather than
+assumed (`#3691`).** gofmt is this feature's stated model, so its own
+tabwriter-driven alignment is the oracle: an own-line comment inside a
+`gofmt`-aligned block realigns the two sides into two independently-columned
+groups, never one column spanning the interruption. Probed directly with
+`gofmt` (Go 1.27), a two-member `const` block interrupted by an own-line
+comment —
+
+    const (
+        muState     = 0      // MutatorState (atomic)
+        muFrameLong = 111111 // published safepoint-snapshot address, else 0
+        // muFrame's value is also a valid stack pointer for that thread.
+        muAcked         = 2     // the stop epoch this slot last parked FOR
+        muOwnerVeryLong = 33333 // the owning OS thread token, 0 when free
+    )
+
+— aligns `muState`/`muFrameLong` to each other and `muAcked`/`muOwnerVeryLong`
+to a different, independent column; the own-line comment between them never
+joins either group. `bit fmt` matches this exactly: an own-line comment ends
+a trailing-comment run the same way a blank line or a bare code line does,
+for both formatters, rather than Bit inventing a stricter rule than the one
+it is documented to follow. A repo scan across `compiler/`, `runtime/`,
+`stdlib/`, `tools/` and `tests/` (1570 `.bit` files) found 19 places in 13
+files where a hand-aligned trailing-comment run is interrupted by an
+own-line comment — `compiler/codegen.bit`'s `pgWorldStopWordWord`-family
+field-offset table (two of the interruptions) and `runtime/gc/gcworld.bit`'s
+`Mutator` field consts (four) among them — so this is a narrow, bounded
+rule, not one that reformats the corpus at large.
+`tests/cases/fmt_comment_run_own_line_break.bit` pins the decision: its two
+runs land at different comment columns in `.expected`, so a future change
+that starts spanning the interruption fails this fixture.
+
 A run also breaks — in addition to the three line-adjacency breaks above —
 before any member whose own code column would push the shared column past
 `fmtMaxWidth` (fmt.bit's existing 100-column budget, the same one §1, §5 and
