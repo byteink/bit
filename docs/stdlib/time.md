@@ -132,6 +132,29 @@ fn fanOut() {
 }
 ```
 
+### `sleepUntil(deadlineNs: int)`
+
+Parks the calling green thread until `deadlineNs` on the clock `monotonic().ns`
+reads — an absolute instant, not a duration. Useful when several callers must
+park on the exact same deadline: compute it once and hand it to every
+`sleepUntil` caller, rather than each recomputing `deadline - monotonic().ns`
+after acquiring a lock, which drifts. A `deadlineNs` already in the past
+returns quickly rather than parking indefinitely.
+
+```bit
+import { monotonic, sleepUntil, Millisecond } from "std/time"
+
+fn waitUntilDeadline(deadline: int) {
+  sleepUntil(deadline)
+  println("deadline passed at ${monotonic().ns}")
+}
+
+fn example() {
+  let deadline = monotonic().ns + 50 * Millisecond
+  waitUntilDeadline(deadline)
+}
+```
+
 ## Converting a duration
 
 ### `millis(d: int): int`
