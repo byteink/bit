@@ -1351,16 +1351,46 @@ calls `boot`, and exits the process with `boot`'s returned code.
    `configFromEnv(environ)` — §7).
 2. Init and start the scheduler (`runtime/sched/sched.bit`) with `nthreads`
    worker OS threads: `BIT_WORKERS` if set and parseable, clamped to `[1, 32]`,
-   **otherwise 1**. The ceiling is static so `boot` allocates nothing new for it.
+   **otherwise 1**. The ceiling is static so `boot` allocates nothing new for
+   it. `BIT_WORKERS` always overrides the default that follows.
 
-   **The default is 1 by measurement, not caution.** Defaulting to the CPU count
-   was implemented and reverted in the same ticket: an idle worker still runs its
-   find-work/steal/backoff loop, so a pool wider than the runnable work costs
-   more than it saves. On an 18-core box, four CPU-bound tasks took 108% of one
-   task's time with four workers and 215% with eighteen; a full `./make test`,
-   which runs many Bit processes at once, drove load to 79 and timed out a test
-   that had never timed out. Every Bit process would have become a thread bomb.
-   The default flips once an idle worker is cheap.
+   **The boot-time default is 1, and it changes at run time, not at boot.**
+   Defaulting *boot itself* to the CPU count was tried and reverted twice, for
+   two independent, measured reasons (`runtime/sched/pool-sizing.md` records
+   both verbatim). First: an idle worker ran its find-work/steal/backoff loop
+   regardless of runnable work, so a pool wider than the work cost more than
+   it saved — on an 18-core box, four CPU-bound tasks took 108% of one task's
+   time with four workers and 215% with eighteen. #1902 fixed that (idle
+   workers now park on a futex instead of spinning; the same repro is flat at
+   0.04-0.05s for 1..18 idle workers). Second, even after idle cost was fixed,
+   a core-count default still failed `./make test`: a boot-time snapshot of
+   "cores available right now" is a claim on the *whole machine*, wrong for a
+   process that is itself one of N run at once. `tests/bit/docs.bit` runs 12
+   `bit` processes concurrently by design; at 18 workers each that is 200+
+   parked worker threads on 18 cores, and a batch that runs in ~48s blew its
+   300s deadline on oversubscription alone — the threads were genuinely
+   parked (sampled at 0:00.00 CPU), not spinning.
+
+   **The rule that changes the pool size at run time**
+   (`runtime/sched/grow.bit`, #2593/#3569/#3583 — grow-on-demand, the design
+   chosen in `runtime/sched/pool-sizing.md`): every `spawn` tracks backlog two
+   ways, one for each of the queues a task can land on. `schedGrowObserve`
+   counts a streak of consecutive enqueues that find the scheduler's global
+   run queue still non-empty; `schedGrowObserveLocal` reads a spawning
+   worker's own local ring depth directly (its head/tail already give an
+   exact count, so this needs no streak — a ring at or above threshold IS
+   backlog the instant it's observed). Either one reaching
+   `growStreakThreshold` (4), with the pool still below `schedMaxWorkers`
+   (32 — the same static ceiling the clamp above uses), starts exactly one
+   more OS thread and resets. Both paths matter: an ordinary CPU-bound
+   program's spawns stay on the calling worker's own local ring, so without
+   the local check the global one alone never sees them and the pool never
+   grows past 1 regardless of backlog (#3583). This applies regardless of
+   whether the pool started at the default above or at an explicit
+   `BIT_WORKERS` — nothing gates growth on which one produced the starting
+   count. A program that never has parallel work never pays for a pool it
+   doesn't use; a program with sustained backlog grows toward the machine's
+   actual, current free capacity instead of a boot-time guess at it.
 
    This was pinned to **exactly one** until #1900. It was never a *collector*
    requirement — §5's handshake makes concurrent mutators safe, and each worker
@@ -1375,8 +1405,11 @@ calls `boot`, and exits the process with `boot`'s returned code.
    that appears only under multiple workers as a first execution, not a
    regression.
 
-   `BIT_WORKERS=1` reproduces the pre-#1900 behaviour exactly, and exists so a
-   suspected concurrency failure can be bisected against it without a rebuild.
+   `BIT_WORKERS=1` fixes the *boot-time* pool at pre-#1900's single worker,
+   and exists so a suspected concurrency failure can be bisected against it
+   without a rebuild — it is not a ceiling on growth, which can still raise
+   the pool above 1 under sustained backlog exactly as it would from the
+   default.
 3. Spawn `main_fn` (§10) as the first green thread.
 4. Poll (bounded exponential backoff) until that task reports done, then shut
    the scheduler down, tear down the collector, and return the task's exit
