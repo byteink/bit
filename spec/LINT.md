@@ -311,9 +311,48 @@ through a block that already has the outer name in play.
 Bit-specific aliasing rule the type system does not express, and one this
 repository has already paid for once in the self-hosted compiler. It fires when
 `append`'s first argument resolves to a parameter of slice type, and the result
-is not assigned back to that same parameter. It is the rule most likely to need
-overriding, since appending to a locally-owned copy is legitimate and not
+is not assigned back to that same parameter **and then handed out of the
+function through its own return value** (#3688). It is the rule most likely to
+need overriding, since appending to a locally-owned copy is legitimate and not
 always distinguishable from the AST.
+
+**Assigning back to a parameter is not equivalent to returning it — that used
+to be the whole exemption, and it was wrong.** `out = append(out, x)` reassigns
+a local binding; a parameter's binding is exactly as local as any other
+variable's, so on its own this never reaches the caller. It becomes safe only
+when the function's *own* return value carries the grown slice back out —
+concretely, one of three shapes, checked once per function and not chased past
+one hop:
+
+- `return out` — the parameter itself, bare;
+- `return append(out, ...)` — grown once more on the way out, so a function
+  whose every `append` is self-assigned-then-returned-through-another-`append`
+  is not misread as never returning its parameter at all;
+- `return Bundle{ field: out, ... }` — threaded through one field of a
+  returned composite literal (`compiler/emitelf.bit`'s
+  `EmElfBlobs{ symbols: symbols, ... }`, #3648).
+
+A self-assignment whose function does none of the three is reported exactly
+like a bare, unassigned `append(out, x)` — self-assignment alone reaches none
+of the three shapes above, so this rule's own former suggested fix, "assign
+the result back to the parameter," was recommending the exact broken pattern
+it should have been catching (#3688). The current suggestion instead names
+the two shapes above that actually work: return the slice, or thread it
+through a returned bundle field.
+
+**One shape remains genuinely ambiguous from the AST, and is not attempted:**
+a slice parameter used purely as a local work buffer — grown across a loop,
+fully drained, and never read by the caller again — inside a function that
+returns nothing at all. `compiler/strip.bit`'s `closeKeptOverRelocs` is
+exactly this: `stack: []int` grows via `append` and shrinks via reslicing
+within one `while (len(stack) > 0)` drain, the function returns `()!`, and its
+caller (`deadStrip`) never touches its own `stack` local again after the call.
+That is indistinguishable, from this function's own body, from the shape the
+rule exists to catch — telling them apart needs the *caller's* body, which is
+the whole-program view this rule already declines elsewhere in this section.
+It is resolved the way every other AST-ambiguous case here is: a
+`// bit:lint allow E0214` directive naming the reason a human, not the rule,
+established.
 
 Note the tension, recorded rather than resolved: in Go these three are
 *compiler* errors, not vet findings. Making them hard errors in `bit check` is
