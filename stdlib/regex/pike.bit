@@ -13,15 +13,30 @@
 // time" becomes a lie every functional test still passes (see this file's
 // mutation-test note in the ticket this shipped under).
 //
-// ALLOCATION: both thread lists, their sparse sets, and the closure stack
-// are allocated exactly once per call to `runPike` — never per input
-// position, never per rune, and never stored on `Regex` (which stays
-// immutable and safe to share across any number of green threads; hanging
-// scratch state off it would make every spawned caller race on the same
-// buffer). The one exception, unavoidable once captures are tracked, is
-// `slots`: a thread RECORDED into a `ThreadList` gets its own snapshot
-// (`snapshotSlots`), because it has to outlive the closure walk that
-// produced it. The walk itself allocates nothing — see CAPTURES below.
+// ALLOCATION: both thread lists, their sparse sets, the closure stack, the
+// walk's scratch capture array and the start thread all live on one
+// `PikeScratch` (below), allocated once by the CALLER and reset — never
+// reallocated — at the top of every `runPike`. Never per input position,
+// never per rune, and never stored on `Regex` (which stays immutable and
+// safe to share across any number of green threads; hanging scratch state
+// off it would make every spawned caller race on the same buffer). The one
+// exception, unavoidable once captures are tracked, is `slots`: a thread
+// RECORDED into a `ThreadList` gets its own snapshot (`snapshotSlots`),
+// because it has to outlive the closure walk that produced it — and, being
+// its own array, it also outlives the scratch's reset, which is what lets
+// `findAll` keep every match it has already collected while reusing one
+// scratch for the next search. The walk itself allocates nothing — see
+// CAPTURES below.
+//
+// WHY THE SCRATCH IS THE CALLER'S, NOT `runPike`'s (#3659). `findAll` runs
+// one `runPike` per match, and the scratch is sized from `numInsts`/
+// `numSlots`, both fixed per `Prog` — so allocating it inside `runPike`
+// meant re-allocating the identical buffers once per match. On a 446-deep
+// pattern (`numInsts` 895, `numSlots` 894) that is ~96 KB of churn per
+// match, ~131 MB to collect 4096 of them, and it showed: `findAll` cost
+// 0.47-0.49 ms per search against 0.43 ms for the single `matches()` doing
+// the same work. One `newPikeScratch` per `findAll` makes the per-match
+// cost the search itself and nothing else.
 //
 // WHY THE WALK MUST NOT COPY PER `Save` (#3629). It used to: every `Save`
 // reached during the epsilon closure allocated a fresh `numSlots` array and
@@ -236,11 +251,13 @@ fn stackPushUndo(stack: PcStack, slot: int, val: int) {
 // pattern as `PcStack.sp`. Bundled so those functions stay at or under the
 // five-parameter ceiling without paying for extra parameters per call.
 //
-// `cur` is the walk's single scratch capture array (see CAPTURES at the top
-// of this file): `prog.numSlots` long, allocated once per `runPike`, reset
-// by `addThread` from whichever thread seeded the walk, mutated in place by
-// `Save` and undone by `PcStack`'s undo records. It is walk-local scratch,
-// never handed out — a recorded thread gets `snapshotSlots(cur)`.
+// `stack` and `cur` are borrowed from the caller's `PikeScratch`, not owned
+// here — a `PikeCtx` is the per-`runPike` view onto them. `cur` is the
+// walk's single scratch capture array (see CAPTURES at the top of this
+// file): `prog.numSlots` long, overwritten wholesale by `addThread` from
+// whichever thread seeded the walk, mutated in place by `Save` and undone
+// by `PcStack`'s undo records. It is walk-local scratch, never handed out —
+// a recorded thread gets `snapshotSlots(cur)`.
 class PikeCtx { prog: Prog, stack: PcStack, pos: int, cur: []int }
 
 // Resolves one pc reached during the epsilon closure: pushes its
@@ -399,8 +416,8 @@ fn runeBeforePos(s: string, pos: int): rune {
 }
 
 // `numSlots` slots, all unset (`-1`) — the capture state a brand-new start
-// thread begins with, seeded fresh at every input position an unanchored
-// search tries starting from.
+// thread begins with, at every input position an unanchored search tries
+// starting from.
 fn freshSlots(numSlots: int): []int {
   let out = []int(numSlots)
   let i = 0
@@ -409,6 +426,85 @@ fn freshSlots(numSlots: int): []int {
     i = i + 1
   }
   return out
+}
+
+// Every buffer `runPike` works in, sized from a `Prog` and reusable across
+// any number of searches against it (see ALLOCATION at the top of this
+// file). CALLER-OWNED and caller-local by construction — `newPikeScratch`
+// is the only way to get one, and `regex.bit`'s `matches`/`find`/`findAll`
+// each make their own on the stack of the call — so the shared, immutable
+// `Regex` never carries one and two green threads matching the same
+// pattern can never touch the same buffer.
+//
+// `start` is the seed thread every unanchored search position begins from:
+// `pc 0` with an all-`-1` capture state. It is safe to hand the SAME
+// `Thread` to every `addThread` call because `addThread` only ever reads
+// `start.pc` and copies `start.slots` out (`loadSlots`) — it never writes
+// through either, and never records `start` itself into a `ThreadList`
+// (`addThreadStep` builds a fresh `Thread` around `snapshotSlots`). So
+// `start.slots` stays all-`-1` for the life of the scratch and needs no
+// reset.
+class PikeScratch {
+  clist: ThreadList,
+  nlist: ThreadList,
+  stack: PcStack,
+  cur: []int,
+  start: Thread,
+}
+
+// A scratch sized for `prog` — `numInsts` bounds both thread lists and the
+// closure stack, `numSlots` both capture arrays, and neither changes for
+// the life of a compiled `Regex`, which is what makes one scratch good for
+// every search against it. `stack` is sized `numInsts + 1`: `addThread`'s
+// own bound (its comment) shows the closure stack can never hold more than
+// one entry per Split-or-Save instruction plus the one initial push, and no
+// instruction is both.
+fn newPikeScratch(prog: Prog): PikeScratch {
+  let numInsts = len(prog.insts)
+  return PikeScratch{
+    clist: newThreadList(numInsts),
+    nlist: newThreadList(numInsts),
+    stack: newPcStack(numInsts + 1),
+    cur: []int(prog.numSlots),
+    start: Thread{ pc: 0, slots: freshSlots(prog.numSlots) },
+  }
+}
+
+// Returns `sc` to its just-allocated state, in O(1) — `runPike`'s first act,
+// so a reused scratch is indistinguishable from a fresh one.
+//
+// BOTH `threadListClear`s ARE LOAD-BEARING, and dropping either is a
+// silent wrong-answer bug rather than a crash: `runPike` leaves its lists
+// populated on every one of its return paths, so without the clear the next
+// search would iterate the PREVIOUS search's threads in `stepClist` (stale
+// pcs at stale capture offsets) and its closure walk would skip real work,
+// `pcSetHas` reporting pcs as already-visited that this position has not
+// visited at all. Each is O(1) — the sparse set only resets `count` — so
+// there is no cost argument for skipping them either.
+//
+// `cur` needs no reset: `addThread` overwrites it wholesale (`loadSlots`)
+// before reading it. `start.slots` needs none either (see `PikeScratch`).
+// The closure stack is ASSERTED empty rather than reset, because it is
+// drained by construction — `addThread` loops until `sp == 0` and there is
+// no path out of it that leaves an entry behind — so a non-zero `sp` here
+// means an invariant broke, and quietly zeroing it would hide that.
+//
+// `prog` is taken only to CHECK that `sc` was sized for it. Every buffer on
+// a scratch is indexed by a pc or a slot number of the program it was made
+// for, so handing `runPike` a scratch from a different `Regex` is a
+// wrong-answer bug (a bigger scratch reads stale entries rather than
+// faulting), and it is the one way the caller-threaded design can be
+// misused. Two O(1) comparisons per search make it impossible to do
+// quietly.
+fn pikeScratchReset(sc: PikeScratch, prog: Prog) {
+  assert(len(sc.cur) == prog.numSlots, "regex: pike VM scratch sized for a different program")
+  assert(
+    len(sc.clist.threads) == len(prog.insts),
+    "regex: pike VM scratch sized for a different program",
+  )
+  threadListClear(sc.clist)
+  threadListClear(sc.nlist)
+  assert(sc.stack.sp == 0, "regex: pike VM closure stack left undrained")
 }
 
 // Runs `prog` against `s`, searching for the leftmost-first unanchored match
@@ -441,11 +537,12 @@ fn freshSlots(numSlots: int): []int {
 // it, for an empty match) to find the next non-overlapping one — so this one
 // function is the whole VM entry point all three go through.
 //
-// All VM scratch state is allocated exactly once here, per call (this
-// file's header). `ctx.stack` is sized `numInsts + 1`: `addThread`'s own
-// bound (its comment) shows the closure stack can never hold more than one
-// entry per Split-or-Save instruction plus the one initial push, and no
-// instruction is both.
+// `sc` is the caller's scratch (this file's ALLOCATION note) and MUST have
+// been built by `newPikeScratch(prog)` for this same `prog` — every buffer
+// on it is indexed by `prog`'s own pc and slot numbers. It is reset, not
+// reallocated, so nothing here allocates a buffer at all; what this
+// function returns is the winning thread's own `snapshotSlots` array,
+// which belongs to the caller and survives any later reuse of `sc`.
 //
 // `pf` (`prefilter.bit`, #2052) gates only whether a FRESH start thread is
 // seeded at a given position — it never affects a thread already carried
@@ -454,17 +551,13 @@ fn freshSlots(numSlots: int): []int {
 // `noPrefilter()`'s `pf.kind == PrefilterKind.None` makes
 // `isCandidateStart` unconditionally `true`, so this is byte-for-byte the
 // pre-#2052 search whenever the caller passes it.
-fn runPike(prog: Prog, s: string, startAt: int, pf: Prefilter): (bool, []int) {
+fn runPike(prog: Prog, s: string, startAt: int, pf: Prefilter, sc: PikeScratch): (bool, []int) {
   let numInsts = len(prog.insts)
   let n = len(s)
-  let clist = newThreadList(numInsts)
-  let nlist = newThreadList(numInsts)
-  let ctx = PikeCtx{
-    prog: prog,
-    stack: newPcStack(numInsts + 1),
-    pos: startAt,
-    cur: []int(prog.numSlots),
-  }
+  pikeScratchReset(sc, prog)
+  let clist = sc.clist
+  let nlist = sc.nlist
+  let ctx = PikeCtx{ prog: prog, stack: sc.stack, pos: startAt, cur: sc.cur }
   let pos = startAt
   let before = runeBeforePos(s, startAt)
   let matched = false
@@ -476,7 +569,7 @@ fn runPike(prog: Prog, s: string, startAt: int, pf: Prefilter): (bool, []int) {
     let (after, width) = stepRune(s, pos)
     if (!matched && isCandidateStart(pf, s, pos)) {
       ctx.pos = pos
-      addThread(clist, Thread{ pc: 0, slots: freshSlots(prog.numSlots) }, before, after, ctx)
+      addThread(clist, sc.start, before, after, ctx)
     }
     // The linearity invariant, once per input position (never per VM
     // step): if the sparse-set dedupe above is ever removed, this is what
