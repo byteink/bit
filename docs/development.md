@@ -469,8 +469,8 @@ triple and the wrapper cannot know the target.
 **A hang is a failure, not a stall.** Every subprocess a harness spawns carries a
 wall-clock deadline. Exceeding it kills that child (by its own PID, never a name
 pattern), reports `TIMED OUT` naming the case, and reddens the suite. Default
-**300s** (`defaultTimeoutS`, `tests/bit/stress/stress.bit:192` and
-`tests/bit/golden/golden.bit:84`); override with `BIT_TEST_TIMEOUT_S=<seconds>` on a
+**300s** (`defaultTimeoutS`, `tests/bit/stress/stress.bit:200` and
+`tests/bit/golden/golden.bit:88`); override with `BIT_TEST_TIMEOUT_S=<seconds>` on a
 slower host, or `0` to block forever as before. A timeout is a distinct outcome
 from a crash: a child killed by SIGSEGV/SIGBUS/SIGABRT is reported as a crash
 naming the signal.
@@ -493,7 +493,7 @@ machine code no longer comes from an optimising backend. **Do not read a
 **A per-program `timeout-s` file overrides the stress budget for that program
 alone, and never the other way around.** The stress harness
 (`tests/bit/stress/stress.bit`) gives every program in `tests/stress/` the same
-default budget, `defaultTimeoutS` seconds (`stress.bit:185`), applied as its own
+default budget, `defaultTimeoutS` seconds (`stress.bit:200`), applied as its own
 wall-clock deadline to each of the program's three bounded subprocesses in
 turn — compile, the default-policy run, and the `BIT_GC=stress` run
 (`resolveTimeoutMs` folds the effective budget into a per-program `Ctx` at
