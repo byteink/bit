@@ -1563,6 +1563,15 @@ is emitted as an undefined external and resolved at link, so the failure mode fo
 a build that somehow omits the table is a link error naming the symbol, not
 silent zeroes.
 
+**`debugLinesBegin(): *byte` and `debugLinesEnd(): *byte` (#3285)** are the
+identical shape, over a second, independent linker-merged table: the debug-info
+line table (ABI.md §4.2) `bit_rt_panic`'s own trace walker symbolizes a return
+address against. Same rules throughout — unmanaged subset, zero arity (E0050 on
+any argument), `@nosplit`-legal on the identical proof (one relocation, no load,
+no call), `end >= begin` always, empty exactly when the image carries no
+debug-info entry at all, and a build that omits the table fails at link with the
+symbol named, not silently.
+
 ---
 
 ## 12. Expressions
