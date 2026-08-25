@@ -45,12 +45,21 @@ set -u
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
 
-# 20s matches this family's single-call convention (diffdump.sh/diffcheck.sh/
-# diffverdict.sh/diffdoc.sh); DIFFSAFEPOINTS_TIMEOUT overrides for a slower
-# host. Do not go below ~12s on a shared box: #2863's mutation run at a 3s
-# bound produced 11 false timeouts from ordinary machine load, redone at
-# 12-20s.
-TIMEOUT=${DIFFSAFEPOINTS_TIMEOUT:-20}
+# 60s, not the 20s dump-call convention (diffdump.sh/diffcheck.sh/diffverdict.sh/
+# diffdoc.sh) this used to follow (#3689): this script's calls are a full
+# `build --emit-obj`/`build -o`, the same weight as selfhost-diffexamples.sh's
+# and selfhost-diffexamples-x64.sh's own build+run budget for the SAME corpus
+# (stdlib+examples+tests/cases), both of which already use 60s. 20s undercounted
+# by construction: the ten HTTP-touching files (stdlib/http/http.bit and the
+# nine that import it) measured 24-26s on a quiet box and up to 34s
+# (tests/cases/httpatoioverflow.bit, the slowest observed) under fleet
+# contention -- every one of the ten timed out on BOTH the 20s attempt and its
+# retry, every run, on any host, regardless of correctness (#3689). 60s clears
+# the slowest observed time (34s) with ~1.8x margin. DIFFSAFEPOINTS_TIMEOUT
+# overrides for a slower host. Do not go below ~12s on a shared box: #2863's
+# mutation run at a 3s bound produced 11 false timeouts from ordinary machine
+# load, redone at 12-20s.
+TIMEOUT=${DIFFSAFEPOINTS_TIMEOUT:-60}
 
 # --- preconditions, loud ------------------------------------------------------
 # A missing tool must ABORT, never silently score every case as "match". Four
@@ -122,6 +131,7 @@ echo "self-test: plain-loop safepoint count — seed=$st_seed self=$st_self"
 # produced no verdict, so it is its own counter, not folded into SKIP (which
 # means "declined to build") or MISMATCH (which means "built and disagreed").
 match=0 mismatch=0 skip=0 timeout=0
+total=$(find stdlib examples tests/cases tests/stress -name '*.bit' | wc -l | tr -d ' ')
 for f in $(find stdlib examples tests/cases tests/stress -name '*.bit' | sort); do
   s=$(sites "$ORACLE" "$f" "$tmp/a.o")
   if [ "$s" = "TIMEOUT" ]; then
@@ -143,7 +153,12 @@ for f in $(find stdlib examples tests/cases tests/stress -name '*.bit' | sort); 
   fi
 done
 
-echo "safepoint differential: MATCH=$match MISMATCH=$mismatch SKIP(does not build alone)=$skip TIMEOUT=$timeout"
+# The denominator (compared+timeout+... must equal $total) is printed
+# explicitly so a TIMEOUT>0 run cannot be misread as full coverage: MATCH=N
+# alone looks identical whether N is the whole corpus or the corpus minus
+# whatever timed out (#3689).
+compared=$((match + mismatch + skip))
+echo "safepoint differential: MATCH=$match MISMATCH=$mismatch SKIP(does not build alone)=$skip TIMEOUT=$timeout  compared=$compared/$total corpus files ($((compared + timeout))/$total accounted for)"
 
 # =============================================================================
 # PHASE 2 — the LINKED EXECUTABLE path (#1461)
