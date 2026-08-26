@@ -409,6 +409,13 @@ fn emitPollCachePrefetch(cx: A64Ctx) {
   storeImm(cx.code, retRegNum(), regSp(), pollCacheOffset(cx.frame, 0), 8)
   emitCallReloc(cx, gcAddrSymbol())
   storeImm(cx.code, retRegNum(), regSp(), pollCacheOffset(cx.frame, 1), 8)
+  // #3746: the preempt summary word's address, on the same terms as the two
+  // above and for the same reason — a fixed module global in
+  // runtime/sched/preempt.bit, so its ADDRESS is a per-process constant even
+  // though the word it points at changes. One extra call per function ENTRY,
+  // against the two per loop ITERATION it is here to remove.
+  emitCallReloc(cx, preemptAnyAddrSymbol())
+  storeImm(cx.code, retRegNum(), regSp(), pollCacheOffset(cx.frame, 2), 8)
 }
 
 // Loads the plain (non-atomic) i64 at word offset `wordOff` from the pointer
@@ -447,16 +454,26 @@ fn emitAtomicPollFieldInPlace(cx: A64Ctx, baseReg: int, wordOff: int) {
 //
 // UNLIKE the rest of this ladder, both `schedCurrentWorker`
 // (runtime/sched/sched.bit) and `preemptRequested` (runtime/sched/preempt.bit,
-// #3563's pin) are genuine cross-module calls, and this clause runs them on
-// EVERY guard evaluation, not only on the "poll needed" branch the way the
-// eventual `bl bit_rt_safepoint` below does. Neither answer can be cached the
-// way emitPollCachePrefetch caches worldAddr/gcAddr once per function entry:
-// those are per-process constants that never change; the current worker is
-// the current execution context, which this very guard can change out from
+// #3563's pin) are genuine cross-module calls. Neither ANSWER can be cached
+// the way emitPollCachePrefetch caches worldAddr/gcAddr once per function
+// entry: those are per-process constants that never change; the current worker
+// is the current execution context, which this very guard can change out from
 // under a cached copy the moment it causes a yield (a preempted task may
-// resume on a different worker). So the fast/no-preempt path of this ladder
-// is no longer call-free once this clause is present — see #3564's own
-// ticket for the measured before/after instruction count and wall clock.
+// resume on a different worker).
+//
+// #3746 PUT BOTH CALLS BEHIND A GATE, and everything below is the record of
+// why the obvious alternatives were rejected — read it as history, not as the
+// current shape. #3564 ran them on EVERY guard evaluation, not only on the
+// "poll needed" branch the way the eventual `bl bit_rt_safepoint` below does,
+// and MEASURED that cost 3.28x on bench/cases/collatz and 2.36x on matrix. Its
+// own verification had reported +10 instructions at the call site, predicting
+// +22%: a correct static number, wrong by ~15x as a prediction, because
+// neither callee is a leaf. They now run only when a THIRD cached poll address
+// — the `anyRequested` summary word, runtime/sched/preempt.bit — says a
+// preempt is pending for SOME worker; the fast path is one `ldar` and a
+// branch, and is call-free again. The clause's ANSWER is unchanged: the
+// summary may read 1 with nothing pending, and can never read 0 with something
+// pending (that invariant is proven where the word is declared).
 //
 // A CALL-FREE INLINE WAS INVESTIGATED AND IS NOT POSSIBLE WITHIN THIS
 // TICKET'S CONSTRAINTS, not merely undone for lack of time. `preemptRequested`
@@ -486,6 +503,22 @@ fn emitAtomicPollFieldInPlace(cx: A64Ctx, baseReg: int, wordOff: int) {
 // result corresponds to an IR vreg — both are pure codegen-internal scratch
 // values with no backing IR instruction.
 fn emitInlinedPreemptCheck(cx: A64Ctx, pollFixups: []int): []int {
+  // #3746: THE FAST-PATH GATE. Four leaf instructions — a frame load of the
+  // cached address, one `ldar` of the summary word, a compare and a branch —
+  // decide whether this back edge spends the two calls below at all. The
+  // summary is 0 whenever no worker anywhere has a pending request, which is
+  // every iteration of every loop in a program that is not being preempted
+  // right now, so the calls leave the fast path entirely without leaving the
+  // ladder. Correctness rests on ONE invariant, proven where the word is
+  // declared (runtime/sched/preempt.bit): a set flag implies a nonzero
+  // summary. A false positive costs one slow evaluation; a false negative
+  // cannot occur.
+  let rAny = scratch1()
+  loadImm(cx.code, rAny, regSp(), pollCacheOffset(cx.frame, 2), 8, false)
+  emitAtomicPollFieldInPlace(cx, rAny, 0)
+  cmpZero(cx.code, rAny)
+  let noneFixup = emitLocalCondBranch(cx, condEq()) // nothing pending anywhere
+
   emitCallReloc(cx, schedCurrentWorkerSymbol())
   let rWorker = scratch1()
   movRR(cx.code, rWorker, retRegNum())
@@ -507,7 +540,11 @@ fn emitInlinedPreemptCheck(cx: A64Ctx, pollFixups: []int): []int {
   cmpZero(cx.code, retRegNum())
   pollFixups = append(pollFixups, emitLocalCondBranch(cx, condNe())) // preempt pending -> poll
 
+  // Both no-op exits — off-task, and the #3746 fast-path gate — converge here,
+  // at the ladder's next clause, exactly as stwPollNeeded's own
+  // `if (worker != 0) { ... }` falls through.
   patchLocalCondBranch(cx, offTaskFixup)
+  patchLocalCondBranch(cx, noneFixup)
   return pollFixups
 }
 
