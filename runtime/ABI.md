@@ -2490,7 +2490,7 @@ separate signal channel):
 
 `-2` and `<= -100` stay distinct on purpose: `-2` means the *runtime* killed the
 child on a budget, `<= -100` means something else killed it first. `timeout_ms`
-is clamped to 80 minutes (`os_run_bounded_max_ms`), matching the harnesses'
+is clamped to 100 minutes (`os_run_bounded_max_ms`), matching the harnesses'
 own `max_timeout_s` clamp, so a caller typo cannot reinstate an unbounded wait; the
 poll loop's iteration count is bounded by that clamp divided by the poll
 interval (Power of 10 rule 2) rather than an open-ended `while (true)` — the
