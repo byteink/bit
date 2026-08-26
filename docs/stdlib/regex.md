@@ -41,11 +41,16 @@ which matches a pattern reports.
 
 Three inline flags, matching RE2/Go:
 
-- **`i`** — case-insensitive matching. **ASCII-only**: it folds `A-Z` and
-  `a-z` onto each other and nothing else. `(?i)café` does not match `CAFÉ` —
-  the `é`/`É` pair is outside the fold. Full Unicode case folding is a
-  separate module (a later ticket); this module never silently does more
-  than the ASCII fold it documents.
+- **`i`** — case-insensitive matching, using full Unicode **simple** case
+  folding (built from the UCD's `CaseFolding.txt`, version 17.0.0, `C`/`S`
+  status lines): `(?i)café` matches `CAFÉ`, `(?i)k` matches U+212A KELVIN
+  SIGN, and `(?i)σ` matches both `Σ` and the Greek final form `ς` — every
+  member of a rune's fold orbit matches every other member. **Simple only**:
+  a fold that would turn one rune into MULTIPLE runes is never applied,
+  since the matcher steps one rune at a time and cannot express "this one
+  input character satisfies two of the pattern's" — `(?i)ß` does **not**
+  match `ss`, matching Go and RE2, which draw the same line for the same
+  reason.
 - **`s`** — dot matches `\n` too. Without it, `.` matches every rune except
   `\n` (a lone `\r` always matches `.`, with or without `s` — only `\n` is
   ever excluded).
@@ -143,9 +148,9 @@ fn identifierChars(s: string): bool {
 
 An unknown name is `regex: unknown Unicode property 'Name' at offset N`; an
 unterminated `\p{` is `regex: missing closing } in Unicode property at
-offset N`. Under `(?i)`, a `\p{...}`/`\P{...}` class folds the same
-ASCII-only way every other class does today (see Flags, above) — a later
-ticket that adds full Unicode folding will fold it the same way too.
+offset N`. Under `(?i)`, a `\p{...}`/`\P{...}` class folds the same way
+every other class does (see Flags, above) — `(?i)\p{Lu}` also matches
+lowercase, matching Go's `regexp/syntax`.
 
 The tables are generated, not hand-transcribed — see
 `tools/genunicode/main.bit`'s own header for the exact regeneration command
