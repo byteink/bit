@@ -1452,6 +1452,19 @@ reading as a parameter instead of reading one itself
 - `maybePreempt(worker: i64): bool`, which reports a pending request and
   clears it in the same call. It only reports — the caller is responsible
   for the actual yield (`runtime/sched/preempt.bit:117-123`).
+- **#3746:** `anyRequested`, a `[1]i64` SUMMARY of `requested`, and its pinned
+  accessor `bit_rt_port_sched_preempt_any_addr` (`preemptAnyAddr(): int`).
+  Both backends' inlined back-edge poll guard caches that address once per
+  function entry, beside `bit_rt_world_addr` and `bit_rt_gc_addr`, and reads
+  the word on every back edge — reaching `schedCurrentWorker` and
+  `preemptRequested` only when it is nonzero. The word may read 1 with nothing
+  pending; it can never read 0 with something pending. `sysmonTick` publishes
+  it AFTER setting a flag, `maybePreempt`/`preemptStamp` write 0 and re-scan
+  AFTER clearing one; that ordering is what makes the one-way error one-way,
+  and the proof is on the declaration in `runtime/sched/preempt.bit`.
+
+  NOTE: the `runtime/sched/preempt.bit:NN` line citations in this section
+  predate #3560/#3563/#3564/#3746 and have drifted. Resolve by NAME.
 
 **Wired: the stamp on dispatch (#2578, landed).** `schedWorkerStep` calls
 `preemptStamp(*(w + wkId), monoNs())` once per task dispatch, immediately

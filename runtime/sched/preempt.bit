@@ -58,6 +58,64 @@ const preemptSlots: int = 32
 let startNs: [32]i64
 let requested: [32]i64
 
+// #3746: the SUMMARY of `requested` -- nonzero while any slot may be set, 0
+// only when a scan has just observed every slot clear. It exists so the
+// compiler-inlined back-edge poll guard can answer "is any preempt pending
+// anywhere" with ONE atomic load and no call at all, and reach the two real
+// calls (`schedCurrentWorker`, `preemptRequested`) only when the answer is
+// yes. #3564 put those two calls on the FAST path of every loop back edge and
+// that cost 3.28x on bench/cases/collatz and 2.36x on matrix; the clause
+// itself is correct and stays -- this word is what gets it off the fast path.
+//
+// THE ONLY INVARIANT THIS WORD OWES, and the guard's correctness rests on
+// exactly this one: `requested[w] != 0` for any `w` IMPLIES this word is
+// nonzero. A false POSITIVE is free (one guard evaluation takes the slow path
+// and finds nothing); a false NEGATIVE would drop a preempt request. Which is
+// why the two sides are ordered the way they are:
+//   - the SETTER (`sysmonTick`, the only writer of `requested` and the only
+//     one, single-threaded on its own OS thread) publishes the flag FIRST and
+//     this word SECOND;
+//   - the CLEARER (`refreshPreemptAny`) writes 0 FIRST and re-scans AFTER.
+// A final 0 therefore always comes from a clearer whose scan ran strictly
+// after its own 0-store, hence strictly after any setter's write of 1 to this
+// word, hence strictly after that setter's earlier write of the flag -- so
+// that scan saw the flag and wrote 1 back. There is no interleaving that
+// leaves a set flag with a zero summary. `atomicStore` is a release store
+// (`stlr` on arm64, an ordered plain store under x86-64 TSO), so the two
+// stores in each pair cannot be reordered with each other.
+//
+// THE SCAN COVERS EVERY SLOT, AND THAT IS LOAD-BEARING, NOT DEFENSIVE. The
+// obvious saving -- a clearer knows which worker it just cleared, so why look
+// at the other 31 -- is exactly what opens the window: `sysmonTick` can be
+// mid-publish for a DIFFERENT worker x while this clearer zeroes the summary,
+// and only a scan that reads slot x can put the 1 back. Proof, for a final
+// summary of 0: the last write to it must be some clearer's 0-store (a setter
+// and a re-scan both write 1), and both orderings die -- if the setter's
+// 1-store came first, this clearer's scan runs after it and therefore after
+// the flag store, so it sees the flag and writes 1 after; if it came second,
+// it is itself the later write. Neither leaves a set flag under a 0 summary.
+//
+// IT DEPENDS ON TWO CODEGEN FACTS, both currently true and both worth naming
+// because "optimising" either one silently reopens the window. The clearer
+// needs STORE->LOAD ordering between its 0-store and its scan, which is the
+// one ordering neither TSO nor plain release/acquire gives for free:
+//   - arm64 emits `ldar` for atomicLoad and `stlr` for atomicStore
+//     (compiler/arm64selectmem.bit). That pair is RCsc -- an `ldar` may NOT be
+//     hoisted above an `stlr`. Weakening the load to `ldapr` (RCpc), which is
+//     otherwise a fair optimisation, breaks this and nothing would catch it.
+//   - x86-64 emits a plain `mov` PLUS `mfence` for atomicStore
+//     (compiler/x64selectmem.bit's own "a seq-cst store needs a trailing full
+//     barrier on x86"). Under TSO a bare store is already a release, so that
+//     `mfence` looks redundant and is not -- without it this clearer's scan
+//     loads can complete while the 0-store sits in the store buffer, and the
+//     0 can drain AFTER a setter's 1. That comment now guards this invariant
+//     too, not only whatever motivated it.
+//
+// A [1]i64 rather than a bare `let any: i64` for the same reason every other
+// global here is an array: `ptrOf` is how a `@nosplit` body addresses module
+// state without indexing (E0075).
+let anyRequested: [1]i64
+
 // `worker` must be `< preemptSlots` -- callers get that for free today
 // because the scheduler never hands out a worker id past `schedMaxWorkers`
 // (`sleep.bit`), which is in turn never above `preemptSlots` (see the
@@ -67,13 +125,63 @@ let requested: [32]i64
   return base + worker
 }
 
+// Recompute `anyRequested` after a clear. Writes 0 FIRST, then re-scans -- see
+// `anyRequested`'s own header for why that order and not the obvious
+// scan-then-store-if-empty, which loses a request to a setter that lands
+// mid-scan. Bounded by `preemptSlots`, this file's own array capacity, exactly
+// like `sysmonTick`'s scan (Power of 10: a compile-time constant limit).
+//
+// Called only from the two CLEARING paths and only when they really cleared
+// something, so its cost lands on a preempt actually being consumed (once per
+// ~10ms budget per worker), never on a back edge.
+@nosplit fn refreshPreemptAny() {
+  atomicStore(slotAddr(ptrOf(anyRequested), 0), 0)
+  let w: i64 = 0
+  while (w < preemptSlots) {
+    if (atomicLoad(slotAddr(ptrOf(requested), w)) != 0) {
+      atomicStore(slotAddr(ptrOf(anyRequested), 0), 1)
+      return
+    }
+    w = w + 1
+  }
+}
+
+// The address of `anyRequested`, for the one caller that needs it and cannot
+// reach it any other way: BOTH backends' inlined back-edge poll guard
+// (`compiler/arm64call.bit`'s emitInlinedPreemptCheck,
+// `compiler/x64controlflow.bit`'s xEmitPreemptClause) caches it once per
+// function entry, in the same poll-address cache `bit_rt_world_addr`
+// and `bit_rt_gc_addr` already fill, and then reads the word directly on every
+// back edge. Module state cannot be pinned across the compiler/runtime object
+// boundary -- only a FUNCTION can (SPEC 11.9) -- so an accessor is the only
+// spelling available, exactly as `rootGcAddr`/`rootWorldAddr` are for theirs.
+//
+// A true leaf: no allocation, no park, no safepoint, and the address is a
+// per-process constant for the whole life of the program, which is what makes
+// caching it at function entry sound.
+export @nosplit @symbol("bit_rt_port_sched_preempt_any_addr") fn preemptAnyAddr(): int {
+  return int(ptrOf(anyRequested))
+}
+
 // Record that `worker` just picked up a new task at `nowNs`, and drop any
 // preempt request left over from whatever ran on `worker` before it -- a
 // freshly dispatched task must not inherit a stale flag from its
 // predecessor.
 export @nosplit fn preemptStamp(worker: i64, nowNs: i64) {
   atomicStore(slotAddr(ptrOf(startNs), worker), nowNs)
+  // The clear stays UNCONDITIONAL -- reading first and skipping the store when
+  // the slot is already 0 would let a request `sysmonTick` sets between the
+  // read and the store survive into the freshly dispatched task, which is the
+  // one thing this function exists to prevent. Only the `anyRequested` refresh
+  // (#3746) is conditional, and only on the value observed BEFORE the store:
+  // if nothing was set, this call cleared nothing and the summary is still
+  // correct; if the race above happens, the summary is merely left reading 1
+  // with nothing pending, which the invariant explicitly permits.
+  let had = atomicLoad(slotAddr(ptrOf(requested), worker))
   atomicStore(slotAddr(ptrOf(requested), worker), 0)
+  if (had != 0) {
+    refreshPreemptAny()
+  }
 }
 
 // Scan every worker slot and flag any that has held its task past
@@ -108,6 +216,11 @@ export @nosplit @symbol("bit_rt_port_sched_sysmon_tick") fn sysmonTick(nowNs: i6
     let started = atomicLoad(slotAddr(ptrOf(startNs), w))
     if (started != 0 && nowNs - started > preemptBudgetNs) {
       atomicStore(slotAddr(ptrOf(requested), w), 1)
+      // #3746: publish the summary AFTER the flag, never before -- see
+      // `anyRequested`'s own header for the proof that this order (paired with
+      // the clearer's opposite one) admits no interleaving that hides a set
+      // flag behind a zero summary.
+      atomicStore(slotAddr(ptrOf(anyRequested), 0), 1)
       count = count + 1
     }
     w = w + 1
@@ -142,5 +255,11 @@ export @nosplit fn maybePreempt(worker: i64): bool {
     return false
   }
   atomicStore(slotAddr(ptrOf(requested), worker), 0)
+  // #3746: this is the path that CONSUMES a request, so it is the one that has
+  // to hand the summary back to 0 -- without it every back edge on every
+  // worker would keep taking the guard's slow path until `sysmonTick`'s next
+  // scan (2ms away, against a 10ms budget), which is ~20% of a compute task's
+  // life and would give back most of what the summary buys.
+  refreshPreemptAny()
   return true
 }
