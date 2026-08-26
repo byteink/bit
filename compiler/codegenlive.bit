@@ -296,6 +296,9 @@ fn isSafepointOp(op: Op): bool {
 class IntervalBuild {
   intervals: []LiveInterval,
   safepoints: []int,
+  // #3738: per instruction slot, the vreg whose location it must share. See
+  // computeCopyRoots at the bottom of this file.
+  roots: []int,
 }
 
 // One LiveInterval per instruction slot (dense 0..len(instrs), matching
@@ -356,5 +359,198 @@ fn buildIntervals(ctx: TypeContext, f: IrFunc): IntervalBuild {
   }
   extendParamsToPreds(intervals, f)
   forceParamInterference(intervals, f)
-  return IntervalBuild{ intervals: intervals, safepoints: safepoints }
+  return IntervalBuild{ intervals: intervals, safepoints: safepoints,
+    roots: computeCopyRoots(f) }
+}
+
+// ===========================================================================
+// SSA copy roots (#3738)
+//
+// A block param whose predecessors all pass the same value IS that value: the
+// edge's parallel move writes `P := A` on every path into the block, so P and A
+// can share one location and every one of those moves becomes a self-move the
+// sequencer drops. `allocateCoalesced` (regalloc.bit) consumes what this
+// computes.
+//
+// This is what the emitted code costs without it. `schedWorkPending`
+// (runtime/sched/worker.bit) threads six loop-invariant values — the worker, the
+// scheduler, the worker count, this worker's id — through the params of every
+// block in its steal loop. Each block gave each of them a fresh vreg and the
+// allocator gave each fresh vreg a fresh register, so one iteration paid a
+// six-register round trip (x25->x20, x27->x23, x26->x22 on the way in and back
+// again on the way out) for values nothing ever writes. Measured on 189ef1e6:
+// 34 of the function's 156 instructions were `mov`, and the pressure that
+// shuffle created spilled the loop counter to the frame as well.
+//
+// A CHAIN AND A LOOP BOTH NEED A FIXPOINT, which is why this is not a single
+// pass over the edges. bb12's param is fed by bb8's copy of bb7's param and by
+// bb11's copy of the same value; neither is literally bb7's vreg, so they agree
+// only once both have been resolved to it. And bb7's own param is fed by the
+// entry value and, around the back edge, by a copy of itself.
+//
+// THE SELF-REFERENCE RULE IS RESTRICTED TO BACK EDGES ON PURPOSE. Ignoring an
+// argument that resolves to the param itself is what collapses the loop-carried
+// pass-through, and it is sound because the first entry to the block cannot come
+// from an edge carrying the param's own value — that edge is only reachable once
+// the block has already run. Bit lowers only structured `while`/`for`, so every
+// loop is reducible and "the edge that closes the loop" is exactly
+// `isBackEdge`; requiring it rather than trusting the value test keeps the
+// argument true without depending on reducibility holding forever.
+// ===========================================================================
+
+// One CFG edge, with the arguments its terminator binds to the target's params.
+// `src` is the predecessor block index (`from` is a reserved word, SPEC §5.2).
+class IrEdge {
+  src: int,
+  target: int,
+  args: []int,
+}
+
+fn collectEdges(f: IrFunc): []IrEdge {
+  let out = []IrEdge(0)
+  let bi = 0
+  while (bi < len(f.blocks)) {
+    let b = f.blocks[bi]
+    // A well-formed block always ends in a terminator; guard anyway so
+    // malformed IR cannot index out of bounds behind our backs.
+    if (b.instsLen > 0) {
+      let t = f.instrs[b.instsStart + b.instsLen - 1]
+      if (t.op == Op.Jump) {
+        out = append(out, IrEdge{ src: bi, target: t.ival, args: t.args })
+      }
+      if (t.op == Op.Br) {
+        out = append(out, IrEdge{ src: bi, target: t.ival, args: t.thenArgs })
+        out = append(out, IrEdge{ src: bi, target: t.ival2, args: t.elseArgs })
+      }
+    }
+    bi = bi + 1
+  }
+  return out
+}
+
+// Follows `v`'s chain to the vreg that owns the location. Bounded by the array
+// length — entries are written already-resolved, so this is one hop in practice
+// and the guard only exists so a malformed table cannot spin.
+fn copyRootOf(roots: []int, v: int): int {
+  let r = v
+  let guard = 0
+  while (roots[r] != r && guard < len(roots)) {
+    r = roots[r]
+    guard = guard + 1
+  }
+  return r
+}
+
+// Edge indices grouped by target block, so a refinement round costs one pass
+// over each block's OWN predecessors rather than over every edge in the
+// function. Without it the walk is quadratic in the block count on every round
+// and shows up as compiler wall clock, not as generated code.
+fn indexEdges(f: IrFunc, edges: []IrEdge): [][]int {
+  let byTarget = [][]int(0)
+  let i = 0
+  while (i < len(f.blocks)) {
+    byTarget = append(byTarget, []int(0))
+    i = i + 1
+  }
+  i = 0
+  while (i < len(edges)) {
+    let t = edges[i].target
+    if (t >= 0 && t < len(byTarget)) {
+      byTarget[t] = append(byTarget[t], i)
+    }
+    i = i + 1
+  }
+  return byTarget
+}
+
+// The single root every predecessor passes into param `p` (slot `k` of block
+// `bi`), or -1 when the block has no predecessor, when two predecessors
+// disagree, or when a terminator's argument list is too short for the slot.
+fn paramRootCandidate(f: IrFunc, edges: []IrEdge, inEdges: []int, roots: []int, bi: int, k: int): int {
+  let p = f.blocks[bi].instsStart + k
+  let cand = -1
+  let e = 0
+  while (e < len(inEdges)) {
+    let ed = edges[inEdges[e]]
+    if (k >= len(ed.args)) {
+      return -1
+    }
+    let r = copyRootOf(roots, ed.args[k])
+    if (r != p || !isBackEdge(ed.src, bi)) {
+      if (cand < 0) {
+        cand = r
+      }
+      if (cand != r) {
+        return -1
+      }
+    }
+    e = e + 1
+  }
+  return cand
+}
+
+// One refinement round over every still-unresolved param. Returns whether
+// anything moved, so the caller can stop at the fixpoint.
+fn refineCopyRoots(f: IrFunc, edges: []IrEdge, byTarget: [][]int, roots: []int): bool {
+  let changed = false
+  // Block 0's params are the function's incoming ARGUMENTS: the prologue binds
+  // them from the ABI's argument registers, not from any edge move, so nothing
+  // a predecessor passes describes them. A back edge that targeted block 0
+  // would otherwise offer a candidate and the prologue would then write over
+  // the value it was aliased to.
+  let bi = 1
+  while (bi < len(f.blocks)) {
+    let b = f.blocks[bi]
+    let k = 0
+    while (k < b.paramCount) {
+      let p = b.instsStart + k
+      if (roots[p] == p) {
+        let cand = paramRootCandidate(f, edges, byTarget[bi], roots, bi, k)
+        if (cand >= 0 && cand != p) {
+          roots[p] = cand
+          changed = true
+        }
+      }
+      k = k + 1
+    }
+    bi = bi + 1
+  }
+  return changed
+}
+
+// Per instruction slot, the vreg whose location it must share — itself when it
+// has none. Bounded: a round that changes nothing stops the walk, and no walk
+// runs more rounds than there are blocks (each round resolves at least one
+// param or is the last).
+fn computeCopyRoots(f: IrFunc): []int {
+  let roots = []int(0)
+  let i = 0
+  while (i < len(f.instrs)) {
+    roots = append(roots, i)
+    i = i + 1
+  }
+  let edges = collectEdges(f)
+  let byTarget = indexEdges(f, edges)
+  let round = 0
+  while (round <= len(f.blocks)) {
+    if (!refineCopyRoots(f, edges, byTarget, roots)) {
+      return normalizeCopyRoots(roots)
+    }
+    round = round + 1
+  }
+  return normalizeCopyRoots(roots)
+}
+
+// Collapses every chain to its endpoint, so a consumer needs no walk of its
+// own: a param resolved to a root that a later round resolved further leaves a
+// two-hop entry behind. A cycle cannot form (a round only writes an entry that
+// still points at itself, and never to a vreg that resolves back to it), and
+// `copyRootOf`'s guard bounds the walk regardless.
+fn normalizeCopyRoots(roots: []int): []int {
+  let i = 0
+  while (i < len(roots)) {
+    roots[i] = copyRootOf(roots, i)
+    i = i + 1
+  }
+  return roots
 }

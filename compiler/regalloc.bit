@@ -383,6 +383,105 @@ fn orderByStart(intervals: []LiveInterval): []int {
   return order
 }
 
+// Position of each vreg in the interval array. The dense-vreg contract makes
+// this a bijection, so one pass fills it.
+fn vregPositions(intervals: []LiveInterval): []int {
+  let posOf = []int(0)
+  let i = 0
+  while (i < len(intervals)) {
+    posOf = append(posOf, 0)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(intervals)) {
+    posOf[intervals[i].vreg] = i
+    i = i + 1
+  }
+  return posOf
+}
+
+// A private, element-wise copy of the caller's intervals. LiveInterval is a
+// class, so widening one in place below would reach back into the array
+// codegen keeps and re-reads (arm64compile.bit's savedGpr scan walks it).
+fn copyIntervals(intervals: []LiveInterval): []LiveInterval {
+  let out = []LiveInterval(0)
+  let i = 0
+  while (i < len(intervals)) {
+    let iv = intervals[i]
+    out = append(out, LiveInterval{ vreg: iv.vreg, regClass: iv.regClass, start: iv.start,
+      end: iv.end, isRef: iv.isRef })
+    i = i + 1
+  }
+  return out
+}
+
+// Widens each root's interval in `scan` to the union of its own and every alias
+// that shares it, and reports which positions are aliases. The union is what
+// keeps the shared register reserved for as long as ANY of them is live; without
+// it the root expires early and the scan hands the register away while the alias
+// still reads it.
+fn mergeAliases(scan: []LiveInterval, posOf: []int, roots: []int): []bool {
+  let alias = []bool(0)
+  let i = 0
+  while (i < len(scan)) {
+    alias = append(alias, false)
+    i = i + 1
+  }
+  if (len(roots) == 0) {
+    return alias
+  }
+  assert(len(roots) == len(scan))
+  i = 0
+  while (i < len(scan)) {
+    let v = scan[i].vreg
+    let r = roots[v]
+    if (r != v) {
+      assert(r >= 0 && r < len(scan))
+      assert(roots[r] == r) // computeCopyRoots normalizes; a chain would alias a spilled entry
+      let rp = posOf[r]
+      assert(scan[rp].regClass == scan[i].regClass)
+      if (scan[i].start < scan[rp].start) { scan[rp].start = scan[i].start }
+      if (scan[i].end > scan[rp].end) { scan[rp].end = scan[i].end }
+      // The reference moves to the root along with the range. Clearing it here
+      // rather than filtering aliases out of the stack-map walk is what keeps
+      // that walk exactly as it was: an alias would otherwise report the shared
+      // register a second time at the same safepoint.
+      if (scan[i].isRef) {
+        scan[rp].isRef = true
+        scan[i].isRef = false
+      }
+      alias[i] = true
+    }
+    i = i + 1
+  }
+  return alias
+}
+
+// The scan order with every alias dropped: an alias takes its root's location
+// afterwards and must never compete for a register of its own.
+fn rootOrder(order: []int, alias: []bool): []int {
+  let out = []int(0)
+  let i = 0
+  while (i < len(order)) {
+    if (!alias[order[i]]) {
+      out = append(out, order[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Hands every alias the location its root was given.
+fn propagateAliasLocations(locations: []RegLoc, scan: []LiveInterval, alias: []bool, roots: []int) {
+  let i = 0
+  while (i < len(scan)) {
+    if (alias[i]) {
+      locations[scan[i].vreg] = locations[roots[scan[i].vreg]]
+    }
+    i = i + 1
+  }
+}
+
 // Runs linear-scan register allocation over `intervals` for `target`, then
 // derives a GC stack map for each position in `safepoints`.
 //
@@ -400,6 +499,26 @@ fn orderByStart(intervals: []LiveInterval): []int {
 // interval spills. An empty `clobbers` restores the plain Poletto & Sarkar
 // scan exactly, register for register.
 fn allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int, clobbers: []int): RegAllocResult {
+  return allocateCoalesced(target, intervals, safepoints, clobbers, []int(0))
+}
+
+// `roots` (#3738) names, per vreg, the vreg whose location it must share —
+// codegenlive.bit's `computeCopyRoots`, which finds every block param its
+// predecessors all bind to one value. An ALIAS (a vreg that is not its own root)
+// never enters the scan: its root's interval is widened to cover it, the root
+// alone competes for a register, and the alias takes the root's location
+// verbatim afterwards. The block-edge parallel move that used to bind the two
+// then has src == dst and the sequencer drops it.
+//
+// WHY SHARING IS SOUND, since this is the one place a bug here is a miscompile
+// rather than a slow program: an alias holds, by construction, the value its
+// root holds — every predecessor writes it from a vreg that resolves to the same
+// root, so every edge move is `r := r`. Nothing else can occupy the register in
+// between, because the widened interval spans the union and the scan honours it.
+// An empty `roots` is exactly the plain Poletto & Sarkar behaviour, register for
+// register.
+fn allocateCoalesced(target: TargetRegs, intervals: []LiveInterval, safepoints: []int,
+  clobbers: []int, roots: []int): RegAllocResult {
   let n = len(intervals)
   // Validate the caller's dense-vreg contract — an internal-caller invariant,
   // asserted rather than surfaced as an error.
@@ -443,7 +562,13 @@ fn allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int, cl
   // moves are sequenced or ordered relative to each other.
   let intSpills = newSpillPool()
   let floatSpills = newSpillPool()
-  let order = orderByStart(intervals)
+  // #3738: the scan runs over a merged copy — each root widened to cover its
+  // aliases, each alias skipped entirely — so from here down `scan` is the
+  // authority on liveness and `intervals` is not read again.
+  let posOf = vregPositions(intervals)
+  let scan = copyIntervals(intervals)
+  let alias = mergeAliases(scan, posOf, roots)
+  let order = rootOrder(orderByStart(scan), alias)
 
   // #3171: which intervals may not hold a caller-saved register. Indexed by
   // interval array position (the main loop's `idx`), not by vreg. Bounded by
@@ -455,7 +580,7 @@ fn allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int, cl
     let crosses = false
     let ci = 0
     while (ci < len(clobbers)) {
-      if (crossesPoint(intervals[i], clobbers[ci])) {
+      if (crossesPoint(scan[i], clobbers[ci])) {
         crosses = true
         break
       }
@@ -468,15 +593,15 @@ fn allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int, cl
   let oi = 0
   while (oi < len(order)) {
     let idx = order[oi]
-    let iv = intervals[idx]
+    let iv = scan[idx]
     let state = floatState
     let spills = floatSpills
     if (iv.regClass == RegClass.Int) {
       state = intState
       spills = intSpills
     }
-    expireClass(state, intervals, iv.start)
-    expireSpills(spills, intervals, iv.start)
+    expireClass(state, scan, iv.start)
+    expireSpills(spills, scan, iv.start)
 
     // #3171: an interval live across a clobber point may only occupy a register
     // the target preserves across one. With no clobbers (or an all-callee-saved
@@ -491,17 +616,17 @@ fn allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int, cl
     if (reg >= 0) {
       state.used[reg] = true
       locations[iv.vreg] = RegLoc{ isSpill: false, index: reg }
-      insertActive(state, intervals, ActiveEntry{ idx: idx, reg: reg })
+      insertActive(state, scan, ActiveEntry{ idx: idx, reg: reg })
       oi = oi + 1
       continue
     }
     let victim = furthestActiveIn(state, allowed)
-    if (victim < 0 || intervals[state.active[victim].idx].end <= iv.end) {
+    if (victim < 0 || scan[state.active[victim].idx].end <= iv.end) {
       // Nothing active is worth evicting (the allowed subset is empty, or `iv`
       // itself has the furthest end among its holders) — Poletto & Sarkar's
       // SpillAtInterval "else" branch. `iv` is the interval being processed, so
       // its start is the scan frontier and recycling a freed slot is sound.
-      locations[iv.vreg] = RegLoc{ isSpill: true, index: assignSpill(spills, intervals, idx, true) }
+      locations[iv.vreg] = RegLoc{ isSpill: true, index: assignSpill(spills, scan, idx, true) }
       oi = oi + 1
       continue
     }
@@ -511,12 +636,17 @@ fn allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int, cl
     // recycled one.
     let evicted = state.active[victim]
     removeActiveAt(state, victim)
-    let slot = assignSpill(spills, intervals, evicted.idx, false)
-    locations[intervals[evicted.idx].vreg] = RegLoc{ isSpill: true, index: slot }
+    let slot = assignSpill(spills, scan, evicted.idx, false)
+    locations[scan[evicted.idx].vreg] = RegLoc{ isSpill: true, index: slot }
     locations[iv.vreg] = RegLoc{ isSpill: false, index: evicted.reg }
-    insertActive(state, intervals, ActiveEntry{ idx: idx, reg: evicted.reg })
+    insertActive(state, scan, ActiveEntry{ idx: idx, reg: evicted.reg })
     oi = oi + 1
   }
+
+  // #3738: every alias now takes its root's location verbatim. Done before the
+  // float-slot shift below so both ends of a share move together whichever
+  // class they are.
+  propagateAliasLocations(locations, scan, alias, roots)
 
   // Shift every float spill slot number past the last int spill slot number,
   // so the two classes' slot numbers never collide (#3168). Each pool numbered
@@ -526,7 +656,7 @@ fn allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int, cl
   let numIntSlots = intSpills.next
   i = 0
   while (i < n) {
-    let iv2 = intervals[i]
+    let iv2 = scan[i]
     if (iv2.regClass == RegClass.Float && locations[iv2.vreg].isSpill) {
       locations[iv2.vreg] = RegLoc{ isSpill: true, index: locations[iv2.vreg].index + numIntSlots }
     }
@@ -542,7 +672,7 @@ fn allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int, cl
     let slots = []int(0)
     i = 0
     while (i < n) {
-      let iv = intervals[i]
+      let iv = scan[i]
       if (iv.isRef && iv.start <= pos && iv.end >= pos) {
         let loc = locations[iv.vreg]
         if (loc.isSpill) {
