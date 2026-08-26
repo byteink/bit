@@ -73,6 +73,33 @@ fn composite() {
 A foreign class's unexported fields cannot appear in a literal built outside
 its own module, the same restriction `export` places on plain field access.
 
+### Field shorthand
+
+A field key with no `: value` is shorthand for a value with the same name:
+`User{ name, age }` means `User{ name: name, age: age }`, reusing a binding
+already in scope. Shorthand and keyed fields mix freely in one literal, and
+field order stays irrelevant either way - shorthand does not make the literal
+positional (§12.2).
+
+```bit
+fn shorthandLiteral() {
+  let name = "Ada"
+  let age = 30
+  let a = User{ name, age }         // shorthand for User{ name: name, age: age }
+  let b = User{ age: 42, name }     // shorthand and keyed mix; order irrelevant
+}
+```
+
+There is still no positional form - `User{ 30, "Ada" }` is rejected, shorthand
+or not:
+
+```bit ignore
+let bad = User{ 30, "Ada" }   // rejected - a bare value never means a position
+```
+
+`bit fmt` preserves the shorthand exactly as written; it never expands
+`User{ name }` to `User{ name: name }`.
+
 ## Fields that are themselves a class
 
 A class field whose own type is a class has no zero value, so it **must** be
