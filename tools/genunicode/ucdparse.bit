@@ -1,0 +1,239 @@
+// tools/genunicode — parses the three UCD source files this tool reads:
+// `UnicodeData.txt` (general categories), `Scripts.txt` (script names) and
+// `CaseFolding.txt` (simple case-fold orbits).
+
+import { readFile } from "std/fs"
+import { hasPrefix, hasSuffix, indexOf, split, trimSpace } from "std/strings"
+
+fn mustReadFile(path: string): string {
+  return readFile(path) catch e {
+    panic("genunicode: reading ${path}: ${e.message()}")
+  }
+}
+
+// --- UnicodeData.txt: general categories ------------------------------------
+//
+// Field 0 is the codepoint (hex), field 1 the name, field 2 the two-letter
+// general category (e.g. "Lu"). A codepoint whose Name reads
+// "<Block Name, First>"/"<..., Last>" opens/closes a contiguous run sharing
+// one category — CJK Unified Ideographs and Hangul Syllables are each tens
+// of thousands of codepoints represented this way, never one line per
+// codepoint. Every range (single or First/Last) is added to BOTH its exact
+// two-letter bucket ("Lu") and its one-letter aggregate ("L") — mirroring
+// how Go's own `unicode.Categories` map holds both independently.
+//
+// `Cn` (unassigned) is the one category `UnicodeData.txt` never lists at
+// all — an unassigned codepoint simply has no row — so it cannot be read
+// off any field the way every other category is. It is derived afterward
+// as the complement of every codepoint this file DOES list (`allListedKey`,
+// accumulated alongside every real category during the same scan), and
+// folded into the aggregate `"C"` bucket alongside `Cc`/`Cf`/`Co`/`Cs`,
+// matching Go's own `unicode.Categories["C"]` exactly (verified against a
+// full Go oracle sweep: 954481 codepoints, zero missing, zero extra).
+const allListedKey: string = "*ALL*"
+
+fn parseGeneralCategories(path: string): map<string, []UniRange> {
+  let lines = split(mustReadFile(path), "\n")
+  let out = map<string, []UniRange>()
+  let pendingLo = -1
+  let pendingCat = ""
+  let i = 0
+  // Bounded by `len(lines)`, fixed before the loop starts.
+  while (i < len(lines)) {
+    let line = trimSpace(lines[i])
+    i = i + 1
+    let (nextPendingLo, nextPendingCat) = parseUnicodeDataLine(out, line, pendingLo, pendingCat)
+    pendingLo = nextPendingLo
+    pendingCat = nextPendingCat
+  }
+  deriveUnassignedIntoC(out)
+  return out
+}
+
+// `Cn` = the complement of `allListedKey`'s accumulated ranges over the
+// full scalar range `[0, 0x10FFFF]` — surrogates are excluded automatically
+// since `Cs` (D800-DFFF) is itself listed and therefore already part of
+// `allListedKey`. `"C"` is then rebuilt as `Cn` union its own
+// already-collected `Cc`/`Cf`/`Co`/`Cs` members.
+fn deriveUnassignedIntoC(out: map<string, []UniRange>) {
+  let (listed, ok) = out[allListedKey]
+  if (!ok) {
+    listed = []UniRange(0)
+  }
+  let cn = complementRanges(mergeRanges(listed), 0, 0x10FFFF)
+  let c = cn
+  c = appendBucket(c, out, "Cc")
+  c = appendBucket(c, out, "Cf")
+  c = appendBucket(c, out, "Co")
+  c = appendBucket(c, out, "Cs")
+  out["C"] = c
+}
+
+fn appendBucket(acc: []UniRange, out: map<string, []UniRange>, key: string): []UniRange {
+  let (rs, ok) = out[key]
+  if (!ok) {
+    return acc
+  }
+  let i = 0
+  // Bounded by `len(rs)`, fixed before the loop starts.
+  while (i < len(rs)) {
+    acc = append(acc, rs[i])
+    i = i + 1
+  }
+  return acc
+}
+
+// One `UnicodeData.txt` line: updates `out` in place and returns the
+// pending "First>" state for the next line (`-1`/`""` when there is none in
+// flight). Split out of `parseGeneralCategories` to keep that function's
+// own loop body to the state-threading it exists for.
+fn parseUnicodeDataLine(
+  out: map<string, []UniRange>,
+  line: string,
+  pendingLo: int,
+  pendingCat: string,
+): (int, string) {
+  if (len(line) == 0) {
+    return pendingLo, pendingCat
+  }
+  let fields = split(line, ";")
+  if (len(fields) < 3) {
+    return pendingLo, pendingCat
+  }
+  let code = parseHex(fields[0])
+  let name = fields[1]
+  let cat = fields[2]
+  if (hasSuffix(name, ", First>")) {
+    return code, cat
+  }
+  if (hasSuffix(name, ", Last>")) {
+    addCategoryRange(out, pendingCat, pendingLo, code)
+    return -1, ""
+  }
+  addCategoryRange(out, cat, code, code)
+  return pendingLo, pendingCat
+}
+
+// Adds `[lo, hi]` to `cat`'s own bucket, its one-letter aggregate
+// (`cat[0:1]` — a no-op second insert when `cat` is already one letter,
+// which never occurs in `UnicodeData.txt`'s category field, but costs
+// nothing to leave general), and `allListedKey` (`deriveUnassignedIntoC`'s
+// input: every codepoint this file lists at all, regardless of category).
+fn addCategoryRange(out: map<string, []UniRange>, cat: string, lo: int, hi: int) {
+  addRange(out, cat, lo, hi)
+  addRange(out, cat[0:1], lo, hi)
+  addRange(out, allListedKey, lo, hi)
+}
+
+fn addRange(out: map<string, []UniRange>, key: string, lo: int, hi: int) {
+  let (existing, ok) = out[key]
+  if (!ok) {
+    existing = []UniRange(0)
+  }
+  out[key] = append(existing, UniRange{ lo: lo, hi: hi })
+}
+
+// --- Scripts.txt: script names -----------------------------------------------
+//
+// A line is `<hex>[..<hex>]  ; ScriptName  # comment`; blank lines and
+// full-line `#` comments are skipped. Only script names in `wanted` are
+// kept — `Scripts.txt` lists well over 150 scripts and this ticket asks for
+// exactly eleven of them.
+fn parseScripts(path: string, wanted: []string): map<string, []UniRange> {
+  let lines = split(mustReadFile(path), "\n")
+  let out = map<string, []UniRange>()
+  let i = 0
+  // Bounded by `len(lines)`, fixed before the loop starts.
+  while (i < len(lines)) {
+    parseScriptsLine(out, trimSpace(lines[i]), wanted)
+    i = i + 1
+  }
+  return out
+}
+
+fn parseScriptsLine(out: map<string, []UniRange>, line: string, wanted: []string) {
+  if (len(line) == 0 || hasPrefix(line, "#")) {
+    return
+  }
+  let semi = indexOf(line, ";")
+  if (semi < 0) {
+    return
+  }
+  let rangeField = trimSpace(line[0:semi])
+  let scriptName = scriptNameField(line[semi + 1:len(line)])
+  if (!stringInList(wanted, scriptName)) {
+    return
+  }
+  let (lo, hi) = parseCodepointOrRange(rangeField)
+  addRange(out, scriptName, lo, hi)
+}
+
+// The script name between the first `;` and a trailing `#` comment (if
+// any), trimmed.
+fn scriptNameField(rest: string): string {
+  let hash = indexOf(rest, "#")
+  if (hash < 0) {
+    return trimSpace(rest)
+  }
+  return trimSpace(rest[0:hash])
+}
+
+// `"XXXX"` or `"XXXX..YYYY"`, hex, to `(lo, hi)` — `lo == hi` for the
+// single-codepoint form.
+fn parseCodepointOrRange(field: string): (int, int) {
+  let dotdot = indexOf(field, "..")
+  if (dotdot < 0) {
+    let v = parseHex(field)
+    return v, v
+  }
+  return parseHex(field[0:dotdot]), parseHex(field[dotdot + 2:len(field)])
+}
+
+fn stringInList(xs: []string, s: string): bool {
+  let i = 0
+  // Bounded by `len(xs)`, fixed (11 scripts) before the loop starts.
+  while (i < len(xs)) {
+    if (xs[i] == s) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// --- CaseFolding.txt: simple case-fold pairs --------------------------------
+//
+// A line is `CODE; STATUS; MAPPING; # comment`. Only `C` (common) and `S`
+// (simple) status lines are kept — `F` (full, e.g. ss <- ß) and `T`
+// (Turkic) are out of scope for #2033 by design (see casefold.bit).
+class FoldPair { code: int, mapping: int }
+
+fn parseCaseFoldPairs(path: string): []FoldPair {
+  let lines = split(mustReadFile(path), "\n")
+  let out: []FoldPair = []FoldPair(0)
+  let i = 0
+  // Bounded by `len(lines)`, fixed before the loop starts.
+  while (i < len(lines)) {
+    out = parseCaseFoldLine(out, trimSpace(lines[i]))
+    i = i + 1
+  }
+  return out
+}
+
+fn parseCaseFoldLine(out: []FoldPair, line: string): []FoldPair {
+  if (len(line) == 0 || hasPrefix(line, "#")) {
+    return out
+  }
+  let fields = split(line, ";")
+  if (len(fields) < 3) {
+    return out
+  }
+  let status = trimSpace(fields[1])
+  if (status != "C" && status != "S") {
+    return out
+  }
+  let code = parseHex(trimSpace(fields[0]))
+  let mapping = parseHex(trimSpace(fields[2]))
+  out = append(out, FoldPair{ code: code, mapping: mapping })
+  return out
+}

@@ -41,11 +41,16 @@ which matches a pattern reports.
 
 Three inline flags, matching RE2/Go:
 
-- **`i`** — case-insensitive matching. **ASCII-only**: it folds `A-Z` and
-  `a-z` onto each other and nothing else. `(?i)café` does not match `CAFÉ` —
-  the `é`/`É` pair is outside the fold. Full Unicode case folding is a
-  separate module (a later ticket); this module never silently does more
-  than the ASCII fold it documents.
+- **`i`** — case-insensitive matching, using full Unicode **simple** case
+  folding (built from the UCD's `CaseFolding.txt`, version 17.0.0, `C`/`S`
+  status lines): `(?i)café` matches `CAFÉ`, `(?i)k` matches U+212A KELVIN
+  SIGN, and `(?i)σ` matches both `Σ` and the Greek final form `ς` — every
+  member of a rune's fold orbit matches every other member. **Simple only**:
+  a fold that would turn one rune into MULTIPLE runes is never applied,
+  since the matcher steps one rune at a time and cannot express "this one
+  input character satisfies two of the pattern's" — `(?i)ß` does **not**
+  match `ss`, matching Go and RE2, which draw the same line for the same
+  reason.
 - **`s`** — dot matches `\n` too. Without it, `.` matches every rune except
   `\n` (a lone `\r` always matches `.`, with or without `s` — only `\n` is
   ever excluded).
@@ -105,6 +110,51 @@ fn isZipCode(s: string): bool {
   return re.matches(s)
 }
 ```
+
+### Unicode classes
+
+`\p{Name}` matches every rune with Unicode property `Name`; `\P{Name}` is
+its exact complement. `\pX`/`\PX` is the one-letter shorthand, valid only
+for a single-letter category name (`\pL`, never `\pLu` or a script). Both
+forms work standalone and inside a `[...]` class, where they union into the
+surrounding class the same way `\d`/`\s`/`\w` do.
+
+Supported names, built from Unicode 17.0.0 — nothing wider, since every
+added property is table weight a caller may never reach for:
+
+- **General categories**, one- and two-letter: `C Cc Cf Co Cs L Ll Lm Lo Lt
+  Lu M Mc Me Mn N Nd Nl No P Pc Pd Pe Pf Pi Po Ps S Sc Sk Sm So Z Zl Zp Zs`.
+  The one-letter forms are aggregates (`L` is every `Lu`/`Ll`/`Lt`/`Lm`/`Lo`
+  rune combined) — `C` additionally includes every codepoint with no
+  assigned category at all (`Cn`, unassigned), matching Go's own
+  `regexp/syntax` exactly.
+- **Scripts**: `Latin Greek Cyrillic Han Arabic Hebrew Hiragana Katakana
+  Hangul Thai Devanagari`.
+- **`Any`**: every valid Unicode scalar value, `0..0x10FFFF`.
+
+```bit
+import { mustCompile } from "std/regex"
+
+fn isCJK(s: string): bool {
+  let re = mustCompile("^\\p{Han}+$")
+  return re.matches(s)
+}
+
+fn identifierChars(s: string): bool {
+  let re = mustCompile("^[\\p{L}\\p{N}_]+$")
+  return re.matches(s)
+}
+```
+
+An unknown name is `regex: unknown Unicode property 'Name' at offset N`; an
+unterminated `\p{` is `regex: missing closing } in Unicode property at
+offset N`. Under `(?i)`, a `\p{...}`/`\P{...}` class folds the same way
+every other class does (see Flags, above) — `(?i)\p{Lu}` also matches
+lowercase, matching Go's `regexp/syntax`.
+
+The tables are generated, not hand-transcribed — see
+`tools/genunicode/main.bit`'s own header for the exact regeneration command
+and UCD source URLs.
 
 ### Groups
 
@@ -380,6 +430,41 @@ fn wordCount(s: string): int {
   return len(re.findAll(s, -1))
 }
 ```
+
+### `Regex.split(s: string, limit: int): []string`
+
+The text between successive non-overlapping matches of `re`'s pattern in
+`s`, using `findAll`'s exact left-to-right scan (above), including its
+empty-match one-rune advance rule. `limit < 0` is unlimited pieces;
+`limit == 0` returns an empty slice with no scanning at all; `limit > 0`
+returns at most `limit` pieces, and the **last** piece holds the entire
+unsplit remainder of `s` — matches included — rather than truncating it.
+
+A match at offset 0 yields an empty **leading** piece; a match ending at
+`len(s)` yields an empty **trailing** piece — neither is dropped. A subject
+with no match returns a single piece: the whole subject.
+
+```bit
+import { mustCompile } from "std/regex"
+
+fn words(s: string): []string {
+  let re = mustCompile("\\s+")
+  return re.split(s, -1)
+}
+```
+
+**The empty-match trap, resolved the same way Go's `regexp.Split` resolves
+it**: a pattern that can match the empty string splits *between* every
+rune rather than looping forever — `mustCompile("").split("abc", -1)`
+yields `["a", "b", "c"]`, three pieces, not five. The two zero-width
+matches that land exactly at offset 0 and at `len(s)` are a special case
+and do **not** produce an extra empty piece the way a non-empty match at
+those same offsets would (splitting `",ab"` on `","` still yields a
+leading `""`, since that match is not zero-width). A pattern whose source
+text is non-empty, applied to an empty subject, always returns a single
+empty piece, `[""]`, regardless of whether the pattern could itself match
+the empty string — matching Go's `(*Regexp).Split` exactly, including this
+corner.
 
 ### `Regex.replaceAll(s: string, repl: string): string`
 
