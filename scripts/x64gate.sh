@@ -83,14 +83,13 @@ else
 fi
 echo "x64gate: host(s)=$(printf '%s' "${HOSTS}" | tr '\n' ' ')"
 
+# "clean" always uses an ephemeral cache, so it never needs a peer check.
+# "fast" shares a named volume across invocations and DOES need one — done
+# below, inside the ssh session, per run (#3733).
 if [ "$MODE" = "clean" ]; then
-  # Ephemeral in-container cache: nothing persists, guaranteeing a cold build.
-  CACHE_ARGS=""
-  CACHE_ENV="/tmp/gc"
+  CACHE_MODE="clean"
 else
-  # Named volume survives across runs so incremental compilation kicks in.
-  CACHE_ARGS="-v ${VOLUME}:/cache"
-  CACHE_ENV="/cache"
+  CACHE_MODE="fast"
 fi
 
 fails=0
@@ -109,19 +108,48 @@ while IFS= read -r host; do
   for i in $(seq 1 "${RUNS}"); do
     total=$((total + 1))
     { [ "${RUNS}" -gt 1 ] || [ "${X64GATE_ALL_HOSTS:-0}" = "1" ]; } && echo "===RUN host=${host} ${i}/${RUNS}==="
-    code=$(git archive HEAD | ssh "${host}" "docker run --rm -i ${CACHE_ARGS} ${IMAGE} bash -c '
-      mkdir -p /work && cd /work && tar x &&
-      BIT_STAGE0_CACHE=${CACHE_ENV}/stage0 ./make ${STEP} > /tmp/o 2>&1
-      e=\$?
-      if [ \$e -eq 0 ]; then
-        echo ===TAIL===
-        tail -35 /tmp/o
+    # Several agents can share the remote box. The peer probe below runs ON
+    # THE REMOTE HOST, inside this same ssh session, immediately before the
+    # `docker run` it gates — a `docker ps` on the Mac driving this script
+    # would inspect the wrong machine and confidently report on containers
+    # that were never contending for ${VOLUME} at all.
+    #
+    # This narrows the race, it does not close it: another invocation's
+    # `docker run` can still start in the gap between this host's `docker ps`
+    # sample and the `docker run` two lines below it. That gap is one ssh
+    # round trip's worth of remote-shell work, not the whole script's setup
+    # time — which is what made the old top-of-script, once-per-invocation
+    # sample TOCTOU against arm64gate.sh's own RUNS loop.
+    code=$(git archive HEAD | ssh "${host}" "
+      if [ \"${CACHE_MODE}\" = clean ]; then
+        CACHE_ARGS=''
+        CACHE_ENV=/tmp/gc
       else
-        echo ===FAILURE_FULL_LOG===
-        cat /tmp/o
+        PEERS=\$(docker ps -q --filter \"ancestor=${IMAGE}\" | wc -l | tr -d ' ')
+        echo X64GATE_PEERS=\$PEERS
+        if [ \"\$PEERS\" -gt 0 ]; then
+          echo \"x64gate: \$PEERS other ${IMAGE} container(s) running on \$(hostname); not sharing ${VOLUME} -- using an isolated cache (cold, slower, trustworthy)\" >&2
+          CACHE_ARGS=''
+          CACHE_ENV=/tmp/gc
+        else
+          CACHE_ARGS='-v ${VOLUME}:/cache'
+          CACHE_ENV=/cache
+        fi
       fi
-      echo X64LINUX_EXIT=\$e
-    '" | tee /dev/stderr | sed -n 's/^X64LINUX_EXIT=//p')
+      docker run --rm -i -e CACHE_ENV=\$CACHE_ENV \$CACHE_ARGS ${IMAGE} bash -c '
+        mkdir -p /work && cd /work && tar x &&
+        BIT_STAGE0_CACHE=\$CACHE_ENV/stage0 ./make ${STEP} > /tmp/o 2>&1
+        e=\$?
+        if [ \$e -eq 0 ]; then
+          echo ===TAIL===
+          tail -35 /tmp/o
+        else
+          echo ===FAILURE_FULL_LOG===
+          cat /tmp/o
+        fi
+        echo X64LINUX_EXIT=\$e
+      '
+    " | tee /dev/stderr | sed -n 's/^X64LINUX_EXIT=//p')
     [ "${code}" != "0" ] && fails=$((fails + 1))
   done
 done <<< "${HOSTS}"
