@@ -161,6 +161,92 @@ export @nosplit fn schedGrowObserveLocal(s: *i64, depth: int) {
   atomicStore(s + scGrowStreak, growStreakThreshold)
 }
 
+// ---------------------------------------------------------------------------
+// THE BACKLOG COUNTERPART (#3726) — the two observers above fire only from
+// `schedSpawn`, so a fixed burst of work can earn exactly ONE extra worker
+// ---------------------------------------------------------------------------
+//
+// MEASURED, not reasoned: 32 independent CPU-bound green tasks on a 28-core
+// x86_64-linux host produced 3 OS threads (boot + 2 workers) — the same 3 as
+// 6 tasks, and the same 3 as on a 6-core host. A trace of `scGrowStreak` and
+// `scNWorkers` at every `tryGrowPool` call printed `4 1` once and then `0 2`
+// thirty-three times; at `BIT_WORKERS=16` it printed `4 16` once and `0 17`
+// thirty-two times. Exactly one grow, ever, whatever the backlog.
+//
+// The cause is that `scGrowStreak` has only two writers that can RAISE it —
+// `schedGrowObserve` (line ~111) and `schedGrowObserveLocal` (line ~161) —
+// and both are reached only from `schedSpawn`'s body. `schedGrowArm` then
+// zeroes the whole streak on the single attempt it earns. So a program that
+// spawns its work up front and then computes has no signal left: the queues
+// stay deep for the rest of the run and nothing ever looks at them again.
+// Growth was enqueue-driven, while `../root/<os>/boottail.bit`'s own comment
+// describes the policy as "reacts to the backlog this process actually has".
+//
+// This is the missing half: a probe the WORKER LOOP runs, so persistent
+// backlog keeps earning workers until it is gone or the pool hits
+// `schedMaxWorkers`. It changes no policy constant — the same
+// `growStreakThreshold` (4) unclaimed tasks are still what a new OS thread
+// costs, and `schedGrowArm` still starts at most one worker per call and
+// still refuses past the ceiling and past `scStopping`.
+//
+// WHY IT MUST BE PEER-AWARE, and this is the part a same-worker-only probe
+// gets wrong. `schedSpawn` sends an in-worker spawn to the CALLER's ring
+// (#3264), so N tasks spawned by `main` all sit on worker 0's deque. Every
+// worker started after that has an empty ring of its own and an empty global
+// queue, and would observe a backlog of 0 while 30 tasks sat one deque away.
+// The bounded pass over the worker array here is `schedWorkPending`'s own
+// (`./worker.bit`), minus the steal and counting depth instead of returning
+// at the first hit — same trip count (the worker count, Power of 10 #2),
+// same racy plain loads, no lock and no CAS.
+//
+// THE GLOBAL QUEUE CONTRIBUTES 1, NOT ITS DEPTH, and that is a deliberate
+// limitation rather than an oversight: `gqNonEmpty` (`./queue.bit`) reads one
+// word, while a real count means chasing a linked list that only `gqLock`
+// makes safe to walk — a lock this probe must not take on every worker turn.
+// Backlog that lives ONLY on the global queue therefore still depends on
+// `schedGrowObserve`'s spawn-time streak exactly as it does today; nothing
+// regresses, and the case this closes (an ordinary program's spawns, which
+// #3583 established stay on the local ring) is fully covered.
+//
+// `@nosplit` so the caller may run it anywhere in its loop, and PINNED
+// (ABI.md §9) because `../root/<os>` calls it and that module emits
+// `--freestanding`: an unpinned callee there is a mangled name no archive
+// member defines (see `./sleep.bit`'s `lockOf` note).
+// `dqDepth` is `tail - head` read with two unsynchronised loads, so a steal
+// landing between them shows -1 for an empty ring (`./queue.bit`). Summing
+// that raw would let one racing peer CANCEL another peer's real backlog, so
+// every term is floored at 0 before it is added.
+@nosplit fn dqDepthOrZero(q: *i64): int {
+  let d = dqDepth(q)
+  if (d < 0) {
+    return 0
+  }
+  return d
+}
+
+export @nosplit @symbol("bit_rt_port_sched_grow_observe_backlog") fn schedGrowObserveBacklog(w: *i64) {
+  let s = taskAt(*(w + wkSched))
+  let depth = dqDepthOrZero(w + wkDeque)
+  if (gqNonEmpty(s + scGlobal)) {
+    depth = depth + 1
+  }
+  let n = atomicLoad(s + scNWorkers)
+  let me = *(w + wkId)
+  let i = 0
+  while (i < n && depth < growStreakThreshold) {
+    if (i != me) {
+      depth = depth + dqDepthOrZero(schedWorkerAt(s, i) + wkDeque)
+    }
+    i = i + 1
+  }
+  if (depth >= growStreakThreshold) {
+    // Latched, never accumulated, for `schedGrowObserveLocal`'s reason: this
+    // runs once per worker turn and an accumulating counter would leave a
+    // number that survives the backlog it was counting.
+    atomicStore(s + scGrowStreak, growStreakThreshold)
+  }
+}
+
 // The platform thread-start recipe `schedMaybeGrow`/`schedStartWorker`/
 // `schedStart` all take verbatim: caller-owned areas sized for at least
 // `schedMaxWorkers` entries, plus the worker entry point and the platform
