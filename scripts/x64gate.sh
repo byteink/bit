@@ -120,23 +120,35 @@ while IFS= read -r host; do
     # round trip's worth of remote-shell work, not the whole script's setup
     # time — which is what made the old top-of-script, once-per-invocation
     # sample TOCTOU against arm64gate.sh's own RUNS loop.
+    # CACHE_FLAG/CACHE_VOL are two separate, space-free words rather than one
+    # "-v name:/cache" string in a single variable: this remote command runs
+    # under whatever shell the target account's login shell is, and a shell
+    # that does not word-split unquoted expansions (zsh, without
+    # SH_WORD_SPLIT) would pass a one-token "-v name:/cache" to docker,
+    # which is not the two-token form docker's flag parser expects. Each of
+    # these two variables holds a single word, so splitting is never needed:
+    # an unquoted empty expansion vanishes from the command line and a
+    # non-empty one is exactly one argv entry, in every POSIX-ish shell.
     code=$(git archive HEAD | ssh "${host}" "
       if [ \"${CACHE_MODE}\" = clean ]; then
-        CACHE_ARGS=''
+        CACHE_FLAG=''
+        CACHE_VOL=''
         CACHE_ENV=/tmp/gc
       else
         PEERS=\$(docker ps -q --filter \"ancestor=${IMAGE}\" | wc -l | tr -d ' ')
         echo X64GATE_PEERS=\$PEERS
         if [ \"\$PEERS\" -gt 0 ]; then
           echo \"x64gate: \$PEERS other ${IMAGE} container(s) running on \$(hostname); not sharing ${VOLUME} -- using an isolated cache (cold, slower, trustworthy)\" >&2
-          CACHE_ARGS=''
+          CACHE_FLAG=''
+          CACHE_VOL=''
           CACHE_ENV=/tmp/gc
         else
-          CACHE_ARGS='-v ${VOLUME}:/cache'
+          CACHE_FLAG='-v'
+          CACHE_VOL='${VOLUME}:/cache'
           CACHE_ENV=/cache
         fi
       fi
-      docker run --rm -i -e CACHE_ENV=\$CACHE_ENV \$CACHE_ARGS ${IMAGE} bash -c '
+      docker run --rm -i -e CACHE_ENV=\$CACHE_ENV \$CACHE_FLAG \$CACHE_VOL ${IMAGE} bash -c '
         mkdir -p /work && cd /work && tar x &&
         BIT_STAGE0_CACHE=\$CACHE_ENV/stage0 ./make ${STEP} > /tmp/o 2>&1
         e=\$?
