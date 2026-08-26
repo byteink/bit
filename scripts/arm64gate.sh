@@ -69,27 +69,15 @@ docker image inspect "${IMAGE}" >/dev/null 2>&1 || {
 docker run --rm "${IMAGE}" sh -c 'command -v git' >/dev/null 2>&1 || {
   echo "arm64gate: ${IMAGE} has no git — rebuild it from docker/linux-gate.Dockerfile" >&2; exit 127; }
 
+# "clean" always uses an ephemeral cache, so it never needs a peer check.
+# "fast" shares a named volume across invocations and DOES need one — sampled
+# below, freshly, inside run_suite() on every call (#3733).
 if [ "${MODE}" = "clean" ]; then
-  # Ephemeral in-container cache: nothing persists, guaranteeing a cold build.
-  CACHE_ARGS=""
-  CACHE_ENV="/tmp/gc"
+  CACHE_MODE="clean"
 else
-  # Named volume survives across runs so incremental compilation kicks in.
-  CACHE_ARGS="-v ${VOLUME}:/cache"
-  CACHE_ENV="/cache"
+  CACHE_MODE="fast"
 fi
 
-# Several agents share this machine. Two gate runs against one named cache volume
-# can read each other's artifacts, so a contended `fast` run is not a sign-off.
-# Report the peer count (machine-greppable) and drop to an isolated cache rather
-# than hand back a fast-but-untrustworthy result.
-PEERS=$(docker ps -q --filter "ancestor=${IMAGE}" | wc -l | tr -d ' ')
-echo "ARM64GATE_PEERS=${PEERS}"
-if [ "${PEERS}" -gt 0 ] && [ -n "${CACHE_ARGS}" ]; then
-  echo "arm64gate: ${PEERS} other ${IMAGE} container(s) running; not sharing ${VOLUME} — using an isolated cache (cold, slower, trustworthy)" >&2
-  CACHE_ARGS=""
-  CACHE_ENV="/tmp/gc"
-fi
 # Host load is shared too: a suite killed by memory/CPU pressure reads exactly
 # like a real failure. Say so up front instead of letting someone misread it.
 echo "ARM64GATE_LOAD=$(uptime | sed -n 's/.*load averages*: *//p' | awk '{print $1}')"
@@ -97,7 +85,32 @@ echo "ARM64GATE_LOAD=$(uptime | sed -n 's/.*load averages*: *//p' | awk '{print 
 # Run the suite over the tar stream on stdin. Echoes the container log and prints
 # ARM64LINUX_EXIT=<code>; returns that code as its own exit status.
 run_suite() {
-  local code name
+  local code name cache_args cache_env peers
+  if [ "${CACHE_MODE}" = "clean" ]; then
+    cache_args=""
+    cache_env="/tmp/gc"
+  else
+    # Several agents share this machine. Two gate runs against one named cache
+    # volume can read each other's artifacts, so a contended `fast` run is not
+    # a sign-off. Sampled HERE, immediately before the `docker run` below,
+    # rather than once at script startup: a single startup sample was reused
+    # across every call this function makes — the whole RUNS loop and the
+    # selftest/mutant control-then-mutant pair — so a peer that started after
+    # that one sample was invisible for the rest of the invocation (#3733).
+    # This narrows the window to the gap between this line and the `docker
+    # run` a few lines down; it does not close it — a peer can still start in
+    # that gap and go undetected.
+    peers=$(docker ps -q --filter "ancestor=${IMAGE}" | wc -l | tr -d ' ')
+    echo "ARM64GATE_PEERS=${peers}"
+    if [ "${peers}" -gt 0 ]; then
+      echo "arm64gate: ${peers} other ${IMAGE} container(s) running; not sharing ${VOLUME} — using an isolated cache (cold, slower, trustworthy)" >&2
+      cache_args=""
+      cache_env="/tmp/gc"
+    else
+      cache_args="-v ${VOLUME}:/cache"
+      cache_env="/cache"
+    fi
+  fi
   # Name the container so it can be reaped. `docker run` does NOT die with its
   # driving shell: when this script is killed (harness timeout, Ctrl-C, the perl
   # alarm), an unnamed container keeps burning every core on a result nobody will
@@ -118,9 +131,9 @@ run_suite() {
   ( sleep "${DEADLINE}"; docker rm -f "${name}" >/dev/null 2>&1 ) >/dev/null 2>&1 &
   local watchdog=$!
 
-  code=$(docker run --rm -i --name "${name}" ${CACHE_ARGS} "${IMAGE}" bash -c '
+  code=$(docker run --rm -i --name "${name}" ${cache_args} "${IMAGE}" bash -c '
       mkdir -p /work && cd /work && tar x &&
-      BIT_STAGE0_CACHE='"${CACHE_ENV}"'/stage0 ./make '"${STEP}"' > /tmp/o 2>&1
+      BIT_STAGE0_CACHE='"${cache_env}"'/stage0 ./make '"${STEP}"' > /tmp/o 2>&1
       e=$?
       if [ $e -eq 0 ]; then
         echo ===TAIL===

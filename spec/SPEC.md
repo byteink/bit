@@ -1630,7 +1630,7 @@ composite_lit = type_name [ "<" type_args ">" ] "{" [ field_inits ] "}"
               | array_type   "{" [ arguments ] "}"
               | map_type     "{" [ map_entries ] "}" .
 field_inits   = field_init { "," field_init } [ "," ] .
-field_init    = IDENT ":" expression .           (* keyed; order-independent *)
+field_init    = IDENT [ ":" expression ] .       (* keyed; order-independent; bare IDENT is shorthand for IDENT ":" IDENT *)
 map_entries   = map_entry { "," map_entry } [ "," ] .
 map_entry     = expression ":" expression .
 type_args     = type { "," type } .
@@ -1643,6 +1643,21 @@ literal. Class literals are keyed; any field omitted from the literal takes its
 zero value (§13.4). A field whose own type is a **class** has no zero value and
 therefore may **not** be omitted — leaving it out is **E0083**. Fields not visible
 to the current module (unexported fields of a foreign class) may not appear.
+
+A `field_init` with no `: expression` is **shorthand**: `Point{ x, y }` means
+`Point{ x: x, y: y }` — the field name doubles as the name of a binding already
+in scope. Shorthand and keyed fields may be freely mixed in one literal
+(`Point{ x, y: 2.0 }`), and field order stays irrelevant either way. There is no
+positional form: `Point{ 1.0, 2.0 }` is rejected (a bare number cannot start a
+`field_init`), which is what keeps a bare `IDENT` unambiguous — it can only mean
+the shorthand, never a position. A shorthand field is two independent things
+that can each fail on their own: the field name (`x`) is resolved against the
+class's own fields, exactly as the keyed form's key is, and a name the class does
+not declare is **E0057**, unaffected by which spelling was used; the implied
+value (the second `x`) is resolved as an ordinary identifier reference against
+the enclosing scope, and a name with no binding in scope is **E0040 undefined
+name** — not a field diagnostic, since the mistake is a missing variable, not a
+missing field.
 
 ### 12.3 Slice, Array, and Map Literals
 
@@ -3952,7 +3967,7 @@ composite_lit = type_name [ "<" type { "," type } ">" ] "{" [ field_inits ] "}"
               | array_type "{" [ arguments ] "}"
               | map_type   "{" [ map_entries ] "}" .
 field_inits   = field_init { "," field_init } [ "," ] .
-field_init    = IDENT ":" expression .
+field_init    = IDENT [ ":" expression ] .
 map_entries   = map_entry { "," map_entry } [ "," ] .
 map_entry     = expression ":" expression .
 

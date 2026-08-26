@@ -48,7 +48,10 @@ emit() {
   EMITTED=$((EMITTED + $(printf '%s\n' "${body}" | grep -c .)))
   printf '### %s\n\n' "${title}"
   printf '%s\n' "${body}" | while IFS='|' read -r subject sha; do
-    printf -- '- %s (%s)\n' "${subject}" "${sha}"
+    printf -- '- %s (%s)\n' \
+      "$(printf '%s' "${subject}" \
+         | sed -E 's/@([A-Za-z0-9][A-Za-z0-9-]*)/`@\1`/g')" \
+      "${sha}"
   done
   printf '\n'
 }
