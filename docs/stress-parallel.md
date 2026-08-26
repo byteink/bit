@@ -28,7 +28,7 @@ deliberately **not** part of `./make test` — same shape as
 Every build and every run is bounded to a **300-second base** deadline
 (`perRunTimeoutMs`, `tests/bit/stressparallel.bit:99`). Since #3587, that base
 is scaled by currently observed host load (up to `loadScaleCap=8`,
-`tests/bit/stressparallel.bit:103`) and capped at `clampTimeoutMs=3600000`
+`tests/bit/stressparallel.bit:103`) and capped at `clampTimeoutMs=4800000`
 (`tests/bit/stressparallel.bit:109`, matching the runtime's own
 `osBoundedMaxMs` clamp in `runtime/root/{darwin,linux}/os.bit:450/458`) —
 a fixed 300s wall was found to false-time-out under heavy fleet contention
