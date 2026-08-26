@@ -62,15 +62,17 @@ fn checkX64ScanFlags() {
 
 // #3171: the positions at which the allocator must treat caller-saved registers
 // as destroyed. Every safepoint, PLUS the poll-address prefetch, which is a
-// pair of real calls that deliberately records no safepoint.
+// run of real calls (three since #3746, two before) that deliberately records
+// no safepoint. They are contiguous, so they are ONE position, not three.
 //
 // Deleting that extra position is silent at the source level and NOT silent in
 // the emitted code, which is why this is pinned here rather than by a program
 // that prints a number. Removing it and rebuilding turns beforeLoop() in
 // tests/x64 probing into:
 //
-//   callq <bit_rt_world_addr>      ; the prefetch pair
+//   callq <bit_rt_world_addr>      ; the prefetch run
 //   callq <bit_rt_gc_addr>
+//   callq <bit_rt_port_sched_preempt_any_addr>
 //   movsd %xmm0, %xmm14            ; reads float param `a` OUT OF THE REGISTER
 //   addsd %xmm1, %xmm14            ; the two calls were free to destroy
 //
@@ -82,7 +84,7 @@ fn checkX64ClobberPoints() {
   let ctx = newTypeContext()
   let i64t = primType(ctx, 3)
 
-  // Two entry params and a self-loop: the back edge means the prefetch pair is
+  // Two entry params and a self-loop: the back edge means the prefetch run is
   // emitted, so the entry block's first NON-parameter index (2) is prepended.
   let p0 = mkInstr(Op.BlockParam, i64t)
   let p1 = mkInstr(Op.BlockParam, i64t)
@@ -240,22 +242,27 @@ fn checkX64CompileLoop() {
 
   // push rbp; mov rsp,rbp; push rbx/r13/r14/r15 — the file is the callee-saved
   // subset because the poll is a call, so all four are preserved — then
-  // `sub rsp, 16` for #3169's two poll-cache slots. 18 bytes of prologue.
+  // `sub rsp, 32` for #3169's poll-cache slots. #3746 took those from two to
+  // three (worldAddr, gcAddr, preemptAnyAddr), so the 24 raw bytes round up to
+  // 32 behind an even number of pushes where 16 used to do. 18 bytes of
+  // prologue.
   let h = hexOfBytes(fc.code)
-  assert(len(h) > 36 && h[0:36] == "554889e5534155415641574881ec10000000")
-  // #3169: the entry prefetch fills the pair, then the back edge's inlined
+  assert(len(h) > 36 && h[0:36] == "554889e5534155415641574881ec20000000")
+  // #3169: the entry prefetch fills the slots, then the back edge's inlined
   // ladder replaces #2926's guard call. #3565 added the worker-preempt clause
   // (schedCurrentWorker + preemptRequested, both real calls) between the
-  // stop-pending check and the gcAddr==0 check, so the ladder now emits two
-  // more relocations before the real poll. Five total, and only the LAST is a
-  // safepoint: the entry prefetch and the preempt clause's two calls neither
-  // allocate nor park.
-  assert(len(fc.relocs) == 5)
+  // stop-pending check and the gcAddr==0 check, so the ladder emits two more
+  // relocations before the real poll; #3746 added a third PREFETCH call for
+  // the preempt summary word's address. Six total, and only the LAST is a
+  // safepoint: the three entry prefetches and the preempt clause's two calls
+  // neither allocate nor park.
+  assert(len(fc.relocs) == 6)
   assert(fc.relocs[0].symbol == "bit_rt_world_addr")
   assert(fc.relocs[1].symbol == "bit_rt_gc_addr")
-  assert(fc.relocs[2].symbol == "bit_rt_port_sched_current_worker")
-  assert(fc.relocs[3].symbol == "bit_rt_port_sched_preempt_requested")
-  assert(fc.relocs[4].symbol == "bit_rt_safepoint")
+  assert(fc.relocs[2].symbol == "bit_rt_port_sched_preempt_any_addr")
+  assert(fc.relocs[3].symbol == "bit_rt_port_sched_current_worker")
+  assert(fc.relocs[4].symbol == "bit_rt_port_sched_preempt_requested")
+  assert(fc.relocs[5].symbol == "bit_rt_safepoint")
   // The guard call is GONE — that is the whole ticket, so assert its absence
   // rather than inferring it from the count.
   let ri = 0
@@ -272,9 +279,9 @@ fn checkX64CompileLoop() {
   // targets block 0 — which starts after the prologue AND the prefetch, not at
   // byte 0, so the displacement is not the whole code length.
   assert(len(h) >= 10 && h[len(h) - 10:len(h) - 8] == "e9")
-  // Two poll-cache slots and no xmm saves: 16 bytes, already 16-aligned behind
-  // an even number of pushes.
-  assert(fc.frameSize == 16)
+  // Three poll-cache slots (#3746) and no xmm saves: 24 raw bytes, rounded to
+  // 32 behind an even number of pushes.
+  assert(fc.frameSize == 32)
 }
 
 // End-to-end: the whole driver on the identity function `f(a: i64): i64 { a }`.
@@ -516,6 +523,15 @@ fn checkX64ControlFlow() {
   // step is there. want.cc is SysV (xCallTestCtx), so xShadowSpace(want.cc)
   // is 0 and neither call needs the shadow-space push/pop xEmitPreemptClause
   // guards with `if (shadow > 0)`.
+  //
+  // #3746's fast-path gate comes FIRST and is pinned here for the same reason
+  // the rest of the ladder is: it is the load-bearing part of the fix, and a
+  // silent loss of the `jz` past the two calls would restore the measured
+  // 3.28x with every behavioural gate still green.
+  xMovLoad(want.buf, rTmp, xMemB(XReg64.Rbp, xPollCacheOffset(want.frame, 2)), 8, false)
+  xMovLoad(want.buf, rTmp, xMemB(rTmp, 0), 8, false)
+  xTestRR(want.buf, rTmp, rTmp)
+  let noneSkip = xJccRel32Placeholder(want, ccE())              // nothing pending
   xEmitCallLike(want, xSchedCurrentWorkerSymbol(), []int(0), false, 0, 0, false)
   xMovRR(want.buf, rTmp, XReg64.Rax)
   xTestRR(want.buf, rTmp, rTmp)
@@ -527,6 +543,7 @@ fn checkX64ControlFlow() {
   xTestRR(want.buf, XReg64.Rax, XReg64.Rax)
   pollFx = append(pollFx, xJccRel32Placeholder(want, ccNe()))   // preempt requested
   xPatchRel32Here(want, workerSkip)
+  xPatchRel32Here(want, noneSkip)
   xMovLoad(want.buf, rGc, xMemB(XReg64.Rbp, xPollCacheOffset(want.frame, 1)), 8, false)
   xTestRR(want.buf, rGc, rGc)
   pollFx = append(pollFx, xJccRel32Placeholder(want, ccE()))   // gcAddr == 0

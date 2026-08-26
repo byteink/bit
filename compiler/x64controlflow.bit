@@ -95,26 +95,26 @@ fn xEmitBackEdgeSafepointIfNeeded(cx: XCtx, curBlock: int, target: int) {
 // #3169: the poll guard's condition, inlined at the call site
 // ---------------------------------------------------------------------------
 
-// The two cached poll addresses sit at the TOP of the spill area, in the two
+// The three cached poll addresses sit at the TOP of the spill area, in the
 // slots xCompileFunction carves ABOVE the ones the register allocator asked
 // for. Reusing the spill area rather than adding a frame region keeps
 // x64frame.bit's layout comment ("then spill slots, then saved XMMs") true as
-// written and needs no new XFrame field — and it keeps these two raw runtime
+// written and needs no new XFrame field — and it keeps these raw runtime
 // addresses out of every stack map, because xCompileFunction builds a
 // SafepointView's `slots` only from the indices the ALLOCATOR reports, which
-// never reach this high. A GC that walked them would try to trace the World
-// and GC module-state addresses as managed objects.
+// never reach this high. A GC that walked them would try to trace the World,
+// GC and scheduler module-state addresses as managed objects.
 fn xPollCacheOffset(f: XFrame, i: int): int {
   // Sized by xCompileFunction on the same hasBackEdgeSafepoint predicate that
-  // gates every caller here, so a frame reaching this point always has the
-  // pair. Asserted rather than assumed: a silently negative index would
+  // gates every caller here, so a frame reaching this point always has all
+  // three. Asserted rather than assumed: a silently negative index would
   // address the CALLER's frame.
-  assert(f.numSpillSlots >= 2 && i >= 0 && i < 2)
-  return xSpillOffset(f, f.numSpillSlots - 2 + i)
+  assert(f.numSpillSlots >= 3 && i >= 0 && i < 3)
+  return xSpillOffset(f, f.numSpillSlots - 3 + i)
 }
 
-// Fetches (worldAddr, gcAddr) ONCE per function invocation into that pair,
-// rather than once per loop iteration. Safe because runtime/stw/stw.bit's
+// Fetches (worldAddr, gcAddr, preemptAnyAddr) ONCE per function invocation into
+// those slots, rather than once per loop iteration. Safe because runtime/stw/stw.bit's
 // stwBind runs exactly once at boot — before any compiled Bit function's entry
 // can execute — and never unbinds (#2184): the two addresses are a per-process
 // constant for the entire lifetime of every function this backend compiles, so
@@ -137,9 +137,9 @@ fn xPollCacheOffset(f: XFrame, i: int): int {
 // would silently destroy a float parameter, and no stack map would notice: the
 // collector never sees float locations at all.
 //
-// bit_rt_world_addr/bit_rt_gc_addr are
+// bit_rt_world_addr/bit_rt_gc_addr/bit_rt_port_sched_preempt_any_addr are
 // themselves true leaves that never allocate or park, so — like the #2926
-// guard call they replace at the call site — neither is recorded as a
+// guard call they replace at the call site — none is recorded as a
 // safepoint.
 fn xEmitPollCachePrefetch(cx: XCtx) {
   if (!hasBackEdgeSafepoint(cx.f)) {
@@ -149,6 +149,14 @@ fn xEmitPollCachePrefetch(cx: XCtx) {
   xMovStore(cx.buf, xMemB(XReg64.Rbp, xPollCacheOffset(cx.frame, 0)), XReg64.Rax, 8)
   xEmitCallLike(cx, gcAddrSymbol(), []int(0), false, 0, 0, false)
   xMovStore(cx.buf, xMemB(XReg64.Rbp, xPollCacheOffset(cx.frame, 1)), XReg64.Rax, 8)
+  // #3746: the preempt summary word's address, on the same terms as the two
+  // above and for the same reason — a fixed module global in
+  // runtime/sched/preempt.bit, so its ADDRESS is a per-process constant even
+  // though the word it points at changes. One extra call per function ENTRY,
+  // against the two per loop ITERATION it is here to remove. Clause for clause
+  // with arm64's emitPollCachePrefetch, as this whole ladder must stay.
+  xEmitCallLike(cx, preemptAnyAddrSymbol(), []int(0), false, 0, 0, false)
+  xMovStore(cx.buf, xMemB(XReg64.Rbp, xPollCacheOffset(cx.frame, 2)), XReg64.Rax, 8)
 }
 
 // ---------------------------------------------------------------------------
@@ -175,10 +183,17 @@ fn xSchedCurrentWorkerSymbol(): string { return "bit_rt_port_sched_current_worke
 fn xPreemptRequestedSymbol(): string { return "bit_rt_port_sched_preempt_requested" }
 
 // `schedCurrentWorker`/`preemptRequested` are real cross-module calls, not
-// leaves (schedCurrentWorker walks a stack-tag table), so this clause pays
-// two real `call`s where every other clause in the ladder is a plain
-// load+compare -- the cost stwPollNeeded's own header now documents for the
-// reference function this mirrors; this only reproduces it.
+// leaves (schedCurrentWorker walks a stack-tag table), so when this clause
+// reaches them it pays two real `call`s where every other clause in the ladder
+// is a plain load+compare -- the cost stwPollNeeded's own header documents for
+// the reference function this mirrors.
+//
+// #3746 MOVED THEM OFF THE FAST PATH. #3565 (mirroring #3564) ran them on every
+// guard evaluation; measured on arm64, the identical arm64 clause cost 3.28x on
+// bench/cases/collatz and 2.36x on matrix. They now run only behind the summary
+// load below. THIS BOX IS arm64 AND THE x64 NUMBER IS UNMEASURED -- the two
+// ladders are required to stay clause-for-clause identical, so this change
+// lands here on that contract, not on an x64 measurement.
 //
 // `worker == 0` (off-task) and `!preemptRequested(...)` both just fall
 // through to the ladder's next clause, exactly like every other check here --
@@ -204,6 +219,20 @@ fn xPreemptRequestedSymbol(): string { return "bit_rt_port_sched_preempt_request
 // (rcx) differs from SysV (rdi); using it here rather than a hardcoded
 // register is what keeps this correct on both, unlike #3503/#3554.
 fn xEmitPreemptClause(cx: XCtx, rTmp: XReg64, pollFixups: []int): []int {
+  // #3746: THE FAST-PATH GATE, clause for clause with arm64's
+  // emitInlinedPreemptCheck. Three leaf instructions — a frame load of the
+  // cached address, a load of the summary word (a plain `mov` IS the acquire
+  // load under x86-64 TSO, the same fact the ladder's other two atomic reads
+  // already rely on), a test and a branch — decide whether this back edge
+  // spends the two calls below at all. Correctness rests on ONE invariant,
+  // proven where the word is declared (runtime/sched/preempt.bit): a set flag
+  // implies a nonzero summary. A false positive costs one slow evaluation; a
+  // false negative cannot occur.
+  xMovLoad(cx.buf, rTmp, xMemB(XReg64.Rbp, xPollCacheOffset(cx.frame, 2)), 8, false)
+  xMovLoad(cx.buf, rTmp, xMemB(rTmp, 0), 8, false)
+  xTestRR(cx.buf, rTmp, rTmp)
+  let noneSkip = xJccRel32Placeholder(cx, ccE()) // nothing pending anywhere
+
   xEmitCallLike(cx, xSchedCurrentWorkerSymbol(), []int(0), false, 0, 0, false)
   xMovRR(cx.buf, rTmp, XReg64.Rax) // rTmp = worker (0 off-task)
   xTestRR(cx.buf, rTmp, rTmp)
@@ -224,7 +253,12 @@ fn xEmitPreemptClause(cx: XCtx, rTmp: XReg64, pollFixups: []int): []int {
   xMovzxb(cx.buf, XReg64.Rax, XReg64.Rax)
   xTestRR(cx.buf, XReg64.Rax, XReg64.Rax)
   pollFixups = append(pollFixups, xJccRel32Placeholder(cx, ccNe()))
+  // Both no-op exits — off-task, and the #3746 fast-path gate — converge here,
+  // at the ladder's next clause, exactly as stwPollNeeded's own
+  // `if (worker != 0) { ... }` falls through, and exactly as arm64's mirror
+  // patches its own two.
   xPatchRel32Here(cx, workerSkip)
+  xPatchRel32Here(cx, noneSkip)
   return pollFixups
 }
 
@@ -248,8 +282,9 @@ fn xEmitPreemptClause(cx: XCtx, rTmp: XReg64, pollFixups: []int): []int {
 // (xScratch3) is deliberately not used: it is callee-saved under SysV.
 //
 // #3565: the worker-preempt clause (stwPollNeeded's clause 3, added by #3560)
-// pays two real `call`s -- `schedCurrentWorker`/`preemptRequested` are not
-// leaves, unlike every other check in this ladder. That is SAFE against the
+// can pay two real `call`s -- `schedCurrentWorker`/`preemptRequested` are not
+// leaves, unlike every other check in this ladder, though since #3746 it only
+// reaches them when a preempt really is pending somewhere. That is SAFE against the
 // register file this function's caller (xBuildIntRegs, compiler/x64frame.bit)
 // already picked: any function with a back-edge safepoint restricts its WHOLE
 // int register file to the callee-saved subset for its entire body, not just
