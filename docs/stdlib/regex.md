@@ -106,6 +106,51 @@ fn isZipCode(s: string): bool {
 }
 ```
 
+### Unicode classes
+
+`\p{Name}` matches every rune with Unicode property `Name`; `\P{Name}` is
+its exact complement. `\pX`/`\PX` is the one-letter shorthand, valid only
+for a single-letter category name (`\pL`, never `\pLu` or a script). Both
+forms work standalone and inside a `[...]` class, where they union into the
+surrounding class the same way `\d`/`\s`/`\w` do.
+
+Supported names, built from Unicode 17.0.0 — nothing wider, since every
+added property is table weight a caller may never reach for:
+
+- **General categories**, one- and two-letter: `C Cc Cf Co Cs L Ll Lm Lo Lt
+  Lu M Mc Me Mn N Nd Nl No P Pc Pd Pe Pf Pi Po Ps S Sc Sk Sm So Z Zl Zp Zs`.
+  The one-letter forms are aggregates (`L` is every `Lu`/`Ll`/`Lt`/`Lm`/`Lo`
+  rune combined) — `C` additionally includes every codepoint with no
+  assigned category at all (`Cn`, unassigned), matching Go's own
+  `regexp/syntax` exactly.
+- **Scripts**: `Latin Greek Cyrillic Han Arabic Hebrew Hiragana Katakana
+  Hangul Thai Devanagari`.
+- **`Any`**: every valid Unicode scalar value, `0..0x10FFFF`.
+
+```bit
+import { mustCompile } from "std/regex"
+
+fn isCJK(s: string): bool {
+  let re = mustCompile("^\\p{Han}+$")
+  return re.matches(s)
+}
+
+fn identifierChars(s: string): bool {
+  let re = mustCompile("^[\\p{L}\\p{N}_]+$")
+  return re.matches(s)
+}
+```
+
+An unknown name is `regex: unknown Unicode property 'Name' at offset N`; an
+unterminated `\p{` is `regex: missing closing } in Unicode property at
+offset N`. Under `(?i)`, a `\p{...}`/`\P{...}` class folds the same
+ASCII-only way every other class does today (see Flags, above) — a later
+ticket that adds full Unicode folding will fold it the same way too.
+
+The tables are generated, not hand-transcribed — see
+`tools/genunicode/main.bit`'s own header for the exact regeneration command
+and UCD source URLs.
+
 ### Groups
 
 Four forms, `(?:...)` alone costing no capture slot at all:
