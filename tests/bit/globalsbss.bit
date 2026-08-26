@@ -7,20 +7,27 @@
 // Two programs, identical except one extra module-level `let buf: [N]u8`
 // that is never given an initializer (§11.11's "zero-valued" case):
 //
-//   - on aarch64-macos (the host), both are linked to real executables.
+//   - on the HOST's own default target, both are linked to real executables.
 //     Checked: (a) the linked binary grows by far less than the array's own
 //     size — a size-only proxy a bug could pass by accident, so paired with
-//     (b) `otool -l` reporting a __DATA,__bss section at least as large as
-//     the array; and (c) the array reads as all-zero before the first write
-//     in TWO SEPARATE runs of the same already-linked binary — the "the
-//     loader actually zero-maps it" half of the claim, which (a) and (b)
-//     alone cannot prove (a section header can be lying).
+//     (c) the array reads as all-zero before the first write in TWO SEPARATE
+//     runs of the same already-linked binary — the "the loader actually
+//     zero-maps it" half of the claim, which (a) alone cannot prove. On a
+//     macOS host only, (b) `otool -l` additionally confirms a __DATA,__bss
+//     section at least as large as the array (a section header can be
+//     lying, which is why (c) does not depend on it). `otool` has no Linux
+//     build at all (docker/linux-gate.Dockerfile installs no Mach-O
+//     tooling), so (b) is COUNTED-SKIPPED rather than run on the two Linux
+//     gate hosts — see `isMacosHost()`/`skip()` below (#3732). (a) and (c)
+//     are format-agnostic and run on every host: on a Linux host they check
+//     the ELF .bss the host's own `bit build` produced, not the Mach-O one.
 //   - on x86_64-linux and aarch64-linux, cross-compiled `--emit-obj` (no
 //     execution needed — a linker/ELF-loader concern, not a codegen one):
 //     checked by parsing the object's own ELF64 section headers for a
 //     SHT_NOBITS section at least as large as the array, and asserting no
 //     SHT_PROGBITS section is (the shape the bug produced: the array's full
-//     size as real file bytes in a PROGBITS `.data`).
+//     size as real file bytes in a PROGBITS `.data`). This half runs
+//     identically on every host, macOS included.
 //
 // A minimal ELF64 section-header reader is written directly in this file
 // rather than importing tests/bit/objread's `readElf`: that reader's `Sec`
@@ -85,7 +92,7 @@ fn parseIntOr(s: string, fallback: int): int {
   return n
 }
 
-class Tally { checks: int, failures: int }
+class Tally { checks: int, failures: int, skipped: int }
 
 fn check(t: Tally, cond: bool, label: string) {
   t.checks = t.checks + 1
@@ -93,6 +100,24 @@ fn check(t: Tally, cond: bool, label: string) {
     t.failures = t.failures + 1
     eprint("FAIL: ${label}\n")
   }
+}
+
+// Counts `n` checks as deliberately not run, with the reason printed so a
+// green run says less loudly rather than silently (#3732). Never used to
+// avoid a real failure — only for the one sub-check (otool -l parsing) that
+// cannot execute on a host with no Mach-O tooling at all.
+fn skip(t: Tally, n: int, label: string) {
+  t.skipped = t.skipped + n
+  eprint("SKIP: ${label}\n")
+}
+
+// `hostTarget()` (§11.8, the runtime primitive `hostBuildTarget()` is built
+// on — see tests/bit/pathresolve.bit's `hostTriple()`) is 2 for aarch64-macos
+// and 0/1 for the two Linux targets. This is the only host-detection query
+// in this file, and the only thing that decides whether otool exists to run:
+// docker/linux-gate.Dockerfile installs no Mach-O tooling at all.
+fn isMacosHost(): bool {
+  return hostTarget() == 2
 }
 
 // Runs `script` through /bin/sh and returns its exit code. Always exits 0
@@ -276,18 +301,31 @@ fn elfSectionHeaders(b: []u8): []ElfShdrInfo {
 
 // ---- checks --------------------------------------------------------------
 
-fn checkMacos(t: Tally, scratch: string, bit: string, ms: int) {
+// Paths are deterministic functions of `scratch` alone, exactly as
+// checkElfTarget below recomputes `withbufSrcPath` itself rather than
+// threading it through as a parameter — kept that way here too so
+// buildHostBinaries/checkHostBinary stay at 4 params, under E0202's max of 5.
+fn writeFixtures(scratch: string) {
   let nobufSrcPath = "${scratch}/nobuf.bit"
   let withbufSrcPath = "${scratch}/withbuf.bit"
-  let nobufOut = "${scratch}/nobuf"
-  let withbufOut = "${scratch}/withbuf"
   writeFile(nobufSrcPath, nobufSrc()) catch e {
     panic("globalsbss: cannot write ${nobufSrcPath}: ${e.message()}")
   }
   writeFile(withbufSrcPath, withbufSrc()) catch e {
     panic("globalsbss: cannot write ${withbufSrcPath}: ${e.message()}")
   }
+}
 
+// Builds both fixtures for the HOST's own default target (no --target: this
+// exercises the real linker and loader for whatever platform is running this
+// test, unlike checkElfTarget's cross-compiled --emit-obj). Returns the
+// linked withbuf binary's path and whether both builds succeeded — callers
+// must not run anything against that path when this returns false.
+fn buildHostBinaries(t: Tally, scratch: string, bit: string, ms: int): (string, bool) {
+  let nobufSrcPath = "${scratch}/nobuf.bit"
+  let withbufSrcPath = "${scratch}/withbuf.bit"
+  let nobufOut = "${scratch}/nobuf"
+  let withbufOut = "${scratch}/withbuf"
   let (c1, o1) = runCapture(scratch, "buildnobuf",
     "'${bit}' build '${nobufSrcPath}' -o '${nobufOut}'", ms) catch e {
     panic("globalsbss: ${e.message()}")
@@ -300,10 +338,10 @@ fn checkMacos(t: Tally, scratch: string, bit: string, ms: int) {
   }
   check(t, c2 == 0, "build withbuf.bit: exit ${c2} — ${o2}")
   if (c1 != 0 || c2 != 0) {
-    return
+    return withbufOut, false
   }
 
-  // (a) size delta: the whole-file proxy.
+  // (a) size delta: the whole-file proxy, host-format-agnostic.
   let nobufBytes = readFile(nobufOut) catch e {
     panic("globalsbss: cannot read ${nobufOut}: ${e.message()}")
   }
@@ -312,9 +350,14 @@ fn checkMacos(t: Tally, scratch: string, bit: string, ms: int) {
   }
   let delta = len(withbufBytes) - len(nobufBytes)
   check(t, delta >= 0 && delta < maxSizeDelta,
-    "aarch64-macos: withbuf is ${delta} bytes larger than nobuf, want < ${maxSizeDelta} (a ${bufLen}-byte array must not cost its own size in the binary)")
+    "host build: withbuf is ${delta} bytes larger than nobuf, want < ${maxSizeDelta} (a ${bufLen}-byte array must not cost its own size in the binary)")
+  return withbufOut, true
+}
 
-  // (b) otool -l: the section-header proxy, independent of (a).
+// (b) otool -l: the Mach-O section-header proxy, independent of (a). Only
+// called when isMacosHost() — otool does not exist on Linux at all, so there
+// is no way to run this check there rather than skip it (#3732).
+fn checkMachoSection(t: Tally, scratch: string, withbufOut: string, ms: int) {
   let (c3, otoolOut) = runCapture(scratch, "otool",
     "otool -l '${withbufOut}'", ms) catch e {
     panic("globalsbss: ${e.message()}")
@@ -323,19 +366,40 @@ fn checkMacos(t: Tally, scratch: string, bit: string, ms: int) {
   let bssSize = otoolSectionSize(otoolOut, "__bss")
   check(t, bssSize >= bufLen,
     "aarch64-macos: __DATA,__bss reports size ${bssSize}, want >= ${bufLen} (otool -l ${withbufOut})")
+}
 
-  // (c) the array is genuinely zero-mapped, in TWO separate process runs of
-  // the SAME linked binary — the correctness half (a)/(b) cannot prove.
+// (c) the array is genuinely zero-mapped, in TWO separate process runs of the
+// SAME linked host binary — the correctness half neither (a) nor a
+// section-header inspection can prove. True of the ELF loader exactly as much
+// as the Mach-O one, so unlike (b) this runs on every host unconditionally.
+fn checkZeroMapped(t: Tally, scratch: string, withbufOut: string, ms: int) {
   let (c4, run1) = runCapture(scratch, "run1", "'${withbufOut}'", ms) catch e {
     panic("globalsbss: ${e.message()}")
   }
   check(t, c4 == 0 && run1 == wantStdout,
-    "aarch64-macos: first run of withbuf printed '${run1}' (exit ${c4}), want '${wantStdout}'")
+    "host binary: first run of withbuf printed '${run1}' (exit ${c4}), want '${wantStdout}'")
   let (c5, run2) = runCapture(scratch, "run2", "'${withbufOut}'", ms) catch e {
     panic("globalsbss: ${e.message()}")
   }
   check(t, c5 == 0 && run2 == wantStdout,
-    "aarch64-macos: second (fresh) run of withbuf printed '${run2}' (exit ${c5}), want '${wantStdout}' again")
+    "host binary: second (fresh) run of withbuf printed '${run2}' (exit ${c5}), want '${wantStdout}' again")
+}
+
+// Orchestrates the three host-binary checks above. On a non-macOS host this
+// runs 2 fewer checks than on macOS — (b) is skipped, loudly and counted,
+// never silently — because otool has no Linux build at all
+// (docker/linux-gate.Dockerfile installs no Mach-O tooling).
+fn checkHostBinary(t: Tally, scratch: string, bit: string, ms: int) {
+  let (withbufOut, built) = buildHostBinaries(t, scratch, bit, ms)
+  if (!built) {
+    return
+  }
+  if (isMacosHost()) {
+    checkMachoSection(t, scratch, withbufOut, ms)
+  } else {
+    skip(t, 2, "__DATA,__bss otool check needs a macOS host — otool has no Linux build (2 of 15 checks skipped)")
+  }
+  checkZeroMapped(t, scratch, withbufOut, ms)
 }
 
 fn checkElfTarget(t: Tally, scratch: string, bit: string, ms: int, target: string) {
@@ -386,9 +450,10 @@ fn main() {
     panic("globalsbss: cannot create ${scratch}: ${e.message()}")
   }
 
-  let t = Tally{ checks: 0, failures: 0 }
-  checkMacos(t, scratch, bit, ms)
-  // withbuf.bit is written by checkMacos above; both ELF targets reuse it.
+  writeFixtures(scratch)
+  let t = Tally{ checks: 0, failures: 0, skipped: 0 }
+  checkHostBinary(t, scratch, bit, ms)
+  // withbuf.bit is written by writeFixtures above; both ELF targets reuse it.
   checkElfTarget(t, scratch, bit, ms, "x86_64-linux")
   checkElfTarget(t, scratch, bit, ms, "aarch64-linux")
 
@@ -399,6 +464,10 @@ fn main() {
   if (t.failures > 0) {
     println("globalsbss: FAIL — ${t.failures} of ${t.checks} checks failed")
     exit(1)
+    return
+  }
+  if (t.skipped > 0) {
+    println("globalsbss: PASS — ${t.checks} of ${t.checks + t.skipped} checks run (${t.skipped} skipped: __DATA,__bss otool check needs a macOS host)")
     return
   }
   println("globalsbss: PASS — ${t.checks} checks")
