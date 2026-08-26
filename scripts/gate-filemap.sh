@@ -212,6 +212,12 @@ gates_for_file() {
     # into a sibling to stay under the 800-line limit, the same shape as
     # tests/bit/fmtcitations/* and tests/bit/golden/* above.
     tests/bit/importsrun/*) printf 'test-imports-bit\n'; return 0 ;;
+    # #2369 split this from a single file (tests/bit/pmrangegate.bit) to a
+    # directory module — formatting it past the 800-line limit while the
+    # tests/bit fmt ratchet demanded it be formatted forced the split, the
+    # same shape as tests/bit/fmtcitations/*, tests/bit/golden/* and
+    # tests/bit/importsrun/* above.
+    tests/bit/pmrangegate/*) printf 'test-pmrangegate\n'; return 0 ;;
     tests/bit/pollfree/*) printf 'test-pollfree\n'; return 0 ;;
     tests/bit/rootabi/*) printf 'test-rootabi\n'; return 0 ;;
     tests/bit/rootpins/*) printf 'test-rootpins\n'; return 0 ;;
