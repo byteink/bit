@@ -2658,8 +2658,12 @@ Implemented as a poll-and-sleep loop (`runtime/net/{darwin,linux}/tcp.bit`'s
 poll/timer race to the scheduler: on each `EAGAIN` the deadline is checked,
 then the calling task sleeps a short, bounded slice (2ms, matching §19's
 `osPollNs`) via `schedSleepUntil` before retrying the syscall itself, capped
-at an 80-minute wait ceiling (`os_run_bounded_max_ms`'s own clamp) expressed as
-a worst-case poll count so the loop is statically bounded either way. No
+at a one-hour wait ceiling (`netDeadlineMaxWaitNs`, `runtime/net/net.bit`) —
+kept independent of §19's own clamp on purpose (#3720): that one governs
+test/gate wall-clock capacity, this one bounds a caller's own deadline input
+against a unit typo, a different reason with no tie to gate timing —
+expressed as a worst-case poll count (`netDeadlineMaxPolls`) so the loop is
+statically bounded either way. No
 `gcSyscallBegin`/`gcSyscallEnd` bracket: every syscall this touches
 (`read`/`write`/`connect`) runs on this provider's always-non-blocking
 sockets, so each returns immediately rather than holding the OS thread in
