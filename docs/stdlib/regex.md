@@ -381,6 +381,41 @@ fn wordCount(s: string): int {
 }
 ```
 
+### `Regex.split(s: string, limit: int): []string`
+
+The text between successive non-overlapping matches of `re`'s pattern in
+`s`, using `findAll`'s exact left-to-right scan (above), including its
+empty-match one-rune advance rule. `limit < 0` is unlimited pieces;
+`limit == 0` returns an empty slice with no scanning at all; `limit > 0`
+returns at most `limit` pieces, and the **last** piece holds the entire
+unsplit remainder of `s` — matches included — rather than truncating it.
+
+A match at offset 0 yields an empty **leading** piece; a match ending at
+`len(s)` yields an empty **trailing** piece — neither is dropped. A subject
+with no match returns a single piece: the whole subject.
+
+```bit
+import { mustCompile } from "std/regex"
+
+fn words(s: string): []string {
+  let re = mustCompile("\\s+")
+  return re.split(s, -1)
+}
+```
+
+**The empty-match trap, resolved the same way Go's `regexp.Split` resolves
+it**: a pattern that can match the empty string splits *between* every
+rune rather than looping forever — `mustCompile("").split("abc", -1)`
+yields `["a", "b", "c"]`, three pieces, not five. The two zero-width
+matches that land exactly at offset 0 and at `len(s)` are a special case
+and do **not** produce an extra empty piece the way a non-empty match at
+those same offsets would (splitting `",ab"` on `","` still yields a
+leading `""`, since that match is not zero-width). A pattern whose source
+text is non-empty, applied to an empty subject, always returns a single
+empty piece, `[""]`, regardless of whether the pattern could itself match
+the empty string — matching Go's `(*Regexp).Split` exactly, including this
+corner.
+
 ### `Regex.replaceAll(s: string, repl: string): string`
 
 Every leftmost, non-overlapping match of `re`'s pattern in `s`, replaced by
