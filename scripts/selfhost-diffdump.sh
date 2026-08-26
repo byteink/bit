@@ -287,6 +287,20 @@ whydied() {
   esac
 }
 
+# A Bit-level panic (bit_rt_panic, ABI.md §12 / SPEC §18.4) is a CONTROLLED
+# exit, always 2, always with "panic: <msg>" as the first line written -- not
+# death by signal, so `rc -ge 128` never sees it (#3757, #2084/#2070
+# recurring with a controlled exit instead of a signal). A legitimate decline
+# never writes this line: verified against every --dump-ir/--dump-ir-pre
+# handler in compiler/main.bit, which exits 1 with no stderr output on
+# failure. $1 is a captured stdout+stderr file (alarmrun_retry_cap) -- safe to
+# merge because both compilers write nothing to stderr on a call that
+# succeeds (checked over the full corpus), so this can never mistake real
+# dump text for a panic line.
+is_panic() {
+  [ -s "$1" ] && head -n 1 "$1" | grep -q '^panic: '
+}
+
 # ast/tokens/diags row bodies: a single MATCH/MISMATCH pass, first divergence
 # reported. diags never skips (SKIPLABEL empty) — a valid file renders empty on
 # both sides and a rejected one renders the same diagnostic on both, so nothing
@@ -490,13 +504,20 @@ run_ir() {
   : >"$work/timeout"
   : >"$work/oracletimeout"
   : >"$work/oraclecrash"
+  : >"$work/oraclepanic"
 
   for f in $(find $CORPUS -name '*.bit' | sort); do
     # The oracle is bounded too, and its timeout is NOT a skip: a skip means the
     # oracle could not lower or check the file, which is a real and expected
     # outcome, while a hang is a broken stage0 that must be named (#2070).
     # Verdict-deciding (#3422): retry-once-on-stall, same as run_basic() above.
-    want=$(alarmrun_retry ORACLE "" "$ORACLE" "$FLAG" "$f")
+    # Captured to a file rather than piped through $() so a panic (exit 2,
+    # "panic: ...") can be told apart from a decline (#3757) -- alarmrun_retry_cap
+    # merges stdout+stderr and re-truncates the file on every attempt, including
+    # the retry, so a stalled first attempt can never leave stale bytes for
+    # is_panic() to misread.
+    ocap="$work/oracle.cap"
+    alarmrun_retry_cap ORACLE "" "$ocap" "$ORACLE" "$FLAG" "$f"
     rc=$?
     if [ "$rc" -eq 142 ]; then
       echo "$f${sep}$(whydied "$rc")" >>"$work/oracletimeout"
@@ -506,10 +527,19 @@ run_ir() {
       echo "$f${sep}$(whydied "$rc")" >>"$work/oraclecrash"
       continue
     fi
-    [ "$rc" -ne 0 ] && { skip=$((skip + 1)); continue; }
+    if [ "$rc" -ne 0 ]; then
+      if is_panic "$ocap"; then
+        echo "$f${sep}$(head -n 1 "$ocap")" >>"$work/oraclepanic"
+      else
+        skip=$((skip + 1))
+      fi
+      continue
+    fi
+    want=$(cat "$ocap")
     [ -z "$want" ] && { skip=$((skip + 1)); continue; }
 
-    b2=$(alarmrun_retry BIT2 "" "$BIT2" "$FLAG" "$f")
+    bcap="$work/bit2.cap"
+    alarmrun_retry_cap BIT2 "" "$bcap" "$BIT2" "$FLAG" "$f"
     rc=$?
     # >=128 is death by signal, and WHICH signal is not a detail. 142 is our own
     # SIGALRM — a timeout. Anything else is the compiler dying, and reporting a
@@ -519,6 +549,19 @@ run_ir() {
       echo "$f${sep}$(whydied "$rc")" >>"$work/timeout"
       continue
     fi
+    # The BIT2-side mirror of the oracle panic check above (#3757): before
+    # this fix a working-tree panic left $b2 empty, which was then compared
+    # as TEXT against a real IR dump and fabricated a MISMATCH. A panic here
+    # is the identical "no verdict" outcome as a signal death just above, so
+    # it joins the SAME bucket -- never text-compared, never scored as a
+    # divergence. Unlike the oracle's panic, this one is our own tree's and is
+    # a real, actionable regression, so it stays in the no-verdict/exit-2
+    # class rather than being downgraded to purely informational.
+    if [ "$rc" -ne 0 ] && is_panic "$bcap"; then
+      echo "$f${sep}PANICKED: $(head -n 1 "$bcap")" >>"$work/timeout"
+      continue
+    fi
+    b2=$(cat "$bcap")
 
     # $t<id> suffixes are interning-order artifacts, not structural — canonicalize
     # before comparing (see selfhost-ir-canon.sh). Raw compare first: the
@@ -549,8 +592,9 @@ run_ir() {
   timeouts=$(wc -l <"$work/timeout" | tr -d ' ')
   oracletimeouts=$(wc -l <"$work/oracletimeout" | tr -d ' ')
   oraclecrashes=$(wc -l <"$work/oraclecrash" | tr -d ' ')
+  oraclepanics=$(wc -l <"$work/oraclepanic" | tr -d ' ')
 
-  echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch EXPLAINED=$explained NO-VERDICT=$timeouts ORACLE-TIMEOUT=$oracletimeouts ORACLE-CRASH=$oraclecrashes SKIP($SKIPLABEL)=$skip"
+  echo "$LABEL differential: MATCH=$match MISMATCH=$mismatch EXPLAINED=$explained NO-VERDICT=$timeouts ORACLE-TIMEOUT=$oracletimeouts ORACLE-CRASH=$oraclecrashes ORACLE-PANIC=$oraclepanics SKIP($SKIPLABEL)=$skip"
 
   # A RUN THAT COMPARED NOTHING IS NOT A PASS (#1881). Two ways to get here having
   # verified nothing, and both leave `mismatch` and `timeout` empty, so every check
@@ -648,6 +692,18 @@ run_ir() {
     echo
     echo "NOTE: the pinned stage0 crashed on $oraclecrashes file(s) — no verdict available, tracked as #2084:"
     while read -r f; do echo "  $f"; done <"$work/oraclecrash"
+  fi
+
+  # AN ORACLE PANIC IS REPORTED BUT DOES NOT FAIL, for the identical reason
+  # ORACLE-CRASH above does not: the oracle is a published, immutable binary
+  # and a panic is a controlled exit (2), not death by signal, but "no change
+  # to this tree can stop it faulting" applies exactly the same. Before #3757
+  # a panic-exit fell straight through into SKIP, indistinguishable from a
+  # legitimate decline -- #3755 and #3756 sat unseen inside SKIP as a result.
+  if [ -s "$work/oraclepanic" ]; then
+    echo
+    echo "NOTE: the pinned stage0 PANICKED on $oraclepanics file(s) — no verdict available, tracked as #3757:"
+    while read -r f; do echo "  $f"; done <"$work/oraclepanic"
   fi
 
   if [ "$mismatch" -eq 0 ] && [ "$timeouts" -eq 0 ] && [ "$oracletimeouts" -eq 0 ]; then
