@@ -1,0 +1,483 @@
+// #3703. One parameterised `bit fmt --check` count-ratchet driver, replacing
+// FIVE near-identical harnesses that had accreted one ticket at a time:
+// fmtceiling.bit (#3670/#3654, multi-tree: compiler/+runtime/+tools/),
+// fmtimportsceiling.bit (#3693, tests/imports/), fmtstressceiling.bit
+// (#3702, tests/stress/), fmttestsbitceiling.bit (#3711, tests/bit/), and
+// this ticket's own tests/cases/ ratchet — each identical apart from a
+// header comment, a tree list, a ceiling filename, and whether rendered
+// parse-failure diagnostics need tolerating. That is exactly the shape this
+// repo already has a rule against (CLAUDE.md, "do not bloat scripts/", and
+// #2743's `selfhost-diffdump.sh` precedent): one driver plus a data table,
+// never a sixth (here, fifth) copy. The "data table" is the `Gate{}` env in
+// tools/build/gates.bit, one row per tree-set.
+//
+// Contract, identical to every harness this replaces: going over the
+// recorded ceiling in the named ceiling file fails; going under it passes and
+// names the lower number a human could ratchet it down to. A human lowers a
+// ceiling; this gate only ever refuses a rise. It never runs `bit fmt -w` and
+// never rewrites any ceiling file.
+//
+// Configuration is four required env vars, read once in `main`:
+//   BIT_FMTCEIL_LABEL   the gate's own name for its messages, e.g. "fmt-ceiling"
+//   BIT_FMTCEIL_TREES   "<key>:<repo-relative-dir>" pairs, space-separated,
+//                        e.g. "compiler:compiler runtime:runtime tools:tools"
+//                        or a single "cases:tests/cases"
+//   BIT_FMTCEIL_FILE    repo-relative path to the ceiling file, containing one
+//                        "<key> <count>" line per tree in BIT_FMTCEIL_TREES
+//   BIT_FMTCEIL_TOLERATE_DIAG  "1" if the tree(s) contain fixtures that can
+//                        never parse (so `bit fmt --check` renders a full
+//                        diagnostic block, not a bare path, for them) and
+//                        those blocks must be skipped rather than treated as
+//                        an unrecognized line; any other value (or absent)
+//                        means no tree here is expected to contain one.
+// BIT_SELF_EXE and BIT_REPO are required exactly as in every sibling gate.
+//
+// ONE DELIBERATE DIFFERENCE the tolerant mode encodes, ported verbatim from
+// fmttestsbitceiling.bit: a tree with permanently-unparseable fixtures can
+// never make `bit fmt --check` exit 0, so `assertTrustworthy` below checks
+// only the two shapes that mean the invocation itself misbehaved (exit
+// outside {0,1}; exit 0 with nonempty stderr; exit 1 with empty stderr) and
+// never treats exit 0 as an independent "must be clean" signal — the ratchet
+// is computed purely from the parsed, tolerance-filtered finding count.
+//
+// BIT_REPO IS REQUIRED, same reason as every gate in this directory: each
+// tree resolves to `${BIT_REPO}/<dir>` and the ceiling file to
+// `${BIT_REPO}/<BIT_FMTCEIL_FILE>` — neither silently defaults to ".".
+//
+// Run it from the repository root, e.g.:
+//     BIT_FMTCEIL_LABEL=fmt-ceiling \
+//     BIT_FMTCEIL_TREES="compiler:compiler runtime:runtime tools:tools" \
+//     BIT_FMTCEIL_FILE=tools/build/fmt-ceiling.txt \
+//     ./bit-out/bin/bit run tests/bit/fmtceilingcheck.bit
+import { env, envOr, exit } from "std/os"
+import { exists, isDir, mkdir, readDir, readFile, writeFile } from "std/fs"
+import { hasPrefix, hasSuffix, parseInt, split, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// Bounds on the independent file-count walk below — Power of 10 rule 2.
+const maxEntries: int = 4096
+const maxScanDepth: int = 16
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "300")) catch _ {
+    300
+  }
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s mechanism channel, never a program exit status, so
+// each one is a named panic rather than a value any assertion could consume.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("fmtceilingcheck: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("fmtceilingcheck: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("fmtceilingcheck: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("fmtceilingcheck: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+fn requiredEnv(name: string): string! {
+  let v = env(name)
+  if (len(v) == 0) {
+    fail newError("fmtceilingcheck: ${name} is required and was not set")
+  }
+  return v
+}
+
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// One `bit fmt --check <dir>` invocation, as seen from outside it.
+class Run { code: int, err: string }
+
+fn runFmtCheck(bit: string, dir: string, capDir: string, ms: int): Run! {
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  let script = "#!/bin/sh\n" +
+    "'${bit}' fmt --check '${dir}' > /dev/null 2> '${errPath}'\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/fmt.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("fmtceilingcheck: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("fmtceilingcheck: no exit code was recorded — the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, err: readFile(errPath)? }
+}
+
+// `r` is a usable observation of a real run. See the header for why exit 0
+// is never treated as an independent "must be clean" signal here — only the
+// two shapes that mean the invocation itself misbehaved are checked.
+fn assertTrustworthy(r: Run, dir: string) {
+  if (r.code != 0 && r.code != 1) {
+    panic("fmtceilingcheck: `bit fmt --check ${dir}` exited ${r.code}, want 0 or 1")
+  }
+  if (r.code == 0 && len(r.err) > 0) {
+    panic("fmtceilingcheck: `bit fmt --check ${dir}` exited 0 but wrote to stderr:\n${r.err}")
+  }
+  if (r.code == 1 && len(r.err) == 0) {
+    panic("fmtceilingcheck: `bit fmt --check ${dir}` exited 1 but stderr is empty — untrustworthy run")
+  }
+}
+
+fn isDigit(c: u8): bool {
+  return c >= '0' && c <= '9'
+}
+
+// The `-->` location line of a rendered diagnostic (compiler/diagnostics.bit's
+// `renderOne`): `${pad}--> ${path}:${line}:${col}`.
+fn isDiagArrowLine(line: string): bool {
+  return hasPrefix(trimSpace(line), "-->")
+}
+
+// Either the bare gutter (`${pad} |`) or the caret line
+// (`${pad} | ${caretPad}^^^ <hint>`) of a rendered diagnostic — both are the
+// trimmed line starting with `|`.
+fn isDiagGutterLine(line: string): bool {
+  return hasPrefix(trimSpace(line), "|")
+}
+
+// The quoted source line of a rendered diagnostic: `${lineNo} | <source>`,
+// i.e. one or more digits followed by ` | `.
+fn isDiagSourceLine(line: string): bool {
+  let i = 0
+  while (i < len(line) && isDigit(line[i])) {
+    i = i + 1
+  }
+  if (i == 0) {
+    return false
+  }
+  return hasPrefix(line[i:], " | ")
+}
+
+// The header line of a rendered diagnostic: `severityLabel[code]: message` or
+// `severityLabel: message` when the diagnostic carries no code
+// (compiler/diagnostics.bit's `severityLabel`: "error", "warning" or "note").
+fn isDiagHeaderLine(line: string): bool {
+  return hasPrefix(line, "error") || hasPrefix(line, "warning") || hasPrefix(line, "note")
+}
+
+// True for any line belonging to a rendered parse-failure diagnostic block —
+// tolerated debt-free noise from a deliberately-malformed fixture, never
+// counted against the ceiling. Only consulted when BIT_FMTCEIL_TOLERATE_DIAG
+// is set (see header for why not every tree needs this).
+fn isDiagLine(line: string): bool {
+  return isDiagHeaderLine(line) ||
+    isDiagArrowLine(line) ||
+    isDiagGutterLine(line) ||
+    isDiagSourceLine(line)
+}
+
+// Every nonblank stderr line from `bit fmt --check` is EITHER the bare
+// repo-relative-once-stripped path of an unformatted file (compiler/
+// fmtcmd.bit's `fmtOneFile`: `eprint("${path}\n")`, checkOnly path), a line of
+// a rendered parse-failure diagnostic block (tolerated only when
+// `tolerateDiag` is true — see `isDiagLine`), or a `bit fmt: ...`-prefixed
+// tool diagnostic (unexpected here, always fatal). Anything else fails
+// loudly rather than being silently folded into "0 findings".
+fn parseUnformatted(err: string, repo: string, tolerateDiag: bool): []string! {
+  let out = []string(0)
+  let prefix = "${repo}/"
+  for line of split(err, "\n") {
+    if (len(trimSpace(line)) == 0) {
+      continue
+    }
+    if (hasPrefix(line, "bit fmt: ")) {
+      fail newError("fmtceilingcheck: unexpected `bit fmt` diagnostic: ${line}")
+    }
+    if (tolerateDiag && isDiagLine(line)) {
+      continue
+    }
+    if (!hasSuffix(line, ".bit")) {
+      fail newError("fmtceilingcheck: unrecognized `bit fmt --check` output line: ${line}")
+    }
+    if (!hasPrefix(line, prefix)) {
+      fail newError("fmtceilingcheck: unformatted path outside ${repo}: ${line}")
+    }
+    out = append(out, line[len(prefix):])
+  }
+  return out
+}
+
+// One `<key>:<repo-relative-dir>` entry from BIT_FMTCEIL_TREES.
+class TreeSpec { key: string, dir: string }
+
+fn parseTreeSpecs(raw: string): []TreeSpec! {
+  let out = []TreeSpec(0)
+  for tok of split(raw, " ") {
+    if (len(trimSpace(tok)) == 0) {
+      continue
+    }
+    let fields = split(tok, ":")
+    if (len(fields) != 2) {
+      fail newError("fmtceilingcheck: malformed BIT_FMTCEIL_TREES entry: '${tok}' (want key:dir)")
+    }
+    out = append(out, TreeSpec{ key: fields[0], dir: fields[1] })
+  }
+  if (len(out) == 0) {
+    fail newError("fmtceilingcheck: BIT_FMTCEIL_TREES named zero trees")
+  }
+  return out
+}
+
+fn containsStr(xs: []string, s: string): bool {
+  for x of xs {
+    if (x == s) {
+      return true
+    }
+  }
+  return false
+}
+
+// Parses the ceiling file named by BIT_FMTCEIL_FILE: one `<key> <count>` line
+// per tree in `validKeys`, in any order. A human edits this file to lower a
+// ceiling; this gate reads it and never writes it.
+fn parseCeilingFile(text: string, validKeys: []string): map<string, int>! {
+  let seen = map<string, int>{}
+  for rawLine of split(text, "\n") {
+    let line = trimSpace(rawLine)
+    if (len(line) == 0) {
+      continue
+    }
+    let fields = split(line, " ")
+    if (len(fields) != 2) {
+      fail newError("fmtceilingcheck: malformed ceiling file line: '${line}'")
+    }
+    if (!containsStr(validKeys, fields[0])) {
+      fail newError("fmtceilingcheck: unknown scope '${fields[0]}' in ceiling file")
+    }
+    let n = parseInt(fields[1])?
+    seen[fields[0]] = n
+  }
+  for k of validKeys {
+    let (_, ok) = seen[k]
+    if (!ok) {
+      fail newError("fmtceilingcheck: ceiling file must have a '${k} <n>' line")
+    }
+  }
+  return seen
+}
+
+fn loadCeiling(repo: string, relPath: string, validKeys: []string): map<string, int>! {
+  let path = "${repo}/${relPath}"
+  if (!exists(path)) {
+    fail newError("fmtceilingcheck: no ceiling file at ${path}")
+  }
+  return parseCeilingFile(readFile(path)?, validKeys)?
+}
+
+// The count of `.bit` files anywhere beneath `dir` — an independent walk used
+// only as the anti-vacuity denominator. Bounded by `maxScanDepth` (Power of
+// 10 rule 2), not merely documented as such.
+fn countBitFiles(dir: string, depth: int): int {
+  if (depth <= 0) {
+    panic("fmtceilingcheck: ${dir} nesting exceeds ${maxScanDepth} levels")
+  }
+  let names = readDir(dir) catch e {
+    panic("fmtceilingcheck: cannot list ${dir}: ${e.message()}")
+  }
+  if (len(names) > maxEntries) {
+    panic("fmtceilingcheck: ${dir} has ${len(names)} entries, over the ${maxEntries} bound")
+  }
+  let n = 0
+  for name of names {
+    let path = "${dir}/${name}"
+    if (isDir(path)) {
+      n = n + countBitFiles(path, depth - 1)
+    } else if (hasSuffix(name, ".bit")) {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+// One tree's full verdict: the independently walked `.bit` file count, and
+// the unformatted files that count against the ceiling.
+class TreeResult { key: string, dir: string, filesTotal: int, files: []string }
+
+// Bundles the four values every tree-scan shares, so `scanTree` below stays
+// at 3 params instead of 6 (E0202, max 5) — the scan-time analogue of `Config`
+// (see `main`).
+class ScanCtx { bit: string, repo: string, capDir: string, ms: int }
+
+fn scanTree(ctx: ScanCtx, spec: TreeSpec, tolerateDiag: bool): TreeResult {
+  let full = "${ctx.repo}/${spec.dir}"
+  if (!exists(full)) {
+    panic("fmtceilingcheck: no such directory: ${full}")
+  }
+  let filesTotal = countBitFiles(full, maxScanDepth)
+  if (filesTotal == 0) {
+    panic("fmtceilingcheck: ${full} contains zero .bit files — refusing a vacuous scan")
+  }
+  let subDir = "${ctx.capDir}/${spec.key}"
+  mkdir(subDir) catch e {
+    panic("fmtceilingcheck: cannot create ${subDir}: ${e.message()}")
+  }
+  let r = runFmtCheck(ctx.bit, full, subDir, ctx.ms) catch e {
+    panic("fmtceilingcheck: ${e.message()}")
+  }
+  assertTrustworthy(r, full)
+  let unformatted = parseUnformatted(r.err, ctx.repo, tolerateDiag) catch e {
+    panic("fmtceilingcheck: ${e.message()}")
+  }
+  return TreeResult{ key: spec.key, dir: spec.dir, filesTotal: filesTotal, files: unformatted }
+}
+
+fn printFiles(dir: string, files: []string) {
+  eprint("  ${dir} unformatted file(s) counted against the ceiling:\n")
+  for f of files {
+    eprint("    ${f}\n")
+  }
+}
+
+// The verdict for one tree. Returns true when this tree FAILS the gate.
+fn reportTree(tr: TreeResult, ceiling: int, label: string, ceilingFile: string): bool {
+  let total = len(tr.files)
+  if (total > ceiling) {
+    eprint("${label}: FAIL -- ${tr.dir} reports ${total} unformatted file(s) (of ${tr.filesTotal} scanned), ceiling is ${ceiling} (${ceilingFile}) -- grew by ${total - ceiling}.\n")
+    printFiles(tr.dir, tr.files)
+    return true
+  }
+  if (total < ceiling) {
+    println("${label}: ${tr.dir} ${total} unformatted of ${tr.filesTotal} .bit file(s) scanned (ceiling ${ceiling}) -- PASS. Lower the ceiling to ${total} in ${ceilingFile} once reviewed.")
+    return false
+  }
+  println("${label}: ${tr.dir} ${total} unformatted of ${tr.filesTotal} .bit file(s) scanned (ceiling ${ceiling}) -- PASS.")
+  return false
+}
+
+fn newCapDir(): string {
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  return "${tmp}/bit-fmtceilingcheck-${uuidFormat(uuidV4())}"
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}
+
+fn teardown(dir: string, ms: int) {
+  shell("${dir}/rm.sh", "#!/bin/sh\nrm -rf '${dir}'\n", ms) catch _ {
+    return
+  }
+}
+
+fn treeKeys(specs: []TreeSpec): []string {
+  let out = []string(0)
+  for s of specs {
+    out = append(out, s.key)
+  }
+  return out
+}
+
+fn ceilingFor(ceilings: map<string, int>, key: string): int {
+  let (n, ok) = ceilings[key]
+  if (!ok) {
+    panic("fmtceilingcheck: no ceiling loaded for '${key}' — loadCeiling should have refused this")
+  }
+  return n
+}
+
+// Every env var this gate reads, loaded once. Keeps `main` to one `catch`
+// for the whole config instead of six, which is what brought its own
+// cyclomatic complexity over the E0204 limit before this split.
+class Config {
+  bit: string,
+  repo: string,
+  label: string,
+  treesRaw: string,
+  ceilingRel: string,
+  tolerateDiag: bool,
+}
+
+fn loadConfig(): Config! {
+  let bit = requiredEnv("BIT_SELF_EXE")?
+  let repo = requiredEnv("BIT_REPO")?
+  let label = requiredEnv("BIT_FMTCEIL_LABEL")?
+  let treesRaw = requiredEnv("BIT_FMTCEIL_TREES")?
+  let ceilingRel = requiredEnv("BIT_FMTCEIL_FILE")?
+  let tolerateDiag = envOr("BIT_FMTCEIL_TOLERATE_DIAG", "0") == "1"
+  return Config{
+    bit: bit,
+    repo: repo,
+    label: label,
+    treesRaw: treesRaw,
+    ceilingRel: ceilingRel,
+    tolerateDiag: tolerateDiag,
+  }
+}
+
+// One tree's scan-and-report step, folded out of `main`'s loop body to keep
+// the loop itself to a single call (also an E0204 contributor before this
+// split).
+fn scanAndReport(ctx: ScanCtx, spec: TreeSpec, ceilings: map<string, int>, cfg: Config): bool {
+  let tr = scanTree(ctx, spec, cfg.tolerateDiag)
+  return reportTree(tr, ceilingFor(ceilings, spec.key), cfg.label, cfg.ceilingRel)
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let cfg = loadConfig() catch e {
+    panic("fmtceilingcheck: ${e.message()}")
+  }
+  let specs = parseTreeSpecs(cfg.treesRaw) catch e {
+    panic("fmtceilingcheck: ${e.message()}")
+  }
+  let ceilings = loadCeiling(cfg.repo, cfg.ceilingRel, treeKeys(specs)) catch e {
+    panic("fmtceilingcheck: ${e.message()}")
+  }
+
+  let capDir = newCapDir()
+  mkdir(capDir) catch e {
+    panic("fmtceilingcheck: cannot create ${capDir}: ${e.message()}")
+  }
+  let ctx = ScanCtx{ bit: cfg.bit, repo: cfg.repo, capDir: capDir, ms: ms }
+
+  let anyFail = false
+  for spec of specs {
+    if (scanAndReport(ctx, spec, ceilings, cfg)) {
+      anyFail = true
+    }
+  }
+
+  if (anyFail) {
+    // `exit()` does not run pending defers (#3694, same shape as #3677) —
+    // call teardown explicitly on both the PASS and FAIL paths.
+    teardown(capDir, ms)
+    eprint("${cfg.label}: ceiling lives in ${cfg.ceilingRel}; a human lowers it, this gate never does.\n")
+    exit(1)
+  }
+  teardown(capDir, ms)
+  println("${cfg.label}: PASS")
+}
