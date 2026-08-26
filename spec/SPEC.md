@@ -127,7 +127,7 @@ class  const   continue  default  defer      else
 enum   export  fail      false    fn         for
 from   if      import    in       interface  let
 map    match   nil       of       return     select
-spawn  switch  true      type     while
+spawn  switch  this      true     type       while
 ```
 
 `struct` is not a keyword. Pre-0.1.24 code that declared types with `struct` is
@@ -140,6 +140,10 @@ function (§5.3, §16), so it must be an identifier for `assert(cond)` to parse 
 a call.
 
 `match` selects on an enum value and binds its payload (§13.8).
+
+`this` is the implicit receiver of a method declared inside a class body
+(§10.4); it is never written at the declaration site and names nothing outside
+a method body.
 
 ### 5.3 Predeclared Identifiers (not keywords)
 
@@ -693,15 +697,32 @@ declaration order. Green-thread stacks are fixed-size and guarded (§20), so
 
 ### 10.4 Method Declarations
 
-Methods attach a named function to a class or type-alias target via an explicit
-receiver placed before the method name:
+A method attaches a named function to a class or type-alias target, in one of
+two forms.
+
+**In the class body**, using the reserved receiver `this`:
+
+```
+class Point {
+  x: f64
+  y: f64
+
+  norm(): f64 {
+    return sqrt(this.x * this.x + this.y * this.y)
+  }
+}
+```
+
+`this` is typed as the enclosing class; no `fn` keyword and no receiver clause
+are written. A method may still declare its own `generic_params`
+(`scaled<T>(...)`), independently of any the class itself declares.
+
+**With an explicit receiver**, placed before the method name:
 
 ```
 method_decl = [ "export" ] "fn" "(" receiver ")" IDENT [ generic_params ] signature block .
 receiver    = IDENT ":" type_name .
 ```
-
-Example:
 
 ```
 class Point { x: f64; y: f64 }
@@ -710,6 +731,9 @@ fn (p: Point) norm(): f64 {
   return sqrt(p.x * p.x + p.y * p.y)
 }
 ```
+
+Both forms declare the same construct and share every rule below; a program
+may use either form for any method.
 
 - The receiver type must be a class or type-alias declared in the **same
   module**. Methods can only be declared for locally-declared types.
