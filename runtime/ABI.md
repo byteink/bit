@@ -1878,10 +1878,19 @@ RtBytes { ptr: *const u8, len: usize }   // extern class — a transient,
   diagnostics on stdout would mix into a program's real output the moment it is
   piped, so anything a caller is not asking *for* goes to fd 2.
 - Both terminate the process the same way on failure: write `panic: <msg>\n`
-  to fd 2, then exit immediately with code 2 (SPEC.md §18.4: "a non-zero exit
-  code"). There is no `recover` (SPEC.md §18.4) and v1 emits no stack trace —
-  codegen has made no frame-pointer-chain promise this runtime could walk, and
-  there is no debug-info format yet to symbolize one if it did.
+  to fd 2, then, if `BIT_BACKTRACE=1` is set in the environment, a symbolized
+  stack trace — one `  at <name> (<file>:<line>)` line per resolved frame,
+  walked from `bit_rt_panic`'s own frame pointer (§4, "Frame chain") and
+  symbolized against the `.bit_dbg` debug-info table (§4.2) — then exit
+  immediately with code 2 (SPEC.md §18.4: "a non-zero exit code"). There is
+  no `recover` (SPEC.md §18.4). The trace is opt-in, not default: the `//
+  panic` golden mode (`tests/cases/*.bit`) compares stderr byte-for-byte, so
+  an always-on trace would need every `.expected` file updated in the same
+  change. See `runtime/root/backtrace.bit` (#3285, #3820) for the walker and
+  its degrade rules — an unresolvable frame prints a raw `0x<hex>` address, a
+  `format_version` mismatch untrusts the whole table for that process, and a
+  missing or corrupt `name_hdr_ptr` omits just the name and keeps
+  `file:line` — none of which ever calls `bit_rt_panic` recursively.
 - `defer` unwinding (SPEC.md §18.5: deferred calls run while a panic unwinds
   to the program's top) is codegen's obligation, not the runtime's: by the
   time a panic reaches `bit_rt_panic`, every `defer` between the panic site
