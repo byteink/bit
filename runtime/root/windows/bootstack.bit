@@ -1,0 +1,128 @@
+// Stack alignment + the guarded-stack allocator (#3818): `alignUpStack`,
+// `alignDownStack`, `mapGuardHole`, `guardedStackBase` and `mapGuardedStack`
+// — split out of ./boot.bit, whose own header still explains the boot
+// sequence this feeds into, once inserting `guardedStackBase` (below) to
+// keep `mapGuardedStack`'s own complexity under the E0204 limit took
+// ./boot.bit past the 800-line E0200 limit. A pure move, not a new
+// decision: nothing here changes behaviour.
+//
+// Sibling of ./boot.bit in the same directory, so this is the SAME MODULE
+// (an import is per-module, not per-file) — nothing here needs a new
+// import: `schedStackBytes`, `schedStackAligned`, `pageSize`, `mapPages`,
+// `unmapPages`, `protectPages` and `guardPages` are all already imported by
+// ./boot.bit and visible here unchanged.
+//
+// Identical algorithm to ../linux and ../darwin's `mapGuardedStack` (#2433's
+// header there is the full argument for the two-granule reservation and the
+// fixed head guard). Only the underlying page-provider semantics differ:
+// see ../../alloc/windows/pages.bit's header for why `unmapPages` here is
+// MEM_DECOMMIT, not a true release.
+
+@nosplit fn alignUpStack(addr: int): int {
+  let bumped = addr + schedStackBytes - 1
+  return bumped - bumped % schedStackBytes
+}
+
+@nosplit fn alignDownStack(addr: int): int {
+  return addr - addr % schedStackBytes
+}
+
+// #3652: the size of the plain, committed PAGE_READWRITE slack placed BELOW
+// the PAGE_GUARD trip page in the guard hole (see mapGuardedStack below).
+// Windows' exception dispatch writes its CONTEXT + EXCEPTION_RECORD trap
+// frame (~1.4 KiB per ../signal.bit's verified sizeof) at addresses BELOW
+// the faulting sp, never above it -- confirmed by ../signal.bit's own header:
+// an ordinary access-violation probe found the handler's own Rsp only 36
+// bytes from a value captured immediately before the fault, i.e. the whole
+// dispatch apparatus lands in the small range right under where the fault
+// happened. So the slack has to sit on the low-address side of the trip
+// page, not the high-address side facing the live stack -- an overrun never
+// touches it at all until the trip page has already faulted. 64 KiB, not
+// independently tuned: the same figure ../signal.bit's `stackGuaranteeBytes`
+// already established sufficient for a VEH to run a real handler to
+// completion after a dispatchable fault on this OS (that constant is not
+// reused directly -- these two guards are separate mechanisms, deliberately
+// not coupled to each other).
+const stackDispatchSlackBytes: int = 65536
+
+// Install the three-way split guard hole immediately below `base` — see
+// mapGuardedStack's own comment for the layout and why. Split out of
+// mapGuardedStack to keep that function's own complexity at its pre-#3652
+// count (docs/development.md's file-size rule's sibling, E0204).
+//
+// STATUS: VERIFIED, but only in combination with ../io.bit's
+// writeConstSignalSafe/rootWriteAllSignalSafe -- NEITHER alone is
+// sufficient, both proven independently on mustafa-desktop-win (native, 3-6
+// runs each): this trip page alone still crashed identically to the
+// PAGE_NOACCESS-only baseline (0xC0000005, no message), because the
+// diagnostic-emission path second-faulted inside the now-reachable handler
+// the same way ../linux/signal.bit's writeConst did (#3728) -- there is no
+// altstack on Windows, so ../signal.bit's vehHandler runs with the CURRENT
+// sp sitting in this guard hole's own slack, and the unsafe masked lookup
+// dereferences a tag address inside the wall below it. Conversely the
+// signal-safe write alone, with the ORIGINAL single PAGE_NOACCESS wall
+// (no trip page), also still crashed identically, because dispatch of the
+// original fault itself never reached the handler at all -- the kernel had
+// nowhere committed below the faulting sp to write its own CONTEXT +
+// EXCEPTION_RECORD trap frame. Together: 10/10 clean runs, both repro
+// programs, printing the expected diagnostic and exiting 2.
+@nosplit fn mapGuardHole(base: int): bool {
+  let tripPageBase = base - pageSize
+  if (!guardPages(tripPageBase, pageSize)) {
+    return false
+  }
+  let wallBytes = schedStackBytes - pageSize - stackDispatchSlackBytes
+  return protectPages(tripPageBase - stackDispatchSlackBytes - wallBytes, wallBytes)
+}
+
+// The aligned stack base within `region`, or 0 if it fails alignment or
+// falls outside the two-granule reservation mapGuardedStack made for it.
+// Split out of mapGuardedStack to keep that function's own complexity under
+// the E0204 limit (#3818), the same reason mapGuardHole above is split out.
+@nosplit fn guardedStackBase(region: int): int {
+  let base = alignUpStack(region + schedStackBytes)
+  if (!schedStackAligned(base) ||
+    base < region + schedStackBytes ||
+    base - region >= 2 * schedStackBytes) {
+    return 0
+  }
+  return base
+}
+
+@nosplit fn mapGuardedStack(bytes: int): int {
+  if (bytes <= 0) {
+    return 0
+  }
+  let region = mapPages(bytes + 2 * schedStackBytes)
+  if (region == 0) {
+    return 0
+  }
+  let base = guardedStackBase(region)
+  if (base == 0) {
+    return 0
+  }
+  // The guard hole is split three ways rather than one uniform PAGE_NOACCESS
+  // wall -- see ../signal.bit's header for why a green task overflowing
+  // straight into PAGE_NOACCESS can never be diagnosed. From `base` downward:
+  // `stackDispatchSlackBytes` of plain PAGE_READWRITE slack, one PAGE_GUARD
+  // trip page (the actual detector -- touching it raises a dispatchable
+  // STATUS_GUARD_PAGE_VIOLATION in ../signal.bit's `vehHandler`, with the
+  // slack still sitting above the faulting sp), then a hard PAGE_NOACCESS
+  // wall for the remainder of the granule as a backstop.
+  if (!mapGuardHole(base)) {
+    return 0
+  }
+  let headSlop = base - schedStackBytes - region
+  if (headSlop > 0) {
+    if (!unmapPages(region, headSlop)) {
+      return 0
+    }
+  }
+  let tailSlop = schedStackBytes - headSlop
+  if (tailSlop > 0) {
+    if (!unmapPages(base + bytes, tailSlop)) {
+      return 0
+    }
+  }
+  return base
+}
