@@ -21,6 +21,16 @@
 # exactly as difftypes skips files the oracle's checker rejects. Only the two
 # compilers disagreeing on a module the oracle DID document is a finding.
 #
+# ## Concurrency (#3782)
+#
+# Per module directory, the ORACLE pair (plain + --json) and the BIT2 pair
+# run CONCURRENTLY, not sequentially -- they are independent of each other
+# and are only ever compared after both finish. #3770 measured the two
+# halves as a near-even split (oracle=386.61s, bit2=386.47s of the family's
+# ~815s), so overlapping them cuts this script's own wall clock close to in
+# half. BIT2 now runs on every directory rather than only ones the ORACLE
+# went on to accept -- see run_bit2_pair's comment for why that is safe.
+#
 # ## Preconditions are hard failures, never a vacuous green (#1514)
 #
 # Two gates: a missing binary aborts, and a compiler that does not IMPLEMENT `doc`
@@ -123,20 +133,76 @@ doc_surface_nonempty() {
   [ "$(grep -c '^  {"name": ' "$1")" -gt 0 ]
 }
 
-for d in stdlib/*/ examples/*/ tests/imports/*/; do
-  [ -d "$d" ] || continue
-
+# run_oracle_pair / run_bit2_pair <dir> -- the two per-module halves (#3782).
+# Backgrounded concurrently by the loop below instead of run sequentially:
+# they are compared only after both finish, so nothing downstream needs them
+# in order, and #3770 measured the two halves at oracle=386.61s/bit2=386.47s
+# -- a near-even split, so overlapping them cuts this script's wall clock
+# close to in half.
+#
+# Each writes ONLY to its own files ($work/seed.* / $work/oracle.status vs
+# $work/bit.* / $work/bit2.status) so the two backgrounded subshells never
+# race on a shared path. The decision tree that reads the two status files
+# back is UNCHANGED from the sequential version -- only how the four
+# alarmrun_retry calls are scheduled moved; every rc comparison below is
+# byte-for-byte the same branch the old inline loop made.
+#
+# bash 3.2 (this Mac's /bin/bash) has no `wait -n`, but that primitive is for
+# reaping "whichever of N finishes first" -- here N is fixed at exactly 2 and
+# the caller needs BOTH before it can decide anything, so a plain `wait "$pid"`
+# on each of the two held PIDs (order irrelevant) is sufficient and needs no
+# FIFO. `kill -0` is not used anywhere in this file.
+#
+# Deliberate change from the sequential version (ticket-sanctioned: "keep
+# [the SKIP short-circuit] or change it deliberately"): BIT2 now runs on
+# EVERY directory, concurrently with ORACLE, even one the oracle will go on
+# to SKIP or time out on -- discovering that only after both have already
+# run costs nothing extra in wall clock (they were concurrent), and the
+# decision tree below still discards BIT2's result on that path exactly as
+# before, so SKIP/TIMEOUT/MATCH/MISMATCH counts are unaffected.
+run_oracle_pair() {
+  local d=$1 seed_rc seed_json_rc=skipped
   # The oracle is bounded too (#2863): it had no bound at all here, so a hung
   # ORACLE wedged this script indefinitely — exactly the shape
   # selfhost-diffcheck.sh's header warns about ("the seed side had no bound at
-  # all, so a hung ORACLE wedged the whole gate indefinitely"). A timeout is
-  # its own outcome, never folded into SKIP: SKIP means the oracle legitimately
-  # declined the directory (not a module, or a module it cannot compile); a
-  # hang means it never reached a verdict at all. Verdict-deciding (#3422):
-  # alarmrun_retry's one retry-on-stall, outfile "" since the redirect below
-  # already targets a fresh per-iteration path.
+  # all, so a hung ORACLE wedged the whole gate indefinitely"). Verdict-deciding
+  # (#3422): alarmrun_retry's one retry-on-stall, outfile "" since the redirect
+  # below already targets a fresh per-iteration path.
   alarmrun_retry ORACLE "" "$ORACLE" doc "$d" >"$work/seed.plain"
   seed_rc=$?
+  if [ "$seed_rc" -eq 0 ]; then
+    alarmrun_retry ORACLE "" "$ORACLE" doc --json "$d" >"$work/seed.json"
+    seed_json_rc=$?
+  else
+    : >"$work/seed.json"
+  fi
+  printf '%s %s\n' "$seed_rc" "$seed_json_rc" >"$work/oracle.status"
+}
+
+run_bit2_pair() {
+  local d=$1 bit_rc bit_json_rc
+  alarmrun_retry BIT2 "" "$BIT2" doc "$d" >"$work/bit.plain"
+  bit_rc=$?
+  alarmrun_retry BIT2 "" "$BIT2" doc --json "$d" >"$work/bit.json"
+  bit_json_rc=$?
+  printf '%s %s\n' "$bit_rc" "$bit_json_rc" >"$work/bit2.status"
+}
+
+for d in stdlib/*/ examples/*/ tests/imports/*/; do
+  [ -d "$d" ] || continue
+
+  run_oracle_pair "$d" &
+  oracle_pid=$!
+  run_bit2_pair "$d" &
+  bit2_pid=$!
+  # Both PIDs are always waited on before either status file is read, so a
+  # backgrounded call never outlives this iteration as an orphan/zombie --
+  # regardless of which branch below discards its result.
+  wait "$oracle_pid"
+  wait "$bit2_pid"
+  read -r seed_rc seed_json_rc <"$work/oracle.status"
+  read -r bit_rc bit_json_rc <"$work/bit2.status"
+
   if [ "$seed_rc" -ge 128 ]; then
     echo "$d (ORACLE timed out after ${TIMEOUT}s, rc=$seed_rc)" >>"$work/timeout"
     continue
@@ -146,8 +212,6 @@ for d in stdlib/*/ examples/*/ tests/imports/*/; do
     skip=$((skip + 1))
     continue
   fi
-  alarmrun_retry ORACLE "" "$ORACLE" doc --json "$d" >"$work/seed.json"
-  seed_json_rc=$?
   if [ "$seed_json_rc" -ge 128 ]; then
     echo "$d (ORACLE --json timed out after ${TIMEOUT}s, rc=$seed_json_rc)" >>"$work/timeout"
     continue
@@ -158,11 +222,6 @@ for d in stdlib/*/ examples/*/ tests/imports/*/; do
   # $compared set, never a BIT2-timeout or an oracle SKIP.
   module_nonempty=0
   doc_surface_nonempty "$work/seed.json" && module_nonempty=1
-
-  alarmrun_retry BIT2 "" "$BIT2" doc "$d" >"$work/bit.plain"
-  bit_rc=$?
-  alarmrun_retry BIT2 "" "$BIT2" doc --json "$d" >"$work/bit.json"
-  bit_json_rc=$?
 
   if [ "$bit_rc" -ge 128 ] || [ "$bit_json_rc" -ge 128 ]; then
     echo "$d (BIT2 timed out after ${TIMEOUT}s, rc=$bit_rc/$bit_json_rc)" >>"$work/timeout"
