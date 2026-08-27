@@ -131,12 +131,106 @@ export fn getHeader(headers: []HeaderField, name: string): string {
 // on `replyCh` the same way `h2connAwaitReady` bounds the SETTINGS wait
 // (#3036).
 export class Conn {
-  isClient: bool,
-  cmdCh: chan<h2connCmd>,
-  acceptCh: chan<h2connAccept>,
-  readerDone: chan<int>,
-  writerDone: chan<int>,
-  deadlineNs: int,
+  isClient: bool
+  cmdCh: chan<h2connCmd>
+  acceptCh: chan<h2connAccept>
+  readerDone: chan<int>
+  writerDone: chan<int>
+  deadlineNs: int
+
+  // Send `req` on a fresh stream and block until its full response arrives. Safe to
+  // call from many green threads at once — each request rides its own stream,
+  // multiplexed over the one connection. Bounded by the same deadline
+  // `connect`/`accept` received (0 = no bound) — see `h2connAwaitReply` (#3036).
+  export roundTrip(req: Request): Response! {
+    let replyCh = chan<h2connMsg>(1)
+    this.cmdCh <- h2connCmd{
+      kind: h2cmdOpen,
+      request: req,
+      response: h2connZeroResponse(),
+      streamId: 0,
+      errorCode: 0,
+      replyCh: replyCh,
+    }
+    let msg = h2connAwaitReply(replyCh, this.deadlineNs)?
+    if (!msg.ok) {
+      fail newError(msg.errMsg)
+    }
+    return msg.response
+  }
+
+  // Serve inbound requests, dispatching each to `handler` on its own green thread,
+  // until the connection closes. A handler that returns a `Response` with status 0
+  // aborts that stream with RST_STREAM (CANCEL).
+  export serve(handler: (Request) => Response): ()! {
+    while (true) {
+      let a = <- this.acceptCh
+      if (a.stop) {
+        return
+      }
+      spawn h2connHandle(this.cmdCh, a.streamId, a.request, handler)
+    }
+  }
+
+  // Block until the reader green thread spawned by `connect`/`accept` has
+  // observed a transport read failure (an ordinary close included) and returned.
+  //
+  // A closer that releases the transport's underlying resource (e.g. an fd a
+  // later `dial` can recycle) WITHOUT calling this first is racing the reader,
+  // which is still parked in a read on that same resource with no way for
+  // anything outside this thread to interrupt it — closing does not wake it,
+  // it only makes the read the reader is retrying eventually fail, on the
+  // reader's own schedule. Call this AFTER closing the transport (that failure
+  // is what the reader is waiting to observe) and BEFORE reusing anything the
+  // transport owned. NOT idempotent — the reader signals exactly once, so a
+  // second call on the same `Conn` blocks forever; call it exactly once per
+  // `Conn`, from a single teardown path. Returns immediately if the reader has
+  // already stopped for any other reason (a protocol error, the peer closing
+  // first) by the time this is called.
+  export waitReaderDone() {
+    <- this.readerDone
+  }
+
+  // Block until the writer green thread spawned by `connect`/`accept` has
+  // stopped touching the transport. Unlike the reader, the writer is normally
+  // parked on an empty command channel rather than a transport read, so
+  // closing (or even shutting down) the transport does not wake it by itself —
+  // only the loop thread's own `eof` handling (`events.bit`) queues the stop
+  // message that lets it exit, once it has observed (via `waitReaderDone()`)
+  // that the connection is tearing down. Call this AFTER `waitReaderDone()`
+  // and BEFORE reusing anything the transport owned, for the identical
+  // use-after-close reason `waitReaderDone()` documents — the writer's last
+  // queued write is a real transport write, and closing out from under it is
+  // the same fd-reuse hazard #3016 fixed for reads. NOT idempotent — call it
+  // exactly once per `Conn`, from a single teardown path.
+  export waitWriterDone() {
+    <- this.writerDone
+  }
+
+  // Begin a graceful shutdown: emit GOAWAY so the peer starts no new streams.
+  // In-flight streams still complete; subsequent `roundTrip` calls are refused.
+  export close() {
+    this.cmdCh <- h2connCmd{
+      kind: h2cmdGoaway,
+      request: h2connZeroRequest(),
+      response: h2connZeroResponse(),
+      streamId: 0,
+      errorCode: errorNoError,
+      replyCh: h2connDummyReply(),
+    }
+  }
+
+  // Abort stream `streamId` with RST_STREAM carrying `errorCode`.
+  export resetStream(streamId: int, errorCode: int) {
+    this.cmdCh <- h2connCmd{
+      kind: h2cmdReset,
+      request: h2connZeroRequest(),
+      response: h2connZeroResponse(),
+      streamId: streamId,
+      errorCode: errorCode,
+      replyCh: h2connDummyReply(),
+    }
+  }
 }
 
 // --- connection setup --------------------------------------------------------
@@ -590,40 +684,6 @@ fn h2connAtoi(s: string): int {
 
 // --- public connection API ---------------------------------------------------
 
-// Send `req` on a fresh stream and block until its full response arrives. Safe to
-// call from many green threads at once — each request rides its own stream,
-// multiplexed over the one connection. Bounded by the same deadline
-// `connect`/`accept` received (0 = no bound) — see `h2connAwaitReply` (#3036).
-export fn (c: Conn) roundTrip(req: Request): Response! {
-  let replyCh = chan<h2connMsg>(1)
-  c.cmdCh <- h2connCmd{
-    kind: h2cmdOpen,
-    request: req,
-    response: h2connZeroResponse(),
-    streamId: 0,
-    errorCode: 0,
-    replyCh: replyCh,
-  }
-  let msg = h2connAwaitReply(replyCh, c.deadlineNs)?
-  if (!msg.ok) {
-    fail newError(msg.errMsg)
-  }
-  return msg.response
-}
-
-// Serve inbound requests, dispatching each to `handler` on its own green thread,
-// until the connection closes. A handler that returns a `Response` with status 0
-// aborts that stream with RST_STREAM (CANCEL).
-export fn (c: Conn) serve(handler: (Request) => Response): ()! {
-  while (true) {
-    let a = <- c.acceptCh
-    if (a.stop) {
-      return
-    }
-    spawn h2connHandle(c.cmdCh, a.streamId, a.request, handler)
-  }
-}
-
 fn h2connHandle(
   cmdCh: chan<h2connCmd>,
   streamId: int,
@@ -641,62 +701,3 @@ fn h2connHandle(
   }
 }
 
-// Block until the reader green thread spawned by `connect`/`accept` has
-// observed a transport read failure (an ordinary close included) and returned.
-//
-// A closer that releases the transport's underlying resource (e.g. an fd a
-// later `dial` can recycle) WITHOUT calling this first is racing the reader,
-// which is still parked in a read on that same resource with no way for
-// anything outside this thread to interrupt it — closing does not wake it,
-// it only makes the read the reader is retrying eventually fail, on the
-// reader's own schedule. Call this AFTER closing the transport (that failure
-// is what the reader is waiting to observe) and BEFORE reusing anything the
-// transport owned. NOT idempotent — the reader signals exactly once, so a
-// second call on the same `Conn` blocks forever; call it exactly once per
-// `Conn`, from a single teardown path. Returns immediately if the reader has
-// already stopped for any other reason (a protocol error, the peer closing
-// first) by the time this is called.
-export fn (c: Conn) waitReaderDone() {
-  <- c.readerDone
-}
-
-// Block until the writer green thread spawned by `connect`/`accept` has
-// stopped touching the transport. Unlike the reader, the writer is normally
-// parked on an empty command channel rather than a transport read, so
-// closing (or even shutting down) the transport does not wake it by itself —
-// only the loop thread's own `eof` handling (`events.bit`) queues the stop
-// message that lets it exit, once it has observed (via `waitReaderDone()`)
-// that the connection is tearing down. Call this AFTER `waitReaderDone()`
-// and BEFORE reusing anything the transport owned, for the identical
-// use-after-close reason `waitReaderDone()` documents — the writer's last
-// queued write is a real transport write, and closing out from under it is
-// the same fd-reuse hazard #3016 fixed for reads. NOT idempotent — call it
-// exactly once per `Conn`, from a single teardown path.
-export fn (c: Conn) waitWriterDone() {
-  <- c.writerDone
-}
-
-// Begin a graceful shutdown: emit GOAWAY so the peer starts no new streams.
-// In-flight streams still complete; subsequent `roundTrip` calls are refused.
-export fn (c: Conn) close() {
-  c.cmdCh <- h2connCmd{
-    kind: h2cmdGoaway,
-    request: h2connZeroRequest(),
-    response: h2connZeroResponse(),
-    streamId: 0,
-    errorCode: errorNoError,
-    replyCh: h2connDummyReply(),
-  }
-}
-
-// Abort stream `streamId` with RST_STREAM carrying `errorCode`.
-export fn (c: Conn) resetStream(streamId: int, errorCode: int) {
-  c.cmdCh <- h2connCmd{
-    kind: h2cmdReset,
-    request: h2connZeroRequest(),
-    response: h2connZeroResponse(),
-    streamId: streamId,
-    errorCode: errorCode,
-    replyCh: h2connDummyReply(),
-  }
-}

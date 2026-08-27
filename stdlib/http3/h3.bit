@@ -98,12 +98,79 @@ export class H3Response { export status: int, export headers: []HeaderField, exp
 // control and QPACK unidirectional streams. Marshal all requests/responses
 // through the one `H3Conn`, so the QPACK tables track the peer.
 export class H3Conn {
-  conn: Conn,
-  enc: Encoder,
-  dec: Decoder,
-  control: Stream,
-  qpackEnc: Stream,
-  qpackDec: Stream,
+  conn: Conn
+  enc: Encoder
+  dec: Decoder
+  control: Stream
+  qpackEnc: Stream
+  qpackDec: Stream
+
+  // Send `req` and read the response. Opens a client-initiated bidirectional stream,
+  // writes a HEADERS frame (a QPACK field section of the pseudo- and regular
+  // headers) then a DATA frame for the body if any, finishes the send half, and
+  // reads the response HEADERS + DATA back off the same stream.
+  export request(req: H3Request): H3Response! {
+    let s = this.conn.openStream()?
+    let sid = s.id()
+    let section = this.enc.encodeFieldSection(sid, this.enc.insertCount(), h3requestFields(req))
+    let out = h3frame(h3FrameHeaders, section)
+    if (len(req.body) > 0) {
+      out = qpackAppendBytes(out, h3frame(h3FrameData, req.body))
+    }
+    s.write(out)?
+    s.finish()?
+    let buf = h3readAll(s)?
+    return h3parseResponse(this, sid, buf)?
+  }
+
+  // Accept the next request. Peer-initiated streams are classified by their leading
+  // byte: a control stream (0x00), qpack-encoder stream (0x02) and qpack-decoder
+  // stream (0x03) are consumed into the QPACK state and skipped; the first stream
+  // that is none of these is a request stream (its HEADERS frame type, 0x01), which
+  // is read to completion, decoded, and returned. Blocks until such a stream opens.
+  export accept(): H3ServerRequest! {
+    let guard = 0
+    while (guard < h3AcceptScan) {
+      guard = guard + 1
+      let s = this.conn.acceptStream()?
+      let first = h3readFirst(s)?
+      if (len(first.data) > 0) {
+        let t = int(first.data[0])
+        if (t == h3StreamControl) {
+          h3drainControl(first.data)
+        } else if (t == h3StreamQpackEncoder) {
+          this.dec.applyEncoderStream(h3tail(first.data))?
+        } else if (t == h3StreamQpackDecoder) {
+          this.enc.applyDecoderStream(h3tail(first.data))?
+        } else {
+          let buf = h3readRest(s, first)?
+          let req = h3parseRequest(this, s.id(), buf)?
+          return H3ServerRequest{ req: req, stream: s }
+        }
+      }
+    }
+    fail newError("h3: no request stream within the accept scan bound")
+  }
+
+  // Answer the request in `sr` with `resp` on its stream: a HEADERS frame carrying
+  // the `:status` field section, then a DATA frame for the body if any, then FIN.
+  export respond(sr: H3ServerRequest, resp: H3Response): ()! {
+    let sid = sr.stream.id()
+    let section = this.enc.encodeFieldSection(sid, this.enc.insertCount(), h3responseFields(resp))
+    let out = h3frame(h3FrameHeaders, section)
+    if (len(resp.body) > 0) {
+      out = qpackAppendBytes(out, h3frame(h3FrameData, resp.body))
+    }
+    sr.stream.write(out)?
+    sr.stream.finish()?
+  }
+
+  // Close the connection: send a GOAWAY, then tear down the underlying QUIC
+  // connection and its socket.
+  export close() {
+    h3sendGoaway(this)
+    this.conn.close()
+  }
 }
 
 // A received request together with the stream it arrived on. `req` is the decoded
@@ -470,7 +537,15 @@ export fn h3Accept(sock: UdpSocket, certChainPem: string, keyPem: string): H3Con
 
 // An HTTP/3 server listener over a QUIC `Listener`: many client connections on
 // one bound UDP socket, demultiplexed by connection id.
-export class H3Listener { lst: Listener }
+export class H3Listener {
+  lst: Listener
+  // Accept the next HTTP/3 connection, blocking until a client completes its
+  // handshake, and set up its control and QPACK streams.
+  export accept(): H3Conn! {
+    let conn = this.lst.accept()?
+    return h3newConn(conn, false)?
+  }
+}
 
 // Start an HTTP/3 listener on the bound UDP socket `sock` with the PEM
 // certificate chain and private key. Returns immediately; each established
@@ -480,80 +555,13 @@ export fn h3Listen(sock: UdpSocket, certChainPem: string, keyPem: string): H3Lis
   return H3Listener{ lst: listenQuic(sock, certChainPem, keyPem)? }
 }
 
-// Accept the next HTTP/3 connection, blocking until a client completes its
-// handshake, and set up its control and QPACK streams.
-export fn (l: H3Listener) accept(): H3Conn! {
-  let conn = l.lst.accept()?
-  return h3newConn(conn, false)?
-}
-
 // ---------------------------------------------------------------------------
 // Client request / response
 // ---------------------------------------------------------------------------
 
-// Send `req` and read the response. Opens a client-initiated bidirectional stream,
-// writes a HEADERS frame (a QPACK field section of the pseudo- and regular
-// headers) then a DATA frame for the body if any, finishes the send half, and
-// reads the response HEADERS + DATA back off the same stream.
-export fn (c: H3Conn) request(req: H3Request): H3Response! {
-  let s = c.conn.openStream()?
-  let sid = s.id()
-  let section = c.enc.encodeFieldSection(sid, c.enc.insertCount(), h3requestFields(req))
-  let out = h3frame(h3FrameHeaders, section)
-  if (len(req.body) > 0) {
-    out = qpackAppendBytes(out, h3frame(h3FrameData, req.body))
-  }
-  s.write(out)?
-  s.finish()?
-  let buf = h3readAll(s)?
-  return h3parseResponse(c, sid, buf)?
-}
-
 // ---------------------------------------------------------------------------
 // Server accept / respond
 // ---------------------------------------------------------------------------
-
-// Accept the next request. Peer-initiated streams are classified by their leading
-// byte: a control stream (0x00), qpack-encoder stream (0x02) and qpack-decoder
-// stream (0x03) are consumed into the QPACK state and skipped; the first stream
-// that is none of these is a request stream (its HEADERS frame type, 0x01), which
-// is read to completion, decoded, and returned. Blocks until such a stream opens.
-export fn (c: H3Conn) accept(): H3ServerRequest! {
-  let guard = 0
-  while (guard < h3AcceptScan) {
-    guard = guard + 1
-    let s = c.conn.acceptStream()?
-    let first = h3readFirst(s)?
-    if (len(first.data) > 0) {
-      let t = int(first.data[0])
-      if (t == h3StreamControl) {
-        h3drainControl(first.data)
-      } else if (t == h3StreamQpackEncoder) {
-        c.dec.applyEncoderStream(h3tail(first.data))?
-      } else if (t == h3StreamQpackDecoder) {
-        c.enc.applyDecoderStream(h3tail(first.data))?
-      } else {
-        let buf = h3readRest(s, first)?
-        let req = h3parseRequest(c, s.id(), buf)?
-        return H3ServerRequest{ req: req, stream: s }
-      }
-    }
-  }
-  fail newError("h3: no request stream within the accept scan bound")
-}
-
-// Answer the request in `sr` with `resp` on its stream: a HEADERS frame carrying
-// the `:status` field section, then a DATA frame for the body if any, then FIN.
-export fn (c: H3Conn) respond(sr: H3ServerRequest, resp: H3Response): ()! {
-  let sid = sr.stream.id()
-  let section = c.enc.encodeFieldSection(sid, c.enc.insertCount(), h3responseFields(resp))
-  let out = h3frame(h3FrameHeaders, section)
-  if (len(resp.body) > 0) {
-    out = qpackAppendBytes(out, h3frame(h3FrameData, resp.body))
-  }
-  sr.stream.write(out)?
-  sr.stream.finish()?
-}
 
 // Best-effort GOAWAY on the control stream (RFC 9114 §5.2), ignoring a write error
 // on an already-closing connection.
@@ -563,9 +571,3 @@ fn h3sendGoaway(c: H3Conn) {
   }
 }
 
-// Close the connection: send a GOAWAY, then tear down the underlying QUIC
-// connection and its socket.
-export fn (c: H3Conn) close() {
-  h3sendGoaway(c)
-  c.conn.close()
-}

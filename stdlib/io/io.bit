@@ -43,7 +43,44 @@ const readChunkSize: int = 4096
 // `[]byte` grown with `append` (amortized O(1) per byte), not a `string`
 // rebuilt with `+` on every write — the shape that made this quadratic (#2340,
 // mirroring the #2328 `Reader.readLine` fix).
-export class Writer { fd: i64, buf: []byte }
+export class Writer {
+  fd: i64
+  buf: []byte
+  // Buffer `s`, flushing once the buffer is full, or fail on a write error.
+  // `Stdout`/`Stderr` are unbuffered (see file header): `s` reaches the fd
+  // before this call returns.
+  export write(s: string): ()! {
+    if (isStandardStream(this.fd)) {
+      if (fsWrite(this.fd, s) < 0) {
+        fail newError("write failed")
+      }
+      return
+    }
+    this.buf = appendRange(this.buf, s, 0, len(s))
+    if (len(this.buf) >= writeBufferSize) {
+      this.flush()?
+    }
+  }
+
+  // Buffer `s` and a newline, or fail on a write error.
+  export writeLine(s: string): ()! {
+    this.write(s + "\n")?
+  }
+
+  // Write everything buffered to the descriptor, or fail on a write error. A
+  // no-op when nothing is pending — always true for `Stdout`/`Stderr`, which
+  // never buffer.
+  export flush(): ()! {
+    if (len(this.buf) == 0) {
+      return
+    }
+    let pending = string(this.buf)
+    this.buf = []byte(0)
+    if (fsWrite(this.fd, pending) < 0) {
+      fail newError("write failed")
+    }
+  }
+}
 
 // True for the two descriptors every `stdout()`/`stderr()` call independently
 // targets — see the file header (#2323) for why they must be unbuffered.
@@ -64,45 +101,99 @@ export fn stderr(): Writer {
   return writer(Stderr)
 }
 
-// Buffer `s`, flushing once the buffer is full, or fail on a write error.
-// `Stdout`/`Stderr` are unbuffered (see file header): `s` reaches the fd
-// before this call returns.
-export fn (w: Writer) write(s: string): ()! {
-  if (isStandardStream(w.fd)) {
-    if (fsWrite(w.fd, s) < 0) {
-      fail newError("write failed")
-    }
-    return
-  }
-  w.buf = appendRange(w.buf, s, 0, len(s))
-  if (len(w.buf) >= writeBufferSize) {
-    w.flush()?
-  }
-}
-
-// Buffer `s` and a newline, or fail on a write error.
-export fn (w: Writer) writeLine(s: string): ()! {
-  w.write(s + "\n")?
-}
-
-// Write everything buffered to the descriptor, or fail on a write error. A
-// no-op when nothing is pending — always true for `Stdout`/`Stderr`, which
-// never buffer.
-export fn (w: Writer) flush(): ()! {
-  if (len(w.buf) == 0) {
-    return
-  }
-  let pending = string(w.buf)
-  w.buf = []byte(0)
-  if (fsWrite(w.fd, pending) < 0) {
-    fail newError("write failed")
-  }
-}
-
 // --- reading --------------------------------------------------------------
 
 // Exported for the same reason as `Writer`: `reader`/`stdin` return one.
-export class Reader { fd: i64, buf: string, pos: int, eof: bool }
+export class Reader {
+  fd: i64
+  buf: string
+  pos: int
+  eof: bool
+  // Pulls another chunk when the buffer is spent. Returns whether any unread
+  // bytes are now available.
+  fill(): bool {
+    if (this.pos < len(this.buf)) {
+      return true
+    }
+    if (this.eof) {
+      return false
+    }
+    let chunk = fsRead(this.fd, readChunkSize)
+    if (len(chunk) == 0) {
+      this.eof = true
+      return false
+    }
+    this.buf = chunk
+    this.pos = 0
+    return true
+  }
+
+  // The next line, without its trailing newline. `None` only at end of input, so
+  // a final line with no newline of its own is still returned.
+  export readLine(): Option<string> {
+    if (!this.fill()) {
+      return Option<string>.None
+    }
+    // Only a line that spans more than one refill needs `acc`: the common case
+    // (a line found within the current buffer) returns a single string slice
+    // below, no byte-by-byte copy at all (#2328).
+    let acc = []byte(0)
+    let haveAcc = false
+    while (true) {
+      if (!this.fill()) {
+        // Input ended mid-line: what we have is a real, newline-less last line.
+        return Option.Some(string(acc))
+      }
+      // Consume up to the next newline in the current buffer, in one slice.
+      let start = this.pos
+      let i = this.pos
+      while (i < len(this.buf) && this.buf[i] != '\n') {
+        i = i + 1
+      }
+      if (i < len(this.buf)) {
+        this.pos = i + 1 // step over the newline; it is not part of the line
+        if (!haveAcc) {
+          return Option.Some(this.buf[start:i])
+        }
+        acc = appendRange(acc, this.buf, start, i)
+        return Option.Some(string(acc))
+      }
+      // Buffer exhausted mid-line: accumulate what this refill held and keep
+      // going. Each refill costs O(chunk), never O(line-so-far).
+      acc = appendRange(acc, this.buf, start, i)
+      haveAcc = true
+      this.pos = i
+    }
+  }
+
+  // Everything still unread, to end of input.
+  export readAll(): string {
+    let out = ""
+    while (this.fill()) {
+      out = out + this.buf[this.pos:len(this.buf)]
+      this.pos = len(this.buf)
+    }
+    return out
+  }
+
+  // Exactly `n` bytes, or fewer only when input truly ends first. Buffered bytes
+  // left by a prior `readLine` are consumed before any refill, so `readBytes`
+  // composes with `readLine` on the same Reader — the basis for length-framed
+  // protocols (LSP `Content-Length`). `n <= 0` reads nothing and touches no input.
+  export readBytes(n: int): string {
+    let out = ""
+    while (len(out) < n && this.fill()) {
+      let take = n - len(out)
+      let avail = len(this.buf) - this.pos
+      if (avail < take) {
+        take = avail
+      }
+      out = out + this.buf[this.pos:this.pos + take]
+      this.pos = this.pos + take
+    }
+    return out
+  }
+}
 
 // A buffered reader over an already-open descriptor.
 export fn reader(fd: i64): Reader {
@@ -111,25 +202,6 @@ export fn reader(fd: i64): Reader {
 
 export fn stdin(): Reader {
   return reader(Stdin)
-}
-
-// Pulls another chunk when the buffer is spent. Returns whether any unread
-// bytes are now available.
-fn (r: Reader) fill(): bool {
-  if (r.pos < len(r.buf)) {
-    return true
-  }
-  if (r.eof) {
-    return false
-  }
-  let chunk = fsRead(r.fd, readChunkSize)
-  if (len(chunk) == 0) {
-    r.eof = true
-    return false
-  }
-  r.buf = chunk
-  r.pos = 0
-  return true
 }
 
 // Appends `buf[start:end]` to `acc` one byte at a time and returns `acc`.
@@ -146,68 +218,3 @@ fn appendRange(acc: []byte, buf: string, start: int, end: int): []byte {
   return acc
 }
 
-// The next line, without its trailing newline. `None` only at end of input, so
-// a final line with no newline of its own is still returned.
-export fn (r: Reader) readLine(): Option<string> {
-  if (!r.fill()) {
-    return Option<string>.None
-  }
-  // Only a line that spans more than one refill needs `acc`: the common case
-  // (a line found within the current buffer) returns a single string slice
-  // below, no byte-by-byte copy at all (#2328).
-  let acc = []byte(0)
-  let haveAcc = false
-  while (true) {
-    if (!r.fill()) {
-      // Input ended mid-line: what we have is a real, newline-less last line.
-      return Option.Some(string(acc))
-    }
-    // Consume up to the next newline in the current buffer, in one slice.
-    let start = r.pos
-    let i = r.pos
-    while (i < len(r.buf) && r.buf[i] != '\n') {
-      i = i + 1
-    }
-    if (i < len(r.buf)) {
-      r.pos = i + 1 // step over the newline; it is not part of the line
-      if (!haveAcc) {
-        return Option.Some(r.buf[start:i])
-      }
-      acc = appendRange(acc, r.buf, start, i)
-      return Option.Some(string(acc))
-    }
-    // Buffer exhausted mid-line: accumulate what this refill held and keep
-    // going. Each refill costs O(chunk), never O(line-so-far).
-    acc = appendRange(acc, r.buf, start, i)
-    haveAcc = true
-    r.pos = i
-  }
-}
-
-// Everything still unread, to end of input.
-export fn (r: Reader) readAll(): string {
-  let out = ""
-  while (r.fill()) {
-    out = out + r.buf[r.pos:len(r.buf)]
-    r.pos = len(r.buf)
-  }
-  return out
-}
-
-// Exactly `n` bytes, or fewer only when input truly ends first. Buffered bytes
-// left by a prior `readLine` are consumed before any refill, so `readBytes`
-// composes with `readLine` on the same Reader — the basis for length-framed
-// protocols (LSP `Content-Length`). `n <= 0` reads nothing and touches no input.
-export fn (r: Reader) readBytes(n: int): string {
-  let out = ""
-  while (len(out) < n && r.fill()) {
-    let take = n - len(out)
-    let avail = len(r.buf) - r.pos
-    if (avail < take) {
-      take = avail
-    }
-    out = out + r.buf[r.pos:r.pos + take]
-    r.pos = r.pos + take
-  }
-  return out
-}

@@ -157,40 +157,42 @@ export interface Tx {
 // places anything needs to import a concrete driver package are the call
 // that constructs it and the call that registers it, never the call sites
 // that use the resulting `Conn`.
-export class Registry { drivers: map<string, Driver>, mu: Mutex }
+export class Registry {
+  drivers: map<string, Driver>
+  mu: Mutex
+  // Adds d under name. Fails if name is already registered — silently
+  // replacing one driver with another under a program's back is exactly the
+  // kind of bug this registry exists to make loud instead.
+  export register(name: string, d: Driver): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (_, exists) = this.drivers[name]
+    if (exists) {
+      fail newError("sql: driver already registered: ${name}")
+    }
+    this.drivers[name] = d
+  }
+
+  // Looks up the driver registered as driverName and opens dsn with it,
+  // returning a connection wrapped so that several green threads sharing it
+  // never interleave calls on the one underlying socket it represents — see
+  // the doc comment on `pooledConn` below. Fails if driverName was never
+  // registered, or if the driver's own `open` fails.
+  export open(driverName: string, dsn: string): Conn! {
+    this.mu.lock()
+    let (d, ok) = this.drivers[driverName]
+    this.mu.unlock()
+    if (!ok) {
+      fail newError("sql: unknown driver: ${driverName}")
+    }
+    let inner = d.open(dsn)?
+    return pooledConn{ inner: inner, mu: newMutex() }
+  }
+}
 
 // An empty Registry, ready for `register` calls.
 export fn newRegistry(): Registry {
   return Registry{ drivers: map<string, Driver>(), mu: newMutex() }
-}
-
-// Adds d under name. Fails if name is already registered — silently
-// replacing one driver with another under a program's back is exactly the
-// kind of bug this registry exists to make loud instead.
-export fn (r: Registry) register(name: string, d: Driver): ()! {
-  r.mu.lock()
-  defer r.mu.unlock()
-  let (_, exists) = r.drivers[name]
-  if (exists) {
-    fail newError("sql: driver already registered: ${name}")
-  }
-  r.drivers[name] = d
-}
-
-// Looks up the driver registered as driverName and opens dsn with it,
-// returning a connection wrapped so that several green threads sharing it
-// never interleave calls on the one underlying socket it represents — see
-// the doc comment on `pooledConn` below. Fails if driverName was never
-// registered, or if the driver's own `open` fails.
-export fn (r: Registry) open(driverName: string, dsn: string): Conn! {
-  r.mu.lock()
-  let (d, ok) = r.drivers[driverName]
-  r.mu.unlock()
-  if (!ok) {
-    fail newError("sql: unknown driver: ${driverName}")
-  }
-  let inner = d.open(dsn)?
-  return pooledConn{ inner: inner, mu: newMutex() }
 }
 
 // pooledConn wraps a driver-supplied Conn with a single-slot Mutex (same
@@ -203,90 +205,97 @@ export fn (r: Registry) open(driverName: string, dsn: string): Conn! {
 // one socket." A driver that wants true N-way concurrency pools several
 // physical connections internally and hands one out per `open`; this
 // wrapper still serializes access to whichever one it gets.
-class pooledConn { inner: Conn, mu: Mutex }
-
-fn (c: pooledConn) query(sqlText: string, params: []Value): Rows! {
-  c.mu.lock()
-  defer c.mu.unlock()
-  return c.inner.query(sqlText, params)?
-}
-
-fn (c: pooledConn) exec(sqlText: string, params: []Value): int! {
-  c.mu.lock()
-  defer c.mu.unlock()
-  return c.inner.exec(sqlText, params)?
-}
-
-fn (c: pooledConn) prepare(sqlText: string): Stmt! {
-  c.mu.lock()
-  defer c.mu.unlock()
-  let stmt = c.inner.prepare(sqlText)?
-  return pooledStmt{ inner: stmt, mu: c.mu }
-}
-
-// begin holds the lock for the whole transaction rather than just for this
-// call: unlike query/exec/prepare, a transaction genuinely needs exclusive
-// use of the connection until it ends, not only for the duration of one
-// call. pooledTx.commit/rollback release it.
-fn (c: pooledConn) begin(): Tx! {
-  c.mu.lock()
-  let tx = c.inner.begin() catch e {
-    c.mu.unlock()
-    fail e
+class pooledConn {
+  inner: Conn
+  mu: Mutex
+  query(sqlText: string, params: []Value): Rows! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.inner.query(sqlText, params)?
   }
-  return pooledTx{ inner: tx, mu: c.mu }
-}
 
-fn (c: pooledConn) close() {
-  c.mu.lock()
-  defer c.mu.unlock()
-  c.inner.close()
+  exec(sqlText: string, params: []Value): int! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.inner.exec(sqlText, params)?
+  }
+
+  prepare(sqlText: string): Stmt! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let stmt = this.inner.prepare(sqlText)?
+    return pooledStmt{ inner: stmt, mu: this.mu }
+  }
+
+  // begin holds the lock for the whole transaction rather than just for this
+  // call: unlike query/exec/prepare, a transaction genuinely needs exclusive
+  // use of the connection until it ends, not only for the duration of one
+  // call. pooledTx.commit/rollback release it.
+  begin(): Tx! {
+    this.mu.lock()
+    let tx = this.inner.begin() catch e {
+      this.mu.unlock()
+      fail e
+    }
+    return pooledTx{ inner: tx, mu: this.mu }
+  }
+
+  close() {
+    this.mu.lock()
+    defer this.mu.unlock()
+    this.inner.close()
+  }
 }
 
 // pooledStmt shares its parent pooledConn's Mutex, so a statement prepared
 // from a pooled Conn keeps serializing on the same underlying socket as
 // every other call through that Conn — not just calls made through the
 // Stmt itself.
-class pooledStmt { inner: Stmt, mu: Mutex }
+class pooledStmt {
+  inner: Stmt
+  mu: Mutex
+  query(params: []Value): Rows! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.inner.query(params)?
+  }
 
-fn (s: pooledStmt) query(params: []Value): Rows! {
-  s.mu.lock()
-  defer s.mu.unlock()
-  return s.inner.query(params)?
-}
+  exec(params: []Value): int! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.inner.exec(params)?
+  }
 
-fn (s: pooledStmt) exec(params: []Value): int! {
-  s.mu.lock()
-  defer s.mu.unlock()
-  return s.inner.exec(params)?
-}
-
-fn (s: pooledStmt) close() {
-  s.mu.lock()
-  defer s.mu.unlock()
-  s.inner.close()
+  close() {
+    this.mu.lock()
+    defer this.mu.unlock()
+    this.inner.close()
+  }
 }
 
 // pooledTx already holds its parent pooledConn's lock — acquired by
 // pooledConn.begin before this value was constructed — so its own
 // query/exec must not lock again; only commit/rollback release it, ending
 // the exclusive hold begin() started.
-class pooledTx { inner: Tx, mu: Mutex }
+class pooledTx {
+  inner: Tx
+  mu: Mutex
+  query(sqlText: string, params: []Value): Rows! {
+    return this.inner.query(sqlText, params)?
+  }
 
-fn (t: pooledTx) query(sqlText: string, params: []Value): Rows! {
-  return t.inner.query(sqlText, params)?
+  exec(sqlText: string, params: []Value): int! {
+    return this.inner.exec(sqlText, params)?
+  }
+
+  commit(): ()! {
+    defer this.mu.unlock()
+    this.inner.commit()?
+  }
+
+  rollback(): ()! {
+    defer this.mu.unlock()
+    this.inner.rollback()?
+  }
 }
 
-fn (t: pooledTx) exec(sqlText: string, params: []Value): int! {
-  return t.inner.exec(sqlText, params)?
-}
-
-fn (t: pooledTx) commit(): ()! {
-  defer t.mu.unlock()
-  t.inner.commit()?
-}
-
-fn (t: pooledTx) rollback(): ()! {
-  defer t.mu.unlock()
-  t.inner.rollback()?
-}
