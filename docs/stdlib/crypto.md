@@ -47,31 +47,31 @@ import { Hash, digest } from "std/crypto"
 // 4-byte tag. A real SHA-256 satisfies `Hash` the same way - by its methods.
 class ByteCounter {
   seen: int
-}
 
-fn (c: ByteCounter) write(data: []byte) {
-  c.seen = c.seen + len(data)
-}
+  write(data: []byte) {
+    this.seen = this.seen + len(data)
+  }
 
-fn (c: ByteCounter) sum(): []byte {
-  let out = []byte(4)
-  out[0] = 1
-  out[1] = 2
-  out[2] = 3
-  out[3] = 4
-  return out
-}
+  sum(): []byte {
+    let out = []byte(4)
+    out[0] = 1
+    out[1] = 2
+    out[2] = 3
+    out[3] = 4
+    return out
+  }
 
-fn (c: ByteCounter) reset() {
-  c.seen = 0
-}
+  reset() {
+    this.seen = 0
+  }
 
-fn (c: ByteCounter) size(): int {
-  return 4
-}
+  size(): int {
+    return 4
+  }
 
-fn (c: ByteCounter) blockSize(): int {
-  return 64
+  blockSize(): int {
+    return 64
+  }
 }
 
 // Streaming: reset, feed bytes across as many `write`s as you like, read `sum`.
@@ -623,48 +623,48 @@ import { Aead } from "std/crypto"
 // the same way - by its four methods.
 class XorSeal {
   pad: byte
-}
 
-fn (x: XorSeal) seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte {
-  let out = []byte(len(plaintext) + 1)
-  let tag: byte = 0
-  let i = 0
-  while (i < len(plaintext)) {
-    let c = plaintext[i] ^ x.pad
-    out[i] = c
-    tag = tag ^ c
-    i = i + 1
+  seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte {
+    let out = []byte(len(plaintext) + 1)
+    let tag: byte = 0
+    let i = 0
+    while (i < len(plaintext)) {
+      let c = plaintext[i] ^ this.pad
+      out[i] = c
+      tag = tag ^ c
+      i = i + 1
+    }
+    out[len(plaintext)] = tag // the 1-byte authentication tag
+    return out
   }
-  out[len(plaintext)] = tag // the 1-byte authentication tag
-  return out
-}
 
-fn (x: XorSeal) open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte! {
-  if (len(ciphertext) < 1) {
-    fail newError("open: ciphertext shorter than the tag")
+  open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte! {
+    if (len(ciphertext) < 1) {
+      fail newError("open: ciphertext shorter than the tag")
+    }
+    let n = len(ciphertext) - 1
+    let out = []byte(n)
+    let tag: byte = 0
+    let i = 0
+    while (i < n) {
+      let c = ciphertext[i]
+      tag = tag ^ c
+      out[i] = c ^ this.pad
+      i = i + 1
+    }
+    if (tag != ciphertext[n]) { // tag mismatch: reject, never return plaintext
+      fail newError("open: authentication failed")
+    }
+    return out
   }
-  let n = len(ciphertext) - 1
-  let out = []byte(n)
-  let tag: byte = 0
-  let i = 0
-  while (i < n) {
-    let c = ciphertext[i]
-    tag = tag ^ c
-    out[i] = c ^ x.pad
-    i = i + 1
-  }
-  if (tag != ciphertext[n]) { // tag mismatch: reject, never return plaintext
-    fail newError("open: authentication failed")
-  }
-  return out
-}
 
-fn (x: XorSeal) nonceSize(): int {
-  return 12
-}
+  nonceSize(): int {
+    return 12
+  }
 
-fn (x: XorSeal) overhead(): int {
-  return 1
+  overhead(): int {
+    return 1
+  }
 }
 
 // Encrypt-then-decrypt through the `Aead` interface: `open` recovers what `seal`

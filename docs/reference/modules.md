@@ -67,11 +67,15 @@ export class Config {
 - `export` on a class field makes that field readable and writable outside the
   module; an unexported field cannot appear in a foreign composite literal or be
   selected outside its module.
-- Export a method by placing `export` before its `fn` keyword:
+- Export a method by placing `export` before it in the class body:
 
 ```bit
-export fn (c: Config) describe(): string {
-  return c.name
+class Described {
+  export name: string
+
+  export describe(): string {
+    return this.name
+  }
 }
 ```
 
@@ -118,11 +122,15 @@ fn builtins(xs: []int, m: map<string, int>) {
 ```bit
 interface Shape { area(): f64 }
 
-class Circle { export r: f64 }
-class Rect   { export w: f64; export h: f64 }
-
-fn (c: Circle) area(): f64 { return 3.14159 * c.r * c.r }
-fn (r: Rect)   area(): f64 { return r.w * r.h }
+class Circle {
+  export r: f64
+  area(): f64 { return 3.14159 * this.r * this.r }
+}
+class Rect {
+  export w: f64
+  export h: f64
+  area(): f64 { return this.w * this.h }
+}
 
 fn totalArea<T: Shape>(shapes: []T): f64 {
   let sum = 0.0
