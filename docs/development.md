@@ -427,7 +427,7 @@ green differential as the stronger claim.
 resolver, so they cannot see a bug that only exists on the resolver-active
 path.** `--dump-ir-pre`/`--dump-ir`/`--dump-types` all reach `checkModule`
 through `lowerSourceModule`/`checkSourceDump` (`compiler/lowerdriver.bit:312`,
-`compiler/checkmodule.bit:490`) and never call `resolveModule`.
+`compiler/checkmodule.bit:510`) and never call `resolveModule`.
 `compiler/check.bit:163`'s own field comment says so: `nodeSymbols` is "[e]mpty
 on the bare dump entry points ... checkExprType falls back to the flat env
 there." `bit build`/`run`/`test`/`check`/`doc` all resolve first

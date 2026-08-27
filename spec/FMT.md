@@ -303,7 +303,7 @@ formatter may re-indent the block (see §2) but never reorders its clauses
 a fix rather than being true by default). The block is width-aware like any
 other bracketed construct (§1): it renders on one line only if that fits
 under the 100-column budget and holds no comment, via a trial render
-(`fmtAsmFlatSlots`, `compiler/fmtdispatch.bit:694-703`); otherwise each
+(`fmtAsmFlatSlots`, `compiler/fmtdispatch.bit:702-711`); otherwise each
 clause — `x64 { ... }`, `arm64 { ... }`, `input ...`, etc. — gets its own
 line. Before `#3679` the flat form was assumed whenever the block held no
 comment, with no width check: a clause whose own content (e.g. a long
