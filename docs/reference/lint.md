@@ -48,7 +48,10 @@ override line itself is skimmed past.
 already uses. `--stats` prints the overrides in force (`<path>: <rule>=<n>` or
 `<path>: disable <rule>`) and no findings.
 
-## The 11 rules
+## The 12 rules
+
+(E0215 `unused-result` is registered and documented in
+[spec/LINT.md §4.3](../../spec/LINT.md) but missing from this table — #3805.)
 
 | Code | Rule | Default | What it means when it fires |
 | --- | --- | --- | --- |
@@ -63,6 +66,7 @@ already uses. `--stats` prints the overrides in force (`<path>: <rule>=<n>` or
 | E0212 | `unreachable-code` | - | A statement after one that always diverges (`return`/`fail`/`break`/`continue`/`panic`) in the same block. |
 | E0213 | `shadowed-local` | - | An inner `let`/`const` hides a name already bound in an enclosing scope; later edits to either binding silently change which one is read. |
 | E0214 | `append-aliasing` | - | `append` on a slice **parameter** grows it in place and aliases the caller's backing array - the caller may see writes it never made. |
+| E0216 | `empty-test-file` | - | A `.test.bit` file's own suffix (SPEC §19) promises tests; declaring none is almost always a rename that lost its content or a stub nobody finished. |
 
 A rule with a default is a **threshold** rule: its override takes a value
 (`rule=N`). A rule with no default (` - ` above) is **boolean**: the only
@@ -99,6 +103,17 @@ needs no resolver was done, and diagnostic codes are never renumbered once
 assigned. It reuses the same divergence analysis `bit check` already uses for
 missing-return (E0055) and catch-block completeness, so it never disagrees
 with the checker about what "always diverts control" means.
+
+`empty-test-file` (E0216) needs no resolver either, for the same reason: a
+test is a top-level `fn` with no parameters and no return type, declared in a
+`.test.bit` file (SPEC §19) - both the shape and the filename are answered
+from the AST and the file's own path, with nothing to resolve. It checks the
+FILENAME only, never a directory: a plain `.bit` helper sitting inside a
+`_tests_/` directory (a fake server, a fixture builder) is never in scope,
+whatever it declares. `main` does not count toward "has a test" even when it
+is shaped like one - `bit test` renames whatever `main` it finds before
+synthesizing its own dispatcher, so a user's `fn main(){}` is never itself a
+discovered test.
 
 ### Phase 2 - dead weight and footguns (E0210, E0211, E0213, E0214)
 

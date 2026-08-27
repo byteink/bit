@@ -3360,12 +3360,14 @@ There is **no `recover`** in v0.1: panics are fatal by design, keeping control f
 free of hidden unwinding. Recoverable conditions must use the Result model.
 
 A test may still assert that a panic happens, without `recover`. `bit test` (§19)
-treats a top-level function named with the `testpanic_` prefix as
-expected to panic: it discovers `testpanic_` functions alongside `test_` ones,
-runs each in its own child process the same way, passes it when that process
-exits with the panic status (2), and fails it when the process returns
-normally or exits with any other status. This is
-a convention owned by the test runner, not a language feature — `panic` itself
+treats a discovered test named with the `testpanic_` prefix as expected to
+panic — a VERDICT modifier on an already-discovered test, not a second
+discovery mechanism, so it applies exactly like any other name to any
+function `bit test` finds in a `.test.bit` file. It runs a `testpanic_`
+function in its own child process the same way as any other test, passes it
+when that process exits with the panic status (2), and fails it when the
+process returns normally or exits with any other status. This is a
+convention owned by the test runner, not a language feature — `panic` itself
 is unchanged and `recover` remains absent from the language.
 
 ### 18.5 Deferred Cleanup
@@ -3739,31 +3741,56 @@ research under a code-review deadline instead of a design one.
 
 ## 19. Testing
 
-A **test** is a top-level function whose name begins with `test_`, taking no
-parameters and returning nothing:
+A **test** is a top-level function declared in a file named `<name>.test.bit`,
+taking no parameters and returning nothing. No name prefix is required or
+meaningful — discovery is entirely by filename and shape:
 
 ```
-fn test_addition() {
+fn addition() {
   assert(1 + 1 == 2)
 }
 
-fn test_concat() {
+fn concat() {
   assert("ab" + "c" == "abc", "string concat")
 }
 ```
 
 - No new syntax: a test is an ordinary function, so `test` is not a reserved
-  word (§5.2) and a test may call any function in its module.
-- `bit test <file.bit|dir>` discovers every `test_` function in the module a
-  file names, or in every module beneath a directory — never in a module
-  reached only by importing it from outside that directory. It runs each,
-  prints `ok`/`FAIL` per test plus a summary, and exits `0` iff every test
-  passed, `1` otherwise.
+  word (§5.2) and a test may call any function in its module — including a
+  private one declared in a sibling file. A module's files are simply its
+  `*.bit` entries concatenated in one flat scope (§14.8), so a `.test.bit`
+  file sits in the same module as the code it tests and needs no import to
+  reach it.
+- The FILENAME is the only discovery marker. `bit test` scans every top-level
+  function in a `.test.bit` file that takes no parameters and returns
+  nothing, whatever it is named. A differently-shaped function in the same
+  file (one that takes a parameter, or returns a value) is an ordinary
+  helper, not an error — name it however reads best; it is excluded by its
+  shape, never by a naming rule. `main` is the one name excluded regardless
+  of shape: `bit test` renames whatever `main` it finds before synthesizing
+  its own entry point (§17.4), so a user's `fn main(){}` is never itself a
+  discovered test.
+- Tests live in one of two places: beside the file they test, as
+  `<name>.test.bit`, or grouped under a `_tests_/` subdirectory for
+  black-box tests that exercise only a module's exported surface. A
+  `_tests_/` directory is an ordinary directory — its `*.bit` files form
+  their own module and reach the parent's exported names through an
+  ordinary relative import, `import { publicName } from "../"`.
+- A plain `.bit` file is never scanned for tests, wherever it sits — including
+  inside a `_tests_/` directory. Helper code that is not itself a test (a fake
+  server, fixture builders) belongs in a plain `.bit` file there and is never
+  mistaken for a test regardless of its own functions' shapes.
+- `bit test <file.bit|dir>` discovers every test in the module a file names,
+  or in every module beneath a directory — never in a module reached only by
+  importing it from outside that directory. It runs each, prints `ok`/`FAIL`
+  per test plus a summary, and exits `0` iff every test passed, `1`
+  otherwise.
 - A test fails when it panics — which a failed `assert` (§18.4) does. Each test
   therefore runs in its own process, so one failure neither hides the others nor
   aborts the run.
 - Tests are ordinary unreferenced functions to `bit build`/`bit run`, so the
-  linker's dead-strip drops them from a normal program's binary.
+  linker's dead-strip drops them from a normal program's binary — every
+  function in a `.test.bit` file, test-shaped or not.
 - Test execution order is the order of declaration; tests must not depend on it.
 
 Richer assertions with value diffs live in `std/testing`, layered on this runner.
