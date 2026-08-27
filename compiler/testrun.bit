@@ -23,12 +23,24 @@ import { isSymlink } from "std/fs"
 // Directories this walk never opens, regardless of what they hold: `bit-out`
 // is the build driver's own output (never a project's source), and a dotted
 // directory (`.git` among them) is neither a module nor a place a project
-// keeps one.
-fn testWalkSkipsDir(name: string): bool {
+// keeps one. Both are skipped unconditionally — that has been true of an
+// explicit `bit test <dir>` since #2247 and #3784 must not change it.
+//
+// `vendor` (a fetched/vendored dependency tree) is skipped ONLY when
+// `skipVendor` is set — #3784's whole-project walk (`checkProjectCmd`,
+// projectcli.bit; `testCmd` with no operand, below) passes true, because
+// walking `vendor/bit` would run the COMPILER's own test suite from inside a
+// user's project. A caller naming a directory explicitly gets the pre-#3784
+// walk unchanged: `bit test some/dir` must not start skipping a `vendor/`
+// subdirectory it used to walk into.
+fn testWalkSkipsDir(name: string, skipVendor: bool): bool {
   if (len(name) > 0 && name[0] == '.') {
     return true
   }
-  return name == "bit-out"
+  if (name == "bit-out") {
+    return true
+  }
+  return skipVendor && name == "vendor"
 }
 
 // Bounds recursion depth the same way `std/fs.walk` bounds its own (a cycle
@@ -81,12 +93,12 @@ fn dirEntryNames(dir: string): []string {
 // ancestor — is never visited. That is what keeps every path this walk
 // returns inside `root`'s own subtree, and what makes a cycle a non-event
 // rather than something `maxTestWalkDepth` merely happens to survive.
-fn collectTestModules(root: string): []string {
+fn collectTestModules(root: string, skipVendor: bool): []string {
   let out = []string(0)
   if (len(listBitFiles(root)) > 0) {
     out = append(out, root)
   }
-  return testWalkInto(root, out, maxTestWalkDepth)
+  return testWalkInto(root, out, maxTestWalkDepth, skipVendor)
 }
 
 // Whether `p` is a directory this walk may descend into: a REAL one, not a
@@ -102,13 +114,13 @@ fn testWalkIsRealDir(p: string): bool {
   return fsIsDir(p) && !isSymlink(p)
 }
 
-fn testWalkInto(dir: string, acc: []string, depth: int): []string {
+fn testWalkInto(dir: string, acc: []string, depth: int, skipVendor: bool): []string {
   if (depth <= 0 || len(acc) >= maxModules) {
     return acc
   }
   let out = acc
   for name of sortStrings(dirEntryNames(dir)) {
-    if (testWalkSkipsDir(name)) {
+    if (testWalkSkipsDir(name, skipVendor)) {
       continue
     }
     let p = dir + "/" + name
@@ -122,7 +134,7 @@ fn testWalkInto(dir: string, acc: []string, depth: int): []string {
     if (len(out) >= maxModules) {
       return out
     }
-    out = testWalkInto(p, out, depth - 1)
+    out = testWalkInto(p, out, depth - 1, skipVendor)
   }
   return out
 }
@@ -153,6 +165,16 @@ class ModuleTestReport {
   ranAny: bool,
   buildFailed: bool,
   noMatch: bool,
+}
+
+// `testModule`/`testProject`'s exit code plus the one number #3784's
+// project-level `bit test` summary needs and neither function's own return
+// used to carry: how many tests actually RAN (passed+failed), regardless of
+// how many modules or files that came from. `testCmd` reads `.ran` only when
+// `opts.wholeProject` is set — every explicit-path caller is unaffected.
+class TestRunTotals {
+  code: int,
+  ran: int,
 }
 
 // Whether `td`'s dispatch list is empty ONLY because a non-empty `runPattern`
@@ -265,26 +287,26 @@ fn runModuleTests(src: string, runPattern: string, timeoutMs: int): ModuleTestRe
 // drop visible on the summary's own face rather than needing a diff to
 // notice — the repo's convention elsewhere (`imports: 113/113 OK`,
 // `golden: PASS — 447 cases`).
-fn testModule(src: string, runPattern: string, timeoutMs: int): int {
+fn testModule(src: string, runPattern: string, timeoutMs: int): TestRunTotals {
   let r = runModuleTests(src, runPattern, timeoutMs)
   if (r.buildFailed) {
-    return 1
+    return TestRunTotals{ code: 1, ran: 0 }
   }
   if (r.noMatch) {
     eprint("bit test: no test matched --run ${runPattern}\n")
-    return 1
+    return TestRunTotals{ code: 1, ran: 0 }
   }
   if (!r.ranAny) {
     print("no tests in ${src} (a test is a top-level fn, no parameters, no return, in a .test.bit file)\n")
-    return 0
+    return TestRunTotals{ code: 0, ran: 0 }
   }
   let total = r.passed + r.failed
   print("\ndiscovered ${r.discovered} test${pluralS(r.discovered)}, ran ${total}: " +
     "${r.passed} passed, ${r.failed} failed\n")
   if (r.failed == 0) {
-    return 0
+    return TestRunTotals{ code: 0, ran: total }
   }
-  return 1
+  return TestRunTotals{ code: 1, ran: total }
 }
 
 // `bit test <project root>`: runs every module `mods` names — independently,
@@ -292,7 +314,7 @@ fn testModule(src: string, runPattern: string, timeoutMs: int): int {
 // its own path so a failure is attributable, plus one combined summary and
 // exit code. This is what makes `bit test <dir>` at a project root actually
 // cover the project (#2247) instead of only its own top level.
-fn testProject(mods: []string, runPattern: string, timeoutMs: int): int {
+fn testProject(mods: []string, runPattern: string, timeoutMs: int): TestRunTotals {
   let totalPassed = 0
   let totalFailed = 0
   let totalDiscovered = 0
@@ -317,17 +339,17 @@ fn testProject(mods: []string, runPattern: string, timeoutMs: int): int {
     }
     print("\n")
   }
-  if (len(runPattern) > 0 && totalPassed + totalFailed == 0) {
-    eprint("bit test: no test matched --run ${runPattern}\n")
-    return 1
-  }
   let total = totalPassed + totalFailed
+  if (len(runPattern) > 0 && total == 0) {
+    eprint("bit test: no test matched --run ${runPattern}\n")
+    return TestRunTotals{ code: 1, ran: 0 }
+  }
   print("discovered ${totalDiscovered} test${pluralS(totalDiscovered)} across ${len(mods)} module${pluralS(len(mods))}, " +
     "ran ${total}: ${totalPassed} passed, ${totalFailed} failed\n")
   if (totalFailed > 0 || anyBuildFailed) {
-    return 1
+    return TestRunTotals{ code: 1, ran: total }
   }
-  return 0
+  return TestRunTotals{ code: 0, ran: total }
 }
 
 // The operand `bit test` builds, plus the `--run` substring filter (#2833,
@@ -340,6 +362,11 @@ class TestOptions {
   src: string,
   runPattern: string,
   timeoutMs: int,
+  // #3784: true only for `bit test`'s no-operand ("whole project") form —
+  // `src` is then `projectRootDir()` (main.bit), not something the caller
+  // typed. Every explicit-path caller leaves this false, so `testCmd`'s
+  // output for a GIVEN path is unchanged (the extra line below never prints).
+  wholeProject: bool,
 }
 
 // `bit test <file.bit|dir>` (SPEC §19). A file is always exactly one module —
@@ -350,19 +377,34 @@ class TestOptions {
 // wording. Only a directory holding more than its own top level, or holding
 // modules with nothing at its own top level, reaches `testProject`.
 fn testCmd(opts: TestOptions): int {
-  let src = opts.src
   // Refuse before any compile — `runModuleTests` (above) always calls
   // `buildIr` first regardless of file vs. directory or how many modules a
-  // directory walk finds, so one check here ahead of the fsIsDir branch
-  // below covers `testModule` AND `testProject` (#2979, `refuseTestUnderStressGc`
+  // directory walk finds, so one check here ahead of `testRunResult` below
+  // covers `testModule` AND `testProject` (#2979, `refuseTestUnderStressGc`
   // in build.bit — same module, no import needed).
-  if (refuseTestUnderStressGc(src)) {
+  if (refuseTestUnderStressGc(opts.src)) {
     return 1
   }
+  let result = testRunResult(opts)
+  // #3784's whole line: the project-level summary a path-given `bit test`
+  // never prints. `countConventionTestFiles` (projectcli.bit) is REPORTING
+  // ONLY — it never decides which tests run, so it cannot disagree with
+  // `result.ran` about what actually happened.
+  if (opts.wholeProject) {
+    print("${countConventionTestFiles(opts.src)} test file(s) found, ${result.ran} test(s) run\n")
+  }
+  return result.code
+}
+
+// The file-vs-directory, single-module-vs-project split `testCmd` used to
+// inline before #3784 needed its RESULT (not just its exit code) to build
+// the whole-project summary line above.
+fn testRunResult(opts: TestOptions): TestRunTotals {
+  let src = opts.src
   if (!fsIsDir(src)) {
     return testModule(src, opts.runPattern, opts.timeoutMs) // a file, or a path that does not exist at all
   }
-  let mods = collectTestModules(src)
+  let mods = collectTestModules(src, opts.wholeProject)
   if (len(mods) == 0 || (len(mods) == 1 && mods[0] == src)) {
     return testModule(src, opts.runPattern, opts.timeoutMs)
   }
