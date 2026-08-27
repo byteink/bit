@@ -480,8 +480,7 @@ top_decl     = import_decl
              | [ "export" ] trait_decl
              | [ "export" ] enum_decl
              | [ "export" ] type_alias
-             | [ "export" ] extern_fn_decl
-             | method_decl .            (* export follows the receiver type *)
+             | [ "export" ] extern_fn_decl .
 ```
 
 Top-level declarations may appear in any order within a module; forward
@@ -707,10 +706,12 @@ declaration order. Green-thread stacks are fixed-size and guarded (§20), so
 
 ### 10.4 Method Declarations
 
-A method attaches a named function to a class or type-alias target, in one of
-two forms.
+```
+method_decl = [ "export" ] IDENT [ generic_params ] signature block .
+```
 
-**In the class body**, using the reserved receiver `this`:
+A method attaches a named function to a class, declared **in the class
+body**, using the reserved receiver `this`:
 
 ```
 class Point {
@@ -727,26 +728,14 @@ class Point {
 are written. A method may still declare its own `generic_params`
 (`scaled<T>(...)`), independently of any the class itself declares.
 
-**With an explicit receiver**, placed before the method name:
-
-```
-method_decl = [ "export" ] "fn" "(" receiver ")" IDENT [ generic_params ] signature block .
-receiver    = IDENT ":" type_name .
-```
-
-```
-class Point { x: f64; y: f64 }
-
-fn (p: Point) norm(): f64 {
-  return sqrt(p.x * p.x + p.y * p.y)
-}
-```
-
-Both forms declare the same construct and share every rule below; a program
-may use either form for any method.
-
-- The receiver type must be a class or type-alias declared in the **same
-  module**. Methods can only be declared for locally-declared types.
+- The receiver's type is always the class the method is declared in — methods
+  can only be declared for a class in the **same module**, and only by
+  writing them inside that class's body. (Prior to 0.2.0, a method could also
+  be declared outside the class body with an explicit `fn (recv: Type)
+  name()` clause, and that clause could name a type-alias to a class or to a
+  primitive. That form is retired; a type-alias VALUE can still call a
+  method declared on its underlying class — aliases are transparent, §14.1 —
+  but a primitive can no longer have a method at all.)
 - Because classes are **reference types** (§13.3), a method mutating a receiver
   field mutates the caller's value; no pointer receiver syntax is needed.
 - Methods participate in structural interface satisfaction (§14.3).
@@ -754,7 +743,8 @@ may use either form for any method.
 ### 10.5 Class Declarations
 
 ```
-class_decl  = "class" IDENT [ generic_params ] "{" [ field { ( ";" | "," ) field } [ ";" | "," ] ] "}" .
+class_decl  = "class" IDENT [ generic_params ] "{" [ member { ( ";" | "," ) member } [ ";" | "," ] ] "}" .
+member      = field | method_decl .    (* method_decl, §10.4 *)
 field       = [ "export" ] IDENT ":" type .
 ```
 
@@ -765,7 +755,9 @@ field       = [ "export" ] IDENT ":" type .
   module-private (§17.3). The class type itself is exported via the leading
   `export` on the declaration.
 - Fields are ordered; that order is the composite-literal positional order and the
-  memory layout order (subject to the compiler's alignment padding).
+  memory layout order (subject to the compiler's alignment padding). A
+  method interleaved between fields does not affect this order or count as
+  a field itself.
 - Classes are reference types with reference semantics on assignment (§13.3).
 
 ### 10.6 Interface Declarations
@@ -2525,19 +2517,23 @@ A type `S` **satisfies** interface `I` if, for every method `m` in `I`, `S` has 
 method named `m` whose signature is identical to `I`'s (with `Self` bound to `S`).
 Method sets:
 
-- The method set of a class/alias type is the set of methods declared with a
-  receiver of that type in its home module, plus any method injected into it by
-  a `use` statement (§10.7) — an injected method is indistinguishable from a
-  declared one for this purpose.
+- The method set of a class type is the set of methods declared in its body
+  (§10.4), in its home module, plus any method injected into it by a `use`
+  statement (§10.7) — an injected method is indistinguishable from a declared
+  one for this purpose. A type alias has no method set of its own — aliases
+  are transparent (§14.1), so a value typed through one satisfies an
+  interface exactly as its underlying class would.
 - Interfaces may not declare fields; only method signatures.
 - `S` must be a **class** type (or another interface, or `nil`). An interface
   value *is* the receiver's object pointer — there is no boxed scalar — so only a
   type that is already a reference (§13.3) can sit behind one. Storing anything
   else would leave a non-pointer in a word the collector traces as a root and a
   type assertion (§14.4) reads as an object header. This is a rule about the
-  value's representation, not its method set: a method may be declared on a type
-  alias (§10.4), and an alias to a scalar is transparently that scalar (§14.1),
-  so a scalar can carry methods yet still not be storable in an interface.
+  value's representation, not its method set — though since a scalar can never
+  have a method at all (§10.4: methods are declared only in a class body), the
+  two rules are never actually in tension for a scalar; the empty interface
+  `interface {}` is what isolates the representation rule from a method-set
+  check, since every value's (trivially empty) method set satisfies it.
 - `nil` is assignable to *any* interface, empty or not, and satisfaction is never
   consulted for it: `nil` has no method set, so testing it against `I`'s methods
   would reject it out of every non-empty interface and leave such a location's
@@ -3909,11 +3905,15 @@ import { parseInt } from "std/strings"
 
 interface Shape { area(): f64 }
 
-class Circle { export r: f64 }
-class Rect   { export w: f64; export h: f64 }
-
-fn (c: Circle) area(): f64 { return 3.14159265358979 * c.r * c.r }
-fn (r: Rect)   area(): f64 { return r.w * r.h }
+class Circle {
+  export r: f64
+  area(): f64 { return 3.14159265358979 * this.r * this.r }
+}
+class Rect {
+  export w: f64
+  export h: f64
+  area(): f64 { return this.w * this.h }
+}
 
 // Generic: works for any Shape (structural satisfaction).
 fn totalArea<T: Shape>(shapes: []T): f64 {
@@ -3926,8 +3926,8 @@ fn totalArea<T: Shape>(shapes: []T): f64 {
 
 // Fallible: parse an f64 count from a file, default to a computed value on error.
 fn loadCount(path: string): int! {
-  let text = readFile(path)?          // propagate fs errors
-  return parseInt(text)?              // propagate parse errors
+  let text = readFile(path)? // propagate fs errors
+  return parseInt(text)?     // propagate parse errors
 }
 
 // Concurrency: fan work out to green threads, collect over a channel.
@@ -4003,8 +4003,7 @@ top_decl      = import_decl
               | [ "export" ] trait_decl
               | [ "export" ] enum_decl
               | [ "export" ] type_alias
-              | [ "export" ] extern_fn_decl
-              | method_decl .
+              | [ "export" ] extern_fn_decl .
 
 import_decl   = "import" import_body "from" STRING_LIT .
 import_body   = IDENT | "*" "as" IDENT
@@ -4021,15 +4020,15 @@ type_alias    = "type" IDENT [ generic_params ] "=" type .
 func_decl     = [ attr_list ] "fn" IDENT [ generic_params ] signature block .
 attr_list     = attr { attr } .
 attr          = "@" IDENT [ "(" STRING_LIT ")" ] .
-method_decl   = [ "export" ] "fn" "(" receiver ")" IDENT [ generic_params ] signature block .
-receiver      = IDENT ":" type_name .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
 params        = param { "," param } [ "," ] .
 param         = [ "..." ] IDENT ":" type .
 extern_fn_decl = "extern" "fn" IDENT signature .
 
-class_decl    = "class" IDENT [ generic_params ] "{" [ field { fsep field } [ fsep ] ] "}" .
+class_decl    = "class" IDENT [ generic_params ] "{" [ member { fsep member } [ fsep ] ] "}" .
+member        = field | method_decl .
 field         = [ "export" ] IDENT ":" type .
+method_decl   = [ "export" ] IDENT [ generic_params ] signature block .
 interface_decl= "interface" IDENT [ generic_params ] "{" [ method_sig { fsep method_sig } [ fsep ] ] "}" .
 method_sig    = IDENT signature .
 fsep          = ";" | "," .

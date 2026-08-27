@@ -211,14 +211,183 @@ export fn hwAvailableSha256(): bool {
 // all built once at construction and `reset` does not disturb them, so a hasher
 // never re-reads the CPU.
 export class Sha256 {
-  state: []u32,
-  buf: []byte,
-  bufLen: int,
-  total: uint,
-  sz: int,
-  iv: []u32,
-  k: []u32,
-  hw: bool,
+  state: []u32
+  buf: []byte
+  bufLen: int
+  total: uint
+  sz: int
+  iv: []u32
+  k: []u32
+  hw: bool
+
+  // Fold `blocks` whole 64-byte blocks, starting at `data[off]`, into `state` —
+  // the one place either path is chosen. `state` is the caller's running state
+  // (`h.state` while writing, the finalization copy in `sum`), never assumed to
+  // be `h`'s own.
+  absorb(state: []u32, data: []byte, off: int, blocks: int) {
+    if (!this.hw) {
+      let i = 0
+      while (i < blocks) {
+        compress(state, data, off + i * 64, this.k)
+        i = i + 1
+      }
+      return
+    }
+    // The 32-byte packed-state buffer is local, NOT a field on `h`: `sum`
+    // finalizes on a copy of the running state and must stay read-only with
+    // respect to the hasher, which a shared scratch field would quietly break for
+    // two concurrent `sum` calls. `absorb` runs at most twice per `write` and
+    // twice per `sum` — never once per block — so this is a per-run allocation,
+    // and it replaces the software path's own `[]u32(64)` schedule, which is 512
+    // bytes per BLOCK.
+    let packed = []byte(32)
+    packState(state, packed)
+    bit_rt_sha256_hw_blocks(int(ptrOf(packed)), int(ptrOf(data)) + off, u64(blocks))
+    unpackState(packed, state)
+
+    // GC KEEP-ALIVE, and the reason it is AFTER the call rather than before it.
+    // `data` reaches the primitive only as a raw address, and a raw `int` is not
+    // a stack-map slot while a `[]byte` local is (`runtime/root/floats.bit`'s
+    // `packLowBytes` header; `codegen.bit`'s `isRefType` excludes `*T`). Stack
+    // maps are live-range precise — `regalloc.bit` records an interval at a
+    // safepoint only while `start <= pos && end >= pos` — so a slice whose last
+    // use precedes the call is absent from that call's map. The primitive
+    // allocates (its round-constant table and its scratch block), so a
+    // collection CAN run inside it. This read is what holds `data`'s interval,
+    // and so its stack-map entry, open across the call above. It is also a real
+    // bounds invariant: every caller must have `blocks` whole blocks in hand.
+    if (len(data) < off + blocks * 64) {
+      panic("sha256: hardware block run extends past the end of the buffer")
+    }
+  }
+
+  // Absorb `data`, buffering into 64-byte blocks and compressing each full one.
+  // Whole blocks that are already 64-byte aligned in the caller's own buffer are
+  // handed to `absorb` in one run, so they are neither copied through `h.buf` nor
+  // split into one primitive call each; only the ragged head and tail are
+  // buffered. The block sequence, and so the digest, is identical either way.
+  export write(data: []byte) {
+    let n = len(data)
+    let i = 0
+
+    // Head: top up a partial block, so the bulk run below starts block-aligned.
+    while (this.bufLen > 0 && i < n) {
+      this.buf[this.bufLen] = data[i]
+      this.bufLen = this.bufLen + 1
+      i = i + 1
+      if (this.bufLen == 64) {
+        this.absorb(this.state, this.buf, 0, 1)
+        this.bufLen = 0
+      }
+    }
+
+    let blocks = (n - i) / 64
+    if (blocks > 0) {
+      this.absorb(this.state, data, i, blocks)
+      i = i + blocks * 64
+    }
+
+    // Tail: whatever is left cannot fill a block.
+    while (i < n) {
+      this.buf[this.bufLen] = data[i]
+      this.bufLen = this.bufLen + 1
+      i = i + 1
+    }
+
+    this.total = this.total + uint(n)
+  }
+
+  // The digest of everything written since the last reset. Finalizes on a copy of
+  // the running state, so it neither consumes the hasher nor blocks further
+  // `write`s. Padding is `0x80`, then zeros, then the 64-bit big-endian bit length.
+  export sum(): []byte {
+    // Snapshot the running state so finalization is non-destructive.
+    let s = []u32(8)
+    let i = 0
+    while (i < 8) {
+      s[i] = this.state[i]
+      i = i + 1
+    }
+
+    // Build the padded tail from the current partial block.
+    let pad = []byte(64)
+    i = 0
+    while (i < this.bufLen) {
+      pad[i] = this.buf[i]
+      i = i + 1
+    }
+    let n = this.bufLen
+    pad[n] = 0x80
+    n = n + 1
+
+    // The 8-byte length must fit in this block; if not, flush and start a fresh
+    // all-zero block for it.
+    if (n > 56) {
+      while (n < 64) {
+        pad[n] = 0
+        n = n + 1
+      }
+      this.absorb(s, pad, 0, 1)
+      i = 0
+      while (i < 64) {
+        pad[i] = 0
+        i = i + 1
+      }
+      n = 0
+    }
+    while (n < 56) {
+      pad[n] = 0
+      n = n + 1
+    }
+
+    // 64-bit big-endian message length in bits.
+    let bitLen = this.total * 8
+    pad[56] = byte(bitLen >> 56)
+    pad[57] = byte(bitLen >> 48)
+    pad[58] = byte(bitLen >> 40)
+    pad[59] = byte(bitLen >> 32)
+    pad[60] = byte(bitLen >> 24)
+    pad[61] = byte(bitLen >> 16)
+    pad[62] = byte(bitLen >> 8)
+    pad[63] = byte(bitLen)
+    this.absorb(s, pad, 0, 1)
+
+    // Serialize the first `sz` bytes of the state, each word big-endian.
+    let out = []byte(this.sz)
+    let words = this.sz / 4
+    i = 0
+    while (i < words) {
+      let v = s[i]
+      out[i * 4] = byte(v >> 24)
+      out[i * 4 + 1] = byte(v >> 16)
+      out[i * 4 + 2] = byte(v >> 8)
+      out[i * 4 + 3] = byte(v)
+      i = i + 1
+    }
+    return out
+  }
+
+  // Rewind to the empty message: restore the variant's initial state and drop any
+  // buffered bytes.
+  export reset() {
+    let i = 0
+    while (i < 8) {
+      this.state[i] = this.iv[i]
+      i = i + 1
+    }
+    this.bufLen = 0
+    this.total = 0
+  }
+
+  // The digest length in bytes: 32 for SHA-256, 28 for SHA-224.
+  export size(): int {
+    return this.sz
+  }
+
+  // The internal block size in bytes (64 for both variants).
+  export blockSize(): int {
+    return 64
+  }
 }
 
 // A fresh SHA-256 hasher over the empty message.
@@ -253,171 +422,3 @@ export fn newSha224(): Hash {
   return h
 }
 
-// Fold `blocks` whole 64-byte blocks, starting at `data[off]`, into `state` —
-// the one place either path is chosen. `state` is the caller's running state
-// (`h.state` while writing, the finalization copy in `sum`), never assumed to
-// be `h`'s own.
-fn (h: Sha256) absorb(state: []u32, data: []byte, off: int, blocks: int) {
-  if (!h.hw) {
-    let i = 0
-    while (i < blocks) {
-      compress(state, data, off + i * 64, h.k)
-      i = i + 1
-    }
-    return
-  }
-  // The 32-byte packed-state buffer is local, NOT a field on `h`: `sum`
-  // finalizes on a copy of the running state and must stay read-only with
-  // respect to the hasher, which a shared scratch field would quietly break for
-  // two concurrent `sum` calls. `absorb` runs at most twice per `write` and
-  // twice per `sum` — never once per block — so this is a per-run allocation,
-  // and it replaces the software path's own `[]u32(64)` schedule, which is 512
-  // bytes per BLOCK.
-  let packed = []byte(32)
-  packState(state, packed)
-  bit_rt_sha256_hw_blocks(int(ptrOf(packed)), int(ptrOf(data)) + off, u64(blocks))
-  unpackState(packed, state)
-
-  // GC KEEP-ALIVE, and the reason it is AFTER the call rather than before it.
-  // `data` reaches the primitive only as a raw address, and a raw `int` is not
-  // a stack-map slot while a `[]byte` local is (`runtime/root/floats.bit`'s
-  // `packLowBytes` header; `codegen.bit`'s `isRefType` excludes `*T`). Stack
-  // maps are live-range precise — `regalloc.bit` records an interval at a
-  // safepoint only while `start <= pos && end >= pos` — so a slice whose last
-  // use precedes the call is absent from that call's map. The primitive
-  // allocates (its round-constant table and its scratch block), so a
-  // collection CAN run inside it. This read is what holds `data`'s interval,
-  // and so its stack-map entry, open across the call above. It is also a real
-  // bounds invariant: every caller must have `blocks` whole blocks in hand.
-  if (len(data) < off + blocks * 64) {
-    panic("sha256: hardware block run extends past the end of the buffer")
-  }
-}
-
-// Absorb `data`, buffering into 64-byte blocks and compressing each full one.
-// Whole blocks that are already 64-byte aligned in the caller's own buffer are
-// handed to `absorb` in one run, so they are neither copied through `h.buf` nor
-// split into one primitive call each; only the ragged head and tail are
-// buffered. The block sequence, and so the digest, is identical either way.
-export fn (h: Sha256) write(data: []byte) {
-  let n = len(data)
-  let i = 0
-
-  // Head: top up a partial block, so the bulk run below starts block-aligned.
-  while (h.bufLen > 0 && i < n) {
-    h.buf[h.bufLen] = data[i]
-    h.bufLen = h.bufLen + 1
-    i = i + 1
-    if (h.bufLen == 64) {
-      h.absorb(h.state, h.buf, 0, 1)
-      h.bufLen = 0
-    }
-  }
-
-  let blocks = (n - i) / 64
-  if (blocks > 0) {
-    h.absorb(h.state, data, i, blocks)
-    i = i + blocks * 64
-  }
-
-  // Tail: whatever is left cannot fill a block.
-  while (i < n) {
-    h.buf[h.bufLen] = data[i]
-    h.bufLen = h.bufLen + 1
-    i = i + 1
-  }
-
-  h.total = h.total + uint(n)
-}
-
-// The digest of everything written since the last reset. Finalizes on a copy of
-// the running state, so it neither consumes the hasher nor blocks further
-// `write`s. Padding is `0x80`, then zeros, then the 64-bit big-endian bit length.
-export fn (h: Sha256) sum(): []byte {
-  // Snapshot the running state so finalization is non-destructive.
-  let s = []u32(8)
-  let i = 0
-  while (i < 8) {
-    s[i] = h.state[i]
-    i = i + 1
-  }
-
-  // Build the padded tail from the current partial block.
-  let pad = []byte(64)
-  i = 0
-  while (i < h.bufLen) {
-    pad[i] = h.buf[i]
-    i = i + 1
-  }
-  let n = h.bufLen
-  pad[n] = 0x80
-  n = n + 1
-
-  // The 8-byte length must fit in this block; if not, flush and start a fresh
-  // all-zero block for it.
-  if (n > 56) {
-    while (n < 64) {
-      pad[n] = 0
-      n = n + 1
-    }
-    h.absorb(s, pad, 0, 1)
-    i = 0
-    while (i < 64) {
-      pad[i] = 0
-      i = i + 1
-    }
-    n = 0
-  }
-  while (n < 56) {
-    pad[n] = 0
-    n = n + 1
-  }
-
-  // 64-bit big-endian message length in bits.
-  let bitLen = h.total * 8
-  pad[56] = byte(bitLen >> 56)
-  pad[57] = byte(bitLen >> 48)
-  pad[58] = byte(bitLen >> 40)
-  pad[59] = byte(bitLen >> 32)
-  pad[60] = byte(bitLen >> 24)
-  pad[61] = byte(bitLen >> 16)
-  pad[62] = byte(bitLen >> 8)
-  pad[63] = byte(bitLen)
-  h.absorb(s, pad, 0, 1)
-
-  // Serialize the first `sz` bytes of the state, each word big-endian.
-  let out = []byte(h.sz)
-  let words = h.sz / 4
-  i = 0
-  while (i < words) {
-    let v = s[i]
-    out[i * 4] = byte(v >> 24)
-    out[i * 4 + 1] = byte(v >> 16)
-    out[i * 4 + 2] = byte(v >> 8)
-    out[i * 4 + 3] = byte(v)
-    i = i + 1
-  }
-  return out
-}
-
-// Rewind to the empty message: restore the variant's initial state and drop any
-// buffered bytes.
-export fn (h: Sha256) reset() {
-  let i = 0
-  while (i < 8) {
-    h.state[i] = h.iv[i]
-    i = i + 1
-  }
-  h.bufLen = 0
-  h.total = 0
-}
-
-// The digest length in bytes: 32 for SHA-256, 28 for SHA-224.
-export fn (h: Sha256) size(): int {
-  return h.sz
-}
-
-// The internal block size in bytes (64 for both variants).
-export fn (h: Sha256) blockSize(): int {
-  return 64
-}

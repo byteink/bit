@@ -13,7 +13,37 @@
 // layer and a certificate verifier, which is its own task.
 
 // A listening socket. Not a `Conn`: the only thing you can do with it is accept.
-export class Listener { fd: i64 }
+export class Listener {
+  fd: i64
+  // The port this listener is bound to. Meaningful even when 0 was requested.
+  export port(): int! {
+    let p = netLocalPort(this.fd)
+    if (p < 0) {
+      fail newError("could not read the listener's port")
+    }
+    return p
+  }
+
+  // Wait for the next connection. Parks the calling green thread; the OS thread
+  // goes and runs somebody else.
+  export accept(): Conn! {
+    let fd = netAccept(this.fd)
+    if (fd < 0) {
+      fail newError("accept failed")
+    }
+    return Conn{ fd: fd }
+  }
+
+  // Idempotent: a second call is a no-op. Without this, a second close on an
+  // already-closed listener closes whatever fd number the kernel has since
+  // reassigned to a different, live socket.
+  export close() {
+    if (this.fd >= 0) {
+      fsClose(this.fd)
+      this.fd = 0 - 1
+    }
+  }
+}
 
 // One end of an established connection. `deadlineNs` is an ABSOLUTE monotonic
 // nanosecond deadline (`std/time`'s `monotonic()` plus a budget) that
@@ -21,7 +51,109 @@ export class Listener { fd: i64 }
 // built by `dialDeadline` gets, means "no deadline" — `read`/`write` never
 // consult it at all, so an existing `dial()`-then-`read()` caller is
 // unaffected (#2291).
-export class Conn { fd: i64, deadlineNs: i64 }
+export class Conn {
+  fd: i64
+  deadlineNs: i64
+  // Up to `max` bytes. An empty result means the peer closed: an orderly end of
+  // stream, and the condition that ends a read loop.
+  export read(max: int): string {
+    return netRead(this.fd, max)
+  }
+
+  // Write all of `s`. A short write is retried internally, so this either wrote
+  // every byte or failed.
+  export write(s: string): ()! {
+    if (netWrite(this.fd, s) < 0) {
+      fail newError("write failed")
+    }
+  }
+
+  // Read until the peer closes. Only safe against a peer that actually closes —
+  // a keep-alive protocol needs a framing layer instead.
+  export readAll(): string {
+    let out = ""
+    while (true) {
+      let chunk = this.read(4096)
+      if (len(chunk) == 0) {
+        return out
+      }
+      out = out + chunk
+    }
+  }
+
+  // Idempotent: a second call is a no-op. Without this, a second close on an
+  // already-closed connection closes whatever fd number the kernel has since
+  // reassigned to a different, live socket.
+  export close() {
+    if (this.fd >= 0) {
+      fsClose(this.fd)
+      this.fd = 0 - 1
+    }
+  }
+
+  export shutdown() {
+    if (this.fd >= 0) {
+      let _ = bit_rt_net_shutdown_sock_w(this.fd)
+    }
+  }
+
+  // Set (or, with `0`, clear) the absolute monotonic deadline `readDeadline`/
+  // `writeDeadline` respect on this connection from now on. Does not reach back
+  // to bound a `dial`/`dialDeadline` connect already completed.
+  export setDeadline(deadlineNs: int) {
+    this.deadlineNs = deadlineNs
+  }
+
+  // Up to `max` bytes, bounded by the connection's deadline (`dialDeadline`/
+  // `setDeadline`; the zero value blocks like `read` — at most one hour
+  // (`netDeadlineMaxWaitNs`, `runtime/net/net.bit`), a sanity ceiling against a
+  // caller's unit typo, kept independent of `runtime/ABI.md` §19's
+  // `os_run_bounded_max_ms` gate-timing clamp — #3720). An empty result is a
+  // CLEAN CLOSE, exactly as `read`
+  // reports it — an orderly end of stream, never an error. A timeout is a
+  // `fail` whose message names it, so a caller distinguishes the two by
+  // which one it got: a value back (even `""`) was never on the timeout path.
+  export readDeadline(max: int): string! {
+    if (max <= 0) {
+      return ""
+    }
+    let w = []byte(max)
+    let n = bit_rt_net_read_deadline_w(this.fd, ptrOf(w), max, this.deadlineNs)
+    if (n == 0 - 2) {
+      fail newError("read timed out")
+    }
+    if (n < 0) {
+      fail newError("read failed")
+    }
+    if (n == 0) {
+      return ""
+    }
+    return string(w[0:n])
+  }
+
+  // Write all of `s`, bounded by the connection's deadline. `()!` already, so
+  // no new distinguishing shape is needed: a plain error is a hard I/O
+  // failure, an error naming the timeout is the deadline elapsing first.
+  export writeDeadline(s: string): ()! {
+    let n = len(s)
+    if (n == 0) {
+      return
+    }
+    let w = []byte(n)
+    let i = 0
+    while (i < n) {
+      w[i] = s[i]
+      i = i + 1
+    }
+    let wrote = bit_rt_net_write_deadline_w(this.fd, ptrOf(w), n, this.deadlineNs)
+    if (wrote == 0 - 2) {
+      fail newError("write timed out")
+    }
+    if (wrote < 0) {
+      fail newError("write failed")
+    }
+  }
+}
 
 // #2314: `netListen`/`netDial`/`netUdpBind` return `0 - errno` when the
 // failure reached a real syscall (#2343) and the flat sentinel `-1` when it
@@ -54,35 +186,6 @@ export fn listen(host: string, port: int): Listener! {
   return Listener{ fd: fd }
 }
 
-// The port this listener is bound to. Meaningful even when 0 was requested.
-export fn (l: Listener) port(): int! {
-  let p = netLocalPort(l.fd)
-  if (p < 0) {
-    fail newError("could not read the listener's port")
-  }
-  return p
-}
-
-// Wait for the next connection. Parks the calling green thread; the OS thread
-// goes and runs somebody else.
-export fn (l: Listener) accept(): Conn! {
-  let fd = netAccept(l.fd)
-  if (fd < 0) {
-    fail newError("accept failed")
-  }
-  return Conn{ fd: fd }
-}
-
-// Idempotent: a second call is a no-op. Without this, a second close on an
-// already-closed listener closes whatever fd number the kernel has since
-// reassigned to a different, live socket.
-export fn (l: Listener) close() {
-  if (l.fd >= 0) {
-    fsClose(l.fd)
-    l.fd = 0 - 1
-  }
-}
-
 // Connect to `host:port`. A refused connection fails here, not at the first
 // write.
 export fn dial(host: string, port: int): Conn! {
@@ -91,43 +194,6 @@ export fn dial(host: string, port: int): Conn! {
     fail newError(netFailMsg("dial", host, port, fd))
   }
   return Conn{ fd: fd }
-}
-
-// Up to `max` bytes. An empty result means the peer closed: an orderly end of
-// stream, and the condition that ends a read loop.
-export fn (c: Conn) read(max: int): string {
-  return netRead(c.fd, max)
-}
-
-// Write all of `s`. A short write is retried internally, so this either wrote
-// every byte or failed.
-export fn (c: Conn) write(s: string): ()! {
-  if (netWrite(c.fd, s) < 0) {
-    fail newError("write failed")
-  }
-}
-
-// Read until the peer closes. Only safe against a peer that actually closes —
-// a keep-alive protocol needs a framing layer instead.
-export fn (c: Conn) readAll(): string {
-  let out = ""
-  while (true) {
-    let chunk = c.read(4096)
-    if (len(chunk) == 0) {
-      return out
-    }
-    out = out + chunk
-  }
-}
-
-// Idempotent: a second call is a no-op. Without this, a second close on an
-// already-closed connection closes whatever fd number the kernel has since
-// reassigned to a different, live socket.
-export fn (c: Conn) close() {
-  if (c.fd >= 0) {
-    fsClose(c.fd)
-    c.fd = 0 - 1
-  }
 }
 
 // Shut both directions of the connection down WITHOUT releasing the fd (#3016)
@@ -151,19 +217,54 @@ export fn (c: Conn) close() {
 // (stdlib/http/h2.bit) for the shape this exists for.
 extern fn bit_rt_net_shutdown_sock_w(fd: i64): bool
 
-export fn (c: Conn) shutdown() {
-  if (c.fd >= 0) {
-    let _ = bit_rt_net_shutdown_sock_w(c.fd)
-  }
-}
-
 // One received datagram: its bytes and the address it came from. The address is
 // what a server replies to — UDP has no connection to reply over.
 export class Datagram { data: string, host: string, port: int }
 
 // A UDP socket. Connectionless: there is no accept or dial, you send and receive
 // datagrams straight off the socket, each carrying its own destination.
-export class UdpSocket { fd: i64 }
+export class UdpSocket {
+  fd: i64
+  // The port this socket is bound to. Meaningful even when 0 was requested.
+  export port(): int! {
+    let p = netLocalPort(this.fd)
+    if (p < 0) {
+      fail newError("could not read the socket's port")
+    }
+    return p
+  }
+
+  // Send one datagram to `host:port`. All-or-nothing: a datagram is never
+  // partially sent, so success means every byte went.
+  export send(host: string, port: int, data: string): ()! {
+    if (netUdpSend(this.fd, host, port, data) < 0) {
+      fail newError("udp send to ${host}:${port} failed")
+    }
+  }
+
+  // Receive the next datagram, up to `max` bytes, parking until one arrives. The
+  // returned `Datagram` carries the sender's address. A zero-length datagram is
+  // legal and is not an error — unlike a TCP read, empty does not mean "closed".
+  export recv(max: int): Datagram! {
+    let data = netUdpRecv(this.fd, max)
+    let port = netUdpSenderPort()
+    if (port < 0) {
+      fail newError("udp recv failed")
+    }
+    let host = netUdpSenderHost()
+    return Datagram{ data: data, host: host, port: port }
+  }
+
+  // Idempotent: a second call is a no-op. Without this, a second close on an
+  // already-closed socket closes whatever fd number the kernel has since
+  // reassigned to a different, live socket.
+  export close() {
+    if (this.fd >= 0) {
+      fsClose(this.fd)
+      this.fd = 0 - 1
+    }
+  }
+}
 
 // Bind a UDP socket to `host:port`. Like `listen`, `port` may be 0 to let the
 // kernel choose one — read it back with `port()`.
@@ -173,46 +274,6 @@ export fn udpBind(host: string, port: int): UdpSocket! {
     fail newError(netFailMsg("udp bind", host, port, fd))
   }
   return UdpSocket{ fd: fd }
-}
-
-// The port this socket is bound to. Meaningful even when 0 was requested.
-export fn (s: UdpSocket) port(): int! {
-  let p = netLocalPort(s.fd)
-  if (p < 0) {
-    fail newError("could not read the socket's port")
-  }
-  return p
-}
-
-// Send one datagram to `host:port`. All-or-nothing: a datagram is never
-// partially sent, so success means every byte went.
-export fn (s: UdpSocket) send(host: string, port: int, data: string): ()! {
-  if (netUdpSend(s.fd, host, port, data) < 0) {
-    fail newError("udp send to ${host}:${port} failed")
-  }
-}
-
-// Receive the next datagram, up to `max` bytes, parking until one arrives. The
-// returned `Datagram` carries the sender's address. A zero-length datagram is
-// legal and is not an error — unlike a TCP read, empty does not mean "closed".
-export fn (s: UdpSocket) recv(max: int): Datagram! {
-  let data = netUdpRecv(s.fd, max)
-  let port = netUdpSenderPort()
-  if (port < 0) {
-    fail newError("udp recv failed")
-  }
-  let host = netUdpSenderHost()
-  return Datagram{ data: data, host: host, port: port }
-}
-
-// Idempotent: a second call is a no-op. Without this, a second close on an
-// already-closed socket closes whatever fd number the kernel has since
-// reassigned to a different, live socket.
-export fn (s: UdpSocket) close() {
-  if (s.fd >= 0) {
-    fsClose(s.fd)
-    s.fd = 0 - 1
-  }
 }
 
 // Resolve a hostname to an IPv4 address (dotted quad) via the system resolver
@@ -278,59 +339,3 @@ export fn dialDeadline(host: string, port: int, deadlineNs: int): Conn! {
   return Conn{ fd: fd, deadlineNs: deadlineNs }
 }
 
-// Set (or, with `0`, clear) the absolute monotonic deadline `readDeadline`/
-// `writeDeadline` respect on this connection from now on. Does not reach back
-// to bound a `dial`/`dialDeadline` connect already completed.
-export fn (c: Conn) setDeadline(deadlineNs: int) {
-  c.deadlineNs = deadlineNs
-}
-
-// Up to `max` bytes, bounded by the connection's deadline (`dialDeadline`/
-// `setDeadline`; the zero value blocks like `read` — at most one hour
-// (`netDeadlineMaxWaitNs`, `runtime/net/net.bit`), a sanity ceiling against a
-// caller's unit typo, kept independent of `runtime/ABI.md` §19's
-// `os_run_bounded_max_ms` gate-timing clamp — #3720). An empty result is a
-// CLEAN CLOSE, exactly as `read`
-// reports it — an orderly end of stream, never an error. A timeout is a
-// `fail` whose message names it, so a caller distinguishes the two by
-// which one it got: a value back (even `""`) was never on the timeout path.
-export fn (c: Conn) readDeadline(max: int): string! {
-  if (max <= 0) {
-    return ""
-  }
-  let w = []byte(max)
-  let n = bit_rt_net_read_deadline_w(c.fd, ptrOf(w), max, c.deadlineNs)
-  if (n == 0 - 2) {
-    fail newError("read timed out")
-  }
-  if (n < 0) {
-    fail newError("read failed")
-  }
-  if (n == 0) {
-    return ""
-  }
-  return string(w[0:n])
-}
-
-// Write all of `s`, bounded by the connection's deadline. `()!` already, so
-// no new distinguishing shape is needed: a plain error is a hard I/O
-// failure, an error naming the timeout is the deadline elapsing first.
-export fn (c: Conn) writeDeadline(s: string): ()! {
-  let n = len(s)
-  if (n == 0) {
-    return
-  }
-  let w = []byte(n)
-  let i = 0
-  while (i < n) {
-    w[i] = s[i]
-    i = i + 1
-  }
-  let wrote = bit_rt_net_write_deadline_w(c.fd, ptrOf(w), n, c.deadlineNs)
-  if (wrote == 0 - 2) {
-    fail newError("write timed out")
-  }
-  if (wrote < 0) {
-    fail newError("write failed")
-  }
-}

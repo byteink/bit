@@ -50,7 +50,91 @@ const recordMaxCiphertext: int = 16640
 // the monotonic record `seq`. Fields are module-private — construct via
 // `newRecordKeys` and mutate only through the methods, so the sequence number
 // can never be desynchronised from the nonce it feeds.
-export class RecordKeys { suite: CipherSuite, secret: []byte, aead: Aead, iv: []byte, seq: int }
+export class RecordKeys {
+  suite: CipherSuite
+  secret: []byte
+  aead: Aead
+  iv: []byte
+  seq: int
+  // Protect `plaintext` as a `TLSCiphertext` record carrying inner `contentType`,
+  // returning the full on-the-wire record (5-byte header ‖ AEAD output) and
+  // advancing this direction's sequence number. FAILS if the fragment exceeds the
+  // 2^14 plaintext cap (RFC 8446 §5.2). No padding is added — the inner plaintext
+  // is `content ‖ contentType`.
+  export seal(plaintext: []byte, contentType: int): []byte! {
+    if (len(plaintext) > recordMaxPlaintext) {
+      fail newError("tls record: fragment of ${len(plaintext)} bytes exceeds the 2^14 plaintext limit")
+    }
+    let inner = recordInner(plaintext, contentType)
+    let cipherLen = len(inner) + this.aead.overhead()
+    let header = recordHeader(cipherLen)
+    let sealed = this.aead.seal(recordNonceBytes(this.iv, this.seq), inner, header)
+    this.seq = this.seq + 1
+    return recordConcat(header, sealed)
+  }
+
+  // Recover the inner content of a protected `record` (the full on-the-wire bytes,
+  // header included) and advance this direction's sequence number. FAILS — fatally,
+  // with no retry — on a truncated header, an over-long ciphertext (> 2^14 + 256),
+  // a header/length mismatch, or an AEAD authentication failure (`bad_record_mac`).
+  export open(record: []byte): RecordPlaintext! {
+    if (len(record) < 5) {
+      fail newError("tls record: truncated record header")
+    }
+    let cipherLen = (int(record[3]) << 8) | int(record[4])
+    if (cipherLen > recordMaxCiphertext) {
+      fail newError("tls record: ciphertext of ${cipherLen} bytes exceeds the 2^14+256 limit")
+    }
+    if (len(record) != 5 + cipherLen) {
+      fail newError("tls record: record length ${len(record)} does not match its ${cipherLen}-byte header")
+    }
+    let header = record[0:5]
+    let ciphertext = record[5:5 + cipherLen]
+    let inner = this.aead.open(recordNonceBytes(this.iv, this.seq), ciphertext, header) catch _ {
+      fail newError("tls record: bad_record_mac")
+    }
+    this.seq = this.seq + 1
+    // De-pad the AUTHENTICATED inner plaintext (RFC 8446 §5.2, §5.4): the real
+    // content type is the last non-zero octet; any trailing zeros are padding.
+    // This scan runs only on bytes the AEAD has already verified, so it is not a
+    // padding oracle.
+    let end = len(inner) - 1
+    while (end >= 0 && inner[end] == 0) {
+      end = end - 1
+    }
+    if (end < 0) {
+      fail newError("tls record: inner plaintext is all padding, no content type")
+    }
+    return RecordPlaintext{ content: inner[0:end], contentType: int(inner[end]) }
+  }
+
+  // Advance this direction to its next traffic key (RFC 8446 §7.2): derive
+  // `application_traffic_secret_{N+1}` with HKDF-Expand-Label(secret, "traffic upd",
+  // "", Hash.length), re-derive the AEAD key and IV from it, and reset the sequence
+  // number to zero. FAILS only if the suite rejects the re-derived key length.
+  export keyUpdate(): ()! {
+    let next = recordUpdateSecret(this.suite, this.secret)
+    let mk = () => tlsSuiteNewHash(this.suite)
+    let key = trafficKey(mk, next, this.suite.keyLen)
+    this.aead = tlsSuiteNewAead(this.suite, key)?
+    this.iv = trafficIV(mk, next, this.suite.ivLen)
+    this.secret = next
+    this.seq = 0
+  }
+
+  // This direction's current record sequence number — the counter the next `seal`
+  // or `open` will use, `0` on a fresh context or just after `keyUpdate`.
+  export sequence(): int {
+    return this.seq
+  }
+
+  // The AEAD nonce the next `seal`/`open` will use: the fixed IV XOR the current
+  // sequence number (RFC 8446 §5.3). Exposed for diagnostics and to observe nonce
+  // progression across records; the layer computes it internally per operation.
+  export nonce(): []byte {
+    return recordNonceBytes(this.iv, this.seq)
+  }
+}
 
 // The result of `open`: the recovered application-visible `content` and the
 // `contentType` that was hidden inside the protected record.
@@ -66,85 +150,6 @@ export fn newRecordKeys(suite: CipherSuite, secret: []byte): RecordKeys! {
   let iv = trafficIV(mk, secret, suite.ivLen)
   let aead = tlsSuiteNewAead(suite, key)?
   return RecordKeys{ suite: suite, secret: secret, aead: aead, iv: iv, seq: 0 }
-}
-
-// Protect `plaintext` as a `TLSCiphertext` record carrying inner `contentType`,
-// returning the full on-the-wire record (5-byte header ‖ AEAD output) and
-// advancing this direction's sequence number. FAILS if the fragment exceeds the
-// 2^14 plaintext cap (RFC 8446 §5.2). No padding is added — the inner plaintext
-// is `content ‖ contentType`.
-export fn (k: RecordKeys) seal(plaintext: []byte, contentType: int): []byte! {
-  if (len(plaintext) > recordMaxPlaintext) {
-    fail newError("tls record: fragment of ${len(plaintext)} bytes exceeds the 2^14 plaintext limit")
-  }
-  let inner = recordInner(plaintext, contentType)
-  let cipherLen = len(inner) + k.aead.overhead()
-  let header = recordHeader(cipherLen)
-  let sealed = k.aead.seal(recordNonceBytes(k.iv, k.seq), inner, header)
-  k.seq = k.seq + 1
-  return recordConcat(header, sealed)
-}
-
-// Recover the inner content of a protected `record` (the full on-the-wire bytes,
-// header included) and advance this direction's sequence number. FAILS — fatally,
-// with no retry — on a truncated header, an over-long ciphertext (> 2^14 + 256),
-// a header/length mismatch, or an AEAD authentication failure (`bad_record_mac`).
-export fn (k: RecordKeys) open(record: []byte): RecordPlaintext! {
-  if (len(record) < 5) {
-    fail newError("tls record: truncated record header")
-  }
-  let cipherLen = (int(record[3]) << 8) | int(record[4])
-  if (cipherLen > recordMaxCiphertext) {
-    fail newError("tls record: ciphertext of ${cipherLen} bytes exceeds the 2^14+256 limit")
-  }
-  if (len(record) != 5 + cipherLen) {
-    fail newError("tls record: record length ${len(record)} does not match its ${cipherLen}-byte header")
-  }
-  let header = record[0:5]
-  let ciphertext = record[5:5 + cipherLen]
-  let inner = k.aead.open(recordNonceBytes(k.iv, k.seq), ciphertext, header) catch _ {
-    fail newError("tls record: bad_record_mac")
-  }
-  k.seq = k.seq + 1
-  // De-pad the AUTHENTICATED inner plaintext (RFC 8446 §5.2, §5.4): the real
-  // content type is the last non-zero octet; any trailing zeros are padding.
-  // This scan runs only on bytes the AEAD has already verified, so it is not a
-  // padding oracle.
-  let end = len(inner) - 1
-  while (end >= 0 && inner[end] == 0) {
-    end = end - 1
-  }
-  if (end < 0) {
-    fail newError("tls record: inner plaintext is all padding, no content type")
-  }
-  return RecordPlaintext{ content: inner[0:end], contentType: int(inner[end]) }
-}
-
-// Advance this direction to its next traffic key (RFC 8446 §7.2): derive
-// `application_traffic_secret_{N+1}` with HKDF-Expand-Label(secret, "traffic upd",
-// "", Hash.length), re-derive the AEAD key and IV from it, and reset the sequence
-// number to zero. FAILS only if the suite rejects the re-derived key length.
-export fn (k: RecordKeys) keyUpdate(): ()! {
-  let next = recordUpdateSecret(k.suite, k.secret)
-  let mk = () => tlsSuiteNewHash(k.suite)
-  let key = trafficKey(mk, next, k.suite.keyLen)
-  k.aead = tlsSuiteNewAead(k.suite, key)?
-  k.iv = trafficIV(mk, next, k.suite.ivLen)
-  k.secret = next
-  k.seq = 0
-}
-
-// This direction's current record sequence number — the counter the next `seal`
-// or `open` will use, `0` on a fresh context or just after `keyUpdate`.
-export fn (k: RecordKeys) sequence(): int {
-  return k.seq
-}
-
-// The AEAD nonce the next `seal`/`open` will use: the fixed IV XOR the current
-// sequence number (RFC 8446 §5.3). Exposed for diagnostics and to observe nonce
-// progression across records; the layer computes it internally per operation.
-export fn (k: RecordKeys) nonce(): []byte {
-  return recordNonceBytes(k.iv, k.seq)
 }
 
 // The per-record nonce (RFC 8446 §5.3): the fixed `iv` XORed with `seq` encoded

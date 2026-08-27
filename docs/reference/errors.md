@@ -89,7 +89,13 @@ fn loadCount(path: string): int! {
   `fail`, `panic`, `break`, or `continue`.
 
 ```bit
-class Config { export port: int }
+class Config {
+  export port: int
+
+  valid(): bool {
+    return this.port > 0
+  }
+}
 
 fn defaults(): Config {
   return Config{ port: 8080 }
@@ -97,10 +103,6 @@ fn defaults(): Config {
 
 fn parseConfig(text: string): Config! {
   return Config{ port: parsePort(text)? }
-}
-
-fn (c: Config) valid(): bool {
-  return c.port > 0
 }
 
 fn loadConfig(path: string): Config! {

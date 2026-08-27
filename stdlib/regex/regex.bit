@@ -40,13 +40,256 @@ import { envOr } from "std/os"
 // array — one entry per capturing group, index order, `""` for an unnamed
 // one — built once here too, alongside `prog`.
 export class Regex {
-  source: string,
-  ast: Ast,
-  groups: int,
-  prog: Prog,
-  names: []string,
-  prefilter: Prefilter,
-  selfCheck: bool,
+  source: string
+  ast: Ast
+  groups: int
+  prog: Prog
+  names: []string
+  prefilter: Prefilter
+  selfCheck: bool
+
+  // `re`'s source pattern, verbatim — exactly the string `compile` was given.
+  export pattern(): string {
+    return this.source
+  }
+
+  // The number of capturing groups in `re` — `(...)` and the two named-group
+  // forms, not counting the implicit whole-match group 0, and not counting a
+  // non-capturing `(?:...)`.
+  export groupCount(): int {
+    return this.groups
+  }
+
+  // One entry per capturing group in `re`'s pattern, in index order —
+  // `groupNames()[0]` is group 1's name — `""` for a group with no name
+  // (`(...)`); a non-capturing `(?:...)` never gets an entry, since it never
+  // gets an index either. `len(re.groupNames()) == re.groupCount()` always
+  // holds. Returns a fresh copy every call, never `re.names` itself: `re` is
+  // immutable and shared across green threads (this file's header), so no
+  // caller may ever be handed a reference it could mutate out from under a
+  // concurrent one.
+  export groupNames(): []string {
+    let out = []string(len(this.names))
+    let i = 0
+    while (i < len(this.names)) {
+      out[i] = this.names[i]
+      i = i + 1
+    }
+    return out
+  }
+
+  // Whether `re`'s pattern matches anywhere in `s` — an unanchored search, the
+  // same convention as Go's `regexp.MatchString`: use `^`/`$` in the pattern
+  // itself for a whole-string match. Runs `re.prog` with a Pike VM
+  // (`pike.bit`): exactly one left-to-right pass over `s`, so this always
+  // finishes in O(len(s) x len(re's program)) time — there is no
+  // backtracking, so no pattern and no input can make it exponential.
+  export matches(s: string): bool {
+    let (matched, _) = searchRegex(this, s, 0, newPikeScratch(this.prog))
+    return matched
+  }
+
+  // The leftmost-first match of `re`'s pattern anywhere in `s`, or
+  // `Option.None` when there is none — an unanchored search, same convention
+  // as `matches`.
+  export find(s: string): Option<Match> {
+    let (matched, slots) = searchRegex(this, s, 0, newPikeScratch(this.prog))
+    if (!matched) {
+      return Option.None
+    }
+    return Option.Some(Match{ start: slots[0], end: slots[1], slots: slots, names: this.names })
+  }
+
+  // Successive non-overlapping matches of `re`'s pattern in `s`, scanning left
+  // to right. `limit < 0` means no limit; `limit == 0` returns an empty slice;
+  // otherwise at most `limit` matches.
+  //
+  // After a match, the next search starts at its end offset — except when the
+  // match is empty AND starts exactly at the position this search began from
+  // (`end == pos`; see `nextSearchPos`), where the next search starts one RUNE
+  // later instead of one byte later, so a multi-byte character is never
+  // split. Without that rule `findAll("a*", "bb")` never terminates; with it,
+  // `a*` over `"bb"` yields three empty matches, at byte offsets 0, 1 and 2.
+  //
+  // A SECOND, independent rule sits alongside the advance rule, mirroring
+  // Go's `regexp.go` (`(*Regexp).matches`, go1.27.0 regexp.go:747-800) exactly:
+  // an empty match found at the search origin `pos` is rejected — never
+  // appended to `out` — when it starts right where the immediately preceding
+  // ACCEPTED match ended (`start == prevMatchEnd`, Go's `matches[0] ==
+  // prevMatchEnd` at line 768). That is what stops `".*"` over `"abcdef"`
+  // from reporting a spurious second, empty match `[6,6)` right after
+  // `[0,6)`: Go's own `findTests` never reports that echo. The rune-advance
+  // rule still fires whether or not the match was accepted — REJECTING a
+  // match must not also skip advancing, or the loop can re-find the exact
+  // same rejected match forever.
+  //
+  // The loop below is bounded independently of both rules, at `len(s) + 1`
+  // iterations (`pos` strictly increases every pass, by at least one rune,
+  // whether or not the match found that pass is accepted), so a bug in
+  // either rule can never hang a caller.
+  //
+  // ONE VM scratch for the whole scan (#3659), made here and threaded through
+  // every `searchRegex` below. It is a local of this call — never a field on
+  // `re`, which is shared and immutable — so a concurrent `findAll` on the
+  // same `Regex` gets its own. The `Match`es accumulated in `out` are NOT
+  // views into it: each carries the `snapshotSlots` array its own winning
+  // thread produced (`pike.bit`), so resetting the scratch for the next
+  // search cannot reach back and alter a match already collected.
+  export findAll(s: string, limit: int): []Match {
+    let out: []Match = []Match(0)
+    if (limit == 0) {
+      return out
+    }
+    let sc = newPikeScratch(this.prog)
+    let n = len(s)
+    let pos = 0
+    let prevMatchEnd = -1
+    let i = 0
+    while (pos <= n && i <= n) {
+      if (limit > 0 && len(out) >= limit) {
+        return out
+      }
+      let (matched, slots) = searchRegex(this, s, pos, sc)
+      if (!matched) {
+        return out
+      }
+      let start = slots[0]
+      let end = slots[1]
+      let accept = !(end == pos && start == prevMatchEnd)
+      if (accept) {
+        out = append(out, Match{ start: start, end: end, slots: slots, names: this.names })
+      }
+      prevMatchEnd = end
+      pos = nextSearchPos(s, pos, end)
+      i = i + 1
+    }
+    return out
+  }
+
+  // The text between successive non-overlapping matches of `re`'s pattern in
+  // `s`, using `findAll`'s exact scan (the same one-rune advance after a
+  // zero-width match, and the same echo-rejection right after a real match —
+  // this function adds nothing to that scan, it only slices around whatever
+  // `findAll` finds). `limit < 0` is unlimited pieces; `limit == 0` returns an
+  // empty slice with no scanning at all; `limit > 0` returns at most `limit`
+  // pieces, the last one holding the entire unsplit remainder of `s` — found
+  // by calling `findAll(s, limit)` (which itself returns at most `limit`
+  // matches) and then, mirroring Go's own `(*Regexp).Split` loop (go1.27.0,
+  // regexp.go:1291-1312) exactly, stopping one match early once `limit - 1`
+  // pieces have been produced, so the final piece always absorbs the rest —
+  // matches included — rather than truncating it.
+  //
+  // A pattern whose SOURCE TEXT is non-empty, applied to an empty subject, is
+  // a hardcoded special case in Go's own implementation and reproduced here
+  // verbatim: it always returns a single empty piece, `[""]`, without
+  // scanning at all — never zero pieces, regardless of whether the pattern
+  // could itself match the empty string. `split("", "")` (an empty PATTERN on
+  // an empty subject) does not hit this case and falls through to the
+  // general logic below, which independently yields zero pieces for it (see
+  // the next paragraph) — the two both happen to avoid `[""]`, but by
+  // entirely different mechanisms.
+  //
+  // THE TRAP: a match that is BOTH zero-width AND sits exactly at the
+  // position a piece would start from — offset 0 for the very first match,
+  // `len(s)` for the very last — does NOT produce the empty piece a plain
+  // "every match boundary gets a piece" reading would suggest, exactly
+  // mirroring Go's `if match[1] != 0` (leading) and `if end != len(s)`
+  // (trailing) guards. Concretely, `split("", "abc", -1)` — the empty
+  // pattern matches at every rune boundary, 0/1/2/3 — yields `["a","b","c"]`,
+  // three pieces, not five: the zero-width matches sitting exactly at 0 and
+  // 3 are this degenerate case, while the ones at 1 and 2 sit strictly
+  // between real content and behave normally. A NON-empty match at offset 0
+  // (e.g. splitting ",ab" on ",") still produces its leading empty piece —
+  // the suppression is specific to a zero-width match, never to "any match
+  // at offset 0".
+  export split(s: string, limit: int): []string {
+    if (limit == 0) {
+      return []string(0)
+    }
+    if (len(s) == 0 && len(this.source) > 0) {
+      let single: []string = []string(0)
+      return append(single, "")
+    }
+    let matches = this.findAll(s, limit)
+    let out: []string = []string(0)
+    let beg = 0
+    let lastStart = 0
+    let pieceCap = limit - 1
+    let i = 0
+    let total = len(matches)
+    // Bounded by `len(matches)`, itself bounded by `findAll`'s own
+    // `len(s) + 1` iteration cap — a bug in either rule above can never hang
+    // a caller.
+    while (i < total) {
+      if (limit > 0 && len(out) >= pieceCap) {
+        break
+      }
+      let m = matches[i]
+      lastStart = m.start
+      if (m.end != 0) {
+        out = append(out, s[beg:lastStart])
+      }
+      beg = m.end
+      i = i + 1
+    }
+    if (lastStart != len(s)) {
+      out = append(out, s[beg:len(s)])
+    }
+    return out
+  }
+
+  // The leftmost non-overlapping matches of `re`'s pattern in `s`, each
+  // replaced by `repl` with its own `$`-template expanded against that
+  // match's capture groups (see the module doc comment above for the exact
+  // grammar). Text between matches, and any text after the last one, is
+  // copied through unchanged. A pattern that never matches returns `s`
+  // itself, unchanged.
+  export replaceAll(s: string, repl: string): string {
+    let b = newBuilder()
+    let n = len(s)
+    let pos = 0
+    let written = 0
+    let prevMatchEnd = -1
+    let i = 0
+    // One scratch for the whole scan, reused every pass (#3659) — `findAll`
+    // does the same, and this loop otherwise mirrors it exactly.
+    let sc = newPikeScratch(this.prog)
+    // Bounded by len(s) + 1 iterations: `pos` strictly increases every pass,
+    // by at least one rune, whether or not the match found that pass is
+    // accepted — identical termination argument to `findAll` (regex.bit),
+    // which this loop otherwise mirrors exactly.
+    while (pos <= n && i <= n) {
+      let (matched, slots) = searchRegex(this, s, pos, sc)
+      if (!matched) {
+        break
+      }
+      let start = slots[0]
+      let end = slots[1]
+      let accept = !(end == pos && start == prevMatchEnd)
+      if (accept) {
+        b = b.write(s[written:start])
+        let m = Match{ start: start, end: end, slots: slots, names: this.names }
+        b = expandTemplate(b, repl, m, s)
+        written = end
+      }
+      prevMatchEnd = end
+      pos = nextSearchPos(s, pos, end)
+      i = i + 1
+    }
+    b = b.write(s[written:n])
+    return b.toString()
+  }
+
+  // The leftmost match of `re`'s pattern in `s`, replaced by `repl` with its
+  // `$`-template expanded against that match's capture groups. Every other
+  // match, if any, is left untouched. Returns `s` unchanged when there is no
+  // match at all.
+  export replaceFirst(s: string, repl: string): string {
+    return match (this.find(s)) {
+      Some(m) => buildReplaceFirst(s, repl, m)
+      None => s
+    }
+  }
 }
 
 // Parses `pattern` and returns a validated `Regex`, or fails with a
@@ -152,47 +395,6 @@ export fn mustCompile(pattern: string): Regex {
   }
 }
 
-// `re`'s source pattern, verbatim — exactly the string `compile` was given.
-export fn (re: Regex) pattern(): string {
-  return re.source
-}
-
-// The number of capturing groups in `re` — `(...)` and the two named-group
-// forms, not counting the implicit whole-match group 0, and not counting a
-// non-capturing `(?:...)`.
-export fn (re: Regex) groupCount(): int {
-  return re.groups
-}
-
-// One entry per capturing group in `re`'s pattern, in index order —
-// `groupNames()[0]` is group 1's name — `""` for a group with no name
-// (`(...)`); a non-capturing `(?:...)` never gets an entry, since it never
-// gets an index either. `len(re.groupNames()) == re.groupCount()` always
-// holds. Returns a fresh copy every call, never `re.names` itself: `re` is
-// immutable and shared across green threads (this file's header), so no
-// caller may ever be handed a reference it could mutate out from under a
-// concurrent one.
-export fn (re: Regex) groupNames(): []string {
-  let out = []string(len(re.names))
-  let i = 0
-  while (i < len(re.names)) {
-    out[i] = re.names[i]
-    i = i + 1
-  }
-  return out
-}
-
-// Whether `re`'s pattern matches anywhere in `s` — an unanchored search, the
-// same convention as Go's `regexp.MatchString`: use `^`/`$` in the pattern
-// itself for a whole-string match. Runs `re.prog` with a Pike VM
-// (`pike.bit`): exactly one left-to-right pass over `s`, so this always
-// finishes in O(len(s) x len(re's program)) time — there is no
-// backtracking, so no pattern and no input can make it exponential.
-export fn (re: Regex) matches(s: string): bool {
-  let (matched, _) = searchRegex(re, s, 0, newPikeScratch(re.prog))
-  return matched
-}
-
 // A single match: `start`/`end` are byte offsets into the subject string —
 // never rune indices, so they are usable directly as `s[m.start:m.end]`
 // slice bounds. `slots` holds every capture group's start/end pair the
@@ -201,128 +403,55 @@ export fn (re: Regex) matches(s: string): bool {
 // along so `named` can resolve a name without a separate `Regex` argument
 // (this ticket's `Match.named(name: string)` signature takes only a name).
 // Both stay module-private — `group`/`named` below are the only readers.
-export class Match { export start: int, export end: int, slots: []int, names: []string }
+export class Match {
+  export start: int
+  export end: int
+  slots: []int
+  names: []string
+  // The substring of `s` this match covers, `s[m.start:m.end]`. `s` must be
+  // the same string (or an identical copy) `find`/`findAll` matched against —
+  // `m.start`/`m.end` are byte offsets into it, not into an arbitrary string.
+  export text(s: string): string {
+    return s[this.start:this.end]
+  }
 
-// The substring of `s` this match covers, `s[m.start:m.end]`. `s` must be
-// the same string (or an identical copy) `find`/`findAll` matched against —
-// `m.start`/`m.end` are byte offsets into it, not into an arbitrary string.
-export fn (m: Match) text(s: string): string {
-  return s[m.start:m.end]
-}
+  // `m`'s `i`-th capturing group: `group(0)` is the whole match, always
+  // `Option.Some` — it is how `m` itself was produced. `Option.None` for `i`
+  // out of range (`i < 0`, or past the pattern's own group count), and
+  // `Option.None` for a capturing group that took no part in this particular
+  // match, e.g. the untaken branch of `(a)|(b)` — distinct from a group that
+  // matched the empty string, which is `Option.Some` with `start == end`
+  // (`m.slots` holds `-1` in both halves of a slot pair no `Save` reached;
+  // `pike.bit`'s header). `2 * i + 1 >= len(m.slots)` catches both `i` too
+  // large and (defensively) a negative `i` reaching this far, though the
+  // explicit `i < 0` check above already rejects the latter.
+  export group(i: int): Option<Match> {
+    if (i < 0 || 2 * i + 1 >= len(this.slots)) {
+      return Option.None
+    }
+    let start = this.slots[2 * i]
+    let end = this.slots[2 * i + 1]
+    if (start < 0 || end < 0) {
+      return Option.None
+    }
+    return Option.Some(Match{ start: start, end: end, slots: this.slots, names: this.names })
+  }
 
-// `m`'s `i`-th capturing group: `group(0)` is the whole match, always
-// `Option.Some` — it is how `m` itself was produced. `Option.None` for `i`
-// out of range (`i < 0`, or past the pattern's own group count), and
-// `Option.None` for a capturing group that took no part in this particular
-// match, e.g. the untaken branch of `(a)|(b)` — distinct from a group that
-// matched the empty string, which is `Option.Some` with `start == end`
-// (`m.slots` holds `-1` in both halves of a slot pair no `Save` reached;
-// `pike.bit`'s header). `2 * i + 1 >= len(m.slots)` catches both `i` too
-// large and (defensively) a negative `i` reaching this far, though the
-// explicit `i < 0` check above already rejects the latter.
-export fn (m: Match) group(i: int): Option<Match> {
-  if (i < 0 || 2 * i + 1 >= len(m.slots)) {
+  // `m.group(i)` for whichever `i` `m`'s pattern gave `name` to —
+  // `Option.None` for a name the pattern never declared, same as an
+  // out-of-range `group` index. Looks the name up in `m.names` (a copy of
+  // `Regex.names`, carried on `m` since the ticket's signature takes no
+  // separate `Regex` argument), bounded by `len(m.names) == groupCount()`.
+  export named(name: string): Option<Match> {
+    let i = 0
+    while (i < len(this.names)) {
+      if (this.names[i] == name) {
+        return this.group(i + 1)
+      }
+      i = i + 1
+    }
     return Option.None
   }
-  let start = m.slots[2 * i]
-  let end = m.slots[2 * i + 1]
-  if (start < 0 || end < 0) {
-    return Option.None
-  }
-  return Option.Some(Match{ start: start, end: end, slots: m.slots, names: m.names })
-}
-
-// `m.group(i)` for whichever `i` `m`'s pattern gave `name` to —
-// `Option.None` for a name the pattern never declared, same as an
-// out-of-range `group` index. Looks the name up in `m.names` (a copy of
-// `Regex.names`, carried on `m` since the ticket's signature takes no
-// separate `Regex` argument), bounded by `len(m.names) == groupCount()`.
-export fn (m: Match) named(name: string): Option<Match> {
-  let i = 0
-  while (i < len(m.names)) {
-    if (m.names[i] == name) {
-      return m.group(i + 1)
-    }
-    i = i + 1
-  }
-  return Option.None
-}
-
-// The leftmost-first match of `re`'s pattern anywhere in `s`, or
-// `Option.None` when there is none — an unanchored search, same convention
-// as `matches`.
-export fn (re: Regex) find(s: string): Option<Match> {
-  let (matched, slots) = searchRegex(re, s, 0, newPikeScratch(re.prog))
-  if (!matched) {
-    return Option.None
-  }
-  return Option.Some(Match{ start: slots[0], end: slots[1], slots: slots, names: re.names })
-}
-
-// Successive non-overlapping matches of `re`'s pattern in `s`, scanning left
-// to right. `limit < 0` means no limit; `limit == 0` returns an empty slice;
-// otherwise at most `limit` matches.
-//
-// After a match, the next search starts at its end offset — except when the
-// match is empty AND starts exactly at the position this search began from
-// (`end == pos`; see `nextSearchPos`), where the next search starts one RUNE
-// later instead of one byte later, so a multi-byte character is never
-// split. Without that rule `findAll("a*", "bb")` never terminates; with it,
-// `a*` over `"bb"` yields three empty matches, at byte offsets 0, 1 and 2.
-//
-// A SECOND, independent rule sits alongside the advance rule, mirroring
-// Go's `regexp.go` (`(*Regexp).matches`, go1.27.0 regexp.go:747-800) exactly:
-// an empty match found at the search origin `pos` is rejected — never
-// appended to `out` — when it starts right where the immediately preceding
-// ACCEPTED match ended (`start == prevMatchEnd`, Go's `matches[0] ==
-// prevMatchEnd` at line 768). That is what stops `".*"` over `"abcdef"`
-// from reporting a spurious second, empty match `[6,6)` right after
-// `[0,6)`: Go's own `findTests` never reports that echo. The rune-advance
-// rule still fires whether or not the match was accepted — REJECTING a
-// match must not also skip advancing, or the loop can re-find the exact
-// same rejected match forever.
-//
-// The loop below is bounded independently of both rules, at `len(s) + 1`
-// iterations (`pos` strictly increases every pass, by at least one rune,
-// whether or not the match found that pass is accepted), so a bug in
-// either rule can never hang a caller.
-//
-// ONE VM scratch for the whole scan (#3659), made here and threaded through
-// every `searchRegex` below. It is a local of this call — never a field on
-// `re`, which is shared and immutable — so a concurrent `findAll` on the
-// same `Regex` gets its own. The `Match`es accumulated in `out` are NOT
-// views into it: each carries the `snapshotSlots` array its own winning
-// thread produced (`pike.bit`), so resetting the scratch for the next
-// search cannot reach back and alter a match already collected.
-export fn (re: Regex) findAll(s: string, limit: int): []Match {
-  let out: []Match = []Match(0)
-  if (limit == 0) {
-    return out
-  }
-  let sc = newPikeScratch(re.prog)
-  let n = len(s)
-  let pos = 0
-  let prevMatchEnd = -1
-  let i = 0
-  while (pos <= n && i <= n) {
-    if (limit > 0 && len(out) >= limit) {
-      return out
-    }
-    let (matched, slots) = searchRegex(re, s, pos, sc)
-    if (!matched) {
-      return out
-    }
-    let start = slots[0]
-    let end = slots[1]
-    let accept = !(end == pos && start == prevMatchEnd)
-    if (accept) {
-      out = append(out, Match{ start: start, end: end, slots: slots, names: re.names })
-    }
-    prevMatchEnd = end
-    pos = nextSearchPos(s, pos, end)
-    i = i + 1
-  }
-  return out
 }
 
 // Where `findAll`'s next search should start, given the position `pos` this
@@ -349,78 +478,6 @@ fn nextSearchPos(s: string, pos: int, end: int): int {
   }
   let (_, width) = decodeRuneAt(s, pos)
   return pos + width
-}
-
-// The text between successive non-overlapping matches of `re`'s pattern in
-// `s`, using `findAll`'s exact scan (the same one-rune advance after a
-// zero-width match, and the same echo-rejection right after a real match —
-// this function adds nothing to that scan, it only slices around whatever
-// `findAll` finds). `limit < 0` is unlimited pieces; `limit == 0` returns an
-// empty slice with no scanning at all; `limit > 0` returns at most `limit`
-// pieces, the last one holding the entire unsplit remainder of `s` — found
-// by calling `findAll(s, limit)` (which itself returns at most `limit`
-// matches) and then, mirroring Go's own `(*Regexp).Split` loop (go1.27.0,
-// regexp.go:1291-1312) exactly, stopping one match early once `limit - 1`
-// pieces have been produced, so the final piece always absorbs the rest —
-// matches included — rather than truncating it.
-//
-// A pattern whose SOURCE TEXT is non-empty, applied to an empty subject, is
-// a hardcoded special case in Go's own implementation and reproduced here
-// verbatim: it always returns a single empty piece, `[""]`, without
-// scanning at all — never zero pieces, regardless of whether the pattern
-// could itself match the empty string. `split("", "")` (an empty PATTERN on
-// an empty subject) does not hit this case and falls through to the
-// general logic below, which independently yields zero pieces for it (see
-// the next paragraph) — the two both happen to avoid `[""]`, but by
-// entirely different mechanisms.
-//
-// THE TRAP: a match that is BOTH zero-width AND sits exactly at the
-// position a piece would start from — offset 0 for the very first match,
-// `len(s)` for the very last — does NOT produce the empty piece a plain
-// "every match boundary gets a piece" reading would suggest, exactly
-// mirroring Go's `if match[1] != 0` (leading) and `if end != len(s)`
-// (trailing) guards. Concretely, `split("", "abc", -1)` — the empty
-// pattern matches at every rune boundary, 0/1/2/3 — yields `["a","b","c"]`,
-// three pieces, not five: the zero-width matches sitting exactly at 0 and
-// 3 are this degenerate case, while the ones at 1 and 2 sit strictly
-// between real content and behave normally. A NON-empty match at offset 0
-// (e.g. splitting ",ab" on ",") still produces its leading empty piece —
-// the suppression is specific to a zero-width match, never to "any match
-// at offset 0".
-export fn (re: Regex) split(s: string, limit: int): []string {
-  if (limit == 0) {
-    return []string(0)
-  }
-  if (len(s) == 0 && len(re.source) > 0) {
-    let single: []string = []string(0)
-    return append(single, "")
-  }
-  let matches = re.findAll(s, limit)
-  let out: []string = []string(0)
-  let beg = 0
-  let lastStart = 0
-  let pieceCap = limit - 1
-  let i = 0
-  let total = len(matches)
-  // Bounded by `len(matches)`, itself bounded by `findAll`'s own
-  // `len(s) + 1` iteration cap — a bug in either rule above can never hang
-  // a caller.
-  while (i < total) {
-    if (limit > 0 && len(out) >= pieceCap) {
-      break
-    }
-    let m = matches[i]
-    lastStart = m.start
-    if (m.end != 0) {
-      out = append(out, s[beg:lastStart])
-    }
-    beg = m.end
-    i = i + 1
-  }
-  if (lastStart != len(s)) {
-    out = append(out, s[beg:len(s)])
-  }
-  return out
 }
 
 // The number of capturing groups in `ast`, walked once at `compile` time so

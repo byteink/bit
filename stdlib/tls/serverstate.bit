@@ -1,0 +1,174 @@
+// Bit standard library — std/tls, the server's configuration and connection
+// state types: `TlsServerConfig`, its PEM-loading helpers, `TlsServerStep` and
+// `TlsServerConn`. Split out of `server.bit` (#3762 receiver-form sweep, which
+// grew `server.bit` past the 800-line file-size limit by consolidating
+// `TlsServerConn`'s methods — previously spread across `serverflight.bit` via
+// the receiver form — into its class body). Module-wide imports (std/tls is
+// one flat module): this file uses `RsaPrivateKey`, `rsaParsePrivateKey`,
+// `rsaParsePkcs1PrivateKey` and `PemBlock`, all imported by `server.bit`.
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+// A server handshake configuration: the certificate `chain` (raw DER, end-entity
+// certificate first), the RSA private `key` matching the leaf, the ALPN protocols
+// the server supports (preference order), the acceptable key-exchange `groups`
+// (preference order), and the acceptable cipher `suites` (preference order).
+// Build one from PEM with `newTlsServerConfig`.
+export class TlsServerConfig {
+  export chain: [][]byte,
+  export key: RsaPrivateKey,
+  export alpn: []string,
+  export groups: []TlsGroup,
+  export suites: []int,
+  // Session resumption (#1209): the server-lifetime ticket store
+  // `TlsServerHandshake.processClientHello` looks tickets up in and
+  // `TlsServerConn.issueTicket` writes into. Shared across every handshake run
+  // from this config — `newTlsServerConfig` gives each config its own store.
+  export tickets: TlsTicketStore,
+  // Whether this server accepts 0-RTT early data on a resumed handshake
+  // (RFC 8446 §2.3, §4.6.1). Off does not disable resumption itself — only
+  // early data; a PSK-DHE handshake still skips Certificate/CertificateVerify.
+  export allowEarlyData: bool,
+}
+
+// The server's default group preference: the post-quantum hybrid first, then the
+// classical curves. A group is only used when the client actually shares it, so
+// listing the hybrid first simply prefers it when present.
+fn srvDefaultGroups(): []TlsGroup {
+  return [TlsGroup.X25519MLKEM768, TlsGroup.X25519, TlsGroup.Secp256r1, TlsGroup.Secp384r1]
+}
+
+// The server's default cipher-suite preference, strongest first.
+fn srvDefaultSuites(): []int {
+  return [TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256, TLS_AES_128_GCM_SHA256]
+}
+
+// A `TlsServerConfig` from PEM: `certChainPem` is one or more concatenated
+// `CERTIFICATE` blocks (end-entity certificate first), `keyPem` is the leaf's RSA
+// private key as a `PRIVATE KEY` (PKCS#8) or `RSA PRIVATE KEY` (PKCS#1) block, and
+// `alpn` is the supported protocol list. Fails on malformed PEM, an empty chain,
+// or a private key this parser cannot read. Groups and suites default to the full
+// supported sets.
+export fn newTlsServerConfig(
+  certChainPem: string,
+  keyPem: string,
+  alpn: []string,
+): TlsServerConfig! {
+  let certBlocks = pemDecode(certChainPem)?
+  let chain = [][]byte(0)
+  for b of certBlocks {
+    if (b.label == "CERTIFICATE") {
+      chain = append(chain, b.der)
+    }
+  }
+  if (len(chain) == 0) {
+    fail newError("tls server: certificate chain has no CERTIFICATE blocks")
+  }
+  let keyBlocks = pemDecode(keyPem)?
+  let key = srvParsePrivateKey(keyBlocks[0])?
+  return TlsServerConfig{
+    chain: chain,
+    key: key,
+    alpn: alpn,
+    groups: srvDefaultGroups(),
+    suites: srvDefaultSuites(),
+    tickets: newTicketStore(),
+    allowEarlyData: true,
+  }
+}
+
+// Parse an RSA private key from a PEM block, dispatching on its label: PKCS#8
+// (`PRIVATE KEY`) or PKCS#1 (`RSA PRIVATE KEY`). Fails on any other label.
+fn srvParsePrivateKey(block: PemBlock): RsaPrivateKey! {
+  if (block.label == "PRIVATE KEY") {
+    return rsaParsePrivateKey(block.der)?
+  }
+  if (block.label == "RSA PRIVATE KEY") {
+    return rsaParsePkcs1PrivateKey(block.der)?
+  }
+  fail newError("tls server: unsupported private-key PEM label ${block.label}")
+}
+
+// ---------------------------------------------------------------------------
+// Handshake state and results
+// ---------------------------------------------------------------------------
+
+// One step of the server handshake from `processClientHello`. `retry` means a
+// HelloRetryRequest was produced; send `outbound` and feed the next ClientHello
+// back in. Otherwise `outbound` is the ServerHello plus the encrypted
+// authentication flight, after which `processClientFinished` completes the
+// handshake.
+export class TlsServerStep { export retry: bool, export outbound: []byte }
+
+// A completed server connection: the negotiated parameters and the two
+// application-data record contexts. Obtain it from `processClientFinished`.
+export class TlsServerConn {
+  suite: CipherSuite
+  alpn: string
+  appWrite: RecordKeys
+  appRead: RecordKeys
+  exporter: []byte
+  resumption: []byte
+  // Session resumption (#1209): carried from `TlsServerConfig` so `issueTicket`
+  // needs no arguments — the store and the early-data policy travel with the
+  // connection they came from.
+  tickets: TlsTicketStore
+  allowEarlyData: bool
+
+  // Issue a NewSessionTicket for this connection: mint fresh ticket and nonce
+  // bytes, record the session (resumption secret, suite, whether 0-RTT is
+  // allowed on it) in the ticket store this connection's config carries, and
+  // return the sealed post-handshake record to send. The caller decides when —
+  // and whether — to call this, same as `sealApp`; a server that never calls it
+  // simply never offers resumption.
+  export issueTicket(): []byte! {
+    let ticket = randomBytes(32)
+    let nonce = randomBytes(8)
+    this.tickets.sessions[string(ticket)] = TlsServerSession{
+      resumptionSecret: this.resumption,
+      nonce: nonce,
+      suiteId: this.suite.id,
+      allowEarlyData: this.allowEarlyData,
+    }
+    let exts = []Extension(0)
+    if (this.allowEarlyData) {
+      exts = append(exts, extEarlyDataMaxSize(resumeMaxEarlyData))
+    }
+    let nst = NewSessionTicket{
+      lifetime: resumeTicketLifetimeSec,
+      ageAdd: resumeRandomU32(),
+      nonce: nonce,
+      ticket: ticket,
+      extensions: exts,
+    }
+    return this.appWrite.seal(encodeNewSessionTicket(nst), recordHandshake)?
+  }
+
+  // The negotiated cipher suite's IANA code point.
+  export cipherSuiteId(): int { return this.suite.id }
+
+  // The ALPN protocol negotiated with the client, or "" if none.
+  export alpnProtocol(): string { return this.alpn }
+
+  // The exporter_master_secret (RFC 8446 §7.5) for exported keying material.
+  export exporterSecret(): []byte { return this.exporter }
+
+  // The resumption_master_secret (RFC 8446 §7.1) for issuing session tickets.
+  export resumptionSecret(): []byte { return this.resumption }
+
+  // Seal `plaintext` as one outbound application_data record under the server's
+  // application-traffic key, advancing its sequence number. Fails if the fragment
+  // exceeds the 2^14 record limit.
+  export sealApp(plaintext: []byte): []byte! {
+    return this.appWrite.seal(plaintext, recordApplicationData)?
+  }
+
+  // Open one inbound protected record under the client's application-traffic key,
+  // returning the recovered content and its inner type. Fails fatally on an
+  // authentication failure.
+  export openApp(record: []byte): RecordPlaintext! {
+    return this.appRead.open(record)?
+  }
+}

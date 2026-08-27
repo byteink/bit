@@ -23,13 +23,17 @@ Any type with the required methods satisfies the interface. Satisfaction is
 checked where a value is used as the interface, not at declaration.
 
 ```bit
-class Circle { export r: f64 }
-class Rect   { export w: f64; export h: f64 }
-
-fn (c: Circle) area(): f64      { return 3.14159 * c.r * c.r }
-fn (c: Circle) perimeter(): f64 { return 2.0 * 3.14159 * c.r }
-fn (r: Rect)   area(): f64      { return r.w * r.h }
-fn (r: Rect)   perimeter(): f64 { return 2.0 * (r.w + r.h) }
+class Circle {
+  export r: f64
+  area(): f64      { return 3.14159 * this.r * this.r }
+  perimeter(): f64 { return 2.0 * 3.14159 * this.r }
+}
+class Rect {
+  export w: f64
+  export h: f64
+  area(): f64      { return this.w * this.h }
+  perimeter(): f64 { return 2.0 * (this.w + this.h) }
+}
 
 fn describe(s: Shape): f64 {     // takes anything satisfying Shape
   return s.area()

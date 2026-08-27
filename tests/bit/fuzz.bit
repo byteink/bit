@@ -326,6 +326,136 @@ class Runner {
   crashesDir: string
   timeoutMs: int
   hangMs: int
+
+  runFor(budgetMs: int): Attempt {
+    let start = monotonic()
+    let rc = osRunBounded(this.script, budgetMs)
+    return Attempt{ rc: rc, ms: since(start) / Millisecond }
+  }
+
+  // The budget for a seed whose confirmed-terminating high-water mark is
+  // `observedMs` (0 before any mutant of it has been adjudicated).
+  budgetFor(observedMs: int): int {
+    let b = observedMs * hangFactor
+    if (b < this.timeoutMs) {
+      b = this.timeoutMs
+    }
+    if (b > this.hangMs) {
+      b = this.hangMs
+    }
+    return b
+  }
+
+  // Re-runs the bytes already in `r.work` against the ceiling. Both outcomes are
+  // printed: an adjudication that stayed silent is how a false artifact became
+  // something two people deleted by hand instead of a thing anyone noticed.
+  adjudicate(what: string, firstMs: int): Slow {
+    print("slow: ${what} did not finish in ${firstMs}ms; re-running once against the ${this.hangMs}ms non-termination ceiling\n")
+    let a = this.runFor(this.hangMs)
+    if (a.rc == -2) {
+      return Slow{ hung: true, rc: a.rc, ms: a.ms }
+    }
+    print("slow: ${what} terminated in ${a.ms}ms (rc=${a.rc}): slow, not hung - nothing saved\n")
+    return Slow{ hung: false, rc: a.rc, ms: a.ms }
+  }
+
+  harvest(prefix: string): string {
+    let bytes = mustRead(this.work)
+    let path = "${this.crashesDir}/${prefix}-${hex16(fnv1a64(bytes))}.bit"
+    mustWrite(path, bytes)
+    return path
+  }
+
+  // Replays tests/fuzz/crashes/*.bit. The directory is legitimately empty today,
+  // so an empty replay is not a failure - but the COUNT is printed, because that
+  // is the only thing that distinguishes a clean corpus from a mistyped path, and
+  // a missing directory is fatal.
+  //
+  // A saved case that now merely compiles slowly is a PASS, so the adjudication
+  // applies here too: a 28-second replay cannot re-trip the budget that wrongly
+  // harvested it. That was the ratchet in #2400 - one bad artifact made every
+  // later run pay for it, first.
+  replayCrashes() {
+    let files = bitFilesIn(this.crashesDir)
+    print("regress: replaying ${len(files)} saved crash(es) from ${this.crashesDir}\n")
+    for f of files {
+      mustWrite(this.work, mustRead(f))
+      let a = this.runFor(this.timeoutMs)
+      if (a.rc == -2) {
+        let s = this.adjudicate("regress ${f}", a.ms)
+        if (s.hung) {
+          die("regress: ${f}: hang - the ${this.hangMs}ms ceiling elapsed too")
+        }
+        a = Attempt{ rc: s.rc, ms: s.ms }
+      }
+      let o = classify(a.rc)
+      if (!o.ok) {
+        die("regress: ${f}: ${o.label}")
+      }
+    }
+  }
+
+  // One `bit check` on a known-good program, before any mutant. Without it a
+  // broken BIT_FUZZ_BIN is only visible through the 126/127 branch, and only on
+  // shells that report it. Bounded by the ceiling rather than the floor: the
+  // question is "is the compiler reachable at all", and a program that terminates
+  // costs its own time whatever the budget says, so the generous bound buys
+  // immunity to a loaded machine for free.
+  preflight() {
+    mustWrite(this.work, "fn main() {\n  print(\"ok\")\n}\n")
+    let a = this.runFor(this.hangMs)
+    if (a.rc != 0) {
+      die("preflight: the runner rejected a known-good program (rc=${a.rc} after ${a.ms}ms); the compiler under test is not reachable")
+    }
+  }
+
+  fuzzLoop(seeds: []string, seed: u64, seconds: int): int {
+    let st = []u64(1)
+    st[0] = seed
+
+    // Per-seed high-water mark of a CONFIRMED terminating compile, in ms; zero
+    // until a mutant of that seed has been adjudicated. This is the measurement
+    // the budget scales from, so the corpus calibrates the fuzzer instead of the
+    // fuzzer's constant vetoing the corpus.
+    let slowMs = []int(len(seeds))
+
+    let deadline = monotonic().ns + seconds * Second
+    let credited = 0
+    let iterations = 0
+    while (iterations < maxIterations && monotonic().ns < deadline) {
+      let idx = nextBelow(st, len(seeds))
+      let src = mustRead(seeds[idx])
+      mustWrite(this.work, mutate(src, st))
+
+      let a = this.runFor(this.budgetFor(slowMs[idx]))
+      if (a.rc == -2) {
+        let s = this.adjudicate("iteration ${iterations} (seed ${seeds[idx]})", a.ms)
+        if (s.hung) {
+          let saved = this.harvest("hang")
+          die("iteration ${iterations}: hang - neither the budget nor the ${this.hangMs}ms ceiling saw it terminate; input saved as ${saved}")
+        }
+        if (s.ms > slowMs[idx]) {
+          slowMs[idx] = s.ms
+        }
+        if (credited < slowCreditCapMs) {
+          deadline = deadline + (a.ms + s.ms) * Millisecond
+          credited = credited + a.ms + s.ms
+        }
+        a = Attempt{ rc: s.rc, ms: s.ms }
+      }
+
+      let o = classify(a.rc)
+      if (o.fatal) {
+        die("iteration ${iterations}: ${o.label}")
+      }
+      if (!o.ok) {
+        let saved = this.harvest("crash")
+        die("iteration ${iterations}: ${o.label} - input saved as ${saved}")
+      }
+      iterations = iterations + 1
+    }
+    return iterations
+  }
 }
 
 // One bounded `bit check`, with the wall time it actually took. The elapsed
@@ -336,44 +466,12 @@ class Attempt {
   ms: int
 }
 
-fn (r: Runner) runFor(budgetMs: int): Attempt {
-  let start = monotonic()
-  let rc = osRunBounded(r.script, budgetMs)
-  return Attempt{ rc: rc, ms: since(start) / Millisecond }
-}
-
-// The budget for a seed whose confirmed-terminating high-water mark is
-// `observedMs` (0 before any mutant of it has been adjudicated).
-fn (r: Runner) budgetFor(observedMs: int): int {
-  let b = observedMs * hangFactor
-  if (b < r.timeoutMs) {
-    b = r.timeoutMs
-  }
-  if (b > r.hangMs) {
-    b = r.hangMs
-  }
-  return b
-}
-
 // The second opinion on an input that blew its budget. `hung` is the only
 // answer that justifies saving anything.
 class Slow {
   hung: bool
   rc: int   // the second attempt's raw code, when it terminated
   ms: int   // and the wall time it took
-}
-
-// Re-runs the bytes already in `r.work` against the ceiling. Both outcomes are
-// printed: an adjudication that stayed silent is how a false artifact became
-// something two people deleted by hand instead of a thing anyone noticed.
-fn (r: Runner) adjudicate(what: string, firstMs: int): Slow {
-  print("slow: ${what} did not finish in ${firstMs}ms; re-running once against the ${r.hangMs}ms non-termination ceiling\n")
-  let a = r.runFor(r.hangMs)
-  if (a.rc == -2) {
-    return Slow{ hung: true, rc: a.rc, ms: a.ms }
-  }
-  print("slow: ${what} terminated in ${a.ms}ms (rc=${a.rc}): slow, not hung - nothing saved\n")
-  return Slow{ hung: false, rc: a.rc, ms: a.ms }
 }
 
 class Outcome {
@@ -407,105 +505,7 @@ fn classify(rc: int): Outcome {
   return Outcome{ ok: true, fatal: false, label: "exit ${rc}" }
 }
 
-fn (r: Runner) harvest(prefix: string): string {
-  let bytes = mustRead(r.work)
-  let path = "${r.crashesDir}/${prefix}-${hex16(fnv1a64(bytes))}.bit"
-  mustWrite(path, bytes)
-  return path
-}
-
 // --- phases -----------------------------------------------------------------
-
-// Replays tests/fuzz/crashes/*.bit. The directory is legitimately empty today,
-// so an empty replay is not a failure - but the COUNT is printed, because that
-// is the only thing that distinguishes a clean corpus from a mistyped path, and
-// a missing directory is fatal.
-//
-// A saved case that now merely compiles slowly is a PASS, so the adjudication
-// applies here too: a 28-second replay cannot re-trip the budget that wrongly
-// harvested it. That was the ratchet in #2400 - one bad artifact made every
-// later run pay for it, first.
-fn (r: Runner) replayCrashes() {
-  let files = bitFilesIn(r.crashesDir)
-  print("regress: replaying ${len(files)} saved crash(es) from ${r.crashesDir}\n")
-  for f of files {
-    mustWrite(r.work, mustRead(f))
-    let a = r.runFor(r.timeoutMs)
-    if (a.rc == -2) {
-      let s = r.adjudicate("regress ${f}", a.ms)
-      if (s.hung) {
-        die("regress: ${f}: hang - the ${r.hangMs}ms ceiling elapsed too")
-      }
-      a = Attempt{ rc: s.rc, ms: s.ms }
-    }
-    let o = classify(a.rc)
-    if (!o.ok) {
-      die("regress: ${f}: ${o.label}")
-    }
-  }
-}
-
-// One `bit check` on a known-good program, before any mutant. Without it a
-// broken BIT_FUZZ_BIN is only visible through the 126/127 branch, and only on
-// shells that report it. Bounded by the ceiling rather than the floor: the
-// question is "is the compiler reachable at all", and a program that terminates
-// costs its own time whatever the budget says, so the generous bound buys
-// immunity to a loaded machine for free.
-fn (r: Runner) preflight() {
-  mustWrite(r.work, "fn main() {\n  print(\"ok\")\n}\n")
-  let a = r.runFor(r.hangMs)
-  if (a.rc != 0) {
-    die("preflight: the runner rejected a known-good program (rc=${a.rc} after ${a.ms}ms); the compiler under test is not reachable")
-  }
-}
-
-fn (r: Runner) fuzzLoop(seeds: []string, seed: u64, seconds: int): int {
-  let st = []u64(1)
-  st[0] = seed
-
-  // Per-seed high-water mark of a CONFIRMED terminating compile, in ms; zero
-  // until a mutant of that seed has been adjudicated. This is the measurement
-  // the budget scales from, so the corpus calibrates the fuzzer instead of the
-  // fuzzer's constant vetoing the corpus.
-  let slowMs = []int(len(seeds))
-
-  let deadline = monotonic().ns + seconds * Second
-  let credited = 0
-  let iterations = 0
-  while (iterations < maxIterations && monotonic().ns < deadline) {
-    let idx = nextBelow(st, len(seeds))
-    let src = mustRead(seeds[idx])
-    mustWrite(r.work, mutate(src, st))
-
-    let a = r.runFor(r.budgetFor(slowMs[idx]))
-    if (a.rc == -2) {
-      let s = r.adjudicate("iteration ${iterations} (seed ${seeds[idx]})", a.ms)
-      if (s.hung) {
-        let saved = r.harvest("hang")
-        die("iteration ${iterations}: hang - neither the budget nor the ${r.hangMs}ms ceiling saw it terminate; input saved as ${saved}")
-      }
-      if (s.ms > slowMs[idx]) {
-        slowMs[idx] = s.ms
-      }
-      if (credited < slowCreditCapMs) {
-        deadline = deadline + (a.ms + s.ms) * Millisecond
-        credited = credited + a.ms + s.ms
-      }
-      a = Attempt{ rc: s.rc, ms: s.ms }
-    }
-
-    let o = classify(a.rc)
-    if (o.fatal) {
-      die("iteration ${iterations}: ${o.label}")
-    }
-    if (!o.ok) {
-      let saved = r.harvest("crash")
-      die("iteration ${iterations}: ${o.label} - input saved as ${saved}")
-    }
-    iterations = iterations + 1
-  }
-  return iterations
-}
 
 // --- entry ------------------------------------------------------------------
 

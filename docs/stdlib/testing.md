@@ -216,11 +216,11 @@ Put this in `stack.test.bit`:
 
 ```bit
 class Stack {
-  items: []i64,
-}
+  items: []i64
 
-fn (s: Stack) pop(): i64 {
-  return s.items[len(s.items) - 1]
+  pop(): i64 {
+    return this.items[len(this.items) - 1]
+  }
 }
 
 fn testpanic_pop_on_empty() {
