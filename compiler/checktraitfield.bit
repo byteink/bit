@@ -1,0 +1,288 @@
+// compiler/checktraitfield.bit — trait FIELDS, injected into the using
+// class's layout and GC pointer map (SPEC §10.7, #3370).
+//
+// Unlike a provided method (checktrait.bit), a trait field is never cloned
+// into a brand-new top-level declaration: it is spliced directly into the
+// using class's own `field_list`, as a literal `Tag.Field` node
+// indistinguishable from one the class wrote itself. That is deliberate and
+// is the whole point — `structFieldNodes`/`structLayout` (lowercall.bit),
+// `resolveStructFields` (checkbind.bit), `fillInstMembers` (checkinst.bit),
+// `vMissingStructFields` (validatezero.bit, the E0083 zero-value rule) and
+// `bit doc`'s own field walk all read a class's field_list straight off the
+// tree with NO trait-awareness at all, so once the splice has happened
+// before any of them run, every one of those ~13 call sites (see #3802)
+// handles an injected field correctly for free — most importantly the GC
+// pointer map, which `structLayout` builds from the exact same walk.
+//
+// Splicing is a Tree mutation, done by rewriting the field_list node's OWN
+// (kidsStart, kidsLen) window in place (extendFieldList below) rather than
+// building a replacement node and threading it back up through the
+// StructDecl/Export/Program chain to root — the same in-place-rewrite
+// technique parserexpr.bit already uses for a Node's `span` field. This
+// only works because it runs before ANY other pass has looked at the tree
+// (injectTraitsInModule, checktrait.bit, calls this before its own
+// `attachNewDecls` reads `tree.root`'s kids), so no stale reference to the
+// field_list's old window can have leaked out yet.
+//
+// SPEC §10.7's rule for fields is simpler than for methods: there is no
+// override. A method conflict is resolved by "the class's own declaration
+// wins silently"; a field conflict — trait/trait, or trait/class, whatever
+// the two types are — is ALWAYS an error naming both sources. So this file
+// needs no analogue of checktrait.bit's two-pass
+// merge-then-apply-own-overrides shape: one walk, in source order, is
+// enough (resolveTraitFields below).
+
+// First free code above checktrait.bit's ecSelfOutsideSignature (108).
+const ecTraitFieldConflict = 109
+
+// One trait's (or one class `use` site's) accumulated field set, in the
+// exact order fields are found — SPEC §10.7: "the using class's declared
+// fields, then each used trait's fields in use order", which a map's
+// iteration order cannot be trusted to reproduce build to build. `order`
+// is the only thing layout may ever read from; `providedBy`/`providedNode`
+// are lookups keyed off it.
+class TraitFieldSet {
+  order: []string,
+  providedBy: map<string, string>,
+  providedNode: map<string, int>,
+}
+
+fn emptyTraitFieldSet(): TraitFieldSet {
+  return TraitFieldSet{
+    order: []string(0),
+    providedBy: map<string, string>{},
+    providedNode: map<string, int>{},
+  }
+}
+
+// Folds one field named `name`, declared by `provider`, into `dst`. Any
+// name already present is a hard conflict — fields are never overridden,
+// regardless of whether the two sources are two traits or a trait and the
+// trait's own nested `use` (SPEC §10.7).
+fn mergeOneField(
+  dst: TraitFieldSet,
+  provider: string,
+  node: int,
+  name: string,
+  diags: Diagnostics,
+  span: Span,
+) {
+  let (existing, has) = dst.providedBy[name]
+  if (has) {
+    report(
+      diags, ecTraitFieldConflict, span,
+      "trait field conflict: '${existing}' and '${provider}' both declare '${name}'",
+      "rename the field in one of them; trait fields are never overridden",
+    )
+    return
+  }
+  dst.order = append(dst.order, name)
+  dst.providedBy[name] = provider
+  dst.providedNode[name] = node
+}
+
+// Merges `src` into `dst` in `src`'s own order — shared by nested trait
+// composition and class-level `use A, B` composition.
+fn mergeTraitFieldSets(dst: TraitFieldSet, src: TraitFieldSet, diags: Diagnostics, span: Span) {
+  let i = 0
+  while (i < len(src.order)) {
+    let name = src.order[i]
+    mergeOneField(dst, src.providedBy[name], src.providedNode[name], name, diags, span)
+    i = i + 1
+  }
+}
+
+// The full field set trait `name` contributes: its own directly-declared
+// fields plus everything transitively reached through its own `use`
+// statements, walked in ONE pass over `name`'s member list in source
+// order — a `use` statement pulls in its target's fields at that point, a
+// field is added at that point, so the result reads exactly like the
+// trait's body read top to bottom. `depth` bounds the recursion; cycles are
+// rejected separately (checkTraitCycles), so this is a defensive ceiling,
+// not the real guard — the same shape as checktrait.bit's
+// `resolveTraitMethods`.
+fn resolveTraitFields(ctx: TraitCtx, name: string, depth: int): TraitFieldSet {
+  let result = emptyTraitFieldSet()
+  let (node, ok) = ctx.traits[name]
+  if (!ok || depth > 64) {
+    return result
+  }
+  let members = kidsOf(ctx.tree, kidsOf(ctx.tree, node)[1])
+  let i = 0
+  while (i < len(members)) {
+    let m = members[i]
+    let tag = getNode(ctx.tree, m).tag
+    if (tag == Tag.UseStmt) {
+      let usedIdents = kidsOf(ctx.tree, m)
+      let j = 0
+      while (j < len(usedIdents)) {
+        let usedName = identText(ctx.tree, ctx.source, usedIdents[j])
+        mergeTraitFieldSets(
+          result,
+          resolveTraitFields(ctx, usedName, depth + 1),
+          ctx.diags,
+          getNode(ctx.tree, m).span,
+        )
+        j = j + 1
+      }
+    } else if (tag == Tag.Field) {
+      let fname = identText(ctx.tree, ctx.source, kidsOf(ctx.tree, m)[0])
+      mergeOneField(result, name, m, fname, ctx.diags, getNode(ctx.tree, m).span)
+    }
+    i = i + 1
+  }
+  return result
+}
+
+// The field set a class's `use` statements bring in, in use-statement order
+// and (within one `use A, B`) left to right — SPEC §10.7's "use order".
+// Unknown trait names are already reported by the method pass
+// (checktrait.bit's `effectiveUses`); silently skipped here to avoid a
+// second diagnostic for the same bad name.
+fn effectiveUseFields(ctx: TraitCtx, cu: ClassUse): TraitFieldSet {
+  let effective = emptyTraitFieldSet()
+  let j = 0
+  while (j < len(cu.useStmts)) {
+    let names = kidsOf(ctx.tree, cu.useStmts[j])
+    let k = 0
+    while (k < len(names)) {
+      let tSpan = getNode(ctx.tree, names[k]).span
+      let tName = ctx.source[tSpan.start:tSpan.end]
+      let (_, known) = ctx.traits[tName]
+      if (known) {
+        mergeTraitFieldSets(effective, resolveTraitFields(ctx, tName, 0), ctx.diags, tSpan)
+      }
+      k = k + 1
+    }
+    j = j + 1
+  }
+  return effective
+}
+
+// The class's own field kids, filtered from its field_list the same way
+// `structFieldNodes` (lowercall.bit) will later: skip an in-body method
+// (#3367, a func_decl) and a `use` statement (#3369) — neither is a field.
+// This pass runs before a Checker exists, so it reads the raw Tree.
+fn ownFieldKids(tree: Tree, fieldListKids: []int): []int {
+  let out = []int(0)
+  let i = 0
+  while (i < len(fieldListKids)) {
+    let f = fieldListKids[i]
+    if (getNode(tree, f).tag == Tag.Export) {
+      f = kidsOf(tree, f)[0]
+    }
+    if (getNode(tree, f).tag == Tag.Field) {
+      out = append(out, f)
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// name -> that field's own node, for collision checks against trait fields.
+fn ownFieldNameSet(tree: Tree, source: string, fieldKids: []int): map<string, int> {
+  let out = map<string, int>{}
+  let i = 0
+  while (i < len(fieldKids)) {
+    out[identText(tree, source, kidsOf(tree, fieldKids[i])[0])] = fieldKids[i]
+    i = i + 1
+  }
+  return out
+}
+
+// Reports a trait-field/class-field collision (naming both sources) for
+// every effective trait field whose name the class already declares itself,
+// and returns the CLONED field nodes safe to inject — the ones with no
+// collision — in `effective`'s own deterministic order.
+fn safeInjectedFields(
+  ctx: TraitCtx,
+  className: string,
+  classNameNode: int,
+  ownNames: map<string, int>,
+  effective: TraitFieldSet,
+): []int {
+  let out = []int(0)
+  let classSpan = getNode(ctx.tree, classNameNode).span
+  let i = 0
+  while (i < len(effective.order)) {
+    let name = effective.order[i]
+    let (ownNode, hasOwn) = ownNames[name]
+    if (hasOwn) {
+      report(
+        ctx.diags, ecTraitFieldConflict, getNode(ctx.tree, ownNode).span,
+        "trait field conflict: class '${className}' and trait '${effective.providedBy[name]}' both declare '${name}'",
+        "trait fields are never overridden; rename the field in one of them",
+      )
+    } else {
+      out = append(
+        out,
+        cloneWithSelf(ctx.tree, ctx.source, effective.providedNode[name], classSpan),
+      )
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Appends `newFields` (already-cloned Field node ids) to the end of
+// `classNode`'s field_list by rewriting that node's OWN (kidsStart,
+// kidsLen) window in place — see this file's header. `oldKids` is the
+// field_list's full, UNFILTERED kid list (fields, in-body methods and use
+// statements, in original source order); appending strictly after all of
+// them, regardless of how those are interleaved, guarantees `structFieldNodes`
+// (which then filters to just the Field-tagged kids) sees the class's own
+// declared fields first and the injected trait fields after — SPEC §10.7's
+// required order, satisfied by construction rather than by sorting.
+fn extendFieldList(tree: Tree, classNode: int, oldKids: []int, newFields: []int) {
+  let combined = []int(0)
+  let i = 0
+  while (i < len(oldKids)) {
+    combined = append(combined, oldKids[i])
+    i = i + 1
+  }
+  i = 0
+  while (i < len(newFields)) {
+    combined = append(combined, newFields[i])
+    i = i + 1
+  }
+  let fieldListId = kidsOf(tree, classNode)[2]
+  let start = len(tree.extra)
+  i = 0
+  while (i < len(combined)) {
+    tree.extra = append(tree.extra, combined[i])
+    i = i + 1
+  }
+  let n = getNode(tree, fieldListId)
+  n.kidsStart = start
+  n.kidsLen = len(combined)
+}
+
+// Validates and splices trait fields into one class. A no-op when the
+// class's effective trait set has no fields at all (the common case: most
+// traits are still method-only), so classes using no trait — or only
+// method-providing ones — never have their field_list touched, which is
+// exactly what `selfhost-diffir.sh`'s MISMATCH=0 requirement depends on.
+fn injectFieldsIntoClass(ctx: TraitCtx, cu: ClassUse) {
+  let effective = effectiveUseFields(ctx, cu)
+  if (len(effective.order) == 0) {
+    return
+  }
+  let className = identText(ctx.tree, ctx.source, cu.className)
+  let fieldListKids = kidsOf(ctx.tree, kidsOf(ctx.tree, cu.classNode)[2])
+  let ownNames = ownFieldNameSet(ctx.tree, ctx.source, ownFieldKids(ctx.tree, fieldListKids))
+  let newFields = safeInjectedFields(ctx, className, cu.className, ownNames, effective)
+  if (len(newFields) == 0) {
+    return
+  }
+  extendFieldList(ctx.tree, cu.classNode, fieldListKids, newFields)
+}
+
+// Entry point, called from checktrait.bit's `injectTraitsInModule` before
+// method injection reads `tree.root`.
+fn injectTraitFieldsInModule(ctx: TraitCtx, classes: []ClassUse) {
+  let i = 0
+  while (i < len(classes)) {
+    injectFieldsIntoClass(ctx, classes[i])
+    i = i + 1
+  }
+}

@@ -791,18 +791,22 @@ interface error { message(): string }
 
 ```
 trait_decl   = "trait" IDENT "{" { trait_member } "}" .
-trait_member = use_stmt | trait_method .
+trait_member = use_stmt | trait_method | field .
 use_stmt     = "use" IDENT { "," IDENT } .
 trait_method = IDENT [ generic_params ] signature [ block ] .
 ```
 
 A trait declares methods to be **injected into a class at check time** by a
-`use` statement in that class's body:
+`use` statement in that class's body, and may also declare **fields**,
+injected into the using class's own layout and GC pointer map exactly like a
+field the class declared itself:
 
 ```
 trait Damageable {
+  hp: i64                                 // FIELD: injected into layout
+
   hurt(n: i64)                            // REQUIRED: signature, no body
-  dead(): bool { return this.hp() <= 0 }  // PROVIDED: has a body
+  dead(): bool { return this.hp <= 0 }    // PROVIDED: has a body
 }
 
 class Enemy {
@@ -810,14 +814,29 @@ class Enemy {
   use Serializable, Poolable              // `use` is its own statement
 
   name: string
-  hurt(n: i64) { this.hp0 = this.hp0 - n }  // supplies the required method
+  hurt(n: i64) { this.hp = this.hp - n }  // supplies the required method
 }
 ```
 
 `use` is a statement inside the class body, never mixed into the field list —
 `use A, B, x: f64` would give no way to see where the traits end and the fields
-begin. `use` and `trait` do not affect the class's memory layout (traits cannot
-declare fields).
+begin.
+
+**Field order is deterministic**: the using class's own declared fields
+first, then each `use`d trait's fields in `use` order (and, within one trait,
+in its own source order, including transitively through that trait's own
+`use` of another). This never depends on map or declaration-table iteration
+order — two builds of the same source always agree on layout.
+
+**A field name collision is always a compile error**, naming both sources —
+trait/trait (two `use`d traits declaring the same field name) or trait/class
+(the class itself also declares that name). Unlike a method conflict, there
+is **no override**: the class declaring a field of the same name a trait
+provides does not silently win, regardless of whether the two types agree.
+
+A trait field whose type is a class has no zero value (§13.4) the same way a
+hand-written one does, so it may not be omitted from a composite literal
+constructing the using class — `E0083`, exactly as for a declared field.
 
 A trait member is either **required** (a signature with no body — the using
 class must supply it itself, or get it from another `use`d trait) or
@@ -4031,7 +4050,7 @@ interface_decl= "interface" IDENT [ generic_params ] "{" [ method_sig { fsep met
 method_sig    = IDENT signature .
 fsep          = ";" | "," .
 trait_decl    = "trait" IDENT "{" { trait_member } "}" .
-trait_member  = use_stmt | trait_method .
+trait_member  = use_stmt | trait_method | field .
 use_stmt      = "use" IDENT { "," IDENT } .
 trait_method  = IDENT [ generic_params ] signature [ block ] .
 enum_decl     = "enum" IDENT [ generic_params ] "{" [ enum_variant { fsep enum_variant } [ fsep ] ] "}" .

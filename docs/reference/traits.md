@@ -1,9 +1,9 @@
 # Traits
 
-A trait declares methods that are injected into a class at compile time by a
-`use` statement in that class's body. Unlike an interface, a trait supplies
-method *bodies*, not just a method *set* to check a value against. (Spec:
-§10.7, §14.3.)
+A trait declares methods and fields that are injected into a class at compile
+time by a `use` statement in that class's body. Unlike an interface, a trait
+supplies method *bodies*, not just a method *set* to check a value against.
+(Spec: §10.7, §14.3.)
 
 ## Declaring a trait
 
@@ -64,6 +64,37 @@ fn reportOn(m: Mortal): string {
 ```
 
 `Enemy` satisfies `Mortal` even though it never writes `dead(): bool` itself.
+
+## Fields
+
+A trait can declare fields too, injected into the using class's own layout
+and GC pointer map exactly like a hand-written field — readable, writable,
+and settable in a composite literal:
+
+```bit
+trait Named {
+  label: string
+
+  greet(): string { return "hi ${this.label}" }
+}
+
+class Gadget {
+  use Named
+  hp: i64,
+}
+
+fn greetGadget() {
+  let g = Gadget{ label: "gizmo", hp: 5 }
+  print("${g.greet()}\n")   // hi gizmo
+}
+```
+
+Field order is deterministic: the class's own declared fields first, then
+each `use`d trait's fields in `use` order — never dependent on iteration
+order, so two builds of the same source always agree on layout. A field name
+colliding between two traits, or between a trait and the class itself, is
+always a compile error naming both sources; unlike a method conflict, there
+is no silent override.
 
 ## `Self`
 
