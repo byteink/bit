@@ -49,6 +49,12 @@ Opens `path` for reading.
 
 Creates or truncates `path` for writing.
 
+### `openReadWrite(path: string): File!`
+
+Opens `path` for both reading and writing via `File.readAt`/`File.writeAt`,
+creating it if absent. Existing content is preserved — unlike `create`, this
+never truncates.
+
 ### `openAppend(path: string): File!`
 
 Opens `path` for writing at the end, creating it if absent.
