@@ -85,7 +85,7 @@ echo "ARM64GATE_LOAD=$(uptime | sed -n 's/.*load averages*: *//p' | awk '{print 
 # Run the suite over the tar stream on stdin. Echoes the container log and prints
 # ARM64LINUX_EXIT=<code>; returns that code as its own exit status.
 run_suite() {
-  local code name cache_args cache_env peers
+  local code name cache_args cache_env peers wd_marker start_ts elapsed pipe_rc
   if [ "${CACHE_MODE}" = "clean" ]; then
     cache_args=""
     cache_env="/tmp/gc"
@@ -116,7 +116,14 @@ run_suite() {
   # alarm), an unnamed container keeps burning every core on a result nobody will
   # ever read. Observed exactly that on 2026-07-19.
   name="arm64gate-$$-${RANDOM}"
-  trap 'docker rm -f "${name}" >/dev/null 2>&1 || true' EXIT INT TERM
+  # A separate marker (not the container, which any of several things can remove)
+  # records whether the WATCHDOG itself fired. Without it, an empty `code` below
+  # is ambiguous between "the deadline genuinely elapsed" and "docker run or the
+  # container failed before it ever printed a verdict" — a docker daemon error
+  # under host contention, an OOM kill, an image problem. Both used to get the
+  # same "deadline hit" message regardless of which happened (#3813).
+  wd_marker=$(mktemp -u)
+  trap 'docker rm -f "${name}" >/dev/null 2>&1 || true; rm -f "${wd_marker}" 2>/dev/null || true' EXIT INT TERM
 
   # Enforce the deadline by REMOVING THE CONTAINER, not by signalling the client.
   # `perl -e 'alarm N; exec docker run ...'` — the obvious portable idiom, and what
@@ -128,9 +135,12 @@ run_suite() {
   # substitution pipe to exit, and a watchdog that inherits stdout is one — the
   # gate would then sit idle until the full deadline elapsed even after the suite
   # had finished, looking exactly like the hang it exists to catch.
-  ( sleep "${DEADLINE}"; docker rm -f "${name}" >/dev/null 2>&1 ) >/dev/null 2>&1 &
+  # The marker is written BEFORE `docker rm -f`, so a later read of it is proof
+  # the watchdog is the one that reaped the container, not a race on rm's result.
+  ( sleep "${DEADLINE}"; : > "${wd_marker}" 2>/dev/null; docker rm -f "${name}" >/dev/null 2>&1 ) >/dev/null 2>&1 &
   local watchdog=$!
 
+  start_ts=$(date +%s)
   code=$(docker run --rm -i --name "${name}" ${cache_args} "${IMAGE}" bash -c '
       mkdir -p /work && cd /work && tar x &&
       BIT_STAGE0_CACHE='"${cache_env}"'/stage0 ./make '"${STEP}"' > /tmp/o 2>&1
@@ -144,16 +154,34 @@ run_suite() {
       fi
       echo ARM64LINUX_EXIT=$e
     ' | tee /dev/stderr | sed -n 's/^ARM64LINUX_EXIT=//p')
+  # `code=$(pipeline)`'s own exit status, under `set -o pipefail`, is the rightmost
+  # non-zero status in the pipe — i.e. docker run's real exit code, since tee/sed
+  # only fail if THEY are killed. Capture it immediately: the very next commands
+  # (kill, wait, docker rm) each set their own $? and would overwrite it unread,
+  # which is exactly how it was being swallowed before this fix.
+  pipe_rc=$?
+  elapsed=$(( $(date +%s) - start_ts ))
   kill "${watchdog}" 2>/dev/null || true
   wait "${watchdog}" 2>/dev/null || true
   docker rm -f "${name}" >/dev/null 2>&1 || true
-  trap - EXIT INT TERM
   # An empty code means the container died or the deadline fired — that is a
-  # failure, not an unknown to be shrugged off.
+  # failure, not an unknown to be shrugged off. Distinguish which, using the
+  # watchdog marker rather than guessing from elapsed time alone: elapsed time
+  # under contention is not a reliable signal by itself (a real hang and a slow
+  # peer-contended run can both take minutes), but the marker only exists if the
+  # watchdog's own sleep actually completed.
   if [ -z "${code}" ]; then
-    echo "ARM64LINUX_EXIT=124  (no exit line: container killed or ${DEADLINE}s deadline hit)"
+    if [ -f "${wd_marker}" ]; then
+      echo "ARM64LINUX_EXIT=124  (no exit line: ${DEADLINE}s deadline hit, watchdog killed the container after ${elapsed}s)"
+    else
+      echo "ARM64LINUX_EXIT=124  (no exit line after ${elapsed}s — well under the ${DEADLINE}s deadline, so the watchdog did NOT fire: docker run exited ${pipe_rc} before the container printed a verdict — daemon error, OOM kill, or similar)"
+    fi
+    rm -f "${wd_marker}" 2>/dev/null || true
+    trap - EXIT INT TERM
     return 124
   fi
+  rm -f "${wd_marker}" 2>/dev/null || true
+  trap - EXIT INT TERM
   return "${code}"
 }
 
