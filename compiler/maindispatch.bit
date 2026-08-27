@@ -1,0 +1,381 @@
+// compiler/maindispatch.bit — the CLI subcommand table and each
+// subcommand's handler, split out of `fn main()` (main.bit) (#3791): that
+// function was 337 lines and complexity 93, far past this repo's own E0204
+// ceiling (spec/LINT.md). `dispatchCheck`/`dispatchFmt`/`dispatchTest`
+// (projectcli.bit, #3784) already use this exact shape — a plain
+// `fn (a: []string)` per subcommand — so this table holds those three
+// directly alongside the ones declared below.
+//
+// Same module as main.bit (sibling `.bit` files, no import needed): every
+// name here is visible to `main()` and every name main.bit declares
+// (`dumpTokens`, `isArOperationCode`, `warnCompilerUnderStressGc`, ...) is
+// visible here, order-independent (SPEC name resolution).
+
+// `build`'s parsed flags, threaded through the small functions below instead
+// of six separate `let`s — `handleBuild` mutates one of these through
+// `parseBuildFlagsFrom`/`resolveBuildOut` rather than returning a tuple that
+// would grow every time a flag is added. `target` defaults to the host triple
+// (`hostBuildTarget()`) exactly as the original inline `let target = ...` did.
+class BuildFlags {
+  out: string,
+  emitObj: bool,
+  freestanding: bool,
+  debug: bool,
+  noOptimize: bool,
+  target: BuildTarget,
+}
+
+// `-o <out>` — true only when a value actually follows, exactly like the
+// original inline `a[ai] == "-o" && ai + 1 < len(a)` condition it replaces.
+fn isBuildOutFlag(a: []string, ai: int): bool {
+  return a[ai] == "-o" && ai + 1 < len(a)
+}
+
+// `--target <t>` / `-t <t>` — same shape as `isBuildOutFlag` above.
+fn isBuildTargetFlag(a: []string, ai: int): bool {
+  return (a[ai] == "--target" || a[ai] == "-t") && ai + 1 < len(a)
+}
+
+// Parses the `--target`/`-t` value at `a[ai + 1]`, mutating `f.target` and
+// returning the index to resume at — or exiting directly (unchanged exit
+// code 1) on an unrecognised target, exactly as the inline `while` did.
+fn applyBuildTargetFlag(a: []string, ai: int, f: BuildFlags): int {
+  let ti = parseBuildTarget(a[ai + 1])
+  if (ti < 0) {
+    eprint("bit: unknown target '${a[ai + 1]}' (x86_64-linux | aarch64-linux | aarch64-macos | x86_64-windows)\n")
+    exit(1)
+    return ai
+  }
+  f.target = buildTargetOf(ti)
+  return ai + 2
+}
+
+// One token of `bit build`'s flag loop: mutates `f` for whichever flag
+// `a[ai]` names and returns the index to resume at. Falls through to the
+// same "unexpected argument" exit(2) the original inline `else` branch had —
+// reached only for a value-taking flag with no value left (`bit build x.bit
+// -o`): `cliFrontEnd` already refused anything else flag-shaped that `build`
+// does not declare, and any surplus operand.
+fn applyBuildFlag(a: []string, ai: int, f: BuildFlags): int {
+  if (isBuildOutFlag(a, ai)) {
+    f.out = a[ai + 1]
+    return ai + 2
+  }
+  if (a[ai] == "--emit-obj" || a[ai] == "-c") {
+    f.emitObj = true
+    return ai + 1
+  }
+  if (a[ai] == "--freestanding") {
+    f.freestanding = true
+    return ai + 1
+  }
+  if (a[ai] == "--debug") {
+    f.debug = true
+    return ai + 1
+  }
+  if (a[ai] == "--no-optimize") {
+    f.noOptimize = true
+    return ai + 1
+  }
+  if (isBuildTargetFlag(a, ai)) {
+    return applyBuildTargetFlag(a, ai, f)
+  }
+  eprint("bit build: unexpected argument '${a[ai]}'\n")
+  exit(2)
+  return ai
+}
+
+// Parse: one positional <src>, plus `-o <out>`, `--emit-obj` and
+// `--target <t>` in any order after it, starting at `a[start]`.
+fn parseBuildFlagsFrom(a: []string, start: int): BuildFlags {
+  let f = BuildFlags{
+    out: "", emitObj: false, freestanding: false, debug: false,
+    noOptimize: false, target: hostBuildTarget(),
+  }
+  let ai = start
+  while (ai < len(a)) {
+    ai = applyBuildFlag(a, ai, f)
+  }
+  return f
+}
+
+// Fills `f.out` when the caller gave no `-o`. A directory target (§17.1's
+// project-directory build mode) has no `.bit` suffix for `pathStem` to
+// strip, so that path derives an EMPTY name for ".", "./" and any argument
+// ending in "/" — the directory's own last path component is the empty
+// string after the trailing slash (#2260). Derive it separately instead.
+fn resolveBuildOut(a: []string, f: BuildFlags) {
+  if (f.out != "") {
+    return
+  }
+  if (fsIsDir(a[2])) {
+    f.out = buildDirDefaultOut(a[2]) catch e {
+      eprint("bit build: ${e.message()}\n")
+      exit(2)
+      return
+    }
+  } else {
+    f.out = pathStem(a[2])
+  }
+  if (f.emitObj) {
+    f.out = f.out + ".o"
+  }
+}
+
+// `bit build`'s full dispatch. Split out of `main` (#3791) the same way
+// `dispatchCheck`/`dispatchFmt`/`dispatchTest` (projectcli.bit, #3784)
+// already are: that function is far past this repo's own E0204 ceiling
+// (spec/LINT.md).
+fn handleBuild(a: []string) {
+  let f = parseBuildFlagsFrom(a, 3)
+  resolveBuildOut(a, f)
+  // §17.6: freestanding describes an archive MEMBER — a module compiled with
+  // no prelude and emitted alone. There is no freestanding executable today
+  // (nothing would boot it), so require --emit-obj rather than implying it.
+  if (f.freestanding && !f.emitObj) {
+    eprint("bit: --freestanding emits an archive member: pass --emit-obj\n")
+    exit(2)
+    return
+  }
+  let ok = false
+  if (f.emitObj) {
+    ok = buildObjCmd(a[2], f.out, f.target, f.freestanding, f.debug, f.noOptimize)
+  } else {
+    ok = buildCmd(a[2], f.out, f.target, f.debug, f.noOptimize)
+  }
+  if (ok) {
+    return
+  }
+  exit(1)
+}
+
+// `bit ar` is OUTPUT-FIRST; GNU `ar` is operation-first. So `bit ar t lib.a`
+// — muscle memory for "list this archive" — used to silently CREATE a file
+// named `t` whose single member is lib.a, and print nothing. The empty output
+// then reads as "the archive has no members", which is a confidently wrong
+// answer to a question that was never asked (#1896).
+//
+// It is not hypothetical: `t` reached this repo's history three times and was
+// committed twice (afd448f, then again in b336e70 after 499b9f5 removed it).
+// The name is plausible enough to survive review and matches no .gitignore.
+//
+// Rejecting is safe because an operation code is never a sensible output
+// filename and `bit ar` has no listing mode for this to shadow.
+fn handleAr(a: []string) {
+  if (len(a) < 3) {
+    eprint("usage: bit ar <out.a> <obj.o...> [--target x86_64-linux|aarch64-linux|aarch64-macos|x86_64-windows]\n")
+    exit(2)
+    return
+  }
+  if (isArOperationCode(a[2])) {
+    eprint("bit ar: '${a[2]}' is a GNU ar operation code, not an output path.\n")
+    eprint("bit ar: usage is output-first: bit ar <out.a> <obj.o...>\n")
+    eprint("bit ar: to inspect an existing archive, use `ar t <archive>` or `nm <archive>`.\n")
+    eprint("bit ar: to write a file genuinely named '${a[2]}', spell it './${a[2]}'.\n")
+    exit(2)
+    return
+  }
+  if (!arCmd(a)) {
+    exit(1)
+  }
+}
+
+// `doc [--json] [--fields] <module-dir>`: the module's exported symbols,
+// derived from the checker rather than a hand-kept list (#1590). Dispatched
+// on argc >= 2 so a bare `bit doc` reports the usage error rather than the
+// banner, matching the seed. Exactly one operand must remain after the two
+// optional flags, accepted in either order.
+fn handleDoc(a: []string) {
+  let asJson = false
+  let withFields = false
+  let di = 2
+  while (di < len(a) && (a[di] == "--json" || a[di] == "--fields")) {
+    if (a[di] == "--json") {
+      asJson = true
+    } else {
+      withFields = true
+    }
+    di = di + 1
+  }
+  // Exit 2, like every other usage error here — 1 is what a doc run that
+  // actually ran and failed returns, and the two were indistinguishable.
+  if (di + 1 != len(a)) {
+    eprint("usage: bit doc [--json] [--fields] <module-dir|name>\n")
+    exit(2)
+    return
+  }
+  if (docCmd(a[di], asJson, withFields)) {
+    return
+  }
+  exit(1)
+}
+
+// Every `--dump-*` returns false iff its input could not be read, and each
+// exits 1 on that — they used to print to stdout and fall off the end of
+// `main` with status 0, which made every differential in
+// `scripts/selfhost-diff*.sh` capable of passing without comparing anything
+// (#2396). The exit lives here rather than in the dump so the handlers keep
+// the one-way-out shape the rest of this dispatch has.
+fn dumpOrExit(ok: bool) {
+  if (!ok) {
+    exit(1)
+  }
+}
+
+fn handleDumpTokens(a: []string) {
+  dumpOrExit(dumpTokens(a[2]))
+}
+
+fn handleDumpTypes(a: []string) {
+  dumpOrExit(dumpTypesCmd(a[2]))
+}
+
+// `--dump-ir-pre` renders the raw lowering; `--dump-ir` renders it after the
+// optimizer, matching the seed's two surfaces (#1338 / #1339 differentials).
+fn handleDumpIrPre(a: []string) {
+  dumpOrExit(dumpIrCmd(a[2], false))
+}
+
+fn handleDumpIr(a: []string) {
+  dumpOrExit(dumpIrCmd(a[2], true))
+}
+
+fn handleDumpAst(a: []string) {
+  dumpOrExit(dumpAstCmd(a[2]))
+}
+
+fn handleDumpDiags(a: []string) {
+  dumpOrExit(dumpDiagsCmd(a[2]))
+}
+
+// `lint` takes no mandatory operand — with no paths it lints `.` — so it is
+// dispatched on argc >= 2, unlike `check`/`run`/`test`.
+fn handleLint(a: []string) {
+  exit(lintCmd(a))
+}
+
+// `lsp` takes no operand — it speaks the language server protocol over stdio
+// until the client closes the stream. Dispatched on argc >= 2 like `lint`.
+fn handleLsp(a: []string) {
+  lspRun()
+}
+
+// `init [name]`: the name is OPTIONAL (§2262 — Bit's fs ABI has no getcwd,
+// so there is no directory name to default to), dispatched on argc >= 2
+// like `lint`/`lsp`, not argc >= 3 like `add`.
+fn handleInit(a: []string) {
+  exit(initCmd(a))
+}
+
+fn handleAdd(a: []string) {
+  exit(addCmd(a))
+}
+
+// `up [name]` / `update [name]`: the dependency name is OPTIONAL (refresh
+// everything), unlike `add`'s mandatory spec — dispatched on argc >= 2 like
+// `lint`/`lsp`, not argc >= 3. `update` is an exact alias, routed to the
+// same handler as `up`.
+fn handleUp(a: []string) {
+  exit(upCmd(a))
+}
+
+fn handleRemove(a: []string) {
+  exit(removeCmd(a))
+}
+
+// `list` takes no mandatory operand — dispatched on argc >= 2 like
+// `lint`/`lsp`/`init`, not argc >= 3 (#2271).
+fn handleList(a: []string) {
+  exit(listCmd(a))
+}
+
+// `why <name>` (#3511): dispatched on argc >= 2, like `list` — a missing
+// or surplus operand is `whyCmd`'s own usage error (pmcliwhy.bit), not
+// main's.
+fn handleWhy(a: []string) {
+  exit(whyCmd(a))
+}
+
+// `outdated` (#2368): takes no mandatory operand, dispatched on argc >= 2
+// like `list`/`why` — it reports every dependency in one run, there is no
+// per-name form.
+fn handleOutdated(a: []string) {
+  exit(outdatedCmd(a))
+}
+
+fn handleRun(a: []string) {
+  exit(runCmd(a[2], runForwardedArgs(a, 3)))
+}
+
+// A real `version` subcommand (#1451). It used to only APPEAR to work: every
+// unrecognized argument fell through to the banner below, so `bit version`
+// and `bit vresion` printed the same thing. The output is one machine-
+// readable line, byte-identical to the seed's, so installers and the
+// differential harnesses can compare the two compilers directly.
+fn handleVersion(a: []string) {
+  print("bit ${bitVersion}\n")
+}
+
+// `bit selfcheck`: the in-Bit self-tests, run by `./make test-selfcheck`.
+// EXPLICIT, because this used to be what no-args did. That was right while
+// `bit` was a bootstrap artifact and wrong the moment it shipped: a user who
+// typed `bit` got lock-file test fixtures ("pmlock check: no stale fixture to
+// remove") and a wait long enough to look like a hang, instead of usage.
+fn handleSelfcheck(a: []string) {
+  selfcheck()
+  print("bit ")
+  print(bitVersion)
+  print(" — selfcheck OK\n")
+}
+
+// One CLI subcommand: the exact spelling matched against `a[1]`, the argc
+// floor below which `a[1]` is present but its operand is missing (so `main`
+// falls through to the "missing operand" message instead of dispatching),
+// and the handler that owns everything past that point. Every handler has
+// the same shape as `dispatchCheck`/`dispatchFmt`/`dispatchTest`
+// (projectcli.bit, #3784) — a plain `fn (a: []string)` — so this table holds
+// those three directly alongside the ones declared above.
+class DispatchEntry {
+  name: string,
+  minArgc: int,
+  handler: ([]string) => (),
+}
+
+// The subcommand table `main` walks below. `a[1]` selects at most one name,
+// so order does not affect which entry matches — this lists commands in the
+// same order the old flat dispatch chain did, for a reader diffing against
+// history. `up`/`update` and the four `version` spellings are separate
+// entries sharing one handler, exactly as the two merged `if` conditions
+// they replace did.
+fn dispatchEntries(): []DispatchEntry {
+  return [
+    DispatchEntry{ name: "check", minArgc: 2, handler: dispatchCheck },
+    DispatchEntry{ name: "lint", minArgc: 2, handler: handleLint },
+    DispatchEntry{ name: "lsp", minArgc: 2, handler: handleLsp },
+    DispatchEntry{ name: "doc", minArgc: 2, handler: handleDoc },
+    DispatchEntry{ name: "init", minArgc: 2, handler: handleInit },
+    DispatchEntry{ name: "add", minArgc: 3, handler: handleAdd },
+    DispatchEntry{ name: "up", minArgc: 2, handler: handleUp },
+    DispatchEntry{ name: "update", minArgc: 2, handler: handleUp },
+    DispatchEntry{ name: "remove", minArgc: 3, handler: handleRemove },
+    DispatchEntry{ name: "list", minArgc: 2, handler: handleList },
+    DispatchEntry{ name: "why", minArgc: 2, handler: handleWhy },
+    DispatchEntry{ name: "outdated", minArgc: 2, handler: handleOutdated },
+    DispatchEntry{ name: "run", minArgc: 3, handler: handleRun },
+    DispatchEntry{ name: "test", minArgc: 2, handler: dispatchTest },
+    DispatchEntry{ name: "fmt", minArgc: 2, handler: dispatchFmt },
+    DispatchEntry{ name: "--dump-tokens", minArgc: 3, handler: handleDumpTokens },
+    DispatchEntry{ name: "--dump-types", minArgc: 3, handler: handleDumpTypes },
+    DispatchEntry{ name: "--dump-ir-pre", minArgc: 3, handler: handleDumpIrPre },
+    DispatchEntry{ name: "--dump-ir", minArgc: 3, handler: handleDumpIr },
+    DispatchEntry{ name: "--dump-ast", minArgc: 3, handler: handleDumpAst },
+    DispatchEntry{ name: "--dump-diags", minArgc: 3, handler: handleDumpDiags },
+    DispatchEntry{ name: "ar", minArgc: 2, handler: handleAr },
+    DispatchEntry{ name: "build", minArgc: 3, handler: handleBuild },
+    DispatchEntry{ name: "version", minArgc: 2, handler: handleVersion },
+    DispatchEntry{ name: "--version", minArgc: 2, handler: handleVersion },
+    DispatchEntry{ name: "-V", minArgc: 2, handler: handleVersion },
+    DispatchEntry{ name: "-v", minArgc: 2, handler: handleVersion },
+    DispatchEntry{ name: "selfcheck", minArgc: 2, handler: handleSelfcheck },
+  ]
+}
