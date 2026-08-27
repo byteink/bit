@@ -155,6 +155,106 @@ fn example() {
 }
 ```
 
+## Timer channels
+
+Built on the scheduler's own timer-channel primitives: arming a timer claims
+one of a fixed pool of slots and queues it against the scheduler's timer
+wheel. Nothing here spawns a green thread; expiry is a plain send on the
+channel. A duration `d` is nanoseconds, the same unit `sleep` takes.
+
+### `after(d: int): chan<bool>`
+
+A channel that receives `true` once, `d` nanoseconds from now — the
+idiomatic `select` timeout arm. If the timeout arm is never taken, the pool
+slot leaks only until its own deadline: it fires and self-frees regardless,
+so the leak is bounded by `d`, never permanent. In a loop, prefer `newTimer`
+and `Timer.reset` over a fresh `after` each iteration, which would otherwise
+accumulate one live slot per iteration between fires.
+
+### `Timer`
+
+A one-shot timer. `c` receives `true` once, when the timer fires.
+
+### `newTimer(d: int): Timer`
+
+Starts a one-shot `Timer` that fires `d` nanoseconds from now.
+
+### `Timer.stop(): bool`
+
+Cancels the timer. Returns `true` when it was still pending, `false` when it
+had already fired. Does not drain `c` — a fired timer's buffered `true`
+value stays there, matching Go's own `Timer.Stop`: `if !t.stop() { <-t.c }`
+drains it before reuse.
+
+### `Timer.reset(d: int): bool`
+
+Re-arms the timer for `d` nanoseconds from now. Returns `false`, with no
+effect, when the timer already fired: its pool slot was freed at fire time,
+so there is no entry left to move and no second value will ever arrive on
+`c`. Build a new `Timer` with `newTimer` instead of trying to resurrect a
+fired one.
+
+### `Ticker`
+
+A repeating timer. `c` receives `true` every `d` nanoseconds until stopped.
+An un-stopped `Ticker` leaks its pool slot forever — the same caveat Go's own
+`time.Ticker` documents.
+
+### `newTicker(d: int): Ticker`
+
+Starts a `Ticker` that ticks every `d` nanoseconds.
+
+### `Ticker.stop(): bool`
+
+Cancels the ticker. Returns `true` when it was still pending, `false`
+otherwise. After this returns, `c` receives no further ticks.
+
+### `tick(d: int): chan<bool>`
+
+A channel that receives `true` every `d` nanoseconds, forever. There is no
+way to stop it — the underlying `Ticker` is discarded, so its pool slot
+leaks for the life of the program. Use `newTicker` directly when the ticker
+must ever be stopped.
+
+```bit
+import { after, newTimer, newTicker, tick, Millisecond } from "std/time"
+
+fn waitForWork(work: chan<int>): int {
+  select {
+    case v = <- work:
+      return v
+    case <- after(100 * Millisecond):
+      return -1
+  }
+}
+
+fn pollFiveTimes(): int {
+  let t = newTicker(50 * Millisecond)
+  let n = 0
+  while (n < 5) {
+    let v = <- t.c
+    n = n + 1
+  }
+  t.stop()
+  return n
+}
+
+fn countdown(): int {
+  let deadline = newTimer(200 * Millisecond)
+  let ticks = tick(50 * Millisecond)
+  let n = 0
+  while (true) {
+    select {
+      case <- ticks:
+        n = n + 1
+      case <- deadline.c:
+        return n
+    }
+  }
+  return n
+}
+```
+
 ## Converting a duration
 
 ### `millis(d: int): int`
