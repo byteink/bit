@@ -49,14 +49,17 @@
 // falling back to a raw hex address exactly like ABI.md §4.2's own
 // convention (mirroring `sample`'s "??? (0x...)" for an unresolved sample).
 //
-// NOT FUNCTION NAMES — STILL OUT OF #3285's SCOPE, THOUGH THE DATA NOW
-// EXISTS. At the time this walker was first written, ABI.md §4.2's wire
-// format carried no name field at all; #3662 has since landed and added a
-// per-entry `name_hdr_ptr` (bumping `format_version` 1 -> 2, below), so a
-// function's display name IS now in the table this walker already reads.
-// This walker still prints `file:line` only, deliberately: #3285's own
-// acceptance scopes it to file:line, and consuming `name_hdr_ptr` to print a
-// name is new work, not a fix — filed separately rather than folded in here.
+// FUNCTION NAMES (#3820). #3285 shipped `file:line` only, because at the time
+// ABI.md §4.2's wire format carried no name field; #3662 added the per-entry
+// `name_hdr_ptr` (bumping `format_version` 1 -> 2, below) but this walker did
+// not yet consume it. It now does: `btLookup` resolves the CURRENT function's
+// name once per entry (not once per row — a function's name does not vary row
+// to row the way its rows' files can) and `btFormatFrame` prints it ahead of
+// `file:line` when present, e.g. `  at helper (panictest.bit:2)`. Same degrade
+// rule as everything else in this file: a zero (missing) or otherwise
+// unusable `name_hdr_ptr` — the synthetic-corruption case this ticket's own
+// acceptance calls for — drops the name and falls back to the unchanged
+// `file:line` form, never blocks it and never calls `bit_rt_panic`.
 
 // No imports: `loadWord`/`storeWord`/`loadByte`/`storeByte` (./root.bit's own
 // "../gc" import), `strPtr`/`strLen` (./root.bit), `ptrOf`/`debugLinesBegin`/
@@ -84,6 +87,14 @@ const btMaxFuncs: int = 4194304
 // Binary search over a `u16 numRows` (max 65535): log2(65536) = 16 halvings,
 // rounded up with margin.
 const btMaxRowIters: int = 20
+
+// A display name longer than this is truncated (never overrun) — ample for
+// any real Bit identifier, and fixing it as a compile-time constant keeps
+// `btFormatFrame`'s file-path budget a simple subtraction rather than a
+// recomputation after the name's actual (post-clamp) length is known. Mirrors
+// the "silently truncated, never overrun" degrade `btFormatFrame`'s own file
+// path already uses below.
+const btMaxNameLen: int = 48
 
 // Matches `compiler/codegen.bit`'s `dbgFormatVersion`. A mismatch degrades
 // that one function's rows to "no record" (ABI.md §4.2) — never a panic.
@@ -127,12 +138,37 @@ const btFormatVersion: int = 2
 // Per-frame lookup result — module state, not a composite return (ABI.md
 // §1.1: a multi-value return boxes on the heap; a class return is a heap
 // object too — both are wrong on this path, per #3285's own constraint).
-// Written only by `btSearchRows`, read only by `btFormatFrame`, both called
-// strictly sequentially from `btPrintTrace`'s single-threaded walk.
+// `btRowFileAddr`/`btRowFileLen`/`btRowLine` are written only by
+// `btSearchRows` (once per ROW); `btRowNameAddr`/`btRowNameLen` are written
+// only by `btSetName` (once per ENTRY — #3820, a function's name does not
+// vary row to row). All five are read only by `btFormatFrame`, and every
+// writer and reader is called strictly sequentially from `btPrintTrace`'s
+// single-threaded walk.
 // ---------------------------------------------------------------------------
 let btRowFileAddr: [1]i64
 let btRowFileLen: [1]i64
 let btRowLine: [1]i64
+let btRowNameAddr: [1]i64
+let btRowNameLen: [1]i64
+
+// Resolves the CURRENT function's display name from its entry's
+// `name_hdr_ptr` (ABI.md §4.2, one per entry, #3662) into the module-state
+// pair above, the same `{ptr,len}` string-pool header shape `btSearchRows`
+// already reads for `file_hdr_ptr`. A zero pointer — absent by construction
+// in a real linked table, but exactly the shape a hand-corrupted synthetic
+// entry takes — means "no name": `btRowNameLen` is left at 0 and
+// `btFormatFrame`'s name branch is then simply skipped. Never dereferences a
+// nonzero-but-implausible pointer beyond the one read `bit_rt_panic`'s own
+// degrade contract already accepts for `file_hdr_ptr` — this is the same
+// trust boundary, not a new one.
+@nosplit fn btSetName(nameHdrPtr: int) {
+  if (nameHdrPtr == 0) {
+    storeWord(int(ptrOf(btRowNameLen)), 0)
+    return
+  }
+  storeWord(int(ptrOf(btRowNameAddr)), loadWord(nameHdrPtr + strPtr))
+  storeWord(int(ptrOf(btRowNameLen)), loadWord(nameHdrPtr + strLen))
+}
 
 // Binary search `rowsOff`'s `numRows` rows (ABI.md §4.2: sorted ascending by
 // `pcOffset` within one function, by construction) for the greatest
@@ -184,14 +220,15 @@ let btRowLine: [1]i64
     let numRows = btBlobU16(dbgBase, off + 14)
     // Header is 24 bytes since #3662 (ABI.md §4.2): code_addr(8) +
     // format_version(2) + code_size(4) + num_rows(2) + name_hdr_ptr(8) = 24.
-    // `name_hdr_ptr` (off+16..off+24) is never read here -- this walker
-    // prints file:line only (#3662 tracks the name-printing follow-up).
+    // `name_hdr_ptr` (off+16..off+24) is read below, on a hit, via
+    // `btSetName` (#3820) -- one read per ENTRY, not per row.
     let entryLen = 24 + numRows * 16
     if (!btInBlob(off, entryLen, dbgLen)) {
       return 0
     }
     let hit = version == btFormatVersion && pc >= codeAddr && pc < codeAddr + codeSize
     if (hit) {
+      btSetName(btBlobU64(dbgBase, off + 16))
       return btSearchRows(dbgBase, off + 24, numRows, pc - codeAddr)
     }
     off = off + entryLen
@@ -208,10 +245,16 @@ let btRowLine: [1]i64
 // already issued), so there is no live reader of the earlier contents.
 // ---------------------------------------------------------------------------
 
-// "  at " (5 bytes) and ":" (1 byte), packed little-endian exactly as
-// ./darwin/io.bit's `panicPrefixWord` — computed, not hand-derived.
+// "  at " (5 bytes), " (" (2 bytes), ")" (1 byte) and ":" (1 byte), packed
+// little-endian exactly as ./darwin/io.bit's `panicPrefixWord` — computed,
+// not hand-derived. " (" / ")" (#3820) wrap the function name when one
+// resolves; `btColonWord` still separates file from line either way.
 const btAtPrefixWord: int = 139391475744
 const btAtPrefixLen: int = 5
+const btOpenParenWord: int = 10272 // ' ' (32) | '(' (40) << 8
+const btOpenParenLen: int = 2
+const btCloseParenWord: int = 41 // ')'
+const btCloseParenLen: int = 1
 const btColonWord: int = 58
 const btNewlineWord: int = 10
 const btNewlineLen: int = 1
@@ -262,31 +305,51 @@ const btNewlineLen: int = 1
 }
 
 // Formats one frame line into `ioLineSlotAddr()` and returns its length:
-// "  at <file>:<line>\n" when `found` (from `btLookup`) is nonzero, or
-// "  at 0x<16 hex digits>\n" otherwise. The file path is clamped to what
-// fits alongside the fixed prefix, a colon, up to 10 decimal digits and the
-// newline within `ioLineCap` — this trace is diagnostic, so a silently
-// truncated (never overrun) long path is an acceptable degrade, matching the
+// "  at <name> (<file>:<line>)\n" when `found` (from `btLookup`) is nonzero
+// AND a name resolved (#3820), "  at <file>:<line>\n" when found but no name
+// resolved (the corrupt/missing-`name_hdr_ptr` degrade), or
+// "  at 0x<16 hex digits>\n" when not found at all. The name is clamped to
+// `btMaxNameLen` and the file path to whatever budget remains within
+// `ioLineCap` after the fixed prefix, the parens (if any), a colon and up to
+// 10 decimal digits — this trace is diagnostic, so a silently truncated
+// (never overrun) long name or path is an acceptable degrade, matching the
 // "never truncates the common case, narrows the race window for the rest"
 // spirit `panicWrite` already established for the message line itself.
 @nosplit fn btFormatFrame(pc: int, found: int): int {
   let addr = ioLineSlotAddr()
   ioLineAppendWord(addr, btAtPrefixWord, btAtPrefixLen)
   let off = btAtPrefixLen
-  if (found != 0) {
-    let fileAddr = loadWord(int(ptrOf(btRowFileAddr)))
-    let fileLen = loadWord(int(ptrOf(btRowFileLen)))
-    let maxFile = ioLineCap - btAtPrefixLen - 1 - 10 - btNewlineLen
-    if (fileLen > maxFile) {
-      fileLen = maxFile
-    }
-    ioLineCopyBytes(addr + off, fileAddr, fileLen)
-    off = off + fileLen
-    ioLineAppendWord(addr + off, btColonWord, 1)
-    off = off + 1
-    off = btAppendDecimal(addr, off, loadWord(int(ptrOf(btRowLine))))
-  } else {
+  if (found == 0) {
     off = btAppendHex(addr, off, pc)
+    ioLineAppendWord(addr + off, btNewlineWord, btNewlineLen)
+    return off + btNewlineLen
+  }
+  let nameLen = loadWord(int(ptrOf(btRowNameLen)))
+  let hasName = nameLen > 0
+  let maxFile = ioLineCap - btAtPrefixLen - 1 - 10 - btNewlineLen
+  if (hasName) {
+    if (nameLen > btMaxNameLen) {
+      nameLen = btMaxNameLen
+    }
+    ioLineCopyBytes(addr + off, loadWord(int(ptrOf(btRowNameAddr))), nameLen)
+    off = off + nameLen
+    ioLineAppendWord(addr + off, btOpenParenWord, btOpenParenLen)
+    off = off + btOpenParenLen
+    maxFile = maxFile - nameLen - btOpenParenLen - btCloseParenLen
+  }
+  let fileAddr = loadWord(int(ptrOf(btRowFileAddr)))
+  let fileLen = loadWord(int(ptrOf(btRowFileLen)))
+  if (fileLen > maxFile) {
+    fileLen = maxFile
+  }
+  ioLineCopyBytes(addr + off, fileAddr, fileLen)
+  off = off + fileLen
+  ioLineAppendWord(addr + off, btColonWord, 1)
+  off = off + 1
+  off = btAppendDecimal(addr, off, loadWord(int(ptrOf(btRowLine))))
+  if (hasName) {
+    ioLineAppendWord(addr + off, btCloseParenWord, btCloseParenLen)
+    off = off + btCloseParenLen
   }
   ioLineAppendWord(addr + off, btNewlineWord, btNewlineLen)
   return off + btNewlineLen
