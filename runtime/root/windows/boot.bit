@@ -150,14 +150,22 @@ import { pollCreate, pollClose, pollDrain, winSpawnTrampoline } from "../../sche
 import { threadStackBytes } from "../../thread"
 import { parkMinBackoffNs, parkMaxBackoffNs, parkNextBackoff } from "../../park"
 import { parkMonoNs, parkSleepNs, parkWait, parkWake } from "../../park/windows"
-import { mapPages, unmapPages, protectPages } from "../../alloc/windows"
+import { mapPages, unmapPages, protectPages, guardPages } from "../../alloc/windows"
 import {
   rootBindMemory, rootInit, rootConfigureFromEnv, rootEnvMarkStack,
   rootEnvWorkers, rootEnvVerbose,
 } from "../../root"
 import { rootGcAddr, rootWorldAddr } from "../../root"
 import { chanBootBind } from "../../chan"
-import { gcBlockingBegin, gcBlockingEnd, gcThreadEnter, gcThreadExit, gcDefaultMinTrigger, gcDefaultMarkStack, gcDefaultGrowthPct } from "../../gc"
+import {
+  gcBlockingBegin,
+  gcBlockingEnd,
+  gcThreadEnter,
+  gcThreadExit,
+  gcDefaultMinTrigger,
+  gcDefaultMarkStack,
+  gcDefaultGrowthPct,
+} from "../../gc"
 import { stwBind } from "../../stw"
 
 // The per-program entry the compiled user object defines (ABI.md §10),
@@ -171,8 +179,10 @@ extern fn bit_main(): i32
 // ---------------------------------------------------------------------------
 
 extern fn ExitProcess(code: i32)
-extern fn CreateThread(attrs: *byte, stackSize: i64, startAddr: *byte,
-    param: *byte, flags: i32, threadIdOut: *i32): *byte
+extern fn CreateThread(
+  attrs: *byte, stackSize: i64, startAddr: *byte,
+  param: *byte, flags: i32, threadIdOut: *i32,
+): *byte
 // `WaitForSingleObject` here is ONLY for joining a worker's real CreateThread
 // HANDLE (step 8 below) — the monotonic-clock and idle-sleep declarations
 // this file used to carry (`QueryPerformanceCounter`/`_Frequency`,
@@ -269,6 +279,54 @@ const chanReserveBytes: int = 1048576
   return addr - addr % schedStackBytes
 }
 
+// #3652: the size of the plain, committed PAGE_READWRITE slack placed BELOW
+// the PAGE_GUARD trip page in the guard hole (see mapGuardedStack below).
+// Windows' exception dispatch writes its CONTEXT + EXCEPTION_RECORD trap
+// frame (~1.4 KiB per ../signal.bit's verified sizeof) at addresses BELOW
+// the faulting sp, never above it -- confirmed by ../signal.bit's own header:
+// an ordinary access-violation probe found the handler's own Rsp only 36
+// bytes from a value captured immediately before the fault, i.e. the whole
+// dispatch apparatus lands in the small range right under where the fault
+// happened. So the slack has to sit on the low-address side of the trip
+// page, not the high-address side facing the live stack -- an overrun never
+// touches it at all until the trip page has already faulted. 64 KiB, not
+// independently tuned: the same figure ../signal.bit's `stackGuaranteeBytes`
+// already established sufficient for a VEH to run a real handler to
+// completion after a dispatchable fault on this OS (that constant is not
+// reused directly -- these two guards are separate mechanisms, deliberately
+// not coupled to each other).
+const stackDispatchSlackBytes: int = 65536
+
+// Install the three-way split guard hole immediately below `base` — see
+// mapGuardedStack's own comment for the layout and why. Split out of
+// mapGuardedStack to keep that function's own complexity at its pre-#3652
+// count (docs/development.md's file-size rule's sibling, E0204).
+//
+// STATUS: VERIFIED, but only in combination with ../io.bit's
+// writeConstSignalSafe/rootWriteAllSignalSafe -- NEITHER alone is
+// sufficient, both proven independently on mustafa-desktop-win (native, 3-6
+// runs each): this trip page alone still crashed identically to the
+// PAGE_NOACCESS-only baseline (0xC0000005, no message), because the
+// diagnostic-emission path second-faulted inside the now-reachable handler
+// the same way ../linux/signal.bit's writeConst did (#3728) -- there is no
+// altstack on Windows, so ../signal.bit's vehHandler runs with the CURRENT
+// sp sitting in this guard hole's own slack, and the unsafe masked lookup
+// dereferences a tag address inside the wall below it. Conversely the
+// signal-safe write alone, with the ORIGINAL single PAGE_NOACCESS wall
+// (no trip page), also still crashed identically, because dispatch of the
+// original fault itself never reached the handler at all -- the kernel had
+// nowhere committed below the faulting sp to write its own CONTEXT +
+// EXCEPTION_RECORD trap frame. Together: 10/10 clean runs, both repro
+// programs, printing the expected diagnostic and exiting 2.
+@nosplit fn mapGuardHole(base: int): bool {
+  let tripPageBase = base - pageSize
+  if (!guardPages(tripPageBase, pageSize)) {
+    return false
+  }
+  let wallBytes = schedStackBytes - pageSize - stackDispatchSlackBytes
+  return protectPages(tripPageBase - stackDispatchSlackBytes - wallBytes, wallBytes)
+}
+
 @nosplit fn mapGuardedStack(bytes: int): int {
   if (bytes <= 0) {
     return 0
@@ -278,10 +336,20 @@ const chanReserveBytes: int = 1048576
     return 0
   }
   let base = alignUpStack(region + schedStackBytes)
-  if (!schedStackAligned(base) || base < region + schedStackBytes || base - region >= 2 * schedStackBytes) {
+  if (!schedStackAligned(base) ||
+    base < region + schedStackBytes ||
+    base - region >= 2 * schedStackBytes) {
     return 0
   }
-  if (!protectPages(base - schedStackBytes, schedStackBytes)) {
+  // The guard hole is split three ways rather than one uniform PAGE_NOACCESS
+  // wall -- see ../signal.bit's header for why a green task overflowing
+  // straight into PAGE_NOACCESS can never be diagnosed. From `base` downward:
+  // `stackDispatchSlackBytes` of plain PAGE_READWRITE slack, one PAGE_GUARD
+  // trip page (the actual detector -- touching it raises a dispatchable
+  // STATUS_GUARD_PAGE_VIOLATION in ../signal.bit's `vehHandler`, with the
+  // slack still sitting above the faulting sp), then a hard PAGE_NOACCESS
+  // wall for the remainder of the granule as a backstop.
+  if (!mapGuardHole(base)) {
     return 0
   }
   let headSlop = base - schedStackBytes - region
@@ -496,8 +564,10 @@ export @nosplit @symbol("bit_rt_spawn") fn rtSpawn(entry: *byte, arg: int) {
     winSpawnFatal(70)
   }
   *(taskAt(taskAddr) + taskSpawnEntry) = int(entry)
-  schedTaskInit(taskAt(taskAddr), stackBase, schedStackBytes,
-                entryOf(winSpawnTrampoline), arg)
+  schedTaskInit(
+    taskAt(taskAddr), stackBase, schedStackBytes,
+    entryOf(winSpawnTrampoline), arg,
+  )
   schedSpawn(s, taskAddr)
 }
 
@@ -591,8 +661,10 @@ fn boot(): int {
   if (chanMem == 0) {
     return 70
   }
-  chanBootBind(int(ptrOf(chanReserveDesc)), chanMem, chanReserveBytes,
-               int(ptrOf(chanRegBlock)), int(sched))
+  chanBootBind(
+    int(ptrOf(chanReserveDesc)), chanMem, chanReserveBytes,
+    int(ptrOf(chanRegBlock)), int(sched),
+  )
 
   // 4d. Arm stop-the-world.
   stwBind(rootGcAddr(), int(sched), int(ptrOf(chanRegBlock)), rootWorldAddr())
@@ -630,8 +702,10 @@ fn boot(): int {
     let argPtr = z + workerAddr
     let flags = STACK_SIZE_PARAM_IS_A_RESERVATION
     let nullAttrs: *byte = nil
-    let handle = CreateThread(nullAttrs, i64(threadStackBytes),
-                               entryOf(workerBody), argPtr, flags, ptrOf(winThreadIdScratch))
+    let handle = CreateThread(
+      nullAttrs, i64(threadStackBytes),
+      entryOf(workerBody), argPtr, flags, ptrOf(winThreadIdScratch),
+    )
     *(ptrOf(startHandles) + wi) = int(handle)
     if (int(handle) == 0) {
       if (wi == 0) {
@@ -716,5 +790,5 @@ export @symbol("_start") fn winMain(): i32 {
   winCaptureArgsEnv()
   let code = boot()
   ExitProcess(i32(code))
-  return i32(code)   // unreached: ExitProcess does not return.
+  return i32(code) // unreached: ExitProcess does not return.
 }

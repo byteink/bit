@@ -50,26 +50,65 @@
 // `ExceptionCode == 0xC00000FD`, not `0xC0000005`.
 //
 // BUT A BIT GREEN TASK'S STACK IS NOT THE OS THREAD'S NATIVE STACK, SO THIS
-// FILE STILL NEEDS ../darwin's HEURISTIC FOR THAT CASE. Every green task
-// (including `bit_main`'s own task) runs on a separately `mapGuardedStack`'d
-// region (../boot.bit) whose guard hole is `VirtualProtect(..., PAGE_NOACCESS)`
-// (../../alloc/windows/pages.bit's `protectPages`) — an ordinary inaccessible
-// mapping the kernel has no notion is "a stack", NOT the special `PAGE_GUARD`
-// region tied to a thread's own TEB. So a green task overrunning ITS stack
-// raises the SAME generic `STATUS_ACCESS_VIOLATION` a bad pointer would, and
-// `vehHandler` classifies it exactly the way ../darwin's `segvHandler` does:
-// compare the faulting address and the saved `Rsp` against `mainStackBaseAddr`
-// / `schedTaskOnStack`, with the same accepted false-negative this runtime
-// already lives with on the other two platforms (#2433's guard-hole-width
-// gap; not this ticket's to fix). `STATUS_STACK_OVERFLOW` is therefore the
-// DEFENSIVE case here — the boot/worker OS thread's OWN native stack
-// (`threadStackBytes`, 16 MiB) running out before any task ever switches onto
-// it, e.g. a scheduler bug — not the path ordinary user recursion takes.
-// Both are handled, both point at the identical `classifyOverflowTrap`
-// (a straight port of ../darwin's, unchanged), because neither carries a
-// faulting address that means anything as a MEMORY location — `sp` is the
-// only useful signal either way, exactly ../darwin's `trapHandler`'s own
-// SIGTRAP/SIGILL case.
+// FILE STILL NEEDS ../darwin's HEURISTIC FOR THAT CASE, AND (#3652) A SECOND
+// MECHANISM BESIDES. Every green task (including `bit_main`'s own task) runs
+// on a separately `mapGuardedStack`'d region (../boot.bit) whose guard hole
+// is now a THREE-WAY SPLIT (../boot.bit's `mapGuardHole`, #3652), not a
+// single `VirtualProtect(..., PAGE_NOACCESS)` wall: from the live stack
+// downward, `stackDispatchSlackBytes` (64 KiB) of plain committed
+// PAGE_READWRITE slack, one `PAGE_GUARD` trip page
+// (../../alloc/windows/pages.bit's `guardPages`), then a PAGE_NOACCESS
+// backstop for the remainder. A green task overrunning its stack now raises
+// a dispatchable `STATUS_GUARD_PAGE_VIOLATION` (`excGuardPage` below) the
+// FIRST time it touches the trip page, sharing `EXCEPTION_ACCESS_VIOLATION`'s
+// `ExceptionInformation` layout, so `vehHandler` classifies it exactly the
+// way ../darwin's `segvHandler` does: compare the faulting address and the
+// saved `Rsp` against `mainStackBaseAddr`/`schedTaskOnStack`, with the same
+// accepted false-negative this runtime already lives with on the other two
+// platforms (#2433's guard-hole-width gap; not this ticket's to fix).
+// `STATUS_STACK_OVERFLOW` is therefore the DEFENSIVE case here — the
+// boot/worker OS thread's OWN native stack (`threadStackBytes`, 16 MiB)
+// running out before any task ever switches onto it, e.g. a scheduler bug —
+// not the path ordinary user recursion takes. Both are handled, both point
+// at the identical `classifyOverflowTrap` (a straight port of ../darwin's,
+// unchanged), because neither carries a faulting address that means
+// anything as a MEMORY location — `sp` is the only useful signal either way,
+// exactly ../darwin's `trapHandler`'s own SIGTRAP/SIGILL case.
+//
+// WHY THE TRIP PAGE ALONE COULD NOT WORK, AND NEITHER COULD THE OTHER HALF
+// ALONE — #3652's central finding, verified on real hardware, not reasoned.
+// A plain `PAGE_NOACCESS` guard hole cannot be diagnosed at all: the kernel's
+// own exception dispatch needs committed, writable memory BELOW the faulting
+// `sp` to construct its CONTEXT + EXCEPTION_RECORD trap frame (same
+// requirement `SetThreadStackGuarantee` exists to satisfy for a THREAD's own
+// native stack — see below), and a `PAGE_NOACCESS` hole offers none, so the
+// dispatch attempt itself second-faults and the process dies with the
+// ORIGINAL exception code and `vehHandler` never runs at all. The
+// `PAGE_GUARD` trip page fixes exactly that: it is real committed memory
+// once it exists (the slack sitting below it, on the LOW-address side —
+// Windows' dispatch frame lands below the faulting `sp`, never above it,
+// confirmed by this file's own probe further down finding the handler's
+// `Rsp` only 36 bytes from the pre-fault value on the SAME thread), so the
+// trap frame lands there and `vehHandler` genuinely starts running. But that
+// alone was STILL not enough: `vehHandler` calls `writeConst` to emit its
+// diagnostic, and `writeConst`'s scratch-slot lookup masks the CURRENT `sp`
+// down to `schedStackBytes` to find a task tag — safe from a real task or
+// worker stack, unsafe here, because with no altstack the handler is running
+// with `sp` inside the guard hole's OWN granule, one `schedStackBytes` below
+// the live stack's registered floor, and `schedTaskOnStack` dereferences a
+// tag address computed from THAT wrong floor, landing in the wall below —
+// the identical class of bug #3728 fixed on Linux (`writeConst`'s masked
+// slot lookup, unsafe from a signal handler's abnormal stack), reached here
+// by a different route (no altstack vs. a genuinely wrong floor). The fix is
+// the same shape: ../io.bit's `writeConstSignalSafe`/
+// `rootWriteAllSignalSafe` use the fixed fallback slot directly, no masking
+// at all. BOTH mechanisms were tested in isolation on mustafa-desktop-win
+// (native): the trip page alone still crashed identically to the
+// `PAGE_NOACCESS`-only baseline (0xC0000005, no message, 6/6 runs); the
+// signal-safe write alone, against the ORIGINAL single-wall guard hole, also
+// crashed identically (6/6) because dispatch never reached the handler to
+// begin with. Combined: 10/10 clean runs across both repro programs, each
+// printing its expected diagnostic and exiting 2.
 //
 // EVERY STRUCT OFFSET AND EXCEPTION-CODE CONSTANT BELOW WAS READ OFF A REAL
 // RUN ON mustafa-desktop-win, NOT FROM MEMORY. This Mac has no Windows SDK to
@@ -134,24 +173,25 @@
 // mechanism behind the original numbers, only that the configuration that
 // produced them no longer exists on `main`.
 //
-// The real remaining problem is dispatch, not placement, and it is NARROWER
-// than "a green task's stack overflow never dispatches": an ORDINARY access
-// violation on the SAME green task's stack (a deliberate null-pointer write
-// in `bit_main`, plenty of headroom below `rsp`) dispatches through this
-// handler and reports "bit: fatal signal: segmentation fault" correctly with
-// only the default 2 OS threads (boot thread parked, one worker). Only a
+// The real remaining problem WAS dispatch, not placement, and it was
+// NARROWER than "a green task's stack overflow never dispatches": an
+// ORDINARY access violation on the SAME green task's stack (a deliberate
+// null-pointer write in `bit_main`, plenty of headroom below `rsp`)
+// dispatched through this handler and reported "bit: fatal signal:
+// segmentation fault" correctly even before #3652's fix, with only the
+// default 2 OS threads (boot thread parked, one worker). Only a
 // stack-EXHAUSTION fault — by definition almost no headroom left below `rsp`
-// at fault time, on the native thread's own stack OR a green task's — fails
-// to reach this handler at all (silent `ExitProcess`-free process death,
-// raw `0xC0000005` as the exit code). #3704's own second finding (comment 2)
-// describes a workaround (a third, actively-running OS thread); three
-// attempts to reproduce it here (a spawned Bit task busy-looping on a second
-// worker, and a raw runtime-oblivious `CreateThread` started both after and
-// before worker bring-up) all still failed to dispatch, so that workaround is
-// NOT confirmed reliable and nothing here depends on it. Filed back onto
-// #3652, which owns the actual remaining question: why Windows does not
-// deliver an exception on a thread whose current stack has no headroom left,
-// and what (if anything) can be done about it from this side.
+// at fault time, on the native thread's own stack OR a green task's —
+// failed to reach this handler at all (silent `ExitProcess`-free process
+// death, raw `0xC0000005` as the exit code). #3704's own second finding
+// (comment 2) described a workaround (a third, actively-running OS thread);
+// three attempts to reproduce it could not, so it was never confirmed
+// reliable and nothing here depends on it. #3652 RESOLVED this: see the
+// "WHY THE TRIP PAGE ALONE COULD NOT WORK" section above for the two
+// mechanisms it took together — the `PAGE_GUARD` trip page (../boot.bit's
+// `mapGuardHole`) gives the kernel's own exception dispatch somewhere
+// committed to land, and ../io.bit's `writeConstSignalSafe` stops the
+// now-reachable handler from second-faulting on its own diagnostic write.
 //
 // WHAT THIS DOES AND DOES NOT DO IN THE HANDLER, PER THE TICKET'S CONSTRAINT.
 // `vehHandler` and everything it calls (`classifyOverflowTrap`, the `emit*`
@@ -223,6 +263,14 @@ const ctxRspOff: int = 152
 const excAccessViolation: int = 0xC0000005
 const excStackOverflow: int = 0xC00000FD
 const excIllegalInstruction: int = 0xC000001D // #2432/#2946's x64 `ud2` trap
+// #3652: STATUS_GUARD_PAGE_VIOLATION, raised the first time a thread
+// touches a PAGE_GUARD page (../../alloc/windows/pages.bit's `guardPages`,
+// ../boot.bit's `mapGuardedStack`'s trip page). Shares
+// EXCEPTION_RECORD.ExceptionInformation's layout with excAccessViolation
+// (index 1 is the faulting virtual address, same as an access violation --
+// documented identically for both codes), so `vehHandler` below classifies
+// it through the exact same faultAddr/sp double-check.
+const excGuardPage: int = 0x80000001
 
 // `EXCEPTION_CONTINUE_SEARCH` — hand the exception to the next handler
 // (another VEH, an SEH frame, or the OS default action) unchanged. This file
@@ -274,19 +322,19 @@ const overflowSpawned: int = 2
 // criterion), and it is platform-independent ASCII, so the same packed words
 // are correct here unchanged.
 @nosplit fn emitMainStackOverflow() {
-  writeConst(stderrFd, 7022364301234301282, 8) // "bit: sta"
-  writeConst(stderrFd, 7382074298558606179, 8) // "ck overf"
-  writeConst(stderrFd, 175599468, 4)           // "low\n"
+  writeConstSignalSafe(stderrFd, 7022364301234301282, 8) // "bit: sta"
+  writeConstSignalSafe(stderrFd, 7382074298558606179, 8) // "ck overf"
+  writeConstSignalSafe(stderrFd, 175599468, 4)           // "low\n"
   rootExit(2)
 }
 
 // "bit: stack overflow in a spawned task\n" — same reuse as above.
 @nosplit fn emitSpawnedStackOverflow() {
-  writeConst(stderrFd, 7022364301234301282, 8) // "bit: sta"
-  writeConst(stderrFd, 7382074298558606179, 8) // "ck overf"
-  writeConst(stderrFd, 6998715218729070444, 8) // "low in a"
-  writeConst(stderrFd, 7234309835455492896, 8) // " spawned"
-  writeConst(stderrFd, 11456613544992, 6)      // " task\n"
+  writeConstSignalSafe(stderrFd, 7022364301234301282, 8) // "bit: sta"
+  writeConstSignalSafe(stderrFd, 7382074298558606179, 8) // "ck overf"
+  writeConstSignalSafe(stderrFd, 6998715218729070444, 8) // "low in a"
+  writeConstSignalSafe(stderrFd, 7234309835455492896, 8) // " spawned"
+  writeConstSignalSafe(stderrFd, 11456613544992, 6)      // " task\n"
   rootExit(2)
 }
 
@@ -299,22 +347,29 @@ const overflowSpawned: int = 2
 // `classifyOverflowTrap` could not attribute the native-thread overflow to a
 // known Bit stack (see the header — the defensive case, not the common one).
 @nosplit fn emitFatalSignal(code: int) {
-  writeConst(stderrFd, 8386096269746268514, 8) // "bit: fat"
-  writeConst(stderrFd, 7020662571717913697, 8) // "al signa"
+  writeConstSignalSafe(stderrFd, 8386096269746268514, 8) // "bit: fat"
+  writeConstSignalSafe(stderrFd, 7020662571717913697, 8) // "al signa"
   if (code == excAccessViolation) {
-    writeConst(stderrFd, 7308611455713032812, 8) // "l: segme"
-    writeConst(stderrFd, 2336927755366659182, 8) // "ntation "
-    writeConst(stderrFd, 11495152116070, 6)      // "fault\n"
+    writeConstSignalSafe(stderrFd, 7308611455713032812, 8) // "l: segme"
+    writeConstSignalSafe(stderrFd, 2336927755366659182, 8) // "ntation "
+    writeConstSignalSafe(stderrFd, 11495152116070, 6)      // "fault\n"
   } else if (code == excIllegalInstruction) {
-    writeConst(stderrFd, 7450480371430341228, 8) // "l: illeg"
-    writeConst(stderrFd, 8247343735669550177, 8) // "al instr"
-    writeConst(stderrFd, 2936174556767093, 7)    // "uction\n"
+    writeConstSignalSafe(stderrFd, 7450480371430341228, 8) // "l: illeg"
+    writeConstSignalSafe(stderrFd, 8247343735669550177, 8) // "al instr"
+    writeConstSignalSafe(stderrFd, 2936174556767093, 7)    // "uction\n"
   } else {
-    writeConst(stderrFd, 7738135737528236652, 8) // "l: stack"
-    writeConst(stderrFd, 8028904877209317152, 8) // " overflo"
-    writeConst(stderrFd, 2679, 2)                // "w\n"
+    writeConstSignalSafe(stderrFd, 7738135737528236652, 8) // "l: stack"
+    writeConstSignalSafe(stderrFd, 8028904877209317152, 8) // " overflo"
+    writeConstSignalSafe(stderrFd, 2679, 2)                // "w\n"
   }
   rootExit(2)
+}
+
+// True for the two codes the faultAddr/sp double-check below applies to —
+// split out of vehHandler to keep that function's own complexity at its
+// pre-#3652 count (docs/development.md's file-size rule's sibling, E0204).
+@nosplit fn isGenericFaultCode(code: int): bool {
+  return code == excAccessViolation || code == excGuardPage
 }
 
 // The vectored exception handler — see the header for the full contract.
@@ -326,12 +381,14 @@ const overflowSpawned: int = 2
   let code = loadWord(recAddr + excRecordCodeOff) & 0xFFFFFFFF
   let sp = loadWord(ctxAddr + ctxRspOff)
 
-  if (code == excAccessViolation) {
+  if (isGenericFaultCode(code)) {
     // The generic fault path — a green task's guarded stack (the common
-    // case) or an ordinary bad pointer. Same double-check as ../darwin's
-    // `segvHandler`: the faulting address AND the saved `sp` must both land
-    // on the same stack-granule boundary before this is trusted as an
-    // overflow rather than an unrelated fault that happens to be near one.
+    // case, now reached via excGuardPage's dispatchable trip page rather
+    // than a silent excAccessViolation on PAGE_NOACCESS — see #3652) or an
+    // ordinary bad pointer. Same double-check as ../darwin's `segvHandler`:
+    // the faulting address AND the saved `sp` must both land on the same
+    // stack-granule boundary before this is trusted as an overflow rather
+    // than an unrelated fault that happens to be near one.
     let faultAddr = loadWord(recAddr + excRecordInfo1Off)
     let fromFault = alignUpStack(faultAddr)
     let fromSp = alignUpStack(sp)
