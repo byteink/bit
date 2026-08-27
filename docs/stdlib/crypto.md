@@ -1187,7 +1187,7 @@ import { newGcm, encodeHex } from "std/crypto"
 // the recovered plaintext as hex, or fails if the tag does not verify.
 fn protect(key: []byte, nonce: []byte, msg: []byte, aad: []byte): string! {
   let cipher = newGcm(key)?
-  let sealed = cipher.seal(nonce, msg, aad) // ciphertext ‖ 16-byte tag
+  let sealed = cipher.seal(nonce, msg, aad)     // ciphertext ‖ 16-byte tag
   let opened = cipher.open(nonce, sealed, aad)? // fails on any tag mismatch
   return encodeHex(opened)
 }
@@ -3082,7 +3082,7 @@ import { newAesGcmSiv, encodeHex } from "std/crypto"
 // plaintext as hex, or fails if the tag does not verify.
 fn protectSiv(key: []byte, nonce: []byte, msg: []byte, aad: []byte): string! {
   let cipher = newAesGcmSiv(key)?
-  let sealed = cipher.seal(nonce, msg, aad) // ciphertext ‖ 16-byte tag
+  let sealed = cipher.seal(nonce, msg, aad)     // ciphertext ‖ 16-byte tag
   let opened = cipher.open(nonce, sealed, aad)? // fails on any tag mismatch
   return encodeHex(opened)
 }
@@ -3289,7 +3289,13 @@ import { x509Parse, x509VerifySignature, x509VerifyChain, x509MatchHostname, Cer
 // Whether `leafDer` chains to one of `roots` (through `intermediates`) for `host`
 // at `nowUnix`. Any parse or verification failure returns false. `nowUnix` is
 // injected, so the decision never depends on the wall clock.
-fn trusts(leafDer: []byte, intermediates: []Certificate, roots: []Certificate, host: string, nowUnix: int): bool {
+fn trusts(
+  leafDer: []byte,
+  intermediates: []Certificate,
+  roots: []Certificate,
+  host: string,
+  nowUnix: int,
+): bool {
   let leaf = x509Parse(leafDer) catch e {
     return false
   }
@@ -3571,7 +3577,13 @@ fn truststoreExampleCert(pem: string): Certificate! {
 // `host` at `nowUnix`. The caller's PEM roots become a TrustStore; any parse or
 // verification failure yields false. `nowUnix` is injected, so the decision
 // never depends on the wall clock.
-fn truststoreTrusts(rootsPem: string, interPem: string, leafPem: string, host: string, nowUnix: int): bool {
+fn truststoreTrusts(
+  rootsPem: string,
+  interPem: string,
+  leafPem: string,
+  host: string,
+  nowUnix: int,
+): bool {
   let store = fromPem(rootsPem) catch e {
     return false
   }

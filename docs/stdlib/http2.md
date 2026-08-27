@@ -212,18 +212,22 @@ import { newEncoder, HeaderField, encodeHeaders, HeadersFrame } from "std/http2"
 // Frame a header block onto stream `sid`, ending both the headers and the stream.
 fn headersFrame(sid: int): []byte! {
   let enc = newEncoder()
-  let block = enc.encode([]HeaderField{ HeaderField{ name: ":status", value: "200", sensitive: false } })
-  return encodeHeaders(HeadersFrame{
-    streamId: sid,
-    blockFragment: block,
-    endStream: true,
-    endHeaders: true,
-    padLength: 0 - 1,
-    hasPriority: false,
-    exclusive: false,
-    streamDependency: 0,
-    weight: 0,
-  })?
+  let block = enc.encode(
+    []HeaderField{ HeaderField{ name: ":status", value: "200", sensitive: false } },
+  )
+  return encodeHeaders(
+    HeadersFrame{
+      streamId: sid,
+      blockFragment: block,
+      endStream: true,
+      endHeaders: true,
+      padLength: 0 - 1,
+      hasPriority: false,
+      exclusive: false,
+      streamDependency: 0,
+      weight: 0,
+    },
+  )?
 }
 ```
 
