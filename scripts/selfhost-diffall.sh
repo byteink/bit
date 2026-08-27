@@ -205,9 +205,25 @@ pass=0 fail=0 inconc=0 timeout=0 absent=0
 # MEMORY, never load -- a leaked language server at 10.8GB, VS Code at
 # 16.93GB -- so this leaves 2 cores free rather than tuning against load).
 # nproc covers Linux; sysctl covers macOS; getconf is the POSIX fallback.
-ncpu=$(command -v nproc >/dev/null 2>&1 && nproc \
-  || command -v sysctl >/dev/null 2>&1 && sysctl -n hw.ncpu 2>/dev/null \
-  || getconf _NPROCESSORS_ONLN 2>/dev/null)
+#
+# A flat `A && B || C && D || E` is NOT "run B, else run D, else run E": bash
+# evaluates AND-OR lists strictly left to right on the exit status of the
+# LAST command run, so on a host where `nproc` EXISTS and succeeds, the `||`
+# it satisfies still leaves the trailing `&& sysctl ...` free to run too --
+# both commands' stdout lands in the same command substitution, giving a
+# two-line value like "28\n18" that fails the numeric guard below and
+# silently falls back to ncpu=4 (proven on this exact host by stubbing
+# `nproc`+`sysctl` on PATH, 2026-08-27 -- macOS has no `nproc`, which is
+# exactly why that flat form looked fine here and would have shipped
+# 14x-under-subscribed to mustafa-desktop-wsl's 28 cores). An explicit
+# if/elif runs exactly one probe.
+if command -v nproc >/dev/null 2>&1; then
+  ncpu=$(nproc)
+elif command -v sysctl >/dev/null 2>&1; then
+  ncpu=$(sysctl -n hw.ncpu 2>/dev/null)
+else
+  ncpu=$(getconf _NPROCESSORS_ONLN 2>/dev/null)
+fi
 case "$ncpu" in ''|*[!0-9]*) ncpu=4 ;; esac  # unrecognized host: a safe guess, never 0
 default_jobs=$((ncpu > 2 ? ncpu - 2 : 1))
 JOBS=${DIFFALL_JOBS:-$default_jobs}
