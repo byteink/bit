@@ -1,0 +1,409 @@
+// tools/fuzz/regexdifffuzz/ — the Bit half of #2057's differential fuzzer
+// (epic #2025): generates a deterministic pattern/subject corpus from a
+// seed, runs it through std/regex, and writes both the corpus and Bit's own
+// answers for scripts/regex-difffuzz.sh to hand to the Go oracle
+// (scripts/regex-oracle/main.go) and diff.
+//
+// WHY A CORPUS FILE INSTEAD OF LETTING GO GENERATE INDEPENDENTLY. Go's
+// math/rand and this module's std/rand are different algorithms; "the same
+// seed" would not mean the same patterns in both languages, and there would
+// be no way to tell a real semantic disagreement from two engines simply
+// looking at different inputs. So ONLY this side generates. It writes every
+// pattern and every subject to disk (patterns.hex, subjects.hex — hex, not
+// raw text, so a mutated pattern's control bytes or a UTF-8 subject's raw
+// bytes never need escaping) and the Go side is a pure oracle: given the
+// same corpus, what does Go's regexp say. See gorun.bit / that file's own
+// header would live here if this were split further; the whole generator
+// fits in this one directory module (this file, corpus.bit, subject.bit,
+// answer.bit) rather than as one 800+-line file.
+//
+// THIS FILE is CLI parsing, the pattern generator (mutation half + random-
+// structure half, RE2-syntax, bounded recursion depth so no pattern is
+// unboundedly large), and main(). corpus.bit holds the literal-pattern seed
+// corpus and the known-divergent-construct check. subject.bit builds the
+// five subject kinds. answer.bit runs std/regex over one pattern and writes
+// every result line.
+//
+// Run: `bit run tools/fuzz/regexdifffuzz -- --seed 1 --count 10000 --out DIR`
+
+import { args, exit } from "std/os"
+import { writeFile, mkdir } from "std/fs"
+import { parseInt, newBuilder, repeat } from "std/strings"
+import { newRand, Rand } from "std/rand"
+import { compile } from "std/regex"
+import { encodeHex } from "std/crypto"
+import { monotonic, since } from "std/time"
+
+// Ceiling on --count, so a typo cannot turn this into an unbounded
+// generation run — same discipline as tools/fuzz/selfcheck.bit's maxCount.
+const maxCount: int = 200000
+
+// Bounded recursion depth for the random-structure half of the generator
+// (genAtomOrGroup in this file): guarantees termination and keeps generated
+// patterns from blowing std/regex's own program-size compile cap.
+//
+// 1, not 2 or 3 — checked live, twice, not assumed. At depth 3 (4-in-5
+// chance of wrapping in a group) a 200-pattern run against the 4 KiB
+// block4k subject took a full minute, worst case 14.8s for ONE pattern. At
+// depth 2, EVEN WITH counted-repeat quantifiers ({n,m}) removed from this
+// generator (genQuantifier's own comment), a 500-pattern run still took
+// 186s with a 75.3s outlier: `(?:(...)+)+`-shaped DOUBLE-nested `*`/`+`
+// stacking is enough on its own — Pike-VM thread dedup keeps a SINGLE
+// `(a*)*` linear (this is exactly benchgate's thread_churn row, ~5ms for
+// 4000 chars) but nesting two or three levels of star/plus, each wrapping
+// a group that itself contains another quantified group, multiplies the
+// distinct epsilon-closure states the VM must track — still finite and
+// bounded (never a hang), but with a constant factor 1000x+ larger than
+// realistic patterns produce. At depth 1, genAtomOrGroup can wrap ONE
+// level of atoms in a group but nothing INSIDE that group can wrap again,
+// so no `(X*)*` shape is reachable from the random generator at all (the
+// fixed corpus's own groups are single-level, already proven fast by the
+// existing regexlinear/ReDoS corpus). This is a fuzzer-generator tuning
+// choice, not a std/regex fix — the underlying cost is a real, separate
+// finding, filed rather than investigated further here (see this
+// dispatch's ticket comment).
+const maxGenDepth: int = 1
+
+// Threshold for main()'s "this pattern was slow" diagnostic line — 500ms,
+// well above the fixed per-call setup cost tests/bit/benchgate's own
+// capture_groups-shaped rows measure (tens of microseconds), so this only
+// fires on the genuinely expensive tail.
+const slowPatternThresholdNs: int = 500000000
+
+// A string's raw bytes, for `encodeHex` — Bit has no direct string->[]byte
+// cast, so this copies byte by byte, the same loop Builder.write itself
+// uses internally (stdlib/strings/builder.bit).
+fn stringBytes(s: string): []byte {
+  let out = []byte(len(s))
+  let i = 0
+  while (i < len(s)) {
+    out[i] = s[i]
+    i = i + 1
+  }
+  return out
+}
+
+// Hex, never raw text or base64: every string this module writes to disk
+// (a pattern, a subject, a replaceAll/split result) may contain arbitrary
+// or even invalid UTF-8 from a mutation, so hex is the one encoding with no
+// escaping question on either the Bit or the Go side.
+fn hexOf(s: string): string {
+  return encodeHex(stringBytes(s))
+}
+
+class Args {
+  seed: int,
+  count: int,
+  out: string,
+}
+
+fn usageFail() {
+  eprint("usage: regexdifffuzz [--seed <n>] [--count <n>] --out <dir>\n")
+  exit(2)
+}
+
+fn parseIntArg(s: string, flag: string): int {
+  return parseInt(s) catch _ {
+    eprint("regexdifffuzz: ${flag} value '${s}' is not an integer\n")
+    exit(2)
+    0
+  }
+}
+
+fn parseArgs(): Args {
+  let a = args()
+  let seed = 1
+  let count = 10000
+  let out = ""
+  let i = 1
+  while (i < len(a)) {
+    if (a[i] == "--seed" && i + 1 < len(a)) {
+      seed = parseIntArg(a[i + 1], "--seed")
+      i = i + 2
+    } else if (a[i] == "--count" && i + 1 < len(a)) {
+      count = parseIntArg(a[i + 1], "--count")
+      i = i + 2
+    } else if (a[i] == "--out" && i + 1 < len(a)) {
+      out = a[i + 1]
+      i = i + 2
+    } else {
+      usageFail()
+      i = i + 1
+    }
+  }
+  validateArgs(count, out)
+  return Args{ seed: seed, count: count, out: out }
+}
+
+fn validateArgs(count: int, out: string) {
+  if (count <= 0) {
+    die("regexdifffuzz: --count must be > 0")
+  }
+  if (count > maxCount) {
+    die("regexdifffuzz: --count ${count} exceeds the ${maxCount} ceiling")
+  }
+  if (len(out) == 0) {
+    die("regexdifffuzz: --out is required")
+  }
+}
+
+fn die(msg: string) {
+  eprint(msg + "\n")
+  exit(1)
+}
+
+// --- pattern generation -------------------------------------------------
+
+// One pattern, plus whether it deliberately uses a Bit-only construct
+// (currently: the `(?<name>...)` named-group spelling — see corpus.bit's
+// isKnownDivergent). scripts/regex-difffuzz.sh reads this flag from
+// patterns.hex to decide whether a compile disagreement on this pattern is
+// expected (skip) or a real finding (fail).
+class GenPattern {
+  text: string,
+  divergent: bool,
+}
+
+fn genPattern(r: Rand): GenPattern {
+  if (r.intn(2) == 0) {
+    let text = mutateCorpusPattern(r)
+    return GenPattern{ text: text, divergent: isKnownDivergent(text) }
+  }
+  let text = genRandomPattern(r)
+  return GenPattern{ text: text, divergent: isKnownDivergent(text) }
+}
+
+// One quantifier suffix: none (most common), greedy, or lazy.
+// No counted repeat ({n,m}) here, deliberately — checked live, not
+// assumed: at maxGenDepth == 2 with an earlier version of this function
+// that included "{2,4}"/"{1,}", a counted repeat compiled INSIDE a group
+// that another counted repeat also quantifies compounds multiplicatively
+// (RE2/Pike-VM engines commonly compile {n,m} by unrolling n..m copies of
+// the sub-program), and 177 of 200 generated patterns took over 5ms to
+// answer against the 4 KiB block4k subject — one took 14.8s. `*`/`+`
+// nesting stays linear under Pike-VM thread dedup (this is exactly
+// benchgate's thread_churn row: `(a*)*b` against 4000 chars costs ~5ms),
+// so only the counted-repeat case was cut. {n,m} coverage is not lost —
+// corpus.bit's fixed seed corpus already has four counted-repeat patterns
+// ("[a-z]{2,4}", "x{3}", "\\d{3}-\\d{4}", "(?:foo|bar){2}") and the
+// mutation half of genPattern perturbs them without this generator's
+// compounding.
+fn genQuantifier(r: Rand): string {
+  let k = r.intn(6)
+  if (k == 0) {
+    return "*"
+  }
+  if (k == 1) {
+    return "+"
+  }
+  if (k == 2) {
+    return "?"
+  }
+  if (k == 3) {
+    return "*?"
+  }
+  if (k == 4) {
+    return "+?"
+  }
+  return ""
+}
+
+// A single safe (non-metacharacter) literal, digit or letter — kept out of
+// the regex-metacharacter set so it never accidentally changes the
+// surrounding syntax.
+fn genLiteralChar(r: Rand): string {
+  let letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+  let i = r.intn(len(letters))
+  return string([]byte{ letters[i] })
+}
+
+fn genCharClass(r: Rand): string {
+  let k = r.intn(4)
+  if (k == 0) {
+    return "[a-z]"
+  }
+  if (k == 1) {
+    return "[0-9]"
+  }
+  if (k == 2) {
+    return "[^a-z0-9]"
+  }
+  return "[A-Za-z0-9_]"
+}
+
+fn genAtom(r: Rand): string {
+  let k = r.intn(6)
+  if (k == 0) {
+    return genLiteralChar(r)
+  }
+  if (k == 1) {
+    return "."
+  }
+  if (k == 2) {
+    return genCharClass(r)
+  }
+  if (k == 3) {
+    return "\\d"
+  }
+  if (k == 4) {
+    return "\\w"
+  }
+  return "\\s"
+}
+
+// An atom, OR — when `depth` allows it — a parenthesised sub-branch:
+// capturing, non-capturing, `(?P<name>...)` (Go-compatible) or
+// `(?<name>...)` (deliberately Bit-only, see corpus.bit). `gid` numbers
+// generated group names so two groups in one pattern never collide.
+// `k` out of 8, not 5 of 5: only 3 of 8 wrap in a group at all (1 in 8
+// each for capturing/non-capturing/named), the rest are plain atoms — see
+// maxGenDepth's comment for why this is tuned for pattern SIZE, not just
+// termination.
+fn genAtomOrGroup(r: Rand, gid: int, depth: int): (string, int) {
+  if (depth <= 0) {
+    return genAtom(r), gid
+  }
+  let k = r.intn(8)
+  if (k <= 4) {
+    return genAtom(r), gid
+  }
+  let (inner, gid2) = genBranch(r, gid, depth - 1)
+  if (k == 5) {
+    return "(" + inner + ")", gid2
+  }
+  if (k == 6) {
+    return "(?:" + inner + ")", gid2
+  }
+  let name = "g${gid2}"
+  if (r.intn(2) == 0) {
+    return "(?P<${name}>" + inner + ")", gid2 + 1
+  }
+  return "(?<${name}>" + inner + ")", gid2 + 1
+}
+
+fn genPiece(r: Rand, gid: int, depth: int): (string, int) {
+  let (piece, gid2) = genAtomOrGroup(r, gid, depth)
+  return piece + genQuantifier(r), gid2
+}
+
+// A concatenation of 1..3 quantified pieces — one alternation branch.
+fn genBranch(r: Rand, gid: int, depth: int): (string, int) {
+  let n = 1 + r.intn(3)
+  let b = newBuilder()
+  let gidCur = gid
+  let i = 0
+  while (i < n) {
+    let (piece, gidNext) = genPiece(r, gidCur, depth)
+    b.write(piece)
+    gidCur = gidNext
+    i = i + 1
+  }
+  return b.toString(), gidCur
+}
+
+fn genFlagPrefix(r: Rand): string {
+  let flags = []string{ "(?i)", "(?s)", "(?m)", "(?i)(?m)" }
+  return flags[r.intn(len(flags))]
+}
+
+// The random-structure half: 1..3 alternated branches, each up to
+// `maxGenDepth` deep, with an occasional inline-flag prefix.
+fn genRandomPattern(r: Rand): string {
+  let branches = 1 + r.intn(3)
+  let b = newBuilder()
+  let gid = 1
+  let i = 0
+  while (i < branches) {
+    if (i > 0) {
+      b.write("|")
+    }
+    let (branch, gid2) = genBranch(r, gid, maxGenDepth)
+    b.write(branch)
+    gid = gid2
+    i = i + 1
+  }
+  let body = b.toString()
+  if (r.intn(4) == 0) {
+    return genFlagPrefix(r) + body
+  }
+  return body
+}
+
+// --- mutation half: perturb one char of a fixed valid pattern -----------
+
+fn mutateCorpusPattern(r: Rand): string {
+  let base = corpusPatterns()[r.intn(len(corpusPatterns()))]
+  if (len(base) == 0) {
+    return base
+  }
+  let pos = r.intn(len(base))
+  let op = r.intn(3)
+  if (op == 0) {
+    return spliceOut(base, pos)
+  }
+  if (op == 1) {
+    return spliceIn(base, pos, genLiteralChar(r))
+  }
+  return spliceReplace(base, pos, genLiteralChar(r))
+}
+
+fn spliceOut(s: string, pos: int): string {
+  return s[0:pos] + s[pos + 1:len(s)]
+}
+
+fn spliceIn(s: string, pos: int, ch: string): string {
+  return s[0:pos] + ch + s[pos:len(s)]
+}
+
+fn spliceReplace(s: string, pos: int, ch: string): string {
+  return s[0:pos] + ch + s[pos + 1:len(s)]
+}
+
+// --- main -----------------------------------------------------------------
+
+fn main() {
+  let a = parseArgs()
+  mkdir(a.out) catch e {
+    die("regexdifffuzz: mkdir ${a.out}: " + e.message())
+  }
+  let r = newRand(uint(a.seed))
+
+  let patternsOut = newBuilder()
+  let subjectsOut = newBuilder()
+  let resultsOut = newBuilder()
+
+  let i = 0
+  while (i < a.count) {
+    let t0 = monotonic()
+    let gp = genPattern(r)
+    let divergentFlag = 0
+    if (gp.divergent) {
+      divergentFlag = 1
+    }
+    patternsOut.write("${i}\t${divergentFlag}\t${hexOf(gp.text)}\n")
+    writeSubjectsAndAnswers(r, i, gp.text, subjectsOut, resultsOut)
+    // Diagnostic, not a failure: even a single-level-nested pattern can
+    // occasionally cost multiple seconds against the 4 KiB block4k
+    // subject (checked live, see maxGenDepth's comment) — this is a real
+    // std/regex performance characteristic, not a bug in this generator,
+    // and is worth surfacing on a long run without slowing down the
+    // common case with per-pattern printing.
+    let elapsed = since(t0)
+    if (elapsed > slowPatternThresholdNs) {
+      eprint("regexdifffuzz: pattern ${i} took ${elapsed / 1000000}ms: ${gp.text}\n")
+    }
+    i = i + 1
+  }
+
+  writeFile(a.out + "/patterns.hex", patternsOut.toString()) catch e {
+    die("regexdifffuzz: write patterns.hex: " + e.message())
+  }
+  writeFile(a.out + "/subjects.hex", subjectsOut.toString()) catch e {
+    die("regexdifffuzz: write subjects.hex: " + e.message())
+  }
+  writeFile(a.out + "/bit-results.tsv", resultsOut.toString()) catch e {
+    die("regexdifffuzz: write bit-results.tsv: " + e.message())
+  }
+  print("regexdifffuzz: wrote ${a.count} patterns (seed=${a.seed}) to ${a.out}\n")
+  exit(0)
+}
