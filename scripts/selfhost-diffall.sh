@@ -83,14 +83,31 @@
 #   2  no divergence, but at least one constituent could not decide
 #      (INCONCLUSIVE / TIMEOUT / ERROR), or discovery fell below the floor
 #
-# Constituents run SEQUENTIALLY and all of them run: they share bit-out/ and
-# fixpoint rewrites .fixpoint-work, so parallelism would corrupt them, and
-# fail-fast would hand back a partial board -- which is the checklist problem
-# again, one differential at a time.
+# Constituents run CONCURRENTLY, bounded to DIFFALL_JOBS at a time (#3769;
+# default: host cores minus 2, floor 1), and ALL of them still run regardless
+# of failures -- no fail-fast, which is unchanged and is still the point: a
+# partial board is the checklist problem this script exists to end.
+#
+# Each constituent already does its own scratch work under a private
+# `mktemp -d` (verified per-script, 2026-08-27) EXCEPT selfhost-fixpoint.sh,
+# whose `.fixpoint-work` is a fixed path -- but that name is touched by no
+# other constituent, so it is only a hazard against ANOTHER fixpoint.sh, and
+# this script never runs two of the same constituent at once. The one
+# genuinely SHARED path is stage0's oracle wrapper
+# (bit-out/stage0/bit-oracle, scripts/stage0.sh): this script's own
+# precondition check above already resolves it once, serially, before any
+# constituent starts, so the fan-out only ever hits the already-unpacked fast
+# path. That path's own rewrite (`emit_wrapper`) writes a byte-identical file
+# through a per-PID temp name and an atomic `mv -f`, so N constituents each
+# re-resolving it concurrently race harmlessly to the same content -- proven
+# under concurrent invocation, not assumed (see the ticket's test evidence).
+# No constituent writes into bit-out/ itself; all of them only ever READ
+# bit-out/bin/bit.
 #
 # Usage: ./make selfhost && bash scripts/selfhost-diffall.sh
 #   DIFFALL_TIMEOUT=n   per-constituent hang guard, seconds (default 3600)
 #   DIFFALL_MIN=n       discovery floor (default 15)
+#   DIFFALL_JOBS=n      max constituents running at once (default: cores-2, min 1)
 #   DIFFALL_DIR=path    constituent directory -- for mutation-testing this gate
 #   DIFFALL_KEEP=1      keep the per-constituent logs instead of deleting them
 #
@@ -184,19 +201,28 @@ pass=0 fail=0 inconc=0 timeout=0 absent=0
 : >"$work/undecided"
 : >"$work/absent"
 
-for s in "${scripts[@]}"; do
-  name=$(basename "$s")
-  log="$work/$name.log"
-  start=$SECONDS
+# Concurrency: cores minus headroom (this box's real incidents have all been
+# MEMORY, never load -- a leaked language server at 10.8GB, VS Code at
+# 16.93GB -- so this leaves 2 cores free rather than tuning against load).
+# nproc covers Linux; sysctl covers macOS; getconf is the POSIX fallback.
+ncpu=$(command -v nproc >/dev/null 2>&1 && nproc \
+  || command -v sysctl >/dev/null 2>&1 && sysctl -n hw.ncpu 2>/dev/null \
+  || getconf _NPROCESSORS_ONLN 2>/dev/null)
+case "$ncpu" in ''|*[!0-9]*) ncpu=4 ;; esac  # unrecognized host: a safe guess, never 0
+default_jobs=$((ncpu > 2 ? ncpu - 2 : 1))
+JOBS=${DIFFALL_JOBS:-$default_jobs}
+case "$JOBS" in ''|*[!0-9]*|0) JOBS=1 ;; esac
+[ "$JOBS" -le "$found" ] || JOBS=$found
 
-  # Own the process: spawn it, hold its PID, wait on that PID. `alarm` survives
-  # exec, so the constituent inherits the deadline and dies with SIGALRM (142).
-  ALARMRUN_KEEP_STDERR=1 alarmrun bash "$s" >"$log" 2>&1 &
-  pid=$!
-  wait "$pid"
-  rc=$?
-  elapsed=$((SECONDS - start))
+echo "running up to $JOBS of $found constituent(s) concurrently (host reports ${ncpu} core(s))"
+echo
 
+# record_verdict decides and prints exactly the verdict the old sequential
+# loop did, from the SAME four inputs (rc, absent_list, the counters, the
+# $work/{failed,undecided,absent} files) -- only the caller changed, from an
+# inline loop body to a callback invoked as each constituent finishes.
+record_verdict() {
+  local name=$1 rc=$2 elapsed=$3 verdict
   case "$rc" in
     0)
       verdict=PASS
@@ -231,7 +257,96 @@ for s in "${scripts[@]}"; do
   esac
 
   printf '  %-12s %5ds  %-34s (exit %d)\n' "$verdict" "$elapsed" "$name" "$rc"
+}
+
+# A bounded worker pool, bash-3.2-compatible (no `wait -n`: added in 4.3, and
+# this Mac's /bin/bash is 3.2.57). A FIFO is the wakeup: each backgrounded
+# constituent writes its own name to fd 8 as its LAST act, strictly after it
+# has already written its own "$work/$name.done" (rc + elapsed) -- so by the
+# time the pool's `read -u 8` unblocks, that file is guaranteed complete, with
+# no race and no need to re-check. This gives a true "whichever finishes
+# first" wakeup, unlike a fixed-order `wait "${pids[0]}"` sliding window, and
+# it avoids `kill -0` entirely -- `kill -0` on a not-yet-reaped zombie can
+# still report the process as present, which would silently read a finished
+# constituent as still running.
+fifo="$work/pool.fifo"
+mkfifo "$fifo"
+exec 8<>"$fifo"
+
+pool_names=()
+pool_pids=()
+
+start_one() {
+  local s=$1 name
+  name=$(basename "$s")
+  (
+    t0=$SECONDS
+    # Own the process: spawn it, hold its PID, wait on that PID. `alarm`
+    # survives exec, so the constituent inherits the deadline and dies with
+    # SIGALRM (142) -- unchanged from the sequential version, just now one of
+    # up to $JOBS running at once instead of the only one running.
+    ALARMRUN_KEEP_STDERR=1 alarmrun bash "$s" >"$work/$name.log" 2>&1
+    rc=$?
+    printf '%d %d\n' "$rc" "$((SECONDS - t0))" >"$work/$name.done"
+    printf '%s\n' "$name" >&8
+  ) &
+  pool_names+=("$name")
+  pool_pids+=("$!")
+}
+
+# Blocks until some running constituent finishes, reaps it (bounding zombie
+# accumulation) and records its verdict. `${pool_names[@]}`-style whole-array
+# expansion on an EMPTY array is an unbound-variable error under `set -u` in
+# this bash (see the M4 comment above) -- every rebuild below is guarded so
+# the pool can legitimately drain to zero without tripping it.
+reap_one() {
+  local name pid i found_i=-1 new_names=() new_pids=()
+  read -u 8 name
+  i=0
+  while [ "$i" -lt "${#pool_names[@]}" ]; do
+    if [ "${pool_names[$i]}" = "$name" ]; then
+      found_i=$i
+      break
+    fi
+    i=$((i + 1))
+  done
+  pid=${pool_pids[$found_i]}
+  wait "$pid" 2>/dev/null
+  read -r rc elapsed <"$work/$name.done"
+  record_verdict "$name" "$rc" "$elapsed"
+
+  i=0
+  while [ "$i" -lt "${#pool_names[@]}" ]; do
+    if [ "$i" -ne "$found_i" ]; then
+      new_names+=("${pool_names[$i]}")
+      new_pids+=("${pool_pids[$i]}")
+    fi
+    i=$((i + 1))
+  done
+  if [ "${#new_names[@]}" -gt 0 ]; then
+    pool_names=("${new_names[@]}")
+    pool_pids=("${new_pids[@]}")
+  else
+    pool_names=()
+    pool_pids=()
+  fi
+}
+
+next=0
+while [ "$next" -lt "$found" ] && [ "${#pool_names[@]}" -lt "$JOBS" ]; do
+  start_one "${scripts[$next]}"
+  next=$((next + 1))
 done
+
+while [ "${#pool_names[@]}" -gt 0 ]; do
+  reap_one
+  if [ "$next" -lt "$found" ]; then
+    start_one "${scripts[$next]}"
+    next=$((next + 1))
+  fi
+done
+
+exec 8>&-
 
 # Everything below is REPORTING. The verdicts are already decided above, so
 # nothing below can influence any status.
