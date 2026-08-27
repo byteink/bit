@@ -1,8 +1,8 @@
 # Classes
 
 A class groups named fields under one type name and gives them behavior with
-methods attached via an explicit receiver. (Spec: §10.4, §10.5, §12.2, §13.3,
-§13.4, §14.6.)
+methods declared in the class body. (Spec: §10.4, §10.5, §12.2, §13.3, §13.4,
+§14.6.)
 
 ## A class is a reference type {#reference-type}
 
@@ -155,32 +155,64 @@ let bad = m[7]                     // panics: 'Outer' has no zero value
 
 ## Methods {#methods}
 
-A method is a function with a receiver written before its name. The receiver
-type must be a class or type alias declared in the same module. Because
-classes are reference types (see [above](#reference-type)), a method that
-mutates a field mutates the caller's value directly - there is no pointer
-receiver syntax to opt into that.
+A method is a function attached to a class, declared **in the class body**
+with the reserved receiver `this`:
 
 ```bit
-class Counter { n: int }
+class Counter {
+  n: int
 
-fn (c: Counter) increment() {
-  c.n += 1                     // mutates the caller's Counter
-}
+  bump(): int {
+    this.n = this.n + 1
+    return this.n
+  }
 
-fn (c: Counter) value(): int {
-  return c.n
+  export doubled(): int {
+    return this.n * 2
+  }
 }
 
 fn useCounter() {
-  let c = Counter{ n: 0 }
-  c.increment()
-  let v = c.value()            // 1
+  let c = Counter{ n: 5 }
+  let a = c.bump()             // 6, and c.n is now 6
+  let b = c.doubled()          // 12
 }
 ```
 
-Export a method the same way as a function, by placing `export` before its
-`fn` keyword (see [Modules](modules.md#visibility-with-export)).
+- `this` is implicit - it never appears in the parameter list or the
+  signature - and is typed as the enclosing class, `Counter` here.
+- The receiver type must be a class or type alias declared in the **same
+  module**: a method can only be added to a locally-declared type, never to a
+  foreign or a builtin one.
+- Because classes are reference types (see [above](#reference-type)), a
+  method that mutates a field through `this` mutates the caller's value
+  directly - there is no pointer-receiver syntax to opt into that. `bump()`
+  above changes `c.n` for every reference to `c`, not a copy.
+- `export` goes right before the method name, exactly like on a field (see
+  [Modules](modules.md#visibility-with-export)). An unexported method, like
+  `bump()` above, is callable only from code in the same module.
+- A method may declare its own generic parameters (`scaled<T>(...)`),
+  independently of any the class itself declares.
+- Methods participate in structural interface satisfaction (§14.3) the same
+  way regardless of form - see [Interfaces](interfaces.md).
+
+### The explicit-receiver form
+
+Bit also still parses an older form, written with the receiver before the
+method name instead of inside the class body:
+
+```bit ignore
+fn (c: Counter) bump(): int {
+  c.n = c.n + 1
+  return c.n
+}
+```
+
+This declares the same method as the in-body `bump()` above, and shares
+every rule listed there - visibility, the restriction to the receiver's own
+module, and reference-mutation behavior. It predates the in-body form and is
+being removed from the language; write new methods in the class body
+as shown above.
 
 ## Interfaces
 
