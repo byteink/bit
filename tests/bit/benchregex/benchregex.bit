@@ -1,0 +1,412 @@
+// std/regex throughput benchmark (#2055, epic #2025).
+//
+// THIS STEP NEVER FAILS THE BUILD. It is reachable as `./make bench-regex`
+// (a `coreSteps()` Step plus a matching `Gate{}` record, same registration
+// shape as `test-fuzz-regex`/`test-differentials` — tools/build/defs.bit,
+// tools/build/gates.bit) and is deliberately NOT in `gateSteps()`, so
+// `./make test` never runs it. Do not wire it into any gate, and do not add
+// a threshold that can turn a slow row into a non-zero exit — that is what
+// the committed baseline and the printed delta are FOR, not a substitute
+// for one. Timing on a shared machine is not a merge gate (see
+// bitlang-ws/CLAUDE.md, "GATE SPEED OUTRANKS FEATURE WORK"); a wall-clock
+// assertion here would be exactly the flaky-gate mistake this repo has
+// already paid for elsewhere (tests/bit/schedbench.bit's header,
+// docs/perf-regression-rca.md).
+//
+// HOW TO TAKE A FAIR READING. Run `uptime` first: load above ~20 on this
+// 18-core box makes every number below worthless (the same threshold
+// tests/bit/benchgate/benchgate.bit's header uses). Then:
+//
+//   ./bit-out/bin/bit run tests/bit/benchregex
+//
+// WHY MEDIAN, NOT MINIMUM (#2055's own text, and a deliberate departure
+// from tests/bit/benchgate/benchgate.bit's "minimum of N" design, which
+// exists to defeat CONTENTION on a metric that never goes negative). Each
+// row already amortises a fixed inner iteration count into one elapsed
+// reading, so a single reading is not noisy the way a bare context switch
+// is; what the ticket wants defeated instead is a single GC pause landing
+// inside one rep and skewing it. The median of `reps` independent readings
+// is insensitive to exactly one outlier in either direction — a minimum
+// would silently hide a rep that got faster than physically possible
+// (never happens) but would also report an untypically lucky rep as truth.
+//
+// SEVEN ROWS, each isolating one cost (see #2055's own list):
+//   literal_hit_1mib       plain literal, present, over 1 MiB of text — the
+//                           prefilter's byte scan.
+//   literal_miss_1mib      the same literal, absent — the pure miss path.
+//   date_scan               `[0-9]{4}-[0-9]{2}-[0-9]{2}` over a log-shaped
+//                           subject — a realistic scan.
+//   alternation_ten         ten literals in one alternation, scanned across
+//                           filler built from their own first letters, so
+//                           many candidate threads start and die at every
+//                           position — many threads alive at once.
+//   capture_groups           a pattern with three capture groups, through
+//                           `find` — the slot-copying cost.
+//   thread_churn            `(a*)*b` against 4000 `a`s, no trailing `b` —
+//                           the classic worst-case thread-churn pattern,
+//                           reused verbatim from tests/imports/regexlinear
+//                           (#2037's ReDoS corpus).
+//   compile_large_pattern    `compile` of a 200-way alternation, timed on
+//                           its own — compilation is a separate cost from
+//                           matching and hides regressions when averaged
+//                           together with it.
+//
+// CORRECTNESS IS CHECKED, LOUDLY, BUT NEVER FATALLY. Each row accumulates a
+// checksum across every timed call (the same "don't let it get elided"
+// discipline as tests/bit/schedbench.bit's `benchSpinWork`) and compares it
+// against the expected total once, after timing — printing `WARN` rather
+// than panicking, because a broken regex call is exactly the kind of
+// surprising-but-not-a-build-breaker fact this step exists to surface, not
+// hide. See the header rule above: this step must never exit non-zero for
+// ANY reason short of the harness itself failing to run.
+
+import { compile, mustCompile } from "std/regex"
+import { monotonic, since } from "std/time"
+import { repeat, join, newBuilder, formatFloat } from "std/strings"
+import { sortInPlace } from "std/sort"
+import { isSome } from "std/core"
+import { exit } from "std/os"
+
+// Independent readings per row; odd, so the median is one element, not an
+// average of two. See the header for why median, not minimum.
+const reps: int = 11
+
+// One row's measured result.
+class Row {
+  name: string,
+  subjectBytes: int,
+  nsPerOp: int,
+}
+
+// Sorts a COPY of `xs` (never the caller's array — `xs` may still be needed
+// for a WARN message) and returns the middle element. `xs` is always
+// exactly `reps` long and `reps` is odd, so this is well-defined.
+fn medianOf(xs: []int): int {
+  let copy = []int(len(xs))
+  let i = 0
+  while (i < len(xs)) {
+    copy[i] = xs[i]
+    i = i + 1
+  }
+  sortInPlace(copy, (a, b) => a < b)
+  return copy[len(copy) / 2]
+}
+
+// --- row 1/2: literal hit / miss over 1 MiB of text -------------------------
+
+// A single scan of 1 MiB already measures ~450ms (checked live, current
+// std/regex has no fast byte-level prefilter for a plain literal — see
+// #2055's own justification for this benchmark's existence). At that scale
+// one call per rep is already six-plus orders of magnitude above
+// `monotonic()`'s nanosecond noise floor, so no inner-loop amortisation is
+// needed; adding one would only slow the whole step down for nothing.
+const literalIters: int = 1
+
+// Exactly 1,048,576 bytes ('x'), the shared filler for both the hit and the
+// miss row — a real byte scan has to cross the whole thing either way.
+fn buildLiteralFiller(): string {
+  return repeat(repeat("x", 64), 16384)
+}
+
+fn rowLiteralHit(filler: string): Row {
+  let re = mustCompile("NEEDLEPATTERN")
+  let subject = filler + "NEEDLEPATTERN"
+  let samples = []int(reps)
+  let hits = 0
+  let r = 0
+  while (r < reps) {
+    let start = monotonic()
+    let i = 0
+    while (i < literalIters) {
+      if (re.matches(subject)) {
+        hits = hits + 1
+      }
+      i = i + 1
+    }
+    samples[r] = since(start) / literalIters
+    r = r + 1
+  }
+  if (hits != reps * literalIters) {
+    print("WARN benchregex: literal_hit_1mib: ${hits} of ${reps * literalIters} calls matched, expected all\n")
+  }
+  return Row{ name: "literal_hit_1mib", subjectBytes: len(subject), nsPerOp: medianOf(samples) }
+}
+
+fn rowLiteralMiss(filler: string): Row {
+  let re = mustCompile("NEEDLEPATTERN_ABSENT")
+  let samples = []int(reps)
+  let misses = 0
+  let r = 0
+  while (r < reps) {
+    let start = monotonic()
+    let i = 0
+    while (i < literalIters) {
+      if (!re.matches(filler)) {
+        misses = misses + 1
+      }
+      i = i + 1
+    }
+    samples[r] = since(start) / literalIters
+    r = r + 1
+  }
+  if (misses != reps * literalIters) {
+    print("WARN benchregex: literal_miss_1mib: ${misses} of ${reps * literalIters} calls correctly missed, expected all\n")
+  }
+  return Row{ name: "literal_miss_1mib", subjectBytes: len(filler), nsPerOp: medianOf(samples) }
+}
+
+// --- row 3: date pattern over a log-shaped subject ---------------------------
+
+const dateScanIters: int = 1
+const dateScanLines: int = 2000
+
+fn buildDateScanSubject(): string {
+  let b = newBuilder()
+  let i = 0
+  while (i < dateScanLines) {
+    b.write("2024-03-15 12:00:00 INFO request id=${i} processed successfully\n")
+    i = i + 1
+  }
+  return b.toString()
+}
+
+fn rowDateScan(): Row {
+  let re = mustCompile("[0-9]{4}-[0-9]{2}-[0-9]{2}")
+  let subject = buildDateScanSubject()
+  let samples = []int(reps)
+  let total = 0
+  let r = 0
+  while (r < reps) {
+    let start = monotonic()
+    let i = 0
+    while (i < dateScanIters) {
+      total = total + len(re.findAll(subject, 0 - 1))
+      i = i + 1
+    }
+    samples[r] = since(start) / dateScanIters
+    r = r + 1
+  }
+  let want = reps * dateScanIters * dateScanLines
+  if (total != want) {
+    print("WARN benchregex: date_scan: ${total} matches across all calls, expected ${want}\n")
+  }
+  return Row{ name: "date_scan", subjectBytes: len(subject), nsPerOp: medianOf(samples) }
+}
+
+// --- row 4: alternation of ten literals --------------------------------------
+
+const alternationIters: int = 1
+const alternationFillerReps: int = 6000
+
+fn rowAlternation(): Row {
+  let re = mustCompile("alpha|bravo|charlie|delta|echo|foxtrot|golf|hotel|india|juliet")
+  // Filler built from the ten candidates' own first letters: at nearly
+  // every position a thread starts for whichever candidate that letter
+  // begins, then dies on the second byte — many threads alive at once,
+  // matching #2055's own description of this row. The real word at the
+  // end forces the scan across the whole filler before it resolves.
+  let subject = repeat("abcdefghij", alternationFillerReps) + "hotel"
+  let samples = []int(reps)
+  let hits = 0
+  let r = 0
+  while (r < reps) {
+    let start = monotonic()
+    let i = 0
+    while (i < alternationIters) {
+      if (re.matches(subject)) {
+        hits = hits + 1
+      }
+      i = i + 1
+    }
+    samples[r] = since(start) / alternationIters
+    r = r + 1
+  }
+  if (hits != reps * alternationIters) {
+    print("WARN benchregex: alternation_ten: ${hits} of ${reps * alternationIters} calls matched, expected all\n")
+  }
+  return Row{ name: "alternation_ten", subjectBytes: len(subject), nsPerOp: medianOf(samples) }
+}
+
+// --- row 5: capture groups through find --------------------------------------
+
+const captureIters: int = 5000
+
+fn rowCaptureGroups(): Row {
+  let re = mustCompile("(\\w+)@(\\w+)\\.(\\w+)")
+  let subject = "contact user123 at name123@example123.com for details"
+  let samples = []int(reps)
+  let hits = 0
+  let r = 0
+  while (r < reps) {
+    let start = monotonic()
+    let i = 0
+    while (i < captureIters) {
+      if (isSome(re.find(subject))) {
+        hits = hits + 1
+      }
+      i = i + 1
+    }
+    samples[r] = since(start) / captureIters
+    r = r + 1
+  }
+  if (hits != reps * captureIters) {
+    print("WARN benchregex: capture_groups: ${hits} of ${reps * captureIters} calls matched, expected all\n")
+  }
+  return Row{ name: "capture_groups", subjectBytes: len(subject), nsPerOp: medianOf(samples) }
+}
+
+// --- row 6: (a*)*b thread churn -----------------------------------------------
+
+const churnIters: int = 5
+const churnLength: int = 4000
+
+fn rowThreadChurn(): Row {
+  // Reused verbatim from tests/imports/regexlinear/main.bit's ReDoS corpus
+  // (#2037): the classic catastrophic-backtracking teaser, linear here, but
+  // still the worst case for Pike-VM thread churn — no trailing `b`, so the
+  // VM must walk the full closure at every position before failing.
+  let re = mustCompile("(a*)*b")
+  let subject = repeat("a", churnLength)
+  let samples = []int(reps)
+  let misses = 0
+  let r = 0
+  while (r < reps) {
+    let start = monotonic()
+    let i = 0
+    while (i < churnIters) {
+      if (!re.matches(subject)) {
+        misses = misses + 1
+      }
+      i = i + 1
+    }
+    samples[r] = since(start) / churnIters
+    r = r + 1
+  }
+  if (misses != reps * churnIters) {
+    print("WARN benchregex: thread_churn: ${misses} of ${reps * churnIters} calls correctly missed, expected all\n")
+  }
+  return Row{ name: "thread_churn", subjectBytes: len(subject), nsPerOp: medianOf(samples) }
+}
+
+// --- row 7: compile of a large pattern, timed alone ---------------------------
+
+const compileIters: int = 50
+const compileAltCount: int = 200
+
+fn buildLargePattern(): string {
+  let words = []string(compileAltCount)
+  let i = 0
+  while (i < compileAltCount) {
+    words[i] = "word${i}xyz"
+    i = i + 1
+  }
+  return join(words, "|")
+}
+
+// `compile`, discarding the result — this row measures compile time alone,
+// never matching. Returns whether it succeeded so the caller can checksum
+// it exactly like every other row, without ever panicking (see header).
+fn compileOk(pattern: string): bool {
+  compile(pattern) catch _ {
+    return false
+  }
+  return true
+}
+
+fn rowCompileLarge(): Row {
+  let pattern = buildLargePattern()
+  let samples = []int(reps)
+  let ok = 0
+  let r = 0
+  while (r < reps) {
+    let start = monotonic()
+    let i = 0
+    while (i < compileIters) {
+      if (compileOk(pattern)) {
+        ok = ok + 1
+      }
+      i = i + 1
+    }
+    samples[r] = since(start) / compileIters
+    r = r + 1
+  }
+  if (ok != reps * compileIters) {
+    print("WARN benchregex: compile_large_pattern: ${ok} of ${reps * compileIters} compiles succeeded — this is a std/regex bug, not a benchmark regression; file it, do not fix it here\n")
+  }
+  return Row{
+    name: "compile_large_pattern",
+    subjectBytes: len(pattern),
+    nsPerOp: medianOf(samples),
+  }
+}
+
+// --- reporting -----------------------------------------------------------------
+
+// The `20%` slower threshold #2055's own text names as the loud-flag line.
+// Never used to exit non-zero — see the header.
+const flagPct: f64 = 20.0
+
+fn findBaseline(name: string, base: []Baseline): Baseline {
+  let i = 0
+  while (i < len(base)) {
+    if (base[i].name == name) {
+      return base[i]
+    }
+    i = i + 1
+  }
+  return Baseline{ name: name, nsPerOp: 0.0 - 1.0, machine: "", provisional: false }
+}
+
+fn printRow(row: Row, base: []Baseline) {
+  let b = findBaseline(row.name, base)
+  if (b.nsPerOp < 0.0) {
+    print("benchregex: ${row.name} subject=${row.subjectBytes}B ns/op=${row.nsPerOp} baseline=NONE\n")
+    return
+  }
+  let deltaPct = (f64(row.nsPerOp) - b.nsPerOp) / b.nsPerOp * 100.0
+  let deltaStr = formatFloat(deltaPct, 1)
+  let provTag = ""
+  if (b.provisional) {
+    provTag = " (baseline PROVISIONAL — see baselines.bit)"
+  }
+  print(
+    "benchregex: ${row.name} subject=${row.subjectBytes}B ns/op=${row.nsPerOp} baseline=${formatFloat(
+      b.nsPerOp,
+      0,
+    )} delta=${deltaStr}%${provTag}\n",
+  )
+  if (deltaPct > flagPct) {
+    print("benchregex: SLOWER by more than ${formatFloat(flagPct, 0)}% — ${row.name}: ${deltaStr}% (informational; this step still exits 0)\n")
+  }
+}
+
+fn main() {
+  print("benchregex: std/regex throughput benchmark (#2055) — informational only, never fails the build\n")
+  print("benchregex: run `uptime` first; load above ~20 on this 18-core box makes every number below meaningless\n")
+
+  let filler = buildLiteralFiller()
+  let rows = []Row(0)
+  print("benchregex: literal_hit_1mib...\n")
+  rows = append(rows, rowLiteralHit(filler))
+  print("benchregex: literal_miss_1mib...\n")
+  rows = append(rows, rowLiteralMiss(filler))
+  print("benchregex: date_scan...\n")
+  rows = append(rows, rowDateScan())
+  print("benchregex: alternation_ten...\n")
+  rows = append(rows, rowAlternation())
+  print("benchregex: capture_groups...\n")
+  rows = append(rows, rowCaptureGroups())
+  print("benchregex: thread_churn...\n")
+  rows = append(rows, rowThreadChurn())
+  print("benchregex: compile_large_pattern...\n")
+  rows = append(rows, rowCompileLarge())
+
+  let base = regexBaselines()
+  let i = 0
+  while (i < len(rows)) {
+    printRow(rows[i], base)
+    i = i + 1
+  }
+  print("OK benchregex\n")
+  exit(0)
+}
