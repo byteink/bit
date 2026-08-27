@@ -60,13 +60,13 @@ unless you write them.
 
 ```bit
 fn variables() {
-  let count = 0             // inferred int (i64)
-  count = count + 1         // let is mutable
+  let count = 0     // inferred int (i64)
+  count = count + 1 // let is mutable
 
-  const limit = 10          // immutable
-  let name: string = "bit"  // explicit type
+  const limit = 10         // immutable
+  let name: string = "bit" // explicit type
 
-  let ratio = 3.0 / 4.0     // f64
+  let ratio = 3.0 / 4.0 // f64
   println("${name}: ${count} of ${limit}, ratio ${ratio}")
 }
 ```
@@ -109,7 +109,7 @@ exceptions, so every failure path is visible in the source.
 import { readFile } from "std/fs"
 
 fn firstLineLength(path: string): int! {
-  let text = readFile(path)?           // on error, return it to our caller
+  let text = readFile(path)? // on error, return it to our caller
   if (len(text) == 0) {
     fail newError("file is empty: ${path}")
   }
@@ -130,16 +130,16 @@ makes counting a one-liner.
 
 ```bit
 fn collections() {
-  let xs = [3, 1, 2]           // []int
+  let xs = [3, 1, 2] // []int
   xs = append(xs, 4)
   println("len=${len(xs)} first=${xs[0]}")
 
   let counts = map<string, int>()
-  counts["fox"] = counts["fox"] + 1   // absent key reads as 0
+  counts["fox"] = counts["fox"] + 1 // absent key reads as 0
   counts["fox"] = counts["fox"] + 1
   println("fox=${counts["fox"]} missing=${counts["absent"]}")
 
-  for (word, n) of counts {           // maps iterate as (key, value)
+  for (word, n) of counts { // maps iterate as (key, value)
     println("${word} ${n}")
   }
 }
@@ -155,7 +155,7 @@ parks, leaving its OS thread free for the others.
 import { sleep, Millisecond } from "std/time"
 
 fn worker(id: int, out: chan<int>) {
-  sleep(10 * Millisecond)   // parks; does not block an OS thread
+  sleep(10 * Millisecond) // parks; does not block an OS thread
   out <- id * id
 }
 
@@ -170,10 +170,10 @@ fn concurrency() {
   let sum = 0
   i = 0
   while (i < 4) {
-    sum = sum + <- results  // blocks this green thread until one arrives
+    sum = sum + <- results // blocks this green thread until one arrives
     i = i + 1
   }
-  println("sum of squares = ${sum}")   // 14
+  println("sum of squares = ${sum}") // 14
 }
 ```
 
@@ -246,8 +246,12 @@ needed anywhere, and the only shared state is the channel.
 
 ## Testing
 
-A test is a top-level function named `test_...`. `bit test` finds them, runs
-each in its own process, and reports what failed.
+A test is any top-level function with no parameters and no return value,
+declared in a file named `<name>.test.bit`. The filename is the only
+discovery marker - no naming convention is required, though `test_...`
+remains a common, readable choice for the function itself.
+
+Put this in `math.test.bit`:
 
 ```bit
 import { eq, ok } from "std/testing"
@@ -262,8 +266,11 @@ fn test_double() {
 }
 ```
 
+`double` takes a parameter and returns a value, so it is an ordinary helper,
+not a test - it is excluded by its shape, not by its name.
+
 ```
-$ bit test math.bit
+$ bit test math.test.bit
 ok   test_double
 
 discovered 1 test, ran 1: 1 passed, 0 failed

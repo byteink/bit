@@ -1,7 +1,11 @@
 # std/testing
 
-Assertions for `bit test`. A test is any top-level function named `test_...`;
+Assertions for `bit test`. A test is any top-level function with no
+parameters and no return value, declared in a file named `<name>.test.bit`;
 `bit test` finds them, runs each in its own process, and reports what failed.
+Discovery is by filename and shape alone - no naming convention is required.
+The examples below keep the `test_`/`testpanic_` style because it groups
+tests visually and reads well; any name works equally.
 
 A failing assertion panics, which is why each test gets its own process - one
 failure cannot take the rest of the run down with it. It also means the first
@@ -13,6 +17,8 @@ Every assertion takes a `label` as its final argument. It is printed on failure,
 so make it say which case failed, not which function.
 
 <!-- doctest: per-block -->
+
+Put this in `math.test.bit`, beside the `math.bit` it tests:
 
 ```bit
 import { eq, ok } from "std/testing"
@@ -28,7 +34,7 @@ fn test_double() {
 ```
 
 ```
-$ bit test math.bit
+$ bit test math.test.bit
 ok   test_double
 
 discovered 1 test, ran 1: 1 passed, 0 failed
@@ -134,6 +140,8 @@ path. **A test that calls a `checkX` and never calls `checkDone()` silently
 passes** - the one sharp edge of this pair, and the reason to always write them
 together.
 
+Put this in `table.test.bit`:
+
 ```bit
 import { checkEq, checkDone } from "std/testing"
 
@@ -153,7 +161,7 @@ fn test_table() {
 ```
 
 ```
-$ bit test table.bit
+$ bit test table.test.bit
 check failed: case b: got 2, want 20
 check failed: case c: got 3, want 30
 panic: one or more checks failed above
@@ -195,15 +203,20 @@ recorded rather than panicked.
 
 ## Expected panics
 
-`bit test` also discovers a top-level function named with the `testpanic_`
-prefix, alongside `test_` ones, and runs it the same way in its own process —
-but the assertion is inverted: it passes when that process dies by a panic and
-fails when it returns normally instead. No `ok`/`notOk`/`failNow` call is
-needed inside it; the panic itself is the assertion.
+`bit test` discovers a `testpanic_`-named function exactly like any other
+test - by file and shape, not by its name. The `testpanic_` prefix is a
+**verdict modifier**, not a discovery marker: it flips what counts as passing
+for that one already-discovered test. It runs in its own child process the
+same as every other test, but it passes when that process dies by a panic
+(exit code 2) and fails when it returns normally or exits any other way. No
+`ok`/`notOk`/`failNow` call is needed inside it; the panic itself is the
+assertion.
+
+Put this in `stack.test.bit`:
 
 ```bit
 class Stack {
-  items: []i64
+  items: []i64,
 }
 
 fn (s: Stack) pop(): i64 {
@@ -218,11 +231,13 @@ fn testpanic_pop_on_empty() {
 
 ## Running a subset of tests: `--run <pattern>`
 
-`bit test <file.bit|dir> --run <pattern>` runs only the `test_...`
-functions whose name contains `<pattern>` as a **literal substring** — not
-a glob and not a regex, so nothing in `<pattern>` needs escaping and no
-`*`/`?`/`.` is special. `--run al` matches `test_alpha` and nothing else.
-The match is case sensitive: `--run Alpha` does not match `test_alpha`.
+`bit test <file.bit|dir> --run <pattern>` runs only the discovered tests
+whose name contains `<pattern>` as a **literal substring** — not a glob and
+not a regex, so nothing in `<pattern>` needs escaping and no `*`/`?`/`.` is
+special. The match is against whatever the function is actually called, with
+no assumption of a `test_` prefix: `--run al` matches a test named
+`test_alpha` and nothing else. The match is case sensitive: `--run Alpha`
+does not match `test_alpha`.
 
 The summary line reports the true pre-filter discovered count beside the
 post-filter ran count:

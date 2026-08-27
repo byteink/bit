@@ -105,10 +105,12 @@ import { Json, JsonEntry, jsonAsObject } from "std/json"
 
 // Two entries named "a": jsonAsObject keeps both, in source order.
 fn countKeys(): int {
-  let obj = Json.JsonObject([]JsonEntry{
-    JsonEntry{ key: "a", value: Json.JsonInt(1) },
-    JsonEntry{ key: "a", value: Json.JsonInt(2) },
-  })
+  let obj = Json.JsonObject(
+    []JsonEntry{
+      JsonEntry{ key: "a", value: Json.JsonInt(1) },
+      JsonEntry{ key: "a", value: Json.JsonInt(2) },
+    },
+  )
   match (jsonAsObject(obj)) {
     Some(entries) => return len(entries)
     None => return -1
@@ -172,10 +174,12 @@ import { Json, JsonEntry, jsonGet, jsonAsInt } from "std/json"
 
 // Last-key-wins: two entries named "a", jsonGet returns the second (2).
 fn lastWins(): i64 {
-  let obj = Json.JsonObject([]JsonEntry{
-    JsonEntry{ key: "a", value: Json.JsonInt(1) },
-    JsonEntry{ key: "a", value: Json.JsonInt(2) },
-  })
+  let obj = Json.JsonObject(
+    []JsonEntry{
+      JsonEntry{ key: "a", value: Json.JsonInt(1) },
+      JsonEntry{ key: "a", value: Json.JsonInt(2) },
+    },
+  )
   match (jsonGet(obj, "a")) {
     Some(v) => {
       match (jsonAsInt(v)) {
@@ -227,10 +231,12 @@ the shape of `JSON.stringify(v, null, 2)`.
 import { Json, JsonEntry, jsonEncode, jsonEncodePretty } from "std/json"
 
 fn encodeExample(): string {
-  let obj = Json.JsonObject([]JsonEntry{
-    JsonEntry{ key: "name", value: Json.JsonString("bit\n") },
-    JsonEntry{ key: "count", value: Json.JsonInt(2) },
-  })
+  let obj = Json.JsonObject(
+    []JsonEntry{
+      JsonEntry{ key: "name", value: Json.JsonString("bit\n") },
+      JsonEntry{ key: "count", value: Json.JsonInt(2) },
+    },
+  )
   return jsonEncode(obj) + "\n" + jsonEncodePretty(obj, "  ")
 }
 ```
@@ -514,7 +520,11 @@ fn cstSetStringPathExample(): string {
   let root = cstParse("{}") catch e {
     return "error"
   }
-  let updated = cstSetStringPath(root, []string{ "dependencies", "quicwire" }, "github.com/byteink/quicwire@v1.4.2") catch e {
+  let updated = cstSetStringPath(
+    root,
+    []string{ "dependencies", "quicwire" },
+    "github.com/byteink/quicwire@v1.4.2",
+  ) catch e {
     return "error"
   }
   match (cstGet(updated, []string{ "dependencies", "quicwire" })) {
