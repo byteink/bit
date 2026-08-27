@@ -1932,7 +1932,7 @@ scope, for the whole body of the arrow:
 const v = "hello"
 
 fn main() {
-  let g: (int) => int = v => v + 1
+  let g: (int) => int = (v) => v + 1
   print("${g(1)} ${v}")
 }
 ```
@@ -1950,12 +1950,15 @@ not a special case:
 ```bit
 fn counter(): () => int {
   let n = 0
-  return () => { n = n + 1; return n }   // one n, shared with the closure
+  return () => {
+    n = n + 1
+    return n
+  } // one n, shared with the closure
 }
 
 fn main() {
   let c = counter()
-  print("${c()} ${c()} ${c()}")            // 1 2 3
+  print("${c()} ${c()} ${c()}") // 1 2 3
 }
 ```
 
@@ -1969,7 +1972,7 @@ fn main() {
   let n = 0
   let peek = () => n
   n = 41
-  print("${peek()}")                       // 41 — not the value at creation
+  print("${peek()}") // 41 — not the value at creation
 }
 ```
 
@@ -2120,11 +2123,11 @@ the common idiom mean what it reads as:
 
 ```bit
 fn main() {
-  let fs = []( () => int )(0)
+  let fs = []() => int(0)
   for (let i = 0; i < 3; i = i + 1) {
-    fs = append(fs, () => i)               // each closure keeps its OWN i
+    fs = append(fs, () => i) // each closure keeps its OWN i
   }
-  print("${fs[0]()} ${fs[1]()} ${fs[2]()}")   // 0 1 2
+  print("${fs[0]()} ${fs[1]()} ${fs[2]()}") // 0 1 2
 }
 ```
 
@@ -2133,13 +2136,13 @@ every closure over it shares that one:
 
 ```bit
 fn main() {
-  let gs = []( () => int )(0)
+  let gs = []() => int(0)
   let j = 0
   while (j < 3) {
     gs = append(gs, () => j)
     j = j + 1
   }
-  print("${gs[0]()} ${gs[1]()} ${gs[2]()}")   // 3 3 3
+  print("${gs[0]()} ${gs[1]()} ${gs[2]()}") // 3 3 3
 }
 ```
 
@@ -2186,9 +2189,9 @@ Break a cycle with any type that has an empty or `nil` state. `Option<T>` is the
 idiomatic one and gives the ordinary recursive structures:
 
 ```bit
-class Node { v: int, next: Option<Node> }   // linked list
-class Tree { v: int, kids: []Tree }         // slice also terminates
-class Trie { next: map<rune, Trie> }        // so does a map
+class Node { v: int, next: Option<Node> } // linked list
+class Tree { v: int, kids: []Tree }       // slice also terminates
+class Trie { next: map<rune, Trie> }      // so does a map
 ```
 
 A cycle passing through a generic instantiation is not diagnosed here, since

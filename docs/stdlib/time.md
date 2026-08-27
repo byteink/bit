@@ -240,8 +240,10 @@ The inverse of `civilFromUnix`: nanoseconds since the Unix epoch for a UTC
 import { Civil, unixFromCivil } from "std/time"
 
 fn leapDaySeconds(): int! {
-  let c = Civil{ year: 2024, month: 2, day: 29, hour: 0, minute: 0, second: 0,
-    nanosecond: 0, weekday: 0, yearDay: 0 }
+  let c = Civil{
+    year: 2024, month: 2, day: 29, hour: 0, minute: 0, second: 0,
+    nanosecond: 0, weekday: 0, yearDay: 0,
+  }
   return unixFromCivil(c)?
 }
 ```

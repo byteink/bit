@@ -243,12 +243,12 @@ fn suite(): Hash { return newSha256() }
 // From the ECDHE shared secret and the running transcript, derive the client's
 // handshake write key and nonce, and the key that authenticates its Finished.
 fn clientHandshake(ecdhe: []byte, t: TranscriptHash): []byte {
-  let early = earlySecret(suite, []byte(0))          // no PSK: all-zero IKM
+  let early = earlySecret(suite, []byte(0)) // no PSK: all-zero IKM
   let hs = handshakeSecret(suite, early, ecdhe)
   let chs = clientHandshakeTrafficSecret(suite, hs, t.sum())
-  let key = trafficKey(suite, chs, 16)               // AES-128 key
-  let iv = trafficIV(suite, chs, 12)                 // AEAD nonce
-  let fin = finishedMac(suite, chs, t.sum())         // Finished verify_data
+  let key = trafficKey(suite, chs, 16)       // AES-128 key
+  let iv = trafficIV(suite, chs, 12)         // AEAD nonce
+  let fin = finishedMac(suite, chs, t.sum()) // Finished verify_data
   return key
 }
 ```
@@ -781,9 +781,9 @@ fn roundtrip(secret: []byte, msg: []byte): []byte! {
   let writer = newRecordKeys(suite, secret)?
   let reader = newRecordKeys(suite, secret)?
 
-  let record = writer.seal(msg, recordApplicationData)?   // TLSCiphertext on the wire
-  let opened = reader.open(record)?                        // -> content + content type
-  writer.keyUpdate()?                                      // rotate key, reset sequence to 0
+  let record = writer.seal(msg, recordApplicationData)? // TLSCiphertext on the wire
+  let opened = reader.open(record)?                     // -> content + content type
+  writer.keyUpdate()?                                   // rotate key, reset sequence to 0
   return opened.content
 }
 ```
@@ -1342,7 +1342,12 @@ import { tlsClientStartExts, TlsClientConfig, Extension } from "std/tls"
 // `clientHelloMessage`) goes in Initial-level CRYPTO frames; after the server's
 // ServerHello and Handshake flight, the returned client Finished goes in
 // Handshake-level CRYPTO frames. The secrets exposed on `h` key the QUIC levels.
-fn quicClientHandshake(config: TlsClientConfig, tp: Extension, serverHello: []byte, serverFlight: []byte): []byte! {
+fn quicClientHandshake(
+  config: TlsClientConfig,
+  tp: Extension,
+  serverHello: []byte,
+  serverFlight: []byte,
+): []byte! {
   let h = tlsClientStartExts(config, [tp])?
   let retry = h.processServerHelloMessage(serverHello)?
   if (len(retry) > 0) {
@@ -1629,7 +1634,7 @@ import { dial, listen, newTlsConfig, newTrustStore, emptyTrustStore } from "std/
 // Client: dial a host, verifying its certificate against a PEM root bundle, send
 // a request, and read the reply.
 fn fetch(rootsPem: string, host: string, request: []byte): []byte! {
-  let cfg = newTlsConfig(newTrustStore(rootsPem)?)   // verification on by default
+  let cfg = newTlsConfig(newTrustStore(rootsPem)?) // verification on by default
   cfg.serverName = host
   cfg.alpn = ["http/1.1"]
   let conn = dial(host, 443, cfg)?

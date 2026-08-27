@@ -33,10 +33,14 @@ export class Cfg {
   export timeoutMs: i64,
 }
 
-// One check: the child's exit status, and whatever it printed.
+// One check: the child's exit status, and whatever it printed. #3809 adds the
+// `bit fmt --check` half run against the same module — `fmtCode`/`fmtReport`
+// mirror `code`/`report` exactly, one slot, two verdicts.
 export class CheckResult {
   export code: i64,
   export report: string,
+  export fmtCode: i64,
+  export fmtReport: string,
 }
 
 // Ceilings on the queue and on the fan-out, so the run's resource use is
@@ -169,6 +173,10 @@ fn slotMain(dir: string, i: int): string { return "${dir}/w${i}/main.bit" }
 fn slotOut(dir: string, i: int): string { return "${dir}/o${i}" }
 fn slotStatus(dir: string, i: int): string { return "${dir}/s${i}" }
 fn slotClaim(dir: string, i: int): string { return "${dir}/c${i}" }
+// #3809: the `bit fmt --check` half of the same job, named `f`+the existing
+// `o`/`s` letters so the four files for one slot sort together.
+fn slotFmtOut(dir: string, i: int): string { return "${dir}/fo${i}" }
+fn slotFmtStatus(dir: string, i: int): string { return "${dir}/fs${i}" }
 
 // The scratch root's own top-level files, named the same way `setup` builds
 // them into `Cfg` — kept as functions of `dir` alone so both `setup` and
@@ -189,30 +197,38 @@ fn scrub(path: string) {
   }
 }
 
-// What slot `i` produced, once the runner has finished with it. Absent, empty
-// or non-numeric status all abort the run: a check whose result is unknown is
-// not a check, and there is no lenient reading of this file.
-fn slotResult(cfg: Cfg, i: int): CheckResult {
-  let p = slotStatus(cfg.dir, i)
-  if (!exists(p)) {
-    die("no exit status at ${p}: the runner did not record slot ${i}, so its snippet is unchecked")
+// Reads one slot's exit-status/output pair, aborting if either is missing or
+// the status is not a plain integer. Shared by the `bit check` and #3809's
+// `bit fmt --check` halves of the same slot, so "absent means unchecked" is
+// written once rather than diverging between the two verdicts.
+fn readSlotVerdict(statusPath: string, outPath: string, i: int, what: string): (i64, string) {
+  if (!exists(statusPath)) {
+    die("no exit status at ${statusPath}: the runner did not record slot ${i}'s ${what}, so it is unchecked")
   }
   // trimInfo strips " \t\r" but not the newline `echo` writes, which is the
   // last byte when present.
-  let raw = slurp(p, "check status")
+  let raw = slurp(statusPath, "${what} status")
   let cut = raw
   while (len(cut) > 0 && cut[len(cut) - 1] == '\n') {
     cut = cut[:len(cut) - 1]
   }
   let code = parseInt(trimInfo(cut)) catch _ {
-    die("unreadable exit status in ${p}: ${jsonish(raw)}")
+    die("unreadable exit status in ${statusPath}: ${jsonish(raw)}")
     0
   }
-  let outPath = slotOut(cfg.dir, i)
   if (!exists(outPath)) {
-    die("no output capture at ${outPath}: the runner script is not redirecting slot ${i}")
+    die("no output capture at ${outPath}: the runner script is not redirecting slot ${i}'s ${what}")
   }
-  return CheckResult{ code: i64(code), report: slurp(outPath, "check output") }
+  return i64(code), slurp(outPath, "${what} output")
+}
+
+// What slot `i` produced, once the runner has finished with it. Absent, empty
+// or non-numeric status all abort the run: a check whose result is unknown is
+// not a check, and there is no lenient reading of this file.
+fn slotResult(cfg: Cfg, i: int): CheckResult {
+  let (code, report) = readSlotVerdict(slotStatus(cfg.dir, i), slotOut(cfg.dir, i), i, "check")
+  let (fmtCode, fmtReport) = readSlotVerdict(slotFmtStatus(cfg.dir, i), slotFmtOut(cfg.dir, i), i, "fmt check")
+  return CheckResult{ code: code, report: report, fmtCode: fmtCode, fmtReport: fmtReport }
 }
 
 // `collectBatch`'s sentinel for "the batch deadline elapsed before this slot
@@ -248,6 +264,8 @@ fn stageBatch(cfg: Cfg, srcs: []string) {
     spill(slotMain(cfg.dir, i), srcs[i], "scratch module")
     scrub(slotOut(cfg.dir, i))
     scrub(slotStatus(cfg.dir, i))
+    scrub(slotFmtOut(cfg.dir, i))
+    scrub(slotFmtStatus(cfg.dir, i))
     scrub(slotClaim(cfg.dir, i))
     i = i + 1
   }
@@ -282,12 +300,10 @@ fn collectBatch(cfg: Cfg, n: int, r: i64): []CheckResult {
   let j = 0
   while (j < n) {
     if (r == timedOutCode && !exists(slotStatus(cfg.dir, j))) {
+      let msg = "TIMED OUT: still running when the batch deadline of ${cfg.timeoutMs}ms elapsed"
       out = append(
         out,
-        CheckResult{
-          code: timedOutCode,
-          report: "TIMED OUT: still running when the batch deadline of ${cfg.timeoutMs}ms elapsed",
-        },
+        CheckResult{ code: timedOutCode, report: msg, fmtCode: timedOutCode, fmtReport: msg },
       )
     } else {
       out = append(out, slotResult(cfg, j))
@@ -332,6 +348,38 @@ export fn plumbingSelfTest(cfg: Cfg) {
   }
   if (!contains(bad.report, "error[")) {
     die("plumbing: the broken snippet failed (status ${bad.code}) but no diagnostics were captured — the output redirect is not wired. Captured:\n${bad.report}")
+  }
+}
+
+// #3809's fmt-check half, same shape and same reason as `plumbingSelfTest`
+// above: the fmt verdict is read from a generated script too, so it needs its
+// own "the bad one must not come back clean" proof. Both snippets typecheck —
+// only the second lacks the trailing comma `bit fmt` requires — so `check`'s
+// own exit code cannot be what is actually distinguishing them.
+export fn plumbingFmtSelfTest(cfg: Cfg) {
+  assert(cfg.jobs >= 2)
+  let rs = runBatch(
+    cfg,
+    [
+      "class DocsPlumbingFmtGood {\n  x: int,\n}\n",
+      "class DocsPlumbingFmtBad {\n  x: int\n}\n",
+    ],
+  )
+  assert(len(rs) == 2)
+  let good = rs[0]
+  let bad = rs[1]
+
+  if (good.code != 0) {
+    die("fmt plumbing: a known-good snippet did not typecheck (status ${good.code}):\n${good.report}")
+  }
+  if (good.fmtCode != 0) {
+    die("fmt plumbing: a canonically-formatted snippet failed bit fmt --check (status ${good.fmtCode}) — the fmt pass is miscomparing. Captured:\n${good.fmtReport}")
+  }
+  if (bad.code != 0) {
+    die("fmt plumbing: the snippet missing its trailing comma failed to typecheck (status ${bad.code}) — it must typecheck cleanly so only fmt distinguishes it:\n${bad.report}")
+  }
+  if (bad.fmtCode == 0) {
+    die("fmt plumbing: a snippet missing its required trailing comma passed bit fmt --check — the runner is not recording the fmt verdict, so this half of the gate cannot fail.")
   }
 }
 
@@ -454,6 +502,12 @@ fn deadlineMs(): i64 {
 // stops the background workers sharing the shell's stdin, and `wait` with no
 // operand waits for all of them, so the runner cannot return while a check is
 // still writing its status.
+//
+// #3809: each claimed job also runs `bit fmt --check` on the same module file,
+// writing its own `fo$id`/`fs$id` pair alongside `check`'s `o$id`/`s$id` —
+// unconditionally, even when `check` failed, so the script has no branch that
+// could skip recording a verdict. `docs.bit` decides whether the fmt verdict
+// is worth reporting for a job whose typecheck already failed.
 fn writeRunner(cfg: Cfg) {
   spill(
     cfg.script,
@@ -471,6 +525,8 @@ fn writeRunner(cfg: Cfg) {
       "      if mkdir \"c$id\" 2>/dev/null; then\n" +
       "        '${cfg.bin}' check \"w$id\" >\"o$id\" 2>&1\n" +
       "        echo $? >\"s$id\"\n" +
+      "        '${cfg.bin}' fmt --check \"w$id/main.bit\" >\"fo$id\" 2>&1\n" +
+      "        echo $? >\"fs$id\"\n" +
       "      fi\n" +
       "      id=$((id+1))\n" +
       "    done\n" +
@@ -504,6 +560,8 @@ export fn teardown(dir: string) {
     drop(slotMain(dir, i))
     drop(slotOut(dir, i))
     drop(slotStatus(dir, i))
+    drop(slotFmtOut(dir, i))
+    drop(slotFmtStatus(dir, i))
     drop(slotClaim(dir, i))
     drop(slotDir(dir, i))
     i = i + 1
