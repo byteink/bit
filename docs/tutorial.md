@@ -246,8 +246,12 @@ needed anywhere, and the only shared state is the channel.
 
 ## Testing
 
-A test is a top-level function named `test_...`. `bit test` finds them, runs
-each in its own process, and reports what failed.
+A test is any top-level function with no parameters and no return value,
+declared in a file named `<name>.test.bit`. The filename is the only
+discovery marker - no naming convention is required, though `test_...`
+remains a common, readable choice for the function itself.
+
+Put this in `math.test.bit`:
 
 ```bit
 import { eq, ok } from "std/testing"
@@ -262,8 +266,11 @@ fn test_double() {
 }
 ```
 
+`double` takes a parameter and returns a value, so it is an ordinary helper,
+not a test - it is excluded by its shape, not by its name.
+
 ```
-$ bit test math.bit
+$ bit test math.test.bit
 ok   test_double
 
 discovered 1 test, ran 1: 1 passed, 0 failed
