@@ -42,6 +42,13 @@ class BuildResult { ok: bool, timedOut: bool }
 // timeout never reads as the same claim as a wrong answer.
 class Verdict { failed: int, inconclusive: int, oracled: bool, proved: bool }
 
+// The three oracle markers `judgeVerdict` needs, grouped into one class
+// (#3776) so that function and its `judgeOracled` helper stay at the 5-param
+// lint ceiling (E0202) with room for `first`/`second` too. `waivedReason` is
+// NOT here: it is only ever printed by the caller, before `second` even
+// exists, never read during judging itself.
+class JudgeMarkers { noCollect: bool, noAbandon: bool, waived: bool }
+
 // The shared "this program's verdict is bad" constructor for every early-return
 // site in `checkProgram`: `timedOut` routes the outcome to `inconclusive`
 // instead of `failed` (#2401) — every other failure reason is unchanged.
@@ -326,8 +333,84 @@ fn buildProgram(cx: Ctx, name: string, dir: string, bin: string): BuildResult {
   return BuildResult{ ok: false, timedOut: r == -2 }
 }
 
-// One execution. `envLine` is the environment prefix the wrapper applies; it is
-// always the whole story about the policy, so a run is labelled by what it got.
+// What one execution produced, bundled (#3776, E0202's 5-param ceiling) so
+// `judgeRun` below reads `res.code` etc. instead of taking each field as its
+// own parameter. `code`/`timedOut` follow `osRunBounded`'s own sentinel
+// convention (ABI.md §19).
+class RunCapture { code: int, timedOut: bool, outBody: string, errBody: string }
+
+// Judges one already-COMPLETED execution against the oracle rules every
+// caller shares: output must byte-match `expected`, and the aggregate
+// GC-stats line must be present (unless `statsRequired` is false) and
+// well-formed. Factored out of `runOnce` (#3776) so the fanned-out batch path
+// (`fanout.bit`'s `gradeOutcome`, which grades a job `gatefanout` already ran
+// instead of running one itself) judges a result with the exact same rules
+// rather than a second, drifting copy of them.
+fn judgeRun(
+  name: string,
+  label: string,
+  res: RunCapture,
+  expected: string,
+  statsRequired: bool,
+): Outcome {
+  if (res.code != 0) {
+    say("stress '" + name + "' [" + label + "]: " + runMsg(res.code))
+    say("stderr: " + trim(res.errBody))
+    return Outcome{
+      ok: false,
+      statsOk: false,
+      collections: -1,
+      abandoned: -1,
+      timedOut: res.timedOut,
+    }
+  }
+  if (res.outBody != expected) {
+    say("stress '" + name + "' [" + label + "]: output mismatch")
+    say("  expected: " + trim(expected))
+    say("  got:      " + trim(res.outBody))
+    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: false }
+  }
+
+  // Both runs carry `BIT_GC_STATS=1`, so the aggregate line must be there in
+  // BOTH. Its absence is the tell that the environment never reached the child
+  // (or that the capture is broken), and it is fatal for exactly that reason —
+  // unless the program has DECLARED that it owns the exit path and therefore
+  // never reaches `statsReport` (`no-stats`, see `checkProgram`).
+  if (!statsPresent(res.errBody)) {
+    if (statsRequired) {
+      say("stress '" + name + "' [" + label + "]: no '" + aggregatePrefix + "' line in captured stderr.")
+      say("  BIT_GC_STATS=1 was set for this run, so the line is missing only if the")
+      say("  environment never reached the child or the capture is broken. Either way")
+      say("  the collector oracle below would read every field as absent. A program that")
+      say("  replaces the runtime's own exit path declares that with a 'no-stats' file.")
+      return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: false }
+    }
+    return Outcome{ ok: true, statsOk: false, collections: -1, abandoned: -1, timedOut: false }
+  }
+  let collections = statsField(res.errBody, "collections=")
+  let abandoned = statsField(res.errBody, "abandoned=")
+  if (collections < 0 || abandoned < 0) {
+    say("stress '" + name + "' [" + label + "]: malformed stats line in captured stderr")
+    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: false }
+  }
+  return Outcome{
+    ok: true,
+    statsOk: true,
+    collections: collections,
+    abandoned: abandoned,
+    timedOut: false,
+  }
+}
+
+// One LIVE execution: writes the wrapper, makes the `osRunBounded` call
+// itself, then judges what it captured via `judgeRun`. Used by the serial
+// `checkProgram` path (the `exclusive` partition, and a plain unpartitioned
+// run) — the fanned-out `batch` partition (`fanout.bit`) instead stages this
+// same command as a `gatefanout` job and grades it after the ONE outer call,
+// but reaches the identical judging rules through `judgeRun`.
+//
+// `envLine` is the environment prefix the wrapper applies; it is always the
+// whole story about the policy, so a run is labelled by what it got.
 //
 // `slot` keeps the two runs' capture files APART, and that is not tidiness: with
 // one shared pair of paths, a second run whose redirect never happened would
@@ -372,9 +455,8 @@ fn runOnce(
     return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: timedOut }
   }
   if (r != 0) {
-    say("stress '" + name + "' [" + label + "]: " + runMsg(r))
-    say("stderr: " + trim(errText.body))
-    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: timedOut }
+    let bad = RunCapture{ code: r, timedOut: timedOut, outBody: "", errBody: errText.body }
+    return judgeRun(name, label, bad, expected, statsRequired)
   }
 
   let outText = readText(outPath)
@@ -382,42 +464,8 @@ fn runOnce(
     say("stress '" + name + "' [" + label + "]: could not read captured stdout " + outPath)
     return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: false }
   }
-  if (outText.body != expected) {
-    say("stress '" + name + "' [" + label + "]: output mismatch")
-    say("  expected: " + trim(expected))
-    say("  got:      " + trim(outText.body))
-    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: false }
-  }
-
-  // Both runs carry `BIT_GC_STATS=1`, so the aggregate line must be there in
-  // BOTH. Its absence is the tell that the environment never reached the child
-  // (or that the capture is broken), and it is fatal for exactly that reason —
-  // unless the program has DECLARED that it owns the exit path and therefore
-  // never reaches `statsReport` (`no-stats`, see `checkProgram`).
-  if (!statsPresent(errText.body)) {
-    if (statsRequired) {
-      say("stress '" + name + "' [" + label + "]: no '" + aggregatePrefix + "' line in " + errPath + ".")
-      say("  BIT_GC_STATS=1 was set for this run, so the line is missing only if the")
-      say("  environment never reached the child or the capture is broken. Either way")
-      say("  the collector oracle below would read every field as absent. A program that")
-      say("  replaces the runtime's own exit path declares that with a 'no-stats' file.")
-      return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: false }
-    }
-    return Outcome{ ok: true, statsOk: false, collections: -1, abandoned: -1, timedOut: false }
-  }
-  let collections = statsField(errText.body, "collections=")
-  let abandoned = statsField(errText.body, "abandoned=")
-  if (collections < 0 || abandoned < 0) {
-    say("stress '" + name + "' [" + label + "]: malformed stats line in " + errPath)
-    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1, timedOut: false }
-  }
-  return Outcome{
-    ok: true,
-    statsOk: true,
-    collections: collections,
-    abandoned: abandoned,
-    timedOut: false,
-  }
+  let ok = RunCapture{ code: r, timedOut: false, outBody: outText.body, errBody: errText.body }
+  return judgeRun(name, label, ok, expected, statsRequired)
 }
 
 // Both policies for one program, plus the oracles the second run must satisfy.
@@ -486,30 +534,69 @@ fn checkProgram(cx: Ctx, name: string, dir: string): Verdict {
   if (!second.ok) {
     return badVerdict(second.timedOut)
   }
+
+  let m = JudgeMarkers{
+    noCollect: noCollect.present,
+    noAbandon: noAbandon.present,
+    waived: waived.present,
+  }
+  return judgeVerdict(name, label, m, first, second)
+}
+
+// Turns two already-`.ok` Outcomes (default policy, then stress policy or its
+// `BIT_GC=off` waiver) into this program's Verdict. Shared by the live serial
+// path above (`checkProgram`, whose `first`/`second` come from `runOnce`) and
+// the fanned-out batch path (`fanout.bit`'s `gradeOne`, whose `first`/`second`
+// come from grading pre-run jobs) — factored out (#3776) because the two paths
+// differ only in HOW an Outcome is obtained, never in how it is judged, and a
+// second copy of this logic is exactly the kind of drift #2743/#2866 already
+// cost this repo once elsewhere.
+fn judgeVerdict(
+  name: string,
+  label: string,
+  m: JudgeMarkers,
+  first: Outcome,
+  second: Outcome,
+): Verdict {
   if (!second.statsOk) {
     return Verdict{ failed: 0, inconclusive: 0, oracled: false, proved: false }
   }
-
-  // `BIT_GC=off` collects nothing BY DEFINITION, so a non-zero count here means
-  // the policy in the wrapper is not the policy the child ran under. The waived
-  // programs are the only place the port can prove that directly.
-  if (waived.present) {
-    if (second.collections != 0) {
-      say(
-          "stress '" +
-          name +
-          "' [" +
-          label +
-          "]: " +
-          num(second.collections) +
-          " collections under BIT_GC=off. The policy in the wrapper did not reach the child.",
-      )
-      return badVerdict(false)
-    }
-    return Verdict{ failed: 0, inconclusive: 0, oracled: false, proved: false }
+  if (m.waived) {
+    return judgeWaived(name, label, second)
   }
+  return judgeOracled(name, label, m, first, second)
+}
 
-  let oracled = !noCollect.present
+// `BIT_GC=off` collects nothing BY DEFINITION, so a non-zero count here means
+// the policy in the wrapper is not the policy the child ran under. The waived
+// programs are the only place the port can prove that directly.
+fn judgeWaived(name: string, label: string, second: Outcome): Verdict {
+  if (second.collections != 0) {
+    say(
+        "stress '" +
+        name +
+        "' [" +
+        label +
+        "]: " +
+        num(second.collections) +
+        " collections under BIT_GC=off. The policy in the wrapper did not reach the child.",
+    )
+    return badVerdict(false)
+  }
+  return Verdict{ failed: 0, inconclusive: 0, oracled: false, proved: false }
+}
+
+// The non-waived case: the collection-oracle margin, then the `no-abandon`
+// check. Split from `judgeVerdict` (#3776) to stay under E0201's 80-line
+// ceiling once `JudgeMarkers` is unpacked.
+fn judgeOracled(
+  name: string,
+  label: string,
+  m: JudgeMarkers,
+  first: Outcome,
+  second: Outcome,
+): Verdict {
+  let oracled = !m.noCollect
   let proved = false
   if (oracled) {
     if (second.collections == 0) {
@@ -549,7 +636,7 @@ fn checkProgram(cx: Ctx, name: string, dir: string): Verdict {
   // possible cause (ABI.md §6): an abandoned rendezvous is always SAFE, and a
   // thread asleep in `parkSleepNs` reads as `running`, so most programs here
   // cannot promise zero.
-  if (noAbandon.present && second.abandoned != 0) {
+  if (m.noAbandon && second.abandoned != 0) {
     say(
         "stress '" +
         name +
