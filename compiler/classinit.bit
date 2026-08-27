@@ -1,0 +1,324 @@
+// compiler/classinit.bit — `init` constructors (SPEC §10.4, #3371): `class
+// Account { init(opening: i64)! { ... } }`, called as `Account(500)?`. New
+// sibling file rather than growing checkbind.bit/fmt.bit/fmtdispatch.bit/
+// lowercall.bit, all of which sit at or near the 800-line ceiling; every
+// other file below carries only the smallest hook needed to reach these.
+//
+// DESIGN: `init` is parsed into the IDENTICAL func_decl/receiver shape an
+// ordinary in-body method gets (parsertype.bit's parseMethodMember, #3367) —
+// same name/generics/params/result/body kid layout, receiver type the
+// enclosing class, receiver name kid 0 (implicit `this`). That is what lets
+// every pass that discovers a method by walking the arena for
+// func_decl-with-receiver (collectFuncDecl/buildSignatures in checkbind.bit,
+// the fallible-body validation in validateattr.bit's vFuncDecl, method
+// emission in lowering) pick `init` up with ZERO changes — the only new code
+// is at the few call sites that must recognize `init` BY NAME: the
+// `T(...)` construction call itself (checkexpr.bit/validatecall.bit/
+// lowercall.bit) and its printed form (fmt.bit).
+//
+// `init` is a CONTEXTUAL keyword, the same shape #3369 gave `use`: it lexes
+// as an ordinary Ident and stays usable as one everywhere outside a class
+// body's member-start position — `git grep -nw init -- '*.bit'` (188 hits)
+// found it in heavy use as a local variable name across checkbind.bit,
+// checkgeneric.bit, lintappend.bit, parserstmt.bit and lowerctrl.bit, so
+// reserving it outright would force renaming all of those for a purely
+// additive feature.
+
+// ---- parsing (parsertype.bit's parseClassMember calls into here) ----------
+
+// Unambiguous the same way `atUseStmt` is: a class member's own name is
+// always followed by `:` (a field) or `(`/`<` (a method) — an ordinary
+// method named "init" is therefore impossible to write once this fires, which
+// is exactly the "reserved inside a class body" SPEC asks for. Requiring the
+// immediate `(` (rather than accepting any 'init' identifier) means a
+// composite-literal field key spelled `init` two tokens later never reaches
+// this check at all.
+fn atInitDecl(p: Parser): bool {
+  return peekKind(p) == Kind.Ident && curText(p) == "init" && peekKindAt(p, 1) == Kind.LParen
+}
+
+// `init_member = "init" "(" params ")" ["!" [type]] block`. No colon/result
+// type: init always yields the class itself (never written), so the only
+// declarable shape past the params is fallible-or-not — `init(...)!` /
+// `init(...)!E`, built directly as Tag.Fallible[VoidType, err] rather than
+// through parseResultType, which requires a leading type before the '!' that
+// init has no syntax for.
+fn parseInitMember(p: Parser, className: int, classGenerics: int): int {
+  let name = expectIdent(p) // 'init' — contextual, an ordinary Ident token
+  let params = parseParams(p)
+  let result = 0
+  if (acceptTok(p, Kind.Bang)) {
+    let ok = mkNode(p, Tag.VoidType, 0, []int(0))
+    let err = 0
+    let k = peekKind(p)
+    if (k == Kind.Ident || k == Kind.LBracket || k == Kind.KwMap || k == Kind.KwChan) {
+      err = parseType(p)
+    }
+    result = mkNode(p, Tag.Fallible, 0, [ok, err])
+  }
+  let body = parseBlock(p)
+  let nameSpan = getNode(p.tree, name).span
+  let recv = mkSpanNode(
+    p, Tag.Receiver, 0, [0, classTypeRef(p, className, classGenerics)],
+    nameSpan.start, nameSpan.end,
+  )
+  let generics = dupGenericParams(p, classGenerics)
+  return mkNode(p, Tag.FuncDecl, 0, [recv, name, generics, params, result, body])
+}
+
+// ---- shared lookup (checker + lowering + fmt) ------------------------------
+
+// `decl`'s own 'init' func_decl member, or 0. Mirrors lowercall.bit's
+// structFieldNodes' Export-unwrapping walk, but keeps the FuncDecl (fields
+// skip it there) and filters to the one named "init".
+//
+// Keeps the LAST match, not the first: collectFuncDecl/buildSignatures
+// (checkbind.bit) register a method by overwriting methodResults/methodSigs
+// per node visited, so a duplicate 'init' (E0109, reported separately by
+// vClassInitDuplicate) leaves the LAST declaration as what a construction
+// call is actually validated and linked against — agreeing with this lookup
+// here keeps a cascaded arity diagnostic honest about which signature would
+// really be called, rather than naming the shadowed first one.
+fn classInitDeclNode(oc: Checker, decl: int): int {
+  let raw = kidsOf(oc.tree, kidsOf(oc.tree, decl)[2])
+  let found = 0
+  let i = 0
+  while (i < len(raw)) {
+    let f = raw[i]
+    if (getNode(oc.tree, f).tag == Tag.Export) {
+      f = kidsOf(oc.tree, f)[0]
+    }
+    if (getNode(oc.tree, f).tag == Tag.FuncDecl) {
+      let nm = getNode(oc.tree, kidsOf(oc.tree, f)[1])
+      if (oc.source[nm.span.start:nm.span.end] == "init") {
+        found = f
+      }
+    }
+    i = i + 1
+  }
+  return found
+}
+
+// `classTy`'s declared 'init' func_decl node (in its OWNING module's tree —
+// see typeOwner), or 0 when the class declares none. The one presence check
+// every caller below gates on before doing anything init-specific.
+fn classInitNode(c: Checker, classTy: int): int {
+  let decl = structDeclOf(c, classTy)
+  if (decl == 0) {
+    return 0
+  }
+  return classInitDeclNode(typeOwner(c, classTy), decl)
+}
+
+// Is `classTy`'s 'init' fallible (`init(...)!`)? Caller must already know
+// `initNode` is nonzero. Reads back through the shared methodResults table
+// collectFuncDecl already populated — init is just a method named "init" to
+// that pass — rather than re-deriving from the node, so this agrees with
+// whatever buildSignatures recorded.
+fn classInitFallible(c: Checker, classTy: int): bool {
+  let rty = methodResultLookup(c, "${classTy}.init")
+  return rty != 0 && c.ctx.types[rty].kind == TypeKind.Fallible
+}
+
+// The error type of a fallible `classTy.init`; caller must already know it is
+// fallible (classInitFallible).
+fn classInitErrType(c: Checker, classTy: int): int {
+  return c.ctx.types[methodResultLookup(c, "${classTy}.init")].errTy
+}
+
+// `Account(500)`'s own result type: the class itself, or — when its 'init' is
+// fallible — that Fallible-wrapped type, exactly as any other fallible call's
+// callee-side result is computed (checkexpr.bit's checkCall already does the
+// analogous method.result-lookup for `recv.method(...)`). `initNode` is
+// `classInitNode(c, classTy)`, passed in so callers that already looked it up
+// (to decide whether to route here at all) never repeat the walk.
+fn classConstructResultType(c: Checker, classTy: int, initNode: int): int {
+  if (initNode == 0) {
+    return classTy
+  }
+  if (classInitFallible(c, classTy)) {
+    return mkFallible(c.ctx, classTy, classInitErrType(c, classTy))
+  }
+  return classTy
+}
+
+// ---- E0109/E0110 (checker) -------------------------------------------------
+
+// E0109 (#3371): a class declaring a SECOND 'init'. An ordinary duplicate
+// method has no guard at all today — collectFuncDecl (checkbind.bit) simply
+// overwrites methodResults/methodSigs with the later declaration and `bit
+// check` exits 0 — but init's whole point is an unambiguous construction
+// contract, so two candidates cannot be allowed to silently pick "the last
+// one". First free code above E0108 (checktrait.bit's ecSelfOutsideSignature).
+const ecDuplicateInit = 109
+
+// E0110 (#3371, SPEC §12.2): a composite literal for an 'init'-declaring
+// class, written outside the module that declares it. Without this an
+// exported `init` guarantees nothing — every field stays reachable by the
+// literal form from anywhere the class's fields are visible.
+const ecClassInitSealed = 110
+
+// Called once per StructDecl from checkModule's signature sweep (the same
+// arena pass that already visits every StructDecl in source order for
+// vTypeNodes, so this reports in that same normative order — SPEC §14.8).
+fn vClassInitDuplicate(c: Checker, decl: int) {
+  let raw = kidsOf(c.tree, kidsOf(c.tree, decl)[2])
+  let seen = false
+  let i = 0
+  while (i < len(raw)) {
+    let f = raw[i]
+    if (getNode(c.tree, f).tag == Tag.Export) {
+      f = kidsOf(c.tree, f)[0]
+    }
+    if (getNode(c.tree, f).tag == Tag.FuncDecl) {
+      let nm = getNode(c.tree, kidsOf(c.tree, f)[1])
+      if (c.source[nm.span.start:nm.span.end] == "init") {
+        if (seen) {
+          report(
+            c.diags, ecDuplicateInit, vSpan(c, f),
+            "'${declName(c, decl)}' already declares an 'init'",
+            "a class may declare at most one 'init' (SPEC §10.4); Bit has no constructor overloading",
+          )
+        }
+        seen = true
+      }
+    }
+    i = i + 1
+  }
+}
+
+// Called from vComposite (validatestmt.bit) once per composite literal, right
+// beside vCompositeNoOmitted — the same "whole literal, before any slot"
+// timing. Permissive on everything the seal cannot decide (unresolved type,
+// no reachable decl), matching every other validator in this checker.
+fn vCompositeInitSeal(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [type, init]
+  let target = typeFromNode(c, kids[0])
+  if (target == 0 || c.ctx.types[target].kind != TypeKind.Struct) {
+    return
+  }
+  if (classInitNode(c, target) == 0) {
+    return
+  }
+  if (c.ctx.types[target].declModule == c.moduleId) {
+    return
+  }
+  let tn = typeName(c.ctx, target)
+  report(
+    c.diags, ecClassInitSealed, vSpan(c, node),
+    "'${tn}' declares 'init' and cannot be built with a composite literal outside its defining module",
+    "construct it with '${tn}(...)' instead",
+  )
+}
+
+// ---- construction call: checker + validator + lowering --------------------
+
+// Validates `Account(500)`'s argument list against 'init's own declared
+// params — arity, then per-argument type via vExpectExpr, the same primitive
+// vCall's free-function path (validatecall.bit) uses. Deliberately narrower
+// than that path: no variadic/spread/generic handling, none of which init
+// syntax admits (SPEC §10.4 gives init a fixed, non-generic param list).
+fn vClassConstructCall(c: Checker, node: int, owner: Checker, initDecl: int) {
+  let params = kidsOf(owner.tree, kidsOf(owner.tree, initDecl)[3])
+  let want = len(params)
+  let args = kidsOf(c.tree, kidsOf(c.tree, node)[2])
+  let got = len(args)
+  if (want != got) {
+    reportNoHint(
+      c.diags, ecArgCount, vSpan(c, node),
+      "expected ${want} argument(s), found ${got}",
+    )
+    return
+  }
+  let i = 0
+  while (i < got) {
+    let a = args[i]
+    if (getNode(c.tree, a).tag == Tag.Arg) {
+      a = kidsOf(c.tree, a)[0]
+    }
+    let pty = typeFromNode(owner, kidsOf(owner.tree, params[i])[1])
+    if (pty != 0) {
+      vExpectExpr(c, a, pty)
+    }
+    i = i + 1
+  }
+}
+
+// Lowers `Account(500)`: allocate a zero-valued Account (lowerlit.bit's
+// zeroValue — the same allocation a field-less `Account{}` composite literal
+// would build), then call 'init' on it exactly as an ordinary method call
+// dispatches (lowercall.bit's class-receiver arm), discarding init's own
+// (void) result. The constructed object, not init's result, is the value of
+// this expression — matching how `unwrapFallible` already reports this
+// call's OK type as the class itself, never `()`.
+//
+// init's own fail/return machinery (lowerFunc's fallible prologue/epilogue,
+// unchanged by this ticket) publishes the error-channel state as a side
+// effect of the call below; a `?`/`catch` wrapping this expression reads
+// that state right after evaluating it (lowerfail.bit's lowerTryExpr calls
+// `getErr` immediately after `lowerExpr` on the operand), so nothing here
+// needs to branch on success/failure itself.
+fn lowerClassConstruct(fc: FnCtx, node: int, classTy: int): int {
+  let span = getNode(fc.c.tree, node).span
+  let a = lowerArgs(fc, node, methodParamTypes(fc, classTy, "init"))
+  if (fc.failed) {
+    return 0
+  }
+  let obj = zeroValue(fc, classTy, span)
+  let all = [obj]
+  let j = 0
+  while (j < len(a)) {
+    all = append(all, a[j])
+    j = j + 1
+  }
+  let ins = mkInstr(Op.Call, fc.c.ctx.voidId)
+  ins.name = methodSymbol(fc.lowerer, "init", classTy)
+  ins.args = all
+  builderEmit(fc.b, ins)
+  return obj
+}
+
+// ---- fmt --------------------------------------------------------------
+
+// Is `funcDeclNode` (a class member's func_decl, receiver already known
+// nonzero by fmtPrintMember's caller) specifically the constructor? The only
+// way a class-body func_decl's name is ever "init" is through
+// parseInitMember above — an ordinary method literally named "init" cannot
+// be written once atInitDecl claims that position — so a name-text compare
+// is exact, not a heuristic.
+fn isClassInitDecl(t: Tree, src: string, funcDeclNode: int): bool {
+  let nm = getNode(t, kidsOf(t, funcDeclNode)[1])
+  return src[nm.span.start:nm.span.end] == "init"
+}
+
+// Prints init's desugared func_decl (parseInitMember above) in its own
+// source form: no `fn`, no receiver clause, no colon before the fallible
+// marker — `init(params)! { ... }` / `init(params)!Err { ... }` /
+// `init(params) { ... }`, never fmtPrintClassMethod's `': ()!'`, which is
+// syntax init's own grammar does not accept back in.
+fn fmtPrintClassInit(p: Printer, idx: int) {
+  let k = kidsOf(p.tree, idx) // [recv, name, generics, params, result, body]
+  fmtPrintNode(p, k[1])
+  let fallible = k[4] != 0
+  let errNode = 0
+  if (fallible) {
+    errNode = kidsOf(p.tree, k[4])[1]
+  }
+  let tail = 2 // ' {'
+  if (fallible) {
+    tail = 3 // '! {'
+    if (errNode != 0) {
+      tail = tail + len(fmtRenderFlat(p, errNode))
+    }
+  }
+  p.nextListTail = tail
+  fmtPrintNode(p, k[3])
+  if (fallible) {
+    fmtRaw(p, "!")
+    if (errNode != 0) {
+      fmtPrintNode(p, errNode)
+    }
+  }
+  fmtRaw(p, " ")
+  fmtPrintBodyBlock(p, k[5], true)
+}
