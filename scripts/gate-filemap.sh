@@ -219,6 +219,10 @@ gates_for_file() {
     # tests/bit/importsrun/* above.
     tests/bit/pmrangegate/*) printf 'test-pmrangegate\n'; return 0 ;;
     tests/bit/pollfree/*) printf 'test-pollfree\n'; return 0 ;;
+    # #3822: split from a single file to a directory module (the receiver-form
+    # baseline migration needed its own sibling — see receiverform.bit's own
+    # header) the same shape as tests/bit/spec/* below.
+    tests/bit/releasesurface/*) printf 'test-release-surface\n'; return 0 ;;
     tests/bit/rootabi/*) printf 'test-rootabi\n'; return 0 ;;
     tests/bit/rootpins/*) printf 'test-rootpins\n'; return 0 ;;
     tests/bit/spec/*) printf 'test-spec\n'; return 0 ;;
