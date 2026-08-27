@@ -1,0 +1,659 @@
+// compiler/checktrait.bit — traits and `use` injection (SPEC §10.7, #3369).
+//
+// Injection happens BEFORE resolve, not inside checkModule: `injectTraits`
+// runs at the top of `resolveProject` (checkproject.bit), the one place
+// every front end (check/build/doc/lsp) reaches the checker through. Each
+// provided method a using class does not override is CLONED into a fresh
+// `func_decl` with a real receiver typed to that class — the exact shape
+// `parseMethodMember` already produces for an ordinary in-body method
+// (#3367) — and appended as a new top-level declaration. Every `Self`
+// identifier in the clone is replaced by the class's own name at clone
+// time, so resolve, check and lower never see the name "Self" and need no
+// changes at all: an injected method is indistinguishable from one the
+// class wrote itself.
+//
+// A trait declaration is otherwise INERT to the rest of the pipeline: it is
+// not in resolve's or checkModule's per-tag dispatch, so its own signatures
+// are never independently resolved or type-checked. That is deliberate —
+// `this` inside a provided method's body has no concrete type until a real
+// class injects it, so the body can only be checked once per USE SITE, on
+// the clone. The one cost is that a REQUIRED method's signature (no body to
+// clone) is never independently validated; a bad type there only surfaces
+// if some using class's own override also gets checked.
+
+// ---- diagnostics -------------------------------------------------------
+
+// First free codes above E0102 (parserdecl.bit's ecStructKeywordRemoved).
+const ecTraitMethodConflict = 103
+const ecTraitMethodMissing = 104
+const ecTraitAsType = 105
+const ecTraitCycle = 106
+const ecUnknownTrait = 107
+const ecSelfOutsideSignature = 108
+
+fn identText(tree: Tree, source: string, node: int): string {
+  let sp = getNode(tree, node).span
+  return source[sp.start:sp.end]
+}
+
+// Everything a class-level or trait-level `use` needs to read: the trait
+// table, the module's tree and source, and where to report. Bundled so no
+// function in this file needs more than a handful of its OWN parameters on
+// top of it (spec/LINT.md's max-params=5).
+class TraitCtx {
+  traits: map<string, int>,
+  tree: Tree,
+  source: string,
+  diags: Diagnostics,
+}
+
+// ---- collecting trait declarations and class `use` sites ----------------
+
+// Every trait declared at this module's top level, by name. `export trait`
+// unwraps like any other exportable declaration.
+fn collectTraitDecls(tree: Tree, source: string): map<string, int> {
+  let out = map<string, int>{}
+  let decls = kidsOf(tree, tree.root)
+  let i = 0
+  while (i < len(decls)) {
+    let d = decls[i]
+    if (d != 0 && getNode(tree, d).tag == Tag.Export) {
+      d = kidsOf(tree, d)[0]
+    }
+    if (d != 0 && getNode(tree, d).tag == Tag.TraitDecl) {
+      out[identText(tree, source, kidsOf(tree, d)[0])] = d
+    }
+    i = i + 1
+  }
+  return out
+}
+
+class ClassUse {
+  classNode: int,
+  className: int,
+  classGenerics: int,
+  useStmts: []int,
+}
+
+// Every class that has at least one `use` statement in its body.
+fn collectClassUseSites(tree: Tree): []ClassUse {
+  let out = []ClassUse(0)
+  let decls = kidsOf(tree, tree.root)
+  let i = 0
+  while (i < len(decls)) {
+    let d = decls[i]
+    if (d != 0 && getNode(tree, d).tag == Tag.Export) {
+      d = kidsOf(tree, d)[0]
+    }
+    if (d != 0 && getNode(tree, d).tag == Tag.StructDecl) {
+      let k = kidsOf(tree, d)
+      let uses = classUseStmts(tree, k[2])
+      if (len(uses) > 0) {
+        out = append(out, ClassUse{ classNode: d, className: k[0], classGenerics: k[1], useStmts: uses })
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn classUseStmts(tree: Tree, fieldList: int): []int {
+  let members = kidsOf(tree, fieldList)
+  let uses = []int(0)
+  let j = 0
+  while (j < len(members)) {
+    if (getNode(tree, members[j]).tag == Tag.UseStmt) {
+      uses = append(uses, members[j])
+    }
+    j = j + 1
+  }
+  return uses
+}
+
+// The receiver's type-ref text, whether the receiver is `(x: Box)` or the
+// generic `(x: Box<T>)` — same read `typeNodeName` (checklookup.bit) does,
+// duplicated here in three lines because this pass runs before a Checker
+// exists to call it on.
+fn receiverTypeName(tree: Tree, source: string, recv: int): string {
+  let tref = kidsOf(tree, recv)[1]
+  if (getNode(tree, tref).tag == Tag.GenericInst) {
+    return identText(tree, source, kidsOf(tree, tref)[0])
+  }
+  return identText(tree, source, tref)
+}
+
+// "ClassName.methodName" for every method the module ALREADY declares —
+// arena-wide, because a method's home class comes from its receiver's type
+// text, never from tree position (parsertype.bit's parseMethodMember desugars
+// an in-body method to the identical `func_decl [receiver ...]` shape a
+// written receiver produces). This is what "the class declaring a method
+// itself wins silently" reads against.
+fn collectOwnMethodNames(tree: Tree, source: string): map<string, bool> {
+  let out = map<string, bool>{}
+  let i = 1
+  while (i < len(tree.nodes)) {
+    if (getNode(tree, i).tag == Tag.FuncDecl) {
+      let k = kidsOf(tree, i)
+      if (k[0] != 0) {
+        out["${receiverTypeName(tree, source, k[0])}.${identText(tree, source, k[1])}"] = true
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// ---- a trait's effective (required, provided) method set ----------------
+
+// `providedBy[name]` names the trait that supplies `name` (possibly reached
+// through a nested `use`); `providedNode[name]` is the `trait_method` to
+// clone. `required[name]` is true iff `name` still needs a supplier.
+class TraitMethodSet {
+  required: map<string, bool>,
+  // The trait that first declared `name` as required — kept even after
+  // `name` is satisfied (required[name] flips to false) so a diagnostic can
+  // still name which trait asked for it.
+  requiredFrom: map<string, string>,
+  providedBy: map<string, string>,
+  providedNode: map<string, int>,
+}
+
+fn emptyTraitMethodSet(): TraitMethodSet {
+  return TraitMethodSet{ required: map<string, bool>{}, requiredFrom: map<string, string>{},
+    providedBy: map<string, string>{}, providedNode: map<string, int>{} }
+}
+
+// Folds one provided name from `src` into `dst`, reporting E0103 when the
+// two disagree on who provides it. Split out of `mergeTraitSets` purely to
+// keep that loop's own body under the complexity limit.
+fn mergeOneProvided(dst: TraitMethodSet, src: TraitMethodSet, name: string, diags: Diagnostics, span: Span) {
+  let provider = src.providedBy[name]
+  let (existing, has) = dst.providedBy[name]
+  if (has && existing != "" && existing != provider) {
+    report(diags, ecTraitMethodConflict, span,
+      "trait method conflict: '${existing}' and '${provider}' both provide '${name}'",
+      "declare '${name}' on the class itself to resolve the conflict")
+    return
+  }
+  dst.providedBy[name] = provider
+  dst.providedNode[name] = src.providedNode[name]
+  dst.required[name] = false
+}
+
+// Merges `src` into `dst`. Shared by nested trait composition (a trait
+// `use`ing another) and class-level composition (a class `use`ing several)
+// — both are "combine several method sets, a name provided twice by two
+// different sources is an error".
+fn mergeTraitSets(dst: TraitMethodSet, src: TraitMethodSet, diags: Diagnostics, span: Span) {
+  for (name, provider) of src.providedBy {
+    if (provider != "") {
+      mergeOneProvided(dst, src, name, diags, span)
+    }
+  }
+  for (name, isReq) of src.required {
+    if (!isReq) {
+      continue
+    }
+    let (existing, has) = dst.providedBy[name]
+    if (!(has && existing != "")) {
+      dst.required[name] = true
+      dst.requiredFrom[name] = src.requiredFrom[name]
+    }
+  }
+}
+
+// One trait's OWN direct members (not what it inherits via `use`), folded
+// into `result` so they override anything already merged in from a nested
+// trait — "the class [or trait] declaring that method itself wins".
+fn applyOwnMembers(result: TraitMethodSet, tree: Tree, source: string, name: string, members: []int) {
+  let i = 0
+  while (i < len(members)) {
+    let m = members[i]
+    if (getNode(tree, m).tag == Tag.TraitMethod) {
+      let mk = kidsOf(tree, m) // [name, params, result, body_or_none]
+      let mname = identText(tree, source, mk[0])
+      if (mk[3] == 0) {
+        result.required[mname] = true
+        result.requiredFrom[mname] = name
+        result.providedBy[mname] = ""
+        result.providedNode[mname] = 0
+      } else {
+        result.providedBy[mname] = name
+        result.providedNode[mname] = m
+        result.required[mname] = false
+      }
+    }
+    i = i + 1
+  }
+}
+
+// The full method set `name` provides once every trait it (transitively)
+// `use`s is folded in, with `name`'s OWN direct members overriding anything
+// inherited. `depth` bounds the recursion — cycles are rejected separately
+// (checkTraitCycles), so this is a defensive ceiling, not the real guard.
+fn resolveTraitMethods(ctx: TraitCtx, name: string, depth: int): TraitMethodSet {
+  let result = emptyTraitMethodSet()
+  let (node, ok) = ctx.traits[name]
+  if (!ok || depth > 64) {
+    return result
+  }
+  let members = kidsOf(ctx.tree, kidsOf(ctx.tree, node)[1])
+  let i = 0
+  while (i < len(members)) {
+    if (getNode(ctx.tree, members[i]).tag == Tag.UseStmt) {
+      let usedIdents = kidsOf(ctx.tree, members[i])
+      let j = 0
+      while (j < len(usedIdents)) {
+        let usedName = identText(ctx.tree, ctx.source, usedIdents[j])
+        let sub = resolveTraitMethods(ctx, usedName, depth + 1)
+        mergeTraitSets(result, sub, ctx.diags, getNode(ctx.tree, members[i]).span)
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  applyOwnMembers(result, ctx.tree, ctx.source, name, members)
+  return result
+}
+
+// ---- trait `use` cycles (SPEC §10.7) --------------------------------------
+
+fn pathPush(path: []string, name: string): []string {
+  let out = []string(len(path) + 1)
+  let i = 0
+  while (i < len(path)) {
+    out[i] = path[i]
+    i = i + 1
+  }
+  out[len(path)] = name
+  return out
+}
+
+fn pathContains(path: []string, name: string): bool {
+  let k = 0
+  while (k < len(path)) {
+    if (path[k] == name) {
+      return true
+    }
+    k = k + 1
+  }
+  return false
+}
+
+fn traitCycleDFS(ctx: TraitCtx, name: string, path: []string, visited: map<string, bool>): bool {
+  if (pathContains(path, name)) {
+    reportNoHint(ctx.diags, ecTraitCycle, getNode(ctx.tree, ctx.traits[name]).span,
+      "trait cycle: '${name}' uses itself, directly or indirectly")
+    return true
+  }
+  visited[name] = true
+  let (node, ok) = ctx.traits[name]
+  if (!ok || len(path) > 64) {
+    return false
+  }
+  let nextPath = pathPush(path, name)
+  let members = kidsOf(ctx.tree, kidsOf(ctx.tree, node)[1])
+  let i = 0
+  while (i < len(members)) {
+    if (getNode(ctx.tree, members[i]).tag == Tag.UseStmt) {
+      let usedIdents = kidsOf(ctx.tree, members[i])
+      let j = 0
+      while (j < len(usedIdents)) {
+        let usedName = identText(ctx.tree, ctx.source, usedIdents[j])
+        if (traitCycleDFS(ctx, usedName, nextPath, visited)) {
+          return true
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn checkTraitCycles(ctx: TraitCtx) {
+  let visited = map<string, bool>{}
+  for (name, _) of ctx.traits {
+    let (_, done) = visited[name]
+    if (!done) {
+      let _ = traitCycleDFS(ctx, name, []string(0), visited)
+    }
+  }
+}
+
+// ---- a trait is never a type (SPEC §10.7) --------------------------------
+
+fn walkTypeForTrait(ctx: TraitCtx, node: int) {
+  if (node == 0) {
+    return
+  }
+  let n = getNode(ctx.tree, node)
+  if (n.tag == Tag.Ident) {
+    let name = ctx.source[n.span.start:n.span.end]
+    let (_, isTrait) = ctx.traits[name]
+    if (isTrait) {
+      report(ctx.diags, ecTraitAsType, n.span,
+        "trait '${name}' cannot be used as a type",
+        "traits are injected into a class, not stored in one — declare a structural interface instead (SPEC §14.3)")
+    }
+    return
+  }
+  let kids = kidsOf(ctx.tree, node)
+  let i = 0
+  while (i < len(kids)) {
+    walkTypeForTrait(ctx, kids[i])
+    i = i + 1
+  }
+}
+
+// The single-kid-at-index-1 type slots: a param/field's type, a variable's
+// annotation, a type assertion's target.
+fn checkTraitAsTypeSlot1(ctx: TraitCtx, n: Node, i: int) {
+  if (n.tag == Tag.Param || n.tag == Tag.ParamRest || n.tag == Tag.Field ||
+      n.tag == Tag.Binding || n.tag == Tag.TypeAssert) {
+    walkTypeForTrait(ctx, kidsOf(ctx.tree, i)[1])
+  }
+}
+
+// The result-type slots, whose kid index varies by declaration shape: a
+// type alias' target, a function/method/trait-method/interface-method
+// result.
+fn checkTraitAsTypeSlot2(ctx: TraitCtx, n: Node, i: int) {
+  if (n.tag == Tag.TypeAlias) {
+    walkTypeForTrait(ctx, kidsOf(ctx.tree, i)[2])
+  } else if (n.tag == Tag.FuncDecl) {
+    walkTypeForTrait(ctx, kidsOf(ctx.tree, i)[4])
+  } else if (n.tag == Tag.ExternFnDecl || n.tag == Tag.TraitMethod || n.tag == Tag.MethodSig) {
+    walkTypeForTrait(ctx, kidsOf(ctx.tree, i)[2])
+  }
+}
+
+// Every declared "type slot" in the module. Composite shapes (`[]Trait`,
+// `Box<Trait>`, `Trait!E`) are covered by recursion from each of these
+// anchors (walkTypeForTrait), not by a separate case per shape.
+fn checkTraitAsType(ctx: TraitCtx) {
+  let i = 1
+  while (i < len(ctx.tree.nodes)) {
+    let n = getNode(ctx.tree, i)
+    checkTraitAsTypeSlot1(ctx, n, i)
+    checkTraitAsTypeSlot2(ctx, n, i)
+    i = i + 1
+  }
+}
+
+// ---- `Self` only in a trait method's own signature -----------------------
+
+fn forbidSelfIn(ctx: TraitCtx, node: int) {
+  if (node == 0) {
+    return
+  }
+  let n = getNode(ctx.tree, node)
+  if (n.tag == Tag.Ident) {
+    if (ctx.source[n.span.start:n.span.end] == "Self") {
+      report(ctx.diags, ecSelfOutsideSignature, n.span,
+        "'Self' is only legal as a trait method's own parameter or result type",
+        "not a local variable's type, a field type, or anywhere else in the body")
+    }
+    return
+  }
+  let kids = kidsOf(ctx.tree, node)
+  let i = 0
+  while (i < len(kids)) {
+    forbidSelfIn(ctx, kids[i])
+    i = i + 1
+  }
+}
+
+// A provided method's BODY may reference `this`, but `Self` stays a
+// signature-only name (SPEC §10.7) — checked here rather than by scoping it
+// into the resolver, because a trait body is never independently resolved
+// at all (see this file's header).
+fn checkSelfPositions(ctx: TraitCtx) {
+  for (_, node) of ctx.traits {
+    let members = kidsOf(ctx.tree, kidsOf(ctx.tree, node)[1])
+    let i = 0
+    while (i < len(members)) {
+      if (getNode(ctx.tree, members[i]).tag == Tag.TraitMethod) {
+        let body = kidsOf(ctx.tree, members[i])[3]
+        if (body != 0) {
+          forbidSelfIn(ctx, body)
+        }
+      }
+      i = i + 1
+    }
+  }
+}
+
+// ---- cloning a provided method into a using class ------------------------
+
+// A deep copy of `node`, with every bare `Self` identifier replaced by
+// `classSpan` — the using class's own name. Every other node is copied with
+// its ORIGINAL span (so a diagnostic inside the injected body still points
+// at the trait's own source), which is safe because these clones are never
+// compared node-identity-wise against the original.
+fn cloneWithSelf(tree: Tree, source: string, node: int, classSpan: Span): int {
+  if (node == 0) {
+    return 0
+  }
+  let n = getNode(tree, node)
+  if (isLeafTag(n.tag)) {
+    if (n.tag == Tag.Ident && source[n.span.start:n.span.end] == "Self") {
+      return addLeaf(tree, Tag.Ident, classSpan)
+    }
+    return addLeaf(tree, n.tag, n.span)
+  }
+  let kids = kidsOf(tree, node)
+  let newKids = []int(0)
+  let i = 0
+  while (i < len(kids)) {
+    newKids = append(newKids, cloneWithSelf(tree, source, kids[i], classSpan))
+    i = i + 1
+  }
+  return addNode(tree, n.tag, n.span, n.main, newKids)
+}
+
+// A type reference to the using class, mirroring parsertype.bit's
+// `classTypeRef` at the Tree level (that one runs at parse time, off a live
+// Parser; this one runs after parsing, off the Tree it left behind).
+fn traitClassTypeRef(tree: Tree, className: int, classGenerics: int): int {
+  let dup = addLeaf(tree, Tag.Ident, getNode(tree, className).span)
+  if (classGenerics == 0) {
+    return dup
+  }
+  let gps = kidsOf(tree, classGenerics)
+  let targItems = []int(0)
+  let gi = 0
+  while (gi < len(gps)) {
+    targItems = append(targItems, kidsOf(tree, gps[gi])[0])
+    gi = gi + 1
+  }
+  let targs = addNode(tree, Tag.TypeArgs, getNode(tree, classGenerics).span, 0, targItems)
+  return addNode(tree, Tag.GenericInst, getNode(tree, classGenerics).span, 0, [dup, targs])
+}
+
+// A fresh copy of the class's own generic-param list, mirroring
+// parsertype.bit's `dupGenericParams`: `registerGenerics` mints a TypeParam
+// id per NODE IDENTITY, so the injected method needs its own node, not the
+// class's.
+fn dupGenericParamsTree(tree: Tree, genNode: int): int {
+  let gps = kidsOf(tree, genNode)
+  let items = []int(0)
+  let gi = 0
+  while (gi < len(gps)) {
+    items = append(items, addNode(tree, Tag.GenericParam, getNode(tree, gps[gi]).span, 0, kidsOf(tree, gps[gi])))
+    gi = gi + 1
+  }
+  return addNode(tree, Tag.GenericParams, getNode(tree, genNode).span, 0, items)
+}
+
+fn unionSpan(tree: Tree, kids: []int, fallback: Span): Span {
+  let start = -1
+  let end = -1
+  let i = 0
+  while (i < len(kids)) {
+    let k = kids[i]
+    if (k != 0) {
+      let s = getNode(tree, k).span
+      if (!(s.start == 0 && s.end == 0)) {
+        if (start < 0 || s.start < start) { start = s.start }
+        if (end < 0 || s.end > end) { end = s.end }
+      }
+    }
+    i = i + 1
+  }
+  if (start < 0) {
+    return fallback
+  }
+  return Span{ file: fallback.file, start: start, end: end }
+}
+
+// Clones trait_method `methodNode` into a `func_decl [receiver name generics
+// params result body]` — the same shape #3367's in-body methods desugar to
+// — with `this` typed as the using class and every `Self` replaced by it.
+fn cloneTraitMethod(tree: Tree, source: string, methodNode: int, classNameNode: int, classGenerics: int): int {
+  let mk = kidsOf(tree, methodNode) // [name, params, result, body]
+  let classSpan = getNode(tree, classNameNode).span
+  let name = cloneWithSelf(tree, source, mk[0], classSpan)
+  let params = cloneWithSelf(tree, source, mk[1], classSpan)
+  let result = cloneWithSelf(tree, source, mk[2], classSpan)
+  let body = cloneWithSelf(tree, source, mk[3], classSpan)
+  let generics = 0
+  if (classGenerics != 0) {
+    generics = dupGenericParamsTree(tree, classGenerics)
+  }
+  let recv = addNode(tree, Tag.Receiver, getNode(tree, name).span, 0,
+    [0, traitClassTypeRef(tree, classNameNode, classGenerics)])
+  let kids = [recv, name, generics, params, result, body]
+  return addNode(tree, Tag.FuncDecl, unionSpan(tree, kids, getNode(tree, methodNode).span), 0, kids)
+}
+
+// ---- per-class injection ---------------------------------------------------
+
+fn reportMissingRequired(diags: Diagnostics, className: string, traitName: string, methodName: string, span: Span) {
+  report(diags, ecTraitMethodMissing, span,
+    "class '${className}' does not supply '${methodName}', required by trait '${traitName}'",
+    "declare '${methodName}' on '${className}' itself")
+}
+
+// The (required, provided) set for everything a class's `use` statements
+// bring in, one merge per named trait. Unknown trait names are reported
+// here (E0107) and otherwise ignored — nothing to merge.
+fn effectiveUses(ctx: TraitCtx, cu: ClassUse): TraitMethodSet {
+  let effective = emptyTraitMethodSet()
+  let j = 0
+  while (j < len(cu.useStmts)) {
+    let names = kidsOf(ctx.tree, cu.useStmts[j])
+    let k = 0
+    while (k < len(names)) {
+      let tSpan = getNode(ctx.tree, names[k]).span
+      let tName = ctx.source[tSpan.start:tSpan.end]
+      let (_, known) = ctx.traits[tName]
+      if (!known) {
+        reportNoHint(ctx.diags, ecUnknownTrait, tSpan, "no trait named '${tName}' is declared in this module")
+      } else {
+        mergeTraitSets(effective, resolveTraitMethods(ctx, tName, 0), ctx.diags, tSpan)
+      }
+      k = k + 1
+    }
+    j = j + 1
+  }
+  return effective
+}
+
+fn reportMissingIn(ctx: TraitCtx, className: string, ownMethods: map<string, bool>, cu: ClassUse, effective: TraitMethodSet) {
+  for (mname, isReq) of effective.required {
+    if (isReq) {
+      let (_, ownHas) = ownMethods["${className}.${mname}"]
+      if (!ownHas) {
+        reportMissingRequired(ctx.diags, className, effective.requiredFrom[mname], mname, getNode(ctx.tree, cu.classNode).span)
+      }
+    }
+  }
+}
+
+fn injectProvidedIn(ctx: TraitCtx, className: string, ownMethods: map<string, bool>, cu: ClassUse, effective: TraitMethodSet): []int {
+  let injected = []int(0)
+  for (mname, node) of effective.providedNode {
+    let (_, ownHas) = ownMethods["${className}.${mname}"]
+    if (node != 0 && !ownHas) {
+      injected = append(injected, cloneTraitMethod(ctx.tree, ctx.source, node, cu.className, cu.classGenerics))
+    }
+  }
+  return injected
+}
+
+// Validates and injects for one class, returning the new `func_decl` nodes
+// (possibly none) to attach as top-level declarations.
+fn injectIntoClass(ctx: TraitCtx, ownMethods: map<string, bool>, cu: ClassUse): []int {
+  let className = identText(ctx.tree, ctx.source, cu.className)
+  let effective = effectiveUses(ctx, cu)
+  reportMissingIn(ctx, className, ownMethods, cu, effective)
+  return injectProvidedIn(ctx, className, ownMethods, cu, effective)
+}
+
+// ---- module entry point ---------------------------------------------------
+
+fn attachNewDecls(tree: Tree, newDecls: []int) {
+  if (len(newDecls) == 0) {
+    return
+  }
+  let old = kidsOf(tree, tree.root)
+  let combined = []int(0)
+  let i = 0
+  while (i < len(old)) {
+    combined = append(combined, old[i])
+    i = i + 1
+  }
+  i = 0
+  while (i < len(newDecls)) {
+    combined = append(combined, newDecls[i])
+    i = i + 1
+  }
+  tree.root = addNode(tree, Tag.Program, getNode(tree, tree.root).span, 0, combined)
+}
+
+// Runs trait validation and `use` injection over one already-parsed module,
+// mutating its tree in place before resolve ever sees it.
+fn injectTraitsInModule(m: SrcModule, diags: Diagnostics) {
+  let traits = collectTraitDecls(m.tree, m.source)
+  if (len(traits) == 0) {
+    return
+  }
+  let ctx = TraitCtx{ traits: traits, tree: m.tree, source: m.source, diags: diags }
+  checkTraitCycles(ctx)
+  checkTraitAsType(ctx)
+  checkSelfPositions(ctx)
+  let ownMethods = collectOwnMethodNames(ctx.tree, ctx.source)
+  let classes = collectClassUseSites(ctx.tree)
+  let newDecls = []int(0)
+  let i = 0
+  while (i < len(classes)) {
+    let got = injectIntoClass(ctx, ownMethods, classes[i])
+    let j = 0
+    while (j < len(got)) {
+      newDecls = append(newDecls, got[j])
+      j = j + 1
+    }
+    i = i + 1
+  }
+  attachNewDecls(ctx.tree, newDecls)
+}
+
+// Entry point, called at the top of `resolveProject` (checkproject.bit) —
+// every front end (check/build/doc/lsp) reaches the checker through there.
+//
+// A module's files are parsed as one concatenated source (project.bit), so
+// every span this pass reports is a MODULE-GLOBAL offset with `file` still
+// the placeholder the parser stamped it with — remapDiags (project.bit,
+// the same call `buildextern.bit`/`rootcollision.bit` make) rewrites it to
+// the real file and in-file offset. Skipping this rendered a class's own
+// `use` statement against file id 0 (the prelude) instead of its own file.
+fn injectTraits(p: Project) {
+  let i = 0
+  while (i < len(p.mods)) {
+    let before = len(p.diags.list)
+    injectTraitsInModule(p.mods[i], p.diags)
+    remapDiags(p.diags, before, p.mods[i].files, p.mods[i].fileStarts)
+    i = i + 1
+  }
+}
