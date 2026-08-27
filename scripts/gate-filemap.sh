@@ -197,6 +197,9 @@ gates_for_file() {
       ;;
     tests/bit/abimembers/*) printf 'test-abimembers\n'; return 0 ;;
     tests/bit/benchgate/*) printf 'test-benchgate\n'; return 0 ;;
+    # #2055: gate name is "bench-regex", not "test-bench-regex" — same shape
+    # as fuzz-regex's own coreSteps() naming (tools/build/defs.bit).
+    tests/bit/benchregex/*) printf 'bench-regex\n'; return 0 ;;
     tests/bit/clicmd/*) printf 'test-clicmd\n'; return 0 ;;
     # #3458 moved this from a single file (tests/bit/fmtcitations.bit) to a
     # directory module — its self-tests split into a sibling to stay under the
