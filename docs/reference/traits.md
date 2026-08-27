@@ -12,8 +12,8 @@ must supply it) or **provided** (has a body, and is injected):
 
 ```bit
 trait Damageable {
-  hurt(n: i64)                            // required: no body
-  dead(): bool { return this.hp() <= 0 }  // provided: has a body
+  hurt(n: i64)                           // required: no body
+  dead(): bool { return this.hp() <= 0 } // provided: has a body
 }
 ```
 
@@ -27,7 +27,7 @@ it is checked once per class that actually uses the trait.
 class Enemy {
   use Damageable
 
-  hp0: i64,
+  hp0: i64
   hurt(n: i64) { this.hp0 = this.hp0 - n }
   hp(): i64 { return this.hp0 }
 }
@@ -35,9 +35,9 @@ class Enemy {
 fn checkEnemy() {
   let e = Enemy{ hp0: 10 }
   e.hurt(3)
-  print("${e.dead()}\n")   // false
+  print("${e.dead()}\n") // false
   e.hurt(10)
-  print("${e.dead()}\n")   // true
+  print("${e.dead()}\n") // true
 }
 ```
 
@@ -54,11 +54,13 @@ like a declared one:
 
 ```bit
 interface Mortal {
-  dead(): bool
+  dead(): bool,
 }
 
 fn reportOn(m: Mortal): string {
-  if (m.dead()) { return "dead" }
+  if (m.dead()) {
+    return "dead"
+  }
   return "alive"
 }
 ```
@@ -77,19 +79,25 @@ A `Self` result type gives a trait fluent, chainable methods:
 
 ```bit
 trait Buildable {
-  withHp(n: i64): Self { this.hp = n; return this }
-  withName(s: string): Self { this.name = s; return this }
+  withHp(n: i64): Self {
+    this.hp = n
+    return this
+  }
+  withName(s: string): Self {
+    this.name = s
+    return this
+  }
 }
 
 class Widget {
   use Buildable
-  hp: i64,
-  name: string,
+  hp: i64
+  name: string
 }
 
 fn buildWidget() {
   let w = Widget{ hp: 0, name: "" }.withHp(30).withName("gizmo")
-  print("${w.hp} ${w.name}\n")   // 30 gizmo
+  print("${w.hp} ${w.name}\n") // 30 gizmo
 }
 ```
 
@@ -103,13 +111,13 @@ trait Comparable {
 
 class Box {
   use Comparable
-  n: i64,
+  n: i64
 }
 
 fn compareBoxes() {
   let a = Box{ n: 5 }
   let b = Box{ n: 5 }
-  print("${a.equals(b)}\n")   // true
+  print("${a.equals(b)}\n") // true
 }
 ```
 
