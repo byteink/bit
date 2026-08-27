@@ -49,6 +49,12 @@ Opens `path` for reading.
 
 Creates or truncates `path` for writing.
 
+### `openReadWrite(path: string): File!`
+
+Opens `path` for both reading and writing via `File.readAt`/`File.writeAt`,
+creating it if absent. Existing content is preserved — unlike `create`, this
+never truncates.
+
 ### `openAppend(path: string): File!`
 
 Opens `path` for writing at the end, creating it if absent.
@@ -66,6 +72,20 @@ returns `""` with no error.
 ### `File.write(s: string): ()!`
 
 Writes `s`.
+
+### `File.readAt(buf: []byte, off: i64): int!`
+
+Reads into `buf` starting at byte offset `off`, without moving the file's own
+read/write cursor. A short result — including 0 at end of file — is not a
+failure. Safe to call concurrently with other `readAt`/`writeAt` calls on the
+same fd from several green threads: there is no shared cursor to race.
+
+### `File.writeAt(buf: []byte, off: i64): int!`
+
+Writes `buf` starting at byte offset `off`, without moving the file's own
+read/write cursor. Extends the file, or leaves a zero-filled hole before
+`off` if the file was shorter. Safe to call concurrently with other
+`readAt`/`writeAt` calls on the same fd from several green threads.
 
 ### `File.sync(): ()!`
 
