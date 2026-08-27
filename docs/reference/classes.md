@@ -51,9 +51,8 @@ class User {
   module-private. Export the class itself with `export class User { ... }` -
   see [Modules](modules.md#visibility-with-export) for the full visibility
   model, including exporting a method.
-- Fields are ordered; that order is both the composite-literal positional
-  order and the memory layout order (subject to the compiler's alignment
-  padding).
+- Fields are ordered; that order is the memory layout order (subject to the
+  compiler's alignment padding).
 
 ## Composite literals {#composite-literals}
 
@@ -196,10 +195,10 @@ fn useCounter() {
 - Methods participate in structural interface satisfaction (§14.3) the same
   way regardless of form - see [Interfaces](interfaces.md).
 
-### The explicit-receiver form
+### The removed explicit-receiver form
 
-Bit also still parses an older form, written with the receiver before the
-method name instead of inside the class body:
+Before 0.2.0, Bit also supported an older form, written with the receiver
+before the method name instead of inside the class body:
 
 ```bit ignore
 fn (c: Counter) bump(): int {
@@ -208,11 +207,11 @@ fn (c: Counter) bump(): int {
 }
 ```
 
-This declares the same method as the in-body `bump()` above, and shares
+This declared the same method as the in-body `bump()` above, and shared
 every rule listed there - visibility, the restriction to the receiver's own
-module, and reference-mutation behavior. It predates the in-body form and is
-being removed from the language; write new methods in the class body
-as shown above.
+module, and reference-mutation behavior. It predated the in-body form and
+was removed in 0.2.0: the compiler now rejects it with `error[E0103]`. Write
+methods in the class body as shown above.
 
 ## Interfaces
 

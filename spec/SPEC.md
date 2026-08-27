@@ -790,10 +790,9 @@ field       = [ "export" ] IDENT ":" type .
 - A field marked `export` is visible outside the module; otherwise it is
   module-private (§17.3). The class type itself is exported via the leading
   `export` on the declaration.
-- Fields are ordered; that order is the composite-literal positional order and the
-  memory layout order (subject to the compiler's alignment padding). A
-  method interleaved between fields does not affect this order or count as
-  a field itself.
+- Fields are ordered; that order is the memory layout order (subject to the
+  compiler's alignment padding). A method interleaved between fields does
+  not affect this order or count as a field itself.
 - Classes are reference types with reference semantics on assignment (§13.3).
 
 ### 10.6 Interface Declarations
