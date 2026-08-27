@@ -186,6 +186,7 @@ information, so they can land first.
 | E0204 | `max-complexity` | 10 | Independent paths through a function, the count a reader must hold at once. |
 | E0205 | `defer-in-loop` | — | Defers run at function exit, so one inside a loop holds every resource until the function returns. |
 | E0212 | `unreachable-code` | — | A statement after `return`/`fail`/`break`/`continue`/`panic` in the same block. |
+| E0216 | `empty-test-file` | — | A `.test.bit` file's own suffix (§19) promises tests; declaring none is almost always a rename that lost its content or a stub nobody finished. |
 
 Counting rules, so the numbers are reproducible:
 
@@ -219,6 +220,14 @@ follows one that diverges (`return`/`fail`/`break`/`continue`/`panic`) is
 answered from the AST alone, by reusing the same `diverges` analysis
 `bit check` already uses for E0055 missing-return and catch-block
 completeness (compiler/validatestmt.bit:610).
+
+`empty-test-file` is E0216 for the same reason `unreachable-code` is E0212:
+assigned from the next free E02xx slot at the time, landing here despite the
+number because it needs no resolver either — a rule reads a file's own
+FILENAME (never a directory component; a plain `.bit` helper inside a
+`_tests_/` directory is never in scope) and whether its top level declares at
+least one test-shaped `fn` (§19: no parameters, no return type), both
+answered from the AST and the file path alone.
 
 ### Phase 2 — dead weight and footguns (needs the resolver)
 

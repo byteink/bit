@@ -112,12 +112,51 @@ run() {
   return "$rc"
 }
 
+# run_cap <side> <capture> <cmd...> -- like run() above, but writes stderr to
+# a FILE instead of returning it via `$(...)`, so the caller can background
+# it: a shell variable assigned inside `$(...)` run in `&` never reaches the
+# parent shell, but a file written before the child exits, read after `wait`
+# returns, does (#3783). Mirrors alarmrun_retry's own retry-once-on-stall
+# shape rather than calling it directly, because alarmrun_retry_cap merges
+# stdout into the capture and this differential discards stdout (see run()
+# above) -- so <capture> is truncated before EACH attempt here, same as
+# alarmrun_cap does for its own merged capture and for the same reason
+# (#3478): a stalled first attempt's partial bytes must never survive into a
+# retry's compared payload.
+run_cap() {
+  local side=$1 cap=$2 rc
+  shift 2
+  local TIMEOUT="$TIMEOUT_S"
+  : >"$cap"
+  ALARMRUN_KEEP_STDERR=1 alarmrun "$@" 2>"$cap" >/dev/null
+  rc=$?
+  if [ "$rc" -eq 142 ]; then
+    echo "$side check stalled once (SIGALRM after ${TIMEOUT_S}s), retrying: $*" >&9
+    : >"$cap"
+    ALARMRUN_KEEP_STDERR=1 alarmrun "$@" 2>"$cap" >/dev/null
+    rc=$?
+  fi
+  return "$rc"
+}
+
 match=0 missing=0 falsepos=0 diff=0 timeout=0 firstfp="" firstdiff="" firsthang=""
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+seedcap="$work/seed.out"
+b2cap="$work/b2.out"
 for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort); do
-  # BOTH sides are alarm-guarded and BOTH statuses are captured. The oracle side
-  # had no bound at all, so a hung ORACLE wedged the whole gate indefinitely.
-  seed=$(run "$ORACLE" check "$f"); src=$?
-  b2=$(run "$BIT2" check "$f"); brc=$?
+  # ORACLE and BIT2 are independent per file -- compared only after both
+  # return -- so run them CONCURRENTLY rather than back-to-back (#3783).
+  # Each is still independently alarm-guarded, so a hung ORACLE still cannot
+  # wedge the whole gate: it only stalls this one file's own iteration.
+  run_cap ORACLE "$seedcap" "$ORACLE" check "$f" &
+  oraclepid=$!
+  run_cap BIT2 "$b2cap" "$BIT2" check "$f" &
+  bit2pid=$!
+  wait "$oraclepid"; src=$?
+  wait "$bit2pid"; brc=$?
+  seed=$(cat "$seedcap")
+  b2=$(cat "$b2cap")
   if [ "$src" -eq 142 ] || [ "$brc" -eq 142 ]; then
     # Undecided: this file was never compared. Counted on its own, and
     # deliberately NOT folded into MISSING or FALSEPOS — those are tracked,

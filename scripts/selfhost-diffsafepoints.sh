@@ -130,21 +130,44 @@ echo "self-test: plain-loop safepoint count — seed=$st_seed self=$st_self"
 # carries for its own ORACLE/BIT2 timeouts: a build killed by the alarm
 # produced no verdict, so it is its own counter, not folded into SKIP (which
 # means "declined to build") or MISMATCH (which means "built and disagreed").
+#
+# CONCURRENCY (#3781). ORACLE and BIT2 build different objects from the same
+# source and are compared only after both finish -- they share no state, so
+# both sides are launched in the background and waited on before the verdict
+# is decided. No FIFO/`wait -n` is needed: unlike a first-to-finish race, this
+# always waits for BOTH specific PIDs, which plain `wait "$pid"` supports on
+# bash 3.2 (this Mac's default `/bin/bash`). Each side writes its result to
+# its own file before the backgrounded function returns, so the parent never
+# reads a variable a subshell set (that write would never reach it) and never
+# races a file that is still being written.
+#
+# DELIBERATE CHANGE vs the old sequential loop: BIT2 used to be skipped
+# entirely whenever ORACLE failed to build a file (the "SKIP short-circuit").
+# Launching both concurrently means BIT2 is now always attempted too, since
+# ORACLE's outcome is not known until after BIT2 has already started. The
+# final verdict is unaffected -- TIMEOUT beats SKIP beats a real comparison,
+# exactly the old priority -- only the amount of BIT2 work done on files
+# ORACLE cannot build changes (from zero to one attempt, run in parallel with
+# ORACLE's own failure rather than after it).
 match=0 mismatch=0 skip=0 timeout=0
 total=$(find stdlib examples tests/cases tests/stress -name '*.bit' | wc -l | tr -d ' ')
 for f in $(find stdlib examples tests/cases tests/stress -name '*.bit' | sort); do
-  s=$(sites "$ORACLE" "$f" "$tmp/a.o")
-  if [ "$s" = "TIMEOUT" ]; then
+  sites "$ORACLE" "$f" "$tmp/a.o" >"$tmp/s.out" &
+  pid_s=$!
+  sites "$BIT2" "$f" "$tmp/b.o" >"$tmp/b.out" &
+  pid_b=$!
+  wait "$pid_s"
+  wait "$pid_b"
+  s=$(cat "$tmp/s.out")
+  b=$(cat "$tmp/b.out")
+  if [ "$s" = "TIMEOUT" ] || [ "$b" = "TIMEOUT" ]; then
     timeout=$((timeout + 1))
     continue
   fi
-  [ "$s" = "x" ] && { skip=$((skip + 1)); continue; }
-  b=$(sites "$BIT2" "$f" "$tmp/b.o")
-  if [ "$b" = "TIMEOUT" ]; then
-    timeout=$((timeout + 1))
+  if [ "$s" = "x" ] || [ "$b" = "x" ]; then
+    skip=$((skip + 1))
     continue
   fi
-  [ "$b" = "x" ] && { skip=$((skip + 1)); continue; }
   if [ "$s" = "$b" ]; then
     match=$((match + 1))
   else
@@ -312,23 +335,44 @@ echo "self-test: plain-loop collection count under BIT_GC=stress — seed=$sc_se
 # A timeout is not evidence, same reasoning as phase 1's own counter above: a
 # build killed by the alarm produced no verdict, so it is counted apart from
 # SKIP (declined to build) and MISMATCH (built and disagreed).
+#
+# CONCURRENCY (#3781): same background+wait shape as phase 1's loop above,
+# and the same deliberate change -- BIT2 is always attempted now, even when
+# ORACLE fails to build/link, since both sides start before either result is
+# known. This corpus is 5 synthetic files so the wall-clock effect here is
+# negligible; it is done for behavioural consistency with phase 1.
 exe_match=0 exe_mismatch=0 exe_skip=0 exe_timeout=0
 for f in "$tmp"/exe/*.bit; do
   name=$(basename "$f")
   sb="$tmp/exe/${name}.seedbin"
   bb="$tmp/exe/${name}.selfbin"
-  s=$(exe_collections "$ORACLE" "$f" "$sb")
-  if [ "$s" = "TIMEOUT" ]; then
+  exe_collections "$ORACLE" "$f" "$sb" >"$tmp/exe/${name}.s.out" &
+  pid_s=$!
+  exe_collections "$BIT2" "$f" "$bb" >"$tmp/exe/${name}.b.out" &
+  pid_b=$!
+  wait "$pid_s"
+  wait "$pid_b"
+  s=$(cat "$tmp/exe/${name}.s.out")
+  b=$(cat "$tmp/exe/${name}.b.out")
+  if [ "$s" = "TIMEOUT" ] || [ "$b" = "TIMEOUT" ]; then
     exe_timeout=$((exe_timeout + 1))
     continue
   fi
-  [ "$s" = "x" ] && { echo "EXE SKIP (seed did not build) $name"; exe_skip=$((exe_skip + 1)); continue; }
-  b=$(exe_collections "$BIT2" "$f" "$bb")
-  if [ "$b" = "TIMEOUT" ]; then
-    exe_timeout=$((exe_timeout + 1))
+  if [ "$s" = "x" ] && [ "$b" = "x" ]; then
+    echo "EXE SKIP (neither built) $name"
+    exe_skip=$((exe_skip + 1))
     continue
   fi
-  [ "$b" = "x" ] && { echo "EXE SKIP (self did not build) $name"; exe_skip=$((exe_skip + 1)); continue; }
+  if [ "$s" = "x" ]; then
+    echo "EXE SKIP (seed did not build) $name"
+    exe_skip=$((exe_skip + 1))
+    continue
+  fi
+  if [ "$b" = "x" ]; then
+    echo "EXE SKIP (self did not build) $name"
+    exe_skip=$((exe_skip + 1))
+    continue
+  fi
 
   # Comparing collection counts is only meaningful if the two binaries compute
   # the same thing. A miscompile that changed the ANSWER could otherwise land on

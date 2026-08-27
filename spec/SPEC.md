@@ -127,7 +127,8 @@ class  const   continue  default  defer      else
 enum   export  fail      false    fn         for
 from   if      import    in       interface  let
 map    match   nil       of       return     select
-spawn  switch  this      true     type       while
+spawn  switch  this      trait    true       type
+while
 ```
 
 `struct` is not a keyword. Pre-0.1.24 code that declared types with `struct` is
@@ -144,6 +145,14 @@ a call.
 `this` is the implicit receiver of a method declared inside a class body
 (§10.4); it is never written at the declaration site and names nothing outside
 a method body.
+
+`trait` declares a trait (§10.7). `use` and `Self` are **not** keywords:
+`use` lexes as an ordinary identifier and is recognized only where a class or
+trait body expects a member and sees `use` followed by another identifier — a
+field or method literally named `use` is always followed by `:`, `(`, or `<`
+instead, so there is no ambiguity. `Self` is likewise an ordinary identifier,
+predeclared as a type name only inside a trait or interface body (§10.7,
+§11.3); anywhere else it is simply undefined.
 
 ### 5.3 Predeclared Identifiers (not keywords)
 
@@ -468,6 +477,7 @@ top_decl     = import_decl
              | [ "export" ] func_decl
              | [ "export" ] class_decl
              | [ "export" ] interface_decl
+             | [ "export" ] trait_decl
              | [ "export" ] enum_decl
              | [ "export" ] type_alias
              | [ "export" ] extern_fn_decl .
@@ -769,6 +779,90 @@ The predeclared `error` interface is:
 interface error { message(): string }
 ```
 
+### 10.7 Trait Declarations
+
+```
+trait_decl   = "trait" IDENT "{" { trait_member } "}" .
+trait_member = use_stmt | trait_method .
+use_stmt     = "use" IDENT { "," IDENT } .
+trait_method = IDENT [ generic_params ] signature [ block ] .
+```
+
+A trait declares methods to be **injected into a class at check time** by a
+`use` statement in that class's body:
+
+```
+trait Damageable {
+  hurt(n: i64)                            // REQUIRED: signature, no body
+  dead(): bool { return this.hp() <= 0 }  // PROVIDED: has a body
+}
+
+class Enemy {
+  use Damageable
+  use Serializable, Poolable              // `use` is its own statement
+
+  name: string
+  hurt(n: i64) { this.hp0 = this.hp0 - n }  // supplies the required method
+}
+```
+
+`use` is a statement inside the class body, never mixed into the field list —
+`use A, B, x: f64` would give no way to see where the traits end and the fields
+begin. `use` and `trait` do not affect the class's memory layout (traits cannot
+declare fields).
+
+A trait member is either **required** (a signature with no body — the using
+class must supply it itself, or get it from another `use`d trait) or
+**provided** (has a body). A provided method's body may use `this` (§10.4's
+in-body form) once injected, but is never independently checked as part of the
+trait declaration: `this` has no concrete type until a real class injects the
+method, so each use site is checked on its own copy.
+
+Injection rules:
+
+- A provided method a using class does not declare itself is copied into that
+  class **as if declared there**, with `this` typed as the class and every
+  `Self` (below) resolved to it. The injected method participates in structural
+  interface satisfaction (§14.3) exactly like a method the class wrote itself.
+- If the class **itself** declares a method with the same name, that
+  declaration wins silently — there is no `insteadof`/`as` conflict syntax.
+- Two `use`d traits (directly, or transitively through a trait's own `use`)
+  providing the same method name, with neither overridden by the class itself,
+  is a compile error naming both.
+- A required method neither supplied by the class nor provided by any `use`d
+  trait is a compile error naming the trait and the method.
+- A trait may `use` another trait; a cycle is a compile error.
+- Injection is compile-time only: no vtable, no subtyping, no runtime dispatch,
+  and nothing left over at runtime beyond the injected method's own code.
+
+A trait is **never a type**: it cannot appear as a variable's type, a
+parameter, a return type, a field type, a type-assertion target, or a generic
+argument. A function needing "anything with these methods" declares a
+structural interface (§14.3) instead — a trait supplies method *bodies* to a
+class; an interface describes a method *set* a value can be checked against.
+
+**`Self`** is a predeclared type name, legal **only inside a trait body**, and
+**only as a parameter or result type** of a trait method — never a local
+variable's type, a field type, or anywhere inside an interface. It denotes the
+class that ends up `use`ing the trait, resolved once, at injection:
+
+```
+trait Buildable {
+  withHp(n: i64): Self { this.hp = n; return this }   // fluent chaining
+}
+
+trait Comparable {
+  equals(other: Self): bool                            // another instance of me
+}
+```
+
+In `class Enemy { use Buildable }`, `withHp(n: i64): Self` is injected as the
+ordinary, concrete `withHp(n: i64): Enemy` — there is no abstract "Self type"
+left at runtime. This is a narrower name than the interface `Self` of §11.3:
+that one stays abstract until a value is checked against the interface, because
+many types may satisfy the same interface; a trait's `Self` is a single
+class, fixed the moment `use` names it.
+
 ---
 
 ## 11. Types
@@ -898,7 +992,10 @@ fn max<T: Ord>(a: T, b: T): T {
 ```
 
 `Self` is a predeclared type name inside an interface body denoting the concrete
-implementing type; it may appear in method signatures only.
+implementing type; it may appear in method signatures only. A trait body has
+its own, narrower `Self` (§10.7): the same spelling, but resolved once, at
+`use` time, to the single class that names the trait — not left abstract for
+every future implementer the way an interface's is.
 
 ### 11.4 Raw Pointers (unmanaged subset)
 
@@ -1827,7 +1924,7 @@ scope, for the whole body of the arrow:
 const v = "hello"
 
 fn main() {
-  let g: (int) => int = v => v + 1
+  let g: (int) => int = (v) => v + 1
   print("${g(1)} ${v}")
 }
 ```
@@ -1845,12 +1942,15 @@ not a special case:
 ```bit
 fn counter(): () => int {
   let n = 0
-  return () => { n = n + 1; return n }   // one n, shared with the closure
+  return () => {
+    n = n + 1
+    return n
+  } // one n, shared with the closure
 }
 
 fn main() {
   let c = counter()
-  print("${c()} ${c()} ${c()}")            // 1 2 3
+  print("${c()} ${c()} ${c()}") // 1 2 3
 }
 ```
 
@@ -1864,7 +1964,7 @@ fn main() {
   let n = 0
   let peek = () => n
   n = 41
-  print("${peek()}")                       // 41 — not the value at creation
+  print("${peek()}") // 41 — not the value at creation
 }
 ```
 
@@ -2015,11 +2115,11 @@ the common idiom mean what it reads as:
 
 ```bit
 fn main() {
-  let fs = []( () => int )(0)
+  let fs = []() => int(0)
   for (let i = 0; i < 3; i = i + 1) {
-    fs = append(fs, () => i)               // each closure keeps its OWN i
+    fs = append(fs, () => i) // each closure keeps its OWN i
   }
-  print("${fs[0]()} ${fs[1]()} ${fs[2]()}")   // 0 1 2
+  print("${fs[0]()} ${fs[1]()} ${fs[2]()}") // 0 1 2
 }
 ```
 
@@ -2028,13 +2128,13 @@ every closure over it shares that one:
 
 ```bit
 fn main() {
-  let gs = []( () => int )(0)
+  let gs = []() => int(0)
   let j = 0
   while (j < 3) {
     gs = append(gs, () => j)
     j = j + 1
   }
-  print("${gs[0]()} ${gs[1]()} ${gs[2]()}")   // 3 3 3
+  print("${gs[0]()} ${gs[1]()} ${gs[2]()}") // 3 3 3
 }
 ```
 
@@ -2081,9 +2181,9 @@ Break a cycle with any type that has an empty or `nil` state. `Option<T>` is the
 idiomatic one and gives the ordinary recursive structures:
 
 ```bit
-class Node { v: int, next: Option<Node> }   // linked list
-class Tree { v: int, kids: []Tree }         // slice also terminates
-class Trie { next: map<rune, Trie> }        // so does a map
+class Node { v: int, next: Option<Node> } // linked list
+class Tree { v: int, kids: []Tree }       // slice also terminates
+class Trie { next: map<rune, Trie> }      // so does a map
 ```
 
 A cycle passing through a generic instantiation is not diagnosed here, since
@@ -2418,8 +2518,10 @@ method named `m` whose signature is identical to `I`'s (with `Self` bound to `S`
 Method sets:
 
 - The method set of a class type is the set of methods declared in its body
-  (§10.4), in its home module. A type alias has no method set of its own —
-  aliases are transparent (§14.1), so a value typed through one satisfies an
+  (§10.4), in its home module, plus any method injected into it by a `use`
+  statement (§10.7) — an injected method is indistinguishable from a declared
+  one for this purpose. A type alias has no method set of its own — aliases
+  are transparent (§14.1), so a value typed through one satisfies an
   interface exactly as its underlying class would.
 - Interfaces may not declare fields; only method signatures.
 - `S` must be a **class** type (or another interface, or `nil`). An interface
@@ -3356,12 +3458,14 @@ There is **no `recover`** in v0.1: panics are fatal by design, keeping control f
 free of hidden unwinding. Recoverable conditions must use the Result model.
 
 A test may still assert that a panic happens, without `recover`. `bit test` (§19)
-treats a top-level function named with the `testpanic_` prefix as
-expected to panic: it discovers `testpanic_` functions alongside `test_` ones,
-runs each in its own child process the same way, passes it when that process
-exits with the panic status (2), and fails it when the process returns
-normally or exits with any other status. This is
-a convention owned by the test runner, not a language feature — `panic` itself
+treats a discovered test named with the `testpanic_` prefix as expected to
+panic — a VERDICT modifier on an already-discovered test, not a second
+discovery mechanism, so it applies exactly like any other name to any
+function `bit test` finds in a `.test.bit` file. It runs a `testpanic_`
+function in its own child process the same way as any other test, passes it
+when that process exits with the panic status (2), and fails it when the
+process returns normally or exits with any other status. This is a
+convention owned by the test runner, not a language feature — `panic` itself
 is unchanged and `recover` remains absent from the language.
 
 ### 18.5 Deferred Cleanup
@@ -3735,31 +3839,56 @@ research under a code-review deadline instead of a design one.
 
 ## 19. Testing
 
-A **test** is a top-level function whose name begins with `test_`, taking no
-parameters and returning nothing:
+A **test** is a top-level function declared in a file named `<name>.test.bit`,
+taking no parameters and returning nothing. No name prefix is required or
+meaningful — discovery is entirely by filename and shape:
 
 ```
-fn test_addition() {
+fn addition() {
   assert(1 + 1 == 2)
 }
 
-fn test_concat() {
+fn concat() {
   assert("ab" + "c" == "abc", "string concat")
 }
 ```
 
 - No new syntax: a test is an ordinary function, so `test` is not a reserved
-  word (§5.2) and a test may call any function in its module.
-- `bit test <file.bit|dir>` discovers every `test_` function in the module a
-  file names, or in every module beneath a directory — never in a module
-  reached only by importing it from outside that directory. It runs each,
-  prints `ok`/`FAIL` per test plus a summary, and exits `0` iff every test
-  passed, `1` otherwise.
+  word (§5.2) and a test may call any function in its module — including a
+  private one declared in a sibling file. A module's files are simply its
+  `*.bit` entries concatenated in one flat scope (§14.8), so a `.test.bit`
+  file sits in the same module as the code it tests and needs no import to
+  reach it.
+- The FILENAME is the only discovery marker. `bit test` scans every top-level
+  function in a `.test.bit` file that takes no parameters and returns
+  nothing, whatever it is named. A differently-shaped function in the same
+  file (one that takes a parameter, or returns a value) is an ordinary
+  helper, not an error — name it however reads best; it is excluded by its
+  shape, never by a naming rule. `main` is the one name excluded regardless
+  of shape: `bit test` renames whatever `main` it finds before synthesizing
+  its own entry point (§17.4), so a user's `fn main(){}` is never itself a
+  discovered test.
+- Tests live in one of two places: beside the file they test, as
+  `<name>.test.bit`, or grouped under a `_tests_/` subdirectory for
+  black-box tests that exercise only a module's exported surface. A
+  `_tests_/` directory is an ordinary directory — its `*.bit` files form
+  their own module and reach the parent's exported names through an
+  ordinary relative import, `import { publicName } from "../"`.
+- A plain `.bit` file is never scanned for tests, wherever it sits — including
+  inside a `_tests_/` directory. Helper code that is not itself a test (a fake
+  server, fixture builders) belongs in a plain `.bit` file there and is never
+  mistaken for a test regardless of its own functions' shapes.
+- `bit test <file.bit|dir>` discovers every test in the module a file names,
+  or in every module beneath a directory — never in a module reached only by
+  importing it from outside that directory. It runs each, prints `ok`/`FAIL`
+  per test plus a summary, and exits `0` iff every test passed, `1`
+  otherwise.
 - A test fails when it panics — which a failed `assert` (§18.4) does. Each test
   therefore runs in its own process, so one failure neither hides the others nor
   aborts the run.
 - Tests are ordinary unreferenced functions to `bit build`/`bit run`, so the
-  linker's dead-strip drops them from a normal program's binary.
+  linker's dead-strip drops them from a normal program's binary — every
+  function in a `.test.bit` file, test-shaped or not.
 - Test execution order is the order of declaration; tests must not depend on it.
 
 Richer assertions with value diffs live in `std/testing`, layered on this runner.
@@ -3871,6 +4000,7 @@ top_decl      = import_decl
               | [ "export" ] func_decl
               | [ "export" ] class_decl
               | [ "export" ] interface_decl
+              | [ "export" ] trait_decl
               | [ "export" ] enum_decl
               | [ "export" ] type_alias
               | [ "export" ] extern_fn_decl .
@@ -3902,6 +4032,10 @@ method_decl   = [ "export" ] IDENT [ generic_params ] signature block .
 interface_decl= "interface" IDENT [ generic_params ] "{" [ method_sig { fsep method_sig } [ fsep ] ] "}" .
 method_sig    = IDENT signature .
 fsep          = ";" | "," .
+trait_decl    = "trait" IDENT "{" { trait_member } "}" .
+trait_member  = use_stmt | trait_method .
+use_stmt      = "use" IDENT { "," IDENT } .
+trait_method  = IDENT [ generic_params ] signature [ block ] .
 enum_decl     = "enum" IDENT [ generic_params ] "{" [ enum_variant { fsep enum_variant } [ fsep ] ] "}" .
 enum_variant  = IDENT [ "(" type { "," type } ")" ] .
 

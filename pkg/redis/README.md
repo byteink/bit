@@ -74,19 +74,19 @@ Everything here is what a second package author copies without asking
   `./make test-package-<name>` (`tools/build/gates.bit`'s `packageGates()`,
   filesystem-driven from whatever `pkg/<name>/` directories exist -- nothing
   to register by hand) runs `bit test pkg/<name>` (SPEC §19), which
-  discovers every top-level `fn test_*()` in the module. `resptest.bit` and
-  `clienttest.bit` here are ordinary siblings of `resp.bit`/`client.bit` --
+  discovers every top-level `fn test_*()` in the module. `resp.test.bit` and
+  `client.test.bit` here are ordinary siblings of `resp.bit`/`client.bit` --
   same module, so a test calls an unexported helper directly with no
   import. This is a deliberate split from how the `bit` compiler tests
   itself (`tests/bit/`, `tests/imports/`): a first-party package is tested
   the way SPEC §19 documents testing an ordinary Bit project, because that
   is what it is.
-- **No test may reach a real network service.** `resptest.bit` drives the
+- **No test may reach a real network service.** `resp.test.bit` drives the
   RESP codec directly against captured byte strings through the
   `byteSource` interface (`resp.bit`), which both `Client` (over a live
   `std/net.Conn`) and a test fixture (a fixed buffer, replayed once then
   EOF) satisfy structurally -- no socket involved at all.
-  `clienttest.bit` stands up a real TCP listener on `127.0.0.1:0`
+  `client.test.bit` stands up a real TCP listener on `127.0.0.1:0`
   (kernel-chosen port) and `spawn`s exactly one accept-and-reply -- the same
   listen/spawn/accept/dial shape `tests/imports/nettcp/main.bit` already
   uses -- never a connection to a host the test did not itself start.

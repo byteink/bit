@@ -18,6 +18,7 @@ single static native binary. The guiding goal is **easy to write**.
 | [Classes](classes.md) | declaring a class, fields and zero values, composite literals, reference semantics, methods, comparability |
 | [Functions](functions.md) | functions, parameters, variadics, arrow functions, control flow |
 | [Interfaces](interfaces.md) | structural interfaces, satisfaction, `error`, type assertions |
+| [Traits](traits.md) | `trait`, `use` injection, required vs. provided methods, `Self` |
 | [Generics](generics.md) | type parameters, constraints, inference, monomorphization |
 | [Concurrency](concurrency.md) | `spawn`, channels, `select`, the memory model |
 | [Errors](errors.md) | fallible functions, `?`, `catch`, `fail`, `defer`, panics |
@@ -54,6 +55,7 @@ left without a reference page:
 | §10.3 functions | Functions |
 | §10.4–§10.5 methods, classes | Classes |
 | §10.6 interfaces | Interfaces |
+| §10.7 traits | Traits |
 | §11 types | Types |
 | §11.3 generics | Generics |
 | §12 expressions, operators, conversions | Types, Functions |

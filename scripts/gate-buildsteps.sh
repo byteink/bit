@@ -186,13 +186,19 @@ case "${BUCKET}" in
     BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-docs test-packages)
     ;;
   pkg)
-    # #3271. THE ONE BUCKET that runs test-packages and NOTHING else — see
-    # the header comment block's "pkg/ IS THE ONE BUCKET..." paragraph and
-    # tools/build/defs.bit's test-packages Step{} comment for the asymmetry
-    # this rests on: a pkg/**-only diff can never reach compiler/, runtime/
-    # or stdlib/, so every compiler gate is provably irrelevant here, not
-    # merely expensive.
-    BUILD_STEPS=(test-packages)
+    # #3271. See the header comment block's "pkg/ IS THE ONE BUCKET..."
+    # paragraph and tools/build/defs.bit's test-packages Step{} comment for
+    # the asymmetry this rests on: a pkg/**-only diff can never reach
+    # compiler/, runtime/ or stdlib/, so every compiler gate is provably
+    # irrelevant here, not merely expensive.
+    # test-lint-sweep (#3806) is the one exception: its dirNames array
+    # (tests/bit/lintsweep.bit) now sweeps pkg/ for E0200 max-file-lines
+    # alongside runtime/compiler/stdlib/tools, exactly the same
+    # "examines this bucket's content directly" reason test-lint-filelines
+    # is in the selfhost/runtime/stdlib buckets above — without it here, a
+    # pkg/**-only diff that added an 800+-line file would pass this scoped
+    # bucket and only fail the full suite.
+    BUILD_STEPS=(test-packages test-lint-sweep)
     ;;
   spec)
     BUILD_STEPS=(test-spec)
