@@ -1,0 +1,87 @@
+// runtime/root/linux/sysmon.bit — the preemption monitor thread (#2580,
+// #1768's remaining half; ../darwin/boot.bit's #2579 is the twin). A new
+// sibling file rather than folded into ./boot.bit or ./boottail.bit: both
+// were already near the 800-line cap (measured 782 / 758 before this change)
+// and adding sysmonRun to either would cross it — the same reason
+// ../darwin/boot.bit's own sysmonRun forced the #2882 split there. Same
+// module as every other file in this directory (module files share one
+// scope), so ./boot.bit's `WORKER_MAX_STEPS` import, ./io.bit's
+// `sysNanosleep` import and ./time.bit's `parkMonoNs` import are visible here
+// with no re-import (a second import of any of them is E0042 — see
+// CLAUDE.md's module-import trap). Named for readability only: the checker
+// types every top-level declaration before any function body, so resolution
+// across sibling files is order-independent (../darwin/bootworker.bit's
+// header, verified 838c1dc0).
+//
+// An independent OS thread that drives `../../sched`'s `sysmonTick` off the
+// wall clock, so a green thread that never reaches a safepoint still gets
+// flagged as over budget (`../../sched/preempt.bit`'s own header names
+// #2577/#2578 as the two callers that act on the flag this sets; this file
+// adds the producer). Started once, in `boottail.bit`'s `boot()` step 6b,
+// right after the worker bring-up loop — see that file for the call site.
+//
+// THE MUTATOR-REGISTRY DECISION IS IDENTICAL TO ../darwin/boot.bit's
+// sysmonRun, FOR THE SAME REASON — read that file's header for the full
+// argument if this summary is not enough. In short: `@nosplit` end to end
+// (this function and every callee — `sysmonTick`, `parkMonoNs`, the raw
+// `nanosleep` syscall) means codegen never emits the back-edge
+// `bl bit_rt_safepoint` this loop would otherwise take, so this thread never
+// calls `currentMutator`, never claims a World slot, and is therefore
+// invisible to the collector's stop-the-world rendezvous rather than merely
+// excused from it. `gcBlockingBegin`/`gcSyscallBegin` are deliberately NOT
+// used here: both register the calling thread with the mutator table first
+// (`currentMutator(0)`, ../../gc/gcworldsync.bit), which is exactly the
+// registration this thread must never acquire. `sysmonTick` itself touches
+// only its own `@nosplit` atomic words (preempt.bit's own header: "NO OS
+// CALLS HERE"), never the GC heap, so there is no live reference this thread
+// could ever hold across the sleep for a bracket to protect in the first
+// place. The STW rendezvous is therefore neither weakened nor bypassed:
+// sysmon is simply never a party to it, the same way a thread this runtime
+// never started would be.
+//
+// THE CLOCK MUST BE `parkMonoNs`, NOT `../os.bit`'s `osMonoNs` — matching
+// ../darwin/boot.bit's own finding (#2582's oracle: "peer starved, rounds=1"
+// vs "rounds=2" under BIT_GC=stress, which forces every poll live, pointed at
+// the clock comparison itself rather than at "ok"). `../../sched`'s
+// `preemptStamp` (called at every dispatch, workerrun.bit) stamps with
+// `monoNs()`, which on Linux pins `parkMonoNs` (CLOCK_MONOTONIC via
+// `clock_gettime`, ../../park/linux/wait.bit) — see ./time.bit's own
+// `rtTimeMonoNs`. `sysmonTick`'s `nowNs - started > preemptBudgetNs` silently
+// compares two unrelated epochs if the two sides disagree on which clock they
+// read.
+//
+// UNLIKE DARWIN, `parkMonoNs` HERE TAKES A CALLER-OWNED SCRATCH (`*i64`, at
+// least 2 words — ../../park/linux/wait.bit's own header explains why: a
+// clock reading cannot be cached, so every call needs a fresh buffer). This
+// reuses the same 2-word buffer the sleep timespec below already occupies: by
+// the time `parkMonoNs` writes it, the nanosleep syscall has already
+// consumed its own read of it, and sysmon is the buffer's only ever writer or
+// reader, so nothing in it needs to survive from one use to the next.
+
+import { sysmonTick } from "../../sched"
+
+let sysmonSleepReq: [2]i64
+
+// `threadStart`'s `done` word for sysmon (./boottail.bit's `threadStart`
+// call, same shape as `startDones`). Never read again after boot arms it —
+// sysmon has no green task, is not reaped in `boottail.bit`'s step 8 join
+// loop, and simply outlives the program: the kernel reclaims its OS thread at
+// `exit()` like any other. A dedicated word rather than a slot in
+// `startDones` for the same reason `bootSleepReq` (./boot.bit) is not shared
+// with a worker's `wkSleepReq` — sysmon runs concurrently with the boot
+// thread's own step-7 wait and with every worker, so it cannot share scratch
+// any of them owns.
+let sysmonDone: [1]i32
+
+@nosplit fn sysmonRun(arg: *byte): *byte {
+  let req = int(ptrOf(sysmonSleepReq))
+  let n = 0
+  while (n < WORKER_MAX_STEPS) {
+    storeWord(req, 0)
+    storeWord(req + 8, 2000000) // 2ms: sysmonTick's 10ms budget (preempt.bit) / 5
+    let _ = syscall(sysNanosleep(), i64(req), i64(0))
+    let _ = sysmonTick(i64(parkMonoNs(ptrOf(sysmonSleepReq))))
+    n = n + 1
+  }
+  return nil
+}
