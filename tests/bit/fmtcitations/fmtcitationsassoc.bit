@@ -19,6 +19,18 @@
 //     file no longer declares the symbol because a split moved it gets
 //     searched across the row's own file index for exactly one OTHER file
 //     declaring it, rather than silently no-opping.
+//
+// #3773 makes the symbol, not the stored line range, the source of truth for
+// a Tier-2 citation (checkSymbolCitation): the symbol only has to resolve
+// SOMEWHERE reachable, so inserting or removing lines above a cited symbol
+// within its own file cannot redden this gate. What still fails: the symbol
+// not resolving in its cited file (checkSymbolMoved's "moved" report when
+// exactly one other file has it, and its "renamed or deleted" report when no
+// file does AND the name no longer appears there as plain text either —
+// `identifierAppearsIn` — so a citation pointing at a local variable or an
+// enum-tag reference, never a top-level fn/const, keeps its pre-existing
+// "cannot understand it, skip" treatment instead of becoming a false
+// failure).
 
 // `x` clamped to a non-negative floor — every backward scan below needs
 // this at least twice, so it is its own function rather than a repeated
@@ -143,32 +155,38 @@ fn findAssociatedSymbol(text: string, citStartOffset: int): string {
   return names[len(names) - 1 - idx]
 }
 
-// The (already-found) declaration at `declLine` either falls in the cited
-// range or it doesn't — a same-file line drift.
-fn checkSymbolInRange(ctx: CheckCtx, cited: CitedSymbol, declLine: int, segs: []Segment) {
-  let inRange = false
-  for seg of segs {
-    if (declLine >= seg.start && declLine <= seg.end) {
-      inRange = true
-    }
-  }
-  if (inRange) {
+// `symbolName` is the source of truth (#3773): whether it is declared
+// ANYWHERE in `resLines` (the cited file's own current text) is the whole
+// check. The doc's stored line range is never compared against `declLine`
+// here — that comparison is exactly what reddened this gate on every past
+// insertion above a cited symbol, for a citation whose prose was correct the
+// whole time. Falls through to checkSymbolMoved only when the cited file
+// itself no longer declares the symbol at all.
+fn checkSymbolCitation(ctx: CheckCtx, cited: CitedSymbol, resLines: []string) {
+  let declLine = lookupDecl(extractDecls(resLines), cited.symbolName)
+  if (declLine >= 1) {
     ctx.sc.verified = ctx.sc.verified + 1
     markVerified(ctx.seen, cited.symbolName)
     return
   }
-  report(
-    ctx.sc,
-    "${ctx.row.docPath}:${cited.tok.docLine}: `${cited.symbolName}` is declared at ${cited.resolved}:${declLine}, outside the cited range ${cited.resolved}:${cited.tok.lineSpecRaw}",
-  )
+  checkSymbolMoved(ctx, cited, resLines)
 }
 
 // `symbolName` is not declared in `resolved`, the file the citation itself
-// names. Search every OTHER file in this row's index for exactly one
-// declaring it — an unambiguous "moved" signal, not a guess. Zero or
-// multiple matches stay silent (ambiguous), the same discipline
-// `resolveToken`'s own suffix-match fallback already uses.
-fn checkSymbolMoved(ctx: CheckCtx, cited: CitedSymbol) {
+// names. Search every OTHER file in this row's index: exactly one other file
+// declaring it is an unambiguous "moved" signal; more than one is genuinely
+// ambiguous and stays silent, the same discipline `resolveToken`'s own
+// suffix-match fallback already uses. Zero elsewhere is NOT automatically a
+// failure: `findAssociatedSymbol`'s heuristic also pairs a citation with a
+// bare identifier that was never a top-level fn/const at all — a local
+// variable (`grouped`) or an enum-tag reference (`` `FuncDecl` `` naming
+// `Tag.FuncDecl`) — and those still appear as plain text in `resLines`, so
+// `identifierAppearsIn` tells that case apart from a genuine rename/deletion
+// (#3773 — where the old name has vanished from the cited file's text
+// entirely) and only the latter fails loudly. Before this, EITHER shape
+// returned silently here, so a citation to a symbol deleted outright passed
+// unchecked; that gap is what the "renamed or deleted" acceptance case closes.
+fn checkSymbolMoved(ctx: CheckCtx, cited: CitedSymbol, resLines: []string) {
   if (wasVerified(ctx.seen, cited.symbolName)) {
     return
   }
@@ -181,13 +199,64 @@ fn checkSymbolMoved(ctx: CheckCtx, cited: CitedSymbol) {
       moved = append(moved, cand)
     }
   }
-  if (len(moved) != 1) {
+  if (len(moved) > 1) {
+    return
+  }
+  if (len(moved) == 1) {
+    report(
+      ctx.sc,
+      "${ctx.row.docPath}:${cited.tok.docLine}: `${cited.symbolName}` is not declared in the cited ${cited.resolved}, but is declared in ${moved[0]} — the citation is likely stale after a file move",
+    )
+    return
+  }
+  if (identifierAppearsIn(resLines, cited.symbolName)) {
     return
   }
   report(
     ctx.sc,
-    "${ctx.row.docPath}:${cited.tok.docLine}: `${cited.symbolName}` is not declared in the cited ${cited.resolved}, but is declared in ${moved[0]} — the citation is likely stale after a file move",
+    "${ctx.row.docPath}:${cited.tok.docLine}: `${cited.symbolName}` is not declared in ${cited.resolved} or in any other file under ${join(
+      ctx.row.searchRoots,
+      ", ",
+    )}, and no longer appears there as text either — the citation is likely stale after a rename or a deletion",
   )
+}
+
+// Whether `name` appears anywhere in `lines` as a WHOLE identifier, not as a
+// substring of a longer one (a rename to `nameSuffixed` must not read as
+// `name` still being present). Distinguishes a bare identifier that was
+// never a top-level declaration (still real text: a local variable, an enum
+// tag) from one that has genuinely vanished from its cited file.
+fn identifierAppearsIn(lines: []string, name: string): bool {
+  for line of lines {
+    if (lineHasWholeIdentifier(line, name)) {
+      return true
+    }
+  }
+  return false
+}
+
+// One line of `lineHasWholeIdentifier`'s search: every occurrence of `name`
+// in `line`, checking the characters immediately before and after each hit
+// are not themselves identifier characters — bounded by `len(line)` since
+// `pos` strictly increases every iteration.
+fn lineHasWholeIdentifier(line: string, name: string): bool {
+  let n = len(line)
+  let nameLen = len(name)
+  let pos = 0
+  while (pos <= n - nameLen) {
+    let hit = int(indexOfFrom(line, name, pos))
+    if (hit < 0) {
+      return false
+    }
+    let before = hit == 0 || !isIdentContCh(line[hit - 1])
+    let afterPos = hit + nameLen
+    let after = afterPos >= n || !isIdentContCh(line[afterPos])
+    if (before && after) {
+      return true
+    }
+    pos = hit + 1
+  }
+  return false
 }
 
 // Whether `path` (under `root`) declares a top-level fn/const named `symbolName`.
