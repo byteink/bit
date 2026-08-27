@@ -216,7 +216,7 @@ Put this in `stack.test.bit`:
 
 ```bit
 class Stack {
-  items: []i64
+  items: []i64,
 }
 
 fn (s: Stack) pop(): i64 {
