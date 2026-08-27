@@ -82,12 +82,12 @@ trait Named {
 
 class Gadget {
   use Named
-  hp: i64,
+  hp: i64
 }
 
 fn greetGadget() {
   let g = Gadget{ label: "gizmo", hp: 5 }
-  print("${g.greet()}\n")   // hi gizmo
+  print("${g.greet()}\n") // hi gizmo
 }
 ```
 
