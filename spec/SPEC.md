@@ -740,6 +740,42 @@ are written. A method may still declare its own `generic_params`
   field mutates the caller's value; no pointer receiver syntax is needed.
 - Methods participate in structural interface satisfaction (§14.3).
 
+**Constructors (`init`).** A class may declare at most one `init`, in the
+class body:
+
+```
+init_decl = "init" "(" [ params ] ")" [ "!" [ type ] ] block .
+```
+
+```
+class Account {
+  balance: i64
+
+  init(opening: i64)! {
+    if (opening < 0) { fail newError("negative opening balance") }
+    this.balance = opening
+  }
+}
+
+let a = Account(500)?
+```
+
+- `init` is called through the class's own name: `Account(500)` allocates a
+  zero-valued `Account`, runs `init` on it with `this` bound to the new
+  value, and yields that value. There is no `new` keyword — allocation is
+  already implicit, and `T(...)` is the same construction shape `[]int(n)`
+  and every other type conversion already use (§12.9).
+- `init` declares no result type of its own; it may only be marked
+  **fallible** (`init(...)!` / `init(...)!E`), the same `!`/`!E` shape a
+  function's own result carries (§18.2) but written directly after the
+  parameter list, since there is no ok type to write one before. A call to a
+  fallible `init` is handled like any other fallible call — `?` or `catch`
+  at the call site (§18.3).
+- One `init` per class; a second is a compile error. Bit has no constructor
+  overloading.
+- **A class declaring `init` may not be built with a composite literal
+  outside its defining module** — see §12.2.
+
 ### 10.5 Class Declarations
 
 ```
@@ -1771,6 +1807,16 @@ value (the second `x`) is resolved as an ordinary identifier reference against
 the enclosing scope, and a name with no binding in scope is **E0040 undefined
 name** — not a field diagnostic, since the mistake is a missing variable, not a
 missing field.
+
+**A class declaring `init` (§10.4) seals its composite literal.** `Point{ x:
+1.0, y: 2.0 }` is unaffected — the rule bites only a class that declares a
+constructor. `Account{ balance: -500 }` is legal **inside** the module that
+declares `Account`, where the literal form is how `init` itself (and any
+other code in that module) builds the value; from **any other module** it is
+a compile error naming the constructor, `Account(...)`. Without this an
+exported `init` would guarantee nothing: every field would stay reachable by
+the literal form from anywhere the fields themselves are visible, defeating
+the one reason to declare a constructor at all.
 
 ### 12.3 Slice, Array, and Map Literals
 
