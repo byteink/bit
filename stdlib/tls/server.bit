@@ -41,162 +41,658 @@
 import { RsaPrivateKey, rsaParsePrivateKey, rsaParsePkcs1PrivateKey, rsaSignPss } from "std/crypto"
 import { PemBlock } from "std/crypto"
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
-// A server handshake configuration: the certificate `chain` (raw DER, end-entity
-// certificate first), the RSA private `key` matching the leaf, the ALPN protocols
-// the server supports (preference order), the acceptable key-exchange `groups`
-// (preference order), and the acceptable cipher `suites` (preference order).
-// Build one from PEM with `newTlsServerConfig`.
-export class TlsServerConfig {
-  export chain: [][]byte,
-  export key: RsaPrivateKey,
-  export alpn: []string,
-  export groups: []TlsGroup,
-  export suites: []int,
-  // Session resumption (#1209): the server-lifetime ticket store
-  // `TlsServerHandshake.processClientHello` looks tickets up in and
-  // `TlsServerConn.issueTicket` writes into. Shared across every handshake run
-  // from this config — `newTlsServerConfig` gives each config its own store.
-  export tickets: TlsTicketStore,
-  // Whether this server accepts 0-RTT early data on a resumed handshake
-  // (RFC 8446 §2.3, §4.6.1). Off does not disable resumption itself — only
-  // early data; a PSK-DHE handshake still skips Certificate/CertificateVerify.
-  export allowEarlyData: bool,
-}
-
-// The server's default group preference: the post-quantum hybrid first, then the
-// classical curves. A group is only used when the client actually shares it, so
-// listing the hybrid first simply prefers it when present.
-fn srvDefaultGroups(): []TlsGroup {
-  return [TlsGroup.X25519MLKEM768, TlsGroup.X25519, TlsGroup.Secp256r1, TlsGroup.Secp384r1]
-}
-
-// The server's default cipher-suite preference, strongest first.
-fn srvDefaultSuites(): []int {
-  return [TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256, TLS_AES_128_GCM_SHA256]
-}
-
-// A `TlsServerConfig` from PEM: `certChainPem` is one or more concatenated
-// `CERTIFICATE` blocks (end-entity certificate first), `keyPem` is the leaf's RSA
-// private key as a `PRIVATE KEY` (PKCS#8) or `RSA PRIVATE KEY` (PKCS#1) block, and
-// `alpn` is the supported protocol list. Fails on malformed PEM, an empty chain,
-// or a private key this parser cannot read. Groups and suites default to the full
-// supported sets.
-export fn newTlsServerConfig(
-  certChainPem: string,
-  keyPem: string,
-  alpn: []string,
-): TlsServerConfig! {
-  let certBlocks = pemDecode(certChainPem)?
-  let chain = [][]byte(0)
-  for b of certBlocks {
-    if (b.label == "CERTIFICATE") {
-      chain = append(chain, b.der)
-    }
-  }
-  if (len(chain) == 0) {
-    fail newError("tls server: certificate chain has no CERTIFICATE blocks")
-  }
-  let keyBlocks = pemDecode(keyPem)?
-  let key = srvParsePrivateKey(keyBlocks[0])?
-  return TlsServerConfig{
-    chain: chain,
-    key: key,
-    alpn: alpn,
-    groups: srvDefaultGroups(),
-    suites: srvDefaultSuites(),
-    tickets: newTicketStore(),
-    allowEarlyData: true,
-  }
-}
-
-// Parse an RSA private key from a PEM block, dispatching on its label: PKCS#8
-// (`PRIVATE KEY`) or PKCS#1 (`RSA PRIVATE KEY`). Fails on any other label.
-fn srvParsePrivateKey(block: PemBlock): RsaPrivateKey! {
-  if (block.label == "PRIVATE KEY") {
-    return rsaParsePrivateKey(block.der)?
-  }
-  if (block.label == "RSA PRIVATE KEY") {
-    return rsaParsePkcs1PrivateKey(block.der)?
-  }
-  fail newError("tls server: unsupported private-key PEM label ${block.label}")
-}
-
-// ---------------------------------------------------------------------------
-// Handshake state and results
-// ---------------------------------------------------------------------------
-
-// One step of the server handshake from `processClientHello`. `retry` means a
-// HelloRetryRequest was produced; send `outbound` and feed the next ClientHello
-// back in. Otherwise `outbound` is the ServerHello plus the encrypted
-// authentication flight, after which `processClientFinished` completes the
-// handshake.
-export class TlsServerStep { export retry: bool, export outbound: []byte }
-
-// A completed server connection: the negotiated parameters and the two
-// application-data record contexts. Obtain it from `processClientFinished`.
-export class TlsServerConn {
-  suite: CipherSuite,
-  alpn: string,
-  appWrite: RecordKeys,
-  appRead: RecordKeys,
-  exporter: []byte,
-  resumption: []byte,
-  // Session resumption (#1209): carried from `TlsServerConfig` so `issueTicket`
-  // needs no arguments — the store and the early-data policy travel with the
-  // connection they came from.
-  tickets: TlsTicketStore,
-  allowEarlyData: bool,
-}
-
 // The in-progress server handshake state. Drive it with `processClientHello` then
 // `processClientFinished`; all fields are internal.
 export class TlsServerHandshake {
-  config: TlsServerConfig,
-  transcript: []byte,
-  ch1: []byte,
-  suite: CipherSuite,
-  usedHrr: bool,
-  shared: []byte,
-  chs: []byte,
-  shs: []byte,
-  serverReadKeys: RecordKeys,
+  config: TlsServerConfig
+  transcript: []byte
+  ch1: []byte
+  suite: CipherSuite
+  usedHrr: bool
+  shared: []byte
+  chs: []byte
+  shs: []byte
+  serverReadKeys: RecordKeys
   // The record-write keys under `shs`, set for real by `srvSendServerFlight`
   // the moment it actually seals the auth flight with them — placeholder
   // `dummy` (same as `serverReadKeys`/`earlyReadKeys`) until then. A
   // post-flight fail-and-close alert (#2955) reuses this SAME object rather
   // than re-deriving one from `shs`, so its sequence number continues from
   // the auth flight's rather than restarting at an already-spent nonce.
-  hsWriteKeys: RecordKeys,
-  master: []byte,
-  sapSecret: []byte,
-  capSecret: []byte,
-  exporterSec: []byte,
-  alpn: string,
-  connected: bool,
-  extraEEExts: []Extension,
+  hsWriteKeys: RecordKeys
+  master: []byte
+  sapSecret: []byte
+  capSecret: []byte
+  exporterSec: []byte
+  alpn: string
+  connected: bool
+  extraEEExts: []Extension
   // Session resumption / 0-RTT (#1209): set by `srvTryPsk` while processing the
   // ClientHello. `earlyReadKeys` is only valid when `earlyDataAccepted`.
-  pskAccepted: bool,
-  pskEarly: []byte,
-  earlyDataAccepted: bool,
-  earlyReadKeys: RecordKeys,
-  earlyData: []byte,
+  pskAccepted: bool
+  pskEarly: []byte
+  earlyDataAccepted: bool
+  earlyReadKeys: RecordKeys
+  earlyData: []byte
+
+  // Validate `ch`'s `pre_shared_key`/`psk_key_exchange_modes` extensions against
+  // this server's ticket store and, on a valid binder, accept the PSK
+  // (`s.pskAccepted`/`s.pskEarly`) and — if the client also offered `early_data`
+  // and this server allows it for that ticket — accept 0-RTT
+  // (`s.earlyDataAccepted`/`s.earlyReadKeys`). Any failure to qualify (no PSK
+  // offered, unknown ticket, wrong suite, bad binder) is not fatal: it silently
+  // leaves `s.pskAccepted` false, which `srvBuildServerFlight` reads as "run a
+  // fresh handshake" — exactly RFC 8446's "server MAY choose an earlier version
+  // [handshake] instead" fallback. Only a structurally malformed PSK extension
+  // (one that parses as present but not as valid TLS) is a hard failure, the
+  // same standard the rest of this module's decoders hold hostile input to.
+  //
+  // PSK-after-HelloRetryRequest is not implemented (`s.usedHrr` short-circuits
+  // this): #1209's required tests never combine resumption with HRR, and
+  // supporting it would mean threading the truncated-transcript computation
+  // through the post-HRR synthetic-transcript path for no tested benefit.
+  // Whether `ch` is even eligible to attempt PSK resumption: no prior
+  // HelloRetryRequest (`s.usedHrr` short-circuits it, see the header comment
+  // above), and both `pre_shared_key`/`psk_key_exchange_modes` present with
+  // `psk_dhe_ke` offered. Split out of `srvTryPsk` (#2448).
+  srvPskModeEligible(ch: ClientHello): bool! {
+    if (this.usedHrr) {
+      return false
+    }
+    let pskLookup = findExtOptional(ch.extensions, extTypePreSharedKey)
+    if (!pskLookup.found) {
+      return false
+    }
+    let modesLookup = findExtOptional(ch.extensions, extTypePskKeyExchangeModes)
+    if (!modesLookup.found) {
+      return false
+    }
+    let modes = parsePskKeyExchangeModes(modesLookup.ext)?
+    return hasInt(modes, pskKeModePskDhe)
+  }
+
+  srvTryPsk(ch: ClientHello, chMsg: []byte): ()! {
+    if (!this.srvPskModeEligible(ch)?) {
+      return
+    }
+    let pskLookup = findExtOptional(ch.extensions, extTypePreSharedKey)
+    let offered = parsePreSharedKeyClient(pskLookup.ext)?
+    if (len(offered.identities) == 0 || len(offered.binders) == 0) {
+      return
+    }
+    let sess = this.config.tickets.sessions[string(offered.identities[0].identity)]
+    if (len(sess.resumptionSecret) == 0) {
+      return
+    }
+    if (sess.suiteId != this.suite.id) {
+      return
+    }
+
+    let mk = this.srvNewHash
+    let psk = resumptionPsk(mk, sess.resumptionSecret, sess.nonce)
+    let early = earlySecret(mk, psk)
+    let bKey = binderKey(mk, early)
+    let binder = offered.binders[0]
+    if (len(binder) > len(chMsg)) {
+      fail newError("tls server: pre_shared_key binder is longer than the ClientHello")
+    }
+    let truncated = chMsg[0:len(chMsg) - len(binder)]
+    let expected = finishedMac(mk, bKey, digest(mk(), truncated))
+    if (!ctEq(expected, binder)) {
+      return
+    }
+
+    this.pskAccepted = true
+    this.pskEarly = early
+
+    this.srvTryEarlyData(ch, sess, early, mk)?
+  }
+
+  // Accept 0-RTT if this server allows it globally, the resumed session's own
+  // ticket allows it, and the client actually offered `early_data` -- deriving
+  // the early traffic read keys `srvConsumeEarlyData` decrypts under. Split
+  // out of `srvTryPsk` (#2448).
+  srvTryEarlyData(
+    ch: ClientHello,
+    sess: TlsServerSession,
+    early: []byte,
+    mk: () => Hash,
+  ): ()! {
+    if (this.config.allowEarlyData &&
+      sess.allowEarlyData &&
+      hasExt(ch.extensions, extTypeEarlyData)) {
+      let earlyTraffic = clientEarlyTrafficSecret(mk, early, digest(mk(), this.transcript))
+      this.earlyReadKeys = newRecordKeys(this.suite, earlyTraffic)?
+      this.earlyDataAccepted = true
+    }
+  }
+
+  // Decrypt the client's speculative 0-RTT records — everything in the flight
+  // after the ClientHello, `records[startIdx:]`, skipping any
+  // change_cipher_spec — under the early traffic key `srvTryPsk` just derived,
+  // accumulating their content into `s.earlyData`. Only called once
+  // `s.earlyDataAccepted` is already true, so an unreadable record here is a
+  // genuine protocol violation (RFC 8446 §4.2.10: "if the server fails to
+  // decrypt a 0-RTT record following an accepted early_data extension, it MUST
+  // terminate the connection with a bad_record_mac alert") rather than evidence
+  // early data should have been declined — that decision was already made.
+  srvConsumeEarlyData(records: [][]byte, startIdx: int): ()! {
+    let idx = startIdx
+    while (idx < len(records)) {
+      let rec = records[idx]
+      idx = idx + 1
+      if (tlsWireRecordType(rec) == tlsCcsType) {
+        continue
+      }
+      let pt = this.earlyReadKeys.open(rec)?
+      if (pt.contentType != recordApplicationData) {
+        fail newError("tls server: expected application_data in the early-data flight")
+      }
+      this.earlyData = tlsHsPutBytes(this.earlyData, pt.content)
+    }
+  }
+
+  // Consume the EndOfEarlyData record that must precede the client Finished when
+  // early data was accepted (RFC 8446 §4.5): skip any change_cipher_spec from
+  // `startIdx`, open the next record under the early traffic key (not
+  // `serverReadKeys` — this one record is still early-traffic-protected), verify
+  // it really is EndOfEarlyData, and fold its bytes into the transcript the
+  // server's own Finished check and application-secret derivation both cover.
+  // Returns the index of the first record after it, for `processClientFinished`
+  // to resume its normal (handshake-key) record scan from.
+  srvConsumeEndOfEarlyData(records: [][]byte, startIdx: int): int! {
+    let idx = startIdx
+    while (idx < len(records) && tlsWireRecordType(records[idx]) == tlsCcsType) {
+      idx = idx + 1
+    }
+    if (idx >= len(records)) {
+      fail newError("tls server: expected EndOfEarlyData after accepted early data")
+    }
+    let pt = this.earlyReadKeys.open(records[idx])?
+    if (pt.contentType != recordHandshake) {
+      fail newError("tls server: expected an EndOfEarlyData record")
+    }
+    parseEndOfEarlyData(pt.content)?
+    this.transcript = tlsHsPutBytes(this.transcript, pt.content)
+    return idx + 1
+  }
+
+  // Whether the client's ClientHello carried a PSK this server accepted — the
+  // server-side mirror of `TlsClientHandshake.pskWasAccepted`. Meaningful once
+  // `processClientHello` has run.
+  export pskWasAccepted(): bool {
+    return this.pskAccepted
+  }
+
+  // Whether this handshake accepted the client's 0-RTT early data. When true,
+  // `earlyDataReceived()` holds it.
+  export earlyDataWasAccepted(): bool {
+    return this.earlyDataAccepted
+  }
+
+  // The 0-RTT early application data this handshake decrypted, concatenated in
+  // the order the client sent it. Empty unless `earlyDataWasAccepted()`.
+  //
+  // *** This data is replayable — see this file's header comment. *** Treat it
+  // as safe to process more than once before acting on it.
+  export earlyDataReceived(): []byte {
+    return this.earlyData
+  }
+
+  // The suite hash as a `() => Hash` for the key schedule.
+  srvNewHash(): Hash { return tlsSuiteNewHash(this.suite) }
+
+  // The transcript hash of the messages absorbed so far, under the negotiated suite.
+  srvTh(): []byte {
+    return digest(tlsSuiteNewHash(this.suite), this.transcript)
+  }
+
+  // Parse and validate `chMsg`, negotiate the cipher suite and key-exchange group,
+  // and — on the non-retry path — extend the transcript with this ClientHello (CH1,
+  // or CH2 after an HRR). Returns whether a HelloRetryRequest is required; on the
+  // retry path the transcript is left untouched for `srvBuildHelloRetry`, which
+  // rebuilds it around the synthetic message_hash. Fails on a parse error, an
+  // absent common suite, or (after an HRR) an unshareable group.
+  srvNegotiate(chMsg: []byte): srvNegotiation! {
+    let ch = parseClientHello(chMsg)?
+    srvCheckTls13(ch)?
+    this.suite = srvNegotiateSuite(this.config.suites, ch.cipherSuites)?
+
+    let shares = srvClientKeyShares(ch)?
+    let supported = srvClientGroups(ch)?
+
+    // Prefer a group the client already shared; else request one via HRR.
+    let shared = srvSelectShared(this.config.groups, shares)
+    if (!shared.ok) {
+      if (this.usedHrr) {
+        fail tlsAlertFail{
+          desc: alertHandshakeFailure,
+          msg: "tls server: client did not share an acceptable group after HelloRetryRequest",
+        }
+      }
+      return srvNegotiation{ retry: true, supported: supported, ch: ch, sel: shared }
+    }
+
+    // Extend the transcript with this ClientHello (CH1, or CH2 after an HRR).
+    if (this.usedHrr) {
+      this.transcript = tlsHsPutBytes(this.transcript, chMsg)
+    } else {
+      // chMsg may be a caller-owned view (e.g. the QUIC record-bypass path's
+      // CryptoAssembler.contiguous(), quic/tls.bit) that outlives this call;
+      // copy it once so growing s.transcript later never mutates memory the
+      // caller still owns (#3208).
+      let ch1Copy = tlsHsCopyBytes(chMsg)
+      this.ch1 = ch1Copy
+      this.transcript = ch1Copy
+    }
+    return srvNegotiation{ retry: false, supported: supported, ch: ch, sel: shared }
+  }
+
+  // Process a ClientHello flight. Returns a `retry` step carrying a
+  // HelloRetryRequest when the client shared no acceptable group, or a step whose
+  // `outbound` is the ServerHello followed by the encrypted authentication flight.
+  // Fails on any parse error, an absent common suite or group, or a signing failure.
+  export processClientHello(flight: []byte): TlsServerStep! {
+    let records = tlsWireSplitRecords(flight)?
+    let idx = srvClientHelloIndex(records)?
+    let chMsg = tlsWireRecordBody(records[idx])
+    let neg = this.srvNegotiate(chMsg)?
+    if (neg.retry) {
+      return this.srvSendHelloRetry(chMsg, neg.supported)?
+    }
+    // Session resumption / 0-RTT (#1209): validate any offered PSK before
+    // building the server flight, since a valid, early-data-accepted PSK changes
+    // both the key schedule input and which messages the flight contains. Any
+    // records after the ClientHello are the client's speculative early
+    // application data; they are only decrypted (and thus only fail the
+    // handshake if unreadable) once early data has actually been accepted —
+    // otherwise they are simply left unconsumed, which is exactly the reject
+    // path's silent-fallback behavior.
+    this.srvTryPsk(neg.ch, chMsg)?
+    if (this.earlyDataAccepted) {
+      this.srvConsumeEarlyData(records, idx + 1)?
+    }
+    return this.srvSendServerFlight(neg.ch, neg.sel)?
+  }
+
+  // Build a HelloRetryRequest *message* asking for the first server-preferred group
+  // the client advertised in supported_groups (RFC 8446 §4.1.4). Rebuilds the
+  // transcript around the synthetic message_hash of the first ClientHello and marks
+  // `usedHrr`. Returns the HRR handshake-message bytes; record mode wraps it in a
+  // plaintext record, the QUIC path carries it in an Initial-level CRYPTO frame.
+  // Fails if no advertised group is acceptable.
+  srvBuildHelloRetry(chMsg: []byte, supported: []int): []byte! {
+    let target = -1
+    for g of this.config.groups {
+      let cp = int(tlsGroupCodepoint(g))
+      for adv of supported {
+        if (adv == cp && target < 0) {
+          target = cp
+        }
+      }
+    }
+    if (target < 0) {
+      fail tlsAlertFail{
+        desc: alertHandshakeFailure,
+        msg: "tls server: no key-exchange group in common with the client",
+      }
+    }
+
+    let ksData = tlsHsPutU16([]byte(0), target)
+    let exts = []Extension(0)
+    exts = append(exts, extSupportedVersionsServer(versionTls13))
+    exts = append(exts, Extension{ extType: extTypeKeyShare, data: ksData })
+    let hrr = encodeServerHello(
+      ServerHello{
+        legacyVersion: versionTls12,
+        random: tlsHsHelloRetryRandom(),
+        sessionId: []byte(0),
+        cipherSuite: this.suite.id,
+        extensions: exts,
+      },
+    )
+
+    let synthetic = tlsWireSyntheticHash(this.srvNewHash, chMsg)
+    // Same caller-owned-view hazard as srvNegotiate above (#3208): copy before
+    // storing, even though nothing currently reads s.ch1 back out on this path —
+    // it is a durable field, not a borrowed one.
+    this.ch1 = tlsHsCopyBytes(chMsg)
+    this.transcript = tlsHsPutBytes(synthetic, hrr)
+    this.usedHrr = true
+    return hrr
+  }
+
+  // Send a HelloRetryRequest in record mode: build the HRR message and frame it as
+  // the plaintext record to send.
+  srvSendHelloRetry(chMsg: []byte, supported: []int): TlsServerStep! {
+    let hrr = this.srvBuildHelloRetry(chMsg, supported)?
+    return TlsServerStep{ retry: true, outbound: tlsWirePlaintextRecord(recordHandshake, hrr) }
+  }
+
+  // Build the ServerHello and the plaintext authentication flight
+  // (EncryptedExtensions, Certificate, CertificateVerify, Finished), derive the
+  // handshake-traffic secrets and the server's read context, and compute the
+  // application-traffic material and the expected client Finished for
+  // `processClientFinished`/`processClientFinishedMessage`. The security-relevant
+  // server signing (CertificateVerify) happens here; record mode and the QUIC path
+  // share it byte-for-byte.
+  srvBuildServerFlight(ch: ClientHello, sel: srvSharedGroup): srvFlight! {
+    let resp = tlsGroupResponder(sel.group, sel.peerShare)?
+    this.shared = resp.shared
+
+    let shExts = []Extension(0)
+    shExts = append(shExts, extSupportedVersionsServer(versionTls13))
+    shExts = append(
+      shExts,
+      extKeyShareServer(KeyShareEntry{ group: sel.cp, keyExchange: resp.keyShare }),
+    )
+    // Session resumption (#1209): echo pre_shared_key (always identity 0 — this
+    // server only ever offers/accepts a single PSK identity) when `srvTryPsk`
+    // validated the client's binder.
+    if (this.pskAccepted) {
+      shExts = append(shExts, extPreSharedKeyServer(0))
+    }
+    let shMsg = encodeServerHello(
+      ServerHello{
+        legacyVersion: versionTls12,
+        random: randomBytes(32),
+        sessionId: ch.sessionId,
+        cipherSuite: this.suite.id,
+        extensions: shExts,
+      },
+    )
+    this.transcript = tlsHsPutBytes(this.transcript, shMsg)
+
+    // Handshake-traffic secrets and the server's read context. A resumed
+    // handshake feeds the ticket-derived early secret into the same generic
+    // ladder a fresh handshake feeds the all-zero one into (#1209).
+    let mk = this.srvNewHash
+    let early = earlySecret(mk, []byte(0))
+    if (this.pskAccepted) {
+      early = this.pskEarly
+    }
+    let hs = handshakeSecret(mk, early, this.shared)
+    let thSH = this.srvTh()
+    this.chs = clientHandshakeTrafficSecret(mk, hs, thSH)
+    this.shs = serverHandshakeTrafficSecret(mk, hs, thSH)
+    this.serverReadKeys = newRecordKeys(this.suite, this.chs)?
+
+    // EncryptedExtensions (ALPN [, early_data]), then Certificate +
+    // CertificateVerify — skipped when the PSK was accepted (RFC 8446 §4.4.2:
+    // "the server MUST NOT send a Certificate ... unless it is used with a
+    // fresh handshake") — then Finished.
+    let ee = this.srvEncryptedExtensions(ch)?
+    this.transcript = tlsHsPutBytes(this.transcript, ee)
+    let flightBody = ee
+    if (!this.pskAccepted) {
+      let cert = srvCertificateMessage(this.config.chain)
+      this.transcript = tlsHsPutBytes(this.transcript, cert)
+      let cv = this.srvCertificateVerify()?
+      this.transcript = tlsHsPutBytes(this.transcript, cv)
+      flightBody = tlsHsPutBytes(tlsHsPutBytes(flightBody, cert), cv)
+    }
+    let serverFin = encodeFinished(Finished{ verifyData: finishedMac(mk, this.shs, this.srvTh()) })
+    this.transcript = tlsHsPutBytes(this.transcript, serverFin)
+    flightBody = tlsHsPutBytes(flightBody, serverFin)
+
+    // Application-traffic material over Transcript-Hash(.. server Finished). The
+    // client Finished MAC is NOT precomputed here: RFC 8446 §4.4.4 keys it to the
+    // transcript through "the later of server Finished/EndOfEarlyData" — when
+    // 0-RTT is accepted, EndOfEarlyData is appended to the transcript after this
+    // function returns (`srvConsumeEndOfEarlyData`), so `srvFinishFromMessage`
+    // computes the expected MAC fresh, over whatever the transcript is by then.
+    let thSF = this.srvTh()
+    this.master = masterSecret(mk, hs)
+    this.capSecret = clientApplicationTrafficSecret(mk, this.master, thSF)
+    this.sapSecret = serverApplicationTrafficSecret(mk, this.master, thSF)
+    this.exporterSec = exporterMasterSecret(mk, this.master, thSF)
+
+    return srvFlight{ serverHello: shMsg, authFlight: flightBody }
+  }
+
+  // Send the ServerHello and the AEAD-sealed authentication flight in record mode:
+  // build both plaintext flights, seal the auth flight under the server's
+  // handshake-traffic key, and concatenate the ServerHello record with the sealed
+  // flight.
+  srvSendServerFlight(
+    ch: ClientHello,
+    sel: srvSharedGroup,
+  ): TlsServerStep! {
+    let fl = this.srvBuildServerFlight(ch, sel)?
+    let writeKeys = newRecordKeys(this.suite, this.shs)?
+    this.hsWriteKeys = writeKeys
+    let sealed = writeKeys.seal(fl.authFlight, recordHandshake)?
+    let outbound = tlsHsPutBytes(tlsWirePlaintextRecord(recordHandshake, fl.serverHello), sealed)
+    return TlsServerStep{ retry: false, outbound: outbound }
+  }
+
+  // Build EncryptedExtensions, negotiating ALPN: the first client-offered protocol
+  // the server supports. Records the selection in `s.alpn`.
+  srvEncryptedExtensions(ch: ClientHello): []byte! {
+    let exts = []Extension(0)
+    let selected = this.srvSelectAlpn(ch)?
+    if (len(selected) > 0) {
+      this.alpn = selected
+      exts = append(exts, extALPN([selected]))
+    }
+    // Session resumption / 0-RTT (#1209): echo early_data, empty body, to tell
+    // the client its 0-RTT data was accepted (`srvTryPsk` already decided this
+    // before the flight was built).
+    if (this.earlyDataAccepted) {
+      exts = append(exts, extEarlyDataEmpty())
+    }
+    // Extra caller extensions (empty in record mode) — the QUIC record-bypass path
+    // uses this to answer with the quic_transport_parameters extension (RFC 9001 §8.2).
+    for e of this.extraEEExts {
+      exts = append(exts, e)
+    }
+    return encodeEncryptedExtensions(EncryptedExtensions{ extensions: exts })
+  }
+
+  // The first client-offered ALPN protocol the server supports, or "" when there
+  // is nothing to negotiate. A client that offers ALPN with NO overlap is a hard
+  // failure: RFC 7301 §3.2 says the server SHALL abort with a fatal
+  // `no_application_protocol` alert. Returning "" there instead would silently
+  // downgrade the connection to the fallback protocol and serve the client anyway
+  // — which is exactly the bug this closes. Failing here tags the error with
+  // that AlertDescription (`tlsAlertFail`, `alert.bit`); `tlsapiDriveServer`
+  // (`tls.bit`) sends it as a real plaintext Alert record before the socket
+  // closes (#2955) — the load-bearing guarantee is that a disjoint offer never
+  // completes the handshake, on the wire as well as locally.
+  srvSelectAlpn(ch: ClientHello): string! {
+    // A server that advertises no ALPN protocols does not negotiate ALPN at all:
+    // it ignores the client's extension and proceeds. RFC 7301's abort applies
+    // only when the server supports ALPN but shares nothing with the client.
+    if (len(this.config.alpn) == 0) {
+      return ""
+    }
+    for e of ch.extensions {
+      if (e.extType == extTypeALPN) {
+        let offered = parseALPN(e)?
+        for want of this.config.alpn {
+          for o of offered {
+            if (o == want) {
+              return want
+            }
+          }
+        }
+        fail tlsAlertFail{
+          desc: alertNoApplicationProtocol,
+          msg: "tls server: no application protocol in common (RFC 7301 no_application_protocol)",
+        }
+      }
+    }
+    // No ALPN extension from the client: nothing to negotiate, proceed.
+    return ""
+  }
+
+  // Sign the CertificateVerify over the RFC 8446 §4.4.3 signed content with the
+  // server's RSA key (RSA-PSS, SHA-256, salt = hash length). Fails on a signing
+  // error.
+  srvCertificateVerify(): []byte! {
+    let signed = tlsWireCertVerifyContent(tlsWireServerCertVerifyContext, this.srvTh())
+    let sig = rsaSignPss(this.config.key, srvSha256, signed, 32)?
+    return encodeCertificateVerify(
+      CertificateVerify{ algorithm: sigRsaPssRsaeSha256, signature: sig },
+    )
+  }
+
+  // Verify the client Finished *message* MAC in constant time and complete the
+  // handshake, returning the application connection. Shared by record-mode
+  // `processClientFinished` (after it AEAD-decrypts the Finished record) and the
+  // QUIC `processClientFinishedMessage` (which receives the plaintext message from a
+  // Handshake-level CRYPTO frame). Fails on a parse error or a MAC mismatch.
+  srvFinishFromMessage(finMsg: []byte): TlsServerConn! {
+    let fin = parseFinished(finMsg)?
+    let mk = this.srvNewHash
+    // Computed fresh, not precomputed in `srvBuildServerFlight`: RFC 8446
+    // §4.4.4 keys the client Finished to the transcript through "the later of
+    // server Finished/EndOfEarlyData", and `s.transcript` already reflects
+    // EndOfEarlyData here when 0-RTT was accepted (#1209).
+    let expected = finishedMac(mk, this.chs, this.srvTh())
+    if (!ctEq(fin.verifyData, expected)) {
+      fail tlsAlertFail{
+        desc: alertDecryptError,
+        msg: "tls server: client Finished MAC is invalid",
+      }
+    }
+
+    this.transcript = tlsHsPutBytes(this.transcript, finMsg)
+    let resumption = resumptionMasterSecret(mk, this.master, this.srvTh())
+    this.connected = true
+    return TlsServerConn{
+      suite: this.suite,
+      alpn: this.alpn,
+      appWrite: newRecordKeys(this.suite, this.sapSecret)?,
+      appRead: newRecordKeys(this.suite, this.capSecret)?,
+      exporter: this.exporterSec,
+      resumption: resumption,
+      tickets: this.config.tickets,
+      allowEarlyData: this.config.allowEarlyData,
+    }
+  }
+
+  // Verify the client Finished and complete the handshake, returning the
+  // application connection. Fails on a parse error or a Finished MAC that does not
+  // match the expected value in constant time.
+  export processClientFinished(flight: []byte): TlsServerConn! {
+    let records = tlsWireSplitRecords(flight)?
+    let idx = 0
+    // 0-RTT (#1209): an accepted early-data flight's client Finished is preceded
+    // by EndOfEarlyData, sealed under the early traffic key rather than `chs` —
+    // the RFC 8446 §4.5 signal that the record layer is switching keys.
+    if (this.earlyDataAccepted) {
+      idx = this.srvConsumeEndOfEarlyData(records, idx)?
+    }
+    let finMsg = []byte(0)
+    let got = false
+    while (idx < len(records)) {
+      let rec = records[idx]
+      idx = idx + 1
+      if (tlsWireRecordType(rec) == tlsCcsType) {
+        continue
+      }
+      let pt = this.serverReadKeys.open(rec) catch e {
+        fail tlsAlertFail{
+          desc: alertBadRecordMac,
+          msg: "tls server: client Finished record failed authentication: ${e.message()}",
+        }
+      }
+      if (pt.contentType == recordAlert) {
+        // The client rejected the server's certificate (or another auth-flight
+        // problem) and sent a fatal alert instead of its Finished message
+        // (#2320's send side, `clientflight.bit`). Decode and report it by name
+        // — the same defect #2319 fixed on the client's receive path; without
+        // this, `pt.contentType != recordHandshake` below would misreport it as
+        // "expected a handshake record for the client Finished" and the alert
+        // bytes the client just sent would be silently discarded again.
+        tlsAlertError(pt.content)?
+      }
+      if (pt.contentType != recordHandshake) {
+        fail tlsAlertFail{
+          desc: alertUnexpectedMessage,
+          msg: "tls server: expected a handshake record for the client Finished",
+        }
+      }
+      finMsg = pt.content
+      got = true
+    }
+    if (!got) {
+      fail tlsAlertFail{
+        desc: alertUnexpectedMessage,
+        msg: "tls server: client flight has no Finished record",
+      }
+    }
+    return this.srvFinishFromMessage(finMsg)?
+  }
+
+  // Process the client's ClientHello *message* (plaintext, from Initial-level
+  // CRYPTO frames). Negotiates the suite and group; on success it derives the
+  // handshake- and application-traffic secrets and returns the ServerHello plus the
+  // plaintext authentication flight to carry in CRYPTO frames, and on an
+  // unshareable group it returns a HelloRetryRequest. Fails on a parse error, an
+  // absent common suite/group, or a signing failure.
+  export processClientHelloMessage(chMsg: []byte): TlsServerQuicFlight! {
+    let neg = this.srvNegotiate(chMsg)?
+    if (neg.retry) {
+      let hrr = this.srvBuildHelloRetry(chMsg, neg.supported)?
+      return TlsServerQuicFlight{ retry: true, serverHello: hrr, handshake: []byte(0) }
+    }
+    let fl = this.srvBuildServerFlight(neg.ch, neg.sel)?
+    return TlsServerQuicFlight{
+      retry: false,
+      serverHello: fl.serverHello,
+      handshake: fl.authFlight,
+    }
+  }
+
+  // Verify the client Finished *message* (plaintext, from a Handshake-level CRYPTO
+  // frame) and complete the handshake, returning the application connection. Runs
+  // the same constant-time MAC check as record mode. Fails on a parse error or a
+  // Finished MAC that does not match.
+  export processClientFinishedMessage(finMsg: []byte): TlsServerConn! {
+    return this.srvFinishFromMessage(finMsg)?
+  }
+
+  // The negotiated cipher suite's IANA code point, valid once a ClientHello has been
+  // processed. std/quic uses it to pick the suite hash and key length.
+  export cipherSuiteId(): int {
+    return this.suite.id
+  }
+
+  // The client_handshake_traffic_secret (RFC 8446 §7.1), derived once the server
+  // flight is produced. std/quic keys the client's Handshake-level packets from it.
+  export clientHandshakeSecret(): []byte {
+    return this.chs
+  }
+
+  // The server_handshake_traffic_secret (RFC 8446 §7.1), derived once the server
+  // flight is produced. std/quic keys the server's Handshake-level packets from it.
+  export serverHandshakeSecret(): []byte {
+    return this.shs
+  }
+
+  // The client_application_traffic_secret_0 (RFC 8446 §7.1), derived once the server
+  // flight is produced. std/quic keys the client's 1-RTT packets from it.
+  export clientApplicationSecret(): []byte {
+    return this.capSecret
+  }
+
+  // The server_application_traffic_secret_0 (RFC 8446 §7.1), derived once the server
+  // flight is produced. std/quic keys the server's 1-RTT packets from it.
+  export serverApplicationSecret(): []byte {
+    return this.sapSecret
+  }
+
+  // The exporter_master_secret (RFC 8446 §7.5), derived once the server flight is
+  // produced — the root of exported keying material bound to this handshake.
+  export exporterSecret(): []byte {
+    return this.exporterSec
+  }
 }
 
 // SHA-256 exposed as a `() => Hash` for the RSA-PSS signer.
 fn srvSha256(): Hash { return newSha256() }
-
-// The suite hash as a `() => Hash` for the key schedule.
-fn (s: TlsServerHandshake) srvNewHash(): Hash { return tlsSuiteNewHash(s.suite) }
-
-// The transcript hash of the messages absorbed so far, under the negotiated suite.
-fn (s: TlsServerHandshake) srvTh(): []byte {
-  return digest(tlsSuiteNewHash(s.suite), s.transcript)
-}
 
 // Start a server handshake. The returned state produces no output until the first
 // ClientHello is fed to `processClientHello`.
