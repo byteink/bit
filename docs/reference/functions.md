@@ -1,10 +1,10 @@
 # Functions
 
 Functions are declared with `fn` and are first-class values. This chapter also
-covers the control-flow statements that live in function bodies. Attaching a
-function to a class as a method uses the same `fn` syntax with an explicit
-receiver - see [Methods](classes.md#methods) in the Classes chapter. (Spec:
-§10.3, §12.4, §12.8, §13.1.)
+covers the control-flow statements that live in function bodies. A method is
+different: it is declared in the class body with the implicit `this`
+receiver, not with a top-level `fn` - see [Methods](classes.md#methods) in
+the Classes chapter. (Spec: §10.3, §12.4, §12.8, §13.1.)
 
 ## Declaring functions
 
