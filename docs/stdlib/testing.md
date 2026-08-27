@@ -84,6 +84,45 @@ These are generic, so a failure can print what it compared - not merely that the
 comparison failed. Annotate the type argument when it cannot be inferred from the
 arguments alone: `eq<i64>(got, 42, "...")`.
 
+`eq`, `neq` and `eqSlice` build their failure message by interpolating `got`
+and `want` (`"${label}: got ${got}, want ${want}"`), so `T` needs a way to
+render as text: every primitive and `string` has one built in, but a `class`
+type needs its own `show(): string` method. Without one, the call is a
+compile error at the `eq`/`neq`/`eqSlice` call site, naming the missing
+method and the type:
+
+```bit ignore
+class Point { x: int, y: int }
+
+fn test_points() {
+  eq<Point>(Point{ x: 1, y: 2 }, Point{ x: 1, y: 2 }, "same point")
+}
+```
+
+```
+error[E0073]: cannot interpolate a value of type 'Point'
+  ...this generic is instantiated with a type that has no 'show(): string' method
+```
+
+Add `show()` to the class and the call compiles:
+
+```bit
+import { eq } from "std/testing"
+
+class Point {
+  x: int
+  y: int
+
+  show(): string {
+    return "(${this.x}, ${this.y})"
+  }
+}
+
+fn test_points() {
+  eq<Point>(Point{ x: 1, y: 2 }, Point{ x: 1, y: 2 }, "same point")
+}
+```
+
 ### `eq(got: T, want: T, label: string)`
 
 Fails unless `got == want`, printing both.
