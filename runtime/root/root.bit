@@ -194,15 +194,28 @@ import { spinUnlocked } from "../"
 // Object layouts (ABI.md §2) — reproduced field for field from `runtime/root/`
 // ---------------------------------------------------------------------------
 
-// A `string` value: a GC object holding `{ptr, len}` immediately followed by its
-// bytes, with `ptr` addressing those inline bytes. The object is therefore a
-// LEAF — `ptr` is an interior pointer into the object itself, never a separate
-// reference — which is why `stringInfo` carries no pointer offsets. This is also
-// why `bit_rt_string_slice` COPIES instead of sharing: an interior pointer
-// cannot keep a backing object alive (ABI.md §3).
+// A `string` value: `{ptr, len, base}` (ABI.md §2.3, #3892's ruling,
+// superseding #3435's `{base, len, off}`). Slots 0/1 keep their v1 meaning —
+// `ptr` addresses the inline bytes exactly as it always has, `len` is the
+// byte count — so a bare 16-byte `{ptr, len}` header is STILL a valid,
+// readable string forever. `strHeaderSize` (16) is therefore the MINIMUM
+// READABLE header, not "the" header size: it is what every hand-built
+// panic header (`slices.bit`, `maps.bit`, `chanwrap.bit`, `worker.bit`,
+// `gc/stackmap.bit`) still uses, unedited, and what a v1 literal still is
+// until #3896 (Step B) appends the third word. `strBase` (+16) is a heap
+// string's own owning object — its **own** address for a freshly allocated
+// string, the source string for a view (#3897, Step C) — and is the ONLY
+// traced field (`ptr_offsets = [16]`, written once by `rootInit`).
+// `strAllocHeader` (24) is the size every FRESH heap allocation now uses.
+// `ptr` stays an interior pointer into the object itself and must NEVER
+// appear in `ptr_offsets` (ABI.md §3): `strInitOwned`/`strInitView` below
+// are the only code allowed to write a header, which is what confines that
+// rule to one place instead of re-deriving it at every write site.
 export const strPtr: int = 0
 export const strLen: int = 8
 export const strHeaderSize: int = 16
+export const strBase: int = 16
+export const strAllocHeader: int = 24
 
 // A `[]T` value: `{buf, len, off, cap, is_ref}`. `buf` is a SEPARATE GC object
 // (the header's one traced reference, hence ptr_offsets = [0]) holding
@@ -260,9 +273,9 @@ let heapBlock: [41]i64        // heapWords
 let heapLockCell: i32 = 0
 let listLockCell: i32 = 0
 
-// The six type descriptors, plus the two pointer-offset arrays they name.
+// The six type descriptors, plus the three pointer-offset arrays they name.
 // See `rootInit` for the layout; 7 words is one `TypeInfo` (ABI.md §2).
-let infoBlock: [46]i64
+let infoBlock: [47]i64
 
 const riString: int = 0
 const riSlice: int = 7
@@ -272,7 +285,8 @@ const riMapCtrl: int = 28
 const riRefArray: int = 35
 const riSliceOffs: int = 42   // [0]
 const riMapOffs: int = 43     // [0, 8, 16]
-const riWords: int = 46
+const riStringOffs: int = 46  // [16] — the `base` field, ABI.md §2.3
+const riWords: int = 47
 
 // The addresses of `gcState` and `infoBlock`, taken ONCE by `rootInit`.
 //
@@ -408,12 +422,18 @@ fn rootInit(markStackLen: int): bool {
   storeWord(base + riMapOffs * 8 + 0, 0)
   storeWord(base + riMapOffs * 8 + 8, 8)
   storeWord(base + riMapOffs * 8 + 16, 16)
+  storeWord(base + riStringOffs * 8, strBase)
 
-  // `string` and the two element buffers are LEAVES; the three headers carry
-  // the traced offsets. Sizes are the header sizes: a string's inline bytes and
-  // a buffer's words are sized per allocation via `gcAllocRaw`, which is what
-  // the 0-size leaf descriptors here mean.
-  writeInfo(base, riString, 0, 0, 0, 0, 0)
+  // The two element buffers are LEAVES; `string` and `slice` headers carry the
+  // traced offsets. `riString`'s size is `strAllocHeader` (24) — the fixed
+  // MINIMUM every fresh heap string now allocates, per `strInitOwned` below —
+  // not the variable total (header + inline bytes), because `scanObject`
+  // (`runtime/gc/gcmark.bit`) bounds-checks a traced offset against the
+  // descriptor's declared `size` (`off + 8 > size`), and `strBase` (16) must
+  // clear that check. The two element buffers' sizes stay 0: their inline
+  // words are sized per allocation via `gcAllocRaw`, which is what a 0-size
+  // leaf descriptor means.
+  writeInfo(base, riString, strAllocHeader, base + riStringOffs * 8, 1, 0, 0)
   writeInfo(base, riSlice, slcHeaderSize, base + riSliceOffs * 8, 1, 0, 0)
   writeInfo(base, riSliceBuf, 0, 0, 0, 0, 0)
   writeInfo(base, riMap, mapHeaderSize, base + riMapOffs * 8, 3, 0, 0)
@@ -499,9 +519,35 @@ fn rtGcAlloc(info: int): int {
   return gcAlloc(g, info)
 }
 
-// A `len`-byte string body: the `{ptr, len}` header followed by the bytes, with
-// `ptr` addressing them. Returns the object address; exhaustion is fatal, not
-// a 0 return (constraint 3).
+// The ONLY two places a string header's words are ever stored (ABI.md §2.3).
+// Confining every write to these two `@nosplit` functions is the mitigation
+// for keeping `ptr` an interior pointer out of `ptr_offsets`: the rule is one
+// fact in one place instead of one a future write site has to re-derive.
+//
+// `strInitOwned`: a fresh, self-owning heap string — `body` is a `strAllocHeader
+// + n`-byte object just returned by `gcAllocRaw`, its bytes immediately
+// following the header exactly as v1 laid them out. `base = body` (the string
+// owns itself), so the collector's one traced field marks the object it is
+// already scanning — inert, not a cycle.
+@nosplit fn strInitOwned(body: int, n: int) {
+  storeWord(body + strPtr, body + strAllocHeader)
+  storeWord(body + strLen, n)
+  storeWord(body + strBase, body)
+}
+
+// `strInitView`: a header-only string sharing another string's bytes (#3897,
+// Step C) — `body` is a fresh `strAllocHeader`-byte object, `src` is the
+// string it shares. `ptr` is derived once, here, as `src`'s own `ptr` plus
+// `lo`; `base = src` keeps `src` alive for as long as the view is reachable.
+@nosplit fn strInitView(body: int, src: int, lo: int, n: int) {
+  storeWord(body + strPtr, loadWord(src + strPtr) + lo)
+  storeWord(body + strLen, n)
+  storeWord(body + strBase, src)
+}
+
+// A `len`-byte string body: the `{ptr, len, base}` header followed by the
+// bytes, with `ptr` addressing them. Returns the object address; exhaustion
+// is fatal, not a 0 return (constraint 3).
 //
 // PINNED because `strings.bit`'s exported wrapper `rtStrAlloc`
 // (`bit_rt_port_root_str_alloc`) is a one-liner: at `-O1` the inliner splices
@@ -517,9 +563,8 @@ export @nosplit @symbol("bit_rt_port_root_alloc_string")
 fn allocString(nbytes: int): int {
   let g = wordAt(gcAddr)
   let base = infoAddr
-  let body = gcAllocRaw(g, strHeaderSize + nbytes, base + riString * 8)
-  storeWord(body + strPtr, body + strHeaderSize)
-  storeWord(body + strLen, nbytes)
+  let body = gcAllocRaw(g, strAllocHeader + nbytes, base + riString * 8)
+  strInitOwned(body, nbytes)
   return body
 }
 
