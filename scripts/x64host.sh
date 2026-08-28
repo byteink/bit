@@ -32,7 +32,10 @@ if [ "${1:-}" = "--all" ]; then
 fi
 
 _probe() {                       # $1 = alias; answers ssh within 8s?
-  ssh -o ConnectTimeout=8 -o BatchMode=yes "$1" true >/dev/null 2>&1
+  # </dev/null: without it ssh inherits the caller's stdin and drains a
+  # non-deterministic prefix of it before "true" runs — #3899, proved by #3833
+  # with a piped `git archive HEAD` losing bytes to this exact probe.
+  ssh -o ConnectTimeout=8 -o BatchMode=yes "$1" true </dev/null >/dev/null 2>&1
 }
 
 # 1. explicit single host — trusted, not probed, so a deliberate choice always wins
