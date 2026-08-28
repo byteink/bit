@@ -1420,11 +1420,11 @@ calls `boot`, and exits the process with `boot`'s returned code.
 
 ### Preemption: the sysmon monitor and the preempt request flag
 
-**Only half of this exists today.** Epic #1768 splits preemption into a
-state module plus four consumers; as of this writing only two of the five
-child tickets have landed (#2576, #2578 — #2577, #2579, #2580 are open).
-Every claim below was checked directly against the source with the greps
-shown, not against ticket text or a comment's stated intent.
+**All five of epic #1768's child tickets have landed.** Epic #1768 splits
+preemption into a state module plus four consumers: #2576, #2577, #2578,
+#2579 and #2580 are all Done. Every claim below was checked directly
+against the source with the greps shown, not against ticket text or a
+comment's stated intent.
 
 **The state module (`runtime/sched/preempt.bit`, #2576, landed).** No
 function in this file makes an OS call; every function takes its clock
@@ -1488,19 +1488,18 @@ header makes the same argument rather than repeating it). So `requested` is
 set by a real, clock-driven tick on both platforms, not only by the
 dispatch-time stamp described above.
 
-**Not wired: nothing consumes the flag.** `maybePreempt` and
-`preemptRequested` likewise have zero call sites anywhere in the tree
-outside their own definitions in `preempt.bit`
-(`git grep -n 'maybePreempt\|preemptRequested' -- '*.bit'` matches only
-`preempt.bit` itself) — no safepoint check anywhere in `runtime/sched/` or
-`runtime/root/` reads either function today. Calling `maybePreempt` from the
-scheduler's safepoint check, and yielding when it returns true, is #2577,
-open.
+**Wired: the safepoint consumes the flag (#2577, landed).**
+`schedMaybeYieldForPreempt` (`runtime/sched/task.bit:286-292`) calls
+`maybePreempt(workerId)` at `runtime/sched/task.bit:290` and yields via the
+existing `schedYield` path when it returns true. `stwSafepoint`
+(`runtime/stw/stwpoll.bit:413`) calls `schedMaybeYieldForPreempt()` at
+`runtime/stw/stwpoll.bit:415`, immediately after `stwPoll(snap)` returns —
+the real, pinned safepoint entry point (`bit_rt_port_stw_safepoint`).
 
 **Net effect today:** the flag is stamped at dispatch and set by a real
-tick on both platforms (above) — see the paragraph above for whether
-anything consumes it at a safepoint. A task with no safepoint is not
-preemptible even when `sysmonTick` has set its flag: the flag is only ever
+tick on both platforms (above), and it is consumed whenever a task reaches
+the real safepoint poll (#2577, above). A task with no safepoint is still
+not preemptible even when `sysmonTick` has set its flag: the flag is only
 acted on where `maybePreempt` is called, and a task that never reaches that
 call point keeps running regardless of `requested`'s value.
 
