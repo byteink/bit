@@ -1,0 +1,238 @@
+// _tests_/bit/testloc.bit — regression gate for #2252: `bit test` output
+// must contain the CALLER's file:line for a failed std/testing assertion,
+// not testing.bit's own line and not a helper's line one statement removed
+// from the true call site.
+//
+// NOT placed in _tests_/cases/ (the golden.bit-swept corpus, `./make
+// test-golden`): the property under test is `bit test`'s own per-test child
+// process and its default `BIT_BACKTRACE` wiring (#3826), and golden.bit's
+// corpus compiles each case standalone with `bit build <file> -o <bin>`
+// (checkRun) then executes the resulting binary directly — it never invokes
+// `bit test` at all. Same "route it to _tests_/bit/ behind a registered
+// gate" treatment _tests_/bit/testpanic.bit already uses for exactly this
+// reason.
+//
+// Three cases in one fixture, matching the ticket's acceptance exactly (test
+// function names are the gate's own choice — #3786 dropped the `test_`
+// prefix requirement, discovery is filename+shape only):
+//   - helperCase: four calls to one helper; only the third (line 11) fails.
+//     The reported location must be the CALLER's line 11, not the helper's
+//     own line 5 and not an adjacent statement.
+//   - loopCase: a hand-written loop with no per-iteration label; the
+//     failing `eq()` call is line 19.
+//   - directCase: an assertion failing directly in a test body (no helper)
+//     must report that body's own line, 26.
+//
+// The trace lands on STDERR (the panic message + `at ...` frames); the
+// PASS/FAIL summary lands on STDOUT and is pinned byte-for-byte against
+// _tests_/bit/testloc.expected, written from a real run, never composed by
+// hand. BIT_BACKTRACE is explicitly unset in the wrapper script so this
+// gate proves the DEFAULT path #3826 added, not an ambient env var a runner
+// happens to already have set.
+//
+// Function names and the scratch-dir prefix are deliberately short:
+// `btFormatFrame` (runtime/root/backtrace.bit) formats each frame into a
+// fixed 128-byte line (`ioLineCap`) and silently truncates the FILE PATH
+// from the end once `<name>+<path>` overflows that budget — documented,
+// intentional degrade, not a bug (verified against a long-name fixture: a
+// 26-char resolved frame name plus this worktree's own long absolute
+// scratch path truncated "loc.test.bit" down to a bare "l"). A short name
+// keeps the per-frame budget comfortably above any plausible TMPDIR length
+// instead of gambling on this machine's specific path length.
+//
+// WIRED INTO `./make test` as `test-testloc` (tools/build/gates.bit,
+// tools/build/defs.bit).
+
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir } from "std/fs"
+import { parseInt, trimSpace, contains } from "std/strings"
+
+const defaultTimeoutS: int = 60
+const maxTimeoutMs: int = 6000000
+
+fn requiredEnv(name: string): string {
+  let v = env(name)
+  if (v == "") {
+    eprint("testloc: ${name} is not set — refusing to guess.\n")
+    exit(2)
+  }
+  return v
+}
+
+fn timeoutMs(): int {
+  let raw = trimSpace(envOr("BIT_TEST_TIMEOUT_S", ""))
+  if (raw == "") {
+    return defaultTimeoutS * 1000
+  }
+  let s = parseInt(raw) catch _ {
+    return defaultTimeoutS * 1000
+  }
+  if (s <= 0) {
+    return maxTimeoutMs
+  }
+  if (s * 1000 > maxTimeoutMs) {
+    return maxTimeoutMs
+  }
+  return s * 1000
+}
+
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+// The fixture: the ticket's own repro (translated to the `.test.bit`
+// discovery convention, #3786, and to short function names — see the header
+// note on the frame-line budget), plus one top-level case for the "reports
+// its own line" clause. Line numbers below are load-bearing — they are
+// checked against verbatim in main() — so any edit to this string must keep
+// the `expectPositive(0 - 7)` call on line 11, the loop's `eq()` call on
+// line 19, and the top-level `eq()` call on line 26.
+const fixtureSrc: string = "import { ok, eq } from \"std/testing\"\n" +
+  "\n" +
+  "// One helper, four call sites. Which one failed?\n" +
+  "fn expectPositive(n: int) {\n" +
+  "  ok(n > 0, \"must be positive\")\n" +
+  "}\n" +
+  "\n" +
+  "fn helperCase() {\n" +
+  "  expectPositive(1)\n" +
+  "  expectPositive(2)\n" +
+  "  expectPositive(0 - 7)\n" +
+  "  expectPositive(3)\n" +
+  "}\n" +
+  "\n" +
+  "// Same question for a loop with no hand-written label.\n" +
+  "fn loopCase() {\n" +
+  "  let xs = [1, 2, 3, 4, 5]\n" +
+  "  for (let i = 0; i < len(xs); i++) {\n" +
+  "    eq(xs[i] % 2, 0, \"should be even\")\n" +
+  "  }\n" +
+  "}\n" +
+  "\n" +
+  "fn directCase() {\n" +
+  "  let a = 1\n" +
+  "  let b = 2\n" +
+  "  eq(a + b, 5, \"arithmetic\")\n" +
+  "}\n"
+
+// Runs `bit test srcPath` with BIT_BACKTRACE explicitly unset, so this gate
+// proves #3826's default rather than an ambient env var the runner happens
+// to already carry.
+fn runTest(
+  bin: string,
+  stdlib: string,
+  libbitrt: string,
+  dir: string,
+  srcPath: string,
+): (int, string, string) {
+  let shPath = dir + "/run.sh"
+  let outPath = dir + "/run.out"
+  let errPath = dir + "/run.err"
+  let script = "#!/bin/sh\n" +
+    "unset BIT_BACKTRACE\n" +
+    "BIT_STDLIB=" +
+    shQuote(stdlib) +
+    "\nexport BIT_STDLIB\n" +
+    "BIT_LIBBITRT=" +
+    shQuote(libbitrt) +
+    "\nexport BIT_LIBBITRT\n" +
+    "exec " +
+    shQuote(bin) +
+    " test " +
+    shQuote(srcPath) +
+    " > " +
+    shQuote(outPath) +
+    " 2> " +
+    shQuote(errPath) +
+    "\n"
+  writeFile(shPath, script) catch e {
+    eprint("testloc: cannot write run wrapper: ${e.message()}\n")
+    exit(2)
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    eprint("testloc: cannot chmod run wrapper\n")
+    exit(2)
+  }
+  let code = osRunBounded(shPath, timeoutMs())
+  let out = readFile(outPath) catch _ {
+    ""
+  }
+  let err = readFile(errPath) catch _ {
+    ""
+  }
+  return code, out, err
+}
+
+fn requireContains(err: string, needle: string, what: string) {
+  if (!contains(err, needle)) {
+    eprint("testloc: FAIL — stderr missing ${what} (${needle}):\n${err}\n")
+    exit(1)
+  }
+}
+
+fn main() {
+  let bin = requiredEnv("BIT_BIN")
+  let stdlib = requiredEnv("BIT_STDLIB")
+  let libbitrt = requiredEnv("BIT_LIBBITRT")
+  let repo = requiredEnv("BIT_REPO")
+
+  let expectedPath = "${repo}/_tests_/bit/testloc.expected"
+  let wantOut = readFile(expectedPath) catch e {
+    panic("testloc: cannot read ${expectedPath}: ${e.message()}")
+  }
+
+  // Short prefix ("tl", not "bit-testloc-") — see the header note: this
+  // path is part of the frame-line budget the runtime's fixed-size trace
+  // buffer must fit within, alongside the resolved function name.
+  let scratch = envOr("TMPDIR", "/tmp") + "/tl${timeUnixNs()}"
+  mkdir(scratch) catch e {
+    eprint("testloc: cannot create scratch directory ${scratch}: ${e.message()}\n")
+    exit(2)
+  }
+
+  let srcPath = scratch + "/loc.test.bit"
+  writeFile(srcPath, fixtureSrc) catch e {
+    eprint("testloc: cannot write ${srcPath}: ${e.message()}\n")
+    exit(2)
+  }
+
+  let (code, out, err) = runTest(bin, stdlib, libbitrt, scratch, srcPath)
+  if (code == 0) {
+    eprint("testloc: FAIL — exit 0, want non-zero (all three fixture cases must fail):\n  stdout: ${out}\n  stderr: ${err}\n")
+    exit(1)
+  }
+  if (out != wantOut) {
+    eprint("testloc: FAIL — stdout did not match ${expectedPath}:\n  want: ${wantOut}\n  got:  ${out}\n")
+    exit(1)
+  }
+
+  // Clause: helper case names the CALLER's line (11), not testing.bit's own
+  // line and not the helper's own line (5).
+  requireContains(
+    err,
+    "panic: must be positive: expected true",
+    "the helper case's unchanged label",
+  )
+  requireContains(err, "loc.test.bit:11", "the helper case's caller line (11)")
+
+  // Clause: loop case names the failing iteration's call site (19).
+  requireContains(err, "panic: should be even: got 1, want 0", "the loop case's unchanged label")
+  requireContains(err, "loc.test.bit:19", "the loop case's call site (19)")
+
+  // Clause: an assertion failing directly inside a test body reports that
+  // body's own line (26), not testing.bit's.
+  requireContains(err, "panic: arithmetic: got 3, want 5", "the top-level case's unchanged label")
+  requireContains(err, "loc.test.bit:26", "the top-level case's own line (26)")
+
+  print("PASS testloc: bit test names the caller's file:line for a helper, a loop and a direct assertion\n")
+}
