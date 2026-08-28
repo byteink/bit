@@ -103,8 +103,12 @@ fn firstSentence(s: string): string {
 }
 ```
 
-An unknown flag letter (`(?x)`) is `regex: unknown flag at offset N`; an
-empty flag list (`(?)`) is `regex: missing flags at offset N`.
+An unknown flag letter (`(?x)`) is `regex: unknown flag at offset N`. A
+completely empty flag list, `(?)`, is a no-op — it matches Go's
+`regexp/syntax` exactly, changing no flags and producing no group of its
+own, so `(?)hello` compiles the same as `hello`. A `-` with no flag letter
+after it, `(?-)`, is still `regex: missing flags at offset N`, since Go
+rejects that shape too.
 
 ### Counted repetition
 
