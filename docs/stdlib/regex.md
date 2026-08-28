@@ -103,8 +103,12 @@ fn firstSentence(s: string): string {
 }
 ```
 
-An unknown flag letter (`(?x)`) is `regex: unknown flag at offset N`; an
-empty flag list (`(?)`) is `regex: missing flags at offset N`.
+An unknown flag letter (`(?x)`) is `regex: unknown flag at offset N`. A
+completely empty flag list, `(?)`, is a no-op — it matches Go's
+`regexp/syntax` exactly, changing no flags and producing no group of its
+own, so `(?)hello` compiles the same as `hello`. A `-` with no flag letter
+after it, `(?-)`, is still `regex: missing flags at offset N`, since Go
+rejects that shape too.
 
 ### Counted repetition
 
@@ -146,6 +150,13 @@ added property is table weight a caller may never reach for:
 - **Scripts**: `Latin Greek Cyrillic Han Arabic Hebrew Hiragana Katakana
   Hangul Thai Devanagari`.
 - **`Any`**: every valid Unicode scalar value, `0..0x10FFFF`.
+
+`Name` is canonicalized before lookup, matching Go's `regexp/syntax`
+exactly: the first letter is uppercased, every later letter is
+lowercased, and `_`/`-`/` ` are dropped entirely. So `\pp`, `\p{lu}` and
+`\p{L_u}` mean the same as `\pP`, `\p{Lu}` and `\p{Lu}` respectively — a
+name's case and internal punctuation never change which property it
+selects.
 
 ```bit
 import { mustCompile } from "std/regex"
