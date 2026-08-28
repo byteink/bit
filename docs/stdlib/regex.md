@@ -19,6 +19,21 @@ pattern matched, as byte-offset spans (`Match`). `Match.group`/`.named` and
 `Regex.groupNames` read a match's capture groups back out (see Groups,
 below).
 
+**That linear-time guarantee is per matching pass, not per call.**
+`Regex.matches` and `Regex.find` each run the VM exactly once, so they stay
+`O(len(s) x len(program))` always — genuinely linear, no exceptions.
+`Regex.findAll`, `Regex.replaceAll` and `Regex.split` are different: they
+restart a full unanchored scan after every match rather than continuing the
+previous one, and the VM cannot return the instant *some* match is found,
+because a currently-alive higher-priority thread might still complete into a
+better match later. The result is `O(len(s)^2 x numInsts)` — quadratic in
+the subject length, not linear. See `Regex.findAll` below for the mechanism
+and a measured worst case; until a continuous single-pass scan across
+matches exists (tracked separately from this doc), treat `findAll` /
+`replaceAll` / `split` over attacker-influenced text with the same caution
+you would give a backtracking engine, and prefer `matches`/`find` — which
+are unaffected — when only presence or the first match is needed.
+
 A compiled `Regex` is **immutable** and **safe to share across any number of
 green threads** — the natural usage is one `mustCompile` call, shared by
 every request handler an HTTP server spawns, rather than recompiling the
@@ -415,6 +430,21 @@ Successive non-overlapping matches of `re`'s pattern in `s`, scanning left
 to right. `limit < 0` means no limit; `limit == 0` returns an empty slice;
 otherwise at most `limit` matches.
 
+**Not linear in `len(s)`.** `findAll` restarts a full unanchored VM scan
+after every match instead of continuing the previous one, so the total cost
+is `O(len(s)^2 x numInsts)`, quadratic in the subject length — not the
+`O(len(s) x numInsts)` bound a single `matches`/`find` call gets. A crafted
+pattern/subject pair (a ~4 KiB subject, a small program with a
+never-completing high-priority thread) has been measured to visit
+7,910,253 VM positions during one `findAll` call — exactly `(n+1)(n+2)/2`
+for `n = 3976`, the closed form for `n+1` restarted scans of shrinking
+length. `matches` and `find` are not affected: each calls the VM exactly
+once. Fixing this needs a continuous single-pass scan across matches and is
+tracked separately (not in scope here) — until then, avoid `findAll` (and
+`replaceAll`/`split`, which share this scan) over attacker-influenced input
+where only presence or the first match is actually needed; use `find`
+instead.
+
 Offsets are **byte** offsets throughout, same as `Match`. After a match, the
 next search starts at its end offset — except when the match is empty
 (`start == end`), where the next search starts one **rune** later instead of
@@ -435,10 +465,13 @@ fn wordCount(s: string): int {
 
 The text between successive non-overlapping matches of `re`'s pattern in
 `s`, using `findAll`'s exact left-to-right scan (above), including its
-empty-match one-rune advance rule. `limit < 0` is unlimited pieces;
-`limit == 0` returns an empty slice with no scanning at all; `limit > 0`
-returns at most `limit` pieces, and the **last** piece holds the entire
-unsplit remainder of `s` — matches included — rather than truncating it.
+empty-match one-rune advance rule **and its `O(len(s)^2 x numInsts)`
+quadratic cost** — `split` calls `findAll` directly, so the same
+attacker-influenced-input caution applies (see `Regex.findAll` above).
+`limit < 0` is unlimited pieces; `limit == 0` returns an empty slice with no
+scanning at all; `limit > 0` returns at most `limit` pieces, and the
+**last** piece holds the entire unsplit remainder of `s` — matches included
+— rather than truncating it.
 
 A match at offset 0 yields an empty **leading** piece; a match ending at
 `len(s)` yields an empty **trailing** piece — neither is dropped. A subject
@@ -475,9 +508,12 @@ through unchanged. A pattern that never matches returns `s` itself,
 unchanged.
 
 Uses the same non-overlapping scan as `findAll` (above), including its
-empty-match rule: a pattern that can match the empty string still
-terminates, and never substitutes twice at the same position — `a*` against
-`"bb"` yields three substitutions, at byte offsets 0, 1 and 2, never four.
+empty-match rule and its `O(len(s)^2 x numInsts)` quadratic cost — a
+pattern that can match the empty string still terminates, and never
+substitutes twice at the same position (`a*` against `"bb"` yields three
+substitutions, at byte offsets 0, 1 and 2, never four), but the same
+attacker-influenced-input caution as `findAll` applies (see
+`Regex.findAll` above).
 
 Template syntax:
 
