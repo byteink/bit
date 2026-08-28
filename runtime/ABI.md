@@ -315,8 +315,7 @@ string header {                  // TypeInfo{ size = 24, ptr_offsets = [16] }
   base : ref     // +16  the object that owns the inline bytes. TRACED
                  //      (ptr_offsets = [16]) — self for a fresh heap string
                  //      (`strInitOwned`), the source string for a view
-                 //      (`strInitView`, Step C), 0 for a static literal until
-                 //      Step B appends this word to emitted literals.
+                 //      (`strInitView`, Step C), 0 for a static literal.
 }
 ```
 
@@ -345,10 +344,11 @@ rather than three independent steps.
   `compiler/emitelf.bit`, `compiler/emitpecode.bit` append a third word
   (`base = 0`) to every emitted string literal header; symbol size 16 -> 24.
   The existing absolute reloc in slot 0 and `len` in slot 1 are untouched.
-- **Step C (#3897) — the payoff.** `rtStringSlice` becomes a header-only
+- **Step C (#3897) — the payoff.** `rtStringSlice` is a header-only
   allocation (24 bytes, no byte copy): `ptr = ptr(s) + lo`, `len = hi - lo`,
   `base = s` — sharing `s`'s bytes instead of copying them, which is what
-  Step A and Step B alone do not yet buy. `base` must be the immediate
+  Step A and Step B alone did not yet buy. `allocStringView` is the one
+  allocator for it, beside `allocString`. `base` must be the immediate
   source `s`, not `base(s)`: flattening a chain read is a separate follow-up
   gated on every `libbitrt.a` in the field carrying a 3-word base, since
   reading slot +16 of a 2-word header (any string built before that repin)
@@ -384,7 +384,7 @@ now guarantees for every `riString`-tagged heap object; the variable part
 what the descriptor's `size` field describes, mirroring how the dynamic
 slice header's fixed `slcHeaderSize` already works (§2 above).
 
-**No aliasing hazard, unlike `[]T`, once Step C lands.** `[]T` sharing (§2
+**No aliasing hazard, unlike `[]T`.** `[]T` sharing (§2
 above) already accepts that a mutation through one view is visible through
 every other view of the same buffer. `string` has SPEC §13.3 read-only value
 semantics and no mutation path at all (§1.1 above makes the identical
@@ -392,8 +392,7 @@ argument for tuples), so two views of the same backing bytes can never
 disagree — sharing costs nothing in observable behaviour that `[]T` sharing
 did not already cost.
 
-**One accepted, un-mitigated cost, once Step C lands — already priced in for
-`[]T`.** A tiny, long-lived view keeps its ENTIRE backing string alive:
+**One accepted, un-mitigated cost — already priced in for `[]T`.** A tiny, long-lived view keeps its ENTIRE backing string alive:
 `s[0:1]` on a multi-megabyte `s` retains the whole megabyte for as long as
 the view is reachable. This is the identical shape `[]T` reslicing already
 accepts in §2 and is not new here.
@@ -1572,7 +1571,7 @@ defined exactly once).
 | `bit_rt_string_eq`    | `(a: *const RtBytes, b: *const RtBytes) -> bool` (§2)   |
 | `bit_rt_string_cmp`   | `(a: *const RtBytes, b: *const RtBytes) -> i64` (§2, three-way lexicographic order; unsigned bytes, shorter-is-less on a common prefix) |
 | `bit_rt_string_byte`  | `(s: *const RtBytes, index: usize) -> u64` (§2, `s[i]`; u64-widened) |
-| `bit_rt_string_slice` | `(s: *const RtBytes, lo: usize, hi: usize) -> *const RtBytes` (§2, `s[lo:hi]`; copies) |
+| `bit_rt_string_slice` | `(s: *const RtBytes, lo: usize, hi: usize) -> *const RtBytes` (§2, `s[lo:hi]`; a shared-backing view since #3897 — header only, `base = s`, no byte copy) |
 | `bit_rt_bytes_from_string` | `(s: *const RtBytes) -> *SliceHeader` (§2, `[]byte(s)`) |
 | `bit_rt_string_from_bytes` | `(h: *const SliceHeader) -> *const RtBytes` (§2, `string(b)`) |
 | `bit_rt_string_from_int`   | `(v: i64) -> *const RtBytes` (§2, the signed prims i8..i64) |
