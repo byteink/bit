@@ -197,9 +197,25 @@ whether each buffered element is itself a GC reference.
 **Element storage: word-per-element by default, byte-packed only for `[]u8`.**
 A GC reference is word-sized, and when `is_ref` the collector traces every word
 of the element buffer as a root (below) — so a reference-typed buffer can never
-pack: decoding packed scalar bytes as a reference would be a silent-wrongness
-bug, not a crash, and this invariant forbids it by construction. Packing is
-scoped narrower still: only `[]u8` (a non-ref, 1-byte element) packs to one
+pack. This is a forward-looking design constraint, not a description of what
+today's collector would do with a violation: on the current non-moving
+collector, `gcMarkRoot` (`runtime/gc/gcmark.bit:95-105`) marks a candidate word
+only if it is non-null, in-range, and confirmed by `gcOwns` to be exactly a
+live object's body base, and `markObject` (`runtime/gc/gcmark.bit:65-82`) only
+sets the object's mark bit and pushes it on the worklist — it never writes back
+through the traced slot (`scanObject`, `runtime/gc/gcmark.bit:131-164`, drives
+both). So decoding packed scalar bytes as a reference today is bounded to
+retention, never corruption — the same soundness argument §5 makes for the
+conservative stack scan. The invariant still forbids packing by construction,
+because it is what keeps this rule safe the day the collector gains a write
+barrier or starts moving objects, and because unbounded retention is itself a
+bug worth ruling out now. The direction that already produces a
+silent-wrongness bug is the opposite one: a reference-typed buffer handed the
+LEAF `slice_buf_info` descriptor instead of the traced `ref_array_info` one,
+so the collector never walks it and sweeps referents the program still
+holds — see the fabricated-header bug at `runtime/root/slices.bit:369-377`
+(`_tests_/cases/run_empty_slice_null_header.bit`). Packing is scoped narrower
+still: only `[]u8` (a non-ref, 1-byte element) packs to one
 byte per element (`elem_size = 1`, §9). Every other element type — every
 `is_ref == true` buffer, and every non-ref scalar 2 bytes or wider (`i16` and
 up, `f64`, boxed values) — stays word-per-element (`elem_size = 8`) exactly as
