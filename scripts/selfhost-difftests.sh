@@ -18,6 +18,14 @@
 # above); alarmrun's own default discards stderr, which would silently drop a
 # panic and turn a real divergence into a false MATCH.
 #
+# The unresolved-frame fallback ("  at 0x<16 hex digits>", backtrace.bit's
+# btAppendHex) prints an absolute address that moves every run under ASLR —
+# only the low bits are stable (#3871). Both captures are normalized to a
+# constant token before comparing, so the compared signal stays the
+# PRESENCE, ORDER and COUNT of frames, never the slide. Symbolized frames
+# ("  at name (file:line)") never match that pattern and are left untouched
+# — they are real signal and must keep comparing exactly.
+#
 # Usage: ./make selfhost && bash scripts/selfhost-difftests.sh
 set -u
 # shellcheck source=scripts/alarmrun.sh
@@ -58,12 +66,18 @@ else
   if [ "$b2" -eq 142 ]; then
     echo "BIT2 timed out after ${TIMEOUT}s running: $BIT2 test $PROJ"
     bit2timeout=1
-  elif [ "$se" != "$b2" ] || ! cmp -s "$TMP/seed" "$TMP/b2"; then
-    echo "DIFF $PROJ (exit seed=$se bit2=$b2)"
-    command diff "$TMP/seed" "$TMP/b2" | head -20
-    mismatch=1
   else
-    echo "test-runner differential: MATCH $PROJ (exit=$se)"
+    # #3871: normalize the ASLR-moved raw address before deciding MATCH/DIFF.
+    aslr_normalize() { sed -E 's/^( *at )0x[0-9a-f]{8,16}$/\1ADDR/' "$1"; }
+    aslr_normalize "$TMP/seed" >"$TMP/seed.norm"
+    aslr_normalize "$TMP/b2" >"$TMP/b2.norm"
+    if [ "$se" != "$b2" ] || ! cmp -s "$TMP/seed.norm" "$TMP/b2.norm"; then
+      echo "DIFF $PROJ (exit seed=$se bit2=$b2)"
+      command diff "$TMP/seed.norm" "$TMP/b2.norm" | head -20
+      mismatch=1
+    else
+      echo "test-runner differential: MATCH $PROJ (exit=$se)"
+    fi
   fi
 fi
 
