@@ -33,6 +33,11 @@
 
 import { sysClone, sysMmap, sysMprotect, sysMunmap } from "../../syscalls"
 import { runningSentinel } from "../../thread"
+// `atPagesz` only: `getauxval` is already imported into this module's scope by
+// sibling ./tls.bit's `import { getauxval, atPhdr, atPhent, atPhnum } from
+// "../../auxv"` — re-importing it here would be E0042 (imports are per
+// MODULE, not per file).
+import { atPagesz } from "../../auxv"
 
 fn protNone(): int { return 0 }
 fn protReadWrite(): int { return 3 }
@@ -41,12 +46,53 @@ fn protReadWrite(): int { return 3 }
 // which is passed as -1 by convention.
 fn mapPrivateAnon(): int { return 34 }
 
-// 4096 on both x86_64 and aarch64 Linux, the same value and the same
-// justification as runtime/alloc/linux/pages.bit's `pageSize`. Used here only
-// as the size of the guard page, where being too small is the only thing that
-// could matter — and it is not, because a guard is a lower bound on protection,
-// not an exact requirement.
-fn pageSize(): int { return 4096 }
+// The REAL kernel page size (#3828), read once from `AT_PAGESZ` and cached.
+//
+// THIS USED TO BE A HARDCODED 4096, and the comment defending it was wrong: it
+// argued the value only sizes a guard page, "where being too small is the
+// only thing that could matter". `mapStack` below instead uses it to compute
+// the byte OFFSET at which it calls `sysMprotect` — an address that the
+// kernel requires to be aligned to the REAL page size, not a lower bound on
+// anything. On a 16 KiB-page aarch64 kernel (e.g. a Raspberry Pi;
+// `getconf PAGESIZE` = 16384) `base + 4096` is not 16384-aligned, so
+// `mprotect` returned `EINVAL` and every program exited 70 at boot — the
+// mapping/protect/unmap/exit_group(70) sequence `strace` shows on such a
+// host. `runtime/alloc/linux/pages.bit`'s own `pageSize()` was hardcoded for
+// the identical (wrong) reason but is never used as an mprotect address —
+// only to round a size handed to plain `mmap`, which the kernel rounds
+// internally regardless — so it is left alone; see #3828's ticket for the
+// full audit of every 4096-derived constant in this tree.
+//
+// CACHED RATHER THAN QUERIED EVERY CALL, for the same reason and by the same
+// construction as ./tls.bit's `tlsCached`/`cacheTlsGeometry` (#3812):
+// `../../root/linux/boot.bit`'s `tryGrowPool` calls `threadStart` (below)
+// WHILE HOLDING `scRegLock`, and `getauxval`'s own `while` walk — in a
+// non-`@nosplit` function — carries a back-edge safepoint poll that would park
+// mid-walk under `BIT_GC=stress` while still holding the lock `stwScanTasks`'s
+// root scan needs to enumerate every worker: the exact deadlock #3812 fixed
+// for TLS geometry, reachable here through the identical call path. The FIRST
+// call to this function is `../../root/linux/boottail.bit`'s step 6, the
+// initial `threadStart` for worker 0 — single-threaded, lock-free, and before
+// any grow path can exist (growth only runs from inside an already-running
+// worker's own loop) — so every later call, including one under `scRegLock`,
+// reads an already-cached scalar with no loop and no auxv walk.
+//
+// 4096 is the fallback ONLY for the auxv having no `AT_PAGESZ` entry at all —
+// `getauxval` returns 0 for "missing", which is never a valid page size, so a
+// 0 read is refused rather than propagated into an mprotect offset.
+let pageSizeCached: bool = false
+let pageSizeCachedVal: int = 4096
+
+fn pageSize(): int {
+  if (!pageSizeCached) {
+    pageSizeCached = true
+    let real = getauxval(atPagesz)
+    if (real > 0) {
+      pageSizeCachedVal = real
+    }
+  }
+  return pageSizeCachedVal
+}
 
 // ---- the child's exit path (#1801) ---------------------------------------
 //
