@@ -22,7 +22,7 @@ non-Bit parent has no budget to inherit and falls back to some other rule
 anyway, so the mechanism doesn't remove the need for a real default — it only
 covers the one case where a Bit parent fans out to Bit children. The exact
 failure this project already hit (12 concurrent `bit` invocations from
-`tests/bit/docs.bit`) is not a Bit-parent-fans-out-to-Bit-children scenario in
+`_tests_/bit/docs.bit`) is not a Bit-parent-fans-out-to-Bit-children scenario in
 the general case; nothing forces every caller of the compiler to be Bit itself.
 
 **Option 2, boot-time read of run-queue length or core count.** Rejected because
@@ -42,7 +42,7 @@ workload this repo runs on every push.
 - #1902 fixed that with per-worker futex park words, and the idle repro is now
   flat at 0.04s for 1..18 workers.
 - A `parkCpuCount()` default still failed `./make test` because
-  `tests/bit/docs.bit` runs 12 `bit` processes at once, giving 204 parked
+  `_tests_/bit/docs.bit` runs 12 `bit` processes at once, giving 204 parked
   worker threads on 18 cores and blowing the 300000ms batch deadline.
 - A sample during that failing run showed every one of the 204 threads at
   0:00.00 CPU, so the cause is oversubscription, not a spin.

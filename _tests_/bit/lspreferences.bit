@@ -1,0 +1,442 @@
+// `bit lsp` textDocument/references gate (#2335): drives the REAL self-hosted
+// `bit lsp` binary as a subprocess and asserts on its raw JSON-RPC output, the
+// same mechanics as _tests_/bit/lspresolve.bit (see its header) and
+// _tests_/bit/lsplifecycle.bit — each `bit run _tests_/bit/*.bit` is a standalone
+// single-file program, so the small harness (frame/shQuote/runLsp/...) is
+// duplicated here rather than imported.
+//
+// THE THING THIS GATE EXISTS TO CATCH: a references handler that silently
+// returns an empty list looks identical, from the wire, to a correct "no
+// references" answer — so every scenario below pairs a query with a KNOWN
+// nonzero answer (declaration plus real call sites) rather than asserting
+// absence alone, and `checkReferencesSameNameDifferentTypes` is the point of
+// the whole ticket: two types (`Alpha`, `Beta`) each declare a method spelled
+// `run`, called from both branches, so a textual search for "run(" cannot
+// separate them but a type-resolved reference query must — each of the two
+// queries below is simultaneously the OTHER query's negative control.
+//
+// WIRED INTO `./make test` as `test-lsp-references` (tools/build/gates.bit,
+// tools/build/defs.bit), registered in the same commit as this file so
+// scripts/gate.sh does not see it as an unmapped _tests_/bit/** path.
+
+import { envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir, exists } from "std/fs"
+
+const timeoutMs: int = 20000
+
+fn failCase(msg: string) {
+  eprint("FAIL lspreferences: " + msg + "\n")
+  exit(1)
+}
+
+fn frame(body: string): string {
+  return "Content-Length: ${len(body)}\r\n\r\n" + body
+}
+
+fn mkdirQuiet(path: string) {
+  mkdir(path) catch e {
+    return
+  }
+}
+
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+fn runLsp(bin: string, scratch: string, payload: string): (string, bool) {
+  mkdirQuiet(scratch)
+  let inPath = scratch + "/in"
+  let outPath = scratch + "/out"
+  let errPath = scratch + "/err"
+  let shPath = scratch + "/w.sh"
+  writeFile(inPath, payload) catch e {
+    failCase("cannot write input payload: " + e.message())
+    return "", false
+  }
+  let script = "#!/bin/sh\nexec " +
+    shQuote(bin) +
+    " lsp < " +
+    shQuote(inPath) +
+    " > " +
+    shQuote(outPath) +
+    " 2> " +
+    shQuote(errPath) +
+    "\n"
+  writeFile(shPath, script) catch e {
+    failCase("cannot write wrapper script: " + e.message())
+    return "", false
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    failCase("cannot chmod wrapper script")
+    return "", false
+  }
+  let code = osRunBounded(shPath, timeoutMs)
+  if (code == 0 - 2) {
+    failCase("TIMED OUT after ${timeoutMs}ms (raise BIT_TEST_TIMEOUT_S)")
+    return "", false
+  }
+  if (code == 0 - 1) {
+    failCase("cannot launch wrapper script (spawn/wait failure)")
+    return "", false
+  }
+  if (code <= 0 - 100) {
+    failCase("CRASHED: killed by signal ${0 - code - 100}")
+    return "", false
+  }
+  let out = readFile(outPath) catch e {
+    ""
+  }
+  return out, true
+}
+
+// Escapes `s` for embedding as a JSON string literal's body — the only bytes
+// the fixtures below ever contain are '"', '\' and '\n'.
+fn jsonEscape(s: string): string {
+  let out = ""
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == u8('"')) {
+      out = out + "\\\""
+    } else if (c == u8('\\')) {
+      out = out + "\\\\"
+    } else if (c == u8('\n')) {
+      out = out + "\\n"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn contains(haystack: string, needle: string): bool {
+  let n = len(needle)
+  if (n == 0) {
+    return true
+  }
+  let i = 0
+  while (i + n <= len(haystack)) {
+    if (haystack[i:i + n] == needle) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn countOccurrences(haystack: string, needle: string): int {
+  let n = len(needle)
+  if (n == 0) {
+    return 0
+  }
+  let count = 0
+  let i = 0
+  while (i + n <= len(haystack)) {
+    if (haystack[i:i + n] == needle) {
+      count = count + 1
+      i = i + n
+    } else {
+      i = i + 1
+    }
+  }
+  return count
+}
+
+// One reply's own JSON body, bounded to the next framed message (or end of
+// `out`) rather than to end of string: a `textDocument/references` reply is
+// routinely followed by `publishDiagnostics` notifications that carry their
+// own `"uri"` field, and this file counts `"uri"` occurrences to count
+// locations — an unbounded tail would silently fold those in.
+fn resultTail(out: string, idMarker: string): string {
+  let mlen = len(idMarker)
+  let start = 0
+  while (start + mlen <= len(out) && out[start:start + mlen] != idMarker) {
+    start = start + 1
+  }
+  if (start + mlen > len(out)) {
+    failCase("resultTail: marker " + idMarker + " not found\n" + out)
+    return ""
+  }
+  let sep = "Content-Length:"
+  let slen = len(sep)
+  let end = start + mlen
+  while (end + slen <= len(out) && out[end:end + slen] != sep) {
+    end = end + 1
+  }
+  if (end + slen > len(out)) {
+    end = len(out)
+  }
+  return out[start:end]
+}
+
+fn initReq(): string {
+  return frame(
+      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"," +
+      "\"params\":{\"processId\":null,\"rootUri\":null,\"capabilities\":{}}}",
+  )
+}
+
+fn initNotif(): string {
+  return frame("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}")
+}
+
+fn didOpen(uri: string, text: string): string {
+  return frame(
+      "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+      "\"textDocument\":{\"uri\":\"${uri}\",\"languageId\":\"bit\",\"version\":1," +
+      "\"text\":\"" +
+      jsonEscape(text) +
+      "\"}}}",
+  )
+}
+
+fn referencesReq(id: int, uri: string, line: int, character: int, includeDecl: bool): string {
+  let incl = "false"
+  if (includeDecl) {
+    incl = "true"
+  }
+  return frame(
+      "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"textDocument/references\"," +
+      "\"params\":{\"textDocument\":{\"uri\":\"${uri}\"},\"position\":{\"line\":${line}," +
+      "\"character\":${character}},\"context\":{\"includeDeclaration\":${incl}}}}",
+  )
+}
+
+// The capability an editor's Shift+F12 / "Find All References" gates on
+// (ticket #2335's own repro: absent -> `-32601 method not found`).
+fn checkReferencesCapability(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/cap"
+  mkdirQuiet(dir)
+  let payload = initReq()
+  let (out, ok) = runLsp(bin, dir, payload)
+  if (!ok) {
+    return
+  }
+  if (!contains(out, "\"referencesProvider\":true")) {
+    failCase("initialize result is missing referencesProvider:true\n" + out)
+    return
+  }
+  print("PASS lspreferences: initialize advertises referencesProvider\n")
+}
+
+// #2335's own reproduction shape: `Board.add`, declared once and called 3
+// times across `main.bit`, beside `Task.addTag` — a DIFFERENTLY-spelled
+// method a substring search for "add" would still snag (`grep -n add` in the
+// ticket's own repro matches `addTag` 4 times). Positions verified against a
+// real `bit lsp` run before being hard-coded here.
+fn referencesAcceptanceFixture(dir: string): (string, string) {
+  let board = "class Board {\n  tasks: []Task,\n\n  add(title: string): Task {\n" +
+    "    let t = Task{ title: title }\n    this.tasks = append(this.tasks, t)\n" +
+    "    return t\n  }\n}\n\nclass Task {\n  title: string,\n\n  addTag(tag: string) {\n  }\n}\n"
+  // addTag now lives in board.bit's own Task class body (SPEC §10.4
+  // post-#3762: a method must be in its class's file) — task.bit is left
+  // empty; nothing in this fixture reads its content.
+  let task = ""
+  let main = "fn main() {\n  let b = Board{ tasks: []Task(0) }\n" +
+    "  let a = b.add(\"write the parser\")\n  a.addTag(\"compiler\")\n" +
+    "  let c = b.add(\"ship the release\")\n  c.addTag(\"ops\")\n  c.addTag(\"compiler\")\n" +
+    "  let d = b.add(\"answer email\")\n}\n"
+  writeFile(dir + "/board.bit", board) catch e {
+    failCase("cannot write board.bit: " + e.message())
+    return "", ""
+  }
+  writeFile(dir + "/task.bit", task) catch e {
+    failCase("cannot write task.bit: " + e.message())
+    return "", ""
+  }
+  writeFile(dir + "/main.bit", main) catch e {
+    failCase("cannot write main.bit: " + e.message())
+    return "", ""
+  }
+  return board, main
+}
+
+// Asserts the ticket's own acceptance shape: `includeDeclaration:true` on
+// `Board.add`'s declaration returns exactly 4 locations (the declaration plus
+// the 3 real call sites) and none of `addTag`'s 3 call sites; `false` drops
+// exactly the declaration, leaving the 3 call sites.
+fn checkReferencesAcceptance(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/acceptance"
+  mkdirQuiet(dir)
+  let (board, main) = referencesAcceptanceFixture(dir)
+  if (board == "") {
+    return
+  }
+  let bUri = "file://" + dir + "/board.bit"
+  let mUri = "file://" + dir + "/main.bit"
+  // board.bit line 3 (0-based) "  add(title: string): Task {":
+  // 'add' starts at character 2.
+  let payload = initReq() +
+    initNotif() +
+    didOpen(bUri, board) +
+    didOpen(mUri, main) +
+    referencesReq(2, bUri, 3, 3, true) +
+    referencesReq(3, bUri, 3, 3, false)
+  let (out, ok) = runLsp(bin, dir, payload)
+  if (!ok) {
+    return
+  }
+  let withDecl = resultTail(out, "\"id\":2,\"result\":")
+  let n1 = countOccurrences(withDecl, "\"uri\":")
+  if (n1 != 4) {
+    failCase("Board.add references (includeDeclaration:true): expected 4 locations, got ${n1}\n" + withDecl)
+    return
+  }
+  assertAcceptanceDeclAndCalls(withDecl, out)
+  let withoutDecl = resultTail(out, "\"id\":3,\"result\":")
+  let n2 = countOccurrences(withoutDecl, "\"uri\":")
+  if (n2 != 3) {
+    failCase(
+        "Board.add references (includeDeclaration:false): expected 3 locations, got ${n2}\n" +
+        withoutDecl,
+    )
+    return
+  }
+  if (contains(withoutDecl, "\"line\":3,\"character\":2")) {
+    failCase("Board.add references (includeDeclaration:false): declaration still present\n" + withoutDecl)
+    return
+  }
+  print("PASS lspreferences: Board.add lists its declaration and 3 call sites, never addTag\n")
+}
+
+// Split out of `checkReferencesAcceptance` to keep it under the repo's
+// max-fn-lines limit (E0201): the exact-position and negative-space checks.
+fn assertAcceptanceDeclAndCalls(withDecl: string, out: string) {
+  if (!contains(withDecl, "board.bit") || !contains(withDecl, "\"line\":3,\"character\":2")) {
+    failCase("Board.add references: missing the declaration site\n" + out)
+    return
+  }
+  if (countOccurrences(withDecl, "main.bit") != 3) {
+    failCase("Board.add references: expected exactly 3 main.bit locations\n" + out)
+    return
+  }
+  if (!contains(withDecl, "\"line\":2,\"character\":12") ||
+    !contains(withDecl, "\"line\":4,\"character\":12") ||
+    !contains(withDecl, "\"line\":7,\"character\":12")) {
+    failCase("Board.add references: missing one of the 3 known call sites\n" + out)
+    return
+  }
+}
+
+// THE DISCRIMINATOR THIS TICKET EXISTS FOR: `Alpha.run` and `Beta.run` share a
+// spelling on two unrelated types, each called twice/once respectively. A
+// textual "run(" search cannot tell them apart; the type-resolved query must.
+// Each of the two queries below is the other's negative control, and both are
+// nonzero, which is the positive-control half of the evidence bar.
+fn referencesDiscriminatorFixture(dir: string): string {
+  let text = "class Alpha {\n  n: int,\n\n  run(): int {\n    return this.n\n  }\n}\n\n" +
+    "class Beta {\n  n: int,\n\n  run(): int {\n    return this.n\n  }\n}\n\n" +
+    "fn main() {\n  let a = Alpha{ n: 1 }\n  let b = Beta{ n: 2 }\n" +
+    "  let x = a.run()\n  let y = b.run()\n  let z = a.run()\n}\n"
+  writeFile(dir + "/types.bit", text) catch e {
+    failCase("cannot write types.bit: " + e.message())
+    return ""
+  }
+  return text
+}
+
+fn checkReferencesSameNameDifferentTypes(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/discriminator"
+  mkdirQuiet(dir)
+  let text = referencesDiscriminatorFixture(dir)
+  if (text == "") {
+    return
+  }
+  let uri = "file://" + dir + "/types.bit"
+  // line 3 "  run(): int {" (Alpha's): 'run' at character 2.
+  // line 11 "  run(): int {" (Beta's): 'run' at character 2.
+  let payload = initReq() +
+    initNotif() +
+    didOpen(uri, text) +
+    referencesReq(2, uri, 3, 3, true) +
+    referencesReq(3, uri, 11, 3, true)
+  let (out, ok) = runLsp(bin, dir, payload)
+  if (!ok) {
+    return
+  }
+  let alpha = resultTail(out, "\"id\":2,\"result\":")
+  let beta = resultTail(out, "\"id\":3,\"result\":")
+  assertDiscriminator(alpha, beta, out)
+  print("PASS lspreferences: same-named methods on different types resolve to disjoint reference sets\n")
+}
+
+fn assertDiscriminator(alpha: string, beta: string, out: string) {
+  let na = countOccurrences(alpha, "\"uri\":")
+  if (na != 3) {
+    failCase("Alpha.run references: expected 3 (decl + 2 calls), got ${na}\n" + alpha)
+    return
+  }
+  let nb = countOccurrences(beta, "\"uri\":")
+  if (nb != 2) {
+    failCase("Beta.run references: expected 2 (decl + 1 call), got ${nb}\n" + beta)
+    return
+  }
+  // Alpha's calls are lines 19 and 21; Beta's own call (line 20) must be absent.
+  if (contains(alpha, "\"line\":20,")) {
+    failCase("Alpha.run references wrongly includes Beta's call site (line 20)\n" + out)
+    return
+  }
+  // Beta's call is line 20; Alpha's calls (lines 19, 21) must be absent.
+  if (contains(beta, "\"line\":19,") || contains(beta, "\"line\":21,")) {
+    failCase("Beta.run references wrongly includes an Alpha call site\n" + out)
+    return
+  }
+}
+
+// A bare (non-member) symbol — the other branch `lspRenameTargetAt` can take
+// (compiler/lsprename.bit) — as a positive control that the free-function path
+// is exercised too, not only the member path the two scenarios above cover.
+fn checkReferencesFreeFunction(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/free"
+  mkdirQuiet(dir)
+  let text = "fn helper(): int {\n  return 1\n}\n\nfn other(): int {\n  return 2\n}\n\n" +
+    "fn main() {\n  let a = helper()\n  let b = other()\n  let c = helper()\n}\n"
+  writeFile(dir + "/free.bit", text) catch e {
+    failCase("cannot write free.bit: " + e.message())
+    return
+  }
+  let uri = "file://" + dir + "/free.bit"
+  // line 0 "fn helper(): int {": 'helper' at character 3.
+  let payload = initReq() + initNotif() + didOpen(uri, text) + referencesReq(2, uri, 0, 4, true)
+  let (out, ok) = runLsp(bin, dir, payload)
+  if (!ok) {
+    return
+  }
+  let tail = resultTail(out, "\"id\":2,\"result\":")
+  let n = countOccurrences(tail, "\"uri\":")
+  if (n != 3) {
+    failCase("helper() references: expected 3 (decl + 2 calls), got ${n}\n" + tail)
+    return
+  }
+  if (contains(tail, "\"line\":10,")) {
+    failCase("helper() references wrongly includes other()'s own call site (line 10)\n" + out)
+    return
+  }
+  print("PASS lspreferences: a free function's declaration and call sites resolve, excluding an unrelated function\n")
+}
+
+fn main() {
+  let bin = envOr("BIT", "bit-out/bin/bit")
+  if (!exists(bin)) {
+    failCase("BIT='${bin}' does not exist — refusing to guess")
+    return
+  }
+  let scratchRoot = envOr("TMPDIR", "/tmp") + "/bit-lspreferences-${timeUnixNs()}"
+  mkdirQuiet(scratchRoot)
+  checkReferencesCapability(bin, scratchRoot)
+  checkReferencesAcceptance(bin, scratchRoot)
+  checkReferencesSameNameDifferentTypes(bin, scratchRoot)
+  checkReferencesFreeFunction(bin, scratchRoot)
+  print("lspreferences: all scenarios passed\n")
+}

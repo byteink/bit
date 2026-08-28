@@ -1,0 +1,140 @@
+// Module-level mutable state (§11.11, #1402) — the storage form the runtime
+// ports (#1363 GC heap metadata, #1364 run queue, #1366/#1367 the deleted
+// native runtime's `root` module's process-wide instance) are built on.
+//
+// Module state is a statically allocated `.data` cell: it persists across
+// calls, it has an address `ptrOf` can hand to the atomic builtins, and
+// reaching it is pure address arithmetic — no allocation and no safepoint —
+// which is what makes it legal inside a `@nosplit` body.
+//
+// The collector does NOT scan these cells. That is the whole design decision:
+// the first real consumers (the allocator's free-list heads, the scheduler's
+// run queue) hold raw addresses of unmanaged memory that has no `GcHeader`, so
+// tracing them would decode garbage as objects. Instead the checker guarantees
+// module state can never hold a reference at all, which is why not scanning it
+// is sound rather than merely convenient. See SPEC §11.11.
+//
+// Five properties, all deterministic:
+//
+//   (a) Persistence across calls — `bump()` returns 1 then 2 then 3. A cell
+//       re-zeroed per call (or inlined to a constant) fails here immediately.
+//
+//   (b) `@nosplit` reachability — `bump` is `@nosplit`, so the checker has
+//       proved its body neither allocates nor reaches a safepoint. It still
+//       reads and writes module state. This is the property the run queue and
+//       free lists actually need, and it is checked at COMPILE time: if
+//       `global_addr` ever lowered to something allocating, this file would
+//       stop compiling rather than stop working.
+//
+//   (c) Addressability for atomics — `ptrOf(lockWord)` yields the cell's
+//       static address, and the whole spin/CAS surface works through it. The
+//       counter below is incremented with `atomicAdd` from four green
+//       threads, so the total is exact only if every thread addressed the SAME
+//       cell. A per-thread or per-call copy shows up as a short count.
+//
+//   (d) Fixed arrays at module scope — `slots` is a `[4]i64` laid out inline
+//       in the cell, indexed with the ordinary element ops. This is the shape
+//       the allocator's 37 free-list heads need.
+//
+//   (e) Rooting, under `BIT_GC=stress` — the harness runs every program a
+//       second time with the collector firing at EVERY safepoint. `keeper`
+//       allocates a slice, records a value derived from it in module state,
+//       drops every managed reference, then churns the heap hard enough to
+//       reuse any swept memory before reading the module cell back. Module
+//       state holds only the derived i64, never the slice, so this asserts the
+//       *positive* half of the decision: an untraced cell survives a collection
+//       untouched. The negative half — that a reference can never get into one
+//       — is a compile error, and is covered by the golden case
+//       _tests_/cases/module_state_ref.bit rather than at run time, because the
+//       program that would test it does not compile by design.
+//
+// WORKERS*ITERS = 4 * 500 = 2000.
+
+const WORKERS = 4
+const ITERS = 500
+
+// The atomically-incremented counter, the lock word, and an inline array —
+// one of each admissible module-state shape (§11.11).
+let counter: i64 = 0
+let lockWord: i32 = 0
+let slots: [4]i64
+let calls = 0
+let survivor = 0
+
+// (a) + (b): persistence across calls, from a body the checker has proved
+// takes no safepoint and performs no allocation.
+@nosplit
+fn bump(): i64 {
+  calls = calls + 1
+  return calls
+}
+
+// (c): every worker hits the one shared cell through its static address.
+fn worker(done: chan<i64>) {
+  let p = ptrOf(counter)
+  let k = 0
+  while (k < ITERS) {
+    atomicAdd(p, 1)
+    k = k + 1
+  }
+  done <- 1
+}
+
+// (e): allocate, derive a value into module state, drop the reference, then
+// churn the heap so anything swept is reused before the cell is read back.
+fn keeper() {
+  let buf = []i64(8)
+  buf[0] = 4242
+  survivor = buf[0]                  // an i64 copy, never the slice itself
+  let j = 0
+  while (j < 200) {                  // churn: force reuse of any swept memory
+    let waste = []i64(16)
+    waste[0] = j
+    j = j + 1
+  }
+}
+
+fn main() {
+  // (a) persistence: three calls, three distinct values.
+  let b1 = bump()
+  let b2 = bump()
+  let b3 = bump()
+  let persisted = 0
+  if (b1 == 1 && b2 == 2 && b3 == 3 && calls == 3) {
+    persisted = 1
+  }
+
+  // (d) inline array at module scope.
+  slots[0] = 11
+  slots[3] = 44
+  let arrOk = 0
+  if (slots[0] == 11 && slots[3] == 44 && slots[1] == 0) {
+    arrOk = 1
+  }
+
+  // (c) the lock word is addressable and holds what was stored.
+  let lp = ptrOf(lockWord)
+  atomicStore(lp, 9)
+  let lockOk = 0
+  if (atomicLoad(lp) == 9) {
+    lockOk = 1
+  }
+
+  // (e) rooting oracle.
+  keeper()
+
+  // (c) contention: WORKERS threads, ITERS atomic increments each.
+  let done = chan<i64>(WORKERS)
+  let w = 0
+  while (w < WORKERS) {
+    spawn worker(done)
+    w = w + 1
+  }
+  let j = 0
+  while (j < WORKERS) {
+    let sig = <- done
+    j = j + 1
+  }
+
+  print("${persisted} ${arrOk} ${lockOk} ${counter} ${survivor}\n")
+}

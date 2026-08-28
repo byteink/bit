@@ -49,10 +49,10 @@ BIT2=bit-out/bin/bit
 # diffdoc.sh) this used to follow (#3689): this script's calls are a full
 # `build --emit-obj`/`build -o`, the same weight as selfhost-diffexamples.sh's
 # and selfhost-diffexamples-x64.sh's own build+run budget for the SAME corpus
-# (stdlib+examples+tests/cases), both of which already use 60s. 20s undercounted
+# (stdlib+examples+_tests_/cases), both of which already use 60s. 20s undercounted
 # by construction: the ten HTTP-touching files (stdlib/http/http.bit and the
 # nine that import it) measured 24-26s on a quiet box and up to 34s
-# (tests/cases/httpatoioverflow.bit, the slowest observed) under fleet
+# (_tests_/cases/httpatoioverflow.bit, the slowest observed) under fleet
 # contention -- every one of the ten timed out on BOTH the 20s attempt and its
 # retry, every run, on any host, regardless of correctness (#3689). 60s clears
 # the slowest observed time (34s) with ~1.8x margin. DIFFSAFEPOINTS_TIMEOUT
@@ -150,8 +150,8 @@ echo "self-test: plain-loop safepoint count — seed=$st_seed self=$st_self"
 # ORACLE cannot build changes (from zero to one attempt, run in parallel with
 # ORACLE's own failure rather than after it).
 match=0 mismatch=0 skip=0 timeout=0
-total=$(find stdlib examples tests/cases tests/stress -name '*.bit' | wc -l | tr -d ' ')
-for f in $(find stdlib examples tests/cases tests/stress -name '*.bit' | sort); do
+total=$(find stdlib examples _tests_/cases _tests_/stress -name '*.bit' | wc -l | tr -d ' ')
+for f in $(find stdlib examples _tests_/cases _tests_/stress -name '*.bit' | sort); do
   sites "$ORACLE" "$f" "$tmp/a.o" >"$tmp/s.out" &
   pid_s=$!
   sites "$BIT2" "$f" "$tmp/b.o" >"$tmp/b.out" &
@@ -232,7 +232,7 @@ exe_stdout() { # $1=binary -> its stdout, or "x" if it did not exit 0
   printf '%s' "$o"
 }
 
-# The corpus is written here rather than borrowed from tests/, deliberately:
+# The corpus is written here rather than borrowed from _tests_/, deliberately:
 # every case must LOOP (a straight-line program executes no safepoint and would
 # score 0==0 forever), must be bounded and deterministic (the count is the
 # assertion), and must be cheap under `BIT_GC=stress`, which collects at every
@@ -408,7 +408,7 @@ fi
 # WHY THIS EXISTS. #3068 fixed `resolveCallTarget` (compiler/lowerprim.bit) to
 # substitute a generic call's type args through `fc.genEnv` before looking up
 # which instantiation it targets. Nothing re-runs the bug once fixed: the
-# golden fixture #3068 added for it (tests/cases/run_generic_call_via_param.bit)
+# golden fixture #3068 added for it (_tests_/cases/run_generic_call_via_param.bit)
 # compares stdout, and the degenerate, mistyped instance still computes the
 # right VALUE (#2379) — with the fix reverted, `./make test-golden` still
 # exits 0, 465/465. Every dump-based differential (diffcheck/diffir/diffiropt/
@@ -449,7 +449,7 @@ fi
 # relocation naming `_f1$0` in __text is therefore the exact, deterministic
 # signature of the reverted bug for this fixture — not a heuristic.
 instcheck() { # $1=compiler $2=outobj -> prints verdict; sets $INSTCHECK_RC (0 pass, 1 fail, 2 could-not-decide)
-  local fixture="tests/cases/run_generic_call_via_param.bit" calls rc side
+  local fixture="_tests_/cases/run_generic_call_via_param.bit" calls rc side
   [ "$1" = "$ORACLE" ] && side=ORACLE || side=BIT2
   alarmrun_retry "$side" "$2" "$1" build "$fixture" --emit-obj -o "$2"
   rc=$?

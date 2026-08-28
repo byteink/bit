@@ -70,7 +70,7 @@ Everything here is what a second package author copies without asking
   itself. Add `pkg/<name>/bit.json` only once that package genuinely
   depends on another package or a third-party module; the shape is
   identical to any consuming project's.
-- **Tests live in the package's own directory, not under `tests/`.**
+- **Tests live in the package's own directory, not under `_tests_/`.**
   `./make test-package-<name>` (`tools/build/gates.bit`'s `packageGates()`,
   filesystem-driven from whatever `pkg/<name>/` directories exist -- nothing
   to register by hand) runs `bit test pkg/<name>` (SPEC §19), which
@@ -78,7 +78,7 @@ Everything here is what a second package author copies without asking
   `client.test.bit` here are ordinary siblings of `resp.bit`/`client.bit` --
   same module, so a test calls an unexported helper directly with no
   import. This is a deliberate split from how the `bit` compiler tests
-  itself (`tests/bit/`, `tests/imports/`): a first-party package is tested
+  itself (`_tests_/bit/`, `_tests_/imports/`): a first-party package is tested
   the way SPEC §19 documents testing an ordinary Bit project, because that
   is what it is.
 - **No test may reach a real network service.** `resp.test.bit` drives the
@@ -88,7 +88,7 @@ Everything here is what a second package author copies without asking
   EOF) satisfy structurally -- no socket involved at all.
   `client.test.bit` stands up a real TCP listener on `127.0.0.1:0`
   (kernel-chosen port) and `spawn`s exactly one accept-and-reply -- the same
-  listen/spawn/accept/dial shape `tests/imports/nettcp/main.bit` already
+  listen/spawn/accept/dial shape `_tests_/imports/nettcp/main.bit` already
   uses -- never a connection to a host the test did not itself start.
 - **Versioning and release tags.** A release is a git tag on the `bit`
   repository itself, spelled `<name>/vMAJOR.MINOR.PATCH` -- for this

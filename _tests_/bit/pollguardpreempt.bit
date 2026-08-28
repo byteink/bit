@@ -1,0 +1,210 @@
+// #3564. Behavioural counterpart to _tests_/bit/pollguardoffsets.bit's ninth
+// (wkId) offset, in the same shape _tests_/bit/pollguardstopword.bit already
+// uses for the worldStopWord clause: pollguardoffsets.bit only compares
+// LITERALS (this file's copy against compiler/codegen.bit's, parsed as
+// text), and never runs a single compiled program, so it cannot tell
+// whether the COMPILED back-edge poll guard actually observes and acts on
+// a pending preempt request. This gate closes that for clause 3
+// (compiler/arm64call.bit's emitInlinedPreemptCheck, mirroring
+// runtime/stw/stwpoll.bit's #3560 clause exactly).
+//
+// #3560's own runtime-level fix, alone, could not be tested end to end:
+// nothing compiled calls stwPollNeeded (compiler/codegen.bit:322 — dead
+// since #2925/#3169), so #3560's ticket recorded a deterministic harness
+// driving stwPollNeeded directly instead. THIS gate drives the same
+// scenario through the REAL compiled path: a spinning, allocation-free
+// mutator with a genuine loop back edge, so the compiler emits the inlined
+// guard at it, and a real bl bit_rt_safepoint only fires if that guard's
+// preempt clause actually returns true.
+//
+// WHY preemptStamp/sysmonTick DIRECTLY, not a real 10ms wait. Backdating the
+// stamp (`monotonic().ns - preemptBudgetNs - 1`) then calling `sysmonTick`
+// once sets the flag deterministically, the same way sysmonTick's own OS
+// thread would after a real preemptBudgetNs of continuous running — see
+// runtime/sched/preempt.bit's own comments on both functions. This is
+// exactly what the ticket's acceptance criterion asks for: "a second task
+// setting the preempt flag via preemptStamp/sysmonTick".
+//
+// WHY THE MUTATOR PUBLISHES ITS OWN WORKER ID, rather than this file
+// scanning every slot. `schedCurrentWorker()` returns a raw, word-aligned
+// WORKER BLOCK ADDRESS (never a small index — see runtime/sched/task.bit's
+// own note on schedMaybeYieldForPreempt), so the small id `preemptStamp`/
+// `preemptRequested`/`sysmonTick` index by is `*(taskAt(w) + wkId)` — the
+// exact conversion the guard's own new clause performs. The mutator is the
+// only task that can legitimately ask "what worker am I running on right
+// now", and it publishes once, before it starts spinning; since nothing
+// makes it yield until the fix under test fires, that worker binding cannot
+// change out from under this file's later preemptStamp/sysmonTick call.
+//
+// THE CLAUSE THIS KILLS: clause 3, `preemptRequested(workerId)` (after
+// schedCurrentWorker() != 0). MUTATION-PROVEN — see smash #3564: reverting
+// compiler/arm64call.bit's emitInlinedPreemptCheck call site (the
+// `pollFixups = emitInlinedPreemptCheck(cx, pollFixups)` line in
+// emitInlinedPollGuard) and rebuilding makes this gate FAIL — the flag never
+// clears within the deadline below, exit 1. Restoring it makes this gate
+// PASS again, exit 0.
+//
+// REQUIRES BIT_WORKERS >= 2, same reason and same failure mode as
+// pollguardstopword.bit's own header: with the scheduler's single-worker
+// default the controller and the mutator can never run concurrently, so
+// this hangs (bounded by the mutator's own iteration ceiling, not by this
+// file) rather than failing fast. Set in this gate's own tools/build/gates.bit
+// entry, not left to the caller's environment.
+
+import { exit } from "std/os"
+import { newWaitGroup, WaitGroup } from "std/sync"
+import { monotonic, sleep, Millisecond, Second } from "std/time"
+import {
+  schedCurrentWorker, taskAt, wkId, schedMaxWorkers,
+  preemptStamp, sysmonTick, preemptRequested, preemptBudgetNs,
+} from "../../runtime/sched"
+
+class Shared { wg: WaitGroup, started: []i64, testDone: []i64, workerId: []i64 }
+
+// The mutator under test: allocation-free, with a real loop back edge so the
+// compiler emits the inlined poll guard at it — see pollguardstopword.bit's
+// mutatorLoop for why this shape (spawn, bounded spin, shared testDone) beats
+// a userspace lock for isolating one clause.
+fn mutatorLoop(s: Shared) {
+  let raw = schedCurrentWorker()
+  // raw==0 means off-task (see runtime/sched/task.bit's own note on
+  // schedCurrentWorker — a small-index worker id of 0 is a perfectly valid
+  // first worker and must NOT be confused with this). A properly dispatched
+  // task can never observe raw==0; -1 is a sentinel the controller checks.
+  let wid = -1
+  if (raw != 0) {
+    wid = *(taskAt(raw) + wkId)
+  }
+  atomicStore(ptrOf(s.workerId), wid)
+  atomicStore(ptrOf(s.started), 1)
+  let i = 0
+  // Bounded per Power of 10 (rule 2); see pollguardstopword.bit's own note on
+  // this exact ceiling and iteration rate. Never reached in a correctly
+  // configured (BIT_WORKERS >= 2) run, win or lose.
+  while (i < 2000000000 && atomicLoad(ptrOf(s.testDone)) == 0) {
+    i = i + 1
+  }
+  s.wg.done()
+}
+
+fn waitForStart(started: []i64) {
+  let startDeadline = monotonic().ns + 5 * Second
+  while (atomicLoad(ptrOf(started)) == 0) {
+    if (monotonic().ns > startDeadline) {
+      println("pollguardpreempt: FAIL — mutator loop never started")
+      exit(1)
+    }
+    sleep(1 * Millisecond)
+  }
+}
+
+// Race-free setup proof by ELIMINATION (smash #3609): reset every OTHER
+// worker slot's clock immediately before stamping wid, so the caller's
+// flagged-count check is not satisfied by ambient noise, then deliberately
+// backdate wid's own clock and return sysmonTick's own return value -- the
+// only race-free signal available (see the caller's own comment on why a
+// direct preemptRequested(wid) read here is racy against the guard under
+// test). Bounded by schedMaxWorkers (32, a compile-time constant, Power of
+// 10). Stamping an idle slot (no task ever dispatched there — this program
+// spawns exactly one task besides main) is harmless: preempt.bit's only
+// other reader of startNs is the scheduler's own dispatch-time preemptStamp
+// call, which simply overwrites it again if that slot is ever really used.
+//
+// MUTATION-TESTED, two failure modes closed, one NOT (documented here
+// rather than silently narrowed, per this ticket):
+//   - CLOSED: preemptStamp given an insufficient backdate for wid itself
+//     (simulating broken preemptStamp/sysmonTick arithmetic) — 5/5 caught
+//     with this elimination loop, vs 2/3 with an earlier controller-only-
+//     reset revision, because the CALLING task's own waitForStart+settle-
+//     sleep stretch can independently put ITS OWN worker over
+//     preemptBudgetNs and mask the bug via ambient noise.
+//   - NOT CLOSED: preemptStamp given a WRONG (but valid, in-range) worker
+//     index instead of wid — false-PASSED 3/3 even with this elimination
+//     loop, because the wrongly-targeted slot's own artificial stamp
+//     satisfies `flagged >= 1` exactly like a correct one would. No
+//     aggregate count can distinguish "wid was flagged" from "some other
+//     single worker was flagged instead" — that needs either a race-free
+//     PER-WORKER read (no such accessor is exported from preempt.bit
+//     today) or reading preemptRequested(wid) directly, which is exactly
+//     the racy read this fix removes. This narrow class (a bug in the
+//     literal worker-index argument at this function's own preemptStamp(wid,
+//     ...) call, as opposed to a bug in preemptStamp/sysmonTick's own
+//     arithmetic) is left uncaught by this self-check.
+fn armPreemptFor(wid: i64): i64 {
+  let w = 0
+  while (w < schedMaxWorkers) {
+    if (w != wid) {
+      preemptStamp(w, monotonic().ns)
+    }
+    w = w + 1
+  }
+  // A second task (this one) sets the preempt flag directly, the same way
+  // sysmonTick's own OS thread would after preemptBudgetNs of real time.
+  preemptStamp(wid, monotonic().ns - preemptBudgetNs - 1)
+  return sysmonTick(monotonic().ns)
+}
+
+fn main() {
+  let started = []i64(1)
+  let testDone = []i64(1)
+  let workerId = []i64(1)
+  let wg = newWaitGroup()
+  wg.add(1)
+  spawn mutatorLoop(Shared{ wg: wg, started: started, testDone: testDone, workerId: workerId })
+
+  waitForStart(started)
+  sleep(20 * Millisecond) // settle solidly inside the loop, not its first iteration
+
+  let wid = atomicLoad(ptrOf(workerId))
+  if (wid < 0) {
+    println("pollguardpreempt: FAIL — mutator's schedCurrentWorker() returned 0 (off-task); a spawned, dispatched task should never observe this")
+    exit(1)
+  }
+
+  // `flagged` (sysmonTick's own return value, via armPreemptFor -- see its
+  // doc comment for the full race-freeness and mutation-testing rationale)
+  // is the setup-correctness signal here, deliberately NOT a direct read of
+  // preemptRequested(wid) (smash #3609: that used to be this check, and it
+  // false-failed once under heavy fleet contention, "setup broken ...
+  // preemptRequested(0) is false right after sysmonTick flagged 2
+  // worker(s)" -- a fast, CORRECT guard clearing the flag before this
+  // thread's next instruction runs). `flagged == 0` here can only mean
+  // sysmonTick's own scan is broken, never that the guard raced ahead.
+  let flagged = armPreemptFor(wid)
+  if (flagged == 0) {
+    atomicStore(ptrOf(testDone), 1)
+    wg.wait()
+    println("pollguardpreempt: FAIL — setup broken, not the guard under test: sysmonTick flagged 0 worker(s) despite worker ${wid} being deliberately backdated past preemptBudgetNs via preemptStamp")
+    exit(1)
+  }
+
+  // Poll (bounded by wall-clock deadline, the same shape waitForStart above
+  // uses) for the COMPILED guard to observe and clear it. Only
+  // compiler/arm64call.bit's emitInlinedPreemptCheck reaching bit_rt_safepoint
+  // -> schedMaybeYieldForPreempt -> maybePreempt can make this clear — that
+  // is the actual thing under test. It is legitimate for `cleared` to go
+  // true on the very FIRST check below: the `flagged >= 1` proof above
+  // already establishes the flag really was set for wid specifically, and
+  // the only thing that clears requested[wid] while the mutator's task is
+  // still alive is that same guard's maybePreempt call — so an instant
+  // "already false" here means the guard won the race, not that setup was
+  // skipped.
+  let deadline = monotonic().ns + 2 * Second
+  let cleared = false
+  while (!cleared && monotonic().ns < deadline) {
+    if (!preemptRequested(wid)) {
+      cleared = true
+    } else {
+      sleep(1 * Millisecond)
+    }
+  }
+
+  atomicStore(ptrOf(testDone), 1)
+  wg.wait()
+
+  if (!cleared) {
+    println("pollguardpreempt: FAIL — preemptRequested(${wid}) never cleared; the compiled back-edge poll guard did not observe the pending preempt (compiler/arm64call.bit's emitInlinedPreemptCheck is missing, wrong, or compiler/codegen.bit's pgWkIdWord has drifted)")
+    exit(1)
+  }
+  println("pollguardpreempt: PASS — allocation-free mutator's own back-edge poll guard observed and cleared the pending preempt for worker ${wid}")
+}

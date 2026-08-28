@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Self-host `bit doc` differential (#1590): run every corpus MODULE through both
 # compilers' `doc` and compare the exported-surface bytes. `doc` derives a
-# module's public API from the checker (not a text scrape), and `tests/bit/stdlibdocs.bit`
+# module's public API from the checker (not a text scrape), and `_tests_/bit/stdlibdocs.bit`
 # fails the build on any undocumented export — so this surface is a live gate.
 # This is the standing differential that keeps the
 # two `doc` implementations in step.
@@ -12,7 +12,7 @@
 # "<kind> <name> <type>" listing and the `--json` array. The unit is a module
 # DIRECTORY, not a `.bit` file: `bit doc` documents a whole module (its files are
 # concatenated), and a lone-file root has no doc form (SPEC §17.1). So the corpus
-# is `stdlib/*/`, `examples/*/` and `tests/imports/*/`, not a `-name '*.bit'` glob.
+# is `stdlib/*/`, `examples/*/` and `_tests_/imports/*/`, not a `-name '*.bit'` glob.
 #
 # ## Scope: only what the oracle can document
 #
@@ -188,7 +188,7 @@ run_bit2_pair() {
   printf '%s %s\n' "$bit_rc" "$bit_json_rc" >"$work/bit2.status"
 }
 
-for d in stdlib/*/ examples/*/ tests/imports/*/; do
+for d in stdlib/*/ examples/*/ _tests_/imports/*/; do
   [ -d "$d" ] || continue
 
   run_oracle_pair "$d" &

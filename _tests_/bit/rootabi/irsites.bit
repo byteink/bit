@@ -1,0 +1,366 @@
+// _tests_/bit/rootabi/irsites.bit — the compiler-side probe for the register-
+// class gate (#2867 phase 2's split of `_tests_/bit/rootabi.bit`).
+//
+// Sibling of `rootabi.bit` in the same directory module: no `import`, one
+// shared scope. This file is the whole pipeline that produces the
+// compiler's OWN answer about what it calls and how: `probeMain`/`probePrims`
+// build one Bit program that makes the compiler emit an `rt_call` for every
+// runtime primitive it can reach one for; `runCapture`/`dumpProbe` write it to
+// scratch, run it through `bit check` then `bit --dump-ir`, and capture the
+// SSA text; and the SSA reader (`Vregs`, `readInstr`, `readCallSite`,
+// `readSites`) parses that text into `[]Site` — one entry per `rt_call`, with
+// the argument and result types the compiler actually used. `readSites`'
+// caller in `rootabi.bit`'s `main` feeds the result straight into
+// `compareAll` against the pin side's `[]Sig`.
+//
+// `Ctx` and `say` (the shared, side-effecting failure counter every function
+// here calls into) are declared in `rootabi.bit`; so are the small text
+// helpers (`splitTop`, `matchParen`, `firstToken`, `lastToken`) `readCallSite`/
+// `readBlockParams`/`resultType` use, and `isMember`, which the opcode
+// classifiers (`typeAfterOp`/`opIsAddress`/`typeAtEnd`) call.
+
+// `readFile`/`exists` (std/fs) and `hasPrefix`/`indexOf`/`parseInt`/`split`/
+// `trimSpace` (std/strings) are already imported by `rootabi.bit` — one
+// shared scope means one import each, not one per file that calls them.
+import { writeFile, remove } from "std/fs"
+
+// --- the probe -------------------------------------------------------------
+//
+// One Bit program that makes the compiler emit an `rt_call` for every runtime
+// primitive it can emit one for. It is never RUN — `--dump-ir` stops after
+// lowering — so `osExit`, `panic` and `fsRemove("p")` are safe to name. `\$` is an
+// escaped interpolation: the probe's own `${...}` must survive being a string
+// literal here, and those are not decoration — they exercise
+// `string_from_int`/`string_from_uint`/`string_from_float`/`string_from_bool`.
+// The `u64` local is what reaches `string_from_uint`, which exists only because
+// the signed formatter rendered a u64 above 2^63 as a negative number (#2011);
+// its pin takes a `u64` where its sibling takes an `i64`, and this gate is what
+// holds those two declarations to the same register class.
+//
+// WHAT IT DELIBERATELY DOES NOT REACH, so the coverage claim stays honest:
+// `sqrt`, `floor`, `ceil`, `round`, `trunc`, `float_bits` and `float32_bits` are
+// lowered by this compiler to INLINE ops (`Op.FSqrt`, `Op.Bitcast`, ...), never
+// to a call, so no probe can make it emit one; their pins exist for the seed and
+// go dead with it. `test_index` is emitted only into the synthetic `main` that
+// `bit test` appends, which `--dump-ir` never builds.
+fn probeMain(): string {
+  return "interface Shape { area(): f64 }\n" +
+    "class Sq { s: f64, area(): f64 { return this.s * this.s } }\n" +
+    "fn fallible(): int! { fail newError(\"x\") }\n" +
+    "fn worker() { print(\"w\") }\n\nfn main() {\n" +
+    "  let a = \"ab\"\n  let b = \"cd\"\n  let c = a + b\n" +
+    "  let uu: u64 = 1\n" +
+    "  let d = \"\${1}\${2.5}\${true}\${a}\${uu}\"\n" +
+    "  let e = a == b\n  let f = a < b\n  let g = a[0]\n  let h = a[0:1]\n" +
+    "  let i = []byte(a)\n  let j = string(i)\n  print(c)\n  eprint(d)\n" +
+    "  let s = []f64(0)\n  s = append(s, 1.5)\n  let s0 = s[0]\n" +
+    "  s[0] = 2.5\n  let s1 = s[0:1]\n" +
+    "  let m = map<string, f64>{}\n  m[\"k\"] = 1.5\n" +
+    "  let (mv, mh) = m[\"k\"]\n  delete(m, \"k\")\n  let ml = len(m)\n" +
+    "  for (k, v) of m { print(\"\${k}\${v}\") }\n" +
+    "  let ch = chan<f64>(1)\n  ch <- 1.5\n  let cv = <- ch\n" +
+    "  let (cv2, ok) = <- ch\n  close(ch)\n  spawn worker()\n" +
+    "  select {\n    case x = <- ch: print(\"\${x}\")\n    default: print(\"d\")\n  }\n" +
+    "  let sh: Shape = Sq{s: 2.0}\n  let (sq, ok2) = sh.(Sq)\n" +
+    "  let sq2 = sh.(Sq)\n  let r = fallible() catch _ { 0 }\n" +
+    "  assert(true, \"m\")\n  let pf = parseFloat(\"1.5\")\n" +
+    "  print(\"\${pf}\${e}\${f}\${g}\${h}\${j}\${s0}\${len(s1)}\${mv}\${mh}\${ml}\" +\n" +
+    "    \"\${cv}\${cv2}\${ok}\${sq.s}\${sq2.s}\${r}\${ok2}\")\n" +
+    "  panic(\"end\")\n}\n"
+}
+
+// The builtin half: every primitive `compiler/lowerprim.bit`'s `primRtName`
+// maps to an `RtFn`, called at its declared signature.
+fn probePrims(): string {
+  return "\nfn prims() {\n" +
+    "  let fd = fsOpen(\"p\", false)\n  let all = fsReadAll(fd)\n" +
+    "  let nw = fsWrite(fd, \"x\")\n  let cl = fsClose(fd)\n" +
+    "  let ap = fsAppend(\"p\")\n  let rd = fsRead(fd, 8)\n" +
+    "  let ex = fsExists(\"p\")\n  let isd = fsIsDir(\"p\")\n" +
+    "  let mk = fsMkdir(\"p\")\n  let rm = fsRemove(\"p\")\n" +
+    "  let ld = fsListDir(\"p\")\n  let cm = fsChmod(\"p\", 493)\n" +
+    "  let l = netListen(\"h\", 1)\n  let lp = netLocalPort(l)\n" +
+    "  let ac = netAccept(l)\n  let dl = netDial(\"h\", 1)\n" +
+    "  let nr = netRead(l, 8)\n  let nwr = netWrite(l, \"x\")\n" +
+    "  let ub = netUdpBind(\"h\", 1)\n  let us = netUdpSend(ub, \"h\", 1, \"x\")\n" +
+    "  let ur = netUdpRecv(ub, 8)\n  let uh = netUdpSenderHost()\n" +
+    "  let up = netUdpSenderPort()\n  let rv = netResolve(\"h\")\n" +
+    "  let pw = fpow(2.0, 3.0)\n  let at = fatan2(1.0, 2.0)\n" +
+    "  let lg = flog(2.0)\n  let l2 = flog2(2.0)\n  let l10 = flog10(2.0)\n" +
+    "  let tm = timeMonoNs()\n  let tu = timeUnixNs()\n  timeSleepNs(1)\n" +
+    "  let ar = osArgc()\n  let a0 = osArgAt(0)\n  let ev = osEnv(\"X\")\n" +
+    "  let se = osSelfExe()\n  let rn = cryptoRandomBytes(4)\n" +
+    "  let bz = []byte(\"ab\")\n  cryptoSecureZero(bz)\n" +
+    "  let sv = []string(0)\n  let orn = osRun(\"p\", sv)\n  let ort = osRunTest(\"p\", 0)\n" +
+    "  let orb = osRunBounded(\"p\", 1)\n  let ortb = osRunTestBounded(\"p\", 0, 1)\n" +
+    "  let ht = hostTarget()\n  let ax = auxv()\n" +
+    "  print(\"\${all}\${nw}\${cl}\${ap}\${rd}\${ex}\${isd}\${mk}\${rm}\${ld}\${cm}\${lp}\${ac}\" +\n" +
+    "    \"\${dl}\${nr}\${nwr}\${us}\${ur}\${uh}\${up}\${rv}\${pw}\${at}\${lg}\${l2}\${l10}\" +\n" +
+    "    \"\${tm}\${tu}\${ar}\${a0}\${ev}\${se}\${rn}\${orn}\${ort}\${orb}\${ortb}\${ht}\${ax}\")\n" +
+    "  osExit(0)\n}\n"
+}
+
+// --- the compiler side: `bit --dump-ir` over the probe ---------------------
+fn shQuote(s: string): string {
+  let out = "'"
+  for (let i = 0; i < len(s); i = i + 1) {
+    // A single quote ends the word, so it is spelled `'\''` outside it.
+    if (s[i] == 39) { out = out + "'\\''" } else { out = out + s[i:i + 1] }
+  }
+  return out + "'"
+}
+
+// `osRunBounded`'s negative results, named; "" means the child actually ran.
+fn launchFailure(code: int, timeoutMs: int): string {
+  if (code == 0 - 2) { return "TIMED OUT after ${timeoutMs}ms (raise BIT_TEST_TIMEOUT_S)" }
+  if (code == 0 - 1) { return "cannot launch the wrapper script (spawn/wait failure)" }
+  if (code <= 0 - 100) { return "CRASHED: killed by signal ${0 - code - 100}" }
+  return ""
+}
+
+// Writes and runs a `/bin/sh` wrapper that `exec`s `argv` with both streams
+// redirected to files — `_tests_/bit/golden.bit`'s idiom: `osRunBounded` takes a
+// bare path and captures nothing, and `exec` makes a child that dies of a signal
+// kill the process being waited on. Returns ok=false only after reporting why, so
+// a caller can never read an absent redirect file as "empty output" — the hole
+// that would let this gate pass on a compiler that never ran.
+fn runCapture(c: Ctx, what: string, argv: []string): (string, bool) {
+  let outPath = c.scratch + "/out"
+  let errPath = c.scratch + "/err"
+  let shPath = c.scratch + "/w.sh"
+  removeQuiet(outPath)
+  removeQuiet(errPath)
+  let script = "#!/bin/sh\nexec"
+  for a of argv { script = script + " " + shQuote(a) }
+  script = script + " > " + shQuote(outPath) + " 2> " + shQuote(errPath) + "\n"
+  writeFile(shPath, script) catch _ {
+    say(c, "${what}: cannot write the wrapper script ${shPath}")
+    return "", false
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    say(c, "${what}: cannot chmod the wrapper script ${shPath}")
+    return "", false
+  }
+
+  let code = osRunBounded(shPath, c.timeoutMs)
+  let why = launchFailure(code, c.timeoutMs)
+  if (why != "") {
+    say(c, "${what}: ${why}")
+    return "", false
+  }
+  // The redirections are established before `exec`, so both files exist the
+  // moment the command starts. A missing one means the wrapper never got there.
+  if (!exists(outPath) || !exists(errPath)) {
+    say(c, "${what}: the wrapper produced no redirect files — it never ran ${c.bin}")
+    return "", false
+  }
+  // THE EXIT CODE IS THE VERDICT, not the captured stdout: `bit` writes every
+  // diagnostic to STDERR, so a guard reading stdout for them matches nothing.
+  if (code != 0) {
+    say(c, "${what}: `${c.bin}` exited ${code}:\n" + (readFile(errPath) catch _ { "" }))
+    return "", false
+  }
+  let text = readFile(outPath) catch _ {
+    say(c, "${what}: cannot read the captured stdout")
+    return "", false
+  }
+  return text, true
+}
+
+fn removeQuiet(path: string) {
+  remove(path) catch _ { return }
+}
+
+// Writes the probe, refuses to continue unless it CHECKS clean, then returns its
+// SSA dump. Not redundant: on a module with parse errors `--dump-ir` still exits
+// 0, silently dropping what it could not parse — sometimes the whole body — so
+// without this a probe broken by a syntax change hands the gate a dump missing
+// the very `rt_call`s it exists to read, and every comparison then passes.
+fn dumpProbe(c: Ctx): (string, bool) {
+  let src = c.scratch + "/probe.bit"
+  writeFile(src, probeMain() + probePrims()) catch _ {
+    say(c, "cannot write the probe to ${src}")
+    return "", false
+  }
+  let (unused, okCheck) = runCapture(c, "probe check", [c.bin, "check", src])
+  if (!okCheck || len(unused) > 0) {
+    return "", false
+  }
+  return runCapture(c, "probe dump-ir", [c.bin, "--dump-ir", src])
+}
+
+// --- the SSA reader --------------------------------------------------------
+// Vreg -> result-type text by vreg number; "" is "not defined here", fatal at a use.
+class Vregs {
+  types: []string,
+}
+fn vregSet(v: Vregs, idx: int, ty: string) {
+  while (len(v.types) <= idx) { v.types = append(v.types, "") }
+  v.types[idx] = ty
+}
+
+fn vregGet(v: Vregs, idx: int): string {
+  if (idx < 0 || idx >= len(v.types)) { return "" }
+  return v.types[idx]
+}
+
+// Opcodes whose result type is the token immediately AFTER the opcode.
+fn typeAfterOp(op: string): bool {
+  if (hasPrefix(op, "icmp_") || hasPrefix(op, "fcmp_")) { return true }
+  return isMember(op, ["const_int", "const_float", "bitcast", "convert",
+    "add", "shl",
+    "fmul", "fadd", "fsub", "fdiv", "fneg",
+    "fsqrt", "ffloor", "fceil", "fround", "ftrunc"])
+}
+
+// Opcodes whose result is an ADDRESS, whatever type text trails them.
+// `type_info` prints the type it DESCRIBES and `gc_alloc` the one it allocates;
+// both yield a pointer, so neither may be read off the tail.
+fn opIsAddress(op: string): bool {
+  return isMember(op, ["type_info", "func_addr", "gc_alloc", "global_addr",
+    "stackmaps_addr"])
+}
+
+// Opcodes whose result type is the LAST token on the line.
+fn typeAtEnd(op: string): bool {
+  return isMember(op, ["rt_call", "call", "call_value", "call_iface",
+    "field_get", "index_get", "make_closure"])
+}
+
+// The result type of one `%N = op ...` instruction, or "" when the opcode is
+// unknown — which the caller treats as fatal.
+fn resultType(op: string, rest: string): string {
+  if (op == "const_bool") { return "bool" }
+  if (op == "const_string") { return "string" }
+  if (op == "const_nil") { return "nil" }
+  if (op == "slice_len") { return "i64" }
+  if (opIsAddress(op)) { return "ptr" }
+  if (typeAfterOp(op)) { return firstToken(rest) }
+  if (typeAtEnd(op)) { return lastToken(rest) }
+  return ""
+}
+
+// One observed call site: the symbol the compiler emits, and the types it uses.
+class Site {
+  primitive: string,
+  symbol: string,
+  args: []string,
+  ret: string,
+  line: int,
+}
+
+// `compiler/codegen.bit`'s `rtSymbol`, the compiler's ONLY name-shaping rule:
+// tag prefixed with `bit_rt_`, bar the two error-slot accessors (verb-first).
+fn rtSymbol(rt: string): string {
+  if (rt == "err_set") { return "bit_rt_set_err" }
+  if (rt == "err_get") { return "bit_rt_get_err" }
+  return "bit_rt_${rt}"
+}
+
+fn parseVregRef(tok: string): int {
+  let t = trimSpace(tok)
+  if (!hasPrefix(t, "%")) { return 0 - 1 }
+  return parseInt(t[1:]) catch _ { 0 - 1 }
+}
+
+fn readBlockParams(c: Ctx, v: Vregs, line: string, lineNo: int) {
+  let open = indexOf(line, "(")
+  if (open < 0) { return }
+  let close = matchParen(line, open)
+  if (close < 0) {
+    say(c, "IR line ${lineNo}: unbalanced block-parameter list")
+    return
+  }
+  for p of splitTop(line[open + 1:close]) {
+    let colon = indexOf(p, ":")
+    let idx = 0 - 1
+    if (colon >= 0) { idx = parseVregRef(p[:colon]) }
+    if (idx < 0) {
+      say(c, "IR line ${lineNo}: block parameter `${p}` has no vreg and type")
+      continue
+    }
+    vregSet(v, idx, trimSpace(p[colon + 1:]))
+  }
+}
+
+// RETURNS the accumulator rather than growing the caller's header through the
+// parameter (#3648). `append` on a slice PARAMETER used to reach the caller by
+// aliasing (spec/LINT.md E0214 names that a hazard), and this reader depended
+// on it — but a statically-empty `[]Site(0)` is the null header now, so the
+// first `append` allocates a fresh one and the caller would keep an empty
+// slice. Every `rt_call` site then went missing and `rootabi` reported all four
+// of its floors at zero. Threading it back is what the sibling `rootpins`
+// harness already does (`out = pinsInSrc(src, out)`), so this is the tree's
+// existing idiom rather than a new one.
+fn readCallSite(c: Ctx, v: Vregs, sites: []Site, rest: string, lineNo: int): []Site {
+  let open = indexOf(rest, "(")
+  let close = 0 - 1
+  if (open >= 0) { close = matchParen(rest, open) }
+  if (close < 0) {
+    say(c, "IR line ${lineNo}: rt_call has no readable argument list")
+    return sites
+  }
+  let prim = trimSpace(rest[:open])
+  let args = []string(0)
+  for a of splitTop(rest[open + 1:close]) {
+    let ty = vregGet(v, parseVregRef(a))
+    if (ty == "") {
+      say(c, "IR line ${lineNo}: rt_call `${prim}` argument `${a}` is not a defined vreg")
+      return sites
+    }
+    args = append(args, ty)
+  }
+  return append(sites, Site{primitive: prim, symbol: rtSymbol(prim),
+    args: args, ret: lastToken(rest[close + 1:]), line: lineNo})
+}
+
+// One `%N = ...` instruction: record its result type, and its call site when it
+// is an `rt_call`.
+fn readInstr(c: Ctx, v: Vregs, sites: []Site, line: string, lineNo: int): []Site {
+  let eq = indexOf(line, " = ")
+  if (eq < 0) { return sites }
+  let dst = parseVregRef(line[:eq])
+  if (dst < 0) {
+    say(c, "IR line ${lineNo}: cannot read the destination of `${line}`")
+    return sites
+  }
+  let body = line[eq + 3:]
+  let op = firstToken(body)
+  let rest = trimSpace(body[len(op):])
+  let ty = resultType(op, rest)
+  if (ty == "") {
+    say(c, "IR line ${lineNo}: unknown opcode `${op}` — this reader cannot type its " +
+      "result, and guessing integer is how a float would slip past. Teach it the op.")
+    return sites
+  }
+  vregSet(v, dst, ty)
+  if (op == "rt_call") { return readCallSite(c, v, sites, rest, lineNo) }
+  return sites
+}
+
+// Reads the SSA text into one `Site` per `rt_call`. Vreg numbering restarts at
+// every `func`, so the type table is cleared there. One forward pass suffices:
+// SSA dominance puts every definition ahead of its uses, and an undefined use is
+// reported rather than assumed.
+fn readSites(c: Ctx, dump: string): []Site {
+  let sites = []Site(0)
+  let lines = split(dump, "\n")
+  if (len(lines) > maxDumpLines) {
+    say(c, "the IR dump has ${len(lines)} lines, above the ${maxDumpLines} bound")
+    return sites
+  }
+  let v = Vregs{types: []string(0)}
+  for (let i = 0; i < len(lines); i = i + 1) {
+    let line = trimSpace(lines[i])
+    if (hasPrefix(line, "func ")) {
+      v = Vregs{types: []string(0)}
+      continue
+    }
+    if (hasPrefix(line, "bb")) {
+      readBlockParams(c, v, line, i + 1)
+      continue
+    }
+    if (hasPrefix(line, "%")) { sites = readInstr(c, v, sites, line, i + 1) }
+  }
+  return sites
+}

@@ -73,7 +73,7 @@
 #      quieter.
 #
 # BUCKETS: a change confined to exactly one of compiler/, runtime/,
-# tests/cases/, examples/, stdlib/, pkg/, docs/**/*.md, or spec/SPEC.md runs
+# _tests_/cases/, examples/, stdlib/, pkg/, docs/**/*.md, or spec/SPEC.md runs
 # only that area's minimal steps. A change touching any OTHER path (anything
 # unlisted below), or spanning MORE THAN ONE of those eight areas, is
 # ambiguous and always runs the full `./make test` — never a partial skip —
@@ -82,7 +82,7 @@
 #
 # `pkg/` IS THE ONE BUCKET WHOSE STEP LIST IS NOT ARGV/ENV INTERSECTION
 # (#3271, epic: first-party packages under pkg/<name>/). `test-packages`'s own
-# argv is `runArgs("tests/bit/packagesgate.bit")` — no `pkg/` path anywhere in
+# argv is `runArgs("_tests_/bit/packagesgate.bit")` — no `pkg/` path anywhere in
 # gates.bit's table for it to intersect — so it is added to the `pkg`,
 # `selfhost`, `runtime`, `stdlib`, `stdlibdocs` and `full` buckets BY HAND,
 # for the asymmetry bitlang-ws/CLAUDE.md's "First-party packages" section
@@ -100,12 +100,12 @@
 # gate's scope is not its name. Concretely: `stdlib` and `examples` both run
 # `test-fmt` (its argv literally names `${repoRoot()}/stdlib` and
 # `${repoRoot()}/examples`); `selfhost`, `runtime`, `stdlib` and `examples` all
-# run `test-lint-filelines` (tests/bit/lintfilelines.bit's own `dirs =
-# ["compiler", "runtime", "stdlib", "tests/stress", "examples", "tests/bit",
-# "tests/imports"]` — seven directories, not three; #3128 wired up the fourth
+# run `test-lint-filelines` (_tests_/bit/lintfilelines.bit's own `dirs =
+# ["compiler", "runtime", "stdlib", "_tests_/stress", "examples", "_tests_/bit",
+# "_tests_/imports"]` — seven directories, not three; #3128 wired up the fourth
 # bucket, `examples`, plus the three directories that never resolve to a
-# concrete bucket at all: `tests/bit/**`, `tests/imports/**`, and
-# `tests/stress/**` each run it too, added to the `testsbit_steps_for()`
+# concrete bucket at all: `_tests_/bit/**`, `_tests_/imports/**`, and
+# `_tests_/stress/**` each run it too, added to the `testsbit_steps_for()`
 # special-case block next to test-filesize below rather than to a bucket,
 # since all three route through the shared `testsbit` bucket instead of one
 # of the five concrete areas); `runtime` also runs `test-lint-runtime` (its own
@@ -114,10 +114,10 @@
 # `["check", "${repoRoot()}/compiler"]`); `docs` also runs `test-stdlib-docs`
 # (BIT_DOCS_ROOT — it fails on a `docs/stdlib/<mod>.md` missing a heading, same
 # as it does on an undocumented stdlib export); `testcases` also runs
-# `test-fuzz` (BIT_FUZZ_CASES=`${repoRoot()}/tests/cases` — it mutates that
-# real corpus, not a synthetic one); every tests/bit/** file also runs
-# `test-filesize` (tests/bit/filesize.bit's own stated scope: "anywhere under
-# tests/bit/, RECURSIVELY", not just its own harness file).
+# `test-fuzz` (BIT_FUZZ_CASES=`${repoRoot()}/_tests_/cases` — it mutates that
+# real corpus, not a synthetic one); every _tests_/bit/** file also runs
+# `test-filesize` (_tests_/bit/filesize.bit's own stated scope: "anywhere under
+# _tests_/bit/, RECURSIVELY", not just its own harness file).
 #
 # `selfhost` ALSO runs `test-selfcheck` (#3127), but NOT by the argv/env rule
 # above — its argv is literally `["selfcheck"]`, no path at all, because it is
@@ -160,18 +160,18 @@
 # THREE NARROW EXCEPTIONS (#2435, #3055), because registering a gate is
 # mandatory in this repo and otherwise forces `full` on every single ticket
 # that adds one:
-#   - tests/bit/**, tests/imports/**, and tests/stress/** (#2825 added the
-#     second — a new fixture directory under tests/imports/ used to fall
+#   - _tests_/bit/**, _tests_/imports/**, and _tests_/stress/** (#2825 added the
+#     second — a new fixture directory under _tests_/imports/ used to fall
 #     through to the catch-all below and force `full` on its own; #2977 added
-#     the third — tests/stress/ is the corpus tests/bit/stress/stress.bit
-#     reads by default, root + "/tests/stress", but is a different top-level
+#     the third — _tests_/stress/ is the corpus _tests_/bit/stress/stress.bit
+#     reads by default, root + "/_tests_/stress", but is a different top-level
 #     directory from its harness and so was never mapped at all) join
 #     whichever of the five areas also changed, instead of forcing `full` on
 #     their own: their own mapped gate(s) run IN ADDITION to that area's steps
 #     (#2510 — a five-area bucket used to silently replace the file's own gate
-#     instead of adding to it). If tests/bit/**/tests/imports/**/tests/stress/**
+#     instead of adding to it). If _tests_/bit/**/_tests_/imports/**/_tests_/stress/**
 #     is the ONLY thing that changed, the gates whose `Gate.argv` names each
-#     changed file (or, for tests/stress/**, the hand-named exception in
+#     changed file (or, for _tests_/stress/**, the hand-named exception in
 #     `gates_for_file()` below) run — nothing more — or `full` if any changed
 #     file cannot be mapped that way, whether or not one of the five areas
 #     also fired.
@@ -182,7 +182,7 @@
 #     tools/build/** file, or any non-additive change to these two, still
 #     forces `full` — that code is the driver every step runs under.
 #   - stdlib/** paired ONLY with its own mandatory docs/stdlib/**.md page
-#     (#3055): tests/bit/stdlibdocs.bit fails the build on any exported
+#     (#3055): _tests_/bit/stdlibdocs.bit fails the build on any exported
 #     stdlib symbol whose module lacks a docs/stdlib/<mod>.md heading, so an
 #     ordinary stdlib-export ticket is structurally required to touch both
 #     the `stdlib` and `docs` buckets in the same diff — the `bucket_count
@@ -265,7 +265,7 @@ RANGE="${RANGE:-main...HEAD}"
 # which is the same defect as a differential that prints a count and cannot fail.
 #
 # `ls-files --others` matters as much as the diffs: a brand new untracked
-# tests/cases/*.bit is exactly the change that must select a bucket, and no form
+# _tests_/cases/*.bit is exactly the change that must select a bucket, and no form
 # of `git diff` reports one.
 CHANGED="$(
   {
@@ -446,7 +446,7 @@ while IFS= read -r f; do
     # more specific case of `runtime/*` and must win it: a markdown file
     # cannot change what any gate compiles or runs.
     #
-    # docs/**/*.md compiles the code fences inside it (tests/bit/docs.bit),
+    # docs/**/*.md compiles the code fences inside it (_tests_/bit/docs.bit),
     # so it gets a REAL bucket, same shape as the five below.
     docs/*.md)
       has_docs=1
@@ -457,7 +457,7 @@ while IFS= read -r f; do
       fi
       docs_files="${docs_files:+${docs_files} }${f}"
       ;;
-    # spec/SPEC.md compiles nothing, but tests/bit/spec/ (#2758's
+    # spec/SPEC.md compiles nothing, but _tests_/bit/spec/ (#2758's
     # test-spec) DOES read it — a grammar-consistency check, not prose with no
     # gate — so it gets a REAL bucket too (#2962), matched ahead of the
     # `spec/*` no-gate arm below the same way docs/*.md is matched ahead of
@@ -490,7 +490,7 @@ while IFS= read -r f; do
       ;;
     compiler/*) has_selfhost=1 ;;
     runtime/*) has_runtime=1 ;;
-    tests/cases/*) has_testcases=1 ;;
+    _tests_/cases/*) has_testcases=1 ;;
     examples/*) has_examples=1 ;;
     stdlib/*)
       has_stdlib=1
@@ -501,12 +501,12 @@ while IFS= read -r f; do
     # anything under pkg/, so a pkg/**-only diff can only ever need this
     # bucket's own steps.
     pkg/*) has_pkg=1 ;;
-    # tests/imports/** joins tests/bit/** here (#2825), and tests/stress/**
+    # _tests_/imports/** joins _tests_/bit/** here (#2825), and _tests_/stress/**
     # joins both (#2977): all three are fixture-only paths whose gate is known
     # by name, never by path prefix, so they share has_testsbit/testsbit_list
     # end to end — see gates_for_file() above and the comment ahead of
     # testsbit_steps below.
-    tests/bit/*|tests/imports/*|tests/stress/*)
+    _tests_/bit/*|_tests_/imports/*|_tests_/stress/*)
       has_testsbit=1
       if [ -n "${testsbit_list}" ]; then
         testsbit_list="${testsbit_list} ${f}"
@@ -544,7 +544,7 @@ if [ "${has_runtime}" -eq 1 ]; then
   if [ -n "${touched_list}" ]; then touched_list="${touched_list}, runtime"; else touched_list="runtime"; fi
 fi
 if [ "${has_testcases}" -eq 1 ]; then
-  if [ -n "${touched_list}" ]; then touched_list="${touched_list}, tests/cases"; else touched_list="tests/cases"; fi
+  if [ -n "${touched_list}" ]; then touched_list="${touched_list}, _tests_/cases"; else touched_list="_tests_/cases"; fi
 fi
 if [ "${has_examples}" -eq 1 ]; then
   if [ -n "${touched_list}" ]; then touched_list="${touched_list}, examples"; else touched_list="examples"; fi
@@ -568,9 +568,9 @@ bucket_count=$((has_selfhost + has_runtime + has_testcases + has_examples + has_
 # Computed ONCE, ahead of bucket selection, regardless of whether one of the
 # five areas also fired (#2510). Two consequences fall out of computing it
 # here rather than only inside the old `has_testsbit` elif branch:
-#   - an UNMAPPED tests/bit/**, tests/imports/**, or tests/stress/** file must
+#   - an UNMAPPED _tests_/bit/**, _tests_/imports/**, or _tests_/stress/** file must
 #     force `full` even when it rides alongside a bucket, exactly like it
-#     already did when tests/bit/** was the only change — so
+#     already did when _tests_/bit/** was the only change — so
 #     `testsbit_unmapped` is checked ahead of every concrete bucket below, not
 #     after all five have had a chance to win.
 #   - a MAPPED file's gate(s) are available to be unioned into whichever
@@ -596,7 +596,7 @@ elif [ "${bucket_count}" -eq 2 ] && [ "${has_stdlib}" -eq 1 ] && [ "${has_docs}"
   # THIRD NARROW EXCEPTION (#3055) — see the header comment block above and
   # stdlib_docs_pairing_ok() for what this requires. Guarded by
   # testsbit_unmapped here (rather than only in the elif below) so an
-  # unmapped tests/bit/** file riding alongside stdlib+docs still forces
+  # unmapped _tests_/bit/** file riding alongside stdlib+docs still forces
   # `full` exactly as it did before this exception existed.
   BUCKET="stdlibdocs"
   REASON="only stdlib/** and its paired docs/stdlib/**.md changed (${touched_list})"
@@ -605,7 +605,7 @@ elif [ "${bucket_count}" -gt 1 ]; then
   REASON="spans more than one bucket: ${touched_list}"
 elif [ "${testsbit_unmapped}" -eq 1 ]; then
   BUCKET="full"
-  REASON="tests/bit/**, tests/imports/**, or tests/stress/** changed but at least one file could not be mapped to a gate by name — falling through to full"
+  REASON="_tests_/bit/**, _tests_/imports/**, or _tests_/stress/** changed but at least one file could not be mapped to a gate by name — falling through to full"
 elif [ "${has_selfhost}" -eq 1 ]; then
   BUCKET="selfhost"
   REASON="only compiler/** changed"
@@ -614,7 +614,7 @@ elif [ "${has_runtime}" -eq 1 ]; then
   REASON="only runtime/** changed"
 elif [ "${has_testcases}" -eq 1 ]; then
   BUCKET="testcases"
-  REASON="only tests/cases/** changed"
+  REASON="only _tests_/cases/** changed"
 elif [ "${has_examples}" -eq 1 ]; then
   BUCKET="examples"
   REASON="only examples/** changed"
@@ -632,13 +632,13 @@ elif [ "${has_spec}" -eq 1 ]; then
   REASON="only spec/SPEC.md changed"
 elif [ "${has_testsbit}" -eq 1 ]; then
   BUCKET="testsbit"
-  REASON="only tests/bit/**, tests/imports/**, or tests/stress/** changed (gate(s): ${testsbit_steps})"
+  REASON="only _tests_/bit/**, _tests_/imports/**, or _tests_/stress/** changed (gate(s): ${testsbit_steps})"
 elif [ "${has_noop}" -eq 1 ]; then
   BUCKET="noop"
   REASON="matched only path(s) known to be pure documentation with no gate: ${noop_list}"
 else
-  # Nothing in the five buckets, docs/**/*.md, spec/SPEC.md, tests/bit/**,
-  # tests/imports/**, or a known no-gate prose path changed, has_other is 0,
+  # Nothing in the five buckets, docs/**/*.md, spec/SPEC.md, _tests_/bit/**,
+  # _tests_/imports/**, or a known no-gate prose path changed, has_other is 0,
   # and CHANGED is non-empty — the only
   # way here is a purely-additive tools/build/defs.bit/gates.bit registration
   # with no accompanying harness or source change. Nothing to scope narrowly

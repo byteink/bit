@@ -1,0 +1,199 @@
+// _tests_/bit/deferblock.bit — regression gate for #3443: a `defer` with
+// arguments (or a receiver) inside a bare, unconditional `{ }` block used to
+// panic `bit build` with a location-free `index out of range` — #2378's
+// E0092 refusal (deferScopeEnd) never fires for a bare block since it is
+// unconditional, and lowering indexed the deferred call's captured-argument
+// env slots after the block's own scope truncation had already dropped them.
+//
+// NOT placed in _tests_/cases/: that corpus is swept by every
+// scripts/selfhost-diff*.sh differential (CORPUS="stdlib examples
+// _tests_/cases _tests_/imports" in scripts/selfhost-diffdump.sh) against the
+// PINNED STAGE0 oracle (0.1.23, commit 2523897d) — and stage0 panics on this
+// exact program too (verified directly against /opt/homebrew/bin/bit, no
+// override). A fixture in that corpus that crashes the oracle would redden
+// every differential by construction — the same "route it to _tests_/bit/
+// behind a registered gate" treatment #3425's _tests_/bit/classkeyword.bit
+// documents for a not-yet-released diagnostic. So this drives the CLI
+// directly instead, outside the oracle-swept corpus.
+//
+// Covers a free-function call, a receiver method call, a zero-argument call
+// (already correct before #3443; kept as a regression control), two defers
+// in one block (LIFO order must hold across the block boundary), and a block
+// that terminates via `return` (the "already replayed, drop it" path,
+// mirroring deferScopeEnd's terminated branch) beside ones that fall through
+// (the "still pending, rehome its slot" path).
+//
+// WIRED INTO `./make test` as `test-deferblock` (tools/build/gates.bit,
+// tools/build/defs.bit).
+
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir } from "std/fs"
+import { parseInt, trimSpace } from "std/strings"
+
+const defaultTimeoutS: int = 60
+const maxTimeoutMs: int = 6000000
+
+fn requiredEnv(name: string): string {
+  let v = env(name)
+  if (v == "") {
+    eprint("deferblock: ${name} is not set — refusing to guess.\n")
+    exit(2)
+  }
+  return v
+}
+
+fn timeoutMs(): int {
+  let raw = trimSpace(envOr("BIT_TEST_TIMEOUT_S", ""))
+  if (raw == "") {
+    return defaultTimeoutS * 1000
+  }
+  let s = parseInt(raw) catch _ {
+    return defaultTimeoutS * 1000
+  }
+  if (s <= 0) {
+    return maxTimeoutMs
+  }
+  if (s * 1000 > maxTimeoutMs) {
+    return maxTimeoutMs
+  }
+  return s * 1000
+}
+
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+// The fixture: covers every shape #3443 broke (free-function-with-arg
+// receiver-method, zero-arg control, two-in-one-block LIFO, terminates-early)
+// in a single program with a fixed, order-sensitive stdout.
+fn fixtureSrc(): string {
+  return "class C {\n  n: int,\n\n  bump() {\n    this.n = this.n + 1\n  }\n" +
+    "  show() {\n    print(\"show\\n\")\n  }\n}\n" +
+    "fn note(s: string) {\n  print(s)\n}\n\n" +
+    "fn oneArg() {\n  { defer note(\"one-arg\\n\") }\n  print(\"after one-arg\\n\")\n}\n\n" +
+    "fn receiver() {\n  let c = C{ n: 0 }\n  { defer c.show() }\n  print(\"after receiver\\n\")\n}\n\n" +
+    "fn zeroArg() {\n  { defer note(\"zero-arg\\n\") }\n}\n\n" +
+    "fn twoDefers() {\n  {\n    defer note(\"first\\n\")\n    defer note(\"second\\n\")\n  }\n  print(\"after two\\n\")\n}\n\n" +
+    "fn terminates(c: C) {\n  {\n    defer c.bump()\n    return\n  }\n}\n\n" +
+    "fn main() {\n" +
+    "  oneArg()\n  receiver()\n  zeroArg()\n  twoDefers()\n" +
+    "  let t = C{ n: 0 }\n  terminates(t)\n" +
+    "  if (t.n == 1) {\n    print(\"terminates ok\\n\")\n  } else {\n    print(\"terminates bad\\n\")\n  }\n" +
+    "}\n"
+}
+
+const wantOut: string =
+  "after one-arg\n" +
+  "one-arg\n" +
+  "after receiver\n" +
+  "show\n" +
+  "zero-arg\n" +
+  "after two\n" +
+  "second\n" +
+  "first\n" +
+  "terminates ok\n"
+
+// Builds `srcPath` to `outPath`, with the compiler's own environment
+// (BIT_STDLIB/BIT_LIBBITRT) exported. Returns the wrapper's exit code and
+// captured stderr.
+fn buildOne(bin: string, stdlib: string, libbitrt: string, dir: string, srcPath: string, outPath: string): (int, string) {
+  let shPath = dir + "/build.sh"
+  let errPath = dir + "/build.err"
+  let script = "#!/bin/sh\n" +
+    "BIT_STDLIB=" + shQuote(stdlib) + "\nexport BIT_STDLIB\n" +
+    "BIT_LIBBITRT=" + shQuote(libbitrt) + "\nexport BIT_LIBBITRT\n" +
+    "exec " + shQuote(bin) + " build " + shQuote(srcPath) + " -o " + shQuote(outPath) +
+    " > /dev/null 2> " + shQuote(errPath) + "\n"
+  writeFile(shPath, script) catch e {
+    eprint("deferblock: cannot write build wrapper: ${e.message()}\n")
+    teardown(dir, timeoutMs())
+    exit(2)
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    eprint("deferblock: cannot chmod build wrapper\n")
+    teardown(dir, timeoutMs())
+    exit(2)
+  }
+  let code = osRunBounded(shPath, timeoutMs())
+  let err = readFile(errPath) catch _ { "" }
+  return code, err
+}
+
+// Runs the built binary at `binPath`. Returns its exit code and stdout.
+fn runOne(dir: string, binPath: string): (int, string) {
+  let shPath = dir + "/run.sh"
+  let outPath = dir + "/run.out"
+  let script = "#!/bin/sh\nexec " + shQuote(binPath) + " > " + shQuote(outPath) + " 2>&1\n"
+  writeFile(shPath, script) catch e {
+    eprint("deferblock: cannot write run wrapper: ${e.message()}\n")
+    teardown(dir, timeoutMs())
+    exit(2)
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    eprint("deferblock: cannot chmod run wrapper\n")
+    teardown(dir, timeoutMs())
+    exit(2)
+  }
+  let code = osRunBounded(shPath, timeoutMs())
+  let out = readFile(outPath) catch _ { "" }
+  return code, out
+}
+
+// `exit()` does not run pending defers (documented on `std/os.exit` itself,
+// #3677) — a `defer teardown(scratch, ms)` registered in main() would never
+// fire on any of its exit(1)/exit(2) branches, leaking `scratch` under
+// $TMPDIR on every run. Call it explicitly at every exit site instead.
+fn teardown(scratch: string, ms: int) {
+  let shPath = scratch + "/rm.sh"
+  writeFile(shPath, "#!/bin/sh\nrm -rf '${scratch}'\n") catch _ { return }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    return
+  }
+  osRunBounded(shPath, ms)
+}
+
+fn main() {
+  let bin = requiredEnv("BIT_BIN")
+  let stdlib = requiredEnv("BIT_STDLIB")
+  let libbitrt = requiredEnv("BIT_LIBBITRT")
+
+  let scratch = envOr("TMPDIR", "/tmp") + "/bit-deferblock-${timeUnixNs()}"
+  mkdir(scratch) catch e {
+    eprint("deferblock: cannot create scratch directory ${scratch}: ${e.message()}\n")
+    exit(2)
+  }
+
+  let srcPath = scratch + "/deferblock_fixture.bit"
+  writeFile(srcPath, fixtureSrc()) catch e {
+    eprint("deferblock: cannot write ${srcPath}: ${e.message()}\n")
+    teardown(scratch, timeoutMs())
+    exit(2)
+  }
+
+  let outPath = scratch + "/deferblock_out"
+  let (buildCode, buildErr) = buildOne(bin, stdlib, libbitrt, scratch, srcPath, outPath)
+  if (buildCode != 0) {
+    eprint("deferblock: FAIL — the fixture failed to build (exit ${buildCode}):\n${buildErr}\n")
+    teardown(scratch, timeoutMs())
+    exit(1)
+  }
+  let (runCode, out) = runOne(scratch, outPath)
+  if (runCode != 0 || out != wantOut) {
+    eprint("deferblock: FAIL — ran wrong: exit=${runCode}\n  want: ${wantOut}\n  got:  ${out}\n")
+    teardown(scratch, timeoutMs())
+    exit(1)
+  }
+
+  teardown(scratch, timeoutMs())
+  print("PASS deferblock: defer-with-arguments and defer-with-receiver inside a bare block build and run correctly\n")
+}

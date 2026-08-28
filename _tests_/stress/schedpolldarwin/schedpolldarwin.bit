@@ -1,0 +1,221 @@
+// The scheduler's netpoller (#1364) against a REAL kernel, Darwin/kqueue.
+//
+// This is the half of the poller that cannot be tested with a fake: the timer
+// queue's clock is a parameter, so `_tests_/stress/schedtimer` can drive it
+// exactly, but a poller's whole job is to agree with the kernel about a class
+// layout and a set of flag constants. Every one of those is a value that a
+// wrong guess reproduces as silence — a misparsed `udata` unparks a garbage
+// pointer, a wrong filter registers interest in the wrong direction, and both
+// look like "the task just never woke". So this program registers a real pipe
+// with a real kqueue and makes a real task wake on it.
+//
+// Darwin-only by construction, hence the sibling `darwin-only` marker: it binds
+// runtime/sched/darwin, which reaches libSystem through `extern function`
+// (SPEC §11.7) — rejected on Linux even for an uncalled declaration. Its twin
+// ../schedpolllinux runs the identical properties against epoll, so a
+// divergence between the two means a real platform difference rather than a
+// spelling one.
+
+import { schedInit, schedWorkerAt, schedWorkerRun, schedNoTimers } from "../../../runtime/sched"
+import { schedSetPollFd, pollRead, schedTaskInit, schedRegister } from "../../../runtime/sched"
+import { schedSpawn, schedShutdown, schedTaskExit, schedPark } from "../../../runtime/sched"
+import { schedStackAligned, schedStackBytes, taskAt, taskState, taskParked } from "../../../runtime/sched"
+import { pollCreate, pollClose, pollRegister, pollDrain } from "../../../runtime/sched/darwin"
+
+// int pipe(int fds[2]); ssize_t write(int, const void *, size_t);
+// Only C-representable types cross the boundary (§11.7).
+extern fn pipe(fds: *u8): i32
+extern fn write(fd: i32, buf: *u8, n: i64): i64
+
+const pollWorkers: int = 1
+
+let schedBlock: [16]i64
+let workerBlocks: [292]i64
+// Two 256KiB stacks inside a 768KiB region, so two 256KiB-aligned bases exist
+// whatever address the linker gives the array.
+let stackArea: [98304]i64
+let waiterTask: [32]i64
+let waiterTask2: [32]i64
+
+// `int fds[2]` — TWO PACKED 32-BIT FIELDS IN ONE 8-BYTE WORD, so this is an
+// `[1]i64` read through a byte cursor rather than the `[2]i32` it looks like.
+// A Bit array stores one 8-BYTE WORD per element (§11.8), so `[2]i32` would be
+// SIXTEEN bytes and the kernel's 8-byte write would land entirely inside
+// element 0 — `pipeFds[1]` would then read uninitialised memory as a file
+// descriptor. That is exactly what the first version of this file did, and it
+// SIGSEGV'd before printing a single line. Same bridge runtime/park/darwin
+// documents for `mach_timebase_info`, and the trap the brief warns has now
+// bitten six agents.
+let pipeFds: [1]i64
+let pipeFds2: [1]i64
+let writeBuf: [1]i64
+
+// Observations. Untraced module state (§11.11): written from a green thread,
+// read by the driver, and never walked by the collector.
+let obsWoke: i64 = 0
+let obsWoke2: i64 = 0
+let addrWoke: i64 = 0
+let addrWoke2: i64 = 0
+let addrSched: i64 = 0
+
+// The largest number of events any single `pollDrain` returned.
+//
+// THIS EXISTS BECAUSE A ONE-EVENT TEST CANNOT SEE THE STRIDE. `pollDrain` walks
+// the kernel's answer with `i * keventSize + kqUdataOff`; with a single ready
+// event `i` is always 0, so the stride is multiplied by zero and a completely
+// wrong `keventSize` passes. That is a vacuous guard of exactly the kind this
+// project has now found ten of, and it was vacuous here until this counter was
+// added — mutating `keventSize` from 32 to 40 (the natural-alignment answer,
+// which is the wrong guess a reader is most likely to make) did NOT fail the
+// one-task version of this program.
+//
+// Two tasks on two pipes, both made ready before any worker runs, means one
+// drain returns both — and asserting `maxDrain >= 2` is what PROVES the second
+// event was decoded at a non-zero offset rather than merely hoping it was.
+let maxDrain: i64 = 0
+
+// The idle-pass budget before the program gives up and declares the wake lost.
+//
+// A wake that never arrives must FAIL, not hang — `schedWorkerRun`'s own trip
+// bound is a billion steps and would wedge the suite for hours, reporting a
+// timeout rather than a verdict. This rides the CLOCK hook while the poller is
+// the thing under test, which is the mirror of the choice ../schedtimer makes
+// (its guard rides the poller hook because timers are what it tests). A
+// termination guard must never share a code path with the property it bounds,
+// or it stops guarding exactly when it is needed — mutation-testing caught that
+// in ../schedtimer's first draft, where deleting the timer probe also deleted
+// the give-up and the program hung instead of failing.
+const idleGiveUp: int = 200000
+let idlePasses: i64 = 0
+
+fn guardClock(): int {
+  idlePasses = idlePasses + 1
+  if (int(idlePasses) > idleGiveUp) {
+    schedShutdown(taskAt(addrSched))
+  }
+  return int(idlePasses)
+}
+
+fn schedAddr(): int {
+  return int(ptrOf(schedBlock))
+}
+
+// The waiting task: register interest in the read end, then park. It is woken
+// only by `pollDrain` unparking it, so the store after the park is reached only
+// if the whole chain worked — kqueue registration, the kernel's readiness
+// report, the `udata` round trip, and `schedUnpark`.
+//
+// `@nosplit` because a green task's stack is reached by the conservative scan
+// rather than by a published safepoint frame — still true for every task body.
+//
+// REGISTERING BEFORE PARKING IS THE RACE THIS SCHEDULER HAS TO LIVE WITH.
+// the deleted native runtime's `sched` module registers from a `ParkFn`, i.e. on the worker's side of the
+// switch, strictly after the context is saved. That hook is a call through a
+// function value, which `@nosplit` rejects (E0075). So the task registers
+// first, and the window is closed at the other end: `pollDrain` wakes only
+// through `schedUnpark`, whose compare-and-exchange requires `taskParked`, and
+// `taskParked` is stored by the worker only after the context is saved. A
+// readiness report that arrives too early therefore fails the CAS and is
+// dropped — which is why the driver writes to the pipe only after observing the
+// task parked, and why a real netpoller consumer (#1366) needs this seam
+// closed properly rather than by timing.
+@nosplit fn waiterBody() {
+  schedPark()
+  atomicStore(taskAt(addrWoke), 1)
+  schedTaskExit()
+}
+
+// The second waiter, on its own pipe. Its only differences from the first are
+// which observation it sets and that IT owns the shutdown — so the loop cannot
+// end until BOTH tasks have been woken by the poller.
+@nosplit fn waiterBody2() {
+  schedPark()
+  atomicStore(taskAt(addrWoke2), 1)
+  schedShutdown(taskAt(addrSched))
+  schedTaskExit()
+}
+
+// Wraps `pollDrain` to record the largest batch any one call returned. The run
+// loop calls this instead of the provider's function directly; it forwards
+// unchanged, so it changes no scheduler behaviour. See `maxDrain`.
+fn pollTap(schedAddr: int, timeoutMs: int): int {
+  let n = pollDrain(schedAddr, timeoutMs)
+  if (i64(n) > maxDrain) {
+    maxDrain = i64(n)
+  }
+  return n
+}
+
+fn main() {
+  let s = taskAt(schedAddr())
+  schedInit(s, int(ptrOf(workerBlocks)), pollWorkers)
+  addrWoke = int(ptrOf(obsWoke))
+  addrWoke2 = int(ptrOf(obsWoke2))
+  addrSched = schedAddr()
+
+  let pfd = pollCreate()
+  let created = pfd >= 0
+  schedSetPollFd(s, pfd)
+
+  pipeFds[0] = 0
+  pipeFds2[0] = 0
+  let zb: *u8 = nil
+  let piped = int(pipe(zb + int(ptrOf(pipeFds)))) == 0
+  let piped2 = int(pipe(zb + int(ptrOf(pipeFds2)))) == 0
+  // Split each packed pair: fds[0] is the low 32 bits, fds[1] the high 32.
+  let fdWord = int(pipeFds[0])
+  let readFd = fdWord % 4294967296
+  let writeFd = fdWord / 4294967296
+  let fdWord2 = int(pipeFds2[0])
+  let readFd2 = fdWord2 % 4294967296
+  let writeFd2 = fdWord2 / 4294967296
+
+  let base = int(ptrOf(stackArea))
+  let bumped = base + schedStackBytes - 1
+  let stackBase = bumped - bumped % schedStackBytes
+  let stackBase2 = stackBase + schedStackBytes
+  let aligned = schedStackAligned(stackBase) && schedStackAligned(stackBase2)
+
+  let taskAddr = int(ptrOf(waiterTask))
+  schedTaskInit(taskAt(taskAddr), stackBase, schedStackBytes, entryOf(waiterBody), 0)
+  schedRegister(s, taskAddr)
+
+  let taskAddr2 = int(ptrOf(waiterTask2))
+  schedTaskInit(taskAt(taskAddr2), stackBase2, schedStackBytes, entryOf(waiterBody2), 0)
+  schedRegister(s, taskAddr2)
+
+  // Register BEFORE the tasks run, so each fd is armed and a task only has to
+  // park. Doing it from inside a task would need the task to reach the
+  // provider, which a `@nosplit` body cannot (an `extern` call is E0075).
+  let registered = pollRegister(pfd, readFd, pollRead, taskAddr) &&
+                   pollRegister(pfd, readFd2, pollRead, taskAddr2)
+
+  schedSpawn(s, taskAddr)
+  schedSpawn(s, taskAddr2)
+
+  // Nothing is ready yet: two empty pipes must produce no events at all. This
+  // is the negative half, and it matters as much as the positive one — a drain
+  // that reported spurious readiness would wake the tasks early and the
+  // positive check alone could not tell the difference.
+  let spurious = pollDrain(schedAddr(), 0)
+
+  // Make BOTH pipes readable before any worker runs, so the first successful
+  // drain sees two ready events at once. That is what makes the event stride
+  // load-bearing — see `maxDrain`.
+  writeBuf[0] = 0
+  let z: *u8 = nil
+  let wbuf = z + int(ptrOf(writeBuf))
+  let wrote = int(write(i32(writeFd), wbuf, i64(1))) == 1 &&
+              int(write(i32(writeFd2), wbuf, i64(1))) == 1
+
+  schedWorkerRun(schedWorkerAt(s, 0), guardClock, pollTap)
+
+  let woke = int(obsWoke) != 0 && int(obsWoke2) != 0
+  let batched = int(maxDrain) >= 2
+
+  pollClose(pfd)
+
+  println("poller ${created} ${piped} ${piped2} ${aligned}")
+  println("armed ${registered} spurious ${spurious} wrote ${wrote}")
+  println("woke ${woke} batched ${batched}")
+}

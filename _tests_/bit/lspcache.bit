@@ -1,0 +1,397 @@
+// `bit lsp` allocation gate (#2326/#2348): drives the REAL self-hosted
+// `bit lsp` binary and asserts that a REPEATED request — one whose project
+// bytes are byte-identical to the request before it — costs at least
+// `minRatio`x less than one that has to rebuild.
+//
+// WHY ALLOCATION AND NOT RSS. The bug this gate protects is volume: every
+// request re-loaded, re-parsed, re-resolved and re-type-checked the whole
+// project including the stdlib, so a hover cost a full `bit check` (measured:
+// 62,281 GC objects per hover against 60,460 for `bit check` of the same
+// directory). Process RSS cannot measure that half on its own, because the
+// small-object allocator does not return spans to the OS (#2325/#2373-#2375):
+// RSS tracks a historical high-water mark, so it would keep this gate red for a
+// reason that is not this gate's subject. `BIT_GC_STATS=1`'s exit summary is the
+// runtime's own accounting — `swept + live` is every object the run allocated —
+// and it is allocator-policy-independent and reproducible to ~0.003% here.
+//
+// WHY A RATIO AND NOT A NUMBER. Both arms are measured in the SAME run of the
+// SAME binary against the SAME fixture, so the threshold needs no absolute
+// object count that the stdlib growing by a file would invalidate. At the
+// behaviour this gate exists to reject, the two arms are the same work and the
+// ratio is ~1; with the cache it is ~70x.
+//
+// SUBPROCESS MECHANICS as _tests_/bit/lspresolve.bit: a generated `/bin/sh`
+// wrapper redirects a pre-built batch JSON-RPC transcript to stdin and both
+// output streams to files, via `osRunBounded` (ABI.md §19). The transcript ends
+// WITHOUT an `exit` notification on purpose — `exit` calls the exit() builtin,
+// which terminates the process before boot writes the `BIT_GC_STATS` summary,
+// so this gate closes stdin instead and lets `lspRun` return through `main`.
+
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir, exists } from "std/fs"
+
+const timeoutMs: int = 120000
+
+// Requests per measured arm. Large enough that the per-arm fixed cost (process
+// start, the first cold build, `didOpen`) divides out of the marginal, small
+// enough that the rebuild arm stays a few seconds.
+const reps: int = 40
+
+// A repeated request must allocate at least this many times less than one that
+// rebuilds. Measured on this fixture: ~50x with the cache, ~1x without it, so
+// the bar sits an order of magnitude clear of both.
+const minRatio: int = 20
+
+// A request that DOES rebuild must still cost measurably less than building the
+// project from cold, because the modules the edit did not touch — the stdlib,
+// every dependency — keep the trees they were parsed into. Expressed as a
+// percentage of one cold build, self-calibrating for the same reason `minRatio`
+// is. Measured on this fixture: 72% with the trees reused, 106% without, so 90
+// separates them with room on both sides.
+const maxRebuildPercentOfCold: int = 90
+
+fn failCase(msg: string) {
+  eprint("FAIL lspcache: " + msg + "\n")
+  exit(1)
+}
+
+// Wraps `s` as exactly one POSIX `/bin/sh` word.
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+fn frame(body: string): string {
+  return "Content-Length: ${len(body)}\r\n\r\n" + body
+}
+
+fn mkdirQuiet(path: string) {
+  mkdir(path) catch e { return }
+}
+
+// A scratch root whose path is already lexically canonical.
+//
+// THE TRAILING SLASH IS LOAD-BEARING, not tidiness: `$TMPDIR` on macOS ends in
+// one, so the usual `envOr("TMPDIR", "/tmp") + "/bit-..."` puts a `//` in every
+// document URI this gate sends — and `bit lsp` keys its overlay map on the raw
+// URI path while the loader looks overlays up under `pathResolve`'d paths, so a
+// doubled separator makes the server silently read the file from DISK and ignore
+// the buffer (#2410). This gate measures the cost of edits, so an ignored
+// didChange would make its rebuild arm cost nothing and the whole measurement a
+// lie — it was, until this was found.
+fn scratchRoot(): string {
+  let base = envOr("TMPDIR", "/tmp")
+  while (len(base) > 1 && base[len(base) - 1] == u8('/')) {
+    base = base[0:len(base) - 1]
+  }
+  return base + "/bit-lspcache-${timeUnixNs()}"
+}
+
+// Escapes `s` for embedding as a JSON string literal's body — the fixture
+// texts here only ever contain '"', '\' and '\n'.
+fn jsonEscape(s: string): string {
+  let out = ""
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == u8('"')) {
+      out = out + "\\\""
+    } else if (c == u8('\\')) {
+      out = out + "\\\\"
+    } else if (c == u8('\n')) {
+      out = out + "\\n"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Occurrences of `needle` in `haystack`, non-overlapping.
+fn countOf(haystack: string, needle: string): int {
+  let n = len(needle)
+  if (n == 0) {
+    return 0
+  }
+  let hits = 0
+  let i = 0
+  while (i + n <= len(haystack)) {
+    if (haystack[i:i + n] == needle) {
+      hits = hits + 1
+      i = i + n
+    } else {
+      i = i + 1
+    }
+  }
+  return hits
+}
+
+// The decimal that follows the FIRST occurrence of `key`, or -1 when `key` is
+// absent or is not followed by a digit. -1 rather than 0 is load-bearing: a
+// missing `BIT_GC_STATS` line must fail this gate, never read as "allocated
+// nothing" and satisfy it.
+fn intAfter(s: string, key: string): int {
+  let n = len(key)
+  let i = 0
+  while (i + n <= len(s)) {
+    if (s[i:i + n] == key) {
+      let j = i + n
+      let v = 0
+      let digits = 0
+      while (j < len(s) && s[j] >= u8('0') && s[j] <= u8('9')) {
+        v = v * 10 + (int(s[j]) - int(u8('0')))
+        digits = digits + 1
+        j = j + 1
+      }
+      if (digits == 0) {
+        return 0 - 1
+      }
+      return v
+    }
+    i = i + 1
+  }
+  return 0 - 1
+}
+
+// One measured run: `total` is every GC object the process allocated
+// (`swept + live` from the exit summary), `out` its stdout. `ok` false means the
+// child could not be run or reported no summary at all.
+class Run {
+  ok: bool,
+  total: int,
+  out: string,
+}
+
+fn runLsp(bin: string, scratch: string, payload: string): Run {
+  mkdirQuiet(scratch)
+  let inPath = scratch + "/in"
+  let outPath = scratch + "/out"
+  let errPath = scratch + "/err"
+  let shPath = scratch + "/w.sh"
+  writeFile(inPath, payload) catch e {
+    failCase("cannot write input payload: " + e.message())
+    return Run{ ok: false, total: 0, out: "" }
+  }
+  // `osRunBounded` forwards none of this process's environment, so both the
+  // stdlib root (the fixture imports std/strings) and the accounting flag are
+  // exported by the wrapper — _tests_/bit/lspresolve.bit's own idiom.
+  let stdlib = env("BIT_STDLIB")
+  let envLines = "BIT_GC_STATS=1\nexport BIT_GC_STATS\n"
+  if (stdlib != "") {
+    envLines = envLines + "BIT_STDLIB=" + shQuote(stdlib) + "\nexport BIT_STDLIB\n"
+  }
+  let script = "#!/bin/sh\n" + envLines + "exec " + shQuote(bin) + " lsp < " + shQuote(inPath) +
+    " > " + shQuote(outPath) + " 2> " + shQuote(errPath) + "\n"
+  writeFile(shPath, script) catch e {
+    failCase("cannot write wrapper script: " + e.message())
+    return Run{ ok: false, total: 0, out: "" }
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    failCase("cannot chmod wrapper script")
+    return Run{ ok: false, total: 0, out: "" }
+  }
+  let code = osRunBounded(shPath, timeoutMs)
+  if (code == 0 - 2) {
+    failCase("TIMED OUT after ${timeoutMs}ms (raise BIT_TEST_TIMEOUT_S)")
+    return Run{ ok: false, total: 0, out: "" }
+  }
+  if (code == 0 - 1) {
+    failCase("cannot launch wrapper script (spawn/wait failure)")
+    return Run{ ok: false, total: 0, out: "" }
+  }
+  if (code <= 0 - 100) {
+    failCase("CRASHED: killed by signal ${0 - code - 100}")
+    return Run{ ok: false, total: 0, out: "" }
+  }
+  if (code != 0) {
+    failCase("bit lsp exited ${code} on a stdin-EOF transcript")
+    return Run{ ok: false, total: 0, out: "" }
+  }
+  let errText = readFile(errPath) catch e { "" }
+  let swept = intAfter(errText, "swept=")
+  let live = intAfter(errText, "live=")
+  if (swept < 0 || live < 0) {
+    failCase("no `[bit-gc] ... swept=N live=N` summary on stderr — the run was " +
+      "not measured. stderr was:\n" + errText)
+    return Run{ ok: false, total: 0, out: "" }
+  }
+  let out = readFile(outPath) catch e { "" }
+  return Run{ ok: true, total: swept + live, out: out }
+}
+
+// The fixture module: two files, one importing std/strings, so the module graph
+// this measures includes the stdlib — the part that cannot change while an
+// editor is open and was three quarters of every request's allocation.
+//
+// `fieldType` is what the edit arm changes, so the hover this gate sends has a
+// DIFFERENT right answer before and after each edit. Only line 4 moves; the
+// hover is on line 8 either way.
+fn fixtureModel(fieldType: string): string {
+  return "import { toUpper } from \"std/strings\"\n\n" +
+    "class Task {\n  title: string,\n  done: ${fieldType},\n}\n\n" +
+    "fn shout(t: Task): string {\n  let flag = t.done\n  return toUpper(t.title)\n}\n"
+}
+
+fn fixtureOther(): string {
+  return "fn helper(): int {\n  return 7\n}\n"
+}
+
+fn main() {
+  let bin = envOr("BIT", "bit-out/bin/bit")
+  if (!exists(bin)) {
+    failCase("BIT='${bin}' does not exist — refusing to guess")
+    return
+  }
+  if (env("BIT_STDLIB") == "") {
+    failCase("BIT_STDLIB is unset — this gate needs the real std/strings source")
+    return
+  }
+  let root = scratchRoot()
+  mkdirQuiet(root)
+  let dir = root + "/proj"
+  mkdirQuiet(dir)
+  let modelPath = dir + "/model.bit"
+  let model = fixtureModel("bool")
+  writeFile(modelPath, model) catch e {
+    failCase("cannot write ${modelPath}: " + e.message())
+    return
+  }
+  writeFile(dir + "/other.bit", fixtureOther()) catch e {
+    failCase("cannot write the second fixture file: " + e.message())
+    return
+  }
+
+  let uri = "file://" + modelPath
+  let initReq = frame("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"," +
+    "\"params\":{\"processId\":null,\"rootUri\":null,\"capabilities\":{}}}")
+  let initNotif = frame("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}")
+  let didOpen = frame("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+    "\"textDocument\":{\"uri\":\"${uri}\",\"languageId\":\"bit\",\"version\":1," +
+    "\"text\":\"" + jsonEscape(model) + "\"}}}")
+  // model.bit line 8 (0-based) "  let flag = t.done": 'done' starts at character 15.
+  let hoverReq = frame("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/hover\"," +
+    "\"params\":{\"textDocument\":{\"uri\":\"${uri}\"},\"position\":{\"line\":8,\"character\":15}}}")
+  let prologue = initReq + initNotif + didOpen + hoverReq
+
+  // Arm 0: process start and nothing else — no document, so no project is ever
+  // built. Subtracting it from arm 1 leaves exactly one COLD build, the yardstick
+  // the rebuild arm has to beat.
+  let idle = runLsp(bin, root + "/idle", initReq + initNotif)
+  if (!idle.ok) { return }
+
+  // Arm 1: the fixed cost — start, open, one cold build.
+  let base = runLsp(bin, root + "/base", prologue)
+  if (!base.ok) { return }
+
+  // Arm 2: `reps` MORE hovers at the same position with the buffer untouched.
+  let repeats = ""
+  let i = 0
+  while (i < reps) {
+    repeats = repeats + hoverReq
+    i = i + 1
+  }
+  let repeat = runLsp(bin, root + "/repeat", prologue + repeats)
+  if (!repeat.ok) { return }
+
+  // Arm 3: `reps` hovers, each behind a didChange that makes the buffer TEXT
+  // different — the sustained-typing shape no request-level cache can serve,
+  // and the honest upper bound for what one request costs.
+  //
+  // Every buffer is unique (the trailing comment counts up), so every one of
+  // these requests really does rebuild; and every SECOND buffer declares the
+  // hovered field as `i64` instead of `bool`, so the replies have to alternate.
+  // That is what makes this arm a staleness test too: a cache that decided
+  // freshness from anything other than the bytes — a document version, a
+  // request signature, a timestamp — would answer `done: bool` all 41 times and
+  // still look fast.
+  let edits = ""
+  let e = 0
+  while (e < reps) {
+    let ftype = "bool"
+    if (e - (e / 2) * 2 == 1) {
+      ftype = "i64"
+    }
+    let edited = fixtureModel(ftype) + "// edit ${e}\n"
+    edits = edits + frame("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{" +
+      "\"textDocument\":{\"uri\":\"${uri}\",\"version\":${e + 2}}," +
+      "\"contentChanges\":[{\"text\":\"" + jsonEscape(edited) + "\"}]}}") + hoverReq
+    e = e + 1
+  }
+  let edit = runLsp(bin, root + "/edit", prologue + edits)
+  if (!edit.ok) { return }
+
+  let perRepeat = (repeat.total - base.total) / reps
+  let perRebuild = (edit.total - base.total) / reps
+  print("lspcache: objects per repeated request ${perRepeat}, " +
+    "per rebuilt request ${perRebuild} (base ${base.total})\n")
+  if (perRepeat < 0 || perRebuild <= 0) {
+    failCase("nonsensical marginals: repeat ${perRepeat}, rebuild ${perRebuild} " +
+      "(base ${base.total}, repeat ${repeat.total}, edit ${edit.total})")
+    return
+  }
+  if (perRepeat * minRatio > perRebuild) {
+    failCase("a repeated request allocates ${perRepeat} objects against " +
+      "${perRebuild} for one that rebuilds — under ${minRatio}x apart, i.e. the " +
+      "request is rebuilding the whole project again (#2326/#2348)")
+    return
+  }
+  print("PASS lspcache: a repeated request costs ${perRebuild / perRepeat}x less than a rebuild\n")
+
+  let cold = base.total - idle.total
+  if (cold <= 0) {
+    failCase("nonsensical cold-build cost ${cold} (base ${base.total}, idle ${idle.total})")
+    return
+  }
+  let pct = perRebuild * 100 / cold
+  print("lspcache: a rebuilt request is ${pct}% of one cold build (${perRebuild} of ${cold})\n")
+  if (pct > maxRebuildPercentOfCold) {
+    failCase("a request that rebuilds allocates ${perRebuild} objects against " +
+      "${cold} for a COLD build — ${pct}% of it, over the ${maxRebuildPercentOfCold}% " +
+      "bar, i.e. the modules the edit did not touch are being re-parsed too " +
+      "(#2348)")
+    return
+  }
+  print("PASS lspcache: an edit re-parses only the module it changed\n")
+
+  // Correctness under reuse: every one of the `reps + 1` replies carries the
+  // SAME right answer. A cache that served a stale or empty project would still
+  // be cheap, so cheapness alone is not the property under test.
+  let want = "done: bool"
+  let hits = countOf(repeat.out, want)
+  if (hits != reps + 1) {
+    failCase("expected '${want}' in all ${reps + 1} hover replies, found ${hits}:\n" +
+      repeat.out)
+    return
+  }
+  if (countOf(repeat.out, "\"id\":2,\"result\":null") != 0) {
+    failCase("a hover served from the cache replied null:\n" + repeat.out)
+    return
+  }
+  print("PASS lspcache: all ${reps + 1} repeated hovers answer '${want}'\n")
+
+  // The edit arm's replies must FOLLOW the buffer: `bool` for the prologue
+  // hover and every even edit, `i64` for every odd one.
+  let wantBool = reps / 2 + 1
+  let wantI64 = reps / 2
+  let gotBool = countOf(edit.out, "done: bool")
+  let gotI64 = countOf(edit.out, "done: i64")
+  if (gotBool != wantBool || gotI64 != wantI64) {
+    failCase("the edited hovers did not follow the buffer: expected ${wantBool} " +
+      "x 'done: bool' and ${wantI64} x 'done: i64', got ${gotBool} and ${gotI64} " +
+      "— a request was answered from a project built for text the editor has " +
+      "already replaced")
+    return
+  }
+  print("PASS lspcache: every edited hover answers for the buffer it was sent with\n")
+  print("lspcache: all scenarios passed\n")
+}

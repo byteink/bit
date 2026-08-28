@@ -1,0 +1,295 @@
+// E0078's contract (§11.7, `rejectExternForTarget`, compiler/build.bit:115): an
+// `extern fn` whose symbol is absent from the target's runtime archive — and,
+// on Darwin, also absent from libSystem — must fail the build with a specific,
+// named diagnostic, never link a program that dyld then aborts at load. This
+// is the diagnostic that has stopped a fresh clone's release build outright
+// twice: `bit_rt_fs_is_symlink_w` forced the 0.1.9 -> 0.1.10 stage0 repin, and
+// `bit_rt_safepoint_needed` had to be checked before 0.1.13 -> 0.1.15 (both
+// recorded in dist/stage0/SHA256SUMS's header). Nothing pinned its wording
+// before this file (#2861 found it quoted the removed `extern function`
+// syntax and nothing caught the drift; #2864/#3071).
+//
+// WHY THIS LIVES IN _tests_/bit/ AND NOT _tests_/cases/ OR _tests_/bit/checkercases/.
+// Both those corpora are driven exclusively through `bit check`
+// (_tests_/bit/golden.bit:416, _tests_/bit/checkerdiag.bit:344's own header). E0078
+// fires from `rejectExternForTarget`, called only by `buildIr` and gated
+// `if (!linking) { return false }` — `checkCmd` (compiler/main.bit:110) never
+// calls `buildIr` at all, deliberately: the checker is target-independent and
+// an unresolvable extern is a *link* fact, not a *type* fact. So `bit check`
+// on the fixture below never names this specific symbol and exits 0; `bit
+// build` is where E0078 fires. Confirmed empirically before writing this
+// file. (#3519: `bit check` now prints one informational line to stderr when
+// a module declares any `extern fn`, saying it did not verify §11.7
+// admissibility — but it still does not run `rejectExternForTarget`, still
+// does not name this symbol, and still exits 0.) Identical wall, identical
+// fix shape, as _tests_/bit/rootnamecollision.bit documents for its sibling
+// E0096 (same `linking` gate, right beside this one in build.bit).
+//
+// THE WORDING IS TARGET-DEPENDENT, which is why this pins three literal
+// strings rather than one. `rejectExternForTarget` reports a different `what`/
+// `note` pair on Darwin (a second legitimate source, libSystem, resolved by
+// dyld at load) than on Linux (fully static, only the merged archive). The
+// rendered diagnostic's structure (code, `-->` path, gutter, source excerpt,
+// caret span, trailing `bit: <src>: check failed`) is target-INDEPENDENT — it
+// comes from the shared `report`/renderOne machinery (compiler/diagnostics.bit),
+// not from any Darwin/Linux branch — so only the message text and the
+// `buildTargetName` tail vary; `expectedStderr` below picks the pinned text by
+// `hostTarget()`, the same builtin `rejectExternForTarget` derives its own
+// gate from.
+//
+// The aarch64-macos text below is transcribed byte-for-byte from a real
+// `bit build` run on this fixture (verified with `od -c`, not typed from
+// memory). The two Linux variants are the same template with the `what`/
+// `note` literals read directly out of compiler/build.bit's own source
+// (lines ~152-158) substituted in — this machine cannot produce a real Linux
+// run to transcribe from, but the surrounding structure is proven
+// target-independent above, so only those two fragments were sourced by
+// reading rather than running.
+//
+// Run it from the repository root:
+//     ./bit-out/bin/bit run _tests_/bit/externunresolvable.bit
+// `BIT_SELF_EXE` overrides which `bit` is exercised; unset, the compiler under
+// test is `<cwd>/bit-out/bin/bit`, resolved from a child's own `pwd`.
+import { envOr, exit } from "std/os"
+import { exists, mkdir, readFile, remove, writeFile } from "std/fs"
+import { contains, parseInt, repeat } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// One `bit build` invocation, as seen from outside it.
+class Run { code: int, out: string, err: string }
+
+// Assertion accounting. A class because Bit has no mutable module-level
+// state, and the count is the anti-vacuity marker: an empty run must not read
+// as pass.
+class Tally { checks: int, failures: int }
+
+// A build of a two-line program is well under a second; this only ever fires
+// on a hang, and a hang is a failure.
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "300")) catch _ { 300 }
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s mechanism channel, never a program exit status, so
+// each one is a named panic rather than a value any assertion could consume.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("externunresolvable: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("externunresolvable: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("externunresolvable: could not spawn ${scriptPath}")
+  }
+  if (code <= 0 - 100) {
+    panic("externunresolvable: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+// This repository's own root, discovered the same way
+// _tests_/bit/rootnamecollision.bit does: Bit has no getcwd primitive, so a
+// child's own `pwd` is the only way to recover the directory this program was
+// launched from.
+fn resolveCwd(scratch: string, ms: int): string! {
+  let cwdFile = "${scratch}/cwd.txt"
+  let code = shell("${scratch}/pwd.sh", "#!/bin/sh\npwd > '${cwdFile}'\n", ms)?
+  if (code != 0) {
+    fail newError("externunresolvable: could not read the working directory (exit ${code})")
+  }
+  return trimWs(readFile(cwdFile)?)
+}
+
+// The `bit` under test. `BIT_SELF_EXE` wins; otherwise `${cwd}/bit-out/bin/bit`
+// — never returns "": a compiler this cannot find is a hard stop, not a
+// skipped test.
+fn bitBinary(cwd: string): string! {
+  let explicit = envOr("BIT_SELF_EXE", "")
+  if (len(explicit) > 0) {
+    if (!exists(explicit)) {
+      fail newError("externunresolvable: BIT_SELF_EXE=${explicit} does not exist")
+    }
+    return explicit
+  }
+  let candidate = "${cwd}/bit-out/bin/bit"
+  if (!exists(candidate)) {
+    fail newError("externunresolvable: no compiler at ${candidate}; run this from the repository root or set BIT_SELF_EXE")
+  }
+  return candidate
+}
+
+fn clear(path: string) {
+  if (exists(path)) {
+    remove(path) catch _ { return }
+  }
+}
+
+// Runs `bit build <src> -o out.bin` with `root` as the working directory and
+// `src` a bare filename (no directory component), matching the `-->` path
+// `bit` itself renders for a same-directory invocation. The script always
+// exits 0 and writes the real status to `code.txt`, so a missing `code.txt` is
+// unmistakably "the run never happened" rather than a status some assertion
+// could mistake for success — mirrors _tests_/bit/rootnamecollision.bit's
+// `runBit`.
+fn runBuild(bit: string, root: string, capDir: string, src: string, ms: int): Run! {
+  let outPath = "${capDir}/out.txt"
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  clear(outPath)
+  clear(errPath)
+  clear(codePath)
+
+  let script = "#!/bin/sh\n" +
+    "cd '${root}' || exit 0\n" +
+    "'${bit}' build '${src}' -o out.bin > '${outPath}' 2> '${errPath}'\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/run.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("externunresolvable: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("externunresolvable: no exit code was recorded for `bit build ${src}` — the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, out: readFile(outPath)?, err: readFile(errPath)? }
+}
+
+// Records one assertion. Failures are named and the run continues, so a
+// single invocation reports every broken expectation instead of only the
+// first.
+fn check(t: Tally, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    eprint("FAIL: ${label}\n")
+  }
+}
+
+// The E0078 text `rejectExternForTarget` renders for this exact fixture, keyed
+// by `hostTarget()`'s ordinal (0=x86_64-linux, 1=aarch64-linux, 2=aarch64-macos
+// — compiler/build.bit's `buildTargetOf`). See the file header for how each
+// branch was sourced.
+fn expectedStderr(target: int): string {
+  if (target == 2) {
+    return "error[E0078]: 'extern fn' totallyBogusSymbolXYZ123 is defined neither in the runtime archive nor by libSystem, for target aarch64-macos\n" +
+      " --> ./bogus.bit:1:1\n" +
+      "  |\n" +
+      "1 | extern fn totallyBogusSymbolXYZ123(): i32\n" +
+      "  | ${repeat("^", 41)} dyld would bind it to libSystem and abort at load: only a symbol inside libbitrt.a or exported by libSystem can be resolved\n" +
+      "bit: bogus.bit: check failed\n"
+  }
+  let name = "x86_64-linux"
+  if (target == 1) {
+    name = "aarch64-linux"
+  }
+  return "error[E0078]: 'extern fn' totallyBogusSymbolXYZ123 is not defined in the runtime archive for target ${name}\n" +
+    " --> ./bogus.bit:1:1\n" +
+    "  |\n" +
+    "1 | extern fn totallyBogusSymbolXYZ123(): i32\n" +
+    "  | ${repeat("^", 41)} the Linux output is fully static: only a symbol already inside libbitrt.a can be resolved\n" +
+    "bit: bogus.bit: check failed\n"
+}
+
+// THE HEADLINE CASE: an extern declaring a symbol no target's runtime archive
+// nor libSystem defines must refuse to build, with E0078 and exactly the
+// pinned text for this host's target.
+fn checkExternUnresolvable(t: Tally, bit: string, root: string, capDir: string, ms: int): ()! {
+  writeFile("${root}/bogus.bit",
+    "extern fn totallyBogusSymbolXYZ123(): i32\n" +
+    "fn main() { totallyBogusSymbolXYZ123() }\n")?
+  let r = runBuild(bit, root, capDir, "bogus.bit", ms)?
+  check(t, r.code != 0, "exit ${r.code}, want non-zero (must not build)")
+  check(t, contains(r.err, "error[E0078]"), "no E0078 on stderr: ${r.err}")
+  check(t, r.out == "", "unexpected stdout: ${r.out}")
+  let want = expectedStderr(hostTarget())
+  check(t, r.err == want,
+    "stderr does not match the pinned E0078 wording\n--- want ---\n${want}--- got ---\n${r.err}")
+}
+
+fn runAll(t: Tally, scratch: string, ms: int) {
+  let root = "${scratch}/tree"
+  let capDir = "${scratch}/cap"
+  mkdir(root) catch e {
+    panic("externunresolvable: cannot create ${root}: ${e.message()}")
+  }
+  mkdir(capDir) catch e {
+    panic("externunresolvable: cannot create ${capDir}: ${e.message()}")
+  }
+  let cwd = resolveCwd(scratch, ms) catch e {
+    panic("externunresolvable: ${e.message()}")
+  }
+  let bit = bitBinary(cwd) catch e {
+    panic("externunresolvable: ${e.message()}")
+  }
+  checkExternUnresolvable(t, bit, root, capDir, ms) catch e {
+    panic("externunresolvable: ${e.message()}")
+  }
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-externunresolvable-${uuidFormat(uuidV4())}"
+  let t = Tally{ checks: 0, failures: 0 }
+
+  mkdir(scratch) catch e {
+    panic("externunresolvable: cannot create ${scratch}: ${e.message()}")
+  }
+  runAll(t, scratch, ms)
+
+  // The run marker: 4 is what checkExternUnresolvable asserts today; the
+  // floor only has to be tight enough that the whole case going missing
+  // trips it.
+  if (t.checks < 4) {
+    eprint("FAIL: only ${t.checks} checks ran, want at least 4\n")
+    t.failures = t.failures + 1
+  }
+  if (t.failures > 0) {
+    // `exit()` does not run pending defers (#3694, same shape as #3677) —
+    // call teardown explicitly on both the PASS and FAIL paths.
+    teardown(scratch, ms)
+    println("externunresolvable: FAIL — ${t.failures} of ${t.checks} checks failed")
+    exit(1)
+  }
+  teardown(scratch, ms)
+  println("externunresolvable: PASS — ${t.checks} checks")
+}
+
+// std/fs has no recursive remove, so the scratch tree goes the way it came.
+fn teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ { return }
+}
+
+// std/strings' trimSpace only strips ASCII spaces and tabs, not the trailing
+// newline `echo $?` writes to code.txt — this one strips both, matching
+// _tests_/bit/rootnamecollision.bit's own trimWs.
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}

@@ -1,0 +1,227 @@
+// Shared property checks for the parking providers (#1403), applied unchanged
+// to `runtime/park/linux` and `runtime/park/darwin`. The provider is taken as a
+// set of function VALUES rather than imported, which is what lets one copy of
+// these checks run against either platform — the same shape
+// _tests_/stress/alloc/props uses.
+//
+// WHAT THESE CHECKS ARE FOR. A parking primitive has exactly two ways to be
+// catastrophically wrong, and they are opposites:
+//
+//   - IT NEVER BLOCKS. The "park" returns immediately, so an idle worker spins
+//     at 100% CPU instead of waiting. This is the failure that a naive test
+//     cannot see at all: every assertion about correctness still passes,
+//     because a busy-wait computes the same answers. It is caught here by
+//     TIMING, which is the only observable that distinguishes the two — P1.
+//
+//   - IT NEVER WAKES. The park blocks forever, so the program deadlocks. Caught
+//     by P1 completing at all (its wait is bounded by a timeout, so a park that
+//     ignored the timeout would hang the suite rather than fail it — which is
+//     why every wait below is finite, and why none of these loops is unbounded;
+//     an unbounded probe loop would turn a failure into a hang, which is a
+//     Power-of-10 violation and a strictly worse outcome than a red test).
+//
+// P1 AND P2 ARE THE LOAD-BEARING PAIR. They exercise the same call with the
+// only difference being whether the compared value MATCHES the word, and they
+// assert timings that are three times apart (>=150ms vs <50ms). A park that
+// never blocks fails P1; a park that blocks when it should not fails P2; and a
+// park that ignores its `expected` argument entirely — the single likeliest
+// defect, since it is what a wrong argument ORDER produces — fails one or the
+// other whichever way it errs. Neither can pass by accident.
+//
+// WHAT IS DELIBERATELY NOT CHECKED, AND WHY IT CANNOT BE. There is no test here
+// of one thread waking another, because a Bit program today has exactly ONE OS
+// thread that runs Bit code: the deleted native runtime's `root` module pins the scheduler to a single worker,
+// and creating a second OS thread from Bit is blocked on #1404 (no way to
+// obtain a function's code entry address — see ../../../runtime/park/park.bit).
+// A wait that genuinely blocks therefore cannot be released by any Bit code in
+// the same process, so the cross-thread handoff is unobservable until #1404
+// lands. P3 checks the wake path's CONTRACT (syscall number, operation
+// encoding, argument order — via its documented no-waiter return), which is
+// where the likely defects live, but IT IS NOT A PROOF THAT A WAKE WAKES
+// ANYTHING. #1364 must not treat `parkWake` as exercised.
+//
+// The timing bounds are generous on purpose: the suite runs under load and
+// twice per program (once under BIT_GC=stress). They are still nowhere near
+// the failure they guard, which is ~0ms against a 200ms wait.
+
+import { parkWaitReady, parkWaitTimedOut, parkMinBackoffNs, parkMaxBackoffNs,
+         parkNextBackoff } from "../../../../runtime/park"
+
+// All six properties passed: P1|P2|P3|P4|P5|P6 = 1|2|4|8|16|32.
+// A bitmask rather than a count so a failure names the property that broke.
+export fn parkTotal(): int { return 63 }
+
+// How long P1 asks to wait, and the floor it must actually have waited.
+const WAIT_NS = 200000000        // 200ms
+const WAIT_FLOOR_NS = 150000000  // 150ms
+// The ceiling a non-blocking return must come in under. Disjoint from the floor
+// above by 3x, so no plausible scheduling delay can turn one into the other.
+const IMMEDIATE_CEIL_NS = 50000000 // 50ms
+const SLEEP_NS = 50000000          // 50ms
+const SLEEP_FLOOR_NS = 45000000    // 45ms
+
+// The upper bound `Scheduler.init` already asserts on its worker count.
+const MAX_CPUS = 1024
+
+export fn parkProps(waitFn: (*i32, i32, int) => int,
+                          wakeFn: (*i32, bool) => int,
+                          sleepFn: (int) => (),
+                          monoFn: () => int,
+                          cpuFn: () => int): int {
+  let mask = 0
+
+  let w = []i32(1)
+  let p = ptrOf(w)
+  atomicStore(p, 42)
+
+  // ---- P1: a matching compare really BLOCKS, and reports the timeout -------
+  //
+  // The word holds 42 and the wait is told to expect 42, so the compare
+  // succeeds and the primitive must sleep until its deadline. Both halves are
+  // asserted: the elapsed time (which is what catches a park that never
+  // blocks) and the returned status, compared against `parkWaitTimedOut`
+  // IMPORTED FROM ../../../../runtime/park. That import is what pins the
+  // providers' duplicated literal status codes to the core's constants — if a
+  // provider's spelling ever drifts from park.bit's, this comparison fails.
+  let t0 = monoFn()
+  let rc1 = waitFn(p, i32(42), WAIT_NS)
+  let t1 = monoFn()
+  let blocked = t1 - t0
+  if (rc1 == parkWaitTimedOut && blocked >= WAIT_FLOOR_NS) {
+    mask = mask | 1
+  }
+
+  // ---- P2: a mismatching compare does NOT block ---------------------------
+  //
+  // Same call, same timeout, only the expected value differs from the word.
+  // The primitive must notice up front and return without sleeping. This is
+  // the half that proves the `expected` argument is actually being compared
+  // rather than ignored — and, with P1, that it is compared against the right
+  // operand.
+  let t2 = monoFn()
+  let rc2 = waitFn(p, i32(99), WAIT_NS)
+  let t3 = monoFn()
+  let quick = t3 - t2
+  if (rc2 == parkWaitReady && quick < IMMEDIATE_CEIL_NS) {
+    mask = mask | 2
+  }
+
+  // ---- P3: waking with no waiters is benign, in both forms ----------------
+  //
+  // Nobody can be parked on `p` (see the header: there is no second Bit
+  // thread), so both wakes must report 0 woken rather than an error. This
+  // validates the syscall number, the operation encoding and the argument
+  // order — a wrong operation returns a negative code, which normalises to 0
+  // woken, so the check is deliberately paired with P1/P2 above: those prove
+  // the WAIT half of the same encoding is right.
+  let woke1 = wakeFn(p, false)
+  let wokeAll = wakeFn(p, true)
+  if (woke1 == 0 && wokeAll == 0) {
+    mask = mask | 4
+  }
+
+  // ---- P4: sleep really sleeps, and the clock is scaled correctly ---------
+  //
+  // This is two checks in one, and the second is the subtle one. Darwin's
+  // monotonic clock counts mach ticks at ~24MHz, not nanoseconds, so a
+  // provider that forgot to apply the timebase ratio would report an interval
+  // ~40x too small. Measuring a KNOWN duration with the provider's own clock
+  // catches that: an unscaled clock cannot make a 50ms sleep look like 45ms.
+  let s0 = monoFn()
+  sleepFn(SLEEP_NS)
+  let s1 = monoFn()
+  if (s1 - s0 >= SLEEP_FLOOR_NS) {
+    mask = mask | 8
+  }
+
+  // ---- P5: the monotonic clock never goes backwards -----------------------
+  //
+  // Bounded sample (Power of 10: a fixed trip count, not "until something
+  // happens"). Monotonicity is the one property the scheduler's timer queue
+  // depends on — a clock that stepped backwards would make a due deadline
+  // un-expire and strand a sleeping task.
+  let prev = monoFn()
+  let ok5 = true
+  let i = 0
+  while (i < 1000) {
+    let now = monoFn()
+    if (now < prev) {
+      ok5 = false
+    }
+    prev = now
+    i = i + 1
+  }
+  if (ok5 && prev > s0) {
+    mask = mask | 16
+  }
+
+  // ---- P6: the CPU count is sane ------------------------------------------
+  //
+  // The exact number is the machine's, so it is not assertable; what IS
+  // assertable is the range the scheduler requires. `Scheduler.init` asserts
+  // `n > 0 and n <= 1024`, so a count outside that would panic the scheduler
+  // at boot — which is precisely the bound checked here.
+  let n = cpuFn()
+  if (n >= 1 && n <= MAX_CPUS) {
+    mask = mask | 32
+  }
+
+  return mask
+}
+
+// The backoff policy KAT — platform-free, so it is checked here once and run by
+// every one of the three park programs.
+//
+// Returns 1 only if the whole schedule matches the deleted native runtime's `sched` module's
+// `backoff = @min(backoff * 2, max_backoff_ns)` seeded at `min_backoff_ns`:
+// pure doubling from 1us, saturating at 1ms and staying there.
+export fn parkBackoffKat(): int {
+  // Doubling from the minimum reaches the cap in exactly 10 steps
+  // (1000 * 2^10 = 1024000 > 1000000), and the 10th step is the clamp.
+  let expect = []int(11)
+  expect[0] = 1000
+  expect[1] = 2000
+  expect[2] = 4000
+  expect[3] = 8000
+  expect[4] = 16000
+  expect[5] = 32000
+  expect[6] = 64000
+  expect[7] = 128000
+  expect[8] = 256000
+  expect[9] = 512000
+  expect[10] = 1000000        // clamped, NOT 1024000
+
+  let cur = parkMinBackoffNs
+  let ok = cur == expect[0]
+  let k = 1
+  while (k < 11) {
+    cur = parkNextBackoff(cur)
+    if (cur != expect[k]) {
+      ok = false
+    }
+    k = k + 1
+  }
+
+  // Saturation is stable: once at the cap it stays there rather than wrapping
+  // or resuming its climb.
+  let j = 0
+  while (j < 8) {
+    cur = parkNextBackoff(cur)
+    if (cur != parkMaxBackoffNs) {
+      ok = false
+    }
+    j = j + 1
+  }
+
+  // The clamp on a caller-supplied seed (the deviation from the deleted
+  // original documented in park.bit): a zero or negative seed must come back to the floor, not stay
+  // at zero and spin forever, and an over-large seed must come back to the cap.
+  if (parkNextBackoff(0) != parkMinBackoffNs) { ok = false }
+  if (parkNextBackoff(0 - 5) != parkMinBackoffNs) { ok = false }
+  if (parkNextBackoff(parkMaxBackoffNs * 4) != parkMaxBackoffNs) { ok = false }
+
+  if (ok) {
+    return 1
+  }
+  return 0
+}

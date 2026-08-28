@@ -1,0 +1,372 @@
+// SPEC §17.4's entry-point contract, as seen from outside the compiler (#2235).
+//
+// THE PROPERTY, in one sentence: the process exit code and fd 2 say what `main`
+// actually did — a returned error prints and exits 1, a returned int IS the exit
+// code, a panic stays 2, and a `main` that succeeded prints nothing at all.
+//
+// SPEC §17.4, verbatim, is the whole specification:
+//
+//     function main() { ... }          // exit code 0 on normal return
+//     function main(): int { ... }     // returned int is the process exit code
+//     function main(): ()! { ... }     // a returned error prints to stderr, exit code 1
+//
+// THE DEFECT THIS REMOVES, which shipped in every release up to and including
+// 0.1.8. The third row did not exist in code. `fail` published the error into the
+// §18 thread-local slot, the hand-assembled `bit_main` trampoline never read it,
+// and the process exited **0 with an empty stderr**. Measured on 0.1.8, for the
+// program in `void-fail` below: `rc=0`, stdout `starting work`, stderr empty — via
+// `bit run` AND via `bit build` plus exec'ing the binary. So a deployment script, a
+// migration or a data import written in Bit reported total success on its unhappy
+// path, with the error text discarded. That is the one signal every caller has.
+//
+// Four shapes were broken and six were already correct, and the gate keeps both
+// halves: `int-fail`, `two-frames` and `try-in-main` failed the same silent way as
+// `void-fail`, while `void-ok`, `void-explicit-return`, `int-ok`, `catch-in-main`,
+// `plain-void` and `plain-int` were right on 0.1.8 and must stay right. A fix that
+// repaired only the headline program would pass a one-case gate.
+//
+// `panic-in-fallible-main` is here to pin the two codes APART. SPEC §18.4 gives a
+// panic its own non-zero exit — 2 in this implementation — and §17.4 gives a
+// returned error 1. Collapsing them would lose the distinction between "this
+// program failed" and "this program is broken", so the gate asserts both numbers,
+// from a fallible `main` in both cases.
+//
+// WHY THIS LIVES IN _tests_/bit/ AND NOT _tests_/cases/.
+//
+// The headline case asserts a NON-ZERO exit plus stderr text. `directiveOf` in
+// _tests_/bit/golden.bit offers `// panic` for that shape, and `checkRun` pins a
+// `// panic` case to exit exactly `panicExit` (2) — so exit 1 plus stderr is not
+// expressible, and bending a `// panic` case to fit would assert the wrong number
+// on purpose. _tests_/bit/ is also outside
+//     find stdlib examples _tests_/cases _tests_/imports -name '*.bit'
+// which scripts/selfhost-diffcheck.sh and the diffir family sweep with the pinned
+// 0.1.5 oracle; that matters here because the fix deliberately changes the IR of
+// every fallible `main` (the body moves to `main$fallible` and a normalizing
+// `main` wrapper appears — runtime/ABI.md §10), and the oracle predates it. Same
+// reasoning as _tests_/bit/lowerrefuse.bit and _tests_/bit/constoverflow.bit.
+//
+// BOTH PATHS, deliberately. #2235 reproduced through `bit run` and through `bit
+// build` + exec, so every case is driven both ways and the two must agree. `bit
+// run` has its own exit-code plumbing (_tests_/bit/runcmd.bit, #2019) which could
+// mask or invent a code; exec'ing the binary has none.
+//
+// ANTI-VACUITY, all of it load-bearing. Exit codes are compared as numbers and
+// both streams as EXACT strings, so a case cannot pass by printing extra. The
+// success cases assert stderr is exactly "" — an implementation that reported
+// every `main` would satisfy the failure half alone. Every capture is proved to
+// have happened (a missing `code.txt` is a hard failure, never a verdict), the
+// table's length is asserted before the loop and the iteration count after, and
+// the final line prints how many checks ran with a floor below it.
+//
+// Run it from the repository root:
+//     ./bit-out/bin/bit run _tests_/bit/mainexit.bit
+// `BIT_SELF_EXE` overrides which `bit` is exercised; unset, the compiler under
+// test is `<cwd>/bit-out/bin/bit`, resolved from a child's own `pwd`.
+import { env, envOr, exit } from "std/os"
+import { exists, mkdir, readFile, remove, writeFile } from "std/fs"
+import { parseInt } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// One child invocation, as seen from outside it.
+class Run { code: int, out: string, err: string }
+
+// Assertion accounting. A class because Bit has no mutable module-level state,
+// and the count is the anti-vacuity marker: an empty run must not read as pass.
+class Tally { checks: int, failures: int }
+
+// One program plus the exact process-visible result it owes, on both paths.
+class Case { name: string, src: string, code: int, out: string, err: string }
+
+// How long any one child gets. A build of a ten-line program is well under a
+// second; this only ever fires on a hang, and a hang is a failure.
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "300")) catch _ { 300 }
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns are
+// `osRunBounded`'s mechanism channel, never a program exit status, so each one is
+// a named panic rather than a value any assertion could consume.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("mainexit: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("mainexit: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("mainexit: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("mainexit: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+// The `bit` under test. `BIT_SELF_EXE` wins; otherwise the dev-tree build artifact
+// relative to the working directory this program was started in. Never returns ""
+// — a compiler this cannot find is a hard stop, not a skipped test.
+fn bitBinary(scratch: string, ms: int): string! {
+  let explicit = env("BIT_SELF_EXE")
+  if (len(explicit) > 0) {
+    if (!exists(explicit)) {
+      fail newError("mainexit: BIT_SELF_EXE=${explicit} does not exist")
+    }
+    return explicit
+  }
+  let cwdFile = "${scratch}/cwd.txt"
+  let code = shell("${scratch}/pwd.sh", "#!/bin/sh\npwd > '${cwdFile}'\n", ms)?
+  if (code != 0) {
+    fail newError("mainexit: could not read the working directory (exit ${code})")
+  }
+  let cwd = trimWs(readFile(cwdFile)?)
+  let candidate = "${cwd}/bit-out/bin/bit"
+  if (!exists(candidate)) {
+    fail newError("mainexit: no compiler at ${candidate}; run this from the repository root or set BIT_SELF_EXE")
+  }
+  return candidate
+}
+
+// Runs one command line with `dir` as the working directory.
+//
+// The wrapper always exits 0 and writes the real status to `code.txt`, so a
+// missing `code.txt` is unmistakably "the child never ran" rather than a status
+// some assertion could mistake for a verdict. Stale captures are deleted first for
+// the same reason: no case may read a previous case's output.
+fn runCmd(cmd: string, dir: string, capDir: string, ms: int): Run! {
+  let outPath = "${capDir}/out.txt"
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  clear(outPath)
+  clear(errPath)
+  clear(codePath)
+  let script = "#!/bin/sh\n" +
+    "cd '${dir}' || exit 0\n" +
+    "${cmd} > '${outPath}' 2> '${errPath}'\n" +
+    "echo \$? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/run.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("mainexit: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("mainexit: no exit code was recorded for `${cmd}` — the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, out: readFile(outPath)?, err: readFile(errPath)? }
+}
+
+fn clear(path: string) {
+  if (exists(path)) {
+    remove(path) catch _ { return }
+  }
+}
+
+// Records one assertion. Failures are named and the run continues, so a single
+// invocation reports every broken expectation instead of only the first.
+fn check(t: Tally, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    eprint("FAIL: ${label}\n")
+  }
+}
+
+// The corpus. Ten of these are the ten `main` shapes #2235's brief enumerated,
+// plus a user-defined error type (dispatch through a `message()` that is not
+// `errorString`'s), a `defer` that must still run before the report, and the
+// panic case that keeps 1 and 2 apart.
+//
+// `\$` in a fixture is a literal dollar in the GENERATED program — the fixtures
+// are Bit source built by Bit source, and an unescaped one would interpolate here
+// instead of there.
+fn cases(): []Case {
+  return [
+    // The ticket's own program. On 0.1.8: rc=0, stderr empty.
+    Case{ name: "void-fail",
+      src: "fn main(): ()! {\n  println(\"starting work\")\n" +
+        "  fail newError(\"could not reach the database\")\n}\n",
+      code: 1, out: "starting work\n", err: "error: could not reach the database\n" },
+    // The success path of the same signature: silent, and 0.
+    Case{ name: "void-ok",
+      src: "fn main(): ()! {\n  println(\"all good\")\n}\n",
+      code: 0, out: "all good\n", err: "" },
+    Case{ name: "void-explicit-return",
+      src: "fn main(): ()! {\n  println(\"explicit return\")\n  return\n}\n",
+      code: 0, out: "explicit return\n", err: "" },
+    // `int!`: the error arm wins over the ok value, and 1 is the code.
+    Case{ name: "int-fail",
+      src: "fn main(): int! {\n  println(\"starting work\")\n" +
+        "  fail newError(\"int main failed\")\n}\n",
+      code: 1, out: "starting work\n", err: "error: int main failed\n" },
+    // ... and its ok arm still delivers the declared int, not 0.
+    Case{ name: "int-ok",
+      src: "fn main(): int! {\n  println(\"int main ok\")\n  return 7\n}\n",
+      code: 7, out: "int main ok\n", err: "" },
+    // A `fail` two frames below `main`, propagated by `?` at each level.
+    Case{ name: "two-frames",
+      src: "fn inner(): ()! {\n  fail newError(\"deep failure\")\n}\n\n" +
+        "fn outer(): ()! {\n  inner()?\n  return\n}\n\n" +
+        "fn main(): ()! {\n  println(\"before\")\n  outer()?\n  println(\"after\")\n}\n",
+      code: 1, out: "before\n", err: "error: deep failure\n" },
+    // `?` directly in `main` on a fallible call. Note the empty stdout: the
+    // statement after it must not run.
+    Case{ name: "try-in-main",
+      src: "fn load(): int! {\n  fail newError(\"load failed\")\n}\n\n" +
+        "fn main(): ()! {\n  let v = load()?\n  println(\"got \${v}\")\n}\n",
+      code: 1, out: "", err: "error: load failed\n" },
+    // A HANDLED error must leave no trace: the slot is cleared, so 0 and silence.
+    Case{ name: "catch-in-main",
+      src: "fn load(): int! {\n  fail newError(\"load failed\")\n}\n\n" +
+        "fn main(): ()! {\n  let v = load() catch 42\n  println(\"got \${v}\")\n}\n",
+      code: 0, out: "got 42\n", err: "" },
+    // Not `errorString`: the report dispatches `message()` on whatever concrete
+    // type was failed, so a program's own error type renders its own text.
+    Case{ name: "custom-error-type",
+      src: "class dbError {\n  code: int\n\n  message(): string {\n" +
+        "    return \"db error code \${this.code}\"\n  }\n}\n\n" +
+        "fn main(): ()! {\n  println(\"go\")\n  fail dbError{ code: 7 }\n}\n",
+      code: 1, out: "go\n", err: "error: db error code 7\n" },
+    // §18.5: `fail` is an exit path, so the defer runs — and it runs BEFORE the
+    // report, which the stdout/stderr split here pins.
+    Case{ name: "defer-then-fail",
+      src: "fn main(): ()! {\n  defer println(\"cleanup ran\")\n  println(\"go\")\n" +
+        "  fail newError(\"with defer\")\n}\n",
+      code: 1, out: "go\ncleanup ran\n", err: "error: with defer\n" },
+    // §18.4 keeps its own code. If this ever reads 1, the two failure kinds have
+    // been collapsed.
+    Case{ name: "panic-in-fallible-main",
+      src: "fn main(): ()! {\n  println(\"go\")\n  panic(\"boom\")\n}\n",
+      code: 2, out: "go\n", err: "panic: boom\n" },
+    // The two shapes that were never broken, kept so a regression in the wrapper's
+    // detection (it must fire for a fallible `main` and for nothing else) shows up.
+    Case{ name: "plain-void",
+      src: "fn main() {\n  println(\"plain void\")\n}\n",
+      code: 0, out: "plain void\n", err: "" },
+    Case{ name: "plain-int",
+      src: "fn main(): int {\n  println(\"plain int\")\n  return 3\n}\n",
+      code: 3, out: "plain int\n", err: "" },
+  ]
+}
+
+const caseCount: int = 13
+
+// Asserts one child's exit code and both streams against `c`. `path` names which
+// of the two routes produced it, so a divergence says which one.
+fn expectRun(t: Tally, c: Case, path: string, r: Run) {
+  check(t, r.code == c.code, "${c.name}/${path}: exit ${r.code}, want ${c.code}")
+  check(t, r.out == c.out, "${c.name}/${path}: stdout '${r.out}', want '${c.out}'")
+  check(t, r.err == c.err, "${c.name}/${path}: stderr '${r.err}', want '${c.err}'")
+}
+
+// Route 1: `bit run <file>`.
+fn checkRunPath(t: Tally, bit: string, dir: string, capDir: string, ms: int): ()! {
+  let cs = cases()
+  check(t, len(cs) == caseCount, "case table has ${len(cs)} entries, want ${caseCount}")
+  let ran = 0
+  for c of cs {
+    let file = "m_${c.name}.bit"
+    writeFile("${dir}/${file}", c.src)?
+    expectRun(t, c, "run", runCmd("'${bit}' run '${file}'", dir, capDir, ms)?)
+    ran = ran + 1
+  }
+  check(t, ran == caseCount, "only ${ran} of ${caseCount} cases ran via `bit run`")
+}
+
+// Route 2: `bit build <file> -o <bin>`, then exec the binary. No `bit` in the
+// process tree at the moment the exit code is produced.
+fn checkBuildPath(t: Tally, bit: string, dir: string, capDir: string, ms: int): ()! {
+  let cs = cases()
+  let ran = 0
+  for c of cs {
+    let file = "b_${c.name}.bit"
+    let bin = "${dir}/b_${c.name}.bin"
+    clear(bin)
+    writeFile("${dir}/${file}", c.src)?
+    let b = runCmd("'${bit}' build '${file}' -o '${bin}'", dir, capDir, ms)?
+    check(t, b.code == 0, "${c.name}/build: compile exited ${b.code} — stderr: ${b.err}")
+    check(t, exists(bin), "${c.name}/build: no binary at ${bin}")
+    if (b.code != 0 || !exists(bin)) {
+      continue
+    }
+    expectRun(t, c, "exec", runCmd("'${bin}'", dir, capDir, ms)?)
+    ran = ran + 1
+  }
+  check(t, ran == caseCount, "only ${ran} of ${caseCount} cases ran via `bit build` + exec")
+}
+
+// Both routes against a scratch directory built fresh. Split out of `main` so each
+// stays inside the repo's own max-fn-lines limit.
+fn runAll(t: Tally, scratch: string, ms: int) {
+  let dir = "${scratch}/src"
+  let capDir = "${scratch}/cap"
+  mkdir(dir) catch e { panic("mainexit: cannot create ${dir}: ${e.message()}") }
+  mkdir(capDir) catch e { panic("mainexit: cannot create ${capDir}: ${e.message()}") }
+  let bit = bitBinary(scratch, ms) catch e { panic("mainexit: ${e.message()}") }
+  checkRunPath(t, bit, dir, capDir, ms) catch e { panic("mainexit: ${e.message()}") }
+  checkBuildPath(t, bit, dir, capDir, ms) catch e { panic("mainexit: ${e.message()}") }
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-mainexit-${uuidFormat(uuidV4())}"
+  let t = Tally{ checks: 0, failures: 0 }
+
+  mkdir(scratch) catch e {
+    panic("mainexit: cannot create ${scratch}: ${e.message()}")
+  }
+  runAll(t, scratch, ms)
+
+  // The run marker: a gate that stopped checking is visible here rather than
+  // green. 13 cases x 3 assertions on the run route + 13 x 5 on the build route
+  // (2 build assertions + 3 exec) + 3 table/loop assertions = 107.
+  if (t.checks < 107) {
+    eprint("FAIL: only ${t.checks} checks ran, want at least 107\n")
+    t.failures = t.failures + 1
+  }
+  if (t.failures > 0) {
+    // `exit()` does not run pending defers (#3694, same shape as #3677) —
+    // call teardown explicitly on both the PASS and FAIL paths.
+    teardown(scratch, ms)
+    println("mainexit: FAIL — ${t.failures} of ${t.checks} checks failed")
+    exit(1)
+  }
+  teardown(scratch, ms)
+  println("mainexit: PASS — ${t.checks} checks")
+}
+
+// std/fs has no recursive remove, so the scratch tree goes the way it came.
+fn teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ { return }
+}
+
+// `std/strings`' `trimSpace` stops at spaces and tabs, and every capture here
+// arrives newline-terminated from a shell redirect.
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}

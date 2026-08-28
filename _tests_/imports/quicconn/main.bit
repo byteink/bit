@@ -1,0 +1,721 @@
+// std/quic QUIC v1 transport core (#1220): a full connection over a local UDP
+// pair, driven by two green-thread endpoints (spawn + channels). Eleven
+// scenarios (was miscounted "nine" pre-#3557; ten predate it, #3557 adds one):
+//
+//   * direct — complete the QUIC-TLS handshake, open a client bidi stream,
+//     transfer a 96 KiB payload, and assert byte-identical delivery (the
+//     received SHA-256 equals the sent one). The payload is three times the
+//     32 KiB flow-control window, so it exercises multiple packets, MAX_DATA /
+//     MAX_STREAM_DATA window extension, and NewReno pacing.
+//
+//   * loss — the same transfer, but a shim relay between the endpoints drops a
+//     deterministic fraction of the 1-RTT datagrams (never the handshake), so
+//     retransmission (packet-threshold + PTO) must recover the whole stream.
+//
+//   * listener — accept two connections on one shared socket, close the first,
+//     then require a round trip on the second and a brand-new third connection.
+//     Closing one accepted connection used to close the listener's socket (#1473).
+//
+//   * idle — blackhole the peer after the handshake and require a thread parked
+//     in `finish` to come back with an error in bounded time (#1449/#1474).
+//
+//   * idleslow — the same blackhole, but above the RFC 9002 PTO backoff
+//     ceiling, where a broken timer re-arm is actually distinguishable from a
+//     correct one on the wall clock (#3557; `idle` cannot see this at 500 ms).
+//
+//   * reset — the client resets a freshly-opened stream; the server's first
+//     `read` on it must return a reset chunk promptly rather than hang on data
+//     that will never arrive (#3229).
+//
+//   * resetnodata — the client resets a stream it never wrote to, so RESET_STREAM
+//     is the very first frame the server ever sees for that stream id; the
+//     server's `acceptStream` must still return it instead of hanging forever
+//     (#3232).
+//
+//   * streamlimit — open the peer's advertised 16-stream limit, then require the
+//     17th `openStream` to fail distinctly instead of the limit going
+//     unenforced (#3229).
+//
+//   * streamlimitinbound — the missing inbound half of `streamlimit`: a peer
+//     (the server here) referencing more than 16 distinct stream ids must be
+//     refused with a connection close, not grow an unbounded entry per id
+//     (#3247). The first 16 must still deliver normally, proving the check
+//     counts distinct ids in bounds rather than misfiring on legitimate traffic.
+//
+//   * stopsendingnodata — the client opens a stream and immediately asks the
+//     peer to stop sending on it, with zero prior writes, so STOP_SENDING is
+//     the very first frame the server ever sees for that stream id; the
+//     server's `acceptStream` must still return it instead of hanging until
+//     the idle timeout (#3243, the StopSending half of #3232's fix).
+//
+//   * lowerstreamopen — a reference to the 6th client-bidi stream, with the
+//     first 5 opened locally but never written to, must implicitly open all
+//     6 (RFC 9000 §2.1's "every lower-numbered stream of the same type"), not
+//     only the one actually referenced (#3243).
+//
+// Every printed line is a boolean, a byte count, a content hash, or a fixed
+// error string — nothing timing-dependent — so the golden is stable across
+// targets and schedules.
+//
+// This program is NOT run under `BIT_GC=stress`, and that hole is declared and
+// argued in _tests_/bit/stress/stress.bit rather than left to be inferred (#1475): a QUIC-TLS
+// handshake is millions of loop back-edges, stress collects at every one of them,
+// and even a 1-byte payload does not finish in 300s. It is not a QUIC defect —
+// `_tests_/imports/cryptorsa` behaves the same way — and it is not the #1462
+// no-safepoint shape, which the measurements there rule out explicitly.
+import { dialQuic, acceptQuic, listenQuic, Conn, Listener, Stream, StreamChunk } from "std/quic"
+import { udpBind, UdpSocket } from "std/net"
+import { monotonic, since } from "std/time"
+import { newSha256, encodeHex, decodeHex, pemEncode } from "std/crypto"
+
+const caHex: string = "308203343082021ca00302010202147a41595b201213a150211bd80e3675b37dca46b1300d06092a864886f70d01010b050030323119301706035504030c10426974205465737420526f6f7420434131153013060355040a0c0c426974205465737420504b49301e170d3236303731313131343535385a170d3336303730383131343535385a30323119301706035504030c10426974205465737420526f6f7420434131153013060355040a0c0c426974205465737420504b4930820122300d06092a864886f70d01010105000382010f003082010a028201010098f8ba065685597f71734c9b91a2776948f635bb81fe386746877777af0a4b0393bbf34f7a6119438154454faab68f647d782771af85495d063bae956ab80e81a6d1d7b25a67d4e34f2c2702a36e56aebdcf53c6b63a5ac5279c7c5a655c9f21ce2937ed8c097003af0ac87edac572a6fe169bb25c4fc0030513e0702f1a42c7274f294dd0e1f625310b21ca28a42062bf03b3fc7a27237ae4baf4511f8015a221dc53b2462facfb403e928338096e617c344e9084ec2070594db0541f88beea9d643d8e6a7bf58047ae3e81fc2745344c44ea739918fe3f976f9ff79a64beb947ea65a83e7c63250064de1f38a59e48beef30c135d96aebe07b2f7bb27c9e730203010001a3423040300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106301d0603551d0e04160414df41e90ebf24804aaa0ef33e59374d14c3d17adb300d06092a864886f70d01010b0500038201010054d76a48852a9d62ba2a670d689bafcba37d3f7d3bc904fd867a494dba087bc5b846d215ab0450512d846f341e40808a003f88496e0fd4d59924f422af7c2604cbe6157782f71f45b029cdced03a7ecd1790abc3d5d832316596df9bbe6b893c610ae171feda2b3c67827158f3a082c81ce6b4ab6b74fa35a2d85e0015b447b0ed6425e9e72d82b1a0ba631ce3fc9b2f35a40dc5317b4ca74cd8b43ff0d086a55e9dcd6b727ac7478678536568352e4bcae334b2e1d72518cbacd37c9062073bc9e937373b2202a9c1782b485071257eddc7af78a1c5503559fc2f1a6e0e39625aa85ccf90f881318f55c3fc0b9e05440aecb12220ddf921f961ebb7580aff6b"
+const leafHex: string = "308203833082026ba003020102021414c7140ea3acd77bf06dc5820f6a01a116e5187f300d06092a864886f70d01010b050030323119301706035504030c10426974205465737420526f6f7420434131153013060355040a0c0c426974205465737420504b49301e170d3236303731313131343535385a170d3336303730383131343535385a302c3112301006035504030c096c6f63616c686f737431163014060355040a0c0d4269742054657374204c65616630820122300d06092a864886f70d01010105000382010f003082010a0282010100dd84b94dc3c7f6812fd9cf5510d2bb39a591054abdb85ef809d1d2353165b98a73a3103c7a98e7abb1b93cbe3d768c827b054697ab80cb36896f3bf94c5e1cbb115d09948f063126d6b0696679630313b5edc386fb58c8b40210418821f7d6ab8f7c2cb313b78b039d27c6fb07131434d7fa4a1513881f53e7cdba9b9055341300085ba30a4ebcd69367d088b6eda97b62df743ce343050cac87d12462dc5b05f419e5d384098cb3ef1c17b41b276473ecd16dbb0aac68d2330cd9312cb99b1b4e0ff671fc745726abf76d0eddbc49179188a00fb5d4d72b3bcea0fd14f8e97ce036631e55516f653faaec62baad58bc09460749750b23e1fa4bd6be1033d45f0203010001a3819630819330090603551d1304023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b0601050507030130210603551d11041a301882096c6f63616c686f7374820b6578616d706c652e636f6d301d0603551d0e04160414420e26d56f5890db5c5af8acd12d8156b58b91d8301f0603551d23041830168014df41e90ebf24804aaa0ef33e59374d14c3d17adb300d06092a864886f70d01010b05000382010100047da02b5b77beaa777d0efcc2bba1e46bc92714e7a75385f58af99f75441123a372d565e5009b472ba7f76bc7be854b968a04687e6f6840b5fa0b830aeadee63f8795cf675f6cb8bd5226205f0aedf3465ed578893627939b390f09bd33d34189ab61f064b0fe566bdd5cb9e5b78cb638fb2540eaee946a77fa780342643c10584b9b0f87d9001751bb25e6a3ee4a03a971160eb24ae80d2ed015d348eefb8e55444d7d05a7fe04e069a26bcaab1ca97ad82d9e25201f7bc81fec23143a9af66572595aef86aa1f34a57584cc7ef4a5e3e2f4ffd543b776d232dd37a00ff272c13f6dfe3fc9f2a472a2d7c6738399a11b0417e004874baf20405fba9cba214b"
+const keyHex: string = "308204be020100300d06092a864886f70d0101010500048204a8308204a40201000282010100dd84b94dc3c7f6812fd9cf5510d2bb39a591054abdb85ef809d1d2353165b98a73a3103c7a98e7abb1b93cbe3d768c827b054697ab80cb36896f3bf94c5e1cbb115d09948f063126d6b0696679630313b5edc386fb58c8b40210418821f7d6ab8f7c2cb313b78b039d27c6fb07131434d7fa4a1513881f53e7cdba9b9055341300085ba30a4ebcd69367d088b6eda97b62df743ce343050cac87d12462dc5b05f419e5d384098cb3ef1c17b41b276473ecd16dbb0aac68d2330cd9312cb99b1b4e0ff671fc745726abf76d0eddbc49179188a00fb5d4d72b3bcea0fd14f8e97ce036631e55516f653faaec62baad58bc09460749750b23e1fa4bd6be1033d45f02030100010282010053f3b89cb9bdbf74ff730f4a2069950e486ab93435c9b9a84c646a43c198596498e5ac42177e7a928df4f389efd64d7327f77c64ffd8fc6b0b540e4931819b66e4323beec2f3a84e1d605759c0585f72a968d649025a081a7c8bb7a245a95d80c08ce18deec3895a51c5a0fa43189e785680237270680ee3683f06616da674e8a800b2f02407bdb4387b9327dcd25e4b56494b53d3200b747c7b9b9a6c3743d32cf8db1c054d53d8f77f390ea1eb18b0117b2030a5a814b126ba7f9f8f8fa09a47764c9c1504d29dc150e8f9a429ca224fc01bd058dc96f834b4abb8ddec9b683294ff497e7a12c1bb781691a4f8c016c717c1df670f54170f35fa6b6b2b93e102818100f03148423002e1af8bc190ef471c0e8c034d384eee72a1f248024b376bf6a9f5fa4f4c456842555bdba25d9a084064c47ff309a743f10ac601949d974040fde3e6d3aa26ecb879da1ebae9d7a5ea7a56f1c93a865ceba4142c76e61818e4701337781b8d7b40107b74e778baec4de7e18eefd5654253df8dcd72060ab16b1c6102818100ec18d31b05ed52b2d3af035b09d96aae44b314d1826da682b1e7d09ec06d902db557a27f6961912a9e6183e8beabd493159e351ef4b03e16a140acab1bd5c30c98ff352d03e70367377315c929e692ba8601ba04ac81a84076197ca27a2fb3b21626684671625862c1fd2a5837113478382bab281de3626bd642ea1136eaa8bf0281804cd3568b6513e6dfe151be6bea50bd0e6797f164bdbc08b497f7b3db3c3b1f4dc00c5116fa2c0d655e30e6c377d430e6f10de98e889ab69972b3f85c027f4735f804c7adbf9599d3fc74488b635446613ce0e2494bbb4b35f0aaef19d20c6f14966f6250b4955f303dca33c18607bd1d563cbc02b15e6668d2c79fcb17c86cc1028181008e0488c81292a552489f5807652f514aaeac82735c5f94efbd10529f8be4dbfb82bfca519614487c38753421c6c019c8b81248a5ec4e2faaf128b434e1337e768f79c484e57a0ac405c8c66c11364f40bfe73dfc1dc08872ee177aaf498c742d45c1a8abe6fc5f6a58826efc4d739dfa4adf89bf41eb4b82ce89c5bec127fa8502818100c51caa1667cb86c3cf5dc084bda1a0a508b3c8929eb4ec4733c5b7cea3f905df22ef4f9e851c8c742f162e8f660efee8993e71d9c658ceea61ee4ee7a146ab1c6201cc892537cacd1df3e4a5169c639f6c8778e76b067ac4cc28471ecb2694550e85b19c202217ce4347477a06baf3de929aa1deed6202fc3b73eddbf541ffc4"
+
+const payloadBytes: int = 98304
+const dropEvery: int = 10
+
+fn hx(s: string): []byte {
+  return decodeHex(s) catch e {
+    return []byte(0)
+  }
+}
+fn pemOf(label: string, h: string): string { return pemEncode(label, hx(h)) }
+
+// The server certificate chain (leaf then CA) and its RSA key, as PEM.
+fn chainPem(): string { return pemOf("CERTIFICATE", leafHex) + pemOf("CERTIFICATE", caHex) }
+fn keyPem(): string { return pemOf("PRIVATE KEY", keyHex) }
+
+// A deterministic pseudo-random payload (a linear congruential stream), so the
+// content hash is fixed across runs.
+fn makePayload(n: int): []byte {
+  let out = []byte(n)
+  let x = u32(0x12345678)
+  let i = 0
+  while (i < n) {
+    x = x * u32(1664525) + u32(1013904223)
+    out[i] = byte(x >> u32(24))
+    i = i + 1
+  }
+  return out
+}
+
+fn sha256Hex(data: []byte): string {
+  let h = newSha256()
+  h.write(data)
+  return encodeHex(h.sum())
+}
+
+fn boolStr(b: bool): string {
+  if (b) {
+    return "true"
+  }
+  return "false"
+}
+
+// A shared drop counter the loss shim increments and the driver reads once the
+// transfer has settled.
+class Counter { n: int }
+
+// Forward one datagram, ignoring a send error (a closed socket at shutdown).
+fn relay(sock: UdpSocket, host: string, port: int, data: string) {
+  sock.send(host, port, data) catch e {
+    return
+  }
+}
+
+// The server endpoint: accept the connection, accept the client's bidi stream,
+// read it to completion, and report "<sha256>:<len>" (or an error tag).
+fn serverRole(sock: UdpSocket, chain: string, keyp: string, resultCh: chan<string>) {
+  let conn = acceptQuic(sock, chain, keyp) catch e {
+    resultCh <- "server-handshake-failed"
+    return
+  }
+  let s = conn.acceptStream() catch e {
+    resultCh <- "accept-failed"
+    return
+  }
+  let got = []byte(0)
+  let done = false
+  let guard = 0
+  while (!done && guard < 1000000) {
+    guard = guard + 1
+    let chunk = s.read() catch e {
+      done = true
+      continue
+    }
+    for b of chunk.data {
+      got = append(got, b)
+    }
+    if (chunk.fin) {
+      done = true
+    }
+  }
+  resultCh <- "${sha256Hex(got)}:${len(got)}"
+  conn.close()
+}
+
+// The loss shim: one UDP socket between the client and the server. Datagrams
+// from the server go to the client and vice versa; a deterministic 1-in-N of the
+// 1-RTT (short-header) datagrams is dropped. Handshake (long-header) datagrams
+// are never dropped, so the handshake always completes.
+fn lossShim(sock: UdpSocket, srvHost: string, srvPort: int, ctr: Counter) {
+  let cliHost = ""
+  let cliPort = 0
+  let haveCli = false
+  let seen = 0
+  while (true) {
+    let d = sock.recv(2048) catch e {
+      return
+    }
+    let fromSrv = d.host == srvHost && d.port == srvPort
+    if (!fromSrv) {
+      cliHost = d.host
+      cliPort = d.port
+      haveCli = true
+    }
+    let bytes = []byte(d.data)
+    let isLong = len(bytes) > 0 && (int(bytes[0]) & 0x80) != 0
+    if (!isLong) {
+      seen = seen + 1
+      if (seen % dropEvery == 0) {
+        ctr.n = ctr.n + 1
+        continue
+      }
+    }
+    if (fromSrv) {
+      if (haveCli) {
+        relay(sock, cliHost, cliPort, d.data)
+      }
+    } else {
+      relay(sock, srvHost, srvPort, d.data)
+    }
+  }
+}
+
+// Client side of a transfer: dial `port`, open a stream, send `payload`, wait for
+// full acknowledgement, close.
+fn clientSend(port: int, payload: []byte): bool {
+  let conn = dialQuic("127.0.0.1", port, "localhost") catch e {
+    return false
+  }
+  let s = conn.openStream() catch e {
+    return false
+  }
+  s.write(payload) catch e {
+    return false
+  }
+  s.finish() catch e {
+    return false
+  }
+  conn.close()
+  return true
+}
+
+// Used by `idleScenario`/`idleSlowScenario` in idle.bit (same module) and, as
+// a fast-vs-idle-timeout discriminator, by several scenarios below.
+const idleTimeoutNs: int = 500000000
+const idleBoundNs: int = 5000000000
+
+const resetErrCode: int = 42
+
+// #3229 / #3232: the server side of both the reset and resetnodata scenarios. A
+// short idle timeout means an unfixed regression (the `ResetStream` arm back to
+// a no-op, or `quicconnEnsureStream`'s implicit-open reverted) does not hang the
+// whole suite: `acceptStream`/`read` would instead come back — slowly, via the
+// pre-existing #1449 idle-timeout path, or not at all if `acceptStream` itself
+// never sees the stream — with a generic connection-closed error (or a hang)
+// once nothing more arrives from the peer, rather than the reset chunk directly
+// and promptly. `fast` is the discriminator between "fixed" and "reverted"; the
+// read loop is bounded so a still-broken build fails this scenario instead of
+// wedging every scenario after it.
+//
+// Reads until a reset chunk arrives or the connection ends, accumulating any
+// data delivered first. Shared verbatim by `resetScenario` (client writes a few
+// bytes before resetting) and `resetnodataScenario` (client resets with zero
+// prior writes, so RESET_STREAM is the first frame referencing the stream
+// server-side — the case `quicconnEnsureStream` fixed, #3232).
+fn resetServerRole(sock: UdpSocket, chain: string, keyp: string, resultCh: chan<string>) {
+  let conn = acceptQuic(sock, chain, keyp) catch e {
+    resultCh <- "handshake-failed"
+    return
+  }
+  conn.setIdleTimeout(idleTimeoutNs)
+  let s = conn.acceptStream() catch e {
+    resultCh <- "accept-failed"
+    return
+  }
+  let start = monotonic()
+  let gotData = 0
+  let sawReset = false
+  let resetCode = -1
+  let guard = 0
+  while (!sawReset && guard < 1000) {
+    guard = guard + 1
+    let chunk = s.read() catch e {
+      resultCh <- "read-failed"
+      return
+    }
+    gotData = gotData + len(chunk.data)
+    if (chunk.reset) {
+      sawReset = true
+      resetCode = chunk.resetCode
+    }
+  }
+  let elapsed = since(start)
+  resultCh <- "reset=${boolStr(sawReset)}:code=${resetCode}:predata=${gotData}:" +
+    "fast=${boolStr(elapsed < idleTimeoutNs)}"
+}
+
+// A `read()` on a stream the peer RESET_STREAM'd must return a distinguishable
+// reset chunk instead of waiting for data or a FIN that will now never arrive
+// (#3229's core finding). The client writes a few bytes first, so the server
+// learns the stream exists via a real STREAM frame before the reset — the
+// zero-prior-writes case is `resetnodataScenario` below (#3232).
+fn resetScenario(chain: string, keyp: string): ()! {
+  let srv = udpBind("127.0.0.1", 0)?
+  let srvPort = srv.port()?
+  let res = chan<string>(1)
+  spawn resetServerRole(srv, chain, keyp, res)
+  let conn = dialQuic("127.0.0.1", srvPort, "localhost")?
+  let s = conn.openStream()?
+  s.write([]byte("hi"))?
+  s.reset(resetErrCode)?
+  let got = <- res
+  println("reset_result=${got}")
+  conn.close()
+}
+
+// #3232: RESET_STREAM sent as the very first frame for a stream id — no prior
+// STREAM frame, so the server has never heard of this stream before —  must
+// still create the stream server-side and surface it via `acceptStream`
+// instead of the peer's abort being silently dropped (`st.present[id] == 0`
+// used to return early with no stream ever created, so `acceptStream` blocked
+// forever). `resetServerRole` is the identical server role `resetScenario`
+// uses; only the client's behavior differs here — no `write` before `reset`.
+fn resetnodataScenario(chain: string, keyp: string): ()! {
+  let srv = udpBind("127.0.0.1", 0)?
+  let srvPort = srv.port()?
+  let res = chan<string>(1)
+  spawn resetServerRole(srv, chain, keyp, res)
+  let conn = dialQuic("127.0.0.1", srvPort, "localhost")?
+  let s = conn.openStream()?
+  s.reset(resetErrCode)?
+  let got = <- res
+  println("resetnodata_result=${got}")
+  conn.close()
+}
+
+// "" if `conn.openStream` succeeds, else the error it failed with. A separate
+// function because a `catch` block used as a statement must either produce a
+// `Stream` or divert control (`return`), the same constraint `keyRejected` in
+// _tests_/imports/cryptoaes/main.bit works around the same way.
+fn tryOpenStream(conn: Conn): string {
+  let s = conn.openStream() catch e {
+    return e.message()
+  }
+  return ""
+}
+
+// The peer only ever advertises `initialMaxStreamsBidi = 16`
+// (`quicconnLocalParams`); nothing gated `Conn.openStream` against it at all
+// before #3229. Open exactly that many, then require the next one to fail
+// distinctly (not hang, not fail with the generic "connection closed").
+fn streamLimitScenario(chain: string, keyp: string): ()! {
+  let srv = udpBind("127.0.0.1", 0)?
+  let srvPort = srv.port()?
+  spawn acceptOnly(srv, chain, keyp)
+  let conn = dialQuic("127.0.0.1", srvPort, "localhost")?
+  let opened = 0
+  let i = 0
+  while (i < 16) {
+    let s = conn.openStream()?
+    opened = opened + 1
+    i = i + 1
+  }
+  let msg = tryOpenStream(conn)
+  println("streamlimit_opened=${opened}")
+  println("streamlimit_17th_blocked=${boolStr(msg != "")}")
+  println("streamlimit_17th_message=${msg}")
+  conn.close()
+}
+
+// Complete the handshake and hold the connection open; `streamLimitScenario`
+// needs a live peer only to learn the peer's advertised transport parameters —
+// none of the streams it opens ever carry data, so the server never even learns
+// they exist (a STREAM frame is what creates a stream server-side, and no
+// `write` is ever called).
+fn acceptOnly(sock: UdpSocket, chain: string, keyp: string) {
+  let conn = acceptQuic(sock, chain, keyp) catch e {
+    return
+  }
+  conn.setIdleTimeout(listenerIdleNs)
+}
+
+// More than `quicconnLocalMaxStreamsBidi` (16): every one of these
+// server-initiated opens succeeds from the server's own perspective, because
+// `quicconnReadPeerParams` is client-only (handshake.bit) — a server-side
+// connection's `peerMaxStreamsBidi` never learns the real value, so its own
+// outbound gate (#3229) never fires here. That gap is exactly what makes this
+// scenario able to exercise the CLIENT's *inbound* enforcement (#3247) at all:
+// going through `Conn.openStream` on the client instead would hit the client's
+// own outbound gate first and never reach the wire.
+const streamLimitInboundTotal: int = 20
+
+// Open `streamLimitInboundTotal` server-initiated streams and put one acked
+// byte on each. `finish` (not a bare `write`) is required, not just tidier:
+// this runtime defaults to one scheduler worker OS thread (ABI.md §9), and a
+// tight loop of `openStream`+`write` calls that never blocks on the PEER
+// never yields it — the peer's own dial/accept/read green threads starved
+// completely in a from-scratch repro of this exact scenario, every single
+// time, until either a real cross-connection round trip (`finish`, which
+// cannot return until the client's own loop has processed and acked it) or a
+// second worker (`BIT_WORKERS=2`) was added. `_tests_/bit/importsrun/importsrun.bit` runs
+// every `_tests_/imports/**` project under the default one-worker config, so
+// this scenario must yield for real rather than assume fairness.
+fn streamLimitInboundServerRole(sock: UdpSocket, chain: string, keyp: string) {
+  let conn = acceptQuic(sock, chain, keyp) catch e {
+    return
+  }
+  let i = 0
+  while (i < streamLimitInboundTotal) {
+    let s = conn.openStream() catch e {
+      return
+    }
+    s.write([]byte("x")) catch e {
+      return
+    }
+    s.finish() catch e {
+      return
+    }
+    i = i + 1
+  }
+}
+
+// #3247: the missing inbound half of `streamLimitScenario`. The server (see
+// `streamLimitInboundServerRole`) references 20 distinct stream ids; this
+// endpoint advertised room for only 16 (`quicconnLocalParams`), so the last 4
+// must be refused as a connection error (RFC 9000 §4.6 STREAM_LIMIT_ERROR)
+// instead of growing `st.streams`/`st.present` without bound.
+//
+// `first16Ok` accepts and reads exactly the first 16 — all within the
+// advertised limit — and requires every one to deliver its byte normally: the
+// acceptance requirement that a peer referencing streams that stay within the
+// limit is never wrongly refused, which a count of raw map entries (conflating
+// this endpoint's own id space, or type) could get wrong even when the
+// over-limit check itself is correct.
+//
+// `fast` is the same discriminator `resetServerRole` uses: a reverted fix
+// still ends the connection eventually — nothing else answers the peer past
+// this point, so the pre-existing idle timeout (`idleTimeoutNs`, set below)
+// fires regardless — but only a real fix ends it near-instantly, on the
+// violating reference itself, rather than after a 500ms timeout.
+fn streamLimitInboundScenario(chain: string, keyp: string): ()! {
+  let srv = udpBind("127.0.0.1", 0)?
+  let srvPort = srv.port()?
+  spawn streamLimitInboundServerRole(srv, chain, keyp)
+  let conn = dialQuic("127.0.0.1", srvPort, "localhost")?
+  conn.setIdleTimeout(idleTimeoutNs)
+
+  let first16Ok = true
+  let held = conn.acceptStream()?
+  let firstChunk = held.read()?
+  if (len(firstChunk.data) != 1) {
+    first16Ok = false
+  }
+  let j = 1
+  while (j < 16) {
+    let s = conn.acceptStream() catch e {
+      first16Ok = false
+      j = 16
+      continue
+    }
+    let chunk = s.read() catch e {
+      first16Ok = false
+      j = 16
+      continue
+    }
+    if (len(chunk.data) != 1) {
+      first16Ok = false
+    }
+    j = j + 1
+  }
+  println("streamlimitinbound_first16_ok=${boolStr(first16Ok)}")
+
+  let start = monotonic()
+  let closed = false
+  let guard = 0
+  while (!closed && guard < 100000) {
+    guard = guard + 1
+    let chunk2 = held.read() catch e {
+      closed = true
+      continue
+    }
+  }
+  let elapsed = since(start)
+  println("streamlimitinbound_closed=${boolStr(closed)}")
+  println("streamlimitinbound_fast=${boolStr(elapsed < idleTimeoutNs)}")
+}
+
+// #3243: STOP_SENDING has the same `st.present[id] == 0` early-return
+// `quicconnAbortSend` shares with RESET_STREAM/MAX_STREAM_DATA, but wasn't
+// routed through `quicconnEnsureStream` when #3232 fixed those two — so a
+// STOP_SENDING referencing a stream id the server has never seen before used
+// to be silently dropped instead of implicitly opening the stream. Mirrors
+// `resetnodataScenario`'s "zero prior writes" shape (#3232), but there is
+// nothing for this accepted stream to `read` — `stopSending` only affects the
+// receiver's own send side, not what it receives — so this checks that
+// `acceptStream` itself returns fast rather than waiting out the idle
+// timeout.
+fn stopSendingNoDataServerRole(
+  sock: UdpSocket,
+  chain: string,
+  keyp: string,
+  resultCh: chan<string>,
+) {
+  let conn = acceptQuic(sock, chain, keyp) catch e {
+    resultCh <- "handshake-failed"
+    return
+  }
+  conn.setIdleTimeout(idleTimeoutNs)
+  let start = monotonic()
+  let s = conn.acceptStream() catch e {
+    resultCh <- "accept-failed"
+    return
+  }
+  let elapsed = since(start)
+  resultCh <- "accepted=true:id=${s.id()}:fast=${boolStr(elapsed < idleTimeoutNs)}"
+}
+
+fn stopSendingNoDataScenario(chain: string, keyp: string): ()! {
+  let srv = udpBind("127.0.0.1", 0)?
+  let srvPort = srv.port()?
+  let res = chan<string>(1)
+  spawn stopSendingNoDataServerRole(srv, chain, keyp, res)
+  let conn = dialQuic("127.0.0.1", srvPort, "localhost")?
+  let s = conn.openStream()?
+  s.stopSending(resetErrCode)?
+  let got = <- res
+  println("stopsendingnodata_result=${got}")
+  conn.close()
+}
+
+// #3243: a reference to stream ordinal 5 (id 20, the 6th client-bidi stream)
+// must implicitly open every lower-numbered stream of the same type (RFC 9000
+// §2.1), not only the one referenced. The client opens 6 streams locally but
+// only ever writes to the last one — ordinals 0-4 carry no traffic at all,
+// exactly like `streamLimitScenario`'s streams that "never carry data, so the
+// server never even learns they exist" — so before the fix the server only
+// ever learns about the referenced id; after it, all 6 must be visible via
+// `acceptStream`. Closing the connection right after the one real write
+// drains makes a still-broken build fail fast (the 2nd `acceptStream` call
+// errors out immediately once the close arrives) rather than waiting out the
+// idle timeout.
+const lowerStreamOpenCount: int = 6
+
+fn lowerStreamOpenServerRole(sock: UdpSocket, chain: string, keyp: string, resultCh: chan<string>) {
+  let conn = acceptQuic(sock, chain, keyp) catch e {
+    resultCh <- "handshake-failed"
+    return
+  }
+  conn.setIdleTimeout(idleTimeoutNs)
+  let count = 0
+  let idSum = 0
+  let i = 0
+  while (i < lowerStreamOpenCount) {
+    let s = conn.acceptStream() catch e {
+      i = lowerStreamOpenCount
+      continue
+    }
+    count = count + 1
+    idSum = idSum + s.id()
+    i = i + 1
+  }
+  resultCh <- "count=${count}:idsum=${idSum}"
+}
+
+fn lowerStreamOpenScenario(chain: string, keyp: string): ()! {
+  let srv = udpBind("127.0.0.1", 0)?
+  let srvPort = srv.port()?
+  let res = chan<string>(1)
+  spawn lowerStreamOpenServerRole(srv, chain, keyp, res)
+  let conn = dialQuic("127.0.0.1", srvPort, "localhost")?
+  let i = 0
+  while (i < lowerStreamOpenCount - 1) {
+    let discarded = conn.openStream()?
+    i = i + 1
+  }
+  let last = conn.openStream()?
+  last.write([]byte("x"))?
+  last.finish()?
+  conn.close()
+  let got = <- res
+  println("lowerstreamopen_result=${got}")
+}
+
+// One listener client: dial, open a stream, then wait for `go` before sending, so
+// the driver controls exactly when traffic has to cross the shared socket.
+fn listenerClient(port: int, msg: string, go: chan<int>, out: chan<string>) {
+  let conn = dialQuic("127.0.0.1", port, "localhost") catch e {
+    out <- "dial-failed"
+    return
+  }
+  let s = conn.openStream() catch e {
+    out <- "open-failed"
+    return
+  }
+  <- go
+  s.write([]byte(msg)) catch e {
+    out <- "write-failed"
+    return
+  }
+  s.finish() catch e {
+    out <- "finish-failed"
+    return
+  }
+  out <- "sent"
+}
+
+// Drain one accepted connection's first stream to FIN.
+fn readStream(c: Conn): string {
+  let s = c.acceptStream() catch e {
+    return "accept-failed"
+  }
+  let got = []byte(0)
+  let done = false
+  let guard = 0
+  while (!done && guard < 1000000) {
+    guard = guard + 1
+    let chunk = s.read() catch e {
+      done = true
+      continue
+    }
+    for b of chunk.data {
+      got = append(got, b)
+    }
+    if (chunk.fin) {
+      done = true
+    }
+  }
+  return string(got)
+}
+
+const listenerIdleNs: int = 5000000000
+
+// #1473: closing ONE listener-created connection must not touch the socket it
+// shares with the listener and every sibling connection. Accept two, close the
+// first, then require a full round trip on the second and a brand-new third
+// connection — every one of which needs that socket alive, and none of which can
+// be satisfied from data already buffered, because the clients hold their
+// payload until told to send. The surviving connection gets a short idle timeout
+// so a regressed build answers wrongly within seconds instead of hanging.
+fn listenerScenario(chain: string, keyp: string): ()! {
+  let lsock = udpBind("127.0.0.1", 0)?
+  let port = lsock.port()?
+  let lst = listenQuic(lsock, chain, keyp)?
+
+  let goA = chan<int>(1)
+  let outA = chan<string>(1)
+  spawn listenerClient(port, "alpha", goA, outA)
+  let c1 = lst.accept()?
+
+  let goB = chan<int>(1)
+  let outB = chan<string>(1)
+  spawn listenerClient(port, "beta", goB, outB)
+  let c2 = lst.accept()?
+  c2.setIdleTimeout(listenerIdleNs)
+
+  // The destructive act: before #1473 this closed `lsock` itself, taking the
+  // accept loop and every sibling connection with it.
+  c1.close()
+
+  goB <- 1
+  let got2 = readStream(c2)
+  println("listener_sibling_roundtrip=${boolStr(got2 == "beta")}")
+
+  let goC = chan<int>(1)
+  let outC = chan<string>(1)
+  goC <- 1
+  spawn listenerClient(port, "gamma", goC, outC)
+  // Read the client's own verdict first: it is bounded by the 5s dial handshake
+  // timeout, so a dead listener socket surfaces as a failure here rather than
+  // parking the accept below forever.
+  let rc = <- outC
+  let got3 = ""
+  if (rc == "sent") {
+    let c3 = lst.accept()?
+    got3 = readStream(c3)
+  }
+  println("listener_third_accept=${boolStr(got3 == "gamma")}")
+}
+
+fn run(): ()! {
+  let payload = makePayload(payloadBytes)
+  let want = sha256Hex(payload)
+  println("payload_len=${payloadBytes}")
+  println("payload_hash=${want}")
+
+  // --- direct: no loss ---
+  let srv = udpBind("127.0.0.1", 0)?
+  let srvPort = srv.port()?
+  let res = chan<string>(1)
+  spawn serverRole(srv, chainPem(), keyPem(), res)
+  let ok = clientSend(srvPort, payload)
+  let got = <- res
+  println("direct_handshake=${boolStr(ok)}")
+  println("direct_match=${boolStr(got == "${want}:${payloadBytes}")}")
+
+  // --- loss: shim drops ~10% of 1-RTT datagrams ---
+  let srv2 = udpBind("127.0.0.1", 0)?
+  let srvPort2 = srv2.port()?
+  let shim = udpBind("127.0.0.1", 0)?
+  let shimPort = shim.port()?
+  let ctr = Counter{ n: 0 }
+  spawn lossShim(shim, "127.0.0.1", srvPort2, ctr)
+  let res2 = chan<string>(1)
+  spawn serverRole(srv2, chainPem(), keyPem(), res2)
+  let ok2 = clientSend(shimPort, payload)
+  let got2 = <- res2
+  println("loss_handshake=${boolStr(ok2)}")
+  println("loss_match=${boolStr(got2 == "${want}:${payloadBytes}")}")
+  println("loss_dropped_some=${boolStr(ctr.n > 0)}")
+
+  // --- listener: one connection's close must not kill its siblings (#1473) ---
+  listenerScenario(chainPem(), keyPem())?
+
+  // --- idle: a vanished peer unparks `finish` in bounded time (#1449/#1474) ---
+  idleScenario(chainPem(), keyPem())?
+
+  // --- idleslow: idle above the PTO backoff ceiling, so a broken re-arm is
+  // distinguishable (#3557) ---
+  idleSlowScenario(chainPem(), keyPem())?
+
+  // --- reset: RESET_STREAM wakes a blocked `read` instead of hanging (#3229) ---
+  resetScenario(chainPem(), keyPem())?
+
+  // --- resetnodata: RESET_STREAM as the first frame for a stream id implicitly
+  // opens it instead of being silently dropped (#3232) ---
+  resetnodataScenario(chainPem(), keyPem())?
+
+  // --- streamlimit: MAX_STREAMS is enforced, not silently ignored (#3229) ---
+  streamLimitScenario(chainPem(), keyPem())?
+
+  // --- streamlimitinbound: a peer referencing more than 16 distinct stream
+  // ids is refused with STREAM_LIMIT_ERROR instead of growing st.streams
+  // without bound (#3247) ---
+  streamLimitInboundScenario(chainPem(), keyPem())?
+
+  // --- stopsendingnodata: STOP_SENDING as the first frame for a stream id
+  // implicitly opens it instead of being silently dropped (#3243) ---
+  stopSendingNoDataScenario(chainPem(), keyPem())?
+
+  // --- lowerstreamopen: referencing stream ordinal 5 implicitly opens
+  // ordinals 0-4 too, not only the one referenced (#3243) ---
+  lowerStreamOpenScenario(chainPem(), keyPem())?
+}
+
+fn main() {
+  run() catch e {
+    println("failed: ${e.message()}")
+  }
+}

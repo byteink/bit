@@ -1,0 +1,250 @@
+// #2546 (epic #1660). The darwin boot thread's step-7 park loop must stay
+// bracketed with `gcBlockingBegin`/`gcBlockingEnd` (#2543) so a collection
+// that starts while it sleeps counts it as BLOCKED, not RUNNING, and never
+// has to wait for it.
+//
+// THE PROPERTY, in one sentence: a program that allocates enough to force
+// many collections under `BIT_GC=stress` finishes every one of them —
+// `abandoned` stays 0 — because the boot thread's own bracket takes it out
+// of the rendezvous for the whole time it is parked.
+//
+// WHY THE COLLECTION COUNT IS ASSERTED TOO, NOT JUST `abandoned=0`.
+// `abandoned=0` is trivially true of a run that never collected at all — a
+// fixture that allocates nothing, or a `BIT_GC=stress` that silently failed
+// to engage, would pass that check for the wrong reason. This gate asserts
+// and PRINTS `collections > 0` first, with its own failure message, so a
+// broken denominator is reported as exactly that rather than reading as
+// "the abandoned bug is fixed" when nothing was ever measured.
+//
+// WHY `bit build` + exec, NOT `bit run`. `bit run` refuses `BIT_GC=stress`
+// outright (compiler/build.bit:444, `refuseRunUnderStressGc`, #2425) — it
+// would stress the compiler's own compile of the fixture, not the fixture
+// itself. So the fixture is compiled once with a plain `bit build`, and the
+// produced binary is exec'd directly under `BIT_GC=stress BIT_GC_STATS=1`.
+// `BIT_GC=stress` alone prints no summary; `BIT_GC_STATS=1` is what makes
+// the runtime write the `[bit-gc] collections=... abandoned=...` line at
+// exit (#2545's finding).
+//
+// WHY `exclusive: true` (tools/build/gates.bit). `abandoned` counts a
+// rendezvous that gave up after `stwSpinBound` spins (runtime/gc/gcworld.bit)
+// — a co-scheduled neighbour stealing CPU from either side of that race can
+// manufacture a spurious abandon that has nothing to do with this bracket.
+// Measured directly while writing this gate, on a box at load 75: the SAME
+// binary reported abandoned 0-4 across five back-to-back runs with the
+// bracket intact. Same reasoning as `test-lsp-cache`/`test-stress-exclusive`
+// beside it in the gate table: this gate needs the machine to itself, not a
+// fixed threshold immune to load.
+//
+// THE FIXTURE just appends to a slice for a bounded count.
+// `BIT_GC=stress` collects at every safepoint, ignoring the byte trigger
+// (runtime/gc/gccollect.bit:172), so a loop back edge is enough — no large
+// allocation is needed to get several collections.
+//
+// Run it from the repository root:
+//     ./bit-out/bin/bit run _tests_/bit/gcbootsafepoint.bit
+// `BIT_SELF_EXE` overrides which `bit` is exercised.
+import { env, envOr, exit } from "std/os"
+import { exists, mkdir, readFile, writeFile } from "std/fs"
+import { parseInt } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// Loop iterations for the fixture. Empirically close to 1:1 with collections
+// under `BIT_GC=stress` (a little over, from safepoints outside the loop) —
+// this size finishes in about a second and lands collections in the low
+// thousands, comfortably clear of the >0 floor this gate actually asserts.
+const fixtureIterations: int = 3000
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "120")) catch _ { 120 }
+  if (s <= 0) {
+    return 120000
+  }
+  return s * 1000
+}
+
+class Tally { checks: int, failures: int }
+
+fn check(t: Tally, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    eprint("FAIL: ${label}\n")
+  }
+}
+
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("gcbootsafepoint: cannot make script executable: ${scriptPath}")
+  }
+  return osRunBounded(scriptPath, ms)
+}
+
+fn bitBinary(scratch: string, ms: int): string! {
+  let explicit = env("BIT_SELF_EXE")
+  if (len(explicit) > 0) {
+    if (!exists(explicit)) {
+      fail newError("gcbootsafepoint: BIT_SELF_EXE=${explicit} does not exist")
+    }
+    return explicit
+  }
+  let cwdFile = "${scratch}/cwd.txt"
+  let code = shell("${scratch}/pwd.sh", "#!/bin/sh\npwd > '${cwdFile}'\n", ms)?
+  if (code != 0) {
+    fail newError("gcbootsafepoint: could not read the working directory (exit ${code})")
+  }
+  let candidate = "${trimWs(readFile(cwdFile)?)}/bit-out/bin/bit"
+  if (!exists(candidate)) {
+    fail newError("gcbootsafepoint: no compiler at ${candidate}; run this from the repository root or set BIT_SELF_EXE")
+  }
+  return candidate
+}
+
+// A bounded allocation loop: `fixtureIterations` appends, one loop-back-edge
+// safepoint each. No imports — the fixture must build without BIT_STDLIB.
+fn fixtureSource(): string {
+  return "class Node { x: i64, y: i64 }\n\n" +
+    "fn main() {\n" +
+    "  let xs = []Node(0)\n" +
+    "  let i = 0\n" +
+    "  while (i < ${fixtureIterations}) {\n" +
+    "    xs = append(xs, Node{ x: i, y: i + 1 })\n" +
+    "    i = i + 1\n" +
+    "  }\n" +
+    "}\n"
+}
+
+// The decimal that follows the FIRST occurrence of `key`, or -1 when `key` is
+// absent or not followed by a digit. -1 rather than 0 is load-bearing: a
+// missing field must fail this gate, never read as "zero of it happened".
+fn intAfter(s: string, key: string): int {
+  let n = len(key)
+  let i = 0
+  while (i + n <= len(s)) {
+    if (s[i:i + n] == key) {
+      let j = i + n
+      let v = 0
+      let digits = 0
+      while (j < len(s) && s[j] >= u8('0') && s[j] <= u8('9')) {
+        v = v * 10 + (int(s[j]) - int(u8('0')))
+        digits = digits + 1
+        j = j + 1
+      }
+      if (digits == 0) {
+        return 0 - 1
+      }
+      return v
+    }
+    i = i + 1
+  }
+  return 0 - 1
+}
+
+fn runAll(t: Tally, scratch: string, ms: int) {
+  let bit = bitBinary(scratch, ms) catch e { panic("gcbootsafepoint: ${e.message()}") }
+  let src = "${scratch}/alloc.bit"
+  let prog = "${scratch}/alloc"
+  let errPath = "${scratch}/err.txt"
+
+  writeFile(src, fixtureSource()) catch e {
+    panic("gcbootsafepoint: cannot write the fixture: ${e.message()}")
+  }
+  let build = shell("${scratch}/build.sh",
+    "#!/bin/sh\n'${bit}' build '${src}' -o '${prog}'\n", ms) catch e {
+    panic("gcbootsafepoint: ${e.message()}")
+  }
+  check(t, build == 0, "the fixture must compile (bit build exited ${build})")
+  if (build != 0 || !exists(prog)) {
+    return
+  }
+
+  let run = "#!/bin/sh\n" +
+    "BIT_GC=stress\nexport BIT_GC\n" +
+    "BIT_GC_STATS=1\nexport BIT_GC_STATS\n" +
+    "exec '${prog}' > '${scratch}/out.txt' 2> '${errPath}'\n"
+  let code = shell("${scratch}/run.sh", run, ms) catch e {
+    panic("gcbootsafepoint: ${e.message()}")
+  }
+  check(t, code == 0, "the fixture must exit 0 under BIT_GC=stress (exited ${code})")
+
+  let err = readFile(errPath) catch _ { "" }
+  let collections = intAfter(err, "collections=")
+  let abandoned = intAfter(err, "abandoned=")
+
+  // ANTI-VACUITY. A missing line is not zero of either field — it is the run
+  // never having been measured at all, and must fail loudly as such rather
+  // than satisfy `abandoned == 0` for having nothing to report.
+  check(t, collections >= 0 && abandoned >= 0,
+    "no `[bit-gc] ... collections=N ... abandoned=N` line found on stderr — " +
+    "the run was not measured. stderr was:\n${err}")
+  if (collections < 0 || abandoned < 0) {
+    return
+  }
+
+  // THE DENOMINATOR. Asserted and printed before the abandoned check, so a
+  // fixture that stopped allocating (or a stress mode that silently stopped
+  // engaging) fails on ITS OWN, distinguishable message instead of
+  // `abandoned=0` reading as proof of anything.
+  check(t, collections > 0,
+    "collections=${collections}, want > 0 — abandoned=0 proves nothing " +
+    "unless the collector actually ran (#2546)")
+  print("gcbootsafepoint: collections=${collections} abandoned=${abandoned}\n")
+
+  check(t, abandoned == 0,
+    "abandoned=${abandoned} of collections=${collections}, want abandoned=0 " +
+    "— the boot thread's step-7 park loop is not bracketing its blocked " +
+    "window (runtime/root/darwin/boot.bit, #2543)")
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-gcbootsafepoint-${uuidFormat(uuidV4())}"
+  let t = Tally{ checks: 0, failures: 0 }
+
+  mkdir(scratch) catch e { panic("gcbootsafepoint: cannot create ${scratch}: ${e.message()}") }
+  runAll(t, scratch, ms)
+
+  if (t.checks < 4) {
+    eprint("FAIL: only ${t.checks} checks ran, want at least 4\n")
+    t.failures = t.failures + 1
+  }
+  if (t.failures > 0) {
+    // `exit()` does not run pending defers (documented on `std/os.exit`
+    // itself, #3677) — a `defer teardown(scratch, ms)` registered above
+    // this branch would never fire here, leaking `scratch` under $TMPDIR
+    // on every failing run. Call it explicitly on both paths instead.
+    teardown(scratch, ms)
+    println("gcbootsafepoint: FAIL — ${t.failures} of ${t.checks} checks failed")
+    exit(1)
+  }
+  teardown(scratch, ms)
+  println("gcbootsafepoint: PASS — ${t.checks} checks")
+}
+
+fn teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ { return }
+}
+
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}

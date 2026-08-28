@@ -165,7 +165,7 @@ fmt_retry() {
 # So the roots are named once, and checked. A rename now stops the gate instead
 # of quietly shrinking it — the same reasoning as the zero-file guard in the IR
 # differentials (#1881), one step earlier in the pipeline.
-CORPUS="stdlib examples tests/cases tests/imports compiler runtime"
+CORPUS="stdlib examples _tests_/cases _tests_/imports compiler runtime"
 for d in $CORPUS; do
   [ -d "$d" ] || { echo "difffmt: corpus root '$d' does not exist — refusing to scan a partial tree" >&2; exit 2; }
 done

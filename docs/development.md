@@ -154,7 +154,7 @@ Two traps, each cost a real run when skipped:
   that it happened.
 
 **Regression coverage for the escape hatch itself is `./make
-test-stage0override`** (#3118, `tests/bit/stage0override.bit`): asserts
+test-stage0override`** (#3118, `_tests_/bit/stage0override.bit`): asserts
 `BIT_STAGE0_BIN` is actually honoured (not silently ignored) and that
 `fingerprint()`'s override-hashing invalidates the `libbitrt` cache when the
 override binary's content changes at a fixed path. It does not assert that a
@@ -232,8 +232,8 @@ regression has a push-to-push window to surface, through a suite only the
 integrator runs.
 
 **2. Does `BIT_STAGE0_BIN` fully cover recovery, and is it exercised by
-anything?** No. `grep -rln STAGE0_BIN tests/` returns exactly one file,
-`tests/bit/coldboot.bit`, and its own comment says it deliberately does *not*
+anything?** No. `grep -rln STAGE0_BIN _tests_/` returns exactly one file,
+`_tests_/bit/coldboot.bit`, and its own comment says it deliberately does *not*
 use `BIT_STAGE0_BIN` — "using it here would defeat the point," since
 `test-coldboot`'s whole job is proving the pinned stage0 *alone* can
 bootstrap. No test anywhere sets `BIT_STAGE0_BIN` and asserts the resulting
@@ -354,13 +354,13 @@ visible to every subprocess `./make` spawns, so `./make libbitrt` followed by
 **Verify scoped changes with `scripts/gate.sh`, not the full suite.** It reads
 your `git diff` and runs only the steps that change can affect — a `compiler/**`
 edit runs the selfhost diffs plus `test-imports-bit`, `test-lint-filelines`,
-`test-selfhostcheck` and `test-selfcheck`, a `tests/cases/**` edit runs
+`test-selfhostcheck` and `test-selfcheck`, a `_tests_/cases/**` edit runs
 `./make test-golden test-fuzz`.
 Every bucket runs every gate whose OWN declared file set (its `argv`/`env` in
 `tools/build/gates.bit`) intersects that bucket's paths, not just the one gate
 the bucket was originally named after — see `scripts/gate.sh`'s own header
 comment for the full bucket→gate table (#2962). One narrow exception to "a mix
-of areas forces full" (#3055): `tests/bit/stdlibdocs.bit` makes a
+of areas forces full" (#3055): `_tests_/bit/stdlibdocs.bit` makes a
 `docs/stdlib/<mod>.md` page mandatory for every exported stdlib symbol, so an
 ordinary stdlib-export change is structurally required to touch both the
 `stdlib` and `docs` buckets in the same diff — resolving that to `full` would
@@ -388,7 +388,7 @@ also has its own named step
 (`./make test-golden|test-examples|test-stress|test-selfcheck|…`) for running one
 area directly.
 
-**Golden-file tests** are `tests/cases/*.bit` with a sibling `.expected`; the
+**Golden-file tests** are `_tests_/cases/*.bit` with a sibling `.expected`; the
 line-1 directive selects the mode — `// run` (execute, compare stdout),
 `// panic` (must exit 2, compare stderr), `// error` (expect diagnostics),
 `// fmt` (canonicalization), `// types` (inferred-type dump), `// lint`.
@@ -400,7 +400,7 @@ caught — self-hosted `lowerCall`/`checkCall`/`vCall`/`vUnmanagedBuiltin`
 dispatching on a callee's raw source text before its resolved declaration, so a
 user's own `close`/`timeMonoNs`/`fsClose`/… silently lost to the ~70-name
 predeclared list — was fixed at all four sites (`3ca737c`) and is covered by
-`tests/cases/run_shadow_predeclared.bit` (part of `test-golden`, in the
+`_tests_/cases/run_shadow_predeclared.bit` (part of `test-golden`, in the
 mandatory suite), which exercises one name per resolution site under the same
 precedence check. `extern fn` declarations are not an independent code path
 that could regress without also tripping that golden:
@@ -435,7 +435,7 @@ there." `bit build`/`run`/`test`/`check`/`doc` all resolve first
 check — a different branch inside `checkExprType`, with different staleness
 behaviour, so the two paths can disagree on the same source.
 
-Demonstrated on `tests/cases/run_generic_let_chain.bit` (#3069, the #3068
+Demonstrated on `_tests_/cases/run_generic_let_chain.bit` (#3069, the #3068
 degenerate-generic-instance repro, live in the corpus): `--dump-ir-pre` and
 `--dump-ir` both show `f1(x)` inside `build<T>` targeting the CONCRETE
 `f1$3`. A real `bit build --emit-obj` of the same file, disassembled
@@ -469,14 +469,14 @@ triple and the wrapper cannot know the target.
 **A hang is a failure, not a stall.** Every subprocess a harness spawns carries a
 wall-clock deadline. Exceeding it kills that child (by its own PID, never a name
 pattern), reports `TIMED OUT` naming the case, and reddens the suite. Default
-**300s** (`defaultTimeoutS`, `tests/bit/stress/stress.bit:200` and
-`tests/bit/golden/golden.bit:88`); override with `BIT_TEST_TIMEOUT_S=<seconds>` on a
+**300s** (`defaultTimeoutS`, `_tests_/bit/stress/stress.bit:200` and
+`_tests_/bit/golden/golden.bit:88`); override with `BIT_TEST_TIMEOUT_S=<seconds>` on a
 slower host, or `0` to block forever as before. A timeout is a distinct outcome
 from a crash: a child killed by SIGSEGV/SIGBUS/SIGABRT is reported as a crash
 naming the signal.
 
-`tests/stress/quicwire`'s `BIT_GC=stress` run measures ~176s standalone
-(`tests/stress/quicwire/quicwire.bit:38-44`), ~59% of the 300s default — but
+`_tests_/stress/quicwire`'s `BIT_GC=stress` run measures ~176s standalone
+(`_tests_/stress/quicwire/quicwire.bit:38-44`), ~59% of the 300s default — but
 under `./make test`'s concurrency it can exceed that budget, which is why it
 now carries its own `timeout-s` override rather than leaning on the corpus
 default (documented below). Two counter-intuitive things about timing this
@@ -492,23 +492,23 @@ machine code no longer comes from an optimising backend. **Do not read a
 
 **A per-program `timeout-s` file overrides the stress budget for that program
 alone, and never the other way around.** The stress harness
-(`tests/bit/stress/stress.bit`) gives every program in `tests/stress/` the same
+(`_tests_/bit/stress/stress.bit`) gives every program in `_tests_/stress/` the same
 default budget, `defaultTimeoutS` seconds (`stress.bit:200`), applied as its own
 wall-clock deadline to each of the program's three bounded subprocesses in
 turn — compile, the default-policy run, and the `BIT_GC=stress` run
 (`resolveTimeoutMs` folds the effective budget into a per-program `Ctx` at
-`tests/bit/stress/stress.bit:479-495`, and `runScript`/`osRunBounded` re-apply it
-separately at each phase, `tests/bit/stress/verify.bit:263-289`, called from
-`buildProgram` at `tests/bit/stress/verify.bit:298` and `runOnce` at
-`tests/bit/stress/verify.bit:336`). `BIT_TEST_TIMEOUT_S` raises or lowers that
+`_tests_/bit/stress/stress.bit:479-495`, and `runScript`/`osRunBounded` re-apply it
+separately at each phase, `_tests_/bit/stress/verify.bit:263-289`, called from
+`buildProgram` at `_tests_/bit/stress/verify.bit:298` and `runOnce` at
+`_tests_/bit/stress/verify.bit:336`). `BIT_TEST_TIMEOUT_S` raises or lowers that
 default for the whole corpus. A program directory may instead hold a file
 named `timeout-s`, sitting beside the existing `no-collect`/`stress-waived`
-markers (`tests/stress/<name>/timeout-s`) — one line holding a single positive
+markers (`_tests_/stress/<name>/timeout-s`) — one line holding a single positive
 integer, the whole-program budget in seconds for that program only, trailing
 whitespace and a trailing newline both fine. Precedence is exactly:
 a valid `timeout-s` file wins over `BIT_TEST_TIMEOUT_S`, which wins over
 `defaultTimeoutS` (`timeoutSOverrideMs`/`resolveTimeoutMs`,
-`tests/bit/stress/setup.bit:160-188`).
+`_tests_/bit/stress/setup.bit:160-188`).
 A present-but-unparsable file fails that one program outright rather than
 silently falling back to the default — a typo must not quietly disable the
 deadline it was meant to set.
@@ -519,7 +519,7 @@ delaying how fast a real hang anywhere else in the corpus is caught — the
 per-program file exists precisely so one program's cost does not become every
 program's risk.
 
-**`tests/stress/quicwire/timeout-s` holds `1200`** — the one program in the
+**`_tests_/stress/quicwire/timeout-s` holds `1200`** — the one program in the
 corpus that needs a wider budget than the 300s default. It used to get that
 budget from a second, less discoverable mechanism instead: `timeoutMsForProgram`
 hardcoded `baseMs * 4` for the name `quicwire` (#3210, 2026-08-17, predating
@@ -528,7 +528,7 @@ this file's mechanism). #2696 replaced the hardcode with the file and deleted
 is one mechanism now, not two.
 
 **A valid file always wins outright; the two never layer**
-(`resolveTimeoutMs`, `tests/bit/stress/setup.bit:179-188`: an absent file falls
+(`resolveTimeoutMs`, `_tests_/bit/stress/setup.bit:179-188`: an absent file falls
 through to `cx.timeoutMs`, i.e. `defaultTimeoutS` scaled by `BIT_TEST_TIMEOUT_S`/
 host load; a present one returns instead of adding to it). That non-layering is
 why migrating quicwire off the hardcode had to land in the same commit as the
@@ -537,8 +537,8 @@ hook replaces its budget rather than widening it — #2696 itself would have
 halved quicwire's from 1200s to 600s had it shipped the file alone without
 also removing the hook.
 
-Doc snippets are gated: `tests/bit/docs.bit` typechecks every Bit-tagged fenced
-code block under `docs/`, and `tests/bit/stdlibdocs.bit` fails on an undocumented
+Doc snippets are gated: `_tests_/bit/docs.bit` typechecks every Bit-tagged fenced
+code block under `docs/`, and `_tests_/bit/stdlibdocs.bit` fails on an undocumented
 export. A doc that does not compile fails the build.
 
 **A gate whose printed count omits its denominator reads as coverage when it
@@ -548,17 +548,17 @@ under `## File size` below is about what a *file split* can silently break,
 not about scope.) Three measured instances, all re-measured on `main` at
 `c2a1eb27`:
 
-- **`test-filesize`** enforces the 800-line limit over `tests/bit/` only and
+- **`test-filesize`** enforces the 800-line limit over `_tests_/bit/` only and
   prints `filesize: ok — 77 file(s) scanned, 30 file(s) skipped as fixture
-  corpora, …` (`./bit-out/bin/bit run tests/bit/filesize.bit`). The tree holds
+  corpora, …` (`./bit-out/bin/bit run _tests_/bit/filesize.bit`). The tree holds
   **1182** tracked `.bit` files (`git ls-files -- '*.bit' | wc -l`), so the
   limit is enforced over 77 of 1182 (6.5%) and 1105 files are checked by
   nothing. Its scoping is deliberate — the point is only that the line reads
   as a whole-tree verdict.
 - **`test-fmt`** (`tools/build/gates.bit`) walks `stdlib/` and `examples/`
   only — 173 of 1182 files (14.6%, `git ls-files -- 'stdlib/*.bit'
-  'examples/*.bit' | wc -l`). `compiler/`, `runtime/` and `tests/` — 997 of
-  1182 (84%, `git ls-files -- 'compiler/*.bit' 'runtime/*.bit' 'tests/*.bit' |
+  'examples/*.bit' | wc -l`). `compiler/`, `runtime/` and `_tests_/` — 997 of
+  1182 (84%, `git ls-files -- 'compiler/*.bit' 'runtime/*.bit' '_tests_/*.bit' |
   wc -l`) — are checked for fmt-canonicality by nothing, which is why four
   genuine formatter bugs (#2878, #2879, #2880, #2140) sat unreported in the
   directories it omits.
@@ -573,18 +573,18 @@ with no denominator cannot be read as coverage. A scoped gate should print
 both its scope and the size of what it excludes, so the ratio is visible in
 the log rather than reconstructible only by someone who goes looking. #2747
 gates E0200 (the same 800-line rule) over `compiler/**` and `runtime/**`,
-closing the gap instance 1 leaves outside `tests/bit/`; #2876 widens
+closing the gap instance 1 leaves outside `_tests_/bit/`; #2876 widens
 `test-fmt` itself, closing instance 2.
 
 **A benchmark win is not landed until its baseline moves down with it.**
-`tests/bit/benchgate/{benchgate,baselines}.bit` compares peak RSS and user CPU
+`_tests_/bit/benchgate/{benchgate,baselines}.bit` compares peak RSS and user CPU
 against a baseline at 1.5x — see that file's own header for the method
 (minimum of N runs, peak RSS and user CPU, never wall clock; not restated
 here). The reason worth stating, because it is not obvious from the gate's
 code: **the bar is one-directional on purpose, so the ratchet only tightens
 when a human tightens it.** A change that improves a `bench/cases/*`
 benchmark is not finished until the case's entry in
-`tests/bit/benchgate/baselines.bit` is re-recorded in the same commit. Run
+`_tests_/bit/benchgate/baselines.bit` is re-recorded in the same commit. Run
 `./make test-benchgate` and read the `cpu=`/`rss=` line it prints for that
 case (`benchgate: <name> cpu=...cs (baseline ...cs, ceiling ...cs)
 rss=...B (baseline ...B, ceiling ...B)` — printed before the comparison
@@ -662,7 +662,7 @@ describes what's on `main` today.) So the only thing any tool can currently
 name for a bad access is still a raw code address, not a source line.
 
 **Cheaper substitute already in the suite — extend it instead of building a
-detector.** `tests/stress/` already combines the two ideas a real race
+detector.** `_tests_/stress/` already combines the two ideas a real race
 detector would, at the program level instead of the instruction level:
 
 - `BIT_GC=stress` (`runtime/ABI.md` §7) collects at every safepoint, widening
@@ -670,7 +670,7 @@ detector would, at the program level instead of the instruction level:
   costs — the same "make the window huge" idea a detector uses, for free,
   from an already-shipped knob.
 - A deterministic verdict checked after the run, not a live happens-before
-  graph during it: `tests/stress/chan/race/race.bit`'s `raceVerdict()` checks
+  graph during it: `_tests_/stress/chan/race/race.bit`'s `raceVerdict()` checks
   a received-count, a checksum, and a closed-exit count against their
   expected totals; `chanracedarwin`/`chanracelinux` drive two real OS threads
   through it and fail on a stalled counter (`STALL_NS`) rather than a
@@ -684,7 +684,7 @@ The substitute proves narrower than a real detector ("this invariant held
 under this stress run", not "no data race exists anywhere in this binary"),
 but it costs nothing beyond an ordinary test program, needs no special build,
 and directly exercises the composite-value race §23 names as the actual
-hazard. If more coverage is wanted, the next step is another `tests/stress/`
+hazard. If more coverage is wanted, the next step is another `_tests_/stress/`
 program in the same shape — a counter/checksum verdict plus `BIT_GC=stress` —
 covering `std/sync`'s `Mutex`/`RWMutex`/`WaitGroup` (already chan-based,
 `stdlib/sync/`, so they already inherit the channel happens-before edge, §23
@@ -701,7 +701,7 @@ comparison is structurally blind to a bug both trees share; see "What the
 differentials assert" above. A fuzzer with its own expected answer does not
 have that blind spot.
 
-**`./make test-fuzz`** (`tests/bit/fuzz.bit`) mutation-fuzzes the lexer and
+**`./make test-fuzz`** (`_tests_/bit/fuzz.bit`) mutation-fuzzes the lexer and
 the parser. It runs `bit check` on each mutant and watches only for a crash
 or a hang. It sees front-end crashes only: a program that parses cleanly and
 later computes the wrong value is invisible to it.
@@ -846,7 +846,7 @@ before #2520.
 **But the detector has no caller yet, so behavior is unchanged.** Nothing
 under `runtime/` or `stdlib/crypto/` calls `bit_rt_crypto_hwcaps` — grep for
 it turns up only its own definitions and one comment in
-`tests/imports/cryptokat/main.bit` noting exactly this gap. `stdlib/crypto`
+`_tests_/imports/cryptokat/main.bit` noting exactly this gap. `stdlib/crypto`
 still dispatches only on the three x86-64-scoped `_hw_available` probes
 above, which are still hardcoded `false` everywhere. So AES, GHASH and
 SHA-256 run through the constant-time software path on ARM64 today, the same
@@ -866,7 +866,7 @@ testing). `BIT_CRYPTO_NO_HW` is not read by any `.bit` file either — the
 inputs are `getauxval`/`sysctlbyname` only.
 
 **Verified by running the existing KAT suites, not by reading the source
-alone.** `tests/imports/{cryptoaes,cryptogcm,cryptosha256}` (which exercise
+alone.** `_tests_/imports/{cryptoaes,cryptogcm,cryptosha256}` (which exercise
 `hwAvailableAes`/`hwAvailableGhash`/`hwAvailableSha256` directly) were run
 unset, `BIT_CRYPTO_HW=0`, `BIT_CRYPTO_HW=1`, and `BIT_CRYPTO_NO_HW=1` on
 aarch64-macos. Every run: `hwAvailable*() == false`, and stdout matched each
@@ -916,7 +916,7 @@ of the site is generated *from* this tree — `docs/tutorial.md`, `docs/referenc
 
 Two consequences for work done **here**:
 
-- **The doc gates still carry the site.** `tests/bit/docs.bit` typechecks every
+- **The doc gates still carry the site.** `_tests_/bit/docs.bit` typechecks every
   Bit-tagged block under `docs/`, and the site publishes those same files —
   "Get started" *is* `docs/tutorial.md`, not a copy. A docs change that passes
   the gate here is publishable there; one that fails is not.

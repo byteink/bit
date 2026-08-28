@@ -1,0 +1,385 @@
+// The `spec/SPEC.md` grammar-consistency gate (#2758).
+//
+// Nothing had ever read `spec/SPEC.md` before this file, though it is the
+// project's stated syntax authority: it contradicted itself and the parser
+// silently and repeatedly (#2754, #2815-#2820, #2774, #2823 — nine corrections
+// in one session, every one found by a human re-reading the text). NOT a
+// grammar validator (ruled out: most of SPEC.md is illustrative prose or
+// deliberately-invalid examples a parser-based check would misjudge). Instead
+// a symbol-table pass plus a structural cross-check over the EBNF blocks —
+// cheap, zero false positives on the reviewed text, catches 5 of the 9.
+//
+// SCOPE: "## 9. Syntactic Grammar" onward only (§10-21 + Appendix A), never
+// §1-8's lexical grammar. §4's lexical productions reference bare
+// meta-identifiers with no production of their own (`any_char`,
+// `unicode_letter`, `a`..`z` ranges) — legitimate there, indistinguishable
+// from a real dangling reference by any check this file could write. Every
+// historical defect below is in §9 or later anyway.
+//
+// CHECK 1 — DANGLING NONTERMINALS. Every bare identifier in an EBNF RHS must
+// name a defined production or be ALL UPPERCASE (this grammar's terminal
+// convention: `IDENT`, `STRING_LIT`, `EOF`). Otherwise reported — naming the
+// case mismatch directly if the uppercase form is a terminal used elsewhere
+// (#2823's `string_lit`/`STRING_LIT` shape). Catches #2817 (`call_expression`,
+// never defined) and #2819 (`expr`, meant `expression`).
+//
+// CHECK 2 — APPENDIX A vs THE DEFINING SECTION. Appendix A calls itself a
+// restatement, so a production defined in both places should describe the
+// same alternatives. NOT byte-identical — tried first and rejected: on the
+// CURRENT, correct tree, `struct_decl`/`interface_decl`/`enum_decl` spell out
+// `";" | ","` in their section but use the `fsep` shorthand in Appendix A,
+// `statement`'s alternatives are reordered between the two, and `constraint`
+// names two UNRELATED grammars (a generic bound, a semver range) that happen
+// to share a name — four legitimate differences that would make a
+// byte-identical check permanently red on main. What actually distinguishes a
+// real defect (#2754 dropped `match_stmt`; #2818 dropped `extern_fn_decl`) is
+// that ONE ALTERNATIVE VANISHED — so this compares each side's alternatives by
+// LEADING token only (skipping a leading `[ "export" ]`), order-insensitive,
+// tolerant of anything deeper. Verified zero findings on main; reproduces
+// #2754/#2818 exactly when reverted (ticket's own report has the mutations).
+//
+// CHECK 3 — A PRODUCTION'S OWN ALTERNATION MUST NOT REPEAT ITSELF. CHECK 2
+// compares Appendix A against the body BY LEADING TOKEN, but a defect that
+// corrupts both copies identically is invisible to a cross-copy diff — #3427's
+// blind struct->class sweep left `struct_decl = ( "class" | "class" ) IDENT
+// ...` at BOTH copies, and CHECK 2 stayed green because the two sides still
+// agreed with each other. CHECK 3 instead looks WITHIN one production: every
+// scope its own `|` can introduce alternatives in — the top-level RHS, and
+// every group nested inside it (`( ... )`, `[ ... ]`, `{ ... }`) — is split
+// into alternatives and checked for two sharing a leading token. Reproduces
+// #3427's exact shape when reintroduced into a scratch copy (ticket's own
+// report has the mutation); zero findings on the current, correct tree.
+//
+// WHAT THIS CANNOT SEE, so a green run is not misread: it never runs the
+// parser, so a form the compiler accepts that the spec never admits (or the
+// reverse) is invisible — that needs the parser as an oracle, a bigger job,
+// not done here. Not prose correctness, not §20's worked examples. (#3269:
+// `_tests_/bit/docs.bit` now compiles `spec/SPEC.md`'s ```` ```bit ```` blocks
+// too, alongside `docs/`'s — that check is semantic, not grammatical, and
+// stays entirely separate from this file's productions-only pass.) Not §1-8.
+// A production restated in a body section with no Appendix A counterpart
+// (`type_args`) is not flagged: Appendix A does not claim to restate every
+// helper, only that what it DOES restate agrees.
+//
+// Run from the repository root: bit-out/bin/bit run _tests_/bit/spec
+// `BIT_REPO` overrides the repository root (default: search . / .. / ../.. /
+// ../../..).
+
+import { exists, readFile } from "std/fs"
+import { env } from "std/os"
+import { hasPrefix, indexOf, join, split, trimSpace, toUpper } from "std/strings"
+
+// Bounds — every walk below is over a fixed, small file, but each is still
+// capped explicitly (Power of 10 rule 2).
+const maxSpecBytes: int = 2097152
+const maxScanLines: int = 8192
+const maxBlockLines: int = 400
+const maxAltsPerProduction: int = 64
+const maxTokensPerRhs: int = 256
+const maxCommentSpans: int = 16
+const maxOptionalSkips: int = 8
+const maxTotalProductions: int = 512
+const maxGroupNesting: int = 16
+
+// Floors, not exact counts (a pinned exact count merges cleanly across two
+// branches that each add one production while the total is actually two —
+// see this repo's own scar tissue on that). Each is set well under today's
+// real count (24 grammar blocks, 178 productions, 90 of them in Appendix A).
+const minGrammarBlocks: int = 15
+const minProductions: int = 100
+const minAppendixProductions: int = 50
+
+const scopeMarker: string = "## 9. Syntactic Grammar"
+const appendixMarker: string = "## Appendix A"
+
+class Production {
+  name: string
+  rhs: string       // comments stripped, continuation lines joined with " | "
+  fileLine: int      // 1-based, for a diagnostic naming spec/SPEC.md:<line>
+  appendix: bool     // true if this occurrence is inside Appendix A
+}
+
+class Scan { failures: int, blocks: int, productions: int, appendixProductions: int }
+
+fn die(msg: string) {
+  eprint("spec: SETUP FAILED: ${msg}\n")
+  osExit(1)
+}
+
+fn report(sc: Scan, msg: string) {
+  eprint("spec: FAIL: ${msg}\n")
+  sc.failures = sc.failures + 1
+}
+
+// The repo root: the nearest ancestor holding `spec/SPEC.md`. BIT_REPO wins.
+// Never falls back silently — a wrong cwd must abort, not scan an empty file.
+fn repoRoot(): string {
+  let override = env("BIT_REPO")
+  if (len(override) > 0) {
+    return override
+  }
+  let candidates = [".", "..", "../..", "../../.."]
+  for c of candidates {
+    if (exists("${c}/spec/SPEC.md")) {
+      return c
+    }
+  }
+  die("cannot locate spec/SPEC.md from this cwd; set BIT_REPO")
+  return ""
+}
+
+
+fn collectNames(productions: []Production): []string {
+  let defined = []string(0)
+  for p of productions {
+    if (!containsStr(defined, p.name)) {
+      defined = append(defined, p.name)
+    }
+  }
+  return defined
+}
+
+// Every ALL-UPPERCASE token referenced anywhere — this grammar's own
+// convention for a terminal (`IDENT`, `STRING_LIT`, `EOF`, ...).
+fn collectUpperTokens(productions: []Production): []string {
+  let upperSeen = []string(0)
+  for p of productions {
+    for tok of identTokens(p.rhs) {
+      if (toUpper(tok) == tok && !containsStr(upperSeen, tok)) {
+        upperSeen = append(upperSeen, tok)
+      }
+    }
+  }
+  return upperSeen
+}
+
+// One token from one production's RHS: fine if it names a defined production
+// or looks like a terminal; otherwise dangling, or — if its uppercase form is
+// a terminal seen elsewhere — a case mismatch (the #2823 shape).
+fn checkToken(sc: Scan, p: Production, tok: string, defined: []string, upperSeen: []string) {
+  if (containsStr(defined, tok) || toUpper(tok) == tok) {
+    return
+  }
+  let upperForm = toUpper(tok)
+  if (containsStr(upperSeen, upperForm)) {
+    report(sc, "spec/SPEC.md:${p.fileLine}: production `${p.name}` references `${tok}`, which looks like the terminal `${upperForm}` written in the wrong case")
+    return
+  }
+  report(sc, "spec/SPEC.md:${p.fileLine}: production `${p.name}` references undefined nonterminal `${tok}`")
+}
+
+// CHECK 1: every RHS token is either a defined production, or looks like a
+// terminal (ALL UPPERCASE). Anything else is dangling.
+fn checkDangling(sc: Scan, productions: []Production) {
+  let defined = collectNames(productions)
+  let upperSeen = collectUpperTokens(productions)
+  for p of productions {
+    for tok of identTokens(p.rhs) {
+      checkToken(sc, p, tok, defined, upperSeen)
+    }
+  }
+}
+
+// CHECK 2: for every production restated in both Appendix A and a body
+// section, the two sides' alternative-discriminator sets must agree. A name
+// can legitimately have more than one body occurrence (`constraint` names two
+// unrelated grammars) — passing against ANY one of them is enough.
+fn checkAppendixConsistency(sc: Scan, productions: []Production) {
+  for p of productions {
+    if (!p.appendix) {
+      continue
+    }
+    let pd = canonicalDiscriminators(p.rhs)
+    let bodyCount = 0
+    let anyMatch = false
+    let detail = ""
+    for q of productions {
+      if (q.appendix || q.name != p.name) {
+        continue
+      }
+      bodyCount = bodyCount + 1
+      let qd = canonicalDiscriminators(q.rhs)
+      if (qd == pd) {
+        anyMatch = true
+      }
+      detail = detail + "\n    body spec/SPEC.md:${q.fileLine}: {${humanize(qd)}}"
+    }
+    if (bodyCount == 0 || anyMatch) {
+      continue
+    }
+    report(sc, "spec/SPEC.md:${p.fileLine}: Appendix A's `${p.name}` = {${humanize(pd)}} agrees with none of its body restatement(s):${detail}")
+  }
+}
+
+// CHECK 3: within a single production's own alternation — its top-level RHS
+// or any nested group — no two alternatives may share a leading token. Runs
+// over every production, appendix and body alike: #3427's duplicate sat in
+// BOTH copies, and CHECK 2's cross-copy comparison cannot see a defect they
+// share.
+fn checkSelfDuplicateAlternatives(sc: Scan, productions: []Production) {
+  for p of productions {
+    for scope of selfDuplicateScopes(p.rhs) {
+      let dup = firstDuplicateLeadingToken(scope)
+      if (len(dup) > 0) {
+        report(sc, "spec/SPEC.md:${p.fileLine}: production `${p.name}` has two alternatives in the same group both starting with ${dup}")
+      }
+    }
+  }
+}
+
+fn checkFloors(sc: Scan) {
+  if (sc.blocks < minGrammarBlocks) {
+    report(sc, "only ${sc.blocks} grammar block(s) found in the §9+ scope, want >= ${minGrammarBlocks} — the fence classifier broke or the scope boundary moved")
+  }
+  if (sc.productions < minProductions) {
+    report(sc, "only ${sc.productions} production(s) extracted, want >= ${minProductions}")
+  }
+  if (sc.appendixProductions < minAppendixProductions) {
+    report(sc, "only ${sc.appendixProductions} production(s) found inside Appendix A, want >= ${minAppendixProductions} — Appendix A may have been gutted")
+  }
+}
+
+// The scoped text (§9 onward) split into lines, plus the two pieces of
+// bookkeeping the scan needs: `appendixOffset` (a char offset into the
+// scoped text, marking where Appendix A begins) and `scopeStartFileLine`
+// (the 1-based file line of `lines[0]`, so every reported line number is a
+// real spec/SPEC.md line).
+class SpecDoc { lines: []string, appendixOffset: int, scopeStartFileLine: int }
+
+fn loadSpecDoc(root: string): SpecDoc {
+  let path = "${root}/spec/SPEC.md"
+  let text = readFile(path) catch e {
+    die("cannot read ${path}: ${e.message()}")
+    ""
+  }
+  if (len(text) > maxSpecBytes) {
+    die("${path} is ${len(text)} bytes, over the ${maxSpecBytes} bound")
+  }
+  let scopeRel = indexOf(text, scopeMarker)
+  if (scopeRel < 0) {
+    die("could not find '${scopeMarker}' in ${path} — has §9's heading moved or been reworded?")
+  }
+  let scopeStart = int(scopeRel)
+  let scoped = text[scopeStart:len(text)]
+  let appendixRel = indexOf(scoped, appendixMarker)
+  if (appendixRel < 0) {
+    die("could not find '${appendixMarker}' within the syntactic-grammar scope of ${path}")
+  }
+  let scopeStartFileLine = len(split(text[0:scopeStart], "\n"))
+  let lines = split(scoped, "\n")
+  if (len(lines) > maxScanLines) {
+    die("the syntactic-grammar scope of ${path} has ${len(lines)} lines, over the ${maxScanLines} bound")
+  }
+  return SpecDoc{ lines: lines, appendixOffset: int(appendixRel), scopeStartFileLine: scopeStartFileLine }
+}
+
+// Fence-walk state, carried across lines. A class (a reference type, §14.2)
+// so the small helpers below mutate it directly rather than threading a
+// dozen return values back up.
+class FenceState {
+  inFence: bool
+  grammarFence: bool
+  blockLines: []string
+  blockStartLineIdx: int
+  blockStartOffset: int
+}
+
+// One line's position while walking `doc.lines`: its text, its char offset
+// into the scoped text, and its 0-based index in `doc.lines`.
+class LinePos { text: string, offset: int, idx: int }
+
+// A `\`\`\`` line, either opening or closing a fence. On open, records
+// whether it is bare (a grammar-block candidate) or carries a language tag
+// (ignored). On close, classifies the buffered block and — if it is a
+// genuine EBNF block — extracts its productions into `out`.
+fn handleFenceLine(sc: Scan, st: FenceState, pos: LinePos, doc: SpecDoc,
+    out: []Production): []Production {
+  if (!st.inFence) {
+    st.inFence = true
+    st.blockStartOffset = pos.offset
+    let tag = trimSpace(pos.text[3:len(pos.text)])
+    st.grammarFence = len(tag) == 0
+    if (st.grammarFence) {
+      st.blockLines = []string(0)
+      st.blockStartLineIdx = pos.idx + 1
+    }
+    return out
+  }
+  if (st.grammarFence && classifyBlock(st.blockLines).isGrammar) {
+    sc.blocks = sc.blocks + 1
+    let isAppendix = st.blockStartOffset >= doc.appendixOffset
+    out = extractProductions(out, st.blockLines,
+      doc.scopeStartFileLine + st.blockStartLineIdx, isAppendix)
+  }
+  st.inFence = false
+  st.grammarFence = false
+  return out
+}
+
+fn bufferBlockLine(st: FenceState, line: string, doc: SpecDoc) {
+  if (len(st.blockLines) >= maxBlockLines) {
+    die("a fenced block starting near spec/SPEC.md:${doc.scopeStartFileLine + st.blockStartLineIdx} exceeds the ${maxBlockLines}-line bound")
+  }
+  st.blockLines = append(st.blockLines, line)
+}
+
+// Walks every line of `doc`, extracting every production from every bare
+// fenced block that classifies as EBNF, and tallying `sc.blocks` as it goes.
+fn scanProductions(sc: Scan, doc: SpecDoc): []Production {
+  let out = []Production(0)
+  let st = FenceState{ inFence: false, grammarFence: false, blockLines: []string(0),
+    blockStartLineIdx: 0, blockStartOffset: 0 }
+  let offset = 0
+  let i = 0
+  let n = len(doc.lines)
+  while (i < n) {
+    let line = doc.lines[i]
+    if (hasPrefix(line, "```")) {
+      out = handleFenceLine(sc, st, LinePos{ text: line, offset: offset, idx: i }, doc, out)
+    } else if (st.inFence && st.grammarFence) {
+      bufferBlockLine(st, line, doc)
+    }
+    offset = offset + len(line) + 1
+    i = i + 1
+  }
+  if (st.inFence) {
+    die("an unterminated bare fence starts near spec/SPEC.md:${doc.scopeStartFileLine + st.blockStartLineIdx - 1}")
+  }
+  return out
+}
+
+fn tallyProductions(sc: Scan, productions: []Production) {
+  sc.productions = len(productions)
+  for p of productions {
+    if (p.appendix) {
+      sc.appendixProductions = sc.appendixProductions + 1
+    }
+  }
+}
+
+fn reportResult(sc: Scan) {
+  if (sc.failures > 0) {
+    eprint("spec: FAILED — ${sc.failures} finding(s) over ${sc.productions} production(s) in ${sc.blocks} grammar block(s)\n")
+    osExit(1)
+  }
+  print("spec: ok — ${sc.productions} production(s) (${sc.appendixProductions} in Appendix A) over ${sc.blocks} grammar block(s), 0 dangling reference(s), 0 Appendix/body disagreement(s), 0 self-duplicate alternative(s)\n")
+}
+
+fn main() {
+  let selfFailed = selfTest()
+  if (selfFailed != 0) {
+    eprint("spec: SELFTEST FAILED — ${selfFailed} case(s); aborting before the real scan\n")
+    osExit(1)
+  }
+
+  let doc = loadSpecDoc(repoRoot())
+  let sc = Scan{ failures: 0, blocks: 0, productions: 0, appendixProductions: 0 }
+  let productions = scanProductions(sc, doc)
+  tallyProductions(sc, productions)
+
+  checkFloors(sc)
+  checkDangling(sc, productions)
+  checkAppendixConsistency(sc, productions)
+  checkSelfDuplicateAlternatives(sc, productions)
+  reportResult(sc)
+}

@@ -1,0 +1,229 @@
+// The Bit port of the deleted native runtime's `root` module's float surface
+// (runtime/root, #1367):
+// `bit_rt_sqrt`, `bit_rt_floor/ceil/round/trunc` and
+// `bit_rt_float_bits/float32_bits`, driven as a real linked binary.
+//
+// WHY THIS FILE'S ORACLE IS NOT THE OTHER COMPILER. `_tests_/stress/rootbit` can
+// use the language itself as its oracle, because every `string`/`[]T`/`map`
+// operation still routes through the `bit_rt_*` symbol it is checking. That
+// trick is UNAVAILABLE here and would in fact be circular: after #1442 the
+// primitives `ffloor`/`fceil`/`ftrunc`/`fround`/`fsqrt`/`floatBits`/
+// `float32Bits` are inline IR ops in BOTH compilers, so writing `ffloor(x)` on
+// the "expected" side of a comparison emits the SAME instruction as the port —
+// the test would pass for any implementation, including no implementation.
+//
+// So the expected values are EXTERNAL: IEEE-754 bit patterns generated outside
+// this repo (CPython, whose floats are IEEE binary64 and whose `math.sqrt` is
+// the platform's correctly-rounded libm). Every one of these results is fully
+// determined by IEEE-754 for the given input, so pinning them is portable
+// across both supported architectures — unlike a NaN payload, see below.
+//
+// WHY EVERY COMPARISON IS ON BIT PATTERNS AND NEVER ON VALUES. `==` is useless
+// for validating float work in both directions: `-0.0 == +0.0` is true, so it
+// PASSES an implementation that loses the sign of zero, and `NaN != NaN`, so it
+// FAILS a correct one. IEEE-754 roundToIntegral preserves the sign of zero of
+// its operand, which means `ceil(-1e-300)` is `-0.0` and `trunc(-0.5)` is
+// `-0.0`; the magic-constant identity `(x + 2^52) - 2^52` that an earlier
+// attempt at this port proposed yields `+0.0` for both. That difference is
+// invisible to `==`, visible in `floatBits`, and it flips the printed string
+// "-0" -> "0" — which is what a `const_float` golden compares. The corpus below
+// therefore carries `-0.0`, `-0.5`, `-1e-300` and `-0.9999999999999999`
+// deliberately: they are the inputs that separate a correct implementation from
+// the plausible wrong one.
+//
+// The same discipline applies to the generator, and it bit once while writing
+// this: CPython's `math.floor`/`ceil`/`trunc` return an *int*, which silently
+// drops the sign of zero, so the first generated corpus asserted `+0.0` for
+// four cases that IEEE says are `-0.0`. The oracle needs the sign restored
+// explicitly (`copysign` when the result is zero).
+//
+// NaN IS ASSERTED STRUCTURALLY, NEVER AS A CONSTANT. The default quiet NaN is
+// NEGATIVE on x86-64 (`0xFFF8...`) and POSITIVE on AArch64 (`0x7FF8...`), so a
+// pinned constant fails cross-arch and reads exactly like a codegen divergence.
+// `sqrt(-1.0)` is checked as "exponent all ones AND mantissa non-zero", which
+// is true of every NaN on every target. Infinity has no such freedom and is
+// pinned.
+//
+// A BUG FOUND WHILE WRITING THIS, WHICH IS NOT THIS PORT'S AND IS NOT WORKED
+// AROUND SILENTLY: reading an element out of a FLOAT-ELEMENT slice returns the
+// wrong value in BOTH compilers. Minimal repro, seed and self-hosted alike:
+//
+//     let xs = []f64(3)
+//     xs[0] = 1.0; xs[1] = 2.0; xs[2] = 3.0
+//     print("${xs[0]} ${xs[1]} ${xs[2]}")   // prints "3 0 0"
+//
+// `[]i64` and `[]u64` are correct, and a one-element `[]f64` is correct, which
+// points at the result of `bit_rt_slice_get` (a `u64` returned in the integer
+// register) not being moved into an FP register when the element type is a
+// float — every read after the first sees whatever is left in `d0`. `[]f32` is
+// equally wrong. Filed separately; it is a codegen/lowering defect, outside
+// this file's ownership, and it is why the corpus below is a straight line of
+// calls instead of a loop over a table.
+//
+// NOTHING HERE ALLOCATES OR NEEDS THE PORT'S HEAP. All seven functions are pure
+// and `@nosplit`; unlike the object-model surface they take no runtime state, so
+// this program neither binds memory nor calls `rootInit`.
+
+import {
+  rtSqrt, rtFloor, rtCeil, rtRound, rtTrunc, rtFloatBits, rtFloat32Bits,
+} from "../../../runtime/root"
+
+const EXP_MASK: u64 = 0x7ff0000000000000
+const MANT_MASK: u64 = 0x000fffffffffffff
+const SIGN_BIT: u64 = 0x8000000000000000
+
+// One corpus row: the four roundings plus the identity `floatBits` of the input
+// itself, all compared as patterns. Returns the number of the five that matched
+// so a partial failure still reports which family broke.
+fn ck(x: f64, efl: u64, ece: u64, ero: u64, etr: u64, ebits: u64): int {
+  let ok = 0
+  let gfl = rtFloatBits(rtFloor(x))
+  let gce = rtFloatBits(rtCeil(x))
+  let gro = rtFloatBits(rtRound(x))
+  let gtr = rtFloatBits(rtTrunc(x))
+  let gbi = rtFloatBits(x)
+  if (gfl == efl) { ok = ok + 1 } else { print("floor ${gfl} != ${efl}\n") }
+  if (gce == ece) { ok = ok + 1 } else { print("ceil ${gce} != ${ece}\n") }
+  if (gro == ero) { ok = ok + 1 } else { print("round ${gro} != ${ero}\n") }
+  if (gtr == etr) { ok = ok + 1 } else { print("trunc ${gtr} != ${etr}\n") }
+  if (gbi == ebits) { ok = ok + 1 } else { print("bits ${gbi} != ${ebits}\n") }
+  return ok
+}
+
+fn cs(x: f64, e: u64): int {
+  let g = rtFloatBits(rtSqrt(x))
+  if (g == e) {
+    return 1
+  }
+  print("sqrt ${g} != ${e}\n")
+  return 0
+}
+
+fn c32(x: f32, e: u32): int {
+  let g = rtFloat32Bits(x)
+  if (g == e) {
+    return 1
+  }
+  print("f32 ${g} != ${e}\n")
+  return 0
+}
+
+// The corpus is written as a straight line of calls rather than looped over a
+// `[]f64`, and that is NOT a style choice: reading a float out of a
+// float-element slice is BROKEN in both compilers today (see the note at the
+// top of this file). `main` supplies the loop instead, so the back-edge
+// safepoints and the allocation churn that make a `BIT_GC=stress` run mean
+// something are still here.
+//
+// Constant arguments are safe to use: the deleted seed compiler's `opt`
+// module folds none of these ops (they are absent from its fold table in
+// both compilers), so each call still emits
+// the instruction under test rather than being computed at compile time.
+fn phaseD(): int {
+  let n = 0
+  n = n + ck(0.0, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000)
+  n = n + ck(-0.0, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000)
+  n = n + ck(1.0, 0x3ff0000000000000, 0x3ff0000000000000, 0x3ff0000000000000, 0x3ff0000000000000, 0x3ff0000000000000)
+  n = n + ck(-1.0, 0xbff0000000000000, 0xbff0000000000000, 0xbff0000000000000, 0xbff0000000000000, 0xbff0000000000000)
+  n = n + ck(0.5, 0x0000000000000000, 0x3ff0000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x3fe0000000000000)
+  n = n + ck(-0.5, 0xbff0000000000000, 0x8000000000000000, 0xbff0000000000000, 0x8000000000000000, 0xbfe0000000000000)
+  n = n + ck(1.5, 0x3ff0000000000000, 0x4000000000000000, 0x4000000000000000, 0x3ff0000000000000, 0x3ff8000000000000)
+  n = n + ck(-1.5, 0xc000000000000000, 0xbff0000000000000, 0xc000000000000000, 0xbff0000000000000, 0xbff8000000000000)
+  n = n + ck(2.5, 0x4000000000000000, 0x4008000000000000, 0x4008000000000000, 0x4000000000000000, 0x4004000000000000)
+  n = n + ck(-2.5, 0xc008000000000000, 0xc000000000000000, 0xc008000000000000, 0xc000000000000000, 0xc004000000000000)
+  n = n + ck(3.7, 0x4008000000000000, 0x4010000000000000, 0x4010000000000000, 0x4008000000000000, 0x400d99999999999a)
+  n = n + ck(-3.7, 0xc010000000000000, 0xc008000000000000, 0xc010000000000000, 0xc008000000000000, 0xc00d99999999999a)
+  n = n + ck(1e-300, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x0000000000000000, 0x01a56e1fc2f8f359)
+  n = n + ck(-1e-300, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x81a56e1fc2f8f359)
+  n = n + ck(1e15, 0x430c6bf526340000, 0x430c6bf526340000, 0x430c6bf526340000, 0x430c6bf526340000, 0x430c6bf526340000)
+  n = n + ck(-1e15, 0xc30c6bf526340000, 0xc30c6bf526340000, 0xc30c6bf526340000, 0xc30c6bf526340000, 0xc30c6bf526340000)
+  n = n + ck(4503599627370496.0, 0x4330000000000000, 0x4330000000000000, 0x4330000000000000, 0x4330000000000000, 0x4330000000000000)
+  n = n + ck(-4503599627370496.0, 0xc330000000000000, 0xc330000000000000, 0xc330000000000000, 0xc330000000000000, 0xc330000000000000)
+  n = n + ck(4503599627370495.5, 0x432ffffffffffffe, 0x4330000000000000, 0x4330000000000000, 0x432ffffffffffffe, 0x432fffffffffffff)
+  n = n + ck(123456.789, 0x40fe240000000000, 0x40fe241000000000, 0x40fe241000000000, 0x40fe240000000000, 0x40fe240c9fbe76c9)
+  n = n + ck(-123456.789, 0xc0fe241000000000, 0xc0fe240000000000, 0xc0fe241000000000, 0xc0fe240000000000, 0xc0fe240c9fbe76c9)
+  n = n + ck(0.9999999999999999, 0x0000000000000000, 0x3ff0000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x3fefffffffffffff)
+  n = n + ck(-0.9999999999999999, 0xbff0000000000000, 0x8000000000000000, 0xbff0000000000000, 0x8000000000000000, 0xbfefffffffffffff)
+  n = n + ck(8.5, 0x4020000000000000, 0x4022000000000000, 0x4022000000000000, 0x4020000000000000, 0x4021000000000000)
+  n = n + ck(-8.5, 0xc022000000000000, 0xc020000000000000, 0xc022000000000000, 0xc020000000000000, 0xc021000000000000)
+  n = n + ck(1e308, 0x7fe1ccf385ebc8a0, 0x7fe1ccf385ebc8a0, 0x7fe1ccf385ebc8a0, 0x7fe1ccf385ebc8a0, 0x7fe1ccf385ebc8a0)
+  n = n + ck(-1e308, 0xffe1ccf385ebc8a0, 0xffe1ccf385ebc8a0, 0xffe1ccf385ebc8a0, 0xffe1ccf385ebc8a0, 0xffe1ccf385ebc8a0)
+  return n
+}
+
+fn phaseS(): int {
+  let n = 0
+  n = n + cs(0.0, 0x0000000000000000)
+  n = n + cs(-0.0, 0x8000000000000000)
+  n = n + cs(1.0, 0x3ff0000000000000)
+  n = n + cs(2.0, 0x3ff6a09e667f3bcd)
+  n = n + cs(4.0, 0x4000000000000000)
+  n = n + cs(0.25, 0x3fe0000000000000)
+  n = n + cs(1e-300, 0x20ca2fe76a3f9475)
+  n = n + cs(2.5, 0x3ff94c583ada5b53)
+  n = n + cs(1e15, 0x417e286789a07f2f)
+  n = n + cs(1e308, 0x5fe7dddf6b095ff1)
+  n = n + cs(0.5, 0x3fe6a09e667f3bcd)
+  return n
+}
+
+fn phaseF(): int {
+  let n = 0
+  n = n + c32(f32(0.0), 0x00000000)
+  n = n + c32(f32(-0.0), 0x80000000)
+  n = n + c32(f32(1.0), 0x3f800000)
+  n = n + c32(f32(-1.0), 0xbf800000)
+  n = n + c32(f32(0.5), 0x3f000000)
+  n = n + c32(f32(3.5), 0x40600000)
+  n = n + c32(f32(-3.5), 0xc0600000)
+  n = n + c32(f32(1e-30), 0x0da24260)
+  n = n + c32(f32(1e30), 0x7149f2ca)
+  n = n + c32(f32(0.1), 0x3dcccccd)
+  n = n + c32(f32(-0.1), 0xbdcccccd)
+  return n
+}
+// `sqrt(-1.0)` is NaN. Asserted by SHAPE — exponent all ones, mantissa
+// non-zero — because the default NaN's sign bit differs between x86-64 and
+// AArch64 and a pinned constant would fail cross-arch for no real reason.
+fn phaseNan(): bool {
+  let b = rtFloatBits(rtSqrt(-1.0))
+  return (b & EXP_MASK) == EXP_MASK && (b & MANT_MASK) != u64(0)
+}
+
+// Infinity has exactly one encoding per sign, so it IS pinned; and rounding an
+// infinity must return it unchanged rather than saturating.
+
+fn phaseInf(): bool {
+  let inf = rtSqrt(1e308) * rtSqrt(1e308) * 1e300
+  let b = rtFloatBits(inf)
+  let posinf = b == EXP_MASK
+  let stable = rtFloatBits(rtFloor(inf)) == EXP_MASK &&
+    rtFloatBits(rtCeil(inf)) == EXP_MASK &&
+    rtFloatBits(rtTrunc(inf)) == EXP_MASK &&
+    rtFloatBits(rtRound(inf)) == EXP_MASK
+  let neg = rtFloatBits(rtFloor(-inf)) == (EXP_MASK | SIGN_BIT)
+  return posinf && stable && neg
+}
+
+fn main() {
+  // REPEATED, and the repetition is load-bearing rather than paranoia: codegen
+  // emits `bit_rt_safepoint` only at loop back-edges and `gc.alloc` never
+  // collects, so a straight-line program runs ZERO collections under
+  // `BIT_GC=stress` and its "stress" run is just the default run twice. The
+  // loop supplies the back-edge and `churn` supplies the allocation, so the
+  // collector actually runs between corpus passes and every pass must still
+  // agree. The deleted harness `stress` asserts the collection count is non-zero.
+  let d = 0
+  let s = 0
+  let f = 0
+  let churn: []string = []
+  let i = 0
+  while (i < 4) {
+    d = phaseD()
+    s = phaseS()
+    f = phaseF()
+    churn = append(churn, "pass ${i}")
+    i = i + 1
+  }
+  print("dbl=${d}/135 sqrt=${s}/11 f32=${f}/11 nan=${phaseNan()} inf=${phaseInf()} passes=${len(churn)}\n")
+}

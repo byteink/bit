@@ -1,0 +1,800 @@
+// _tests_/bit/pmvanity.bit — `bit add` of a VANITY-named package end to end
+// through the real dispatched CLI (#2069, epic #2065). The Bit sibling of
+// _tests_/bit/pmimports.bit, which only ever drives `bit run`/`bit check`
+// against a HAND-WRITTEN bit.lock; this file is the one gate that drives
+// `bit add` itself down the vanity branch (SPEC.md §17.7's vanity
+// subsection, landed 369cf7e), resolving a `bit-import:` document and
+// fetching the git repo it names, then proves the result actually builds
+// and runs.
+//
+// WHY THIS NEEDED A BLOCKER TICKET FIRST (see #2069's own history): the
+// vanity path always dials `https://<name>` for its document
+// (pmfetch.bit's `resolveVanityUrl`) with no override, and `bit add --url`
+// is refused for a vanity spec BY DESIGN (the git URL has to come from the
+// document, not the command line) — so there was no way to drive this
+// offline until `BIT_VANITY_ORIGIN` (#2300, f2ee0da's sibling ca2a657)
+// gave the document fetch a local-origin override. That closes HALF the
+// gap: it only redirects the *document* fetch — `docs/package-manager.md`
+// is explicit that it "never applies to the git fetch of that resolved
+// URL". The resolved `<gitURL>` a real document names must still be
+// `https://` (`parseVanityDoc` rejects anything else), and the actual
+// `git fetch`/`git ls-remote` of THAT url has no Bit-side override at all.
+//
+// The second half is closed here with a plain, standard git mechanism
+// external to Bit entirely: a scoped `GIT_CONFIG_GLOBAL` file carrying one
+// `url.<file-path>.insteadOf <https-url>` rule, so `git` itself transparently
+// rewrites the fetch to the local fixture — proven offline below, never
+// touching the developer's real `~/.gitconfig` (a fresh file, named only by
+// `GIT_CONFIG_GLOBAL`, is used in its place) or `~/.bit/pkg`
+// (`BIT_PKG_CACHE` points at a scratch root). `bit.lock`'s own `url` field
+// still records the plain `https://` address the document named — the
+// rewrite is invisible to Bit's own bookkeeping, exactly as intended.
+//
+// The vanity name is chosen with the REAL shape #2069 calls for: a
+// non-git host (`isKnownGitHost` doesn't recognize it, so `parseSpec` takes
+// the vanity branch) carrying a `/pkg/` path segment — `localhost:<port>`
+// would look the part but a colon is not a legal spec-segment byte
+// (pmfetch.bit's `validateSegment`), so the port lives only in
+// `BIT_VANITY_ORIGIN` (`docs/package-manager.md`'s own documented split:
+// the origin overrides WHERE the document is dialed, never what name is
+// recorded in bit.json/bit.lock). Both hostnames below sit under the
+// IANA-reserved `.invalid` TLD (RFC 2606 §2), the same defense pmimports.bit
+// already uses: if any piece of this wiring were silently dropped, the
+// fallback is a guaranteed-fast DNS failure, never an accidental real dial
+// or a hang.
+//
+// The git fixture's tag is ANNOTATED (`git tag -a`), not lightweight — the
+// one hard requirement #2064 exists to guard: `resolveDependencyRef`'s
+// `git ls-remote` must peel `<ref>^{}` to the underlying commit rather than
+// recording the tag OBJECT's own sha, and a lightweight-tag fixture sails
+// straight past that bug. `assertAnnotatedTag`, below, asserts
+// `git cat-file -t refs/tags/v1.0.0` reports exactly `tag`, so this gate
+// cannot silently regress to a lightweight fixture.
+//
+// Every git invocation below runs under its OWN scoped `GIT_CONFIG_GLOBAL`
+// + `GIT_CONFIG_SYSTEM=/dev/null` + a scratch `HOME` — never the operator's
+// real ambient config (which sets `tag.gpgsign true` on this fleet) — so
+// this gate's outcome depends only on what it itself wires, not on the
+// machine it happens to run on.
+//
+// BIT_WORKERS=2 IS REQUIRED to run this file (`tools/build/gates.bit`'s
+// `test-pmvanity` entry sets it). The vanity-document server runs on a
+// spawned green thread while the main thread blocks inside `osRunBounded`
+// waiting on the `bit add` child — this runtime defaults to exactly ONE
+// scheduler worker OS thread (ABI.md §9), and that spawned thread never
+// gets to run until the blocking native call returns, so the fetch always
+// times out with one worker. Reproduced directly before adding this: the
+// same server+subprocess shape hangs the accept until the subprocess
+// itself gives up, and a second worker turns it instant. `bit run` this
+// file standalone without `BIT_WORKERS=2` and it fails the same way.
+//
+// ANTI-VACUITY RULES (identical to pmimports.bit's own, restated here
+// because this file cannot import that one — every _tests_/bit/*.bit program
+// is its own standalone compilation unit):
+//
+//  - Nothing is ever SKIPPED. A missing `git` is a loud failure naming it
+//    (`rcGitAbsent`), never an early return.
+//  - Exit codes are compared EXACTLY (`== 0`), never `!= 0`.
+//  - The wrapper script reserves 111-114 and 121 for its OWN failures, and
+//    those are rejected before any verdict is read.
+//  - Capture files must EXIST before they are read.
+//  - stdout is compared with exact equality, not `contains`.
+//  - The fixture HEAD is checked to be 40 hex digits before it is used.
+//  - bit.json/bit.lock are read back through the real JSON/JSONC parsers
+//    and specific fields are asserted present and equal to an expected
+//    value — never a substring search that an empty or truncated file
+//    would also satisfy.
+import { exists, readFile, remove, writeFile } from "std/fs"
+import { envOr, exit } from "std/os"
+import { base as pathBase, dir as pathDir } from "std/path"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+import { Json, jsonGet, jsonAsString, jsonParse, jsoncParse } from "std/json"
+import { serve, ok, Server } from "std/http"
+
+// Wall-clock ceiling on any one subprocess — the same budget
+// pmimports.bit's cold `bit run` case uses, and everything this file runs
+// (one local git fixture build, one local HTTP round trip, one local git
+// fetch, one compile+link+run) is far below it on a healthy host.
+const subprocessTimeoutMs: int = 120000
+
+// The wrapper script's own reserved exit codes — a harness break, never the
+// compiler under test disagreeing (pmimports.bit carries the identical set;
+// see its own header for why each one is named rather than folded into a
+// generic nonzero check).
+const rcCdFailed: int = 111
+const rcBitNotExecutable: int = 112
+const rcStdlibUnresolvable: int = 113
+const rcBitDirUnresolvable: int = 114
+const rcGitAbsent: int = 121
+
+// `osRunBounded`'s timed-out sentinel (runtime/root/, ABI.md §19).
+const rcTimedOut: int = -2
+
+// The vanity name under test — non-git host, `/pkg/` prefix, `.invalid` TLD
+// (see the module header). `pmLastSegment` (pmcli.bit) would derive "greet"
+// from this as the bit.json/bit.lock key; `depName` below is that value,
+// spelled out rather than recomputed, since this file cannot import
+// pmcli.bit (compiler/ is the compiler's own implementation).
+const vanityName: string = "pmvanity.invalid/pkg/greet"
+const depName: string = "greet"
+
+// The git remote the fixture's `bit-import:` document names. Deliberately a
+// DIFFERENT `.invalid` host than `vanityName`'s — SPEC §17.7 never requires
+// them to match, and keeping them visibly distinct in this fixture is a
+// small proof the two names are never conflated.
+const gitRemoteUrl: string = "https://git.pmvanity.invalid/acme/greet.git"
+
+// #3270 acceptance: a SECOND vanity name/remote/package, whose fixture repo
+// puts the package in a subdirectory rather than at the repo root, and
+// whose `bit-import:` document names that subdirectory with the format's
+// `dir` extension field (SPEC §17.7). `vanityName`/`gitRemoteUrl` above are
+// untouched, and their own `checkVanityAdd` flow's document still carries
+// only the original three tokens — so one gate run proves BOTH that the new
+// field resolves a subdirectory package end to end AND that an old-format
+// document with no `dir` field still resolves exactly as before.
+const vanityNameDir: string = "pmvanity.invalid/pkg/tomllib"
+const depNameDir: string = "tomllib"
+const gitRemoteUrlDir: string = "https://git.pmvanity.invalid/acme/monorepo.git"
+const pkgSubdir: string = "pkg/toml"
+
+class Run { code: int, stdout: string, stderr: string }
+
+// The git fixture's on-disk location and isolated git identity — bundled
+// into one value passed to every fixture helper below, rather than four
+// separate positional parameters (spec/LINT.md's own E0202 guidance: past
+// five params "the arguments want to be a class").
+class FixtureCtx { root: string, srcDir: string, fixtureHome: string, noConfigPath: string }
+
+fn main() {
+  let bitExe = envOr("BIT_UNDER_TEST", "bit-out/bin/bit")
+  let stdRoot = envOr("BIT_STDLIB_UNDER_TEST", "stdlib")
+  if (!exists(bitExe)) {
+    fatal("setup", "no compiler under test at '${bitExe}' — run from the repo root, or set BIT_UNDER_TEST")
+  }
+  if (!exists(stdRoot)) {
+    fatal("setup", "no stdlib at '${stdRoot}' — run from the repo root, or set BIT_STDLIB_UNDER_TEST")
+  }
+
+  // #2367: `@v1.0.0` on the command line WRITES the canonicalised "1.0.0".
+  checkVanityAdd(bitExe, stdRoot, "v1.0.0", "1.0.0")
+  print("PASS: pmvanity — bit add resolves a vanity dependency end to end and the fetched package builds and runs\n")
+
+  checkVanityAddSubdir(bitExe, stdRoot)
+  print("PASS: pmvanity — bit add resolves a vanity dependency living in a SUBDIRECTORY of the fetched repo (dir field, #3270) end to end\n")
+
+  // #3287 regression: a tag whose OWN name contains '/' (the first-party
+  // package release scheme, SPEC §17.7, e.g. "toml/v0.1.0") — this is the
+  // vanity-form half of the ticket's reproduction; _tests_/bit/pmaddgit.bit
+  // covers the direct git-host form. Not version-shaped (#2367's
+  // `parseAddVersionRef` never matches it), so it is written verbatim.
+  checkVanityAdd(bitExe, stdRoot, "toml/v0.1.0", "toml/v0.1.0")
+  print("PASS: pmvanity — bit add resolves a vanity dependency whose REF CONTAINS '/' end to end (#3287)\n")
+}
+
+// The whole flow: build the git+HTTP fixtures, run `bit add` against them
+// through the real CLI, verify bit.json/bit.lock, then `bit run` a program
+// that imports the fetched package. `tag` is the fixture's own annotated git
+// tag AND the `@ref` `bit add` is given on the command line — parametrized
+// (rather than hardcoded "v1.0.0") so this same scenario also drives
+// #3287's regression: a tag whose name itself contains '/' is exactly the
+// shape that broke `hasExplicitRef` (compiler/pmfetch.bit) into corrupting
+// the spec with a doubly-appended "@HEAD". `written` is what #2367 writes
+// for that `tag` — identical to it for a non-version ref, canonicalised (no
+// `v` prefix) for a version-shaped one.
+fn checkVanityAdd(bitExe: string, stdRoot: string, tag: string, written: string) {
+  let name = "vanity-add"
+  let root = "/tmp/bit-pmvanity-" + uuidFormat(uuidV4())
+  let srcDir = root + "/fixture-repo"
+  mkdirp(name, srcDir)
+  writeFile(srcDir + "/greet.bit",
+    "export fn greet(): string {\n  return \"hi from vanity pkg\\n\"\n}\n") catch e {
+    fatal(name, "cannot write the fixture module: " + e.message())
+  }
+
+  let fixtureHome = root + "/fixture-home"
+  mkdirp(name, fixtureHome)
+  let noConfigPath = root + "/git-noconfig"
+  writeFile(noConfigPath, "") catch e {
+    fatal(name, "cannot write the git isolation config: " + e.message())
+  }
+
+  let ctx = FixtureCtx{ root: root, srcDir: srcDir, fixtureHome: fixtureHome, noConfigPath: noConfigPath }
+  let sha = buildFixtureRepo(name, ctx, tag)
+  assertAnnotatedTag(name, ctx, tag)
+
+  // The rewrite that makes the resolved `https://` URL fetchable offline —
+  // see the module header. `bit.lock` still records `gitRemoteUrl` itself;
+  // this file is never read by anything but `git`.
+  let rewriteConfigPath = root + "/git-rewrite-config"
+  writeFile(rewriteConfigPath, "[url \"file://${srcDir}\"]\n\tinsteadOf = ${gitRemoteUrl}\n") catch e {
+    fatal(name, "cannot write the git insteadOf config: " + e.message())
+  }
+
+  let doc = "bit-import: ${vanityName} git ${gitRemoteUrl}\n"
+  let (srv, port) = startVanityServer(name, doc)
+
+  let projDir = root + "/proj"
+  mkdirp(name, projDir)
+  // A bare manifest is all `bit add` needs to start from — it never
+  // scaffolds one itself (`docs/package-manager.md`).
+  writeFile(projDir + "/bit.json", "{}\n") catch e {
+    fatal(name, "cannot write bit.json: " + e.message())
+  }
+
+  let cacheRoot = root + "/cache"
+  let addHome = root + "/add-home"
+  mkdirp(name, addHome)
+  let addEnv = [
+    "BIT_VANITY_ORIGIN=http://127.0.0.1:${port}",
+    "GIT_CONFIG_GLOBAL=" + rewriteConfigPath,
+    "GIT_CONFIG_SYSTEM=/dev/null",
+    "HOME=" + addHome,
+  ]
+
+  let addResult = runBitCli(name, bitExe, stdRoot, projDir, cacheRoot, addEnv,
+    ["add", "${vanityName}@${tag}"], root + "/add.out", root + "/add.err")
+  srv.close()
+
+  if (addResult.code != 0) {
+    fatal(name, "`bit add ${vanityName}@${tag}` exited ${addResult.code}, want 0\n  stdout: ${addResult.stdout}  stderr: ${addResult.stderr}")
+  }
+  let expectedAddStdout = "bit add: ${depName} -> ${vanityName}@${written} (${sha})\n"
+  if (addResult.stdout != expectedAddStdout) {
+    fatal(name, "bit add stdout was '${addResult.stdout}', want exactly '${expectedAddStdout}'\n  stderr: ${addResult.stderr}")
+  }
+
+  checkManifestAndLock(name, projDir, sha, written)
+
+  writeFile(projDir + "/main.bit",
+    "import { greet } from \"greet\"\nfn main() {\n  print(greet())\n}\n") catch e {
+    fatal(name, "cannot write main.bit: " + e.message())
+  }
+
+  // No extra env here: a warm, locked import never re-resolves anything —
+  // _tests_/bit/pmimports.bit already covers that path in isolation. This
+  // call only has to prove what `bit add` just wrote is actually usable.
+  let runResult = runBitCli(name, bitExe, stdRoot, projDir, cacheRoot, []string(0),
+    ["run", "main.bit"], root + "/run.out", root + "/run.err")
+  if (runResult.code != 0) {
+    fatal(name, "`bit run main.bit` exited ${runResult.code}, want 0\n  stdout: ${runResult.stdout}  stderr: ${runResult.stderr}")
+  }
+  if (runResult.stdout != "hi from vanity pkg\n") {
+    fatal(name, "bit run stdout was '${runResult.stdout}', want exactly 'hi from vanity pkg\\n'\n  stderr: ${runResult.stderr}")
+  }
+
+  rmrf(root)
+}
+
+// #3270 acceptance: the vanity counterpart of `checkVanityAdd` above, for a
+// package that lives at `pkgSubdir` inside its fetched repo rather than at
+// the repo root — the shape a first-party `bit/pkg/<name>` package will use
+// once one exists. Same git-fixture/vanity-server/CLI-driving machinery;
+// only the fixture's own layout and the resolved document (which carries
+// the `dir` field) differ.
+//
+// The fixture repo ALSO carries a decoy module at its OWN root, exporting
+// the identical symbol name the real module exports inside `pkgSubdir`. If
+// `dir` resolution silently fell back to the repo root (the pre-#3270
+// behavior, or a regression of this fix), `bit run` below would either
+// resolve the decoy's own — visibly wrong — string, or fail outright,
+// rather than silently passing: this is not just an end-to-end resolve, it
+// is proof the RIGHT subdirectory was read.
+fn checkVanityAddSubdir(bitExe: string, stdRoot: string) {
+  let name = "vanity-add-subdir"
+  let root = "/tmp/bit-pmvanitydir-" + uuidFormat(uuidV4())
+  let srcDir = root + "/fixture-repo"
+  let modDir = srcDir + "/" + pkgSubdir
+  mkdirp(name, modDir)
+  writeFile(modDir + "/toml.bit",
+    "export fn tomlGreet(): string {\n  return \"hi from a subdirectory pkg\\n\"\n}\n") catch e {
+    fatal(name, "cannot write the fixture module: " + e.message())
+  }
+  writeFile(srcDir + "/decoy.bit",
+    "export fn tomlGreet(): string {\n  return \"WRONG: this is the repo root, not ${pkgSubdir}\\n\"\n}\n") catch e {
+    fatal(name, "cannot write the decoy module: " + e.message())
+  }
+
+  let fixtureHome = root + "/fixture-home"
+  mkdirp(name, fixtureHome)
+  let noConfigPath = root + "/git-noconfig"
+  writeFile(noConfigPath, "") catch e {
+    fatal(name, "cannot write the git isolation config: " + e.message())
+  }
+
+  let sha = buildFixtureRepoAll(name, root, srcDir, fixtureHome, noConfigPath)
+
+  let rewriteConfigPath = root + "/git-rewrite-config"
+  writeFile(rewriteConfigPath, "[url \"file://${srcDir}\"]\n\tinsteadOf = ${gitRemoteUrlDir}\n") catch e {
+    fatal(name, "cannot write the git insteadOf config: " + e.message())
+  }
+
+  let doc = "bit-import: ${vanityNameDir} git ${gitRemoteUrlDir} dir ${pkgSubdir}\n"
+  let (srv, port) = startVanityServer(name, doc)
+
+  let projDir = root + "/proj"
+  mkdirp(name, projDir)
+  writeFile(projDir + "/bit.json", "{}\n") catch e {
+    fatal(name, "cannot write bit.json: " + e.message())
+  }
+
+  let cacheRoot = root + "/cache"
+  let addHome = root + "/add-home"
+  mkdirp(name, addHome)
+  let addEnv = [
+    "BIT_VANITY_ORIGIN=http://127.0.0.1:${port}",
+    "GIT_CONFIG_GLOBAL=" + rewriteConfigPath,
+    "GIT_CONFIG_SYSTEM=/dev/null",
+    "HOME=" + addHome,
+  ]
+
+  let addResult = runBitCli(name, bitExe, stdRoot, projDir, cacheRoot, addEnv,
+    ["add", "${vanityNameDir}@v1.0.0"], root + "/add.out", root + "/add.err")
+  srv.close()
+
+  if (addResult.code != 0) {
+    fatal(name, "`bit add ${vanityNameDir}@v1.0.0` exited ${addResult.code}, want 0\n  stdout: ${addResult.stdout}  stderr: ${addResult.stderr}")
+  }
+  // #2367: written canonically as "1.0.0", never the "v1.0.0" typed above.
+  let expectedAddStdout = "bit add: ${depNameDir} -> ${vanityNameDir}@1.0.0 (${sha})\n"
+  if (addResult.stdout != expectedAddStdout) {
+    fatal(name, "bit add stdout was '${addResult.stdout}', want exactly '${expectedAddStdout}'\n  stderr: ${addResult.stderr}")
+  }
+
+  checkManifestAndLockDir(name, projDir, sha)
+
+  writeFile(projDir + "/main.bit",
+    "import { tomlGreet } from \"tomllib\"\nfn main() {\n  print(tomlGreet())\n}\n") catch e {
+    fatal(name, "cannot write main.bit: " + e.message())
+  }
+
+  // No extra env here, same reasoning as `checkVanityAdd`'s own `bit run`: a
+  // warm, locked import never re-resolves anything.
+  let runResult = runBitCli(name, bitExe, stdRoot, projDir, cacheRoot, []string(0),
+    ["run", "main.bit"], root + "/run.out", root + "/run.err")
+  if (runResult.code != 0) {
+    fatal(name, "`bit run main.bit` exited ${runResult.code}, want 0\n  stdout: ${runResult.stdout}  stderr: ${runResult.stderr}")
+  }
+  if (runResult.stdout != "hi from a subdirectory pkg\n") {
+    fatal(name, "bit run stdout was '${runResult.stdout}', want exactly 'hi from a subdirectory pkg\\n' (got the DECOY's output instead, meaning dir resolution silently fell back to the repo root) — stderr: ${runResult.stderr}")
+  }
+
+  rmrf(root)
+}
+
+// --- the git fixture --------------------------------------------------
+
+// One commit, one ANNOTATED tag `tag`, built under its own scoped git
+// identity — `ctx.fixtureHome`/`ctx.noConfigPath` seal it away from the
+// operator's real `~/.gitconfig` (this fleet sets `tag.gpgsign true` there)
+// so the fixture is unsigned and deterministic regardless of what machine
+// runs this gate. `tag` may itself contain '/' (#3287) — git accepts that
+// as a nested ref under `refs/tags/`. Returns the tagged commit's own
+// 40-hex sha.
+fn buildFixtureRepo(name: string, ctx: FixtureCtx, tag: string): string {
+  let shaPath = ctx.root + "/fixture-head"
+  let q = shQuote(ctx.srcDir)
+  let setup = "set -e\n" +
+    "command -v git > /dev/null 2>&1 || exit ${rcGitAbsent}\n" +
+    "export HOME=" + shQuote(ctx.fixtureHome) + "\n" +
+    "export GIT_CONFIG_GLOBAL=" + shQuote(ctx.noConfigPath) + "\n" +
+    "export GIT_CONFIG_SYSTEM=/dev/null\n" +
+    "git init --quiet -b main " + q + "\n" +
+    "git -C " + q + " config user.email " + shQuote("pmvanity@example.com") + "\n" +
+    "git -C " + q + " config user.name " + shQuote("pmvanity fixture") + "\n" +
+    "git -C " + q + " add greet.bit\n" +
+    "git -C " + q + " commit --quiet --no-gpg-sign -m " + shQuote("vanity fixture") + "\n" +
+    "git -C " + q + " tag -a " + shQuote(tag) + " --no-sign -m " + shQuote(tag) + "\n" +
+    "git -C " + q + " rev-parse HEAD > " + shQuote(shaPath) + "\n"
+  mustSucceed(name, "git fixture repo", setup)
+
+  let sha = trimEol(readFile(shaPath) catch e {
+    fatal(name, "cannot read the fixture HEAD: " + e.message())
+    ""
+  })
+  if (!isFullSha(sha)) {
+    fatal(name, "fixture HEAD is not a 40-hex commit sha: '${sha}'")
+  }
+  return sha
+}
+
+// Same shape as `buildFixtureRepo` above, but `git add -A .` rather than one
+// named file — `checkVanityAddSubdir`'s fixture tree has more than one path
+// (the decoy at the repo root, plus the real module nested under
+// `pkgSubdir`), and both need to be in the commit.
+fn buildFixtureRepoAll(name: string, root: string, srcDir: string, fixtureHome: string, noConfigPath: string): string {
+  let shaPath = root + "/fixture-head"
+  let q = shQuote(srcDir)
+  let setup = "set -e\n" +
+    "command -v git > /dev/null 2>&1 || exit ${rcGitAbsent}\n" +
+    "export HOME=" + shQuote(fixtureHome) + "\n" +
+    "export GIT_CONFIG_GLOBAL=" + shQuote(noConfigPath) + "\n" +
+    "export GIT_CONFIG_SYSTEM=/dev/null\n" +
+    "git init --quiet -b main " + q + "\n" +
+    "git -C " + q + " config user.email " + shQuote("pmvanity@example.com") + "\n" +
+    "git -C " + q + " config user.name " + shQuote("pmvanity fixture") + "\n" +
+    "git -C " + q + " add -A .\n" +
+    "git -C " + q + " commit --quiet --no-gpg-sign -m " + shQuote("vanity subdir fixture") + "\n" +
+    "git -C " + q + " tag -a v1.0.0 --no-sign -m " + shQuote("v1.0.0") + "\n" +
+    "git -C " + q + " rev-parse HEAD > " + shQuote(shaPath) + "\n"
+  mustSucceed(name, "git fixture repo (subdir)", setup)
+
+  let sha = trimEol(readFile(shaPath) catch e {
+    fatal(name, "cannot read the fixture HEAD: " + e.message())
+    ""
+  })
+  if (!isFullSha(sha)) {
+    fatal(name, "fixture HEAD is not a 40-hex commit sha: '${sha}'")
+  }
+  return sha
+}
+
+// The one assertion #2069 exists to pin: the fixture tag must be a real
+// annotated tag OBJECT, never a lightweight ref — #2064's bug is exactly a
+// failure a lightweight-tag fixture sails past.
+fn assertAnnotatedTag(name: string, ctx: FixtureCtx, tag: string) {
+  let typePath = ctx.root + "/fixture-tag-type"
+  let q = shQuote(ctx.srcDir)
+  let check = "set -e\n" +
+    "export HOME=" + shQuote(ctx.fixtureHome) + "\n" +
+    "export GIT_CONFIG_GLOBAL=" + shQuote(ctx.noConfigPath) + "\n" +
+    "export GIT_CONFIG_SYSTEM=/dev/null\n" +
+    "git -C " + q + " cat-file -t refs/tags/" + tag + " > " + shQuote(typePath) + "\n"
+  mustSucceed(name, "checking the fixture tag is annotated", check)
+
+  let tagType = trimEol(readFile(typePath) catch e {
+    fatal(name, "cannot read the fixture tag type: " + e.message())
+    ""
+  })
+  if (tagType != "tag") {
+    fatal(name, "fixture tag ${tag} is not annotated: `git cat-file -t` reported '${tagType}', want 'tag'")
+  }
+}
+
+// --- the vanity-document HTTP fixture ----------------------------------
+
+// Binds a kernel-chosen local port and serves exactly ONE request with
+// `doc`'s body — `addVanityDependency`'s own resolution (no requires in
+// this fixture's manifest, so no transitive walk) issues exactly one
+// `resolveVanityUrl` GET, never more. `ready` blocks the caller until the
+// spawned green thread has actually started, the same rendezvous
+// `examples/httpserver/httpserver.bit` uses — the kernel's own listen
+// backlog would absorb the race regardless, but the explicit handshake
+// costs nothing and removes any doubt.
+fn startVanityServer(name: string, doc: string): (Server, int) {
+  let srv = serve("127.0.0.1", 0) catch e {
+    fatal(name, "cannot bind the local vanity-document server: " + e.message())
+    panic("pmvanity: unreachable — fatal() already exited")
+  }
+  let port = srv.port() catch e {
+    fatal(name, "cannot read the vanity-document server's port: " + e.message())
+    0 - 1
+  }
+  let ready = chan<int>(1)
+  spawn serveVanityOnce(srv, doc, ready)
+  let started = <- ready
+  return srv, port
+}
+
+// Runs on its own green thread. A connection or write failure here surfaces
+// as `bit add` itself failing (it has nothing to resolve the vanity name
+// against), which the caller already treats as a hard failure — no need to
+// duplicate that diagnosis on this side of the wire.
+fn serveVanityOnce(s: Server, body: string, ready: chan<int>) {
+  ready <- 0
+  let ex = s.accept() catch e { return }
+  ex.respond(ok(body)) catch e { return }
+}
+
+// --- bit.json / bit.lock verification -----------------------------------
+
+// Reads both files back through the real JSON/JSONC parsers and asserts the
+// specific fields SPEC §17.7 promises for a vanity dependency — never a
+// substring search, which an empty or truncated file could also satisfy.
+// `expectedSpecRef` comparing EQUAL to the literal `@${written}` form
+// (rather than a resolved sha) is exactly what proves `hasExplicitRef`
+// (compiler/pmfetch.bit) correctly detected the ref as explicit (#3287):
+// the pre-fix bug would have failed `bit add` outright before this is ever
+// reached. `written` (#2367) differs from `tag` only when `tag` was a
+// `v`-prefixed version (`checkVanityAdd`'s own doc comment).
+fn checkManifestAndLock(name: string, projDir: string, sha: string, written: string) {
+  let bitJsonText = readFile(projDir + "/bit.json") catch e {
+    fatal(name, "cannot read the updated bit.json: " + e.message())
+    ""
+  }
+  let bitJsonDoc = mustParseJsonc(name, "bit.json", bitJsonText)
+  let deps = mustJsonGet(name, "bit.json", bitJsonDoc, "dependencies")
+  let specRef = mustJsonString(name, "bit.json .dependencies", deps, depName)
+  let expectedSpecRef = "${vanityName}@${written}"
+  if (specRef != expectedSpecRef) {
+    fatal(name, "bit.json's ${depName} dependency is '${specRef}', want '${expectedSpecRef}'")
+  }
+
+  let bitLockText = readFile(projDir + "/bit.lock") catch e {
+    fatal(name, "cannot read bit.lock: " + e.message())
+    ""
+  }
+  let bitLockDoc = mustParseJson(name, "bit.lock", bitLockText)
+  let entry = mustJsonGet(name, "bit.lock", bitLockDoc, depName)
+
+  let vanityField = mustJsonString(name, "bit.lock ${depName} entry", entry, "vanity")
+  if (vanityField != vanityName) {
+    fatal(name, "bit.lock's vanity field is '${vanityField}', want '${vanityName}'")
+  }
+  // #3270: this fixture's `bit-import:` document carries only the original
+  // three tokens (no `dir` field) — proving that shape still resolves, and
+  // that the resulting entry carries no stray `dir` key, is this file's own
+  // half of #3270's "old-format document is a compatible extension"
+  // acceptance criterion.
+  let dirV = jsonGet(entry, "dir")
+  if (isSome(dirV)) {
+    fatal(name, "bit.lock's ${depName} entry unexpectedly has a 'dir' key — its bit-import: document named no dir field")
+  }
+  let urlField = mustJsonString(name, "bit.lock ${depName} entry", entry, "url")
+  if (urlField != gitRemoteUrl) {
+    fatal(name, "bit.lock's url field is '${urlField}', want '${gitRemoteUrl}'")
+  }
+  let commitField = mustJsonString(name, "bit.lock ${depName} entry", entry, "commit")
+  if (!isFullSha(commitField)) {
+    fatal(name, "bit.lock's commit field is not a 40-hex sha: '${commitField}'")
+  }
+  if (commitField != sha) {
+    fatal(name, "bit.lock's commit field is '${commitField}', want '${sha}' (the fixture's own tagged commit)")
+  }
+}
+
+// #3270 acceptance: the `checkManifestAndLock` counterpart for
+// `checkVanityAddSubdir` — same shape, plus the one field this ticket
+// exists to add: `bit.lock`'s `dir` key, pasted verbatim into this
+// ticket's own evidence.
+fn checkManifestAndLockDir(name: string, projDir: string, sha: string) {
+  let bitJsonText = readFile(projDir + "/bit.json") catch e {
+    fatal(name, "cannot read the updated bit.json: " + e.message())
+    ""
+  }
+  let bitJsonDoc = mustParseJsonc(name, "bit.json", bitJsonText)
+  let deps = mustJsonGet(name, "bit.json", bitJsonDoc, "dependencies")
+  let specRef = mustJsonString(name, "bit.json .dependencies", deps, depNameDir)
+  // #2367: canonicalised — never the "v1.0.0" typed on the command line above.
+  let expectedSpecRef = "${vanityNameDir}@1.0.0"
+  if (specRef != expectedSpecRef) {
+    fatal(name, "bit.json's ${depNameDir} dependency is '${specRef}', want '${expectedSpecRef}'")
+  }
+
+  let bitLockText = readFile(projDir + "/bit.lock") catch e {
+    fatal(name, "cannot read bit.lock: " + e.message())
+    ""
+  }
+  let bitLockDoc = mustParseJson(name, "bit.lock", bitLockText)
+  let entry = mustJsonGet(name, "bit.lock", bitLockDoc, depNameDir)
+
+  let vanityField = mustJsonString(name, "bit.lock ${depNameDir} entry", entry, "vanity")
+  if (vanityField != vanityNameDir) {
+    fatal(name, "bit.lock's vanity field is '${vanityField}', want '${vanityNameDir}'")
+  }
+  let dirField = mustJsonString(name, "bit.lock ${depNameDir} entry", entry, "dir")
+  if (dirField != pkgSubdir) {
+    fatal(name, "bit.lock's dir field is '${dirField}', want '${pkgSubdir}'")
+  }
+  let urlField = mustJsonString(name, "bit.lock ${depNameDir} entry", entry, "url")
+  if (urlField != gitRemoteUrlDir) {
+    fatal(name, "bit.lock's url field is '${urlField}', want '${gitRemoteUrlDir}'")
+  }
+  let commitField = mustJsonString(name, "bit.lock ${depNameDir} entry", entry, "commit")
+  if (!isFullSha(commitField)) {
+    fatal(name, "bit.lock's commit field is not a 40-hex sha: '${commitField}'")
+  }
+  if (commitField != sha) {
+    fatal(name, "bit.lock's commit field is '${commitField}', want '${sha}' (the fixture's own tagged commit)")
+  }
+}
+
+fn mustParseJsonc(name: string, what: string, text: string): Json {
+  return jsoncParse(text) catch e {
+    fatal(name, "cannot parse ${what}: " + e.message())
+    Json.JsonNull
+  }
+}
+
+fn mustParseJson(name: string, what: string, text: string): Json {
+  return jsonParse(text) catch e {
+    fatal(name, "cannot parse ${what}: " + e.message())
+    Json.JsonNull
+  }
+}
+
+fn mustJsonGet(name: string, what: string, container: Json, key: string): Json {
+  let v = jsonGet(container, key)
+  if (!isSome(v)) {
+    fatal(name, "${what} has no '${key}' field")
+  }
+  return unwrap(v)
+}
+
+fn mustJsonString(name: string, what: string, container: Json, key: string): string {
+  let v = mustJsonGet(name, what, container, key)
+  let s = jsonAsString(v)
+  if (!isSome(s)) {
+    fatal(name, "${what}'s '${key}' field is not a JSON string")
+  }
+  return unwrap(s)
+}
+
+// --- driving the CLI ------------------------------------------------------
+
+// Runs `<bitExe> <args...>` with `projDir` as its working directory and a
+// SEALED environment (`/usr/bin/env -i`), same discipline as
+// pmimports.bit's own `runBitCli` — plus `extraEnv`, the `KEY=VALUE` pairs
+// this file's vanity/git-rewrite plumbing needs that the warm-cache-only
+// sibling gate never did.
+fn runBitCli(name: string, bitExe: string, stdRoot: string, projDir: string,
+                   pkgCache: string, extraEnv: []string, args: []string, outPath: string, errPath: string): Run {
+  let cmd = "\"$BIT\""
+  let i = 0
+  while (i < len(args)) {
+    cmd = cmd + " " + shQuote(args[i])
+    i = i + 1
+  }
+
+  let extra = ""
+  let j = 0
+  while (j < len(extraEnv)) {
+    let eq = indexOfByte(extraEnv[j], '=')
+    if (eq >= 0) {
+      extra = extra + " " + extraEnv[j][0:eq] + "=" + shQuote(extraEnv[j][eq + 1:len(extraEnv[j])])
+    }
+    j = j + 1
+  }
+
+  let body = "BITDIR=$(cd " + shQuote(pathDir(bitExe)) + " && pwd) || exit ${rcBitDirUnresolvable}\n" +
+    "BIT=\"$BITDIR\"/" + shQuote(pathBase(bitExe)) + "\n" +
+    "[ -x \"$BIT\" ] || exit ${rcBitNotExecutable}\n" +
+    "STD=$(cd " + shQuote(stdRoot) + " && pwd) || exit ${rcStdlibUnresolvable}\n" +
+    "cd " + shQuote(projDir) + " || exit ${rcCdFailed}\n" +
+    "exec /usr/bin/env -i" +
+    " PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin" +
+    " TMPDIR=/tmp BIT_STDLIB=\"$STD\" BIT_PKG_CACHE=" + shQuote(pkgCache) + extra + " " +
+    cmd + " > " + shQuote(outPath) + " 2> " + shQuote(errPath) + "\n"
+
+  let code = runScript(name, body)
+  if (code == rcTimedOut) {
+    fatal(name, "`bit ${args[0]}` TIMED OUT after ${subprocessTimeoutMs}ms — a hang is a failure, not a stall")
+  }
+  rejectWrapperFailure(name, code)
+  if (!exists(outPath) || !exists(errPath)) {
+    fatal(name, "the wrapper exited ${code} without creating its capture files — it never launched the compiler")
+  }
+  let out = readFile(outPath) catch e {
+    fatal(name, "cannot read captured stdout: " + e.message())
+    ""
+  }
+  let err = readFile(errPath) catch e {
+    fatal(name, "cannot read captured stderr: " + e.message())
+    ""
+  }
+  return Run{ code: code, stdout: out, stderr: err }
+}
+
+// Every code the wrapper reserves for its own breakage — none of them can
+// be the compiler's verdict.
+fn rejectWrapperFailure(name: string, code: int) {
+  if (code < 0) {
+    fatal(name, "the wrapper script could not be launched (osRunBounded returned ${code})")
+  }
+  if (code == rcCdFailed) {
+    fatal(name, "wrapper: cd into the project directory failed")
+  }
+  if (code == rcBitNotExecutable) {
+    fatal(name, "wrapper: the compiler under test is not executable")
+  }
+  if (code == rcStdlibUnresolvable) {
+    fatal(name, "wrapper: the stdlib root could not be resolved to an absolute path")
+  }
+  if (code == rcBitDirUnresolvable) {
+    fatal(name, "wrapper: the compiler's directory could not be resolved to an absolute path")
+  }
+  if (code == 126) {
+    fatal(name, "wrapper: /bin/sh reported a command found but not executable (126)")
+  }
+  if (code == 127) {
+    fatal(name, "wrapper: /bin/sh reported a command not found (127) — the compiler never ran")
+  }
+}
+
+// --- shell plumbing -------------------------------------------------------
+
+fn runScript(name: string, body: string): int {
+  let path = "/tmp/bit-pmvanity-" + uuidFormat(uuidV4()) + ".sh"
+  writeFile(path, "#!/bin/sh\n" + body) catch e {
+    fatal(name, "cannot write the wrapper script: " + e.message())
+  }
+  if (fsChmod(path, 448) != 0) { // 0o700: owner rwx only
+    fatal(name, "cannot make the wrapper script executable: ${path}")
+  }
+  let code = osRunBounded(path, subprocessTimeoutMs)
+  removeQuiet(path)
+  return code
+}
+
+fn mustSucceed(name: string, what: string, body: string) {
+  let code = runScript(name, body)
+  if (code == rcTimedOut) {
+    fatal(name, "fixture setup (${what}) TIMED OUT after ${subprocessTimeoutMs}ms")
+  }
+  if (code == rcGitAbsent) {
+    fatal(name, "fixture setup (${what}) needs `git` on PATH and it is not there")
+  }
+  if (code != 0) {
+    fatal(name, "fixture setup (${what}) exited ${code}, want 0")
+  }
+}
+
+fn mkdirp(name: string, path: string) {
+  mustSucceed(name, "mkdir -p ${path}", "set -e\nmkdir -p " + shQuote(path) + "\n")
+}
+
+fn rmrf(path: string) {
+  let code = runScript("cleanup", "rm -rf " + shQuote(path) + "\n")
+  if (code != 0) {
+    print("note: could not remove the scratch tree ${path} (rm exited ${code})\n")
+  }
+}
+
+fn removeQuiet(path: string) {
+  remove(path) catch e { return }
+}
+
+// Wraps `s` as one POSIX `/bin/sh` word: every embedded `'` becomes `'\''`.
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == '\'') {
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+fn indexOfByte(s: string, c: byte): int {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == c) {
+      return i
+    }
+    i = i + 1
+  }
+  return 0 - 1
+}
+
+// --- small shared helpers ---------------------------------------------
+
+fn isFullSha(s: string): bool {
+  if (len(s) != 40) {
+    return false
+  }
+  let i = 0
+  while (i < 40) {
+    let c = s[i]
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn trimEol(s: string): string {
+  let n = len(s)
+  while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
+    n = n - 1
+  }
+  return s[0:n]
+}
+
+fn fatal(name: string, msg: string) {
+  print("FAIL [${name}]: ${msg}\n")
+  exit(1)
+}

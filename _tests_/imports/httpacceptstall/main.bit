@@ -1,0 +1,123 @@
+// Server.accept()/Exchange.read() must not read the request on the caller's
+// thread (#2346): the raw Server/accept()/respond() API used to run
+// readMessage inside accept() itself, so a connection that declared a body
+// and stalled — or a client dribbling one byte at a time — parked the
+// accept loop forever, and no later connection, already waiting or arriving
+// after, was ever accepted. This is _tests_/imports/httpstall's pair of cases
+// (#2170), driven through Server/accept()/Exchange.read()/respond() directly
+// instead of listenAndServe — #2170 only fixed the latter, leaving this
+// direct-drive API exposed.
+//
+// accept() now only wraps the TCP accept; read() (the actual readMessage)
+// runs inside dispatch(), on its own spawned green thread per exchange — so
+// a stalled or slow connection's read can only ever block itself, never the
+// accept loop or any other exchange.
+//
+// Exact elapsed milliseconds are not printed — this repo's dev machines run
+// several concurrent agents, so wall-clock numbers are not reproducible.
+// What must be reproducible, and is asserted directly, is that both bounds
+// the ticket names are met by a wide margin.
+import { serve, get, Server, Exchange, respond, ok } from "std/http"
+import { dial } from "std/net"
+import { sleep, Millisecond, now } from "std/time"
+
+// One exchange, on its own green thread: read() runs here, off the accept
+// loop, so a stalled or malformed request only ever blocks this exchange.
+fn dispatch(ex: Exchange) {
+  let req = ex.read() catch e {
+    ex.respond(respond(400, "")) catch e2 {
+      return
+    }
+    return
+  }
+  ex.respond(ok("hi")) catch e {
+    return
+  }
+}
+
+fn serveLoop(s: Server, n: int, ready: chan<int>): ()! {
+  ready <- 0
+  let i = 0
+  while (i < n) {
+    let ex = s.accept()?
+    spawn dispatch(ex)
+    i = i + 1
+  }
+  s.close()
+}
+
+fn runServer(port: int, n: int, ready: chan<int>) {
+  let s = serve("127.0.0.1", port) catch e {
+    println("serve: ${e.message()}")
+    return
+  }
+  serveLoop(s, n, ready) catch e {
+    println("serveLoop: ${e.message()}")
+  }
+}
+
+// A connection that declares a 100-byte body, sends 5 bytes, then holds the
+// socket open (never closes, never sends the rest) must not delay a normal
+// GET on a fresh connection by more than 2 seconds. Three connections total
+// (GET1, the stalled POST, GET2), so `serveLoop`'s `n` is 3.
+fn stalledConnection(port: int): ()! {
+  let a = get("http://127.0.0.1:${port}/")?
+  println("case1 GET1 -> ${a.status}")
+  let c = dial("127.0.0.1", port)?
+  c.write("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nshort")?
+  sleep(300 * Millisecond)
+  let t0 = now().ns
+  let b = get("http://127.0.0.1:${port}/")?
+  let elapsedMs = (now().ns - t0) / 1000000
+  println("case1 GET2 -> ${b.status} within-2s=${elapsedMs < 2000}")
+}
+
+fn runStalledConnection(port: int) {
+  stalledConnection(port) catch e {
+    println("case1 failed: ${e.message()}")
+  }
+}
+
+// A client sending one byte at a time (200ms apart) toward a declared body
+// must not delay a concurrent ordinary GET on a fresh connection by more than
+// 1 second. Two connections total (the dribble, the concurrent GET), so
+// `serveLoop`'s `n` is 2.
+fn dribble(port: int): ()! {
+  let c = dial("127.0.0.1", port)?
+  c.write("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n")?
+  let i = 0
+  while (i < 10) {
+    c.write("x")?
+    sleep(200 * Millisecond)
+    i = i + 1
+  }
+}
+
+fn runDribble(port: int) {
+  dribble(port) catch e {
+    return
+  }
+}
+
+fn slowClientConcurrency(port: int): ()! {
+  spawn runDribble(port)
+  sleep(300 * Millisecond)
+  let t0 = now().ns
+  let r = get("http://127.0.0.1:${port}/")?
+  let elapsedMs = (now().ns - t0) / 1000000
+  println("case2 GET -> ${r.status} within-1s=${elapsedMs < 1000}")
+}
+
+fn main() {
+  let ready1 = chan<int>(1)
+  spawn runServer(47915, 3, ready1)
+  let started1 = <- ready1
+  runStalledConnection(47915)
+
+  let ready2 = chan<int>(1)
+  spawn runServer(47916, 2, ready2)
+  let started2 = <- ready2
+  slowClientConcurrency(47916) catch e {
+    println("case2 failed: ${e.message()}")
+  }
+}

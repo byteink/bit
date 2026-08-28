@@ -55,7 +55,7 @@
 # like any other divergence, which is what the mutation test below shows.
 #
 # THE #3107 SIGNATURE, derived empirically, not from the ticket's prose: diff
-# `stdlib examples tests/cases tests/imports` between the pinned oracle and
+# `stdlib examples _tests_/cases _tests_/imports` between the pinned oracle and
 # `task-3107-inlineindex` (8d80e0a9), and aggregate every per-opcode COUNT
 # delta over every file that diverges (145 on this tree's corpus count —
 # #3107's own report measured 149 against a slightly different corpus the day

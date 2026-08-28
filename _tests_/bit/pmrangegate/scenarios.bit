@@ -1,0 +1,470 @@
+// _tests_/bit/pmrangegate/scenarios.bit — end-to-end gate for version-RANGE
+// resolution through the real dispatched `bit` CLI (#2369, epic #2362).
+// Sibling of _tests_/bit/pmaddgit.bit/pmvanity.bit (direct/vanity `bit add`)
+// and _tests_/bit/pmimports.bit (warm-cache imports): none of those, and no
+// in-process unit check in compiler/pmzclicheck.bit (which calls
+// `upDependencies` directly, never through `main.bit`'s command dispatch or
+// an observable exit code), drives `^`/`~` resolution or a PubGrub conflict
+// through a real subprocess. That gap is why #3631 ("bit up wipes a caret
+// dependency's recorded version") went unnoticed even though it was already
+// fixed: the one check that exercised the caret/tilde `bit up` path was
+// in-process and, at the time, asserted only `.commit`, never `.version`.
+//
+// This file owns `main()` and the three scenarios; harness.bit (this
+// directory, same module — see its own header for why a directory rather
+// than a single file) owns the git-fixture/CLI-driving/JSON-verification
+// plumbing every scenario below calls unqualified.
+//
+// Three scenarios, each a real `bit` subprocess against a local `file://` git
+// fixture, none of it reaching the network:
+//
+//  1. `checkCaretResolutionAndUp` — `bit add name@^1.0.0` against a fixture
+//     tagged 1.0.0/1.2.0/2.0.0 resolves to 1.2.0 (2.0.0 excluded by the
+//     caret's own upper bound), the fetched package builds and runs, and a
+//     following `bit up` with nothing new published leaves both fields
+//     unchanged.
+//  2. `checkUnsatisfiableConflict` — two real fetched packages ("depa",
+//     whose own bit.json pins a third package "thirdparty" at an exact
+//     v2.0.0, and a direct `bit add thirdparty@^1.0.0` that only has v1.0.0
+//     to resolve to) drive `resolvePubGrub` (compiler/pmresolve.bit) to a
+//     genuine, structured failure via `checkVersionConflict`
+//     (compiler/pmz.bit) — asserted on the EXACT stderr text, not merely a
+//     nonzero exit, and that neither bit.lock nor bit.json gained any debris.
+//  3. `checkBitUpMovesToPublishedVersion` — locks at 1.0.0 under `^1.0.0`,
+//     publishes 1.2.0 to the SAME fixture, then `bit up` moves both
+//     `.commit` and `.version` while `bit.json` stays byte-identical — the
+//     exact shape #3631 was filed against.
+//
+// `checkNeighboringConstraintKinds` covers the other four ref forms this
+// ticket asks about, reusing scenario 1's fixture: an exact pin (`@v1.0.0`),
+// a tilde (`@~1.0.0`, whose narrower upper bound also picks 1.0.0, proving
+// tilde and caret are not the same range), a branch (`@main`, the moving tip)
+// and a bare 40-hex commit sha. Each is asserted on `bit.lock`'s
+// `commit`/`version` fields only — no build+run and no `bit up` follow-on for
+// these four, since scenario 1 already proves the build+run and up-survives
+// paths end to end and repeating them four more times buys nothing new.
+// Deliberately NOT covered: an ssh:// spec and a vanity name — both already
+// have their own dedicated gates (pmclicheck.bit's ssh-url check,
+// pmvanity.bit) and neither is a distinct RANGE-resolution path.
+//
+// `bit up` has no `--url` override (compiler/pmcliup.bit's own module
+// comment: it refreshes whatever `bit.lock` already recorded), so every `bit
+// up` call below runs under a scoped `GIT_CONFIG_GLOBAL` carrying one
+// `url.<file-path>.insteadOf <https-url>` rule (the same mechanism
+// _tests_/bit/pmvanity.bit uses for its git fetch) rather than a CLI flag —
+// `writeInsteadOfConfig`, harness.bit.
+
+fn main() {
+  let bitExe = envOr("BIT_UNDER_TEST", "bit-out/bin/bit")
+  let stdRoot = envOr("BIT_STDLIB_UNDER_TEST", "stdlib")
+  if (!exists(bitExe)) {
+    fatal(
+      "setup",
+      "no compiler under test at '${bitExe}' — run from the repo root, or set BIT_UNDER_TEST",
+    )
+  }
+  if (!exists(stdRoot)) {
+    fatal(
+      "setup",
+      "no stdlib at '${stdRoot}' — run from the repo root, or set BIT_STDLIB_UNDER_TEST",
+    )
+  }
+
+  let (rangeCtx, sha100) = checkCaretResolutionAndUp(bitExe, stdRoot)
+  print("PASS: pmrangegate — caret resolution picks the highest in-range tag, builds+runs, and survives a no-op bit up\n")
+
+  checkNeighboringConstraintKinds(bitExe, stdRoot, rangeCtx, sha100)
+  print("PASS: pmrangegate — exact/tilde/branch/sha refs each resolve bit.lock's commit/version correctly\n")
+
+  checkUnsatisfiableConflict(bitExe, stdRoot)
+  print("PASS: pmrangegate — two packages requiring incompatible versions of a third fail loudly, naming both and the disputed package\n")
+
+  checkBitUpMovesToPublishedVersion(bitExe, stdRoot)
+  print("PASS: pmrangegate — bit up moves both commit and version to a newly published in-range tag; bit.json stays byte-identical (#3631)\n")
+}
+
+// ---- scenario 1: caret resolution + surviving a no-op bit up -------------
+
+// Returns the fixture context (reused by `checkNeighboringConstraintKinds`)
+// and the 1.0.0 tag's own sha (needed for the sha-ref neighbor check).
+fn checkCaretResolutionAndUp(bitExe: string, stdRoot: string): (FixtureCtx, string) {
+  let name = "caret-resolve"
+  let root = scratchRoot("caret")
+  let ctx = newFixtureCtx(root, "caretpkg")
+  gitInitRepo(ctx)
+  let (sha100, sha120) = buildCaretTags(ctx)
+  assertAnnotatedTag(name, ctx, "v1.2.0")
+
+  let cli = newProjectCli(name, bitExe, stdRoot, root, "main")
+  addCaretDependency(cli, ctx, sha120)
+  buildAndRunCaretProgram(cli)
+  verifyNoOpBitUp(cli, ctx, sha120)
+  return ctx, sha100
+}
+
+// Three commits, three ANNOTATED tags (1.0.0/1.2.0/2.0.0), each with
+// DIFFERENT content — so a wrong pick fails on its printed stdout, not just
+// silently building. Returns (sha of 1.0.0, sha of 1.2.0); the 2.0.0 sha is
+// intentionally discarded — only its presence-and-exclusion matters here.
+fn buildCaretTags(ctx: FixtureCtx): (string, string) {
+  writeFile(ctx.srcDir + "/greet.bit", greetSrc("1.0.0")) catch e {
+    fatal("caret-resolve", "cannot write fixture module: " + e.message())
+  }
+  let sha100 = commitAndTag(ctx, "v1.0.0", "v1.0.0")
+  writeFile(ctx.srcDir + "/greet.bit", greetSrc("1.2.0")) catch e {
+    fatal("caret-resolve", "cannot write fixture module: " + e.message())
+  }
+  let sha120 = commitAndTag(ctx, "v1.2.0", "v1.2.0")
+  writeFile(ctx.srcDir + "/greet.bit", greetSrc("2.0.0")) catch e {
+    fatal("caret-resolve", "cannot write fixture module: " + e.message())
+  }
+  let _ = commitAndTag(ctx, "v2.0.0", "v2.0.0")
+  return sha100, sha120
+}
+
+fn greetSrc(version: string): string {
+  return "export fn greet(): string {\n  return \"hi from caretpkg ${version}\\n\"\n}\n"
+}
+
+fn addCaretDependency(cli: CliCtx, ctx: FixtureCtx, sha120: string) {
+  let spec = "${gitHost}/${owner}/caretpkg@^1.0.0"
+  let addResult = runBitCli(
+    cli, ["HOME=" + cli.home],
+    ["add", spec, "--url", "file://${ctx.srcDir}"], cli.projDir + "/add.out", cli.projDir +
+      "/add.err",
+  )
+  if (addResult.code != 0) {
+    fatal(
+      cli.name,
+      "`bit add ${spec}` exited ${addResult.code}, want 0\n  stderr: ${addResult.stderr}",
+    )
+  }
+  let expectedAdd = "bit add: caretpkg -> ${spec} (${sha120})\n"
+  if (addResult.stdout != expectedAdd) {
+    fatal(cli.name, "bit add stdout was '${addResult.stdout}', want exactly '${expectedAdd}'")
+  }
+  let lock1 = readLockEntry(cli.name, cli.projDir, "caretpkg")
+  assertJsonString(cli.name, "bit.lock caretpkg", lock1, "commit", sha120)
+  assertJsonString(cli.name, "bit.lock caretpkg", lock1, "version", "1.2.0")
+}
+
+fn buildAndRunCaretProgram(cli: CliCtx) {
+  writeFile(
+    cli.projDir + "/main.bit",
+    "import { greet } from \"caretpkg\"\nfn main() {\n  print(greet())\n}\n",
+  ) catch e {
+    fatal(cli.name, "cannot write main.bit: " + e.message())
+  }
+  let runResult = runBitCli(
+    cli,
+    []string(0),
+    ["run", "main.bit"],
+    cli.projDir + "/run.out",
+    cli.projDir + "/run.err",
+  )
+  if (runResult.code != 0) {
+    fatal(
+      cli.name,
+      "`bit run main.bit` exited ${runResult.code}, want 0\n  stderr: ${runResult.stderr}",
+    )
+  }
+  if (runResult.stdout != "hi from caretpkg 1.2.0\n") {
+    fatal(
+      cli.name,
+      "bit run stdout was '${runResult.stdout}', want exactly 'hi from caretpkg 1.2.0\\n'",
+    )
+  }
+}
+
+fn verifyNoOpBitUp(cli: CliCtx, ctx: FixtureCtx, sha120: string) {
+  let rewritePath = writeInsteadOfConfig(cli, ctx.srcDir, "caretpkg")
+  let upEnv = [
+    "HOME=" + cli.home,
+    "GIT_CONFIG_GLOBAL=" + rewritePath,
+    "GIT_CONFIG_SYSTEM=/dev/null",
+  ]
+  let upResult = runBitCli(cli, upEnv, ["up"], cli.projDir + "/up.out", cli.projDir + "/up.err")
+  if (upResult.code != 0) {
+    fatal(cli.name, "`bit up` exited ${upResult.code}, want 0\n  stderr: ${upResult.stderr}")
+  }
+  let expectedUp = "bit up: caretpkg -> ^1.0.0 (${sha120})\n"
+  if (upResult.stdout != expectedUp) {
+    fatal(cli.name, "bit up stdout was '${upResult.stdout}', want exactly '${expectedUp}'")
+  }
+  let lock2 = readLockEntry(cli.name, cli.projDir, "caretpkg")
+  assertJsonString(cli.name, "bit.lock caretpkg (after up)", lock2, "commit", sha120)
+  assertJsonString(cli.name, "bit.lock caretpkg (after up)", lock2, "version", "1.2.0")
+}
+
+// ---- neighboring constraint kinds: exact, tilde, branch, sha -------------
+
+// Each ref is added into its OWN fresh project+cache under `ctx.root`, so
+// none of these interacts with scenario 1's own already-populated lock or
+// with each other. All four reuse `ctx`'s already-built, already-tagged
+// fixture: no further git operations are needed.
+fn checkNeighboringConstraintKinds(
+  bitExe: string,
+  stdRoot: string,
+  ctx: FixtureCtx,
+  sha100: string,
+) {
+  // Exact pin: resolves to exactly 1.0.0, written back canonicalised (#2367:
+  // no `v` prefix), even though the tag itself is `v1.0.0`.
+  checkOneRef(
+    bitExe, stdRoot, ctx,
+    NeighborCase{
+      label: "exact",
+      ref: "v1.0.0",
+      wantVersion: "1.0.0",
+      wantCommit: sha100,
+      checkCommit: true,
+    },
+  )
+  // Tilde: `~1.0.0` is `>=1.0.0 <1.1.0` (compiler/pmversion.bit), a NARROWER
+  // range than caret's `^1.0.0` — both fixtures share tags 1.0.0/1.2.0/2.0.0,
+  // so a tilde resolving to 1.0.0 while caret (scenario 1) resolved to 1.2.0
+  // is proof the two operators are not being conflated.
+  checkOneRef(
+    bitExe, stdRoot, ctx,
+    NeighborCase{
+      label: "tilde",
+      ref: "~1.0.0",
+      wantVersion: "1.0.0",
+      wantCommit: sha100,
+      checkCommit: true,
+    },
+  )
+  // Branch: not a version at all — resolves to whatever "main" currently
+  // points at (the LAST commit made, tagged v2.0.0), and bit.lock's
+  // `version` key is omitted entirely (`lockAddEntry`'s own "only when
+  // non-empty" rule), never written as "".
+  checkOneRef(
+    bitExe, stdRoot, ctx,
+    NeighborCase{
+      label: "branch",
+      ref: "main",
+      wantVersion: "",
+      wantCommit: "",
+      checkCommit: false,
+    },
+  )
+  // Bare 40-hex commit sha: also not a version. Pins the FIRST commit
+  // (sha100) directly, proving a sha ref is never treated as "the tip".
+  checkOneRef(
+    bitExe, stdRoot, ctx,
+    NeighborCase{
+      label: "sha",
+      ref: sha100,
+      wantVersion: "",
+      wantCommit: sha100,
+      checkCommit: false,
+    },
+  )
+}
+
+fn checkOneRef(bitExe: string, stdRoot: string, ctx: FixtureCtx, nc: NeighborCase) {
+  let name = "neighbor-" + nc.label
+  let cli = newProjectCli(name, bitExe, stdRoot, ctx.root, nc.label)
+  let spec = "${gitHost}/${owner}/caretpkg@${nc.ref}"
+  let r = runBitCli(
+    cli, []string(0),
+    ["add", spec, "--url", "file://${ctx.srcDir}"], cli.projDir + "/add.out", cli.projDir +
+      "/add.err",
+  )
+  if (r.code != 0) {
+    fatal(name, "`bit add ${spec}` exited ${r.code}, want 0\n  stderr: ${r.stderr}")
+  }
+  let entry = readLockEntry(name, cli.projDir, "caretpkg")
+  if (nc.checkCommit) {
+    assertJsonString(name, "bit.lock caretpkg", entry, "commit", nc.wantCommit)
+  }
+  if (len(nc.wantVersion) > 0) {
+    assertJsonString(name, "bit.lock caretpkg", entry, "version", nc.wantVersion)
+  } else {
+    assertNoKey(name, "bit.lock caretpkg", entry, "version")
+  }
+}
+
+// ---- scenario 2: an unsatisfiable conflict fails loudly ------------------
+
+// "depa" (one commit, tagged v1.0.0) whose own bit.json requires
+// "thirdparty" at an EXACT v2.0.0; "thirdparty" itself (tagged v1.0.0 and
+// v2.0.0). Adding depa locks thirdparty@v2.0.0 transitively
+// (compiler/pmz.bit's `resolveTransitiveDeps`) with no conflict — it is the
+// only stated requirement so far. A direct `bit add thirdparty@^1.0.0` next
+// can only resolve within [1.0.0, 2.0.0), i.e. exactly v1.0.0 (2.0.0 is
+// excluded by the caret's own upper bound AND is the version already locked
+// via depa) — genuinely incompatible with depa's exact pin, and
+// `checkVersionConflict` must refuse it rather than silently overwriting
+// either requirement.
+fn checkUnsatisfiableConflict(bitExe: string, stdRoot: string) {
+  let root = scratchRoot("conflict")
+  let (tp, depa, depaSha) = buildConflictFixtures(root)
+
+  let cli = newProjectCli("conflict", bitExe, stdRoot, root, "main")
+  let rewritePath = addDepaDependency(cli, tp, depa)
+  let before = snapshotProject(cli)
+  let addTp = addConflictingThirdparty(cli, tp, rewritePath)
+  assertConflictResult(cli, depaSha, addTp, before)
+}
+
+fn buildConflictFixtures(root: string): (FixtureCtx, FixtureCtx, string) {
+  let tp = newFixtureCtx(root, "thirdparty")
+  gitInitRepo(tp)
+  writeFile(tp.srcDir + "/a.txt", "v1\n") catch e {
+    fatal("conflict", "cannot write thirdparty fixture: " + e.message())
+  }
+  let _ = commitAndTag(tp, "v1.0.0", "v1.0.0")
+  writeFile(tp.srcDir + "/a.txt", "v2\n") catch e {
+    fatal("conflict", "cannot write thirdparty fixture: " + e.message())
+  }
+  let _ = commitAndTag(tp, "v2.0.0", "v2.0.0")
+  assertAnnotatedTag("conflict", tp, "v2.0.0")
+
+  let depa = newFixtureCtx(root, "depa")
+  gitInitRepo(depa)
+  writeFile(
+    depa.srcDir + "/bit.json",
+    "{\"dependencies\":{\"thirdparty\":\"${gitHost}/${owner}/thirdparty@v2.0.0\"}}",
+  ) catch e {
+    fatal("conflict", "cannot write depa manifest: " + e.message())
+  }
+  let depaSha = commitAndTag(depa, "depa v1.0.0", "v1.0.0")
+  return tp, depa, depaSha
+}
+
+// depa's OWN transitive requirement on "thirdparty" has no `--url` escape
+// hatch (that flag only overrides the ROOT spec's fetch) — it must resolve
+// to a fetchable URL on its own, via an `insteadOf` rewrite. Returns the
+// rewrite config path so the second (conflicting) add can reuse it.
+fn addDepaDependency(cli: CliCtx, tp: FixtureCtx, depa: FixtureCtx): string {
+  let rewritePath = writeInsteadOfConfig(cli, tp.srcDir, "thirdparty")
+  let env = ["HOME=" + cli.home, "GIT_CONFIG_GLOBAL=" + rewritePath, "GIT_CONFIG_SYSTEM=/dev/null"]
+  let addDepa = runBitCli(
+    cli, env,
+    ["add", "${gitHost}/${owner}/depa@v1.0.0", "--url", "file://${depa.srcDir}"],
+    cli.projDir + "/depa.out", cli.projDir + "/depa.err",
+  )
+  if (addDepa.code != 0) {
+    fatal(cli.name, "`bit add depa` exited ${addDepa.code}, want 0\n  stderr: ${addDepa.stderr}")
+  }
+  return rewritePath
+}
+
+fn addConflictingThirdparty(cli: CliCtx, tp: FixtureCtx, rewritePath: string): Run {
+  let env = ["HOME=" + cli.home, "GIT_CONFIG_GLOBAL=" + rewritePath, "GIT_CONFIG_SYSTEM=/dev/null"]
+  return runBitCli(
+    cli, env,
+    ["add", "${gitHost}/${owner}/thirdparty@^1.0.0", "--url", "file://${tp.srcDir}"],
+    cli.projDir + "/tp.out", cli.projDir + "/tp.err",
+  )
+}
+
+fn assertConflictResult(cli: CliCtx, depaSha: string, addTp: Run, before: Snapshot) {
+  if (addTp.code != 1) {
+    fatal(
+      cli.name,
+      "`bit add thirdparty@^1.0.0` exited ${addTp.code}, want exactly 1\n  stdout: ${addTp.stdout}  stderr: ${addTp.stderr}",
+    )
+  }
+  if (addTp.stdout != "") {
+    fatal(cli.name, "conflicting bit add printed stdout '${addTp.stdout}', want none")
+  }
+  // The whole reason PubGrub was chosen over a bare "no version satisfies"
+  // message (compiler/pmresolve.bit's own module header): the diagnostic
+  // must name BOTH conflicting requirements (v2.0.0, v1.0.0) and the
+  // disputed package (thirdparty) — pinned exactly, not merely `contains`.
+  let wantErr = "bit add: pmcli: thirdparty conflicts: depa requires v2.0.0; root requires v1.0.0;\n"
+  if (addTp.stderr != wantErr) {
+    fatal(cli.name, "conflict stderr was '${addTp.stderr}', want exactly '${wantErr}'")
+  }
+  // No debris: a failed add must leave bit.lock/bit.json exactly as they
+  // were, never a half-applied entry for "thirdparty" at the wrong version.
+  let after = snapshotProject(cli)
+  if (after.lock != before.lock) {
+    fatal(cli.name, "bit.lock changed after a failed add")
+  }
+  if (after.json != before.json) {
+    fatal(cli.name, "bit.json changed after a failed add")
+  }
+  if (!isFullSha(depaSha)) {
+    fatal(cli.name, "internal: depa fixture sha is not 40-hex: '${depaSha}'")
+  }
+}
+
+// ---- scenario 3: bit up moves to a newly published version (#3631) ------
+
+fn checkBitUpMovesToPublishedVersion(bitExe: string, stdRoot: string) {
+  let name = "up-moves"
+  let root = scratchRoot("up")
+  let ctx = newFixtureCtx(root, "uppkg")
+  gitInitRepo(ctx)
+  writeFile(ctx.srcDir + "/a.txt", "v1\n") catch e {
+    fatal(name, "cannot write fixture: " + e.message())
+  }
+  let sha1 = commitAndTag(ctx, "v1.0.0", "v1.0.0")
+  assertAnnotatedTag(name, ctx, "v1.0.0")
+
+  let cli = newProjectCli(name, bitExe, stdRoot, root, "main")
+  addUppkgDependency(cli, ctx, sha1)
+  let bitJsonBefore = readFileMust(cli.name, cli.projDir + "/bit.json")
+
+  // Publish 1.2.0 to the SAME fixture repository — simulating an upstream
+  // release made after this project first locked.
+  let sha2 = publishNewUppkgVersion(ctx, sha1)
+  verifyUpMovesVersion(cli, ctx, sha2, bitJsonBefore)
+}
+
+fn addUppkgDependency(cli: CliCtx, ctx: FixtureCtx, sha1: string) {
+  let spec = "${gitHost}/${owner}/uppkg@^1.0.0"
+  let addResult = runBitCli(
+    cli, ["HOME=" + cli.home],
+    ["add", spec, "--url", "file://${ctx.srcDir}"], cli.projDir + "/add.out", cli.projDir +
+      "/add.err",
+  )
+  if (addResult.code != 0) {
+    fatal(
+      cli.name,
+      "`bit add ${spec}` exited ${addResult.code}, want 0\n  stderr: ${addResult.stderr}",
+    )
+  }
+  let lock1 = readLockEntry(cli.name, cli.projDir, "uppkg")
+  assertJsonString(cli.name, "bit.lock uppkg", lock1, "commit", sha1)
+  assertJsonString(cli.name, "bit.lock uppkg", lock1, "version", "1.0.0")
+}
+
+fn publishNewUppkgVersion(ctx: FixtureCtx, sha1: string): string {
+  writeFile(ctx.srcDir + "/a.txt", "v1.2\n") catch e {
+    fatal("up-moves", "cannot advance fixture: " + e.message())
+  }
+  let sha2 = commitAndTag(ctx, "v1.2.0", "v1.2.0")
+  if (sha2 == sha1) {
+    fatal("up-moves", "internal: publishing a new tag did not move the fixture's HEAD")
+  }
+  return sha2
+}
+
+fn verifyUpMovesVersion(cli: CliCtx, ctx: FixtureCtx, sha2: string, bitJsonBefore: string) {
+  let rewritePath = writeInsteadOfConfig(cli, ctx.srcDir, "uppkg")
+  let upEnv = [
+    "HOME=" + cli.home,
+    "GIT_CONFIG_GLOBAL=" + rewritePath,
+    "GIT_CONFIG_SYSTEM=/dev/null",
+  ]
+  let upResult = runBitCli(cli, upEnv, ["up"], cli.projDir + "/up.out", cli.projDir + "/up.err")
+  if (upResult.code != 0) {
+    fatal(cli.name, "`bit up` exited ${upResult.code}, want 0\n  stderr: ${upResult.stderr}")
+  }
+  let expectedUp = "bit up: uppkg -> ^1.0.0 (${sha2})\n"
+  if (upResult.stdout != expectedUp) {
+    fatal(cli.name, "bit up stdout was '${upResult.stdout}', want exactly '${expectedUp}'")
+  }
+  // The #3631 hole this ticket closes: both fields, not just `.commit`.
+  let lock2 = readLockEntry(cli.name, cli.projDir, "uppkg")
+  assertJsonString(cli.name, "bit.lock uppkg (after up)", lock2, "commit", sha2)
+  assertJsonString(cli.name, "bit.lock uppkg (after up)", lock2, "version", "1.2.0")
+  let bitJsonAfter = readFileMust(cli.name, cli.projDir + "/bit.json")
+  if (bitJsonAfter != bitJsonBefore) {
+    fatal(cli.name, "bit.json changed after a plain bit up")
+  }
+}

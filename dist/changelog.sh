@@ -92,7 +92,7 @@ CLASSIFICATION="$(git log --no-merges --reverse --name-only --pretty=format:'@@C
 
     dirmap["compiler"] = "Compiler";   dirmap["runtime"]  = "Runtime"
     dirmap["stdlib"]   = "Standard library"
-    dirmap["tests"]    = "Tests"
+    dirmap["_tests_"]    = "Tests"
     dirmap["spec"]     = "Documentation"; dirmap["docs"]  = "Documentation"
     dirmap["scripts"]  = "Build and tooling"
     dirmap["tools"]    = "Build and tooling"

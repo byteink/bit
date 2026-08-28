@@ -1,0 +1,265 @@
+// `./make test-stdlib-rebuild` (#2419): `stepSelfhost`'s rebuild key must react
+// to `stdlib/**`, not only to `compiler/**` and `runtime/**`.
+//
+// `compiler/*.bit` imports eleven `std/*` modules directly, so their source is
+// compiled INTO `bit-out/bin/bit` by `stage0 build compiler`
+// (`tools/build/artifactsteps.bit`'s `stepSelfhost`). Before #2419's fix, the
+// rebuild key folded in `compilerHash()` (`compiler/**`) but nothing under
+// `stdlib/`, so editing a stdlib module the compiler imports — say
+// `stdlib/json/cst_print.bit`, which `compiler/pmcli.bit` calls to write
+// `bit.json` — left `./make selfhost` reporting "up to date" and shipped a
+// `bit-out/bin/bit` that still ran the PREVIOUS stdlib. That is invisible to
+// the golden corpus (a `// run` case is compiled with `BIT_STDLIB` pointing at
+// the working tree, so IT sees the new stdlib) but exactly wrong for
+// `test-pmimports`/`test-pmvanity`, which exercise the compiler's OWN use of a
+// stdlib module through `bit add`.
+//
+// This gate reproduces the exact defect and its fix directly, in four nested
+// `./make selfhost` calls: a clean baseline ("up to date"), an edit (must
+// relink), a revert (must ALSO relink, back the other way), and a settle
+// (must be "up to date" again). Not part of `gateNames()`
+// (`tools/build/defs.bit`) because it forces two real `stage0 build compiler`
+// relinks, which is not free; run it explicitly with `./make
+// test-stdlib-rebuild`, same as `test-coldboot`.
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile } from "std/fs"
+import { contains, parseInt } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// A `stage0 build compiler` relink is far cheaper than coldboot's full
+// from-scratch rebuild, but this gate forces two of them (plus two cheap
+// "up to date" checks) in a row, so the same override applies. See
+// _tests_/bit/coldboot.bit's `timeoutMs` for why `s <= 0` does not mean
+// "block forever" here.
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "600")) catch _ { 600 }
+  if (s <= 0) {
+    return 600000
+  }
+  return s * 1000
+}
+
+// Set unconditionally by this gate's own `Gate{}` entry
+// (tools/build/gates.bit) — see _tests_/bit/coldboot.bit's `repoRoot` for why a
+// "." fallback would be the wrong kind of quiet default here.
+fn repoRoot(): string {
+  let r = env("BIT_REPO")
+  if (len(r) == 0) {
+    panic("stdlibrebuild: BIT_REPO is not set — run this through `./make test-stdlib-rebuild`")
+  }
+  return r
+}
+
+// `stdlib/strings/builder.bit`: small, and `std/strings` is one of the eleven
+// modules `compiler/*.bit` imports directly (`compare`, used by
+// `compiler/lint.bit` to order cross-file lint findings), so it is compiled
+// into `bit-out/bin/bit`. The fix folds in the WHOLE `stdlib/` tree
+// (`stdlibHash()`, `tools/build/artifactsteps.bit`), so this holds even if that
+// particular import is ever dropped.
+fn targetPath(): string {
+  return "${repoRoot()}/stdlib/strings/builder.bit"
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s own mechanism channel (ABI.md §19), never a program's
+// exit status, so each is a named panic — same convention as
+// _tests_/bit/coldboot.bit's `shell`.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700: owner rwx only
+    fail newError("stdlibrebuild: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("stdlibrebuild: TIMED OUT after ${ms}ms running `./make selfhost` — a hang is a failure, not a stall")
+  }
+  if (code == -1) {
+    panic("stdlibrebuild: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("stdlibrebuild: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+// One `./make selfhost` invocation. Returns its own exit code (read from a
+// file, never inferred from the wrapper's) plus everything it printed.
+fn runSelfhost(scratch: string, root: string, ms: int, tag: string): (int, string) {
+  let outPath = "${scratch}/${tag}.out"
+  let codePath = "${scratch}/${tag}.code"
+  let script = "#!/bin/sh\n" +
+    "cd '${root}' || exit 90\n" +
+    "./make selfhost > '${outPath}' 2>&1\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let wrapperRc = shell("${scratch}/${tag}.sh", script, ms) catch e {
+    panic("stdlibrebuild: ${e.message()}")
+  }
+  if (wrapperRc == 90) {
+    panic("stdlibrebuild: cannot cd into ${root}")
+  }
+  if (wrapperRc != 0) {
+    panic("stdlibrebuild: wrapper script exited ${wrapperRc}, which it never should")
+  }
+  let codeText = trimWs(readFile(codePath) catch e {
+    panic("stdlibrebuild: cannot read ${codePath}: ${e.message()}")
+    ""
+  })
+  let code = parseInt(codeText) catch _ {
+    panic("stdlibrebuild: ${codePath} did not contain a number: '${codeText}'")
+    0 - 1
+  }
+  let out = readFile(outPath) catch ""
+  return code, out
+}
+
+// `make: selfhost` followed immediately by `make:   up to date` — the EXACT
+// two lines `stepSelfhost` prints on its cached path (`tools/build/main.bit`
+// prints the step name, `tools/build/artifactsteps.bit:204` prints the verdict
+// with no suffix). A bare `contains(out, "up to date")` is the wrong check: it
+// also matches `stepLibbitrt`'s OWN "up to date (fingerprint ...)" line, which
+// is unrelated to `stdlib/**` and prints on every one of these three runs
+// regardless of whether selfhost relinked.
+fn containsUpToDate(out: string): bool {
+  return contains(out, "make: selfhost\nmake:   up to date\n")
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let root = repoRoot()
+  let target = targetPath()
+  let original = readFile(target) catch e {
+    panic("stdlibrebuild: cannot read ${target}: ${e.message()}")
+    ""
+  }
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-stdlibrebuild-${uuidFormat(uuidV4())}"
+  mkdirScratch(scratch)
+
+  // `defer` does NOT run while a panic unwinds (#2501, a SPEC §18.5
+  // violation found while writing this gate) and `exit()` never runs it
+  // either (documented on `std/os.exit` itself, #3694). So `probe` reports
+  // its verdict with a plain `return` — which DOES run its own `defer` —
+  // rather than calling `exit` itself, and the restore below runs
+  // UNCONDITIONALLY on this ordinary call-and-return path, never depending
+  // on either of those two broken unwind mechanisms. `scratch`'s own
+  // teardown is called explicitly for the same reason, on both paths below.
+  let passed = probe(scratch, root, ms, target, original)
+  writeFile(target, original) catch _ { return }
+  if (!passed) {
+    teardown(scratch, ms)
+    exit(1)
+  }
+  teardown(scratch, ms)
+  println("stdlibrebuild: PASS — a stdlib/** edit invalidates the selfhost rebuild key, and reverting it settles back to \"up to date\"")
+}
+
+// All four checks, returning whether every one of them held. `target` is
+// left edited or reverted depending on where this returns — `main` restores
+// it unconditionally right after this call returns, by any path.
+fn probe(scratch: string, root: string, ms: int, target: string, original: string): bool {
+  // Baseline: this gate's own deps (`selfhost`, `libbitrt`) just ran, so a
+  // fresh `./make selfhost` must report "up to date" against an untouched
+  // tree — otherwise the two runs below prove nothing.
+  let (code0, out0) = runSelfhost(scratch, root, ms, "baseline")
+  if (code0 != 0) {
+    eprint(out0)
+    println("stdlibrebuild: FAIL — baseline `./make selfhost` exited ${code0}, want 0")
+    return false
+  }
+  if (!containsUpToDate(out0)) {
+    eprint(out0)
+    println("stdlibrebuild: FAIL — baseline `./make selfhost` did not report \"up to date\"; run `./make selfhost` once before this gate")
+    return false
+  }
+
+  // Edit: append a comment line to a stdlib file the compiler imports.
+  writeFile(target, original + "\n// stdlib-rebuild-key probe (#2419)\n") catch e {
+    panic("stdlibrebuild: cannot write ${target}: ${e.message()}")
+  }
+  let (code1, out1) = runSelfhost(scratch, root, ms, "edited")
+  if (code1 != 0) {
+    eprint(out1)
+    println("stdlibrebuild: FAIL — `./make selfhost` exited ${code1} after a stdlib edit, want 0")
+    return false
+  }
+  if (containsUpToDate(out1)) {
+    eprint(out1)
+    println("stdlibrebuild: FAIL — `./make selfhost` reported \"up to date\" after editing ${target}; the rebuild key does not cover stdlib/**")
+    return false
+  }
+
+  // Revert: back to the original bytes. This is ITSELF a content change
+  // relative to the "edited" build just linked, so this run must ALSO
+  // relink — same as "edited" above, just going the other direction. Proves
+  // the key is symmetric, not a one-way ratchet.
+  writeFile(target, original) catch e {
+    panic("stdlibrebuild: cannot restore ${target}: ${e.message()}")
+  }
+  let (code2, out2) = runSelfhost(scratch, root, ms, "reverted")
+  if (code2 != 0) {
+    eprint(out2)
+    println("stdlibrebuild: FAIL — `./make selfhost` exited ${code2} after reverting the stdlib edit, want 0")
+    return false
+  }
+  if (containsUpToDate(out2)) {
+    eprint(out2)
+    println("stdlibrebuild: FAIL — `./make selfhost` reported \"up to date\" while reverting ${target}; it should have relinked back")
+    return false
+  }
+
+  // Settle: a THIRD run, with nothing changed since "reverted" just linked,
+  // must now report "up to date" — the acceptance criterion's actual claim.
+  let (code3, out3) = runSelfhost(scratch, root, ms, "settled")
+  if (code3 != 0) {
+    eprint(out3)
+    println("stdlibrebuild: FAIL — `./make selfhost` exited ${code3} on the settle run, want 0")
+    return false
+  }
+  if (!containsUpToDate(out3)) {
+    eprint(out3)
+    println("stdlibrebuild: FAIL — `./make selfhost` did not settle back to \"up to date\" after reverting ${target}")
+    return false
+  }
+  return true
+}
+
+fn mkdirScratch(scratch: string) {
+  let script = "#!/bin/sh\nmkdir -p '${scratch}'\n"
+  let rc = shell("${scratch}.sh", script, 5000) catch e {
+    panic("stdlibrebuild: cannot create ${scratch}: ${e.message()}")
+    0 - 1
+  }
+  if (rc != 0) {
+    panic("stdlibrebuild: mkdir -p ${scratch} exited ${rc}")
+  }
+}
+
+// std/fs has no recursive remove, so the scratch tree goes the way it came —
+// same reason _tests_/bit/coldboot.bit's teardown does.
+fn teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ { return }
+}
+
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}

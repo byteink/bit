@@ -1,0 +1,128 @@
+// Spawn-per-connection, the shape every Bit network server uses, including
+// `std/http`'s own `listenAndServe` (#2167).
+//
+// WHAT THIS PROVES, AND WHAT IT DOES NOT. Before #2167, `rtSpawn` (this file's
+// own runtime, `runtime/root/{darwin,linux}/boot.bit`) mapped a fresh 64 KiB
+// guarded stack plus a task control block on every `spawn`, and NOTHING ever
+// unmapped either — `schedTaskExit` -> `schedWorkerStep`'s `taskDone` branch
+// called `schedUnregister` and stopped there. That is a leak `ps`/`getrusage`
+// can see and this corpus's own harness cannot: `_tests_/bit/stress/verify.bit`'s
+// `runOnce` diffs deterministic stdout, not process RSS, and it never will (see
+// `gcspanfree`, `gcreserve`, `gclarge`'s identical stance: "an RSS measurement
+// from outside the process... belongs to the ticket, not here"). So this
+// program asserts CORRECTNESS at volume — every dial gets its echo, every
+// accepted connection is handled exactly once — which is what a broken
+// sentinel or a wrong `munmap` range would actually break here: a bad unmap is
+// a crash or corruption, not a slow leak. The RSS proof itself is external,
+// and it is on #2167: `spawnjoin`/`spawnfireforget` (siblings, no sockets) and
+// this program's own repro shape both went from ~48-49 KB/connection retained,
+// linear with no plateau, to flat before/after the fix, at 100/1000/5000
+// spawns and at the ticket's own 20 000-connection scale.
+//
+// THE NETPOLLER-PARKED PATH IS THE POINT, not an accident of using real
+// sockets. `runServer`'s `l.accept()` genuinely parks the accepting task on
+// the netpoller between connections (there is no backlog queued ahead of the
+// client), so the task that retires on each iteration is the one
+// `schedWorkerStepAt`'s `woke > 0, addr == 0` branch found via its own
+// internal `gqPop` — the exact case `runtime/sched/worker.bit`'s `wkLastDone`
+// exists for, because the caller's own `addr` argument is 0 on that path and
+// cannot name the task that actually ran. A fix that only checked the
+// caller's `addr` would silently miss unmapping every connection here.
+//
+// Platform-free: `std/net` is the portable wrapper over
+// `runtime/net/{linux,darwin}`, so this carries no host marker (`quicwire`
+// is the precedent — `std/quic`, no marker, three targets).
+//
+// N is a correctness-volume budget, not a leak-detection one (that needs
+// `ps`/`getrusage`, external to this harness) — large enough that a broken
+// teardown crashes or misroutes a response well before N connections, small
+// enough that two runs (default policy, then `BIT_GC=stress`, which collects
+// at every safepoint) fit the harness's timeout with real loopback I/O.
+
+import { listen, dial, Listener, Conn } from "std/net"
+import { newWaitGroup, WaitGroup } from "std/sync"
+
+const N: int = 200
+
+class HandleArgs { c: Conn, wg: WaitGroup, ok: []i64, idx: int }
+
+fn handle(a: HandleArgs) {
+  let s = a.c.read(64)
+  if (s == "ping") {
+    a.c.write("pong") catch e {
+      a.c.close()
+      a.wg.done()
+      return
+    }
+    a.ok[a.idx] = 1
+  }
+  a.c.close()
+  a.wg.done()
+}
+
+class ServerArgs { l: Listener, wg: WaitGroup, ok: []i64 }
+
+// Accepts exactly N connections, one at a time, spawning each off to `handle`
+// — identical shape to #2167's own reproduction (`netleak.bit`'s `handle`
+// loop), so the code path under test is the one the ticket measured.
+fn runServer(a: ServerArgs) {
+  let i = 0
+  while (i < N) {
+    let c = a.l.accept() catch e { return }
+    spawn handle(HandleArgs{ c: c, wg: a.wg, ok: a.ok, idx: i })
+    i = i + 1
+  }
+}
+
+fn main() {
+  let l = listen("127.0.0.1", 0) catch e {
+    print("bind fail\n")
+    return
+  }
+  let port = l.port() catch e {
+    print("port fail\n")
+    return
+  }
+
+  let wg = newWaitGroup()
+  wg.add(i64(N))
+  let ok = []i64(N)
+  spawn runServer(ServerArgs{ l: l, wg: wg, ok: ok })
+
+  let i = 0
+  let dials = 0
+  while (i < N) {
+    let c = dial("127.0.0.1", port) catch e {
+      i = i + 1
+      continue
+    }
+    c.write("ping") catch e {
+      c.close()
+      i = i + 1
+      continue
+    }
+    let r = c.read(64)
+    c.close()
+    if (r == "pong") {
+      dials = dials + 1
+    }
+    i = i + 1
+  }
+
+  // Every handler decrements this on every path (success, unexpected read,
+  // or a failed write), so waiting on it also bounds the program: a hung
+  // handler hangs here rather than the accept loop above.
+  wg.wait()
+  l.close()
+
+  let okCount = 0
+  let j = 0
+  while (j < N) {
+    if (ok[j] == 1) {
+      okCount = okCount + 1
+    }
+    j = j + 1
+  }
+
+  print("spawnconnleak ${dials} ${okCount}\n")
+}

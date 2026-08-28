@@ -1,0 +1,150 @@
+// Property (l), #3045's span cache. Sibling of `./alloc.bit`, same module
+// (SPEC §17.1) — everything `./alloc.bit` already imports (allocMaxSmall,
+// allocSpanBytes, heap*Locked, spin*, ...) and everything it declares at
+// module scope (`arenaTake`, `A_NEXT`/`A_LIMIT`/`A_SPANS`) is visible here
+// with no import. Split out purely to keep `alloc.bit` under
+// `_tests_/bit/lintfilelines.bit`'s 800-line gate (E0200) — see
+// `bitlang-ws/CLAUDE.md`'s "Splitting a file" section: this seam declares
+// nothing of its own that an earlier-sorting sibling could forward-reference,
+// so there is no ordering question, only a diagnostic-order one the
+// differentials would catch.
+//
+// `allocMaxSmall` is the class with the FEWEST slots per span (7:
+// `allocSpanBytes / allocMaxSmall - spanSkip`), which is the cheapest way to
+// force a class across multiple spans. 16 objects is > 2 * 7, so a cycle
+// always carves at least 3 spans (1 anchor + 2 more), and freeing all 16
+// always empties exactly 2 non-anchor spans — the minimum `allocSpanKeep`(2)
+// needs to fire a reclaim pass every single cycle.
+const SPANCACHE_CYCLES = 5000
+const SPANCACHE_OBJS = 16
+// This property's OWN span budget, independent of `MAX_SPANS`/`a` in
+// `./alloc.bit` so it cannot starve the properties before it. 200 * 128 KiB =
+// 25 MiB: comfortably above the handful of spans the CACHED path ever needs
+// (steady state: 1 anchor + 2 recycled, forever) and comfortably below what an
+// UNCACHED path would demand over 5000 cycles (2 fresh spans/cycle, ~10000
+// total) — the cap just turns "keeps growing" into "hits the ceiling fast"
+// rather than "consumes gigabytes", without weakening the property's
+// discriminating power.
+const SPANCACHE_MAX_SPANS = 200
+const SPANCACHE_ARENA_WORDS = 3276800   // SPANCACHE_MAX_SPANS * (allocSpanBytes / 8)
+// True expected value with the cache working is 3 (the anchor, minted once,
+// plus the 2 non-anchor spans, minted once and recycled every cycle after).
+// 10x headroom over that and >20x below where an uncached run lands.
+const SPANCACHE_ASSERT_MAX = 32
+
+// `heapAllocCached`/`heapFreeCached` compose the allocator with the #3045
+// cache exactly as `gcHeapAlloc`/`gcHeapFree` (runtime/gc/gc.bit) do. Spans
+// here are always `owned = true` — unlike `./alloc.bit`'s own `heapAlloc`,
+// this property's whole point is spans that CAN be reclaimed, so
+// `heapFreeCached` has something to push onto the cache. `spancacheSpanTake`
+// is this property's OWN bump supplier, independent of `spanTake`/
+// `MAX_SPANS`/`a` so its (larger) span budget cannot starve the properties
+// before it.
+fn spancacheSpanTake(sa: []i64): int {
+  if (sa[A_SPANS] >= SPANCACHE_MAX_SPANS) { return 0 }
+  let s = arenaTake(sa, allocSpanBytes, allocSpanBytes)
+  if (s == 0) { return 0 }
+  sa[A_SPANS] = sa[A_SPANS] + 1
+  return s
+}
+
+fn heapAllocCached(h: *i64, lk: *i32, sa: []i64, size: int, alignment: int): int {
+  spinAcquire(lk)
+  let idx = allocClassify(size, alignment)
+  let addr = heapTakeSmallLocked(h, idx, size)
+  if (addr == 0) {
+    let span = heapSpanCacheTakeLocked(h)
+    let owned = true
+    if (span == 0) {
+      span = spancacheSpanTake(sa)
+    }
+    if (span != 0) {
+      heapRefillLocked(h, idx, span, owned)
+      addr = heapTakeSmallLocked(h, idx, size)
+    }
+  }
+  spinRelease(lk)
+  return addr
+}
+
+// The mirror of `heapAllocCached`: a reclaimed span is pushed onto the cache
+// first, and only abandoned — this file, like `./alloc.bit`'s `heapFree`, has
+// nowhere real to unmap a Bit-managed arena TO — when the cache reports full.
+fn heapFreeCached(h: *i64, lk: *i32, addr: int, size: int, alignment: int) {
+  spinAcquire(lk)
+  let idx = allocClassify(size, alignment)
+  let reclaim = heapGiveSmallLocked(h, addr, idx, size)
+  if (reclaim != 0) {
+    let chain = heapReclaimSpansLocked(h, idx)
+    while (chain != 0) {                    // bounded: one class's span list
+      let nxt = allocSpanNext(chain)        // read BEFORE caching overwrites it
+      let _ = heapSpanCachePushLocked(h, chain)
+      heapSpansReleasedLocked(h, allocSpanBytes)
+      chain = nxt
+    }
+  }
+  spinRelease(lk)
+}
+
+// #2803's mechanism in miniature: `heapReclaimSpansLocked` hands back a
+// span's slots but a bump-only supplier never returns its ADDRESS to its own
+// pool, so every re-carve after a reclaim needs a fresh one unless something
+// recycles it. `SPANCACHE_CYCLES` repeats a full carve/fill/empty/reclaim
+// cycle and counts every distinct span this file (playing the OS, exactly as
+// `./alloc.bit`'s own header describes) was asked to supply: `sa[A_SPANS]`,
+// the same counter `spanTake` keeps for the properties in `./alloc.bit`, on
+// this property's own isolated arena and heap. Prints its own line — `main()`
+// just calls this.
+//
+// Mutation-tested (see the ticket): reverting the `heapSpanCacheTakeLocked`
+// call in `heapAllocCached` above turns the bounded count below into one that
+// grows with `SPANCACHE_CYCLES` — this property is what catches that.
+fn spancacheRun() {
+  let h5buf = []i64(heapWords)
+  let h5 = ptrOf(h5buf)
+  let l5buf = []i32(1)
+  let lk5 = ptrOf(l5buf)
+  atomicStore(lk5, spinUnlocked)
+  heapInit(h5)
+
+  let spancacheArena = []i64(SPANCACHE_ARENA_WORDS)
+  let saBase = int(ptrOf(spancacheArena))
+  let sa = []i64(3)
+  sa[A_NEXT] = allocAlignUp(saBase, allocSpanBytes)
+  sa[A_LIMIT] = saBase + SPANCACHE_ARENA_WORDS * 8
+  sa[A_SPANS] = 0
+
+  let scOk = 1
+  let objs = []i64(SPANCACHE_OBJS)
+  let cyc = 0
+  while (cyc < SPANCACHE_CYCLES) {                  // bounded: SPANCACHE_CYCLES
+    let oi = 0
+    while (oi < SPANCACHE_OBJS) {                   // bounded: SPANCACHE_OBJS
+      let addr = heapAllocCached(h5, lk5, sa, allocMaxSmall, 8)
+      if (addr == 0) { scOk = 0 }
+      objs[oi] = addr
+      oi = oi + 1
+    }
+    let fi = 0
+    while (fi < SPANCACHE_OBJS) {                   // bounded: SPANCACHE_OBJS
+      if (objs[fi] != 0) { heapFreeCached(h5, lk5, objs[fi], allocMaxSmall, 8) }
+      fi = fi + 1
+    }
+    if (heapLiveBytes(h5) != 0) { scOk = 0 }
+    cyc = cyc + 1
+  }
+  let spancacheOsCalls = sa[A_SPANS]
+  if (spancacheOsCalls > SPANCACHE_ASSERT_MAX) { scOk = 0 }
+  spinAcquire(lk5)
+  let spancacheBad = heapCheckSpansLocked(h5)
+  spinRelease(lk5)
+  if (spancacheBad != 0) { scOk = 0 }
+  if (heapSpanViolations(h5) != 0) { scOk = 0 }
+
+  // `spancacheArena` is reached here so it stays rooted across every
+  // collection the cycle loop above ran.
+  let spancacheRooted = 0
+  if (len(spancacheArena) == SPANCACHE_ARENA_WORDS) { spancacheRooted = 1 }
+
+  print("spancache=${scOk}/${spancacheOsCalls} scchk=${spancacheBad} scroot=${spancacheRooted}\n")
+}

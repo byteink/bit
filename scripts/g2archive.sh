@@ -83,7 +83,7 @@ RT="$REPO_ROOT/runtime"
 
 # The rename is a SOURCE property now, so this is a verification rather than a
 # transformation: zero live (non-comment) `bit_rt_root_` pins may exist. Kept
-# because it is the cheap pre-flight for the whole class — `tests/bit/rootpins/`
+# because it is the cheap pre-flight for the whole class — `_tests_/bit/rootpins/`
 # proves the pin graph has no cycle, but only after a full build.
 LEFT=$(find "$RT" -name '*.bit' -print0 | xargs -0 grep -n '@symbol("bit_rt_root_' \
   | grep -vE ':[0-9]+:[[:space:]]*//' | wc -l | tr -d ' ')
@@ -98,7 +98,7 @@ if [ "$LEFT" != "0" ]; then
 fi
 
 # --- Module set: 16 platform-free dirs + 9 platform-specific pairs (25 for a
-# linux/darwin build). Matches tests/bit/rootpins/'s module split and the
+# linux/darwin build). Matches _tests_/bit/rootpins/'s module split and the
 # module set the G3 (#1584) attempts converged on. Each entry is REL (module
 # directory relative to $RT, empty string for $RT itself) and LABEL (the
 # archive-member-friendly name, matching the "runtime_alloc.o" /
@@ -134,7 +134,7 @@ PLATFORM_PAIRS="alloc cryptohw gc net park rand root sched thread"
 # bit_rt_port_park_wake`/`bit_rt_port_park_wait`, which only
 # runtime/park/<os>/wait.bit provides, so this was the actual reason ANY
 # program failed to LINK for x86_64-windows before this landed (verified
-# 2026-08-21, tests/bit/windowssmoke.bit's header). `sched` landed #3339 (the
+# 2026-08-21, _tests_/bit/windowssmoke.bit's header). `sched` landed #3339 (the
 # IOCP netpoller, runtime/sched/windows/poll.bit) and IS both consumed and
 # wired: runtime/root/windows/boot.bit's step 4b/8b and `workerBody` call
 # `pollCreate`/`pollDrain`/`pollClose` from it, the same three points

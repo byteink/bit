@@ -1,0 +1,286 @@
+// #2592: `schedStartWorker` starts a worker AFTER boot, not only during it.
+// Linux twin of ../schedgrowdarwin — see that file for the full argument.
+//
+// Boots with ONE worker — this runtime's real boot-time default — lets it run
+// a real task and go idle (a genuine park on its own OS thread, not a
+// simulated one), then grows the pool by THREE while that first worker keeps
+// parking and unparking concurrently. Each grown worker gets a task placed
+// directly on ITS OWN local ring — reachable only by that worker's own OS
+// thread or a peer stealing from it — so this checks both halves of the
+// acceptance: the pool count rises by exactly 3, AND the three new workers
+// are genuinely live, not merely counted.
+//
+// Linux-only by construction, hence the sibling `linux-only` marker: it binds
+// runtime/thread/linux and runtime/park/linux, which reach the kernel through
+// `syscall` (SPEC §11.8) — rejected on Darwin even for an uncalled declaration.
+// Kept identical in shape to its Darwin twin so that a divergence between the
+// two means a real platform difference rather than a spelling one.
+
+import { schedInit, schedWorkerAt, schedWorkerRun, schedNoTimers, schedNoPoller } from "../../../runtime/sched"
+import {
+  schedStartWorker,
+  schedShutdown,
+  schedRegister,
+  schedTaskInit,
+  schedTaskExit,
+  WorkerLaunch,
+} from "../../../runtime/sched"
+import { schedStackAligned, schedStackBytes, taskAt, wkDeque, dqPushBottom, scNWorkers } from "../../../runtime/sched"
+import { threadJoin, threadJoinDone, threadRunning } from "../../../runtime/thread"
+import { threadStart, threadRelease } from "../../../runtime/thread/linux"
+import { parkSleepNs, parkMonoNs } from "../../../runtime/park/linux"
+import { parkMinBackoffNs } from "../../../runtime/park"
+
+const initialWorkers: int = 1
+const grownBy: int = 3
+const totalWorkers: int = 4
+
+// Generous relative to the real timings (a park is microseconds away, a
+// worker exits as soon as it finds no work) and finite, so a wedge fails the
+// suite in seconds rather than hanging it.
+const WAIT_NS: int = 5000000000
+const WAIT_MAX_POLLS: int = 100000
+
+// `schedMaxWorkers`(32) * `workerWords`(292) — an array size must be an
+// integer literal (E0021), so this cannot be written as the product.
+let schedBlock: [16]i64
+let workerBlocks: [9344]i64
+
+// One argument/done/handle slot per possible worker (32), the same
+// caller-owned shape `runtime/root/<os>`'s own `startArgs`/`startDones`/
+// `startHandles` use and `schedStartWorker` documents.
+let argArea: [64]i64
+let doneArea: [32]i32
+let handleArea: [32]i64
+
+// Four 256KiB-aligned task stacks, one per task this program runs. Each region
+// is 512KiB so a 256KiB-aligned base exists inside it whatever address the
+// linker gives the array (module arrays are only 8-byte aligned, #1421).
+let stackArea0: [65536]i64
+let stackArea1: [65536]i64
+let stackArea2: [65536]i64
+let stackArea3: [65536]i64
+
+let taskBlock0: [32]i64
+let taskBlock1: [32]i64
+let taskBlock2: [32]i64
+let taskBlock3: [32]i64
+
+// Written by a green task, read by the driver thread. Untraced module state
+// (§11.11): the collector must never walk these.
+let obsRan0: i64 = 0
+let obsRan1: i64 = 0
+let obsRan2: i64 = 0
+let obsRan3: i64 = 0
+
+let sleepScratch: [2]i64
+
+// `parkMonoNs` takes a caller-owned scratch pointer on Linux (Darwin's does
+// not, #2318) — adapted back to the darwin twin's zero-argument shape using
+// this thread's own scratch, which nothing else on this OS thread touches
+// concurrently, same as ../schedpoollinux/schedpoollinux.bit's `monoAdapt`.
+let scratch: [2]i64
+
+fn monoAdapt(): int {
+  return parkMonoNs(ptrOf(scratch))
+}
+
+@nosplit fn alignUpStack(addr: int): int {
+  let bumped = addr + schedStackBytes - 1
+  return bumped - bumped % schedStackBytes
+}
+
+fn sleepAdapt(ns: int) {
+  parkSleepNs(ns, ptrOf(sleepScratch))
+}
+
+// Bounded poll for a flag a task sets on its way out (Power of 10: both a
+// deadline and a static trip bound, `runtime/thread`'s `threadJoin` shape).
+fn waitFlag(addr: *i64): bool {
+  let deadline = monoAdapt() + WAIT_NS
+  let i = 0
+  while (i < WAIT_MAX_POLLS) {
+    if (atomicLoad(addr) != 0) {
+      return true
+    }
+    if (monoAdapt() >= deadline) {
+      return false
+    }
+    sleepAdapt(parkMinBackoffNs)
+    i = i + 1
+  }
+  return false
+}
+
+// Four near-identical bodies rather than one parameterised one: a task body
+// is `@nosplit` (its stack is reached by conservative scanning, not a
+// published safepoint frame — every task body in this tree keeps that
+// property) and a `@nosplit` body may not reach module state through
+// anything but direct arithmetic on a name already known at compile time
+// (#1421's `ptrOf` restriction), so there is no way to pick "which flag"
+// from an argument without a call this body may not make.
+@nosplit fn task0Body() {
+  atomicStore(ptrOf(obsRan0), 1)
+  schedTaskExit()
+}
+
+@nosplit fn task1Body() {
+  atomicStore(ptrOf(obsRan1), 1)
+  schedTaskExit()
+}
+
+@nosplit fn task2Body() {
+  atomicStore(ptrOf(obsRan2), 1)
+  schedTaskExit()
+}
+
+@nosplit fn task3Body() {
+  atomicStore(ptrOf(obsRan3), 1)
+  schedTaskExit()
+}
+
+// RELEASES THE MUTATOR SLOT ON THE WAY OUT (#1675) — this program links the
+// shared `libbitrt.a` directly rather than through `runtime/root`'s own boot,
+// so the symbol is declared and called directly, exactly as
+// `_tests_/stress/schedpool/props`'s `poolWorkerEntry` does and for the same
+// reason (see its own header).
+extern fn bit_rt_gc_thread_exit()
+
+// The OS thread body every worker in this program runs, started-at-boot or
+// grown-after-boot alike. `arg` is the two-word `{worker address, done-word
+// address}` block `schedStartWorker` (and, for worker 0, this file's own
+// `startWorker0`) both build.
+fn growWorkerEntry(arg: *byte): *byte {
+  let block = taskAt(int(arg))
+  let workerAddr = *block
+  let doneAddr = *(block + 1)
+
+  schedWorkerRun(taskAt(workerAddr), schedNoTimers, schedNoPoller)
+
+  bit_rt_gc_thread_exit()
+  let z: *i32 = nil
+  atomicStore(z + doneAddr / 4, i32(0))
+  return nil
+}
+
+// Queue `body` on worker `i`'s own local ring, registering it first — not
+// optional: a worker unregisters every task it sees finish, and
+// `schedUnregister` on a task never linked in resets the registry head to 0,
+// silently dropping whatever else was on it.
+fn queueOn(s: *i64, i: int, taskAddr: int, stackBase: int, body: *byte): bool {
+  let t = taskAt(taskAddr)
+  schedTaskInit(t, stackBase, schedStackBytes, body, 0)
+  schedRegister(s, taskAddr)
+  return dqPushBottom(schedWorkerAt(s, i) + wkDeque, taskAddr)
+}
+
+// Start worker 0 the way `runtime/root/<os>`'s boot does: `threadStart`
+// called directly, NOT through `schedStartWorker` — this program's contrast
+// case, proving growth composes with a genuinely boot-shaped first worker
+// rather than only with itself.
+fn startWorker0(s: *i64): int {
+  let block = ptrOf(argArea)
+  *block = int(schedWorkerAt(s, 0))
+  let done = ptrOf(doneArea)
+  *(block + 1) = int(done)
+  atomicStore(done, i32(threadRunning))
+  let bp: *byte = nil
+  return threadStart(entryOf(growWorkerEntry), bp + int(block), done)
+}
+
+// Bundles boot-phase results so `main` stays a plain sequence of phase
+// calls. `main`'s own `&&` chains (2+3+3+7=15, plus the base 1) put it at
+// complexity 16 against this repo's limit of 10 (E0204) — the same shape
+// `PollAddrs` in _tests_/stress/stwownstack/stwownstack.bit uses to stay under
+// the param limit, applied here to stay under the complexity limit instead.
+class BootResult {
+  s: *i64,
+  aligned0: bool,
+  queued0: bool,
+  h0: int,
+  ran0: bool,
+}
+
+// Bundles grow-phase results for the same reason `BootResult` does.
+class GrowResult {
+  grew: bool,
+  roseByThree: bool,
+  queuedAll: bool,
+  ranAll: bool,
+}
+
+// ---- Boot: one real task on worker 0, then its own OS thread -------------
+fn bootPhase(): BootResult {
+  let s = taskAt(int(ptrOf(schedBlock)))
+  schedInit(s, int(ptrOf(workerBlocks)), initialWorkers)
+
+  let stackBase0 = alignUpStack(int(ptrOf(stackArea0)))
+  let aligned0 = schedStackAligned(stackBase0)
+  let queued0 = queueOn(s, 0, int(ptrOf(taskBlock0)), stackBase0, entryOf(task0Body))
+  let h0 = startWorker0(s)
+
+  // Worker 0 runs the task and, finding nothing else queued, parks — the
+  // concurrent condition growth below must be safe against.
+  let ran0 = waitFlag(ptrOf(obsRan0))
+
+  return BootResult{ s: s, aligned0: aligned0, queued0: queued0, h0: h0, ran0: ran0 }
+}
+
+// ---- Grow the pool by three, worker 0 idling concurrently ----------------
+fn growPhase(s: *i64, queued0: bool, ran0: bool): GrowResult {
+  let launch = WorkerLaunch{
+    entry: entryOf(growWorkerEntry), argArea: ptrOf(argArea),
+    doneArea: ptrOf(doneArea), handleArea: ptrOf(handleArea),
+    startFn: threadStart,
+  }
+  let ok1 = schedStartWorker(s, launch)
+  let ok2 = schedStartWorker(s, launch)
+  let ok3 = schedStartWorker(s, launch)
+  let grew = ok1 && ok2 && ok3
+  let countAfter = atomicLoad(s + scNWorkers)
+  let roseByThree = countAfter == initialWorkers + grownBy
+
+  // ---- Prove each grown worker is genuinely live, not just counted -------
+  let stackBase1 = alignUpStack(int(ptrOf(stackArea1)))
+  let stackBase2 = alignUpStack(int(ptrOf(stackArea2)))
+  let stackBase3 = alignUpStack(int(ptrOf(stackArea3)))
+  let queued1 = queueOn(s, 1, int(ptrOf(taskBlock1)), stackBase1, entryOf(task1Body))
+  let queued2 = queueOn(s, 2, int(ptrOf(taskBlock2)), stackBase2, entryOf(task2Body))
+  let queued3 = queueOn(s, 3, int(ptrOf(taskBlock3)), stackBase3, entryOf(task3Body))
+  let queuedAll = queued0 && queued1 && queued2 && queued3
+
+  let ran1 = waitFlag(ptrOf(obsRan1))
+  let ran2 = waitFlag(ptrOf(obsRan2))
+  let ran3 = waitFlag(ptrOf(obsRan3))
+  let ranAll = ran0 && ran1 && ran2 && ran3
+
+  return GrowResult{ grew: grew, roseByThree: roseByThree, queuedAll: queuedAll, ranAll: ranAll }
+}
+
+// ---- Teardown: shut down and reap all four threads ------------------------
+fn teardownPhase(s: *i64, h0: int): bool {
+  schedShutdown(s)
+  let joined0 = threadJoin(ptrOf(doneArea), WAIT_NS, sleepAdapt, monoAdapt) == threadJoinDone
+  let rel0 = threadRelease(h0)
+  let joined1 = threadJoin(ptrOf(doneArea) + 1, WAIT_NS, sleepAdapt, monoAdapt) == threadJoinDone
+  let rel1 = threadRelease(*(ptrOf(handleArea) + 1))
+  let joined2 = threadJoin(ptrOf(doneArea) + 2, WAIT_NS, sleepAdapt, monoAdapt) == threadJoinDone
+  let rel2 = threadRelease(*(ptrOf(handleArea) + 2))
+  let joined3 = threadJoin(ptrOf(doneArea) + 3, WAIT_NS, sleepAdapt, monoAdapt) == threadJoinDone
+  let rel3 = threadRelease(*(ptrOf(handleArea) + 3))
+  return joined0 && rel0 && joined1 && rel1 && joined2 && rel2 && joined3 && rel3
+}
+
+fn main() {
+  let boot = bootPhase()
+  let grow = growPhase(boot.s, boot.queued0, boot.ran0)
+  let joinedAll = teardownPhase(boot.s, boot.h0)
+
+  println("stack ${boot.aligned0}")
+  println("queued ${grow.queuedAll}")
+  println("boot ${boot.h0 != 0}")
+  println("grew ${grow.grew}")
+  println("roseByThree ${grow.roseByThree}")
+  println("ranAll ${grow.ranAll}")
+  println("joinedAll ${joinedAll}")
+}

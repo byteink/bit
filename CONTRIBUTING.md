@@ -36,7 +36,7 @@ changes the spec **in the same commit**, not afterwards.
 ## The bar for a change
 
 1. **A test that fails without your change.** Golden cases live in
-   `tests/cases/*.bit` with a sibling `.expected`; line 1 selects the mode
+   `_tests_/cases/*.bit` with a sibling `.expected`; line 1 selects the mode
    (`// run`, `// panic`, `// error`, `// fmt`, `// types`, `// lint`).
 2. **`scripts/gate.sh` green.** It reads your diff and runs only the steps that
    diff can affect. A cross-cutting change (`tools/build/`, `runtime/`, a mix
@@ -44,7 +44,7 @@ changes the spec **in the same commit**, not afterwards.
    instead of guessing - exit 3, nothing run, printing what to do next - except
    a `stdlib/**` change paired only with its own mandatory
    `docs/stdlib/<mod>.md` page, which stays scoped rather than forcing full
-   (#3055 - `tests/bit/stdlibdocs.bit` makes that page mandatory, so an
+   (#3055 - `_tests_/bit/stdlibdocs.bit` makes that page mandatory, so an
    ordinary stdlib-export change always spans both). Run `scripts/gate.sh
    --full` or `./make test` directly (every gate, 18-18.5 min) to actually
    verify a change like that. Do not skip a red step - a hang counts as a
@@ -61,7 +61,7 @@ changes the spec **in the same commit**, not afterwards.
    subdirectories, which would make a new module.
 5. **A benchmark win keeps its baseline.** A change that improves a
    `bench/cases/*` benchmark is not finished until the case's entry in
-   `tests/bit/benchgate/baselines.bit` is re-recorded in the same commit -
+   `_tests_/bit/benchgate/baselines.bit` is re-recorded in the same commit -
    see [`docs/development.md`](docs/development.md)'s Testing conventions
    section for the command and why the gate cannot do this for you.
 

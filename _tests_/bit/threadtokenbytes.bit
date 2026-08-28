@@ -1,0 +1,391 @@
+// #3434: payload-drift gate for BOTH backends' inlined gc thread-token read.
+//
+// THE COUPLING THIS GATE MAKES LOUD. `compiler/arm64call.bit`'s
+// `a64ThreadTokenWords` and `compiler/x64call.bit`'s `xThreadTokenBytes` hold
+// the machine code for `bit_rt_port_gc_thread_token`, which each backend now
+// emits at the call site instead of calling
+// (`emitInlinedThreadToken`/`xEmitInlinedThreadToken`). The runtime still
+// carries the SAME instructions, as `asm` payloads, in
+// `runtime/gc/{linux,darwin,windows}/gcthread.bit` — that is where the symbol
+// is actually defined, and the definition must stay reachable for anything
+// that takes the function's address rather than calling it.
+//
+// So the same instruction sequence exists in two places that cannot import it
+// from each other: a compiler and the runtime are separate compilations, and a
+// §11.9 pinned name crosses that boundary only for a FUNCTION, never for a
+// literal. The backend can only MIRROR the runtime's bytes. If the runtime's
+// payload ever changes — a new OS, a different register, a masking fix — and
+// the backend's copy is not changed in the same commit, every compiled program
+// reads the thread token with the OLD instructions while the runtime's own
+// object holds the new ones. Nothing fails to build, nothing fails to link, and
+// no golden output moves: the two copies simply disagree about which thread is
+// asking, which is #1650 (two threads sharing one token: invisible to the
+// rendezvous, mutating straight through the mark, swept out from under
+// themselves). That is exactly the drift #3359 paid for on the inlined poll
+// guard's word offsets, where the cost was 4x a benchmark's CPU rather than a
+// corrupt heap.
+//
+// THREE COPIES, THREE EDGES, mirroring _tests_/bit/pollguardoffsets.bit's design:
+//   (1) the runtime's own `asm` payloads, read as TEXT out of
+//       runtime/gc/{linux,darwin,windows}/gcthread.bit;
+//   (2) the compiler's copies, read as TEXT out of compiler/arm64call.bit and
+//       compiler/x64call.bit;
+//   (3) this file's own table, below.
+// (1)-vs-(3) and (2)-vs-(3) are both checked, so a change to EITHER side alone
+// fails loudly. Reading (2) as text rather than importing it is deliberate and
+// is the same technique _tests_/bit/version.bit uses: it makes the check
+// independent of whatever the compiler under test happens to have compiled in.
+//
+// The symbol name is checked on the same three edges: `compiler/codegen.bit`'s
+// `gcThreadTokenSymbol()` is what each backend matches a call against, so a
+// typo there does not miscompile — it silently stops inlining and quietly
+// restores the regression #3434 exists to remove.
+//
+// Run from the repository root: ./bit-out/bin/bit run _tests_/bit/threadtokenbytes.bit
+// `BIT_REPO` overrides the repository root (default: search . / .. / ../.. /
+// ../../..).
+import { env, exit } from "std/os"
+import { exists, readFile } from "std/fs"
+import { indexOf } from "std/strings"
+
+// Edge (3): this file's own copy of every payload.
+//
+// AArch64 — ONE payload for every AArch64 target, and that is a property of the
+// probe, not an omission: aarch64-linux and aarch64-macos read the same two
+// system registers in the same order (see runtime/gc/gcthread.bit's header for
+// the hardware measurement behind that order), and aarch64-windows is out of
+// scope for the Windows port (epic #3322 targets x86_64-windows only).
+fn wantArm64(): []int {
+  return [0xD53BD060, 0xB5000040, 0xD53BD040, 0x927DF000]
+}
+
+// x86-64 — TWO payloads, because this is the architecture whose token read
+// could not be answered with one, which is the whole reason #3420 split
+// runtime/gc into a paired module. Windows keeps the TEB at GS (NT_TIB.Self at
+// gs:[0x30]); Linux reads the variant-II TCB self word at fs:0.
+fn wantX64Linux(): []int {
+  return [0x64, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00]
+}
+
+fn wantX64Windows(): []int {
+  return [0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00]
+}
+
+const wantSymbol: string = "bit_rt_port_gc_thread_token"
+
+// Bounds. Every loop here is bounded by one of these, never by "until the end
+// of the file" — a runaway scan over a corrupt source would otherwise look like
+// a hang rather than a failure.
+const maxSourceBytes: int = 400000
+const maxPayloadItems: int = 64
+const maxHexDigits: int = 8
+
+class Tally {
+  checks: int,
+  failures: int,
+}
+
+fn check(t: Tally, ok: bool, msg: string) {
+  t.checks = t.checks + 1
+  if (!ok) {
+    t.failures = t.failures + 1
+    eprint("FAIL: ${msg}\n")
+  }
+}
+
+fn die(msg: string) {
+  eprint("threadtokenbytes: ${msg}\n")
+  exit(1)
+}
+
+// BIT_REPO wins, same convention as _tests_/bit/pollguardoffsets.bit.
+fn repoRoot(): string {
+  let override = env("BIT_REPO")
+  if (len(override) > 0) {
+    return override
+  }
+  let candidates = [".", "..", "../..", "../../.."]
+  for c of candidates {
+    if (exists("${c}/compiler/codegen.bit")) {
+      return c
+    }
+  }
+  die("cannot locate compiler/codegen.bit from this cwd; set BIT_REPO")
+  return ""
+}
+
+fn readSource(path: string): string {
+  let src = readFile(path) catch e {
+    die("cannot read ${path}: ${e.message()}")
+    ""
+  }
+  if (len(src) > maxSourceBytes) {
+    die("${path} is ${len(src)} bytes, over the ${maxSourceBytes} bound")
+  }
+  return src
+}
+
+fn hexValue(c: u8): int {
+  if (c >= '0' && c <= '9') {
+    return int(c) - 48
+  }
+  if (c >= 'a' && c <= 'f') {
+    return int(c) - 87
+  }
+  if (c >= 'A' && c <= 'F') {
+    return int(c) - 55
+  }
+  return -1
+}
+
+fn atHexPrefix(src: string, i: int): bool {
+  if (src[i] != '0' || i + 1 >= len(src)) {
+    return false
+  }
+  return src[i + 1] == 'x' || src[i + 1] == 'X'
+}
+
+// One `0x…` literal starting at `i`, which `atHexPrefix` has already accepted.
+// Returns (value, index just past it, ok). ok=false for an over-wide literal,
+// so a payload that could not fit an instruction word fails loudly rather than
+// silently truncating.
+fn scanHex(src: string, i: int): (int, int, bool) {
+  let n = len(src)
+  let j = i + 2
+  let v = 0
+  let digits = 0
+  while (j < n && digits <= maxHexDigits && hexValue(src[j]) >= 0) {
+    v = v * 16 + hexValue(src[j])
+    digits = digits + 1
+    j = j + 1
+  }
+  if (digits == 0 || digits > maxHexDigits) {
+    return 0, j, false
+  }
+  return v, j, true
+}
+
+// The `0x…` literals between `start` and the next `closer` byte, in source
+// order. Returns ok=false when the closer is missing or a literal is
+// unparseable, so a malformed source fails loudly instead of yielding a short —
+// and therefore silently agreeable — list.
+fn hexRun(src: string, start: int, closer: u8): ([]int, bool) {
+  let out = []int(0)
+  let n = len(src)
+  let i = start
+  let steps = 0
+  while (i < n && steps < maxSourceBytes) {
+    steps = steps + 1
+    if (src[i] == closer) {
+      return out, true
+    }
+    if (!atHexPrefix(src, i)) {
+      i = i + 1
+      continue
+    }
+    let (v, j, ok) = scanHex(src, i)
+    if (!ok || len(out) >= maxPayloadItems) {
+      return out, false
+    }
+    out = append(out, v)
+    i = j
+  }
+  return out, false
+}
+
+// The `0x…` literals inside the first `closer`-terminated run that follows
+// `marker`, itself searched for only after the END of `anchor`. The anchor
+// keeps a marker as ordinary as `arm64 {` or `return [` from matching prose or
+// an earlier sibling list in the same file — and searching past the anchor's
+// last byte, not its first, is what lets one payload anchor on the one before
+// it (the two arms of xThreadTokenBytes).
+fn payloadAfter(src: string, anchor: string, marker: string, closer: u8): ([]int, bool) {
+  let a = indexOf(src, anchor)
+  if (a < 0) {
+    return []int(0), false
+  }
+  let rest = src[int(a) + len(anchor):]
+  let m = indexOf(rest, marker)
+  if (m < 0) {
+    return []int(0), false
+  }
+  return hexRun(rest, int(m) + len(marker), closer)
+}
+
+fn sameList(got: []int, want: []int): bool {
+  if (len(got) != len(want)) {
+    return false
+  }
+  let i = 0
+  while (i < len(want)) {
+    if (got[i] != want[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn hexDigit(v: int): string {
+  return "0123456789ABCDEF"[v:v + 1]
+}
+
+// Hex, not decimal: every one of these numbers is written as a hex literal in
+// both sources this gate compares, so a failure message must be greppable
+// against them. `0x927DF000` is findable; `2457726976` is not.
+fn hexOf(v: int): string {
+  if (v == 0) {
+    return "0x0"
+  }
+  let out = ""
+  let x = v
+  let steps = 0
+  while (x > 0 && steps <= maxHexDigits) {
+    out = hexDigit(x % 16) + out
+    x = x / 16
+    steps = steps + 1
+  }
+  return "0x${out}"
+}
+
+fn render(xs: []int): string {
+  let out = ""
+  let i = 0
+  while (i < len(xs)) {
+    if (i > 0) {
+      out = out + ", "
+    }
+    out = out + hexOf(xs[i])
+    i = i + 1
+  }
+  return "[${out}]"
+}
+
+// One (file, anchor, marker, closer) -> expected payload edge.
+class Payload {
+  label: string,
+  path: string,
+  anchor: string,
+  marker: string,
+  closer: u8,
+  want: []int,
+  hint: string,
+}
+
+fn checkPayload(t: Tally, root: string, p: Payload) {
+  let src = readSource("${root}/${p.path}")
+  let (got, ok) = payloadAfter(src, p.anchor, p.marker, p.closer)
+  if (!ok) {
+    check(
+      t, false,
+        "${p.path}: ${p.label} payload not found or unparseable — the source " +
+        "drifted out of its expected shape (anchor '${p.anchor}', list '${p.marker}')",
+    )
+    return
+  }
+  check(
+    t, sameList(got, p.want),
+    "${p.path}: ${p.label} payload is ${render(got)}, want ${render(p.want)} — ${p.hint}",
+  )
+}
+
+fn checkSymbolIn(t: Tally, root: string, path: string, needle: string, hint: string) {
+  let src = readSource("${root}/${path}")
+  check(
+    t, indexOf(src, needle) >= 0,
+    "${path}: '${needle}' not found — ${hint}",
+  )
+}
+
+fn payloadTable(): []Payload {
+  let mirrorArm = "the compiler and the runtime must carry the SAME instructions"
+  let mirrorX64 = "the compiler and the runtime must carry the SAME instructions"
+  return [
+    // Edge (1): the runtime's own asm payloads. A failure here means the
+    // RUNTIME moved — update the compiler's mirror in the same commit.
+    Payload{
+      label: "runtime arm64", path: "runtime/gc/linux/gcthread.bit",
+      anchor: wantSymbol, marker: "arm64 {", closer: '}', want: wantArm64(),
+      hint: "update compiler/arm64call.bit's a64ThreadTokenWords to match",
+    },
+    Payload{
+      label: "runtime arm64", path: "runtime/gc/darwin/gcthread.bit",
+      anchor: wantSymbol, marker: "arm64 {", closer: '}', want: wantArm64(),
+      hint: "update compiler/arm64call.bit's a64ThreadTokenWords to match",
+    },
+    Payload{
+      label: "runtime x64 (fs:0)", path: "runtime/gc/linux/gcthread.bit",
+      anchor: wantSymbol, marker: "x64 {", closer: '}', want: wantX64Linux(),
+      hint: "update compiler/x64call.bit's xThreadTokenBytes SysV arm to match",
+    },
+    Payload{
+      label: "runtime x64 (gs:0x30)", path: "runtime/gc/windows/gcthread.bit",
+      anchor: wantSymbol, marker: "x64 {", closer: '}', want: wantX64Windows(),
+      hint: "update compiler/x64call.bit's xThreadTokenBytes Win64 arm to match",
+    },
+    // Edge (2): the compiler's own copies, read out of the checked-in source.
+    // A failure here means the COMPILER drifted from the runtime.
+    Payload{
+      label: "compiler arm64", path: "compiler/arm64call.bit",
+      anchor: "fn a64ThreadTokenWords(): []int {", marker: "return [", closer: ']',
+      want: wantArm64(), hint: mirrorArm,
+    },
+    Payload{
+      label: "compiler x64 Win64", path: "compiler/x64call.bit",
+      anchor: "fn xThreadTokenBytes(cc: XCallConv): []int {", marker: "return [",
+      closer: ']', want: wantX64Windows(), hint: mirrorX64,
+    },
+    // The SysV arm is the SECOND `return [` in that function, so it is anchored
+    // past the Win64 one. Order-sensitive on purpose: swapping the two arms is
+    // precisely the mistake that would emit an FS read on Windows.
+    Payload{
+      label: "compiler x64 SysV", path: "compiler/x64call.bit",
+      anchor: "return [0x65,", marker: "return [", closer: ']',
+      want: wantX64Linux(), hint: mirrorX64,
+    },
+  ]
+}
+
+fn main() {
+  let t = Tally{ checks: 0, failures: 0 }
+  let root = repoRoot()
+
+  let payloads = payloadTable()
+  // A shortened table is a green run that proves nothing.
+  assert(len(payloads) == 7)
+  for p of payloads {
+    checkPayload(t, root, p)
+  }
+
+  // Edge (1)/(2)/(3) for the SYMBOL NAME. Both backends match a call against
+  // gcThreadTokenSymbol(); if that string stops naming the runtime's exported
+  // symbol, nothing miscompiles — the inlining just silently stops.
+  checkSymbolIn(
+    t, root, "compiler/codegen.bit",
+    "fn gcThreadTokenSymbol(): string {\n  return \"${wantSymbol}\"\n}",
+      "compiler/codegen.bit's gcThreadTokenSymbol no longer returns '${wantSymbol}', " +
+      "so neither backend will inline the token read any more",
+  )
+  checkSymbolIn(
+    t, root, "runtime/gc/gcthread.bit",
+    "extern fn ${wantSymbol}(): int",
+    "the platform-free runtime/gc no longer declares the extern the backends match on",
+  )
+  for osdir of ["linux", "darwin", "windows"] {
+    checkSymbolIn(
+      t, root, "runtime/gc/${osdir}/gcthread.bit",
+      "@symbol(\"${wantSymbol}\")",
+      "runtime/gc/${osdir} no longer exports the symbol under that name",
+    )
+  }
+
+  if (t.checks < 12) {
+    eprint("FAIL: only ${t.checks} checks ran, want at least 12\n")
+    t.failures = t.failures + 1
+  }
+  if (t.failures > 0) {
+    println("threadtokenbytes: FAIL — ${t.failures} of ${t.checks} checks failed")
+    exit(1)
+  }
+  println("threadtokenbytes: PASS — ${t.checks} checks")
+}

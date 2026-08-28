@@ -1,0 +1,169 @@
+// _tests_/stress/parallel/chanhammer.bit — N-worker channel hammer (#2532,
+// epic #1253). W senders and W receivers pound one bounded channel
+// concurrently; STRESS_WORKERS sets W (8 if empty/unset, envOr's own
+// contract). Sender i sends i*10000 .. i*10000+9999 on a channel of capacity
+// 64, so the bound forces senders and receivers to interleave constantly
+// rather than the senders racing ahead and the receivers draining afterward.
+//
+// CLOSE IS THE PART THAT FINDS BUGS. `panicNilChanClose`, `panicClosedChanClose`
+// and `panicSendClosed` (runtime/chan/chanwrap.bit) all exist because closing
+// while sends or receives are in flight is where a channel's bookkeeping
+// breaks first. This program closes `data` only after every sender has
+// finished (closing under an in-flight send panics), but every receiver may
+// still be blocked waiting on it at that instant — with up to W receivers
+// parked on the same channel, the close races every one of those in-flight
+// receives at once, and each must come back either with a real buffered value
+// or a clean (zero, false), never a hang and never a lost message.
+//
+// Each receiver also selects on a `done` channel, so BOTH arms of its select
+// fire during a real run rather than one being dead code. `done` is filled
+// with W tokens by main, synchronously, before any goroutine is spawned — so
+// the very first select any receiver ever runs sees `done` already ready,
+// with real odds (and, whenever `data` has nothing buffered yet, a guarantee)
+// of picking it before a single message has even arrived. Taking that arm
+// never ends the receive loop — only `data`'s own (zero, false) does — so it
+// can never cause a message still sitting in `data`'s buffer to be lost.
+// `doneHits`, summed across every receiver's returned Tally, proves the arm
+// actually fired instead of assuming it.
+//
+// Correctness is a checksum, not "it did not crash": every message received
+// is summed and counted, and both totals must match the arithmetic sum/count
+// of everything actually sent. A lost message moves the count; a duplicated
+// or corrupted one moves the sum without moving the count — either failure
+// mode is caught independently.
+
+import { envOr } from "std/os"
+import { parseInt } from "std/strings"
+
+const perSender: int = 10000
+
+class Tally {
+  sum: int,
+  count: int,
+  doneHits: int,
+}
+
+fn sender(id: int, data: chan<int>, senderDone: chan<int>) {
+  let base = id * perSender
+  let i = 0
+  while (i < perSender) {
+    data <- base + i
+    i = i + 1
+  }
+  senderDone <- 1
+}
+
+// Drains `data` until it reports closed. `done` is a second, harmless arm the
+// select must also be able to take: taking it only counts a hit, it never
+// sets `running` false, so it can never race the drain and drop a message.
+fn receiver(data: chan<int>, done: chan<int>, results: chan<Tally>) {
+  let sum = 0
+  let count = 0
+  let doneHits = 0
+  let running = true
+  while (running) {
+    select {
+      case (v, ok) = <- data: {
+        if (ok) {
+          sum = sum + v
+          count = count + 1
+        } else {
+          running = false
+        }
+      }
+      case (_, dok) = <- done: {
+        if (dok) {
+          doneHits = doneHits + 1
+        }
+      }
+    }
+  }
+  results <- Tally{ sum: sum, count: count, doneHits: doneHits }
+}
+
+// The arithmetic sum of sender id's own range, base .. base+9999: 10000 terms
+// starting at base, so 10000*base + (0+1+...+9999).
+fn senderSum(id: int): int {
+  let base = id * perSender
+  return perSender * base + 49995000
+}
+
+fn main(): int {
+  let w = parseInt(envOr("STRESS_WORKERS", "8")) catch 8
+  if (w <= 0) {
+    w = 8
+  }
+
+  let data = chan<int>(64)
+  let done = chan<int>(w)
+  let senderDone = chan<int>(w)
+  let results = chan<Tally>(w)
+
+  // Seed BEFORE spawning anything: `done` already holds w ready tokens the
+  // instant any receiver's first select runs — see the header.
+  let seed = 0
+  while (seed < w) {
+    done <- 1
+    seed = seed + 1
+  }
+
+  let ri = 0
+  while (ri < w) {
+    spawn receiver(data, done, results)
+    ri = ri + 1
+  }
+
+  let si = 0
+  while (si < w) {
+    spawn sender(si, data, senderDone)
+    si = si + 1
+  }
+
+  // Every sender must finish before the close — closing while a sender is
+  // still mid-send panics (panicSendClosed, runtime/chan/chanwrap.bit).
+  let joined = 0
+  while (joined < w) {
+    let _ = <- senderDone
+    joined = joined + 1
+  }
+  close(data)
+
+  // Every receiver keeps draining until it observes data's own close, so
+  // collecting exactly w results here can only happen after every message
+  // ever sent has been accounted for by exactly one receiver.
+  let totalSum = 0
+  let totalCount = 0
+  let totalDoneHits = 0
+  let k = 0
+  while (k < w) {
+    let res = <- results
+    totalSum = totalSum + res.sum
+    totalCount = totalCount + res.count
+    totalDoneHits = totalDoneHits + res.doneHits
+    k = k + 1
+  }
+
+  let wantCount = w * perSender
+  let wantSum = 0
+  let wi = 0
+  while (wi < w) {
+    wantSum = wantSum + senderSum(wi)
+    wi = wi + 1
+  }
+
+  if (totalCount != wantCount) {
+    print("chanhammer FAIL want=${wantCount} got=${totalCount}\n")
+    return 1
+  }
+  if (totalSum != wantSum) {
+    print("chanhammer FAIL want=${wantSum} got=${totalSum}\n")
+    return 1
+  }
+  if (totalDoneHits == 0) {
+    print("chanhammer FAIL want=1 got=0\n")
+    return 1
+  }
+
+  print("chanhammer OK\n")
+  return 0
+}

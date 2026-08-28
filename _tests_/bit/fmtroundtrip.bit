@@ -1,0 +1,318 @@
+// #3724: no gate checked that `bit fmt` PRESERVES program meaning across the
+// corpus. #3718 and #3719 (both fixed) were formatter printers that silently
+// dropped or corrupted parser-meaningful content — one deleted `@threadlocal`
+// entirely, turning per-thread storage into shared storage with no
+// diagnostic. Neither was caught by any existing gate: `test-differentials`
+// (scripts/selfhost-diffall.sh) compares this compiler against ITSELF on the
+// same already-mangled file, so a shared printer bug is invisible to it, and
+// `--dump-ir`/`--dump-ir-pre` only walk function BODIES — a top-level
+// declaration's storage class is never represented there at all.
+//
+// The check, per file, independent of every other file (gofmt's contract,
+// same as `fmtOneFile`):
+//   1. `--dump-ast` the ORIGINAL file, untouched, straight out of the repo.
+//   2. Copy its bytes into a scratch file; run `bit fmt` (write mode, NOT
+//      `--check`) on the COPY — never on the real path, which this gate must
+//      never mutate.
+//   3. `--dump-ast` the formatted copy.
+//   4. Compare. Any difference means `bit fmt` changed program meaning: FAIL,
+//      naming the file.
+//
+// `--dump-ast` (compiler/ast.bit's `dumpNode`) is the only dump surface fit
+// for this: it emits tag names, operator symbols, the `@threadlocal` marker
+// and literal leaf text sliced from source — NO line/col/byte-offset, and
+// (verified against compiler/ast.bit) no file path either. A real reformat
+// legitimately shifts token positions and moves the file to a different
+// tmpdir path; `--dump-tokens` (raw byte offsets) and `--dump-types`/
+// `--dump-diags` (line:col + quoted source line) would both score a false
+// divergence on every single reformatted file. `--dump-ast` cannot.
+//
+// NO MANIFEST for the corpus's deliberately-malformed fixtures
+// (_tests_/cases/lex_invalid_*.bit, _tests_/bit/checkercases/*, and siblings) —
+// this gate does not need one. `bit fmt`'s own exit code IS the classifier:
+// `formatSource` (compiler/fmt.bit) explicitly checks `hasErrors(d)` on a
+// diagnostics collector and refuses (nonzero exit) on any lex/parse error,
+// so a file `bit fmt` cannot format is skipped, not failed. `--dump-ast`
+// itself CANNOT be used for this classification — verified against
+// compiler/main.bit's `dumpAstCmd`, which calls the bare `parseSource` with
+// no diagnostics collector at all and never checks for errors, so it
+// "succeeds" (exit 0, some error-recovery tree) even on a file `bit fmt`
+// correctly refuses. Classifying on `bit fmt`'s exit code side-steps that
+// entirely: a manifest can drift (too narrow, too wide — #3703's own design
+// note); an exit code cannot.
+//
+// SCOPE: the nine top-level trees that hold `.bit` sources — compiler,
+// runtime, stdlib, tools, _tests_, examples, pkg, bench, editors (verified via
+// `git ls-files '*.bit' | cut -d/ -f1 | sort -u`, 2026-08-26) — deliberately
+// NOT a walk from the repo root, which would also descend into
+// `bit-out/stage0` (a pinned oracle snapshot, not this repo's source, ~300
+// unrelated `.bit` files) and into `.claude/worktrees/*` (OTHER agents'
+// in-progress checkouts, nondeterministic and none of this gate's business).
+//
+// BIT_REPO IS REQUIRED, same reason as every sibling in this directory: the
+// harness points at `${BIT_REPO}/<tree>` for each of the nine trees above and
+// must not silently default to ".".
+//
+// Run it from the repository root:
+//     ./bit-out/bin/bit run _tests_/bit/fmtroundtrip.bit
+import { env, envOr, exit } from "std/os"
+import { exists, isDir, mkdir, readFile, writeFile, walk } from "std/fs"
+import { hasSuffix, parseInt } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// Power of 10 rule 2: `walk` (std/fs) already bounds its own recursion depth;
+// this is a second, independent ceiling on the TOTAL file count this gate
+// will ever process, so a misconfigured root cannot turn into an unbounded
+// scan.
+const maxTotalFiles: int = 8192
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "300")) catch _ {
+    300
+  }
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s mechanism channel, never a program exit status, so
+// each one is a named panic rather than a value any assertion could consume.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("fmtroundtrip: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("fmtroundtrip: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("fmtroundtrip: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("fmtroundtrip: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+fn requiredEnv(name: string): string! {
+  let v = env(name)
+  if (len(v) == 0) {
+    fail newError("fmtroundtrip: ${name} is required and was not set")
+  }
+  return v
+}
+
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// `bit fmt <path>` (write mode, no `--check`) on a scratch copy. Returns its
+// exit code only: 0 means the copy is now canonical and safe to `--dump-ast`;
+// nonzero means `path` does not parse and this file is out of scope for a
+// round-trip (there is nothing to compare against).
+fn runFmtWrite(bit: string, path: string, capDir: string, ms: int): int! {
+  let codePath = "${capDir}/fmtcode.txt"
+  let script = "#!/bin/sh\n" +
+    "'${bit}' fmt '${path}' > /dev/null 2>/dev/null\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/fmtrun.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("fmtroundtrip: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("fmtroundtrip: no exit code was recorded — the run never happened")
+  }
+  return parseInt(trimWs(readFile(codePath)?))?
+}
+
+// One `--dump-ast <path>` invocation, as seen from outside it.
+class DumpRun { code: int, text: string }
+
+fn runDumpAst(bit: string, path: string, capDir: string, ms: int): DumpRun! {
+  let outPath = "${capDir}/dumpout.txt"
+  let codePath = "${capDir}/dumpcode.txt"
+  let script = "#!/bin/sh\n" +
+    "'${bit}' --dump-ast '${path}' > '${outPath}' 2>/dev/null\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/dumprun.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("fmtroundtrip: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("fmtroundtrip: no exit code was recorded — the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  let text = readFile(outPath) catch _ {
+    ""
+  }
+  return DumpRun{ code: code, text: text }
+}
+
+// One file's verdict. `status` is "match", "mismatch" or "skip" (does not
+// parse, out of scope for a round-trip).
+class Verdict { status: string, path: string }
+
+// The nine top-level trees holding `.bit` sources (see header for how this
+// list was derived and why it is not a root-wide walk).
+fn corpusRoots(): []string {
+  return [
+    "compiler",
+    "runtime",
+    "stdlib",
+    "tools",
+    "_tests_",
+    "examples",
+    "pkg",
+    "bench",
+    "editors",
+  ]
+}
+
+class FileRef { full: string, rel: string }
+
+fn collectBitFiles(repo: string): []FileRef! {
+  let out = []FileRef(0)
+  for root of corpusRoots() {
+    let full = "${repo}/${root}"
+    if (!exists(full) || !isDir(full)) {
+      panic("fmtroundtrip: no such directory: ${full}")
+    }
+    let before = len(out)
+    for p of walk(full)? {
+      if (hasSuffix(p, ".bit")) {
+        out = append(out, FileRef{ full: p, rel: p[len(repo) + 1:] })
+      }
+    }
+    if (len(out) == before) {
+      panic("fmtroundtrip: ${full} contains zero .bit files — refusing a vacuous scan")
+    }
+    if (len(out) > maxTotalFiles) {
+      panic("fmtroundtrip: ${len(out)} .bit file(s) found, over the ${maxTotalFiles} bound")
+    }
+  }
+  return out
+}
+
+// One file's round-trip check. See the header for the full contract: a file
+// `bit fmt` refuses is "skip", not a failure; a genuine dump-ast failure on
+// either side after a successful format is a contradiction, not a skip.
+fn checkFile(bit: string, f: FileRef, capDir: string, ms: int): Verdict {
+  let src = readFile(f.full) catch e {
+    panic("fmtroundtrip: cannot read ${f.full}: ${e.message()}")
+  }
+  let scratch = "${capDir}/work.bit"
+  writeFile(scratch, src) catch e {
+    panic("fmtroundtrip: cannot write scratch copy for ${f.rel}: ${e.message()}")
+  }
+  let rc = runFmtWrite(bit, scratch, capDir, ms) catch e {
+    panic("fmtroundtrip: ${e.message()}")
+  }
+  if (rc != 0) {
+    return Verdict{ status: "skip", path: f.rel }
+  }
+  let dOrig = runDumpAst(bit, f.full, capDir, ms) catch e {
+    panic("fmtroundtrip: ${e.message()}")
+  }
+  if (dOrig.code != 0) {
+    panic("fmtroundtrip: --dump-ast exited ${dOrig.code} on ${f.rel} after `bit fmt` succeeded on identical content — contradiction")
+  }
+  let dFmt = runDumpAst(bit, scratch, capDir, ms) catch e {
+    panic("fmtroundtrip: ${e.message()}")
+  }
+  if (dFmt.code != 0) {
+    panic("fmtroundtrip: --dump-ast exited ${dFmt.code} on the FORMATTED copy of ${f.rel} — `bit fmt` produced unparseable output")
+  }
+  if (dOrig.text != dFmt.text) {
+    return Verdict{ status: "mismatch", path: f.rel }
+  }
+  return Verdict{ status: "match", path: f.rel }
+}
+
+fn newCapDir(): string {
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  return "${tmp}/bit-fmtroundtrip-${uuidFormat(uuidV4())}"
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}
+
+fn teardown(dir: string, ms: int) {
+  shell("${dir}/rm.sh", "#!/bin/sh\nrm -rf '${dir}'\n", ms) catch _ {
+    return
+  }
+}
+
+fn printMismatches(paths: []string) {
+  eprint("  file(s) where `bit fmt` changed program meaning:\n")
+  for p of paths {
+    eprint("    ${p}\n")
+  }
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let bit = requiredEnv("BIT_SELF_EXE") catch e {
+    panic("fmtroundtrip: ${e.message()}")
+  }
+  let repo = requiredEnv("BIT_REPO") catch e {
+    panic("fmtroundtrip: ${e.message()}")
+  }
+
+  let files = collectBitFiles(repo) catch e {
+    panic("fmtroundtrip: ${e.message()}")
+  }
+
+  let capDir = newCapDir()
+  mkdir(capDir) catch e {
+    panic("fmtroundtrip: cannot create ${capDir}: ${e.message()}")
+  }
+
+  let matched = 0
+  let mismatch = 0
+  let skip = 0
+  let mismatched = []string(0)
+
+  for f of files {
+    let v = checkFile(bit, f, capDir, ms)
+    if (v.status == "match") {
+      matched = matched + 1
+    } else if (v.status == "skip") {
+      skip = skip + 1
+    } else {
+      mismatch = mismatch + 1
+      mismatched = append(mismatched, v.path)
+    }
+  }
+
+  teardown(capDir, ms)
+
+  let total = matched + mismatch + skip
+  if (mismatch > 0) {
+    eprint("fmt-roundtrip: FAIL -- MISMATCH=${mismatch} of ${total} .bit file(s) scanned (MATCH=${matched} SKIP=${skip})\n")
+    printMismatches(mismatched)
+    exit(1)
+  }
+  println("fmt-roundtrip: MATCH=${matched} MISMATCH=${mismatch} SKIP=${skip} of ${total} .bit file(s) scanned")
+  println("fmt-roundtrip: PASS")
+}

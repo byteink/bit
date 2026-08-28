@@ -1,0 +1,369 @@
+// Install-prefix path resolution — the Bit-native port of the deleted harness
+// `pathresolve` (#1452).
+//
+// THE PROPERTY, in one sentence: the shipped `bit`, reached through a bare
+// PATH symlink whose own directory is NOT the install prefix, finds
+// `<prefix>/stdlib` and `<prefix>/lib/<triple>/libbitrt.a` by resolving its own
+// executable path through symlinks — with nothing inherited from this process's
+// environment to help it.
+//
+// What was broken and why the shape below is exactly the shape that broke:
+// `bin/bit` used to resolve `stdlib/` and `libbitrt.a` against the CURRENT
+// WORKING DIRECTORY. An installed `bit` invoked from a user's own directory
+// found neither, so every installer (#359 brew, #360 curl|sh) had to ship a
+// wrapper script or a profile export setting `BIT_STDLIB`/`BIT_LIBBITRT`.
+//
+// Four fixture decisions, each load-bearing:
+//
+//  * The prefix is laid out like the release artifact — `bin/bit`, `stdlib/`,
+//    `lib/<triple>/libbitrt.a`.
+//  * `bit` is reached through a BARE SYMLINK in a sibling directory OUTSIDE the
+//    prefix, the way a PATH install works (`/opt/bit-x.y.z` reached via
+//    `/usr/local/bin/bit`). Put the symlink inside the prefix and resolving the
+//    symlink's own directory lands on a valid prefix by accident, so symlink
+//    resolution — the actual fix — is never exercised.
+//  * The child runs under `env -i`: an EMPTY environment, not the inherited one
+//    minus two keys. This process may itself have been started with
+//    `BIT_STDLIB`/`BIT_LIBBITRT` set, and the test is meaningless if either
+//    leaks in. `bit` is invoked by absolute path, so it needs no PATH.
+//  * TWO different working directories, neither the prefix and neither the
+//    build tree. One cwd cannot distinguish a fix from a coincidence, and
+//    cwd-dependence is the precise failure mode here.
+//
+// THE FIXTURE IMPORTS `std/strings` ON PURPOSE. The deleted harness's fixture was
+// `print("resolved\n")` and nothing else — a program that needs no stdlib
+// module at all. Deleting `<prefix>/stdlib` left that test green, so half the
+// asserted property was dead. `toUpper` forces the compiler to actually find
+// and load `<prefix>/stdlib/strings/strings.bit`, and the uppercase output is
+// the proof it did.
+//
+// WHY THE EXIT CODES COME OUT OF FILES AND NOT OUT OF `osRunBounded`. The
+// script shape `... > out 2>&1; echo $? > code` exits with the status of the
+// final `echo`, i.e. 0 forever, no matter how the compiler run went. Asserting
+// on the script's own status is an unconditional pass. So the run half of the
+// script deliberately runs with `set +e`, records each child's status in its own
+// file, and every assertion below reads those files. `osRunBounded`'s return
+// value is only used to tell "the script never ran / timed out" apart from "the
+// script ran and reported".
+//
+// WHY A MISSING SOURCE IS A PANIC AND NEVER A SKIP. The deleted harness opened
+// with two silent `return`s for the cross-build case. There is no cross-build
+// case here — this program runs on the host whose `bit` it is testing — so a
+// missing archive or stdlib is a broken tree, and reporting it as a pass is the
+// vacuity this file exists to avoid.
+
+import { readFile, writeFile, exists, isDir, mkdir } from "std/fs"
+import { contains } from "std/strings"
+import { env } from "std/os"
+
+// Generous: this runs two full compiles of a program that pulls in the stdlib.
+// #1637's convention — a timeout is a DISTINCT outcome from a failure, named as
+// such, never folded into "nonzero".
+const resolveTimeoutMs: i64 = 180000
+
+// Setup failures are never a pass. Every one of them ends the process nonzero
+// rather than leaving a case unrun.
+fn die(msg: string) {
+  eprint("pathresolve: SETUP FAILED: ${msg}\n")
+  osExit(1)
+}
+
+// 63 bits of OS entropy. macOS caches a code signature PER PATH, so a fixed
+// scratch root can validate a previously-cached signature and happily test a
+// stale binary; and two concurrent runs must not share a tree. The top bit is
+// dropped so the value renders without a leading '-' — these end up in
+// directory and SOURCE FILE names, and `bit run` derives a temp output name
+// from the stem.
+fn nonce(): uint {
+  let b = []byte(cryptoRandomBytes(8))
+  let x: uint = 0
+  let i = 0
+  while (i < 8) {
+    x = (x << 8) | uint(b[i])
+    i = i + 1
+  }
+  return x >> 1
+}
+
+// Every path reaches /bin/sh through this. A single quote inside a path would
+// break out of the quoting, so it is refused rather than escaped — no path this
+// program constructs can contain one, and a source path that does is a broken
+// tree, not a case to handle.
+fn shq(p: string, what: string): string {
+  if (contains(p, "'")) {
+    die("${what}: path contains a single quote, refusing to quote it: ${p}")
+  }
+  return "'" + p + "'"
+}
+
+// The `<triple>` component of the shipped `lib/<triple>/libbitrt.a`, spelled the
+// way `bit --target` spells it (the compiler's own naming, not `uname -m`).
+// `hostTarget()` is the runtime primitive `hostBuildTarget()` is built on, so
+// this cannot drift from what the binary under test looks for.
+fn hostTriple(): string {
+  let t = hostTarget()
+  if (t == 0) { return "x86_64-linux" }
+  if (t == 1) { return "aarch64-linux" }
+  if (t == 2) { return "aarch64-macos" }
+  die("unknown hostTarget() ordinal ${t}")
+  return ""
+}
+
+// The repo root: the nearest ancestor holding BOTH the built compiler and the
+// stdlib source. Overridable with BIT_REPO for a runner with a different cwd.
+// Not finding one is a hard failure, never a skip.
+fn repoRoot(): string {
+  let override = env("BIT_REPO")
+  if (len(override) > 0) {
+    return override
+  }
+  let candidates = [".", "..", "../..", "../../.."]
+  for c of candidates {
+    if (exists("${c}/bit-out/bin/bit") && isDir("${c}/stdlib")) {
+      return c
+    }
+  }
+  die("cannot locate the repo root from this cwd; set BIT_REPO")
+  return ""
+}
+
+fn mustMkdir(p: string) {
+  mkdir(p) catch e {
+    die("mkdir ${p}: ${e.message()}")
+  }
+}
+
+fn mustWrite(p: string, content: string) {
+  writeFile(p, content) catch e {
+    die("write ${p}: ${e.message()}")
+  }
+}
+
+// Strips leading/trailing ASCII whitespace INCLUDING newlines. std/strings'
+// `trimSpace` trims only spaces and tabs, so `echo $?` output stayed "0\n" and
+// compared unequal to "0" — a false failure, but the same blind spot would let a
+// looser comparison pass on garbage.
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: byte): bool {
+  return c == byte(32) || c == byte(9) || c == byte(10) || c == byte(13)
+}
+
+// A one-line, newline-escaped rendering so captured output stays on one line in
+// a failure message and an EMPTY capture is visibly empty rather than invisible.
+//
+// The single byte is appended by SLICING `s`, not by `string([]byte([ch]))`.
+// That second form is what _tests_/bit/version.bit's copy of this function uses,
+// and on this toolchain it produces a string with a garbage length — a
+// one-character append turns `len` into ~4.3e9 and the next concatenation
+// wedges the process. version.bit only ever calls it on a failure path, so the
+// bug is latent there; it is not this port's to fix, but this copy must not
+// inherit it.
+fn jsonish(s: string): string {
+  let out = "\""
+  let i = 0
+  while (i < len(s)) {
+    let ch = s[i]
+    if (ch == byte(10)) {
+      out = out + "\\n"
+    } else if (ch == byte(34)) {
+      out = out + "\\\""
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "\""
+}
+
+// Turns `osRunBounded`'s packed i64 (ABI.md §19) into a message, or "" when the
+// script really ran and its own status is not what we assert on.
+fn launchProblem(r: i64): string {
+  if (r == -1) { return "spawn failed (fork/exec/wait error)" }
+  if (r == -2) { return "the fixture script TIMED OUT after ${resolveTimeoutMs}ms" }
+  if (r <= -100) { return "the fixture script was killed by signal ${-r - 100}" }
+  if (r < 0) { return "unknown os_run_bounded result ${r}" }
+  return ""
+}
+
+fn main() {
+  let root = repoRoot()
+
+  // The three things a real install is made of. Each is asserted present up
+  // front, naming itself: a run that silently skipped one of these is the
+  // failure mode this whole file is written against.
+  let exe = "${root}/bit-out/bin/bit"
+  let stdDir = "${root}/stdlib"
+  let triple = hostTriple()
+  let lib = "${root}/bit-out/lib/${triple}/libbitrt.a"
+  if (!exists(exe)) { die("compiler under test is missing: ${exe}") }
+  if (!isDir(stdDir)) { die("stdlib source is missing: ${stdDir}") }
+  if (!exists(lib)) { die("runtime archive for host ${triple} is missing: ${lib}") }
+
+  let tmp = env("TMPDIR")
+  if (len(tmp) == 0) { tmp = "/tmp" }
+  if (tmp[len(tmp) - 1] == byte(47)) { tmp = tmp[:len(tmp) - 1] }
+  let scratch = "${tmp}/bit-pathresolve-${nonce()}"
+
+  // The install prefix is a SUBDIRECTORY of the scratch root; the PATH
+  // directory holding the symlink is a SIBLING outside it.
+  let prefix = "${scratch}/prefix"
+  let binDir = "${prefix}/bin"
+  let libDir = "${prefix}/lib/${triple}"
+  let linkDir = "${scratch}/pathdir"
+  let bitDst = "${binDir}/bit"
+  let link = "${linkDir}/bit"
+
+  mustMkdir(scratch)
+
+  // Each cwd gets its own source STEM: `bit run` names its temporary output
+  // after the stem, so a shared name would let the two runs collide.
+  let names = ["one", "two"]
+  let stamp = nonce()
+  for n of names {
+    let work = "${scratch}/work-${n}"
+    mustMkdir(work)
+    // The `std/strings` import is the whole point: without it the program needs
+    // no stdlib module and deleting <prefix>/stdlib would not be noticed.
+    mustWrite("${work}/prog_${n}_${stamp}.bit",
+      "import { toUpper } from \"std/strings\"\n\nfn main() {\n  print(toUpper(\"resolved\") + \"\\n\")\n}\n")
+  }
+
+  let qBinDir = shq(binDir, "bin dir")
+  let qLibDir = shq(libDir, "lib dir")
+  let qLinkDir = shq(linkDir, "path dir")
+  let qRoot = shq(root, "repo root")
+  let qBitDst = shq(bitDst, "installed bit")
+  let qLibDst = shq("${libDir}/libbitrt.a", "installed archive")
+  let qStdDst = shq("${prefix}/stdlib", "installed stdlib")
+  let qLink = shq(link, "path symlink")
+
+  let script = "${scratch}/fixture.sh"
+  // `set -e` covers the SETUP half only. The run half must not abort on a
+  // failing child — a failing child is a result to record, not a reason to stop.
+  //
+  // `src=$(cd <root> && pwd -P)` is load-bearing, not tidiness. `repoRoot()`
+  // normally answers "." and a symlink's target is resolved relative to the
+  // SYMLINK's own directory, so `ln -s ./stdlib <prefix>/stdlib` produces a
+  // dangling link into the prefix. The first run of this file did exactly that
+  // and the child reported `cannot find module "std/strings"` — the fixture, not
+  // the compiler, was broken.
+  //
+  // stdlib is symlinked rather than deep-copied: what is under test is where the
+  // compiler LOOKS, not how the bytes got there. The PATH symlink is the thing
+  // an installer actually creates, and the reason `selfExe()` must resolve
+  // symlinks.
+  let text = "#!/bin/sh\nset -e\n" +
+    "src=$(cd ${qRoot} && pwd -P)\n" +
+    "mkdir -p ${qBinDir} ${qLibDir} ${qLinkDir}\n" +
+    "cp \"$src/bit-out/bin/bit\" ${qBitDst}\n" +
+    "chmod 755 ${qBitDst}\n" +
+    "cp \"$src/bit-out/lib/${triple}/libbitrt.a\" ${qLibDst}\n" +
+    "ln -s \"$src/stdlib\" ${qStdDst}\n" +
+    "ln -s ${qBitDst} ${qLink}\n" +
+    "set +e\n"
+  for n of names {
+    let qWork = shq("${scratch}/work-${n}", "work dir")
+    let qOut = shq("${scratch}/out-${n}.txt", "stdout capture")
+    let qCode = shq("${scratch}/code-${n}.txt", "status capture")
+    text = text + "cd ${qWork} && env -i ${qLink} run prog_${n}_${stamp}.bit > ${qOut} 2>&1; echo $? > ${qCode}\n"
+  }
+  // The script's own status reports SETUP only, never the compiler runs.
+  text = text + "exit 0\n"
+
+  mustWrite(script, text)
+  if (fsChmod(script, 493) != 0) {
+    die("chmod ${script}")
+  }
+
+  let r = osRunBounded(script, resolveTimeoutMs)
+  let problem = launchProblem(r)
+  if (len(problem) > 0) {
+    die("${problem} (fixture left at ${scratch})")
+  }
+  if (r != 0) {
+    die("fixture setup failed: the script exited ${r} (fixture left at ${scratch})")
+  }
+
+  // `toUpper("resolved")`. The uppercasing is what proves `<prefix>/stdlib` was
+  // found: a compiler that could not load std/strings cannot produce this.
+  let want = "RESOLVED\n"
+  let failed = 0
+  let checked = 0
+  for n of names {
+    let work = "${scratch}/work-${n}"
+    let outPath = "${scratch}/out-${n}.txt"
+    let codePath = "${scratch}/code-${n}.txt"
+
+    // Existence is asserted BEFORE reading. `readFile(p) catch { "" }` is the
+    // house idiom, and paired with an expected value it would let a run that
+    // never happened satisfy the comparison.
+    if (!exists(codePath)) {
+      eprint("pathresolve: FAIL cwd ${work}: no status capture at ${codePath} — the run never happened\n")
+      failed = failed + 1
+      continue
+    }
+    if (!exists(outPath)) {
+      eprint("pathresolve: FAIL cwd ${work}: no output capture at ${outPath} — the run never happened\n")
+      failed = failed + 1
+      continue
+    }
+    let code = trimWs(readFile(codePath) catch e {
+      die("read ${codePath}: ${e.message()}")
+      ""
+    })
+    let out = readFile(outPath) catch e {
+      die("read ${outPath}: ${e.message()}")
+      ""
+    }
+    checked = checked + 1
+
+    if (code != "0") {
+      eprint("pathresolve: FAIL cwd ${work}: `bit run` exited ${code}\n")
+      eprint("pathresolve:   output: ${jsonish(out)}\n")
+      failed = failed + 1
+      continue
+    }
+    if (out != want) {
+      eprint("pathresolve: FAIL cwd ${work}: output was ${jsonish(out)}, want ${jsonish(want)}\n")
+      failed = failed + 1
+    }
+  }
+
+  // The two-cwd loop IS the anti-coincidence argument. A loop that ran zero or
+  // one times and reported success is this repo's twelve-guard failure mode.
+  if (checked != 2) {
+    eprint("pathresolve: FAIL: verified ${checked} working directories, want 2 (fixture left at ${scratch})\n")
+    osExit(1)
+  }
+  if (failed != 0) {
+    eprint("pathresolve: FAILED ${failed}/2 working directories (fixture left at ${scratch})\n")
+    osExit(1)
+  }
+
+  // Teardown only on success, and only through a script: `remove()` is
+  // single-file. A failed run keeps its fixture for inspection, which is why
+  // every failure path above names the directory.
+  let cleanup = "${scratch}.rm.sh"
+  let qScratch = shq(scratch, "scratch root")
+  let qCleanup = shq(cleanup, "cleanup script")
+  mustWrite(cleanup, "#!/bin/sh\nrm -rf ${qScratch} ${qCleanup}\n")
+  if (fsChmod(cleanup, 493) == 0) {
+    let rmrc = osRunBounded(cleanup, 30000)
+    if (rmrc != 0) {
+      eprint("pathresolve: note: teardown of ${scratch} returned ${rmrc}\n")
+    }
+  }
+
+  print("pathresolve: ok — 2 working directories, prefix reached through a bare PATH symlink, env -i, host ${triple}\n")
+}

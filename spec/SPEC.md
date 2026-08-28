@@ -1865,7 +1865,7 @@ rejected the bare form while the self-hosted checker accepted it and
 miscompiled, storing an `f64` into an `f32`-wide element so that `a[0] == 4.5`
 was false, and admitting a length mismatch that read uninitialized memory. The
 rule is stated here so the two cannot drift again (see
-tests/cases/check_array_literal.bit and run_array_value.bit).
+_tests_/cases/check_array_literal.bit and run_array_value.bit).
 
 **Diagnostic order inside a composite literal is normative** — this is the
 general post-order rule of §14.8, spelled out for the literal forms. A literal is
@@ -1884,7 +1884,7 @@ the `a: "s"` mismatch is reported before the `x:` one, even though `x:` starts
 earlier in the source. Order is user-facing, and the two compilers must render
 byte-identical output, so it is fixed here rather than left to whichever
 traversal each implementation happens to use (#1489;
-tests/cases/check_composite_order.bit).
+_tests_/cases/check_composite_order.bit).
 
 ### 12.4 Calls, Variadics, Spread
 
@@ -2731,7 +2731,7 @@ Three consequences, each of which has caused the two compilers to diverge:
 
 Order is user-facing, and the two compilers must render byte-identical output,
 so this is fixed rather than left to whichever traversal each implementation
-happens to use (#1489, #1521; tests/cases/check_typenode_order.bit).
+happens to use (#1489, #1521; _tests_/cases/check_typenode_order.bit).
 
 ---
 

@@ -1,0 +1,266 @@
+// `bit lsp` best-effort type-checking gate (#3559): drives the REAL
+// self-hosted `bit lsp` binary as a subprocess and asserts on its raw
+// JSON-RPC output, the same mechanics as _tests_/bit/lspresolve.bit (see its
+// header) and _tests_/bit/lsplifecycle.bit — each `bit run _tests_/bit/*.bit` is
+// a standalone single-file program, so the small harness
+// (frame/shQuote/runLsp/...) is duplicated here rather than imported.
+//
+// THE BUG THIS GATE EXISTS TO CATCH: `lspBuildProjectOverlay`
+// (compiler/lspbuild.bit) used to skip `checkResolved` for the WHOLE project
+// the moment resolution saw a parse error ANYWHERE in it, via a `checkedOk`
+// flag every query handler gated on. One unclosed paren anywhere in the open
+// buffer — the single most common state while a user is actively typing —
+// disabled hover/definition/references/rename/completion for the entire
+// file, including declarations with no relationship to the error. #3559
+// removed the flag: `checkResolved` now runs unconditionally, so the
+// declarations the parser recovered cleanly still type.
+//
+// `checkHoverIgnoresUnrelatedSyntaxError` is #3559's own acceptance shape.
+// `checkServerSurvivesSeverelyMalformedFile` is the mutation-tested safety
+// half: `checkResolved`'s arena-wide sweeps were never designed to run
+// against a tree the parser rejected, and a genuinely malformed tree (an
+// unclosed function body swallowing every later declaration, plus garbage
+// tokens) is exactly where a hole in that tree would surface as a crash
+// rather than a wrong answer. `runLsp` below already fails the case on a
+// signal-killed subprocess (see its `code <= 0 - 100` branch), so simply
+// completing without crashing is the assertion.
+//
+// WIRED INTO `./make test` as `test-lsp-errortolerant` (tools/build/gates.bit,
+// tools/build/defs.bit), registered in the same commit as this file so
+// scripts/gate.sh does not see it as an unmapped _tests_/bit/** path.
+
+import { envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir, exists } from "std/fs"
+
+const timeoutMs: int = 20000
+
+fn failCase(msg: string) {
+  eprint("FAIL lsperrortolerant: " + msg + "\n")
+  exit(1)
+}
+
+fn frame(body: string): string {
+  return "Content-Length: ${len(body)}\r\n\r\n" + body
+}
+
+fn mkdirQuiet(path: string) {
+  mkdir(path) catch e {
+    return
+  }
+}
+
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+fn runLsp(bin: string, scratch: string, payload: string): (string, bool) {
+  mkdirQuiet(scratch)
+  let inPath = scratch + "/in"
+  let outPath = scratch + "/out"
+  let errPath = scratch + "/err"
+  let shPath = scratch + "/w.sh"
+  writeFile(inPath, payload) catch e {
+    failCase("cannot write input payload: " + e.message())
+    return "", false
+  }
+  let script = "#!/bin/sh\nexec " +
+    shQuote(bin) +
+    " lsp < " +
+    shQuote(inPath) +
+    " > " +
+    shQuote(outPath) +
+    " 2> " +
+    shQuote(errPath) +
+    "\n"
+  writeFile(shPath, script) catch e {
+    failCase("cannot write wrapper script: " + e.message())
+    return "", false
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    failCase("cannot chmod wrapper script")
+    return "", false
+  }
+  let code = osRunBounded(shPath, timeoutMs)
+  if (code == 0 - 2) {
+    failCase("TIMED OUT after ${timeoutMs}ms (raise BIT_TEST_TIMEOUT_S)")
+    return "", false
+  }
+  if (code == 0 - 1) {
+    failCase("cannot launch wrapper script (spawn/wait failure)")
+    return "", false
+  }
+  if (code <= 0 - 100) {
+    failCase("CRASHED: killed by signal ${0 - code - 100}")
+    return "", false
+  }
+  let out = readFile(outPath) catch e {
+    ""
+  }
+  return out, true
+}
+
+fn jsonEscape(s: string): string {
+  let out = ""
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == u8('"')) {
+      out = out + "\\\""
+    } else if (c == u8('\\')) {
+      out = out + "\\\\"
+    } else if (c == u8('\n')) {
+      out = out + "\\n"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn contains(haystack: string, needle: string): bool {
+  let n = len(needle)
+  if (n == 0) {
+    return true
+  }
+  let i = 0
+  while (i + n <= len(haystack)) {
+    if (haystack[i:i + n] == needle) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn initReq(): string {
+  return frame(
+      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"," +
+      "\"params\":{\"processId\":null,\"rootUri\":null,\"capabilities\":{}}}",
+  )
+}
+
+fn initNotif(): string {
+  return frame("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}")
+}
+
+fn didOpen(uri: string, text: string): string {
+  return frame(
+      "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+      "\"textDocument\":{\"uri\":\"${uri}\",\"languageId\":\"bit\",\"version\":1," +
+      "\"text\":\"" +
+      jsonEscape(text) +
+      "\"}}}",
+  )
+}
+
+fn hoverReq(id: int, uri: string, line: int, character: int): string {
+  return frame(
+      "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"textDocument/hover\"," +
+      "\"params\":{\"textDocument\":{\"uri\":\"${uri}\"},\"position\":{\"line\":${line}," +
+      "\"character\":${character}}}}",
+  )
+}
+
+// #3559's own reproduction: a well-formed `g` and `f`, then `main` left open
+// with an unclosed nested call. `bit check` on this reports 4 E0021 parse
+// errors, all inside `main` — `g` and `f` themselves are untouched.
+fn unrelatedErrorFixture(): string {
+  return "fn g(y: i64): i64 {\n  return y\n}\n\n" +
+    "fn f(x: i64): i64 {\n  return x\n}\n\n" +
+    "fn main() {\n  f(g(\n}\n"
+}
+
+// The ticket's acceptance shape: hover on `g`'s own declaration name — line 0
+// character 4, nothing to do with the broken call on line 8 — must return a
+// real hover, not null, and the buffer's parse errors must still be
+// published (the fix must not make the checker swallow them).
+fn checkHoverIgnoresUnrelatedSyntaxError(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/unrelated"
+  mkdirQuiet(dir)
+  let text = unrelatedErrorFixture()
+  let path = dir + "/main.bit"
+  writeFile(path, text) catch e {
+    failCase("cannot write ${path}: " + e.message())
+    return
+  }
+  let uri = "file://" + path
+  let payload = initReq() + initNotif() + didOpen(uri, text) + hoverReq(2, uri, 0, 4)
+  let (out, ok) = runLsp(bin, dir, payload)
+  if (!ok) {
+    return
+  }
+  if (contains(out, "\"id\":2,\"result\":null")) {
+    failCase("hover on g (unrelated to the broken call) returned null\n" + out)
+    return
+  }
+  if (!contains(out, "\"id\":2") || !contains(out, "i64) => i64")) {
+    failCase("hover on g did not report its real (i64) => i64 signature\n" + out)
+    return
+  }
+  if (!contains(out, "E0021")) {
+    failCase("the buffer's own parse errors were not published — the fix must not " +
+      "make checking swallow them\n" + out)
+    return
+  }
+  print("PASS lsperrortolerant: hover on a well-formed function ignores an unrelated syntax error\n")
+}
+
+// A badly broken file: `g`'s own body never closes, so the parser folds the
+// rest of the source (two more `fn` headers, mismatched braces, garbage
+// tokens) into its statement list — not merely one local error but a
+// genuinely different, malformed tree shape. `runLsp` already fails the case
+// if the subprocess is signal-killed; completing at all, for every query
+// type a handler dispatches to, is the assertion.
+fn severelyMalformedFixture(): string {
+  return "fn g(y: i64): i64 {\n  return y\n\n" +
+    "@@@ ### $$$ !!! <<<>>>\n\n" +
+    "class Broken {\n  x: i64,\n  y:\n}\n}\n}\n\n" +
+    "fn f(x: i6\n"
+}
+
+fn checkServerSurvivesSeverelyMalformedFile(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/malformed"
+  mkdirQuiet(dir)
+  let text = severelyMalformedFixture()
+  let path = dir + "/main.bit"
+  writeFile(path, text) catch e {
+    failCase("cannot write ${path}: " + e.message())
+    return
+  }
+  let uri = "file://" + path
+  let payload = initReq() + initNotif() + didOpen(uri, text) +
+    hoverReq(2, uri, 0, 3) + hoverReq(3, uri, 5, 0) + hoverReq(4, uri, 8, 0)
+  let (out, ok) = runLsp(bin, dir, payload)
+  if (!ok) {
+    return
+  }
+  if (!contains(out, "\"id\":2") || !contains(out, "\"id\":3") || !contains(out, "\"id\":4")) {
+    failCase("a severely malformed buffer left one of 3 hover requests unanswered\n" + out)
+    return
+  }
+  print("PASS lsperrortolerant: the server answers every query against a severely malformed buffer, without crashing\n")
+}
+
+fn main() {
+  let bin = envOr("BIT", "bit-out/bin/bit")
+  if (!exists(bin)) {
+    failCase("BIT='${bin}' does not exist — refusing to guess")
+    return
+  }
+  let scratchRoot = envOr("TMPDIR", "/tmp") + "/bit-lsperrortolerant-${timeUnixNs()}"
+  mkdirQuiet(scratchRoot)
+  checkHoverIgnoresUnrelatedSyntaxError(bin, scratchRoot)
+  checkServerSurvivesSeverelyMalformedFile(bin, scratchRoot)
+  print("lsperrortolerant: all scenarios passed\n")
+}

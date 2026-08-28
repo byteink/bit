@@ -1,0 +1,739 @@
+// The index receiver-kind guards, as seen from outside the compiler (#2385 read,
+// #2390 read-modify-write, #2403 plain store).
+//
+// The property under test: `a[i]` is lowered ONLY through an arm that matches the
+// receiver's actual type kind — slice, map, string, fixed array — and a receiver
+// of any other kind makes the compiler REFUSE to emit a binary instead of falling
+// through to the fixed-array `index_get` / `index_set`.
+//
+// Why that matters. `index_get` and `index_set` are raw word addressing,
+// `base + i*width`, over an inline block. Emitted against something that is not an
+// inline block they read, and on the write side OVERWRITE, whatever bytes are
+// there and call the result an element. Against a slice that is the
+// `{ptr, len, cap}` header, so `xs[0]` yields the DATA POINTER and `xs[1]` the
+// length (#2275). Against an `i64` it dereferences the integer. None of it is
+// diagnosed at any stage. Measured: all thirteen programs in `rejects()` below built
+// with exit 0 under the released `bit 0.1.8`, and then
+//   - typeparam-int      printed `x` and died on SIGSEGV (exit 139)
+//   - typeparam-bool     printed nothing and died on SIGSEGV (exit 139)
+//   - typeparam-class   printed `y` and exited 0 — it read field `a` of the
+//                        class as element 0 and agreed that `first(P{a: 7}) == 7`
+//   - lv-compound-int    died on SIGSEGV (exit 139)
+//   - lv-compound-bool   died on SIGSEGV (exit 139)
+//   - lv-incdec-int      died on SIGSEGV (exit 139)
+//   - lv-compound-class printed `y` and exited 0 — `xs[0] += 1` incremented
+//                        field `a` of the class, 7 to 8, and nothing said so
+//   - lv-compound-string printed `bc` and exited 0 — `s[0] += 1` STORED into an
+//                        immutable string's object and destroyed it. Note what it
+//                        did not print: not `bbc`, so the write did not even land
+//                        where the expression says. The string is a different
+//                        string afterwards
+//   - lv-incdec-string   printed `bc` and exited 0 — same corruption via `s[0]++`
+//   - st-plain-int       died on SIGSEGV (exit 139)
+//   - st-plain-bool      died on SIGSEGV (exit 139)
+//   - st-plain-class    printed `y` and exited 0 — `xs[0] = 42` overwrote field
+//                        `a` of the CALLER's class, 7 to 42
+//   - st-plain-string    exited 0 with the string destroyed. 0.1.8 printed nothing
+//                        and the dev tree printed garbage bytes: the same
+//                        corruption landing differently, not a difference in kind
+// The silent ones are why this is gated: a meaningless program that exits 0 with a
+// plausible answer is not something anyone downstream can notice.
+//
+// Ten of these shapes reached lowering (before #2391) for one reason, in
+// compiler/validateexpr.bit: the `typeparam-*` and `lv-*`/`st-*` cases with a bare
+// `T` got past `vIndex`, which returns early and says nothing when the receiver's
+// type is un-inferred, invalid, or an open type param — a deliberate
+// permissiveness. `vInstIndex` (compiler/validateinst.bit, #2391) re-judges the
+// same receiver once the instantiation substitutes a concrete type for `T`, so all
+// ten are now refused by the CHECKER, with `error[E0054]` naming the substituted
+// type, before `bit build` ever reaches the lowerer.
+//
+// The three string cases (`lv-compound-string`, `lv-incdec-string`,
+// `st-plain-string`) got past `vIndex` for the OPPOSITE reason: `vIsIndexable`
+// answers TRUE for a string, correctly for a read, and nothing asked whether this
+// particular index was being WRITTEN — a string is indexable, so there was no
+// type-param substitution for #2391 to catch. #2740's `vAssignTargetString`
+// (compiler/validateassign.bit) is that missing write-side question, asked once
+// per assignment/inc-dec target regardless of whether a type param is involved,
+// so all three are now refused by the CHECKER too, with `error[E0087]`, before
+// `bit build` ever reaches the lowerer.
+//
+// Measured before #2391 landed: `bit check` exited 0 on all thirteen rejection
+// cases below, and the refusal for every one of them came from `bit build`'s
+// lowerer. `Reject.wantErr` below records, per case, the checker fragment now
+// expected — `error[E0054]` for the ten type-param cases, `error[E0087]` for the
+// three string cases. All thirteen are checker-caught as of #2740; none falls
+// back to the lowering-refusal assertions anymore, but those assertions (the
+// lowerer's own guard) stay live in `checkRejects` for whichever case, present or
+// future, still needs them.
+//
+// THREE lowering sites share this hazard, and all three are guarded here — one
+// guard each, written independently, with nothing mechanical keeping them in step.
+// `a[i]` as an rvalue goes through `lowerIndex` in compiler/lowerlit.bit (#2385);
+// the `typeparam-*` cases cover it. A read-modify-write — every compound assign
+// `a[i] op= v`, and `a[i]++` / `a[i]--` — goes through `resolveLvalue` in
+// compiler/lowerassign.bit, whose Elem arm then dispatches on `isSlice` in
+// `readLvalue`/`writeLvalue` (#2390); the `lv-*` cases cover it. A PLAIN `a[i] = v`
+// goes through NEITHER: lowerAssign routes it to `lowerIndexStore` in
+// compiler/lowerflow.bit (#2403); the `st-*` cases cover it, and they are the proof
+// that proximity is not coverage — every one of them still built clean and
+// segfaulted or silently corrupted with BOTH of the other guards already landed.
+// A FOURTH site added later would be silently ungated: do not assume a shape is
+// covered because its sibling is, check which of the three functions the statement
+// reaches, and if you add a site add its cases here.
+//
+// Those three are the whole set as of #2403, verified by grepping every construction
+// of `Op.IndexGet`/`Op.IndexSet` in compiler/. The other emitters do not dispatch on
+// a user receiver's kind and need no guard: `lowerForOf` in compiler/lowerctrl.bit
+// already tests `id.kind` against Slice/Array/Map and fails on anything else before
+// it emits, and compiler/lowerlit.bit's remaining uses fill in array and class
+// LITERALS, whose receiver is a block the compiler allocated itself.
+//
+// WHY THIS LIVES IN _tests_/bit/ AND NOT _tests_/cases/.
+//
+// The guard makes this compiler REJECT programs the pinned stage0 oracle accepts.
+// scripts/selfhost-diffcheck.sh classifies exactly that as FALSEPOS and exits 1 on
+// it, and its sweep is
+//     find stdlib examples _tests_/cases _tests_/imports -name '*.bit'
+// so a golden case would BE the file that turns the corpus differential red. The
+// divergence is deliberate and correct — the oracle predates the guard — and that
+// script refuses known-divergence lists on principle (#1883). _tests_/bit/ is not in
+// the sweep, so the behaviour is gated for real without hiding or fabricating a
+// difference. Same reasoning as _tests_/bit/constoverflow.bit.
+//
+// Everything here drives the shipped `bit` CLI as a subprocess: an exit code and
+// the presence or absence of an output file are observable only to a parent.
+// compiler/lowerlit.bit's `lowerIndex`, compiler/lowerassign.bit's `resolveLvalue`
+// and compiler/lowerflow.bit's `lowerIndexStore` are the units under it.
+//
+// Run it from the repository root:
+//     ./bit-out/bin/bit run _tests_/bit/lowerrefuse.bit
+// `BIT_SELF_EXE` overrides which `bit` is exercised; unset, the compiler under
+// test is `<cwd>/bit-out/bin/bit`, resolved from a child's own `pwd`.
+//
+// ANTI-VACUITY, all of it load-bearing. A compiler that refused EVERY program
+// would satisfy the rejection half trivially, so the acceptance half builds and
+// RUNS twenty-one programs and compares stdout exactly. The read half covers all
+// four arms of `lowerIndex`, three of them also reached through a generic call.
+// The read-modify-write half covers all three lvalue arms `resolveLvalue` can
+// produce, each under both spellings that resolve one — `op=` and `++`/`--` — and
+// reaches the slice arm through a generic call in both spellings as well. The
+// plain-store half covers all three arms `lowerIndexStore` can dispatch to, every
+// one of them through a generic call. Nine programs in all reach an arm through a
+// type parameter, which is what pins the guards to the INSTANTIATED receiver type:
+// a guard that read the declared type instead would refuse those nine. A fixture
+// that never reached disk, or a compiler that failed for an unrelated reason, would
+// also read as a rejection, so every capture is asserted non-empty, every rejection asserts
+// the refusal TEXT (which only lowering emits, and only after parse and check
+// succeeded) and asserts that no output file exists. The tables' lengths are
+// asserted before their loops and their iteration counts after, and the final line
+// prints how many checks actually ran.
+//
+// This file also carries one unrelated case, `checkStubbedDiagShape` below: the
+// shape of the diagnostic `bit build` prints when the LOWERER, not the checker,
+// refuses a program (#2189). It lives here, not in `_tests_/cases/`, for the same
+// reason as everything else above — see that function's own header before
+// touching it, in particular the RETARGET instruction.
+import { env, envOr, exit } from "std/os"
+import { exists, mkdir, readFile, remove, writeFile } from "std/fs"
+import { contains, parseInt } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// One `bit` invocation, as seen from outside it.
+class Run { code: int, out: string, err: string }
+
+// Assertion accounting. A class because Bit has no mutable module-level state,
+// and the count is the anti-vacuity marker: an empty run must not read as pass.
+class Tally { checks: int, failures: int }
+
+// One program whose index receiver is not a lowerable kind. `callee` is the name
+// of the function that must be reported as unlowerable, used only when `wantErr`
+// is empty (the lowering-only fallback `checkRejects` still supports, for
+// whichever case, present or future, the checker does not yet catch). `wantErr`,
+// when non-empty, is the checker fragment `bit check` must now print —
+// `error[E0054]` naming the substituted type for #2391's ten type-param cases
+// (each substitutes a different one, which already pins the case), `error[E0087]`
+// for #2740's three string cases.
+class Reject { name: string, src: string, callee: string, wantErr: string }
+
+// One program that must still be ACCEPTED, and the stdout it must produce. Each
+// prints exactly "ok\n" when the value read back through `a[i]` is the expected
+// one and "bad\n" when it is not, so a wrong VALUE is distinguishable from a
+// crash, from silence, and from a build failure.
+class Accept { name: string, src: string }
+
+// How long any one child gets. A `bit build` of a six-line program is well under
+// a second; this only ever fires on a hang, and a hang is a failure.
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "300")) catch _ { 300 }
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns are
+// `osRunBounded`'s mechanism channel, never a program exit status, so each one is
+// a named panic rather than a value any assertion could consume.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("lowerrefuse: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("lowerrefuse: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("lowerrefuse: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("lowerrefuse: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+// The `bit` under test. `BIT_SELF_EXE` wins; otherwise the dev-tree build artifact
+// relative to the working directory this program was started in. Never returns ""
+// — a compiler this cannot find is a hard stop, not a skipped test.
+fn bitBinary(scratch: string, ms: int): string! {
+  let explicit = env("BIT_SELF_EXE")
+  if (len(explicit) > 0) {
+    if (!exists(explicit)) {
+      fail newError("lowerrefuse: BIT_SELF_EXE=${explicit} does not exist")
+    }
+    return explicit
+  }
+  let cwdFile = "${scratch}/cwd.txt"
+  let code = shell("${scratch}/pwd.sh", "#!/bin/sh\npwd > '${cwdFile}'\n", ms)?
+  if (code != 0) {
+    fail newError("lowerrefuse: could not read the working directory (exit ${code})")
+  }
+  let cwd = trimWs(readFile(cwdFile)?)
+  let candidate = "${cwd}/bit-out/bin/bit"
+  if (!exists(candidate)) {
+    fail newError("lowerrefuse: no compiler at ${candidate}; run this from the repository root or set BIT_SELF_EXE")
+  }
+  return candidate
+}
+
+// Runs `bit <args>` with `dir` as the working directory.
+//
+// The wrapper always exits 0 and writes the real status to `code.txt`, so a
+// missing `code.txt` is unmistakably "the compiler never ran" rather than a status
+// some assertion could mistake for a verdict. Stale captures are deleted first for
+// the same reason: no case may read a previous case's output.
+fn runBit(bit: string, args: string, dir: string, capDir: string, ms: int): Run! {
+  let outPath = "${capDir}/out.txt"
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  clear(outPath)
+  clear(errPath)
+  clear(codePath)
+  let script = "#!/bin/sh\n" +
+    "cd '${dir}' || exit 0\n" +
+    "'${bit}' ${args} > '${outPath}' 2> '${errPath}'\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/run.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("lowerrefuse: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("lowerrefuse: no exit code was recorded for `bit ${args}` — the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, out: readFile(outPath)?, err: readFile(errPath)? }
+}
+
+fn clear(path: string) {
+  if (exists(path)) {
+    remove(path) catch _ { return }
+  }
+}
+
+// Records one assertion. Failures are named and the run continues, so a single
+// invocation reports every broken expectation instead of only the first.
+fn check(t: Tally, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    eprint("FAIL: ${label}\n")
+  }
+}
+
+// The `ok`/`bad` tail every acceptance program shares. Printing a distinct token
+// for the wrong value is what separates "indexed correctly" from "indexed at all".
+fn verdict(cond: string): string {
+  return "  if (" + cond + ") {\n" +
+    "    print(\"ok\\n\")\n" +
+    "  } else {\n" +
+    "    print(\"bad\\n\")\n" +
+    "  }\n}\n"
+}
+
+// A generic function whose parameter is the bare type param `T`, indexed in its
+// body. `T` is what makes the receiver undecidable at check time, and `ret` is the
+// element type the caller's substitution implies.
+fn bareParam(ret: string): string {
+  return "fn first<T>(xs: T): ${ret} {\n  return xs[0]\n}\n\n"
+}
+
+// The same, WRITING the element instead of reading it. `stmt` is the statement
+// under test, and WHICH LOWERING SITE it reaches depends on its spelling:
+// `xs[0] += 1` reaches `resolveLvalue` from lowerAssign's compound-assign arm and
+// `xs[0]++` reaches it from lowerIncDec, both reading AND writing through one
+// resolved lvalue; a plain `xs[0] = 9` reaches neither and goes to
+// `lowerIndexStore` instead. All three receivers are the same bare `T`, so the
+// same substitution exercises a different guard per spelling.
+fn bareWrite(name: string, stmt: string): string {
+  return "fn ${name}<T>(xs: T) {\n  ${stmt}\n}\n\n"
+}
+
+// `main` for a rejection case whose only job is to instantiate the generic. The
+// print is unreachable in a correct compiler and was reached by 0.1.8.
+fn callWith(callee: string, decl: string): string {
+  return "fn main() {\n  let v = ${decl}\n  ${callee}(v)\n  print(\"done\\n\")\n}\n"
+}
+
+// The rejection set: substitutions of `T` that are not indexable at all — now
+// refused by the CHECKER (#2391) — plus the three string cases, refused by the
+// CHECKER too (#2740): a string is immutable and has no write arm at either write
+// site, so `s[0] += 1`, `s[0]++` and `s[0] = 'z'` must all be refused however the
+// receiver was spelled, and none may leave a binary behind. `storeRejects()` is
+// spliced in at the end rather than inlined only to keep this function inside the
+// repo's max-fn-lines limit.
+fn rejects(): []Reject {
+  let all = [
+    // Built clean and died on SIGSEGV under 0.1.8: `xs[0]` dereferenced the
+    // integer 5 as a base address. Now caught at check time: `T = i64`.
+    Reject{ name: "typeparam-int",
+      src: bareParam("int") + "fn main() {\n  print(\"x\")\n  if (first(5) == 0) {\n    print(\"y\")\n  }\n}\n",
+      callee: "first", wantErr: "error[E0054]: 'i64' cannot be indexed" },
+    // Same, with a one-word non-pointer of a different width. `T = bool`.
+    Reject{ name: "typeparam-bool",
+      src: bareParam("bool") + "fn main() {\n  if (first(true)) {\n    print(\"y\")\n  }\n}\n",
+      callee: "first", wantErr: "error[E0054]: 'bool' cannot be indexed" },
+    // The dangerous one: a class IS a heap block, so the raw read succeeds and
+    // hands back field `a`. Under 0.1.8 this built, printed `y` and exited 0 — a
+    // meaningless program agreeing with itself, with no signal anywhere. Now
+    // caught at check time: `T = P`.
+    Reject{ name: "typeparam-class",
+      src: "class P { a: int, b: int }\n\n" + bareParam("int") +
+        "fn main() {\n  if (first(P{a: 7, b: 9}) == 7) {\n    print(\"y\")\n  }\n}\n",
+      callee: "first", wantErr: "error[E0054]: 'P' cannot be indexed" },
+    // #2390, the read-modify-write path. Same three substitutions of `T`, reaching
+    // `resolveLvalue` instead of `lowerIndex` — but the checker's `vInstIndex`
+    // walks every `Tag.Index` node in the instantiated body regardless of whether
+    // it is read or written, so these are caught the same way. Under 0.1.8 the int
+    // and the bool built clean and died on SIGSEGV: `xs[0] += 1` loaded and then
+    // STORED through the value as a base address.
+    Reject{ name: "lv-compound-int",
+      src: bareWrite("bump", "xs[0] += 1") + callWith("bump", "5"),
+      callee: "bump", wantErr: "error[E0054]: 'i64' cannot be indexed" },
+    Reject{ name: "lv-compound-bool",
+      src: bareWrite("bump", "xs[0] += 1") + callWith("bump", "true"),
+      callee: "bump", wantErr: "error[E0054]: 'bool' cannot be indexed" },
+    // The write side's dangerous one, and worse than its read twin: this does not
+    // merely report a wrong value, it MUTATES the class. Under 0.1.8 it built,
+    // incremented field `a` from 7 to 8, printed `y` and exited 0.
+    Reject{ name: "lv-compound-class",
+      src: "class P { a: int, b: int }\n\n" + bareWrite("bump", "xs[0] += 1") +
+        "fn main() {\n  let p = P{a: 7, b: 9}\n  bump(p)\n  if (p.a == 8) {\n    print(\"y\")\n  }\n}\n",
+      callee: "bump", wantErr: "error[E0054]: 'P' cannot be indexed" },
+    // No type parameter anywhere: a string receiver is refused on its own terms.
+    // `lowerIndex` has a `string_byte` arm, so `s[0]` READS fine and is in
+    // `accepts()` below; there is deliberately no write arm, because a string is
+    // immutable. Under 0.1.8 this built and turned "abc" into "bc". `T` never
+    // appears here, so `vInstIndex` has nothing to re-judge, but #2740's
+    // `vAssignTargetString` (compiler/validateassign.bit) now catches it directly:
+    // it asks the write-only question `vIndex` never does, and reports E0087.
+    Reject{ name: "lv-compound-string",
+      src: "fn main() {\n  let s = \"abc\"\n  s[0] += 1\n  print(s)\n}\n",
+      callee: "main", wantErr: "error[E0087]: cannot assign to a string index" },
+    // `++` reaches the same lvalue through lowerIncDec rather than lowerAssign.
+    // Both of these built clean under 0.1.8: the int died on SIGSEGV, the string
+    // was corrupted exactly as above.
+    Reject{ name: "lv-incdec-int",
+      src: bareWrite("step", "xs[0]++") + callWith("step", "5"),
+      callee: "step", wantErr: "error[E0054]: 'i64' cannot be indexed" },
+    Reject{ name: "lv-incdec-string",
+      src: "fn main() {\n  let s = \"abc\"\n  s[0]++\n  print(s)\n}\n",
+      callee: "main", wantErr: "error[E0087]: cannot assign to a string index" },
+  ]
+  for c of storeRejects() {
+    all = append(all, c)
+  }
+  return all
+}
+
+// #2403, the PLAIN-ASSIGNMENT path: `a[i] = v` reaches neither `lowerIndex` nor
+// `resolveLvalue`. lowerAssign routes it straight to `lowerIndexStore` in
+// compiler/lowerflow.bit, which held the third copy of the unguarded shape, so
+// every case here built clean and misbehaved with both of the other two guards
+// already in place. Measured on a tree carrying #2385 and #2390, and identically
+// under the released 0.1.8.
+fn storeRejects(): []Reject {
+  return [
+    // Built clean, then SIGSEGV: `xs[0] = 9` stored 9 through the integer 5 as a
+    // base address. Now caught at check time: `T = i64`.
+    Reject{ name: "st-plain-int",
+      src: bareWrite("put", "xs[0] = 9") + callWith("put", "5"),
+      callee: "put", wantErr: "error[E0054]: 'i64' cannot be indexed" },
+    // Same, with a one-word non-pointer of a different width. `T = bool`.
+    Reject{ name: "st-plain-bool",
+      src: bareWrite("put", "xs[0] = 9") + callWith("put", "true"),
+      callee: "put", wantErr: "error[E0054]: 'bool' cannot be indexed" },
+    // The store side's dangerous one, and the worst of the three sites: no signal,
+    // exit 0, and the caller's class is DIFFERENT afterwards. Under 0.1.8 and on
+    // this tree before the guard it printed `done 42` — `xs[0] = 42` overwrote
+    // field `a`, 7 to 42, and nothing at any stage said so.
+    Reject{ name: "st-plain-class",
+      src: "class P { a: int, b: int }\n\n" + bareWrite("put", "xs[0] = 42") +
+        "fn main() {\n  let p = P{a: 7, b: 9}\n  put(p)\n  if (p.a == 42) {\n    print(\"y\")\n  }\n}\n",
+      callee: "put", wantErr: "error[E0054]: 'P' cannot be indexed" },
+    // No type parameter anywhere: a plain store into a string is refused on its own
+    // terms, for the same reason `s[0] += 1` is — `lowerIndexStore` has no string
+    // arm because a string is immutable. `s[0]` still READS fine and is in
+    // `accepts()`. Before the guard this built and exited 0 with the string
+    // destroyed: 0.1.8 printed nothing for it and this tree printed garbage bytes,
+    // which is the same corruption landing differently, not a difference in kind.
+    // #2740's `vAssignTargetString` now catches this one too, with E0087.
+    Reject{ name: "st-plain-string",
+      src: "fn main() {\n  let s = \"abc\"\n  s[0] = 'z'\n  print(s)\n}\n",
+      callee: "main", wantErr: "error[E0087]: cannot assign to a string index" },
+  ]
+}
+
+// The whole acceptance set: the read cases, then the read-modify-write cases, then
+// the plain-store cases — one table per lowering site under test. Split into three
+// tables only to keep each function inside the repo's max-fn-lines limit.
+fn accepts(): []Accept {
+  let all = readAccepts()
+  for c of writeAccepts() {
+    all = append(all, c)
+  }
+  for c of storeAccepts() {
+    all = append(all, c)
+  }
+  return all
+}
+
+// The read half, and the reason this gate cannot pass by refusing everything: all
+// four arms of `lowerIndex`, each reached directly and — for the three that a type
+// parameter can resolve to — through a generic call as well.
+fn readAccepts(): []Accept {
+  return [
+    // slice_get, the arm #2275 was routed away from.
+    Accept{ name: "slice",
+      src: "fn main() {\n  let xs = [4, 5, 6]\n" + verdict("xs[0] == 4 && xs[2] == 6") },
+    // index_get itself: the fixed-array arm the guard now tests for explicitly.
+    // Reading an untouched element asserts it is still the zero value, not
+    // whatever the guard's `return 0` path might have left behind.
+    Accept{ name: "array",
+      src: "fn main() {\n  let a: [4]int\n  a[3] = 11\n" + verdict("a[3] == 11 && a[0] == 0") },
+    Accept{ name: "map",
+      src: "fn main() {\n  let m = map<int, string>{}\n  m[2] = \"yo\"\n" + verdict("m[2] == \"yo\"") },
+    // string_byte.
+    Accept{ name: "string",
+      src: "fn main() {\n  let s = \"abc\"\n" + verdict("s[1] == 'b'") },
+    // The same three arms reached with a type param in the way, at two element
+    // types each where the width differs. A guard that ran before substitution
+    // would refuse all of these.
+    Accept{ name: "generic-slice",
+      src: "fn at<T>(xs: []T, i: int): T {\n  return xs[i]\n}\n\nfn main() {\n" +
+        verdict("at([9, 10], 1) == 10 && at([\"y\", \"z\"], 0) == \"y\"") },
+    Accept{ name: "generic-array",
+      src: "fn get<T>(a: [4]T, i: int): T {\n  return a[i]\n}\n\nfn main() {\n" +
+        "  let a: [4]int\n  a[2] = 7\n" + verdict("get(a, 2) == 7") },
+    Accept{ name: "generic-map",
+      src: "fn look<K, V>(m: map<K, V>, k: K): V {\n  return m[k]\n}\n\nfn main() {\n" +
+        "  let m = map<int, int>{}\n  m[3] = 8\n" + verdict("look(m, 3) == 8") },
+    // The exact shape of the rejection cases — a bare `T` parameter, indexed —
+    // substituted with a type that IS indexable. This is the line between the
+    // guard and an over-refusal: `first` must still compile here.
+    Accept{ name: "generic-bare-param-string",
+      src: bareParam("u8") + "fn main() {\n" + verdict("first(\"abc\") == 'a'") },
+    // #2275's own shape: an arrow parameter with no annotation, indexed.
+    Accept{ name: "arrow-bare-param",
+      src: "fn main() {\n  let f: ([]int) => int = xs => xs[1]\n" + verdict("f([7, 8]) == 8") },
+  ]
+}
+
+// The write half of the acceptance set (#2390).
+//
+// This half is what stops the `resolveLvalue` guard from being an over-refusal.
+// Before #2390 every acceptance case above was an rvalue READ, so nothing here
+// exercised `resolveLvalue` at all and a guard that rejected every compound assign
+// in the language would still have passed. Each of the three lvalue arms it can
+// reach — slice, fixed array, map — is driven by both spellings that resolve an
+// lvalue, `op=` and `++`/`--`, and each program asserts the element's value AFTER
+// the write, so a store that lands somewhere else reads as "bad" rather than as a
+// pass.
+fn writeAccepts(): []Accept {
+  return [
+    Accept{ name: "lv-slice-compound",
+      src: "fn main() {\n  let xs = [4, 5, 6]\n  xs[1] += 10\n" +
+        verdict("xs[1] == 15 && xs[0] == 4") },
+    // `index_set` itself: the fixed-array arm the guard now tests for explicitly.
+    Accept{ name: "lv-array-compound",
+      src: "fn main() {\n  let a: [4]int\n  a[2] = 5\n  a[2] += 3\n" +
+        verdict("a[2] == 8 && a[0] == 0") },
+    Accept{ name: "lv-map-compound",
+      src: "fn main() {\n  let m = map<int, int>{}\n  m[3] = 8\n  m[3] += 2\n" +
+        verdict("m[3] == 10") },
+    // `++`/`--` reach the same three arms through lowerIncDec.
+    Accept{ name: "lv-slice-incdec",
+      src: "fn main() {\n  let xs = [4, 5, 6]\n  xs[0]++\n  xs[2]--\n" +
+        verdict("xs[0] == 5 && xs[2] == 5 && xs[1] == 5") },
+    Accept{ name: "lv-array-incdec",
+      src: "fn main() {\n  let a: [3]int\n  a[1] = 7\n  a[1]++\n" +
+        verdict("a[1] == 8 && a[0] == 0") },
+    Accept{ name: "lv-map-incdec",
+      src: "fn main() {\n  let m = map<string, int>{}\n  m[\"k\"] = 1\n  m[\"k\"]++\n" +
+        verdict("m[\"k\"] == 2") },
+    // The line between the guard and an over-refusal on the write side: the
+    // receiver is spelled with a type parameter, exactly like the `lv-*` rejection
+    // cases, but substitution makes it a slice. A guard that ran before
+    // substitution, or that read the declared type rather than the instantiated
+    // one, would refuse both of these.
+    Accept{ name: "lv-generic-slice-compound",
+      src: "fn bump<T>(xs: []T, i: int, d: T) {\n  xs[i] += d\n}\n\nfn main() {\n" +
+        "  let xs = [1, 2, 3]\n  bump(xs, 1, 10)\n" + verdict("xs[1] == 12 && xs[0] == 1") },
+    Accept{ name: "lv-generic-slice-incdec",
+      src: "fn step<T>(xs: []T, i: int) {\n  xs[i]++\n}\n\nfn main() {\n" +
+        "  let xs = [1, 2, 3]\n  step(xs, 2)\n" + verdict("xs[2] == 4 && xs[1] == 2") },
+  ]
+}
+
+// The plain-store half of the acceptance set (#2403), and what stops the
+// `lowerIndexStore` guard from being an over-refusal.
+//
+// The read and read-modify-write halves above do not cover this site: the `lv-*`
+// cases all reach `resolveLvalue`, and while a handful of cases here and there
+// happen to contain a plain `a[i] = v` as SETUP (the `array` and `map` accepts, and
+// the `a[2] = 5` line in `lv-array-compound`), nothing covered a plain store into a
+// SLICE at all, and nothing covered any plain store whose receiver is spelled with
+// a type parameter. Those are exactly the shapes a guard reading the declared type
+// rather than the instantiated one would refuse, so each arm `lowerIndexStore` can
+// dispatch to — slice, fixed array, map — is driven here through a generic call,
+// and each program asserts the element's value AFTER the store.
+fn storeAccepts(): []Accept {
+  return [
+    // `slice_set` reached directly, which no case above did.
+    Accept{ name: "st-slice-plain",
+      src: "fn main() {\n  let xs = [4, 5, 6]\n  xs[1] = 9\n" +
+        verdict("xs[1] == 9 && xs[0] == 4 && xs[2] == 6") },
+    // The same store with the receiver spelled `[]T` — the guard must read the
+    // INSTANTIATED receiver kind. The write is asserted from the caller, so a store
+    // that landed anywhere else reads as "bad".
+    Accept{ name: "st-generic-slice-plain",
+      src: "fn put<T>(xs: []T, i: int, v: T) {\n  xs[i] = v\n}\n\nfn main() {\n" +
+        "  let xs = [1, 2, 3]\n  put(xs, 1, 44)\n" + verdict("xs[1] == 44 && xs[0] == 1") },
+    // `index_set` itself — the arm the guard now tests for explicitly — reached
+    // through a type parameter. A fixed array is a value, so the store is asserted
+    // from inside the callee that made it.
+    Accept{ name: "st-generic-array-plain",
+      src: "fn put<T>(a: [4]T, i: int, v: T): T {\n  a[i] = v\n  return a[i]\n}\n\nfn main() {\n" +
+        "  let a: [4]int\n" + verdict("put(a, 2, 7) == 7 && a[2] == 0") },
+    // `map_set` through a generic receiver.
+    Accept{ name: "st-generic-map-plain",
+      src: "fn put<K, V>(m: map<K, V>, k: K, v: V) {\n  m[k] = v\n}\n\nfn main() {\n" +
+        "  let m = map<string, int>{}\n  put(m, \"k\", 5)\n" + verdict("m[\"k\"] == 5") },
+  ]
+}
+
+// Every rejection case: a non-zero exit, the refusal named in stderr — the
+// checker's `error[E0054]` for a case `wantErr` names, else the lowering refusal
+// and the offending function — and NO output binary on disk.
+fn checkRejects(t: Tally, bit: string, dir: string, capDir: string, ms: int): ()! {
+  let cases = rejects()
+  check(t, len(cases) == 13, "reject table has ${len(cases)} entries, want 13")
+  let ran = 0
+  for c of cases {
+    let file = "r_${c.name}.bit"
+    let out = "${dir}/r_${c.name}.out"
+    clear(out)
+    writeFile("${dir}/${file}", c.src)?
+    let r = runBit(bit, "build '${file}' -o '${out}'", dir, capDir, ms)?
+    let msg = r.err
+    // Non-empty FIRST: every text check below is satisfied by the empty string.
+    check(t, len(msg) > 0, "${c.name}: both streams are empty — the compiler said nothing")
+    check(t, r.code != 0, "${c.name}: exit ${r.code}, want non-zero")
+    if (len(c.wantErr) > 0) {
+      // #2391 caught this one at check time, before lowering ever ran; the
+      // fragment already names the substituted type, which is pinned enough
+      // (each case substitutes a different one).
+      check(t, contains(msg, c.wantErr),
+        "${c.name}: output does not carry the checker refusal '${c.wantErr}': ${msg}")
+    } else {
+      check(t, contains(msg, "cannot lower"),
+        "${c.name}: output does not carry the lowering refusal: ${msg}")
+      check(t, contains(msg, "refusing to emit a binary"),
+        "${c.name}: output does not say the binary was withheld: ${msg}")
+      check(t, contains(msg, c.callee),
+        "${c.name}: refusal does not name `${c.callee}`: ${msg}")
+    }
+    // The load-bearing one: a refusal that still writes an executable would be no
+    // better than the miscompile it replaced.
+    check(t, !exists(out), "${c.name}: a binary was emitted at ${out} despite the refusal")
+    ran = ran + 1
+  }
+  check(t, ran == 13, "only ${ran} of 13 rejection cases ran")
+}
+
+// Every acceptance case: builds AND runs, and stdout must be exactly "ok\n".
+// "bad\n" means the program compiled and indexed the wrong thing, which is the
+// failure this half exists to catch.
+fn checkAccepts(t: Tally, bit: string, dir: string, capDir: string, ms: int): ()! {
+  let cases = accepts()
+  check(t, len(cases) == 21, "accept table has ${len(cases)} entries, want 21")
+  let ran = 0
+  for c of cases {
+    let file = "a_${c.name}.bit"
+    writeFile("${dir}/${file}", c.src)?
+    let r = runBit(bit, "run '${file}'", dir, capDir, ms)?
+    check(t, r.code == 0, "${c.name}: exit ${r.code}, want 0 — stderr: ${r.err}")
+    check(t, r.out == "ok\n", "${c.name}: printed '${r.out}', want 'ok'")
+    ran = ran + 1
+  }
+  check(t, ran == 21, "only ${ran} of 21 acceptance cases ran")
+}
+
+// The shape of the #2189 diagnostic a stubbed-function lowering refusal now
+// prints — a span, a code and a caret — as opposed to the location-free
+// "cannot lower N function(s)" line it replaced. Unrelated to the index
+// receiver-kind guards above; it lives in this file only because the file
+// already drives `bit check`/`bit build` as subprocesses and asserts on
+// stderr shape, which is exactly what this case needs too.
+//
+// The construct is a tuple binder on a `for … of` over a channel —
+// `for (a, b) of ch` where `ch: chan<int>` (compiler/lowerctrl.bit:212's
+// `fcFail` site). The checker validates a for-of binder shape against a map
+// (#2108, E0088) and a string (#2013, E0090) but has no equivalent rule for
+// a channel, so this still checks clean and is refused only by the lowerer.
+//
+// This case previously used `len(ch)` on a `chan<int>` (#2021's construct).
+// #2021 correctly closed that as a CHECKER gap — `len`/`cap` on a channel now
+// reports E0099 at check time (compiler/validatecall.bit's vLenCapCall) and
+// never reaches the lowerer at all, so it stopped being a valid specimen for
+// THIS case (#3096). #2021 is right and must stay untouched; only the
+// specimen here changed.
+//
+// RETARGET, DO NOT DELETE, IF THIS EVER FAILS BECAUSE OF THE CHANNEL FOR-OF
+// TUPLE BINDER ITSELF. The day that shape is implemented, or explicitly
+// rejected by the CHECKER instead of the lowerer, `bit check` on this exact
+// program will stop exiting 0, or `bit build` will stop reaching
+// `renderStubbed`, and this case fails for a reason that has nothing to do
+// with #2189's span/code/caret machinery. That is a sign to point this case
+// at a different, still-live member of epic #2185 (the "cannot lower" family
+// in compiler/build.bit) — not that the diagnostic regressed, and not a
+// reason to delete the coverage.
+//
+// The assertions below are scoped to the SHAPE #2189 added, not the prose: the
+// `error[E0092]` code, the ` --> file:line:col` location line, and a caret
+// aligned under the offending construct. The reason text after the code is
+// deliberately excluded, because it is the part #2189 explicitly wants people
+// to keep improving without reddening this gate.
+fn checkStubbedDiagShape(t: Tally, bit: string, dir: string, capDir: string, ms: int): ()! {
+  let file = "e0092.bit"
+  let src = "fn main() {\n  let ch = chan<int>(1)\n  for (a, b) of ch {\n    println(\"\${a}\")\n  }\n}\n"
+  writeFile("${dir}/${file}", src)?
+
+  // The checker has no opinion on a channel for-of's binder shape — only the
+  // lowerer refuses it — so `bit check` must accept the program on its own.
+  let chk = runBit(bit, "check '${file}'", dir, capDir, ms)?
+  check(t, chk.code == 0,
+    "e0092-shape: bit check exited ${chk.code}, want 0 — stderr: ${chk.err}")
+
+  let out = "${dir}/e0092.out"
+  clear(out)
+  let bld = runBit(bit, "build '${file}' -o '${out}'", dir, capDir, ms)?
+  check(t, bld.code != 0, "e0092-shape: bit build exited 0, want non-zero")
+  check(t, !exists(out), "e0092-shape: a binary was emitted at ${out} despite the refusal")
+
+  let msg = bld.err
+  check(t, contains(msg, "error[E0092]: "),
+    "e0092-shape: missing the 'error[E0092]: ' code — stderr: ${msg}")
+  check(t, contains(msg, " --> ./${file}:3:7\n"),
+    "e0092-shape: missing the ' --> ./${file}:3:7' location line — stderr: ${msg}")
+  let excerptAndCaret = "3 |   for (a, b) of ch {\n  |       ^^^^^^"
+  check(t, contains(msg, excerptAndCaret),
+    "e0092-shape: no caret aligned under '(a, b)' — stderr: ${msg}")
+  check(t, !contains(msg, "cannot lower 1 function(s)"),
+    "e0092-shape: the old location-free message is back — stderr: ${msg}")
+}
+
+// Both halves, against a scratch directory built fresh. Split out of `main` so
+// each stays inside the repo's own max-fn-lines limit.
+fn runAll(t: Tally, scratch: string, ms: int) {
+  let dir = "${scratch}/src"
+  let capDir = "${scratch}/cap"
+  mkdir(dir) catch e { panic("lowerrefuse: cannot create ${dir}: ${e.message()}") }
+  mkdir(capDir) catch e { panic("lowerrefuse: cannot create ${capDir}: ${e.message()}") }
+  let bit = bitBinary(scratch, ms) catch e { panic("lowerrefuse: ${e.message()}") }
+  checkRejects(t, bit, dir, capDir, ms) catch e { panic("lowerrefuse: ${e.message()}") }
+  checkAccepts(t, bit, dir, capDir, ms) catch e { panic("lowerrefuse: ${e.message()}") }
+  checkStubbedDiagShape(t, bit, dir, capDir, ms) catch e { panic("lowerrefuse: ${e.message()}") }
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-lowerrefuse-${uuidFormat(uuidV4())}"
+  let t = Tally{ checks: 0, failures: 0 }
+
+  mkdir(scratch) catch e {
+    panic("lowerrefuse: cannot create ${scratch}: ${e.message()}")
+  }
+  runAll(t, scratch, ms)
+
+  // The run marker: a gate that stopped checking is visible here rather than
+  // green. Since #2740, all 13 rejections are checker-caught (the 10 from #2391
+  // plus the 3 string cases), so every one takes the same 4 assertions:
+  // 13 x 4 + 21 acceptances x 2 + 4 table/loop assertions + 7 stubbed-diagnostic
+  // shape assertions (#2189/#2694, `checkStubbedDiagShape`) = 105.
+  if (t.checks < 105) {
+    eprint("FAIL: only ${t.checks} checks ran, want at least 105\n")
+    t.failures = t.failures + 1
+  }
+  if (t.failures > 0) {
+    // `exit()` does not run pending defers (#3694, same shape as #3677) —
+    // call teardown explicitly on both the PASS and FAIL paths.
+    teardown(scratch, ms)
+    println("lowerrefuse: FAIL — ${t.failures} of ${t.checks} checks failed")
+    exit(1)
+  }
+  teardown(scratch, ms)
+  println("lowerrefuse: PASS — ${t.checks} checks")
+}
+
+// std/fs has no recursive remove, so the scratch tree goes the way it came.
+fn teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ { return }
+}
+
+// `std/strings`' `trimSpace` stops at spaces and tabs, and every capture here
+// arrives newline-terminated from a shell redirect.
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}

@@ -1,0 +1,417 @@
+// `bit lint` never ran over the project's OWN source (#2354): 1,273+ findings
+// grew unseen in compiler/ and stdlib/. #2440-#2442/#3205/#3208/#3209
+// resolved the E0214 (append-aliasing) findings that existed at the time —
+// the only rule class here with a proven miscompile-shaped consequence,
+// exactly like test-lint-runtime's E0211 story. This gate is what stops that
+// happening again, for BOTH scopes, in two different ways:
+//
+//   1. E0214 is enforced at ZERO, unconditionally, in every run. It is a
+//      correctness class, not a readability one (#2354's own framing), so it
+//      never gets a ceiling to hide behind — one live finding fails this gate
+//      no matter what the totals say.
+//   2. Every OTHER rule code is a count ratchet against
+//      tools/build/lint-ceiling.txt: a file this gate reads and never
+//      writes, with a `compiler <n>` and `stdlib <n>` line always required
+//      plus an optional third `runtime <n>` line (#3620). Going over a
+//      recorded ceiling fails; going under it passes and says so, naming
+//      the number a human could lower it to. "Human lowers it, the gate
+//      only ever refuses a rise" is the whole design — a self-rewriting
+//      ratchet certifies nothing (#2453's own constraint).
+//
+// runtime/'s ratchet (when the ceiling file has a `runtime <n>` line)
+// excludes E0211 findings from its total: that rule code already has its
+// own dedicated hard-zero gate, test-lint-runtime, and folding it in here
+// would spend runtime's ratchet budget on a code this gate does not own —
+// matching how E0214 stays outside the compiler/stdlib ratchet above (#3620).
+// runtime/'s scope also gets its own unconditional E0214 zero-tolerance
+// check (#3666), mirroring compiler/stdlib's exactly: any live
+// warning[E0214] fails regardless of ratchet room.
+//
+// Distinct from test-lint-runtime (E0211 only, over runtime/) and
+// test-lint-filelines (E0200 only, over seven directories): this is the one
+// that watches the totals grow or shrink, over compiler/ and stdlib/ always,
+// plus runtime/ when configured. BIT_REPO IS REQUIRED, same reason as both
+// siblings: the harness points `bit lint` at `${BIT_REPO}/compiler`,
+// `${BIT_REPO}/stdlib` and (when configured) `${BIT_REPO}/runtime`, and
+// must not silently default to ".".
+//
+// Run it from the repository root:
+//     ./bit-out/bin/bit run _tests_/bit/lintself.bit
+import { env, envOr, exit } from "std/os"
+import { exists, mkdir, readFile, writeFile } from "std/fs"
+import { compare, hasPrefix, indexOf, parseInt, split, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "300")) catch _ { 300 }
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s mechanism channel, never a program exit status, so
+// each one is a named panic rather than a value any assertion could consume.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("lintself: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("lintself: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("lintself: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("lintself: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+fn requiredEnv(name: string): string! {
+  let v = env(name)
+  if (len(v) == 0) {
+    fail newError("lintself: ${name} is required and was not set")
+  }
+  return v
+}
+
+// One `bit lint <dir>` invocation, as seen from outside it.
+class Run { code: int, err: string }
+
+fn runLint(bit: string, dir: string, capDir: string, ms: int): Run! {
+  let outPath = "${capDir}/out.txt"
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  let script = "#!/bin/sh\n" +
+    "'${bit}' lint '${dir}' > '${outPath}' 2> '${errPath}'\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/lint.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("lintself: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("lintself: no exit code was recorded — the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, err: readFile(errPath)? }
+}
+
+// The header line of one finding, e.g. `warning[E0211]: 'sent' is declared...`.
+fn isFindingHeader(line: string): bool {
+  return hasPrefix(line, "warning[E") || hasPrefix(line, "error[E")
+}
+
+// `r` is a usable observation of a real run, not silence mistaken for a clean
+// sheet. Anti-vacuity: `bit lint` always prints a summary to stderr, clean or
+// not, so an empty capture means the run produced nothing trustworthy. Exit 2
+// is SPEC's own "could not be trusted" verdict (usage error, unreadable path,
+// malformed directive) — reading it as a clean run is exactly the hole
+// docs/development.md's ways-to-report-green warns about.
+fn assertTrustworthy(r: Run, dir: string) {
+  if (len(r.err) == 0) {
+    panic("lintself: stderr is empty — `bit lint ${dir}` produced no summary")
+  }
+  if (r.code == 2) {
+    panic("lintself: `bit lint ${dir}` exited 2 (untrusted run):\n${r.err}")
+  }
+  if (r.code != 0 && r.code != 1) {
+    panic("lintself: `bit lint ${dir}` exited ${r.code}, want 0 or 1")
+  }
+}
+
+// Pulls the 5-character rule code (e.g. "E0214") out of a finding header
+// line like `warning[E0214]: ...` or `error[E0214]: ...`. Locating "[E"
+// rather than the line's own prefix means this does not care whether the
+// header said `warning` or `error`.
+fn extractCode(line: string): string! {
+  let idx = int(indexOf(line, "[E"))
+  if (idx < 0) {
+    fail newError("lintself: no rule code in line: ${line}")
+  }
+  let start = idx + 1
+  if (len(line) < start + 6) {
+    fail newError("lintself: truncated rule code in line: ${line}")
+  }
+  if (line[start + 5] != ']') {
+    fail newError("lintself: malformed rule code in line: ${line}")
+  }
+  return line[start:start + 5]
+}
+
+// The finding counts for one scope's `bit lint` stderr capture: the total
+// finding-header count, how many of those are E0214, and a per-rule-code
+// breakdown for the failure report.
+class Breakdown { total: int, e0214: int, byCode: map<string, int> }
+
+fn analyzeFindings(err: string): Breakdown {
+  let byCode = map<string, int>{}
+  let total = 0
+  let e0214 = 0
+  for line of split(err, "\n") {
+    if (!isFindingHeader(line)) {
+      continue
+    }
+    let code = extractCode(line) catch _ { continue }
+    total = total + 1
+    let (n, ok) = byCode[code]
+    if (ok) {
+      byCode[code] = n + 1
+    } else {
+      byCode[code] = 1
+    }
+    if (code == "E0214") {
+      e0214 = e0214 + 1
+    }
+  }
+  return Breakdown{ total: total, e0214: e0214, byCode: byCode }
+}
+
+// Anti-vacuity, per the epic's own standing constraint: `bit lint`'s printed
+// `lint: N findings, M overrides active` summary line is the ground truth for
+// how many findings it reported. This asserts our own line-scan count agrees
+// with it, so a change to the finding-header format cannot silently
+// undercount here without the harness itself going red.
+fn assertSummaryAgrees(err: string, scanned: int, scope: string) {
+  for line of split(err, "\n") {
+    if (!hasPrefix(line, "lint: ")) {
+      continue
+    }
+    let rest = line[6:]
+    let sp = int(indexOf(rest, " "))
+    if (sp < 0) {
+      panic("lintself: malformed summary line for ${scope}: ${line}")
+    }
+    let reported = parseInt(rest[:sp]) catch e { panic("lintself: ${e.message()}") }
+    if (reported != scanned) {
+      panic("lintself: ${scope} scanned ${scanned} findings but bit lint's own summary says ${reported} -- ${line}")
+    }
+    return
+  }
+  panic("lintself: no 'lint: N findings' summary line found for ${scope}")
+}
+
+// Runs `bit lint` over `dir` and returns its verified finding breakdown.
+fn lintScope(bit: string, dir: string, capDir: string, ms: int, scope: string): Breakdown {
+  let r = runLint(bit, dir, capDir, ms) catch e { panic("lintself: ${e.message()}") }
+  assertTrustworthy(r, dir)
+  let b = analyzeFindings(r.err)
+  assertSummaryAgrees(r.err, b.total, scope)
+  return b
+}
+
+// The ceilings recorded in tools/build/lint-ceiling.txt. `runtime` is -1
+// when the file has no `runtime <n>` line, meaning: skip runtime/ entirely
+// (a two-line, compiler/stdlib-only file keeps working unchanged).
+class Ceiling { compiler: int, stdlib: int, runtime: int }
+
+// Parses tools/build/lint-ceiling.txt: `compiler <n>` and `stdlib <n>` are
+// always required, plus an optional `runtime <n>`, in any order. A human
+// edits this file to lower a ceiling; this gate reads it and never writes
+// it (#2453's own constraint).
+fn parseCeilingFile(text: string): Ceiling! {
+  let compilerN = -1
+  let stdlibN = -1
+  let runtimeN = -1
+  for rawLine of split(text, "\n") {
+    let line = trimSpace(rawLine)
+    if (len(line) == 0) {
+      continue
+    }
+    let fields = split(line, " ")
+    if (len(fields) != 2) {
+      fail newError("lintself: malformed lint-ceiling.txt line: '${line}'")
+    }
+    let n = parseInt(fields[1])?
+    if (fields[0] == "compiler") {
+      compilerN = n
+    } else if (fields[0] == "stdlib") {
+      stdlibN = n
+    } else if (fields[0] == "runtime") {
+      runtimeN = n
+    } else {
+      fail newError("lintself: unknown scope '${fields[0]}' in lint-ceiling.txt")
+    }
+  }
+  if (compilerN < 0 || stdlibN < 0) {
+    fail newError("lintself: lint-ceiling.txt must have both 'compiler <n>' and 'stdlib <n>' lines")
+  }
+  return Ceiling{ compiler: compilerN, stdlib: stdlibN, runtime: runtimeN }
+}
+
+fn loadCeiling(repo: string): Ceiling! {
+  let path = "${repo}/tools/build/lint-ceiling.txt"
+  if (!exists(path)) {
+    fail newError("lintself: no ceiling file at ${path}")
+  }
+  return parseCeilingFile(readFile(path)?)?
+}
+
+// One rule code's finding count, for the sorted breakdown printed on failure.
+class CodeCount { code: string, count: int }
+
+// `cur` sorts before `other` when it has a strictly higher count, or an equal
+// count and a lexicographically smaller code — deterministic output out of a
+// map, whose own iteration order is not.
+fn lessCodeCount(cur: CodeCount, other: CodeCount): bool {
+  if (cur.count != other.count) {
+    return cur.count > other.count
+  }
+  return compare(cur.code, other.code) < 0
+}
+
+fn breakdownList(byCode: map<string, int>): []CodeCount {
+  let out = []CodeCount(0)
+  for (k, v) of byCode {
+    out = append(out, CodeCount{ code: k, count: v })
+  }
+  let i = 1
+  while (i < len(out)) {
+    let cur = out[i]
+    let j = i - 1
+    while (j >= 0 && lessCodeCount(cur, out[j])) {
+      out[j + 1] = out[j]
+      j = j - 1
+    }
+    out[j + 1] = cur
+    i = i + 1
+  }
+  return out
+}
+
+fn printBreakdown(scope: string, byCode: map<string, int>) {
+  eprint("  ${scope} rule code totals:\n")
+  for c of breakdownList(byCode) {
+    eprint("    ${c.code}: ${c.count}\n")
+  }
+}
+
+// The verdict for one scope. Returns true when this scope FAILS the gate —
+// either the E0214 override or the count ratchet, checked in that order so a
+// live aliasing finding is always the reported reason, never masked by a
+// ceiling that still has room.
+fn reportScope(scope: string, b: Breakdown, ceiling: int): bool {
+  if (b.e0214 > 0) {
+    eprint("lint-self: FAIL -- ${scope} reports ${b.e0214} warning[E0214] (append-aliasing) finding(s); this check is unconditional and does not depend on the ceiling. Triage each one (epic #2354's E0214 policy) before this gate can pass.\n")
+    printBreakdown(scope, b.byCode)
+    return true
+  }
+  if (b.total > ceiling) {
+    eprint("lint-self: FAIL -- ${scope} reports ${b.total} findings, ceiling is ${ceiling} (tools/build/lint-ceiling.txt) -- grew by ${b.total - ceiling}.\n")
+    printBreakdown(scope, b.byCode)
+    return true
+  }
+  if (b.total < ceiling) {
+    println("lint-self: ${scope} ${b.total} findings (ceiling ${ceiling}) -- PASS. Lower the ceiling to ${b.total} in tools/build/lint-ceiling.txt once reviewed.")
+    return false
+  }
+  println("lint-self: ${scope} ${b.total} findings (ceiling ${ceiling}) -- PASS.")
+  return false
+}
+
+// The verdict for runtime/. Like reportScope's compiler/stdlib pair, E0214
+// is checked unconditionally, first, so a live aliasing finding is always
+// the reported reason rather than being masked by ratchet room (#3666).
+// E0211 is excluded from the ratchet total: it already has its own
+// dedicated hard-zero gate, test-lint-runtime, and folding it in here would
+// spend runtime's ratchet budget on a code this gate does not own.
+fn reportRuntimeScope(b: Breakdown, ceiling: int): bool {
+  if (b.e0214 > 0) {
+    eprint("lint-self: FAIL -- runtime reports ${b.e0214} warning[E0214] (append-aliasing) finding(s); this check is unconditional and does not depend on the ceiling. Triage each one (epic #2354's E0214 policy) before this gate can pass.\n")
+    printBreakdown("runtime", b.byCode)
+    return true
+  }
+  let total = b.total
+  let (e0211, ok) = b.byCode["E0211"]
+  if (ok) {
+    total = b.total - e0211
+  }
+  if (total > ceiling) {
+    eprint("lint-self: FAIL -- runtime reports ${total} findings, ceiling is ${ceiling} (tools/build/lint-ceiling.txt) -- grew by ${total - ceiling}.\n")
+    printBreakdown("runtime", b.byCode)
+    return true
+  }
+  if (total < ceiling) {
+    println("lint-self: runtime ${total} findings (ceiling ${ceiling}) -- PASS. Lower the ceiling to ${total} in tools/build/lint-ceiling.txt once reviewed.")
+    return false
+  }
+  println("lint-self: runtime ${total} findings (ceiling ${ceiling}) -- PASS.")
+  return false
+}
+
+// Runs and reports runtime/'s scope, only when the ceiling file has a
+// `runtime <n>` line (ceiling >= 0). Absent, this is a no-op: no extra
+// `bit lint` invocation, no behavior change from before #3620.
+fn runRuntimeScope(bit: string, repo: string, capDir: string, ms: int, ceiling: int): bool {
+  if (ceiling < 0) {
+    return false
+  }
+  mkdir("${capDir}/r") catch e { panic("lintself: cannot create ${capDir}/r: ${e.message()}") }
+  let b = lintScope(bit, "${repo}/runtime", "${capDir}/r", ms, "runtime")
+  return reportRuntimeScope(b, ceiling)
+}
+
+fn newCapDir(): string {
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  return "${tmp}/bit-lintself-${uuidFormat(uuidV4())}"
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let bit = requiredEnv("BIT_SELF_EXE") catch e { panic("lintself: ${e.message()}") }
+  let repo = requiredEnv("BIT_REPO") catch e { panic("lintself: ${e.message()}") }
+  let ceiling = loadCeiling(repo) catch e { panic("lintself: ${e.message()}") }
+
+  let capDir = newCapDir()
+  mkdir(capDir) catch e { panic("lintself: cannot create ${capDir}: ${e.message()}") }
+  mkdir("${capDir}/c") catch e { panic("lintself: cannot create ${capDir}/c: ${e.message()}") }
+  mkdir("${capDir}/s") catch e { panic("lintself: cannot create ${capDir}/s: ${e.message()}") }
+
+  let compilerBreak = lintScope(bit, "${repo}/compiler", "${capDir}/c", ms, "compiler")
+  let stdlibBreak = lintScope(bit, "${repo}/stdlib", "${capDir}/s", ms, "stdlib")
+
+  let compilerFail = reportScope("compiler", compilerBreak, ceiling.compiler)
+  let stdlibFail = reportScope("stdlib", stdlibBreak, ceiling.stdlib)
+  let runtimeFail = runRuntimeScope(bit, repo, capDir, ms, ceiling.runtime)
+
+  if (compilerFail || stdlibFail || runtimeFail) {
+    // `exit()` does not run pending defers (#3694, same shape as #3677) —
+    // call teardown explicitly on both the PASS and FAIL paths.
+    teardown(capDir, ms)
+    eprint("lint-self: ceilings live in tools/build/lint-ceiling.txt; a human lowers them, this gate never does.\n")
+    exit(1)
+  }
+  teardown(capDir, ms)
+  println("lint-self: PASS")
+}
+
+fn teardown(dir: string, ms: int) {
+  shell("${dir}/rm.sh", "#!/bin/sh\nrm -rf '${dir}'\n", ms) catch _ { return }
+}
+
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}

@@ -1,0 +1,322 @@
+// Examples compile-and-run guard — the Bit port of the deleted harness `examples`.
+//
+// Every directory under `examples/` is a module holding one showcase program.
+// This gate asserts that each still COMPILES with the shipping compiler and
+// that the binary it produces EXITS 0. There are no directives and no
+// `.expected` files: an example is a showcase, not an output oracle, so the
+// only contract is "the showcase does not rot as the language grows". Output
+// correctness stays the golden corpus's job (_tests_/bit/golden).
+//
+// Run it: `bit run _tests_/bit/examplesgate.bit` from the repository root.
+// Configure it by environment, since `bit run` forwards no argv to the program:
+//   BIT                 compiler under test    (default bit-out/bin/bit)
+//   EXAMPLES            examples directory     (default examples)
+//   BIT_TEST_TIMEOUT_S  per-child deadline     (default 300, clamped to 3600)
+//
+// Three things this file exists to NOT do, each of which has shipped here
+// before as a green gate over an empty input set:
+//
+//   - `fs.walk` is never used. It returns FILES only ("directories are
+//     descended into, not themselves returned"), so the obvious
+//     `for p of walk(dir) { if (!isDir(p)) continue ... }` skips every entry
+//     forever. Discovery is `readDir` (one level, already sorted) filtered by
+//     `isDir`.
+//   - The discovered count is pinned EXACTLY, the way
+//     `scripts/selfhost-diffexamples.sh` pins EXPECTED_REFUSED. Adding or
+//     deleting an example is then a reviewed edit to `expectedExamples`, not an
+//     unasserted number scrolling past.
+//   - A bad `BIT`/`EXAMPLES` path, or a `readDir` that fails, is RED. "0
+//     examples, ok" is the failure mode this gate is defending against.
+//
+// A hang is a failure, not a stall (#1637/#1652): every child carries a
+// wall-clock deadline and a child killed by a signal is reported as a CRASH,
+// never as a timeout — scoring a segfault as a timeout sends the reader hunting
+// the wrong bug.
+//
+// PARALLELISED (#1901) via _tests_/bit/gatefanout: build then run are two
+// barriered waves (`gatefanout.wave1`/`wave2`) fanned out in a single
+// generated shell driver, exactly the pattern #2508 landed for
+// _tests_/bit/importsrun/importsrun.bit and for the identical reason — see that
+// module's header for why a `spawn`ed pool cannot safely call
+// `osRunBounded` itself. `runAll` below now has exactly THREE passes over
+// `cases` — stage, run the one driver, grade — instead of one interleaved
+// loop; every pass visits cases in the SAME discovery order, so the report
+// is byte-identical regardless of which build or run happened to finish
+// first inside the shell's `xargs -P`.
+
+import { exists, isDir, readDir } from "std/fs"
+import { envOr, exit } from "std/os"
+import { join } from "std/path"
+import { parseInt } from "std/strings"
+import { now } from "std/time"
+import {
+  FanCfg, Job, JobResult, cleanupJob, commitWave, gradeJob,
+  newFanCfg, runDriver, stageJob, wave1, wave2,
+} from "./gatefanout"
+
+// Exactly how many example modules there must be. See the header: this is a
+// pin, not a bound.
+const expectedExamples: int = 53
+
+// Per-child wall-clock limit, under the `BIT_TEST_TIMEOUT_S` name every harness
+// here shares. There is no `0` escape hatch: `osRunBounded`
+// has no unbounded mode, so the floor is one second.
+const defaultTimeoutS: int = 300
+const maxTimeoutS: int = 3600
+const timeoutEnvVar: string = "BIT_TEST_TIMEOUT_S"
+
+// `osRunBounded`'s result encoding (ABI.md §19), reused verbatim by
+// `gatefanout.gradeJob`. `<= rcSignalBase` means the child died of signal
+// `-(r) - 100`.
+const rcSpawnFailed: int = -1
+const rcTimedOut: int = -2
+const rcSignalBase: int = -100
+
+// What one example did, in the order of severity the exit code reports.
+const outcomeOk: int = 0
+const outcomeFailed: int = 1
+const outcomeTimedOut: int = 2
+
+fn main() {
+  let bin = envOr("BIT", "bit-out/bin/bit")
+  let dir = envOr("EXAMPLES", "examples")
+
+  // A mistyped path must be RED, never "0 examples, ok".
+  if (!exists(bin)) {
+    eprint("examplesgate: compiler not found: ${bin} (set BIT)\n")
+    exit(1)
+    return
+  }
+  if (!isDir(dir)) {
+    eprint("examplesgate: not a directory: ${dir} (set EXAMPLES)\n")
+    exit(1)
+    return
+  }
+
+  let cases = discover(dir)
+  if (len(cases) != expectedExamples) {
+    eprint("examplesgate: ${dir} holds ${len(cases)} modules, want ${expectedExamples}\n")
+    eprint("examplesgate: adding one means updating 'expectedExamples' here\n")
+    exit(1)
+    return
+  }
+  exit(runAll(bin, dir, cases, timeoutSeconds() * 1000))
+}
+
+// The example module names under `dir`: `readDir` (one level, already sorted,
+// so the report order is reproducible) filtered by `isDir`. NEVER `walk` — see
+// the header. A directory that cannot be read ends the run rather than
+// returning an empty list, which the caller could not tell from "no examples".
+fn discover(dir: string): []string {
+  let names = readDir(dir) catch _ {
+    eprint("examplesgate: cannot read ${dir}\n")
+    exit(1)
+    return []string(0)
+  }
+  let cases = []string(0)
+  for name of names {
+    if (isDir(join(dir, name))) {
+      cases = append(cases, name)
+    }
+  }
+  return cases
+}
+
+fn buildKey(idx: int): string { return "b${idx}" }
+fn runKey(idx: int): string { return "r${idx}" }
+fn binOutPath(scratch: string, idx: int): string { return "${scratch}/ex-${idx}.bin" }
+
+// Stages both jobs for every case: compile (wave 1) and, unconditionally,
+// execute the binary compile would produce (wave 2). A case whose compile
+// fails simply produces no binary — its run job then fails to exec and
+// `gradeExample` never even looks at that result, because it grades the
+// build outcome first and returns before touching the run outcome, same as
+// the pre-#1901 serial code did.
+fn stageExample(cfg: FanCfg, dir: string, bin: string, name: string, idx: int) {
+  let src = join(dir, name)
+  let out = binOutPath(cfg.scratch, idx)
+  stageJob(
+    cfg,
+    Job{
+      key: buildKey(idx), wave: wave1, cwd: "",
+      argv: [bin, "build", src, "-o", out], withEnv: true,
+    },
+  )
+  commitWave(cfg.scratch, buildKey(idx), wave1)
+  stageJob(
+    cfg,
+    Job{
+      key: runKey(idx), wave: wave2, cwd: "",
+      argv: [out], withEnv: false,
+    },
+  )
+  commitWave(cfg.scratch, runKey(idx), wave2)
+}
+
+// Grades one case from its two graded jobs and prints its verdict. Returns
+// one of the `outcome*` constants.
+fn gradeExample(scratch: string, name: string, idx: int): int {
+  let br = gradeExampleJob(scratch, buildKey(idx))
+  if (br != outcomeOk) {
+    let r = reportJob(name, "build", scratch, buildKey(idx))
+    cleanupJob(scratch, buildKey(idx))
+    cleanupJob(scratch, runKey(idx))
+    fsRemove(binOutPath(scratch, idx))
+    return r
+  }
+  cleanupJob(scratch, buildKey(idx))
+  let rr = gradeExampleJob(scratch, runKey(idx))
+  fsRemove(binOutPath(scratch, idx))
+  if (rr != outcomeOk) {
+    let r = reportJob(name, "run", scratch, runKey(idx))
+    cleanupJob(scratch, runKey(idx))
+    return r
+  }
+  cleanupJob(scratch, runKey(idx))
+  print("ok ${name}\n")
+  return outcomeOk
+}
+
+// outcomeOk if the job's raw exit code is 0; any other outcome is left to
+// `reportJob` to classify and print, so this stays a pure predicate.
+fn gradeExampleJob(scratch: string, key: string): int {
+  let jr = gradeJob(scratch, key)
+  if (jr.ran && jr.code == 0) {
+    return outcomeOk
+  }
+  return outcomeFailed
+}
+
+// Stages every case (wave 1 + wave 2 scripts on disk, nothing run yet), makes
+// the ONE outer `osRunBounded` call, then grades every case in discovery
+// order — so the report is deterministic no matter which case's shell job
+// happened to finish first.
+fn runAll(bin: string, dir: string, cases: []string, timeoutMs: int): int {
+  let scratch = scratchRoot()
+  if (fsMkdir(scratch) < 0) {
+    eprint("examplesgate: cannot create scratch directory ${scratch}\n")
+    exit(1)
+  }
+  let cfg = newFanCfg(scratch, timeoutMs, "", "")
+  let i = 0
+  while (i < len(cases)) {
+    stageExample(cfg, dir, bin, cases[i], i)
+    i = i + 1
+  }
+
+  let outerMs = 2 * len(cases) * timeoutMs + 60000
+  runDriver(scratch, outerMs)
+
+  let failed = 0
+  let timedOut = 0
+  i = 0
+  while (i < len(cases)) {
+    let r = gradeExample(scratch, cases[i], i)
+    if (r == outcomeTimedOut) {
+      timedOut = timedOut + 1
+    } else if (r == outcomeFailed) {
+      failed = failed + 1
+    }
+    i = i + 1
+  }
+  fsRemove(scratch)
+
+  if (timedOut > 0) {
+    eprint("examplesgate: FAILED — ${timedOut} timed out, ${failed} failed\n")
+    return 2
+  }
+  if (failed > 0) {
+    eprint("examplesgate: FAILED — ${failed} of ${len(cases)} example(s)\n")
+    return 1
+  }
+  print("${len(cases)}/${expectedExamples} examples built and exited 0\n")
+  return 0
+}
+
+// Names one example's failure on stderr and classifies it. `phase` is "build"
+// or "run", so a compiler that refuses is never confused with a program that
+// exits non-zero.
+fn reportJob(name: string, phase: string, scratch: string, key: string): int {
+  let jr = gradeJob(scratch, key)
+  if (!jr.ran) {
+    eprint("example '${name}': could not spawn ${phase}\n")
+    return outcomeFailed
+  }
+  let r = jr.code
+  if (r == rcTimedOut) {
+    eprint("example '${name}': TIMED OUT in ${phase}\n")
+    eprint("  killed at the ${timeoutEnvVar} deadline; raise it on a slower host\n")
+    return outcomeTimedOut
+  }
+  if (r <= rcSignalBase) {
+    eprint("example '${name}': CRASHED in ${phase} — ${signalName(0 - r + rcSignalBase)}\n")
+  } else {
+    eprint("example '${name}': ${phase} exited with ${r}\n")
+  }
+  printJobOutput(name, phase, jr)
+  return outcomeFailed
+}
+
+fn printJobOutput(name: string, phase: string, jr: JobResult) {
+  let text = jr.err
+  if (len(jr.out) > 0) {
+    text = text + jr.out
+  }
+  if (len(text) > 0) {
+    eprint("--- ${name} ${phase} output ---\n${text}\n")
+  }
+}
+
+// The signal numbers worth naming. Anything else reports its number, which is
+// still attributable.
+fn signalName(sig: int): string {
+  if (sig == 4) {
+    return "SIGILL (4)"
+  }
+  if (sig == 6) {
+    return "SIGABRT (6)"
+  }
+  if (sig == 8) {
+    return "SIGFPE (8)"
+  }
+  if (sig == 9) {
+    return "SIGKILL (9)"
+  }
+  if (sig == 10) {
+    return "SIGBUS (10)"
+  }
+  if (sig == 11) {
+    return "SIGSEGV (11)"
+  }
+  return "signal ${sig}"
+}
+
+// The per-child limit in seconds. An unset or unparsable value falls back to
+// the default rather than failing the run — this is a host knob, not a
+// property of the corpus — and any value is clamped into [1, maxTimeoutS] so
+// a typo can neither disable the deadline nor make it useless.
+fn timeoutSeconds(): int {
+  let raw = envOr(timeoutEnvVar, "")
+  if (len(raw) == 0) {
+    return defaultTimeoutS
+  }
+  let n = parseInt(raw) catch _ {
+    eprint("examplesgate: ${timeoutEnvVar}='${raw}' is not a number\n")
+    return defaultTimeoutS
+  }
+  if (n < 1) {
+    return 1
+  }
+  if (n > maxTimeoutS) {
+    return maxTimeoutS
+  }
+  return n
+}
+
+fn scratchRoot(): string {
+  let base = envOr("TMPDIR", "/tmp")
+  if (base[len(base) - 1] == 47) {
+    base = base[0:len(base) - 1]
+  }
+  return "${base}/bit-examplesgate-${now().ns}"
+}

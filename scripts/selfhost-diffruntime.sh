@@ -6,7 +6,7 @@
 #
 # The other fifteen `selfhost-diff*.sh` all walk the same corpus:
 #
-#     find stdlib examples tests/cases tests/imports -name '*.bit'
+#     find stdlib examples _tests_/cases _tests_/imports -name '*.bit'
 #
 # `runtime/` is in none of them. The compiler had therefore NEVER been
 # differentially tested against the source it compiles into every user binary.

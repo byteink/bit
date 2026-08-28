@@ -1,0 +1,540 @@
+// `bit run`'s process-exit-code contract (#2019), the sibling of
+// `_tests_/bit/lintcmd.bit` for the other subcommand that launches a child.
+//
+// THE PROPERTY, in one sentence: `bit run` reports what actually happened to
+// the program it launched — a clean exit passes its code through, a panic
+// stays 2, a compile failure is 1, and a program KILLED BY A SIGNAL is named
+// as such and exits 128+signal, never confused with a launch that failed.
+//
+// THE DEFECT THIS REMOVES, which shipped in 0.1.5. Every signal death printed
+//
+//     bit: could not run /tmp/bit-run-<stem>-<nonce>
+//
+// and exited 1. Three separate wrongs in one line: the binary HAD run (it
+// printed its own output first), the path named had already been deleted by
+// the `fsRemove` on the preceding line, and exit 1 is also what a compile
+// error yields — so a script could not tell "your code does not build" from
+// "your program segfaulted". The root cause was a layer below the message:
+// `osForkExecWait` collapsed every abnormal termination to the same -1 the
+// spawn failures use, so `runCmd` had nothing left to report. ABI.md §19 now
+// gives `os_run` the `<= -100` encoding its bounded sibling always had.
+//
+// WHY THE VEHICLE IS AN EXTERNALLY-DELIVERED SIGABRT, NOT A STACK OVERFLOW
+// (#2970). Until #2946, unbounded recursion was a reliable way to die of an
+// unhandled SIGSEGV/SIGBUS. #2946 installs a runtime handler for every one of
+// SIGSEGV/SIGBUS/SIGTRAP/SIGILL (runtime/root/{darwin,linux}/signal.bit) that
+// converts EVERY delivery of those four — not just genuine stack overflows —
+// into a named diagnostic and a clean `rootExit(2)`. So none of the four can
+// still reach the OS's default "died by signal" disposition, and a vehicle
+// built on any of them would now be testing the stack-overflow path (below),
+// not this one. `checkSignalDeath` instead runs a program that blocks after
+// printing, then has the WRAPPER SHELL SCRIPT deliver SIGABRT to it directly
+// — a signal the runtime installs no handler for. This can't be done from
+// inside the Bit program portably: `extern fn` is Darwin-only
+// (_tests_/stress/externfn/externfn.bit's header — a static Linux ELF has no
+// libc to resolve `kill`/`raise` against), and there is no builtin or std/os
+// primitive to signal the current process.
+//
+// WHY THE SIGNAL NUMBER IS PARSED OUT OF THE MESSAGE RATHER THAN ASSERTED.
+// SIGABRT is 6 on every platform this runs on, but the contract under test is
+// the DECODE, not the number — `bit run` must recover whatever signal a child
+// died of and report 128+that, not just this one. So the case reads the
+// signal out of what `bit run` printed rather than hard-coding 6.
+//
+// ANTI-VACUITY. Each case asserts its POSITIVE needle before any absence
+// check, because the empty string satisfies every `!contains`. The signal case
+// additionally asserts the fixture's own output arrived first: without it a
+// program that never started would satisfy "was killed by" if the message ever
+// regressed into being printed unconditionally. The final line prints how many
+// checks ran, and a floor below it fails the gate, so a case that stops
+// running is visible rather than green.
+//
+// THE STACK-OVERFLOW CASE (#2246/#2946's own contract, added by #2970): a
+// green-thread's (here, main's own) stack overflow is now CAUGHT by the
+// runtime and reported as `bit: stack overflow` with a clean exit 2, never as
+// a signal death. `checkStackOverflow` asserts that shape so a silent revert
+// of #2946 is caught here, not only by runtime/root's own differential.
+//
+// Run it from the repository root:
+//     ./bit-out/bin/bit run _tests_/bit/runcmd.bit
+// `BIT_SELF_EXE` overrides which `bit` is exercised; unset, the compiler under
+// test is `<cwd>/bit-out/bin/bit`, resolved from a child's own `pwd` — Bit has
+// no getcwd primitive, and `selfExe()` here is the throwaway binary `bit run`
+// built, not the compiler that built it.
+import { env, envOr, exit } from "std/os"
+import { exists, mkdir, readFile, remove, writeFile } from "std/fs"
+import { contains, parseInt } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// One `bit run` invocation, as seen from outside it.
+class Run { code: int, out: string, err: string }
+
+// Assertion accounting. A class because Bit has no mutable module-level
+// state, and the count is the anti-vacuity marker.
+class Tally { checks: int, failures: int }
+
+// How long any one child gets. Every fixture below is a few lines that either
+// exits at once or overflows its stack at once, so this only fires on a hang —
+// and a hang is a failure, not a stall (#1637).
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "300")) catch _ { 300 }
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns are
+// `osRunBounded`'s mechanism channel, never a program exit status, so each one
+// is a named panic rather than a value any assertion could consume.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("runcmd: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("runcmd: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("runcmd: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("runcmd: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+// The `bit` under test. `BIT_SELF_EXE` wins; otherwise the dev-tree build
+// artifact relative to the working directory this program was started in,
+// obtained by asking a child for its `pwd`. Never returns "" — a compiler this
+// cannot find is a hard stop, not a skipped test.
+fn bitBinary(scratch: string, ms: int): string! {
+  let explicit = env("BIT_SELF_EXE")
+  if (len(explicit) > 0) {
+    if (!exists(explicit)) {
+      fail newError("runcmd: BIT_SELF_EXE=${explicit} does not exist")
+    }
+    return explicit
+  }
+  let cwdFile = "${scratch}/cwd.txt"
+  let code = shell("${scratch}/pwd.sh", "#!/bin/sh\npwd > '${cwdFile}'\n", ms)?
+  if (code != 0) {
+    fail newError("runcmd: could not read the working directory (exit ${code})")
+  }
+  let cwd = trimWs(readFile(cwdFile)?)
+  let candidate = "${cwd}/bit-out/bin/bit"
+  if (!exists(candidate)) {
+    fail newError("runcmd: no compiler at ${candidate}; run this from the repository root or set BIT_SELF_EXE")
+  }
+  return candidate
+}
+
+// The six programs, one per outcome class. All single-file and builtin-only —
+// `print`, `panic` and `osExit` are predeclared (compiler/symbols.bit), so none
+// of them needs the stdlib to be found, which keeps this gate measuring `bit
+// run`'s reporting rather than its module resolution.
+//
+// `crash.bit` recurses without a base case. Since #2946 the runtime catches
+// that itself (main's stack overflow) and reports it as a clean exit 2 — see
+// `checkStackOverflow` — so this fixture no longer dies by a signal.
+//
+// `abort.bit` prints then blocks forever on purpose: it has no way to reach a
+// terminal state on its own, so it is guaranteed to still be alive when
+// `runBitSignaled`'s wrapper script delivers SIGABRT to it (see the header
+// comment for why the signal must be delivered externally rather than raised
+// by the program itself).
+fn makeFixtures(root: string): ()! {
+  mkdir(root)?
+  writeFile("${root}/crash.bit",
+    "fn boom(n: int): int { return boom(n + 1) + 1 }\n" +
+    "fn main() {\n" +
+    "  print(\"ran-first\\n\")\n" +
+    "  if (boom(1) > 0) { print(\"unreachable\\n\") }\n" +
+    "}\n")?
+  writeFile("${root}/abort.bit",
+    "fn main() {\n" +
+    "  print(\"ran-first\\n\")\n" +
+    "  while (true) {}\n" +
+    "}\n")?
+  writeFile("${root}/clean.bit", "fn main() { print(\"clean\\n\") }\n")?
+  writeFile("${root}/code7.bit", "fn main() { print(\"leaving\\n\"); osExit(7) }\n")?
+  writeFile("${root}/panics.bit", "fn main() { print(\"before\\n\"); panic(\"deliberate\") }\n")?
+  writeFile("${root}/broken.bit", "fn main( { }\n")?
+  writeFile("${root}/hastest.test.bit",
+    "fn test_trivial() {\n" +
+    "  assert(1 == 1)\n" +
+    "}\n")?
+}
+
+// Runs `bit run <src>` with `root` as the working directory.
+//
+// The script always exits 0 and writes the real status to `code.txt`, so a
+// missing `code.txt` is unmistakably "the run never happened" rather than a
+// status some assertion could mistake for success. That indirection is also
+// what makes the signal case observable at all: `exec`ing would work here
+// because `bit run` itself exits normally with 128+sig, but recording the
+// status explicitly keeps this case shaped like every other one.
+fn runBit(bit: string, root: string, capDir: string, src: string, ms: int): Run! {
+  let outPath = "${capDir}/out.txt"
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  clear(outPath)
+  clear(errPath)
+  clear(codePath)
+
+  let script = "#!/bin/sh\n" +
+    "cd '${root}' || exit 0\n" +
+    "'${bit}' run '${src}' > '${outPath}' 2> '${errPath}'\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/run.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("runcmd: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("runcmd: no exit code was recorded for `bit run ${src}` — the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, out: readFile(outPath)?, err: readFile(errPath)? }
+}
+
+// Like `runBit`, but for a fixture that must die of a signal the runtime
+// installs no handler for (see the file header). `bit run` forks and execs a
+// compiled temp binary to run the fixture and stays alive itself to wait() on
+// it and report — so the signal must go to that CHILD, never to `bit run`'s
+// own pid, or `bit run` dies before it can observe or report anything.
+//
+// `bit run` is launched in the BACKGROUND; the wrapper polls (bounded at a
+// share of `ms`, see the poll-window comment inside the function) until BOTH
+// the child exists (`pgrep -P`) AND the fixture's own "ran-first" marker has
+// appeared, so the signal can never be delivered before the fixture has
+// actually started — which would make `checkSignalDeath`'s first assertion
+// pass for the wrong reason. Once both are true the wrapper sends `sigName`
+// (a bare POSIX name, e.g. "ABRT", suitable for `kill -s`) to the CHILD and
+// `wait`s on `bit run` itself — the shell reports a signal death as
+// 128+signal on both macOS and Linux, the same convention `bit run` uses when
+// it turns its child's signal death into its own controlled exit.
+fn runBitSignaled(bit: string, root: string, capDir: string, src: string, sigName: string, ms: int): Run! {
+  let outPath = "${capDir}/out.txt"
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  clear(outPath)
+  clear(errPath)
+  clear(codePath)
+
+  // Detection window before the signal is sent: a share of the SAME per-case
+  // budget (`ms`, from `BIT_TEST_TIMEOUT_S`) every other bound in this
+  // harness already honors, not a wall-clock guess independent of it (#3685).
+  // Under fleet load, compiling and forking the fixture can legitimately take
+  // longer than a fixed 200*50ms=10s window, and this loop used to send the
+  // signal to whatever `pgrep` last found regardless of whether "ran-first"
+  // had actually printed yet — a race that killed the child before its own
+  // output landed and read as "the program's own output is missing — it
+  // never ran". 20% of `ms` (60s at the 300s default) leaves the remaining
+  // 80% for the kill+wait phase, well inside the outer bound `shell()` still
+  // enforces below.
+  let pollIters = ms / 250
+
+  let script = "#!/bin/sh\n" +
+    "cd '${root}' || exit 0\n" +
+    "'${bit}' run '${src}' > '${outPath}' 2> '${errPath}' &\n" +
+    "pid=$!\n" +
+    "i=0\n" +
+    "child=\"\"\n" +
+    "ready=0\n" +
+    "while [ \"$i\" -lt ${pollIters} ]; do\n" +
+    "  child=$(pgrep -P \"$pid\" 2>/dev/null | head -n 1)\n" +
+    "  if [ -n \"$child\" ] && grep -q 'ran-first' '${outPath}' 2>/dev/null; then\n" +
+    "    ready=1\n" +
+    "    break\n" +
+    "  fi\n" +
+    "  i=$((i + 1))\n" +
+    "  sleep 0.05\n" +
+    "done\n" +
+    // Only signal once the fixture's own output has actually been observed —
+    // signalling the last-seen (possibly stale or not-yet-printing) child on
+    // a bare loop exhaustion is exactly the race described above. If
+    // readiness is never observed, no signal is sent; `wait` then blocks on
+    // the still-running (or still-compiling) child until the OUTER `ms`
+    // bound below fires its own honest "TIMED OUT" — never a false "output
+    // is missing" from a premature kill.
+    "if [ \"$ready\" = 1 ] && [ -n \"$child\" ]; then\n" +
+    "  kill -s ${sigName} \"$child\" 2>/dev/null\n" +
+    "fi\n" +
+    "wait \"$pid\"\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/run.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("runcmd: signal wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("runcmd: no exit code was recorded for `bit run ${src}` (signalled) — the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, out: readFile(outPath)?, err: readFile(errPath)? }
+}
+
+// Like `runBit`, but with `BIT_GC=stress` set for the child and `cmd` naming
+// which subcommand to invoke ("run" or "test") — the two cases that must NOT
+// reach a build at all (#2425 for `run`, #2979 for `test`): both refuse
+// rather than compiling under a policy aimed at themselves. A separate
+// helper rather than an env parameter threaded through every existing
+// caller: only these two cases need it.
+fn runBitStressGc(bit: string, root: string, capDir: string, cmd: string, src: string, ms: int): Run! {
+  let outPath = "${capDir}/out.txt"
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  clear(outPath)
+  clear(errPath)
+  clear(codePath)
+
+  let script = "#!/bin/sh\n" +
+    "cd '${root}' || exit 0\n" +
+    "BIT_GC=stress '${bit}' ${cmd} '${src}' > '${outPath}' 2> '${errPath}'\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/run.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("runcmd: stress-gc wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("runcmd: no exit code was recorded for `BIT_GC=stress bit ${cmd} ${src}` — the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, out: readFile(outPath)?, err: readFile(errPath)? }
+}
+
+fn clear(path: string) {
+  if (exists(path)) {
+    remove(path) catch _ { return }
+  }
+}
+
+// Records one assertion. Failures are named and the run continues, so a single
+// invocation reports every broken expectation instead of only the first.
+fn check(t: Tally, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    eprint("FAIL: ${label}\n")
+  }
+}
+
+// The signal number `bit run` named, read back out of its own message, or -1.
+// The message always ends `... (<n>)` — `signalName` in compiler/build.bit
+// parenthesises the number for the named signals AND for the fallback, exactly
+// so this decode has one shape to parse.
+fn namedSignal(out: string): int {
+  let open = lastIndexOf(out, "(")
+  if (open < 0) {
+    return -1
+  }
+  let rest = out[open + 1:]
+  let closeIdx = indexOf(rest, ")")
+  if (closeIdx < 0) {
+    return -1
+  }
+  return parseInt(rest[:closeIdx]) catch _ { -1 }
+}
+
+// THE CASE THIS FILE EXISTS FOR: a program that ran, then died on a signal.
+fn checkSignalDeath(t: Tally, bit: string, root: string, capDir: string, ms: int): ()! {
+  let r = runBitSignaled(bit, root, capDir, "abort.bit", "ABRT", ms)?
+  // Positive needles first: without these the absence checks below are vacuous.
+  check(t, contains(r.out, "ran-first"), "signal: the program's own output is missing — it never ran")
+  // `bit run`'s own report is a diagnostic, not the launched program's output
+  // (#2412), so it belongs on stderr — never mixed into the child's stdout.
+  check(t, contains(r.err, "was killed by"), "signal: `bit run` did not report a signal death: ${r.err}")
+  check(t, !contains(r.out, "was killed by"), "signal: the signal report leaked onto stdout: ${r.out}")
+
+  let sig = namedSignal(r.err)
+  check(t, sig > 0, "signal: no signal number in the message: ${r.err}")
+  // The decode itself: 128+signal is the shell convention, and it must agree
+  // with the number `bit run` printed rather than being any old non-zero.
+  check(t, r.code == 128 + sig, "signal: exit ${r.code}, want ${128 + sig} for signal ${sig}")
+  // And it must not be 1, which is what a compile failure yields.
+  check(t, r.code != 1, "signal: exit 1 is indistinguishable from a build failure")
+
+  // The three original wrongs, each asserted gone.
+  check(t, !contains(r.out, "could not run"), "signal: still blames the launch: ${r.out}")
+  check(t, !contains(r.out, "/tmp/bit-run-"), "signal: names a path it already deleted: ${r.out}")
+  check(t, !contains(r.err, "could not run"), "signal: still blames the launch on stderr: ${r.err}")
+}
+
+// #2246/#2946's contract: a green-thread's stack overflow is CAUGHT by the
+// runtime and reported as a named diagnostic with a clean exit — never left
+// to reach the OS's own signal disposition, unlike `checkSignalDeath`'s case.
+fn checkStackOverflow(t: Tally, bit: string, root: string, capDir: string, ms: int): ()! {
+  let r = runBit(bit, root, capDir, "crash.bit", ms)?
+  check(t, contains(r.out, "ran-first"), "overflow: the program's own output is missing — it never ran")
+  check(t, contains(r.err, "bit: stack overflow"), "overflow: no stack-overflow diagnostic: ${r.err}")
+  check(t, r.code == 2, "overflow: exit ${r.code}, want 2 (a clean, named exit — not a signal death)")
+  // Distinguishes this from checkSignalDeath's 128+signal shape.
+  check(t, !contains(r.err, "was killed by"), "overflow: reported as a signal death rather than a diagnostic: ${r.err}")
+}
+
+// `bit run` under `BIT_GC=stress` refuses rather than compiling under a
+// stress policy aimed at its own process (#2425, `refuseRunUnderStressGc` in
+// compiler/build.bit). `clean.bit` is the vehicle: if this case regresses to
+// the pre-#2425 behaviour it never reaches the program, `clean.bit`'s own
+// "clean" output never appears, and the case blocks for up to `ms` before
+// `shell` times it out — the honest cost of testing a refusal that is
+// supposed to be near-instant.
+fn checkStressGcRefusal(t: Tally, bit: string, root: string, capDir: string, ms: int): ()! {
+  let r = runBitStressGc(bit, root, capDir, "run", "clean.bit", ms)?
+  check(t, r.code != 0, "stress-gc: exit ${r.code}, want non-zero (refused)")
+  check(t, !contains(r.out, "clean"), "stress-gc: the program ran — BIT_GC=stress reached the compile instead of being refused")
+  check(t, contains(r.err, "bit build"), "stress-gc: diagnostic does not name `bit build`: ${r.err}")
+  check(t, contains(r.err, "BIT_GC=stress"), "stress-gc: diagnostic does not name BIT_GC=stress: ${r.err}")
+}
+
+// `bit test` under `BIT_GC=stress` refuses the same way `bit run` does, and
+// for the identical reason (#2979, `refuseTestUnderStressGc` in
+// compiler/build.bit): it compiles then execs a synthetic test binary in
+// this process, so a stress policy lands on the compiler, never the test.
+// `hastest.test.bit` is the vehicle: if this case regresses, the compile never
+// finishes, `test_trivial` never runs, its `ok   test_trivial` line never
+// appears, and the case blocks for up to `ms` before `shell` times it out —
+// same honest cost as `checkStressGcRefusal` above.
+fn checkTestStressGcRefusal(t: Tally, bit: string, root: string, capDir: string, ms: int): ()! {
+  let r = runBitStressGc(bit, root, capDir, "test", "hastest.test.bit", ms)?
+  check(t, r.code != 0, "test-stress-gc: exit ${r.code}, want non-zero (refused)")
+  check(t, !contains(r.out, "ok   test_trivial"), "test-stress-gc: the test ran — BIT_GC=stress reached the compile instead of being refused")
+  check(t, contains(r.err, "bit test"), "test-stress-gc: diagnostic does not name `bit test`: ${r.err}")
+  check(t, contains(r.err, "BIT_GC=stress"), "test-stress-gc: diagnostic does not name BIT_GC=stress: ${r.err}")
+}
+
+// The three outcomes that must NOT have changed. A fix to the signal path that
+// disturbs any of these is a regression, and 0/n/2 are what callers already
+// script against.
+fn checkUnchanged(t: Tally, bit: string, root: string, capDir: string, ms: int): ()! {
+  let ok = runBit(bit, root, capDir, "clean.bit", ms)?
+  check(t, ok.code == 0, "clean: exit ${ok.code}, want 0")
+  check(t, contains(ok.out, "clean"), "clean: the program's output is missing")
+  check(t, !contains(ok.out, "bit:"), "clean: `bit run` added a message to a successful run")
+
+  // A non-zero exit is the program's own, passed through untouched — and 7 is
+  // deliberately below 128 so it can never be read as a signal.
+  let seven = runBit(bit, root, capDir, "code7.bit", ms)?
+  check(t, seven.code == 7, "exit-code: exit ${seven.code}, want 7")
+  check(t, contains(seven.out, "leaving"), "exit-code: the program's output is missing")
+  check(t, !contains(seven.out, "was killed by"), "exit-code: a clean exit was reported as a signal")
+
+  // A panic prints its own message and yields 2 — the runtime's contract, not
+  // `bit run`'s, and this gate is here to notice if the two ever collide.
+  let p = runBit(bit, root, capDir, "panics.bit", ms)?
+  check(t, p.code == 2, "panic: exit ${p.code}, want 2")
+  check(t, contains(p.err, "panic: deliberate"), "panic: message not on stderr: ${p.err}")
+  check(t, !contains(p.out, "was killed by"), "panic: reported as a signal death")
+
+  // A compile failure is 1, and says so without ever reaching a child.
+  let bad = runBit(bit, root, capDir, "broken.bit", ms)?
+  check(t, bad.code == 1, "compile-error: exit ${bad.code}, want 1")
+  check(t, contains(bad.err, "error[E0021]"), "compile-error: no diagnostic on stderr")
+  check(t, !contains(bad.out, "was killed by"), "compile-error: reported as a signal death")
+  check(t, !contains(bad.out, "could not"), "compile-error: reported as a launch failure")
+}
+
+// Every case, against fixtures built fresh under `scratch`. Split out of `main`
+// so each half stays inside the repo's own max-complexity limit.
+fn runAll(t: Tally, scratch: string, ms: int) {
+  let root = "${scratch}/tree"
+  let capDir = "${scratch}/cap"
+  mkdir(capDir) catch e {
+    panic("runcmd: cannot create ${capDir}: ${e.message()}")
+  }
+  let bit = bitBinary(scratch, ms) catch e {
+    panic("runcmd: ${e.message()}")
+  }
+  makeFixtures(root) catch e {
+    panic("runcmd: cannot build the fixtures: ${e.message()}")
+  }
+  checkSignalDeath(t, bit, root, capDir, ms) catch e { panic("runcmd: ${e.message()}") }
+  checkStackOverflow(t, bit, root, capDir, ms) catch e { panic("runcmd: ${e.message()}") }
+  checkUnchanged(t, bit, root, capDir, ms) catch e { panic("runcmd: ${e.message()}") }
+  checkStressGcRefusal(t, bit, root, capDir, ms) catch e { panic("runcmd: ${e.message()}") }
+  checkTestStressGcRefusal(t, bit, root, capDir, ms) catch e { panic("runcmd: ${e.message()}") }
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-runcmd-${uuidFormat(uuidV4())}"
+  let t = Tally{ checks: 0, failures: 0 }
+
+  mkdir(scratch) catch e {
+    panic("runcmd: cannot create ${scratch}: ${e.message()}")
+  }
+  runAll(t, scratch, ms)
+
+  // The run marker: 34 is what the five cases above assert today; the floor
+  // only has to be tight enough that a whole case going missing trips it.
+  if (t.checks < 32) {
+    eprint("FAIL: only ${t.checks} checks ran, want at least 32\n")
+    t.failures = t.failures + 1
+  }
+  if (t.failures > 0) {
+    // `exit()` does not run pending defers (#3694, same shape as #3677) —
+    // call teardown explicitly on both the PASS and FAIL paths.
+    teardown(scratch, ms)
+    println("runcmd: FAIL — ${t.failures} of ${t.checks} checks failed")
+    exit(1)
+  }
+  teardown(scratch, ms)
+  println("runcmd: PASS — ${t.checks} checks")
+}
+
+// std/fs has no recursive remove, so the scratch tree goes the way it came.
+fn teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ { return }
+}
+
+fn indexOf(s: string, needle: string): int {
+  let i = 0
+  while (i + len(needle) <= len(s)) {
+    if (s[i:i + len(needle)] == needle) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+fn lastIndexOf(s: string, needle: string): int {
+  let best = -1
+  let i = 0
+  while (i + len(needle) <= len(s)) {
+    if (s[i:i + len(needle)] == needle) {
+      best = i
+    }
+    i = i + 1
+  }
+  return best
+}
+
+// `std/strings`' `trimSpace` stops at spaces and tabs, and every capture here
+// arrives newline-terminated from a shell redirect.
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}

@@ -1,0 +1,217 @@
+// Allocation gate for UTF-8 decoding (#3623): decoding a NON-ASCII rune must
+// not allocate more heap objects than decoding an ASCII one.
+//
+// THE DEFECT THIS PREVENTS FROM RETURNING. #2448 cleared 50 E0204 complexity
+// findings across stdlib by extracting helpers, and several of those helpers
+// returned a `class` purely as a multiple-return vehicle. A class is a heap
+// object in Bit, so an extraction that reads as a pure refactor silently
+// converts a register-only computation into an allocation on the hot path.
+// `stdlib/strings/utf8.bit`'s `decodeRune` paid two of them per non-ASCII
+// rune -- `LeadByteClass` and `ContinuationResult` -- taking every multi-byte
+// decode in the language from 1 object to 3, a 3x regression that shipped and
+// sat unnoticed. `stdlib/json/parse.bit` had the identical shape (#3617).
+//
+// WHY THIS GATE EXISTS RATHER THAN A BENCHMARK BASELINE. Nothing in
+// `bench/cases/` decodes a non-ASCII rune -- `bench/cases/strings` is
+// deliberately ASCII -- so `_tests_/bit/benchgate`'s `objects` band could not
+// see this and still cannot. A new bench case would have to carry a measured
+// `cpuCentis`/`rssBytes` baseline on three platforms; this reads the exact
+// quantity that regressed, deterministically, in milliseconds.
+//
+// WHY A RATIO AGAINST ASCII RATHER THAN A PINNED PER-RUNE NUMBER. Today both
+// paths allocate exactly one object per decode, and that one is `decodeRune`'s
+// own `(rune, int)` tuple return -- #3613's territory, not this file's. Pinning
+// "1" here would turn #3613's landing into a red gate and a re-baseline chore.
+// The invariant that actually broke is that the two paths DIVERGED, so that is
+// what is asserted: whatever a decode costs, a multi-byte one must not cost
+// more. It stays green when #3613 takes both to zero, and goes red the moment
+// a helper split puts an allocation back on the multi-byte path alone. The
+// absolute per-decode ceiling below is the second half of the pair, because a
+// ratio alone would accept a change that allocated on BOTH paths.
+//
+// Run from the repository root: ./bit-out/bin/bit run _tests_/bit/runealloc.bit
+import { exit } from "std/os"
+import { runeCount } from "std/strings"
+import { stwSwept, stwLiveObjects } from "../../runtime/stw"
+
+// Iterations per case. 5000 x 24 runes = 120000 decodes, so the pre-fix
+// +2-per-rune regression is +240000 against a `slack` of 2048 -- three orders
+// of magnitude of margin, and the whole file runs in well under a second.
+const iters: int = 5000
+const runesPerCase: int = 24
+
+// Objects unrelated to the measured loop that may land inside the window:
+// the sysmon thread (#2579) and any runtime bookkeeping. Sized to swallow
+// noise while leaving a regression of even 0.02 objects per decode visible.
+const slack: int = 2048
+
+// Objects allocated over the whole run so far. `swept` counts everything the
+// collector has reclaimed and `live` everything it still holds, so the SUM is
+// monotone total-ever-allocated and a collection landing between two reads
+// cannot perturb a delta -- a sweep moves N from `live` to `swept`. This is
+// the same pair `BIT_GC_STATS=1` prints; note its SPLIT varies run to run
+// while the sum does not, so never gate on either half alone.
+fn objectsAllocated(): int {
+  return stwSwept() + stwLiveObjects()
+}
+
+class Cell { v: int }
+
+// Instrument liveness (see "prove a measurement query is non-zero"): every
+// assertion below is an upper bound, so a probe that always read 0 -- a
+// collector never bound, an accessor gone dead, `gcAddr == 0` -- would pass
+// all of them while measuring nothing. This allocates exactly `n` objects
+// through the ordinary path and requires the counter to have moved by at
+// least that much. The slice is sized up front so the fill loop allocates
+// only the cells.
+fn instrumentDelta(n: int): int {
+  let keep = []Cell(n)
+  let before = objectsAllocated()
+  let k = 0
+  while (k < n) {
+    keep[k] = Cell{ v: k }
+    k = k + 1
+  }
+  let after = objectsAllocated()
+  return after - before
+}
+
+class Probe { decodes: int, objects: int, sink: int }
+
+// Decodes `s` `iters` times through `runeCount`, which is `decodeRune` --
+// the single path behind `runeAt`, `runes`, `isValidUtf8`, `toValidUtf8` and
+// the `padStart`/`padEnd` family -- and records the objects allocated across
+// the loop. Everything the probe itself needs is allocated before `before` is
+// read. `sink` is carried out and printed by `main` so the loop cannot be
+// eliminated as dead.
+fn probe(s: string, its: int): Probe {
+  let p = Probe{ decodes: runesPerCase * its, objects: 0, sink: 0 }
+  let sink = 0
+  let before = objectsAllocated()
+  let k = 0
+  while (k < its) {
+    sink = sink + runeCount(s)
+    k = k + 1
+  }
+  let after = objectsAllocated()
+  p.objects = after - before
+  p.sink = sink
+  return p
+}
+
+class Case { name: string, s: string, bytesPerRune: int }
+
+// One case per UTF-8 encoding length. All four strings are exactly
+// `runesPerCase` runes so the object counts compare directly with no
+// per-decode division, and each multi-byte case drives a different
+// `leadWant`/`leadMinCp`/`leadCpBits` arm of the decoder.
+fn cases(): []Case {
+  return [
+    Case{ name: "1-byte ASCII", s: "abcdefghijklmnopqrstuvwx", bytesPerRune: 1 },
+    Case{
+      name: "2-byte Greek",
+      s: "αβγδεζηθικλμνξοπρστυφχψω",
+      bytesPerRune: 2,
+    },
+    Case{
+      name: "3-byte CJK",
+      s: "日本語一二三四五六七八九十百千万億兆京垓円字号点",
+      bytesPerRune: 3,
+    },
+    Case{
+      name: "4-byte emoji",
+      s: "🙂🚀🌍🌟🎯🔥💡📦🧩🛠🎨🐝🍀🌊🏔🚗🧭🕹🎲🧮🪐🦋🧊🛰",
+      bytesPerRune: 4,
+    },
+  ]
+}
+
+class Tally { checks: int, failures: int }
+
+fn check(t: Tally, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    eprint("FAIL: ${label}\n")
+  }
+}
+
+// Every case must be exactly `runesPerCase` runes -- so the object counts
+// compare directly with no per-decode division -- AND exactly that many runes
+// times its own encoding width in bytes, which is what proves the case really
+// drives the `leadWant` arm its name claims. Without the byte check a case
+// silently degrading to ASCII (a mangled literal, a normalising checkout)
+// would leave the gate green while testing the 1-byte path four times.
+fn checkShape(t: Tally, c: Case) {
+  check(
+    t, runeCount(c.s) == runesPerCase,
+    "${c.name}: ${runeCount(c.s)} runes, want ${runesPerCase}",
+  )
+  check(
+    t, len(c.s) == runesPerCase * c.bytesPerRune,
+      "${c.name}: ${len(c.s)} bytes over ${runesPerCase} runes, want " +
+      "${runesPerCase * c.bytesPerRune} — this case is not exercising the " +
+      "${c.bytesPerRune}-byte decode arm it claims to",
+  )
+}
+
+// The two assertions per case: an absolute ceiling of one object per decode,
+// and -- for the multi-byte cases -- no more than the ASCII case spent over
+// the same number of decodes.
+fn checkCase(t: Tally, c: Case, p: Probe, asciiObjects: int, isAscii: bool) {
+  check(
+    t, p.objects <= p.decodes + slack,
+      "${c.name}: ${p.objects} objects over ${p.decodes} decodes exceeds the " +
+      "one-per-decode ceiling (${p.decodes} + slack ${slack})",
+  )
+  if (isAscii) {
+    return
+  }
+  check(
+    t, p.objects <= asciiObjects + slack,
+      "${c.name}: ${p.objects} objects over ${p.decodes} decodes against ASCII's " +
+      "${asciiObjects} over the same count — a non-ASCII decode is allocating " +
+      "more than an ASCII one, which is #3623 (#2448's class-as-return-vehicle) " +
+      "back on the multi-byte path",
+  )
+}
+
+fn main() {
+  let cs = cases()
+  let t = Tally{ checks: 0, failures: 0 }
+
+  let live = instrumentDelta(4096)
+  check(
+    t, live >= 4096,
+      "allocation probe is dead: allocating 4096 objects moved swept+live by " +
+      "${live} — every ceiling below would pass vacuously",
+  )
+
+  let asciiObjects = 0
+  let sink = 0
+  let i = 0
+  while (i < len(cs)) {
+    let p = probe(cs[i].s, iters)
+    if (i == 0) {
+      asciiObjects = p.objects
+    }
+    checkShape(t, cs[i])
+    checkCase(t, cs[i], p, asciiObjects, i == 0)
+    println("runealloc: ${cs[i].name}: ${p.objects} objects / ${p.decodes} decodes")
+    sink = sink + p.sink
+    i = i + 1
+  }
+
+  let want = runesPerCase * iters * len(cs)
+  check(t, sink == want, "decode loops produced ${sink} runes, want ${want}")
+
+  if (t.checks < 15) {
+    eprint("FAIL: only ${t.checks} checks ran, want at least 15\n")
+    t.failures = t.failures + 1
+  }
+  if (t.failures > 0) {
+    println("runealloc: FAIL — ${t.failures} of ${t.checks} checks failed")
+    exit(1)
+  }
+  println("runealloc: OK — ${t.checks} checks, ASCII ${asciiObjects} objects / ${runesPerCase * iters} decodes")
+}

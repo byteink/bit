@@ -1,0 +1,572 @@
+// Mutation fuzzer + saved-crash replay for the compiler front end, in Bit.
+//
+// Replaces the deleted harness's `guard`/`mutate`/`fuzz`/`crash_regression`
+// modules (formerly _tests_/fuzz/). The invariant is
+// unchanged: the front end TERMINATES on arbitrary bytes. Every input either
+// compiles or produces diagnostics - never a fatal signal, never a hang.
+//
+// SMOKE TEST, NOT A FUZZ CAMPAIGN. The deleted harness called `bit.parseReport`
+// in-process, tens of thousands of inputs per second. Nothing in compiler/*.bit
+// is `export`ed and compiler/main.bit declares `main()`, so no Bit program
+// outside that directory can reach the lexer or parser. Until a `bit fuzz` verb
+// exists (compiler/fuzzloop.bit + a dispatch entry in main.bit), each mutant
+// costs one fork+exec of `bit check`: measured ~22 inputs/second over the real
+// _tests_/cases corpus on aarch64-macos, so a 60s run is ~1300 inputs. Treat the
+// number it prints as a smoke count, not fuzzer throughput.
+//
+// The bound on every child is `osRunBounded` (ABI.md §19), not a signal handler
+// and a watchdog thread: the runtime already polls `waitpid` against one
+// absolute deadline, SIGKILLs an overrunner and reaps it, and reports crash,
+// timeout and spawn failure as three distinct values. The deleted `guard`
+// module's 90 lines of async-signal-safe handler collapse into reading that
+// return code.
+//
+// "TERMINATES" IS NOT "IS FAST". A bounded child that overran its budget has
+// only ever proved the second, so a timeout here is a question and not a
+// verdict - see the hang-budget note below, and #2400 for the false artifact
+// that came of conflating them.
+//
+// The mutant is written to disk BEFORE it is parsed, which is what made the
+// deleted `guard` module's static `crash_buf` necessary and now makes it
+// unnecessary: the input that killed the child is already a file when the
+// child dies.
+//
+// NOTHING HERE IS FALLIBLE, ON PURPOSE. An error reaching the boundary of a
+// `main(): ()!` is swallowed by the runtime: the process prints nothing and
+// EXITS 0. The first draft of this file was written that way and a missing seed
+// corpus produced a silent, green, zero-iteration run - the exact vacuity this
+// harness exists to refuse. So every fallible call is handled at its call site
+// and routed through `die`, and `main` is not fallible.
+//
+// CONFIGURATION IS ENVIRONMENT, NOT ARGV. `bit run` forwards trailing
+// arguments to the program it launches since #2399, but neither caller here
+// uses that: `tools/build/gates.bit`'s `test-fuzz` gate invokes this file as
+// bare `run <path>` (`runArgs`, no extras), and `scripts/fuzz.sh` (`./make
+// fuzz`) already had its own `$1`/`$2` and re-exports them as `BIT_FUZZ_*`
+// rather than passing them through. So build_options' baked-in absolute
+// paths become env vars with cwd-relative defaults, not argv. Run it from the
+// repo root. A wrong path is a hard failure, never an empty run - that is the
+// single most important difference from the deleted harness, whose
+// `readBitFiles` swallowed `error.FileNotFound` and let the deleted `mutate`
+// module fuzz a 1-byte random buffer forever while reporting success.
+//
+//   BIT_FUZZ_BIN        compiler under test        (default bit-out/bin/bit)
+//   BIT_FUZZ_CASES      seed corpus directory      (default _tests_/cases)
+//   BIT_FUZZ_CRASHES    saved-crash corpus         (default _tests_/fuzz/crashes)
+//   BIT_FUZZ_WORK       scratch directory          (default /tmp/bit-fuzz)
+//   BIT_FUZZ_SECONDS    wall-clock budget, > 0     (default 60)
+//   BIT_FUZZ_SEED       PRNG seed, for replay      (default the wall clock)
+//   BIT_FUZZ_TIMEOUT_MS per-input budget FLOOR     (default 10000)
+//   BIT_FUZZ_HANG_MS    non-termination ceiling    (default 120000)
+
+import { readFile, writeFile, walk, exists, isDir, mkdir } from "std/fs"
+import { envOr, exit } from "std/os"
+import { monotonic, now, Second, Millisecond, since } from "std/time"
+import { hasSuffix, parseInt } from "std/strings"
+
+// --- bounds (Power of 10 rule 2: every loop below is provably finite) -------
+
+// Mutant size ceiling. The deleted `guard` module's `max_input_len`, kept
+// identical so a hash saved by either implementation names the same bytes.
+const maxInputLen: int = 65536
+
+// Point mutations applied per generated input. The deleted `mutate` module's
+// `max_mutations_per_input`.
+const maxMutationsPerInput: int = 8
+
+// Hard iteration backstop, independent of the deadline, in case the clock
+// misbehaves. The deleted `mutate` module's `max_iterations`.
+const maxIterations: int = 50000000
+
+// Upper bound on corpus entries read from one directory. The deleted `guard`
+// module's `max_dir_files`.
+const maxCorpusFiles: int = 4096
+
+// --- the hang budget (#2400) ------------------------------------------------
+//
+// The per-input deadline used to be one flat constant, calibrated against a
+// trivial input. _tests_/cases now holds seeds that `import ... from "std/http"`,
+// whose HONEST `bit check` costs ~11.5s on an idle machine against a 10s
+// budget, so the fuzzer classified a merely-slow input as a hang and wrote a
+// false artifact into the saved-crash corpus - which the next run then replayed
+// first, a ratchet. Raising the constant only moves the line: the corpus grows
+// on purpose, and the next std/*-importing seed re-breaks it.
+//
+// So EXCEEDING THE BUDGET IS A QUESTION, NOT A VERDICT. It re-runs the same
+// bytes once against `hangMs`, the line where "slow" ends and "does not
+// terminate" begins. Terminating on the second attempt means slow, not hung:
+// nothing is saved, and the time it actually took becomes that seed's
+// high-water mark, so every later mutant of that seed is budgeted at
+// `hangFactor` times a MEASURED compile rather than a guessed constant. A new
+// slow seed therefore costs one adjudication, not a red gate. A genuine
+// infinite loop still elapses both budgets and is still saved and reported.
+//
+// Headroom over the measured high-water mark. Large because a mutant may
+// legitimately reach a slower path than its seed, and because this machine runs
+// several build agents at once - a load-inflated compile must not read as a
+// hang.
+const hangFactor: int = 8
+
+// Default `hangMs`. Well under the runtime's own `osBoundedMaxMs` ceiling.
+const defaultHangMs: int = 120000
+
+// Adjudicating a slow input is not fuzzing, so its cost is credited back to the
+// wall-clock budget - otherwise one slow seed silently shortens the campaign to
+// a handful of iterations. Capped so the credit itself stays bounded.
+const slowCreditCapMs: int = 120000
+
+// --- failure ----------------------------------------------------------------
+
+// The only exit path for a red run. Every fallible call in this file ends here.
+fn die(msg: string) {
+  print("FAIL: ${msg}\n")
+  exit(1)
+}
+
+fn mustRead(path: string): string {
+  return readFile(path) catch e {
+    die("read ${path}: ${e.message()}")
+    ""
+  }
+}
+
+fn mustWrite(path: string, content: string) {
+  writeFile(path, content) catch e {
+    die("write ${path}: ${e.message()}")
+  }
+}
+
+fn mustInt(name: string, fallback: int): int {
+  let raw = envOr(name, "")
+  if (len(raw) == 0) {
+    return fallback
+  }
+  return parseInt(raw) catch e {
+    die("${name}=${raw} is not an integer: ${e.message()}")
+    0
+  }
+}
+
+// --- PRNG -------------------------------------------------------------------
+//
+// xorshift64. std/rand does not exist, and the deleted `mutate` module seeded
+// its own PRNG from the wall clock, so a red run there was only reproducible
+// through the saved file. Here the seed is an input and is always echoed.
+//
+// State lives in a one-element slice because Bit structs are value types
+// (stdlib/strings/builder.bit): a slice element is the shortest thing a callee
+// can actually write through.
+
+fn nextU64(st: []u64): u64 {
+  let x = st[0]
+  x = x ^ (x << 13)
+  x = x ^ (x >> 7)
+  x = x ^ (x << 17)
+  st[0] = x
+  return x
+}
+
+// Uniform enough for point mutations; the modulo bias over an n far below 2^64
+// cannot matter to the choice of a byte offset.
+fn nextBelow(st: []u64, n: int): int {
+  if (n <= 1) {
+    return 0
+  }
+  return int(nextU64(st) % u64(n))
+}
+
+fn nextByte(st: []u64): u8 {
+  return u8(int(nextU64(st) % u64(256)))
+}
+
+// --- hashing ----------------------------------------------------------------
+
+// The deleted `guard` module's line 167, ported verbatim, so a crash harvested
+// here and one harvested by the deleted implementation land on the same
+// filename.
+fn fnv1a64(bytes: string): u64 {
+  let h = u64(14695981039346656037)
+  let i = 0
+  while (i < len(bytes)) {
+    h = h ^ u64(bytes[i])
+    h = h * u64(1099511628211)
+    i = i + 1
+  }
+  return h
+}
+
+fn hex16(v: u64): string {
+  const digits = "0123456789abcdef"
+  let out = []byte(0)
+  let i = 0
+  while (i < 16) {
+    let nib = int((v >> u64(60 - 4 * i)) & u64(15))
+    out = append(out, digits[nib])
+    i = i + 1
+  }
+  return string(out)
+}
+
+// --- mutation ---------------------------------------------------------------
+//
+// The deleted `mutate` module's lines 83-110, unchanged: byte flip / insert /
+// delete, 1..8 per input.
+
+fn insertAt(b: []byte, pos: int, v: u8): []byte {
+  let out = []byte(0)
+  let i = 0
+  while (i < pos) {
+    out = append(out, b[i])
+    i = i + 1
+  }
+  out = append(out, v)
+  while (i < len(b)) {
+    out = append(out, b[i])
+    i = i + 1
+  }
+  return out
+}
+
+fn deleteAt(b: []byte, pos: int): []byte {
+  let out = []byte(0)
+  let i = 0
+  while (i < len(b)) {
+    if (i != pos) {
+      out = append(out, b[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn mutate(seed: string, st: []u64): string {
+  let b = []byte(0)
+  let i = 0
+  let n = len(seed)
+  if (n > maxInputLen) {
+    n = maxInputLen
+  }
+  while (i < n) {
+    b = append(b, u8(seed[i]))
+    i = i + 1
+  }
+  if (len(b) == 0) {
+    b = append(b, nextByte(st))
+  }
+
+  let rounds = 1 + nextBelow(st, maxMutationsPerInput)
+  let r = 0
+  while (r < rounds) {
+    let op = nextBelow(st, 3)
+    if (op == 0) {
+      b[nextBelow(st, len(b))] = nextByte(st)
+    } else if (op == 1) {
+      if (len(b) < maxInputLen) {
+        b = insertAt(b, nextBelow(st, len(b) + 1), nextByte(st))
+      }
+    } else {
+      if (len(b) > 1) {
+        b = deleteAt(b, nextBelow(st, len(b)))
+      }
+    }
+    r = r + 1
+  }
+  return string(b)
+}
+
+// --- corpus -----------------------------------------------------------------
+
+// Every `*.bit` file under `dir`. A missing or unreadable directory is fatal,
+// never an empty list: the deleted `guard` module returned an empty slice for
+// a missing directory and the deleted `mutate` module then fuzzed a random
+// 1-byte buffer forever, green.
+fn bitFilesIn(dir: string): []string {
+  if (!exists(dir) || !isDir(dir)) {
+    die("not a directory: ${dir}")
+  }
+  let all = walk(dir) catch e {
+    die("walk ${dir}: ${e.message()}")
+    []string(0)
+  }
+  let out = []string(0)
+  for p of all {
+    if (hasSuffix(p, ".bit")) {
+      if (len(out) >= maxCorpusFiles) {
+        die("corpus exceeds ${maxCorpusFiles} files: ${dir}")
+      }
+      out = append(out, p)
+    }
+  }
+  return out
+}
+
+// --- child ------------------------------------------------------------------
+//
+// `osRunBounded` takes a path and no argv, so the compiler invocation is a
+// generated wrapper. `exec` is the LAST and ONLY command: any trailing
+// statement would replace the compiler's status with the shell's and make every
+// crash invisible. The redirection is part of the exec'd command, not a second
+// one - the diagnostics for the input still on disk stay in `<work>.log`, and
+// the status reaching the parent is still the compiler's.
+
+fn writeRunner(path: string, bin: string, work: string) {
+  mustWrite(path, "#!/bin/sh\nexec \"${bin}\" check \"${work}\" >\"${work}.log\" 2>&1\n")
+  if (fsChmod(path, 493) != 0) {
+    die("chmod +x failed: ${path}")
+  }
+}
+
+// Everything a bounded `bit check` needs: the generated wrapper, the file the
+// wrapper reads, where a triggering input is kept, and the two deadlines - the
+// budget floor a normal input is expected to beat, and the ceiling past which
+// an input is declared non-terminating.
+class Runner {
+  script: string
+  work: string
+  crashesDir: string
+  timeoutMs: int
+  hangMs: int
+
+  runFor(budgetMs: int): Attempt {
+    let start = monotonic()
+    let rc = osRunBounded(this.script, budgetMs)
+    return Attempt{ rc: rc, ms: since(start) / Millisecond }
+  }
+
+  // The budget for a seed whose confirmed-terminating high-water mark is
+  // `observedMs` (0 before any mutant of it has been adjudicated).
+  budgetFor(observedMs: int): int {
+    let b = observedMs * hangFactor
+    if (b < this.timeoutMs) {
+      b = this.timeoutMs
+    }
+    if (b > this.hangMs) {
+      b = this.hangMs
+    }
+    return b
+  }
+
+  // Re-runs the bytes already in `r.work` against the ceiling. Both outcomes are
+  // printed: an adjudication that stayed silent is how a false artifact became
+  // something two people deleted by hand instead of a thing anyone noticed.
+  adjudicate(what: string, firstMs: int): Slow {
+    print("slow: ${what} did not finish in ${firstMs}ms; re-running once against the ${this.hangMs}ms non-termination ceiling\n")
+    let a = this.runFor(this.hangMs)
+    if (a.rc == -2) {
+      return Slow{ hung: true, rc: a.rc, ms: a.ms }
+    }
+    print("slow: ${what} terminated in ${a.ms}ms (rc=${a.rc}): slow, not hung - nothing saved\n")
+    return Slow{ hung: false, rc: a.rc, ms: a.ms }
+  }
+
+  harvest(prefix: string): string {
+    let bytes = mustRead(this.work)
+    let path = "${this.crashesDir}/${prefix}-${hex16(fnv1a64(bytes))}.bit"
+    mustWrite(path, bytes)
+    return path
+  }
+
+  // Replays _tests_/fuzz/crashes/*.bit. The directory is legitimately empty today,
+  // so an empty replay is not a failure - but the COUNT is printed, because that
+  // is the only thing that distinguishes a clean corpus from a mistyped path, and
+  // a missing directory is fatal.
+  //
+  // A saved case that now merely compiles slowly is a PASS, so the adjudication
+  // applies here too: a 28-second replay cannot re-trip the budget that wrongly
+  // harvested it. That was the ratchet in #2400 - one bad artifact made every
+  // later run pay for it, first.
+  replayCrashes() {
+    let files = bitFilesIn(this.crashesDir)
+    print("regress: replaying ${len(files)} saved crash(es) from ${this.crashesDir}\n")
+    for f of files {
+      mustWrite(this.work, mustRead(f))
+      let a = this.runFor(this.timeoutMs)
+      if (a.rc == -2) {
+        let s = this.adjudicate("regress ${f}", a.ms)
+        if (s.hung) {
+          die("regress: ${f}: hang - the ${this.hangMs}ms ceiling elapsed too")
+        }
+        a = Attempt{ rc: s.rc, ms: s.ms }
+      }
+      let o = classify(a.rc)
+      if (!o.ok) {
+        die("regress: ${f}: ${o.label}")
+      }
+    }
+  }
+
+  // One `bit check` on a known-good program, before any mutant. Without it a
+  // broken BIT_FUZZ_BIN is only visible through the 126/127 branch, and only on
+  // shells that report it. Bounded by the ceiling rather than the floor: the
+  // question is "is the compiler reachable at all", and a program that terminates
+  // costs its own time whatever the budget says, so the generous bound buys
+  // immunity to a loaded machine for free.
+  preflight() {
+    mustWrite(this.work, "fn main() {\n  print(\"ok\")\n}\n")
+    let a = this.runFor(this.hangMs)
+    if (a.rc != 0) {
+      die("preflight: the runner rejected a known-good program (rc=${a.rc} after ${a.ms}ms); the compiler under test is not reachable")
+    }
+  }
+
+  fuzzLoop(seeds: []string, seed: u64, seconds: int): int {
+    let st = []u64(1)
+    st[0] = seed
+
+    // Per-seed high-water mark of a CONFIRMED terminating compile, in ms; zero
+    // until a mutant of that seed has been adjudicated. This is the measurement
+    // the budget scales from, so the corpus calibrates the fuzzer instead of the
+    // fuzzer's constant vetoing the corpus.
+    let slowMs = []int(len(seeds))
+
+    let deadline = monotonic().ns + seconds * Second
+    let credited = 0
+    let iterations = 0
+    while (iterations < maxIterations && monotonic().ns < deadline) {
+      let idx = nextBelow(st, len(seeds))
+      let src = mustRead(seeds[idx])
+      mustWrite(this.work, mutate(src, st))
+
+      let a = this.runFor(this.budgetFor(slowMs[idx]))
+      if (a.rc == -2) {
+        let s = this.adjudicate("iteration ${iterations} (seed ${seeds[idx]})", a.ms)
+        if (s.hung) {
+          let saved = this.harvest("hang")
+          die("iteration ${iterations}: hang - neither the budget nor the ${this.hangMs}ms ceiling saw it terminate; input saved as ${saved}")
+        }
+        if (s.ms > slowMs[idx]) {
+          slowMs[idx] = s.ms
+        }
+        if (credited < slowCreditCapMs) {
+          deadline = deadline + (a.ms + s.ms) * Millisecond
+          credited = credited + a.ms + s.ms
+        }
+        a = Attempt{ rc: s.rc, ms: s.ms }
+      }
+
+      let o = classify(a.rc)
+      if (o.fatal) {
+        die("iteration ${iterations}: ${o.label}")
+      }
+      if (!o.ok) {
+        let saved = this.harvest("crash")
+        die("iteration ${iterations}: ${o.label} - input saved as ${saved}")
+      }
+      iterations = iterations + 1
+    }
+    return iterations
+  }
+}
+
+// One bounded `bit check`, with the wall time it actually took. The elapsed
+// time is the whole point: it is the measurement the budget calibrates against,
+// and it is what tells "took 11s" apart from "never came back".
+class Attempt {
+  rc: int
+  ms: int
+}
+
+// The second opinion on an input that blew its budget. `hung` is the only
+// answer that justifies saving anything.
+class Slow {
+  hung: bool
+  rc: int   // the second attempt's raw code, when it terminated
+  ms: int   // and the wall time it took
+}
+
+class Outcome {
+  ok: bool     // the child terminated on its own - clean or with diagnostics
+  fatal: bool  // the HARNESS is broken; nothing was tested
+  label: string
+}
+
+// ABI.md §19's four branches, every one of them explicit. `-1` is the branch a
+// lazy classifier drops: it means fork/exec/wait failed, so the compiler was
+// never launched, and reading it as "not a crash" turns the whole run green
+// having executed nothing.
+fn classify(rc: int): Outcome {
+  if (rc == -1) {
+    return Outcome{ ok: false, fatal: true, label: "spawn failure (osRunBounded -1)" }
+  }
+  // Reached only if a caller forgot to adjudicate: every phase intercepts -2
+  // before classifying, because "over budget" alone is not a hang (#2400).
+  if (rc == -2) {
+    return Outcome{ ok: false, fatal: false, label: "over budget, unadjudicated" }
+  }
+  if (rc <= -100) {
+    return Outcome{ ok: false, fatal: false, label: "crash: signal ${-rc - 100}" }
+  }
+  // 126/127 are the shell's own "cannot execute" / "not found". The compiler
+  // never ran, so this is a broken harness wearing a normal exit code - the
+  // reachable twin of -1, since the runner script above always spawns.
+  if (rc == 126 || rc == 127) {
+    return Outcome{ ok: false, fatal: true, label: "runner could not exec the compiler (sh exit ${rc})" }
+  }
+  return Outcome{ ok: true, fatal: false, label: "exit ${rc}" }
+}
+
+// --- phases -----------------------------------------------------------------
+
+// --- entry ------------------------------------------------------------------
+
+fn main() {
+  let bin = envOr("BIT_FUZZ_BIN", "bit-out/bin/bit")
+  let casesDir = envOr("BIT_FUZZ_CASES", "_tests_/cases")
+  let crashesDir = envOr("BIT_FUZZ_CRASHES", "_tests_/fuzz/crashes")
+  let workDir = envOr("BIT_FUZZ_WORK", "/tmp/bit-fuzz")
+  let seconds = mustInt("BIT_FUZZ_SECONDS", 60)
+  let timeoutMs = mustInt("BIT_FUZZ_TIMEOUT_MS", 10000)
+  let hangMs = mustInt("BIT_FUZZ_HANG_MS", defaultHangMs)
+
+  if (seconds <= 0) {
+    die("BIT_FUZZ_SECONDS must be > 0; ${seconds} would report a green run of zero iterations")
+  }
+  if (timeoutMs <= 0) {
+    die("BIT_FUZZ_TIMEOUT_MS must be > 0")
+  }
+  // A ceiling below the floor would make every adjudication answer "hung"
+  // without ever giving the input more room than it already had - the exact
+  // false positive this pair exists to remove.
+  if (hangMs < timeoutMs) {
+    die("BIT_FUZZ_HANG_MS=${hangMs} is below BIT_FUZZ_TIMEOUT_MS=${timeoutMs}; the ceiling is a second opinion, not a tighter one")
+  }
+
+  // A zero seed is a xorshift64 fixed point - it would yield 0 forever - so it
+  // is replaced, and the replacement is what gets echoed.
+  let seed = u64(now().ns)
+  let rawSeed = envOr("BIT_FUZZ_SEED", "")
+  if (len(rawSeed) > 0) {
+    seed = u64(mustInt("BIT_FUZZ_SEED", 0))
+  }
+  if (seed == u64(0)) {
+    seed = u64(88172645463325252)
+  }
+
+  if (!exists(workDir)) {
+    mkdir(workDir) catch e {
+      die("mkdir ${workDir}: ${e.message()}")
+    }
+  }
+  let r = Runner{
+    script: "${workDir}/run.sh",
+    work: "${workDir}/work.bit",
+    crashesDir: crashesDir,
+    timeoutMs: timeoutMs,
+    hangMs: hangMs,
+  }
+  writeRunner(r.script, bin, r.work)
+
+  print("fuzz: compiler=${bin} seed=${seed} seconds=${seconds} timeout_ms=${timeoutMs} hang_ms=${hangMs}\n")
+
+  r.replayCrashes()
+  r.preflight()
+
+  let seeds = bitFilesIn(casesDir)
+  if (len(seeds) == 0) {
+    die("seed corpus ${casesDir} holds no .bit files; a random-byte generator is not a fuzzer")
+  }
+  print("fuzz: ${len(seeds)} seed inputs from ${casesDir}\n")
+
+  let iterations = r.fuzzLoop(seeds, seed, seconds)
+  print("PASS: ${iterations} inputs, 0 crashes, 0 hangs (seed=${seed}, replay with BIT_FUZZ_SEED=${seed})\n")
+}

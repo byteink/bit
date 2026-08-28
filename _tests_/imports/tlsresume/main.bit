@@ -1,0 +1,162 @@
+// std/tls session resumption + 0-RTT (RFC 8446 §2.3, §4.6.1, #1209). Drives a
+// full handshake, has the server issue a ticket, and resumes with it three
+// ways over an in-memory byte pipe — no sockets, same pattern as
+// _tests_/imports/tlsserver:
+//
+//   1. plain PSK-DHE resumption (no early data): the server must accept the
+//      PSK and skip Certificate/CertificateVerify entirely — asserted
+//      directly via `peerCertificates()` being empty, since that field is
+//      only ever populated by the Certificate-message branch of the client's
+//      auth-flight dispatch.
+//   2. 0-RTT accepted: the client sends early application data in the same
+//      flight as its ClientHello; the server decrypts and delivers it before
+//      the handshake finishes, and both sides still complete the handshake
+//      (EndOfEarlyData + Finished) and exchange ordinary application data
+//      afterward.
+//   3. 0-RTT rejected: the server has early data turned off (but the PSK
+//      itself is still valid), so the client's speculative early data is
+//      never decrypted; the client falls back to resending the same payload
+//      as ordinary 1-RTT application data once connected.
+//
+// *** 0-RTT data is replayable (RFC 8446 §8) — see stdlib/tls/resume.bit's
+// header comment. This module implements no anti-replay defense; an
+// application must only ever put idempotent requests in early data. ***
+import { decodeHex, pemEncode } from "std/crypto"
+import {
+  TrustStore, newTrustStore,
+  TlsClientConfig, TlsClientHandshake, TlsClientConn, tlsClientStart, tlsClientStartResume,
+  TlsServerConfig, newTlsServerConfig, TlsServerHandshake, TlsServerConn, tlsServerStart,
+  TlsGroup, GroupKeypair,
+  SessionTicket, newSessionTicket, parseNewSessionTicket,
+} from "std/tls"
+
+const caHex: string = "308203343082021ca00302010202147a41595b201213a150211bd80e3675b37dca46b1300d06092a864886f70d01010b050030323119301706035504030c10426974205465737420526f6f7420434131153013060355040a0c0c426974205465737420504b49301e170d3236303731313131343535385a170d3336303730383131343535385a30323119301706035504030c10426974205465737420526f6f7420434131153013060355040a0c0c426974205465737420504b4930820122300d06092a864886f70d01010105000382010f003082010a028201010098f8ba065685597f71734c9b91a2776948f635bb81fe386746877777af0a4b0393bbf34f7a6119438154454faab68f647d782771af85495d063bae956ab80e81a6d1d7b25a67d4e34f2c2702a36e56aebdcf53c6b63a5ac5279c7c5a655c9f21ce2937ed8c097003af0ac87edac572a6fe169bb25c4fc0030513e0702f1a42c7274f294dd0e1f625310b21ca28a42062bf03b3fc7a27237ae4baf4511f8015a221dc53b2462facfb403e928338096e617c344e9084ec2070594db0541f88beea9d643d8e6a7bf58047ae3e81fc2745344c44ea739918fe3f976f9ff79a64beb947ea65a83e7c63250064de1f38a59e48beef30c135d96aebe07b2f7bb27c9e730203010001a3423040300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106301d0603551d0e04160414df41e90ebf24804aaa0ef33e59374d14c3d17adb300d06092a864886f70d01010b0500038201010054d76a48852a9d62ba2a670d689bafcba37d3f7d3bc904fd867a494dba087bc5b846d215ab0450512d846f341e40808a003f88496e0fd4d59924f422af7c2604cbe6157782f71f45b029cdced03a7ecd1790abc3d5d832316596df9bbe6b893c610ae171feda2b3c67827158f3a082c81ce6b4ab6b74fa35a2d85e0015b447b0ed6425e9e72d82b1a0ba631ce3fc9b2f35a40dc5317b4ca74cd8b43ff0d086a55e9dcd6b727ac7478678536568352e4bcae334b2e1d72518cbacd37c9062073bc9e937373b2202a9c1782b485071257eddc7af78a1c5503559fc2f1a6e0e39625aa85ccf90f881318f55c3fc0b9e05440aecb12220ddf921f961ebb7580aff6b"
+const leafHex: string = "308203833082026ba003020102021414c7140ea3acd77bf06dc5820f6a01a116e5187f300d06092a864886f70d01010b050030323119301706035504030c10426974205465737420526f6f7420434131153013060355040a0c0c426974205465737420504b49301e170d3236303731313131343535385a170d3336303730383131343535385a302c3112301006035504030c096c6f63616c686f737431163014060355040a0c0d4269742054657374204c65616630820122300d06092a864886f70d01010105000382010f003082010a0282010100dd84b94dc3c7f6812fd9cf5510d2bb39a591054abdb85ef809d1d2353165b98a73a3103c7a98e7abb1b93cbe3d768c827b054697ab80cb36896f3bf94c5e1cbb115d09948f063126d6b0696679630313b5edc386fb58c8b40210418821f7d6ab8f7c2cb313b78b039d27c6fb07131434d7fa4a1513881f53e7cdba9b9055341300085ba30a4ebcd69367d088b6eda97b62df743ce343050cac87d12462dc5b05f419e5d384098cb3ef1c17b41b276473ecd16dbb0aac68d2330cd9312cb99b1b4e0ff671fc745726abf76d0eddbc49179188a00fb5d4d72b3bcea0fd14f8e97ce036631e55516f653faaec62baad58bc09460749750b23e1fa4bd6be1033d45f0203010001a3819630819330090603551d1304023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b0601050507030130210603551d11041a301882096c6f63616c686f7374820b6578616d706c652e636f6d301d0603551d0e04160414420e26d56f5890db5c5af8acd12d8156b58b91d8301f0603551d23041830168014df41e90ebf24804aaa0ef33e59374d14c3d17adb300d06092a864886f70d01010b05000382010100047da02b5b77beaa777d0efcc2bba1e46bc92714e7a75385f58af99f75441123a372d565e5009b472ba7f76bc7be854b968a04687e6f6840b5fa0b830aeadee63f8795cf675f6cb8bd5226205f0aedf3465ed578893627939b390f09bd33d34189ab61f064b0fe566bdd5cb9e5b78cb638fb2540eaee946a77fa780342643c10584b9b0f87d9001751bb25e6a3ee4a03a971160eb24ae80d2ed015d348eefb8e55444d7d05a7fe04e069a26bcaab1ca97ad82d9e25201f7bc81fec23143a9af66572595aef86aa1f34a57584cc7ef4a5e3e2f4ffd543b776d232dd37a00ff272c13f6dfe3fc9f2a472a2d7c6738399a11b0417e004874baf20405fba9cba214b"
+const keyHex: string = "308204be020100300d06092a864886f70d0101010500048204a8308204a40201000282010100dd84b94dc3c7f6812fd9cf5510d2bb39a591054abdb85ef809d1d2353165b98a73a3103c7a98e7abb1b93cbe3d768c827b054697ab80cb36896f3bf94c5e1cbb115d09948f063126d6b0696679630313b5edc386fb58c8b40210418821f7d6ab8f7c2cb313b78b039d27c6fb07131434d7fa4a1513881f53e7cdba9b9055341300085ba30a4ebcd69367d088b6eda97b62df743ce343050cac87d12462dc5b05f419e5d384098cb3ef1c17b41b276473ecd16dbb0aac68d2330cd9312cb99b1b4e0ff671fc745726abf76d0eddbc49179188a00fb5d4d72b3bcea0fd14f8e97ce036631e55516f653faaec62baad58bc09460749750b23e1fa4bd6be1033d45f02030100010282010053f3b89cb9bdbf74ff730f4a2069950e486ab93435c9b9a84c646a43c198596498e5ac42177e7a928df4f389efd64d7327f77c64ffd8fc6b0b540e4931819b66e4323beec2f3a84e1d605759c0585f72a968d649025a081a7c8bb7a245a95d80c08ce18deec3895a51c5a0fa43189e785680237270680ee3683f06616da674e8a800b2f02407bdb4387b9327dcd25e4b56494b53d3200b747c7b9b9a6c3743d32cf8db1c054d53d8f77f390ea1eb18b0117b2030a5a814b126ba7f9f8f8fa09a47764c9c1504d29dc150e8f9a429ca224fc01bd058dc96f834b4abb8ddec9b683294ff497e7a12c1bb781691a4f8c016c717c1df670f54170f35fa6b6b2b93e102818100f03148423002e1af8bc190ef471c0e8c034d384eee72a1f248024b376bf6a9f5fa4f4c456842555bdba25d9a084064c47ff309a743f10ac601949d974040fde3e6d3aa26ecb879da1ebae9d7a5ea7a56f1c93a865ceba4142c76e61818e4701337781b8d7b40107b74e778baec4de7e18eefd5654253df8dcd72060ab16b1c6102818100ec18d31b05ed52b2d3af035b09d96aae44b314d1826da682b1e7d09ec06d902db557a27f6961912a9e6183e8beabd493159e351ef4b03e16a140acab1bd5c30c98ff352d03e70367377315c929e692ba8601ba04ac81a84076197ca27a2fb3b21626684671625862c1fd2a5837113478382bab281de3626bd642ea1136eaa8bf0281804cd3568b6513e6dfe151be6bea50bd0e6797f164bdbc08b497f7b3db3c3b1f4dc00c5116fa2c0d655e30e6c377d430e6f10de98e889ab69972b3f85c027f4735f804c7adbf9599d3fc74488b635446613ce0e2494bbb4b35f0aaef19d20c6f14966f6250b4955f303dca33c18607bd1d563cbc02b15e6668d2c79fcb17c86cc1028181008e0488c81292a552489f5807652f514aaeac82735c5f94efbd10529f8be4dbfb82bfca519614487c38753421c6c019c8b81248a5ec4e2faaf128b434e1337e768f79c484e57a0ac405c8c66c11364f40bfe73dfc1dc08872ee177aaf498c742d45c1a8abe6fc5f6a58826efc4d739dfa4adf89bf41eb4b82ce89c5bec127fa8502818100c51caa1667cb86c3cf5dc084bda1a0a508b3c8929eb4ec4733c5b7cea3f905df22ef4f9e851c8c742f162e8f660efee8993e71d9c658ceea61ee4ee7a146ab1c6201cc892537cacd1df3e4a5169c639f6c8778e76b067ac4cc28471ecb2694550e85b19c202217ce4347477a06baf3de929aa1deed6202fc3b73eddbf541ffc4"
+
+fn hx(s: string): []byte { return decodeHex(s) catch e { return []byte(0) } }
+fn pemOf(label: string, h: string): string { return pemEncode(label, hx(h)) }
+fn bytesEq(a: []byte, b: []byte): bool {
+  if (len(a) != len(b)) { return false }
+  let i = 0
+  while (i < len(a)) { if (a[i] != b[i]) { return false }; i = i + 1 }
+  return true
+}
+
+// The paired connection endpoints a completed handshake yields.
+class Endpoints { cconn: TlsClientConn, sconn: TlsServerConn }
+
+// Drive an already-started client/server pair through the rest of the
+// handshake to completion. Shared by a fresh handshake and a resumed one —
+// only how `c`/`s` were started differs.
+fn drive(c: TlsClientHandshake, s: TlsServerHandshake): Endpoints! {
+  let sstep = s.processClientHello(c.hello)?
+  let guard = 0
+  while (sstep.retry && guard < 2) {
+    let cs = c.processServerFlight(sstep.outbound)?
+    sstep = s.processClientHello(cs.outbound)?
+    guard = guard + 1
+  }
+  let cstep = c.processServerFlight(sstep.outbound)?
+  let sconn = s.processClientFinished(cstep.outbound)?
+  return Endpoints{ cconn: c.connection()?, sconn: sconn }
+}
+
+// A fresh (non-resumed) handshake.
+fn handshake(clientCfg: TlsClientConfig, serverCfg: TlsServerConfig): Endpoints! {
+  let c = tlsClientStart(clientCfg)?
+  let s = tlsServerStart(serverCfg)?
+  return drive(c, s)?
+}
+
+// A resumed handshake plus everything a caller needs to inspect the outcome:
+// both handshake state machines (for `pskWasAccepted`/`earlyDataWasAccepted`/
+// `earlyDataReceived`) alongside the completed endpoints.
+class Resumed { c: TlsClientHandshake, s: TlsServerHandshake, ep: Endpoints }
+
+fn resume(
+  clientCfg: TlsClientConfig,
+  serverCfg: TlsServerConfig,
+  session: SessionTicket,
+  earlyData: []byte,
+): Resumed! {
+  let c = tlsClientStartResume(clientCfg, session, earlyData)?
+  let s = tlsServerStart(serverCfg)?
+  let ep = drive(c, s)?
+  return Resumed{ c: c, s: s, ep: ep }
+}
+
+fn baseClient(trust: TrustStore): TlsClientConfig {
+  return TlsClientConfig{
+    serverName: "localhost",
+    alpn: ["h2"],
+    trust: trust,
+    insecureSkipVerify: false,
+    nowUnix: 1800000000,
+    groups: [TlsGroup.X25519],
+    keyShareGroups: []TlsGroup(0),
+    suites: []int(0),
+    clientHelloOverride: []byte(0),
+    ephemeralOverride: []GroupKeypair(0),
+  }
+}
+
+// Complete a full handshake, have the server issue a ticket, and hand it to
+// the client — the "obtain a ticket to resume with" step every scenario needs.
+fn getTicket(clientCfg: TlsClientConfig, serverCfg: TlsServerConfig): SessionTicket! {
+  let full = handshake(clientCfg, serverCfg)?
+  let ticketRecord = full.sconn.issueTicket()?
+  let pt = full.cconn.openApp(ticketRecord)?
+  println("ticket: postHandshakeMsgType=${pt.contentType}")
+  let nst = parseNewSessionTicket(pt.content)?
+  return newSessionTicket(nst, full.cconn)
+}
+
+fn run(): ()! {
+  let trust = newTrustStore(pemOf("CERTIFICATE", caHex))?
+  let serverCfg = newTlsServerConfig(pemOf("CERTIFICATE", leafHex), pemOf("PRIVATE KEY", keyHex), ["h2"])?
+  let clientCfg = baseClient(trust)
+
+  // --- 1. full handshake -> ticket -> plain PSK-DHE resumption ---
+  let session = getTicket(clientCfg, serverCfg)?
+  let r1 = resume(clientCfg, serverCfg, session, []byte(0))?
+  println("resume: pskAcceptedClient=${r1.c.pskWasAccepted()} pskAcceptedServer=${r1.s.pskWasAccepted()}")
+  println("resume: certificateSkipped=${len(r1.ep.cconn.peerCertificates()) == 0}")
+  let toServer1 = r1.ep.cconn.sealApp([]byte("GET /resumed HTTP/1.1"))?
+  let atServer1 = r1.ep.sconn.openApp(toServer1)?
+  println("resume: c2s='${string(atServer1.content)}'")
+  let toClient1 = r1.ep.sconn.sealApp([]byte("HTTP/1.1 200 OK"))?
+  let atClient1 = r1.ep.cconn.openApp(toClient1)?
+  println("resume: s2c='${string(atClient1.content)}'")
+
+  // --- 2. a second ticket, this time driving 0-RTT ---
+  let session2 = getTicket(clientCfg, serverCfg)?
+  let earlyPayload = []byte("GET /early HTTP/1.1")
+
+  // 2a. accepted: server has early data on (the default).
+  let r2 = resume(clientCfg, serverCfg, session2, earlyPayload)?
+  println("0rtt-accept: pskAccepted=${r2.c.pskWasAccepted()}")
+  println("0rtt-accept: certificateSkipped=${len(r2.ep.cconn.peerCertificates()) == 0}")
+  println("0rtt-accept: serverAccepted=${r2.s.earlyDataWasAccepted()} clientSawAccepted=${r2.c.earlyDataAccepted}")
+  println("0rtt-accept: earlyDataMatch=${bytesEq(r2.s.earlyDataReceived(), earlyPayload)}")
+  let toServer2 = r2.ep.cconn.sealApp([]byte("post-handshake ping"))?
+  let atServer2 = r2.ep.sconn.openApp(toServer2)?
+  println("0rtt-accept: postHandshake='${string(atServer2.content)}'")
+
+  // 2b. rejected: same ticket, but this server now declines early data (a
+  // realistic operator toggle — resumption itself still works). The client
+  // sends the same speculative early data; the server never decrypts it since
+  // it never echoes early_data, so the client falls back to resending it as
+  // ordinary 1-RTT application data once connected.
+  serverCfg.allowEarlyData = false
+  let r3 = resume(clientCfg, serverCfg, session2, earlyPayload)?
+  println("0rtt-reject: pskAccepted=${r3.c.pskWasAccepted()}")
+  println("0rtt-reject: certificateSkipped=${len(r3.ep.cconn.peerCertificates()) == 0}")
+  println("0rtt-reject: serverAccepted=${r3.s.earlyDataWasAccepted()} clientSawAccepted=${r3.c.earlyDataAccepted}")
+  println("0rtt-reject: serverEarlyDataLen=${len(r3.s.earlyDataReceived())}")
+  let fallback = r3.ep.cconn.sealApp(earlyPayload)?
+  let atServerFallback = r3.ep.sconn.openApp(fallback)?
+  println("0rtt-reject: fallbackMatch=${bytesEq(atServerFallback.content, earlyPayload)}")
+}
+
+fn main() { run() catch e { println("error: ${e.message()}") } }

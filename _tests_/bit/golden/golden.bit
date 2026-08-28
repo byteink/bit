@@ -1,0 +1,476 @@
+// Golden-case gate, written in Bit — the replacement for the deleted
+// harness `harness`.
+//
+// For every `*.bit` in the corpus directory, the compiler's observable output
+// in that file's line-1 directive must byte-match the sibling `*.expected`.
+// That is an ABSOLUTE oracle: unlike the ten `scripts/selfhost-diff*.sh`
+// differentials (which compare the seed against the self-hosted compiler and
+// therefore evaporate the day the seed retires), this corpus pins what the
+// compiler must actually SAY. The `// error` cases are the only place in the
+// repo that pins rendered diagnostic text; `expectedCounts` holds their count.
+//
+// Everything here drives the shipped `bit` CLI as a subprocess. The deleted
+// harness ran six of the nine directives in-process, calling straight into
+// the deleted seed compiler's functions since both were the same language;
+// `compiler/` exports almost nothing, so an in-process Bit port is not
+// possible until `export` markers land on the dump entry points. Driving the
+// CLI is not merely a workaround: it is the path a real user takes, and it is
+// the only surface that still exists after `seed/` is deleted.
+//
+// PARALLELISED (#1901), THREE PHASES, NOT ONE INTERLEAVED LOOP. Stage every
+// case's job(s) (write the `/bin/sh` wrapper scripts, no execution yet — see
+// _tests_/bit/gatefanout for why: `bit_rt_os_run_bounded` is not re-entrant, so
+// this process makes exactly ONE such call for the whole corpus), run that
+// one driver (concurrency happens entirely inside its generated shell, via
+// `xargs -P`), then grade every case by reading its jobs' captured output
+// back. Grading is ordinary serial Bit code with no `spawn` anywhere in this
+// harness, so two cases' failures can never interleave and the report never
+// depends on which case's subprocess happened to finish first — both stage
+// and grade visit `cases` in the corpus's own sorted discovery order.
+//
+// NON-VACUITY IS THE POINT. This repo has shipped guards that passed over
+// empty input sets. Four floors, each strictly stronger than the deleted
+// harness's original:
+//
+//   1. `BIT_CASES_DIR` and `BIT_BIN` have NO defaults. Unset is a failure, not
+//      a silent walk of ".".
+//   2. The per-directive census is pinned exactly (`expectedCounts` below).
+//      The deleted harness's only bound was `scanned < max_cases`, which 0
+//      satisfies. Adding or deleting a case must edit this table in the same
+//      commit.
+//   3. Orphans are detected BOTH ways: every `.bit` needs a readable
+//      `.expected` AND every `.expected` needs a `.bit`. The deleted harness only
+//      checked the first, so a renamed case left dead weight behind.
+//   4. A wrapper that never reached its `exec` leaves no redirect file. That
+//      is a hard, named failure — never "the program errored, as expected".
+//      An `// error` case compares rendered TEXT, never just an exit code.
+//
+// An unrecognised line-1 directive is a hard failure, and prefix order is
+// significant: `// panic-debug`, then `// panic`, then `// run` (a
+// `startsWith` ordering bug would silently downgrade one to the other).
+//
+// NO CASE MAY FAIL. There is no permitted-failure list and no way to add one:
+// a case that differs from its `.expected` fails the run. The corpus used to
+// carry an expected-divergence file so a known defect could be written down
+// instead of fixed; its last entry closed with #1882 and the file and its reader
+// went with it (#1883). Fixing the compiler is the only way to make this green.
+//
+// Usage:
+//   BIT_CASES_DIR=$PWD/_tests_/cases BIT_BIN=$PWD/bit-out/bin/bit \
+//   BIT_STDLIB=$PWD/stdlib bit run _tests_/bit/golden
+
+import { env, envOr, exit } from "std/os"
+import { readFile, readDir, exists, mkdir } from "std/fs"
+import { hasPrefix, hasSuffix, indexOf, trimSpace, parseInt } from "std/strings"
+import { newFanCfg, runDriver } from "../gatefanout"
+
+// Directive ids. Order is the census order below; it is not the match order.
+const dRun: int = 0
+const dPanic: int = 1
+const dErr: int = 2
+const dFmt: int = 3
+const dTypes: int = 4
+const dTokens: int = 5
+const dAst: int = 6
+const dIr: int = 7
+const dLint: int = 8
+const dDoc: int = 9
+const dPanicDebug: int = 10
+const dCount: int = 11
+
+// Exit code the runtime uses for every panic (SPEC.md §18.4). Matched exactly
+// rather than "nonzero", so a crash cannot pass as a panic.
+const panicExit: int = 2
+
+// `osRunBounded`'s own ceiling (runtime/root/*/os.bit `osBoundedMaxMs`).
+// `BIT_TEST_TIMEOUT_S=0` means "do not bound", which here is this maximum.
+const maxTimeoutMs: int = 6000000
+const defaultTimeoutS: int = 300
+
+// Per-case rationale for why the census below changed lives in that case's own
+// `.bit` header under _tests_/cases/ (the convention the newest fixtures already
+// follow) — never here. This preamble used to carry a `+1 run case: …` entry
+// for every case ever added, which cannot coexist with a file whose
+// test-filesize budget only shrinks; each entry was confirmed present in its
+// fixture's own header before being deleted from here (#2862). Two things
+// about the *number itself*, rather than any one case, still belong here
+// because other tickets cite them by name.
+//
+// THE STANDING RULE for where a new case may live, recorded here because this
+// is the file a new case gets added to: a case asserting a diagnostic NO
+// RELEASED COMPILER EMITS cannot live in _tests_/cases/ — it turns the corpus
+// differential red by construction, and repinning stage0 cannot fix it when
+// the fix is newer than the newest release. Route it to _tests_/bit/ behind a
+// registered gate (a Step in tools/build/defs.bit AND a Gate in
+// tools/build/gates.bit; an unregistered harness runs never). A case asserting
+// ACCEPTANCE — the MISSING direction, which does not gate — stays here with
+// the corpus. (_tests_/bit/genericdiag.bit and _tests_/bit/checkerdiag.bit are
+// where the rejection halves that this rule sent away actually live, and both
+// explain their own placement in full.)
+//
+// NOTE ON THIS NUMBER. Six branches added cases in parallel and each bumped
+// this line in isolation, so every branch's own value was wrong at merge time
+// (strings said 185, json 181, fs 183). It is not arithmetic on any one
+// branch's delta — it is the count of `// run` first lines actually present in
+// _tests_/cases/, which is what the harness compares against.
+fn expectedCounts(): []int {
+  let c = []int(dCount)
+  // Derived post-merge (task-3762 x main) via
+  // `for f in _tests_/cases/*.bit; do head -1 "$f"; done | sort | uniq -c`:
+  // main alone was dRun=323/dErr=140; task-3762 deletes 1 run case
+  // (run_prim_alias_method.bit) and 4 error cases (check_generic_method_arity,
+  // check_naked_method, check_nosplit_method, check_symbol_attr_method) whose
+  // premise the receiver-form removal makes permanently unreachable.
+  // #3371 (init) then adds 2 run cases, giving 324. main said 322,
+  // task-3371-init said 325; both were right on their own base and wrong
+  // here. Derived with the uniq -c command above.
+  // #3370 (trait fields) then adds 3 run cases and 1 error case, giving
+  // dRun=327/dErr=137. main said 324/136, task-3370-trait-fields said
+  // 326/141 -- its dErr was cut before #3762 deleted 4 error cases, so
+  // taking either side would have been wrong by 1 and by 4 respectively.
+  // #3810 then adds 1 run case and 1 ir case, giving dRun=328/dIr=5. main
+  // said 327, task-3810 said 323 (its base predates this wave). Derived with
+  // the uniq -c command above.
+  c[dRun] = 328
+  c[dPanic] = 27
+  c[dErr] = 137
+  c[dFmt] = 10
+  c[dTypes] = 5
+  c[dTokens] = 1
+  c[dAst] = 1
+  c[dIr] = 5
+  c[dLint] = 43
+  c[dDoc] = 1
+  // #3087: 4 `overflow_trap_*_debug.bit` cases (`// panic-debug`); their 4
+  // `overflow_trap_*_release.bit` siblings are ordinary `// run` cases,
+  // already counted in dRun above.
+  c[dPanicDebug] = 4
+  return c
+}
+
+class Ctx {
+  casesDir: string,
+  bin: string,
+  scratch: string,
+  timeoutMs: int,
+  failures: int,
+  // Failure text is always printed now; `quiet` and `lastWhy` remain because
+  // `expectText` writes them, and a captured reason is what the diff line reads.
+  quiet: bool,
+  lastWhy: string,
+}
+
+class RunOut {
+  code: int,
+  out: string,
+  err: string,
+}
+
+// --- reporting -------------------------------------------------------------
+
+// Every failure names the case and the directive; nothing is ever counted
+// without being printed, so a red run says which case and why. Grading is
+// single-threaded Bit code (see the header), so this mutation is never
+// concurrent — no lock, no interleaving hazard.
+fn failCase(c: Ctx, name: string, what: string, why: string) {
+  c.failures = c.failures + 1
+  c.lastWhy = "[${what}] ${why}"
+  if (c.quiet) {
+    return
+  }
+  eprint("golden: FAIL ${name} [${what}]: ${why}\n")
+}
+
+// Prints a bounded, readable diff of two byte strings.
+fn reportDiff(c: Ctx, expected: string, actual: string) {
+  if (c.quiet) {
+    return
+  }
+  eprint("  expected (${len(expected)} bytes):\n${clip(expected)}\n")
+  eprint("  actual   (${len(actual)} bytes):\n${clip(actual)}\n")
+}
+
+fn clip(s: string): string {
+  if (len(s) <= 600) {
+    return s
+  }
+  return s[0:600] + "\n  ...[truncated]"
+}
+
+// --- directive parsing -----------------------------------------------------
+
+fn firstLine(src: string): string {
+  let nl = indexOf(src, "\n")
+  let line = src
+  if (nl >= 0) {
+    line = src[0:nl]
+  }
+  if (len(line) > 0 && line[len(line) - 1] == 13) { // \r
+    line = line[0:len(line) - 1]
+  }
+  return trimSpace(line)
+}
+
+// The mandatory `exit=<0|1|2>` on a `// lint` line. Lint has three meaningful
+// exit codes and a stderr diff alone cannot tell them apart (spec/LINT.md §8),
+// so the value is asserted, never defaulted. -1 means malformed.
+fn lintExitCode(line: string): int {
+  let at = indexOf(line, "exit=")
+  if (at < 0) {
+    return 0 - 1
+  }
+  let digits = trimSpace(line[at + 5:len(line)])
+  let v = parseInt(digits) catch _ {
+    return 0 - 1
+  }
+  if (v < 0 || v > 2) {
+    return 0 - 1
+  }
+  return v
+}
+
+// `bit check` renders a single-file module's path as `./<name>` because the
+// loader joins the canonicalised root dir onto the file name. The `.expected`
+// corpus was written against the seed's in-process API, which was handed the
+// bare name. Only the `-->` location header is rewritten, and only that exact
+// prefix, so no diagnostic body text can be caught by it. Delete this the day
+// the loader stops prefixing, or the day `compiler/` exports its renderer.
+fn stripDotSlash(s: string): string {
+  let needle = " --> ./"
+  let repl = " --> "
+  let out = ""
+  let rest = s
+  while (true) {
+    let at = indexOf(rest, needle)
+    if (at < 0) {
+      return out + rest
+    }
+    out = out + rest[0:at] + repl
+    rest = rest[at + len(needle):len(rest)]
+  }
+}
+
+// --- shared comparison -------------------------------------------------------
+
+fn expectText(c: Ctx, name: string, what: string, expected: string, actual: string) {
+  if (expected == actual) {
+    return
+  }
+  failCase(c, name, what, "output does not match .expected")
+  reportDiff(c, expected, actual)
+}
+
+// `// run`, `// panic` and `// panic-debug` all compile then execute; only
+// the build argv and pass/fail contract differ between them (stage.bit /
+// grade.bit).
+fn isRunLike(directive: int): bool {
+  return directive == dRun || directive == dPanic || directive == dPanicDebug
+}
+
+// `// panic-debug` shares `// panic`'s exit-code/stderr contract exactly;
+// only the build argv differs.
+fn isPanicLike(directive: int): bool {
+  return directive == dPanic || directive == dPanicDebug
+}
+
+// --- corpus walk -----------------------------------------------------------
+
+// Every `.expected` must have a `.bit`. The deleted harness only checked the other
+// direction, so a renamed case left its old `.expected` behind as dead weight
+// that nothing read and nobody noticed.
+fn checkOrphanExpected(c: Ctx, names: []string) {
+  let stems = map<string, bool>{}
+  for n of names {
+    if (hasSuffix(n, ".bit")) {
+      stems[n[0:len(n) - 4]] = true
+    }
+  }
+  for n of names {
+    if (!hasSuffix(n, ".expected")) {
+      continue
+    }
+    let stem = n[0:len(n) - 9]
+    let (_, has) = stems[stem]
+    if (!has) {
+      c.failures = c.failures + 1
+      eprint("golden: FAIL ${n}: orphaned .expected — no sibling ${stem}.bit\n")
+    }
+  }
+}
+
+fn checkCensus(c: Ctx, counts: []int, total: int) {
+  let want = expectedCounts()
+  let d = 0
+  while (d < dCount) {
+    if (counts[d] != want[d]) {
+      c.failures = c.failures + 1
+      eprint("golden: FAIL census: ${directiveName(d)} = ${counts[d]}, manifest says ${want[d]}\n")
+      eprint("  adding or removing a case must edit expectedCounts() in the same commit\n")
+    }
+    d = d + 1
+  }
+  let wantTotal = 0
+  let i = 0
+  while (i < dCount) {
+    wantTotal = wantTotal + want[i]
+    i = i + 1
+  }
+  if (total != wantTotal) {
+    c.failures = c.failures + 1
+    eprint("golden: FAIL census: scanned ${total} cases, manifest totals ${wantTotal}\n")
+  }
+}
+
+fn requiredEnv(name: string): string {
+  let v = env(name)
+  if (v == "") {
+    eprint("golden: ${name} is not set — refusing to guess. This gate has no defaults;\n")
+    eprint("golden: an unset corpus or compiler path must fail, never silently walk '.'.\n")
+    exit(2)
+  }
+  return v
+}
+
+// `BIT_TEST_TIMEOUT_S`, the contract every harness here shares: default 300s,
+// `0` disables the bound (here: the runtime's own one-hour ceiling).
+fn timeoutMs(): int {
+  let raw = trimSpace(envOr("BIT_TEST_TIMEOUT_S", ""))
+  if (raw == "") {
+    return defaultTimeoutS * 1000
+  }
+  let s = parseInt(raw) catch _ {
+    eprint("golden: BIT_TEST_TIMEOUT_S='${raw}' is not a number; using ${defaultTimeoutS}s\n")
+    return defaultTimeoutS * 1000
+  }
+  if (s <= 0) {
+    return maxTimeoutMs
+  }
+  if (s * 1000 > maxTimeoutMs) {
+    return maxTimeoutMs
+  }
+  return s * 1000
+}
+
+// The run's whole configuration. Every value is resolved before the corpus is
+// walked, so a misconfigured run fails before it can report a verdict.
+fn newCtx(casesDir: string, bin: string, scratch: string): Ctx {
+  return Ctx{
+    casesDir: casesDir,
+    bin: bin,
+    scratch: scratch,
+    timeoutMs: timeoutMs(),
+    failures: 0,
+    quiet: false,
+    lastWhy: "",
+  }
+}
+
+// Scans the corpus into the list of valid cases stage.bit/grade.bit will run.
+// A case with an unrecognised directive or an unreadable `.expected` fails
+// immediately here and is never staged — exactly the pre-#1901 behaviour,
+// just split from the (now separate) execution step.
+fn scanCorpus(c: Ctx, names: []string): []GCase {
+  let cases = []GCase(0)
+  let idx = 0
+  for n of names {
+    if (!hasSuffix(n, ".bit")) {
+      continue
+    }
+    let path = c.casesDir + "/" + n
+    let src = readFile(path) catch _ {
+      c.failures = c.failures + 1
+      eprint("golden: FAIL ${n}: cannot read case source\n")
+      continue
+    }
+    let line = firstLine(src)
+    let directive = directiveOf(line)
+    if (directive < 0) {
+      c.failures = c.failures + 1
+      eprint("golden: FAIL ${n}: unrecognised line-1 directive '${line}'\n")
+      eprint("  expected one of: // run, // panic, // panic-debug, // error, // fmt,\n")
+      eprint("                   // types, // tokens, // ast, // ir, // lint exit=<0|1|2>, // doc\n")
+      continue
+    }
+    let expectedPath = c.casesDir + "/" + n[0:len(n) - 4] + ".expected"
+    let expected = readFile(expectedPath) catch _ {
+      c.failures = c.failures + 1
+      eprint("golden: FAIL ${n}: cannot read ${expectedPath}\n")
+      continue
+    }
+    let raw = RawCase{ name: n, src: src, expected: expected, directive: directive, line: line }
+    cases = append(cases, newGCase(idx, raw, c.scratch))
+    idx = idx + 1
+  }
+  return cases
+}
+
+fn tallyCensus(cases: []GCase): ([]int, int) {
+  let counts = []int(dCount)
+  let total = 0
+  for cs of cases {
+    counts[cs.directive] = counts[cs.directive] + 1
+    total = total + 1
+  }
+  return counts, total
+}
+
+// The outer `osRunBounded` bound over the WHOLE driver (every case's job, both
+// waves) — generous rather than tight, since each job carries its own
+// per-job watchdog. Up to 3 wave-1 jobs (primary, dump-ir, dump-ir-pre) and 1
+// wave-2 job per case at the fully serial worst case (real parallelism only
+// ever finishes sooner); `osRunBounded` itself clamps to its own one-hour
+// ceiling regardless (`maxTimeoutMs`), so this is a true upper bound, not a
+// number that can actually elapse in practice.
+fn outerTimeoutMs(caseCount: int, perCaseMs: int): int {
+  return 4 * caseCount * perCaseMs + 60000
+}
+
+fn main() {
+  let casesDir = requiredEnv("BIT_CASES_DIR")
+  let bin = requiredEnv("BIT_BIN")
+  if (!fsIsDir(casesDir)) {
+    eprint("golden: BIT_CASES_DIR='${casesDir}' is not a directory\n")
+    exit(2)
+  }
+  if (!exists(bin)) {
+    eprint("golden: BIT_BIN='${bin}' does not exist\n")
+    exit(2)
+  }
+
+  let scratch = envOr("TMPDIR", "/tmp") + "/bit-golden-${timeUnixNs()}"
+  mkdir(scratch) catch _ {
+    eprint("golden: cannot create scratch directory ${scratch}\n")
+    exit(2)
+  }
+
+  let c = newCtx(casesDir, bin, scratch)
+
+  let names = readDir(casesDir) catch _ {
+    eprint("golden: cannot list ${casesDir}\n")
+    exit(2)
+    return
+  }
+  checkOrphanExpected(c, names)
+
+  let cases = scanCorpus(c, names)
+  let (counts, total) = tallyCensus(cases)
+  checkCensus(c, counts, total)
+
+  let cfg = newFanCfg(scratch, c.timeoutMs, env("BIT_STDLIB"), env("BIT_LIBBITRT"))
+  for cs of cases {
+    stageOne(cfg, c, casesDir, bin, cs)
+  }
+  runDriver(scratch, outerTimeoutMs(len(cases), c.timeoutMs))
+  for cs of cases {
+    gradeCase(c, scratch, cs)
+  }
+
+  fsRemove(scratch)
+
+  if (c.failures > 0) {
+    eprint("golden: FAIL — ${c.failures} failure(s) over ${total} cases\n")
+    exit(1)
+    return
+  }
+  print("golden: PASS — ${total} cases, 0 failures\n")
+}

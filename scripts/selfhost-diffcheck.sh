@@ -89,7 +89,7 @@ BIT_STDLIB="$(pwd)/stdlib"
 export BIT_STDLIB
 
 # The alarm is a HANG guard, not a performance budget. Measured worst legitimate
-# case over this exact corpus is 1.23s (`bit check tests/imports/nethttp/main.bit`,
+# case over this exact corpus is 1.23s (`bit check _tests_/imports/nethttp/main.bit`,
 # on a host running 9 parallel agents) against a 20s budget — 16x headroom, so no
 # real work was ever near it and every trip was a DESCHEDULED process, not a slow
 # one. Raising the constant would fix a cause that does not exist, so instead a
@@ -144,7 +144,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 seedcap="$work/seed.out"
 b2cap="$work/b2.out"
-for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort); do
+for f in $(find stdlib examples _tests_/cases _tests_/imports -name '*.bit' | sort); do
   # ORACLE and BIT2 are independent per file -- compared only after both
   # return -- so run them CONCURRENTLY rather than back-to-back (#3783).
   # Each is still independently alarm-guarded, so a hung ORACLE still cannot

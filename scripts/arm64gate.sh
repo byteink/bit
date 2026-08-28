@@ -60,8 +60,8 @@ docker image inspect "${IMAGE}" >/dev/null 2>&1 || {
 [ "$(docker run --rm "${IMAGE}" uname -m)" = "aarch64" ] || {
   echo "arm64gate: ${IMAGE} is not native aarch64 — it would gate the wrong backend" >&2; exit 127; }
 # The suite needs a `git` binary INSIDE the image: the package manager fetches
-# dependencies by shelling out to it, so tests/imports/pmadd_e2e,
-# tests/bit/pmimports.bit and compiler/pmclicheck.bit all fail without it — as
+# dependencies by shelling out to it, so _tests_/imports/pmadd_e2e,
+# _tests_/bit/pmimports.bit and compiler/pmclicheck.bit all fail without it — as
 # `git: not found`, an empty failure, and a bare assertion panic respectively
 # (#1818). Refusing here names the cause once instead of leaving three
 # unrelated-looking harnesses red. macOS has git from the host, which is why a
@@ -198,7 +198,7 @@ mutant_stream() {
   tmp=$(mktemp -d)
   git archive HEAD | tar x -C "${tmp}"
   if [ "${kind}" = "golden" ]; then
-    victim=$(ls "${tmp}"/tests/cases/*.expected 2>/dev/null | head -1)
+    victim=$(ls "${tmp}"/_tests_/cases/*.expected 2>/dev/null | head -1)
     [ -n "${victim}" ] || { echo "arm64gate: no golden .expected to mutate" >&2; rm -rf "${tmp}"; exit 127; }
     printf 'arm64gate-deliberate-breakage\n' >> "${victim}"
   else

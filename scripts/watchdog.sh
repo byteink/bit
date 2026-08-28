@@ -23,7 +23,7 @@
 #
 # Usage:
 #   scripts/watchdog.sh --expect 90 -- ./make
-#   scripts/watchdog.sh --expect 8 --rss-mb 512 --label golden -- bit run tests/...
+#   scripts/watchdog.sh --expect 8 --rss-mb 512 --label golden -- bit run _tests_/...
 #
 #   --expect <s>       REQUIRED. How long this is expected to take. The wall is
 #                      derived from it, because a wall picked without one is

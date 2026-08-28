@@ -1,0 +1,780 @@
+// The Bit port of the deleted native runtime's `root` module's managed-data
+// surface (runtime/root, #1367), driven as a real linked binary.
+//
+// THIS IS A DIFFERENTIAL, NOT A GOLDEN — and the oracle is unusually good here,
+// because the other side of it is ALREADY LINKED INTO THIS PROGRAM. Every
+// `string`, `[]T` and `map<K,V>` operation the language itself performs routes
+// through `runtime/root`'s exported `bit_rt_*` symbols. So each phase below
+// runs the SAME operation twice — once through the Bit port's entry points and
+// once through ordinary Bit syntax — and asserts the two agree. That side
+// needs no separate harness and cannot go stale: it is whatever the compiler
+// currently emits calls to.
+//
+// WHETHER THE TWO IMPLEMENTATIONS SHARE A HEAP DEPENDS ON WHICH `libbitrt.a` this
+// binary links (#1835/#3246 — an earlier version of this comment said flatly
+// they do NOT, which is false on the path that actually ships). Against a
+// Bit-sourced runtime, `rootBooted()` is already true when `main` runs (`:669`):
+// `rootInit` ran during `boot`, the port binds no private arena, and every port
+// allocation below comes out of the SAME process collector the language side
+// uses, subject to the SAME collections. Only against the deleted native
+// runtime's archive is `rootBooted()` false, and only then does the port get a
+// private arena carved out of the slices held in `main`. Either way, only raw,
+// untraced addresses cross between the two entry points, so anything this file
+// holds across a safepoint window — a key kept for a later `rtMapSet`, a name
+// kept for a later `rtTypeName` — must sit in a container the collector actually
+// traces. A plain `[]i64` is not one; see `ckeys` below (#3246) and `phaseI`'s
+// `liveNames` keepalive (#3245), both fixed the same way: a small REF-typed
+// holder alongside the untraced buffer, not the buffer itself made traced.
+//
+// WHAT EACH PHASE PROVES
+//
+//   W  Wyhash against the SEVEN OFFICIAL TEST VECTORS (wangyi-fudan's
+//      `test_vector.cpp`, the same set other Wyhash implementations' unit
+//      tests use). This is the
+//      one oracle in the file that is independent of this codebase entirely.
+//      Their lengths — 0, 1, 3, 14, 26, 62, 80 — are chosen by upstream to
+//      cover every length class: the three smallKey branches, the 17..47
+//      final1-only path, and the >=48 round loop.
+//
+//   S  Strings: concat, eq, slice, byte, from_int, from_bytes/bytes_from.
+//
+//   L  Slices: new, append (across the doubling boundary), get, set, reslice.
+//
+//   I  Interfaces: method lookup and both type-assertion forms, against
+//      hand-built descriptors. Kept as its own phase because it is the only
+//      part of the port whose input is a TYPE DESCRIPTOR rather than a value,
+//      so it needs a metadata block the other phases have no use for.
+//
+//   M  Maps: a scripted insert/lookup/delete/overwrite stream on a port map and
+//      a native map in lockstep. The strong assertion is the LAST one: the two
+//      maps must iterate in the SAME SLOT ORDER. Order is a function of the
+//      hash, the probe sequence, the tombstone policy and the grow schedule all
+//      at once, so matching it end to end is a much sharper test than matching
+//      the key SET would be. It is what makes a one-bit error in `mulHi` or an
+//      off-by-one in the 7/8 load factor visible.
+
+import {
+  loadWord, storeWord, loadByte,
+  gcTiSize, gcTiPtrOffsetsPtr, gcTiPtrOffsetsLen, gcTiNamePtr, gcTiNameLen,
+  gcTiMethodsPtr, gcTiMethodsLen,
+} from "../../../runtime/gc"
+import {
+  rootBindMemory, rootInit, rootConfigure, rootStatOom, rootBooted,
+  rtStringConcat, rtStringEq, rtStringByte, rtStringSlice, rtStringFromInt,
+  rtStringFromBool, rtStringFromBytes, rtBytesFromString,
+  rtSliceNew, rtSliceAppend, rtSliceGet, rtSliceSet, rtSliceSlice,
+  rtSliceInBounds,
+  rtMapNew, rtMapSet, rtMapGet, rtMapHas, rtMapDelete, rtMapLen,
+  rtMapIterInit, rtMapIterNext, rtMapKeyAt, rtMapValAt,
+  rtWyhashString,
+  rtGcAlloc, rtIfaceLookup, rtIfaceAs, rtIfaceAsOk, rtIfaceAssert,
+  rtIfaceAssertFailed, rtTypeName,
+  rtParseFloat, fsPathZ,
+  strLen, strPtr, slcLen, slcIsRef,
+} from "../../../runtime/root"
+
+// 8 MiB of object heap and 128 KiB of index. Comfortably more than the script
+// needs — the point is that neither runs out, so a short table is never an
+// allocation failure wearing a passing test's clothes. `rootStatOom` is
+// asserted zero on the final line for exactly that reason. Nothing collects the
+// port's heap in this program (a real runtime collects at safepoints), so every
+// allocation here is permanent and the arena must cover the whole run.
+//
+// An earlier version of this file reported a 4 MiB "ceiling" above which the
+// program faulted. THAT WAS THIS FILE'S OWN BUG, not a limit in `runtime/root`
+// or `runtime/gc`: `arena` was dead after the `ptrOf` that bound it, so the
+// collector swept the port's heap (see `main`'s comment). Sizes to 16 MiB pass
+// under both GC policies now. Recorded because "it breaks above N" was a
+// plausible-looking conclusion that would have sent the next reader hunting a
+// nonexistent size limit.
+const ARENA_WORDS = 1048576
+const INDEX_WORDS = 16384
+const MARK_STACK = 4096
+const MIN_TRIGGER = 65536
+const GROWTH_PCT = 200
+
+// Map script length. Sized by measurement, not feel: the map starts at 8 slots
+// and grows at 7/8 load, so 400 distinct keys forces SIX growth events
+// (8->16->32->64->128->256->512) and therefore six full rehashes. A shorter
+// script that never grows would let `mapGrow` be deleted entirely — verified by
+// mutation, see the task report.
+const MAP_STEPS = 400
+
+// Tombstone-flood sizes. See the phase's comment for the derivation; these are
+// set against the 7/8 load factor so that a missing `used = len` reset ends at
+// a DIFFERENT capacity, which the iteration-order assertion then catches.
+const FLOOD_A = 250
+const FLOOD_KEEP = 4
+const FLOOD_B = 900
+
+// ---------------------------------------------------------------------------
+// Bridges between the two heaps
+// ---------------------------------------------------------------------------
+
+// A port-heap `string` holding the same bytes as the native string `s`.
+//
+// Goes through `rtSliceNew`/`rtSliceSet`/`rtStringFromBytes` rather than a
+// private constructor, so the bridge itself exercises three real entry points
+// and the packed `[]u8` slice model (ABI.md §2) they share.
+fn mine(s: string): int {
+  let n = len(s)
+  let h = rtSliceNew(n, n, 0, 1)
+  let i = 0
+  while (i < n) {
+    rtSliceSet(h, i, int(s[i]), 1)
+    i = i + 1
+  }
+  return rtStringFromBytes(h)
+}
+
+// Whether the port-heap string at `m` holds exactly the native string `s`.
+// Compares LENGTH FIRST and then every byte — a prefix match is not a match.
+fn sameStr(m: int, s: string): bool {
+  if (m == 0) {
+    return false
+  }
+  if (loadWord(m + strLen) != len(s)) {
+    return false
+  }
+  let i = 0
+  while (i < len(s)) {
+    if (rtStringByte(m, i) != int(s[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// splitmix64, the script driver. Identical shape to `_tests_/stress/gcbit`'s so
+// the two are comparable; masked to 62 bits so every draw is a non-negative
+// `int`.
+fn nextRand(state: []u64): int {
+  state[0] = state[0] + 11400714819323198485
+  let z = state[0]
+  z = (z ^ (z >> 30)) * 13787848793156543929
+  z = (z ^ (z >> 27)) * 10723151780598845931
+  z = z ^ (z >> 31)
+  return int(z & 4611686018427387903)
+}
+
+// ---------------------------------------------------------------------------
+// W — Wyhash test vectors
+// ---------------------------------------------------------------------------
+
+// One vector. Returns 1 on a match so the caller can total them.
+fn vec(s: string, seed: u64, want: u64): int {
+  let h = rtWyhashString(mine(s), seed)
+  if (h == want) {
+    return 1
+  }
+  return 0
+}
+
+fn phaseW(): int {
+  let ok = 0
+  ok = ok + vec("", u64(0), 0x0409638ee2bde459)
+  ok = ok + vec("a", u64(1), 0xa8412d091b5fe0a9)
+  ok = ok + vec("abc", u64(2), 0x32dd92e4b2915153)
+  ok = ok + vec("message digest", u64(3), 0x8619124089a3a16b)
+  ok = ok + vec("abcdefghijklmnopqrstuvwxyz", u64(4), 0x7a43afb61d7f5f40)
+  ok = ok + vec("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789", u64(5), 0xff42329b90e50d58)
+  ok = ok + vec("12345678901234567890123456789012345678901234567890123456789012345678901234567890", u64(6), 0xc39cab13b115aad3)
+  return ok
+}
+
+// ---------------------------------------------------------------------------
+// S — strings
+// ---------------------------------------------------------------------------
+
+fn phaseS(): int {
+  let ok = 0
+
+  // concat, including both empty-operand edges.
+  if (sameStr(rtStringConcat(mine("foo"), mine("bar")), "foo" + "bar")) { ok = ok + 1 }
+  if (sameStr(rtStringConcat(mine(""), mine("x")), "x")) { ok = ok + 1 }
+  if (sameStr(rtStringConcat(mine("x"), mine("")), "x")) { ok = ok + 1 }
+
+  // eq: equal-but-distinct objects, differing length, and equal length with a
+  // differing byte (the case a length-only comparison would pass).
+  if (rtStringEq(mine("hello"), mine("hello"))) { ok = ok + 1 }
+  if (!rtStringEq(mine("hello"), mine("hell"))) { ok = ok + 1 }
+  if (!rtStringEq(mine("hello"), mine("hellp"))) { ok = ok + 1 }
+
+  // byte, at both ends. Out-of-range access now panics (#2014, SPEC §12.6);
+  // that contract is covered by run_string_index_panic.bit, not here.
+  if (rtStringByte(mine("abc"), 0) == int('a')) { ok = ok + 1 }
+  if (rtStringByte(mine("abc"), 2) == int('c')) { ok = ok + 1 }
+
+  // slice, against the language's own slicing. The subject is BOUND FIRST:
+  // slicing a bare literal is E0054 ("'untyped string' cannot be indexed") in
+  // the harness's compilation mode, though `bit run` on the directory accepts
+  // it — so the binding is required, not stylistic.
+  let abc: string = "abcdef"
+  if (sameStr(rtStringSlice(mine("abcdef"), 1, 4), abc[1:4])) { ok = ok + 1 }
+  if (sameStr(rtStringSlice(mine("abcdef"), 0, 6), "abcdef")) { ok = ok + 1 }
+  if (sameStr(rtStringSlice(mine("abcdef"), 3, 3), "")) { ok = ok + 1 }
+  // An out-of-range range (lo > hi, or hi > n) now panics (#2014, SPEC §12.6);
+  // covered by run_string_range_panic.bit, not here.
+
+  // from_int, against the language's own integer interpolation. The two
+  // extremes matter: i64's most negative value has no positive counterpart, so
+  // a port that negates into `int` prints garbage for exactly that one input.
+  if (sameStr(rtStringFromInt(0), "${0}")) { ok = ok + 1 }
+  if (sameStr(rtStringFromInt(7), "${7}")) { ok = ok + 1 }
+  if (sameStr(rtStringFromInt(-7), "${-7}")) { ok = ok + 1 }
+  if (sameStr(rtStringFromInt(123456789), "${123456789}")) { ok = ok + 1 }
+  if (sameStr(rtStringFromInt(9223372036854775807), "${9223372036854775807}")) { ok = ok + 1 }
+  if (sameStr(rtStringFromInt(-9223372036854775808), "${-9223372036854775808}")) { ok = ok + 1 }
+
+  if (sameStr(rtStringFromBool(true), "${true}")) { ok = ok + 1 }
+  if (sameStr(rtStringFromBool(false), "${false}")) { ok = ok + 1 }
+
+  // bytes_from_string round-trips through the packed `[]u8` slice model.
+  if (sameStr(rtStringFromBytes(rtBytesFromString(mine("round trip"))), "round trip")) { ok = ok + 1 }
+
+  // THE ROUND TRIP MUST PRESERVE ALL 256 BYTE VALUES, not just ASCII. Every
+  // string above is ASCII, so masking the transferred byte to 7 bits changed
+  // nothing and the conversion could silently corrupt any non-ASCII input
+  // (measured: mutation M24 survived). `[]byte(s)` is exactly the primitive
+  // UTF-8 and crypto code reaches for, where high bytes are the normal case.
+  let hb = rtSliceNew(4, 4, 0, 1)
+  rtSliceSet(hb, 0, 0, 1)
+  rtSliceSet(hb, 1, 127, 1)
+  rtSliceSet(hb, 2, 128, 1)
+  rtSliceSet(hb, 3, 255, 1)
+  let hs = rtStringFromBytes(hb)
+  let back = rtBytesFromString(hs)
+  // One line: a leading `&&` on the next line ends the statement under ASI.
+  if (rtSliceGet(back, 0, 1) == 0 && rtSliceGet(back, 1, 1) == 127 && rtSliceGet(back, 2, 1) == 128 && rtSliceGet(back, 3, 1) == 255) { ok = ok + 1 }
+  // The same range read through `string_byte`, which must zero-extend rather
+  // than sign-extend a byte above 127.
+  if (rtStringByte(hs, 2) == 128 && rtStringByte(hs, 3) == 255) { ok = ok + 1 }
+
+  return ok
+}
+
+// ---------------------------------------------------------------------------
+// L — slices
+// ---------------------------------------------------------------------------
+
+fn phaseL(): int {
+  let ok = 0
+
+  // new: length, capacity and zeroing.
+  let a = rtSliceNew(3, 3, 0, 8)
+  if (rtSliceGet(a, 0, 8) == 0 && rtSliceGet(a, 1, 8) == 0 && rtSliceGet(a, 2, 8) == 0) { ok = ok + 1 }
+  if (!rtSliceInBounds(a, 3) && !rtSliceInBounds(a, -1) && rtSliceInBounds(a, 2)) { ok = ok + 1 }
+
+  // set/get.
+  rtSliceSet(a, 1, 42, 8)
+  if (rtSliceGet(a, 1, 8) == 42) { ok = ok + 1 }
+
+  // AN OUT-OF-RANGE SET now panics (#2014, SPEC §12.6) — covered by
+  // run_slice_index_write_panic.bit, not here. What is still testable inline is
+  // that `rtSliceNew` zeroes the WHOLE capacity, not merely `len`: the check
+  // above only reads indices 0..2 of a cap==len==3 slice, so it never touches
+  // spare capacity. This widens into the capacity region via reslice and reads
+  // an index `len` never reaches.
+  let room = rtSliceNew(3, 8, 0, 8)
+  let widened = rtSliceSlice(room, 0, 8)
+  if (rtSliceGet(widened, 5, 8) == 0) { ok = ok + 1 }
+
+  // append across the doubling boundary, checked against a native slice built
+  // by the same sequence. 33 elements crosses 1,2,4,8,16,32 — six grows.
+  let b = rtSliceNew(0, 0, 0, 8)
+  let nat: []i64 = []i64(0)
+  let i = 0
+  while (i < 33) {
+    b = rtSliceAppend(b, i * 3, 0, 8)
+    nat = append(nat, i * 3)
+    i = i + 1
+  }
+  let agree = 1
+  i = 0
+  while (i < 33) {
+    if (rtSliceGet(b, i, 8) != nat[i]) {
+      agree = 0
+    }
+    i = i + 1
+  }
+  if (agree == 1 && len(nat) == 33) { ok = ok + 1 }
+
+  // reslice shares the buffer: a write through the view is visible in the
+  // parent, which is what "shares" means and what a copying implementation
+  // would fail.
+  let v = rtSliceSlice(b, 4, 8)
+  if (rtSliceGet(v, 0, 8) == rtSliceGet(b, 4, 8)) { ok = ok + 1 }
+  rtSliceSet(v, 0, 777, 8)
+  if (rtSliceGet(b, 4, 8) == 777) { ok = ok + 1 }
+  // GO CAPACITY SEMANTICS: the reslice bound is `cap`, NOT `len` (SPEC §12.6).
+  // 33 appends from empty leave len=33 and cap=64 (doubling 1,2,4,8,16,32,64),
+  // so slicing to 34 is LEGAL — past the length, inside the capacity. This
+  // property was wrong on the first write (it asserted 34 must be rejected)
+  // and the port was right; recorded because a `len`-bounded reslice is the
+  // natural mistake here. The rejecting half (hi=65, past cap) now panics
+  // (#2014, SPEC §12.6) — covered by run_slice_range_panic.bit, not here.
+  if (rtSliceSlice(b, 0, 34) != 0) { ok = ok + 1 }
+  // A reslice's capacity is the parent's minus `lo`, so an append into the view
+  // lands inside the shared buffer rather than reallocating. Its rejecting half
+  // (hi=61, past the view's cap of 60) also now panics — same golden.
+  let tail = rtSliceSlice(b, 4, 8)
+  if (rtSliceSlice(tail, 0, 60) != 0) { ok = ok + 1 }
+  // `lo > hi` (5, 4) now panics too (#2014) — covered by the same golden.
+
+  // APPENDING INTO A VIEW WITH A NON-ZERO `off`, past its capacity, so the grow
+  // path runs on a RESLICED header. Every append above started at `off == 0`,
+  // which left the grow's `off = 0` reset untested — deleting it changed
+  // nothing (measured: mutation M12 survived). A grow reallocates from the
+  // current view, so the new buffer is 0-based and `off` MUST return to 0; a
+  // stale `off` reads the appended elements shifted by the old offset.
+  let view = rtSliceSlice(b, 30, 33)     // off=30, len=3, cap=34
+  let vnat: []i64 = []i64(0)
+  i = 0
+  while (i < 3) {
+    vnat = append(vnat, rtSliceGet(view, i, 8))
+    i = i + 1
+  }
+  i = 0
+  while (i < 40) {                        // past cap=34, so the grow fires
+    view = rtSliceAppend(view, 1000 + i, 0, 8)
+    vnat = append(vnat, 1000 + i)
+    i = i + 1
+  }
+  let vAgree = 1
+  i = 0
+  while (i < 43) {
+    if (rtSliceGet(view, i, 8) != vnat[i]) {
+      vAgree = 0
+    }
+    i = i + 1
+  }
+  if (vAgree == 1 && len(vnat) == 43) { ok = ok + 1 }
+
+  return ok
+}
+
+// ---------------------------------------------------------------------------
+// I — interfaces
+// ---------------------------------------------------------------------------
+
+// Metadata block layout, in words: two `TypeInfo`s (ABI.md §2, 7 words each)
+// and a two-entry method table (2 words per entry).
+const MI_A = 0
+const MI_B = 7
+const MI_METHODS = 14
+// One word holding a copy of `infoA`, positioned so that a crafted "receiver"
+// 32 bytes above it reads that word as its GC header's descriptor slot. See the
+// `gcOwns` property in `phaseI` for why this exists.
+const MI_FAKEHDR = 18
+const META_WORDS = 19
+
+// Two arbitrary, distinctive code addresses. They are never CALLED — the port
+// only ever returns them — so any non-zero value distinguishable from the other
+// serves, and a recognisable one makes a wrong answer obvious.
+const FN_AREA = 0x515A
+const FN_PERIM = 0x9E71
+
+// One `TypeInfo` at word `at` of the metadata block.
+fn writeTi(base: int, at: int, size: int, nameAddr: int, nameLen: int, mtAddr: int, mtLen: int) {
+  let w = base + at * 8
+  storeWord(w + gcTiSize, size)
+  storeWord(w + gcTiPtrOffsetsPtr, 0)
+  storeWord(w + gcTiPtrOffsetsLen, 0)
+  storeWord(w + gcTiNamePtr, nameAddr)
+  storeWord(w + gcTiNameLen, nameLen)
+  storeWord(w + gcTiMethodsPtr, mtAddr)
+  storeWord(w + gcTiMethodsLen, mtLen)
+}
+
+fn phaseI(meta: []i64): int {
+  let ok = 0
+  let base = int(ptrOf(meta))
+
+  // Descriptor names come from port-heap strings, so `rtTypeName` has real
+  // bytes to copy and the name round-trip is a genuine comparison.
+  let nameA = mine("Square")
+  let nameB = mine("Circle")
+
+  // `nameA`/`nameB` are plain `int` locals holding real port-heap string
+  // addresses. A scalar-typed local is never a GC root regardless of its live
+  // range (main()'s "liveness is by LAST USE, not by scope" applies only to
+  // REFERENCE-typed locals) — same reason `meta` itself (`[]i64`) is never
+  // traced. `writeTi` below copies the raw byte pointer out of each string
+  // ONCE (see the two calls just below); `rtTypeName` reads it back out of
+  // `meta` much later, with an `rtGcAlloc` and several more safepoints in
+  // between. Under `BIT_GC=stress` the collector reclaims whichever string it
+  // gets to first (#3245), because nothing traces it.
+  //
+  // The fix is the same primitive #3246 used for `ckeys` — a REF-typed
+  // holder, `rtSliceNew(..., isRef: 1, 8)`, so `gcmark.bit:77` traces every
+  // slot — but scoped to just these two name addresses, NOT to `meta` itself.
+  // `meta` stays a plain `[]i64`: it is a heterogeneous block of forged
+  // TypeInfo descriptors (`writeTi`) whose slots are mostly plain sizes and a
+  // deliberately fake method-table pointer (`FN_AREA`/`FN_PERIM`, never
+  // called — see their declaration above). Marking `meta` traced would hand
+  // the collector those literals as candidate object addresses — a worse bug
+  // than the one being fixed. The collector is non-moving
+  // (`runtime/ABI.md:729`), so retention alone is sufficient: the raw
+  // pointers already copied into `meta` stay valid for as long as the
+  // objects they point into are not swept.
+  let liveNames = rtSliceNew(2, 2, 1, 8)
+  rtSliceSet(liveNames, 0, nameA, 8)
+  rtSliceSet(liveNames, 1, nameB, 8)
+
+  let mt = base + MI_METHODS * 8
+  storeWord(mt + 0, 100)
+  storeWord(mt + 8, FN_AREA)
+  storeWord(mt + 16, 200)
+  storeWord(mt + 24, FN_PERIM)
+
+  let infoA = base + MI_A * 8
+  let infoB = base + MI_B * 8
+  writeTi(base, MI_A, 16, loadWord(nameA + strPtr), loadWord(nameA + strLen), mt, 2)
+  writeTi(base, MI_B, 16, loadWord(nameB + strPtr), loadWord(nameB + strLen), 0, 0)
+
+  // Method lookup scans linearly, so both positions and a miss all matter.
+  if (rtIfaceLookup(infoA, 100) == FN_AREA) { ok = ok + 1 }
+  if (rtIfaceLookup(infoA, 200) == FN_PERIM) { ok = ok + 1 }
+  if (rtIfaceLookup(infoA, 999) == 0) { ok = ok + 1 }
+  // A descriptor with no methods must not read past its (null) table.
+  if (rtIfaceLookup(infoB, 100) == 0) { ok = ok + 1 }
+
+  let obj = rtGcAlloc(infoA)
+  if (obj != 0) { ok = ok + 1 }
+
+  // The two-result assertion. Descriptor identity IS type identity.
+  if (rtIfaceAs(obj, infoA) == obj && rtIfaceAsOk()) { ok = ok + 1 }
+  // A MISMATCH MUST RETURN NULL, not the un-narrowed receiver: the result is
+  // typed T, so handing back `obj` would let a caller that ignores `ok` read a
+  // Circle as a Square.
+  if (rtIfaceAs(obj, infoB) == 0 && !rtIfaceAsOk()) { ok = ok + 1 }
+  // A nil interface is a null word, not an object.
+  if (rtIfaceAs(0, infoA) == 0 && !rtIfaceAsOk()) { ok = ok + 1 }
+
+  // THE `gcOwns` GUARD, on a receiver BUILT TO DEFEAT IT. A reference-typed
+  // value need not be a GC object at all (a `chan` is not), so a type assertion
+  // on one must not decode whatever sits 32 bytes below it as a descriptor.
+  //
+  // Pointing at an arbitrary non-owned address does NOT test this: the word
+  // below it is unlikely to equal the wanted descriptor, so the assertion fails
+  // for the wrong reason and the guard could be deleted (measured: mutation I2
+  // survived exactly that check). So the word below this receiver is set to
+  // `infoA` deliberately. Without `gcOwns`, the assertion SUCCEEDS and hands
+  // back a pointer into a native slice buffer typed as a Square.
+  storeWord(base + MI_FAKEHDR * 8, infoA)
+  let forged = base + MI_FAKEHDR * 8 + 32
+  if (rtIfaceAs(forged, infoA) == 0 && !rtIfaceAsOk()) { ok = ok + 1 }
+  if (rtIfaceAssert(forged, infoA) == 0 && rtIfaceAssertFailed(forged, infoA)) { ok = ok + 1 }
+
+  // The one-result form, and the predicate that decides whether it panics.
+  if (rtIfaceAssert(obj, infoA) == obj) { ok = ok + 1 }
+  if (rtIfaceAssert(obj, infoB) == 0) { ok = ok + 1 }
+  if (!rtIfaceAssertFailed(obj, infoA)) { ok = ok + 1 }
+  if (rtIfaceAssertFailed(obj, infoB)) { ok = ok + 1 }
+  if (rtIfaceAssertFailed(0, infoA)) { ok = ok + 1 }
+
+  // The name a failed assertion's message would interpolate.
+  if (sameStr(rtTypeName(infoA), "Square")) { ok = ok + 1 }
+  if (sameStr(rtTypeName(infoB), "Circle")) { ok = ok + 1 }
+
+  // `liveNames`'s LAST USE must be here, after the reads above: extending its
+  // live range is what keeps the collector from sweeping nameA/nameB's string
+  // objects before `rtTypeName` reads the raw pointers `writeTi` stashed into
+  // `meta`. The comparison is always true by construction — these are the
+  // same ints stored before the first safepoint above, not a dereference — so
+  // it never perturbs `ok` under correct behaviour; its only job is to be a
+  // genuine use of `liveNames` an optimizer cannot prove dead.
+  if (rtSliceGet(liveNames, 0, 8) != nameA || rtSliceGet(liveNames, 1, 8) != nameB) {
+    ok = 0
+  }
+
+  return ok
+}
+
+// ---------------------------------------------------------------------------
+// M — maps
+// ---------------------------------------------------------------------------
+
+// Runs the same scripted stream against a port map and a native map, then
+// compares them. Returns the number of properties satisfied.
+fn phaseM(rng: []u64): int {
+  let ok = 0
+  let m = rtMapNew(1, 0)          // string keys, scalar values
+  let nat = map<string, int>()
+
+  let lenAgree = 1
+  let getAgree = 1
+  let hasAgree = 1
+
+  let step = 0
+  // Bounded: exactly MAP_STEPS iterations.
+  while (step < MAP_STEPS) {
+    let a = nextRand(rng)
+    let b = nextRand(rng)
+    let op = a % 10
+    // Keys drawn from a space smaller than the step count, so overwrites and
+    // deletes of live keys both happen for real rather than by luck.
+    let k = "k${b % 250}"
+    let km = mine(k)
+    // EVERY STORED VALUE IS NON-ZERO. That is what makes the native map a
+    // presence oracle: an absent key reads as V's zero value (SPEC §11.2), so
+    // `nat[k] != 0` is exactly "k is live" — which `delete` then makes false.
+    // Without this, `has` could only be compared against the port's own answer,
+    // which is no test at all.
+    let val = b % 1000000 + 1
+
+    if (op < 6) {
+      rtMapSet(m, km, val)
+      nat[k] = val
+    } else if (op < 8) {
+      if (rtMapGet(m, km) != nat[k]) {
+        getAgree = 0
+      }
+      if (rtMapHas(m, km) != (nat[k] != 0)) {
+        hasAgree = 0
+      }
+    } else if (op < 9) {
+      rtMapDelete(m, km)
+      delete(nat, k)
+    } else {
+      if (rtMapLen(m) != len(nat)) {
+        lenAgree = 0
+      }
+    }
+    step = step + 1
+  }
+
+  if (lenAgree == 1) { ok = ok + 1 }
+  if (getAgree == 1) { ok = ok + 1 }
+  // `hasAgree` was computed and never asserted on the first write of this file
+  // — a guard that runs, records a failure, and is then thrown away. Found by
+  // reading the property count back against the printed denominator, which is
+  // why the denominator is derived from the source rather than written by hand.
+  if (hasAgree == 1) { ok = ok + 1 }
+  if (rtMapLen(m) == len(nat)) { ok = ok + 1 }
+
+  // THE STRONG ASSERTION: both maps must iterate in the same slot order, with
+  // the same keys and the same values. This is what pins the hash, the probe
+  // sequence, the tombstone policy and the grow schedule simultaneously.
+  let orderAgree = 1
+  let seen = 0
+  let slot = rtMapIterInit(m)
+  for (nk, nv) of nat {
+    if (slot < 0) {
+      orderAgree = 0
+    } else {
+      if (!sameStr(rtMapKeyAt(m, slot), nk)) {
+        orderAgree = 0
+      }
+      if (rtMapValAt(m, slot) != nv) {
+        orderAgree = 0
+      }
+      slot = rtMapIterNext(m, slot)
+      seen = seen + 1
+    }
+  }
+  // Both must be exhausted together: a port that stops early would otherwise
+  // agree on every element it did produce.
+  if (slot != -1) {
+    orderAgree = 0
+  }
+  if (orderAgree == 1 && seen == len(nat)) { ok = ok + 1 }
+
+  // A deleted key must read as absent and as the zero value, and must not
+  // resurrect after the tombstone is reclaimed by a later grow.
+  let gone = mine("k0")
+  rtMapDelete(m, gone)
+  if (!rtMapHas(m, gone) && rtMapGet(m, gone) == 0) { ok = ok + 1 }
+
+  // TOMBSTONE FLOOD — the one shape that makes `mapGrow`'s `used = len` reset
+  // (tombstones reclaimed) observable.
+  //
+  // A cycle of delete-then-reinsert does NOT do it, and that is the whole
+  // lesson: reusing a TOMB slot leaves `used` unchanged, so `used` plateaus and
+  // no further grow ever fires — the reset line is simply never reached again.
+  // Deleting the reset changed nothing under that script (measured: mutation M7
+  // survived a 12-round churn of 60 keys).
+  //
+  // What is required is a grow that happens WHILE the table is mostly
+  // tombstones, followed by enough NEW keys that the inflated `used` crosses
+  // the next threshold and the correct `used` does not. Then the two
+  // implementations end at different capacities, and the iteration order — the
+  // assertion below — diverges. Sizes are chosen against the 7/8 load factor,
+  // not by feel: FLOOD_A fills to a grow, FLOOD_KEEP survives the sweep, and
+  // FLOOD_B is sized to sit between the correct and inflated thresholds.
+  let cm = rtMapNew(1, 0)
+  let cnat = map<string, int>()
+  // `ckeys` holds `mine()`'s return values — real port-heap string addresses,
+  // not plain integers — across the whole flood: every one is read back up to
+  // 1396 events after it was written, well past several forced collections
+  // under `BIT_GC=stress`. A `[]i64` cannot hold that safely: `i64` is never a
+  // pointer (`compiler/lowerlit.bit:66-70`), so `[]i64` always lowers with
+  // `is_ref=0`, and a buffer without `ref_array_info` is never traced
+  // (`runtime/gc/gcmark.bit:77`) — correctly so, since scanning a genuine
+  // scalar buffer as pointers is exactly what that check exists to prevent.
+  // An untraced `ckeys` let the collector reclaim and reissue the very blocks
+  // it still meant to read (#1835/#3246, measured: the same address handed to
+  // `mine()` at `j=999` was read back out of `ckeys[999]` corrupted 1396 ring
+  // events later).
+  //
+  // The fix is to build the holder as a REF-typed buffer directly, the same
+  // primitive `runtime/root/maps.bit:513`/`:557` uses for its own keys buffer
+  // (`allocBuf(newcap, keyDesc != mapKeyScalar, 8)`): `rtSliceNew(..., isRef:
+  // 1, 8)` gives the buffer `ref_array_info`, so `gcmark.bit:77` traces every
+  // slot as a live reference and the addresses survive. This keeps the
+  // zero-allocation shape the flood exists to exercise — no extra `mine()`
+  // calls, same 1396-event window — unlike rebuilding each key at the point of
+  // use, which fixes the crash too but adds 1396 allocations and changes what
+  // the phase measures. `rtSliceNew`/`rtSliceGet`/`rtSliceSet` are this file's
+  // own vocabulary (see `mine()` and `phaseL` above), not a reach into
+  // internals: there is no idiomatic Bit-language container for "an array of
+  // raw addresses the collector must trace" — a `[]T` for a pointer-typed `T`
+  // traces the language's own reference layout, and a class field never
+  // traces through a plain `int`, so this primitive is the only thing that
+  // expresses the intent.
+  let ckeys = rtSliceNew(FLOOD_A + FLOOD_B, FLOOD_A + FLOOD_B, 1, 8)
+  let ktexts: []string = []string(0)
+  // Key strings are built ONCE. `mine()` allocates a slice, a buffer and a
+  // string per call and nothing collects the port's heap in this program, so
+  // building keys inside the loops exhausted the arena and faulted on the
+  // resulting null. Hoisting them also sharpens the phase: what is under test
+  // is the grow schedule, not allocation volume.
+  let b0 = 0
+  while (b0 < FLOOD_A + FLOOD_B) {
+    let kt = "f${b0}"
+    ktexts = append(ktexts, kt)
+    rtSliceSet(ckeys, b0, mine(kt), 8)
+    b0 = b0 + 1
+  }
+
+  let j = 0
+  while (j < FLOOD_A) {
+    rtMapSet(cm, rtSliceGet(ckeys, j, 8), j + 1)
+    cnat[ktexts[j]] = j + 1
+    j = j + 1
+  }
+  // Sweep almost everything away, leaving a table that is nearly all tombstones.
+  j = 0
+  while (j < FLOOD_A - FLOOD_KEEP) {
+    rtMapDelete(cm, rtSliceGet(ckeys, j, 8))
+    delete(cnat, ktexts[j])
+    j = j + 1
+  }
+  // Now insert a fresh, disjoint key range. These consume EMPTY slots, so
+  // `used` climbs from whatever the grow left it at.
+  j = FLOOD_A
+  while (j < FLOOD_A + FLOOD_B) {
+    rtMapSet(cm, rtSliceGet(ckeys, j, 8), j + 1)
+    cnat[ktexts[j]] = j + 1
+    j = j + 1
+  }
+
+  let cAgree = 1
+  let cslot = rtMapIterInit(cm)
+  for (ck2, cv2) of cnat {
+    if (cslot < 0 || !sameStr(rtMapKeyAt(cm, cslot), ck2) || rtMapValAt(cm, cslot) != cv2) {
+      cAgree = 0
+    } else {
+      cslot = rtMapIterNext(cm, cslot)
+    }
+  }
+  if (cAgree == 1 && cslot == -1 && rtMapLen(cm) == len(cnat)) { ok = ok + 1 }
+
+  // Scalar-keyed maps take the splitmix64 path instead of Wyhash.
+  let sm = rtMapNew(0, 0)
+  let snat = map<int, int>()
+  let i = 0
+  while (i < 200) {
+    rtMapSet(sm, i * 7, i)
+    snat[i * 7] = i
+    i = i + 1
+  }
+  let sAgree = 1
+  let sslot = rtMapIterInit(sm)
+  for (sk, sv) of snat {
+    if (sslot < 0 || rtMapKeyAt(sm, sslot) != sk || rtMapValAt(sm, sslot) != sv) {
+      sAgree = 0
+    } else {
+      sslot = rtMapIterNext(sm, sslot)
+    }
+  }
+  if (sAgree == 1 && sslot == -1 && rtMapLen(sm) == len(snat)) { ok = ok + 1 }
+
+  return ok
+}
+
+fn main() {
+  // Only raw, untraced addresses into these ever reach the port, so these
+  // bindings are the ONLY thing keeping the arena alive.
+  //
+  // AND A BINDING IS NOT ENOUGH — it must still be LIVE. `arena`'s last use was
+  // the `ptrOf` below, so after that call the stack map stopped naming it and
+  // the very first collection under `BIT_GC=stress` swept the port's entire
+  // heap out from under it (exit 139, `swept=4 survivors=2` with a 3 MiB slice
+  // supposedly held). Liveness is by LAST USE, not by scope. `rooted` at the
+  // bottom of this function is what extends both slices' live ranges across
+  // every safepoint in between — it is load-bearing, not a diagnostic, which is
+  // why its result is printed rather than discarded.
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let rng = []u64(1)
+  let meta = []i64(META_WORDS)
+
+  // USE THE LIVE ROOT WHEN THERE IS ONE (#1835). Root's state is module-level
+  // arrays that ARE this process's singletons, so there is no private instance
+  // to stand up: once `libbitrt.a` is Bit-sourced, `boot` has already run
+  // `rootInit`, and calling `rootBindMemory` here would rebind the LIVE
+  // collector's heap out from under the running process — the same hijack
+  // `runtime/stw` had (#1833) and the reason `rootBooted` has to be asked BEFORE
+  // touching anything rather than inferred from `rootInit` failing.
+  //
+  // Nothing is lost by sharing the heap. Every phase below tests the OBJECT
+  // MODEL — string equality, slice growth, interface dispatch, map probing, null
+  // headers — and none of it depends on which heap the objects came from. That
+  // is exactly the line Go draws: a component owning process-global state is
+  // tested against the live runtime, and only components taking their state as a
+  // parameter get real private instances (`runtime/stw` is the latter, #1836).
+  //
+  // Against the deleted native runtime's archive `rootBooted()` is false — the
+  // live root is that runtime's `root` module's and this module's arrays are
+  // untouched — so the private path below still runs and still gets its own
+  // arena.
+  if (!rootBooted()) {
+    rootBindMemory(int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
+    if (!rootInit(MARK_STACK)) {
+      print("rootInit failed\n")
+      return
+    }
+    rootConfigure(true, false, MIN_TRIGGER, GROWTH_PCT, false)
+  }
+
+  // A second boot must be refused — there is no such thing as rebooting this
+  // runtime, and the deleted native runtime asserted the same thing. This holds on BOTH paths above: a
+  // private root that just booted refuses a second `rootInit`, and a live root
+  // refuses it for the same reason, so the assertion is not weakened by sharing.
+  let reboot = 0
+  if (!rootInit(MARK_STACK)) {
+    reboot = 1
+  }
+
+  rng[0] = u64(88172645463325252)
+
+  let w = phaseW()
+  let s = phaseS()
+  let l = phaseL()
+  let ifc = phaseI(meta)
+  let m = phaseM(rng)
+  let n = phaseN()
+
+  // Extends `arena`/`indexArena` past every safepoint above (see their comment)
+  // and, by allocating from the port's heap AFTER all the churn, proves that
+  // heap is still intact rather than merely still addressable.
+  let stillWorks = rtStringEq(mine("live"), mine("live"))
+  let rooted = len(arena) == ARENA_WORDS && len(indexArena) == INDEX_WORDS && len(meta) == META_WORDS && stillWorks
+
+  // `oom` is part of the line, not a side check: every phase above assumes it
+  // never ran out of arena, and a non-zero value would mean some "0" result was
+  // an allocation failure rather than the behaviour under test.
+  print("wy=${w}/7 str=${s}/22 slc=${l}/10 ifc=${ifc}/17 map=${m}/8 null=${n}/21 reboot=${reboot} rooted=${rooted} oom=${rootStatOom()}\n")
+}

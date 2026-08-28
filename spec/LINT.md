@@ -500,7 +500,7 @@ line, declaration, or non-comment token. Multiple directives may appear; the
 last assignment for a given rule wins.
 
 It is deliberately *not* pinned to line 1: golden test cases already use line 1
-for the harness mode directive ([tests/bit/golden.bit](../tests/bit/golden.bit)),
+for the harness mode directive ([_tests_/bit/golden.bit](../_tests_/bit/golden.bit)),
 and a `// lint` case must be able to carry both.
 
 Overrides are **file-scoped**. There is no line-scoped or function-scoped
@@ -678,7 +678,7 @@ one format for both tools.
 ## 8. Testing
 
 A new golden mode, `// lint`, joins the existing set in
-[tests/bit/golden.bit](../tests/bit/golden.bit). A case runs `bit lint` over the
+[_tests_/bit/golden.bit](../_tests_/bit/golden.bit). A case runs `bit lint` over the
 file and compares stderr against the sibling `.expected` — except that lint
 also asserts the process exit code, since 0 (clean), 1 (findings), and 2 (bad
 directive) are all reachable and a stderr diff alone cannot separate 1 from 2.
@@ -723,9 +723,9 @@ Required coverage:
 | `compiler/lintallow.bit` | new — per-finding `allow` override (§5.5, #2438) |
 | `compiler/lintcheck.bit` | new — in-Bit self-checks, run by `selfcheck()` |
 | `compiler/main.bit` | `lint` subcommand dispatch |
-| `tests/bit/lintcmd.bit` | CLI contract: exit codes, walk, summary, `--json`, `--stats` |
-| `tests/bit/golden.bit` | `// lint` directive |
-| `tests/cases/lint_*.bit` | golden cases |
+| `_tests_/bit/lintcmd.bit` | CLI contract: exit codes, walk, summary, `--json`, `--stats` |
+| `_tests_/bit/golden.bit` | `// lint` directive |
+| `_tests_/cases/lint_*.bit` | golden cases |
 | `docs/reference/` | user-facing rule reference |
 
 A rule is a **registry entry plus a check function**, and landing one touches

@@ -1,0 +1,589 @@
+// _tests_/bit/abimembers/scanners.bit — the source-text scanners for the
+// ABI-membership gate (#2867 phase 2's split of `_tests_/bit/abimembers.bit`).
+//
+// Sibling of `abimembers.bit` in the same directory module: no `import`, one
+// shared scope. Given raw source TEXT, this file's three scanners parse out
+// the three tag/pin lists the gate compares: `scanRtFnTags` reads
+// `compiler/irrtfns.bit`'s `rtFnTags` table, `scanCompilerFile` reads
+// `compiler/*.bit`'s `rt_call` names and direct `bit_rt_*` emissions, and
+// `scanPins` reads `runtime/**/*.bit`'s `@symbol("bit_rt_*")` pins — plus
+// `checkTableCovers`, which is itself a pure comparison over two of those
+// lists. Every one of these is a pure text-to-data function; none of them
+// walks a directory, reads a real file, or calls `bit`. This file also
+// carries their own unit tests (`checkScanners`, run first thing in `main`),
+// hand-built fixtures proving each parsing rule against both a clean and a
+// malformed input — the two traps this gate's header names by name: a false
+// positive (a symbol name mentioned only in a comment or a string) and a
+// false negative (a shape the scanner does not recognise, silently skipped).
+//
+// `abimembers.bit` keeps "the walk" (finding real `.bit` files under
+// `runtime/`/`compiler/` and handing their text to these scanners) and "the
+// gate" (the floors, the anchors, the demand set, and the missing-provider
+// report), plus `main`, which calls `checkScanners` here before doing
+// anything real — a scanner that fails its own fixtures must not be trusted
+// against the real tree.
+
+import { hasPrefix, indexOf, join, split } from "std/strings"
+
+// ==== Lexical helpers ====
+
+fn isIdentByte(c: u8): bool {
+  if (c >= '0' && c <= '9') {
+    return true
+  }
+  if (c >= 'A' && c <= 'Z') {
+    return true
+  }
+  if (c >= 'a' && c <= 'z') {
+    return true
+  }
+  return c == '_'
+}
+
+fn isSpaceByte(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\r'
+}
+
+fn identEnd(s: string, at: int): int {
+  let i = at
+  while (i < len(s) && isIdentByte(s[i])) {
+    i = i + 1
+  }
+  return i
+}
+
+fn identStart(s: string, at: int): int {
+  let i = at
+  while (i > 0 && isIdentByte(s[i - 1])) {
+    i = i - 1
+  }
+  return i
+}
+
+fn trimLeft(s: string): string {
+  let i = 0
+  while (i < len(s) && isSpaceByte(s[i])) {
+    i = i + 1
+  }
+  return s[i:]
+}
+
+fn trimRight(s: string): string {
+  let i = len(s)
+  while (i > 0 && isSpaceByte(s[i - 1])) {
+    i = i - 1
+  }
+  return s[:i]
+}
+
+// The line with any trailing `//` comment removed. Quote-aware, so a `//` inside
+// a string literal does not truncate the code, and a symbol name mentioned in a
+// comment cannot be read as one the compiler emits (trap (1) in the header).
+fn stripComment(line: string): string {
+  let i = 0
+  let inStr = false
+  while (i < len(line)) {
+    let c = line[i]
+    if (inStr) {
+      if (c == 92) {
+        i = i + 2
+        continue
+      }
+      if (c == '"') {
+        inStr = false
+      }
+      i = i + 1
+      continue
+    }
+    if (c == '"') {
+      inStr = true
+      i = i + 1
+      continue
+    }
+    if (c == '/' && i + 1 < len(line) && line[i + 1] == '/') {
+      return line[:i]
+    }
+    i = i + 1
+  }
+  return line
+}
+
+// The identifier a string literal opening at `at` holds, or "" when the literal
+// is not EXACTLY one identifier. `"bit_rt_x: text"` and `"bit_rt_${rt}"` both
+// yield "" — that is trap (1), and it is the whole reason this is a function
+// rather than a substring search.
+fn quotedIdent(s: string, at: int): string {
+  if (at >= len(s) || s[at] != '"') {
+    return ""
+  }
+  let end = identEnd(s, at + 1)
+  if (end >= len(s) || s[end] != '"') {
+    return ""
+  }
+  return s[at + 1:end]
+}
+
+// A `bit_rt_*` symbol name, or "" — `quotedIdent` plus the ABI prefix.
+fn quotedAbiName(s: string, at: int): string {
+  let name = quotedIdent(s, at)
+  if (!hasPrefix(name, abiPrefix) || len(name) == len(abiPrefix)) {
+    return ""
+  }
+  return name
+}
+
+fn lineCount(source: string): []string {
+  let lines = split(source, "\n")
+  if (len(lines) > maxLinesPerFile) {
+    return lines[:maxLinesPerFile]
+  }
+  return lines
+}
+
+// The runtime symbol implementing an `rt_call` — a verbatim port of
+// `compiler/codegen.bit`'s `rtSymbol`. The two must agree; the `bit_rt_set_err`
+// and `bit_rt_get_err` anchors in `main` are what proves they still do.
+fn rtSymbol(rt: string): string {
+  if (rt == "err_set") {
+    return "bit_rt_set_err"
+  }
+  if (rt == "err_get") {
+    return "bit_rt_get_err"
+  }
+  return "bit_rt_${rt}"
+}
+
+// ==== Scanner 1 — the RtFn table (`compiler/irrtfns.bit`) ====
+
+class TagScan {
+  tags: []string
+  bad: int
+}
+
+// Both spellings, while the lexer still accepts `function` as an alias for
+// `fn` (#2773 narrows this once `function` is gone). `compiler/irrtfns.bit`
+// declares this table `fn` today.
+const rtFnHeaderNew: string = "fn rtFnTags(): []string {"
+const rtFnHeaderOld: string = "function rtFnTags(): []string {"
+const rtFnOpen: string = "return ["
+const rtFnClose: string = "]"
+
+// Every tag of `rtFnTags`. A line inside the block that is neither blank, nor a
+// comment, nor `    "<ident>",` is counted `bad`: the table's shape is the whole
+// oracle here, and silently skipping a line it does not recognise is how a
+// demand set shrinks without anyone noticing.
+//
+// Anchoring on the FUNCTION SIGNATURE and not on `return [` matters: the latter
+// is a shape any list-returning helper added to that file later would also have,
+// and the scanner would then read whichever came first as the roster.
+fn scanRtFnTags(source: string): TagScan {
+  let out = TagScan{tags: []string(0), bad: 0}
+  let inside = false
+  for line of lineCount(source) {
+    let t = trimRight(line)
+    if (!inside) {
+      inside = hasPrefix(t, rtFnHeaderNew) || hasPrefix(t, rtFnHeaderOld)
+      continue
+    }
+    let body = trimLeft(t)
+    if (len(body) == 0 || hasPrefix(body, "//")) {
+      continue
+    }
+    if (body == rtFnOpen) {
+      continue
+    }
+    if (body == rtFnClose) {
+      return out
+    }
+    // `    "<ident>",` — quoted, comma-terminated, and the quotes must hold an
+    // identifier and nothing else, so an interpolation or a name with a suffix
+    // is `bad` rather than a tag that no provider could ever satisfy.
+    if (!hasPrefix(t, "    ") || len(body) < 4 || body[0] != '"' ||
+        body[len(body) - 1] != ',' || body[len(body) - 2] != '"') {
+      out.bad = out.bad + 1
+      continue
+    }
+    let name = body[1:len(body) - 2]
+    if (len(name) == 0 || identEnd(name, 0) != len(name)) {
+      out.bad = out.bad + 1
+      continue
+    }
+    out.tags = append(out.tags, name)
+  }
+  // Falling out of the loop means the closing `]` was never reached.
+  out.bad = out.bad + 1
+  return out
+}
+
+// The table is written by hand, so it can fall behind the compiler it describes.
+// Every `rt_call` name the compiler is actually SEEN to build must therefore
+// appear in it. A floor only catches the roster shrinking; this catches the
+// compiler growing past it, which is the direction that ends in an undefined
+// symbol rather than a merely weaker check.
+//
+// Returns the names rather than reporting them so its own unit test does not
+// have to print a failure that is not one.
+fn missingFromTable(tags: []string, seen: []string): []string {
+  let have = map<string, bool>{}
+  for t of tags {
+    have[t] = true
+  }
+  let out = []string(0)
+  for s of seen {
+    if (!have[s]) {
+      have[s] = true
+      out = append(out, s)
+    }
+  }
+  return out
+}
+
+fn checkTableCovers(tags: []string, seen: []string): int {
+  let missing = missingFromTable(tags, seen)
+  for s of missing {
+    eprint("abimembers: compiler/*.bit builds an `rt_call` named `${s}`, which " +
+      "compiler/irrtfns.bit does not list. Add it to `rtFnTags` — that table is " +
+      "the ABI's demand roster, and a primitive missing from it is one no pin is " +
+      "ever checked for.\n")
+  }
+  return len(missing)
+}
+
+// ==== Scanner 2 — the self-hosted compiler's `rt_call` names and direct emissions ====
+
+class EmitScan {
+  // `rt_call` tags, before `rtSymbol`.
+  tags: []string
+  // Whole `bit_rt_*` symbol names emitted directly by a backend.
+  names: []string
+}
+
+const mkInstrMark: string = "= mkInstr(Op."
+const nameMark: string = ".name = \""
+const returnMark: string = "return \""
+// Both spellings, while the lexer still accepts `function` as an alias for
+// `fn` (#2773 narrows this once `function` is gone). `compiler/lowerprim.bit`
+// declares `primRtName` `fn` today.
+const primRtNameHeadNew: string = "fn primRtName("
+const primRtNameHeadOld: string = "function primRtName("
+
+// Records the op a local was built with, so `<var>.name = "<tag>"` can be read
+// as an `rt_call` name only when `<var>` is an `Op.RtCall` instruction.
+fn noteMkInstr(ops: map<string, string>, s: string) {
+  let at = indexOf(s, mkInstrMark)
+  if (at < 0) {
+    return
+  }
+  let lhs = trimRight(s[:at])
+  let v = lhs[identStart(lhs, len(lhs)):]
+  if (len(v) == 0) {
+    return
+  }
+  let o = at + len(mkInstrMark)
+  ops[v] = s[o:identEnd(s, o)]
+}
+
+// The `rt_call` tag a `<var>.name = "<tag>"` line carries, or "" — including ""
+// for the trap this rule exists for, `atoms.name = "bit_stack_maps"`, whose
+// `<var>` is an `Op.StackMapsAddr`.
+fn rtCallName(ops: map<string, string>, s: string): string {
+  let at = indexOf(s, nameMark)
+  if (at <= 0) {
+    return ""
+  }
+  let v = s[identStart(s, at):at]
+  if (len(v) == 0 || ops[v] != "RtCall") {
+    return ""
+  }
+  return quotedIdent(s, at + len(nameMark) - 1)
+}
+
+// Every whole `"bit_rt_*"` literal on a line, comments already stripped, into
+// `out.names`.
+fn emittedNames(out: EmitScan, s: string) {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == '"') {
+      let name = quotedAbiName(s, i)
+      if (len(name) != 0) {
+        out.names = append(out.names, name)
+      }
+      i = identEnd(s, i + 1) + 1
+      continue
+    }
+    i = i + 1
+  }
+}
+
+// One compiler source. `primRtName`'s body is read separately because its tags
+// reach `.name` through a variable, which the `mkInstr` rule cannot see.
+fn scanCompilerFile(out: EmitScan, source: string) {
+  let ops = map<string, string>{}
+  let inPrim = false
+  for line of lineCount(source) {
+    let t = stripComment(line)
+    let s = trimLeft(t)
+    if (inPrim) {
+      inPrim = !hasPrefix(t, "}")
+      let at = indexOf(s, returnMark)
+      let tag = ""
+      if (at >= 0) {
+        tag = quotedIdent(s, at + len(returnMark) - 1)
+      }
+      if (len(tag) != 0) {
+        out.tags = append(out.tags, tag)
+      }
+      continue
+    }
+    inPrim = hasPrefix(t, primRtNameHeadNew) || hasPrefix(t, primRtNameHeadOld)
+    noteMkInstr(ops, s)
+    let tag = rtCallName(ops, s)
+    if (len(tag) != 0) {
+      out.tags = append(out.tags, tag)
+    }
+    emittedNames(out, s)
+  }
+}
+
+// ==== Scanner 3 — the providing half: `@symbol("bit_rt_*")` under `runtime/**/*.bit` ====
+
+class PinScan {
+  names: []string
+  bad: int
+}
+
+const symbolMark: string = "@symbol(\""
+// Both spellings, while the lexer still accepts `function` as an alias for
+// `fn` (#2773 narrows this once `function` is gone). `runtime/**/*.bit` is all
+// `fn` today.
+const funcKwNew: string = "fn "
+const funcKwOld: string = "function "
+
+// A pin line is a top-level declaration head: column 0, `export` or an
+// attribute. That excludes the one live comment mentioning `@symbol("...")`
+// (`runtime/auxv/auxv.bit`), which would otherwise register as a provider — the
+// dangerous direction, since a phantom provider makes a missing symbol PASS.
+fn isDeclHead(t: string): bool {
+  return hasPrefix(t, "export ") || hasPrefix(t, "@")
+}
+
+// Whether `t` carries either function-keyword spelling anywhere in it.
+fn hasFuncKw(t: string): bool {
+  return indexOf(t, funcKwNew) >= 0 || indexOf(t, funcKwOld) >= 0
+}
+
+// Whether `t` starts with either function-keyword spelling.
+fn startsFuncKw(t: string): bool {
+  return hasPrefix(t, funcKwNew) || hasPrefix(t, funcKwOld)
+}
+
+// Every `@symbol("bit_rt_*")` pin. The pin must be attached to a function — on
+// its own line or the next one — and a detached pin is `bad`, never a provider.
+fn scanPins(source: string): PinScan {
+  let out = PinScan{names: []string(0), bad: 0}
+  let lines = lineCount(source)
+  for (let i = 0; i < len(lines); i = i + 1) {
+    let t = trimRight(lines[i])
+    if (!isDeclHead(t)) {
+      continue
+    }
+    let at = indexOf(t, symbolMark)
+    if (at < 0) {
+      continue
+    }
+    let name = quotedAbiName(t, at + len(symbolMark) - 1)
+    if (len(name) == 0) {
+      continue
+    }
+    let here = hasFuncKw(t)
+    let next = i + 1 < len(lines) && startsFuncKw(trimRight(lines[i + 1]))
+    if (!here && !next) {
+      out.bad = out.bad + 1
+      continue
+    }
+    out.names = append(out.names, name)
+  }
+  return out
+}
+
+// ==== The scanners' own unit tests — run before the walk ====
+
+fn tableFixture(): string {
+  return "// a header comment naming \"string_from_a_comment\", which demands nothing\n" +
+    "fn rtFnTags(): []string {\n" +
+    "  return [\n" +
+    "    // a comment with a comma, inside the table\n" +
+    "    \"string_concat\",\n" +
+    "\n" +
+    "    \"err_set\",\n" +
+    "  ]\n" +
+    "}\n" +
+    // `map_set` sits AFTER the table's closing `]`: reading it as a tag would
+    // demand a `bit_rt_map_set` provider from a roster that never named one.
+    "fn someLaterHelper(): []string {\n" +
+    "  return [\n" +
+    "    \"map_set\",\n" +
+    "  ]\n" +
+    "}\n"
+}
+
+// A table whose entries are not plain quoted identifiers. Every one of these is
+// a primitive the gate would NOT be demanding, so each must register as `bad`
+// rather than be skipped in silence.
+fn malformedTableFixture(): string {
+  return "fn rtFnTags(): []string {\n" +
+    "  return [\n" +
+    "    \"ok_tag\",\n" +
+    "    \"trailing text\",\n" +
+    "    bare_ident,\n" +
+    // Split so this harness's own lexer does not interpolate the fixture.
+    "    \"interp_$" + "{x}\",\n" +
+    "    \"no_comma\"\n" +
+    "  ]\n" +
+    "}\n"
+}
+
+fn compilerFixture(): string {
+  return "fn emitAlloc(cx: X) {\n" +
+    "  emitCallReloc(cx, \"bit_rt_gc_alloc\")\n" +
+    "}\n" +
+    "fn safepointSymbol(): string {\n" +
+    "  return \"bit_rt_safepoint\"\n" +
+    "}\n" +
+    "fn rtSymbol(rt: string): string {\n" +
+    // Split so this harness's own lexer does not interpolate the fixture.
+    "  return \"bit_rt_$" + "{rt}\"\n" +
+    "}\n" +
+    "// a comment naming \"bit_rt_from_a_comment\", which emits nothing\n" +
+    "fn fatalText(): string {\n" +
+    "  return \"bit_rt_string_from_float: float text exceeds buffer\"\n" +
+    "}\n" +
+    "fn lowerThings(fc: FnCtx) {\n" +
+    "  let ins = mkInstr(Op.RtCall, ty)\n" +
+    "  ins.name = \"map_len\"\n" +
+    "  let atom = mkInstr(Op.StackMapsAddr, ty)\n" +
+    "  atom.name = \"bit_stack_maps\"\n" +
+    "  let cv = mkInstr(Op.Convert, ty)\n" +
+    "  cv.name = \"not_a_primitive\"\n" +
+    "}\n" +
+    "fn primRtName(name: string): string {\n" +
+    "  if (name == \"fsOpen\") { return \"fs_open\" }\n" +
+    "  return \"\"\n" +
+    "}\n"
+}
+
+fn pinFixture(): string {
+  return "// NOT PINNED WITH `@symbol(\"bit_rt_from_a_comment\")`, unlike its sibling.\n" +
+    "export @nosplit @symbol(\"bit_rt_slice_new\") fn rtSliceNew(n: int): int {\n" +
+    "}\n" +
+    "export @symbol(\"bit_rt_parse_float\")\n" +
+    "fn rtParseFloat(s: int): f64 {\n" +
+    "}\n" +
+    "@naked @symbol(\"bit_rt_safepoint\")\n" +
+    "fn rtSafepoint() {\n" +
+    "}\n" +
+    "export @symbol(\"strlen\")\n" +
+    "fn strlen(p: *u8): int {\n" +
+    "}\n" +
+    "export @symbol(\"bit_rt_detached\")\n" +
+    "\n" +
+    "fn notItsFunction() {\n" +
+    "}\n"
+}
+
+fn expectSet(got: []string, want: []string, what: string): int {
+  let bad = 0
+  let have = map<string, bool>{}
+  for g of got {
+    have[g] = true
+  }
+  for w of want {
+    if (!have[w]) {
+      eprint("scanner: ${what} did not find `${w}`\n")
+      bad = bad + 1
+    }
+  }
+  if (len(got) != len(want)) {
+    eprint("scanner: ${what} found ${len(got)} entries, wanted ${len(want)}: " +
+      "${join(got, " ")}\n")
+    bad = bad + 1
+  }
+  return bad
+}
+
+fn checkTableScanner(): int {
+  let s = scanRtFnTags(tableFixture())
+  let bad = 0
+  if (s.bad != 0) {
+    eprint("scanner: the table fixture reported ${s.bad} unrecognised line(s)\n")
+    bad = bad + 1
+  }
+  bad = bad + expectSet(s.tags, ["string_concat", "err_set"], "the rtFnTags scanner")
+
+  // Four malformed entries, and the one good tag beside them still read.
+  let m = scanRtFnTags(malformedTableFixture())
+  if (m.bad != 4) {
+    eprint("scanner: the malformed table reported ${m.bad} bad line(s), wanted 4\n")
+    bad = bad + 1
+  }
+  bad = bad + expectSet(m.tags, ["ok_tag"], "the rtFnTags scanner on malformed input")
+
+  let none = scanRtFnTags("fn nothing() {\n}\n")
+  if (len(none.tags) != 0 || none.bad == 0) {
+    eprint("scanner: a source with no `rtFnTags` must yield no tags AND report bad\n")
+    bad = bad + 1
+  }
+  // An unterminated table is `bad`, never a short roster read as complete.
+  let cut = scanRtFnTags("fn rtFnTags(): []string {\n  return [\n    \"only\",\n")
+  if (cut.bad == 0) {
+    eprint("scanner: a table with no closing `]` must report bad\n")
+    bad = bad + 1
+  }
+  return bad
+}
+
+fn checkTableCoversUnit(): int {
+  let bad = 0
+  if (len(missingFromTable(["a", "b"], ["a"])) != 0) {
+    eprint("scanner: the coverage check flagged a tag the table does list\n")
+    bad = bad + 1
+  }
+  // Reported once, not once per occurrence.
+  let miss = missingFromTable(["a"], ["a", "absent", "absent"])
+  bad = bad + expectSet(miss, ["absent"], "the table-coverage check")
+  return bad
+}
+
+fn checkCompilerScanner(): int {
+  let s = EmitScan{tags: []string(0), names: []string(0)}
+  scanCompilerFile(s, compilerFixture())
+  // NOT `bit_stack_maps` (an `Op.StackMapsAddr`), NOT `not_a_primitive` (an
+  // `Op.Convert`) — both would be unsatisfiable demands.
+  let bad = expectSet(s.tags, ["map_len", "fs_open"], "the rt_call scanner")
+  // NOT the `fatal(...)` message, NOT the comment, NOT `"bit_rt_${rt}"`.
+  bad = bad + expectSet(s.names, ["bit_rt_gc_alloc", "bit_rt_safepoint"],
+    "the direct-emission scanner")
+  return bad
+}
+
+fn checkPinScanner(): int {
+  let s = scanPins(pinFixture())
+  let bad = expectSet(s.names, ["bit_rt_slice_new", "bit_rt_parse_float", "bit_rt_safepoint"],
+    "the pin scanner")
+  // The detached pin: `bad`, and NOT a provider. A phantom provider is the one
+  // error that makes a missing symbol pass.
+  if (s.bad != 1) {
+    eprint("scanner: the pin fixture reported ${s.bad} detached pin(s), wanted 1\n")
+    bad = bad + 1
+  }
+  if (len(scanPins("").names) != 0) {
+    eprint("scanner: an empty source produced pins\n")
+    bad = bad + 1
+  }
+  return bad
+}
+
+fn checkScanners(): bool {
+  return checkTableScanner() + checkTableCoversUnit() +
+    checkCompilerScanner() + checkPinScanner() == 0
+}

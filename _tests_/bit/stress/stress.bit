@@ -1,0 +1,664 @@
+// Concurrency + GC stress suite — the Bit port of the deleted harness `stress`
+// (task #350, ported under #1593's retire-the-seed programme). Each subdirectory of
+// `_tests_/stress/` is a Bit program that hammers spawn / channels / select / the
+// collector and prints one deterministic line encoding its own correctness. Each
+// is compiled, then run TWICE: once under the default collector policy and once
+// under `BIT_GC=stress`, which collects at every safepoint. The stress run is a
+// precise-rooting oracle — any root the compiler or runtime fails to report is
+// swept the instant it stops being marked, so a rooting bug that a rare
+// production collection would only occasionally hit becomes a deterministic
+// wrong answer here. Both runs must reproduce the program's `.expected` stdout.
+//
+// THE SEED PASS IS GONE, NOT PORTED, AND THAT IS THE ONE THING TO NOTICE.
+// The deleted harness built every program with BOTH compilers — `bit-seed`
+// in-process and self-hosted `bit` as a subprocess — and its header carried a
+// paragraph (#1413) about how the self-hosted pass being absent had once read as
+// coverage. This port drives the SELF-HOSTED COMPILER ONLY. That is deliberate:
+// the seed is the retiring bootstrap oracle, `bit` is what ships, and a harness
+// written in Bit cannot import a non-Bit module in-process anyway. But #1413's
+// lesson runs both ways — a dropped pass that nobody writes down reads as
+// coverage exactly like a missing one did. It is dropped, it is stated here, and
+// it belongs on #1593's ledger.
+//
+// THE ORACLE IS ONLY AS DENSE AS THE SAFEPOINTS, and a program must earn it.
+// Codegen emits `bit_rt_safepoint` at loop back-edges (runtime/ABI.md §4);
+// `bit_rt_alloc` does NOT poll, so allocating does not by itself collect. A
+// straight-line program therefore runs ZERO collections under `BIT_GC=stress` no
+// matter how much it allocates, and its second run verifies nothing about
+// rooting — it is the same run twice. #1438 made that rule enforced rather than
+// merely stated: every stress run sets `BIT_GC_STATS=1` and must show a non-zero
+// collection count, and a legitimately straight-line program declares itself
+// with a non-empty `no-collect` file saying why.
+//
+// AND THE POLICY IS NOW PROVEN TO HAVE ARRIVED, WHICH #1438's OWN GUARD COULD
+// NOT DO. `collections != 0` cannot tell a real `BIT_GC=stress` run from the
+// default run repeated — the churn programs collect under the default policy
+// too — so a harness whose env plumbing silently failed would pass #1438's check
+// on every program while exercising precise rooting exactly zero times. The
+// aggregate stats line does not name the active policy (that is the honest fix,
+// and it needs `statsReport` in runtime/root/{linux,darwin}/boot.bit to emit
+// `policy=<default|stress|off>`), so this port closes the hole differentially
+// instead: BOTH runs carry `BIT_GC_STATS=1`, and a MAJORITY of the oracled
+// programs must show a stress count more than `stressRatio` times their default
+// count. Allocation-driven programs clear it by two to five orders of magnitude
+// (`gcgrow`: 1 against 1,476,203). Clock-paced ones do not and must not be made
+// to — `schedtimer` measures 99 against 41 — which is why the assertion is over
+// the CORPUS, where it belongs: "the environment reached the child" is a fact
+// about this harness, not about any one program. A `stress-waived` program gets
+// the mirror proof directly: its second run is `BIT_GC=off`, which must collect
+// EXACTLY zero.
+//
+// A MISSING STATS LINE IS FATAL, NEVER A SKIP. `osRunBounded` returns only an
+// exit code, so stdout and stderr exist solely as files the wrapper redirected
+// into — if the wrapper never execs, or a redirect is dropped, the reads come
+// back empty and every field lookup "finds nothing". Treating that as "this
+// build does not report the field" would switch the rooting oracle off for the
+// whole corpus in one line with no error text anywhere. Absent is an error —
+// with one DECLARED exception, `no-stats`, for a program that replaces the
+// runtime's own write/exit provider and so never reaches `statsReport`
+// (`rootiodarwin`). Declared, with a reason, and it costs that program the
+// collection oracles while keeping its stdout comparison under both policies.
+//
+// A THIRD MARKER, AND IT IS THE WEAKEST THING IN THIS FILE — `stress-waived`.
+// `no-collect` says "the collector cannot matter here"; `stress-waived` says
+// "the collector DOES matter here and this program does not survive it yet". The
+// second run switches to `BIT_GC=off`, so the program keeps proving its stdout
+// under one policy and proves nothing about rooting under the other. The
+// marker's whole design is that the hole cannot hide: the reason is mandatory,
+// and it is printed on EVERY run. A waiver never suppresses the stdout
+// comparison — only the policy changes.
+//
+// EVERY SUBPROCESS CARRIES A WALL-CLOCK DEADLINE. This is the corpus most able
+// to hang, and a program that deadlocks must be reported as a failure naming
+// itself rather than stalling the suite. `osRunBounded` (ABI.md §19) bounds the
+// compile and both runs. `BIT_TEST_TIMEOUT_S` overrides the 300s default.
+// CAVEAT, and it is a real divergence from what `BIT_TEST_TIMEOUT_S=0` once
+// meant: it used to be "block forever", and `osRunBounded` has no unbounded mode — it
+// clamps to 100 minutes. `0` is therefore honored as 100 MINUTES here, loudly, rather
+// than silently redefined.
+//
+// A per-program `timeout-s` file beside `no-collect` (#2695) goes one step
+// further: it wins over `BIT_TEST_TIMEOUT_S`, which wins over the 300s default.
+//
+// A per-program `workers` file beside `timeout-s` (#2583) pins BIT_WORKERS for
+// this one program's two runs, ahead of whatever the ambient environment (a
+// gate's own env, a developer's shell) already had - `../schedpreempt` is the
+// first user: its whole claim is that the scheduler can force ONE worker to
+// hand itself back to another ready task, which two or more workers would let
+// the peer task satisfy on its own OS thread regardless of whether preemption
+// works at all.
+//
+// THE DEADLINE ITSELF SCALES WITH OBSERVED HOST LOAD (#2401). `defaultTimeoutS`
+// is calibrated against an idle host, and a correct program can legitimately
+// take several times longer under contention — 485s against the 300s default
+// with six agents building, byte-identical to `.expected` when re-run alone.
+// `verify.bit`'s `loadProbe`/`runScript` sample load fresh before every bounded
+// subprocess and multiply the base deadline accordingly (capped at
+// `loadScaleCap`x); at idle-relative load the multiplier is 1 and the wall is
+// exactly the constant below. A program whose deadline elapses even after
+// scaling is `inconclusive`, not `failed` — see `checkProgram`'s `badVerdict`
+// and `main`'s judged/inconclusive summary — because "the deadline could not
+// judge this" and "this program is wrong" are different claims, and folding
+// them together is what made a busy host indistinguishable from a real hang.
+// This does NOT rescue a program whose own baseline (idle) runtime already
+// exceeds the wall — that is #2210, a different, already-decided fix.
+//
+// WHY A `/bin/sh` WRAPPER. `osRunBounded(path, timeout_ms)` takes no argv, no
+// environment and captures no output, so a shell script is the only way to hand
+// a child `BIT_GC=stress` and keep its stdout. `exec` in the wrapper is
+// LOAD-BEARING, not style: without it the shell stays as the child, and
+// `osRunBounded`'s SIGKILL on timeout kills the shell and orphans the deadlocked
+// stress binary — precisely the hazard this corpus exists to catch. The honest
+// fix is an `osRunBoundedEnv(path, argv, env, timeout_ms)` primitive that returns
+// captured pipes; until it exists this suite has a shell dependency the
+// deleted harness did not have.
+//
+// Run it: `bit-out/bin/bit run _tests_/bit/stress`, from the repository root.
+// `BIT_STRESSGATE_DIR` / `BIT_STRESSGATE_ONLY` narrow the run for debugging and
+// mutation-testing; either one turns the corpus floors off and prints NOT A GATE.
+//
+// THIS HARNESS IS A THREE-FILE DIRECTORY MODULE (#2867, widened by #3574),
+// split only along existing seams, not by line count. `stress.bit` (this
+// file) keeps the corpus census and its rationale, the exclusive/batch
+// partition, and `main`. Sibling `verify.bit` keeps the per-program machinery
+// `main` calls into: build, run under both GC policies, and compute a
+// `Verdict`. Sibling `setup.bit` keeps the string primitives single-file mode
+// has no prelude for, plus the target/timeout/private-compiler setup `main`
+// performs once before the corpus loop — #3574 split it out of this file to
+// clear the 800-line ceiling after formatting. Files side by side in one
+// directory share ONE scope — no `import` between them — so every name
+// declared in any of the three is visible in the others, exactly as if this
+// were still a single file.
+
+// Upper bound on the directory walk (Power of 10 rule 2).
+const maxPrograms: int = 256
+
+// `_tests_/stress/parallel/` (#2538/#2539) is a DIFFERENT corpus: standalone
+// single-file programs run individually via `bit run <file>.bit`, gated by
+// its own `test-stress-parallel` (scripts/stress-parallel.sh), never as one
+// directory-per-program legacy entry. This walk requires `<name>.expected`
+// per directory and builds the whole directory as ONE module - neither holds
+// for `parallel`, which has no aggregate `.expected` and would collide two
+// `fn main()` together the moment it holds a second file. #3397.
+const excludedDirName: string = "parallel"
+
+// Corpus floors. A suite that is one loop over a directory reports "0 programs,
+// 0 failures" and exits 0 when the walk finds nothing, so the counts are
+// asserted rather than trusted. `minRunnable` is the per-host half: 44 of the 94
+// directories the walk considers (_tests_/stress/*, minus `excludedDirName`) carry
+// a host marker, so a gate that skipped everything would still look busy.
+//
+// THEY ARE THE EXACT COUNTS, not a comfortable margin, and that is what makes
+// adding a program bump them. Left slack they drift: these read 79/60 while the
+// corpus already held 80 directories, so one addition had gone unrecorded and a
+// second could have too.
+//
+// #2582 added `../schedpreempt` (no host marker, so it counts on both sides).
+// Its branch was cut when the corpus held 89 walk directories and predicted
+// 90/69; three more landed while it waited, so the numbers below are counted
+// off disk at merge time rather than taken from either side of the conflict:
+// `ls -d _tests_/stress/*/ | grep -v /parallel/` is 94, and
+// `ls _tests_/stress/*/linux-only` is 22, so macOS runs 94 - 22 = 72.
+const minPrograms: int = 94
+const minRunnable: int = 72
+
+// How many directories must be skipped for belonging to the OTHER host. #2167's
+// `spawnjoinregionslinux` is linux-only with no Darwin twin, and the two sides
+// move independently: `darwin-only` reached 22 with #2593's
+// ./schedgrowdemanddarwin (after #2645's ./stwownstack — a raw OS thread with
+// no green task, which needs a real platform thread door — had taken it to
+// 21), and `linux-only` reached 22 separately with #3476's ./schedgrowlinux
+// (after #3291's ../netclockmono had taken it to 21).
+//
+// The two sides are EQUAL right now, 22 and 22, but that is a coincidence of
+// today's corpus, not something either side owes the other: they were 21/22 as
+// recently as #3476, and the next host-only test added to just one side (the
+// common case — additions are rarely paired) breaks the equality again, in
+// either direction. `minHostSkips` is deliberately a FLOOR well below both
+// sides rather than either side's exact value or their shared value: the check
+// on each platform reads the OTHER side's skip count (a macOS run's floor is
+// really a bound on the linux-only count, a Linux run's on the darwin-only
+// count), so the guard is only as safe as the SMALLER of the two — and pinning
+// it to today's number assumes that relationship holds, which the 21/22
+// history above shows it does not.
+// Inverting the host gate still leaves `minRunnable` satisfied; mutation-testing
+// found that.
+const minHostSkips: int = 19
+
+// How far above its default-policy count a program's stress-policy count must
+// sit before the second run counts as having had a different policy. See the
+// header: the measured margins are 250x and up.
+const stressRatio: int = 8
+
+// The corpus-wide plumbing assertion: at least 1-in-`minProofShare` of the
+// oracled programs must clear `stressRatio`, and the check only applies once
+// `minProofSample` of them have run (a one-program debugging run proves nothing
+// about plumbing and should not pretend to).
+const minProofShare: int = 2
+const minProofSample: int = 4
+
+const defaultTimeoutS: int = 300
+const clampTimeoutMs: int = 6000000
+
+// `timeoutSOverrideMs`'s two non-value results: no file at all, versus a file
+// that exists but is not a positive integer. Kept distinct because the two
+// cases have opposite handling in the caller - absent falls through to the
+// existing bound, invalid fails the one program outright.
+const timeoutSAbsent: int = -1
+const timeoutSInvalid: int = -2
+
+// `workersOverride`'s two non-value results (#2583), same shape and same
+// reason as the pair above: absent lets the ambient BIT_WORKERS (if any)
+// stand, invalid fails the one program rather than silently keeping
+// whatever the environment already had.
+const workersAbsent: int = -1
+const workersInvalid: int = -2
+
+const targetX64Linux: int = 0
+const targetArm64Linux: int = 1
+const targetArm64Macos: int = 2
+
+const aggregatePrefix: string = "[bit-gc] collections="
+
+// --- the exclusive/batch split (#2564) --------------------------------------
+//
+// `test-stress` used to run every eligible program itself, `exclusive: true`
+// (tools/build/gates.bit), because a program that asserts on real elapsed time
+// gives a false red when a neighbour gate is co-scheduled on the same cores
+// (#2400 was a 4% margin). But most of the corpus asserts only on correctness —
+// an exit predicate, a byte comparison, a deterministic counter — and does not
+// care who else is on the box.
+//
+// EXACTLY FOUR NAMES HERE, and each earned its place by actually reading a real
+// clock as the DISCRIMINATOR between a pass and a fail, not merely as an
+// anti-hang backstop around a boolean/count outcome (`threadJoin`'s deadline,
+// the pool families' generous multi-second polls, `chanrace*`'s progress-reset
+// stall detector — all of those get SAFER as the box gets slower, since a
+// ceiling-only backstop just gets more room). These four do not:
+//
+//   - `parkdarwin`/`parklinux` drive `park/props`'s P1/P2/P4, which discriminate
+//     "really blocked" from "returned immediately" by a *3x* margin (a 150ms
+//     floor against a 50ms ceiling) — the tightest window in this corpus, and
+//     the shape #2400 broke on elsewhere.
+//   - `threaddarwin`/`threadlinux` drive `thread/props`'s P4/P5, a wider 25x-50x
+//     margin (40ms/2s, 200ms/5s) but still a genuine elapsed-time discriminator
+//     rather than a backstop. Kept in rather than argued out of it: a program
+//     whose classification is a judgment call stays on the safe side of it.
+//
+// Every other real-clock use in the corpus was read and is a backstop, not a
+// discriminator (see #2564's ticket for the file-by-file account). Nothing here
+// classifies by NAME PATTERN — "thread" and "threaddarwin" share a prefix and
+// opposite classifications, because only one of them reads a real clock.
+fn exclusiveNames(): []string {
+  return ["parkdarwin", "parklinux", "threaddarwin", "threadlinux"]
+}
+
+fn isExclusiveProgram(name: string): bool {
+  for n of exclusiveNames() {
+    if (n == name) {
+      return true
+    }
+  }
+  return false
+}
+
+// Host-invariant like `minHostSkips`: the four names above are two darwin/linux
+// pairs, so the host gate always admits exactly one of each pair, and exactly
+// two of the four are ever eligible on one host. An exact count, not a floor,
+// for the reason `minRunnable`'s header gives — a name added to one partition
+// and not this list would otherwise drift in silence.
+const minExclusiveRunnable: int = 2
+
+// The harness-wide context every setup and per-program function threads
+// through. `Text`/`Marker`/`Outcome`/`Verdict` — the per-program result types
+// `checkProgram` and its callees use — live in `verify.bit` beside the code
+// that produces them.
+class Ctx {
+  root: string,
+  compiler: string,
+  stdlib: string,
+  libbitrt: string,
+  scratch: string,
+  timeoutMs: int,
+  target: int,
+}
+
+fn say(s: string) {
+  print(s)
+  print("\n")
+}
+
+// Single-file mode has no prelude, so `string(i)` is not a conversion; the one
+// int-to-string road is interpolation.
+fn num(v: int): string {
+  return "${v}"
+}
+
+fn die(s: string) {
+  say("stress: FATAL: " + s)
+  osExit(1)
+}
+
+fn main() {
+  let root = trim(osEnv("BIT_STRESSGATE_ROOT"))
+  if (len(root) == 0) {
+    root = "."
+  }
+  if (!fsIsDir(root + "/_tests_/stress") || !fsIsDir(root + "/stdlib")) {
+    die(
+        "run this from the repository root (or set BIT_STRESSGATE_ROOT): '" +
+        root +
+        "' has no _tests_/stress + stdlib",
+    )
+  }
+
+  // The two debugging knobs, and the asymmetry between them is deliberate.
+  // `BIT_STRESSGATE_ONLY` narrows which programs are EXECUTED; it does not touch
+  // enumeration or the host gate, so BOTH corpus floors still apply under it and
+  // a filtered run cannot hide an empty walk or an inverted host gate.
+  // `BIT_STRESSGATE_DIR` replaces the corpus outright, which the floors are
+  // counting - so that one, and only that one, turns them off and says so.
+  let corpus = trim(osEnv("BIT_STRESSGATE_DIR"))
+  let only = trim(osEnv("BIT_STRESSGATE_ONLY"))
+  let fixture = len(corpus) > 0
+  let partial = fixture || len(only) > 0
+  if (len(corpus) == 0) {
+    corpus = root + "/_tests_/stress"
+  }
+  if (partial) {
+    say("stress: *** PARTIAL RUN - NOT A GATE *** (BIT_STRESSGATE_DIR/ONLY set)")
+  }
+  if (fixture) {
+    say("stress: corpus floors are OFF - BIT_STRESSGATE_DIR replaced the corpus")
+  }
+
+  // `BIT_STRESSGATE_PARTITION` is NOT a debugging knob like the two above: it is
+  // how `./make test-stress-exclusive` / `./make test-stress-batch`
+  // (tools/build/gates.bit) split one permanent gate into two, so unlike `only`
+  // it must NOT print "NOT A GATE" or otherwise read as a lesser run. Unset (the
+  // default, and what plain `./make test-stress` uses) runs everything, exactly
+  // as before the split existed.
+  let partition = trim(osEnv("BIT_STRESSGATE_PARTITION"))
+  if (partition != "" && partition != "exclusive" && partition != "batch") {
+    die("BIT_STRESSGATE_PARTITION must be 'exclusive', 'batch', or unset - got '" + partition + "'")
+  }
+  if (partition != "") {
+    say("stress: partition '" + partition + "' (BIT_STRESSGATE_PARTITION)")
+  }
+
+  let target = hostTarget()
+  let compilerSrc = root + "/bit-out/bin/bit"
+  let libbitrt = root + "/bit-out/lib/" + targetTriple(target) + "/libbitrt.a"
+  if (!fsExists(compilerSrc)) {
+    die("no self-hosted compiler at " + compilerSrc)
+  }
+  if (!fsExists(libbitrt)) {
+    die("no runtime archive at " + libbitrt)
+  }
+
+  let scratch = "/tmp/bit-stressgate-" + num(timeUnixNs())
+  if (fsMkdir(scratch) != 0) {
+    die("cannot create scratch dir " + scratch)
+  }
+
+  let cx = Ctx{
+    root: root,
+    compiler: compilerSrc,
+    stdlib: root + "/stdlib",
+    libbitrt: libbitrt,
+    scratch: scratch,
+    timeoutMs: timeoutMs(),
+    target: target,
+  }
+  cx = Ctx{
+    root: cx.root,
+    compiler: privateCompiler(cx, compilerSrc),
+    stdlib: cx.stdlib,
+    libbitrt: cx.libbitrt,
+    scratch: cx.scratch,
+    timeoutMs: cx.timeoutMs,
+    target: cx.target,
+  }
+
+  let names = sortNames(splitNul(fsListDir(corpus)))
+  if (len(names) > maxPrograms) {
+    die("more than " + num(maxPrograms) + " entries in " + corpus)
+  }
+
+  let dirs = []string(0)
+  let i = 0
+  while (i < len(names) && i < maxPrograms) {
+    if (names[i] != excludedDirName && fsIsDir(corpus + "/" + names[i])) {
+      dirs = append(dirs, names[i])
+    }
+    i = i + 1
+  }
+  if (!fixture && len(dirs) < minPrograms) {
+    die(
+        "found " +
+        num(len(dirs)) +
+        " program directories in " +
+        corpus +
+        ", expected at least " +
+        num(minPrograms) +
+        " - the corpus walk found nothing to run",
+    )
+  }
+
+  // Apply the host gate as its OWN pass, and check its floor before a single
+  // program is built. A program that can only run on one OS marks itself:
+  // `darwin-only` is `extern function` (SPEC §11.7) — Bit's ELF output is fully
+  // static with no dynamic symbol table, so an extern symbol has nothing to
+  // resolve against and the compiler rejects it outright — and `linux-only` is
+  // the mirror, for `syscall` (§11.8). Neither compiles elsewhere, so it is a
+  // skip, not a failure.
+  //
+  // Separated from the run loop for two reasons. The floor below is the guard
+  // against an INVERTED gate, and an inverted gate selects exactly the programs
+  // that cannot compile here — so checking it afterwards means sitting through
+  // 19 compile failures to be told the gate is backwards. And `eligible` is
+  // counted before `ONLY` is applied, so a filtered run still enforces it: a
+  // guard a debugging knob can switch off is not a guard.
+  let eligible = []string(0)
+  let skippedDarwin = 0
+  let skippedLinux = 0
+  let e = 0
+  while (e < len(dirs)) {
+    let dir = corpus + "/" + dirs[e]
+    if (fsExists(dir + "/darwin-only") && target != targetArm64Macos) {
+      skippedDarwin = skippedDarwin + 1
+    } else if (fsExists(dir + "/linux-only") && target == targetArm64Macos) {
+      skippedLinux = skippedLinux + 1
+    } else {
+      eligible = append(eligible, dirs[e])
+    }
+    e = e + 1
+  }
+  let skipped = skippedDarwin + skippedLinux
+  if (!fixture && len(eligible) < minRunnable) {
+    die(
+        "only " +
+        num(len(eligible)) +
+        " of " +
+        num(len(dirs)) +
+        " programs are runnable on this host (" +
+        num(skipped) +
+        " skipped), expected at least " +
+        num(minRunnable),
+    )
+  }
+  // The count above does NOT catch an inverted gate, and finding that out is the
+  // reason this check exists. The corpus carries 19 `darwin-only` and 19
+  // `linux-only` directories — inverting the comparison SWAPS which 19 are
+  // skipped and leaves the runnable total at 59, green, with a skip count that
+  // still looks right. Only counting the two marker kinds SEPARATELY breaks that
+  // symmetry: on macOS the darwin-only skip count must be zero and the
+  // linux-only one must not be, and inverting the gate reverses exactly that.
+  let wrongWay = skippedDarwin
+  let rightWay = skippedLinux
+  if (target != targetArm64Macos) {
+    wrongWay = skippedLinux
+    rightWay = skippedDarwin
+  }
+  if (!fixture && (wrongWay != 0 || rightWay < minHostSkips)) {
+    die(
+        "host gate is inverted: skipped " +
+        num(wrongWay) +
+        " programs marked for THIS host and " +
+        num(rightWay) +
+        " marked for the other (expected 0 and at least " +
+        num(minHostSkips) +
+        ")",
+    )
+  }
+
+  let ran = 0
+  let failures = 0
+  // #2401: a program the (load-scaled) deadline could not judge at all is
+  // counted separately from a program that ran and was wrong. `judged` is the
+  // corpus-wide denominator this buys - see the summary at the end of `main`.
+  let inconclusive = 0
+  let oracled = 0
+  let proofs = 0
+
+  // The `batch` partition is fanned out through `fanout.bit`'s `runBatch`
+  // (#3776) instead of this loop: one `gatefanout` batch (stage every
+  // program's jobs, ONE outer `osRunBounded` call, grade in order) rather
+  // than `checkProgram` one program at a time. `exclusive` and the plain
+  // unpartitioned run still take the loop below unchanged — see fanout.bit's
+  // header for why the four timing-sensitive `exclusive` programs cannot
+  // share cores with anything else, including each other.
+  if (partition == "batch") {
+    let batchList = batchNames(eligible, only)
+    let batch = runBatch(cx, corpus, batchList)
+    ran = batch.ran
+    failures = batch.failures
+    inconclusive = batch.inconclusive
+    oracled = batch.oracled
+    proofs = batch.proofs
+  } else {
+    let k = 0
+    while (k < len(eligible)) {
+      let name = eligible[k]
+      k = k + 1
+      if (len(only) > 0 && indexOfAt("," + only + ",", "," + name + ",", 0) < 0) {
+        continue
+      }
+      if (partition == "exclusive" && !isExclusiveProgram(name)) {
+        continue
+      }
+      ran = ran + 1
+      let dir = corpus + "/" + name
+      // Per-program deadline override (see the header and `resolveTimeoutMs`):
+      // an invalid `timeout-s` file fails this one program without touching
+      // any other.
+      let effTimeoutMs = resolveTimeoutMs(cx, dir)
+      if (effTimeoutMs == timeoutSInvalid) {
+        say("stress '" + name + "': bad timeout-s file")
+        failures = failures + 1
+        continue
+      }
+      // Applied as its own `Ctx` copy for just this call - every other field,
+      // and every other program's `cx`, is untouched.
+      let pcx = Ctx{
+        root: cx.root,
+        compiler: cx.compiler,
+        stdlib: cx.stdlib,
+        libbitrt: cx.libbitrt,
+        scratch: cx.scratch,
+        timeoutMs: effTimeoutMs,
+        target: cx.target,
+      }
+      let v = checkProgram(pcx, name, dir)
+      failures = failures + v.failed
+      inconclusive = inconclusive + v.inconclusive
+      if (v.oracled) {
+        oracled = oracled + 1
+      }
+      if (v.proved) {
+        proofs = proofs + 1
+      }
+    }
+  }
+
+  // A SPLIT THAT SILENTLY DROPS A PROGRAM IS WORSE THAN NO SPLIT: `batch` is
+  // defined as "not exclusive", so between the two partitions every eligible
+  // name runs exactly once by construction, with no third bucket a typo could
+  // fall into - but a typo in `exclusiveNames()` that matches no real directory
+  // would move a program from `exclusive` to `batch` without failing anything,
+  // which is a real classification bug even though it drops no coverage. This
+  // is what catches THAT: an exact count, like `minRunnable`'s own reasoning,
+  // and skipped only when a debugging knob has already made `ran` mean
+  // something else.
+  if (!partial) {
+    if (partition == "exclusive" && ran != minExclusiveRunnable) {
+      die(
+          "stress: partition 'exclusive' ran " +
+          num(ran) +
+          " programs, expected exactly " +
+          num(minExclusiveRunnable) +
+          " - exclusiveNames() and the corpus have drifted apart",
+      )
+    }
+    if (partition == "batch" && ran != len(eligible) - minExclusiveRunnable) {
+      die(
+          "stress: partition 'batch' ran " +
+          num(ran) +
+          " programs, expected exactly " +
+          num(len(eligible) - minExclusiveRunnable) +
+          " - exclusiveNames() and the corpus have drifted apart",
+      )
+    }
+  }
+
+  // THE PLUMBING ASSERTION, and it is the one guard the deleted harness could not
+  // have. `collections != 0` cannot tell `BIT_GC=stress` from the default run
+  // repeated, so if the second wrapper's environment silently stopped arriving
+  // every program would still pass its own oracle while precise rooting was
+  // never exercised. Collecting at every safepoint costs two to five orders of
+  // magnitude, so a majority of the oracled programs must show it. Asserted over
+  // the corpus rather than per program because a clock-paced program legitimately
+  // cannot clear the margin (see `checkProgram`), and asserted as a SHARE rather
+  // than a count so a filtered run enforces it too.
+  say(
+      "stress: policy proofs " +
+      num(proofs) +
+      "/" +
+      num(oracled) +
+      " (stress count above " +
+      num(stressRatio) +
+      "x the default count)",
+  )
+  if (oracled >= minProofSample && proofs * minProofShare < oracled) {
+    say("stress: FAIL - only " + num(proofs) + " of " + num(oracled) + " oracled programs collected")
+    say("  meaningfully more under BIT_GC=stress than under the default policy. That is not a")
+    say("  stress pass, it is the default run performed twice: the environment in the second")
+    say("  wrapper is not reaching the child.")
+    failures = failures + 1
+  }
+
+  // #2401's denominator, printed on EVERY run, success or failure: a run that
+  // judged nothing must look different from one that judged everything. `ran`
+  // is programs that reached `checkProgram`; `judged` is the ones a verdict was
+  // actually reached for - the two are equal unless the load-scaled deadline
+  // still elapsed somewhere.
+  let judged = ran - inconclusive
+  say(
+      "stress: " +
+      num(judged) +
+      "/" +
+      num(ran) +
+      " program(s) judged (" +
+      num(inconclusive) +
+      " inconclusive)",
+  )
+
+  if (inconclusive != 0) {
+    // An unjudged program is never a silent pass - the corpus-wide plumbing
+    // proof above and the per-program oracle both need every program to have
+    // actually run. But it is also not the same CLAIM as `failures`: this is
+    // "the deadline elapsed even after scaling for observed load", not "the
+    // program produced a wrong answer or would not build" - see runScript's own
+    // TIMED OUT line, above, for the load average and scale at each occurrence.
+    say(
+        "stress: INCONCLUSIVE - " +
+        num(inconclusive) +
+        " of " +
+        num(ran) +
+        " program(s) did not finish within the load-scaled deadline. Host contention or a",
+    )
+    say("  genuine hang - re-run the named program(s) standalone on a quiet host to tell them apart.")
+  }
+
+  if (failures != 0 || inconclusive != 0) {
+    say(
+        "stress: FAIL - " +
+        num(ran) +
+        " programs run, " +
+        num(skipped) +
+        " skipped, " +
+        num(failures) +
+        " failed, " +
+        num(inconclusive) +
+        " inconclusive",
+    )
+    osExit(1)
+  }
+  let tag = "PASS"
+  if (partial) {
+    tag = "PASS (PARTIAL RUN - NOT A GATE)"
+  }
+  say(
+      "stress: " +
+      tag +
+      " - " +
+      num(ran) +
+      " programs run, " +
+      num(skipped) +
+      " skipped, " +
+      num(judged) +
+      "/" +
+      num(ran) +
+      " judged",
+  )
+}

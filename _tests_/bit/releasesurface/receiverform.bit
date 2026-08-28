@@ -1,0 +1,465 @@
+// _tests_/bit/releasesurface/receiverform.bit — migrates the pinned baseline's
+// `fn (recv: Type) name()` methods (SPEC 10.4 pre-0.2.0, removed by #3762)
+// into the in-body form, so `bit doc --fields` (the CURRENT compiler — see
+// releasesurface.bit's own "WHY THE SAME (CURRENT) COMPILER DOCUMENTS BOTH
+// SIDES") can still parse and document the baseline at all.
+//
+// WHY THIS EXISTS. #3822: every 0.1.28 baseline module uses the written
+// receiver form somewhere (351 declarations across the pinned stdlib), and
+// #3762 made that a hard parse error (E0103) in the compiler under test.
+// Sibling of `rewriteBaselineKeyword` (releasesurface.bit) in shape — copy
+// privately, rewrite mechanically, self-retiring once the pin moves past a
+// release that predates #3762 — but this rewrite is STRUCTURAL, not a word
+// swap: it moves a whole declaration from top level into a `class`/`enum`
+// body and renames its receiver to `this`.
+//
+// WHY TOKENS, NOT TEXT SCANNING. `struct`/`class` is a single reserved word
+// with no nested structure. A receiver-form method's signature and body can
+// contain arbitrary strings, comments and nested braces, and hand-rolling a
+// scanner for all of that is exactly the class of bug this project keeps
+// re-discovering (see CLAUDE.md's own "why tokens, not regex" lessons). The
+// CURRENT compiler's `--dump-tokens` is the LEXER only (compiler/main.bit's
+// `dumpTokens`) — it does not care that the receiver form was removed from
+// the PARSER, so it tokenizes baseline source exactly as it always did,
+// with correct string/comment/interpolation handling already solved. Every
+// structural decision below (declaration boundaries, brace matching, the
+// method body's exact byte span) is made against that token stream; the
+// only place original SOURCE BYTES are read is the final verbatim slice
+// copied into its new home.
+//
+// SCOPE, VERIFIED AGAINST THE ACTUAL 0.1.28 BASELINE, NOT ASSUMED:
+//   - No receiver clause carries its own generics (`grep -rn '^fn (' | grep
+//     '<'` is empty) — panicked on rather than silently mishandled if a
+//     future pin has one (detectReceiverForm below).
+//   - A receiver-form method's target type can be declared in a DIFFERENT
+//     FILE of the same top-level module directory (12 of 77 cases, e.g.
+//     tls/serverflight.bit's methods on TlsServerHandshake, declared in
+//     tls/resume.bit) — hence migrateModule scans a whole module directory
+//     before resolving any target, never one file in isolation.
+//   - Bare type names COLLIDE ACROSS modules (`Conn` in net/, http2/ and
+//     quic/ are three unrelated types) — hence the target-type map is
+//     rebuilt fresh per module directory, never shared across modules.
+//   - Zero receiver-name/parameter-name collisions and zero receiver-name
+//     local-variable shadowing anywhere in the corpus (checked with a
+//     brace-matching scan over every one of the 351 bodies) — so a blind
+//     word-boundary rename of the receiver to `this` is safe for this
+//     input. A future pin that introduces either would still SYNTAX-CHECK
+//     (or fail loudly in docModule, never silently), because this migration
+//     only ever runs against a private scratch copy, never the real thing.
+
+class Tok {
+  kind: string,
+  start: int,
+  end: int,
+}
+
+// Bounds the token-stream and dump-line loops below (Power of 10 rule 2) —
+// generous enough that no real stdlib file gets near it; a file that does
+// is almost certainly a scanner bug feeding this function garbage.
+const maxScanTokens: int = 200000
+
+// One line of `bit --dump-tokens`'s own output: "<kind> <start>..<end>".
+fn parseTokens(dumpText: string): []Tok {
+  let out = []Tok(0)
+  let lines = split(dumpText, "\n")
+  let n = len(lines)
+  if (n > maxScanTokens) {
+    n = maxScanTokens
+  }
+  for (let i = 0; i < n; i = i + 1) {
+    let line = trimSpace(lines[i])
+    if (len(line) == 0) {
+      continue
+    }
+    let sp = split(line, " ")
+    if (len(sp) != 2) {
+      panic("releasesurface: unparseable --dump-tokens line: ${line}")
+    }
+    let range = split(sp[1], "..")
+    if (len(range) != 2) {
+      panic("releasesurface: unparseable --dump-tokens range: ${sp[1]}")
+    }
+    let start = parseInt(range[0]) catch e {
+      panic("releasesurface: bad token start '${range[0]}': ${e.message()}")
+    }
+    let end = parseInt(range[1]) catch e {
+      panic("releasesurface: bad token end '${range[1]}': ${e.message()}")
+    }
+    out = append(out, Tok{ kind: sp[0], start: start, end: end })
+  }
+  return out
+}
+
+// Shells out to `<bin> --dump-tokens <path>` (lexer only — no BIT_STDLIB, no
+// module resolution, matching compiler/main.bit's dumpTokens) and parses
+// the result.
+fn dumpTokensFor(bin: string, path: string, scratch: string, tag: string, ms: int): []Tok {
+  let outPath = "${scratch}/${tag}.tok.out"
+  let errPath = "${scratch}/${tag}.tok.err"
+  let script = "#!/bin/sh\n" +
+    "exec \"" +
+    bin +
+    "\" --dump-tokens \"" +
+    path +
+    "\" >\"" +
+    outPath +
+    "\" 2>\"" +
+    errPath +
+    "\"\n"
+  let code = shell("${scratch}/${tag}.tok.sh", script, ms) catch e {
+    panic("releasesurface: ${e.message()}")
+  }
+  if (code != 0) {
+    let why = readFile(errPath) catch _ {
+      ""
+    }
+    panic("releasesurface: --dump-tokens ${path} failed (exit ${code}): ${why}")
+  }
+  let text = readFile(outPath) catch e {
+    panic("releasesurface: cannot read ${outPath}: ${e.message()}")
+  }
+  return parseTokens(text)
+}
+
+fn tokenText(src: string, tok: Tok): string {
+  return src[tok.start:tok.end]
+}
+
+fn isKind(toks: []Tok, i: int, kind: string): bool {
+  return i >= 0 && i < len(toks) && toks[i].kind == kind
+}
+
+fn skipExport(toks: []Tok, i: int): int {
+  if (isKind(toks, i, "kw_export")) {
+    return i + 1
+  }
+  return i
+}
+
+// What a top-level construct starting at token `i` turns out to be, once
+// `startTopLevel` has looked past an optional leading `export`. `kind` is
+// "" (something else — a plain fn, const, import: ignored), "type" (a
+// `class`/`enum` declaration) or "recv" (a receiver-form method). `next` is
+// where the caller resumes scanning; `methodStartByte` is only meaningful
+// for "recv" (the byte offset of the method's own name, i.e. where its
+// in-body replacement text begins).
+class TopStart {
+  kind: string,
+  name: string,
+  recvName: string,
+  next: int,
+  methodStartByte: int,
+}
+
+fn noStart(next: int): TopStart {
+  return TopStart{ kind: "", name: "", recvName: "", next: next, methodStartByte: 0 }
+}
+
+// The written form removed by #3762: `fn (recv: Type) name(...) [: result]
+// { body }`. Panics on anything this migration cannot safely handle rather
+// than guessing — see this file's own header for why the corpus in hand
+// needs none of those cases.
+fn detectReceiverForm(toks: []Tok, ti: int, src: string): TopStart {
+  if (!isKind(toks, ti + 2, "ident") ||
+    !isKind(toks, ti + 3, "colon") ||
+    !isKind(toks, ti + 4, "ident") ||
+    !isKind(toks, ti + 5, "r_paren")) {
+    panic("releasesurface: malformed receiver-form header at token ${ti} (expected '(ident: ident)')")
+  }
+  if (isKind(toks, ti + 6, "lt")) {
+    panic("releasesurface: receiver-form with a generic receiver is not supported by this migration (token ${ti})")
+  }
+  if (!isKind(toks, ti + 6, "ident")) {
+    panic("releasesurface: receiver-form with no method name at token ${ti}")
+  }
+  return TopStart{
+    kind: "recv", name: tokenText(src, toks[ti + 4]), recvName: tokenText(src, toks[ti + 2]),
+    next: ti + 7, methodStartByte: toks[ti + 6].start,
+  }
+}
+
+// Whether token `i` (after an optional `export`) begins a top-level
+// declaration this migration cares about. Params/results/generics between
+// here and the real body-opening `{` are never inspected — they cannot
+// contain `{`/`}` in Bit (Power of 10-friendly: no separate grammar needed,
+// the caller's brace-depth counter finds the body for free).
+fn startTopLevel(toks: []Tok, i: int, src: string): TopStart {
+  let ti = skipExport(toks, i)
+  if (isKind(toks, ti, "kw_struct") || isKind(toks, ti, "kw_enum")) {
+    if (!isKind(toks, ti + 1, "ident")) {
+      panic("releasesurface: type declaration with no name at token ${ti}")
+    }
+    return TopStart{
+      kind: "type",
+      name: tokenText(src, toks[ti + 1]),
+      recvName: "",
+      next: ti + 2,
+      methodStartByte: 0,
+    }
+  }
+  if (!isKind(toks, ti, "kw_function") || !isKind(toks, ti + 1, "l_paren")) {
+    return noStart(i)
+  }
+  return detectReceiverForm(toks, ti, src)
+}
+
+// One finished top-level construct: either a type (isType, `name` is the
+// type, `closeBytePos` is where a method gets inserted) or a receiver-form
+// method (`declStartByte`..`declEndByte` is the whole declaration to
+// remove, `methodStartByte`..`declEndByte` is the in-body replacement text).
+class TopLevelRecord {
+  isType: bool,
+  name: string,
+  recvName: string,
+  declStartByte: int,
+  methodStartByte: int,
+  closeBytePos: int,
+  declEndByte: int,
+}
+
+// Single left-to-right pass over one file's tokens. `depth` counts ALL
+// braces (imports' `{ }`, match arms, nested blocks) so the scanner never
+// needs to know what it is skipping — only transitions back to depth 0
+// while a construct is `active` are meaningful.
+fn scanFile(toks: []Tok, src: string, fileIdx: int): []TopLevelRecord {
+  let out = []TopLevelRecord(0)
+  let depth = 0
+  let active = false
+  let cur = noStart(0)
+  let declStartByte = 0
+  let n = len(toks)
+  if (n > maxScanTokens) {
+    n = maxScanTokens
+  }
+  let i = 0
+  while (i < n) {
+    let tk = toks[i]
+    if (depth == 0 && !active) {
+      let started = startTopLevel(toks, i, src)
+      if (len(started.kind) > 0) {
+        active = true
+        cur = started
+        declStartByte = tk.start
+        i = started.next
+        continue
+      }
+    }
+    if (tk.kind == "l_brace") {
+      depth = depth + 1
+    } else if (tk.kind == "r_brace") {
+      depth = depth - 1
+      if (depth == 0 && active) {
+        out = append(
+          out,
+          TopLevelRecord{
+            isType: cur.kind == "type", name: cur.name, recvName: cur.recvName,
+            declStartByte: declStartByte, methodStartByte: cur.methodStartByte, closeBytePos: tk.start, declEndByte: tk.end,
+          },
+        )
+        active = false
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// A top-level `class`/`enum`'s insertion point, scoped to one module
+// directory (bare names collide ACROSS modules — see this file's header).
+class TypeSite {
+  name: string,
+  fileIdx: int,
+  closeBytePos: int,
+}
+
+class RecvMethod {
+  recvName: string,
+  recvType: string,
+  fileIdx: int,
+  declStartByte: int,
+  declEndByte: int,
+  methodStartByte: int,
+}
+
+// A single byte-range edit against one file's ORIGINAL text: `len == 0` is
+// a pure insertion (`replacement` spliced in at `pos`); `len > 0` removes
+// `[pos, pos+len)` (`replacement` is "" for a plain deletion).
+class Edit {
+  fileIdx: int,
+  pos: int,
+  len: int,
+  replacement: string,
+}
+
+fn collectBitFiles(dir: string): []string {
+  let entries = walk(dir) catch e {
+    panic("releasesurface: cannot walk ${dir}: ${e.message()}")
+  }
+  let out = []string(0)
+  for p of entries {
+    if (hasSuffix(p, ".bit")) {
+      out = append(out, p)
+    }
+  }
+  return out
+}
+
+// `struct`/`class` word-boundary swap (releasesurface.bit's
+// rewriteStructKeyword) and the receiver-name-to-`this` rename below are
+// the same algorithm with different needle/replacement pairs: copy runs of
+// non-matching text verbatim, splice the replacement in at each
+// word-bounded match. Cost is proportional to the (small) number of
+// matches, not the text length squared.
+fn replaceWord(text: string, needle: string, replacement: string): string {
+  let n = len(text)
+  let needleLen = len(needle)
+  let out = ""
+  let runStart = 0
+  let i = 0
+  while (i < n) {
+    if (i + needleLen <= n && text[i:i + needleLen] == needle) {
+      let beforeOk = i == 0 || !isWordChar(text[i - 1])
+      let afterOk = i + needleLen == n || !isWordChar(text[i + needleLen])
+      if (beforeOk && afterOk) {
+        out = out + text[runStart:i] + replacement
+        i = i + needleLen
+        runStart = i
+        continue
+      }
+    }
+    i = i + 1
+  }
+  return out + text[runStart:n]
+}
+
+fn editsForFile(edits: []Edit, fileIdx: int): []Edit {
+  let out = []Edit(0)
+  for e of edits {
+    if (e.fileIdx == fileIdx) {
+      out = append(out, e)
+    }
+  }
+  return out
+}
+
+// Applies one file's edits (sorted ascending, applied left to right) to its
+// ORIGINAL text. Overlapping edits would mean two records claimed the same
+// byte span — a scanner bug, not a legitimate input — so this panics rather
+// than producing silently-corrupt source.
+fn applyEdits(text: string, fileEdits: []Edit): string {
+  let edits = fileEdits
+  sortInPlace(edits, (a: Edit, b: Edit) => a.pos < b.pos)
+  let out = ""
+  let cursor = 0
+  for e of edits {
+    if (e.pos < cursor) {
+      panic("releasesurface: overlapping receiver-form edits at byte ${e.pos}")
+    }
+    out = out + text[cursor:e.pos] + e.replacement
+    cursor = e.pos + e.len
+  }
+  return out + text[cursor:len(text)]
+}
+
+// Resolves every receiver-form method against its module-local type map and
+// turns each into a (remove-from-origin, insert-into-target) edit pair, then
+// rewrites every touched file. A method whose target type this module never
+// declared is a scanner or corpus assumption failing, not a "skip and hope"
+// situation (this file's header explains why the corpus in hand has none).
+fn applyMigration(
+  files: []string,
+  srcs: []string,
+  types: map<string, TypeSite>,
+  recvs: []RecvMethod,
+  modDir: string,
+) {
+  if (len(recvs) == 0) {
+    return
+  }
+  let edits = []Edit(0)
+  for r of recvs {
+    let (site, ok) = types[r.recvType]
+    if (!ok) {
+      panic("releasesurface: receiver-form method '${r.recvName}.${r.recvType}' in ${files[r.fileIdx]} has no matching class/enum '${r.recvType}' in module ${modDir}")
+    }
+    let methodText = replaceWord(
+      srcs[r.fileIdx][r.methodStartByte:r.declEndByte],
+      r.recvName,
+      "this",
+    )
+    edits = append(
+      edits,
+      Edit{
+        fileIdx: site.fileIdx,
+        pos: site.closeBytePos,
+        len: 0,
+        replacement: "\n" + methodText + "\n",
+      },
+    )
+    edits = append(
+      edits,
+      Edit{
+        fileIdx: r.fileIdx,
+        pos: r.declStartByte,
+        len: r.declEndByte - r.declStartByte,
+        replacement: "",
+      },
+    )
+  }
+  for (let fi = 0; fi < len(files); fi = fi + 1) {
+    let fileEdits = editsForFile(edits, fi)
+    if (len(fileEdits) == 0) {
+      continue
+    }
+    writeFile(files[fi], applyEdits(srcs[fi], fileEdits)) catch e {
+      panic("releasesurface: cannot write ${files[fi]}: ${e.message()}")
+    }
+  }
+}
+
+// Scans every `.bit` file under one top-level module directory (recursively
+// — a module can nest, e.g. strings/internal/), then resolves and applies
+// every receiver-form method found. Two passes are required, not one: a
+// method's target type can be declared in a FILE SCANNED LATER than the
+// method itself (see this file's header).
+fn migrateModule(scratch: string, bin: string, modDir: string, modTag: string, ms: int) {
+  let files = collectBitFiles(modDir)
+  let srcs = []string(0)
+  let types = map<string, TypeSite>{}
+  let recvs = []RecvMethod(0)
+  for (let fi = 0; fi < len(files); fi = fi + 1) {
+    let text = readFile(files[fi]) catch e {
+      panic("releasesurface: cannot read ${files[fi]}: ${e.message()}")
+    }
+    srcs = append(srcs, text)
+    let toks = dumpTokensFor(bin, files[fi], scratch, "${modTag}-${fi}", ms)
+    for rec of scanFile(toks, text, fi) {
+      if (rec.isType) {
+        let (_, dup) = types[rec.name]
+        if (dup) {
+          panic("releasesurface: duplicate top-level type '${rec.name}' within module ${modDir}")
+        }
+        types[rec.name] = TypeSite{ name: rec.name, fileIdx: fi, closeBytePos: rec.closeBytePos }
+        continue
+      }
+      recvs = append(
+        recvs,
+        RecvMethod{
+          recvName: rec.recvName, recvType: rec.name, fileIdx: fi,
+          declStartByte: rec.declStartByte, declEndByte: rec.declEndByte, methodStartByte: rec.methodStartByte,
+        },
+      )
+    }
+  }
+  applyMigration(files, srcs, types, recvs, modDir)
+}
+
+// Entry point: one independent migration per top-level stdlib module
+// directory (releasesurface.bit's own `moduleList`), so a bare type name
+// colliding across modules (Conn in net/, http2/, quic/) can never be
+// resolved against the wrong one.
+fn migrateReceiverForms(scratch: string, bin: string, baselineDoc: string, ms: int) {
+  for m of moduleList(baselineDoc) {
+    migrateModule(scratch, bin, "${baselineDoc}/${m}", m, ms)
+  }
+}

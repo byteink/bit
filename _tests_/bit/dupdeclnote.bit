@@ -1,0 +1,522 @@
+// E0042's "previously declared here" note (#2129), E0045's sibling-import
+// wording (#2870) and its final "cannot find module" fallback (#2909), plus
+// E0040's sibling-declares-it hint (#2869) — all four live here because all
+// four need the same fixture shape: one or two `.bit` files in one directory
+// module, checked from the CLI so stderr is visible.
+//
+// The property under test for #2129: when a name collides, the compiler shows
+// BOTH declarations. The advice it already printed — "rename or remove one of
+// the declarations" — names two and used to show one, and §17.1 makes a module a
+// DIRECTORY of `.bit` files sharing a single declaration namespace, so the other
+// one is routinely in a file the author is not looking at. Go prints "other
+// declaration at ./a.go:3:6", Rust E0428 prints "first definition of the value
+// `shared` here", TypeScript TS2451 prints both.
+//
+// The property under test for #2870: `import { x } from "./helpers"` where
+// `helpers.bit` sits beside the importing file used to render E0045 as "cannot
+// find module ... relative paths must start with './' or '../'" — advice
+// describing a rule the path already satisfies, on top of the E0042 above that
+// already says what actually happened (the name is in scope, not missing). The
+// fix adds a THIRD E0045 arm, selected only when the resolved target is a `.bit`
+// FILE beside the importing file. `checkBareImportUnaffected` and
+// `checkMissingRelativeUnaffected` below are the other two cases the ticket
+// requires stay distinguishable: a bare name with no leading "./" (a
+// package-resolution failure, unrelated to this arm) and a "./name" naming no
+// real file (the ORIGINAL must-start-with case, still correct there) — proving
+// the new arm is selected by the sibling condition, not by every E0045.
+//
+// The property under test for #2909: once #2870 gave the sibling case its own
+// arm, nothing reachable still satisfied the generic fallback's "must start
+// with './' or '../'; standard-library modules aren't available yet" — a
+// relative path that reaches it already starts with "./" or "../", a std/
+// path was never actually unavailable, and a bare name routes to the
+// bit.lock message instead. `checkMissingRelativeUnaffected` now pins the
+// TRUE replacement text for a genuinely-missing "./nope"/"../nope", and
+// `checkStdImport` pins a different, std/-specific message for "std/nope" —
+// proving the two failures are no longer described by one interchangeable
+// hint — plus a real "std/seq" import checking clean. This also absorbs what
+// `_tests_/cases/check_import_not_found.{bit,expected}` used to pin: that
+// golden could not simply be updated in place, because the new text is not
+// what the pinned stage0 oracle renders for "./nope", and _tests_/cases/ is
+// exactly the corpus `scripts/selfhost-diffcheck.sh` sweeps against that
+// oracle. It was deleted and `_tests_/bit/golden.bit`'s `c[dErr]` dropped
+// 129 -> 128 in the same commit, counted off the directive lines actually on
+// disk, never by decrementing the prior number.
+//
+// The property under test for #2869: naming a single `.bit` FILE as the
+// build target (§17.1) loads only that file, so a name declared in a sibling
+// `.bit` file right next to it renders as a bare "undefined name" — true, but
+// it hides that the fix is one directory over. `checkSiblingUndefinedName`
+// pins the new hint AND its mutation-test mirror: the same shape with the
+// sibling NOT declaring the missing name, which must still get the plain
+// E0040 with no advice. That second half is also what caught a real bug: the
+// obvious "does any file in this OS directory declare the name" scan broke
+// two EXISTING _tests_/cases/ goldens (`check_undefined_name.bit`'s `x`,
+// `check_forin_pair_binder.bit`'s `a`/`b`) that coincidentally share a name
+// with an unrelated file in that 442-file corpus — caught by `./make
+// test-golden`, not by this fixture. The fix (`rFindSiblingDeclaring` in
+// compiler/resolve.bit) also verifies the directory would actually merge
+// cleanly (no cross-file collision on ANY name, not just the one being
+// looked up) before trusting the hint.
+//
+// WHY THIS IS NOT A _tests_/imports/ CASE, which is what the ticket asked for.
+// That harness (_tests_/bit/importsrun/importsrun.bit) BUILDS each project and compares its
+// STDOUT: `runCase` fails outright on a non-zero compile and never looks at
+// stderr. A project that must not compile cannot be expressed there. And it is
+// not a _tests_/cases/ golden either, because the collision has to span two sibling
+// files in one module and a golden case is a single file. A CLI gate is the only
+// shape that can see two files AND stderr.
+//
+// #2870 SPECIFICALLY cannot live in _tests_/cases/ or _tests_/imports/ for a second
+// reason on top of the two-files-and-stderr one above: the pinned stage0 oracle
+// predates the fix and still renders the OLD "must start with" text for a
+// sibling import, so a golden case pinning the NEW text would be exactly the
+// file that turns scripts/selfhost-diffcheck.sh's sweep red (FALSEPOS/DIFF) by
+// construction — the same reasoning _tests_/bit/genericdiag.bit and
+// _tests_/bit/checkerdiag.bit's headers give for their own cases, and the standing
+// rule _tests_/bit/golden.bit states: a case asserting a diagnostic no released
+// compiler emits is routed here, behind a registered gate, never into the
+// differential's sweep.
+//
+// Run it from the repository root:
+//     ./bit-out/bin/bit run _tests_/bit/dupdeclnote.bit
+// `BIT_SELF_EXE` overrides which `bit` is exercised.
+//
+// ANTI-VACUITY. Every capture is asserted non-empty before any content check;
+// the two-file fixture is read back off disk before it is compiled, so a failed
+// write cannot present as a clean module; the negative case asserts a POSITIVE
+// needle first so "no note" is never satisfied by "no output"; and the final line
+// prints how many checks ran.
+import { env, envOr, exit } from "std/os"
+import { exists, mkdir, readFile, remove, writeFile } from "std/fs"
+import { contains, indexOf, parseInt } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+class Run { code: int, out: string, err: string }
+
+class Tally { checks: int, failures: int }
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "300")) catch _ { 300 }
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns are
+// `osRunBounded`'s mechanism channel, never a program exit status, so each one is
+// a named panic rather than a value any assertion could consume.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("dupdeclnote: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("dupdeclnote: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("dupdeclnote: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("dupdeclnote: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+// The `bit` under test. `BIT_SELF_EXE` wins; otherwise the dev-tree artifact
+// relative to the directory this program was started in. Never returns "".
+fn bitBinary(scratch: string, ms: int): string! {
+  let explicit = env("BIT_SELF_EXE")
+  if (len(explicit) > 0) {
+    if (!exists(explicit)) {
+      fail newError("dupdeclnote: BIT_SELF_EXE=${explicit} does not exist")
+    }
+    return explicit
+  }
+  let cwdFile = "${scratch}/cwd.txt"
+  let code = shell("${scratch}/pwd.sh", "#!/bin/sh\npwd > '${cwdFile}'\n", ms)?
+  if (code != 0) {
+    fail newError("dupdeclnote: could not read the working directory (exit ${code})")
+  }
+  let cwd = trimWs(readFile(cwdFile)?)
+  let candidate = "${cwd}/bit-out/bin/bit"
+  if (!exists(candidate)) {
+    fail newError("dupdeclnote: no compiler at ${candidate}; run this from the repository root or set BIT_SELF_EXE")
+  }
+  return candidate
+}
+
+// Runs `bit check <target>` from `dir`. The wrapper always exits 0 and records
+// the real status, so a missing code file is unmistakably "the compiler never
+// ran" rather than a verdict.
+fn runCheck(bit: string, dir: string, target: string, capDir: string, ms: int): Run! {
+  let outPath = "${capDir}/out.txt"
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  clear(outPath)
+  clear(errPath)
+  clear(codePath)
+  let script = "#!/bin/sh\n" +
+    "cd '${dir}' || exit 0\n" +
+    "'${bit}' check '${target}' > '${outPath}' 2> '${errPath}'\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/check.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("dupdeclnote: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("dupdeclnote: no exit code was recorded for `bit check ${target}` — the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, out: readFile(outPath)?, err: readFile(errPath)? }
+}
+
+fn clear(path: string) {
+  if (exists(path)) {
+    remove(path) catch _ { return }
+  }
+}
+
+fn check(t: Tally, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    eprint("FAIL: ${label}\n")
+  }
+}
+
+// Two sibling files in one directory module, each declaring `shared`. The
+// module's files are concatenated in name order, so `a.bit` is the FIRST
+// declaration and `b.bit` the one reported.
+fn makeModule(root: string): ()! {
+  mkdir(root)?
+  writeFile("${root}/a.bit",
+    "fn shared(): int { return 1 }\nfn main() { println(\"hi\") }\n")?
+  writeFile("${root}/b.bit", "fn shared(): int { return 2 }\n")?
+}
+
+// Read back before compiling: the write path is the same GC'd runtime under
+// test, and an unwritten b.bit turns this whole gate into "one clean module".
+fn verifyModule(t: Tally, root: string): ()! {
+  let a = readFile("${root}/a.bit")?
+  let b = readFile("${root}/b.bit")?
+  check(t, contains(a, "fn shared"), "fixture: a.bit does not declare shared")
+  check(t, contains(b, "fn shared"), "fixture: b.bit does not declare shared")
+}
+
+// The cross-FILE collision: the case the ticket is about, and the one that is
+// unfindable without the note.
+fn checkCrossFile(t: Tally, bit: string, root: string, capDir: string, ms: int): ()! {
+  let r = runCheck(bit, root, ".", capDir, ms)?
+  check(t, len(r.err) > 0, "cross-file: stderr is empty — the compiler said nothing")
+  check(t, r.code != 0, "cross-file: exit ${r.code}, want non-zero")
+  check(t, contains(r.err, "error[E0042]"), "cross-file: no E0042")
+  check(t, contains(r.err, "'shared' is already declared in this scope"),
+    "cross-file: primary message changed")
+
+  // The note itself, rendered WITHOUT a code — it annotates the error above it
+  // rather than being a registry entry of its own.
+  check(t, contains(r.err, "note: previously declared here"),
+    "cross-file: no `note: previously declared here`")
+  check(t, !contains(r.err, "note[E"),
+    "cross-file: the note carries a diagnostic code; it must render bare")
+
+  // BOTH files named, which is the whole point. `b.bit` is the primary span,
+  // `a.bit` is reachable only through the note.
+  check(t, contains(r.err, "b.bit:1:4"), "cross-file: primary span is not b.bit:1:4")
+  check(t, contains(r.err, "a.bit:1:4"), "cross-file: note does not point at a.bit:1:4")
+
+  // ORDER: the primary error first, its note after. Nothing links the two
+  // structurally — the renderer walks the list — so the ordering is the contract.
+  let ePos = indexOf(r.err, "error[E0042]")
+  let nPos = indexOf(r.err, "note: previously declared here")
+  check(t, ePos >= 0 && nPos > ePos, "cross-file: note is not after its error (error at ${ePos}, note at ${nPos})")
+
+  // The note is NOT itself an error: one collision must not read as two.
+  check(t, countOf(r.err, "error[E0042]") == 1,
+    "cross-file: E0042 reported ${countOf(r.err, "error[E0042]")} times, want 1")
+
+  // The note must underline the NAME, not the whole declaration. `Symbol.decl`
+  // for a function is the entire `fn shared(): int { return 1 }`, so
+  // without narrowing the caret run covers the rest of the line.
+  check(t, contains(r.err, "^^^^^^\n") || contains(r.err, "^^^^^^ "),
+    "cross-file: note's caret is not six columns wide — it is underlining more than `shared`")
+  check(t, !contains(r.err, "^^^^^^^^"),
+    "cross-file: a caret run longer than the identifier — the note span was not narrowed")
+}
+
+// A clean module must stay silent. Without this, a compiler that emitted the
+// note unconditionally would satisfy every assertion above.
+fn checkCleanIsSilent(t: Tally, bit: string, scratch: string, capDir: string, ms: int): ()! {
+  let ok = "${scratch}/clean"
+  mkdir(ok)?
+  writeFile("${ok}/a.bit", "fn shared(): int { return 1 }\n")?
+  // No string interpolation in the generated source: `${` cannot be written
+  // literally inside a Bit string, the lexer opens an interpolation on it.
+  writeFile("${ok}/main.bit",
+    "fn main() {\n  if (shared() == 1) { println(\"ok\") }\n}\n")?
+  let r = runCheck(bit, ok, ".", capDir, ms)?
+  check(t, r.code == 0, "clean: exit ${r.code}, want 0 — stderr: ${r.err}")
+  check(t, !contains(r.err, "previously declared here"),
+    "clean: a note was emitted for a module with no collision")
+}
+
+// The single-FILE collision, which `_tests_/cases/check_duplicate_declaration.bit`
+// also pins. Here to prove the note reaches the local-scope path
+// (`rActivateLocal`) and not only the module-scope one.
+fn checkLocalScope(t: Tally, bit: string, scratch: string, capDir: string, ms: int): ()! {
+  let dir = "${scratch}/local"
+  mkdir(dir)?
+  writeFile("${dir}/m.bit", "fn f() { let x = 1\n  let x = 2 }\n")?
+  let r = runCheck(bit, dir, "m.bit", capDir, ms)?
+  check(t, len(r.err) > 0, "local: stderr is empty")
+  check(t, r.code != 0, "local: exit ${r.code}, want non-zero")
+  check(t, contains(r.err, "error[E0042]"), "local: no E0042")
+  check(t, contains(r.err, "note: previously declared here"),
+    "local: a block-local redeclaration got no note")
+  check(t, contains(r.err, "m.bit:1:14"), "local: note does not point at the first `let x`")
+}
+
+// #2870's case 1: `main.bit` imports `./helpers`, and `helpers.bit` sits right
+// beside it. Not a missing module — §17.1 makes the two files one module, so
+// `greet` is already in scope, and E0042 below is the diagnostic that is
+// actually true. E0045 must name the real reason instead of sending the reader
+// looking for a typo in a path that already starts with "./".
+fn checkSiblingImport(t: Tally, bit: string, scratch: string, capDir: string, ms: int): ()! {
+  let dir = "${scratch}/sibling"
+  mkdir(dir)?
+  writeFile("${dir}/main.bit",
+    "import { greet } from \"./helpers\"\n\nfn main() { println(greet()) }\n")?
+  writeFile("${dir}/helpers.bit", "fn greet(): string { return \"hi\" }\n")?
+  let r = runCheck(bit, dir, ".", capDir, ms)?
+  check(t, len(r.err) > 0, "sibling-import: stderr is empty")
+  check(t, r.code != 0, "sibling-import: exit ${r.code}, want non-zero")
+  check(t, contains(r.err, "error[E0045]"), "sibling-import: no E0045")
+  check(t, contains(r.err, "\"./helpers\" is part of this module, not a separate one"),
+    "sibling-import: new message text is missing")
+  check(t, contains(r.err, "helpers.bit sits beside this file"),
+    "sibling-import: hint naming helpers.bit is missing")
+  check(t, !contains(r.err, "must start with './' or '../'"),
+    "sibling-import: the false must-start-with advice is still rendered here")
+  // The fix renames the false first error; it must not remove the true second
+  // one, which is still what actually explains the failure.
+  check(t, contains(r.err, "error[E0042]"), "sibling-import: E0042 is gone")
+  check(t, contains(r.err, "'greet' is already declared in this scope"),
+    "sibling-import: E0042 message changed")
+}
+
+// #2870's case 2: the SAME missing-symbol shape, but the import path has no
+// leading "./" at all — a bare name, resolved as a package import and refused
+// for a bit.lock reason. Proves the sibling arm is not just "every E0045".
+fn checkBareImportUnaffected(t: Tally, bit: string, scratch: string, capDir: string, ms: int): ()! {
+  let dir = "${scratch}/bare"
+  mkdir(dir)?
+  writeFile("${dir}/main.bit",
+    "import { greet } from \"helpers\"\n\nfn main() { println(greet()) }\n")?
+  writeFile("${dir}/helpers.bit", "fn greet(): string { return \"hi\" }\n")?
+  let r = runCheck(bit, dir, ".", capDir, ms)?
+  check(t, r.code != 0, "bare-import: exit ${r.code}, want non-zero")
+  check(t, contains(r.err, "error[E0045]"), "bare-import: no E0045")
+  check(t, !contains(r.err, "is part of this module, not a separate one"),
+    "bare-import: the sibling message fired for a package-shaped path")
+}
+
+// #2909: a well-formed relative path naming a directory/file that does not
+// exist at all — either "./nope" or "../nope". This used to render "relative
+// paths must start with './' or '../'", which was already true of the input
+// and told the reader nothing; it now names the real failure. This case is
+// what `_tests_/cases/check_import_not_found.{bit,expected}` used to pin — moved
+// here rather than updated in place, because the NEW text is not what the
+// pinned stage0 oracle renders for this input, and _tests_/cases/ is exactly the
+// corpus `scripts/selfhost-diffcheck.sh` sweeps against that oracle (the same
+// reason #2870's sibling case above lives here and not there). `c[dErr]` in
+// _tests_/bit/golden.bit dropped 129 -> 128 in the same commit as the deletion.
+fn checkMissingRelativeUnaffected(t: Tally, bit: string, scratch: string, capDir: string, ms: int): ()! {
+  let dir = "${scratch}/nope"
+  mkdir(dir)?
+  writeFile("${dir}/main.bit",
+    "import { greet } from \"./nope\"\n\nfn main() { println(greet()) }\n")?
+  let r = runCheck(bit, dir, ".", capDir, ms)?
+  check(t, r.code != 0, "missing-relative: exit ${r.code}, want non-zero")
+  check(t, contains(r.err, "error[E0045]"), "missing-relative: no E0045")
+  check(t, contains(r.err, "no directory or file named \"./nope\" exists relative to this file"),
+    "missing-relative: the new true message is missing")
+  check(t, !contains(r.err, "must start with './' or '../'"),
+    "missing-relative: the old false must-start-with advice is still rendered")
+  check(t, !contains(r.err, "is part of this module, not a separate one"),
+    "missing-relative: the sibling message fired for a genuinely missing module")
+
+  // Nested two levels deep so "../nope" resolves to "${scratch}/up/nope" — a
+  // directory nothing else in this fixture creates, unlike a bare
+  // "${scratch}/nopeup" sibling of "${scratch}/nope" above, whose "../nope"
+  // would climb straight back into that FIRST case's own (existing) directory.
+  let dir2 = "${scratch}/up/inner"
+  mkdir("${scratch}/up")?
+  mkdir(dir2)?
+  writeFile("${dir2}/main.bit",
+    "import { greet } from \"../nope\"\n\nfn main() { println(greet()) }\n")?
+  let r2 = runCheck(bit, dir2, ".", capDir, ms)?
+  check(t, r2.code != 0, "missing-relative-up: exit ${r2.code}, want non-zero")
+  check(t, contains(r2.err, "error[E0045]"), "missing-relative-up: no E0045")
+  check(t, contains(r2.err, "no directory or file named \"../nope\" exists relative to this file"),
+    "missing-relative-up: the new true message is missing")
+}
+
+// #2909: a "std/nope" import — a different failure from a missing relative
+// path, and it used to share the exact same false hint. Proves the two are
+// now distinguishable, and that a real std/ module still checks clean.
+fn checkStdImport(t: Tally, bit: string, scratch: string, capDir: string, ms: int): ()! {
+  let dir = "${scratch}/stdnope"
+  mkdir(dir)?
+  writeFile("${dir}/main.bit",
+    "import { mapped } from \"std/nope\"\n\nfn main() { println(\"hi\") }\n")?
+  let r = runCheck(bit, dir, ".", capDir, ms)?
+  check(t, r.code != 0, "std-missing: exit ${r.code}, want non-zero")
+  check(t, contains(r.err, "error[E0045]"), "std-missing: no E0045")
+  check(t, contains(r.err, "no standard-library module named \"nope\" exists"),
+    "std-missing: the new true message is missing")
+  check(t, !contains(r.err, "must start with './' or '../'"),
+    "std-missing: the old false relative-path advice is still rendered")
+
+  let ok = "${scratch}/stdok"
+  mkdir(ok)?
+  writeFile("${ok}/main.bit",
+    "import { mapped } from \"std/seq\"\n\nfn main() { println(\"ok\") }\n")?
+  let rok = runCheck(bit, ok, ".", capDir, ms)?
+  check(t, rok.code == 0, "std-valid: exit ${rok.code}, want 0 — stderr: ${rok.err}")
+}
+
+// #2869: `greet` is declared in `helpers.bit`, right next to `main.bit`, but
+// naming the FILE (not the directory) as the build target loads only
+// `main.bit` — the sibling scan is what tells the difference between "no
+// such name anywhere" and "the file just wasn't in this build". The second
+// half (no such declaration in the sibling either) is the mutation-test
+// mirror AND the regression check for the false-positive #2869 itself found:
+// the hint must not fire just because a `.bit` file happens to sit next door.
+fn checkSiblingUndefinedName(t: Tally, bit: string, scratch: string, capDir: string, ms: int): ()! {
+  let dir = "${scratch}/undefsib"
+  mkdir(dir)?
+  writeFile("${dir}/main.bit", "fn main() { println(greet()) }\n")?
+  writeFile("${dir}/helpers.bit", "fn greet(): string { return \"hi\" }\n")?
+  let r = runCheck(bit, dir, "main.bit", capDir, ms)?
+  check(t, r.code != 0, "sibling-undefined: exit ${r.code}, want non-zero")
+  check(t, contains(r.err, "error[E0040]"), "sibling-undefined: no E0040")
+  check(t, contains(r.err, "undefined name 'greet'"), "sibling-undefined: primary message changed")
+  check(t, contains(r.err, "'greet' is declared in helpers.bit"),
+    "sibling-undefined: hint naming helpers.bit is missing")
+  check(t, contains(r.err, "bit build .") && contains(r.err, "bit run ."),
+    "sibling-undefined: hint does not name the directory-build fix")
+
+  let dir2 = "${scratch}/undefsibtypo"
+  mkdir(dir2)?
+  writeFile("${dir2}/main.bit", "fn main() { println(greet()) }\n")?
+  writeFile("${dir2}/helpers.bit", "fn other(): string { return \"hi\" }\n")?
+  let r2 = runCheck(bit, dir2, "main.bit", capDir, ms)?
+  check(t, r2.code != 0, "sibling-typo: exit ${r2.code}, want non-zero")
+  check(t, contains(r2.err, "error[E0040]"), "sibling-typo: no E0040")
+  check(t, contains(r2.err, "undefined name 'greet'"), "sibling-typo: primary message changed")
+  check(t, !contains(r2.err, "is declared in"), "sibling-typo: misleading sibling advice fired anyway")
+}
+
+// Occurrences of `needle` in `s`. Bounded by the string length (Power of 10).
+fn countOf(s: string, needle: string): int {
+  if (len(needle) == 0) {
+    return 0
+  }
+  let n = 0
+  let i = 0
+  while (i + len(needle) <= len(s)) {
+    if (s[i:i + len(needle)] == needle) {
+      n = n + 1
+      i = i + len(needle)
+    } else {
+      i = i + 1
+    }
+  }
+  return n
+}
+
+fn runAll(t: Tally, scratch: string, ms: int) {
+  let root = "${scratch}/mod"
+  let capDir = "${scratch}/cap"
+  mkdir(capDir) catch e { panic("dupdeclnote: cannot create ${capDir}: ${e.message()}") }
+  let bit = bitBinary(scratch, ms) catch e { panic("dupdeclnote: ${e.message()}") }
+  makeModule(root) catch e { panic("dupdeclnote: cannot build the fixture: ${e.message()}") }
+  verifyModule(t, root) catch e { panic("dupdeclnote: cannot read the fixture back: ${e.message()}") }
+  checkCrossFile(t, bit, root, capDir, ms) catch e { panic("dupdeclnote: ${e.message()}") }
+  checkCleanIsSilent(t, bit, scratch, capDir, ms) catch e { panic("dupdeclnote: ${e.message()}") }
+  checkLocalScope(t, bit, scratch, capDir, ms) catch e { panic("dupdeclnote: ${e.message()}") }
+  checkSiblingUndefinedName(t, bit, scratch, capDir, ms) catch e { panic("dupdeclnote: ${e.message()}") }
+  runImportChecks(t, bit, scratch, capDir, ms)
+}
+
+// Split out of `runAll` (#2909): one more `catch`-wrapped call there would
+// have pushed it over the repo's own E0204 max-complexity limit of 10. Every
+// case here is an E0045 import-resolution shape; `runAll` above keeps the
+// E0042/local-scope shapes.
+fn runImportChecks(t: Tally, bit: string, scratch: string, capDir: string, ms: int) {
+  checkSiblingImport(t, bit, scratch, capDir, ms) catch e { panic("dupdeclnote: ${e.message()}") }
+  checkBareImportUnaffected(t, bit, scratch, capDir, ms) catch e { panic("dupdeclnote: ${e.message()}") }
+  checkMissingRelativeUnaffected(t, bit, scratch, capDir, ms) catch e { panic("dupdeclnote: ${e.message()}") }
+  checkStdImport(t, bit, scratch, capDir, ms) catch e { panic("dupdeclnote: ${e.message()}") }
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-dupdeclnote-${uuidFormat(uuidV4())}"
+  let t = Tally{ checks: 0, failures: 0 }
+
+  mkdir(scratch) catch e {
+    panic("dupdeclnote: cannot create ${scratch}: ${e.message()}")
+  }
+  runAll(t, scratch, ms)
+
+  // 2 fixture + 12 cross-file + 2 clean + 5 local + 9 sibling-undefined-name
+  // (#2869) + 8 sibling-import + 3 bare-import (#2870) + 8 missing-relative
+  // + 5 std-import (#2909) = 54.
+  if (t.checks < 54) {
+    eprint("FAIL: only ${t.checks} checks ran, want at least 54\n")
+    t.failures = t.failures + 1
+  }
+  if (t.failures > 0) {
+    // `exit()` does not run pending defers (#3694, same shape as #3677) —
+    // call teardown explicitly on both the PASS and FAIL paths.
+    teardown(scratch, ms)
+    println("dupdeclnote: FAIL — ${t.failures} of ${t.checks} checks failed")
+    exit(1)
+  }
+  teardown(scratch, ms)
+  println("dupdeclnote: PASS — ${t.checks} checks")
+}
+
+// std/fs has no recursive remove, so the scratch tree goes the way it came.
+fn teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ { return }
+}
+
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}
