@@ -147,6 +147,13 @@ added property is table weight a caller may never reach for:
   Hangul Thai Devanagari`.
 - **`Any`**: every valid Unicode scalar value, `0..0x10FFFF`.
 
+`Name` is canonicalized before lookup, matching Go's `regexp/syntax`
+exactly: the first letter is uppercased, every later letter is
+lowercased, and `_`/`-`/` ` are dropped entirely. So `\pp`, `\p{lu}` and
+`\p{L_u}` mean the same as `\pP`, `\p{Lu}` and `\p{Lu}` respectively — a
+name's case and internal punctuation never change which property it
+selects.
+
 ```bit
 import { mustCompile } from "std/regex"
 
