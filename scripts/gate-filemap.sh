@@ -238,6 +238,11 @@ gates_for_file() {
     # harness reads at runtime, not Bit source — so the generic grep below
     # can never find it; named by hand, same shape as _tests_/bit/checkercases/*.
     _tests_/bit/releasesurface.allowlist) printf 'test-release-surface\n'; return 0 ;;
+    # #2252: same shape as releasesurface.allowlist above — a sidecar
+    # `.expected` byte-match target testloc.bit's own main() reads at
+    # runtime, not Bit source, so the generic `runArgs()` grep below can
+    # never find it either.
+    _tests_/bit/testloc.expected) printf 'test-testloc\n'; return 0 ;;
   esac
   # Excludes any extracted name containing a literal `${` — that is a
   # per-instance template (e.g. tools/build/gates.bit's `packageGates()`
