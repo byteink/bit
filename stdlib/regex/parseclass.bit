@@ -13,6 +13,15 @@
 // alphanumeric escape (`regex: invalid escape sequence`), NOT as a backspace
 // literal the way Perl/PCRE read it — deliberately narrower than those
 // engines rather than guessing at a meaning nothing in #2026 pins down.
+//
+// A `[:` that never reaches a matching `:]` is NOT a syntax error (#3831,
+// verified against go1.26.6's `regexp/syntax`): `[[:alpha]]+` has no `:]`
+// anywhere in the pattern at all, so Go falls back to treating `[`, `:`,
+// `a`, `l`, `p`, `h`, `a` as ordinary literal class members, closing at the
+// first bare `]` — the SAME first-`]`-is-the-closer rule as any other class.
+// `tryParsePosixClass` below implements that fallback; see its own comment
+// for the (surprising, but Go-verified) rule that the search for `:]`
+// spans the REST OF THE WHOLE PATTERN, not just this class body.
 
 // One member of a class body, not yet folded into the accumulator:
 // `isSingle` says whether it is a single rune usable as a range endpoint
@@ -75,7 +84,10 @@ fn classBodyDone(p: RegexParser, first: bool): bool {
 
 // One member: the POSIX first-`]`-literal special case, a `[:name:]` POSIX
 // class, or an ordinary item (`parseClassItem`, folded in by
-// `mergeClassItem`, which also handles `-` ranges).
+// `mergeClassItem`, which also handles `-` ranges). A `[:` that
+// `tryParsePosixClass` decides was never a POSIX class attempt at all
+// (`Option.None`) falls through to ordinary item parsing, so the `[` is
+// simply consumed as one literal member and `:` follows on the next call.
 fn parseClassMember(
   p: RegexParser,
   acc: CharClass,
@@ -88,8 +100,10 @@ fn parseClassMember(
     return ccAddRune(acc, rune(']'))
   }
   if (isPosixClassStart(p)) {
-    let contributed = parsePosixClass(p, openPos)?
-    return ccUnion(acc, contributed)
+    let attempt = tryParsePosixClass(p, openPos)?
+    if (isSome(attempt)) {
+      return ccUnion(acc, unwrap(attempt))
+    }
   }
   let item = parseClassItem(p, openPos, flags)?
   return mergeClassItem(p, acc, item, openPos, flags)?
@@ -99,28 +113,57 @@ fn isPosixClassStart(p: RegexParser): bool {
   return curByte(p) == '[' && peekByte(p, 1) == ':'
 }
 
-// `[:name:]` — consumes it whole and looks `name` up in `ccPosixByName`
-// (charclass.bit). Any shape mismatch (no letters, no closing `:]`) or an
-// unrecognized name is `regex: invalid POSIX class name`.
-fn parsePosixClass(p: RegexParser, openPos: int): CharClass! {
-  advanceByte(p)
-  advanceByte(p)
-  let start = p.pos
-  // Bounded: each iteration consumes one byte.
-  while (!atEnd(p) && isAsciiLetter(curByte(p))) {
-    advanceByte(p)
+// The byte offset of the `:` in the next `:]` at or after `start`, or `-1`
+// if none exists before the end of `p.src`. Bounded: the pattern is capped
+// at `maxPatternLength` (4096 bytes, parse.bit) before parsing ever starts,
+// so this scan is statically bounded regardless of how many `[:` a pattern
+// contains.
+fn findClassColonBracket(p: RegexParser, start: int): int {
+  let i = start
+  // Bounded by `p.n - start`, itself bounded by the 4096-byte pattern cap.
+  while (i + 1 < p.n) {
+    if (p.src[i] == ':' && p.src[i + 1] == ']') {
+      return i
+    }
+    i = i + 1
   }
-  let name = p.src[start:p.pos]
-  if (len(name) == 0 || atEnd(p) || curByte(p) != ':' || peekByte(p, 1) != ']') {
-    fail parseErr(errInvalidPosixClass, openPos)
+  return -1
+}
+
+// `[:name:]` — attempts to parse it starting at `p`'s cursor (already known
+// to be `[:`, `isPosixClassStart`). Matches go1.26.6's `regexp/syntax`
+// `parseNamedClass` exactly, verified directly against it (#3831):
+//
+//   - No `:]` anywhere in the REST OF THE PATTERN — not merely before this
+//     class's own closing `]` — means this was never a POSIX class attempt:
+//     returns `Option.None`, consuming nothing, so the caller treats the
+//     `[` as an ordinary literal member. This is `[[:alpha]]+`'s case: no
+//     `:]` exists anywhere in the pattern, so `[`, `:`, `a`, `l`, `p`, `h`,
+//     `a` all become literal class members and the first bare `]` closes
+//     the class (the POSIX first-`]`-is-literal rule does not apply here
+//     since it is not the first member) — leaving `]+` outside the class,
+//     a literal `]` followed by `+`.
+//   - A `:]` DOES exist later in the pattern (Go's own search is a flat
+//     string scan with no bracket-nesting awareness, so this can span past
+//     this class's own `]`, or through an unrelated later `[:name:]`) and
+//     the text between is one of the 13 recognized POSIX names: returns
+//     `Option.Some` of that class, cursor advanced past the `:]`.
+//   - A `:]` exists later but the enclosed text is not a recognized name:
+//     `regex: invalid POSIX class name` — same as an unrecognized
+//     well-formed name always was.
+fn tryParsePosixClass(p: RegexParser, openPos: int): Option<CharClass>! {
+  let nameStart = p.pos + 2
+  let colon = findClassColonBracket(p, nameStart)
+  if (colon < 0) {
+    return Option.None
   }
-  advanceByte(p)
-  advanceByte(p)
+  let name = p.src[nameStart:colon]
   let found = ccPosixByName(name)
   if (isNone(found)) {
     fail parseErr(errInvalidPosixClass, openPos)
   }
-  return unwrap(found)
+  p.pos = colon + 2
+  return Option.Some(unwrap(found))
 }
 
 // One item: an escape (`parseClassEscape`) or a literal rune (possibly
