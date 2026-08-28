@@ -1472,17 +1472,21 @@ before `schedSwitch` hands control to the task
 (`runtime/sched/workerrun.bit:143`) — the only call site for `preemptStamp`
 in the tree (`git grep -n preemptStamp -- '*.bit'`).
 
-**Not wired: nothing ticks the monitor.** `sysmonTick` has no call site
-anywhere in the tree outside its own definition in `preempt.bit`
-(`git grep -n sysmonTick -- '*.bit'` finds the definition plus one comment
-in `runtime/sched/workerrun.bit` that names it, and nothing else). There is
-no `sysmonRun` function, and no monitor OS thread of any kind, anywhere in
-the repository (`git grep -n sysmonRun` — zero matches, including in
-`runtime/root/darwin/boot.bit` and `runtime/root/linux/boot.bit`). Neither
-platform starts a second OS thread next to the `BIT_WORKERS` worker boot
-sequence above. Booting that thread is #2579 (darwin) and #2580 (linux);
-both are open. Until one of them lands, `requested` can never become
-nonzero on any worker, because nothing ever calls `sysmonTick`.
+**Wired: the monitor ticks the flag (#2579 darwin, #2580 linux, both
+landed).** `sysmonRun` is a `nanosleep`-then-`sysmonTick` loop, sleeping
+~2ms between ticks, bounded by `WORKER_MAX_STEPS`
+(`runtime/sched/workerrun.bit:65`; 1e9 iterations at ~2ms is over 20 days,
+so in practice it runs for the life of the process) rather than looping
+unbounded: defined at `runtime/root/darwin/boot.bit:471` and started on its
+own OS thread at `runtime/root/darwin/boot.bit:673`; the linux twin is
+defined at `runtime/root/linux/sysmon.bit:76` and started at
+`runtime/root/linux/boottail.bit:423`. Both start next to the
+`BIT_WORKERS` worker boot sequence above. The thread is deliberately never
+registered as a mutator with the collector — see the rationale already
+written at `runtime/root/darwin/boot.bit:412-470` (linux's `sysmon.bit`
+header makes the same argument rather than repeating it). So `requested` is
+set by a real, clock-driven tick on both platforms, not only by the
+dispatch-time stamp described above.
 
 **Not wired: nothing consumes the flag.** `maybePreempt` and
 `preemptRequested` likewise have zero call sites anywhere in the tree
@@ -1493,13 +1497,12 @@ outside their own definitions in `preempt.bit`
 scheduler's safepoint check, and yielding when it returns true, is #2577,
 open.
 
-**Net effect today:** the flag is stamped into existence on every dispatch
-but never set by a tick (no monitor exists to tick it) and never consumed at
-a safepoint (nothing calls `maybePreempt`). Once #2577/#2579/#2580 land, a
-task with no safepoint is still not preemptible even though `sysmonTick` may
-have set its flag: the flag is only ever acted on where `maybePreempt` is
-called, and a task that never reaches that call point keeps running
-regardless of `requested`'s value.
+**Net effect today:** the flag is stamped at dispatch and set by a real
+tick on both platforms (above) — see the paragraph above for whether
+anything consumes it at a safepoint. A task with no safepoint is not
+preemptible even when `sysmonTick` has set its flag: the flag is only ever
+acted on where `maybePreempt` is called, and a task that never reaches that
+call point keeps running regardless of `requested`'s value.
 
 **No separate preemption knob.** `preemptBudgetNs` is a compile-time
 constant, read from no environment variable. The only worker-related
