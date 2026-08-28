@@ -195,9 +195,16 @@ explainMismatch() {
     END {
       for (op in a) allop[op] = 1
       for (op in b) allop[op] = 1
+      # `moved` is the set of opcodes that ACTUALLY changed, recorded here and
+      # never written again. `delta` cannot serve that purpose: in awk, merely
+      # READING `delta["field_get"]` creates the element, so by the time the
+      # second signature below runs, `delta` also contains every opcode the
+      # first one asked about. Iterating it would then see keys that never
+      # moved. (The #3107 block above is unaffected only because every key it
+      # reads is in its own `core` list.)
       for (op in allop) {
         d = b[op] - a[op]
-        if (d != 0) delta[op] = d
+        if (d != 0) { delta[op] = d; moved[op] = 1 }
       }
 
       # --- #3107 + #3108: inline slice element ACCESS lowering (see the block
@@ -264,6 +271,51 @@ explainMismatch() {
 
       if (ok) {
         if (Ns > 0) { print "3108-slice-store-inline" } else { print "3107-slice-read-inline" }
+        exit 0
+      }
+
+      # --- #3898: pointer-scale / right-shift cancellation ---
+      #
+      # `emitScaledOffset` (compiler/loweraccess.bit) rewrites the byte offset
+      # of `p +- (e >> k)` on a `*T` of size 2^k from `(e >> k) * 2^k` to the
+      # equivalent `e & ~(2^k - 1)`. Nm is the number of sites folded in this
+      # file. Derived the same empirical way as the identity above -- diffed
+      # against the pinned oracle over every runtime file that diverges
+      # (runtime/gc/mem.bit, runtime/sched/task.bit, runtime/spinlock.bit),
+      # both dump kinds, every coefficient an independent equation:
+      #
+      #   pre-opt   delta(mul) = -Nm   delta(band) = +Nm
+      #             every OTHER opcode: delta == 0.
+      #             The shift and its count constant are still emitted (dead),
+      #             and `const_int 2^k` becomes `const_int ~(2^k - 1)`, so
+      #             neither `ashr` nor `const_int` moves at all.
+      #
+      #   post-opt  delta(mul) = -Nm   delta(band) = +Nm
+      #             delta(ashr) = -Nm  delta(const_int) = -Nm
+      #             every OTHER opcode: delta == 0.
+      #             DCE has now removed the dead shift and the shift-count
+      #             constant; the scale constant survives as the mask, so
+      #             const_int falls by exactly one per site, not two.
+      #
+      # Measured Nm: mem.bit 1 pre-opt / 10 post-opt (inlining multiplies the
+      # sites), task.bit 1/1, spinlock.bit 1/2. NOTHING outside these four
+      # opcodes moves on any of the three, on either kind -- so unlike the
+      # #3107 post-opt arm this one needs no unconstrained-magnitude allowance,
+      # and it is checked exactly on both kinds.
+      Nm = -delta["mul"]
+      okPtr = (Nm > 0 && delta["band"] == Nm)
+      if (kind == "ir") {
+        if (delta["ashr"] != 0)               okPtr = 0
+        if (delta["const_int"] != 0)          okPtr = 0
+      } else {
+        if (delta["ashr"] != -Nm)             okPtr = 0
+        if (delta["const_int"] != -Nm)        okPtr = 0
+      }
+      for (op in moved) {
+        if (op != "mul" && op != "band" && op != "ashr" && op != "const_int") okPtr = 0
+      }
+      if (okPtr) {
+        print "3898-ptr-scale-shift-fold"
         exit 0
       }
       exit 1
@@ -347,6 +399,79 @@ index_set %0[%7] = %v'
   rc2=$?
   if [ "$rc2" -eq 0 ] || [ -n "$sig2" ]; then
     echo "FAIL: an unrelated opcode delta was wrongly explained (rc=$rc2 sig='$sig2')"
+    fail=1
+  fi
+
+  # --- #3898: the pointer-scale / right-shift cancellation, both kinds ---
+  #
+  # Pre-opt, Nm = 1: the `const_int 8` + `mul` pair becomes `const_int -8` +
+  # `band`, and the dead `ashr`/`const_int 3` are still emitted, so `ashr` and
+  # `const_int` must NOT move.
+  oracle_ptr='%1 = const_int i64 3
+%2 = ashr i64 %0, %1
+%3 = const_int i64 8
+%4 = mul i64 %2, %3
+%5 = convert i64 %4'
+  bit2_ptr='%1 = const_int i64 3
+%2 = ashr i64 %0, %1
+%3 = const_int i64 -8
+%4 = band i64 %0, %3
+%5 = convert i64 %4'
+
+  sigp=$(explainMismatch "$oracle_ptr" "$bit2_ptr" ir)
+  rcp=$?
+  if [ "$rcp" -ne 0 ] || [ "$sigp" != "3898-ptr-scale-shift-fold" ]; then
+    echo "FAIL: a #3898-shaped pre-opt delta was not explained (rc=$rcp sig='$sigp')"
+    fail=1
+  fi
+
+  # Post-opt, Nm = 1: DCE has removed the dead shift and its count constant, so
+  # `ashr` and `const_int` each fall by exactly Nm. The SAME text scored as
+  # `ir` must be REJECTED there and vice versa — the two kinds are different
+  # identities, not one loosened check.
+  bit2_ptr_opt='%3 = const_int i64 -8
+%4 = band i64 %0, %3
+%5 = convert i64 %4'
+
+  sigq=$(explainMismatch "$oracle_ptr" "$bit2_ptr_opt" iropt)
+  rcq=$?
+  if [ "$rcq" -ne 0 ] || [ "$sigq" != "3898-ptr-scale-shift-fold" ]; then
+    echo "FAIL: a #3898-shaped post-opt delta was not explained (rc=$rcq sig='$sigq')"
+    fail=1
+  fi
+
+  sigr=$(explainMismatch "$oracle_ptr" "$bit2_ptr_opt" ir)
+  rcr=$?
+  if [ "$rcr" -eq 0 ] || [ -n "$sigr" ]; then
+    echo "FAIL: a post-opt-shaped delta was wrongly explained as pre-opt (rc=$rcr sig='$sigr')"
+    fail=1
+  fi
+
+  # THE MASK IS THE WHOLE CORRECTNESS ARGUMENT, so a fold that DROPPED it — the
+  # tempting `(e >> k) * 2^k == e` non-identity, which truncates for a
+  # misaligned `e` — must NOT be explained. It removes the mul and its constant
+  # and adds no band at all.
+  bit2_ptr_nomask='%1 = const_int i64 3
+%2 = ashr i64 %0, %1
+%5 = convert i64 %0'
+
+  sigs2=$(explainMismatch "$oracle_ptr" "$bit2_ptr_nomask" ir)
+  rcs2=$?
+  if [ "$rcs2" -eq 0 ] || [ -n "$sigs2" ]; then
+    echo "FAIL: a mask-dropping fold was wrongly explained (rc=$rcs2 sig='$sigs2')"
+    fail=1
+  fi
+
+  # A second, unrelated opcode moving alongside a real #3898 delta must still
+  # fail: a signature names an identity the WHOLE delta must satisfy, not a
+  # file that is allowed to differ.
+  bit2_ptr_plus="$bit2_ptr
+%6 = call @somethingElse()"
+
+  sigt=$(explainMismatch "$oracle_ptr" "$bit2_ptr_plus" ir)
+  rct=$?
+  if [ "$rct" -eq 0 ] || [ -n "$sigt" ]; then
+    echo "FAIL: a #3898 delta carrying an unrelated op was wrongly explained (rc=$rct sig='$sigt')"
     fail=1
   fi
 

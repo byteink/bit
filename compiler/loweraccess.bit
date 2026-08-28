@@ -588,3 +588,106 @@ fn lowerSliceExpr(fc: FnCtx, node: int): int {
   ins.args = [recv, lo, hi]
   return emitRtCall(fc, ins)
 }
+
+// `log2(n)` when `n` is a power of two in [2, 2^62], otherwise -1. Used by
+// `emitScaledOffset` below to recognize an element size a shift can express.
+fn log2Exact(n: int): int {
+  if (n < 2 || (n & (n - 1)) != 0) {
+    return -1
+  }
+  let k = 1
+  while (k < 63) {
+    if ((1 << k) == n) {
+      return k
+    }
+    k = k + 1
+  }
+  return -1
+}
+
+// Whether `v` names an instruction the builder has actually emitted. Every
+// operand read below goes through this: a lowering that failed leaves operand
+// ids that were never emitted, and indexing `b.instrs` with one would fault
+// rather than decline the fold.
+fn builderHasValue(b: IrBuilder, v: int): bool {
+  return v >= 0 && v < len(b.instrs)
+}
+
+// Whether value `v` is an ARITHMETIC right shift of an `i64` by the literal
+// amount `k`. Structural, on the already-lowered value: `analyzeConsts` has not
+// run yet, so the shift count is recognized only when it is literally a
+// `const_int`, which is what `e >> 3` in source lowers to.
+//
+// `AShr` and not `LShr`, even though the cancellation below holds for both
+// directions: `binOpFor` (lower.bit) picks `LShr` only for an UNSIGNED result
+// type, so an `LShr` whose type is `i64` cannot be lowered from any source at
+// all. Accepting one would be a branch no test could reach and no transform
+// signature could cover (scripts/selfhost-ir-signatures.sh).
+fn isAShrBy(b: IrBuilder, v: int, k: int, i64ty: int): bool {
+  if (!builderHasValue(b, v)) {
+    return false
+  }
+  let ins = b.instrs[v]
+  if (ins.op != Op.AShr) {
+    return false
+  }
+  if (ins.ty != i64ty) {
+    return false
+  }
+  if (!builderHasValue(b, ins.lhs) || b.instrs[ins.lhs].ty != i64ty) {
+    return false
+  }
+  if (!builderHasValue(b, ins.rhs)) {
+    return false
+  }
+  return b.instrs[ins.rhs].op == Op.ConstInt && b.instrs[ins.rhs].ival == k
+}
+
+// The byte offset of `p ± n` (§11.4): `n` scaled by `sizeOf(elem)`.
+//
+// STRENGTH REDUCTION (#3898) when the scale is a power of two `2^k` and `n` is
+// itself `e >> k` by that SAME k. That is the shape of every address-to-pointer
+// bridge in the runtime — `nil + (addr / 8)` on a `*i64` and its `/ 4` twins on
+// `*i32` — because §11.4 offers no int-to-pointer conversion, so dividing an
+// address down to an element index and having the compiler scale it straight
+// back up is the ONLY way to name an address. Emitted naively that is a divide
+// and a multiply by the same constant: two instructions, or five when the
+// division is signed and pays the round-toward-zero correction (`asr #63`,
+// `lsr #64-k`, `add` for the bias, then the shift).
+//
+// `(e >> k) * 2^k` is `e & ~(2^k - 1)`: one `and`, which both backends encode
+// as a logical immediate (arm64 `fitsLogicalImm`, x64 `xLogicalConstSkip`).
+//
+// THE MASK IS NOT DROPPED, and that is the entire correctness argument. The
+// rewrite PRESERVES the truncation, so it asserts nothing about `e` being
+// aligned and holds for a misaligned or negative `e` exactly as the shift pair
+// did: a right shift discards the low `k` bits and the scale cannot bring them
+// back, which is what `& ~(2^k - 1)` also does. An arithmetic shift replicates
+// the sign bit into the high end and the scale's left shift discards those same
+// replicated bits again, so `(-9 >> 3) * 8` is -16 and so is `-9 & ~7` — while
+// `(-9 / 8) * 8` is -8, which is why a signed DIVISION is not a candidate here
+// and keeps its round-toward-zero bias. Only a proof that `e` is already
+// `2^k`-aligned would license dropping the `and` outright, and nothing at this
+// level has one.
+//
+// The shift's own operand is read from the current block, where the shift just
+// read it, so no new value crosses a block boundary and dominance is preserved
+// by construction. The shift itself is left in place; `deadCodeElim` drops it
+// when nothing else used it.
+fn emitScaledOffset(fc: FnCtx, off: int, scale: int, i64ty: int): int {
+  let k = log2Exact(scale)
+  if (k > 0 && isAShrBy(fc.b, off, k, i64ty)) {
+    let mk = mkInstr(Op.ConstInt, i64ty)
+    mk.ival = ~(scale - 1)
+    let an = mkInstr(Op.BAnd, i64ty)
+    an.lhs = fc.b.instrs[off].lhs
+    an.rhs = builderEmit(fc.b, mk)
+    return builderEmit(fc.b, an)
+  }
+  let sc = mkInstr(Op.ConstInt, i64ty)
+  sc.ival = scale
+  let ml = mkInstr(Op.Mul, i64ty)
+  ml.lhs = off
+  ml.rhs = builderEmit(fc.b, sc)
+  return builderEmit(fc.b, ml)
+}
