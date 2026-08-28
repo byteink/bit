@@ -46,9 +46,12 @@ export BIT_LIBBITRT="$PWD/$X64_RT"
 
 REMOTE=/tmp/bitdiff-x64
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"; ssh "$HOST" "rm -rf $REMOTE" >/dev/null 2>&1' EXIT
+# </dev/null on every ssh below: none of these send anything over stdin, and
+# without it each inherits the caller's and can drain a non-deterministic
+# prefix of it (#3899).
+trap 'rm -rf "$TMP"; ssh "$HOST" "rm -rf $REMOTE" </dev/null >/dev/null 2>&1' EXIT
 
-ssh "$HOST" "rm -rf $REMOTE && mkdir -p $REMOTE" || { echo "cannot reach $HOST"; exit 1; }
+ssh "$HOST" "rm -rf $REMOTE && mkdir -p $REMOTE" </dev/null || { echo "cannot reach $HOST"; exit 1; }
 
 # The same list selfhost-diffexamples.sh skips: these need constructs bit2
 # cannot lower yet (closures/spawn), so they refuse on EVERY target — they are
@@ -84,8 +87,8 @@ for d in examples/*/; do
   # example failed to reach the host still exited 0 (#1513). Nothing was compared;
   # that cannot read as agreement.
   scp -q "$TMP/oracle_$n" "$TMP/b2_$n" "$HOST:$REMOTE/" || { echo "SCP-FAIL $n"; scpfail=$((scpfail + 1)); continue; }
-  so=$(ssh "$HOST" "cd $REMOTE && chmod +x oracle_$n b2_$n && timeout 30 ./oracle_$n 2>&1; echo EXIT=\$?")
-  bo=$(ssh "$HOST" "cd $REMOTE && timeout 30 ./b2_$n 2>&1; echo EXIT=\$?")
+  so=$(ssh "$HOST" "cd $REMOTE && chmod +x oracle_$n b2_$n && timeout 30 ./oracle_$n 2>&1; echo EXIT=\$?" </dev/null)
+  bo=$(ssh "$HOST" "cd $REMOTE && timeout 30 ./b2_$n 2>&1; echo EXIT=\$?" </dev/null)
   if [ "$so" = "$bo" ]; then
     pass=$((pass + 1))
   else

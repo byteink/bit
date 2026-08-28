@@ -103,7 +103,8 @@ while IFS= read -r host; do
   # (#1818). Refused here so the cause is named once, instead of three
   # unrelated-looking harnesses going red on the remote box. macOS has git from
   # the host, which is why a git-less image passed the local gate.
-  ssh "${host}" "docker run --rm ${IMAGE} sh -c 'command -v git'" >/dev/null 2>&1 || {
+  # </dev/null: a liveness probe must not inherit the caller's stdin (#3899).
+  ssh "${host}" "docker run --rm ${IMAGE} sh -c 'command -v git'" </dev/null >/dev/null 2>&1 || {
     echo "x64gate: ${IMAGE} on ${host} has no git — rebuild it from docker/linux-gate.Dockerfile" >&2; exit 127; }
   for i in $(seq 1 "${RUNS}"); do
     total=$((total + 1))
