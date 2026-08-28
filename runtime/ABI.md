@@ -437,7 +437,7 @@ estimate):
    test `rtStringSlice`: force a collection (`BIT_GC=stress`) between
    constructing a view and reading it, and between dropping every other
    reference to the source string and reading the view, confirming the bytes
-   survive — the shape `tests/stress/gcworld` already exercises for the #1991
+   survive — the shape `_tests_/stress/gcworld` already exercises for the #1991
    defect this section's `base` field is specifically designed to avoid
    repeating. `string` layout is `runtime/**`, so per this workspace's standing
    rule the proof artifact is `cmp` on `libbitrt-{aarch64-macos,aarch64-linux,
@@ -680,7 +680,7 @@ absent map is never consulted.
 
 **That requirement collides head-on with the scheduler.** `schedWorkerRun` must
 *not* be `@nosplit`: its safepoints are what let a worker yield to a stop-the-world
-rendezvous, and removing the attribute is what took `tests/stress/schedpool` from
+rendezvous, and removing the attribute is what took `_tests_/stress/schedpool` from
 **zero** collections under `BIT_GC=stress` to a working count. Re-adding it to
 satisfy §17.6 would re-break the collector. Both rules are correct in isolation
 and cannot both hold, so a runtime module that must reach safepoints has **no
@@ -904,7 +904,7 @@ plain integer. That is what #1991 was. A bound address is invisible to the
 collector — not a root, never traced, never rewritten — and there was no unbind,
 so handing it managed memory type-checked, linked and ran until a collection
 swept the block, after which every safepoint poll in the process read freed
-memory. `tests/stress/gcworld` did exactly that: bound a `[]i64` slice, printed
+memory. `_tests_/stress/gcworld` did exactly that: bound a `[]i64` slice, printed
 all 29 of its assertions correctly, then took a SIGSEGV at teardown once `main`
 returned. Keeping the slice live through `main` does not help; the faulting reads
 happen after `main` returns.
@@ -916,7 +916,7 @@ because it carries no address.
 A program that wants a **private** registry passes its own block to the
 parameterised doors (`bit_rt_port_stw_poll_on`,
 `bit_rt_port_gc_current_mutator_on`), which never touch the process-wide
-**registry block** — the rule #1833 established and `tests/stress/stwcollect`
+**registry block** — the rule #1833 established and `_tests_/stress/stwcollect`
 follows. #1833's defect was a private caller REPLACING the live runtime's own
 address binding, so its own worker registered into the wrong registry entirely;
 "never touch" is about that block/binding, not about every word this file's
@@ -1251,7 +1251,7 @@ safepoint poll, so a thread can never be invisible to the collector.
 stays `running` forever, which does not corrupt anything but does make every
 later rendezvous time out, i.e. collection stops — and that is silent, so a rule
 each new caller had to remember was the wrong place for it (measured: 247 of
-`tests/stress/gcthreadslinux`'s 292 abandoned collections were blocked on an
+`_tests_/stress/gcthreadslinux`'s 292 abandoned collections were blocked on an
 exited child's slot). The release now happens without the body's cooperation, by
 whichever hook the platform actually offers:
 
@@ -1365,7 +1365,7 @@ calls `boot`, and exits the process with `boot`'s returned code.
    0.04-0.05s for 1..18 idle workers). Second, even after idle cost was fixed,
    a core-count default still failed `./make test`: a boot-time snapshot of
    "cores available right now" is a claim on the *whole machine*, wrong for a
-   process that is itself one of N run at once. `tests/bit/docs.bit` runs 12
+   process that is itself one of N run at once. `_tests_/bit/docs.bit` runs 12
    `bit` processes concurrently by design; at 18 workers each that is 200+
    parked worker threads on 18 cores, and a batch that runs in ~48s blew its
    300s deadline on oversubscription alone — the threads were genuinely
@@ -1884,7 +1884,7 @@ RtBytes { ptr: *const u8, len: usize }   // extern class — a transient,
   symbolized against the `.bit_dbg` debug-info table (§4.2) — then exit
   immediately with code 2 (SPEC.md §18.4: "a non-zero exit code"). There is
   no `recover` (SPEC.md §18.4). The trace is opt-in, not default: the `//
-  panic` golden mode (`tests/cases/*.bit`) compares stderr byte-for-byte, so
+  panic` golden mode (`_tests_/cases/*.bit`) compares stderr byte-for-byte, so
   an always-on trace would need every `.expected` file updated in the same
   change. See `runtime/root/backtrace.bit` (#3285, #3820) for the walker and
   its degrade rules — an unresolvable frame prints a raw `0x<hex>` address, a
@@ -2330,7 +2330,7 @@ silently-approximate stand-in.
 > The `log` family is table-driven, which is what made it the first thing to
 > notice the AArch64 mapping-symbol bug: a mis-atomized `.rodata` literal pool
 > shifted the lookup tables and these returned garbage while table-free fast
-> paths stayed exact. `tests/cases/run_math.bit` guards that.
+> paths stayed exact. `_tests_/cases/run_math.bit` guards that.
 
 **`bit_rt_float_bits`/`bit_rt_float32_bits` are not math functions — they
 reinterpret an f64/f32's IEEE-754 bit pattern as a same-width unsigned integer
@@ -2339,9 +2339,9 @@ way a Bit program can observe `-0.0` or distinguish two NaN payloads, since
 `==` reports `-0.0 == +0.0` as true and `NaN == NaN` as false either way.
 Since #1442 the compiler's own `floatBits`/`float32Bits` primitives lower to
 an inline `Op.Bitcast`, not an `ir.RtFn` call (`compiler/lowerprim.bit`), so
-neither pinned symbol is reached by generated code — `tests/bit/rootpins/`
+neither pinned symbol is reached by generated code — `_tests_/bit/rootpins/`
 proves that (§9). The exports (`runtime/root/floats.bit:121-129`) remain
-because `tests/stress/rootfloat` links and calls them directly as ordinary
+because `_tests_/stress/rootfloat` links and calls them directly as ordinary
 `bit_rt_*` C ABI entry points, and because they are `runtime/root`'s port of
 the same-named symbols the pre-selfhost runtime shipped.
 
@@ -2435,8 +2435,8 @@ nothing new required of its own predeclared-name table. Every caller was
 updated in the same commit instead: `compiler/build.bit`'s `runCmd`,
 `compiler/pmfetchtail.bit`'s `runGit`, and the fixtures that call the
 predeclared `osRun` builtin directly rather than through a `std/os` wrapper
-(none exists) — `tests/cases/fs_walk_symlink.bit`,
-`tests/imports/pmadd_e2e/main.bit`, `examples/staticserver/staticserver.bit`.
+(none exists) — `_tests_/cases/fs_walk_symlink.bit`,
+`_tests_/imports/pmadd_e2e/main.bit`, `examples/staticserver/staticserver.bit`.
 
 `argv` is a `[]string` SliceHeader (§2), or a null header for the empty/default
 slice — the same content the old fixed `[path, NULL]` construction always
@@ -2522,7 +2522,7 @@ deadline check inside the loop is what actually ends every real call.
 lowers to an `ir.RtFn` that codegen emits as a call to the symbol itself, and
 that lowering stays permanent for both (SEAM 6, #1580).** A Bit *provider* whose
 body called the primitive would therefore be a call to itself, now that #1369
-has dropped the `_root` infix (the pin cycle `tests/bit/rootpins/` guards). Both are
+has dropped the `_root` infix (the pin cycle `_tests_/bit/rootpins/` guards). Both are
 PORTED regardless — `auxv` by #1617, `host_target` by #1635 — each by finding the
 answer somewhere other than the primitive:
 
@@ -2551,11 +2551,11 @@ answer somewhere other than the primitive:
   aarch64-only, so (provider, arch) names all three exactly; Darwin therefore needs
   no `asm` at all and returns the literal 2. The provider must never call
   `hostTarget()` — that primitive lowers to a call to this very symbol, now that
-  #1583 has dropped the `_root` infix (the pin cycle `tests/bit/rootpins/`
+  #1583 has dropped the `_root` infix (the pin cycle `_tests_/bit/rootpins/`
   guards) — and an `asm` immediate is inline by construction, so there is no
   callee for the rename to redirect. Verified running on all three targets, not
   just by disassembly:
-  `tests/stress/roothost{darwin,linux}`.
+  `_tests_/stress/roothost{darwin,linux}`.
 - `auxv` is a **process-entry fact owned by the boot layer (SEAM 3, #1576)**, and
   `bit_rt_auxv`'s provider is `runtime/root/os.bit` (#1617). The kernel places the
   auxiliary vector on the initial stack, unreachable once any Bit code runs, so only

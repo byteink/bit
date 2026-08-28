@@ -23,7 +23,7 @@
 FROM debian:bookworm
 
 # git: the package manager (#1731-#1738) fetches dependencies by shelling out to
-# it, and two test surfaces exercise that — tests/imports/pmadd_e2e and
+# it, and two test surfaces exercise that — _tests_/imports/pmadd_e2e and
 # compiler/pmclicheck.bit. Without it the suite fails with `git: not found` and
 # a bare assertion panic. macOS has git from the host, which is why this went
 # unnoticed until the Linux gates ran.

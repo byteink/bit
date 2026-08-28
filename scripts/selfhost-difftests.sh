@@ -32,7 +32,7 @@ set -u
 # docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=${BIT2:-bit-out/bin/bit}
-PROJ=${1:-tests/testproj}
+PROJ=${1:-_tests_/testproj}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 

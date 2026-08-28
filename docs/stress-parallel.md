@@ -1,7 +1,7 @@
 # Parallel stress coverage
 
-`tests/bit/stressparallel.bit` (#2538, epic #1253) builds and runs the five
-programs in `tests/stress/parallel/*.bit`. Together they prove three things
+`_tests_/bit/stressparallel.bit` (#2538, epic #1253) builds and runs the five
+programs in `_tests_/stress/parallel/*.bit`. Together they prove three things
 about the runtime under real concurrency, each independently checked by a
 reconciling value (an exact count, a checksum, or an exactly-once tally) — not
 by "it did not crash": **no data race** (`mutexcounter`'s final count must be
@@ -26,10 +26,10 @@ deliberately **not** part of `./make test` — same shape as
 `test-stress`/`test-differentials`.
 
 Every build and every run is bounded to a **300-second base** deadline
-(`perRunTimeoutMs`, `tests/bit/stressparallel.bit:99`). Since #3587, that base
+(`perRunTimeoutMs`, `_tests_/bit/stressparallel.bit:99`). Since #3587, that base
 is scaled by currently observed host load (up to `loadScaleCap=8`,
-`tests/bit/stressparallel.bit:103`) and capped at `clampTimeoutMs=6000000`
-(`tests/bit/stressparallel.bit:109`, matching the runtime's own
+`_tests_/bit/stressparallel.bit:103`) and capped at `clampTimeoutMs=6000000`
+(`_tests_/bit/stressparallel.bit:109`, matching the runtime's own
 `osBoundedMaxMs` clamp in `runtime/root/{darwin,linux}/os.bit:450/458`) —
 a fixed 300s wall was found to false-time-out under heavy fleet contention
 (load 41-50) while the same binary finished in 30.85s wall run alone. A
@@ -47,7 +47,7 @@ run below names it explicitly rather than relying on the runtime's default
 
 Each program is built once and executed twice — `BIT_WORKERS=8` then
 `BIT_WORKERS=1` — both passes always with `STRESS_WORKERS=8`
-(`tests/bit/stressparallel.bit:289-291`, hardcoded regardless of
+(`_tests_/bit/stressparallel.bit:289-291`, hardcoded regardless of
 `BIT_WORKERS`), so the `BIT_WORKERS` column below covers both runs for that
 program: a target only reads `pass` once **both** passes reported `PASS` in
 the same run.

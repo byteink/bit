@@ -185,7 +185,7 @@ nothing more.
 | `selfhost-difftypes.sh` | inferred types | re-based on N-1 |
 | `selfhost-diffir.sh` | pre-opt IR | re-based on N-1 |
 | `selfhost-diffiropt.sh` | post-opt IR | re-based on N-1 |
-| `selfhost-diffruntime.sh` | runtime codegen IR — its own corpus, `runtime/**/*.bit`, not the shared stdlib/examples/tests/cases/tests/imports corpus every other row walks (#1859) | re-based on N-1 |
+| `selfhost-diffruntime.sh` | runtime codegen IR — its own corpus, `runtime/**/*.bit`, not the shared stdlib/examples/_tests_/cases/_tests_/imports corpus every other row walks (#1859) | re-based on N-1 |
 | `selfhost-diffsafepoints.sh` | static safepoint counts | re-based on N-1 |
 | `selfhost-difffmt.sh` | formatter output | re-based on N-1 |
 | `selfhost-diffdoc.sh` | `bit doc` output | re-based on N-1 |

@@ -86,7 +86,7 @@ not catch. Read it before a large refactor.
 | `docs/`     | Reference and tutorial documentation                |
 | `editors/`  | Editor support (VS Code extension, LSP client)      |
 | `dist/`     | Packaging (brew formula, installers)                |
-| `tests/`    | Golden-file and stress tests                        |
+| `_tests_/`    | Golden-file and stress tests                        |
 
 See [`docs/release/VERSIONING.md`](docs/release/VERSIONING.md) for what
 counts as a breaking, additive, or fix change across the language, CLI,

@@ -66,7 +66,7 @@ run() {
 }
 
 match=0 mismatch=0 timeout=0 crash=0 firstbad="" firsthang=""
-for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort); do
+for f in $(find stdlib examples _tests_/cases _tests_/imports -name '*.bit' | sort); do
   lines=$(wc -l < "$f")
   # Cap truncation points per file (Power-of-10: bounded work per input).
   step=$(( lines / 20 + 1 ))

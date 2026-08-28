@@ -192,7 +192,7 @@ those lines are over budget with zero code on them. Re-measure rather than
 quoting a figure here; both are near enough to the limit that a reword moves
 them, and a stale number in this file has misled a reader before.
 
-**Check:** `tests/cases/fmt_comment_tail_budget.bit` — a single-item call
+**Check:** `_tests_/cases/fmt_comment_tail_budget.bit` — a single-item call
 with a binary-chain argument and a trailing `//` comment, over budget — has
 a `.expected` byte-identical to its input, so any future change that starts
 wrapping this shape reddens `test-golden` rather than drifting silently.
@@ -489,13 +489,13 @@ joins either group. `bit fmt` matches this exactly: an own-line comment ends
 a trailing-comment run the same way a blank line or a bare code line does,
 for both formatters, rather than Bit inventing a stricter rule than the one
 it is documented to follow. A repo scan across `compiler/`, `runtime/`,
-`stdlib/`, `tools/` and `tests/` (1570 `.bit` files) found 19 places in 13
+`stdlib/`, `tools/` and `_tests_/` (1570 `.bit` files) found 19 places in 13
 files where a hand-aligned trailing-comment run is interrupted by an
 own-line comment — `compiler/codegen.bit`'s `pgWorldStopWordWord`-family
 field-offset table (two of the interruptions) and `runtime/gc/gcworld.bit`'s
 `Mutator` field consts (four) among them — so this is a narrow, bounded
 rule, not one that reformats the corpus at large.
-`tests/cases/fmt_comment_run_own_line_break.bit` pins the decision: its two
+`_tests_/cases/fmt_comment_run_own_line_break.bit` pins the decision: its two
 runs land at different comment columns in `.expected`, so a future change
 that starts spanning the interruption fails this fixture.
 

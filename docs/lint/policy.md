@@ -296,7 +296,7 @@ never checker-mandated. The two shapes:
   `Tag.ExprStmt` case (`vIsPanicCall`, `validatestmt.bit:339`), so the type
   check is skipped and no filler value is required. This exemption landed in
   `4c32c6d5` and is proven by an existing golden case,
-  `tests/cases/run_parseint_intmin.bit`, which ships `catch e { panic("...") }`
+  `_tests_/cases/run_parseint_intmin.bit`, which ships `catch e { panic("...") }`
   with no filler and has always compiled.
 - **A trailing `return <dummy>` after an internally-exhaustive loop or an
   all-arms-diverging `match`.** `vDiverges`'s `WhileStmt` case

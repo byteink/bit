@@ -70,7 +70,7 @@ bucket_scripts() {
     examples)
       BUCKET_POST="scripts/selfhost-diffexamples.sh"
       ;;
-    # spec and pkg (test-spec/test-packages, tests/bit/spec//tests/bit/
+    # spec and pkg (test-spec/test-packages, _tests_/bit/spec//_tests_/bit/
     # packagesgate.bit) have no differential script — same shape as
     # testcases/stdlib/docs/testsbit above, which also fall through with
     # both empty.
@@ -94,7 +94,7 @@ case "${BUCKET}" in
     ;;
   selfhost)
     # test-lint-filelines (its own harness: dirs = ["compiler", "runtime",
-    # "stdlib", "tests/stress", "examples", "tests/bit", "tests/imports"])
+    # "stdlib", "_tests_/stress", "examples", "_tests_/bit", "_tests_/imports"])
     # and test-selfhostcheck (argv literally
     # ["check", "${repoRoot()}/compiler"]) both examine compiler/ content
     # directly and were missing here (#2962) — a compiler/**-only change ran
@@ -125,7 +125,7 @@ case "${BUCKET}" in
     # test-stress-batch is DELIBERATELY NOT in this bucket (#3309). Measured
     # standalone on an idle box: `make: test-stress-batch — 11m0s` (65/65
     # programs judged, PASS) — over the subagent Bash tool's 600s ceiling on
-    # its own, serially: tests/bit/stress/stress.bit's main loop calls
+    # its own, serially: _tests_/bit/stress/stress.bit's main loop calls
     # checkProgram() once per eligible program with no concurrency, so there
     # is no batching win available here the way the concurrent gate batch
     # gives every OTHER step in this bucket. With it included, the same idle
@@ -143,10 +143,10 @@ case "${BUCKET}" in
     BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages)
     ;;
   testcases)
-    # test-fuzz mutates the real tests/cases corpus (BIT_FUZZ_CASES=
-    # ${repoRoot()}/tests/cases, not a synthetic one — tests/bit/fuzz.bit's own
-    # header: "measured ~22 inputs/second over the real tests/cases corpus"),
-    # so a tests/cases/**-only change ran test-golden but never the fuzzer
+    # test-fuzz mutates the real _tests_/cases corpus (BIT_FUZZ_CASES=
+    # ${repoRoot()}/_tests_/cases, not a synthetic one — _tests_/bit/fuzz.bit's own
+    # header: "measured ~22 inputs/second over the real _tests_/cases corpus"),
+    # so a _tests_/cases/**-only change ran test-golden but never the fuzzer
     # against its own new/changed seeds (#2962). exclusive: true in gates.bit,
     # same as this bucket's existing test-stress-exclusive, so mixing it in
     # here is already a proven shape.
@@ -155,7 +155,7 @@ case "${BUCKET}" in
   examples)
     # test-fmt's argv literally includes "${repoRoot()}/examples" alongside
     # stdlib — missing here was the same bug this ticket exists to fix (#2962).
-    # test-lint-filelines scans examples/ too (tests/bit/lintfilelines.bit's own
+    # test-lint-filelines scans examples/ too (_tests_/bit/lintfilelines.bit's own
     # dirs list includes it) and was missing here the same way (#3128).
     BUILD_STEPS=(test-examples test-fmt test-lint-filelines)
     ;;
@@ -163,8 +163,8 @@ case "${BUCKET}" in
     # test-fmt's argv literally includes "${repoRoot()}/stdlib" (#2962, the
     # instance that opened this ticket — #2955 shipped unformatted
     # stdlib/tls/server.bit and this bucket stayed green). test-lint-filelines
-    # scans stdlib/ too (dirs = ["compiler", "runtime", "stdlib", "tests/stress",
-    # "examples", "tests/bit", "tests/imports"] in its own harness).
+    # scans stdlib/ too (dirs = ["compiler", "runtime", "stdlib", "_tests_/stress",
+    # "examples", "_tests_/bit", "_tests_/imports"] in its own harness).
     # test-packages (#3271) too, same reason as the selfhost/runtime buckets
     # above: stdlib/** can break every package even though no package
     # imports it directly by name — every package still builds against it.
@@ -192,7 +192,7 @@ case "${BUCKET}" in
     # compiler/, runtime/ or stdlib/, so every compiler gate is provably
     # irrelevant here, not merely expensive.
     # test-lint-sweep (#3806) is the one exception: its dirNames array
-    # (tests/bit/lintsweep.bit) now sweeps pkg/ for E0200 max-file-lines
+    # (_tests_/bit/lintsweep.bit) now sweeps pkg/ for E0200 max-file-lines
     # alongside runtime/compiler/stdlib/tools, exactly the same
     # "examines this bucket's content directly" reason test-lint-filelines
     # is in the selfhost/runtime/stdlib buckets above — without it here, a
@@ -216,7 +216,7 @@ esac
 }
 
 union_testsbit_steps() {
-# tests/bit/**, tests/imports/**, or tests/stress/** riding alongside one of
+# _tests_/bit/**, _tests_/imports/**, or _tests_/stress/** riding alongside one of
 # the five concrete areas contributes its OWN mapped gate(s) too (#2510) — the
 # case above only reflects the AREA that also changed, so without this union a
 # changed harness's gate silently never ran even though `has_testsbit` was 1
@@ -236,7 +236,7 @@ case "${BUCKET}" in
           *) BUILD_STEPS+=("${s}") ;;
         esac
       done
-      REASON="${REASON}; tests/bit/**, tests/imports/**, or tests/stress/** also changed — added gate(s): ${testsbit_steps}"
+      REASON="${REASON}; _tests_/bit/**, _tests_/imports/**, or _tests_/stress/** also changed — added gate(s): ${testsbit_steps}"
     fi
     ;;
 esac
@@ -250,7 +250,7 @@ assert_full_is_superset() {
 # ran three differential scripts `./make test` does not contain — so adding one
 # unrelated file to a compiler/** change made the gate STRICTLY WEAKER, behind a
 # green GATE_RESULT=PASS. Measured on #2084, whose change set was two
-# compiler/** files plus tests/bit/golden.bit (#2194).
+# compiler/** files plus _tests_/bit/golden.bit (#2194).
 #
 # So the invariant is CHECKED rather than trusted, in the same spirit as the
 # stale-step-name check below: adding a script to any bucket without adding it

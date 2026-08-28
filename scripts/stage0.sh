@@ -9,7 +9,7 @@
 # `sh scripts/stage0.sh --stdlib-root` prints a SECOND thing instead: the
 # absolute path to the pinned release's OWN `stdlib/` (unpacked from the same
 # tarball, fetched/verified exactly as above; no wrapper, no BIT_STDLIB
-# involved). test-release-surface (tests/bit/releasesurface/, #3039) is the
+# involved). test-release-surface (_tests_/bit/releasesurface/, #3039) is the
 # one consumer — it diffs the stdlib SOURCE across a version boundary, which
 # needs the previous release's own copy of `stdlib/http`, not the working
 # tree's. Every other consumer here wants compiler EQUIVALENCE on one shared

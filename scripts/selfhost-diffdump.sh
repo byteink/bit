@@ -32,7 +32,7 @@
 # the bare dump entry points"), with different staleness behaviour. So a bug
 # that only exists on the resolver-active path is invisible to these three
 # rows, however MATCH they read. Demonstrated on
-# tests/cases/run_generic_let_chain.bit: this dump shows `f1(x)` inside
+# _tests_/cases/run_generic_let_chain.bit: this dump shows `f1(x)` inside
 # `build<T>` targeting the concrete `f1$3`, while a real `bit build` of the
 # same file emits a call to `f1$0`, the degenerate unbound-type-param
 # instance -- see docs/development.md "What the differentials assert" and
@@ -92,7 +92,7 @@
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
-CORPUS="stdlib examples tests/cases tests/imports"
+CORPUS="stdlib examples _tests_/cases _tests_/imports"
 # shellcheck source=scripts/selfhost-ir-canon.sh
 . "${ROOT}/scripts/selfhost-ir-canon.sh"
 # shellcheck source=scripts/alarmrun.sh
@@ -196,7 +196,7 @@ NAME="${1:?usage: selfhost-diffdump.sh <ast|tokens|diags|types|ir|iropt>}"
 # The alarm is a HANG guard, not a performance budget, so it belongs well above
 # the slowest legitimate file rather than beside it. 20s was below the corpus's
 # worst case measured on the post-opt twin (25.20s wall on this tree, 21.86s on
-# the oracle, for tests/imports/cryptomldsa/main.bit); pre-opt IR is cheaper and
+# the oracle, for _tests_/imports/cryptomldsa/main.bit); pre-opt IR is cheaper and
 # escaped by luck, not by design. 300s matches the sibling and is ~12x that.
 #
 # The oracle used to run UNBOUNDED, so a hung stage0 wedged this script with no
@@ -229,7 +229,7 @@ NAME="${1:?usage: selfhost-diffdump.sh <ast|tokens|diags|types|ir|iropt>}"
 #
 # The alarm is a HANG guard, not a performance budget, so it must sit well above
 # the slowest legitimate file rather than near it. It was 20s while the corpus's
-# worst case — tests/imports/cryptomldsa/main.bit — needed 25.20s wall and ~14s
+# worst case — _tests_/imports/cryptomldsa/main.bit — needed 25.20s wall and ~14s
 # CPU on THIS tree and 21.86s on the oracle. That is not a margin; the gate went
 # red with MISMATCH=0 whenever the box was busy, which is the shape docs/development.md
 # warns about ("do not read a TIMED OUT as a hang until you have timed the

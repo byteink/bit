@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Converter for tests/imports/regexconform/: Go's regexp `findTests` table
+"""Converter for _tests_/imports/regexconform/: Go's regexp `findTests` table
 (https://github.com/golang/go/blob/<tag>/src/regexp/find_test.go) -> a Bit
 data table (main.bit) plus a golden `expected` file, both derived
 mechanically from the same parse of Go's source so the corpus can be
@@ -266,7 +266,7 @@ def go_want_string(matches):
     against, kept separate from `expected` (this project's own top-level
     pass/fail report), which reflects std/regex's CURRENT behaviour and is
     recaptured by re-running the corpus, exactly like every other
-    tests/imports/* project's `expected` file."""
+    _tests_/imports/* project's `expected` file."""
     if matches is None:
         return "count=0"
     parts = [",".join(str(v) for v in m) for m in matches]
@@ -311,13 +311,13 @@ HEADER_TEMPLATE = '''\
 // generated. This program compares its own `rowStr` output against `want`
 // FOR EVERY ROW and prints a summary ("N of M vectors pass") plus one block
 // per disagreement — never a per-row raw dump — because the outer harness
-// (tests/bit/importsrun.bit) grades this project by diffing its stdout
+// (_tests_/bit/importsrun.bit) grades this project by diffing its stdout
 // against the checked-in `expected` file byte for byte. If `want` were
 // printed and diffed directly, the only way to make this project's gate
 // pass while std/regex has open bugs would be editing `expected` to match
 // the wrong answer, exactly what this file forbids. Instead `expected`
 // holds THIS PROGRAM'S OWN current summary+mismatch report — captured by
-// running it once, the same way every other tests/imports/* project's
+// running it once, the same way every other _tests_/imports/* project's
 // `expected` is captured — so a NEW disagreement (a regression) changes the
 // summary and fails the gate, and a FIX (a mismatch disappearing) also
 // changes the summary and fails the gate until `expected` is refreshed in
@@ -495,7 +495,7 @@ def write_outputs(kept, skipped, tag, fetched, total):
     print("NOTE: main.bit and SKIPPED.tsv are regenerated. `expected` is NOT "
           "written by this script — it is std/regex's CURRENT stdout, "
           "captured by building and running this project once (same "
-          "convention as every other tests/imports/* project) and is left "
+          "convention as every other _tests_/imports/* project) and is left "
           "untouched here so a real behaviour change is never silently "
           "masked.", file=sys.stderr)
 

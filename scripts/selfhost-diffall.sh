@@ -22,8 +22,8 @@
 # its content. A rule people have to remember is not a control. This script is
 # the control: one command that cannot be under-run.
 #
-# So: add or change anything under tests/cases, examples/, stdlib/ or
-# tests/imports -> run THIS, not a subset you chose.
+# So: add or change anything under _tests_/cases, examples/, stdlib/ or
+# _tests_/imports -> run THIS, not a subset you chose.
 #
 # ## The family is DISCOVERED, not listed
 #

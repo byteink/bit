@@ -97,8 +97,8 @@ total=0
 while IFS= read -r host; do
   [ -n "${host}" ] || continue
   # The suite needs a `git` binary INSIDE the image: the package manager fetches
-  # dependencies by shelling out to it, so tests/imports/pmadd_e2e,
-  # tests/bit/pmimports.bit and compiler/pmclicheck.bit all fail without it — as
+  # dependencies by shelling out to it, so _tests_/imports/pmadd_e2e,
+  # _tests_/bit/pmimports.bit and compiler/pmclicheck.bit all fail without it — as
   # `git: not found`, an empty failure, and a bare assertion panic respectively
   # (#1818). Refused here so the cause is named once, instead of three
   # unrelated-looking harnesses going red on the remote box. macOS has git from

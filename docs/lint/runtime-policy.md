@@ -2,7 +2,7 @@
 
 #2567. This is the policy for every `bit lint runtime` finding **except
 E0211** `unused-local` (already fixed and gated: #2515,
-`tests/bit/lintruntime.bit`, `test-lint-runtime`) and **except E0214**
+`_tests_/bit/lintruntime.bit`, `test-lint-runtime`) and **except E0214**
 `append-aliasing` (a correctness rule with its own settled per-instance
 triage elsewhere in this repo, out of scope for a readability-policy
 document).
@@ -176,7 +176,7 @@ grep -c '\[E0215\]' "$LOG"   # target: 0
 
 Zero in `runtime/` today. No file in `runtime/` needs a decision. This rule
 is also already gated for `runtime/` independent of this ticket —
-`test-lint-filelines` (`tests/bit/lintfilelines.bit`) scans seven trees
+`test-lint-filelines` (`_tests_/bit/lintfilelines.bit`) scans seven trees
 including `runtime/`, so a future regression here is caught without any new
 gate. Nothing to add.
 
@@ -392,7 +392,7 @@ The original ticket's step 2 ("extend the settled count into a gate") is
 explicitly deferred, for two reasons stated in this ticket's own dispatch:
 first, this ticket's deliverable is the decision, not the mechanical
 gate-wiring (`tools/build/lint-ceiling.txt` only supports exactly two scopes
-today, `compiler`/`stdlib` — `tests/bit/lintself.bit:224` hard-requires
+today, `compiler`/`stdlib` — `_tests_/bit/lintself.bit:224` hard-requires
 both lines and no others — so adding `runtime` needs a real code change to
 that harness, not a data-file edit); second, **#3616 is concurrently
 tightening `tools/build/lint-ceiling.txt` to the measured counts**, so
