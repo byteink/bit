@@ -12,8 +12,8 @@ fn first<T>(xs: []T): T {
 }
 
 fn use() {
-  let a = first([]int{1, 2, 3})        // T inferred as int
-  let b = first([]string{"x", "y"})    // T inferred as string
+  let a = first([]int{ 1, 2, 3 })     // T inferred as int
+  let b = first([]string{ "x", "y" }) // T inferred as string
 }
 ```
 
@@ -27,11 +27,13 @@ may use exactly the methods the bound guarantees.
 
 ```bit
 interface Ord {
-  less(other: Self): bool
+  less(other: Self): bool,
 }
 
 fn max<T: Ord>(a: T, b: T): T {
-  if (a.less(b)) { return b }
+  if (a.less(b)) {
+    return b
+  }
   return a
 }
 ```
@@ -55,17 +57,17 @@ Type parameters attach to classes, interfaces, and type aliases too.
 
 ```bit
 class Box<T> {
-  export value: T
+  export value: T,
 }
 
 interface Container<T> {
-  get(): T
+  get(): T,
 }
 
 type Pair<A, B> = (A, B)
 
 fn boxed() {
-  let b = Box<int>{ value: 42 }        // generic composite literal
+  let b = Box<int>{ value: 42 } // generic composite literal
   let v = b.value
 }
 ```
@@ -83,7 +85,7 @@ fn make<T>(): []T {
 }
 
 fn explicit() {
-  let xs = make<int>()      // explicit: T appears only in the result
+  let xs = make<int>() // explicit: T appears only in the result
 }
 ```
 

@@ -7,11 +7,11 @@ rarely write a type annotation. (Spec: §10.1, §13.2, §13.4, §15.1.)
 ## `let` and `const`
 
 ```bit
-let count = 0          // mutable, inferred type int
-const limit = 100      // immutable, inferred type int
+let count = 0     // mutable, inferred type int
+const limit = 100 // immutable, inferred type int
 
 fn tick() {
-  count = count + 1    // ok: let is mutable
+  count = count + 1 // ok: let is mutable
   // limit = 200       // error: const cannot be reassigned
 }
 ```
@@ -28,10 +28,10 @@ the annotation is then required.
 
 ```bit
 fn demo() {
-  let name: string = "bit"   // explicit type, redundant here
-  let score: int             // no initializer -> zero value 0
-  let ready: bool            // -> false
-  let ratio = 3.0            // inferred f64 (float default type)
+  let name: string = "bit" // explicit type, redundant here
+  let score: int           // no initializer -> zero value 0
+  let ready: bool          // -> false
+  let ratio = 3.0          // inferred f64 (float default type)
 }
 ```
 
@@ -57,10 +57,10 @@ bits in such a field would be a null rather than a live instance - see
 [Classes](classes.md#reference-type).
 
 ```bit
-class Point { x: f64; y: f64 }
+class Point { x: f64, y: f64 }
 
 fn origin(): Point {
-  let p: Point       // {x: 0.0, y: 0.0}, ready to use
+  let p: Point // {x: 0.0, y: 0.0}, ready to use
   return p
 }
 ```
@@ -74,8 +74,8 @@ exists. There is no `:=`. To shadow a name in an inner scope, declare it again.
 fn scope() {
   let x = 1
   {
-    let x = 2     // a new binding shadows the outer x in this block
-    x = 3         // assigns to the inner x
+    let x = 2 // a new binding shadows the outer x in this block
+    x = 3     // assigns to the inner x
   }
   // x is 1 again here
 }
@@ -89,9 +89,9 @@ never be read.
 
 ```bit
 fn unpack(): (int, int) {
-  let a = 1, b = 2                 // two bindings in one statement
-  let (lo, hi) = bounds()          // destructure a tuple result
-  let (_, second) = bounds()       // discard the first element
+  let a = 1, b = 2           // two bindings in one statement
+  let (lo, hi) = bounds()    // destructure a tuple result
+  let (_, second) = bounds() // discard the first element
   return lo, hi
 }
 
@@ -107,7 +107,7 @@ which makes swaps clean:
 ```bit
 fn swap() {
   let a = 1, b = 2
-  a, b = b, a          // simultaneous: a is now 2, b is 1
+  a, b = b, a // simultaneous: a is now 2, b is 1
 }
 ```
 
@@ -117,7 +117,7 @@ single target and value:
 ```bit
 fn accumulate() {
   let total = 0
-  total += 5           // total = total + 5
+  total += 5 // total = total + 5
   total *= 2
   total <<= 1
 }
@@ -168,7 +168,7 @@ is inserted before it:
 
 ```bit
 fn braces(ready: bool) {
-  if (ready) {         // correct: the brace opens on the construct's own line
+  if (ready) { // correct: the brace opens on the construct's own line
     println("work")
   }
 }

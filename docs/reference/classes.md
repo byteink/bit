@@ -13,13 +13,13 @@ fields.** That is reference semantics, like a TypeScript or Java object -
 unlike a Go or C `struct`, which copies its fields on assignment.
 
 ```bit
-class Point { x: f64; y: f64 }
+class Point { x: f64, y: f64 }
 
 fn classes() {
-  let p = Point{ x: 1.0, y: 2.0 }   // keyed literal, always type-prefixed
-  let q = Point{ x: 3.0 }           // y omitted -> zero value 0.0
-  let shared = p                    // copies the handle, not the fields
-  shared.x = 9.0                    // p.x is now 9.0 too - same object
+  let p = Point{ x: 1.0, y: 2.0 } // keyed literal, always type-prefixed
+  let q = Point{ x: 3.0 }         // y omitted -> zero value 0.0
+  let shared = p                  // copies the handle, not the fields
+  shared.x = 9.0                  // p.x is now 9.0 too - same object
 }
 ```
 
@@ -42,8 +42,8 @@ Two consequences follow directly:
 
 ```bit
 class User {
-  export name: string    // visible to other modules
-  age: int                // module-private
+  export name: string, // visible to other modules
+  age: int,            // module-private
 }
 ```
 
@@ -64,8 +64,8 @@ out of a literal takes its type's zero value.
 
 ```bit
 fn composite() {
-  let a = User{ age: 30, name: "Ada" }   // keyed - order doesn't matter
-  let b = User{ name: "Grace" }          // age omitted -> zero value 0
+  let a = User{ age: 30, name: "Ada" } // keyed - order doesn't matter
+  let b = User{ name: "Grace" }        // age omitted -> zero value 0
 }
 ```
 
@@ -84,8 +84,8 @@ positional (§12.2).
 fn shorthandLiteral() {
   let name = "Ada"
   let age = 30
-  let a = User{ name, age }         // shorthand for User{ name: name, age: age }
-  let b = User{ age: 42, name }     // shorthand and keyed mix; order irrelevant
+  let a = User{ name, age }     // shorthand for User{ name: name, age: age }
+  let b = User{ age: 42, name } // shorthand and keyed mix; order irrelevant
 }
 ```
 
@@ -134,9 +134,9 @@ cycle with any type that has an empty or `nil` state; `Option<T>` is the
 idiomatic one:
 
 ```bit
-class ListNode { v: int, next: Option<ListNode> }   // linked list
-class TreeNode { v: int, kids: []TreeNode }         // a slice terminates too
-class TrieNode { next: map<rune, TrieNode> }        // and so does a map
+class ListNode { v: int, next: Option<ListNode> } // linked list
+class TreeNode { v: int, kids: []TreeNode }       // a slice terminates too
+class TrieNode { next: map<rune, TrieNode> }      // and so does a map
 ```
 
 A map whose value type is such a class is still fine to build, insert into,
@@ -173,8 +173,8 @@ class Counter {
 
 fn useCounter() {
   let c = Counter{ n: 5 }
-  let a = c.bump()             // 6, and c.n is now 6
-  let b = c.doubled()          // 12
+  let a = c.bump()    // 6, and c.n is now 6
+  let b = c.doubled() // 12
 }
 ```
 
@@ -232,9 +232,9 @@ class Money { cents: int }
 fn comparableMoney() {
   let a = Money{ cents: 500 }
   let b = Money{ cents: 500 }
-  let sameFields = a == b        // true - fields compare equal
+  let sameFields = a == b // true - fields compare equal
   let alias = a
-  let sameHandle = a == alias    // also true, but for the same reason
+  let sameHandle = a == alias // also true, but for the same reason
 }
 ```
 
