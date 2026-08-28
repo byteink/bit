@@ -105,17 +105,28 @@ fn lowerSliceAlloc(fc: FnCtx, node: int): int {
     refI.ival = 1
   }
   let refV = builderEmit(fc.b, refI)
-  // elem_size (ABI.md §9, #3121/#3226): 1 for a packed `[]u8`, 8 for every
-  // other element type. `sliceElemSizeFor` (lowercall.bit) is the single
-  // source of truth for which prim gets packed.
+  // elem_size (ABI.md §9, #3121/#3226, #3862): 1 for a packed `[]u8`, a
+  // class's own size for a `[]T` using the packed inline representation, 8
+  // for every other element type. `sliceElemSizeFor` (lowercall.bit) is the
+  // single source of truth for which element type gets packed.
+  let stride = sliceElemSizeFor(fc, elemTy)
   let esI = mkInstr(Op.ConstInt, primType(fc.c.ctx, 3))
-  esI.ival = sliceElemSizeFor(fc, elemTy)
+  esI.ival = stride
   let esV = builderEmit(fc.b, esI)
   let sn = mkInstr(Op.RtCall, sliceTy)
   sn.name = "slice_new"
   sn.args = [nV, capV, refV, esV]
   let s = emitRtCall(fc, sn)
   if (fc.c.ctx.types[elemTy].kind == TypeKind.Struct) {
+    // A PACKED class (#3862) needs no fill loop: `slice_new`'s buffer is a
+    // fresh GC allocation, always zeroed, and zero bytes ARE an all-scalar
+    // class's zero value — the same invariant `structHasNoZeroValue`
+    // guarantees can never fail for a class this ticket lets qualify (its
+    // `ptrOffsets` must be empty, so it can never have the class-typed field
+    // `fillStructElems`'s panic path exists for).
+    if (stride > 8) {
+      return s
+    }
     return fillStructElems(fc, s, elemTy, nV, getNode(fc.c.tree, node).span)
   }
   return s
@@ -187,15 +198,19 @@ fn lowerSliceElems(fc: FnCtx, sliceTy: int, items: []int): int {
     refI.ival = 1
   }
   let refV = builderEmit(fc.b, refI)
-  // elem_size (ABI.md §9, #3121/#3226): see `lowerSliceAlloc`'s identical
-  // comment above.
+  // elem_size (ABI.md §9, #3121/#3226, #3862): see `lowerSliceAlloc`'s
+  // identical comment above.
+  let stride = sliceElemSizeFor(fc, elemTy)
   let esI = mkInstr(Op.ConstInt, i64ty)
-  esI.ival = sliceElemSizeFor(fc, elemTy)
+  esI.ival = stride
   let esV = builderEmit(fc.b, esI)
   let sn = mkInstr(Op.RtCall, sliceTy)
   sn.name = "slice_new"
   sn.args = [lenV, lenV, refV, esV]
   let s = emitRtCall(fc, sn)
+  if (stride > 8) {
+    return fillPackedSliceLitElems(fc, s, elemTy, stride, items)
+  }
   let i = 0
   while (i < len(items)) {
     let a = items[i]
@@ -216,6 +231,85 @@ fn lowerSliceElems(fc: FnCtx, sliceTy: int, items: []int): int {
     i = i + 1
   }
   return s
+}
+
+// Fills a freshly-allocated PACKED `[]elemTy` slice literal's elements
+// directly (#3862): `sliceElemInlineSafe` (lowersliceinline.bit) already
+// proved every item here is a `Tag.CompositeLit` of elemTy, so each is
+// written straight into its slot rather than boxed via `lowerCompositeLit`
+// and then copied — boxing first would pay exactly the per-element
+// allocation packing exists to remove.
+// One packed slice element's address inputs (#3862) — the receiver slice
+// value, the target index, its runtime stride and its (all-scalar) class
+// type — bundled so the writer below and its callers stay under E0202's
+// max-params=5 (spec/LINT.md).
+class PackedSlot {
+  recv: int,
+  idxV: int,
+  stride: int,
+  elemTy: int,
+}
+
+fn fillPackedSliceLitElems(fc: FnCtx, s: int, elemTy: int, stride: int, items: []int): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let i = 0
+  while (i < len(items)) {
+    let a = items[i]
+    if (getNode(fc.c.tree, a).tag == Tag.Arg) {
+      a = kidsOf(fc.c.tree, a)[0]
+    }
+    let idxI = mkInstr(Op.ConstInt, i64ty)
+    idxI.ival = i
+    let idxV = builderEmit(fc.b, idxI)
+    storePackedCompositeLit(fc, PackedSlot{ recv: s, idxV: idxV, stride: stride, elemTy: elemTy }, a)
+    if (fc.failed) {
+      return 0
+    }
+    i = i + 1
+  }
+  return s
+}
+
+// Writes `litNode`'s (a `Tag.CompositeLit` of `slot.elemTy`) field values
+// directly into the packed slot at `slot.recv[slot.idxV]` (#3862) — never
+// through `GcAlloc` + `FieldSet` on a throwaway boxed object (which
+// `lowerCompositeLit` builds), and never through `slice_set` (word-valued,
+// FATAL above 8 bytes since #3861). A field the literal omits is left at
+// whatever the slot already holds, which is always zero: the slot is either
+// freshly allocated (`slice_new`) or a `slice_append` tail slot, and #3861's
+// grow-copy only ever exposes fresh or never-written bytes as a NEW
+// element's storage — the same zero a boxed `GcAlloc` would give an omitted
+// field.
+fn storePackedCompositeLit(fc: FnCtx, slot: PackedSlot, litNode: int) {
+  let lk = kidsOf(fc.c.tree, litNode)
+  let decl = structDeclOf(fc.c, slot.elemTy)
+  let oc = typeOwner(fc.c, slot.elemTy)
+  let sub = structLitSubst(fc.c, oc, decl, lk[0])
+  let layout = structLayout(fc, oc, decl, sub)
+  let fields = structFieldNodes(oc, decl)
+  let addr = emitPackedElemAddr(fc, slot.recv, slot.idxV, slot.stride)
+  let inits = kidsOf(fc.c.tree, lk[1])
+  let i = 0
+  while (i < len(inits) && !fc.failed) {
+    let ik = kidsOf(fc.c.tree, inits[i])
+    let fldNode = getNode(fc.c.tree, ik[0])
+    let fidx = fieldIndexByName(oc, fields, fc.c.source[fldNode.span.start:fldNode.span.end])
+    if (fidx == -1) {
+      fcFail(fc, fldNode.span, "a composite literal field that does not exist on the class")
+      return
+    }
+    let fty = typeFromNodeIn(oc, kidsOf(oc.tree, fields[fidx])[1], sub)
+    let val = lowerExprH(fc, ik[1], fty)
+    if (fc.failed) {
+      return
+    }
+    let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+    fs.lhs = addr
+    fs.ival = layout.offsets[fidx]
+    fs.rhs = val
+    builderEmit(fc.b, fs)
+    i = i + 1
+  }
 }
 
 // Allocates an empty map: `rt_call map_new(key_desc, val_is_ref)`. The two
