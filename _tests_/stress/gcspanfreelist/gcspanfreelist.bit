@@ -1,0 +1,144 @@
+// The span reserve's free list (#3868) actually gets USED, not merely
+// present -- `gcspanfree`'s existing (d) `spanBad` check does NOT cover this:
+// `heapCheckSpansLocked` (runtime/alloc/alloc.bit) walks only the live
+// per-class span lists, never the free list or the #3045 cache, and
+// `gcspanfree`'s ~25-span burst never crosses that cache's 64-slot cap, so
+// `spanFreeListPush`/`spanFreeListTake` are never reached from that fixture
+// at all. This one is sized to cross the boundary by a wide margin.
+//
+// WHAT THIS ASSERTS. Two identical bursts, back to back, each large enough
+// to reclaim well over 64 spans of one class in a single sweep (the #3045
+// cache overflows into the free list on the FIRST burst's reclaim already).
+// If the free list is doing its job, growing the reserve for the SECOND
+// burst costs close to nothing -- the addresses the first burst's overflow
+// released are still there to be recycled. If it is not (this file's own
+// `spanFreeListTake` call reverted to always return 0, the #3868 mutation
+// test), the second burst has to map as many fresh chunks as the first did,
+// because nothing was ever recovered.
+//
+//   (a) GREW. Same shape as gcspanfree: the caller-bound arena is small on
+//       purpose, so the burst forces the reserve to map its own chunks.
+//   (b) CHUNKS BOUNDED ACROSS THE SECOND BURST. `chunksAfterBurst2` must not
+//       exceed `chunksAfterBurst1` by more than a small slack -- growing from
+//       an already-fully-freed heap a second time must be nearly free once
+//       the first burst's overflow is recoverable. Mutation-proven: reverting
+//       `spanFreeListTake` to a constant 0 in this program's own copy of
+//       runtime/gc/gc.bit's logic is exactly what #3868 verified doubles this
+//       number instead of leaving it flat (see the ticket's own report).
+//   (c) SOUND. `gcSpanViolations` re-derives the span bookkeeping and must be
+//       0, read before `gcDeinit` for the same reason gcspanfree reads it
+//       there.
+//   (d) NO LEAK. `gcLiveBytes` is 0 after `gcDeinit`.
+
+import { spinUnlocked } from "../../../runtime"
+import { heapInit, heapWords } from "../../../runtime/alloc"
+import {
+  gcInit, gcConfigure, gcBindMemory, gcAlloc, gcCollectRoots, gcDeinit,
+  gcWords, gcSpanViolations, gcLiveBytes, gcSpanChunks,
+} from "../../../runtime/gc"
+
+// 256 KiB, matching gcspanfree: two spans' worth, so nearly every span the
+// burst fills comes from a reserve-mapped (releasable) chunk, not the
+// caller-bound arena.
+const ARENA_WORDS: int = 32768
+const INDEX_WORDS: int = 8192
+const META_WORDS: int = 8
+
+// 150000 x 128-byte bodies is ~18.3 MB, ~140 spans of one class -- more than
+// double the #3045 cache's 64-slot cap, so the first burst's reclaim alone
+// overflows into the free list this ticket added.
+const OBJS: int = 150000
+
+fn burst(g: *i64, metaAddr: int, roots: *i64): int {
+  let i = 0
+  let allocOk = 1
+  while (i < OBJS) { // bounded: OBJS iterations
+    let p = gcAlloc(g, metaAddr)
+    if (p == 0) {
+      allocOk = 0
+    }
+    *(roots + i) = p
+    i = i + 1
+  }
+  gcCollectRoots(g, int(roots), OBJS) // every root live: nothing swept
+  let d = 0
+  while (d < OBJS) { // bounded: OBJS iterations
+    *(roots + d) = 0
+    d = d + 1
+  }
+  gcCollectRoots(g, int(roots), OBJS) // now all garbage: reclaim fires
+  return allocOk
+}
+
+fn main() {
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let heapBlock = []i64(heapWords)
+  let heapLock = []i32(1)
+  let lock = []i32(1)
+  let state = []i64(gcWords)
+  let meta = []i64(META_WORDS)
+  let roots = []i64(OBJS)
+
+  let metaAddr = int(ptrOf(meta))
+  meta[0] = 128 // body size: a small-path object, well under allocMaxSmall
+  meta[1] = 0   // no pointer fields: a leaf, so this is pure allocator traffic
+  meta[2] = 0
+  meta[3] = 0
+  meta[4] = 0
+  meta[5] = 0
+  meta[6] = 0
+
+  let hp = ptrOf(heapBlock)
+  heapInit(hp)
+  let hlk = ptrOf(heapLock)
+  atomicStore(hlk, spinUnlocked)
+  let lp = ptrOf(lock)
+  atomicStore(lp, spinUnlocked)
+
+  let g = ptrOf(state)
+  let rootsAddr = ptrOf(roots)
+  gcBindMemory(g, int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
+  if (!gcInit(g, int(hp), int(hlk), int(lp), metaAddr, 256)) {
+    print("gcInit failed\n")
+    return
+  }
+  // `stress` on arms the span-bookkeeping check on every refill. See (c).
+  gcConfigure(g, true, true, 4096, 200, false)
+
+  let allocOk1 = burst(g, metaAddr, rootsAddr)
+  let chunksAfterBurst1 = gcSpanChunks(g)
+  let grew = 0
+  if (chunksAfterBurst1 > 0) {
+    grew = 1
+  }
+
+  let allocOk2 = burst(g, metaAddr, rootsAddr)
+  let chunksAfterBurst2 = gcSpanChunks(g)
+
+  // Slack of 2: an exact match is not required (a span or two can legitimately
+  // land back in the arena/anchor accounting differently run to run), but
+  // anywhere near DOUBLING chunksAfterBurst1 -- which is what a reserve with
+  // no free list does, verified directly on #3868's own branch with this
+  // exact shape -- must fail this.
+  let bounded = 0
+  if (chunksAfterBurst2 <= chunksAfterBurst1 + 2) {
+    bounded = 1
+  }
+
+  // Read BEFORE `gcDeinit`: teardown frees every object, and a heap with no
+  // spans left has nowhere to keep the count.
+  let spanBad = gcSpanViolations(g)
+
+  gcDeinit(g)
+  let leaked = gcLiveBytes(g)
+
+  // `arena`/`roots` reached here so both stay rooted across every ambient
+  // collection above, which under BIT_GC=stress is every loop back-edge.
+  let rooted = 0
+  if (len(arena) == ARENA_WORDS && len(roots) == OBJS) {
+    rooted = 1
+  }
+
+  print("gcspanfreelist ${allocOk1} ${allocOk2} ${grew} ${chunksAfterBurst1} ${chunksAfterBurst2} ${bounded} ${spanBad} ${leaked} ${rooted}\n")
+}

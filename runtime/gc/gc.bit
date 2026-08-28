@@ -163,9 +163,19 @@ const gcIdxRes = 32
 // `idxGrow`.
 const gcIdxSpareAddr = 35
 const gcIdxSpareCap = 36
+// Head of the span reserve's free list (#3868): released spans the #3045
+// cache had no room for, recovered by address instead of abandoned. See
+// `./mem.bit`'s `spanFreeListPush`/`spanFreeListTake` — this word is exactly
+// what those take as `head`, and it is a dedicated word here rather than a
+// 4th `reserveWords` word because only `gcSpanRes` ever needs one (see that
+// const's own comment in `./mem.bit`). 38, not 37: `gcNextObjects` above
+// already owns 37 — the two constants are declared out of numeric order
+// because `gcNextObjects` was appended by #3292 next to its sibling
+// `gcNextBytes` rather than at the end of the block.
+const gcSpanFree = 38
 
 // Words the caller must provide for the state block.
-export const gcWords = 38
+export const gcWords = 39
 
 // Defaults, matching `Config`'s field defaults in runtime/gc/.
 export const gcDefaultMinTrigger = 4194304   // 4 * 1024 * 1024
@@ -288,6 +298,7 @@ export @nosplit @symbol("bit_rt_port_gc_init") fn gcInit(g: *i64, heapAddr: int,
   *(g + gcStBadOffset) = 0
   *(g + gcIdxSpareAddr) = 0
   *(g + gcIdxSpareCap) = 0
+  *(g + gcSpanFree) = 0
 
   // The mark worklist is allocated from the OBJECT heap, exactly as `Gc.init`
   // does. That is deliberate rather than incidental: it means the worklist
@@ -378,26 +389,39 @@ export @nosplit @symbol("bit_rt_port_gc_bind_memory") fn gcBindMemory(g: *i64, s
     // Class empty: try the #3045 span cache before the reserve. A reclaimed
     // span sitting there is address space that is already ours — resident,
     // owned, and unlinked from every class — so reusing it costs nothing the
-    // reserve would otherwise have to map fresh (#2803: the reserve is a pure
-    // bump allocator with no free list, so every miss here is a chunk that
-    // never comes back).
+    // reserve would otherwise have to map fresh.
     let span = heapSpanCacheTakeLocked(heapBlock(g))
     let owned = true
     if (span == 0) {
-      // Cache empty: carve a fresh span out of the reserve and retry, which is
-      // `allocSmall`'s `refill` path. `reserveGrow` maps a fresh chunk when the
-      // reserve is spent, so this fails only when the OS is out — `refill`'s
-      // `mapPages(span_bytes) orelse return false` exactly (#1638).
-      span = reserveGrow(g + gcSpanRes, allocSpanBytes)
+      // Cache empty: try the span reserve's own free list next (#3868) —
+      // an address `gcHeapFree`'s overflow arm recovered rather than
+      // abandoned when the #3045 cache was already full for it. Cheaper
+      // than `reserveGrow` even though both eventually return mapped
+      // memory: this skips a syscall entirely, `bit_rt_remap_pages` having
+      // already paid it when the span was pushed.
+      span = spanFreeListTake(g + gcSpanFree)
       if (span == 0) {
-        spinRelease(heapLock(g))
-        return 0
+        // Free list empty too: carve a fresh span out of the reserve and
+        // retry, which is `allocSmall`'s `refill` path. `reserveGrow` maps a
+        // fresh chunk when the reserve is spent, so this fails only when the
+        // OS is out — `refill`'s `mapPages(span_bytes) orelse return false`
+        // exactly (#1638).
+        span = reserveGrow(g + gcSpanRes, allocSpanBytes)
+        if (span == 0) {
+          spinRelease(heapLock(g))
+          return 0
+        }
+        // Whether this span may ever be given back to the OS is decided HERE
+        // and recorded on the span, because this is the only place that
+        // knows: a span out of a chunk the reserve mapped is releasable, one
+        // out of the arena the CALLER bound is not (#2375, see
+        // `reserveHeadOwns`).
+        owned = reserveHeadOwns(g + gcSpanRes, span, allocSpanBytes)
       }
-      // Whether this span may ever be given back to the OS is decided HERE and
-      // recorded on the span, because this is the only place that knows: a span out
-      // of a chunk the reserve mapped is releasable, one out of the arena the
-      // CALLER bound is not (#2375, see `reserveHeadOwns`).
-      owned = reserveHeadOwns(g + gcSpanRes, span, allocSpanBytes)
+      // A free-list span is always releasable too, same reasoning as the
+      // cache below: it can only have arrived here via `gcHeapFree`'s
+      // overflow arm, which only ever reaches a span already established as
+      // owned. `owned` stays at its default (true) for it.
     }
     // A cached span is always releasable: `heapSpanCachePushLocked` only ever
     // receives spans `heapReclaimSpansLocked` marked doomed, and that pass
@@ -470,13 +494,16 @@ export @nosplit @symbol("bit_rt_port_gc_bind_memory") fn gcBindMemory(g: *i64, s
         // Read BEFORE the span is cached or unmapped: caching overwrites the
         // span's own first word (#3045), and unmapping makes it unreadable.
         let nxt = allocSpanNext(chain)
-        // Try the #3045 cache first; only unmap when it reports full. Either
-        // way the span leaves `heapMappedBytes`' count here — a cache hit
-        // stays resident but is no longer "mapped" in the accounting sense
-        // until a later refill adds it back, exactly as an unmapped span's
-        // bytes leave the count now and return only via a fresh refill.
+        // Try the #3045 cache first; only hand it to the reserve's free list
+        // (#3868) when the cache reports full. Either way the span leaves
+        // `heapMappedBytes`' count here — a cache hit stays resident but is
+        // no longer "mapped" in the accounting sense until a later refill
+        // adds it back; a free-list push actually decommits it (see
+        // `spanFreeListPush`), so its bytes leave the count for the same
+        // reason an unmapped span's did before #3868 — and return only via a
+        // fresh refill either way.
         if (heapSpanCachePushLocked(heapBlock(g), chain) == 0) {
-          memUnmapPages(chain, allocSpanBytes)
+          spanFreeListPush(g + gcSpanFree, chain)
         }
         heapSpansReleasedLocked(heapBlock(g), allocSpanBytes)
         chain = nxt
@@ -540,7 +567,7 @@ export @nosplit fn gcDeinit(g: *i64) {
   // been unmapped and its bytes are already off `mappedBytes`. What the counter
   // still holds is therefore EXACTLY the spans carved out of the reserve —
   // which is how the span total is recovered without a counter of its own, and
-  // it needs none: `gcWords` is full, every one of its 38 words assigned, and
+  // it needs none: `gcWords` is full, every one of its 39 words assigned, and
   // `runtime/root/root.bit` refuses to boot if that width moves.
   //
   // Release the accounting first, then the pages: a window where the counter
