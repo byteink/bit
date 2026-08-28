@@ -3559,19 +3559,20 @@ codegen, both object writers, and the runtime walker are all separate,
 follow-on tickets, and none of them lands here.
 
 **This reverses a documented v1 position, and says so rather than superseding
-it silently.** `runtime/ABI.md` §12 ("Panics") currently states, verbatim:
+it silently.** `runtime/ABI.md` §12 ("Panics") stated, at the time of this
+decision, verbatim:
 *"There is no `recover` (SPEC.md §18.4) and v1 emits no stack trace — codegen
 has made no frame-pointer-chain promise this runtime could walk, and there is
 no debug-info format yet to symbolize one if it did."* Both halves of that
 sentence are now deliberately becoming false: codegen will make that promise,
 and a debug-info format will exist to symbolize a walk with. `runtime/ABI.md`
 itself is not edited here — this ticket's own constraints keep it out of
-`runtime/` — so that document still reads as it did until a follow-on ticket
-updates it; this entry is what authorizes that update. §18.4 above already
-claims "a message and a stack trace to stderr" for every panic; until this
-decision, that clause named no reachable implementation and flatly
-contradicted `runtime/ABI.md`'s own text. This is what commits to making it
-true.
+`runtime/` — so that document read as it did until #3286 updated it (§12 now
+describes the opt-in `BIT_BACKTRACE=1` walk, #3285/#3820); this entry is what
+authorized that update. §18.4 above already claims "a message and a stack
+trace to stderr" for every panic; until this decision, that clause named no
+reachable implementation and flatly contradicted `runtime/ABI.md`'s own text
+at the time. This is what committed to making it true.
 
 **What this costs**, stated up front because choosing this shape over the
 narrower ones requires saying so:
@@ -3600,16 +3601,18 @@ narrower ones requires saying so:
   (`compiler/arm64compile.bit:506-525`) elides the frame record entirely for
   any function that makes no call and closes no loop back-edge, and its own
   comment says why that is sound *today*: "this backend's panic path never
-  walks a frame chain at all," quoting the `bit_rt_panic` doc comment
-  (`runtime/root/darwin/io.bit:281-282`, `runtime/root/linux/io.bit:323-324`:
-  *"No stack trace: codegen makes no frame-pointer-chain promise..."*). A
-  frameless leaf can still contain one of §12.1's backend-injected,
-  argument-free panics (`bit_rt_panic_div_zero`, `bit_rt_panic_nil_call`,
-  `bit_rt_panic_nil_iface`), which are deliberately excluded from
-  `hasSafepoints` on that same reasoning. Once a walk exists, the reasoning
-  is gone: this decision requires revisiting `#2929` for the panic-reachable
-  subset of frameless functions, which is a real codegen change, not a
-  no-op.
+  walks a frame chain at all," quoting the `bit_rt_panic` doc comment as it
+  then read in `runtime/root/darwin/io.bit` and `runtime/root/linux/io.bit`
+  (both since rewritten by #3285/#3820 to describe the `BIT_BACKTRACE=1`
+  walk — neither file still carries this text, so no current line citation
+  applies): *"No stack trace: codegen makes no frame-pointer-chain
+  promise..."*). A frameless leaf can still contain one of §12.1's
+  backend-injected, argument-free panics (`bit_rt_panic_div_zero`,
+  `bit_rt_panic_nil_call`, `bit_rt_panic_nil_iface`), which are deliberately
+  excluded from `hasSafepoints` on that same reasoning. Once a walk exists,
+  the reasoning is gone: this decision requires revisiting `#2929` for the
+  panic-reachable subset of frameless functions, which is a real codegen
+  change, not a no-op.
 - **Symbolization that still works on a binary a user has run `strip` on.**
   Nothing in the current release pipeline strips (`dist/release.sh`,
   `tools/build/` invoke no `strip`), so this is a forward design constraint,
