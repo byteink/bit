@@ -1,0 +1,420 @@
+// compiler/lowersliceinline.bit — #3862: whether a `[]T` (T an all-scalar
+// class) may use the packed/inline element representation the runtime
+// started accepting in #3861, instead of one boxed heap object per element.
+// Sibling of lowercall.bit, where `sliceElemSizeFor` (the single source of
+// truth for a slice's runtime element stride) lives: same module, so this
+// needs no imports and no call-site changes.
+//
+// THE HAZARD THIS FILE EXISTS TO CLOSE (runtime/ABI.md §1's `ptr_offsets`
+// contract): a packed element has no independent heap reference, so any
+// construct that would hand one out as a first-class handle — bound to a
+// name, passed to a call, returned, converted to an interface — has nothing
+// valid to hand out; the collector would be asked to trace an address into
+// the middle of an untraced buffer. Every use this file accepts as safe is a
+// direct field load/store at a COMPUTED address, never a value that outlives
+// the expression that computed it. Anything else falls back to stride 8,
+// the boxed representation the rest of the compiler already lowers
+// correctly — a wrong bail-out costs performance, a wrong "safe" costs
+// correctness, so every check below is written to fail closed.
+
+// The recursion bound for the whole-module walk below, in AST nesting
+// levels. Reusing lowerclosure.bit's `boxedLocalNames` constant and its
+// reasoning: hitting it means the answer may be a SUBSET of what is unsafe,
+// and an inline representation built on a subset answer is exactly the
+// silent-wrongness this file exists to prevent — so overflow is treated as
+// unsafe, never as "nothing more to find".
+
+// One elemTy's scan state, shared by reference through the recursive walk
+// below (mirrors lowerclosure.bit's FreeScan).
+class SliceScan {
+  elemTy: int,
+  unsafe: bool,
+  overflow: bool,
+}
+
+// True when `ty` is ever supplied as a type ARGUMENT to any generic function
+// or generic named type anywhere in the project (both ledgers are
+// project-wide — TypeContext's own comments on `instantiations`/`typeInsts`).
+// A generic body's own AST nodes carry the TEMPLATE's unsubstituted type
+// (e.g. `[]T`, never `[]Node`), so the direct type comparison the scan below
+// relies on cannot see a use reached only through a generic instantiation —
+// it would silently miss an unsafe `let n = xs[0]` living inside
+// `fn f<T>(xs: []T)` called with T=Node. Ruling this out first is what makes
+// the scan exhaustive over whatever it DOES look at: an elemTy that flows
+// through no generic boundary at all appears in the AST only tagged with its
+// own concrete TypeId, so a direct equality test cannot miss a use the way a
+// substituted one could.
+fn typeFlowsThroughGeneric(ctx: TypeContext, ty: int): bool {
+  for inst of ctx.instantiations {
+    for a of inst.args {
+      if (a == ty) {
+        return true
+      }
+    }
+  }
+  for ti of ctx.typeInsts {
+    for a of ti.args {
+      if (a == ty) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+// Whether `elemTy`'s class declares a field of INLINE ARRAY type (`[N]U`).
+// `structLayout`'s pointer map never records an array field's own interior
+// offsets (its element width is folded into the field's byte span, not
+// walked), so this ticket's packed-write paths — which write one field at a
+// time via `Op.FieldSet` — cannot correctly initialize one either. Simpler to
+// exclude the shape than to teach every write site `copyArrayInto`'s
+// multi-word copy.
+fn structHasArrayField(fc: FnCtx, oc: Checker, decl: int, sub: TypeSubst): bool {
+  for f of structFieldNodes(oc, decl) {
+    let fty = typeFromNodeIn(oc, kidsOf(oc.tree, f)[1], sub)
+    if (fc.c.ctx.types[fty].kind == TypeKind.Array) {
+      return true
+    }
+  }
+  return false
+}
+
+// The packed stride for `[]elemTy`, or 0 when it must stay boxed (stride 8).
+// Recomputed on every call rather than cached: this compiler threads lowering
+// state explicitly through Checker/FnCtx/Lowerer, and every existing
+// per-module or per-project cache lives on one of those — adding a new one
+// would touch files this ticket has no call to touch. The recompute cost is
+// bounded by how often a program actually asks about a wide, all-scalar
+// class as a slice element: every scalar and every reference element type
+// (the overwhelming majority of `sliceElemSizeFor` calls) never reaches past
+// the first `kind != TypeKind.Struct` check below.
+//
+// SCOPED TO ONE MODULE, DELIBERATELY: `elemTy`'s class must not be
+// `export`ed (checked below), which is what makes `fc.c.tree` — this
+// module's own AST, the only place a program may even NAME a private type —
+// a COMPLETE enumeration of every `[]elemTy` use in the whole program. An
+// exported class could be used, safely or not, from an importing module this
+// scan never visits; excluding it is what keeps two modules from ever
+// disagreeing about the same type's stride.
+//
+// Also excludes anything reached through a generic: an instantiated class
+// (`typeInstOfResult >= 0`), an un-instantiated template (`sub.names` is
+// non-empty — its own fields still mention its rigid type params), and
+// anything caught by `typeFlowsThroughGeneric` above.
+// The purely STRUCTURAL half of eligibility (T's own shape — no usage-safety
+// scan). Split out of `inlineElemStride` purely to keep both functions under
+// E0204's max-complexity=10 (spec/LINT.md); `.ok` false means "boxed", and
+// `.layout` is meaningless then.
+class InlineCandidate {
+  ok: bool,
+  layout: StructLayout,
+}
+
+fn noInlineCandidate(): InlineCandidate {
+  return InlineCandidate{
+    ok: false,
+    layout: StructLayout{ size: 0, offsets: []int(0), ptrOffsets: []int(0) },
+  }
+}
+
+fn inlineStructCandidate(fc: FnCtx, elemTy: int): InlineCandidate {
+  let t = fc.c.ctx.types[elemTy]
+  if (t.kind != TypeKind.Struct) {
+    return noInlineCandidate()
+  }
+  if (typeInstOfResult(fc.c.ctx, elemTy) != -1 || typeFlowsThroughGeneric(fc.c.ctx, elemTy)) {
+    return noInlineCandidate()
+  }
+  let decl = structDeclOf(fc.c, elemTy)
+  if (decl == 0) {
+    return noInlineCandidate()
+  }
+  let oc = typeOwner(fc.c, elemTy)
+  if (oc.exports[t.name]) {
+    return noInlineCandidate()
+  }
+  let sub = structTySubst(fc, oc, decl, elemTy)
+  if (len(sub.names) != 0) {
+    return noInlineCandidate()
+  }
+  let layout = structLayout(fc, oc, decl, sub)
+  if (len(layout.ptrOffsets) != 0 || layout.size <= 8) {
+    return noInlineCandidate()
+  }
+  if (structHasArrayField(fc, oc, decl, sub)) {
+    return noInlineCandidate()
+  }
+  return InlineCandidate{ ok: true, layout: layout }
+}
+
+fn inlineElemStride(fc: FnCtx, elemTy: int): int {
+  let cand = inlineStructCandidate(fc, elemTy)
+  if (!cand.ok || !sliceElemInlineSafe(fc, elemTy)) {
+    return 0
+  }
+  return cand.layout.size
+}
+
+// True when `node`'s checked, UNSUBSTITUTED type is a slice whose element is
+// `s.elemTy`. `typeFlowsThroughGeneric` (checked once, before the walk
+// starts) already ruled out the one way this could disagree with the
+// concrete type a generic instantiation would see.
+fn isSliceOfScanElem(c: Checker, s: SliceScan, node: int): bool {
+  let ty = defaultType(c, checkExprType(c, node))
+  return c.ctx.types[ty].kind == TypeKind.Slice && c.ctx.types[ty].elem == s.elemTy
+}
+
+// Unwraps a call argument's `Arg` wrapper node to the underlying expression,
+// if present — the same idiom `lowerAppend`/`lowerAtomic`/`lowerSliceElems`
+// each carry their own copy of (see lowerprim.bit's `unwrapAtomicArg`).
+fn unwrapArgNode(c: Checker, node: int): int {
+  if (getNode(c.tree, node).tag == Tag.Arg) {
+    return kidsOf(c.tree, node)[0]
+  }
+  return node
+}
+
+// True when `node` (a `Tag.Call`) is `append(xs, ...)` where `xs`'s slice
+// element type is `s.elemTy`.
+fn isAppendCallOfScanElem(c: Checker, s: SliceScan, node: int): bool {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) < 3) {
+    return false
+  }
+  let cn = getNode(c.tree, kids[0])
+  if (cn.tag != Tag.Ident || c.source[cn.span.start:cn.span.end] != "append") {
+    return false
+  }
+  let args = kidsOf(c.tree, kids[2])
+  if (len(args) == 0) {
+    return false
+  }
+  return isSliceOfScanElem(c, s, unwrapArgNode(c, args[0]))
+}
+
+// `append(xs, v0, v1, ...)`: `xs` is scanned normally (it names the whole
+// slice, always safe here — see this file's header). Every trailing vI must
+// be a FRESH composite literal of elemTy: this lowerer never boxes a value
+// read from elsewhere and then copies it into the packed slot, because that
+// would pay exactly the per-element allocation packing exists to remove.
+// Anything else disqualifies elemTy rather than silently falling back to a
+// slower (but correct) copy path — the ticket names `append(xs, T{...})` as
+// the one accepted append shape. A literal's own field values are scanned
+// normally, since they may nest further slice-of-elemTy uses.
+fn scanAppendArgs(c: Checker, s: SliceScan, node: int, depth: int) {
+  let kids = kidsOf(c.tree, node)
+  let args = kidsOf(c.tree, kids[2])
+  scanSliceUse(c, s, unwrapArgNode(c, args[0]), depth + 1)
+  let i = 1
+  while (i < len(args) && !s.unsafe && !s.overflow) {
+    let v = unwrapArgNode(c, args[i])
+    if (getNode(c.tree, v).tag != Tag.CompositeLit) {
+      s.unsafe = true
+      return
+    }
+    scanSliceUse(c, s, v, depth + 1)
+    i = i + 1
+  }
+}
+
+// A scan's two termination checks, shared by `scanSliceUse` and
+// `scanRestrictedName`: nothing left to walk, or the verdict is already
+// decided (unsafe or overflowed). Split out purely to keep both walks' own
+// complexity down — each `||` is its own McCabe decision point.
+fn scanDone(s: SliceScan, node: int): bool {
+  return node == 0 || s.unsafe || s.overflow
+}
+
+// True when `kids` (a `Tag.Member` node's own two kids) is `name.f` — the
+// one safe use of a restricted binder as a Member receiver. Requires the
+// receiver to be the BARE name, not merely an expression that happens to
+// evaluate the same way; `name` is a raw packed-element address (see
+// `emitPackedElemAddr`), so only the literal `name.field` shape the lowerer
+// itself knows how to emit is exempted. Callers must have already checked
+// `len(kids) == 2`.
+fn isRestrictedFieldAccess(c: Checker, kids: []int, name: string): bool {
+  let recv = getNode(c.tree, kids[0])
+  return recv.tag == Tag.Ident && c.source[recv.span.start:recv.span.end] == name
+}
+
+// Within a `for` loop body, checks that every reference to the iteration
+// BINDER `name` (an inline element — no independent heap identity) is the
+// receiver of a field access. Any other use — bound to another name, passed
+// to a call, returned, compared, converted to an interface — would hand out
+// a raw address into the slice's untraced packed buffer as if it were a real
+// object reference. Mirrors `scanSliceUse`'s shape, keyed on a NAME instead
+// of a TYPE.
+fn scanRestrictedName(c: Checker, s: SliceScan, node: int, name: string, depth: int) {
+  if (scanDone(s, node)) {
+    return
+  }
+  if (depth >= scanMaxDepth) {
+    s.overflow = true
+    return
+  }
+  let n = getNode(c.tree, node)
+  let kids = kidsOf(c.tree, node)
+  if (n.tag == Tag.Ident) {
+    if (c.source[n.span.start:n.span.end] == name) {
+      s.unsafe = true
+    }
+    return
+  }
+  if (n.tag == Tag.Member && len(kids) == 2) {
+    if (isRestrictedFieldAccess(c, kids, name)) {
+      return
+    }
+    scanRestrictedName(c, s, kids[0], name, depth + 1)
+    return
+  }
+  for k of kids {
+    scanRestrictedName(c, s, k, name, depth + 1)
+  }
+}
+
+// The `for` binder name that is bound to one ELEMENT of a `[]elemTy`
+// iterable — the plain-name form (`for nd of xs`) or the element half of a
+// `(index, element)` pair (#2012) — or "" when the binder is not one of
+// those two shapes.
+fn forOfElemBinderName(c: Checker, binderNode: int): string {
+  let bn = getNode(c.tree, binderNode)
+  if (bn.tag == Tag.Ident) {
+    return c.source[bn.span.start:bn.span.end]
+  }
+  if (bn.tag == Tag.TuplePat) {
+    let bk = kidsOf(c.tree, binderNode)
+    if (len(bk) == 2 && getNode(c.tree, bk[1]).tag == Tag.Ident) {
+      let en = getNode(c.tree, bk[1])
+      return c.source[en.span.start:en.span.end]
+    }
+  }
+  return ""
+}
+
+// A `Tag.Index` reached by the generic walk (i.e. not exempted by a Member
+// caller below) disqualifies elemTy — nothing else may consume an indexed
+// element of a packed slice as a value. Still walks the Index's own kids
+// (the base expression, the index expression), which may themselves nest
+// further slice-of-elemTy uses.
+fn scanSliceUseIndex(c: Checker, s: SliceScan, kids: []int, depth: int) {
+  if (isSliceOfScanElem(c, s, kids[0])) {
+    s.unsafe = true
+    return
+  }
+  for k of kids {
+    scanSliceUse(c, s, k, depth + 1)
+  }
+}
+
+// `kids[0].kids[1]` (a `Tag.Member` node's own two kids — `len(kids) != 2` on
+// a malformed tree falls back to plain recursion, matching `scanSliceUse`'s
+// own default arm). Exempts `xs[i]` as the receiver — `xs[i].f` is the one
+// safe field-access-of-index shape — by walking the INDEX's own operands
+// instead of the Index node itself; any other receiver shape recurses
+// normally. `kids[1]` names a FIELD, not a value (mirrors lowerclosure.bit's
+// `scanFree`, same arm).
+fn scanSliceUseMember(c: Checker, s: SliceScan, kids: []int, depth: int) {
+  if (len(kids) != 2) {
+    for k of kids {
+      scanSliceUse(c, s, k, depth + 1)
+    }
+    return
+  }
+  let recv = getNode(c.tree, kids[0])
+  if (recv.tag == Tag.Index && isSliceOfScanElem(c, s, kidsOf(c.tree, kids[0])[0])) {
+    for k of kidsOf(c.tree, kids[0]) {
+      scanSliceUse(c, s, k, depth + 1)
+    }
+    return
+  }
+  scanSliceUse(c, s, kids[0], depth + 1)
+}
+
+// `for binder of iter body` (`kids` = a `Tag.ForOf` node's own three kids).
+// The iterable is scanned normally; when it is a `[]elemTy` and the binder
+// names one element, that name's uses inside the body are restricted via
+// `scanRestrictedName`. The body is ALSO scanned normally regardless, since
+// it may contain other, unrelated slice-of-elemTy uses.
+fn scanSliceUseForOf(c: Checker, s: SliceScan, kids: []int, depth: int) {
+  scanSliceUse(c, s, kids[1], depth + 1)
+  let name = forOfElemBinderName(c, kids[0])
+  if (name != "" && isSliceOfScanElem(c, s, kids[1])) {
+    scanRestrictedName(c, s, kids[2], name, depth + 1)
+    if (s.unsafe || s.overflow) {
+      return
+    }
+  }
+  scanSliceUse(c, s, kids[2], depth + 1)
+}
+
+// The default, UNSAFE walk: any `Tag.Index` on a `[]elemTy` reached from here
+// — i.e. not exempted by a caller that recognised a safe consumption context
+// — disqualifies elemTy. Mirrors lowerclosure.bit's `scanFree` in shape: a
+// bounded recursive walk over the whole module's AST, a handful of node
+// kinds that change how their own kids are visited (each split into its own
+// function above, purely to keep this dispatcher's own complexity under
+// E0204's max-complexity=10 — spec/LINT.md), everything else falling through
+// to "recurse into every kid unchanged".
+fn scanSliceUse(c: Checker, s: SliceScan, node: int, depth: int) {
+  if (scanDone(s, node)) {
+    return
+  }
+  if (depth >= scanMaxDepth) {
+    s.overflow = true
+    return
+  }
+  let n = getNode(c.tree, node)
+  let kids = kidsOf(c.tree, node)
+  if (n.tag == Tag.Index) {
+    scanSliceUseIndex(c, s, kids, depth)
+    return
+  }
+  if (n.tag == Tag.Member) {
+    scanSliceUseMember(c, s, kids, depth)
+    return
+  }
+  if (n.tag == Tag.ForOf && len(kids) == 3) {
+    scanSliceUseForOf(c, s, kids, depth)
+    return
+  }
+  if (n.tag == Tag.Call && isAppendCallOfScanElem(c, s, node)) {
+    scanAppendArgs(c, s, node, depth)
+    return
+  }
+  for k of kids {
+    scanSliceUse(c, s, k, depth + 1)
+  }
+}
+
+// Whether every appearance of a `[]elemTy` value in `fc.c`'s module obeys the
+// packed representation's rule: an indexed element (or a `for ... of` binder
+// over one) is used only as the receiver of a field access, plus
+// `len`/`append`/reslice on the whole slice, and an appended value is always
+// a fresh composite literal. See `inlineElemStride` for why scoping this to
+// one module (rather than the whole project) is sound.
+fn sliceElemInlineSafe(fc: FnCtx, elemTy: int): bool {
+  let s = SliceScan{ elemTy: elemTy, unsafe: false, overflow: false }
+  scanSliceUse(fc.c, s, fc.c.tree.root, 0)
+  return !s.unsafe && !s.overflow
+}
+
+// Whether a `[]elemTy` slice's buffer holds GC references, word-per-element —
+// the `isRef` argument to `rtSliceNew`/`rtSliceAppend` (ABI.md §2). NOT
+// simply `fieldLayoutFor(fc, elemTy).isPtr`: that treats ANY class type as a
+// reference, correct for STRUCT FIELD layout (a nested class field always IS
+// a pointer) but wrong for a slice element `sliceElemSizeFor` has decided to
+// PACK. `[]u8` (stride 1, #3121/#3226) and a qualifying all-scalar class
+// (stride > 8, #3862) are both non-reference buffers by construction
+// (`ptrOffsets` empty) — passing `isRef=1` for either would make the
+// runtime's `packed` gate (`elemSize != 8 && isRef == 0`,
+// runtime/root/slices.bit) refuse the packed path, silently addressing the
+// buffer word-per-element instead of stride-per-element and corrupting
+// every element but the first (found via `append` writing its placeholder
+// word at `+8` instead of `+stride`, clobbering the previous element's
+// second field).
+fn sliceElemIsRef(fc: FnCtx, elemTy: int): bool {
+  if (sliceElemSizeFor(fc, elemTy) != 8) {
+    return false
+  }
+  return fieldLayoutFor(fc, elemTy).isPtr
+}
