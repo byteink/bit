@@ -1671,6 +1671,9 @@ defined exactly once).
 | `bit_rt_aes_hw_encrypt_block` | `(roundKeys: i64, rounds: i64, blockIn: i64, out: i64) -> void` (§21d) |
 | `bit_rt_aes_hw_decrypt_block` | `(roundKeys: i64, rounds: i64, blockIn: i64, out: i64) -> void` (§21d) |
 | `bit_rt_sha256_hw_blocks` | `(state: i64, data: i64, blocks: u64) -> void` (§21f) |
+| `bit_rt_bytes_copy`   | `(dst: *byte, src: *byte, n: i64) -> void` (§11.4/§11.7, #3207, `@nosplit`, bounded by `n` — copies `n` bytes; regions must be disjoint) |
+| `bit_rt_bytes_equal`  | `(a: *byte, b: *byte, n: i64) -> bool` (§11.4/§11.7, #3207, `@nosplit`, bounded by `n`) |
+| `bit_rt_bytes_indexbyte` | `(p: *byte, n: i64, b: u8) -> i64` (§11.4/§11.7, #3207, `@nosplit`, bounded by `n` — first index of `b` in `[0, n)`, or -1) |
 
 **Narrow return values.** The C ABI returns a `bool` in `al`/`w0` and leaves the
 rest of the return register **unspecified**; the same is true of any sub-word

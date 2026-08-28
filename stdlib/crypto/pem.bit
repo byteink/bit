@@ -56,10 +56,16 @@ export fn pemEncode(label: string, der: []byte): string {
 // between, or after blocks (RFC 7468 explanatory text) is ignored. Fails on a
 // block whose END line is missing (truncated) or whose END label does not match
 // its BEGIN label, and on a body that is not valid base64.
+//
+// Converts to `[]byte` once up front (`[]byte(pem)`, a single
+// `bit_rt_bytes_from_string` call — SPEC §12.9, `runtime/root/strings.bit`) so
+// every position-scanning helper below can use the #3207 bulk primitives,
+// which take a `*byte` (§11.4/§11.7's `extern fn` boundary admits no `string`).
 export fn pemDecode(pem: string): []PemBlock! {
+  let data = []byte(pem)
   let blocks = []PemBlock(0)
   let pos = 0
-  let n = len(pem)
+  let n = len(data)
 
   // Each pass consumes one complete block, so at most `n` passes can run before
   // `pemIndexFrom` reports no further BEGIN marker.
@@ -67,37 +73,37 @@ export fn pemDecode(pem: string): []PemBlock! {
   while (guard <= n) {
     guard = guard + 1
 
-    let bi = pemIndexFrom(pem, pemBeginPrefix, pos)
+    let bi = pemIndexFrom(data, pemBeginPrefix, pos)
     if (bi < 0) {
       break
     }
 
     // Label of the BEGIN line: from just after the prefix to the closing dashes.
     let labelStart = bi + len(pemBeginPrefix)
-    let labelEnd = pemIndexFrom(pem, pemDashes, labelStart)
+    let labelEnd = pemIndexFrom(data, pemDashes, labelStart)
     if (labelEnd < 0) {
       fail newError("pem: BEGIN line has no closing dashes")
     }
-    let label = pem[labelStart:labelEnd]
+    let label = string(data[labelStart:labelEnd])
     let bodyStart = labelEnd + len(pemDashes)
 
     // The body runs up to the first END marker after it; that marker's label
     // must match this block's, or the file is malformed.
-    let ei = pemIndexFrom(pem, pemEndPrefix, bodyStart)
+    let ei = pemIndexFrom(data, pemEndPrefix, bodyStart)
     if (ei < 0) {
       fail newError("pem: block ${label} is truncated (no END line)")
     }
     let endLabelStart = ei + len(pemEndPrefix)
-    let endLabelEnd = pemIndexFrom(pem, pemDashes, endLabelStart)
+    let endLabelEnd = pemIndexFrom(data, pemDashes, endLabelStart)
     if (endLabelEnd < 0) {
       fail newError("pem: END line has no closing dashes")
     }
-    let endLabel = pem[endLabelStart:endLabelEnd]
+    let endLabel = string(data[endLabelStart:endLabelEnd])
     if (endLabel != label) {
       fail newError("pem: END label ${endLabel} does not match BEGIN label ${label}")
     }
 
-    let der = decodeBase64(pemStripSpace(pem[bodyStart:ei]))?
+    let der = decodeBase64(string(pemStripSpace(data, bodyStart, ei)))?
     blocks = append(blocks, PemBlock{ label: label, der: der })
     pos = endLabelEnd + len(pemDashes)
   }
@@ -108,16 +114,16 @@ export fn pemDecode(pem: string): []PemBlock! {
   return blocks
 }
 
-// Whether `sub` occurs in `s` starting exactly at byte offset `at`. Compares
-// bytes in place — no substring is materialized — so a scan over `s` calling
-// this at every position allocates nothing per position it tries. The caller
-// guarantees `at + len(sub) <= len(s)` (see `pemIndexFrom`'s own bound), which
-// is what makes `s[at + j]` safe for every `j < len(sub)` below.
-fn pemMatchAt(s: string, at: int, sub: string): bool {
+// Whether `sub` occurs in `data` starting exactly at byte offset `at`. `sub`
+// stays a `string`: it is one of the three short marker constants above (5-11
+// bytes), so indexing it costs a handful of back edges at most — the caller
+// guarantees `at + len(sub) <= len(data)` (see `pemIndexFrom`'s own bound),
+// which is what makes `data[at + j]` safe for every `j < len(sub)` below.
+fn pemMatchAt(data: []byte, at: int, sub: string): bool {
   let j = 0
   let m = len(sub)
   while (j < m) {
-    if (s[at + j] != sub[j]) {
+    if (data[at + j] != sub[j]) {
       return false
     }
     j = j + 1
@@ -125,25 +131,37 @@ fn pemMatchAt(s: string, at: int, sub: string): bool {
   return true
 }
 
-// The byte index of the first occurrence of `sub` in `s` at or after `start`,
-// or -1 if it does not occur there. Tries every position with `pemMatchAt`
-// rather than slicing `s[i:i+m]` and comparing strings: the PEM body between
-// two markers routinely runs to a few thousand base64 bytes, and a per-position
-// slice was materializing one throwaway `string` for every byte tried — 2080 of
-// them scanning a single ~2.5 KB certificate's body for its END marker
-// (measured, #2959). Same bound (`i <= last`, `last = n - m`), so every offset
-// `pemMatchAt` reads is inside `s`; behavior is unchanged, only the allocation
-// this loop does per position is gone.
-fn pemIndexFrom(s: string, sub: string, start: int): int {
-  let n = len(s)
+// The byte index of the first occurrence of `sub` in `data` at or after
+// `start`, or -1 if it does not occur there.
+//
+// #3207: every one of `sub`'s three possible values (`pemBeginPrefix`,
+// `pemEndPrefix`, `pemDashes`) starts with '-', a byte the standard base64
+// alphabet (RFC 4648 §4, `stdAlphabet` in base64.bit) never produces — so a
+// candidate position is never more than one byte scan away. `bit_rt_bytes_indexbyte`
+// jumps straight to the next '-' in the remaining range with ONE native call
+// (was #2959's own fix: a per-position `pemMatchAt` try, back edge per
+// position — a few thousand of them scanning one certificate's base64 body for
+// its END marker). `pemMatchAt` still verifies the full marker at each
+// candidate, so a stray '-' outside a real marker (never happens for these
+// three `sub` values, but the search stays correct even if it did) just
+// advances by one and retries — still O(1) Bit-level back edges in practice,
+// since '-' occurs nowhere else in this input.
+fn pemIndexFrom(data: []byte, sub: string, start: int): int {
+  let n = len(data)
   let m = len(sub)
   if (start + m > n) {
     return -1
   }
   let last = n - m
   let i = start
+  let first = byte(sub[0])
   while (i <= last) {
-    if (pemMatchAt(s, i, sub)) {
+    let hit = bit_rt_bytes_indexbyte(ptrOf(data) + i, last - i + 1, first)
+    if (hit < 0) {
+      return -1
+    }
+    i = i + hit
+    if (pemMatchAt(data, i, sub)) {
       return i
     }
     i = i + 1
@@ -151,18 +169,61 @@ fn pemIndexFrom(s: string, sub: string, start: int): int {
   return -1
 }
 
-// `s` with every ASCII whitespace byte removed (space, tab, CR, LF, VT, FF), so
-// a CRLF- or LF-wrapped base64 body collapses to the contiguous symbols that
-// `decodeBase64` expects.
-fn pemStripSpace(s: string): string {
-  let out = []byte(0)
-  let i = 0
-  while (i < len(s)) {
-    let c = s[i]
-    if (c != 9 && c != 10 && c != 11 && c != 12 && c != 13 && c != 32) {
-      out = append(out, c)
-    }
-    i = i + 1
+// One whitespace-byte candidate for `pemNextWhitespace`: if `b` occurs in the
+// `n` bytes at `p` (whose absolute start is `lo`) before `best`, its absolute
+// index; else `best` unchanged. Split out so `pemNextWhitespace` is six
+// straight-line calls rather than six inline `if`s (E0204: six inline checks
+// measured complexity 14 against the limit of 10).
+fn pemWsCandidate(p: *byte, n: int, b: byte, lo: int, best: int): int {
+  let r = bit_rt_bytes_indexbyte(p, n, b)
+  if (r >= 0 && lo + r < best) {
+    return lo + r
   }
-  return string(out)
+  return best
+}
+
+// The earliest index in `[lo, hi)` holding an ASCII whitespace byte (space,
+// tab, VT, FF, CR, or LF), or `hi` if none of the six occurs there. Six
+// `bit_rt_bytes_indexbyte` calls (via `pemWsCandidate`), one per whitespace
+// byte, each a single native scan over the same remaining range —
+// `pemStripSpace` below calls this once per whitespace RUN (typically once
+// per wrapped line, #3207), not once per byte.
+fn pemNextWhitespace(data: []byte, lo: int, hi: int): int {
+  let n = hi - lo
+  if (n <= 0) {
+    return hi
+  }
+  let p = ptrOf(data) + lo
+  let best = hi
+  best = pemWsCandidate(p, n, byte(9), lo, best)
+  best = pemWsCandidate(p, n, byte(10), lo, best)
+  best = pemWsCandidate(p, n, byte(11), lo, best)
+  best = pemWsCandidate(p, n, byte(12), lo, best)
+  best = pemWsCandidate(p, n, byte(13), lo, best)
+  best = pemWsCandidate(p, n, byte(32), lo, best)
+  return best
+}
+
+// `data[lo:hi]` with every ASCII whitespace byte removed, so a CRLF- or
+// LF-wrapped base64 body collapses to the contiguous symbols `decodeBase64`
+// expects. #3207: walks whitespace RUN to whitespace RUN (`pemNextWhitespace`)
+// rather than byte to byte, bulk-copying each clean span with
+// `bit_rt_bytes_copy` — for a 64-column-wrapped body (RFC 7468 §2, this
+// module's own `pemEncode`) that is one Bit-level back edge per LINE instead
+// of per byte. `out` is sized `to - from` up front (stripping only ever
+// shrinks) and sliced down to the bytes actually written.
+fn pemStripSpace(data: []byte, lo: int, hi: int): []byte {
+  let out = []byte(hi - lo)
+  let pos = lo
+  let w = 0
+  while (pos < hi) {
+    let next = pemNextWhitespace(data, pos, hi)
+    let runLen = next - pos
+    if (runLen > 0) {
+      bit_rt_bytes_copy(ptrOf(out) + w, ptrOf(data) + pos, runLen)
+      w = w + runLen
+    }
+    pos = next + 1
+  }
+  return out[0:w]
 }
