@@ -20,22 +20,30 @@
 // classes. That keeps `gc.bit` compiling for all three targets while the real
 // size-class allocator does all the actual allocation policy.
 //
-// The reserve is bump-only: it never takes an individual span back into its own
-// bump space. Reclaimed object memory is recycled by the allocator's free lists,
-// not by the reserve, so a churning program is bounded by its live set.
+// The reserve's OWN bump cursor is still forward-only: it never takes an
+// individual span back into its bump space by rewinding. But a released span
+// need not be lost: `gcHeapFree`'s overflow arm (the #3045 span cache is full)
+// hands it to the SPAN FREE LIST below (`spanFreeListPush`/`spanFreeListTake`,
+// #3868), which `gcHeapAlloc`'s refill path consults before growing the
+// reserve. #2803 measured what happens without this: every span address lost
+// past the cache burned a whole 4 MiB chunk that was then abandoned forever,
+// ~9.5 chunks per LSP edit on a mid-sized project.
 //
-// A SPAN IS NONETHELESS RELEASED TO THE OS ONCE IT IS ENTIRELY FREE (#2375), by
-// `munmap` of that 128 KiB alone. The reserve's bump cursor does not rewind over
-// it, so the ADDRESS RANGE is abandoned while the physical memory goes back —
-// which is the whole point, since RSS is what ratchets (#2325). Recycling the
-// range too would need either a decommit primitive (`madvise`, and the seam for
-// it lives in `runtime/root/`) or a free list of empty spans, and a fourth
-// descriptor word to hold its head. Neither is this ticket.
+// A SPAN THE FREE LIST WON'T TAKE IS RELEASED TO THE OS ANYWAY (#2375), by
+// `munmap` of that 128 KiB alone — today that is only the fallback inside
+// `spanFreeListPush` itself, when the OS refuses the MAP_FIXED reset the push
+// tries first (should not happen for a range this reserve already owns). The
+// reserve's bump cursor does not rewind over an unmapped span, so in that one
+// case the ADDRESS RANGE really is abandoned while the physical memory goes
+// back — which is still the point on that path, since RSS is what ratchets
+// (#2325).
 //
-// `reserveRelease` therefore unmaps chunks that already have holes in them, which
-// is fine — munmap of a range containing unmapped pages is not an error — and a
-// chunk's own two link words can never be inside a span, because the first
-// span-aligned take out of a chunk starts strictly above `base + chunkHdrBytes`.
+// `reserveRelease` therefore unmaps chunks that already have holes in them
+// (some spans truly unmapped, some merely decommitted-and-relinked by the free
+// list), which is fine — munmap of a range containing unmapped OR decommitted
+// pages is not an error — and a chunk's own two link words can never be inside
+// a span, because the first span-aligned take out of a chunk starts strictly
+// above `base + chunkHdrBytes`.
 //
 // WHOLE CHUNKS, HOWEVER, ARE KNOWABLE AND RELEASABLE (#2373). Until this ticket
 // they were neither: `reserveGrow` mapped a chunk, rebased the descriptor onto
@@ -76,9 +84,13 @@
 // convenience: `runtime/root/{linux,darwin}/boot.bit` spells the channel
 // descriptor as a literal `[3]i64`, and `../gc.bit` embeds two of them in a
 // state block whose width `runtime/root/root.bit` refuses to boot unless it is
-// exactly `gcWords` (38, #3292 grew it from 37 to add `gcNextObjects`). A
-// fourth reserve word is not free; it is three edits in two other modules —
-// same shape #3292 paid to grow `gcWords` itself.
+// exactly `gcWords` (39, #3292 grew it 37->38 to add `gcNextObjects`, #3868
+// grew it 38->39 for the span free list head below). A fourth reserve word is
+// not free; it is three edits in two other modules — same shape #3292 paid to
+// grow `gcWords` itself. #3868 deliberately did NOT take that route: only the
+// SPAN reserve (`gcSpanRes`) ever needs a free-list head, so `gc.bit` owns one
+// dedicated word (`gcSpanFree`) instead of widening every reserve — the
+// channel descriptor and the address-index reserve stay three words, untouched.
 export const reserveWords = 3
 
 // Head of the list of chunks THIS reserve mapped from the OS, 0 = none.
@@ -278,6 +290,14 @@ extern fn bit_rt_map_pages(nbytes: i64): i64
 // mapped cannot fail for any reason a caller could act on.
 extern fn bit_rt_unmap_pages(addr: i64, nbytes: i64): i64
 
+// The span free list's decommit primitive (#3868): an atomic MAP_FIXED reset
+// of `[addr, addr+nbytes)` to a fresh, zeroed, private mapping AT THE SAME
+// ADDRESS. The OS drops whatever physical pages backed the old mapping as
+// part of installing the new one — a decommit — while the address stays
+// valid, unlike `bit_rt_unmap_pages` — a recommit. Non-zero on success. See
+// `spanFreeListPush` for why both properties are required together.
+extern fn bit_rt_remap_pages(addr: i64, nbytes: i64): i64
+
 // Heap exhaustion is FATAL, and this is the seam that makes it loud (#1642).
 //
 // `runtime/root/`'s allocating doors are uniformly `g_gc.alloc(info) orelse
@@ -383,6 +403,14 @@ export @nosplit @symbol("bit_rt_port_mem_reserve_grow") fn reserveGrow(r: *i64, 
 // `resChunks != 0` keeps that reasoning out of the load-bearing path: a caller
 // that asks about some other address gets a truthful `false` instead of a
 // licence to unmap it.
+//
+// STILL TRUE WITH THE SPAN FREE LIST (#3868) BELOW, and deliberately so: a
+// free-list-recycled span never reaches this function at all. It is popped by
+// `spanFreeListTake`, not by `reserveTake`/`reserveGrow`, so `gcHeapAlloc`
+// never calls this on one — see that function's refill comment for why it is
+// always `owned = true` by construction instead. Widening this check to scan
+// every chunk (so it could also answer for an OLDER chunk's recycled span)
+// would be needless: nothing ever asks it to.
 export @nosplit fn reserveHeadOwns(r: *i64, addr: int, nbytes: int): bool {
   let c = *(r + resChunks)
   if (c == 0 || addr <= 0 || nbytes <= 0) {
@@ -390,6 +418,87 @@ export @nosplit fn reserveHeadOwns(r: *i64, addr: int, nbytes: int): bool {
   }
   let chunkLen = loadWord(c + chunkLenOff)
   return addr >= c && addr + nbytes <= c + chunkLen
+}
+
+// ---------------------------------------------------------------------------
+// The span free list (#3868) — recovering a released span's ADDRESS, not
+// just its pages
+// ---------------------------------------------------------------------------
+//
+// `reserveGrow`'s bump never rewinds, so a span released past the #3045 span
+// cache's 64 slots was previously lost forever: its pages went back via
+// `memUnmapPages`, but its address did not, and the next refill had to map a
+// fresh 4 MiB chunk. Measured on a churning `bit lsp --stdio`: ~9.5 abandoned
+// chunks per edit on a 16-file project, each retaining a resident header page
+// for the rest of the process's life (#2803, #3868).
+//
+// EVERY SPAN THIS LIST EVER HOLDS IS THE SAME SIZE — `reserveTake` aligns any
+// take of at least `allocSpanBytes` to it (#2373) — so this needs no
+// coalescing and no size search: a plain singly-linked stack, threaded
+// through each span's own first word exactly as `reserveGrow`'s chunk list
+// threads through each chunk's first two.
+//
+// THE TWO INVARIANTS THAT MAKE THIS SAFE, both from the ticket that added it:
+//
+//   1. OWNERSHIP. `reserveHeadOwns` still gates whether a span may become
+//      unmapped/recycled at all — unchanged, see its own comment above. This
+//      list is pushed to from exactly one place, `gcHeapFree`'s overflow arm,
+//      and that arm only ever reaches a span `heapReclaimSpansLocked`
+//      reclaimed — which only takes spans with `spanOwned != 0` to begin with
+//      (see `gcHeapAlloc`'s refill comment in `../gc.bit`). So every span
+//      here was already established as reserve-owned before it arrived, and
+//      handing it back out needs no re-check.
+//
+//   2. THE PAGES STILL GO BACK TO THE OS — the #2375 retention leak is not
+//      reintroduced. A span sitting mapped-and-idle in this list would BE
+//      that leak with a different data structure wrapped around it. So
+//      `spanFreeListPush` does not simply remember the address: it first
+//      REPLACES the span's mapping with a fresh one at the SAME address
+//      (`bit_rt_remap_pages`, an atomic MAP_FIXED reset). The OS drops
+//      whatever physical pages backed the old mapping as part of installing
+//      the new one, and the new one is untouched — 0 bytes resident — until
+//      something writes to it. The single word this function writes next,
+//      the "next" link, is the only byte that becomes resident again; the
+//      rest of the span stays unbacked for as long as it sits in the list.
+//
+// THE HEAD LIVES OUTSIDE THE 3-WORD RESERVE DESCRIPTOR ON PURPOSE: only the
+// SPAN reserve (`gcSpanRes`) ever needs one, and widening `reserveWords`
+// would cost the channel reserve and the address-index reserve a word
+// neither uses (see that const's own comment above). `../gc.bit` instead owns
+// one dedicated state word, `gcSpanFree`, the same shape #3292 used to grow
+// `gcWords` for a single caller-specific field. That is also why these two
+// functions take a plain `head: *i64` rather than the reserve descriptor `r`
+// every other function here takes — this list is not part of any reserve's
+// own bookkeeping, and `reserveTake`/`reserveGrow` never consult it, which is
+// what keeps `_tests_/stress/gcreserve`'s "64 span-sized takes are pairwise
+// distinct" proof (no freeing in between) unaffected by this file.
+
+// Push a released, `allocSpanBytes`-sized, `allocSpanBytes`-aligned span onto
+// the free list rooted at `*head`. See the section header above for why this
+// decommits-and-relinks rather than unmapping.
+@nosplit fn spanFreeListPush(head: *i64, addr: int) {
+  if (bit_rt_remap_pages(i64(addr), i64(allocSpanBytes)) == 0) {
+    // The OS refused a MAP_FIXED reset of a range this reserve already owns
+    // — should not happen. Fall back to the pre-#3868 behaviour: unmap it and
+    // let the address go, rather than link in a span that might still hold
+    // the stale mapping.
+    memUnmapPages(addr, allocSpanBytes)
+    return
+  }
+  storeWord(addr, *head)
+  *head = addr
+}
+
+// Pop an address off the free list rooted at `*head`, or 0 when empty. The
+// memory is already mapped and zeroed — `spanFreeListPush`'s remap — so the
+// caller needs no further action before treating it as a fresh span.
+@nosplit fn spanFreeListTake(head: *i64): int {
+  let addr = *head
+  if (addr == 0) {
+    return 0
+  }
+  *head = loadWord(addr)
+  return addr
 }
 
 // Unmap every chunk this reserve mapped, and report how many bytes went back to
@@ -431,7 +540,7 @@ export @nosplit fn reserveRelease(r: *i64): int {
 // chunks 11762 -> 13) moved neither.
 //
 // A WALK, NOT A NEW FIELD: the three-word descriptor is fixed width
-// (`reserveWords` above, and `gc.bit`'s `gcWords == 38` boot guard), and the
+// (`reserveWords` above, and `gc.bit`'s `gcWords == 39` boot guard), and the
 // chunk list is already threaded through the chunks themselves, so counting
 // it costs nothing but the same walk `reserveRelease` already pays — this is
 // that walk with the `munmap` left out, which is also what makes it safe to
