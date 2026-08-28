@@ -20,10 +20,10 @@ fn worker(id: int, out: chan<int>) {
 fn fanOut(n: int) {
   let results = chan<int>(n)
   for (let i = 1; i <= n; i++) {
-    spawn worker(i, results)     // starts a green thread
+    spawn worker(i, results) // starts a green thread
   }
   for (let k = 0; k < n; k++) {
-    let sq = <- results          // collect results
+    let sq = <- results // collect results
   }
 }
 ```
@@ -58,12 +58,14 @@ no environment variable or flag that changes the limit.
 
 ```bit
 fn down(n: int): int {
-  if (n == 0) { return 0 }
+  if (n == 0) {
+    return 0
+  }
   return 1 + down(n - 1)
 }
 
 fn deepWorker(depth: int, done: chan<int>) {
-  done <- down(depth)      // 4000 frames: fine on main, SIGSEGV here
+  done <- down(depth) // 4000 frames: fine on main, SIGSEGV here
 }
 ```
 
@@ -86,8 +88,8 @@ synchronous; buffered channels hold up to their capacity.
 
 ```bit
 fn channels() {
-  let c = chan<int>()      // unbuffered (synchronous)
-  let b = chan<int>(16)    // buffered, capacity 16
+  let c = chan<int>()   // unbuffered (synchronous)
+  let b = chan<int>(16) // buffered, capacity 16
 }
 ```
 
@@ -100,9 +102,9 @@ fn channels() {
 
 ```bit
 fn pingPong(c: chan<int>) {
-  c <- 1                         // send
-  let x = <- c                   // receive
-  let (v, ok) = <- c             // ok is false if closed and drained
+  c <- 1             // send
+  let x = <- c       // receive
+  let (v, ok) = <- c // ok is false if closed and drained
 }
 ```
 
@@ -117,11 +119,11 @@ fn producer(out: chan<int>) {
   for (let i = 0; i < 3; i++) {
     out <- i
   }
-  close(out)                     // signal completion
+  close(out) // signal completion
 }
 
 fn consumer(input: chan<int>) {
-  for v of input {               // receives until closed and drained
+  for v of input { // receives until closed and drained
     // handle v
   }
 }
@@ -151,9 +153,9 @@ fn pump(input: chan<int>, out: chan<int>, next: int) {
   }
 }
 
-fn handle(v: int) { }
-fn advance() { }
-fn idle() { }
+fn handle(v: int) {}
+fn advance() {}
+fn idle() {}
 ```
 
 An empty `select {}` blocks forever. Case operands (and the sent value for a

@@ -16,7 +16,7 @@ fn add(a: int, b: int): int {
   return a + b
 }
 
-fn log(msg: string) {   // no result type -> returns nothing (void)
+fn log(msg: string) { // no result type -> returns nothing (void)
   // ...
 }
 ```
@@ -33,7 +33,7 @@ fn divmod(a: int, b: int): (int, int) {
 }
 
 fn useIt() {
-  let (q, r) = divmod(17, 5)   // q = 3, r = 2
+  let (q, r) = divmod(17, 5) // q = 3, r = 2
 }
 ```
 
@@ -53,9 +53,9 @@ fn sum(...xs: int): int {
 }
 
 fn callers() {
-  let a = sum(1, 2, 3)         // individual args
-  let nums = []int{4, 5, 6}
-  let b = sum(...nums)         // spread a slice
+  let a = sum(1, 2, 3) // individual args
+  let nums = []int{ 4, 5, 6 }
+  let b = sum(...nums) // spread a slice
 }
 ```
 
@@ -74,11 +74,11 @@ fn transform(xs: []int): []int {
 }
 
 fn explicit(): (int, int) => int {
-  return (a: int, b: int) => a + b       // explicit types
+  return (a: int, b: int) => a + b // explicit types
 }
 
 fn withBlock(): (int) => int {
-  return (x: int) => {                   // block body uses return
+  return (x: int) => { // block body uses return
     let y = x * x
     return y + 1
   }
@@ -125,15 +125,15 @@ not documented here - this reference will add it when the spec does.)
 
 ```bit
 fn loops(xs: []int, m: map<string, int>) {
-  for (let i = 0; i < len(xs); i++) {   // C-style
+  for (let i = 0; i < len(xs); i++) { // C-style
     // ...
   }
 
-  for v of xs {                          // value iteration
+  for v of xs { // value iteration
     // ...
   }
 
-  for (k, val) of m {                    // key/value iteration over a map
+  for (k, val) of m { // key/value iteration over a map
     // ...
   }
 }
@@ -144,7 +144,9 @@ fn loops(xs: []int, m: map<string, int>) {
 ```bit
 fn firstEven(xs: []int): int {
   for x of xs {
-    if (x % 2 != 0) { continue }
+    if (x % 2 != 0) {
+      continue
+    }
     return x
   }
   return -1
@@ -180,7 +182,7 @@ a function call, a channel receive, or an error-propagation (`?`) chain. A lone
 
 ```bit
 fn effects() {
-  println("side effect")   // ok: a call
+  println("side effect") // ok: a call
   // 1 + 2                 // error: no effect
 }
 ```

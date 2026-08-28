@@ -12,15 +12,15 @@ standard-library module like `"std/io"` or a relative project path like
 `"./util"` or `"../shared"`.
 
 ```bit
-import { readFile, writeFile } from "std/fs"  // named members
-import { readFile as slurp } from "std/fs"    // rename on import
+import { readFile, writeFile } from "std/fs" // named members
+import { readFile as slurp } from "std/fs"   // rename on import
 ```
 
 A namespace import binds the module itself, and members are reached through it:
 
 ```bit
-import io from "std/io"       // namespace: io.stdout()
-import * as fs from "std/fs"  // explicit namespace form
+import io from "std/io"      // namespace: io.stdout()
+import * as fs from "std/fs" // explicit namespace form
 
 fn dump(path: string): ()! {
   let w = io.stdout()
@@ -42,7 +42,7 @@ error.
 
 ```bit
 fn show(path: string): ()! {
-  println(readFile(path)?)   // readFile imported above
+  println(readFile(path)?) // readFile imported above
   return
 }
 ```
@@ -53,13 +53,13 @@ Visibility is by the explicit `export` keyword, not by identifier casing.
 Unmarked declarations are module-private.
 
 ```bit
-export fn publicApi(): int { return 42 }   // visible to importers
+export fn publicApi(): int { return 42 } // visible to importers
 
-fn helper(): int { return 1 }               // module-private
+fn helper(): int { return 1 } // module-private
 
 export class Config {
-  export name: string      // field visible outside the module
-  secret: string           // field module-private
+  export name: string, // field visible outside the module
+  secret: string,      // field module-private
 }
 ```
 

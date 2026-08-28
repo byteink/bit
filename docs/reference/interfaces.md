@@ -9,8 +9,8 @@ signatures - there is no `implements` clause and no declaration of intent.
 
 ```bit
 interface Shape {
-  area(): f64
-  perimeter(): f64
+  area(): f64,
+  perimeter(): f64,
 }
 ```
 
@@ -25,17 +25,17 @@ checked where a value is used as the interface, not at declaration.
 ```bit
 class Circle {
   export r: f64
-  area(): f64      { return 3.14159 * this.r * this.r }
+  area(): f64 { return 3.14159 * this.r * this.r }
   perimeter(): f64 { return 2.0 * 3.14159 * this.r }
 }
 class Rect {
   export w: f64
   export h: f64
-  area(): f64      { return this.w * this.h }
+  area(): f64 { return this.w * this.h }
   perimeter(): f64 { return 2.0 * (this.w + this.h) }
 }
 
-fn describe(s: Shape): f64 {     // takes anything satisfying Shape
+fn describe(s: Shape): f64 { // takes anything satisfying Shape
   return s.area()
 }
 
@@ -54,7 +54,7 @@ appear only in method signatures.
 
 ```bit
 interface Ord {
-  less(other: Self): bool
+  less(other: Self): bool,
 }
 ```
 

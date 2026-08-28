@@ -55,9 +55,9 @@ fn toInt(s: string): int! {
 fn parsePort(s: string): int! {
   let n = toInt(s)?
   if (n < 0 || n > 65535) {
-    fail newError("port out of range")   // err result
+    fail newError("port out of range") // err result
   }
-  return n                               // ok result
+  return n // ok result
 }
 ```
 
@@ -73,8 +73,8 @@ assignable to the enclosing function's error type.
 
 ```bit
 fn loadCount(path: string): int! {
-  let text = readFile(path)?     // returns early on a read error
-  return parsePort(text)?        // returns early on a parse error
+  let text = readFile(path)? // returns early on a read error
+  return parsePort(text)?    // returns early on a parse error
 }
 ```
 
@@ -109,7 +109,7 @@ fn loadConfig(path: string): Config! {
   let text = readFile(path)?
   let cfg = parseConfig(text) catch e {
     println("bad config: ${e.message()}")
-    return defaults()                            // recover with a default
+    return defaults() // recover with a default
   }
   if (!cfg.valid()) {
     fail newError("config failed validation")
@@ -118,7 +118,7 @@ fn loadConfig(path: string): Config! {
 }
 
 fn quickCount(path: string): int {
-  return loadCount(path) catch 0                 // fall back to 0 on any error
+  return loadCount(path) catch 0 // fall back to 0 on any error
 }
 ```
 
@@ -134,7 +134,7 @@ import { open, create } from "std/fs"
 
 fn copyFile(src: string, dst: string): ()! {
   let f = open(src)?
-  defer f.close()             // runs on every exit path below
+  defer f.close() // runs on every exit path below
   let g = create(dst)?
   defer g.close()
   g.write(f.readAll()?)?
@@ -162,7 +162,7 @@ invariants, never for expected failures. Sources include:
 
 ```bit
 fn mustPositive(n: int): int {
-  assert(n > 0, "n must be positive")   // panics if the condition is false
+  assert(n > 0, "n must be positive") // panics if the condition is false
   return n
 }
 ```
