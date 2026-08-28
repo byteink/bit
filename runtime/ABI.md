@@ -194,10 +194,11 @@ a reslice `s[lo:hi]` shares the same `buf` and only bumps `off`/`len`/`cap` —
 **no interior pointer is ever stored as a GC reference** (§3). `is_ref` records
 whether each buffered element is itself a GC reference.
 
-**Element storage: word-per-element by default, byte-packed only for `[]u8`.**
+**Element storage: word-per-element by default; a non-ref buffer may pack to
+its element's own byte stride.**
 A GC reference is word-sized, and when `is_ref` the collector traces every word
 of the element buffer as a root (below) — so a reference-typed buffer can never
-pack. This is a forward-looking design constraint, not a description of what
+pack, unconditionally, regardless of element width. This is a forward-looking design constraint, not a description of what
 today's collector would do with a violation: on the current non-moving
 collector, `gcMarkRoot` (`runtime/gc/gcmark.bit:95-105`) marks a candidate word
 only if it is non-null, in-range, and confirmed by `gcOwns` to be exactly a
@@ -213,14 +214,30 @@ bug worth ruling out now. The direction that already produces a
 silent-wrongness bug is the opposite one: a reference-typed buffer handed the
 LEAF `slice_buf_info` descriptor instead of the traced `ref_array_info` one,
 so the collector never walks it and sweeps referents the program still
-holds — see the fabricated-header bug at `runtime/root/slices.bit:369-377`
-(`_tests_/cases/run_empty_slice_null_header.bit`). Packing is scoped narrower
-still: only `[]u8` (a non-ref, 1-byte element) packs to one
-byte per element (`elem_size = 1`, §9). Every other element type — every
-`is_ref == true` buffer, and every non-ref scalar 2 bytes or wider (`i16` and
-up, `f64`, boxed values) — stays word-per-element (`elem_size = 8`) exactly as
-before. Packing wider non-ref scalars (`i16`/`i32`/`bool`/...) is explicitly
-future work; this document does not authorize it.
+holds — see the fabricated-header bug at `runtime/root/slices.bit:443-451`
+(`_tests_/cases/run_empty_slice_null_header.bit`). Packing is scoped by
+`is_ref`, not by element identity: any `is_ref == false` buffer may pack to its
+element's own byte stride (`elem_size`, §9) — `1` for `[]u8` (a non-ref,
+1-byte element, `elem_size = 1`), or a class `T`'s own body size
+(`elem_size = layout.size`) when EVERY field of `T` is a non-reference scalar
+(`ptr_offsets` empty, epic #2945, #3861/#3862). `elem_size` is a per-call-site
+compile-time constant, never runtime state, and travels as an explicit
+argument to every slice entry point below — the collector needs no change to
+support it: a packed, non-ref buffer keeps the LEAF `slice_buf_info`
+descriptor regardless of stride, so `scanObject` reads zero words of it either
+way. A buffer whose element type has ANY reference field — `ptr_offsets`
+non-empty, including a single reference field mixed with scalars — stays
+word-per-element (`elem_size = 8`) unconditionally: the collector's tracing
+loop for a ref buffer walks it word by word, and a struct-wide stride is not
+representable that way. `bit_rt_slice_get`/`bit_rt_slice_set` stay
+WORD-VALUED (one `int` in, one `int` out) regardless of `elem_size`, so
+neither is ever called with `elem_size > 8` for a packed buffer — the
+compiler lowers a wide-element field read/write to a direct load/store at the
+field's own offset instead, and the runtime FATALs if a stride it cannot
+represent through either function ever reaches it, rather than silently
+returning or storing a truncated word. Packing a non-ref scalar narrower than
+8 bytes and wider than 1 byte (`i16`/`i32`/`bool`/...) remains future work;
+this document does not authorize it.
 
 Channels (§11) and native maps (§15, `runtime/root/maps.bit`'s `allocBuf`
 callers) do **not** pack and stay word-per-element regardless of element type:
@@ -1605,10 +1622,10 @@ defined exactly once).
 | `bit_rt_string_from_float` | `(v: f64) -> *const RtBytes` (§2)                  |
 | `bit_rt_parse_float`  | `(s: *const RtBytes) -> f64` (§2, correctly-rounded text->f64; the inverse of `bit_rt_string_from_float`) |
 | `bit_rt_string_from_bool`  | `(v: bool) -> *const RtBytes` (§2)                 |
-| `bit_rt_slice_new`    | `(len: usize, cap: usize, is_ref: usize, elem_size: usize) -> *SliceHeader` (§2, `elem_size` in **bytes** — `1` for a packed `[]u8`, `8` for every other element type) |
-| `bit_rt_slice_append` | `(h: *SliceHeader, word: u64, is_ref: usize, elem_size: usize) -> *SliceHeader` (§2, `is_ref`/`elem_size` are the static element type's — a null `h` has no header to read them from, #1569) |
-| `bit_rt_slice_get`    | `(h: *const SliceHeader, index: usize, elem_size: usize) -> u64` (§2) |
-| `bit_rt_slice_set`    | `(h: *SliceHeader, index: usize, word: u64, elem_size: usize) -> void` (§2) |
+| `bit_rt_slice_new`    | `(len: usize, cap: usize, is_ref: usize, elem_size: usize) -> *SliceHeader` (§2, `elem_size` in **bytes** — `1` for a packed `[]u8`, a class's own body size for a packed all-scalar `T`, `8` for every other element type, #3861) |
+| `bit_rt_slice_append` | `(h: *SliceHeader, word: u64, is_ref: usize, elem_size: usize) -> *SliceHeader` (§2, `is_ref`/`elem_size` are the static element type's — a null `h` has no header to read them from, #1569; for `elem_size > 8` writes only the element's low word, since the payload is one `u64` — the caller fills the rest at its own computed offset, #3861) |
+| `bit_rt_slice_get`    | `(h: *const SliceHeader, index: usize, elem_size: usize) -> u64` (§2; FATAL for a packed, non-ref buffer with `elem_size` neither `1` nor `8` — one `u64` cannot represent a wider element without truncating, #3861) |
+| `bit_rt_slice_set`    | `(h: *SliceHeader, index: usize, word: u64, elem_size: usize) -> void` (§2; FATAL under the identical condition `bit_rt_slice_get` is, and for the identical reason, #3861) |
 | `bit_rt_slice_slice`  | `(h: *const SliceHeader, lo: usize, hi: usize) -> *SliceHeader` (§2, unchanged — reslicing works in element counts already, `runtime/root/slices.bit` `rtSliceSlice`) |
 | `bit_rt_map_new`      | `(key_desc: usize, val_is_ref: usize) -> *MapHeader` (§15, §15.1) |
 | `bit_rt_map_set`      | `(m: ?*MapHeader, key: u64, val: u64) -> void` (§15)    |

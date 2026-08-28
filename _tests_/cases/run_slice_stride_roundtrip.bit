@@ -1,0 +1,148 @@
+// run
+// #3861: the slice runtime accepts an arbitrary compile-time element stride,
+// not just 1 (packed `[]u8`) and 8 (word-per-element). This drives the ABI
+// entry points directly the way `run_nosplit_extern_call.bit` drives
+// `bit_rt_host_target`: `elemSize` 16/24/32 cannot be produced by any Bit
+// source today — lowering `[]T` to those strides is #3862, a sibling ticket,
+// and this file's whole point is to prove the runtime half works before that
+// lands.
+//
+// Strides 1 and 8 are exercised through `bit_rt_slice_get`/`_set` exactly as
+// an ordinary `[]u8`/`[]int` would be — regression coverage: #3861 must not
+// change either. `bit_rt_slice_get`/`_set` are word-valued and FATAL for a
+// packed stride wider than a word (proven separately in
+// `run_slice_stride_get_fatal.bit`/`run_slice_stride_set_fatal.bit`), so a
+// stride > 8 is exercised through `bit_rt_slice_append` (which writes only
+// the new element's low word, `runtime/ABI.md` §2) plus direct word loads/
+// stores at the element's own computed address — precisely the mechanism
+// #3862's compiler lowering uses for a packed struct field access. Appending
+// 5 elements forces three regrows (cap 0->1->2->4->8), which is what proves a
+// wide element's full body survives a regrow and not just the one word
+// `append` itself wrote.
+//
+// Reslice (`bit_rt_slice_slice`) takes no `elemSize` at all — it works
+// purely in element counts (`runtime/ABI.md` §2) — so it needs no per-stride
+// variant; its null-header arm (the bug `run_empty_slice_null_header.bit`
+// pins) is re-checked once at the end, in the same binary that has just
+// exercised non-8 strides.
+extern fn bit_rt_slice_new(want: int, capWant: int, isRef: int, elemSize: int): int
+extern fn bit_rt_slice_append(h: int, word: int, isRef: int, elemSize: int): int
+extern fn bit_rt_slice_get(h: int, index: int, elemSize: int): int
+extern fn bit_rt_slice_set(h: int, index: int, word: int, elemSize: int)
+extern fn bit_rt_slice_slice(h: int, lo: int, hi: int): int
+extern fn bit_rt_port_mem_load_word(addr: int): int
+extern fn bit_rt_port_mem_store_word(addr: int, v: int)
+
+const n: int = 5
+
+// Header field offsets (`runtime/ABI.md` §2, `runtime/root/root.bit`'s
+// `slcBuf`/`slcOff`): buf=0, len=8, off=16, cap=24, isRef=32.
+const hdrBuf: int = 0
+const hdrOff: int = 16
+
+// Strides 1 and 8: `get`/`set` return/take the whole element, so the
+// round-trip goes straight through the public entry points. Values stay
+// under 256 so the check is valid for the byte-packed stride too.
+fn roundtripWord(elemSize: int) {
+  let h = bit_rt_slice_new(0, 0, 0, elemSize)
+  let i = 0
+  while (i < n) {
+    h = bit_rt_slice_append(h, 10 + i, 0, elemSize)
+    i = i + 1
+  }
+  i = 0
+  while (i < n) {
+    if (bit_rt_slice_get(h, i, elemSize) != 10 + i) {
+      panic("get mismatch, stride ${elemSize}")
+    }
+    i = i + 1
+  }
+  i = 0
+  while (i < n) {
+    bit_rt_slice_set(h, i, 50 + i, elemSize)
+    i = i + 1
+  }
+  i = 0
+  while (i < n) {
+    if (bit_rt_slice_get(h, i, elemSize) != 50 + i) {
+      panic("set mismatch, stride ${elemSize}")
+    }
+    i = i + 1
+  }
+  let view = bit_rt_slice_slice(h, 1, n)
+  i = 0
+  while (i < n - 1) {
+    if (bit_rt_slice_get(view, i, elemSize) != 50 + i + 1) {
+      panic("reslice mismatch, stride ${elemSize}")
+    }
+    i = i + 1
+  }
+}
+
+// Strides > 8: `append`/`get`/`set` cannot pass a whole element through one
+// word, so every field of every element is written and read directly at its
+// own computed byte address, `buf + (off + index) * elemSize + k * 8` for
+// word `k` of the element — the same address `xs[i].f` would resolve to
+// under #3862's compiler lowering.
+fn roundtripWide(elemSize: int) {
+  let words = elemSize / 8
+  let h = bit_rt_slice_new(0, 0, 0, elemSize)
+  let i = 0
+  while (i < n) {
+    // append's payload is the element's low word (word 0); the rest of the
+    // freshly reserved slot is filled directly below.
+    h = bit_rt_slice_append(h, i * 100 + 0, 0, elemSize)
+    let buf = bit_rt_port_mem_load_word(h + hdrBuf)
+    let off = bit_rt_port_mem_load_word(h + hdrOff)
+    let addr = buf + (off + i) * elemSize
+    let k = 1
+    while (k < words) {
+      bit_rt_port_mem_store_word(addr + k * 8, i * 100 + k)
+      k = k + 1
+    }
+    i = i + 1
+  }
+  // Full readback proves every element's every word survived every regrow
+  // this loop forced.
+  let buf = bit_rt_port_mem_load_word(h + hdrBuf)
+  let off = bit_rt_port_mem_load_word(h + hdrOff)
+  i = 0
+  while (i < n) {
+    let addr = buf + (off + i) * elemSize
+    let k = 0
+    while (k < words) {
+      if (bit_rt_port_mem_load_word(addr + k * 8) != i * 100 + k) {
+        panic("wide roundtrip mismatch, stride ${elemSize}")
+      }
+      k = k + 1
+    }
+    i = i + 1
+  }
+  // Reslice: element counts, so stride-independent — verify the shared
+  // buffer's view starts at the right element (the null-header arm this
+  // function never reaches is covered separately in `main`).
+  let view = bit_rt_slice_slice(h, 1, n)
+  let voff = bit_rt_port_mem_load_word(view + hdrOff)
+  if (voff != off + 1) {
+    panic("wide reslice offset mismatch, stride ${elemSize}")
+  }
+  let vaddr = buf + voff * elemSize
+  if (bit_rt_port_mem_load_word(vaddr) != 1 * 100 + 0) {
+    panic("wide reslice element mismatch, stride ${elemSize}")
+  }
+}
+
+fn main() {
+  roundtripWord(1)
+  roundtripWord(8)
+  roundtripWide(16)
+  roundtripWide(24)
+  roundtripWide(32)
+  // The null-header reslice fix (`run_empty_slice_null_header.bit`) holds in
+  // a binary that has also exercised non-8 strides (#3861 constraint: do not
+  // touch `rtSliceSlice`'s null arm).
+  if (bit_rt_slice_slice(0, 0, 0) != 0) {
+    panic("null-header reslice regression")
+  }
+  print("OK\n")
+}

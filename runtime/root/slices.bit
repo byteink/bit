@@ -158,6 +158,53 @@ const oobStringRange: int = 2
   bit_rt_panic(base)
 }
 
+// The packed-element-too-wide panic (#3861): a struct stride wider than one
+// machine word reaching `rtSliceGet`/`rtSliceSet` below. Both stay
+// WORD-VALUED — `get` returns one `int`, `set` takes one `word: int` — and a
+// packed, non-ref element wider than 8 bytes cannot be represented by either
+// without dropping bytes the caller never asked to lose. The compiler side
+// (sibling ticket #3862) is what guarantees this is never reached in a real
+// program: a field read/write on a packed `[]T` lowers to a direct load/store
+// at `buf + (off + i) * elemSize + fieldOffset`, never through `rtSliceGet`/
+// `rtSliceSet`. This is defense in depth, the same shape `panicBounds` above
+// is: a runtime that silently returned/wrote a truncated word instead would
+// be the exact silent-wrongness shape this epic exists to avoid (a stride
+// that isn't the single-byte `[]u8` case or a full word is never legal here).
+//
+// The message, packed little-endian exactly as `panicBounds`'s three and
+// `panicNilMapWrite`'s (`maps.bit`) are, and for the same reason: the panic
+// path must not allocate (root.bit constraint 3, E0075).
+//
+//   "packed slice element too wide" (29) =
+//     "packed s" "lice ele" "ment too" " wide"
+const badStrideWord0: int = 8295740900372603248
+const badStrideWord1: int = 7308327485129845100
+const badStrideWord2: int = 8029764343366051181
+const badStrideWord3: int = 435476330272
+const badStrideLen: int = 29
+
+// MODULE STATE, NOT A LOCAL — same rationale as `boundsMsg` above: `ptrOf`
+// needs an addressable object and `@nosplit` forbids allocating one per call
+// (E0075), and the panic path is exactly the path that must still work when
+// allocation is what failed. Two header words plus four text words: 32 bytes
+// of text, enough for the 29-byte message. Unlocked and non-reentrant is
+// sound for the identical reason `boundsMsg` gives: the only writer never
+// returns.
+let badStrideMsg: [6]i64
+
+// Report "packed slice element too wide" and abort. NEVER RETURNS.
+@nosplit fn panicBadStride() {
+  let base = int(ptrOf(badStrideMsg))
+  let text = base + strHeaderSize
+  storeWord(base + strPtr, text)
+  storeWord(base + strLen, badStrideLen)
+  storeWord(text + 0, badStrideWord0)
+  storeWord(text + 8, badStrideWord1)
+  storeWord(text + 16, badStrideWord2)
+  storeWord(text + 24, badStrideWord3)
+  bit_rt_panic(base)
+}
+
 // ---------------------------------------------------------------------------
 // Slices (ABI.md §2)
 // ---------------------------------------------------------------------------
@@ -217,20 +264,29 @@ fn rtSliceNew(want: int, capWant: int, isRef: int, elemSize: int): int {
 // `elemSize` travels alongside `isRef` for the same reason (#1569): a null `h`
 // has no header to read it from either.
 //
-// PACKED `[]u8` (elemSize == 1, non-ref, #3121/#3226): the grow-copy and the
-// new element both address byte-for-byte instead of the word stride. Live as
-// of #3226: the compiler now passes `elemSize == 1` for every `[]u8`
-// (`compiler/lowercall.bit`'s `sliceElemSizeFor`). Every other elemSize/isRef
-// combination is unchanged (`* 8`, gated on isRef per epic #2941's
-// constraint — a ref buffer stays word-per-element regardless of elemSize,
-// since the collector's tracing loop walks it word by word).
+// PACKED, non-ref (`elemSize != 8`, #3121/#3226/#3861): the grow-copy and the
+// new element both address byte-for-byte (`index * elemSize`) instead of the
+// word stride (`index * 8`). `[]u8` (`elemSize == 1`) keeps the byte-exact
+// write it always had. A wider packed stride (16/24/32/..., a class whose
+// `ptr_offsets` is empty, epic #2945) writes only the LOW WORD of the newly
+// reserved `elemSize`-byte slot here — that is honest, not truncating: the
+// caller asked for exactly this one word stored at this element's start, and
+// the compiler (#3862) follows up with direct stores for the struct's other
+// fields at `buf + (off + index) * elemSize + fieldOffset`, never through
+// this entry point. The grow-copy is unconditionally lossless for any stride
+// (`copyBytes` of `vlen * elemSize` raw bytes), which is what makes growing a
+// packed slice of wide elements safe: every previously appended element's
+// full body survives a regrow, not just the word this function itself wrote.
+// Every isRef/elemSize==8 combination is unchanged (`* 8`, gated on isRef per
+// epic #2941's constraint — a ref buffer stays word-per-element regardless of
+// elemSize, since the collector's tracing loop walks it word by word).
 export @nosplit @symbol("bit_rt_slice_append")
 fn rtSliceAppend(hIn: int, word: int, isRef: int, elemSize: int): int {
   let h = appendTarget(hIn, isRef, elemSize)
   let vlen = loadWord(h + slcLen)
   let vcap = loadWord(h + slcCap)
   let off = loadWord(h + slcOff)
-  let packed = elemSize == 1 && loadWord(h + slcIsRef) == 0
+  let packed = elemSize != 8 && loadWord(h + slcIsRef) == 0
   if (vlen == vcap) {
     let newcap = vcap * 2
     if (vcap == 0) {
@@ -240,7 +296,7 @@ fn rtSliceAppend(hIn: int, word: int, isRef: int, elemSize: int): int {
     let nb = allocBuf(newcap, bufIsRef != 0, elemSize)
     let old = loadWord(h + slcBuf)
     if (packed) {
-      copyBytes(nb, old + off, vlen)
+      copyBytes(nb, old + off * elemSize, vlen * elemSize)
     } else {
       let i = 0
       while (i < vlen) {
@@ -256,7 +312,11 @@ fn rtSliceAppend(hIn: int, word: int, isRef: int, elemSize: int): int {
   }
   let buf = loadWord(h + slcBuf)
   if (packed) {
-    storeByte(buf + off + vlen, word)
+    if (elemSize == 1) {
+      storeByte(buf + off + vlen, word)
+    } else {
+      storeWord(buf + (off + vlen) * elemSize, word)
+    }
   } else {
     storeWord(buf + (off + vlen) * 8, word)
   }
@@ -274,18 +334,18 @@ fn rtSliceAppend(hIn: int, word: int, isRef: int, elemSize: int): int {
 //
 // The `return 0` after each panic is unreachable: Bit has no `noreturn`, so the
 // type checker still wants a value on that path.
-// PACKED `[]u8` (elemSize == 1, non-ref, #3121/#3226): addressed byte-for-byte
-// instead of the word stride below. Every other elemSize/isRef combination
-// takes the unchanged `* 8` path. Live as of #3226: the compiler passes
-// `elemSize == 1` for every `[]u8` (`compiler/lowerlit.bit`,
-// `lowerassign.bit`, `loweraccess.bit` and `lowerprim.bit`, via
-// `compiler/lowercall.bit`'s `sliceElemSizeFor`) — that flip landed atomically
-// with this addressing arm, in the same commit, because either half without
-// the other corrupts the heap: a packed allocation sized `n` read/written at
-// a word stride walks off the end of the buffer. Gated on isRef too: a ref
-// buffer stays word-per-element unconditionally regardless of elemSize (epic
-// #2941's constraint), because the collector's tracing loop walks it word by
-// word.
+// PACKED, non-ref (`elemSize != 8`, #3121/#3226/#3861): addressed byte-for-byte
+// (`index * elemSize`) instead of the word stride below. `[]u8`
+// (`elemSize == 1`) is the one packed width this function can actually
+// return: `loadByte` widens it to a word with no data lost. Any OTHER packed
+// width (16/24/32/..., a class stride, epic #2945) cannot be returned through
+// a single `int` without silently dropping bytes the caller never asked to
+// lose, so it is FATAL (`panicBadStride`, above) rather than a truncated
+// read — the compiler (#3862) never emits this call for such a `T`; a field
+// read lowers to a direct load at its own offset instead. Every isRef/
+// elemSize==8 combination takes the unchanged `* 8` path, unconditionally
+// regardless of elemSize when isRef (epic #2941's constraint: the collector's
+// tracing loop walks a ref buffer word by word).
 export @nosplit @symbol("bit_rt_slice_get")
 fn rtSliceGet(h: int, index: int, elemSize: int): int {
   if (h == 0) {
@@ -299,8 +359,12 @@ fn rtSliceGet(h: int, index: int, elemSize: int): int {
   }
   let off = loadWord(h + slcOff)
   let buf = loadWord(h + slcBuf)
-  if (elemSize == 1 && loadWord(h + slcIsRef) == 0) {
-    return loadByte(buf + off + index)
+  if (elemSize != 8 && loadWord(h + slcIsRef) == 0) {
+    if (elemSize == 1) {
+      return loadByte(buf + off + index)
+    }
+    panicBadStride()
+    return 0
   }
   let w = loadWord(buf + (off + index) * 8)
   return w
@@ -332,9 +396,15 @@ fn rtSliceInBounds(h: int, index: int): bool {
 // has just replaced.
 //
 // Null is the length-0 case again: no index is writable, so every index panics.
-// PACKED `[]u8` (elemSize == 1, non-ref, #3121/#3226): addressed byte-for-byte
-// instead of the word stride below. See `rtSliceGet`'s comment for the full
-// rationale and the ordering constraint this arm was activated under.
+// PACKED, non-ref (`elemSize != 8`, #3121/#3226/#3861): addressed byte-for-byte
+// instead of the word stride below. `[]u8` (`elemSize == 1`) writes the one
+// byte; any other packed width is FATAL for the identical reason `rtSliceGet`
+// is — this function takes exactly one `word: int`, and silently writing it
+// into only the first 8 bytes of a wider `elemSize`-byte slot while leaving
+// the rest untouched would misrepresent what got stored, the write-side twin
+// of a truncated read. The compiler (#3862) never emits this call for such a
+// `T`: a field write lowers to a direct store at its own offset instead. See
+// `rtSliceGet`'s comment for the full rationale.
 export @nosplit @symbol("bit_rt_slice_set")
 fn rtSliceSet(h: int, index: int, word: int, elemSize: int) {
   if (h == 0) {
@@ -348,8 +418,12 @@ fn rtSliceSet(h: int, index: int, word: int, elemSize: int) {
   }
   let off = loadWord(h + slcOff)
   let buf = loadWord(h + slcBuf)
-  if (elemSize == 1 && loadWord(h + slcIsRef) == 0) {
-    storeByte(buf + off + index, word)
+  if (elemSize != 8 && loadWord(h + slcIsRef) == 0) {
+    if (elemSize == 1) {
+      storeByte(buf + off + index, word)
+      return
+    }
+    panicBadStride()
     return
   }
   storeWord(buf + (off + index) * 8, word)
@@ -385,6 +459,12 @@ fn rtSliceSet(h: int, index: int, word: int, elemSize: int) {
 // The two checks above are the only ways out of this function without a fresh
 // header: once both pass, `gcAlloc` below either succeeds or is fatal
 // (constraint 3, #1642/#3013) — exhaustion never surfaces as a 0 return here.
+//
+// STRIDE-AGNOSTIC BY CONSTRUCTION (re-checked for #3861): this function takes
+// no `elemSize` at all — `len`/`off`/`cap` are counted in elements (ABI.md
+// §2), so the fix above (return null, never a fabricated header) holds for
+// every stride unconditionally, packed or not. Nothing here needed to change
+// to generalise the runtime past `elemSize` 1 and 8.
 export @nosplit @symbol("bit_rt_slice_slice")
 fn rtSliceSlice(h: int, lo: int, hi: int): int {
   // A null receiver reslices to null (#3648) — see the header above for why the
