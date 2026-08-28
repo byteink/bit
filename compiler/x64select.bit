@@ -79,21 +79,12 @@ fn xCanonNarrow(b: X64Buf, reg: XReg64, w: Width) {
 // Operand fetch and store
 // ---------------------------------------------------------------------------
 //
-// Every selector materializes both operands into scratch registers, computes
-// there, and writes the result back through these. That is more `mov`s than
-// reusing an operand's own register would need, but it is uniform.
-//
-// This used to add "and the register file is already restricted enough
-// (callee-saved-only across calls) that the extra moves are not where the cost
-// is", with a ponytail note to tighten it if a hot path measured. #3171 removed
-// that premise on the FLOAT side — a function with safepoints now allocates
-// xmm0..xmm13 — and it measured immediately: the round trip through xFScratch1
-// was 38 of the 47 register-to-register `movsd` left in mandelbrot's `main`. So
-// the float RESULT now goes straight into its own register where it has one
-// (xFloatAcc, below); operands are still fetched through the scratch pair, and
-// the integer selectors are untouched, since their file IS still restricted.
-// ponytail: int selectors still route through scratch; revisit if the int file
-// is ever widened the same way.
+// Operands are fetched into scratch registers; the RESULT is computed straight
+// into the destination's own register when the allocator gave it one, falling
+// back to a scratch only when it is spilled — #3171 for floats (xFloatAcc),
+// #3845 for integers (xIntAccMov). Routing every result through xScratch1 cost
+// an extra `mov` per instruction: 20370 of the 92752 in the x86_64-linux
+// libbitrt were a move to or from that one register.
 
 fn xRegLocOf(cx: XCtx, vreg: int): RegLoc {
   assert(vreg >= 0 && vreg < len(cx.alloc.locations))
@@ -119,6 +110,47 @@ fn xPutInt(cx: XCtx, vreg: int, src: XReg64) {
     return
   }
   xMovStore(cx.buf, xMemB(XReg64.Rbp, xSpillOffset(cx.frame, loc.index)), src, 8)
+}
+
+// The register an integer selector should compute `dst`'s value INTO: its own
+// when the allocator gave it one, xScratch1 when it is spilled. Paired with
+// xPutInt, which then emits nothing where `dst` has a register, since xMovRR
+// elides a self-move. The integer twin of xFloatAcc (#3171).
+//
+// Bare xIntAcc has no precondition and so no assert: its callers write the
+// accumulator with the very instruction that reads the operands (a load naming
+// the base register, a setcc after its cmp, a cvt), and that read happens
+// within the instruction — `mov %rax, (%rax)` is well defined. The one caller
+// where that is NOT true, xEmitHeaderWordOrZero, stays on the scratch and says
+// so.
+fn xIntAcc(cx: XCtx, dst: int): XReg64 {
+  let loc = xRegLocOf(cx, dst)
+  if (loc.isSpill) {
+    return xScratch1()
+  }
+  return cx.intRegs[loc.index]
+}
+
+// xIntAcc with `src` moved in first — the opening of every selector that
+// computes in place from an operand it already fetched. `after1`/`after2` are
+// the operand registers still to be READ once the accumulator holds `src`;
+// pass xScratch1, never allocatable, when there are none. The move is what
+// creates the hazard, so the guard is exactly "this move can destroy a later
+// read": `acc == src` makes it encode nothing and is the BEST case, while
+// `acc == rhs` with a different `src` is the miscompile this refuses.
+fn xIntAccMov(cx: XCtx, dst: int, src: XReg64, after1: XReg64, after2: XReg64): XReg64 {
+  let loc = xRegLocOf(cx, dst)
+  if (loc.isSpill) {
+    // A spilled destination accumulates in xScratch1, and the only value that
+    // can already be there is a reload of `src` itself — xGetInt fetches a
+    // spilled second operand through xScratch2. So no later read lives here.
+    xMovRR(cx.buf, xScratch1(), src)
+    return xScratch1()
+  }
+  let acc = cx.intRegs[loc.index]
+  assert(acc == src || acc != after1 && acc != after2)
+  xMovRR(cx.buf, acc, src)
+  return acc
 }
 
 fn xGetFloat(cx: XCtx, vreg: int, scratch: XmmReg): XmmReg {
@@ -187,11 +219,11 @@ fn fitsXArithImm32(val: int): bool {
 // bytes for the folded case exactly as it does for the register-register one.
 fn xEmitArithImmInt(cx: XCtx, op: XArith, dst: int, operand: int, imm: int, w: Width) {
   let o = xGetInt(cx, operand, xScratch1())
-  xMovRR(cx.buf, xScratch1(), o)
-  xArithImm32(cx.buf, op, xScratch1(), imm)
-  xMaybeOverflowTrap(cx, xScratch1(), w)
-  xCanonNarrow(cx.buf, xScratch1(), w)
-  xPutInt(cx, dst, xScratch1())
+  let acc = xIntAccMov(cx, dst, o, xScratch1(), xScratch1())
+  xArithImm32(cx.buf, op, acc, imm)
+  xMaybeOverflowTrap(cx, acc, w)
+  xCanonNarrow(cx.buf, acc, w)
+  xPutInt(cx, dst, acc)
 }
 
 // Same encoding shape as xEmitArithImmInt, for AND/OR/XOR (#3495), but
@@ -200,9 +232,9 @@ fn xEmitArithImmInt(cx: XCtx, op: XArith, dst: int, operand: int, imm: int, w: W
 // already-canonical result would be a dead instruction at any width < 8.
 fn xEmitLogicalImmInt(cx: XCtx, op: XArith, dst: int, operand: int, imm: int) {
   let o = xGetInt(cx, operand, xScratch1())
-  xMovRR(cx.buf, xScratch1(), o)
-  xArithImm32(cx.buf, op, xScratch1(), imm)
-  xPutInt(cx, dst, xScratch1())
+  let acc = xIntAccMov(cx, dst, o, xScratch1(), xScratch1())
+  xArithImm32(cx.buf, op, acc, imm)
+  xPutInt(cx, dst, acc)
 }
 
 // Tries the ADD/SUB-immediate fold (#1853); true if it emitted, in which case
@@ -269,15 +301,15 @@ fn xEmitBinaryInt(cx: XCtx, op: XArith, dst: int, lhs: int, rhs: int, w: Width) 
   }
   let l = xGetInt(cx, lhs, xScratch1())
   let r = xGetInt(cx, rhs, xScratch2())
-  xMovRR(cx.buf, xScratch1(), l)
-  xArithRR(cx.buf, op, xScratch1(), r)
+  let acc = xIntAccMov(cx, dst, l, r, r)
+  xArithRR(cx.buf, op, acc, r)
   // add/sub can carry bits past the type width; the bitwise ops cannot — they
   // map canonical inputs to a canonical output, so they need no re-narrowing.
   if (op == XArith.Add || op == XArith.Sub) {
-    xMaybeOverflowTrap(cx, xScratch1(), w)
-    xCanonNarrow(cx.buf, xScratch1(), w)
+    xMaybeOverflowTrap(cx, acc, w)
+    xCanonNarrow(cx.buf, acc, w)
   }
-  xPutInt(cx, dst, xScratch1())
+  xPutInt(cx, dst, acc)
 }
 
 // Which operand (if any) of a commutative And/Or/Xor is a known constant
@@ -318,19 +350,19 @@ fn xLogicalConstSkip(f: IrFunc, rhs: int, lhs: int): int {
 // instructions it always has.
 fn xEmitPow2MulInt(cx: XCtx, dst: int, value: int, k: int, w: Width) {
   let v = xGetInt(cx, value, xScratch1())
-  xMovRR(cx.buf, xScratch1(), v)
+  let acc = xIntAccMov(cx, dst, v, xScratch1(), xScratch1())
   let trap64 = cx.debug && w.signed && w.bytes == 8
   if (trap64) {
-    xMovRR(cx.buf, xScratch2(), xScratch1())
+    xMovRR(cx.buf, xScratch2(), acc)
   }
-  xShiftImm(cx.buf, XShift.Shl, xScratch1(), k)
+  xShiftImm(cx.buf, XShift.Shl, acc, k)
   if (trap64) {
-    xEmitPow2MulOverflowTrap64(cx, xScratch1(), xScratch2(), k)
+    xEmitPow2MulOverflowTrap64(cx, acc, xScratch2(), k)
   } else {
-    xMaybeOverflowTrap(cx, xScratch1(), w)
+    xMaybeOverflowTrap(cx, acc, w)
   }
-  xCanonNarrow(cx.buf, xScratch1(), w)
-  xPutInt(cx, dst, xScratch1())
+  xCanonNarrow(cx.buf, acc, w)
+  xPutInt(cx, dst, acc)
 }
 
 // `factor` is xConstPow2Factor's verdict, precomputed by the caller
@@ -344,11 +376,11 @@ fn xEmitMulInt(cx: XCtx, dst: int, lhs: int, rhs: int, factor: Pow2Factor, w: Wi
   }
   let l = xGetInt(cx, lhs, xScratch1())
   let r = xGetInt(cx, rhs, xScratch2())
-  xMovRR(cx.buf, xScratch1(), l)
-  xImulRR(cx.buf, xScratch1(), r)
-  xMaybeOverflowTrap(cx, xScratch1(), w) // 0F AF sets OF on true 64-bit overflow
-  xCanonNarrow(cx.buf, xScratch1(), w) // a product overflows its width readily
-  xPutInt(cx, dst, xScratch1())
+  let acc = xIntAccMov(cx, dst, l, r, r)
+  xImulRR(cx.buf, acc, r)
+  xMaybeOverflowTrap(cx, acc, w) // 0F AF sets OF on true 64-bit overflow
+  xCanonNarrow(cx.buf, acc, w) // a product overflows its width readily
+  xPutInt(cx, dst, acc)
 }
 
 // Which of the four division ops this is.
@@ -400,18 +432,18 @@ enum XDivOp {
 // under-shifts and corrupts the bias for bits < 64 (#1707).
 fn xEmitPow2DivInt(cx: XCtx, dst: int, lhs: int, k: int, signed: bool) {
   let l = xGetInt(cx, lhs, xScratch1())
-  xMovRR(cx.buf, xScratch1(), l)
+  let acc = xIntAccMov(cx, dst, l, xScratch1(), xScratch1())
   if (!signed) {
-    xShiftImm(cx.buf, XShift.Shr, xScratch1(), k)
-    xPutInt(cx, dst, xScratch1())
+    xShiftImm(cx.buf, XShift.Shr, acc, k)
+    xPutInt(cx, dst, acc)
     return
   }
-  xMovRR(cx.buf, xScratch2(), xScratch1())
+  xMovRR(cx.buf, xScratch2(), acc)
   xShiftImm(cx.buf, XShift.Sar, xScratch2(), 63) // sign mask: 0 or all-ones
   xShiftImm(cx.buf, XShift.Shr, xScratch2(), 64 - k) // isolate low k bits: 0 or 2^k-1
-  xArithRR(cx.buf, XArith.Add, xScratch1(), xScratch2())
-  xShiftImm(cx.buf, XShift.Sar, xScratch1(), k)
-  xPutInt(cx, dst, xScratch1())
+  xArithRR(cx.buf, XArith.Add, acc, xScratch2())
+  xShiftImm(cx.buf, XShift.Sar, acc, k)
+  xPutInt(cx, dst, acc)
 }
 
 // Emits `lhs % 2^k` as a mask (unsigned) or a mask-and-correct sequence
@@ -446,23 +478,23 @@ fn xEmitPow2DivInt(cx: XCtx, dst: int, lhs: int, k: int, signed: bool) {
 // specified but not yet implemented (SPEC section 13.5, task #3076).
 fn xEmitPow2RemInt(cx: XCtx, dst: int, lhs: int, k: int, signed: bool) {
   let l = xGetInt(cx, lhs, xScratch1())
-  xMovRR(cx.buf, xScratch1(), l)
+  let acc = xIntAccMov(cx, dst, l, xScratch1(), xScratch1())
   let maskLo = (u64(1) << u64(k)) - u64(1)
   if (!signed) {
     xMovRI(cx.buf, xScratch2(), int(maskLo))
-    xArithRR(cx.buf, XArith.And, xScratch1(), xScratch2())
-    xPutInt(cx, dst, xScratch1())
+    xArithRR(cx.buf, XArith.And, acc, xScratch2())
+    xPutInt(cx, dst, acc)
     return
   }
-  xMovRR(cx.buf, xScratch2(), xScratch1())
+  xMovRR(cx.buf, xScratch2(), acc)
   xShiftImm(cx.buf, XShift.Sar, xScratch2(), 63) // sign mask: 0 or all-ones
   xShiftImm(cx.buf, XShift.Shr, xScratch2(), 64 - k) // bias: 0 or 2^k-1
-  xMovRR(cx.buf, xScratch3(), xScratch1())
+  xMovRR(cx.buf, xScratch3(), acc)
   xArithRR(cx.buf, XArith.Add, xScratch3(), xScratch2()) // lhs + bias
   xMovRI(cx.buf, xScratch2(), int(~maskLo))
   xArithRR(cx.buf, XArith.And, xScratch3(), xScratch2()) // toward zero to a multiple of 2^k
-  xArithRR(cx.buf, XArith.Sub, xScratch1(), xScratch3()) // lhs - that = truncated remainder
-  xPutInt(cx, dst, xScratch1())
+  xArithRR(cx.buf, XArith.Sub, acc, xScratch3()) // lhs - that = truncated remainder
+  xPutInt(cx, dst, acc)
 }
 
 // `dst = lhs / rhs` or `lhs % rhs`.
@@ -543,15 +575,15 @@ fn xEmitDivInt(cx: XCtx, op: XDivOp, dst: int, lhs: int, rhs: int, pow2K: int, w
 // unchanged. BNOT never overflows (SPEC §13.5) and stays untouched.
 fn xEmitUnaryInt(cx: XCtx, isNeg: bool, dst: int, operand: int, w: Width) {
   let v = xGetInt(cx, operand, xScratch1())
-  xMovRR(cx.buf, xScratch1(), v)
+  let acc = xIntAccMov(cx, dst, v, xScratch1(), xScratch1())
   if (isNeg) {
-    xNegR(cx.buf, xScratch1())
-    xMaybeOverflowTrap(cx, xScratch1(), w)
+    xNegR(cx.buf, acc)
+    xMaybeOverflowTrap(cx, acc, w)
   } else {
-    xNotR(cx.buf, xScratch1())
+    xNotR(cx.buf, acc)
   }
-  xCanonNarrow(cx.buf, xScratch1(), w)
-  xPutInt(cx, dst, xScratch1())
+  xCanonNarrow(cx.buf, acc, w)
+  xPutInt(cx, dst, acc)
 }
 
 // ---------------------------------------------------------------------------
@@ -566,9 +598,10 @@ fn xEmitIcmp(cx: XCtx, cc: int, dst: int, lhs: int, rhs: int) {
   let l = xGetInt(cx, lhs, xScratch1())
   let r = xGetInt(cx, rhs, xScratch2())
   xArithRR(cx.buf, XArith.Cmp, l, r)
-  xSetcc(cx.buf, cc, xScratch1())
-  xMovzxb(cx.buf, xScratch1(), xScratch1())
-  xPutInt(cx, dst, xScratch1())
+  let acc = xIntAcc(cx, dst)
+  xSetcc(cx.buf, cc, acc)
+  xMovzxb(cx.buf, acc, acc)
+  xPutInt(cx, dst, acc)
 }
 
 enum XFCmp {
@@ -677,10 +710,10 @@ fn xEmitBinaryFloat(cx: XCtx, op: XFArith, dst: int, lhs: int, rhs: int, width: 
 fn xEmitConvert(cx: XCtx, dst: int, src: int, sw: Width, dw: Width) {
   if (sw.regClass == RegClass.Int && dw.regClass == RegClass.Int) {
     let r = xGetInt(cx, src, xScratch1())
-    xMovRR(cx.buf, xScratch1(), r)
-    xExtendReg(cx.buf, xScratch1(), sw.bytes, sw.signed)
-    xExtendReg(cx.buf, xScratch1(), dw.bytes, dw.signed)
-    xPutInt(cx, dst, xScratch1())
+    let acc = xIntAccMov(cx, dst, r, xScratch1(), xScratch1())
+    xExtendReg(cx.buf, acc, sw.bytes, sw.signed)
+    xExtendReg(cx.buf, acc, dw.bytes, dw.signed)
+    xPutInt(cx, dst, acc)
     return
   }
   if (sw.regClass == RegClass.Int && dw.regClass == RegClass.Float) {
@@ -693,9 +726,10 @@ fn xEmitConvert(cx: XCtx, dst: int, src: int, sw: Width, dw: Width) {
   }
   if (sw.regClass == RegClass.Float && dw.regClass == RegClass.Int) {
     let x = xGetFloat(cx, src, xFScratch1())
-    xCvtF2I(cx.buf, xScratch1(), x, sw.bytes)
-    xExtendReg(cx.buf, xScratch1(), dw.bytes, dw.signed)
-    xPutInt(cx, dst, xScratch1())
+    let acc = xIntAcc(cx, dst)
+    xCvtF2I(cx.buf, acc, x, sw.bytes)
+    xExtendReg(cx.buf, acc, dw.bytes, dw.signed)
+    xPutInt(cx, dst, acc)
     return
   }
   let x = xGetFloat(cx, src, xFScratch1())
@@ -708,7 +742,7 @@ fn xEmitConvert(cx: XCtx, dst: int, src: int, sw: Width, dw: Width) {
 }
 
 // ---------------------------------------------------------------------------
-// Constants, shifts, and memory selectors
+// GPR<->XMM bit transfers, and the shift selector
 // ---------------------------------------------------------------------------
 
 // `movq/movd xmm, r64/r32` — moves raw BITS from a GPR into an xmm, no
@@ -737,50 +771,28 @@ fn xMovGX(b: X64Buf, dst: XReg64, src: XmmReg, width: int) {
   xEmitByte(b, xModrmReg(xmmNum(src), xRegNum(dst)))
 }
 
-// `sqrtsd`/`sqrtss` — SSE2, IEEE-exact and correctly rounded, so no libm and
-// no runtime call.
-fn xSqrtF(b: X64Buf, dst: XmmReg, src: XmmReg, width: int) {
-  xEmitByte(b, xFPrefix(width))
-  xMaybeRex(b, false, xNeedsRexBit(xmmNum(dst)), false, xNeedsRexBit(xmmNum(src)))
-  xEmitByte(b, 0x0F)
-  xEmitByte(b, 0x51)
-  xEmitByte(b, xModrmReg(xmmNum(dst), xmmNum(src)))
-}
-
-fn xEmitConstInt(cx: XCtx, dst: int, val: int) {
-  xMovRI(cx.buf, xScratch1(), val)
-  xPutInt(cx, dst, xScratch1())
-}
-
-// A float constant is materialized by its BITS, not by any conversion — the
-// literal's exact IEEE encoding goes into a GPR and then across to an xmm.
-fn xEmitConstFloat(cx: XCtx, dst: int, bits: int, width: int) {
-  xMovRI(cx.buf, xScratch1(), bits)
-  // #3171: materialize into dst's own register when it has one — a constant has
-  // no float operand at all, so nothing can be sitting in it.
-  let acc = xFloatAcc(cx, dst, xFScratch1())
-  xMovXG(cx.buf, acc, xScratch1(), width)
-  xPutFloat(cx, dst, acc)
-}
-
 // `dst = lhs << rhs` / `>> rhs`. `constAmt >= 0` selects the immediate form;
 // otherwise the count goes through cl, x86-64's only variable shift count —
 // which is why a function with a variable shift excludes rcx from allocation.
 fn xEmitShiftInt(cx: XCtx, op: XShift, dst: int, lhs: int, rhs: int, constAmt: int, w: Width) {
   let l = xGetInt(cx, lhs, xScratch1())
-  xMovRR(cx.buf, xScratch1(), l)
+  let acc = xIntAccMov(cx, dst, l, xScratch1(), xScratch1())
   if (constAmt >= 0) {
-    xShiftImm(cx.buf, op, xScratch1(), constAmt)
+    xShiftImm(cx.buf, op, acc, constAmt)
   } else {
     let r = xGetInt(cx, rhs, xScratch2())
+    // xIntAccMov's guard, deferred because `rhs` is fetched only on this arm.
+    // rcx is excluded from the file in a function with a variable shift.
+    assert(acc == l || acc != r)
+    assert(acc != XReg64.Rcx)
     xMovRR(cx.buf, XReg64.Rcx, r)
-    xShiftCl(cx.buf, op, xScratch1())
+    xShiftCl(cx.buf, op, acc)
   }
   // Only a LEFT shift pushes bits past the type width. The right shifts carry a
   // canonical operand to a canonical result, so they need no re-narrowing —
   // and that is exactly why the canonical invariant is worth maintaining.
   if (op == XShift.Shl) {
-    xCanonNarrow(cx.buf, xScratch1(), w)
+    xCanonNarrow(cx.buf, acc, w)
   }
-  xPutInt(cx, dst, xScratch1())
+  xPutInt(cx, dst, acc)
 }
