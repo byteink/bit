@@ -71,7 +71,7 @@
 // toward, and for why `BIT_STAGE0_BIN` itself must skip this check rather
 // than fail it.
 
-import { trimSpace, indexOf, contains, split, hasPrefix } from "std/strings"
+import { trimSpace, indexOf, contains, split, hasPrefix, parseInt } from "std/strings"
 
 class AbiSymbol {
   name: string
@@ -324,20 +324,185 @@ fn checkRuntimeAbiArity(): bool {
       mismatches = append(mismatches, AbiMismatch{symbol: s.name, file: s.file, treeArity: s.arity, stage0Arity: oldArity})
     }
   }
+  if (len(mismatches) > 0) {
+    eprint("make: selfhost: refusing to link — runtime ABI arity mismatch against the pinned stage0 (${tag}):\n")
+    for m of mismatches {
+      eprint("make:   ${m.symbol} (${m.file}): stage0 (${tag}) emits calls for ${m.stage0Arity} arg(s); this tree's runtime/** now declares ${m.treeArity}\n")
+    }
+    eprint("make: stage0's call-site lowering for these symbols is baked into its own compiled machine code and does not re-read runtime/** — linking would succeed and the callee would read an unwritten argument register (#3152).\n")
+    eprint("make: land this with the two-pass BIT_STAGE0_BIN bootstrap instead (docs/development.md, \"Landing a runtime ABI change\"):\n")
+    eprint("make:   rm -rf bit-out\n")
+    eprint("make:   git checkout <commit before this runtime/** change> -- runtime/  # pass 1 needs the OLD runtime, matching stage0's baked-in arity\n")
+    eprint("make:   ./make                                                          # pass 1: stage0 -> a compiler from the new compiler/** source, linked against the OLD runtime\n")
+    eprint("make:   cp bit-out/bin/bit $TMPDIR/bit1\n")
+    eprint("make:   git checkout HEAD -- runtime/                                   # restore BEFORE anything else reads the tree\n")
+    eprint("make:   BIT_STAGE0_BIN=$TMPDIR/bit1 ./make                              # pass 2 -- do NOT rm -rf bit-out here\n")
+    return false
+  }
+  // Arities match; the same extracted stage0RuntimeDir also answers the
+  // narrower, LAYOUT question this check was blind to (#3891, #3893).
+  return checkRuntimeAbiLayout(stage0RuntimeDir, tag)
+}
+
+// #3893: `checkRuntimeAbiArity` above compares declared ARITIES — how many
+// words a call passes — against the pinned stage0. It cannot see a LAYOUT
+// change: which field lives at which byte offset inside a compiler-emitted
+// object. #3891 is what that gap cost: the string header widened from two
+// words to three in `runtime/**` while the pinned stage0 still emitted (and
+// every other reader still expected) the two-word shape — a hard crash on
+// x86_64-linux, and on aarch64-macos a silent miscompile where every
+// `BIT_*` environment variable stopped working with no diagnostic anywhere.
+//
+// Deliberately a short, explicit, hand-picked list — not "every const in
+// runtime/root/root.bit". Only fields a compiler-emitted literal (string,
+// slice) actually writes, or that codegen itself must agree with the
+// runtime on (the GC object header size), are a data contract with the
+// pinned compiler in the way an extern arity is. A constant nothing outside
+// `runtime/**` reads or writes (e.g. `slcHeaderSize`'s own internal helper
+// constants, if any existed) would not belong here even if it happened to
+// be a layout number, because stage0 has no baked-in expectation of it to
+// diverge from.
+class LayoutConst {
+  file: string // relative to `runtime/`
+  name: string
+}
+
+fn abiLayoutConsts(): []LayoutConst {
+  return [
+    LayoutConst{file: "root/root.bit", name: "strPtr"},
+    LayoutConst{file: "root/root.bit", name: "strLen"},
+    LayoutConst{file: "root/root.bit", name: "strHeaderSize"},
+    LayoutConst{file: "root/root.bit", name: "strBase"},
+    LayoutConst{file: "root/root.bit", name: "strAllocHeader"},
+    LayoutConst{file: "root/root.bit", name: "slcBuf"},
+    LayoutConst{file: "root/root.bit", name: "slcLen"},
+    LayoutConst{file: "root/root.bit", name: "slcOff"},
+    LayoutConst{file: "root/root.bit", name: "slcCap"},
+    LayoutConst{file: "root/root.bit", name: "slcIsRef"},
+    LayoutConst{file: "root/root.bit", name: "slcHeaderSize"},
+    LayoutConst{file: "gc/gc.bit", name: "gcHeaderSize"},
+  ]
+}
+
+class LayoutMismatch {
+  name: string
+  file: string
+  treeValue: int
+  stage0Value: int
+}
+
+fn isConstNameByte(c: byte): bool {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// Finds `const <name>` (with or without a leading `export`) and returns the
+// integer literal after its `=`, ignoring any trailing `//` comment on the
+// same line. Word-bounded on both sides — via `isConstNameByte` immediately
+// before and after the match — so searching for `strLen` cannot match
+// inside a hypothetical `strLenExtra`, the same false-match risk this
+// file's own `parseArity` already guards against for a different token.
+// True when `text[absAt:afterMarker]` (the just-matched "const <name>") is
+// not itself a substring of a longer identifier — the char immediately
+// before `absAt` and immediately after `afterMarker` must both be absent or
+// non-identifier, or e.g. `strLen` would match inside a hypothetical
+// `strLenExtra`. Split out of `parseNamedConst` to keep both under the
+// complexity-10 ceiling (spec/LINT.md:186, E0204).
+fn constNameBoundaryOk(text: string, absAt: int, afterMarker: int): bool {
+  let precededOk = absAt == 0 || !isConstNameByte(text[absAt - 1])
+  let followedOk = afterMarker >= len(text) || !isConstNameByte(text[afterMarker])
+  return precededOk && followedOk
+}
+
+// Parses the integer literal after the first `=` on the line starting at
+// `afterMarker`, ignoring a trailing `//` comment. `ok` is false when the
+// line has no `=` or the text after it is not a valid integer literal.
+fn parseConstLineValue(text: string, afterMarker: int): (int, bool) {
+  let restOfLine = text[afterMarker:]
+  let nlAt = indexOf(restOfLine, "\n")
+  let line = restOfLine
+  if (nlAt >= 0) {
+    line = restOfLine[:nlAt]
+  }
+  let eqAt = indexOf(line, "=")
+  if (eqAt < 0) {
+    return 0, false
+  }
+  let valuePart = trimSpace(line[eqAt + 1:])
+  let commentAt = indexOf(valuePart, "//")
+  if (commentAt >= 0) {
+    valuePart = trimSpace(valuePart[:commentAt])
+  }
+  let parsedOk = true
+  let value = parseInt(valuePart) catch _ {
+    parsedOk = false
+    0
+  }
+  return value, parsedOk
+}
+
+fn parseNamedConst(text: string, name: string): (int, bool) {
+  let marker = "const " + name
+  let searchFrom = 0
+  while (true) {
+    let at = indexOf(text[searchFrom:], marker)
+    if (at < 0) {
+      return 0, false
+    }
+    let absAt = searchFrom + at
+    let afterMarker = absAt + len(marker)
+    searchFrom = afterMarker
+    if (!constNameBoundaryOk(text, absAt, afterMarker)) {
+      continue
+    }
+    let (value, ok) = parseConstLineValue(text, afterMarker)
+    if (ok) {
+      return value, true
+    }
+  }
+}
+
+// Reads `lc`'s value out of `root + "/" + lc.file"` — `root` is `"runtime"`
+// for the working tree, or `extractStage0Runtime`'s returned directory for
+// the pinned tag, so the same `LayoutConst` table answers both sides.
+fn layoutConstValue(root: string, lc: LayoutConst): (int, bool) {
+  let text = readFile(root + "/" + lc.file) catch _ { return 0, false }
+  return parseNamedConst(text, lc.name)
+}
+
+// Compares `abiLayoutConsts()` between the working tree and the already-
+// extracted `stage0RuntimeDir` (`checkRuntimeAbiArity` extracts it once and
+// passes it in, reusing the same `git archive` this check needs). Returns
+// false — and has already printed the diagnostic — when the build must not
+// proceed.
+fn checkRuntimeAbiLayout(stage0RuntimeDir: string, tag: string): bool {
+  let mismatches = []LayoutMismatch(0)
+  for lc of abiLayoutConsts() {
+    let (treeValue, tok) = layoutConstValue("runtime", lc)
+    let (stage0Value, sok) = layoutConstValue(stage0RuntimeDir, lc)
+    // A constant this table expects but cannot find on either side is an
+    // infrastructure fact (renamed file, moved constant), not a proven
+    // layout mismatch — skip it rather than refuse a build over a check
+    // that could not actually run, same posture as the arity check's own
+    // "too few symbols parsed" guard above.
+    if (!tok || !sok) {
+      continue
+    }
+    if (treeValue != stage0Value) {
+      mismatches = append(mismatches, LayoutMismatch{name: lc.name, file: lc.file, treeValue: treeValue, stage0Value: stage0Value})
+    }
+  }
   if (len(mismatches) == 0) {
     return true
   }
-  eprint("make: selfhost: refusing to link — runtime ABI arity mismatch against the pinned stage0 (${tag}):\n")
+  eprint("make: selfhost: refusing to link — runtime object LAYOUT mismatch against the pinned stage0 (${tag}):\n")
   for m of mismatches {
-    eprint("make:   ${m.symbol} (${m.file}): stage0 (${tag}) emits calls for ${m.stage0Arity} arg(s); this tree's runtime/** now declares ${m.treeArity}\n")
+    eprint("make:   ${m.name} (runtime/${m.file}): stage0 (${tag}) was built expecting ${m.stage0Value}; this tree's runtime/** now declares ${m.treeValue}\n")
   }
-  eprint("make: stage0's call-site lowering for these symbols is baked into its own compiled machine code and does not re-read runtime/** — linking would succeed and the callee would read an unwritten argument register (#3152).\n")
-  eprint("make: land this with the two-pass BIT_STAGE0_BIN bootstrap instead (docs/development.md, \"Landing a runtime ABI change\"):\n")
-  eprint("make:   rm -rf bit-out\n")
-  eprint("make:   git checkout <commit before this runtime/** change> -- runtime/  # pass 1 needs the OLD runtime, matching stage0's baked-in arity\n")
-  eprint("make:   ./make                                                          # pass 1: stage0 -> a compiler from the new compiler/** source, linked against the OLD runtime\n")
-  eprint("make:   cp bit-out/bin/bit $TMPDIR/bit1\n")
-  eprint("make:   git checkout HEAD -- runtime/                                   # restore BEFORE anything else reads the tree\n")
-  eprint("make:   BIT_STAGE0_BIN=$TMPDIR/bit1 ./make                              # pass 2 -- do NOT rm -rf bit-out here\n")
+  eprint("make: stage0 is the compiler that EMITS this object's layout (string/slice header fields, the GC header size) into every program it builds. It cannot re-read runtime/**'s new constant, so linking would succeed and produce a silent miscompile — a hard crash on one platform, and on another, running code that reads the wrong bytes with no diagnostic anywhere (#3891).\n")
+  eprint("make: BIT_LIBBITRT_TREE=1 does NOT fix this — it still builds L0 with the PINNED stage0 compiling THIS tree's runtime source (stepLibbitrtTree, artifactsteps.bit), so L0 carries the identical mismatch.\n")
+  eprint("make: land this with the three-pass bootstrap instead (#3891's recipe):\n")
+  eprint("make:   BIT_LIBBITRT=<main's libbitrt.a for this host> bit-out/stage0/bit-oracle build compiler -o \$TMPDIR/p1   # a self-consistent compiler: new compiler/** source, OLD (matching) runtime archive\n")
+  eprint("make:   BIT=\$TMPDIR/p1 bash scripts/g2archive.sh <target> \$TMPDIR/libbitrt-p1-<target>.a                        # a runtime archive whose layout matches the NEW reader\n")
+  eprint("make:   BIT_LIBBITRT=\$TMPDIR/libbitrt-p1-<target>.a \$TMPDIR/p1 build <program> -o <out> -t <target>            # build a program against the matched pair\n")
   return false
 }
