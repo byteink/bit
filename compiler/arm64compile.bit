@@ -1,362 +1,8 @@
-// Self-host Stage 3 (#1342): ARM64 instruction dispatch and the top-level
-// per-function driver (register allocation, frame layout, emission), split out
-// of arm64.bit (#1503). Sibling .bit file, same module: see arm64.bit.
-
-// ===========================================================================
-// Instruction dispatch
-// ===========================================================================
-
-// Which `const_int` definitions (#1853) an ADD/SUB-immediate fold, a bitmask
-// AND/ORR/EOR-immediate fold (#3495), a power-of-two Mul (#3105) or a
-// power-of-two SDiv/UDiv (#3104) consumes entirely, indexed by instruction id.
-// `instrOperands` (opt.bit) is the SAME operand map DCE uses, so a constant
-// with any use besides the one fold that reads it as an immediate keeps
-// `false` and still materializes normally — this only marks a def whose sole
-// structural use is that one fold, mirroring the emitters' own operand order
-// so nothing here marks skipped a value an emitter actually reads as a
-// register.
-//
-// SRem/URem are deliberately excluded from the divide case: `emitDivInt`
-// only takes the shift path for SDiv/UDiv (#3104 — msub still needs the real
-// divisor register to recover a remainder), so skipping the divisor for a Rem
-// would leave the general path reading an unmaterialized register — the
-// `useCount == 1` guard below exists to prevent exactly this class of bug.
-//
-// `debug` (#3080/§13.5) is the same hazard: a debug build's `emitBinaryInt`
-// skips the ADD/SUB-immediate fold (no flag-setting immediate form exists),
-// so this arm must agree or a constant marked skipped here reads an
-// unmaterialized register. Verified live: unguarded, `x + 1` under `--debug`
-// emitted `adds x21, x19, x20` with no prior write to x20. Mul's debug
-// overflow trap (#3084, arm64selectovf.bit) does read `cx.debug` now, but
-// never re-reads the skipped operand: `emitPow2MulInt`'s check only touches
-// the non-constant operand's register and the compile-time-known shift
-// amount `k`, so skipping the power-of-two constant here stays safe in every
-// build mode. Div is still untouched — it reads `cx.debug` nowhere.
-fn computeSkipConstMaterialize(ctx: TypeContext, f: IrFunc, debug: bool): []bool {
-  let n = len(f.instrs)
-  let useCount = []int(0)
-  let i = 0
-  while (i < n) {
-    useCount = append(useCount, 0)
-    i = i + 1
-  }
-  i = 0
-  while (i < n) {
-    let ops = instrOperands(f, i)
-    let k = 0
-    while (k < len(ops)) {
-      useCount[ops[k]] = useCount[ops[k]] + 1
-      k = k + 1
-    }
-    i = i + 1
-  }
-  let skip = []bool(0)
-  i = 0
-  while (i < n) {
-    skip = append(skip, false)
-    i = i + 1
-  }
-  i = 0
-  while (i < n) {
-    let ins = f.instrs[i]
-    if ((ins.op == Op.Add || ins.op == Op.Sub) && !debug) {
-      let rc = constIntOf(f, ins.rhs)
-      if (rc.known && resolveAddSubImm(ins.op, rc.ival).fits && useCount[ins.rhs] == 1) {
-        skip[ins.rhs] = true
-      } else if (ins.op == Op.Add) {
-        let lc = constIntOf(f, ins.lhs)
-        if (lc.known && resolveAddSubImm(ins.op, lc.ival).fits && useCount[ins.lhs] == 1) {
-          skip[ins.lhs] = true
-        }
-      }
-    } else if (ins.op == Op.Mul) {
-      let w = widthOf(ctx, ins.ty)
-      let factor = xConstPow2Factor(f, ins.lhs, ins.rhs, w)
-      if (factor.k >= 0) {
-        let constOp = ins.lhs
-        if (factor.value == ins.lhs) {
-          constOp = ins.rhs
-        }
-        if (useCount[constOp] == 1) {
-          skip[constOp] = true
-        }
-      }
-    } else if (ins.op == Op.BAnd || ins.op == Op.BOr || ins.op == Op.BXor) {
-      let s = logicalConstSkip(f, ins.rhs, ins.lhs)
-      if (s >= 0 && useCount[s] == 1) {
-        skip[s] = true
-      }
-    } else if (ins.op == Op.SDiv || ins.op == Op.UDiv) {
-      let w = widthOf(ctx, ins.ty)
-      let pk = xConstPow2Divisor(f, ins.rhs, w)
-      if (pk >= 0 && useCount[ins.rhs] == 1) {
-        skip[ins.rhs] = true
-      }
-    }
-    i = i + 1
-  }
-  return skip
-}
-
-// #3101: does `compileInst` write instruction `i`'s own allocated register?
-//
-// Mirrors the dispatch below, and DEFAULTS TO TRUE so the mirror can only ever
-// fail safe: a new op, or one this list forgets, is treated as writing its
-// register and is saved as before. Only the reverse — claiming a write does not
-// happen when it does — could drop a live callee-saved value, so nothing goes in
-// the false list without a `compileInst` arm that provably binds no destination:
-//
-//   * Jump/Br/Ret/Unreachable/FieldSet/IndexSet/AtomicStore pass no `i` to their
-//     emitter at all; they only read operands.
-//   * Call/CallValue/CallIface/RtCall/Asm route their destination through
-//     `dstOrNone`, which answers -1 for a void result, and `emitCall`/`emitAsm`
-//     each guard on that (arm64call.bit's `dst < 0`, emitAsm's `dst >= 0`).
-//   * a `const_int` in `skipConst` is the one arm that materializes nothing;
-//     `computeSkipConstMaterialize` above already proves its sole use reads it as
-//     an immediate, never as a register, so nothing loads it either.
-//
-// block_param is deliberately absent: `moveBlockArgs` writes a param's register
-// on every incoming edge, so it is a real definition even though `compileInst`
-// never sees one.
-fn arm64WritesResult(ctx: TypeContext, f: IrFunc, skipConst: []bool, i: int): bool {
-  let ins = f.instrs[i]
-  let op = ins.op
-  if (op == Op.Jump || op == Op.Br || op == Op.Ret || op == Op.Unreachable ||
-    op == Op.FieldSet || op == Op.IndexSet || op == Op.AtomicStore) {
-    return false
-  }
-  if (op == Op.ConstInt) {
-    return !skipConst[i]
-  }
-  if (op == Op.Call || op == Op.CallValue || op == Op.CallIface ||
-    op == Op.RtCall || op == Op.Asm) {
-    return ins.ty != ctx.voidId
-  }
-  return true
-}
-
-// Emits one instruction. `curBlock` is only needed to classify an edge as a
-// back-edge.
-fn compileInst(cx: A64Ctx, curBlock: int, i: int) {
-  let ins = cx.f.instrs[i]
-  let op = ins.op
-  let ty = ins.ty
-  let iw = widthOf(cx.module.ctx, ty) // result width: drives narrow re-canonicalization
-
-  if (op == Op.ConstInt) {
-    if (!cx.skipConst[i]) { emitConstInt(cx, i, ins.ival) }
-    return
-  }
-  if (op == Op.ConstBool) { emitConstBool(cx, i, ins.bval); return }
-  if (op == Op.ConstNil) { emitConstNil(cx, i); return }
-  if (op == Op.ConstFloat) { emitConstFloat(cx, i, ins.fval, iw.bytes); return }
-  if (op == Op.ConstString) { emitConstString(cx, i, ins.ival); return }
-  if (op == Op.Add || op == Op.Sub || op == Op.BAnd || op == Op.BOr || op == Op.BXor) {
-    emitBinaryInt(cx, op, i, ins.lhs, ins.rhs, iw)
-    return
-  }
-  if (op == Op.Mul) {
-    emitMulInt(cx, i, ins.lhs, ins.rhs, xConstPow2Factor(cx.f, ins.lhs, ins.rhs, iw), iw)
-    return
-  }
-  if (op == Op.SDiv || op == Op.UDiv || op == Op.SRem || op == Op.URem) {
-    emitDivInt(cx, op, i, ins.lhs, ins.rhs, xConstPow2Divisor(cx.f, ins.rhs, iw), iw)
-    return
-  }
-  if (op == Op.Shl || op == Op.LShr || op == Op.AShr) {
-    emitShiftInt(cx, op, i, ins.lhs, ins.rhs, iw)
-    return
-  }
-  if (isIcmp(op)) { emitIcmp(cx, op, i, ins.lhs, ins.rhs); return }
-  if (op == Op.FAdd) { emitBinaryFloat(cx, FArithOp.Add, i, ins.lhs, ins.rhs, iw.bytes); return }
-  if (op == Op.FSub) { emitBinaryFloat(cx, FArithOp.Sub, i, ins.lhs, ins.rhs, iw.bytes); return }
-  if (op == Op.FMul) { emitBinaryFloat(cx, FArithOp.Mul, i, ins.lhs, ins.rhs, iw.bytes); return }
-  if (op == Op.FDiv) { emitBinaryFloat(cx, FArithOp.Div, i, ins.lhs, ins.rhs, iw.bytes); return }
-  if (isFcmp(op)) {
-    // A float compare's operand width comes from the OPERANDS — its own result is
-    // a bool.
-    emitFcmp(cx, op, i, ins.lhs, ins.rhs, widthOf(cx.module.ctx, cx.f.instrs[ins.lhs].ty).bytes)
-    return
-  }
-  if (op == Op.Neg || op == Op.BNot) { emitUnaryInt(cx, op, i, ins.lhs, iw); return }
-  if (op == Op.Convert) { emitConvert(cx, i, ins.lhs, ty); return }
-  if (op == Op.FNeg) { emitFneg(cx, i, ins.lhs, iw.bytes); return }
-  if (op == Op.FSqrt) { emitFsqrt(cx, i, ins.lhs, iw.bytes); return }
-  // FRINTM / FRINTP / FRINTZ / FRINTA — floor, ceil, truncate,
-  // round-half-away-from-zero.
-  if (op == Op.FFloor) { emitFRound(cx, i, ins.lhs, iw.bytes, 10); return }
-  if (op == Op.FCeil) { emitFRound(cx, i, ins.lhs, iw.bytes, 9); return }
-  if (op == Op.FTrunc) { emitFRound(cx, i, ins.lhs, iw.bytes, 11); return }
-  if (op == Op.FRound) { emitFRound(cx, i, ins.lhs, iw.bytes, 12); return }
-  // The width always comes from the FLOAT side — the integer view of an f32 is
-  // 4 bytes wide whichever direction the transfer runs, and only one of the two
-  // types carries a float width to read.
-  if (op == Op.Bitcast) {
-    let dstIsFloat = iw.regClass == RegClass.Float
-    let bw = widthOf(cx.module.ctx, cx.f.instrs[ins.lhs].ty).bytes
-    if (dstIsFloat) { bw = iw.bytes }
-    emitBitcast(cx, i, ins.lhs, bw, dstIsFloat)
-    return
-  }
-  if (op == Op.Jump) {
-    emitBackEdgeSafepointIfNeeded(cx, curBlock, ins.ival)
-    moveBlockArgs(cx, ins.ival, ins.args)
-    emitJumpOrFallThrough(cx, curBlock, i, ins.ival)
-    return
-  }
-  if (op == Op.Br) {
-    let elseFixup = emitCondBranchOnBool(cx, i, ins.lhs)
-    emitBackEdgeSafepointIfNeeded(cx, curBlock, ins.ival)
-    moveBlockArgs(cx, ins.ival, ins.thenArgs)
-    emitJumpFixup(cx, ins.ival)
-    patchLocalCondBranch(cx, elseFixup)
-    emitBackEdgeSafepointIfNeeded(cx, curBlock, ins.ival2)
-    moveBlockArgs(cx, ins.ival2, ins.elseArgs)
-    emitJumpOrFallThrough(cx, curBlock, i, ins.ival2)
-    return
-  }
-  if (op == Op.Ret) {
-    // Multi-value returns are lowered to a boxed tuple before codegen, so at most
-    // one value reaches here.
-    assert(len(ins.args) <= 1)
-    if (len(ins.args) == 1) {
-      let v = ins.args[0]
-      if (regClassOf(cx.module.ctx, cx.f.instrs[v].ty) == RegClass.Int) {
-        movRR(cx.code, retRegNum(), getInt(cx, vregOf(cx, v), scratch1()))
-      } else {
-        fmovFF(cx.code, retRegNum(), getFloat(cx, vregOf(cx, v), fscratch1()), 8)
-      }
-    }
-    emitEpilogueAndRet(cx)
-    return
-  }
-  if (op == Op.Unreachable) { emitUdf(cx.code); return }
-  if (op == Op.Call) { emitCall(cx, dstOrNone(cx, i, ty), ty, ins.name, ins.args, true); return }
-  if (op == Op.CallValue) { emitCallValue(cx, dstOrNone(cx, i, ty), ty, ins.lhs, ins.args); return }
-  if (op == Op.CallIface) {
-    emitCallIface(cx, dstOrNone(cx, i, ty), ty, ins.lhs, ins.ival, ins.args)
-    return
-  }
-  if (op == Op.RtCall) {
-    emitCall(cx, dstOrNone(cx, i, ty), ty, rtSymbol(ins.name), ins.args, true)
-    return
-  }
-  if (op == Op.GcAlloc) { emitGcAlloc(cx, i, ins.ival, ins.offsets); return }
-  if (op == Op.TypeInfo) { emitTypeInfo(cx, i, ins.ival, ins.ival2, ins.offsets); return }
-  if (op == Op.FieldGet) {
-    emitFieldGet(cx, i, ins.lhs, ins.ival, ty,
-      cx.module.ctx.types[cx.f.instrs[ins.lhs].ty].kind == TypeKind.Slice)
-    return
-  }
-  if (op == Op.FieldSet) {
-    emitFieldSet(cx, ins.lhs, ins.ival, ins.rhs, cx.f.instrs[ins.rhs].ty)
-    return
-  }
-  if (op == Op.IndexGet) { emitIndexGet(cx, i, ins.lhs, ins.rhs, ty); return }
-  if (op == Op.IndexSet) {
-    // index_set keeps its VALUE operand in ival (rhs is the index).
-    emitIndexSet(cx, ins.lhs, ins.rhs, ins.ival, cx.f.instrs[ins.ival].ty)
-    return
-  }
-  if (op == Op.SliceLen) { emitSliceLen(cx, i, ins.lhs); return }
-  if (op == Op.AtomicLoad) { emitAtomicLoad(cx, i, ins.lhs, ty); return }
-  if (op == Op.AtomicStore) {
-    emitAtomicStore(cx, ins.lhs, ins.rhs, cx.f.instrs[ins.rhs].ty)
-    return
-  }
-  if (op == Op.AtomicCmpxchg) {
-    emitAtomicCmpxchg(cx, i, ins.lhs, ins.rhs, ins.ival)
-    return
-  }
-  if (opIsAtomicRmw(op)) {
-    emitAtomicRmw(cx, op, i, ins.lhs, ins.rhs, ty)
-    return
-  }
-  if (op == Op.MakeClosure) { emitMakeClosure(cx, i, ins.name, ins.lhs); return }
-  if (op == Op.FuncAddr) { emitFuncAddr(cx, i, ins.name); return }
-  if (op == Op.GlobalAddr) { emitGlobalAddr(cx, i, ins.name); return }
-  if (op == Op.StackMapsAddr) { emitStackMapsAddr(cx, i, ins.name); return }
-  if (op == Op.Syscall) {
-    emitSyscall(cx, i, ins.lhs, ins.args)
-    return
-  }
-  if (op == Op.Asm) {
-    emitAsm(cx, dstOrNone(cx, i, ty), ins.ival, ins.args)
-    return
-  }
-  // block_param is never reached: every emission loop starts past a block's
-  // params.
-  assert(op != Op.BlockParam)
-  assert(false) // unhandled op
-}
-
-// A void-typed instruction has no result to bind; -1 says so.
-// emitAsm/emitSyscall moved to arm64asm.bit (#3283, pure move — line budget).
-
-// Every arm64 register pinned by an `asm` block (`input`/`result`/clobber) or by
-// a `syscall` in `f`, indexed by register number 0..31. The `memory` sentinel
-// (254) falls outside the array and is skipped; `sp`/`xzr` (31) is never
-// allocatable anyway.
-fn collectReservedArm64(module: IrModule, f: IrFunc): []bool {
-  let reserved = []bool(32)
-  let i = 0
-  while (i < len(f.instrs)) {
-    let ins = f.instrs[i]
-    // §11.8: x8 holds the syscall number, x0..x5 the arguments, x0 the kernel's
-    // return value. `svc` is a trap, not a `bl` — the Linux arm64 kernel ABI
-    // preserves every other register, so unlike x64 there is nothing more to
-    // exclude.
-    if (ins.op == Op.Syscall) {
-      reserved[syscallNrReg()] = true
-      let regs = syscallArgRegs()
-      let k = 0
-      while (k < len(regs)) {
-        reserved[regs[k]] = true
-        k = k + 1
-      }
-    }
-    if (ins.op == Op.Asm) {
-      let blk = module.asmBlocks[ins.ival]
-      if (blk.hasResult && blk.resultArm64 < 32) {
-        reserved[blk.resultArm64] = true
-      }
-      let j = 0
-      while (j < len(blk.inArm64)) {
-        if (blk.inArm64[j] < 32) {
-          reserved[blk.inArm64[j]] = true
-        }
-        j = j + 1
-      }
-      j = 0
-      while (j < len(blk.clobArm64)) {
-        if (blk.clobArm64[j] < 32) {
-          reserved[blk.clobArm64[j]] = true
-        }
-        j = j + 1
-      }
-    }
-    i = i + 1
-  }
-  return reserved
-}
-
-fn dstOrNone(cx: A64Ctx, i: int, ty: int): int {
-  if (ty == cx.module.ctx.voidId) {
-    return -1
-  }
-  return i
-}
-
-fn isIcmp(op: Op): bool {
-  return op == Op.ICmpEq || op == Op.ICmpNe || op == Op.ICmpSlt || op == Op.ICmpSle ||
-    op == Op.ICmpSgt || op == Op.ICmpSge || op == Op.ICmpUlt || op == Op.ICmpUle ||
-    op == Op.ICmpUgt || op == Op.ICmpUge
-}
-
-fn isFcmp(op: Op): bool {
-  return op == Op.FCmpEq || op == Op.FCmpNe || op == Op.FCmpLt || op == Op.FCmpLe ||
-    op == Op.FCmpGt || op == Op.FCmpGe
-}
+// Self-host Stage 3 (#1342): ARM64 top-level per-function driver — register
+// allocation, frame layout, emission — split out of arm64.bit (#1503).
+// Sibling .bit file, same module: see arm64.bit for the backend overview.
+// compiler/arm64dispatch.bit (#3915, sibling split) holds compileInst's
+// per-op dispatch and collectReservedArm64.
 
 // ===========================================================================
 // Top-level: register allocation, frame layout, emission
@@ -422,6 +68,49 @@ fn hasDivZeroGuard(ctx: TypeContext, f: IrFunc): bool {
     i = i + 1
   }
   return false
+}
+
+// #3915: does `f` contain an `asm` block (§11.6) whose arm64 clobber list
+// names x30 (register 30, the link register)? `blr`/`bl` inside an asm
+// payload IS a call, but Op.Asm is deliberately absent from isSafepointOp
+// (codegenlive.bit) — widening it would force every one- or two-instruction
+// atomic/syscall asm block in the tree onto the callee-saved file for no
+// reason (most clobber nothing beyond what they already declare). Declaring
+// `clobber arm64 { x30 }` is the one signal the language actually gives an
+// author for "this block destroys the return address": SPEC.md:1160 only
+// promises the register is excluded from the allocator, which does nothing
+// for x30 in a leaf, since x30 there is never allocated in the first place —
+// it's the incoming return address, not a vreg location. So frame layout
+// keys off the declared clobber directly rather than the (silently
+// ineffective) exclusion.
+fn hasAsmLrClobber(module: IrModule, f: IrFunc): bool {
+  let i = 0
+  while (i < len(f.instrs)) {
+    let ins = f.instrs[i]
+    if (ins.op == Op.Asm) {
+      let blk = module.asmBlocks[ins.ival]
+      let j = 0
+      while (j < len(blk.clobArm64)) {
+        if (blk.clobArm64[j] == 30) {
+          return true
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// #3915 (revisits #3284): a call this backend emits or admits that
+// `hasSafepoints` does not see, and that must still force a real frame
+// record for x30 (or, for hasDivZeroGuard, for the stack space §18.6's
+// panic walker needs) to survive. Two instances today — the div-zero panic
+// guard and an asm block's declared link-register clobber. A third instance
+// extends this function; `frameless` below stays a fixed-shape expression
+// instead of growing another `&&` operand per instance.
+fn hasHiddenCallHazard(module: IrModule, ctx: TypeContext, f: IrFunc): bool {
+  return hasDivZeroGuard(ctx, f) || hasAsmLrClobber(module, f)
 }
 
 // One compiled function: its machine code plus everything an object writer needs
@@ -585,30 +274,39 @@ fn compileFunction(module: IrModule, f: IrFunc, debug: bool): FuncCode {
   let outgoingBytes = outgoingSlots * 8
 
   // #2929: elide the frame entirely when this function provably needs none.
-  // `!hasSafepoints` is exactly "makes no call and closes no loop back-edge"
-  // (isSafepointOp/buildIntervals above), so x30 is live across nothing; the
-  // other three conditions cover the callee-saved/spill/outgoing-argument space
-  // a frame record would otherwise exist to address. The standard fourth
-  // condition, "takes no address of a local", is vacuous here — Bit has no
-  // address-of operator (spec/SPEC.md §13) — so nothing ever needs this
-  // function's frame to be stable.
+  // `!hasSafepoints` alone is NOT "x30 is live across nothing" — an `asm`
+  // block's `blr`/`bl` is a real call that `isSafepointOp` deliberately does
+  // not count (see hasHiddenCallHazard below and #3915) — so `hasSafepoints`
+  // only covers "makes no Op.Call/RtCall/GcAlloc/MakeClosure/CallValue/
+  // CallIface and closes no loop back-edge" (isSafepointOp/buildIntervals
+  // above); the remaining call-shaped hazards are `hiddenCallHazard`, below.
+  // The other three conditions cover the callee-saved/spill/outgoing-argument
+  // space a frame record would otherwise exist to address. The standard
+  // fourth condition, "takes no address of a local", is vacuous here — Bit
+  // has no address-of operator (spec/SPEC.md §13) — so nothing else ever
+  // needs this function's frame to be stable.
   //
-  // #3284 (revisits #2929): one call this backend emits is NOT in
-  // `hasSafepoints` and used to be let through anyway — emitDivInt's inline
-  // `bl bit_rt_panic_div_zero` guard (#2016), reachable from a bare SDiv/UDiv/
-  // SRem/URem with no other call in the function. That was sound only as long
-  // as "this backend's panic path never walks a frame chain at all"
-  // (runtime/root/darwin/io.bit's `bit_rt_panic` doc comment) stayed true;
-  // spec/SPEC.md §18.6 commits to a runtime stack walker (#3285) that makes it
-  // false, so a div-zero panic inside an otherwise-frameless leaf must now
-  // establish a real frame record for that walker to find — `hasDivZeroGuard`
-  // (above) covers exactly this gap. A safepoint-bearing function
-  // (CallValue/CallIface's own nil-check panics) never needed this: those ops
-  // are already in `hasSafepoints`, which already excludes it from `frameless`
-  // — hasSafepoints is reused for that half and is NOT reused for div/rem,
-  // because it does not cover div/rem.
-  let panicReachable = hasDivZeroGuard(ctx, f)
-  let frameless = !f.isNaked && !hasSafepoints && !panicReachable &&
+  // #3284 (revisits #2929), extended by #3915: calls this backend emits or
+  // admits that are NOT in `hasSafepoints` and used to be let through
+  // anyway — emitDivInt's inline `bl bit_rt_panic_div_zero` guard (#2016),
+  // reachable from a bare SDiv/UDiv/SRem/URem with no other call in the
+  // function, and an `asm` block whose payload issues a `blr`/`bl` and
+  // declares as much via `clobber arm64 { x30 }`. The div-zero case was sound
+  // only as long as "this backend's panic path never walks a frame chain at
+  // all" (runtime/root/darwin/io.bit's `bit_rt_panic` doc comment) stayed
+  // true; spec/SPEC.md §18.6 commits to a runtime stack walker (#3285) that
+  // makes it false, so a div-zero panic inside an otherwise-frameless leaf
+  // must now establish a real frame record for that walker to find. The asm
+  // case needs a frame for a more direct reason: without one, `blr` destroys
+  // x30 and the bare `ret` returns into the middle of the function.
+  // `hasHiddenCallHazard` (above) covers both. A safepoint-bearing function
+  // (CallValue/CallIface's own nil-check panics, or an asm block whose
+  // callee-saved-only exclusion already forced one) never needed this: those
+  // are already in `hasSafepoints`, which already excludes it from
+  // `frameless` — hasSafepoints is reused for that half and is NOT reused
+  // here, because it does not cover div/rem or a bare asm `blr`.
+  let hiddenCallHazard = hasHiddenCallHazard(module, ctx, f)
+  let frameless = !f.isNaked && !hasSafepoints && !hiddenCallHazard &&
     result.numSpillSlots == 0 && len(savedGpr) == 0 && len(savedFpr) == 0 && outgoingBytes == 0
 
   let frameSize = 0
