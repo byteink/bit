@@ -1,0 +1,133 @@
+// ARM64 branch emission peepholes (#3843), split out of arm64compile.bit and
+// arm64select.bit so each has room for the reasoning that makes it safe.
+// Sibling .bit file, same module: see arm64.bit for the backend overview.
+//
+// Nothing here is shared with the x86-64 backend on purpose. That backend
+// reorders its blocks into RPO (see codegen.bit's note on debug-line rows),
+// so "the next block in emission order" is a different question there and the
+// answer this file relies on does not carry over.
+
+// ===========================================================================
+// #3843: a compare that feeds a `br` branches on its own flags
+// ===========================================================================
+//
+// Lowering emits every comparison as a value, so `if (a != b)` costs four
+// instructions where two do:
+//
+//     cmp   x0, x1        <- sets NZCV
+//     cset  x2, ne        <- materializes the boolean
+//     cmp   x2, xzr       <- tests the boolean, discarding the first result
+//     b.eq  <else>
+//
+// The `cset`/`cmp` pair is pure round-tripping: `b.ne`'s own condition is
+// already decided by the first `cmp`. Fusing them leaves `cmp x0, x1` +
+// `b.eq <else>`, which is what `clang -O2` emits.
+//
+// Two conditions make the fusion exact, and BOTH are required:
+//
+//   1. The boolean has exactly one use and that use is the branch's
+//      condition. A boolean that is also stored, returned, passed as a call
+//      or block argument, or read by a second branch is a real value and
+//      still needs its `cset`. Use counts come from `instrOperands`
+//      (opt.bit) — the SAME operand map DCE uses, and the one
+//      `computeSkipConstMaterialize` already relies on for #1853 — so a use
+//      this file forgot to think about is still counted. Note `Op.Br`'s own
+//      entry there is `[lhs] ++ thenArgs ++ elseArgs`: a condition that is
+//      ALSO passed along one of its own edges counts twice and is refused.
+//
+//   2. NZCV is still live at the branch. The compare must be the instruction
+//      immediately before the `br` IN THE SAME BLOCK, so nothing can be
+//      emitted between the two. Adjacency in the instruction array is not
+//      enough by itself: a `br` that is the only instruction of its own block
+//      is adjacent to the last instruction of the PREVIOUS block, and that
+//      block is not the only way in — a different predecessor would reach the
+//      branch with arbitrary flags. `computeFuseCmpBranch` walks per block so
+//      a cross-block pair can never be formed.
+//
+// Emission-order adjacency then follows from IR adjacency: the fused
+// `emitIcmp`/`emitFcmp` path (arm64select.bit) ends with the flag-setting
+// `cmp`/`fcmp` itself, and `emitCondBranchOnBool` below starts with the
+// conditional branch. Both operand fetches happen before the compare, and
+// neither the destination binding nor the spill store the unfused path ends
+// with is emitted at all.
+
+// Marks each icmp/fcmp whose only consumer is the `br` immediately after it
+// in the same block. Indexed by instruction id, like `skipConst`.
+fn computeFuseCmpBranch(f: IrFunc): []bool {
+  let n = len(f.instrs)
+  let useCount = []int(n)
+  let i = 0
+  while (i < n) {
+    for u of instrOperands(f, i) {
+      useCount[u] = useCount[u] + 1
+    }
+    i = i + 1
+  }
+  let fuse = []bool(n)
+  let bi = 0
+  while (bi < len(f.blocks)) {
+    let b = f.blocks[bi]
+    let idx = b.instsStart + b.paramCount + 1
+    while (idx < b.instsStart + b.instsLen) {
+      let ins = f.instrs[idx]
+      if (ins.op == Op.Br &&
+        ins.lhs == idx - 1 &&
+        useCount[idx - 1] == 1 &&
+        (isIcmp(f.instrs[idx - 1].op) || isFcmp(f.instrs[idx - 1].op))) {
+        fuse[idx - 1] = true
+      }
+      idx = idx + 1
+    }
+    bi = bi + 1
+  }
+  return fuse
+}
+
+// The condition `br` must branch on to take its ELSE edge, given the compare
+// `cmpIdx` that set the flags. The unfused sequence tests the materialized
+// boolean against zero and takes the else edge when it is 0, so the fused
+// form takes it on the complement of the compare's own condition.
+//
+// `condInvert` is the flag-level complement (it flips the low bit of the
+// condition field, which is how AArch64 pairs EQ/NE, MI/PL, HI/LS, ...), not
+// a negation of the source-level predicate. That distinction is what makes
+// this correct for floats: `fcmp` sets NZCV so that an unordered (NaN)
+// compare answers false for LT via MI, and PL is true on exactly the NZCV
+// states MI is false on — NaN included. Negating the PREDICATE instead
+// (LT -> GE) would be wrong there, and is not what happens here.
+fn fusedElseCond(f: IrFunc, cmpIdx: int): int {
+  let op = f.instrs[cmpIdx].op
+  if (isIcmp(op)) {
+    return condInvert(icmpCond(op))
+  }
+  assert(isFcmp(op))
+  return condInvert(fcmpCond(op))
+}
+
+// Emits `br`'s branch to its else edge and returns the fixup to patch once
+// the else code's offset is known. `cond` is the boolean operand and `i` the
+// `br`'s own instruction id.
+fn emitCondBranchOnBool(cx: A64Ctx, i: int, cond: int): int {
+  if (cond == i - 1 && cx.fuseCmp[cond]) {
+    return emitLocalCondBranch(cx, fusedElseCond(cx.f, cond))
+  }
+  cmpZero(cx.code, getInt(cx, vregOf(cx, cond), scratch1()))
+  return emitLocalCondBranch(cx, condEq())
+}
+
+// Does instruction `i` bind a physical register of its own?
+//
+// A fused compare's whole result is NZCV, so it defines no register and must
+// not keep one alive — the same reasoning `arm64WritesResult` already applies
+// to a `const_int` folded into an immediate. Kept as a wrapper rather than
+// one more clause inside `arm64WritesResult`, which is already at this repo's
+// E0204 complexity ceiling (spec/LINT.md).
+fn arm64DefinesRegister(
+  ctx: TypeContext, f: IrFunc, skipConst: []bool,
+  fuseCmp: []bool, i: int,
+): bool {
+  if (fuseCmp[i]) {
+    return false
+  }
+  return arm64WritesResult(ctx, f, skipConst, i)
+}
