@@ -318,6 +318,114 @@ explainMismatch() {
         print "3898-ptr-scale-shift-fold"
         exit 0
       }
+
+      # --- #3862: inline slice elements (all-scalar class, `[]T` packed) ---
+      #
+      # `emitInlineSliceElem` (compiler/lowersliceinline.bit) replaces THREE
+      # old shapes with an inline bounds-check + address computation, once
+      # `sliceElemSizeFor` returns the class T size (>8) instead of the
+      # word stride 8:
+      #
+      #   rt_call slice_get(...)         a for-of-style whole-element READ
+      #   rt_call slice_set(...)         a composite-literal element WRITE
+      #   index_get %ptr[%adjIdx] T      a direct `xs[i]` handle load -- the
+      #                                  OLD boxed lowering already emitted a
+      #                                  bounds check ahead of this one, so
+      #                                  replacing it adds no prologue.
+      #
+      # `append` additionally re-locates its growth target via `slice_len - 1`
+      # (a `sub` this identity uses nowhere else, so it is read DIRECTLY, not
+      # derived like the other three):
+      #
+      #   Ng  = -delta(rt_call:slice_get)   reads inlined            (>= 0)
+      #   Nsl = -delta(rt_call:slice_set)   literal-population writes(>= 0)
+      #   Na  = delta(sub)                  append growths reindexed(>= 0)
+      #   Np  = -delta(index_get)           already-checked handle loads (>=0)
+      #   B   = Ng + Nsl + Na   -- sites gaining a FRESH bounds-check prologue;
+      #         Np sites already had one, so they add no prologue, only the
+      #         address-computation tail (mul by stride instead of an implicit
+      #         word-indexed load).
+      #
+      # Derived empirically from EVERY file that diverges on EITHER dump kind
+      # (4 files, both kinds checked -- #3843 already proved these 4 are the
+      # WHOLE diverging set against the pinned oracle):
+      # _tests_/cases/check_composite_order.bit (Ng=0 Nsl=2 Na=0 Np=0),
+      # _tests_/cases/run_slice_inline_basic.bit (Ng=2 Nsl=1 Na=4 Np=8),
+      # _tests_/imports/selfhostlex/main.bit (Ng=1 Nsl=0 Na=4 Np=0),
+      # stdlib/quic/frames.bit (Ng=1 Nsl=0 Na=1 Np=0). Every coefficient below
+      # is an independent equation and all 4 satisfy every one, on both kinds:
+      #
+      #   delta(slice_len)  = B + Na   (an append re-locate needs a SECOND
+      #                                 slice_len beyond the one the prologue itself uses)
+      #   delta(icmp_ult) = delta(br) = delta(const_string) =
+      #     delta(rt_call:panic) = delta(unreachable) = B
+      #   delta(field_get)  = 2*B      (the address prologue ptr + start-
+      #                                 offset fields; per-FIELD value reads
+      #                                 are unchanged -- same field_get count
+      #                                 as the old boxed form, just off a
+      #                                 different base pointer)
+      #   delta(mul)        = B + Np   (the stride multiply; Np sites gain
+      #                                 this even though they gain no prologue)
+      #   delta(const_int)  = Nsl + 3*Na + Np
+      #                       Ng contributes ZERO: the old rt_call:slice_get
+      #                       own stride-constant argument is removed at the
+      #                       same rate the new mul stride constant is
+      #                       added. Nsl contributes 1 (new mul stride only --
+      #                       the old rt_call:slice_set stride arg was
+      #                       already shared/reused, not one-per-site). Na
+      #                       contributes 3: the mul stride, the append call
+      #                       new null value-pointer argument (there is no
+      #                       struct left to point at), and the literal `1` in
+      #                       `slice_len - 1`. Np contributes 1 (mul stride).
+      #   delta(sub)         = Na   (by definition -- this is how Na is read)
+      #   delta(gc_alloc)    = -(Nsl + Na)   (every packed element that no
+      #                                       longer needs its own heap box)
+      #   delta(rt_call:slice_get) = -Ng   delta(rt_call:slice_set) = -Nsl
+      #   delta(index_get)   = -Np
+      #   delta(add), PRE-OPT ONLY = 2*B + Np   (2 per prologue site: the
+      #                                 existing offset+index add is
+      #                                 unchanged, this is the NEW base+scaled
+      #                                 add, plus a second one Np sites also
+      #                                 gain; 1 per Np site, which only gains
+      #                                 the base+scaled add.)
+      #
+      # POST-OPT: every equation above holds UNCHANGED except `add`, which
+      # DCE can shrink by folding an `add x, 0` identity when a written index
+      # is the literal 0 (observed: -1 of the predicted total on 2 of the 4
+      # files, 0 on the other 2 -- not a fixed multiple of B, Na, or Np, so
+      # `add` is left with UNCONSTRAINED magnitude for iropt only, the same
+      # allowance the #3107 post-opt arm makes for call/call_value/sub above).
+      Ng2 = -delta["rt_call:slice_get"]
+      Nsl2 = -delta["rt_call:slice_set"]
+      Na2 = delta["sub"] + 0
+      Np2 = -delta["index_get"]
+      B2 = Ng2 + Nsl2 + Na2
+      okSlice = (Ng2 >= 0 && Nsl2 >= 0 && Na2 >= 0 && Np2 >= 0 && (B2 + Np2) > 0)
+      if (delta["slice_len"] != B2 + Na2)              okSlice = 0
+      if (delta["icmp_ult"] != B2)                     okSlice = 0
+      if (delta["br"] != B2)                           okSlice = 0
+      if (delta["const_string"] != B2)                 okSlice = 0
+      if (delta["rt_call:panic"] != B2)                okSlice = 0
+      if (delta["unreachable"] != B2)                  okSlice = 0
+      if (delta["field_get"] != 2 * B2)                okSlice = 0
+      if (delta["mul"] != B2 + Np2)                    okSlice = 0
+      if (delta["const_int"] != Nsl2 + 3 * Na2 + Np2)  okSlice = 0
+      if (delta["gc_alloc"] != -(Nsl2 + Na2))          okSlice = 0
+      if (kind == "ir") {
+        if (delta["add"] != 2 * B2 + Np2)              okSlice = 0
+      }
+      split("slice_get slice_set gc_alloc slice_len icmp_ult br const_string panic unreachable field_get add mul sub const_int index_get", silist, " ")
+      for (i in silist) sicore[silist[i]] = 1
+      for (op in moved) {
+        opname = op
+        sub(/^rt_call:/, "", opname)
+        if (!(opname in sicore)) okSlice = 0
+      }
+      if (okSlice) {
+        print "3862-slice-inline-elements"
+        exit 0
+      }
+
       exit 1
     }
   ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
@@ -472,6 +580,153 @@ index_set %0[%7] = %v'
   rct=$?
   if [ "$rct" -eq 0 ] || [ -n "$sigt" ]; then
     echo "FAIL: a #3898 delta carrying an unrelated op was wrongly explained (rc=$rct sig='$sigt')"
+    fail=1
+  fi
+
+  # --- #3862: inline slice elements, both dump kinds (#3907) ---
+  #
+  # Minimal Ng=1 instance (a for-of-style whole-element READ inlined): one
+  # `rt_call slice_get` replaced by a bounds check + address computation.
+  oracle_si_read='%1 = const_int i64 8
+%2 = rt_call slice_get(%0, %i, %1) T
+%3 = field_get %2[0] i64'
+  bit2_si_read='%1 = slice_len %0
+%2 = icmp_ult bool %i, %1
+br %2, bb1, bb2
+%3 = const_string "index out of range"
+%4 = rt_call panic(%3) void
+unreachable
+%5 = field_get %0[0] i64
+%6 = field_get %0[16] i64
+%7 = add i64 %6, %i
+%8 = const_int i64 16
+%9 = mul i64 %7, %8
+%10 = add i64 %5, %9
+%11 = field_get %10[0] i64'
+
+  sigsi=$(explainMismatch "$oracle_si_read" "$bit2_si_read" ir)
+  rcsi=$?
+  if [ "$rcsi" -ne 0 ] || [ "$sigsi" != "3862-slice-inline-elements" ]; then
+    echo "FAIL: a #3862-shaped Ng read delta was not explained (rc=$rcsi sig='$sigsi')"
+    fail=1
+  fi
+
+  # Minimal Na=1 instance (an `append` growth reindexed via `slice_len - 1`),
+  # pinning the `sub`-derived Na and its 3-per-site const_int contribution
+  # (stride, the null value-pointer arg, and the literal `1`).
+  oracle_si_append='%1 = const_int i64 1
+%2 = const_int i64 8
+%3 = gc_alloc size=16 ptrs=[] T
+%4 = const_int i64 42
+field_set %3[0] = %4
+%6 = rt_call slice_append(%0, %3, %1, %2) []T'
+  bit2_si_append='%1 = const_int i64 0
+%2 = const_int i64 16
+%3 = const_int i64 0
+%4 = rt_call slice_append(%0, %3, %1, %2) []T
+%5 = slice_len %4
+%6 = const_int i64 1
+%7 = sub i64 %5, %6
+%8 = slice_len %4
+%9 = icmp_ult bool %7, %8
+br %9, bb1, bb2
+%11 = const_string "index out of range"
+%12 = rt_call panic(%11) void
+unreachable
+%14 = field_get %4[0] i64
+%15 = field_get %4[16] i64
+%16 = add i64 %15, %7
+%17 = const_int i64 16
+%18 = mul i64 %16, %17
+%19 = add i64 %14, %18
+%20 = const_int i64 42
+field_set %19[0] = %20'
+
+  sigsa=$(explainMismatch "$oracle_si_append" "$bit2_si_append" ir)
+  rcsa=$?
+  if [ "$rcsa" -ne 0 ] || [ "$sigsa" != "3862-slice-inline-elements" ]; then
+    echo "FAIL: a #3862-shaped Na append delta was not explained (rc=$rcsa sig='$sigsa')"
+    fail=1
+  fi
+
+  # Post-opt: DCE folds one `add x, 0` identity (observed on real corpus
+  # files whose written index is a literal 0), so `add` must be accepted
+  # with ONE FEWER occurrence than the pre-opt identity requires — but ONLY
+  # under `iropt`. The same text scored as `ir` must be REJECTED, exactly
+  # the cross-kind check #3898's post-opt arm already makes.
+  bit2_si_read_opt='%1 = slice_len %0
+%2 = icmp_ult bool %i, %1
+br %2, bb1, bb2
+%3 = const_string "index out of range"
+%4 = rt_call panic(%3) void
+unreachable
+%5 = field_get %0[0] i64
+%6 = field_get %0[16] i64
+%8 = const_int i64 16
+%9 = mul i64 %6, %8
+%10 = add i64 %5, %9
+%11 = field_get %10[0] i64'
+
+  sigso=$(explainMismatch "$oracle_si_read" "$bit2_si_read_opt" iropt)
+  rcso=$?
+  if [ "$rcso" -ne 0 ] || [ "$sigso" != "3862-slice-inline-elements" ]; then
+    echo "FAIL: a #3862-shaped post-opt (add-folded) delta was not explained (rc=$rcso sig='$sigso')"
+    fail=1
+  fi
+
+  sigso2=$(explainMismatch "$oracle_si_read" "$bit2_si_read_opt" ir)
+  rcso2=$?
+  if [ "$rcso2" -eq 0 ] || [ -n "$sigso2" ]; then
+    echo "FAIL: a post-opt-folded #3862 delta was wrongly explained as pre-opt (rc=$rcso2 sig='$sigso2')"
+    fail=1
+  fi
+
+  # REJECTION 1: the bounds check dropped (the safety-relevant fold this
+  # signature exists to refuse to paper over) — same read, minus the
+  # const_string/panic/unreachable trio. `unreachable`'s delta then reads 0
+  # against a required B=1, so this must NOT be explained on either kind.
+  bit2_si_read_nocheck='%1 = slice_len %0
+%2 = icmp_ult bool %i, %1
+br %2, bb1, bb2
+%5 = field_get %0[0] i64
+%6 = field_get %0[16] i64
+%7 = add i64 %6, %i
+%8 = const_int i64 16
+%9 = mul i64 %7, %8
+%10 = add i64 %5, %9
+%11 = field_get %10[0] i64'
+
+  sigrc=$(explainMismatch "$oracle_si_read" "$bit2_si_read_nocheck" ir)
+  rcrc=$?
+  if [ "$rcrc" -eq 0 ] || [ -n "$sigrc" ]; then
+    echo "FAIL: a #3862 delta with its bounds check dropped was wrongly explained (rc=$rcrc sig='$sigrc')"
+    fail=1
+  fi
+
+  # REJECTION 2: an unrelated opcode moving alongside an otherwise-valid
+  # #3862 delta must still fail — a signature is an identity the WHOLE delta
+  # must satisfy, not a file allowed to differ elsewhere (same shape as the
+  # #3898 rejection above).
+  bit2_si_read_plus="$bit2_si_read
+%12 = call @somethingElse()"
+
+  sigrd=$(explainMismatch "$oracle_si_read" "$bit2_si_read_plus" ir)
+  rcrd=$?
+  if [ "$rcrd" -eq 0 ] || [ -n "$sigrd" ]; then
+    echo "FAIL: a #3862 delta carrying an unrelated op was wrongly explained (rc=$rcrd sig='$sigrd')"
+    fail=1
+  fi
+
+  # REJECTION 3: an extra, unaccounted field_get — the shape of a fold that
+  # reads one field too many. field_get must be exactly 2*B; a third read
+  # breaks the count even though field_get is already a declared opcode.
+  bit2_si_read_extraread="$bit2_si_read
+%12 = field_get %10[8] i64"
+
+  sigre=$(explainMismatch "$oracle_si_read" "$bit2_si_read_extraread" ir)
+  rcre=$?
+  if [ "$rcre" -eq 0 ] || [ -n "$sigre" ]; then
+    echo "FAIL: a #3862 delta with a spurious extra field_get was wrongly explained (rc=$rcre sig='$sigre')"
     fail=1
   fi
 
