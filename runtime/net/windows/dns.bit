@@ -1,0 +1,254 @@
+// Windows DNS resolution for the Stage-2 port of runtime/net/ (#3589, epic
+// #3322). Split out of ./sock.bit, mirroring ../darwin/dns.bit's own split;
+// same module, so the constants, buffers and helpers there (and in
+// ./sock.bit, ./udp.bit) are in scope unchanged.
+//
+// TWO HALVES, AND ONLY ONE OF THEM IS NEW. `netDnsSocket`/`netResolveHost`
+// below are the identical shape as ../linux/udp.bit's and
+// ../darwin/dns.bit's own twins: a blocking UDP socket with a receive
+// timeout, speaking ../../net's already platform-free DNS wire codec
+// (`netBuildQuery`/`netParseAnswer`) to a nameserver passed in as a
+// parameter. NONE of that is touched or reimplemented here.
+//
+// `nameserverFromAdapters` is what is actually new (#3589's whole point):
+// Windows has no `/etc/resolv.conf` for ../linux/netabi.bit's
+// `readResolvConf` + ../../net's `netFirstNameserver` to read. The
+// equivalent is `GetAdaptersAddresses` (iphlpapi.dll) -- a linked list of
+// Windows-specific structures, not a text file, so this is genuinely new
+// provider code rather than a file-read swap.
+
+import {
+  netDnsId, netBuildQuery, netParseAnswer, netMaxDnsMsg,
+  netDnsTimeoutMs, netDnsRetries, dnsBytes, getU64Le, netSockAddrOctets,
+} from "../../net"
+
+// ---------------------------------------------------------------------------
+// The DNS socket and resolver (unchanged shape from ../darwin/dns.bit)
+// ---------------------------------------------------------------------------
+
+// SOL_SOCKET/SO_RCVTIMEO (winsock2.h). WINDOWS-SPECIFIC SHAPE: `optval` is a
+// raw DWORD of MILLISECONDS here, NOT a `struct timeval` -- the BSD shape
+// ../linux and ../darwin's `class timeval`/`tvBytes` machinery builds.
+// Getting this wrong does not fail to compile or fail loudly: it reads a
+// timeval-shaped buffer's first four bytes as a millisecond count, which for
+// this file's `netDnsTimeoutMs` (a small number of milliseconds, written as
+// the timeval's SECONDS field by mistake) would silently install a timeout
+// of a few milliseconds instead of a few seconds -- so the value is written
+// with `putU32Le` directly, never through `tvBytes()`.
+@nosplit fn soRcvTimeo(): int { return 0x1006 }
+
+// WSAETIMEDOUT (winerror.h) -- what a BLOCKING socket's SO_RCVTIMEO
+// expiring actually reports on Windows. `wsaEwouldblock` (../udp.bit) is
+// the NON-blocking-socket "try again" error and does not apply to this
+// socket, which is never put into non-blocking mode; both are accepted
+// below purely as defence in depth.
+@nosplit fn wsaEtimedout(): int { return 10060 }
+
+// A BLOCKING socket with SO_RCVTIMEO, matching ../darwin/dns.bit's own
+// rationale exactly: DNS is an occasional millisecond cost, so a bounded
+// receive timeout buys a real error on packet loss without putting
+// timer-driven wakes on the poller. Blocks the calling worker for up to
+// `netDnsTimeoutMs` on a lost packet.
+export @symbol("bit_rt_port_net_dns_socket") @nosplit fn netDnsSocket(): int {
+  let fd = wsaRc(int(socket(i32(afInet()), i32(sockDgram()), i32(ipprotoUdp()))))
+  if (fd < 0) {
+    return 0 - 1
+  }
+  putU32Le(optBytes(), 0, netDnsTimeoutMs)
+  if (wsaRc(int(setsockopt(i64(fd), i32(solSocket()), i32(soRcvTimeo()),
+                           optBytes(), i32(4)))) < 0) {
+    netClose(fd)
+    return 0 - 1
+  }
+  return fd
+}
+
+// Resolve `host` to an IPv4 address, written to `out`. A dotted quad passes
+// straight through; a hostname is queried against the nameserver at
+// `ns[0..4]`.
+//
+// THE NAMESERVER IS A PARAMETER RATHER THAN DISCOVERED HERE, matching
+// ../linux/udp.bit's and ../darwin/dns.bit's identical contract: discovery
+// is a platform call (`nameserverFromAdapters`, below), kept out of this
+// function so it can be pointed at an in-process fake nameserver for
+// testing without depending on the real network.
+export @symbol("bit_rt_port_net_resolve") @nosplit fn netResolveHost(host: *u8, hostLen: int, ns: *u8, out: *u8): bool {
+  if (netParseIpv4(host, hostLen, out)) {
+    return true
+  }
+  let query = dnsBytes()
+  let qlen = netBuildQuery(query, netMaxDnsMsg, host, hostLen, netDnsId)
+  if (qlen < 0) {
+    return false
+  }
+  let fd = netDnsSocket()
+  if (fd < 0) {
+    return false
+  }
+  let reply = dnsBytes() + netMaxDnsMsg
+  let attempt = 0
+  // Bounded retransmits (Power of 10): a lost query is retried a fixed
+  // number of times and then reported, never waited on forever.
+  while (attempt < netDnsRetries) {
+    netFillSockAddr(saBytes2(), ns, 53)
+    if (wsaRc(int(sendto(i64(fd), query, i32(qlen), i32(0), saBytes2(), i32(saLen)))) < 0) {
+      attempt = attempt + 1
+    } else {
+      let noneAddr: *u8 = nil
+      let noneLen: *i32 = nil
+      let got = wsaRc(int(recvfrom(i64(fd), reply, i32(netMaxDnsMsg), i32(0), noneAddr, noneLen)))
+      if (got < 0) {
+        // Timed out: retransmit. Anything else is fatal.
+        let e = lastErr()
+        if (e != wsaEtimedout() && e != wsaEwouldblock()) {
+          netClose(fd)
+          return false
+        }
+        attempt = attempt + 1
+      } else {
+        if (netParseAnswer(reply, got, netDnsId, out)) {
+          netClose(fd)
+          return true
+        }
+        // Malformed, or an answer with no A record: retry.
+        attempt = attempt + 1
+      }
+    }
+  }
+  netClose(fd)
+  return false
+}
+
+// ---------------------------------------------------------------------------
+// Nameserver discovery (#3589) -- the genuinely new half. Windows has no
+// /etc/resolv.conf; the equivalent is GetAdaptersAddresses (iphlpapi.dll),
+// admitted as a FIFTH DLL alongside kernel32/bcrypt/kernelbase/ws2_32
+// (compiler/pesyms.bit).
+//
+// GetAdaptersAddresses OVER THE OLDER GetNetworkParams: Microsoft's own
+// reference for GetNetworkParams documents it as returning at most one
+// machine-wide primary/secondary DNS server with no per-adapter context, so
+// it "may not return the correct value" on a machine with more than one
+// adapter. GetAdaptersAddresses returns every adapter's own configured
+// server list AND its OperStatus, which is what lets this function skip a
+// disabled/disconnected adapter's stale configuration -- GetNetworkParams
+// has no such signal at all.
+// ---------------------------------------------------------------------------
+
+// GetAdaptersAddresses(family, flags, reserved, addresses, sizePointer) ->
+// ULONG (0 == ERROR_SUCCESS, 111 == ERROR_BUFFER_OVERFLOW). iphlpapi.dll.
+extern fn GetAdaptersAddresses(family: i32, flags: i32, reserved: *byte, addresses: *byte, sizePointer: *i32): i32
+
+@nosplit fn afUnspec(): i32 { return i32(0) }
+
+// GAA_FLAG_SKIP_UNICAST | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST
+// (iptypes.h): this call only ever reads FirstDnsServerAddress, so every
+// other linked list GetAdaptersAddresses would otherwise populate is
+// skipped -- less work for the OS, and one fewer list this file has no use
+// for and therefore does not need to walk correctly.
+@nosplit fn gaaSkipFlags(): i32 { return i32(0x0007) }
+
+const errorBufferOverflow: int = 111
+
+// IP_ADAPTER_ADDRESSES field offsets on x64 (iptypes.h): an 8-byte union at
+// offset 0 (ULONG Length + IF_INDEX IfIndex, sized to match the struct's own
+// `ULONGLONG Alignment` union member), then five pointers in declaration
+// order (Next, AdapterName, FirstUnicastAddress, FirstAnycastAddress,
+// FirstMulticastAddress) before FirstDnsServerAddress; OperStatus follows
+// DnsSuffix/Description/FriendlyName (pointers), PhysicalAddress[8],
+// PhysicalAddressLength, Flags, Mtu and IfType (four more ULONGs).
+const iaaNextOff: int = 8
+const iaaFirstDnsServerOff: int = 48
+const iaaOperStatusOff: int = 104
+
+// IF_OPER_STATUS (ifdef.h): IfOperStatusUp. Only an adapter reporting this
+// is trusted for a nameserver -- a disabled/disconnected adapter can still
+// carry a stale DNS entry.
+const ifOperStatusUp: int = 1
+
+// IP_ADAPTER_DNS_SERVER_ADDRESS field offsets on x64 (iptypes.h): an 8-byte
+// union at offset 0 (ULONG Length + DWORD Reserved), Next (pointer) at
+// offset 8, then an inline SOCKET_ADDRESS (LPSOCKADDR lpSockaddr at offset
+// 16; INT iSockaddrLength at offset 24, unused here -- the family byte
+// inside the pointed-to sockaddr is what this file checks instead).
+const dnsAddrNextOff: int = 8
+const dnsAddrSockaddrPtrOff: int = 16
+
+// Bounded walks (Power of 10 rule 2): a corrupt or circular list cannot
+// hang this function, the same defensive-depth reasoning ../../net.bit's
+// `netSkipName` states for a wire format this runtime does not control.
+const maxAdaptersWalk: int = 256
+const maxDnsServersWalk: int = 64
+
+// Buffer sizing for the retry loop below (Power of 10 rule 3: bounded,
+// never grows without limit). 16 KiB is Microsoft's own documented starting
+// guess; 256 KiB is a hard ceiling far past any real adapter count.
+const gaaInitialWords: int = 2048
+const gaaMaxWords: int = 32768
+const gaaMaxAttempts: int = 3
+
+// The first IPv4 DNS server address configured on any UP adapter, written
+// to `out`. Returns false if the call fails or no adapter has one.
+fn nameserverFromAdapters(out: *u8): bool {
+  let words = gaaInitialWords
+  let attempt = 0
+  // Bounded (Power of 10): the adapter list can change between two calls
+  // (Microsoft's own documented reason ERROR_BUFFER_OVERFLOW can recur), so
+  // this retries with the OS-reported size rather than looping forever.
+  while (attempt < gaaMaxAttempts) {
+    let buf = []i64(words)
+    let bufPtr = int(ptrOf(buf))
+    let sizeBuf = []i64(1)
+    let sizeBytes = bytesAtI64(ptrOf(sizeBuf))
+    putU32Le(sizeBytes, 0, words * 8)
+    let rc = int(
+      GetAdaptersAddresses(
+        afUnspec(), gaaSkipFlags(), nilByte(),
+        bytesAt(bufPtr), i32PtrAt(int(ptrOf(sizeBuf))),
+      ),
+    )
+    if (rc == 0) {
+      return firstDnsIpv4(bufPtr, out)
+    }
+    if (rc != errorBufferOverflow) {
+      return false
+    }
+    let needed = getU32Le(sizeBytes, 0)
+    words = (needed + 7) / 8
+    if (words > gaaMaxWords) {
+      words = gaaMaxWords
+    }
+    attempt = attempt + 1
+  }
+  return false
+}
+
+// Walks the IP_ADAPTER_ADDRESSES list starting at `firstAdapter`, and for
+// each UP adapter its FirstDnsServerAddress list, returning the first IPv4
+// (AF_INET) server address found. GetAdaptersAddresses' DNS server list is
+// NOT filtered by the Family this file requests -- Microsoft's own
+// documented behaviour is that it can carry IPv6 entries even when only
+// IPv4 was asked for -- so every entry's own address family is checked
+// here rather than trusted from the call's `Family` argument.
+fn firstDnsIpv4(firstAdapter: int, out: *u8): bool {
+  let adapter = firstAdapter
+  let steps = 0
+  while (adapter != 0 && steps < maxAdaptersWalk) {
+    if (getU32Le(bytesAt(adapter), iaaOperStatusOff) == ifOperStatusUp) {
+      let dnsAddr = getU64Le(bytesAt(adapter), iaaFirstDnsServerOff)
+      let dsteps = 0
+      while (dnsAddr != 0 && dsteps < maxDnsServersWalk) {
+        let sa = getU64Le(bytesAt(dnsAddr), dnsAddrSockaddrPtrOff)
+        if (sa != 0 && netSockAddrFamily(bytesAt(sa)) == afInet()) {
+          netSockAddrOctets(bytesAt(sa), out)
+          return true
+        }
+        dnsAddr = getU64Le(bytesAt(dnsAddr), dnsAddrNextOff)
+        dsteps = dsteps + 1
+      }
+    }
+    adapter = getU64Le(bytesAt(adapter), iaaNextOff)
+    steps = steps + 1
+  }
+  return false
+}
