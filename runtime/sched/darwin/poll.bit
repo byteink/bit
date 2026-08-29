@@ -14,7 +14,7 @@
 
 import { taskAt, schedPollUnpark, scPollFd, pollRead } from "../../sched"
 import { schedPollTryEnter, schedPollLeave } from "../../sched"
-import { schedPollPendingInc, schedPollPendingDec } from "../../sched"
+import { schedPollPendingInc, schedPollPendingDec, schedPollPendingCount } from "../../sched"
 
 // int kqueue(void);
 // int kevent(int kq, const kevent *changelist, int nchanges,
@@ -236,6 +236,50 @@ export @symbol("bit_rt_port_sched_poll_register") fn pollRegister(pollFd: int, f
   return true
 }
 
+// True when this drain can answer without entering the kernel — either there
+// is no poller at all, or nothing is armed on it.
+//
+// NOTHING ARMED => NOTHING CAN BE READY (#3736). Every registration this
+// poller has is EV_ONESHOT and is counted by `schedPollPendingInc` on the
+// success path of `pollRegister` — the only path that arms one — and
+// decremented only when the kernel reports its one edge. So a zero count
+// means the kqueue holds no armed filter, and a `kevent` against it can only
+// return 0 events. Skipping the syscall is therefore not an approximation; it
+// returns what the call was going to return.
+//
+// ONLY FOR THE NON-BLOCKING DRAIN, and that condition is load-bearing rather
+// than caution. A caller passing a positive `timeoutMs` is asking to WAIT,
+// not merely to collect — `runtime/net/windows/tcp.bit`'s deadline threads
+// drive `pollDrain(schedAddr, netDeadlinePollMs)` in a bounded loop and depend
+// on it blocking. Returning 0 immediately there would convert a bounded park
+// into a hot spin, which is a worse bug than the syscall this removes.
+//
+// A STALE COUNT CANNOT SKIP A NEEDED DRAIN. The count is incremented after the
+// filter is armed and decremented when its edge is reported, so it is >= 1 for
+// the whole window in which an event is possible; the only documented way it
+// is ever wrong (a stress harness's second private poller, see
+// `schedPollPendingCount`) leaves it too HIGH, which costs one ordinary
+// syscall and skips nothing. A registration armed by another thread
+// immediately after this read is picked up by the next idle turn, which is
+// bounded by the same `parkMaxBackoffNs` that already bounds how long the
+// worker loop may go between drains.
+//
+// WHY IT MATTERS: this is the idle path of every program, and the kevent fired
+// on every idle turn whether or not the program did any I/O at all. Measured
+// on 8 green threads sleeping at a 200us cadence, no sockets in the process:
+// 159,655 kevent syscalls for 160,000 timer wakes — one full kernel round trip
+// per wake, every one of them provably empty.
+//
+// SEPARATE FUNCTION rather than two `if`s inline because `pollDrain` was
+// already at E0204's complexity ceiling of 10; folding both early exits in
+// here keeps it there instead of buying the check with a lint suppression.
+@nosplit fn pollDrainSkippable(pollFd: int, timeoutMs: int): bool {
+  if (pollFd == 0) {
+    return true
+  }
+  return timeoutMs == 0 && schedPollPendingCount() == 0
+}
+
 // Drain ready events and unpark the waiting task for each. Returns how many
 // were woken. `runtime/sched/`'s `pollReady`.
 //
@@ -247,7 +291,7 @@ export @symbol("bit_rt_port_sched_poll_register") fn pollRegister(pollFd: int, f
 export @symbol("bit_rt_port_sched_poll_drain") fn pollDrain(schedAddr: int, timeoutMs: int): int {
   let s = taskAt(schedAddr)
   let pollFd = *(s + scPollFd)
-  if (pollFd == 0) {
+  if (pollDrainSkippable(pollFd, timeoutMs)) {
     return 0
   }
   if (!schedPollTryEnter(s)) {
