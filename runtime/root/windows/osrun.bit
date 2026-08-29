@@ -1,0 +1,796 @@
+// Windows process-spawn provider (#3923, epic #3322): the four kernel-facing
+// `bit_rt_os_run*` ABI wrappers (ABI.md §19) — `os_run`, `os_run_test`,
+// `os_run_bounded`, `os_run_test_bounded`. A SIBLING file to ./os.bit
+// (628 lines before this ticket, close to the 800-line ceiling), not an
+// addition to it — this is real Win32 process plumbing, not a few lines.
+//
+// `bit_rt_os_self_exe` is NOT implemented here. It IS the next link blocker
+// on this chain -- `compiler/mainpaths.bit:105` calls `std/os`'s `selfExe()`
+// wrapper (`compiler/main.bit` imports it) -- filed separately as #3927 per
+// this chain's own established pattern (#3920→#3921→#3922→#3923→this) of
+// filing the NEXT gap rather than widening the current ticket. (An earlier
+// draft of this comment claimed no call site existed; that was wrong -- it
+// grepped for the raw `osSelfExe()` primitive name and missed the `std/os`
+// wrapper indirection. Corrected once the real link recipe below found it.)
+//
+// ---------------------------------------------------------------------------
+// MATCHING THE CONTRACT, NOT THE MECHANISM
+// ---------------------------------------------------------------------------
+//
+// ../linux/os.bit and ../darwin/os.bit share one mechanism: `fork` gives a
+// child that exists before it execs, so the parent can set up process-group
+// membership (`setpgid`, both sides, race-free) BEFORE the child's own image
+// replaces it. Windows has no `fork`. `CreateProcessW` creates a NEW process
+// from a NEW image in one call — there is no window between "the child
+// exists" and "the child is running its own code" to hook into, UNLESS the
+// process is created with `CREATE_SUSPENDED`: its primary thread exists but
+// never runs a single instruction until `ResumeThread`. That is the Windows
+// analogue of the fork-before-exec window, and it is what makes the tree-kill
+// setup below race-free instead of racing the child's own startup.
+//
+// The four functions here reproduce the CONTRACT ABI.md §19 documents for
+// their POSIX counterparts:
+//   - normal exit:     >= 0, the child's exit code masked to a byte (0-255)
+//   - spawn/wait failure: -1
+//   - timed out (bounded only): -2, and the child (and anything it spawned,
+//     via the job-object tree-kill below) is not left running
+//   - killed by a signal: NEVER PRODUCED HERE. Windows has no POSIX signals
+//     and no `WIFSIGNALED`-style distinction: an unhandled exception (e.g.
+//     an access violation) simply makes the process exit with its own
+//     NTSTATUS-shaped code (e.g. 0xC0000005), which `GetExitCodeProcess`
+//     reports like any other exit code -- no separate "was it a crash"
+//     channel exists to read. Rather than fabricate a `<= -100` mapping this
+//     platform cannot support, that value flows straight through `>= 0`,
+//     masked to a byte like every other exit code.
+//
+// ---------------------------------------------------------------------------
+// THE COMMAND LINE: argv[] -> ONE MUTABLE STRING, AND THE QUOTING HAZARD
+// ---------------------------------------------------------------------------
+//
+// `CreateProcessW` takes `lpCommandLine` as a single UTF-16 string it may
+// modify in place -- not an argv array. `winJoinArgv`/`winAppendArg` below
+// build one from the POSIX-shaped `[path, forwarded..., NULL]` pointer array
+// `../../root`'s `osBuildRunArgv` already builds for the POSIX providers,
+// applying Microsoft's own documented quoting algorithm (the "argv quoting"
+// rules from "Parsing C++ Command-Line Arguments", the same source
+// ./os.bit's own header cites for `winSplitArgs`) -- the EXACT REVERSE of
+// that function: a run of N backslashes immediately before a literal `"` (or
+// at the end of a QUOTED argument, where the closing quote is the next
+// character conceptually) doubles to 2N and, if a literal `"` follows, adds
+// one more backslash and copies the quote as a literal, non-toggling
+// character; a run before an ORDINARY character, or anywhere in an
+// UNQUOTED argument, is copied through verbatim, never doubled. An argument
+// is quoted at all only if it is empty or contains a space, tab or `"`.
+//
+// ARGV[0] gets the SAME uniform treatment as every other argument, exactly
+// the deviation ./os.bit's header documents for the SPLIT direction
+// (`winSplitArgs`): `CommandLineToArgvW` special-cases the executable-path
+// token (no backslash escaping inside it). That never matters here, in
+// EITHER direction: a Windows path cannot contain a `"` (a reserved
+// filename character), so the general algorithm and the path-only special
+// case agree on every real path.
+//
+// ---------------------------------------------------------------------------
+// THE ENVIRONMENT BLOCK
+// ---------------------------------------------------------------------------
+//
+// `os_run`/`os_run_bounded` pass `lpEnvironment = NULL`, meaning "inherit the
+// caller's own current environment" -- the direct Windows equivalent of
+// `../linux/os.bit`'s `osForkExecWait` handing `execve` the captured `envp`
+// unmodified. `os_run_test`/`os_run_test_bounded` need to PREPEND
+// `BIT_TEST_INDEX=<idx>` (and, for the bounded pair, conditionally append
+// `BIT_BACKTRACE=1`, exactly mirroring ../linux/os.bit's own two functions),
+// so those two build a real UTF-16, double-NUL-terminated environment block
+// from `../../root`'s `osEnvp()` -- the SAME captured, POSIX-shaped pointer
+// array `winCaptureArgsEnv` (./os.bit) already publishes through
+// `osSetArgs`, on every platform including this one.
+//
+// ---------------------------------------------------------------------------
+// THE BOUNDED TIMEOUT: A JOB OBJECT, NOT JUST TerminateProcess
+// ---------------------------------------------------------------------------
+//
+// ../linux/os.bit's bounded wait kills the whole PROCESS GROUP, not just the
+// direct child (#2986: a single-pid kill left a grandchild -- a compile a
+// wrapper shell had spawned -- running indefinitely after the timeout had
+// already been reported). A Windows JOB OBJECT is the direct analogue of a
+// process group for this purpose: any process assigned to it, and (by
+// default, on Windows 8+) any process THAT process later creates, is killed
+// together by one `TerminateJobObject` call. The child is created
+// `CREATE_SUSPENDED` specifically so it is assigned to the job BEFORE it can
+// run a single instruction of its own -- the same "before exec has a chance
+// to run" window ../linux/os.bit's own `osExecChild` comment describes for
+// its parent-and-child racing `setpgid` calls.
+//
+// `CreateJobObjectW`/`AssignProcessToJobObject` failing is not fatal to the
+// spawn: it only means a subsequent timeout can no longer guarantee killing
+// anything the child itself spawns, so the direct child is still terminated
+// either way (`winKillAndReap` below, the `haveJob` branch).
+
+import { osEnvp, osBuildRunArgv, osFillTestIndex, osFillBacktraceEnv, osScratchSlot, fsPathZ, btEnvKeyMatch } from "../../root"
+
+// kernel32 imports beyond what ./os.bit, ./boot.bit and ./fs.bit already
+// declare in this module (a second `extern fn WaitForSingleObject`/
+// `CloseHandle` here would be E0042 -- ./boot.bit already declares both).
+// `TerminateProcess` is already admitted in `compiler/pesyms.bit`'s table
+// (#3337) but not yet DECLARED as an `extern fn` anywhere in the runtime --
+// this is that first declaration. The other five are all NEW admissions
+// this ticket adds to that table (kernel32.dll, Microsoft's own
+// processthreadsapi.h/jobapi2.h reference; not hardware-probed, matching
+// that table's own honesty note for documentation-sourced entries).
+extern fn CreateProcessW(
+  appName: *byte, cmdLine: *byte, procAttrs: *byte, threadAttrs: *byte,
+  inheritHandles: i32, creationFlags: i32, environment: *byte, currentDir: *byte,
+  startupInfo: *byte, processInfo: *byte,
+): i32
+extern fn GetExitCodeProcess(handle: *byte, exitCodeOut: *i32): i32
+extern fn TerminateProcess(handle: *byte, exitCode: i32): i32
+extern fn CreateJobObjectW(secAttrs: *byte, name: *byte): *byte
+extern fn AssignProcessToJobObject(job: *byte, process: *byte): i32
+extern fn TerminateJobObject(job: *byte, exitCode: i32): i32
+extern fn ResumeThread(thread: *byte): i32
+
+// ---------------------------------------------------------------------------
+// Struct layouts (processthreadsapi.h) -- offsets verified against
+// Microsoft's own documented field order, not guessed; every field below is
+// already DWORD/pointer-aligned, matching ./fs.bit's own WIN32_FIND_DATAW
+// comment's standard for this project.
+// ---------------------------------------------------------------------------
+
+// PROCESS_INFORMATION: hProcess(HANDLE)@0, hThread(HANDLE)@8,
+// dwProcessId(DWORD)@16, dwThreadId(DWORD)@20. Total 24 bytes.
+const winProcessInfoBytes: int = 24
+
+// STARTUPINFOW (the WIN64 layout): cb(DWORD)@0, padding, lpReserved(LPWSTR)@8,
+// lpDesktop@16, lpTitle@24, dwX..dwFlags(DWORD each)@32-60, wShowWindow/
+// cbReserved2(WORD each)@64/66, padding, lpReserved2(LPBYTE)@72,
+// hStdInput/Output/Error(HANDLE each)@80/88/96. Total 104 bytes -- the
+// documented sizeof(STARTUPINFOW) on x64. Only `cb` is ever written (see
+// `winZeroBytes` below): every other field stays zero, which `dwFlags == 0`
+// makes Windows treat as "no window/show-state/std-handle override" -- the
+// plain-inherit behaviour `bit_rt_os_run`'s POSIX siblings get from `fork`.
+const winStartupInfoBytes: int = 104
+
+// Creation flags (winbase.h/processthreadsapi.h). `CREATE_SUSPENDED`: the
+// bounded path's tree-kill race-fix (see header). `CREATE_UNICODE_ENVIRONMENT`:
+// required whenever `lpEnvironment` is non-NULL, since a Windows process's
+// default environment-block encoding is ANSI.
+const winCreateSuspended: int = 4          // 0x00000004
+const winCreateUnicodeEnvironment: int = 1024 // 0x00000400
+
+// WaitForSingleObject's own return codes (synchapi.h/winbase.h).
+const winWaitObject0: int = 0
+const winWaitTimeout: int = 258 // 0x102
+
+// The `dwMilliseconds` bit pattern for INFINITE (winbase.h) -- 0xFFFFFFFF,
+// which a plain i32 -1 already is at the ABI boundary (the same
+// "unsigned parameter, signed literal" move `../../thread/windows/spawn.bit`'s
+// `STACK_SIZE_PARAM_IS_A_RESERVATION` flag makes, and
+// `../../park/windows/wait.bit`'s own `infiniteMs` -- not reused directly:
+// that function lives in a DIFFERENT module, `runtime/park`, unexported).
+@nosplit fn winInfiniteMs(): i32 { return i32(0 - 1) }
+
+// A bounded (never INFINITE) wait for the reap after a kill: Power of 10
+// rule 2 forbids an unbounded wait even here. `TerminateProcess`/
+// `TerminateJobObject` are about as close to unstoppable as Windows offers,
+// so this is generous slack for the OS to tear the process down, not a
+// realistic timeout.
+const winReapWaitMs: int = 5000
+
+// ---------------------------------------------------------------------------
+// Per-worker scratch (#3274-style: two workers racing one shared buffer
+// corrupts a THIRD process's spawn, the same hazard every sibling per-worker
+// buffer in this tree documents). `osScratchSlots` (32) + 1 fallback slot,
+// literal-sized ([N]i64 needs a compile-time literal, E0021).
+// ---------------------------------------------------------------------------
+
+let winStartupInfoBuf: [429]i64   // 33 * (104/8 = 13)
+let winProcessInfoBuf: [99]i64    // 33 * (24/8 = 3)
+let winExitCodeScratch: [33]i32   // one DWORD per slot
+
+// Intermediate UTF-8 command-line arena, before UTF-16 encoding. Sized off
+// `winMaxCmdUnits` (./os.bit, Windows' own ~32767-character `CreateProcess`
+// ceiling) * 3 -- the worst-case UTF-8 bytes per UTF-16 unit ./os.bit's own
+// decode direction already budgets for the same reason.
+const winRunCmdArenaBytes: int = 98304  // winMaxCmdUnits * 3
+let winRunCmdArena: [405504]i64   // 33 * (98304/8 = 12288)
+
+// The final UTF-16LE command line handed to `CreateProcessW`.
+const winRunCmdUnitsBytes: int = 65536  // winMaxCmdUnits * 2
+let winRunCmdUnitsBuf: [270336]i64 // 33 * (65536/8 = 8192)
+
+// The UTF-16LE, double-NUL-terminated environment block for
+// `os_run_test`/`os_run_test_bounded`. 64 KiB/slot -- generous against any
+// real environment (Windows historically documented a 32 KiB ceiling); one
+// that does not fit is REJECTED (spawn failure, `-1`), never truncated,
+// matching this file family's "reject, don't truncate" rule.
+const winRunEnvArenaBytes: int = 65536
+let winRunEnvArena: [270336]i64   // 33 * (65536/8 = 8192)
+
+// ---------------------------------------------------------------------------
+// Small bounded primitives shared by the command-line and environment
+// builders below.
+// ---------------------------------------------------------------------------
+
+// Zero `n` bytes at `addr` (Power of 10 rule 2: bounded by `n`). Required
+// before every `CreateProcessW` call: uninitialized `STARTUPINFOW.dwFlags`
+// could, by chance, contain `STARTF_USESTDHANDLES`, making Windows read the
+// equally-uninitialized handle fields that follow it.
+@nosplit fn winZeroBytes(addr: int, n: int) {
+  let i = 0
+  while (i < n) {
+    storeByte(addr + i, 0)
+    i = i + 1
+  }
+}
+
+// The length of the NUL-terminated byte string at `addr`, capped at
+// `winCstrMax`. NOT `../../root`'s `cstrLen`: that one caps at 256
+// (NAME_MAX, sized for a filesystem entry name) and would SILENTLY TRUNCATE
+// any longer argv element or environment value with no error -- this file
+// measures whole CLI arguments and environment entries, either of which can
+// legitimately run into the thousands of bytes.
+const winCstrMax: int = 8192
+@nosplit fn winCstrLen(addr: int): int {
+  let i = 0
+  while (i < winCstrMax) {
+    if (loadByte(addr + i) == 0) {
+      return i
+    }
+    i = i + 1
+  }
+  return winCstrMax
+}
+
+// The small helpers below (`winAppendByte` through `winAppendArgStep`) all
+// speak in the SAME convention: `cur` is an ABSOLUTE write pointer and
+// `remaining` is the budget left at `cur` (so a caller updates
+// `cur += written; remaining -= written` between calls, never re-deriving
+// `cur` from a separate base+offset pair). That is what keeps each of these
+// functions at or under E0202's 5-param ceiling: `winAppendArg` below is the
+// one place that still speaks the (dst, used, budget) convention its own
+// caller expects, converting to/from `cur`/`remaining` at its own boundary.
+// Every function returns the count of bytes written/consumed (>= 0), or
+// `-1` on overflow (rejected, never truncated).
+
+// Append one byte at `cur`. Returns `1`, or `-1` if `remaining < 1`.
+@nosplit fn winAppendByte(cur: int, remaining: int, b: int): int {
+  if (remaining < 1) {
+    return 0 - 1
+  }
+  storeByte(cur, b)
+  return 1
+}
+
+// Append `count` literal backslash bytes at `cur`, bounds-checked once.
+// Returns `count`, or `-1` if it would exceed `remaining`.
+@nosplit fn winAppendBackslashes(cur: int, remaining: int, count: int): int {
+  if (count > remaining) {
+    return 0 - 1
+  }
+  let k = 0
+  while (k < count) {
+    storeByte(cur + k, 92)
+    k = k + 1
+  }
+  return count
+}
+
+// ---------------------------------------------------------------------------
+// argv[] -> ONE quoted Windows command-line string (see header)
+// ---------------------------------------------------------------------------
+
+// True if `src[0..n)` needs quoting: empty (an empty argument must still
+// occupy a token) or containing a space, tab or `"`.
+@nosplit fn winArgNeedsQuote(src: int, n: int): bool {
+  if (n == 0) {
+    return true
+  }
+  let i = 0
+  while (i < n) {
+    let b = loadByte(src + i)
+    if (b == 32 || b == 9 || b == 34) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// The number of consecutive backslash bytes starting at `p`, bounded by
+// `remaining`.
+@nosplit fn winCountBackslashRun(p: int, remaining: int): int {
+  let q = 0
+  while (q < remaining && loadByte(p + q) == 92) {
+    q = q + 1
+  }
+  return q
+}
+
+// Append `total` backslashes (the caller has already multiplied the run's
+// own count by 1 or 2 per Microsoft's quoting rule) and, if `beforeQuote`,
+// one further backslash and the literal `"` that follows it. Returns the
+// total bytes written, or `-1` on overflow.
+@nosplit fn winAppendEscapedBackslashes(cur: int, remaining: int, total: int, beforeQuote: bool): int {
+  let w = winAppendBackslashes(cur, remaining, total)
+  if (w < 0) {
+    return 0 - 1
+  }
+  if (!beforeQuote) {
+    return w
+  }
+  let w2 = winAppendByte(cur + w, remaining - w, 92)
+  if (w2 < 0) {
+    return 0 - 1
+  }
+  let w3 = winAppendByte(cur + w + 1, remaining - w - 1, 34)
+  if (w3 < 0) {
+    return 0 - 1
+  }
+  return w + 2
+}
+
+// Both halves of every packed return stay well under this base:
+// bytes-written <= `winRunCmdArenaBytes` (98304) and bytes-consumed <=
+// `winCstrLen`'s own cap (`winCstrMax`, 8192), so `written * winArgPackBase
+// + consumed` round-trips exactly. Packing avoids a heap-allocating
+// multi-value return in this `@nosplit` code (tuple returns allocate here).
+// `-1` (never a valid packed value, always >= 0) signals overflow.
+const winArgPackBase: int = 100000
+
+// Handle one run of backslash bytes starting at `srcPos` for
+// `winAppendArgStep` below (see `winAppendArg`'s own header for the exact
+// escaping rule): resolve the run's length and what follows it, apply
+// Microsoft's doubling rule, and append. Packed return (bytesWritten,
+// bytesConsumed) -- see `winArgPackBase` above.
+@nosplit fn winAppendArgBackslashRun(cur: int, remaining: int, srcPos: int, srcRemaining: int, quote: bool): int {
+  let bs = winCountBackslashRun(srcPos, srcRemaining)
+  let consumed = bs
+  let atEnd = consumed == srcRemaining
+  let beforeQuote = !atEnd && loadByte(srcPos + consumed) == 34
+  let mult = 1
+  if (beforeQuote || (atEnd && quote)) {
+    mult = 2
+  }
+  let written = winAppendEscapedBackslashes(cur, remaining, bs * mult, beforeQuote)
+  if (written < 0) {
+    return 0 - 1
+  }
+  if (beforeQuote) {
+    consumed = consumed + 1
+  }
+  return written * winArgPackBase + consumed
+}
+
+// One step of `winAppendArg`'s scan: either a single ordinary byte, or (see
+// `winAppendArgBackslashRun`) a full backslash run and its resolution.
+// Packed return (bytesWritten, bytesConsumed), consumed always >= 1.
+@nosplit fn winAppendArgStep(cur: int, remaining: int, srcPos: int, srcRemaining: int, quote: bool): int {
+  let b = loadByte(srcPos)
+  if (b != 92) {
+    let w = winAppendByte(cur, remaining, b)
+    if (w < 0) {
+      return 0 - 1
+    }
+    return w * winArgPackBase + 1
+  }
+  return winAppendArgBackslashRun(cur, remaining, srcPos, srcRemaining, quote)
+}
+
+// Append one argument (`src[0..n)`, UTF-8 bytes) to the command-line arena
+// at `dst`, starting at `used`, quoted and escaped per the header's stated
+// rules, preceded by a separating space if this is not the first argument
+// (`used > 0`). Returns the new `used` offset, or `-1` on overflow.
+//
+// BOUNDED (Power of 10 rule 2): the loop advances `i` by at least 1 every
+// iteration (`winAppendArgStep`'s own `bytesConsumed` is always >= 1) and is
+// capped by `n`.
+@nosplit fn winAppendArg(dst: int, used: int, budget: int, src: int, n: int): int {
+  let cur = dst + used
+  let remaining = budget - used
+  if (used > 0) {
+    let w = winAppendByte(cur, remaining, 32)
+    if (w < 0) {
+      return 0 - 1
+    }
+    cur = cur + w
+    remaining = remaining - w
+  }
+  let quote = winArgNeedsQuote(src, n)
+  if (quote) {
+    let w = winAppendByte(cur, remaining, 34)
+    if (w < 0) {
+      return 0 - 1
+    }
+    cur = cur + w
+    remaining = remaining - w
+  }
+  let i = 0
+  while (i < n) {
+    let packed = winAppendArgStep(cur, remaining, src + i, n - i, quote)
+    if (packed < 0) {
+      return 0 - 1
+    }
+    let written = packed / winArgPackBase
+    cur = cur + written
+    remaining = remaining - written
+    i = i + packed % winArgPackBase
+  }
+  if (quote) {
+    let w = winAppendByte(cur, remaining, 34)
+    if (w < 0) {
+      return 0 - 1
+    }
+    cur = cur + w
+  }
+  return cur - dst
+}
+
+// Walk the NULL-terminated pointer array at `argvPtrs` (`../../root`'s
+// `osBuildRunArgv` own `[path, forwarded..., NULL]` shape, UTF-8
+// NUL-terminated C strings) and join it into one quoted command line at
+// `dst`. Returns the byte count written, or `-1` on overflow.
+//
+// BOUNDED (Power of 10 rule 2): at most `osRunMaxArgv + 2` elements
+// (`osBuildRunArgv`'s own array shape: path + up to 64 forwarded + NULL).
+@nosplit fn winJoinArgv(argvPtrs: int, dst: int, budget: int): int {
+  let used = 0
+  let i = 0
+  while (i < 66) {
+    let p = loadWord(argvPtrs + i * 8)
+    if (p == 0) {
+      return used
+    }
+    used = winAppendArg(dst, used, budget, p, winCstrLen(p))
+    if (used < 0) {
+      return 0 - 1
+    }
+    i = i + 1
+  }
+  return used
+}
+
+// Build the final UTF-16LE `lpCommandLine` for `argvPtrs` in this worker's
+// scratch slot. Returns its address, or `0` on any overflow (spawn failure).
+@nosplit fn winBuildCommandLine(argvPtrs: int): int {
+  let slot = osScratchSlot()
+  let arena = int(ptrOf(winRunCmdArena)) + slot * winRunCmdArenaBytes
+  let used = winJoinArgv(argvPtrs, arena, winRunCmdArenaBytes)
+  if (used < 0) {
+    return 0
+  }
+  let dst = int(ptrOf(winRunCmdUnitsBuf)) + slot * winRunCmdUnitsBytes
+  let units = winUtf8ToUtf16(arena, used, dst, winMaxCmdUnits)
+  if (units < 0) {
+    return 0
+  }
+  return dst
+}
+
+// ---------------------------------------------------------------------------
+// The environment block for os_run_test / os_run_test_bounded (see header)
+// ---------------------------------------------------------------------------
+
+// Bound on entries copied from the captured environment -- matches
+// ../linux/os.bit's own `osMaxEnv` ceiling on the identical copy loop.
+const winMaxEnvCopy: int = 1024
+
+// Encode one NUL-terminated UTF-8 "NAME=VALUE" entry into the UTF-16
+// double-NUL-terminated block being built at `arena`, at byte offset `used`.
+// `winUtf8ToUtf16` itself writes the entry's own terminating NUL unit, so
+// the next entry starts `(units + 1) * 2` bytes later. Returns the new
+// `used` offset, or `-1` if it would not fit `budget`.
+@nosplit fn winAppendEnvEntry(arena: int, used: int, budget: int, src: int, n: int): int {
+  let remainUnits = (budget - used) / 2
+  if (remainUnits <= 0) {
+    return 0 - 1
+  }
+  let units = winUtf8ToUtf16(src, n, arena + used, remainUnits)
+  if (units < 0) {
+    return 0 - 1
+  }
+  return used + (units + 1) * 2
+}
+
+// Copy the captured process environment (`../../root`'s `osEnvp()`) into the
+// block at `arena` starting at byte offset `used`, then -- if
+// `appendBacktrace` and none of the copied entries already set
+// `BIT_BACKTRACE` -- append `BIT_BACKTRACE=1`. Folding the append into this
+// same loop (rather than returning a `hasBacktrace` flag to the caller) is
+// what keeps `winBuildRunEnvBlock` below a plain three-step sequence. Exactly
+// mirrors ../linux/os.bit's own `rtOsRunTestBounded` copy loop. Returns the
+// new `used` offset, or `-1` on overflow.
+//
+// BOUNDED (Power of 10 rule 2): at most `winMaxEnvCopy` iterations.
+@nosplit fn winCopyEnvAndMaybeBacktrace(arena: int, used: int, appendBacktrace: bool): int {
+  let src = osEnvp()
+  let copied = 0
+  let hasBacktrace = false
+  let o = used
+  while (copied < winMaxEnvCopy) {
+    let e = loadWord(src + copied * 8)
+    if (e == 0) {
+      break
+    }
+    if (appendBacktrace && btEnvKeyMatch(e)) {
+      hasBacktrace = true
+    }
+    o = winAppendEnvEntry(arena, o, winRunEnvArenaBytes, e, winCstrLen(e))
+    if (o < 0) {
+      return 0 - 1
+    }
+    copied = copied + 1
+  }
+  if (appendBacktrace && !hasBacktrace) {
+    let bt = osFillBacktraceEnv()
+    o = winAppendEnvEntry(arena, o, winRunEnvArenaBytes, bt, winCstrLen(bt))
+  }
+  return o
+}
+
+// Build a UTF-16LE, double-NUL-terminated environment block for
+// `CreateProcessW` (with `CREATE_UNICODE_ENVIRONMENT`) from the captured
+// process environment, with `prependPtr` (a UTF-8 NUL-terminated
+// "NAME=VALUE" string, or `0` for none) placed FIRST so it wins over any
+// inherited value (`getenv`'s first-match-wins) -- exactly mirroring
+// ../linux/os.bit's own `rtOsRunTest`/`rtOsRunTestBounded` shape.
+//
+// Returns the block's address, or `0` on overflow (spawn failure) -- REJECTED,
+// never truncated.
+@nosplit fn winBuildRunEnvBlock(prependPtr: int, appendBacktrace: bool): int {
+  let slot = osScratchSlot()
+  let arena = int(ptrOf(winRunEnvArena)) + slot * winRunEnvArenaBytes
+  let used = 0
+  if (prependPtr != 0) {
+    used = winAppendEnvEntry(arena, used, winRunEnvArenaBytes, prependPtr, winCstrLen(prependPtr))
+    if (used < 0) {
+      return 0
+    }
+  }
+  used = winCopyEnvAndMaybeBacktrace(arena, used, appendBacktrace)
+  if (used < 0) {
+    return 0
+  }
+  if (used + 2 > winRunEnvArenaBytes) {
+    return 0
+  }
+  storeByte(arena + used, 0)
+  storeByte(arena + used + 1, 0)
+  return arena
+}
+
+// ---------------------------------------------------------------------------
+// Spawn + wait (unbounded and bounded)
+// ---------------------------------------------------------------------------
+
+// Read back this worker's `GetExitCodeProcess` result, masked to a byte --
+// matching ../linux/os.bit's own `(status / osWExitShift) & 255` masking of
+// `WEXITSTATUS`, so a child's exit code behaves identically across targets.
+@nosplit fn winReadExitCode(hProcess: int): int {
+  let slot = osScratchSlot()
+  let excPtr = ptrOf(winExitCodeScratch) + slot
+  let _ = GetExitCodeProcess(hAt(hProcess), excPtr)
+  return int(atomicLoad(excPtr)) & 255
+}
+
+// `envBlock == 0` means "no override, inherit" -> NULL + no special flag;
+// non-zero means a real UTF-16 double-NUL block -> the flag it needs.
+@nosplit fn winEnvCreationFlags(envBlock: int): int {
+  if (envBlock != 0) {
+    return winCreateUnicodeEnvironment
+  }
+  return 0
+}
+
+// Kill the child (via its job if one exists, otherwise the process
+// directly) and reap it with a bounded wait -- shared by both outcomes in
+// `winSpawnAndWaitBounded` that must not leave the child running.
+@nosplit fn winKillAndReap(hProcess: int, job: int, haveJob: bool) {
+  if (haveJob) {
+    let _ = TerminateJobObject(hAt(job), i32(1))
+  } else {
+    let _ = TerminateProcess(hAt(hProcess), i32(1))
+  }
+  let _ = WaitForSingleObject(hAt(hProcess), i32(winReapWaitMs))
+}
+
+// The unbounded spawn+wait shared by `rtOsRun`/`rtOsRunTest`: create the
+// process (inheriting handles, exactly as `fork` inherits file descriptors),
+// block until it exits, and report its exit code. `envBlock == 0` inherits
+// the caller's own environment (`lpEnvironment = NULL`); otherwise it is a
+// block built by `winBuildRunEnvBlock`.
+@nosplit fn winSpawnAndWait(appName: int, cmdLine: int, envBlock: int): int {
+  let slot = osScratchSlot()
+  let si = int(ptrOf(winStartupInfoBuf)) + slot * winStartupInfoBytes
+  winZeroBytes(si, winStartupInfoBytes)
+  storeWord(si, winStartupInfoBytes)
+  let pi = int(ptrOf(winProcessInfoBuf)) + slot * winProcessInfoBytes
+
+  let ok = CreateProcessW(
+    hAt(appName), hAt(cmdLine), hAt(0), hAt(0),
+    i32(1), i32(winEnvCreationFlags(envBlock)), hAt(envBlock), hAt(0),
+    hAt(si), hAt(pi),
+  )
+  if (int(ok) == 0) {
+    return 0 - 1
+  }
+  let hProcess = loadWord(pi)
+  let hThread = loadWord(pi + 8)
+  let _ = CloseHandle(hAt(hThread))
+  let _ = WaitForSingleObject(hAt(hProcess), winInfiniteMs())
+  let code = winReadExitCode(hProcess)
+  let _ = CloseHandle(hAt(hProcess))
+  return code
+}
+
+// The bounded spawn+wait shared by `rtOsRunBounded`/`rtOsRunTestBounded`
+// (see the header's "JOB OBJECT" section for the full race-freedom argument).
+// Result encoding matches ../linux/os.bit's `osForkExecWaitBounded` minus the
+// `<= -100` case (see header): `>= 0` normal exit, `-1` spawn or wait
+// failure, `-2` timed out (killed and reaped).
+@nosplit fn winSpawnAndWaitBounded(appName: int, cmdLine: int, envBlock: int, timeoutMs: int): int {
+  let clamped = timeoutMs
+  if (clamped < 0) {
+    clamped = 0
+  }
+  if (clamped > winBoundedMaxMs) {
+    clamped = winBoundedMaxMs
+  }
+
+  let slot = osScratchSlot()
+  let si = int(ptrOf(winStartupInfoBuf)) + slot * winStartupInfoBytes
+  winZeroBytes(si, winStartupInfoBytes)
+  storeWord(si, winStartupInfoBytes)
+  let pi = int(ptrOf(winProcessInfoBuf)) + slot * winProcessInfoBytes
+
+  let flags = winCreateSuspended | winEnvCreationFlags(envBlock)
+  let ok = CreateProcessW(
+    hAt(appName), hAt(cmdLine), hAt(0), hAt(0),
+    i32(1), i32(flags), hAt(envBlock), hAt(0),
+    hAt(si), hAt(pi),
+  )
+  if (int(ok) == 0) {
+    return 0 - 1
+  }
+  let hProcess = loadWord(pi)
+  let hThread = loadWord(pi + 8)
+
+  let job = int(CreateJobObjectW(hAt(0), hAt(0)))
+  let haveJob = job != 0
+  if (haveJob) {
+    let _ = AssignProcessToJobObject(hAt(job), hAt(hProcess))
+  }
+  let _ = ResumeThread(hAt(hThread))
+  let _ = CloseHandle(hAt(hThread))
+
+  let wait = int(WaitForSingleObject(hAt(hProcess), i32(clamped)))
+  let result = 0 - 1
+  if (wait == winWaitObject0) {
+    result = winReadExitCode(hProcess)
+  } else {
+    winKillAndReap(hProcess, job, haveJob)
+    if (wait == winWaitTimeout) {
+      result = 0 - 2
+    }
+  }
+  if (haveJob) {
+    let _ = CloseHandle(hAt(job))
+  }
+  let _ = CloseHandle(hAt(hProcess))
+  return result
+}
+
+// Ceiling on `timeoutMs`, matching ../linux/os.bit's `osBoundedMaxMs`
+// exactly (ABI.md §19's documented `os_run_bounded_max_ms` clamp).
+const winBoundedMaxMs: int = 6000000
+
+// ---------------------------------------------------------------------------
+// The exported ABI surface (ABI.md §19)
+// ---------------------------------------------------------------------------
+
+// Resolve `path` (a Bit `string`) to both forms every function below needs:
+// a UTF-16 `lpApplicationName` (`checkedPathW`, ./fs.bit, module-scoped) and
+// a UTF-8 NUL-terminated buffer for `../../root`'s `osBuildRunArgv` (which
+// builds the shared `[pathPtr, forwarded..., NULL]` array every POSIX
+// provider also uses). `argv == 0` builds a bare `[pathPtr, NULL]` --
+// `os_run_test`/`os_run_bounded`/`os_run_test_bounded` never forward a
+// caller argv, exactly like ../linux/os.bit's own manual `[p, NULL]`
+// construction for those three.
+@nosplit fn winResolveRunTarget(path: int, argv: int): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0
+  }
+  return osBuildRunArgv(p, argv)
+}
+
+// `bit_rt_os_run`: run `path` as a child inheriting this process's
+// environment and standard handles, with `argv` appended after `path` --
+// `bit run`'s launcher.
+export @nosplit @symbol("bit_rt_os_run") fn rtOsRun(path: int, argv: int): int {
+  let ab = winResolveRunTarget(path, argv)
+  if (ab == 0) {
+    return 0 - 1
+  }
+  let appName = checkedPathW(path)
+  if (appName == 0) {
+    return 0 - 1
+  }
+  let cmdLine = winBuildCommandLine(ab)
+  if (cmdLine == 0) {
+    return 0 - 1
+  }
+  return winSpawnAndWait(appName, cmdLine, 0)
+}
+
+// `bit_rt_os_run_test(path, idx)`: like `os_run`, but the child sees
+// `BIT_TEST_INDEX=<idx>` prepended to its environment so its synthetic
+// `main` dispatches to test `idx`.
+export @nosplit @symbol("bit_rt_os_run_test") fn rtOsRunTest(path: int, idx: int): int {
+  let ab = winResolveRunTarget(path, 0)
+  if (ab == 0) {
+    return 0 - 1
+  }
+  let appName = checkedPathW(path)
+  if (appName == 0) {
+    return 0 - 1
+  }
+  let cmdLine = winBuildCommandLine(ab)
+  if (cmdLine == 0) {
+    return 0 - 1
+  }
+  let envBlock = winBuildRunEnvBlock(osFillTestIndex(idx), false)
+  if (envBlock == 0) {
+    return 0 - 1
+  }
+  return winSpawnAndWait(appName, cmdLine, envBlock)
+}
+
+// `bit_rt_os_run_bounded(path, timeoutMs)`: like `os_run`, but killed and
+// reported (`-2`) rather than waited on forever once `timeoutMs` elapses.
+export @nosplit @symbol("bit_rt_os_run_bounded") fn rtOsRunBounded(path: int, timeoutMs: int): int {
+  let ab = winResolveRunTarget(path, 0)
+  if (ab == 0) {
+    return 0 - 1
+  }
+  let appName = checkedPathW(path)
+  if (appName == 0) {
+    return 0 - 1
+  }
+  let cmdLine = winBuildCommandLine(ab)
+  if (cmdLine == 0) {
+    return 0 - 1
+  }
+  return winSpawnAndWaitBounded(appName, cmdLine, 0, timeoutMs)
+}
+
+// `bit_rt_os_run_test_bounded(path, idx, timeoutMs)`: `os_run_test` with the
+// same bounded wait as `os_run_bounded`, plus (#3826, mirrored from
+// ../linux/os.bit) a default `BIT_BACKTRACE=1` unless the parent's own
+// environment already sets one.
+export @nosplit @symbol("bit_rt_os_run_test_bounded") fn rtOsRunTestBounded(path: int, idx: int, timeoutMs: int): int {
+  let ab = winResolveRunTarget(path, 0)
+  if (ab == 0) {
+    return 0 - 1
+  }
+  let appName = checkedPathW(path)
+  if (appName == 0) {
+    return 0 - 1
+  }
+  let cmdLine = winBuildCommandLine(ab)
+  if (cmdLine == 0) {
+    return 0 - 1
+  }
+  let envBlock = winBuildRunEnvBlock(osFillTestIndex(idx), true)
+  if (envBlock == 0) {
+    return 0 - 1
+  }
+  return winSpawnAndWaitBounded(appName, cmdLine, envBlock, timeoutMs)
+}
+
+// RUNTIME VERIFICATION: done, on real hardware (`mustafa-desktop-win`), not
+// merely `bit check`. Standalone probes (no `std/os` import, so none pull in
+// the still-unimplemented `bit_rt_os_self_exe`, #3927) cover `rtOsRun`
+// against compiled Bit children returning 0 and 42, and `rtOsRunBounded`
+// against a busy-loop child past an 800ms bound -- all three required
+// scenarios, three runs each, identical results, `Get-Process` confirming no
+// orphan survives the Job Object kill. See #3923's own comments for output.
