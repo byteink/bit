@@ -240,6 +240,21 @@ const idxLoadPct = 80        // grow at 80% occupancy, the conventional open-add
 // `markStackLen` of 0 becomes 1: a zero-length worklist would make every mark overflow.
 // Returns false if the worklist could not be allocated (the
 // `error{OutOfMemory}`).
+//
+// #3177: `heapLockAddr` AND `listLockAddr` MUST BE DIFFERENT WORDS. Before this
+// ticket the two were never nested (`gcHeapAlloc` always released the heap
+// lock before `linkObject` took the list lock), so a caller aliasing them to
+// one word was harmless. `idxInsertSpan` (`./gcindex.bit`) now takes the list
+// lock from INSIDE `gcHeapAlloc`'s class-empty path, still holding the heap
+// lock — including on THIS function's own worklist allocation below, its very
+// first call. A shared word makes that a self-deadlock on a non-reentrant
+// spinlock: the worklist allocation never returns and `gcInit` never
+// completes. Found this way, reproducibly, in three private-collector stress
+// fixtures that had aliased them (`_tests_/stress/chanmakeroots`,
+// `stwcollect`, `stwownstack`) — each hung indefinitely on its first run,
+// `lldb bt` showing thread stuck in `bit_rt_spin_acquire` under
+// `bit_rt_port_gc_init`. Fixed there by giving each its own list-lock word;
+// do the same for any new caller.
 export @nosplit @symbol("bit_rt_port_gc_init") fn gcInit(g: *i64, heapAddr: int, heapLockAddr: int, listLockAddr: int, refArrayInfoAddr: int, markStackLen: int): bool {
   // `gcBindMemory` must have run first, because the mark worklist below is
   // allocated through the heap and the heap draws its spans from the reserve.
@@ -427,6 +442,13 @@ export @nosplit @symbol("bit_rt_port_gc_bind_memory") fn gcBindMemory(g: *i64, s
     // receives spans `heapReclaimSpansLocked` marked doomed, and that pass
     // only takes spans with `spanOwned != 0` to begin with.
     heapRefillLocked(heapBlock(g), idx, span, owned)
+    // #3177: register the span as span-backed BEFORE any slot in it is
+    // handed out, so `gcOwns` can answer every object carved from it via the
+    // #3176 bitmap instead of `idxContains`/`gcOwnsLinear`. Still inside the
+    // heap lock — safe to nest the list lock this takes underneath it, never
+    // the other way (`./gcindex.bit`'s span-presence note: nothing reachable
+    // under the list lock ever acquires the heap lock).
+    idxInsertSpan(g, span)
     if (*(g + gcCfgStress) != 0) {
       let _ = heapCheckSpansLocked(heapBlock(g))
     }
@@ -494,6 +516,14 @@ export @nosplit @symbol("bit_rt_port_gc_bind_memory") fn gcBindMemory(g: *i64, s
         // Read BEFORE the span is cached or unmapped: caching overwrites the
         // span's own first word (#3045), and unmapping makes it unreadable.
         let nxt = allocSpanNext(chain)
+        // #3177: remove the span-presence key BEFORE either disposal below —
+        // once cached or freelisted the span can be refilled for a different
+        // class with a differently-sized bitmap, and `gcOwns` must stop
+        // answering this address from the OLD layout the instant that can
+        // happen, not merely once no live object remains (every slot here is
+        // already free, so the old bitmap already reads all-zero; this is
+        // about correctness after reuse, not about the answer right now).
+        idxRemoveSpan(g, chain)
         // Try the #3045 cache first; only hand it to the reserve's free list
         // (#3868) when the cache reports full. Either way the span leaves
         // `heapMappedBytes`' count here — a cache hit stays resident but is
