@@ -183,6 +183,140 @@ export @nosplit @symbol("bit_rt_port_sched_timer_push") fn schedTimerPush(s: *i6
   spinRelease(lockOf(s, scTimerLock))
 }
 
+// ---------------------------------------------------------------------------
+// The next known deadline, and what it is for (#3911)
+// ---------------------------------------------------------------------------
+//
+// The earliest FUTURE deadline each sweep below saw, or 0 when that queue had
+// none. `runtime/root/<os>`'s `workerBody` reads it through `schedParkBoundNs`
+// to bound its idle park, instead of waiting a blind doubling that knows
+// nothing about when the next thing is actually due.
+//
+// WHY A BLIND RAMP IS NOT ENOUGH, and why this is a fix rather than a tuning
+// knob. `parkNextBackoff` doubles to `parkMaxBackoffNs` on a stretch of idle
+// turns, so a worker whose only pending work is a timer sleeps past that
+// timer's deadline by however far the ramp happened to have climbed — up to
+// 1ms, for a deadline it already knows the exact value of. #3736 measured the
+// consequence directly: a nominal 200us sleep achieved 338,163ns on average
+// there, tracking the ramp's own maximum rather than the nominal. Nothing
+// caps the overshoot at a value related to the workload, which is why making
+// the idle turn CHEAPER made the latency WORSE — more turns per unit time
+// means the ramp climbs further before the timer fires.
+//
+// The bound below is the deadline itself, so it costs nothing to compute here
+// and carries no fitted constant: with no timer armed both cells read 0 and
+// the park is exactly today's `backoff`, and with one armed the park is
+// exactly as long as it can be without being late.
+//
+// TWO CELLS, NOT ONE, and each writer owns exactly one of them. A single cell
+// would need one sweep to min-merge into the other's write, which makes the
+// answer depend on the order the two happen to be called in — they are
+// separate functions with separate call sites (`schedFindWorkAt`,
+// `schedFindWorkIdle`), and an ordering constraint nothing in either body can
+// state is the shape this file already refuses elsewhere. Each cell is
+// overwritten wholesale on every pass of its own sweep, so neither can hold a
+// value its queue no longer justifies.
+//
+// PROCESS-GLOBAL for the same reason `schedPollPending` above is, and wrong in
+// the same safe direction: a stress harness's private second scheduler writes
+// these cells too, and a value it publishes can only make some other worker's
+// park SHORTER than it needed to be — one extra idle turn, never a missed
+// wake. A too-short park costs a turn; a too-long one is the defect.
+const dlTasks: int = 0
+const dlChans: int = 1
+let schedNextDeadline: [2]i64
+
+@nosplit fn nextDeadlineAddr(): *i64 {
+  return ptrOf(schedNextDeadline)
+}
+
+// The earlier of two deadlines under the "0 means none" encoding, which plain
+// `min` gets wrong in exactly the case that matters (one queue empty).
+@nosplit fn earlierDeadline(a: int, b: int): int {
+  if (a == 0) {
+    return b
+  }
+  if (b == 0) {
+    return a
+  }
+  if (b < a) {
+    return b
+  }
+  return a
+}
+
+// How long an idle worker may park, given the blind backoff it would otherwise
+// have used and the clock it just read: never longer than that backoff, never
+// past the next deadline this scheduler knows about, and never shorter than
+// `parkMinBackoffNs` — the module's own existing floor, so a deadline that has
+// already gone by while this turn ran costs one short sleep rather than a
+// spin.
+//
+// `now` IS THE CALLER'S, deliberately, exactly as `schedTimerExpire`'s is:
+// this module holds no clock (see the timer queue's section header), and the
+// caller has to read the same one the deadlines were computed against or the
+// subtraction below is meaningless.
+//
+// PINNED (ABI.md §9): called from `runtime/root/<os>`'s `workerBody`, emitted
+// `--freestanding` (SPEC §11.9), which refuses an unpinned reference.
+export @nosplit @symbol("bit_rt_port_sched_park_bound_ns") fn schedParkBoundNs(
+  backoffNs: int,
+  now: int,
+): int {
+  let due = earlierDeadline(
+    atomicLoad(nextDeadlineAddr() + dlTasks),
+    atomicLoad(nextDeadlineAddr() + dlChans),
+  )
+  if (due == 0) {
+    return backoffNs
+  }
+  let wait = due - now
+  if (wait < parkMinBackoffNs) {
+    return parkMinBackoffNs
+  }
+  if (wait < backoffNs) {
+    return wait
+  }
+  return backoffNs
+}
+
+// Split the sleeping list at `now` under the timer lock: the due ones come
+// back as a list for the caller to unpark OUTSIDE the lock (see
+// `schedTimerExpire`), the rest go back onto `scTimerHead`, and the earliest
+// of the rest is published for the park bound above. Extracted from
+// `schedTimerExpire` so that neither half carries the other's branches.
+//
+// The earliest deadline falls out of the `keep` branch for free — this walk
+// already reads every entry's deadline and already decides which side of `now`
+// it is on, so the only added work is one compare and one store per pass.
+@nosplit fn timerPartition(s: *i64, now: int): int {
+  spinAcquire(lockOf(s, scTimerLock))
+  let due = 0
+  let keep = 0
+  let earliest = 0
+  let it = *(s + scTimerHead)
+  let n = 0
+  while (it != 0 && n < schedMaxRegistered) {
+    n = n + 1
+    let t = taskAt(it)
+    let next = *(t + taskTimerNext)
+    let deadline = *(t + taskDeadline)
+    if (deadline <= now) {
+      *(t + taskTimerNext) = due
+      due = it
+    } else {
+      *(t + taskTimerNext) = keep
+      keep = it
+      earliest = earlierDeadline(earliest, deadline)
+    }
+    it = next
+  }
+  *(s + scTimerHead) = keep
+  spinRelease(lockOf(s, scTimerLock))
+  atomicStore(nextDeadlineAddr() + dlTasks, earliest)
+  return due
+}
+
 // Wake every sleeper whose deadline has passed. Returns how many actually woke.
 //
 // `runtime/sched/`'s `expire`, including its two-list partition and its rule that the
@@ -192,7 +326,9 @@ export @nosplit @symbol("bit_rt_port_sched_timer_push") fn schedTimerPush(s: *i6
 //
 // A task whose deadline has passed but which has not yet reached `taskParked`
 // goes back on the list rather than being dropped or spun on; see
-// `schedTimerPush`'s ordering contract for why that case exists at all.
+// `schedTimerPush`'s ordering contract for why that case exists at all. Such a
+// task is due, not future, so it never contributes to the published deadline —
+// the worker retries it on its next idle turn exactly as it always has.
 //
 // Both walks are bounded by `schedMaxRegistered` (Power of 10) — the same
 // runaway backstop the registry walk uses, for the same reason: a corrupted link
@@ -201,27 +337,7 @@ export @nosplit @symbol("bit_rt_port_sched_timer_expire") fn schedTimerExpire(
   s: *i64,
   now: int,
 ): int {
-  spinAcquire(lockOf(s, scTimerLock))
-  let due = 0
-  let keep = 0
-  let it = *(s + scTimerHead)
-  let n = 0
-  while (it != 0 && n < schedMaxRegistered) {
-    n = n + 1
-    let t = taskAt(it)
-    let next = *(t + taskTimerNext)
-    if (*(t + taskDeadline) <= now) {
-      *(t + taskTimerNext) = due
-      due = it
-    } else {
-      *(t + taskTimerNext) = keep
-      keep = it
-    }
-    it = next
-  }
-  *(s + scTimerHead) = keep
-  spinRelease(lockOf(s, scTimerLock))
-
+  let due = timerPartition(s, now)
   let woken = 0
   let m = 0
   while (due != 0 && m < schedMaxRegistered) {
@@ -526,27 +642,47 @@ extern fn bit_rt_port_chan_try_send_drop(ch: int, value: int): bool
 // A one-shot entry (`period <= 0`) is freed before the send, not after: the
 // send cannot fail as far as this pool is concerned (`chanTrySendDrop` drops
 // rather than erroring), so there is no outcome that should leave it pending.
-@nosplit fn chanTimerExpireSlot(slot: int, now: int) {
+//
+// RETURNS THIS SLOT'S REMAINING FUTURE DEADLINE, or 0 when it has none — free,
+// or a one-shot that just fired and was released. A periodic entry reports the
+// deadline it was just re-armed to, not the one that expired, so the sweep's
+// answer is what is still owed rather than what has already been paid. This is
+// the same read the state/deadline check above already does, under the same
+// acquisition of the same lock; see the next-known-deadline section above for
+// what the caller does with it.
+@nosplit fn chanTimerExpireSlot(slot: int, now: int): int {
   let cell = chanTimerLockAddr()
   spinAcquire(cell)
   let e = ctEntryAt(slot)
-  if (*(e + ctState) != 1 || *(e + ctDeadline) > now) {
+  if (*(e + ctState) != 1) {
     spinRelease(cell)
-    return
+    return 0
+  }
+  let deadline = *(e + ctDeadline)
+  if (deadline > now) {
+    spinRelease(cell)
+    return deadline
   }
   let c = *(e + ctChan)
   let period = *(e + ctPeriod)
+  let rearmed = 0
   if (period > 0) {
-    *(e + ctDeadline) = now + period
+    rearmed = now + period
+    *(e + ctDeadline) = rearmed
   } else {
     ctFreeSlot(slot)
   }
   spinRelease(cell)
   let _ = bit_rt_port_chan_try_send_drop(c, 1)
+  return rearmed
 }
 
 // Sweeps every slot ever claimed (`[0, chanTimerHigh)`) for one due, sends its
-// `true` and re-arms or frees it. Called from the same idle-path call sites
+// `true` and re-arms or frees it, and publishes the earliest deadline still
+// owed by this pool for the park bound (see the next-known-deadline section
+// above — a channel timer is as much a known deadline as a sleeping task's,
+// and bounding only one of the two queues would leave the same defect standing
+// in the other). Called from the same idle-path call sites
 // `schedTimerExpire` is (`schedFindWorkIdle`/`schedFindWorkAt`, worker.bit) —
 // it has no task to hand back, so unlike `schedTimerExpire` there is nothing
 // for the caller to `gqPop` afterward. Bounded by `ctCap` (Power of 10): a
@@ -556,9 +692,11 @@ export @nosplit @symbol("bit_rt_port_sched_timer_chan_expire") fn schedTimerChan
   if (high > ctCap) {
     high = ctCap
   }
+  let earliest = 0
   let slot = 0
   while (slot < high) {
-    chanTimerExpireSlot(slot, now)
+    earliest = earlierDeadline(earliest, chanTimerExpireSlot(slot, now))
     slot = slot + 1
   }
+  atomicStore(nextDeadlineAddr() + dlChans, earliest)
 }
