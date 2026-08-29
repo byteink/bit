@@ -4,15 +4,16 @@
 #   dist/package.sh <version> <target> <outdir> [archivedir]
 #
 # <target> is a compiler target triple as `bit --target` spells it
-# (x86_64-linux | aarch64-linux | aarch64-macos). <version> is the tag without
-# its leading `v`. The staged `bit` binary must already exist at
-# <outdir>/stage/bin/bit — the caller produces it, because producing a
-# self-hosted `bit` means EXECING the seed and only the workflow knows which
-# host it is on (see tools/build/artifacts.bit's hostTriple note).
+# (x86_64-linux | aarch64-linux | aarch64-macos | x86_64-windows). <version> is
+# the tag without its leading `v`. The staged binary must already exist at
+# <outdir>/stage/bin/bit (bit.exe for x86_64-windows) — the caller produces it,
+# because producing a self-hosted `bit` means EXECING the seed and only the
+# workflow knows which host it is on (see tools/build/artifacts.bit's
+# hostTriple note).
 #
-# [archivedir] is where the three runtime archives (<triple>/libbitrt.a) are
-# read from, defaulting to `bit-out/lib` — the tree `./make libbitrt` writes,
-# so every existing caller is unaffected. `dist/release.sh` (#3034) passes its
+# [archivedir] is where the runtime archives (<triple>/libbitrt.a) are read
+# from, defaulting to `bit-out/lib` — the tree `./make libbitrt` writes, so
+# every existing caller is unaffected. `dist/release.sh` (#3034) passes its
 # own scratch directory instead: its shipped archives are built by THIS tree's
 # own compiler, not stage0, and writing them into `bit-out/lib` would make
 # `./make libbitrt`'s own staleness check blind to it — the fingerprint covers
@@ -22,10 +23,12 @@
 # idempotency (and #3035's reproducibility check, which relies on a fresh
 # tree's `bit-out/lib` staying genuinely stage0-built).
 #
-# Emits <outdir>/bit-<version>-<os>-<arch>.tar.xz. The artifact contract this
-# implements — layout, naming, the BIT_STDLIB/BIT_LIBBITRT env requirement — is
-# specified in dist/README.md and consumed by the brew formula (#359), the
-# curl|sh installer (#360) and the winget package (#361). Change it there first.
+# Emits <outdir>/bit-<version>-<os>-<arch>.tar.xz — except x86_64-windows,
+# which emits a .zip (#3342: a Windows user has no tar.xz extractor by
+# default). The artifact contract this implements — layout, naming, the
+# BIT_STDLIB/BIT_LIBBITRT env requirement — is specified in dist/README.md and
+# consumed by the brew formula (#359), the curl|sh installer (#360) and the
+# winget package (#361). Change it there first.
 set -euo pipefail
 
 VERSION="${1:?usage: package.sh <version> <target> <outdir> [archivedir]}"
@@ -36,9 +39,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARCHIVE_DIR="${4:-${ROOT}/bit-out/lib}"
 
 case "${TARGET}" in
-  x86_64-linux)   OS=linux;  ARCH=x86_64 ;;
-  aarch64-linux)  OS=linux;  ARCH=aarch64 ;;
-  aarch64-macos)  OS=macos;  ARCH=aarch64 ;;
+  x86_64-linux)   OS=linux;   ARCH=x86_64;  BIN_NAME=bit ;;
+  aarch64-linux)  OS=linux;   ARCH=aarch64; BIN_NAME=bit ;;
+  aarch64-macos)  OS=macos;   ARCH=aarch64; BIN_NAME=bit ;;
+  x86_64-windows) OS=windows; ARCH=x86_64;  BIN_NAME=bit.exe ;;
   *) echo "package.sh: unsupported target '${TARGET}'" >&2; exit 2 ;;
 esac
 
@@ -47,12 +51,21 @@ esac
 # same install. x86_64-macos is deliberately absent: `./make libbitrt`
 # emits it, but no compiler target selects it (the Mach-O linker has no x86-64
 # relocation support yet), so shipping it would advertise a target that fails.
+#
+# x86_64-windows's OWN archive is added ONLY for the windows package, not
+# folded into the base list every target ships: the three existing artifacts
+# must stay byte-identical across this change (#3342 acceptance), and adding a
+# fourth member here would change what they contain. The windows package still
+# needs its own archive so a bare `bit.exe run foo.bit` resolves it without an
+# explicit BIT_LIBBITRT, the same as every other target already does for
+# itself.
 RUNTIME_TRIPLES="x86_64-linux aarch64-linux aarch64-macos"
+[ "${TARGET}" = "x86_64-windows" ] && RUNTIME_TRIPLES="${RUNTIME_TRIPLES} x86_64-windows"
 
 NAME="bit-${VERSION}-${OS}-${ARCH}"
 STAGE="${OUTDIR}/stage"
 
-[ -x "${STAGE}/bin/bit" ] || { echo "package.sh: missing ${STAGE}/bin/bit" >&2; exit 1; }
+[ -x "${STAGE}/bin/${BIN_NAME}" ] || { echo "package.sh: missing ${STAGE}/bin/${BIN_NAME}" >&2; exit 1; }
 
 for triple in ${RUNTIME_TRIPLES}; do
   src="${ARCHIVE_DIR}/${triple}/libbitrt.a"
@@ -129,8 +142,23 @@ fi
 # compiler globs those as real sources — a macOS-built artifact then fails to
 # compile anything at all. Caught by unpacking a macOS-built package inside a
 # Linux container; the `--exclude`s above are the belt to this suspenders.
-COPYFILE_DISABLE=1 tar -C "${OUTDIR}" "${TARFLAGS[@]}" -cf - -T "${MEMBERS}" | xz -9 -T0 > "${OUTDIR}/${NAME}.tar.xz"
+#
+# A Windows user has no tar.xz extractor by default (#3342), so x86_64-windows
+# ships a .zip instead — everything above this line (staging, mtime
+# normalisation, member ordering) is format-agnostic and applies unchanged.
+if [ "${OS}" = "windows" ]; then
+  ARTIFACT="${OUTDIR}/${NAME}.zip"
+  rm -f "${ARTIFACT}"
+  # -X: no extra timestamp/uid-gid fields (the mtime normalisation above is
+  # what actually makes this reproducible; -X stops zip re-adding its own
+  # higher-precision timestamps on top of it). -x: belt to tar's --exclude
+  # suspenders above, in case a stray macOS sidecar ever lands in the tree.
+  ( cd "${OUTDIR}" && zip -q -X -r "${ARTIFACT}" -@ -x '*.DS_Store' -x '*._*' < "${MEMBERS}" )
+else
+  ARTIFACT="${OUTDIR}/${NAME}.tar.xz"
+  COPYFILE_DISABLE=1 tar -C "${OUTDIR}" "${TARFLAGS[@]}" -cf - -T "${MEMBERS}" | xz -9 -T0 > "${ARTIFACT}"
+fi
 rm -f "${MEMBERS}"
 rm -rf "${OUTDIR:?}/${NAME}"
 
-echo "${OUTDIR}/${NAME}.tar.xz"
+echo "${ARTIFACT}"
