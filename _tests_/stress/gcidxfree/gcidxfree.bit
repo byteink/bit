@@ -1,0 +1,118 @@
+// `reserveReclaimChunks` (runtime/gc/mem.bit, #3179): the address->object
+// index's orphaned reserve chunks come back to the OS.
+//
+// WHY THIS EXISTS. `gcIdxRes` (`./gcindex.bit`) is a bump reserve with no free
+// list, and `idxGrow` retires an old table on almost every capacity growth —
+// each growth overwrites `gcIdxSpareAddr`/`gcIdxSpareCap` with the table that
+// was live a moment ago, silently discarding whatever address was in spare
+// before (#3147's own framing: "every smaller table ever allocated ...
+// permanently resident"). #3179 adds `reserveReclaimChunks`, called from
+// `idxGrow` after every growth, to unmap the chunk such a table is left alone
+// in. This program drives the primitive DIRECTLY — the same way
+// `_tests_/stress/gcreserve`'s `checkSpans` drives `reserveGrow`/`reserveRelease`
+// directly — because reaching the natural growth trigger from real object
+// counts needs hundreds of thousands of live entries to force a second 4 MiB
+// chunk; the primitive itself needs only a handful of `reserveGrow` calls.
+//
+// TWO PROTECTIONS, TWO CHECKS:
+//
+//   1. A CHUNK STILL REACHABLE FROM A "KEEP" RANGE IS NEVER RECLAIMED. Three
+//      chunks are built (31 spans each fills one, per `gcreserve`'s own
+//      count); the middle one is named as a keep range and must still hold
+//      its sentinel after the first reclaim pass, and must be GONE (chunk
+//      count down by exactly one) once a second pass names no keep range at
+//      all.
+//   2. THE HEAD CHUNK IS NEVER RECLAIMED, EVEN WHEN NOTHING NAMES IT. It is
+//      read back after EVERY reclaim call in this program, including the
+//      last, and a `reserveGrow` for one more span after both reclaims must
+//      still succeed without mapping a fourth chunk — proof that
+//      `resBump`/`resEnd` (which point into the head chunk) were never
+//      invalidated.
+//
+// MUTATION-PROVEN, NOT ASSUMED: removing protection 2 (the loop starting
+// at `head` instead of past it) makes this program's own head-chunk read-back
+// dereference memory the mutated reclaim call just unmapped — a wild read,
+// the same failure SHAPE #2375's mutation A produced (`bit build` dereferencing
+// memory its own mutated runtime had unmapped, exit 139). See the task's
+// ticket comment for the observed exit code with that mutation applied.
+//
+// No private `Gc`/heap state at all: this is a raw exercise of the reserve
+// primitive, so nothing here depends on the ambient collector's mode.
+
+import { allocSpanBytes } from "../../../runtime/alloc"
+import { reserveWords, reserveInit, reserveGrow, reserveReclaimChunks, reserveRelease,
+  reserveChunkCount, reserveChunkBytesMapped, loadWord, storeWord } from "../../../runtime/gc"
+
+// A 4 MiB chunk holds 31 `allocSpanBytes` takes (the chunk's own 16-byte
+// header plus the alignment gap ahead of the first span-aligned address costs
+// one span's worth — see `_tests_/stress/gcreserve`'s own comment).
+const SPANS_PER_CHUNK: int = 31
+const CHUNK_BYTES: int = 4194304
+
+// Enough takes for three distinct chunks: chunk1 filled (0..30), chunk2
+// filled (31..61), chunk3 (the head) holding just two spans (62..63) with
+// plenty of room left for the post-reclaim take in step 4.
+const TAKES: int = 64
+
+const SENTINEL: int = 981723456891
+
+fn main() {
+  let desc = []i64(reserveWords)
+  let got = []i64(TAKES)
+  let r = ptrOf(desc)
+  reserveInit(r, 0, 0)
+
+  let ok = 1
+  let i = 0
+  while (i < TAKES) {                       // bounded: TAKES iterations
+    let s = reserveGrow(r, allocSpanBytes)
+    if (s == 0) { ok = 0 }
+    got[i] = s
+    i = i + 1
+  }
+  if (reserveChunkCount(r) != 3) { ok = 0 }
+  if (reserveChunkBytesMapped(r) != 3 * CHUNK_BYTES) { ok = 0 }
+
+  let chunk1Span = got[0]
+  let chunk2Span = got[31]
+  let chunk3Span = got[62]                  // in the head chunk
+  storeWord(chunk1Span, SENTINEL + 1)
+  storeWord(chunk2Span, SENTINEL + 2)
+  storeWord(chunk3Span, SENTINEL + 3)
+
+  // Pass 1: keep only chunk2's span. chunk1 has no keep range at all and must
+  // go; chunk3 is the head and must survive regardless of not being named.
+  let freed1 = reserveReclaimChunks(r, chunk2Span, allocSpanBytes, 0, 0)
+  if (freed1 != CHUNK_BYTES) { ok = 0 }
+  if (reserveChunkCount(r) != 2) { ok = 0 }
+  if (reserveChunkBytesMapped(r) != 2 * CHUNK_BYTES) { ok = 0 }
+  // chunk2 (kept) must still read back its sentinel.
+  if (loadWord(chunk2Span) != SENTINEL + 2) { ok = 0 }
+  // chunk3 (head) must still read back its sentinel — protection 2. This is
+  // the read the head-skip mutation turns into a wild dereference.
+  if (loadWord(chunk3Span) != SENTINEL + 3) { ok = 0 }
+
+  // Pass 2: keep nothing. chunk2 must now go too; chunk3 (still the head)
+  // must still survive with no keep range naming it at all.
+  let freed2 = reserveReclaimChunks(r, 0, 0, 0, 0)
+  if (freed2 != CHUNK_BYTES) { ok = 0 }
+  if (reserveChunkCount(r) != 1) { ok = 0 }
+  if (reserveChunkBytesMapped(r) != CHUNK_BYTES) { ok = 0 }
+  if (loadWord(chunk3Span) != SENTINEL + 3) { ok = 0 }
+
+  // The reserve is still usable: `resBump`/`resEnd` were never invalidated by
+  // either reclaim, so one more span-sized take must succeed and must land
+  // inside the SAME (still only) chunk — chunk3 had room for 29 more spans.
+  let extra = reserveGrow(r, allocSpanBytes)
+  if (extra == 0) { ok = 0 }
+  if (reserveChunkCount(r) != 1) { ok = 0 }
+
+  // Teardown: the one remaining chunk comes back, and the reserve reports
+  // empty afterward, exactly as `gcreserve`'s own teardown does.
+  let freed3 = reserveRelease(r)
+  if (freed3 != CHUNK_BYTES) { ok = 0 }
+  if (reserveChunkCount(r) != 0) { ok = 0 }
+  if (reserveChunkBytesMapped(r) != 0) { ok = 0 }
+
+  print("gcidxfree ${ok}\n")
+}

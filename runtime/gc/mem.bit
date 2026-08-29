@@ -510,6 +510,83 @@ export @nosplit fn reserveHeadOwns(r: *i64, addr: int, nbytes: int): bool {
   return addr
 }
 
+// ---------------------------------------------------------------------------
+// Selective (live) reclaim (#3179): unmap a reserve's DEAD chunks without
+// tearing the reserve down.
+// ---------------------------------------------------------------------------
+//
+// `reserveRelease` below is the teardown form: every chunk goes, and the
+// reserve cannot be used again without a fresh `reserveInit`. #3179's problem
+// is different — `./gcindex.bit`'s `idxGrow` retires an old table on almost
+// every capacity growth (parking the new spare over whatever the old one was,
+// see that function's own comment), and the CHUNK an abandoned table lived in
+// has no owner left at all once neither the live table nor the spare table
+// reaches into it any more. `gcIdxRes` is a bump reserve with no free list
+// (#3147's own framing), so nothing has ever taken such a chunk back — this
+// is that.
+//
+// TWO PROTECTIONS, BOTH REQUIRED, NEITHER OPTIONAL:
+//
+//   1. ONLY A CHUNK THIS RESERVE ITSELF MAPPED IS EVEN CONSIDERED. Walking
+//      `*(r + resChunks)` is the whole guarantee: exactly as `reserveRelease`
+//      documents above, memory a caller handed to `reserveInit` — `boot`'s own
+//      arena, or a stress fixture's Bit-managed `[]i64` (`gcindexchurn`) — is
+//      never pushed onto that list, so it can never be reached from here no
+//      matter what the caller passes as a keep range. This is the same
+//      "confirmed reserve-owned" gate #2375's `spanOwned`/`reserveHeadOwns`
+//      exist for on the span side; punching a caller-bound arena there is the
+//      hazard this ticket's constraint names explicitly.
+//
+//   2. THE HEAD CHUNK IS NEVER RECLAIMED, UNCONDITIONALLY, REGARDLESS OF THE
+//      KEEP RANGES. `resBump`/`resEnd` always point INSIDE the head chunk
+//      (`reserveGrow` sets both together — see its own comment), so a live
+//      `reserveTake` may still hand out an address in it even when nothing
+//      the CALLER currently tracks (a live/spare table, here) happens to
+//      reach into it yet. Reclaiming it anyway would leave `resBump`/`resEnd`
+//      pointing into unmapped memory — the next `reserveTake` returns a
+//      dangling address as if it were fresh, silently. The walk therefore
+//      starts one node PAST the head, mirroring the same "never touch the
+//      chunk `reserveHeadOwns` guards" restraint the span side already
+//      observes, from the other direction: that function protects a span
+//      freshly carved FROM the head; this protects the head chunk ITSELF from
+//      ever being a candidate.
+//
+// `keepAddr2`/`keepLen2` may be a second live range (`gcIdxRes` has two: the
+// live table and the one-slot spare `idxGrow` caches) or 0/0 for "none" — an
+// empty or non-positive length never matches, so passing 0/0 for an unused
+// slot is exact rather than a special case the walk has to detect.
+//
+// Bounded: one iteration per chunk this reserve has mapped, same as every
+// other walk in this file.
+export @nosplit fn reserveReclaimChunks(r: *i64, keepAddr1: int, keepLen1: int, keepAddr2: int, keepLen2: int): int {
+  let freed = 0
+  let head = *(r + resChunks)
+  if (head == 0) {
+    return 0
+  }
+  let prev = head
+  let c = loadWord(head + chunkNextOff)   // start PAST the head — see protection 2 above
+  while (c != 0) {
+    let next = loadWord(c + chunkNextOff)
+    let nbytes = loadWord(c + chunkLenOff)
+    let keep = keepLen1 > 0 && keepAddr1 < c + nbytes && c < keepAddr1 + keepLen1
+    if (!keep && keepLen2 > 0 && keepAddr2 < c + nbytes && c < keepAddr2 + keepLen2) {
+      keep = true
+    }
+    if (keep) {
+      prev = c
+    } else {
+      // Unlink first: `memUnmapPages` makes `c` unreadable, and `chunkNextOff`
+      // is `c`'s own first word.
+      storeWord(prev + chunkNextOff, next)
+      memUnmapPages(c, nbytes)
+      freed = freed + nbytes
+    }
+    c = next
+  }
+  return freed
+}
+
 // Unmap every chunk this reserve mapped, and report how many bytes went back to
 // the OS. The reserve is EMPTY afterwards, not merely rewound: `resEnd` and
 // `resBump` are zeroed, so a later `reserveTake` returns 0 and a later
