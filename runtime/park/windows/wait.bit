@@ -189,7 +189,7 @@ export @symbol("bit_rt_port_park_mono_ns") @nosplit fn parkMonoNs(scratch: *i64)
 // park-bound fix (both express sub-ms waits natively via
 // nanosleep/clock_nanosleep). The fix is `CreateWaitableTimerExW` with
 // `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` in place of the pseudo-handle
-// trick below, which stays as the fallback — see `parkHighResTimer`.
+// trick below, which stays as the fallback.
 fn createWaitableTimerHighResolution(): i32 { return i32(2) }
 
 // SYNCHRONIZE | TIMER_MODIFY_STATE — the two access rights this provider
@@ -197,103 +197,111 @@ fn createWaitableTimerHighResolution(): i32 { return i32(2) }
 // TIMER_ALL_ACCESS.
 fn timerAccessMask(): i32 { return i32(0x00100002) }
 
-// A HANDLE value CreateWaitableTimerExW itself can never return on success
-// — used purely as this module's own "already tried, and it did not work"
-// sentinel so `parkHighResTimer` never repeats a failing create every sleep.
-fn timerUnsupported(): int { return -1 }
-
-@nosplit fn handleOf(addr: int): *byte {
-  let z: *byte = nil
-  return z + addr
-}
-
-// The cached high-resolution waitable timer for THIS caller, or nil if none
-// is available.
+// NO PER-CALLER HANDLE CACHE — a first version of this tried to stash the
+// created HANDLE in `scratch` across calls and measured ZERO improvement on
+// real hardware. Root cause: `scratch` is NOT free storage this function
+// owns. Every call site computes its `ns` argument as
+// `schedParkBoundNs(backoff, parkMonoNs(w + wkSleepReq))`, and `parkMonoNs`
+// (above) writes a fresh QueryPerformanceCounter tick straight into
+// `*scratch` as its OWN scratch use, immediately before `parkSleepNs` runs.
+// So a "cached handle" read back from `scratch` was actually a QPC
+// timestamp, `SetWaitableTimer` silently failed against that garbage
+// handle every time, and every call fell through to the millisecond floor
+// below — exactly the "no differential effect at any granularity" result
+// this ticket exists to fix, just moved one level down. `scratch` is safe
+// to use as WRITE-THEN-IMMEDIATELY-READ scratch within a single call (this
+// function does, for the due-time buffer below) but never as read-before-
+// write cross-call state.
 //
-// `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` is documented as introduced in
-// Windows 10 version 1803; this project states no minimum Windows version,
-// has no pre-1803 hardware to test against, and there is no reliable
-// documentation of whether an unrecognized dwFlags bit fails the call
-// outright or is silently ignored there. So this never assumes success:
-// a NULL return is cached and every later call from this same caller falls
-// straight through to the millisecond-floored `WaitForSingleObject` path
-// below, unchanged from before this ticket. Either way there is no
-// correctness risk — a normal-resolution timer still sleeps the requested
-// duration, just without the sub-ms accuracy this ticket adds.
-//
-// ONE HANDLE PER CALLER, CACHED FOREVER, NOT PER CALL: `scratch` is the
-// same caller-owned 2-word buffer every provider's `parkSleepNs` already
-// takes (`w + wkSleepReq` per worker, `bootSleepReq` for the boot thread —
-// see the call sites in ../../root/windows/boot.bit) and, on Windows, was
-// previously unused entirely. Cell 0 caches the created HANDLE (or the
-// unsupported sentinel above); cell 1 is transient scratch for the
-// LARGE_INTEGER `SetWaitableTimer` reads its due time through, below. Each
-// caller is exactly one OS thread for its whole lifetime — a worker's own
-// `w`, or the one boot thread — so neither cell is ever touched
-// concurrently, the same premise ../darwin's and ../linux's own scratch
-// buffers rely on. Total handles created over a program's life is bounded
-// by `schedMaxWorkers + 1` (one per worker, one for the boot thread), never
-// unbounded.
-fn parkHighResTimer(scratch: *i64): *byte {
-  let cached = *(scratch + 0)
-  if (cached == i64(timerUnsupported())) {
-    let z: *byte = nil
-    return z
-  }
-  if (cached != i64(0)) {
-    return handleOf(int(cached))
-  }
-  let nullAttrs: *byte = nil
-  let nullName: *byte = nil
-  let h = CreateWaitableTimerExW(nullAttrs, nullName,
-      createWaitableTimerHighResolution(), timerAccessMask())
-  if (int(h) == 0) {
-    *(scratch + 0) = i64(timerUnsupported())
-  } else {
-    *(scratch + 0) = i64(int(h))
-  }
-  return h
-}
+// So this creates and closes a real timer on every call instead. No
+// per-caller identity is needed to make that cheap where it matters: the
+// one thing worth remembering across calls is whether
+// `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` works AT ALL, and that is a
+// property of the running Windows version, not of the caller — identical
+// for every thread, exactly the argument `winQpcFreq` above already makes
+// for caching `QueryPerformanceFrequency`. So `winHighResTimerKnown` is one
+// shared module word, racing initializers are harmless (every thread that
+// determines it writes the same verdict), and a known-unsupported host
+// (pre-1803; this project states no minimum Windows version and has no
+// such hardware to test against) skips straight to the millisecond
+// fallback instead of retrying a doomed create on every idle turn.
+// 0 = not yet known, 1 = supported, -1 = known unsupported.
+let winHighResTimerKnown: int = 0
 
-// `Sleep` itself is not in compiler/pesyms.bit's admitted surface (nothing in
-// Stage B calls it), so the fallback path uses the same substitute
-// `runtime/root/windows/boot.bit` used before this file existed:
-// WaitForSingleObject on `GetCurrentProcess()`'s pseudo-handle, which is
-// never signaled by anything this process does, so the wait always times
-// out — exactly a sleep, with no separate `Sleep` import needed. Rounded up
-// to whole milliseconds, 1ms minimum: WaitForSingleObject takes no finer
-// unit. `scratch`'s call-site shape is unchanged
-// (`parkSleepNs(backoff, w + wkSleepReq)`), which is what lets
-// ../../root/windows/boot.bit's worker loop match ../linux and ../darwin's
-// line for line.
-export @symbol("bit_rt_port_park_sleep_ns") fn parkSleepNs(ns: int, scratch: *i64) {
-  if (ns <= 0) {
-    return
-  }
-  let timer = parkHighResTimer(scratch)
-  if (int(timer) != 0) {
-    // Negative DueTime is relative to now, in 100ns units — the finest
-    // SetWaitableTimer takes. Rounded UP so the achieved wait is never
-    // shorter than requested, the same "sleep at least ns" contract
-    // ../darwin's and ../linux's own nanosleep/clock_nanosleep calls give.
-    let hundredNs = (ns + 99) / 100
-    if (hundredNs < 1) {
-      hundredNs = 1
+extern fn CloseHandle(handle: *byte): i32
+
+// MEASURED ON REAL HARDWARE (mustafa-desktop-win): the high-res timer ALONE
+// (`parkCoarseSleep` below, with no spin) cut a 200us-nominal request from
+// ~1.41ms achieved (7.06x, the pre-#3917 floor) to ~522us (2.61x) — a real,
+// large improvement, but still short of the 1.15x bar, because the timer's
+// OWN OS-thread-wakeup jitter (~300-500us observed here) is larger than the
+// 200us request itself. That jitter cannot be slept away — it happens
+// DURING the OS wait, so nothing after the wait returns can correct for it.
+// The only way to close it is to ask the OS for LESS than the full `ns` and
+// make up the remainder with a precise busy-poll of the monotonic clock,
+// exactly the "short busy-wait for the final residual" this ticket names as
+// an acceptable alternate direction.
+//
+// `parkSpinBudgetNs` is deliberately not zero and not `ns` itself: below it,
+// asking the OS for `ns - budget` would be negative or negligible, so
+// `parkSleepNs` skips `parkCoarseSleep` entirely and busy-polls the WHOLE
+// duration — the only reliable way to hit sub-500us precision on this
+// hardware. Above it, `parkCoarseSleep` still does the OS-blocking (near
+// zero CPU) work for the bulk of the wait, and the spin below only closes
+// the last `parkSpinBudgetNs`-ish gap. `parkMaxBackoffNs` (1ms, ../park.bit)
+// is above this budget, so the worker's REAL, sustained-idle backoff value
+// (the one it spends almost all idle time parked at, since exponential
+// backoff reaches the 1ms cap within ~10 doublings) gets the hybrid, not
+// the full spin — only the brief ramp-up right after each idle spell begins
+// pays the full-spin cost, bounded at roughly `parkSpinBudgetNs` total.
+fn parkSpinBudgetNs(): int { return 500000 }
+
+// The OS-blocking half of the sleep: `CreateWaitableTimerExW` with
+// `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, falling back to the original
+// millisecond-floored `WaitForSingleObject` pseudo-handle trick — see
+// `winHighResTimerKnown`'s own comment above for why no per-caller state is
+// needed here. `Sleep` itself is not in compiler/pesyms.bit's admitted
+// surface (nothing in Stage B calls it), which is why the fallback is the
+// same substitute `runtime/root/windows/boot.bit` used before this file
+// existed.
+fn parkCoarseSleep(ns: int, scratch: *i64) {
+  if (winHighResTimerKnown >= 0) {
+    let nullAttrs: *byte = nil
+    let nullName: *byte = nil
+    let timer = CreateWaitableTimerExW(nullAttrs, nullName,
+        createWaitableTimerHighResolution(), timerAccessMask())
+    if (int(timer) != 0) {
+      winHighResTimerKnown = 1
+      // Negative DueTime is relative to now, in 100ns units — the finest
+      // SetWaitableTimer takes. Rounded UP so the achieved wait is never
+      // shorter than requested, the same "sleep at least ns" contract
+      // ../darwin's and ../linux's own nanosleep/clock_nanosleep calls
+      // give. `scratch` is written here and read back immediately by
+      // `SetWaitableTimer` within this same call — never relied on across
+      // calls (see `winHighResTimerKnown`'s header above).
+      let hundredNs = (ns + 99) / 100
+      if (hundredNs < 1) {
+        hundredNs = 1
+      }
+      *scratch = i64(-hundredNs)
+      let nullRoutine: *byte = nil
+      let ok = SetWaitableTimer(timer, scratch, 0, nullRoutine, nullRoutine, 0)
+      if (ok != 0) {
+        // Always returns WAIT_TIMEOUT — nothing else signals this timer —
+        // so the result carries no information; discarded like the
+        // pseudo-handle wait below.
+        let _ = WaitForSingleObject(timer, infiniteMs())
+        let _ = CloseHandle(timer)
+        return
+      }
+      // SetWaitableTimer failing after a successful create is not observed
+      // in testing and not expected (it would need a corrupted handle),
+      // but falling through to the millisecond path is strictly safer than
+      // silently skipping the sleep.
+      let _ = CloseHandle(timer)
+    } else {
+      winHighResTimerKnown = -1
     }
-    *(scratch + 1) = i64(-hundredNs)
-    let nullRoutine: *byte = nil
-    let ok = SetWaitableTimer(timer, scratch + 1, 0, nullRoutine, nullRoutine, 0)
-    if (ok != 0) {
-      // Always returns WAIT_TIMEOUT — nothing else signals this timer — so
-      // the result carries no information; discarded like the pseudo-handle
-      // wait below.
-      let _ = WaitForSingleObject(timer, infiniteMs())
-      return
-    }
-    // SetWaitableTimer failing after a successful create is not observed
-    // in testing and not expected (it would need a corrupted handle), but
-    // falling through to the millisecond path is strictly safer than
-    // silently skipping the sleep.
   }
   let ms = ns / nsPerMs()
   if (ms < 1) {
@@ -302,6 +310,29 @@ export @symbol("bit_rt_port_park_sleep_ns") fn parkSleepNs(ns: int, scratch: *i6
   // Always returns WAIT_TIMEOUT — the pseudo-handle never signals — so the
   // result carries no information; discarded like the two QPC calls above.
   let _ = WaitForSingleObject(GetCurrentProcess(), i32(ms))
+}
+
+// `scratch`'s call-site shape is unchanged (`parkSleepNs(backoff,
+// w + wkSleepReq)`), which is what lets ../../root/windows/boot.bit's
+// worker loop match ../linux and ../darwin's line for line.
+export @symbol("bit_rt_port_park_sleep_ns") fn parkSleepNs(ns: int, scratch: *i64) {
+  if (ns <= 0) {
+    return
+  }
+  let start = parkMonoNs(scratch)
+  let sleepPart = ns - parkSpinBudgetNs()
+  if (sleepPart > 0) {
+    parkCoarseSleep(sleepPart, scratch)
+  }
+  // Busy-poll the residual `parkCoarseSleep` left behind — a no-op if that
+  // call's own OS-wakeup jitter already overshot `ns` (the common case once
+  // `sleepPart` is a few hundred us or more), and the ONLY way to close the
+  // gap when `sleepPart <= 0` and nothing was slept at all. Bounded in real
+  // time by construction: `parkCoarseSleep` already waited at least
+  // `sleepPart`, so this loop runs for at most `ns - sleepPart`, i.e.
+  // `min(ns, parkSpinBudgetNs())` — a fixed, small ceiling, never unbounded.
+  while (parkMonoNs(scratch) - start < ns) {
+  }
 }
 
 // ---------------------------------------------------------------------------
