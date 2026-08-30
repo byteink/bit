@@ -16,7 +16,7 @@ freestanding boot entrypoints (`boot()`, `workerBody()`,
 `mapGuardedStack()`), raw syscall/`asm` wrappers, or direct ports of
 published numerical algorithms (Dragon4 float formatting, fdlibm-style
 `pow`/`atan`). None of those can be safety-verified by a clean build — this
-is the tree where `root.bit` refuses to boot unless `gcWords == 37`
+is the tree where `root.bit` refuses to boot unless `gcWords == 39`
 (`runtime/root/**`) and a passing compile says nothing about whether the
 result still boots on darwin/linux/windows. So the default here is reversed:
 **override is the norm, fix is the exception**, and every fix decision below
