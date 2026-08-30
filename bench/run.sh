@@ -12,7 +12,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."          # repo root
 BIT=./bit-out/bin/bit
-CASES="fib mandelbrot collatz alloc strings map sort matrix json"
+CASES="fib mandelbrot collatz alloc allocflat strings map sort matrix json"
 RUNS=7                           # timed runs per case; median reported
 CRUNS=3                          # compile-time samples per case; median reported
 STARTUP_ITERS=200                # exec count for startup timing
@@ -26,11 +26,27 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 RES="$WORK/res"      # lines: "<case> <lang> <median_s> <rss_bytes> <bin_bytes>"
 : > "$RES"
+ALC="$WORK/alc"      # lines: "<case> <lang> <heap_allocations_per_run>"
+: > "$ALC"
 
 now()    { perl -MTime::HiRes -e 'printf "%.6f\n", Time::HiRes::time()'; }
 median() { sort -n | awk '{a[NR]=$1} END{n=NR; if(n%2){print a[(n+1)/2]} else {printf "%.6f\n",(a[n/2]+a[n/2+1])/2}}'; }
 size()   { stat -f%z "$1"; }
 get()    { awk -v c="$1" -v l="$2" -v k="$3" '$1==c&&$2==l{print $(k)}' "$RES"; }  # k: 3=s 4=rss 5=bin
+alc()    { awk -v c="$1" -v l="$2" '$1==c&&$2==l{print $3}' "$ALC"; }
+alcmd()  { n=$(alc "$1" "$2"); [ -n "$n" ] && echo "$n" || echo "—"; }
+
+# Heap allocations one run of a case performs, per language — the number that
+# proves the three sources still express the SAME data structure (#3934: the
+# Bit side of `alloc` silently became a slice of inline values while the Go and
+# C sides kept allocating per node, and the row compared them for a day). Bit
+# reports it from the runtime (BIT_GC_STATS, every case); Go and C report it
+# only where the source opts in (see bench/cases/alloc/alloc.go's
+# `reportAllocs` and alloc.c's BENCH_ALLOC_STATS), and print "—" otherwise.
+bit_allocs() { awk '{for(i=1;i<=NF;i++){if($i~/^swept=/){s=substr($i,7)}
+                     if($i~/^live=/){l=substr($i,6)}}}
+                END{if(s!="")print s+l}' "$1"; }
+tag_allocs() { awk '/^\[allocs\]/{print $2}' "$1"; }
 
 # Runs $@ once under /usr/bin/time -l, echoes "<real_seconds> <max_rss_bytes>".
 time_run() {
@@ -55,8 +71,21 @@ for c in $CASES; do
   cc $CFLAGS "$d/$c.c" -o "$WORK/$c.c"
   go build -o "$WORK/$c.go" "$d/$c.go"
 
-  # --- correctness gate ---
-  ob=$("$WORK/$c.bit"); oc=$("$WORK/$c.c"); og=$("$WORK/$c.go")
+  # --- correctness gate, doubling as the allocation-count probe ---
+  # Both stats env vars write to STDERR only, so stdout stays the answer this
+  # gate compares and no extra run is needed for the counts. The timed runs
+  # below set neither.
+  ob=$(BIT_GC_STATS=1 "$WORK/$c.bit" 2>"$WORK/ab")
+  oc=$("$WORK/$c.c")
+  og=$(BENCH_ALLOC_STATS=1 "$WORK/$c.go" 2>"$WORK/ag")
+  echo "$c bit $(bit_allocs "$WORK/ab")" >> "$ALC"
+  echo "$c go $(tag_allocs "$WORK/ag")" >> "$ALC"
+  if grep -q BENCH_ALLOC_STATS "$d/$c.c"; then
+    # A counting build, never the timed one: the counter is a malloc macro.
+    cc $CFLAGS -DBENCH_ALLOC_STATS "$d/$c.c" -o "$WORK/$c.cstat"
+    "$WORK/$c.cstat" >/dev/null 2>"$WORK/ac"
+    echo "$c c $(tag_allocs "$WORK/ac")" >> "$ALC"
+  fi
   if [ "$c" = mandelbrot ]; then
     # cross-compiler float results differ by FMA contraction; allow 0.01%.
     awk -v a="$ob" -v b="$oc" -v g="$og" 'BEGIN{
@@ -76,7 +105,7 @@ for c in $CASES; do
     done
     echo "$c $l $(median < "$WORK/rs") $(median < "$WORK/ms") $(size "$WORK/$c.$l")" >> "$RES"
   done
-  echo "  $c ok (= $ob)"
+  echo "  $c ok (= $ob) allocs bit=$(alcmd "$c" bit) go=$(alcmd "$c" go) c=$(alcmd "$c" c)"
 done
 
 # --- startup: median per-exec ms over a tight loop ---
@@ -133,6 +162,14 @@ md="$WORK/results.md"
     echo "| $c | $(mb "$(get "$c" bit 4)") MB | $(mb "$(get "$c" go 4)") MB | $(mb "$(get "$c" c 4)") MB |"
   done
   echo
+  echo "### Heap allocations per run — the equivalence check, not a score"
+  echo
+  echo "| Benchmark | Bit | Go | C |"
+  echo "|---|--:|--:|--:|"
+  for c in $CASES; do
+    echo "| $c | $(alcmd "$c" bit) | $(alcmd "$c" go) | $(alcmd "$c" c) |"
+  done
+  echo
   echo "### Binary size — static, as emitted"
   echo
   echo "| Benchmark | Bit | Go | C |"
@@ -152,6 +189,8 @@ md="$WORK/results.md"
   echo "> Machine: ${CPU}, macOS ${OSV}. Bit @ \`${GITSHA}\`, Go $(go version | awk '{print $3}'), $(cc --version | head -1)."
   echo "> Method: median of ${RUNS} runs. C built \`cc ${CFLAGS}\`, Go \`go build\`, Bit \`bit build\` — each language's standard optimized build."
   echo "> Mandelbrot: Bit and C agree to the last bit; Go differs by ~0.0002% because it contracts \`a*b+c\` to a hardware FMA. Not a bug — cross-compiler float bit-identity is not guaranteed."
+  echo "> alloc measures the ALLOCATOR: 10M short-lived nodes, each its own heap object in all three languages (Bit's element class has a reference field, Go holds \`[]*Node\`, C mallocs per node). allocflat measures DATA LAYOUT: the same 10M nodes and the same printed total, stored by value in one buffer per batch (Bit packs \`[]Node\` inline since #3862, Go holds \`[]Node\`, C mallocs the batch once). The gap between the two rows is what per-node heap allocation costs a language."
+  echo "> The allocation table above is how those two claims are checked rather than asserted — same order of magnitude across a row means the three sources still express the same data structure, which is exactly what \`alloc\` silently lost for a day (#3934). Bit's count is \`swept+live\` from \`BIT_GC_STATS=1\`; Go's is \`runtime.MemStats.Mallocs\` and C's a \`malloc\` counter, both opt-in (\`BENCH_ALLOC_STATS\`, \`-DBENCH_ALLOC_STATS\`) and both absent from every timed binary."
   echo "> Generated by \`bench/run.sh\` on ${STAMP} — do not edit by hand."
 } > "$md"
 
