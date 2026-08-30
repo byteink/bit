@@ -67,6 +67,16 @@ let trustCacheState: i64 = 0 // 0 empty, 1 building, 2 ready
 // encoding's exact inverse — there is no tag, and nothing is optional.
 // ---------------------------------------------------------------------------
 
+// `runtime/alloc/bulkbytes.bit`, same three symbols #3207 wired into
+// stdlib/crypto/asn1.bit and pem.bit: one runtime call replaces an N-byte,
+// N-back-edge Bit loop, so under `BIT_GC=stress` N per-byte collections
+// collapse to the one already implicit at the call's own return address.
+// stdlib/http is a different module from stdlib/crypto, so these need their
+// own `extern fn` declarations here (#3207's own file: `bit_rt_panic` is
+// independently declared in four separate runtime modules the same way).
+extern fn bit_rt_bytes_copy(dst: *byte, src: *byte, n: int)
+extern fn bit_rt_bytes_equal(a: *byte, b: *byte, n: int): bool
+
 fn tcPutU32(buf: []byte, v: int): []byte {
   buf = append(buf, byte((v >> 24) & 0xff))
   buf = append(buf, byte((v >> 16) & 0xff))
@@ -75,12 +85,20 @@ fn tcPutU32(buf: []byte, v: int): []byte {
   return buf
 }
 
+// #3865: was an 8-iteration back-edge loop, called 6 times per certificate
+// (twice per publish attempt) -- unrolled to match tcPutU32's own shape two
+// functions above, in the same file. A fixed 8-trip loop still pays 8
+// collections per call under BIT_GC=stress; measured to be the difference
+// between clearing and missing this ticket's 10x floor on the real store.
 fn tcPutI64(buf: []byte, v: int): []byte {
-  let i = 56
-  while (i >= 0) {
-    buf = append(buf, byte((v >> i) & 0xff))
-    i = i - 8
-  }
+  buf = append(buf, byte((v >> 56) & 0xff))
+  buf = append(buf, byte((v >> 48) & 0xff))
+  buf = append(buf, byte((v >> 40) & 0xff))
+  buf = append(buf, byte((v >> 32) & 0xff))
+  buf = append(buf, byte((v >> 24) & 0xff))
+  buf = append(buf, byte((v >> 16) & 0xff))
+  buf = append(buf, byte((v >> 8) & 0xff))
+  buf = append(buf, byte(v & 0xff))
   return buf
 }
 
@@ -93,14 +111,19 @@ fn tcPutBool(buf: []byte, v: bool): []byte {
   return append(buf, byte(0))
 }
 
+// #3865: was an N-back-edge `append` loop over `b`, called per field of
+// every certificate (twice per cert: initial encode + tcTryPublish's
+// self-check re-encode). Two `bit_rt_bytes_copy` calls replace it, mirroring
+// asn1.bit's `asn1appendAll` (#3207) — `buf`'s already-built prefix plus `b`
+// copied into one freshly sized destination.
 fn tcPutBytes(buf: []byte, b: []byte): []byte {
   buf = tcPutU32(buf, len(b))
-  let i = 0
-  while (i < len(b)) {
-    buf = append(buf, b[i])
-    i = i + 1
-  }
-  return buf
+  let bn = len(buf)
+  let sn = len(b)
+  let out = []byte(bn + sn)
+  bit_rt_bytes_copy(ptrOf(out), ptrOf(buf), bn)
+  bit_rt_bytes_copy(ptrOf(out) + bn, ptrOf(b), sn)
+  return out
 }
 
 fn tcPutString(buf: []byte, s: string): []byte {
@@ -199,16 +222,21 @@ fn tcReadU32(rd: tcReader): int! {
   return v
 }
 
+// #3865: tcPutI64's mirror -- was the same 8-iteration back-edge loop,
+// unrolled the same way, matching tcReadU32's own already-unrolled shape
+// directly above.
 fn tcReadI64(rd: tcReader): int! {
   if (rd.pos + 8 > len(rd.buf)) {
     fail newError("trustcache: truncated i64")
   }
-  let v = 0
-  let i = 0
-  while (i < 8) {
-    v = (v << 8) | int(rd.buf[rd.pos + i])
-    i = i + 1
-  }
+  let v = (int(rd.buf[rd.pos]) << 56) |
+    (int(rd.buf[rd.pos + 1]) << 48) |
+    (int(rd.buf[rd.pos + 2]) << 40) |
+    (int(rd.buf[rd.pos + 3]) << 32) |
+    (int(rd.buf[rd.pos + 4]) << 24) |
+    (int(rd.buf[rd.pos + 5]) << 16) |
+    (int(rd.buf[rd.pos + 6]) << 8) |
+    int(rd.buf[rd.pos + 7])
   rd.pos = rd.pos + 8
   return v
 }
@@ -344,18 +372,14 @@ fn tcDecodeCertificates(buf: []byte): []Certificate! {
 // The cache itself
 // ---------------------------------------------------------------------------
 
+// #3865: was an independent copy of x509.bit's pre-#3207 `x509BytesEqual` —
+// same per-byte shape, never applied here. `bit_rt_bytes_equal` replaces it,
+// mirroring that fix exactly.
 fn tcBytesEqual(a: []byte, b: []byte): bool {
   if (len(a) != len(b)) {
     return false
   }
-  let i = 0
-  while (i < len(a)) {
-    if (a[i] != b[i]) {
-      return false
-    }
-    i = i + 1
-  }
-  return true
+  return bit_rt_bytes_equal(ptrOf(a), ptrOf(b), len(a))
 }
 
 // Attempt to publish `roots` as the process-wide default trust-store cache.
@@ -380,11 +404,11 @@ fn tcTryPublish(roots: []Certificate): bool {
   if (!tcBytesEqual(encoded, reencoded)) {
     return false
   }
-  let i = 0
-  while (i < len(encoded)) {
-    trustCacheBuf[i] = encoded[i]
-    i = i + 1
-  }
+  // #3865: was a per-byte loop copying up to trustCacheCap bytes one at a
+  // time into the fixed cache array. `ptrOf` on an array cell yields a
+  // pointer to its element 0, exactly like a slice (compiler/checkexpr.bit),
+  // so `bit_rt_bytes_copy` applies here unchanged.
+  bit_rt_bytes_copy(ptrOf(trustCacheBuf), ptrOf(encoded), len(encoded))
   trustCacheLen = i64(len(encoded))
   atomicStore(ptrOf(trustCacheState), 2)
   return true
@@ -392,14 +416,12 @@ fn tcTryPublish(roots: []Certificate): bool {
 
 // The cached roots, valid only once trustCacheState == 2 (the caller checks
 // via atomicLoad before calling this).
+// #3865: the cache-HIT mirror of tcTryPublish's copy above — every
+// newClient() call after the first pays this path, not just the miss.
 fn tcRead(): []Certificate! {
   let n = int(trustCacheLen)
   let out = []byte(n)
-  let i = 0
-  while (i < n) {
-    out[i] = trustCacheBuf[i]
-    i = i + 1
-  }
+  bit_rt_bytes_copy(ptrOf(out), ptrOf(trustCacheBuf), n)
   return tcDecodeCertificates(out)?
 }
 
