@@ -96,6 +96,28 @@ element, a shared box is indistinguishable from a copy, the same argument the
 spec already makes for `string`. Boxing a *mutable* tuple would silently convert
 a declared value type into a reference type.
 
+### 1.2 Payload-carrying enums
+
+A payload-carrying enum construction (`Enum.Variant(args)`) is **one**
+`gc_alloc`'d object, not two: `{ tag: i64 @0, arg0 @16, arg1 @24, ... }` (#4018).
+The tag word at offset 0 is never a GC reference; each argument word at
+`16 + 8*i` is listed in `ptr_offsets` (§2) exactly when that argument's static
+type holds a GC reference — there is no separate payload box and no
+intermediate payload pointer to trace. This is the same generic
+`(type, size, ptr_offsets)`-keyed shape every multi-field class already uses
+(§2); an enum's payload merely starts its fields at offset 16 instead of 0 to
+leave room for the tag.
+
+A **no-payload** variant construction (`Enum.NoArgVariant` or the bare tag
+reference `Enum.Variant`) is unaffected: a fixed 16-byte `{ tag: i64 @0,
+payload: i64 @8 }` object with the payload word always zero (`ptr_offsets`
+empty for a scalar-only enum's no-arg variant, since there is no reference to
+trace).
+
+`match` reads the tag at offset 0 (`matchTag`) regardless of shape, and binds
+arm `i`'s payload from `16 + 8*i` directly off the subject object
+(`bindArmPayload`) — there is no intermediate box read.
+
 ---
 
 ## 2. Per-type pointer maps (`TypeInfo`)
