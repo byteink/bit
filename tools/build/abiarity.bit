@@ -26,9 +26,47 @@
 // compares two compilers' OUTPUT over the SAME source, and both compilers
 // here are self-consistent, so there is nothing to diff. The check below
 // instead compares SOURCE, before any expensive or dangerous build runs:
-// every `@symbol("bit_rt_x")`-exported `runtime/**` function's declared
-// parameter count in the working tree, against the SAME symbol's arity in
-// the git tag stage0 was cut from (`dist/stage0/SHA256SUMS`).
+// the declared parameter count of every `@symbol("bit_rt_x")`-exported
+// `runtime/**` function THE COMPILER CAN ACTUALLY EMIT A CALL TO in the
+// working tree, against the SAME symbol's arity in the git tag stage0 was
+// cut from (`dist/stage0/SHA256SUMS`).
+//
+// NARROWED TO THE COMPILER'S OWN EMITTED-PRIMITIVE SET, #3936. The
+// mechanism above only exists for a symbol `stepSelfhost`'s stage0-compiled
+// `compiler/**` build ITSELF calls while compiling `compiler/**`'s OWN
+// source — which happens only for the small, closed set of primitives a
+// backend hardcodes a call to (`compilerEmittedSymbols()` below): the
+// `Op.RtCall` roster (`compiler/irrtfns.bit`'s `rtFnTags()`) plus the dozen
+// names each backend's `emitCallReloc`/`xCallReloc`/`emitCall` sites name
+// directly (gc_alloc, iface_lookup, safepoint, the four panic helpers,
+// world_addr/gc_addr, and the three scheduler-poll symbols). `compiler/**`
+// is itself a Bit program that uses slices, maps, strings, `new`,
+// interfaces and overflow-checked arithmetic throughout its OWN
+// implementation, so STAGE0 — not the tree's own resulting compiler —
+// emits the machine code for all of THAT usage, using stage0's own,
+// possibly-stale, hardcoded arity. A symbol `compiler/**` never references
+// at all (e.g. `bit_rt_port_park_wait`, `grep -rn park_wait compiler/` is
+// empty) has no such call site baked into stage0's output: its only
+// caller is other `runtime/**` source, which is always compiled fresh, in
+// one pass, by the tree's OWN just-built compiler (`g2archive.sh`/
+// `stepLibbitrt`), so caller and callee can never diverge in the first
+// place — a normal `extern fn` call is type-checked against whatever the
+// SAME compile sees, not baked into a previously-built binary.
+//
+// EMPIRICALLY VERIFIED, not just reasoned (#3936): a minimal g2archive.sh
+// repro mutating `bit_rt_slice_append`'s arity (an emitted primitive)
+// reproducibly corrupted a linked program's output under BOTH the pinned
+// stage0 and this tree's own compiler as the caller, while an analogous
+// mutation to a park_wait-shaped, never-emitted symbol (declaration and
+// implementation always co-compiled) was correct under all four
+// compiler/runtime pairings. And the real case this guard exists for
+// (#3152, `bit_rt_slice_new`+`bit_rt_slice_get`/`set`/`append`) is
+// unaffected by the narrowing: all five are in `rtFnTags()`. A REAL
+// single-pass build of the #3914 `bit_rt_port_park_wait` 3->4 change (at
+// `3bfc9090`, guard bypassed via the documented `BIT_STAGE0_BIN` escape
+// hatch) produced a compiler that ran a program and passed
+// `test-golden` (571/571) — the two-pass bootstrap this guard forced for
+// that change was never actually necessary.
 //
 // WHY THIS IS A SOUND PROXY FOR STAGE0'S OWN OPAQUE CALL-SITE TABLE, which we
 // cannot read directly (it is machine code inside an already-built binary):
@@ -279,6 +317,153 @@ fn abiSymbolKey(s: AbiSymbol): string {
   return s.file + ":" + s.name
 }
 
+// ---- #3936: the compiler's own emitted-primitive set ----------------------
+
+// Extracts `compiler/irrtfns.bit`'s `rtFnTags()` string list as text, the
+// same way `_tests_/bit/abimembers/scanners.bit`'s `scanRtFnTags` reads the
+// identical file for the identical reason: `tools/build/**` does not import
+// `compiler/**` Bit source, so the canonical roster is parsed rather than
+// executed. Deliberately not a general-purpose parser — this list is one
+// flat `return [ "a", "b", ... ]`, never nested, matching the file's own
+// comment that it must stay a plain array for exactly this kind of reader.
+fn parseRtFnTags(text: string): []string {
+  // Searches for `return [`, not the first `[` after the marker: the
+  // function's own `(): []string` return-type annotation contains a `[`
+  // that sorts earlier than the list literal and is immediately followed
+  // by `]`, which looked like a (contentless) match before this fix.
+  let marker = "fn rtFnTags()"
+  let at = indexOf(text, marker)
+  if (at < 0) {
+    return []string(0)
+  }
+  let retMarker = "return ["
+  let openAt = indexOf(text[at:], retMarker)
+  if (openAt < 0) {
+    return []string(0)
+  }
+  let body = text[at + openAt + len(retMarker) - 1:]
+  let out = []string(0)
+  let i = 0
+  let depth = 0
+  while (i < len(body)) {
+    let c = body[i]
+    if (c == '[') {
+      depth = depth + 1
+    } else if (c == ']') {
+      depth = depth - 1
+      if (depth == 0) {
+        break
+      }
+    } else if (c == '"') {
+      let rest = body[i + 1:]
+      let closeAt = indexOf(rest, "\"")
+      if (closeAt < 0) {
+        break
+      }
+      out = append(out, rest[:closeAt])
+      i = i + 1 + closeAt
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Mirrors `compiler/codegen.bit`'s `rtSymbol` exactly (verb-first for the
+// two error-slot accessors, `bit_rt_<tag>` otherwise) — the same duplication
+// `_tests_/bit/abimembers/scanners.bit`'s own local `rtSymbol` already
+// carries, for the same reason: a text-based reader cannot import the
+// function it mirrors.
+fn rtSymbolForTag(t: string): string {
+  if (t == "err_set") {
+    return "bit_rt_set_err"
+  }
+  if (t == "err_get") {
+    return "bit_rt_get_err"
+  }
+  return "bit_rt_${t}"
+}
+
+// The names each backend emits DIRECTLY (a literal string argument to
+// `emitCallReloc`/`xCallReloc`/`emitCall`/`xEmitCallLike` in
+// `compiler/arm64call.bit`, `compiler/x64call.bit`, `compiler/x64controlflow.bit`,
+// `compiler/arm64select*.bit` and `compiler/x64select*.bit`) rather than
+// through `Op.RtCall`'s generic `rtSymbol(tag)` path — verified by grepping
+// every such call site as of #3936, excluding `compiler/*check.bit` (those
+// are the compiler's own unit-test fixtures, not real emission).
+//
+// `bit_rt_port_gc_thread_token` and `bit_rt_safepoint_needed` are
+// DELIBERATELY absent though each has a `*Symbol()` helper here too:
+// `compiler/codegen.bit`'s own comment on `gcThreadTokenSymbol` says the
+// backends inline that primitive's body instead of ever emitting a `bl` to
+// it (confirmed: `arm64call.bit`'s `emitCall` intercepts the symbol name and
+// calls `emitInlinedThreadToken` instead of `emitCallReloc`), and no backend
+// emits `bit_rt_safepoint_needed` any more (#2925 arm64, #3169 x64). Neither
+// is a real call site, so neither can develop this ABI hazard — same shape
+// as `bit_rt_port_park_wait`, just inside `compiler/**` instead of outside it.
+fn directEmissionSymbols(): []string {
+  return [
+    "bit_rt_gc_alloc", "bit_rt_iface_lookup", "bit_rt_safepoint",
+    "bit_rt_panic_div_zero", "bit_rt_panic_overflow",
+    "bit_rt_panic_nil_call", "bit_rt_panic_nil_iface",
+    "bit_rt_world_addr", "bit_rt_gc_addr",
+    "bit_rt_port_sched_preempt_any_addr",
+    "bit_rt_port_sched_current_worker",
+    "bit_rt_port_sched_preempt_requested",
+  ]
+}
+
+// The full set of runtime symbol names this tree's `compiler/**` can
+// actually emit a call to (#3936) — see this file's header for why only
+// these, not every `@symbol(...)` export, are at risk from a stage0/tree
+// ABI pairing. `ok` is false when `compiler/irrtfns.bit` could not be read
+// or its roster parsed with reasonable confidence; the caller then falls
+// back to checking every exported symbol (the pre-#3936 behaviour) rather
+// than silently narrowing on data it could not verify.
+fn compilerEmittedSymbols(): (map<string, bool>, bool) {
+  let text = readFile("compiler/irrtfns.bit") catch _ { return map<string, bool>{}, false }
+  let tags = parseRtFnTags(text)
+  // Mirrors abimembers.bit's own `minRtFnTags` floor (90 against ~96 today):
+  // a short parse is a fact about this reader, not about the roster.
+  if (len(tags) < 90) {
+    return map<string, bool>{}, false
+  }
+  let out = map<string, bool>{}
+  for t of tags {
+    out[rtSymbolForTag(t)] = true
+  }
+  for s of directEmissionSymbols() {
+    out[s] = true
+  }
+  return out, true
+}
+
+// Compares `treeSymbols`' declared arity against `stage0Arity` and returns
+// every real mismatch — split out of `checkRuntimeAbiArity` to keep both
+// under the complexity-10 ceiling (spec/LINT.md:186, E0204).
+//
+// #3936: only a symbol the compiler itself can emit a call to is at risk
+// from this pairing (see this file's header) — a symbol `compiler/**` never
+// references at all is always compiled fresh, atomically, with its callers,
+// by the tree's own just-built compiler. `compilerEmittedSymbols`'s `ok`
+// false means the emitted-set parse failed, so every mismatch is kept (the
+// pre-#3936, more conservative behaviour) rather than silently narrowing on
+// data this function could not verify.
+fn collectArityMismatches(treeSymbols: []AbiSymbol, stage0Arity: map<string, int>): []AbiMismatch {
+  let (emitted, emittedOk) = compilerEmittedSymbols()
+  let mismatches = []AbiMismatch(0)
+  for s of treeSymbols {
+    let (oldArity, ok) = stage0Arity[abiSymbolKey(s)]
+    if (!ok || oldArity == s.arity) {
+      continue
+    }
+    if (emittedOk && !emitted[s.name]) {
+      continue
+    }
+    mismatches = append(mismatches, AbiMismatch{symbol: s.name, file: s.file, treeArity: s.arity, stage0Arity: oldArity})
+  }
+  return mismatches
+}
+
 // The entry point `stepSelfhost` calls before linking. Returns false (and
 // has already printed the diagnostic) when the build must not proceed.
 //
@@ -317,13 +502,7 @@ fn checkRuntimeAbiArity(): bool {
   for s of stage0Symbols {
     stage0Arity[abiSymbolKey(s)] = s.arity
   }
-  let mismatches = []AbiMismatch(0)
-  for s of treeSymbols {
-    let (oldArity, ok) = stage0Arity[abiSymbolKey(s)]
-    if (ok && oldArity != s.arity) {
-      mismatches = append(mismatches, AbiMismatch{symbol: s.name, file: s.file, treeArity: s.arity, stage0Arity: oldArity})
-    }
-  }
+  let mismatches = collectArityMismatches(treeSymbols, stage0Arity)
   if (len(mismatches) > 0) {
     eprint("make: selfhost: refusing to link — runtime ABI arity mismatch against the pinned stage0 (${tag}):\n")
     for m of mismatches {
