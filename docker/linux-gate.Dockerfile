@@ -35,8 +35,15 @@ FROM debian:bookworm
 # descendants with `pgrep -P`. Without it, `pgrep` is missing, the walk
 # silently sees zero descendants (its stderr is redirected to /dev/null), and
 # only the direct child gets killed on timeout (#3230, a regression of #3066).
+# binutils: checkStackMapPadding (tools/build/artifacts.bit) runs `objdump -h`
+# on the freshly built libbitrt.a to check the #3198 stack-map padding
+# invariant. Without it, `command -v objdump` finds nothing, the check prints
+# an infra-skip warning (rc=127) and reports success either way — so this
+# guard has never actually run on a Linux gate (#3909). macOS has otool from
+# the host, which is why this went unnoticed until objdump was checked for
+# directly.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates curl xz-utils procps \
+ && apt-get install -y --no-install-recommends git ca-certificates curl xz-utils procps binutils \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
