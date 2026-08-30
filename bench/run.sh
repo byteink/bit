@@ -208,11 +208,14 @@ awk -v f="$md" '
 cp "$md" bench/RESULTS.md
 
 # --- append history.csv ---
+# alloc_count is empty, not 0, wherever a language has no counter for a case
+# (alc() already returns "" on no match) -- a 0 meaning "not measured" is
+# indistinguishable from a 0 meaning "allocated nothing" (#3997).
 hist=bench/history.csv
-[ -f "$hist" ] || echo "timestamp,git_sha,case,lang,median_s,rss_bytes,bin_bytes" > "$hist"
+[ -f "$hist" ] || echo "timestamp,git_sha,case,lang,median_s,rss_bytes,bin_bytes,alloc_count" > "$hist"
 for c in $CASES; do
   for l in bit c go; do
-    echo "$STAMP,$GITSHA,$c,$l,$(get "$c" "$l" 3),$(get "$c" "$l" 4),$(get "$c" "$l" 5)" >> "$hist"
+    echo "$STAMP,$GITSHA,$c,$l,$(get "$c" "$l" 3),$(get "$c" "$l" 4),$(get "$c" "$l" 5),$(alc "$c" "$l")" >> "$hist"
   done
 done
 
