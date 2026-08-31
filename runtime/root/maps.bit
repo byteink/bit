@@ -2,12 +2,6 @@
 // (SPEC §11.2, §13.5; ABI.md §15). Sibling file, same module — see `root.bit`
 // for the port's header and seams.
 
-// `schedCurrentWorker`/`taskAt`/`wkId`/`schedMaxWorkers` reach `mapProbe`'s
-// per-worker slot (#3297) through ./fs.bit's import — a sibling file in this
-// same module, and an import is per-MODULE, not per-file. A second import here
-// is E0042; see ./os.bit for what happened the last time four branches each
-// added their own.
-
 // ---------------------------------------------------------------------------
 // Wyhash (final version 4) — the string-key hash
 // ---------------------------------------------------------------------------
@@ -428,66 +422,37 @@ fn rtValueEq(a: int, b: int, desc: int): bool {
   return rtValueEq(a, b, d)
 }
 
-// Locates `key`'s slot. Returns the slot index; `mapProbeFound` reports whether
-// it holds the key. When it does not, the slot is where the key BELONGS — the
-// first tombstone seen, else the terminating EMPTY.
+// Locates `key`'s slot AND reports presence in ONE returned value: a key that
+// is present returns its slot index, always >= 0; a key that is absent returns
+// `-1 - slot`, where `slot` is where it BELONGS — the first tombstone the walk
+// saw, else the EMPTY slot that stopped it. `mapProbeFound` and `mapProbeSlot`
+// decode it.
 //
-// Split into two calls rather than a two-result return because the pair is read
-// immediately and adjacently at every call site, and a class return would be a
-// traced type this `@nosplit` body cannot hold.
+// ONE VALUE, NOT SHARED SCRATCH (#4020, replacing #3297's per-worker slot).
+// The found flag used to be stored into a per-worker word that the caller read
+// back on its very next statement. That cost a second worker-identity walk —
+// `schedCurrentWorker` -> `schedCurrentTask` -> `schedTaskOnStack`, 97
+// instructions — on every probe, and its soundness rested on an adjacency
+// argument about where a safepoint may land. A value returned in a register is
+// private to the calling task by construction: there is no argument left to
+// make and no buffer left to clobber. #3297's actual defect — one
+// process-wide `probeFound` word that two GENUINELY CONCURRENT workers
+// overwrote for each other, no yield involved — cannot recur without shared
+// state for it to recur in.
 //
-// PER-WORKER, NOT A SHARED WORD, AND NOT PER-TASK EITHER (#3297; ABI.md §5.1).
-// `mapProbe` and its four callers (`rtMapSet`, `rtMapGet`, `rtMapHas`,
-// `rtMapDelete`) are ALL `@nosplit`, and E0075 statically proves every
-// function they in turn call (`mapHash`, `mapKeyEq`, `mapGrow`, `allocBuf`,
-// `allocCtrl`, `gcAlloc`, `gcAllocRaw`, `wyhash`, `rtStringEq`, `rtValueEq`,
-// `descHashAgg`, ...) is `@nosplit` too — an `@nosplit` body may only call
-// another `@nosplit` function (plus a short allowlist of intrinsics that
-// neither allocate nor reach a safepoint). None of that reachable set calls
-// `schedPark`/`schedSwitch`, so — proved from the callee list, not inferred
-// from the `@nosplit` attribute alone, per ABI.md §5.1's explicit warning —
-// the calling task cannot park anywhere between the write (inside
-// `mapProbe`) and the read (the caller's very next statement), so it cannot
-// migrate to a different worker in that span either. A slot indexed by the
-// CURRENT worker is therefore always the slot the write just used.
-//
-// This is `bit_rt_iface_as_ok`'s FORMER shape, and #3280 disproved that one —
-// but for a different reason that does not apply here: `iface_as`/
-// `iface_as_ok` are two *separate* exported ABI calls reached from the
-// caller's own ordinary (non-`@nosplit`) generated code, where a safepoint
-// poll CAN land between the two calls, so the flag had to survive a
-// migration and needed per-task scratch. Here the write and the read never
-// leave `@nosplit` runtime code — there is no second call boundary for a
-// poll to land on — so the strictly cheaper per-worker slot (the
-// `ioConstScratchSlot` shape, `runtime/root/darwin/io.bit`) already closes
-// the gap. What both fixes share is the actual defect: `probeFound` used to
-// be one process-wide word, so two workers running genuinely concurrently —
-// not merely two tasks on one worker — could clobber each other's answer
-// with no yield involved at all.
-const mapProbeScratchSlots: int = 32
-
-@nosplit fn mapProbeScratchSlot(): int {
-  let w = schedCurrentWorker()
-  if (w == 0) {
-    return mapProbeScratchSlots
-  }
-  let id = *(taskAt(w) + wkId)
-  if (id < 0 || id >= schedMaxWorkers || id >= mapProbeScratchSlots) {
-    return mapProbeScratchSlots
-  }
-  return id
+// The encoding is `~slot` (`-1 - slot`), chosen so a HIT needs no decoding at
+// all: the returned value already is the slot. Only `rtMapSet`, which inserts
+// at the miss slot, pays the subtraction.
+@nosplit fn mapProbeFound(r: int): bool {
+  return r >= 0
 }
 
-// (mapProbeScratchSlots + 1) slots: one per worker plus a fallback slot for a
-// caller with no current task/worker — mirrors `io.bit`'s `ioConstBuf`, which
-// needs the identical fallback for the identical reason.
-let probeFoundBuf: [33]i64
-
-// Reads back what the immediately preceding `mapProbe` call on THIS worker
-// found. See the adjacency argument on `mapProbe` above — every call site
-// reads this on the very next statement after calling `mapProbe`.
-@nosplit fn mapProbeFound(): bool {
-  return loadWord(int(ptrOf(probeFoundBuf)) + mapProbeScratchSlot() * 8) != 0
+// The slot `r` names, hit or miss — see the encoding note on `mapProbe`.
+@nosplit fn mapProbeSlot(r: int): int {
+  if (r >= 0) {
+    return r
+  }
+  return -1 - r
 }
 
 @nosplit fn mapProbe(m: int, key: int): int {
@@ -498,16 +463,14 @@ let probeFoundBuf: [33]i64
   let i = int(mapHash(m, key) & u64(mask))
   let firstTomb = vcap    // sentinel: "none seen"
   let steps = 0
-  let slotAddr = int(ptrOf(probeFoundBuf)) + mapProbeScratchSlot() * 8
   // Bounded by `cap`: the 7/8 load factor guarantees an EMPTY slot exists.
   while (steps < vcap) {
     let c = loadByte(ctrl + i)
     if (c == ctrlEmpty) {
-      storeWord(slotAddr, 0)
       if (firstTomb != vcap) {
-        return firstTomb
+        return -1 - firstTomb
       }
-      return i
+      return -1 - i
     }
     if (c == ctrlTomb) {
       if (firstTomb == vcap) {
@@ -516,7 +479,6 @@ let probeFoundBuf: [33]i64
     } else {
       let k = loadWord(keys + i * 8)
       if (mapKeyEq(m, k, key)) {
-        storeWord(slotAddr, 1)
         return i
       }
     }
@@ -527,8 +489,7 @@ let probeFoundBuf: [33]i64
   // "not found" at the last slot is the non-panicking answer and
   // cannot corrupt — a caller inserting there overwrites one entry rather than
   // running off the buffer.
-  storeWord(slotAddr, 0)
-  return vcap - 1
+  return -1 - (vcap - 1)
 }
 
 // Exhaustion is fatal here, not a returned 0 (root.bit constraint 3):
@@ -684,8 +645,9 @@ fn rtMapSet(m: int, key: int, val: int) {
   if ((used + 1) * 8 >= vcap * 7) {
     mapGrow(m)
   }
-  let slot = mapProbe(m, key)
-  if (!mapProbeFound()) {
+  let r = mapProbe(m, key)
+  let slot = mapProbeSlot(r)
+  if (!mapProbeFound(r)) {
     let ctrl = loadWord(m + mapCtrl)
     if (loadByte(ctrl + slot) == ctrlEmpty) {
       storeWord(m + mapUsed, loadWord(m + mapUsed) + 1)
@@ -708,7 +670,7 @@ fn rtMapGet(m: int, key: int): int {
     return 0
   }
   let slot = mapProbe(m, key)
-  if (!mapProbeFound()) {
+  if (!mapProbeFound(slot)) {
     return 0
   }
   let v = loadWord(loadWord(m + mapVals) + slot * 8)
@@ -724,8 +686,7 @@ fn rtMapHas(m: int, key: int): bool {
   if (loadWord(m + mapLen) == 0) {
     return false
   }
-  let _ = mapProbe(m, key)
-  return mapProbeFound()
+  return mapProbeFound(mapProbe(m, key))
 }
 
 // `bit_rt_map_delete`: `delete(m, key)` — a no-op if absent.
@@ -743,7 +704,7 @@ fn rtMapDelete(m: int, key: int) {
     return
   }
   let slot = mapProbe(m, key)
-  if (!mapProbeFound()) {
+  if (!mapProbeFound(slot)) {
     return
   }
   storeByte(loadWord(m + mapCtrl) + slot, ctrlTomb)
