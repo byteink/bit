@@ -58,27 +58,110 @@ export @nosplit @symbol("bit_rt_alloc_non_zero") fn allocNonZero(n: int): int {
   return n
 }
 
+// Index of the highest set bit of `v`, for `v >= 1`. An unrolled binary
+// search, not a loop: four compares cover the whole 64-bit range, and this is
+// called once per `allocClassify` on the fast path.
+//
+// `>>` and not `/`, and it is sound rather than merely faster (#3904): every
+// caller here passes a positive `needed`, so there is no negative-dividend
+// rounding question to get wrong.
+@nosplit fn allocMsb(v: int): int {
+  let x = v
+  let k = 0
+  if (x >= 256) {
+    x = x >> 8
+    k = k + 8
+  }
+  if (x >= 16) {
+    x = x >> 4
+    k = k + 4
+  }
+  if (x >= 4) {
+    x = x >> 2
+    k = k + 2
+  }
+  if (x >= 2) { k = k + 1 }
+  return k
+}
+
+// The size-class index for an already-aligned `needed`, in CLOSED FORM: the
+// smallest class at least as large as `needed`, computed rather than searched.
+//
+// PRECONDITION, established by the caller and NOT rechecked here:
+// `112 < needed <= allocMaxSmall`, and the request's alignment is a power of
+// two no larger than 8. Every class size is a multiple of 8, so under that
+// alignment the scan's `cs % alignment == 0` filter is vacuous and "first class
+// that fits" IS the scan's answer.
+//
+// WHY THE ARITHMETIC WORKS. From index 4 up, every class size is `k * 2^j`
+// with `k` in 4..7 — that is `allocClassSize`'s `base + r * (base/4)` for
+// `base = 64 << g`, read as a 3-bit mantissa `k = 4 + r` and an exponent
+// `j = g + 4`. So rounding `needed` up to a class is just rounding it up to
+// three significant bits:
+//
+//   s = msb(needed) - 2                  the weight of the lowest kept bit
+//   q = ceil(needed / 2^s)               the 3-bit mantissa, in 4..8
+//   q == 8 is the carry case             renormalise to q = 4, s = s + 1
+//   index = 4 + 4*(s - 4) + (q - 4)      = 4*s + q - 16, and 4*s - 8 on carry
+//
+// The formula is correct from class 4 (64 bytes) up, but the caller answers
+// everything through class 7 (112 bytes) by a cheaper route, so `needed > 112`
+// is the domain that reaches here.
+//
+// EXHAUSTIVELY EQUIVALENT TO THE SCAN, not argued to be:
+// `_tests_/stress/alloc/classify.bit` runs this against a verbatim copy of the
+// pre-#3100 scan over every (size, alignment) pair in the domain.
+@nosplit fn allocClassIndexOf(needed: int): int {
+  let s = allocMsb(needed) - 2
+  let q = (needed + (1 << s) - 1) >> s
+  if (q > 7) { return 4 * s - 8 }
+  return 4 * s + q - 16
+}
+
+// The pre-#3100 linear scan, still the answer for every alignment the fast
+// path's guard turns away: not a power of two, larger than 8, or zero or
+// negative (where `cs % alignment` traps, and must keep trapping).
+//
+// Split out of `allocClassify` for E0204 headroom, not for speed — it is one
+// `bl` on a path no caller in this repo takes.
+@nosplit fn allocClassifyScan(needed: int, alignment: int): int {
+  let i = 0
+  while (i < allocNumClasses) {          // bounded: <= allocNumClasses iterations
+    let cs = allocClassSize(i)
+    // `cs % alignment == 0` plus a page-aligned span base means every slot in
+    // the class is `alignment`-aligned.
+    if (cs >= needed && cs % alignment == 0) { return i }
+    i = i + 1
+  }
+  return -1                              // unreachable for alignment <= allocMaxSmall
+}
+
 // Map a request to a size-class index, or -1 if it must be direct-mapped.
 // There is no optional int in this subset, and -1 is not a valid
 // class index, so it carries "none" unambiguously.
 //
 // ON THE HOT PATH TWICE PER OBJECT. `gcHeapAlloc` (runtime/gc/gc.bit) calls it
-// on every allocation and `gcHeapFree` on every free, so a
-// `class { x: i64, y: i64 }` — a 16-byte body plus the fixed 32-byte GC header
-// = 48 bytes, class 3 — paid FOUR iterations of the scan below per call, each
-// one an out-of-line call to `allocClassSize`, eight per object lifecycle.
-// #3098 measured that at 10.5% of the `alloc` benchmark's cycles: more than
-// twice what every seq-cst atomic in the allocator costs put together.
+// on every allocation and `gcHeapFree` on every free, and `linkObject` and
+// `freeObject` each call it once more, so it runs four times per object
+// lifecycle. #3098 measured the scan at 10.5% of the `alloc` benchmark's
+// cycles for a 48-byte object — more than every seq-cst atomic in the
+// allocator put together — and #4041 measured it at 278.07 instructions per
+// call for a 56-byte one, 50.2% of the whole 2214.7-instruction lifecycle,
+// because #3100's ladder stopped at class 3 and the scan below is LINEAR in
+// the class index: 64 instructions at 40 bytes, 670 at 232, 1062 at 1000.
+// #4042 replaced the ladder with a closed form covering every class, so the
+// cost no longer grows with the request.
 export @nosplit @symbol("bit_rt_alloc_classify") fn allocClassify(size: int, alignment: int): int {
   let needed = allocAlignUp(size, alignment)
   if (needed > allocMaxSmall) { return -1 }
 
-  // FAST PATH for classes 0-3 (8/16/32/48), #3100. Every class size is a
-  // multiple of 8, so when `alignment` divides 8 the scan's `cs % alignment`
-  // filter is vacuous and the scan's answer is exactly the first class at least
-  // as large as `needed` — which is what this returns. An EQUIVALENCE, not an
-  // approximation: no size class, no span layout and no safety check changes,
-  // and `_tests_/stress/alloc/classify.bit` proves the two halves agree on EVERY
+  // FAST PATH, #3100 and #4042. Every class size is a multiple of 8, so when
+  // `alignment` divides 8 the scan's `cs % alignment` filter is vacuous and the
+  // scan's answer is exactly the first class at least as large as `needed` —
+  // which is what `allocClassIndexOf` returns, for the WHOLE range rather than
+  // #3100's first four classes. An EQUIVALENCE, not an approximation: no size
+  // class, no span layout and no safety check changes, and
+  // `_tests_/stress/alloc/classify.bit` proves the two halves agree on EVERY
   // (size, alignment) pair in range rather than on a sample.
   //
   // BOTH HALVES OF THE GUARD ARE LOAD-BEARING, and neither is obvious.
@@ -91,20 +174,29 @@ export @nosplit @symbol("bit_rt_alloc_classify") fn allocClassify(size: int, ali
   //     heap corruption, so it is not a licence worth taking.
   //   - `alignment > 0`, because `cs % 0` traps in the scan below today. The
   //     fast path must keep trapping rather than quietly start answering.
+  //
+  // CLASSES 0-7 ARE ANSWERED IN THIS FRAME, and that is measured rather than
+  // stylistic: routing the small classes through `allocClassIndexOf` instead
+  // cost 64.01 -> 81.01 instructions per call at 40 bytes, because the
+  // inliner takes only single-block callees under 8 instructions
+  // (`compiler/optinline.bit`) and no branching helper can ever qualify — so a
+  // 2-field class would have paid a whole call frame it did not pay before. A
+  // 2-field class is 49% of the declarations in compiler+stdlib+runtime; that
+  // is a regression on the commonest object in the language, bought with a win
+  // on larger ones.
+  //
+  // `ceil(needed / 16)` IS the class index from 16 through 112, because those
+  // seven classes are exactly the multiples of 16 in order: 16, 32, 48, 64, 80,
+  // 96, 112 at indices 1..7. Two compares and three arithmetic operations
+  // therefore replace #3100's four-rung ladder AND reach three classes further,
+  // covering every object up to a ten-field class. `needed - 1` is safe to
+  // shift here — the `needed <= 8` rung above has already taken every zero and
+  // negative request.
   if (alignment > 0 && alignment <= 8 && (alignment & (alignment - 1)) == 0) {
     if (needed <= 8) { return 0 }
-    if (needed <= 16) { return 1 }
-    if (needed <= 32) { return 2 }
-    if (needed <= 48) { return 3 }
+    if (needed <= 112) { return ((needed - 1) >> 4) + 1 }
+    return allocClassIndexOf(needed)
   }
 
-  let i = 0
-  while (i < allocNumClasses) {          // bounded: <= allocNumClasses iterations
-    let cs = allocClassSize(i)
-    // `cs % alignment == 0` plus a page-aligned span base means every slot in
-    // the class is `alignment`-aligned.
-    if (cs >= needed && cs % alignment == 0) { return i }
-    i = i + 1
-  }
-  return -1                              // unreachable for alignment <= allocMaxSmall
+  return allocClassifyScan(needed, alignment)
 }
