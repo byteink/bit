@@ -1,7 +1,22 @@
 // Matches matrix.bit exactly: same data, same i-k-j loop order, same 6
-// trials.
+// trials, and the same three buffers allocated once outside the trial loop
+// with c re-zeroed inside it (#4056 -- the Bit side allocated inside the loop
+// and the memory row compared different programs).
 #include <stdio.h>
 #include <stdlib.h>
+
+// See bench/cases/alloc/alloc.c's copy: -DBENCH_ALLOC_STATS builds a counting
+// copy that prints this run's malloc count on stderr for bench/run.sh's
+// cross-language comparison (#3934). The timed binary is built without it and
+// is byte-for-byte the program below. Added by #4056: without it this case's
+// allocation row printed "—" for Go and C.
+#ifdef BENCH_ALLOC_STATS
+static long nmalloc = 0;
+#define malloc(n) (nmalloc++, malloc(n))
+#define REPORT_ALLOCS() fprintf(stderr, "[allocs] %ld\n", nmalloc)
+#else
+#define REPORT_ALLOCS() ((void)0)
+#endif
 
 int main(void) {
   long n = 512, trials = 6;
@@ -40,6 +55,7 @@ int main(void) {
   }
 
   printf("%ld %ld %ld %ld\n", grandSum, grandTrace, lastFirst, lastLast);
+  REPORT_ALLOCS();
   free(a);
   free(b);
   free(c);
