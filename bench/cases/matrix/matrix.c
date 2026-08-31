@@ -1,5 +1,7 @@
 // Matches matrix.bit exactly: same data, same i-k-j loop order, same 6
-// trials.
+// trials, and the same three buffers allocated once outside the trial loop
+// with c re-zeroed inside it (#4056 -- the Bit side allocated inside the loop
+// and the memory row compared different programs).
 #include <stdio.h>
 #include <stdlib.h>
 
