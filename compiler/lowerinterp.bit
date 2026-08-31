@@ -1,0 +1,179 @@
+// compiler/lowerinterp.bit — the string-interpolation half of lowering, split
+// out of lowerexpr.bit under the 800-line rule (#4037). Sibling of lower.bit:
+// same module, so this needs no imports and no call-site changes.
+//
+// Name resolution is order-independent (a module is its files concatenated in
+// bytewise filename order, compiler/project.bit:7), so the split is a pure move.
+
+// The `string_from_*` call for one non-string primitive operand of an
+// interpolation. Split out of `lowerToString` under the complexity ceiling
+// (E0204); `prim` is the type's `TypeDesc.prim` code, already known non-11.
+fn lowerPrimToString(fc: FnCtx, v: int, prim: int, stringTy: int): int {
+  let rt = "string_from_int"
+  if (prim == 10) {
+    rt = "string_from_bool"
+  } else if (prim == 8 || prim == 9) {
+    rt = "string_from_float"
+  } else if (prim >= 4 && prim <= 7) {
+    // u8/u16/u32/u64. The signed formatter reads the argument as an i64, so a
+    // `u64` with bit 63 set rendered as its negative twin — 2^64-1 printed
+    // `-1` (#2011). The narrower three arrive zero-extended and so print the
+    // same either way; they take this path too, because signedness is a
+    // property of the type, not of which values happen to survive the bug.
+    rt = "string_from_uint"
+  }
+  let arg = v
+  // `bit_rt_string_from_float` takes an `f64`, so an `f32` must be widened
+  // first: passing a single leaves the callee's d0/xmm0 upper half undefined
+  // and it formats a denormal near zero (a long all-zero fractional tail —
+  // #1457). Converted here, not by the callee, because the C signature is f64.
+  if (prim == 8) {
+    let cv = mkInstr(Op.Convert, primType(fc.c.ctx, 9))
+    cv.lhs = v
+    arg = builderEmit(fc.b, cv)
+  }
+  let ins = mkInstr(Op.RtCall, stringTy)
+  ins.name = rt
+  ins.args = [arg]
+  return emitRtCall(fc, ins)
+}
+
+// Converts a lowered value to a string for interpolation (§5.7): a string is
+// itself; bool/float/int dispatch to their `string_from_*` runtime call. A
+// class/interface `show()` operand falls back for now.
+fn lowerToString(fc: FnCtx, v: int, node: int): int {
+  // `defaultLitType`, not `defaultType` (#2487): a BARE `0xFFFFFFFFFFFFFFFF` or
+  // `18446744073709551615` interpolated with no declared type — `println("${
+  // 0xFFFFFFFFFFFFFFFF}")` — has no name to carry a `u64` annotation, so this is
+  // the one place that literal's own type is still decided. `defaultType` alone
+  // would default it to i64 and this fell through to the SIGNED formatter below,
+  // which reads bit 63 as the sign (#2011 fixed every value with a declared
+  // `u64`; this is the one it could not see).
+  let ty = defaultLitType(fc.c, node, nodeType(fc, node))
+  let td = fc.c.ctx.types[ty]
+  let stringTy = primType(fc.c.ctx, 11)
+  if (td.kind == TypeKind.Prim) {
+    if (td.prim == 11) {
+      return v
+    }
+    return lowerPrimToString(fc, v, td.prim, stringTy)
+  }
+  // An interface value stringifies through its `show()` method (dynamic dispatch).
+  if (td.kind == TypeKind.Interface) {
+    let ins = mkInstr(Op.CallIface, stringTy)
+    ins.lhs = v
+    ins.ival = methodId(fc.lowerer, "show")
+    ins.args = []int(0)
+    return builderEmit(fc.b, ins)
+  }
+  // A class value with a `show()` method stringifies through it (static call).
+  if (td.kind == TypeKind.Struct && methodResultLookup(fc.c, "${ty}.show") != 0) {
+    let ins = mkInstr(Op.Call, stringTy)
+    ins.name = methodSymbol(fc.lowerer, "show", ty)
+    ins.args = [v]
+    return builderEmit(fc.b, ins)
+  }
+  fcFail(
+    fc,
+    getNode(fc.c.tree, node).span,
+    "interpolating a value whose type has no `show()` method",
+  )
+  return 0
+}
+
+// Lowers a string interpolation `"a${x}b"`: each literal segment -> const_string
+// (decoded), each interpolated expr -> lowerToString, then the parts are joined.
+//
+// EMPTY literal segments are dropped (#4037). The parser emits one for a literal
+// that opens or closes on `${`, so `"${x}\n"` used to concat a zero-length
+// string onto the operand — an allocation and a full byte copy for nothing — and
+// `"${x}"` now reduces to the operand itself with no call at all.
+fn lowerStrInterp(fc: FnCtx, node: int): int {
+  let parts = kidsOf(fc.c.tree, node)
+  let stringTy = primType(fc.c.ctx, 11)
+  let vals = []int(0)
+  let i = 0
+  while (i < len(parts) && !fc.failed) {
+    let p = parts[i]
+    let pn = getNode(fc.c.tree, p)
+    if (pn.tag == Tag.StrPart) {
+      let text = decodeEscapes(fc.c.source, pn.span.start, pn.span.end)
+      if (text != "") {
+        vals = append(vals, emitInterpConst(fc, stringTy, text))
+      }
+    } else {
+      vals = append(vals, lowerToString(fc, lowerExpr(fc, p), p))
+    }
+    i = i + 1
+  }
+  if (fc.failed) {
+    return 0
+  }
+  if (len(vals) == 0) {
+    return emitInterpConst(fc, stringTy, "")
+  }
+  if (len(vals) == 1) {
+    return vals[0]
+  }
+  return joinStrings(fc, vals, stringTy)
+}
+
+// One `const_string` operand of an interpolation, interned into the module pool.
+fn emitInterpConst(fc: FnCtx, stringTy: int, text: string): int {
+  let cs = mkInstr(Op.ConstString, stringTy)
+  cs.sval = text
+  cs.ival = internPoolString(fc, text)
+  return builderEmit(fc.b, cs)
+}
+
+// Joins two or more already-stringified parts into one value.
+//
+// The seed folded them left through the BINARY `string_concat`, so a k-part
+// literal cost k-1 allocations and copied O(k^2) bytes — 12 allocations and ~620
+// bytes for the 62-byte record in bench/cases/json (#4037). `string_concat5`
+// takes five operands, so each allocation absorbs four new parts instead of one.
+// A trailing lone part still uses the binary call: that is the same single
+// allocation with no padding operands to marshal.
+fn joinStrings(fc: FnCtx, vals: []int, stringTy: int): int {
+  let acc = vals[0]
+  let j = 1
+  while (j < len(vals)) {
+    let take = len(vals) - j
+    if (take > 4) {
+      take = 4
+    }
+    if (take == 1) {
+      let bin = mkInstr(Op.RtCall, stringTy)
+      bin.name = "string_concat"
+      bin.args = [acc, vals[j]]
+      acc = emitRtCall(fc, bin)
+    } else {
+      acc = emitConcat5(fc, acc, vals, j, take)
+    }
+    j = j + take
+  }
+  return acc
+}
+
+// `string_concat5(acc, vals[at..at+take], "", ...)` — the operands past the last
+// real part are one shared empty `const_string`, which is a pooled zero-length
+// string, so padding allocates nothing and copies nothing.
+fn emitConcat5(fc: FnCtx, acc: int, vals: []int, at: int, take: int): int {
+  let stringTy = primType(fc.c.ctx, 11)
+  let args = [acc]
+  let k = 0
+  while (k < take) {
+    args = append(args, vals[at + k])
+    k = k + 1
+  }
+  if (len(args) < 5) {
+    let empty = emitInterpConst(fc, stringTy, "")
+    while (len(args) < 5) {
+      args = append(args, empty)
+    }
+  }
+  let ins = mkInstr(Op.RtCall, stringTy)
+  ins.name = "string_concat5"
+  ins.args = args
+  return emitRtCall(fc, ins)
+}
