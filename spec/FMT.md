@@ -389,10 +389,14 @@ file marks it as excluded, so a reader sees ordinary source with no signal
 that any tool has stopped looking at it, while every gate built on top of
 `bit fmt --check` keeps reporting green regardless of what the file
 actually contains. Contrast a *ceiling* (`#3670`'s `test-fmt-ceiling`,
-ratcheting the trees `bit fmt` has not yet reached): a ceiling says "not
-yet," and the gate can only ever prove the count shrinks. An ignore list
-says "never," and nothing ever checks that claim again. The two read as
-similar and are not: **ignore means never, ceiling means not yet.**
+which ratcheted the trees `bit fmt` had not yet reached): a ceiling says
+"not yet," and the gate can only ever prove the count shrinks. An ignore
+list says "never," and nothing ever checks that claim again. The two read
+as similar and are not: **ignore means never, ceiling means not yet.**
+`test-fmt-ceiling` proved the point by reaching zero and being retired —
+`#3713` reformatted every remaining file and replaced it with a
+zero-tolerance gate (`test-fmt-strict`, `_tests_/bit/fmtzerocheck.bit`)
+naming its residual debt by file rather than by count.
 
 **The concrete instance that prompted this.** Six files in `runtime/`
 carry `asm` byte-array literals with each instruction's mnemonic in a
@@ -444,10 +448,19 @@ assumption**: the first draft of this decision conflated them into one
 fails `bit fmt --check`," which is exactly the category error this section
 exists to avoid repeating. These eight files, plus
 `runtime/root/linux/boot.bit` and `runtime/root/windows/boot.bit` (checked
-for the same reason, also ordinary import/signature/`if`-wrap drift), are
-tracked as ordinary, ungated debt by `#3670`'s `test-fmt-ceiling` ratchet,
-the same as any other file in `compiler/`, `runtime/` or `tools/` that has
-never been run through `bit fmt`.
+for the same reason, also ordinary import/signature/`if`-wrap drift), were
+tracked as ordinary, ungated debt by `#3670`'s `test-fmt-ceiling` ratchet.
+
+`#3713` reformatted the whole tree once: `grow.bit`, `queue.bit`,
+`workerrun.bit` and all three `poll.bit` siblings are now ordinary
+formatted files with no special handling, same as this section predicted
+above for the six comment-alignment files once `#3673` landed. `sleep.bit`
+and `runtime/root/windows/boot.bit` were already canonical by the time
+`#3713` ran (fixed independently of this list; this section's "fails
+`bit fmt --check` today" claim about them no longer holds). `worker.bit`
+and `runtime/root/linux/boot.bit` remain debt — canonical formatting pushes
+both over the 800-line E0200 ceiling — now tracked by name, not count, in
+`test-fmt-strict`'s debt list (`#4099`).
 
 **Check:** `bit fmt --check` on the six files named above exits 1 today.
 `#3673`'s acceptance is that it exits 0 for exactly those six once the

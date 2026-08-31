@@ -1,0 +1,413 @@
+// #3713. Replaces the five ceiling-ratchet gates
+// (formerly _tests_/bit/fmtceilingcheck.bit, tools/build/fmt-ceiling*.txt)
+// now that the whole tree has been reformatted once: a ceiling exists to
+// survive debt it cannot yet fix; with the debt gone, a count that can only
+// ever shrink is pure surface area over a gate that should just say zero.
+//
+// Contract: every `.bit` file in the named tree(s) must be `bit fmt --check`
+// canonical, with exactly two tolerated exceptions, both NAMED rather than
+// counted, so neither can silently absorb an unrelated new debt file the way
+// a ceiling number could:
+//
+//   1. Files `bit fmt` refuses outright (a lex/parse error, so there is
+//      nothing to canonicalize) — same classification #3703's driver used,
+//      ported verbatim: `bit fmt --check`'s own exit code is the classifier,
+//      never a manifest (see the exit-code contract in compiler/fmtcmd.bit).
+//   2. A short, explicit list of KNOWN debt files passed in
+//      BIT_FMTZERO_DEBT, each one a real, currently-tracked ticket rather
+//      than an open-ended allowance:
+//        - 31 files that #3713's own reformat pushed over the 800-line
+//          E0200 ceiling (all were under 800 before), tracked by #4099.
+//        - 30 files (15 _tests_/cases, 15 _tests_/bit/checkercases) whose
+//          paired `.expected` asserts a line:col or a quoted source line
+//          that reformatting moved — #3713 must never touch `.expected`,
+//          so these were left unformatted rather than laundering the
+//          golden. Tracked by #4101.
+//      A debt entry that is NOT found unformatted is a hard failure: the
+//      list only ever shrinks as those tickets land, exactly like the
+//      ratchet it replaces, but expressed as named files instead of a
+//      count a human could raise by mistake.
+//
+// Configuration, four required env vars plus one optional:
+//   BIT_FMTZERO_LABEL   the gate's own name for its messages
+//   BIT_FMTZERO_TREES   "<key>:<repo-relative-dir>" pairs, space-separated
+//   BIT_FMTZERO_TOLERATE_DIAG  "1" if this tree can contain fixtures that
+//                        never parse (see exception 1 above); any other
+//                        value or absent means none is expected here
+//   BIT_FMTZERO_DEBT     optional, space-separated repo-relative paths —
+//                        exception 2 above. Absent or empty means true
+//                        hard zero, no exceptions at all.
+// BIT_SELF_EXE and BIT_REPO are required exactly as in every sibling gate.
+import { env, envOr, exit } from "std/os"
+import { exists, isDir, mkdir, readDir, readFile, writeFile } from "std/fs"
+import { hasPrefix, hasSuffix, parseInt, split, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+const maxEntries: int = 4096
+const maxScanDepth: int = 16
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "300")) catch _ {
+    300
+  }
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("fmtzerocheck: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("fmtzerocheck: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("fmtzerocheck: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("fmtzerocheck: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+fn requiredEnv(name: string): string! {
+  let v = env(name)
+  if (len(v) == 0) {
+    fail newError("fmtzerocheck: ${name} is required and was not set")
+  }
+  return v
+}
+
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+class Run { code: int, err: string }
+
+fn runFmtCheck(bit: string, dir: string, capDir: string, ms: int): Run! {
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  let script = "#!/bin/sh\n" +
+    "'${bit}' fmt --check '${dir}' > /dev/null 2> '${errPath}'\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/fmt.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("fmtzerocheck: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("fmtzerocheck: no exit code was recorded — the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, err: readFile(errPath)? }
+}
+
+fn assertTrustworthy(r: Run, dir: string) {
+  if (r.code != 0 && r.code != 1) {
+    panic("fmtzerocheck: `bit fmt --check ${dir}` exited ${r.code}, want 0 or 1")
+  }
+  if (r.code == 0 && len(r.err) > 0) {
+    panic("fmtzerocheck: `bit fmt --check ${dir}` exited 0 but wrote to stderr:\n${r.err}")
+  }
+  if (r.code == 1 && len(r.err) == 0) {
+    panic("fmtzerocheck: `bit fmt --check ${dir}` exited 1 but stderr is empty — untrustworthy run")
+  }
+}
+
+fn isDigit(c: u8): bool {
+  return c >= '0' && c <= '9'
+}
+
+fn isDiagArrowLine(line: string): bool {
+  return hasPrefix(trimSpace(line), "-->")
+}
+
+fn isDiagGutterLine(line: string): bool {
+  return hasPrefix(trimSpace(line), "|")
+}
+
+fn isDiagSourceLine(line: string): bool {
+  let i = 0
+  while (i < len(line) && isDigit(line[i])) {
+    i = i + 1
+  }
+  if (i == 0) {
+    return false
+  }
+  return hasPrefix(line[i:], " | ")
+}
+
+fn isDiagHeaderLine(line: string): bool {
+  return hasPrefix(line, "error") || hasPrefix(line, "warning") || hasPrefix(line, "note")
+}
+
+fn isDiagLine(line: string): bool {
+  return isDiagHeaderLine(line) ||
+    isDiagArrowLine(line) ||
+    isDiagGutterLine(line) ||
+    isDiagSourceLine(line)
+}
+
+fn parseUnformatted(err: string, repo: string, tolerateDiag: bool): []string! {
+  let out = []string(0)
+  let prefix = "${repo}/"
+  for line of split(err, "\n") {
+    if (len(trimSpace(line)) == 0) {
+      continue
+    }
+    if (hasPrefix(line, "bit fmt: ")) {
+      fail newError("fmtzerocheck: unexpected `bit fmt` diagnostic: ${line}")
+    }
+    if (tolerateDiag && isDiagLine(line)) {
+      continue
+    }
+    if (!hasSuffix(line, ".bit")) {
+      fail newError("fmtzerocheck: unrecognized `bit fmt --check` output line: ${line}")
+    }
+    if (!hasPrefix(line, prefix)) {
+      fail newError("fmtzerocheck: unformatted path outside ${repo}: ${line}")
+    }
+    out = append(out, line[len(prefix):])
+  }
+  return out
+}
+
+class TreeSpec { key: string, dir: string }
+
+fn parseTreeSpecs(raw: string): []TreeSpec! {
+  let out = []TreeSpec(0)
+  for tok of split(raw, " ") {
+    if (len(trimSpace(tok)) == 0) {
+      continue
+    }
+    let fields = split(tok, ":")
+    if (len(fields) != 2) {
+      fail newError("fmtzerocheck: malformed BIT_FMTZERO_TREES entry: '${tok}' (want key:dir)")
+    }
+    out = append(out, TreeSpec{ key: fields[0], dir: fields[1] })
+  }
+  if (len(out) == 0) {
+    fail newError("fmtzerocheck: BIT_FMTZERO_TREES named zero trees")
+  }
+  return out
+}
+
+fn parseDebtList(raw: string): []string {
+  let out = []string(0)
+  for tok of split(raw, " ") {
+    let t = trimSpace(tok)
+    if (len(t) > 0) {
+      out = append(out, t)
+    }
+  }
+  return out
+}
+
+fn containsStr(xs: []string, s: string): bool {
+  for x of xs {
+    if (x == s) {
+      return true
+    }
+  }
+  return false
+}
+
+fn countBitFiles(dir: string, depth: int): int {
+  if (depth <= 0) {
+    panic("fmtzerocheck: ${dir} nesting exceeds ${maxScanDepth} levels")
+  }
+  let names = readDir(dir) catch e {
+    panic("fmtzerocheck: cannot list ${dir}: ${e.message()}")
+  }
+  if (len(names) > maxEntries) {
+    panic("fmtzerocheck: ${dir} has ${len(names)} entries, over the ${maxEntries} bound")
+  }
+  let n = 0
+  for name of names {
+    let path = "${dir}/${name}"
+    if (isDir(path)) {
+      n = n + countBitFiles(path, depth - 1)
+    } else if (hasSuffix(name, ".bit")) {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+class TreeResult { key: string, dir: string, filesTotal: int, files: []string }
+
+class ScanCtx { bit: string, repo: string, capDir: string, ms: int }
+
+fn scanTree(ctx: ScanCtx, spec: TreeSpec, tolerateDiag: bool): TreeResult {
+  let full = "${ctx.repo}/${spec.dir}"
+  if (!exists(full)) {
+    panic("fmtzerocheck: no such directory: ${full}")
+  }
+  let filesTotal = countBitFiles(full, maxScanDepth)
+  if (filesTotal == 0) {
+    panic("fmtzerocheck: ${full} contains zero .bit files — refusing a vacuous scan")
+  }
+  let subDir = "${ctx.capDir}/${spec.key}"
+  mkdir(subDir) catch e {
+    panic("fmtzerocheck: cannot create ${subDir}: ${e.message()}")
+  }
+  let r = runFmtCheck(ctx.bit, full, subDir, ctx.ms) catch e {
+    panic("fmtzerocheck: ${e.message()}")
+  }
+  assertTrustworthy(r, full)
+  let unformatted = parseUnformatted(r.err, ctx.repo, tolerateDiag) catch e {
+    panic("fmtzerocheck: ${e.message()}")
+  }
+  return TreeResult{ key: spec.key, dir: spec.dir, filesTotal: filesTotal, files: unformatted }
+}
+
+fn printFiles(label: string, dir: string, files: []string) {
+  eprint("  ${dir} ${label}:\n")
+  for f of files {
+    eprint("    ${f}\n")
+  }
+}
+
+// Splits a tree's unformatted files into (real failures, matched debt). Any
+// file not on the debt list is a real failure — the whole point of this gate
+// over the ratchet it replaces.
+fn partitionDebt(files: []string, debt: []string): ([]string, []string) {
+  let real = []string(0)
+  let matched = []string(0)
+  for f of files {
+    if (containsStr(debt, f)) {
+      matched = append(matched, f)
+    } else {
+      real = append(real, f)
+    }
+  }
+  return real, matched
+}
+
+// The verdict for one tree. Returns true when this tree FAILS the gate.
+fn reportTree(tr: TreeResult, debt: []string, label: string): bool {
+  let (real, matched) = partitionDebt(tr.files, debt)
+  if (len(real) > 0) {
+    eprint("${label}: FAIL -- ${tr.dir} has ${len(real)} unformatted file(s) not on the known-debt list (of ${tr.filesTotal} scanned).\n")
+    printFiles("unformatted file(s) counted against this gate", tr.dir, real)
+    return true
+  }
+  if (len(matched) > 0) {
+    println("${label}: ${tr.dir} 0 real failure(s) of ${tr.filesTotal} .bit file(s) scanned (${len(matched)} known debt, tracked in #4099/#4101) -- PASS.")
+  } else {
+    println("${label}: ${tr.dir} 0 unformatted of ${tr.filesTotal} .bit file(s) scanned -- PASS.")
+  }
+  return false
+}
+
+fn newCapDir(): string {
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  return "${tmp}/bit-fmtzerocheck-${uuidFormat(uuidV4())}"
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}
+
+fn teardown(dir: string, ms: int) {
+  shell("${dir}/rm.sh", "#!/bin/sh\nrm -rf '${dir}'\n", ms) catch _ {
+    return
+  }
+}
+
+class Config {
+  bit: string,
+  repo: string,
+  label: string,
+  treesRaw: string,
+  tolerateDiag: bool,
+  debt: []string,
+}
+
+fn loadConfig(): Config! {
+  let bit = requiredEnv("BIT_SELF_EXE")?
+  let repo = requiredEnv("BIT_REPO")?
+  let label = requiredEnv("BIT_FMTZERO_LABEL")?
+  let treesRaw = requiredEnv("BIT_FMTZERO_TREES")?
+  let tolerateDiag = envOr("BIT_FMTZERO_TOLERATE_DIAG", "0") == "1"
+  let debt = parseDebtList(envOr("BIT_FMTZERO_DEBT", ""))
+  return Config{
+    bit: bit,
+    repo: repo,
+    label: label,
+    treesRaw: treesRaw,
+    tolerateDiag: tolerateDiag,
+    debt: debt,
+  }
+}
+
+// Every debt entry must actually be unformatted somewhere in this run, or
+// the list has gone stale (the file was fixed and nobody removed its
+// entry) — the self-cleaning half of the contract described in the header.
+fn checkDebtFreshness(cfg: Config, allUnformatted: []string): bool {
+  let stale = false
+  for d of cfg.debt {
+    if (!containsStr(allUnformatted, d)) {
+      eprint("${cfg.label}: FAIL -- ${d} is on the known-debt list but is already canonical; remove it.\n")
+      stale = true
+    }
+  }
+  return stale
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let cfg = loadConfig() catch e {
+    panic("fmtzerocheck: ${e.message()}")
+  }
+  let specs = parseTreeSpecs(cfg.treesRaw) catch e {
+    panic("fmtzerocheck: ${e.message()}")
+  }
+
+  let capDir = newCapDir()
+  mkdir(capDir) catch e {
+    panic("fmtzerocheck: cannot create ${capDir}: ${e.message()}")
+  }
+  let ctx = ScanCtx{ bit: cfg.bit, repo: cfg.repo, capDir: capDir, ms: ms }
+
+  let anyFail = false
+  let allUnformatted = []string(0)
+  for spec of specs {
+    let tr = scanTree(ctx, spec, cfg.tolerateDiag)
+    for f of tr.files {
+      allUnformatted = append(allUnformatted, f)
+    }
+    if (reportTree(tr, cfg.debt, cfg.label)) {
+      anyFail = true
+    }
+  }
+  if (checkDebtFreshness(cfg, allUnformatted)) {
+    anyFail = true
+  }
+
+  if (anyFail) {
+    teardown(capDir, ms)
+    exit(1)
+  }
+  teardown(capDir, ms)
+  println("${cfg.label}: PASS")
+}
