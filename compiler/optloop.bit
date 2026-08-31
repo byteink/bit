@@ -1,0 +1,781 @@
+// compiler/optloop.bit — LOOP-INVARIANT CODE MOTION (#4051). Sibling of
+// optcse.bit and optstore.bit in the same module, split out for the same
+// reason: opt.bit is at its size limit.
+//
+// optcse.bit forwards a load to a LATER identical load, and never crosses a
+// back edge — that is stated in its header as the property that keeps it away
+// from the safepoint a back edge carries. This file is the pass that must
+// cross one: it takes a computation the loop repeats with the same answer
+// every iteration and performs it once, before the loop.
+//
+// ## Why a hoist here is not a move
+//
+// codegenlive.bit builds ONE live interval per value, `[def, last use]`, with
+// no holes and no loop extension. A value defined in the preheader and read
+// inside the loop would end its interval at its last TEXTUAL use, so anything
+// defined later in the loop body could be handed its register — and would
+// clobber it for the next iteration. That is a miscompile, and no gate in the
+// tree would see it as anything but a wrong answer.
+//
+// The reason it has never happened is that lowering threads every loop-carried
+// value through the header's BLOCK PARAMS, and a param passed on a back edge
+// has its interval extended to the latch by `extendForwardArgs`
+// (`argFeedsLiveTarget` treats every back-edge argument as live). So a value
+// that is live across a back edge is a block param, always.
+//
+// This pass keeps that invariant rather than teaching the allocator a second
+// shape. Hoisting instruction `I` out of loop `L` means:
+//
+//   1. emit `I` in the preheader, just before its terminator;
+//   2. add a new param to the header, in `plan.licm.ids` order;
+//   3. append one argument to EVERY edge into the header — the preheader edge
+//      passes the value emitted in step 1, every back edge passes the param
+//      from step 2.
+//
+// Step 3 needs no case analysis, because `remap[I]` already holds exactly the
+// right new id at each point: the preheader's terminator is emitted while
+// `remap[I]` still names the preheader value, and every back-edge block is
+// emitted after the header, by which time the header's own param emission has
+// overwritten `remap[I]` with the param id.
+//
+// ## The loop structure, and the one check that replaces a dominator tree
+//
+// A back edge is `isBackEdge(p, h)` — `h <= p` by block id (codegen.bit:613),
+// the same predicate that decides where a safepoint poll is emitted. The
+// natural loop of header `h` is `{h}` plus every block that reaches a
+// back-edge predecessor of `h` without passing through `h`.
+//
+// For a hoist to be legal, `h` must DOMINATE every block in that set —
+// otherwise a block could be entered without the preheader having run. Rather
+// than build a dominator tree, `licmSingleEntry` checks the equivalent local
+// property: every loop block other than `h` has all of its predecessors inside
+// the loop. If that holds, the only way into the set is through `h`, so every
+// path from the function entry to any loop block passes `h`. It also refuses
+// an irreducible region for free, without ever having to assume the CFG is
+// reducible.
+//
+// `h` must have exactly ONE forward predecessor; that block is the preheader.
+// None is materialised here — a header with two forward predecessors is
+// refused outright (#4054).
+//
+// A header param at index `k` is LOOP-INVARIANT iff every back edge into `h`
+// passes that param's own value back at position `k` — directly, or through a
+// chain `licmResolve` can prove is the same value. Its value throughout the
+// loop is then whatever the preheader edge passes at `k`, which is a value
+// that already dominates the preheader's terminator — so a hoisted
+// instruction reading it needs no dominance argument of its own.
+//
+// ## What this pass hoists, and what it REFUSES
+//
+// ACCEPTS `slice_len`, and `field_get` at a NON-ZERO offset, whose operand is
+// an invariant header param. Both read one word of a header through the
+// null-safe path (`emitHeaderWordOrZero`): they cannot fault and cannot trap,
+// so performing one before a loop that turns out to run zero times is safe.
+//
+// REFUSES `field_get` at offset 0. Word 0 of every header shape in
+// runtime/ABI.md §2 is the payload POINTER, and loweraccess.bit's header
+// states the hazard in terms of this exact pass: `buf` is a GC-managed pointer
+// typed `i64`, so no stack map describes it, and what makes that sound is that
+// its live range contains no safepoint. Hoisting it puts it across the loop's
+// back-edge poll. That is #4053, and it needs the collector's answer, not a
+// predicate change.
+//
+// REFUSES every arithmetic op. `bit build --debug` traps signed add/sub/mul/
+// neg on overflow (arm64select.bit:506, `cx.debug && w.signed`), `cx.debug` is
+// a codegen flag the optimizer cannot see, and the loop guard may be false on
+// entry — so a hoisted `mul` can trap on an iteration the program never ran.
+// That is #4052, and it is a decision about `--debug`, not a predicate.
+//
+// REFUSES every load in a loop containing a call, `gc_alloc`, `make_closure`,
+// a syscall, inline asm, any atomic, a `field_set`, or a trapping divide.
+// `bit_rt_slice_append` mutates the header IN PLACE (slices.bit:238), so a
+// call really can change `len` and `off` underneath a hoist.
+//
+// REFUSES an `index_set` only when it cannot prove the store lands in a slice
+// ELEMENT BUFFER. `rtSliceNew` (slices.bit:221) allocates the header with
+// `gcAlloc` and the buffer with `allocBuf` — two distinct heap objects — so a
+// store through `field_get X[0]` with `X` slice-typed cannot reach any
+// header's words. Every other `index_set` clobbers, including the raw-pointer
+// form module state uses (§11.11), whose base is a `global_addr` and not a
+// header word at all.
+//
+// ## What it does NOT model
+//
+// A NON-ATOMIC read that another task writes. `while (!x.done) {}` with
+// `done` a plain field becomes an infinite loop under this pass, exactly as it
+// does under every optimising compiler. Atomics are clobbers, so the runtime's
+// own spin loops (`spinAcquire`, the poll guard) keep their reloads; a plain
+// field shared across tasks without synchronisation is a data race the
+// language does not define.
+
+// Predecessors in CSR form: the predecessors of block `b` are
+// `list[start[b] .. start[b+1])`. Built once per function — a per-header scan
+// of every block's terminator would be quadratic in the block count, and the
+// compiler's own hottest functions have hundreds of blocks.
+class PredMap {
+  start: []int,
+  list: []int,
+}
+
+// The blocks `bi`'s terminator can branch to. An empty block has no terminator
+// (DCE can empty a block it keeps), and reading `instsStart + instsLen - 1`
+// there names the instruction BEFORE the block — index -1 for block 0, which
+// is how #2084 segfaulted.
+fn licmTargets(f: IrFunc, bi: int): []int {
+  let blk = f.blocks[bi]
+  if (blk.instsLen == 0) {
+    return []int(0)
+  }
+  let t = f.instrs[blk.instsStart + blk.instsLen - 1]
+  if (t.op == Op.Jump) {
+    return [t.ival]
+  }
+  if (t.op == Op.Br) {
+    return [t.ival, t.ival2]
+  }
+  return []int(0)
+}
+
+// `start`, prefix-summed: entry `b+1` counts the edges arriving at `b`, then
+// the running sum turns it into the offset of `b`'s run.
+fn licmPredStarts(f: IrFunc): []int {
+  let n = len(f.blocks)
+  let start = []int(0)
+  let i = 0
+  while (i <= n) {
+    start = append(start, 0)
+    i = i + 1
+  }
+  i = 0
+  while (i < n) {
+    let ts = licmTargets(f, i)
+    let k = 0
+    while (k < len(ts)) {
+      start[ts[k] + 1] = start[ts[k] + 1] + 1
+      k = k + 1
+    }
+    i = i + 1
+  }
+  i = 0
+  while (i < n) {
+    start[i + 1] = start[i + 1] + start[i]
+    i = i + 1
+  }
+  return start
+}
+
+fn licmPredMap(f: IrFunc): PredMap {
+  let n = len(f.blocks)
+  let start = licmPredStarts(f)
+  let list = []int(0)
+  let i = 0
+  while (i < start[n]) {
+    list = append(list, -1)
+    i = i + 1
+  }
+  let fill = []int(0)
+  i = 0
+  while (i <= n) {
+    fill = append(fill, start[i])
+    i = i + 1
+  }
+  i = 0
+  while (i < n) {
+    licmFillPreds(f, list, fill, i)
+    i = i + 1
+  }
+  return PredMap{ start: start, list: list }
+}
+
+// Records `bi` as a predecessor of each of its targets. A `br` with both arms
+// on one block records it twice, which is what makes `licmPreheader` refuse
+// that edge instead of guessing which argument list to read.
+fn licmFillPreds(f: IrFunc, list: []int, fill: []int, bi: int) {
+  let ts = licmTargets(f, bi)
+  let k = 0
+  while (k < len(ts)) {
+    list[fill[ts[k]]] = bi
+    fill[ts[k]] = fill[ts[k]] + 1
+    k = k + 1
+  }
+}
+
+fn licmFalses(n: int): []bool {
+  let out = []bool(0)
+  let i = 0
+  while (i < n) {
+    out = append(out, false)
+    i = i + 1
+  }
+  return out
+}
+
+// The natural loop of header `h`: `h`, plus every block that reaches a
+// back-edge predecessor of `h` without passing through `h`. `h` is marked
+// first and never enqueued, which is what stops the backward walk at the
+// header. Bounded: each block enters the worklist at most once.
+fn licmLoopBlocks(f: IrFunc, pm: PredMap, h: int): []bool {
+  let inLoop = licmFalses(len(f.blocks))
+  inLoop[h] = true
+  let work = []int(0)
+  let e = pm.start[h]
+  while (e < pm.start[h + 1]) {
+    let p = pm.list[e]
+    if (isBackEdge(p, h) && !inLoop[p]) {
+      inLoop[p] = true
+      work = append(work, p)
+    }
+    e = e + 1
+  }
+  let s = 0
+  while (s < len(work)) {
+    let e2 = pm.start[work[s]]
+    let stop = pm.start[work[s] + 1]
+    s = s + 1
+    while (e2 < stop) {
+      let p = pm.list[e2]
+      if (!inLoop[p]) {
+        inLoop[p] = true
+        work = append(work, p)
+      }
+      e2 = e2 + 1
+    }
+  }
+  return inLoop
+}
+
+// True iff `h` is the loop's ONLY entry — every other loop block has all of
+// its predecessors inside the loop. That makes `h` dominate the whole set
+// (every path in must pass it) without building a dominator tree, and refuses
+// an irreducible region rather than assuming reducibility.
+//
+// It also demands every loop block be emitted AFTER `h`. Under the RPO
+// schedule a dominator always is, but the rest of this file relies on it (the
+// header's params must be in `remap` before any latch reads them), so it is
+// checked rather than assumed.
+fn licmSingleEntry(lc: LicmCtx, inLoop: []bool, h: int): bool {
+  let b = 0
+  while (b < len(inLoop)) {
+    if (inLoop[b] && b != h) {
+      if (lc.pos[b] <= lc.pos[h] || !licmPredsInside(lc.pm, inLoop, b)) {
+        return false
+      }
+    }
+    b = b + 1
+  }
+  return true
+}
+
+fn licmPredsInside(pm: PredMap, inLoop: []bool, b: int): bool {
+  let e = pm.start[b]
+  while (e < pm.start[b + 1]) {
+    if (!inLoop[pm.list[e]]) {
+      return false
+    }
+    e = e + 1
+  }
+  return true
+}
+
+// The single forward predecessor of `h`, or -1 when there is not exactly one.
+// A `br` whose two arms both target `h` appears twice in the predecessor list,
+// so it is refused here — its two argument lists can disagree and there is no
+// single value to bind an invariant param to.
+fn licmPreheader(pm: PredMap, h: int): int {
+  let found = -1
+  let e = pm.start[h]
+  while (e < pm.start[h + 1]) {
+    let p = pm.list[e]
+    if (!isBackEdge(p, h)) {
+      if (found >= 0) {
+        return -1
+      }
+      found = p
+    }
+    e = e + 1
+  }
+  return found
+}
+
+fn licmHasBackEdge(pm: PredMap, h: int): bool {
+  let e = pm.start[h]
+  while (e < pm.start[h + 1]) {
+    if (isBackEdge(pm.list[e], h)) {
+      return true
+    }
+    e = e + 1
+  }
+  return false
+}
+
+// The arguments `p`'s terminator passes to `h`, or an empty list when the edge
+// is absent or ambiguous. Every caller compares the length against the
+// header's `paramCount`, so an empty list reads as "refuse".
+fn licmEdgeArgs(f: IrFunc, p: int, h: int): []int {
+  let blk = f.blocks[p]
+  if (blk.instsLen == 0) {
+    return []int(0)
+  }
+  let t = f.instrs[blk.instsStart + blk.instsLen - 1]
+  if (t.op == Op.Jump && t.ival == h) {
+    return t.args
+  }
+  if (t.op != Op.Br || (t.ival == h && t.ival2 == h)) {
+    return []int(0)
+  }
+  if (t.ival == h) {
+    return t.thenArgs
+  }
+  if (t.ival2 == h) {
+    return t.elseArgs
+  }
+  return []int(0)
+}
+
+// Which of `h`'s params hold the same value on every iteration: those whose
+// every back edge hands the param's own value straight back.
+//
+// A DIRECT COMPARISON IS NOT ENOUGH, and the gap costs the outer loop of every
+// nested `while`. `lowerWhile` closes a loop through a separate increment
+// block carrying its OWN full parameter list, so the back edge into the header
+// passes that block's param, not the header's. `licmResolve` follows it back:
+// the increment block has one predecessor, which passes the header's param, so
+// the two are provably the same value.
+fn licmInvariantParams(lc: LicmCtx, h: int): []bool {
+  let inv = []bool(0)
+  let k = 0
+  while (k < lc.f.blocks[h].paramCount) {
+    inv = append(inv, true)
+    k = k + 1
+  }
+  let e = lc.pm.start[h]
+  while (e < lc.pm.start[h + 1]) {
+    let p = lc.pm.list[e]
+    if (isBackEdge(p, h)) {
+      licmMarkVarying(lc, inv, p, h)
+    }
+    e = e + 1
+  }
+  return inv
+}
+
+// Clears every param this back edge does not pass straight through. An edge
+// whose argument list does not match the param count is not one this pass can
+// read, so it clears all of them.
+fn licmMarkVarying(lc: LicmCtx, inv: []bool, p: int, h: int) {
+  let args = licmEdgeArgs(lc.f, p, h)
+  let base = lc.f.blocks[h].instsStart
+  let k = 0
+  while (k < len(inv)) {
+    if (len(args) != len(inv)) {
+      inv[k] = false
+    } else if (args[k] != base + k && licmResolve(lc, args[k]) != base + k) {
+      inv[k] = false
+    }
+    k = k + 1
+  }
+}
+
+// An `index_set` lands in a slice's element buffer iff its base is
+// `field_get X[0]` with `X` slice-typed — the one shape
+// `emitInlineSliceElem` produces. `rtSliceNew` allocates the header and the
+// buffer as two distinct objects, so such a store cannot reach a header word.
+fn licmWritesSliceBuf(f: IrFunc, ctx: TypeContext, base: int): bool {
+  let b = f.instrs[base]
+  if (b.op != Op.FieldGet || b.ival != 0) {
+    return false
+  }
+  return ctx.types[f.instrs[b.lhs].ty].kind == TypeKind.Slice
+}
+
+// What stops a header word being hoisted out of this loop. Derived from
+// `isSideEffecting` rather than listed, which is optstore.bit's rule 3: an op
+// added later that writes memory must join that predicate or DCE would already
+// be deleting it, so it becomes a barrier here the day it lands.
+//
+// `index_get` is a pure load whose only effect is a bounds panic, and a panic
+// does not return. A TERMINATOR writes no memory; the one memory-relevant
+// thing it does is the back-edge poll, and the collector is non-moving and
+// cannot change a live header's `len` or `off`.
+fn licmClobbers(f: IrFunc, ctx: TypeContext, idx: int): bool {
+  let ins = f.instrs[idx]
+  if (ins.op == Op.IndexGet) {
+    return false
+  }
+  if (ins.op == Op.IndexSet) {
+    return !licmWritesSliceBuf(f, ctx, ins.lhs)
+  }
+  return isSideEffecting(ins.op) && !opIsTerminator(ins.op)
+}
+
+// Everything one candidate loop needs, in one record so the walk stays inside
+// `max-params`. `inv` is indexed by the header's param position; `args` is the
+// preheader edge's argument list, so `args[k]` is what invariant param `k`
+// holds before the loop starts.
+class LicmScan {
+  known: []ConstVal,
+  fwd: []int,
+  inv: []bool,
+  hdr: int,
+  pre: int,
+  args: []int,
+}
+
+// The hoistable set, and the whole of it. Both ops read one header word
+// through the null-safe path, so neither faults on a null receiver and
+// neither can trap — which is what makes performing one ahead of a loop that
+// may run zero times safe. See the header for why offset 0 and every
+// arithmetic op are refused.
+fn licmHoistableOp(ins: IrInstr): bool {
+  if (ins.op == Op.SliceLen) {
+    return true
+  }
+  return ins.op == Op.FieldGet && ins.ival != 0
+}
+
+// The header parameter position `idx` reads, or -1 when it is not hoistable
+// out of `sc`'s loop: not one of the two ops, already answered by folding or by
+// optstore/optcse's forwarding map, or reading something that is not LITERALLY
+// an invariant param of this loop's header.
+//
+// THE OPERAND IS NOT RESOLVED HERE, and that is a correctness rule rather than
+// a missed opportunity. `licmResolve` will happily prove that an inner loop's
+// param equals an outer one's, and hoisting on that basis lands the definition
+// outside a loop that still reads it — which verify.bit rejects outright
+// ("reads %N, which is defined outside the loop closed by the back edge in
+// bbK"). A hoist across two loop levels has to thread the value through the
+// inner header's parameter list as well; that is not what this pass does.
+//
+// Demanding a literal param of `h` makes the depth question disappear.
+// verify.bit already rejects any input in which a block inside a nested loop
+// reads a value defined outside it, so an operand that IS `h`'s param proves
+// the reading block is not inside a loop nested within `h` — nothing here has
+// to compute loop depth to know it.
+fn licmHoistSlot(lc: LicmCtx, sc: LicmScan, idx: int): int {
+  if (sc.known[idx].known || sc.fwd[idx] >= 0) {
+    return -1
+  }
+  if (!licmHoistableOp(lc.f.instrs[idx])) {
+    return -1
+  }
+  let k = lc.f.instrs[idx].lhs - lc.f.blocks[sc.hdr].instsStart
+  if (k < 0 || k >= len(sc.inv) || !sc.inv[k]) {
+    return -1
+  }
+  return k
+}
+
+// The hoists this rebuild must perform. `home[i]` is the preheader block
+// instruction `i` moves into and `hdr[i]` the header whose parameter list it
+// joins, both -1 for the instructions that stay put. `ids` lists the hoisted
+// instructions and `pre` is parallel to it: the OLD value id each one's
+// operand takes on in the preheader, which is the preheader edge's argument
+// for the invariant param it reads.
+//
+// PARAMS AND ARGUMENTS ARE BOTH EMITTED BY WALKING `ids` IN ORDER and keeping
+// only the entries for one header, so the two orders agree by construction
+// rather than by a sort.
+class LicmPlan {
+  home: []int,
+  hdr: []int,
+  ids: []int,
+  pre: []int,
+}
+
+// The neutral plan: nothing hoisted. Every rebuild that is not doing LICM
+// passes this rather than the rebuild carrying a special case.
+fn noLicm(n: int): LicmPlan {
+  let home = []int(0)
+  let hdr = []int(0)
+  let i = 0
+  while (i < n) {
+    home = append(home, -1)
+    hdr = append(hdr, -1)
+    i = i + 1
+  }
+  return LicmPlan{ home: home, hdr: hdr, ids: []int(0), pre: []int(0) }
+}
+
+// The per-function analysis state, bundled for the same reason `LicmScan` is.
+class LicmCtx {
+  ctx: TypeContext,
+  f: IrFunc,
+  pm: PredMap,
+  pos: []int,
+  // The block each instruction slot belongs to, so `licmParamSource` can find
+  // the predecessors of a block param it is handed by value id alone.
+  owner: []int,
+  plan: LicmPlan,
+}
+
+// One entry per instruction slot naming its block. Blocks do not overlap and
+// every slot belongs to exactly one, so a single pass fills it.
+fn licmOwners(f: IrFunc): []int {
+  let owner = []int(0)
+  let i = 0
+  while (i < len(f.instrs)) {
+    owner = append(owner, 0)
+    i = i + 1
+  }
+  let b = 0
+  while (b < len(f.blocks)) {
+    let blk = f.blocks[b]
+    let idx = blk.instsStart
+    while (idx < blk.instsStart + blk.instsLen) {
+      owner[idx] = b
+      idx = idx + 1
+    }
+    b = b + 1
+  }
+  return owner
+}
+
+// The single value every predecessor edge passes to block param `v`, or -1
+// when `v` is not a block param, when an edge cannot be read, or when two
+// edges disagree.
+//
+// AN EDGE THAT PASSES `v` ITSELF IS IGNORED, and that is the rule that makes
+// this useful. A loop-carried param that is handed straight back on the back
+// edge only ever holds what the entry edge gave it, so dropping the self-edge
+// is not an approximation: the first entry sets the value and every self-edge
+// preserves it.
+//
+// A block with no predecessors — the entry block, whose params are the
+// FUNCTION's params — yields -1, so a function parameter is never resolved
+// away into something that does not exist.
+fn licmParamSource(lc: LicmCtx, v: int): int {
+  if (lc.f.instrs[v].op != Op.BlockParam) {
+    return -1
+  }
+  let b = lc.owner[v]
+  let k = v - lc.f.blocks[b].instsStart
+  let found = -1
+  let e = lc.pm.start[b]
+  while (e < lc.pm.start[b + 1]) {
+    let args = licmEdgeArgs(lc.f, lc.pm.list[e], b)
+    if (len(args) != lc.f.blocks[b].paramCount) {
+      return -1
+    }
+    if (args[k] != v) {
+      if (found >= 0 && found != args[k]) {
+        return -1
+      }
+      found = args[k]
+    }
+    e = e + 1
+  }
+  return found
+}
+
+// The value `v0` provably always equals, following block params back through
+// the edges that can only pass one thing. Every step is an equality, so
+// stopping early — at the step bound, or where the sources disagree — is still
+// a true answer, just a less useful one. The bound is what makes a mutually
+// referring pair of params terminate.
+fn licmResolve(lc: LicmCtx, v0: int): int {
+  let v = v0
+  let steps = 0
+  while (steps < 64) {
+    let w = licmParamSource(lc, v)
+    if (w < 0) {
+      return v
+    }
+    v = w
+    steps = steps + 1
+  }
+  return v
+}
+
+// #4051: fills a plan with every loop-invariant header word this function can
+// safely compute once. Every block is tried as a header; the refusals above do
+// the filtering, so there is no separate loop-nest structure to build.
+fn licmPlanFor(ctx: TypeContext, f: IrFunc, known: []ConstVal, fwd: []int): LicmPlan {
+  let plan = noLicm(len(f.instrs))
+  let lc = LicmCtx{
+    ctx: ctx, f: f, pm: licmPredMap(f),
+    pos: blockOrderPositions(f, blockEmissionOrder(f)), owner: licmOwners(f),
+    plan: plan,
+  }
+  let h = 0
+  while (h < len(f.blocks)) {
+    licmPlanLoop(lc, known, fwd, h)
+    h = h + 1
+  }
+  return plan
+}
+
+// One candidate header. Returns without recording anything unless every
+// refusal in this file's header passes.
+fn licmPlanLoop(lc: LicmCtx, known: []ConstVal, fwd: []int, h: int) {
+  let pre = licmPreheader(lc.pm, h)
+  if (pre < 0 || lc.pos[pre] >= lc.pos[h] || !licmHasBackEdge(lc.pm, h)) {
+    return
+  }
+  let args = licmEdgeArgs(lc.f, pre, h)
+  if (len(args) != lc.f.blocks[h].paramCount || len(args) == 0) {
+    return
+  }
+  let sc = LicmScan{
+    known: known, fwd: fwd,
+    inv: licmInvariantParams(lc, h), hdr: h, pre: pre, args: args,
+  }
+  let inLoop = licmLoopBlocks(lc.f, lc.pm, h)
+  if (!licmSingleEntry(lc, inLoop, h) || licmLoopClobbers(lc, inLoop)) {
+    return
+  }
+  licmCollect(lc, sc, inLoop)
+}
+
+fn licmLoopClobbers(lc: LicmCtx, inLoop: []bool): bool {
+  let b = 0
+  while (b < len(inLoop)) {
+    if (inLoop[b] && licmBlockClobbers(lc, b)) {
+      return true
+    }
+    b = b + 1
+  }
+  return false
+}
+
+fn licmBlockClobbers(lc: LicmCtx, b: int): bool {
+  let blk = lc.f.blocks[b]
+  let idx = blk.instsStart + blk.paramCount
+  let end = blk.instsStart + blk.instsLen
+  while (idx < end) {
+    if (licmClobbers(lc.f, lc.ctx, idx)) {
+      return true
+    }
+    idx = idx + 1
+  }
+  return false
+}
+
+fn licmCollect(lc: LicmCtx, sc: LicmScan, inLoop: []bool) {
+  let b = 0
+  while (b < len(inLoop)) {
+    if (inLoop[b]) {
+      licmCollectBlock(lc, sc, b)
+    }
+    b = b + 1
+  }
+}
+
+// An instruction an OUTER loop already claimed keeps that home: it is hoisted
+// further out, which is strictly better, and claiming it twice would emit it
+// in two places.
+fn licmCollectBlock(lc: LicmCtx, sc: LicmScan, b: int) {
+  let blk = lc.f.blocks[b]
+  let idx = blk.instsStart + blk.paramCount
+  let end = blk.instsStart + blk.instsLen
+  while (idx < end) {
+    if (lc.plan.home[idx] < 0) {
+      licmRecord(lc, sc, idx)
+    }
+    idx = idx + 1
+  }
+}
+
+fn licmRecord(lc: LicmCtx, sc: LicmScan, idx: int) {
+  let k = licmHoistSlot(lc, sc, idx)
+  if (k < 0) {
+    return
+  }
+  lc.plan.home[idx] = sc.pre
+  lc.plan.hdr[idx] = sc.hdr
+  lc.plan.ids = append(lc.plan.ids, idx)
+  lc.plan.pre = append(lc.plan.pre, sc.args[k])
+}
+
+// ---------------------------------------------------------------------------
+// The rebuild half — called from opt.bit's rebuildBlock
+// ---------------------------------------------------------------------------
+
+// True iff instruction `idx` is emitted somewhere other than `bi`, so `bi`'s
+// own walk must skip it.
+fn licmMovedAway(plan: LicmPlan, bi: int, idx: int): bool {
+  return plan.home[idx] >= 0 && plan.home[idx] != bi
+}
+
+// The extra params `bi` carries as a hoist header, appended after its own. The
+// walk order is `ids` order, matching `licmEdgeArgs`' append below.
+fn licmAddParams(rc: RebuildCtx, bi: int) {
+  let plan = rc.plan.licm
+  let k = 0
+  while (k < len(plan.ids)) {
+    if (plan.hdr[plan.ids[k]] == bi) {
+      rc.remap[plan.ids[k]] = builderAddParam(rc.b, rc.f.instrs[plan.ids[k]].ty)
+    }
+    k = k + 1
+  }
+}
+
+// Emits the instructions hoisted into `bi`, immediately before its terminator.
+//
+// Each one reads an invariant param of the header it is being lifted out of, a
+// value that does not exist here — so `remap` for that param slot is pointed
+// at the preheader edge's argument first. The override is temporary by
+// construction: the header is rebuilt after this block and `builderAddParam`
+// writes the same slot again.
+fn licmEmitHoisted(rc: RebuildCtx, bi: int) {
+  let plan = rc.plan.licm
+  let k = 0
+  while (k < len(plan.ids)) {
+    let id = plan.ids[k]
+    if (plan.home[id] == bi) {
+      rc.remap[rc.f.instrs[id].lhs] = rc.remap[plan.pre[k]]
+      emitTranslated(rc.b, rc.f, rc.plan.known, rc.remap, rc.blockMap, id)
+    }
+    k = k + 1
+  }
+}
+
+// `args` with one entry appended for every value hoisted onto `oldTarget`'s
+// param list. `remap` already holds the right new id: the preheader's
+// terminator is emitted while it still names the value emitted by
+// `licmEmitHoisted`, and every back-edge block is emitted after the header, by
+// which point `licmAddParams` has overwritten it with the param.
+fn licmEdgeExtra(rc: RebuildCtx, args: []int, oldTarget: int): []int {
+  let plan = rc.plan.licm
+  let out = licmCopyInts(args)
+  let k = 0
+  while (k < len(plan.ids)) {
+    if (plan.hdr[plan.ids[k]] == oldTarget) {
+      out = append(out, rc.remap[plan.ids[k]])
+    }
+    k = k + 1
+  }
+  return out
+}
+
+// Extends the argument lists of the terminator `emitTranslated` has just
+// emitted. Reading the EMITTED instruction rather than the original is what
+// keeps this correct when a `br` with a known condition has collapsed to a
+// `jump`: the surviving target is read off the result instead of the decision
+// being duplicated here, where it could drift.
+// A FRESH list, never `args` itself: the emitted terminator's argument slice is
+// the builder's own, and `append` aliases its backing (SPEC §13.6), so growing
+// it in place could write through to whatever else shares that array.
+fn licmCopyInts(src: []int): []int {
+  let out = []int(0)
+  let i = 0
+  while (i < len(src)) {
+    out = append(out, src[i])
+    i = i + 1
+  }
+  return out
+}
+
+fn licmExtendEdges(rc: RebuildCtx) {
+  if (len(rc.plan.licm.ids) == 0) {
+    return
+  }
+  let t = rc.b.instrs[len(rc.b.instrs) - 1]
+  if (t.op == Op.Jump) {
+    t.args = licmEdgeExtra(rc, t.args, rc.newToOld[t.ival])
+    return
+  }
+  if (t.op == Op.Br) {
+    t.thenArgs = licmEdgeExtra(rc, t.thenArgs, rc.newToOld[t.ival])
+    t.elseArgs = licmEdgeExtra(rc, t.elseArgs, rc.newToOld[t.ival2])
+  }
+}
