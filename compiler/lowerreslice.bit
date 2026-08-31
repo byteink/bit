@@ -1,0 +1,235 @@
+// compiler/lowerreslice.bit — split out of loweraccess.bit (#4048) to keep both
+// files under the 800-line lint limit. Reslice lowering only: `a[lo:hi]` on a
+// slice (still `rt_call slice_slice`) and on a string (inline since #4048).
+// Sibling of loweraccess.bit: same module, so this needs no imports and no
+// call-site changes.
+
+// The out-of-line bounds panic both reslice paths would share if the slice side
+// were ever inlined too. Today only the string side calls it.
+//
+// The message text is the runtime's own, byte for byte:
+// `runtime/root/slices.bit`'s `strOobWord0..3`/`strOobLen` decode to exactly
+// "string bounds out of range" (26 bytes), which `panicBounds(oobStringRange)`
+// hands to `bit_rt_panic`. Reaching the same `bit_rt_panic` with the same text
+// gives the same stderr line and the same exit 2.
+fn emitStringSliceOob(fc: FnCtx) {
+  let msg = mkInstr(Op.ConstString, primType(fc.c.ctx, 11))
+  msg.sval = "string bounds out of range"
+  msg.ival = internPoolString(fc, msg.sval)
+  let pn = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+  pn.name = "panic"
+  pn.args = [builderEmit(fc.b, msg)]
+  emitRtCall(fc, pn)
+  builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
+}
+
+// `s[lo:hi]` on a string, built INLINE instead of through
+// `rt_call string_slice` (#4048). Reproduces `rtStringSlice`
+// (runtime/root/strings.bit:166) and the `allocStringView`/`strInitView` pair it
+// calls (runtime/root/root.bit:636, :589), verbatim:
+//
+//   n = len(s)                         // strSize: a NULL header reads as 0
+//   lo < 0 || lo > hi || hi > n  -> panic "string bounds out of range"
+//   out = gc_alloc(24, ptr_offsets=[16])
+//   out.ptr  = ptr(s) + lo             // strBytes: a NULL header reads as 0
+//   out.len  = hi - lo
+//   out.base = s                       // the IMMEDIATE source, never base(s)
+//
+// WHY INLINE AT ALL, and what this does NOT buy. It removes one `bl
+// _bit_rt_string_slice` and one safepoint per slice, which is real but small.
+// The reason it comes first in #3901's plan is different: the allocation this
+// expression performs is invisible to every compiler pass while it happens
+// inside a runtime call. #4007 measured `bench/cases/strings` at 1 non-escaping
+// allocation out of 7,125,044 — an artefact, because 41.1% of that program's
+// allocations have no `Op.GcAlloc` in anyone's IR. 7,125,001 of them are this
+// expression. `s[lo:hi]` STILL ALLOCATES after this change; it allocates
+// somewhere the optimizer, and any future escape analysis, can see.
+//
+// TWO UNSIGNED COMPARES COVER ALL THREE RUNTIME CONDITIONS, and the reduction is
+// exact rather than approximate. `0 <= lo <= hi <= n` holds iff `lo <=u hi` and
+// `hi <=u n`: `hi <=u n` forces `hi` into `[0, n]` (a length is non-negative and
+// far below 2^63, so a negative `hi` reads as an unsigned value larger than any
+// `n`), and given that, `lo <=u hi` forces `lo` into `[0, hi]`. Both directions
+// hold, so nothing legal is rejected and nothing illegal accepted. It is exact
+// at every integer width because this compiler keeps every value in a register
+// sign/zero-extended to its true 64-bit value (arm64select.bit's `canonNarrow`)
+// and both backends' `icmp` is a full 64-bit compare.
+//
+// A SIGN-BIT TRICK WAS TRIED AND IS UNSOUND, recorded so it is not re-proposed:
+// `(lo | (hi - lo) | (n - hi)) >= 0` accepts `n = 0, hi = -(2^63-1), lo = 2`,
+// where `hi - lo` wraps positive and `n - hi` does too. It would take a 2^63-byte
+// length from a 5-byte string. Two compares are what this needs.
+//
+// BLOCK IDS ASCEND WITH EMISSION ORDER, and here that is load-bearing rather
+// than tidy. `isBackEdge` (codegen.bit:588) is `target <= curBlock`, so a branch
+// to an ALREADY-EMITTED block is read as a loop back edge and both backends emit
+// a safepoint poll ladder there. The second bounds test branches to the same
+// panic block the first one does, so the panic block must be minted AFTER it:
+// `chk2`, then `oob`, then `ok`, emitted in that order. Minting `oob` first — the
+// order `emitInlineSliceElem` uses, where there is only one test — would put an
+// unnecessary poll on the second test's path.
+//
+// THE INTERIOR POINTER IS FORMED AFTER THE ALLOCATION, not before, and that is
+// the GC argument. `ptr` is an address INTO the backing object and must never be
+// traced (ABI.md §2.3), so nothing keeps it valid across a collection except the
+// backing staying alive. Computing it after `gc_alloc` — the only safepoint in
+// this sequence — means it never crosses one. `s` itself does cross it, and is
+// safely rooted: its IR type is `string`, which `isRefType` (codegen.bit:79)
+// reports as a GC reference, so the register allocator marks its live interval
+// `isRef` and the stack map at the `gc_alloc` return address names it. Its range
+// covers the call because the `field_set` of `base` reads it afterwards. That is
+// the same requirement `allocStringView`'s own header states ("`src` must
+// survive `gcAllocRaw`, which can collect") and the same one the copying
+// implementation before #3897 already had.
+//
+// NO WRITE BARRIER, for the reason #3108 established for the inline slice store:
+// `runtime/gc/gccollect.bit` is a full stop-the-world mark-sweep, there is no
+// barrier anywhere in the tree, and `strInitView`'s own `storeWord` performs
+// none either. When the GC goes incremental the barrier is owed here, at both
+// backends' `field_set`, and at `strInitView` together.
+//
+// THE DESCRIPTOR MATCHES THE RUNTIME'S. `typeInfoSymbol` emits
+// `__bittype_<string>_24_16` — size 24, `ptr_offsets = [16]` — which is exactly
+// what `rootInit` writes for `riString` (`writeInfo(base, riString,
+// strAllocHeader, ..., 1, ...)` with `riStringOffs` holding `strBase`). Two
+// descriptors with identical contents, and nothing in the collector matches
+// `riString` by ADDRESS: only `riRefArray` is a by-address sentinel
+// (runtime/root/root.bit's `ref_array_info` note), and a string view is never
+// allocated with it.
+fn emitInlineStringSlice(fc: FnCtx, recv: int, lo: int, hi: int, ty: int): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let boolty = primType(fc.c.ctx, 10)
+  let nIns = mkInstr(Op.SliceLen, i64ty)
+  nIns.lhs = recv
+  let n = builderEmit(fc.b, nIns)
+  // Minted before either is emitted, in the order they are emitted, so every
+  // branch below targets a HIGHER id than the block it leaves.
+  let chk2 = builderNewBlock(fc.b)
+  let oob = builderNewBlock(fc.b)
+  let ok = builderNewBlock(fc.b)
+
+  let c1 = mkInstr(Op.ICmpUle, boolty)
+  c1.lhs = lo
+  c1.rhs = hi
+  let br1 = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br1.lhs = builderEmit(fc.b, c1)
+  br1.ival = chk2
+  br1.ival2 = oob
+  builderEmit(fc.b, br1)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, chk2)
+  let c2 = mkInstr(Op.ICmpUle, boolty)
+  c2.lhs = hi
+  c2.rhs = n
+  let br2 = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br2.lhs = builderEmit(fc.b, c2)
+  br2.ival = ok
+  br2.ival2 = oob
+  builderEmit(fc.b, br2)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, oob)
+  emitStringSliceOob(fc)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, ok)
+  let ga = mkInstr(Op.GcAlloc, ty)
+  ga.ival = strViewHeaderSize()
+  ga.offsets = [strViewBaseOffset()]
+  let obj = builderEmit(fc.b, ga)
+  // `ptr` at +0, read null-safely (`isHeaderBase`, codegen.bit): a zeroed
+  // class's string field is the null word, and `strBytes` answers 0 for it.
+  let pIns = mkInstr(Op.FieldGet, i64ty)
+  pIns.lhs = recv
+  pIns.ival = 0
+  let addIns = mkInstr(Op.Add, i64ty)
+  addIns.lhs = builderEmit(fc.b, pIns)
+  addIns.rhs = lo
+  let setPtr = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  setPtr.lhs = obj
+  setPtr.ival = 0
+  setPtr.rhs = builderEmit(fc.b, addIns)
+  builderEmit(fc.b, setPtr)
+  let subIns = mkInstr(Op.Sub, i64ty)
+  subIns.lhs = hi
+  subIns.rhs = lo
+  let setLen = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  setLen.lhs = obj
+  setLen.ival = 8
+  setLen.rhs = builderEmit(fc.b, subIns)
+  builderEmit(fc.b, setLen)
+  let setBase = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  setBase.lhs = obj
+  setBase.ival = strViewBaseOffset()
+  setBase.rhs = recv
+  builderEmit(fc.b, setBase)
+  return obj
+}
+
+// `strAllocHeader` (runtime/root/root.bit:218) — the byte size of a `{ptr, len,
+// base}` string header, and the whole size of a view, which owns no inline
+// bytes. Named rather than written as a literal at the two sites above because
+// it is a runtime layout constant this file is MIRRORING, not choosing.
+fn strViewHeaderSize(): int {
+  return 24
+}
+
+// `strBase` (runtime/root/root.bit:217) — the offset of the one traced field of
+// a string header, and so the whole of its `ptr_offsets` (ABI.md §2.3). `ptr`
+// at +0 is an interior pointer and must never appear there.
+fn strViewBaseOffset(): int {
+  return 16
+}
+
+// Lowers a reslice `s[lo:hi]` (SPEC §12.7): `rt_call slice_slice(s, lo, hi)` for a
+// slice, inline for a string (#4048). An omitted `lo` is 0; an omitted `hi` is
+// the receiver's current length. Array reslice is not lowerable (matches seed).
+fn lowerSliceExpr(fc: FnCtx, node: int): int {
+  let k = kidsOf(fc.c.tree, node)
+  let recvTy = defaultType(fc.c, nodeType(fc, k[0]))
+  let rd = fc.c.ctx.types[recvTy]
+  let isString = rd.kind == TypeKind.Prim && rd.prim == 11
+  if (rd.kind != TypeKind.Slice && !isString) {
+    fcFail(
+      fc,
+      getNode(fc.c.tree, node).span,
+      "a reslice of a value that is not a slice or a string",
+    )
+    return 0
+  }
+  let i64ty = primType(fc.c.ctx, 3)
+  let recv = lowerExpr(fc, k[0])
+  if (fc.failed) {
+    return 0
+  }
+  let lo = 0
+  if (k[1] != 0) {
+    lo = lowerExprH(fc, k[1], i64ty)
+  } else {
+    let z = mkInstr(Op.ConstInt, i64ty)
+    lo = builderEmit(fc.b, z)
+  }
+  let hi = 0
+  if (k[2] != 0) {
+    hi = lowerExprH(fc, k[2], i64ty)
+  } else {
+    let sl = mkInstr(Op.SliceLen, i64ty)
+    sl.lhs = recv
+    hi = builderEmit(fc.b, sl)
+  }
+  if (fc.failed) {
+    return 0
+  }
+  // `recv`, `lo` and `hi` are ALL lowered before the sequence below starts.
+  // Evaluating either bound can allocate or call, and that is a safepoint;
+  // keeping them ahead of the allocation is what leaves the derived interior
+  // pointer's live range safepoint-free.
+  if (isString) {
+    return emitInlineStringSlice(fc, recv, lo, hi, nodeType(fc, node))
+  }
+  let ins = mkInstr(Op.RtCall, nodeType(fc, node))
+  ins.name = "slice_slice"
+  ins.args = [recv, lo, hi]
+  return emitRtCall(fc, ins)
+}
