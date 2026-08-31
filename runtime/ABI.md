@@ -1595,6 +1595,7 @@ defined exactly once).
 | `bit_rt_print`        | `(s: *const RtBytes) -> void` (§12, fd 1)               |
 | `bit_rt_eprint`       | `(s: *const RtBytes) -> void` (§12, fd 2)               |
 | `bit_rt_string_concat`| `(a: *const RtBytes, b: *const RtBytes) -> *const RtBytes` (§2) |
+| `bit_rt_string_concat5`| `(a: *const RtBytes, ..., e: *const RtBytes) -> *const RtBytes` (§2, five operands joined in ONE sized allocation; an operand past the last real part is the empty string, which lowering materializes as a pooled `const_string ""` — a null header reads the same way through §2's string funnel. Interpolation joins four new parts per call instead of folding one per binary `string_concat`, #4037) |
 | `bit_rt_string_eq`    | `(a: *const RtBytes, b: *const RtBytes) -> bool` (§2)   |
 | `bit_rt_string_cmp`   | `(a: *const RtBytes, b: *const RtBytes) -> i64` (§2, three-way lexicographic order; unsigned bytes, shorter-is-less on a common prefix) |
 | `bit_rt_string_byte`  | `(s: *const RtBytes, index: usize) -> u64` (§2, `s[i]`; u64-widened) |
