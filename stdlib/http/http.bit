@@ -18,7 +18,7 @@
 // server itself never emits chunked.
 
 import { listen, dial, dialDeadline, udpBind, Listener, Conn } from "std/net"
-import { indexOf, hasPrefix, toLower } from "std/strings"
+import { indexOf, hasPrefix, toLower, newBuilder } from "std/strings"
 import {
   dial as tlsDial, dialDeadline as tlsDialDeadline, listen as tlsListen, TlsConn, TlsConfig,
   TlsListener, newTlsConfig, emptyTrustStore, TrustStore as TlsTrustStore,
@@ -416,16 +416,13 @@ class tlsStream {
 // Read `s` to end of stream (an empty read). Only safe against a peer that
 // closes — `Connection: close` guarantees it here.
 fn readAllStream(s: byteStream): string! {
-  let out = ""
+  let out = newBuilder()
   while (true) {
     let chunk = s.readUp(65536)?
     if (len(chunk) == 0) {
-      return out
+      return out.toString()
     }
-    // ponytail: O(N^2) over the chunk count (~80 for a 1 MB body = ~50 MB of
-    // copies, negligible); a bulk byte-buffer append would make it O(N) but needs
-    // a runtime primitive the stdlib does not yet have.
-    out = out + chunk
+    out.write(chunk)
   }
 }
 
@@ -437,17 +434,56 @@ fn readAllStream(s: byteStream): string! {
 // text before the first `delim` and whatever of `buf` came after it (bytes
 // already buffered past the delimiter — e.g. the start of a chunk body or the
 // next header line). Fails if the peer closes before `delim` ever appears.
+// The last `n` bytes of `s`, or all of `s` when it is shorter. `n` is
+// `len(delim) - 1` at both call sites: the widest window a delimiter match
+// can straddle when the next chunk arrives.
+fn lastBytes(s: string, n: int): string {
+  if (len(s) <= n) {
+    return s
+  }
+  return s[len(s) - n:len(s)]
+}
+
+// The index, within an accumulated buffer of `accLen` bytes followed by
+// `chunk`, of the first `delim` — or -1 if there is none. `tail` is that
+// buffer's last `len(delim) - 1` bytes, and the buffer is already known to
+// contain no `delim`, so a match can only start inside `tail`: scanning
+// `tail + chunk` is O(len(chunk)) per read where re-scanning the whole buffer
+// would be O(accLen). That is what lets an accumulate-until-delimiter loop
+// keep its accumulator in a Builder — it never has to be materialised as a
+// string until the delimiter is actually found.
+fn delimIndex(accLen: int, tail: string, chunk: string, delim: string): int {
+  let hit = indexOf(tail + chunk, delim)
+  if (hit < 0) {
+    return -1
+  }
+  return accLen - len(tail) + hit
+}
+
 fn readUntil(s: byteStream, buf: string, delim: string): (string, string)! {
-  let b = buf
-  while (indexOf(b, delim) < 0) {
+  let at = indexOf(buf, delim)
+  if (at >= 0) {
+    return buf[0:at], buf[at + len(delim):len(buf)]
+  }
+  let back = len(delim) - 1
+  let acc = newBuilder()
+  acc.write(buf)
+  let n = len(buf)
+  let tail = lastBytes(buf, back)
+  while (true) {
     let chunk = s.readUp(4096)?
     if (len(chunk) == 0) {
       fail newError("readMessage: connection closed mid-message")
     }
-    b = b + chunk
+    let hit = delimIndex(n, tail, chunk, delim)
+    acc.write(chunk)
+    n = n + len(chunk)
+    if (hit >= 0) {
+      let all = acc.toString()
+      return all[0:hit], all[hit + len(delim):len(all)]
+    }
+    tail = lastBytes(tail + chunk, back)
   }
-  let at = indexOf(b, delim)
-  return b[0:at], b[at + len(delim):len(b)]
 }
 
 // Decodes a `Transfer-Encoding: chunked` body (RFC 9112 §7.1) off `s`,
@@ -455,10 +491,33 @@ fn readUntil(s: byteStream, buf: string, delim: string): (string, string)! {
 // headers. Fails on a non-hex chunk-size, a stream that closes mid-chunk, or a
 // chunk stream that never terminates within `maxChunks` — bounded so the loop
 // is provably finite (Power of 10 rule 2), not to cap a legitimately large body.
+// Reads 4096-byte chunks from `s` onto `have` until it holds at least `n`
+// bytes. Split out of `decodeChunkedBody` (#4028) so the chunk-fill
+// accumulates into a Builder without spending a branch from that function's
+// own complexity budget; the loop it replaces there re-copied the whole
+// partially-filled chunk on every read.
+fn fillTo(s: byteStream, have: string, n: int): string! {
+  if (len(have) >= n) {
+    return have
+  }
+  let b = newBuilder()
+  b.write(have)
+  let got = len(have)
+  while (got < n) {
+    let chunk = s.readUp(4096)?
+    if (len(chunk) == 0) {
+      fail newError("readMessage: connection closed mid-chunk")
+    }
+    b.write(chunk)
+    got = got + len(chunk)
+  }
+  return b.toString()
+}
+
 fn decodeChunkedBody(s: byteStream, buffered: string): string! {
   let maxChunks = 1048576
   let buf = buffered
-  let body = ""
+  let body = newBuilder()
   let n = 0
   while (n < maxChunks) {
     n = n + 1
@@ -482,19 +541,13 @@ fn decodeChunkedBody(s: byteStream, buffered: string): string! {
         let (line, rest2) = readUntil(s, buf, "\r\n")?
         buf = rest2
         if (len(line) == 0) {
-          return body
+          return body.toString()
         }
       }
       fail newError("readMessage: too many trailer fields")
     }
-    while (len(buf) < size + 2) {
-      let chunk = s.readUp(4096)?
-      if (len(chunk) == 0) {
-        fail newError("readMessage: connection closed mid-chunk")
-      }
-      buf = buf + chunk
-    }
-    body = body + buf[0:size]
+    buf = fillTo(s, buf, size + 2)?
+    body.write(buf[0:size])
     buf = buf[size + 2:len(buf)]
   }
   fail newError("readMessage: too many chunks")
@@ -561,18 +614,28 @@ const maxHeaderBytes = 65536
 // The caller slices exactly the two strings the class used to carry, so the
 // object is removed and no copying is added.
 fn readThroughHeaderEnd(s: byteStream): string! {
-  let buf = ""
-  while (indexOf(buf, "\r\n\r\n") < 0) {
-    if (len(buf) > maxHeaderBytes) {
-      fail newError("readMessage: header block exceeds ${maxHeaderBytes} bytes")
-    }
+  let delim = "\r\n\r\n"
+  let acc = newBuilder()
+  let n = 0
+  let tail = ""
+  // Same cap as before: the loop is left, and the message below raised, once
+  // the accumulated block passes `maxHeaderBytes` with no terminator in it.
+  // A terminator that arrives in the chunk which crosses the cap is still
+  // accepted, exactly as the pre-#4028 `indexOf`-first loop accepted it.
+  while (n <= maxHeaderBytes) {
     let chunk = s.readUp(4096)?
     if (len(chunk) == 0) {
       return ""
     }
-    buf = buf + chunk
+    let hit = delimIndex(n, tail, chunk, delim)
+    acc.write(chunk)
+    n = n + len(chunk)
+    if (hit >= 0) {
+      return acc.toString()
+    }
+    tail = lastBytes(tail + chunk, len(delim) - 1)
   }
-  return buf
+  fail newError("readMessage: header block exceeds ${maxHeaderBytes} bytes")
 }
 
 // Reads the remaining `cl - len(initial)` bytes of a Content-Length-framed
@@ -581,21 +644,27 @@ fn readThroughHeaderEnd(s: byteStream): string! {
 // (`break`, not `fail`) — request framing has always been lenient here.
 // Split out of `readMessage` (#2448).
 fn readRequestContentLengthBody(s: byteStream, initial: string, cl: int): string! {
-  let body = initial
-  if (len(body) > cl) {
-    body = body[0:cl]
+  if (len(initial) >= cl) {
+    return initial[0:cl]
   }
-  while (len(body) < cl) {
+  let body = newBuilder()
+  body.write(initial)
+  let have = len(initial)
+  while (have < cl) {
     let chunk = s.readUp(4096)?
     if (len(chunk) == 0) {
       break
     }
-    body = body + chunk
-    if (len(body) > cl) {
-      body = body[0:cl]
+    // Truncate the OVERSHOOTING CHUNK rather than the accumulated body, which
+    // is the same `cl` bytes kept and the same excess dropped, without
+    // re-slicing everything read so far on every read.
+    if (have + len(chunk) > cl) {
+      chunk = chunk[0:cl - have]
     }
+    body.write(chunk)
+    have = have + len(chunk)
   }
-  return body
+  return body.toString()
 }
 
 // Frame the body per RFC 9112 §6. Content-Length and Transfer-Encoding
