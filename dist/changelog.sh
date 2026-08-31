@@ -195,9 +195,9 @@ fi
 
 printf '### Artifacts\n\n'
 printf 'Published for `x86_64-linux`, `aarch64-linux` and `aarch64-macos`.\n'
-printf 'Windows and `x86_64-macos` are not built yet — see `dist/README.md`\n'
-printf 'for the full target table, the archive layout, the required\n'
-printf '`BIT_STDLIB`/`BIT_LIBBITRT` environment, and the `SHA256SUMS` format.\n\n'
+printf 'See `dist/README.md` for the full target table, the archive layout,\n'
+printf 'the required `BIT_STDLIB`/`BIT_LIBBITRT` environment, and the\n'
+printf '`SHA256SUMS` format.\n\n'
 printf 'Verify a download before running it:\n\n'
 printf '```sh\n'
 printf 'sha256sum --check --ignore-missing SHA256SUMS   # shasum -a 256 on macOS\n'
