@@ -1,0 +1,313 @@
+// Multi-chunk body framing (#4028). Every body-reading loop in std/http used
+// to accumulate with `x = x + chunk` inside a 4096-byte read loop; they now
+// accumulate into a `std/strings` Builder. That is a rewrite of SIX framing
+// loops plus the header-block reader, so this exercises each of them at a
+// size that takes MANY reads — a single-chunk fixture cannot tell a correct
+// accumulator from one that drops, duplicates or misorders whole chunks.
+//
+// Every payload is checked by length AND by FNV-1a over its bytes: a body
+// that is the right size with two chunks swapped has the right length.
+//
+// The header-block cases are the security half. `readThroughHeaderEnd`'s
+// 64 KiB cap is the only thing stopping a peer that never sends the blank
+// line from growing the buffer without limit, and nothing else in the corpus
+// covered it — the loop enforcing it was rewritten here, so it is tested
+// here.
+//
+// Nothing prints raw wire bytes: the `expected` beside this file must hold no
+// CRLFs for this repo's `core.autocrlf=input` to rewrite.
+import { serve, Server, Exchange, ok, respond, get, post } from "std/http"
+import { listen, dial, Listener } from "std/net"
+import { indexOf } from "std/strings"
+import { sleep } from "std/time"
+
+const unit: int = 4096
+const reps: int = 64
+const bodyBytes: int = 262144
+
+fn unitBytes(): string {
+  let b = []byte(0)
+  let i = 0
+  while (i < unit) {
+    b = append(b, byte(32 + (i * 31 + 7) % 95))
+    i = i + 1
+  }
+  return string(b)
+}
+
+// A distinct 4096-byte block per repetition, so a dropped or duplicated
+// chunk changes the hash even when the total length is right.
+fn blockAt(u: string, k: int): string {
+  return "${k}|" + u[0:unit - len("${k}|")]
+}
+
+fn payload(u: string): string {
+  let b = []byte(0)
+  let i = 0
+  while (i < reps) {
+    let blk = blockAt(u, i)
+    let j = 0
+    while (j < unit) {
+      b = append(b, blk[j])
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return string(b)
+}
+
+fn hash(s: string): int {
+  let h = 2166136261
+  let i = 0
+  while (i < len(s)) {
+    h = (h ^ int(s[i])) * 16777619 % 4294967296
+    i = i + 1
+  }
+  return h
+}
+
+fn repeatByte(c: string, n: int): string {
+  let b = []byte(0)
+  let i = 0
+  while (i < n) {
+    b = append(b, c[0])
+    i = i + 1
+  }
+  return string(b)
+}
+
+fn statusOf(raw: string): string {
+  let eol = indexOf(raw, "\r\n")
+  if (eol < 0) {
+    return raw
+  }
+  return raw[0:eol]
+}
+
+fn bodyOf(raw: string): string {
+  let sep = indexOf(raw, "\r\n\r\n")
+  if (sep < 0) {
+    return ""
+  }
+  return raw[sep + 4:len(raw)]
+}
+
+fn rawExchange(port: int, req: string): string {
+  let c = dial("127.0.0.1", port) catch _ {
+    return "DIAL FAILED"
+  }
+  c.write(req) catch _ {
+    c.close()
+    return "WRITE FAILED"
+  }
+  let r = c.readAll()
+  c.close()
+  return r
+}
+
+// Writes a request in two parts with a pause between, so the server's header
+// reader is forced to resume across the boundary at exactly `part1`'s end.
+fn rawExchangeSplit(port: int, part1: string, part2: string): string {
+  let c = dial("127.0.0.1", port) catch _ {
+    return "DIAL FAILED"
+  }
+  c.write(part1) catch _ {
+    c.close()
+    return "WRITE FAILED"
+  }
+  sleep(50000000)
+  c.write(part2) catch _ {
+    c.close()
+    return "WRITE FAILED"
+  }
+  let r = c.readAll()
+  c.close()
+  return r
+}
+
+fn dispatch(ex: Exchange, want: string) {
+  let r = ex.read() catch _ {
+    ex.respond(respond(400, "")) catch _ {
+      return
+    }
+    return
+  }
+  if (len(r.body) > 0) {
+    ex.respond(ok("len=${len(r.body)} h=${hash(r.body)}")) catch _ {
+      return
+    }
+    return
+  }
+  ex.respond(ok(want)) catch _ {
+    return
+  }
+}
+
+fn serveLoop(s: Server, n: int, want: string, ready: chan<int>): ()! {
+  ready <- 0
+  let i = 0
+  while (i < n) {
+    let ex = s.accept()?
+    spawn dispatch(ex, want)
+    i = i + 1
+  }
+  s.close()
+}
+
+// A raw responder: writes `wire` verbatim and closes, so the client sees
+// whatever framing the caller built (chunked, or none at all). `splitAt > 0`
+// writes it in two parts with a pause between, so the reader is FORCED to
+// resume mid-token at that offset.
+fn rawLoop(l: Listener, wire: string, splitAt: int, ready: chan<int>): ()! {
+  ready <- 0
+  let c = l.accept()?
+  let _ = c.read(4096)
+  if (splitAt <= 0) {
+    c.write(wire)?
+    c.close()
+    l.close()
+    return
+  }
+  c.write(wire[0:splitAt])?
+  sleep(50000000)
+  c.write(wire[splitAt:len(wire)])?
+  c.close()
+  l.close()
+}
+
+fn chunkedWire(u: string): string {
+  let b = []byte(0)
+  let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+  let i = 0
+  while (i < len(head)) {
+    b = append(b, head[i])
+    i = i + 1
+  }
+  let k = 0
+  while (k < reps) {
+    let piece = "1000\r\n" + blockAt(u, k) + "\r\n"
+    let j = 0
+    while (j < len(piece)) {
+      b = append(b, piece[j])
+      j = j + 1
+    }
+    k = k + 1
+  }
+  let tailText = "0\r\n\r\n"
+  let t = 0
+  while (t < len(tailText)) {
+    b = append(b, tailText[t])
+    t = t + 1
+  }
+  return string(b)
+}
+
+fn eofWire(body: string): string {
+  return "HTTP/1.1 200 OK\r\n\r\n" + body
+}
+
+fn rawServed(wire: string, label: string, want: string, splitAt: int) {
+  let l = listen("127.0.0.1", 0) catch _ {
+    println("${label}: listen failed")
+    return
+  }
+  let port = l.port() catch _ {
+    println("${label}: port failed")
+    return
+  }
+  let ready = chan<int>(1)
+  spawn rawLoop(l, wire, splitAt, ready)
+  let _ = <- ready
+  let r = get("http://127.0.0.1:${port}/") catch e {
+    println("${label}: get failed: ${e.message()}")
+    return
+  }
+  println("${label}: len=${len(r.body)} h=${hash(r.body)} match=${r.body == want}")
+}
+
+fn main() {
+  let u = unitBytes()
+  let want = payload(u)
+  println("payload: len=${len(want)} h=${hash(want)} want=${bodyBytes}")
+
+  let s = serve("127.0.0.1", 0) catch _ {
+    println("serve failed")
+    return
+  }
+  let port = s.port() catch _ {
+    println("port failed")
+    return
+  }
+  let ready = chan<int>(1)
+  spawn serveLoop(s, 6, want, ready)
+  let _ = <- ready
+
+  // 1. Client reads a Content-Length body spanning 64 reads.
+  let r1 = get("http://127.0.0.1:${port}/") catch e {
+    println("clientCL: get failed: ${e.message()}")
+    return
+  }
+  println("clientCL: len=${len(r1.body)} h=${hash(r1.body)} match=${r1.body == want}")
+
+  // 2. Server reads a Content-Length request body spanning 64 reads.
+  let r2 = post("http://127.0.0.1:${port}/", want) catch e {
+    println("serverCL: post failed: ${e.message()}")
+    return
+  }
+  println("serverCL: ${r2.body} want=len=${len(want)} h=${hash(want)}")
+
+  // 3. Content-Length shorter than the bytes on the wire: the excess is
+  //    truncated, not appended, and the guard survived the rewrite.
+  let short = 100000
+  let cut = rawExchange(
+    port,
+    "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: ${short}\r\nConnection: close\r\n\r\n" + want,
+  )
+  println("truncate: ${statusOf(cut)} | ${bodyOf(cut)} want=len=${short} h=${hash(want[0:short])}")
+
+  // 4. Header block over the 64 KiB cap, with no terminating blank line
+  //    anywhere: rejected, never accumulated without limit.
+  let over = rawExchange(
+    port,
+    "POST / HTTP/1.1\r\nHost: x\r\nX-Pad: " + repeatByte("A", 70000),
+  )
+  println("headerOverCap: ${statusOf(over)}")
+
+  // 5. Header block just under the cap: still served.
+  let under = rawExchange(
+    port,
+      "POST / HTTP/1.1\r\nHost: x\r\nX-Pad: " +
+      repeatByte("A", 60000) +
+      "\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
+  )
+  println("headerUnderCap: ${statusOf(under)} | ${bodyOf(under)}")
+
+  // 6. Chunked response, 64 chunks: readUntil (size lines), the chunk fill
+  //    and the body accumulation all run 64 times.
+  rawServed(chunkedWire(u), "clientChunked", want, 0)
+
+  // 7. No Content-Length and no Transfer-Encoding: read-to-EOF.
+  rawServed(eofWire(want), "clientEof", want, 0)
+
+  // 8. The same chunked wire, but cut in the MIDDLE OF A CHUNK-SIZE LINE, so
+  //    `readUntil` has to resume a partial token across two reads. Without
+  //    this the size line is always already buffered and `readUntil`'s
+  //    accumulate path never runs at all — a mutation deleting it passed
+  //    every other case here.
+  let cw = chunkedWire(u)
+  let recordAt = indexOf(cw, "\r\n\r\n") + 4 + 4104
+  rawServed(cw, "clientChunkedSplit", want, recordAt + 2)
+
+  // 9. The same, cut BETWEEN the CR and the LF of a chunk-size line. This is
+  //    the straddle the incremental delimiter scan exists for: the match
+  //    starts in what has already been accumulated and finishes in the next
+  //    read, so a scanner that only looks at the new bytes misses it and
+  //    parses the size line as the whole 4 KiB chunk that follows.
+  rawServed(cw, "clientChunkedCrLfSplit", want, recordAt + 5)
+
+  // 10. Request headers cut between the CR and the final LF of the blank
+  //     line, the same straddle on the server's header reader.
+  let hreq = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nConnection: close\r\n\r"
+  let split = rawExchangeSplit(port, hreq, "\nabc")
+  println("headerCrLfSplit: ${statusOf(split)} | ${bodyOf(split)}")
+}
