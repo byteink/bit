@@ -1,0 +1,270 @@
+// compiler/optcse.bit — REDUNDANT-LOAD ELIMINATION (#4035) and COMMON-
+// SUBEXPRESSION ELIMINATION (#4036). Sibling of optstore.bit in the same
+// module, split out for the same reason: opt.bit is at its size limit.
+//
+// optstore.bit forwards a STORE to a later load of the same slot. This file is
+// the other two halves of the same idea — forwarding a LOAD to a later
+// identical load, and a pure computation to a later identical computation —
+// and it shares that file's discipline: every rule refuses rather than reasons
+// when it cannot prove the answer.
+//
+// ## Why this is not strictly block-local, and why block-local would be worth
+// ## nothing here
+//
+// #4035 described the transform as block-local. Read against the IR, that is
+// wrong, and it is worth stating because "block-local" is the safe-sounding
+// answer. Every inline slice access (loweraccess.bit's `emitInlineSliceElem`)
+// ENDS ITS BLOCK: the bounds test emits `br` to an out-of-line panic block and
+// a fresh `ok` block, and the header words are read in that `ok` block. So the
+// three accesses of matrix's `c[i*n+j] = c[i*n+j] + aik*b[k*n+j]` sit in four
+// different blocks (bb20/bb22/bb24/bb26 on 6f6a730e), and a pass that cannot
+// see past one block removes none of the 42 instructions the ticket measured.
+//
+// What those blocks are is a CHAIN: each has exactly one predecessor. A block
+// with exactly one predecessor is dominated by it, so every value live at that
+// predecessor's exit is available at its entry — no dataflow, no meet, no
+// dominator tree. That single rule is the whole extension, and it is applied
+// only forwards (`p < bi` and earlier in emission order), so the table never
+// crosses a back edge and therefore never crosses the safepoint a back edge
+// carries.
+//
+// ## What invalidates an entry
+//
+// LOADS: any instruction that can write memory, call, allocate or trap-and-
+// return clears the whole table. That list is `isSideEffecting` (opt.bit)
+// minus `index_get`, which is a pure load whose only effect is a panic, and a
+// panic does not return. Deriving the barrier set from `isSideEffecting`
+// rather than listing it is deliberate and is optstore.bit's rule 3: an op
+// added later that writes memory must join `isSideEffecting` or DCE would
+// already be deleting it, so it becomes a barrier here the day it lands.
+//
+// The table holds MANY bases at once (matrix caches `b` and `c` together), so
+// unlike optstore.bit's store table it cannot answer "do these two SSA values
+// alias" — and it never has to, because it never keeps an entry across
+// anything that could store. That is why a store clears everything rather than
+// clearing one offset.
+//
+// PURE OPS: nothing invalidates them. A pure op over the same SSA operand ids
+// is the same value by definition; SSA values are immutable, so a call between
+// the two computations cannot change either operand. Only the availability
+// chain breaking (a block with two predecessors) drops them.
+//
+// ## What this does NOT do
+//
+// No code motion of any kind — no LICM, no hoisting, no sinking. Every value
+// this pass reuses was already computed at that point on every path.
+// loweraccess.bit:316 stakes the GC's correctness on `buf`'s live range
+// containing no safepoint; a reuse extends that range forwards, and the
+// barrier rule above is what keeps a call or an allocation out of it.
+
+// Available expressions as a PERSISTENT LIST in one arena: `next[e]` is the
+// entry visible before `e`, so a block inherits its predecessor's set by
+// copying ONE integer (the head) and adding to it without disturbing a sibling
+// block that inherited the same head. Clearing is `head = -1`. Nothing is ever
+// copied and nothing is ever removed, which is what makes the chain shared.
+//
+// `a` is the first operand (a resolved value id), `b` the second operand for a
+// binary op or the byte offset for a `field_get`, `ty` the result type — width
+// is taken from the result type at codegen, so two loads of one slot at
+// different widths must not answer each other.
+class AvailArena {
+  op: []int,
+  a: []int,
+  b: []int,
+  ty: []int,
+  val: []int,
+  next: []int,
+}
+
+fn newAvailArena(): AvailArena {
+  return AvailArena{ op: []int(0), a: []int(0), b: []int(0), ty: []int(0),
+    val: []int(0), next: []int(0) }
+}
+
+// What makes two instructions the same computation. A class rather than four
+// arguments because `max-params` is 5 (spec/LINT.md:184) and its stated reason
+// is exactly this one: past five, the arguments want to be a class.
+class AvailKey {
+  op: int,
+  a: int,
+  b: int,
+  ty: int,
+}
+
+// Records `val` under `k` and returns the new head. Bounded: at most one entry
+// per instruction examined.
+fn availPush(ar: AvailArena, head: int, k: AvailKey, val: int): int {
+  ar.op = append(ar.op, k.op)
+  ar.a = append(ar.a, k.a)
+  ar.b = append(ar.b, k.b)
+  ar.ty = append(ar.ty, k.ty)
+  ar.val = append(ar.val, val)
+  ar.next = append(ar.next, head)
+  return len(ar.op) - 1
+}
+
+// The value id already holding `k` at `head`, or -1. Walks the chain, which is
+// bounded by the number of entries pushed so far and strictly descending, so it
+// terminates.
+fn availFind(ar: AvailArena, head: int, k: AvailKey): int {
+  let e = head
+  while (e >= 0) {
+    if (ar.op[e] == k.op && ar.a[e] == k.a && ar.b[e] == k.b && ar.ty[e] == k.ty) {
+      return ar.val[e]
+    }
+    e = ar.next[e]
+  }
+  return -1
+}
+
+// The value `id` has already been forwarded to, following the chain to its
+// representative so two uses that differ only by an eliminated intermediate
+// key the same. Bounded by the instruction count: `fwd` only ever points at a
+// strictly lower index.
+fn cseResolve(fwd: []int, id: int): int {
+  let cur = id
+  let steps = 0
+  while (steps < len(fwd) && fwd[cur] >= 0) {
+    cur = fwd[cur]
+    steps = steps + 1
+  }
+  return cur
+}
+
+// The ops that clear the load table: `isSideEffecting` minus the two members
+// this pass accounts for exactly.
+//
+// `index_get` is a pure load whose only effect is a bounds panic, and a panic
+// does not return.
+//
+// A TERMINATOR writes no memory — it transfers control. It is in
+// `isSideEffecting` so DCE cannot delete it, which is a different question.
+// The one memory-relevant thing any terminator does is the BACK-EDGE SAFEPOINT
+// POLL (arm64call.bit's `emitBackEdgeSafepointIfNeeded`, `target <= curBlock`),
+// and `cseInheritHead` refuses every edge that could be one, so no entry ever
+// survives a poll. Leaving terminators in the set is not conservative, it is
+// vacuous: a block's own `br` would clear the set at the block's exit, which is
+// the only moment a successor reads it, so the pass would fire block-locally
+// and never once across the chain it exists for.
+fn opClobbersLoads(op: Op): bool {
+  return isSideEffecting(op) && op != Op.IndexGet && !opIsTerminator(op)
+}
+
+// The loads this pass forwards. Both read one word of a slice/class header
+// through the null-safe path; neither can trap and neither writes anything.
+fn opIsCseLoad(op: Op): bool {
+  return op == Op.SliceLen || op == Op.FieldGet
+}
+
+// One instruction against the load table; returns the block's new head.
+// A `field_get` optstore.bit already answered from a store is left alone: its
+// value is the stored one, which is a strictly better answer.
+fn cseLoadOne(f: IrFunc, ar: AvailArena, fwd: []int, head: int, idx: int): int {
+  let ins = f.instrs[idx]
+  if (opClobbersLoads(ins.op)) {
+    return -1
+  }
+  if (!opIsCseLoad(ins.op) || fwd[idx] >= 0) {
+    return head
+  }
+  let k = AvailKey{ op: int(ins.op), a: cseResolve(fwd, ins.lhs), b: ins.ival, ty: ins.ty }
+  let hit = availFind(ar, head, k)
+  if (hit >= 0) {
+    fwd[idx] = hit
+    return head
+  }
+  return availPush(ar, head, k, idx)
+}
+
+// One block front to back. Block params are skipped: they define values but
+// compute nothing, and `rebuild` emits them ahead of this range.
+fn cseLoadBlock(f: IrFunc, ar: AvailArena, fwd: []int, headIn: int, bi: int): int {
+  let blk = f.blocks[bi]
+  let head = headIn
+  let idx = blk.instsStart + blk.paramCount
+  let end = blk.instsStart + blk.instsLen
+  while (idx < end) {
+    head = cseLoadOne(f, ar, fwd, head, idx)
+    idx = idx + 1
+  }
+  return head
+}
+
+// `pred[b]` is b's only predecessor, or -1 when it has none or more than one.
+// An unreachable predecessor still counts, which only ever refuses an
+// opportunity. A block with no terminator (DCE can empty a block it keeps)
+// branches nowhere — reading `instsStart + instsLen - 1` there names the
+// instruction BEFORE the block, which is how #2084 segfaulted.
+fn singlePredecessors(f: IrFunc): []int {
+  let pred = []int(0)
+  let i = 0
+  while (i < len(f.blocks)) {
+    pred = append(pred, -1)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(f.blocks)) {
+    let blk = f.blocks[i]
+    if (blk.instsLen != 0) {
+      let term = f.instrs[blk.instsStart + blk.instsLen - 1]
+      if (term.op == Op.Jump) {
+        pred[term.ival] = notePred(pred[term.ival], i)
+      } else if (term.op == Op.Br) {
+        pred[term.ival] = notePred(pred[term.ival], i)
+        pred[term.ival2] = notePred(pred[term.ival2], i)
+      }
+    }
+    i = i + 1
+  }
+  return pred
+}
+
+// -2 is "more than one predecessor"; -1 "none seen yet". Both read as "do not
+// inherit" at the one place that consults the array.
+fn notePred(cur: int, src: int): int {
+  if (cur == -1) {
+    return src
+  }
+  return -2
+}
+
+// The head to start block `bi` from: its predecessor's exit set when that
+// predecessor is its only one AND the edge runs forwards. Forwards means both
+// a lower block id — `isBackEdge` is `target <= curBlock` by id, so this is
+// exactly "the edge carries no safepoint poll" — and an earlier position in
+// emission order, so the predecessor's exit head is already computed.
+fn cseInheritHead(pred: []int, pos: []int, exitHead: []int, bi: int, at: int): int {
+  let p = pred[bi]
+  if (p < 0 || p >= bi || pos[p] >= at) {
+    return -1
+  }
+  return exitHead[p]
+}
+
+// #4035: fills `fwd` with the loads that another load already answered.
+// Walks blocks in emission order so a predecessor's exit set is always ready.
+fn cseRedundantLoads(f: IrFunc, fwd: []int) {
+  let ar = newAvailArena()
+  let pred = singlePredecessors(f)
+  let order = blockEmissionOrder(f)
+  let exitHead = []int(0)
+  let pos = []int(0)
+  let i = 0
+  while (i < len(f.blocks)) {
+    exitHead = append(exitHead, -1)
+    pos = append(pos, 0)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(order)) {
+    pos[order[i]] = i
+    i = i + 1
+  }
+  i = 0
+  while (i < len(order)) {
+    let bi = order[i]
+    let head = cseInheritHead(pred, pos, exitHead, bi, i)
+    exitHead[bi] = cseLoadBlock(f, ar, fwd, head, bi)
+    i = i + 1
+  }
+}
