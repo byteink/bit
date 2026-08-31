@@ -110,9 +110,14 @@ leave room for the tag.
 
 A **no-payload** variant construction (`Enum.NoArgVariant` or the bare tag
 reference `Enum.Variant`) is unaffected: a fixed 16-byte `{ tag: i64 @0,
-payload: i64 @8 }` object with the payload word always zero (`ptr_offsets`
-empty for a scalar-only enum's no-arg variant, since there is no reference to
-trace).
+payload: i64 @8 }` object with the payload word always zero. `buildEnumObj`
+lists that word in `ptr_offsets` unconditionally, so the collector traces a
+value that is always nil. That is deliberate and it is the SAFE direction —
+tracing a nil word is wasted work, whereas omitting a word that turned out to
+hold a reference is a missed root and a wrong answer. **#4026** owns whether it
+can be dropped, together with the question of reclaiming the reserved word at
+offset 8; the two are the same question and must be decided with a
+`BIT_GC=stress` run over the corpus, not by reading.
 
 `match` reads the tag at offset 0 (`matchTag`) regardless of shape, and binds
 arm `i`'s payload from `16 + 8*i` directly off the subject object
