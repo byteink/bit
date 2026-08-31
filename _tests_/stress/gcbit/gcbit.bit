@@ -77,11 +77,12 @@
 // collector, and that the `@nosplit` collector bodies take no safepoint.
 
 import { spinUnlocked } from "../../../runtime"
-import { heapInit, heapWords } from "../../../runtime/alloc"
+import { heapInit, heapWords, allocMaxSmall } from "../../../runtime/alloc"
 import {
   gcInit,
   gcConfigure,
   gcAlloc,
+  gcAllocRaw,
   gcOwns,
   gcOwnsLinear,
   gcCollectRoots,
@@ -102,6 +103,7 @@ import {
   gcCollectFinish,
   gcHeaderSize,
   storeWord,
+  loadWord,
 } from "../../../runtime/gc"
 
 const ROOTS = 16
@@ -129,7 +131,20 @@ const MI_WIDE = 7
 const MI_REFARR = 14
 const MI_NODE_OFFS = 21
 const MI_WIDE_OFFS = 23
-const META_WORDS = 31
+// A LEAF descriptor (empty `ptr_offsets`), deliberately at a DIFFERENT address
+// from `MI_REFARR` above: `scanObject` matches the reference-array sentinel by
+// ADDRESS, so a leaf that happens to have the same field values must still be
+// scanned by the ordinary pointer-map path (#4083's size sweep uses it).
+const MI_LEAF = 25
+const META_WORDS = 32
+
+// #4083: the mark bit shares bit 63 of the size word, so every reader of that
+// word must mask. `SWEEP_STEP` of 8 over the whole small domain walks every
+// size class; `allocMaxSmall - gcHeaderSize` is the largest body that still
+// takes the span-backed path, so the sweep never reaches the direct-mapped
+// allocator (which would map pages this scripted heap does not own).
+const SWEEP_STEP = 8
+const REFARR_MAX = 96
 
 // splitmix64. Computed in u64 for defined modular arithmetic; the deleted
 // harness's side used the identical constants and the identical `+%`/`*%`
@@ -153,6 +168,104 @@ fn writeInfo(meta: []i64, at: int, size: int, offsAddr: int, offsLen: int) {
   meta[at + 4] = 0
   meta[at + 5] = 0
   meta[at + 6] = 0
+}
+
+// EXHAUSTIVE SIZE ROUND-TRIP (#4083). Every attainable span-backed allocation
+// size, allocated, MARKED, unmarked, and freed.
+//
+// `heapTakeSmallLocked` adds the requested size to the live-byte counter and
+// `heapGiveSmallLocked` subtracts whatever `freeObject` read back OUT of the
+// header, so a size that does not round-trip through the packed word leaves a
+// residue here. The first collection is what makes this a test of the PACKING
+// rather than of the counter: it marks every object, so the raw size word is
+// NEGATIVE while the object is live, which is the only state in which a
+// missing mask is observable at all.
+//
+// Returns the number of batches whose live-byte residue was non-zero, and
+// writes the number of sizes it ACTUALLY allocated into `tally[0]` — a
+// denominator the loop produces rather than one the printf recomputes, so a
+// sweep that examined nothing cannot print the same line as one that examined
+// everything. Bounded: `(allocMaxSmall - gcHeaderSize) / SWEEP_STEP`
+// allocations, in batches of `ROOTS`.
+fn sizeRoundTrip(g: *i64, leafInfo: int, rootsAddr: int, roots: []i64, tally: []i64): int {
+  let bad = 0
+  tally[0] = 0
+  let base = gcLiveBytes(g)
+  let maxBody = allocMaxSmall - gcHeaderSize
+  let b = 0
+  while (b <= maxBody) {
+    let k = 0
+    while (k < ROOTS) {
+      if (b <= maxBody) {
+        roots[k] = gcAllocRaw(g, b, leafInfo)
+        b = b + SWEEP_STEP
+        tally[0] = tally[0] + 1
+      } else {
+        roots[k] = 0
+      }
+      k = k + 1
+    }
+    gcCollectRoots(g, rootsAddr, ROOTS)
+    let j = 0
+    while (j < ROOTS) {
+      roots[j] = 0
+      j = j + 1
+    }
+    gcCollectRoots(g, rootsAddr, ROOTS)
+    if (gcLiveBytes(g) != base) {
+      bad = bad + 1
+    }
+  }
+  return bad
+}
+
+// REFERENCE-BUFFER TRACING (#4083), the silent-wrongness arm.
+//
+// `scanObject`'s reference-buffer path derives its word count from the size
+// word: `(hdrSize(h) - gcHeaderSize) / 8`. It only ever runs on an object
+// `markObject` has already marked, so the raw word is negative there, and an
+// unmasked read yields a NEGATIVE count, skips the loop and traces nothing —
+// every element of the buffer is then swept while the program still holds the
+// buffer. That is under-tracing, the same failure class `runtime/root/`'s
+// fabricated leaf header once shipped, and it is a wrong answer rather than a
+// crash. So: root ONLY the array, collect, and require every referent to still
+// be a live object afterwards.
+//
+// Returns the number of referents that did NOT survive, and writes the number
+// of referents it ACTUALLY checked into `tally[1]`, for the same reason
+// `sizeRoundTrip` writes `tally[0]`. Bounded: `REFARR_MAX` lengths, each with
+// at most `REFARR_MAX` elements.
+fn refArrayTrace(g: *i64, arrInfo: int, nodeInfo: int, rootsAddr: int, roots: []i64, tally: []i64): int {
+  let lost = 0
+  tally[1] = 0
+  let n = 1
+  while (n <= REFARR_MAX) {
+    let arr = gcAllocRaw(g, n * 8, arrInfo)
+    roots[0] = arr
+    let i = 1
+    while (i < ROOTS) {
+      roots[i] = 0
+      i = i + 1
+    }
+    let f = 0
+    while (f < n) {
+      storeWord(arr + f * 8, gcAlloc(g, nodeInfo))
+      f = f + 1
+    }
+    gcCollectRoots(g, rootsAddr, ROOTS)
+    let c = 0
+    while (c < n) {
+      tally[1] = tally[1] + 1
+      if (!gcOwns(g, loadWord(arr + c * 8))) {
+        lost = lost + 1
+      }
+      c = c + 1
+    }
+    roots[0] = 0
+    gcCollectRoots(g, rootsAddr, ROOTS)
+    n = n + 1
+  }
+  return lost
 }
 
 fn main() {
@@ -183,6 +296,9 @@ fn main() {
   writeInfo(meta, MI_WIDE, 64, metaAddr + MI_WIDE_OFFS * 8, 8)
   // The `ref_array_info` sentinel: matched by ADDRESS, never by content.
   writeInfo(meta, MI_REFARR, 0, 0, 0)
+  // Leaf: no reference fields. Same field VALUES as the sentinel above and a
+  // different address, which is the whole point (#4083).
+  writeInfo(meta, MI_LEAF, 0, 0, 0)
 
   let nodeInfo = metaAddr + MI_NODE * 8
   let wideInfo = metaAddr + MI_WIDE * 8
@@ -324,4 +440,11 @@ fn main() {
     idxOk = 1
   }
   print("done ${gcNumObjects(g)} ${gcStatTotalAllocated(g)} ${gcStatTotalSwept(g)} ${gcStatBadOffsets(g)} ${indexAgree} ${ownsAgree} ${idxOk} ${gcIndexEntries(g)}\n")
+
+  // #4083's two arms. Both denominators are printed so a run that silently
+  // examined nothing cannot read as a pass.
+  let tally = []i64(2)
+  let sizesBad = sizeRoundTrip(g, metaAddr + MI_LEAF * 8, rootsAddr, roots, tally)
+  let lost = refArrayTrace(g, refArrInfo, nodeInfo, rootsAddr, roots, tally)
+  print("hdrpack sizes=${tally[0]} residues=${sizesBad} refs=${tally[1]} lost=${lost} bad=${gcStatBadOffsets(g)}\n")
 }
