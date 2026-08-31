@@ -26,9 +26,9 @@ Every GC-managed allocation is `header ++ body`:
 offset  size  field
 0       8     info    *const TypeInfo   type descriptor (§2)
 8       8     next    ?*GcHeader        runtime-private all-objects list
-16      8     size    usize             runtime-private total alloc size
-24      1     marked  bool              runtime-private mark bit
-        7     (padding)
+16      8     size    usize             runtime-private total alloc size in bits
+                                        0..62; the mark bit is bit 63
+24      8     (reserved, unused)
 32      ...   body                      the object's fields
 ```
 
@@ -36,9 +36,19 @@ offset  size  field
 - **The reference the compiler works with is the body pointer** (`base + 32`),
   i.e. the value returned by the allocator. Codegen never sees the header; the
   runtime reaches it by subtracting 32.
-- `next`, `size`, `marked` are owned by the runtime. Codegen must not read or
-  write them, and must not assume their meaning — only `info` and the 32-byte
-  offset are stable ABI for codegen. The rest may change with the collector.
+- `next`, `size` and the mark bit are owned by the runtime. Codegen must not
+  read or write them, and must not assume their meaning — only `info` and the
+  32-byte offset are stable ABI for codegen. The rest may change with the
+  collector.
+- **The mark bit lives in bit 63 of the size word** (#4083). A single
+  allocation's byte count is positive and far below 2^63, so the top bit is free
+  by construction. `runtime/gc/gc.bit`'s `hdrSize`/`hdrMarked`/`hdrSetMark`/
+  `hdrClearMark` are the only sanctioned readers; a bare load of the word reads
+  a NEGATIVE value for any marked object.
+- **Bytes 24..31 are reserved and hold nothing.** They are being emptied so the
+  header can shrink to 16 bytes in one ABI change rather than three (#4086),
+  once #4059 has retired the all-objects list and with it the `next` word.
+  Nothing may take them in the meantime.
 
 ### Alignment
 
