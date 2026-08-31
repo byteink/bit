@@ -44,10 +44,24 @@
 // anything that could store. That is why a store clears everything rather than
 // clearing one offset.
 //
-// PURE OPS: nothing invalidates them. A pure op over the same SSA operand ids
-// is the same value by definition; SSA values are immutable, so a call between
-// the two computations cannot change either operand. Only the availability
-// chain breaking (a block with two predecessors) drops them.
+// PURE OPS (#4036): nothing invalidates them, and they get their own chain for
+// exactly that reason. A pure op over the same SSA operand ids is the same
+// value by definition; SSA values are immutable, so a call between the two
+// computations cannot change either operand, and a barrier that must drop
+// every cached load must NOT drop these. Only the availability chain breaking
+// (a block with two predecessors) ends their reach.
+//
+// `opIsBinary && !isSideEffecting` is the whole membership test — arithmetic,
+// bitwise, shifts, float arithmetic and every compare, with `sdiv`/`udiv`/
+// `srem`/`urem` excluded because they trap and `isSideEffecting` already says
+// so. Under `--debug` an `add`/`sub`/`mul` traps on signed overflow; that is
+// still sound here, because the FIRST of two identical computations traps and
+// a trap does not return.
+//
+// Operands are resolved through `fwd` before they are keyed, so the two halves
+// compose: matrix's store index `add %off, %idx` matches the load's only after
+// `%off` has been forwarded to the earlier `field_get` and `%idx` to the
+// earlier `add`. Neither half finds it alone.
 //
 // ## What this does NOT do
 //
@@ -156,18 +170,39 @@ fn opIsCseLoad(op: Op): bool {
   return op == Op.SliceLen || op == Op.FieldGet
 }
 
-// One instruction against the load table; returns the block's new head.
-// A `field_get` optstore.bit already answered from a store is left alone: its
-// value is the stored one, which is a strictly better answer.
-fn cseLoadOne(f: IrFunc, ar: AvailArena, fwd: []int, head: int, idx: int): int {
+// The computations this pass reuses without any barrier at all: every binary
+// op `isSideEffecting` does not name. See the header for why a call between
+// two of them changes nothing.
+fn opIsCsePure(op: Op): bool {
+  return opIsBinary(op) && !isSideEffecting(op)
+}
+
+// The two chains a block carries. One object per function, rewritten at each
+// block boundary, so the walk allocates nothing per instruction.
+class CseHeads {
+  load: int,
+  pure: int,
+}
+
+// What identifies instruction `idx` as a computation. `b` is the byte offset
+// for a load and the second operand for a binary op; both operands are
+// resolved through `fwd` so an eliminated intermediate does not hide a match.
+// `ty` is in the key because codegen takes a load's width from its result type
+// (arm64compile.bit:232), so two reads of one slot at different widths must
+// not answer each other.
+fn cseKeyOf(f: IrFunc, fwd: []int, idx: int): AvailKey {
   let ins = f.instrs[idx]
-  if (opClobbersLoads(ins.op)) {
-    return -1
+  let b = ins.ival
+  if (!opIsCseLoad(ins.op)) {
+    b = cseResolve(fwd, ins.rhs)
   }
-  if (!opIsCseLoad(ins.op) || fwd[idx] >= 0) {
-    return head
-  }
-  let k = AvailKey{ op: int(ins.op), a: cseResolve(fwd, ins.lhs), b: ins.ival, ty: ins.ty }
+  return AvailKey{ op: int(ins.op), a: cseResolve(fwd, ins.lhs), b: b, ty: ins.ty }
+}
+
+// `idx` against one chain: forward it to an earlier equal computation, or
+// record it as the one that answers the next. Returns that chain's new head.
+fn cseTry(f: IrFunc, ar: AvailArena, fwd: []int, head: int, idx: int): int {
+  let k = cseKeyOf(f, fwd, idx)
   let hit = availFind(ar, head, k)
   if (hit >= 0) {
     fwd[idx] = hit
@@ -176,18 +211,34 @@ fn cseLoadOne(f: IrFunc, ar: AvailArena, fwd: []int, head: int, idx: int): int {
   return availPush(ar, head, k, idx)
 }
 
+// One instruction against both chains. A `field_get` optstore.bit already
+// answered from a store is left alone: its value is the stored one, which is a
+// strictly better answer than any load.
+fn cseStep(f: IrFunc, ar: AvailArena, fwd: []int, h: CseHeads, idx: int) {
+  let ins = f.instrs[idx]
+  if (opClobbersLoads(ins.op)) {
+    h.load = -1
+  }
+  if (fwd[idx] >= 0) {
+    return
+  }
+  if (opIsCseLoad(ins.op)) {
+    h.load = cseTry(f, ar, fwd, h.load, idx)
+  } else if (opIsCsePure(ins.op)) {
+    h.pure = cseTry(f, ar, fwd, h.pure, idx)
+  }
+}
+
 // One block front to back. Block params are skipped: they define values but
 // compute nothing, and `rebuild` emits them ahead of this range.
-fn cseLoadBlock(f: IrFunc, ar: AvailArena, fwd: []int, headIn: int, bi: int): int {
+fn cseBlock(f: IrFunc, ar: AvailArena, fwd: []int, h: CseHeads, bi: int) {
   let blk = f.blocks[bi]
-  let head = headIn
   let idx = blk.instsStart + blk.paramCount
   let end = blk.instsStart + blk.instsLen
   while (idx < end) {
-    head = cseLoadOne(f, ar, fwd, head, idx)
+    cseStep(f, ar, fwd, h, idx)
     idx = idx + 1
   }
-  return head
 }
 
 // `pred[b]` is b's only predecessor, or -1 when it has none or more than one.
@@ -241,17 +292,12 @@ fn cseInheritHead(pred: []int, pos: []int, exitHead: []int, bi: int, at: int): i
   return exitHead[p]
 }
 
-// #4035: fills `fwd` with the loads that another load already answered.
-// Walks blocks in emission order so a predecessor's exit set is always ready.
-fn cseRedundantLoads(f: IrFunc, fwd: []int) {
-  let ar = newAvailArena()
-  let pred = singlePredecessors(f)
-  let order = blockEmissionOrder(f)
-  let exitHead = []int(0)
+// The emission-order position of each block, so `cseInheritHead` can tell
+// whether a predecessor's exit set has been computed yet.
+fn blockOrderPositions(f: IrFunc, order: []int): []int {
   let pos = []int(0)
   let i = 0
   while (i < len(f.blocks)) {
-    exitHead = append(exitHead, -1)
     pos = append(pos, 0)
     i = i + 1
   }
@@ -260,11 +306,40 @@ fn cseRedundantLoads(f: IrFunc, fwd: []int) {
     pos[order[i]] = i
     i = i + 1
   }
-  i = 0
+  return pos
+}
+
+// `n` entries of -1: an empty chain for every block, before the walk fills in
+// the real exit heads.
+fn emptyHeads(n: int): []int {
+  let h = []int(0)
+  let i = 0
+  while (i < n) {
+    h = append(h, -1)
+    i = i + 1
+  }
+  return h
+}
+
+// #4035 + #4036: fills `fwd` with every load another load already answered and
+// every pure computation another pure computation already answered. Walks
+// blocks in emission order so a predecessor's exit sets are always ready.
+fn cseAvailableValues(f: IrFunc, fwd: []int) {
+  let ar = newAvailArena()
+  let pred = singlePredecessors(f)
+  let order = blockEmissionOrder(f)
+  let pos = blockOrderPositions(f, order)
+  let exitLoad = emptyHeads(len(f.blocks))
+  let exitPure = emptyHeads(len(f.blocks))
+  let h = CseHeads{ load: -1, pure: -1 }
+  let i = 0
   while (i < len(order)) {
     let bi = order[i]
-    let head = cseInheritHead(pred, pos, exitHead, bi, i)
-    exitHead[bi] = cseLoadBlock(f, ar, fwd, head, bi)
+    h.load = cseInheritHead(pred, pos, exitLoad, bi, i)
+    h.pure = cseInheritHead(pred, pos, exitPure, bi, i)
+    cseBlock(f, ar, fwd, h, bi)
+    exitLoad[bi] = h.load
+    exitPure[bi] = h.pure
     i = i + 1
   }
 }
