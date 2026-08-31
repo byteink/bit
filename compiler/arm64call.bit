@@ -387,8 +387,8 @@ fn emitBackEdgeSafepointIfNeeded(cx: A64Ctx, curBlock: int, target: int) {
 // one copy. See that block's header for the mirroring contract, and
 // _tests_/bit/pollguardoffsets.bit for the gate that pins it.
 
-// Fetches (worldAddr, gcAddr) ONCE per function invocation and caches them in
-// this function's own frame (FrameInfo.pollCacheSlots), rather than once per
+// Fetches the three poll addresses ONCE per function invocation and caches them
+// in this function's own frame (FrameInfo.pollCacheSlots), rather than once per
 // loop iteration. Safe because runtime/stw/stw.bit's stwBind runs exactly once
 // at boot — before any compiled Bit function's entry can execute — and never
 // unbinds (#2184): the two addresses are a per-process constant for the
@@ -405,7 +405,18 @@ fn emitPollCachePrefetch(cx: A64Ctx) {
   if (cx.frame.pollCacheSlots == 0) {
     return
   }
+  // Slot 0 holds the address of the world's STOP WORD, not the world base:
+  // `worldAddr + worldStopWord*8`, folded in here once per call instead of at
+  // every back edge. `worldStopWord` is 1792 words = 0x3800 bytes, which is
+  // wider than one add-immediate, so the per-iteration form cost TWO adds
+  // before `ldar` (LDAR has no offset form at all). Zero is kept as-is and
+  // means "world not bound", which the ladder's leading CBZ reads as "poll" —
+  // the same conservative answer the separate `waddr == 0` test used to give,
+  // now folded into the load the ladder already had to do.
   emitCallReloc(cx, worldAddrSymbol())
+  let boundFixup = emitLocalCbz(cx, false, retRegNum())
+  addSubImmWide(cx.code, false, retRegNum(), retRegNum(), pgWorldStopWordWord() * 8)
+  patchLocalCondBranch(cx, boundFixup)
   storeImm(cx.code, retRegNum(), regSp(), pollCacheOffset(cx.frame, 0), 8)
   emitCallReloc(cx, gcAddrSymbol())
   storeImm(cx.code, retRegNum(), regSp(), pollCacheOffset(cx.frame, 1), 8)
@@ -428,7 +439,9 @@ fn emitPollField(cx: A64Ctx, dst: int, baseReg: int, wordOff: int) {
 // `baseReg`, overwriting `baseReg` with the loaded value. Mirrors a bare
 // `atomicLoad(p + off)`. LDAR has no immediate-offset form (arm64ctx.bit's
 // emitAddrOf note: no movabs/addressing-mode equivalent exists here either),
-// so a nonzero offset is materialized into the same register first.
+// so a nonzero offset is materialized into the same register first — which is
+// why the one wide offset the ladder needs, the world stop word, is folded
+// into its cached address by emitPollCachePrefetch instead of here.
 fn emitAtomicPollFieldInPlace(cx: A64Ctx, baseReg: int, wordOff: int) {
   if (wordOff != 0) {
     addSubImmWide(cx.code, false, baseReg, baseReg, wordOff * 8)
@@ -516,14 +529,12 @@ fn emitInlinedPreemptCheck(cx: A64Ctx, pollFixups: []int): []int {
   let rAny = scratch1()
   loadImm(cx.code, rAny, regSp(), pollCacheOffset(cx.frame, 2), 8, false)
   emitAtomicPollFieldInPlace(cx, rAny, 0)
-  cmpZero(cx.code, rAny)
-  let noneFixup = emitLocalCondBranch(cx, condEq()) // nothing pending anywhere
+  let noneFixup = emitLocalCbz(cx, false, rAny) // nothing pending anywhere
 
   emitCallReloc(cx, schedCurrentWorkerSymbol())
   let rWorker = scratch1()
   movRR(cx.code, rWorker, retRegNum())
-  cmpZero(cx.code, rWorker)
-  let offTaskFixup = emitLocalCondBranch(cx, condEq()) // worker==0: off-task, no-op
+  let offTaskFixup = emitLocalCbz(cx, false, rWorker) // worker==0: off-task, no-op
 
   // workerId = *(taskAt(worker) + wkId): worker is a raw, word-aligned block
   // address (never a small index — see task.bit's own note on this, which
@@ -537,8 +548,7 @@ fn emitInlinedPreemptCheck(cx: A64Ctx, pollFixups: []int): []int {
   // every other call result (ABI.md: a narrow bool return leaves the upper
   // bits of the register unspecified).
   uxtb(cx.code, retRegNum())
-  cmpZero(cx.code, retRegNum())
-  pollFixups = append(pollFixups, emitLocalCondBranch(cx, condNe())) // preempt pending -> poll
+  pollFixups = append(pollFixups, emitLocalCbz(cx, true, retRegNum())) // preempt pending -> poll
 
   // Both no-op exits — off-task, and the #3746 fast-path gate — converge here,
   // at the ladder's next clause, exactly as stwPollNeeded's own
@@ -554,6 +564,11 @@ fn emitInlinedPreemptCheck(cx: A64Ctx, pollFixups: []int): []int {
 //     let waddr = worldAddr
 //     if (waddr == 0) { return true }
 //     if (atomicLoad(world + worldStopWord) != 0) { return true }
+//
+// The first two clauses are one load and one CBZ here rather than two tests,
+// because poll-cache slot 0 already holds `worldAddr + worldStopWord*8` and
+// holds 0 exactly when `worldAddr` is 0 (emitPollCachePrefetch). Zero means
+// "poll", which is what the `waddr == 0` clause above answers.
 //     // #3564's clause -- emitInlinedPreemptCheck above
 //     let gA = gcAddr
 //     if (gA == 0) { return true }
@@ -568,7 +583,12 @@ fn emitInlinedPreemptCheck(cx: A64Ctx, pollFixups: []int): []int {
 //   }
 //
 // `true` (poll needed) falls into the real `bl bit_rt_safepoint`; `false`
-// (skip) branches past it. Three scratch registers cover the whole ladder —
+// (skip) branches past it. Every zero test is a single CBZ/CBNZ rather than
+// `cmp Xn, xzr` + `B.cond`: identical on a 64-bit register, one instruction
+// instead of two, and it writes no flags — nothing in this ladder reads NZCV
+// across a branch, and the two comparisons that are not against zero (the byte
+// and object triggers) keep their own `cmp` + `B.cond`.
+// Three scratch registers cover the whole ladder —
 // scratch1/scratch2 hold the cached worldAddr/gcAddr only until each is used
 // for the last time, then get reused as plain temporaries, exactly as the
 // rest of this backend already treats them (never live across an instruction
@@ -582,26 +602,21 @@ fn emitInlinedPollGuard(cx: A64Ctx) {
   let skipFixups = []int(0)
 
   loadImm(cx.code, rWorld, regSp(), pollCacheOffset(cx.frame, 0), 8, false)
-  cmpZero(cx.code, rWorld)
-  pollFixups = append(pollFixups, emitLocalCondBranch(cx, condEq())) // waddr==0
+  pollFixups = append(pollFixups, emitLocalCbz(cx, false, rWorld)) // world not bound
 
-  emitAtomicPollFieldInPlace(cx, rWorld, pgWorldStopWordWord())
-  cmpZero(cx.code, rWorld)
-  pollFixups = append(pollFixups, emitLocalCondBranch(cx, condNe())) // stop pending
+  ldar(cx.code, 3, rWorld, rWorld)
+  pollFixups = append(pollFixups, emitLocalCbz(cx, true, rWorld)) // stop pending
 
   pollFixups = emitInlinedPreemptCheck(cx, pollFixups) // #3564 clause 3
 
   loadImm(cx.code, rGc, regSp(), pollCacheOffset(cx.frame, 1), 8, false)
-  cmpZero(cx.code, rGc)
-  pollFixups = append(pollFixups, emitLocalCondBranch(cx, condEq())) // gcAddr==0
+  pollFixups = append(pollFixups, emitLocalCbz(cx, false, rGc)) // gcAddr==0
 
   emitPollField(cx, rTmp, rGc, pgGcCfgStressWord())
-  cmpZero(cx.code, rTmp)
-  pollFixups = append(pollFixups, emitLocalCondBranch(cx, condNe())) // stress mode
+  pollFixups = append(pollFixups, emitLocalCbz(cx, true, rTmp)) // stress mode
 
   emitPollField(cx, rTmp, rGc, pgGcCfgEnabledWord())
-  cmpZero(cx.code, rTmp)
-  skipFixups = append(skipFixups, emitLocalCondBranch(cx, condEq())) // disabled -> skip
+  skipFixups = append(skipFixups, emitLocalCbz(cx, false, rTmp)) // disabled -> skip
 
   emitPollField(cx, rTmp, rGc, pgGcHeapAddrWord())          // rTmp = heap base addr
   emitAtomicPollFieldInPlace(cx, rTmp, pgHeapLiveWordWord()) // rTmp = heap live bytes
