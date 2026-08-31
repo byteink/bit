@@ -1615,12 +1615,13 @@ defined exactly once).
 | `bit_rt_map_set`      | `(m: ?*MapHeader, key: u64, val: u64) -> void` (§15)    |
 | `bit_rt_map_get`      | `(m: ?*MapHeader, key: u64) -> u64` (§15)               |
 | `bit_rt_map_has`      | `(m: ?*MapHeader, key: u64) -> bool` (§15)              |
+| `bit_rt_map_slot`     | `(m: ?*MapHeader, key: u64) -> i64` (§15, the key's slot or `-1`) |
 | `bit_rt_map_delete`   | `(m: ?*MapHeader, key: u64) -> void` (§15)              |
 | `bit_rt_map_len`      | `(m: ?*MapHeader) -> i64` (§15)                         |
 | `bit_rt_map_iter_init`| `(m: ?*MapHeader) -> i64` (§15)                         |
 | `bit_rt_map_iter_next`| `(m: ?*MapHeader, prev: i64) -> i64` (§15)              |
 | `bit_rt_map_key_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15)               |
-| `bit_rt_map_val_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15)               |
+| `bit_rt_map_val_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15; a NEGATIVE slot reads as `0`, so `map_slot`'s miss marker needs no branch at the call site) |
 | `bit_rt_fs_append`    | `(path: *const RtBytes) -> i64` (§14)                   |
 | `bit_rt_fs_read`      | `(fd: i64, max: i64) -> *const RtBytes` (§14)           |
 | `bit_rt_fs_exists`    | `(path: *const RtBytes) -> bool` (§14)                  |
@@ -2264,6 +2265,10 @@ the handle of a string CONSTANT, which is static for the life of the process.
   next grow.
 - **Nil.** Reads on a nil map (`?*MapHeader == null`) yield the zero word /
   `false` / `0`; `map_set` on a nil map is fatal (SPEC §11.2, Go semantics).
+- **Two-result read** (`let (v, ok) = m[k]`, §12.6) is ONE probe: `map_slot`
+  returns the key's slot or `-1`, `ok` is `slot >= 0`, and `map_val_at` reads the
+  value word (yielding `0` for the `-1`). It used to be `map_get` + `map_has` —
+  two probes of the same key for one expression (#4019).
 - **Iteration** (`for (k, v) of m`, §13.5) is by slot cursor: `map_iter_init`
   returns the first FULL slot or `-1`, `map_iter_next` the next after `prev`,
   then `map_key_at`/`map_val_at` read the pair. Slot order is unspecified and the
