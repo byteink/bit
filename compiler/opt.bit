@@ -443,6 +443,7 @@ fn deadCodeElim(f: IrFunc): IrFunc {
     RebuildPlan{
       known: noFold, keep: computeLive(f, deadAllocs(f)),
       fwd: noForwarding(len(f.instrs)), blockReachable: reachAll,
+      licm: noLicm(len(f.instrs)),
     },
   )
 }
@@ -480,6 +481,10 @@ class RebuildPlan {
   keep: []bool,
   fwd: []int,
   blockReachable: []bool,
+  // optloop.bit's hoists: which instructions are emitted in a preheader
+  // instead of where they were written, and which header parameter list each
+  // one joins. `noLicm(len(f.instrs))` is the neutral value.
+  licm: LicmPlan,
 }
 
 // The rebuild's own working state, likewise bundled: `remap` translates an old
@@ -491,6 +496,10 @@ class RebuildCtx {
   plan: RebuildPlan,
   remap: []int,
   blockMap: []int,
+  // `blockMap` read backwards, so `licmExtendEdges` can name the ORIGINAL
+  // block an emitted terminator branches to without re-deciding which arm of a
+  // folded `br` survived.
+  newToOld: []int,
 }
 
 // Block ids in their original emission order (ascending `instsStart`), NOT
@@ -526,10 +535,16 @@ fn canForward(plan: RebuildPlan, idx: int): bool {
   return plan.fwd[idx] >= 0 && plan.keep[plan.fwd[idx]]
 }
 
-// Emits one kept block: its params first (always), then each instruction the
-// plan keeps. A forwarded instruction emits NOTHING and takes its source's new
-// id, which is what deletes the redundant reload — its source index is always
-// lower than its own and in the same block, so `remap` already holds the answer.
+// Emits one kept block: its params first (always, plus any optloop.bit hoisted
+// onto this block as a loop header), then each instruction the plan keeps.
+// A forwarded instruction emits NOTHING and takes its source's new id, which is
+// what deletes the redundant reload — its source index is always lower than its
+// own and in the same block, so `remap` already holds the answer.
+//
+// A block's LAST instruction is its terminator, and optloop.bit's hoists are
+// emitted immediately before it: a hoisted value must be computed on this
+// block's own path, and the terminator is the edge that carries it into the
+// loop header's parameter list.
 fn rebuildBlock(rc: RebuildCtx, bi: int) {
   let blk = rc.f.blocks[bi]
   builderBeginBlock(rc.b, rc.blockMap[bi])
@@ -539,16 +554,33 @@ fn rebuildBlock(rc: RebuildCtx, bi: int) {
     rc.remap[idx] = builderAddParam(rc.b, rc.f.instrs[idx].ty)
     idx = idx + 1
   }
+  licmAddParams(rc, bi)
   let end = blk.instsStart + blk.instsLen
   while (idx < end) {
-    if (canForward(rc.plan, idx)) {
-      rc.remap[idx] = rc.remap[rc.plan.fwd[idx]]
-    } else if (rc.plan.keep[idx]) {
-      emitTranslated(rc.b, rc.f, rc.plan.known, rc.remap, rc.blockMap, idx)
+    if (idx == end - 1) {
+      licmEmitHoisted(rc, bi)
     }
+    rebuildOne(rc, bi, idx)
     idx = idx + 1
   }
   builderEndBlock(rc.b)
+}
+
+// One instruction of block `bi`. An instruction optloop.bit moved out of this
+// block emits nothing here — its `remap` slot is written by the header's param
+// emission instead, which happens before any block that reads it.
+fn rebuildOne(rc: RebuildCtx, bi: int, idx: int) {
+  if (licmMovedAway(rc.plan.licm, bi, idx)) {
+    return
+  }
+  if (canForward(rc.plan, idx)) {
+    rc.remap[idx] = rc.remap[rc.plan.fwd[idx]]
+    return
+  }
+  if (rc.plan.keep[idx]) {
+    emitTranslated(rc.b, rc.f, rc.plan.known, rc.remap, rc.blockMap, idx)
+    licmExtendEdges(rc)
+  }
 }
 
 // Rebuilds `f`, keeping only blocks marked in `plan.blockReachable` and, within
@@ -571,14 +603,22 @@ fn rebuild(f: IrFunc, plan: RebuildPlan): IrFunc {
   }
   let order = blockEmissionOrder(f)
   let b = newBuilder()
+  let newToOld = []int(0)
+  i = 0
+  while (i < n) {
+    newToOld = append(newToOld, 0)
+    i = i + 1
+  }
   i = 0
   while (i < n) {
     if (plan.blockReachable[order[i]]) {
       blockMap[order[i]] = builderNewBlock(b)
+      newToOld[blockMap[order[i]]] = order[i]
     }
     i = i + 1
   }
-  let rc = RebuildCtx{ b: b, f: f, plan: plan, remap: remap, blockMap: blockMap }
+  let rc = RebuildCtx{ b: b, f: f, plan: plan, remap: remap, blockMap: blockMap,
+    newToOld: newToOld }
   i = 0
   while (i < n) {
     if (plan.blockReachable[order[i]]) {
@@ -623,6 +663,7 @@ fn foldConstantsAndPrune(ctx: TypeContext, f: IrFunc): IrFunc {
     RebuildPlan{
       known: known, keep: keepAll,
       fwd: fwd, blockReachable: computeReachable(f, known),
+      licm: licmPlanFor(ctx, f, known, fwd),
     },
   )
 }
