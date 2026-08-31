@@ -2,7 +2,11 @@
 // trials.
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"runtime"
+)
 
 func main() {
 	n, trials := 512, 6
@@ -47,4 +51,19 @@ func main() {
 	}
 
 	fmt.Printf("%d %d %d %d\n", grandSum, grandTrace, lastFirst, lastLast)
+	reportAllocs()
+}
+
+// See bench/cases/alloc/alloc.go's copy: BENCH_ALLOC_STATS=1 prints this
+// run's heap allocation count on stderr for bench/run.sh's cross-language
+// comparison (#3934), off by default and after all timed work. Added by
+// #4056: without it this case's allocation row printed "—" for Go and C, so
+// nothing could see the Bit side allocating 18 matrices to their 3.
+func reportAllocs() {
+	if os.Getenv("BENCH_ALLOC_STATS") == "" {
+		return
+	}
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	fmt.Fprintf(os.Stderr, "[allocs] %d\n", ms.Mallocs)
 }
