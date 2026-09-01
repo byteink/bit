@@ -17,6 +17,18 @@
 // fixed head guard). Only the underlying page-provider semantics differ:
 // see ../../alloc/windows/pages.bit's header for why `unmapPages` here is
 // MEM_DECOMMIT, not a true release.
+//
+// #3992: unlike the other two platforms, THIS `mapGuardedStack` cannot let
+// its pre-alignment `mapPages` return value go out of scope. `unmapPages`'s
+// header explains why: releasing the reservation later needs
+// `VirtualFree(exactOriginalBase, 0, MEM_RELEASE)`, and `base` below (the
+// value this function returns, aligned up from that original address) is
+// NOT that address — `base - region` is whatever padding landed it on a
+// `schedStackBytes` boundary, which depends on where the OS placed the
+// mapping and cannot be recovered from `base` alone. `regionOut` is how the
+// caller gets the address back: written once, right after the mapping that
+// produced it succeeds, so a caller that only reads it after a non-zero
+// return never sees a stale value from a previous call.
 
 @nosplit fn alignUpStack(addr: int): int {
   let bumped = addr + schedStackBytes - 1
@@ -89,7 +101,28 @@ const stackDispatchSlackBytes: int = 65536
   return base
 }
 
-@nosplit fn mapGuardedStack(bytes: int): int {
+// A discard target for `./boot.bit`'s ONE `mapGuardedStack` call this ticket
+// does not need the region for: `boot`'s own step 5 maps the main thread's
+// stack, which is never retired (`workerBody`'s retirement check excludes
+// `mainTaskBlock` by address, matching ../linux and ../darwin) and so is
+// never released either — this port has always leaked the main stack's
+// reservation on process exit, same as every other reservation still held
+// when a process dies, and that is the OS's job, not this runtime's. Safe as
+// a single shared module-level cell (unlike a per-spawn slot, which would
+// race across concurrently spawning workers — see `rtSpawn`'s own regionOut
+// argument for the one that cannot share a cell): `boot` runs this call
+// exactly once, before any worker thread exists. Same idiom as
+// `../../alloc/windows/pages.bit`'s `winOldProtectScratch` — a cell that
+// exists only so an out-param has somewhere valid to write.
+let winMainStackRegionScratch: i64 = 0
+
+// `regionOut` receives the pre-alignment `mapPages` base the moment that
+// mapping succeeds — see the header above for why the caller cannot derive
+// it from the return value later. Left unwritten on an early `return 0`
+// (bytes<=0 or the mapping itself fails): every caller here already treats a
+// zero return as fatal (`rtSpawn`'s `winSpawnFatal`), so nothing ever reads
+// `regionOut` on that path.
+@nosplit fn mapGuardedStack(bytes: int, regionOut: *i64): int {
   if (bytes <= 0) {
     return 0
   }
@@ -97,6 +130,7 @@ const stackDispatchSlackBytes: int = 65536
   if (region == 0) {
     return 0
   }
+  *regionOut = i64(region)
   let base = guardedStackBase(region)
   if (base == 0) {
     return 0
@@ -125,4 +159,45 @@ const stackDispatchSlackBytes: int = 65536
     }
   }
   return base
+}
+
+// mapGuardedStack's retirement counterpart (#3992): `region` is the
+// pre-alignment base `mapGuardedStack` wrote into its `regionOut` when it
+// made this task's stack — the only address `releaseReservation` (below,
+// ../../alloc/windows/pages.bit) accepts. ONE call retires the whole
+// reservation: the head slop, the guard hole (never decommitted at all
+// before this fix, unlike the two POSIX ports' #3990), the live stack, and
+// the tail slop together, because MEM_RELEASE tears down every page in a
+// reservation regardless of its current commit state — no separate decommit
+// step first is needed or useful.
+//
+// `../../root/windows/boot.bit`'s `workerBody` calls this rather than
+// inlining it, for the same reason `mapGuardHole`/`guardedStackBase` above
+// are their own functions: that loop's own complexity and line count are
+// already over E0204/E0201's limits on `main`, pre-dating this ticket, and
+// this keeps this fix from adding to that overage rather than pretending to
+// fix a pre-existing, out-of-scope violation this ticket did not create.
+//
+// `releaseReservation`'s return is a genuine invariant check, not a
+// transient-failure retry point: `region` is a value this same task's own
+// `rtSpawn` recorded moments (at most) earlier, never user input and never
+// derived at this call site, so `false` here can only mean the base/size
+// pairing itself is wrong — exactly the class of bug that would let this
+// leak survive a "fix" silently if the return were discarded. A loud panic
+// (matching ../../rand/windows/random.bit's `rtRandomBytes`, the existing
+// precedent for a "should never happen" Windows OS-call failure on this
+// port) is preferable to continuing with a task whose teardown did not
+// complete as expected.
+//
+// NOT `@nosplit`, mechanically: `panic` is not `@nosplit`-callable (E0075
+// refuses it), same as `rtRandomBytes`. On the poll-free gate's reviewed
+// exception list ("root/windows:winRetireTaskStack",
+// `_tests_/bit/pollfree/exceptions.bit`) with the same argument that entry
+// already makes: `region` is a plain OS address, never a GC-tracked
+// reference, this function holds no other state, has no loop, and the one
+// call it makes while `region` is live — `panic` — never returns.
+fn winRetireTaskStack(region: int) {
+  if (!releaseReservation(region)) {
+    panic("bit_rt_spawn: VirtualFree(MEM_RELEASE) failed retiring a task's stack reservation")
+  }
 }
