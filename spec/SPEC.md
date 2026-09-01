@@ -781,7 +781,7 @@ let a = Account(500)?
 ```
 class_decl  = "class" IDENT [ generic_params ] "{" [ member { ( ";" | "," ) member } [ ";" | "," ] ] "}" .
 member      = field | method_decl .    (* method_decl, §10.4 *)
-field       = [ "export" ] IDENT ":" type .
+field       = [ "export" ] [ "readonly" ] IDENT ":" type .
 ```
 
 - `struct` is not a keyword (§5.2): the compiler rejects it with `E0102`,
@@ -790,6 +790,18 @@ field       = [ "export" ] IDENT ":" type .
 - A field marked `export` is visible outside the module; otherwise it is
   module-private (§17.3). The class type itself is exported via the leading
   `export` on the declaration.
+- A field marked `readonly` may be assigned only in a composite
+  literal (§12.2) or inside the declaring class's own `init` (§10.4); any
+  other assignment — including from within the declaring module itself — is
+  `E0114`. `readonly` is orthogonal to `export`: an unexported `readonly`
+  field is legal and meaningful, and stops even the declaring module from
+  reassigning it. `readonly` is **shallow** — it forbids rebinding the field
+  itself, never mutating the value it refers to. This is Java's `final` or
+  TypeScript's `readonly`: given `class Wrapper { export readonly inner:
+  Box }`, `w.inner.x = 1` is unaffected; only `w.inner = otherBox` is
+  rejected. `readonly` is a contextual keyword, not reserved (§5.2) — it
+  parses as an ordinary identifier everywhere outside the `[export]
+  readonly IDENT ":"` field position.
 - Fields are ordered; that order is the memory layout order (subject to the
   compiler's alignment padding). A method interleaved between fields does
   not affect this order or count as a field itself.
@@ -818,9 +830,10 @@ interface error { message(): string }
 
 ```
 trait_decl   = "trait" IDENT "{" { trait_member } "}" .
-trait_member = use_stmt | trait_method | field .
+trait_member = use_stmt | trait_method | trait_field .
 use_stmt     = "use" IDENT { "," IDENT } .
 trait_method = IDENT [ generic_params ] signature [ block ] .
+trait_field  = [ "export" ] IDENT ":" type .    (* no `readonly` — §10.5 is class-only *)
 ```
 
 A trait declares methods to be **injected into a class at check time** by a
@@ -2925,9 +2938,12 @@ is the general form of it.
 Visibility is by the explicit `export` keyword, not by identifier casing:
 
 - A top-level declaration marked `export` is visible to importing modules.
-- A class **field** marked `export` is readable/writable outside the module; an
-  unexported field is module-private (and may not appear in a foreign composite
-  literal or be selected outside the module).
+- A class **field** marked `export` is readable outside the module, and
+  writable there too unless it is also marked `readonly` (§10.5); an
+  unexported field is module-private (and may not appear in a foreign
+  composite literal or be selected outside the module). `readonly` is
+  orthogonal to `export` — an unexported `readonly` field still forbids the
+  declaring module itself from reassigning it.
 - A method is exported by placing `export` before its `fn` keyword (§10.4);
   an exported type may still have unexported methods (they do not contribute to
   satisfaction of an interface used across module boundaries only if the interface
@@ -4094,15 +4110,16 @@ extern_fn_decl = "extern" "fn" IDENT signature .
 
 class_decl    = "class" IDENT [ generic_params ] "{" [ member { fsep member } [ fsep ] ] "}" .
 member        = field | method_decl .
-field         = [ "export" ] IDENT ":" type .
+field         = [ "export" ] [ "readonly" ] IDENT ":" type .
 method_decl   = [ "export" ] IDENT [ generic_params ] signature block .
 interface_decl= "interface" IDENT [ generic_params ] "{" [ method_sig { fsep method_sig } [ fsep ] ] "}" .
 method_sig    = IDENT signature .
 fsep          = ";" | "," .
 trait_decl    = "trait" IDENT "{" { trait_member } "}" .
-trait_member  = use_stmt | trait_method | field .
+trait_member  = use_stmt | trait_method | trait_field .
 use_stmt      = "use" IDENT { "," IDENT } .
 trait_method  = IDENT [ generic_params ] signature [ block ] .
+trait_field   = [ "export" ] IDENT ":" type .
 enum_decl     = "enum" IDENT [ generic_params ] "{" [ enum_variant { fsep enum_variant } [ fsep ] ] "}" .
 enum_variant  = IDENT [ "(" type { "," type } ")" ] .
 

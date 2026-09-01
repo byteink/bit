@@ -54,6 +54,63 @@ class User {
 - Fields are ordered; that order is the memory layout order (subject to the
   compiler's alignment padding).
 
+## Readonly fields {#readonly-fields}
+
+A field marked `readonly` may be set only in a composite literal, or inside
+the declaring class's own `init` (SPEC §10.4) - any other assignment is
+rejected, including from code in the class's own declaring module.
+
+```bit
+class Timestamp {
+  export readonly ns: int,
+}
+
+class Sample {
+  export readonly n: int
+
+  init(start: int) {
+    this.n = start // allowed: readonly is assignable inside its own 'init'
+  }
+}
+
+fn buildReadonly() {
+  let t = Timestamp{ ns: 5 }
+  print("${t.ns}\n") // 5
+
+  let s = Sample(9)
+  print("${s.n}\n") // 9
+}
+```
+
+```bit ignore
+t.ns = 0 // rejected: E0114 - 'readonly' forbids reassigning the field
+```
+
+`readonly` is orthogonal to `export` - an unexported `readonly` field is
+legal and meaningful, and stops even the declaring module from reassigning
+it.
+
+### `readonly` is shallow
+
+`readonly` forbids reassigning the field itself; it says nothing about the
+value that field refers to. On a class-typed field this is Java's `final` or
+TypeScript's `readonly`:
+
+```bit
+class Box { export x: int }
+class Wrapper { export readonly inner: Box }
+
+fn mutateThroughReadonly() {
+  let w = Wrapper{ inner: Box{ x: 1 } }
+  w.inner.x = 99          // fine - mutates the Box 'inner' refers to, not 'inner' itself
+  print("${w.inner.x}\n") // 99
+}
+```
+
+Only `w.inner = anotherBox` is rejected. `w.inner.x = 99` reassigns a field
+of the `Box` that `inner` refers to, not `inner` itself, so it is
+unaffected.
+
 ## Composite literals {#composite-literals}
 
 A class literal is **always** prefixed by its type name -
