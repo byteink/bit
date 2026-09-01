@@ -131,7 +131,7 @@ import {
   schedWorkerAt, taskAt, taskWords, schedStackBytes, schedMainStackBytes,
   schedStackAligned, schedRegisterBigStack, wkDeque, schedTaskExit, dqPushBottom,
   WORKER_MAX_STEPS, workerStepStop, scStopping, schedFindWorkAt,
-  schedWorkerStepAt, wkLastDone, taskStackBase, taskStackBytes,
+  schedWorkerStepAt, wkLastDone,
   taskSpawnEntry, wkSleepReq,
   schedIdleArm, schedIdleDisarm, schedIdlePark, schedSetPollFd,
   schedParkBoundNs,
@@ -151,7 +151,9 @@ import { pollCreate, pollClose, pollDrain, winSpawnTrampoline } from "../../sche
 import { threadStackBytes } from "../../thread"
 import { parkMinBackoffNs, parkMaxBackoffNs, parkNextBackoff } from "../../park"
 import { parkMonoNs, parkSleepNs, parkWait, parkWake } from "../../park/windows"
-import { mapPages, unmapPages, remapPages, protectPages, guardPages } from "../../alloc/windows"
+import {
+  mapPages, unmapPages, remapPages, protectPages, guardPages, releaseReservation,
+} from "../../alloc/windows"
 import {
   rootBindMemory, rootInit, rootWidthsOk, rootConfigureFromEnv, rootEnvMarkStack,
   rootEnvWorkers, rootEnvVerbose,
@@ -358,8 +360,17 @@ fn workerBody(arg: *byte): *byte {
     let doneTask = *(w + wkLastDone)
     if (doneTask != 0 && doneTask != int(ptrOf(mainTaskBlock))) {
       let dt = taskAt(doneTask)
-      unmapPages(*(dt + taskStackBase), *(dt + taskStackBytes))
-      unmapPages(doneTask, (taskWords + 1) * 8)
+      // #3992: `winRetireTaskStack` (./bootstack.bit) releases the WHOLE
+      // reservation `mapGuardedStack` made for this task, using the
+      // pre-alignment base `rtSpawn` recorded at `winTaskStackRegion` — see
+      // that function's own header for why this replaces, rather than adds
+      // to, the `unmapPages(taskStackBase, taskStackBytes)` decommit this
+      // branch used to make. Kept out of this branch's own body, matching
+      // `mapGuardHole`/`guardedStackBase`'s precedent, so a `workerBody`
+      // already over its complexity/line ceilings on `main` does not climb
+      // further because of this fix.
+      winRetireTaskStack(int(*(dt + winTaskStackRegion)))
+      unmapPages(doneTask, (taskWords + 2) * 8)
     }
     if (backoff == workerStepStop) {
       break
@@ -441,6 +452,17 @@ export @nosplit fn spawnBindScheduler(schedAddr: int) {
   gSched = schedAddr
 }
 
+// #3992: the ONE word past `taskSpawnEntry` (32), present ONLY in the
+// oversized block `rtSpawn` below maps — Windows-only, unlike
+// `taskSpawnEntry` itself, because only this platform's `unmapPages` is
+// decommit-only (see `../../alloc/windows/pages.bit`'s header): Linux and
+// Darwin release a stack's reservation with an ordinary sub-range `munmap`
+// at retirement and never need the pre-alignment base again. Deliberately
+// NOT added to `../../sched/task.bit`'s shared `taskWords` — that constant
+// sizes every task block on every platform, and growing it would make Linux
+// and Darwin pay 8 bytes per spawn for a field neither ever reads.
+const winTaskStackRegion: int = taskWords + 1
+
 // A fatal exit for `rtSpawn`'s own error paths ONLY — a live `spawn()` call
 // that cannot allocate a task stack or task block, mid-program. NOT
 // `bit_rt_os_exit` (ABI.md §19's pinned, stable `(code: i64) -> noreturn`
@@ -453,17 +475,27 @@ export @nosplit fn spawnBindScheduler(schedAddr: int) {
   ExitProcess(i32(code))
 }
 
+// #3992: the task block is mapped BEFORE the stack, the reverse of the order
+// every other platform uses, so `mapGuardedStack`'s `regionOut` has somewhere
+// race-free to write the stack's true pre-alignment base — a fresh word
+// inside THIS call's own just-mapped block, never shared with a sibling
+// worker's concurrent `rtSpawn`. Safe on Windows specifically: reordering the
+// two `mapPages` calls cannot reopen #2433's collision, because that hazard
+// needs a released (POSIX-freed) hole for the second call to first-fit into,
+// and `../../alloc/windows/pages.bit`'s header is explicit that a decommitted
+// Windows range is "never available to a later VirtualAlloc call from this
+// same reservation" regardless of ordering.
 export @nosplit @symbol("bit_rt_spawn") fn rtSpawn(entry: *byte, arg: int) {
   if (gSched == 0) {
     winSpawnFatal(70)
   }
   let s = taskAt(gSched)
-  let stackBase = mapGuardedStack(schedStackBytes)
-  if (stackBase == 0) {
+  let taskAddr = mapPages((taskWords + 2) * 8)
+  if (taskAddr == 0) {
     winSpawnFatal(70)
   }
-  let taskAddr = mapPages((taskWords + 1) * 8)
-  if (taskAddr == 0) {
+  let stackBase = mapGuardedStack(schedStackBytes, taskAt(taskAddr) + winTaskStackRegion)
+  if (stackBase == 0) {
     winSpawnFatal(70)
   }
   *(taskAt(taskAddr) + taskSpawnEntry) = int(entry)
@@ -585,7 +617,7 @@ fn boot(): int {
   stwBind(rootGcAddr(), int(sched), int(ptrOf(chanRegBlock)), rootWorldAddr())
 
   // 5. Place `bit_main`'s task on worker 0's deque; register before queueing.
-  let stackBase = mapGuardedStack(schedMainStackBytes)
+  let stackBase = mapGuardedStack(schedMainStackBytes, ptrOf(winMainStackRegionScratch))
   if (stackBase == 0) {
     return 70
   }
