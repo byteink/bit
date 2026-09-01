@@ -72,6 +72,53 @@
 // lines down is sized to fail that misconfiguration fast (a few seconds)
 // rather than reading as a hang, not to bound the intended (multi-worker)
 // run, which never gets near it.
+//
+// #4030: `stopped` ABOVE CANNOT DISTINGUISH "polls only when told" FROM
+// "polls on every iteration". Reproduced directly: inverting this file's own
+// clause 1 sense in compiler/arm64call.bit (`emitLocalCbz(cx, true, rWorld)`
+// -> `emitLocalCbz(cx, false, rWorld)` for the "stop pending" test) still
+// PASSES this file unmodified — `stopped` still comes back true, elapsedMs
+// still ~0ms. The reason: the inverted clause makes the guard call the real
+// `bit_rt_safepoint` on essentially every iteration whenever the stop word
+// reads 0 (the overwhelming majority of the run), rather than only when it
+// is nonzero. `stwPoll` inside that call is untouched by the mutation and
+// still makes the correct park decision every time it is reached — it is
+// simply reached constantly instead of rarely, so a call already in flight
+// (or the very next one) always straddles the controller's brief stop
+// window. `checkThroughput` below closes this: it cannot be fooled by an
+// inversion that preserves "parks eventually", because #2921/#2925 exist
+// specifically because calling bit_rt_safepoint on every back edge is
+// expensive (an unconditional call cost ~58% of collatz's runtime) — an
+// always-poll guard collapses this loop's own iteration rate, which
+// `stopped` never observes but a rate comparison does.
+//
+// WHY A RATIO AGAINST A `@nosplit` REFERENCE LOOP, NOT AN ABSOLUTE COUNT.
+// Tried first: assert `mutatorLoop`'s own iteration count (during the
+// settle window it already runs) is above a fixed floor. Both a single
+// later-spawned-probe version AND this settle-window version were
+// eventually broken by real fleet contention on this box (#4030): readings
+// that were 35-55M at load 39 fell to 7.3M at a self-induced load in the
+// 60s, well under any fixed floor wide enough to also pass at load 39.
+// Wall-clock throughput is not load-invariant, so no single absolute
+// threshold survives an unbounded range of contention.
+//
+// A RATIO is, because `refLoop` below is `@nosplit` — §10.3.1 makes the
+// compiler skip poll-guard emission at its back edge ENTIRELY, for any
+// build under test here including a mutated one (`needsNoSafepoints(cx.f)`
+// in `emitBackEdgeSafepointIfNeeded` is checked before
+// `emitInlinedPollGuard` is ever called), so nothing this file mutates can
+// touch `refLoop`'s rate. Whatever ambient contention does to one
+// allocation-free loop on this box it does to both roughly in proportion,
+// so `mutatorLoop`'s rate divided by `refLoop`'s stays close to constant
+// across load while their INDIVIDUAL rates both swing by 10x+.
+//
+// MEASURED (#4030), ratio_x1000 = mutatorLoop_iters * 1000 / refLoop_iters,
+// both sampled at the same instant at the end of the settle sleep, across
+// load averages from ~6 to ~45 (idle box through a deliberately induced 40
+// concurrent CPU-bound processes): correct ~276-310, inverted-clause-1
+// mutant ~75-86 — neither range moved outward as load climbed, unlike the
+// absolute counts above. 150 sits with >1.7x margin on both sides of every
+// reading in both ranges.
 
 import { exit } from "std/os"
 import { newWaitGroup, WaitGroup } from "std/sync"
@@ -81,11 +128,17 @@ import {
   worldRendezvous, worldRestart, wordAt,
 } from "../../runtime/gc"
 
-class Shared { wg: WaitGroup, started: []i64, testDone: []i64 }
+class Shared { wg: WaitGroup, started: []i64, testDone: []i64, iters: []i64 }
 
 // The mutator under test: allocation-free, with a real loop back edge so the
 // compiler emits the inlined poll guard at it. See the header for why
 // heapLiveWord cannot move while this runs.
+//
+// #4030: publishes its own progress every 2^20 iterations into `s.iters`
+// (not every iteration — that would add its own overhead to the very rate
+// `main`'s throughput check below is trying to measure) so the controller
+// can read, at the end of the settle sleep it already does, how far this
+// SAME already-running loop got, for comparison against `refLoop` below.
 fn mutatorLoop(s: Shared) {
   atomicStore(ptrOf(s.started), 1)
   let i = 0
@@ -97,16 +150,95 @@ fn mutatorLoop(s: Shared) {
   // resolves in a few seconds rather than 100+.
   while (i < 2000000000 && atomicLoad(ptrOf(s.testDone)) == 0) {
     i = i + 1
+    if ((i & 1048575) == 0) {
+      atomicStore(ptrOf(s.iters), i)
+    }
   }
   s.wg.done()
 }
 
-fn main() {
+// #4030: the reference loop the throughput ratio is measured against — see
+// the file header for why `@nosplit` (never gets a poll guard emitted at its
+// back edge, §10.3.1, regardless of any mutation to emitInlinedPollGuard) is
+// what makes the ratio load-insensitive. Same publish shape as mutatorLoop.
+@nosplit fn refLoop(testDone: []i64, iters: []i64) {
+  let i: i64 = 0
+  while (i < 2000000000 && atomicLoad(ptrOf(testDone)) == 0) {
+    i = i + 1
+    if ((i & 1048575) == 0) {
+      atomicStore(ptrOf(iters), i)
+    }
+  }
+  atomicStore(ptrOf(iters), i)
+}
+
+// `wg.done()` is not itself `@nosplit` (WaitGroup uses a channel), so it
+// cannot be called from inside refLoop's body (E0075) — this wrapper is the
+// ordinary, non-nosplit task spawn calls instead.
+fn refLoopTask(wg: WaitGroup, testDone: []i64, iters: []i64) {
+  refLoop(testDone, iters)
+  wg.done()
+}
+
+// #4030: throughput ratio check — see the file header for the full
+// rationale and the measurements behind 150. Runs as its OWN self-contained
+// phase, spawning and fully joining a private pair of loops BEFORE `main`
+// spawns the stop-word test's own mutatorLoop below.
+//
+// MUST NOT RUN CONCURRENTLY WITH THE STOP-WORD TEST — found directly (#4030)
+// by trying it: `refLoop` never polls at all (that is the whole point of
+// making it `@nosplit`), so a mutator slot running it can never report
+// itself stopped. `worldRendezvous` below requires EVERY slot but the
+// caller's own to report stopped (`runtime/gc/gcworldstop.bit`'s own scan),
+// so an alive, never-parking `refLoop` mutator makes `worldRendezvous`
+// abandon every single time regardless of whether the guard under test is
+// correct — reproduced on an UNMUTATED tree: `test-pollguardstopword` failed
+// 4/4 with "worldStopWord clause did not park" once refLoop ran alongside
+// it. Spawning this phase first and fully joining it (`wg.wait()` below)
+// before phase two's mutatorLoop is spawned removes the extra mutator slot
+// entirely by the time worldRendezvous scans, while still giving both loops
+// here the same favourable "freshly spawned" scheduling the measurements in
+// the header depend on — as the very first spawns in the process, not spawns
+// competing with an already-running mutator.
+fn checkThroughput() {
   let started = []i64(1)
   let testDone = []i64(1)
+  let iters = []i64(1)
+  let refIters = []i64(1)
+  let wg = newWaitGroup()
+  wg.add(2)
+  spawn mutatorLoop(Shared{ wg: wg, started: started, testDone: testDone, iters: iters })
+  spawn refLoopTask(wg, testDone, refIters)
+
+  sleep(20 * Millisecond)
+
+  let mutIters = atomicLoad(ptrOf(iters))
+  let refItersAt = atomicLoad(ptrOf(refIters))
+
+  atomicStore(ptrOf(testDone), 1)
+  wg.wait()
+
+  let ratioX1000 = mutIters * 1000 / refItersAt
+  if (ratioX1000 < 150) {
+    println("pollguardstopword: FAIL — allocation-free mutator reached ${mutIters} iterations against the nosplit reference loop's ${refItersAt} over a 20ms window with nothing pending (ratio_x1000=${ratioX1000}, want >= 150); the inlined poll guard is calling bit_rt_safepoint far more often than its clauses justify, masking a broken clause behind an always-poll fallback")
+    exit(1)
+  }
+}
+
+fn main() {
+  // #4030: a SEPARATE, independent, and separately-phased check -- see
+  // checkThroughput's own comment for why it must run to completion before
+  // this phase's mutatorLoop spawns, and the file header for why `stopped`
+  // below cannot catch a clause that polls unconditionally instead of only
+  // when told.
+  checkThroughput()
+
+  let started = []i64(1)
+  let testDone = []i64(1)
+  let iters = []i64(1)
   let wg = newWaitGroup()
   wg.add(1)
-  spawn mutatorLoop(Shared{ wg: wg, started: started, testDone: testDone })
+  spawn mutatorLoop(Shared{ wg: wg, started: started, testDone: testDone, iters: iters })
 
   // Bounded wait for the mutator to publish that it is inside its loop.
   // Racing an as-yet-unscheduled task would let `worldRendezvous` pass
@@ -156,5 +288,6 @@ fn main() {
     println("pollguardstopword: FAIL — worldStopWord clause did not park the allocation-free mutator; worldRendezvous abandoned after ${elapsedMs}ms (compiler/codegen.bit pgWorldStopWordWord has drifted from runtime/gc's real worldStopWord)")
     exit(1)
   }
+
   println("pollguardstopword: PASS — allocation-free mutator observed and parked by the worldStopWord clause (${elapsedMs}ms)")
 }
