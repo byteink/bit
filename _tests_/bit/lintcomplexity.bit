@@ -1,0 +1,603 @@
+// #4008. CLAUDE.md names cyclomatic complexity 10/function as one of exactly
+// two hard limits ("Power of 10"); the other, 800 lines/file, is gated by
+// _tests_/bit/lintfilelines.bit. Nothing ran E0204 (max-complexity,
+// spec/LINT.md §4/§8) before this gate — an unenforced ceiling is not a
+// ceiling, and it had drifted to a real worst case of complexity 117 (see
+// below) before anyone measured it.
+//
+// SCOPE IS PRODUCTION CODE ONLY -- runtime/, compiler/, stdlib/, tools/,
+// pkg/, the same five trees _tests_/bit/lintsweep.bit already sweeps for
+// E0200, for the identical reason (#3543): `bit lint`'s error sink is
+// all-or-nothing PER INVOCATION -- the first file that adds a parse or
+// directive error blanks every finding already computed for every OTHER
+// file in that same `bit lint <dirs...>` call, tree-wide. _tests_/bit/
+// checkercases/ and parsercases/, plus _tests_/cases/'s deliberate boundary
+// fixtures, live outside this scope for exactly that reason. See
+// lintsweep.bit's header for the full argument; it applies unchanged here.
+//
+// THE DEBT IS FAR TOO LARGE FOR A HARD ZERO: 282 top-level functions were
+// already over complexity 10 across those five trees when this gate was
+// written (#4008, measured on merged `main`), the worst at complexity 117
+// (compiler/fmtdispatch.bit). A hard-zero-with-named-exceptions list, the
+// shape _tests_/bit/fmtzerocheck.bit used to replace the deleted
+// fmt-ceiling ratchets (#3713), does not fit unchanged: fmtzerocheck's
+// exceptions are a boolean per FILE ("is this file canonical"). Complexity
+// is scored per FUNCTION, and a function can regress -- gain another branch
+// -- without ever leaving a boolean debt list, which would make the gate
+// blind to the exact regression it exists to catch.
+//
+// So each line of tools/build/complexity-debt.txt instead records a
+// per-function BASELINE SCORE: file, function name, and its complexity at
+// the time it was catalogued. A live E0204 finding at or below its
+// recorded baseline is tolerated known debt; a live finding ABOVE its
+// baseline, or with no entry at all, is a hard failure. A debt entry with
+// no matching live finding at all is stale (the function was fixed) and is
+// itself a hard failure until removed -- fmtzerocheck's self-cleaning
+// contract, unchanged. Nothing here can ever raise a baseline; only a human
+// editing the data file can lower or remove one. New debt needs its own
+// ticket and its own entry, never a raised number.
+//
+// Identity is (file, function name), NOT (file, line): a function's line
+// moves every time anything above it in the file changes, and a line-keyed
+// list would make this gate spuriously call fixed debt "stale" (the line
+// moved, not the function) or silently stop watching a real offender whose
+// line shifted. Duplicate function names at module scope are already a
+// compile error (E0042), so (file, name) is a stable, collision-free key
+// for every top-level `fn`/`export fn` this gate scores -- the same
+// population `compiler/lintapply.bit`'s `lintComplexityVisitDecl` scores
+// (top-level func_decl only, unwrapping `export`; class methods and arrow
+// functions are out of E0204's own scope, not this gate's).
+//
+// The printed denominator has two independent parts, on purpose: a
+// hand-rolled `.bit`-file count (matching lintsweep's own anti-vacuity
+// check, so a shrunk corpus cannot pass looking full) and a hand-rolled
+// top-level `fn`/`export fn` LINE count, independent of both `bit lint`'s
+// own collector and of the AST walk that scores E0204 -- sharing either
+// would make the denominator blind to a bug in the very thing it exists to
+// audit. The function count is a textual heuristic (a line starting with
+// `fn ` or `export fn `), not a parse, so it is not exact to the character;
+// it only needs to move when the corpus does, which a heuristic scan does
+// reliably.
+//
+// Run it from the repository root:
+//     ./bit-out/bin/bit run _tests_/bit/lintcomplexity.bit
+// BIT_SELF_EXE names the compiler under test; BIT_REPO names the repo root
+// tools/build/complexity-debt.txt and the five swept directories hang off.
+// Both are required -- a missing one is a hard stop, not a silently
+// different (and silently green) scope.
+import { env, envOr, exit } from "std/os"
+import { exists, isDir, mkdir, readDir, readFile, writeFile } from "std/fs"
+import { hasPrefix, hasSuffix, indexOf, parseInt, split, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+import { Json, jsonAsArray, jsonAsInt, jsonAsString, jsonGet, jsonParse } from "std/json"
+
+// Power of 10 rule 2: every walk below has a statically bounded depth and a
+// bounded per-directory fan-out, not merely a hope of termination.
+const maxEntries: int = 4096
+const maxScanDepth: int = 16
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "300")) catch _ {
+    300
+  }
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s mechanism channel, never a program exit status, so
+// each one is a named panic rather than a value any assertion could consume.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("lintcomplexity: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("lintcomplexity: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("lintcomplexity: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("lintcomplexity: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+fn requiredEnv(name: string): string! {
+  let v = env(name)
+  if (len(v) == 0) {
+    fail newError("lintcomplexity: ${name} is required and was not set")
+  }
+  return v
+}
+
+class Config { bit: string, repo: string }
+
+fn loadConfig(): Config! {
+  let bit = requiredEnv("BIT_SELF_EXE")?
+  let repo = requiredEnv("BIT_REPO")?
+  return Config{ bit: bit, repo: repo }
+}
+
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// "runtime/ + compiler/ + stdlib/ + tools/ + pkg/" -- built from the swept
+// list itself so the printed label always matches what actually ran.
+fn treeLabel(names: []string): string {
+  let out = ""
+  for d of names {
+    if (len(out) > 0) {
+      out = out + " + "
+    }
+    out = out + d + "/"
+  }
+  return out
+}
+
+// The `.bit` file count and the heuristic top-level function count for one
+// directory, walked together so the corpus is only traversed once.
+class TreeStats { files: int, funcs: int }
+
+fn isFnDeclLine(line: string): bool {
+  return hasPrefix(line, "fn ") || hasPrefix(line, "export fn ")
+}
+
+fn countFuncLines(path: string): int {
+  let text = readFile(path) catch e {
+    panic("lintcomplexity: cannot read ${path}: ${e.message()}")
+  }
+  let n = 0
+  for line of split(text, "\n") {
+    if (isFnDeclLine(line)) {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+fn scanOneTree(dir: string, depth: int): TreeStats {
+  if (depth <= 0) {
+    panic("lintcomplexity: ${dir} nesting exceeds ${maxScanDepth} levels")
+  }
+  let names = readDir(dir) catch e {
+    panic("lintcomplexity: cannot list ${dir}: ${e.message()}")
+  }
+  if (len(names) > maxEntries) {
+    panic("lintcomplexity: ${dir} has ${len(names)} entries, over the ${maxEntries} bound")
+  }
+  let files = 0
+  let funcs = 0
+  for name of names {
+    let path = "${dir}/${name}"
+    if (isDir(path)) {
+      let sub = scanOneTree(path, depth - 1)
+      files = files + sub.files
+      funcs = funcs + sub.funcs
+    } else if (hasSuffix(name, ".bit")) {
+      files = files + 1
+      funcs = funcs + countFuncLines(path)
+    }
+  }
+  return TreeStats{ files: files, funcs: funcs }
+}
+
+fn scanTrees(repo: string, names: []string): TreeStats! {
+  let files = 0
+  let funcs = 0
+  for d of names {
+    let full = "${repo}/${d}"
+    if (!exists(full)) {
+      fail newError("lintcomplexity: no such directory: ${full}")
+    }
+    let s = scanOneTree(full, maxScanDepth)
+    if (s.files == 0) {
+      fail newError("lintcomplexity: ${full} contains zero .bit files -- refusing a vacuous scan")
+    }
+    files = files + s.files
+    funcs = funcs + s.funcs
+  }
+  return TreeStats{ files: files, funcs: funcs }
+}
+
+fn buildAbsDirs(repo: string, names: []string): []string {
+  let out = []string(0)
+  for n of names {
+    out = append(out, "${repo}/${n}")
+  }
+  return out
+}
+
+// One `bit lint --json <dirs...>` invocation, as seen from outside it.
+class Run { code: int, out: string, err: string }
+
+fn quotedPaths(paths: []string): string {
+  let out = ""
+  for p of paths {
+    out = out + " '${p}'"
+  }
+  return out
+}
+
+fn runLintJson(bit: string, absDirs: []string, capDir: string, ms: int): Run! {
+  let outPath = "${capDir}/out.json"
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  let script = "#!/bin/sh\n" +
+    "'${bit}' lint --json" +
+    quotedPaths(absDirs) +
+    " > '${outPath}' 2> '${errPath}'\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/lint.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("lintcomplexity: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("lintcomplexity: no exit code was recorded -- the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, out: readFile(outPath)?, err: readFile(errPath)? }
+}
+
+// `r` is a usable observation of a real run, not silence mistaken for a
+// clean sheet. `bit lint` always prints a summary to stderr, clean or not.
+// Exit 2 is SPEC's own "could not be trusted" verdict.
+fn assertTrustworthy(r: Run, label: string) {
+  if (len(r.err) == 0) {
+    panic("lintcomplexity: stderr is empty -- `bit lint` produced no summary for ${label}")
+  }
+  if (r.code == 2) {
+    panic("lintcomplexity: `bit lint` exited 2 (untrusted run) over ${label}:\n${r.err}")
+  }
+  if (r.code != 0 && r.code != 1) {
+    panic("lintcomplexity: `bit lint` exited ${r.code} over ${label}, want 0 or 1")
+  }
+}
+
+fn jsonField(o: Json, key: string): string {
+  let f = jsonGet(o, key)
+  if (isNone(f)) {
+    return "<missing>"
+  }
+  return unwrapOr(jsonAsString(unwrap(f)), "<not-a-string>")
+}
+
+fn jsonInt(o: Json, key: string): int {
+  let f = jsonGet(o, key)
+  if (isNone(f)) {
+    return -1
+  }
+  return unwrapOr(jsonAsInt(unwrap(f)), -1)
+}
+
+// One E0204 finding, resolved down to the identity this gate ratchets:
+// the file (repo-relative), the function's own name, and its live score.
+class Finding { file: string, func: string, score: int }
+
+class Pos { line: int, col: int }
+
+fn stripRepoPrefix(file: string, repo: string): string! {
+  let prefix = "${repo}/"
+  if (!hasPrefix(file, prefix)) {
+    fail newError("lintcomplexity: E0204 finding path outside ${repo}: ${file}")
+  }
+  return file[len(prefix):]
+}
+
+// "function complexity is 34, limit is 10" -> 34.
+fn parseComplexityScore(msg: string): int! {
+  let prefix = "function complexity is "
+  if (!hasPrefix(msg, prefix)) {
+    fail newError("lintcomplexity: unexpected E0204 message: '${msg}'")
+  }
+  let rest = msg[len(prefix):]
+  let comma = int(indexOf(rest, ","))
+  if (comma < 0) {
+    fail newError("lintcomplexity: unexpected E0204 message: '${msg}'")
+  }
+  return parseInt(rest[:comma])?
+}
+
+fn findingStart(d: Json, rawFile: string): Pos! {
+  let range = jsonGet(d, "range")
+  if (isNone(range)) {
+    fail newError("lintcomplexity: E0204 finding in ${rawFile} has no range")
+  }
+  let start = jsonGet(unwrap(range), "start")
+  if (isNone(start)) {
+    fail newError("lintcomplexity: E0204 finding in ${rawFile} has no range.start")
+  }
+  let line = jsonInt(unwrap(start), "line")
+  let col = jsonInt(unwrap(start), "character")
+  if (line < 0 || col < 0) {
+    fail newError("lintcomplexity: E0204 finding in ${rawFile} has an invalid range.start")
+  }
+  return Pos{ line: line, col: col }
+}
+
+fn isIdentChar(c: u8): bool {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+fn funcNameAt(line: string, col: int): string! {
+  if (col < 0 || col > len(line)) {
+    fail newError("lintcomplexity: column ${col} out of range for line of length ${len(line)}: '${line}'")
+  }
+  let i = col
+  while (i < len(line) && isIdentChar(line[i])) {
+    i = i + 1
+  }
+  if (i == col) {
+    fail newError("lintcomplexity: no identifier at column ${col}: '${line}'")
+  }
+  return line[col:i]
+}
+
+// The diagnostic's own span.start does NOT reliably land on the function
+// name: for a bare `fn foo(...)` it lands right after `fn ` (verified
+// against real `bit lint` output), but for `export @attr(...) fn foo(...)`
+// it lands right after `export ` -- at the first attribute, three tokens
+// earlier. Rather than trust that column, this locates the `fn` keyword
+// itself as a whole word on the line and reads the name after IT, which is
+// stable regardless of how many attributes precede it.
+fn findFnKeywordCol(line: string): int! {
+  if (hasPrefix(line, "fn ")) {
+    return 0
+  }
+  let idx = int(indexOf(line, " fn "))
+  if (idx < 0) {
+    fail newError("lintcomplexity: no 'fn' keyword found in line: '${line}'")
+  }
+  return idx + 1
+}
+
+// A declaration's `fn` keyword is expected on its own reported line for
+// every case seen in this tree (attributes here are always same-line), but
+// this still tolerates a few following lines rather than assuming it, so a
+// rare multi-line attribute block fails loudly instead of silently
+// misnaming the function.
+const maxDeclScanLines: int = 8
+
+fn funcNameNear(repo: string, file: string, startLine: int): string! {
+  let lines = split(readFile("${repo}/${file}")?, "\n")
+  let limit = startLine + maxDeclScanLines
+  let i = startLine
+  while (i < len(lines) && i < limit) {
+    let fnCol = findFnKeywordCol(lines[i]) catch _ {
+      i = i + 1
+      continue
+    }
+    return funcNameAt(lines[i], fnCol + 3)?
+  }
+  fail newError("lintcomplexity: ${file}: no 'fn' keyword found within ${maxDeclScanLines} line(s) of line ${startLine}")
+}
+
+fn findingFromJson(d: Json, repo: string): Finding! {
+  let rawFile = jsonField(d, "file")
+  let file = stripRepoPrefix(rawFile, repo)?
+  let score = parseComplexityScore(jsonField(d, "message"))?
+  let start = findingStart(d, rawFile)?
+  let name = funcNameNear(repo, file, start.line)?
+  return Finding{ file: file, func: name, score: score }
+}
+
+fn extractFindings(out: string, repo: string): []Finding! {
+  let parsed = jsonParse(trimSpace(out))?
+  let arr = unwrapOr(jsonAsArray(parsed), []Json(0))
+  let result = []Finding(0)
+  for d of arr {
+    if (jsonField(d, "code") != "E0204") {
+      continue
+    }
+    result = append(result, findingFromJson(d, repo)?)
+  }
+  return result
+}
+
+fn collectFindings(
+  cfg: Config,
+  dirNames: []string,
+  capDir: string,
+  ms: int,
+  label: string,
+): []Finding! {
+  let absDirs = buildAbsDirs(cfg.repo, dirNames)
+  let r = runLintJson(cfg.bit, absDirs, capDir, ms)?
+  assertTrustworthy(r, label)
+  return extractFindings(r.out, cfg.repo)?
+}
+
+// One line of tools/build/complexity-debt.txt: a function this gate already
+// knows is over the limit, and the complexity it had when catalogued.
+class DebtEntry { file: string, func: string, baseline: int }
+
+fn parseDebtLine(line: string): DebtEntry! {
+  let fields = split(line, " ")
+  if (len(fields) != 3) {
+    fail newError("lintcomplexity: malformed complexity-debt.txt line: '${line}' (want '<file> <func> <baseline>')")
+  }
+  let baseline = parseInt(fields[2])?
+  return DebtEntry{ file: fields[0], func: fields[1], baseline: baseline }
+}
+
+fn loadDebt(path: string): []DebtEntry! {
+  if (!exists(path)) {
+    fail newError("lintcomplexity: no debt file at ${path}")
+  }
+  let out = []DebtEntry(0)
+  for raw of split(readFile(path)?, "\n") {
+    let line = trimSpace(raw)
+    if (len(line) == 0 || hasPrefix(line, "#")) {
+      continue
+    }
+    out = append(out, parseDebtLine(line)?)
+  }
+  return out
+}
+
+fn keyOf(file: string, func: string): string {
+  return "${file} ${func}"
+}
+
+class Regression { file: string, func: string, baseline: int, now: int }
+
+class Verdict { unlisted: []Finding, regressed: []Regression, stale: []DebtEntry }
+
+fn evaluate(findings: []Finding, debt: []DebtEntry): Verdict {
+  let debtMap = map<string, int>{}
+  for e of debt {
+    debtMap[keyOf(e.file, e.func)] = e.baseline
+  }
+  let matched = map<string, bool>{}
+  let unlisted = []Finding(0)
+  let regressed = []Regression(0)
+  for f of findings {
+    let key = keyOf(f.file, f.func)
+    let (baseline, ok) = debtMap[key]
+    if (!ok) {
+      unlisted = append(unlisted, f)
+      continue
+    }
+    matched[key] = true
+    if (f.score > baseline) {
+      regressed = append(
+        regressed,
+        Regression{ file: f.file, func: f.func, baseline: baseline, now: f.score },
+      )
+    }
+  }
+  let stale = []DebtEntry(0)
+  for e of debt {
+    let (_, ok) = matched[keyOf(e.file, e.func)]
+    if (!ok) {
+      stale = append(stale, e)
+    }
+  }
+  return Verdict{ unlisted: unlisted, regressed: regressed, stale: stale }
+}
+
+fn verdictFails(v: Verdict): bool {
+  return len(v.unlisted) > 0 || len(v.regressed) > 0 || len(v.stale) > 0
+}
+
+fn printUnlisted(v: Verdict) {
+  if (len(v.unlisted) == 0) {
+    return
+  }
+  eprint("  unlisted E0204 finding(s) -- not in tools/build/complexity-debt.txt, over this repo's own limit of 10:\n")
+  for f of v.unlisted {
+    eprint("    ${f.file} ${f.func} ${f.score}\n")
+  }
+}
+
+fn printRegressed(v: Verdict) {
+  if (len(v.regressed) == 0) {
+    return
+  }
+  eprint("  regressed past their recorded baseline:\n")
+  for r of v.regressed {
+    eprint("    ${r.file} ${r.func} was ${r.baseline}, now ${r.now}\n")
+  }
+}
+
+fn printStale(v: Verdict) {
+  if (len(v.stale) == 0) {
+    return
+  }
+  eprint("  stale debt entries -- no longer a live E0204 finding, remove from tools/build/complexity-debt.txt:\n")
+  for e of v.stale {
+    eprint("    ${e.file} ${e.func} ${e.baseline}\n")
+  }
+}
+
+fn printFailReport(
+  findings: []Finding,
+  debt: []DebtEntry,
+  scan: TreeStats,
+  label: string,
+  v: Verdict,
+) {
+  eprint("lint-complexity: FAIL -- ${len(findings)} of ${scan.funcs} top-level function(s) over complexity 10 across ${scan.files} .bit file(s) scanned (${label}); ${len(debt)} named in tools/build/complexity-debt.txt.\n")
+  printUnlisted(v)
+  printRegressed(v)
+  printStale(v)
+  eprint("lint-complexity: complexity-debt.txt only ever shrinks or holds a baseline steady -- a human lowers or removes an entry, this gate never does. New debt needs a real ticket and its own entry, never a raised baseline.\n")
+}
+
+fn printPassReport(findings: []Finding, debt: []DebtEntry, scan: TreeStats, label: string) {
+  println("lint-complexity: ${len(findings)} of ${scan.funcs} top-level function(s) over complexity 10 across ${scan.files} .bit file(s) scanned (${label}), all ${len(debt)} named in tools/build/complexity-debt.txt -- PASS.")
+}
+
+fn report(findings: []Finding, debt: []DebtEntry, scan: TreeStats, label: string) {
+  let v = evaluate(findings, debt)
+  if (verdictFails(v)) {
+    printFailReport(findings, debt, scan, label, v)
+    exit(1)
+  }
+  printPassReport(findings, debt, scan, label)
+}
+
+fn newCapDir(): string {
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  return "${tmp}/bit-lintcomplexity-${uuidFormat(uuidV4())}"
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}
+
+fn teardown(dir: string, ms: int) {
+  shell("${dir}/rm.sh", "#!/bin/sh\nrm -rf '${dir}'\n", ms) catch _ {
+    return
+  }
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let cfg = loadConfig() catch e {
+    panic("lintcomplexity: ${e.message()}")
+  }
+  let dirNames = ["runtime", "compiler", "stdlib", "tools", "pkg"]
+  let label = treeLabel(dirNames)
+  let scan = scanTrees(cfg.repo, dirNames) catch e {
+    panic("lintcomplexity: ${e.message()}")
+  }
+
+  let capDir = newCapDir()
+  mkdir(capDir) catch e {
+    panic("lintcomplexity: cannot create ${capDir}: ${e.message()}")
+  }
+
+  let findings = collectFindings(cfg, dirNames, capDir, ms, label) catch e {
+    teardown(capDir, ms)
+    panic("lintcomplexity: ${e.message()}")
+  }
+  let debt = loadDebt("${cfg.repo}/tools/build/complexity-debt.txt") catch e {
+    teardown(capDir, ms)
+    panic("lintcomplexity: ${e.message()}")
+  }
+  teardown(capDir, ms)
+
+  report(findings, debt, scan, label)
+}
