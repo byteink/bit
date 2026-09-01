@@ -1,0 +1,144 @@
+// Split out of ./boot.bit (#4094): that file sat at the 800-line ceiling with
+// zero headroom (spec/LINT.md §4), and the `indexok=` field this ticket adds
+// could not fit without either exceeding it or splitting. ../windows/stats.bit
+// took the same split for the same reason under #3725; this file mirrors its
+// shape. `statsBuf`, `statsConst`, `statsNum` and `statsReport` below have no
+// dependency on anything else in ./boot.bit beyond the imports already
+// declared there (`stwCollections` and siblings, `rootStatOom`,
+// `rootWriteAll`, `stderrFd`) — an import is per-MODULE, not per-file, so
+// this file uses them directly rather than re-importing.
+
+// ---------------------------------------------------------------------------
+// The `BIT_GC_STATS` line (#1639) — kept identical in ../linux/boottail.bit
+// and ../windows/stats.bit
+// ---------------------------------------------------------------------------
+//
+// `runtime/gc/`'s `collect` prints `[bit-gc] collection N: ...` per collection. THIS
+// PORT CANNOT PRINT FROM THERE: every function on the collection path is
+// `@nosplit`, which admits no `print`, no `extern` call and no `syscall`
+// (`runtime/gc` deviation 6, E0075). So the flag's OWNER is boot, which is
+// ordinary Bit sitting next to ./io.bit's write primitive, and the shape becomes
+// one SUMMARY line at exit instead of one line per collection.
+//
+// That deviation is worth naming precisely, because #1639 measured the missing
+// output and the missing collections together: a Bit-runtime binary printed
+// nothing under `BIT_GC_STATS=1` for TWO independent reasons, and fixing only
+// the wiring would still have printed nothing. `swept=` and `live=` are on the
+// line for the same reason — a count alone cannot tell a collector that
+// reclaims from one that marks everything.
+//
+// Text is emitted through `writeConst` (packed byte constants) rather than
+// string literals: this module is `--freestanding` (#1628) and builds no
+// managed string. The decimals go through ./os.bit's `osWriteDecimal`, a
+// sibling.
+
+// The line is assembled in MODULE STATE and written in ONE call, and it
+// allocates nothing. That is a hard requirement, not tidiness: this runs on the
+// boot thread after the worker is joined, i.e. after a whole run's worth of
+// collection, and `[]int(n)` there returned 0 on roughly 40% of runs at
+// 65k-collection density — a null the decimal writer then stored through
+// (`strb w19, [x20]`, x20 = 4). ../io.bit's `writeConst` allocates too, so it is
+// not used here either. `panicWrite` states the same rule for the same reason:
+// the one path that must work when allocation is what failed cannot allocate.
+// The residual question the null raised — whether a boot-thread allocation can
+// fail after a heavy collected run — is filed separately (#1643); it is not
+// reached from here any more.
+//
+// 248 bytes, and the size is a SUM to redo whenever a field is added, not a
+// round number (#3046 recomputed this when ` chunks=`/` chunkbytes=` were
+// added, and corrected a miscount in the process: the ORIGINAL six fields —
+// collections/swept/live/abandoned/oom/bad — call `statsNum` SIX times, not
+// the five this comment used to claim, so the true prior worst case was
+// already 176 bytes against a 160-byte buffer, 16 bytes over; nothing had
+// tripped it because hitting six simultaneous 19-digit counters is not a real
+// collector state). #3146 added ` idxchunks=<n> idxbytes=<n>` (97 bytes fixed
+// text: 76 from #3046 + 11 + 10). #4094 added ` indexok=<n>` for the index's
+// live/disabled flag (9 more bytes, 106 total). ELEVEN i64 decimals are at
+// most 220 (20 bytes each, worst case), so 326 is the worst case — 41 whole
+// words, rounded up to 42 for a word of slack. `statsConst`/`statsNum` write
+// through a raw `ptrOf`, so an undersized block runs off the end in silence
+// (#1682).
+let statsBuf: [42]i64
+
+// `osWriteDecimal` pulled up to core (#2551,
+// docs/development/provider-duplication.md's `root` -> `os.bit` section): no
+// OS call in its body. This file is the only remaining caller in this
+// module (`statsNum` below), so it imports directly rather than relying on
+// ./os.bit, which no longer needs it locally.
+import { osWriteDecimal } from "../../root"
+
+// Append `nbytes` low bytes of the packed constant `word` at byte offset `at`,
+// returning the new offset. Packed constants rather than string literals because
+// this module is `--freestanding` (#1628) and builds no managed string.
+@nosplit fn statsConst(at: int, word: int, nbytes: int): int {
+  let base = int(ptrOf(statsBuf))
+  let w = word
+  let i = 0
+  while (i < nbytes) {
+    storeByte(base + at + i, w & 255)
+    w = w >> 8
+    i = i + 1
+  }
+  return at + nbytes
+}
+
+// Append `v` in decimal at byte offset `at`, returning the new offset.
+@nosplit fn statsNum(at: int, v: int): int {
+  return at + osWriteDecimal(int(ptrOf(statsBuf)) + at, v)
+}
+
+// `[bit-gc] collections=<n> swept=<n> live=<n> abandoned=<n> oom=<n> bad=<n>
+// chunks=<n> chunkbytes=<n> idxchunks=<n> idxbytes=<n> indexok=<n>`, on
+// stderr, once, only under `BIT_GC_STATS`. Called after `main` has finished
+// and the worker is reaped, so nothing can be collecting while it reads.
+@nosplit fn statsReport() {
+  let at = statsConst(0, 6729335713145905755, 8) // "[bit-gc]"
+  at = statsConst(at, 8386658447444108064, 8)    // " collect"
+  at = statsConst(at, 263929622377, 5)           // "ions="
+  at = statsNum(at, stwCollections())
+  at = statsConst(at, 17297999666836256, 7) // " swept="
+  at = statsNum(at, stwSwept())
+  at = statsConst(at, 67505987611680, 6) // " live="
+  at = statsNum(at, stwLiveObjects())
+  at = statsConst(at, 7957689491829973280, 8) // " abandon"
+  at = statsConst(at, 4023397, 3)             // "ed="
+  at = statsNum(at, stwAbandonedCount())
+  at = statsConst(at, 28448, 2)   // " o"
+  at = statsConst(at, 4025711, 3) // "om="
+  at = statsNum(at, rootStatOom())
+  // Pointer-map offsets the tracer refused and SKIPPED (#1682): a skipped field
+  // is a reference never marked, and that degraded trace is indistinguishable
+  // from a healthy one everywhere else.
+  at = statsConst(at, 263677108768, 5) // " bad="
+  at = statsNum(at, stwBadOffsets())
+  // The span reserve's chunk count and total mapped bytes (#3046) — the
+  // number that would have root-caused #2803's month-long RSS investigation
+  // in one run, where RSS itself and per-class occupancy both pointed the
+  // wrong way. `stwSpanChunks`/`stwSpanChunkBytes` are the same pinned
+  // forwarders `runtime/gc/mem.bit`'s `reserveChunkCount`/
+  // `reserveChunkBytesMapped` reach through `runtime/stw`.
+  at = statsConst(at, 4428000980795679520, 8) // " chunks="
+  at = statsNum(at, stwSpanChunks())
+  at = statsConst(at, 8746671548467274528, 8) // " chunkby"
+  at = statsConst(at, 1030972788, 4)          // "tes="
+  at = statsNum(at, stwSpanChunkBytes())
+  // The address->object index reserve (`gcIdxRes`) — the tables `idxGrow`
+  // (`../gc/gcindex.bit`) allocates and never frees back to the OS (#3146).
+  // `chunks=`/`chunkbytes=` above only ever covered the span reserve; this
+  // one was invisible until now, and it is not small — measured at 30% of
+  // peak RSS on the `alloc` benchmark. `stwIdxChunks`/`stwIdxChunkBytes` are
+  // the same pinned-forwarder shape as the span pair above.
+  at = statsConst(at, 7959382692878117152, 8) // " idxchun"
+  at = statsConst(at, 4027243, 3)             // "ks="
+  at = statsNum(at, stwIdxChunks())
+  at = statsConst(at, 7310601558962759968, 8) // " idxbyte"
+  at = statsConst(at, 15731, 2)               // "s="
+  at = statsNum(at, stwIdxChunkBytes())
+  // The index's live/disabled flag (#4094) — see ../gc/gcindex.bit's
+  // `idxDisable` comment for what 0 costs (Theta(live) lookups from then on).
+  at = statsConst(at, 7741538661345159456, 8) // " indexok"
+  at = statsConst(at, 61, 1)                  // "="
+  at = statsNum(at, stwIdxOk())
+  at = statsConst(at, 10, 1) // "\n"
+  rootWriteAll(stderrFd, int(ptrOf(statsBuf)), at)
+}
