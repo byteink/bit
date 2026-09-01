@@ -691,6 +691,45 @@ no frames at all. The linker decides it after dead-strip, in the same pass that
 orders the merged group. Dead-stripping `libbitrt.a` is thereby *finer*-grained
 than a whole-program table allowed, not coarser.
 
+**The SLOT half of an entry is currently redundant for correctness (#4046),
+and this is proven, not assumed.** `slot_fp_off[num_slots]` above is read by
+exactly two root classes, both walking `gcScanSnapshot`
+(`runtime/gc/stackmap.bit`): the collecting thread's own frames
+(`runtime/stw/stw.bit:765`) and every other STOPPED mutator's published
+frame (`runtime/stw/stw.bit:774`). No other root class reads it —
+`grep -rn '\.slots'` outside `compiler/codegen.bit` (the writer) and this
+file's own reader finds nothing else. Both call sites are shadowed by an
+UNCONDITIONAL conservative scan of the identical stack memory that runs on
+every single collection, in production as well as under `BIT_GC=stress`:
+
+- The collecting thread's own live `sp` (`stwReadSp`, `runtime/stw/stw.bit:545`)
+  is read strictly deeper in the call chain than the `SafepointFrame` the
+  safepoint shim recorded above, so it is always a lower (or equal) address.
+  Root class 8 (`runtime/stw/stw.bit:712-718`, #1832) lowers that task's
+  conservative scan bound to this `sp` before the unconditional
+  `stwScanStackRange(g, lo, top)` at `runtime/stw/stw.bit:728` — a range that
+  is therefore always a superset of every address `gcScanSnapshot`'s
+  frame-pointer-chain walk can reach on that same stack (frame pointers only
+  grow toward higher addresses, `runtime/gc/stackmap.bit:496-498`).
+- A parked mutator's scan bound is lowered the same way by root class 10
+  (`stwParkedLo`, `runtime/stw/stw.bit:648-662`, #1834) to the exact address
+  of that mutator's own published `SafepointFrame` — the very address
+  `gcScanSnapshot`'s unwind starts from — before the same unconditional
+  `stwScanStackRange` call.
+
+So **no frame shape currently leaves a stack-map slot as the sole root for a
+spilled reference.** Confirmed empirically as well as by this argument:
+mutating `compiler/regalloc.bit`'s `slots = append(slots, loc.index)` to a
+no-op drops every emitted entry's `num_slots` to 0 while a program built
+against the mutated compiler still runs tens of thousands of `BIT_GC=stress`
+collections to an unchanged result (#4046's ticket comment thread has the
+counts). **This does not mean the field should be removed or that class 8/10
+are optional** — a future generational or moving collector, or any future
+narrowing of class 8/10's conservative range for performance, would make the
+slot list load-bearing again. It means today's always-on conservative
+fallback happens to make it redundant for correctness right now, and nothing
+in the codebase currently tests that the slot list is itself correct.
+
 ### 4.1 The one-table assumption, and why it had to go (RESOLVED)
 
 The format above assumes **one table per link**, under one fixed symbol, emitted
