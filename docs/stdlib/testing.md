@@ -162,6 +162,37 @@ fn test_mapped() {
 }
 ```
 
+### `eqMap(got: map<K, V>, want: map<K, V>, label: string)`
+
+Fails unless the maps have the same length and equal values at every key.
+Reports the first differing key found, or - if `want` has a key `got` does
+not - that key and what `want` held for it, rather than rendering both whole
+maps on one line. As with `eqSlice`, a plain length mismatch is reported
+separately, without naming a key.
+
+```bit
+import { eqMap } from "std/testing"
+
+fn test_counts() {
+  let got = map<string, int>{ "a": 1, "b": 2 }
+  let want = map<string, int>{ "a": 1, "b": 2 }
+  eqMap<string, int>(got, want, "counts")
+}
+```
+
+A failing case (`{ "a": 1, "b": 99 }` against `{ "a": 1, "b": 2 }`) panics with
+
+```
+panic: counts[b]: got 99, want 2
+```
+
+naming only the key that differs, not the two whole maps.
+
+`eqMap` has no counterpart for a `class` instance: naming which *field*
+differs needs walking the type's fields generically, and `std/testing` has no
+such mechanism today (there is no reflection API in Bit v0.1) - a class
+failure still renders as one line via its `show()` method, the same as `eq`.
+
 ## Non-fatal checks
 
 Every assertion above is fatal: it panics on the first bad value, so a
@@ -239,6 +270,11 @@ The non-fatal twin of `near`.
 
 The non-fatal twin of `eqSlice`: same "first index that differs" report,
 recorded rather than panicked.
+
+### `checkEqMap(got: map<K, V>, want: map<K, V>, label: string)`
+
+The non-fatal twin of `eqMap`: same "first differing key" report, recorded
+rather than panicked.
 
 ## Expected panics
 
