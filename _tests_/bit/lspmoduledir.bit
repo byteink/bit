@@ -1,0 +1,380 @@
+// `bit lsp` module-directory gate (#4157): drives the REAL self-hosted `bit
+// lsp` binary as a subprocess, the same mechanics as _tests_/bit/lsplifecycle.bit
+// (see its header) — each `bit run _tests_/bit/*.bit` is a standalone
+// single-file program, so the small harness (frame/shQuote/runLsp/...) is
+// duplicated here rather than imported.
+//
+// THE BUG THIS GATE EXISTS TO CATCH: `lspOnDidOpen` (compiler/lspserver.bit)
+// always builds the opened file's DIRECTORY as one module (SPEC §17.1: "a
+// module is a directory of .bit files sharing one declaration namespace").
+// That is correct for `compiler/`, `runtime/`, `stdlib/<mod>/` — but
+// `_tests_/bit/` is 71 independent single-file programs, each invoked on its
+// own by tools/build/gates.bit's `runArgs("_tests_/bit/<name>.bit")`.
+// Concatenating them collided every duplicate top-level declaration:
+// `bit check _tests_/bit` reports 1345 errors, all E0042, where
+// `bit check _tests_/bit/allocslope.bit` alone reports 0.
+//
+// THE FIX (compiler/lspbuild.bit): SPEC §17.4 permits AT MOST ONE top-level
+// `main` per module, so a directory whose build reports more than one is not
+// a guess about intent — it PROVES the directory could never be one
+// well-formed module. `lspIsCoherentModule` detects exactly that and
+// `lspBuildProjectFor`/`lspRecheckAndPublish` fall back to building (and
+// publishing for) each open file on its own, the same single-file scope
+// `bit check <file>.bit` uses from the CLI. A real module — at most one
+// `main` by construction — never trips the fallback, so cross-file
+// diagnostics must still work there: `checkCoherentModuleStillReportsSiblingDiagnostics`
+// is that other half.
+//
+// WIRED INTO `./make test` as `test-lsp-moduledir` (tools/build/gates.bit,
+// tools/build/defs.bit), registered in the same commit as this file so
+// scripts/gate.sh does not see it as an unmapped _tests_/bit/** path.
+
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir, exists } from "std/fs"
+import { parseInt } from "std/strings"
+
+// Mirrors _tests_/bit/lsplifecycle.bit's `timeoutMs`: reads the shared
+// per-gate override rather than hardcoding a bound with no way to widen.
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "60")) catch _ {
+    60
+  }
+  if (s <= 0) {
+    return 60000
+  }
+  return s * 1000
+}
+
+fn failCase(msg: string) {
+  eprint("FAIL lspmoduledir: " + msg + "\n")
+  exit(1)
+}
+
+// Wraps `s` as exactly one POSIX `/bin/sh` word.
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+fn frame(body: string): string {
+  return "Content-Length: ${len(body)}\r\n\r\n" + body
+}
+
+fn mkdirQuiet(path: string) {
+  mkdir(path) catch _ {
+    return
+  }
+}
+
+// A scratch root whose path is already lexically canonical: _tests_/bit/lspcache.bit's
+// `scratchRoot()` (see its header) — `$TMPDIR` on macOS ends in a trailing
+// slash, and every URI this gate builds by hand (`"file://" + path`) must
+// come out byte-identical to what the server publishes, which resolves the
+// path through `pathResolve` first and so never carries a doubled separator.
+fn scratchRootPath(): string {
+  let base = envOr("TMPDIR", "/tmp")
+  while (len(base) > 1 && base[len(base) - 1] == u8('/')) {
+    base = base[0:len(base) - 1]
+  }
+  return base + "/bit-lspmoduledir-${timeUnixNs()}"
+}
+
+fn contains(haystack: string, needle: string): bool {
+  let n = len(needle)
+  if (n == 0) {
+    return true
+  }
+  let i = 0
+  while (i + n <= len(haystack)) {
+    if (haystack[i:i + n] == needle) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Escapes `s` for embedding as a JSON string literal's body.
+fn jsonEscape(s: string): string {
+  let out = ""
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == u8('"')) {
+      out = out + "\\\""
+    } else if (c == u8('\\')) {
+      out = out + "\\\\"
+    } else if (c == u8('\n')) {
+      out = out + "\\n"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Runs `bin lsp` with `payload` on stdin, both streams captured under
+// `scratch`. `BIT_STDLIB` is forwarded exactly as _tests_/bit/lspcache.bit
+// does: `osRunBounded` passes none of this process's environment, and every
+// scenario here opens a document that imports real stdlib modules.
+fn runLsp(bin: string, scratch: string, payload: string): (string, bool) {
+  mkdirQuiet(scratch)
+  let inPath = scratch + "/in"
+  let outPath = scratch + "/out"
+  let errPath = scratch + "/err"
+  let shPath = scratch + "/w.sh"
+  writeFile(inPath, payload) catch e {
+    failCase("cannot write input payload: " + e.message())
+    return "", false
+  }
+  let stdlib = env("BIT_STDLIB")
+  let envLines = ""
+  if (stdlib != "") {
+    envLines = "BIT_STDLIB=" + shQuote(stdlib) + "\nexport BIT_STDLIB\n"
+  }
+  let script = "#!/bin/sh\n" +
+    envLines +
+    "exec " +
+    shQuote(bin) +
+    " lsp < " +
+    shQuote(inPath) +
+    " > " +
+    shQuote(outPath) +
+    " 2> " +
+    shQuote(errPath) +
+    "\n"
+  writeFile(shPath, script) catch e {
+    failCase("cannot write wrapper script: " + e.message())
+    return "", false
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    failCase("cannot chmod wrapper script")
+    return "", false
+  }
+  let code = osRunBounded(shPath, timeoutMs())
+  if (code == 0 - 2) {
+    failCase("TIMED OUT after ${timeoutMs()}ms (raise BIT_TEST_TIMEOUT_S)")
+    return "", false
+  }
+  if (code == 0 - 1) {
+    failCase("cannot launch wrapper script (spawn/wait failure)")
+    return "", false
+  }
+  if (code <= 0 - 100) {
+    let errText = readFile(errPath) catch _ {
+      ""
+    }
+    failCase("CRASHED: killed by signal ${0 - code - 100}\n" + errText)
+    return "", false
+  }
+  let out = readFile(outPath) catch _ {
+    ""
+  }
+  return out, true
+}
+
+const initReq = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"," +
+  "\"params\":{\"processId\":null,\"rootUri\":null,\"capabilities\":{}}}"
+const initNotif = "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}"
+
+fn didOpen(uri: string, text: string): string {
+  return "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+    "\"textDocument\":{\"uri\":\"${uri}\",\"languageId\":\"bit\",\"version\":1," +
+    "\"text\":\"" +
+    jsonEscape(text) +
+    "\"}}}"
+}
+
+// The `"diagnostics":[...]` array's raw text for `uri`'s OWN publish
+// notification — not a substring search over the whole transcript, which
+// would find another file's diagnostics just as easily. "" means no
+// publishDiagnostics notification named this URI at all.
+fn diagnosticsFor(out: string, uri: string): string {
+  let marker = "\"uri\":\"${uri}\",\"diagnostics\":["
+  let start = 0
+  while (start + len(marker) <= len(out)) {
+    if (out[start:start + len(marker)] == marker) {
+      let i = start + len(marker)
+      while (i < len(out) && out[i] != u8(']')) {
+        i = i + 1
+      }
+      return out[start + len(marker):i]
+    }
+    start = start + 1
+  }
+  return " NONE"
+}
+
+// #4157 acceptance half 1, synthetic and fast: a directory of THREE
+// independent single-file programs (each its own `fn main`), the same shape
+// as `_tests_/bit/` at 71 — SPEC §17.4 permits at most one `main` per
+// module, so building all three together can never be well-formed. Opening
+// one must publish ZERO diagnostics for it, not the cross-file E0042 pileup
+// the old directory-is-the-module rule produced.
+fn checkIndependentPrograms(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/independent"
+  mkdirQuiet(dir)
+  let names = ["progone.bit", "progtwo.bit", "progthree.bit"]
+  let i = 0
+  while (i < len(names)) {
+    let text = "fn main() {\n  print(\"program ${i}\")\n}\n"
+    writeFile(dir + "/" + names[i], text) catch e {
+      failCase("cannot write ${dir}/${names[i]}: " + e.message())
+      return
+    }
+    i = i + 1
+  }
+  let path = dir + "/" + names[0]
+  let text = "fn main() {\n  print(\"program 0\")\n}\n"
+  let uri = "file://" + path
+  let payload = frame(initReq) + frame(initNotif) + frame(didOpen(uri, text))
+  let (out, ok) = runLsp(bin, dir, payload)
+  if (!ok) {
+    return
+  }
+  let diags = diagnosticsFor(out, uri)
+  if (diags == " NONE") {
+    failCase("independent-programs directory: no publishDiagnostics for the opened file at all\n" + out)
+    return
+  }
+  if (diags != "") {
+    failCase(
+        "independent-programs directory: expected 0 diagnostics for the opened " +
+        "file, got \"[${diags}]\" — the directory's OTHER programs leaked in\n" +
+        out,
+    )
+    return
+  }
+  print("PASS lspmoduledir: opening one of 3 independent-program siblings publishes 0 diagnostics\n")
+}
+
+// #4157's own literal repro: `_tests_/bit/allocslope.bit`, measured on
+// merged main at `bit check _tests_/bit` == 1345 errors (all E0042) against
+// `bit check _tests_/bit/allocslope.bit` alone == 0. `BIT_REPO` is provided
+// by the gate registration (tools/build/gates.bit); read-only, never written.
+fn checkAllocslopePublishesZero(bin: string) {
+  let repo = envOr("BIT_REPO", "")
+  if (repo == "") {
+    failCase("BIT_REPO is unset — cannot locate the real _tests_/bit/ corpus")
+    return
+  }
+  let path = repo + "/_tests_/bit/allocslope.bit"
+  let text = readFile(path) catch e {
+    failCase("cannot read ${path}: " + e.message())
+    return
+  }
+  let uri = "file://" + path
+  let payload = frame(initReq) + frame(initNotif) + frame(didOpen(uri, text))
+  let (out, ok) = runLsp(
+    bin,
+    envOr("TMPDIR", "/tmp") + "/bit-lspmoduledir-allocslope-${timeUnixNs()}",
+    payload,
+  )
+  if (!ok) {
+    return
+  }
+  let diags = diagnosticsFor(out, uri)
+  if (diags == " NONE") {
+    failCase("allocslope.bit: no publishDiagnostics notification at all\n" + out)
+    return
+  }
+  if (diags != "") {
+    failCase(
+        "allocslope.bit: expected 0 diagnostics (against the 1345 measured for " +
+        "the whole _tests_/bit/ directory as one module, #4157), got \"[${diags}]\"\n" +
+        out,
+    )
+    return
+  }
+  print("PASS lspmoduledir: opening _tests_/bit/allocslope.bit publishes 0 diagnostics (was 1345 for the directory)\n")
+}
+
+// #4157 acceptance half 2: a directory of TWO files sharing one scope — a
+// real SPEC §17.1 module, at most one `main` — must still build as one
+// module and still surface a genuine error in a file OTHER than the one
+// that's open. Run once with `helper.bit` broken, once with it fixed, so
+// the same scenario proves both "reported" and "cleared".
+fn checkCoherentModuleStillReportsSiblingDiagnostics(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/coherent"
+  mkdirQuiet(dir)
+  let mainPath = dir + "/mainuse.bit"
+  let mainText = "fn main() {\n  helper()\n}\n"
+  writeFile(mainPath, mainText) catch e {
+    failCase("cannot write ${mainPath}: " + e.message())
+    return
+  }
+  let uri = "file://" + mainPath
+  let payload = frame(initReq) + frame(initNotif) + frame(didOpen(uri, mainText))
+
+  let helperPath = dir + "/helper.bit"
+  let broken = "fn helper(): int {\n  return undefinedThing\n}\n"
+  writeFile(helperPath, broken) catch e {
+    failCase("cannot write ${helperPath}: " + e.message())
+    return
+  }
+  let (outBroken, okBroken) = runLsp(bin, dir + "/run1", payload)
+  if (!okBroken) {
+    return
+  }
+  let helperUri = "file://" + helperPath
+  let brokenDiags = diagnosticsFor(outBroken, helperUri)
+  if (brokenDiags == " NONE" || !contains(brokenDiags, "undefined name 'undefinedThing'")) {
+    failCase(
+        "coherent module: mainuse.bit is open, helper.bit is not, but helper.bit's " +
+        "real error ('undefined name') was not published — the directory stopped " +
+        "resolving as one module\n" +
+        outBroken,
+    )
+    return
+  }
+  print("PASS lspmoduledir: a real 2-file module still reports a genuine error in an unopened sibling\n")
+
+  let fixed = "fn helper(): int {\n  return 1\n}\n"
+  writeFile(helperPath, fixed) catch e {
+    failCase("cannot rewrite ${helperPath}: " + e.message())
+    return
+  }
+  let (outFixed, okFixed) = runLsp(bin, dir + "/run2", payload)
+  if (!okFixed) {
+    return
+  }
+  let fixedDiags = diagnosticsFor(outFixed, helperUri)
+  if (fixedDiags != "" && fixedDiags != " NONE") {
+    failCase(
+        "coherent module: helper.bit was fixed but still reports diagnostics: [${fixedDiags}]\n" +
+        outFixed,
+    )
+    return
+  }
+  print("PASS lspmoduledir: fixing the sibling clears its diagnostics\n")
+}
+
+fn main() {
+  let bin = envOr("BIT", "bit-out/bin/bit")
+  if (!exists(bin)) {
+    failCase("BIT='${bin}' does not exist — refusing to guess")
+    return
+  }
+  if (env("BIT_STDLIB") == "") {
+    failCase("BIT_STDLIB is unset — allocslope.bit needs the real stdlib source")
+    return
+  }
+  let scratchRoot = scratchRootPath()
+  mkdirQuiet(scratchRoot)
+
+  checkIndependentPrograms(bin, scratchRoot)
+  checkAllocslopePublishesZero(bin)
+  checkCoherentModuleStillReportsSiblingDiagnostics(bin, scratchRoot)
+
+  print("lspmoduledir: all scenarios passed\n")
+}
