@@ -1,0 +1,154 @@
+// Multi-worker deadlock detection (#4134), the pool-path sibling of
+// `./worker.bit`'s `schedCheckDeadlock`. Read that function's header first —
+// this file is what it hands off to "above one worker".
+
+// ---------------------------------------------------------------------------
+// THE THIRD INPUT: is any OTHER worker mid-task right now?
+// ---------------------------------------------------------------------------
+//
+// `wkRunning` (`./worker.bit`) already names this — set to the task address
+// before `schedSwitch` hands control over, cleared to 0 after it returns
+// (`./workerrun.bit`'s `schedWorkerStep`). Both accesses are now
+// `atomicStore`/`atomicLoad` rather than the plain access this file's sibling
+// used before #4134: SPEC §11.5 makes every Bit atomic sequentially
+// consistent, the strongest ordering there is, so a peer's store is visible
+// to this worker's load with no separate fence needed.
+//
+// This is the read, over every worker index `schedFindWork` could ever hand a
+// task to. Finding even one worker mid-task is enough to stay silent — that
+// worker might still spawn, send or requeue before it goes idle — matching
+// the "stay silent unless certain" rule `schedCheckDeadlock`'s header states.
+@nosplit fn schedAnyWorkerRunning(s: *i64, n: int): bool {
+  let i = 0
+  while (i < n) {
+    if (atomicLoad(schedWorkerAt(s, i) + wkRunning) != 0) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Is anything queued ANYWHERE a worker could still take it from — the same
+// question `schedFindWork` (`./worker.bit`) answers destructively, asked here
+// without consuming anything, so a caller that is not yet certain never
+// steals the very evidence it would need to explain why it declined. Global
+// queue first (same order `schedFindWork` itself probes in), then every
+// worker's own ring and next-run slot: `dqNonEmpty`/`rnNonEmpty` are
+// `./queue.bit`'s existing non-destructive probes, already proven by
+// `schedWorkPending` (`./worker.bit`) for the idle spin — this is that same
+// probe widened to every worker rather than just the caller's own.
+@nosplit fn schedAnyWorkPending(s: *i64, n: int): bool {
+  if (gqNonEmpty(s + scGlobal)) {
+    return true
+  }
+  let i = 0
+  while (i < n) {
+    let w = schedWorkerAt(s, i)
+    if (dqNonEmpty(w + wkDeque)) {
+      return true
+    }
+    if (rnNonEmpty(w)) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// The four checks #2530 already made for the solo path — `scStopping`,
+// `schedTimerCount`, `schedPollPendingCount`, `schedTimerChanCount`, and
+// `schedRegCount(s) == 0` — read fresh, shared verbatim by the solo path
+// (`./worker.bit`'s `schedCheckDeadlock`) and the pool path below, so the two
+// can never drift apart on what "busy" means.
+@nosplit fn schedDeadlockBusy(s: *i64): bool {
+  if (atomicLoad(s + scStopping) != 0) {
+    return true
+  }
+  if (schedTimerCount(s) != 0) {
+    return true
+  }
+  if (schedPollPendingCount() != 0) {
+    return true
+  }
+  if (schedTimerChanCount() != 0) {  // pending channel timer, #2665
+    return true
+  }
+  return schedRegCount(s) == 0
+}
+
+// ---------------------------------------------------------------------------
+// THE RACE THE THREE CHECKS ABOVE DO NOT CLOSE, AND WHY A CLOCK CLOSES IT
+// ---------------------------------------------------------------------------
+//
+// `schedTimerExpire` (`./timer.bit`) removes a due timer from the sleeping
+// list and only THEN calls `schedUnpark` to place its task on a queue — two
+// steps, no lock held across both. A worker's own idle-turn bookkeeping (not
+// a dispatched task, so invisible to `schedAnyWorkerRunning`) can therefore
+// leave a WINDOW: `schedTimerCount` already down, but the task not yet
+// visible to `schedAnyWorkPending`. Rewriting that pair to hold one lock
+// across both steps would touch the timer subsystem's own hot,
+// already-tuned locking (`./timer.bit`'s own header) for a window that is a
+// handful of instructions wide — out of scope here, and unnecessary: the
+// gap is a THING IN FLIGHT, not a stable state, so it cannot outlast the
+// scheduler actually making progress.
+//
+// So instead of trusting one instant, this requires the SAME verdict —
+// nothing running, nothing pending, nothing armed — to hold continuously for
+// `deadlockConfirmNs` of real wall-clock time, re-derived from scratch on
+// every call rather than cached or extrapolated. The window is 10x
+// `idleParkMaxNs` (`./sleep.bit`, the longest a parked worker sleeps
+// unprompted) — generous margin against real OS scheduling jitter, since
+// this repo's own gates routinely run at load 60-80 (CLAUDE.md's fleet
+// notes) where a preempted thread's resume can itself take milliseconds. A
+// genuine in-flight requeue finishes in microseconds regardless of load —
+// orders of magnitude below this window — so the very next call after it
+// lands sees the task in a queue, `schedAnyWorkPending` returns `true`, and
+// the window resets to zero. Only a state that is ACTUALLY permanent — no
+// in-flight work left to ever land — can survive the whole window, which is
+// what a deadlock is by definition. The cost is paid once, is bounded, and
+// is invisible next to the alternative it replaces (a 90-minute suite
+// timeout with no message at all).
+const deadlockConfirmNs: int = 1000000000  // 1s = 10x idleParkMaxNs
+
+// One process-global cell: monoNs() when the pool FIRST looked entirely
+// quiescent, 0 while it does not. `./worker.bit`'s header already argues
+// there is exactly one live scheduler `schedCheckDeadlock` is ever reached
+// from — `runtime/root`'s boot — so one cell is correct, not merely
+// convenient: a stress harness embedding a second, private scheduler never
+// reaches this path at all.
+let scQuietSinceNs: [1]i64
+
+@nosplit fn quietSinceAddr(): *i64 {
+  return ptrOf(scQuietSinceNs)
+}
+
+// The pool path: `schedCheckDeadlock` (`./worker.bit`) hands off here for
+// every `nworkers != 1`. Same panic, same message, same `schedDeadlockBusy`
+// gate as the solo path — the two additions are the running/pending checks
+// above and the confirmation window that makes them sound against the timer
+// race.
+fn schedCheckDeadlockPool(s: *i64, n: int) {
+  if (schedDeadlockBusy(s)) {
+    atomicStore(quietSinceAddr(), 0)
+    return
+  }
+  if (schedAnyWorkerRunning(s, n)) {
+    atomicStore(quietSinceAddr(), 0)
+    return
+  }
+  if (schedAnyWorkPending(s, n)) {
+    atomicStore(quietSinceAddr(), 0)
+    return
+  }
+  let now = monoNs()
+  let since = atomicLoad(quietSinceAddr())
+  if (since == 0) {
+    atomicStore(quietSinceAddr(), now)
+    return
+  }
+  if (now - since < deadlockConfirmNs) {
+    return
+  }
+  panicDeadlock()
+}

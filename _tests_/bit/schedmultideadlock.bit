@@ -1,0 +1,178 @@
+// #4134. Regression gate for `runtime/sched/deadlockpool.bit`'s
+// `schedCheckDeadlockPool`. `schedCheckDeadlock` (`runtime/sched/worker.bit`)
+// used to stand down unconditionally above `BIT_WORKERS=1`, so a program
+// that could never make progress hung silently forever instead of panicking
+// — and `test-pmvanity` (BIT_WORKERS=2), `test-pollguardstopword` and
+// `test-pollguardpreempt` (BIT_WORKERS=4) are exactly the mandatory-suite
+// gates that run above one worker.
+//
+// EVERY CHECK HERE RUNS AS A BOUNDED CHILD PROCESS, NOT IN-PROCESS.
+// `BIT_WORKERS` is read once at boot (`runtime/root/rootconfig.bit`), so
+// exercising three worker counts needs three separate processes — and this
+// harness has to survive the very defect it is proving fixed, which an
+// in-process spawn cannot: if the detector regressed, an in-process hang
+// would hang the gate itself with no diagnostic, exactly the failure #4134
+// describes. `./childrun`'s `runBounded` gives every child a wall-clock
+// deadline and captures its output to a log this harness reads back.
+//
+// THREE CHILD PROGRAMS, embedded as source so this file has no fixture to
+// keep in sync with it. Each marker string is written out literally in BOTH
+// the check below and the embedded source (never interpolated from one into
+// the other): the source strings already use `${...}` for the CHILD's own
+// interpolation, and mixing that with the harness's own `${...}` on the same
+// text would ask the harness to resolve a name (`r`, `total`) that only
+// exists in the child it is generating.
+//
+//   deadlockSrc — receives from a `nil` channel: no task can ever run
+//     again. Must exit 2 with "all tasks are asleep - deadlock!" at
+//     BIT_WORKERS 1, 2 and 4 (1 already worked before #4134; 2 and 4 are
+//     the regression this gate exists for).
+//   idleSrc — spawns a sibling that sleeps briefly, then sends on a channel
+//     `main` receives from. A live timer registration (`schedTimerCount`)
+//     spans the ENTIRE wait, so `schedDeadlockBusy`
+//     (`runtime/sched/deadlockpool.bit`) never even reaches the
+//     running/pending checks — the "waiting on a channel a sibling will
+//     feed after a delay" false-positive control the ticket requires. Must
+//     exit 0 at BIT_WORKERS=4.
+//   busySrc — four spawned tasks each spin a bounded loop, then report over
+//     a channel `main` joins on. The "control program that merely runs
+//     slowly across 4 workers" the acceptance names literally. Must exit 0
+//     at BIT_WORKERS=4.
+
+import { exists, readFile, writeFile } from "std/fs"
+import { envOr, exit, run } from "std/os"
+import { contains } from "std/strings"
+import { now } from "std/time"
+import {
+  reportChild, runBounded, scriptPath, timeoutSeconds,
+} from "./childrun"
+
+const tag: string = "schedmultideadlock"
+
+const deadlockMarker: string = "schedmultideadlock: deadlock-src marker"
+const deadlockSrc: string = "fn main() {\n" +
+  "  print(\"schedmultideadlock: deadlock-src marker\\n\")\n" +
+  "  let c: chan<int> = nil\n" +
+  "  let _ = <-c\n" +
+  "}\n"
+
+const idleMarker: string = "schedmultideadlock: idle-src got"
+const idleSrc: string = "import { sleep, Millisecond } from \"std/time\"\n" +
+  "fn worker(c: chan<int>) {\n" +
+  "  sleep(300 * Millisecond)\n" +
+  "  c <- 7\n" +
+  "}\n" +
+  "fn main() {\n" +
+  "  let c: chan<int> = chan<int>(1)\n" +
+  "  spawn worker(c)\n" +
+  "  let r = <-c\n" +
+  "  print(\"schedmultideadlock: idle-src got \${r}\\n\")\n" +
+  "}\n"
+
+const busyMarker: string = "schedmultideadlock: busy-src total"
+const busySrc: string = "fn burn(c: chan<int>) {\n" +
+  "  let sum = 0\n" +
+  "  let i = 0\n" +
+  "  while (i < 20000000) {\n" +
+  "    sum = sum + i\n" +
+  "    i = i + 1\n" +
+  "  }\n" +
+  "  c <- sum\n" +
+  "}\n" +
+  "fn main() {\n" +
+  "  let c: chan<int> = chan<int>(4)\n" +
+  "  spawn burn(c)\n" +
+  "  spawn burn(c)\n" +
+  "  spawn burn(c)\n" +
+  "  spawn burn(c)\n" +
+  "  let total = 0\n" +
+  "  let n = 0\n" +
+  "  while (n < 4) {\n" +
+  "    total = total + <-c\n" +
+  "    n = n + 1\n" +
+  "  }\n" +
+  "  print(\"schedmultideadlock: busy-src total \${total}\\n\")\n" +
+  "}\n"
+
+fn gateFail(msg: string) {
+  eprint("${tag}: FAIL — ${msg}\n")
+  exit(1)
+}
+
+// Compile `src` (written to `srcPath`) into an executable at `binPath` with
+// the compiler under test. Any nonzero exit means the source itself is
+// broken, not the scheduler this gate is actually checking, so it fails
+// loudly and separately from a `runOne` mismatch.
+fn buildOrFail(bin: string, srcPath: string, src: string, binPath: string) {
+  writeFile(srcPath, src) catch e {
+    gateFail("cannot write ${srcPath}: ${e.message()}")
+    return
+  }
+  let rc = run(bin, ["build", srcPath, "-o", binPath])
+  if (rc != 0) {
+    gateFail("compiling ${srcPath} exited ${rc}")
+  }
+}
+
+// Runs `binPath` as a bounded child at `BIT_WORKERS=workers`, and fails
+// unless it exits `wantRc` with `wantSubstr` somewhere in its combined
+// output. `reportChild` names a timeout/signal/spawn-failure distinctly from
+// an ordinary wrong exit code, so a real regression here reads as what it
+// is rather than as a generic mismatch.
+fn runOne(script: string, log: string, binPath: string, workers: int, wantRc: int, wantSubstr: string, timeoutMs: int) {
+  let cmd = "BIT_WORKERS=${workers} '${binPath}'"
+  let r = runBounded(tag, script, log, cmd, timeoutMs)
+  let text = readFile(log) catch _ {
+    ""
+  }
+  if (r != wantRc || !contains(text, wantSubstr)) {
+    eprint("${tag}: FAIL — BIT_WORKERS=${workers} ${binPath}: want rc=${wantRc} containing '${wantSubstr}'\n")
+    reportChild(tag, "BIT_WORKERS=${workers} ${binPath}", r, log)
+    exit(1)
+    return
+  }
+  fsRemove(log)
+}
+
+fn main() {
+  let bin = envOr("BIT", "bit-out/bin/bit")
+  if (!exists(bin)) {
+    eprint("${tag}: compiler not found: ${bin} (set BIT)\n")
+    exit(1)
+    return
+  }
+  let nonce = now().ns
+  let deadlockSrcPath = "/tmp/bit-${tag}-${nonce}-deadlock.bit"
+  let deadlockBin = "/tmp/bit-${tag}-${nonce}-deadlock"
+  let idleSrcPath = "/tmp/bit-${tag}-${nonce}-idle.bit"
+  let idleBin = "/tmp/bit-${tag}-${nonce}-idle"
+  let busySrcPath = "/tmp/bit-${tag}-${nonce}-busy.bit"
+  let busyBin = "/tmp/bit-${tag}-${nonce}-busy"
+  let script = scriptPath(tag)
+  let log = "/tmp/bit-${tag}-${nonce}.log"
+  let timeoutMs = timeoutSeconds(tag) * 1000
+
+  buildOrFail(bin, deadlockSrcPath, deadlockSrc, deadlockBin)
+  buildOrFail(bin, idleSrcPath, idleSrc, idleBin)
+  buildOrFail(bin, busySrcPath, busySrc, busyBin)
+
+  // THE REGRESSION: above one worker, this used to hang forever (rc=142
+  // under an external alarm) instead of panicking.
+  runOne(script, log, deadlockBin, 1, 2, deadlockMarker, timeoutMs)
+  runOne(script, log, deadlockBin, 2, 2, deadlockMarker, timeoutMs)
+  runOne(script, log, deadlockBin, 4, 2, deadlockMarker, timeoutMs)
+
+  // THE FALSE-POSITIVE CONTROLS: neither may be mistaken for a deadlock.
+  runOne(script, log, idleBin, 4, 0, idleMarker, timeoutMs)
+  runOne(script, log, busyBin, 4, 0, busyMarker, timeoutMs)
+
+  fsRemove(script)
+  fsRemove(deadlockSrcPath)
+  fsRemove(deadlockBin)
+  fsRemove(idleSrcPath)
+  fsRemove(idleBin)
+  fsRemove(busySrcPath)
+  fsRemove(busyBin)
+
+  print("${tag}: PASS — deadlock panics at BIT_WORKERS 1/2/4, both false-positive controls exit 0\n")
+}
