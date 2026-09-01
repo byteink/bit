@@ -3954,22 +3954,21 @@ test "concat" {
   contain spaces, punctuation, anything a string literal can hold.
 - `test "..." { }` outside a `.test.bit` file is E0115: "'test' declarations
   are only allowed in a '.test.bit' file", reported on the declaration's head.
-- **The legacy form — a plain top-level function, no parameters, no return,
-  discovered by file and shape alone with no `test` keyword — is still
-  supported, but is DEPRECATED in favor of the declaration form above.** A
-  file may mix both forms freely; each is discovered independently and both
-  run under the identical isolation and dispatch rules below. The legacy
-  form exists only because this repository's own `.test.bit` corpus had not
-  yet migrated to it when discovery for the declaration form shipped; new
-  tests should use `test "name" { }`, and the legacy form is expected to be
-  removed once that migration completes. A differently-shaped legacy
+- **`test "name" { }` is the ONLY discovery shape.** A bare top-level
+  function — no parameters, no return type — inside a `.test.bit` file is
+  E0117: "a bare 'fn' with no parameters and no return type is not allowed
+  in a '.test.bit' file", reported on the declaration's head, with a hint to
+  write a `test "..." { }` declaration instead. A differently-shaped
   function (one that takes a parameter, or returns a value) is an ordinary
-  helper, not an error — it is excluded by its shape, never by a naming
-  rule. `main` is the one legacy name excluded regardless of shape: `bit
-  test` renames whatever `main` it finds before synthesizing its own entry
-  point (§17.4), so a user's `fn main(){}` is never itself a discovered
-  test. A `test` declaration can never collide with `main` — its own name
-  is a string, never a symbol.
+  helper, not an error — it is excluded by its shape, exactly as before.
+  `main` is excluded from E0117 regardless of shape: `bit test` renames
+  whatever `main` it finds before synthesizing its own entry point (§17.4),
+  so a user's `fn main(){}` in a `.test.bit` file is an ordinary function,
+  never flagged. A `test` declaration can never collide with `main` — its
+  own name is a string, never a symbol. (A shape-based legacy form —
+  discovered with no `test` keyword at all — existed here from #3786 until
+  #4148 removed it; this file no longer describes that form because it no
+  longer exists.)
 - Tests live in one of two places: beside the file they test, as
   `<name>.test.bit`, or grouped under a `_tests_/` subdirectory for
   black-box tests that exercise only a module's exported surface. A
