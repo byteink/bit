@@ -156,7 +156,7 @@ export @nosplit @symbol("bit_rt_port_sched_worker_at") fn schedWorkerAt(s: *i64,
   let w = schedWorkerAt(s, i)
   *(w + wkId) = i
   atomicStore(lockOf(w, wkPark), 0)
-  *(w + wkRunning) = 0
+  atomicStore(w + wkRunning, 0)
   *(w + wkDisposition) = taskRunning
   *(w + wkSched) = int(s)
   // The next-run slot starts empty (#3264). Explicit rather than relying on a
@@ -638,9 +638,12 @@ export @symbol("bit_rt_port_sched_find_work_at") fn schedFindWorkAt(w: *i64, now
 // count, which `threadMaxWorkers` caps at 1024). Own slot excluded because
 // `schedFindWork` has already emptied it on the path that reaches here.
 //
-// Cannot disturb `schedCheckDeadlock` below it: that check acts only at
-// `nworkers == 1`, where this loop's only candidate index is the caller's own
-// and it therefore returns 0 without touching a word.
+// Cannot disturb `schedCheckDeadlock` below it: at `nworkers == 1` this
+// loop's only candidate index is the caller's own and it returns 0 without
+// touching a word; above one worker, `schedCheckDeadlockPool`
+// (`./deadlockpool.bit`) re-checks every peer's run-next slot itself, so a
+// steal here — which only succeeds by taking real work away — can never be
+// mistaken for a slot this loop silently missed.
 @nosplit fn schedStealRunNext(w: *i64, s: *i64): int {
   let n = atomicLoad(s + scNWorkers)
   let me = *(w + wkId)
@@ -658,7 +661,7 @@ export @symbol("bit_rt_port_sched_find_work_at") fn schedFindWorkAt(w: *i64, now
 }
 
 // ---------------------------------------------------------------------------
-// Deadlock detection (#2530)
+// Deadlock detection (#2530, multi-worker #4134)
 // ---------------------------------------------------------------------------
 //
 // Go panics `fatal error: all goroutines are asleep - deadlock!` when no
@@ -685,19 +688,11 @@ export @symbol("bit_rt_port_sched_find_work_at") fn schedFindWorkAt(w: *i64, now
 //     idle turn ever evaluates this, so a thread mid-syscall is simply never
 //     the one asking.
 //   - ANOTHER OS WORKER THREAD still holding a runnable or running task —
-//     NOT SEEN in general, and this is why the check below refuses to run at
-//     all above one worker: nothing in this module's state says "a task is
-//     mid-execution on worker N" in a form a DIFFERENT idling worker can read
-//     safely (`wkRunning` is written without a memory fence, being touched
-//     only by the same thread today). With exactly one worker this case
-//     cannot arise — this very call is the only worker there is, so its
-//     reaching an idle turn already proves nothing else in the process is
-//     running. `BIT_WORKERS>1` gets no detection at all rather than a guess.
-//
-// SOUND FOR `nworkers == 1` — THIS RUNTIME'S DEFAULT — AND ONLY THAT.
-// A false positive here kills a working program, which the ticket (#2530)
-// weighs as strictly worse than the bug it fixes, so this stays off rather
-// than approximate the multi-worker case.
+//     above one worker this is now SEEN, in `./deadlockpool.bit`, which is
+//     why `wkRunning` is an `atomicStore`/`atomicLoad` pair rather than the
+//     plain access this file used before #4134. Read that file's header for
+//     the one race atomics alone do not close and why a bounded confirmation
+//     window, not a memory fence, is what closes it.
 //
 // THE FOURTH INPUT, AND WHY IT IS NOT OPTIONAL: `schedRegCount(s) > 0`. main's
 // own `schedTaskExit` (`../sched/task.bit`) now sets `scStopping` SYNCHRONOUSLY
@@ -715,23 +710,20 @@ export @symbol("bit_rt_port_sched_find_work_at") fn schedFindWorkAt(w: *i64, now
 // wants to distinguish this from an ordinary crash can only do so from the
 // message on stderr, exactly as a Go program does from `recover`'s absence
 // facing its own fatal errors.
+//
+// SPLIT AT `nworkers == 1`. The solo path below is #2530's original four
+// checks, unchanged in order or behaviour — still sound for exactly the
+// reason its own comment gave: this call is the only worker there is,
+// so reaching an idle turn already proves nothing else in the process is
+// running. Above one worker, `schedCheckDeadlockPool` (`./deadlockpool.bit`)
+// takes over with the extra machinery the header above describes.
 fn schedCheckDeadlock(s: *i64) {
-  if (atomicLoad(s + scNWorkers) != 1) {
+  let n = atomicLoad(s + scNWorkers)
+  if (n != 1) {
+    schedCheckDeadlockPool(s, n)
     return
   }
-  if (atomicLoad(s + scStopping) != 0) {
-    return
-  }
-  if (schedTimerCount(s) != 0) {
-    return
-  }
-  if (schedPollPendingCount() != 0) {
-    return
-  }
-  if (schedTimerChanCount() != 0) {  // pending channel timer, #2665
-    return
-  }
-  if (schedRegCount(s) == 0) {
+  if (schedDeadlockBusy(s)) {
     return
   }
   panicDeadlock()
