@@ -610,6 +610,10 @@ guaranteed 8-aligned, only the entry boundaries are):
 ```
 per function (repeated to the end of the extent):
   u64 code_addr        # abs reloc -> the function's code symbol
+  u16 version           # format-version stamp (#3189); must equal
+                         # smFormatVersion (1) in both compiler/codegen.bit
+                         # and runtime/gc/stackmap.bit, checked before any
+                         # count-driven field below is trusted
   u32 code_size        # bytes; the function spans [code_addr, code_addr+code_size)
   u16 num_saved
   per saved (num_saved times):
@@ -651,29 +655,31 @@ guard against this *class* of skew — any future change to this wire format
 that a stage0 repin has not yet caught up to — not a promise that today's
 exact field layout is what a mismatch would ever reproduce again.
 
-**#3189 (designed, not yet shipped): a per-entry format-version stamp.** The
-padding checker above is a build-time guard for one specific historical skew;
-it does not generalize to the *next* layout change, and #1927 reached
-production as a silent bus error before any guard existed for it at all. The
-designed fix is a `u16` version field placed right after `code_addr` (so the
-field the object writer's relocation logic depends on — `code_addr` sitting
-at each entry's offset 0 — is untouched, and neither `emitmacho.bit` nor
-`emitelf.bit` needs to change), checked by the reader before any
-count-driven field (`num_saved`, `num_safepoints`, ...) is trusted. A
-mismatch panics by name with both versions, using the same idiom as
-`panicStackMapBounds` above rather than a fixed literal message, since the
-two numbers are runtime values read off the blob. `runtime/gc/stackmap.bit`
-carries the reader half (`smFormatVersion`, `panicStackMapVersion`,
-`appendDecimal`) as of this note, proven against a synthetic blob through a
-temporary C-driver hook (#1839's technique) in both directions — match walks
-normally, mismatch refuses with `"gc: stack-map format version mismatch:
-expected <E>, found <F>"` — but is **not yet wired into `scanFrame`'s live
-parse**, because the writer half (`compiler/codegen.bit`'s `writeStackMaps`
-emitting the same stamp) has to land in the same change: this format's
-correctness already depends on the writer and reader agreeing (the paragraph
-above), so widening the reader's expected entry-header size without the
-writer emitting the new field would desync every entry of every program, not
-just a mismatched one. See #3189 for the exact writer diff.
+**#3189: a per-entry format-version stamp, shipped.** The padding checker
+above is a build-time guard for one specific historical skew; it does not
+generalize to the *next* layout change, and #1927 reached production as a
+silent bus error before any guard existed for it at all. The fix is the
+`u16 version` field in the format block above, placed right after
+`code_addr` (so the field the object writer's relocation logic depends on —
+`code_addr` sitting at each entry's offset 0 — is untouched, and neither
+`emitmacho.bit` nor `emitelf.bit` needed to change), checked by the reader
+before any count-driven field (`num_saved`, `num_safepoints`, ...) is
+trusted. A mismatch panics by name with both versions, using the same idiom
+as `panicStackMapBounds` above rather than a fixed literal message, since the
+two numbers are runtime values read off the blob. `compiler/codegen.bit`'s
+`writeStackMaps` stamps `smFormatVersion` (currently 1) into every entry it
+writes, and `runtime/gc/stackmap.bit` carries the matching reader half
+(`smFormatVersion`, `panicStackMapVersion`, `appendDecimal`), wired into
+`scanFrame`'s live parse: the fixed-header bounds check widened 14 -> 16
+bytes to cover the new field, and the version is read and compared before
+`num_saved` or any other count-driven field is trusted. Proven against a
+synthetic blob through a temporary C-driver hook (#1839's technique) in both
+directions — match walks normally, mismatch refuses with `"gc: stack-map
+format version mismatch: expected <E>, found <F>"`. Because the writer and
+reader landed in the same change, a default single-pass build's merged table
+only ever carries one version; the mismatch path fires only across a stage0
+repin boundary (see the paragraph above) — the loud failure this stamp
+exists to produce instead of #1927's silent bus error.
 
 The walk, per frame: find the function whose code range contains `pc`; at the
 matching `ret_offset`, `markRoot` each `slot_fp_off` slot and each live register
@@ -849,16 +855,17 @@ function's range can never fail to match some row — "no row covers this
 offset" is not a state the walker has to handle.
 
 **`format_version`, shipped from the first line, not retrofitted.** #3189
-designed (but has not yet shipped) a version stamp for `.bit_gc` after #1927
-reached production as a silent bus error with no guard at all — producer and
-reader are different build stages (`libbitrt`'s own entries come from the
-pinned stage0; every other entry in the same link comes from whatever
-compiler built it), and this table has the identical exposure. Rather than
-repeat that retrofit, the walker reads and compares `format_version` *before*
-trusting `code_size`, `num_rows`, or any row — placed immediately after
-`code_addr`, the same position #3189 chose, so the one field the relocation
-logic depends on sitting at offset 0 is undisturbed. A mismatch does **not**
-call `bit_rt_panic` (below): it is treated exactly like "no record."
+added a version stamp for `.bit_gc` (§4) after #1927 reached production as a
+silent bus error with no guard at all — producer and reader are different
+build stages (`libbitrt`'s own entries come from the pinned stage0; every
+other entry in the same link comes from whatever compiler built it), and
+this table has the identical exposure. Rather than repeat that retrofit
+later, this table's `format_version` is present from its first line: the
+walker reads and compares it *before* trusting `code_size`, `num_rows`, or
+any row — placed immediately after `code_addr`, the same position #3189
+chose, so the one field the relocation logic depends on sitting at offset 0
+is undisturbed. A mismatch does **not** call `bit_rt_panic` (below): it is
+treated exactly like "no record."
 
 **`format_version` bumped 1 -> 2 by #3662**, the change that added
 `name_hdr_ptr` — a reader built against version 1's 16-byte header must not
