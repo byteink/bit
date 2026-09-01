@@ -150,6 +150,18 @@ fn testVerdictPassed(name: string, code: int): bool {
 // collides with the freshly synthesized dispatcher's own `main` symbol,
 // which would make a discovered "main" call itself.
 fn isTestFunc(f: IrFunc, voidId: int): bool {
+  // #4128: a `test "..." { }` declaration lowers to this shape BY
+  // CONSTRUCTION (lowerTestDeclNamed, below) — no params, void, never
+  // fallible, never named "main" — so none of the shape/name checks below
+  // apply to it. Its internal symbol always carries a `$` (lowerTestDecls'
+  // `test$<n>`, never a spelling a user's own source could produce), which
+  // would make `nameHasDollar` wrongly exclude it; `inRootModule` alone is
+  // the right filter here, the same "root module only" rule SPEC §19 already
+  // applies to a legacy test, just read off the flag lowering already sets
+  // instead of inferred from name shape.
+  if (f.isTestDecl) {
+    return f.inRootModule
+  }
   if (f.name == "main") {
     return false
   }
@@ -162,32 +174,63 @@ fn isTestFunc(f: IrFunc, voidId: int): bool {
   return len(f.paramTypes) == 0 && f.result == voidId && !f.isFallible
 }
 
-// Test discovery's answer to `--run`: every top-level test found
-// (`discovered`, dispatch order, unchanged from before #2834) and the subset
-// the `--run` substring narrowed to (`names` — what the synthetic `main`'s
-// BIT_TEST_INDEX dispatch actually runs). They are the same slice when
-// `runPattern` is "" (not given). `testrun.bit`'s `runModuleTests` reads both
-// so a filtered run can report what it discovered separately from what it
-// ran, rather than folding to one count.
+// `td.names`' display text for `f` — the STRING a `test "..." { }`
+// declaration's author wrote (`f.testDisplayName`), or a legacy test's own
+// call symbol, which already IS its display name (SPEC §19 pre-#4128).
+fn testDisplayNameOf(f: IrFunc): string {
+  if (f.isTestDecl) {
+    return f.testDisplayName
+  }
+  return f.name
+}
+
+// Test discovery's answer to `--run`: every top-level test found, as its
+// DISPLAY text (`discovered`, dispatch order, unchanged from before #2834)
+// and the subset the `--run` substring narrowed to (`names` — what `bit
+// test` prints and what a failure is reported against). They are the same
+// slice when `runPattern` is "" (not given). `symbols` is `names`' call-
+// target counterpart, 1:1 and same order: the internal link name the
+// synthetic `main`'s BIT_TEST_INDEX dispatch actually calls
+// (`buildDispatch`). For a legacy shape-discovered test the two are
+// identical; for a `test "name" { }` declaration (#4128) they diverge — see
+// `testDisplayNameOf` above. `testrun.bit`'s `runModuleTests` reads
+// `discovered`'s LENGTH and `names` (for printing/filtering-agreement) so a
+// filtered run can report what it discovered separately from what it ran,
+// rather than folding to one count; it never reads `symbols` directly, since
+// running a test is by INDEX (BIT_TEST_INDEX), not by name.
 class TestDiscovery {
   discovered: []string,
   names: []string,
+  symbols: []string,
 }
 
-// Keeps only the names that CONTAIN `pattern` as a literal substring — plain
-// string search, no glob, no regex (std/regex does not exist yet). An empty
-// `pattern` returns `names` unchanged: the entire `--run`-not-given case.
-fn filterTestNames(names: []string, pattern: string): []string {
+// `filterTestPairs`' return shape: `names[i]`/`symbols[i]` are one test.
+class TestNamePairs {
+  names: []string,
+  symbols: []string,
+}
+
+// Pairs `names` (display) with `symbols` (call targets) index-for-index and
+// keeps only the pairs whose DISPLAY name CONTAINS `pattern` as a literal
+// substring — `--run` matches what `bit test` prints, never a `test "..." {
+// }` declaration's internal `test$<n>` symbol (#4128). Plain string search,
+// no glob, no regex (std/regex does not exist yet). An empty `pattern`
+// returns both slices unchanged: the entire `--run`-not-given case.
+fn filterTestPairs(names: []string, symbols: []string, pattern: string): TestNamePairs {
   if (len(pattern) == 0) {
-    return names
+    return TestNamePairs{ names: names, symbols: symbols }
   }
-  let out = []string(0)
-  for n of names {
-    if (contains(n, pattern)) {
-      out = append(out, n)
+  let outNames = []string(0)
+  let outSymbols = []string(0)
+  let i = 0
+  while (i < len(names)) {
+    if (contains(names[i], pattern)) {
+      outNames = append(outNames, names[i])
+      outSymbols = append(outSymbols, symbols[i])
     }
+    i = i + 1
   }
-  return out
+  return TestNamePairs{ names: outNames, symbols: outSymbols }
 }
 
 // Discovers the root module's tests, narrows them by the `--run` substring,
@@ -204,16 +247,18 @@ fn filterTestNames(names: []string, pattern: string): []string {
 fn injectTestMain(module: IrModule, runPattern: string): TestDiscovery {
   let voidId = module.ctx.voidId
   let discovered = []string(0)
+  let discSymbols = []string(0)
   let i = 0
   while (i < len(module.funcs)) {
     if (isTestFunc(module.funcs[i], voidId)) {
-      discovered = append(discovered, module.funcs[i].name)
+      discovered = append(discovered, testDisplayNameOf(module.funcs[i]))
+      discSymbols = append(discSymbols, module.funcs[i].name)
     }
     i = i + 1
   }
-  let names = filterTestNames(discovered, runPattern)
-  if (len(runPattern) > 0 && len(names) == 0) {
-    return TestDiscovery{ discovered: discovered, names: names }
+  let filtered = filterTestPairs(discovered, discSymbols, runPattern)
+  if (len(runPattern) > 0 && len(filtered.names) == 0) {
+    return TestDiscovery{ discovered: discovered, names: filtered.names, symbols: filtered.symbols }
   }
   // A test module's own `main`, if any, is not the entry: rename it so the
   // synthetic one below is the only `main` symbol. It stays an unreferenced
@@ -229,7 +274,10 @@ fn injectTestMain(module: IrModule, runPattern: string): TestDiscovery {
       // Only the NAME changes; every other field must survive verbatim. An
       // omitted field zero-fills, so the decl-only flags have to be listed
       // explicitly — dropping them here would quietly strip @naked/@nosplit
-      // (and, since §17.6, the module tag) from a renamed `main`.
+      // (and, since §17.6, the module tag) from a renamed `main`. `main` can
+      // never itself be `isTestDecl` (lowerTestDeclNamed's symbols are always
+      // `test$<n>`), so the two new #4128 fields need no entry here — they
+      // stay at their correct zero values for a renamed ordinary function.
       rebuilt = append(rebuilt, IrFunc{ name: "__bit_module_main", paramTypes: f.paramTypes,
         result: f.result, blocks: f.blocks, instrs: f.instrs, isFallible: f.isFallible,
         isNaked: f.isNaked, isNosplit: f.isNosplit, inRootModule: f.inRootModule,
@@ -239,14 +287,15 @@ fn injectTestMain(module: IrModule, runPattern: string): TestDiscovery {
     }
     j = j + 1
   }
-  module.funcs = append(rebuilt, buildDispatch(module.ctx, names))
-  return TestDiscovery{ discovered: discovered, names: names }
+  module.funcs = append(rebuilt, buildDispatch(module.ctx, filtered.symbols))
+  return TestDiscovery{ discovered: discovered, names: filtered.names, symbols: filtered.symbols }
 }
 
 // Builds `main`: read the wanted index once, then walk a linear chain of equality
 // checks. `idx` is defined in the entry block, which dominates every check block,
 // so no block parameters are needed to thread it through (SSA value ids are flat
-// across blocks).
+// across blocks). `tests` are CALL SYMBOLS (`injectTestMain`'s `filtered.symbols`),
+// never display text — for a `test "..." { }` declaration (#4128) the two differ.
 fn buildDispatch(ctx: TypeContext, tests: []string): IrFunc {
   let i64ty = primType(ctx, 3)
   let boolty = primType(ctx, 10)
@@ -424,4 +473,112 @@ fn demangleTestRootCollisions(module: IrModule, names: []string) {
     }
     gi = gi + 1
   }
+}
+
+// Lowers one `test "name" { }` declaration (#4128, SPEC §19, epic #4126) to
+// its own callable `IrFunc`, under an internal `symbolName` — never the
+// string the author wrote, which travels separately as `testDisplayName`
+// (`bit test` prints it, `--run` matches against it; see `testDisplayNameOf`
+// above). Modeled on `lowerFuncNamed` (lowerfunc.bit) with every receiver,
+// generics, params, result and fallible concern removed: `parseTestDecl`
+// (parserdecl.bit) admits none of them, so this needs neither
+// `substTypeList`/`substType` nor a `nameOverride`/pinned-symbol check.
+fn lowerTestDeclNamed(
+  c: Checker,
+  decl: int,
+  moduleConsts: map<string, int>,
+  lowerer: Lowerer,
+  symbolName: string,
+): IrFunc {
+  let kids = kidsOf(c.tree, decl) // [name, body]
+  let nm = getNode(c.tree, kids[0])
+  let display = decodeStringContent(c.source, nm.span.start, nm.span.end)
+  let b = newBuilder()
+  let entry = builderNewBlock(b)
+  builderBeginBlock(b, entry)
+  let fc = FnCtx{
+    c: c, b: b, env: []LocalBind(0), failed: false,
+    failSpan: pointSpan(0, 0), failReason: "", terminated: false,
+    loops: []LoopFrame(0), moduleConsts: moduleConsts, lowerer: lowerer, defers: []DeferCall(0),
+    fallibleOk: 0, fallibleErr: 0, genEnv: emptyTypeEnv(), resultTy: c.ctx.voidId,
+    boxedNames: []string(0),
+  }
+  let scan = boxedLocalNames(c, kids[1], []string(0))
+  fc.boxedNames = scan.names
+  if (scan.overflow) {
+    fcFail(fc, nm.span, "a test whose closures capture more locals than the lowerer can box")
+  }
+  // Same ordering as lowerFuncNamed: defer slots are reserved before the body
+  // lowers at all (#2378, deferPreScan's own doc, lowerdefer.bit).
+  deferPreScan(fc, kids[1])
+  lowerStmtList(fc, kids[1])
+  if (fc.failed) {
+    lowerer.stubbed = append(
+      lowerer.stubbed,
+      StubbedFn{ name: symbolName, span: remapModuleSpan(c, fc.failSpan), reason: fc.failReason },
+    )
+    return signatureOnlyFunc(c, symbolName, []int(0), c.ctx.voidId)
+  }
+  if (!fc.terminated) {
+    runDefers(fc)
+    builderEmit(fc.b, mkInstr(Op.Ret, c.ctx.voidId))
+  }
+  builderEndBlock(fc.b)
+  return IrFunc{
+    name: symbolName, paramTypes: []int(0), result: c.ctx.voidId,
+    blocks: fc.b.blocks, instrs: fc.b.instrs, isFallible: false,
+    isNaked: false, isNosplit: false,
+    inRootModule: lowerer.curModule == lowerer.root, isPinned: false,
+    inTestFile: declInTestFile(c, nm.span), isTestDecl: true, testDisplayName: display,
+  }
+}
+
+// Pass A (#4128 extends the ORIGINAL Pass A, lowerglobal.bit, to `test
+// "..." { }` declarations too, SPEC §19, epic #4126): every module's
+// non-generic free functions and test declarations, lowered in ONE walk so
+// the two forms interleave in real declaration order — a `test$<n>` symbol's
+// `n` restarts at 0 per module and counts only `Tag.TestDecl` nodes, so an
+// intervening `fn` never skips a number. `lowerer.modPrefix` (the same
+// prefix an ordinary function already gets) keeps two modules' symbols
+// apart. Kept OUT of `lowerProject` itself because that function's own
+// complexity is a pinned ratchet (tools/build/complexity-debt.txt) at its
+// CURRENT score, and a new branch there would cross it — `lowerProject`
+// calls this (plus `appendIrFuncs`, below) with one plain statement, adding
+// no branch of its own.
+fn lowerModuleTopLevelFuncs(mods: []Checker, root: int, lowerer: Lowerer): []IrFunc {
+  let funcs = []IrFunc(0)
+  let mi = 0
+  while (mi < len(mods)) {
+    let c = mods[mi]
+    lowerer.modPrefix = modulePrefix(mi, root)
+    lowerer.curModule = mi
+    let consts = collectModuleConsts(c)
+    let counter = 0
+    let i = 1
+    while (i < len(c.tree.nodes)) {
+      let n = getNode(c.tree, i)
+      if (n.tag == Tag.FuncDecl && kidsOf(c.tree, i)[0] == 0 && !isGenericFuncDecl(c, i)) {
+        funcs = append(funcs, lowerFunc(c, i, consts, lowerer))
+      } else if (n.tag == Tag.TestDecl) {
+        let symbolName = "${lowerer.modPrefix}test\$${counter}"
+        funcs = append(funcs, lowerTestDeclNamed(c, i, consts, lowerer, symbolName))
+        counter = counter + 1
+      }
+      i = i + 1
+    }
+    mi = mi + 1
+  }
+  return funcs
+}
+
+// Appends every element of `src` to `dst`, in order. Exists so
+// `lowerProject`'s own call site for `lowerTestDecls` above stays a single
+// statement (see that function's own comment for why).
+fn appendIrFuncs(dst: []IrFunc, src: []IrFunc): []IrFunc {
+  let i = 0
+  while (i < len(src)) {
+    dst = append(dst, src[i])
+    i = i + 1
+  }
+  return dst
 }
