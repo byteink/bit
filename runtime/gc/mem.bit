@@ -31,8 +31,8 @@
 //
 // A SPAN THE FREE LIST WON'T TAKE IS RELEASED TO THE OS ANYWAY (#2375), by
 // `munmap` of that 128 KiB alone — today that is only the fallback inside
-// `spanFreeListPush` itself, when the OS refuses the MAP_FIXED reset the push
-// tries first (should not happen for a range this reserve already owns). The
+// `spanFreeListPush`/`spanFreeListTake`, when the OS refuses a MAP_FIXED reset
+// of a range this reserve already owns (should not happen either time). The
 // reserve's bump cursor does not rewind over an unmapped span, so in that one
 // case the ADDRESS RANGE really is abandoned while the physical memory goes
 // back — which is still the point on that path, since RSS is what ratchets
@@ -434,61 +434,93 @@ export @nosplit fn reserveHeadOwns(r: *i64, addr: int, nbytes: int): bool {
 }
 
 // ---------------------------------------------------------------------------
-// The span free list (#3868) — recovering a released span's ADDRESS, not
-// just its pages
+// The span free list (#3868, #4058) — recovering a released span's ADDRESS,
+// not just its pages
 // ---------------------------------------------------------------------------
 //
 // `reserveGrow`'s bump never rewinds, so a span released past the #3045 span
 // cache's 64 slots was previously lost forever: its pages went back via
-// `memUnmapPages`, but its address did not, and the next refill had to map a
-// fresh 4 MiB chunk. Measured on a churning `bit lsp --stdio`: ~9.5 abandoned
-// chunks per edit on a 16-file project, each retaining a resident header page
-// for the rest of the process's life (#2803, #3868).
+// `memUnmapPages` but its address did not, and the next refill had to map a
+// fresh 4 MiB chunk — ~9.5 abandoned per edit on a churning `bit lsp --stdio`,
+// each retaining a resident header page for the process's life (#2803, #3868).
 //
 // EVERY SPAN THIS LIST EVER HOLDS IS THE SAME SIZE — `reserveTake` aligns any
 // take of at least `allocSpanBytes` to it (#2373) — so this needs no
-// coalescing and no size search: a plain singly-linked stack, threaded
-// through each span's own first word exactly as `reserveGrow`'s chunk list
-// threads through each chunk's first two.
+// coalescing and no size search: a stack of addresses and nothing else.
 //
-// THE TWO INVARIANTS THAT MAKE THIS SAFE, both from the ticket that added it:
+// THE ADDRESSES LIVE IN BLOCKS, NOT ONE PER SPAN (#4058), and that is the whole
+// shape of this structure. #3868 threaded a `next` link through each parked
+// span's own first word — the obvious singly-linked stack. That link does not
+// cost a word, it costs a PAGE: the push below decommits the span and then
+// writes the link straight back into it, faulting one page of it in again, and
+// `getconf PAGESIZE` is 16384 on macOS/arm64 against an `allocSpanBytes` of
+// 131072. So a program that had once peaked kept an eighth of every span it
+// ever parked resident for the rest of its life: measured at 17.2 KB per
+// parked span (#4058).
+//
+// So one parked span in every `spanNodeCap + 1` is a NODE and it names the
+// others: the previous node's address, a count, then up to `spanNodeCap`
+// addresses of spans nothing ever writes to. Only a node is written to, so only
+// a node is resident, and only its first page — one page per `spanNodeCap + 1`
+// parked spans instead of one page each, with no allocation, no side table and
+// no extra state word, because the storage IS the pool. It is the trade
+// `reserveGrow`'s chunk list above already makes (put the links in memory that
+// has to be resident anyway) applied one level down.
+//
+// THE THREE INVARIANTS THAT MAKE THIS SAFE:
 //
 //   1. OWNERSHIP. `reserveHeadOwns` still gates whether a span may become
 //      unmapped/recycled at all — unchanged, see its own comment above. This
-//      list is pushed to from exactly one place, `gcHeapFree`'s overflow arm,
-//      and that arm only ever reaches a span `heapReclaimSpansLocked`
-//      reclaimed — which only takes spans with `spanOwned != 0` to begin with
-//      (see `gcHeapAlloc`'s refill comment in `../gc.bit`). So every span
-//      here was already established as reserve-owned before it arrived, and
-//      handing it back out needs no re-check.
+//      list is pushed to from one place, `gcHeapFree`'s overflow arm, which
+//      only ever reaches a span `heapReclaimSpansLocked` reclaimed — and that
+//      pass only takes spans with `spanOwned != 0` (see `gcHeapAlloc`'s refill
+//      comment in `../gc.bit`). Every span here was therefore established as
+//      reserve-owned before it arrived, and handing it out needs no re-check.
 //
 //   2. THE PAGES STILL GO BACK TO THE OS — the #2375 retention leak is not
-//      reintroduced. A span sitting mapped-and-idle in this list would BE
-//      that leak with a different data structure wrapped around it. So
-//      `spanFreeListPush` does not simply remember the address: it first
-//      REPLACES the span's mapping with a fresh one at the SAME address
-//      (`bit_rt_remap_pages`, an atomic MAP_FIXED reset). The OS drops
-//      whatever physical pages backed the old mapping as part of installing
-//      the new one, and the new one is untouched — 0 bytes resident — until
-//      something writes to it. The single word this function writes next,
-//      the "next" link, is the only byte that becomes resident again; the
-//      rest of the span stays unbacked for as long as it sits in the list.
+//      reintroduced. A span sitting mapped-and-idle here would BE that leak
+//      with a different data structure around it. So the push does not simply
+//      remember the address: it first REPLACES the span's mapping with a fresh
+//      one at the SAME address (`bit_rt_remap_pages`, an atomic MAP_FIXED
+//      reset). The OS drops whatever backed the old mapping as part of
+//      installing the new one, and the new one stays 0 bytes resident until
+//      something writes to it — which, for every span but a node, never happens.
+//
+//   3. A SPAN HANDED BACK OUT IS ZEROED. `heapRefillLocked` overwrites the span
+//      header but NOT the #3176 occupied-slot bitmap behind it, and
+//      `../alloc/bitmap.bit` names this list as one of the two sources that
+//      arrive clean without help. A node's array reaches 4096 bytes in, well
+//      past that bitmap, so `spanFreeListTake` remaps a node span before
+//      returning it — the only take that pays a syscall, one in
+//      `spanNodeCap + 1`, and also what gives the node's one page back.
 //
 // THE HEAD LIVES OUTSIDE THE 3-WORD RESERVE DESCRIPTOR ON PURPOSE: only the
-// SPAN reserve (`gcSpanRes`) ever needs one, and widening `reserveWords`
-// would cost the channel reserve and the address-index reserve a word
-// neither uses (see that const's own comment above). `../gc.bit` instead owns
-// one dedicated state word, `gcSpanFree`, the same shape #3292 used to grow
-// `gcWords` for a single caller-specific field. That is also why these two
-// functions take a plain `head: *i64` rather than the reserve descriptor `r`
-// every other function here takes — this list is not part of any reserve's
-// own bookkeeping, and `reserveTake`/`reserveGrow` never consult it, which is
-// what keeps `_tests_/stress/gcreserve`'s "64 span-sized takes are pairwise
-// distinct" proof (no freeing in between) unaffected by this file.
+// SPAN reserve (`gcSpanRes`) ever needs one, and widening `reserveWords` would
+// cost the channel and address-index reserves a word neither uses. `../gc.bit`
+// owns one dedicated state word, `gcSpanFree` (#3292's shape), and #4058 kept
+// it at exactly one: a node's count and back-link live in the node, so blocking
+// the list costs `gcWords` nothing and leaves `runtime/root/root.bit`'s
+// `gcWords == 39` boot guard untouched. It is also why these take a plain
+// `head: *i64` rather than the descriptor `r` — the list is no reserve's own
+// bookkeeping, and `reserveTake`/`reserveGrow` never consult it, which keeps
+// `_tests_/stress/gcreserve`'s "64 span-sized takes are pairwise distinct"
+// proof unaffected by this file.
+
+// A free-list node's own two header words, and how many span addresses follow
+// them. 510 IS DERIVED, NOT TUNED: `spanNodeHdrBytes + 8 * spanNodeCap` is
+// exactly 4096, the smallest page any supported target has (x86-64 Linux and
+// macOS; arm64 macOS is 16384). Sizing off the smallest keeps "a node dirties
+// exactly one page" true everywhere rather than on the machine it was measured
+// on; a wider node would trade one page for two.
+const spanNodePrevOff = 0
+const spanNodeCountOff = 8
+const spanNodeHdrBytes = 16
+const spanNodeCap = 510
 
 // Push a released, `allocSpanBytes`-sized, `allocSpanBytes`-aligned span onto
 // the free list rooted at `*head`. See the section header above for why this
-// decommits-and-relinks rather than unmapping.
+// decommits before linking, and why the address usually goes INTO a node rather
+// than becoming one.
 @nosplit fn spanFreeListPush(head: *i64, addr: int) {
   if (bit_rt_remap_pages(i64(addr), i64(allocSpanBytes)) == 0) {
     // The OS refused a MAP_FIXED reset of a range this reserve already owns
@@ -498,20 +530,48 @@ export @nosplit fn reserveHeadOwns(r: *i64, addr: int, nbytes: int): bool {
     memUnmapPages(addr, allocSpanBytes)
     return
   }
-  storeWord(addr, *head)
+  let node = *head
+  if (node != 0) {
+    let n = loadWord(node + spanNodeCountOff)
+    if (n < spanNodeCap) {
+      storeWord(node + spanNodeHdrBytes + n * 8, addr)
+      storeWord(node + spanNodeCountOff, n + 1)
+      return
+    }
+  }
+  // No node yet, or the newest one is full: this span becomes the next node,
+  // and its two header words are the only bytes of it that fault back in.
+  storeWord(addr + spanNodePrevOff, node)
+  storeWord(addr + spanNodeCountOff, 0)
   *head = addr
 }
 
-// Pop an address off the free list rooted at `*head`, or 0 when empty. The
-// memory is already mapped and zeroed — `spanFreeListPush`'s remap — so the
-// caller needs no further action before treating it as a fresh span.
+// Pop an address off the free list rooted at `*head`, or 0 when empty. What is
+// returned is mapped and zeroed: `spanFreeListPush`'s remap for a span some
+// node merely names, and a second remap here for a node span itself, whose own
+// array has dirtied the bitmap region invariant 3 above is about.
 @nosplit fn spanFreeListTake(head: *i64): int {
-  let addr = *head
-  if (addr == 0) {
+  let node = *head
+  if (node == 0) {
     return 0
   }
-  *head = loadWord(addr)
-  return addr
+  let n = loadWord(node + spanNodeCountOff)
+  if (n > 0) {
+    storeWord(node + spanNodeCountOff, n - 1)
+    return loadWord(node + spanNodeHdrBytes + (n - 1) * 8)
+  }
+  // This node names nothing further, so the node span itself is what is left.
+  // Read the back-link BEFORE the remap, which zeroes the word holding it.
+  let prev = loadWord(node + spanNodePrevOff)
+  *head = prev
+  if (bit_rt_remap_pages(i64(node), i64(allocSpanBytes)) == 0) {
+    // Same "should not happen" as the push above and the same answer: let the
+    // address go rather than hand out a span still holding this node's array.
+    // The blocks behind it are already unlinked, so the list stays usable.
+    memUnmapPages(node, allocSpanBytes)
+    return 0
+  }
+  return node
 }
 
 // ---------------------------------------------------------------------------
