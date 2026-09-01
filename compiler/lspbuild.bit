@@ -250,37 +250,131 @@ fn lspParseCache(server: LspServer): map<string, SrcModule> {
 // declarations the parser recovered cleanly type exactly as they would in an
 // otherwise-valid file.
 //
-// `store` is false for the `.`-completion splice only. That build is against a
-// buffer with a throwaway marker identifier spliced in at the cursor
-// (`lspDotCompletion`), which no other request will ever send: keeping it would
-// hold a slot for a fictional document and, because slots are keyed by
-// directory, push out the snapshot of the real one the next hover wants. It
-// still READS the parse cache — the stdlib does not care that the root module
-// has a marker in it.
+// `store` is false for the `.`-completion splice, and for any `only`-scoped
+// (single-file) build — see `lspBuildProjectFor` below. A throwaway or
+// single-file build (`lspDotCompletion`'s marker splice, or a directory that
+// turned out not to be one module) would hold a cache slot for a document no
+// other request will ask for the same way twice, and slots are keyed by
+// directory, so it would push out the snapshot of the real one the next
+// hover wants. It still READS the parse cache — the stdlib does not care
+// that the root module has a marker in it, or that `only` narrowed it to one
+// file.
+//
+// `only` is `loadModuleAt`'s own parameter (project.bit), passed straight
+// through: "" scans `dir`; a filename takes just that one file, exactly as
+// `bit check <file>.bit` does via the CLI's `rootOnly`. Freshness caching
+// (`lspFindSnapshot`/`lspStoreSnapshot`) is keyed on `dir` alone and has no
+// concept of `only`, so it is skipped entirely when `only != ""` — a
+// single-file fallback build simply re-runs each time it is asked for. That
+// is a real, deliberate cost (see `lspBuildProjectFor`), not an oversight.
 fn lspBuildProjectOverlay(
   server: LspServer, overlays: map<string, string>,
-  dir: string, store: bool,
+  dir: string, only: string, store: bool,
 ): LspProject {
-  let (cached, hit) = lspFindSnapshot(server, overlays, dir)
-  if (hit) {
-    return cached
+  if (only == "") {
+    let (cached, hit) = lspFindSnapshot(server, overlays, dir)
+    if (hit) {
+      return cached
+    }
   }
-  let p = loadProjectCached(dir, "", stdRootPath(), overlays, lspParseCache(server))
+  let p = loadProjectCached(dir, only, stdRootPath(), overlays, lspParseCache(server))
   if (p.root < 0 || len(p.mods) == 0) {
     return LspProject{ p: p, mods: []Checker(0) }
   }
   let mods = resolveProject(p)
   checkResolved(p, mods)
   let lp = LspProject{ p: p, mods: mods }
-  if (store) {
+  if (store && only == "") {
     lspStoreSnapshot(server, dir, lp)
   }
   return lp
 }
 
-// The build every handler uses: the server's own open documents, cached.
+// The whole-directory build every handler used to call directly: the
+// server's own open documents, cached. Kept for `lspRecheckAndPublish`, which
+// needs the directory build FIRST regardless of whether it turns out
+// coherent — every other caller wants `lspBuildProjectFor` instead, which
+// adds the coherence check and the single-file fallback.
 fn lspBuildProject(server: LspServer, dir: string): LspProject {
-  return lspBuildProjectOverlay(server, server.overlays, dir, true)
+  return lspBuildProjectOverlay(server, server.overlays, dir, "", true)
+}
+
+// The number of top-level, receiver-less `fn main` declarations in a root
+// module's tree, unwrapping one leading `export`. A method named `main` (a
+// FuncDecl WITH a receiver, kid 0) is never a candidate: SPEC §17.4 says so
+// outright — "a method named main ... [is an] ordinary function and not an
+// entry point." Mirrors `topDeclName`'s (check.bit) FuncDecl kid layout.
+fn lspTopLevelMainCount(tree: Tree, source: string): int {
+  let count = 0
+  for d of kidsOf(tree, tree.root) {
+    let node = d
+    if (node == 0) {
+      continue
+    }
+    if (getNode(tree, node).tag == Tag.Export) {
+      node = kidsOf(tree, node)[0]
+      if (node == 0) {
+        continue
+      }
+    }
+    if (getNode(tree, node).tag != Tag.FuncDecl) {
+      continue
+    }
+    let k = kidsOf(tree, node)
+    if (k[0] != 0 || k[1] == 0) {
+      continue // a receiver (method) or a poisoned name: not a candidate
+    }
+    let nm = getNode(tree, k[1])
+    if (source[nm.span.start:nm.span.end] == "main") {
+      count = count + 1
+    }
+  }
+  return count
+}
+
+// Whether `lp`'s root module could ever be a well-formed SPEC §17.1 module at
+// all: SPEC §17.4 permits AT MOST ONE top-level `main` per module, so finding
+// more than one is not a guess about intent, it is proof — concatenating
+// those files into one shared scope could never type-check as written. That
+// is exactly the shape of a directory of independent single-file programs
+// invoked one at a time (`_tests_/bit/`, `_tests_/cases/`,
+// `_tests_/stress/parallel/` — the last already documented and excluded from
+// the stress-corpus walk for precisely this reason, #3397), as opposed to a
+// real multi-file module, which has at most one entry point by construction.
+// `len(lp.mods) == 0` (no checkers) covers both "no module at all" branches
+// of `lspBuildProjectOverlay` above and is left alone: there is nothing to
+// reject, the caller's own empty-result handling already applies.
+fn lspIsCoherentModule(lp: LspProject): bool {
+  if (len(lp.mods) == 0) {
+    return true
+  }
+  let root = lp.p.mods[lp.p.root]
+  return lspTopLevelMainCount(root.tree, root.source) <= 1
+}
+
+// The build for the module CONTAINING `path`: `pathDir(path)` as a whole
+// when it resolves as one module, or `path` alone when it does not
+// (`lspIsCoherentModule`) — the conservative fallback over guessing intent
+// from source shape ahead of time (#4157). Every query handler
+// (hover/definition/references/rename/signature/completion) goes through
+// this rather than `lspBuildProject` directly, so the decision lives in one
+// place. The coherence-check build itself is the same cached directory build
+// `lspBuildProject` always did; only the (rare) fallback pays a second,
+// uncached, single-file build.
+fn lspBuildProjectOverlayFor(
+  server: LspServer, overlays: map<string, string>, path: string, store: bool,
+): LspProject {
+  let dir = pathDir(path)
+  let lp = lspBuildProjectOverlay(server, overlays, dir, "", store)
+  if (lspIsCoherentModule(lp)) {
+    return lp
+  }
+  return lspBuildProjectOverlay(server, overlays, dir, pathBase(path), false)
+}
+
+// `lspBuildProjectOverlayFor` against the server's own open documents.
+fn lspBuildProjectFor(server: LspServer, path: string): LspProject {
+  return lspBuildProjectOverlayFor(server, server.overlays, path, true)
 }
 
 // A Project with no modules — the `found: false` half of `lspFindSnapshot`,
