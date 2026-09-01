@@ -3479,6 +3479,10 @@ except via `return`/`fail`.
   enclosing function immediately returns that err (its `E` must be assignable to
   the enclosing function's error type); if ok, `expr?` evaluates to the unwrapped
   `T`. `?` is only legal inside a fallible function.
+- **Operand must be fallible:** `expr`'s own type must be a fallible `T!E`. `?`
+  applied to a non-fallible operand is a compile error naming the operand's
+  type, distinct from the enclosing-function requirement above — one rejects
+  the context `?` appears in, the other rejects what it is applied to.
 - **Handle:** the `catch` expression consumes a fallible value locally:
 
 ```
