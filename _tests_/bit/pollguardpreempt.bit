@@ -44,6 +44,25 @@
 // clears within the deadline below, exit 1. Restoring it makes this gate
 // PASS again, exit 0.
 //
+// #4030: THE POLL LOOP MUST NOT `sleep` — see `waitForClear` below.
+// `pollguardpreemptx64.bit` (#3565) already carries this fix and its own
+// header records the false PASS it closes; this file (#3564, written first)
+// never got it ported over. Reproduced directly: with
+// `compiler/arm64call.bit`'s `emitBackEdgeSafepointIfNeeded` neutered so NO
+// back edge anywhere emits ANY poll (a strictly stronger break than clause 3
+// alone), this file's PRIOR `sleep(1ms)`-based poll loop still printed PASS.
+// The mutator's own worker id is a small, reused index (0..BIT_WORKERS-1,
+// runtime/sched/worker.bit's `wkId`), and `preemptStamp` — called on every
+// ordinary task dispatch, runtime/sched/workerrun.bit — unconditionally
+// clears whatever `requested` flag was left on that SAME index by whoever
+// ran there before. The controller's own `sleep`-driven park/redispatch
+// cycles through worker indices too (confirmed by instrumenting both sides:
+// the flag flipped to clear on the exact check where the controller's own
+// `schedCurrentWorker()` read the mutator's published `wid`), so with only a
+// few workers it lands back on the mutator's index by chance within the
+// 2-second window essentially every time — clearing the flag as ordinary
+// scheduler bookkeeping, with clause 3 never called at all.
+//
 // REQUIRES BIT_WORKERS >= 2, same reason and same failure mode as
 // pollguardstopword.bit's own header: with the scheduler's single-worker
 // default the controller and the mutator can never run concurrently, so
@@ -96,6 +115,40 @@ fn waitForStart(started: []i64) {
     }
     sleep(1 * Millisecond)
   }
+}
+
+// #4030: BUSY-SPIN on `preemptRequested` ONLY — no `sleep`, no `monotonic()`,
+// ported verbatim (as a design, adapted to this file's naming) from
+// `pollguardpreemptx64.bit`'s own `waitForClear`, which already carries the
+// full rationale for both restrictions:
+//
+//   - `sleep`/any blocking call PARKS the controller, and `preemptStamp`
+//     clears a worker's `requested` flag as a side effect of ANY fresh
+//     dispatch onto that worker index. A parked controller gets
+//     re-dispatched repeatedly and, with only a few workers, lands back on
+//     the mutator's own index by chance — clearing the flag itself with the
+//     guard under test never having run. See this file's own header for the
+//     #4030 repro that hit exactly this.
+//   - `monotonic()` allocates (`Mono`, #2678); called every iteration of a
+//     tight loop it would exhaust the GC trigger, and `stwSafepoint` calls
+//     `schedMaybeYieldForPreempt()` unconditionally whenever ANY clause polls
+//     — so a GC-due poll (clause 2, pre-existing on this ladder) would clear
+//     the mutator's flag as a side effect too, with clause 3 never firing.
+//
+// A plain iteration ceiling (Power of 10 rule 2) is the only bound left: no
+// syscall, no allocation, so nothing here can itself cause a dispatch or a
+// collection. pollguardstopword.bit measured ~485M iterations/s for a
+// similar allocation-free loop, so 2 billion resolves in a few seconds if the
+// clause never fires, and in far less than one if it does.
+fn waitForClear(wid: i64): bool {
+  let i = 0
+  while (i < 2000000000) {
+    if (!preemptRequested(wid)) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
 }
 
 // Race-free setup proof by ELIMINATION (smash #3609): reset every OTHER
@@ -178,26 +231,19 @@ fn main() {
     exit(1)
   }
 
-  // Poll (bounded by wall-clock deadline, the same shape waitForStart above
-  // uses) for the COMPILED guard to observe and clear it. Only
+  // Poll (bounded by a plain iteration ceiling, `waitForClear` above — #4030,
+  // NOT a wall-clock deadline with `sleep` between checks, which reopened a
+  // false-PASS path) for the COMPILED guard to observe and clear it. Only
   // compiler/arm64call.bit's emitInlinedPreemptCheck reaching bit_rt_safepoint
   // -> schedMaybeYieldForPreempt -> maybePreempt can make this clear — that
   // is the actual thing under test. It is legitimate for `cleared` to go
-  // true on the very FIRST check below: the `flagged >= 1` proof above
-  // already establishes the flag really was set for wid specifically, and
-  // the only thing that clears requested[wid] while the mutator's task is
-  // still alive is that same guard's maybePreempt call — so an instant
-  // "already false" here means the guard won the race, not that setup was
-  // skipped.
-  let deadline = monotonic().ns + 2 * Second
-  let cleared = false
-  while (!cleared && monotonic().ns < deadline) {
-    if (!preemptRequested(wid)) {
-      cleared = true
-    } else {
-      sleep(1 * Millisecond)
-    }
-  }
+  // true on the very FIRST check inside `waitForClear`: the `flagged >= 1`
+  // proof above already establishes the flag really was set for wid
+  // specifically, and the only thing that clears requested[wid] while the
+  // mutator's task is still alive is that same guard's maybePreempt call —
+  // so an instant "already false" means the guard won the race, not that
+  // setup was skipped.
+  let cleared = waitForClear(wid)
 
   atomicStore(ptrOf(testDone), 1)
   wg.wait()
