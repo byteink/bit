@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Cut a release from THIS machine. Bit does not use GitHub Actions.
 #
-#   dist/release.sh <version>            # build, verify, upload as a draft
-#   dist/release.sh <version> --dry-run  # build and verify, publish nothing
+#   dist/release.sh <version>                 # build, verify, upload as a draft
+#   dist/release.sh <version> --dry-run       # build and verify, publish nothing
+#   dist/release.sh <version> --resume-notes  # re-check a hand-edited dist/out/NOTES.md and
+#                                              # publish, reusing a PRIOR run's artifacts (#4124)
 #
 # <version> is semver without the leading v, e.g. 0.1.0.
 #
@@ -31,9 +33,17 @@
 # Nothing here needs a token beyond the `gh` login already on this machine.
 set -euo pipefail
 
-VERSION="${1:?usage: dist/release.sh <version> [--dry-run]}"
+VERSION="${1:?usage: dist/release.sh <version> [--dry-run] [--resume-notes]}"
+shift
 DRY=0
-[ "${2:-}" = "--dry-run" ] && DRY=1
+RESUME_NOTES=0
+for arg in "$@"; do
+	case "${arg}" in
+	--dry-run) DRY=1 ;;
+	--resume-notes) RESUME_NOTES=1 ;;
+	*) echo "release.sh: unknown argument '${arg}'" >&2; exit 2 ;;
+	esac
+done
 
 printf '%s' "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' || {
 	echo "release.sh: '${VERSION}' is not a semver version" >&2
@@ -60,6 +70,12 @@ git diff --cached --quiet || { echo "release.sh: staged changes present" >&2; ex
 # that way. Captured before the build rather than after so a commit landing mid-run
 # cannot move it.
 BUILT_COMMIT="$(git rev-parse HEAD)"
+
+# --resume-notes (#4124): everything down to SHA256SUMS below builds and
+# smoke-tests the artifacts. Skip it and reuse what a PRIOR run of this
+# command already left in ${OUT} — validated right before the changelog.sh
+# call further down, which refuses loudly if ${OUT} is not actually populated.
+if [ "${RESUME_NOTES}" -eq 0 ]; then
 
 # --- preflight: confirm both smoke-test images exist BEFORE cross-building ---
 # (#2930). "the artifact is broken" and "the verifier is not provisioned" are
@@ -581,10 +597,37 @@ echo "release.sh: wrote ${OUT}/bit-${VERSION}.cdx.json"
 echo "release.sh: SHA256SUMS"
 cat "${OUT}/SHA256SUMS" | sed 's/^/  /'
 
-bash dist/changelog.sh "${VERSION}" > "${OUT}/NOTES.md" 2>/dev/null || {
-	echo "release.sh: changelog.sh failed; writing a minimal note" >&2
-	printf '# Bit %s\n' "${VERSION}" > "${OUT}/NOTES.md"
-}
+fi # RESUME_NOTES -eq 0 (build block opened above at BUILT_COMMIT)
+
+if [ "${RESUME_NOTES}" -eq 0 ]; then
+	bash dist/changelog.sh "${VERSION}" > "${OUT}/NOTES.md" 2>/dev/null || {
+		echo "release.sh: changelog.sh failed; writing a minimal note" >&2
+		printf '# Bit %s\n' "${VERSION}" > "${OUT}/NOTES.md"
+	}
+else
+	# Remediation path for checkNotesLanguage's refusal (#4124): reuse
+	# NOTES.md AS-IS, never regenerate it — regenerating is exactly what
+	# clobbered the hand-edit before this fix.
+	[ -f "${OUT}/NOTES.md" ] || {
+		echo "release.sh: --resume-notes given but ${OUT}/NOTES.md does not exist" >&2
+		echo "  --resume-notes reuses the NOTES.md and artifacts a prior" >&2
+		echo "  'dist/release.sh ${VERSION}' run already produced; it does not build" >&2
+		echo "  anything. Run a full build first: dist/release.sh ${VERSION}" >&2
+		exit 1
+	}
+	missing=""
+	for f in "bit-${VERSION}-linux-x86_64.tar.xz" "bit-${VERSION}-linux-aarch64.tar.xz" \
+		"bit-${VERSION}-macos-aarch64.tar.xz" "bit-${VERSION}.cdx.json" "SHA256SUMS"; do
+		[ -f "${OUT}/${f}" ] || missing="${missing} ${f}"
+	done
+	[ -z "${missing}" ] || {
+		echo "release.sh: --resume-notes given but ${OUT} is missing:${missing}" >&2
+		echo "  --resume-notes does not rebuild. Run a full build first:" >&2
+		echo "    dist/release.sh ${VERSION}" >&2
+		exit 1
+	}
+	echo "release.sh: --resume-notes: reusing ${OUT}/NOTES.md (mtime $(stat -f '%Sm' "${OUT}/NOTES.md" 2>/dev/null || stat -c '%y' "${OUT}/NOTES.md")) and the artifacts already in ${OUT}"
+fi
 
 # Refuse a bullet naming another language BEFORE the draft is created (#3973).
 # Owner ruling 2026-08-30: "in any release notes we don't want to mention Go
@@ -604,7 +647,21 @@ bash dist/changelog.sh "${VERSION}" > "${OUT}/NOTES.md" 2>/dev/null || {
 # v0.1.25 through the range since v0.5.0 (10 ranges), this pattern hit 7
 # times and every hit named the language — 0 observed false positives.
 # Golang/Rust/Java/JavaScript/Swift/C++ never occurred at all in that corpus.
-LANG_NAME_PATTERN='\b(Go|Golang|Rust|Zig|Python|Java|TypeScript|JavaScript|Swift)\b|C\+\+'
+#
+# `\.(go|c)\b` ADDED (#4125): missed a lowercase language name inside a
+# filename — "as matrix.go and matrix.c do" (1921a807) shipped in 0.6.0
+# uncaught. `bench/cases/**` carries 12 `.go` and 11 `.c` files that exist
+# SPECIFICALLY to be compared against in prose like that, so a `.go`/`.c`
+# mention here is always genuine. Re-verified 2026-09-01 against 12 tag
+# ranges (v0.1.24..v0.6.0 + open v0.6.0..HEAD: 875 subject + 1286 NOTES.md
+# lines) AND full history (3154 subjects): 2 hits, same bullet, 0 false
+# positives. `.py`/`.rs`/`.ts`/`.java`/`.cpp` deliberately NOT added: this
+# repo's own tooling has `.py`/`.ts` files (dist/sbom.py, gen.py,
+# editors/vscode/src/extension.ts), and one IS a real false positive in
+# history — "wire dist/sbom.py into dist/release.sh" names Bit's own tooling,
+# not a Python comparison. `.rs`/`.java`/`.cpp` have zero tracked files and
+# zero corpus hits — unmeasured; add one only with its own corpus re-run.
+LANG_NAME_PATTERN='\b(Go|Golang|Rust|Zig|Python|Java|TypeScript|JavaScript|Swift)\b|C\+\+|\.(go|c)\b'
 
 checkNotesLanguage() { # <notes-file>
 	local notesFile="$1" hits bad=0 lineno text sha
@@ -636,9 +693,10 @@ checkNotesLanguage() { # <notes-file>
 	[ "${bad}" -eq 0 ] && return 0
 
 	echo "release.sh: refusing — release notes must not name another language (owner ruling 2026-08-30)" >&2
-	echo "release.sh: reword the commit subject upstream (preferred) or edit ${notesFile} and re-run" >&2
-	echo "release.sh: to approve a specific bullet for this run:" >&2
-	echo "release.sh:   RELEASE_NOTES_LANG_ALLOW=\"<sha> ...\" dist/release.sh ${VERSION}" >&2
+	echo "release.sh: reword the commit subject upstream (preferred), or edit ${notesFile} by hand and" >&2
+	echo "release.sh:   re-run WITHOUT rebuilding: dist/release.sh ${VERSION} --resume-notes" >&2
+	echo "release.sh: or approve a specific bullet (same flag avoids a rebuild here too):" >&2
+	echo "release.sh:   RELEASE_NOTES_LANG_ALLOW=\"<sha> ...\" dist/release.sh ${VERSION} --resume-notes" >&2
 	return 1
 }
 
@@ -700,7 +758,9 @@ foldPendingNotes() { # <pending-notes-file> <notes-md-file>
 	echo "release.sh:   removal. See that file's own \"How to use this file\" section." >&2
 	echo "release.sh: ================================================================" >&2
 }
-foldPendingNotes "${ROOT}/docs/release/PENDING-NOTES.md" "${OUT}/NOTES.md"
+# Skipped under --resume-notes: the reused NOTES.md was already folded once,
+# by the prior run that produced it — folding again would duplicate it.
+[ "${RESUME_NOTES}" -eq 0 ] && foldPendingNotes "${ROOT}/docs/release/PENDING-NOTES.md" "${OUT}/NOTES.md"
 
 checkNotesLanguage "${OUT}/NOTES.md" || exit 1
 

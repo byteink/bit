@@ -200,6 +200,257 @@ fn popcountWord(v: int): int {
   return count
 }
 
+// ---------------------------------------------------------------------------
+// #4122: a span recycled through the #3045 cache or the #4058 free list must
+// arrive with a CLEAN #3176 bitmap. The burst above never reclaims anything
+// -- its arena is caller-bound, so `reserveHeadOwns` reports every span
+// `owned = false` and `heapReclaimSpansLocked` skips them all. The two
+// phases below give the RESERVE spans to recycle instead, push them through
+// each path, and re-carve for a different class before checking. See
+// `../../../runtime/alloc/bitmap.bit` (the #3925 cache guard) and
+// `../../../runtime/gc/mem.bit` (the #4058 free-list guard) for the two
+// invariants this proves.
+// ---------------------------------------------------------------------------
+
+// The popcount(bitmap) == spanTotal - spanFree tie-in "THE ASSERTION" below
+// uses, pulled out so both new phases share it rather than re-deriving it.
+// Works for a span from ANY gc instance: allocSpanTotal/Free/BitmapWord are
+// pure address reads, not tied to a particular `g`.
+fn checkSpanBitmap(span: int): bool {
+  let total = allocSpanTotal(span)
+  let free = allocSpanFree(span)
+  let want = total - free
+  let words = (total + 63) / 64
+  let got = 0
+  let wi = 0
+  while (wi < words) { // bounded: <= 256 words, class 0's width, the widest
+    got = got + popcountWord(allocSpanBitmapWord(span, wi))
+    wi = wi + 1
+  }
+  return got == want
+}
+
+// --- #4122 phase A: the #3925 cache guard -----------------------------------
+//
+// A span reclaimed into the #3045 cache while carved for SRC (body 160 -> 32
+// header = 192 -> class 10, 681 slots/span, carved slots starting at byte
+// 192) must arrive clean when refilled for DEST (body 16 -> 48 -> class 3,
+// 2721 slots/span), whose bitmap window [80,424) reaches well into class
+// 10's own carved slot area. SRC's own bitmap ([80,168)) stays correct
+// either way -- ordinary `linkObject`/`freeObject` bit clearing keeps it so,
+// unaffected by this guard -- so a same-class reuse could never show this
+// corruption; DEST must be narrower than SRC for the stale bytes to fall
+// inside DEST's bitmap. A tiny caller arena means every span in this phase
+// is reserve-owned (RC_ARENA_WORDS is under one span, so the very first
+// refill request already fails `reserveTake` and falls to `reserveGrow`).
+const RC_ARENA_WORDS: int = 512
+const RC_SRC_BODY: int = 160
+const RC_SRC_SPAN_SLOTS: int = 681
+const RC_SRC_SPANS: int = 5 // >= allocSpanKeep(2), clears the reclaim
+// hysteresis (e * 2 >= spanSpans) with room to spare: 4 non-anchor owned
+// spans reclaim, 1 stays the anchor.
+const RC_SRC_OBJS: int = RC_SRC_SPANS * RC_SRC_SPAN_SLOTS
+const RC_DEST_BODY: int = 16
+const RC_DEST_SPAN_SLOTS: int = 2721
+const RC_CACHE_CYCLES: int = RC_SRC_SPANS // >= the <= 4 spans that reclaim;
+// the extra cycle falls through to a fresh, clean `reserveGrow` span, which
+// is a legitimate (clean) measurement rather than wasted work.
+
+// `results` out-param, `checkSpanBitmap`'s own return-shape convention
+// extended to four fields: checked, mismatches, span-bookkeeping violations,
+// leaked bytes. Never returns raw addresses -- everything this phase reads
+// is read and checked before its own private heap's `gcDeinit`, so nothing
+// dangles once this function returns.
+fn phaseCacheGuard(results: []i64) {
+  let arena = []i64(RC_ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let heapBlock = []i64(heapWords)
+  let heapLock = []i32(1)
+  let lock = []i32(1)
+  let state = []i64(gcWords)
+  let srcMeta = []i64(META_WORDS)
+  let destMeta = []i64(META_WORDS)
+  let roots = []i64(RC_SRC_OBJS)
+
+  srcMeta[0] = RC_SRC_BODY
+  destMeta[0] = RC_DEST_BODY
+  let mi = 1
+  while (mi < META_WORDS) { // bounded: META_WORDS iterations
+    srcMeta[mi] = 0
+    destMeta[mi] = 0
+    mi = mi + 1
+  }
+  let srcMetaAddr = int(ptrOf(srcMeta))
+  let destMetaAddr = int(ptrOf(destMeta))
+
+  let hp = ptrOf(heapBlock)
+  heapInit(hp)
+  let hlk = ptrOf(heapLock)
+  atomicStore(hlk, spinUnlocked)
+  let lp = ptrOf(lock)
+  atomicStore(lp, spinUnlocked)
+
+  let g = ptrOf(state)
+  let rootsAddr = int(ptrOf(roots))
+  gcBindMemory(
+    g,
+    int(ptrOf(arena)),
+    RC_ARENA_WORDS * 8,
+    int(ptrOf(indexArena)),
+    INDEX_WORDS * 8,
+    4096,
+  )
+  if (!gcInit(g, int(hp), int(hlk), int(lp), srcMetaAddr, 256)) {
+    results[0] = 0
+    results[1] = 1
+    return
+  }
+  gcConfigure(g, true, true, 4096, 200, false)
+
+  let j = 0
+  while (j < RC_SRC_OBJS) { // bounded: RC_SRC_OBJS iterations
+    roots[j] = gcAlloc(g, srcMetaAddr)
+    j = j + 1
+  }
+  gcCollectRoots(g, rootsAddr, RC_SRC_OBJS) // still live: nothing swept
+  let k = 0
+  while (k < RC_SRC_OBJS) { // bounded: RC_SRC_OBJS iterations
+    roots[k] = 0
+    k = k + 1
+  }
+  gcCollectRoots(g, rootsAddr, RC_SRC_OBJS) // all garbage: reclaim fires,
+  // caching the non-anchor owned spans
+
+  let checked = 0
+  let mismatches = 0
+  let lastSpan = 0
+  let total = RC_CACHE_CYCLES * RC_DEST_SPAN_SLOTS
+  let d = 0
+  while (d < total) { // bounded: RC_CACHE_CYCLES * RC_DEST_SPAN_SLOTS
+    let p = gcAlloc(g, destMetaAddr)
+    let span = allocSpanOf(p - gcHeaderSize)
+    if (span != lastSpan) {
+      lastSpan = span
+      checked = checked + 1
+      if (!checkSpanBitmap(span)) {
+        mismatches = mismatches + 1
+      }
+    }
+    d = d + 1
+  }
+
+  let spanBad = gcSpanViolations(g)
+  gcDeinit(g)
+  results[0] = checked
+  results[1] = mismatches
+  results[2] = spanBad
+  results[3] = gcLiveBytes(g)
+}
+
+// --- #4122 phase B: the #4058 free-list node guard --------------------------
+//
+// A span popped as a free-list NODE ITSELF (not merely named in one) carries
+// its own array's addresses in bytes [16, 16 + 8 * entries) -- well past the
+// #3176 bitmap of any class, including a fat one, so unlike phase A this
+// needs no "different class" trick: the SAME fat class (8000-byte body + 32
+// header = 8032 -> class 32, 15 slots/span -- `gcspanblocks`' own fat-body
+// trick) is both the burst that crosses the block boundary and the class
+// re-carved after. Rather than compute exactly which cycle lands on node
+// 2's own pop, this checks the bitmap after EVERY refill along the way: 64
+// (#3045 cache) + 511 (`spanNodeCap` + the node itself) can only ever be
+// exceeded by a burst this size (never guessed at), so RC_CYCLES only needs
+// to be a safe upper bound on however many spans the burst parked -- a
+// cycle that runs past the free list just costs one fresh, clean
+// `reserveGrow` span, still a legitimate (clean) measurement.
+const RC_FAT_BODY: int = 8000
+const RC_FAT_SPAN_SLOTS: int = 15
+const RC_FAT_OBJS: int = 12000 // `gcspanblocks`' own MIN_CHUNKS=18 burst
+// size: >= 576 spans, comfortably past one full free-list node
+const RC_FAT_ARENA_WORDS: int = 512 // tiny: every span is reserve-owned
+const RC_CYCLES: int = 900          // > 64 + 511 + any plausible node-2 tail
+
+fn phaseFreeListGuard(results: []i64) {
+  let arena = []i64(RC_FAT_ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let heapBlock = []i64(heapWords)
+  let heapLock = []i32(1)
+  let lock = []i32(1)
+  let state = []i64(gcWords)
+  let meta = []i64(META_WORDS)
+  let roots = []i64(RC_FAT_OBJS)
+
+  meta[0] = RC_FAT_BODY
+  let mi = 1
+  while (mi < META_WORDS) { // bounded: META_WORDS iterations
+    meta[mi] = 0
+    mi = mi + 1
+  }
+  let metaAddr = int(ptrOf(meta))
+
+  let hp = ptrOf(heapBlock)
+  heapInit(hp)
+  let hlk = ptrOf(heapLock)
+  atomicStore(hlk, spinUnlocked)
+  let lp = ptrOf(lock)
+  atomicStore(lp, spinUnlocked)
+
+  let g = ptrOf(state)
+  let rootsAddr = int(ptrOf(roots))
+  gcBindMemory(
+    g,
+    int(ptrOf(arena)),
+    RC_FAT_ARENA_WORDS * 8,
+    int(ptrOf(indexArena)),
+    INDEX_WORDS * 8,
+    4096,
+  )
+  if (!gcInit(g, int(hp), int(hlk), int(lp), metaAddr, 256)) {
+    results[0] = 0
+    results[1] = 1
+    return
+  }
+  gcConfigure(g, true, true, 4096, 200, false)
+
+  let j = 0
+  while (j < RC_FAT_OBJS) { // bounded: RC_FAT_OBJS iterations
+    roots[j] = gcAlloc(g, metaAddr)
+    j = j + 1
+  }
+  gcCollectRoots(g, rootsAddr, RC_FAT_OBJS) // still live: nothing swept
+  let k = 0
+  while (k < RC_FAT_OBJS) { // bounded: RC_FAT_OBJS iterations
+    roots[k] = 0
+    k = k + 1
+  }
+  gcCollectRoots(g, rootsAddr, RC_FAT_OBJS) // all garbage: reclaim fires,
+  // crossing the cache and at least one full free-list node
+
+  let checked = 0
+  let mismatches = 0
+  let lastSpan = 0
+  let total = RC_CYCLES * RC_FAT_SPAN_SLOTS
+  let d = 0
+  while (d < total) { // bounded: RC_CYCLES * RC_FAT_SPAN_SLOTS
+    let p = gcAlloc(g, metaAddr)
+    let span = allocSpanOf(p - gcHeaderSize)
+    if (span != lastSpan) {
+      lastSpan = span
+      checked = checked + 1
+      if (!checkSpanBitmap(span)) {
+        mismatches = mismatches + 1
+      }
+    }
+    d = d + 1
+  }
+
+  let spanBad = gcSpanViolations(g)
+  gcDeinit(g)
+  results[0] = checked
+  results[1] = mismatches
+  results[2] = spanBad
+  results[3] = gcLiveBytes(g)
+}
+
 fn main() {
   let arena = []i64(ARENA_WORDS)
   let indexArena = []i64(INDEX_WORDS)
@@ -299,23 +550,13 @@ fn main() {
   probeDomain(g, tally, spans, keeper, spanCount, int(ptrOf(arena)), int(ptrOf(indexArena)))
 
   // THE ASSERTION: for every span this run touched, popcount(bitmap) ==
-  // spanTotal - spanFree.
+  // spanTotal - spanFree (`checkSpanBitmap`, shared with the two #4122
+  // phases below).
   let spansOk = 0
   let mismatches = 0
   let sj = 0
   while (sj < spanCount) { // bounded: BM_MAX_SPANS iterations
-    let span = spans[sj]
-    let total = allocSpanTotal(span)
-    let free = allocSpanFree(span)
-    let want = total - free
-    let words = (total + 63) / 64
-    let got = 0
-    let wi = 0
-    while (wi < words) { // bounded: <= 1 word for class 28
-      got = got + popcountWord(allocSpanBitmapWord(span, wi))
-      wi = wi + 1
-    }
-    if (got == want) {
+    if (checkSpanBitmap(spans[sj])) {
       spansOk = spansOk + 1
     } else {
       mismatches = mismatches + 1
@@ -338,5 +579,14 @@ fn main() {
     rooted = 1
   }
 
-  print("gcslotbitmap ${allocOk} ${spanCount} ${spansOk} ${mismatches} ${spanBad} ${leaked} ${rooted} owns ${tally[0]} ${tally[1]} ${tally[2]}\n")
+  // #4122: the two recycling-guard phases, entirely independent private
+  // heaps -- each prints its own checked/mismatch/violation/leaked counts,
+  // so a failure names which guard (cache or free-list) is broken rather
+  // than only that the program failed.
+  let cacheResults = []i64(4)
+  phaseCacheGuard(cacheResults)
+  let flResults = []i64(4)
+  phaseFreeListGuard(flResults)
+
+  print("gcslotbitmap ${allocOk} ${spanCount} ${spansOk} ${mismatches} ${spanBad} ${leaked} ${rooted} owns ${tally[0]} ${tally[1]} ${tally[2]} recycle cache ${cacheResults[0]} ${cacheResults[1]} ${cacheResults[2]} ${cacheResults[3]} freelist ${flResults[0]} ${flResults[1]} ${flResults[2]} ${flResults[3]}\n")
 }

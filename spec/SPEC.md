@@ -3926,35 +3926,50 @@ research under a code-review deadline instead of a design one.
 
 ## 19. Testing
 
-A **test** is a top-level function declared in a file named `<name>.test.bit`,
-taking no parameters and returning nothing. No name prefix is required or
-meaningful — discovery is entirely by filename and shape:
+A **test** is a `test "name" { ... }` declaration in a file named
+`<name>.test.bit`. `test` is a *contextual* keyword (§5.2, like `extern` and
+`readonly`): it lexes as an ordinary identifier and is recognized as a
+declaration only in the exact position `IDENT("test") STRING '{'` at the top
+level of a module, so it introduces no new reserved word and costs no
+existing identifier named `test`.
 
 ```
-fn addition() {
+test "addition" {
   assert(1 + 1 == 2)
 }
 
-fn concat() {
+test "concat" {
   assert("ab" + "c" == "abc", "string concat")
 }
 ```
 
-- No new syntax: a test is an ordinary function, so `test` is not a reserved
-  word (§5.2) and a test may call any function in its module — including a
-  private one declared in a sibling file. A module's files are simply its
-  `*.bit` entries concatenated in one flat scope (§14.8), so a `.test.bit`
-  file sits in the same module as the code it tests and needs no import to
-  reach it.
-- The FILENAME is the only discovery marker. `bit test` scans every top-level
-  function in a `.test.bit` file that takes no parameters and returns
-  nothing, whatever it is named. A differently-shaped function in the same
-  file (one that takes a parameter, or returns a value) is an ordinary
-  helper, not an error — name it however reads best; it is excluded by its
-  shape, never by a naming rule. `main` is the one name excluded regardless
-  of shape: `bit test` renames whatever `main` it finds before synthesizing
-  its own entry point (§17.4), so a user's `fn main(){}` is never itself a
-  discovered test.
+- No parameters, no return type, no receiver, no generics — the grammar admits
+  none of them. A test's body is an ordinary statement list and may call any
+  function in its module, including a private one declared in a sibling file:
+  a module's files are simply its `*.bit` entries concatenated in one flat
+  scope (§14.8), so a `.test.bit` file sits in the same module as the code it
+  tests and needs no import to reach it.
+- The declaration's STRING is its name, shown by `ok`/`FAIL` lines and matched
+  by `--run`'s substring filter (below) — never an identifier, so it may
+  contain spaces, punctuation, anything a string literal can hold.
+- `test "..." { }` outside a `.test.bit` file is E0115: "'test' declarations
+  are only allowed in a '.test.bit' file", reported on the declaration's head.
+- **The legacy form — a plain top-level function, no parameters, no return,
+  discovered by file and shape alone with no `test` keyword — is still
+  supported, but is DEPRECATED in favor of the declaration form above.** A
+  file may mix both forms freely; each is discovered independently and both
+  run under the identical isolation and dispatch rules below. The legacy
+  form exists only because this repository's own `.test.bit` corpus had not
+  yet migrated to it when discovery for the declaration form shipped; new
+  tests should use `test "name" { }`, and the legacy form is expected to be
+  removed once that migration completes. A differently-shaped legacy
+  function (one that takes a parameter, or returns a value) is an ordinary
+  helper, not an error — it is excluded by its shape, never by a naming
+  rule. `main` is the one legacy name excluded regardless of shape: `bit
+  test` renames whatever `main` it finds before synthesizing its own entry
+  point (§17.4), so a user's `fn main(){}` is never itself a discovered
+  test. A `test` declaration can never collide with `main` — its own name
+  is a string, never a symbol.
 - Tests live in one of two places: beside the file they test, as
   `<name>.test.bit`, or grouped under a `_tests_/` subdirectory for
   black-box tests that exercise only a module's exported surface. A
@@ -3968,15 +3983,18 @@ fn concat() {
 - `bit test <file.bit|dir>` discovers every test in the module a file names,
   or in every module beneath a directory — never in a module reached only by
   importing it from outside that directory. It runs each, prints `ok`/`FAIL`
-  per test plus a summary, and exits `0` iff every test passed, `1`
-  otherwise.
+  per test (by its string name) plus a summary, and exits `0` iff every test
+  passed, `1` otherwise. `--run <pattern>` narrows the run to tests whose name
+  contains `pattern` as a literal substring; a pattern that matches nothing is
+  an error, not a silent zero-test pass.
 - A test fails when it panics — which a failed `assert` (§18.4) does. Each test
   therefore runs in its own process, so one failure neither hides the others nor
   aborts the run.
-- Tests are ordinary unreferenced functions to `bit build`/`bit run`, so the
+- Tests are ordinary unreferenced declarations to `bit build`/`bit run`, so the
   linker's dead-strip drops them from a normal program's binary — every
-  function in a `.test.bit` file, test-shaped or not.
-- Test execution order is the order of declaration; tests must not depend on it.
+  test or test-shaped function in a `.test.bit` file, whichever form it uses.
+- Test execution order is the order of declaration, both forms interleaved
+  exactly as written; tests must not depend on it.
 
 Richer assertions with value diffs live in `std/testing`, layered on this runner.
 
