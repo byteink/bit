@@ -586,6 +586,62 @@ bash dist/changelog.sh "${VERSION}" > "${OUT}/NOTES.md" 2>/dev/null || {
 	printf '# Bit %s\n' "${VERSION}" > "${OUT}/NOTES.md"
 }
 
+# Refuse a bullet naming another language BEFORE the draft is created (#3973).
+# Owner ruling 2026-08-30: "in any release notes we don't want to mention Go
+# or any other language for that matter". dist/changelog.sh copies commit
+# SUBJECTS into NOTES.md verbatim, and a subject is authored weeks earlier by
+# someone not thinking about publication — three 0.4.0 bullets named Go and
+# were caught by eye and hand-fixed on the PUBLISHED release. "Write it
+# carefully" cannot fix text that comes from a different corpus than the one
+# anyone reviews; only a mechanical check at cut time can.
+#
+# Case-sensitive, one word each: proper-noun capitalization is what makes this
+# precise instead of noisy — a bare case-insensitive `go` matches ordinary
+# English ("does not go", "let it go") constantly, and this repo's own
+# CLAUDE.md draft pattern (`[^a-z]c[^a-z+]` for a bare "C") matches almost
+# every short word in the corpus. Verified empirically, not assumed: across
+# 3140 non-merge commit subjects and 1315 lines of NOTES.md generated for
+# v0.1.25 through the range since v0.5.0 (10 ranges), this pattern hit 7
+# times and every hit named the language — 0 observed false positives.
+# Golang/Rust/Java/JavaScript/Swift/C++ never occurred at all in that corpus.
+LANG_NAME_PATTERN='\b(Go|Golang|Rust|Zig|Python|Java|TypeScript|JavaScript|Swift)\b|C\+\+'
+
+checkNotesLanguage() { # <notes-file>
+	local notesFile="$1" hits bad=0 lineno text sha
+	[ -f "${notesFile}" ] || {
+		echo "release.sh: ${notesFile} does not exist — cannot check it for language mentions" >&2
+		return 1
+	}
+	hits="$(grep -nE "${LANG_NAME_PATTERN}" "${notesFile}" || true)"
+	[ -z "${hits}" ] && return 0
+
+	# One bullet per line ("- <subject> (<sha>)", dist/changelog.sh), so the
+	# trailing "(<sha>)" is the commit to name alongside the line — the way
+	# abiarity.bit's refusal names the symbol and both arities, not just "a
+	# mismatch exists somewhere".
+	while IFS= read -r line; do
+		[ -n "${line}" ] || continue
+		lineno="${line%%:*}"
+		text="${line#*:}"
+		sha="$(printf '%s' "${text}" | grep -oE '\([0-9a-f]{7,40}\)[[:space:]]*$' | tr -d '()' || true)"
+		if [ -n "${sha}" ] && [ -n "${RELEASE_NOTES_LANG_ALLOW:-}" ]; then
+			case " ${RELEASE_NOTES_LANG_ALLOW} " in
+			*" ${sha} "*) continue ;;
+			esac
+		fi
+		bad=1
+		echo "release.sh: ${notesFile}:${lineno}: names another language: ${text}" >&2
+		[ -n "${sha}" ] && echo "release.sh:   commit ${sha}" >&2
+	done <<<"${hits}"
+	[ "${bad}" -eq 0 ] && return 0
+
+	echo "release.sh: refusing — release notes must not name another language (owner ruling 2026-08-30)" >&2
+	echo "release.sh: reword the commit subject upstream (preferred) or edit ${notesFile} and re-run" >&2
+	echo "release.sh: to approve a specific bullet for this run:" >&2
+	echo "release.sh:   RELEASE_NOTES_LANG_ALLOW=\"<sha> ...\" dist/release.sh ${VERSION}" >&2
+	return 1
+}
+
 # Folds any entries from docs/release/PENDING-NOTES.md into the just-generated
 # NOTES.md (#3213, #3392). Entries live PAST the file's `---` separator —
 # everything above it is static usage documentation, never release content.
@@ -645,6 +701,8 @@ foldPendingNotes() { # <pending-notes-file> <notes-md-file>
 	echo "release.sh: ================================================================" >&2
 }
 foldPendingNotes "${ROOT}/docs/release/PENDING-NOTES.md" "${OUT}/NOTES.md"
+
+checkNotesLanguage "${OUT}/NOTES.md" || exit 1
 
 if [ "${DRY}" -eq 1 ]; then
 	echo "release.sh: --dry-run, publishing nothing. Artifacts in ${OUT}"
