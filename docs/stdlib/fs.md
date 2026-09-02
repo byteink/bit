@@ -115,6 +115,23 @@ fn head(path: string, n: int): string! {
 }
 ```
 
+## The current directory
+
+### `cwd(): string!`
+
+The absolute path of the process's current working directory. Fails if it
+could not be determined — the directory was removed out from under the
+running process, a path component became unreadable, or the resolved path
+exceeds the runtime's path length limit.
+
+```bit
+import { cwd } from "std/fs"
+
+fn describeCwd(): string! {
+  return "running in ${cwd()?}"
+}
+```
+
 ## Inspecting
 
 ### `exists(path: string): bool`
