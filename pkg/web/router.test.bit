@@ -1,0 +1,416 @@
+// pkg/web/router.test.bit — precedence, conflict detection, the awkward
+// paths, and a measurement of the short-circuit claim (#3881's acceptance:
+// "prove the precedence, do not assert it").
+//
+// Handler is `() => ()` (router.bit's placeholder alias) and function
+// values are not comparable (E0052), so "which handler matched" is proven
+// by CALLING `m.handler()` and observing which closure wrote to its own
+// test-local `called` variable — never by comparing handler references.
+
+import { contains } from "std/strings"
+import { monotonic, since } from "std/time"
+
+// --- precedence, distinguished rather than merely exercised ---------------
+
+// Registers `:id` BEFORE `new`, on purpose — precedence must come from the
+// segment KIND, never from registration order.
+test "static beats param beats wildcard, order-independent of registration" {
+  let called = ""
+  let hId: Handler = () => {
+    called = "id"
+  }
+  let hNew: Handler = () => {
+    called = "new"
+  }
+  let hList: Handler = () => {
+    called = "list"
+  }
+  let hFiles: Handler = () => {
+    called = "files"
+  }
+
+  let r = Router()
+  r.add("GET", "/users/:id", hId)
+  r.add("GET", "/users/new", hNew)
+  r.add("GET", "/users", hList)
+  r.add("GET", "/files/*path", hFiles)
+  r.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+
+  let m1 = r.lookup("GET", "/users/new") catch e {
+    panic("lookup /users/new: ${e.message()}")
+  }
+  m1.handler()
+  assert(called == "new", "/users/new must take the STATIC route, not :id (got '${called}')")
+
+  called = ""
+  let m2 = r.lookup("GET", "/users/42") catch e {
+    panic("lookup /users/42: ${e.message()}")
+  }
+  m2.handler()
+  assert(called == "id", "/users/42 must take the param route (got '${called}')")
+  let (id, idOk) = m2.params["id"]
+  assert(idOk, "expected an 'id' param")
+  assert(id == "42", "id param: got '${id}'")
+
+  let m3 = r.lookup("GET", "/files/a/b/c") catch e {
+    panic("lookup /files/a/b/c: ${e.message()}")
+  }
+  let (path, pathOk) = m3.params["path"]
+  assert(pathOk, "expected a 'path' param")
+  assert(path == "a/b/c", "wildcard param: got '${path}'")
+}
+
+// A path that could resolve through EITHER a param edge or a wildcard edge
+// at the same position must take the param — the case a suite that only
+// tests static-vs-param can miss entirely.
+test "param beats wildcard when both could match" {
+  let called = ""
+  let hRest: Handler = () => {
+    called = "rest"
+  }
+  let hId: Handler = () => {
+    called = "id"
+  }
+
+  let r = Router()
+  r.add("GET", "/x/*rest", hRest)
+  r.add("GET", "/x/:id", hId)
+  r.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+
+  let m = r.lookup("GET", "/x/hello") catch e {
+    panic("lookup /x/hello: ${e.message()}")
+  }
+  m.handler()
+  assert(called == "id", "/x/hello must take :id, not *rest (got '${called}')")
+  let (v, ok) = m.params["id"]
+  assert(ok && v == "hello", "id param: got '${v}'")
+}
+
+// A static route several segments deeper than a wildcard's own edge must
+// still win — the wildcard must not "swallow" a later static match just
+// because it is reachable first.
+test "a deep static route beats a shallower wildcard" {
+  let called = ""
+  let hWild: Handler = () => {
+    called = "wild"
+  }
+  let hStatic: Handler = () => {
+    called = "static"
+  }
+
+  let r = Router()
+  r.add("GET", "/assets/*path", hWild)
+  r.add("GET", "/assets/special/report", hStatic)
+  r.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+
+  let m1 = r.lookup("GET", "/assets/special/report") catch e {
+    panic("lookup /assets/special/report: ${e.message()}")
+  }
+  m1.handler()
+  assert(called == "static", "the fully-static path must win over the wildcard (got '${called}')")
+
+  called = ""
+  let m2 = r.lookup("GET", "/assets/other/thing") catch e {
+    panic("lookup /assets/other/thing: ${e.message()}")
+  }
+  m2.handler()
+  assert(
+    called == "wild",
+    "a non-static path must still fall through to the wildcard (got '${called}')",
+  )
+  let (rest, ok) = m2.params["path"]
+  assert(ok && rest == "other/thing", "wildcard param: got '${rest}'")
+}
+
+// A static branch that only exists as a PREFIX of some deeper pattern (no
+// handler of its own at this depth) must not block precedence from falling
+// through to a param that DOES have a handler here — the trie's own
+// internal bookkeeping (a node with children but no handlers) must never
+// leak into the caller as a false miss.
+test "a static prefix with no handler at this depth falls through to param" {
+  let called = ""
+  let hParam: Handler = () => {
+    called = "param"
+  }
+  let hDeep: Handler = () => {
+    called = "deep"
+  }
+
+  let r = Router()
+  r.add("GET", "/a/b/c", hDeep)
+  r.add("GET", "/a/:x", hParam)
+  r.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+
+  let m = r.lookup("GET", "/a/b") catch e {
+    panic("lookup /a/b: ${e.message()}")
+  }
+  m.handler()
+  assert(
+    called == "param",
+    "/a/b must fall through to :x, 'b' alone has no handler (got '${called}')",
+  )
+  let (x, ok) = m.params["x"]
+  assert(ok && x == "b", "x param: got '${x}'")
+}
+
+// --- 404 vs 405, distinguishable by TYPE, not by message text -------------
+
+test "a method mismatch is reported distinguishably from no match at all" {
+  let hId: Handler = () => {}
+
+  let r = Router()
+  r.add("GET", "/users/:id", hId)
+  r.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+
+  let sawMethodNotAllowed = false
+  let allowed = []string(0)
+  let _ = r.lookup("DELETE", "/users/42") catch e {
+    let (mna, ok) = e.(MethodNotAllowed)
+    if (ok) {
+      sawMethodNotAllowed = true
+      allowed = mna.allowed
+    }
+    Match{ handler: hId, params: map<string, string>() }
+  }
+  assert(sawMethodNotAllowed, "DELETE /users/42 must fail as MethodNotAllowed, not a plain miss")
+  assert(len(allowed) == 1 && allowed[0] == "GET", "allowed methods: got ${len(allowed)}")
+
+  let sawPlainMiss = false
+  let _ = r.lookup("GET", "/nope") catch e {
+    let (_, ok) = e.(MethodNotAllowed)
+    sawPlainMiss = !ok
+    Match{ handler: hId, params: map<string, string>() }
+  }
+  assert(sawPlainMiss, "GET /nope must NOT be reported as MethodNotAllowed")
+}
+
+// --- freeze() conflict detection, each naming the offending pattern(s) ----
+
+test "freeze reports a duplicate method and pattern, naming it" {
+  let h: Handler = () => {}
+  let r = Router()
+  r.add("GET", "/x", h)
+  r.add("GET", "/x", h)
+  let msg = freezeErr(r)
+  assert(contains(msg, "GET"), "message must name the method: ${msg}")
+  assert(contains(msg, "/x"), "message must name the pattern: ${msg}")
+}
+
+test "freeze reports a :id vs :userId clash, naming both patterns" {
+  let h: Handler = () => {}
+  let r = Router()
+  r.add("GET", "/users/:id", h)
+  r.add("POST", "/users/:userId", h)
+  let msg = freezeErr(r)
+  assert(contains(msg, "/users/:id"), "message must name the first pattern: ${msg}")
+  assert(contains(msg, "/users/:userId"), "message must name the second pattern: ${msg}")
+}
+
+test "freeze reports a non-final wildcard" {
+  let h: Handler = () => {}
+  let r = Router()
+  r.add("GET", "/files/*path/extra", h)
+  let msg = freezeErr(r)
+  assert(contains(msg, "/files/*path/extra"), "message must name the pattern: ${msg}")
+  assert(contains(msg, "wildcard"), "message must say why: ${msg}")
+}
+
+// --- awkward paths, each with a specified (not incidental) behaviour ------
+
+// "" and "/" both mean the root, and are the SAME lookup target.
+test "an empty path and a bare slash both mean the root" {
+  let called = ""
+  let h: Handler = () => {
+    called = "root"
+  }
+  let r = Router()
+  r.add("GET", "/", h)
+  r.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  let m1 = r.lookup("GET", "/") catch e {
+    panic("lookup '/': ${e.message()}")
+  }
+  m1.handler()
+  assert(called == "root", "'/' must match the root route")
+
+  called = ""
+  let m2 = r.lookup("GET", "") catch e {
+    panic("lookup '': ${e.message()}")
+  }
+  m2.handler()
+  assert(called == "root", "'' must match the root route exactly like '/'")
+}
+
+// A trailing slash is a real, distinct, EMPTY final segment — never
+// collapsed — so "/users/" only matches a pattern registered with that
+// trailing segment, never "/users" itself.
+test "a trailing slash is significant, not collapsed" {
+  let called = ""
+  let hPlain: Handler = () => {
+    called = "plain"
+  }
+  let hSlash: Handler = () => {
+    called = "slash"
+  }
+  let r = Router()
+  r.add("GET", "/users", hPlain)
+  r.add("GET", "/users/", hSlash)
+  r.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  let m1 = r.lookup("GET", "/users") catch e {
+    panic("lookup /users: ${e.message()}")
+  }
+  m1.handler()
+  assert(called == "plain", "/users must take the no-slash route")
+
+  called = ""
+  let m2 = r.lookup("GET", "/users/") catch e {
+    panic("lookup /users/: ${e.message()}")
+  }
+  m2.handler()
+  assert(called == "slash", "/users/ must take the trailing-slash route, a DIFFERENT one")
+}
+
+test "a param may sit at the root, and two params may follow each other" {
+  let h: Handler = () => {}
+
+  let r1 = Router()
+  r1.add("GET", "/:only", h)
+  r1.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  let m1 = r1.lookup("GET", "/hello") catch e {
+    panic("lookup /hello: ${e.message()}")
+  }
+  let (only, onlyOk) = m1.params["only"]
+  assert(onlyOk && only == "hello", "root param: got '${only}'")
+
+  let r2 = Router()
+  r2.add("GET", "/:a/:b", h)
+  r2.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  let m2 = r2.lookup("GET", "/x/y") catch e {
+    panic("lookup /x/y: ${e.message()}")
+  }
+  let (a, aOk) = m2.params["a"]
+  let (b, bOk) = m2.params["b"]
+  assert(aOk && a == "x", "first param: got '${a}'")
+  assert(bOk && b == "y", "second param: got '${b}'")
+}
+
+// No percent-decoding happens anywhere in this module: a captured segment
+// comes back byte-for-byte as it appeared in the request path.
+test "a percent-encoded segment is captured literally, not decoded" {
+  let h: Handler = () => {}
+  let r = Router()
+  r.add("GET", "/search/:term", h)
+  r.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  let m = r.lookup("GET", "/search/hello%20world") catch e {
+    panic("lookup: ${e.message()}")
+  }
+  let (term, ok) = m.params["term"]
+  assert(ok && term == "hello%20world", "term param: got '${term}', expected the raw encoded text")
+}
+
+// --- scale: correctness and cost among a large route table ----------------
+
+// 1000 unrelated static routes plus one 4-segment target — the target must
+// still resolve correctly.
+test "a table of 1000 registered routes still matches a 4-segment path" {
+  let h: Handler = () => {}
+  let r = Router()
+  let i = 0
+  while (i < 1000) {
+    r.add("GET", "/r${i}", h)
+    i = i + 1
+  }
+  r.add("GET", "/api/v1/users/:id", h)
+  r.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  let m = r.lookup("GET", "/api/v1/users/777") catch e {
+    panic("lookup: ${e.message()}")
+  }
+  let (id, ok) = m.params["id"]
+  assert(ok && id == "777", "id param amid 1000 routes: got '${id}'")
+}
+
+// The short-circuit claim, measured rather than asserted: looking up the
+// SAME 4-segment path costs about the same whether it is the only route
+// registered or one of 1001. A route COUNT that mattered (an O(n) scan)
+// would show roughly a 1000x gap between these two; a per-segment radix
+// walk shows close to 1x. 5000 lookups per router, to average out clock
+// noise; the tolerance (8x, plus a fixed 1ms floor) is generous on purpose
+// since this runs on a shared, often-contended build box (see
+// bitlang-ws/CLAUDE.md's timing notes) — the point is ruling out O(n)
+// growth, not a tight benchmark.
+test "lookup cost does not grow with the number of registered routes" {
+  let h: Handler = () => {}
+  let target = "/api/v1/users/777"
+  let iterations = 5000
+
+  let small = Router()
+  small.add("GET", "/api/v1/users/:id", h)
+  small.freeze() catch e {
+    panic("freeze small: ${e.message()}")
+  }
+
+  let big = Router()
+  let i = 0
+  while (i < 1000) {
+    big.add("GET", "/r${i}", h)
+    i = i + 1
+  }
+  big.add("GET", "/api/v1/users/:id", h)
+  big.freeze() catch e {
+    panic("freeze big: ${e.message()}")
+  }
+
+  let smallNs = timeLookups(small, target, iterations)
+  let bigNs = timeLookups(big, target, iterations)
+  print("router bench: 1 route = ${smallNs}ns, 1001 routes = ${bigNs}ns, over ${iterations} lookups each\n")
+
+  assert(
+    bigNs < smallNs * 8 + 1000000,
+    "1001-route lookup (${bigNs}ns) should not scale with route count vs. the 1-route baseline (${smallNs}ns)",
+  )
+}
+
+fn timeLookups(r: Router, path: string, iterations: int): int {
+  let start = monotonic()
+  let i = 0
+  while (i < iterations) {
+    let _ = r.lookup("GET", path) catch e {
+      panic("lookup: ${e.message()}")
+    }
+    i = i + 1
+  }
+  return since(start)
+}
+
+// Runs freeze() on a router already known to hold a conflict and returns
+// the error message, panicking if freeze() unexpectedly succeeds — every
+// conflict-detection test in this file shares this shape.
+fn freezeErr(r: Router): string {
+  let msg = ""
+  let _ = r.freeze() catch e {
+    msg = e.message()
+  }
+  assert(len(msg) > 0, "expected freeze() to fail")
+  return msg
+}

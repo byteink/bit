@@ -1,0 +1,378 @@
+// pkg/web/router.bit — a radix trie over path segments, standalone: no
+// dependency on Ctx, App or HTTP (#3881). Takes a method and a path, returns
+// the matched entry plus its extracted parameters.
+//
+// Lookup cost is the number of segments in the REQUEST, not the number of
+// routes registered — 10 routes or 10,000, the same walk, and it
+// short-circuits: `/api/v1/users/123` fails at segment one if nothing is
+// registered under `/api` (see router.test.bit's `route table of 1000...`
+// case for the measurement).
+//
+// Precedence at each node is static, then param, then wildcard, decided at
+// MATCH time by `tryStatic`/`tryParam`/`tryWildcard` in that order — never by
+// registration order. A registered pattern's SHAPE is fixed the moment its
+// nodes are created; only the trie's construction differs from a hand-built
+// one in that two different patterns can create or reuse the same node.
+//
+// `Handler` is an opaque placeholder shape (`() => ()`) rather than the real
+// `(Ctx) => Res!` the epic describes (#3875's "Handlers return Res!"),
+// because that type does not exist yet without importing stdlib/http and the
+// rest of pkg/web — forbidden by this ticket's own constraint. #3885 (the
+// stdlib adapter) is expected to widen this alias once Ctx/Res land; aliases
+// are transparent (SPEC §14.1), so nothing about Router's shape changes when
+// it does.
+import { join, split } from "std/strings"
+import { sorted } from "std/sort"
+
+export type Handler = () => ()
+
+// A miss distinguishable from a plain 404: the path resolved to a node that
+// has a handler for SOME method, just not the one asked for. Structurally
+// satisfies `error` (has `message()`), so a caller tells the two apart with
+// a type assertion (`e.(MethodNotAllowed)`) instead of parsing message text.
+export class MethodNotAllowed {
+  export method: string
+  export path: string
+  export allowed: []string
+  export message(): string {
+    let allow = join(this.allowed, ", ")
+    return "405: ${this.method} ${this.path} not allowed (allowed: ${allow})"
+  }
+}
+
+export class Match {
+  export handler: Handler,
+  export params: map<string, string>,
+}
+
+// One trie node. Children are keyed three ways, one per precedence level:
+// `staticChildren` breaks the Node/Node self-reference the same way SPEC
+// §13.3's own `Trie { next: map<rune, Trie> }` example does; `paramChild`
+// and `wildcardChild` use `Option<Node>` for the same reason (SPEC §13.4) —
+// at most one of each per node, since a second param or wildcard at the same
+// position is exactly the name-clash conflict `freeze()` reports.
+//
+// A Node's `Option<Node>` fields are NEVER left at their default: #4182
+// found that a zero-valued `Option<T>` segfaults the moment its tag is read
+// (match/isNone/isSome), so `newNode()` below always sets both explicitly to
+// `Option<Node>.None`, and nothing in this file ever constructs a `Node`
+// literal any other way.
+class Node {
+  staticChildren: map<string, Node>,
+  paramChild: Option<Node>,
+  paramName: string,
+  paramPattern: string,
+  wildcardChild: Option<Node>,
+  wildcardName: string,
+  wildcardPattern: string,
+  // method -> handler, present only on a node that is some pattern's own
+  // terminal (an intermediate node like "users" in "/users/new" has none).
+  handlers: map<string, Handler>,
+  // method -> the exact pattern text registered for it, kept only to name
+  // both sides of a "duplicate method+pattern" conflict.
+  handlerPattern: map<string, string>,
+}
+
+fn newNode(): Node {
+  return Node{
+    staticChildren: map<string, Node>(),
+    paramChild: Option<Node>.None,
+    paramName: "",
+    paramPattern: "",
+    wildcardChild: Option<Node>.None,
+    wildcardName: "",
+    wildcardPattern: "",
+    handlers: map<string, Handler>(),
+    handlerPattern: map<string, string>(),
+  }
+}
+
+export class Router {
+  root: Node
+  errors: []string
+  frozen: bool
+
+  init() {
+    this.root = newNode()
+  }
+
+  // Builds/reuses the nodes for `pattern`'s segments and registers `h` at
+  // the terminal. Never fails directly — SPEC-shaped conflicts (a non-final
+  // wildcard, a param/wildcard name clash, a duplicate method+pattern) are
+  // recorded and only surface when `freeze()` is called, per the ticket's
+  // "do not defer conflict detection to request time; it runs at freeze" —
+  // read the other way, detection may happen as routes register, but the
+  // ERROR is never raised before freeze().
+  //
+  // `method` is matched by exact string equality, both here and in
+  // `lookup()` — no case-folding. HTTP methods are conventionally already
+  // uppercase (GET, POST, ...); the caller supplies a canonical spelling
+  // rather than this module guessing one.
+  export add(method: string, pattern: string, h: Handler) {
+    let segs = splitSegments(pattern)
+    let node = this.root
+    let i = 0
+    while (i < len(segs)) {
+      let seg = segs[i]
+      let isLast = i == len(segs) - 1
+      if (isParamSeg(seg)) {
+        node = this.descendParam(node, segName(seg), pattern)
+      } else if (isWildcardSeg(seg)) {
+        if (!isLast) {
+          this.errors = append(
+            this.errors,
+            "wildcard '${seg}' in pattern '${pattern}' is not the final segment",
+          )
+          return
+        }
+        node = this.descendWildcard(node, segName(seg), pattern)
+      } else {
+        node = descendStatic(node, seg)
+      }
+      i = i + 1
+    }
+    this.registerHandler(node, method, pattern, h)
+  }
+
+  descendParam(node: Node, name: string, pattern: string): Node {
+    match (node.paramChild) {
+      None => {
+        let created = newNode()
+        node.paramChild = Option.Some(created)
+        node.paramName = name
+        node.paramPattern = pattern
+        return created
+      }
+      Some(pc) => {
+        if (node.paramName != name) {
+          this.errors = append(
+            this.errors,
+            "param name clash at the same position: '${node.paramPattern}' declares :${node.paramName}, '${pattern}' declares :${name}",
+          )
+        }
+        return pc
+      }
+    }
+  }
+
+  descendWildcard(node: Node, name: string, pattern: string): Node {
+    match (node.wildcardChild) {
+      None => {
+        let created = newNode()
+        node.wildcardChild = Option.Some(created)
+        node.wildcardName = name
+        node.wildcardPattern = pattern
+        return created
+      }
+      Some(wc) => {
+        if (node.wildcardName != name) {
+          this.errors = append(
+            this.errors,
+            "wildcard name clash at the same position: '${node.wildcardPattern}' declares *${node.wildcardName}, '${pattern}' declares *${name}",
+          )
+        }
+        return wc
+      }
+    }
+  }
+
+  registerHandler(node: Node, method: string, pattern: string, h: Handler) {
+    let (existing, ok) = node.handlerPattern[method]
+    if (ok) {
+      this.errors = append(
+        this.errors,
+        "duplicate handler for ${method} ${pattern} (already registered as ${existing})",
+      )
+      return
+    }
+    node.handlers[method] = h
+    node.handlerPattern[method] = pattern
+  }
+
+  // Closes registration. A router with any recorded conflict fails here,
+  // naming every offending pattern in one message; a caller past this point
+  // may `lookup()`.
+  export freeze(): ()! {
+    this.frozen = true
+    if (len(this.errors) > 0) {
+      fail newError(join(this.errors, "\n"))
+    }
+  }
+
+  // Matches `path` against the frozen trie and looks up `method` at the
+  // resolved node. Three outcomes: a `Match`, a plain "no route" `error`
+  // (nothing registered for this path under any method), or a
+  // `MethodNotAllowed` (this exact path IS registered, just not for
+  // `method`) — the 404-vs-405 distinction the ticket requires.
+  //
+  // Named `lookup`, not the ticket's literal `match` — `match` is a
+  // reserved keyword (SPEC §5.2) and cannot name a method at all; this is a
+  // second, undocumented translation the same amendment that retired the
+  // receiver form should have flagged.
+  export lookup(method: string, path: string): Match! {
+    if (!this.frozen) {
+      fail newError("router: lookup() called before freeze()")
+    }
+    let segs = splitSegments(path)
+    let r = matchNode(this.root, segs, 0)
+    match (r) {
+      None => fail newError("no route matches ${method} ${path}")
+      Some(mi) => return finishMatch(mi, method, path)?
+    }
+  }
+}
+
+// --- segment / pattern helpers -------------------------------------------
+
+fn isParamSeg(seg: string): bool {
+  return len(seg) > 0 && seg[0] == ':'
+}
+
+fn isWildcardSeg(seg: string): bool {
+  return len(seg) > 0 && seg[0] == '*'
+}
+
+// The name after a leading `:` or `*` — both strip the same one byte.
+fn segName(seg: string): string {
+  return seg[1:len(seg)]
+}
+
+// `/` and `` both mean the root (zero segments) — a deliberate design
+// choice, not a fallthrough: a caller that never normalizes an empty path
+// still gets root behaviour instead of an out-of-range slice. Every other
+// slash is significant, INCLUDING a trailing one: `splitSegments("/a/")` is
+// `["a", ""]`, one real (empty-string) segment longer than
+// `splitSegments("/a")`'s `["a"]`, so `/a/` matches only a route registered
+// with that trailing empty segment, never `/a` itself. No percent-decoding
+// happens anywhere in this file: a `%2F` inside a segment is three literal
+// bytes, never a separator, and a param/wildcard capture returns it
+// unmolested.
+fn splitSegments(path: string): []string {
+  if (path == "/" || path == "") {
+    return []string(0)
+  }
+  let p = path
+  if (p[0] == '/') {
+    p = p[1:len(p)]
+  }
+  return split(p, "/")
+}
+
+fn joinFrom(segs: []string, idx: int): string {
+  return join(segs[idx:len(segs)], "/")
+}
+
+// --- matching --------------------------------------------------------------
+
+// One param binding accumulated on the way back up a successful match.
+class ParamBinding {
+  name: string,
+  value: string,
+}
+
+class MatchInternal {
+  node: Node,
+  params: []ParamBinding,
+}
+
+// Recursive descent with backtracking: static, then param, then wildcard,
+// at every node — so a static branch that dead-ends deeper in the tree does
+// not shadow a param branch that would have matched. `idx == len(segs)` is
+// the only place a match can terminate, and it only counts as a match if
+// the node has a handler for SOME method (`terminalMatch`) — otherwise it
+// is a purely intermediate node (e.g. "users" in a trie holding only
+// "/users/new"), and the caller must keep trying the next precedence level.
+fn matchNode(node: Node, segs: []string, idx: int): Option<MatchInternal> {
+  if (idx == len(segs)) {
+    return terminalMatch(node)
+  }
+  let seg = segs[idx]
+  match (tryStatic(node, segs, idx, seg)) {
+    Some(m) => return Option.Some(m)
+    None => {}
+  }
+  match (tryParam(node, segs, idx, seg)) {
+    Some(m) => return Option.Some(m)
+    None => {}
+  }
+  return tryWildcard(node, segs, idx)
+}
+
+fn terminalMatch(node: Node): Option<MatchInternal> {
+  if (len(node.handlers) > 0) {
+    return Option.Some(MatchInternal{ node: node, params: []ParamBinding(0) })
+  }
+  return Option.None
+}
+
+fn descendStatic(node: Node, seg: string): Node {
+  let (child, ok) = node.staticChildren[seg]
+  if (ok) {
+    return child
+  }
+  let created = newNode()
+  node.staticChildren[seg] = created
+  return created
+}
+
+fn tryStatic(node: Node, segs: []string, idx: int, seg: string): Option<MatchInternal> {
+  let (child, ok) = node.staticChildren[seg]
+  if (!ok) {
+    return Option.None
+  }
+  return matchNode(child, segs, idx + 1)
+}
+
+fn tryParam(node: Node, segs: []string, idx: int, seg: string): Option<MatchInternal> {
+  match (node.paramChild) {
+    None => return Option.None
+    Some(pc) => {
+      match (matchNode(pc, segs, idx + 1)) {
+        None => return Option.None
+        Some(m) => {
+          m.params = append(m.params, ParamBinding{ name: node.paramName, value: seg })
+          return Option.Some(m)
+        }
+      }
+    }
+  }
+}
+
+// A wildcard consumes every remaining segment in one step (it must be the
+// final segment — `add()` already refused any pattern where it is not), so
+// it needs at least one remaining segment: `idx == len(segs)` already
+// returned in `matchNode` before this is ever tried, so `/files/*path`
+// never matches a bare `/files`.
+fn tryWildcard(node: Node, segs: []string, idx: int): Option<MatchInternal> {
+  match (node.wildcardChild) {
+    None => return Option.None
+    Some(wc) => {
+      if (len(wc.handlers) == 0) {
+        return Option.None
+      }
+      let params = []ParamBinding(0)
+      params = append(params, ParamBinding{ name: node.wildcardName, value: joinFrom(segs, idx) })
+      return Option.Some(MatchInternal{ node: wc, params: params })
+    }
+  }
+}
+
+fn finishMatch(mi: MatchInternal, method: string, path: string): Match! {
+  let (h, ok) = mi.node.handlers[method]
+  if (!ok) {
+    fail MethodNotAllowed{ method: method, path: path, allowed: allowedMethods(mi.node) }
+  }
+  let params = map<string, string>()
+  for b of mi.params {
+    params[b.name] = b.value
+  }
+  return Match{ handler: h, params: params }
+}
+
+fn allowedMethods(node: Node): []string {
+  let out = []string(0)
+  for (m, _) of node.handlers {
+    out = append(out, m)
+  }
+  return sorted(out, (a, b) => a < b)
+}
