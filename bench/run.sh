@@ -64,7 +64,7 @@ trimmean() { sort -n | awk '{a[NR]=$1} END{k=int(NR/5); if(k<1)k=1; n=NR-k;
 size()   { stat -f%z "$1"; }
 get()    { awk -v c="$1" -v l="$2" -v k="$3" '$1==c&&$2==l{print $(k)}' "$RES"; }  # k: 3=s 4=rss 5=bin 6=cyc 7=instr
 alc()    { awk -v c="$1" -v l="$2" '$1==c&&$2==l{print $3}' "$ALC"; }
-alcmd()  { n=$(alc "$1" "$2"); [ -n "$n" ] && echo "$n" || echo "—"; }
+alcmd()  { n=$(alc "$1" "$2"); [ -n "$n" ] && echo "$n" || echo "n/a"; }
 
 # Heap allocations one run of a case performs, per language — the number that
 # proves the three sources still express the SAME data structure (#3934: the
@@ -72,7 +72,7 @@ alcmd()  { n=$(alc "$1" "$2"); [ -n "$n" ] && echo "$n" || echo "—"; }
 # C sides kept allocating per node, and the row compared them for a day). Bit
 # reports it from the runtime (BIT_GC_STATS, every case); Go and C report it
 # only where the source opts in (see bench/cases/alloc/alloc.go's
-# `reportAllocs` and alloc.c's BENCH_ALLOC_STATS), and print "—" otherwise.
+# `reportAllocs` and alloc.c's BENCH_ALLOC_STATS), and print "n/a" otherwise.
 bit_allocs() { awk '{for(i=1;i<=NF;i++){if($i~/^swept=/){s=substr($i,7)}
                      if($i~/^live=/){l=substr($i,6)}}}
                 END{if(s!="")print s+l}' "$1"; }
@@ -201,7 +201,7 @@ mil()  { awk -v x="$1" 'BEGIN{printf "%.1f", x/1000000}'; }
 # for allocflat because its C median rounded to 0.000s.
 netcyc() { awk -v t="$(get "$1" "$2" 6)" -v b="$(scyc "$2")" 'BEGIN{v=t-b; if(v<1)v=1; print v}'; }
 netins() { awk -v t="$(get "$1" "$2" 7)" -v b="$(sins "$2")" 'BEGIN{v=t-b; if(v<1)v=1; print v}'; }
-ratio()  { awk -v a="$1" -v b="$2" 'BEGIN{if(b+0<=0){printf "—"}else{printf "%.2fx", a/b}}'; }
+ratio()  { awk -v a="$1" -v b="$2" 'BEGIN{if(b+0<=0){printf "n/a"}else{printf "%.2fx", a/b}}'; }
 
 STARTBASE=$(awk '{printf "%s%s %.1fM", (NR>1?", ":""), $1, $2/1000000} END{print ""}' "$WORK/startcyc")
 
@@ -209,7 +209,7 @@ md="$WORK/results.md"
 {
   echo "_Full method and caveats below the tables._"
   echo
-  echo "### Runtime — CPU cycles, lower is better"
+  echo "### Runtime: CPU cycles, lower is better"
   echo
   echo "| Benchmark | Bit | Go | C | Bit / Go | Bit / C |"
   echo "|---|--:|--:|--:|--:|--:|"
@@ -219,7 +219,7 @@ md="$WORK/results.md"
          "$(ratio "$bcy" "$gcy") | $(ratio "$bcy" "$ccy") |"
   done
   echo
-  echo "### Instructions retired — work emitted, not time taken"
+  echo "### Instructions retired: work emitted, not time taken"
   echo
   echo "| Benchmark | Bit | Go | C |"
   echo "|---|--:|--:|--:|"
@@ -227,7 +227,7 @@ md="$WORK/results.md"
     echo "| $c | $(mil "$(netins "$c" bit)") M | $(mil "$(netins "$c" go)") M | $(mil "$(netins "$c" c)") M |"
   done
   echo
-  echo "### Wall clock — median of ${RUNS} runs, context only"
+  echo "### Wall clock: median of ${RUNS} runs, context only"
   echo
   echo "| Benchmark | Bit | Go | C |"
   echo "|---|--:|--:|--:|"
@@ -235,7 +235,7 @@ md="$WORK/results.md"
     echo "| $c | $(secs "$(get "$c" bit 3)")s | $(secs "$(get "$c" go 3)")s | $(secs "$(get "$c" c 3)")s |"
   done
   echo
-  echo "### Peak memory — max RSS, lower is better"
+  echo "### Peak memory: max RSS, lower is better"
   echo
   echo "| Benchmark | Bit | Go | C |"
   echo "|---|--:|--:|--:|"
@@ -243,7 +243,7 @@ md="$WORK/results.md"
     echo "| $c | $(mb "$(get "$c" bit 4)") MB | $(mb "$(get "$c" go 4)") MB | $(mb "$(get "$c" c 4)") MB |"
   done
   echo
-  echo "### Heap allocations per run — the equivalence check, not a score"
+  echo "### Heap allocations per run: the equivalence check, not a score"
   echo
   echo "| Benchmark | Bit | Go | C |"
   echo "|---|--:|--:|--:|"
@@ -251,7 +251,7 @@ md="$WORK/results.md"
     echo "| $c | $(alcmd "$c" bit) | $(alcmd "$c" go) | $(alcmd "$c" c) |"
   done
   echo
-  echo "### Binary size — static, as emitted"
+  echo "### Binary size: static, as emitted"
   echo
   echo "| Benchmark | Bit | Go | C |"
   echo "|---|--:|--:|--:|"
@@ -268,15 +268,15 @@ md="$WORK/results.md"
   echo "Bit compile speed: **${lps} lines/sec** (${srclines} lines across ${comp_n} cases, warm)."
   echo
   echo "> Machine: ${CPU}, macOS ${OSV}. Bit @ \`${GITSHA}\`, Go $(go version | awk '{print $3}'), $(cc --version | head -1)."
-  echo "> Method: ${RUNS} runs per case per language. Cycles and instructions are a trimmed mean of those runs — the mean after dropping the slowest fifth, which was the most reproducible of four estimators measured over 40 samples per series; wall clock and RSS are the median. C built \`cc ${CFLAGS}\`, Go \`go build\`, Bit \`bit build\` — each language's standard optimized build."
-  echo "> Mandelbrot: Bit and C agree to the last bit; Go differs by ~0.0002% because it contracts \`a*b+c\` to a hardware FMA. Not a bug — cross-compiler float bit-identity is not guaranteed."
+  echo "> Method: ${RUNS} runs per case per language. Cycles and instructions are a trimmed mean of those runs, meaning the mean after dropping the slowest fifth, which was the most reproducible of four estimators measured over 40 samples per series; wall clock and RSS are the median. C built \`cc ${CFLAGS}\`, Go \`go build\`, Bit \`bit build\`, each language's standard optimized build."
+  echo "> Mandelbrot: Bit and C agree to the last bit; Go differs by ~0.0002% because it contracts \`a*b+c\` to a hardware FMA. Not a bug: cross-compiler float bit-identity is not guaranteed."
   echo "> alloc measures the ALLOCATOR: 10M short-lived nodes, each its own heap object in all three languages (Bit's element class has a reference field, Go holds \`[]*Node\`, C mallocs per node). allocflat measures DATA LAYOUT: the same 10M nodes and the same printed total, stored by value in one buffer per batch (Bit packs \`[]Node\` inline since #3862, Go holds \`[]Node\`, C mallocs the batch once). The gap between the two rows is what per-node heap allocation costs a language."
-  echo "> The allocation table above is how those two claims are checked rather than asserted — same order of magnitude across a row means the three sources still express the same data structure, which is exactly what \`alloc\` silently lost for a day (#3934). Bit's count is \`swept+live\` from \`BIT_GC_STATS=1\`; Go's is \`runtime.MemStats.Mallocs\` and C's a \`malloc\` counter, both opt-in (\`BENCH_ALLOC_STATS\`, \`-DBENCH_ALLOC_STATS\`) and both absent from every timed binary."
-  echo "> The ratios are built from CYCLES, not from wall clock. \`/usr/bin/time\` reports \`real\` in hundredths of a second and most of the C sides here finish in under 0.10s, so a wall-clock ratio for those rows is quantisation: \`map\` published 7.50x C off 0.300s/0.040s where the counters say ~4.5x. Adding runs does not fix that — it narrows the spread around a quantised value instead of removing the quantisation — so the unit changed (#4040). Both counters come from the same \`/usr/bin/time -l\` invocation that already produced the wall clock and the RSS; nothing extra is run and nothing extra is installed. The wall-clock table is kept as context and carries no ratio column."
+  echo "> The allocation table above is how those two claims are checked rather than asserted: same order of magnitude across a row means the three sources still express the same data structure, which is exactly what \`alloc\` silently lost for a day (#3934). Bit's count is \`swept+live\` from \`BIT_GC_STATS=1\`; Go's is \`runtime.MemStats.Mallocs\` and C's a \`malloc\` counter, both opt-in (\`BENCH_ALLOC_STATS\`, \`-DBENCH_ALLOC_STATS\`) and both absent from every timed binary."
+  echo "> The ratios are built from CYCLES, not from wall clock. \`/usr/bin/time\` reports \`real\` in hundredths of a second and most of the C sides here finish in under 0.10s, so a wall-clock ratio for those rows is quantisation: \`map\` published 7.50x C off 0.300s/0.040s where the counters say ~4.5x. Adding runs does not fix that, because it narrows the spread around a quantised value instead of removing the quantisation, so the unit changed (#4040). Both counters come from the same \`/usr/bin/time -l\` invocation that already produced the wall clock and the RSS; nothing extra is run and nothing extra is installed. The wall-clock table is kept as context and carries no ratio column."
   echo "> Cycles and instructions are startup-corrected: each figure has that language's own empty-program cost (\`bench/cases/startup\`, ${STARTBASE}) subtracted, because dyld and runtime init differ per language and are a fifth of C's \`allocflat\` row. Every other table is raw."
   echo "> Reproducibility was measured rather than assumed (#4040): four independent regenerations of this table on this box held every ratio to 2.5% between adjacent runs and 8.5% at worst across all four. The loose rows are \`alloc\`, \`map\`, \`allocflat\` and \`strings\`, whose Go or C side is short enough that that language's own allocator and collector scheduling moves it by several percent from run to run; \`matrix\`, \`mandelbrot\`, \`fib\` and \`sort\` reproduce to about 1%. On those four loose rows, read a change under ~3% as noise."
   echo "> Instructions are published beside cycles because a cycle gap alone does not say whether it is work emitted or work stalled, and the two ratios differ a lot here: Bit retires roughly 4-7 instructions per cycle against C's 1.4-1.8, so its instruction ratio always overstates its cycle ratio. Cycles are the time; instructions are the reason."
-  echo "> Generated by \`bench/run.sh\` on ${STAMP} — do not edit by hand."
+  echo "> Generated by \`bench/run.sh\` on ${STAMP}. Do not edit by hand."
 } > "$md"
 
 # --- inject into README between markers ---
