@@ -60,6 +60,11 @@ class XCtx {
   // code-emission order by appendDebugLineIfChanged (compiler/codegen.bit) as
   // xCompileFunction's block loop reaches each instruction.
   dbgRows: []DebugLineRow,
+  // #3906: this function's frame was laid out WITHOUT the 16-byte call
+  // alignment, because xNeedsCallAlign proved it emits no call. Read only by
+  // the two call emitters below, which abort rather than misalign a real call
+  // — see the assert in xCallReloc for why that backstop exists.
+  noCallAlign: bool,
 }
 
 // The register class a value id belongs to — which bank marshals it.
@@ -90,7 +95,7 @@ fn newXCtx(cc: XCallConv): XCtx {
     },
     curBlock: 0, safepointCodeOffsets: []int(0), nextSafepointIdx: 0,
     f: xEmptyIrFunc(), ctx: ctx, skipConst: []bool(0), debug: false,
-    dbgRows: []DebugLineRow(0),
+    dbgRows: []DebugLineRow(0), noCallAlign: false,
     module: IrModule{
       funcs: []IrFunc(0), ctx: ctx, stringPool: []string(0),
       methodTables: []MethodTable(0), stubbed: []StubbedFn(0), sm: newSourceManager(),
@@ -100,7 +105,16 @@ fn newXCtx(cc: XCallConv): XCtx {
 
 // `call <symbol>` — `E8 rel32` with a zero placeholder and a relocation naming
 // the target. Nothing needs to exist at codegen time; the linker fills it.
+//
+// #3906: with `xCallReg` below, this is the ONLY place an x86-64 call opcode is
+// written — `0xE8` and `FF /2` appear nowhere else in this backend. So asserting
+// here turns a MISSED entry in xNeedsCallAlign's op set from a silently
+// misaligned stack (a fault inside libc's SSE, far from the cause) into a loud
+// compiler abort at the exact instruction. It is a backstop, not the proof:
+// `asm` bytes (xEmitAsm) are copied out verbatim and never reach either
+// emitter, which is why xNeedsCallAlign refuses Op.Asm outright.
 fn xCallReloc(cx: XCtx, symbol: string) {
+  assert(!cx.noCallAlign)
   xEmitByte(cx.buf, 0xE8)
   let off = len(cx.buf.code)
   xEmitU32(cx.buf, 0)
@@ -119,8 +133,10 @@ fn xMovAbsSymbol(cx: XCtx, dst: XReg64, symbol: string) {
 }
 
 // `call r/m64` (`FF /2`) — an indirect call through a register, for closure
-// dispatch. No REX.W: the operand is 64-bit by default in long mode.
+// dispatch. No REX.W: the operand is 64-bit by default in long mode. Carries
+// xCallReloc's #3906 assert for the same reason.
 fn xCallReg(cx: XCtx, r: XReg64) {
+  assert(!cx.noCallAlign)
   if (xNeedsRexBit(xRegNum(r))) {
     xEmitByte(cx.buf, xRex(false, false, false, true))
   }
@@ -233,7 +249,21 @@ fn xXmmSaveOffset(f: XFrame, i: int): int {
 // off by 8 crashes inside someone else's code, far from the cause. An ODD
 // number of saved pushes leaves rsp at 8 mod 16, so the frame must itself be
 // 8 mod 16 to bring it back.
-fn xAlignFrame(raw: int, savedCount: int): int {
+//
+// #3906: "for any call in the body" is the whole obligation, so a function with
+// no call in its body owes nothing and `raw` is returned unrounded. Nothing
+// else reads rsp: every frame slot is addressed off rbp (xSpillOffset /
+// xXmmSaveOffset), which the prologue sets before the subtraction. `raw` is
+// `8 * (numSlots + len(savedXmm))` at the one real call site, and the assert
+// pins that — the Win64 unwind encoder (xAllocLargeOp) takes the compact
+// size/8 form only for a multiple of 8, and an rbp-relative offset that is not
+// 8-aligned would misalign every spill. `needsCallAlign` comes from
+// xNeedsCallAlign below; a caller that cannot prove the predicate passes true.
+fn xAlignFrame(raw: int, savedCount: int, needsCallAlign: bool): int {
+  if (!needsCallAlign) {
+    assert(raw % 8 == 0)
+    return raw
+  }
   let needed = 0
   if (savedCount % 2 != 0) {
     needed = 8
@@ -246,6 +276,82 @@ fn xAlignFrame(raw: int, savedCount: int): int {
     return raw + (needed - rem)
   }
   return raw + (16 - (rem - needed))
+}
+
+// The ops whose x86-64 emitter plants a `call` REGARDLESS of build mode.
+// Deliberately WIDER than isSafepointOp (codegenlive.bit), which answers a
+// different question — "is this a GC point" — and so correctly omits two
+// emitters that call without being one:
+//
+//   * SDiv/UDiv/SRem/URem — xEmitDivInt (x64select.bit) branches over a real
+//     `call bit_rt_panic_div_zero` on a zero divisor (#2016, SPEC §13.5). The
+//     power-of-two fast path emits no such call, but the divisor's shape is not
+//     visible here, so all four ops are taken.
+//   * Asm — xEmitAsm (x64dispatch.bit) copies the block's x64 bytes out
+//     VERBATIM, so a `call` inside one reaches the object without passing
+//     through xCallReloc/xCallReg at all. It is the one call this backend can
+//     emit that its own assert cannot catch, so it is refused outright. #3878
+//     is the arm64 twin of exactly this hole: an `asm` `blr` invisible to
+//     isSafepointOp, correct on the shipped tree only because an unrelated
+//     neighbouring `bl` happened to sit beside it.
+fn xOpAlwaysCalls(op: Op): bool {
+  if (isSafepointOp(op)) {
+    return true
+  }
+  if (op == Op.SDiv || op == Op.UDiv || op == Op.SRem || op == Op.URem) {
+    return true
+  }
+  return op == Op.Asm
+}
+
+// The ops that additionally call in a `--debug` build: the signed-overflow trap
+// (x64selectovf.bit, SPEC §13.5) branches over `call bit_rt_panic_overflow`
+// after ADD/SUB (xEmitBinaryInt, xEmitArithImmInt), MUL (xEmitMulInt, including
+// its power-of-two form) and NEG (xEmitUnaryInt). It fires only at a SIGNED
+// width — a fact about the operand type, not about the op — so all four are
+// taken whenever debug is on.
+fn xOpCallsWhenDebug(op: Op): bool {
+  return op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Neg
+}
+
+// Whether this function's frame must keep the 16-byte call alignment: true if
+// ANY call instruction can appear in its body (#3906).
+//
+// #3860 is what made this worth having: with the saved set narrowed to what the
+// allocation actually touched, an ODD savedCount became common, and an odd count
+// is exactly when xAlignFrame adds the 8-byte pad. Measured over the 25
+// x86_64-linux runtime modules, 127 of 1050 emitted functions carried a pad that
+// bought nothing.
+//
+// Conservative in the safe direction. An op nobody classified keeps the pad,
+// which costs 8 bytes of stack and two instructions; the opposite mistake
+// misaligns a real call, which faults inside libc far from the cause. So this
+// answers "may call", never "does call".
+//
+// `flags.hasSafepoints` carries the safepoint half xScanFuncFlags already
+// computed, INCLUDING the loop back-edge poll — three calls plus the address
+// prefetch (x64controlflow.bit) that no per-instruction scan of the body can
+// see, since the IR terminator is a plain Jump/Br. This pass adds only what
+// that predicate leaves out.
+fn xNeedsCallAlign(f: IrFunc, flags: XFuncFlags, debug: bool): bool {
+  if (flags.hasSafepoints) {
+    return true
+  }
+  let bi = 0
+  while (bi < len(f.blocks)) {
+    let b = f.blocks[bi]
+    let i = b.instsStart + b.paramCount
+    let end = b.instsStart + b.instsLen
+    while (i < end) {
+      let op = f.instrs[i].op
+      if (xOpAlwaysCalls(op) || (debug && xOpCallsWhenDebug(op))) {
+        return true
+      }
+      i = i + 1
+    }
+    bi = bi + 1
+  }
+  return false
 }
 
 // `rsp -= imm32` / `rsp += imm32` — group-1 /5 (sub) and /0 (add).
