@@ -1,4 +1,7 @@
 // Matches map.bit, using Go's built-in map.
+// #4064: pre-sized for n entries with make(map[int64]int64, n), matching
+// map.bit's map<i64,i64>(n) capacity hint and map.c's calloc-to-capacity, so
+// none of the three pays for growth+rehash that the others do not.
 package main
 
 import "fmt"

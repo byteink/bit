@@ -2,6 +2,9 @@
 // open-addressing table (linear probing, tombstone delete) over the same
 // key set -- same asymptotic behaviour as map.bit/map.go's native maps, not
 // the same code.
+// #4064: pre-sized in one calloc to >= n*3 slots, matching map.bit's
+// map<i64,i64>(n) capacity hint and map.go's make(map[int64]int64, n), so
+// none of the three pays for growth+rehash that the others do not.
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>

@@ -1023,8 +1023,11 @@ interface is a separate extension this section does not make.
   type-prefixed literal form `[N]T{...}` (§12.3) still requires a literal length,
   because `[x]` there is ambiguous with a one-element slice literal.
 - **Map** `map<K,V>`: hash map; reference type; `K` must be a comparable type
-  (§14.6). Built with `map<K,V>()` or a map literal. Absent keys read as the zero
-  value of `V`; use the two-result index form to test presence (§12.6).
+  (§14.6). Built with `map<K,V>()`, `map<K,V>(n)` (a capacity hint for about n
+  entries, ADVISORY: it never changes the map's contents or behavior, only how
+  it is pre-sized — an `n <= 0` is a no-op, not an error), or a map literal.
+  Absent keys read as the zero value of `V`; use the two-result index form to
+  test presence (§12.6).
 - **Tuple** `(T1, T2, ...)`: fixed heterogeneous group; value type; used for
   grouped returns and destructuring. Accessed by destructuring or `.0`, `.1`, …
 - **Function** `(P...) => R`: first-class function value; reference type.
@@ -2084,6 +2087,7 @@ string(b)         // []byte -> string (copy)
 []int(n)          // allocate a length-n zeroed slice
 []int(n, m)       // length n, capacity m
 map<string,int>() // empty map
+map<string,int>(1000) // empty map, pre-sized for ~1000 entries (advisory hint)
 chan<int>()       // unbuffered channel
 chan<int>(16)     // buffered channel, capacity 16
 int(tag)          // C-like enum -> its integer tag
