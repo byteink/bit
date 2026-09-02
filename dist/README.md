@@ -10,18 +10,19 @@ the consumers.
 
 ## Which targets actually ship
 
-The compiler has three build targets — `bit build --target` accepts exactly
-`x86_64-linux`, `aarch64-linux`, `aarch64-macos` (`compiler/main.bit`,
-`parseBuildTarget`). Those three, and only those three, are published today.
+The compiler has four build targets — `bit build --target` accepts exactly
+`x86_64-linux`, `aarch64-linux`, `aarch64-macos`, `x86_64-windows`
+(`compiler/build.bit`, `parseBuildTarget`). Those four, and only those four,
+are published today.
 
 | target | artifact | status |
 |---|---|---|
 | `x86_64-linux`  | `bit-<version>-linux-x86_64.tar.xz`  | shipping |
 | `aarch64-linux` | `bit-<version>-linux-aarch64.tar.xz` | shipping |
 | `aarch64-macos` | `bit-<version>-macos-aarch64.tar.xz` | shipping |
+| `x86_64-windows` | `bit-<version>-windows-x86_64.zip`  | shipping (#3342), smoke-tested on real hardware over SSH |
 | `x86_64-macos`  | `bit-<version>-macos-x86_64.tar.xz`  | **not built** — the Mach-O linker has no x86-64 relocation support; `./make libbitrt` emits the archive but no compiler target selects it |
-| `x86_64-windows` | `bit-<version>-windows-x86_64.zip`  | **not built** — blocked on #1103 (PE/COFF writer); the runtime also `@compileError`s outside POSIX |
-| `aarch64-windows` | `bit-<version>-windows-aarch64.zip` | **not built** — same blockers as above |
+| `aarch64-windows` | `bit-<version>-windows-aarch64.zip` | **not built** — out of scope for the Windows port (epic #3322 targets x86_64-windows only) |
 
 `dist/release.sh` is a maintainer-run script with no CI behind it (this repo
 has no GitHub Actions and never will; see `CONTRIBUTING.md`'s "No GitHub
@@ -34,7 +35,7 @@ clear failure downstream, a broken one is a silent one.
 
 ```
 bit-<version>-<os>-<arch>.tar.xz      # linux, macos
-bit-<version>-<os>-<arch>.zip         # windows, when it exists
+bit-<version>-<os>-<arch>.zip         # windows
 bit-<version>.cdx.json                # CycloneDX SBOM, one per release
 ```
 
@@ -206,7 +207,7 @@ successful version query.
 
 * A release build stamps the tag by STAGING: `dist/release.sh` copies
   `compiler/` to `dist/out/stagesrc/compiler` with `version.bit` excluded and a
-  generated one written in its place, then cross-builds the three targets from
+  generated one written in its place, then cross-builds the four targets from
   that copy. The staging is the **only** difference between a release build and
   a local one — nothing patches a source file, and the working tree stays clean.
 

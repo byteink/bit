@@ -673,7 +673,7 @@ rm -rf "${SBOM_VENV}"
 echo "release.sh: wrote ${OUT}/bit-${VERSION}.cdx.json"
 
 # --- checksums and notes ----------------------------------------------------
-( cd "${OUT}" && shasum -a 256 ./*.tar.xz ./*.cdx.json | sed 's#\./##' > SHA256SUMS )
+( cd "${OUT}" && shasum -a 256 ./*.tar.xz ./*.zip ./*.cdx.json | sed 's#\./##' > SHA256SUMS )
 echo "release.sh: SHA256SUMS"
 cat "${OUT}/SHA256SUMS" | sed 's/^/  /'
 
@@ -700,7 +700,8 @@ else
 	}
 	missing=""
 	for f in "bit-${VERSION}-linux-x86_64.tar.xz" "bit-${VERSION}-linux-aarch64.tar.xz" \
-		"bit-${VERSION}-macos-aarch64.tar.xz" "bit-${VERSION}.cdx.json" "SHA256SUMS"; do
+		"bit-${VERSION}-macos-aarch64.tar.xz" "bit-${VERSION}-windows-x86_64.zip" \
+		"bit-${VERSION}.cdx.json" "SHA256SUMS"; do
 		[ -f "${OUT}/${f}" ] || missing="${missing} ${f}"
 	done
 	[ -z "${missing}" ] || {
@@ -860,14 +861,14 @@ case "${VERSION}" in *-*) args+=(--prerelease) ;; esac
 
 if gh release view "v${VERSION}" >/dev/null 2>&1; then
 	echo "release.sh: v${VERSION} exists; uploading assets with --clobber"
-	gh release upload "v${VERSION}" "${OUT}"/*.tar.xz "${OUT}"/*.cdx.json "${OUT}/SHA256SUMS" --clobber
+	gh release upload "v${VERSION}" "${OUT}"/*.tar.xz "${OUT}"/*.zip "${OUT}"/*.cdx.json "${OUT}/SHA256SUMS" --clobber
 else
 	# --target pins the new tag to the tree that was actually built and smoke-tested
 	# (#1856). Only meaningful on this branch: for an existing tag gh ignores it,
 	# which is correct — the tag is already placed and re-cutting must not move it.
 	echo "release.sh: tagging v${VERSION} at ${BUILT_COMMIT}"
 	gh release create "v${VERSION}" --target "${BUILT_COMMIT}" "${args[@]}" \
-		"${OUT}"/*.tar.xz "${OUT}"/*.cdx.json "${OUT}/SHA256SUMS"
+		"${OUT}"/*.tar.xz "${OUT}"/*.zip "${OUT}"/*.cdx.json "${OUT}/SHA256SUMS"
 fi
 
 # Report what the release ACTUALLY is now, not what --draft asked for: re-cutting
