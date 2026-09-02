@@ -1,0 +1,295 @@
+// `bit lsp` published-diagnostic shape gate (#4176): drives the REAL
+// self-hosted `bit lsp` binary as a subprocess and asserts on its raw
+// JSON-RPC output, the same mechanics as _tests_/bit/lspresolve.bit (see its
+// header) and _tests_/bit/lsplifecycle.bit — each `bit run _tests_/bit/*.bit`
+// is a standalone single-file program, so the small harness
+// (frame/shQuote/runLsp/...) is duplicated here rather than imported.
+//
+// THE BUG THIS GATE EXISTS TO CATCH, two halves. `lspDiagnosticJson`
+// (compiler/lspserver.bit) used to serialise a `code` for every diagnostic
+// unconditionally, including a NOTE — whose `code` is always 0 (diagnostics.bit)
+// because a note has no registry entry of its own. `codeString(0)` rendered
+// the nonexistent "E0000", so a hover showed `bitls(E0000)` for a plain
+// "previously declared here". Second, notes were published as their own
+// standalone diagnostics rather than attached to the error they explain, so
+// several unrelated-looking hints stacked with nothing tying them to a
+// primary error.
+//
+// `checkDuplicateDeclarationPublishesOneDiagnostic` is the reported
+// reproduction: `bit check` on this fixture reports 2 diagnostics (E0042 plus
+// its note, verified by hand while writing this case — see the ticket). The
+// LSP must publish exactly 1, with the note folded into the E0042 entry's
+// `relatedInformation`, never a second top-level diagnostic and never
+// carrying "E0000". `checkWarningKeepsItsCode` is the control this fix must
+// not break: a warning's `code` (E0200) must survive, proving the guard omits
+// `code` only for a note, not for every diagnostic.
+//
+// WIRED INTO `./make test` as `test-lsp-diagnostics` (tools/build/gates.bit,
+// tools/build/defs.bit), registered in the same commit as this file so
+// scripts/gate.sh does not see it as an unmapped _tests_/bit/** path.
+
+import { envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir, exists } from "std/fs"
+
+const timeoutMs: int = 20000
+
+fn failCase(msg: string) {
+  eprint("FAIL lspdiagnostics: " + msg + "\n")
+  exit(1)
+}
+
+fn frame(body: string): string {
+  return "Content-Length: ${len(body)}\r\n\r\n" + body
+}
+
+fn mkdirQuiet(path: string) {
+  mkdir(path) catch _ {
+    return
+  }
+}
+
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+fn runLsp(bin: string, scratch: string, payload: string): (string, bool) {
+  mkdirQuiet(scratch)
+  let inPath = scratch + "/in"
+  let outPath = scratch + "/out"
+  let errPath = scratch + "/err"
+  let shPath = scratch + "/w.sh"
+  writeFile(inPath, payload) catch e {
+    failCase("cannot write input payload: " + e.message())
+    return "", false
+  }
+  let script = "#!/bin/sh\nexec " +
+    shQuote(bin) +
+    " lsp < " +
+    shQuote(inPath) +
+    " > " +
+    shQuote(outPath) +
+    " 2> " +
+    shQuote(errPath) +
+    "\n"
+  writeFile(shPath, script) catch e {
+    failCase("cannot write wrapper script: " + e.message())
+    return "", false
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    failCase("cannot chmod wrapper script")
+    return "", false
+  }
+  let code = osRunBounded(shPath, timeoutMs)
+  if (code == 0 - 2) {
+    failCase("TIMED OUT after ${timeoutMs}ms (raise BIT_TEST_TIMEOUT_S)")
+    return "", false
+  }
+  if (code == 0 - 1) {
+    failCase("cannot launch wrapper script (spawn/wait failure)")
+    return "", false
+  }
+  if (code <= 0 - 100) {
+    failCase("CRASHED: killed by signal ${0 - code - 100}")
+    return "", false
+  }
+  let out = readFile(outPath) catch _ {
+    ""
+  }
+  return out, true
+}
+
+fn jsonEscape(s: string): string {
+  let out = ""
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == u8('"')) {
+      out = out + "\\\""
+    } else if (c == u8('\\')) {
+      out = out + "\\\\"
+    } else if (c == u8('\n')) {
+      out = out + "\\n"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn contains(haystack: string, needle: string): bool {
+  let n = len(needle)
+  if (n == 0) {
+    return true
+  }
+  let i = 0
+  while (i + n <= len(haystack)) {
+    if (haystack[i:i + n] == needle) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Occurrences of `needle` in `haystack`, non-overlapping. Used to count
+// top-level published diagnostics via `"source":"bitls"`, which appears once
+// per top-level entry and never inside a `relatedInformation` item (that
+// object carries only `location` and `message` — see `lspRelatedInfoJson`).
+fn countSubstr(haystack: string, needle: string): int {
+  let n = len(needle)
+  if (n == 0) {
+    return 0
+  }
+  let count = 0
+  let i = 0
+  while (i + n <= len(haystack)) {
+    if (haystack[i:i + n] == needle) {
+      count = count + 1
+      i = i + n
+    } else {
+      i = i + 1
+    }
+  }
+  return count
+}
+
+fn initReq(): string {
+  return frame(
+      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"," +
+      "\"params\":{\"processId\":null,\"rootUri\":null,\"capabilities\":{}}}",
+  )
+}
+
+fn initNotif(): string {
+  return frame("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}")
+}
+
+fn didOpen(uri: string, text: string): string {
+  return frame(
+      "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+      "\"textDocument\":{\"uri\":\"${uri}\",\"languageId\":\"bit\",\"version\":1," +
+      "\"text\":\"" +
+      jsonEscape(text) +
+      "\"}}}",
+  )
+}
+
+// The reported reproduction: a name declared twice in one file. `bit check`
+// on this exact text reports 2 diagnostics — the E0042 error and its
+// "previously declared here" note (checked by hand: `bit check` prints both,
+// the note with no code of its own).
+fn duplicateDeclFixture(): string {
+  return "fn dup() {\n}\nfn dup() {\n}\n"
+}
+
+fn checkDuplicateDeclarationPublishesOneDiagnostic(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/dup"
+  mkdirQuiet(dir)
+  let text = duplicateDeclFixture()
+  let path = dir + "/main.bit"
+  writeFile(path, text) catch e {
+    failCase("cannot write ${path}: " + e.message())
+    return
+  }
+  let uri = "file://" + path
+  let payload = initReq() + initNotif() + didOpen(uri, text)
+  let (out, ok) = runLsp(bin, dir, payload)
+  if (!ok) {
+    return
+  }
+  // The CLI reports 2 diagnostics for this identical fixture (E0042 + its
+  // note); the LSP must publish 1, with the note attached instead of
+  // standing alone.
+  let published = countSubstr(out, "\"source\":\"bitls\"")
+  if (published != 1) {
+    failCase(
+        "published ${published} diagnostic(s) for a duplicate declaration, " +
+        "want 1 (of the 2 the CLI reports for the same file) — the note " +
+        "must be relatedInformation, not a second top-level diagnostic\n" +
+        out,
+    )
+    return
+  }
+  if (!contains(out, "\"code\":\"E0042\"")) {
+    failCase("the E0042 error itself went missing\n" + out)
+    return
+  }
+  if (contains(out, "E0000")) {
+    failCase("a published diagnostic still carries the fabricated E0000 code\n" + out)
+    return
+  }
+  if (!contains(out, "\"relatedInformation\":[{\"location\"") ||
+    !contains(out, "\"message\":\"previously declared here\"")) {
+    failCase("the note was dropped instead of attached as relatedInformation\n" + out)
+    return
+  }
+  print(
+      "PASS lspdiagnostics: a duplicate declaration publishes 1 diagnostic " +
+      "(of the CLI's 2), its note carried as relatedInformation\n",
+  )
+}
+
+// 801 top-level `let`s, each uniquely named so the fixture is otherwise
+// clean (a real project's own max-file-lines trigger, not a lint-only
+// throwaway tree) — `bit lint` on this reports exactly one E0200 finding,
+// checked by hand while writing this case.
+fn overLimitFixture(): string {
+  let out = ""
+  let i = 0
+  while (i < 801) {
+    out = out + "let x${i} = ${i}\n"
+    i = i + 1
+  }
+  return out
+}
+
+fn checkWarningKeepsItsCode(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/big"
+  mkdirQuiet(dir)
+  let text = overLimitFixture()
+  let path = dir + "/main.bit"
+  writeFile(path, text) catch e {
+    failCase("cannot write ${path}: " + e.message())
+    return
+  }
+  let uri = "file://" + path
+  let payload = initReq() + initNotif() + didOpen(uri, text)
+  let (out, ok) = runLsp(bin, dir, payload)
+  if (!ok) {
+    return
+  }
+  if (!contains(out, "\"code\":\"E0200\"")) {
+    failCase(
+        "a file over 800 lines did not publish its E0200 warning with a real " +
+        "code — the note fix must not have omitted `code` for every " +
+        "diagnostic\n" +
+        out,
+    )
+    return
+  }
+  print("PASS lspdiagnostics: an over-the-limit file still publishes E0200 with a real code\n")
+}
+
+fn main() {
+  let bin = envOr("BIT", "bit-out/bin/bit")
+  if (!exists(bin)) {
+    failCase("BIT='${bin}' does not exist — refusing to guess")
+    return
+  }
+  let scratchRoot = envOr("TMPDIR", "/tmp") + "/bit-lspdiagnostics-${timeUnixNs()}"
+  mkdirQuiet(scratchRoot)
+  checkDuplicateDeclarationPublishesOneDiagnostic(bin, scratchRoot)
+  checkWarningKeepsItsCode(bin, scratchRoot)
+  print("lspdiagnostics: all scenarios passed\n")
+}
