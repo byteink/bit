@@ -212,6 +212,13 @@ let osChildEnvp: [33891]i64 // (osScratchSlots+1) * 1027
     syscall(sysExecve(), i64(pathPtr), i64(argvPtr), i64(envpPtr))
     rootExit(127)
   }
+  // #4172: publish `forked` as this worker's outstanding UNBOUNDED child so a
+  // SIGTERM/SIGINT landing on THIS process while blocked in the `wait4` retry
+  // loop below can still reap it — see `osUnboundedChildPid`'s own comment for
+  // why this is a single-pid record, not `osOutstandingChildPid`. Cleared
+  // unconditionally right after the loop, covering every path below.
+  let outstanding = int(ptrOf(osUnboundedChildPid)) + osScratchSlot() * 8
+  storeWord(outstanding, forked)
   let sb = int(ptrOf(osStatusBuf)) + osScratchSlot() * 8
   storeWord(sb, 0)
   let tries = 0
@@ -233,11 +240,16 @@ let osChildEnvp: [33891]i64 // (osScratchSlots+1) * 1027
       tries = 256
     } else {
       if (0 - w != 4) {
-        return 0 - 1
+        // A real (non-EINTR) failure: stop retrying, `!ok` below reports it.
+        // Folded into the shared loop exit (rather than returning here
+        // directly) so `outstanding` has exactly one clearing point (#4172).
+        tries = 256
+      } else {
+        tries = tries + 1
       }
-      tries = tries + 1
     }
   }
+  storeWord(outstanding, 0)
   if (!ok) {
     return 0 - 1
   }
@@ -420,6 +432,45 @@ const osSigKill: int = 9
 // kept running, reparented to pid 1.
 @nosplit fn osKillGroup(pid: int) {
   syscall(sysKill(), i64(0 - pid), i64(osSigKill))
+}
+
+// #4172: `osForkExecWait`'s (UNBOUNDED `os_run`/`os_run_test`, i.e. `bit
+// run`'s own launcher) outstanding child, one slot per worker, 0 = none
+// outstanding. #3507's SIGTERM/SIGINT backstop only ever walked
+// `osOutstandingChildPid` below, which `osForkExecWait` never wrote to — so a
+// `bit run` process that receives SIGTERM/SIGINT DIRECTLY (not via
+// `osRunBounded`'s own poll-loop deadline, which reaches this the same way
+// #2986 already does) had nothing tracking the scratch binary it just
+// `fork`+`exec`'d, and the handler's cleanup sweep found it nowhere. Verified:
+// `bit run` on a program that never terminates, SIGTERM'd directly, left the
+// binary alive with ppid=1 before this array existed.
+//
+// A SEPARATE array from `osOutstandingChildPid`, not a shared one, because the
+// two need DIFFERENT kill semantics. `osOutstandingChildPid`'s bounded child
+// is always a process-group LEADER (`osExecChild`'s `setpgid(0,0)`), so
+// `osKillGroup` is correct for it. This one is deliberately left in the
+// CALLING process's own group — giving it a separate group would be exactly
+// what makes it unreachable from an OUTER `osRunBounded` wrapper's own group
+// kill (`tools/killtree/killtree.bit`'s header makes the identical argument
+// for why its PPID walk avoids process groups). So `pid` here is not
+// guaranteed to be a group leader, and killing `-pid` could target a bogus or
+// unrelated group; `osKillAllUnboundedChildren` below kills the PID directly.
+let osUnboundedChildPid: [33]i64 // (osScratchSlots+1) * 1
+
+// Kill every unbounded `os_run`/`os_run_test` child still outstanding (#4172),
+// by PID — never by group, see `osUnboundedChildPid`'s comment.  `@nosplit`:
+// called from a signal handler, so it must not allocate or touch anything the
+// interrupted code's own invariants might be mid-way through.
+@nosplit fn osKillAllUnboundedChildren() {
+  let base = int(ptrOf(osUnboundedChildPid))
+  let i = 0
+  while (i <= osScratchSlots) {
+    let pid = loadWord(base + i * 8)
+    if (pid != 0) {
+      syscall(sysKill(), i64(pid), i64(osSigKill))
+    }
+    i = i + 1
+  }
 }
 
 // #3507: the bounded child currently outstanding, one slot per worker
