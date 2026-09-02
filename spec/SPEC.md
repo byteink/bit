@@ -1756,25 +1756,43 @@ symbol named, not silently.
 
 ## 12. Expressions
 
-Precedence, highest to lowest. All binary operators are **left-associative**.
+Precedence, highest to lowest. All binary operators are **left-associative**;
+the one exception is the conditional expression at level 2, which is
+**right-associative** (below).
 
 | Level | Operators                                   | Kind             |
 | ----- | ------------------------------------------- | ---------------- |
-| 8     | `f(...)` `a[i]` `a[lo:hi]` `a.b` `x?`        | postfix / primary |
-| 7     | `!x` `-x` `+x` `~x` `<-c`                    | unary prefix     |
-| 6     | `*` `/` `%` `<<` `>>` `&`                    | multiplicative   |
-| 5     | `+` `-` `\|` `^`                             | additive         |
-| 4     | `==` `!=` `<` `<=` `>` `>=`                  | comparison       |
-| 3     | `&&`                                         | logical and      |
-| 2     | `\|\|`                                       | logical or       |
+| 9     | `f(...)` `a[i]` `a[lo:hi]` `a.b` `x?`        | postfix / primary |
+| 8     | `!x` `-x` `+x` `~x` `<-c`                    | unary prefix     |
+| 7     | `*` `/` `%` `<<` `>>` `&`                    | multiplicative   |
+| 6     | `+` `-` `\|` `^`                             | additive         |
+| 5     | `==` `!=` `<` `<=` `>` `>=`                  | comparison       |
+| 4     | `&&`                                         | logical and      |
+| 3     | `\|\|`                                       | logical or       |
+| 2     | `? :` (conditional)                          | ternary, right-assoc |
 | 1     | `=>` (arrow function)                        | lowest           |
 
 Assignment is a **statement**, not an expression (§13.2), so `=` never appears
-inside an expression. There is no ternary `?:` operator in v0.1; use an `if`
-statement. `&&` and `||` short-circuit.
+inside an expression. `&&` and `||` short-circuit.
+
+**Conditional expression** `cond ? a : b` (#3941): `cond` must be `bool` — no
+truthiness — and `a`/`b` must meet at one type under the untyped-constant rules
+of §15.4; the result is that common type. Right-associative, so
+`a ? b : c ? d : e` reads `a ? b : (c ? d : e)`, and looser than every binary
+operator, so `a || b ? c : d` reads `(a || b) ? c : d`.
+
+The postfix `?` (error propagation, level 9) uses the identical token and
+binds tighter, so it is tried first at every position `binary` can end on —
+not only at the very end of `cond` as a whole. Nothing at parse time knows
+whether an operand is fallible (that is a checker fact, E0116), so a bare,
+unparenthesized `cond ? a : b` is disambiguated by a bounded, rolled-back
+speculative parse: try `<then> :` from the `?`, and only treat it as
+propagation if that fails. `f()? ? a : b` takes the first `?` as propagation
+(nothing valid follows it as a `then`) and the second as the conditional's own.
 
 ```
-expression   = arrow_fn | catch_expr .          (* catch_expr, §18.3 *)
+expression   = arrow_fn | conditional .         (* catch_expr, §18.3 *)
+conditional  = catch_expr [ "?" expression ":" conditional ] .
 binary       = unary { binop unary } .          (* shaped by the precedence table *)
 binop        = "*" | "/" | "%" | "<<" | ">>" | "&"
              | "+" | "-" | "|" | "^"
@@ -4201,7 +4219,8 @@ comm_clause   = "case" ( send_stmt | recv_bind ) ":" { statement ";" }
               | "default" ":" { statement ";" } .
 recv_bind     = [ ( IDENT | tuple_pat ) "=" ] "<-" expression .
 
-expression    = arrow_fn | catch_expr .
+expression    = arrow_fn | conditional .
+conditional   = catch_expr [ "?" expression ":" conditional ] .   (* §12, right-assoc *)
 catch_expr    = binary [ "catch" ( expression | IDENT block ) ] .
 arrow_fn      = arrow_params "=>" ( expression | block ) .
 arrow_params  = IDENT | "(" [ arrow_p { "," arrow_p } [ "," ] ] ")" .
