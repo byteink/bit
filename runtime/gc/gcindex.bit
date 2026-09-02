@@ -1,5 +1,11 @@
 // Split out of ./gc.bit (#1503): the address->object membership index.
 
+// `heapClassAnchor` is used only here (`idxRebuildSpans` below), not by any
+// other file in this module -- imported here rather than in `./gc.bit` so
+// `bit lint`'s per-file E0210 "imported but never used" check sees the real
+// use site.
+import { heapClassAnchor } from "../alloc"
+
 // ---------------------------------------------------------------------------
 // The address->object membership index
 // ---------------------------------------------------------------------------
@@ -588,5 +594,119 @@
   spinAcquire(lockPtr(g))
   idxRemove(g, spanAddr + 1)
   spinRelease(lockPtr(g))
+}
+
+// ---------------------------------------------------------------------------
+// #4096: RE-ENABLE AFTER A TRANSIENT FAILURE
+// ---------------------------------------------------------------------------
+//
+// `idxDisable` above is called on an index allocation failure and nothing
+// used to set `gcIndexOk` back — the failure that trips it is transient (one
+// allocation the OS could not serve right then), the response was permanent
+// (`gcOwns` falls to `gcOwnsLinear`'s Theta(live) walk for the rest of the
+// process, measured 27x-494x, #3930). This is the retry.
+//
+// COLLECTION-SCOPED, NOT PER-ALLOCATION, WITH NO PROCESS-WIDE ATTEMPT CAP —
+// AND THAT ABSENCE IS DELIBERATE, NOT AN OVERSIGHT. Called from exactly one
+// place, `gccollect.bit`'s `gcCollectFinish`, once per collection, only while
+// the index is currently disabled. A per-process retry counter (the ticket's
+// "at most K times") needs a stored word, and `gcWords` (39) is full and
+// boot-pinned (`tools/build/abiarity.bit`) — adding one is a runtime ABI
+// change and a two-pass bootstrap release, out of scope here and not
+// justified by what it would buy: each attempt below is already bounded to
+// ONE walk of the live state a collection has ALREADY paid to visit for mark
+// and sweep, so a permanently out-of-memory process pays one extra failed
+// `reserveGrow` call per collection — not a retry per allocation, not a
+// growing cost, and not a busy loop. That is what "collection-scoped and
+// bounded" (the ticket's own constraint) means without new state.
+//
+// WHY RIGHT AFTER `sweep(g)` AND NOWHERE ELSE. Two things must both be true
+// for a rebuilt index to be CORRECT rather than merely non-empty, and this is
+// the only point in the whole collector where both hold at once:
+//
+//   1. `gcAll` AND EVERY CLASS'S SPAN LIST ARE AUTHORITATIVE. `sweep` has
+//      already unlinked every dead object, and `freeObject` -> `gcHeapFree`
+//      has already run every reclaim pass its frees triggered — reclaim is
+//      SYNCHRONOUS inside `gcHeapFree` (`../gc/gc.bit`), not deferred. So by
+//      the time `sweep(g)` returns there is no span mid-reclaim and no
+//      freed-but-still-linked object left to race against.
+//   2. NOTHING CAN QUERY `gcOwns` CONCURRENTLY. `gcCollectFinish` runs with
+//      the world already stopped (`../stw/stw.bit`'s `stwCollect`: "the world
+//      is already stopped and this thread holds the world lock"), every root
+//      scan that could call `gcMarkRoot` -> `gcOwns` for THIS collection has
+//      already run before `gcCollectFinish` is even called, and nothing
+//      later in `gcCollectFinish` itself calls `gcOwns`. So `gcIndexOk` can
+//      be set to 1 before the walk below finishes without any reader ever
+//      observing a half-populated table — the only readers are mutators, and
+//      every one of them is parked until this function returns.
+//
+// Setting `gcIndexOk = 1` BEFORE the walk (not after) is what makes
+// `idxInsert`/`idxInsertSpan` do any work at all — both early-return while it
+// reads 0. Reading 0 for the whole walk would make every call below a silent
+// no-op.
+//
+// TWO POPULATIONS, BOTH REBUILT, MATCHING THE TWO REAL INSERT SITES EXACTLY —
+// see `idxRebuildSpans`/`idxRebuildObjects` below.
+//
+// FAILS SAFE, NOT PARTIALLY. If a `reserveGrow` inside `idxGrow` fails
+// partway through either walk, `idxGrow` has already called `idxDisable`
+// (existing behaviour, unchanged) and every subsequent `idxInsert`/
+// `idxInsertSpan` call in the SAME walk is then a no-op via their own
+// `gcIndexOk == 0` early return, so the walk still terminates in the same
+// bounded pass and the index is left fully disabled again — never a half
+// table nobody would trust. The next collection tries again from scratch.
+@nosplit fn idxRebuild(g: *i64) {
+  *(g + gcIndexOk) = 1
+  idxRebuildSpans(g)
+  if (*(g + gcIndexOk) == 0) {
+    return
+  }
+  idxRebuildObjects(g)
+}
+
+// Re-insert every span currently carved on any class's list — the presence
+// key population `gcOwns` consults first (`../gc/gcalloc.bit`). Walked
+// through `heapClassAnchor`/`allocSpanNext` (`../alloc/alloc.bit`), the same
+// two exported primitives `heapCheckSpansLocked` walks internally, never a
+// second copy of the class-list layout in this module.
+//
+// Split out of `idxRebuild` to keep each half well under the complexity
+// ceiling — same reason `idxReclaimRetired` was split out of `idxGrow` above.
+@nosplit fn idxRebuildSpans(g: *i64) {
+  let maxSpans = heapMappedBytes(heapBlock(g)) / allocSpanBytes + 1
+  let cidx = 0
+  while (cidx < allocNumClasses) { // bounded: allocNumClasses iterations
+    let s = heapClassAnchor(heapBlock(g), cidx)
+    let seen = 0
+    while (s != 0 && seen < maxSpans) { // bounded: maxSpans iterations
+      idxInsertSpan(g, s)
+      if (*(g + gcIndexOk) == 0) {
+        return
+      }
+      s = allocSpanNext(s)
+      seen = seen + 1
+    }
+    cidx = cidx + 1
+  }
+}
+
+// Re-insert every live LARGE object's body key, mirroring `linkObject`'s own
+// gate exactly (`../gc/gcalloc.bit`: `if (idx < 0) { idxInsert(...) }`) —
+// `idx` is not stored on the header, so it is recomputed from the header's own
+// size word the same way `freeObject` already does. A span-backed object's
+// body is deliberately NOT reinserted here: #3178 stopped `linkObject`
+// inserting one at all, and `gcOwns` never asks the object-key table for one.
+@nosplit fn idxRebuildObjects(g: *i64) {
+  let o = *(g + gcAll)
+  // Bounded: at most `gcNumObjectsIdx` links, same as `gcOwnsLinear`.
+  while (o != 0) {
+    if (*(g + gcIndexOk) == 0) {
+      return
+    }
+    if (allocClassify(hdrSize(o), 8) < 0) {
+      idxInsert(g, bodyFromHeader(o))
+    }
+    o = loadWord(o + gcHdrNext)
+  }
 }
 
