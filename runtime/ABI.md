@@ -1689,7 +1689,7 @@ defined exactly once).
 | `bit_rt_slice_get`    | `(h: *const SliceHeader, index: usize, elem_size: usize) -> u64` (§2; FATAL for a packed, non-ref buffer with `elem_size` neither `1` nor `8` — one `u64` cannot represent a wider element without truncating, #3861) |
 | `bit_rt_slice_set`    | `(h: *SliceHeader, index: usize, word: u64, elem_size: usize) -> void` (§2; FATAL under the identical condition `bit_rt_slice_get` is, and for the identical reason, #3861) |
 | `bit_rt_slice_slice`  | `(h: *const SliceHeader, lo: usize, hi: usize) -> *SliceHeader` (§2, unchanged — reslicing works in element counts already, `runtime/root/slices.bit` `rtSliceSlice`) |
-| `bit_rt_map_new`      | `(key_desc: usize, val_is_ref: usize) -> *MapHeader` (§15, §15.1) |
+| `bit_rt_map_new`      | `(key_desc: usize, val_is_ref: usize, cap_hint: i64) -> *MapHeader` (§15, §15.1; `cap_hint <= 0` is no hint) |
 | `bit_rt_map_set`      | `(m: ?*MapHeader, key: u64, val: u64) -> void` (§15)    |
 | `bit_rt_map_get`      | `(m: ?*MapHeader, key: u64) -> u64` (§15)               |
 | `bit_rt_map_has`      | `(m: ?*MapHeader, key: u64) -> bool` (§15)              |
@@ -2338,6 +2338,13 @@ the handle of a string CONSTANT, which is static for the life of the process.
 - **Growth.** At `(used+1)*8 >= cap*7` the table doubles and rehashes, dropping
   tombstones (`used` resets to `len`). This keeps an EMPTY slot present at all
   times, so every probe terminates in `<= cap` steps (a statically bounded loop).
+- **Capacity hint** (`map<K,V>(n)`, SPEC §11.2/§12.9, #4064). `map_new`'s
+  `cap_hint` picks the initial `cap` directly instead of starting at
+  `mapInitCap` and growing there: the smallest power of two with
+  `cap*7 > n*8`, so `n` entries can be inserted without an immediate grow.
+  ADVISORY, never a correctness input — `n <= 0` or an `n*8` overflow both fall
+  back to `mapInitCap` and the map still grows normally past whatever `n`
+  under-promised (`mapCapForHint`, `runtime/root/maps.bit`).
 - **Delete** leaves a `TOMB` and zeroes the slot's key/value words (dropping the
   refs so a removed entry becomes collectable); the tombstone is reclaimed at the
   next grow.
