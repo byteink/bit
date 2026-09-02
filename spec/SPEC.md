@@ -590,7 +590,7 @@ reads, field access on a value in hand, `if`/`while`/`for`, assignment,
 `break`/`continue`, and `return` — plus calls to other `@nosplit` functions,
 to the **atomic builtins** (§11.5), to **`ptrOf`** (§11.5), **`entryOf`**
 (§11.10) and **`stackMapsBegin`/`stackMapsEnd`** (§11.12), a raw **`syscall`**
-(§11.8), and **conversions
+(§11.8), **`len`/`cap` over a fixed-size array** (§11.2), and **conversions
 between numeric prims** (§12.9), all of which lower
 to inline machine instructions rather than a call
 and so can neither allocate nor reach a safepoint. A numeric conversion covers
@@ -610,6 +610,15 @@ could never be called. Admission covers the address computation only — the
 **argument expression is still checked** against this allowlist, exactly as an
 `asm` operand is, so `ptrOf` applied to an allocating expression such as a
 slice literal remains E0075.
+
+`len`/`cap` are admitted **only** when the argument's type is a fixed-size
+array `[N]T` (§11.2): `N` is a compile-time constant, so both builtins lower
+to that constant directly and the argument expression is not evaluated at
+all — no field read, no call, no allocation, no safepoint. This is a
+type-conditional admission of the *operand*, not of the builtin name:
+`len`/`cap` on a slice or a string still lower to a field read of the slice
+header, and on a map to an allocating runtime call, so all three remain
+**E0075** under the "anything else" rule below.
 
 A **`syscall` (§11.8)** is admitted on the strongest proof on that list: it is
 not a call at all. Both backends emit the kernel trap *inline* — `syscall` on
