@@ -177,7 +177,8 @@ fn conversions() {
 
 ## Operators and precedence
 
-All binary operators are left-associative. Highest to lowest:
+All binary operators are left-associative, except the conditional expression
+below, which is right-associative. Highest to lowest:
 
 | Level | Operators | Kind |
 | ----- | --------- | ---- |
@@ -188,11 +189,14 @@ All binary operators are left-associative. Highest to lowest:
 | comparison | `== != < <= > >=` | |
 | logical and | `&&` | short-circuits |
 | logical or | `\|\|` | short-circuits |
+| conditional | `? :` | right-associative |
 
-`&`, `|`, `^`, `~` are bitwise; `&&`, `||`, `!` are logical. There is no ternary
-`?:` (use an `if`) and no address-of operator (Bit has no pointers). `?` is
-error propagation, `<-` is channel send/receive (see [Errors](errors.md) and
-[Concurrency](concurrency.md)).
+`&`, `|`, `^`, `~` are bitwise; `&&`, `||`, `!` are logical. There is no
+address-of operator (Bit has no pointers). `cond ? a : b` requires a `bool`
+condition (no truthiness) and arms that meet at one type; `a || b ? c : d`
+reads `(a || b) ? c : d`, and `a ? b : c ? d : e` reads `a ? b : (c ? d : e)`.
+`?` is also error propagation, `<-` is channel send/receive (see
+[Errors](errors.md) and [Concurrency](concurrency.md)).
 
 ```bit
 fn operators(a: int, b: int): int {
