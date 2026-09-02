@@ -137,7 +137,7 @@
 // toward, and for why `BIT_STAGE0_BIN` itself must skip this check rather
 // than fail it.
 
-import { trimSpace, indexOf, contains, split, hasPrefix, parseInt } from "std/strings"
+import { trimSpace, indexOf, split, hasPrefix } from "std/strings"
 
 class AbiSymbol {
   name: string,
@@ -219,8 +219,14 @@ fn extractStage0Runtime(tag: string): (string, bool) {
 // for the same source file, which `checkRuntimeAbiArity` depends on to tell
 // a real mismatch apart from an unrelated per-platform declaration sharing a
 // symbol name (see this file's header).
-fn parseAbiSymbols(root: string): []AbiSymbol {
+//
+// The second return is every `path: symbol` a real (non-comment) `@symbol(`
+// marker was attached to but whose declared signature could not be parsed
+// (#4189) — never silently dropped from the count, because a symbol this
+// scan cannot see is a symbol the arity comparison below cannot protect.
+fn parseAbiSymbols(root: string): ([]AbiSymbol, []string) {
   let out = []AbiSymbol(0)
+  let failures = []string(0)
   let prefix = root + "/"
   for p of walkBit(root) {
     let relPath = p
@@ -230,23 +236,71 @@ fn parseAbiSymbols(root: string): []AbiSymbol {
     let text = readFile(p) catch _ {
       continue
     }
-    for sym of parseAbiSymbolsInFile(relPath, text) {
+    let (syms, fails) = parseAbiSymbolsInFile(relPath, text)
+    for sym of syms {
       out = append(out, sym)
     }
+    for f of fails {
+      failures = append(failures, f)
+    }
   }
-  return out
+  return out, failures
+}
+
+// True for a `//` comment line (leading whitespace allowed). `runtime/**`
+// documents its own ABI pins in prose — `@symbol("...")` appears inside a
+// comment three times as of #4189 (an example in a doc comment, and two
+// cross-references to a symbol pinned elsewhere) — and a marker match inside
+// one of those is not a declaration at all, so it must never reach the
+// signature parser below.
+fn isCommentLine(line: string): bool {
+  return hasPrefix(trimSpace(line), "//")
+}
+
+// Builds the text `parseArity` needs to see a signature that wraps across
+// any number of lines: `firstChunk` is already the tail of the marker's own
+// line starting at the closing quote of the symbol string (never the start
+// of `line` — see the comment at the call site for why), and this appends
+// subsequent RAW lines onto it. `parseArity` tracks paren depth itself and
+// stops at the first point that depth returns to zero, so it is safe to
+// hand it more text than the real signature — including, in the common
+// case, the function's own body — as long as enough lines are present to
+// reach the actual closing paren. Bounded per Power-of-10: the longest
+// exported signature in this corpus today is 6 params / 7 lines
+// (`bit_rt_configure`, `bit_rt_bind_memory`), so 20 extra lines is a wide
+// margin, not a tight fit.
+fn joinSignatureWindow(lines: []string, startIdx: int, firstChunk: string): string {
+  let n = len(lines)
+  let bound = startIdx + 20
+  if (bound > n) {
+    bound = n
+  }
+  let joined = firstChunk
+  let j = startIdx + 1
+  while (j < bound) {
+    joined = joined + "\n" + lines[j]
+    j = j + 1
+  }
+  return joined
 }
 
 // Handles both shapes actually present in `runtime/**` (verified by the
 // header's grep, 2026-08-16): `@symbol("x") fn name(...)` on one line, or
-// `@symbol("x")` on its own line immediately above the `fn` line.
-fn parseAbiSymbolsInFile(path: string, text: string): []AbiSymbol {
+// `@symbol("x")` on its own line immediately above the `fn` line — and, as
+// of #4189, a signature wrapped across any number of further lines, joined
+// via `joinSignatureWindow` before `parseArity` ever sees it.
+fn parseAbiSymbolsInFile(path: string, text: string): ([]AbiSymbol, []string) {
   let out = []AbiSymbol(0)
+  let failures = []string(0)
   let lines = split(text, "\n")
   let n = len(lines)
   let i = 0
   while (i < n) {
     let line = lines[i]
+    if (isCommentLine(line)) {
+      i = i + 1
+      continue
+    }
     let marker = "@symbol(\""
     let at = indexOf(line, marker)
     if (at < 0) {
@@ -261,60 +315,32 @@ fn parseAbiSymbolsInFile(path: string, text: string): []AbiSymbol {
       continue
     }
     let symName = rest[:closeAt]
-    // Search for `fn ` starting at the closing quote, never at the start of
-    // `line` — a symbol string containing the two characters "fn" would
-    // otherwise be found before the real `fn` keyword. (Checked separately:
-    // no symbol name in this tree contains "fn", but the search is
-    // structured to not depend on that staying true.)
-    let afterSymbol = rest[closeAt:]
-    let fnLine = ""
-    let found = false
-    if (contains(afterSymbol, "fn ")) {
-      fnLine = afterSymbol
-      found = true
+    // Join from the closing quote, never from the start of `line` — a
+    // symbol string containing the two characters "fn" would otherwise be
+    // found before the real `fn` keyword. (Checked separately: no symbol
+    // name in this tree contains "fn", but the search is structured to not
+    // depend on that staying true.)
+    let joined = joinSignatureWindow(lines, i, rest[closeAt:])
+    let (arity, ok) = parseArity(joined)
+    if (ok) {
+      out = append(out, AbiSymbol{ name: symName, arity: arity, file: path })
     } else {
-      let j = i + 1
-      let bound = i + 4
-      if (bound > n) {
-        bound = n
-      }
-      while (j < bound && !found) {
-        if (contains(lines[j], "fn ")) {
-          fnLine = lines[j]
-          found = true
-        }
-        j = j + 1
-      }
-    }
-    if (found) {
-      let (arity, ok) = parseArity(fnLine)
-      if (ok) {
-        out = append(out, AbiSymbol{ name: symName, arity: arity, file: path })
-      }
+      failures = append(failures, path + ": symbol \"" + symName + "\"")
     }
     i = i + 1
   }
-  return out
+  return out, failures
 }
 
-// Counts top-level (paren-depth-1) commas between the first `(` after `fn `
-// and its matching `)`, tracking depth so a nested parameter (e.g. a
-// function-typed parameter) cannot be miscounted. Zero-argument parses as
-// arity 0, not 1.
-fn parseArity(fnLine: string): (int, bool) {
-  let fnAt = indexOf(fnLine, "fn ")
-  if (fnAt < 0) {
-    return 0, false
-  }
-  let tail = fnLine[fnAt:]
-  let openAt = indexOf(tail, "(")
-  if (openAt < 0) {
-    return 0, false
-  }
+// The index of the `)` matching the `(` at `openAt`, tracking depth so a
+// nested paren (e.g. a function-typed parameter) cannot be miscounted. -1
+// when `tail` never returns to depth 0 (an unterminated / unparseable
+// signature). Split out of `parseArity` to keep both this and
+// `countTopLevelCommas` under the complexity-10 ceiling (spec/LINT.md:186,
+// E0204) after #4189 added the trailing-comma handling that function needs.
+fn findMatchingParen(tail: string, openAt: int): int {
   let depth = 0
   let k = openAt
-  let bodyStart = openAt + 1
-  let bodyEnd = -1
   while (k < len(tail)) {
     let c = tail[k]
     if (c == '(') {
@@ -322,18 +348,36 @@ fn parseArity(fnLine: string): (int, bool) {
     } else if (c == ')') {
       depth = depth - 1
       if (depth == 0) {
-        bodyEnd = k
-        break
+        return k
       }
     }
     k = k + 1
   }
-  if (bodyEnd < 0) {
-    return 0, false
-  }
-  let body = trimSpace(tail[bodyStart:bodyEnd])
+  return -1
+}
+
+// Counts top-level (paren-depth-1) commas in a parameter list body, tracking
+// depth so a nested parameter cannot be miscounted. Returns -1 for an empty
+// (zero-argument) body, never 0, so the caller can tell "no parameters" apart
+// from "one parameter, no commas" without a second empty check.
+//
+// #4189: a magic trailing comma before the closing paren -- what every
+// multi-line wrapped signature in this corpus has, one param per line, e.g.
+// `bit_rt_map_new`'s `capHint: int,\n): int {` -- is stripped before
+// counting. Left unstripped it is indistinguishable from a real separator,
+// so an N-param wrapped signature parsed as N+1: this was live and wrong the
+// first time `joinSignatureWindow` made a wrapped signature reachable at
+// all, reporting `bit_rt_map_new` as tree-arity 4 instead of the true 3.
+fn countTopLevelCommas(rawBody: string): int {
+  let body = trimSpace(rawBody)
   if (len(body) == 0) {
-    return 0, true
+    return -1
+  }
+  if (body[len(body) - 1] == ',') {
+    body = trimSpace(body[:len(body) - 1])
+    if (len(body) == 0) {
+      return -1
+    }
   }
   let commaDepth = 0
   let commas = 0
@@ -348,6 +392,27 @@ fn parseArity(fnLine: string): (int, bool) {
       commas = commas + 1
     }
     m = m + 1
+  }
+  return commas
+}
+
+fn parseArity(fnLine: string): (int, bool) {
+  let fnAt = indexOf(fnLine, "fn ")
+  if (fnAt < 0) {
+    return 0, false
+  }
+  let tail = fnLine[fnAt:]
+  let openAt = indexOf(tail, "(")
+  if (openAt < 0) {
+    return 0, false
+  }
+  let bodyEnd = findMatchingParen(tail, openAt)
+  if (bodyEnd < 0) {
+    return 0, false
+  }
+  let commas = countTopLevelCommas(tail[openAt + 1:bodyEnd])
+  if (commas < 0) {
+    return 0, true
   }
   return commas + 1, true
 }
@@ -512,6 +577,53 @@ fn collectArityMismatches(treeSymbols: []AbiSymbol, stage0Arity: map<string, int
   return mismatches
 }
 
+// The outcome of scanning one side (working tree or extracted stage0 tag)
+// for exported symbols. `stop == true` means the caller must return
+// immediately with `buildOk` as its own return value; `stop == false` means
+// `symbols` is a complete, trustworthy table safe to compare.
+class AbiScanResult {
+  symbols: []AbiSymbol,
+  stop: bool,
+  buildOk: bool,
+}
+
+// A symbol whose `@symbol(...)` marker was found attached to real
+// (non-comment) source but whose declared signature `parseArity` still could
+// not parse, even after `joinSignatureWindow` joined the surrounding lines.
+// This — not a low total count — was the actual defect (#4189): a bare
+// `if (ok) { append }` with no `else` silently dropped exactly this case, so
+// the arity comparison below never saw 164 of 783 real declarations,
+// `bit_rt_map_new` and `bit_rt_slice_new` among them. A guard that drops what
+// it cannot read is not a guard, so this refuses the build outright rather
+// than comparing a partial table.
+fn reportAbiParseFailures(where: string, failures: []string): bool {
+  eprint("make: selfhost: refusing to link — could not parse the declared signature for ${len(failures)} exported symbol(s) in ${where}:\n")
+  for f of failures {
+    eprint("make:   ${f}\n")
+  }
+  eprint("make: the runtime ABI arity check cannot trust a partial symbol table — fix the signature's formatting (or this parser, tools/build/abiarity.bit) rather than let it silently drop the symbol.\n")
+  return false
+}
+
+// Parses every exported symbol under `root` and decides whether the result
+// is safe to use: any individual parse failure stops the build outright
+// (`reportAbiParseFailures`); a suspiciously small total (below `minParsed`)
+// is instead treated as an infrastructure fact about this reader — same
+// posture `compilerEmittedSymbols` already takes at its own floor of 90 —
+// and skips just this check rather than blocking an unrelated build.
+fn scanAbiSide(root: string, label: string, minParsed: int): AbiScanResult {
+  let (symbols, failures) = parseAbiSymbols(root)
+  if (len(failures) > 0) {
+    let buildOk = reportAbiParseFailures(label, failures)
+    return AbiScanResult{ symbols: symbols, stop: true, buildOk: buildOk }
+  }
+  if (len(symbols) < minParsed) {
+    eprint("make: selfhost: parsed only ${len(symbols)} exported symbol(s) from ${label} (want >= ${minParsed}) — too few to trust; skipping the runtime ABI arity check\n")
+    return AbiScanResult{ symbols: symbols, stop: true, buildOk: true }
+  }
+  return AbiScanResult{ symbols: symbols, stop: false, buildOk: true }
+}
+
 // The entry point `stepSelfhost` calls before linking. Returns false (and
 // has already printed the diagnostic) when the build must not proceed.
 //
@@ -537,15 +649,21 @@ fn checkRuntimeAbiArity(): bool {
     eprint("make: selfhost: cannot extract runtime/** at ${tag} (tag missing locally, or `git archive` failed); skipping the runtime ABI arity check\n")
     return true
   }
-  let treeSymbols = parseAbiSymbols("runtime")
-  let stage0Symbols = parseAbiSymbols(stage0RuntimeDir)
-  // A near-empty parse of the tag's own tree is a fact about the extraction,
-  // not about the ABI — proceeding would silently trust an all-clear that
-  // was never actually checked.
-  if (len(stage0Symbols) < 10) {
-    eprint("make: selfhost: parsed only ${len(stage0Symbols)} exported symbol(s) from ${tag}'s runtime/** — too few to trust; skipping the runtime ABI arity check\n")
-    return true
+  // 780: the working tree parses to exactly this many real (non-comment)
+  // exported declarations as of #4189, with zero drops — see this file's
+  // header for the corpus grep. A floor here, not just a print, mirrors
+  // `compilerEmittedSymbols`'s own floor of 90 against its ~96.
+  let treeScan = scanAbiSide("runtime", "runtime/**", 780)
+  if (treeScan.stop) {
+    return treeScan.buildOk
   }
+  eprint("make: selfhost: runtime ABI arity scan: parsed=${len(treeScan.symbols)} dropped=0\n")
+  let stage0Scan = scanAbiSide(stage0RuntimeDir, "${tag}'s runtime/**", 10)
+  if (stage0Scan.stop) {
+    return stage0Scan.buildOk
+  }
+  let treeSymbols = treeScan.symbols
+  let stage0Symbols = stage0Scan.symbols
   let stage0Arity = map<string, int>{}
   for s of stage0Symbols {
     stage0Arity[abiSymbolKey(s)] = s.arity
@@ -569,177 +687,4 @@ fn checkRuntimeAbiArity(): bool {
   // Arities match; the same extracted stage0RuntimeDir also answers the
   // narrower, LAYOUT question this check was blind to (#3891, #3893).
   return checkRuntimeAbiLayout(stage0RuntimeDir, tag)
-}
-
-// #3893: `checkRuntimeAbiArity` above compares declared ARITIES — how many
-// words a call passes — against the pinned stage0. It cannot see a LAYOUT
-// change: which field lives at which byte offset inside a compiler-emitted
-// object. #3891 is what that gap cost: the string header widened from two
-// words to three in `runtime/**` while the pinned stage0 still emitted (and
-// every other reader still expected) the two-word shape — a hard crash on
-// x86_64-linux, and on aarch64-macos a silent miscompile where every
-// `BIT_*` environment variable stopped working with no diagnostic anywhere.
-//
-// Deliberately a short, explicit, hand-picked list — not "every const in
-// runtime/root/root.bit". Only fields a compiler-emitted literal (string,
-// slice) actually writes, or that codegen itself must agree with the
-// runtime on (the GC object header size), are a data contract with the
-// pinned compiler in the way an extern arity is. A constant nothing outside
-// `runtime/**` reads or writes (e.g. `slcHeaderSize`'s own internal helper
-// constants, if any existed) would not belong here even if it happened to
-// be a layout number, because stage0 has no baked-in expectation of it to
-// diverge from.
-class LayoutConst {
-  file: string, // relative to `runtime/`
-  name: string,
-}
-
-fn abiLayoutConsts(): []LayoutConst {
-  return [
-    LayoutConst{ file: "root/root.bit", name: "strPtr" },
-    LayoutConst{ file: "root/root.bit", name: "strLen" },
-    LayoutConst{ file: "root/root.bit", name: "strHeaderSize" },
-    LayoutConst{ file: "root/root.bit", name: "strBase" },
-    LayoutConst{ file: "root/root.bit", name: "strAllocHeader" },
-    LayoutConst{ file: "root/root.bit", name: "slcBuf" },
-    LayoutConst{ file: "root/root.bit", name: "slcLen" },
-    LayoutConst{ file: "root/root.bit", name: "slcOff" },
-    LayoutConst{ file: "root/root.bit", name: "slcCap" },
-    LayoutConst{ file: "root/root.bit", name: "slcIsRef" },
-    LayoutConst{ file: "root/root.bit", name: "slcHeaderSize" },
-    LayoutConst{ file: "gc/gc.bit", name: "gcHeaderSize" },
-  ]
-}
-
-class LayoutMismatch {
-  name: string,
-  file: string,
-  treeValue: int,
-  stage0Value: int,
-}
-
-fn isConstNameByte(c: byte): bool {
-  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
-}
-
-// Finds `const <name>` (with or without a leading `export`) and returns the
-// integer literal after its `=`, ignoring any trailing `//` comment on the
-// same line. Word-bounded on both sides — via `isConstNameByte` immediately
-// before and after the match — so searching for `strLen` cannot match
-// inside a hypothetical `strLenExtra`, the same false-match risk this
-// file's own `parseArity` already guards against for a different token.
-// True when `text[absAt:afterMarker]` (the just-matched "const <name>") is
-// not itself a substring of a longer identifier — the char immediately
-// before `absAt` and immediately after `afterMarker` must both be absent or
-// non-identifier, or e.g. `strLen` would match inside a hypothetical
-// `strLenExtra`. Split out of `parseNamedConst` to keep both under the
-// complexity-10 ceiling (spec/LINT.md:186, E0204).
-fn constNameBoundaryOk(text: string, absAt: int, afterMarker: int): bool {
-  let precededOk = absAt == 0 || !isConstNameByte(text[absAt - 1])
-  let followedOk = afterMarker >= len(text) || !isConstNameByte(text[afterMarker])
-  return precededOk && followedOk
-}
-
-// Parses the integer literal after the first `=` on the line starting at
-// `afterMarker`, ignoring a trailing `//` comment. `ok` is false when the
-// line has no `=` or the text after it is not a valid integer literal.
-fn parseConstLineValue(text: string, afterMarker: int): (int, bool) {
-  let restOfLine = text[afterMarker:]
-  let nlAt = indexOf(restOfLine, "\n")
-  let line = restOfLine
-  if (nlAt >= 0) {
-    line = restOfLine[:nlAt]
-  }
-  let eqAt = indexOf(line, "=")
-  if (eqAt < 0) {
-    return 0, false
-  }
-  let valuePart = trimSpace(line[eqAt + 1:])
-  let commentAt = indexOf(valuePart, "//")
-  if (commentAt >= 0) {
-    valuePart = trimSpace(valuePart[:commentAt])
-  }
-  let parsedOk = true
-  let value = parseInt(valuePart) catch _ {
-    parsedOk = false
-    0
-  }
-  return value, parsedOk
-}
-
-fn parseNamedConst(text: string, name: string): (int, bool) {
-  let marker = "const " + name
-  let searchFrom = 0
-  while (true) {
-    let at = indexOf(text[searchFrom:], marker)
-    if (at < 0) {
-      return 0, false
-    }
-    let absAt = searchFrom + at
-    let afterMarker = absAt + len(marker)
-    searchFrom = afterMarker
-    if (!constNameBoundaryOk(text, absAt, afterMarker)) {
-      continue
-    }
-    let (value, ok) = parseConstLineValue(text, afterMarker)
-    if (ok) {
-      return value, true
-    }
-  }
-}
-
-// Reads `lc`'s value out of `root + "/" + lc.file"` — `root` is `"runtime"`
-// for the working tree, or `extractStage0Runtime`'s returned directory for
-// the pinned tag, so the same `LayoutConst` table answers both sides.
-fn layoutConstValue(root: string, lc: LayoutConst): (int, bool) {
-  let text = readFile(root + "/" + lc.file) catch _ {
-    return 0, false
-  }
-  return parseNamedConst(text, lc.name)
-}
-
-// Compares `abiLayoutConsts()` between the working tree and the already-
-// extracted `stage0RuntimeDir` (`checkRuntimeAbiArity` extracts it once and
-// passes it in, reusing the same `git archive` this check needs). Returns
-// false — and has already printed the diagnostic — when the build must not
-// proceed.
-fn checkRuntimeAbiLayout(stage0RuntimeDir: string, tag: string): bool {
-  let mismatches = []LayoutMismatch(0)
-  for lc of abiLayoutConsts() {
-    let (treeValue, tok) = layoutConstValue("runtime", lc)
-    let (stage0Value, sok) = layoutConstValue(stage0RuntimeDir, lc)
-    // A constant this table expects but cannot find on either side is an
-    // infrastructure fact (renamed file, moved constant), not a proven
-    // layout mismatch — skip it rather than refuse a build over a check
-    // that could not actually run, same posture as the arity check's own
-    // "too few symbols parsed" guard above.
-    if (!tok || !sok) {
-      continue
-    }
-    if (treeValue != stage0Value) {
-      mismatches = append(
-        mismatches,
-        LayoutMismatch{
-          name: lc.name,
-          file: lc.file,
-          treeValue: treeValue,
-          stage0Value: stage0Value,
-        },
-      )
-    }
-  }
-  if (len(mismatches) == 0) {
-    return true
-  }
-  eprint("make: selfhost: refusing to link — runtime object LAYOUT mismatch against the pinned stage0 (${tag}):\n")
-  for m of mismatches {
-    eprint("make:   ${m.name} (runtime/${m.file}): stage0 (${tag}) was built expecting ${m.stage0Value}; this tree's runtime/** now declares ${m.treeValue}\n")
-  }
-  eprint("make: stage0 is the compiler that EMITS this object's layout (string/slice header fields, the GC header size) into every program it builds. It cannot re-read runtime/**'s new constant, so linking would succeed and produce a silent miscompile — a hard crash on one platform, and on another, running code that reads the wrong bytes with no diagnostic anywhere (#3891).\n")
-  eprint("make: BIT_LIBBITRT_TREE=1 does NOT fix this — it still builds L0 with the PINNED stage0 compiling THIS tree's runtime source (stepLibbitrtTree, artifactsteps.bit), so L0 carries the identical mismatch.\n")
-  eprint("make: land this with the three-pass bootstrap instead (#3891's recipe):\n")
-  eprint("make:   BIT_LIBBITRT=<main's libbitrt.a for this host> bit-out/stage0/bit-oracle build compiler -o \$TMPDIR/p1   # a self-consistent compiler: new compiler/** source, OLD (matching) runtime archive\n")
-  eprint("make:   BIT=\$TMPDIR/p1 bash scripts/g2archive.sh <target> \$TMPDIR/libbitrt-p1-<target>.a                        # a runtime archive whose layout matches the NEW reader\n")
-  eprint("make:   BIT_LIBBITRT=\$TMPDIR/libbitrt-p1-<target>.a \$TMPDIR/p1 build <program> -o <out> -t <target>            # build a program against the matched pair\n")
-  return false
 }
