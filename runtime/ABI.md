@@ -736,6 +736,27 @@ slot list load-bearing again. It means today's always-on conservative
 fallback happens to make it redundant for correctness right now, and nothing
 in the codebase currently tests that the slot list is itself correct.
 
+**The REGISTER half is a different story: it is genuinely load-bearing
+(#4111), not shadowed.** `runtime/stw/stw.bit:729-737` skips class 7's ctx
+scan for the running task, so `gcMarkRoot(g, *(regs + rn))` is, for a
+self-collecting task, the only thing marking a live register directly.
+Mutating `compiler/regalloc.bit`'s `regs = append(regs, loc.index)` to a
+no-op (every entry's `num_regs` -> 0) makes `_tests_/stress/schedgrowdarwin`
+and `schedgrowdemanddarwin` (`test-stress-batch`) crash deterministically —
+`bus error` / `segmentation fault`, 3/3 runs, at idle host load, both clean
+on the unmutated compiler at comparable load, ruling out contention. Both
+programs start a real OS thread and hand it a GC-managed `WorkerLaunch`
+(`runtime/sched/grow.bit`); the spawning call chain can hold that reference
+live only in a register across the handoff, and a missing root there frees
+it out from under the new thread reading its fields. **One narrower shape
+does happen to survive**: a single task that triggers its own collection
+while holding a register-only reference with no other thread involved
+survives, because `bit_rt_safepoint`'s snapshot frame — including its raw
+`regs[32]` dump — sits on that same task's own stack, inside class 8's
+`[sp, top)` scan (`runtime/gc/stackmap.bit`'s fuller note has the full
+argument). That corner is not the general case and must not be generalized
+from — `.regs` stays exactly as necessary as it looks.
+
 ### 4.1 The one-table assumption, and why it had to go (RESOLVED)
 
 The format above assumes **one table per link**, under one fixed symbol, emitted
