@@ -2304,6 +2304,13 @@ Every declared binding without an initializer is deterministically zero-valued:
   values; **writing** a `nil` map, or calling a `nil` function, **panics**
   (§18.4); sending on a `nil` channel blocks forever instead (§16.2). Use the
   constructor forms (§12.9) to allocate.
+- `enum` (§14.7) → its declaration-order **first** variant, at that variant's
+  tag — **provided that variant carries no payload**. An enum whose first
+  variant carries a payload has no zero value at all: see below. A no-payload
+  enum's first variant is always safe (its tag is a bare word, nothing to
+  materialize); a payload-carrying enum's first variant is safe only when that
+  one variant itself carries no payload — `enum Shape { Unit, Circle(f64) }`'s
+  zero value is `Shape.Unit` even though `Circle` carries one.
 
 Every context that produces a zero value produces the *same* zero value: a
 declaration without an initializer, a missing map key (§12.6), a receive from a
@@ -2342,6 +2349,34 @@ Only a **class-typed** field is affected. Scalars, `string`, slices, maps,
 channels, functions and interfaces all have a zero value that is literally zero
 bits, and an inline `[N]T` field lives in the class's own storage, so all of
 them stay omittable and `let p: Inner` above is still valid.
+
+**An enum whose declaration-order first variant carries a payload has no zero
+value, for the same reason a class with a class-typed field does not.** A
+payload-carrying enum is a boxed `{tag, payloadPtr}` reference (§14.7); its
+first variant is the one that would materialize with no arguments given, and a
+variant with a payload has none to give. Both forms that would ask for one are
+**E0083**, the identical surfaces as the class-typed-field rule above:
+
+```
+enum Option<T> { None, Some(T) }       // the prelude's own declaration (§17.5)
+enum Result<T, E> { Ok(T), Err(E) }    // likewise
+
+let a: Option<int>                     // ok; None (tag 0) carries no payload
+let b = []Option<int>(2)               // ok; both elements zero to None
+
+let c: Result<int, string>             // E0083 — Ok (tag 0) carries a payload
+let d = []Result<int, string>(2)       // E0083 — same reason
+class Box { r: Result<int, string> }
+let e = Box{}                          // E0083 — omits the payload-first field
+```
+
+This is why the prelude declares `Option<T>` as `{ None, Some(T) }` rather than
+`{ Some(T), None }`: ordering the empty variant first gives `Option<T>` a real
+zero value, which is what makes a self-referential field like `next:
+Option<Node>` omittable and lets `Option<T>` serve as §13.3's cycle-breaking
+alternative to a bare class-to-class field (a cycle of class-typed fields is
+rejected outright, `E0047`). `Result<T, E>` has no such rescue — both `Ok` and
+`Err` carry a payload — and correctly has no zero value at all.
 
 ### 13.5 Arithmetic and Overflow
 
@@ -2716,7 +2751,7 @@ let s = Shape.Rect(3.0, 4.0)   // payload variant: construct with arguments
 - Enum values are consumed by `match` (§13.8), which is exhaustive over the
   variants and binds a variant's payload in its arm. Enums are not ordered and not
   `==`-comparable in v0.1 — use `match`.
-- An enum may be **generic** (`enum Option<T> { Some(T), None }`), monomorphized
+- An enum may be **generic** (`enum Option<T> { None, Some(T) }`), monomorphized
   per instantiation like a generic class (§14.1, §15). A construction's type
   arguments are usually inferred: from the payload argument (`Option.Some(5)`
   gives `Option<i64>`), from the expected type when no argument constrains a
@@ -3419,7 +3454,7 @@ variant list is the type's entire meaning; every other symbol prints
 
 ```
 // Option<T> is present (Some) or absent (None).
-enum Option<T> { Some(T), None }
+enum Option<T> { None, Some(T) }
 class Point
 class Reader
 method Reader.readAll () => string

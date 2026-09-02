@@ -1,24 +1,41 @@
 // compiler/lowerslicefill.bit — split out of lowerlit.bit (#1924), which the
-// fill loop below pushed past the 800-line limit. Sibling of lowerlit.bit: same
-// module, so this needs no imports and no call-site changes.
+// fill loop below pushed past the 800-line limit; `zeroValue` and
+// `fillOmittedEnumFields` moved here from lowerlit.bit for the same reason
+// (#4182). This is now the module's "§13.4 zero-value machinery" file: what a
+// type's zero value IS (`zeroValue`), whether it HAS one at all
+// (`typeHasNoZeroValue`), and the two lowering sites that must materialize one
+// where a literal's own zeroed allocation is not enough (`fillZeroElems` for
+// `[]T(n)`, `fillOmittedEnumFields` for an omitted composite-literal field).
+// Sibling of lowerlit.bit: same module, so this needs no imports and no
+// call-site changes.
 //
-// Named to sort AFTER `lowerlit`, `lowerprim` and `lowercond`, which hold every
-// helper called here (`zeroValue`/`structTySubst`, `emitRtCall`, `emitJump`).
-// Module files concatenate in bytewise filename order and the inliner only
-// inlines a callee it has already lowered, so a name sorting earlier would
-// silently change the machine code rather than merely move text (#1511).
+// FILENAME ORDER NO LONGER AFFECTS CODEGEN QUALITY (#3163, 2026-08-16):
+// inlining is whole-module and order-independent, so which file a callee's
+// definition lives in cannot change what gets inlined. It still affects
+// nothing about correctness here regardless, since every function in this
+// module resolves by name — `structTySubst`/`emitRtCall`/`emitJump`/
+// `buildEnumObj`/`lowerSliceElems` are all still defined elsewhere in this
+// module and called from here exactly as they were before the move.
 
-// Whether `ty` is a class with a class-typed field — i.e. one of the types
-// §13.4 gives no zero value (E0083, #1914). The checker's
-// `vMissingStructFields` answers the same question and builds the message; this
-// side only needs the yes/no, and cannot reuse it because that one runs off a
-// `Checker` before lowering has a `FnCtx`.
+// Whether `ty` has no zero value at all (§13.4, E0083, #1914, #4182): a class
+// with a class-typed (or no-zero-value-enum-typed) field, or itself a boxed
+// enum whose declaration-order first variant carries a payload. The checker's
+// `vMissingStructFields`/`vFieldHasNoZeroValue`/`enumZeroVariantName`
+// (validatezero.bit) answer the same question and build the message; this
+// side only needs the yes/no, and cannot reuse those directly because they run
+// off a `Checker` before lowering has an `FnCtx` — `vFieldHasNoZeroValue` IS
+// reused here per field, since it already takes a bare `Checker` and `fc.c` is
+// one.
 //
 // Substituted through `structTySubst`, for the same reason the layouts are: a
 // generic `Box<Inner>` must see `Inner` where the declaration says `T`, or a
-// monomorphization with a class argument slips past.
-fn structHasNoZeroValue(fc: FnCtx, ty: int): bool {
-  if (fc.c.ctx.types[ty].kind != TypeKind.Struct) {
+// monomorphization with a class or enum argument slips past.
+fn typeHasNoZeroValue(fc: FnCtx, ty: int): bool {
+  let tk = fc.c.ctx.types[ty].kind
+  if (tk == TypeKind.Enum) {
+    return enumZeroVariantName(fc.c, ty) != ""
+  }
+  if (tk != TypeKind.Struct) {
     return false
   }
   let decl = structDeclOf(fc.c, ty)
@@ -29,22 +46,24 @@ fn structHasNoZeroValue(fc: FnCtx, ty: int): bool {
   let sub = structTySubst(fc, oc, decl, ty)
   for f of structFieldNodes(oc, decl) {
     let fty = typeFromNodeIn(oc, kidsOf(oc.tree, f)[1], sub)
-    if (fc.c.ctx.types[fty].kind == TypeKind.Struct) {
+    if (vFieldHasNoZeroValue(fc.c, fty)) {
       return true
     }
   }
   return false
 }
 
-// `[]T(n)` where T is a STRUCT: give the fresh backing `n` live zero instances
-// (#1924).
+// `[]T(n)` where T is a STRUCT, or (#4182) a BOXED ENUM whose first variant
+// has no payload: give the fresh backing `n` live zero instances (#1924).
 //
 // `slice_new` zeroes the buffer, which IS the zero value of a scalar, a string
-// or a nested slice — and is a NULL for a class, because structs are
-// references. So `[]Inner(2)` handed back two wild pointers and `s[0].xs`
-// segfaulted with no diagnostic, on a construct whose whole documented purpose
-// is "n zero values" (SPEC §12.9). Nothing else in the language produces a null
-// class, so nothing downstream is prepared to meet one.
+// or a nested slice — and is a NULL REFERENCE for a class or a boxed enum,
+// since both are reference types. So `[]Inner(2)` handed back two wild
+// pointers and `s[0].xs` segfaulted with no diagnostic, on a construct whose
+// whole documented purpose is "n zero values" (SPEC §12.9); `[]Shape(2)` for
+// `enum Shape { Unit, Circle(f64) }` did the same the instant anything read
+// its tag. Nothing else in the language produces a null class or a null enum,
+// so nothing downstream is prepared to meet one.
 //
 // A REAL IR LOOP, not a runtime primitive, and the reason is the collector
 // rather than convenience. The slice stays live across every element's
@@ -53,9 +72,9 @@ fn structHasNoZeroValue(fc: FnCtx, ty: int): bool {
 // raw `int` in a frame that only the conservative scan can see, which is the
 // weaker guarantee and an open defect in its own right (#1834).
 //
-// Only `Struct` needs filling. Every other element kind's zero value is zero
-// bits, and `[N]T` cannot be a slice element at all (E0072 rejects a
-// reference-typed array element).
+// Only `Struct` and boxed `Enum` need filling. Every other element kind's zero
+// value is zero bits, and `[N]T` cannot be a slice element at all (E0072
+// rejects a reference-typed array element).
 //
 // Returns the slice again, as the exit block's parameter — NOT the value passed
 // in, and `hSlice`/`hN` are read rather than `sliceV`/`nV`. That is a hard
@@ -75,7 +94,7 @@ fn structHasNoZeroValue(fc: FnCtx, ty: int): bool {
 //
 // The body takes no parameters: it has the header as its single predecessor, so
 // there is nothing to merge (again as `lowerWhile` does).
-fn fillStructElems(fc: FnCtx, sliceV: int, elemTy: int, nV: int, span: Span): int {
+fn fillZeroElems(fc: FnCtx, sliceV: int, elemTy: int, nV: int, span: Span): int {
   let i64ty = primType(fc.c.ctx, 3)
   let sliceTy = fc.b.instrs[sliceV].ty
   let header = builderNewBlock(fc.b)
@@ -104,14 +123,14 @@ fn fillStructElems(fc: FnCtx, sliceV: int, elemTy: int, nV: int, span: Span): in
   builderEndBlock(fc.b)
 
   builderBeginBlock(fc.b, body)
-  // An element type with NO zero value (a class with a class-typed field,
-  // §13.4) cannot be filled. The checker rejects that outright when `n` folds to
-  // a constant above zero, which is the diagnosable case; a runtime `n` it
-  // cannot decide, and `[]S(0)` is both legal and the idiomatic empty slice. So
-  // the body — entered only when `n > 0` — panics rather than storing a null and
-  // handing the caller a segfault later, at a place that no longer names the
-  // slice.
-  if (structHasNoZeroValue(fc, elemTy)) {
+  // An element type with NO zero value (a class with a class-typed field, or a
+  // boxed enum whose first variant carries a payload, §13.4) cannot be filled.
+  // The checker rejects that outright when `n` folds to a constant above zero,
+  // which is the diagnosable case; a runtime `n` it cannot decide, and `[]S(0)`
+  // is both legal and the idiomatic empty slice. So the body — entered only
+  // when `n > 0` — panics rather than storing a null and handing the caller a
+  // segfault later, at a place that no longer names the slice.
+  if (typeHasNoZeroValue(fc, elemTy)) {
     emitNoZeroValuePanic(fc, elemTy, "[]" + typeName(fc.c.ctx, elemTy) + "(n)")
     builderEndBlock(fc.b)
     builderBeginBlock(fc.b, exit)
@@ -123,8 +142,9 @@ fn fillStructElems(fc: FnCtx, sliceV: int, elemTy: int, nV: int, span: Span): in
   }
   // elem_size (ABI.md §9, #3121/#3226): see `lowerlit.bit`'s
   // `lowerSliceAlloc` for the full rationale; `sliceElemSizeFor` lives in
-  // `lowercall.bit`. `elemTy` is always a class here (`fillStructElems`'s
-  // only caller gates on `TypeKind.Struct`), so this is always 8 in
+  // `lowercall.bit`. `elemTy` is always a class or a boxed enum here
+  // (`fillZeroElems`'s only caller gates on `TypeKind.Struct` or a boxed
+  // `TypeKind.Enum`), so this is always 8 in
   // practice — never a packed `[]u8` — but computed rather than hard-coded
   // to match every other call site and not depend on that invariant holding.
   let esI = mkInstr(Op.ConstInt, i64ty)
@@ -150,24 +170,167 @@ fn fillStructElems(fc: FnCtx, sliceV: int, elemTy: int, nV: int, span: Span): in
 // the current one.
 //
 // Shared by the two places that must materialize a zero value and cannot: the
-// `[]T(n)` fill above, and `m[k]`'s miss edge (`emitMapGet`, lowerlit.bit). Both
-// are reached only at run time — the checker rejects every case it can decide
-// statically (E0083) — and both would otherwise store or return a null class,
-// which segfaults later at a place that no longer names the map or the slice.
+// `[]T(n)` fill above, and `m[k]`'s miss edge (`emitMapMiss`, loweraccess.bit).
+// Both are reached only at run time — the checker rejects every case it can
+// decide statically (E0083) — and both would otherwise store or return a null
+// class or a null enum, which segfaults later at a place that no longer names
+// the map or the slice.
 //
 // `what` names the construct, not the type, so the message reads as the thing
-// the programmer wrote rather than as a compiler-internal fact.
+// the programmer wrote rather than as a compiler-internal fact. The message
+// itself does not say WHY `ty` has no zero value (#4182: it is either a
+// class-typed field or a payload-carrying zero-tag enum variant) — `bit check`
+// already reported that with a field or variant name; this is the runtime
+// fallback for the case it could not decide statically.
 fn emitNoZeroValuePanic(fc: FnCtx, ty: int, what: string) {
   let name = typeName(fc.c.ctx, ty)
   let msg = mkInstr(Op.ConstString, primType(fc.c.ctx, 11))
   msg.sval = what +
     ": '" +
     name +
-    "' has a class-typed field and therefore no zero value (SPEC 13.4)"
+    "' has no zero value (SPEC 13.4)"
   msg.ival = internPoolString(fc, msg.sval)
   let pn = mkInstr(Op.RtCall, fc.c.ctx.voidId)
   pn.name = "panic"
   pn.args = [builderEmit(fc.b, msg)]
   emitRtCall(fc, pn)
   builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
+}
+
+// The zero value of `ty`, materialized.
+//
+// The Struct arm below emits a bare zeroed `GcAlloc` and writes no field, and
+// that is CORRECT rather than a shortcut, because of an invariant the checker
+// now enforces (E0083, #1914): a class type that has a class-typed field has
+// no zero value at all and never reaches here — `vBindingNoZeroValue` rejects
+// `let o: Outer` before lowering. So every class that does get here has only
+// fields whose zero value IS zero bits (scalars, strings, slices, maps,
+// interfaces, inline arrays), which is exactly what `GcAlloc` hands back.
+//
+// The Enum arm is the same invariant reached through variant order instead of
+// field order (#4182): a boxed enum reaches it only when its tag-0 variant
+// carries no payload (validatezero.bit rejects every other one as E0083
+// first). The old fallthrough built a bare `ConstNil` for EVERY enum — a null
+// REFERENCE, not a tag-0 object, so the first tag read (`match`, `isNone`, ...)
+// dereferenced it. A bare (non-boxed) enum's zero bits are already its first
+// variant's tag, so that case still falls through unchanged.
+//
+// This function used to be paired with a `zeroOmittedFields` in the literal
+// path that filled class-typed fields one level deep. That fill was deleted
+// with the checker rule: two mechanisms answering the same question is how they
+// come to disagree, and the fill's own recursion stopped at depth 1 anyway, so
+// `Inner` inside `Inner` was still a null.
+fn zeroValue(fc: FnCtx, ty: int, span: Span): int {
+  let td = fc.c.ctx.types[ty]
+  if (td.kind == TypeKind.Prim) {
+    if (td.prim == 10) {
+      let b = mkInstr(Op.ConstBool, ty)
+      b.bval = false
+      return builderEmit(fc.b, b)
+    }
+    if (td.prim == 8 || td.prim == 9) {
+      let f = mkInstr(Op.ConstFloat, ty)
+      return builderEmit(fc.b, f)
+    }
+    if (td.prim == 11) {
+      let s = mkInstr(Op.ConstString, ty)
+      s.sval = ""
+      s.ival = internPoolString(fc, s.sval)
+      return builderEmit(fc.b, s)
+    }
+    let ci = mkInstr(Op.ConstInt, ty)
+    return builderEmit(fc.b, ci)
+  }
+  if (td.kind == TypeKind.Array) {
+    return newArray(fc, ty)
+  }
+  if (td.kind == TypeKind.Struct) {
+    let decl = structDeclOf(fc.c, ty)
+    if (decl == 0) {
+      fcFail(fc, span, "a zero value for a class type with no declaration in scope")
+      return 0
+    }
+    let oc = typeOwner(fc.c, ty)
+    let layout = structLayout(fc, oc, decl, structTySubst(fc, oc, decl, ty))
+    let ga = mkInstr(Op.GcAlloc, ty)
+    ga.ival = layout.size
+    ga.offsets = layout.ptrOffsets
+    return builderEmit(fc.b, ga)
+  }
+  // A slice zero-value is the EMPTY slice (SPEC §13.4), which since #3648 is
+  // spelled as the null header — `lowerSliceElems` with no items.
+  //
+  // THIS COMMENT USED TO SAY THE OPPOSITE and its reason was stale: "a null
+  // header has no `len` word to load, so `len(xs)` on it faults". #1564 fixed
+  // that fault in both backends (`emitHeaderWordOrZero`), so null and empty are
+  // now indistinguishable to a program in every operation, not just in the
+  // `xs == nil` that E0053 already forbids.
+  if (td.kind == TypeKind.Slice) {
+    return lowerSliceElems(fc, ty, []int(0))
+  }
+  return zeroValueEnumOrNil(fc, ty, td)
+}
+
+// The last two arms of `zeroValue` above, split out to keep it under E0204's
+// complexity ceiling: a boxed enum's real zero value (#4182), or `ConstNil`
+// for everything else that reaches here (map/chan/function/interface, whose
+// zero IS `nil`, per §13.4).
+fn zeroValueEnumOrNil(fc: FnCtx, ty: int, td: Type): int {
+  if (td.kind == TypeKind.Enum && td.enumBoxed) {
+    return buildEnumObj(fc, ty, 0, -1)
+  }
+  let nl = mkInstr(Op.ConstNil, ty)
+  return builderEmit(fc.b, nl)
+}
+
+// Fills every field `lowerClassLit` left OMITTED (not named in the literal's
+// initializer list) whose type is a BOXED enum, with that type's real zero
+// value (#4182). `GcAlloc`'s raw zero bytes are already the right zero value
+// for every other omittable field (scalar, string, slice, map, chan,
+// interface, inline array) — only a boxed enum's zero bits are a null
+// REFERENCE rather than its live `{tag:0,nil}` object. Recomputes the
+// declaration/layout `lowerClassLit` already has, trading a little duplicate
+// (compile-time-only) work for staying at E0202's 5-param ceiling — a class
+// bundling `oc`/`fields`/`sub`/`layout` for one caller would be more
+// machinery than the question it answers.
+//
+// The checker (`vMissingStructFields`/`vFieldHasNoZeroValue`,
+// validatezero.bit) has already rejected any field whose enum type has NO
+// zero value (its tag-0 variant carries a payload), so every field reaching
+// here is safe to materialize. Unlike a class-typed field — always rejected
+// outright, per §13.4's cycle-recursion rationale — an enum's tag-0 zero
+// value never itself has a payload to recurse into, so there is no cycle to
+// worry about and no reason to reject the safe case the way a class-typed
+// field is.
+fn fillOmittedEnumFields(fc: FnCtx, obj: int, structTy: int, node: int) {
+  let kids = kidsOf(fc.c.tree, node)
+  let decl = structDeclOf(fc.c, structTy)
+  let oc = typeOwner(fc.c, structTy)
+  let sub = structLitSubst(fc.c, oc, decl, kids[0])
+  let layout = structLayout(fc, oc, decl, sub)
+  let fields = structFieldNodes(oc, decl)
+  let inits = kidsOf(fc.c.tree, kids[1])
+  let span = getNode(fc.c.tree, node).span
+  let i = 0
+  while (i < len(fields)) {
+    let fldNode = getNode(oc.tree, kidsOf(oc.tree, fields[i])[0])
+    let name = oc.source[fldNode.span.start:fldNode.span.end]
+    if (vLitNamesField(fc.c, inits, name)) {
+      i = i + 1
+      continue
+    }
+    let fty = typeFromNodeIn(oc, kidsOf(oc.tree, fields[i])[1], sub)
+    if (fc.c.ctx.types[fty].kind == TypeKind.Enum && fc.c.ctx.types[fty].enumBoxed) {
+      let zv = zeroValue(fc, fty, span)
+      if (fc.failed) {
+        return
+      }
+      let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+      fs.lhs = obj
+      fs.ival = layout.offsets[i]
+      fs.rhs = zv
+      builderEmit(fc.b, fs)
+    }
+    i = i + 1
+  }
 }
