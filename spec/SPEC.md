@@ -4094,6 +4094,15 @@ test "concat" {
 - A test fails when it panics — which a failed `assert` (§18.4) does. Each test
   therefore runs in its own process, so one failure neither hides the others nor
   aborts the run.
+- **No `t.Run(name, fn)` subtest form is provided, deliberately.** Subtests
+  share their parent's process by construction, so one subtest's panic would
+  end its siblings — trading away the one-process-per-test guarantee above.
+  The benefit subtests are usually reached for, naming the failing row of a
+  table-driven test, is delivered instead by the `label` parameter every
+  `std/testing` assertion requires (`stdlib/testing/testing.bit`): it is a
+  positional, non-optional parameter — §10.3's `param = [ "..." ] IDENT ":"
+  type .` grammar has no default-value production for any parameter — so the
+  row a failure came from can never go unnamed.
 - Tests are ordinary unreferenced declarations to `bit build`/`bit run`, so the
   linker's dead-strip drops them from a normal program's binary — every
   test or test-shaped function in a `.test.bit` file, whichever form it uses.
