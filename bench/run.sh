@@ -205,6 +205,68 @@ ratio()  { awk -v a="$1" -v b="$2" 'BEGIN{if(b+0<=0){printf "n/a"}else{printf "%
 
 STARTBASE=$(awk '{printf "%s%s %.1fM", (NR>1?", ":""), $1, $2/1000000} END{print ""}' "$WORK/startcyc")
 
+# --- append history.csv (moved ahead of the render below, #4199: the
+# reproducibility paragraph reads this file, so THIS run's own row must
+# already be in it) ---
+# alloc_count is empty, not 0, wherever a language has no counter for a case
+# (alc() already returns "" on no match) -- a 0 meaning "not measured" is
+# indistinguishable from a 0 meaning "allocated nothing" (#3997).
+# cycles/instructions are the startup-corrected figures the tables publish, so a
+# ratio recomputed from this file matches the one in RESULTS.md exactly.
+hist=bench/history.csv
+HDR="timestamp,git_sha,case,lang,median_s,rss_bytes,bin_bytes,alloc_count,cycles,instructions"
+if [ ! -f "$hist" ]; then
+  echo "$HDR" > "$hist"
+elif [ "$(head -1 "$hist")" != "$HDR" ]; then
+  # A column was added. Rewrite the header line only: historical rows keep their
+  # own shorter arity, because a row that stops early means "not measured then",
+  # which is the same claim an empty field makes (#3997). Padding them would
+  # invent a measurement that was never taken.
+  { echo "$HDR"; tail -n +2 "$hist"; } > "$WORK/hist" && mv "$WORK/hist" "$hist"
+fi
+for c in $CASES; do
+  for l in bit c go; do
+    echo "$STAMP,$GITSHA,$c,$l,$(get "$c" "$l" 3),$(get "$c" "$l" 4),$(get "$c" "$l" 5),$(alc "$c" "$l"),$(netcyc "$c" "$l"),$(netins "$c" "$l")" >> "$hist"
+  done
+done
+
+# --- peak-RSS reproducibility across regenerations (#4199) ------------------
+# The RSS this table publishes is already a MEDIAN of ${RUNS} in-process
+# samples, but #4068 found that median itself can swing between SEPARATE
+# regenerations -- Go's `strings` RSS was reported at "68.9-122 MB across
+# runs", which a single run's own ${RUNS} samples cannot show. history.csv is
+# the record of every regeneration this repo has ever committed, so it is
+# read here rather than re-measured.
+#
+# Scoped to the SAME four rows #4040 already flagged as noisy on the cycle
+# ratios (alloc, map, allocflat, strings) and to the go/c columns only. The
+# bit column is deliberately excluded: it legitimately swings across real
+# compiler/runtime changes over that history window (`strings` bit's own RSS
+# fell 952MB -> 131MB as the allocator improved, a 7x move with no bug and no
+# noise in it), and folding that into a noise disclosure would misreport a
+# real fix as instability.
+rssHistSpread() {  # case lang -> "min median max N" in MB, or empty if N<5
+  awk -F, -v c="$1" -v l="$2" '$3==c && $4==l && $6!="" {print $6}' "$hist" \
+    | sort -n | awk '{a[NR]=$1} END{
+        if (NR<5) exit 0
+        med = (NR%2) ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2
+        printf "%.1f %.1f %.1f %d", a[1]/1048576, med/1048576, a[NR]/1048576, NR
+      }'
+}
+RSSNOTE=""
+for c in alloc map allocflat strings; do
+  for l in go c; do
+    s=$(rssHistSpread "$c" "$l")
+    [ -n "$s" ] || continue
+    set -- $s
+    rlo=$1; rmed=$2; rhi=$3; rn=$4
+    # >10%, same order of magnitude as #4040's "read a change under ~3% as
+    # noise" for the loose cycle rows, scaled up for a cruder cross-run signal.
+    unstable=$(awk -v a="$rhi" -v b="$rlo" 'BEGIN{print (a > b*1.10) ? 1 : 0}')
+    [ "$unstable" = 1 ] && RSSNOTE="${RSSNOTE}${RSSNOTE:+; }\`$c\` $l: ${rlo}-${rhi} MB (median ${rmed} MB, N=${rn})"
+  done
+done
+
 md="$WORK/results.md"
 {
   echo "_Full method and caveats below the tables._"
@@ -275,6 +337,9 @@ md="$WORK/results.md"
   echo "> The ratios are built from CYCLES, not from wall clock. \`/usr/bin/time\` reports \`real\` in hundredths of a second and most of the C sides here finish in under 0.10s, so a wall-clock ratio for those rows is quantisation: \`map\` published 7.50x C off 0.300s/0.040s where the counters say ~4.5x. Adding runs does not fix that, because it narrows the spread around a quantised value instead of removing the quantisation, so the unit changed (#4040). Both counters come from the same \`/usr/bin/time -l\` invocation that already produced the wall clock and the RSS; nothing extra is run and nothing extra is installed. The wall-clock table is kept as context and carries no ratio column."
   echo "> Cycles and instructions are startup-corrected: each figure has that language's own empty-program cost (\`bench/cases/startup\`, ${STARTBASE}) subtracted, because dyld and runtime init differ per language and are a fifth of C's \`allocflat\` row. Every other table is raw."
   echo "> Reproducibility was measured rather than assumed (#4040): four independent regenerations of this table on this box held every ratio to 2.5% between adjacent runs and 8.5% at worst across all four. The loose rows are \`alloc\`, \`map\`, \`allocflat\` and \`strings\`, whose Go or C side is short enough that that language's own allocator and collector scheduling moves it by several percent from run to run; \`matrix\`, \`mandelbrot\`, \`fib\` and \`sort\` reproduce to about 1%. On those four loose rows, read a change under ~3% as noise."
+  if [ -n "${RSSNOTE}" ]; then
+    echo "> Peak RSS above is a within-run median like every other figure in that table, but it can still swing further ACROSS separate regenerations than one run shows (#4199). From every regeneration recorded in \`bench/history.csv\`, restricted to the same four loose rows above and to the Go/C columns (the Bit column reflects real compiler/runtime changes over that history, not noise): ${RSSNOTE}. Read that cell's published number as representative of the stated range, not a fixed constant."
+  fi
   echo "> Instructions are published beside cycles because a cycle gap alone does not say whether it is work emitted or work stalled, and the two ratios differ a lot here: Bit retires roughly 4-7 instructions per cycle against C's 1.4-1.8, so its instruction ratio always overstates its cycle ratio. Cycles are the time; instructions are the reason."
   echo "> Generated by \`bench/run.sh\` on ${STAMP}. Do not edit by hand."
 } > "$md"
@@ -286,29 +351,6 @@ awk -v f="$md" '
   !skip
 ' README.md > "$WORK/README.md" && mv "$WORK/README.md" README.md
 cp "$md" bench/RESULTS.md
-
-# --- append history.csv ---
-# alloc_count is empty, not 0, wherever a language has no counter for a case
-# (alc() already returns "" on no match) -- a 0 meaning "not measured" is
-# indistinguishable from a 0 meaning "allocated nothing" (#3997).
-# cycles/instructions are the startup-corrected figures the tables publish, so a
-# ratio recomputed from this file matches the one in RESULTS.md exactly.
-hist=bench/history.csv
-HDR="timestamp,git_sha,case,lang,median_s,rss_bytes,bin_bytes,alloc_count,cycles,instructions"
-if [ ! -f "$hist" ]; then
-  echo "$HDR" > "$hist"
-elif [ "$(head -1 "$hist")" != "$HDR" ]; then
-  # A column was added. Rewrite the header line only: historical rows keep their
-  # own shorter arity, because a row that stops early means "not measured then",
-  # which is the same claim an empty field makes (#3997). Padding them would
-  # invent a measurement that was never taken.
-  { echo "$HDR"; tail -n +2 "$hist"; } > "$WORK/hist" && mv "$WORK/hist" "$hist"
-fi
-for c in $CASES; do
-  for l in bit c go; do
-    echo "$STAMP,$GITSHA,$c,$l,$(get "$c" "$l" 3),$(get "$c" "$l" 4),$(get "$c" "$l" 5),$(alc "$c" "$l"),$(netcyc "$c" "$l"),$(netins "$c" "$l")" >> "$hist"
-  done
-done
 
 echo
 cat "$md"
