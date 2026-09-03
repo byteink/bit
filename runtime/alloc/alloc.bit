@@ -169,8 +169,11 @@ const heapSpanCacheCountWord: int = 40
 // and the cumulative CLASS-ROUNDED bytes ever handed to a caller (never
 // decremented — the byte twin of the `swept=`/`live=` OBJECT counts
 // `BIT_GC_STATS` already prints). Both are observability-only: nothing on the
-// allocation or free hot path ever reads either back, so they cost one
-// `atomicAdd`/compare at the three sites bytes are newly minted
+// allocation or free hot path ever reads either back — see
+// `heapPeakMappedBytes`'s header for the measured reason both are updated
+// with a PLAIN, non-atomic load-modify-store rather than `atomicAdd`/
+// `atomicLoad`/`atomicStore` — so they cost one integer add (plus, for the
+// peak, one compare) at the three sites bytes are newly minted
 // (`heapTakeSmallLocked`, `heapRefillLocked`, `heapLargeAllocLocked`) and
 // nothing at all on the free path.
 const heapPeakMappedWord: int = 41
@@ -275,13 +278,23 @@ export @nosplit fn heapMappedBytes(h: *i64): int {
 // asking "how much memory did this need" wants (`runtime/ABI.md` §8.1's "a
 // scavenger cannot lower a peak" note is the same fact from the other side).
 //
-// Read/written atomically, OFF the lock for the read (same contract as
-// `heapLiveBytes` above); the compare-and-maybe-store on the write side runs
-// only from `heapRefillLocked`/`heapLargeAllocLocked`, both already under the
-// heap lock, so the two writers can never race each other.
+// PLAIN LOAD, NOT ATOMIC — deliberately UNLIKE `heapLiveBytes`/
+// `heapMappedBytes` above. Those two are read OFF the lock on the collector's
+// own growth-trigger hot path, concurrently with every allocation, so a torn
+// read there is a real hazard. This function and `heapAllocBytes` below have
+// exactly ONE caller anywhere in the runtime — `BIT_GC_STATS`' `statsReport`,
+// which every boot path calls only after `main` has returned and the worker
+// is reaped, i.e. with no allocation and no writer of any kind still running.
+// Measured, not assumed: making these two atomic cost `bench/cases/alloc`
+// +12.6% cycles with `BIT_GC_STATS` UNSET (10M individual small allocations,
+// each paying an uncontended-but-still-fenced `atomicAdd`), against a <1%
+// noise floor on the same box — the exact "unset path must stay free" cost
+// this ticket asks not to hide. Dropping the atomics for these two
+// exit-only-read fields removed it; see the ticket's engineer comment for
+// the full before/after/null-control numbers.
 export @nosplit @symbol("bit_rt_heap_peak_mapped_bytes") fn heapPeakMappedBytes(h: *i64): int {
   let p = h + heapPeakMappedWord
-  return atomicLoad(p)
+  return *p
 }
 
 // Cumulative CLASS-ROUNDED bytes ever handed to a caller — never decremented,
@@ -289,10 +302,10 @@ export @nosplit @symbol("bit_rt_heap_peak_mapped_bytes") fn heapPeakMappedBytes(
 // already on `BIT_GC_STATS`: dividing this by their sum gives bytes/object,
 // independent of anything the collector has since reclaimed. See
 // `heapLiveBytes` above for why this is the CLASS-ROUNDED figure and that one
-// is not.
+// is not, and `heapPeakMappedBytes` above for why this is a plain load.
 export @nosplit @symbol("bit_rt_heap_alloc_bytes") fn heapAllocBytes(h: *i64): int {
   let p = h + heapAllocBytesWord
-  return atomicLoad(p)
+  return *p
 }
 
 // --- Small path -------------------------------------------------------------
@@ -338,8 +351,23 @@ export @nosplit @symbol("bit_rt_heap_take_small_locked") fn heapTakeSmallLocked(
   let _ = atomicAdd(live, size)
   // #4057: `heapAllocBytes` is CLASS-ROUNDED, so this adds `allocClassSize(idx)`
   // rather than the caller's exact `size` — see `heapLiveBytes`'s header for why
-  // the two differ.
-  let _ = atomicAdd(h + heapAllocBytesWord, allocClassSize(idx))
+  // the two differ. PLAIN add, not atomic — see `heapAllocBytes`'s own header
+  // for why this word has no concurrent reader.
+  //
+  // MEASURED COST, NOT HIDDEN: `allocClassSize` (`./classify.bit`) branches on
+  // `i < 4`, so it is never inlining-eligible — the inliner (`compiler/
+  // optinline.bit`'s `calleeShapeOk`) only splices a callee with exactly one
+  // basic block, and a genuinely branch-free reformulation covering all 37
+  // classes was tried and rejected as exactly the "clever code that obscures
+  // behavior" this project's own engineering discipline forbids for an
+  // uncertain gain. `objdump -d` of the rebuilt archive confirms a real `bl`
+  // here. `bench/cases/alloc` (10M small allocations, nothing else) costs
+  // +5.5% cycles for it with `BIT_GC_STATS` UNSET (down from +12.6% before the
+  // atomics above were dropped); `bench/cases/allocflat`, which does not hit
+  // this path per object, costs 0%. See the ticket's engineer comment for the
+  // full before/after/null-control numbers.
+  let alloc = h + heapAllocBytesWord
+  *alloc = *alloc + allocClassSize(idx)
   return addr
 }
 
@@ -473,13 +501,13 @@ export @nosplit @symbol("bit_rt_heap_refill_locked") fn heapRefillLocked(h: *i64
 // #4057: record a new `heapMappedWord` high-water mark if `newMapped` exceeds
 // the one already stored. CALLER MUST HOLD THE HEAP LOCK — both call sites
 // (`heapRefillLocked` above, `heapLargeAllocLocked` below) already do, which
-// is what makes two writers here impossible; the plain load-compare-store is
-// still done through `atomicLoad`/`atomicStore` because `heapPeakMappedBytes`
-// reads it OFF the lock, the same contract `heapLiveBytes` documents.
+// is what makes two writers here impossible. PLAIN load-compare-store, not
+// atomic — see `heapPeakMappedBytes`'s own header for why this word has no
+// concurrent reader either.
 @nosplit fn heapNotePeakLocked(h: *i64, newMapped: int) {
   let peak = h + heapPeakMappedWord
-  if (newMapped > atomicLoad(peak)) {
-    atomicStore(peak, newMapped)
+  if (newMapped > *peak) {
+    *peak = newMapped
   }
 }
 
@@ -691,8 +719,10 @@ export @nosplit @symbol("bit_rt_heap_large_alloc_locked") fn heapLargeAllocLocke
   let _ = atomicAdd(live, size)
   // #4057: `nbytes` is the page-rounded mapped length (`allocLargeLen`), the
   // large-path twin of `heapTakeSmallLocked`'s `allocClassSize(idx)` — both
-  // are the CLASS/PAGE-rounded figure, never the caller's exact `size`.
-  let _ = atomicAdd(h + heapAllocBytesWord, nbytes)
+  // are the CLASS/PAGE-rounded figure, never the caller's exact `size`. PLAIN
+  // add, not atomic — see `heapAllocBytes`'s own header for why.
+  let alloc = h + heapAllocBytesWord
+  *alloc = *alloc + nbytes
 }
 
 // Account the release of a direct-mapped allocation. CALLER MUST HOLD THE LOCK.
