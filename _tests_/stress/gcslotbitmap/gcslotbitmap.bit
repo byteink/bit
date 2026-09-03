@@ -135,21 +135,26 @@ fn probeSlotDense(g: *i64, tally: []i64, slot: int) {
   probe(g, tally, slot + gcHeaderSize - 1)
 }
 
-// The whole address domain, over every span recorded. Called once with
-// everything live and once after the sweep burst, so each address is answered
-// in both the live and the freed state.
-fn probeDomain(
-  g: *i64,
-  tally: []i64,
+// The domain probeDomain replays twice: everything live, then everything but
+// the keepers freed. `spans`/`keeper`/`spanCount` come from the burst
+// (burstAllocate, below main), `arenaBase`/`idxBase` are fixed for the whole
+// run -- grouped into one class so probeDomain stays under E0202's 5-param
+// limit rather than taking all five separately.
+class ProbeDomain {
   spans: []i64,
   keeper: []i64,
   spanCount: int,
   arenaBase: int,
   idxBase: int,
-) {
+}
+
+// The whole address domain, over every span recorded. Called once with
+// everything live and once after the sweep burst, so each address is answered
+// in both the live and the freed state.
+fn probeDomain(g: *i64, tally: []i64, dom: ProbeDomain) {
   let si = 0
-  while (si < spanCount) { // bounded: BM_MAX_SPANS iterations
-    let span = spans[si]
+  while (si < dom.spanCount) { // bounded: BM_MAX_SPANS iterations
+    let span = dom.spans[si]
     let k = 0
     while (k < BM_GRID) { // bounded: BM_GRID iterations
       let slot = span + k * BM_SLOT
@@ -160,7 +165,7 @@ fn probeDomain(
       probe(g, tally, slot + BM_SLOT - 8)                     // interior, last word
       k = k + 1
     }
-    probeSlotDense(g, tally, keeper[si] - gcHeaderSize)
+    probeSlotDense(g, tally, dom.keeper[si] - gcHeaderSize)
     si = si + 1
   }
 
@@ -169,9 +174,9 @@ fn probeDomain(
   // conservative scan really does present.
   let f = 0
   while (f < 64) { // bounded: 64 iterations
-    probe(g, tally, arenaBase - (f + 1) * 4096)
-    probe(g, tally, arenaBase + ARENA_WORDS * 8 + f * 4096)
-    probe(g, tally, idxBase + f * 128)
+    probe(g, tally, dom.arenaBase - (f + 1) * 4096)
+    probe(g, tally, dom.arenaBase + ARENA_WORDS * 8 + f * 4096)
+    probe(g, tally, dom.idxBase + f * 128)
     f = f + 1
   }
   probe(g, tally, 0)
@@ -228,6 +233,30 @@ fn checkSpanBitmap(span: int): bool {
     wi = wi + 1
   }
   return got == want
+}
+
+// Runs `total` gcAlloc/checkSpanBitmap cycles against `metaAddr`, tallying
+// each distinct span touched. Identical loop for both #4122 phases below --
+// only the metadata address and cycle count differ, so it is shared rather
+// than duplicated.
+fn recycleCycles(g: *i64, metaAddr: int, total: int): (i64, i64) {
+  let checked = 0
+  let mismatches = 0
+  let lastSpan = 0
+  let d = 0
+  while (d < total) { // bounded: caller-provided total
+    let p = gcAlloc(g, metaAddr)
+    let span = allocSpanOf(p - gcHeaderSize)
+    if (span != lastSpan) {
+      lastSpan = span
+      checked = checked + 1
+      if (!checkSpanBitmap(span)) {
+        mismatches = mismatches + 1
+      }
+    }
+    d = d + 1
+  }
+  return (checked, mismatches)
 }
 
 // --- #4122 phase A: the #3925 cache guard -----------------------------------
@@ -321,23 +350,8 @@ fn phaseCacheGuard(results: []i64) {
   gcCollectRoots(g, rootsAddr, RC_SRC_OBJS) // all garbage: reclaim fires,
   // caching the non-anchor owned spans
 
-  let checked = 0
-  let mismatches = 0
-  let lastSpan = 0
   let total = RC_CACHE_CYCLES * RC_DEST_SPAN_SLOTS
-  let d = 0
-  while (d < total) { // bounded: RC_CACHE_CYCLES * RC_DEST_SPAN_SLOTS
-    let p = gcAlloc(g, destMetaAddr)
-    let span = allocSpanOf(p - gcHeaderSize)
-    if (span != lastSpan) {
-      lastSpan = span
-      checked = checked + 1
-      if (!checkSpanBitmap(span)) {
-        mismatches = mismatches + 1
-      }
-    }
-    d = d + 1
-  }
+  let (checked, mismatches) = recycleCycles(g, destMetaAddr, total)
 
   let spanBad = gcSpanViolations(g)
   gcDeinit(g)
@@ -425,23 +439,8 @@ fn phaseFreeListGuard(results: []i64) {
   gcCollectRoots(g, rootsAddr, RC_FAT_OBJS) // all garbage: reclaim fires,
   // crossing the cache and at least one full free-list node
 
-  let checked = 0
-  let mismatches = 0
-  let lastSpan = 0
   let total = RC_CYCLES * RC_FAT_SPAN_SLOTS
-  let d = 0
-  while (d < total) { // bounded: RC_CYCLES * RC_FAT_SPAN_SLOTS
-    let p = gcAlloc(g, metaAddr)
-    let span = allocSpanOf(p - gcHeaderSize)
-    if (span != lastSpan) {
-      lastSpan = span
-      checked = checked + 1
-      if (!checkSpanBitmap(span)) {
-        mismatches = mismatches + 1
-      }
-    }
-    d = d + 1
-  }
+  let (checked, mismatches) = recycleCycles(g, metaAddr, total)
 
   let spanBad = gcSpanViolations(g)
   gcDeinit(g)
@@ -449,6 +448,96 @@ fn phaseFreeListGuard(results: []i64) {
   results[1] = mismatches
   results[2] = spanBad
   results[3] = gcLiveBytes(g)
+}
+
+// Allocate the burst, recording the FIRST object seen in each distinct span
+// as that span's keeper. Order within a span is an implementation detail
+// (spans fill highest-address-first, #2374) this test does not depend on:
+// any object seen first for a new span works as its keeper. `dom` is a
+// reference type, so its spans/keeper/spanCount fields are filled in place
+// for the caller; the return value is whether every gcAlloc succeeded.
+fn burstAllocate(g: *i64, metaAddr: int, rootsAddr: int, roots: []i64, dom: ProbeDomain): int {
+  let allocOk = 1
+  let i = 0
+  while (i < BM_OBJS) { // bounded: BM_OBJS iterations
+    let p = gcAlloc(g, metaAddr)
+    if (p == 0) {
+      allocOk = 0
+    }
+    roots[i] = p
+    let span = allocSpanOf(p - gcHeaderSize)
+    let found = -1
+    let si = 0
+    while (si < dom.spanCount) { // bounded: BM_MAX_SPANS iterations
+      if (dom.spans[si] == span) {
+        found = si
+      }
+      si = si + 1
+    }
+    if (found < 0 && dom.spanCount < BM_MAX_SPANS) {
+      dom.spans[dom.spanCount] = span
+      dom.keeper[dom.spanCount] = p
+      dom.spanCount = dom.spanCount + 1
+    }
+    i = i + 1
+  }
+  gcCollectRoots(g, rootsAddr, BM_OBJS) // everything still rooted: nothing swept yet
+  return allocOk
+}
+
+// THE ASSERTION: for every span this run touched, popcount(bitmap) ==
+// spanTotal - spanFree (`checkSpanBitmap`, shared with the two #4122 phases).
+fn countSpanMatches(dom: ProbeDomain): (i64, i64) {
+  let spansOk = 0
+  let mismatches = 0
+  let sj = 0
+  while (sj < dom.spanCount) { // bounded: BM_MAX_SPANS iterations
+    if (checkSpanBitmap(dom.spans[sj])) {
+      spansOk = spansOk + 1
+    } else {
+      mismatches = mismatches + 1
+    }
+    sj = sj + 1
+  }
+  return (spansOk, mismatches)
+}
+
+// Read span-violations BEFORE `gcDeinit`: teardown frees every object, and a
+// heap with no spans left has nowhere to keep the count. `rooted` confirms
+// arena/indexArena/roots are still exactly the sizes bound -- see main()'s
+// own leading comment for why that read matters under `BIT_GC=stress`.
+fn teardownAndCheck(g: *i64, arena: []i64, indexArena: []i64, roots: []i64): (i64, i64, i64) {
+  let spanBad = gcSpanViolations(g)
+  gcDeinit(g)
+  let leaked = gcLiveBytes(g)
+  let rooted = 0
+  if (len(arena) == ARENA_WORDS && len(indexArena) == INDEX_WORDS && len(roots) == BM_OBJS) {
+    rooted = 1
+  }
+  return (spanBad, leaked, rooted)
+}
+
+// Free every object except the keepers -- the CHURN BURST that exercises the
+// bit-clear path (`freeObject` -> `clearSlotBit`) across every span at once,
+// while never letting a span go fully free.
+fn freeNonKeepers(g: *i64, rootsAddr: int, roots: []i64, dom: ProbeDomain) {
+  let d = 0
+  while (d < BM_OBJS) { // bounded: BM_OBJS iterations
+    let p = roots[d]
+    let isKeeper = 0
+    let ki = 0
+    while (ki < dom.spanCount) { // bounded: BM_MAX_SPANS iterations
+      if (dom.keeper[ki] == p) {
+        isKeeper = 1
+      }
+      ki = ki + 1
+    }
+    if (isKeeper == 0) {
+      roots[d] = 0
+    }
+    d = d + 1
+  }
+  gcCollectRoots(g, rootsAddr, BM_OBJS) // sweeps every non-keeper
 }
 
 fn main() {
@@ -496,98 +585,28 @@ fn main() {
   }
   gcConfigure(g, true, true, 4096, 200, false) // stress ON: arms the span-bookkeeping check
 
-  // Allocate the burst, recording the FIRST object seen in each distinct span
-  // as that span's keeper. Order within a span is an implementation detail
-  // (spans fill highest-address-first, #2374) this test does not depend on:
-  // any object seen first for a new span works as its keeper.
-  let spans = []i64(BM_MAX_SPANS)
-  let keeper = []i64(BM_MAX_SPANS)
-  let spanCount = 0
-  let allocOk = 1
-  let i = 0
-  while (i < BM_OBJS) { // bounded: BM_OBJS iterations
-    let p = gcAlloc(g, metaAddr)
-    if (p == 0) {
-      allocOk = 0
-    }
-    roots[i] = p
-    let span = allocSpanOf(p - gcHeaderSize)
-    let found = -1
-    let si = 0
-    while (si < spanCount) { // bounded: BM_MAX_SPANS iterations
-      if (spans[si] == span) {
-        found = si
-      }
-      si = si + 1
-    }
-    if (found < 0 && spanCount < BM_MAX_SPANS) {
-      spans[spanCount] = span
-      keeper[spanCount] = p
-      spanCount = spanCount + 1
-    }
-    i = i + 1
+  let dom = ProbeDomain{
+    spans: []i64(BM_MAX_SPANS),
+    keeper: []i64(BM_MAX_SPANS),
+    spanCount: 0,
+    arenaBase: int(ptrOf(arena)),
+    idxBase: int(ptrOf(indexArena)),
   }
-  gcCollectRoots(g, rootsAddr, BM_OBJS) // everything still rooted: nothing swept yet
+  let allocOk = burstAllocate(g, metaAddr, rootsAddr, roots, dom)
 
   // #3177 pass 1: the whole domain with all BM_OBJS objects live.
   let tally = []i64(BM_TALLY)
-  probeDomain(g, tally, spans, keeper, spanCount, int(ptrOf(arena)), int(ptrOf(indexArena)))
+  probeDomain(g, tally, dom)
 
-  // Free every object except the keepers -- the CHURN BURST that exercises
-  // the bit-clear path (`freeObject` -> `clearSlotBit`) across every span at
-  // once, while never letting a span go fully free.
-  let d = 0
-  while (d < BM_OBJS) { // bounded: BM_OBJS iterations
-    let p = roots[d]
-    let isKeeper = 0
-    let ki = 0
-    while (ki < spanCount) { // bounded: BM_MAX_SPANS iterations
-      if (keeper[ki] == p) {
-        isKeeper = 1
-      }
-      ki = ki + 1
-    }
-    if (isKeeper == 0) {
-      roots[d] = 0
-    }
-    d = d + 1
-  }
-  gcCollectRoots(g, rootsAddr, BM_OBJS) // sweeps every non-keeper
+  freeNonKeepers(g, rootsAddr, roots, dom)
 
   // #3177 pass 2: the SAME domain, now that all but the keepers are freed and
   // back on the allocator's free list. Every body address probed as live above
   // is probed again as a freed slot here.
-  probeDomain(g, tally, spans, keeper, spanCount, int(ptrOf(arena)), int(ptrOf(indexArena)))
+  probeDomain(g, tally, dom)
 
-  // THE ASSERTION: for every span this run touched, popcount(bitmap) ==
-  // spanTotal - spanFree (`checkSpanBitmap`, shared with the two #4122
-  // phases below).
-  let spansOk = 0
-  let mismatches = 0
-  let sj = 0
-  while (sj < spanCount) { // bounded: BM_MAX_SPANS iterations
-    if (checkSpanBitmap(spans[sj])) {
-      spansOk = spansOk + 1
-    } else {
-      mismatches = mismatches + 1
-    }
-    sj = sj + 1
-  }
-
-  // Read BEFORE `gcDeinit`: teardown frees every object, and a heap with no
-  // spans left has nowhere to keep the count.
-  let spanBad = gcSpanViolations(g)
-
-  gcDeinit(g)
-  let leaked = gcLiveBytes(g)
-
-  // `arena`/`indexArena`/`roots` are reached here so they stay rooted across
-  // every ambient collection above (every loop back-edge under
-  // `BIT_GC=stress`).
-  let rooted = 0
-  if (len(arena) == ARENA_WORDS && len(indexArena) == INDEX_WORDS && len(roots) == BM_OBJS) {
-    rooted = 1
-  }
+  let (spansOk, mismatches) = countSpanMatches(dom)
+  let (spanBad, leaked, rooted) = teardownAndCheck(g, arena, indexArena, roots)
 
   // #4122: the two recycling-guard phases, entirely independent private
   // heaps -- each prints its own checked/mismatch/violation/leaked counts,
@@ -598,5 +617,5 @@ fn main() {
   let flResults = []i64(4)
   phaseFreeListGuard(flResults)
 
-  print("gcslotbitmap ${allocOk} ${spanCount} ${spansOk} ${mismatches} ${spanBad} ${leaked} ${rooted} owns ${tally[0]} ${tally[1]} ${tally[2]} recycle cache ${cacheResults[0]} ${cacheResults[1]} ${cacheResults[2]} ${cacheResults[3]} freelist ${flResults[0]} ${flResults[1]} ${flResults[2]} ${flResults[3]}\n")
+  print("gcslotbitmap ${allocOk} ${dom.spanCount} ${spansOk} ${mismatches} ${spanBad} ${leaked} ${rooted} owns ${tally[0]} ${tally[1]} ${tally[2]} recycle cache ${cacheResults[0]} ${cacheResults[1]} ${cacheResults[2]} ${cacheResults[3]} freelist ${flResults[0]} ${flResults[1]} ${flResults[2]} ${flResults[3]}\n")
 }
