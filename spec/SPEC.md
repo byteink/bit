@@ -2236,6 +2236,13 @@ what the binder receives:
 | `chan<T>`     | the received value, until closed (§16.2) | **rejected**          | —           |
 | anything else | **rejected**                             | **rejected**          | —           |
 
+A pair binder over `for_of`'s slice/array row is legal too, not only over a
+map: `for (i, x) of xs` binds `i` to the **index** (`int`) and `x` to the
+**element** (`T`) — the same two values the row's two single-binder forms give
+separately (`for x of xs` the element, `for x in xs` the index), joined into
+one binder. This is the `( IDENT | "(" pat "," pat ")" )` alternative in
+`for_of`'s own grammar, the same production a map's `(k, v)` pair binder uses.
+
 A single (non-pair) binder over a map is rejected for `for_of` too (§12.6): one
 binder cannot say whether it means the key or the value, and neither guess is
 recoverable once shipped. `for_in` rejects everything that is not a slice,
@@ -4087,6 +4094,15 @@ test "concat" {
 - A test fails when it panics — which a failed `assert` (§18.4) does. Each test
   therefore runs in its own process, so one failure neither hides the others nor
   aborts the run.
+- **No `t.Run(name, fn)` subtest form is provided, deliberately.** Subtests
+  share their parent's process by construction, so one subtest's panic would
+  end its siblings — trading away the one-process-per-test guarantee above.
+  The benefit subtests are usually reached for, naming the failing row of a
+  table-driven test, is delivered instead by the `label` parameter every
+  `std/testing` assertion requires (`stdlib/testing/testing.bit`): it is a
+  positional, non-optional parameter — §10.3's `param = [ "..." ] IDENT ":"
+  type .` grammar has no default-value production for any parameter — so the
+  row a failure came from can never go unnamed.
 - Tests are ordinary unreferenced declarations to `bit build`/`bit run`, so the
   linker's dead-strip drops them from a normal program's binary — every
   test or test-shaped function in a `.test.bit` file, whichever form it uses.
