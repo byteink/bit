@@ -587,13 +587,13 @@ collector can never run inside it. This is what lets code that *implements* the
 allocator and collector call it safely. A `@nosplit` body is restricted to
 provably non-allocating forms — arithmetic and comparison, name and literal
 reads, field access on a value in hand, `if`/`while`/`for`, assignment,
-`break`/`continue`, and `return` — plus calls to other `@nosplit` functions,
-to the **atomic builtins** (§11.5), to **`ptrOf`** (§11.5), **`entryOf`**
-(§11.10) and **`stackMapsBegin`/`stackMapsEnd`** (§11.12), a raw **`syscall`**
-(§11.8), **`len`/`cap` over a fixed-size array** (§11.2), and **conversions
-between numeric prims** (§12.9), all of which lower
-to inline machine instructions rather than a call
-and so can neither allocate nor reach a safepoint. A numeric conversion covers
+`break`/`continue`, and `return` — plus calls to other `@nosplit` functions, to
+the **atomic builtins** (§11.5), to **`ptrOf`** (§11.5), **`entryOf`** (§11.10)
+and **`stackMapsBegin`/`stackMapsEnd`** (§11.12), a raw **`syscall`** (§11.8),
+**`len`/`cap` over a fixed-size array** (§11.2), **indexing a fixed-size array**
+(§12.6), and **conversions between numeric prims** (§12.9), all of which lower
+to inline machine instructions rather than a call and so can neither allocate
+nor reach a safepoint. A numeric conversion covers
 the integer and float prims and their aliases (`int`, `uint`, `byte`, `rune`),
 and includes `int(p)` — a raw pointer's address (§11.4), the one bridge the
 unmanaged subset has from a pointer back to an integer. A declared function
@@ -620,6 +620,16 @@ type-conditional admission of the *operand*, not of the builtin name:
 header, and on a map to an allocating runtime call, so all three remain
 **E0075** under the "anything else" rule below.
 
+**Indexing** (§12.6) a **fixed-size array** `[N]T` (§11.2) is admitted **only**
+on that base type: `a[i]` there lowers to `index_get`, a scaled register-offset
+load against a static base, with no bounds-check branch, no call, no allocation
+and no safepoint. This is a type-conditional admission of the *base*, not of
+indexing in general — both the base and the index expression are still checked
+against this allowlist like any other operand, so an allocating index expression
+stays E0075. A **slice** base is refused, since its out-of-range edge still
+reaches a runtime call, and a **map** base is a runtime call outright — both
+remain **E0075** under the "anything else" rule below.
+
 A **`syscall` (§11.8)** is admitted on the strongest proof on that list: it is
 not a call at all. Both backends emit the kernel trap *inline* — `syscall` on
 x86-64, `svc #0` on AArch64 — so it references no symbol, takes no stack-map
@@ -631,11 +641,11 @@ kernel, and the allocator and collector — `@nosplit` in their entirety — cou
 otherwise never obtain a page from the OS.
 
 Anything else is **E0075** `nosplit_calls_allocating`, including composite,
-slice and map construction, indexing, `append`, `spawn`, closures, channel
-operations, string interpolation, every other builtin, and any call through a
-value or interface (whose target is not knowable statically). `string(x)` is
-**not** admitted by the conversion rule: it copies into a fresh managed object,
-so it allocates.
+slice and map construction, slice or map indexing, `append`, `spawn`, closures,
+channel operations, string interpolation, every other builtin, and any call
+through a value or interface (whose target is not knowable statically).
+`string(x)` is **not** admitted by the conversion rule: it copies into a fresh
+managed object, so it allocates.
 
 An **`asm` block (§11.6) is permitted**, and is the one construct here admitted
 on assertion rather than on proof. Everything else on the allowlist is *proved*
