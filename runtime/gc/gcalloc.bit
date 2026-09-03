@@ -184,36 +184,59 @@ import { pollRequest } from "../sched"
 }
 
 // ---------------------------------------------------------------------------
-// THE ALLOCATION DOOR REGISTERS THE CALLING THREAD (#1651)
+// REGISTRATION IS EAGER AT OS-THREAD ENTRY, NOT PER ALLOCATION (#4060)
 // ---------------------------------------------------------------------------
 //
-// `runtime/gc/`'s `currentMutator` carries the reason, and states it as measured
-// rather than reasoned:
+// This door used to open with `registerAllocator()` — `currentMutator(0)`,
+// i.e. `mutatorSlot(worldBlockAddr(), 0, true)` — on EVERY allocation. What
+// that established is worth stating exactly, because it is a soundness
+// property and not a nicety: the calling OS thread is present in the mutator
+// registry with its real stack top and base published
+// (`worldSetStackTop`/`worldSetStackBase`, `../gc/gcworldsync.bit`) before it
+// can hold the sole reference to a fresh object. Two consumers depend on it —
+// the stop-the-world rendezvous (`worldStoppedFor`, `./gcworldstop.bit`, which
+// counts an UNCLAIMED slot as stopped and therefore never waits for it) and
+// the root scan (`stwScanOwnStack`, which needs the published range). An
+// unregistered allocator is a stack neither waited for nor scanned; ABI.md §5
+// records #1677's reproducer sweeping such an object 20/20 runs.
 //
-//   CALLED FROM EVERY DOOR INTO THE COLLECTOR — the safepoint poll and all eight
-//   allocation sites, via `gcAlloc`/`gcAllocRaw`. The allocation door is the one
-//   that matters: a thread registering only at its first safepoint is invisible
-//   for the whole window between starting and reaching a loop back edge, and it
-//   can allocate in that window — `let keep = []i64(16)` before the first loop is
-//   exactly that shape. Another thread collecting there finds no snapshot for
-//   this one and sweeps a live object out from under it. Measured, not theorised:
-//   it is what made `_tests_/stress/gcthreads*` panic with `index out of range`.
+// THE PAYLOAD FIRES EXACTLY ONCE PER THREAD, AND WAS PAID ONCE PER OBJECT.
+// `mutatorSlot` claims, publishes and (only on that first claim) parks on a
+// pending stop. On every later call it re-verifies a fact that cannot have
+// changed — a slot is released only by `gcThreadExit`, on that same thread's
+// own exit path — for one `bl` into a function whose prologue spills x19-x28,
+// one `ldar`, and the `bl bit_rt_port_gc_world_addr` beside it. Measured at
+// **79 instructions and 11-15 cycles per object** on `bench/cases/alloc`.
 //
-// This port had only the SAFEPOINT door until #1650 gave `../gc/gcworld.bit` an
-// exact per-OS-thread token; before that there was nothing to key a registration
-// on here, which is why the omission was filed rather than fixed.
+// So the registration moved to where it belongs: the entry point of every OS
+// thread that can run allocating Bit code, which is Go's shape (a P owns its
+// mcache, so thread identity is structural). Every such thread now registers
+// before its first Bit statement:
 //
-// `currentMutator` is a sibling-file private, reached in-module. It is called
-// BEFORE `gcHeapAlloc`, so no lock is held across it: a thread that arrives
-// while a stop is pending PARKS here, and parking with the object-list lock in
-// hand would deadlock the collector that is waiting for it.
+//   - scheduler workers, and the ones `../sched/grow.bit` adds later:
+//     `workerBody`'s first statement is `gcThreadEnter()`
+//     (`../root/{linux,darwin}/bootworker.bit`, `../root/windows/boot.bit`),
+//     eager since #1677/#1699.
+//   - raw OS threads started through `../thread/<os>`'s `threadStart`: the
+//     provider owns the child's entry and now calls `gcThreadEnter()` there,
+//     symmetrically with the `bit_rt_gc_thread_exit()` it already made at the
+//     child's exit (#1801/#1846). `_tests_/stress/thread/gcprops`'s `gcChild`
+//     is the in-tree program that needs this: its first statement is
+//     `let keep = []i64(16)`, an allocation before any back edge, which is
+//     the exact shape the old note here named.
+//   - the boot thread: allocates nothing managed at any point (the argument is
+//     in `../root/darwin/boot.bit`'s header) and registers through
+//     `gcBlockingBegin` around its step-7 sleep.
+//   - sysmon: `@nosplit` end to end, never touches the heap, and must NEVER
+//     register — `../root/linux/sysmon.bit` states why. Unchanged by this.
 //
-// `frame` is 0 — an allocating thread publishes no snapshot, as the
-// allocation door passes none. It is registered, so the rendezvous WAITS for it;
-// it parks at its next safepoint, where it does have a stack map to publish.
-@nosplit fn registerAllocator() {
-  let _ = currentMutator(0)
-}
+// WHAT IS NO LONGER COVERED, stated rather than discovered later: a thread
+// this runtime did not create. ABI.md §5/§6 already puts
+// `bit_rt_gc_thread_enter` on such a caller as an obligation, and nothing in
+// this tree creates one (`../thread/<os>`'s `threadStart` is the only thread
+// primitive and a Bit binary embeds no foreign thread source). Before this
+// change the allocation door caught it and degraded the failure from "a live
+// object is swept" to "collections are abandoned"; it no longer does.
 
 // ---------------------------------------------------------------------------
 // EXHAUSTION IS FATAL AT THE DOOR (#1642)
@@ -259,24 +282,19 @@ import { pollRequest } from "../sched"
 // by ABI.md §1, because a collection between allocation and initialization must
 // never trace garbage.
 export @nosplit @symbol("bit_rt_port_gc_alloc") fn gcAlloc(g: *i64, infoAddr: int): int {
-  registerAllocator()
   let size = loadWord(infoAddr + gcTiSize)
   return allocObject(g, infoAddr, gcHeaderSize + size, size)
 }
 
-// The whole of `gcAlloc` and `gcAllocRaw` below the thread registration. They
-// differed only in where the body length comes from — a `TypeInfo` field or an
-// argument — and were otherwise the same eight lines twice.
+// The whole of `gcAlloc` and `gcAllocRaw`. They differ only in where the body
+// length comes from — a `TypeInfo` field or an argument — and were otherwise
+// the same eight lines twice.
 //
 // THE SIZE CLASS IS COMPUTED HERE AND NOWHERE ELSE ON THE ALLOCATION PATH
 // (#4043). `gcHeapAlloc` needs it to pick a free list and `linkObject` needs it
 // to address the occupied-slot bitmap; both used to derive it independently
 // from the same `(total, 8)`. It is one value, so it is computed once and
 // passed down.
-//
-// `registerAllocator()` stays in the two entry points rather than moving here,
-// because it must run before ANY lock is taken (see the section note below): a
-// thread arriving while a stop is pending parks inside it.
 @nosplit fn allocObject(g: *i64, infoAddr: int, total: int, bodySize: int): int {
   let idx = allocClassify(total, 8)
   let raw = gcHeapAlloc(g, total, 8, idx)
@@ -325,7 +343,6 @@ export @nosplit @symbol("bit_rt_port_gc_alloc_raw") fn gcAllocRaw(
   bodySize: int,
   infoAddr: int,
 ): int {
-  registerAllocator()
   return allocObject(g, infoAddr, gcHeaderSize + bodySize, bodySize)
 }
 

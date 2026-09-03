@@ -1219,15 +1219,28 @@ that — the eager call is being restored at OS-thread entry points, measured fo
 "preferred", it is what closes this gap; a thread that skips it is exposed for
 as long as its first door-touch is delayed.
 
-The allocation door is the one that matters, and it means *every* allocation
-entry point, not just `bit_rt_gc_alloc`: strings, slice headers, slice buffers,
-slice growth, map control blocks, map headers and select-case buffers all
-allocate, and a thread can reach any of them long before its first loop back
-edge. A runtime that registers at only some of them has threads that allocate
-while the rendezvous does not wait for them and the root scan cannot see them —
-their live objects are swept underneath them. (`runtime/root/root.bit` funnels all of these
-through two wrappers so the invariant is checkable by grep; #1431 is what
-happens when it is not.)
+**Since #4060 the allocation door does NOT register, and
+`bit_rt_gc_thread_enter` at OS-thread entry is the only claim a thread gets.**
+It used to be the fallback that mattered, and it had to cover *every*
+allocation entry point rather than just `bit_rt_gc_alloc` — strings, slice
+headers, slice buffers, slice growth, map control blocks, map headers and
+select-case buffers all allocate, and a thread can reach any of them long
+before its first loop back edge, so a runtime that registered at only some of
+them had threads whose live objects were swept underneath them (#1431). The
+property that fallback maintained is unchanged; what changed is where it is
+paid. Re-establishing "this thread is in the registry" once per OBJECT cost 79
+instructions and 11-15 cycles per allocation on `bench/cases/alloc`, to
+maintain a fact that changes exactly once in a thread's life — a slot is
+claimed at entry and released only by `bit_rt_gc_thread_exit` on that same
+thread's own exit path.
+
+So the obligation above is now load-bearing with nothing behind it, and the
+in-tree thread primitives discharge it themselves rather than asking a caller
+to remember: `runtime/root/<os>`'s `workerBody` calls it as its first
+statement, and every `runtime/thread/<os>` provider now calls it at the child's
+entry, symmetrically with the `bit_rt_gc_thread_exit` it already makes at the
+child's exit. A thread this runtime did **not** create must call it itself; it
+has no other way into the registry.
 
 **A parked slot counts as stopped only for the stop it acknowledged.** Each stop
 carries a monotonically increasing **epoch**, and a mutator records the epoch it
