@@ -133,84 +133,128 @@ echo "L0: building bootstrap runtime archives at ${TAG}..."
 # every other build failure: buried in build.log, exit 1.
 EXIT_ABI_SEAM=3
 L0_RC=0
+TWOPASS_BASE=""
 ( cd "${WORK}/src" && ./make libbitrt ) >"${WORK}/build.log" 2>&1 || L0_RC=$?
 if [ "${L0_RC}" -ne 0 ]; then
   if grep -q 'runtime ABI arity mismatch against the pinned stage0' "${WORK}/build.log"; then
     pinned_tag="$(grep -m1 'runtime ABI arity mismatch against the pinned stage0' "${WORK}/build.log" |
       grep -oE '\(v[^)]*\)' | tr -d '()')"
-    echo "verify-reproducible-release.sh: ${TAG} cannot be verified by a single-pass build." >&2
-    echo "verify-reproducible-release.sh: its own dist/stage0/SHA256SUMS pins ${pinned_tag:-an earlier release}, whose runtime/** predates a runtime ABI change now present in ${TAG} -- #3152's guard correctly refuses to link the mismatched pair (unsafe, not merely unavailable)." >&2
-    echo "verify-reproducible-release.sh: reproducing ${TAG} needs the two-pass BIT_STAGE0_BIN bootstrap (docs/development.md, \"Landing a runtime ABI change\"); this script does not perform that rebuild. Guard output:" >&2
-    sed -n '/runtime ABI arity mismatch against the pinned stage0/,$p' "${WORK}/build.log" >&2
-    exit "${EXIT_ABI_SEAM}"
+    # #4198: ${TAG}'s OWN tree may carry #4197's two-pass recovery tooling
+    # (dist/abitwopass.py derives+verifies the pass-1 base mechanically from
+    # this exact refusal's mismatch set; dist/abitwopass-boot.sh performs the
+    # two-pass BIT_STAGE0_BIN build). Invoke THAT COPY, with cwd ${WORK}/src
+    # -- never this checkout's own dist/ -- same principle already applied to
+    # stage0 resolution below: an old tag rebuilds with the toolchain it was
+    # actually cut with. A tag predating #4197 has no dist/abitwopass.py at
+    # all, so the recovery is conditional on its presence; absent it, fall
+    # through to the EXIT_ABI_SEAM=3 refusal exactly as before.
+    if [ -f "${WORK}/src/dist/abitwopass.py" ]; then
+      echo "verify-reproducible-release.sh: ${TAG} refuses a single-pass build (pinned stage0 ${pinned_tag:-an earlier release}); ${TAG}'s own tree carries #4197's two-pass recovery tooling -- using it." >&2
+      PLAN="${WORK}/abiplan.txt"
+      if ! ( cd "${WORK}/src" && python3 dist/abitwopass.py "${WORK}/build.log" ) >"${PLAN}"; then
+        echo "verify-reproducible-release.sh: ${TAG}'s own dist/abitwopass.py could not derive a two-pass base for this refusal -- see its diagnostics above." >&2
+        exit 1
+      fi
+      TWOPASS_BASE="$(sed -n 's/^ABI_TWOPASS_BASE=//p' "${PLAN}")"
+      [ -n "${TWOPASS_BASE}" ] || {
+        echo "verify-reproducible-release.sh: ${TAG}'s dist/abitwopass.py exited 0 but printed no ABI_TWOPASS_BASE" >&2
+        exit 1
+      }
+      echo "verify-reproducible-release.sh: two-pass bootstrap, pass-1 base ${TWOPASS_BASE}" >&2
+      ( cd "${WORK}/src" && bash dist/abitwopass-boot.sh "${TWOPASS_BASE}" ) >>"${WORK}/build.log" 2>&1 ||
+        { echo "verify-reproducible-release.sh: ${TAG}'s own dist/abitwopass-boot.sh failed, see ${WORK}/build.log" >&2; exit 1; }
+      L0_RC=0
+    else
+      echo "verify-reproducible-release.sh: ${TAG} cannot be verified by a single-pass build." >&2
+      echo "verify-reproducible-release.sh: its own dist/stage0/SHA256SUMS pins ${pinned_tag:-an earlier release}, whose runtime/** predates a runtime ABI change now present in ${TAG} -- #3152's guard correctly refuses to link the mismatched pair (unsafe, not merely unavailable)." >&2
+      echo "verify-reproducible-release.sh: reproducing ${TAG} needs the two-pass BIT_STAGE0_BIN bootstrap (docs/development.md, \"Landing a runtime ABI change\"); this script does not perform that rebuild. Guard output:" >&2
+      sed -n '/runtime ABI arity mismatch against the pinned stage0/,$p' "${WORK}/build.log" >&2
+      exit "${EXIT_ABI_SEAM}"
+    fi
+  else
+    echo "verify-reproducible-release.sh: ./make libbitrt failed, see ${WORK}/build.log" >&2
+    exit 1
   fi
-  echo "verify-reproducible-release.sh: ./make libbitrt failed, see ${WORK}/build.log" >&2
-  exit 1
 fi
 
-# THE PINNED STAGE0 AT THIS TAG, never a compiler built from this tree — same
-# reason dist/release.sh uses it and the differentials use it as their oracle:
-# a compiler bug introduced in the tag being verified must not be able to
-# compile itself into its own "reproduction". Resolved from inside the
-# worktree so it reads THAT COMMIT's dist/stage0/SHA256SUMS, not this
-# checkout's — the pin moves release to release, and a release must be
-# rebuilt with whatever it actually pinned at the time it was cut.
-#
-# Its job stops here (#3034/#3035): stage0 builds C1 — a native host compiler
-# ("bit1") — and nothing else. Everything compared against the release below
-# is built by bit1, not by stage0.
-echo "resolving the pinned stage0 at ${TAG}..."
-STAGE0="$(cd "${WORK}/src" && sh scripts/stage0.sh)" ||
-  { echo "verify-reproducible-release.sh: stage0 resolution failed" >&2; exit 1; }
-echo "stage0 = ${STAGE0}"
-
-# C1: stage0 builds compiler/ AS IT SITS ON DISK (unstamped — the version
-# stamp is for C2's STAGED copy below) for the HOST triple, linking the L0
-# archive `./make libbitrt` just wrote. This is stage0's ENTIRE job in this
-# script: bit1 is a native host binary that can cross-produce every shipped
-# target below the same way stage0 always has, exactly as dist/release.sh's
-# own comment describes its C1 step.
-#
-# A DELIBERATE duplicate of `stepSelfhost` (tools/build/artifactsteps.bit:234-237)
-# rather than a call to `./make` — same reasoning as the STAGE_SRC staging
-# duplicate above: this script must not depend on the driver's own caching or
-# side effects (it writes bit-out/make/*.stamp, bit-out/make/host.triple), and
-# spelling the recipe out here keeps it auditable as the one thing stage0 is
-# still trusted to build.
-#
-# #3195: because this is a raw stage0 invocation rather than a `./make` step,
-# it never calls checkRuntimeAbiArity() itself and would silently link a
-# mismatched pair if reached unguarded (the same 11.3 GB/3s defect #3152
-# exists to prevent). It is safe ONLY because L0 above already ran that exact
-# check (`./make libbitrt` -> stepLibbitrt) against this same ${WORK}/src
-# tree and did not exit — checkRuntimeAbiArity() is a pure function of (this
-# tree's runtime/**, the tag stage0 was cut from), and nothing between L0 and
-# here writes to runtime/**, so L0's verdict is authoritative here too.
-# Assert that invariant instead of trusting it silently, so a future reorder
-# that separates L0 from C1 trips a clear error instead of quietly
-# unguarding this call.
-[ "${L0_RC}" -eq 0 ] || {
-  echo "verify-reproducible-release.sh: internal error: reached C1 without L0's ABI arity guard having passed (L0_RC=${L0_RC})" >&2
-  exit 1
-}
-case "$(uname -s)-$(uname -m)" in
-  Darwin-arm64)              HOST_TRIPLE=aarch64-macos ;;
-  Linux-aarch64|Linux-arm64) HOST_TRIPLE=aarch64-linux ;;
-  Linux-x86_64)              HOST_TRIPLE=x86_64-linux ;;
-  *) echo "verify-reproducible-release.sh: unsupported host $(uname -s)-$(uname -m)" >&2; exit 1 ;;
-esac
-l0host="${WORK}/src/bit-out/lib/${HOST_TRIPLE}/libbitrt.a"
-[ -f "${l0host}" ] || {
-  echo "verify-reproducible-release.sh: missing ${l0host} (./make libbitrt did not produce it)" >&2
-  exit 1
-}
-echo "C1: bootstrapping the host self-hosted compiler with stage0 (bit1) at ${TAG}..."
 BIT1="${WORK}/src/bit-out/bin/bit"
-mkdir -p "$(dirname "${BIT1}")"
-( cd "${WORK}/src" && BIT_LIBBITRT="${l0host}" "${STAGE0}" build compiler -o "${BIT1}" ) \
-  >>"${WORK}/build.log" 2>&1 ||
-  { echo "verify-reproducible-release.sh: stage0 build of bit1 failed, see ${WORK}/build.log" >&2; exit 1; }
-chmod +x "${BIT1}"
+if [ -n "${TWOPASS_BASE}" ]; then
+  # #4198: the two-pass recovery above already built a working bit1 at this
+  # exact path — compiler** + runtime** at ${TAG}'s own HEAD, self-hosted via
+  # the derived pass-1 base rather than the pinned stage0 directly
+  # (dist/abitwopass-boot.sh's pass 2 sets BIT_STAGE0_BIN, which
+  # checkRuntimeAbiArity() skips itself under, tools/build/abiarity.bit:635).
+  # dist/release.sh treats this artifact identically to the ordinary path's
+  # (release.sh:217-218, same variable, same path), and so does everything
+  # below — there is no separate stage0 resolution or raw C1 build to do.
+  [ -x "${BIT1}" ] || {
+    echo "verify-reproducible-release.sh: internal error: ${TAG}'s dist/abitwopass-boot.sh exited 0 but ${BIT1} is not executable" >&2
+    exit 1
+  }
+else
+  # THE PINNED STAGE0 AT THIS TAG, never a compiler built from this tree — same
+  # reason dist/release.sh uses it and the differentials use it as their oracle:
+  # a compiler bug introduced in the tag being verified must not be able to
+  # compile itself into its own "reproduction". Resolved from inside the
+  # worktree so it reads THAT COMMIT's dist/stage0/SHA256SUMS, not this
+  # checkout's — the pin moves release to release, and a release must be
+  # rebuilt with whatever it actually pinned at the time it was cut.
+  #
+  # Its job stops here (#3034/#3035): stage0 builds C1 — a native host compiler
+  # ("bit1") — and nothing else. Everything compared against the release below
+  # is built by bit1, not by stage0.
+  echo "resolving the pinned stage0 at ${TAG}..."
+  STAGE0="$(cd "${WORK}/src" && sh scripts/stage0.sh)" ||
+    { echo "verify-reproducible-release.sh: stage0 resolution failed" >&2; exit 1; }
+  echo "stage0 = ${STAGE0}"
+
+  # C1: stage0 builds compiler/ AS IT SITS ON DISK (unstamped — the version
+  # stamp is for C2's STAGED copy below) for the HOST triple, linking the L0
+  # archive `./make libbitrt` just wrote. This is stage0's ENTIRE job in this
+  # script: bit1 is a native host binary that can cross-produce every shipped
+  # target below the same way stage0 always has, exactly as dist/release.sh's
+  # own comment describes its C1 step.
+  #
+  # A DELIBERATE duplicate of `stepSelfhost` (tools/build/artifactsteps.bit:234-237)
+  # rather than a call to `./make` — same reasoning as the STAGE_SRC staging
+  # duplicate above: this script must not depend on the driver's own caching or
+  # side effects (it writes bit-out/make/*.stamp, bit-out/make/host.triple), and
+  # spelling the recipe out here keeps it auditable as the one thing stage0 is
+  # still trusted to build.
+  #
+  # #3195: because this is a raw stage0 invocation rather than a `./make` step,
+  # it never calls checkRuntimeAbiArity() itself and would silently link a
+  # mismatched pair if reached unguarded (the same 11.3 GB/3s defect #3152
+  # exists to prevent). It is safe ONLY because L0 above already ran that exact
+  # check (`./make libbitrt` -> stepLibbitrt) against this same ${WORK}/src
+  # tree and did not exit — checkRuntimeAbiArity() is a pure function of (this
+  # tree's runtime/**, the tag stage0 was cut from), and nothing between L0 and
+  # here writes to runtime/**, so L0's verdict is authoritative here too.
+  # Assert that invariant instead of trusting it silently, so a future reorder
+  # that separates L0 from C1 trips a clear error instead of quietly
+  # unguarding this call.
+  [ "${L0_RC}" -eq 0 ] || {
+    echo "verify-reproducible-release.sh: internal error: reached C1 without L0's ABI arity guard having passed (L0_RC=${L0_RC})" >&2
+    exit 1
+  }
+  case "$(uname -s)-$(uname -m)" in
+    Darwin-arm64)              HOST_TRIPLE=aarch64-macos ;;
+    Linux-aarch64|Linux-arm64) HOST_TRIPLE=aarch64-linux ;;
+    Linux-x86_64)              HOST_TRIPLE=x86_64-linux ;;
+    *) echo "verify-reproducible-release.sh: unsupported host $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+  esac
+  l0host="${WORK}/src/bit-out/lib/${HOST_TRIPLE}/libbitrt.a"
+  [ -f "${l0host}" ] || {
+    echo "verify-reproducible-release.sh: missing ${l0host} (./make libbitrt did not produce it)" >&2
+    exit 1
+  }
+  echo "C1: bootstrapping the host self-hosted compiler with stage0 (bit1) at ${TAG}..."
+  mkdir -p "$(dirname "${BIT1}")"
+  ( cd "${WORK}/src" && BIT_LIBBITRT="${l0host}" "${STAGE0}" build compiler -o "${BIT1}" ) \
+    >>"${WORK}/build.log" 2>&1 ||
+    { echo "verify-reproducible-release.sh: stage0 build of bit1 failed, see ${WORK}/build.log" >&2; exit 1; }
+  chmod +x "${BIT1}"
+fi
 echo "bit1 = ${BIT1}"
 
 # Stamp the version into a staged copy of compiler/ — DELIBERATELY duplicating
@@ -250,7 +294,7 @@ real="$(find "${WORK}/src/compiler" -maxdepth 1 -name '*.bit' | wc -l | tr -d ' 
 #
 # #3206: THE TAG'S OWN stdlib, set explicitly for every bit1 invocation below
 # that does not `cd "${WORK}/src"` first (L1 here, and C2 further down).
-# Unlike L0 (:136) and C1 (:210), neither loop changes directory, so absent
+# Unlike L0 (:137) and C1 (:253), neither loop changes directory, so absent
 # this override bit1's stdRootPath() (compiler/mainpaths.bit:73-82) falls
 # through BIT_STDLIB -> resolveNearExe("stdlib") -> the bare relative
 # "stdlib", which resolves against the CALLER's cwd, not the tag's tree.
