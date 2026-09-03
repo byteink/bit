@@ -18,9 +18,8 @@ for using packages today.
 bit init [name]
 ```
 
-Writes a minimal `bit.json` in the current directory - `{"dependencies": {}}`,
-or, with `[name]`, `{"name": "<name>", "dependencies": {}}` - and exits 0.
-Fails, leaving the directory untouched, if a `bit.json` already exists there.
+Writes a minimal `bit.json` in the current directory and exits 0. Fails,
+leaving the directory untouched, if a `bit.json` already exists there.
 
 ```console
 $ bit init
@@ -29,11 +28,14 @@ $ bit init
 bit init: bit.json already exists — refusing to overwrite
 ```
 
-**Bit's fs ABI has no `getcwd`** (`compiler/buildout.bit`'s own comment on
-`manifestProjectName`), so `bit init` has no way to read the directory it is
-running in and default `[name]` to it, the way `npm init -y` derives one from
-`path.basename(process.cwd())`. Omit `[name]` and the manifest simply carries
-no `"name"` key - see below for the one thing that key actually does.
+`[name]`, when given, is written verbatim: `{"name": "<name>", "dependencies":
+{}}`. Omitted, it defaults to the current directory's own basename
+(`defaultInitName`, `compiler/pmcliinit.bit:85`, via `std/fs`'s `cwd()` —
+#3502), the way `npm init -y` derives one from
+`path.basename(process.cwd())`. If that basename is not usable - empty, or
+holding a path separator (`isUsableProjectName`, same file) - `bit init`
+fails instead of writing an unnamed manifest; pass `[name]` explicitly in
+that case. See below for the one thing the `"name"` key actually does.
 
 ## `bit.json`
 
