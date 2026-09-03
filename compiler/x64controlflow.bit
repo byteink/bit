@@ -91,14 +91,64 @@ fn xEmitBackEdgeSafepointIfNeeded(cx: XCtx, curBlock: int, target: int) {
   if (!isBackEdge(curBlock, target) || needsNoSafepoints(cx.f)) {
     return
   }
+  xEmitThinnedPollGuard(cx)
+}
+
+// #4200: the ladder below evaluates once per `pollThinN()` (compiler/codegen.bit)
+// back edges instead of once per back edge, behind a four-instruction countdown
+// in poll-cache slot 3 — load, subtract, store, jump-if-nonzero. Four steps in
+// the same order as arm64's emitThinnedPollGuard (compiler/arm64call.bit), and
+// they must stay in lockstep: the countdown decides WHEN the collector can run,
+// so a backend that thins differently collects on a different schedule for the
+// same program. `pollThinN` itself is shared for exactly that reason.
+//
+// The countdown is a per-invocation frame slot, NOT module state: two threads
+// running the same function keep separate counts, so no thread can be starved
+// of polls by another's progress. xEmitPollCachePrefetch seeds it with 1 so the
+// first back edge of every invocation still evaluates the ladder in full.
+//
+// The `jnz` reads the SUB's own ZF across the intervening store, which is exact
+// rather than lucky: `mov` is the one instruction in this sequence that writes
+// no flag at all. That is why no `test` appears here, unlike every zero-test in
+// the ladder itself — a `test` would be a fifth instruction on the one path
+// that runs every iteration.
+fn xEmitThinnedPollGuard(cx: XCtx) {
+  let rc = xScratch1()
+  let slot = xMemB(XReg64.Rbp, xPollCacheOffset(cx.frame, 3))
+  xMovLoad(cx.buf, rc, slot, 8, false)
+  xArithImm32(cx.buf, XArith.Sub, rc, 1)
+  xMovStore(cx.buf, slot, rc, 8)
+  let skip = xJccRel32Placeholder(cx, ccNe()) // not due yet -> past the ladder
+  xEmitPollCountdownReset(cx, rc, slot)
   xEmitInlinedPollGuard(cx)
+  xPatchRel32Here(cx, skip)
+}
+
+// `stress ? 1 : pollThinN()`, clause for clause with arm64's
+// emitPollCountdownReset — see that function's header for why the stress arm is
+// a correctness obligation and not a refinement, and for the measured cost of
+// omitting it (stress collections 303 -> 128 on a 200-iteration loop).
+fn xEmitPollCountdownReset(cx: XCtx, rc: XReg64, slot: XMem) {
+  let rGc = xScratch2()
+  xMovRI(cx.buf, rc, pollThinN())
+  xMovLoad(cx.buf, rGc, xMemB(XReg64.Rbp, xPollCacheOffset(cx.frame, 1)), 8, false)
+  xTestRR(cx.buf, rGc, rGc)
+  let unbound = xJccRel32Placeholder(cx, ccE())
+  xMovLoad(cx.buf, rGc, xMemB(rGc, pgGcCfgStressWord() * 8), 8, false)
+  xTestRR(cx.buf, rGc, rGc)
+  let notStress = xJccRel32Placeholder(cx, ccE())
+  xMovRI(cx.buf, rc, 1)
+  xPatchRel32Here(cx, notStress)
+  xPatchRel32Here(cx, unbound)
+  xMovStore(cx.buf, slot, rc, 8)
 }
 
 // ---------------------------------------------------------------------------
 // #3169: the poll guard's condition, inlined at the call site
 // ---------------------------------------------------------------------------
 
-// The three cached poll addresses sit at the TOP of the spill area, in the
+// The three cached poll addresses — and, since #4200, the poll countdown that
+// is not an address — sit at the TOP of the spill area, in the
 // slots xCompileFunction carves ABOVE the ones the register allocator asked
 // for. Reusing the spill area rather than adding a frame region keeps
 // x64frame.bit's layout comment ("then spill slots, then saved XMMs") true as
@@ -110,10 +160,10 @@ fn xEmitBackEdgeSafepointIfNeeded(cx: XCtx, curBlock: int, target: int) {
 fn xPollCacheOffset(f: XFrame, i: int): int {
   // Sized by xCompileFunction on the same hasBackEdgeSafepoint predicate that
   // gates every caller here, so a frame reaching this point always has all
-  // three. Asserted rather than assumed: a silently negative index would
+  // four. Asserted rather than assumed: a silently negative index would
   // address the CALLER's frame.
-  assert(f.numSpillSlots >= 3 && i >= 0 && i < 3)
-  return xSpillOffset(f, f.numSpillSlots - 3 + i)
+  assert(f.numSpillSlots >= 4 && i >= 0 && i < 4)
+  return xSpillOffset(f, f.numSpillSlots - 4 + i)
 }
 
 // Fetches (worldAddr, gcAddr, preemptAnyAddr) ONCE per function invocation into
@@ -160,6 +210,12 @@ fn xEmitPollCachePrefetch(cx: XCtx) {
   // with arm64's emitPollCachePrefetch, as this whole ladder must stay.
   xEmitCallLike(cx, preemptAnyAddrSymbol(), []int(0), false, 0, 0, false)
   xMovStore(cx.buf, xMemB(XReg64.Rbp, xPollCacheOffset(cx.frame, 2)), XReg64.Rax, 8)
+  // #4200: slot 3 is a COUNTDOWN, not an address — the only slot here whose
+  // value is not a per-process constant. 1, so the first back edge of this
+  // invocation evaluates the poll ladder in full; xEmitThinnedPollGuard resets
+  // it to pollThinN() from then on. Mirrors arm64's emitPollCachePrefetch.
+  xMovRI(cx.buf, XReg64.Rax, 1)
+  xMovStore(cx.buf, xMemB(XReg64.Rbp, xPollCacheOffset(cx.frame, 3)), XReg64.Rax, 8)
 }
 
 // ---------------------------------------------------------------------------

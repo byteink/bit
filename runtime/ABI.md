@@ -971,10 +971,105 @@ its own debug-info entries needs no companion restriction.
 
 - v1 is **stop-the-world**: no mutator observes the heap mid-collection.
 - A **safepoint** is a program point where the stack maps are valid and the
-  mutator may yield to the collector. Codegen inserts safepoint polls (at least at
-  loop back-edges and function entry/allocation) so collection cannot be starved.
+  mutator may yield to the collector. Codegen inserts safepoint polls **at loop
+  back-edges, and nowhere else**, so collection cannot be starved.
 - The collector never moves objects (non-moving mark-sweep), so references are
   stable across a collection and no pointer fix-up is required.
+
+**WHERE THE POLLS ACTUALLY ARE, AND WHY THAT SENTENCE WAS CORRECTED.** The bullet
+above read "at least at loop back-edges and function entry/allocation" until
+#4200. The second half never existed. Each backend has **exactly one** poll
+emission site — `emitBackEdgeSafepointIfNeeded` (`compiler/arm64call.bit`) and
+`xEmitBackEdgeSafepointIfNeeded` (`compiler/x64controlflow.bit`) — and both are
+gated on `isBackEdge`. Nothing is emitted at a function entry, and nothing is
+emitted at an allocation: `grep -rn 'safepointSymbol()' compiler/` returns those
+two sites plus the two checks that pin them, and nothing in `runtime/alloc/**`
+calls `gcShouldCollect` at all.
+
+**So the back-edge poll is the ONLY automatic collection trigger in this
+runtime.** `gcShouldCollect` is reached from exactly two places, both of them
+under the poll: `gcSafepointRoots` (`runtime/gc/gccollect.bit`), and the
+under-the-lock re-test in `runtime/stw/stwpoll.bit`, whose own fast path mirrors
+the same predicate inline. Measured by ablating the
+back-edge poll (#4038): `bench/cases/alloc`'s collection count goes 181 → **1**
+and its peak RSS 6.2 MB → **745.2 MB**; `allocflat` 66 → 1 and 6.0 → 264.3 MB;
+`strings` 10 → 1 and 137.2 → 558.2 MB. Removing the poll does not remove a
+latency mechanism, it removes the collector. Anything that proposes to replace
+the poll — signal-based preemption is the recurring one — has to supply a
+trigger as well as a yield, and the corrected sentence above is what makes that
+cost visible.
+
+**Poll thinning (#4200): the ladder runs once per N back edges, N = 8.** A
+per-invocation countdown lives in poll-cache slot 3 of the polling function's own
+frame, initialised to 1 at function entry (`emitPollCachePrefetch` /
+`xEmitPollCachePrefetch`) and reset to `pollThinN()` (`compiler/codegen.bit`,
+the single copy both backends read) by the ladder it gates. Every back edge
+executes four instructions — load, subtract one, store, branch-if-nonzero — and
+evaluates the full guard only when the counter reaches zero.
+
+**The bounded-latency argument.** Let `c` be the countdown of the frame a thread
+is executing in. `c` is initialised to 1, decremented unconditionally on every
+back edge, and set to `N` only on the back edge that evaluates the ladder. So
+`c ∈ [0, N]` always, `c` strictly decreases on every back edge that skips the
+ladder, and a decrementing integer bounded below reaches zero. **At most `N`
+consecutive back edges can pass without a ladder evaluation, for every thread, on
+every path.** The rendezvous therefore still terminates: a stop request is
+acknowledged within `N` back edges of the requesting thread's slowest peer,
+against 1 before.
+
+Three properties this rests on, each of which a future change must preserve:
+
+- **The counter is stack memory, so it is per-thread and per-invocation.** Two
+  threads in the same function cannot hold each other away from zero, and a
+  recursive or nested call cannot inherit a nearly-exhausted count — every new
+  frame starts at 1, so the FIRST back edge of every invocation evaluates the
+  ladder in full. A loop that runs fewer than `N` iterations polls exactly as
+  often as it did before thinning.
+- **The bound is in back edges, not in time, and it always was.** One loop
+  iteration is an arbitrary straight-line block, and a thread inside a long
+  non-looping call reaches no poll at all — that is unchanged. Thinning
+  multiplies a pre-existing bound by a compile-time constant; it does not
+  introduce unboundedness, which is the property "collection cannot be starved"
+  actually asserts.
+- **A COUNTDOWN IS SOUND WHERE A PREDICATE IS NOT.** "Poll only on outer loops"
+  was the obvious alternative and is unsound in kind rather than in degree: an
+  innermost loop with no call in it would never poll, and the contract above
+  becomes a hang rather than a slowdown. A countdown cannot do that, because it
+  is a strictly decreasing quantity reset only by the thing it gates. Any future
+  thinning scheme owes that same argument.
+
+**What it costs the collector, measured rather than argued (#4038, 11 interleaved
+rounds per binary under `boxlock solo`, base-vs-base noise floor 0.40% mean).**
+Because the poll is also the trigger, thinning changes *when* a collection starts,
+not only how late a stop is acknowledged. At N=8: collection counts identical on
+alloc (181), allocflat (66), sort (5) and strings (10); json 22 → 23 with `swept`
+byte-identical at 2 208 244; peak RSS unchanged on all ten benchmarks; all ten
+outputs byte-identical. At N=64 the trigger slips past the point where a batch is
+dropped — `swept` 2 208 244 → 1 254 409, json peak RSS +12%, and its cycle series
+goes bimodal with a 69% tail. **The practical ceiling on N is heap behaviour, not
+latency**, and it is well below the point where the latency argument above would
+start to matter.
+
+Re-derived on the landed form (#4200, same method, noise floor 0.24% mean /
+1.16% max) rather than inherited: identical on all ten counts above, and
+`swept + live` — the program's total allocation count, which no schedule can
+change — is identical on all ten on BOTH targets, while the split between the
+two moves on `strings`, `sort` and `json`. That split IS the schedule; the sum is
+the program. Check the sum, not the halves.
+
+**`BIT_GC=stress` IS NOT THINNED, AND THAT IS A CORRECTNESS OBLIGATION RATHER
+THAN A REFINEMENT.** Under stress every ladder evaluation collects, which is what
+makes the stress suite this runtime's precise-rooting oracle — "any root the
+caller fails to report is swept on the very next poll" (`gcSafepointRoots`). A
+flat reset to `N` thins the oracle along with the fast path: measured on a
+200-iteration if/else loop, collections under stress went **303 → 128, −58%**,
+with every behavioural gate still green. Buying a benchmark win with the
+collector's own test instrument is not a trade this may make. So the reset value
+is `stress ? 1 : pollThinN()` — four instructions on the reset path, which runs
+once per `N` back edges — and the stress schedule is bit-for-bit what it was
+before thinning: the same probe reads **303 = 303**. `emitPollCountdownReset`
+(arm64) and `xEmitPollCountdownReset` (x64) carry it, and both selection checks
+pin it, because a silently-dropped stress arm fails no behavioural gate at all.
 
 **The stop-the-world handshake.** "Stop the world" is a real rendezvous, not an
 assumption about there being one thread. Any number of OS threads may execute Bit

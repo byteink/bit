@@ -372,8 +372,72 @@ fn emitCallIface(cx: A64Ctx, dst: int, dstTy: int, ifaceVal: int, methodId: int,
 fn emitBackEdgeSafepointIfNeeded(cx: A64Ctx, curBlock: int, target: int) {
   // §10.3.1: a @naked/@nosplit function polls no safepoint on its back-edges.
   if (isBackEdge(curBlock, target) && !needsNoSafepoints(cx.f)) {
-    emitInlinedPollGuard(cx)
+    emitThinnedPollGuard(cx)
   }
+}
+
+// #4200: the ladder below evaluates once per `pollThinN()` (codegen.bit) back
+// edges instead of once per back edge, behind a four-instruction countdown in
+// poll-cache slot 3 — `ldr` / `sub` / `str` / `cbnz` against the ladder's own
+// eighteen-instruction fast path, for an amortised 4 + 18/8 = 6.25.
+//
+// The countdown is a per-invocation frame slot, NOT module state: two threads
+// running the same function keep separate counts, so no thread can be starved
+// of polls by another's progress. emitPollCachePrefetch seeds it with 1 so the
+// first back edge of every invocation still evaluates the ladder in full — a
+// loop that runs fewer than `pollThinN()` iterations is unchanged, and the
+// thinning never compounds down a call chain.
+//
+// `cbnz` reads the countdown register directly rather than the flags
+// `addSubImmediate` would set with S, matching the rest of this ladder's
+// zero-tests: one instruction, and it leaves NZCV alone.
+//
+// x64's xEmitThinnedPollGuard (compiler/x64controlflow.bit) is the same four
+// steps in the same order; the two must stay in lockstep, since the countdown
+// decides WHEN the collector can run and a backend that thins differently
+// collects on a different schedule for the same program.
+fn emitThinnedPollGuard(cx: A64Ctx) {
+  let rc = scratch1()
+  loadImm(cx.code, rc, regSp(), pollCacheOffset(cx.frame, 3), 8, false)
+  addSubImmediate(cx.code, true, rc, rc, 1, false)
+  storeImm(cx.code, rc, regSp(), pollCacheOffset(cx.frame, 3), 8)
+  let skipFixup = emitLocalCbz(cx, true, rc) // not due yet -> past the ladder
+  emitPollCountdownReset(cx, rc)
+  emitInlinedPollGuard(cx)
+  patchLocalCondBranch(cx, skipFixup)
+}
+
+// The reset value is `stress ? 1 : pollThinN()`, and the stress arm is a
+// CORRECTNESS obligation rather than a refinement. Under `BIT_GC=stress` every
+// poll collects, which is what makes the stress suite this runtime's
+// precise-rooting oracle — `gcSafepointRoots`' own words: "any root the caller
+// fails to report is swept on the very next poll". A flat reset to
+// pollThinN() thins that oracle along with the fast path: measured on a
+// 200-iteration if/else loop, collections under stress went 303 → 128 (−58%),
+// and scripts/selfhost-diffsafepoints.sh compares exactly that number against
+// the pinned oracle. Buying a benchmark win with the collector's own test
+// instrument is not a trade this may make, so stress resets to 1 and its
+// schedule is bit-for-bit what it was before thinning.
+//
+// It is free where it matters: these four instructions sit on the reset path,
+// which runs once per pollThinN() back edges — 0.5 amortised instructions
+// against the 14 the thinning removes. Under stress the reset path IS every
+// back edge, and a stress run already pays a full collection there.
+//
+// gcAddr unbound (slot 1 == 0) keeps pollThinN(): with no GC bound there is no
+// stress flag to read and nothing to collect, and the ladder's own `gcAddr == 0`
+// arm still forces the poll on the back edges that do evaluate it.
+fn emitPollCountdownReset(cx: A64Ctx, rc: int) {
+  let rGc = scratch2()
+  movImm64(cx.code, rc, pollThinN())
+  loadImm(cx.code, rGc, regSp(), pollCacheOffset(cx.frame, 1), 8, false)
+  let unboundFixup = emitLocalCbz(cx, false, rGc)
+  emitPollField(cx, rGc, rGc, pgGcCfgStressWord())
+  let notStressFixup = emitLocalCbz(cx, false, rGc)
+  movImm64(cx.code, rc, 1)
+  patchLocalCondBranch(cx, notStressFixup)
+  patchLocalCondBranch(cx, unboundFixup)
+  storeImm(cx.code, rc, regSp(), pollCacheOffset(cx.frame, 3), 8)
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +491,12 @@ fn emitPollCachePrefetch(cx: A64Ctx) {
   // against the two per loop ITERATION it is here to remove.
   emitCallReloc(cx, preemptAnyAddrSymbol())
   storeImm(cx.code, retRegNum(), regSp(), pollCacheOffset(cx.frame, 2), 8)
+  // #4200: slot 3 is a COUNTDOWN, not an address — the only slot here whose
+  // value is not a per-process constant. 1, so the first back edge of this
+  // invocation evaluates the poll ladder in full; emitThinnedPollGuard resets
+  // it to pollThinN() from then on.
+  movImm64(cx.code, retRegNum(), 1)
+  storeImm(cx.code, retRegNum(), regSp(), pollCacheOffset(cx.frame, 3), 8)
 }
 
 // Loads the plain (non-atomic) i64 at word offset `wordOff` from the pointer
