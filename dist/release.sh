@@ -327,93 +327,11 @@ done
 
 # --- packaged-runtime atomic-width probe (#2742, #2744) ---------------------
 #
-# The probe above (#2213) catches a STALE runtime; this one catches WRONG
-# CODEGEN in a runtime that is otherwise current. `bit_rt_spin_try_acquire`
-# and `bit_rt_spin_release` (runtime/spinlock.bit:61,118) take `p: *i32`
-# (spinUnlocked is declared `i32` at :46), so every aarch64 exclusive-access
-# instruction inside them must address a 32-bit word — `ldaxr`/`stlxr`/
-# `stlr`/`ldar` through a `w` register, never `x`. #2742 shipped the `x` form
-# in 0.1.11 unnoticed because nothing here looked for it.
-#
-# aarch64 ONLY. x86 atomics carry width in the OPERAND SIZE (`lock cmpxchg
-# %eax,(%rdi)` vs `%rax,(%rdi)`), not in a distinct register name the way
-# aarch64's w/x split does, so there is no equivalent single-mnemonic check
-# for x86_64-linux. Skipped on purpose, not an oversight.
-#
-# A HIT HERE IS NOW A REAL DEFECT (#3034), not a known, tolerated lag. Before
-# #3034 the packaged runtime came from `./make libbitrt`'s PINNED STAGE0 build
-# (see `stepLibbitrt` in tools/build/artifactsteps.bit) and a codegen fix landing
-# in this tree could not reach it until the stage0 pin moved past the release
-# carrying the fix — 0.1.11 shipped the #2742 bug unnoticed exactly that way.
-# `stepLibbitrt` is unchanged (#3034's constraint: the L0 archive it produces
-# is still stage0-built, and still only bootstraps bit1 above), but the
-# archive this probe actually reads is packaged from L1 — bit1's own codegen —
-# so a failure here means THIS TREE'S compiler still emits the 64-bit form,
-# not that the fix is waiting on a pin.
-
-# <archive> <symbol-spelling-as-it-appears-in-the-object> <triple>
-# <bit_rt-name-for-messages>. Returns 0 clean, 1 a 64-bit hit, 2 this spelling
-# of the symbol is not in the object — Mach-O mangles every C symbol with a
-# leading `_`, ELF does not, and the caller tries both.
-checkAtomicWidth() {
-	local archive="$1" name="$2" triple="$3" sym="$4"
-	local dump hits
-	dump="$(objdump -d --disassemble-symbols="${name}" "${archive}" 2>/dev/null)" || true
-	printf '%s\n' "${dump}" | grep -q "<${name}>:" || return 2
-	# The function's own body only: from its label to the next blank line, so
-	# the "missing symbol" warning objdump prints for every OTHER .o member of
-	# the archive (only one member defines this symbol) can never be mistaken
-	# for an instruction belonging to it.
-	hits="$(printf '%s\n' "${dump}" |
-		awk "/<${name}>:/{p=1} p; /^\$/{if (p) exit}" |
-		awk -F'\t' '
-			NF < 3 { next }
-			{
-				mnem = $2; ops = $3
-				gsub(/^[ \t]+|[ \t]+$/, "", mnem)
-				if (mnem !~ /^(ldaxr|stlxr|stlr|ldar)$/) next
-				n = split(ops, parts, ",")
-				regn = 0
-				for (i = 1; i <= n; i++) {
-					tok = parts[i]
-					gsub(/^[ \t]+|[ \t]+$/, "", tok)
-					if (tok ~ /^[wx][0-9]+$/) { regn++; regs[regn] = tok }
-				}
-				# stlxr Rs,Rt,[Rn]: Rs (regs[1]) is the exclusive-store status,
-				# always w by the ISA regardless of the data width — the WIDTH
-				# that matters is Rt (regs[2]). Every other mnemonic here takes
-				# one register operand, the value itself, in regs[1].
-				target = (mnem == "stlxr") ? regs[2] : regs[1]
-				if (substr(target, 1, 1) != "w") print mnem "\t" target "\t" $0
-			}')"
-	[ -z "${hits}" ] && return 0
-	while IFS="$(printf '\t')" read -r mnem target rest; do
-		echo "release.sh: ${triple} libbitrt.a: ${sym} does a 64-bit ${mnem} (${target}) through what runtime/spinlock.bit declares *i32: ${rest}" >&2
-	done <<<"${hits}"
-	return 1
-}
-
-# One triple's libbitrt.a, both symbols, both possible symbol spellings.
-checkAtomicWidthTriple() { # <archive> <triple>
-	local archive="$1" triple="$2" bad=0
-	local symname resolved rc spelling
-	for symname in bit_rt_spin_try_acquire bit_rt_spin_release; do
-		resolved=0
-		for spelling in "_${symname}" "${symname}"; do
-			rc=0
-			checkAtomicWidth "${archive}" "${spelling}" "${triple}" "${symname}" || rc=$?
-			[ "${rc}" -eq 2 ] && continue
-			resolved=1
-			[ "${rc}" -eq 0 ] || bad=1
-			break
-		done
-		if [ "${resolved}" -eq 0 ]; then
-			echo "release.sh: ${triple} libbitrt.a: symbol ${symname} not found under either Mach-O or ELF spelling — cannot verify atomic width" >&2
-			bad=1
-		fi
-	done
-	return "${bad}"
-}
+# checkAtomicWidth() and checkAtomicWidthTriple() moved to
+# dist/release-atomiccheck.sh (#4132, pure move -- unchanged below, only
+# relocated). Sourced here; the invocation loop below is unchanged.
+# shellcheck source=dist/release-atomiccheck.sh
+. "${ROOT}/dist/release-atomiccheck.sh"
 
 echo "release.sh: checking packaged aarch64 libbitrt.a for #2742's 64-bit-through-*i32 defect"
 atomicBad=0
@@ -448,86 +366,12 @@ echo "release.sh: aarch64 libbitrt.a atomic widths OK"
 
 # --- verify the bytes that ship ---------------------------------------------
 #
-# Each artifact is unpacked somewhere unrelated and asked to COMPILE AND RUN a
-# program. A version banner proves nothing about a compiler.
-
-# CPU time consumed by <pid>, in centiseconds. TWO KERNELS, TWO SOURCES: macOS
-# offers `ps -o time=`, whose output is `[[HH:]MM:]SS.CC`, so the awk fold
-# accumulates base-60; the Linux images carry no `ps` that accepts it, so
-# /proc/<pid>/stat's utime+stime (fields 14 and 15, in clock ticks) is read
-# instead. `sed 's/.*) //'` drops `pid (comm) ` first, because comm can contain
-# spaces and would shift every field after it.
-cpuCentis() {
-	if [ -r "/proc/$1/stat" ]; then
-		sed 's/.*) //' "/proc/$1/stat" |
-			awk -v t="$(getconf CLK_TCK 2>/dev/null || echo 100)" \
-				'{printf "%d", ($12 + $13) * 100 / t}'
-	else
-		ps -o time= -p "$1" | tr -d ' ' |
-			awk -F: '{s=0; for(i=1;i<=NF;i++) s=s*60+$i; printf "%d", s*100}'
-	fi
-}
-
-smoke() { # <tarball> <target> <runner...>
-	local tar="$1" target="$2"; shift 2
-	local work; work="$(mktemp -d)"
-	tar -C "${work}" -xf "${tar}"
-	local prefix; prefix="$(ls -d "${work}"/bit-*)"
-	local lspFifo="${work}/lspfifo"
-	mkfifo "${lspFifo}"
-	mkdir -p "${work}/proj"
-	printf 'fn main() {\n  print("smoke ok\\n")\n}\n' > "${work}/proj/smoke.bit"
-	local got
-	got="$(cd "${work}/proj" && BIT_STDLIB="${prefix}/stdlib" \
-		BIT_LIBBITRT="${prefix}/lib/${target}/libbitrt.a" \
-		"$@" "${prefix}/bin/bit" run smoke.bit)"
-	# The version the shipped binary REPORTS, not the one we think we built. v0.1.0
-	# went out saying `bit 0.1.0-dev` because nothing here ever asked it.
-	local ver
-	ver="$("$@" "${prefix}/bin/bit" --version)"
-
-	# DOES `bin/bit` CARRY THIS TREE'S RUNTIME? (#2213) Everything above passes
-	# with a STALE runtime linked into the compiler: `run` exercises the archive
-	# in `lib/`, not the one inside `bin/bit`, and `--version` exercises neither.
-	# 0.1.6 and 0.1.7 both shipped that way — the GC fix they were cut for was
-	# present in `lib/` and absent from the binary beside it.
-	#
-	# So probe the compiler's OWN runtime, using the cheapest property that
-	# distinguishes them: #2207 made a thread blocked in `fsRead` stop burning
-	# CPU. `bit lsp --stdio` deliberately blocks on stdin, so launch it with stdin
-	# held open, send nothing, and measure. A stale runtime spins a whole core;
-	# a current one is idle. CPU time is read rather than wall-clock %, so a
-	# loaded machine cannot fake either verdict.
-	local before after used
-	"$@" "${prefix}/bin/bit" lsp --stdio < "${lspFifo}" > /dev/null 2>&1 &
-	local lsp=$!
-	exec 7> "${lspFifo}"
-	sleep 1
-	before="$(cpuCentis "${lsp}")"
-	sleep 6
-	after="$(cpuCentis "${lsp}")"
-	# `|| true` on BOTH, and it is load-bearing under `set -e`: `wait` reports the
-	# job's status, which is 143 for the process we just SIGTERMed, and an
-	# unguarded non-zero there terminates this script rather than the probe.
-	# `wait` also absorbs the shell's own "Terminated" job notice.
-	kill "${lsp}" 2>/dev/null || true
-	wait "${lsp}" 2>/dev/null || true
-	exec 7>&-
-	used=$((after - before))
-
-	rm -rf "${work}"
-	[ "${used}" -lt 100 ] || {
-		echo "release.sh: ${target} bin/bit burned ${used} centiseconds idle in 6s;" >&2
-		echo "  it is linked against a STALE runtime (BIT_LIBBITRT missing? see #2213)" >&2
-		return 1
-	}
-	[ "${got}" = "smoke ok" ] || { echo "release.sh: ${target} smoke test said '${got}'" >&2; return 1; }
-	[ "${ver}" = "bit ${VERSION}" ] || {
-		echo "release.sh: ${target} reports '${ver}', expected 'bit ${VERSION}'" >&2
-		return 1
-	}
-	echo "release.sh: ${target} smoke ok (${ver})"
-}
+# cpuCentis() and smoke() moved to dist/release-smoke.sh (#4132, pure move --
+# unchanged below, only relocated). Sourced here; every invocation (native
+# macOS call, aarch64-linux via docker, x86_64-linux and x86_64-windows over
+# SSH) stays in THIS file, in the same order, right below.
+# shellcheck source=dist/release-smoke.sh
+. "${ROOT}/dist/release-smoke.sh"
 
 # Native host: macOS on ARM64.
 smoke "${OUT}/bit-${VERSION}-macos-aarch64.tar.xz" aarch64-macos
@@ -713,135 +557,15 @@ else
 	echo "release.sh: --resume-notes: reusing ${OUT}/NOTES.md (mtime $(stat -f '%Sm' "${OUT}/NOTES.md" 2>/dev/null || stat -c '%y' "${OUT}/NOTES.md")) and the artifacts already in ${OUT}"
 fi
 
-# Refuse a bullet naming another language BEFORE the draft is created (#3973).
-# Owner ruling 2026-08-30: "in any release notes we don't want to mention Go
-# or any other language for that matter". dist/changelog.sh copies commit
-# SUBJECTS into NOTES.md verbatim, and a subject is authored weeks earlier by
-# someone not thinking about publication — three 0.4.0 bullets named Go and
-# were caught by eye and hand-fixed on the PUBLISHED release. "Write it
-# carefully" cannot fix text that comes from a different corpus than the one
-# anyone reviews; only a mechanical check at cut time can.
+# --- release-notes language guard + pending-notes folding -------------------
 #
-# Case-sensitive, one word each: proper-noun capitalization is what makes this
-# precise instead of noisy — a bare case-insensitive `go` matches ordinary
-# English ("does not go", "let it go") constantly, and this repo's own
-# CLAUDE.md draft pattern (`[^a-z]c[^a-z+]` for a bare "C") matches almost
-# every short word in the corpus. Verified empirically, not assumed: across
-# 3140 non-merge commit subjects and 1315 lines of NOTES.md generated for
-# v0.1.25 through the range since v0.5.0 (10 ranges), this pattern hit 7
-# times and every hit named the language — 0 observed false positives.
-# Golang/Rust/Java/JavaScript/Swift/C++ never occurred at all in that corpus.
-#
-# `\.(go|c)\b` ADDED (#4125): missed a lowercase language name inside a
-# filename — "as matrix.go and matrix.c do" (1921a807) shipped in 0.6.0
-# uncaught. `bench/cases/**` carries 12 `.go` and 11 `.c` files that exist
-# SPECIFICALLY to be compared against in prose like that, so a `.go`/`.c`
-# mention here is always genuine. Re-verified 2026-09-01 against 12 tag
-# ranges (v0.1.24..v0.6.0 + open v0.6.0..HEAD: 875 subject + 1286 NOTES.md
-# lines) AND full history (3154 subjects): 2 hits, same bullet, 0 false
-# positives. `.py`/`.rs`/`.ts`/`.java`/`.cpp` deliberately NOT added: this
-# repo's own tooling has `.py`/`.ts` files (dist/sbom.py, gen.py,
-# editors/vscode/src/extension.ts), and one IS a real false positive in
-# history — "wire dist/sbom.py into dist/release.sh" names Bit's own tooling,
-# not a Python comparison. `.rs`/`.java`/`.cpp` have zero tracked files and
-# zero corpus hits — unmeasured; add one only with its own corpus re-run.
-LANG_NAME_PATTERN='\b(Go|Golang|Rust|Zig|Python|Java|TypeScript|JavaScript|Swift)\b|C\+\+|\.(go|c)\b'
-
-checkNotesLanguage() { # <notes-file>
-	local notesFile="$1" hits bad=0 lineno text sha
-	[ -f "${notesFile}" ] || {
-		echo "release.sh: ${notesFile} does not exist — cannot check it for language mentions" >&2
-		return 1
-	}
-	hits="$(grep -nE "${LANG_NAME_PATTERN}" "${notesFile}" || true)"
-	[ -z "${hits}" ] && return 0
-
-	# One bullet per line ("- <subject> (<sha>)", dist/changelog.sh), so the
-	# trailing "(<sha>)" is the commit to name alongside the line — the way
-	# abiarity.bit's refusal names the symbol and both arities, not just "a
-	# mismatch exists somewhere".
-	while IFS= read -r line; do
-		[ -n "${line}" ] || continue
-		lineno="${line%%:*}"
-		text="${line#*:}"
-		sha="$(printf '%s' "${text}" | grep -oE '\([0-9a-f]{7,40}\)[[:space:]]*$' | tr -d '()' || true)"
-		if [ -n "${sha}" ] && [ -n "${RELEASE_NOTES_LANG_ALLOW:-}" ]; then
-			case " ${RELEASE_NOTES_LANG_ALLOW} " in
-			*" ${sha} "*) continue ;;
-			esac
-		fi
-		bad=1
-		echo "release.sh: ${notesFile}:${lineno}: names another language: ${text}" >&2
-		[ -n "${sha}" ] && echo "release.sh:   commit ${sha}" >&2
-	done <<<"${hits}"
-	[ "${bad}" -eq 0 ] && return 0
-
-	echo "release.sh: refusing — release notes must not name another language (owner ruling 2026-08-30)" >&2
-	echo "release.sh: reword the commit subject upstream (preferred), or edit ${notesFile} by hand and" >&2
-	echo "release.sh:   re-run WITHOUT rebuilding: dist/release.sh ${VERSION} --resume-notes" >&2
-	echo "release.sh: or approve a specific bullet (same flag avoids a rebuild here too):" >&2
-	echo "release.sh:   RELEASE_NOTES_LANG_ALLOW=\"<sha> ...\" dist/release.sh ${VERSION} --resume-notes" >&2
-	return 1
-}
-
-# Folds any entries from docs/release/PENDING-NOTES.md into the just-generated
-# NOTES.md (#3213, #3392). Entries live PAST the file's `---` separator —
-# everything above it is static usage documentation, never release content.
-# Appended right after the version heading, not at the end: a security
-# disclosure belongs at the top of the notes, not after "Artifacts".
-#
-# NEVER CLEARS PENDING-NOTES.md ITSELF, on --dry-run or a real run: this
-# script only ever creates a DRAFT (see the header comment above), and a
-# draft can be abandoned or re-cut. Clearing here would let an abandoned
-# draft silently eat the disclosure, with nothing left to fold into the
-# release that actually ships it. So this prints an instruction instead —
-# the entry is removed by hand, in the commit that records the release notes
-# were actually published (see PENDING-NOTES.md's own "How to use this
-# file" section).
-foldPendingNotes() { # <pending-notes-file> <notes-md-file>
-	local pendingFile="$1" notesFile="$2"
-	[ -f "${pendingFile}" ] || return 0
-
-	local raw
-	raw="$(awk '/^---$/{found=1;next} found{print}' "${pendingFile}")"
-	printf '%s\n' "${raw}" | grep -q '[^[:space:]]' || return 0
-
-	# The release skill's own accounting check (grep -cE '^[-*] '
-	# dist/out/NOTES.md vs the non-merge commit count, bit-release
-	# SKILL.md step 1) would silently miscount a hand-written top-level
-	# bullet as a displaced commit bullet — refuse rather than let a
-	# pending entry corrupt that assertion into noise.
-	local bad
-	bad="$(printf '%s\n' "${raw}" | grep -E '^[-*] ' || true)"
-	if [ -n "${bad}" ]; then
-		echo "release.sh: ${pendingFile} has an entry starting with '- ' or '* ', which the" >&2
-		echo "  release skill's bullet-count check would misread as a commit bullet:" >&2
-		printf '%s\n' "${bad}" | sed 's/^/  /' >&2
-		exit 1
-	fi
-
-	# Demote each entry's heading one level (## -> ###) so it nests under
-	# the version title the same way "Breaking changes" / "Features" do,
-	# instead of competing with it at the same level.
-	local demoted title rest count
-	demoted="$(printf '%s\n' "${raw}" | sed -E 's/^## /### /')"
-	title="$(head -n1 "${notesFile}")"
-	rest="$(tail -n +2 "${notesFile}")"
-	{
-		printf '%s\n\n' "${title}"
-		printf '%s\n' "${demoted}"
-		printf '\n%s\n' "${rest}"
-	} > "${notesFile}"
-
-	count="$(printf '%s\n' "${raw}" | grep -c '^## ' || true)"
-	echo "release.sh: folded ${count} pending entry(ies) from ${pendingFile} into ${notesFile}" >&2
-	echo "release.sh: ================================================================" >&2
-	echo "release.sh: ACTION REQUIRED once this release is PUBLISHED (not on a draft" >&2
-	echo "release.sh:   that gets abandoned or re-cut): remove the folded entry(ies) from" >&2
-	echo "release.sh:   ${pendingFile} (everything after its '---') and commit that" >&2
-	echo "release.sh:   removal. See that file's own \"How to use this file\" section." >&2
-	echo "release.sh: ================================================================" >&2
-}
+# LANG_NAME_PATTERN, checkNotesLanguage() and foldPendingNotes() moved to
+# dist/release-notes.sh (#4132, pure move -- unchanged below, only relocated --
+# to bring this file back under the 800-line ceiling). Sourced here, not
+# before: it defines only functions and one variable, so sourcing it at this
+# exact position is identical to having typed it inline.
+# shellcheck source=dist/release-notes.sh
+. "${ROOT}/dist/release-notes.sh"
 # Skipped under --resume-notes: the reused NOTES.md was already folded once,
 # by the prior run that produced it — folding again would duplicate it.
 [ "${RESUME_NOTES}" -eq 0 ] && foldPendingNotes "${ROOT}/docs/release/PENDING-NOTES.md" "${OUT}/NOTES.md"
