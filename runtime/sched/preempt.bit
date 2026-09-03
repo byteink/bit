@@ -184,6 +184,38 @@ export @nosplit fn preemptStamp(worker: i64, nowNs: i64) {
   }
 }
 
+// Record that `worker` no longer has a task in flight: `schedSwitch` just
+// returned control to the run loop (`workerrun.bit`'s `schedWorkerStep`,
+// right where it clears `wkRunning` -- see that field's own comment,
+// `worker.bit:23`, "0 between tasks", which names exactly the transition
+// this call marks), whether the task parked, finished, or is merely being
+// requeued for a later turn. Mirrors `preemptStamp`'s unconditional clear of
+// `requested` for the identical reason: `startNs` going back to 0 is the
+// value `sysmonTick`'s own comment below already promises means "no task is
+// currently dispatched on that worker", and before this call existed
+// NOTHING made that true for a worker that goes idle, parks a task, or
+// blocks rather than being redispatched -- `preemptStamp` runs only at
+// dispatch, so a worker with no next dispatch kept its last stamp forever
+// and `sysmonTick` flagged it as perpetually over budget, which
+// (`stwpoll.bit`'s widened clause, #4203) then held EVERY thread's back
+// edge on the safepoint slow path forever too. #4278.
+//
+// Safe to clear unconditionally: this runs strictly after `schedSwitch` has
+// returned, so the task that was running is not executing on the CPU right
+// now by construction -- there is nothing left for the CPU half of a
+// preempt request to interrupt. A worker immediately redispatched (the
+// `taskRunnable` requeue case) simply gets a fresh, correct stamp from the
+// very next `preemptStamp` call; a momentary 0 in between is exactly true
+// for that instant.
+export @nosplit fn preemptClear(worker: i64) {
+  atomicStore(slotAddr(ptrOf(startNs), worker), 0)
+  let had = atomicLoad(slotAddr(ptrOf(requested), worker))
+  atomicStore(slotAddr(ptrOf(requested), worker), 0)
+  if (had != 0) {
+    refreshPreemptAny()
+  }
+}
+
 // Scan every worker slot and flag any that has held its task past
 // `preemptBudgetNs`. Bounded by `schedMaxWorkers` AND `preemptSlots` --
 // `preemptSlots` is the one that actually matters for safety here: it is
@@ -214,7 +246,16 @@ export @nosplit @symbol("bit_rt_port_sched_sysmon_tick") fn sysmonTick(nowNs: i6
   let w: i64 = 0
   while (w < schedMaxWorkers && w < preemptSlots) {
     let started = atomicLoad(slotAddr(ptrOf(startNs), w))
-    if (started != 0 && nowNs - started > preemptBudgetNs) {
+    if (started != 0 &&
+      nowNs - started > preemptBudgetNs &&
+      atomicLoad(slotAddr(ptrOf(startNs), w)) == started) {
+      // Re-validated against a second load, immediately before publishing:
+      // `preemptClear` can run on `w`'s own thread between the first load
+      // above and here, if the task that was over budget finishes or parks
+      // in exactly that window. Without the re-check this would publish a
+      // request for a worker that, by the time it lands, is running
+      // nothing -- and since no safepoint or dispatch is coming to consume
+      // it, that republishes the exact permanently-stuck state #4278 fixed.
       atomicStore(slotAddr(ptrOf(requested), w), 1)
       // #3746: publish the summary AFTER the flag, never before -- see
       // `anyRequested`'s own header for the proof that this order (paired with
