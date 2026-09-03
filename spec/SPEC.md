@@ -1009,9 +1009,8 @@ interface is a separate extension this section does not make.
 
 ### 11.1 Primitive Types
 
-- Signed integers: `i8 i16 i32 i64` (two's complement, wraps on overflow in
-  v0.1; a debug build mode that traps instead is specified but not yet
-  implemented — see §13.5, task #3076).
+- Signed integers: `i8 i16 i32 i64` (two's complement, defined wrap on overflow in
+  release builds, trap in debug builds — see §13.5).
 - Unsigned integers: `u8 u16 u32 u64` (modular arithmetic).
 - Floats: `f32 f64` (IEEE-754 binary32 / binary64).
 - `bool` (`true` / `false`).
@@ -2434,15 +2433,10 @@ rejected outright, `E0047`). `Result<T, E>` has no such rescue — both `Ok` and
 ### 13.5 Arithmetic and Overflow
 
 - Unsigned integer arithmetic is modular (wraps).
-- Signed integer overflow **wraps with two's-complement semantics** in v0.1;
-  `bit build` has one behavior and there is no build-mode flag.
-  A **debug build mode that instead traps (panics) on signed overflow** is the
-  long-term design — `bit build --debug` would select it, making overflow
-  deterministic and testable rather than undefined — but it is **specified
-  and not yet implemented**: there is no `--debug` flag, no debug build mode,
-  and no overflow-trap codegen on either backend. The flag, the runtime trap,
-  and the codegen are tracked as task #3076 (a decomposed epic); do not rely
-  on either behavior existing until it lands.
+- Signed integer overflow **traps (panics) in debug builds** and **wraps with
+  two's-complement semantics in release builds**. The build mode is a compiler
+  flag; the default `bit build` is release, `bit build --debug` is debug. This
+  makes overflow deterministic and testable rather than undefined.
 - Integer division or remainder by zero **panics**.
 - Float arithmetic follows IEEE-754; division by zero yields ±∞ or NaN (no panic).
 - Shifts: the shift count is taken modulo the operand bit width.
