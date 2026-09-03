@@ -1,0 +1,386 @@
+// compiler/lowerlayout.bit — class/struct field layout and enum
+// construction lowering (FieldLayout/fieldLayoutFor/sliceElemSizeFor/
+// alignUp/StructLayout/typeOwner/declNodeIn/structDeclOf/enumDeclOf/
+// enumVariantNodes/variantOrdinal/variantPayloadTypes/buildEnumObj/
+// lowerVariantConstruction/structFieldNodes/structLayout) — split out of
+// compiler/lowercall.bit under #4183 (spec/LINT.md:186's 800-line E0200
+// limit; lowercall.bit was at 798, itself already a sibling split of
+// lower.bit per #1809). Same module, so this needs no imports and no
+// call-site changes.
+// A class field's byte size and whether it holds a GC reference (ABI: prims by
+// width, string/slice/map/chan/tuple/class/interface/func are 8-byte handles).
+// ponytail: enums treated as ref handles; C-like-enum non-ptr fields deferred.
+class FieldLayout {
+  size: int,
+  isPtr: bool,
+}
+
+fn fieldLayoutFor(fc: FnCtx, ty: int): FieldLayout {
+  let t = fc.c.ctx.types[ty]
+  if (t.kind == TypeKind.Prim) {
+    let p = t.prim
+    if (p == 0 || p == 4 || p == 10) {
+      return FieldLayout{ size: 1, isPtr: false }
+    }
+    if (p == 1 || p == 5) {
+      return FieldLayout{ size: 2, isPtr: false }
+    }
+    if (p == 2 || p == 6 || p == 8) {
+      return FieldLayout{ size: 4, isPtr: false }
+    }
+    if (p == 3 || p == 7 || p == 9) {
+      return FieldLayout{ size: 8, isPtr: false }
+    }
+  }
+  // A raw pointer `*T` (§11.4) is a single word the GC must never follow: 8
+  // bytes, isPtr=false so its offset stays out of the object's pointer map.
+  if (t.kind == TypeKind.Ptr) {
+    return FieldLayout{ size: 8, isPtr: false }
+  }
+  // A C-like enum's value is a bare i64 tag (not a traced pointer); only a boxed
+  // (payload) enum's value is an object reference.
+  if (t.kind == TypeKind.Enum && !t.enumBoxed) {
+    return FieldLayout{ size: 8, isPtr: false }
+  }
+  return FieldLayout{ size: 8, isPtr: true }
+}
+
+// The runtime `elem_size` argument for a slice's element type (ABI.md §2's
+// "Element storage" table, §9): `1` for a packed `[]u8` (#3121/#3226), a
+// class's own byte size for a `[]T` that qualifies for the inline element
+// representation (#3862 — `inlineElemStride`, lowersliceinline.bit), `8` for
+// every other element type. The u8 check is the PRIM tag directly rather than
+// `fieldLayoutFor`'s `.size`, which conflates u8/i8/bool at 1 byte for
+// STRUCT FIELD layout (a different question from which slices the runtime
+// may pack).
+fn sliceElemSizeFor(fc: FnCtx, elemTy: int): int {
+  let t = fc.c.ctx.types[elemTy]
+  if (t.kind == TypeKind.Prim && t.prim == 4) {
+    return 1
+  }
+  let packed = inlineElemStride(fc, elemTy)
+  if (packed != 0) {
+    return packed
+  }
+  return 8
+}
+
+// Rounds `x` up to a multiple of `a`.
+fn alignUp(x: int, a: int): int {
+  if (a <= 1) {
+    return x
+  }
+  return (x + a - 1) / a * a
+}
+
+// A class's total size (8-aligned), per-field byte offsets, and the offsets of
+// its reference fields (for the GC descriptor). Mirrors layoutFields.
+class StructLayout {
+  size: int,
+  offsets: []int,
+  ptrOffsets: []int,
+}
+
+// The StructDecl node for a named class, or 0.
+// The Checker for the module that DECLARES `ty`, a named type. Fields, variants
+// and payloads are all read back from the decl node, and a node index only means
+// something in its own tree (the declOwner rule) — so an imported type (`File`
+// from std/fs, `Option` from the prelude) must be read from its declaring
+// module, not the importer's. Falls back to `c` when the module is unrecorded or
+// out of range, which is the single-module case.
+fn typeOwner(c: Checker, ty: int): Checker {
+  let m = c.ctx.types[ty].declModule
+  if (m < 0 || m == c.moduleId || m >= len(c.mods)) {
+    return c
+  }
+  return c.mods[m]
+}
+
+// The decl node of tag `tag` named `name` in `oc`'s tree, or 0.
+//
+// #2908: was a linear `while` scan over every node in `oc.tree` on EVERY call.
+// `structDeclOf`/`enumDeclOf` have ~22 call sites and the two hottest —
+// `vLitUnknownField`, `vMissingStructFields` — run once per class-literal
+// field / per composite literal, so a whole-project check was quadratic in
+// AST size (measured: ~86% of one `bit-lsp` specimen's CPU).
+//
+// `checkModule`'s pre-scan (checkmodule.bit:16-23) already builds exactly this
+// map, once per module, before anything can call `structDeclOf`/`enumDeclOf`:
+// `oc.typeDecls` is name -> decl node for every StructDecl/EnumDecl/
+// InterfaceDecl/TypeAlias, keyed on the bare `declName` — the same string
+// `declTypeOf` used to establish the type's kind and members in the first
+// place (checkbind.bit:549), so this can never disagree with `oc`'s own
+// TypeId for a validly-declared name. `instantiateNamed` (checkinst.bit:436)
+// already reads a DIFFERENT module's `typeDecls` this same way — through a
+// `Checker` handed around by value — so the map-is-reference-typed sharing
+// this relies on is already load-bearing, not new. The tag check below is the
+// only thing this loses versus a full scan: a name declared as some OTHER
+// kind (e.g. an interface reusing a class's name, which the resolver already
+// rejects as a redeclaration) yields 0, matching the old scan's contract.
+fn declNodeIn(oc: Checker, tag: Tag, name: string): int {
+  let decl = oc.typeDecls[name]
+  if (decl != 0 && getNode(oc.tree, decl).tag == tag) {
+    return decl
+  }
+  return 0
+}
+
+// The `struct_decl` node for `structTy`, or 0. The result indexes into
+// `typeOwner(c, structTy)`'s tree — never `c`'s. Keyed on the type's bare
+// `name` field, not `typeName()`: the latter is a DISPLAY renderer and (#2723)
+// appends a nominal instantiation's type arguments, which the AST decl node's
+// name never carries.
+fn structDeclOf(c: Checker, structTy: int): int {
+  return declNodeIn(typeOwner(c, structTy), Tag.StructDecl, c.ctx.types[structTy].name)
+}
+
+// The `enum_decl` node for `enumTy`, or 0. The result indexes into
+// `typeOwner(c, enumTy)`'s tree — never `c`'s. See `structDeclOf`: keyed on
+// the bare `name` field, not the display renderer `typeName()`.
+fn enumDeclOf(c: Checker, enumTy: int): int {
+  return declNodeIn(typeOwner(c, enumTy), Tag.EnumDecl, c.ctx.types[enumTy].name)
+}
+
+// An enum declaration's variant nodes in order (kid 2 is the variant_list).
+fn enumVariantNodes(c: Checker, decl: int): []int {
+  return kidsOf(c.tree, kidsOf(c.tree, decl)[2])
+}
+
+// The declaration-order tag of a variant name in `enumTy`, or 0 if not found
+// (the checker has already validated the name).
+fn variantOrdinal(c: Checker, enumTy: int, variantName: string): int {
+  let oc = typeOwner(c, enumTy)
+  let decl = enumDeclOf(c, enumTy)
+  if (decl == 0) {
+    return 0
+  }
+  let vs = enumVariantNodes(oc, decl)
+  let i = 0
+  while (i < len(vs)) {
+    let vn = getNode(oc.tree, kidsOf(oc.tree, vs[i])[0])
+    if (oc.source[vn.span.start:vn.span.end] == variantName) {
+      return i
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// The resolved payload types of a variant (empty when it has none).
+//
+// The TYPE TABLE is the authority (#1560): `ctx.variantPayloads` holds an
+// instantiation's payloads already substituted, so `Opt<i64>` answers i64 for
+// `Some` with no reference to the scrutinee's syntax at all. The AST walk below
+// is the fallback for the cases the table cannot have an entry for — a
+// payload-less variant, or an enum whose declaring module has not been resolved
+// through `declTypeOf` on this path. It reads the payload off `enum_variant`'s
+// kid 1, a `type_list` of type nodes, resolved against the declaring module
+// since that is the tree the type nodes index into.
+fn variantPayloadTypes(c: Checker, enumTy: int, variantName: string): []int {
+  let recorded = variantPayloadLookup(c.ctx, "${enumTy}.${variantName}")
+  if (len(recorded) != 0) {
+    return recorded
+  }
+  let out = []int(0)
+  let oc = typeOwner(c, enumTy)
+  let decl = enumDeclOf(c, enumTy)
+  if (decl == 0) {
+    return out
+  }
+  let vs = enumVariantNodes(oc, decl)
+  let i = 0
+  while (i < len(vs)) {
+    let vn = getNode(oc.tree, kidsOf(oc.tree, vs[i])[0])
+    if (oc.source[vn.span.start:vn.span.end] == variantName) {
+      let payload = kidsOf(oc.tree, vs[i])[1]
+      if (payload == 0) {
+        return out
+      }
+      let types = kidsOf(oc.tree, payload)
+      let j = 0
+      while (j < len(types)) {
+        out = append(out, typeFromNode(oc, types[j]))
+        j = j + 1
+      }
+      return out
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Builds the no-payload enum object `{ tag: i64 @0, payload @enumPayloadBase }`.
+// Since #4026 moved the base to 8 this is EXACTLY the argc=1 shape
+// `lowerVariantConstruction` emits with a nil argument — same size, same
+// `ptr_offsets`, same `TypeInfo` symbol — so both derive from one constant and
+// cannot drift. That word stays in `offsets`: here it is always nil, so tracing
+// it is wasted work and never a wrong answer, whereas omitting a word that held
+// a reference is a missed root. `payload` is -1 for none — NOT 0, the value id
+// of a function's first instruction and so a valid payload (the seed's
+// `?ir.ValueId` carried that in the type; here it must be a value the id space
+// can never produce).
+fn buildEnumObj(fc: FnCtx, enumTy: int, tag: int, payload: int): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let ga = mkInstr(Op.GcAlloc, enumTy)
+  ga.ival = enumPayloadBase + 8
+  ga.offsets = [enumPayloadBase]
+  let obj = builderEmit(fc.b, ga)
+  let tc = mkInstr(Op.ConstInt, i64ty)
+  tc.ival = tag
+  let fs0 = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  fs0.lhs = obj
+  fs0.ival = 0
+  fs0.rhs = builderEmit(fc.b, tc)
+  builderEmit(fc.b, fs0)
+  let payV = payload
+  if (payload == -1) {
+    let z = mkInstr(Op.ConstInt, i64ty)
+    payV = builderEmit(fc.b, z)
+  }
+  let fs8 = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  fs8.lhs = obj
+  fs8.ival = enumPayloadBase
+  fs8.rhs = payV
+  builderEmit(fc.b, fs8)
+  return obj
+}
+
+// Byte offset of a boxed enum's first payload word: the tag takes word 0, the
+// payload starts at word 1 (runtime/ABI.md §1.2). Named because six sites here
+// and in lowerbranch.bit must agree. 16 until #4026, which reclaimed the hole at
+// offset 8 — 32-byte header + 24 body = 56 took the 64 size class, 48 takes the
+// 48 class, so 16 bytes off every argc=1 payload enum. Table in ABI.md §1.2.
+const enumPayloadBase: int = 8
+
+// Lowers `Enum.Variant(args)`. A no-payload variant construction wraps a nil
+// payload (`buildEnumObj`, which is this shape at argc=1). A payload-carrying
+// construction is ONE object: `{ tag: i64 @0, arg0 @8, arg1 @16, ... }` (#4018,
+// base moved to 8 by #4026) — no separate payload box, since the merged layout
+// already fits the generic `ptrOffsets` tracing every multi-field class uses.
+fn lowerVariantConstruction(fc: FnCtx, node: int): int {
+  let k = kidsOf(fc.c.tree, node)
+  let enumTy = nodeType(fc, k[0])
+  let mn = getNode(fc.c.tree, kidsOf(fc.c.tree, k[0])[1])
+  let vname = fc.c.source[mn.span.start:mn.span.end]
+  let tag = variantOrdinal(fc.c, enumTy, vname)
+  let args = kidsOf(fc.c.tree, k[2])
+  if (len(args) == 0) {
+    return buildEnumObj(fc, enumTy, tag, -1)
+  }
+  // The concrete payload types come from the arguments, not the variant's
+  // declared payload — so a generic enum `Opt<i64>.Some(x)` boxes the payload at
+  // the substituted type (i64), giving the right size and GC-ptr offsets.
+  let offs = []int(0)
+  let i = 0
+  while (i < len(args)) {
+    let at = defaultType(fc.c, checkArgType(fc.c, node, i))
+    if (fieldLayoutFor(fc, at).isPtr) {
+      offs = append(offs, enumPayloadBase + 8 * i)
+    }
+    i = i + 1
+  }
+  let ga = mkInstr(Op.GcAlloc, enumTy)
+  ga.ival = enumPayloadBase + 8 * len(args)
+  ga.offsets = offs
+  let obj = builderEmit(fc.b, ga)
+  let tc = mkInstr(Op.ConstInt, primType(fc.c.ctx, 3))
+  tc.ival = tag
+  let fs0 = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  fs0.lhs = obj
+  fs0.ival = 0
+  fs0.rhs = builderEmit(fc.b, tc)
+  builderEmit(fc.b, fs0)
+  let j = 0
+  while (j < len(args) && !fc.failed) {
+    let a = args[j]
+    if (getNode(fc.c.tree, a).tag == Tag.Arg) {
+      a = kidsOf(fc.c.tree, a)[0]
+    }
+    let av = lowerExprH(fc, a, defaultType(fc.c, checkArgType(fc.c, node, j)))
+    if (fc.failed) {
+      return 0
+    }
+    let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+    fs.lhs = obj
+    fs.ival = enumPayloadBase + 8 * j
+    fs.rhs = av
+    builderEmit(fc.b, fs)
+    j = j + 1
+  }
+  return obj
+}
+
+// A class declaration's field nodes in order (unwrapping exported fields).
+//
+// The field list also holds in-body methods (#3367) and `use` statements
+// (#3369) — neither is a field (`checkbind.bit`'s `resolveStructFields` and
+// `checkinst.bit`'s `fillInstMembers` already skip both the same way), so
+// both are excluded here too.
+//
+// #3762 found this the hard way: kid[2] ("fields", named before #3367 added
+// in-body methods) is a MIX of `Tag.Field` and `Tag.FuncDecl` — an in-body
+// method sits in the same list. A `FuncDecl` skipped here, not appended: its
+// kid[0] is a `Receiver` node whose span is deliberately pinned to the
+// METHOD'S OWN NAME (parsertype.bit's `parseMethodMember`, for `bit fmt`'s
+// member placement), so treating it as a field's name node read back that
+// name and silently counted the method as an extra field — `fieldIndexByName`
+// then resolved a bare method value like `p.get` to `field_get` at a real
+// byte offset instead of falling through to `lowerStructMethodValue`, and
+// `structLayout` (which shares this list) allocated real storage for every
+// method, growing every in-body-method class's size by 8 bytes per method
+// with no observable effect until something read the phantom "field" back (a
+// panic diagnosed as _tests_/cases/run_struct_method_value.bit's "call of a nil
+// function"). A single-trait `use`'s only kid hits the same class of bug from
+// the `Tag.UseStmt` side: read as a field's TYPE node, it is an out-of-range
+// crash rather than a silent mislabelling.
+fn structFieldNodes(c: Checker, decl: int): []int {
+  let raw = kidsOf(c.tree, kidsOf(c.tree, decl)[2])
+  let out = []int(0)
+  let i = 0
+  while (i < len(raw)) {
+    let f = raw[i]
+    if (getNode(c.tree, f).tag == Tag.Export) {
+      f = kidsOf(c.tree, f)[0]
+    }
+    let ftag = getNode(c.tree, f).tag
+    if (ftag != Tag.FuncDecl && ftag != Tag.UseStmt) {
+      out = append(out, f)
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Computes a class's layout from its declaration (field decl order). `sub`
+// binds the class's type parameters to concrete types at a generic
+// construction site (`Box<i64>{...}` -> {T: i64}); noSubst() for a non-generic
+// class. Without it a generic field `val: T` resolves to the bare type param,
+// which classifies as a pointer — mislabelling `Box<i64>`'s i64 in the GC
+// descriptor.
+fn structLayout(fc: FnCtx, oc: Checker, decl: int, sub: TypeSubst): StructLayout {
+  let fields = structFieldNodes(oc, decl)
+  let offsets = []int(0)
+  let ptrOffsets = []int(0)
+  let cur = 0
+  let i = 0
+  while (i < len(fields)) {
+    let fty = typeFromNodeIn(oc, kidsOf(oc.tree, fields[i])[1], sub)
+    let ft = fc.c.ctx.types[fty]
+    if (ft.kind == TypeKind.Array) {
+      let el = fieldLayoutFor(fc, ft.elem)
+      cur = alignUp(cur, el.size)
+      offsets = append(offsets, cur)
+      cur = cur + ft.arrayLen * el.size
+    } else {
+      let fl = fieldLayoutFor(fc, fty)
+      cur = alignUp(cur, fl.size)
+      offsets = append(offsets, cur)
+      if (fl.isPtr) {
+        ptrOffsets = append(ptrOffsets, cur)
+      }
+      cur = cur + fl.size
+    }
+    i = i + 1
+  }
+  return StructLayout{ size: alignUp(cur, 8), offsets: offsets, ptrOffsets: ptrOffsets }
+}

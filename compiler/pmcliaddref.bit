@@ -1,0 +1,356 @@
+// compiler/pmcliaddref.bit — `bit add`'s ref/version resolution
+// (resolveAddRef/resolveVersionRefSha/resolveHighestSatisfying),
+// addLocalDependency, and the bit.json/bit.lock write helpers
+// (checkManifestExists/rewriteManifest/ensureDependenciesObject/
+// pmAppendGapSlot/upsertLockEntry) — split out of compiler/pmcli.bit under
+// #4183 (spec/LINT.md:186's 800-line E0200 limit; pmcli.bit was at 799).
+// Same module, sibling file, exactly like the pmz.bit/pmcliup.bit/
+// pmcliremove.bit splits pmcli.bit's own header already documents: every
+// helper here is called from pmcli.bit unqualified, and this file uses
+// pmcli.bit's own `std/json` CST import (CstNode/cstGet/cstParse/...)
+// without re-importing it — a module's imports are shared across its
+// files (#2870), and a second `import { CstNode, ... } from "std/json"`
+// here would be E0042 (already declared in this scope).
+// ---- ref resolution: caret-by-default, exact-when-named (#2367) -------
+
+// What `bit add` fetches vs. what it writes into `bit.json` — decoupled
+// because a `^`/`~` constraint is fetched as whichever tag currently
+// satisfies it highest, but WRITTEN verbatim (the constraint itself, never
+// the version it happened to resolve to today). `resolvedVersion` (#2856)
+// is a THIRD, different thing again: the actual `MAJOR.MINOR.PATCH`
+// `resolveHighestSatisfying` matched — canonical, no `v` prefix
+// (`versionText`, pmresolveexplain.bit) — recorded into `bit.lock`'s own
+// `version` field, never `bit.json`. "" when `rawRef` is not a version
+// constraint at all (a branch name or a bare commit sha): there is nothing
+// resolved to record.
+class AddRefResolution { fetchRef: string, writtenRef: string, resolvedVersion: string }
+
+// `hasRef`/`rawRef` are `addCmd`'s own `hadRef`/`d.ref` (`parseAddSpec`
+// always fills `d.ref` with a placeholder "HEAD" when `hasRef` is false —
+// that placeholder is never read here, matching the ticket's own
+// constraint: a bare `bit add` must never resolve a branch or HEAD).
+//
+// A branch name or bare commit sha (`parseAddVersionRef` returns
+// `(_, false)`) is not a version constraint at all and passes straight
+// through unresolved, exactly as before this ticket: SPEC §17.7's other two
+// ref forms carry nothing for `listVersions`/the resolver to reason about.
+fn resolveAddRef(
+  gitBin: string,
+  url: string,
+  hasRef: bool,
+  rawRef: string,
+  timeoutMs: int,
+): AddRefResolution! {
+  if (!hasRef) {
+    let picked = resolveHighestSatisfying(gitBin, url, versionSetUniverse(), timeoutMs)?
+    let caret = Constraint{ op: ConstraintOp.Caret, version: picked.version }
+    return AddRefResolution{
+      fetchRef: picked.ref,
+      writtenRef: formatConstraint(caret),
+      resolvedVersion: versionText(picked.version),
+    }
+  }
+  let (c, isVersion) = parseAddVersionRef(rawRef)
+  if (!isVersion) {
+    return AddRefResolution{ fetchRef: rawRef, writtenRef: rawRef, resolvedVersion: "" }
+  }
+  let picked = resolveHighestSatisfying(gitBin, url, versionSetFromConstraint(c), timeoutMs)?
+  return AddRefResolution{
+    fetchRef: picked.ref,
+    writtenRef: formatConstraint(c),
+    resolvedVersion: versionText(picked.version),
+  }
+}
+
+// The version `ref` names, parsed as a `Constraint` (#2364): a leading `v`
+// is accepted and canonicalised away for a bare version
+// (`canonicalVersion`, pmversion.bit) — spelled `v1.2.3` or `1.2.3`, both
+// become `ConstraintOp.Exact` — while `^`/`~` never take a `v` prefix
+// (pmversion.bit's own grammar, unchanged here). `(_, false)` for anything
+// else: a branch name or a bare commit sha, SPEC §17.7's other two ref
+// forms, neither of which this ticket's caret/exact default applies to.
+fn parseAddVersionRef(ref: string): (Constraint, bool) {
+  let (bare, ok) = canonicalVersion(ref)
+  if (ok) {
+    let (v, _) = parseVersion(bare)
+    return Constraint{ op: ConstraintOp.Exact, version: v }, true
+  }
+  return parseVersionConstraint(ref)
+}
+
+class HighestSatisfying { version: Version, ref: string }
+
+// The git ref `v` actually resolves to (`v`-prefixed tried first, falling
+// back to bare — SPEC §17.7's tag-matching rule, since a third-party
+// repository may tag either way and `v`-prefixed takes precedence when both
+// exist on different commits) and the commit sha that ref names. Split out
+// of `resolveHighestSatisfying` (below) so `bit outdated`
+// (compiler/pmclioutdated.bit) can reuse the identical tag-matching rule to
+// map an ALREADY-locked commit back to the version it came from, rather than
+// only picking a version forward from a constraint.
+fn resolveVersionRefSha(
+  gitBin: string,
+  url: string,
+  v: Version,
+  timeoutMs: int,
+): (string, string)! {
+  let vTag = "v${v.major}.${v.minor}.${v.patch}"
+  let bareTag = "${v.major}.${v.minor}.${v.patch}"
+  // `resolveDependencyRef` returns a non-empty 40-hex sha on success, so an
+  // empty fallback here is a safe "the v-prefixed tag was not found"
+  // sentinel — never a real result, since `isFullSha` (pmfetch.bit) is
+  // never satisfied by "".
+  let vSha = resolveDependencyRef(gitBin, url, vTag, timeoutMs) catch _ {
+    ""
+  }
+  if (len(vSha) > 0) {
+    return vTag, vSha
+  }
+  let bareSha = resolveDependencyRef(gitBin, url, bareTag, timeoutMs)?
+  return bareTag, bareSha
+}
+
+// The highest available tag (`listVersions`, #2365) inside `set`
+// (`highestInSet`, pmresolvesolve.bit's own PubGrub selection rule — reused
+// rather than a second "pick a version" policy), and the git ref it
+// actually resolves to (`resolveVersionRefSha`, above).
+fn resolveHighestSatisfying(
+  gitBin: string,
+  url: string,
+  set: []Range,
+  timeoutMs: int,
+): HighestSatisfying! {
+  let versions = listVersions(gitBin, url, timeoutMs)?
+  let (chosen, found) = highestInSet(versions, set)
+  if (!found) {
+    fail newError("pmcli: no available version of ${url} satisfies the requested constraint")
+  }
+  let (ref, _) = resolveVersionRefSha(gitBin, url, chosen, timeoutMs)?
+  return HighestSatisfying{ version: chosen, ref: ref }
+}
+
+// `bit add`'s local-filesystem counterpart to `addDependency` (#2244):
+// verifies `localPath` exists (`resolveLocalDependency`, pmz.bit) and reads
+// its own `bit.json` requirements, but never fetches — there is no git
+// remote and no commit to resolve. `rawSpec` is recorded in `bit.json`
+// VERBATIM (exactly what the user typed: a bare path or a `file://` URL),
+// so it round-trips through `parseSpec` unchanged on the next `bit up`.
+//
+// `entry.requires` still feeds `resolveTransitiveDeps` exactly like a
+// git-backed add: a local dependency's OWN `bit.json` may name ordinary
+// git-host/vanity/ssh dependencies of its own, and those resolve normally.
+// What it may NOT name is ANOTHER local/file dependency of its own — see
+// `resolveTransitiveSpec` (pmz.bit) for that check and why: a local/file
+// spec is only ever trusted directly from the project's OWN bit.json, never
+// from something reached by walking a dependency's manifest.
+export fn addLocalDependency(
+  projectDir: string, cacheRoot: string, gitBin: string,
+  name: string, rawSpec: string, localPath: string, timeoutMs: int,
+): AddResult! {
+  // #2751: same precondition, checked first, as addDependency above.
+  checkManifestExists(projectDir)?
+  let lockPath = pmJoin(projectDir, "bit.lock")
+  let entries = readLock(lockPath)?
+  let entry = resolveLocalDependency(projectDir, name, localPath)?
+
+  // Same bit.lock-first, bit.json-second ordering as `addDependency`. A
+  // local dependency has no resolved version (#2856): there is no git tag,
+  // only a live directory.
+  let updated = upsertLockEntry(
+    entries,
+    name,
+    entry.url,
+    entry.commit,
+    "",
+    entry.requires,
+    "",
+    entry.localPath,
+    "",
+  )
+  let resolved = resolveTransitiveDeps(
+    cacheRoot,
+    gitBin,
+    updated,
+    flattenRequires(updated),
+    timeoutMs,
+  )?
+  writeLock(lockPath, resolved)?
+
+  rewriteManifest(projectDir, name, rawSpec)?
+
+  return AddResult{ name: name, specRef: rawSpec, url: "", commit: "" }
+}
+
+// ---- bit.json / bit.lock writes -----------------------------------------
+
+// Fails if `<projectDir>/bit.json` doesn't exist or doesn't parse as JSONC
+// — the precondition `addDependency`/`addVanityDependency` (below) check
+// FIRST, before any fetch, resolution or write. #2751: this used to be
+// `rewriteManifest`'s own check (still below it, structurally unchanged),
+// run LAST, after the dependency was already fetched into the cache and
+// bit.lock already rewritten — so a project with no bit.json, or one that
+// fails to parse, still left both of those behind despite the command's
+// own exit code marking it a failure. No prefix on the message: every
+// caller of `addDependency`/`addVanityDependency` already adds its own
+// `bit add: `/`bit up: ` prefix once, on the way out.
+fn checkManifestExists(projectDir: string): ()! {
+  let path = pmJoin(projectDir, "bit.json")
+  if (!exists(path)) {
+    fail newError("${path} does not exist — run inside a project with a bit.json")
+  }
+  let src = readFile(path)?
+  cstParse(src)?
+}
+
+// Rewrites `<projectDir>/bit.json`'s `dependencies.<name>` entry to
+// `specRef`, through the CST edit layer only — every other byte of the file
+// (comments, formatting, every other entry) survives untouched. Fails rather
+// than guessing if the project has no `bit.json` at all: `bit add` adds TO a
+// project, it does not scaffold one (that is `bit init`'s job, out of scope
+// here). `checkManifestExists` (above) already ran this same existence/parse
+// check before any fetch or write happened; this re-reads and re-parses
+// because it needs the actual CST root to mutate, not just a yes/no.
+fn rewriteManifest(projectDir: string, name: string, specRef: string): ()! {
+  let path = pmJoin(projectDir, "bit.json")
+  if (!exists(path)) {
+    fail newError("${path} does not exist — run inside a project with a bit.json")
+  }
+  let src = readFile(path)?
+  let root = ensureDependenciesObject(cstParse(src)?)
+  let updated = cstSetStringPath(root, ["dependencies", name], specRef)?
+  writeFile(path, cstPrint(updated))?
+}
+
+// Pre-creates a REAL, empty `"dependencies": {}` entry on `root` when it has
+// none yet — the first `bit add` in a hand-written project, which starts from
+// a manifest with no `dependencies` key at all (#2245).
+//
+// Root cause this works around, without touching stdlib/json (outside this
+// file's fence): `cstSetStringPath` (stdlib/json/edit.bit), when the
+// intermediate "dependencies" object doesn't exist, builds one via
+// `emptyCstObject()`, whose single gap starts life as `Option<string>.None`.
+// Appending the first entry into that object doubles the `None` (edit.bit's
+// `appendGapSlot`) into a TAIL gap — the boundary after the last entry, before
+// the closing `}` — that the printer (stdlib/json/cst_print.bit's
+// `gapForIndex`) cannot distinguish from an ordinary BETWEEN-entries gap, so
+// it synthesizes a leading comma there as if another sibling followed. The
+// result is `"dependencies": {"textutil": "…",}"` — a trailing comma before
+// the closing brace, invalid JSON. A manifest that already has `"dependencies":
+// {}` never hits this: its object came from `cstParse` itself, whose tail gap
+// is always a real `Some("")`, never `None`.
+//
+// The fix: build "dependencies": {} here ourselves, with a `Some("")` tail gap
+// — exactly the shape `cstParse` itself would produce for `{}` in source — so
+// `cstSetStringPath` above always finds an EXISTING "dependencies" object (the
+// already-correct path) and never exercises `emptyCstObject()` for it. Only
+// the top-level append is done here; `cstSetStringPath` still owns inserting
+// the actual `name: specRef` entry into the now-real empty object.
+fn ensureDependenciesObject(root: CstNode): CstNode {
+  match (cstGet(root, ["dependencies"])) {
+    Some(_) => return root
+    None => {}
+  }
+  match (root) {
+    CstObject(entries, gaps, trivia) => {
+      let depsEntry = CstEntry{
+        keyText: "\"dependencies\"",
+        key: "dependencies",
+        midGap: ": ",
+        value: CstNode.CstObject(
+          []CstEntry(0),
+          [Option<string>.Some("")],
+          Trivia{ leading: "", trailing: "" },
+        ),
+      }
+      return CstNode.CstObject(append(entries, depsEntry), pmAppendGapSlot(gaps), trivia)
+    }
+    CstNull(_) => return root
+    CstBool(_, _) => return root
+    CstNumber(_, _) => return root
+    CstString(_, _) => return root
+    CstArray(_, _, _) => return root
+  }
+}
+
+// A top-level-only mirror of stdlib/json/edit.bit's private `appendGapSlot`
+// (unexported, and edit.bit is outside this file's fence): `gaps`
+// (`len(entries) + 1`) with one more slot inserted for an appended entry — a
+// fresh `None` leading gap for the new entry (the printer infers its comma
+// and indentation from the preceding sibling), and the OLD tail gap reused as
+// the new tail, since it still describes "after the last entry, before the
+// close". Used only by `ensureDependenciesObject`, always at `root`'s own
+// level, which already has a real (non-`None`) tail gap from `cstParse` — the
+// exact case that does not trigger the bug this function's caller works
+// around.
+fn pmAppendGapSlot(gaps: []Option<string>): []Option<string> {
+  let out = []Option<string>(0)
+  let i = 0
+  while (i < len(gaps) - 1) {
+    out = append(out, gaps[i])
+    i = i + 1
+  }
+  out = append(out, Option<string>.None)
+  out = append(out, gaps[len(gaps) - 1])
+  return out
+}
+
+// `entries` with `name`'s entry replaced (or appended, if absent) by a fresh
+// one built from this run's fetch — bit.lock is fully machine-owned, so the
+// whole entry is regenerated rather than patched field-by-field. `localPath`
+// (#2244) is "" for every git-backed (direct/vanity/ssh) entry; non-empty
+// only for a local filesystem dependency (`addLocalDependency`, below).
+// `version` (#2856) is the caller's already-resolved `MAJOR.MINOR.PATCH` —
+// "" when the ref fetched was a branch, a bare sha, or a local path, exactly
+// as every caller below already computed before calling in.
+fn upsertLockEntry(
+  entries: []LockEntry,
+  name: string,
+  url: string,
+  commit: string,
+  version: string,
+  requires: []LockRequire,
+  vanity: string,
+  localPath: string,
+  dir: string,
+): []LockEntry {
+  let out = []LockEntry(0)
+  let replaced = false
+  let i = 0
+  while (i < len(entries)) {
+    if (entries[i].name == name) {
+      out = append(
+        out,
+        LockEntry{
+          name: name,
+          url: url,
+          commit: commit,
+          version: version,
+          requires: requires,
+          vanity: vanity,
+          localPath: localPath,
+          dir: dir,
+        },
+      )
+      replaced = true
+    } else {
+      out = append(out, entries[i])
+    }
+    i = i + 1
+  }
+  if (!replaced) {
+    out = append(
+      out,
+      LockEntry{
+        name: name,
+        url: url,
+        commit: commit,
+        version: version,
+        requires: requires,
+        vanity: vanity,
+        localPath: localPath,
+        dir: dir,
+      },
+    )
+  }
+  return out
+}

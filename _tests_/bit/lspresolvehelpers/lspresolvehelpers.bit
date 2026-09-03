@@ -1,0 +1,382 @@
+// _tests_/bit/lspresolvehelpers — the `bit lsp` JSON-RPC subprocess plumbing
+// and the rename-scenario session/assertion helpers `_tests_/bit/lspresolve.bit`
+// needs, split out under #4183 (spec/LINT.md:186's 800-line E0200 limit;
+// lspresolve.bit was at 799). A pure move — every declaration below is
+// byte-identical to what lspresolve.bit carried before the split.
+//
+// A real directory module, imported via a plain relative path
+// (`import { ... } from "./lspresolvehelpers"`) from `_tests_/bit/lspresolve.bit`
+// — the same shape `_tests_/bit/examplesgate.bit` already uses for
+// `_tests_/bit/gatefanout`. `_tests_/bit/lspresolve.bit` is invoked directly
+// by `tools/build/gates.bit`'s `test-lsp-resolve` gate as a single file
+// (`bit run _tests_/bit/lspresolve.bit`), which loads it as a module of
+// exactly that one file (SPEC §17.1) — it cannot see a bare sibling `.bit`
+// file in the same directory, only a real subdirectory reached through an
+// explicit import. This file is that subdirectory.
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir } from "std/fs"
+import { parseInt } from "std/strings"
+
+// Wall clock for one `bit lsp` scenario: fork+exec plus a small JSON-RPC
+// batch, milliseconds in practice on an idle box. The old hardcoded 20000
+// had no way to widen and its own failure message lied about
+// `BIT_TEST_TIMEOUT_S` doing so (#3685 measured this firing under fleet
+// load) — this now actually reads it, the same knob every sibling harness in
+// _tests_/bit/ honors (tools/build/gatesexec.bit threads it to every gate).
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "300")) catch _ {
+    300
+  }
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+export fn failCase(msg: string) {
+  eprint("FAIL lspresolve: " + msg + "\n")
+  exit(1)
+}
+
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+export fn frame(body: string): string {
+  return "Content-Length: ${len(body)}\r\n\r\n" + body
+}
+
+export fn mkdirQuiet(path: string) {
+  mkdir(path) catch e {
+    return
+  }
+}
+
+export fn runLsp(bin: string, scratch: string, payload: string): (int, string, bool) {
+  mkdirQuiet(scratch)
+  let inPath = scratch + "/in"
+  let outPath = scratch + "/out"
+  let errPath = scratch + "/err"
+  let shPath = scratch + "/w.sh"
+  writeFile(inPath, payload) catch e {
+    failCase("cannot write input payload: " + e.message())
+    return 0, "", false
+  }
+  // `osRunBounded` does not forward this process's environment to the
+  // child, so a scenario that imports std/* (#2330) needs BIT_STDLIB
+  // exported explicitly — _tests_/bit/golden.bit's own idiom.
+  let stdlib = env("BIT_STDLIB")
+  let envLines = ""
+  if (stdlib != "") {
+    envLines = "BIT_STDLIB=" + shQuote(stdlib) + "\nexport BIT_STDLIB\n"
+  }
+  let script = "#!/bin/sh\n" +
+    envLines +
+    "exec " +
+    shQuote(bin) +
+    " lsp < " +
+    shQuote(inPath) +
+    " > " +
+    shQuote(outPath) +
+    " 2> " +
+    shQuote(errPath) +
+    "\n"
+  writeFile(shPath, script) catch e {
+    failCase("cannot write wrapper script: " + e.message())
+    return 0, "", false
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    failCase("cannot chmod wrapper script")
+    return 0, "", false
+  }
+  let code = osRunBounded(shPath, timeoutMs())
+  if (code == 0 - 2) {
+    failCase("TIMED OUT after ${timeoutMs()}ms (raise BIT_TEST_TIMEOUT_S)")
+    return 0, "", false
+  }
+  if (code == 0 - 1) {
+    failCase("cannot launch wrapper script (spawn/wait failure)")
+    return 0, "", false
+  }
+  if (code <= 0 - 100) {
+    failCase("CRASHED: killed by signal ${0 - code - 100}")
+    return 0, "", false
+  }
+  let out = readFile(outPath) catch e {
+    ""
+  }
+  return code, out, true
+}
+
+// Escapes `s` for embedding as a JSON string literal's body. Narrow on
+// purpose: the only bytes the fixture source texts in this file ever contain
+// are '"', '\' and '\n'.
+export fn jsonEscape(s: string): string {
+  let out = ""
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == u8('"')) {
+      out = out + "\\\""
+    } else if (c == u8('\\')) {
+      out = out + "\\\\"
+    } else if (c == u8('\n')) {
+      out = out + "\\n"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out
+}
+
+export fn contains(haystack: string, needle: string): bool {
+  let n = len(needle)
+  if (n == 0) {
+    return true
+  }
+  let i = 0
+  while (i + n <= len(haystack)) {
+    if (haystack[i:i + n] == needle) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// How many (non-overlapping-scan) occurrences of `needle` appear in
+// `haystack` — the negative half of a rename check needs a COUNT, not just a
+// presence check: a handler that renamed every `title` in the project would
+// still make `contains` true for each of the 4 wanted edits.
+export fn countOccurrences(haystack: string, needle: string): int {
+  let n = len(needle)
+  if (n == 0) {
+    return 0
+  }
+  let count = 0
+  let i = 0
+  while (i + n <= len(haystack)) {
+    if (haystack[i:i + n] == needle) {
+      count = count + 1
+      i = i + n
+    } else {
+      i = i + 1
+    }
+  }
+  return count
+}
+
+// #2327: hover on a class field resolves against the receiver's type, not a
+// same-named unrelated variable in a sibling file.
+// #2334: textDocument/rename on a class field renames its declaration, every
+// `recv.field` use (including one folded inside a string interpolation, and
+// cross-file), and its own KEY in a composite literal — but never the VALUE
+// half of `title: title`, which happens to share the field's spelling only
+// because it is initialized from a same-named parameter. That parameter's own
+// declaration and its use are the negative half: a handler that renamed every
+// occurrence of the spelling "title" project-wide would pass every check that
+// only looks for the 4 wanted edits, so this asserts their absence too.
+// Writes the fixture, sends the JSON-RPC session (initialize, both didOpens,
+// prepareRename, then rename), and returns the raw output — split out of
+// `checkRenameField` to keep both functions under the repo's 80-line
+// `max-fn-lines` limit (E0201).
+export fn runRenameFieldSession(bin: string, scratchRoot: string): (string, bool) {
+  let dir = scratchRoot + "/rename"
+  mkdirQuiet(dir)
+  let taskPath = dir + "/task.bit"
+  let mainPath = dir + "/main.bit"
+  let task = "class Task {\n  title: string,\n\n  label(): string {\n    return \"task: \${this.title}\"\n  }\n}\n\n" +
+    "fn newTask(title: string): Task {\n  return Task{ title: title }\n}\n"
+  let main2 = "fn show(t: Task) {\n  let x = t.title\n}\n"
+  writeFile(taskPath, task) catch e {
+    failCase("cannot write ${taskPath}: " + e.message())
+    return "", false
+  }
+  writeFile(mainPath, main2) catch e {
+    failCase("cannot write ${mainPath}: " + e.message())
+    return "", false
+  }
+  let tUri = "file://" + taskPath
+  let mUri = "file://" + mainPath
+  let initReq = frame(
+      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"," +
+      "\"params\":{\"processId\":null,\"rootUri\":null,\"capabilities\":{}}}",
+  )
+  let initNotif = frame("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}")
+  let openTask = frame(
+      "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+      "\"textDocument\":{\"uri\":\"${tUri}\",\"languageId\":\"bit\",\"version\":1," +
+      "\"text\":\"" +
+      jsonEscape(task) +
+      "\"}}}",
+  )
+  let openMain = frame(
+      "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+      "\"textDocument\":{\"uri\":\"${mUri}\",\"languageId\":\"bit\",\"version\":1," +
+      "\"text\":\"" +
+      jsonEscape(main2) +
+      "\"}}}",
+  )
+  // task.bit line 1 (0-based) "  title: string,": the field's own declaration,
+  // character 2.
+  let prepareReq = frame(
+      "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/prepareRename\"," +
+      "\"params\":{\"textDocument\":{\"uri\":\"${tUri}\"},\"position\":{\"line\":1,\"character\":2}}}",
+  )
+  let renameReq = frame(
+      "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/rename\"," +
+      "\"params\":{\"textDocument\":{\"uri\":\"${tUri}\"},\"position\":{\"line\":1,\"character\":2}," +
+      "\"newName\":\"heading\"}}",
+  )
+  let payload = initReq + initNotif + openTask + openMain + prepareReq + renameReq
+  let (code, out, ok) = runLsp(bin, dir, payload)
+  return out, ok
+}
+
+// The `"id":3` reply's own tail of `out` — isolating it (rather than
+// searching the whole transcript) is what lets the edit COUNT and the
+// excluded-position checks below tell a real edit apart from, say, the
+// unrelated `"id":2` prepareRename reply also naming line 1 character 2.
+export fn renameResultTail(out: string): string {
+  let idx3 = 0
+  while (idx3 + 7 <= len(out) && out[idx3:idx3 + 7] != "\"id\":3,") {
+    idx3 = idx3 + 1
+  }
+  return out[idx3:len(out)]
+}
+
+// The id2 (prepareRename)/id3 (rename) presence checks — split out of
+// `checkRenameField` to keep both under the repo's complexity limit (E0204)
+// now that the negative-space assertions have joined it.
+export fn assertRenameRepliesPresent(out: string): bool {
+  if (!contains(out, "\"id\":2") || contains(out, "\"id\":2,\"result\":null")) {
+    failCase("rename field: prepareRename on the declaration returned null\n" + out)
+    return false
+  }
+  if (!contains(out, "\"id\":3") || contains(out, "\"id\":3,\"result\":null")) {
+    failCase("rename field: rename returned null instead of a WorkspaceEdit\n" + out)
+    return false
+  }
+  return true
+}
+
+// The positive half (the 4 wanted edits) and the negative half (the 2
+// excluded positions, the same-spelling parameter's declaration and its use
+// as the composite literal's VALUE) — split out of `checkRenameField` for the
+// same reason as `assertRenameRepliesPresent`.
+export fn assertRenameEditPositions(edit3: string, out: string): bool {
+  if (!contains(edit3, "\"line\":1,\"character\":2}")) {
+    failCase("rename field: missing the edit at the field's own declaration\n" + out)
+    return false
+  }
+  if (!contains(edit3, "\"line\":9,\"character\":15}")) {
+    failCase("rename field: missing the edit at the composite literal's KEY\n" + out)
+    return false
+  }
+  if (!contains(edit3, "\"line\":4,\"character\":25}")) {
+    failCase("rename field: missing the edit at task.bit's member access\n" + out)
+    return false
+  }
+  if (!contains(edit3, "\"line\":1,\"character\":12}")) {
+    failCase("rename field: missing the edit at main.bit's cross-file member access\n" + out)
+    return false
+  }
+  if (contains(edit3, "\"line\":8,\"character\":11}")) {
+    failCase("rename field: wrongly touched the unrelated parameter's declaration\n" + out)
+    return false
+  }
+  if (contains(edit3, "\"line\":9,\"character\":22}")) {
+    failCase(
+        "rename field: wrongly touched the composite literal's VALUE " +
+        "(the parameter reference), not just its KEY\n" +
+        out,
+    )
+    return false
+  }
+  return true
+}
+// #3742: field shorthand (#3735, `P{ db }` for `db: db`) desugars into TWO
+// nodes sharing one span — the field's key and the shorthand's synthesized
+// value both cover the same "db" token (compiler/parserexpr.bit:169). A
+// naive rename that emits one text edit over that shared span corrupts
+// whichever half it does not intend to touch, so both directions below must
+// instead expand the shorthand to its explicit keyed form.
+fn shorthandFixtureSrc(): string {
+  return "class P {\n  db: int,\n}\n\n" + "fn make(): P {\n  let db = 1\n  return P{ db }\n}\n"
+}
+
+// Writes the shared fixture into `dir` and drives one rename request at
+// (line, ch) — split out so both directions below reuse one session shape.
+export fn runRenameShorthandSession(
+  bin: string,
+  dir: string,
+  line: int,
+  ch: int,
+  newName: string,
+): (string, bool) {
+  mkdirQuiet(dir)
+  let path = dir + "/p.bit"
+  let src = shorthandFixtureSrc()
+  writeFile(path, src) catch e {
+    failCase("cannot write ${path}: " + e.message())
+    return "", false
+  }
+  let uri = "file://" + path
+  let initReq = frame(
+      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"," +
+      "\"params\":{\"processId\":null,\"rootUri\":null,\"capabilities\":{}}}",
+  )
+  let initNotif = frame("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}")
+  let openDoc = frame(
+      "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+      "\"textDocument\":{\"uri\":\"${uri}\",\"languageId\":\"bit\",\"version\":1," +
+      "\"text\":\"" +
+      jsonEscape(src) +
+      "\"}}}",
+  )
+  let renameReq = frame(
+      "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/rename\"," +
+      "\"params\":{\"textDocument\":{\"uri\":\"${uri}\"},\"position\":{\"line\":${line}," +
+      "\"character\":${ch}},\"newName\":\"${newName}\"}}",
+  )
+  let payload = initReq + initNotif + openDoc + renameReq
+  let (code, out, ok) = runLsp(bin, dir, payload)
+  return out, ok
+}
+
+// The `"id":2` rename reply must contain the expanded two-part edit, never a
+// naked `newName` over the shared span — that would silently corrupt the
+// half not being renamed. `plainCount` is how many ordinary edits (the
+// renamed symbol's own declaration) should carry `newName` verbatim.
+export fn assertShorthandExpanded(
+  out: string,
+  label: string,
+  expanded: string,
+  plain: string,
+  plainCount: int,
+): bool {
+  if (!contains(out, "\"id\":2") || contains(out, "\"id\":2,\"result\":null")) {
+    failCase("${label}: rename returned null instead of a WorkspaceEdit\n" + out)
+    return false
+  }
+  if (!contains(out, "\"newText\":\"${expanded}\"")) {
+    failCase("${label}: shorthand site was not expanded to '${expanded}'\n" + out)
+    return false
+  }
+  if (countOccurrences(out, "\"newText\":\"${plain}\"") != plainCount) {
+    failCase("${label}: expected exactly ${plainCount} plain '${plain}' edit(s)\n" + out)
+    return false
+  }
+  return true
+}

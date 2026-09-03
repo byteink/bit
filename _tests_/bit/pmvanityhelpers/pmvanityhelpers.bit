@@ -1,0 +1,284 @@
+// _tests_/bit/pmvanityhelpers — the wrapper-script plumbing, JSON assertion
+// helpers and small string utilities `_tests_/bit/pmvanity.bit` needs, split
+// out under #4183 (spec/LINT.md:186's 800-line E0200 limit; pmvanity.bit was
+// at 800). A pure move: every declaration below is byte-identical to what
+// pmvanity.bit carried before the split, only the reserved exit codes and
+// the timeout constant moved along with the one function set that reads
+// them (runBitCli/rejectWrapperFailure/runScript/mustSucceed).
+//
+// A real directory module, imported via a plain relative path
+// (`import { ... } from "./pmvanityhelpers"`) from `_tests_/bit/pmvanity.bit`
+// — the same shape `_tests_/bit/examplesgate.bit` already uses for
+// `_tests_/bit/gatefanout`. `_tests_/bit/pmvanity.bit` is invoked directly
+// by `tools/build/gates.bit`'s `test-pmvanity` gate as a single file
+// (`bit run _tests_/bit/pmvanity.bit`), which loads it as a module of
+// exactly that one file (SPEC §17.1) — it cannot see a bare sibling `.bit`
+// file in the same directory, only a real subdirectory reached through an
+// explicit import. This file is that subdirectory.
+import { exists, readFile, remove, writeFile } from "std/fs"
+import { exit } from "std/os"
+import { base as pathBase, dir as pathDir } from "std/path"
+import { Json, jsonGet, jsonAsString, jsonParse, jsoncParse } from "std/json"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// Wall-clock ceiling on any one subprocess — the same budget
+// pmimports.bit's cold `bit run` case uses, and everything this file runs
+// (one local git fixture build, one local HTTP round trip, one local git
+// fetch, one compile+link+run) is far below it on a healthy host.
+const subprocessTimeoutMs: int = 120000
+
+// The wrapper script's own reserved exit codes — a harness break, never the
+// compiler under test disagreeing (pmimports.bit carries the identical set;
+// see its own header for why each one is named rather than folded into a
+// generic nonzero check).
+const rcCdFailed: int = 111
+const rcBitNotExecutable: int = 112
+const rcStdlibUnresolvable: int = 113
+const rcBitDirUnresolvable: int = 114
+export const rcGitAbsent: int = 121
+
+// `osRunBounded`'s timed-out sentinel (runtime/root/, ABI.md §19).
+const rcTimedOut: int = -2
+
+export fn mustParseJsonc(name: string, what: string, text: string): Json {
+  return jsoncParse(text) catch e {
+    fatal(name, "cannot parse ${what}: " + e.message())
+    Json.JsonNull
+  }
+}
+
+export fn mustParseJson(name: string, what: string, text: string): Json {
+  return jsonParse(text) catch e {
+    fatal(name, "cannot parse ${what}: " + e.message())
+    Json.JsonNull
+  }
+}
+
+export fn mustJsonGet(name: string, what: string, container: Json, key: string): Json {
+  let v = jsonGet(container, key)
+  if (!isSome(v)) {
+    fatal(name, "${what} has no '${key}' field")
+  }
+  return unwrap(v)
+}
+
+export fn mustJsonString(name: string, what: string, container: Json, key: string): string {
+  let v = mustJsonGet(name, what, container, key)
+  let s = jsonAsString(v)
+  if (!isSome(s)) {
+    fatal(name, "${what}'s '${key}' field is not a JSON string")
+  }
+  return unwrap(s)
+}
+
+// --- driving the CLI ------------------------------------------------------
+
+// Runs `<bitExe> <args...>` with `projDir` as its working directory and a
+// SEALED environment (`/usr/bin/env -i`), same discipline as
+// pmimports.bit's own `runBitCli` — plus `extraEnv`, the `KEY=VALUE` pairs
+// this file's vanity/git-rewrite plumbing needs that the warm-cache-only
+// sibling gate never did.
+export fn runBitCli(
+  name: string, bitExe: string, stdRoot: string, projDir: string,
+  pkgCache: string, extraEnv: []string, args: []string, outPath: string, errPath: string,
+): Run {
+  let cmd = "\"$BIT\""
+  let i = 0
+  while (i < len(args)) {
+    cmd = cmd + " " + shQuote(args[i])
+    i = i + 1
+  }
+
+  let extra = ""
+  let j = 0
+  while (j < len(extraEnv)) {
+    let eq = indexOfByte(extraEnv[j], '=')
+    if (eq >= 0) {
+      extra = extra + " " + extraEnv[j][0:eq] + "=" + shQuote(extraEnv[j][eq + 1:len(extraEnv[j])])
+    }
+    j = j + 1
+  }
+
+  let body = "BITDIR=$(cd " +
+    shQuote(pathDir(bitExe)) +
+    " && pwd) || exit ${rcBitDirUnresolvable}\n" +
+    "BIT=\"$BITDIR\"/" +
+    shQuote(pathBase(bitExe)) +
+    "\n" +
+    "[ -x \"$BIT\" ] || exit ${rcBitNotExecutable}\n" +
+    "STD=$(cd " +
+    shQuote(stdRoot) +
+    " && pwd) || exit ${rcStdlibUnresolvable}\n" +
+    "cd " +
+    shQuote(projDir) +
+    " || exit ${rcCdFailed}\n" +
+    "exec /usr/bin/env -i" +
+    " PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin" +
+    " TMPDIR=/tmp BIT_STDLIB=\"$STD\" BIT_PKG_CACHE=" +
+    shQuote(pkgCache) +
+    extra +
+    " " +
+    cmd +
+    " > " +
+    shQuote(outPath) +
+    " 2> " +
+    shQuote(errPath) +
+    "\n"
+
+  let code = runScript(name, body)
+  if (code == rcTimedOut) {
+    fatal(
+      name,
+      "`bit ${args[0]}` TIMED OUT after ${subprocessTimeoutMs}ms — a hang is a failure, not a stall",
+    )
+  }
+  rejectWrapperFailure(name, code)
+  if (!exists(outPath) || !exists(errPath)) {
+    fatal(
+      name,
+      "the wrapper exited ${code} without creating its capture files — it never launched the compiler",
+    )
+  }
+  let out = readFile(outPath) catch e {
+    fatal(name, "cannot read captured stdout: " + e.message())
+    ""
+  }
+  let err = readFile(errPath) catch e {
+    fatal(name, "cannot read captured stderr: " + e.message())
+    ""
+  }
+  return Run{ code: code, stdout: out, stderr: err }
+}
+
+// Every code the wrapper reserves for its own breakage — none of them can
+// be the compiler's verdict.
+fn rejectWrapperFailure(name: string, code: int) {
+  if (code < 0) {
+    fatal(name, "the wrapper script could not be launched (osRunBounded returned ${code})")
+  }
+  if (code == rcCdFailed) {
+    fatal(name, "wrapper: cd into the project directory failed")
+  }
+  if (code == rcBitNotExecutable) {
+    fatal(name, "wrapper: the compiler under test is not executable")
+  }
+  if (code == rcStdlibUnresolvable) {
+    fatal(name, "wrapper: the stdlib root could not be resolved to an absolute path")
+  }
+  if (code == rcBitDirUnresolvable) {
+    fatal(name, "wrapper: the compiler's directory could not be resolved to an absolute path")
+  }
+  if (code == 126) {
+    fatal(name, "wrapper: /bin/sh reported a command found but not executable (126)")
+  }
+  if (code == 127) {
+    fatal(name, "wrapper: /bin/sh reported a command not found (127) — the compiler never ran")
+  }
+}
+
+// --- shell plumbing -------------------------------------------------------
+
+fn runScript(name: string, body: string): int {
+  let path = "/tmp/bit-pmvanity-" + uuidFormat(uuidV4()) + ".sh"
+  writeFile(path, "#!/bin/sh\n" + body) catch e {
+    fatal(name, "cannot write the wrapper script: " + e.message())
+  }
+  if (fsChmod(path, 448) != 0) { // 0o700: owner rwx only
+    fatal(name, "cannot make the wrapper script executable: ${path}")
+  }
+  let code = osRunBounded(path, subprocessTimeoutMs)
+  removeQuiet(path)
+  return code
+}
+
+export fn mustSucceed(name: string, what: string, body: string) {
+  let code = runScript(name, body)
+  if (code == rcTimedOut) {
+    fatal(name, "fixture setup (${what}) TIMED OUT after ${subprocessTimeoutMs}ms")
+  }
+  if (code == rcGitAbsent) {
+    fatal(name, "fixture setup (${what}) needs `git` on PATH and it is not there")
+  }
+  if (code != 0) {
+    fatal(name, "fixture setup (${what}) exited ${code}, want 0")
+  }
+}
+
+export fn mkdirp(name: string, path: string) {
+  mustSucceed(name, "mkdir -p ${path}", "set -e\nmkdir -p " + shQuote(path) + "\n")
+}
+
+export fn rmrf(path: string) {
+  let code = runScript("cleanup", "rm -rf " + shQuote(path) + "\n")
+  if (code != 0) {
+    print("note: could not remove the scratch tree ${path} (rm exited ${code})\n")
+  }
+}
+
+fn removeQuiet(path: string) {
+  remove(path) catch e {
+    return
+  }
+}
+
+// Wraps `s` as one POSIX `/bin/sh` word: every embedded `'` becomes `'\''`.
+export fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == '\'') {
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+fn indexOfByte(s: string, c: byte): int {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == c) {
+      return i
+    }
+    i = i + 1
+  }
+  return 0 - 1
+}
+
+// --- small shared helpers ---------------------------------------------
+
+export fn isFullSha(s: string): bool {
+  if (len(s) != 40) {
+    return false
+  }
+  let i = 0
+  while (i < 40) {
+    let c = s[i]
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+export fn trimEol(s: string): string {
+  let n = len(s)
+  while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
+    n = n - 1
+  }
+  return s[0:n]
+}
+
+export fn fatal(name: string, msg: string) {
+  print("FAIL [${name}]: ${msg}\n")
+  exit(1)
+}
+
+// The wrapper subprocess's captured result — moved alongside the functions
+// that build it (runBitCli's return type), since pmvanity.bit's own
+// `checkVanityAdd`/`checkVanityAddSubdir` only ever receive a `Run` value
+// back from `runBitCli`, never construct one themselves.
+export class Run { code: int, stdout: string, stderr: string }
