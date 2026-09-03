@@ -1,0 +1,617 @@
+// #4243. `test-lint-complexity` (E0201 max-fn-lines, E0202 max-params, E0204
+// max-complexity) is scoped to PRODUCTION code only -- runtime/, compiler/,
+// stdlib/, tools/, pkg/ (_tests_/bit/lintcomplexity.bit's own header: #3543,
+// one malformed fixture corpus discards every finding for every OTHER file
+// in the same `bit lint` invocation). Its sibling `test-lint-filelines`
+// covers the three _tests_/ trees but checks ONLY E0200 (file size) -- so a
+// fn-lines/param-count/complexity violation under _tests_/stress/,
+// _tests_/bit/ or _tests_/imports/ was silent debt no gate caught at all,
+// exactly the shape #4135 found in gcslotbitmap.bit, discovered only
+// because a PM audit happened to lint that one file by hand.
+//
+// THE DEBT IS TOO LARGE FOR A HARD ZERO: 167 findings across 96 files were
+// already present when this gate was written (measured on merged `main` @
+// acd69411): 75 in _tests_/stress/ (33 E0201, 8 E0202, 34 E0204), 70 in
+// _tests_/bit/ (19 E0201, 28 E0202, 23 E0204), 22 in _tests_/imports/ (7
+// E0201, 7 E0202, 8 E0204). A hard-zero gate would be red on day one and get
+// ignored -- the same reasoning _tests_/bit/lintcomplexity.bit's own header
+// gives for its 282-entry complexity-debt.txt.
+//
+// So this follows _tests_/bit/fmtzerocheck.bit's two-way-assertion shape
+// (#3713) rather than a count: a NAMED debt list of repo-relative file
+// paths, BIT_LINTTESTS_DEBT, space-separated -- not a per-function baseline
+// like lintcomplexity.bit's complexity-debt.txt. Identity is the FILE,
+// deliberately: unlike E0204's production-only population (top-level
+// `fn`/`export fn` only), E0201/E0202 walk EVERY function-shaped node,
+// including class methods and anonymous arrow functions
+// (compiler/lintapply.bit's lintCollectFuncs) -- arrow functions have no
+// name a per-function key could use. The two-way assertion:
+//   - a live E0201/E0202/E0204 finding in a file NOT on the debt list is a
+//     hard failure, regardless of how many OTHER findings that file already
+//     has debt for;
+//   - a debt entry with NO live finding of any of the three codes anywhere
+//     in it is ALSO a hard failure (stale -- the file was fixed and nobody
+//     removed the entry), the identical self-cleaning contract
+//     fmtzerocheck.bit enforces for BIT_FMTZERO_DEBT.
+// New debt needs a real ticket and its own entry, never a raised count; the
+// list only ever shrinks or holds steady, never grows without one.
+//
+// SCOPE: _tests_/stress/, _tests_/bit/, _tests_/imports/ ONLY -- the three
+// _tests_/ trees test-lint-complexity does not cover. compiler/, runtime/,
+// stdlib/, tools/ and pkg/ stay test-lint-complexity's territory; examples/
+// and _tests_/cases/ belong to neither gate (see lintfilelines.bit's header
+// for why _tests_/cases/ must stay excluded forever -- its own E0200
+// boundary fixtures -- a reason unrelated to but as firm as this one).
+//
+// _tests_/bit/checkercases/ and _tests_/bit/parsercases/ are FIXTURE
+// CORPORA, exactly the distinction _tests_/bit/lintfilelines.bit's own
+// isFixtureCorpus draws (a directory holding at least one `.expected` file)
+// -- the walk below (isFixtureCorpus/hasFixtureCorpus/walkChildren/
+// collectLintTargets/collectRootTargets/countBitFiles) is ported from that
+// file unchanged rather than imported: _tests_/bit/*.bit harnesses are each
+// self-contained (see e.g. shell()/requiredEnv()/trimWs() duplicated
+// verbatim across lintcomplexity.bit, lintfilelines.bit and
+// fmtzerocheck.bit already), and this repo's own lesson on splitting a
+// working, already-gated file for an unrelated ticket is: don't. Several
+// checkercases/parsercases .bit files are deliberately malformed and make
+// `bit lint` exit 2 (untrusted run), which this gate would otherwise
+// mistake for a real failure. Every .bit file beneath _tests_/bit/ is still
+// counted for the denominator; fixture-corpus files are never handed to
+// `bit lint` and are reported as skipped. _tests_/stress/ and
+// _tests_/imports/ get NO such exclusion -- lintfilelines.bit's header
+// explains why the same generic property would be WRONG there (an
+// `.expected` file beside nearly every _tests_/stress/ subdirectory is a
+// stress-test oracle, not a lint-hostile fixture corpus).
+//
+// THE DENOMINATOR IS PRINTED ON PURPOSE, per tree: "N of N .bit file(s)
+// scanned" (plus a skipped count where nonzero) so a shrunk corpus cannot
+// pass looking full. `N` is computed by a hand-rolled walk independent of
+// `bit lint`'s own file collector, and `scanTree` below asserts the two
+// agree before trusting either -- the same anti-vacuity shape every sibling
+// lint gate in this directory uses.
+//
+// Run it from the repository root:
+//     ./bit-out/bin/bit run _tests_/bit/linttests.bit
+// BIT_SELF_EXE and BIT_REPO are required, same as every sibling lint gate --
+// a missing one is a hard stop, not a silently different (and silently
+// green) scope. BIT_LINTTESTS_DEBT is optional; absent or empty means a
+// true hard zero, no exceptions at all.
+import { env, envOr, exit } from "std/os"
+import { exists, isDir, mkdir, readDir, readFile, writeFile } from "std/fs"
+import { hasPrefix, hasSuffix, parseInt, replace, split, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+import { Json, jsonAsArray, jsonAsInt, jsonAsString, jsonGet, jsonParse } from "std/json"
+
+// Power of 10 rule 2: every walk below has a statically bounded depth and a
+// bounded per-directory fan-out, not merely a hope of termination.
+const maxEntries: int = 4096
+const maxScanDepth: int = 16
+const defaultTimeoutS: int = 300
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "${defaultTimeoutS}")) catch _ {
+    defaultTimeoutS
+  }
+  if (s <= 0) {
+    return defaultTimeoutS * 1000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s mechanism channel, never a program exit status, so
+// each one is a named panic rather than a value any assertion could consume.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("linttests: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("linttests: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("linttests: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("linttests: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+fn requiredEnv(name: string): string! {
+  let v = env(name)
+  if (len(v) == 0) {
+    fail newError("linttests: ${name} is required and was not set")
+  }
+  return v
+}
+
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+class Config { bit: string, repo: string, debt: []string }
+
+fn parseDebtList(raw: string): []string {
+  let out = []string(0)
+  for tok of split(raw, " ") {
+    let t = trimSpace(tok)
+    if (len(t) > 0) {
+      out = append(out, t)
+    }
+  }
+  return out
+}
+
+fn loadConfig(): Config! {
+  let bit = requiredEnv("BIT_SELF_EXE")?
+  let repo = requiredEnv("BIT_REPO")?
+  let debt = parseDebtList(envOr("BIT_LINTTESTS_DEBT", ""))
+  return Config{ bit: bit, repo: repo, debt: debt }
+}
+
+fn containsStr(xs: []string, s: string): bool {
+  for x of xs {
+    if (x == s) {
+      return true
+    }
+  }
+  return false
+}
+
+// ---- fixture-corpus-aware tree walk, ported from lintfilelines.bit -------
+
+// Whether `names` (one directory's listing) marks that directory as a
+// FIXTURE CORPUS: a directory holding at least one `.expected` file is a
+// `.bit`/`.expected` pair corpus consumed by test-checker-diag/test-parser,
+// not a harness `bit lint` can safely run over.
+fn isFixtureCorpus(names: []string): bool {
+  for name of names {
+    if (hasSuffix(name, ".expected")) {
+      return true
+    }
+  }
+  return false
+}
+
+fn countBitFiles(dir: string, depth: int): int {
+  if (depth <= 0) {
+    panic("linttests: ${dir} nesting exceeds ${maxScanDepth} levels")
+  }
+  let names = readDir(dir) catch e {
+    panic("linttests: cannot list ${dir}: ${e.message()}")
+  }
+  if (len(names) > maxEntries) {
+    panic("linttests: ${dir} has ${len(names)} entries, over the ${maxEntries} bound")
+  }
+  let n = 0
+  for name of names {
+    let path = "${dir}/${name}"
+    if (isDir(path)) {
+      n = n + countBitFiles(path, depth - 1)
+    } else if (hasSuffix(name, ".bit")) {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+fn hasFixtureCorpus(dir: string, depth: int): bool {
+  if (depth <= 0) {
+    panic("linttests: ${dir} nesting exceeds ${maxScanDepth} levels")
+  }
+  let names = readDir(dir) catch e {
+    panic("linttests: cannot list ${dir}: ${e.message()}")
+  }
+  if (isFixtureCorpus(names)) {
+    return true
+  }
+  for name of names {
+    let path = "${dir}/${name}"
+    if (isDir(path) && hasFixtureCorpus(path, depth - 1)) {
+      return true
+    }
+  }
+  return false
+}
+
+// What `collectLintTargets` (below) found: `paths` are the absolute
+// files/directories to hand `bit lint`, `files` is every `.bit` file
+// visited (fixture-corpus ones included), `skipped` is the subset inside a
+// fixture corpus that were never linted.
+class LintTargets { paths: []string, files: int, skipped: int }
+
+fn walkChildren(dir: string, names: []string, depth: int): LintTargets {
+  let paths = []string(0)
+  let files = 0
+  let skipped = 0
+  for name of names {
+    let path = "${dir}/${name}"
+    if (isDir(path)) {
+      if (hasFixtureCorpus(path, depth - 1)) {
+        let sub = collectLintTargets(path, depth - 1)
+        for p of sub.paths {
+          paths = append(paths, p)
+        }
+        files = files + sub.files
+        skipped = skipped + sub.skipped
+      } else {
+        let n = countBitFiles(path, depth - 1)
+        files = files + n
+        if (n > 0) {
+          paths = append(paths, path)
+        }
+      }
+    } else if (hasSuffix(name, ".bit")) {
+      paths = append(paths, path)
+      files = files + 1
+    }
+  }
+  return LintTargets{ paths: paths, files: files, skipped: skipped }
+}
+
+fn collectLintTargets(dir: string, depth: int): LintTargets {
+  if (depth <= 0) {
+    panic("linttests: ${dir} nesting exceeds ${maxScanDepth} levels")
+  }
+  let names = readDir(dir) catch e {
+    panic("linttests: cannot list ${dir}: ${e.message()}")
+  }
+  if (len(names) > maxEntries) {
+    panic("linttests: ${dir} has ${len(names)} entries, over the ${maxEntries} bound")
+  }
+  if (isFixtureCorpus(names)) {
+    let n = countBitFiles(dir, depth)
+    return LintTargets{ paths: []string(0), files: n, skipped: n }
+  }
+  return walkChildren(dir, names, depth)
+}
+
+// The scan root's own entry point: reads `dir`'s listing and walks its
+// children directly, WITHOUT ever asking whether `dir` itself is a fixture
+// corpus (_tests_/bit/testloc.bit and testpanic.bit carry a same-named
+// `.expected` oracle directly at top level -- an unrelated harness-output
+// convention, not a fixture corpus; see lintfilelines.bit's header).
+fn collectRootTargets(dir: string, depth: int): LintTargets {
+  if (depth <= 0) {
+    panic("linttests: ${dir} nesting exceeds ${maxScanDepth} levels")
+  }
+  let names = readDir(dir) catch e {
+    panic("linttests: cannot list ${dir}: ${e.message()}")
+  }
+  if (len(names) > maxEntries) {
+    panic("linttests: ${dir} has ${len(names)} entries, over the ${maxEntries} bound")
+  }
+  return walkChildren(dir, names, depth)
+}
+
+// The fixture-corpus exclusion is scoped to `_tests_/bit/` ONLY, by
+// directory name -- not a generic "does this tree contain a `.expected`
+// file anywhere" property, which would wrongly exclude _tests_/stress/
+// wholesale (lintfilelines.bit's header documents catching exactly that
+// regression). Every other tree keeps a plain, unconditional single-path
+// scan.
+fn lintTargetsFor(dirName: string, full: string, depth: int): LintTargets {
+  if (dirName != "_tests_/bit") {
+    return LintTargets{ paths: [full], files: countBitFiles(full, depth), skipped: 0 }
+  }
+  return collectRootTargets(full, depth)
+}
+
+// ---- `bit lint --json <targets...>` -------------------------------------
+
+class Run { code: int, out: string, err: string }
+
+fn quotedPaths(paths: []string): string {
+  let out = ""
+  for p of paths {
+    out = out + " '${p}'"
+  }
+  return out
+}
+
+fn runLintJson(bit: string, absDirs: []string, capDir: string, ms: int): Run! {
+  let outPath = "${capDir}/out.json"
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  let script = "#!/bin/sh\n" +
+    "'${bit}' lint --json" +
+    quotedPaths(absDirs) +
+    " > '${outPath}' 2> '${errPath}'\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/lint.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("linttests: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("linttests: no exit code was recorded -- the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, out: readFile(outPath)?, err: readFile(errPath)? }
+}
+
+// `r` is a usable observation of a real run, not silence mistaken for a
+// clean sheet. `bit lint` always prints a summary to stderr, clean or not.
+// Exit 2 is SPEC's own "could not be trusted" verdict -- unreachable here
+// because fixture corpora are excluded from every target list above; a
+// panic rather than a graceful skip is deliberate, since it means the
+// exclusion above has a hole.
+fn assertTrustworthy(r: Run, label: string) {
+  if (len(r.err) == 0) {
+    panic("linttests: stderr is empty -- `bit lint` produced no summary for ${label}")
+  }
+  if (r.code == 2) {
+    panic("linttests: `bit lint` exited 2 (untrusted run) over ${label}:\n${r.err}")
+  }
+  if (r.code != 0 && r.code != 1) {
+    panic("linttests: `bit lint` exited ${r.code} over ${label}, want 0 or 1")
+  }
+}
+
+fn jsonField(o: Json, key: string): string {
+  let f = jsonGet(o, key)
+  if (isNone(f)) {
+    return "<missing>"
+  }
+  return unwrapOr(jsonAsString(unwrap(f)), "<not-a-string>")
+}
+
+fn jsonInt(o: Json, key: string): int {
+  let f = jsonGet(o, key)
+  if (isNone(f)) {
+    return -1
+  }
+  return unwrapOr(jsonAsInt(unwrap(f)), -1)
+}
+
+// One E0201/E0202/E0204 finding, resolved to the identity this gate
+// ratchets: the file (repo-relative), its code, and the 1-based line for a
+// readable FAIL report -- no function name is resolved (unlike
+// lintcomplexity.bit's per-function debt): E0201/E0202 findings can land on
+// an anonymous arrow function, which has none.
+class Finding { file: string, code: string, line: int }
+
+fn isTargetCode(code: string): bool {
+  return code == "E0201" || code == "E0202" || code == "E0204"
+}
+
+fn stripRepoPrefix(file: string, repo: string): string! {
+  let prefix = "${repo}/"
+  if (!hasPrefix(file, prefix)) {
+    fail newError("linttests: finding path outside ${repo}: ${file}")
+  }
+  return file[len(prefix):]
+}
+
+fn findingFromJson(d: Json, repo: string): Finding! {
+  let rawFile = jsonField(d, "file")
+  let file = stripRepoPrefix(rawFile, repo)?
+  let code = jsonField(d, "code")
+  let range = jsonGet(d, "range")
+  if (isNone(range)) {
+    fail newError("linttests: finding in ${rawFile} has no range")
+  }
+  let start = jsonGet(unwrap(range), "start")
+  if (isNone(start)) {
+    fail newError("linttests: finding in ${rawFile} has no range.start")
+  }
+  let line = jsonInt(unwrap(start), "line")
+  if (line < 0) {
+    fail newError("linttests: finding in ${rawFile} has an invalid range.start.line")
+  }
+  return Finding{ file: file, code: code, line: line + 1 }
+}
+
+fn extractFindings(out: string, repo: string): []Finding! {
+  let parsed = jsonParse(trimSpace(out))?
+  let arr = unwrapOr(jsonAsArray(parsed), []Json(0))
+  let result = []Finding(0)
+  for d of arr {
+    if (!isTargetCode(jsonField(d, "code"))) {
+      continue
+    }
+    result = append(result, findingFromJson(d, repo)?)
+  }
+  return result
+}
+
+// ---- per-tree scan + two-way debt assertion ------------------------------
+
+class ScanCtx { bit: string, repo: string, capDir: string, ms: int }
+
+class TreeResult { dir: string, filesTotal: int, skipped: int, findings: []Finding }
+
+fn scanTree(ctx: ScanCtx, dirName: string): TreeResult {
+  let full = "${ctx.repo}/${dirName}"
+  if (!exists(full)) {
+    panic("linttests: no such directory: ${full}")
+  }
+  let filesTotal = countBitFiles(full, maxScanDepth)
+  if (filesTotal == 0) {
+    panic("linttests: ${full} contains zero .bit files -- refusing a vacuous scan")
+  }
+  let targets = lintTargetsFor(dirName, full, maxScanDepth)
+  if (targets.files != filesTotal) {
+    panic("linttests: ${full}: two independent walks disagree on the file count (${filesTotal} vs ${targets.files}) -- refusing to trust either")
+  }
+  if (len(targets.paths) == 0) {
+    return TreeResult{ dir: dirName, filesTotal: filesTotal, skipped: targets.skipped, findings: []Finding(0) }
+  }
+  let subDir = "${ctx.capDir}/${replace(dirName, "/", "-")}"
+  mkdir(subDir) catch e {
+    panic("linttests: cannot create ${subDir}: ${e.message()}")
+  }
+  let r = runLintJson(ctx.bit, targets.paths, subDir, ctx.ms) catch e {
+    panic("linttests: ${e.message()}")
+  }
+  assertTrustworthy(r, full)
+  let findings = extractFindings(r.out, ctx.repo) catch e {
+    panic("linttests: ${e.message()}")
+  }
+  return TreeResult{ dir: dirName, filesTotal: filesTotal, skipped: targets.skipped, findings: findings }
+}
+
+// Distinct, sorted (insertion order of first sight is fine -- `debt` lookups
+// below are unordered membership tests, not a diff) files with at least one
+// qualifying finding.
+fn distinctFiles(findings: []Finding): []string {
+  let out = []string(0)
+  for f of findings {
+    if (!containsStr(out, f.file)) {
+      out = append(out, f.file)
+    }
+  }
+  return out
+}
+
+fn codeCounts(findings: []Finding): (int, int, int) {
+  let e0201 = 0
+  let e0202 = 0
+  let e0204 = 0
+  for f of findings {
+    if (f.code == "E0201") {
+      e0201 = e0201 + 1
+    } else if (f.code == "E0202") {
+      e0202 = e0202 + 1
+    } else if (f.code == "E0204") {
+      e0204 = e0204 + 1
+    }
+  }
+  return e0201, e0202, e0204
+}
+
+// Splits `files` (this tree's violating files) into (real failures, matched
+// debt). A file not on the debt list is a real failure regardless of how
+// many findings it has -- the whole point of this gate over a count.
+fn partitionDebt(files: []string, debt: []string): ([]string, []string) {
+  let real = []string(0)
+  let matched = []string(0)
+  for f of files {
+    if (containsStr(debt, f)) {
+      matched = append(matched, f)
+    } else {
+      real = append(real, f)
+    }
+  }
+  return real, matched
+}
+
+fn printFindingsFor(findings: []Finding, file: string) {
+  for f of findings {
+    if (f.file == file) {
+      eprint("    ${f.file}:${f.line} [${f.code}]\n")
+    }
+  }
+}
+
+fn denomLabel(tr: TreeResult): string {
+  if (tr.skipped > 0) {
+    return "${tr.filesTotal} of ${tr.filesTotal} .bit file(s) scanned, ${tr.skipped} skipped as fixture corpora"
+  }
+  return "${tr.filesTotal} of ${tr.filesTotal} .bit file(s) scanned"
+}
+
+// The verdict for one tree. Returns true when this tree FAILS the gate.
+fn reportTree(tr: TreeResult, debt: []string): bool {
+  let (e0201, e0202, e0204) = codeCounts(tr.findings)
+  let violating = distinctFiles(tr.findings)
+  let (real, matched) = partitionDebt(violating, debt)
+  let denom = denomLabel(tr)
+  if (len(real) > 0) {
+    eprint("lint-tests: FAIL -- ${tr.dir}/: ${denom}, ${len(tr.findings)} finding(s) (${e0201} E0201, ${e0202} E0202, ${e0204} E0204); ${len(real)} file(s) not on the known-debt list:\n")
+    for f of real {
+      printFindingsFor(tr.findings, f)
+    }
+    return true
+  }
+  if (len(matched) > 0) {
+    println("lint-tests: ${tr.dir}/: ${denom}, ${len(tr.findings)} finding(s) (${e0201} E0201, ${e0202} E0202, ${e0204} E0204), ${len(matched)} file(s) known debt -- PASS.")
+  } else {
+    println("lint-tests: ${tr.dir}/: ${denom}, 0 finding(s) -- PASS.")
+  }
+  return false
+}
+
+// Every debt entry must actually be violating somewhere in this run, or the
+// list has gone stale (the file was fixed and nobody removed its entry) --
+// the self-cleaning half of the contract fmtzerocheck.bit already enforces
+// for BIT_FMTZERO_DEBT.
+fn checkDebtFreshness(debt: []string, allViolating: []string): bool {
+  let stale = false
+  for d of debt {
+    if (!containsStr(allViolating, d)) {
+      eprint("lint-tests: FAIL -- ${d} is on the known-debt list but has no live E0201/E0202/E0204 finding; remove it.\n")
+      stale = true
+    }
+  }
+  return stale
+}
+
+fn newCapDir(): string {
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  return "${tmp}/bit-linttests-${uuidFormat(uuidV4())}"
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}
+
+fn teardown(dir: string, ms: int) {
+  shell("${dir}/rm.sh", "#!/bin/sh\nrm -rf '${dir}'\n", ms) catch _ {
+    return
+  }
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let cfg = loadConfig() catch e {
+    panic("linttests: ${e.message()}")
+  }
+  let dirNames = ["_tests_/stress", "_tests_/bit", "_tests_/imports"]
+
+  let capDir = newCapDir()
+  mkdir(capDir) catch e {
+    panic("linttests: cannot create ${capDir}: ${e.message()}")
+  }
+  let ctx = ScanCtx{ bit: cfg.bit, repo: cfg.repo, capDir: capDir, ms: ms }
+
+  let anyFail = false
+  let allViolating = []string(0)
+  for d of dirNames {
+    let tr = scanTree(ctx, d)
+    for f of distinctFiles(tr.findings) {
+      allViolating = append(allViolating, f)
+    }
+    if (reportTree(tr, cfg.debt)) {
+      anyFail = true
+    }
+  }
+  if (checkDebtFreshness(cfg.debt, allViolating)) {
+    anyFail = true
+  }
+
+  if (anyFail) {
+    eprint("lint-tests: split any newly over-limit function, or raise the limit in the file's own leading comment (see spec/LINT.md §4/§8) -- never widen this gate's debt list without a real ticket.\n")
+    teardown(capDir, ms)
+    exit(1)
+  }
+  teardown(capDir, ms)
+  println("lint-tests: PASS -- scope is _tests_/stress/ + _tests_/bit/ + _tests_/imports/ ONLY (E0201/E0202/E0204); compiler/, runtime/, stdlib/, tools/ and pkg/ are test-lint-complexity's territory")
+}
