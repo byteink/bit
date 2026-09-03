@@ -190,8 +190,8 @@ fn withRemoved(xs: []int, at: i64): []int {
 
 Whether `a` and `b` hold the same elements in the same order. A plain
 `a == b` is not this: a slice is not comparable. Element equality uses `==`,
-so `equal` over a slice of structs is only correct once #2105 (`==` on
-structs currently compares handles, not fields) lands.
+which is field-wise content comparison for structs (#2105), so `equal` over
+a slice of structs is correct.
 
 ### `unique(xs: []T): []T`
 
