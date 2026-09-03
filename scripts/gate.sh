@@ -381,9 +381,10 @@ while IFS= read -r f; do
     # no automated gate), bench/**/*.md (bench/**/*.bit and bench/run.sh still
     # fall through to `full`, unproven output-irrelevant), and the three
     # standalone READMEs nothing greps.
-    # Deliberately NOT added to has_other, has_noop, or bucket_count: mixed
-    # with a real bucket it must be silently ignored, never force `full` and
-    # never downgrade the real bucket (constraint in #2801).
+    # Deliberately NOT added to has_other or bucket_count — has_noop and
+    # noop_list ARE set below, but mixed with a real bucket the noop path
+    # must be silently ignored, never force `full` and never downgrade the
+    # real bucket (constraint in #2801).
     runtime/*.md|spec/*|bench/*.md|README.md|CONTRIBUTING.md|dist/README.md)
       has_noop=1
       if [ -n "${noop_list}" ]; then
