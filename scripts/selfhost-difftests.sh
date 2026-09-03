@@ -12,11 +12,16 @@
 # BOTH the ORACLE and BIT2 runs are alarm-guarded (#2866): neither had a bound
 # before, so a hung `bit test` on either side wedged this script indefinitely —
 # the same shape selfhost-diffcheck.sh's header warns about ("the seed side had
-# no bound at all, so a hung ORACLE wedged the whole gate indefinitely").
-# ALARMRUN_KEEP_STDERR=1 because this differential depends on the child's
-# stderr landing in the SAME captured file as its stdout (the panic note
-# above); alarmrun's own default discards stderr, which would silently drop a
-# panic and turn a real divergence into a false MATCH.
+# no bound at all, so a hung ORACLE wedged the whole gate indefinitely"). Each
+# side retries once on a stall via scripts/alarmrun.sh's per-attempt
+# capture-truncating retry helper (#3490), which truncates its capture before
+# EACH attempt and places its own redirect on the forked child rather than
+# this script's shell — so a stalled first attempt's partial bytes, and
+# bash's own "Alarm clock: 14" job-status note, can never survive into the
+# retried attempt's compared payload (#3478, #4205). It always merges
+# stdout+stderr into the capture, which is what this differential needs: a
+# panic line comes from the child on stderr, so the compared output
+# deliberately folds stdout+stderr together (see above).
 #
 # The unresolved-frame fallback ("  at 0x<16 hex digits>", backtrace.bit's
 # btAppendHex) prints an absolute address that moves every run under ASLR —
@@ -55,13 +60,13 @@ oracletimeout=0 bit2timeout=0 mismatch=0
 
 # Verdict-deciding (#3422): the only comparison in this script, so a single
 # transient SIGALRM must not turn a real MATCH/DIFF into a false TIMEOUT.
-ALARMRUN_KEEP_STDERR=1 alarmrun_retry ORACLE "" "$ORACLE" test "$PROJ" >"$TMP/seed" 2>&1
+alarmrun_retry_cap ORACLE "" "$TMP/seed" "$ORACLE" test "$PROJ"
 se=$?
 if [ "$se" -eq 142 ]; then
   echo "ORACLE timed out after ${TIMEOUT}s running: $ORACLE test $PROJ"
   oracletimeout=1
 else
-  ALARMRUN_KEEP_STDERR=1 alarmrun_retry BIT2 "" "$BIT2" test "$PROJ" >"$TMP/b2" 2>&1
+  alarmrun_retry_cap BIT2 "" "$TMP/b2" "$BIT2" test "$PROJ"
   b2=$?
   if [ "$b2" -eq 142 ]; then
     echo "BIT2 timed out after ${TIMEOUT}s running: $BIT2 test $PROJ"
