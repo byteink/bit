@@ -210,9 +210,8 @@ fn operators(a: int, b: int): int {
 ## Arithmetic and overflow
 
 - Unsigned arithmetic is modular (wraps).
-- Signed overflow **wraps** (two's complement) in v0.1 — there is no build-mode
-  flag. A debug build mode that traps on signed overflow instead is specified
-  but not yet implemented (see [SPEC.md §13.5](../../spec/SPEC.md), task #3076).
+- Signed overflow **traps in debug builds** and **wraps** (two's complement) in
+  release builds - deterministic either way.
 - Integer divide or remainder by zero **panics**.
 - Float division by zero yields ±∞ or NaN (no panic).
 - Shift counts are taken modulo the operand's bit width.
