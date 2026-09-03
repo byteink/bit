@@ -146,8 +146,9 @@ echo "release.sh: SBOM dependencies resolved"
 
 TARGETS=(x86_64-linux aarch64-linux aarch64-macos)
 
-echo "release.sh: building the bootstrap runtime archives (L0, stage0-built)"
-./make libbitrt
+# Bootstraps bit1 off the pinned stage0, falling back to the two-pass
+# BIT_STAGE0_BIN bootstrap on a runtime ABI transition (dist/abitwopass-run.sh, #4197).
+PASS1_BASE="$(bash dist/abitwopass-run.sh)"
 
 echo "release.sh: resolving the pinned stage0"
 # Downloads + digest-verifies against dist/stage0/SHA256SUMS; refuses on failure.
@@ -165,11 +166,7 @@ echo "release.sh: stage0 version = ${STAGE0_VERSION}"
 # for the HOST triple only, linking the L0 archive `./make libbitrt` just
 # built. This is stage0's entire job in this script: bit1 is a native host
 # binary exactly like stage0 itself, so it can cross-produce every shipped
-# target below the same way stage0 always has. `./make` is `install`, which
-# depends on `selfhost` which depends on `libbitrt` — both already satisfied
-# or cheaply re-verified by the call above.
-echo "release.sh: bootstrapping the host self-hosted compiler with stage0 (bit1)"
-./make
+# target below the same way stage0 always has.
 BIT1="${ROOT}/bit-out/bin/bit"
 [ -x "${BIT1}" ] || { echo "release.sh: ./make did not produce ${BIT1}" >&2; exit 1; }
 # `stepSelfhost` (tools/build/artifactsteps.bit) writes this on every `./make`
@@ -587,7 +584,7 @@ fi
 # are already proven by the time we get here, so only the actual generation,
 # whose output path depends on ${OUT}, happens at this site.
 echo "release.sh: generating SBOM"
-"${SBOM_VENV}/bin/python3" dist/sbom.py "${VERSION}" "${STAGE0_VERSION}" \
+"${SBOM_VENV}/bin/python3" dist/sbom.py "${VERSION}" "${STAGE0_VERSION}" "${PASS1_BASE}" \
 	> "${OUT}/bit-${VERSION}.cdx.json"
 rm -rf "${SBOM_VENV}"
 echo "release.sh: wrote ${OUT}/bit-${VERSION}.cdx.json"
@@ -604,6 +601,9 @@ if [ "${RESUME_NOTES}" -eq 0 ]; then
 		echo "release.sh: changelog.sh failed; writing a minimal note" >&2
 		printf '# Bit %s\n' "${VERSION}" > "${OUT}/NOTES.md"
 	}
+	# #4197: record the extra bootstrap link; skipped on an ordinary release.
+	[ -n "${PASS1_BASE}" ] && printf '%s\n\n## Build provenance\n\nRooted at stage0 v%s via the two-pass BIT_STAGE0_BIN bootstrap (docs/development.md, "Landing a runtime ABI change"), pass-1 base %s.\n\n%s\n' \
+		"$(head -n1 "${OUT}/NOTES.md")" "${STAGE0_VERSION}" "${PASS1_BASE}" "$(tail -n +2 "${OUT}/NOTES.md")" > "${OUT}/NOTES.md"
 else
 	# Remediation path for checkNotesLanguage's refusal (#4124): reuse
 	# NOTES.md AS-IS, never regenerate it — regenerating is exactly what
