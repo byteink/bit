@@ -280,6 +280,24 @@ And two that go the other way, dropping information:
 | `DateTime` / `NaiveDateTime` | `Time` | `.time()` |
 | `DateTime` | `NaiveDateTime` | `.naive()` |
 
+**`Date.atTime` and `NaiveDateTime`'s own `.date()`/`.time()` are shipped.**
+`atStartOfDay`, `inZone`, `toTimestamp` and `naive` are not yet — they need a
+`Zone` (#4071), which does not exist yet.
+
+### `Date.atTime(hour: int, minute: int, second: int): NaiveDateTime!`
+
+Combines this date with a time of day: "this date, at this time, somewhere"
+— docs/stdlib/time.md, "Choosing a type". Fails exactly when
+`time(hour, minute, second)` fails; the field bounds are that constructor's.
+
+### `NaiveDateTime.date(): Date`
+
+The `Date` half.
+
+### `NaiveDateTime.time(): Time`
+
+The `Time` half.
+
 ### `inZone` and `withZone` are different operations
 
 This pair is worth reading twice.
@@ -310,9 +328,10 @@ only, because only a `DateTime` already has an instant to preserve.
 
 **Shipped on `Date`**: `year()`, `month()`, `day()`, `dayOfWeek()`,
 `dayOfYear()`, `quarter()`, `daysInMonth()` and `weekOfYear()`. **Shipped on
-`Time`**: `hour()`, `minute()`, `second()` and `nanosecond()`. Everything
-else below — the `NaiveDateTime`/`DateTime` fields, and the `DateTime`-only
-and `Timestamp`-only rows — is not yet implemented.
+`Time`**: `hour()`, `minute()`, `second()` and `nanosecond()`. **Shipped on
+`NaiveDateTime`**: all eleven of the above, each forwarding to the matching
+`Date` or `Time` accessor. Everything else below — the `DateTime` fields, and
+the `DateTime`-only and `Timestamp`-only rows — is not yet implemented.
 
 ### `Date.year(): int`
 
@@ -369,6 +388,33 @@ The second, 0..59. Never 60 — this module has no leap seconds.
 ### `Time.nanosecond(): int`
 
 The nanosecond, 0..999999999.
+
+Each of the following forwards to the matching accessor on `.date()` or
+`.time()` — same range, same meaning, no field re-derived here.
+
+### `NaiveDateTime.year(): int`
+
+### `NaiveDateTime.month(): int`
+
+### `NaiveDateTime.day(): int`
+
+### `NaiveDateTime.hour(): int`
+
+### `NaiveDateTime.minute(): int`
+
+### `NaiveDateTime.second(): int`
+
+### `NaiveDateTime.nanosecond(): int`
+
+### `NaiveDateTime.dayOfWeek(): int`
+
+### `NaiveDateTime.dayOfYear(): int`
+
+### `NaiveDateTime.quarter(): int`
+
+### `NaiveDateTime.daysInMonth(): int`
+
+### `NaiveDateTime.weekOfYear(): int`
 
 Available on every type that carries the field.
 
@@ -497,15 +543,19 @@ fn inDay(t: Timestamp, dayStart: Timestamp, nextDayStart: Timestamp): bool {
 
 ## Comparison
 
-**`isLeapYear()` is shipped, on `Date`.** Everything else in this section —
-`isBefore`, `isAfter`, `isSame`, `isBetween`, `compare`, `isSameDay`,
-`isSameMonth`, `isSameYear`, `isWeekend`, `isWeekday`, `isPast` and
-`isFuture` — is not yet implemented.
+**`isLeapYear()` is shipped, on `Date` and `NaiveDateTime`.** Everything else
+in this section — `isBefore`, `isAfter`, `isSame`, `isBetween`, `compare`,
+`isSameDay`, `isSameMonth`, `isSameYear`, `isWeekend`, `isWeekday`, `isPast`
+and `isFuture` — is not yet implemented.
 
 ### `Date.isLeapYear(): bool`
 
 True when the year is divisible by 4, and not by 100 unless also by 400 —
 so 1900 is not a leap year and 2000 is.
+
+### `NaiveDateTime.isLeapYear(): bool`
+
+Forwards to `.date().isLeapYear()`.
 
 | Method | Meaning |
 |---|---|
@@ -677,11 +727,17 @@ digits is appended: 500 nanoseconds prints `"09:00:00.000000500"`, never
 `"09:00:00.5"`. Matches the shipped `formatRfc3339`'s existing fractional
 rule.
 
+### `NaiveDateTime.toString(): string`
+
+`"2026-09-01T09:00:00"` — `.date().toString()` and `.time().toString()`
+joined by an uppercase `"T"`, RFC 3339's date-time separator. With
+nanoseconds: `"2026-09-01T09:00:00.000000500"`.
+
 ### `toString()`
 
-Each type's canonical form, `Date` and `Time` shipped and the rest specified below it.
-Whatever `toString` writes, the matching `parse` function reads back to the
-same value.
+Each type's canonical form, `Date`, `Time` and `NaiveDateTime` shipped and the
+rest specified below it. Whatever `toString` writes, the matching `parse`
+function reads back to the same value.
 
 | Type | `toString()` |
 |---|---|
