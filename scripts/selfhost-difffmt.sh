@@ -99,12 +99,27 @@ probe_fmt() {
   local bin=$1 dir="$work/probe.$2"
   mkdir -p "$dir"
   printf 'fn main() {\n  print("hi\\n")\n}\n' >"$dir/p.bit"
-  local out
+  local out cap="$dir/out"
   # Verdict-deciding (#3422): a single stall aborts the WHOLE differential as
-  # could-not-decide, so it gets alarmrun_retry's one retry, same as the main
-  # loop below and unlike the two forbidden report-only sites in this file.
-  out=$(ALARMRUN_KEEP_STDERR=1 alarmrun_retry "$2" "" "$bin" fmt "$dir/p.bit" 2>&1)
+  # could-not-decide, so it gets alarmrun_retry_cap's one retry, same as the
+  # main loop below and unlike the two forbidden report-only sites in this
+  # file.
+  #
+  # <capture> used to be a caller-owned `$(... 2>&1)` opened ONCE for BOTH
+  # attempts, so a stalled first attempt's partial output -- plus bash's own
+  # "Alarm clock: 14" job-status note -- could survive as a prefix inside the
+  # retried attempt's compared payload (#3478/#4209, same shape as
+  # #4196/#4205). alarmrun_retry_cap truncates <capture> before EACH attempt
+  # instead. ALARMRUN_KEEP_STDERR=1 is dropped: alarmrun_cap always merges
+  # stdout+stderr into <capture> regardless of that flag, which is what this
+  # probe already relied on via the old `2>&1`.
+  # <outfile> stays "" -- p.bit is fmt's INPUT here, not an artifact fmt
+  # creates, so alarmrun_retry_cap must never remove it between attempts
+  # (same reason fmt_retry() below does not route its own target through
+  # alarmrun_retry_cap's outfile arg either).
+  alarmrun_retry_cap "$2" "" "$cap" "$bin" fmt "$dir/p.bit"
   local rc=$?
+  out=$(cat "$cap")
   if [ "$rc" -eq 142 ]; then
     echo "difffmt: PROBE TIMEOUT — $bin hung on the capability probe after ${TIMEOUT}s" >&2
     echo "difffmt: nothing was compared — a hung probe is not evidence of absence." >&2
