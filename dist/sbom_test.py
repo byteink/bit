@@ -69,6 +69,39 @@ def main() -> int:
         return 1
     print("ok: vendored-dependencies property present")
 
+    # #4197: the ordinary (no pass1-base-commit argument) call must NOT gain
+    # a two-pass property -- a routine release's SBOM must be unchanged.
+    if "bit:pass1-base-commit" in props:
+        print("FAIL: ordinary (no base-commit arg) SBOM carries bit:pass1-base-commit", file=sys.stderr)
+        return 1
+    print("ok: no bit:pass1-base-commit property without a pass1-base-commit argument")
+
+    with tempfile.TemporaryDirectory() as venv_dir2:
+        venv.create(venv_dir2, with_pip=True)
+        pip2 = str(Path(venv_dir2, "bin", "pip"))
+        python2 = str(Path(venv_dir2, "bin", "python3"))
+        subprocess.run(
+            [pip2, "install", "--quiet", "--require-hashes", "-r",
+             str(ROOT / "dist" / "sbom-requirements.txt")],
+            check=True,
+        )
+        out2 = subprocess.run(
+            [python2, str(ROOT / "dist" / "sbom.py"), "9.9.9-test", "0.1.4", "deadbeef1234"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        doc2 = json.loads(out2)
+    props2 = {p["name"]: p["value"] for p in doc2["metadata"]["properties"]}
+    if props2.get("bit:pass1-base-commit") != "deadbeef1234":
+        print(f"FAIL: two-pass SBOM's bit:pass1-base-commit is {props2.get('bit:pass1-base-commit')!r}, want 'deadbeef1234'", file=sys.stderr)
+        return 1
+    print("ok: bit:pass1-base-commit property present and correct when a base commit is given")
+    if "deadbeef1234" not in get(doc2, "metadata/tools/components/0/description"):
+        print("FAIL: two-pass SBOM's stage0 tool description does not name the pass1 base commit", file=sys.stderr)
+        return 1
+    print("ok: stage0 tool description names the pass1 base commit")
+
     print("dist/sbom_test.py: all checks passed")
     return 0
 
