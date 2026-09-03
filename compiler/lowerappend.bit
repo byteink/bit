@@ -1,0 +1,130 @@
+// compiler/lowerappend.bit — split out of lowerprim.bit, which `append`'s
+// lowering pushed past the 800-line lint limit; same reason lowerreslice.bit
+// was split out of loweraccess.bit (#4048). `append(s, ...)` lowering only, in
+// all three of its forms: the ordinary word/byte element, the packed `[]T`
+// element (#3862), and the inline fast path (#4039). Sibling of lowerprim.bit:
+// same module, so this needs no imports and no call-site changes —
+// `emitRtCall`, `emitJump`, `sliceElemSizeFor`, `sliceElemIsRef` and
+// `storePackedCompositeLit` are all still defined elsewhere in this module and
+// called from here exactly as they were before the move.
+
+// Lowers `append(s, e1, e2, ...)`: folds each element through `slice_append`,
+// threading the returned (possibly regrown) header so a `s = append(s, ...)`
+// observes the new length. Each element lowers with the slice's element hint.
+// `is_ref` travels on every call (ABI.md §2, #1569): a null header (a zeroed
+// class's slice field, #1564) has no element type to read, so the call site
+// — the only place that still knows the static element type — supplies it.
+fn lowerAppend(fc: FnCtx, node: int): int {
+  let args = kidsOf(fc.c.tree, kidsOf(fc.c.tree, node)[2])
+  let a0 = args[0]
+  if (getNode(fc.c.tree, a0).tag == Tag.Arg) {
+    a0 = kidsOf(fc.c.tree, a0)[0]
+  }
+  let sliceTy = defaultType(fc.c, nodeType(fc, a0))
+  let elemTy = fc.c.ctx.types[sliceTy].elem
+  let i64ty = primType(fc.c.ctx, 3)
+  let refI = mkInstr(Op.ConstInt, i64ty)
+  if (sliceElemIsRef(fc, elemTy)) {
+    refI.ival = 1
+  }
+  let refV = builderEmit(fc.b, refI)
+  // elem_size (ABI.md §9, #3121/#3226, #3862): see `lowerlit.bit`'s
+  // `lowerSliceAlloc` for the full rationale; `sliceElemSizeFor` lives in
+  // `lowercall.bit`.
+  let stride = sliceElemSizeFor(fc, elemTy)
+  let esI = mkInstr(Op.ConstInt, i64ty)
+  esI.ival = stride
+  let esV = builderEmit(fc.b, esI)
+  let acc = lowerExpr(fc, a0)
+  if (fc.failed) {
+    return 0
+  }
+  if (stride > 8) {
+    return lowerAppendPacked(
+      fc,
+      acc,
+      AppendPackedCtx{ sliceTy: sliceTy, elemTy: elemTy, stride: stride, refV: refV, esV: esV },
+      args,
+    )
+  }
+  let i = 1
+  while (i < len(args) && !fc.failed) {
+    let a = args[i]
+    if (getNode(fc.c.tree, a).tag == Tag.Arg) {
+      a = kidsOf(fc.c.tree, a)[0]
+    }
+    let v = lowerExprH(fc, a, elemTy)
+    if (fc.failed) {
+      return 0
+    }
+    let ins = mkInstr(Op.RtCall, sliceTy)
+    ins.name = "slice_append"
+    ins.args = [acc, v, refV, esV]
+    acc = emitRtCall(fc, ins)
+    i = i + 1
+  }
+  return acc
+}
+
+// The inputs a packed `append` shares across every trailing value it writes
+// (#3862) — bundled so `lowerAppendPacked` stays under E0202's
+// max-params=5 (spec/LINT.md).
+class AppendPackedCtx {
+  sliceTy: int,
+  elemTy: int,
+  stride: int,
+  refV: int,
+  esV: int,
+}
+
+// Appends a PACKED element (#3862) without a throwaway boxed intermediate.
+// `sliceElemInlineSafe` (lowersliceinline.bit) already proved every trailing
+// arg here is a `Tag.CompositeLit` of elemTy — this lowerer never boxes a
+// value read from elsewhere and copies it in, which would pay exactly the
+// per-element allocation packing exists to remove.
+//
+// Grows via the ordinary `slice_append`, passing a placeholder 0 for the
+// word #3861's runtime writes to the new slot's low 8 bytes — immediately
+// overwritten below along with every other field, so the placeholder's value
+// is never observed. `storePackedCompositeLit` is the same helper
+// `fillPackedSliceLitElems` (lowerlit.bit) uses for a packed slice literal's
+// elements.
+fn lowerAppendPacked(fc: FnCtx, accIn: int, ctx: AppendPackedCtx, args: []int): int {
+  let acc = accIn
+  let i64ty = primType(fc.c.ctx, 3)
+  let i = 1
+  while (i < len(args) && !fc.failed) {
+    let a = args[i]
+    if (getNode(fc.c.tree, a).tag == Tag.Arg) {
+      a = kidsOf(fc.c.tree, a)[0]
+    }
+    if (getNode(fc.c.tree, a).tag != Tag.CompositeLit) {
+      panic("lowerAppendPacked: a packed []T append's argument was not a composite literal — sliceElemInlineSafe should have refused this program")
+    }
+    let z = mkInstr(Op.ConstInt, i64ty)
+    z.ival = 0
+    let ins = mkInstr(Op.RtCall, ctx.sliceTy)
+    ins.name = "slice_append"
+    ins.args = [acc, builderEmit(fc.b, z), ctx.refV, ctx.esV]
+    acc = emitRtCall(fc, ins)
+    if (fc.failed) {
+      return 0
+    }
+    let lenIns = mkInstr(Op.SliceLen, i64ty)
+    lenIns.lhs = acc
+    let lenV = builderEmit(fc.b, lenIns)
+    let one = mkInstr(Op.ConstInt, i64ty)
+    one.ival = 1
+    let subIns = mkInstr(Op.Sub, i64ty)
+    subIns.lhs = lenV
+    subIns.rhs = builderEmit(fc.b, one)
+    let newIdx = builderEmit(fc.b, subIns)
+    let slot = PackedSlot{ recv: acc, idxV: newIdx, stride: ctx.stride, elemTy: ctx.elemTy }
+    storePackedCompositeLit(fc, slot, a)
+    if (fc.failed) {
+      return 0
+    }
+    i = i + 1
+  }
+  return acc
+}
