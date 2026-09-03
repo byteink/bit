@@ -361,3 +361,192 @@ fn checkFloatBits() {
   fmovToFp(want, 0, scratch1(), 4)
   assertSameBytes(cx.code, want)
 }
+
+// #4239: the ARM64 return convention at width W — retRegsFor, bindCallResults
+// and emitMultiWordRet. Every function the front end builds today returns W <= 1
+// (`return a, b` is boxed into one tuple handle by lowerfunc.bit before
+// codegen), so NOTHING in this tree emits a W > 1 return yet and these checks
+// ARE that capability's only gate, not a supplement to one.
+fn assertRetRegs(classes: []RegClass, want: []int) {
+  let got = retRegsFor(classes)
+  assert(len(got) == len(want))
+  let i = 0
+  while (i < len(want)) {
+    assert(got[i] == want[i])
+    i = i + 1
+  }
+}
+
+fn checkArm64RetRegs() {
+  // Width 1 is retRegNum in either class. Asserted rather than commented,
+  // because bindCallResult (the width-1 fast path) and bindCallResults (the
+  // general one) are separate bodies that have to agree about it.
+  assertRetRegs([RegClass.Int], [retRegNum()])
+  assertRetRegs([RegClass.Float], [retRegNum()])
+
+  assertRetRegs([RegClass.Int, RegClass.Int], [0, 1]) // x0, x1
+
+  // {i64, f64} is {x0, d0}, NOT {x0, x1} — the case a flat x0..x(W-1) gets
+  // wrong. Both are register #0; they are different registers because they are
+  // different files. `Option<f64>` (stdlib/json/value.bit) is exactly this
+  // shape, and both #4167's and #4236's int-only aggregates were blind to it.
+  assertRetRegs([RegClass.Int, RegClass.Float], [0, 0])
+
+  // Interleaving perturbs neither count: the two files are independent.
+  assertRetRegs([RegClass.Float, RegClass.Int, RegClass.Float, RegClass.Int], [0, 0, 1, 1])
+
+  // Generalized by width, not hardcoded to the decided N = 2: a full integer
+  // budget is legal and leaves the float file at its own zero.
+  let wide = []RegClass(0)
+  let i = 0
+  while (i < maxArgRegs()) {
+    wide = append(wide, RegClass.Int)
+    i = i + 1
+  }
+  wide = append(wide, RegClass.Float)
+  let wr = retRegsFor(wide)
+  assert(len(wr) == maxArgRegs() + 1)
+  assert(wr[maxArgRegs() - 1] == maxArgRegs() - 1) // x7
+  assert(wr[maxArgRegs()] == 0)                    // d0
+}
+
+// The width-1 half: bindCallResults must emit BYTE FOR BYTE what bindCallResult
+// already emits, in a register destination, in a spill destination, for a bool
+// and for a float. That equality is the whole claim that adding the capability
+// changed no existing call site, so it is checked rather than argued.
+fn checkArm64RetWidthOne() {
+  let probe = selCtx()
+  let ctx = probe.module.ctx
+  let i64t = primType(ctx, 3)
+  let f64t = primType(ctx, 9)
+  let boolt = primType(ctx, 10)
+
+  // vreg 1 is x1: a plain register destination.
+  let fast = selCtx()
+  bindCallResult(fast, 1, i64t, false)
+  let gen = selCtx()
+  bindCallResults(gen, [1], [i64t], false)
+  assertSameBytes(gen.code, fast.code)
+
+  // A bool result is normalized with uxtb first, in the word's OWN return
+  // register, before anything reads it.
+  fast = selCtx()
+  bindCallResult(fast, 1, boolt, true)
+  gen = selCtx()
+  bindCallResults(gen, [1], [boolt], true)
+  assertSameBytes(gen.code, fast.code)
+  let want = newByteBuf()
+  uxtb(want, 0)
+  movRR(want, 1, 0)
+  assertSameBytes(gen.code, want)
+
+  // vreg 1 as a float destination is d1.
+  fast = selCtx()
+  bindCallResult(fast, 1, f64t, false)
+  gen = selCtx()
+  bindCallResults(gen, [1], [f64t], false)
+  assertSameBytes(gen.code, fast.code)
+
+  // A SPILLED destination stores straight out of the return register — the arm
+  // where the fast path uses putInt and the general one uses emitMove, i.e. the
+  // one most likely to drift apart.
+  let frame = FrameInfo{
+    savedGpr: []int(0), savedFpr: []int(0), numSpillSlots: 2,
+    outgoingBytes: 0, frameSize: 64,
+  }
+  fast = selCtx()
+  fast.frame = frame
+  fast.result.locations[1] = RegLoc{ isSpill: true, index: 1 }
+  bindCallResult(fast, 1, i64t, false)
+  gen = selCtx()
+  gen.frame = frame
+  gen.result.locations[1] = RegLoc{ isSpill: true, index: 1 }
+  bindCallResults(gen, [1], [i64t], false)
+  assertSameBytes(gen.code, fast.code)
+  want = newByteBuf()
+  storeImm(want, 0, regSp(), 8, 8)
+  assertSameBytes(gen.code, want)
+}
+
+// The W > 1 half: the caller's binding, the callee's `ret`, and the aliasing
+// case a sequence of single moves gets wrong.
+fn checkArm64RetWords() {
+  let probe = selCtx()
+  let ctx = probe.module.ctx
+  let i64t = primType(ctx, 3)
+  let f64t = primType(ctx, 9)
+
+  // Two int words into two ordinary destinations: x0 and x1, in word order.
+  let cx = selCtx()
+  bindCallResults(cx, [4, 5], [i64t, i64t], false)
+  let want = newByteBuf()
+  movRR(want, 4, 0)
+  movRR(want, 5, 1)
+  assertSameBytes(cx.code, want)
+
+  // The mixed-class binding: word 1 comes out of d0, not x1.
+  cx = selCtx()
+  bindCallResults(cx, [4, 5], [i64t, f64t], false)
+  want = newByteBuf()
+  movRR(want, 4, 0)
+  fmovFF(want, 5, 0, 8)
+  assertSameBytes(cx.code, want)
+
+  // A DISCARDED word still consumes its class's ordinal. Word 0 is dropped, so
+  // word 1 must still come from x1 — deriving its register from the surviving
+  // words alone would read x0 and bind the wrong value.
+  cx = selCtx()
+  bindCallResults(cx, [-1, 5], [i64t, i64t], false)
+  want = newByteBuf()
+  movRR(want, 5, 1)
+  assertSameBytes(cx.code, want)
+
+  // THE ALIASING CASE. Word 0 must land in x1 while word 1 is still IN x1: a
+  // left-to-right `mov x1,x0; mov x0,x1` destroys word 1 and returns word 0
+  // twice. Reachable whenever the function has no safepoint at all, since
+  // buildIntRegs then hands out x0..x7 as well. One parallel move rotates it
+  // through the reserved secondary scratch.
+  cx = selCtx()
+  bindCallResults(cx, [1, 0], [i64t, i64t], false)
+  want = newByteBuf()
+  movRR(want, scratch2(), 1)
+  movRR(want, 1, 0)
+  movRR(want, 0, scratch2())
+  assertSameBytes(cx.code, want)
+
+  // The callee half: two values into {x0, d0}, again per class.
+  cx = selCtx()
+  cx.f.instrs = [
+    mkInstr(Op.BlockParam, i64t), mkInstr(Op.BlockParam, i64t),
+    mkInstr(Op.BlockParam, i64t), mkInstr(Op.BlockParam, f64t),
+  ]
+  emitMultiWordRet(cx, [2, 3])
+  want = newByteBuf()
+  movRR(want, 0, 2)
+  fmovFF(want, 0, 3, 8)
+  assertSameBytes(cx.code, want)
+
+  // End to end through compileFunction, so the `Op.Ret` dispatch arm is proven
+  // wired and not just the helper. `ret %1, %0` on two int params is a genuine
+  // swap through x0/x1, so it cannot be satisfied by self-moves: with the
+  // multi-word arm removed this emits a bare `ret` (4 bytes) and passes nothing.
+  let ctx2 = newTypeContext()
+  let ai = primType(ctx2, 3)
+  let r2 = mkInstr(Op.Ret, ctx2.voidId)
+  r2.args = [1, 0]
+  let f2 = IrFunc{
+    name: "ret2", paramTypes: [ai, ai], result: ai,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 2, instsLen: 3 }],
+    instrs: [mkInstr(Op.BlockParam, ai), mkInstr(Op.BlockParam, ai), r2],
+    isFallible: false,
+  }
+  let c2 = compileFunction(
+    IrModule{ funcs: [f2], ctx: ctx2, stringPool: []string(0), sm: newSourceManager() },
+    f2,
+    false,
+  )
+  assert(c2.frameSize == 0) // no safepoint -> frameless
+  assert(len(c2.relocs) == 0)
+  assert(len(c2.code) == 16) // three rotation moves, then ret
+  assert(wordAt(ByteBuf{ bytes: c2.code }, 12) == 0xd65f03c0)
+}
