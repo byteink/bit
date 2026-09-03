@@ -236,6 +236,10 @@ gates_for_file() {
     # as fuzz-regex's own coreSteps() naming (tools/build/defs.bit).
     _tests_/bit/benchregex/*) printf 'bench-regex\n'; return 0 ;;
     _tests_/bit/clicmd/*) printf 'test-clicmd\n'; return 0 ;;
+    # #4262: a directory module from the start (arread.bit split out to stay
+    # under the 800-line limit), same shape as _tests_/bit/fmtcitations/*
+    # and _tests_/bit/golden/* below.
+    _tests_/bit/externarchive/*) printf 'test-extern-archive\n'; return 0 ;;
     # #3458 moved this from a single file (_tests_/bit/fmtcitations.bit) to a
     # directory module — its self-tests split into a sibling to stay under the
     # 800-line limit, the same shape as _tests_/bit/benchgate/* above.

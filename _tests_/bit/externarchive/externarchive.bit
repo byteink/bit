@@ -1,0 +1,579 @@
+// _tests_/bit/externarchive/externarchive.bit — #4262: a standing gate over
+// Linux extern/runtime-archive admissibility, so a symbol mismatch like
+// #4253's is caught here instead of needing a manual hardware-gate sweep.
+//
+// THE GAP THIS CLOSES. `bit check` never evaluates SPEC §11.7's E0078
+// extern-admissibility gate at all (compiler/main.bit:120, #3519 — `check`'s
+// CliSpec declares no `--target`, and the gate needs a `BuildTarget` plus a
+// linked runtime archive, neither of which a target-independent front end
+// has). `scripts/gate.sh`/`./make test` on this Mac only ever build against
+// the HOST's own libbitrt archive. So a symbol declared `extern fn` under
+// `stdlib/**` that exists in one target's runtime archive and not another's
+// is invisible to every gate that runs here, always — the only thing that
+// ever caught one was a human running `scripts/arm64gate.sh`/
+// `scripts/x64gate.sh` by hand (#3727, #4253, and the #2624 sweep that found
+// both).
+//
+// DESIGN DECISION (recorded here and on #4262's ticket thread): a STATIC
+// cross-archive check, not a scheduled hardware-gate run. The archive for
+// EVERY target `./make libbitrt` builds already exists locally on any host
+// after a normal build — `scripts/g2archive.sh` cross-compiles all three
+// (x86_64-linux, aarch64-linux, aarch64-macos) without touching real Linux
+// hardware or a container (verified: `bit-out/lib/<target>/libbitrt.a`
+// exists for all three on this Mac with no docker/ssh involved). So the
+// admissibility QUESTION — "does this archive define this symbol" — is a
+// static property of three files already on disk, not something that needs
+// a remote host to answer. That makes this cheap enough to sit in
+// `gateSteps()` (part of `./make test`, not a periodic sweep): it costs one
+// pass over ~1.3MB of archive bytes and ~36 stdlib extern declarations,
+// well under a second, with no network and no SSH. The tradeoff against a
+// scheduled `scripts/arm64gate.sh`/`x64gate.sh` run: a hardware sweep also
+// catches a target-conditional CODEGEN divergence this static check cannot
+// (it only compares symbol PRESENCE, never behaviour), but costs 20+
+// minutes and real hardware, which is why nothing runs it by default today.
+// This gate is deliberately narrower and cheaper, aimed only at the
+// mismatch class #3727/#4253 actually were: a symbol the archive-builder
+// simply never defined for one target.
+//
+// SCOPE: `extern fn` declarations under `stdlib/**` only. "Compiler-emitted"
+// primitives (bit_rt_gc_alloc, bit_rt_safepoint, the panic helpers, the
+// Op.RtCall roster — tools/build/abiarity.bit's `compilerEmittedSymbols()`)
+// are deliberately excluded: they are not declared via `extern fn` in any
+// `.bit` source at all (the backend hardcodes the call), and if one were
+// ever missing from a target's archive, `./make libbitrt`/`stepSelfhost`
+// itself would fail loudly at that target's own link step — a much earlier,
+// louder failure than the invisible one this gate exists to catch.
+//
+// THE CHECK: for every `extern fn NAME` declared anywhere under `stdlib/**`,
+// NAME's presence (defined, GLOBAL binding — the same "defined" `archiveDefines`
+// (compiler/elflayout.bit) uses for the real E0078 decision) is computed
+// against all three `bit-out/lib/<target>/libbitrt.a` archives, using a
+// Bit-native ar+ELF64+Mach-O64 reader (arread.bit, this module's sibling
+// file; ELF/Mach-O object reading via `../objread`, already shared by
+// `_tests_/bit/rootpins` and `_tests_/bit/stwwiring`) rather than shelling
+// out to a host `nm`/`objdump` — `_tests_/bit/globalsbss.bit`'s header
+// already explains why: `otool` has no Linux build at all, so a host tool
+// is not a reliable oracle across the three targets this gate must inspect
+// identically on any one host.
+//
+// A symbol's presence is expected to be IDENTICAL across all three targets
+// unless it is named in `allowedAsymmetries()` below, which pins the EXACT
+// expected presence set — not just "this one is allowed to differ somehow".
+// That makes the check TWO-WAY, the same shape as `BIT_FMTZERO_DEBT`
+// (_tests_/bit/fmtzerocheck.bit): an unlisted asymmetric symbol fails (the
+// #4253 shape — a real, undocumented mismatch), AND a listed symbol whose
+// real presence no longer matches its recorded expectation ALSO fails
+// (demanding the stale entry be corrected or removed, e.g. once a Linux
+// implementation lands) — a named allowlist cannot silently keep excusing a
+// symbol that has stopped needing the excuse, unlike a bare count would.
+//
+// Run from the repository root: bit-out/bin/bit run _tests_/bit/externarchive
+// BIT_REPO overrides the directory searched for `_tests_/bit` (default:
+// search . / .. / ../.. / ../../.. — same convention every sibling harness
+// in this family uses).
+
+import { isDir, readDir, readFile } from "std/fs"
+import { env } from "std/os"
+import { hasSuffix, join, split, trimSpace } from "std/strings"
+
+// Bounds — Power of 10 rule 2: every walk below is over a small, fixed
+// tree (today: ~90 stdlib files, 36 extern declarations), but each loop is
+// capped explicitly rather than merely expected to terminate. arread.bit
+// carries its own bound (`maxArMembers`) for the archives it walks.
+const maxStdlibEntries: int = 512
+const maxFileBytes: int = 4194304
+const maxScanDepth: int = 16
+
+// ---------------------------------------------------------------------------
+// stdlib `extern fn` declaration collection.
+// ---------------------------------------------------------------------------
+
+class ExternDecl { symbol: string, file: string }
+class WalkResult { externs: []ExternDecl, filesScanned: int }
+
+// The identifier after a line that starts with the literal "extern fn " (10
+// bytes) — every real declaration in stdlib/** today is unindented and
+// starts a line this way (verified: `grep -rn "extern fn" stdlib` has no
+// indented or `export extern fn` hit). Stops at `(` or whitespace, so
+// `extern fn NAME(...)` and a hypothetical no-paren form both work.
+fn externNameFromLine(trimmed: string): string {
+  let rest = []u8(trimmed[10:len(trimmed)])
+  let i = 0
+  while (i < len(rest) && rest[i] != u8(40) && rest[i] != u8(32) && rest[i] != u8(9)) {
+    i = i + 1
+  }
+  return string(rest[0:i])
+}
+
+fn collectExternsInFile(path: string, acc: WalkResult) {
+  let content = readFile(path) catch e {
+    panic("externarchive: cannot read ${path}: ${e.message()}")
+  }
+  if (len(content) > maxFileBytes) {
+    panic("externarchive: ${path} exceeds ${maxFileBytes} bytes")
+  }
+  for line of split(content, "\n") {
+    let trimmed = trimSpace(line)
+    if (hasPrefix(trimmed, "extern fn ")) {
+      let name = externNameFromLine(trimmed)
+      if (len(name) > 0) {
+        acc.externs = append(acc.externs, ExternDecl{ symbol: name, file: path })
+      }
+    }
+  }
+}
+
+// Mutates `acc` in place (classes are reference-typed here — the same
+// pattern _tests_/bit/filesize.bit's `report(sc: ScanResult, ...)` uses),
+// so nested calls need no merge step.
+fn walkStdlib(dir: string, acc: WalkResult, depth: int) {
+  if (depth <= 0) {
+    panic("externarchive: ${dir} nesting exceeds ${maxScanDepth} levels")
+  }
+  let names = readDir(dir) catch e {
+    panic("externarchive: cannot list ${dir}: ${e.message()}")
+  }
+  if (len(names) > maxStdlibEntries) {
+    panic("externarchive: ${dir} has ${len(names)} entries, over ${maxStdlibEntries}")
+  }
+  for name of names {
+    let path = "${dir}/${name}"
+    if (isDir(path)) {
+      walkStdlib(path, acc, depth - 1)
+    } else if (hasSuffix(name, ".bit")) {
+      acc.filesScanned = acc.filesScanned + 1
+      collectExternsInFile(path, acc)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Presence / allowlist.
+// ---------------------------------------------------------------------------
+
+class Presence { macos: bool, arm64lx: bool, x64lx: bool }
+
+fn presenceAll(): Presence {
+  return Presence{ macos: true, arm64lx: true, x64lx: true }
+}
+
+fn presenceEqual(a: Presence, b: Presence): bool {
+  return a.macos == b.macos && a.arm64lx == b.arm64lx && a.x64lx == b.x64lx
+}
+
+fn presenceStr(p: Presence): string {
+  let parts = []string(0)
+  if (p.macos) {
+    parts = append(parts, "aarch64-macos")
+  }
+  if (p.arm64lx) {
+    parts = append(parts, "aarch64-linux")
+  }
+  if (p.x64lx) {
+    parts = append(parts, "x86_64-linux")
+  }
+  if (len(parts) == 0) {
+    return "(none)"
+  }
+  return join(parts, ", ")
+}
+
+class Allowed { symbol: string, expect: Presence, note: string }
+
+// THE TWO-WAY LIST. Every entry pins the EXACT expected presence set for
+// one symbol, not merely "may differ". Verified against merged main
+// (2026-09-04): `bit_rt_prof_start`/`_stop`/`_sample` are the ONLY
+// asymmetric stdlib externs today — every other symbol under stdlib/**
+// (crypto AES/GHASH/SHA256 hardware paths, fs/net `_w` wrappers, the
+// scheduler timer helpers) is present on all three archives. Cross-checked
+// independently with the host's own `nm -g --defined-only` on all three
+// `bit-out/lib/<target>/libbitrt.a` before this gate existed.
+//
+// stdlib/prof/prof.bit:16-19 documents this itself: "aarch64-macos ONLY,
+// today. The runtime half is Darwin-specific (SIGPROF/setitimer)... Linux
+// support is out of scope." #4253 confirmed this is deliberate design, not
+// a bug (no runtime/root/linux/prof.bit exists at all). If Linux support is
+// ever added, the real presence will become {macos, arm64lx, x64lx} = all
+// true, this entry's expectation will stop matching reality, and THIS GATE
+// FAILS demanding the entry be removed — it cannot silently keep excusing a
+// symbol that no longer needs the excuse.
+fn allowedAsymmetries(): []Allowed {
+  let macosOnly = Presence{ macos: true, arm64lx: false, x64lx: false }
+  return [
+    Allowed{
+      symbol: "bit_rt_prof_start", expect: macosOnly,
+      note: "#1906/#4253: Darwin-only CPU profiler (SIGPROF/setitimer), no Linux runtime implementation exists",
+    },
+    Allowed{
+      symbol: "bit_rt_prof_stop", expect: macosOnly,
+      note: "#1906/#4253: Darwin-only CPU profiler (SIGPROF/setitimer), no Linux runtime implementation exists",
+    },
+    Allowed{
+      symbol: "bit_rt_prof_sample", expect: macosOnly,
+      note: "#1906/#4253: Darwin-only CPU profiler (SIGPROF/setitimer), no Linux runtime implementation exists",
+    },
+  ]
+}
+
+fn findAllowed(symbol: string, allowed: []Allowed): (Allowed, bool) {
+  for a of allowed {
+    if (a.symbol == symbol) {
+      return a, true
+    }
+  }
+  return Allowed{ symbol: "", expect: presenceAll(), note: "" }, false
+}
+
+// ---------------------------------------------------------------------------
+// The check itself.
+// ---------------------------------------------------------------------------
+
+class GateResult { checked: int, mismatches: int, filesScanned: int, declTotal: int }
+
+// The three archives' own defined-symbol maps, bundled so `checkSymbolPresence`
+// stays under the 5-parameter limit (spec/LINT.md's E0202) instead of taking
+// each map separately.
+class ArchiveSymbols {
+  macos: map<string, bool>,
+  arm64lx: map<string, bool>,
+  x64lx: map<string, bool>,
+}
+
+fn loadArchive(tag: string, path: string): []u8 {
+  let raw = readFile(path) catch e {
+    panic("externarchive: cannot read ${path}: ${e.message()}")
+  }
+  return []u8(raw)
+}
+
+// Multiple files may legitimately declare the SAME extern name (e.g.
+// bit_rt_bytes_copy in both stdlib/crypto/asn1.bit and
+// stdlib/http/trustcache.bit) — dedupe by symbol, keep the first declaring
+// file for diagnostics.
+fn dedupeExterns(externs: []ExternDecl): map<string, string> {
+  let bySymbol = map<string, string>{}
+  for d of externs {
+    let (_, already) = bySymbol[d.symbol]
+    if (!already) {
+      bySymbol[d.symbol] = d.file
+    }
+  }
+  return bySymbol
+}
+
+// True (no mismatch) if `symbol`'s real presence across the three archives
+// matches its expectation (the allowlist's, or present-everywhere by
+// default). Prints the FAIL line itself so `runCheck`'s own loop stays a
+// single call per symbol.
+fn checkSymbolPresence(
+  symbol: string,
+  file: string,
+  syms: ArchiveSymbols,
+  allowed: []Allowed,
+): bool {
+  let (_, onMacos) = syms.macos[symbol]
+  let (_, onArm64lx) = syms.arm64lx[symbol]
+  let (_, onX64lx) = syms.x64lx[symbol]
+  let actual = Presence{ macos: onMacos, arm64lx: onArm64lx, x64lx: onX64lx }
+  let (a, isListed) = findAllowed(symbol, allowed)
+  let expected = presenceAll()
+  if (isListed) {
+    expected = a.expect
+  }
+  if (presenceEqual(actual, expected)) {
+    return true
+  }
+  eprint("externarchive: FAIL ${symbol} (declared at ${file}): present on [${presenceStr(actual)}], expected [${presenceStr(expected)}]\n")
+  return false
+}
+
+// The other half of the two-way assertion: an allowlist entry naming a
+// symbol stdlib no longer declares at all is equally stale. Returns the
+// count of such stale entries found.
+fn checkStaleAllowlistEntries(allowed: []Allowed, bySymbol: map<string, string>): int {
+  let stale = 0
+  for a of allowed {
+    let (_, declared) = bySymbol[a.symbol]
+    if (!declared) {
+      stale = stale + 1
+      eprint("externarchive: FAIL allowlist entry '${a.symbol}' names a symbol no stdlib file declares anymore — remove it\n")
+    }
+  }
+  return stale
+}
+
+// A count of zero here would mean the ar/object reader is broken (or read
+// the wrong file), not that the archives genuinely define nothing — either
+// way, silently treating it as "nothing to check against" is exactly the
+// all-clear-that-lies trap this gate must not fall into.
+fn loadArchiveSymbols(root: string): ArchiveSymbols {
+  let macosBytes = loadArchive("aarch64-macos", "${root}/bit-out/lib/aarch64-macos/libbitrt.a")
+  let arm64lxBytes = loadArchive("aarch64-linux", "${root}/bit-out/lib/aarch64-linux/libbitrt.a")
+  let x64lxBytes = loadArchive("x86_64-linux", "${root}/bit-out/lib/x86_64-linux/libbitrt.a")
+
+  let syms = ArchiveSymbols{
+    macos: archiveDefinedSymbols("aarch64-macos", macosBytes, true),
+    arm64lx: archiveDefinedSymbols("aarch64-linux", arm64lxBytes, false),
+    x64lx: archiveDefinedSymbols("x86_64-linux", x64lxBytes, false),
+  }
+  if (len(syms.macos) == 0 || len(syms.arm64lx) == 0 || len(syms.x64lx) == 0) {
+    panic("externarchive: an archive parsed to zero defined global symbols — reader or path is broken")
+  }
+  print("externarchive: aarch64-macos archive: ${len(syms.macos)} defined global symbol(s)\n")
+  print("externarchive: aarch64-linux archive: ${len(syms.arm64lx)} defined global symbol(s)\n")
+  print("externarchive: x86_64-linux archive: ${len(syms.x64lx)} defined global symbol(s)\n")
+  return syms
+}
+
+fn runCheck(root: string): GateResult {
+  let syms = loadArchiveSymbols(root)
+
+  let walk = WalkResult{ externs: []ExternDecl(0), filesScanned: 0 }
+  walkStdlib("${root}/stdlib", walk, maxScanDepth)
+  if (walk.filesScanned == 0 || len(walk.externs) == 0) {
+    panic("externarchive: scanned ${walk.filesScanned} stdlib file(s), found ${len(walk.externs)} extern fn declaration(s) — the walk or the line scan is broken")
+  }
+
+  let bySymbol = dedupeExterns(walk.externs)
+  let allowed = allowedAsymmetries()
+  let mismatches = 0
+  for (symbol, file) of bySymbol {
+    if (!checkSymbolPresence(symbol, file, syms, allowed)) {
+      mismatches = mismatches + 1
+    }
+  }
+  mismatches = mismatches + checkStaleAllowlistEntries(allowed, bySymbol)
+
+  return GateResult{
+    checked: len(bySymbol), mismatches: mismatches,
+    filesScanned: walk.filesScanned, declTotal: len(walk.externs),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Self-test — proves the ar-parsing and comparison logic can distinguish a
+// correct case from a broken one, run before every real scan (mirrors
+// _tests_/bit/filesize.bit's selfTest()). Only bytes-level machinery is
+// exercised here; the ELF/Mach-O object reader itself is ../objread's own
+// contract, already exercised by rootpins/stwwiring. `arMagic`,
+// `arResolveName` and `parseArchiveMembers` below are arread.bit's — no
+// import needed, sibling files share one module.
+// ---------------------------------------------------------------------------
+
+fn padField(s: string, width: int): string {
+  let out = s
+  while (len(out) < width) {
+    out = out + " "
+  }
+  return out
+}
+
+// Builds a FRESH byte slice rather than growing `a` in place: `a`'s own
+// backing array is never passed to `append`, so a caller holding onto `a`
+// separately (this file's own `buildOneMemberArchive` reassigns its
+// accumulator at each call site, but a future caller might not) can never
+// observe it mutated.
+fn concatBytes(a: []u8, b: []u8): []u8 {
+  let out = []u8(0)
+  for x of a {
+    out = append(out, x)
+  }
+  for x of b {
+    out = append(out, x)
+  }
+  return out
+}
+
+// One well-formed GNU-format ar archive holding a single member
+// ("name" + "/", short inline name) with `data` as its content — `data`
+// must be even length so no padding byte is needed after it.
+fn buildOneMemberArchive(name: string, data: []u8): []u8 {
+  let header = padField("${name}/", 16) +
+    padField("0", 12) +
+    padField("0", 6) +
+    padField("0", 6) +
+    padField("0", 8) +
+    padField("${len(data)}", 10) +
+    "`\n"
+  let out = []u8(arMagic())
+  out = concatBytes(out, []u8(header))
+  out = concatBytes(out, data)
+  return out
+}
+
+fn selfCheck(cond: bool, msg: string): int {
+  if (!cond) {
+    eprint("externarchive: SELFTEST FAILED: ${msg}\n")
+    return 1
+  }
+  return 0
+}
+
+fn selfTestExternNameFromLine(): int {
+  let failed = 0
+  failed = failed +
+    selfCheck(
+        externNameFromLine("extern fn bit_rt_prof_start(intervalMicros: int): int") ==
+        "bit_rt_prof_start",
+      "did not extract the name before '(' from a parameterized declaration",
+    )
+  failed = failed +
+    selfCheck(
+      externNameFromLine("extern fn bit_rt_gc_addr()") == "bit_rt_gc_addr",
+      "did not extract the name before '(' from a no-arg declaration",
+    )
+  failed = failed +
+    selfCheck(
+      externNameFromLine("extern fn bit_rt_prof_stop(): int") == "bit_rt_prof_stop",
+      "did not stop at '(' when a return type follows",
+    )
+  return failed
+}
+
+fn selfTestPresence(): int {
+  let failed = 0
+  let all = presenceAll()
+  failed = failed +
+    selfCheck(presenceEqual(all, all), "presenceEqual rejected two identical Presence values")
+  failed = failed +
+    selfCheck(
+      !presenceEqual(all, Presence{ macos: true, arm64lx: false, x64lx: true }),
+      "presenceEqual accepted two DIFFERENT Presence values",
+    )
+  failed = failed +
+    selfCheck(
+      presenceStr(Presence{ macos: false, arm64lx: false, x64lx: false }) == "(none)",
+      "presenceStr did not render an all-absent Presence as '(none)'",
+    )
+  failed = failed +
+    selfCheck(
+      presenceStr(Presence{ macos: true, arm64lx: false, x64lx: false }) == "aarch64-macos",
+      "presenceStr did not render a macOS-only Presence correctly",
+    )
+  return failed
+}
+
+fn selfTestArResolveName(): int {
+  let failed = 0
+  // GNU short inline name.
+  let gnuShort = arResolveName("t", "runtime.o/", []u8(0), []u8(0))
+  failed = failed +
+    selfCheck(gnuShort.name == "runtime.o", "GNU inline short-name resolution failed")
+  // GNU long name via the "//" table: table holds "runtime_cryptohw.o/\n",
+  // entry references offset 0.
+  let table = []u8("runtime_cryptohw.o/\n")
+  let gnuLong = arResolveName("t", "/0", table, []u8(0))
+  failed = failed +
+    selfCheck(gnuLong.name == "runtime_cryptohw.o", "GNU long-name table resolution failed")
+  // BSD "#1/<len>": name is the first `len` bytes of data, NUL-padded.
+  let bsdData = concatBytes([]u8("runtime.o"), []u8{ u8(0), u8(0), u8(0) })
+  let bsd = arResolveName("t", "#1/12", []u8(0), bsdData)
+  failed = failed + selfCheck(bsd.name == "runtime.o", "BSD #1/<len> name resolution failed")
+  failed = failed +
+    selfCheck(bsd.dataStart == 12, "BSD #1/<len> did not report the real content's start offset")
+  return failed
+}
+
+fn selfTestParseArchiveMembers(): int {
+  let failed = 0
+  let data = []u8("AB") // even length: no inter-member padding needed
+  let archive = buildOneMemberArchive("test.o", data)
+  let members = parseArchiveMembers("selftest", archive)
+  failed = failed +
+    selfCheck(len(members) == 1, "expected exactly one member from a one-member archive")
+  if (len(members) == 1) {
+    failed = failed + selfCheck(members[0].name == "test.o", "recovered the wrong member name")
+    failed = failed +
+      selfCheck(
+        len(members[0].data) == 2 && members[0].data[0] == u8(65) && members[0].data[1] == u8(66),
+        "recovered the wrong member data",
+      )
+  }
+  return failed
+}
+
+// The comparison logic itself, run against synthetic presence maps rather
+// than real archives — proves a genuinely asymmetric, unlisted symbol is
+// flagged, a listed one with matching presence is not, and a stale listed
+// entry (real presence no longer matches its recorded expectation) IS
+// flagged. This is the mutation proof's LOGIC half; the DATA half (that the
+// real archives really do produce exactly this shape) is proven separately
+// against merged main and recorded on the ticket.
+fn selfTestTwoWayAssertion(): int {
+  let failed = 0
+  let allowed = allowedAsymmetries()
+
+  // An unlisted asymmetric symbol must mismatch against the default
+  // (present-everywhere) expectation.
+  let unlisted = Presence{ macos: true, arm64lx: false, x64lx: false }
+  let (_, isListed1) = findAllowed("bit_rt_totally_unlisted_symbol", allowed)
+  failed = failed + selfCheck(!isListed1, "an invented symbol name was found in the allowlist")
+  failed = failed +
+    selfCheck(
+      !presenceEqual(unlisted, presenceAll()),
+      "an asymmetric presence equalled the default present-everywhere expectation",
+    )
+
+  // A listed symbol whose real presence matches its recorded expectation
+  // must NOT mismatch.
+  let (profEntry, isListed2) = findAllowed("bit_rt_prof_start", allowed)
+  failed = failed + selfCheck(isListed2, "bit_rt_prof_start is missing from allowedAsymmetries()")
+  let matching = Presence{ macos: true, arm64lx: false, x64lx: false }
+  failed = failed +
+    selfCheck(
+      presenceEqual(matching, profEntry.expect),
+      "a presence matching the documented prof asymmetry was reported as a mismatch",
+    )
+
+  // A listed symbol whose real presence has drifted from its recorded
+  // expectation (e.g. Linux support was added) MUST mismatch — this is the
+  // stale-allowlist-entry half of the two-way assertion.
+  let drifted = presenceAll()
+  failed = failed +
+    selfCheck(
+      !presenceEqual(drifted, profEntry.expect),
+      "a DRIFTED presence (all-present) was not flagged against the macOS-only allowlist entry",
+    )
+
+  return failed
+}
+
+fn selfTest(): int {
+  return selfTestExternNameFromLine() +
+    selfTestPresence() +
+    selfTestArResolveName() +
+    selfTestParseArchiveMembers() +
+    selfTestTwoWayAssertion()
+}
+
+// ---------------------------------------------------------------------------
+
+fn repoRoot(): string {
+  let override = env("BIT_REPO")
+  if (len(override) > 0) {
+    return override
+  }
+  for c of [".", "..", "../..", "../../.."] {
+    if (isDir("${c}/_tests_/bit")) {
+      return c
+    }
+  }
+  panic("externarchive: cannot locate a _tests_/bit directory from this cwd; set BIT_REPO")
+}
+
+fn main() {
+  let selfFailed = selfTest()
+  if (selfFailed != 0) {
+    eprint("externarchive: SELFTEST FAILED — ${selfFailed} case(s); aborting before the real scan\n")
+    osExit(1)
+  }
+
+  let root = repoRoot()
+  let r = runCheck(root)
+  print("externarchive: ${r.checked} distinct extern symbol(s) (${r.declTotal} declaration(s) across ${r.filesScanned} stdlib file(s)) checked against 3 archives, ${r.mismatches} mismatch(es)\n")
+  if (r.mismatches != 0) {
+    eprint("externarchive: FAILED — ${r.mismatches} mismatch(es)\n")
+    osExit(1)
+  }
+  print("externarchive: PASS\n")
+}
