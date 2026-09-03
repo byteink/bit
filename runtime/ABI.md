@@ -151,7 +151,7 @@ two-pass `BIT_STAGE0_BIN` landing.
 arm `i`'s payload from `8 + 8*i` directly off the subject object
 (`bindArmPayload`) — there is no intermediate box read. `lowerVariantConstruction`
 is the only writer of a payload word and `bindArmPayload` the only reader; both
-take the offset from `enumPayloadBase` in `compiler/lowercall.bit`, because a
+take the offset from `enumPayloadBase` in `compiler/lowerlayout.bit`, because a
 writer and a reader that disagree here produce a wrong answer with no
 diagnostic, not a crash.
 
