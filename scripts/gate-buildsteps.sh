@@ -4,15 +4,18 @@
 # functions: bucket_scripts() is unchanged; build_steps_for_bucket(),
 # union_testsbit_steps(), assert_full_is_superset() and validate_build_steps()
 # each wrap a previously-inline block with no change to the statements inside
-# it. Source this after `cd`-ing to the repo root, and after BUCKET/REASON/
-# testsbit_steps/has_testsbit are already set by gate.sh's own bucket-
-# selection logic — every function here reads those as globals rather than
-# taking parameters, matching gate.sh's own existing style (bucket_scripts()
-# already did this for BUCKET_PRE/BUCKET_POST before this file existed).
+# it. union_spec_steps() (#4136) is the one function here that is NOT a pure
+# move — see its own comment. Source this after `cd`-ing to the repo root,
+# and after BUCKET/REASON/testsbit_steps/has_testsbit/SPEC_PARTNER are
+# already set by gate.sh's own bucket-selection logic — every function here
+# reads those as globals rather than taking parameters, matching gate.sh's
+# own existing style (bucket_scripts() already did this for
+# BUCKET_PRE/BUCKET_POST before this file existed).
 #
-# Call order, exactly as gate.sh used to run this code inline:
+# Call order, exactly as gate.sh runs this code:
 #   build_steps_for_bucket   # sets BUILD_STEPS from BUCKET
 #   union_testsbit_steps     # folds testsbit_steps into BUILD_STEPS + REASON
+#   union_spec_steps         # folds test-spec into BUILD_STEPS + REASON (#4136)
 #   assert_full_is_superset  # every bucket's scripts must be gate_scripts+ #2194
 #   bucket_scripts "${BUCKET}"; PRE_SCRIPTS=...; POST_SCRIPTS=...
 #   validate_build_steps     # STALE check against ./make --list
@@ -240,6 +243,23 @@ case "${BUCKET}" in
     fi
     ;;
 esac
+}
+
+# #4136's FOURTH NARROW EXCEPTION — same shape as union_testsbit_steps() just
+# above: folds one extra gate (test-spec) into whichever bucket
+# build_steps_for_bucket already selected, rather than owning a bucket of its
+# own. SPEC_PARTNER (scripts/gate.sh, set ahead of bucket selection) is empty
+# unless the diff resolved BUCKET by way of the spec-pairing exception, so
+# this is a no-op for every other bucket, including `full` (test-spec already
+# runs there via the aggregate `test` step) and `testsbit`/`stdlibdocs` (spec
+# cannot pair with either — see SPEC_PARTNER's own computation).
+union_spec_steps() {
+  [ -n "${SPEC_PARTNER:-}" ] || return 0
+  case " ${BUILD_STEPS[*]} " in
+    *" test-spec "*) ;;
+    *) BUILD_STEPS+=("test-spec") ;;
+  esac
+  REASON="${REASON}; spec/SPEC.md also changed — added gate(s): test-spec"
 }
 
 assert_full_is_superset() {

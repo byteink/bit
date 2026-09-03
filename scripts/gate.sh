@@ -157,7 +157,7 @@
 # directly instead of `--full`; see gate-filemap.sh's header for the full
 # reasoning.
 #
-# THREE NARROW EXCEPTIONS (#2435, #3055), because registering a gate is
+# FOUR NARROW EXCEPTIONS (#2435, #3055, #4136), because registering a gate is
 # mandatory in this repo and otherwise forces `full` on every single ticket
 # that adds one:
 #   - _tests_/bit/**, _tests_/imports/**, and _tests_/stress/** (#2825 added the
@@ -198,6 +198,21 @@
 #     in the same diff. See `stdlib_docs_pairing_ok` below for the exact
 #     check. Any docs/*.md outside docs/stdlib/, or a docs/stdlib/<mod>.md
 #     with no matching stdlib/<mod>/** change, still forces `full`.
+#   - spec/SPEC.md paired with exactly ONE other bucket (#4136): spec/SPEC.md's
+#     own gate (test-spec, #2758) is a single self-contained grammar check
+#     with no PRE/POST script and no cross-file consistency requirement
+#     (unlike the stdlib+docs pairing just above, which needs
+#     stdlib_docs_pairing_ok's per-module check) — pairing it with ANY other
+#     single bucket can never make that bucket's own steps insufficient, so
+#     unioning in test-spec is unconditionally safe. Resolves to the OTHER
+#     bucket's own name (not a new "<x>spec" bucket) with test-spec unioned
+#     into its BUILD_STEPS by union_spec_steps() (scripts/gate-buildsteps.sh)
+#     — the same shape testsbit already uses to ride alongside a bucket
+#     without owning one (see the first exception above). Only fires when
+#     spec is paired with exactly one of the other seven areas (bucket_count
+#     == 2, computed below): spec alongside an already-multi-area diff —
+#     including stdlibdocs, which is itself two areas — still forces `full`,
+#     since that is genuinely more than "exactly two buckets".
 #
 # selfhost and examples pull in a non-`./make` diff script
 # (selfhost-diffcheck.sh/selfhost-fixpoint.sh, selfhost-diffexamples.sh).
@@ -493,6 +508,25 @@ if [ "${has_testsbit}" -eq 1 ]; then
   [ -z "${testsbit_steps}" ] && testsbit_unmapped=1
 fi
 
+# FOURTH NARROW EXCEPTION (#4136) — see the header comment block above.
+# Computed here, ahead of bucket selection, the same way SPEC_PARTNER is the
+# one OTHER area (of the seven non-spec ones) spec may safely pair with; empty
+# unless bucket_count is exactly 2 with spec as one of the two, so it can
+# never fire alongside stdlibdocs (already 2 areas on its own) or any wider
+# diff. union_spec_steps() (scripts/gate-buildsteps.sh) reads this same
+# global to union test-spec into whichever bucket SPEC_PARTNER names.
+SPEC_PARTNER=""
+if [ "${bucket_count}" -eq 2 ] && [ "${has_spec}" -eq 1 ]; then
+  if [ "${has_selfhost}" -eq 1 ]; then SPEC_PARTNER="selfhost"
+  elif [ "${has_runtime}" -eq 1 ]; then SPEC_PARTNER="runtime"
+  elif [ "${has_testcases}" -eq 1 ]; then SPEC_PARTNER="testcases"
+  elif [ "${has_examples}" -eq 1 ]; then SPEC_PARTNER="examples"
+  elif [ "${has_stdlib}" -eq 1 ]; then SPEC_PARTNER="stdlib"
+  elif [ "${has_pkg}" -eq 1 ]; then SPEC_PARTNER="pkg"
+  elif [ "${has_docs}" -eq 1 ]; then SPEC_PARTNER="docs"
+  fi
+fi
+
 BUCKET=""
 REASON=""
 if [ "${FULL}" -eq 1 ]; then
@@ -510,6 +544,16 @@ elif [ "${bucket_count}" -eq 2 ] && [ "${has_stdlib}" -eq 1 ] && [ "${has_docs}"
   # `full` exactly as it did before this exception existed.
   BUCKET="stdlibdocs"
   REASON="only stdlib/** and its paired docs/stdlib/**.md changed (${touched_list})"
+elif [ -n "${SPEC_PARTNER}" ] && [ "${testsbit_unmapped}" -eq 0 ]; then
+  # FOURTH NARROW EXCEPTION (#4136) — see the header comment block and the
+  # SPEC_PARTNER computation above. BUCKET stays the partner's own name (not
+  # a new combined bucket) so bucket_scripts()/build_steps_for_bucket() need
+  # no new case arms; union_spec_steps() below adds test-spec on top. Guarded
+  # by testsbit_unmapped for the same reason the stdlibdocs exception above
+  # is: an unmapped _tests_/bit/** file riding alongside must still force
+  # `full`.
+  BUCKET="${SPEC_PARTNER}"
+  REASON="only ${SPEC_PARTNER}/** and spec/SPEC.md changed (${touched_list})"
 elif [ "${bucket_count}" -gt 1 ]; then
   BUCKET="full"
   REASON="spans more than one bucket: ${touched_list}"
@@ -607,12 +651,15 @@ fi
 # and assert_full_is_superset() all live in scripts/gate-buildsteps.sh; see
 # its header comment for what each does. Pure move, wrapped into named
 # functions: the call order below is exactly the order this code used to run
-# inline.
+# inline. union_spec_steps() (#4136) is the one addition — same shape as
+# union_testsbit_steps() just above it, folding SPEC_PARTNER's gate in on top
+# of whichever bucket build_steps_for_bucket already selected.
 # shellcheck source=scripts/gate-buildsteps.sh
 . scripts/gate-buildsteps.sh
 
 build_steps_for_bucket
 union_testsbit_steps
+union_spec_steps
 if [ "${RESUME}" -eq 1 ]; then
   gate_resume_inject_new_gates
 fi
