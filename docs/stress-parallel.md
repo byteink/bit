@@ -21,7 +21,7 @@ Reproduce the whole table with:
 ```
 
 This is registered in `coreSteps()`, not `gateSteps()`
-(`tools/build/defs.bit:104`, `tools/build/gates.bit:443`), so it is
+(`tools/build/defs.bit:104`, `tools/build/gatestable2.bit:206`), so it is
 deliberately **not** part of `./make test` — same shape as
 `test-stress`/`test-differentials`.
 
