@@ -2,10 +2,11 @@
 // optcse.bit and optstore.bit in the same module, split out for the same
 // reason: opt.bit is at its size limit.
 //
-// THIS FILE IS THE ANALYSIS HALF: it answers what may move and produces a
-// `LicmPlan`. optloopemit.bit performs the plan from inside opt.bit's
-// `rebuildBlock`. They were one file until #4063 took it past 800 lines; the
-// plan is the only state they share.
+// THIS FILE IS THE LOOP HALF: it finds the loops and answers which of a
+// header's parameters hold the same value on every iteration. optloopcand.bit
+// answers which instruction may then leave one (#4052) and owns `LicmPlan`;
+// optloopemit.bit performs the plan from inside opt.bit's `rebuildBlock`
+// (#4063). All three are one module; the plan is the only state they share.
 //
 // optcse.bit forwards a load to a LATER identical load, and never crosses a
 // back edge — that is stated in its header as the property that keeps it away
@@ -72,37 +73,24 @@
 //
 // ## What this pass hoists, and what it REFUSES
 //
-// ACCEPTS `slice_len`, and `field_get` at a NON-ZERO offset, whose operand is
-// an invariant header param. Both read one word of a header through the
-// null-safe path (`emitHeaderWordOrZero`): they cannot fault and cannot trap,
-// so performing one before a loop that turns out to run zero times is safe.
+// The per-instruction answer is optloopcand.bit's, and its header is where the
+// reasons live. What this file contributes to it is `LicmScan.clobbered`: does
+// any block of this loop write memory, allocate, call, or trap.
 //
-// REFUSES `field_get` at offset 0. Word 0 of every header shape in
-// runtime/ABI.md §2 is the payload POINTER, and loweraccess.bit's header
-// states the hazard in terms of this exact pass: `buf` is a GC-managed pointer
-// typed `i64`, so no stack map describes it, and what makes that sound is that
-// its live range contains no safepoint. Hoisting it puts it across the loop's
-// back-edge poll. That is #4053, and it needs the collector's answer, not a
-// predicate change.
+// That bounds LOADS ONLY, and the split is the point. `slice_len` and
+// `field_get` read a header word, and `bit_rt_slice_append` mutates a header IN
+// PLACE (slices.bit:238), so a call in the loop really can change `len` or
+// `off` underneath such a hoist. A pure computation over header parameters is
+// immune — its operands are SSA values that no call can reach — so a loop full
+// of calls still yields its invariant arithmetic.
 //
-// REFUSES every arithmetic op. `bit build --debug` traps signed add/sub/mul/
-// neg on overflow (arm64select.bit:506, `cx.debug && w.signed`), `cx.debug` is
-// a codegen flag the optimizer cannot see, and the loop guard may be false on
-// entry — so a hoisted `mul` can trap on an iteration the program never ran.
-// That is #4052, and it is a decision about `--debug`, not a predicate.
-//
-// REFUSES every load in a loop containing a call, `gc_alloc`, `make_closure`,
-// a syscall, inline asm, any atomic, a `field_set`, or a trapping divide.
-// `bit_rt_slice_append` mutates the header IN PLACE (slices.bit:238), so a
-// call really can change `len` and `off` underneath a hoist.
-//
-// REFUSES an `index_set` only when it cannot prove the store lands in a slice
-// ELEMENT BUFFER. `rtSliceNew` (slices.bit:221) allocates the header with
+// An `index_set` counts as a clobber only when it cannot be proven to land in a
+// slice ELEMENT BUFFER. `rtSliceNew` (slices.bit:221) allocates the header with
 // `gcAlloc` and the buffer with `allocBuf` — two distinct heap objects — so a
-// store through `field_get X[0]` with `X` slice-typed cannot reach any
-// header's words. Every other `index_set` clobbers, including the raw-pointer
-// form module state uses (§11.11), whose base is a `global_addr` and not a
-// header word at all.
+// store through `field_get X[0]` with `X` slice-typed cannot reach any header's
+// words. Every other `index_set` clobbers, including the raw-pointer form
+// module state uses (§11.11), whose base is a `global_addr` and not a header
+// word at all.
 //
 // ## What it does NOT model
 //
@@ -381,38 +369,6 @@ fn licmMarkVarying(lc: LicmCtx, inv: []bool, p: int, h: int) {
   }
 }
 
-// An `index_set` lands in a slice's element buffer iff its base is
-// `field_get X[0]` with `X` slice-typed — the one shape
-// `emitInlineSliceElem` produces. `rtSliceNew` allocates the header and the
-// buffer as two distinct objects, so such a store cannot reach a header word.
-fn licmWritesSliceBuf(f: IrFunc, ctx: TypeContext, base: int): bool {
-  let b = f.instrs[base]
-  if (b.op != Op.FieldGet || b.ival != 0) {
-    return false
-  }
-  return ctx.types[f.instrs[b.lhs].ty].kind == TypeKind.Slice
-}
-
-// What stops a header word being hoisted out of this loop. Derived from
-// `isSideEffecting` rather than listed, which is optstore.bit's rule 3: an op
-// added later that writes memory must join that predicate or DCE would already
-// be deleting it, so it becomes a barrier here the day it lands.
-//
-// `index_get` is a pure load whose only effect is a bounds panic, and a panic
-// does not return. A TERMINATOR writes no memory; the one memory-relevant
-// thing it does is the back-edge poll, and the collector is non-moving and
-// cannot change a live header's `len` or `off`.
-fn licmClobbers(f: IrFunc, ctx: TypeContext, idx: int): bool {
-  let ins = f.instrs[idx]
-  if (ins.op == Op.IndexGet) {
-    return false
-  }
-  if (ins.op == Op.IndexSet) {
-    return !licmWritesSliceBuf(f, ctx, ins.lhs)
-  }
-  return isSideEffecting(ins.op) && !opIsTerminator(ins.op)
-}
-
 // Everything one candidate loop needs, in one record so the walk stays inside
 // `max-params`. `inv` is indexed by the header's param position; `args` is the
 // preheader edge's argument list, so `args[k]` is what invariant param `k`
@@ -421,6 +377,9 @@ fn licmClobbers(f: IrFunc, ctx: TypeContext, idx: int): bool {
 // compares a candidate only against hoists out of the SAME loop. Every entry
 // from `base` on shares this header, because `licmCollect` runs once per
 // header and appends nothing before it.
+// `clobbered` is whether any block of this loop writes memory, allocates,
+// calls or traps. It disqualifies the two header-word LOADS and nothing else —
+// see the header, and `licmHoistable` in optloopcand.bit for where it is spent.
 class LicmScan {
   known: []ConstVal,
   fwd: []int,
@@ -429,90 +388,7 @@ class LicmScan {
   pre: int,
   args: []int,
   base: int,
-}
-
-// The hoistable set, and the whole of it. Both ops read one header word
-// through the null-safe path, so neither faults on a null receiver and
-// neither can trap — which is what makes performing one ahead of a loop that
-// may run zero times safe. See the header for why offset 0 and every
-// arithmetic op are refused.
-fn licmHoistableOp(ins: IrInstr): bool {
-  if (ins.op == Op.SliceLen) {
-    return true
-  }
-  return ins.op == Op.FieldGet && ins.ival != 0
-}
-
-// The header parameter position `idx` reads, or -1 when it is not hoistable
-// out of `sc`'s loop: not one of the two ops, already answered by folding or by
-// optstore/optcse's forwarding map, or reading something that is not LITERALLY
-// an invariant param of this loop's header.
-//
-// THE OPERAND IS NOT RESOLVED HERE, and that is a correctness rule rather than
-// a missed opportunity. `licmResolve` will happily prove that an inner loop's
-// param equals an outer one's, and hoisting on that basis lands the definition
-// outside a loop that still reads it — which verify.bit rejects outright
-// ("reads %N, which is defined outside the loop closed by the back edge in
-// bbK"). A hoist across two loop levels has to thread the value through the
-// inner header's parameter list as well; that is not what this pass does.
-//
-// Demanding a literal param of `h` makes the depth question disappear.
-// verify.bit already rejects any input in which a block inside a nested loop
-// reads a value defined outside it, so an operand that IS `h`'s param proves
-// the reading block is not inside a loop nested within `h` — nothing here has
-// to compute loop depth to know it.
-fn licmHoistSlot(lc: LicmCtx, sc: LicmScan, idx: int): int {
-  if (sc.known[idx].known || sc.fwd[idx] >= 0) {
-    return -1
-  }
-  if (!licmHoistableOp(lc.f.instrs[idx])) {
-    return -1
-  }
-  let k = lc.f.instrs[idx].lhs - lc.f.blocks[sc.hdr].instsStart
-  if (k < 0 || k >= len(sc.inv) || !sc.inv[k]) {
-    return -1
-  }
-  return k
-}
-
-// The hoists this rebuild must perform. `home[i]` is the preheader block
-// instruction `i` moves into and `hdr[i]` the header whose parameter list it
-// joins, both -1 for the instructions that stay put. `ids` lists the hoisted
-// instructions and `pre` is parallel to it: the OLD value id each one's
-// operand takes on in the preheader, which is the preheader edge's argument
-// for the invariant param it reads.
-//
-// PARAMS AND ARGUMENTS ARE BOTH EMITTED BY WALKING `ids` IN ORDER and keeping
-// only the entries for one header, so the two orders agree by construction
-// rather than by a sort.
-//
-// `dupOf` is parallel to `ids` as well: the OLD instruction id of an earlier
-// hoist out of the same loop that computes exactly this, or -1. A duplicate is
-// emitted nowhere and joins no parameter list — it takes the original's new id
-// in `remap`. Discovery order puts the original earlier in `ids`, so that id is
-// always written before it is read (#4063).
-class LicmPlan {
-  home: []int,
-  hdr: []int,
-  ids: []int,
-  pre: []int,
-  dupOf: []int,
-}
-
-// The neutral plan: nothing hoisted. Every rebuild that is not doing LICM
-// passes this rather than the rebuild carrying a special case.
-fn noLicm(n: int): LicmPlan {
-  let home = []int(0)
-  let hdr = []int(0)
-  let i = 0
-  while (i < n) {
-    home = append(home, -1)
-    hdr = append(hdr, -1)
-    i = i + 1
-  }
-  return LicmPlan{
-    home: home, hdr: hdr, ids: []int(0), pre: []int(0), dupOf: []int(0),
-  }
+  clobbered: bool,
 }
 
 // The per-function analysis state, bundled for the same reason `LicmScan` is.
@@ -525,6 +401,9 @@ class LicmCtx {
   // the predecessors of a block param it is handed by value id alone.
   owner: []int,
   plan: LicmPlan,
+  // `bit build --debug`, the only build flag any optimizer pass reads. It
+  // refuses one class of hoist; optloopcand.bit's header is the decision.
+  debug: bool,
 }
 
 // One entry per instruction slot naming its block. Blocks do not overlap and
@@ -608,12 +487,14 @@ fn licmResolve(lc: LicmCtx, v0: int): int {
 // #4051: fills a plan with every loop-invariant header word this function can
 // safely compute once. Every block is tried as a header; the refusals above do
 // the filtering, so there is no separate loop-nest structure to build.
-fn licmPlanFor(ctx: TypeContext, f: IrFunc, known: []ConstVal, fwd: []int): LicmPlan {
+fn licmPlanFor(
+  ctx: TypeContext, f: IrFunc, known: []ConstVal, fwd: []int, debug: bool,
+): LicmPlan {
   let plan = noLicm(len(f.instrs))
   let lc = LicmCtx{
     ctx: ctx, f: f, pm: licmPredMap(f),
     pos: blockOrderPositions(f, blockEmissionOrder(f)), owner: licmOwners(f),
-    plan: plan,
+    plan: plan, debug: debug,
   }
   let h = 0
   while (h < len(f.blocks)) {
@@ -634,14 +515,18 @@ fn licmPlanLoop(lc: LicmCtx, known: []ConstVal, fwd: []int, h: int) {
   if (len(args) != lc.f.blocks[h].paramCount || len(args) == 0) {
     return
   }
+  let inLoop = licmLoopBlocks(lc.f, lc.pm, h)
+  if (!licmSingleEntry(lc, inLoop, h)) {
+    return
+  }
+  // A clobbering loop is SCANNED, not refused. It yields no header-word hoist,
+  // but its invariant arithmetic is unaffected by anything a call can do — and
+  // refusing the loop outright is what kept `i * n` inside every bounds-checked
+  // inner loop in the tree, since the bounds panic is itself an `rt_call`.
   let sc = LicmScan{
     known: known, fwd: fwd,
     inv: licmInvariantParams(lc, h), hdr: h, pre: pre, args: args,
-    base: len(lc.plan.ids),
-  }
-  let inLoop = licmLoopBlocks(lc.f, lc.pm, h)
-  if (!licmSingleEntry(lc, inLoop, h) || licmLoopClobbers(lc, inLoop)) {
-    return
+    base: len(lc.plan.ids), clobbered: licmLoopClobbers(lc, inLoop),
   }
   licmCollect(lc, sc, inLoop)
 }
@@ -693,51 +578,4 @@ fn licmCollectBlock(lc: LicmCtx, sc: LicmScan, b: int) {
     }
     idx = idx + 1
   }
-}
-
-// An earlier hoist out of this same loop that computes exactly what `idx`
-// computes, or -1. The key is optcse.bit's `AvailKey` with the operand taken
-// AFTER the hoist: `op`, the byte offset `ival`, the result type `ty` — width
-// comes from `ty` at codegen, so two reads of one slot at different widths must
-// not answer each other — and `preArg`, the value the operand becomes in the
-// preheader. That is every field `emitFieldGet`/`emitSliceLen` reads.
-//
-// `for x of xs` is why this exists at all. Lowering threads `xs` into the
-// header TWICE, so the length test and the bounds test read `slice_len` of two
-// different param slots holding one slice. Both are invariant, both hoist, and
-// both land on the same preheader value. optcse collapses the two preheader
-// INSTRUCTIONS a round later, but not the two header params it left behind —
-// and `forceParamInterference` (codegenlive.bit:122) makes every param of a
-// block interfere, so the spare one costs a register across the whole loop.
-fn licmDupOf(lc: LicmCtx, sc: LicmScan, idx: int, preArg: int): int {
-  let ins = lc.f.instrs[idx]
-  let j = sc.base
-  while (j < len(lc.plan.ids)) {
-    let other = lc.f.instrs[lc.plan.ids[j]]
-    if (other.op == ins.op &&
-      other.ival == ins.ival &&
-      other.ty == ins.ty &&
-      lc.plan.pre[j] == preArg) {
-      return lc.plan.ids[j]
-    }
-    j = j + 1
-  }
-  return -1
-}
-
-fn licmRecord(lc: LicmCtx, sc: LicmScan, idx: int) {
-  let k = licmHoistSlot(lc, sc, idx)
-  if (k < 0) {
-    return
-  }
-  // `licmDupOf` FIRST: it scans `plan.ids`, so appending before asking makes
-  // every hoist match itself, which hands the rebuild `remap[idx] = remap[idx]`
-  // -- an unwritten slot, read as value id 0. That miscompiles silently and
-  // self-hosts clean (the corpus IR diff is what caught it).
-  let dup = licmDupOf(lc, sc, idx, sc.args[k])
-  lc.plan.home[idx] = sc.pre
-  lc.plan.hdr[idx] = sc.hdr
-  lc.plan.ids = append(lc.plan.ids, idx)
-  lc.plan.pre = append(lc.plan.pre, sc.args[k])
-  lc.plan.dupOf = append(lc.plan.dupOf, dup)
 }
