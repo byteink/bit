@@ -500,6 +500,12 @@ done
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+# Per-attempt-truncated captures for the two --dump-ir-pre calls below (#4207,
+# same #3478 shape as #4196/#4205): reused across iterations of the sequential
+# loop, which is safe because alarmrun_retry_cap truncates each before EVERY
+# attempt and the loop never runs the two sides concurrently.
+oraclecap="$work/dump.oracle"
+bit2cap="$work/dump.bit2"
 
 match=0 skip=0 total=0
 : >"$work/mismatch"
@@ -515,8 +521,14 @@ for f in $(find runtime -name '*.bit' | sort); do
   # The oracle is bounded too (#2070). Its timeout is NOT a skip: a skip means
   # the oracle could not lower the file, an expected outcome, while a hang is a
   # broken stage0 — and an unbounded oracle wedged this gate with no message.
-  a=$(alarmrun_retry ORACLE "" "$ORACLE" --dump-ir-pre "$f")  # #3422: verdict-deciding retry
+  # #3422: verdict-deciding retry, via the capture-truncating retry helper
+  # (#3490) so a stalled first attempt's partial bytes can never survive as a
+  # prefix inside the retried attempt's compared payload (#3478, #4207) — the
+  # old `a=$(alarmrun_retry ...)` command substitution was a sink opened once
+  # for both attempts.
+  alarmrun_retry_cap ORACLE "" "$oraclecap" "$ORACLE" --dump-ir-pre "$f"
   arc=$?
+  a=$(cat "$oraclecap")
   if [ "$arc" -eq 142 ]; then
     echo "$f${sep}$(whydied "$arc")" >>"$work/oracletimeout"
     continue
@@ -532,8 +544,10 @@ for f in $(find runtime -name '*.bit' | sort); do
     continue
   fi
 
-  b=$(alarmrun_retry BIT2 "" "$BIT2" --dump-ir-pre "$f")  # #3422: verdict-deciding retry
+  # Same conversion as the ORACLE call above (#4207).
+  alarmrun_retry_cap BIT2 "" "$bit2cap" "$BIT2" --dump-ir-pre "$f"
   rc=$?
+  b=$(cat "$bit2cap")
   # >=128 is death by signal, and WHICH signal is not a detail: 142 is our own
   # alarm, anything else is the compiler crashing. Either way no verdict (#2070).
   if [ "$rc" -ge 128 ]; then

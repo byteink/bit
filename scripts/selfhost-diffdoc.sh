@@ -90,18 +90,21 @@ probe_doc() {
   local bin=$1 dir="$work/probe.$2"
   mkdir -p "$dir"
   printf 'export fn inc(n: i64): i64 {\n  return n + 1\n}\n' >"$dir/m.bit"
-  local out
+  local cap="$work/probe.$2.out"
   # Verdict-deciding (#3422): a single stall here aborts the WHOLE differential
-  # as could-not-decide, so it gets alarmrun_retry's one retry like the main
-  # loop below, not the bare alarmrun the two forbidden report sites keep.
-  out=$(ALARMRUN_KEEP_STDERR=1 alarmrun_retry "$2" "" "$bin" doc "$dir" 2>&1)
+  # as could-not-decide, so it gets one retry-on-stall like the main loop
+  # below, via the capture-truncating retry helper (#3490) whose capture is
+  # truncated before EACH attempt — so a stalled first attempt's partial
+  # bytes and bash's own "Alarm clock" note can never survive into the
+  # retried attempt's compared payload (#3478).
+  alarmrun_retry_cap "$2" "" "$cap" "$bin" doc "$dir"
   local rc=$?
   if [ "$rc" -eq 142 ]; then
     echo "diffdoc: PROBE TIMEOUT — $bin hung on the capability probe after ${TIMEOUT}s" >&2
     echo "diffdoc: nothing was compared — a hung probe is not evidence of absence." >&2
     exit 2
   fi
-  if printf '%s' "$out" | grep -q 'unknown subcommand'; then
+  if grep -q 'unknown subcommand' "$cap"; then
     return 1
   fi
   return 0
@@ -166,24 +169,26 @@ run_oracle_pair() {
   # ORACLE wedged this script indefinitely — exactly the shape
   # selfhost-diffcheck.sh's header warns about ("the seed side had no bound at
   # all, so a hung ORACLE wedged the whole gate indefinitely"). Verdict-deciding
-  # (#3422): alarmrun_retry's one retry-on-stall, outfile "" since the redirect
-  # below already targets a fresh per-iteration path.
-  alarmrun_retry ORACLE "" "$ORACLE" doc "$d" >"$work/seed.plain"
+  # (#3422): one retry-on-stall via the capture-truncating retry helper
+  # (#3490) — a caller-owned `>"$work/seed.plain"` redirect opened once for
+  # both attempts used to let a stalled first attempt's partial bytes survive
+  # into the retried attempt's compared payload (#3478).
+  alarmrun_retry_cap ORACLE "" "$work/seed.plain" "$ORACLE" doc "$d"
   seed_rc=$?
   if [ "$seed_rc" -eq 0 ]; then
-    alarmrun_retry ORACLE "" "$ORACLE" doc --json "$d" >"$work/seed.json"
+    alarmrun_retry_cap ORACLE "" "$work/seed.json" "$ORACLE" doc --json "$d"
     seed_json_rc=$?
   else
-    : >"$work/seed.json"
+    : > "$work/seed.json"
   fi
   printf '%s %s\n' "$seed_rc" "$seed_json_rc" >"$work/oracle.status"
 }
 
 run_bit2_pair() {
   local d=$1 bit_rc bit_json_rc
-  alarmrun_retry BIT2 "" "$BIT2" doc "$d" >"$work/bit.plain"
+  alarmrun_retry_cap BIT2 "" "$work/bit.plain" "$BIT2" doc "$d"
   bit_rc=$?
-  alarmrun_retry BIT2 "" "$BIT2" doc --json "$d" >"$work/bit.json"
+  alarmrun_retry_cap BIT2 "" "$work/bit.json" "$BIT2" doc --json "$d"
   bit_json_rc=$?
   printf '%s %s\n' "$bit_rc" "$bit_json_rc" >"$work/bit2.status"
 }
