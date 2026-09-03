@@ -312,6 +312,46 @@ only, because only a `DateTime` already has an instant to preserve.
 else below — the `Time`/`NaiveDateTime`/`DateTime` fields, and the
 `DateTime`-only and `Timestamp`-only rows — is not yet implemented.
 
+### `Date.year(): int`
+
+The calendar year, 1..9999.
+
+### `Date.month(): int`
+
+The calendar month, 1..12.
+
+### `Date.day(): int`
+
+The day of month, 1..`daysInMonth()`.
+
+### `Date.dayOfWeek(): int`
+
+1 for Monday through 7 for Sunday — ISO 8601 numbering. The superseded
+`Civil.weekday` is 0 for Sunday through 6 for Saturday; this is a
+deliberately different numbering, not a bug.
+
+### `Date.dayOfYear(): int`
+
+1 for January 1 up to 365, or 366 in a leap year, for December 31.
+
+### `Date.quarter(): int`
+
+1..4: January-March is 1, April-June is 2, July-September is 3,
+October-December is 4.
+
+### `Date.daysInMonth(): int`
+
+28..31, leap years included.
+
+### `Date.weekOfYear(): int`
+
+1..53, the full ISO 8601 week-date algorithm: week 1 is the week containing
+the year's first Thursday, and weeks start on Monday. A date in the last
+days of December can fall in week 1 of the following ISO year, and a date
+in the first days of January can fall in the last week (52 or 53) of the
+previous one — the returned number is scoped to that ISO week-numbering
+year, which need not equal `year()`.
+
 Available on every type that carries the field.
 
 | Method | Returns | On |
@@ -443,6 +483,11 @@ fn inDay(t: Timestamp, dayStart: Timestamp, nextDayStart: Timestamp): bool {
 `isBefore`, `isAfter`, `isSame`, `isBetween`, `compare`, `isSameDay`,
 `isSameMonth`, `isSameYear`, `isWeekend`, `isWeekday`, `isPast` and
 `isFuture` — is not yet implemented.
+
+### `Date.isLeapYear(): bool`
+
+True when the year is divisible by 4, and not by 100 unless also by 400 —
+so 1900 is not a leap year and 2000 is.
 
 | Method | Meaning |
 |---|---|
@@ -600,10 +645,17 @@ and saves a class of bug that appears once a year in production.
 
 Use `weekOfYear()` and `dayOfYear()` when those values are genuinely wanted.
 
+### `Date.toString(): string`
+
+`"2026-09-01"` — ISO 8601, zero-padded. The year is always exactly four
+digits: the representable range is 1..9999, so it is never shorter than
+four digits and never negative.
+
 ### `toString()`
 
-Each type's canonical form. Whatever `toString` writes, the matching `parse`
-function reads back to the same value.
+Each type's canonical form, `Date` shipped and the rest specified below it.
+Whatever `toString` writes, the matching `parse` function reads back to the
+same value.
 
 | Type | `toString()` |
 |---|---|
