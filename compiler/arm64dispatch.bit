@@ -156,111 +156,155 @@ fn arm64WritesResult(ctx: TypeContext, f: IrFunc, skipConst: []bool, i: int): bo
   return true
 }
 
-// Emits one instruction. `curBlock` is only needed to classify an edge as a
-// back-edge.
-fn compileInst(cx: A64Ctx, curBlock: int, i: int) {
-  let ins = cx.f.instrs[i]
-  let op = ins.op
-  let ty = ins.ty
-  let iw = widthOf(cx.module.ctx, ty) // result width: drives narrow re-canonicalization
+// #4110: `compileInst` was a single complexity-64 dispatch (E0204 limit 10) —
+// one flat if-chain covering every arm64 IR op. Split into instruction-family
+// helpers below, each trying only the ops in its own family and reporting
+// whether it handled `op`; `compileInst` tries each family in turn and
+// returns as soon as one claims the op. Every helper reads `op`/`ty` straight
+// off `ins` rather than taking them as separate parameters — they are always
+// `ins.op`/`ins.ty`, so passing both again would just be restating the same
+// value under a second name. Pure grouping — no arm moved to a different
+// family, no dispatch order changed, no emitter call rewritten.
 
+// True for the five integer ops `emitBinaryInt` may fold an ADD/SUB-immediate
+// or a bitmask AND/ORR/EOR-immediate into (`resolveAddSubImm`/`logicalConstSkip`,
+// both above).
+fn isIntBinOp(op: Op): bool {
+  return op == Op.Add || op == Op.Sub || op == Op.BAnd || op == Op.BOr || op == Op.BXor
+}
+
+fn isDivOp(op: Op): bool {
+  return op == Op.SDiv || op == Op.UDiv || op == Op.SRem || op == Op.URem
+}
+
+fn isShiftOp(op: Op): bool {
+  return op == Op.Shl || op == Op.LShr || op == Op.AShr
+}
+
+fn isUnaryIntOp(op: Op): bool {
+  return op == Op.Neg || op == Op.BNot
+}
+
+// FRINTM / FRINTP / FRINTZ / FRINTA — floor, ceil, truncate,
+// round-half-away-from-zero.
+fn isFRoundOp(op: Op): bool {
+  return op == Op.FFloor || op == Op.FCeil || op == Op.FTrunc || op == Op.FRound
+}
+
+fn arm64RoundModeForOp(op: Op): int {
+  if (op == Op.FFloor) {
+    return 10
+  }
+  if (op == Op.FCeil) {
+    return 9
+  }
+  if (op == Op.FTrunc) {
+    return 11
+  }
+  assert(op == Op.FRound)
+  return 12
+}
+
+fn compileInstConst(cx: A64Ctx, i: int, ins: IrInstr, iw: Width): bool {
+  let op = ins.op
   if (op == Op.ConstInt) {
     if (!cx.skipConst[i]) {
       emitConstInt(cx, i, ins.ival)
     }
-    return
+    return true
   }
   if (op == Op.ConstBool) {
     emitConstBool(cx, i, ins.bval)
-    return
+    return true
   }
   if (op == Op.ConstNil) {
     emitConstNil(cx, i)
-    return
+    return true
   }
   if (op == Op.ConstFloat) {
     emitConstFloat(cx, i, ins.fval, iw.bytes)
-    return
+    return true
   }
   if (op == Op.ConstString) {
     emitConstString(cx, i, ins.ival)
-    return
+    return true
   }
-  if (op == Op.Add || op == Op.Sub || op == Op.BAnd || op == Op.BOr || op == Op.BXor) {
+  return false
+}
+
+fn compileInstIntArith(cx: A64Ctx, i: int, ins: IrInstr, iw: Width): bool {
+  let op = ins.op
+  if (isIntBinOp(op)) {
     emitBinaryInt(cx, op, i, ins.lhs, ins.rhs, iw)
-    return
+    return true
   }
   if (op == Op.Mul) {
     emitMulInt(cx, i, ins.lhs, ins.rhs, xConstPow2Factor(cx.f, ins.lhs, ins.rhs, iw), iw)
-    return
+    return true
   }
-  if (op == Op.SDiv || op == Op.UDiv || op == Op.SRem || op == Op.URem) {
+  if (isDivOp(op)) {
     emitDivInt(cx, op, i, ins.lhs, ins.rhs, xConstPow2Divisor(cx.f, ins.rhs, iw), iw)
-    return
+    return true
   }
-  if (op == Op.Shl || op == Op.LShr || op == Op.AShr) {
+  if (isShiftOp(op)) {
     emitShiftInt(cx, op, i, ins.lhs, ins.rhs, iw)
-    return
+    return true
   }
   if (isIcmp(op)) {
     emitIcmp(cx, op, i, ins.lhs, ins.rhs)
-    return
+    return true
   }
+  return false
+}
+
+fn compileInstFloatArith(cx: A64Ctx, i: int, ins: IrInstr, iw: Width): bool {
+  let op = ins.op
   if (op == Op.FAdd) {
     emitBinaryFloat(cx, FArithOp.Add, i, ins.lhs, ins.rhs, iw.bytes)
-    return
+    return true
   }
   if (op == Op.FSub) {
     emitBinaryFloat(cx, FArithOp.Sub, i, ins.lhs, ins.rhs, iw.bytes)
-    return
+    return true
   }
   if (op == Op.FMul) {
     emitBinaryFloat(cx, FArithOp.Mul, i, ins.lhs, ins.rhs, iw.bytes)
-    return
+    return true
   }
   if (op == Op.FDiv) {
     emitBinaryFloat(cx, FArithOp.Div, i, ins.lhs, ins.rhs, iw.bytes)
-    return
+    return true
   }
   if (isFcmp(op)) {
     // A float compare's operand width comes from the OPERANDS — its own result is
     // a bool.
     emitFcmp(cx, op, i, ins.lhs, ins.rhs, widthOf(cx.module.ctx, cx.f.instrs[ins.lhs].ty).bytes)
-    return
+    return true
   }
-  if (op == Op.Neg || op == Op.BNot) {
+  return false
+}
+
+fn compileInstUnary(cx: A64Ctx, i: int, ins: IrInstr, iw: Width): bool {
+  let op = ins.op
+  if (isUnaryIntOp(op)) {
     emitUnaryInt(cx, op, i, ins.lhs, iw)
-    return
+    return true
   }
   if (op == Op.Convert) {
-    emitConvert(cx, i, ins.lhs, ty)
-    return
+    emitConvert(cx, i, ins.lhs, ins.ty)
+    return true
   }
   if (op == Op.FNeg) {
     emitFneg(cx, i, ins.lhs, iw.bytes)
-    return
+    return true
   }
   if (op == Op.FSqrt) {
     emitFsqrt(cx, i, ins.lhs, iw.bytes)
-    return
+    return true
   }
-  // FRINTM / FRINTP / FRINTZ / FRINTA — floor, ceil, truncate,
-  // round-half-away-from-zero.
-  if (op == Op.FFloor) {
-    emitFRound(cx, i, ins.lhs, iw.bytes, 10)
-    return
-  }
-  if (op == Op.FCeil) {
-    emitFRound(cx, i, ins.lhs, iw.bytes, 9)
-    return
-  }
-  if (op == Op.FTrunc) {
-    emitFRound(cx, i, ins.lhs, iw.bytes, 11)
-    return
-  }
-  if (op == Op.FRound) {
-    emitFRound(cx, i, ins.lhs, iw.bytes, 12)
-    return
+  if (isFRoundOp(op)) {
+    emitFRound(cx, i, ins.lhs, iw.bytes, arm64RoundModeForOp(op))
+    return true
   }
   // The width always comes from the FLOAT side — the integer view of an f32 is
   // 4 bytes wide whichever direction the transfer runs, and only one of the two
@@ -272,13 +316,18 @@ fn compileInst(cx: A64Ctx, curBlock: int, i: int) {
       bw = iw.bytes
     }
     emitBitcast(cx, i, ins.lhs, bw, dstIsFloat)
-    return
+    return true
   }
+  return false
+}
+
+fn compileInstControl(cx: A64Ctx, curBlock: int, i: int, ins: IrInstr): bool {
+  let op = ins.op
   if (op == Op.Jump) {
     emitBackEdgeSafepointIfNeeded(cx, curBlock, ins.ival)
     moveBlockArgs(cx, ins.ival, ins.args)
     emitJumpOrFallThrough(cx, curBlock, i, ins.ival)
-    return
+    return true
   }
   if (op == Op.Br) {
     let elseFixup = emitCondBranchOnBool(cx, i, ins.lhs)
@@ -289,7 +338,7 @@ fn compileInst(cx: A64Ctx, curBlock: int, i: int) {
     emitBackEdgeSafepointIfNeeded(cx, curBlock, ins.ival2)
     moveBlockArgs(cx, ins.ival2, ins.elseArgs)
     emitJumpOrFallThrough(cx, curBlock, i, ins.ival2)
-    return
+    return true
   }
   if (op == Op.Ret) {
     // Multi-value returns are lowered to a boxed tuple before codegen, so at most
@@ -304,103 +353,161 @@ fn compileInst(cx: A64Ctx, curBlock: int, i: int) {
       }
     }
     emitEpilogueAndRet(cx)
-    return
+    return true
   }
   if (op == Op.Unreachable) {
     emitUdf(cx.code)
-    return
+    return true
   }
+  return false
+}
+
+fn compileInstCall(cx: A64Ctx, i: int, ins: IrInstr): bool {
+  let op = ins.op
+  let ty = ins.ty
   if (op == Op.Call) {
     emitCall(cx, dstOrNone(cx, i, ty), ty, ins.name, ins.args, true)
-    return
+    return true
   }
   if (op == Op.CallValue) {
     emitCallValue(cx, dstOrNone(cx, i, ty), ty, ins.lhs, ins.args)
-    return
+    return true
   }
   if (op == Op.CallIface) {
     emitCallIface(cx, dstOrNone(cx, i, ty), ty, ins.lhs, ins.ival, ins.args)
-    return
+    return true
   }
   if (op == Op.RtCall) {
     emitCall(cx, dstOrNone(cx, i, ty), ty, rtSymbol(ins.name), ins.args, true)
-    return
+    return true
   }
+  return false
+}
+
+fn compileInstMem(cx: A64Ctx, i: int, ins: IrInstr): bool {
+  let op = ins.op
   if (op == Op.GcAlloc) {
     emitGcAlloc(cx, i, ins.ival, ins.offsets)
-    return
+    return true
   }
   if (op == Op.TypeInfo) {
     emitTypeInfo(cx, i, ins.ival, ins.ival2, ins.offsets)
-    return
+    return true
   }
   if (op == Op.FieldGet) {
     emitFieldGet(
-      cx, i, ins.lhs, ins.ival, ty,
+      cx, i, ins.lhs, ins.ival, ins.ty,
       isHeaderBase(cx.module.ctx, cx.f.instrs[ins.lhs].ty),
     )
-    return
+    return true
   }
   if (op == Op.FieldSet) {
     emitFieldSet(cx, ins.lhs, ins.ival, ins.rhs, cx.f.instrs[ins.rhs].ty)
-    return
+    return true
   }
   if (op == Op.IndexGet) {
-    emitIndexGet(cx, i, ins.lhs, ins.rhs, ty)
-    return
+    emitIndexGet(cx, i, ins.lhs, ins.rhs, ins.ty)
+    return true
   }
   if (op == Op.IndexSet) {
     // index_set keeps its VALUE operand in ival (rhs is the index).
     emitIndexSet(cx, ins.lhs, ins.rhs, ins.ival, cx.f.instrs[ins.ival].ty)
-    return
+    return true
   }
   if (op == Op.SliceLen) {
     emitSliceLen(cx, i, ins.lhs)
-    return
+    return true
   }
+  return false
+}
+
+fn compileInstAtomic(cx: A64Ctx, i: int, ins: IrInstr): bool {
+  let op = ins.op
   if (op == Op.AtomicLoad) {
-    emitAtomicLoad(cx, i, ins.lhs, ty)
-    return
+    emitAtomicLoad(cx, i, ins.lhs, ins.ty)
+    return true
   }
   if (op == Op.AtomicStore) {
     emitAtomicStore(cx, ins.lhs, ins.rhs, cx.f.instrs[ins.rhs].ty)
-    return
+    return true
   }
   if (op == Op.AtomicCmpxchg) {
     emitAtomicCmpxchg(cx, i, ins.lhs, ins.rhs, ins.ival)
-    return
+    return true
   }
   if (opIsAtomicRmw(op)) {
-    emitAtomicRmw(cx, op, i, ins.lhs, ins.rhs, ty)
-    return
+    emitAtomicRmw(cx, op, i, ins.lhs, ins.rhs, ins.ty)
+    return true
   }
+  return false
+}
+
+fn compileInstAddr(cx: A64Ctx, i: int, ins: IrInstr): bool {
+  let op = ins.op
   if (op == Op.MakeClosure) {
     emitMakeClosure(cx, i, ins.name, ins.lhs)
-    return
+    return true
   }
   if (op == Op.FuncAddr) {
     emitFuncAddr(cx, i, ins.name)
-    return
+    return true
   }
   if (op == Op.GlobalAddr) {
     emitGlobalAddr(cx, i, ins.name)
-    return
+    return true
   }
   if (op == Op.StackMapsAddr) {
     emitStackMapsAddr(cx, i, ins.name)
-    return
+    return true
   }
   if (op == Op.Syscall) {
     emitSyscall(cx, i, ins.lhs, ins.args)
-    return
+    return true
   }
   if (op == Op.Asm) {
-    emitAsm(cx, dstOrNone(cx, i, ty), ins.ival, ins.args)
+    emitAsm(cx, dstOrNone(cx, i, ins.ty), ins.ival, ins.args)
+    return true
+  }
+  return false
+}
+
+// Emits one instruction. `curBlock` is only needed to classify an edge as a
+// back-edge. Tries each instruction-family helper above in turn; the first
+// one that claims `op` does the emission.
+fn compileInst(cx: A64Ctx, curBlock: int, i: int) {
+  let ins = cx.f.instrs[i]
+  let iw = widthOf(cx.module.ctx, ins.ty) // result width: drives narrow re-canonicalization
+
+  if (compileInstConst(cx, i, ins, iw)) {
+    return
+  }
+  if (compileInstIntArith(cx, i, ins, iw)) {
+    return
+  }
+  if (compileInstFloatArith(cx, i, ins, iw)) {
+    return
+  }
+  if (compileInstUnary(cx, i, ins, iw)) {
+    return
+  }
+  if (compileInstControl(cx, curBlock, i, ins)) {
+    return
+  }
+  if (compileInstCall(cx, i, ins)) {
+    return
+  }
+  if (compileInstMem(cx, i, ins)) {
+    return
+  }
+  if (compileInstAtomic(cx, i, ins)) {
+    return
+  }
+  if (compileInstAddr(cx, i, ins)) {
     return
   }
   // block_param is never reached: every emission loop starts past a block's
   // params.
-  assert(op != Op.BlockParam)
+  assert(ins.op != Op.BlockParam)
   assert(false) // unhandled op
 }
 
