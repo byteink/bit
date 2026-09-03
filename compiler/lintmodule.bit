@@ -19,17 +19,23 @@
 // that walks a directory in the first place, so this is where the module view
 // belongs.
 
-// The module boundary mirrors `compiler/project.bit`'s `loadModuleAt`
-// EXACTLY: naming a directory sweeps every `.bit` file in it; naming a file
-// selects that file alone and does not sweep in its siblings, even though
-// they sit right next to it on disk. Without this distinction, every golden
-// case in _tests_/cases/ — one flat directory of hundreds of unrelated
-// single-file fixtures, each lint-tested by its bare filename — would become
-// ONE giant module the moment any two of them happened to import the same
-// stdlib name.
+// #4228: the module view now applies REGARDLESS of how `bit lint` was
+// invoked — the previous cut (apply it only to files swept in by a
+// directory walk, never to a file named explicitly on argv) was a proxy for
+// "is this really a multi-file module", based on argv shape rather than on
+// the directory's actual contents, and it was wrong: `bit lint
+// runtime/root/linux/boot.bit` (an explicit file, in a real directory
+// module deliberately split across sibling files, e.g. #4094's darwin
+// pair) reported every import used only by its sibling `bootstats.bit` as
+// unused. `loadModuleAt`'s `only` parameter answers a different question —
+// what to COMPILE — and stays exactly as it was; it has no bearing on
+// whether an import is dead CODE, which is a project-wide question.
+//
+// The real signal for "is this directory one coherent module" is whether it
+// resolves as one without duplicate top-level declarations — see
+// `lintModuleUsedImportNames` below, which is where that is now checked.
 class LintFile {
   path: string,
-  swept: bool,
 }
 
 // Sorted by path (insertion sort — the file list is small): two paths naming
@@ -73,10 +79,24 @@ fn newLintModuleCache(): LintModuleCache {
 // already uses — `buildStubImports`, `collectWriteOnlyNodes`,
 // `computeUsedSymbols` — just over the module's CONCATENATED source instead
 // of one file's, the same concatenation `SrcModule` itself uses to give every
-// sibling file one flat scope. An import re-declared by two sibling files
-// (illegal per #2121's E0042, caught elsewhere) is not specially handled
-// here: this function only asks "is the name used", and `bit check` is what
-// rejects the program in the first place.
+// sibling file one flat scope.
+//
+// #4228: an import re-declared by two sibling files (illegal per #2121's
+// E0042 once the directory really is one module) is now the signal this
+// function uses to tell a real multi-file module apart from a directory that
+// merely holds several UNRELATED single-file programs — `_tests_/cases/` is
+// exactly the latter: ~595 independent fixtures, several of which import the
+// same stdlib name for unrelated reasons (`_tests_/cases/lint_unused_import.bit`
+// leaves `foo` genuinely dead while its unrelated neighbour
+// `lint_unused_import_nested_use.bit` uses a same-named `foo`). Concatenating
+// such a directory produces duplicate-declaration errors (two `fn main`s, two
+// `import { foo } ...`) that a real module never would, since `bit check`
+// already rejects those; `resolveDiags.errorCount > 0` is read as "this
+// directory is not one module" and `usedNames` is left empty, so every E0210
+// finding in an incoherent directory stands exactly as computed per-file —
+// the same outcome the old argv-based `swept` cut gave `_tests_/cases/`, now
+// reached by asking what the directory actually contains instead of how it
+// was named on the command line.
 fn lintModuleUsedImportNames(cache: LintModuleCache, dir: string): map<string, bool> {
   let (hit, found) = cache.dirs[dir]
   if (found) {
@@ -99,54 +119,50 @@ fn lintModuleUsedImportNames(cache: LintModuleCache, dir: string): map<string, b
     imports: stubs.paths, files: [scratchFile],
   }
   let resolveDiags = newDiagnostics(scratchSm)
-  // #2919: `false` — `resolveDiags` is never read below either (only `mod` and
-  // `used` are), and this concatenates the whole directory into one module
-  // already, so a genuine cross-file reference resolves normally and the
-  // sibling scan would fire only on a truly undefined name.
-  // #3244: `isRootModule: true` — this directory is the one under lint, and
-  // `resolveDiags` above is never read anyway, so E0048's suppression here is
-  // moot either way; `true` keeps the call honest about what it means.
+  // #3244: `isRootModule: true` — this directory is the one under lint.
   let mod = resolveModule(resolveDiags, m, stubs.mods, -1, false, true)
-  let used = computeUsedSymbols(mod, collectWriteOnlyNodes(tree))
   let usedNames = map<string, bool>{}
-  let i = 1
-  while (i < len(mod.symbols)) {
-    let s = mod.symbols[i]
-    if ((s.kind == SymbolKind.ImportItem || s.kind == SymbolKind.ImportNamespace) && used[i]) {
-      usedNames[s.name] = true
+  if (resolveDiags.errorCount == 0) {
+    let used = computeUsedSymbols(mod, collectWriteOnlyNodes(tree))
+    let i = 1
+    while (i < len(mod.symbols)) {
+      let s = mod.symbols[i]
+      if ((s.kind == SymbolKind.ImportItem || s.kind == SymbolKind.ImportNamespace) && used[i]) {
+        usedNames[s.name] = true
+      }
+      i = i + 1
     }
-    i = i + 1
   }
   cache.dirs[dir] = usedNames
   return usedNames
 }
 
 // Drops every E0210 finding whose import name IS used elsewhere in its
-// module, for files that were reached by a DIRECTORY walk (`swept`). A file
-// named explicitly on argv is its own singleton module (see `LintFile`) and
-// is left exactly as `runLintRules` computed it.
+// module — for EVERY file, regardless of whether `bit lint` reached it by a
+// directory walk or by naming it explicitly on argv (#4228). Whether the
+// directory is a real module at all is decided inside
+// `lintModuleUsedImportNames` itself (an incoherent directory yields an
+// empty `usedNames`, so this drops nothing for it); this function no longer
+// needs to know how the file was reached.
 //
 // A post-filter over the findings already computed, not a change to how they
 // are computed: `span.start:span.end` for an E0210 finding is always the
 // imported name's own span (`lintUnusedImport`, lintunused.bit), so the name
 // is read straight back out of the source rather than re-parsed from the
 // message text.
-fn lintDropModuleUsedImports(findings: Diagnostics, cache: LintModuleCache, swept: map<int, bool>) {
+fn lintDropModuleUsedImports(findings: Diagnostics, cache: LintModuleCache) {
   let out = []Diagnostic(0)
   let i = 0
   while (i < len(findings.list)) {
     let g = findings.list[i]
     if (g.code == ecLintUnusedImport) {
-      let (isSwept, _) = swept[g.span.file]
-      if (isSwept) {
-        let dir = pathDir(filePath(findings.sm, g.span.file))
-        let usedNames = lintModuleUsedImportNames(cache, dir)
-        let name = fileSource(findings.sm, g.span.file)[g.span.start:g.span.end]
-        let (isUsed, _) = usedNames[name]
-        if (isUsed) {
-          i = i + 1
-          continue // used by a sibling file in the same module (#2284)
-        }
+      let dir = pathDir(filePath(findings.sm, g.span.file))
+      let usedNames = lintModuleUsedImportNames(cache, dir)
+      let name = fileSource(findings.sm, g.span.file)[g.span.start:g.span.end]
+      let (isUsed, _) = usedNames[name]
+      if (isUsed) {
+        i = i + 1
+        continue // used by a sibling file in the same module (#2284)
       }
     }
     out = append(out, g)
