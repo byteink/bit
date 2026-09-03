@@ -974,12 +974,16 @@ result type; the one place it must be spelled is when it carries `!` and so
 cannot be omitted, written `()` — chiefly `()!`, "returns nothing or an error"
 (§18.2). A bare `()` is thus a valid type only in result position.
 
-There is deliberately **no tuple literal expression**. `(a, b)` in expression
-position is a syntax error, not a tuple — `"(" expression ")"` is grouping (§12),
-and making it conditionally a constructor would make the meaning of parentheses
-depend on their contents. A tuple value is produced by a multi-value `return`
-(§13.1), which is the use case tuples exist for; anything that wants a named,
-constructible, mutable aggregate wants a class.
+`(a, b)` in expression position is a **tuple literal** (§12.10), constructing a
+tuple value directly — the third spelling of one representation, alongside this
+section's type and §10.1's destructuring pattern. It is not a special case of
+parenthesized grouping conditional on its contents: the two forms are
+distinguished by the same fixed arity rule as `tuple_type` above, never by what
+the parentheses contain. `"(" expression ")"` (§12) stays grouping with any
+single expression, including one that itself happens to produce a tuple. A
+multi-value `return` (§13.1) remains the other way to build a tuple value;
+anything that wants a named, constructible, mutable aggregate still wants a
+class.
 
 A `qual_type_name` (`io.Writer`) names a type exported by a namespace-imported
 module (`import io from "std/io"`, §17.2) — the same `ns.member` spelling already
@@ -1823,6 +1827,7 @@ arg          = [ "..." ] expression .           (* '...' spreads a slice, §12.4
 primary      = literal
              | IDENT
              | "(" expression ")"
+             | tuple_lit
              | composite_lit
              | "[" [ arguments ] "]" .           (* bare slice literal, possibly empty *)
 ```
@@ -2114,6 +2119,33 @@ adapt to context (§15.4). Integer conversions sign- or zero-extend / truncate t
 the destination width; float→int truncates toward zero. *(v1 limit: converting a
 `u64` whose top bit is set to or from a float uses the signed path, so such a
 value is out of range — fixed when a full unsigned float path lands.)*
+
+### 12.10 Tuple Literals
+
+```
+tuple_lit = "(" expression "," expression { "," expression } ")" .   (* at least 2 elements *)
+```
+
+A tuple literal `(a, b, ...)` constructs a tuple value directly, element-wise
+matching the tuple type `(T1, T2, ...)` of §11: element `i`'s type is element
+`i`'s own (defaulted) type under the untyped-constant rules of §15.4, exactly
+as a multi-value `return`'s values are typed — or, where the literal is checked
+against a declared or expected tuple type (a `let`/`const` annotation, a
+`return`, an argument), the corresponding element type instead, so an untyped
+element widens to it rather than being compared against its own bare default.
+
+A single parenthesized expression `(x)` is never a tuple: `tuple_type` and
+`tuple_pat` both require **two or more** elements (§11), and `tuple_lit` takes
+the identical rule — the parser commits to a tuple literal only once a `,`
+appears before the matching `)`; with none, `(x)` is ordinary grouping (§12).
+This keeps parentheses' meaning fixed by arity alone, never by what the
+contents happen to be.
+
+`t.0`, `t.1`, … read a tuple literal's elements exactly as they read any other
+tuple value (§12.5) — read-only, like every tuple element. A tuple literal is
+otherwise an ordinary expression and may appear anywhere a value is expected:
+a `let`/`const` initializer, an argument, a slice/array/map element, a
+`return` value, or the right-hand side of a `tuple_pat` destructure (§13.1).
 
 ---
 
@@ -4289,8 +4321,9 @@ type_assert   = "." "(" type ")" .
 arguments     = arg { "," arg } [ "," ] .
 arg           = [ "..." ] expression .
 
-primary       = literal | IDENT | "(" expression ")" | composite_lit
+primary       = literal | IDENT | "(" expression ")" | tuple_lit | composite_lit
               | "[" [ arguments ] "]" .    (* bare slice literal *)
+tuple_lit     = "(" expression "," expression { "," expression } ")" .   (* §12.10, at least 2 elements *)
 composite_lit = type_name [ "<" type { "," type } ">" ] "{" [ field_inits ] "}"
               | slice_type "{" [ arguments ] "}"
               | array_type "{" [ arguments ] "}"
