@@ -590,7 +590,8 @@ reads, field access on a value in hand, `if`/`while`/`for`, assignment,
 `break`/`continue`, and `return` — plus calls to other `@nosplit` functions,
 to the **atomic builtins** (§11.5), to **`ptrOf`** (§11.5), **`entryOf`**
 (§11.10) and **`stackMapsBegin`/`stackMapsEnd`** (§11.12), a raw **`syscall`**
-(§11.8), **`len`/`cap` over a fixed-size array** (§11.2), and **conversions
+(§11.8), **`len`/`cap` over a fixed-size array** (§11.2), a **provably
+in-range index into a fixed-size array** (§12.6), and **conversions
 between numeric prims** (§12.9), all of which lower
 to inline machine instructions rather than a call
 and so can neither allocate nor reach a safepoint. A numeric conversion covers
@@ -620,6 +621,29 @@ type-conditional admission of the *operand*, not of the builtin name:
 header, and on a map to an allocating runtime call, so all three remain
 **E0075** under the "anything else" rule below.
 
+**Indexing** (§12.6) a **fixed-size array** `[N]T` (§11.2) is admitted **only**
+when the index is **provably in range at compile time** — a bare literal
+already inside `[0, N)`, or that literal masked with `& m` where `m < N`
+(`x & m` is always in `[0, m]` for any `x`, since ANDing with a non-negative
+literal clears the sign bit and can only clear bits `m` itself has cleared —
+this is the shape a hash-table style lookup `TAB[i & 3]` uses to stay in
+range with no data-dependent branch at all). Only then does `a[i]` lower to a
+bare `index_get`, a scaled register-offset load against a static base, with
+no bounds-check branch, no call, no allocation and no safepoint.
+An index that is **not** provably in range this way — a bare variable, or an
+expression the compiler cannot bound — is refused, for the identical reason a
+slice index already is: `index_get` for such an index now compiles to a
+bounds-check branch whose out-of-range edge calls `bit_rt_panic` with a
+materialized message, and this allowlist judges a construct by every edge it
+can take, not by its likely one. This is a type-and-value-conditional
+admission, not of indexing in general — the base, the index expression, and
+(when the check does run) the runtime path it takes are irrelevant to the
+proof; only a statically bounded index counts. A **slice** base is refused
+unconditionally, since its length is a runtime field and no compile-time
+proof of "in range" is possible for it at all, and a **map** base is a
+runtime call outright — both remain **E0075** under the "anything else" rule
+below.
+
 A **`syscall` (§11.8)** is admitted on the strongest proof on that list: it is
 not a call at all. Both backends emit the kernel trap *inline* — `syscall` on
 x86-64, `svc #0` on AArch64 — so it references no symbol, takes no stack-map
@@ -631,7 +655,8 @@ kernel, and the allocator and collector — `@nosplit` in their entirety — cou
 otherwise never obtain a page from the OS.
 
 Anything else is **E0075** `nosplit_calls_allocating`, including composite,
-slice and map construction, indexing, `append`, `spawn`, closures, channel
+slice and map construction, slice or map indexing (or an array index that is
+not provably in range, above), `append`, `spawn`, closures, channel
 operations, string interpolation, every other builtin, and any call through a
 value or interface (whose target is not knowable statically). `string(x)` is
 **not** admitted by the conversion rule: it copies into a fresh managed object,
@@ -1960,8 +1985,14 @@ while being represented as a shared box.
 
 ### 12.6 Index and Slice
 
-- `s[i]` indexes a slice/array (`i` must be an integer; out-of-range **panics**,
-  §18.4) or a string (yielding `byte`).
+- `s[i]` indexes a slice/array (`i` must be an integer; out-of-range
+  **panics**, §18.4) or a string (yielding `byte`). On a fixed-size array
+  `[N]T` (§11.2), an `i` that is a compile-time-constant literal is checked at
+  compile time instead: an out-of-range literal is a compile error
+  (**E0122**) rather than a runtime panic, since it costs nothing to reject
+  before the program ever runs. A non-constant `i` still panics at runtime on
+  either type, with the identical message and exit code (§18.4) — a slice and
+  an array are indistinguishable out-of-range failure modes to a caller.
 - `m[k]` indexes a map; a missing key yields the zero value of the value type
   (§13.4) — for a slice, string, or class V that is a usable empty/zero object,
   never a null reference. The

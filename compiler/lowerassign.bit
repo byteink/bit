@@ -24,6 +24,7 @@ class Lvalue {
   offset: int,   // Global/Field: byte offset (0 for Global).
   index: int,    // Elem: index SSA value. MapElem: key SSA value.
   isSlice: bool, // Elem only: true for a slice element, false for a fixed array.
+  arrayLen: int, // Elem, !isSlice only: the fixed array's compile-time length (#4270).
 }
 
 // A stub Lvalue for a failed resolution; its fields are never read because
@@ -37,6 +38,7 @@ fn invalidLvalue(): Lvalue {
     offset: 0,
     index: 0,
     isSlice: false,
+    arrayLen: 0,
   }
 }
 
@@ -58,6 +60,7 @@ fn resolveLvalue(fc: FnCtx, node: int): Lvalue {
         offset: 0,
         index: 0,
         isSlice: false,
+        arrayLen: 0,
       }
     }
     // Not a local: a module-level `let` (§11.11). Its cell is written through
@@ -76,6 +79,7 @@ fn resolveLvalue(fc: FnCtx, node: int): Lvalue {
       offset: 0,
       index: 0,
       isSlice: false,
+      arrayLen: 0,
     }
   }
   if (n.tag == Tag.Member) {
@@ -122,6 +126,7 @@ fn resolveLvalue(fc: FnCtx, node: int): Lvalue {
       offset: layout.offsets[fidx],
       index: 0,
       isSlice: false,
+      arrayLen: 0,
     }
   }
   if (n.tag == Tag.Index) {
@@ -142,6 +147,7 @@ fn resolveLvalue(fc: FnCtx, node: int): Lvalue {
         offset: 0,
         index: key,
         isSlice: false,
+        arrayLen: 0,
       }
     }
     let isSlice = rd.kind == TypeKind.Slice
@@ -178,6 +184,10 @@ fn resolveLvalue(fc: FnCtx, node: int): Lvalue {
       offset: 0,
       index: idx,
       isSlice: isSlice,
+      // 0 for a slice (readLvalue/writeLvalue never reads it on that arm) —
+      // #4270's bounds check on the fixed-array arm needs the compile-time
+      // length, which only `rd` (the receiver's own type) carries.
+      arrayLen: rd.arrayLen,
     }
   }
   fcFail(fc, n.span, "an assignment target that is not a name, field or index expression")
@@ -208,6 +218,10 @@ fn readLvalue(fc: FnCtx, lv: Lvalue, span: Span): int {
       ins.args = [lv.recv, lv.index, esV]
       return emitRtCall(fc, ins)
     }
+    // #4270: `xs[i]` in `xs[i] += v` / `xs[i]++` on a fixed array is the same
+    // raw `index_get` lowerIndex emits for a plain read, so it needs the same
+    // bounds check (loweraccess.bit).
+    emitArrayBoundsCheckIfNeeded(fc, lv.index, lv.arrayLen)
     let ins = mkInstr(Op.IndexGet, lv.ty)
     ins.lhs = lv.recv
     ins.rhs = lv.index
@@ -251,6 +265,8 @@ fn writeLvalue(fc: FnCtx, lv: Lvalue, val: int) {
       emitRtCall(fc, ins)
       return
     }
+    // #4270: the write-side twin of the read-side check just above.
+    emitArrayBoundsCheckIfNeeded(fc, lv.index, lv.arrayLen)
     let ins = mkInstr(Op.IndexSet, fc.c.ctx.voidId)
     ins.lhs = lv.recv
     ins.rhs = lv.index
@@ -281,4 +297,62 @@ fn oneConst(fc: FnCtx, ty: int): int {
   let i = mkInstr(Op.ConstInt, ty)
   i.ival = 1
   return builderEmit(fc.b, i)
+}
+
+// #4270/#4194: whether the already-lowered index `idx` is PROVABLY inside
+// `[0, arrayLen)` with no runtime test needed at all, so a fixed-array access
+// can skip `emitBoundsCheck` (loweraccess.bit) entirely rather than pay a
+// branch that can never be taken. Two shapes, both structural on the lowered
+// IR (the same technique `isAShrBy` in loweraccess.bit uses, and for the same
+// reason: `analyzeConsts` has not run yet, so only a value that is LITERALLY
+// a `const_int` here is recognized):
+//
+//   const_int k                  in range iff 0 <= k < arrayLen
+//   (anything) & const_int m     in range iff 0 <= m < arrayLen
+//
+// The second shape is `x & m`, an unsigned bitwise AND against a non-negative
+// literal mask: that ALWAYS yields a result in `[0, m]` regardless of `x`,
+// because ANDing with a literal that has 0 in the sign bit clears the sign bit
+// and can only clear bits `m` itself has cleared — no fact about `x` is
+// needed. This is precisely the shape SPEC §10.3.1's `@nosplit` carve-out
+// rests on (`_tests_/cases/run_nosplit_const_array_read.bit`'s `TAB[i & 3]`,
+// arrayLen 4, mask 3): `vNosplitWalk`'s `Tag.Index` arm (validateattr.bit)
+// recognizes the same two shapes on the AST, one level earlier, so an index
+// the checker admits into a `@nosplit` body is guaranteed to land here too and
+// never grow a branch `@nosplit`'s allowlist did not agree to.
+//
+// A bare local (`a[i]` with `i` a variable) is NOT provably in range even when
+// its value happens to be constant at every call site — that needs dataflow
+// this function does not attempt, and it gets the real runtime check instead,
+// exactly like every other non-constant index.
+fn indexProvablyInBounds(fc: FnCtx, idx: int, arrayLen: int): bool {
+  if (!builderHasValue(fc.b, idx)) {
+    return false
+  }
+  let ins = fc.b.instrs[idx]
+  if (ins.op == Op.ConstInt) {
+    return ins.ival >= 0 && ins.ival < arrayLen
+  }
+  if (ins.op != Op.BAnd || !builderHasValue(fc.b, ins.rhs)) {
+    return false
+  }
+  let rhs = fc.b.instrs[ins.rhs]
+  return rhs.op == Op.ConstInt && rhs.ival >= 0 && rhs.ival < arrayLen
+}
+
+// Emits `emitBoundsCheck` (loweraccess.bit) against `arrayLen` (a fixed
+// array's length, always a compile-time constant) unless
+// `indexProvablyInBounds` shows it is unnecessary. Shared by every fixed-array
+// `index_get`/`index_set` emission site (#4270: `lowerIndex` in
+// loweraccess.bit, `lowerIndexStore` in lowerflow.bit, and this file's own
+// `readLvalue`/`writeLvalue` Elem arm) so the proof and the check cannot drift
+// between a read site and a write site the way the bug this ticket fixes
+// drifted between arrays and slices in the first place.
+fn emitArrayBoundsCheckIfNeeded(fc: FnCtx, idx: int, arrayLen: int) {
+  if (indexProvablyInBounds(fc, idx, arrayLen)) {
+    return
+  }
+  let lenI = mkInstr(Op.ConstInt, primType(fc.c.ctx, 3))
+  lenI.ival = arrayLen
+  emitBoundsCheck(fc, idx, builderEmit(fc.b, lenI))
 }
