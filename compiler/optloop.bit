@@ -417,6 +417,10 @@ fn licmClobbers(f: IrFunc, ctx: TypeContext, idx: int): bool {
 // `max-params`. `inv` is indexed by the header's param position; `args` is the
 // preheader edge's argument list, so `args[k]` is what invariant param `k`
 // holds before the loop starts.
+// `base` is where this header's entries start in `plan.ids`, so `licmDupOf`
+// compares a candidate only against hoists out of the SAME loop. Every entry
+// from `base` on shares this header, because `licmCollect` runs once per
+// header and appends nothing before it.
 class LicmScan {
   known: []ConstVal,
   fwd: []int,
@@ -424,6 +428,7 @@ class LicmScan {
   hdr: int,
   pre: int,
   args: []int,
+  base: int,
 }
 
 // The hoistable set, and the whole of it. Both ops read one header word
@@ -480,11 +485,18 @@ fn licmHoistSlot(lc: LicmCtx, sc: LicmScan, idx: int): int {
 // PARAMS AND ARGUMENTS ARE BOTH EMITTED BY WALKING `ids` IN ORDER and keeping
 // only the entries for one header, so the two orders agree by construction
 // rather than by a sort.
+//
+// `dupOf` is parallel to `ids` as well: the OLD instruction id of an earlier
+// hoist out of the same loop that computes exactly this, or -1. A duplicate is
+// emitted nowhere and joins no parameter list — it takes the original's new id
+// in `remap`. Discovery order puts the original earlier in `ids`, so that id is
+// always written before it is read (#4063).
 class LicmPlan {
   home: []int,
   hdr: []int,
   ids: []int,
   pre: []int,
+  dupOf: []int,
 }
 
 // The neutral plan: nothing hoisted. Every rebuild that is not doing LICM
@@ -498,7 +510,9 @@ fn noLicm(n: int): LicmPlan {
     hdr = append(hdr, -1)
     i = i + 1
   }
-  return LicmPlan{ home: home, hdr: hdr, ids: []int(0), pre: []int(0) }
+  return LicmPlan{
+    home: home, hdr: hdr, ids: []int(0), pre: []int(0), dupOf: []int(0),
+  }
 }
 
 // The per-function analysis state, bundled for the same reason `LicmScan` is.
@@ -623,6 +637,7 @@ fn licmPlanLoop(lc: LicmCtx, known: []ConstVal, fwd: []int, h: int) {
   let sc = LicmScan{
     known: known, fwd: fwd,
     inv: licmInvariantParams(lc, h), hdr: h, pre: pre, args: args,
+    base: len(lc.plan.ids),
   }
   let inLoop = licmLoopBlocks(lc.f, lc.pm, h)
   if (!licmSingleEntry(lc, inLoop, h) || licmLoopClobbers(lc, inLoop)) {
@@ -680,13 +695,49 @@ fn licmCollectBlock(lc: LicmCtx, sc: LicmScan, b: int) {
   }
 }
 
+// An earlier hoist out of this same loop that computes exactly what `idx`
+// computes, or -1. The key is optcse.bit's `AvailKey` with the operand taken
+// AFTER the hoist: `op`, the byte offset `ival`, the result type `ty` — width
+// comes from `ty` at codegen, so two reads of one slot at different widths must
+// not answer each other — and `preArg`, the value the operand becomes in the
+// preheader. That is every field `emitFieldGet`/`emitSliceLen` reads.
+//
+// `for x of xs` is why this exists at all. Lowering threads `xs` into the
+// header TWICE, so the length test and the bounds test read `slice_len` of two
+// different param slots holding one slice. Both are invariant, both hoist, and
+// both land on the same preheader value. optcse collapses the two preheader
+// INSTRUCTIONS a round later, but not the two header params it left behind —
+// and `forceParamInterference` (codegenlive.bit:122) makes every param of a
+// block interfere, so the spare one costs a register across the whole loop.
+fn licmDupOf(lc: LicmCtx, sc: LicmScan, idx: int, preArg: int): int {
+  let ins = lc.f.instrs[idx]
+  let j = sc.base
+  while (j < len(lc.plan.ids)) {
+    let other = lc.f.instrs[lc.plan.ids[j]]
+    if (other.op == ins.op &&
+      other.ival == ins.ival &&
+      other.ty == ins.ty &&
+      lc.plan.pre[j] == preArg) {
+      return lc.plan.ids[j]
+    }
+    j = j + 1
+  }
+  return -1
+}
+
 fn licmRecord(lc: LicmCtx, sc: LicmScan, idx: int) {
   let k = licmHoistSlot(lc, sc, idx)
   if (k < 0) {
     return
   }
+  // `licmDupOf` FIRST: it scans `plan.ids`, so appending before asking makes
+  // every hoist match itself, which hands the rebuild `remap[idx] = remap[idx]`
+  // -- an unwritten slot, read as value id 0. That miscompiles silently and
+  // self-hosts clean (the corpus IR diff is what caught it).
+  let dup = licmDupOf(lc, sc, idx, sc.args[k])
   lc.plan.home[idx] = sc.pre
   lc.plan.hdr[idx] = sc.hdr
   lc.plan.ids = append(lc.plan.ids, idx)
   lc.plan.pre = append(lc.plan.pre, sc.args[k])
+  lc.plan.dupOf = append(lc.plan.dupOf, dup)
 }
