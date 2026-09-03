@@ -1,0 +1,215 @@
+// _tests_/bit/typenodecallee.bit — #4098: `checkCall` (compiler/checkexpr.bit)
+// infers a result type for exactly four type-node callees — `chan<T>(...)`,
+// `[]T(...)`, `map<K,V>(...)`, `[N]T(...)` — via the single table
+// `typeNodeCallees()`. That SAME table drives `vStmt`'s `Tag.Call` dispatch
+// (compiler/validatestmt.bit), which runs each entry's argument validator
+// (compiler/validatezero.bit) unconditionally per call node. Before #4098
+// those were two independently hand-maintained lists with nothing tying them
+// together: two of the four forms had ZERO argument validation until
+// #4065/#4092, a third had only arity checking and no argument-TYPE checking
+// until #4091 — all three found by manual audit, none by a check.
+//
+// This gate walks the four known accepted forms and, for each, builds a
+// minimal program with an invalid argument and asserts `bit check` rejects it
+// with the specific diagnostic the matching validator owns. A regression in
+// any one validator's logic reddens this gate — mutation-verified against
+// vSliceAllocArity, vSliceAllocArgType, vMapCtorArity, vMapCapArgType,
+// vChanCtorArgs, vChanCapArgType and vArrayCtorRejected while writing it
+// (each neutralized in turn made its matching case wrongly pass).
+//
+// Because a `TypeNodeCallee{tag: ...}` table entry with `validate` omitted
+// zero-values to a nil function reference (SPEC §12.3: an omitted field is
+// zero-valued, not rejected), and `vStmt` calls every entry's `validate`
+// unconditionally for every `Tag.Call` node, that omission panics
+// ("call of a nil function") on the very next `bit check` of ANY program with
+// a function call — not just one exercising the new form. That is the
+// structural guard for a FIFTH type-node tag added to `checkCall`'s
+// inference (via `isTypeNodeCalleeTag`) with no validator wired: it cannot
+// ship quietly, because building this compiler's own sources would panic
+// first.
+//
+// WIRED INTO `./make test` as `test-typenodecallee` (tools/build/gates.bit,
+// tools/build/defs.bit).
+
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir } from "std/fs"
+import { parseInt, trimSpace, contains } from "std/strings"
+
+const defaultTimeoutS: int = 60
+const maxTimeoutMs: int = 6000000
+
+fn requiredEnv(name: string): string {
+  let v = env(name)
+  if (v == "") {
+    eprint("typenodecallee: ${name} is not set — refusing to guess.\n")
+    exit(2)
+  }
+  return v
+}
+
+// Same contract every harness here shares: default 60s (this gate checks
+// seven tiny one-file programs, no build/link), `0` disables the bound.
+fn timeoutMs(): int {
+  let raw = trimSpace(envOr("BIT_TEST_TIMEOUT_S", ""))
+  if (raw == "") {
+    return defaultTimeoutS * 1000
+  }
+  let s = parseInt(raw) catch _ {
+    return defaultTimeoutS * 1000
+  }
+  if (s <= 0) {
+    return maxTimeoutMs
+  }
+  if (s * 1000 > maxTimeoutMs) {
+    return maxTimeoutMs
+  }
+  return s * 1000
+}
+
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+// One invalid-argument program exercising exactly one validator's rejection.
+class Case {
+  name: string,
+  src: string,
+  wantCode: string,
+  validator: string,
+}
+
+fn cases(): []Case {
+  return [
+    Case{
+      name: "slice_arity_zero",
+      src: "fn main() {\n  let s = []i64()\n  print(\"\${len(s)}\")\n}\n",
+      wantCode: "E0050",
+      validator: "vSliceAllocArity",
+    },
+    Case{
+      name: "slice_argtype_string",
+      src: "fn main() {\n  let s = []i64(\"bad\")\n  print(\"\${len(s)}\")\n}\n",
+      wantCode: "E0111",
+      validator: "vSliceAllocArgType",
+    },
+    Case{
+      name: "map_arity_toomany",
+      src: "fn main() {\n  let m = map<string,int>(1, 2)\n  print(\"\${len(m)}\")\n}\n",
+      wantCode: "E0050",
+      validator: "vMapCtorArity",
+    },
+    Case{
+      name: "map_argtype_string",
+      src: "fn main() {\n  let m = map<string,int>(\"bad\")\n  print(\"\${len(m)}\")\n}\n",
+      wantCode: "E0119",
+      validator: "vMapCapArgType",
+    },
+    Case{
+      name: "chan_arity_toomany",
+      src: "fn main() {\n  let c = chan<i64>(1, 2)\n  print(\"ok\")\n}\n",
+      wantCode: "E0050",
+      validator: "vChanCtorArgs",
+    },
+    Case{
+      name: "chan_argtype_string",
+      src: "fn main() {\n  let c = chan<i64>(\"bad\")\n  print(\"ok\")\n}\n",
+      wantCode: "E0112",
+      validator: "vChanCapArgType",
+    },
+    Case{
+      name: "array_ctor_rejected",
+      src: "fn main() {\n  let a = [5]int()\n  print(\"\${len(a)}\")\n}\n",
+      wantCode: "E0113",
+      validator: "vArrayCtorRejected",
+    },
+  ]
+}
+
+// Runs `bit check <path>` under the compiler's own environment
+// (BIT_STDLIB/BIT_LIBBITRT), bounded, via a `/bin/sh` wrapper `exec`'d so a
+// SIGSEGV kills the process this waits on rather than hiding behind a shell
+// exit code. Returns the wrapper's exit code and captured stderr.
+fn checkOne(bin: string, stdlib: string, libbitrt: string, scratch: string, srcPath: string): (int, string) {
+  let shPath = scratch + "/check.sh"
+  let errPath = scratch + "/check.err"
+  let script = "#!/bin/sh\n" +
+    "BIT_STDLIB=" + shQuote(stdlib) + "\nexport BIT_STDLIB\n" +
+    "BIT_LIBBITRT=" + shQuote(libbitrt) + "\nexport BIT_LIBBITRT\n" +
+    "exec " + shQuote(bin) + " check " + shQuote(srcPath) +
+    " > /dev/null 2> " + shQuote(errPath) + "\n"
+  writeFile(shPath, script) catch e {
+    eprint("typenodecallee: cannot write check wrapper: ${e.message()}\n")
+    exit(2)
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    eprint("typenodecallee: cannot chmod check wrapper\n")
+    exit(2)
+  }
+  let code = osRunBounded(shPath, timeoutMs())
+  let err = readFile(errPath) catch _ {
+    ""
+  }
+  return code, err
+}
+
+// Runs one case, returning "" on pass or a description of what failed.
+fn runCase(bin: string, stdlib: string, libbitrt: string, root: string, cs: Case): string {
+  let dir = root + "/${cs.name}"
+  mkdir(dir) catch e {
+    return "cannot create scratch directory ${dir}: ${e.message()}"
+  }
+  let srcPath = dir + "/case.bit"
+  writeFile(srcPath, cs.src) catch e {
+    return "cannot write ${srcPath}: ${e.message()}"
+  }
+  let (code, err) = checkOne(bin, stdlib, libbitrt, dir, srcPath)
+  if (code == 0) {
+    return "'${cs.name}' (exercising ${cs.validator}) built successfully; it must be rejected"
+  }
+  if (!contains(err, cs.wantCode)) {
+    return "'${cs.name}' (exercising ${cs.validator}) was rejected (exit ${code}) but did not report " +
+      "${cs.wantCode}:\n${err}"
+  }
+  return ""
+}
+
+fn main() {
+  let bin = requiredEnv("BIT_BIN")
+  let stdlib = requiredEnv("BIT_STDLIB")
+  let libbitrt = requiredEnv("BIT_LIBBITRT")
+
+  let root = envOr("TMPDIR", "/tmp") + "/bit-typenodecallee-${timeUnixNs()}"
+  mkdir(root) catch e {
+    eprint("typenodecallee: cannot create scratch directory ${root}: ${e.message()}\n")
+    exit(2)
+  }
+
+  let cs = cases()
+  let i = 0
+  let failed = 0
+  while (i < len(cs)) {
+    let msg = runCase(bin, stdlib, libbitrt, root, cs[i])
+    if (msg != "") {
+      eprint("typenodecallee: FAIL — ${msg}\n")
+      failed = failed + 1
+    }
+    i = i + 1
+  }
+
+  if (failed > 0) {
+    eprint("typenodecallee: FAIL — ${failed} of ${len(cs)} case(s) failed\n")
+    exit(1)
+  }
+
+  print("PASS typenodecallee: ${len(cs)} of ${len(cs)} type-node-callee argument validators reject their invalid case\n")
+}
