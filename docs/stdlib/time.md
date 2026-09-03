@@ -815,8 +815,9 @@ fn example() {
 
 ## Clocks
 
-**Shipped**, except that `Instant` is renamed `Timestamp` by the rewrite and gains
-the calendar methods above. `now()` keeps its signature and its meaning.
+**Shipped** as `Timestamp` (renamed from `Instant`, `.ns` now `readonly`); it
+gains the calendar methods above as the rest of the rewrite lands. `now()`
+keeps its signature and its meaning.
 
 Two clocks, for two different jobs. `now` tells you *when*; `monotonic` tells you
 *how long*, and never jumps when the system clock is adjusted. Each returns its own
@@ -824,12 +825,12 @@ nominal record, so a reading from one clock can never be passed to the other
 clock's API by accident; `.ns` gives the raw nanoseconds when a caller genuinely
 needs an int.
 
-### `Instant`
+### `Timestamp`
 
 A wall-clock reading, nanoseconds since the Unix epoch, returned by `now`.
-`.ns` gives the raw nanoseconds. Never pass one to `since` — an `Instant` can
-jump backwards (NTP, an operator setting the clock), so it cannot measure an
-interval; use a `Mono` from `monotonic` instead.
+`.ns` is `readonly` and gives the raw nanoseconds. Never pass one to `since` —
+a `Timestamp` can jump backwards (NTP, an operator setting the clock), so it
+cannot measure an interval; use a `Mono` from `monotonic` instead.
 
 ### `Mono`
 
@@ -837,7 +838,7 @@ A monotonic reading, returned by `monotonic`. Only differences between two
 `Mono` readings are meaningful; pass one to `since` to get the elapsed
 nanoseconds. `.ns` gives the raw nanoseconds.
 
-### `now(): Instant`
+### `now(): Timestamp`
 
 Nanoseconds since the Unix epoch. Follows the system clock, so it can jump
 backwards. Use it to stamp an event, never to measure an interval.
