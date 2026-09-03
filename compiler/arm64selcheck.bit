@@ -624,155 +624,51 @@ fn checkArm64Safepoints() {
   cx.safepointPositions = [0]
   emitBackEdgeSafepointIfNeeded(cx, 2, 5) // forward: nothing
   assert(len(cx.code.bytes) == 0 && len(cx.safepoints) == 0)
-  // back-edge (#2925): the #2921 guard's condition inlined at the call site —
-  // no `bl bit_rt_safepoint_needed`, no runtime leaf prologue/epilogue.
-  // Mirrors stwPollNeeded's own short-circuit ladder (runtime/stw/stwpoll.bit)
-  // via ordinary loads/compares/branches, converging on one real
-  // `bl bit_rt_safepoint` when a poll is actually needed. The ladder itself
-  // records no safepoint of its own — only the real poll does — so exactly
-  // one stack map is still recorded per back edge, matching the count
+  // back-edge (#2925/#4203): three instructions and one call. The #2921 guard's
+  // condition is neither called nor inlined any more — the runtime publishes
+  // its answer in one word (runtime/sched/pollreq.bit) and the back edge reads
+  // it. The guard itself records no safepoint — only the real poll does — so
+  // exactly one stack map is still recorded per back edge, matching the count
   // buildIntervals (compiler/codegen.bit) already produced for this edge.
+  //
+  // PINNED FOR THE SAME REASON THE EIGHTEEN-INSTRUCTION LADDER WAS: this is
+  // what decides whether the collector can ever run. Inverting the branch, or
+  // losing the `ldar` to a plain `ldr`, yields a program that passes every
+  // behavioural gate on this box and misses a stop-the-world on another.
   emitBackEdgeSafepointIfNeeded(cx, 2, 1)
   let want = newByteBuf()
-  let rWorld = scratch1()
-  let rGc = scratch2()
-  let rTmp = scratch3()
-
-  // #4200's countdown gate comes FIRST and is pinned for the same reason the
-  // rest of this ladder is: it decides WHEN the collector may run, and losing
-  // the reset store (or inverting the branch) yields a program that polls once
-  // per invocation and then never again — every behavioural gate still green,
-  // the collector effectively off. Four instructions: load slot 3, subtract
-  // one, store it back, branch past the whole ladder while it is nonzero.
-  // `rc` is scratch1 under another name, dead again before the ladder's own
-  // first load into it, exactly as emitThinnedPollGuard leaves it.
-  let rc = rWorld
-  loadImm(want, rc, regSp(), pollCacheOffset(cx.frame, 3), 8, false)
-  addSubImmediate(want, true, rc, rc, 1, false)
-  storeImm(want, rc, regSp(), pollCacheOffset(cx.frame, 3), 8)
-  let fxThin = len(want.bytes)
-  cbnzX(want, rc, 0) // not due yet -> skip the ladder entirely
-  // The reset value is `stress ? 1 : pollThinN()`. The stress arm is pinned
-  // because dropping it silently thins the precise-rooting oracle -- measured
-  // at 303 -> 128 collections on a 200-iteration loop -- while every
-  // behavioural gate stays green.
-  movImm64(want, rc, pollThinN())
-  loadImm(want, rGc, regSp(), pollCacheOffset(cx.frame, 1), 8, false)
-  let fxUnbound = len(want.bytes)
-  cbz(want, rGc, 0)
-  loadImm(want, rGc, rGc, pgGcCfgStressWord() * 8, 8, false)
-  let fxNotStress = len(want.bytes)
-  cbz(want, rGc, 0)
-  movImm64(want, rc, 1)
-  patchImm19At(want, fxNotStress, len(want.bytes))
-  patchImm19At(want, fxUnbound, len(want.bytes))
-  storeImm(want, rc, regSp(), pollCacheOffset(cx.frame, 3), 8)
-
-  // world not bound -> poll. Slot 0 is the stop word's ADDRESS, pre-folded at
-  // function entry, and is 0 exactly when worldAddr is 0 — so one CBZ answers
-  // stwPollNeeded's `waddr == 0` clause, and the LDAR needs no offset add.
-  loadImm(want, rWorld, regSp(), pollCacheOffset(cx.frame, 0), 8, false)
-  let fx1 = len(want.bytes)
-  cbz(want, rWorld, 0)
-  // stop pending -> poll (atomic load, in place)
-  ldar(want, 3, rWorld, rWorld)
-  let fx2 = len(want.bytes)
-  cbnzX(want, rWorld, 0)
-  // #3564: clause 3 (preempt pending), emitInlinedPreemptCheck. Two real
-  // calls, not a leaf sequence like every arm above and below it — see that
-  // function's own header for why. rWorker reuses rWorld's register (scratch1,
-  // dead after the stop-pending check above), exactly as emitInlinedPreemptCheck
-  // does.
-  //
-  // #3746's fast-path gate comes FIRST and is pinned here for the same reason
-  // the rest of the ladder is: it is the load-bearing part of the fix, and a
-  // silent loss of the `b.eq` past the two calls would restore #3564's 3.28x
-  // with every behavioural gate still green. Cached address (poll slot 2),
-  // `ldar` of the summary word, compare, branch — four leaf instructions.
-  let rWorker = rWorld
-  loadImm(want, rWorker, regSp(), pollCacheOffset(cx.frame, 2), 8, false)
-  ldar(want, 3, rWorker, rWorker)
-  let fxNoneP = len(want.bytes)
-  cbz(want, rWorker, 0)      // nothing pending anywhere -> skip clause
-  emitWord(want, 0x94000000) // bl bit_rt_port_sched_current_worker (placeholder)
-  movRR(want, rWorker, retRegNum())
-  let fxOffTask = len(want.bytes)
-  cbz(want, rWorker, 0)                                       // worker==0 -> off-task, skip this clause only
-  loadImm(want, rWorker, rWorker, pgWkIdWord() * 8, 8, false) // *(taskAt(worker)+wkId)
-  movRR(want, argReg(RegClass.Int, 0), rWorker)
-  emitWord(want, 0x94000000) // bl bit_rt_port_sched_preempt_requested (placeholder)
-  uxtb(want, retRegNum())
-  let fxPreempt = len(want.bytes)
-  cbnzX(want, retRegNum(), 0) // preempt pending -> poll
-  // worker==0 (off-task) and #3746's "nothing pending anywhere" both converge
-  // HERE, right where the gcAddr==0 check begins — the clause is a pure no-op
-  // in both cases, exactly like stwPollNeeded's own `if (worker != 0) { ... }`.
-  patchImm19At(want, fxOffTask, len(want.bytes))
-  patchImm19At(want, fxNoneP, len(want.bytes))
-  // gcAddr == 0 -> poll
-  loadImm(want, rGc, regSp(), pollCacheOffset(cx.frame, 1), 8, false)
-  let fx3 = len(want.bytes)
-  cbz(want, rGc, 0)
-  // stress mode -> poll
-  loadImm(want, rTmp, rGc, pgGcCfgStressWord() * 8, 8, false)
-  let fx4 = len(want.bytes)
-  cbnzX(want, rTmp, 0)
-  // disabled -> skip (the one early-false, everything else above is early-true)
-  loadImm(want, rTmp, rGc, pgGcCfgEnabledWord() * 8, 8, false)
-  let fx5 = len(want.bytes)
-  cbz(want, rTmp, 0)
-  // heapLive >= gcNextBytes -> poll, else skip
-  loadImm(want, rTmp, rGc, pgGcHeapAddrWord() * 8, 8, false)
-  ldar(want, 3, rTmp, rTmp)
-  loadImm(want, rGc, rGc, pgGcNextBytesWord() * 8, 8, false)
-  cmpRR(want, rTmp, rGc)
-  let fx6 = len(want.bytes)
-  emitWord(want, 0x54000000 | condLt())
-  // liveBytes - nextBytes >= nextBytes -> poll (#3359: the second growth
-  // cycle, as a subtraction — exactly `liveBytes >= nextBytes * 2` with no
-  // overflow and so no saturation guard, matching the runtime predicate).
-  subRR(want, rTmp, rTmp, rGc)
-  cmpRR(want, rTmp, rGc)
-  let fx7 = len(want.bytes)
-  emitWord(want, 0x54000000 | condGe())
-  // objects < object trigger -> skip; otherwise fall through to the poll.
-  // rGc was overwritten by the gcNextBytes load, so gcAddr is reloaded.
-  loadImm(want, rGc, regSp(), pollCacheOffset(cx.frame, 1), 8, false)
-  loadImm(want, rTmp, rGc, pgGcNumObjectsIdxWord() * 8, 8, false)
-  loadImm(want, rGc, rGc, pgGcNextObjectsWord() * 8, 8, false)
-  cmpRR(want, rTmp, rGc)
-  let fx8 = len(want.bytes)
-  emitWord(want, 0x54000000 | condLt())
-  // fx1/fx2/fxPreempt/fx4/fx7 converge on the real poll; fxOffTask (patched
-  // above, at the gcAddr==0 check's own start) and fx5/fx6/fx8 converge on
-  // skipping it — mirroring emitInlinedPollGuard's own two-list patch order
-  // through the same low-level patchBranchTo rather than hardcoding the
-  // resulting words, so a future change to its encoding cannot silently desync
-  // the two (#2927's concern, carried forward from the #2921 shape this
-  // replaces).
-  patchImm19At(want, fx1, len(want.bytes))
-  patchImm19At(want, fx2, len(want.bytes))
-  patchImm19At(want, fxPreempt, len(want.bytes))
-  patchImm19At(want, fx3, len(want.bytes))
-  patchImm19At(want, fx4, len(want.bytes))
-  patchImm19At(want, fx7, len(want.bytes))
+  let r = scratch1()
+  loadImm(want, r, regSp(), pollCacheOffset(cx.frame, 0), 8, false)
+  // LDAR, not LDR: the acquire half of the message-passing pair whose release
+  // half is pollRequest's store. See emitPollGuard's header.
+  ldar(want, 3, r, r)
+  let fxSkip = len(want.bytes)
+  cbz(want, r, 0)            // nobody is asking -> past the call
   emitWord(want, 0x94000000) // bl bit_rt_safepoint (placeholder)
-  patchImm19At(want, fx5, len(want.bytes))
-  patchImm19At(want, fx6, len(want.bytes))
-  patchImm19At(want, fx8, len(want.bytes))
-  // #4200: the countdown's own skip lands past EVERYTHING above — the ladder,
-  // the real poll and the three skip targets alike — so a back edge that is not
-  // due executes exactly the four countdown instructions and nothing else.
-  patchImm19At(want, fxThin, len(want.bytes))
+  patchImm19At(want, fxSkip, len(want.bytes))
   assertSameBytes(cx.code, want)
-  // #3564: three relocs now, not one -- the preempt clause's two calls
-  // (schedCurrentWorker, preemptRequested), in emission order, then the
-  // original bit_rt_safepoint.
-  assert(len(cx.relocs) == 3)
-  assert(cx.relocs[0].symbol == schedCurrentWorkerSymbol())
-  assert(cx.relocs[1].symbol == preemptRequestedSymbol())
-  assert(cx.relocs[2].symbol == "bit_rt_safepoint")
+  // ONE reloc, not three: #3564's preempt clause called schedCurrentWorker and
+  // preemptRequested from the fast path, and #4203 moved both behind the word.
+  assert(len(cx.relocs) == 1)
+  assert(cx.relocs[0].symbol == "bit_rt_safepoint")
   assert(len(cx.safepoints) == 1)
+
+  // The entry-side half: ONE call, ONE store, into poll-cache slot 0. It was
+  // three calls and four slots (worldAddr, gcAddr, preemptAnyAddr, countdown)
+  // while the back edge re-derived the predicate itself.
+  cx = selCtx()
+  cx.frame = FrameInfo{
+    savedGpr: []int(0), savedFpr: []int(0), numSpillSlots: 0,
+    outgoingBytes: 0, pollCacheSlots: 1, frameSize: 32,
+  }
+  emitPollCachePrefetch(cx)
+  want = newByteBuf()
+  emitWord(want, 0x94000000) // bl bit_rt_port_sched_poll_attention_addr
+  storeImm(want, retRegNum(), regSp(), pollCacheOffset(cx.frame, 0), 8)
+  assertSameBytes(cx.code, want)
+  assert(len(cx.relocs) == 1)
+  assert(cx.relocs[0].symbol == pollAttentionAddrSymbol())
+  assert(len(cx.safepoints) == 0) // a true leaf: never recorded as a safepoint
 
   // A stack map's slot offsets are normalized to FRAME-POINTER-relative
   // (x29 = sp + frameSize - 16) so the runtime's walker stays arch-neutral, and

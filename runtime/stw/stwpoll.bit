@@ -8,7 +8,13 @@
 // #3560 also reaches into `../sched` from `stwPollNeeded` itself, below, for
 // `schedCurrentWorker`/`preemptRequested`/`wkId` — see that clause's own
 // comment for why, and for the leaf cost it pays.
-import { schedMaybeYieldForPreempt, schedCurrentWorker, preemptRequested, wkId } from "../sched"
+//
+// #4203 REPLACED `schedCurrentWorker`/`preemptRequested`/`wkId` with the
+// summary `preemptAnyPending`, and added `pollRequest`/`pollConsume`
+// (../sched/pollreq.bit) — the word a compiled mutator now reads at its back
+// edge instead of re-deriving this whole predicate.
+import { schedMaybeYieldForPreempt, preemptAnyPending } from "../sched"
+import { pollRequest, pollConsume } from "../sched"
 
 // ---------------------------------------------------------------------------
 // `bit_rt_safepoint_needed` — the SPEC, not what compiled code runs (#2921, #2925/#3169)
@@ -114,25 +120,25 @@ export @nosplit @symbol("bit_rt_safepoint_needed") fn stwPollNeeded(): bool {
   if (atomicLoad(world + worldStopWord) != 0) {
     return true // a stop is pending
   }
-  // #3560 -- clause 3: a preempt is pending for the WORKER RUNNING THIS
-  // CALL. Orthogonal to GC state entirely (a task must stay preemptible even
-  // with GC disabled), so this runs before the GC-specific checks below, not
-  // folded into their tail. `schedCurrentWorker()` returns 0 off-task (the
-  // worker's own idle loop, the boot thread -- see its own comment in
-  // ../sched/sched.bit), which this treats the same way
-  // `schedMaybeYieldForPreempt` (../sched/task.bit) already does: a no-op.
-  // `taskAt(w) + wkId` is inlined here as `wNil + (w >> 3) + wkId` rather
-  // than calling `taskAt` -- the same trade this file already makes for
-  // `world`/`g` above, and `taskAt`'s own comment (../sched/task.bit) is why
-  // `>> 3` and not `/ 8`: a shift is one instruction, a signed divide by a
-  // constant that must round toward zero is four.
-  let worker = schedCurrentWorker()
-  if (worker != 0) {
-    let wNil: *i64 = nil
-    let workerId = *(wNil + (worker >> 3) + wkId)
-    if (preemptRequested(workerId)) {
-      return true // a preempt is pending for this worker
-    }
+  // #3560 -- clause 3: a preempt is pending. Orthogonal to GC state entirely
+  // (a task must stay preemptible even with GC disabled), so this runs before
+  // the GC-specific checks below, not folded into their tail.
+  //
+  // #4203 ASKS THE SUMMARY, NOT THIS WORKER. The clause used to call
+  // `schedCurrentWorker()` and then `preemptRequested(workerId)` -- two real
+  // cross-module calls, which is what cost this function its leaf status (see
+  // the header above). `preemptAnyPending` (../sched/preempt.bit) is the
+  // conservative form of the same question: it can read 1 with nothing pending
+  // for THIS worker, and can never read 0 with something pending for it. This
+  // function's own contract is "a safe over-approximation" (header above), so
+  // widening a clause from one worker to any worker stays inside it -- a false
+  // positive costs one real poll, and `schedMaybeYieldForPreempt`
+  // (`stwSafepoint`, below) still makes the per-worker decision about whether
+  // to actually yield. #4203 needs the global form regardless: the word this
+  // predicate republishes is read by every thread, so a per-worker answer
+  // would be wrong to store in it.
+  if (preemptAnyPending()) {
+    return true // a preempt is pending somewhere
   }
   let gA = gcAddr
   if (gA == 0) {
@@ -436,8 +442,27 @@ export @nosplit @symbol("bit_rt_port_stw_poll_on") fn stwPollOn(
 // yielded task's stack registered and conservatively scannable (#1562) — the
 // requirement is inherited, not re-proven here.
 export @nosplit @symbol("bit_rt_port_stw_safepoint") fn stwSafepoint(snap: int) {
+  // #4203: CONSUME FIRST, REPUBLISH LAST, and both halves are load-bearing.
+  //
+  // The clear must precede every read of the state it summarises. A slow path
+  // that worked and then cleared would lose a request published in between;
+  // this order cannot, because every writer stores its state before it stores
+  // the word (../sched/pollreq.bit's `pollConsume` carries the interleaving
+  // proof). So a request landing after this line survives into the word and the
+  // next back edge polls again, and one landing before it is seen by the work
+  // below.
+  pollConsume()
   stwPoll(snap)
   schedMaybeYieldForPreempt()
+  // Republish if a reason still holds -- which is the normal case under
+  // `BIT_GC=stress` (`gcShouldCollect` is unconditionally true there, so every
+  // back edge polls exactly as it did before the word existed) and the case
+  // that keeps the collector moving when this call could not collect: a lost
+  // `worldLockTry`, or a thread with no mutator slot. This only ever SETS, so
+  // it cannot undo a request that arrived while `stwPoll` ran.
+  if (stwPollNeeded()) {
+    pollRequest()
+  }
 }
 
 // ---------------------------------------------------------------------------

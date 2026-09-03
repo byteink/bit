@@ -364,373 +364,90 @@ fn emitCallIface(cx: A64Ctx, dst: int, dstTy: int, ifaceVal: int, methodId: int,
 // #2921: the naked shim's full chain (five stack frames, see
 // runtime/stw/stwpoll.bit) is only needed when a stop is pending or a
 // collection is due — both rare. #2921 guarded it behind a call to
-// `bit_rt_safepoint_needed`; #2925 inlines that call's own condition instead
-// (emitInlinedPollGuard) — see the header there for why a call, even to a
-// true leaf, remained ~0.50s of collatz's 0.86s and could not be fixed by
-// #2929 (that leaf's own prologue/epilogue is baked into the pinned-stage0
-// libbitrt.a, out of this tree's reach).
+// `bit_rt_safepoint_needed`; #2925 inlined that call's own condition instead;
+// #4203 replaced the inlined condition with a single word the runtime
+// publishes (emitPollGuard below). A call, even to a true leaf, was ~0.50s of
+// collatz's 0.86s and could not be fixed by #2929 — that leaf's own
+// prologue/epilogue is baked into the pinned-stage0 libbitrt.a, out of this
+// tree's reach — which is why the answer is a load and not a call.
 fn emitBackEdgeSafepointIfNeeded(cx: A64Ctx, curBlock: int, target: int) {
   // §10.3.1: a @naked/@nosplit function polls no safepoint on its back-edges.
   if (isBackEdge(curBlock, target) && !needsNoSafepoints(cx.f)) {
-    emitThinnedPollGuard(cx)
+    emitPollGuard(cx)
   }
 }
 
-// #4200: the ladder below evaluates once per `pollThinN()` (codegen.bit) back
-// edges instead of once per back edge, behind a four-instruction countdown in
-// poll-cache slot 3 — `ldr` / `sub` / `str` / `cbnz` against the ladder's own
-// eighteen-instruction fast path, for an amortised 4 + 18/8 = 6.25.
+// #4203: THE WHOLE BACK EDGE IS THREE INSTRUCTIONS.
 //
-// The countdown is a per-invocation frame slot, NOT module state: two threads
-// running the same function keep separate counts, so no thread can be starved
-// of polls by another's progress. emitPollCachePrefetch seeds it with 1 so the
-// first back edge of every invocation still evaluates the ladder in full — a
-// loop that runs fewer than `pollThinN()` iterations is unchanged, and the
-// thinning never compounds down a call chain.
+//   ldr  x9, [sp, #<pollCache 0>]   the address of the attention word
+//   ldar x9, [x9]                   acquire-load it
+//   cbz  x9, <past the call>        the answer is no, essentially always
+//   bl   bit_rt_safepoint           the answer is yes: find out why in there
 //
-// `cbnz` reads the countdown register directly rather than the flags
-// `addSubImmediate` would set with S, matching the rest of this ladder's
-// zero-tests: one instruction, and it leaves NZCV alone.
+// What it replaces is eighteen instructions asking three independent questions
+// — is a stop-the-world pending, is a preempt pending, has the GC trigger been
+// crossed — of state the runtime had already computed, plus (#4200) a
+// four-instruction countdown that existed only to make asking them rarer.
+// runtime/sched/pollreq.bit holds the design and the invariant; the short
+// version is that every writer of one of those three conditions now publishes a
+// single word after it, so the mutator reads an answer instead of deriving one.
 //
-// x64's xEmitThinnedPollGuard (compiler/x64controlflow.bit) is the same four
-// steps in the same order; the two must stay in lockstep, since the countdown
-// decides WHEN the collector can run and a backend that thins differently
-// collects on a different schedule for the same program.
-fn emitThinnedPollGuard(cx: A64Ctx) {
-  let rc = scratch1()
-  loadImm(cx.code, rc, regSp(), pollCacheOffset(cx.frame, 3), 8, false)
-  addSubImmediate(cx.code, true, rc, rc, 1, false)
-  storeImm(cx.code, rc, regSp(), pollCacheOffset(cx.frame, 3), 8)
-  let skipFixup = emitLocalCbz(cx, true, rc) // not due yet -> past the ladder
-  emitPollCountdownReset(cx, rc)
-  emitInlinedPollGuard(cx)
+// THE ACQUIRE IS REQUIRED AND IS NOT A LEFTOVER. It is the acquire half of a
+// message-passing pair: a writer stores its state, then stores the word with
+// release ordering. Without an acquire here, the slow path's own loads of that
+// state may be satisfied before this load — control dependencies do not order
+// loads on AArch64 — so a mutator could observe the request and then read the
+// state stale, conclude nothing is pending, and clear a live stop request. One
+// `ldar` per back edge, against the three the ladder ran.
+//
+// NO ACQUIRE WAS DOWNGRADED to get here. The ladder's three (`worldStopWord`,
+// the preempt summary, `heapLive`) all still execute with exactly the ordering
+// they had — in `stwPollOn`/`preemptRequested`/`heapLiveBytes`, on the slow
+// path, which is where the values are actually consumed. What changed is that
+// the mutator no longer performs them speculatively at every iteration to
+// answer a question that is "no".
+//
+// `cbz` reads the register directly rather than the flags a `cmp` would set:
+// one instruction instead of two, and it leaves NZCV alone.
+//
+// x64's xEmitPollGuard (compiler/x64controlflow.bit) is the same three steps in
+// the same order — there, an ordinary `mov` load already IS the acquire load
+// under TSO, which is the same fact Op.AtomicLoad itself relies on.
+fn emitPollGuard(cx: A64Ctx) {
+  let r = scratch1()
+  loadImm(cx.code, r, regSp(), pollCacheOffset(cx.frame, 0), 8, false)
+  ldar(cx.code, 3, r, r)
+  let skipFixup = emitLocalCbz(cx, false, r) // nobody is asking -> past the call
+  emitCall(cx, -1, 0, safepointSymbol(), []int(0), true)
   patchLocalCondBranch(cx, skipFixup)
 }
 
-// The reset value is `stress ? 1 : pollThinN()`, and the stress arm is a
-// CORRECTNESS obligation rather than a refinement. Under `BIT_GC=stress` every
-// poll collects, which is what makes the stress suite this runtime's
-// precise-rooting oracle — `gcSafepointRoots`' own words: "any root the caller
-// fails to report is swept on the very next poll". A flat reset to
-// pollThinN() thins that oracle along with the fast path: measured on a
-// 200-iteration if/else loop, collections under stress went 303 → 128 (−58%),
-// and scripts/selfhost-diffsafepoints.sh compares exactly that number against
-// the pinned oracle. Buying a benchmark win with the collector's own test
-// instrument is not a trade this may make, so stress resets to 1 and its
-// schedule is bit-for-bit what it was before thinning.
+// Fetches the attention word's ADDRESS once per function invocation and caches
+// it in this function's own frame (FrameInfo.pollCacheSlots), rather than once
+// per loop iteration. Safe because it is the address of a module global in
+// runtime/sched/pollreq.bit — a per-process constant for the entire lifetime of
+// every function this backend compiles — so re-fetching it per iteration would
+// buy nothing.
 //
-// It is free where it matters: these four instructions sit on the reset path,
-// which runs once per pollThinN() back edges — 0.5 amortised instructions
-// against the 14 the thinning removes. Under stress the reset path IS every
-// back edge, and a stress run already pays a full collection there.
-//
-// gcAddr unbound (slot 1 == 0) keeps pollThinN(): with no GC bound there is no
-// stress flag to read and nothing to collect, and the ladder's own `gcAddr == 0`
-// arm still forces the poll on the back edges that do evaluate it.
-fn emitPollCountdownReset(cx: A64Ctx, rc: int) {
-  let rGc = scratch2()
-  movImm64(cx.code, rc, pollThinN())
-  loadImm(cx.code, rGc, regSp(), pollCacheOffset(cx.frame, 1), 8, false)
-  let unboundFixup = emitLocalCbz(cx, false, rGc)
-  emitPollField(cx, rGc, rGc, pgGcCfgStressWord())
-  let notStressFixup = emitLocalCbz(cx, false, rGc)
-  movImm64(cx.code, rc, 1)
-  patchLocalCondBranch(cx, notStressFixup)
-  patchLocalCondBranch(cx, unboundFixup)
-  storeImm(cx.code, rc, regSp(), pollCacheOffset(cx.frame, 3), 8)
-}
-
-// ---------------------------------------------------------------------------
-// #2925: the poll guard's condition, inlined at the call site
-// ---------------------------------------------------------------------------
-//
-// The six word offsets this ladder reads (pgWorldStopWordWord/pgGcCfgStressWord/
-// pgGcCfgEnabledWord/pgGcHeapAddrWord/pgHeapLiveWordWord/pgGcNextBytesWord)
-// live in compiler/codegen.bit — #3169 gave the x64 backend the same inlined
-// ladder, and a number two backends mirror from one runtime must have exactly
-// one copy. See that block's header for the mirroring contract, and
-// _tests_/bit/pollguardoffsets.bit for the gate that pins it.
-
-// Fetches the three poll addresses ONCE per function invocation and caches them
-// in this function's own frame (FrameInfo.pollCacheSlots), rather than once per
-// loop iteration. Safe because runtime/stw/stw.bit's stwBind runs exactly once
-// at boot — before any compiled Bit function's entry can execute — and never
-// unbinds (#2184): the two addresses are a per-process constant for the
-// entire lifetime of every function this backend compiles, so re-fetching
-// them on every iteration (what a per-iteration call would do) buys nothing.
 // Emitted right after bindIncomingArgs: the incoming args are already off
-// x0..x7 by then, so these calls' ordinary caller-saved clobber is harmless,
-// and every vreg in a hasSafepoints function is callee-saved-only already
-// (buildIntRegs), so neither call can clobber a live loop-carried value.
-// bit_rt_world_addr/bit_rt_gc_addr are themselves true leaves that never
-// allocate or park, so — like the #2921 guard call they replace at the call
-// site — neither is recorded as a safepoint.
+// x0..x7 by then, so this call's ordinary caller-saved clobber is harmless, and
+// every vreg in a hasSafepoints function is callee-saved-only already
+// (buildIntRegs), so it cannot clobber a live loop-carried value.
+// bit_rt_port_sched_poll_attention_addr is itself a true leaf that never
+// allocates or parks, so — like the #2921 guard call it descends from — it is
+// not recorded as a safepoint.
+//
+// #4203 CUT THIS FROM THREE CALLS AND FOUR SLOTS TO ONE AND ONE. It used to
+// fetch worldAddr (folded with `worldStopWord*8`), gcAddr and the preempt
+// summary address, and seed a countdown, because the ladder read all four. The
+// ladder is gone, so the only address a back edge can still reach for is the
+// one below.
 fn emitPollCachePrefetch(cx: A64Ctx) {
   if (cx.frame.pollCacheSlots == 0) {
     return
   }
-  // Slot 0 holds the address of the world's STOP WORD, not the world base:
-  // `worldAddr + worldStopWord*8`, folded in here once per call instead of at
-  // every back edge. `worldStopWord` is 1792 words = 0x3800 bytes, which is
-  // wider than one add-immediate, so the per-iteration form cost TWO adds
-  // before `ldar` (LDAR has no offset form at all). Zero is kept as-is and
-  // means "world not bound", which the ladder's leading CBZ reads as "poll" —
-  // the same conservative answer the separate `waddr == 0` test used to give,
-  // now folded into the load the ladder already had to do.
-  emitCallReloc(cx, worldAddrSymbol())
-  let boundFixup = emitLocalCbz(cx, false, retRegNum())
-  addSubImmWide(cx.code, false, retRegNum(), retRegNum(), pgWorldStopWordWord() * 8)
-  patchLocalCondBranch(cx, boundFixup)
+  emitCallReloc(cx, pollAttentionAddrSymbol())
   storeImm(cx.code, retRegNum(), regSp(), pollCacheOffset(cx.frame, 0), 8)
-  emitCallReloc(cx, gcAddrSymbol())
-  storeImm(cx.code, retRegNum(), regSp(), pollCacheOffset(cx.frame, 1), 8)
-  // #3746: the preempt summary word's address, on the same terms as the two
-  // above and for the same reason — a fixed module global in
-  // runtime/sched/preempt.bit, so its ADDRESS is a per-process constant even
-  // though the word it points at changes. One extra call per function ENTRY,
-  // against the two per loop ITERATION it is here to remove.
-  emitCallReloc(cx, preemptAnyAddrSymbol())
-  storeImm(cx.code, retRegNum(), regSp(), pollCacheOffset(cx.frame, 2), 8)
-  // #4200: slot 3 is a COUNTDOWN, not an address — the only slot here whose
-  // value is not a per-process constant. 1, so the first back edge of this
-  // invocation evaluates the poll ladder in full; emitThinnedPollGuard resets
-  // it to pollThinN() from then on.
-  movImm64(cx.code, retRegNum(), 1)
-  storeImm(cx.code, retRegNum(), regSp(), pollCacheOffset(cx.frame, 3), 8)
-}
-
-// Loads the plain (non-atomic) i64 at word offset `wordOff` from the pointer
-// value in `baseReg`, into `dst`. Mirrors a bare `*(g + off)` deref.
-fn emitPollField(cx: A64Ctx, dst: int, baseReg: int, wordOff: int) {
-  loadImm(cx.code, dst, baseReg, wordOff * 8, 8, false)
-}
-
-// Atomically loads the i64 at word offset `wordOff` from the pointer value in
-// `baseReg`, overwriting `baseReg` with the loaded value. Mirrors a bare
-// `atomicLoad(p + off)`. LDAR has no immediate-offset form (arm64ctx.bit's
-// emitAddrOf note: no movabs/addressing-mode equivalent exists here either),
-// so a nonzero offset is materialized into the same register first — which is
-// why the one wide offset the ladder needs, the world stop word, is folded
-// into its cached address by emitPollCachePrefetch instead of here.
-fn emitAtomicPollFieldInPlace(cx: A64Ctx, baseReg: int, wordOff: int) {
-  if (wordOff != 0) {
-    addSubImmWide(cx.code, false, baseReg, baseReg, wordOff * 8)
-  }
-  ldar(cx.code, 3, baseReg, baseReg)
-}
-
-// ---------------------------------------------------------------------------
-// #3564: clause 3 (preempt pending) — NOT a leaf, unlike every arm above
-// ---------------------------------------------------------------------------
-//
-// The inlined equivalent of stwPollNeeded's #3560 clause, mirrored exactly:
-//
-//   let worker = schedCurrentWorker()
-//   if (worker != 0) {
-//     let workerId = *(taskAt(worker) + wkId)
-//     if (preemptRequested(workerId)) { return true }
-//   }
-//
-// Placed between the world-stop check and the gcAddr==0 check in the ladder
-// below, exactly as in stwPollNeeded — preemption must work even with GC
-// disabled, so this cannot be folded into the GC-only tail.
-//
-// UNLIKE the rest of this ladder, both `schedCurrentWorker`
-// (runtime/sched/sched.bit) and `preemptRequested` (runtime/sched/preempt.bit,
-// #3563's pin) are genuine cross-module calls. Neither ANSWER can be cached
-// the way emitPollCachePrefetch caches worldAddr/gcAddr once per function
-// entry: those are per-process constants that never change; the current worker
-// is the current execution context, which this very guard can change out from
-// under a cached copy the moment it causes a yield (a preempted task may
-// resume on a different worker).
-//
-// #3746 PUT BOTH CALLS BEHIND A GATE, and everything below is the record of
-// why the obvious alternatives were rejected — read it as history, not as the
-// current shape. #3564 ran them on EVERY guard evaluation, not only on the
-// "poll needed" branch the way the eventual `bl bit_rt_safepoint` below does,
-// and MEASURED that cost 3.28x on bench/cases/collatz and 2.36x on matrix. Its
-// own verification had reported +10 instructions at the call site, predicting
-// +22%: a correct static number, wrong by ~15x as a prediction, because
-// neither callee is a leaf. They now run only when a THIRD cached poll address
-// — the `anyRequested` summary word, runtime/sched/preempt.bit — says a
-// preempt is pending for SOME worker; the fast path is one `ldar` and a
-// branch, and is call-free again. The clause's ANSWER is unchanged: the
-// summary may read 1 with nothing pending, and can never read 0 with something
-// pending (that invariant is proven where the word is declared).
-//
-// A CALL-FREE INLINE WAS INVESTIGATED AND IS NOT POSSIBLE WITHIN THIS
-// TICKET'S CONSTRAINTS, not merely undone for lack of time. `preemptRequested`
-// reads one atomic word (runtime/sched/preempt.bit: "return
-// atomicLoad(slotAddr(ptrOf(requested), worker)) != 0"), which in principle
-// could be inlined the way pgWorldStopWordWord's clause is — BUT its backing
-// array (`requested`) carries no `@symbol` pin, and #3564's own constraints
-// forbid touching runtime/sched/preempt.bit to add one. So at least one real
-// call is unavoidable regardless of schedCurrentWorker. `schedCurrentWorker`
-// itself is architecturally O(1) in the common case (runtime/sched/task.bit's
-// own comment on schedMaybeYieldForPreempt: "not a scan, but not free"), so a
-// call-free inline of IT ALONE is conceivable — but only by adding a NEW
-// `@symbol`-pinned accessor to runtime/sched/sched.bit for its lookup table's
-// base address (module state has no cross-module pin today — see this file's
-// own header on the eight/nine pgWord offsets) and by hand-encoding
-// schedTaskOnStack's mask-and-index sequence identically in BOTH backends —
-// the same class of drift-prone duplication #3420's gcThreadTokenSymbol
-// comment describes and scopes as its own carefully-mirrored, test-pinned
-// unit, not something to improvise inline here. Since preemptRequested still
-// needs a real call either way, halving the call count would be a genuine
-// follow-up (a single new runtime accessor combining both checks, symbol-pinned
-// once) rather than an inline-without-a-call — reported, not attempted, in
-// #3564's own ticket comments.
-//
-// `emitCallReloc` directly, exactly like emitPollCachePrefetch's two calls
-// above, not the vreg-based emitCall/marshalArgs: neither call's argument nor
-// result corresponds to an IR vreg — both are pure codegen-internal scratch
-// values with no backing IR instruction.
-fn emitInlinedPreemptCheck(cx: A64Ctx, pollFixups: []int): []int {
-  // #3746: THE FAST-PATH GATE. Four leaf instructions — a frame load of the
-  // cached address, one `ldar` of the summary word, a compare and a branch —
-  // decide whether this back edge spends the two calls below at all. The
-  // summary is 0 whenever no worker anywhere has a pending request, which is
-  // every iteration of every loop in a program that is not being preempted
-  // right now, so the calls leave the fast path entirely without leaving the
-  // ladder. Correctness rests on ONE invariant, proven where the word is
-  // declared (runtime/sched/preempt.bit): a set flag implies a nonzero
-  // summary. A false positive costs one slow evaluation; a false negative
-  // cannot occur.
-  let rAny = scratch1()
-  loadImm(cx.code, rAny, regSp(), pollCacheOffset(cx.frame, 2), 8, false)
-  emitAtomicPollFieldInPlace(cx, rAny, 0)
-  let noneFixup = emitLocalCbz(cx, false, rAny) // nothing pending anywhere
-
-  emitCallReloc(cx, schedCurrentWorkerSymbol())
-  let rWorker = scratch1()
-  movRR(cx.code, rWorker, retRegNum())
-  let offTaskFixup = emitLocalCbz(cx, false, rWorker) // worker==0: off-task, no-op
-
-  // workerId = *(taskAt(worker) + wkId): worker is a raw, word-aligned block
-  // address (never a small index — see task.bit's own note on this, which
-  // this mirrors), so a direct byte-offset immediate load is exactly
-  // `*(wNil + (worker >> 3) + wkId)` for any aligned address, the same
-  // reduction this file's other loads already make (emitPollField).
-  loadImm(cx.code, rWorker, rWorker, pgWkIdWord() * 8, 8, false)
-  movRR(cx.code, argReg(RegClass.Int, 0), rWorker)
-  emitCallReloc(cx, preemptRequestedSymbol())
-  // C-ABI bool: normalize before testing, same rule bindCallResult applies to
-  // every other call result (ABI.md: a narrow bool return leaves the upper
-  // bits of the register unspecified).
-  uxtb(cx.code, retRegNum())
-  pollFixups = append(pollFixups, emitLocalCbz(cx, true, retRegNum())) // preempt pending -> poll
-
-  // Both no-op exits — off-task, and the #3746 fast-path gate — converge here,
-  // at the ladder's next clause, exactly as stwPollNeeded's own
-  // `if (worker != 0) { ... }` falls through.
-  patchLocalCondBranch(cx, offTaskFixup)
-  patchLocalCondBranch(cx, noneFixup)
-  return pollFixups
-}
-
-// The inlined equivalent of:
-//
-//   fn stwPollNeeded(): bool {
-//     let waddr = worldAddr
-//     if (waddr == 0) { return true }
-//     if (atomicLoad(world + worldStopWord) != 0) { return true }
-//
-// The first two clauses are one load and one CBZ here rather than two tests,
-// because poll-cache slot 0 already holds `worldAddr + worldStopWord*8` and
-// holds 0 exactly when `worldAddr` is 0 (emitPollCachePrefetch). Zero means
-// "poll", which is what the `waddr == 0` clause above answers.
-//     // #3564's clause -- emitInlinedPreemptCheck above
-//     let gA = gcAddr
-//     if (gA == 0) { return true }
-//     if (*(g + gcCfgStress) != 0) { return true }
-//     if (*(g + gcCfgEnabled) == 0) { return false }
-//     let hb = *(g + gcHeapAddr)
-//     let liveBytes = atomicLoad(hb + heapLiveWord)
-//     let nextBytes = *(g + gcNextBytes)
-//     return liveBytes >= nextBytes
-//       && (liveBytes - nextBytes >= nextBytes
-//           || *(g + gcNumObjectsIdx) >= *(g + gcNextObjects))
-//   }
-//
-// `true` (poll needed) falls into the real `bl bit_rt_safepoint`; `false`
-// (skip) branches past it. Every zero test is a single CBZ/CBNZ rather than
-// `cmp Xn, xzr` + `B.cond`: identical on a 64-bit register, one instruction
-// instead of two, and it writes no flags — nothing in this ladder reads NZCV
-// across a branch, and the two comparisons that are not against zero (the byte
-// and object triggers) keep their own `cmp` + `B.cond`.
-// Three scratch registers cover the whole ladder —
-// scratch1/scratch2 hold the cached worldAddr/gcAddr only until each is used
-// for the last time, then get reused as plain temporaries, exactly as the
-// rest of this backend already treats them (never live across an instruction
-// boundary by convention) — emitInlinedPreemptCheck follows the identical
-// convention for its own two calls.
-fn emitInlinedPollGuard(cx: A64Ctx) {
-  let rWorld = scratch1()
-  let rGc = scratch2()
-  let rTmp = scratch3()
-  let pollFixups = []int(0)
-  let skipFixups = []int(0)
-
-  loadImm(cx.code, rWorld, regSp(), pollCacheOffset(cx.frame, 0), 8, false)
-  pollFixups = append(pollFixups, emitLocalCbz(cx, false, rWorld)) // world not bound
-
-  ldar(cx.code, 3, rWorld, rWorld)
-  pollFixups = append(pollFixups, emitLocalCbz(cx, true, rWorld)) // stop pending
-
-  pollFixups = emitInlinedPreemptCheck(cx, pollFixups) // #3564 clause 3
-
-  loadImm(cx.code, rGc, regSp(), pollCacheOffset(cx.frame, 1), 8, false)
-  pollFixups = append(pollFixups, emitLocalCbz(cx, false, rGc)) // gcAddr==0
-
-  emitPollField(cx, rTmp, rGc, pgGcCfgStressWord())
-  pollFixups = append(pollFixups, emitLocalCbz(cx, true, rTmp)) // stress mode
-
-  emitPollField(cx, rTmp, rGc, pgGcCfgEnabledWord())
-  skipFixups = append(skipFixups, emitLocalCbz(cx, false, rTmp)) // disabled -> skip
-
-  emitPollField(cx, rTmp, rGc, pgGcHeapAddrWord())           // rTmp = heap base addr
-  emitAtomicPollFieldInPlace(cx, rTmp, pgHeapLiveWordWord()) // rTmp = heap live bytes
-  emitPollField(cx, rGc, rGc, pgGcNextBytesWord())           // rGc = next trigger
-  cmpRR(cx.code, rTmp, rGc)
-  skipFixups = append(skipFixups, emitLocalCondBranch(cx, condLt())) // under trigger -> skip
-
-  // The object half of the trigger (#3292), inlined here by #3359 — without
-  // it this ladder polls on the byte trigger alone and the runtime then
-  // declines to collect, once per back edge, for as long as the two disagree.
-  //
-  //   liveBytes - nextBytes >= nextBytes            -> poll (second cycle)
-  //   *(g+gcNumObjectsIdx) <  *(g+gcNextObjects)    -> skip
-  //   otherwise                                     -> poll (objects caught up)
-  //
-  // The subtraction IS `liveBytes >= nextBytes * 2`, exactly and without
-  // overflow, which is why no saturation guard appears here; the runtime
-  // predicate is written the same way for the same reason. The final compare
-  // falls THROUGH to the poll, so the object arm needs no extra branch.
-  //
-  // `rGc` held gcAddr until the `gcNextBytes` load above overwrote it, so the
-  // object arm reloads it from the poll cache — one frame load, against the
-  // ~190 instructions a wasted poll costs.
-  subRR(cx.code, rTmp, rTmp, rGc) // rTmp = live - next
-  cmpRR(cx.code, rTmp, rGc)
-  pollFixups = append(pollFixups, emitLocalCondBranch(cx, condGe())) // 2x -> poll
-
-  loadImm(cx.code, rGc, regSp(), pollCacheOffset(cx.frame, 1), 8, false)
-  emitPollField(cx, rTmp, rGc, pgGcNumObjectsIdxWord()) // rTmp = live objects
-  emitPollField(cx, rGc, rGc, pgGcNextObjectsWord())    // rGc = object trigger
-  cmpRR(cx.code, rTmp, rGc)
-  skipFixups = append(skipFixups, emitLocalCondBranch(cx, condLt())) // not caught up -> skip
-
-  let i = 0
-  while (i < len(pollFixups)) {
-    patchLocalCondBranch(cx, pollFixups[i])
-    i = i + 1
-  }
-  emitCall(cx, -1, 0, safepointSymbol(), []int(0), true)
-  i = 0
-  while (i < len(skipFixups)) {
-    patchLocalCondBranch(cx, skipFixups[i])
-    i = i + 1
-  }
 }
 
 // Binds a jump's arguments to the target block's parameters. All of them at once
