@@ -1,0 +1,328 @@
+// compiler/optappend.bit — #4039: expands `rt_call slice_append`'s
+// SPARE-CAPACITY case inline, after the inliner has run. Sibling of opt.bit:
+// same module, so this needs no imports and no call-site changes —
+// `blockEmissionOrder`, `emitTranslated`, `noConst` and the builder API are all
+// defined elsewhere in this module.
+//
+// WHY A PASS AND NOT A LOWERING. `bit_rt_slice_append` (runtime/root/slices.bit)
+// is ~200 instructions and makes two further calls of its own — `appendTarget`,
+// and `bit_rt_port_mem_store_byte` for a `[]u8` — so a `Builder.writeByte` loop
+// paid a `bl`, a prologue and an epilogue per BYTE: 37.0 cycles per byte
+// appended on `bench/cases/strings`' build phase against Go's ~12.5. The
+// obvious fix is to emit the fast path in `lowerAppend`, and it BACKFIRES: the
+// fast path needs three blocks, `optinline.bit`'s `calleeShapeOk` only splices
+// a callee with exactly one, and `Builder.writeByte`'s whole body is a single
+// `append`. Measured both ways on the same probe, same box, same session:
+//
+//   lowered inline    1.057e9 -> 1.452e9 cycles   +37%  (writeByte stops inlining)
+//   expanded here     1.057e9 -> see the ticket   -43%  (writeByte still inlines)
+//
+// with instructions retired FALLING 33% in the regressing case — the call's
+// prologue/epilogue and register pressure cost more than the instructions it
+// saved. Running after `inlineCalls` gets both: the callee is still one block
+// when the inliner looks at it, and every surviving call site — the inlined
+// copy included — is expanded here.
+//
+// Block ids minted here do NOT ascend with the linear schedule, and that is
+// safe only because `optimizeModule` runs `foldConstantsAndPrune` after this
+// pass: its `rebuild` renumbers blocks into emission order (ascending
+// `instsStart`), which is the invariant `isBackEdge` and the x64 linear-scan
+// allocator's interval numbering both assume (build.bit's `writeModuleExe`).
+// Do not reorder this pass to after that fold.
+
+// Whether instruction `idx` is a `slice_append` whose element write is the same
+// single store `rtSliceAppend` performs, so the fast path can reproduce it.
+//
+// The two expandable strides are the two the runtime writes with one
+// instruction:
+//
+//   stride 8 -> `storeWord(buf + (off + vlen) * 8, word)` — every reference
+//               type plus i64/u64/int, and f64/f32 which `emitRtCall` has
+//               already bitcast into an integer word (ir.bit's `rtWordArgs`);
+//   stride 1 -> `storeByte(buf + off + vlen, word)`       — a packed `[]u8`.
+//
+// `index_set` scales its index by the VALUE operand's own width
+// (arm64dispatch.bit, x64dispatch.bit both read `f.instrs[ins.ival].ty`), so
+// the argument's IR type is what is checked here.
+//
+// EVERY OTHER NARROW PRIM KEEPS THE CALL, the same asymmetry
+// `canInlineSliceStore` (loweraccess.bit) documents rather than a missed case.
+// i8/i16/i32/u16/u32/bool are stored WORD-PER-ELEMENT (stride 8) while their
+// own width is 1/2/4, so a narrow store would write the low bytes and leave the
+// rest of that word holding whatever a previous view of the same buffer left
+// there — and `rtSliceGet` reads the word whole. A reslice shares its backing
+// (`rtSliceSlice`), so the slot at `off + len` genuinely can hold an older
+// element's bytes; this is not a fresh-memory argument that happens to hold.
+//
+// A non-constant `elem_size` operand is refused rather than guessed. Lowering
+// always emits it as a `const_int` and the inliner copies it as one, so this
+// fails closed on a shape that does not occur, never silently on one that does.
+fn appendExpandable(ctx: TypeContext, f: IrFunc, idx: int): bool {
+  let ins = f.instrs[idx]
+  if (ins.op != Op.RtCall || ins.name != "slice_append" || len(ins.args) != 4) {
+    return false
+  }
+  let es = f.instrs[ins.args[3]]
+  if (es.op != Op.ConstInt) {
+    return false
+  }
+  let w = widthOf(ctx, f.instrs[ins.args[1]].ty).bytes
+  return (es.ival == 8 && w == 8) || (es.ival == 1 && w == 1)
+}
+
+// Whether `f` contains any expandable append at all. The pass rebuilds nothing
+// when this is false, so every function without one comes out of
+// `optimizeModule` byte-identical to before — which is what keeps this change's
+// blast radius the append sites and nothing else.
+fn hasExpandableAppend(ctx: TypeContext, f: IrFunc): bool {
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (appendExpandable(ctx, f, i)) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// The spare-capacity arm's body: store `v` at element `off + len` of `h`'s
+// buffer and bump the header's length word. Emitted into the block its caller
+// opened, and it must stay call-free — see `emitExpandedAppend`'s GC argument.
+fn emitAppendFastStore(b: IrBuilder, ctx: TypeContext, h: int, v: int, lenV: int) {
+  let i64ty = primType(ctx, 3)
+  // Header words at runtime/ABI.md §2 offsets: `buf` 0, `len` 8, `off` 16.
+  // `off` is not always zero — a reslice carries a view offset — so it is
+  // loaded and added rather than assumed away.
+  let bufIns = mkInstr(Op.FieldGet, i64ty)
+  bufIns.lhs = h
+  bufIns.ival = 0
+  let buf = builderEmit(b, bufIns)
+  let offIns = mkInstr(Op.FieldGet, i64ty)
+  offIns.lhs = h
+  offIns.ival = 16
+  let slot = mkInstr(Op.Add, i64ty)
+  slot.lhs = builderEmit(b, offIns)
+  slot.rhs = lenV
+  let is = mkInstr(Op.IndexSet, ctx.voidId)
+  is.lhs = buf
+  is.rhs = builderEmit(b, slot)
+  is.ival = v
+  builderEmit(b, is)
+  let one = mkInstr(Op.ConstInt, i64ty)
+  one.ival = 1
+  let bump = mkInstr(Op.Add, i64ty)
+  bump.lhs = lenV
+  bump.rhs = builderEmit(b, one)
+  let set = mkInstr(Op.FieldSet, ctx.voidId)
+  set.lhs = h
+  set.ival = 8
+  set.rhs = builderEmit(b, bump)
+  builderEmit(b, set)
+}
+
+// Replaces one `rt_call slice_append(h, word, is_ref, elem_size)` with
+//
+//     len = slice_len h ; cap = field_get h[24] ; br (len < cap) -> fast, grow
+//   fast: store the element at h.buf[h.off + len] ; h.len = len + 1 ; jump join(h)
+//   grow: jump join(rt_call slice_append h, word, is_ref, elem_size)
+//   join: (result)
+//
+// and returns the join block's parameter — the value the call's own id must
+// remap to. LEAVES `join` OPEN: the rest of the block being rewritten continues
+// into it.
+//
+// THE SEMANTICS, from `rtSliceAppend` (runtime/root/slices.bit) verbatim:
+//
+//   vlen == vcap                -> grow: realloc, copy, off = 0, cap *= 2
+//   store the element at buf + (off + vlen) * stride
+//   h.len = vlen + 1 ; RETURN h — the same header, mutated in place
+//
+// so `append` ALIASES its argument's backing (spec/LINT.md E0214), and both the
+// aliasing and the exact reallocation point are what this must not move. The
+// fast path yields `h` itself, which is what the runtime returns for any
+// non-null header, and it fires on `len < cap` — the complement of the
+// runtime's own `vlen == vcap` grow test, so a reallocation happens on exactly
+// the same appends as before. `len <= cap` is an invariant of every header this
+// compiler can produce (`rtSliceNew` clamps `cap` up to `len`, `rtSliceSlice`
+// gives `len = hi-lo` and `cap = vcap-lo`, and the fast path adds one to each
+// side of `len < cap`), so `<` and `!=` select the same appends; `<` is used
+// because it FAILS CLOSED into the runtime if that invariant is ever broken,
+// where `!=` would write past the buffer.
+//
+// THE NULL HEADER NEEDS NO SEPARATE TEST, exactly as it needs none in
+// `emitInlineSliceElem` (loweraccess.bit). A zeroed class's slice field is the
+// null word (#1564), and both `slice_len` and a `field_get` on a slice-typed
+// base read a null header as 0 (`emitHeaderWordOrZero`). So a null receiver has
+// `len == cap == 0`, fails `0 < 0`, and reaches the runtime — which is where
+// `appendTarget`'s fresh-header arm lives and where the compiler-supplied
+// `is_ref` is honoured (#3648: a fabricated header with the wrong `is_ref` was
+// a real GC bug, not merely a wasted allocation).
+//
+// THE ELEMENT LANDS IN BOUNDS BY THE RUNTIME'S OWN ARGUMENT. `off + cap` is the
+// buffer's element count and is invariant under reslicing (`rtSliceSlice` moves
+// `lo` from `cap` to `off`), so `len < cap` gives `off + len < off + cap`. No
+// bounds test is emitted, for the same reason `rtSliceAppend` emits none.
+//
+// THE GC HAZARD IS `emitInlineSliceElem`'s, unchanged and for the same reason.
+// `buf` is a GC-managed pointer living in an `i64` vreg that no stack map
+// describes (runtime/ABI.md §4); what makes that sound is that its live range
+// contains no safepoint. Everything between the `field_get [0]` and the
+// `index_set` is arithmetic in ONE straight-line block — no call, no
+// allocation, and no back edge, since `join` is minted after `fast` and
+// `isBackEdge` is `target <= curBlock` once `rebuild` has renumbered both into
+// emission order. `opt.bit` has no code motion that could open that window, and
+// `optloop.bit` already refuses to hoist a `field_get` at offset 0 for exactly
+// this reason (#4053). The `rt_call` on the grow arm IS a safepoint, and `buf`
+// is not live there: it is never computed on that side.
+//
+// NO WRITE BARRIER, for the reason #3108 records: the collector is
+// stop-the-world mark-sweep, non-moving, and `rtSliceAppend` itself stores with
+// a bare `storeWord`. When it goes incremental the barrier is owed here, at
+// `emitInlineSliceSet`, and at both backends' `field_set` together.
+fn emitExpandedAppend(b: IrBuilder, ctx: TypeContext, call: IrInstr, args: []int): int {
+  let i64ty = primType(ctx, 3)
+  let h = args[0]
+  let lenIns = mkInstr(Op.SliceLen, i64ty)
+  lenIns.lhs = h
+  lenIns.span = call.span
+  let lenV = builderEmit(b, lenIns)
+  // `cap(s)` is `field_get [24]` on the header itself (lowerprim.bit's
+  // `lowerLen`), null-safe on both backends.
+  let capIns = mkInstr(Op.FieldGet, i64ty)
+  capIns.lhs = h
+  capIns.ival = 24
+  capIns.span = call.span
+  let cmp = mkInstr(Op.ICmpSlt, primType(ctx, 10))
+  cmp.lhs = lenV
+  cmp.rhs = builderEmit(b, capIns)
+  cmp.span = call.span
+  let room = builderEmit(b, cmp)
+  let fast = builderNewBlock(b)
+  let grow = builderNewBlock(b)
+  let join = builderNewBlock(b)
+  let br = mkInstr(Op.Br, ctx.voidId)
+  br.lhs = room
+  br.ival = fast
+  br.thenArgs = []int(0)
+  br.ival2 = grow
+  br.elseArgs = []int(0)
+  br.span = call.span
+  builderEmit(b, br)
+  builderEndBlock(b)
+
+  builderBeginBlock(b, fast)
+  emitAppendFastStore(b, ctx, h, args[1], lenV)
+  emitAppendJump(b, join, h, call.span)
+  builderEndBlock(b)
+
+  builderBeginBlock(b, grow)
+  let slow = mkInstr(Op.RtCall, call.ty)
+  slow.name = call.name
+  slow.args = args
+  slow.span = call.span
+  emitAppendJump(b, join, builderEmit(b, slow), call.span)
+  builderEndBlock(b)
+
+  builderBeginBlock(b, join)
+  return builderAddParam(b, call.ty)
+}
+
+// `jump target(v)`, carrying `span` so the rewritten sequence keeps the
+// original call's source position (#3282's span-on-rewrite policy).
+fn emitAppendJump(b: IrBuilder, target: int, v: int, span: Span) {
+  let j = mkInstr(Op.Jump, 0)
+  j.ival = target
+  j.args = [v]
+  j.span = span
+  builderEmit(b, j)
+}
+
+// One block of `f`, rewritten into `b`. Every append in it splits the block:
+// `emitExpandedAppend` closes the block being written and opens the join, and
+// the remaining instructions — including the terminator — land there.
+fn expandAppendBlock(x: AppendCtx, bi: int) {
+  let blk = x.f.blocks[bi]
+  builderBeginBlock(x.b, x.blockMap[bi])
+  let idx = blk.instsStart
+  let paramsEnd = blk.instsStart + blk.paramCount
+  while (idx < paramsEnd) {
+    x.remap[idx] = builderAddParam(x.b, x.f.instrs[idx].ty)
+    idx = idx + 1
+  }
+  let end = blk.instsStart + blk.instsLen
+  while (idx < end) {
+    if (appendExpandable(x.ctx, x.f, idx)) {
+      x.remap[idx] = emitExpandedAppend(
+        x.b, x.ctx, x.f.instrs[idx], trList(x.remap, x.f.instrs[idx].args),
+      )
+    } else {
+      emitTranslated(x.b, x.f, x.known, x.remap, x.blockMap, idx)
+    }
+    idx = idx + 1
+  }
+  builderEndBlock(x.b)
+}
+
+// The rewrite state shared across one function's blocks — bundled so
+// `expandAppendBlock` stays under E0202's max-params (spec/LINT.md), the same
+// shape `RebuildCtx` uses in opt.bit.
+class AppendCtx {
+  b: IrBuilder,
+  f: IrFunc,
+  ctx: TypeContext,
+  remap: []int,
+  blockMap: []int,
+  known: []ConstVal,
+}
+
+// Pass 4 of `optimizeModule`: expand every expandable `slice_append` in `f`.
+// Returns `f` untouched when there is none, so the pass cannot perturb a
+// function it has no work in.
+fn expandAppends(ctx: TypeContext, f: IrFunc): IrFunc {
+  if (!hasExpandableAppend(ctx, f)) {
+    return f
+  }
+  let n = len(f.blocks)
+  let blockMap = []int(0)
+  let remap = []int(0)
+  let known = []ConstVal(0)
+  let i = 0
+  while (i < n) {
+    blockMap = append(blockMap, 0)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(f.instrs)) {
+    remap = append(remap, 0)
+    // Nothing is folded here; `emitTranslated` needs the array regardless.
+    known = append(known, noConst())
+    i = i + 1
+  }
+  // Emission order, not id order: the blocks must be rewritten in the order
+  // their instructions appear, so `rebuild`'s ascending-`instsStart` renumber
+  // in the next pass reproduces a valid linear schedule (opt.bit's
+  // `blockEmissionOrder`).
+  let order = blockEmissionOrder(f)
+  let b = newBuilder()
+  i = 0
+  while (i < n) {
+    blockMap[order[i]] = builderNewBlock(b)
+    i = i + 1
+  }
+  let x = AppendCtx{
+    b: b, f: f, ctx: ctx, remap: remap, blockMap: blockMap, known: known,
+  }
+  i = 0
+  while (i < n) {
+    expandAppendBlock(x, order[i])
+    i = i + 1
+  }
+  return IrFunc{
+    name: f.name, paramTypes: f.paramTypes, result: f.result,
+    blocks: b.blocks, instrs: b.instrs, isFallible: f.isFallible,
+    isNaked: f.isNaked, isNosplit: f.isNosplit,
+    // §17.6 module tag and §11.9 pin flag ride every rebuild — see `rebuild`'s
+    // own note for what dropping either one costs.
+    inRootModule: f.inRootModule, isPinned: f.isPinned,
+  }
+}
