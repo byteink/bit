@@ -60,12 +60,21 @@
 // `field_get X[0]` with `X` slice-typed — the one shape
 // `emitInlineSliceElem` produces. `rtSliceNew` allocates the header and the
 // buffer as two distinct objects, so such a store cannot reach a header word.
-fn licmWritesSliceBuf(f: IrFunc, ctx: TypeContext, base: int): bool {
-  let b = f.instrs[base]
+//
+// RESOLVED THROUGH BLOCK PARAMS, and that is not an extra: #4053 hoists exactly
+// that `field_get` into the preheader, so from the second optimizer round on,
+// the store's base is a hoisted PARAMETER and the shape test alone answers
+// "unknown pointer". A loop that stores into its own element buffer would then
+// count as clobbered and lose every header-word hoist an OUTER loop still owed
+// it — measured on `bench/cases/matrix`, six of them out of the middle loop.
+// `licmResolve` is an equality proof, so following the parameter back to the
+// single value every edge passes it is exact, not an approximation.
+fn licmWritesSliceBuf(lc: LicmCtx, base: int): bool {
+  let b = lc.f.instrs[licmResolve(lc, base)]
   if (b.op != Op.FieldGet || b.ival != 0) {
     return false
   }
-  return ctx.types[f.instrs[b.lhs].ty].kind == TypeKind.Slice
+  return lc.ctx.types[lc.f.instrs[b.lhs].ty].kind == TypeKind.Slice
 }
 
 // What stops a header WORD being hoisted out of this loop. Derived from
@@ -81,33 +90,84 @@ fn licmWritesSliceBuf(f: IrFunc, ctx: TypeContext, base: int): bool {
 // This bounds LOADS ONLY. A pure computation over header parameters is immune:
 // its operands are SSA values, and no call can change what a block parameter
 // holds. `licmHoistable` is where that distinction is spent.
-fn licmClobbers(f: IrFunc, ctx: TypeContext, idx: int): bool {
-  let ins = f.instrs[idx]
+fn licmClobbers(lc: LicmCtx, idx: int): bool {
+  let ins = lc.f.instrs[idx]
   if (ins.op == Op.IndexGet) {
     return false
   }
   if (ins.op == Op.IndexSet) {
-    return !licmWritesSliceBuf(f, ctx, ins.lhs)
+    return !licmWritesSliceBuf(lc, ins.lhs)
   }
   return isSideEffecting(ins.op) && !opIsTerminator(ins.op)
 }
 
-// `slice_len`, and `field_get` at a NON-ZERO offset: one word of a header, read
-// through the null-safe path (`emitHeaderWordOrZero`), so neither faults on a
-// null receiver nor traps — which is what makes performing one ahead of a loop
+// A header word: `slice_len`, `field_get` at a NON-ZERO offset, or `field_get`
+// at offset 0 on a SLICE base. All three go through the null-safe path
+// (`emitHeaderWordOrZero`, keyed on `isHeaderBase`), so none faults on a null
+// receiver and none traps — which is what makes performing one ahead of a loop
 // that may run zero times safe.
 //
-// REFUSES offset 0. Word 0 of every header shape in runtime/ABI.md §2 is the
-// payload POINTER, and loweraccess.bit's header states the hazard in terms of
-// this exact pass: `buf` is a GC-managed pointer typed `i64`, so no stack map
-// describes it, and what makes that sound is that its live range contains no
-// safepoint. Hoisting it puts it across the loop's back-edge poll. That is
-// #4053, and it needs the collector's answer, not a predicate change.
-fn licmReadsHeaderWord(ins: IrInstr): bool {
+// A STRING base at offset 0 is the same shape and is deliberately NOT here.
+// Word 0 of a string header is `ptr`, an INTERIOR pointer (`body +
+// strAllocHeader`), and the argument below holds for it — but its only
+// emission site is `emitInlineStringSlice` (lowerreslice.bit), which emits a
+// `gc_alloc` in the same block, so any loop containing one is already
+// `sc.clobbered` and the arm would be dead code carrying an unmeasured GC
+// argument. `licmWritesSliceBuf` asks the same slice-base question, so this is
+// one notion in this file, not two.
+//
+// OFFSET 0 IS INCLUDED NOW, and it is the whole of #4053. Word 0 is the
+// element BUFFER pointer, so the hoisted value is a GC-managed address typed
+// `i64`, which `isRefType` cannot see and no stack map therefore describes
+// (ABI.md §4). `emitInlineSliceElem` (loweraccess.bit) states the invariant
+// that made that sound until now: `buf`'s LIVE RANGE CONTAINS NO SAFEPOINT. A
+// hoist puts it across every safepoint in the loop, the back-edge poll
+// included. Four facts, each re-derived on this tree rather than quoted,
+// replace it:
+//
+//   1. THE COLLECTOR IS NON-MOVING. `sweep` (runtime/gc/gcmark.bit) unlinks an
+//      unmarked object and frees it, and clears the mark on a survivor; no
+//      phase relocates a body. So an untracked copy of a live object's address
+//      cannot go stale. It can only dangle, and only if the object is freed.
+//   2. THE OWNING HEADER IS REPORTED AT THE POLL. The base must be LITERALLY an
+//      invariant parameter of this header (`licmInvSlot`), so it is slice-typed
+//      and `buildIntervals` marks its interval `isRef`; regalloc's stack-map
+//      loop then records whichever register or spill slot holds it at every
+//      safepoint its interval spans. TWO INDEPENDENT THINGS span the loop with
+//      it, which is why removing either alone changes no emitted byte:
+//      `argFeedsLiveTarget` treats a back-edge argument as live unconditionally
+//      and `extendForwardArgs` runs the interval to the latch terminator; and
+//      `lowerWhile` also threads the value to the loop's EXIT block, whose
+//      params `extendParamsToPreds` pulls back to the header's own terminator,
+//      which `mergeAliases` then unions into the coalesced root.
+//   3. MARKING THE HEADER MARKS THE BUFFER. A slice header's `ptr_offsets` is
+//      `[0]` (`riSliceOffs`, runtime/root/root.bit), so word 0 is traced. The
+//      buffer cannot be swept while its header is marked.
+//   4. THE WORD CANNOT CHANGE UNDER THE HOIST. `sc.clobbered` already refuses
+//      every header-word hoist out of a loop that calls, allocates or stores —
+//      the guard `bit_rt_slice_append`'s in-place header mutation forced for
+//      `len`. It is the same guard that makes a stale `buf` impossible, so
+//      `optappend.bit`'s inlined fast-path `field_get h[0]` is never hoisted
+//      either: its loop always carries the grow path's `gc_alloc`.
+//
+// So the hoisted pointer is never the ONLY reference to its object. Read out of
+// the emitted `__bit_gc` table for `_tests_/stress/licmslicebuf`'s `sum`, whose
+// loop keeps NO other use of the header at all: at the back-edge poll the
+// entry is `refRegs=[19]`, and x19 is the header — it is `mov x19, x0` in the
+// prologue, never read again after the preheader, and it leaves that entry the
+// moment a mutation makes `isRefType` false for a slice.
+//
+// A SECOND, WEAKER NET EXISTS AND IS NOT WHAT THIS RESTS ON. `stwScanTasks`
+// (runtime/stw/stw.bit) scans the RUNNING task's stack range conservatively as
+// well, and a slice buffer's word-0 address is a body address, so
+// `gcMarkConservative` would retain it directly. That is belt and braces on
+// today's collector; fact 2 is the argument.
+fn licmReadsHeaderWord(lc: LicmCtx, ins: IrInstr): bool {
   if (ins.op == Op.SliceLen) {
     return true
   }
-  return ins.op == Op.FieldGet && ins.ival != 0
+  return ins.op == Op.FieldGet &&
+    (ins.ival != 0 || lc.ctx.types[lc.f.instrs[ins.lhs].ty].kind == TypeKind.Slice)
 }
 
 // The four ops a `--debug` build gives an effect the IR does not carry. See the
@@ -135,8 +195,7 @@ fn licmPureOp(op: Op): bool {
   if (isSideEffecting(op)) {
     return false
   }
-  return opIsBinary(op) ||
-    int(op) >= int(Op.Neg) && int(op) <= int(Op.Convert)
+  return opIsBinary(op) || (int(op) >= int(Op.Neg) && int(op) <= int(Op.Convert))
 }
 
 // Whether `idx` is an instruction this pass may perform once ahead of `sc`'s
@@ -152,7 +211,7 @@ fn licmHoistable(lc: LicmCtx, sc: LicmScan, idx: int): bool {
     return false
   }
   let ins = lc.f.instrs[idx]
-  if (licmReadsHeaderWord(ins)) {
+  if (licmReadsHeaderWord(lc, ins)) {
     return !sc.clobbered
   }
   if (lc.debug && licmTrapsInDebug(ins.op)) {
