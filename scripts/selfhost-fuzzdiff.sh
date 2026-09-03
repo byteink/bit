@@ -53,14 +53,23 @@ TIMEOUT_S=${TIMEOUT_S:-60}
 # this script that drops `$?` scores a timed-out run as a MISMATCH instead, which
 # produced two false "still broken" readings during #1515. Returns 142
 # (128+SIGALRM) iff the run timed out twice. Retry-once-on-stall is
-# scripts/alarmrun.sh's alarmrun_retry (#3408); no persistent artifact to clean
-# between attempts here, so its outfile arg is "".
+# scripts/alarmrun.sh's alarmrun_retry_cap (#3490); no persistent build
+# artifact to clean between attempts here, so its outfile arg is "".
+#
+# <capture> used to be the `$(...)` command substitution wrapped around BOTH
+# attempts — one sink opened once for the whole retry, so a stalled first
+# attempt's partial bytes survived as a prefix inside the retried attempt's
+# compared payload (#3478/#4208, same shape as #4196/#4205). alarmrun_retry_cap
+# truncates a per-call file before EACH attempt instead, so this function reads
+# exactly one attempt's bytes back with `cat`.
 run() {
-  local out rc side
+  local out rc side cap
   local TIMEOUT="$TIMEOUT_S"
   [ "$1" = "$ORACLE" ] && side=ORACLE || side=BIT2
-  out=$( ( alarmrun_retry "$side" "" "$@" ) 2>/dev/null )
+  cap="$TMP/run_$side.out"
+  alarmrun_retry_cap "$side" "" "$cap" "$@"
   rc=$?
+  out=$(cat "$cap")
   printf '%s' "$out"
   return "$rc"
 }
