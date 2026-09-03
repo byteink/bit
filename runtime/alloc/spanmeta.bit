@@ -1,0 +1,186 @@
+// Span metadata: the per-span header words and the accessors over them.
+// Sibling of `./alloc.bit`, same module (SPEC §17.1), split out purely to
+// keep `alloc.bit` under `_tests_/bit/lintfilelines.bit`'s 800-line gate
+// (E0200) after #4057 added the `heapPeakMappedWord`/`heapAllocBytesWord`
+// pair and their accessors — no semantic reason for the split, see
+// `bitlang-ws/CLAUDE.md`'s "Splitting a file" section: filename order affects
+// diagnostic order only, never correctness or inlining depth (#3163), for a
+// seam like this one.
+//
+// THIS FILE ADDS DECLARATIONS OF ITS OWN (`spanClass`..`spanEmpty`,
+// `allocSpanHdrWords`, `allocSpanKeep`), unlike `./spancache.bit`'s pure
+// function-only split — a pure move, verified by diffing this module's
+// declaration set before and after the split (`comm -23` on the two lists is
+// empty).
+
+// --- Span metadata ----------------------------------------------------------
+//
+// `bit lsp --stdio` reached 12.5 GB RSS while idle (#2325) and nothing could
+// have given a byte of it back, because a span, once carved, was not
+// represented anywhere: its slots went onto one flat per-class list and the
+// span itself was forgotten. "Is span S entirely free?" needed an O(n) walk of
+// the whole class, and even the answer was useless — the slots are interior
+// nodes of a singly-linked list with no back pointers.
+//
+// A span now carries a header in its own first words, so the question is O(1).
+// #2374 made it ANSWERABLE; #2375 answers it and gives the span back.
+//
+// THE HEADER IS AT THE SPAN'S BASE, AND THE FIRST FEW SLOTS PAY FOR IT. The
+// carve starts at the first whole slot past the header (`spanSkip` of them),
+// which keeps every slot at an exact multiple of the class size from the span
+// base — the alignment argument `allocClassify` rests on, unchanged. Rounding
+// the carve start to a fixed byte offset instead would break it for the classes
+// whose size is not a power of two.
+//
+// FIVE OF THE TEN WORDS DESCRIBE THE SPAN. The other five are CLASS-WIDE and
+// are meaningful only in the span at the head of the class's list — the
+// "anchor" — because `heapWords` is full and has no room for them (see
+// `heapWords`). `heapRefillLocked` copies them onto the new anchor as it pushes
+// it, which is five stores on a path that already walks a whole span.
+//
+// `spanOwned` IS A SAFETY WORD, NOT AN OPTIMISATION (#2375). A span is carved
+// out of whatever the caller bound as the span reserve, and that is not always
+// OS pages this runtime mapped: `boot` binds an 8 MiB arena of its own, and five
+// stress programs bind a Bit-MANAGED `[]i64`. `munmap` on a slice the collector
+// owns is not a leak, it is a hole in the live heap. So only a span the reserve
+// itself got from the OS is ever released, recorded at carve time by the one
+// caller that knows.
+//
+// `spanSpans`/`spanEmpty` EXIST TO KEEP RECLAMATION LINEAR. Reclaiming a span
+// means walking the class's flat free list to unlink the slots inside it
+// (`heapReclaimSpansLocked`), which is O(free slots) — so firing it once per span
+// that empties is quadratic in the span count. Both counters are maintained in
+// O(1) by `take`/`give`/`refill`/`reclaim`, and let `heapGiveSmallLocked` ask for
+// a pass only when at least HALF the class's spans are releasable: each pass then
+// halves the class, so the total walking is linear in the slots freed. Both are
+// re-derived and checked by `heapCheckSpansLocked`. What that costs in retained
+// memory, and the exact-amortisation rule that was measured against it and
+// rejected on cycles, are ABI.md §8.1 (#4000).
+const spanClass: int = 0     // owning size-class index, -1 once doomed
+const spanTotal: int = 1     // slots carved out of this span
+const spanFree: int = 2      // how many of those are on the class's free list
+const spanNext: int = 3      // next span of this class, 0 = end of list
+const spanOwned: int = 4     // 1 = the reserve mapped this span, so it may be unmapped
+const spanList: int = 5      // ANCHOR ONLY: head of the class's free-slot list
+const spanLive: int = 6      // ANCHOR ONLY: slots of the class handed out
+const spanBad: int = 7       // ANCHOR ONLY: violations `heapCheckSpansLocked` saw
+const spanSpans: int = 8     // ANCHOR ONLY: spans on this class's list
+const spanEmpty: int = 9     // ANCHOR ONLY: those that are entirely free AND owned
+export const allocSpanHdrWords: int = 10
+
+// Entirely-free owned spans a class must have accumulated before
+// `heapGiveSmallLocked` asks for a reclaim pass. THIS IS THE HYSTERESIS, and 2
+// is the smallest value that is one: at 1 a class holding a single span would
+// ask on every free of its last slot, and the pass would refuse every time
+// because the anchor is never released — a walk per free that reclaims nothing.
+// At 2 the class has one releasable span beyond the anchor, so every pass that
+// runs gives at least one span back.
+export const allocSpanKeep: int = 2
+
+// The span owning `addr`. A MASK, NOT A LOOKUP, and that is what keeps
+// `heapTakeSmallLocked`/`heapGiveSmallLocked` `@nosplit`-safe and O(1): every
+// span starts on a multiple of `allocSpanBytes`, which is a power of two, so
+// clearing the low bits of any address inside it lands exactly on its base.
+//
+// It is sound only because #2373 aligned span-sized takes to `allocSpanBytes`
+// rather than to the page. Page alignment would NOT have been enough: on
+// aarch64-macos `runtime/root/darwin/boot.bit` passes 4096 as the nominal page
+// size while the real page is 16 KiB, so "page-aligned" is ambiguous there, and
+// neither reading implies this one.
+export @nosplit @symbol("bit_rt_alloc_span_of") fn allocSpanOf(addr: int): int {
+  return addr & ~(allocSpanBytes - 1)
+}
+
+// Slots of size `cs` the header AND the #3176 occupied-slot bitmap
+// (`allocBitmapWords`, `./bitmap.bit`) consume at the span base. Rounded UP to
+// a whole slot so the carve stays on the class's own grid. The bitmap sits
+// immediately after the 10 fixed header words, so this is the only change to
+// the span's physical layout the bitmap requires.
+@nosplit fn spanSkip(cs: int): int {
+  return (allocSpanHdrWords * 8 + allocBitmapWords(cs) * 8 + cs - 1) / cs
+}
+
+// Slots a span yields for class `idx`. At least 1 for every class: the largest
+// class is `allocMaxSmall` and `allocSpanBytes` is eight times it, so the
+// header costs one of those eight slots and seven remain.
+export @nosplit @symbol("bit_rt_alloc_span_slots") fn allocSpanSlots(idx: int): int {
+  let cs = allocClassSize(idx)
+  return allocSpanBytes / cs - spanSkip(cs)
+}
+
+// `allocSlotIndex` (the #3176/#3177 occupied-slot bitmap's addressing
+// primitive) and `allocBitmapWords`/`allocSpanBitmapWord` (the bitmap's
+// sizing and a test-only reader) are `./bitmap.bit`, a sibling file — same
+// module, no import needed. Split out to keep this file under
+// `_tests_/bit/lintfilelines.bit`'s 800-line gate (E0200); it was already at
+// exactly that limit before #3176 (see `./spancache.bit`'s header).
+
+// The three per-span fields, read by address. Exposed so a test can compute the
+// occupancy tally independently and compare, which is the only way to catch a
+// take or give that updated the WRONG span — an error that leaves every
+// aggregate over the class exactly right. `allocSpanClass` is pinned
+// (`@symbol`, required for a cross-module call under `--freestanding`,
+// ABI.md §9): #3177's `gcOwns` reads it to classify a span it has already
+// confirmed is presence-keyed, before indexing into its #3176 bitmap.
+export @nosplit @symbol("bit_rt_alloc_span_class") fn allocSpanClass(spanAddr: int): int {
+  let sp = allocWordAt(spanAddr)
+  return *(sp + spanClass)
+}
+
+export @nosplit fn allocSpanTotal(spanAddr: int): int {
+  let sp = allocWordAt(spanAddr)
+  return *(sp + spanTotal)
+}
+
+export @nosplit fn allocSpanFree(spanAddr: int): int {
+  let sp = allocWordAt(spanAddr)
+  return *(sp + spanFree)
+}
+
+// The next span of the same class, 0 at the end. On the chain
+// `heapReclaimSpansLocked` returns this is the next span to release, and the
+// caller MUST read it BEFORE unmapping this one — the link lives in the span,
+// exactly as a chunk's does in `reserveRelease`.
+export @nosplit @symbol("bit_rt_alloc_span_next") fn allocSpanNext(spanAddr: int): int {
+  let sp = allocWordAt(spanAddr)
+  return *(sp + spanNext)
+}
+
+// Non-zero when the reserve mapped this span from the OS, so it may be handed
+// back. See `spanOwned`.
+export @nosplit fn allocSpanOwned(spanAddr: int): int {
+  let sp = allocWordAt(spanAddr)
+  return *(sp + spanOwned)
+}
+
+// Spans on class `idx`'s list, and how many of those are entirely free AND
+// releasable — the two counters the reclaim trigger reads. Exported so a test
+// can compare them against its own tally over the spans it handed the class,
+// the same independence argument the per-span fields are exported for.
+// `@symbol`-pinned: `runtime/gc/gccollect.bit`'s `gcIndexEntries` (#3177) sums
+// this across every class, cross-module under `--freestanding` (ABI.md §9).
+export @nosplit @symbol("bit_rt_heap_class_spans") fn heapClassSpans(h: *i64, idx: int): int {
+  let anchor = *(h + heapListsWord + idx)
+  if (anchor == 0) { return 0 }
+  let av = allocWordAt(anchor)
+  return *(av + spanSpans)
+}
+
+// The head span of class `idx`'s list, 0 if none. `allocSpanNext` continues
+// the walk from here — the same two-primitive pattern `heapCheckSpansLocked`
+// and `heapReclaimSpansLocked` already use internally, exposed rather than
+// duplicated so a caller outside this module can walk every currently-carved
+// span without its own copy of the list layout. `@symbol`-pinned:
+// `runtime/gc/gcindex.bit`'s index rebuild (#4096) walks every class's spans
+// to re-insert their presence keys after the index is re-enabled, cross-module
+// under `--freestanding` (ABI.md §9).
+export @nosplit @symbol("bit_rt_heap_class_anchor") fn heapClassAnchor(h: *i64, idx: int): int {
+  return *(h + heapListsWord + idx)
+}
+
+export @nosplit fn heapClassEmpty(h: *i64, idx: int): int {
+  let anchor = *(h + heapListsWord + idx)
+  if (anchor == 0) { return 0 }
+  let av = allocWordAt(anchor)
+  return *(av + spanEmpty)
+}
