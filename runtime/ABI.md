@@ -1556,6 +1556,54 @@ mark traces from roots via the pointer maps using a fixed-capacity worklist
 constant); sweep frees unmarked objects back to the size-class heap. Upgrade path
 is incremental/generational collection when pause times matter.
 
+### 8.1 What goes back to the OS, and what does not (informative, #4000)
+
+Three things are returned, and all three are live paths today:
+
+- a **large block** (over `allocMaxSmall`, 16 KiB) is `munmap`ed by `gcHeapFree`
+  the moment it is freed, since it was mapped individually;
+- an **entirely-free owned span** is unlinked by `heapReclaimSpansLocked` and
+  then either parked in the 64-slot cross-class span cache, or pushed onto the
+  span free list, which resets it with `MAP_FIXED` at the same address — the OS
+  drops the physical pages, the address stays valid;
+- **every chunk the span reserve mapped** goes back at `gcDeinit`.
+
+Four things are not, in decreasing order of measured cost:
+
+1. **A span with even one live object.** Reclamation is whole-span and the
+   collector is non-moving, so nothing can compact the survivors together.
+2. **A span carved from memory the caller bound** (`boot`'s own arena, a stress
+   fixture's `[]i64`). It is `spanOwned == 0` and may never be unmapped —
+   unmapping it would punch a hole in memory the caller owns.
+3. **Entirely-free owned spans below the reclaim trigger.** A pass is asked for
+   only when at least half a class's spans are entirely free, because
+   `heapReclaimSpansLocked` walks the class's flat free list and a pass has to
+   pay for itself. A class therefore settles at holding up to half its spans
+   free.
+4. **Reserve address space.** `reserveGrow`'s bump never rewinds; the chunk list
+   is walked only by `reserveRelease` (`gcDeinit`) and `reserveReclaimChunks`
+   (the index reserve). Address space, not resident pages: a span parked on the
+   free list is decommitted.
+
+**Measured on `2e7aabff`, `bench/cases` at their own end state, span occupancy
+read from the live heap through `bit_rt_gc_addr`.** (1) is small in practice —
+spans at most 25% live are 3 of 2052 on `json` (0.15%), 5 of 164 on `sort`, 12
+of 78 on `strings`. (3) is the larger of the two: 25.4 MB held in entirely-free
+owned spans on `json` against a 302 MB peak, 2.2 MB on `sort`, 1.0 MB on
+`strings`.
+
+**Neither is a peak-RSS cost, and that is why the trigger has not been
+tightened.** Replacing the half-the-spans test with the exact amortisation
+question it approximates (are the doomed spans' slots at least half of the free
+list, which is `spanSpans * allocSpanSlots(idx) - spanLive`) removes essentially
+all of (3) — `json` 25.4 MB → 1.3 MB of retained free spans, 2052 → 1867 spans,
+with `heapLive` byte-identical. Peak RSS moves 0.27% on `json` and 3.15% on
+`sort`, and not at all on the other eight cases, because those spans empty
+*after* the high-water mark. Cycles move the wrong way over the noise floor:
+`strings` +7.8%, `json` +3.8%, `alloc` +1.9% (medians of 9, interleaved with a
+second independent baseline series whose own spread was under 2%). The trade was
+therefore rejected, not overlooked.
+
 ---
 
 ## 9. Program entry, boot, and spawn (`runtime/root`)
