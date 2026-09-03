@@ -117,9 +117,9 @@ This comparison is purely lexical — no filesystem access, so a `..` that only
 exists on disk (a symlink planted inside `root`, pointing back outside it) is
 not detected. `contains` alone is therefore not sufficient to decide whether
 serving a path is safe when the tree is attacker-writable.
-`examples/staticserver`'s `safePath` is the relevant contrast, and does a
-different job on purpose: it is a reject-list run on the untrusted request
-string itself, refusing any `..` substring outright, before the filesystem or
+`safePath` (below) is the relevant contrast, and does a different job on
+purpose: it runs directly on an untrusted, still-encoded request string,
+rejecting anything it cannot be sure of outright, before the filesystem or
 `contains` ever enters the picture. `contains` is a general post-`clean`
 containment test; `safePath` is a narrower guard against untrusted input.
 Neither supersedes the other.
@@ -133,5 +133,44 @@ fn isUnderSiteRoot(root: string, requested: string): bool {
 
 fn escapesRoot(root: string, requested: string): bool {
   return !contains(root, requested)
+}
+```
+
+### `safePath(path: string): bool`
+
+Whether `path` is safe to resolve under *any* root, once joined to it — a
+guard against untrusted input, not a general path utility. Unlike `contains`,
+which classifies an already-decoded, already-trusted path, `safePath` is
+meant to run directly on the raw string a caller received (an HTTP request
+path, say), before it is percent-decoded, joined, or touched by the
+filesystem.
+
+Rejects, in order: any `path` that does not start with `/` (a relative path,
+or anything that is not a path at all); a backslash anywhere (a
+Windows-style separator a POSIX check would miss); a NUL byte or a bare CR or
+LF anywhere; and any well-formed `%XX` percent-escape anywhere in `path`,
+whatever it would decode to. `safePath` never percent-decodes: `%25` (which
+decodes to a harmless literal `%`) is rejected exactly like `%2e` (which
+decodes to `.`), because telling them apart needs the very decode step this
+function deliberately never performs. This also removes any
+double-decoding ambiguity — `%252e%252e` is rejected on its first `%25`, with
+no second decode pass needed to reach the inner `..`. A `%` that does **not**
+begin a well-formed escape (`%zz`, or a `%` in the last one or two bytes of
+`path`) is untouched by this rule and passes through like any other byte.
+
+Only after all of that does `path` still have to resolve inside its
+(otherwise unknown) root: it is joined to a synthetic anchor and run through
+`clean`/`contains`, so a raw `..` — doubled, deeply nested, or one that would
+climb past the root entirely — fails.
+
+A caller that needs to accept a literal filename shaped like a
+percent-escape must decode its own input before calling `safePath`, then
+call it on the decoded form.
+
+```bit
+import { safePath } from "std/path"
+
+fn isRequestPathSafe(requestPath: string): bool {
+  return safePath(requestPath)
 }
 ```
