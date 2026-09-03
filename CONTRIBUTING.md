@@ -87,7 +87,7 @@ Verification happens on machines that can actually prove things:
   `scripts/x64host.sh` from a machine-local list, never hardcoded - an emulated
   x86-64 pass is not a pass (a red-zone scheduler bug was only settled on real
   hardware).
-- `dist/release.sh <version>` cuts a release: builds all three targets,
+- `dist/release.sh <version>` cuts a release: builds all four targets,
   smoke-tests each UNPACKED artifact by compiling and running a program on
   hardware that matches it, writes SHA256SUMS, renders notes from conventional
   commits, and creates a DRAFT release. `--dry-run` verifies without publishing.

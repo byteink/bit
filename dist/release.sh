@@ -117,6 +117,22 @@ ssh "${X64_HOST}" "docker image inspect ${GATE_IMAGE_REMOTE}" >/dev/null 2>&1 ||
 }
 echo "release.sh: gate images present (${GATE_IMAGE_LOCAL} local, ${GATE_IMAGE_REMOTE} on ${X64_HOST})"
 
+# Resolved once, here, same reasoning as X64_HOST above: fail before ~11
+# minutes of cross-builds, not at the smoke step. No probing script for a
+# second host — BIT_WINDOWS_HOST/mustafa-desktop-win is already the one
+# hardcoded name this repo uses for its single Windows box
+# (_tests_/bit/windowssmoke.bit's windowsHost()) — reused verbatim rather than
+# inventing a second resolution mechanism for a fleet of one.
+# `</dev/null`: an ssh probe inherits stdin and can drain it (#3899).
+WINDOWS_HOST="${BIT_WINDOWS_HOST:-mustafa-desktop-win}"
+ssh -o BatchMode=yes -o ConnectTimeout=8 -o ConnectionAttempts=1 "${WINDOWS_HOST}" 'exit 0' </dev/null >/dev/null 2>&1 || {
+	echo "release.sh: ${WINDOWS_HOST} is unreachable over SSH — cannot verify x86_64-windows" >&2
+	echo "release.sh: refusing to publish an unverified release" >&2
+	exit 1
+}
+command -v zip >/dev/null || { echo "release.sh: zip not found (needed to package x86_64-windows)" >&2; exit 1; }
+echo "release.sh: windows host reachable (${WINDOWS_HOST})"
+
 # --- preflight: SBOM venv reachability + hash integrity (#2802) -------------
 # dist/sbom.py needs cyclonedx-python-lib, which this Mac does not carry
 # system-wide (#2748). `pip install --require-hashes` against
@@ -144,7 +160,7 @@ python3 -m venv "${SBOM_VENV}"
 }
 echo "release.sh: SBOM dependencies resolved"
 
-TARGETS=(x86_64-linux aarch64-linux aarch64-macos)
+TARGETS=(x86_64-linux aarch64-linux aarch64-macos x86_64-windows)
 
 # Bootstraps bit1 off the pinned stage0, falling back to the two-pass
 # BIT_STAGE0_BIN bootstrap on a runtime ABI transition (dist/abitwopass-run.sh, #4197).
@@ -263,9 +279,15 @@ for t in "${TARGETS[@]}"; do
 		echo "release.sh: missing ${archive} (the L1 build above should have written it)" >&2
 		exit 1
 	}
+	# Windows needs the .exe suffix on the OUTPUT PATH — the compiler writes
+	# exactly what -o names, it does not append one itself (confirmed against
+	# _tests_/bit/windowssmoke.bit, which does the same). dist/package.sh looks
+	# for this same name (BIN_NAME).
+	binName="bit"
+	[ "${t}" = "x86_64-windows" ] && binName="bit.exe"
 	BIT_LIBBITRT="${archive}" \
-		"${BIT1}" build "${STAGE_SRC}" --target "${t}" -o "${OUT}/stage/bin/bit"
-	chmod +x "${OUT}/stage/bin/bit"
+		"${BIT1}" build "${STAGE_SRC}" --target "${t}" -o "${OUT}/stage/bin/${binName}"
+	chmod +x "${OUT}/stage/bin/${binName}"
 
 	if [ "${t}" = "${HOST_TRIPLE}" ]; then
 		# C3, HOST TRIPLE ONLY (#3034): the shipped `bit` (bit2) must
@@ -574,6 +596,67 @@ else
 	exit 1
 fi
 
+# --- verify the Windows artifact, on mustafa-desktop-win over SSH -----------
+#
+# Same shape as the x86_64-linux block above (ship a fresh remote name, run,
+# assert, clean up) with two differences forced by the target: there is no
+# docker gate image to run inside -- the shipped bit.exe runs NATIVELY on the
+# remote box -- and the remote shell is PowerShell, not sh.
+#
+# The PowerShell script is built LOCALLY and shipped as a file rather than
+# inlined into the ssh command string: PowerShell's $ is bash's variable
+# sigil too, and backticks are bash command substitution even inside a
+# double-quoted string, so an inline one-line command here would need every
+# PowerShell variable and newline escape doubled up. Building the file with a
+# single-quoted heredoc (no bash expansion at all) and substituting the
+# placeholders with bash's own parameter substitution avoids that class of
+# mistake entirely -- see _tests_/bit/windowssmoke.bit's header for the same
+# target's other hazards (WSL-alias interop, the scp drive-letter colon).
+echo "release.sh: verifying the Windows artifact"
+winZip="${OUT}/bit-${VERSION}-windows-x86_64.zip"
+[ -f "${winZip}" ] || { echo "release.sh: missing ${winZip}" >&2; exit 1; }
+winRunId="relsmoke-$$-$(date +%s)"
+
+winScratch="$(mktemp -d)"
+printf '%s\n' 'fn main() {' '  print("smoke ok\n")' '}' > "${winScratch}/smoke.bit"
+
+winPs1="${winScratch}/${winRunId}.ps1"
+cat > "${winPs1}" <<PS1EOF
+\$ErrorActionPreference = "Stop"
+Expand-Archive -Path "${winRunId}.zip" -DestinationPath "${winRunId}" -Force
+\$p = (Get-ChildItem -Directory "${winRunId}")[0].FullName
+\$projDir = Join-Path \$p "proj"
+New-Item -ItemType Directory -Path \$projDir -Force | Out-Null
+Copy-Item "${winRunId}.bit" (Join-Path \$projDir "smoke.bit")
+\$env:BIT_STDLIB = Join-Path \$p "stdlib"
+\$env:BIT_LIBBITRT = Join-Path \$p "lib\x86_64-windows\libbitrt.a"
+\$bitExe = Join-Path \$p "bin\bit.exe"
+\$got = & \$bitExe run (Join-Path \$projDir "smoke.bit")
+if (\$LASTEXITCODE -ne 0) { Write-Output "FAIL: run exited \$LASTEXITCODE"; exit 1 }
+if (\$got -ne "smoke ok") { Write-Output "FAIL: smoke test said '\$got'"; exit 1 }
+\$ver = & \$bitExe --version
+if (\$LASTEXITCODE -ne 0) { Write-Output "FAIL: --version exited \$LASTEXITCODE"; exit 1 }
+if (\$ver -ne "bit ${VERSION}") { Write-Output "FAIL: reports '\$ver', want 'bit ${VERSION}'"; exit 1 }
+Write-Output "smoke ok"
+PS1EOF
+
+# `</dev/null` on every ssh/scp call below that is not itself the transfer: an
+# ssh probe inherits stdin and can silently drain a later payload (#3899).
+scp -q "${winZip}" "${WINDOWS_HOST}:${winRunId}.zip" </dev/null
+scp -q "${winScratch}/smoke.bit" "${WINDOWS_HOST}:${winRunId}.bit" </dev/null
+scp -q "${winPs1}" "${WINDOWS_HOST}:${winRunId}.ps1" </dev/null
+rm -rf "${winScratch}"
+
+winRc=0
+winOut="$(ssh "${WINDOWS_HOST}" "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ${winRunId}.ps1" </dev/null)" || winRc=$?
+ssh "${WINDOWS_HOST}" "Remove-Item -Recurse -Force '${winRunId}', '${winRunId}.zip', '${winRunId}.bit', '${winRunId}.ps1' -ErrorAction SilentlyContinue" </dev/null || true
+if [ "${winRc}" -ne 0 ] || ! printf '%s\n' "${winOut}" | grep -q 'smoke ok'; then
+	echo "release.sh: x86_64-windows smoke FAILED on ${WINDOWS_HOST} (ssh exit ${winRc}):" >&2
+	printf '%s\n' "${winOut}" >&2
+	exit 1
+fi
+echo "release.sh: x86_64-windows smoke ok on real hardware (${WINDOWS_HOST})"
+
 # --- SBOM --------------------------------------------------------------------
 #
 # dist/sbom.py needs cyclonedx-python-lib, which this Mac does not carry
@@ -590,7 +673,7 @@ rm -rf "${SBOM_VENV}"
 echo "release.sh: wrote ${OUT}/bit-${VERSION}.cdx.json"
 
 # --- checksums and notes ----------------------------------------------------
-( cd "${OUT}" && shasum -a 256 ./*.tar.xz ./*.cdx.json | sed 's#\./##' > SHA256SUMS )
+( cd "${OUT}" && shasum -a 256 ./*.tar.xz ./*.zip ./*.cdx.json | sed 's#\./##' > SHA256SUMS )
 echo "release.sh: SHA256SUMS"
 cat "${OUT}/SHA256SUMS" | sed 's/^/  /'
 
@@ -617,7 +700,8 @@ else
 	}
 	missing=""
 	for f in "bit-${VERSION}-linux-x86_64.tar.xz" "bit-${VERSION}-linux-aarch64.tar.xz" \
-		"bit-${VERSION}-macos-aarch64.tar.xz" "bit-${VERSION}.cdx.json" "SHA256SUMS"; do
+		"bit-${VERSION}-macos-aarch64.tar.xz" "bit-${VERSION}-windows-x86_64.zip" \
+		"bit-${VERSION}.cdx.json" "SHA256SUMS"; do
 		[ -f "${OUT}/${f}" ] || missing="${missing} ${f}"
 	done
 	[ -z "${missing}" ] || {
@@ -777,14 +861,14 @@ case "${VERSION}" in *-*) args+=(--prerelease) ;; esac
 
 if gh release view "v${VERSION}" >/dev/null 2>&1; then
 	echo "release.sh: v${VERSION} exists; uploading assets with --clobber"
-	gh release upload "v${VERSION}" "${OUT}"/*.tar.xz "${OUT}"/*.cdx.json "${OUT}/SHA256SUMS" --clobber
+	gh release upload "v${VERSION}" "${OUT}"/*.tar.xz "${OUT}"/*.zip "${OUT}"/*.cdx.json "${OUT}/SHA256SUMS" --clobber
 else
 	# --target pins the new tag to the tree that was actually built and smoke-tested
 	# (#1856). Only meaningful on this branch: for an existing tag gh ignores it,
 	# which is correct — the tag is already placed and re-cutting must not move it.
 	echo "release.sh: tagging v${VERSION} at ${BUILT_COMMIT}"
 	gh release create "v${VERSION}" --target "${BUILT_COMMIT}" "${args[@]}" \
-		"${OUT}"/*.tar.xz "${OUT}"/*.cdx.json "${OUT}/SHA256SUMS"
+		"${OUT}"/*.tar.xz "${OUT}"/*.zip "${OUT}"/*.cdx.json "${OUT}/SHA256SUMS"
 fi
 
 # Report what the release ACTUALLY is now, not what --draft asked for: re-cutting

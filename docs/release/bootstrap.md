@@ -73,17 +73,19 @@ bootstrap with no digest check.
 
 ## 2. What happens when no release exists for the host triple
 
-Bit ships **three** targets and no others. There is no Windows build: the
-self-hosted compiler has no PE/COFF object writer, no CLI target and no Windows
-runtime port. A PE/COFF writer and linker existed in the retired Zig seed
-(`seed/obj/pe.zig`, `seed/link/pe.zig`, recoverable at `4ffb5523^`) and are the
-port reference, not code still in the tree. There is also no 32-bit or
-big-endian target.
+`dist/release.sh` ships **four** targets: x86_64-linux, aarch64-linux,
+aarch64-macos and x86_64-windows (#3342). Stage0 covers only the first
+three — a stage0 entry can only name a **published** release for that triple
+(`dist/stage0/SHA256SUMS`), and no Windows release existed before #3342
+shipped one, so there is no Windows stage0 yet. Repinning it is a separate
+ticket, now that a Windows release can exist to name. There is also no
+32-bit or big-endian target, and ARM64 Windows is out of scope for the
+Windows port.
 
-On a host outside those three there is no stage0 and **bootstrapping is not
-possible on that machine**. That is a deliberate statement, not a gap to be
-papered over. The supported path is Go's second option: cross-compile a stage0
-from a machine that has one.
+On a host outside those three stage0-pinned triples there is no stage0 and
+**bootstrapping is not possible on that machine**. That is a deliberate
+statement, not a gap to be papered over. The supported path is Go's second
+option: cross-compile a stage0 from a machine that has one.
 
 ```sh
 # on a supported host

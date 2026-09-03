@@ -19,12 +19,9 @@ What that does *not* mean: the API is not frozen, and `0.x` releases carry no
 support guarantee. Read [the support policy](docs/release/SUPPORT.md) before
 depending on it.
 
-**Platforms.** Linux and macOS on x86-64 and ARM64. Windows is not supported yet:
-the self-hosted compiler has no PE/COFF object writer, no Windows CLI target and
-no Windows runtime port, so no Windows artifact is built. A PE/COFF writer and
-linker existed in the retired Zig seed (`seed/obj/pe.zig`, `seed/link/pe.zig`,
-recoverable at `4ffb5523^`) and are the port reference, not code still in the
-tree.
+**Platforms.** Linux and macOS on x86-64 and ARM64, and Windows on x86-64.
+ARM64 Windows is out of scope for the Windows port; x86-64 is the only
+Windows target.
 
 ## Install
 
