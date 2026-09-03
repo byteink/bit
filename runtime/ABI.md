@@ -1031,13 +1031,24 @@ is the load-bearing part rather than the instruction count.
   `allocObject` (`runtime/gc/gcalloc.bit`) after an allocation that crosses
   `gcShouldCollect`; `gcConfigure` (`runtime/gc/gc.bit`) after installing the
   collector's configuration.
-- **The one consumer clears BEFORE reading that state.** `stwSafepoint` calls
-  `pollConsume()` first, then does the poll, then re-sets the word if a reason
-  still holds. Clearing first admits no interleaving that leaves the word 0 with
-  a condition pending: if a writer's state store lands before the consumer's
-  reads, the consumer sees it; if it lands after them, the writer's own
-  `pollRequest` — which follows its state store — lands after the clear. The
-  proof is on `pollConsume`'s declaration.
+- **The one consumer clears BEFORE RE-DERIVING, and AFTER the poll's work.**
+  `stwSafepoint` does the poll, then `pollConsume()`, then re-sets the word if a
+  reason still holds. Both halves of that placement are load-bearing and they
+  answer different failures.
+
+  *Clear before the re-derivation*, or a request published between the
+  re-derivation's last load and its store is lost: if a writer's state store
+  lands before the re-derivation's reads, the re-derivation sees it and re-sets;
+  if it lands after them, the writer's own `pollRequest` — which follows its
+  state store — lands after the clear. The proof is on `pollConsume`'s
+  declaration.
+
+  *Clear after the work*, or the word being GLOBAL while the clear is
+  PER-THREAD erases a live request for every other mutator: A consumes on entry,
+  parks inside `stwPoll`, and B's next back edge reads 0, never polls, never
+  parks, and `worldRendezvous` spins out `stwSpinBound` and abandons the
+  collection. Placed after, A is still inside `stwPoll` while the stop is
+  pending, so the word stays set for B.
 - **The mutator's read is an ACQUIRE, and that is required rather than
   decorative.** It is the acquire half of a message-passing pair. Without it,
   the slow path's own loads of the summarised state may be satisfied before the
@@ -1063,10 +1074,28 @@ act on it in three instructions instead of re-deriving it in eighteen.
 request is acknowledged at the requesting thread's slowest peer's very next back
 edge, not within `N` of it. #4200's countdown, its `stress ? 1 : pollThinN()`
 reset and its bounded-latency argument are all deleted, and `pollThinN` with
-them: a counter that costs as much as the check it skips is pure complexity. The
-measured case for deleting it is on #4203; the arithmetic alone is close, since
-the countdown is four instructions on the path that skips a three-instruction
-poll.
+them.
+
+**Thinning the cheap poll was BUILT AND MEASURED before it was deleted, not
+argued away.** Three configurations, arm64, 21 interleaved rounds under `boxlock
+solo` with the label order rotated per round and a byte-identical copy of the
+base binary as the control (noise floor 0.43% mean / 1.41% max):
+
+| configuration | geomean cycles vs `main` |
+|---|--:|
+| control (base vs itself) | +0.30% |
+| cheap poll, every lap | **−1.93%** |
+| cheap poll, thinned 1-in-8 | −0.45% |
+
+Cheap-every-lap beats cheap-thinned on 7 of 10 benchmarks, by 7.6pp on
+`allocflat` and 4.4pp on `sort`; thinning wins on `matrix` (+2.0pp) and `map`
+(+0.9pp) and is a wash on `fib`, which has no back edge at all. The countdown is
+four instructions carrying a loop-carried store-to-load dependency through a
+frame slot, on the path that skips a three-instruction poll, so it costs more
+than it saves — and the thinned variant measured here did NOT yet carry the
+stress arm it would need to be landable, so the comparison is generous to it.
+Cutting the eighteen-instruction ladder was worth a countdown (#4200 measured
+−5.95%); cutting a three-instruction one is not.
 
 **`BIT_GC=stress` IS NOT THINNED — now by construction rather than by a special
 case.** Under stress `gcShouldCollect` is unconditionally true, so `gcConfigure`
