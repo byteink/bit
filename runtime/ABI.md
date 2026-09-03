@@ -109,29 +109,51 @@ a declared value type into a reference type.
 ### 1.2 Payload-carrying enums
 
 A payload-carrying enum construction (`Enum.Variant(args)`) is **one**
-`gc_alloc`'d object, not two: `{ tag: i64 @0, arg0 @16, arg1 @24, ... }` (#4018).
-The tag word at offset 0 is never a GC reference; each argument word at
-`16 + 8*i` is listed in `ptr_offsets` (§2) exactly when that argument's static
-type holds a GC reference — there is no separate payload box and no
-intermediate payload pointer to trace. This is the same generic
-`(type, size, ptr_offsets)`-keyed shape every multi-field class already uses
-(§2); an enum's payload merely starts its fields at offset 16 instead of 0 to
-leave room for the tag.
+`gc_alloc`'d object, not two: `{ tag: i64 @0, arg0 @8, arg1 @16, ... }` (#4018,
+base moved from 16 to 8 by #4026). Body size is `8 + 8*argc`. The tag word at
+offset 0 is never a GC reference; each argument word at `8 + 8*i` is listed in
+`ptr_offsets` (§2) exactly when that argument's static type holds a GC reference
+— there is no separate payload box and no intermediate payload pointer to trace.
+This is the same generic `(type, size, ptr_offsets)`-keyed shape every
+multi-field class already uses (§2); an enum's payload merely starts its fields
+at offset 8 instead of 0 to leave room for the tag.
 
 A **no-payload** variant construction (`Enum.NoArgVariant` or the bare tag
-reference `Enum.Variant`) is unaffected: a fixed 16-byte `{ tag: i64 @0,
-payload: i64 @8 }` object with the payload word always zero. `buildEnumObj`
-lists that word in `ptr_offsets` unconditionally, so the collector traces a
-value that is always nil. That is deliberate and it is the SAFE direction —
-tracing a nil word is wasted work, whereas omitting a word that turned out to
-hold a reference is a missed root and a wrong answer. **#4026** owns whether it
-can be dropped, together with the question of reclaiming the reserved word at
-offset 8; the two are the same question and must be decided with a
-`BIT_GC=stress` run over the corpus, not by reading.
+reference `Enum.Variant`) is the SAME layout at `argc == 1` with a nil argument:
+a 16-byte `{ tag: i64 @0, payload: i64 @8 }` object with the payload word always
+zero. `buildEnumObj` derives both its size and that offset from the one
+`enumPayloadBase` the payload path uses, so the two forms cannot drift apart, and
+an argc=1 variant whose argument is a reference produces a byte-identical
+`TypeInfo` to the no-payload form of the same enum.
+
+`buildEnumObj` lists the payload word in `ptr_offsets` unconditionally, so the
+collector traces a value that is always nil on that path. That is deliberate and
+it is the SAFE direction — tracing a nil word is wasted work, whereas omitting a
+word that turned out to hold a reference is a missed root and a wrong answer.
+**#4026 kept it** for exactly that asymmetry: under the merged base it is the
+same word `arg0` occupies, so the pointer map is right for both forms with no
+per-variant reasoning.
+
+**Why offset 8 and not 16 (#4026).** `runtime/alloc/classify.bit` rounds every
+request to a size class, and classes 1..7 are the multiples of 16 up to 112, so
+an odd argc is what crosses a class boundary. With a 32-byte header, at base 16
+an argc=1 object needed 56 bytes and took the 64 class; at base 8 it needs 48 and
+takes the 48 class — 16 bytes, 25%, on every `Option.Some`, `Result.Ok`,
+`Result.Err` and every payload variant of `Json`. argc=3 drops 80 -> 64 the same
+way; the even arities are unmoved. Measured as an RSS slope over a million live
+objects: 64.50 -> 48.50 bytes per object at argc=1, 80.54 -> 64.54 at argc=3,
+64.50 unchanged at argc=2. Nothing in `runtime/**` constructs or matches an enum
+(zero enum declarations in the tree), so this is a codegen shape change that the
+collector follows through `TypeInfo` — not a runtime ABI break, and it needs no
+two-pass `BIT_STAGE0_BIN` landing.
 
 `match` reads the tag at offset 0 (`matchTag`) regardless of shape, and binds
-arm `i`'s payload from `16 + 8*i` directly off the subject object
-(`bindArmPayload`) — there is no intermediate box read.
+arm `i`'s payload from `8 + 8*i` directly off the subject object
+(`bindArmPayload`) — there is no intermediate box read. `lowerVariantConstruction`
+is the only writer of a payload word and `bindArmPayload` the only reader; both
+take the offset from `enumPayloadBase` in `compiler/lowercall.bit`, because a
+writer and a reader that disagree here produce a wrong answer with no
+diagnostic, not a crash.
 
 ---
 
