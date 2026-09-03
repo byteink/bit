@@ -63,6 +63,41 @@
 # anything a bucket could add, and it is what #3553's agent was already
 # observed doing by hand.
 #
+# _tests_/testproj/** (#4153) is unmapped for the same reason, but it never
+# reaches gates_for_file() at all — worth stating precisely, since that is
+# the obvious wrong guess. gate.sh's own file-classification loop (the `case
+# "${f}"` above its bucket_count arithmetic) has no arm for this path
+# either: it is not `_tests_/bit/*`, `_tests_/imports/*`, or `_tests_/stress/*`
+# (a different, sibling top-level directory under `_tests_/`), so it never
+# sets has_testsbit and never calls testsbit_steps_for() / gates_for_file()
+# — it falls straight into gate.sh's generic `*)` catch-all, same as
+# scripts/** above, forcing bucket `full` with REASON "touches path(s)
+# outside the scoped buckets".
+#
+# Its SOLE consumer is scripts/selfhost-difftests.sh —
+# `PROJ=${1:-_tests_/testproj}` is a shell default, not a `runArgs()` literal
+# gates.bit could register — and that script is itself only reached through
+# `test-differentials`, a coreSteps() Step deliberately NOT a gateSteps()
+# Gate (#2570, so `./make test` stays 18-20 min). gates_for_file() only maps
+# to gateSteps()-registered gates by grepping `runArgs()`, so even if this
+# path did reach it, there would be nothing to map it to.
+#
+# A dedicated bucket was rejected for the identical two reasons #2745 gives
+# for scripts/** just above, both re-checked on this tree rather than
+# assumed: (1) gate.sh sits at 799/800 lines, no room for a ninth bucket's
+# ~25 lines of case arm, bucket_count wiring and terminal handling; and (2)
+# wiring one to actually RUN scripts/selfhost-difftests.sh would collide
+# with assert_full_is_superset() (scripts/gate-buildsteps.sh) — that script
+# is in none of `full`'s own BUCKET_PRE/BUCKET_POST lists today, so the
+# bucket would fail before running a single step unless also added to
+# `full`, taxing every --full/pre-push run for one narrow, rarely-touched
+# fixture.
+#
+# WHAT TO RUN INSTEAD of `--full` for a testproj-only change: `bit test
+# _tests_/testproj` directly (fast, no oracle), plus `bash
+# scripts/selfhost-difftests.sh` if verifying against the pinned stage0
+# oracle matters.
+#
 # gates_for_file() answers one question: given a changed file path, which
 # gate(s) (by name, as registered in tools/build/gates.bit) does it belong to?
 # assert_dirgates_current() self-checks that mapping is complete for every
