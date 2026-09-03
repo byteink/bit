@@ -71,6 +71,35 @@ git diff --cached --quiet || { echo "release.sh: staged changes present" >&2; ex
 # cannot move it.
 BUILT_COMMIT="$(git rev-parse HEAD)"
 
+# --- preflight: the benchmark tables must have been regenerated for THIS release ---
+# (#4192). Owner ruled 2026-09-02 that bench/run.sh's README block is
+# regenerated every release; .claude/skills/bit-release/SKILL.md's step 0.5
+# said so in prose only, and prose is exactly what got silently skipped for
+# 0.6.0 and 0.7.0 — README.md kept advertising a snapshot from 2026-08-31
+# that predated 0.5.0's allocator fix, understating Bit's own numbers by
+# roughly 2x on its four worst rows across two releases. A check that refuses
+# does not get silently skipped the way a checklist line does.
+#
+# The invariant: bench/RESULTS.md (written only by bench/run.sh, alongside
+# README.md and bench/history.csv) must have been committed AFTER the
+# previous release tag, i.e. someone ran bench/run.sh since that tag. Same
+# "previous v* tag reachable from HEAD" resolution dist/changelog.sh already
+# uses, so both scripts agree on what "previous release" means.
+BENCH_PREV_TAG="$(git describe --tags --abbrev=0 --match 'v*' "${BUILT_COMMIT}^" 2>/dev/null || true)"
+BENCH_COMMIT="$(git log -1 --format=%H -- bench/RESULTS.md 2>/dev/null || true)"
+[ -n "${BENCH_COMMIT}" ] || {
+	echo "release.sh: bench/RESULTS.md has no commit history — run bench/run.sh before releasing" >&2
+	exit 1
+}
+if [ -n "${BENCH_PREV_TAG}" ] && git merge-base --is-ancestor "${BENCH_COMMIT}" "${BENCH_PREV_TAG}"; then
+	echo "release.sh: bench/RESULTS.md was last regenerated at ${BENCH_COMMIT:0:8}, at or before ${BENCH_PREV_TAG} — the benchmark tables were not regenerated for this release" >&2
+	echo "  run: .claude/boxlock.sh solo bench/run.sh   (needs a quiet box: ps -eo comm= -A | grep -c make-driver == 0)" >&2
+	echo "  then: git add README.md bench/RESULTS.md bench/history.csv && git commit" >&2
+	echo "  then re-run: dist/release.sh ${VERSION}" >&2
+	exit 1
+fi
+echo "release.sh: benchmark tables regenerated at ${BENCH_COMMIT:0:8}, after ${BENCH_PREV_TAG:-<no previous release>}"
+
 # --resume-notes (#4124): everything down to SHA256SUMS below builds and
 # smoke-tests the artifacts. Skip it and reuse what a PRIOR run of this
 # command already left in ${OUT} — validated right before the changelog.sh
