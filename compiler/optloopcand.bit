@@ -1,0 +1,294 @@
+// compiler/optloopcand.bit — WHICH INSTRUCTION MAY LEAVE A LOOP. Split out of
+// optloop.bit under the 800-line file limit (#4052), the same way
+// optloopemit.bit was (#4063). Same module, so nothing here is imported.
+//
+// Loop-invariant code motion is divided across three files by question:
+//
+//   optloop.bit      which loops exist, and which of a header's parameters
+//                    hold the same value on every iteration;
+//   optloopcand.bit  which instruction inside one may be performed ONCE,
+//                    ahead of it — this file;
+//   optloopemit.bit  how the resulting plan is performed during the rebuild.
+//
+// ## The rule
+//
+// An instruction may be hoisted when it is INVARIANT and SPECULABLE.
+//
+// Invariant is `licmInvSlot`: every operand is LITERALLY an invariant
+// parameter of this loop's header. Speculable is the harder half, because a
+// preheader runs whether the loop body does or not — the guard may be false on
+// entry — so a hoisted instruction is performed on a path the original program
+// may never have taken. It is speculable only when performing it can have no
+// effect at all: no store, no allocation, no panic, no trap.
+//
+// ## `bit build --debug`: the decision, and what it leaves unfixed (#4052)
+//
+// The backends trap signed `add`/`sub`/`mul`/`neg` on overflow under `--debug`
+// (`arm64select.bit`'s `cx.debug && w.signed`, `arm64selectovf.bit`, and the
+// x64 twins). `cx.debug` is a CODEGEN flag: the IR is identical with and
+// without it, and nothing in the IR says those four ops can trap at all.
+//
+// Hoisting one moves WHERE a debug build traps, and the bad case is not
+// "earlier" but "at all". A loop that runs zero times never performs its body's
+// multiply; the hoisted copy performs it in the preheader, so a program that is
+// correct under `bit build` panics under `bit build --debug`. SPEC §13.5's
+// stated purpose for the mode is to make overflow "deterministic and testable",
+// and a panic reporting an overflow the program never computed is the one
+// outcome that makes it unusable — the first thing anyone does with a debug
+// mode that fires on correct code is turn it off.
+//
+// So the optimizer is told the build mode (`foldConstantsAndPrune`'s `debug`,
+// threaded from the CLI) and refuses to speculate those four ops under it. The
+// alternatives were weighed and rejected: hoisting only non-trapping ops leaves
+// exactly the two `mul i64` this ticket exists for; and hoisting only where the
+// block is guaranteed to run at least once per loop ENTRY needs a rotated loop,
+// which this compiler does not emit. The case is
+// `_tests_/cases/run_debug_licm_zero_trip_no_trap.bit`.
+//
+// THIS IS A STOP-GAP AND THE ROOT CAUSE IS STILL THERE. The IR cannot say an
+// operation traps, so every IR pass reasons about signed arithmetic as pure
+// while the backend gives it an effect. LICM is the SECOND pass to hit that,
+// not the first: measured on this tree, a dead overflowing i64 multiply traps
+// under `bit build --debug --no-optimize` (exit 2) and does not under
+// `bit build --debug` (exit 0) — `deadCodeElim` already deletes the trap. That
+// hole points the other way (a missed overflow rather than an invented one) and
+// is NOT fixed here. Modelling the trap in the IR — the four ops joining
+// `isSideEffecting` under a debug build, or a distinct trapping op — would
+// answer both with one predicate instead of two.
+
+// An `index_set` lands in a slice's element buffer iff its base is
+// `field_get X[0]` with `X` slice-typed — the one shape
+// `emitInlineSliceElem` produces. `rtSliceNew` allocates the header and the
+// buffer as two distinct objects, so such a store cannot reach a header word.
+fn licmWritesSliceBuf(f: IrFunc, ctx: TypeContext, base: int): bool {
+  let b = f.instrs[base]
+  if (b.op != Op.FieldGet || b.ival != 0) {
+    return false
+  }
+  return ctx.types[f.instrs[b.lhs].ty].kind == TypeKind.Slice
+}
+
+// What stops a header WORD being hoisted out of this loop. Derived from
+// `isSideEffecting` rather than listed, which is optstore.bit's rule 3: an op
+// added later that writes memory must join that predicate or DCE would already
+// be deleting it, so it becomes a barrier here the day it lands.
+//
+// `index_get` is a pure load whose only effect is a bounds panic, and a panic
+// does not return. A TERMINATOR writes no memory; the one memory-relevant
+// thing it does is the back-edge poll, and the collector is non-moving and
+// cannot change a live header's `len` or `off`.
+//
+// This bounds LOADS ONLY. A pure computation over header parameters is immune:
+// its operands are SSA values, and no call can change what a block parameter
+// holds. `licmHoistable` is where that distinction is spent.
+fn licmClobbers(f: IrFunc, ctx: TypeContext, idx: int): bool {
+  let ins = f.instrs[idx]
+  if (ins.op == Op.IndexGet) {
+    return false
+  }
+  if (ins.op == Op.IndexSet) {
+    return !licmWritesSliceBuf(f, ctx, ins.lhs)
+  }
+  return isSideEffecting(ins.op) && !opIsTerminator(ins.op)
+}
+
+// `slice_len`, and `field_get` at a NON-ZERO offset: one word of a header, read
+// through the null-safe path (`emitHeaderWordOrZero`), so neither faults on a
+// null receiver nor traps — which is what makes performing one ahead of a loop
+// that may run zero times safe.
+//
+// REFUSES offset 0. Word 0 of every header shape in runtime/ABI.md §2 is the
+// payload POINTER, and loweraccess.bit's header states the hazard in terms of
+// this exact pass: `buf` is a GC-managed pointer typed `i64`, so no stack map
+// describes it, and what makes that sound is that its live range contains no
+// safepoint. Hoisting it puts it across the loop's back-edge poll. That is
+// #4053, and it needs the collector's answer, not a predicate change.
+fn licmReadsHeaderWord(ins: IrInstr): bool {
+  if (ins.op == Op.SliceLen) {
+    return true
+  }
+  return ins.op == Op.FieldGet && ins.ival != 0
+}
+
+// The four ops a `--debug` build gives an effect the IR does not carry. See the
+// file header for why they are refused there rather than hoisted anyway.
+//
+// Refused WHOLE, not just when signed. Unsigned arithmetic wraps by spec at
+// every width (§13.5) and is never checked, but signedness is a property of the
+// operand WIDTH (`widthOf`) rather than of the op — and a second place deciding
+// which arithmetic traps is a second place to be wrong about it. An unsigned
+// `add` hoisted out of a loop in a debug build is not worth that.
+fn licmTrapsInDebug(op: Op): bool {
+  return op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Neg
+}
+
+// A computation over its operand values alone: reads no memory, writes none,
+// cannot panic. Derived from `isSideEffecting` rather than listed, the same way
+// `licmClobbers` is — `sdiv`/`udiv`/`srem`/`urem` are refused because they sit
+// in that predicate for their divide-by-zero panic, so an op that joins it
+// later is refused here the day it lands, with no edit.
+//
+// `Neg`..`Convert` is the enum's contiguous run of one-operand pure ops. That
+// is the same ordinal-range assumption `opIsBinary` (ir.bit) already makes, and
+// ir.bit's own enum comment pins every op that must stay inside the run.
+fn licmPureOp(op: Op): bool {
+  if (isSideEffecting(op)) {
+    return false
+  }
+  return opIsBinary(op) ||
+    int(op) >= int(Op.Neg) && int(op) <= int(Op.Convert)
+}
+
+// Whether `idx` is an instruction this pass may perform once ahead of `sc`'s
+// loop. The OP question only — `licmRecord` asks the operand question.
+//
+// A header word is a LOAD, so it additionally needs a loop that writes no
+// memory: `bit_rt_slice_append` mutates a header IN PLACE (slices.bit:238), so
+// a call really can change `len` or `off` underneath the hoist. A pure
+// computation needs nothing of the kind, which is why `sc.clobbered` is a
+// per-candidate question here and not a reason to refuse the whole loop.
+fn licmHoistable(lc: LicmCtx, sc: LicmScan, idx: int): bool {
+  if (sc.known[idx].known || sc.fwd[idx] >= 0) {
+    return false
+  }
+  let ins = lc.f.instrs[idx]
+  if (licmReadsHeaderWord(ins)) {
+    return !sc.clobbered
+  }
+  if (lc.debug && licmTrapsInDebug(ins.op)) {
+    return false
+  }
+  return licmPureOp(ins.op)
+}
+
+// The header parameter slot `v` occupies in `sc`'s loop, or -1 when `v` is not
+// LITERALLY an invariant parameter of that header.
+//
+// THE OPERAND IS NOT RESOLVED HERE, and that is a correctness rule rather than
+// a missed opportunity. `licmResolve` will happily prove that an inner loop's
+// param equals an outer one's, and hoisting on that basis lands the definition
+// outside a loop that still reads it — which verify.bit rejects outright
+// ("reads %N, which is defined outside the loop closed by the back edge in
+// bbK"). A hoist across two loop levels has to thread the value through the
+// inner header's parameter list as well; that is not what this pass does.
+//
+// Demanding a literal param of `h` makes the depth question disappear.
+// verify.bit already rejects any input in which a block inside a nested loop
+// reads a value defined outside it, so an operand that IS `h`'s param proves
+// the reading block is not inside a loop nested within `h` — nothing here has
+// to compute loop depth to know it.
+fn licmInvSlot(lc: LicmCtx, sc: LicmScan, v: int): int {
+  let k = v - lc.f.blocks[sc.hdr].instsStart
+  if (k < 0 || k >= len(sc.inv) || !sc.inv[k]) {
+    return -1
+  }
+  return k
+}
+
+// The hoists a rebuild must perform. `home[i]` is the preheader block
+// instruction `i` moves into and `hdr[i]` the header whose parameter list it
+// joins, both -1 for the instructions that stay put. `ids` lists the hoisted
+// instructions; `pre` and `preRhs` are parallel to it and hold the OLD value id
+// each operand takes on in the preheader — the preheader edge's argument for
+// the invariant param that operand reads. `preRhs` is -1 for a one-operand
+// instruction, which is every `slice_len` and every `field_get`.
+//
+// PARAMS AND ARGUMENTS ARE BOTH EMITTED BY WALKING `ids` IN ORDER and keeping
+// only the entries for one header, so the two orders agree by construction
+// rather than by a sort.
+//
+// `dupOf` is parallel to `ids` as well: the OLD instruction id of an earlier
+// hoist out of the same loop that computes exactly this, or -1. A duplicate is
+// emitted nowhere and joins no parameter list — it takes the original's new id
+// in `remap`. Discovery order puts the original earlier in `ids`, so that id is
+// always written before it is read (#4063).
+class LicmPlan {
+  home: []int,
+  hdr: []int,
+  ids: []int,
+  pre: []int,
+  preRhs: []int,
+  dupOf: []int,
+}
+
+// The neutral plan: nothing hoisted. Every rebuild that is not doing LICM
+// passes this rather than the rebuild carrying a special case.
+fn noLicm(n: int): LicmPlan {
+  let home = []int(0)
+  let hdr = []int(0)
+  let i = 0
+  while (i < n) {
+    home = append(home, -1)
+    hdr = append(hdr, -1)
+    i = i + 1
+  }
+  return LicmPlan{
+    home: home, hdr: hdr, ids: []int(0), pre: []int(0), preRhs: []int(0),
+    dupOf: []int(0),
+  }
+}
+
+// An earlier hoist out of this same loop that computes exactly what `idx`
+// computes, or -1. The key is optcse.bit's `AvailKey` with the operands taken
+// AFTER the hoist: `op`, the byte offset `ival`, the result type `ty` — width
+// comes from `ty` at codegen, so two reads of one slot at different widths must
+// not answer each other — and the values BOTH operands become in the preheader.
+// That is every field `emitFieldGet`/`emitSliceLen` reads, and for a pure
+// computation the operand values plus the op determine the result outright.
+//
+// `for x of xs` is why this exists at all. Lowering threads `xs` into the
+// header TWICE, so the length test and the bounds test read `slice_len` of two
+// different param slots holding one slice. Both are invariant, both hoist, and
+// both land on the same preheader value. optcse collapses the two preheader
+// INSTRUCTIONS a round later, but not the two header params it left behind —
+// and `forceParamInterference` (codegenlive.bit:122) makes every param of a
+// block interfere, so the spare one costs a register across the whole loop.
+fn licmDupOf(lc: LicmCtx, sc: LicmScan, idx: int, pre: int, preRhs: int): int {
+  let ins = lc.f.instrs[idx]
+  let j = sc.base
+  while (j < len(lc.plan.ids)) {
+    let other = lc.f.instrs[lc.plan.ids[j]]
+    if (other.op == ins.op &&
+      other.ival == ins.ival &&
+      other.ty == ins.ty &&
+      lc.plan.pre[j] == pre &&
+      lc.plan.preRhs[j] == preRhs) {
+      return lc.plan.ids[j]
+    }
+    j = j + 1
+  }
+  return -1
+}
+
+fn licmRecord(lc: LicmCtx, sc: LicmScan, idx: int) {
+  if (!licmHoistable(lc, sc, idx)) {
+    return
+  }
+  let ins = lc.f.instrs[idx]
+  let kl = licmInvSlot(lc, sc, ins.lhs)
+  if (kl < 0) {
+    return
+  }
+  // EVERY operand must be invariant, not just the first. `opUsesRhs` is the
+  // same predicate `emitTranslated` consults to decide whether to translate
+  // `rhs`, so the two cannot drift into hoisting an operand nobody remaps.
+  let preRhs = -1
+  if (opUsesRhs(ins.op)) {
+    let kr = licmInvSlot(lc, sc, ins.rhs)
+    if (kr < 0) {
+      return
+    }
+    preRhs = sc.args[kr]
+  }
+  // `licmDupOf` FIRST: it scans `plan.ids`, so appending before asking makes
+  // every hoist match itself, which hands the rebuild `remap[idx] = remap[idx]`
+  // -- an unwritten slot, read as value id 0. That miscompiles silently and
+  // self-hosts clean (the corpus IR diff is what caught it).
+  let dup = licmDupOf(lc, sc, idx, sc.args[kl], preRhs)
+  lc.plan.home[idx] = sc.pre
+  lc.plan.hdr[idx] = sc.hdr
+  lc.plan.ids = append(lc.plan.ids, idx)
+  lc.plan.pre = append(lc.plan.pre, sc.args[kl])
+  lc.plan.preRhs = append(lc.plan.preRhs, preRhs)
+  lc.plan.dupOf = append(lc.plan.dupOf, dup)
+}

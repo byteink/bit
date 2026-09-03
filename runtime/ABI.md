@@ -109,29 +109,51 @@ a declared value type into a reference type.
 ### 1.2 Payload-carrying enums
 
 A payload-carrying enum construction (`Enum.Variant(args)`) is **one**
-`gc_alloc`'d object, not two: `{ tag: i64 @0, arg0 @16, arg1 @24, ... }` (#4018).
-The tag word at offset 0 is never a GC reference; each argument word at
-`16 + 8*i` is listed in `ptr_offsets` (§2) exactly when that argument's static
-type holds a GC reference — there is no separate payload box and no
-intermediate payload pointer to trace. This is the same generic
-`(type, size, ptr_offsets)`-keyed shape every multi-field class already uses
-(§2); an enum's payload merely starts its fields at offset 16 instead of 0 to
-leave room for the tag.
+`gc_alloc`'d object, not two: `{ tag: i64 @0, arg0 @8, arg1 @16, ... }` (#4018,
+base moved from 16 to 8 by #4026). Body size is `8 + 8*argc`. The tag word at
+offset 0 is never a GC reference; each argument word at `8 + 8*i` is listed in
+`ptr_offsets` (§2) exactly when that argument's static type holds a GC reference
+— there is no separate payload box and no intermediate payload pointer to trace.
+This is the same generic `(type, size, ptr_offsets)`-keyed shape every
+multi-field class already uses (§2); an enum's payload merely starts its fields
+at offset 8 instead of 0 to leave room for the tag.
 
 A **no-payload** variant construction (`Enum.NoArgVariant` or the bare tag
-reference `Enum.Variant`) is unaffected: a fixed 16-byte `{ tag: i64 @0,
-payload: i64 @8 }` object with the payload word always zero. `buildEnumObj`
-lists that word in `ptr_offsets` unconditionally, so the collector traces a
-value that is always nil. That is deliberate and it is the SAFE direction —
-tracing a nil word is wasted work, whereas omitting a word that turned out to
-hold a reference is a missed root and a wrong answer. **#4026** owns whether it
-can be dropped, together with the question of reclaiming the reserved word at
-offset 8; the two are the same question and must be decided with a
-`BIT_GC=stress` run over the corpus, not by reading.
+reference `Enum.Variant`) is the SAME layout at `argc == 1` with a nil argument:
+a 16-byte `{ tag: i64 @0, payload: i64 @8 }` object with the payload word always
+zero. `buildEnumObj` derives both its size and that offset from the one
+`enumPayloadBase` the payload path uses, so the two forms cannot drift apart, and
+an argc=1 variant whose argument is a reference produces a byte-identical
+`TypeInfo` to the no-payload form of the same enum.
+
+`buildEnumObj` lists the payload word in `ptr_offsets` unconditionally, so the
+collector traces a value that is always nil on that path. That is deliberate and
+it is the SAFE direction — tracing a nil word is wasted work, whereas omitting a
+word that turned out to hold a reference is a missed root and a wrong answer.
+**#4026 kept it** for exactly that asymmetry: under the merged base it is the
+same word `arg0` occupies, so the pointer map is right for both forms with no
+per-variant reasoning.
+
+**Why offset 8 and not 16 (#4026).** `runtime/alloc/classify.bit` rounds every
+request to a size class, and classes 1..7 are the multiples of 16 up to 112, so
+an odd argc is what crosses a class boundary. With a 32-byte header, at base 16
+an argc=1 object needed 56 bytes and took the 64 class; at base 8 it needs 48 and
+takes the 48 class — 16 bytes, 25%, on every `Option.Some`, `Result.Ok`,
+`Result.Err` and every payload variant of `Json`. argc=3 drops 80 -> 64 the same
+way; the even arities are unmoved. Measured as an RSS slope over a million live
+objects: 64.50 -> 48.50 bytes per object at argc=1, 80.54 -> 64.54 at argc=3,
+64.50 unchanged at argc=2. Nothing in `runtime/**` constructs or matches an enum
+(zero enum declarations in the tree), so this is a codegen shape change that the
+collector follows through `TypeInfo` — not a runtime ABI break, and it needs no
+two-pass `BIT_STAGE0_BIN` landing.
 
 `match` reads the tag at offset 0 (`matchTag`) regardless of shape, and binds
-arm `i`'s payload from `16 + 8*i` directly off the subject object
-(`bindArmPayload`) — there is no intermediate box read.
+arm `i`'s payload from `8 + 8*i` directly off the subject object
+(`bindArmPayload`) — there is no intermediate box read. `lowerVariantConstruction`
+is the only writer of a payload word and `bindArmPayload` the only reader; both
+take the offset from `enumPayloadBase` in `compiler/lowercall.bit`, because a
+writer and a reader that disagree here produce a wrong answer with no
+diagnostic, not a crash.
 
 ---
 
@@ -999,77 +1021,114 @@ the poll — signal-based preemption is the recurring one — has to supply a
 trigger as well as a yield, and the corrected sentence above is what makes that
 cost visible.
 
-**Poll thinning (#4200): the ladder runs once per N back edges, N = 8.** A
-per-invocation countdown lives in poll-cache slot 3 of the polling function's own
-frame, initialised to 1 at function entry (`emitPollCachePrefetch` /
-`xEmitPollCachePrefetch`) and reset to `pollThinN()` (`compiler/codegen.bit`,
-the single copy both backends read) by the ladder it gates. Every back edge
-executes four instructions — load, subtract one, store, branch-if-nonzero — and
-evaluates the full guard only when the counter reaches zero.
+**THE BACK-EDGE POLL IS A LOAD, A COMPARE AND A BRANCH (#4203).** A polling
+function fetches ONE address at entry — `bit_rt_port_sched_poll_attention_addr`,
+the address of `runtime/sched/pollreq.bit`'s `pollAttention` word — into one slot
+of its own frame. Every back edge then emits, on arm64:
 
-**The bounded-latency argument.** Let `c` be the countdown of the frame a thread
-is executing in. `c` is initialised to 1, decremented unconditionally on every
-back edge, and set to `N` only on the back edge that evaluates the ladder. So
-`c ∈ [0, N]` always, `c` strictly decreases on every back edge that skips the
-ladder, and a decrementing integer bounded below reaches zero. **At most `N`
-consecutive back edges can pass without a ladder evaluation, for every thread, on
-every path.** The rendezvous therefore still terminates: a stop request is
-acknowledged within `N` back edges of the requesting thread's slowest peer,
-against 1 before.
+```
+ldr  x9, [sp, #<pollCacheOffset 0>]
+ldar x9, [x9]
+cbz  x9, <past the call>
+bl   bit_rt_safepoint
+```
 
-Three properties this rests on, each of which a future change must preserve:
+and the same four steps on x86-64, where the compare cannot fold into the branch
+(`mov`, `mov`, `test`, `je`). It replaces an eighteen-instruction inlined ladder
+that re-derived `stwPollNeeded`'s whole predicate — ten loads, three of them
+`ldar`, seven branches — plus #4200's four-instruction countdown that existed
+only to make evaluating it rarer. Measured on `_spin`, a bare counting loop:
+84 emitted instructions to 34, entry prefetch 11 instructions and 3 calls to 2
+and 1, frame 0x60 to 0x50 bytes.
 
-- **The counter is stack memory, so it is per-thread and per-invocation.** Two
-  threads in the same function cannot hold each other away from zero, and a
-  recursive or nested call cannot inherit a nearly-exhausted count — every new
-  frame starts at 1, so the FIRST back edge of every invocation evaluates the
-  ladder in full. A loop that runs fewer than `N` iterations polls exactly as
-  often as it did before thinning.
-- **The bound is in back edges, not in time, and it always was.** One loop
-  iteration is an arbitrary straight-line block, and a thread inside a long
-  non-looping call reaches no poll at all — that is unchanged. Thinning
-  multiplies a pre-existing bound by a compile-time constant; it does not
-  introduce unboundedness, which is the property "collection cannot be starved"
-  actually asserts.
-- **A COUNTDOWN IS SOUND WHERE A PREDICATE IS NOT.** "Poll only on outer loops"
-  was the obvious alternative and is unsound in kind rather than in degree: an
-  innermost loop with no call in it would never poll, and the contract above
-  becomes a hang rather than a slowdown. A countdown cannot do that, because it
-  is a strictly decreasing quantity reset only by the thing it gates. Any future
-  thinning scheme owes that same argument.
+**The word is a SUMMARY, and it is safe because the slow path is
+self-checking.** `stwPollOn` already re-derives every clause and returns without
+acting when none holds, so a spurious nonzero costs one wasted call. A missed
+nonzero is the only real failure, which is why the publish/consume ordering below
+is the load-bearing part rather than the instruction count.
 
-**What it costs the collector, measured rather than argued (#4038, 11 interleaved
-rounds per binary under `boxlock solo`, base-vs-base noise floor 0.40% mean).**
-Because the poll is also the trigger, thinning changes *when* a collection starts,
-not only how late a stop is acknowledged. At N=8: collection counts identical on
-alloc (181), allocflat (66), sort (5) and strings (10); json 22 → 23 with `swept`
-byte-identical at 2 208 244; peak RSS unchanged on all ten benchmarks; all ten
-outputs byte-identical. At N=64 the trigger slips past the point where a batch is
-dropped — `swept` 2 208 244 → 1 254 409, json peak RSS +12%, and its cycle series
-goes bimodal with a 69% tail. **The practical ceiling on N is heap behaviour, not
-latency**, and it is well below the point where the latency argument above would
-start to matter.
+- **Every writer publishes AFTER the state it summarises.** `worldRendezvous`
+  (`runtime/gc/gcworldstop.bit`) calls `pollRequest()` after storing the stop
+  flag; `sysmonTick` (`runtime/sched/preempt.bit`) after flagging a worker;
+  `allocObject` (`runtime/gc/gcalloc.bit`) after an allocation that crosses
+  `gcShouldCollect`; `gcConfigure` (`runtime/gc/gc.bit`) after installing the
+  collector's configuration.
+- **The one consumer clears BEFORE RE-DERIVING, and AFTER the poll's work.**
+  `stwSafepoint` does the poll, then `pollConsume()`, then re-sets the word if a
+  reason still holds. Both halves of that placement are load-bearing and they
+  answer different failures.
 
-Re-derived on the landed form (#4200, same method, noise floor 0.24% mean /
-1.16% max) rather than inherited: identical on all ten counts above, and
-`swept + live` — the program's total allocation count, which no schedule can
-change — is identical on all ten on BOTH targets, while the split between the
-two moves on `strings`, `sort` and `json`. That split IS the schedule; the sum is
-the program. Check the sum, not the halves.
+  *Clear before the re-derivation*, or a request published between the
+  re-derivation's last load and its store is lost: if a writer's state store
+  lands before the re-derivation's reads, the re-derivation sees it and re-sets;
+  if it lands after them, the writer's own `pollRequest` — which follows its
+  state store — lands after the clear. The proof is on `pollConsume`'s
+  declaration.
 
-**`BIT_GC=stress` IS NOT THINNED, AND THAT IS A CORRECTNESS OBLIGATION RATHER
-THAN A REFINEMENT.** Under stress every ladder evaluation collects, which is what
-makes the stress suite this runtime's precise-rooting oracle — "any root the
-caller fails to report is swept on the very next poll" (`gcSafepointRoots`). A
-flat reset to `N` thins the oracle along with the fast path: measured on a
-200-iteration if/else loop, collections under stress went **303 → 128, −58%**,
-with every behavioural gate still green. Buying a benchmark win with the
-collector's own test instrument is not a trade this may make. So the reset value
-is `stress ? 1 : pollThinN()` — four instructions on the reset path, which runs
-once per `N` back edges — and the stress schedule is bit-for-bit what it was
-before thinning: the same probe reads **303 = 303**. `emitPollCountdownReset`
-(arm64) and `xEmitPollCountdownReset` (x64) carry it, and both selection checks
-pin it, because a silently-dropped stress arm fails no behavioural gate at all.
+  *Clear after the work*, or the word being GLOBAL while the clear is
+  PER-THREAD erases a live request for every other mutator: A consumes on entry,
+  parks inside `stwPoll`, and B's next back edge reads 0, never polls, never
+  parks, and `worldRendezvous` spins out `stwSpinBound` and abandons the
+  collection. Placed after, A is still inside `stwPoll` while the stop is
+  pending, so the word stays set for B.
+- **The mutator's read is an ACQUIRE, and that is required rather than
+  decorative.** It is the acquire half of a message-passing pair. Without it,
+  the slow path's own loads of the summarised state may be satisfied before the
+  summary read — control dependencies do not order loads on AArch64 — so a
+  mutator could observe a request, read the state stale, and clear a live stop.
+  x86-64 needs no instruction for it: an ordinary `mov` load is already an
+  acquire load under TSO.
+- **NO ACQUIRE WAS DOWNGRADED.** The ladder's three (`worldStopWord`, the
+  preempt summary, `heapLive`) all still execute with the ordering they had, in
+  `stwPollOn` / `preemptRequested` / `heapLiveBytes`, on the slow path where the
+  values are consumed. Three per back edge became one; none became a plain load.
+
+**The GC trigger moved to the allocation door, and that is where it belongs.**
+`heapLive` and `gcNumObjectsIdx` rise in `allocObject` and nowhere else; a free
+only lowers them and a collection only raises the trigger they are compared
+against. So the allocation door is the only place `gcShouldCollect` can turn from
+false to true, and it is the only place that publishes for it. This does NOT make
+the allocation door a collection point — collection still happens only at a
+safepoint, where the roots are precise. It records the fact so the back edge can
+act on it in three instructions instead of re-deriving it in eighteen.
+
+**The latency bound is back to what it was before #4200: one back edge.** A stop
+request is acknowledged at the requesting thread's slowest peer's very next back
+edge, not within `N` of it. #4200's countdown, its `stress ? 1 : pollThinN()`
+reset and its bounded-latency argument are all deleted, and `pollThinN` with
+them.
+
+**Thinning the cheap poll was BUILT AND MEASURED before it was deleted, not
+argued away.** Three configurations, arm64, 21 interleaved rounds under `boxlock
+solo` with the label order rotated per round and a byte-identical copy of the
+base binary as the control (noise floor 0.43% mean / 1.41% max):
+
+| configuration | geomean cycles vs `main` |
+|---|--:|
+| control (base vs itself) | +0.30% |
+| cheap poll, every lap | **−1.93%** |
+| cheap poll, thinned 1-in-8 | −0.45% |
+
+Cheap-every-lap beats cheap-thinned on 7 of 10 benchmarks, by 7.6pp on
+`allocflat` and 4.4pp on `sort`; thinning wins on `matrix` (+2.0pp) and `map`
+(+0.9pp) and is a wash on `fib`, which has no back edge at all. The countdown is
+four instructions carrying a loop-carried store-to-load dependency through a
+frame slot, on the path that skips a three-instruction poll, so it costs more
+than it saves — and the thinned variant measured here did NOT yet carry the
+stress arm it would need to be landable, so the comparison is generous to it.
+Cutting the eighteen-instruction ladder was worth a countdown (#4200 measured
+−5.95%); cutting a three-instruction one is not.
+
+**`BIT_GC=stress` IS NOT THINNED — now by construction rather than by a special
+case.** Under stress `gcShouldCollect` is unconditionally true, so `gcConfigure`
+publishes at boot and `stwSafepoint`'s republish keeps the word set for the whole
+run: every back edge takes the poll and every poll collects, which is what makes
+the stress suite this runtime's precise-rooting oracle ("any root the caller
+fails to report is swept on the very next poll", `gcSafepointRoots`). #4200
+needed a four-instruction stress arm on its reset path to preserve this, and
+measured what its omission cost — collections under stress 303 → 128 on a
+200-iteration if/else loop, with every behavioural gate still green. #4203 has no
+reset path to protect: the same probe reads 302 = 302 against `main`.
 
 **The stop-the-world handshake.** "Stop the world" is a real rendezvous, not an
 assumption about there being one thread. Any number of OS threads may execute Bit
@@ -1519,6 +1578,54 @@ mark traces from roots via the pointer maps using a fixed-capacity worklist
 constant); sweep frees unmarked objects back to the size-class heap. Upgrade path
 is incremental/generational collection when pause times matter.
 
+### 8.1 What goes back to the OS, and what does not (informative, #4000)
+
+Three things are returned, and all three are live paths today:
+
+- a **large block** (over `allocMaxSmall`, 16 KiB) is `munmap`ed by `gcHeapFree`
+  the moment it is freed, since it was mapped individually;
+- an **entirely-free owned span** is unlinked by `heapReclaimSpansLocked` and
+  then either parked in the 64-slot cross-class span cache, or pushed onto the
+  span free list, which resets it with `MAP_FIXED` at the same address — the OS
+  drops the physical pages, the address stays valid;
+- **every chunk the span reserve mapped** goes back at `gcDeinit`.
+
+Four things are not, in decreasing order of measured cost:
+
+1. **A span with even one live object.** Reclamation is whole-span and the
+   collector is non-moving, so nothing can compact the survivors together.
+2. **A span carved from memory the caller bound** (`boot`'s own arena, a stress
+   fixture's `[]i64`). It is `spanOwned == 0` and may never be unmapped —
+   unmapping it would punch a hole in memory the caller owns.
+3. **Entirely-free owned spans below the reclaim trigger.** A pass is asked for
+   only when at least half a class's spans are entirely free, because
+   `heapReclaimSpansLocked` walks the class's flat free list and a pass has to
+   pay for itself. A class therefore settles at holding up to half its spans
+   free.
+4. **Reserve address space.** `reserveGrow`'s bump never rewinds; the chunk list
+   is walked only by `reserveRelease` (`gcDeinit`) and `reserveReclaimChunks`
+   (the index reserve). Address space, not resident pages: a span parked on the
+   free list is decommitted.
+
+**Measured on `2e7aabff`, `bench/cases` at their own end state, span occupancy
+read from the live heap through `bit_rt_gc_addr`.** (1) is small in practice —
+spans at most 25% live are 3 of 2052 on `json` (0.15%), 5 of 164 on `sort`, 12
+of 78 on `strings`. (3) is the larger of the two: 25.4 MB held in entirely-free
+owned spans on `json` against a 302 MB peak, 2.2 MB on `sort`, 1.0 MB on
+`strings`.
+
+**Neither is a peak-RSS cost, and that is why the trigger has not been
+tightened.** Replacing the half-the-spans test with the exact amortisation
+question it approximates (are the doomed spans' slots at least half of the free
+list, which is `spanSpans * allocSpanSlots(idx) - spanLive`) removes essentially
+all of (3) — `json` 25.4 MB → 1.3 MB of retained free spans, 2052 → 1867 spans,
+with `heapLive` byte-identical. Peak RSS moves 0.27% on `json` and 3.15% on
+`sort`, and not at all on the other eight cases, because those spans empty
+*after* the high-water mark. Cycles move the wrong way over the noise floor:
+`strings` +7.8%, `json` +3.8%, `alloc` +1.9% (medians of 9, interleaved with a
+second independent baseline series whose own spread was under 2%). The trade was
+therefore rejected, not overlooked.
+
 ---
 
 ## 9. Program entry, boot, and spawn (`runtime/root`)
@@ -1641,16 +1748,24 @@ reading as a parameter instead of reading one itself
 - `maybePreempt(worker: i64): bool`, which reports a pending request and
   clears it in the same call. It only reports — the caller is responsible
   for the actual yield (`runtime/sched/preempt.bit:117-123`).
-- **#3746:** `anyRequested`, a `[1]i64` SUMMARY of `requested`, and its pinned
-  accessor `bit_rt_port_sched_preempt_any_addr` (`preemptAnyAddr(): int`).
-  Both backends' inlined back-edge poll guard caches that address once per
-  function entry, beside `bit_rt_world_addr` and `bit_rt_gc_addr`, and reads
-  the word on every back edge — reaching `schedCurrentWorker` and
-  `preemptRequested` only when it is nonzero. The word may read 1 with nothing
-  pending; it can never read 0 with something pending. `sysmonTick` publishes
-  it AFTER setting a flag, `maybePreempt`/`preemptStamp` write 0 and re-scan
-  AFTER clearing one; that ordering is what makes the one-way error one-way,
-  and the proof is on the declaration in `runtime/sched/preempt.bit`.
+- **#3746:** `anyRequested`, a `[1]i64` SUMMARY of `requested`, with its pinned
+  address accessor `bit_rt_port_sched_preempt_any_addr` (`preemptAnyAddr(): int`)
+  and, since #4203, its pinned value accessor
+  `bit_rt_port_sched_preempt_any` (`preemptAnyPending(): bool`). The word may
+  read 1 with nothing pending; it can never read 0 with something pending.
+  `sysmonTick` publishes it AFTER setting a flag, `maybePreempt`/`preemptStamp`
+  write 0 and re-scan AFTER clearing one; that ordering is what makes the
+  one-way error one-way, and the proof is on the declaration in
+  `runtime/sched/preempt.bit`.
+
+  **#4203: no backend reads this word any more.** Both inlined poll guards
+  cached its address beside `bit_rt_world_addr` and `bit_rt_gc_addr` and read it
+  at every back edge to decide whether to spend `schedCurrentWorker` +
+  `preemptRequested`. The back edge now reads `pollAttention`
+  (`runtime/sched/pollreq.bit`) instead, which `sysmonTick` publishes into on the
+  same terms and in the same place; `stwPollNeeded` consumes `anyRequested`
+  through `preemptAnyPending`, on the slow path, where the two scheduler calls it
+  replaced used to run.
 
   NOTE: the `runtime/sched/preempt.bit:NN` line citations in this section
   predate #3560/#3563/#3564/#3746 and have drifted. Resolve by NAME.
