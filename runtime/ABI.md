@@ -1539,7 +1539,7 @@ Read once at startup by `configFromEnv`. Knobs tune policy, never correctness.
 | `BIT_GC_MIN_KB`     | 4096    | Min live KiB before the first/next collection      |
 | `BIT_GC_GROWTH_PCT` | 200     | Heap growth percent between collections (>= 100)   |
 | `BIT_GC_MARKSTACK`  | 8192    | Mark worklist capacity in entries (> 0)            |
-| `BIT_GC_STATS`      | off     | `1`/`on` prints one line per collection to stderr  |
+| `BIT_GC_STATS`      | off     | `1`/`on` prints one summary line to stderr at exit  |
 
 POSIX only in v1; Windows keeps the compiled defaults until the runtime adds
 `GetEnvironmentVariableW`.
@@ -1625,6 +1625,62 @@ with `heapLive` byte-identical. Peak RSS moves 0.27% on `json` and 3.15% on
 `strings` +7.8%, `json` +3.8%, `alloc` +1.9% (medians of 9, interleaved with a
 second independent baseline series whose own spread was under 2%). The trade was
 therefore rejected, not overlooked.
+
+### 8.2 `BIT_GC_STATS` byte fields (#4057)
+
+Before #4057, every heap figure `BIT_GC_STATS=1` printed was a COUNT — of
+objects (`collections=`/`swept=`/`live=`) or of reserve chunks
+(`chunks=`/`chunkbytes=`/`idxchunks=`/`idxbytes=`) — so no memory claim could
+be attributed without ablating the collector (`BIT_GC=off` for a total, a
+tuned min/growth pair for a live high-water bound; both used independently by
+#4026/#4000/#4045 before this landed). Four byte fields close that gap:
+
+| field | source | rounding |
+|---|---|---|
+| `livebytes=` | `heapLiveBytes` | EXACT — the caller's `gcHeaderSize + bodySize` request |
+| `mappedbytes=` | `heapMappedBytes` | CLASS-ROUNDED — spans plus large (page-rounded) allocations |
+| `peakbytes=` | new: `heapPeakMappedBytes` | CLASS-ROUNDED — high-water mark of `mappedbytes=` |
+| `allocbytes=` | new: `heapAllocBytes` | CLASS-ROUNDED — cumulative, never decremented |
+
+**`livebytes=` is the odd one out on purpose.** It is the EXACT byte count a
+caller asked for, not what class a 56-byte request actually lands in (64) —
+that is what makes it return to exactly 0 when every allocation is freed, the
+leak metric the stress tests already rely on. The other three are
+CLASS-ROUNDED: `mappedbytes=`/`peakbytes=` can only ever be class/page-rounded
+(that is what the allocator actually took from the OS), and `allocbytes=`
+matches them deliberately, so `allocbytes=` divided by (`swept=` + `live=`)
+answers "average bytes ACTUALLY SPENT per object" rather than a number no
+external measurement (RSS, `/usr/bin/time -l`) could ever be checked against.
+Requested-vs-rounded is not a rounding-error footnote here — it is the entire
+subject of #4026, which this field now lets a caller see directly instead of
+inferring from an RSS delta across two size classes.
+
+**`peakbytes=` exists because the value at exit is not the peak.** For a
+program whose heap fell after its high point — spans reclaimed, `mappedbytes=`
+dropped — `mappedbytes=` at exit understates the memory the run actually
+needed. §8.1's "a scavenger cannot lower a peak" is the same fact read from
+the other direction: nothing here can lower `peakbytes=` once set, by
+construction (`heapNotePeakLocked`, `runtime/alloc/alloc.bit`).
+
+**Both new counters are PLAIN loads/stores, not atomic**, unlike
+`heapLiveBytes`/`heapMappedBytes` — deliberately, and the deviation is
+measured rather than a shortcut. `heapLiveBytes`/`heapMappedBytes` are read
+concurrently, off the heap lock, by the collector's own growth-trigger check
+on every allocation, so a torn read there is a real hazard. `heapPeakMappedBytes`/
+`heapAllocBytes` have exactly one caller anywhere in the runtime — `statsReport`,
+called only after `main` has returned and the worker is reaped — so no
+concurrent reader or writer can ever observe either word. Making them atomic
+cost `bench/cases/alloc` (10M individual small allocations) +12.6% cycles with
+`BIT_GC_STATS` UNSET; dropping the atomics brought that to +5.5%, the residue
+being an unavoidable (not inlining-eligible, see `runtime/alloc/alloc.bit`'s
+`heapTakeSmallLocked`) call to `allocClassSize`. `bench/cases/allocflat`, whose
+elements are packed inline rather than individually heap-allocated, costs 0%
+either way — the fixed per-small-allocation cost is real but narrow.
+
+Both live in the HEAP BLOCK (`heapWords` 41 → 43), never the GC state block
+(`gcWords`, unchanged at 39) — the GC state block is boot-pinned exactly full,
+and a new counter belongs beside `heapLiveWord`/`heapMappedWord`, which the
+same block already carries for the same reason.
 
 ---
 

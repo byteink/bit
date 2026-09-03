@@ -140,15 +140,17 @@ export const allocSpanBytes: int = 131072
 
 // The heap's state as a count of 8-byte words, so a caller can size the block:
 // two counters, one span-list head per class, then the #3045 span cache's
-// head and count.
+// head and count, then the #4057 byte-stat pair (peak mapped, cumulative
+// allocated).
 //
-// 2 + 37 + 2 IS EXACTLY 41, AND THE BLOCK IS FULL. That is why the class-wide
-// bookkeeping #2374 needs — the free-slot list head, the live-slot count and
-// the violation count — lives in the anchor SPAN's header rather than here:
-// `runtime/root/root.bit` spells the block `[41]i64` and refuses to boot unless
-// `heapWords == 41`, so a forty-second word is an edit in another module,
-// exactly as a fourth reserve word would be (see `runtime/gc/mem.bit`).
-export const heapWords: int = 41
+// 2 + 37 + 2 + 2 IS EXACTLY 43, AND THE BLOCK IS FULL AGAIN. That is why the
+// class-wide bookkeeping #2374 needs — the free-slot list head, the live-slot
+// count and the violation count — lives in the anchor SPAN's header rather
+// than here: `runtime/root/root.bit` spells the block `[43]i64` and refuses
+// to boot unless `heapWords == 43`, so a forty-fourth word is an edit in
+// another module, exactly as a fourth reserve word would be (see
+// `runtime/gc/mem.bit`).
+export const heapWords: int = 43
 
 // Exported (#1700): stwPoll inlines heapLiveBytes's one-load body on its hot
 // path to avoid a cross-module call, and needs the offset to do it.
@@ -162,6 +164,20 @@ const heapListsWord: int = 2
 // instead of unmapping a reclaimed span and burning reserve address space.
 const heapSpanCacheWord: int = 39
 const heapSpanCacheCountWord: int = 40
+
+// #4057: the high-water mark of `heapMappedWord` for the life of this heap,
+// and the cumulative CLASS-ROUNDED bytes ever handed to a caller (never
+// decremented — the byte twin of the `swept=`/`live=` OBJECT counts
+// `BIT_GC_STATS` already prints). Both are observability-only: nothing on the
+// allocation or free hot path ever reads either back — see
+// `heapPeakMappedBytes`'s header for the measured reason both are updated
+// with a PLAIN, non-atomic load-modify-store rather than `atomicAdd`/
+// `atomicLoad`/`atomicStore` — so they cost one integer add (plus, for the
+// peak, one compare) at the three sites bytes are newly minted
+// (`heapTakeSmallLocked`, `heapRefillLocked`, `heapLargeAllocLocked`) and
+// nothing at all on the free path.
+const heapPeakMappedWord: int = 41
+const heapAllocBytesWord: int = 42
 
 // Max spans the free-span list may hold: 64 * 128 KiB = 8 MiB. THE BOUND IS
 // WHAT STOPS THIS RE-INTRODUCING #2325's RSS RATCHET — an uncapped cache of
@@ -195,177 +211,12 @@ export const allocSpanCache: int = 64
   return z + (addr >> 3)
 }
 
-// --- Span metadata ----------------------------------------------------------
-//
-// `bit lsp --stdio` reached 12.5 GB RSS while idle (#2325) and nothing could
-// have given a byte of it back, because a span, once carved, was not
-// represented anywhere: its slots went onto one flat per-class list and the
-// span itself was forgotten. "Is span S entirely free?" needed an O(n) walk of
-// the whole class, and even the answer was useless — the slots are interior
-// nodes of a singly-linked list with no back pointers.
-//
-// A span now carries a header in its own first words, so the question is O(1).
-// #2374 made it ANSWERABLE; #2375 answers it and gives the span back.
-//
-// THE HEADER IS AT THE SPAN'S BASE, AND THE FIRST FEW SLOTS PAY FOR IT. The
-// carve starts at the first whole slot past the header (`spanSkip` of them),
-// which keeps every slot at an exact multiple of the class size from the span
-// base — the alignment argument `allocClassify` rests on, unchanged. Rounding
-// the carve start to a fixed byte offset instead would break it for the classes
-// whose size is not a power of two.
-//
-// FIVE OF THE TEN WORDS DESCRIBE THE SPAN. The other five are CLASS-WIDE and
-// are meaningful only in the span at the head of the class's list — the
-// "anchor" — because `heapWords` is full and has no room for them (see
-// `heapWords`). `heapRefillLocked` copies them onto the new anchor as it pushes
-// it, which is five stores on a path that already walks a whole span.
-//
-// `spanOwned` IS A SAFETY WORD, NOT AN OPTIMISATION (#2375). A span is carved
-// out of whatever the caller bound as the span reserve, and that is not always
-// OS pages this runtime mapped: `boot` binds an 8 MiB arena of its own, and five
-// stress programs bind a Bit-MANAGED `[]i64`. `munmap` on a slice the collector
-// owns is not a leak, it is a hole in the live heap. So only a span the reserve
-// itself got from the OS is ever released, recorded at carve time by the one
-// caller that knows.
-//
-// `spanSpans`/`spanEmpty` EXIST TO KEEP RECLAMATION LINEAR. Reclaiming a span
-// means walking the class's flat free list to unlink the slots inside it
-// (`heapReclaimSpansLocked`), which is O(free slots) — so firing it once per span
-// that empties is quadratic in the span count. Both counters are maintained in
-// O(1) by `take`/`give`/`refill`/`reclaim`, and let `heapGiveSmallLocked` ask for
-// a pass only when at least HALF the class's spans are releasable: each pass then
-// halves the class, so the total walking is linear in the slots freed. Both are
-// re-derived and checked by `heapCheckSpansLocked`. What that costs in retained
-// memory, and the exact-amortisation rule that was measured against it and
-// rejected on cycles, are ABI.md §8.1 (#4000).
-const spanClass: int = 0     // owning size-class index, -1 once doomed
-const spanTotal: int = 1     // slots carved out of this span
-const spanFree: int = 2      // how many of those are on the class's free list
-const spanNext: int = 3      // next span of this class, 0 = end of list
-const spanOwned: int = 4     // 1 = the reserve mapped this span, so it may be unmapped
-const spanList: int = 5      // ANCHOR ONLY: head of the class's free-slot list
-const spanLive: int = 6      // ANCHOR ONLY: slots of the class handed out
-const spanBad: int = 7       // ANCHOR ONLY: violations `heapCheckSpansLocked` saw
-const spanSpans: int = 8     // ANCHOR ONLY: spans on this class's list
-const spanEmpty: int = 9     // ANCHOR ONLY: those that are entirely free AND owned
-export const allocSpanHdrWords: int = 10
-
-// Entirely-free owned spans a class must have accumulated before
-// `heapGiveSmallLocked` asks for a reclaim pass. THIS IS THE HYSTERESIS, and 2
-// is the smallest value that is one: at 1 a class holding a single span would
-// ask on every free of its last slot, and the pass would refuse every time
-// because the anchor is never released — a walk per free that reclaims nothing.
-// At 2 the class has one releasable span beyond the anchor, so every pass that
-// runs gives at least one span back.
-export const allocSpanKeep: int = 2
-
-// The span owning `addr`. A MASK, NOT A LOOKUP, and that is what keeps
-// `heapTakeSmallLocked`/`heapGiveSmallLocked` `@nosplit`-safe and O(1): every
-// span starts on a multiple of `allocSpanBytes`, which is a power of two, so
-// clearing the low bits of any address inside it lands exactly on its base.
-//
-// It is sound only because #2373 aligned span-sized takes to `allocSpanBytes`
-// rather than to the page. Page alignment would NOT have been enough: on
-// aarch64-macos `runtime/root/darwin/boot.bit` passes 4096 as the nominal page
-// size while the real page is 16 KiB, so "page-aligned" is ambiguous there, and
-// neither reading implies this one.
-export @nosplit @symbol("bit_rt_alloc_span_of") fn allocSpanOf(addr: int): int {
-  return addr & ~(allocSpanBytes - 1)
-}
-
-// Slots of size `cs` the header AND the #3176 occupied-slot bitmap
-// (`allocBitmapWords`, `./bitmap.bit`) consume at the span base. Rounded UP to
-// a whole slot so the carve stays on the class's own grid. The bitmap sits
-// immediately after the 10 fixed header words, so this is the only change to
-// the span's physical layout the bitmap requires.
-@nosplit fn spanSkip(cs: int): int {
-  return (allocSpanHdrWords * 8 + allocBitmapWords(cs) * 8 + cs - 1) / cs
-}
-
-// Slots a span yields for class `idx`. At least 1 for every class: the largest
-// class is `allocMaxSmall` and `allocSpanBytes` is eight times it, so the
-// header costs one of those eight slots and seven remain.
-export @nosplit @symbol("bit_rt_alloc_span_slots") fn allocSpanSlots(idx: int): int {
-  let cs = allocClassSize(idx)
-  return allocSpanBytes / cs - spanSkip(cs)
-}
-
-// `allocSlotIndex` (the #3176/#3177 occupied-slot bitmap's addressing
-// primitive) and `allocBitmapWords`/`allocSpanBitmapWord` (the bitmap's
-// sizing and a test-only reader) are `./bitmap.bit`, a sibling file — same
-// module, no import needed. Split out to keep this file under
-// `_tests_/bit/lintfilelines.bit`'s 800-line gate (E0200); it was already at
-// exactly that limit before #3176 (see `./spancache.bit`'s header).
-
-// The three per-span fields, read by address. Exposed so a test can compute the
-// occupancy tally independently and compare, which is the only way to catch a
-// take or give that updated the WRONG span — an error that leaves every
-// aggregate over the class exactly right. `allocSpanClass` is pinned
-// (`@symbol`, required for a cross-module call under `--freestanding`,
-// ABI.md §9): #3177's `gcOwns` reads it to classify a span it has already
-// confirmed is presence-keyed, before indexing into its #3176 bitmap.
-export @nosplit @symbol("bit_rt_alloc_span_class") fn allocSpanClass(spanAddr: int): int {
-  let sp = allocWordAt(spanAddr)
-  return *(sp + spanClass)
-}
-
-export @nosplit fn allocSpanTotal(spanAddr: int): int {
-  let sp = allocWordAt(spanAddr)
-  return *(sp + spanTotal)
-}
-
-export @nosplit fn allocSpanFree(spanAddr: int): int {
-  let sp = allocWordAt(spanAddr)
-  return *(sp + spanFree)
-}
-
-// The next span of the same class, 0 at the end. On the chain
-// `heapReclaimSpansLocked` returns this is the next span to release, and the
-// caller MUST read it BEFORE unmapping this one — the link lives in the span,
-// exactly as a chunk's does in `reserveRelease`.
-export @nosplit @symbol("bit_rt_alloc_span_next") fn allocSpanNext(spanAddr: int): int {
-  let sp = allocWordAt(spanAddr)
-  return *(sp + spanNext)
-}
-
-// Non-zero when the reserve mapped this span from the OS, so it may be handed
-// back. See `spanOwned`.
-export @nosplit fn allocSpanOwned(spanAddr: int): int {
-  let sp = allocWordAt(spanAddr)
-  return *(sp + spanOwned)
-}
-
-// Spans on class `idx`'s list, and how many of those are entirely free AND
-// releasable — the two counters the reclaim trigger reads. Exported so a test
-// can compare them against its own tally over the spans it handed the class,
-// the same independence argument the per-span fields are exported for.
-// `@symbol`-pinned: `runtime/gc/gccollect.bit`'s `gcIndexEntries` (#3177) sums
-// this across every class, cross-module under `--freestanding` (ABI.md §9).
-export @nosplit @symbol("bit_rt_heap_class_spans") fn heapClassSpans(h: *i64, idx: int): int {
-  let anchor = *(h + heapListsWord + idx)
-  if (anchor == 0) { return 0 }
-  let av = allocWordAt(anchor)
-  return *(av + spanSpans)
-}
-
-// The head span of class `idx`'s list, 0 if none. `allocSpanNext` continues
-// the walk from here — the same two-primitive pattern `heapCheckSpansLocked`
-// and `heapReclaimSpansLocked` already use internally, exposed rather than
-// duplicated so a caller outside this module can walk every currently-carved
-// span without its own copy of the list layout. `@symbol`-pinned:
-// `runtime/gc/gcindex.bit`'s index rebuild (#4096) walks every class's spans
-// to re-insert their presence keys after the index is re-enabled, cross-module
-// under `--freestanding` (ABI.md §9).
-export @nosplit @symbol("bit_rt_heap_class_anchor") fn heapClassAnchor(h: *i64, idx: int): int {
-  return *(h + heapListsWord + idx)
-}
-
-export @nosplit fn heapClassEmpty(h: *i64, idx: int): int {
-  let anchor = *(h + heapListsWord + idx)
-  if (anchor == 0) { return 0 }
-  let av = allocWordAt(anchor)
-  return *(av + spanEmpty)
-}
+// Per-span header words and their accessors (`spanClass`..`spanEmpty`,
+// `allocSpanOf`/`allocSpanSlots`/`allocSpanClass`/... , `heapClassSpans`/
+// `heapClassAnchor`/`heapClassEmpty`) are `./spanmeta.bit`, a sibling file —
+// same module, no import needed. Split out to keep this file under
+// `_tests_/bit/lintfilelines.bit`'s 800-line gate (E0200); see that file's
+// header for why (#4057).
 
 // --- Heap state -------------------------------------------------------------
 
@@ -391,6 +242,16 @@ export @nosplit @symbol("bit_rt_heap_init") fn heapInit(h: *i64) {
 // Bytes handed to callers and not yet freed. Returns to 0 when every allocation
 // is freed — the leak metric the stress test checks.
 //
+// THE EXACT REQUEST, NOT THE CLASS-ROUNDED SIZE (#4057): `size` here is
+// whatever `gcHeapAlloc`'s caller asked for (`gcHeaderSize + bodySize`), and a
+// 56-byte request into the 64-byte class adds 56, not 64. That is deliberate
+// — it is what makes `heapLiveBytes` == 0 the exact "every allocation freed"
+// leak check the stress tests rely on regardless of which class absorbed the
+// rounding. `heapAllocBytes`/`heapMappedBytes`/`heapPeakMappedBytes` below are
+// the CLASS-ROUNDED figures — what the allocator actually took from the OS —
+// and the two will not agree even on a heap with nothing live, because
+// rounding is asymmetric per class.
+//
 // Read atomically and OFF the lock: this is the collector's
 // growth trigger (`runtime/gc/` compares it against `next_gc_bytes` outside the
 // heap's critical section), so the read must never tear. Bit's atomics are
@@ -402,9 +263,49 @@ export @nosplit @symbol("bit_rt_heap_live_bytes") fn heapLiveBytes(h: *i64): int
 }
 
 // Total bytes currently mapped from the OS (spans + large allocations).
+// CLASS-ROUNDED by construction: a span only ever hands out whole
+// class-sized slots and a large object is mapped in whole pages, so there is
+// no "exact" version of this figure to distinguish it from.
 export @nosplit fn heapMappedBytes(h: *i64): int {
   let p = h + heapMappedWord
   return atomicLoad(p)
+}
+
+// High-water mark of `heapMappedBytes` over the life of this heap (#4057).
+// Monotonically non-decreasing; reset only by `heapInit`. Exists because the
+// value AT EXIT is whatever the last collection happened to leave mapped —
+// for a program that peaks and then shrinks, that is not the number anyone
+// asking "how much memory did this need" wants (`runtime/ABI.md` §8.1's "a
+// scavenger cannot lower a peak" note is the same fact from the other side).
+//
+// PLAIN LOAD, NOT ATOMIC — deliberately UNLIKE `heapLiveBytes`/
+// `heapMappedBytes` above. Those two are read OFF the lock on the collector's
+// own growth-trigger hot path, concurrently with every allocation, so a torn
+// read there is a real hazard. This function and `heapAllocBytes` below have
+// exactly ONE caller anywhere in the runtime — `BIT_GC_STATS`' `statsReport`,
+// which every boot path calls only after `main` has returned and the worker
+// is reaped, i.e. with no allocation and no writer of any kind still running.
+// Measured, not assumed: making these two atomic cost `bench/cases/alloc`
+// +12.6% cycles with `BIT_GC_STATS` UNSET (10M individual small allocations,
+// each paying an uncontended-but-still-fenced `atomicAdd`), against a <1%
+// noise floor on the same box — the exact "unset path must stay free" cost
+// this ticket asks not to hide. Dropping the atomics for these two
+// exit-only-read fields removed it; see the ticket's engineer comment for
+// the full before/after/null-control numbers.
+export @nosplit @symbol("bit_rt_heap_peak_mapped_bytes") fn heapPeakMappedBytes(h: *i64): int {
+  let p = h + heapPeakMappedWord
+  return *p
+}
+
+// Cumulative CLASS-ROUNDED bytes ever handed to a caller — never decremented,
+// so it only ever grows. The byte twin of the `swept=`/`live=` OBJECT counts
+// already on `BIT_GC_STATS`: dividing this by their sum gives bytes/object,
+// independent of anything the collector has since reclaimed. See
+// `heapLiveBytes` above for why this is the CLASS-ROUNDED figure and that one
+// is not, and `heapPeakMappedBytes` above for why this is a plain load.
+export @nosplit @symbol("bit_rt_heap_alloc_bytes") fn heapAllocBytes(h: *i64): int {
+  let p = h + heapAllocBytesWord
+  return *p
 }
 
 // --- Small path -------------------------------------------------------------
@@ -448,6 +349,25 @@ export @nosplit @symbol("bit_rt_heap_take_small_locked") fn heapTakeSmallLocked(
   }
   let live = h + heapLiveWord
   let _ = atomicAdd(live, size)
+  // #4057: `heapAllocBytes` is CLASS-ROUNDED, so this adds `allocClassSize(idx)`
+  // rather than the caller's exact `size` — see `heapLiveBytes`'s header for why
+  // the two differ. PLAIN add, not atomic — see `heapAllocBytes`'s own header
+  // for why this word has no concurrent reader.
+  //
+  // MEASURED COST, NOT HIDDEN: `allocClassSize` (`./classify.bit`) branches on
+  // `i < 4`, so it is never inlining-eligible — the inliner (`compiler/
+  // optinline.bit`'s `calleeShapeOk`) only splices a callee with exactly one
+  // basic block, and a genuinely branch-free reformulation covering all 37
+  // classes was tried and rejected as exactly the "clever code that obscures
+  // behavior" this project's own engineering discipline forbids for an
+  // uncertain gain. `objdump -d` of the rebuilt archive confirms a real `bl`
+  // here. `bench/cases/alloc` (10M small allocations, nothing else) costs
+  // +5.5% cycles for it with `BIT_GC_STATS` UNSET (down from +12.6% before the
+  // atomics above were dropped); `bench/cases/allocflat`, which does not hit
+  // this path per object, costs 0%. See the ticket's engineer comment for the
+  // full before/after/null-control numbers.
+  let alloc = h + heapAllocBytesWord
+  *alloc = *alloc + allocClassSize(idx)
   return addr
 }
 
@@ -574,7 +494,21 @@ export @nosplit @symbol("bit_rt_heap_refill_locked") fn heapRefillLocked(h: *i64
   }
   *head = spanAddr
   let mapped = h + heapMappedWord
-  let _ = atomicAdd(mapped, allocSpanBytes)
+  let old = atomicAdd(mapped, allocSpanBytes)
+  heapNotePeakLocked(h, old + allocSpanBytes)
+}
+
+// #4057: record a new `heapMappedWord` high-water mark if `newMapped` exceeds
+// the one already stored. CALLER MUST HOLD THE HEAP LOCK — both call sites
+// (`heapRefillLocked` above, `heapLargeAllocLocked` below) already do, which
+// is what makes two writers here impossible. PLAIN load-compare-store, not
+// atomic — see `heapPeakMappedBytes`'s own header for why this word has no
+// concurrent reader either.
+@nosplit fn heapNotePeakLocked(h: *i64, newMapped: int) {
+  let peak = h + heapPeakMappedWord
+  if (newMapped > *peak) {
+    *peak = newMapped
+  }
 }
 
 // Take every entirely-free releasable span off class `idx` and return them as a
@@ -779,9 +713,16 @@ export @nosplit @symbol("bit_rt_alloc_large_len") fn allocLargeLen(size: int, pa
 // bytes. CALLER MUST HOLD THE LOCK.
 export @nosplit @symbol("bit_rt_heap_large_alloc_locked") fn heapLargeAllocLocked(h: *i64, size: int, nbytes: int) {
   let mapped = h + heapMappedWord
-  let _ = atomicAdd(mapped, nbytes)
+  let old = atomicAdd(mapped, nbytes)
+  heapNotePeakLocked(h, old + nbytes)
   let live = h + heapLiveWord
   let _ = atomicAdd(live, size)
+  // #4057: `nbytes` is the page-rounded mapped length (`allocLargeLen`), the
+  // large-path twin of `heapTakeSmallLocked`'s `allocClassSize(idx)` — both
+  // are the CLASS/PAGE-rounded figure, never the caller's exact `size`. PLAIN
+  // add, not atomic — see `heapAllocBytes`'s own header for why.
+  let alloc = h + heapAllocBytesWord
+  *alloc = *alloc + nbytes
 }
 
 // Account the release of a direct-mapped allocation. CALLER MUST HOLD THE LOCK.
