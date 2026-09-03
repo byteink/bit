@@ -2404,10 +2404,11 @@ them stay omittable and `let p: Inner` above is still valid.
 
 **An enum whose declaration-order first variant carries a payload has no zero
 value, for the same reason a class with a class-typed field does not.** A
-payload-carrying enum is a boxed `{tag, payloadPtr}` reference (§14.7); its
-first variant is the one that would materialize with no arguments given, and a
-variant with a payload has none to give. Both forms that would ask for one are
-**E0083**, the identical surfaces as the class-typed-field rule above:
+payload-carrying enum's variant construction is a boxed, heap-allocated
+reference (§14.7); its first variant is the one that would materialize with no
+arguments given, and a variant with a payload has none to give. Both forms
+that would ask for one are **E0083**, the identical surfaces as the
+class-typed-field rule above:
 
 ```
 enum Option<T> { None, Some(T) }       // the prelude's own declaration (§17.5)
@@ -2816,10 +2817,14 @@ let s = Shape.Rect(3.0, 4.0)   // payload variant: construct with arguments
   unfixed with no turbofish is an error. The prelude (§17) defines `Option<T>` and
   `Result<T, E>` this way.
 
-Representation (non-normative): a no-payload-only enum is a bare tag word; an
-enum with any payload is a boxed `{tag, payloadPtr}` object whose payload is a
-separately allocated, GC-traced record. Inline (unboxed) payload layout is a
-future optimization.
+Representation (non-normative): an enum with no payload-carrying variant is a
+bare tag word. An enum with any payload-carrying variant is boxed: every
+construction of it — including a no-payload variant of that same enum — is one
+heap-allocated `{ tag: i64 @0, ... }` object, with payload argument words
+stored inline starting at offset 8 (`8 + 8*argc` bytes total); there is no
+intermediate payload pointer or second allocation. A no-payload construction is
+the same 16-byte shape with the payload word zeroed. See `runtime/ABI.md`
+§1.2 for the byte layout.
 
 ### 14.8 Diagnostic Order
 
