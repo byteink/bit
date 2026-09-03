@@ -518,56 +518,49 @@ fn safepointSymbol(): string {
 // NO BACKEND EMITS `bit_rt_safepoint_needed` ANY MORE, and the helper that
 // returned its name is gone with the last caller (#2925 arm64, #3169 x64).
 // #2921/#2926 called it at every back edge to decide whether the naked shim's
-// five-frame chain was needed; both backends now inline that leaf's own
-// condition instead (emitInlinedPollGuard / xEmitInlinedPollGuard) against the
-// offsets below. runtime/stw/stwpoll.bit still EXPORTS the symbol — it is an
-// ABI name, and dropping an export is a separate decision from dropping its
-// use — so an unresolved-extern check naming it is still meaningful.
+// five-frame chain was needed; both backends inlined that leaf's own condition
+// instead, and #4203 replaced the inlined condition with the single word below.
+// runtime/stw/stwpoll.bit still EXPORTS the symbol — it is an ABI name, and
+// dropping an export is a separate decision from dropping its use — so an
+// unresolved-extern check naming it is still meaningful.
 
-// The two runtime leaves each backend calls ONCE per polling function's entry
-// to fill its poll-address cache, rather than once per loop iteration. Both are
-// `@nosplit` true leaves (runtime/root/root.bit) that never allocate or park,
-// so neither is a safepoint.
-fn worldAddrSymbol(): string {
-  return "bit_rt_world_addr"
-}
-
-fn gcAddrSymbol(): string {
-  return "bit_rt_gc_addr"
-}
-
-// #3564: the two runtime calls the inlined poll guard's preempt clause needs
-// (compiler/arm64call.bit's emitInlinedPreemptCheck). UNLIKE worldAddrSymbol/
-// gcAddrSymbol above, NEITHER is a leaf and NEITHER can be called once and
-// cached at function entry — the current worker can change the moment this
-// very guard causes a yield, so every evaluation that REACHES them must run
-// them afresh. #3746 is what stops most evaluations reaching them at all: see
-// preemptAnyAddrSymbol below, and emitInlinedPreemptCheck's own header for the
-// full trade and why a call-free inline was rejected.
-fn schedCurrentWorkerSymbol(): string {
-  return "bit_rt_port_sched_current_worker"
-}
-
-fn preemptRequestedSymbol(): string {
-  return "bit_rt_port_sched_preempt_requested"
-}
-
-// #3746: the address of runtime/sched/preempt.bit's `anyRequested` summary
-// word -- "is a preempt pending for ANY worker". UNLIKE the two symbols above
-// and LIKE worldAddrSymbol/gcAddrSymbol, this one IS a true leaf returning a
-// per-process constant, so both backends fetch it once at function entry into
-// a third poll-address cache slot and then read the word itself on every back
-// edge. That single load is what stands between a loop iteration and the two
-// real calls above: they now run only when the summary says something is
-// pending somewhere, which is the whole of #3746's fix (#3564 ran them
-// unconditionally and cost 3.28x on bench/cases/collatz).
+// #4203: THE NINE MIRRORED WORD OFFSETS ARE GONE, AND THAT IS THE POINT.
 //
-// The summary can read 1 with nothing pending; it can never read 0 with
-// something pending. See `anyRequested`'s own header in
-// runtime/sched/preempt.bit for the ordering proof -- the guard below is only
-// as correct as that invariant.
-fn preemptAnyAddrSymbol(): string {
-  return "bit_rt_port_sched_preempt_any_addr"
+// This file used to carry nine word offsets — worldStopWord, gcCfgStress,
+// gcCfgEnabled, gcHeapAddr, heapLiveWord, gcNextBytes, gcNumObjectsIdx,
+// gcNextObjects, wkId — mirrored BY NUMBER from the runtime, because both
+// backends open-coded `stwPollNeeded`'s whole predicate at every back edge and
+// a backend and the runtime are separate compilations (§17.6/§11.9: a pinned
+// name crosses that boundary only for a FUNCTION, never for module state).
+//
+// That mirror was the most drift-prone thing in this file and the drift was not
+// hypothetical: #3292 added the object trigger to the runtime predicate and not
+// to the two ladders, leaving them wider by exactly the state that trigger
+// exists to create, and `bench/cases/matrix` then took a ~190-instruction
+// wasted poll on every one of its 805M back edges — 86.0 G instructions to
+// 254.5 G, user CPU 2.2s to 9.0s — until #3359 re-synchronised them.
+//
+// A backend now emits no field offset at all: it fetches the ONE address below
+// and reads the word at offset 0. The predicate lives in exactly one place, in
+// Bit, in the runtime, so there is nothing left to mirror and nothing left to
+// drift.
+
+// #4203: the address of runtime/sched/pollreq.bit's `pollAttention` word — "has
+// anything asked for a safepoint". Both backends fetch it once per polling
+// function's ENTRY into that function's frame, then read the word itself on
+// every back edge (emitPollGuard / xEmitPollGuard).
+//
+// A true leaf returning a per-process constant, which is what makes caching it
+// at function entry sound — the same terms `bit_rt_world_addr`,
+// `bit_rt_gc_addr` and `bit_rt_port_sched_preempt_any_addr` were fetched on
+// until this ticket replaced all three with this one.
+//
+// The word's SENSE, and the whole of what a backend needs to know: 0 means
+// nobody is asking and the back edge falls through; anything else means call
+// `bit_rt_safepoint` and let the runtime decide why. runtime/sched/pollreq.bit
+// holds the invariant and the publish/consume ordering proof.
+fn pollAttentionAddrSymbol(): string {
+  return "bit_rt_port_sched_poll_attention_addr"
 }
 
 // ---------------------------------------------------------------------------
@@ -614,59 +607,6 @@ fn isBackEdge(curBlock: int, target: int): bool {
   return target <= curBlock
 }
 
-// #4200: HOW MANY BACK EDGES BETWEEN FULL POLL-LADDER EVALUATIONS.
-//
-// Both backends keep a per-invocation countdown in poll-cache slot 3,
-// initialised to 1 at function entry (emitPollCachePrefetch /
-// xEmitPollCachePrefetch) and reset to this value by the ladder it gates. A
-// back edge then costs four instructions — load, subtract, store,
-// branch-if-nonzero — against the eighteen the ladder's own fast path costs,
-// and the ladder runs once per `pollThinN()` back edges. The number lives HERE
-// rather than in either backend for the reason this file's header gives: a
-// value two backends mirror must have exactly one copy, or arm64 and x64 drift
-// into different collection schedules for the same program.
-//
-// THE SOUNDNESS ARGUMENT IS IN runtime/ABI.md §5, under "Poll thinning", and it
-// is not optional reading before changing this number: the back-edge poll is
-// the ONLY automatic collection trigger in the system (nothing in
-// runtime/alloc/** calls gcShouldCollect), so this constant is the multiplier
-// on the worst-case stop-the-world latency, not a codegen tuning knob.
-//
-// The initial 1 is load-bearing rather than a rounding choice: it makes the
-// FIRST back edge of every invocation evaluate the ladder, so a loop running
-// fewer than `pollThinN()` iterations polls exactly as often as it did before,
-// and the thinning cannot compound down a call chain — every frame gets its own
-// countdown. `BIT_GC=stress` is not thinned at all: the reset value is
-// `stress ? 1 : pollThinN()`, so the precise-rooting oracle keeps the schedule
-// it had (emitPollCountdownReset / xEmitPollCountdownReset).
-//
-// WHY 8 AND NOT MORE (#4038, 11 interleaved rounds per binary under boxlock
-// solo, base-vs-base noise floor 0.40% mean / 1.55% max). At 8: suite geomean
-// −5.95% cycles, matrix −31.8%, all ten benchmarks byte-identical output, peak
-// RSS unchanged on all ten, collection counts identical on alloc/allocflat/
-// sort/strings and 22 → 23 on json with `swept` byte-identical. At 64 the extra
-// win is ~10% of that while json's cycle series goes BIMODAL with a 69% tail,
-// peak RSS +12%, and `swept` 2 208 244 → 1 254 409 — the trigger slips past the
-// point where a batch is dropped, so collections run with more live and the
-// heap sits higher. Do not raise this without re-reading the RAW samples: a
-// trimmed mean launders that tail into a plausible single number.
-//
-// THE COUNTDOWN IS NOT FREE, AND THE TWO TARGETS PAY IT DIFFERENTLY. Measured by
-// building this same tree with N=1 — every back edge pays the countdown AND the
-// full ladder — the countdown alone costs +12.35% on arm64 `matrix`, +13.50% on
-// x86_64 `matrix`, +12.02%/+15.51% on `collatz`. It is a loop-carried
-// store-to-load dependency through the frame slot, and it is uniform across
-// targets. What differs is what removing 7/8 of the ladder buys BACK: 43.7pp on
-// arm64 `matrix` (net −31.3%) against 10.9pp on x86_64 `matrix` (net **+2.6%**,
-// a real regression), because that loop absorbs the ladder's eighteen
-// INDEPENDENT instructions in spare issue slots there and cannot absorb a serial
-// recurrence. Holding the counter in a reserved register instead of a frame slot
-// removes the recurrence and is the obvious follow-up; it was out of #4200's
-// scope because reserving a register touches allocation on both backends.
-fn pollThinN(): int {
-  return 8
-}
-
 // §10.3.1: a @naked or @nosplit function emits no back-edge safepoint. Recording
 // (buildIntervals) and emission (x64.bit/arm64.bit) gate on this same predicate
 // so the safepoint-position array stays in lockstep with the emitted calls.
@@ -705,57 +645,3 @@ fn hasBackEdgeSafepoint(f: IrFunc): bool {
   }
   return false
 }
-
-// ---------------------------------------------------------------------------
-// The inlined poll guard's word offsets — SHARED BY BOTH BACKENDS
-// ---------------------------------------------------------------------------
-//
-// MUST MIRROR `stwPollNeeded` (runtime/stw/stwpoll.bit) EXACTLY: same fields,
-// same order, same short-circuit semantics, so each backend's inlined ladder is
-// a safe (never narrower) over-approximation of the real guard — see that
-// function's own header for why narrower is a silent correctness bug and wider
-// is merely a wasted poll.
-//
-// "WIDER IS MERELY A WASTED POLL" IS TRUE PER POLL AND FALSE PER RUN, and
-// #3359 is what that distinction cost. #3292 added the object trigger to
-// `stwPollNeeded` and to `gcShouldCollect` but not to these two ladders, which
-// left them wider by exactly the state that trigger exists to create: byte
-// crossed, objects not caught up, no collection due. A wasted poll is ~190
-// instructions, and `matrix` took one on every one of its 805M back edges for
-// the whole run — 168.5 G instructions, 4x the benchmark's CPU. The cost of
-// being wider is bounded by the number of back edges executed while the state
-// holds, and nothing bounds how long it holds. Keep the ladders EXACT.
-//
-// These nine offsets mirror the runtime's own exported consts by NUMBER, not by
-// importing them — a backend and the runtime are separate compilations
-// (§17.6/§11.9: a pinned name crosses that boundary only for a FUNCTION, never
-// for module state/data) — so a drift between the two is real and would
-// silently read the wrong word. _tests_/bit/pollguardoffsets.bit pins the numbers
-// against the runtime's real consts and fails loudly on drift.
-//
-// They live here rather than in either backend because BOTH now inline the
-// guard (#2925 arm64, #3169 x64), and a number two backends mirror from one
-// runtime must have exactly one copy.
-fn pgWorldStopWordWord(): int { return 1792 } // runtime/gc/gcworld.bit worldStopWord = maxMutators * muWords = 256*7
-fn pgGcCfgStressWord(): int { return 10 }     // runtime/gc/gc.bit gcCfgStress
-fn pgGcCfgEnabledWord(): int { return 9 }     // runtime/gc/gc.bit gcCfgEnabled
-fn pgGcHeapAddrWord(): int { return 0 }       // runtime/gc/gc.bit gcHeapAddr
-fn pgHeapLiveWordWord(): int { return 0 }     // runtime/alloc/alloc.bit heapLiveWord
-fn pgGcNextBytesWord(): int { return 14 }     // runtime/gc/gc.bit gcNextBytes
-// The object half of the trigger (#3292, added to the inlined ladders by
-// #3359). WITHOUT THESE TWO THE LADDER IS WIDER THAN THE RUNTIME PREDICATE,
-// which is safe and was measured ruinous: the byte trigger alone stays crossed
-// for as long as the object trigger has not caught up, and #3292's object
-// floor makes that window effectively permanent for a workload with few live
-// objects. Every back edge in it then took `bl bit_rt_safepoint` — the naked
-// shim plus four frames, ~190 instructions — and the runtime declined to
-// collect every single time. `bench/cases/matrix` paid that on 805M back
-// edges: 86.0 G instructions -> 254.5 G, user CPU 2.2s -> 9.0s.
-fn pgGcNumObjectsIdxWord(): int { return 4 } // runtime/gc/gc.bit gcNumObjectsIdx
-fn pgGcNextObjectsWord(): int { return 37 }  // runtime/gc/gc.bit gcNextObjects
-// #3560's clause 3 (preempt pending), mirrored into the inlined ladders by
-// #3564. `wkId` is a scheduler field offset, not a GC/World one, but the same
-// mirror-by-number rule applies for the same reason — see this block's own
-// header. runtime/sched/worker.bit's own comment on the Worker layout is the
-// source of truth for the field this indexes ("22 id").
-fn pgWkIdWord(): int { return 22 } // runtime/sched/worker.bit wkId

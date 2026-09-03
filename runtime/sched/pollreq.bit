@@ -1,0 +1,112 @@
+// #4203: THE ONE WORD A MUTATOR READS AT A BACK EDGE.
+//
+// Before this file, both backends open-coded `stwPollNeeded`'s whole predicate
+// at every loop back edge: eighteen instructions, ten loads, three of them
+// `ldar` (an acquire load is a barrier on AArch64, not merely a load), asking
+// three independent questions — is a stop-the-world pending, is a preempt
+// pending, has the GC trigger been crossed — of state the runtime had already
+// computed for itself. The mutator paid to re-derive, every iteration, an
+// answer that is "no" for essentially the whole life of a program.
+//
+// It now reads THIS word instead, and nothing else: load the cached address,
+// acquire-load the word, branch if it is zero. Which of the three conditions
+// fired is decided by `bit_rt_safepoint`'s own slow path, on the rare back edge
+// where the word is set.
+//
+// SENSE: 0 means "nobody has asked for a safepoint"; nonzero means "take the
+// slow path and find out why". The slow path re-derives every condition from
+// the live state, so a spurious nonzero costs one wasted call and nothing else
+// — `stwPollOn` already returns without acting when no clause holds, which is
+// what makes a summary safe here at all. A missed nonzero is the only real
+// failure, so every writer below publishes AFTER the state it summarises and
+// every consumer clears BEFORE reading that state.
+//
+// THE INVARIANT, and why zero at process start is correct rather than a
+// convenient default: this word is 0 exactly while no reason to poll has ever
+// been published and none is currently pending. At time zero no subsystem is
+// bound — `worldAddr` and `gcAddr` are 0, no worker exists, nothing is
+// allocated — so there is no reason to publish, and a back-edge poll in that
+// window is a no-op by construction (`stwPollOn` returns at its own `waddr ==
+// 0` guard). Each of the three reasons publishes its own request the moment it
+// can first exist: `worldRendezvous` (../gc/gcworldstop.bit) when it raises the
+// stop flag, `sysmonTick` (./preempt.bit) when it flags a worker, `allocObject`
+// (../gc/gcalloc.bit) when an allocation crosses `gcShouldCollect`, and
+// `gcConfigure` (../gc/gc.bit) when the collector's configuration — including
+// `BIT_GC=stress`, whose whole meaning is "poll at every back edge" — is
+// installed. Pre-boot is not a special case; it is the general invariant
+// holding at t=0.
+//
+// WHY A SEPARATE WORD AND NOT `anyRequested` (./preempt.bit), which the poll
+// guard already cached: that word's clearing path, `refreshPreemptAny`, rescans
+// the preempt slots and writes the answer. Widening its meaning to cover GC and
+// stop-the-world would make that rescan clear a pending collection, and it
+// cannot be taught otherwise without `runtime/sched` importing `runtime/gc` —
+// the reverse of the edge that exists (E0044). Two words, each with one owner.
+//
+// WHY `runtime/sched` AND NOT `runtime/gc`: `runtime/gc`, `runtime/stw` and
+// `runtime/root` all import `../sched`, and `../sched` imports none of them, so
+// this is the only module every writer can reach.
+//
+// A [1]i64 rather than a bare `let w: i64` for the same reason every other
+// global in this module is an array: `ptrOf` is how a `@nosplit` body addresses
+// module state without indexing (E0075).
+let pollAttention: [1]i64
+
+// The address of `pollAttention`, for the one caller that needs it and cannot
+// reach it any other way: BOTH backends' back-edge poll guard
+// (`compiler/arm64call.bit`'s emitPollGuard, `compiler/x64controlflow.bit`'s
+// xEmitPollGuard) fetches it once per polling function's ENTRY into that
+// function's frame, then reads the word directly on every back edge. Module
+// state cannot be pinned across the compiler/runtime object boundary — only a
+// FUNCTION can (SPEC §11.9) — so an accessor is the only spelling available,
+// exactly as `preemptAnyAddr` below it and `rootGcAddr`/`rootWorldAddr` are for
+// theirs.
+//
+// A true leaf: no allocation, no park, no safepoint, and the address is a
+// per-process constant for the whole life of the program, which is what makes
+// caching it at function entry sound.
+export @nosplit @symbol("bit_rt_port_sched_poll_attention_addr") fn pollAttentionAddr(): int {
+  return int(ptrOf(pollAttention))
+}
+
+// Publish "somebody wants a safepoint". MUST be called AFTER the store that
+// makes the underlying condition true, never before: the reader's acquire load
+// of this word is the acquire half of a message-passing pair whose release half
+// is this sequentially-consistent store, so a mutator that observes the request
+// is guaranteed to observe the state that caused it.
+//
+// Only ever SETS. No writer clears this word — see `pollConsume` for the one
+// path that does, and why it does it first rather than last.
+export @nosplit @symbol("bit_rt_port_sched_poll_request") fn pollRequest() {
+  atomicStore(ptrOf(pollAttention), 1)
+}
+
+// Clear the word, BEFORE re-deriving whether anything is still pending.
+//
+// THE ORDER IS THE WHOLE CORRECTNESS ARGUMENT and it is exactly
+// `refreshPreemptAny`'s, which this file's sibling already proves for the
+// preempt summary. A re-derivation that stored its answer without clearing
+// first would lose a request published between its last load and its store;
+// clearing first cannot, because a writer stores its state before it stores
+// this word:
+//
+//   - if the writer's state store lands before the re-derivation's loads, the
+//     re-derivation sees the state and sets the word again;
+//   - if it lands after them, then the writer's own `pollRequest` — which
+//     follows its state store — lands after this clear, so the word ends
+//     nonzero and the next back edge polls again.
+//
+// There is no interleaving that leaves the word 0 with a condition pending.
+// This rests on the clear being ordered before the re-derivation's own atomic
+// reads, which is what sequential consistency gives (`stlr` then `ldar` on
+// AArch64 is an ordered pair; x86-64 TSO orders it through the store's
+// implicit fence).
+//
+// ITS ONE CALLER PLACES IT AFTER THE POLL'S WORK, NOT BEFORE, and that is a
+// multi-mutator requirement rather than a preference — see `stwSafepoint`
+// (../stw/stwpoll.bit). Clearing on entry to the slow path lets the first
+// thread to observe a stop request erase it for every other thread, which
+// abandons the collection.
+export @nosplit @symbol("bit_rt_port_sched_poll_consume") fn pollConsume() {
+  atomicStore(ptrOf(pollAttention), 0)
+}
