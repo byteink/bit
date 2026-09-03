@@ -76,28 +76,36 @@ BIT2=${BIT2:-bit-out/bin/bit}
 # budget with TIMEOUT_S for a slower host.
 TIMEOUT_S=${TIMEOUT_S:-60}
 
-# alarm_run <side> <outfile> <cmd...> — returns 142 iff the run timed out twice.
+# alarm_run <side> <capture> <cmd...> — returns 142 iff the run timed out twice.
 # `timeout` is not on macOS, perl is. alarm(2) survives exec, and exec resets
 # SIGALRM to its default (terminate), so the child dies even though the handler
 # does not carry over. Caveat: a child that deliberately exits 142 is
 # indistinguishable from a timeout — no example does, and the retry means such a
 # child would have to do it twice.
-# The subshell wrapper does NOT silence the shell's own "Alarm clock: 14" job
-# message -- measured false on #3478: the note lands inside $out, because the
-# `>"$out" 2>&1` redirect is function-scoped, so this shell's own fd 2 IS the
-# capture while bash reaps the SIGALRM-killed child. Retry-once-on-stall is
-# scripts/alarmrun.sh's alarmrun_retry (#3408); <outfile> here is "" because
-# $out is a caller-owned redirect opened ONCE for both attempts, not a
-# per-attempt truncate -- so a stalled first attempt's partial bytes (and the
-# "Alarm clock" note) survive into the retry's compared payload (#3478). The
-# fix is scripts/alarmrun.sh's alarmrun_retry_cap (#3490); converting this call
-# site to it is separate follow-up work, not yet done.
+#
+# <capture> used to be a caller-owned redirect opened ONCE for BOTH attempts
+# (the whole call wrapped in a single `>$out 2>&1`), so a stalled first
+# attempt's partial bytes -- plus bash's own "Alarm clock: 14" job-status
+# note, which lands on whatever fd 2 currently is while bash reaps the
+# SIGALRM-killed child -- survived into the retried attempt's compared
+# payload (#3478): a benign stall was reported as a DIFF (miscompile). Fixed
+# by routing through scripts/alarmrun.sh's per-attempt capture-truncating
+# helper (#3490), which places its own redirect on the forked child rather
+# than on this function, so this function's fd 2 is never bound to the
+# capture. A build call's own artifact (the path after `-o` in "$@", when
+# present) is removed before each attempt too, same as the capture; a
+# run-the-built-binary call has no artifact of its own and gets "".
 alarm_run() {
-  local side=$1 out=$2 rc
+  local side=$1 cap=$2 rc outfile="" prev=""
   shift 2
   local TIMEOUT="$TIMEOUT_S"
-  ( ALARMRUN_KEEP_STDERR=1 alarmrun_retry "$side" "" "$@" >"$out" 2>&1 ) 2>/dev/null
-  return $?
+  for a in "$@"; do
+    [ "$prev" = -o ] && outfile=$a
+    prev=$a
+  done
+  alarmrun_retry_cap "$side" "$outfile" "$cap" "$@"
+  rc=$?
+  return "$rc"
 }
 # The pin. Override only to explore locally; the committed value is the gate.
 EXPECTED_REFUSED=${EXPECTED_REFUSED:-0}
