@@ -396,11 +396,32 @@ while IFS= read -r f; do
     # end to end — see gates_for_file() above and the comment ahead of
     # testsbit_steps below.
     _tests_/bit/*|_tests_/imports/*|_tests_/stress/*)
-      has_testsbit=1
-      if [ -n "${testsbit_list}" ]; then
-        testsbit_list="${testsbit_list} ${f}"
+      # #4230: a DELETED path that was NEVER mapped to a gate needs no gate
+      # rerun — there is nothing left on disk for any gate to read, so
+      # removing it cannot change any gate's outcome. Existence on disk is
+      # the correct test (not any one diff source's own status letter):
+      # this script's own "the working tree is always included, on top of
+      # the range" rule above already makes the working tree the final
+      # word on what changed, and it applies here identically. A DELETED
+      # path that DOES still resolve via gates_for_file() (e.g. one file
+      # removed from a directory-mapped fixture dir, whose mapping is by
+      # directory prefix, not by the individual file) is NOT exempted —
+      # it falls through to the normal testsbit_list path below exactly as
+      # before, so that gate still reruns.
+      if [ ! -e "${f}" ] && [ -z "$(gates_for_file "${f}")" ]; then
+        has_noop=1
+        if [ -n "${noop_list}" ]; then
+          noop_list="${noop_list}, ${f}"
+        else
+          noop_list="${f}"
+        fi
       else
-        testsbit_list="${f}"
+        has_testsbit=1
+        if [ -n "${testsbit_list}" ]; then
+          testsbit_list="${testsbit_list} ${f}"
+        else
+          testsbit_list="${f}"
+        fi
       fi
       ;;
     tools/build/defs.bit|tools/build/gates.bit|tools/build/gatestable2.bit)
@@ -524,7 +545,12 @@ elif [ "${has_testsbit}" -eq 1 ]; then
   REASON="only _tests_/bit/**, _tests_/imports/**, or _tests_/stress/** changed (gate(s): ${testsbit_steps})"
 elif [ "${has_noop}" -eq 1 ]; then
   BUCKET="noop"
-  REASON="matched only path(s) known to be pure documentation with no gate: ${noop_list}"
+  # Two kinds of entry land in noop_list: known no-gate prose (see the case
+  # arm above _tests_/bit/**'s), and, since #4230, a deleted _tests_/bit/**,
+  # _tests_/imports/**, or _tests_/stress/** path that was never mapped to a
+  # gate either. The REASON text stays generic across both rather than
+  # naming "documentation", which would be wrong for the second kind.
+  REASON="matched only path(s) with no gate to run: ${noop_list}"
 else
   # Nothing in the five buckets, docs/**/*.md, spec/SPEC.md, _tests_/bit/**,
   # _tests_/imports/**, or a known no-gate prose path changed, has_other is 0,
