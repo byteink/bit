@@ -216,6 +216,11 @@ fn plusRealHours(t: DateTime, n: int): DateTime! {
 
 ## Constructing
 
+**`date()` is shipped**, returning a `Date` with the accessors, `isLeapYear()`
+and `toString()` documented below all implemented. `time`, `timeNs`, `today`
+and `zone` are not yet — the example at the end of this section mixes `date`
+with them and stays fenced `ignore` until the rest of the rewrite lands.
+
 ### `date(year: int, month: int, day: int): Date!`
 
 Fails when `month` is outside 1..12, when `day` is outside 1..(days in that month,
@@ -301,6 +306,11 @@ only, because only a `DateTime` already has an instant to preserve.
 ---
 
 ## Reading fields
+
+**Shipped on `Date`**: `year()`, `month()`, `day()`, `dayOfWeek()`,
+`dayOfYear()`, `quarter()`, `daysInMonth()` and `weekOfYear()`. Everything
+else below — the `Time`/`NaiveDateTime`/`DateTime` fields, and the
+`DateTime`-only and `Timestamp`-only rows — is not yet implemented.
 
 Available on every type that carries the field.
 
@@ -428,6 +438,11 @@ fn inDay(t: Timestamp, dayStart: Timestamp, nextDayStart: Timestamp): bool {
 ---
 
 ## Comparison
+
+**`isLeapYear()` is shipped, on `Date`.** Everything else in this section —
+`isBefore`, `isAfter`, `isSame`, `isBetween`, `compare`, `isSameDay`,
+`isSameMonth`, `isSameYear`, `isWeekend`, `isWeekday`, `isPast` and
+`isFuture` — is not yet implemented.
 
 | Method | Meaning |
 |---|---|
