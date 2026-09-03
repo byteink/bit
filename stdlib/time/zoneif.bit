@@ -1,0 +1,240 @@
+// RFC 8536 TZif reader — internal to std/time only. Nothing here is
+// exported: the public `Zone` API is a separate child ticket (#4071), and
+// this file's whole job is turning TZif bytes into a `ZoneData` for it.
+//
+// Sibling of ./tzlocal.bit, same module (SPEC §17.1): its `tzMagic`,
+// `tzHeaderLen`, `tzBE32` and `tzBE32Signed` are used here unqualified, with
+// no import and no redeclaration. A module's files share one flat
+// declaration namespace, so a second `const tzMagic` here would be E0042
+// "already declared in this scope".
+//
+// `tzlocal.bit`'s own `utcOffset` reads only the version 1 block, whose
+// transition times are signed 32-bit seconds and overflow in 2038. RFC 8536
+// §3.2 puts a second, structurally identical block after the v1 block in
+// every version 2/3 file, with 64-bit transition times; this file is the
+// reader for that block.
+//
+// Every count in a TZif header (isutcnt, isstdcnt, leapcnt, timecnt,
+// typecnt, charcnt) comes from the file itself and is treated as hostile:
+// nothing here is allocated or indexed until a bounds check against
+// `len(data)` has already justified it, and every failure mode below
+// returns a `fail`, never a panic and never a partial table — a short file,
+// a bad magic, an unsupported version byte, a count that would read past
+// the end, or a type index outside `typecnt`.
+//
+// Versions: 0x00 is the v1-only format (32-bit times, parsed as-is). '2'
+// and '3' share the identical second-header/second-block layout described
+// above — RFC 8536 v3 differs from v2 only in the footer's POSIX TZ string,
+// which this file never reads (extrapolating past the last transition is
+// out of scope, filed separately). Any other version byte is rejected
+// outright rather than risked as "close enough to v2".
+
+// One entry in a zone's transition table: at instant `at` (seconds since
+// the Unix epoch), the zone's offset from UTC becomes `offset` seconds, with
+// `isDst` and the abbreviation `abbrev` ("GMT", "BST") in effect until the
+// next transition.
+class Transition {
+  at: int,
+  offset: int,
+  isDst: bool,
+  abbrev: string,
+}
+
+// A parsed zone: its transitions in file order, plus the offset in effect
+// before the first one.
+class ZoneData {
+  transitions: []Transition,
+  fallback: int,
+}
+
+// The six 4-byte counts at the head of every TZif header (v1 or v2+, same
+// layout), read once and threaded through the rest of the parse instead of
+// re-reading the same 24 header bytes at every call site.
+class tzifHeaderFields {
+  isutcnt: int,
+  isstdcnt: int,
+  leapcnt: int,
+  timecnt: int,
+  typecnt: int,
+  charcnt: int,
+}
+
+// Parse a TZif file's transition table. `data` is untrusted: every count
+// read from a header is validated against `len(data)` before it sizes or
+// indexes anything.
+fn tzifParse(data: []byte): ZoneData! {
+  if (len(data) < tzHeaderLen) {
+    fail newError("tzif: data shorter than the 44-byte header")
+  }
+  if (string(data[0:4]) != tzMagic) {
+    fail newError("tzif: missing 'TZif' magic")
+  }
+  let version = data[4]
+  if (version == 0) {
+    let h = tzifReadHeaderFields(data, 0)
+    let z = tzifBuildZone(data, 0, h, 4)?
+    return z
+  }
+  if (version != '2' && version != '3') {
+    fail newError("tzif: unsupported version byte ${int(version)}")
+  }
+  let base2 = tzifV2Offset(data, version)?
+  let h2 = tzifReadHeaderFields(data, base2)
+  let z2 = tzifBuildZone(data, base2, h2, 8)?
+  return z2
+}
+
+// Skip the version 1 block (present only for backward compatibility, RFC
+// 8536 §3.2) and return the byte offset of the version 2 header that
+// follows it. Computes the v1 block's length from the v1 header's own
+// counts, confirms the second header actually fits in `data`, and requires
+// it to start with the same magic and repeat the same version byte before
+// trusting it — a corrupt or truncated v1 block must not be silently
+// misread as a valid v2 header.
+fn tzifV2Offset(data: []byte, version: byte): int! {
+  let h1 = tzifReadHeaderFields(data, 0)
+  if (h1.typecnt < 1) {
+    fail newError("tzif: v1 typecnt must be at least 1")
+  }
+  let base2 = tzHeaderLen + tzifBlockLen(h1, 4)
+  if (len(data) < base2 + tzHeaderLen) {
+    fail newError("tzif: truncated before the version 2 header")
+  }
+  if (string(data[base2:base2 + 4]) != tzMagic || data[base2 + 4] != version) {
+    fail newError("tzif: malformed version 2 header")
+  }
+  return base2
+}
+
+// Read the six header counts at `base` (caller must have already checked
+// `len(data) >= base + 44`).
+fn tzifReadHeaderFields(data: []byte, base: int): tzifHeaderFields {
+  return tzifHeaderFields{
+    isutcnt: tzBE32(data, base + 20),
+    isstdcnt: tzBE32(data, base + 24),
+    leapcnt: tzBE32(data, base + 28),
+    timecnt: tzBE32(data, base + 32),
+    typecnt: tzBE32(data, base + 36),
+    charcnt: tzBE32(data, base + 40),
+  }
+}
+
+// The byte length of one full TZif data block (RFC 8536 §3.1, items A-G)
+// that follows a header whose counts are `h`, given `timeSize` (4 for the
+// version 1 block, 8 for version 2+). Used only to skip the v1 block
+// entirely — never to size an allocation.
+fn tzifBlockLen(h: tzifHeaderFields, timeSize: int): int {
+  return h.timecnt * timeSize +
+    h.timecnt +
+    h.typecnt * 6 +
+    h.charcnt +
+    h.leapcnt * (timeSize + 4) +
+    h.isstdcnt +
+    h.isutcnt
+}
+
+// Build the transition table for the block whose 44-byte header starts at
+// `base` and has already been read into `h`, whose transition times are
+// `timeSize` bytes wide (4 for v1, 8 for v2+).
+//
+// A file claiming an enormous `timecnt`/`typecnt` must be rejected, not
+// allocated for: every offset derived from `h` is checked against
+// `len(data)` in one pass BEFORE any of the three type-table slices below
+// are allocated, so a bogus count fails here rather than sizing an
+// allocation from it. Every index read from the file afterwards (a
+// transition's type, a type's abbreviation) is bounds-checked against its
+// own count before use.
+fn tzifBuildZone(data: []byte, base: int, h: tzifHeaderFields, timeSize: int): ZoneData! {
+  if (h.typecnt < 1) {
+    fail newError("tzif: typecnt must be at least 1")
+  }
+  let transStart = base + tzHeaderLen
+  let typesStart = transStart + h.timecnt * timeSize
+  let ttinfoStart = typesStart + h.timecnt
+  let charStart = ttinfoStart + h.typecnt * 6
+  let charEnd = charStart + h.charcnt
+  if (len(data) < charEnd) {
+    fail newError("tzif: transition/type/abbreviation block runs past end of data")
+  }
+
+  let offsets = []int(h.typecnt)
+  let dsts = []bool(h.typecnt)
+  let abbrevs = []string(h.typecnt)
+  let i = 0
+  while (i < h.typecnt) {
+    let rec = ttinfoStart + i * 6
+    let desigidx = int(data[rec + 5])
+    if (desigidx >= h.charcnt) {
+      fail newError("tzif: abbreviation index out of range")
+    }
+    offsets[i] = tzBE32Signed(data, rec)
+    dsts[i] = data[rec + 4] != 0
+    abbrevs[i] = tzifReadAbbrev(data, charStart, desigidx, h.charcnt)
+    i = i + 1
+  }
+
+  let transitions = []Transition(0)
+  i = 0
+  while (i < h.timecnt) {
+    let typeIdx = int(data[typesStart + i])
+    if (typeIdx >= h.typecnt) {
+      fail newError("tzif: transition type index out of range")
+    }
+    transitions = append(
+      transitions,
+      Transition{
+        at: tzifTransitionAt(data, transStart + i * timeSize, timeSize),
+        offset: offsets[typeIdx],
+        isDst: dsts[typeIdx],
+        abbrev: abbrevs[typeIdx],
+      },
+    )
+    i = i + 1
+  }
+
+  // Before the first transition, RFC 8536 leaves the offset in effect
+  // implementation-defined absent a POSIX-TZ footer (out of scope here);
+  // this reader uses local time type 0, the same convention `tzlocal.bit`'s
+  // v1-only reader already relies on (its `typeIdx` starts at 0 and is only
+  // advanced past a transition that has actually occurred).
+  return ZoneData{ transitions: transitions, fallback: offsets[0] }
+}
+
+// The NUL-terminated abbreviation string starting at `charStart + desigidx`,
+// clipped to the `charcnt`-byte abbreviation block if no NUL is found first
+// — defensive: never reads past the block the caller has already
+// bounds-checked against `len(data)`.
+fn tzifReadAbbrev(data: []byte, charStart: int, desigidx: int, charcnt: int): string {
+  let start = charStart + desigidx
+  let limit = charStart + charcnt
+  let end = start
+  while (end < limit && data[end] != 0) {
+    end = end + 1
+  }
+  return string(data[start:end])
+}
+
+// A transition time at byte offset `off`: 8-byte signed for the version 2+
+// block, 4-byte signed for version 1. Caller has already bounds-checked
+// `off + timeSize <= len(data)`.
+fn tzifTransitionAt(data: []byte, off: int, timeSize: int): int {
+  if (timeSize == 8) {
+    return tzifBE64Signed(data, off)
+  }
+  return tzBE32Signed(data, off)
+}
+
+// Read a big-endian signed int64 (two's complement) at byte offset `off` of
+// `data`. Caller must have already checked `off + 8 <= len(data)`.
+//
+// No overflow correction needed here (unlike `tzBE32Signed`'s 32-into-64-bit
+// case): `hi`/`lo` are each a plain unsigned 32-bit reconstruction, and
+// shifting `hi` up by exactly 32 bits before ORing in `lo` rebuilds the
+// original 8-byte two's-complement bit pattern directly inside a 64-bit
+// `int` — the destination width matches the source width, so the result is
+// already the correct signed value with no separate sign-fixup branch.
+fn tzifBE64Signed(data: []byte, off: int): int {
+  let hi = tzBE32(data, off)
+  let lo = tzBE32(data, off + 4)
+  return (hi << 32) | lo
+}
