@@ -75,7 +75,13 @@ fn isBoolTy(ctx: TypeContext, ty: int): bool {
   return ctx.types[ty].kind == TypeKind.Prim && ctx.types[ty].prim == 10
 }
 
-// Binds one call's single result (if any) into `dst`.
+// Binds one call's single result (if any) into `dst`. The width-1 entry point,
+// which every call site in this backend uses today; `bindCallResults` is the
+// same convention at any width. Kept as its own body rather than delegating so
+// the default path allocates no slices per emitted call and its bytes are
+// visibly unchanged — checkArm64RetWords asserts the two agree byte for byte at
+// width 1, in a register destination, in a spill destination and for a bool,
+// so the agreement is proven rather than asserted in prose.
 fn bindCallResult(cx: A64Ctx, dst: int, dstTy: int, normalizeBool: bool) {
   if (dst < 0) {
     return
@@ -92,6 +98,87 @@ fn bindCallResult(cx: A64Ctx, dst: int, dstTy: int, normalizeBool: bool) {
     uxtb(cx.code, retRegNum())
   }
   putInt(cx, dst, retRegNum())
+}
+
+// Binds a W-word call result into `dsts`, word k from its ABI return register
+// (retRegsFor). Generalized by W: nothing here knows the value 2, and W == 1 is
+// not a special case.
+//
+// `dstTys[k]` is that word's real type and is REQUIRED even when `dsts[k] < 0`
+// discards the word, because a discarded word still consumes its class's return
+// register ordinal — dropping it would slide every later word of the other
+// class into the wrong register. (`bindCallResult`'s width-1 sentinel takes
+// dstTy == 0 with dst < 0 and returns before reading it; that shortcut does not
+// generalize, so it is not offered here.)
+//
+// ONE parallel move, not W sequential ones: a destination may itself be another
+// word's return register. A function with no safepoint at all draws from the
+// full master pool including x0..x7/d0..d7 (buildIntRegs), so a left-to-right
+// `mov x19,x0; mov x0,x1` order is only accidentally safe, and a `mov x1,x0`
+// destination would destroy word 1 before it was read. sequentializeAndEmit
+// resolves the cycle through the reserved secondary scratch.
+//
+// NOTHING MAY BE EMITTED BETWEEN THE `bl` AND THE LAST BINDING (#4236): any
+// instruction in that window can clobber a return register. That is why the
+// whole binding is one call at the call site rather than one per word.
+fn bindCallResults(cx: A64Ctx, dsts: []int, dstTys: []int, normalizeBool: bool) {
+  assert(len(dsts) == len(dstTys))
+  let classes = []RegClass(0)
+  let i = 0
+  while (i < len(dstTys)) {
+    classes = append(classes, regClassOf(cx.module.ctx, dstTys[i]))
+    i = i + 1
+  }
+  let regs = retRegsFor(classes)
+  let moves = []PMove(0)
+  i = 0
+  while (i < len(dsts)) {
+    if (dsts[i] >= 0) {
+      // A C callee returns `bool` in wN, leaving the register's upper bits
+      // unspecified — normalize in place before the move reads it. See
+      // bindCallResult for the whole argument.
+      if (normalizeBool && isBoolTy(cx.module.ctx, dstTys[i])) {
+        uxtb(cx.code, regs[i])
+      }
+      moves = append(
+        moves,
+        PMove{ src: plocReg(regs[i], classes[i]), dst: plocOf(cx, dsts[i], classes[i]) },
+      )
+    }
+    i = i + 1
+  }
+  sequentializeAndEmit(cx, moves)
+}
+
+// The multi-word half of `Op.Ret` (compileInstControl): W > 1 values into the
+// first W ABI return registers, counted per class by retRegsFor. Generalized by
+// W for the same reason as bindCallResults, and a parallel move for the same
+// reason — a returned value can already be sitting in another word's return
+// register, so a left-to-right sequence clobbers a word it has not written yet.
+//
+// The W == 1 path deliberately stays in compileInstControl and is NOT routed
+// through here. For a SPILLED return value this emits `ldr x0,[sp,#off]` where
+// that path emits `ldr x9,[sp,#off]; mov x0,x9` — one instruction better, on
+// every function in the tree. That is a codegen change owing its own
+// measurement, not a side effect of adding a capability nothing produces yet.
+fn emitMultiWordRet(cx: A64Ctx, vals: []int) {
+  let classes = []RegClass(0)
+  let i = 0
+  while (i < len(vals)) {
+    classes = append(classes, regClassOf(cx.module.ctx, cx.f.instrs[vals[i]].ty))
+    i = i + 1
+  }
+  let regs = retRegsFor(classes)
+  let moves = []PMove(0)
+  i = 0
+  while (i < len(vals)) {
+    moves = append(
+      moves,
+      PMove{ src: plocOf(cx, vregOf(cx, vals[i]), classes[i]), dst: plocReg(regs[i], classes[i]) },
+    )
+    i = i + 1
+  }
+  sequentializeAndEmit(cx, moves)
 }
 
 // `dst` is a vreg, or -1 when the call's result is discarded (no vreg is
