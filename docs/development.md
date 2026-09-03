@@ -555,7 +555,7 @@ not about scope.) Three measured instances, all re-measured on `main` at
   limit is enforced over 77 of 1182 (6.5%) and 1105 files are checked by
   nothing. Its scoping is deliberate — the point is only that the line reads
   as a whole-tree verdict.
-- **`test-fmt`** (`tools/build/gates.bit`) walks `stdlib/` and `examples/`
+- **`test-fmt`** (`tools/build/gatestable2.bit`) walks `stdlib/` and `examples/`
   only — 173 of 1182 files (14.6%, `git ls-files -- 'stdlib/*.bit'
   'examples/*.bit' | wc -l`). `compiler/`, `runtime/` and `_tests_/` — 997 of
   1182 (84%, `git ls-files -- 'compiler/*.bit' 'runtime/*.bit' '_tests_/*.bit' |
