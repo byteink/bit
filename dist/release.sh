@@ -493,7 +493,16 @@ winZip="${OUT}/bit-${VERSION}-windows-x86_64.zip"
 winRunId="relsmoke-$$-$(date +%s)"
 
 winScratch="$(mktemp -d)"
-printf '%s\n' 'fn main() {' '  print("smoke ok\n")' '}' > "${winScratch}/smoke.bit"
+# Same top-level, unnested "direct" shape as dist/release-smoke.sh's smoke()
+# and docker/toolchain.Dockerfile's RUN line (_tests_/bit/synthsmoke.bit's
+# header calls this shape "direct") -- this printf is not inside a heredoc or
+# a double-quoted ssh argument either, so there is no reason for it to be a
+# fourth escaping shape. The multi-arg `printf '%s\n' 'a' 'b' 'c'` form this
+# replaced produced byte-identical output (verified with `cmp`) but was a
+# structurally different invocation that _tests_/bit/synthsmoke.bit's
+# extractPrintfBody/classifyReleaseSite — which assume ONE single-quoted
+# `printf '<body>'` argument — could not parse at all (#4259).
+printf 'fn main() {\n  print("smoke ok\\n")\n}\n' > "${winScratch}/smoke.bit"
 
 winPs1="${winScratch}/${winRunId}.ps1"
 cat > "${winPs1}" <<PS1EOF
