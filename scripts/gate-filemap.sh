@@ -21,7 +21,7 @@
 # check, and #2745 decided that inconvenience is not worth fixing, because
 # both routes to a real bucket hit a wall that was checked, not assumed:
 #
-#   1. gate.sh sits at 797-798/800 lines, a hard ceiling (never raised, never
+#   1. gate.sh sits at 797-799/800 lines, a hard ceiling (never raised, never
 #      suppressed — spec/LINT.md's E0200). A bucket needs a has_scripts
 #      declaration, a case arm, bucket_count wiring, an elif branch and
 #      terminal handling, matching the eight buckets already above — on the
@@ -255,7 +255,12 @@ gates_for_file() {
   # un-interpolated template as a build step, which the STALE check below
   # correctly (but unhelpfully) rejects, making the whole scoped gate exit 2
   # and run nothing (#3496).
-  grep -F "runArgs(\"$1\")" tools/build/gates.bit 2>/dev/null |
+  #
+  # Reads BOTH gate-table files (#4169 split `gateTableB()` out of
+  # tools/build/gates.bit into tools/build/gatestable2.bit once gates.bit hit
+  # the 800-line ceiling) — `-h` suppresses the per-file prefix grep adds once
+  # more than one file is given, which the `sed` below does not expect.
+  grep -hF "runArgs(\"$1\")" tools/build/gates.bit tools/build/gatestable2.bit 2>/dev/null |
     sed -n 's/.*Gate{name: "\([^"]*\)".*/\1/p' |
     grep -vF '${' || true
 }
@@ -284,7 +289,8 @@ gates_for_file() {
 # text.
 assert_dirgates_current() {
   local dirs dir probe result
-  dirs="$(grep -oE 'runArgs\("_tests_/bit/[^"]+"\)' tools/build/gates.bit |
+  # Both gate-table files (#4169) — see gates_for_file()'s matching -h note.
+  dirs="$(grep -hoE 'runArgs\("_tests_/bit/[^"]+"\)' tools/build/gates.bit tools/build/gatestable2.bit |
     sed -E 's/runArgs\("(.*)"\)/\1/' | sort -u)"
   for dir in ${dirs}; do
     case "${dir}" in

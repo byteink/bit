@@ -175,11 +175,11 @@
 #     `gates_for_file()` below) run — nothing more — or `full` if any changed
 #     file cannot be mapped that way, whether or not one of the five areas
 #     also fired.
-#   - tools/build/defs.bit and tools/build/gates.bit are the same case only
-#     when the change is PURELY new `Step{}`/`Gate{}` registration: no edit to
-#     an existing entry, no edit to any function body. See
-#     `is_additive_registration` below for exactly what that means. Any other
-#     tools/build/** file, or any non-additive change to these two, still
+#   - tools/build/defs.bit, tools/build/gates.bit and tools/build/gatestable2.bit
+#     (gates.bit's Gate{} table, split by #4169) are the same case only for a
+#     PURE new `Step{}`/`Gate{}` registration — no edited entry, no edited
+#     function body (see `is_additive_registration` below). Any other
+#     tools/build/** file, or a non-additive change to these three, still
 #     forces `full` — that code is the driver every step runs under.
 #   - stdlib/** paired ONLY with its own mandatory docs/stdlib/**.md page
 #     (#3055): _tests_/bit/stdlibdocs.bit fails the build on any exported
@@ -362,21 +362,22 @@ EOF
   return 0
 }
 
-# True only if every change to `$1` (tools/build/defs.bit or
-# tools/build/gates.bit), across the commit range AND the working tree —
-# same three sources CHANGED itself was built from, since a file can carry
-# changes in more than one of them at once — is a bare addition of whole new
-# `Step{}`/`Gate{}` entries: zero removed lines, and every added block either
-# is comment/blank-only or opens and closes exactly one (or more) new entry.
-# Editing an existing entry always removes its old line first, so it is
-# caught by the deletion check alone; inserting a statement into an existing
-# function body without deleting anything is caught by the shape check,
-# because that block does not open with `Step{name:`/`Gate{name:}`.
+# True only if every change to `$1` (tools/build/defs.bit, or gates.bit's
+# Gate{} table split by #4169 into gates.bit and gatestable2.bit), across the
+# commit range AND the working tree — same three sources CHANGED itself was
+# built from — is a bare addition of whole new `Step{}`/`Gate{}` entries:
+# zero removed lines, and every added block either is comment/blank-only or
+# opens and closes exactly one (or more) new entry. Editing an existing
+# entry always removes its old line first, so it is caught by the deletion
+# check alone; inserting a statement into an existing function body without
+# deleting anything is caught by the shape check, because that block does
+# not open with `Step{name:`/`Gate{name:}`.
 is_additive_registration() {
   local file="$1" diff prefix
   case "${file}" in
     tools/build/defs.bit) prefix="Step{name:" ;;
     tools/build/gates.bit) prefix="Gate{name:" ;;
+    tools/build/gatestable2.bit) prefix="Gate{name:" ;;
     *) return 1 ;;
   esac
   diff="$(
@@ -514,7 +515,7 @@ while IFS= read -r f; do
         testsbit_list="${f}"
       fi
       ;;
-    tools/build/defs.bit|tools/build/gates.bit)
+    tools/build/defs.bit|tools/build/gates.bit|tools/build/gatestable2.bit)
       if is_additive_registration "${f}"; then
         :
       else
