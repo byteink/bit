@@ -2236,6 +2236,13 @@ what the binder receives:
 | `chan<T>`     | the received value, until closed (§16.2) | **rejected**          | —           |
 | anything else | **rejected**                             | **rejected**          | —           |
 
+A pair binder over `for_of`'s slice/array row is legal too, not only over a
+map: `for (i, x) of xs` binds `i` to the **index** (`int`) and `x` to the
+**element** (`T`) — the same two values the row's two single-binder forms give
+separately (`for x of xs` the element, `for x in xs` the index), joined into
+one binder. This is the `( IDENT | "(" pat "," pat ")" )` alternative in
+`for_of`'s own grammar, the same production a map's `(k, v)` pair binder uses.
+
 A single (non-pair) binder over a map is rejected for `for_of` too (§12.6): one
 binder cannot say whether it means the key or the value, and neither guess is
 recoverable once shipped. `for_in` rejects everything that is not a slice,
