@@ -40,6 +40,14 @@ fn one(c: Certificate): []Certificate {
   return append(s, c)
 }
 
+// The hostname + verification-time pair every report() call carries, bundled
+// so report() takes 5 params instead of 6 (E0202, limit 5).
+class verifyAt { host: string, now: int }
+
+fn at(host: string, now: int): verifyAt {
+  return verifyAt{ host: host, now: now }
+}
+
 // Verify a chain and print one labelled line: "ok" on success, else the specific
 // failure message — so each negative asserts a distinct error.
 fn report(
@@ -47,10 +55,9 @@ fn report(
   leaf: Certificate,
   inters: []Certificate,
   roots: []Certificate,
-  host: string,
-  now: int,
+  w: verifyAt,
 ) {
-  x509VerifyChain(leaf, inters, roots, host, now) catch e {
+  x509VerifyChain(leaf, inters, roots, w.host, w.now) catch e {
     println("${name}=${e.message()}")
     return
   }
@@ -78,6 +85,100 @@ fn parseSubject(hex: string): string! {
   return c.subject
 }
 
+// Every certificate run() parses, plus the certificate pools built from them.
+// Bundled so the section functions below each take one param instead of
+// threading 12 certificates individually (E0201 -- run() was 88 lines,
+// limit 80; this is the split).
+class x509Certs {
+  root: Certificate, inter: Certificate, leaf: Certificate, nonca: Certificate,
+  leafbad: Certificate, wildleaf: Certificate, ipleaf: Certificate, pssleaf: Certificate,
+  edroot: Certificate, edleaf: Certificate, ecroot: Certificate, ecleaf: Certificate,
+  roots: []Certificate, inters: []Certificate, noInters: []Certificate,
+}
+
+fn printLeafFields(c: x509Certs) {
+  println("subject=${c.leaf.subject}")
+  println("issuer=${c.leaf.issuer}")
+  println("validity=${c.leaf.notBefore}..${c.leaf.notAfter}")
+  println("pubKeyAlg=${c.leaf.pubKeyAlg} isCa=${c.leaf.isCa} hasPathLen=${c.leaf.hasPathLen}")
+  println("dns=${c.leaf.dnsNames[0]},${c.leaf.dnsNames[1]} hasEku=${c.leaf.hasExtKeyUsage}")
+  println("interIsCa=${c.inter.isCa} interPathLen=${c.inter.maxPathLen}")
+  println("edAlg=${c.edleaf.pubKeyAlg} ecAlg=${c.ecleaf.pubKeyAlg} ecCurve=${c.ecleaf.ecCurveOid}")
+}
+
+// Happy path + five distinct negatives, plus the tampered-signature case.
+fn happyAndNegatives(c: x509Certs): ()! {
+  report("happy", c.leaf, c.inters, c.roots, at("example.com", tsHappy))
+  report("expired", c.leaf, c.inters, c.roots, at("example.com", tsExpired))
+  report("hostname", c.leaf, c.inters, c.roots, at("evil.com", tsHappy))
+  report("nonca", c.leafbad, one(c.nonca), c.roots, at("bad.example.com", tsHappy))
+  report("missing", c.leaf, c.noInters, c.roots, at("example.com", tsHappy))
+
+  // tampered signature: flip a byte in the leaf's signatureValue, re-parse, verify.
+  let der = decodeHex(hexLeaf())?
+  der[len(der) - 1] = der[len(der) - 1] ^ 0x01
+  let tampered = x509Parse(der)?
+  report("tampered", tampered, c.inters, c.roots, at("example.com", tsHappy))
+}
+
+// Signature-dispatch coverage through chain verification, then the
+// single-signature dispatch (leaf verified directly under its issuer).
+fn signatureDispatch(c: x509Certs) {
+  report("ed", c.edleaf, c.noInters, one(c.edroot), at("ed.example.com", tsHappy))
+  report("ec", c.ecleaf, c.noInters, one(c.ecroot), at("ec.example.com", tsHappy))
+
+  println("sigRsa=${x509VerifySignature(c.leaf, c.inter)}")
+  println("sigPss=${x509VerifySignature(c.pssleaf, c.inter)}")
+  println("sigEd=${x509VerifySignature(c.edleaf, c.edroot)}")
+  println("sigEc=${x509VerifySignature(c.ecleaf, c.ecroot)}")
+  println("sigWrongIssuer=${x509VerifySignature(c.leaf, c.root)}")
+}
+
+// RFC 5280 §4.2: an unrecognized CRITICAL extension is fail-closed (#1450).
+// The two leaves are identical but for the `critical` flag on the same unknown
+// OID, so this pair isolates the flag itself rather than the extension.
+fn criticalExtensionChecks(c: x509Certs, synthRoot: []Certificate): ()! {
+  report(
+    "critUnknown",
+    certOf(hexCritLeaf())?,
+    c.noInters,
+    synthRoot,
+    at("synth.example.com", tsSynth),
+  )
+  report(
+    "critUnknownNonCrit",
+    certOf(hexNoncritLeaf())?,
+    c.noInters,
+    synthRoot,
+    at("synth.example.com", tsSynth),
+  )
+}
+
+// RFC 5280 §4.2.1.10 / §6.1: nameConstraints dNSName subtrees (#1450). The CA
+// permits DNS:example.com and excludes DNS:bad.example.com. `ncBoundary` is
+// the label-boundary trap: notexample.com is a string suffix of the permitted
+// base but NOT inside its subtree, so a naive suffix test would wrongly accept it.
+fn nameConstraintChecks(c: x509Certs, synthRoot: []Certificate, ncCa: []Certificate): ()! {
+  report("ncInside", certOf(hexNcInside())?, ncCa, synthRoot, at("sub.example.com", tsSynth))
+  report("ncBoundary", certOf(hexNcTrap())?, ncCa, synthRoot, at("notexample.com", tsSynth))
+  report("ncExcluded", certOf(hexNcExcl())?, ncCa, synthRoot, at("host.bad.example.com", tsSynth))
+  // A constraint form this verifier cannot evaluate (iPAddress) must be REFUSED,
+  // not skipped — otherwise "unsupported" would silently mean "unconstrained".
+  parseNote("ncUnsupportedForm", hexNcIp())
+}
+
+fn hostnameMatching(c: x509Certs) {
+  println("mExact=${x509MatchHostname(c.leaf, "example.com")}")
+  println("mCase=${x509MatchHostname(c.leaf, "EXAMPLE.COM")}")
+  println("mWww=${x509MatchHostname(c.leaf, "www.example.com")}")
+  println("mEvil=${x509MatchHostname(c.leaf, "evil.com")}")
+  println("mWild=${x509MatchHostname(c.wildleaf, "a.wild.example.com")}")
+  println("mWildBare=${x509MatchHostname(c.wildleaf, "wild.example.com")}")
+  println("mWildDeep=${x509MatchHostname(c.wildleaf, "a.b.wild.example.com")}")
+  println("mIp=${x509MatchHostname(c.ipleaf, "192.0.2.10")}")
+  println("mIpNo=${x509MatchHostname(c.ipleaf, "192.0.2.11")}")
+}
+
 fn run(): ()! {
   let root = certOf(hexRoot())?
   let inter = certOf(hexInter())?
@@ -91,80 +192,21 @@ fn run(): ()! {
   let edleaf = certOf(hexEdleaf())?
   let ecroot = certOf(hexEcroot())?
   let ecleaf = certOf(hexEcleaf())?
-
-  // --- parsed leaf fields ---
-  println("subject=${leaf.subject}")
-  println("issuer=${leaf.issuer}")
-  println("validity=${leaf.notBefore}..${leaf.notAfter}")
-  println("pubKeyAlg=${leaf.pubKeyAlg} isCa=${leaf.isCa} hasPathLen=${leaf.hasPathLen}")
-  println("dns=${leaf.dnsNames[0]},${leaf.dnsNames[1]} hasEku=${leaf.hasExtKeyUsage}")
-  println("interIsCa=${inter.isCa} interPathLen=${inter.maxPathLen}")
-  println("edAlg=${edleaf.pubKeyAlg} ecAlg=${ecleaf.pubKeyAlg} ecCurve=${ecleaf.ecCurveOid}")
-
-  let roots = one(root)
-  let inters = one(inter)
-  let noInters = []Certificate(0)
-
-  // --- happy path + five distinct negatives ---
-  report("happy", leaf, inters, roots, "example.com", tsHappy)
-  report("expired", leaf, inters, roots, "example.com", tsExpired)
-  report("hostname", leaf, inters, roots, "evil.com", tsHappy)
-  report("nonca", leafbad, one(nonca), roots, "bad.example.com", tsHappy)
-  report("missing", leaf, noInters, roots, "example.com", tsHappy)
-
-  // tampered signature: flip a byte in the leaf's signatureValue, re-parse, verify.
-  let der = decodeHex(hexLeaf())?
-  der[len(der) - 1] = der[len(der) - 1] ^ 0x01
-  let tampered = x509Parse(der)?
-  report("tampered", tampered, inters, roots, "example.com", tsHappy)
-
-  // --- signature-dispatch coverage through chain verification ---
-  report("ed", edleaf, noInters, one(edroot), "ed.example.com", tsHappy)
-  report("ec", ecleaf, noInters, one(ecroot), "ec.example.com", tsHappy)
-
-  // --- single-signature dispatch (leaf verified directly under its issuer) ---
-  println("sigRsa=${x509VerifySignature(leaf, inter)}")
-  println("sigPss=${x509VerifySignature(pssleaf, inter)}")
-  println("sigEd=${x509VerifySignature(edleaf, edroot)}")
-  println("sigEc=${x509VerifySignature(ecleaf, ecroot)}")
-  println("sigWrongIssuer=${x509VerifySignature(leaf, root)}")
-
-  // --- RFC 5280 §4.2: an unrecognized CRITICAL extension is fail-closed (#1450) ---
-  // The two leaves are identical but for the `critical` flag on the same unknown
-  // OID, so this pair isolates the flag itself rather than the extension.
+  let c = x509Certs{
+    root: root, inter: inter, leaf: leaf, nonca: nonca, leafbad: leafbad,
+    wildleaf: wildleaf, ipleaf: ipleaf, pssleaf: pssleaf,
+    edroot: edroot, edleaf: edleaf, ecroot: ecroot, ecleaf: ecleaf,
+    roots: one(root), inters: one(inter), noInters: []Certificate(0),
+  }
   let synthRoot = one(certOf(hexSynthRoot())?)
-  report("critUnknown", certOf(hexCritLeaf())?, noInters, synthRoot, "synth.example.com", tsSynth)
-  report(
-    "critUnknownNonCrit",
-    certOf(hexNoncritLeaf())?,
-    noInters,
-    synthRoot,
-    "synth.example.com",
-    tsSynth,
-  )
-
-  // --- RFC 5280 §4.2.1.10 / §6.1: nameConstraints dNSName subtrees (#1450) ---
-  // The CA permits DNS:example.com and excludes DNS:bad.example.com. `ncBoundary`
-  // is the label-boundary trap: notexample.com is a string suffix of the permitted
-  // base but NOT inside its subtree, so a naive suffix test would wrongly accept it.
   let ncCa = one(certOf(hexNcCa())?)
-  report("ncInside", certOf(hexNcInside())?, ncCa, synthRoot, "sub.example.com", tsSynth)
-  report("ncBoundary", certOf(hexNcTrap())?, ncCa, synthRoot, "notexample.com", tsSynth)
-  report("ncExcluded", certOf(hexNcExcl())?, ncCa, synthRoot, "host.bad.example.com", tsSynth)
-  // A constraint form this verifier cannot evaluate (iPAddress) must be REFUSED,
-  // not skipped — otherwise "unsupported" would silently mean "unconstrained".
-  parseNote("ncUnsupportedForm", hexNcIp())
 
-  // --- hostname matching: exact, case-insensitive, wildcard, IPv4 ---
-  println("mExact=${x509MatchHostname(leaf, "example.com")}")
-  println("mCase=${x509MatchHostname(leaf, "EXAMPLE.COM")}")
-  println("mWww=${x509MatchHostname(leaf, "www.example.com")}")
-  println("mEvil=${x509MatchHostname(leaf, "evil.com")}")
-  println("mWild=${x509MatchHostname(wildleaf, "a.wild.example.com")}")
-  println("mWildBare=${x509MatchHostname(wildleaf, "wild.example.com")}")
-  println("mWildDeep=${x509MatchHostname(wildleaf, "a.b.wild.example.com")}")
-  println("mIp=${x509MatchHostname(ipleaf, "192.0.2.10")}")
-  println("mIpNo=${x509MatchHostname(ipleaf, "192.0.2.11")}")
+  printLeafFields(c)
+  happyAndNegatives(c)?
+  signatureDispatch(c)
+  criticalExtensionChecks(c, synthRoot)?
+  nameConstraintChecks(c, synthRoot, ncCa)?
+  hostnameMatching(c)
 }
 
 fn hexRoot(): string {
