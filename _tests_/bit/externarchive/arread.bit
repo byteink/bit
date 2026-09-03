@@ -1,0 +1,275 @@
+// _tests_/bit/externarchive/arread.bit — `ar` archive splitting plus the
+// per-target defined-symbol surface, split out of externarchive.bit (#4262)
+// once that file crossed the repo's 800-line E0200 limit (spec/LINT.md:186).
+// A sibling `.bit` file is the same module (see e.g. compiler/buildextern.bit's
+// header for the same convention), so nothing here needs importing back into
+// externarchive.bit and nothing there changed except which file a symbol
+// lives in.
+//
+// Ported from compiler/archive.bit's parseArchive. Test harnesses under
+// _tests_/bit/ cannot import compiler/** (nothing in the repo does —
+// verified: `grep -rn 'from "\.\./compiler' --include="*.bit" .` is empty),
+// so every _tests_/bit/*.bit gate that needs to read a real object/archive
+// re-implements its own reader (see ../objread's own header for the same
+// reasoning). Handles both formats `./make libbitrt` writes: GNU/System V
+// (ELF targets: a `/` symbol-table member, a `//` long-name table, GNU
+// trailing-`/` short names) and BSD (Mach-O target: `#1/<len>` names carried
+// as a prefix of the member's own data). Both archives' symbol-table members
+// are skipped, same as the compiler's own reader — this file reads every
+// member's real object symbols directly instead.
+
+import { hasPrefix } from "std/strings"
+import { Obj, badObj, readElf, readMacho } from "../objread"
+
+// Power of 10 rule 2: every archive this file reads holds well under a
+// hundred members, but the walk is still capped explicitly.
+const maxArMembers: int = 4096
+
+class ArMember { name: string, data: []u8 }
+
+fn arMagic(): string { return "!<arch>\n" }
+fn arHeaderLen(): int { return 60 }
+
+fn arBytesEq(b: []u8, off: int, s: string): bool {
+  let t = []u8(s)
+  if (off + len(t) > len(b)) {
+    return false
+  }
+  let i = 0
+  while (i < len(t)) {
+    if (b[off + i] != t[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn arTrimEnd(s: string, c: u8): string {
+  let b = []u8(s)
+  let n = len(b)
+  while (n > 0 && b[n - 1] == c) {
+    n = n - 1
+  }
+  return string(b[0:n])
+}
+
+fn arIsAllDigits(s: string): bool {
+  let b = []u8(s)
+  if (len(b) == 0) {
+    return false
+  }
+  let i = 0
+  while (i < len(b)) {
+    if (b[i] < u8(48) || b[i] > u8(57)) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn arParseDecimal(s: string): int {
+  let t = arTrimEnd(s, u8(32))
+  if (!arIsAllDigits(t)) {
+    return -1
+  }
+  let b = []u8(t)
+  let v = 0
+  let i = 0
+  while (i < len(b)) {
+    v = v * 10 + (int(b[i]) - 48)
+    i = i + 1
+  }
+  return v
+}
+
+class ArResolved { name: string, dataStart: int }
+
+// GNU: "/<decimal offset>" — the name lives in the `//` long-name table,
+// terminated by a newline.
+fn arResolveGnuLongName(tag: string, raw: []u8, longNames: []u8): ArResolved {
+  let off = arParseDecimal(string(raw[1:len(raw)]))
+  if (off < 0 || off >= len(longNames)) {
+    panic("externarchive: ${tag}: malformed GNU long-name offset")
+  }
+  let end = off
+  while (end < len(longNames) && longNames[end] != u8(10)) {
+    end = end + 1
+  }
+  if (end >= len(longNames)) {
+    panic("externarchive: ${tag}: unterminated GNU long-name entry")
+  }
+  let nameEnd = end
+  if (nameEnd > off && longNames[nameEnd - 1] == u8(47)) {
+    nameEnd = nameEnd - 1
+  }
+  return ArResolved{ name: string(longNames[off:nameEnd]), dataStart: 0 }
+}
+
+// BSD: "#1/<len>" — the name is the first `len` (null-padded) bytes of the
+// member's own data; the real content follows at data[len..].
+fn arResolveBsdName(tag: string, raw: []u8, data: []u8): ArResolved {
+  let n = arParseDecimal(string(raw[3:len(raw)]))
+  if (n < 0 || n > len(data)) {
+    panic("externarchive: ${tag}: malformed BSD long-name length")
+  }
+  return ArResolved{ name: arTrimEnd(string(data[0:n]), u8(0)), dataStart: n }
+}
+
+// `data` is needed only for the BSD `#1/<len>` case, where the name is a
+// prefix of the member's own data rather than a separate table lookup.
+fn arResolveName(tag: string, rawName: string, longNames: []u8, data: []u8): ArResolved {
+  let raw = []u8(rawName)
+  // GNU: "name/" — a trailing slash marks the end of a short inline name.
+  if (len(raw) > 0 && raw[len(raw) - 1] == u8(47)) {
+    return ArResolved{ name: string(raw[0:len(raw) - 1]), dataStart: 0 }
+  }
+  if (len(raw) > 1 && raw[0] == u8(47) && arIsAllDigits(string(raw[1:len(raw)]))) {
+    return arResolveGnuLongName(tag, raw, longNames)
+  }
+  if (len(raw) > 3 && raw[0] == u8(35) && raw[1] == u8(49) && raw[2] == u8(47)) {
+    return arResolveBsdName(tag, raw, data)
+  }
+  return ArResolved{ name: rawName, dataStart: 0 }
+}
+
+class ArHeaderInfo { rawName: string, size: int }
+
+// The fixed 60-byte header at `pos`: its raw 16-byte name field (still
+// possibly a GNU/BSD long-name reference) and its decimal size field. Split
+// out of `parseArchiveMembers` to keep that function's own branch count
+// under the complexity limit (spec/LINT.md's E0204).
+fn arParseHeader(tag: string, bytes: []u8, pos: int): ArHeaderInfo {
+  if (pos + arHeaderLen() > len(bytes)) {
+    panic("externarchive: ${tag}: truncated archive header")
+  }
+  if (!arBytesEq(bytes, pos + 58, "`\n")) {
+    panic("externarchive: ${tag}: bad archive header terminator")
+  }
+  let rawName = arTrimEnd(string(bytes[pos:pos + 16]), u8(32))
+  let size = arParseDecimal(string(bytes[pos + 48:pos + 58]))
+  if (size < 0) {
+    panic("externarchive: ${tag}: bad archive member size field")
+  }
+  return ArHeaderInfo{ rawName: rawName, size: size }
+}
+
+// A member named "/" (System V symbol table, unused — real objects give
+// ground truth) or "//" (GNU long-name table) is never a real member: the
+// former is simply skipped, the latter becomes the long-name table for
+// every LATER member in the same archive. Returns the (possibly updated)
+// long-name table and whether the caller should skip this member entirely.
+// Split out of `parseArchiveMembers` for the same complexity reason as
+// `arParseHeader` above.
+class ArSpecialResult { skip: bool, longNames: []u8 }
+
+fn arClassifySpecialMember(rawName: string, data: []u8, longNames: []u8): ArSpecialResult {
+  if (rawName == "/") {
+    return ArSpecialResult{ skip: true, longNames: longNames }
+  }
+  if (rawName == "//") {
+    return ArSpecialResult{ skip: true, longNames: data }
+  }
+  return ArSpecialResult{ skip: false, longNames: longNames }
+}
+
+// Parses a whole `.a` file into its real members, skipping the `/` (System V
+// symbol table), `//` (long-name table), and `__.SYMDEF*` (BSD symbol
+// table) special members. Panics on malformed input — these are freshly
+// built local artifacts (`./make libbitrt`'s own output), so a parse
+// failure means either real corruption or a bug in this reader, and either
+// way must be loud rather than silently answering "no members".
+fn parseArchiveMembers(tag: string, bytes: []u8): []ArMember {
+  let magic = arMagic()
+  if (len(bytes) < len([]u8(magic)) || !arBytesEq(bytes, 0, magic)) {
+    panic("externarchive: ${tag}: not an ar archive (bad magic)")
+  }
+  let longNames = []u8(0)
+  let members = []ArMember(0)
+  let pos = len([]u8(magic))
+  let seen = 0
+  while (pos < len(bytes)) {
+    // Archives pad each member to an even offset with one filler byte.
+    if (pos % 2 == 1) {
+      pos = pos + 1
+    }
+    if (pos == len(bytes)) {
+      break
+    }
+    seen = seen + 1
+    if (seen > maxArMembers) {
+      panic("externarchive: ${tag}: over ${maxArMembers} archive members")
+    }
+    let hdr = arParseHeader(tag, bytes, pos)
+    let dataStart = pos + arHeaderLen()
+    if (dataStart + hdr.size > len(bytes)) {
+      panic("externarchive: ${tag}: truncated archive member")
+    }
+    let data = bytes[dataStart:dataStart + hdr.size]
+    pos = dataStart + hdr.size
+
+    let cls = arClassifySpecialMember(hdr.rawName, data, longNames)
+    longNames = cls.longNames
+    if (cls.skip) {
+      continue
+    }
+    let resolved = arResolveName(tag, hdr.rawName, longNames, data)
+    if (hasPrefix(resolved.name, "__.SYMDEF")) {
+      continue // BSD symbol table
+    }
+    members = append(
+      members,
+      ArMember{ name: resolved.name, data: data[resolved.dataStart:len(data)] },
+    )
+  }
+  return members
+}
+
+// ---------------------------------------------------------------------------
+// Per-target archive symbol surface.
+// ---------------------------------------------------------------------------
+
+// Undecorates a Mach-O symbol name back to the Bit-visible spelling (the
+// leading `_` every Mach-O global carries); a no-op on ELF, which carries
+// no such decoration. Mirrors compiler/machosyms.bit's `machoArchiveExterns`.
+fn undecorate(name: string, isMacos: bool): string {
+  if (isMacos && len(name) > 1 && name[0] == u8(95)) {
+    return name[1:len(name)]
+  }
+  return name
+}
+
+// Records every GLOBAL, DEFINED symbol `obj` exports into `out` — the same
+// "defined" test `archiveDefines` (compiler/elflayout.bit) uses for the
+// real E0078 decision: `sym.sect >= 0` (anchors a real atom, not an
+// undefined/absolute/debug entry) AND `sym.isGlobal` (resolves by name at
+// link time).
+fn recordDefinedSymbols(tag: string, obj: Obj, isMacos: bool, out: map<string, bool>) {
+  if (!obj.ok) {
+    panic("externarchive: ${tag}: an object failed to parse")
+  }
+  for sym of obj.syms {
+    if (sym.sect < 0 || !sym.isGlobal || len(sym.name) == 0) {
+      continue
+    }
+    out[undecorate(sym.name, isMacos)] = true
+  }
+}
+
+// Every GLOBAL, DEFINED symbol name any member of `bytes` exports. `isMacos`
+// picks the Mach-O reader over the ELF one.
+fn archiveDefinedSymbols(tag: string, bytes: []u8, isMacos: bool): map<string, bool> {
+  let members = parseArchiveMembers(tag, bytes)
+  let out = map<string, bool>{}
+  for mem of members {
+    let obj = badObj()
+    if (isMacos) {
+      obj = readMacho("${tag}:${mem.name}", mem.data)
+    } else {
+      obj = readElf("${tag}:${mem.name}", mem.data)
+    }
+    recordDefinedSymbols("${tag}:${mem.name}", obj, isMacos, out)
+  }
+  return out
+}
