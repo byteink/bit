@@ -364,8 +364,9 @@ silent force-close would look identical to a clean one. Safe to call from a
 signal handler and safe to call twice (or concurrently): every call after
 the first replays the first call's own outcome rather than repeating any
 side effect. Scoped to `serve`/`listenAndServe`/`listenAndServeOn`; it does
-not reach a `serveTls`/`serveTlsOn` server or the direct `Server.accept()`/
-`Exchange` API.
+not reach `serveTls`/`serveTlsOn` (use `tlsServe`/`serveTlsServerOn` and
+`TlsServer.shutdown` instead, under [TLS (HTTPS)](#tls-https) below) or the
+direct `Server.accept()`/`Exchange` API.
 
 ## Request headers
 
@@ -598,6 +599,75 @@ fn runTlsOnEphemeralPort(certPem: string, keyPem: string): int! {
 fn serveTlsForever(l: TlsListener) {
   serveTlsOn(l, route) catch e {
     print("server failed: ${e.message()}\n")
+  }
+}
+```
+
+### `TlsServer`
+
+A listening TLS server with graceful shutdown - the TLS mirror of `Server`.
+Bind one with `tlsServe`, drive it with `serveTlsServerOn`, and stop it with
+`shutdown()`. `serveTls`/`serveTlsOn` above are unaffected - they keep their
+original `TlsListener`-based signatures and are not reachable through this
+type.
+
+### `tlsServe(host: string, port: int, certPem: string, keyPem: string): TlsServer!`
+
+Binds `host:port` for TLS with certificate chain `certPem` and matching
+private key `keyPem` (both PEM), advertising ALPN `h2` then `http/1.1` - the
+bind half of `serveTls`, split out so the listener it returns can be shut
+down gracefully. `port` `0` lets the kernel choose one; read it back with
+`TlsServer.port()`.
+
+### `TlsServer.port(): int!`
+
+The port the server is bound to.
+
+### `serveTlsServerOn(ts: TlsServer, handler: (Request) => Response): ()!`
+
+The shutdown-capable mirror of `serveTlsOn`: serves HTTPS forever on an
+already-bound `ts`, dispatching each request to `handler` on its own green
+thread, including over HTTP/2 for a client that negotiates `h2` - exactly as
+`serveTlsOn` does. Every accepted connection registers with
+`ts.drain` so `ts.shutdown(timeoutMs)` can stop it. Returns only on an accept
+error.
+
+### `TlsServer.shutdown(timeoutMs: int): ()!`
+
+Stops `ts` accepting new TLS connections and drains requests already in
+flight, then returns - the TLS mirror of `Server.shutdown()`, with the same
+listener-closes-first, idle-connections-cut-immediately,
+active-connections-given-`timeoutMs` sequence and the same error naming how
+many connections were force-closed. An HTTP/2 connection carrying an
+in-flight stream is sent `GOAWAY` first, so its peer opens no further stream
+on it while the current one finishes; a connection with no stream yet is
+force-closed immediately, same as an idle HTTP/1.1 connection. Safe to call
+from a signal handler and safe to call twice (or concurrently).
+
+```bit
+import { tlsServe, serveTlsServerOn, ok, Request, Response, TlsServer } from "std/http"
+
+fn route(req: Request): Response {
+  return ok("ok")
+}
+
+fn runTlsWithShutdown(certPem: string, keyPem: string): TlsServer! {
+  let ts = tlsServe("127.0.0.1", 0, certPem, keyPem)?
+  spawn serveTlsForeverOn(ts)
+  return ts
+}
+
+fn serveTlsForeverOn(ts: TlsServer) {
+  serveTlsServerOn(ts, route) catch e {
+    print("server failed: ${e.message()}\n")
+  }
+}
+
+// Elsewhere, e.g. a signal handler: stop within 5s, force-closing anything
+// still running past that.
+fn stop(ts: TlsServer) {
+  ts.shutdown(5000) catch e {
+    print("shutdown: ${e.message()}\n")
   }
 }
 ```

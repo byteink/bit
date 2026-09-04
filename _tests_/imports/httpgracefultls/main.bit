@@ -1,0 +1,267 @@
+// std/http graceful shutdown for TLS/h2 servers (#4314): `TlsServer.shutdown`
+// closes the gap `_tests_/imports/httpgracefulshutdown` (plain HTTP) and
+// `httpgracefulh2` (the h2 GOAWAY mechanism, standalone, no TLS) left open —
+// `serveTls`/`serveTlsOn` had no way to stop other than killing the process.
+// `tlsServe`/`serveTlsServerOn` are the shutdown-capable mirror
+// (stdlib/http/server.bit), and this is a REAL running program, not reasoning
+// about the design: a live TLS server, clients holding requests open across the
+// shutdown call, and a raw socket/h2 connection proving what actually happened
+// on the wire — including GOAWAY, observed by a real h2 client refusing a
+// further stream locally.
+//
+// The certificate chain + RSA key are the same throwaway test PKI as
+// `httpsclient`/`http2e2e` (leaf SAN: localhost, example.com), signed by the
+// test root CA.
+//
+// Exact elapsed milliseconds are not printed — this repo's dev machines run
+// several concurrent agents — only that a fast path finishes in a small
+// fraction of its timeout budget, the same style `httpgracefulshutdown`
+// already uses.
+import { tlsServe, serveTlsServerOn, ok, getTls, Request, Response, TlsServer } from "std/http"
+import { connect, newTransport, defaultConfig, newRequest, Transport, Conn as H2Conn } from "std/http2"
+import {
+  dial as tlsDial, dialDeadline as tlsDialDeadline, newTlsConfig, newTrustStore, TlsConfig, TlsConn,
+} from "std/tls"
+import { dial } from "std/net"
+import { decodeHex, pemEncode } from "std/crypto"
+import { sleep, Millisecond, monotonic, since } from "std/time"
+import { indexOf } from "std/strings"
+
+const caHex: string = "308203343082021ca00302010202147a41595b201213a150211bd80e3675b37dca46b1300d06092a864886f70d01010b050030323119301706035504030c10426974205465737420526f6f7420434131153013060355040a0c0c426974205465737420504b49301e170d3236303731313131343535385a170d3336303730383131343535385a30323119301706035504030c10426974205465737420526f6f7420434131153013060355040a0c0c426974205465737420504b4930820122300d06092a864886f70d01010105000382010f003082010a028201010098f8ba065685597f71734c9b91a2776948f635bb81fe386746877777af0a4b0393bbf34f7a6119438154454faab68f647d782771af85495d063bae956ab80e81a6d1d7b25a67d4e34f2c2702a36e56aebdcf53c6b63a5ac5279c7c5a655c9f21ce2937ed8c097003af0ac87edac572a6fe169bb25c4fc0030513e0702f1a42c7274f294dd0e1f625310b21ca28a42062bf03b3fc7a27237ae4baf4511f8015a221dc53b2462facfb403e928338096e617c344e9084ec2070594db0541f88beea9d643d8e6a7bf58047ae3e81fc2745344c44ea739918fe3f976f9ff79a64beb947ea65a83e7c63250064de1f38a59e48beef30c135d96aebe07b2f7bb27c9e730203010001a3423040300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106301d0603551d0e04160414df41e90ebf24804aaa0ef33e59374d14c3d17adb300d06092a864886f70d01010b0500038201010054d76a48852a9d62ba2a670d689bafcba37d3f7d3bc904fd867a494dba087bc5b846d215ab0450512d846f341e40808a003f88496e0fd4d59924f422af7c2604cbe6157782f71f45b029cdced03a7ecd1790abc3d5d832316596df9bbe6b893c610ae171feda2b3c67827158f3a082c81ce6b4ab6b74fa35a2d85e0015b447b0ed6425e9e72d82b1a0ba631ce3fc9b2f35a40dc5317b4ca74cd8b43ff0d086a55e9dcd6b727ac7478678536568352e4bcae334b2e1d72518cbacd37c9062073bc9e937373b2202a9c1782b485071257eddc7af78a1c5503559fc2f1a6e0e39625aa85ccf90f881318f55c3fc0b9e05440aecb12220ddf921f961ebb7580aff6b"
+const leafHex: string = "308203833082026ba003020102021414c7140ea3acd77bf06dc5820f6a01a116e5187f300d06092a864886f70d01010b050030323119301706035504030c10426974205465737420526f6f7420434131153013060355040a0c0c426974205465737420504b49301e170d3236303731313131343535385a170d3336303730383131343535385a302c3112301006035504030c096c6f63616c686f737431163014060355040a0c0d4269742054657374204c65616630820122300d06092a864886f70d01010105000382010f003082010a0282010100dd84b94dc3c7f6812fd9cf5510d2bb39a591054abdb85ef809d1d2353165b98a73a3103c7a98e7abb1b93cbe3d768c827b054697ab80cb36896f3bf94c5e1cbb115d09948f063126d6b0696679630313b5edc386fb58c8b40210418821f7d6ab8f7c2cb313b78b039d27c6fb07131434d7fa4a1513881f53e7cdba9b9055341300085ba30a4ebcd69367d088b6eda97b62df743ce343050cac87d12462dc5b05f419e5d384098cb3ef1c17b41b276473ecd16dbb0aac68d2330cd9312cb99b1b4e0ff671fc745726abf76d0eddbc49179188a00fb5d4d72b3bcea0fd14f8e97ce036631e55516f653faaec62baad58bc09460749750b23e1fa4bd6be1033d45f0203010001a3819630819330090603551d1304023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b0601050507030130210603551d11041a301882096c6f63616c686f7374820b6578616d706c652e636f6d301d0603551d0e04160414420e26d56f5890db5c5af8acd12d8156b58b91d8301f0603551d23041830168014df41e90ebf24804aaa0ef33e59374d14c3d17adb300d06092a864886f70d01010b05000382010100047da02b5b77beaa777d0efcc2bba1e46bc92714e7a75385f58af99f75441123a372d565e5009b472ba7f76bc7be854b968a04687e6f6840b5fa0b830aeadee63f8795cf675f6cb8bd5226205f0aedf3465ed578893627939b390f09bd33d34189ab61f064b0fe566bdd5cb9e5b78cb638fb2540eaee946a77fa780342643c10584b9b0f87d9001751bb25e6a3ee4a03a971160eb24ae80d2ed015d348eefb8e55444d7d05a7fe04e069a26bcaab1ca97ad82d9e25201f7bc81fec23143a9af66572595aef86aa1f34a57584cc7ef4a5e3e2f4ffd543b776d232dd37a00ff272c13f6dfe3fc9f2a472a2d7c6738399a11b0417e004874baf20405fba9cba214b"
+const keyHex: string = "308204be020100300d06092a864886f70d0101010500048204a8308204a40201000282010100dd84b94dc3c7f6812fd9cf5510d2bb39a591054abdb85ef809d1d2353165b98a73a3103c7a98e7abb1b93cbe3d768c827b054697ab80cb36896f3bf94c5e1cbb115d09948f063126d6b0696679630313b5edc386fb58c8b40210418821f7d6ab8f7c2cb313b78b039d27c6fb07131434d7fa4a1513881f53e7cdba9b9055341300085ba30a4ebcd69367d088b6eda97b62df743ce343050cac87d12462dc5b05f419e5d384098cb3ef1c17b41b276473ecd16dbb0aac68d2330cd9312cb99b1b4e0ff671fc745726abf76d0eddbc49179188a00fb5d4d72b3bcea0fd14f8e97ce036631e55516f653faaec62baad58bc09460749750b23e1fa4bd6be1033d45f02030100010282010053f3b89cb9bdbf74ff730f4a2069950e486ab93435c9b9a84c646a43c198596498e5ac42177e7a928df4f389efd64d7327f77c64ffd8fc6b0b540e4931819b66e4323beec2f3a84e1d605759c0585f72a968d649025a081a7c8bb7a245a95d80c08ce18deec3895a51c5a0fa43189e785680237270680ee3683f06616da674e8a800b2f02407bdb4387b9327dcd25e4b56494b53d3200b747c7b9b9a6c3743d32cf8db1c054d53d8f77f390ea1eb18b0117b2030a5a814b126ba7f9f8f8fa09a47764c9c1504d29dc150e8f9a429ca224fc01bd058dc96f834b4abb8ddec9b683294ff497e7a12c1bb781691a4f8c016c717c1df670f54170f35fa6b6b2b93e102818100f03148423002e1af8bc190ef471c0e8c034d384eee72a1f248024b376bf6a9f5fa4f4c456842555bdba25d9a084064c47ff309a743f10ac601949d974040fde3e6d3aa26ecb879da1ebae9d7a5ea7a56f1c93a865ceba4142c76e61818e4701337781b8d7b40107b74e778baec4de7e18eefd5654253df8dcd72060ab16b1c6102818100ec18d31b05ed52b2d3af035b09d96aae44b314d1826da682b1e7d09ec06d902db557a27f6961912a9e6183e8beabd493159e351ef4b03e16a140acab1bd5c30c98ff352d03e70367377315c929e692ba8601ba04ac81a84076197ca27a2fb3b21626684671625862c1fd2a5837113478382bab281de3626bd642ea1136eaa8bf0281804cd3568b6513e6dfe151be6bea50bd0e6797f164bdbc08b497f7b3db3c3b1f4dc00c5116fa2c0d655e30e6c377d430e6f10de98e889ab69972b3f85c027f4735f804c7adbf9599d3fc74488b635446613ce0e2494bbb4b35f0aaef19d20c6f14966f6250b4955f303dca33c18607bd1d563cbc02b15e6668d2c79fcb17c86cc1028181008e0488c81292a552489f5807652f514aaeac82735c5f94efbd10529f8be4dbfb82bfca519614487c38753421c6c019c8b81248a5ec4e2faaf128b434e1337e768f79c484e57a0ac405c8c66c11364f40bfe73dfc1dc08872ee177aaf498c742d45c1a8abe6fc5f6a58826efc4d739dfa4adf89bf41eb4b82ce89c5bec127fa8502818100c51caa1667cb86c3cf5dc084bda1a0a508b3c8929eb4ec4733c5b7cea3f905df22ef4f9e851c8c742f162e8f660efee8993e71d9c658ceea61ee4ee7a146ab1c6201cc892537cacd1df3e4a5169c639f6c8778e76b067ac4cc28471ecb2694550e85b19c202217ce4347477a06baf3de929aa1deed6202fc3b73eddbf541ffc4"
+
+fn hx(s: string): []byte {
+  return decodeHex(s) catch _ {
+    return []byte(0)
+  }
+}
+fn pemOf(label: string, h: string): string { return pemEncode(label, hx(h)) }
+
+fn report(tag: string, passed: bool) {
+  if (passed) {
+    println(tag + " PASS")
+    return
+  }
+  println(tag + " FAIL")
+}
+
+fn certPem(): string { return pemOf("CERTIFICATE", leafHex) }
+fn keyPem(): string { return pemOf("PRIVATE KEY", keyHex) }
+
+fn baseCfg(): TlsConfig! {
+  let cfg = newTlsConfig(newTrustStore(pemOf("CERTIFICATE", caHex))?)
+  cfg.serverName = "localhost"
+  cfg.nowUnix = 1800000000
+  return cfg
+}
+
+fn h1Cfg(): TlsConfig! {
+  let cfg = baseCfg()?
+  cfg.alpn = ["http/1.1"]
+  return cfg
+}
+
+fn h2Cfg(): TlsConfig! {
+  let cfg = baseCfg()?
+  cfg.alpn = ["h2"]
+  return cfg
+}
+
+// A handler that signals `startedCh` the instant it is invoked (proof the
+// request genuinely reached it, not a guessed delay), then sleeps `sleepMs`
+// before answering — the in-flight work `shutdown` must protect.
+fn slowHandler(startedCh: chan<bool>, sleepMs: int): (Request) => Response {
+  return (req) => {
+    startedCh <- true
+    sleep(sleepMs * Millisecond)
+    return ok("slow-done")
+  }
+}
+
+fn quietHandler(req: Request): Response {
+  return ok("quiet")
+}
+
+fn runServer(ts: TlsServer, handler: (Request) => Response) {
+  serveTlsServerOn(ts, handler) catch _ {
+    return
+  }
+}
+
+// The result of a `shutdown` call: its error message ("" for none) and how
+// long it took, mirroring `httpgracefulshutdown`'s own helper.
+class shutdownResult { msg: string, elapsedMs: int }
+
+fn doTlsShutdown(ts: TlsServer, timeoutMs: int): shutdownResult {
+  let t0 = monotonic()
+  let msg = ""
+  ts.shutdown(timeoutMs) catch e {
+    msg = e.message()
+  }
+  return shutdownResult{ msg: msg, elapsedMs: since(t0) / Millisecond }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 1: HTTP/1.1-over-TLS, in-flight request completes before the
+// timeout — the same drain `Server.shutdown()` proves, now reached through
+// `TlsServer`.
+// ---------------------------------------------------------------------------
+
+class getResult { status: int, body: string }
+
+fn doGetTls(port: int, cfg: TlsConfig, resultCh: chan<getResult>) {
+  let r = getTls("https://127.0.0.1:${port}/", cfg) catch _ {
+    resultCh <- getResult{ status: 0, body: "" }
+    return
+  }
+  resultCh <- getResult{ status: r.status, body: r.body }
+}
+
+fn scenarioTlsCompletesInTime(): ()! {
+  let cfg = h1Cfg()?
+  let ts = tlsServe("127.0.0.1", 0, certPem(), keyPem())?
+  let port = ts.port()?
+  let startedCh = chan<bool>(1)
+  spawn runServer(ts, slowHandler(startedCh, 150))
+  let resultCh = chan<getResult>(1)
+  spawn doGetTls(port, cfg, resultCh)
+  <- startedCh
+
+  let first = doTlsShutdown(ts, 5000)
+  report("tls-intime-shutdown-no-error", len(first.msg) == 0)
+
+  let res = <- resultCh
+  report("tls-intime-client-got-full-response", res.status == 200 && res.body == "slow-done")
+
+  let second = doTlsShutdown(ts, 5000)
+  report("tls-intime-second-shutdown-no-error", len(second.msg) == 0)
+  report("tls-intime-second-shutdown-fast", second.elapsedMs < 500)
+
+  dial("127.0.0.1", port) catch _ {
+    report("tls-intime-new-connection-refused", true)
+    return
+  }
+  report("tls-intime-new-connection-refused", false)
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 2: an idle HTTP/1.1-over-TLS connection — handshake done, no
+// request sent — is force-closed right away, not held for the timeout.
+// ---------------------------------------------------------------------------
+
+fn scenarioTlsIdleClosedImmediately(): ()! {
+  let cfg = h1Cfg()?
+  let ts = tlsServe("127.0.0.1", 0, certPem(), keyPem())?
+  let port = ts.port()?
+  spawn runServer(ts, quietHandler)
+
+  let conn = tlsDialDeadline("127.0.0.1", port, cfg, monotonic().ns + 5000 * Millisecond)?
+  // Give the accept loop a moment to register the connection before shutdown
+  // runs, so this tests "idle and already registered", not a race with
+  // accept() itself.
+  sleep(50 * Millisecond)
+
+  let out = doTlsShutdown(ts, 60000)
+  report("tls-idle-shutdown-no-error", len(out.msg) == 0)
+  report("tls-idle-shutdown-fast", out.elapsedMs < 5000)
+
+  let readBack = conn.read(16) catch _ {
+    report("tls-idle-conn-force-closed", true)
+    return
+  }
+  // Empty AND not a deadline timeout — a genuine force-close, not this
+  // connection's own 5s dial deadline expiring.
+  report("tls-idle-conn-force-closed", len(readBack) == 0 && !conn.readTimedOut())
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 3: an in-flight h2 stream — `shutdown` sends GOAWAY (`H2Conn.close()`)
+// while it is running, the client observes it (a further stream is refused
+// LOCALLY, the same proof `httpgracefulh2` uses), the in-flight stream still
+// gets its real response, and `shutdown` returns once the connection closes —
+// well before its timeout budget.
+// ---------------------------------------------------------------------------
+
+fn h2transport(conn: TlsConn): Transport {
+  return newTransport(
+    (n) => {
+      let b = conn.read(n) catch _ {
+        return []byte(0)
+      }
+      return b
+    },
+    (b) => {
+      h2writeConn(conn, b)
+    },
+    () => {
+      conn.close()
+    },
+  )
+}
+
+fn h2writeConn(conn: TlsConn, b: []byte) {
+  conn.write(b) catch _ {
+    return
+  }
+}
+
+class h2Result { status: int, body: string, goawayRefused: bool }
+
+// Round-trip the in-flight stream, then attempt a SECOND stream on the same
+// connection — refused locally, with no wire round trip, iff GOAWAY was
+// genuinely received — and close the connection so the server's transport
+// observes EOF and `shutdown` can return.
+fn h2ClientFlow(conn: TlsConn, cc: H2Conn, resultCh: chan<h2Result>) {
+  let res1 = cc.roundTrip(newRequest("GET", "127.0.0.1", "/")) catch _ {
+    conn.close()
+    resultCh <- h2Result{ status: 0, body: "", goawayRefused: false }
+    return
+  }
+  let status = res1.status
+  let body = string(res1.body)
+
+  let refused = false
+  let _ = cc.roundTrip(newRequest("GET", "127.0.0.1", "/again")) catch e {
+    refused = indexOf(e.message(), "closing") >= 0
+    conn.close()
+    resultCh <- h2Result{ status: status, body: body, goawayRefused: refused }
+    return
+  }
+  conn.close()
+  resultCh <- h2Result{ status: status, body: body, goawayRefused: false }
+}
+
+fn scenarioH2GoawayThenDrain(): ()! {
+  let cfg = h2Cfg()?
+  let ts = tlsServe("127.0.0.1", 0, certPem(), keyPem())?
+  let port = ts.port()?
+  let startedCh = chan<bool>(1)
+  spawn runServer(ts, slowHandler(startedCh, 150))
+
+  let conn = tlsDial("127.0.0.1", port, cfg)?
+  let cc = connect(h2transport(conn), defaultConfig(), 0)?
+  let resultCh = chan<h2Result>(1)
+  spawn h2ClientFlow(conn, cc, resultCh)
+  <- startedCh
+
+  let out = doTlsShutdown(ts, 5000)
+  report("h2-shutdown-no-error", len(out.msg) == 0)
+  report("h2-shutdown-fast", out.elapsedMs < 3000)
+
+  let cres = <- resultCh
+  report("h2-inflight-stream-completed", cres.status == 200 && cres.body == "slow-done")
+  report("h2-goaway-observed-before-close", cres.goawayRefused)
+}
+
+fn run(): ()! {
+  scenarioTlsCompletesInTime()?
+  scenarioTlsIdleClosedImmediately()?
+  scenarioH2GoawayThenDrain()?
+}
+
+fn main() {
+  run() catch e {
+    println("failed: ${e.message()}")
+  }
+}
