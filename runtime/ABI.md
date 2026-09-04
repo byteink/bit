@@ -2390,6 +2390,7 @@ bit_rt_fs_truncate(fd, size: i64) -> i64        // set fd's length; 0, or -1 (#4
 bit_rt_fs_size(fd)                -> i64        // fd's length in bytes, or -1 (#4016)
 bit_rt_fs_lock(fd, exclusive: bool, blocking: bool) -> i64  // whole-file advisory lock; 0/-1/-2 (#4014)
 bit_rt_fs_unlock(fd)              -> i64        // release; 0, or -2 (#4014)
+bit_rt_fs_sync_dir_w(words, n)    -> i64        // fsync the directory itself; 0, or -1; windows always 0 (#4017)
 bit_rt_fs_cwd()                   -> string     // cwd, or "" on failure (#3501)
 bit_rt_fs_close(fd)               -> i64        // always 0
 bit_rt_fs_exists(path)            -> bool
@@ -2569,6 +2570,41 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   no consumer. Pass 2 (`File.lock()`/`tryLock()`/`lockShared()`/
   `tryLockShared()`/`unlock()` in `stdlib/fs/fs.bit`, #4296) is a follow-up
   ticket, gated on a release containing this commit and a stage0 repin to it.
+- `fs_sync_dir_w` (#4017) fsyncs the DIRECTORY named by the `n` path bytes at
+  `words`, not a file inside it — durability for the directory ENTRY a
+  newly created file needs, not for that file's contents. `fs_sync`ing a
+  freshly written file only guarantees its own blocks reach disk; on ext4
+  and several other filesystems the directory entry that gives the file its
+  name is separate metadata and is not guaranteed durable until the
+  containing directory is itself fsynced — SQLite fsyncs its database's
+  containing directory after creating the journal file for exactly this
+  reason. Packed-bytes `(words, n)`, like `fs_open_rw_w`/`fs_is_symlink_w`/
+  `fs_stat_w`/`fs_lstat_w` above — the `_w` shape every path-taking primitive
+  with no compiler-builtin call form uses, since §11.7 admits no `string`
+  across a plain `extern fn` boundary and this one has no reason to earn a
+  new compiler builtin the way `fs_open`/`fs_read`/… have. Darwin and Linux
+  both open the directory read-only (`open(O_RDONLY)` succeeds on a
+  directory on both platforms, the same fact `fs_is_dir`'s probe already
+  relies on) and reuse `fs_sync`'s own provider on the resulting fd —
+  Darwin's `F_FULLFSYNC`/`ENOTSUP`-fallback `fcntl`, Linux's raw `fsync(2)`
+  syscall — since a directory fd answers the identical call as a regular
+  file's. **Windows is a documented successful no-op — no path validation,
+  no handle opened, no syscall at all** — NTFS journals directory-entry
+  creation as part of its own metadata transaction log (`$LogFile`), so an
+  entry NTFS has already reported as created is already durably ordered with
+  respect to the file; there is no Win32 call to make here and none is
+  needed. A caller must not read the no-op as this call being a silent
+  failure on Windows: it is a genuine, documented success. `fs_sync_dir_w`
+  does not validate that the path names a directory rather than a regular
+  file — a regular-file path opens and fsyncs successfully like any other
+  fd, which is why that check belongs to the `stdlib/` caller (mirroring
+  `readDir`'s own `is_dir` guard before it lists), not to this primitive.
+  **No `stdlib/` caller exists yet**, the same `tools/build/` bootstrap
+  cycle the `fs_truncate`/`fs_size` bullet above describes: this landing is
+  pass 1 of 2 (the #3065 pattern), the runtime primitives only, no consumer.
+  Pass 2 (a `syncDir(path)` function in `stdlib/fs/fs.bit`) is a follow-up
+  ticket, gated on a release containing this commit and a stage0 repin to
+  it.
 - `fs_cwd` (#3501) is the only `bit_rt_fs_*` entry point that takes NO
   argument — nothing to encode through `fsPathZ`/`checkedPathW`. Darwin and
   Linux both call `getcwd` (libc on Darwin, the raw syscall on Linux — kernel
