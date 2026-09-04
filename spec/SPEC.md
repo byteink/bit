@@ -1869,11 +1869,22 @@ composite_lit = type_name [ "<" type_args ">" ] "{" [ field_inits ] "}"
               | array_type   "{" [ arguments ] "}"
               | map_type     "{" [ map_entries ] "}" .
 field_inits   = field_init { "," field_init } [ "," ] .
-field_init    = IDENT [ ":" expression ] .       (* keyed; order-independent; bare IDENT is shorthand for IDENT ":" IDENT *)
+field_init    = IDENT [ ( ":" | "=" ) expression ] .       (* keyed; order-independent; bare IDENT is shorthand for IDENT "=" IDENT *)
 map_entries   = map_entry { "," map_entry } [ "," ] .
 map_entry     = expression ":" expression .
 type_args     = type { "," type } .
 ```
+
+`field_init` accepts both `:` and `=` for one release (#3840): `Point{ x: 1.0 }`
+and `Point{ x = 1.0 }` are equivalent, and the two spellings may be freely mixed
+within one literal. **`=` is the target spelling** — `:` means "has type", `=`
+means "gets value", and `:` here is the one inconsistent use of `:` in the
+language. The formatter still emits `:` regardless of which spelling the source
+used; existing source is not rewritten by this release. A later release removes
+the `:` spelling from the grammar and flips the formatter to emit `=`.
+`map_entry` is unaffected and keeps `:` permanently — its left side is a key
+*expression*, not a field name, so the "has type" vs. "gets value" distinction
+does not apply.
 
 A class literal is **always** prefixed by its type name: `Point{ x: 1.0, y: 2.0 }`.
 This is the rule that removes the block-versus-object-literal ambiguity — a bare
@@ -4386,7 +4397,7 @@ composite_lit = type_name [ "<" type { "," type } ">" ] "{" [ field_inits ] "}"
               | array_type "{" [ arguments ] "}"
               | map_type   "{" [ map_entries ] "}" .
 field_inits   = field_init { "," field_init } [ "," ] .
-field_init    = IDENT [ ":" expression ] .
+field_init    = IDENT [ ( ":" | "=" ) expression ] .
 map_entries   = map_entry { "," map_entry } [ "," ] .
 map_entry     = expression ":" expression .
 
