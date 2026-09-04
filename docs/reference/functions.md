@@ -59,6 +59,25 @@ fn callers() {
 }
 ```
 
+## Named arguments
+
+A call may name its arguments instead of relying on position: `name =
+expression`, after any positional arguments. This is only legal for a direct
+call to a named function or method - not through a function value - and each
+parameter may be supplied once, by position or by name. (Spec: §12.11.)
+
+```bit
+fn serve(app: string, port: int, tls: bool) {
+  // ...
+}
+
+fn serveCallers() {
+  serve("web", 3000, true)                    // positional
+  serve(app = "web", port = 3000, tls = true) // fully named
+  serve("web", port = 3000, tls = true)       // positional prefix, then named
+}
+```
+
 ## First-class functions and arrow functions
 
 Functions are values. Arrow functions are concise anonymous functions; their
