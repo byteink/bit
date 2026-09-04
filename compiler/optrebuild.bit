@@ -1,0 +1,303 @@
+// Self-host Stage 2 (#1339): the optimizer's rebuild machinery, split out of
+// opt.bit (#4308) to stay under the 800-line file-size gate.
+//
+// `IrFunc`'s core invariant — instruction index == value id, and each block's
+// instructions are contiguous in emission order — makes deleting an
+// instruction in place illegal, so every pass in opt.bit rebuilds the
+// function through this builder instead of mutating it: `rebuild` walks the
+// old function once (already def-before-use) and `emitTranslated` translates
+// each surviving value through an old-index -> new-id `remap` table via
+// `rebuildBlock`/`rebuildOne`. `RebuildPlan` bundles the per-instruction facts
+// a rebuild consults (constants, liveness, forwarding, block reachability,
+// LICM hoists); `RebuildCtx` is the walk's own working state.
+// Translates a value-id list through `remap`.
+fn trList(remap: []int, olds: []int): []int {
+  let out = []int(0)
+  let i = 0
+  while (i < len(olds)) {
+    out = append(out, remap[olds[i]])
+    i = i + 1
+  }
+  return out
+}
+
+// Emits a constant instruction for an already-known value. `span` is the
+// ORIGINAL instruction this constant replaces (#3282: a fold rewrites the
+// value, not the source position it came from -- see emitTranslated).
+fn emitConst(b: IrBuilder, kv: ConstVal, ty: int, span: Span): int {
+  if (kv.isBool) {
+    let ins = mkInstr(Op.ConstBool, ty)
+    ins.bval = kv.bval
+    ins.span = span
+    return builderEmit(b, ins)
+  }
+  if (kv.isFloat) {
+    let ins = mkInstr(Op.ConstFloat, ty)
+    ins.fval = kv.fval
+    ins.span = span
+    return builderEmit(b, ins)
+  }
+  let ins = mkInstr(Op.ConstInt, ty)
+  ins.ival = kv.ival
+  ins.span = span
+  return builderEmit(b, ins)
+}
+
+// Emits instruction `idx` of `f` into `b`, translating operands through `remap`
+// (old value id -> new) and block targets through `blockMap`. A known value
+// emits the equivalent constant instead of the original op (constant folding); a
+// `br` whose condition is known collapses to a `jump` on the taken edge
+// (dead-branch pruning).
+//
+// #3282's SPAN-ON-REWRITE POLICY, decided here because every optimizer path
+// that rewrites or copies an instruction (fold, prune, DCE's rebuild, AND
+// the inliner's splice -- optinline.bit's spliceCallee/inlineCalls both call
+// this) routes through this one function: every replacement below carries
+// `ins.span`, the span of the instruction it is REPLACING or COPYING, never
+// a fresh one from the new builder's `curSpan` (which is unset here and
+// would read as unknownSpan() if left to builderEmit's own fallback). A
+// spliced callee instruction therefore keeps its ORIGINAL, pre-inlining
+// span rather than being relabeled to the call site -- SPEC S18.6's
+// "innermost frame must report the real leaf file:line" requirement.
+fn emitTranslated(
+  b: IrBuilder, f: IrFunc, known: []ConstVal, remap: []int,
+  blockMap: []int, idx: int,
+) {
+  let ins = f.instrs[idx]
+  let op = ins.op
+  if (known[idx].known) {
+    remap[idx] = emitConst(b, known[idx], ins.ty, ins.span)
+    return
+  }
+  // A terminator carries no result, so it is emitted (never remapped) below.
+  if (op == Op.Jump) {
+    let j = mkInstr(Op.Jump, ins.ty)
+    j.ival = blockMap[ins.ival]
+    j.args = trList(remap, ins.args)
+    j.span = ins.span
+    builderEmit(b, j)
+    return
+  }
+  if (op == Op.Br) {
+    let cond = known[ins.lhs]
+    if (cond.known) {
+      let target = ins.ival2
+      let targs = ins.elseArgs
+      if (cond.bval) {
+        target = ins.ival
+        targs = ins.thenArgs
+      }
+      let j = mkInstr(Op.Jump, ins.ty)
+      j.ival = blockMap[target]
+      j.args = trList(remap, targs)
+      j.span = ins.span
+      builderEmit(b, j)
+      return
+    }
+    let br = mkInstr(Op.Br, ins.ty)
+    br.lhs = remap[ins.lhs]
+    br.ival = blockMap[ins.ival]
+    br.thenArgs = trList(remap, ins.thenArgs)
+    br.ival2 = blockMap[ins.ival2]
+    br.elseArgs = trList(remap, ins.elseArgs)
+    br.span = ins.span
+    builderEmit(b, br)
+    return
+  }
+  // Every other op: copy the record, translating the fields its shape uses.
+  let n = mkInstr(op, ins.ty)
+  n.ival = ins.ival
+  n.ival2 = ins.ival2
+  n.fval = ins.fval
+  n.bval = ins.bval
+  n.sval = ins.sval
+  n.name = ins.name
+  n.offsets = ins.offsets
+  n.span = ins.span
+  n.args = trList(remap, ins.args)
+  if (opUsesLhs(op)) {
+    n.lhs = remap[ins.lhs]
+  }
+  if (opUsesRhs(op)) {
+    n.rhs = remap[ins.rhs]
+  }
+  // `index_set %base[%index] = %value` and `atomic_cmpxchg`'s desired are the
+  // ops whose `ival` holds a VALUE id rather than an immediate, so it needs
+  // translating too.
+  if (op == Op.IndexSet || op == Op.AtomicCmpxchg) {
+    n.ival = remap[ins.ival]
+  }
+  remap[idx] = builderEmit(b, n)
+}
+
+// The per-instruction facts a rebuild consults, in one record so the walk stays
+// inside the parameter limit. `known` is the constant map, `keep` the liveness
+// mask (DCE), `fwd` the store-to-load forwarding map (optstore.bit) and
+// `blockReachable` the dead-block mask. A pass that does not use one of them
+// passes the neutral value — `noConst()` entries, all-true, `noForwarding`,
+// all-true — never a special case inside the rebuild.
+class RebuildPlan {
+  known: []ConstVal,
+  keep: []bool,
+  fwd: []int,
+  blockReachable: []bool,
+  // optloop.bit's hoists: which instructions are emitted in a preheader
+  // instead of where they were written, and which header parameter list each
+  // one joins. `noLicm(len(f.instrs))` is the neutral value.
+  licm: LicmPlan,
+}
+
+// The rebuild's own working state, likewise bundled: `remap` translates an old
+// value id to its new one and `blockMap` an old block id, and both are written
+// as the walk proceeds.
+class RebuildCtx {
+  b: IrBuilder,
+  f: IrFunc,
+  plan: RebuildPlan,
+  remap: []int,
+  blockMap: []int,
+  // `blockMap` read backwards, so `licmExtendEdges` can name the ORIGINAL
+  // block an emitted terminator branches to without re-deciding which arm of a
+  // folded `br` survived.
+  newToOld: []int,
+}
+
+// Block ids in their original emission order (ascending `instsStart`), NOT
+// block-id order: lowering emits a valid linear schedule (an RPO) that the x64
+// linear-scan allocator's interval numbering assumes, and a loop's exit block is
+// ID'd before the body's inner blocks but emitted after them — iterating by id
+// would move it back into the middle of the loop. `instsStart` is unique per
+// block, so the order is deterministic. Insertion sort; the block count is
+// small and is the loop's static bound.
+fn blockEmissionOrder(f: IrFunc): []int {
+  let order = []int(0)
+  let i = 0
+  while (i < len(f.blocks)) {
+    let j = len(order)
+    order = append(order, i)
+    while (j > 0 && f.blocks[order[j - 1]].instsStart > f.blocks[i].instsStart) {
+      order[j] = order[j - 1]
+      order[j - 1] = i
+      j = j - 1
+    }
+    i = i + 1
+  }
+  return order
+}
+
+// Whether instruction `idx` can take another value's id instead of being
+// emitted. The `keep` half is not redundant: today's only forwarding caller
+// keeps everything, but a plan that both forwards and prunes would otherwise
+// hand a load the `remap` slot of an instruction that was never emitted, which
+// reads as value id 0 — a silently wrong value, not a crash. Refusing the
+// forward there just emits the load, which is always correct.
+fn canForward(plan: RebuildPlan, idx: int): bool {
+  return plan.fwd[idx] >= 0 && plan.keep[plan.fwd[idx]]
+}
+
+// Emits one kept block: its params first (always, plus any optloop.bit hoisted
+// onto this block as a loop header), then each instruction the plan keeps.
+// A forwarded instruction emits NOTHING and takes its source's new id, which is
+// what deletes the redundant reload — its source index is always lower than its
+// own and in the same block, so `remap` already holds the answer.
+//
+// A block's LAST instruction is its terminator, and optloop.bit's hoists are
+// emitted immediately before it: a hoisted value must be computed on this
+// block's own path, and the terminator is the edge that carries it into the
+// loop header's parameter list.
+fn rebuildBlock(rc: RebuildCtx, bi: int) {
+  let blk = rc.f.blocks[bi]
+  builderBeginBlock(rc.b, rc.blockMap[bi])
+  let idx = blk.instsStart
+  let paramsEnd = blk.instsStart + blk.paramCount
+  while (idx < paramsEnd) {
+    rc.remap[idx] = builderAddParam(rc.b, rc.f.instrs[idx].ty)
+    idx = idx + 1
+  }
+  licmAddParams(rc, bi)
+  let end = blk.instsStart + blk.instsLen
+  while (idx < end) {
+    if (idx == end - 1) {
+      licmEmitHoisted(rc, bi)
+    }
+    rebuildOne(rc, bi, idx)
+    idx = idx + 1
+  }
+  builderEndBlock(rc.b)
+}
+
+// One instruction of block `bi`. An instruction optloop.bit moved out of this
+// block emits nothing here — its `remap` slot is written by the header's param
+// emission instead, which happens before any block that reads it.
+fn rebuildOne(rc: RebuildCtx, bi: int, idx: int) {
+  if (licmMovedAway(rc.plan.licm, bi, idx)) {
+    return
+  }
+  if (canForward(rc.plan, idx)) {
+    rc.remap[idx] = rc.remap[rc.plan.fwd[idx]]
+    return
+  }
+  if (rc.plan.keep[idx]) {
+    emitTranslated(rc.b, rc.f, rc.plan.known, rc.remap, rc.blockMap, idx)
+    licmExtendEdges(rc)
+  }
+}
+
+// Rebuilds `f`, keeping only blocks marked in `plan.blockReachable` and, within
+// each kept block, only instructions marked in `plan.keep` (block params are
+// always emitted; terminators survive because the liveness sweep always marks
+// them).
+fn rebuild(f: IrFunc, plan: RebuildPlan): IrFunc {
+  let n = len(f.blocks)
+  let blockMap = []int(0)
+  let remap = []int(0)
+  let i = 0
+  while (i < n) {
+    blockMap = append(blockMap, 0)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(f.instrs)) {
+    remap = append(remap, 0)
+    i = i + 1
+  }
+  let order = blockEmissionOrder(f)
+  let b = newBuilder()
+  let newToOld = []int(0)
+  i = 0
+  while (i < n) {
+    newToOld = append(newToOld, 0)
+    i = i + 1
+  }
+  i = 0
+  while (i < n) {
+    if (plan.blockReachable[order[i]]) {
+      blockMap[order[i]] = builderNewBlock(b)
+      newToOld[blockMap[order[i]]] = order[i]
+    }
+    i = i + 1
+  }
+  let rc = RebuildCtx{
+    b: b, f: f, plan: plan, remap: remap, blockMap: blockMap,
+    newToOld: newToOld,
+  }
+  i = 0
+  while (i < n) {
+    if (plan.blockReachable[order[i]]) {
+      rebuildBlock(rc, order[i])
+    }
+    i = i + 1
+  }
+  return IrFunc{
+    name: f.name, paramTypes: f.paramTypes, result: f.result,
+    blocks: b.blocks, instrs: b.instrs, isFallible: f.isFallible,
+    isNaked: f.isNaked, isNosplit: f.isNosplit,
+    // §17.6: carry the module tag across the rebuild. Every pass here builds a
+    // fresh IrFunc, and a field left off a literal zero-fills — so omitting
+    // this would silently mark the function "not mine" and drop it from a
+    // freestanding object. The seed gates the same invariant with a unit test.
+    // §11.9: the pin flag rides the same rebuild and has the same failure mode —
+    // losing it makes a runtime entry point LOCAL and fails the link loudly.
+    inRootModule: f.inRootModule, isPinned: f.isPinned,
+  }
+}
