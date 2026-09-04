@@ -16,6 +16,14 @@
 // Bounded resource allocation after startup (Power of 10 #3): the pool can
 // never exceed `schedMaxWorkers` (32) OS threads, full stop.
 //
+// #4313 adds a SECOND, OPTIONAL, TIGHTER ceiling on top of this one — an
+// explicitly-set `BIT_WORKERS` — checked by `schedGrowArm`/`schedMaybeGrow`
+// before either ever reaches `schedStartWorker`, via the `growCeiling`
+// helper below. It narrows how far growth may go; it never widens
+// `schedMaxWorkers` itself, and `schedStartWorker`'s own check is unchanged
+// and still the final word for any direct caller (`_tests_/stress/
+// schedgrowdarwin`, `schedgrowlinux`) that bypasses this file entirely.
+//
 // ---------------------------------------------------------------------------
 // WHY `schedMaybeGrow` TAKES THE START RECIPE AS PARAMETERS, NOT AS STATE
 // ---------------------------------------------------------------------------
@@ -294,21 +302,16 @@ export @nosplit @symbol("bit_rt_port_sched_grow_observe_backlog") fn schedGrowOb
 // identical shape on every burst of concurrent connections, for the life of
 // the process, not for 150ms.
 //
-// THE OPT-OUT THIS DEFAULT NEEDS DOES NOT EXIST YET. `BIT_WORKERS=<n>` sets
-// only the boot-time floor (`ABI.md` §9): growth "can still raise the pool
-// above 1 under sustained backlog exactly as it would from the default" —
-// confirmed against `../root/<os>/bootworker.bit`, whose `tryGrowPool`/
-// `schedGrowObserveBacklog` calls run unconditionally in the worker loop
-// regardless of how the starting count was obtained. So a deployer who knows
-// their program is channel/lock-dominated (a server, not a batch job) has no
-// way today to pin the pool and disable growth. Making an EXPLICIT
-// `BIT_WORKERS` a hard ceiling on growth, not just a floor, is the missing
-// knob and is filed separately — it is a real policy/code change and this
-// ticket's own constraints forbid making one here.
-//
-// Until that lands, this is the accepted, named cost: any program whose
-// spawn shape crosses `growStreakThreshold`, CPU-bound or not, pays for
-// extra OS threads it may get no benefit from, with no way to opt out.
+// THE OPT-OUT NAMED HERE NOW EXISTS (#4313). `BIT_WORKERS=<n>`, EXPLICITLY
+// set, is now also a hard ceiling on growth, not only the boot-time floor:
+// `schedGrowArm`/`schedMaybeGrow` below refuse to grow the pool past it,
+// through `growCeiling`. The implicit default (unset `BIT_WORKERS`) is
+// unaffected — it still grows freely to `schedMaxWorkers`, which is the
+// control that proves the cap is conditional rather than a blanket disable.
+// So a deployer who knows their program is channel/lock-dominated (a
+// server, not a batch job) can now pin the pool and disable growth; one who
+// does not set `BIT_WORKERS` pays the accepted cost described above exactly
+// as before.
 
 // The platform thread-start recipe `schedMaybeGrow`/`schedStartWorker`/
 // `schedStart` all take verbatim: caller-owned areas sized for at least
@@ -333,11 +336,41 @@ export class WorkerLaunch {
   startFn: (*byte, *byte, *i32) => int,
 }
 
+// ---------------------------------------------------------------------------
+// #4313: AN EXPLICIT `BIT_WORKERS` IS ALSO A HARD CEILING ON GROWTH
+// ---------------------------------------------------------------------------
+//
+// The header above ("THE OPT-OUT THIS DEFAULT NEEDS DOES NOT EXIST YET")
+// named the gap this closes: `BIT_WORKERS=<n>` set only the boot-time floor,
+// so a channel/lock-dominated long-running program (a per-connection server
+// — `stdlib/http/server.bit`, `stdlib/quic/listener.bit`) had no way to keep
+// the pool at `n` once real backlog crossed `growStreakThreshold`. Nothing
+// about the DEFAULT changes: #3740 kept depth-driven growth because no
+// cheap, runtime-visible signal separates a CPU-bound backlog from a
+// channel-bound one, and that reasoning is untouched. What changes is that a
+// deployer who already knows their program's shape now has a real knob.
+//
+// `ceiling` is 0 for "no explicit ceiling" — every existing caller's
+// implicit-default path — and the effective cap used below is then
+// `schedMaxWorkers` exactly as before. A positive `ceiling` above
+// `schedMaxWorkers` is also clamped down to it: `schedMaxWorkers` is the
+// hard, bounded-resource-allocation limit (Power of 10 rule 3) that
+// `schedStartWorker` itself still refuses to cross regardless of what this
+// file decides, so a ceiling wider than that limit is simply the same as
+// none.
+fn growCeiling(ceiling: int): int {
+  if (ceiling > 0 && ceiling < schedMaxWorkers) {
+    return ceiling
+  }
+  return schedMaxWorkers
+}
+
 // The other half: starts at most one extra worker, only when the streak
 // `schedGrowObserve` has been building reached `growStreakThreshold` AND the
-// pool is still below `schedMaxWorkers`. Cannot be `@nosplit` — see the
-// header — so a caller outside `runtime/sched` (boot, or a test standing in
-// for boot) drives it, supplying the same platform thread-start recipe it
+// pool is still below the effective ceiling (`schedMaxWorkers`, or the
+// tighter explicit `BIT_WORKERS` ceiling, #4313). Cannot be `@nosplit` — see
+// the header — so a caller outside `runtime/sched` (boot, or a test standing
+// in for boot) drives it, supplying the same platform thread-start recipe it
 // would give `schedStartWorker` directly.
 //
 // Resets the streak on every call that reaches the threshold, win or lose: a
@@ -345,12 +378,12 @@ export class WorkerLaunch {
 // failed) must not be retried on literally the next call — the next
 // `growStreakThreshold` consecutive non-empty enqueues earn the next
 // attempt, exactly as a fresh streak would after a genuinely idle stretch.
-export fn schedMaybeGrow(s: *i64, launch: WorkerLaunch): bool {
+export fn schedMaybeGrow(s: *i64, launch: WorkerLaunch, ceiling: int): bool {
   if (atomicLoad(s + scGrowStreak) < growStreakThreshold) {
     return false
   }
   atomicStore(s + scGrowStreak, 0)
-  if (atomicLoad(s + scNWorkers) >= schedMaxWorkers) {
+  if (atomicLoad(s + scNWorkers) >= growCeiling(ceiling)) {
     return false
   }
   return schedStartWorker(s, launch)
@@ -428,13 +461,17 @@ export fn schedMaybeGrow(s: *i64, launch: WorkerLaunch): bool {
 // `workerBody` already unpacks its own start argument. Returns a genuine
 // nil `*byte` (address 0, never a live block address) and touches the lock
 // not at all, or only transiently, in every case that is NOT "go start a
-// worker": streak below threshold (lock never taken), pool already at
-// `schedMaxWorkers`, or shutdown already signalled (lock taken and released
+// worker": streak below threshold (lock never taken), pool already at the
+// effective ceiling, or shutdown already signalled (lock taken and released
 // before returning).
+//
+// `ceiling` is #4313's explicit-`BIT_WORKERS` cap, or 0 for "none" — see
+// `growCeiling` above, the same helper `schedMaybeGrow` uses.
 export @symbol("bit_rt_port_sched_grow_arm") fn schedGrowArm(
   s: *i64,
   argArea: *i64,
   doneArea: *i32,
+  ceiling: int,
 ): *byte {
   let bp: *byte = nil
   if (atomicLoad(s + scGrowStreak) < growStreakThreshold) {
@@ -444,7 +481,7 @@ export @symbol("bit_rt_port_sched_grow_arm") fn schedGrowArm(
 
   spinAcquire(lockOf(s, scRegLock))
   let i = atomicLoad(s + scNWorkers)
-  if (i >= schedMaxWorkers || atomicLoad(s + scStopping) != 0) {
+  if (i >= growCeiling(ceiling) || atomicLoad(s + scStopping) != 0) {
     spinRelease(lockOf(s, scRegLock))
     return bp
   }
