@@ -1,0 +1,190 @@
+// Bit standard library — compress module, `deflate`: raw RFC 1951 DEFLATE
+// encoding.
+//
+// FLOOR SCOPE (bitlang-ws/CLAUDE.md's ticket): LZ77 matching (lz77.bit) into
+// the FIXED (static) Huffman tables RFC 1951 §3.2.6 defines (huffman.bit) —
+// no dynamic Huffman tree construction. Encode only; there is no decoder
+// here and none is planned by this ticket.
+//
+// BLOCKING. The input is split into `deflateBlockSize`-byte chunks, each its
+// own independent DEFLATE block (BFINAL set only on the last one) — the
+// property under test is that block-boundary logic runs at all for input
+// larger than one block, and per-block independence keeps the LZ77 window
+// and its hash/prev scratch tables bounded to one block's size rather than
+// growing with the whole input.
+//
+// STORED BLOCKS ARE MANDATORY, PER BLOCK, NOT AN OPTIMIZATION. Every block
+// is tokenized, its fixed-Huffman bit cost estimated (`deflateEstimateBits`),
+// and compared against the stored-block cost computed from the writer's
+// ACTUAL current bit position (so the comparison accounts for whatever
+// partial byte the previous block left behind). Whichever is smaller is what
+// gets written — so truly incompressible input (this ticket's random-bytes
+// case) can never expand by more than a stored block's fixed ~5-byte-per-32KB
+// overhead, never by a percentage of its size.
+
+// One DEFLATE block per this many input bytes — comfortably under a stored
+// block's 65535-byte LEN field, and matches the LZ77 window size so a block
+// is exactly as large as the matcher can usefully search within.
+const deflateBlockSize = 32768
+
+// `level` (already validated to 0..9 by `deflate`) to the match finder's
+// `maxChain` search-effort bound: 0 skips LZ77 entirely (see lz77.bit's
+// literal-only mode), 1..9 scale the number of hash-chain candidates tried
+// per position. Not dynamic Huffman — the floor here is fixed-Huffman only
+// at every level; `level` only trades search effort for ratio within that.
+fn maxChainForLevel(level: int): int {
+  if (level <= 0) {
+    return 0
+  }
+  return level * 16
+}
+
+// What every block in one `deflate` call shares, bundled so
+// `deflateEmitBlock` stays under E0202's max-params=5 (spec/LINT.md): only
+// `start`/`end`/`isLast` actually vary per block.
+class DeflateCtx {
+  bw: BitWriter,
+  src: []u8,
+  maxChain: int,
+}
+
+// Raw DEFLATE-compresses `src` at `level` (0..9, 0 = fastest/least search).
+// Fails only on an out-of-range level; every input, including the empty
+// slice, otherwise produces a valid stream (RFC 1951 requires at least one
+// block even for zero bytes of input).
+export fn deflate(src: []u8, level: int): []u8! {
+  if (level < 0 || level > 9) {
+    fail newError("compress: level must be 0..9, got ${level}")
+  }
+  let bw = newBitWriter(len(src) + 16)
+  let ctx = DeflateCtx{ bw: bw, src: src, maxChain: maxChainForLevel(level) }
+  let n = len(src)
+  // At least one block always — RFC 1951 requires one even for zero bytes
+  // of input — so this is a "run once, then continue while more remains"
+  // loop rather than `while (pos < n)`, which would run zero times for
+  // n == 0 and leave the stream with no blocks at all.
+  let pos = 0
+  let more = true
+  while (more) {
+    let blockEnd = pos + deflateBlockSize
+    if (blockEnd >= n) {
+      blockEnd = n
+      more = false
+    }
+    deflateEmitBlock(ctx, pos, blockEnd, !more)
+    pos = blockEnd
+  }
+  // The final block almost never ends byte-aligned (a fixed-Huffman EOB
+  // code is 7 bits) — `align()` flushes those pending bits into their own
+  // zero-padded byte. Without this the last partial byte of the stream is
+  // silently dropped: `bw.out` only ever grows on a FULL byte
+  // (`writeBits`'s while loop), so up to 7 trailing bits would sit in
+  // `bw.acc` and never reach the returned slice at all.
+  bw.align()
+  return bw.out
+}
+
+// Tokenizes one block and picks stored vs. fixed-Huffman by comparing the
+// two ACTUAL bit costs — never a heuristic ("looks compressible") — so the
+// mandatory stored-block floor is exact, not approximate.
+fn deflateEmitBlock(ctx: DeflateCtx, start: int, end: int, isLast: bool) {
+  let tokens = lz77Tokenize(ctx.src, start, end, ctx.maxChain)
+  let huffBits = deflateEstimateBits(tokens)
+  let storedBits = deflateStoredBits(ctx.bw, end - start)
+  if (huffBits < storedBits) {
+    deflateWriteHuffmanBlock(ctx.bw, tokens, isLast)
+  } else {
+    deflateWriteStoredBlock(ctx.bw, ctx.src, start, end, isLast)
+  }
+}
+
+// The exact bit cost of a stored block if written right now: the 3-bit
+// header, padding to the next byte boundary from the writer's CURRENT
+// pending-bit count, the 4-byte LEN/NLEN, then the raw data.
+fn deflateStoredBits(bw: BitWriter, blockLen: int): int {
+  let padBits = (8 - (bw.nbits + 3) % 8) % 8
+  return 3 + padBits + 32 + blockLen * 8
+}
+
+// The exact bit cost of a fixed-Huffman block for `tokens`: the 3-bit
+// header, one code (+ extra bits, for a match) per token, and the 7-bit
+// end-of-block code every block ends with.
+fn deflateEstimateBits(tokens: TokenList): int {
+  let bits = 3 + fixedLitCodeLen(256) // header + EOB
+  let i = 0
+  let n = len(tokens.kind)
+  while (i < n) {
+    if (tokens.kind[i] == 0) {
+      bits = bits + fixedLitCodeLen(int(tokens.lit[i]))
+    } else {
+      bits = bits + deflateMatchBits(tokens.len[i], tokens.dist[i])
+    }
+    i = i + 1
+  }
+  return bits
+}
+
+fn deflateMatchBits(length: int, dist: int): int {
+  let lsym = lengthSymbolFor(length)
+  let dsym = distSymbolFor(dist)
+  return fixedLitCodeLen(lsym) +
+    lengthExtraTable[lsym - 257] +
+    fixedDistCodeLen(dsym) +
+    distExtraTable[dsym]
+}
+
+fn deflateWriteHuffmanBlock(bw: BitWriter, tokens: TokenList, isLast: bool) {
+  bw.writeBits(deflateFinalBit(isLast), 1)
+  bw.writeBits(1, 2) // BTYPE = 01, fixed Huffman
+  let i = 0
+  let n = len(tokens.kind)
+  while (i < n) {
+    if (tokens.kind[i] == 0) {
+      let sym = int(tokens.lit[i])
+      bw.writeHuffman(fixedLitCode(sym), fixedLitCodeLen(sym))
+    } else {
+      deflateWriteMatch(bw, tokens.len[i], tokens.dist[i])
+    }
+    i = i + 1
+  }
+  bw.writeHuffman(fixedLitCode(256), fixedLitCodeLen(256)) // end-of-block
+}
+
+fn deflateWriteMatch(bw: BitWriter, length: int, dist: int) {
+  let lsym = lengthSymbolFor(length)
+  bw.writeHuffman(fixedLitCode(lsym), fixedLitCodeLen(lsym))
+  let lextra = lengthExtraTable[lsym - 257]
+  if (lextra > 0) {
+    bw.writeBits(u32(length - lengthBaseTable[lsym - 257]), lextra)
+  }
+  let dsym = distSymbolFor(dist)
+  bw.writeHuffman(fixedDistCode(dsym), fixedDistCodeLen(dsym))
+  let dextra = distExtraTable[dsym]
+  if (dextra > 0) {
+    bw.writeBits(u32(dist - distBaseTable[dsym]), dextra)
+  }
+}
+
+fn deflateWriteStoredBlock(bw: BitWriter, src: []u8, start: int, end: int, isLast: bool) {
+  bw.writeBits(deflateFinalBit(isLast), 1)
+  bw.writeBits(0, 2) // BTYPE = 00, stored
+  bw.align()
+  let length = end - start
+  let nlen = ~length & 0xffff
+  bw.writeByte(u8(length & 0xff))
+  bw.writeByte(u8((length >> 8) & 0xff))
+  bw.writeByte(u8(nlen & 0xff))
+  bw.writeByte(u8((nlen >> 8) & 0xff))
+  let i = start
+  while (i < end) {
+    bw.writeByte(src[i])
+    i = i + 1
+  }
+}
+
+fn deflateFinalBit(isLast: bool): u32 {
+  if (isLast) {
+    return 1
+  }
+  return 0
+}

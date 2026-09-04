@@ -1,0 +1,218 @@
+// Bit standard library — compress module, the LZ77 match finder.
+//
+// A hash-chain matcher over 3-byte prefixes (the classic "deflate_fast"
+// shape zlib's lower compression levels use), bounded to `maxChain`
+// candidates per position so the search cost per byte is a fixed constant
+// rather than unbounded — a chain CAN be arbitrarily long on pathological
+// input (every position sharing one hash), and an unbounded walk there
+// would turn one call into an O(n^2) search.
+//
+// Matching is BLOCK-LOCAL: `lz77Tokenize` searches only within
+// `src[start:end)`, resetting the hash table per block (`deflate.bit` calls
+// this once per chunk). This keeps every block independently decodable
+// without a running window across the whole input, and keeps the hash/prev
+// scratch tables sized to one block rather than the whole file.
+//
+// The matcher searches directly against `src` — never a growing output
+// buffer — because a DEFLATE back-reference's distance is measured in the
+// DECOMPRESSED stream, which is exactly `src` here; there is no difference
+// between comparing against the original bytes and comparing against "what
+// the decoder will have already produced by now" (they are the same bytes
+// in the same order), including for an overlapping match (distance <
+// length), which every DEFLATE decoder already handles byte by byte.
+
+const lz77MinMatch = 3
+const lz77MaxMatch = 258
+const lz77WindowSize = 32768
+
+// 2^15 buckets (`hashBits = 15`, spelled out as a literal per this repo's
+// const-initializer convention — see stdlib/crypto/x509.bit's `1 << 5`).
+const lz77HashSize = 32768
+
+// Parallel token stream for one block: `kind[i] == 0` is a literal
+// (`lit[i]` the byte, `len`/`dist` unused at that slot); `kind[i] == 1` is a
+// match (`len`/`dist` used, `lit` unused). Four primitive slices rather than
+// a `[]Token` of boxed structs — each grows with `append`'s amortized
+// doubling and costs no per-token heap object (bitlang-ws/CLAUDE.md's
+// #2448/#3617 land on exactly a class-per-element token list).
+class TokenList {
+  kind: []u8,
+  lit: []u8,
+  len: []int,
+  dist: []int,
+}
+
+fn newTokenList(capacityHint: int): TokenList {
+  return TokenList{
+    kind: []u8(0, capacityHint),
+    lit: []u8(0, capacityHint),
+    len: []int(0, capacityHint),
+    dist: []int(0, capacityHint),
+  }
+}
+
+fn tokenPushLiteral(t: TokenList, b: u8) {
+  t.kind = append(t.kind, 0)
+  t.lit = append(t.lit, b)
+  t.len = append(t.len, 0)
+  t.dist = append(t.dist, 0)
+}
+
+fn tokenPushMatch(t: TokenList, length: int, dist: int) {
+  t.kind = append(t.kind, 1)
+  t.lit = append(t.lit, 0)
+  t.len = append(t.len, length)
+  t.dist = append(t.dist, dist)
+}
+
+// Everything the search shares across every position in one block, bundled
+// so no function below carries more than 3 parameters (spec/LINT.md's
+// E0202, max-params=5) — the same shape `_tests_/bit/allocslope.bit`'s `Ctx`
+// uses. `head`/`prev` are absolute source positions (not block-relative),
+// `-1` meaning "no entry"; `prev` is still indexed by `pos - start` so its
+// size is the block length, not the whole input.
+class Lz77Ctx {
+  src: []u8,
+  start: int,
+  end: int,
+  head: []int,
+  prev: []int,
+  maxChain: int,
+}
+
+// The best match found so far at one position, mutated in place by
+// `lz77FindBestMatch` instead of returned: a `(len, dist)` tuple return
+// would allocate on every one of up to `end - start` calls in the search
+// loop (bitlang-ws/CLAUDE.md: multi-value returns bundle-allocate), where
+// one reused `MatchResult` for the whole block call costs exactly one
+// object regardless of input size.
+class MatchResult {
+  len: int,
+  dist: int,
+}
+
+// Tokenizes `src[start:end)`: `maxChain <= 0` skips the search entirely
+// (every byte becomes a literal token) — the level-0 / "do not spend time
+// matching" mode `deflate.bit` uses to guarantee the stored-block cost
+// comparison always has a defined literal-only alternative to compare
+// against, without paying for a search whose result would be thrown away.
+fn lz77Tokenize(src: []u8, start: int, end: int, maxChain: int): TokenList {
+  if (maxChain <= 0) {
+    return lz77LiteralOnly(src, start, end)
+  }
+  return lz77Search(src, start, end, maxChain)
+}
+
+fn lz77LiteralOnly(src: []u8, start: int, end: int): TokenList {
+  let t = newTokenList(end - start)
+  let i = start
+  while (i < end) {
+    tokenPushLiteral(t, src[i])
+    i = i + 1
+  }
+  return t
+}
+
+fn lz77Search(src: []u8, start: int, end: int, maxChain: int): TokenList {
+  let n = end - start
+  let t = newTokenList(n)
+  let ctx = Lz77Ctx{
+    src: src,
+    start: start,
+    end: end,
+    head: fillNeg1(lz77HashSize),
+    prev: fillNeg1(n),
+    maxChain: maxChain,
+  }
+  let mr = MatchResult{ len: 0, dist: 0 }
+  let i = start
+  while (i < end) {
+    mr.len = 0
+    mr.dist = 0
+    if (i + lz77MinMatch <= end) {
+      lz77FindBestMatch(ctx, i, mr)
+    }
+    if (mr.len >= lz77MinMatch) {
+      lz77InsertRange(ctx, i, mr.len)
+      tokenPushMatch(t, mr.len, mr.dist)
+      i = i + mr.len
+    } else {
+      if (i + lz77MinMatch <= end) {
+        lz77Insert(ctx, i)
+      }
+      tokenPushLiteral(t, src[i])
+      i = i + 1
+    }
+  }
+  return t
+}
+
+// Walks the hash chain at `i`, bounded by `ctx.maxChain` candidates and by
+// the 32KB window, writing the longest match found into `mr` (left at
+// `len: 0` when nothing at least `lz77MinMatch` long is found — the caller
+// checks that, not this function's return, since it has none).
+fn lz77FindBestMatch(ctx: Lz77Ctx, i: int, mr: MatchResult) {
+  let h = hash3(ctx.src, i)
+  let candidate = ctx.head[h]
+  let chain = 0
+  while (candidate >= 0 && chain < ctx.maxChain && i - candidate <= lz77WindowSize) {
+    let mlen = lz77MatchLength(ctx.src, candidate, i, ctx.end)
+    if (mlen > mr.len) {
+      mr.len = mlen
+      mr.dist = i - candidate
+      if (mr.len >= lz77MaxMatch) {
+        return
+      }
+    }
+    candidate = ctx.prev[candidate - ctx.start]
+    chain = chain + 1
+  }
+}
+
+fn lz77Insert(ctx: Lz77Ctx, pos: int) {
+  let h = hash3(ctx.src, pos)
+  ctx.prev[pos - ctx.start] = ctx.head[h]
+  ctx.head[h] = pos
+}
+
+// Inserts every position a just-accepted match covers, so a later position
+// inside it can still be found as a candidate by a subsequent search — capped
+// at the last position with a full 3-byte hash available.
+fn lz77InsertRange(ctx: Lz77Ctx, pos: int, length: int) {
+  let limit = pos + length
+  let maxPos = ctx.end - lz77MinMatch + 1
+  if (limit > maxPos) {
+    limit = maxPos
+  }
+  let p = pos
+  while (p < limit) {
+    lz77Insert(ctx, p)
+    p = p + 1
+  }
+}
+
+fn hash3(src: []u8, i: int): int {
+  return ((int(src[i]) << 10) ^ (int(src[i + 1]) << 5) ^ int(src[i + 2])) & (lz77HashSize - 1)
+}
+
+fn lz77MatchLength(src: []u8, a: int, b: int, limit: int): int {
+  let maxLen = limit - b
+  if (maxLen > lz77MaxMatch) {
+    maxLen = lz77MaxMatch
+  }
+  let k = 0
+  while (k < maxLen && src[a + k] == src[b + k]) {
+    k = k + 1
+  }
+  return k
+}
+
+fn fillNeg1(n: int): []int {
+  let a = []int(n)
+  let i = 0
+  while (i < n) {
+    a[i] = -1
+    i = i + 1
+  }
+  return a
+}
