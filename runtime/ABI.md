@@ -2386,6 +2386,8 @@ bit_rt_fs_pread_w(fd, buf, max, off) -> i64     // positional read; count, or ne
 bit_rt_fs_pwrite_w(fd, buf, n, off)  -> i64     // positional write; count, or negative (#3463)
 bit_rt_fs_open_rw_w(words, n)     -> i64        // O_RDWR|O_CREAT, no O_TRUNC; fd, or -1 (#3533)
 bit_rt_fs_sync(fd)                -> i64        // 0, or -1 (#3462)
+bit_rt_fs_truncate(fd, size: i64) -> i64        // set fd's length; 0, or -1 (#4016)
+bit_rt_fs_size(fd)                -> i64        // fd's length in bytes, or -1 (#4016)
 bit_rt_fs_cwd()                   -> string     // cwd, or "" on failure (#3501)
 bit_rt_fs_close(fd)               -> i64        // always 0
 bit_rt_fs_exists(path)            -> bool
@@ -2488,6 +2490,31 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   primitives only, no consumer. Pass 2 (a `File.sync()` method in
   `stdlib/fs/fs.bit`) is a follow-up ticket, gated on a release containing
   this commit and a stage0 repin to it.
+- `fs_truncate`/`fs_size` (#4016) set and read `fd`'s length. Darwin and
+  Linux call `ftruncate(2)`/`fstat(2)` — Darwin via the bare libc externs,
+  Linux via the raw `ftruncate`/`fstat` syscall numbers, no libc. Windows'
+  `fs_truncate` saves the handle's current position with
+  `SetFilePointerEx(FILE_CURRENT)`, moves it to `size` with
+  `SetFilePointerEx(FILE_BEGIN)`, calls `SetEndOfFile`, then restores the
+  saved position — so on all three platforms `fs_truncate` never moves the
+  fd's own read/write cursor, matching `fs_pread_w`/`fs_pwrite_w`'s
+  cursor-free contract above. `fs_size` uses `GetFileSizeEx` on Windows.
+  Growing does not allocate blocks: the new region reads as zeros and the
+  space is not reserved, so a later write can still fail with `ENOSPC` — a
+  hole, not `fallocate`. Neither call itself flushes; the new length needs
+  `fs_sync` like any other metadata change before it is durable. Both return
+  a negative value on any failure — the OS itself rejects a negative `size`
+  before `fs_truncate`'s own body runs, verified on Darwin and Linux (`-1`,
+  no crash). **No `stdlib/` caller exists yet** — the same `tools/build/`
+  bootstrap cycle #2153's `stat_w`/`lstat_w` bullet below describes:
+  `tools/build/artifacts.bit` imports `std/fs`, which the PINNED stage0
+  compiles against its own frozen `libbitrt.a`, so a `stdlib/fs/fs.bit`
+  reference to either symbol breaks the driver bootstrap with E0078 on every
+  fresh clone until a release ships this commit and the pin moves. This
+  landing is pass 1 of 2 (the #3065 pattern): the runtime primitives only,
+  no consumer. Pass 2 (`File.truncate()`/`File.size()` methods in
+  `stdlib/fs/fs.bit`, #4215) is a follow-up ticket, gated on a release
+  containing this commit and a stage0 repin to it.
 - `fs_cwd` (#3501) is the only `bit_rt_fs_*` entry point that takes NO
   argument — nothing to encode through `fsPathZ`/`checkedPathW`. Darwin and
   Linux both call `getcwd` (libc on Darwin, the raw syscall on Linux — kernel
