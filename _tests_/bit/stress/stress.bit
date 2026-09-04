@@ -318,7 +318,8 @@ fn die(s: string) {
   osExit(1)
 }
 
-fn main() {
+// Resolves BIT_STRESSGATE_ROOT and asserts it looks like the repo root.
+fn resolveRoot(): string {
   let root = trim(osEnv("BIT_STRESSGATE_ROOT"))
   if (len(root) == 0) {
     root = "."
@@ -330,13 +331,28 @@ fn main() {
         "' has no _tests_/stress + stdlib",
     )
   }
+  return root
+}
 
-  // The two debugging knobs, and the asymmetry between them is deliberate.
-  // `BIT_STRESSGATE_ONLY` narrows which programs are EXECUTED; it does not touch
-  // enumeration or the host gate, so BOTH corpus floors still apply under it and
-  // a filtered run cannot hide an empty walk or an inverted host gate.
-  // `BIT_STRESSGATE_DIR` replaces the corpus outright, which the floors are
-  // counting - so that one, and only that one, turns them off and says so.
+// The two debugging knobs plus the partition selector this run was invoked
+// with. `corpus`/`only`/`fixture`/`partial` are `BIT_STRESSGATE_DIR`/`ONLY`,
+// and the asymmetry between them is deliberate: `ONLY` narrows which
+// programs are EXECUTED without touching enumeration or the host gate, so
+// both corpus floors still apply under it; `DIR` replaces the corpus
+// outright, which the floors are counting, so that one alone turns them off
+// and says so. `partition` is `BIT_STRESSGATE_PARTITION` — NOT a debugging
+// knob like the other two: it is how `./make test-stress-exclusive`/
+// `test-stress-batch` (tools/build/gates.bit) split one permanent gate into
+// two, so unlike `only` it must NOT print "NOT A GATE".
+class RunFlags {
+  corpus: string,
+  only: string,
+  fixture: bool,
+  partial: bool,
+  partition: string,
+}
+
+fn resolveFlags(root: string): RunFlags {
   let corpus = trim(osEnv("BIT_STRESSGATE_DIR"))
   let only = trim(osEnv("BIT_STRESSGATE_ONLY"))
   let fixture = len(corpus) > 0
@@ -351,12 +367,6 @@ fn main() {
     say("stress: corpus floors are OFF - BIT_STRESSGATE_DIR replaced the corpus")
   }
 
-  // `BIT_STRESSGATE_PARTITION` is NOT a debugging knob like the two above: it is
-  // how `./make test-stress-exclusive` / `./make test-stress-batch`
-  // (tools/build/gates.bit) split one permanent gate into two, so unlike `only`
-  // it must NOT print "NOT A GATE" or otherwise read as a lesser run. Unset (the
-  // default, and what plain `./make test-stress` uses) runs everything, exactly
-  // as before the split existed.
   let partition = trim(osEnv("BIT_STRESSGATE_PARTITION"))
   if (partition != "" && partition != "exclusive" && partition != "batch") {
     die("BIT_STRESSGATE_PARTITION must be 'exclusive', 'batch', or unset - got '" + partition + "'")
@@ -364,7 +374,13 @@ fn main() {
   if (partition != "") {
     say("stress: partition '" + partition + "' (BIT_STRESSGATE_PARTITION)")
   }
+  return RunFlags{ corpus: corpus, only: only, fixture: fixture, partial: partial, partition: partition }
+}
 
+// Resolves the compiler/runtime/scratch triple and builds the base Ctx,
+// before privateCompiler wraps it (main() does that, since it needs both
+// this Ctx and the original compiler path).
+fn buildBaseCtx(root: string): Ctx {
   let target = hostTarget()
   let compilerSrc = root + "/bit-out/bin/bit"
   let libbitrt = root + "/bit-out/lib/" + targetTriple(target) + "/libbitrt.a"
@@ -380,7 +396,7 @@ fn main() {
     die("cannot create scratch dir " + scratch)
   }
 
-  let cx = Ctx{
+  return Ctx{
     root: root,
     compiler: compilerSrc,
     stdlib: root + "/stdlib",
@@ -389,16 +405,12 @@ fn main() {
     timeoutMs: timeoutMs(),
     target: target,
   }
-  cx = Ctx{
-    root: cx.root,
-    compiler: privateCompiler(cx, compilerSrc),
-    stdlib: cx.stdlib,
-    libbitrt: cx.libbitrt,
-    scratch: cx.scratch,
-    timeoutMs: cx.timeoutMs,
-    target: cx.target,
-  }
+}
 
+// Lists `corpus`, then filters to real, non-excluded subdirectories. Dies if
+// the raw listing exceeds maxPrograms, or (outside a fixture run) if too few
+// real program directories remain.
+fn listCorpusDirs(corpus: string, fixture: bool): []string {
   let names = sortNames(splitNul(fsListDir(corpus)))
   if (len(names) > maxPrograms) {
     die("more than " + num(maxPrograms) + " entries in " + corpus)
@@ -423,21 +435,56 @@ fn main() {
         " - the corpus walk found nothing to run",
     )
   }
+  return dirs
+}
 
-  // Apply the host gate as its OWN pass, and check its floor before a single
-  // program is built. A program that can only run on one OS marks itself:
-  // `darwin-only` is `extern function` (SPEC §11.7) — Bit's ELF output is fully
-  // static with no dynamic symbol table, so an extern symbol has nothing to
-  // resolve against and the compiler rejects it outright — and `linux-only` is
-  // the mirror, for `syscall` (§11.8). Neither compiles elsewhere, so it is a
-  // skip, not a failure.
-  //
-  // Separated from the run loop for two reasons. The floor below is the guard
-  // against an INVERTED gate, and an inverted gate selects exactly the programs
-  // that cannot compile here — so checking it afterwards means sitting through
-  // 19 compile failures to be told the gate is backwards. And `eligible` is
-  // counted before `ONLY` is applied, so a filtered run still enforces it: a
-  // guard a debugging knob can switch off is not a guard.
+class HostGate {
+  eligible: []string,
+  skipped: int,
+}
+
+// The floor above does NOT catch an inverted gate, and finding that out is
+// the reason this check exists. The corpus carries 19 `darwin-only` and 19
+// `linux-only` directories — inverting the comparison SWAPS which 19 are
+// skipped and leaves the runnable total at 59, green, with a skip count that
+// still looks right. Only counting the two marker kinds SEPARATELY breaks
+// that symmetry: on macOS the darwin-only skip count must be zero and the
+// linux-only one must not be, and inverting the gate reverses exactly that.
+fn checkHostGateNotInverted(target: int, fixture: bool, skippedDarwin: int, skippedLinux: int) {
+  let wrongWay = skippedDarwin
+  let rightWay = skippedLinux
+  if (target != targetArm64Macos) {
+    wrongWay = skippedLinux
+    rightWay = skippedDarwin
+  }
+  if (!fixture && (wrongWay != 0 || rightWay < minHostSkips)) {
+    die(
+        "host gate is inverted: skipped " +
+        num(wrongWay) +
+        " programs marked for THIS host and " +
+        num(rightWay) +
+        " marked for the other (expected 0 and at least " +
+        num(minHostSkips) +
+        ")",
+    )
+  }
+}
+
+// Applies the host gate as its OWN pass, and checks its floor before a
+// single program is built. A program that can only run on one OS marks
+// itself: `darwin-only` is `extern function` (SPEC §11.7) — Bit's ELF output
+// is fully static with no dynamic symbol table, so an extern symbol has
+// nothing to resolve against and the compiler rejects it outright — and
+// `linux-only` is the mirror, for `syscall` (§11.8). Neither compiles
+// elsewhere, so it is a skip, not a failure.
+//
+// Separated from the run loop for two reasons. The floor below is the guard
+// against an INVERTED gate, and an inverted gate selects exactly the
+// programs that cannot compile here — so checking it afterwards means
+// sitting through 19 compile failures to be told the gate is backwards. And
+// `eligible` is counted before `ONLY` is applied, so a filtered run still
+// enforces it: a guard a debugging knob can switch off is not a guard.
+fn applyHostGate(dirs: []string, corpus: string, target: int, fixture: bool): HostGate {
   let eligible = []string(0)
   let skippedDarwin = 0
   let skippedLinux = 0
@@ -466,139 +513,131 @@ fn main() {
         num(minRunnable),
     )
   }
-  // The count above does NOT catch an inverted gate, and finding that out is the
-  // reason this check exists. The corpus carries 19 `darwin-only` and 19
-  // `linux-only` directories — inverting the comparison SWAPS which 19 are
-  // skipped and leaves the runnable total at 59, green, with a skip count that
-  // still looks right. Only counting the two marker kinds SEPARATELY breaks that
-  // symmetry: on macOS the darwin-only skip count must be zero and the
-  // linux-only one must not be, and inverting the gate reverses exactly that.
-  let wrongWay = skippedDarwin
-  let rightWay = skippedLinux
-  if (target != targetArm64Macos) {
-    wrongWay = skippedLinux
-    rightWay = skippedDarwin
-  }
-  if (!fixture && (wrongWay != 0 || rightWay < minHostSkips)) {
-    die(
-        "host gate is inverted: skipped " +
-        num(wrongWay) +
-        " programs marked for THIS host and " +
-        num(rightWay) +
-        " marked for the other (expected 0 and at least " +
-        num(minHostSkips) +
-        ")",
-    )
-  }
+  checkHostGateNotInverted(target, fixture, skippedDarwin, skippedLinux)
+  return HostGate{ eligible: eligible, skipped: skipped }
+}
 
+// #2401: a program the (load-scaled) deadline could not judge at all is
+// counted separately from a program that ran and was wrong. `judged` is the
+// corpus-wide denominator this buys - see reportJudged.
+class RunTally {
+  ran: int,
+  failures: int,
+  inconclusive: int,
+  oracled: int,
+  proofs: int,
+}
+
+// The `batch` partition is fanned out through `fanout.bit`'s `runBatch`
+// (#3776): one `gatefanout` batch (stage every program's jobs, ONE outer
+// `osRunBounded` call, grade in order) rather than `checkProgram` one
+// program at a time.
+fn runBatchPartition(cx: Ctx, corpus: string, eligible: []string, only: string): RunTally {
+  let batchList = batchNames(eligible, only)
+  let batch = runBatch(cx, corpus, batchList)
+  return RunTally{
+    ran: batch.ran, failures: batch.failures, inconclusive: batch.inconclusive,
+    oracled: batch.oracled, proofs: batch.proofs,
+  }
+}
+
+// `exclusive` and the plain unpartitioned run take this loop — see
+// fanout.bit's header for why the four timing-sensitive `exclusive`
+// programs cannot share cores with anything else, including each other.
+fn runSerialPartition(cx: Ctx, corpus: string, eligible: []string, only: string, partition: string): RunTally {
   let ran = 0
   let failures = 0
-  // #2401: a program the (load-scaled) deadline could not judge at all is
-  // counted separately from a program that ran and was wrong. `judged` is the
-  // corpus-wide denominator this buys - see the summary at the end of `main`.
   let inconclusive = 0
   let oracled = 0
   let proofs = 0
-
-  // The `batch` partition is fanned out through `fanout.bit`'s `runBatch`
-  // (#3776) instead of this loop: one `gatefanout` batch (stage every
-  // program's jobs, ONE outer `osRunBounded` call, grade in order) rather
-  // than `checkProgram` one program at a time. `exclusive` and the plain
-  // unpartitioned run still take the loop below unchanged — see fanout.bit's
-  // header for why the four timing-sensitive `exclusive` programs cannot
-  // share cores with anything else, including each other.
-  if (partition == "batch") {
-    let batchList = batchNames(eligible, only)
-    let batch = runBatch(cx, corpus, batchList)
-    ran = batch.ran
-    failures = batch.failures
-    inconclusive = batch.inconclusive
-    oracled = batch.oracled
-    proofs = batch.proofs
-  } else {
-    let k = 0
-    while (k < len(eligible)) {
-      let name = eligible[k]
-      k = k + 1
-      if (len(only) > 0 && indexOfAt("," + only + ",", "," + name + ",", 0) < 0) {
-        continue
-      }
-      if (partition == "exclusive" && !isExclusiveProgram(name)) {
-        continue
-      }
-      ran = ran + 1
-      let dir = corpus + "/" + name
-      // Per-program deadline override (see the header and `resolveTimeoutMs`):
-      // an invalid `timeout-s` file fails this one program without touching
-      // any other.
-      let effTimeoutMs = resolveTimeoutMs(cx, dir)
-      if (effTimeoutMs == timeoutSInvalid) {
-        say("stress '" + name + "': bad timeout-s file")
-        failures = failures + 1
-        continue
-      }
-      // Applied as its own `Ctx` copy for just this call - every other field,
-      // and every other program's `cx`, is untouched.
-      let pcx = Ctx{
-        root: cx.root,
-        compiler: cx.compiler,
-        stdlib: cx.stdlib,
-        libbitrt: cx.libbitrt,
-        scratch: cx.scratch,
-        timeoutMs: effTimeoutMs,
-        target: cx.target,
-      }
-      let v = checkProgram(pcx, name, dir)
-      failures = failures + v.failed
-      inconclusive = inconclusive + v.inconclusive
-      if (v.oracled) {
-        oracled = oracled + 1
-      }
-      if (v.proved) {
-        proofs = proofs + 1
-      }
+  let k = 0
+  while (k < len(eligible)) {
+    let name = eligible[k]
+    k = k + 1
+    if (len(only) > 0 && indexOfAt("," + only + ",", "," + name + ",", 0) < 0) {
+      continue
+    }
+    if (partition == "exclusive" && !isExclusiveProgram(name)) {
+      continue
+    }
+    ran = ran + 1
+    let dir = corpus + "/" + name
+    // Per-program deadline override (see the file header and
+    // `resolveTimeoutMs`): an invalid `timeout-s` file fails this one
+    // program without touching any other.
+    let effTimeoutMs = resolveTimeoutMs(cx, dir)
+    if (effTimeoutMs == timeoutSInvalid) {
+      say("stress '" + name + "': bad timeout-s file")
+      failures = failures + 1
+      continue
+    }
+    // Applied as its own `Ctx` copy for just this call - every other field,
+    // and every other program's `cx`, is untouched.
+    let pcx = Ctx{
+      root: cx.root,
+      compiler: cx.compiler,
+      stdlib: cx.stdlib,
+      libbitrt: cx.libbitrt,
+      scratch: cx.scratch,
+      timeoutMs: effTimeoutMs,
+      target: cx.target,
+    }
+    let v = checkProgram(pcx, name, dir)
+    failures = failures + v.failed
+    inconclusive = inconclusive + v.inconclusive
+    if (v.oracled) {
+      oracled = oracled + 1
+    }
+    if (v.proved) {
+      proofs = proofs + 1
     }
   }
+  return RunTally{ ran: ran, failures: failures, inconclusive: inconclusive, oracled: oracled, proofs: proofs }
+}
 
-  // A SPLIT THAT SILENTLY DROPS A PROGRAM IS WORSE THAN NO SPLIT: `batch` is
-  // defined as "not exclusive", so between the two partitions every eligible
-  // name runs exactly once by construction, with no third bucket a typo could
-  // fall into - but a typo in `exclusiveNames()` that matches no real directory
-  // would move a program from `exclusive` to `batch` without failing anything,
-  // which is a real classification bug even though it drops no coverage. This
-  // is what catches THAT: an exact count, like `minRunnable`'s own reasoning,
-  // and skipped only when a debugging knob has already made `ran` mean
-  // something else.
-  if (!partial) {
-    if (partition == "exclusive" && ran != minExclusiveRunnable) {
-      die(
-          "stress: partition 'exclusive' ran " +
-          num(ran) +
-          " programs, expected exactly " +
-          num(minExclusiveRunnable) +
-          " - exclusiveNames() and the corpus have drifted apart",
-      )
-    }
-    if (partition == "batch" && ran != len(eligible) - minExclusiveRunnable) {
-      die(
-          "stress: partition 'batch' ran " +
-          num(ran) +
-          " programs, expected exactly " +
-          num(len(eligible) - minExclusiveRunnable) +
-          " - exclusiveNames() and the corpus have drifted apart",
-      )
-    }
+// A SPLIT THAT SILENTLY DROPS A PROGRAM IS WORSE THAN NO SPLIT: `batch` is
+// defined as "not exclusive", so between the two partitions every eligible
+// name runs exactly once by construction, with no third bucket a typo could
+// fall into - but a typo in `exclusiveNames()` that matches no real directory
+// would move a program from `exclusive` to `batch` without failing anything,
+// which is a real classification bug even though it drops no coverage. This
+// is what catches THAT: an exact count, like `minRunnable`'s own reasoning,
+// and skipped only when a debugging knob has already made `ran` mean
+// something else.
+fn checkPartitionIntegrity(partition: string, partial: bool, ran: int, eligibleCount: int) {
+  if (partial) {
+    return
   }
+  if (partition == "exclusive" && ran != minExclusiveRunnable) {
+    die(
+        "stress: partition 'exclusive' ran " +
+        num(ran) +
+        " programs, expected exactly " +
+        num(minExclusiveRunnable) +
+        " - exclusiveNames() and the corpus have drifted apart",
+    )
+  }
+  if (partition == "batch" && ran != eligibleCount - minExclusiveRunnable) {
+    die(
+        "stress: partition 'batch' ran " +
+        num(ran) +
+        " programs, expected exactly " +
+        num(eligibleCount - minExclusiveRunnable) +
+        " - exclusiveNames() and the corpus have drifted apart",
+    )
+  }
+}
 
-  // THE PLUMBING ASSERTION, and it is the one guard the deleted harness could not
-  // have. `collections != 0` cannot tell `BIT_GC=stress` from the default run
-  // repeated, so if the second wrapper's environment silently stopped arriving
-  // every program would still pass its own oracle while precise rooting was
-  // never exercised. Collecting at every safepoint costs two to five orders of
-  // magnitude, so a majority of the oracled programs must show it. Asserted over
-  // the corpus rather than per program because a clock-paced program legitimately
-  // cannot clear the margin (see `checkProgram`), and asserted as a SHARE rather
-  // than a count so a filtered run enforces it too.
+// THE PLUMBING ASSERTION, and it is the one guard the deleted harness could not
+// have. `collections != 0` cannot tell `BIT_GC=stress` from the default run
+// repeated, so if the second wrapper's environment silently stopped arriving
+// every program would still pass its own oracle while precise rooting was
+// never exercised. Collecting at every safepoint costs two to five orders of
+// magnitude, so a majority of the oracled programs must show it. Asserted over
+// the corpus rather than per program because a clock-paced program legitimately
+// cannot clear the margin (see `checkProgram`), and asserted as a SHARE rather
+// than a count so a filtered run enforces it too. Returns whether it held.
+fn checkPolicyProofs(proofs: int, oracled: int): bool {
   say(
       "stress: policy proofs " +
       num(proofs) +
@@ -613,14 +652,17 @@ fn main() {
     say("  meaningfully more under BIT_GC=stress than under the default policy. That is not a")
     say("  stress pass, it is the default run performed twice: the environment in the second")
     say("  wrapper is not reaching the child.")
-    failures = failures + 1
+    return false
   }
+  return true
+}
 
-  // #2401's denominator, printed on EVERY run, success or failure: a run that
-  // judged nothing must look different from one that judged everything. `ran`
-  // is programs that reached `checkProgram`; `judged` is the ones a verdict was
-  // actually reached for - the two are equal unless the load-scaled deadline
-  // still elapsed somewhere.
+// #2401's denominator, printed on EVERY run, success or failure: a run that
+// judged nothing must look different from one that judged everything. `ran`
+// is programs that reached `checkProgram`; the returned `judged` is the ones
+// a verdict was actually reached for - the two are equal unless the
+// load-scaled deadline still elapsed somewhere.
+fn reportJudged(ran: int, inconclusive: int): int {
   let judged = ran - inconclusive
   say(
       "stress: " +
@@ -648,17 +690,30 @@ fn main() {
     )
     say("  genuine hang - re-run the named program(s) standalone on a quiet host to tell them apart.")
   }
+  return judged
+}
 
-  if (failures != 0 || inconclusive != 0) {
+// The final tallies reportFinalVerdict prints, bundled because it is
+// entirely a reporting function with nothing left to compute.
+class Summary {
+  ran: int,
+  skipped: int,
+  failures: int,
+  inconclusive: int,
+  judged: int,
+}
+
+fn reportFinalVerdict(s: Summary, partial: bool) {
+  if (s.failures != 0 || s.inconclusive != 0) {
     say(
         "stress: FAIL - " +
-        num(ran) +
+        num(s.ran) +
         " programs run, " +
-        num(skipped) +
+        num(s.skipped) +
         " skipped, " +
-        num(failures) +
+        num(s.failures) +
         " failed, " +
-        num(inconclusive) +
+        num(s.inconclusive) +
         " inconclusive",
     )
     osExit(1)
@@ -671,13 +726,54 @@ fn main() {
       "stress: " +
       tag +
       " - " +
-      num(ran) +
+      num(s.ran) +
       " programs run, " +
-      num(skipped) +
+      num(s.skipped) +
       " skipped, " +
-      num(judged) +
+      num(s.judged) +
       "/" +
-      num(ran) +
+      num(s.ran) +
       " judged",
+  )
+}
+
+fn main() {
+  let root = resolveRoot()
+  let flags = resolveFlags(root)
+  let cx0 = buildBaseCtx(root)
+  let cx = Ctx{
+    root: cx0.root,
+    compiler: privateCompiler(cx0, cx0.compiler),
+    stdlib: cx0.stdlib,
+    libbitrt: cx0.libbitrt,
+    scratch: cx0.scratch,
+    timeoutMs: cx0.timeoutMs,
+    target: cx0.target,
+  }
+
+  let dirs = listCorpusDirs(flags.corpus, flags.fixture)
+  let gate = applyHostGate(dirs, flags.corpus, cx.target, flags.fixture)
+
+  let tally = RunTally{ ran: 0, failures: 0, inconclusive: 0, oracled: 0, proofs: 0 }
+  if (flags.partition == "batch") {
+    tally = runBatchPartition(cx, flags.corpus, gate.eligible, flags.only)
+  } else {
+    tally = runSerialPartition(cx, flags.corpus, gate.eligible, flags.only, flags.partition)
+  }
+
+  checkPartitionIntegrity(flags.partition, flags.partial, tally.ran, len(gate.eligible))
+
+  if (!checkPolicyProofs(tally.proofs, tally.oracled)) {
+    tally.failures = tally.failures + 1
+  }
+
+  let judged = reportJudged(tally.ran, tally.inconclusive)
+
+  reportFinalVerdict(
+    Summary{
+      ran: tally.ran, skipped: gate.skipped, failures: tally.failures,
+      inconclusive: tally.inconclusive, judged: judged,
+    },
+    flags.partial,
   )
 }
