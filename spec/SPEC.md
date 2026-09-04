@@ -1840,12 +1840,14 @@ binop        = "*" | "/" | "%" | "<<" | ">>" | "&"
              | "&&" | "||" .
 unary        = ( "!" | "-" | "+" | "~" | "<-" ) unary | postfix .
 postfix      = primary { call | index | slice | member | type_assert | "?" } .
-call         = [ "<" type { "," type } ">" ] "(" [ arguments ] ")" .   (* §12.7 *)
+call         = [ "<" type { "," type } ">" ] "(" [ call_args ] ")" .   (* §12.7, §12.11 *)
 index        = "[" expression "]" .
 slice        = "[" [ expression ] ":" [ expression ] "]" .
 member       = "." ( IDENT | INT_LIT ) .        (* INT_LIT selects a tuple element *)
 type_assert  = "." "(" type ")" .               (* §14.4 *)
-arguments    = arg { "," arg } [ "," ] .
+call_args    = call_arg { "," call_arg } [ "," ] .
+call_arg     = arg | IDENT "=" expression .     (* named, §12.11, #3839 *)
+arguments    = arg { "," arg } [ "," ] .        (* bare slice literal / type-conversion call: no callee to name *)
 arg          = [ "..." ] expression .           (* '...' spreads a slice, §12.4 *)
 
 primary      = literal
@@ -2187,6 +2189,42 @@ tuple value (§12.5) — read-only, like every tuple element. A tuple literal is
 otherwise an ordinary expression and may appear anywhere a value is expected:
 a `let`/`const` initializer, an argument, a slice/array/map element, a
 `return` value, or the right-hand side of a `tuple_pat` destructure (§13.1).
+
+### 12.11 Named Arguments
+
+```
+serve(app, port = 3000, tls = true)
+```
+
+A call argument may be written `name = expression` instead of positionally,
+naming the parameter it fills. **Named arguments come after all positional
+ones** — `f(a = 1, 2)` is a compile error, since there is no rule for which
+parameter the trailing `2` fills. Order among named arguments themselves is
+irrelevant. A parameter may be supplied once: positional-then-named for the
+same parameter, or the same name given twice, is a compile error, and naming
+the variadic parameter (`...xs: T`, §10.3) is a compile error — it takes zero
+or more arguments, so `xs = v` names no single slot. A `...` spread argument
+may not be combined with a named argument in the same call.
+
+**Direct calls only.** A named argument is legal only where the callee is a
+named function or method whose declaration is in scope — resolving `name`
+needs that declaration's own parameter list. A call through a function
+*value* is positional only:
+
+```
+let f = serve
+f(port = 3000)        // error: named arguments need a named callee
+```
+
+`func_type` (§11) is `"(" [ type { "," type } ] ")" "=>" result_type` — types
+only, no parameter names — so there is nothing a name could resolve against.
+
+**Evaluation order.** Arguments evaluate left to right in the order they are
+*written*, exactly like any other argument list; only their *placement* into
+parameter slots follows declared order. `f(b = g(), a = h())` runs `g()`
+before `h()` (written order), then binds `a = h()`'s result and `b = g()`'s
+result to their respective parameters (declared order) — writing the call
+does not reorder the side effects the two argument expressions produce.
 
 ---
 
@@ -4381,11 +4419,13 @@ binop         = "*" | "/" | "%" | "<<" | ">>" | "&"
               | "&&" | "||" .
 unary         = ( "!" | "-" | "+" | "~" | "<-" ) unary | postfix .
 postfix       = primary { call | index | slice | member | type_assert | "?" } .
-call          = [ "<" type { "," type } ">" ] "(" [ arguments ] ")" .   (* §12.7 *)
+call          = [ "<" type { "," type } ">" ] "(" [ call_args ] ")" .   (* §12.7, §12.11 *)
 index         = "[" expression "]" .
 slice         = "[" [ expression ] ":" [ expression ] "]" .
 member        = "." ( IDENT | INT_LIT ) .
 type_assert   = "." "(" type ")" .
+call_args     = call_arg { "," call_arg } [ "," ] .
+call_arg      = arg | IDENT "=" expression .
 arguments     = arg { "," arg } [ "," ] .
 arg           = [ "..." ] expression .
 

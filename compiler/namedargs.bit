@@ -1,0 +1,253 @@
+// compiler/namedargs.bit — named arguments at call sites (SPEC §12.11,
+// #3839): `f(port = 3000)`, after any positional arguments. Sibling of
+// validatecall.bit/validateiface.bit/lowercall.bit: same module, so this
+// needs no imports and no call-site changes.
+//
+// SCOPE: named arguments are validated and lowered here ONLY for a direct
+// call to a CONCRETE (non-generic) top-level free function or `extern fn` —
+// the shape `vCall` (validatecall.bit) already resolves through `funcRefAt`.
+// Every other call shape a `Tag.Call` node can have — a method, a call
+// through a function VALUE, a builtin (`print`, `append`, `len`, ...), a
+// primitive conversion, a class constructor, a generic function, or a
+// type-node "call" (`chan<T>(...)`, `[]T(...)`) — rejects any `Tag.NamedArg`
+// outright (E0128) rather than attempting to resolve it. The ticket's own
+// restriction text names methods as legal too; that is NOT implemented here
+// (a method's checked signature carries parameter TYPES only, never names —
+// `methodSigLookup`'s `TypeKind.Func`, unlike a free function's `Param` node
+// list — so resolving a name against it needs a second, parallel lookup this
+// pass does not have time to build) and is filed as a follow-up rather than
+// silently claimed.
+
+const ecNamedArgUnknown = 124
+const ecNamedArgDuplicate = 125
+const ecPositionalAfterNamed = 126
+const ecNamedArgVariadic = 127
+const ecNamedArgNotDirect = 128
+
+// The index of the first `Tag.NamedArg` in `args`, or `len(args)` if none —
+// the single query every hook point below uses to decide whether a call's
+// argument list needs any of this module's attention at all.
+fn namedArgStart(tree: Tree, args: []int): int {
+  let i = 0
+  while (i < len(args)) {
+    if (getNode(tree, args[i]).tag == Tag.NamedArg) {
+      return i
+    }
+    i = i + 1
+  }
+  return len(args)
+}
+
+// Reports E0128 at every `Tag.NamedArg` in `args` — the call this list
+// belongs to is not a direct call to a named, concrete, free function (SPEC
+// §12.11's DIRECT CALLS ONLY restriction).
+fn vRejectNamedArgs(c: Checker, args: []int) {
+  let i = 0
+  while (i < len(args)) {
+    if (getNode(c.tree, args[i]).tag == Tag.NamedArg) {
+      reportNoHint(
+        c.diags, ecNamedArgNotDirect, vSpan(c, args[i]),
+        "named arguments require a direct call to a named function",
+      )
+    }
+    i = i + 1
+  }
+}
+
+// A `Param`/`ParamRest` node's declared name (kid 0 is the name leaf).
+fn paramNameOf(tree: Tree, source: string, paramNode: int): string {
+  let nm = getNode(tree, kidsOf(tree, paramNode)[0])
+  return source[nm.span.start:nm.span.end]
+}
+
+// `params`'s index whose name is `name`, or -1. `params` is read from
+// `owner`'s tree — a cross-module call reads the exporter's own declaration,
+// exactly as every other per-parameter lookup in this checker does.
+fn paramIndexByName(owner: Checker, params: []int, name: string): int {
+  let i = 0
+  while (i < len(params)) {
+    if (paramNameOf(owner.tree, owner.source, params[i]) == name) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Ordering (SPEC §12.11): every entry from `namedStart` on must be a
+// `Tag.NamedArg` — a positional argument written after a named one is
+// rejected — and a `...` spread may never appear alongside a named argument
+// at all: a spread already claims every remaining position for the variadic
+// slot, leaving no argument-list position a named argument could still fill,
+// so the two forms have nothing to agree on. Checked over the WHOLE list,
+// not just the entries at or after `namedStart`, because a spread BEFORE
+// `namedStart` still makes the call ill-formed here — `vCall`'s own ordinary
+// spread rule never runs for a call that reaches this branch at all. Split
+// out of `vCallNamedArgs` purely to keep ITS OWN complexity from growing
+// (spec/LINT.md E0204, tools/build/complexity-debt.txt); returns true when
+// nothing here was wrong.
+fn vNamedArgOrder(c: Checker, args: []int, namedStart: int): bool {
+  let ok = true
+  let j = 0
+  while (j < len(args)) {
+    let t = getNode(c.tree, args[j]).tag
+    if (t == Tag.ArgSpread) {
+      reportNoHint(
+        c.diags, ecInvalidSpread, vSpan(c, args[j]),
+        "'...' spread cannot be combined with named arguments",
+      )
+      ok = false
+    } else if (j >= namedStart && t != Tag.NamedArg) {
+      reportNoHint(
+        c.diags, ecPositionalAfterNamed, vSpan(c, args[j]),
+        "positional argument after a named argument",
+      )
+      ok = false
+    }
+    j = j + 1
+  }
+  return ok
+}
+
+// Resolves each named entry `args[namedStart:]` to a parameter index,
+// marking `filled`/`slot` (both already sized `want`/`len(args)` by the
+// caller) as it goes. E0124 unknown name, E0127 the variadic parameter
+// itself, E0125 a parameter already filled (by position OR by an earlier
+// named argument — `filled` does not distinguish the two, since SPEC §12.11
+// forbids both the same way). Split out of `vCallNamedArgs` for the same
+// complexity reason as `vNamedArgOrder`; returns true when every name
+// resolved cleanly.
+fn vNamedArgResolveNames(
+  c: Checker, owner: Checker, params: []int, want: int, variadic: bool,
+  args: []int, namedStart: int, filled: []bool, slot: []int,
+): bool {
+  let ok = true
+  let m = namedStart
+  while (m < len(args)) {
+    let nk = kidsOf(c.tree, args[m])
+    let nameNode = getNode(c.tree, nk[0])
+    let argName = c.source[nameNode.span.start:nameNode.span.end]
+    let pidx = paramIndexByName(owner, params, argName)
+    if (pidx < 0) {
+      reportNoHint(
+        c.diags, ecNamedArgUnknown, vSpan(c, args[m]),
+        "no parameter named '${argName}'",
+      )
+      ok = false
+    } else if (variadic && pidx == want - 1) {
+      reportNoHint(
+        c.diags, ecNamedArgVariadic, vSpan(c, args[m]),
+        "variadic parameter '${argName}' cannot be named",
+      )
+      ok = false
+    } else if (filled[pidx]) {
+      reportNoHint(
+        c.diags, ecNamedArgDuplicate, vSpan(c, args[m]),
+        "parameter '${argName}' supplied more than once",
+      )
+      ok = false
+    } else {
+      filled[pidx] = true
+      slot[m] = pidx
+    }
+    m = m + 1
+  }
+  return ok
+}
+
+// Every FIXED parameter must be filled exactly once — no default arguments
+// exist (SPEC §12 note) — checked in two parts: `namedStart` positional
+// arguments can never exceed `fixed` many on their own (or a fixed parameter
+// would need both a position and, per the same rule, a name), and once names
+// are resolved every index below `fixed` must be marked in `filled`. Split
+// out of `vCallNamedArgs` for the same complexity reason as `vNamedArgOrder`.
+fn vNamedArgArity(c: Checker, node: int, fixed: int, namedStart: int, filled: []bool): bool {
+  if (namedStart > fixed) {
+    reportNoHint(
+      c.diags, ecArgCount, vSpan(c, node),
+      "expected ${fixed} argument(s) before named arguments, found ${namedStart}",
+    )
+    return false
+  }
+  let f = 0
+  let missing = 0
+  while (f < fixed) {
+    if (!filled[f]) {
+      missing = missing + 1
+    }
+    f = f + 1
+  }
+  if (missing > 0) {
+    reportNoHint(
+      c.diags, ecArgCount, vSpan(c, node),
+      "expected ${fixed} argument(s), found ${fixed - missing}",
+    )
+    return false
+  }
+  return true
+}
+
+// Argument TYPES (E0041) — the same rule `vCall`'s own positional loop
+// applies to a plain call, ported unchanged: `vExpectExpr` alone answers
+// both the scalar and the interface-target case (#3050), so no separate
+// `vIfaceStore` pass is needed here either. Split out of `vCallNamedArgs` for
+// the same complexity reason as `vNamedArgOrder`.
+fn vNamedArgTypeCheck(
+  c: Checker,
+  owner: Checker,
+  params: []int,
+  args: []int,
+  namedStart: int,
+  slot: []int,
+) {
+  let p = 0
+  while (p < namedStart) {
+    let a = kidsOf(c.tree, args[p])[0] // Tag.Arg
+    let pty = typeFromNode(owner, kidsOf(owner.tree, params[p])[1])
+    if (pty != 0) {
+      vExpectExpr(c, a, pty)
+    }
+    p = p + 1
+  }
+  let q = namedStart
+  while (q < len(args)) {
+    let expr = kidsOf(c.tree, args[q])[1] // Tag.NamedArg [name, expr]
+    let pty = typeFromNode(owner, kidsOf(owner.tree, params[slot[q]])[1])
+    if (pty != 0) {
+      vExpectExpr(c, expr, pty)
+    }
+    q = q + 1
+  }
+}
+
+// Validates AND type-checks a call to a concrete free function `params`
+// (`owner`'s tree) whose argument list `args` contains at least one
+// `Tag.NamedArg`, starting at `namedStart`. Called from `vCall` in place of
+// its ordinary spread/variadic/arity/type loop — this function is the WHOLE
+// of that branch and reports every diagnostic itself, via the four phases
+// above: ordering, name resolution, arity, then argument types — each phase
+// bails the whole call the moment it finds a problem, so `filled`/`slot`
+// (shared, mutated in place) are always read only after they are proven
+// complete for what remains.
+fn vCallNamedArgs(
+  c: Checker, node: int, owner: Checker, params: []int, want: int,
+  fixed: int, variadic: bool, args: []int, namedStart: int,
+) {
+  if (!vNamedArgOrder(c, args, namedStart)) {
+    return
+  }
+  let filled = []bool(want)
+  let k = 0
+  while (k < namedStart) {
+    filled[k] = true
+    k = k + 1
+  }
+  let slot = []int(len(args))
+  if (!vNamedArgResolveNames(c, owner, params, want, variadic, args, namedStart, filled, slot)) {
+    return
+  }
+  if (!vNamedArgArity(c, node, fixed, namedStart, filled)) {
+    return
+  }
+  vNamedArgTypeCheck(c, owner, params, args, namedStart, slot)
+}

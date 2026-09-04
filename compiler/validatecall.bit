@@ -267,6 +267,16 @@ fn vPrintCall(c: Checker, node: int, name: string) {
 fn vCallValue(c: Checker, node: int) {
   let kids = kidsOf(c.tree, node) // [callee, generic_args, arg_list]
   let callee = kids[0]
+  // Named arguments (SPEC §12.11, #3839): every call this function handles —
+  // a function VALUE, a method, a func-typed class field, or a namespaced
+  // call — is exactly the set of shapes the DIRECT CALLS ONLY restriction
+  // excludes. Reject up front so `vMethodCall`/`vCallAgainstFuncSig` below
+  // never have to read a `Tag.NamedArg` as a plain positional one.
+  let argList = kidsOf(c.tree, kids[2])
+  if (namedArgStart(c.tree, argList) < len(argList)) {
+    vRejectNamedArgs(c, argList)
+    return
+  }
   // A Member callee is a METHOD, a func-typed class field (#2786), or a
   // namespaced call — vMethodCall (validateiface.bit) separates the three and
   // reports itself.
@@ -460,23 +470,8 @@ fn vCall(c: Checker, node: int) {
   let fr = funcRefAt(c, callee, name)
   let decl = fr.decl
   if (decl == 0) {
-    if (name == "print" || name == "eprint") { vPrintCall(c, node, name); return }
-    if (name == "append") { vAppendCall(c, node); return }
-    if (name == "len" || name == "cap") { vLenCapCall(c, node, name); return }
-    // A class declaring 'init' (classinit.bit, #3371): `Account(500)` is
-    // judged against 'init's own params, not the 1-argument conversion rule
-    // vConversionArity applies to every other user type below.
-    let ut = userTypeLookup(c, name)
-    if (ut != 0) {
-      let initDecl = classInitNode(c, ut)
-      if (initDecl != 0) {
-        vClassConstructCall(c, node, typeOwner(c, ut), initDecl)
-        return
-      }
-    }
-    vConversionArity(c, node, name, kids[2])
-    vRuntimeBuiltinArity(c, node, name, kids[2])
-    return // builtin / constructor / not a free function
+    vCallResolveBuiltin(c, node, kids, name)
+    return
   }
   // The decl's params live in its OWNING module's tree (FuncRef), which is
   // `c` itself for a local function and the exporter for an imported one.
@@ -504,7 +499,6 @@ fn vCall(c: Checker, node: int) {
   let params = kidsOf(owner.tree, plist)
   let want = len(params)
   let args = kidsOf(c.tree, kids[2])
-  let got = len(args)
   // A variadic `...xs: T` absorbs every argument past the fixed ones, so only
   // the fixed prefix has an exact arity (§12.4). Mirrors the seed's three cases.
   let variadic = want > 0 &&
@@ -513,11 +507,99 @@ fn vCall(c: Checker, node: int) {
   if (variadic) {
     fixed = want - 1
   }
+  vCallKnownDecl(c, node, owner, decl, name, generic, params, want, fixed, variadic, args)
+}
+
+// The `decl == 0` half of `vCall`: a builtin (`print`/`eprint`/`append`/
+// `len`/`cap`), a primitive/user-type conversion, or a class's `init`
+// constructor — every callee shape with no declared parameter LIST of its
+// own for a named argument to resolve against. Split out purely to keep
+// `vCall`'s own McCabe complexity from growing (spec/LINT.md E0204,
+// tools/build/complexity-debt.txt) — everything here already ran inline in
+// `vCall` before #3839 added the named-argument check at its top.
+fn vCallResolveBuiltin(c: Checker, node: int, kids: []int, name: string) {
+  // Named arguments (SPEC §12.11, #3839) resolve against a free function's
+  // OWN declared parameter list, which none of the shapes below has: a
+  // builtin, a conversion, or a class constructor. Reject up front, before
+  // any of those has a chance to read a `Tag.NamedArg` as a plain `Tag.Arg`
+  // and silently skip its type check.
+  let argList = kidsOf(c.tree, kids[2])
+  if (namedArgStart(c.tree, argList) < len(argList)) {
+    vRejectNamedArgs(c, argList)
+    return
+  }
+  if (name == "print" || name == "eprint") { vPrintCall(c, node, name); return }
+  if (name == "append") { vAppendCall(c, node); return }
+  if (name == "len" || name == "cap") { vLenCapCall(c, node, name); return }
+  // A class declaring 'init' (classinit.bit, #3371): `Account(500)` is
+  // judged against 'init's own params, not the 1-argument conversion rule
+  // vConversionArity applies to every other user type below.
+  let ut = userTypeLookup(c, name)
+  if (ut != 0) {
+    let initDecl = classInitNode(c, ut)
+    if (initDecl != 0) {
+      vClassConstructCall(c, node, typeOwner(c, ut), initDecl)
+      return
+    }
+  }
+  vConversionArity(c, node, name, kids[2])
+  vRuntimeBuiltinArity(c, node, name, kids[2])
+}
+
+// The `decl != 0` half of `vCall`: a resolved free function or `extern fn`.
+// Named arguments (SPEC §12.11, #3839) branch off first — a GENERIC callee
+// is rejected outright (E0128, same treatment as a builtin) rather than
+// supported: binding a named argument to a still-open type parameter needs
+// the substituted parameter TYPE by declared index, which
+// `vCallGenericEnv`/`genericEnvOf` below assume matches the ARGUMENT list's
+// own order, exactly the assumption named arguments break. `vCallNamedArgs`
+// (namedargs.bit) is the WHOLE of the non-generic named-argument path.
+// Otherwise this is `vCall`'s pre-#3839 tail, split out purely to keep
+// `vCall`'s own complexity from growing.
+fn vCallKnownDecl(
+  c: Checker, node: int, owner: Checker, decl: int, name: string,
+  generic: bool, params: []int, want: int, fixed: int, variadic: bool, args: []int,
+) {
+  let got = len(args)
+  let namedStart = namedArgStart(c.tree, args)
+  if (namedStart < got) {
+    if (generic) {
+      vRejectNamedArgs(c, args)
+      return
+    }
+    vCallNamedArgs(c, node, owner, params, want, fixed, variadic, args, namedStart)
+    return
+  }
   // `f(...xs)` spreads a slice into the variadic slot and must sit exactly after
   // the fixed arguments; the spread itself is one argument, not a count of them.
   // E0063 rejects a spread that is duplicated, aimed at a non-variadic callee,
   // or not final — reported at the spread argument, as the seed does. A bad
   // spread still falls through to the arity check below: the seed emits both.
+  let spreadAt = vCallSpreadAt(c, args, variadic, got)
+  if (!vCallArity(c, node, want, fixed, variadic, got, spreadAt)) {
+    return
+  }
+  // Argument TYPES, checked only here — at the one point this function has
+  // already proven the call decidable: a known, non-variadic, non-spread free
+  // function whose arity matches. Every undecidable shape (builtin, conversion,
+  // constructor, method, function value, variadic) returned above, which is what
+  // keeps FALSEPOS at 0.
+  let env = emptyTypeEnv()
+  if (generic) {
+    let (e, ok) = vCallGenericEnv(c, node, owner, decl, name)
+    if (!ok) {
+      return
+    }
+    env = e
+  }
+  vCallArgTypes(c, owner, params, args, got, generic, env)
+}
+
+// The `...` spread scan: E0063 for a spread that is duplicated, aimed at a
+// non-variadic callee, or not final — reported at the spread argument, as
+// the seed does. Returns its index, or -1 if the call carries none. Split
+// out of `vCallKnownDecl` for the same complexity reason.
+fn vCallSpreadAt(c: Checker, args: []int, variadic: bool, got: int): int {
   let spreadAt = -1
   let ai = 0
   while (ai < got) {
@@ -530,66 +612,102 @@ fn vCall(c: Checker, node: int) {
     }
     ai = ai + 1
   }
+  return spreadAt
+}
+
+// Arity (E0050), given the spread index `vCallSpreadAt` found. Returns true
+// only for a known, non-variadic, non-spread call whose count matches — the
+// one point `vCallKnownDecl` may proceed to the per-argument type loop. Split
+// out of `vCallKnownDecl` for the same complexity reason.
+fn vCallArity(c: Checker, node: int, want: int, fixed: int, variadic: bool, got: int, spreadAt: int): bool {
   if (spreadAt >= 0) {
     if (spreadAt != fixed) {
       reportNoHint(c.diags, ecArgCount, vSpan(c, node),
         "expected ${fixed} argument(s) before '...', found ${spreadAt}")
     }
-    return
+    return false
   }
   if (variadic) {
     if (got < fixed) {
       reportNoHint(c.diags, ecArgCount, vSpan(c, node),
         "expected at least ${fixed} argument(s), found ${got}")
     }
-    return
+    return false
   }
   if (want != got) {
     reportNoHint(c.diags, ecArgCount, vSpan(c, node),
       "expected ${want} argument(s), found ${got}")
-    return
+    return false
   }
-  // Argument TYPES, checked only here — at the one point this function has
-  // already proven the call decidable: a known, non-variadic, non-spread free
-  // function whose arity matches. Every undecidable shape (builtin, conversion,
-  // constructor, method, function value, variadic) returned above, which is what
-  // keeps FALSEPOS at 0.
-  //
-  // Part of the #1470 class: `f(p: [2]i32)` called with `1` was accepted, the
-  // same missing-vExpect hole as the annotated binding.
-  //
-  // The parameter's declared type is read from its OWNING module's tree
-  // (`owner`, via declOwner) — a cross-module call reads the exporter's nodes,
-  // never this module's. Type ids are interned in the shared ctx, so the id
-  // compared here is the same id either side would produce.
-  //
-  // A GENERIC callee is judged against its parameter types with THIS call's
-  // inferred type arguments substituted in (#2243). Judging the declared type
-  // raw would decide nothing — `vAssignable` accepts a bare type param on either
-  // side unchecked — which is why `eq(got: T, want: T, label: string)` accepted
-  // `eq(1, true, "x")`, reported `ok`, and made every assertion in the corpus
-  // unable to fail in the green direction. Substituting is what turns `want: T`
-  // into `want: i64` and lets the ordinary expectation answer.
-  //
-  // Bound by ID over the CHECKED parameter type, not by name over its node:
-  // `genericEnvOf` keys on the ids `registerGenerics` recorded for THIS decl,
-  // so a module declaring two generics that both spell a param `T` cannot bind
-  // one decl's body against the other's id. Same env and same `substType` that
-  // `validateInstantiations` uses one phase later.
-  let env = emptyTypeEnv()
-  if (generic) {
-    let targs = genericTypeArgs(c, name, node)
-    // THE SAFETY RULE. An un-inferred type param comes back as `void` from
-    // `genericTypeArgs`, and substituting that would manufacture
-    // `expected '()', found 'i64'` on code this validator has always accepted.
-    // An inference gap is undecidable, never a diagnostic — so bail on the whole
-    // call rather than report against a type nobody wrote.
-    for t of targs {
-      if (t == 0 || t == c.ctx.voidId) { return }
+  return true
+}
+
+// A GENERIC callee's substitution env (#2243): its type arguments,
+// inferred from THIS call, bound onto its type params. `ok` is false when
+// inference left a gap — THE SAFETY RULE: an un-inferred type param comes
+// back as `void` from `genericTypeArgs`, and substituting that would
+// manufacture `expected '()', found 'i64'` on code this validator has
+// always accepted, so an inference gap is undecidable, never a diagnostic —
+// bail on the whole call rather than report against a type nobody wrote.
+// Split out of `vCallKnownDecl` for the same complexity reason.
+fn vCallGenericEnv(c: Checker, node: int, owner: Checker, decl: int, name: string): (TypeEnv, bool) {
+  let targs = genericTypeArgs(c, name, node)
+  for t of targs {
+    if (t == 0 || t == c.ctx.voidId) {
+      return emptyTypeEnv(), false
     }
-    env = genericEnvOf(owner, decl, targs)
-    if (len(env.params) == 0) { return }
   }
+  let env = genericEnvOf(owner, decl, targs)
+  if (len(env.params) == 0) {
+    return env, false
+  }
+  return env, true
+}
+
+// Argument TYPES, checked only once `vCallArity` has proven the call
+// decidable. The parameter's declared type is read from its OWNING module's
+// tree (`owner`, via declOwner) — a cross-module call reads the exporter's
+// nodes, never this module's. Type ids are interned in the shared ctx, so
+// the id compared here is the same id either side would produce.
+//
+// A GENERIC callee is judged against its parameter types with THIS call's
+// inferred type arguments substituted in (#2243). Judging the declared type
+// raw would decide nothing — `vAssignable` accepts a bare type param on either
+// side unchecked — which is why `eq(got: T, want: T, label: string)` accepted
+// `eq(1, true, "x")`, reported `ok`, and made every assertion in the corpus
+// unable to fail in the green direction. Substituting is what turns `want: T`
+// into `want: i64` and lets the ordinary expectation answer.
+//
+// Bound by ID over the CHECKED parameter type, not by name over its node:
+// `genericEnvOf` keys on the ids `registerGenerics` recorded for THIS decl,
+// so a module declaring two generics that both spell a param `T` cannot bind
+// one decl's body against the other's id. Same env and same `substType` that
+// `validateInstantiations` uses one phase later.
+//
+// #3050 FIX: an interface parameter is no longer skipped here. vExpectExpr
+// routes to vAssignable's §14.3 branch, which answers BOTH the narrow
+// "non-class value can't sit behind an interface" case (E0041, the
+// "cannot store" wording) AND the general case this bug is about — a
+// class that is storable but does not satisfy the parameter's method set
+// (E0041, the "'T' has no method ...' / 'is (...) => ...'" wording). Before
+// this fix neither vCall nor vCallAgainstFuncSig (validateiface.bit) ever
+// reached the general case for ANY call shape (free, method, or
+// func-value): each assumed the other covered it via vIfaceStore, which
+// covers only the narrow case (its own header, validateiface.bit:264-273,
+// says so explicitly) — so a class argument that did not implement the
+// required interface built rc=0 and segfaulted at the uninitialized method
+// dispatch slot.
+//
+// vCallArgIface (validateiface.bit) used to answer the narrow case here
+// too, on this SAME free-call shape (bare Ident callee, non-shadowed,
+// non-generic) via vIfaceStore. It now skips exactly this shape (fixed
+// arity, non-variadic) so the two do not double-report `take(7)` for
+// `take(p: Any)` — see the guard at the top of vCallArgIface. It stays
+// live for a variadic callee, which this loop never reaches (`vCallArity`
+// returns false before any type check) and which vExpectExpr is therefore
+// not routed through here. Split out of `vCallKnownDecl` for the same
+// complexity reason as its siblings above.
+fn vCallArgTypes(c: Checker, owner: Checker, params: []int, args: []int, got: int, generic: bool, env: TypeEnv) {
   let i = 0
   while (i < got) {
     let a = args[i]
@@ -604,28 +722,6 @@ fn vCall(c: Checker, node: int) {
         pty = 0
       }
     }
-    // #3050 FIX: an interface parameter is no longer skipped here. vExpectExpr
-    // routes to vAssignable's §14.3 branch, which answers BOTH the narrow
-    // "non-class value can't sit behind an interface" case (E0041, the
-    // "cannot store" wording) AND the general case this bug is about — a
-    // class that is storable but does not satisfy the parameter's method set
-    // (E0041, the "'T' has no method ...' / 'is (...) => ...'" wording). Before
-    // this fix neither vCall nor vCallAgainstFuncSig (validateiface.bit) ever
-    // reached the general case for ANY call shape (free, method, or
-    // func-value): each assumed the other covered it via vIfaceStore, which
-    // covers only the narrow case (its own header, validateiface.bit:264-273,
-    // says so explicitly) — so a class argument that did not implement the
-    // required interface built rc=0 and segfaulted at the uninitialized method
-    // dispatch slot.
-    //
-    // vCallArgIface (validateiface.bit) used to answer the narrow case here
-    // too, on this SAME free-call shape (bare Ident callee, non-shadowed,
-    // non-generic) via vIfaceStore. It now skips exactly this shape (fixed
-    // arity, non-variadic) so the two do not double-report `take(7)` for
-    // `take(p: Any)` — see the guard at the top of vCallArgIface. It stays
-    // live for a variadic callee, which this loop never reaches (returns
-    // before any type check, see the arity block above) and which vExpectExpr
-    // is therefore not routed through here.
     if (pty != 0) {
       vExpectExpr(c, a, pty)
     }
