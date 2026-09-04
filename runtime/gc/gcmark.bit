@@ -207,6 +207,12 @@ export @nosplit @symbol("bit_rt_port_gc_mark_conservative") fn gcMarkConservativ
 // Sweep
 // ---------------------------------------------------------------------------
 
+// PRECONDITION: the caller holds `heapLock(g)` (#4319). Both call sites —
+// `sweep` below and `gcDeinit`'s object loop (`./gc.bit`) — take it once around
+// their whole loop, so this reaches `gcHeapFreeLocked` rather than the
+// acquire/release form. Nothing else here touches that lock: `idxRemove`
+// (`./gcindex.bit`) takes none at all and cannot grow the table, and
+// `clearSlotBit` (`./gcalloc.bit`) is a lone `atomicAnd`.
 @nosplit fn freeObject(g: *i64, h: int) {
   let size = hdrSize(h)
   let idx = allocClassify(size, 8)
@@ -220,7 +226,7 @@ export @nosplit @symbol("bit_rt_port_gc_mark_conservative") fn gcMarkConservativ
   clearSlotBit(h, idx)
   // #4043: `gcHeapFree` used to re-derive `idx` from the same `size`. It is one
   // value; it is computed once, here, and passed down.
-  gcHeapFree(g, h, size, 8, idx)
+  gcHeapFreeLocked(g, h, size, 8, idx)
 }
 
 // Free every unmarked object and clear the mark on survivors. Returns the
@@ -229,10 +235,47 @@ export @nosplit @symbol("bit_rt_port_gc_mark_conservative") fn gcMarkConservativ
 // A pointer-to-pointer walk would be natural here; Bit has
 // no `&`, so the equivalent is an explicit `prev` (0 meaning "the list head").
 // Same traversal, same order, same result.
+//
+// ONE HEAP-LOCK ACQUIRE FOR THE WHOLE LOOP (#4319), NOT ONE PER OBJECT.
+// `gcHeapFree` took and released it per freed object — ~55,000 acquire/release
+// pairs per collection on `bench/cases/alloc` (10,002,000 objects over 181
+// collections), four barriers each, for a lock that is uncontended by
+// construction.
+//
+// THE WORLD IS STOPPED HERE, AND THAT IS THE INVARIANT THE HOIST RESTS ON.
+// `sweep` has exactly one caller, `gcCollectFinish` (`./gccollect.bit`), and
+// that has exactly three:
+//
+//   1. `stwCollect` (`../stw/stw.bit`), reached only from `../stw/stwpoll.bit`
+//      after `worldLockTry` AND `worldRendezvous` both succeed — every other
+//      mutator is parked at a safepoint. A rendezvous that times out abandons
+//      the collection instead of forcing it, so this path never runs with a
+//      mutator live. This is the only path a real program takes.
+//   2. `chanDriveCollection` (`../chan/chanreg.bit`) — pinned for the
+//      single-threaded `_tests_/stress/chan*` harnesses, which drive it by hand.
+//   3. `gcCollectRoots` (`./gccollect.bit`), the root-ARRAY entry the
+//      `_tests_/stress/gc*` harnesses and the differential drive, likewise
+//      single-threaded.
+//
+// So no other thread can be inside `gcHeapAlloc` — the only other acquirer of
+// this lock (`./gc.bit`, three acquire sites in the whole runtime) — while this
+// runs. The lock is kept rather than deleted because the invariant is a
+// property of the CALLERS, which nothing mechanically enforces: a future
+// non-stopped caller would find the free path still mutually excluded.
+//
+// NO SELF-DEADLOCK: the spinlock is not recursive, and nothing reachable from
+// this loop acquires `heapLock` again. `freeObject`'s own header lists what it
+// reaches; `gcHeapFreeLocked` nests only the object-list lock (via
+// `idxRemoveSpan`), which is the sanctioned order (`./gc.bit`, `./gcindex.bit`:
+// nothing reachable under the list lock ever takes the heap lock) and is
+// already what `gcHeapFree` did today. Nothing here allocates, so nothing can
+// reach `reserveGrow`. Every function on the path is `@nosplit`, so no
+// safepoint poll can run with the lock held.
 @nosplit fn sweep(g: *i64): int {
   let swept = 0
   let prev = 0
   let h = *(g + gcAll)
+  spinAcquire(heapLock(g))
   // Bounded: num_objects links.
   while (h != 0) {
     let next = loadWord(h + gcHdrNext)
@@ -252,5 +295,6 @@ export @nosplit @symbol("bit_rt_port_gc_mark_conservative") fn gcMarkConservativ
     }
     h = next
   }
+  spinRelease(heapLock(g))
   return swept
 }
