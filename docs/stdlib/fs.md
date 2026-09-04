@@ -104,9 +104,39 @@ for the new length to be durable.
 
 This file's current length in bytes.
 
+### `File.lock(): ()!`
+
+Takes a whole-file, advisory exclusive lock, blocking until it is available.
+Advisory only — it constrains nothing about `read`/`write`/`readAt`/`writeAt`
+on this or any other handle; only another `lock`/`tryLock`/`lockShared`/
+`tryLockShared` call observes it. Two `File` values open on the same path in
+one process contend with each other, same as two processes.
+
+### `File.tryLock(): bool!`
+
+Like `lock`, but never blocks: `true` if the lock was taken, `false` if it is
+currently held elsewhere. Only a genuine error fails.
+
+### `File.lockShared(): ()!`
+
+Takes a whole-file, advisory shared lock, blocking until it is available. Any
+number of shared holders coexist; an exclusive `lock`/`tryLock` against them
+blocks/fails until every shared holder releases.
+
+### `File.tryLockShared(): bool!`
+
+Like `lockShared`, but never blocks: `true` if the shared lock was taken,
+`false` if an exclusive lock is currently held elsewhere.
+
+### `File.unlock(): ()!`
+
+Releases a lock taken by `lock`/`tryLock`/`lockShared`/`tryLockShared` on this
+handle. A safe no-op if this handle holds no lock.
+
 ### `File.close()`
 
-Releases the handle. Safe to call once; do not use the `File` afterwards.
+Releases the handle, and any lock it holds. Safe to call once; do not use the
+`File` afterwards.
 
 ```bit
 import { create, open } from "std/fs"
