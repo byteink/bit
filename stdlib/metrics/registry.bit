@@ -1,0 +1,156 @@
+// Bit standard library — std/metrics: the metric registry and Prometheus
+// text exposition (#3966).
+//
+// PUBLIC SURFACE DEVIATION FROM THE ORIGINAL TICKET, AND WHY: the ticket
+// asked for free functions with an implicit default registry — `counter(name,
+// help, labels): Counter`, `exposition(): string`, no registry argument
+// anywhere. That shape cannot be implemented soundly: a registry holds a
+// growable collection of Counter/Gauge/Histogram objects, all reference
+// types, and Bit's module-level `let` may hold only untraced scalars, fixed
+// arrays of them, or raw pointers (SPEC section 11.11) — a class, slice or
+// map at module scope is a compile error, E0082 (stdlib/http/trustcache.bit's
+// own header hit this exact wall for a different module and documents it in
+// detail). There is no cell a hidden default Registry could live in for a
+// parameterless `counter()` to reach.
+//
+// The fix is the one every other stateful concurrency primitive in this
+// stdlib already uses (Mutex, WaitGroup, RWMutex, Rand): construct an
+// explicit value and call methods on it.
+//
+//   let reg = newRegistry(1000)   // 1000 = max distinct label-value
+//                                 // combinations PER metric on this registry
+//   let hits = reg.counter("http_requests_total", "...", ["method", "code"])
+//   hits.inc(["GET", "200"])
+//   let body = reg.exposition()
+//
+// Registration (counter/gauge/histogram) is a startup-time act (this
+// module's own rule): a bad metric or label name, or a duplicate metric
+// name, PANICS immediately rather than producing a corrupt scrape later.
+// Recording a value (inc/add/set/observe) never panics on caller-supplied
+// label VALUES — an unexpected new label-value combination is bounded by
+// `capMax` and silently dropped past it (see labelkey.bit's seriesIndex):
+// unlike a name typo, a request's own path or user id is data the program
+// does not control and must not crash on.
+
+import { Mutex, newMutex } from "std/sync"
+import { Builder, newBuilder } from "std/strings"
+
+// Anything the registry can render into an exposition buffer. Implemented
+// by Counter, Gauge and Histogram (counter.bit/gauge.bit/histogram.bit);
+// purely structural, so none of them needs to say so.
+interface metricSeries {
+  writeExposition(b: Builder),
+}
+
+const droppedSeriesMetricName: string = "bit_metrics_dropped_series_total"
+const droppedSeriesMetricHelp: string = "Series dropped because a metric's configured label-cardinality cap was reached."
+
+export class Registry {
+  capMax: int
+  regMu: Mutex
+  names: map<string, bool>
+  order: []metricSeries
+  // Total series dropped, across every metric on this registry, because a
+  // metric's own `capMax` was reached. Rendered as its own synthetic
+  // counter by exposition() — the "self-reported counter" this module's
+  // rules require.
+  dropped: []i64
+
+  export counter(name: string, help: string, labels: []string): Counter {
+    requireValidMetricName(name)
+    requireValidLabelNames(labels)
+    this.reserveName(name)
+    let c = newCounter(name, help, labels, this.familyCfg())
+    this.appendSeries(c)
+    return c
+  }
+
+  export gauge(name: string, help: string, labels: []string): Gauge {
+    requireValidMetricName(name)
+    requireValidLabelNames(labels)
+    this.reserveName(name)
+    let g = newGauge(name, help, labels, this.familyCfg())
+    this.appendSeries(g)
+    return g
+  }
+
+  export histogram(name: string, help: string, labels: []string, buckets: []f64): Histogram {
+    requireValidMetricName(name)
+    requireValidLabelNames(labels)
+    requireValidBuckets(buckets)
+    this.reserveName(name)
+    let h = newHistogram(name, help, labels, buckets, this.familyCfg())
+    this.appendSeries(h)
+    return h
+  }
+
+  familyCfg(): familyConfig {
+    return familyConfig{ capMax: this.capMax, dropped: this.dropped }
+  }
+
+  // Renders the whole registry as a Prometheus text-format exposition
+  // body: every registered metric's own HELP/TYPE/series lines, followed by
+  // this registry's self-reported drop counter. Builds into one shared
+  // Builder throughout — never concatenates a per-series string.
+  export exposition(): string {
+    this.regMu.lock()
+    let items = this.order
+    this.regMu.unlock()
+
+    let b = newBuilder()
+    let i = 0
+    while (i < len(items)) {
+      items[i].writeExposition(b)
+      i = i + 1
+    }
+    appendMetricHeader(b, droppedSeriesMetricName, droppedSeriesMetricHelp, "counter")
+    b.write(droppedSeriesMetricName)
+    b.write(" ${atomicLoad(ptrOf(this.dropped))}\n")
+    return b.toString()
+  }
+
+  // Reserves `name` for a new metric, panicking if it is already taken —
+  // by any kind of metric, including this registry's own drop counter
+  // (reserved by newRegistry below).
+  reserveName(name: string) {
+    this.regMu.lock()
+    let (_, exists) = this.names[name]
+    if (exists) {
+      this.regMu.unlock()
+      panic("metrics: \"${name}\" is already registered")
+    }
+    this.names[name] = true
+    this.regMu.unlock()
+  }
+
+  appendSeries(m: metricSeries) {
+    this.regMu.lock()
+    this.order = append(this.order, m)
+    this.regMu.unlock()
+  }
+}
+
+// A fresh, empty Registry. `capMax` bounds the number of distinct
+// label-value combinations EACH metric registered on it may accumulate —
+// see the module header for why this is a hard cap, not a soft warning.
+//
+// It is reserved memory, not just an enforcement ceiling: each Counter/
+// Gauge preallocates `capMax` value cells and each Histogram preallocates
+// `capMax * (len(buckets)+1)` bucket-count cells at REGISTRATION time, so
+// none of them ever has to grow (and therefore never has to synchronize a
+// growing array against a lock-free reader) once created. Size it to the
+// real cardinality you expect, not "large to be safe".
+export fn newRegistry(capMax: int): Registry {
+  if (capMax <= 0) {
+    panic("metrics: newRegistry: capMax must be > 0 (got ${capMax})")
+  }
+  let reg = Registry{
+    capMax: capMax,
+    regMu: newMutex(),
+    names: map<string, bool>(),
+    order: []metricSeries(0),
+    dropped: []i64(1),
+  }
+  reg.names[droppedSeriesMetricName] = true
+  return reg
+}
