@@ -107,6 +107,74 @@ fn withRequestId(rid: string): Response! {
 }
 ```
 
+## Multipart
+
+`parseMultipart` (RFC 7578) turns a `Request.body` into named text fields and
+named file parts — the piece needed to receive a file upload. It lives in this
+module, not a framework, so any plain `std/http` server can read one.
+
+**The body is attacker-controlled.** Every `Limits` field is required and none
+is disableable by passing zero — a zero limit rejects everything that would
+use it, it never means "unlimited". A malformed or missing boundary, an
+over-limit body/file/part-count, or a part whose headers exceed their own
+limit fails the whole parse: nothing is ever returned from a failed call, and
+a bad part is never skipped in favor of the rest.
+
+`filename` and a file part's declared `contentType` are returned **exactly as
+received** and are never inspected, sanitised, decoded, or used to build a
+path — both are attacker-controlled, and a filename of `../../etc/passwd` is
+returned as that literal string. Joining it to a path, or trusting the
+declared content type, is the caller's decision to make deliberately.
+
+### `Limits`
+
+The five required bounds on an untrusted body: `maxBodyBytes` (total body
+size), `maxFileBytes` (a single file part), `maxParts` (fields plus files
+together), `maxHeaderLineBytes` (one header line within a part), and
+`maxPartHeaderBytes` (a part's whole header block). Exceeding any one fails
+the parse naming that limit.
+
+### `defaultLimits(): Limits`
+
+Reasonable defaults for an ordinary upload form: a 32 MiB total body, a 10 MiB
+single file, at most 64 parts, an 8 KiB single header line, and a 16 KiB
+total header block per part.
+
+### `FormField`
+
+One text field as sent: `name` and `value`.
+
+### `FormFile`
+
+One file part as sent: `name`, the sender's declared `filename` and
+`contentType` (both untrusted — see above), and the raw `content` bytes.
+
+### `Form`
+
+The result of a successful `parseMultipart`: every `FormField` in `fields`
+and every `FormFile` in `files`, in the order they appeared. `value(name)`
+returns the first field value matching `name`, or `""` if none did;
+`file(name): FormFile!` returns the first file part matching `name`, or
+fails if none did.
+
+### `parseMultipart(body: []byte, boundary: string, limits: Limits): Form!`
+
+Parses `body` as `multipart/form-data`, delimited by `boundary` (the
+`Content-Type: multipart/form-data; boundary=...` parameter's value, without
+the leading `--`). See above for what fails the whole parse and what is
+returned untouched.
+
+```bit
+import { Form, parseMultipart, defaultLimits } from "std/http"
+
+// `boundary` is the Content-Type header's own "boundary=..." parameter,
+// extracted by the caller before this is reached.
+fn handleUpload(body: []byte, boundary: string): Form! {
+  let form = parseMultipart(body, boundary, defaultLimits())?
+  return form
+}
+```
+
 ## Query strings
 
 `Request.path` is the raw request target straight off the wire —

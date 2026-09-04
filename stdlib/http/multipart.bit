@@ -1,0 +1,370 @@
+// Bit standard library — http module: multipart/form-data parsing (RFC 7578).
+//
+// `parseMultipart` turns a request body into named text fields and named file
+// parts — the missing piece that made file upload impossible with only
+// `stdlib/http` (#3961). It lives in this module rather than in a web
+// framework so any plain `stdlib/http` server can read an upload, not only
+// one built on top of a framework.
+//
+// SECURITY: the body is attacker-controlled. Every `Limits` field below is
+// REQUIRED and none is disableable by passing zero — a zero limit rejects
+// every part that would otherwise consume it, it does not mean "unlimited".
+// A malformed or missing boundary, an over-limit part, or a part whose
+// headers exceed their own limit fails the WHOLE parse; nothing here ever
+// returns a partially-built `Form`, and nothing here skips a bad part and
+// continues — partial acceptance of a malformed body is how request
+// smuggling works.
+//
+// `filename` and the declared `Content-Type` of a file part are returned
+// EXACTLY as received and are never inspected, sanitised, decoded or used to
+// build a path. Both are attacker-controlled: a filename of `../../etc/passwd`
+// is returned verbatim, and a declared `Content-Type` of `image/png` proves
+// nothing about the bytes that follow it. Any path-joining or content
+// sniffing is the caller's job, done deliberately, not this parser's.
+
+import { indexOfFrom } from "std/strings"
+
+// ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+
+// The five bounds a caller MUST set before parsing an untrusted body — see the
+// module comment. Each is a hard ceiling in bytes (or, for `maxParts`, a
+// count): exceeding one fails the parse with a distinct error naming which
+// limit was hit. None has a meaning for zero other than "reject everything
+// that would use it".
+export class Limits {
+  export maxBodyBytes: int,
+  export maxFileBytes: int,
+  export maxParts: int,
+  export maxHeaderLineBytes: int,
+  export maxPartHeaderBytes: int,
+}
+
+// Reasonable defaults for an ordinary web upload form: a 32 MiB total body, a
+// 10 MiB single file, at most 64 parts (fields plus files), an 8 KiB single
+// header line and a 16 KiB total header block per part — generous for any
+// real `Content-Disposition`/`Content-Type` pair, tight enough that a part
+// with thousands of fake header lines cannot run unbounded.
+export fn defaultLimits(): Limits {
+  return Limits{
+    maxBodyBytes: 32 * 1024 * 1024,
+    maxFileBytes: 10 * 1024 * 1024,
+    maxParts: 64,
+    maxHeaderLineBytes: 8 * 1024,
+    maxPartHeaderBytes: 16 * 1024,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Form
+// ---------------------------------------------------------------------------
+
+// One text field: its form name and value, exactly as sent.
+export class FormField {
+  export name: string,
+  export value: string,
+}
+
+// One file part: its form name, the sender's declared filename and content
+// type — both UNTRUSTED, see the module comment — and the raw file bytes.
+export class FormFile {
+  export name: string,
+  export filename: string,
+  export contentType: string,
+  export content: []byte,
+}
+
+// The result of a successful `parseMultipart`: every text field and every
+// file part, in the order they appeared in the body. A name may repeat (the
+// wire format allows it); `value`/`file` return the first match.
+export class Form {
+  export fields: []FormField
+  export files: []FormFile
+
+  // The value of the first field named `name`, or "" if none matched.
+  export value(name: string): string {
+    for f of this.fields {
+      if (f.name == name) {
+        return f.value
+      }
+    }
+    return ""
+  }
+
+  // The first file part named `name`. Fails if none matched.
+  export file(name: string): FormFile! {
+    for f of this.files {
+      if (f.name == name) {
+        return f
+      }
+    }
+    fail newError("multipart: no file part named \"${name}\"")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Boundary
+// ---------------------------------------------------------------------------
+
+// RFC 2046 §5.1.1 `bcharsnospace`: the non-space bytes a boundary token may
+// contain, alongside letters and digits.
+const boundaryExtraBytes = "'()+_,-./:=?"
+
+fn isBoundaryByte(c: byte): bool {
+  if (c >= '0' && c <= '9') {
+    return true
+  }
+  if (c >= 'A' && c <= 'Z') {
+    return true
+  }
+  if (c >= 'a' && c <= 'z') {
+    return true
+  }
+  return indexOfFrom(boundaryExtraBytes, string([]byte{ c }), 0) >= 0
+}
+
+// True iff `b` is a well-formed RFC 2046 boundary token: 1-70 bytes, every
+// byte a boundary character or an interior space, and the last byte not a
+// space. An empty, over-long, or byte-invalid boundary is malformed, not
+// best-effort accepted — see the module comment.
+fn validBoundary(b: string): bool {
+  let n = len(b)
+  if (n < 1 || n > 70) {
+    return false
+  }
+  let i = 0
+  while (i < n) {
+    let c = b[i]
+    if (c != ' ' && !isBoundaryByte(c)) {
+      return false
+    }
+    i = i + 1
+  }
+  return b[n - 1] != ' '
+}
+
+// ---------------------------------------------------------------------------
+// Content-Disposition parameter extraction
+// ---------------------------------------------------------------------------
+
+// Reads a `name="quoted value"` or `name=token` parameter value starting at
+// `start` in `value` (right after the `=`). A quoted-string decodes RFC 2045
+// `quoted-pair` escapes (`\X` -> `X`); an unterminated quote returns
+// everything up to the end of the header line, since the caller's own
+// per-line length limit already bounds how far this can scan. An unquoted
+// token ends at the next `;` or end of string.
+fn readParamValue(value: string, start: int, n: int): string {
+  if (start >= n) {
+    return ""
+  }
+  if (value[start] != '"') {
+    let end = indexOfFrom(value, ";", start)
+    if (end < 0) {
+      end = n
+    }
+    return trimSpace(value[start:end])
+  }
+  let out = []byte(0)
+  let i = start + 1
+  // Bounded by n: `i` strictly increases by 1 or 2 every iteration.
+  while (i < n) {
+    let c = value[i]
+    if (c == '\\' && i + 1 < n) {
+      out = append(out, value[i + 1])
+      i = i + 2
+      continue
+    }
+    if (c == '"') {
+      return string(out)
+    }
+    out = append(out, c)
+    i = i + 1
+  }
+  return string(out)
+}
+
+// The value of parameter `paramName` in a `;`-separated parameter list like
+// `form-data; name="a"; filename="b.txt"`, and whether it was present at
+// all — present-but-empty (`filename=""`) must be distinguishable from
+// absent, since an empty declared filename still marks a part as a file
+// (RFC 7578 §4.2).
+fn dispositionParam(value: string, paramName: string): (string, bool) {
+  let n = len(value)
+  let needle = toLower(paramName) + "="
+  let lower = toLower(value)
+  let i = 0
+  // Bounded by n: each iteration either returns or advances `i` past the
+  // candidate match it just rejected.
+  while (i < n) {
+    let at = indexOfFrom(lower, needle, i)
+    if (at < 0) {
+      return "", false
+    }
+    let boundaryOk = at == 0
+    if (!boundaryOk) {
+      let j = at - 1
+      while (j >= 0 && (value[j] == ' ' || value[j] == '\t')) {
+        j = j - 1
+      }
+      boundaryOk = j < 0 || value[j] == ';'
+    }
+    if (!boundaryOk) {
+      i = at + 1
+      continue
+    }
+    return readParamValue(value, at + len(needle), n), true
+  }
+  return "", false
+}
+
+// ---------------------------------------------------------------------------
+// Part header block
+// ---------------------------------------------------------------------------
+
+// Reads one part's header block starting at `start` (right after the
+// delimiter line's CRLF) up to and including the blank line that ends it.
+// Returns the header block (excluding the blank line, in `header()`'s own
+// "Name: value\r\n..." form) and the offset of the first body byte.
+//
+// Enforces `maxHeaderLineBytes` per line and `maxPartHeaderBytes` for the
+// whole block as it goes, so a header this rejects is rejected the moment it
+// is seen rather than after buffering it. Fails outright — never truncates —
+// if a limit is exceeded or the block never reaches a blank line.
+fn readPartHeaders(body: string, start: int, n: int, limits: Limits): (string, int)! {
+  let pos = start
+  let total = 0
+  // Bounded by n: `pos` strictly advances by at least 2 bytes (a CRLF) every
+  // iteration, and any line exceeding a limit fails immediately.
+  while (pos <= n) {
+    let lineEnd = indexOfFrom(body, "\r\n", pos)
+    if (lineEnd < 0) {
+      fail newError("multipart: part header block is not terminated")
+    }
+    let lineLen = lineEnd - pos
+    if (lineLen > limits.maxHeaderLineBytes) {
+      fail newError("multipart: part header line exceeds ${limits.maxHeaderLineBytes}-byte limit")
+    }
+    total = total + lineLen + 2
+    if (total > limits.maxPartHeaderBytes) {
+      fail newError("multipart: part header block exceeds ${limits.maxPartHeaderBytes}-byte limit")
+    }
+    if (lineLen == 0) {
+      return body[start:pos], pos + 2
+    }
+    pos = lineEnd + 2
+  }
+  fail newError("multipart: part header block is not terminated")
+}
+
+// Skips any transport padding (spaces/tabs) after a delimiter and requires
+// the CRLF that ends the delimiter line. Fails on anything else, so a
+// delimiter line with junk instead of a terminator cannot be silently
+// reinterpreted as part of the next header.
+fn afterDelimiterLine(body: string, pos: int, n: int): int! {
+  let i = pos
+  // Bounded by n.
+  while (i < n && (body[i] == ' ' || body[i] == '\t')) {
+    i = i + 1
+  }
+  if (i + 2 > n || body[i] != '\r' || body[i + 1] != '\n') {
+    fail newError("multipart: malformed boundary line")
+  }
+  return i + 2
+}
+
+// ---------------------------------------------------------------------------
+// parseMultipart
+// ---------------------------------------------------------------------------
+
+// Parses `body` as a `multipart/form-data` message (RFC 7578) delimited by
+// `boundary` — the value of the request's `Content-Type: multipart/form-data;
+// boundary=...` parameter, WITHOUT the leading `--`. Returns every text field
+// and file part found, or fails with a specific error and no partial `Form`
+// on the first problem: an over-limit body/file/part-count, an over-limit
+// part header, a missing or malformed boundary, or a body whose last part
+// never reaches a closing delimiter.
+//
+// See the module comment for what this deliberately does NOT do: sanitise or
+// validate `filename`, or inspect a declared `Content-Type`.
+export fn parseMultipart(body: []byte, boundary: string, limits: Limits): Form! {
+  if (len(body) > limits.maxBodyBytes) {
+    fail newError("multipart: body exceeds ${limits.maxBodyBytes}-byte limit")
+  }
+  if (!validBoundary(boundary)) {
+    fail newError("multipart: missing or malformed boundary")
+  }
+
+  let bodyStr = string(body)
+  let n = len(bodyStr)
+  let delim = "--" + boundary
+
+  let firstAt = indexOfFrom(bodyStr, delim, 0)
+  if (firstAt < 0) {
+    fail newError("multipart: boundary delimiter not found in body")
+  }
+
+  let form = Form{ fields: []FormField(0), files: []FormFile(0) }
+  let pos = firstAt
+  let partCount = 0
+  let closed = false
+
+  // Bounded by n: every branch below either fails or advances `pos` past at
+  // least the delimiter's own length, so this loop runs at most n times.
+  while (pos < n && !closed) {
+    pos = pos + len(delim)
+    if (pos + 2 <= n && bodyStr[pos] == '-' && bodyStr[pos + 1] == '-') {
+      pos = pos + 2
+      closed = true
+      continue
+    }
+
+    partCount = partCount + 1
+    if (partCount > limits.maxParts) {
+      fail newError("multipart: too many parts (limit ${limits.maxParts})")
+    }
+
+    pos = afterDelimiterLine(bodyStr, pos, n)?
+    let (headers, bodyStart) = readPartHeaders(bodyStr, pos, n, limits)?
+
+    let nextDelimAt = indexOfFrom(bodyStr, "\r\n" + delim, bodyStart)
+    if (nextDelimAt < 0) {
+      fail newError("multipart: unterminated part (boundary never closes)")
+    }
+    let partBody = bodyStr[bodyStart:nextDelimAt]
+
+    let cd = header(headers, "Content-Disposition")
+    if (!hasPrefix(trimSpace(toLower(cd)), "form-data")) {
+      fail newError("multipart: part is missing a form-data Content-Disposition")
+    }
+    let (name, hasName) = dispositionParam(cd, "name")
+    if (!hasName) {
+      fail newError("multipart: part is missing the required name parameter")
+    }
+    let (filename, hasFilename) = dispositionParam(cd, "filename")
+
+    if (hasFilename) {
+      if (len(partBody) > limits.maxFileBytes) {
+        fail newError("multipart: file part \"${name}\" exceeds ${limits.maxFileBytes}-byte limit")
+      }
+      form.files = append(
+        form.files,
+        FormFile{
+          name: name,
+          filename: filename,
+          contentType: header(headers, "Content-Type"),
+          content: []byte(partBody),
+        },
+      )
+    } else {
+      form.fields = append(form.fields, FormField{ name: name, value: partBody })
+    }
+
+    pos = nextDelimAt + 2
+  }
+
+  if (!closed) {
+    fail newError("multipart: unterminated body (boundary never closes)")
+  }
+  return form
+}
