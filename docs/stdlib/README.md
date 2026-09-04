@@ -34,6 +34,7 @@ below is compiled by the test suite, so none of it can quietly rot.
 | [sync](sync.md) | `"std/sync"` | `Mutex`, `RWMutex`, `WaitGroup`, `Once`, atomics |
 | [prof](prof.md) | `"std/prof"` | In-process CPU sampling profiler (aarch64-macos only) |
 | [sql](sql.md) | `"std/sql"` | The database driver contract — interface, registry, no driver |
+| [jwt](jwt.md) | `"std/jwt"` | JWS sign/verify, RFC 7519 claim validation, JWKS key selection |
 
 ## Conventions
 
