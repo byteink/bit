@@ -538,10 +538,47 @@ reworking this.
 ### 5.3 Precedence
 
 ```
-built-in default  <  file directive
+built-in default  <  bit.json "lint" key  <  file directive
 ```
 
-That is the whole model. No project layer, no user layer, no inheritance.
+Most specific wins. `bit.json`'s top-level `"lint"` key (#4156) is a
+project-wide layer between the built-in default and a file's own directive:
+
+```jsonc
+// bit.json
+{
+  "lint": {
+    "rules": { "max-file-lines": 900 },
+    "overrides": [
+      { "paths": ["_tests_/cases"], "allow": ["E0021"] },
+      { "paths": ["_tests_/bit/parsercases"], "disable": true },
+      { "paths": ["bench"], "rules": { "max-fn-lines": 200 } }
+    ]
+  }
+}
+```
+
+`bit.json` is parsed as JSONC (comments and one trailing comma allowed, the
+same grammar `bit.json`'s `dependencies` map already uses — §17.7 of
+SPEC.md). `lint.rules` seeds a project-wide limit for a THRESHOLD rule (the
+same five rules a `<rule>=<n>` file directive can set); `lint.overrides` is a
+list of `{ paths, rules?, disable?, allow? }` entries, applied to every file
+under a matching **directory prefix** — never a glob, and a `*`/`?` in a
+path is a config error rather than a silent non-match. `overrides[].rules`
+narrows the project rule further for that path; `overrides[].disable: true`
+exempts every file under it from `bit lint` entirely, dropped from the walk
+before it is even opened, so a corpus of deliberately-malformed fixtures can
+never turn a parse error into the whole run's exit 2; `overrides[].allow`
+suppresses specific diagnostic codes (not limited to lint's own — a parse
+error's code works too) for files under it, as a post-filter over the run's
+diagnostics.
+
+A file's own directive always wins for that file, over whatever `bit.json`
+set — this is the "most specific wins" rule, and its cost is symmetric: a
+project **cannot** use `bit.json` to tighten a limit a file's own directive
+has already relaxed. A `bit.json` with no `"lint"` key, or no `bit.json` at
+all, is exactly today's model — no project layer, no user layer, no
+inheritance beyond what is shown above.
 
 ### 5.4 Day-one adoption
 
