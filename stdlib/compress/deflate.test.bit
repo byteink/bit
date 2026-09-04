@@ -1,0 +1,171 @@
+// stdlib/compress/deflate.test.bit — `deflate` correctness (#3957).
+//
+// SELF-CONSISTENCY PROVES NOTHING HERE: a symmetric bug in this module's
+// encoder would need a matching decoder to check against, and this module
+// has no decoder (encode-only, by design — see deflate.bit's header). So
+// every round-trip below goes through PYTHON'S OWN `zlib` module, run as a
+// real subprocess — never a decoder this repo wrote. `wbits=-15` is
+// Python's zlib module's documented "raw deflate, no zlib/gzip header"
+// mode, the only way to decode `deflate()`'s bare RFC 1951 output.
+//
+// Shared shell/scratch-file plumbing (`scratchDir`, `shellRun`,
+// `assertDeflateRoundTrip`) lives here and is used by `gzip.test.bit` too,
+// without re-importing anything: a module's files share one flat import
+// scope (SPEC §17.2/§19), and importing the same name twice is E0042.
+
+import { writeFile, readFile, mkdir } from "std/fs"
+import { envOr } from "std/os"
+import { eqSlice } from "std/testing"
+
+// Nonce'd per call (bitlang-ws/CLAUDE.md: `$TMPDIR` is shared by every
+// concurrent agent/test, and a plain name is the bug this rule exists for).
+fn scratchDir(tag: string): string {
+  return "${envOr("TMPDIR", "/tmp")}/bit-compress-${tag}-${timeUnixNs()}"
+}
+
+// Writes `script` to `path`, makes it executable, and runs it through
+// /bin/sh — the same shape every `_tests_/bit/*.bit` harness in this repo
+// uses to shell out (e.g. `_tests_/bit/coldboot.bit`'s `shell`).
+fn shellRun(path: string, script: string, timeoutMs: int): int {
+  writeFile(path, script) catch _ {
+    return -999
+  }
+  if (fsChmod(path, 448) != 0) { // 0o700: owner rwx only
+    return -998
+  }
+  return osRunBounded(path, timeoutMs)
+}
+
+// Verifies `compressed` (raw RFC 1951 output from `deflate`) decompresses
+// under Python's zlib to exactly `want`, byte for byte.
+fn assertDeflateRoundTrip(label: string, compressed: []u8, want: []u8) {
+  let dir = scratchDir("deflate")
+  mkdir(dir) catch e {
+    panic("${label}: mkdir ${dir}: ${e.message()}")
+  }
+  writeFile("${dir}/in.bin", string(compressed)) catch e {
+    panic("${label}: write in.bin: ${e.message()}")
+  }
+  let py = "import zlib\n" +
+    "data = open('${dir}/in.bin', 'rb').read()\n" +
+    "out = zlib.decompress(data, -15)\n" +
+    "open('${dir}/out.bin', 'wb').write(out)\n"
+  writeFile("${dir}/dec.py", py) catch e {
+    panic("${label}: write dec.py: ${e.message()}")
+  }
+  let code = shellRun("${dir}/run.sh", "#!/bin/sh\nset -e\npython3 '${dir}/dec.py'\n", 30000)
+  if (code != 0) {
+    panic("${label}: python3 zlib.decompress(data, -15) exited ${code} — see ${dir}")
+  }
+  let got: []byte = []byte(
+    readFile("${dir}/out.bin") catch e {
+      panic("${label}: read out.bin: ${e.message()}")
+    },
+  )
+  eqSlice(got, want, label)
+}
+
+fn repeatByte(n: int, b: byte): []byte {
+  let s: []byte = []byte(n)
+  let i = 0
+  while (i < n) {
+    s[i] = b
+    i = i + 1
+  }
+  return s
+}
+
+fn repeatText(totalLen: int, phrase: string): []byte {
+  let plen = len(phrase)
+  let out: []byte = []byte(totalLen)
+  let i = 0
+  while (i < totalLen) {
+    out[i] = phrase[i % plen]
+    i = i + 1
+  }
+  return out
+}
+
+// Deterministic pseudo-random bytes (a plain LCG) — reproducible across
+// runs, unlike a wall-clock seed, and needs no `std/rand` dependency for
+// what is just "incompressible-looking filler".
+fn pseudoRandomBytes(n: int, seed0: u32): []byte {
+  let out: []byte = []byte(n)
+  let seed = seed0
+  let i = 0
+  while (i < n) {
+    seed = seed * 1103515245 + 12345
+    out[i] = byte((seed >> 16) & 0xff)
+    i = i + 1
+  }
+  return out
+}
+
+test "empty input round-trips through python3 zlib" {
+  let src: []byte = []byte(0)
+  let got = deflate(src, 6) catch e {
+    panic("deflate(empty): ${e.message()}")
+  }
+  assertDeflateRoundTrip("empty", got, src)
+}
+
+test "a single byte round-trips through python3 zlib" {
+  let src: []byte = []byte{ 65 }
+  let got = deflate(src, 6) catch e {
+    panic("deflate(one byte): ${e.message()}")
+  }
+  assertDeflateRoundTrip("one byte", got, src)
+}
+
+test "highly repetitive input round-trips and LZ77 shrinks it well under 10%" {
+  let src = repeatByte(20000, 'A')
+  let got = deflate(src, 6) catch e {
+    panic("deflate(repetitive): ${e.message()}")
+  }
+  assertDeflateRoundTrip("repetitive", got, src)
+  assert(
+    len(got) * 10 < len(src),
+    "20000 repeated bytes compressed to ${len(got)}, expected well under 2000 (10%) — LZ77 matching does not appear to be firing",
+  )
+}
+
+test "64KB of random bytes round-trips and never expands beyond input + 1%" {
+  let src = pseudoRandomBytes(65536, 42)
+  let got = deflate(src, 6) catch e {
+    panic("deflate(random): ${e.message()}")
+  }
+  assertDeflateRoundTrip("random 64KB", got, src)
+  let bound = len(src) + len(src) / 100
+  assert(
+    len(got) <= bound,
+    "64KB of random bytes compressed to ${len(got)}, want <= ${bound} (input + 1%) — the stored-block floor is not being taken",
+  )
+}
+
+test "input larger than one block round-trips (block-boundary logic runs)" {
+  let src = repeatText(100000, "the quick brown fox jumps over the lazy dog ")
+  let got = deflate(src, 6) catch e {
+    panic("deflate(100KB): ${e.message()}")
+  }
+  assertDeflateRoundTrip("100KB multi-block", got, src)
+}
+
+test "level below 0 fails" {
+  let src: []byte = []byte{ 1, 2, 3 }
+  let ok = true
+  let _ = deflate(src, -1) catch _ {
+    ok = false
+    []byte(0)
+  }
+  assert(!ok, "deflate(src, -1) should have failed")
+}
+
+test "level above 9 fails" {
+  let src: []byte = []byte{ 1, 2, 3 }
+  let ok = true
+  let _ = deflate(src, 10) catch _ {
+    ok = false
+    []byte(0)
+  }
+  assert(!ok, "deflate(src, 10) should have failed")
+}
