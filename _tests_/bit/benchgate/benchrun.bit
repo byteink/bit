@@ -1,0 +1,303 @@
+// _tests_/bit/benchgate/benchrun.bit -- the subprocess script generation and
+// result parsing for the benchmark regression gate (#4301's split of
+// `benchgate.bit`, which crossed the 800-line limit again after #3934's
+// second alloc case; #3023 was the first split, into `baselines.bit`).
+//
+// Sibling of `benchgate.bit` in the same directory module: no `import`, one
+// shared scope. This file is the SHELL PLUMBING, BUILD and MEASURE sections
+// moved here VERBATIM -- `shQuote`, `mkdirQuiet`, `scratchRoot`, `runMsg`,
+// `CompilerEnv`, `buildScript`, `darwinMeasureBranch`, `linuxMeasureBranch`,
+// `measureScript`, `Measured`, `trimTrailingNl` and `parseMeasured`. See
+// `benchgate.bit`'s own header for the full design rationale (WHY PEAK RSS,
+// WHY OBJECT COUNT IS TWO-SIDED, etc.) and its SUBPROCESS MECHANICS
+// paragraph for what these functions do: build the benchmark once, then run
+// it `reps` times through a generated `/bin/sh` wrapper that reports exit
+// code, user CPU centiseconds, peak RSS bytes and allocated object count as
+// one space-separated result line.
+
+// --- shell plumbing ----------------------------------------------------
+
+// Wraps `s` as exactly one POSIX `/bin/sh` word.
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+fn mkdirQuiet(path: string) {
+  mkdir(path) catch e {
+    return
+  }
+}
+
+// A scratch root whose path is already lexically canonical (the trailing-
+// slash hazard is _tests_/bit/lspcache.bit's #2410 — `TMPDIR` ends in `/` on
+// macOS, and a doubled separator has bitten a gate here before).
+fn scratchRoot(): string {
+  let base = envOr("TMPDIR", "/tmp")
+  while (len(base) > 1 && base[len(base) - 1] == '/') {
+    base = base[0:len(base) - 1]
+  }
+  return base + "/bit-benchgate-${timeUnixNs()}"
+}
+
+// `osRunBounded`'s three non-zero outcomes rendered as a message (ABI.md
+// §19), same encoding as _tests_/bit/stress/verify.bit's `runMsg`.
+fn runMsg(code: int): string {
+  if (code == 0) {
+    return ""
+  }
+  if (code == 0 - 1) {
+    return "SPAWN FAILED (fork/exec/wait error)"
+  }
+  if (code == 0 - 2) {
+    return "TIMED OUT after ${timeoutMs()}ms (raise BIT_TEST_TIMEOUT_S)"
+  }
+  if (code <= 0 - 100) {
+    return "CRASHED: killed by signal ${0 - code - 100}"
+  }
+  return "exited ${code}"
+}
+
+// --- build ---------------------------------------------------------------
+
+// The compiler under test, bundled with the environment it needs to run
+// (BIT_STDLIB/BIT_LIBBITRT) — grouped because every function below that
+// invokes the compiler needs all three together.
+class CompilerEnv {
+  bit: string,
+  libbitrt: string,
+  stdlib: string,
+}
+
+fn buildScript(
+  cc: CompilerEnv,
+  srcPath: string,
+  binPath: string,
+  outPath: string,
+  errPath: string,
+): string {
+  let s = "#!/bin/sh\n"
+  if (cc.stdlib != "") {
+    s = s + "BIT_STDLIB=" + shQuote(cc.stdlib) + "\nexport BIT_STDLIB\n"
+  }
+  if (cc.libbitrt != "") {
+    s = s + "BIT_LIBBITRT=" + shQuote(cc.libbitrt) + "\nexport BIT_LIBBITRT\n"
+  }
+  s = s +
+    "exec " +
+    shQuote(cc.bit) +
+    " build " +
+    shQuote(srcPath) +
+    " -o " +
+    shQuote(binPath) +
+    " > " +
+    shQuote(outPath) +
+    " 2> " +
+    shQuote(errPath) +
+    "\n"
+  return s
+}
+
+// --- measure ---------------------------------------------------------------
+
+// One run's user-CPU-and-peak-RSS wrapper. Dispatches on `uname -s` so a
+// single generated script serves both gate platforms (macOS dev host, real
+// aarch64/x86_64 Linux via scripts/{arm64,x64}gate.sh) — see the file header
+// for why each branch works the way it does. The wrapper's own `exit`
+// re-raises the BENCHMARK's exit code, so `osRunBounded`'s return value is
+// the thing that failed, not "the wrapper script", and non-zero there is
+// treated as a hard failure by the caller.
+//
+// Result file format: one line, FOUR space-separated decimals —
+// "<benchmark exit code> <user CPU centiseconds> <peak RSS bytes> <allocated
+// objects>" — with -1 standing in for "not measured" on any of the three
+// metrics, never a silent 0 (the same convention _tests_/bit/lspcache.bit's
+// `intAfter` uses). The 4th field is `swept+live` parsed out of the child's
+// own `BIT_GC_STATS=1` exit-summary line (#3130) — see runtime/root's
+// `statsReport` for the line's exact grammar and
+// _tests_/bit/lspcache.bit's header for why `swept+live` is "every object the
+// run allocated" and `collections` is not what this gate reads (it depends
+// on when the trigger fires, which depends on live bytes — see #2941).
+// The Darwin case branch of measureScript's dispatch. The child inherits fd
+// 2 from this redirect, same as before #3130 — its own `[bit-gc] ...` line
+// and `/usr/bin/time -l`'s summary both land in rawPath, in that order (the
+// child exits and is reaped before `time` appends its own report), so no
+// second capture file is needed here. `/usr/bin/time -l`'s first line is
+// fixed-format: "<real> real <user> user <sys> sys", so the user-seconds
+// value is always field 3 of the line matching " user". `(u*100)+0.5`
+// rounds to the nearest centisecond. The same pass folds in the
+// `swept=`/`live=` scan (`gcAwkBody`, built once in measureScript and
+// shared by both branches) so ONE awk call produces all four fields.
+fn darwinMeasureBranch(
+  bin: string,
+  outPath: string,
+  rawPath: string,
+  resPath: string,
+  gcAwkBody: string,
+): string {
+  let s = "  Darwin)\n"
+  s = s +
+    "    /usr/bin/time -l " +
+    shQuote(bin) +
+    " >" +
+    shQuote(outPath) +
+    " 2>" +
+    shQuote(rawPath) +
+    "\n"
+  s = s + "    ec=$?\n"
+  s = s +
+    "    awk -v ec=$ec 'BEGIN{u=-1;r=-1;" +
+    gcAwkBody +
+    "/ user/{u=$3} /maximum resident set size/{r=$1} " +
+    "END{obj=-1; if (sw>=0 && lv>=0) obj=sw+lv; " +
+    "printf \"%d %d %d %d\\n\", ec, (u*100)+0.5, r, obj}' " +
+    shQuote(rawPath) +
+    " > " +
+    shQuote(resPath) +
+    "\n"
+  s = s + "    exit $ec\n"
+  return s + "    ;;\n"
+}
+
+// The `*` (Linux) case branch: no `/usr/bin/time -l`, so this polls
+// /proc/$pid/status and /proc/$pid/stat while the benchmark runs to sample
+// peak RSS (VmHWM) and CPU ticks. `sed 's/.*) //'` strips through the LAST
+// ')' so a comm field containing its own parens cannot shift the column
+// count; the remaining fields' 12th and 13th are utime+stime —
+// _tests_/bit/fsblock.bit's `cpu()` reads the same two fields the same way,
+// mutation-tested for #2207. `gcPath` is the child's OWN stderr, captured
+// separately (Linux has no `/usr/bin/time -l` merging it in for us the way
+// the Darwin branch gets for free) — same `swept=`/`live=` scan, different
+// source file.
+fn linuxMeasureBranch(
+  bin: string,
+  outPath: string,
+  gcPath: string,
+  resPath: string,
+  gcAwkBody: string,
+): string {
+  let s = "  *)\n"
+  s = s + "    " + shQuote(bin) + " >" + shQuote(outPath) + " 2>" + shQuote(gcPath) + " &\n"
+  s = s + "    pid=$!\n"
+  s = s + "    cpu=-1\n"
+  s = s + "    hwm=-1\n"
+  s = s + "    while kill -0 $pid 2>/dev/null; do\n"
+  s = s + "      if [ -r /proc/$pid/status ]; then\n"
+  s = s + "        v=$(awk '/VmHWM/{print $2}' /proc/$pid/status 2>/dev/null)\n"
+  s = s + "        case $v in\n"
+  s = s + "          '') ;;\n"
+  s = s + "          *) hwm=$v ;;\n"
+  s = s + "        esac\n"
+  s = s + "      fi\n"
+  s = s + "      if [ -r /proc/$pid/stat ]; then\n"
+  s = s + "        c=$(sed 's/.*) //' /proc/$pid/stat 2>/dev/null | awk '{print $12+$13}')\n"
+  s = s + "        case $c in\n"
+  s = s + "          '') ;;\n"
+  s = s + "          *) cpu=$c ;;\n"
+  s = s + "        esac\n"
+  s = s + "      fi\n"
+  s = s + "      sleep 0.05\n"
+  s = s + "    done\n"
+  s = s + "    wait $pid\n"
+  s = s + "    ec=$?\n"
+  s = s + "    CLK=$(getconf CLK_TCK 2>/dev/null || echo 100)\n"
+  s = s + "    cpuCs=-1\n"
+  s = s + "    rssB=-1\n"
+  s = s + "    if [ $cpu -ge 0 ]; then cpuCs=$((cpu * 100 / CLK)); fi\n"
+  s = s + "    if [ $hwm -ge 0 ]; then rssB=$((hwm * 1024)); fi\n"
+  s = s +
+    "    obj=$(awk 'BEGIN{" +
+    gcAwkBody +
+    "END{if (sw>=0 && lv>=0) print sw+lv; else print -1}' " +
+    shQuote(gcPath) +
+    ")\n"
+  s = s + "    printf \"%d %d %d %d\\n\" $ec $cpuCs $rssB $obj > " + shQuote(resPath) + "\n"
+  s = s + "    exit $ec\n"
+  return s + "    ;;\n"
+}
+
+fn measureScript(bin: string, outPath: string, resPath: string, gcMinKb: int): string {
+  let rawPath = resPath + ".raw"
+  let gcPath = resPath + ".gcerr"
+  // `swept=`/`live=` extraction shared (as an awk fragment) by both platform
+  // branches below: scan every whitespace-separated field of a captured
+  // stream for the two `key=value` tokens (unambiguous — nothing else either
+  // platform captures produces a field starting with either prefix) and hold
+  // their sum in `obj`, or -1 if the line never arrived. `sub()`'s
+  // replacement is `""` so this needs no `[`/`]` escaping — no anchor on
+  // `[bit-gc]` itself is needed either.
+  let gcAwkBody = "sw=-1;lv=-1} /swept=/{for(i=1;i<=NF;i++){" +
+    "if($i~/^swept=/){t=$i;sub(/^swept=/,\"\",t);sw=t} " +
+    "if($i~/^live=/){t=$i;sub(/^live=/,\"\",t);lv=t}}} "
+  let s = "#!/bin/sh\n"
+  // Exported before the platform dispatch below so it reaches the benchmark
+  // child on either branch. 0 means "leave BIT_GC_MIN_KB unset" (see the
+  // Baseline.gcMinKb field comment). BIT_GC_STATS=1 is unconditional — every
+  // case needs an object-count reading now, not just churn's leak guard.
+  if (gcMinKb > 0) {
+    s = s + "BIT_GC_MIN_KB=${gcMinKb}\nexport BIT_GC_MIN_KB\n"
+  }
+  s = s + "BIT_GC_STATS=1\nexport BIT_GC_STATS\n"
+  s = s + "case \"$(uname -s)\" in\n"
+  s = s + darwinMeasureBranch(bin, outPath, rawPath, resPath, gcAwkBody)
+  s = s + linuxMeasureBranch(bin, outPath, gcPath, resPath, gcAwkBody)
+  s = s + "esac\n"
+  return s
+}
+
+class Measured {
+  ok: bool,
+  exitCode: int,
+  cpuCentis: int,
+  rssBytes: int,
+  objects: int,
+  out: string,
+}
+
+// `trimSpace` (std/strings) only strips spaces and tabs, not newlines — the
+// result file's line always ends in the `\n` awk's/printf's own `%s\n`
+// emitted, so that has to go before `split` sees it or the last field keeps
+// a trailing `\n` and fails `parseInt`.
+fn trimTrailingNl(s: string): string {
+  let hi = len(s)
+  while (hi > 0 && (s[hi - 1] == '\n' || s[hi - 1] == '\r')) {
+    hi = hi - 1
+  }
+  return s[0:hi]
+}
+
+fn parseMeasured(resText: string, outText: string): Measured {
+  let parts = split(trimSpace(trimTrailingNl(resText)), " ")
+  if (len(parts) != 4) {
+    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, out: outText }
+  }
+  let ec = parseInt(parts[0]) catch _ {
+    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, out: outText }
+  }
+  let cpu = parseInt(parts[1]) catch _ {
+    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, out: outText }
+  }
+  let rss = parseInt(parts[2]) catch _ {
+    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, out: outText }
+  }
+  let obj = parseInt(parts[3]) catch _ {
+    return Measured{ ok: false, exitCode: 0, cpuCentis: 0, rssBytes: 0, objects: 0, out: outText }
+  }
+  return Measured{
+    ok: true,
+    exitCode: ec,
+    cpuCentis: cpu,
+    rssBytes: rss,
+    objects: obj,
+    out: outText,
+  }
+}
