@@ -12,6 +12,7 @@
 // `listenAndServe` already avoids doing since #2170.
 export class Server {
   listener: Listener
+  drain: drainState
   // The port the server is bound to.
   export port(): int! {
     return this.listener.port()?
@@ -72,7 +73,7 @@ export class Exchange {
 // choose one; read it back with `port()`.
 export fn serve(host: string, port: int): Server! {
   let l = listen(host, port)?
-  return Server{ listener: l }
+  return Server{ listener: l, drain: newDrainState() }
 }
 
 // Answers a malformed request with `400 Bad Request` and closes the
@@ -112,7 +113,7 @@ fn answerBadRequest(s: byteStream) {
 export fn listenAndServeOn(s: Server, handler: (Request) => Response): ()! {
   while (true) {
     let c = s.listener.accept()?
-    spawn serveOne(netStream{ conn: c }, handler, 0)
+    spawn serveOne(netStream{ conn: c }, handler, 0, s.drain)
   }
 }
 
@@ -130,18 +131,36 @@ export fn listenAndServe(host: string, port: int, handler: (Request) => Response
 
 // Read one request off `s`, answer it with `handler`, and close. On the calling
 // green thread; a read or write failure just drops the connection. `altPort` is
-// advertised in the response's Alt-Svc header (0 to advertise nothing).
-fn serveOne(s: byteStream, handler: (Request) => Response, altPort: int) {
-  answer(s, handler, altPort) catch _ {
+// advertised in the response's Alt-Svc header (0 to advertise nothing). `d` is
+// the owning `Server`'s drain tracker (`shutdown.bit`, #3963): this connection
+// is registered idle for as long as it waits for its request, then marked
+// active for the rest of its life, so a graceful shutdown knows whether it is
+// safe to force-close right away or must be given a chance to finish.
+fn serveOne(s: byteStream, handler: (Request) => Response, altPort: int, d: drainState) {
+  let id = drainRegister(
+    d,
+    () => {
+      s.forceClose()
+    },
+  )
+  defer drainDeregister(d, id)
+  answer(s, handler, altPort, d, id) catch _ {
     return
   }
 }
 
-fn answer(s: byteStream, handler: (Request) => Response, altPort: int): ()! {
+fn answer(
+  s: byteStream,
+  handler: (Request) => Response,
+  altPort: int,
+  d: drainState,
+  id: int,
+): ()! {
   let req = readMessage(s) catch _ {
     answerBadRequest(s)
     return
   }
+  drainMarkActive(d, id)
   // `defer` (SPEC §18.5) runs on `?` propagation the same as a normal
   // return, so a peer that hangs up before the response write completes
   // still shuts `s` down — without this the bare `s.shut()` below the `?`
@@ -171,6 +190,12 @@ fn answer(s: byteStream, handler: (Request) => Response, altPort: int): ()! {
 // port. Returns only on an accept or handshake error.
 export fn serveTlsOn(l: TlsListener, handler: (Request) => Response): ()! {
   let altPort = l.port()?
+  // A private drain tracker, never exposed outside this call: `serveOne`
+  // (server.bit) needs a `drainState` to register HTTP/1.1-over-TLS
+  // connections in either way, and this keeps that signature uniform with the
+  // plain path. Nothing external can drain it — `shutdown` (shutdown.bit,
+  // #3963) is scoped to `Server` only; see that file's header comment for why.
+  let d = newDrainState()
   while (true) {
     // A per-connection failure (a bad or rejected TLS handshake — e.g. a client
     // whose ALPN offer shares nothing with ours, which RFC 7301 §3.2 makes us
@@ -182,7 +207,7 @@ export fn serveTlsOn(l: TlsListener, handler: (Request) => Response): ()! {
     let conn = l.accept() catch _ {
       continue
     }
-    spawn serveTlsConn(conn, handler, altPort)
+    spawn serveTlsConn(conn, handler, altPort, d)
   }
 }
 
@@ -218,10 +243,10 @@ fn altSvcHeader(port: int): string {
 // Dispatch one accepted TLS connection to the HTTP/2 or HTTP/1.1 server path by
 // its negotiated ALPN protocol. Runs on the spawned per-connection green thread.
 // `altPort` is the HTTP/3 port advertised in each response's Alt-Svc header.
-fn serveTlsConn(conn: TlsConn, handler: (Request) => Response, altPort: int) {
+fn serveTlsConn(conn: TlsConn, handler: (Request) => Response, altPort: int, d: drainState) {
   if (conn.alpnProtocol() == "h2") {
     h2glueServe(conn, handler, altPort)
     return
   }
-  serveOne(tlsStream{ conn: conn }, handler, altPort)
+  serveOne(tlsStream{ conn: conn }, handler, altPort, d)
 }

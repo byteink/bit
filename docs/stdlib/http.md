@@ -351,6 +351,22 @@ fn runServer(s: Server, n: int): ()! {
 }
 ```
 
+### `shutdown(s: Server, timeoutMs: int): ()!`
+
+Stops `s` accepting new connections and drains requests already in flight,
+then returns. The listener closes first, so a fresh dial is refused right
+away. A connection still waiting for its request (including one that never
+sent a byte) is force-closed immediately - there is nothing to protect yet.
+A connection whose request has reached `handler` is given up to `timeoutMs`
+to finish; whatever is still running once that elapses is force-closed too,
+and the returned error names exactly how many connections were cut - a
+silent force-close would look identical to a clean one. Safe to call from a
+signal handler and safe to call twice (or concurrently): every call after
+the first replays the first call's own outcome rather than repeating any
+side effect. Scoped to `serve`/`listenAndServe`/`listenAndServeOn`; it does
+not reach a `serveTls`/`serveTlsOn` server or the direct `Server.accept()`/
+`Exchange` API.
+
 ## Request headers
 
 `header(block, name)` only ever *reads* a raw header block — nothing lets a

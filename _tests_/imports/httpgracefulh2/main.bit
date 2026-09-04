@@ -1,0 +1,121 @@
+// std/http2 GOAWAY graceful drain (#3963): `Conn.close()` (stdlib/http2/conn.bit)
+// sends GOAWAY naming the last accepted stream id and lets that stream finish,
+// rather than closing the connection outright. Proven directly against the
+// wire-level std/http2 engine — no TLS/ALPN involved, `Transport` is
+// transport-agnostic (`newTransport` takes plain read/write/shutdown
+// closures) — so the proof does not depend on how a caller like std/http's
+// server.bit wires shutdown in, only on the engine's own documented
+// contract:
+//
+//   1. a stream already in flight when GOAWAY is sent still gets its real
+//      response — the connection is NOT closed out from under it;
+//   2. a client that has genuinely RECEIVED that GOAWAY refuses to open a
+//      further stream on the same connection itself, locally, with no wire
+//      round trip at all (`h2connCmdOpen`, stdlib/http2/events.bit) — this
+//      can only happen if the GOAWAY frame actually reached it.
+import { listen, dial, Listener, Conn } from "std/net"
+import {
+  connect, accept, defaultConfig, newTransport, newRequest, newResponse, Transport,
+  Conn as H2Conn,
+} from "std/http2"
+import { sleep, Millisecond } from "std/time"
+import { indexOf } from "std/strings"
+
+const testPort: int = 47041
+
+fn report(tag: string, passed: bool) {
+  if (passed) {
+    println(tag + " PASS")
+    return
+  }
+  println(tag + " FAIL")
+}
+
+// Adapt a plain `std/net` `Conn` to the http2 engine's byte `Transport` — the
+// same shim shape `std/http`'s own `h2glueTransport` (stdlib/http/h2.bit)
+// uses for a `TlsConn`, over a cleartext socket instead since the engine does
+// not care which.
+fn rawTransport(c: Conn): Transport {
+  return newTransport(
+    (n) => {
+      return []byte(c.read(n))
+    },
+    (b) => {
+      rawWrite(c, b)
+    },
+    () => {
+      c.close()
+    },
+  )
+}
+
+fn rawWrite(c: Conn, b: []byte) {
+  c.write(string(b)) catch _ {
+    return
+  }
+}
+
+// Accept one connection, start the h2 server engine, and serve it: the
+// handler signals `startedCh` the instant its stream begins (proof it
+// genuinely reached the handler, not a guessed delay) then sleeps briefly —
+// long enough for `sendGoawayOnceStarted` to send GOAWAY WHILE this stream is
+// still open, proving GOAWAY-then-drain rather than GOAWAY-then-abort.
+fn runServer(l: Listener, startedCh: chan<bool>) {
+  let c = l.accept() catch e {
+    println("accept failed: ${e.message()}")
+    return
+  }
+  let hc = accept(rawTransport(c), defaultConfig(), 0) catch e {
+    println("h2 accept failed: ${e.message()}")
+    return
+  }
+  spawn sendGoawayOnceStarted(hc, startedCh)
+  hc.serve(
+    (req) => {
+      startedCh <- true
+      sleep(150 * Millisecond)
+      return newResponse(200, []byte("in-flight-ok"))
+    },
+  ) catch e {
+    println("hc.serve failed: ${e.message()}")
+  }
+}
+
+fn sendGoawayOnceStarted(hc: H2Conn, startedCh: chan<bool>) {
+  <- startedCh
+  hc.close()
+}
+
+fn clientRun(): ()! {
+  let c1 = dial("127.0.0.1", testPort)?
+  let cc = connect(rawTransport(c1), defaultConfig(), 0)?
+
+  let res1 = cc.roundTrip(newRequest("GET", "127.0.0.1", "/"))?
+  report("h2-inflight-stream-completed", res1.status == 200 && string(res1.body) == "in-flight-ok")
+
+  // A second stream on the SAME connection, attempted only AFTER the first
+  // round trip returned — by then the client has necessarily already
+  // processed the GOAWAY the server sent while that first stream was still
+  // running (the reader/loop threads apply an incoming GOAWAY as soon as it
+  // arrives, independently of any in-progress roundTrip). Refused LOCALLY,
+  // with no wire round trip, iff GOAWAY was genuinely observed.
+  let _ = cc.roundTrip(newRequest("GET", "127.0.0.1", "/again")) catch e {
+    report("h2-goaway-observed-before-close", indexOf(e.message(), "closing") >= 0)
+    return
+  }
+  // A second round trip succeeded — GOAWAY was never observed.
+  report("h2-goaway-observed-before-close", false)
+}
+
+fn run(): ()! {
+  let l = listen("127.0.0.1", testPort)?
+  let startedCh = chan<bool>(1)
+  spawn runServer(l, startedCh)
+  clientRun()?
+}
+
+fn main() {
+  run() catch e {
+    println("failed: ${e.message()}")
+  }
+}
