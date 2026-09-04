@@ -19,7 +19,8 @@ closes the RS256-to-HS256 algorithm-confusion attack.
 ## Signing and verifying
 
 ```bit
-import { Hs256Key, sign, verify, Json, JsonEntry } from "std/jwt"
+import { SigningKey, VerifyKey, sign, verify } from "std/jwt"
+import { Json, JsonEntry, jsonGet, jsonAsString } from "std/json"
 
 fn run(): ()! {
   let secret = []byte("a shared secret at least this long")
@@ -27,7 +28,14 @@ fn run(): ()! {
 
   let token = sign(SigningKey.Hs256Key(secret), payload)?
   let got = verify(token, VerifyKey.Hs256Key(secret))?
-  println(jsonAsString(unwrap(jsonGet(got, "sub"))).unwrapOr(""))
+  let sub = jsonAsString(unwrap(jsonGet(got, "sub")))
+  println(unwrapOr(sub, ""))
+}
+
+fn main() {
+  run() catch e {
+    println("failed: ${e.message()}")
+  }
 }
 ```
 
@@ -93,12 +101,14 @@ accepted — no standard-claim validation; see `verifyToken`.
 ## Claim validation
 
 ```bit
-import { defaultClaimsOptions, verifyToken } from "std/jwt"
+import { VerifyKey, defaultClaimsOptions, verifyToken } from "std/jwt"
 
 fn checkIt(token: string, key: VerifyKey, nowUnixSeconds: int): ()! {
   let opts = defaultClaimsOptions(nowUnixSeconds)
   let payload = verifyToken(token, key, opts)?
 }
+
+fn main() {}
 ```
 
 ### `ClaimsOptions`
@@ -125,12 +135,14 @@ with its own distinct message.
 ## JWKS
 
 ```bit
-import { parseJwks, jwksFindByKid } from "std/jwt"
+import { VerifyKey, parseJwks, jwksFindByKid } from "std/jwt"
 
 fn selectKey(doc: string, kid: string): VerifyKey! {
   let jwks = parseJwks(doc)?
   return jwksFindByKid(jwks, kid)?
 }
+
+fn main() {}
 ```
 
 ### `Jwk`
