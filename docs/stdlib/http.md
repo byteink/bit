@@ -152,10 +152,15 @@ One file part as sent: `name`, the sender's declared `filename` and
 ### `Form`
 
 The result of a successful `parseMultipart`: every `FormField` in `fields`
-and every `FormFile` in `files`, in the order they appeared. `value(name)`
-returns the first field value matching `name`, or `""` if none did;
-`file(name): FormFile!` returns the first file part matching `name`, or
-fails if none did.
+and every `FormFile` in `files`, in the order they appeared.
+
+### `Form.value(name: string): string`
+
+The value of the first field named `name`, or `""` if none matched.
+
+### `Form.file(name: string): FormFile!`
+
+The first file part named `name`. Fails if none matched.
 
 ### `parseMultipart(body: []byte, boundary: string, limits: Limits): Form!`
 
