@@ -2282,6 +2282,16 @@ keys), or anything else. A `(k, v)` pair binder over `for_in` is rejected too,
 and is not even grammatical: Appendix A's `for_in` production takes one
 `IDENT`, unlike `for_of`'s `( IDENT | "(" pat "," pat ")" )`.
 
+**Field-pattern binder (#4106).** `for_of`'s binder also accepts a `field_pat`
+— `for { a, b, ... } of xs`, legal only when `xs`'s element is a class. Each
+name binds a local of the same name to that field's value, the for-of analogue
+of composite-literal shorthand's `Point{ x, y }` (§12.2). Order in the pattern
+is irrelevant, unlike the positional pair binder above — every name is looked
+up by the class's own field name, not by position — and a name the class does
+not declare is a compile error, never a parse error and never a silent
+`invalid`-typed binding. `field_pat` is never nested: each item is a plain
+`IDENT`, not a `pat`.
+
 **Loop-variable scope.** A loop variable a `for` statement itself declares is a
 **new variable each iteration**: the `for_c` variables declared by the init clause,
 and the `for_of`/`for_in` binders. The first iteration uses the variable the init
@@ -4331,8 +4341,9 @@ if_stmt       = "if" "(" expression ")" block [ "else" ( if_stmt | block ) ] .
 while_stmt    = "while" "(" expression ")" block .
 for_stmt      = "for" ( for_c | for_of | for_in | (* empty -> infinite *) ) block .
 for_c         = "(" [ value_decl | assign_stmt ] ";" [ expression ] ";" [ inc_dec_stmt | assign_stmt ] ")" .
-for_of        = ( IDENT | "(" pat "," pat ")" ) "of" expression .
+for_of        = ( IDENT | "(" pat "," pat ")" | field_pat ) "of" expression .
 for_in        = IDENT "in" expression .
+field_pat     = "{" IDENT { "," IDENT } "}" .   (* for-of field-name binder; §12.6 *)
 switch_stmt   = "switch" [ "(" expression ")" ] "{" { switch_case } "}" .
 switch_case   = "case" expression { "," expression } ":" { statement ";" }
               | "default" ":" { statement ";" } .

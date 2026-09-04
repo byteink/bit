@@ -57,6 +57,83 @@ fn lowerForOfSliceElem(fc: FnCtx, iterCur: int, idxVal: int, elemTy: int): ForOf
   return ForOfSliceElem{ value: emitRtCall(fc, sg), bindTy: elemTy }
 }
 
+// The value of field `fieldName` read off `elemVal` — the per-iteration
+// element `lowerForOfSliceElem`/the array `IndexGet` already loaded. Mirrors
+// `loweraccess.bit`'s `.field` read (`structLayout` + `Op.FieldGet`) but skips
+// receiver lowering (`elemVal` already IS the receiver, boxed or packed —
+// `lowerForOfSliceElem`'s own comment is why `Op.FieldGet` reads either kind
+// identically) and the method-value fallback: the checker's `vForOfFieldPat`
+// (validateloop.bit, #4106) has already refused any name that is not a
+// genuine field, so `idx` here is never -1.
+fn lowerForOfFieldGet(fc: FnCtx, elemVal: int, elemTy: int, fieldName: string, fty: int): int {
+  let oc = typeOwner(fc.c, elemTy)
+  let decl = structDeclOf(fc.c, elemTy)
+  let fields = structFieldNodes(oc, decl)
+  let idx = fieldIndexByName(oc, fields, fieldName)
+  let layout = structLayout(fc, oc, decl, structTySubst(fc, oc, decl, elemTy))
+  let ins = mkInstr(Op.FieldGet, fty)
+  ins.lhs = elemVal
+  ins.ival = layout.offsets[idx]
+  return builderEmit(fc.b, ins)
+}
+
+// `for { a, b, ... } of xs` (#4106): binds each pattern name to the
+// correspondingly-named field of the per-iteration element, in pattern order.
+// `fty` is looked up the same way the checker's `typeForOfFieldPat`
+// (checkmatch.bit) already did, so lowering can never disagree with what the
+// body was type-checked against — no generic-instantiation gap of the kind
+// `fieldAccessType`'s own comment describes for the general `.field` path.
+fn lowerForOfFieldPat(fc: FnCtx, names: []int, elemVal: int, elemTy: int) {
+  let i = 0
+  while (i < len(names)) {
+    let n = getNode(fc.c.tree, names[i])
+    let fname = fc.c.source[n.span.start:n.span.end]
+    let fty = structFieldLookup(fc.c, "${elemTy}." + fname)
+    let fv = lowerForOfFieldGet(fc, elemVal, elemTy, fname, fty)
+    declareLocal(fc, fname, fv, fty)
+    rebindCheckerName(fc, names[i], fty)
+    i = i + 1
+  }
+}
+
+// The per-iteration values `lowerForOfBindElem` has on hand once the element
+// is loaded — bundled purely to keep that function's own parameter count
+// under spec/LINT.md's E0202 limit (5).
+class ForOfBindVals {
+  idxVal: int,
+  elemV: int,
+  elemTy: int,
+  bindTy: int,
+  i64ty: int,
+}
+
+// Binds the SLICE/ARRAY row's per-iteration value(s) into `binderNode`: a
+// plain name gets the element; `(i, x)` gets (index, element) — #2012, the
+// for-of loop's OWN mechanics, not a destructure of the element's type; and
+// `{ a, b }` destructures the element by field name (#4106). Split out of
+// `lowerForOf` — following `lowerForOfSliceElem`'s own precedent, same file
+// — so a third binder shape does not grow that already-oversized function's
+// complexity; this is a pure extraction of the pre-existing two-way dispatch
+// plus the one new arm, not a behavior change to either existing case.
+fn lowerForOfBindElem(fc: FnCtx, binderNode: Node, k: []int, v: ForOfBindVals) {
+  if (binderNode.tag == Tag.TuplePat) {
+    let subs = kidsOf(fc.c.tree, k[0])
+    let inode = getNode(fc.c.tree, subs[0])
+    declareLocal(fc, fc.c.source[inode.span.start:inode.span.end], v.idxVal, v.i64ty)
+    rebindCheckerName(fc, subs[0], v.i64ty)
+    let enode = getNode(fc.c.tree, subs[1])
+    declareLocal(fc, fc.c.source[enode.span.start:enode.span.end], v.elemV, v.bindTy)
+    rebindCheckerName(fc, subs[1], v.elemTy)
+    return
+  }
+  if (binderNode.tag == Tag.FieldPat) {
+    lowerForOfFieldPat(fc, kidsOf(fc.c.tree, k[0]), v.elemV, v.elemTy)
+    return
+  }
+  declareLocal(fc, fc.c.source[binderNode.span.start:binderNode.span.end], v.elemV, v.bindTy)
+  rebindCheckerName(fc, k[0], v.elemTy)
+}
+
 fn lowerForOf(fc: FnCtx, node: int) {
   let k = kidsOf(fc.c.tree, node)
   let iterTy = defaultType(fc.c, nodeType(fc, k[1]))
@@ -79,8 +156,14 @@ fn lowerForOf(fc: FnCtx, node: int) {
     fcFail(fc, binderNode.span, "a map iteration with a binder that is not a `(key, value)` pair")
     return
   }
-  if (binderNode.tag != Tag.Ident && binderNode.tag != Tag.TuplePat) {
-    fcFail(fc, binderNode.span, "a `for … of` binder that is not a name or a `(name, name)` pair")
+  if (binderNode.tag != Tag.Ident &&
+    binderNode.tag != Tag.TuplePat &&
+    binderNode.tag != Tag.FieldPat) {
+    fcFail(
+      fc,
+      binderNode.span,
+      "a `for … of` binder that is not a name, a `(name, name)` pair, or a `{ name, ... }` field pattern",
+    )
     return
   }
   // Both pair forms bind exactly two names; the parser's `"(" pat "," pat ")"`
@@ -196,20 +279,12 @@ fn lowerForOf(fc: FnCtx, node: int) {
       ig.rhs = idxVal
       elemV = builderEmit(fc.b, ig)
     }
-    // `for (i, x) of xs`: the cursor the header already tests IS the index, so
-    // the pair costs one extra binding and no extra instruction (#2012).
-    if (binderNode.tag == Tag.TuplePat) {
-      let subs = kidsOf(fc.c.tree, k[0])
-      let inode = getNode(fc.c.tree, subs[0])
-      declareLocal(fc, fc.c.source[inode.span.start:inode.span.end], idxVal, i64ty)
-      rebindCheckerName(fc, subs[0], i64ty)
-      let enode = getNode(fc.c.tree, subs[1])
-      declareLocal(fc, fc.c.source[enode.span.start:enode.span.end], elemV, bindTy)
-      rebindCheckerName(fc, subs[1], elemTy)
-    } else {
-      declareLocal(fc, fc.c.source[binderNode.span.start:binderNode.span.end], elemV, bindTy)
-      rebindCheckerName(fc, k[0], elemTy)
-    }
+    lowerForOfBindElem(
+      fc,
+      binderNode,
+      k,
+      ForOfBindVals{ idxVal: idxVal, elemV: elemV, elemTy: elemTy, bindTy: bindTy, i64ty: i64ty },
+    )
   }
   lowerStmtList(fc, k[2])
   truncateEnv(fc, bodyMark)
