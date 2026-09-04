@@ -1,0 +1,630 @@
+// Bit standard library — jwt module: JWS signing/verification (RFC 7515),
+// RFC 7519 registered claim validation, and JWKS (RFC 7517) key selection.
+//
+// This is one file rather than several because of a `bit lint` limitation
+// (E0210 "imported but never used" false-positives when one file's import
+// list is used only by sibling files in the same module — filed as its own
+// ticket) — not a design preference. See that ticket for the repro; every
+// import below is used directly within this file, which is what avoids it.
+//
+// Organized in five sections, in order: key types, ES256 point helpers, JWS
+// compact serialization, RFC 7519 claim validation, and JWKS.
+//
+// Every cryptographic primitive is `std/crypto`'s own (RSA PKCS#1 v1.5,
+// ECDSA P-256, Ed25519, SHA-256, HMAC). This module implements no hash, no
+// HMAC, and no signature scheme — only the JOSE format/validation layer on
+// top. `none` (RFC 7518 §3.6) has no representation anywhere below: JWS
+// "none" is the canonical JWT vulnerability, and it must be impossible to
+// reach by configuration, not merely unimplemented. `verify` never reads or
+// branches on the token's own `alg` header to select behaviour — the only
+// use it makes of that field is an exact-string check against the
+// caller-supplied key's own algorithm, so the header can only ever narrow
+// what is accepted, never choose it. This is also what closes the classic
+// RS256-to-HS256 confusion attack: an RSA public key can never reach the
+// HMAC code path, because `VerifyKey`'s variants pair each algorithm with
+// the one key shape it accepts, and there is no constructor that mixes them.
+
+import {
+  RsaPublicKey,
+  RsaPrivateKey,
+  EcdsaPublicKey,
+  EcdsaPrivateKey,
+  EcdsaSignature,
+  digest,
+  hmac,
+  hmacEqual,
+  newSha256,
+  rsaSignPkcs1v15,
+  rsaVerifyPkcs1v15,
+  rsaDigestInfoSha256,
+  ecdsaSign,
+  ecdsaVerify,
+  ecdsaPublicKey,
+  ecdsaPrivateKey,
+  nistecP256,
+  ed25519Sign,
+  ed25519Verify,
+  encodeBase64Url,
+  decodeBase64Url,
+  bigintFromBytes,
+  bigintToBytes,
+} from "std/crypto"
+import {
+  Json,
+  JsonEntry,
+  jsonEncode,
+  jsonParse,
+  jsonGet,
+  jsonAsInt,
+  jsonAsString,
+  jsonAsArray,
+} from "std/json"
+import { split } from "std/strings"
+
+// P-256's field width in bytes (RFC 7518 §3.4) — the only ECDSA curve ES256
+// uses. Each of the JWS raw signature's `r`/`s` halves is exactly this wide.
+const p256FieldBytes: int = 32
+
+// ---------------------------------------------------------------------------
+// Key types
+// ---------------------------------------------------------------------------
+
+// A key usable to SIGN a JWS: the algorithm and its private material are one
+// choice — each variant names its algorithm directly (`Hs256Key`, `Rs256Key`,
+// `Es256Key`, `Ed25519Key`) rather than pairing a separate `Algorithm` enum
+// with a key value that might not match it. `Hs256Key` holds the shared HMAC
+// secret; `Ed25519Key` holds the 32-byte Ed25519 private seed (RFC 8032
+// §5.1.5).
+export enum SigningKey {
+  Hs256Key([]byte),
+  Rs256Key(RsaPrivateKey),
+  Es256Key(EcdsaPrivateKey),
+  Ed25519Key([]byte),
+}
+
+// A key usable to VERIFY a JWS. `Hs256Key` holds the same shared secret used
+// to sign; `Ed25519Key` holds the 32-byte Ed25519 public key.
+export enum VerifyKey {
+  Hs256Key([]byte),
+  Rs256Key(RsaPublicKey),
+  Es256Key(EcdsaPublicKey),
+  Ed25519Key([]byte),
+}
+
+// The JOSE `alg` name (RFC 7518 §3.1) a signing key implies.
+export fn signAlgName(key: SigningKey): string {
+  match (key) {
+    Hs256Key(_) => return "HS256"
+    Rs256Key(_) => return "RS256"
+    Es256Key(_) => return "ES256"
+    Ed25519Key(_) => return "EdDSA"
+  }
+}
+
+// The JOSE `alg` name a verification key implies. `verify` compares this
+// against the token's own header and rejects on any mismatch — the caller's
+// key decides the algorithm, never the token.
+export fn verifyAlgName(key: VerifyKey): string {
+  match (key) {
+    Hs256Key(_) => return "HS256"
+    Rs256Key(_) => return "RS256"
+    Es256Key(_) => return "ES256"
+    Ed25519Key(_) => return "EdDSA"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ES256 (P-256) key and signature helpers
+// ---------------------------------------------------------------------------
+
+// The ES256 public key whose point is the P-256 SEC1 octet string `sec1`
+// (uncompressed `0x04 || X || Y`, or compressed `0x02|0x03 || X`).
+// Convenience over `ecdsaPublicKey(nistecP256(), sec1)` that fixes the curve
+// to the one ES256 requires, so a caller building keys through this module
+// cannot hand ES256 a P-384 point by mistake.
+export fn es256PublicKey(sec1: []byte): EcdsaPublicKey! {
+  return ecdsaPublicKey(nistecP256(), sec1)?
+}
+
+// The ES256 private key whose scalar is the big-endian octet string `scalar`.
+export fn es256PrivateKey(scalar: []byte): EcdsaPrivateKey! {
+  return ecdsaPrivateKey(nistecP256(), scalar)?
+}
+
+// The ES256 public key built from raw JWK coordinates `x`/`y` (each exactly
+// `p256FieldBytes` bytes, RFC 7518 §6.2.1.2/.3): reassembles the uncompressed
+// SEC1 point `0x04 || x || y` and validates it through `es256PublicKey`.
+export fn es256PublicKeyFromCoords(x: []byte, y: []byte): EcdsaPublicKey! {
+  if (len(x) != p256FieldBytes || len(y) != p256FieldBytes) {
+    fail newError("jwt: ES256 JWK coordinates must be ${p256FieldBytes} bytes each")
+  }
+  let sec1 = []byte(1 + p256FieldBytes * 2)
+  sec1[0] = 0x04
+  let i = 0
+  while (i < p256FieldBytes) {
+    sec1[1 + i] = x[i]
+    sec1[1 + p256FieldBytes + i] = y[i]
+    i = i + 1
+  }
+  return es256PublicKey(sec1)?
+}
+
+// `sig` as the JWS raw `R || S` encoding (RFC 7518 §3.4): each of `r` and
+// `s` fixed to `p256FieldBytes` and concatenated — never the ASN.1/DER form
+// `ecdsaSignatureToDer` produces, which JWS never uses.
+export fn ecdsaSigToRaw(sig: EcdsaSignature): []byte! {
+  let r = bigintToBytes(sig.r, p256FieldBytes)?
+  let s = bigintToBytes(sig.s, p256FieldBytes)?
+  let out = []byte(p256FieldBytes * 2)
+  let i = 0
+  while (i < p256FieldBytes) {
+    out[i] = r[i]
+    out[p256FieldBytes + i] = s[i]
+    i = i + 1
+  }
+  return out
+}
+
+// The `EcdsaSignature` a JWS raw `R || S` byte string decodes to. Fails on
+// any length other than exactly `2 * p256FieldBytes` — never silently reads
+// a truncated or over-long signature as valid.
+export fn ecdsaSigFromRaw(raw: []byte): EcdsaSignature! {
+  if (len(raw) != p256FieldBytes * 2) {
+    fail newError("jwt: ES256 signature must be ${p256FieldBytes * 2} bytes, got ${len(raw)}")
+  }
+  let r = bigintFromBytes(raw[0:p256FieldBytes])
+  let s = bigintFromBytes(raw[p256FieldBytes:p256FieldBytes * 2])
+  return EcdsaSignature{ r: r, s: s }
+}
+
+// ---------------------------------------------------------------------------
+// JWS compact serialization (RFC 7515)
+// ---------------------------------------------------------------------------
+//
+// `sign`/`verify` produce and consume the three-segment
+// `base64url(header) "." base64url(payload) "." base64url(signature)` form.
+// The payload is an arbitrary `Json` value — JWS itself does not know about
+// "claims"; the standard-claim validation section below sits on top and runs
+// strictly after `verify` returns.
+//
+// Three rules `verify` is written to make structurally true, not merely
+// checked:
+//
+//   - **The signature is checked before any claim is read.** The payload
+//     segment is only base64url-decoded and JSON-parsed in the last line of
+//     `verify`, after `verifySignatureBytes` has already returned `true`.
+//     Nothing above that line inspects the payload's bytes.
+//   - **The caller's key decides the algorithm, never the token.** The only
+//     use `verify` makes of the header's `alg` field is an exact string
+//     comparison against `verifyAlgName(key)`.
+//   - **No liberal decoding.** `parseCompactSegments` requires exactly three
+//     segments and a non-empty signature; every base64 segment goes through
+//     `decodeBase64Url`, which accepts only the unpadded URL-safe alphabet
+//     (RFC 4648 §5) and rejects standard `+`/`/`/`=` characters outright.
+
+// The raw signature bytes over `signingInput` under `key`, dispatched by the
+// key's own algorithm — never a caller-supplied algorithm tag that could
+// disagree with the key.
+fn signatureBytes(key: SigningKey, signingInput: []byte): []byte! {
+  match (key) {
+    Hs256Key(secret) => return hmac(newSha256, secret, signingInput)
+    Rs256Key(priv) => return rsaSignPkcs1v15(priv, newSha256, rsaDigestInfoSha256(), signingInput)?
+    Es256Key(priv) => {
+      let hash = digest(newSha256(), signingInput)
+      let sig = ecdsaSign(priv, hash, newSha256)?
+      return ecdsaSigToRaw(sig)?
+    }
+    Ed25519Key(seed) => return ed25519Sign(seed, signingInput)
+  }
+}
+
+// Whether `sig` is a valid signature of `signingInput` under `key`. Never
+// fails — a structurally invalid ES256 signature (wrong length) is simply
+// `false`. The HMAC path compares through `hmacEqual` (constant-time, RFC
+// 2104 tag comparison via `crypto/subtle`), never `==` on the raw bytes.
+fn verifySignatureBytes(key: VerifyKey, signingInput: []byte, sig: []byte): bool {
+  match (key) {
+    Hs256Key(secret) => return hmacEqual(hmac(newSha256, secret, signingInput), sig)
+    Rs256Key(pub) => return rsaVerifyPkcs1v15(
+      pub,
+      newSha256,
+      rsaDigestInfoSha256(),
+      signingInput,
+      sig,
+    )
+    Es256Key(pub) => {
+      let ecSig = ecdsaSigFromRaw(sig) catch _ {
+        return false
+      }
+      let hash = digest(newSha256(), signingInput)
+      return ecdsaVerify(pub, hash, ecSig)
+    }
+    Ed25519Key(pub) => return ed25519Verify(pub, signingInput, sig)
+  }
+}
+
+// `token` split on `.`, validated to be exactly the three JWS compact
+// segments with a non-empty signature. A token with more (or fewer) than two
+// dots, or an empty final segment, is rejected here — before either base64
+// segment is even decoded.
+fn parseCompactSegments(token: string): []string! {
+  let parts = split(token, ".")
+  if (len(parts) != 3) {
+    fail newError("jwt: malformed token: expected 3 segments, got ${len(parts)}")
+  }
+  if (len(parts[2]) == 0) {
+    fail newError("jwt: malformed token: empty signature segment")
+  }
+  return parts
+}
+
+// The header segment `headerSeg`, base64url-decoded, JSON-parsed, and its
+// `alg` field extracted as a string. Fails on a non-URL-safe segment, a
+// non-JSON-object header, or an `alg` field that is missing or not a string.
+fn decodeHeaderAlg(headerSeg: string): string! {
+  let raw = decodeBase64Url(headerSeg)?
+  let header = jsonParse(string(raw))?
+  let algVal = jsonGet(header, "alg")
+  if (!isSome(algVal)) {
+    fail newError("jwt: header has no 'alg' field")
+  }
+  let algStr = jsonAsString(unwrap(algVal))
+  if (!isSome(algStr)) {
+    fail newError("jwt: header 'alg' field is not a string")
+  }
+  return unwrap(algStr)
+}
+
+// Sign `payload` as a compact JWS under `key`. The header is always
+// `{"alg":"<key's algorithm>","typ":"JWT"}` — the algorithm is read from the
+// key, never taken as a separate argument that could disagree with it.
+export fn sign(key: SigningKey, payload: Json): string! {
+  let header = Json.JsonObject(
+    [
+      JsonEntry{ key: "alg", value: Json.JsonString(signAlgName(key)) },
+      JsonEntry{ key: "typ", value: Json.JsonString("JWT") },
+    ],
+  )
+  let h = encodeBase64Url([]byte(jsonEncode(header)))
+  let p = encodeBase64Url([]byte(jsonEncode(payload)))
+  let signingInput = []byte(h + "." + p)
+  let sig = signatureBytes(key, signingInput)?
+  return h + "." + p + "." + encodeBase64Url(sig)
+}
+
+// Verify `token`'s signature under `key` and return its payload as `Json` —
+// signature only, no standard-claim validation (`verifyToken` below sits on
+// top of this). Fails on any structural problem (segment count, empty or
+// non-URL-safe segments), on an `alg` header that disagrees with `key`'s own
+// algorithm, or on a signature that does not verify. The payload is decoded
+// and parsed only on the final line, strictly after the signature has
+// already been accepted.
+export fn verify(token: string, key: VerifyKey): Json! {
+  let parts = parseCompactSegments(token)?
+  let headerAlg = decodeHeaderAlg(parts[0])?
+  let expectedAlg = verifyAlgName(key)
+  if (headerAlg != expectedAlg) {
+    fail newError("jwt: algorithm mismatch: header says '${headerAlg}', expected '${expectedAlg}'")
+  }
+  let sigBytes = decodeBase64Url(parts[2])?
+  let signingInput = []byte(parts[0] + "." + parts[1])
+  if (!verifySignatureBytes(key, signingInput, sigBytes)) {
+    fail newError("jwt: invalid signature")
+  }
+  let payloadBytes = decodeBase64Url(parts[1])?
+  return jsonParse(string(payloadBytes))?
+}
+
+// ---------------------------------------------------------------------------
+// RFC 7519 registered claim validation
+// ---------------------------------------------------------------------------
+//
+// `validateClaims` runs strictly after `verify` has already accepted the
+// signature. The clock is always the caller's, via `ClaimsOptions.now` —
+// never this module's own `std/time` read — so a test (or a caller
+// replaying an old token deliberately) gets a deterministic, reproducible
+// verdict rather than one that depends on when it happened to run.
+
+// The checks `validateClaims` runs, and the clock they run against.
+// `leewaySeconds` (60s default) absorbs clock skew between issuer and
+// verifier on `exp`/`nbf`/`iat`. `expectedIss`/`expectedAud` are `None` to
+// skip that check entirely — an absent expectation is not the same as an
+// expectation of the empty string.
+export class ClaimsOptions {
+  export now: int,
+  export leewaySeconds: int,
+  export expectedIss: Option<string>,
+  export expectedAud: Option<string>,
+}
+
+// `ClaimsOptions` for `now`, with the default 60-second leeway and no
+// `iss`/`aud` check. Set `expectedIss`/`expectedAud` on the result to add
+// either check.
+export fn defaultClaimsOptions(now: int): ClaimsOptions {
+  return ClaimsOptions{
+    now: now,
+    leewaySeconds: 60,
+    expectedIss: Option.None,
+    expectedAud: Option.None,
+  }
+}
+
+// `exp` (RFC 7519 §4.1.4): absent is fine (not every token expires), but a
+// present non-numeric claim is rejected same as an expired one.
+fn checkExp(payload: Json, opts: ClaimsOptions): ()! {
+  let claim = jsonGet(payload, "exp")
+  if (!isSome(claim)) {
+    return
+  }
+  let exp = jsonAsInt(unwrap(claim))
+  if (!isSome(exp)) {
+    fail newError("jwt: 'exp' claim is not a number")
+  }
+  if (opts.now > unwrap(exp) + opts.leewaySeconds) {
+    fail newError("jwt: token expired")
+  }
+}
+
+// `nbf` (RFC 7519 §4.1.5): the token is not valid before this instant, minus
+// leeway.
+fn checkNbf(payload: Json, opts: ClaimsOptions): ()! {
+  let claim = jsonGet(payload, "nbf")
+  if (!isSome(claim)) {
+    return
+  }
+  let nbf = jsonAsInt(unwrap(claim))
+  if (!isSome(nbf)) {
+    fail newError("jwt: 'nbf' claim is not a number")
+  }
+  if (opts.now < unwrap(nbf) - opts.leewaySeconds) {
+    fail newError("jwt: token not yet valid")
+  }
+}
+
+// `iat` (RFC 7519 §4.1.6): a token claiming to have been issued in the
+// future (beyond leeway) is rejected.
+fn checkIat(payload: Json, opts: ClaimsOptions): ()! {
+  let claim = jsonGet(payload, "iat")
+  if (!isSome(claim)) {
+    return
+  }
+  let iat = jsonAsInt(unwrap(claim))
+  if (!isSome(iat)) {
+    fail newError("jwt: 'iat' claim is not a number")
+  }
+  if (opts.now < unwrap(iat) - opts.leewaySeconds) {
+    fail newError("jwt: token issued in the future")
+  }
+}
+
+// `iss` (RFC 7519 §4.1.1): checked only when `opts.expectedIss` is set.
+// Missing or mismatched both reject, with the same message.
+fn checkIss(payload: Json, opts: ClaimsOptions): ()! {
+  if (!isSome(opts.expectedIss)) {
+    return
+  }
+  let expected = unwrap(opts.expectedIss)
+  let claim = jsonGet(payload, "iss")
+  if (!isSome(claim)) {
+    fail newError("jwt: unexpected issuer")
+  }
+  let iss = jsonAsString(unwrap(claim))
+  if (!isSome(iss) || unwrap(iss) != expected) {
+    fail newError("jwt: unexpected issuer")
+  }
+}
+
+// Whether the `aud` claim value `claim` names `expected` — `aud` may be a
+// single string or an array of strings (RFC 7519 §4.1.3).
+fn audMatches(claim: Json, expected: string): bool {
+  let single = jsonAsString(claim)
+  if (isSome(single)) {
+    return unwrap(single) == expected
+  }
+  let arr = jsonAsArray(claim)
+  if (!isSome(arr)) {
+    return false
+  }
+  let items = unwrap(arr)
+  let i = 0
+  while (i < len(items)) {
+    let item = jsonAsString(items[i])
+    if (isSome(item) && unwrap(item) == expected) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// `aud` (RFC 7519 §4.1.3): checked only when `opts.expectedAud` is set.
+fn checkAud(payload: Json, opts: ClaimsOptions): ()! {
+  if (!isSome(opts.expectedAud)) {
+    return
+  }
+  let expected = unwrap(opts.expectedAud)
+  let claim = jsonGet(payload, "aud")
+  if (!isSome(claim)) {
+    fail newError("jwt: unexpected audience")
+  }
+  if (!audMatches(unwrap(claim), expected)) {
+    fail newError("jwt: unexpected audience")
+  }
+}
+
+// Validate `payload`'s registered claims against `opts`. Each check fails
+// with its own distinct message, so a caller (or a test) can tell an
+// expired token from a not-yet-valid one from a wrong issuer/audience.
+export fn validateClaims(payload: Json, opts: ClaimsOptions): ()! {
+  checkExp(payload, opts)?
+  checkNbf(payload, opts)?
+  checkIat(payload, opts)?
+  checkIss(payload, opts)?
+  checkAud(payload, opts)?
+}
+
+// Verify `token`'s signature under `key`, then validate its registered
+// claims against `opts`, in that order. Returns the payload only once both
+// have passed.
+export fn verifyToken(token: string, key: VerifyKey, opts: ClaimsOptions): Json! {
+  let payload = verify(token, key)?
+  validateClaims(payload, opts)?
+  return payload
+}
+
+// ---------------------------------------------------------------------------
+// JWKS (RFC 7517, JSON Web Key Set)
+// ---------------------------------------------------------------------------
+//
+// Parses a key set, selects a key by `kid`, and exposes a refresh entry
+// point. Fetching a JWKS document over the network is explicitly out of
+// scope — key rotation is the caller's to schedule; `refreshJwks` only
+// re-parses a document the caller has already obtained, however they
+// obtained it.
+//
+// Four `kty` values are supported, one per algorithm this module signs and
+// verifies: `RSA` (RS256), `EC` with `crv: P-256` (ES256), `OKP` with
+// `crv: Ed25519` (EdDSA), and `oct` (HS256). Every other `kty`, and every
+// other curve, fails to parse rather than silently being skipped.
+
+// One entry of a `Jwks`: its `kid` (RFC 7517 §4.5; the empty string when the
+// JWK carries none — `jwksFindByKid` never matches a lookup for `""`
+// against one of these) and the `VerifyKey` it decodes to.
+export class Jwk { export kid: string, export key: VerifyKey }
+
+// A parsed key set (RFC 7517 §5), in document order.
+export class Jwks { export keys: []Jwk }
+
+// The JWK member `field` of `entry`, required to be present and a string.
+fn jwkRequiredString(entry: Json, field: string): string! {
+  let v = jsonGet(entry, field)
+  if (!isSome(v)) {
+    fail newError("jwt: JWK missing '${field}'")
+  }
+  let s = jsonAsString(unwrap(v))
+  if (!isSome(s)) {
+    fail newError("jwt: JWK '${field}' is not a string")
+  }
+  return unwrap(s)
+}
+
+// The JWK member `field`, required and base64url-decoded (every RSA/EC/OKP/
+// oct key material field — `n`, `e`, `x`, `y`, `k` — is base64url per RFC
+// 7517 §3 / RFC 7518 §6).
+fn jwkRequiredBytes(entry: Json, field: string): []byte! {
+  let s = jwkRequiredString(entry, field)?
+  return decodeBase64Url(s)?
+}
+
+// The optional `kid` member, or `""` when absent or not a string.
+fn jwkOptionalKid(entry: Json): string {
+  let v = jsonGet(entry, "kid")
+  if (!isSome(v)) {
+    return ""
+  }
+  let s = jsonAsString(unwrap(v))
+  if (!isSome(s)) {
+    return ""
+  }
+  return unwrap(s)
+}
+
+// `kty: "RSA"` (RFC 7518 §6.3.1): modulus `n` and exponent `e`.
+fn jwkRsaKey(entry: Json): VerifyKey! {
+  let n = jwkRequiredBytes(entry, "n")?
+  let e = jwkRequiredBytes(entry, "e")?
+  return VerifyKey.Rs256Key(RsaPublicKey{ n: bigintFromBytes(n), e: bigintFromBytes(e) })
+}
+
+// `kty: "EC"` (RFC 7518 §6.2.1), restricted to `crv: "P-256"` — the only
+// curve ES256 uses.
+fn jwkEcKey(entry: Json): VerifyKey! {
+  let crv = jwkRequiredString(entry, "crv")?
+  if (crv != "P-256") {
+    fail newError("jwt: unsupported EC curve '${crv}' (only P-256/ES256)")
+  }
+  let x = jwkRequiredBytes(entry, "x")?
+  let y = jwkRequiredBytes(entry, "y")?
+  return VerifyKey.Es256Key(es256PublicKeyFromCoords(x, y)?)
+}
+
+// `kty: "OKP"` (RFC 8037 §2), restricted to `crv: "Ed25519"`.
+fn jwkOkpKey(entry: Json): VerifyKey! {
+  let crv = jwkRequiredString(entry, "crv")?
+  if (crv != "Ed25519") {
+    fail newError("jwt: unsupported OKP curve '${crv}' (only Ed25519/EdDSA)")
+  }
+  let x = jwkRequiredBytes(entry, "x")?
+  return VerifyKey.Ed25519Key(x)
+}
+
+// `kty: "oct"` (RFC 7518 §6.4): the raw shared secret `k`.
+fn jwkOctKey(entry: Json): VerifyKey! {
+  let k = jwkRequiredBytes(entry, "k")?
+  return VerifyKey.Hs256Key(k)
+}
+
+// The `VerifyKey` one JWKS `keys[]` entry decodes to, dispatched on its
+// `kty`.
+fn jwkKeyFromEntry(entry: Json): VerifyKey! {
+  let kty = jwkRequiredString(entry, "kty")?
+  if (kty == "RSA") {
+    return jwkRsaKey(entry)?
+  }
+  if (kty == "EC") {
+    return jwkEcKey(entry)?
+  }
+  if (kty == "OKP") {
+    return jwkOkpKey(entry)?
+  }
+  if (kty == "oct") {
+    return jwkOctKey(entry)?
+  }
+  fail newError("jwt: unsupported JWK kty '${kty}'")
+}
+
+// Parse a JWKS document (`{"keys":[...]}`) into a `Jwks`. Fails on a missing
+// or non-array `keys` field, or on any entry this module cannot decode —
+// never silently drops one.
+export fn parseJwks(json: string): Jwks! {
+  let doc = jsonParse(json)?
+  let keysVal = jsonGet(doc, "keys")
+  if (!isSome(keysVal)) {
+    fail newError("jwt: JWKS has no 'keys' field")
+  }
+  let arr = jsonAsArray(unwrap(keysVal))
+  if (!isSome(arr)) {
+    fail newError("jwt: JWKS 'keys' field is not an array")
+  }
+  let entries = unwrap(arr)
+  let out = []Jwk(0)
+  let i = 0
+  while (i < len(entries)) {
+    let key = jwkKeyFromEntry(entries[i])?
+    out = append(out, Jwk{ kid: jwkOptionalKid(entries[i]), key: key })
+    i = i + 1
+  }
+  return Jwks{ keys: out }
+}
+
+// The key in `jwks` whose `kid` equals `kid`. Fails when no entry matches —
+// including when `jwks` holds a key with no `kid` at all, which can never
+// match a (necessarily non-empty, caller-supplied) lookup.
+export fn jwksFindByKid(jwks: Jwks, kid: string): VerifyKey! {
+  let i = 0
+  while (i < len(jwks.keys)) {
+    if (jwks.keys[i].kid == kid) {
+      return jwks.keys[i].key
+    }
+    i = i + 1
+  }
+  fail newError("jwt: no JWK with kid '${kid}'")
+}
+
+// Re-parse a (presumably newer) JWKS document into a fresh `Jwks`. This is
+// the refresh entry point: scheduling when to call it — on a TTL, on a
+// signing-key-not-found miss, on a webhook — is entirely the caller's;
+// this module fetches nothing itself.
+export fn refreshJwks(json: string): Jwks! {
+  return parseJwks(json)?
+}
