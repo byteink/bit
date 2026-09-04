@@ -41,11 +41,40 @@ import { pollRequest } from "../sched"
 // here. `idx < 0` is the large/direct-mapped path — not span-backed, so the
 // bitmap does not apply and both helpers below no-op.
 //
-// ATOMIC, NOT A PLAIN READ-MODIFY-WRITE: two mutator threads can concurrently
-// link or free two different slots that land in the SAME 64-bit bitmap word
-// (`linkObject`/`freeObject` hold only the object-list lock, not the heap
-// lock the allocator's own span writes are under), so a non-atomic store here
-// would lose a concurrent sibling's bit.
+// PLAIN READ-MODIFY-WRITE, NOT AN ATOMIC ONE (#4320). This comment used to
+// assert the opposite — that "two mutator threads can concurrently link or free
+// two different slots that land in the SAME 64-bit bitmap word" because
+// `linkObject`/`freeObject` "hold only the object-list lock". That was a claim,
+// not a proof, and it named the wrong lock as the one that fails to help: the
+// object-list lock is a SINGLE global lock and is exactly what serialises the
+// set side. There are two bit-writing call sites in the whole tree and they are
+// mutually exclusive of each other:
+//
+//   `linkObject` -> `setSlotBit` (below) runs between `spinAcquire(lockPtr(g))`
+//   and `spinRelease(lockPtr(g))`, so two sets can never overlap.
+//
+//   `freeObject` -> `clearSlotBit` (`./gcmark.bit`) has exactly two callers:
+//   `sweep`, reached only from `gcCollectFinish` inside `stwCollect`
+//   (`../stw/stw.bit`) AFTER `worldRendezvous` returned true — every other
+//   mutator parked and acknowledged this epoch, and `linkObject` is `@nosplit`
+//   with no poll in it, so no thread can be inside it — and `gcDeinit`
+//   (`./gc.bit`), at shutdown. An expired rendezvous ABANDONS rather than
+//   collecting (`../stw/stwpoll.bit`), so there is no forced-collection arm.
+//
+// So the RMW has one writer at a time and cannot lose a bit. What the atomic
+// additionally bought was the `stlxr`'s release, and that edge was UNPAIRED:
+// the only off-stop-the-world reader, `gcOwns` below via `dynTypeOf`
+// (`../root/iface.bit`), reads through `allocSpanBitmapWord`
+// (`../alloc/bitmap.bit`), which is a plain load with no acquire. A release
+// with no matching acquire establishes no happens-before, so deleting it
+// removes an ordering guarantee no reader ever had. `../alloc/spancache.bit`'s
+// `heapSpanCacheTakeLocked` already writes these same words with a plain
+// full-word store for the same reason.
+//
+// STANDING OBLIGATION: this rests on `linkObject` holding the object-list lock.
+// If that lock is ever removed (#4162 ranks it at 12.53 cycles/object), the
+// atomicity must come back here, or the per-worker arena must own its own
+// bitmap words so that the writers stay disjoint by construction.
 @nosplit fn setSlotBit(addr: int, idx: int) {
   if (idx < 0) {
     return
@@ -58,7 +87,7 @@ import { pollRequest } from "../sched"
   // `n % 64` are `n >> 6` and `n & 63` — #4317, the #3898 lesson applied here.
   let w = wordAt(allocSpanOf(addr) + allocSpanHdrWords * 8 + (n >> 6) * 8)
   let mask = 1 << (n & 63)
-  let _ = atomicOr(w, mask)
+  *w = *w | mask
 }
 
 @nosplit fn clearSlotBit(addr: int, idx: int) {
@@ -72,7 +101,7 @@ import { pollRequest } from "../sched"
   // n >= 0 is proven above (the `n < 0` guard returns) -- see setSlotBit.
   let w = wordAt(allocSpanOf(addr) + allocSpanHdrWords * 8 + (n >> 6) * 8)
   let mask = 1 << (n & 63)
-  let _ = atomicAnd(w, ~mask)
+  *w = *w & ~mask
 }
 
 // Thread a freshly-allocated header onto the all-objects list and bump the
