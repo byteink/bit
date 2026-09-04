@@ -117,13 +117,41 @@
 // so `mutatorLoop`'s rate divided by `refLoop`'s stays close to constant
 // across load while their INDIVIDUAL rates both swing by 10x+.
 //
-// MEASURED (#4030), ratio_x1000 = mutatorLoop_iters * 1000 / refLoop_iters,
-// both sampled at the same instant at the end of the settle sleep, across
-// load averages from ~6 to ~45 (idle box through a deliberately induced 40
-// concurrent CPU-bound processes): correct ~276-310, inverted-clause-1
-// mutant ~75-86 — neither range moved outward as load climbed, unlike the
-// absolute counts above. 150 sits with >1.7x margin on both sides of every
-// reading in both ranges.
+// #4310: the ORIGINAL version of this check used `sleep(20 * Millisecond)` as
+// the window and judged ratio_x1000 against a floor of 150. That sleep never
+// delivered anything near 20ms — with the @nosplit refLoop occupying a
+// worker and nothing else idle, no worker takes a turn to expire the timer
+// until a PARKED worker hits idleParkMaxNs (100ms), so the real window was
+// 100-102ms in every direct measurement taken (45/45 macOS, 8/8
+// x86_64-linux). Past `preemptBudgetNs` (10ms, runtime/sched/preempt.bit)
+// `sysmonTick` flags the @nosplit refLoop's worker for preemption, which it
+// can never clear (no safepoint reachable in an @nosplit body), so
+// `preemptAnyPending()` latches true and EVERY back edge legitimately takes
+// the slow path for the remainder of the run — the ratio was measuring an
+// unmeasured, uncontrolled window well past its own knee, which is why two
+// honest measurement sessions on the SAME unmodified tree recorded
+// non-overlapping bands (100-141 one session, 145-172 another): neither
+// figure was wrong, both were snapshots of one broad, scheduler-dependent
+// distribution with no floor that could separate it from the mutant
+// reliably.
+//
+// checkThroughput below instead busy-waits an EXACT 5ms on
+// bit_rt_time_mono_ns (well under preemptBudgetNs, so refLoop's worker is
+// never flagged) and asserts the window it actually measured rather than
+// the one it asked for. ratio_x1000 = mutatorLoop_iters * 1000 /
+// refLoop_iters, both sampled at the same instant right after the window
+// closes. MEASURED with this instrument (#4258, re-confirmed #4310) at 2ms,
+// 5ms and 10ms windows, idle box through deliberately induced load
+// (aarch64-macos ~18 and ~33-50, x86_64-linux quiet):
+//
+//   aarch64-macos correct           832-910
+//   aarch64-macos always-poll mutant  0-30
+//   x86_64-linux correct            750-795
+//   x86_64-linux always-poll mutant  20-24
+//
+// Floor 400: >1.9x margin under the correct band's floor and >16x over the
+// mutant's ceiling, on both platforms, and neither band moves materially
+// between load ~18 and load ~50.
 
 import { exit } from "std/os"
 import { newWaitGroup, WaitGroup } from "std/sync"
@@ -133,17 +161,26 @@ import {
   worldRendezvous, worldRestart, wordAt,
 } from "../../runtime/gc"
 
+// #4310: the throughput window's own clock. Reached as a runtime-archive
+// symbol rather than through std/time's `monotonic()`, which returns a
+// heap-allocated `Mono` (#2678) unusable inside a tight measurement loop.
+// Same spelling `runtime/sched/idle.bit` uses for the identical reason.
+extern fn bit_rt_time_mono_ns(): int
+
 class Shared { wg: WaitGroup, started: []i64, testDone: []i64, iters: []i64 }
 
 // The mutator under test: allocation-free, with a real loop back edge so the
 // compiler emits the back-edge poll guard at it. See the header for why
 // heapLiveWord cannot move while this runs.
 //
-// #4030: publishes its own progress every 2^20 iterations into `s.iters`
+// #4030: publishes its own progress every 2^14 iterations into `s.iters`
 // (not every iteration — that would add its own overhead to the very rate
 // `main`'s throughput check below is trying to measure) so the controller
 // can read, at the end of the settle sleep it already does, how far this
 // SAME already-running loop got, for comparison against `refLoop` below.
+// #4310: was 2^20 — over a properly-measured 5ms window (see the file
+// header) that published only 2-4 quanta, making the ratio a near-binary
+// signal instead of a rate. 2^14 gives ~150 quanta over the same window.
 fn mutatorLoop(s: Shared) {
   atomicStore(ptrOf(s.started), 1)
   let i = 0
@@ -155,7 +192,7 @@ fn mutatorLoop(s: Shared) {
   // resolves in a few seconds rather than 100+.
   while (i < 2000000000 && atomicLoad(ptrOf(s.testDone)) == 0) {
     i = i + 1
-    if ((i & 1048575) == 0) {
+    if ((i & 16383) == 0) {
       atomicStore(ptrOf(s.iters), i)
     }
   }
@@ -170,7 +207,7 @@ fn mutatorLoop(s: Shared) {
   let i: i64 = 0
   while (i < 2000000000 && atomicLoad(ptrOf(testDone)) == 0) {
     i = i + 1
-    if ((i & 1048575) == 0) {
+    if ((i & 16383) == 0) {
       atomicStore(ptrOf(iters), i)
     }
   }
@@ -186,7 +223,7 @@ fn refLoopTask(wg: WaitGroup, testDone: []i64, iters: []i64) {
 }
 
 // #4030: throughput ratio check — see the file header for the full
-// rationale and the measurements behind 150. Runs as its OWN self-contained
+// rationale and the measurements behind 400. Runs as its OWN self-contained
 // phase, spawning and fully joining a private pair of loops BEFORE `main`
 // spawns the stop-word test's own mutatorLoop below.
 //
@@ -215,7 +252,14 @@ fn checkThroughput() {
   spawn mutatorLoop(Shared{ wg: wg, started: started, testDone: testDone, iters: iters })
   spawn refLoopTask(wg, testDone, refIters)
 
-  sleep(20 * Millisecond)
+  // #4310: an EXACT busy-wait on the monotonic clock, not sleep() -- see the
+  // file header for why sleep(20 * Millisecond) never delivered anything
+  // near 20ms. 5ms is well under preemptBudgetNs (10ms), so sysmonTick has
+  // not yet flagged refLoop's @nosplit worker for preemption.
+  let wStart = bit_rt_time_mono_ns()
+  let deadline = wStart + 5000000
+  while (bit_rt_time_mono_ns() < deadline) {}
+  let realNs = bit_rt_time_mono_ns() - wStart
 
   let mutIters = atomicLoad(ptrOf(iters))
   let refItersAt = atomicLoad(ptrOf(refIters))
@@ -223,11 +267,32 @@ fn checkThroughput() {
   atomicStore(ptrOf(testDone), 1)
   wg.wait()
 
-  let ratioX1000 = mutIters * 1000 / refItersAt
-  if (ratioX1000 < 150) {
-    println("pollguardstopword: FAIL — allocation-free mutator reached ${mutIters} iterations against the nosplit reference loop's ${refItersAt} over a 20ms window with nothing pending (ratio_x1000=${ratioX1000}, want >= 150); the back-edge poll guard is calling bit_rt_safepoint far more often than the runtime's published state justifies, masking a broken clause behind an always-poll fallback")
+  // #4310: judge the window actually measured, not the one asked for. Past
+  // preemptBudgetNs, sysmonTick flags refLoop's worker and it can never
+  // clear the flag (no safepoint reachable in an @nosplit body), so
+  // preemptAnyPending() latches true and every back edge legitimately takes
+  // the slow path for the rest of the run -- a window that long is not a
+  // measurement of clause 1 in isolation.
+  if (realNs > 8000000) {
+    println("pollguardstopword: FAIL — throughput window measured ${realNs}ns, want <= 8000000ns; a window this long crosses preemptBudgetNs and stops being a measurement of clause 1 alone (mut=${mutIters} ref=${refItersAt})")
     exit(1)
   }
+
+  // #4310: refLoop may not have run its first publish yet at very short
+  // windows -- observed once directly. A zero denominator is a harness
+  // defect, not a throughput result.
+  if (refItersAt == 0) {
+    println("pollguardstopword: FAIL — reference loop published 0 iterations over a measured ${realNs}ns window; it was not dispatched in time to measure against (mut=${mutIters})")
+    exit(1)
+  }
+
+  let ratioX1000 = mutIters * 1000 / refItersAt
+  if (ratioX1000 < 400) {
+    println("pollguardstopword: FAIL — allocation-free mutator reached ${mutIters} iterations against the nosplit reference loop's ${refItersAt} over a measured ${realNs}ns window with nothing pending (ratio_x1000=${ratioX1000}, want >= 400); the back-edge poll guard is calling bit_rt_safepoint far more often than the runtime's published state justifies, masking a broken clause behind an always-poll fallback")
+    exit(1)
+  }
+
+  println("pollguardstopword: throughput PASS — mut=${mutIters} ref=${refItersAt} ratio_x1000=${ratioX1000} window=${realNs}ns")
 }
 
 fn main() {
