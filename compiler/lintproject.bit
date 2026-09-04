@@ -1,0 +1,464 @@
+// `bit.json`'s top-level "lint" key (#4156, spec/LINT.md §5.3): a project-wide
+// rule layer that sits BETWEEN the built-in default and a file's own `//
+// bit:lint` directive — "most specific wins", so a directive always beats
+// this layer for its own file, and this layer always beats the built-in
+// default for a file it names. No project layer existed before this file;
+// §5.3 said so explicitly ("No project layer, no user layer, no
+// inheritance") and is corrected alongside this.
+//
+// Schema (JSONC, via `jsoncParse` — `bit.json` is parsed the same way `bit
+// up`'s own `projectDeps`, pmcliup.bit, already reads it):
+//
+//   { "lint": {
+//       "rules": { "<rule-name>": <int>, ... },
+//       "overrides": [
+//         { "paths": ["<dir>", ...],
+//           "rules": { "<rule-name>": <int>, ... },
+//           "disable": <bool>,
+//           "allow": ["E####", ...] },
+//         ...
+//       ] } }
+//
+// `rules` is a project-wide seed for every registered THRESHOLD rule
+// (`hasLimit: true` — max-file-lines and its four siblings, lint.bit's
+// registry): the same `<rule>=<n>` semantics a file directive has, applied
+// before any file is read. A BOOLEAN rule (`hasLimit: false`) cannot appear
+// here — same restriction lint.bit's own directive reader already enforces
+// for `<rule>=<n>` (only `disable <rule>` may name one), reported the same
+// way: a clear error, never a silent no-op.
+//
+// `overrides[].paths` are DIRECTORY PREFIXES relative to the project root
+// (`bit.json`'s own directory) — never a glob; a `*` or `?` in a path is a
+// config error, not a silent non-match (`validatePathEntry`). Every override
+// whose `paths` matches a file applies, in array order (last one wins on a
+// conflicting rule, the same "last entry wins" policy `bit.json`'s
+// `dependencies` already has for a duplicate key).
+//
+// `overrides[].disable: true` exempts every file under `paths` from `bit
+// lint` entirely — not merely from findings: the file is dropped from the
+// walk BEFORE it is opened (`lintExcludeDisabled`, lintbatch.bit), so a
+// corpus that is "pure fixtures, nothing here is real code" (deliberately
+// malformed syntax included) can never turn a parse error into an exit-2
+// hard-stop for the whole run.
+//
+// `overrides[].allow` suppresses specific DIAGNOSTIC CODES for files under
+// `paths` — not limited to lint's own E02xx codes: a corpus that mixes valid
+// fixtures with a few deliberately-malformed ones (parse/lex errors, e.g.
+// E0021/E0001/E0002) can name exactly those codes so the malformed few don't
+// force exit 2 for the corpus, while every other file's ordinary findings
+// (size, naming, ...) are untouched. Applied as a post-filter over the whole
+// run's diagnostics (`lintFilterAllowed`, lintbatch.bit) — a file whose ONLY
+// problem is an allow-listed parse error still has no valid AST, so this
+// does not resurrect finding computation for that one file; it only stops
+// the allow-listed diagnostic from being reported or counted. Sibling files
+// under the same path that parse cleanly are unaffected either way.
+//
+// A malformed or unreadable `bit.json`, or a malformed "lint" key, is always
+// a hard error naming the file — `loadLintProjectConfig` returns `!`, and
+// `lintCmd` (lintbatch.bit) turns a caught error into exit 2, the same shape
+// `collectLintFiles`'s own "unreadable path" failure already uses. An
+// unrecognized key — inside "lint" itself, or inside one override — is
+// ALSO rejected, not silently ignored: `bit.json`'s TOP level tolerates an
+// unrelated key (namespaced by tool — a stray key there is some other
+// tool's future business, `compiler/pmcliup.bit`'s own `projectDeps` never
+// checks for one), but nothing analogous applies once already inside lint's
+// own namespace, and a typo there (`"overide"` for `"overrides"`) must not
+// silently no-op the way an unknown top-level key harmlessly would.
+import { jsonAsObject, jsonAsArray, jsonAsInt, jsonAsBool, JsonEntry } from "std/json"
+
+// One `"rules"` entry, decoded and validated against the registry (a
+// threshold rule that exists) — but not yet applied to any `LintConfig`.
+class LintRuleAssign { name: string, limit: int }
+
+// One `lint.overrides[]` entry, decoded and validated.
+class LintOverride {
+  paths: []string,
+  rules: []LintRuleAssign,
+  disableAll: bool,
+  allowCodes: []int,
+}
+
+// The whole `bit.json` "lint" key for one project, decoded once per `bit
+// lint` invocation (never per file — `lintCmd` calls `loadLintProjectConfig`
+// exactly once). `active` is false whenever there is no `bit.json`, or it
+// has no "lint" key: every function below is then a guaranteed no-op, which
+// is what makes "absent lint key changes nothing" true by construction
+// rather than by coincidence.
+class LintProjectConfig {
+  active: bool,
+  rules: []LintRuleAssign,
+  overrides: []LintOverride,
+}
+
+fn emptyLintProjectConfig(): LintProjectConfig {
+  return LintProjectConfig{ active: false, rules: []LintRuleAssign(0), overrides: []LintOverride(0) }
+}
+
+// Loads `<root>/bit.json`'s "lint" key. `root` is `projectRootDir()`'s
+// result — "." when no ancestor `bit.json` exists at all, in which case this
+// returns the empty (inactive) config without even trying to open a file.
+fn loadLintProjectConfig(root: string): LintProjectConfig! {
+  let path = pmJoin(root, "bit.json")
+  if (!exists(path)) {
+    return emptyLintProjectConfig()
+  }
+  let src = readFile(path)?
+  let doc = jsoncParse(src) catch e {
+    fail newError("${path}: ${e.message()}")
+  }
+  let lintField = jsonGetC(doc, "lint")
+  match (lintField) {
+    None => return emptyLintProjectConfig()
+    Some(lv) => return decodeLintValue(path, lv)?
+  }
+}
+
+fn decodeLintValue(path: string, lv: Json): LintProjectConfig! {
+  let entries = jsonAsObject(lv)
+  match (entries) {
+    None => fail newError("${path}: \"lint\" must be an object")
+    Some(es) => {
+      let rules = []LintRuleAssign(0)
+      let overrides = []LintOverride(0)
+      for e of es {
+        if (e.key == "rules") {
+          rules = decodeRulesObject(path, "lint.rules", e.value)?
+        } else if (e.key == "overrides") {
+          overrides = decodeOverridesArray(path, e.value)?
+        } else {
+          fail newError(
+            "${path}: \"lint\" has unrecognized key \"${e.key}\" (expected \"rules\" or \"overrides\")",
+          )
+        }
+      }
+      return LintProjectConfig{ active: true, rules: rules, overrides: overrides }
+    }
+  }
+}
+
+// Decodes a `{ "<rule-name>": <int>, ... }` object at `where` (a dotted path
+// used only in error messages, e.g. "lint.rules" or
+// "lint.overrides[2].rules"). Every name must be a registered THRESHOLD rule
+// — an unknown name or a boolean rule is rejected here, at load time, the
+// same way an unknown/ineligible name is rejected in a file directive
+// (lint.bit's `lintParseDirective`) rather than silently accepted.
+fn decodeRulesObject(path: string, where: string, v: Json): []LintRuleAssign! {
+  let entries = jsonAsObject(v)
+  match (entries) {
+    None => fail newError("${path}: \"${where}\" must be an object")
+    Some(es) => {
+      let rules = lintRules()
+      let out = []LintRuleAssign(0)
+      for e of es {
+        out = append(out, decodeRuleAssign(path, where, rules, e)?)
+      }
+      return out
+    }
+  }
+}
+
+fn decodeRuleAssign(path: string, where: string, rules: []LintRule, e: JsonEntry): LintRuleAssign! {
+  let idx = lintRuleIndex(rules, e.key)
+  if (idx < 0) {
+    fail newError(
+      "${path}: \"${where}\" names unknown lint rule \"${e.key}\" (known rules: ${lintRuleNames(rules)})",
+    )
+  }
+  if (!rules[idx].hasLimit) {
+    fail newError(
+      "${path}: \"${where}.${e.key}\" takes no value — it can only be turned off, " +
+        "via an override's \"disable\": true",
+    )
+  }
+  let n = jsonAsInt(e.value)
+  match (n) {
+    None => fail newError("${path}: \"${where}.${e.key}\" must be an integer")
+    Some(limit) => {
+      if (limit < 0 || limit > lintMaxLimit) {
+        fail newError("${path}: \"${where}.${e.key}\" is out of range: the maximum is ${lintMaxLimit}")
+      }
+      return LintRuleAssign{ name: e.key, limit: limit }
+    }
+  }
+}
+
+fn decodeOverridesArray(path: string, v: Json): []LintOverride! {
+  let arr = jsonAsArray(v)
+  match (arr) {
+    None => fail newError("${path}: \"lint.overrides\" must be an array")
+    Some(items) => {
+      let out = []LintOverride(0)
+      let i = 0
+      while (i < len(items)) {
+        out = append(out, decodeOverride(path, i, items[i])?)
+        i = i + 1
+      }
+      return out
+    }
+  }
+}
+
+fn decodeOverride(path: string, idx: int, v: Json): LintOverride! {
+  let obj = jsonAsObject(v)
+  match (obj) {
+    None => fail newError("${path}: \"lint.overrides[${idx}]\" must be an object")
+    Some(es) => return decodeOverrideEntries(path, idx, es)?
+  }
+}
+
+fn decodeOverrideEntries(path: string, idx: int, es: []JsonEntry): LintOverride! {
+  let where = "lint.overrides[${idx}]"
+  let paths = []string(0)
+  let hasPaths = false
+  let rules = []LintRuleAssign(0)
+  let disableAll = false
+  let allowCodes = []int(0)
+  for e of es {
+    if (e.key == "paths") {
+      paths = decodePathsArray(path, where, e.value)?
+      hasPaths = true
+    } else if (e.key == "rules") {
+      rules = decodeRulesObject(path, "${where}.rules", e.value)?
+    } else if (e.key == "disable") {
+      disableAll = decodeBoolField(path, "${where}.disable", e.value)?
+    } else if (e.key == "allow") {
+      allowCodes = decodeAllowArray(path, where, e.value)?
+    } else {
+      fail newError(
+        "${path}: \"${where}\" has unrecognized key \"${e.key}\" " +
+          "(expected \"paths\", \"rules\", \"disable\" or \"allow\")",
+      )
+    }
+  }
+  if (!hasPaths || len(paths) == 0) {
+    fail newError("${path}: \"${where}\" is missing \"paths\" (a non-empty array of directory prefixes)")
+  }
+  return LintOverride{ paths: paths, rules: rules, disableAll: disableAll, allowCodes: allowCodes }
+}
+
+fn decodeBoolField(path: string, where: string, v: Json): bool! {
+  let b = jsonAsBool(v)
+  match (b) {
+    None => fail newError("${path}: \"${where}\" must be a boolean")
+    Some(flag) => return flag
+  }
+}
+
+fn decodePathsArray(path: string, where: string, v: Json): []string! {
+  let arr = jsonAsArray(v)
+  match (arr) {
+    None => fail newError("${path}: \"${where}.paths\" must be an array of strings")
+    Some(items) => {
+      let out = []string(0)
+      for it of items {
+        out = append(out, decodePathEntry(path, where, it)?)
+      }
+      return out
+    }
+  }
+}
+
+fn decodePathEntry(path: string, where: string, it: Json): string! {
+  let s = jsonAsString(it)
+  match (s) {
+    None => fail newError("${path}: \"${where}.paths\" entries must be strings")
+    Some(p) => {
+      if (len(p) == 0) {
+        fail newError("${path}: \"${where}.paths\" has an empty entry")
+      }
+      if (contains(p, "*") || contains(p, "?")) {
+        fail newError(
+          "${path}: \"${where}.paths\" entry \"${p}\" looks like a glob pattern — " +
+            "paths are directory prefixes only, no pattern matching is supported",
+        )
+      }
+      return p
+    }
+  }
+}
+
+fn decodeAllowArray(path: string, where: string, v: Json): []int! {
+  let arr = jsonAsArray(v)
+  match (arr) {
+    None => fail newError("${path}: \"${where}.allow\" must be an array of diagnostic codes")
+    Some(items) => {
+      let out = []int(0)
+      for it of items {
+        out = append(out, decodeAllowEntry(path, where, it)?)
+      }
+      return out
+    }
+  }
+}
+
+fn decodeAllowEntry(path: string, where: string, it: Json): int! {
+  let s = jsonAsString(it)
+  match (s) {
+    None => fail newError("${path}: \"${where}.allow\" entries must be strings (e.g. \"E0021\")")
+    Some(code) => {
+      let (n, ok) = parseCodeString(code)
+      if (!ok) {
+        fail newError(
+          "${path}: \"${where}.allow\" entry \"${code}\" is not a diagnostic code (expected 'E' + 4 digits)",
+        )
+      }
+      return n
+    }
+  }
+}
+
+// Parses a diagnostic code string of the exact form `codeString` (diagnostics.bit)
+// renders — "E" + 4 decimal digits — from plain JSON text rather than a source
+// span. `(_, false)` for anything else.
+fn parseCodeString(s: string): (int, bool) {
+  if (len(s) != 5 || s[0] != 'E') {
+    return 0, false
+  }
+  let code = 0
+  let i = 1
+  while (i < 5) {
+    if (s[i] < '0' || s[i] > '9') {
+      return 0, false
+    }
+    code = code * 10 + int(s[i] - '0')
+    i = i + 1
+  }
+  return code, true
+}
+
+// ---- resolving a file's project-relative path -----------------------------
+
+// `p` (a path as `bit lint` constructs or receives it) made relative to
+// `root` (`projectRootDir()`'s result), when `p` is textually under it;
+// `("", false)` otherwise — never a crash, never a wrong match. Handles the
+// two shapes `collectProjectBitFiles`/`collectLintFiles` actually produce:
+// `root == "."` (by far the common case — `bit.json` at the project root,
+// `bit lint` run from there) yields paths like `./foo.bit` or a bare
+// `sub/foo.bit`, both already relative to root; any other root's own files
+// are prefixed with `root + "/"`. A file reached by a path that is not
+// textually under `root` at all (an absolute path, or `bit lint` run from a
+// strict subdirectory of a `bit.json` above it) has no project-relative
+// form here, so no override can ever match it — the project layer is
+// skipped, built-in defaults and file directives still apply.
+fn relToRoot(root: string, p: string): (string, bool) {
+  if (root == ".") {
+    if (hasPrefix(p, "./")) {
+      return p[2:len(p)], true
+    }
+    return p, true
+  }
+  let prefix = root + "/"
+  if (hasPrefix(p, prefix)) {
+    return p[len(prefix):len(p)], true
+  }
+  return "", false
+}
+
+// True when project-relative path `rel` IS `prefix`, or lies inside the
+// directory `prefix` names — a DIRECTORY PREFIX, never a glob:
+// "_tests_/cases" matches "_tests_/cases/x.bit" but not
+// "_tests_/cases_extra/x.bit".
+fn pathUnderPrefix(rel: string, prefix: string): bool {
+  if (rel == prefix) {
+    return true
+  }
+  if (!hasPrefix(rel, prefix)) {
+    return false
+  }
+  return rel[len(prefix)] == '/'
+}
+
+fn overrideMatches(ov: LintOverride, rel: string): bool {
+  for p of ov.paths {
+    if (pathUnderPrefix(rel, p)) {
+      return true
+    }
+  }
+  return false
+}
+
+// ---- applying the config ---------------------------------------------------
+
+fn applyRuleAssigns(cfg: LintConfig, rules: []LintRule, assigns: []LintRuleAssign) {
+  for a of assigns {
+    let idx = lintRuleIndex(rules, a.name)
+    cfg.limits[idx] = a.limit
+    cfg.overridden[idx] = true
+  }
+}
+
+// The seeded `LintConfig` for the file at path `p` — a fresh built-in
+// default with the project's top-level "rules" applied, then every matching
+// override's own "rules" applied in array order (last wins on a
+// conflicting rule name, the same policy as a duplicate `bit.json` key).
+// This is `readLintDirectivesFrom`'s `base` (lint.bit): a file directive
+// always applies AFTER this and so always wins, which is precedence's
+// "most specific wins" (spec/LINT.md §5.3).
+fn seedLintConfig(pc: LintProjectConfig, root: string, p: string): LintConfig {
+  let cfg = newLintConfig()
+  if (!pc.active) {
+    return cfg
+  }
+  let rules = lintRules()
+  applyRuleAssigns(cfg, rules, pc.rules)
+  let (rel, hasRel) = relToRoot(root, p)
+  if (!hasRel) {
+    return cfg
+  }
+  for ov of pc.overrides {
+    if (overrideMatches(ov, rel)) {
+      applyRuleAssigns(cfg, rules, ov.rules)
+    }
+  }
+  return cfg
+}
+
+// The diagnostic codes to suppress for the file at path `p` — the union of
+// every matching override's "allow" list. Always empty when `pc` is
+// inactive or `p` has no project-relative form.
+fn allowCodesFor(pc: LintProjectConfig, root: string, p: string): []int {
+  let out = []int(0)
+  if (!pc.active) {
+    return out
+  }
+  let (rel, hasRel) = relToRoot(root, p)
+  if (!hasRel) {
+    return out
+  }
+  for ov of pc.overrides {
+    if (overrideMatches(ov, rel)) {
+      for c of ov.allowCodes {
+        out = append(out, c)
+      }
+    }
+  }
+  return out
+}
+
+// Whether the file at path `p` matches an override whose "disable" is true
+// — fully exempt from `bit lint`, dropped from the walk before it is even
+// opened (lintbatch.bit's `lintExcludeDisabled`).
+fn isProjectDisabled(pc: LintProjectConfig, root: string, p: string): bool {
+  if (!pc.active) {
+    return false
+  }
+  let (rel, hasRel) = relToRoot(root, p)
+  if (!hasRel) {
+    return false
+  }
+  for ov of pc.overrides {
+    if (ov.disableAll && overrideMatches(ov, rel)) {
+      return true
+    }
+  }
+  return false
+}
+
+fn containsInt(xs: []int, want: int): bool {
+  for x of xs {
+    if (x == want) {
+      return true
+    }
+  }
+  return false
+}

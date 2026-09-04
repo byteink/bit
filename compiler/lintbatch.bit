@@ -178,7 +178,7 @@ fn collectLintFiles(paths: []string): []LintFile! {
 
 // `bit lint [--json] [--stats] [paths...]`. Returns the process exit code:
 // 0 no findings, 1 at least one finding, 2 usage error / unreadable path /
-// malformed directive (§2.1).
+// malformed directive / malformed `bit.json` "lint" key (§2.1).
 fn lintCmd(a: []string): int {
   let opts = parseLintArgs(a)
   if (!opts.ok) {
@@ -186,9 +186,21 @@ fn lintCmd(a: []string): int {
     eprint("usage: bit lint [--json] [--stats] [paths...]\n")
     return 2
   }
-  let files = collectLintFiles(opts.paths) catch _ {
+  // `bit.json`'s "lint" key (#4156, compiler/lintproject.bit), loaded ONCE
+  // per invocation, never per file. `root` is the same anchor
+  // `projectRootDir()` already gives `bit check`/`bit test` (projectcli.bit)
+  // — "." when no ancestor `bit.json` exists, which makes `pc.active` false
+  // and every function in lintproject.bit a no-op: a tree with no `bit.json`
+  // (or one with no "lint" key) behaves exactly as before this existed.
+  let root = projectRootDir()
+  let pc = loadLintProjectConfig(root) catch e {
+    eprint("bit lint: ${e.message()}\n")
     return 2
   }
+  let files0 = collectLintFiles(opts.paths) catch _ {
+    return 2
+  }
+  let (files, skipped) = lintExcludeDisabled(pc, root, files0)
 
   let sm = newSourceManager()
   // Two sinks, because they have different fates: a directive error is an
@@ -199,6 +211,8 @@ fn lintCmd(a: []string): int {
     opts: opts,
     errs: newDiagnostics(sm),
     findings: newDiagnostics(sm),
+    pc: pc,
+    root: root,
   }
   let overrides = 0
   let moduleCache = newLintModuleCache()
@@ -219,19 +233,93 @@ fn lintCmd(a: []string): int {
   // genuinely used — drop the E0210 findings runLintRules computed
   // per-file-in-isolation for those.
   lintDropModuleUsedImports(ctx.findings, moduleCache)
+  // `bit.json`'s "allow" overrides (compiler/lintproject.bit): drop the named
+  // diagnostic codes for files under a matching path, from BOTH sinks — a
+  // directive/parse error as much as an ordinary finding. Printed with its
+  // own denominator, never silent (#4156's proof requirement: a suppression
+  // must be visible, the same reason a per-finding `allow` counts toward
+  // "overrides active", spec/LINT.md §5.5).
+  let suppressed = lintFilterAllowed(pc, root, sm, ctx.errs) + lintFilterAllowed(pc, root, sm, ctx.findings)
+  if (skipped > 0) {
+    eprint("lint: ${skipped} file(s) excluded by bit.json (lint.overrides disable)\n")
+  }
+  if (suppressed > 0) {
+    eprint("lint: ${suppressed} diagnostic(s) suppressed by bit.json (lint.overrides allow)\n")
+  }
 
   return lintReport(opts, ctx.errs, ctx.findings, overrides, fileErrors)
 }
 
+// `files` with every file `isProjectDisabled` (lintproject.bit) names
+// dropped BEFORE it is ever opened — a "disable": true override exempts a
+// corpus from `bit lint` entirely, not merely from findings, so a
+// deliberately-malformed fixture in it can never turn a parse error into an
+// exit-2 hard-stop for the whole run. Returns the drop count alongside the
+// filtered list so the caller can report it (never a silent shrink).
+fn lintExcludeDisabled(pc: LintProjectConfig, root: string, files: []LintFile): ([]LintFile, int) {
+  if (!pc.active) {
+    return files, 0
+  }
+  let out = []LintFile(0)
+  let skipped = 0
+  for lf of files {
+    if (isProjectDisabled(pc, root, lf.path)) {
+      skipped = skipped + 1
+      continue
+    }
+    out = append(out, lf)
+  }
+  return out, skipped
+}
+
+// Drops every diagnostic in `d` whose code is `bit.json`-allow-listed for its
+// own file (lintproject.bit's `allowCodesFor`), fixing up `errorCount` to
+// match what remains — `report()` bumps it per error-severity diagnostic
+// added, so a diagnostic removed here must be un-bumped the same way
+// `truncateDiags` (diagnostics.bit) already does for a different reason.
+// Returns how many were removed; 0 (and `d` untouched) whenever `pc` is
+// inactive, which is what keeps an absent "lint" key byte-identical.
+fn lintFilterAllowed(pc: LintProjectConfig, root: string, sm: SourceManager, d: Diagnostics): int {
+  if (!pc.active) {
+    return 0
+  }
+  let out = []Diagnostic(0)
+  let removed = 0
+  for g of d.list {
+    let path = filePath(sm, g.span.file)
+    if (containsInt(allowCodesFor(pc, root, path), g.code)) {
+      removed = removed + 1
+      continue
+    }
+    out = append(out, g)
+  }
+  if (removed == 0) {
+    return 0
+  }
+  d.list = out
+  let ec = 0
+  let i = 0
+  while (i < len(out)) {
+    if (out[i].severity == 0) {
+      ec = ec + 1
+    }
+    i = i + 1
+  }
+  d.errorCount = ec
+  return removed
+}
+
 // The state one `bit lint` invocation threads through every file: the shared
-// source manager, options and the two sinks `lintOneFile` reports into.
-// Grouped into one struct so `lintOneFile` takes 3 params instead of 6
-// (E0202).
+// source manager, options, the two sinks `lintOneFile` reports into, and the
+// `bit.json` project layer (#4156) every file is seeded from. Grouped into
+// one struct so `lintOneFile` takes 3 params instead of 8 (E0202).
 class LintBatchCtx {
   sm: SourceManager,
   opts: LintArgs,
   errs: Diagnostics,
   findings: Diagnostics,
+  pc: LintProjectConfig,
+  root: string,
 }
 
 // One file's worth of `lintCmd`'s loop body: directives, then (unless a
@@ -249,7 +337,13 @@ fn lintOneFile(lf: LintFile, src0: string, ctx: LintBatchCtx): int {
   let findings = ctx.findings
   let opts = ctx.opts
   let errsBefore = errs.errorCount
-  let cfg = readLintDirectives(src, file, errs)
+  // `bit.json`'s project layer (#4156, compiler/lintproject.bit) seeds this
+  // file's config BEFORE its own directives are read, so a directive always
+  // overwrites what the project set and always wins — "most specific wins"
+  // (spec/LINT.md §5.3). A fresh `LintConfig` per file: nothing else holds a
+  // reference to alias across the loop.
+  let base = seedLintConfig(ctx.pc, ctx.root, lf.path)
+  let cfg = readLintDirectivesFrom(src, file, errs, base)
   // Counted over EVERY file walked, not only files with findings (§2.2): the
   // number exists to make a raised limit visible, and a raised limit is
   // precisely a file that no longer has a finding.
