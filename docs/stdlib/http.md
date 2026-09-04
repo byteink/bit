@@ -351,9 +351,9 @@ fn runServer(s: Server, n: int): ()! {
 }
 ```
 
-### `shutdown(s: Server, timeoutMs: int): ()!`
+### `Server.shutdown(timeoutMs: int): ()!`
 
-Stops `s` accepting new connections and drains requests already in flight,
+Stops the server accepting new connections and drains requests already in flight,
 then returns. The listener closes first, so a fresh dial is refused right
 away. A connection still waiting for its request (including one that never
 sent a byte) is force-closed immediately - there is nothing to protect yet.
