@@ -1,8 +1,11 @@
-// Bit standard library — http module: graceful shutdown for `Server` (#3963).
+// Bit standard library — http module: graceful shutdown for `Server` and
+// `TlsServer` (#3963, #4314).
 //
 // `serve`/`listenAndServe`/`listenAndServeOn` had no way to stop: the only way
 // to end one was to kill the process, severing every response mid-flight.
-// `shutdown` fixes that for the plain HTTP server surface:
+// `shutdown` fixes that for the plain HTTP server surface, and
+// `TlsServer.shutdown` (server.bit, #4314) reuses the exact same engine —
+// `drainRun` below — for `tlsServe`/`serveTlsServerOn`:
 //
 //   1. Close the listener FIRST — a load balancer's next health check fails
 //      and traffic moves away immediately, and a fresh dial gets refused
@@ -12,8 +15,14 @@
 //      and one stalled mid-body. Nothing has been promised to that peer yet,
 //      so there is nothing to protect, and making it wait only slows
 //      shutdown down for no benefit — the peer can simply retry elsewhere.
+//      For h2 (h2.bit's `h2glueServe`) this is a connection with no stream
+//      that has ever started — cutting it loses nothing either.
 //   3. Give every connection that DOES have a request in `handler`'s hands up
-//      to `timeoutMs` to finish writing its response.
+//      to `timeoutMs` to finish writing its response. An h2 connection
+//      carrying an in-flight stream is sent GOAWAY here (`H2Conn.close()`,
+//      via each entry's `goaway` hook) so its peer opens no further stream on
+//      it while the current one(s) finish — the h2-native shape of the same
+//      promise.
 //   4. Force-close whatever is still running once the deadline passes, and
 //      report exactly how many — a silent force-close looks identical to a
 //      clean one, and that difference is what an operator needs to know.
@@ -24,19 +33,20 @@
 // side effect (closing the listener, force-closing a connection) ever runs
 // twice.
 //
-// Scope: this governs `Server` — `serve`/`listenAndServe`/`listenAndServeOn`
-// — only. `serveTls`/`serveTlsOn` keep their existing `TlsListener`-based
-// signatures (used across ten call sites in this repo, and Bit has no
-// optional/default parameters — SPEC §10.3 — so there is no backward-
-// compatible way to thread a shared drain tracker into them without a real
-// `Server`/`TlsListener` unification, which is out of this ticket's bounded
-// scope). `serveTlsOn`'s HTTP/1.1-over-TLS connections still get a private,
-// per-call drain tracker so `serveOne`'s signature stays uniform — it is
-// simply never exposed, so nothing external can drain it yet. The `Server`
-// direct-drive API (`Server.accept()`/`Exchange.read()`/`.respond()`) is
-// unaffected too: `shutdown` still stops it accepting (the same listener),
-// it just does not track its in-flight exchanges, since that API has no
-// registration point of its own.
+// `serveTls`/`serveTlsOn` (server.bit) keep their original `TlsListener`-based
+// signatures — used across ten existing call sites, and Bit has no
+// optional/default parameters (SPEC §10.3), so there is no backward-
+// compatible way to add a shared drain tracker to them directly. Each of
+// their connections (HTTP/1.1-over-TLS and h2 alike) still gets a private,
+// per-call `drainState` so `serveOne`/`h2glueServe`'s signatures stay uniform
+// with the shutdown-capable path below — it is simply never exposed, so
+// nothing external can drain it. `tlsServe`/`serveTlsServerOn` (server.bit,
+// #4314) are the shutdown-capable mirror: same connection handling, a shared
+// `TlsServer.drain` instead of a throwaway one. The `Server` direct-drive API
+// (`Server.accept()`/`Exchange.read()`/`.respond()`) is unaffected too:
+// `shutdown` still stops it accepting (the same listener), it just does not
+// track its in-flight exchanges, since that API has no registration point of
+// its own.
 
 import { Mutex, newMutex } from "std/sync"
 import { after, Millisecond } from "std/time"
@@ -48,10 +58,14 @@ import { after, Millisecond } from "std/time"
 // handed off (`drainMarkActive`). `force` wakes whatever green thread is
 // currently blocked on this connection's socket the way `net.Conn.shutdown`
 // documents: a real state transition the parked read observes as an orderly
-// EOF, never a bare `close`, which would leave it parked forever.
+// EOF, never a bare `close`, which would leave it parked forever. `goaway` is
+// the h2-only step 3 signal (`drainSignalActive`) — `H2Conn.close()` for an
+// h2 connection, a no-op closure for a plain HTTP/1.1 one, which has nothing
+// further to tell its peer before it finishes or is force-closed.
 class connEntry {
   active: bool,
   force: () => (),
+  goaway: () => (),
 }
 
 // Coordinates one `Server`'s graceful shutdown: the registry of connections
@@ -92,9 +106,12 @@ fn newDrainState(): drainState {
 // calls, or `-1` if shutdown has already FULLY finished — the narrow race
 // between the listener closing and a connection already accepted just before
 // that reaching this call. A `-1` connection is force-closed on the spot
-// rather than left untracked and unclosed forever.
+// rather than left untracked and unclosed forever. `goaway` is `connEntry`'s
+// step-3 hook — pass `() => {}` for a connection with nothing to signal
+// (see `connEntry`'s doc comment).
 fn drainRegister(
   d: drainState, force: () => (),
+  goaway: () => (),
 ): int {
   d.mu.lock()
   if (d.finished) {
@@ -104,7 +121,7 @@ fn drainRegister(
   }
   let id = d.nextId
   d.nextId = d.nextId + 1
-  d.conns[id] = connEntry{ active: false, force: force }
+  d.conns[id] = connEntry{ active: false, force: force, goaway: goaway }
   d.mu.unlock()
   return id
 }
@@ -190,16 +207,44 @@ fn drainFinalize(d: drainState): int {
   return cut
 }
 
-// Drain and stop `s` — the private half of `Server.shutdown()` (server.bit).
-// Kept here, not in server.bit, because this file owns the whole drain state
-// machine described in its header comment above; `Server.shutdown()` is a
-// one-line forwarder so the public API is a method (SPEC 11.7 — a bare
-// top-level `fn` here would collide with the runtime's own extern `shutdown`
-// symbol once this module is copied into a root module, #4315). A non-nil
-// error names exactly how many in-flight connections were force-closed after
+// Step 3's h2 half: after `drainSweepIdle` has removed every idle connection,
+// everything left in `d.conns` is active — signal each one's `goaway` hook
+// (see `connEntry`'s doc comment). A no-op for a plain HTTP/1.1 entry.
+fn drainSignalActive(d: drainState) {
+  d.mu.lock()
+  for (_, e) of d.conns {
+    e.goaway()
+  }
+  d.mu.unlock()
+}
+
+// Whether `d`'s shutdown has begun. `serveTlsServerOn` (server.bit) reads
+// this from its accept loop's error branch to tell "the listener just failed
+// because `shutdown` closed it" — stop looping — from an ordinary transient
+// accept/handshake failure, which must NOT stop the loop (see `serveTlsOn`'s
+// own doc comment for why a single bad connection can't be allowed to kill
+// the server). The plain path does not need this: `listenAndServeOn` lets
+// `s.listener.accept()`'s error propagate with `?` and its caller treats any
+// exit as "stop", so a shutdown-induced accept failure already ends the loop
+// correctly without asking why.
+fn drainStarted(d: drainState): bool {
+  d.mu.lock()
+  let started = d.started
+  d.mu.unlock()
+  return started
+}
+
+// The shared shutdown engine for both `Server` and `TlsServer` (server.bit):
+// `closeListener` is the one thing that differs between them (a plain
+// `Listener` vs a `TlsListener`), so it is passed in as a closure rather than
+// duplicating this whole sequence per type. See this file's header comment
+// for the four-step sequence and its h2-specific step 3. A non-nil error
+// names exactly how many in-flight connections were force-closed after
 // `timeoutMs` — never the idle ones, which had nothing to lose.
-fn drainServer(s: Server, timeoutMs: int): ()! {
-  let d = s.drain
+fn drainRun(
+  closeListener: () => (),
+  d: drainState, timeoutMs: int,
+): ()! {
   d.mu.lock()
   if (d.started) {
     let waitCh = d.finishedCh
@@ -217,8 +262,9 @@ fn drainServer(s: Server, timeoutMs: int): ()! {
   let waitNeeded = d.activeCount > 0
   d.mu.unlock()
 
-  s.listener.close()
+  closeListener()
   drainSweepIdle(d)
+  drainSignalActive(d)
 
   if (waitNeeded) {
     select {
@@ -242,4 +288,33 @@ fn drainServer(s: Server, timeoutMs: int): ()! {
   if (len(msg) > 0) {
     fail newError(msg)
   }
+}
+
+// Drain and stop `s` — the private half of `Server.shutdown()` (server.bit).
+// Kept here, not in server.bit, because this file owns the whole drain state
+// machine described in its header comment above; `Server.shutdown()` is a
+// one-line forwarder so the public API is a method (SPEC 11.7 — a bare
+// top-level `fn` here would collide with the runtime's own extern `shutdown`
+// symbol once this module is copied into a root module, #4315).
+fn drainServer(s: Server, timeoutMs: int): ()! {
+  drainRun(
+    () => {
+      s.listener.close()
+    },
+    s.drain,
+    timeoutMs,
+  )?
+}
+
+// Drain and stop `s` — the private half of `TlsServer.shutdown()`
+// (server.bit, #4314). Identical engine to `drainServer`; only what closing
+// "the listener" means differs, which `drainRun` takes as a closure.
+fn drainTlsServer(s: TlsServer, timeoutMs: int): ()! {
+  drainRun(
+    () => {
+      s.listener.close()
+    },
+    s.drain,
+    timeoutMs,
+  )?
 }

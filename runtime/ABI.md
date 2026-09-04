@@ -1750,12 +1750,15 @@ calls `boot`, and exits the process with `boot`'s returned code.
    more OS thread and resets. Both paths matter: an ordinary CPU-bound
    program's spawns stay on the calling worker's own local ring, so without
    the local check the global one alone never sees them and the pool never
-   grows past 1 regardless of backlog (#3583). This applies regardless of
-   whether the pool started at the default above or at an explicit
-   `BIT_WORKERS` — nothing gates growth on which one produced the starting
-   count. A program that never has parallel work never pays for a pool it
-   doesn't use; a program with sustained backlog grows toward the machine's
-   actual, current free capacity instead of a boot-time guess at it.
+   grows past 1 regardless of backlog (#3583). A program that never has
+   parallel work never pays for a pool it doesn't use; a program with
+   sustained backlog grows toward the machine's actual, current free
+   capacity instead of a boot-time guess at it — UNLESS `BIT_WORKERS` was
+   explicitly set, in which case it is also a hard ceiling on that growth,
+   not only the boot-time floor (#4313): `schedGrowArm`/`schedMaybeGrow`
+   (`runtime/sched/grow.bit`) refuse to grow the pool past it. The implicit
+   default (unset `BIT_WORKERS`) is unaffected and still grows to
+   `schedMaxWorkers` exactly as described above.
 
    This was pinned to **exactly one** until #1900. It was never a *collector*
    requirement — §5's handshake makes concurrent mutators safe, and each worker
@@ -1772,9 +1775,13 @@ calls `boot`, and exits the process with `boot`'s returned code.
 
    `BIT_WORKERS=1` fixes the *boot-time* pool at pre-#1900's single worker,
    and exists so a suspected concurrency failure can be bisected against it
-   without a rebuild — it is not a ceiling on growth, which can still raise
-   the pool above 1 under sustained backlog exactly as it would from the
-   default.
+   without a rebuild. As of #4313, an explicit `BIT_WORKERS` is ALSO a hard
+   ceiling on growth, so `BIT_WORKERS=1` now keeps the pool at exactly one
+   worker for the life of the run rather than merely starting it there — the
+   pre-#4313 behaviour (growth ignoring which count started the pool) is no
+   longer accurate for an explicit setting. The implicit default (no
+   `BIT_WORKERS` set at all) is unchanged: it still starts at 1 and grows
+   under sustained backlog exactly as before.
 3. Spawn `main_fn` (§10) as the first green thread.
 4. Poll (bounded exponential backoff) until that task reports done, then shut
    the scheduler down, tear down the collector, and return the task's exit

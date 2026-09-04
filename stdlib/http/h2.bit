@@ -132,26 +132,33 @@ fn h2glueDeadlineRelabel(e: error, conn: TlsConn): error {
 // Serve one h2-negotiated connection: run the http2 server engine and dispatch
 // each stream to the transport-agnostic `handler`, mapping the http2 request and
 // response to this module's types on the way in and out. Each response advertises
-// the HTTP/3 endpoint on `altPort` via an Alt-Svc header.
+// the HTTP/3 endpoint on `altPort` via an Alt-Svc header. `d` is the owning
+// server's drain tracker (`shutdown.bit`, #3963/#4314): this connection is
+// registered idle until its first stream starts, then active for the rest of
+// its life — a graceful shutdown force-closes it right away if idle, or sends
+// GOAWAY and gives it up to its timeout to finish if active, exactly as
+// `serveOne` does for HTTP/1.1 (server.bit). `serveTlsOn`'s call site passes a
+// private, never-drained `d`, so this bookkeeping is a no-op cost there.
 //
 // `h2accept` spawns the same reader/writer/loop trio `h2connect` does
 // (`stdlib/http2/conn.bit:193`), and `hc.serve()` additionally parks THIS green
 // thread reading `hc.acceptCh` until the loop sends a stop (`stdlib/http2/events.bit`)
-// — which, on the server side, only ever happens when the loop observes the
-// transport's own EOF, since nothing here ever calls `hc.close()` to end a
-// connection early. So by the time `hc.serve()` returns, the reader has already
-// hit that same EOF and is done touching the transport (that is what woke the
-// loop in the first place) — `hc.waitReaderDone()` here is a bounded join, not a
-// fresh wait, matching `h2clientExchange`'s teardown (`conn.shutdown()` ->
-// `hc.waitReaderDone()` -> `hc.waitWriterDone()` -> `conn.close()`, #3016,
-// #3026) even though nothing here needs the `shutdown()` to wake anything: the
-// socket was never being closed at all before this fix (#3020), leaking one
-// parked green thread and one open fd per served connection forever.
-// `hc.waitWriterDone()` is bounded the same way `hc.waitReaderDone()` is: the
-// same eof handling that released `hc.serve()` (via `acceptCh`) also queues
-// the writer's stop (via `writeCh`), so both joins settle once the loop has
-// run, not on a fresh unbounded wait.
-fn h2glueServe(conn: TlsConn, handler: (Request) => Response, altPort: int) {
+// — which happens when the loop observes the transport's own EOF, OR when this
+// connection's `force` hook below calls `conn.shutdown()` to manufacture that
+// same EOF from a graceful-shutdown timeout. So by the time `hc.serve()`
+// returns, the reader has already hit that same EOF and is done touching the
+// transport (that is what woke the loop in the first place) — `hc.waitReaderDone()`
+// here is a bounded join, not a fresh wait, matching `h2clientExchange`'s teardown
+// (`conn.shutdown()` -> `hc.waitReaderDone()` -> `hc.waitWriterDone()` ->
+// `conn.close()`, #3016, #3026). `hc.waitWriterDone()` is bounded the same way
+// `hc.waitReaderDone()` is: the same eof handling that released `hc.serve()`
+// (via `acceptCh`) also queues the writer's stop (via `writeCh`), so both joins
+// settle once the loop has run, not on a fresh unbounded wait. Calling
+// `conn.shutdown()` here a second time, after the drain's own `force` already
+// called it once, is safe — `net.Conn.shutdown` (stdlib/net/net.bit) is a plain
+// idempotent syscall on a still-open fd, not a state transition guarded against
+// re-entry the way `close()` is.
+fn h2glueServe(conn: TlsConn, handler: (Request) => Response, altPort: int, d: drainState) {
   // No deadline: `serveTls` gives its handler no per-connection timeout
   // budget to thread through today, so this stays unbounded exactly as
   // before (#3019 is about `getTimeout`'s client-side deadline).
@@ -159,7 +166,22 @@ fn h2glueServe(conn: TlsConn, handler: (Request) => Response, altPort: int) {
     conn.close()
     return
   }
-  hc.serve((r) => h2glueResponseOutAlt(handler(h2glueRequestIn(r)), altPort)) catch _ {
+  let id = drainRegister(
+    d,
+    () => {
+      conn.shutdown()
+    },
+    () => {
+      hc.close()
+    },
+  )
+  defer drainDeregister(d, id)
+  hc.serve(
+    (r) => {
+      drainMarkActive(d, id)
+      return h2glueResponseOutAlt(handler(h2glueRequestIn(r)), altPort)
+    },
+  ) catch _ {
     conn.shutdown()
     hc.waitReaderDone()
     hc.waitWriterDone()
