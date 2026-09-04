@@ -379,6 +379,121 @@ export @nosplit @symbol("bit_rt_fs_size") fn rtFsSize(fd: int): int {
   return loadWord(slotBase + statSizeOff)
 }
 
+// `int flock(int fd, int operation)` (`<sys/file.h>`): whole-file advisory
+// lock/unlock, admitted at `compiler/machosyms.bit`. Operation bits, shared
+// with every BSD/Linux `flock` and NOT libc-specific: LOCK_SH=1 (shared),
+// LOCK_EX=2 (exclusive), LOCK_NB=4 (OR'd in for a non-blocking attempt),
+// LOCK_UN=8 (release).
+extern fn flock(fd: i32, operation: i32): i32
+
+const flockSh: int = 1
+const flockEx: int = 2
+const flockNb: int = 4
+const flockUn: int = 8
+
+// Darwin's `EWOULDBLOCK`/`EAGAIN` (`<sys/errno.h>`, the two names alias the
+// same value on BSD) -- the specific errno `flock(2)` sets when `LOCK_NB` is
+// given and the lock is already held by another process. Reading it lets
+// `bit_rt_fs_lock` turn "the lock is busy" into a fixed, portable sentinel
+// instead of handing the caller a raw errno it would need per-platform
+// knowledge to interpret.
+const eWouldBlock: int = 35
+
+// A large but PROVABLY BOUNDED retry budget (Power of 10 rule 2) for a
+// blocking lock wait interrupted by a signal (`EINTR`) -- the same
+// `maxReadAllRetries` rationale above, applied to `flock`'s indefinite wait
+// instead of `read`'s.
+const maxLockRetries: int = 1000
+
+// `bit_rt_fs_lock` (ABI.md §14, #4014): take a WHOLE-FILE advisory lock on
+// `fd`, exclusive (`LOCK_EX`) or shared (`LOCK_SH`), blocking or
+// non-blocking (`LOCK_NB`).
+//
+// `flock`, deliberately NOT `fcntl(F_SETLK)` -- two independent reasons, both
+// load-bearing for this ticket's own acceptance test:
+//   1. An `fcntl` lock is released the instant ANY fd for the file is closed
+//      ANYWHERE in this process, even an unrelated one opened by library
+//      code -- it silently drops a lock the caller still believes it holds.
+//   2. `fcntl` locks are associated with the PROCESS and the inode, not the
+//      fd. A second `open()` of the same file by the SAME process is then
+//      treated as the process already holding its own lock and never
+//      conflicts with the first -- which is exactly the "two `File` values
+//      in one process" scenario this ticket's acceptance test exercises.
+// `flock`'s lock is tied to the OPEN FILE DESCRIPTION (the specific `open()`
+// call), so two fds from two separate opens correctly contend even within
+// one process, and the lock is released automatically when the LAST fd
+// referring to that open file description is closed -- `bit_rt_fs_close`
+// needs no extra code for the Unix side of "close releases the lock"
+// (ABI.md documents the Windows side, which has no such guarantee).
+//
+// Non-blocking (`LOCK_NB`) returns immediately either way, so that path is
+// a single attempt, unbracketed, matching `rtFsTruncate`/`rtFsSize` above's
+// treatment of fast, bounded calls. Blocking waits for another process to
+// release the lock, potentially indefinitely, so THAT path needs the same
+// #2207 bracket `rtFsRead`/`rtFsReadAll` above use for their own indefinite
+// waits, plus the identical bounded `EINTR` retry.
+//
+// Three-way return, deliberately NOT the raw `-errno` convention #2343
+// documents for `stat_w`/`lstat_w`: 0 on success; -1 only when `blocking` is
+// false and the lock is held elsewhere (`EWOULDBLOCK`) -- the expected
+// outcome for `tryLock`/`tryLockShared`, not a failure; -2 for any other
+// error (bad fd, `ENOLCK`, ...). Normalizing "busy" to a fixed sentinel here
+// means the eventual `std/fs` caller needs no per-platform errno knowledge
+// at all -- ../windows/fsrw.bit's provider (which has no errno, only
+// `GetLastError`) normalizes to this identical -1/-2 contract its own way.
+export @nosplit @symbol("bit_rt_fs_lock") fn rtFsLock(
+  fd: int,
+  exclusive: bool,
+  blocking: bool,
+): int {
+  let op = flockSh
+  if (exclusive) {
+    op = flockEx
+  }
+  if (!blocking) {
+    let rc = int(flock(i32(fd), i32(op | flockNb)))
+    if (rc == 0) {
+      return 0
+    }
+    if (readAllErrno() == eWouldBlock) {
+      return 0 - 1
+    }
+    return 0 - 2
+  }
+  let retries = 0
+  while (retries < maxLockRetries) {
+    gcSyscallBegin()
+    let rc = int(flock(i32(fd), i32(op)))
+    let err = 0
+    if (rc != 0) {
+      err = readAllErrno()
+    }
+    gcSyscallEnd()
+    if (rc == 0) {
+      return 0
+    }
+    if (err == eIntr) {
+      retries = retries + 1
+    } else {
+      return 0 - 2
+    }
+  }
+  return 0 - 2
+}
+
+// `bit_rt_fs_unlock`: release `fd`'s advisory lock via `flock(fd, LOCK_UN)`.
+// A no-op success if `fd` did not hold a lock -- `flock` itself defines
+// `LOCK_UN` this way, so a caller never needs to track whether it is
+// currently holding one before calling this. 0 on success, -2 on any other
+// error; -1 has no meaning here, since releasing a lock has no "would
+// block" outcome to distinguish.
+export @nosplit @symbol("bit_rt_fs_unlock") fn rtFsUnlock(fd: int): int {
+  if (int(flock(i32(fd), i32(flockUn))) == 0) {
+    return 0
+  }
+  return 0 - 2
+}
+
 // `char *getcwd(char *buf, size_t size)`: fills `buf` with the absolute path
 // of the process's current working directory, NUL-terminated. Returns `buf`
 // on success, NULL on any failure -- `ERANGE` if `buf` is too small,

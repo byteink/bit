@@ -2388,6 +2388,8 @@ bit_rt_fs_open_rw_w(words, n)     -> i64        // O_RDWR|O_CREAT, no O_TRUNC; f
 bit_rt_fs_sync(fd)                -> i64        // 0, or -1 (#3462)
 bit_rt_fs_truncate(fd, size: i64) -> i64        // set fd's length; 0, or -1 (#4016)
 bit_rt_fs_size(fd)                -> i64        // fd's length in bytes, or -1 (#4016)
+bit_rt_fs_lock(fd, exclusive: bool, blocking: bool) -> i64  // whole-file advisory lock; 0/-1/-2 (#4014)
+bit_rt_fs_unlock(fd)              -> i64        // release; 0, or -2 (#4014)
 bit_rt_fs_cwd()                   -> string     // cwd, or "" on failure (#3501)
 bit_rt_fs_close(fd)               -> i64        // always 0
 bit_rt_fs_exists(path)            -> bool
@@ -2515,6 +2517,58 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   no consumer. Pass 2 (`File.truncate()`/`File.size()` methods in
   `stdlib/fs/fs.bit`, #4215) is a follow-up ticket, gated on a release
   containing this commit and a stage0 repin to it.
+- `fs_lock`/`fs_unlock` (#4014) take/release a WHOLE-FILE advisory lock on
+  `fd`, exclusive or shared, blocking or non-blocking. Darwin and Linux both
+  call `flock(2)` — Darwin via the bare libc extern, Linux via the raw
+  syscall number (73 on x86-64, 32 on aarch64) — deliberately NOT
+  `fcntl(F_SETLK/F_SETLKW)`: an `fcntl` lock is released the instant ANY fd
+  for the file closes anywhere in the process, even an unrelated one in
+  library code, and `fcntl` locks are keyed on (process, inode) rather than
+  fd, so a second `open()` of the same file by the SAME process would never
+  conflict with the first under `fcntl` — `flock`'s lock is keyed on the
+  OPEN FILE DESCRIPTION instead, so two fds from two separate opens
+  correctly contend even within one process, which the stdlib-level
+  acceptance test (once #4296 lands it) exercises directly. This also means
+  Unix needs no explicit unlock-on-close: `flock` releases automatically
+  when the last fd referring to that open file description closes, so
+  `fs_close` needs no change. Windows has no such guarantee (undocumented
+  behaviour on close per Win32 convention) and calls `LockFileEx`/
+  `UnlockFileEx` instead, locking the `MAXDWORD`/`MAXDWORD` byte range at
+  offset 0 — Microsoft's own documented whole-file convention, since Win32
+  has no separate whole-file lock call — so the STDLIB `close()` wrapper
+  MUST call `fs_unlock` before `fs_close` on that platform once it lands.
+  `fs_lock` blocks indefinitely when `blocking` is true (bracketed with
+  `gcSyscallBegin`/`gcSyscallEnd`, #2207, plus a bounded `EINTR` retry on
+  Darwin/Linux, the same shape `fs_read_all`'s loop uses); non-blocking is a
+  single unbracketed attempt. Both return a normalized THREE-WAY result,
+  deliberately not the raw `-errno` convention #2343 documents for
+  `stat_w`/`lstat_w`: `0` on success; `-1` only when `blocking` is false and
+  the lock is held elsewhere (`EWOULDBLOCK` on Darwin/Linux,
+  `ERROR_LOCK_VIOLATION` on Windows) — the expected outcome for
+  `tryLock`/`tryLockShared`, not a failure; `-2` for any other error. Each
+  provider normalizes its own platform-specific busy signal to this fixed
+  sentinel internally, so the eventual `std/fs` caller needs no
+  per-platform errno/`GetLastError` knowledge at all. `fs_unlock` is a
+  no-op success on an fd/handle that holds no lock, on every platform
+  (Windows folds `ERROR_NOT_LOCKED` into success specifically to match
+  `flock(LOCK_UN)`'s native no-op behaviour), so a caller never needs to
+  track whether it currently holds a lock before releasing it. Verified with
+  a standalone probe on real aarch64-macos and real x86_64-linux hardware
+  (14/14 assertions each: exclusive excludes exclusive and shared, shared
+  coexists with shared, unlock releases, a fresh open after `File.close()`
+  observes the lock gone, unlock-when-never-locked is a no-op) and
+  mutation-tested on both (a wrong `EWOULDBLOCK` constant on Darwin and a
+  wrong syscall number on Linux each turned every affected assertion red;
+  reverting restored all-pass). Windows verified compile+link only — no
+  hardware available this session — via a freestanding cross-build of
+  `runtime/root/windows` confirming `bit_rt_fs_lock`/`bit_rt_fs_unlock` are
+  defined and `LockFileEx`/`UnlockFileEx`/`GetLastError` resolve as PE
+  imports. **No `stdlib/` caller exists yet**, the same `tools/build/`
+  bootstrap cycle the `fs_truncate`/`fs_size` bullet above describes: this
+  landing is pass 1 of 2 (the #3065 pattern), the runtime primitives only,
+  no consumer. Pass 2 (`File.lock()`/`tryLock()`/`lockShared()`/
+  `tryLockShared()`/`unlock()` in `stdlib/fs/fs.bit`, #4296) is a follow-up
+  ticket, gated on a release containing this commit and a stage0 repin to it.
 - `fs_cwd` (#3501) is the only `bit_rt_fs_*` entry point that takes NO
   argument — nothing to encode through `fsPathZ`/`checkedPathW`. Darwin and
   Linux both call `getcwd` (libc on Darwin, the raw syscall on Linux — kernel
