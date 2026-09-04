@@ -120,7 +120,7 @@ order** that did not match the order the programmer wrote them in, so a
 clause printed ahead of its true source position swept up a neighboring
 clause's still-unconsumed comment. The fix — sort the populated clauses by
 their own `span.start` before printing, then explicitly flush the gap before
-each clause (`fmtAsmStmt`, `compiler/fmtdispatch.bit:705-755`) — is what makes
+each clause (`fmtAsmStmt`, `compiler/fmtasm.bit:86-136`) — is what makes
 "attached to the same node it was attached to in the source" hold universally
 rather than for every node kind except `asm`.
 
@@ -299,11 +299,11 @@ re-formatting any of these outputs is a no-op (idempotent).
 **Rule.** An `asm` block's interior statement order and each statement's
 attached comment are preserved exactly as the source wrote them — the
 formatter may re-indent the block (see §2) but never reorders its clauses
-(`fmtAsmStmt`, `compiler/fmtdispatch.bit:705-755`, see §4 for why this needed
+(`fmtAsmStmt`, `compiler/fmtasm.bit:86-136`, see §4 for why this needed
 a fix rather than being true by default). The block is width-aware like any
 other bracketed construct (§1): it renders on one line only if that fits
 under the 100-column budget and holds no comment, via a trial render
-(`fmtAsmFlatSlots`, `compiler/fmtdispatch.bit:717-726`); otherwise each
+(`fmtAsmFlatSlots`, `compiler/fmtasm.bit:75-84`); otherwise each
 clause — `x64 { ... }`, `arm64 { ... }`, `input ...`, etc. — gets its own
 line. Before `#3679` the flat form was assumed whenever the block held no
 comment, with no width check: a clause whose own content (e.g. a long
