@@ -254,20 +254,26 @@ fn runMsg(code: int): string {
 
 // --- build ---------------------------------------------------------------
 
-fn buildScript(
-  bit: string, libbitrt: string, stdlib: string, srcPath: string,
-  binPath: string, outPath: string, errPath: string,
-): string {
+// The compiler under test, bundled with the environment it needs to run
+// (BIT_STDLIB/BIT_LIBBITRT) — grouped because every function below that
+// invokes the compiler needs all three together.
+class CompilerEnv {
+  bit: string,
+  libbitrt: string,
+  stdlib: string,
+}
+
+fn buildScript(cc: CompilerEnv, srcPath: string, binPath: string, outPath: string, errPath: string): string {
   let s = "#!/bin/sh\n"
-  if (stdlib != "") {
-    s = s + "BIT_STDLIB=" + shQuote(stdlib) + "\nexport BIT_STDLIB\n"
+  if (cc.stdlib != "") {
+    s = s + "BIT_STDLIB=" + shQuote(cc.stdlib) + "\nexport BIT_STDLIB\n"
   }
-  if (libbitrt != "") {
-    s = s + "BIT_LIBBITRT=" + shQuote(libbitrt) + "\nexport BIT_LIBBITRT\n"
+  if (cc.libbitrt != "") {
+    s = s + "BIT_LIBBITRT=" + shQuote(cc.libbitrt) + "\nexport BIT_LIBBITRT\n"
   }
   s = s +
     "exec " +
-    shQuote(bit) +
+    shQuote(cc.bit) +
     " build " +
     shQuote(srcPath) +
     " -o " +
@@ -300,6 +306,92 @@ fn buildScript(
 // _tests_/bit/lspcache.bit's header for why `swept+live` is "every object the
 // run allocated" and `collections` is not what this gate reads (it depends
 // on when the trigger fires, which depends on live bytes — see #2941).
+// The Darwin case branch of measureScript's dispatch. The child inherits fd
+// 2 from this redirect, same as before #3130 — its own `[bit-gc] ...` line
+// and `/usr/bin/time -l`'s summary both land in rawPath, in that order (the
+// child exits and is reaped before `time` appends its own report), so no
+// second capture file is needed here. `/usr/bin/time -l`'s first line is
+// fixed-format: "<real> real <user> user <sys> sys", so the user-seconds
+// value is always field 3 of the line matching " user". `(u*100)+0.5`
+// rounds to the nearest centisecond. The same pass folds in the
+// `swept=`/`live=` scan (`gcAwkBody`, built once in measureScript and
+// shared by both branches) so ONE awk call produces all four fields.
+fn darwinMeasureBranch(bin: string, outPath: string, rawPath: string, resPath: string, gcAwkBody: string): string {
+  let s = "  Darwin)\n"
+  s = s +
+    "    /usr/bin/time -l " +
+    shQuote(bin) +
+    " >" +
+    shQuote(outPath) +
+    " 2>" +
+    shQuote(rawPath) +
+    "\n"
+  s = s + "    ec=$?\n"
+  s = s +
+    "    awk -v ec=$ec 'BEGIN{u=-1;r=-1;" +
+    gcAwkBody +
+    "/ user/{u=$3} /maximum resident set size/{r=$1} " +
+    "END{obj=-1; if (sw>=0 && lv>=0) obj=sw+lv; " +
+    "printf \"%d %d %d %d\\n\", ec, (u*100)+0.5, r, obj}' " +
+    shQuote(rawPath) +
+    " > " +
+    shQuote(resPath) +
+    "\n"
+  s = s + "    exit $ec\n"
+  return s + "    ;;\n"
+}
+
+// The `*` (Linux) case branch: no `/usr/bin/time -l`, so this polls
+// /proc/$pid/status and /proc/$pid/stat while the benchmark runs to sample
+// peak RSS (VmHWM) and CPU ticks. `sed 's/.*) //'` strips through the LAST
+// ')' so a comm field containing its own parens cannot shift the column
+// count; the remaining fields' 12th and 13th are utime+stime —
+// _tests_/bit/fsblock.bit's `cpu()` reads the same two fields the same way,
+// mutation-tested for #2207. `gcPath` is the child's OWN stderr, captured
+// separately (Linux has no `/usr/bin/time -l` merging it in for us the way
+// the Darwin branch gets for free) — same `swept=`/`live=` scan, different
+// source file.
+fn linuxMeasureBranch(bin: string, outPath: string, gcPath: string, resPath: string, gcAwkBody: string): string {
+  let s = "  *)\n"
+  s = s + "    " + shQuote(bin) + " >" + shQuote(outPath) + " 2>" + shQuote(gcPath) + " &\n"
+  s = s + "    pid=$!\n"
+  s = s + "    cpu=-1\n"
+  s = s + "    hwm=-1\n"
+  s = s + "    while kill -0 $pid 2>/dev/null; do\n"
+  s = s + "      if [ -r /proc/$pid/status ]; then\n"
+  s = s + "        v=$(awk '/VmHWM/{print $2}' /proc/$pid/status 2>/dev/null)\n"
+  s = s + "        case $v in\n"
+  s = s + "          '') ;;\n"
+  s = s + "          *) hwm=$v ;;\n"
+  s = s + "        esac\n"
+  s = s + "      fi\n"
+  s = s + "      if [ -r /proc/$pid/stat ]; then\n"
+  s = s + "        c=$(sed 's/.*) //' /proc/$pid/stat 2>/dev/null | awk '{print $12+$13}')\n"
+  s = s + "        case $c in\n"
+  s = s + "          '') ;;\n"
+  s = s + "          *) cpu=$c ;;\n"
+  s = s + "        esac\n"
+  s = s + "      fi\n"
+  s = s + "      sleep 0.05\n"
+  s = s + "    done\n"
+  s = s + "    wait $pid\n"
+  s = s + "    ec=$?\n"
+  s = s + "    CLK=$(getconf CLK_TCK 2>/dev/null || echo 100)\n"
+  s = s + "    cpuCs=-1\n"
+  s = s + "    rssB=-1\n"
+  s = s + "    if [ $cpu -ge 0 ]; then cpuCs=$((cpu * 100 / CLK)); fi\n"
+  s = s + "    if [ $hwm -ge 0 ]; then rssB=$((hwm * 1024)); fi\n"
+  s = s +
+    "    obj=$(awk 'BEGIN{" +
+    gcAwkBody +
+    "END{if (sw>=0 && lv>=0) print sw+lv; else print -1}' " +
+    shQuote(gcPath) +
+    ")\n"
+  s = s + "    printf \"%d %d %d %d\\n\" $ec $cpuCs $rssB $obj > " + shQuote(resPath) + "\n"
+  s = s + "    exit $ec\n"
+  return s + "    ;;\n"
+}
+
 fn measureScript(bin: string, outPath: string, resPath: string, gcMinKb: int): string {
   let rawPath = resPath + ".raw"
   let gcPath = resPath + ".gcerr"
@@ -323,83 +415,8 @@ fn measureScript(bin: string, outPath: string, resPath: string, gcMinKb: int): s
   }
   s = s + "BIT_GC_STATS=1\nexport BIT_GC_STATS\n"
   s = s + "case \"$(uname -s)\" in\n"
-  s = s + "  Darwin)\n"
-  // The child inherits fd 2 from this redirect, same as before #3130 — its
-  // own `[bit-gc] ...` line and `/usr/bin/time -l`'s summary both land in
-  // rawPath, in that order (the child exits and is reaped before `time`
-  // appends its own report), so no second capture file is needed here.
-  s = s +
-    "    /usr/bin/time -l " +
-    shQuote(bin) +
-    " >" +
-    shQuote(outPath) +
-    " 2>" +
-    shQuote(rawPath) +
-    "\n"
-  s = s + "    ec=$?\n"
-  // `/usr/bin/time -l`'s first line is fixed-format: "<real> real <user> user
-  // <sys> sys", so the user-seconds value is always field 3 of the line
-  // matching " user". `(u*100)+0.5` rounds to the nearest centisecond. The
-  // same pass folds in the `swept=`/`live=` scan above (rawPath already
-  // holds the child's own stderr ahead of `time`'s own report — see the
-  // comment on the redirect above) so ONE awk call produces all four fields.
-  s = s +
-    "    awk -v ec=$ec 'BEGIN{u=-1;r=-1;" +
-    gcAwkBody +
-    "/ user/{u=$3} /maximum resident set size/{r=$1} " +
-    "END{obj=-1; if (sw>=0 && lv>=0) obj=sw+lv; " +
-    "printf \"%d %d %d %d\\n\", ec, (u*100)+0.5, r, obj}' " +
-    shQuote(rawPath) +
-    " > " +
-    shQuote(resPath) +
-    "\n"
-  s = s + "    exit $ec\n"
-  s = s + "    ;;\n"
-  s = s + "  *)\n"
-  s = s + "    " + shQuote(bin) + " >" + shQuote(outPath) + " 2>" + shQuote(gcPath) + " &\n"
-  s = s + "    pid=$!\n"
-  s = s + "    cpu=-1\n"
-  s = s + "    hwm=-1\n"
-  s = s + "    while kill -0 $pid 2>/dev/null; do\n"
-  s = s + "      if [ -r /proc/$pid/status ]; then\n"
-  s = s + "        v=$(awk '/VmHWM/{print $2}' /proc/$pid/status 2>/dev/null)\n"
-  s = s + "        case $v in\n"
-  s = s + "          '') ;;\n"
-  s = s + "          *) hwm=$v ;;\n"
-  s = s + "        esac\n"
-  s = s + "      fi\n"
-  // `sed 's/.*) //'` strips through the LAST ')' so a comm field containing
-  // its own parens cannot shift the column count; the remaining fields'
-  // 12th and 13th are utime+stime — _tests_/bit/fsblock.bit's `cpu()` reads
-  // the same two fields the same way, mutation-tested for #2207.
-  s = s + "      if [ -r /proc/$pid/stat ]; then\n"
-  s = s + "        c=$(sed 's/.*) //' /proc/$pid/stat 2>/dev/null | awk '{print $12+$13}')\n"
-  s = s + "        case $c in\n"
-  s = s + "          '') ;;\n"
-  s = s + "          *) cpu=$c ;;\n"
-  s = s + "        esac\n"
-  s = s + "      fi\n"
-  s = s + "      sleep 0.05\n"
-  s = s + "    done\n"
-  s = s + "    wait $pid\n"
-  s = s + "    ec=$?\n"
-  s = s + "    CLK=$(getconf CLK_TCK 2>/dev/null || echo 100)\n"
-  s = s + "    cpuCs=-1\n"
-  s = s + "    rssB=-1\n"
-  s = s + "    if [ $cpu -ge 0 ]; then cpuCs=$((cpu * 100 / CLK)); fi\n"
-  s = s + "    if [ $hwm -ge 0 ]; then rssB=$((hwm * 1024)); fi\n"
-  // gcPath is the child's OWN stderr, captured separately above (Linux has no
-  // `/usr/bin/time -l` merging it in for us the way the Darwin branch gets
-  // for free) — same `swept=`/`live=` scan, different source file.
-  s = s +
-    "    obj=$(awk 'BEGIN{" +
-    gcAwkBody +
-    "END{if (sw>=0 && lv>=0) print sw+lv; else print -1}' " +
-    shQuote(gcPath) +
-    ")\n"
-  s = s + "    printf \"%d %d %d %d\\n\" $ec $cpuCs $rssB $obj > " + shQuote(resPath) + "\n"
-  s = s + "    exit $ec\n"
-  s = s + "    ;;\n"
+  s = s + darwinMeasureBranch(bin, outPath, rawPath, resPath, gcAwkBody)
+  s = s + linuxMeasureBranch(bin, outPath, gcPath, resPath, gcAwkBody)
   s = s + "esac\n"
   return s
 }
@@ -480,17 +497,14 @@ class BuildResult { ok: bool, binPath: string }
 // instead of adding to the driver's; paths are derived here (rather than
 // passed in individually) to keep this at the same param count as
 // buildScript()/runCase() rather than adding a new E0202 finding.
-fn buildBenchCase(
-  bit: string, libbitrt: string, stdlib: string, benchDir: string,
-  caseScratch: string, name: string, t: Tally,
-): BuildResult {
+fn buildBenchCase(cc: CompilerEnv, benchDir: string, caseScratch: string, name: string, t: Tally): BuildResult {
   let srcPath = benchDir + "/" + name + "/" + name + ".bit"
   let binPath = caseScratch + "/bin"
   let buildOut = caseScratch + "/build.out"
   let buildErr = caseScratch + "/build.err"
   let buildSh = caseScratch + "/build.sh"
 
-  writeFile(buildSh, buildScript(bit, libbitrt, stdlib, srcPath, binPath, buildOut, buildErr)) catch e {
+  writeFile(buildSh, buildScript(cc, srcPath, binPath, buildOut, buildErr)) catch e {
     markFail(t, "${name}: cannot write build script: " + e.message())
     return BuildResult{ ok: false, binPath: "" }
   }
@@ -657,14 +671,11 @@ fn reportAndCheck(b: Baseline, minCpu: int, minRss: int, minObj: int, t: Tally) 
 // build), runRepOnce()+validateRep() (one repetition's launch and its
 // result), and reportAndCheck() (the ceiling/floor comparisons) — this
 // function is now only the sequencing between them.
-fn runCase(
-  bit: string, libbitrt: string, stdlib: string, benchDir: string,
-  scratch: string, b: Baseline, t: Tally,
-) {
+fn runCase(cc: CompilerEnv, benchDir: string, scratch: string, b: Baseline, t: Tally) {
   let caseScratch = scratch + "/" + b.name
   mkdirQuiet(caseScratch)
 
-  let built = buildBenchCase(bit, libbitrt, stdlib, benchDir, caseScratch, b.name, t)
+  let built = buildBenchCase(cc, benchDir, caseScratch, b.name, t)
   if (!built.ok) {
     return
   }
@@ -743,9 +754,10 @@ fn main() {
   let root = scratchRoot()
   mkdirQuiet(root)
 
+  let cc = CompilerEnv{ bit: bit, libbitrt: libbitrt, stdlib: stdlib }
   let t = Tally{ checks: 0, failures: 0 }
   for b of table {
-    runCase(bit, libbitrt, stdlib, benchDir, root, b, t)
+    runCase(cc, benchDir, root, b, t)
   }
 
   // Compared against the actual table length, not a hardcoded count (#2978):
