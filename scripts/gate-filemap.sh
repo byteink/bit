@@ -260,6 +260,11 @@ gates_for_file() {
     # same shape as _tests_/bit/fmtcitations/*, _tests_/bit/golden/* and
     # _tests_/bit/importsrun/* above.
     _tests_/bit/pmrangegate/*) printf 'test-pmrangegate\n'; return 0 ;;
+    # #4308: split from a single file (_tests_/bit/lintcmd.bit, 799 lines with
+    # zero headroom on the 800-line ceiling) to a directory module — the
+    # individual checkXxx functions split into a lintcmdchecks.bit sibling,
+    # the same shape as _tests_/bit/pmrangegate/* above.
+    _tests_/bit/lintcmd/*) printf 'test-lint\n'; return 0 ;;
     _tests_/bit/pollfree/*) printf 'test-pollfree\n'; return 0 ;;
     # #3822: split from a single file to a directory module (the receiver-form
     # baseline migration needed its own sibling — see receiverform.bit's own

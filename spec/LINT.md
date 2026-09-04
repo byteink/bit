@@ -760,7 +760,7 @@ Required coverage:
 | `compiler/lintallow.bit` | new — per-finding `allow` override (§5.5, #2438) |
 | `compiler/lintcheck.bit` | new — in-Bit self-checks, run by `selfcheck()` |
 | `compiler/main.bit` | `lint` subcommand dispatch |
-| `_tests_/bit/lintcmd.bit` | CLI contract: exit codes, walk, summary, `--json`, `--stats` |
+| `_tests_/bit/lintcmd/lintcmd.bit` | CLI contract: exit codes, walk, summary, `--json`, `--stats` |
 | `_tests_/bit/golden.bit` | `// lint` directive |
 | `_tests_/cases/lint_*.bit` | golden cases |
 | `docs/reference/` | user-facing rule reference |
