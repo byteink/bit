@@ -324,12 +324,14 @@ has_spec=0
 has_testsbit=0
 has_other=0
 has_noop=0
+has_windows=0
 other_list=""
 touched_list=""
 testsbit_list=""
 docs_list=""
 spec_list=""
 noop_list=""
+windows_list=""
 # Space-separated (never comma-joined, unlike docs_list/other_list above,
 # which exist only for human-readable REASON text): stdlib_docs_pairing_ok
 # above word-splits these, so a comma in the string would corrupt the match.
@@ -394,6 +396,19 @@ while IFS= read -r f; do
       fi
       ;;
     compiler/*) has_selfhost=1 ;;
+    # A runtime/<pair>/windows/*.bit change ALSO sets has_windows, on top of
+    # (never instead of) has_runtime=1 — the compiler can already cross-build
+    # for x86_64-windows with no hardware (scripts/g2archive.sh), and #4294 had
+    # to verify that by hand for lack of a gate here. This does not replace
+    # test-windows-smoke (_tests_/bit/windowssmoke.bit), which needs the
+    # reachable mustafa-desktop-win host and stays a manual
+    # `./make test-windows-smoke` step — this is compile+link only, run below
+    # via has_windows regardless of which bucket the diff resolves to (#4311).
+    runtime/*/windows/*.bit)
+      has_runtime=1
+      has_windows=1
+      windows_list="${windows_list:+${windows_list}, }${f}"
+      ;;
     runtime/*) has_runtime=1 ;;
     _tests_/cases/*) has_testcases=1 ;;
     examples/*) has_examples=1 ;;
@@ -684,8 +699,11 @@ case "${TARGET}" in
   arm64) echo "  ARM64GATE_STEP=\"${BUILD_STEPS[*]}\" scripts/arm64gate.sh   (remote, native aarch64-linux)" ;;
 esac
 for s in ${POST_SCRIPTS}; do echo "  bash ${s}"; done
+if [ "${has_windows}" -eq 1 ]; then
+  echo "  bash scripts/g2archive.sh x86_64-windows <tmp.a>   (windows: ${windows_list})"
+fi
 if [ "${TARGET}" != "local" ]; then
-  if [ -n "${PRE_SCRIPTS}${POST_SCRIPTS}" ]; then
+  if [ -n "${PRE_SCRIPTS}${POST_SCRIPTS}" ] || [ "${has_windows}" -eq 1 ]; then
     echo "gate: note: the compiler/examples diff script(s) above run LOCALLY even under --${TARGET} — they need both compilers already built on this machine, not just the remote build steps."
   fi
 fi
@@ -743,6 +761,21 @@ case "${TARGET}" in
 esac
 
 for s in ${POST_SCRIPTS}; do run_step bash "${s}"; done
+
+# #4311: a runtime/<pair>/windows/*.bit change also gets a compile+link-only
+# cross-build check, on top of (never instead of) whatever bucket the diff
+# already resolved to — the same "additive, not a bucket of its own" shape as
+# union_testsbit_steps()/union_spec_steps() above, but for a raw script rather
+# than a ./make step name, so it lives here rather than in BUILD_STEPS. Needs
+# bit-out/bin/bit already built, exactly like the selfhost-diffruntime.sh POST
+# script above under --x64/--arm64 (see the note printed above). Deliberately
+# NOT _tests_/bit/windowssmoke.bit — that needs the reachable
+# mustafa-desktop-win host and stays a manual `./make test-windows-smoke` step.
+if [ "${has_windows}" -eq 1 ]; then
+  WIN_SCRATCH="$(mktemp -d)"
+  run_step scripts/g2archive.sh x86_64-windows "${WIN_SCRATCH}/libbitrt-windows-gate.a"
+  rm -rf "${WIN_SCRATCH}"
+fi
 
 # A real FAILED constituent always wins, even alongside an undecided one — an
 # inconclusive sibling must never downgrade a proven divergence (#2991).
