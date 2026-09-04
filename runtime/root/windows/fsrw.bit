@@ -404,6 +404,139 @@ export @nosplit @symbol("bit_rt_fs_size") fn rtFsSize(fd: int): int {
   return int(atomicLoad(sizePtr))
 }
 
+// `BOOL LockFileEx(HANDLE, DWORD flags, DWORD reserved, DWORD bytesLow,
+// DWORD bytesHigh, LPOVERLAPPED)` / `BOOL UnlockFileEx(HANDLE, DWORD
+// reserved, DWORD bytesLow, DWORD bytesHigh, LPOVERLAPPED)` (#4014): Win32's
+// byte-range lock pair -- there is no separate "lock the whole file" call.
+// `reserved` must be 0 per MSDN. Admitted at `compiler/pesyms.bit`, not
+// hardware-probed.
+extern fn LockFileEx(
+  handle: *byte,
+  flags: i32,
+  reserved: i32,
+  bytesLow: i32,
+  bytesHigh: i32,
+  overlapped: *byte,
+): i32
+extern fn UnlockFileEx(
+  handle: *byte,
+  reserved: i32,
+  bytesLow: i32,
+  bytesHigh: i32,
+  overlapped: *byte,
+): i32
+
+// `DWORD GetLastError(void)`: the calling thread's last error code, the
+// Win32 analogue of `errno`. Admitted at `compiler/pesyms.bit` already (used
+// descriptively by `GetCurrentDirectoryW`'s doc comment above); this is the
+// first `extern fn` declaration for it in this module.
+extern fn GetLastError(): i32
+
+// `LockFileEx`'s `dwFlags` (`<fileapi.h>`): `LOCKFILE_EXCLUSIVE_LOCK`=2
+// requests an exclusive lock (absent means shared);
+// `LOCKFILE_FAIL_IMMEDIATELY`=1 is the `LOCK_NB` equivalent -- OR'd in for a
+// non-blocking attempt.
+const winLockfileExclusiveLock: int = 2
+const winLockfileFailImmediately: int = 1
+
+// `MAXDWORD` = 0xFFFFFFFF, written as the positive 64-bit `int` and
+// `i32()`-cast at the call site -- the same device `winGenericRead` above
+// uses for a value whose top bit is set. Per MSDN's own documented
+// convention, passing `MAXDWORD` for both the low and high byte-range
+// bounds locks the entire file regardless of its current or future size,
+// the closest Win32 equivalent to `flock`'s true whole-file semantics (the
+// ticket's own "no byte-range locking" constraint rules out asking for
+// anything narrower).
+const winMaxDword: int = 4294967295
+
+// `ERROR_LOCK_VIOLATION` (`<winerror.h>`) = 33: the specific code
+// `GetLastError` reports when `LockFileEx` fails because
+// `LOCKFILE_FAIL_IMMEDIATELY` was set and the region is already locked by
+// someone else -- Windows's equivalent of Darwin/Linux's `EWOULDBLOCK`.
+const errLockViolation: int = 33
+
+// `ERROR_NOT_LOCKED` (`<winerror.h>`) = 158: the specific code
+// `GetLastError` reports when `UnlockFileEx` is asked to release a range
+// that was never locked. See `bit_rt_fs_unlock` below for why this is
+// folded into success rather than left as an error.
+const errNotLocked: int = 158
+
+// `bit_rt_fs_lock` (ABI.md §14, #4014): take a WHOLE-FILE advisory lock on
+// `fd` -- exclusive or shared, blocking or non-blocking. Reuses
+// `overlappedAt(0)` above: a synchronous handle still requires a non-NULL
+// `OVERLAPPED` for `LockFileEx`/`UnlockFileEx` (unlike `ReadFile`/
+// `WriteFile`, which tolerate NULL), and locking at offset 0 for
+// `winMaxDword` bytes both ways is this provider's whole-file convention
+// (see `winMaxDword` above).
+//
+// Bracketed with `gcSyscallBegin`/`gcSyscallEnd` for the same #2207 reason
+// `bit_rt_fs_pread_w` above is: a BLOCKING call (no
+// `LOCKFILE_FAIL_IMMEDIATELY`) waits for another process to release the
+// lock, potentially indefinitely. A non-blocking call returns immediately
+// either way, so that path is unbracketed, matching `rtFsTruncate`/
+// `rtFsSize` above's treatment of fast, bounded calls -- there is also no
+// signal/`EINTR` concept on Windows to retry.
+//
+// Three-way return, matching ../darwin/fsrw.bit's `rtFsLock` and
+// ../linux/fsrw.bit's copy exactly, so `std/fs`'s eventual caller needs no
+// per-platform knowledge: 0 on success; -1 only when `blocking` is false
+// and `GetLastError` reports `ERROR_LOCK_VIOLATION` -- the expected outcome
+// for `tryLock`/`tryLockShared`, not a failure; -2 for any other error.
+export @nosplit @symbol("bit_rt_fs_lock") fn rtFsLock(
+  fd: int,
+  exclusive: bool,
+  blocking: bool,
+): int {
+  let flags = 0
+  if (exclusive) {
+    flags = flags | winLockfileExclusiveLock
+  }
+  if (!blocking) {
+    flags = flags | winLockfileFailImmediately
+  }
+  let handle = hAt(fd)
+  let ov = overlappedAt(0)
+  let dword = i32(winMaxDword)
+  if (!blocking) {
+    if (int(LockFileEx(handle, i32(flags), i32(0), dword, dword, hAt(ov))) != 0) {
+      return 0
+    }
+    if (int(GetLastError()) == errLockViolation) {
+      return 0 - 1
+    }
+    return 0 - 2
+  }
+  gcSyscallBegin()
+  let ok = int(LockFileEx(handle, i32(flags), i32(0), dword, dword, hAt(ov)))
+  gcSyscallEnd()
+  if (ok != 0) {
+    return 0
+  }
+  return 0 - 2
+}
+
+// `bit_rt_fs_unlock`: release `fd`'s advisory lock via `UnlockFileEx` over
+// the identical offset-0/`winMaxDword` whole-file range `bit_rt_fs_lock`
+// above locks. A no-op success if `fd` did not hold a lock -- `winerror.h`'s
+// `ERROR_NOT_LOCKED`=158 is treated as success here specifically so this
+// primitive has the same "safe to call unconditionally" contract as
+// ../darwin/fsrw.bit's and ../linux/fsrw.bit's `flock(fd, LOCK_UN)`, which
+// is a genuine no-op on an unlocked fd rather than a Windows-only special
+// case a caller would need to know about. 0 on success, -2 on any other
+// error; -1 has no meaning here.
+export @nosplit @symbol("bit_rt_fs_unlock") fn rtFsUnlock(fd: int): int {
+  let handle = hAt(fd)
+  let ov = overlappedAt(0)
+  let dword = i32(winMaxDword)
+  if (int(UnlockFileEx(handle, i32(0), dword, dword, hAt(ov))) != 0) {
+    return 0
+  }
+  if (int(GetLastError()) == errNotLocked) {
+    return 0
+  }
+  return 0 - 2
+}
+
 // `DWORD GetCurrentDirectoryW(DWORD nBufferLength, LPWSTR lpBuffer)`: fills
 // `lpBuffer` with the process's current directory as NUL-terminated UTF-16LE.
 // Per MSDN: on success, returns the unit count copied EXCLUDING the NUL; if
