@@ -55,6 +55,27 @@
 // merged (`ac83630d`) before #3614 wired stress in here, so this gate now
 // catches #3554's class of bug under load the same way it already catches
 // #3503's at all.
+//
+// PHASE 4 (#4252) adds a second, independent program:
+// _tests_/stress/thread/gcthreadswindows (#4247). It is a HAND-RUN-ONLY
+// fixture on purpose — _tests_/bit/stress/stress.bit's corpus walker
+// recognizes only `darwin-only`/`linux-only` skip markers, there is no
+// `windows-only` one, and this harness never runs with a Windows build
+// target, so a top-level _tests_/stress/ entry would make `test-stress-batch`
+// try to natively compile Windows-only externs on whichever host runs it
+// (verified: 14 E0078s building it for aarch64-macos). Reusing THIS gate's
+// already-proven cross-build/ship/run-over-SSH machinery is the cheaper
+// route than standing up a second one. It reuses Phase 1's SAME archive
+// (the runtime does not change between the two programs) and runs the
+// built exe TWICE on ${s.host}: once under the default GC policy, once
+// under `BIT_GC=stress BIT_GC_STATS=1`. Both must print "true 31" — see
+// _tests_/stress/thread/gcprops/props.bit's header for what that
+// discriminates (a missing `bit_rt_gc_thread_enter()` call in
+// runtime/thread/windows/spawn.bit's threadTrampoline sweeps a live raw OS
+// thread's stack out from under it under concurrent collection) — and the
+// stress run's combined output must additionally carry the
+// `[bit-gc] collections=` aggregate line, proving a collection actually
+// happened rather than the property passing vacuously because none did.
 import { env, envOr, exit } from "std/os"
 import { exists, mkdir, readFile, writeFile } from "std/fs"
 import { contains, hasPrefix, parseInt, trimSpace } from "std/strings"
@@ -287,6 +308,13 @@ fn buildProgram(s: Session, archivePath: string): string {
 // file or directory" against a path PowerShell itself just created). A bare
 // relative name lands in the SSH server's default directory (the user's
 // home) with no such ambiguity.
+//
+// ON SUCCESS THIS NO LONGER TEARS DOWN `s.scratch` (#4252) — Phase 4 below
+// reuses the same session's archive and scratch directory, so tearing down
+// here would delete the directory `runCaptured` writes its next script
+// into. `main()` now owns the single teardown call on the overall PASS
+// path; every FAILURE path below still tears down and exits immediately,
+// unchanged, since a failure here means Phase 4 never runs at all.
 fn shipAndRun(s: Session, exePath: string) {
   let remoteName = "${s.runId}.exe"
   let (rc3, out3) = runCaptured(
@@ -344,8 +372,96 @@ fn shipAndRun(s: Session, exePath: string) {
     println("windowssmoke: FAIL — argv[0] is a UNC path ('${argv0Line}') — this ran through WSL interop, not natively. Check BIT_WINDOWS_HOST.")
     exit(1)
   }
-  teardown(s.scratch, s.host, s.runId, s.ms)
-  println("windowssmoke: PASS — ${s.host}, argv0=${argv0Line}")
+  println("windowssmoke: base smoke — PASS, argv0=${argv0Line}")
+}
+
+// Phase 4 (#4252): cross-build _tests_/stress/thread/gcthreadswindows
+// against Phase 1's archive — see the file header for what this program
+// proves and why it lives here rather than as its own gate.
+fn buildThreadRegProgram(s: Session, archivePath: string): string {
+  let exePath = "${s.scratch}/${s.runId}-threadreg.exe"
+  let (rc, out) = runCaptured(
+    s.scratch, "buildthreadreg",
+      "cd '${s.root}' || exit 90\n" +
+      "BIT_LIBBITRT='${archivePath}' '${s.bitBin}' build '_tests_/stress/thread/gcthreadswindows' --target x86_64-windows -o '${exePath}'\n", s.ms,
+  )
+  if (rc != 0) {
+    failStage(s, "cross-build gcthreadswindows", rc, out)
+  }
+  return exePath
+}
+
+// Ships `exePath` under a name unique to `remoteTag` and runs it with
+// `envPrelude` prepended to the remote PowerShell invocation (e.g. to set
+// BIT_GC/BIT_GC_STATS before the child process starts, the same
+// same-session-inheritance shape shipAndRun's own `$env:BIT_GC` uses above).
+// Returns the captured combined stdout+stderr. A distinct function from
+// shipAndRun above on purpose: that one's assertions (smoke ok / spawn ok /
+// argv0 nativeness) are specific to the base smoke program, and conflating
+// the two would make a failure in either program impossible to name
+// precisely.
+fn shipAndRunThreadReg(s: Session, exePath: string, remoteTag: string, envPrelude: string): string {
+  let remoteName = "${s.runId}-${remoteTag}.exe"
+  let (rcShip, outShip) = runCaptured(
+    s.scratch, "${remoteTag}-ship",
+    "scp -q -o BatchMode=yes -o ConnectTimeout=8 '${exePath}' '${s.host}:${remoteName}'\n", s.ms,
+  )
+  if (rcShip != 0) {
+    failStage(s, "scp gcthreadswindows (${remoteTag}) to ${s.host}", rcShip, outShip)
+  }
+  let (rcRun, outRun) = runCaptured(
+    s.scratch, "${remoteTag}-run",
+      "ssh -o BatchMode=yes -o ConnectTimeout=8 '${s.host}' " +
+      "\"${envPrelude}& (Join-Path \\$PWD.Path '${remoteName}')\"\n", s.ms,
+  )
+  // Best-effort cleanup regardless of the run's own result, same shape as
+  // shipAndRun's own cleanup step above.
+  let _ = runCaptured(
+    s.scratch, "${remoteTag}-cleanup",
+    "ssh -o BatchMode=yes -o ConnectTimeout=8 '${s.host}' 'Remove-Item -Force ${remoteName}'\n", s.ms,
+  )
+  if (rcRun != 0) {
+    failStage(s, "run gcthreadswindows (${remoteTag}) on ${s.host}", rcRun, outRun)
+  }
+  return outRun
+}
+
+// Asserts `out` contains gcthreadswindows's discriminating "<got==total>
+// <got>" line at the all-properties-passed value (gcThreadsTotal() == 31,
+// ../gcprops/props.bit) for the run tagged `label`.
+fn assertThreadRegPass(s: Session, out: string, label: string) {
+  if (!contains(out, "true 31")) {
+    teardown(s.scratch, s.host, s.runId, s.ms)
+    println("windowssmoke: FAIL — gcthreadswindows (${label}) did not print 'true 31':")
+    eprint(out)
+    exit(1)
+  }
+}
+
+// Runs gcthreadswindows once under the default GC policy and once under
+// `BIT_GC=stress BIT_GC_STATS=1`, asserting "true 31" on both and — on the
+// stress run only — that a collection actually ran (the
+// `[bit-gc] collections=` aggregate line, runtime/root/windows/stats.bit's
+// `statsReport`), so the property cannot pass vacuously because
+// `BIT_GC=stress` silently failed to force any collection at all.
+fn runThreadRegPhase(s: Session, archivePath: string) {
+  let exePath = buildThreadRegProgram(s, archivePath)
+
+  let outDefault = shipAndRunThreadReg(s, exePath, "treg-default", "")
+  assertThreadRegPass(s, outDefault, "default policy")
+
+  let outStress = shipAndRunThreadReg(
+    s, exePath, "treg-stress",
+    "\\$env:BIT_GC='stress'; \\$env:BIT_GC_STATS='1'; ",
+  )
+  assertThreadRegPass(s, outStress, "BIT_GC=stress")
+  if (!contains(outStress, "[bit-gc] collections=")) {
+    teardown(s.scratch, s.host, s.runId, s.ms)
+    println("windowssmoke: FAIL — gcthreadswindows (BIT_GC=stress) did not print the BIT_GC_STATS=1 aggregate line:")
+    eprint(outStress)
+    exit(1)
+  }
+  println("windowssmoke: thread registration — PASS, ${s.host}")
 }
 
 fn main() {
@@ -364,12 +480,17 @@ fn main() {
   }
   // `exit()` does not run pending defers (#3694) — every exit/fail path
   // below (checkReachable, buildArchive/buildProgram via failStage,
-  // shipAndRun) calls teardown(s.scratch, ...) explicitly instead of
-  // relying on a defer here.
+  // shipAndRun, runThreadRegPhase) calls teardown(s.scratch, ...) explicitly
+  // instead of relying on a defer here. Neither shipAndRun nor
+  // runThreadRegPhase tears down on ITS OWN success (#4252) — this function
+  // is the only place that does, once, after every phase has passed.
   checkReachable(s)
   let archivePath = buildArchive(s)
   let exePath = buildProgram(s, archivePath)
   shipAndRun(s, exePath)
+  runThreadRegPhase(s, archivePath)
+  teardown(s.scratch, s.host, s.runId, s.ms)
+  println("windowssmoke: PASS — ${s.host}")
 }
 
 // Pulls the value out of the program's own "argv0=..." output line.
