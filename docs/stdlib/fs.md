@@ -93,6 +93,17 @@ Flushes this file's written bytes to stable storage. Until this returns, a
 write that `write` already reported as successful can still be lost to a
 power failure.
 
+### `File.truncate(size: i64): ()!`
+
+Sets this file's length to `size`, without moving the file's own read/write
+cursor. Shrinking discards the trailing bytes; growing extends the file with
+a hole that reads as zeros. Neither direction itself flushes — call `sync`
+for the new length to be durable.
+
+### `File.size(): i64!`
+
+This file's current length in bytes.
+
 ### `File.close()`
 
 Releases the handle. Safe to call once; do not use the `File` afterwards.
