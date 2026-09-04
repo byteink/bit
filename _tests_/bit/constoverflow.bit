@@ -160,25 +160,35 @@ fn bitBinary(scratch: string, ms: int): string! {
   return candidate
 }
 
-// Runs `bit <verb> <file>` with `dir` as the working directory.
+// The compiler under test plus the scratch layout every run against it
+// shares: the source directory `bit <verb>` runs in, where its captured
+// output goes, and the timeout bound.
+class RunCtx {
+  bit: string,
+  dir: string,
+  capDir: string,
+  ms: int,
+}
+
+// Runs `bit <verb> <file>` with `rc.dir` as the working directory.
 //
 // The wrapper always exits 0 and writes the real status to `code.txt`, so a
 // missing `code.txt` is unmistakably "the compiler never ran" rather than a
 // status some assertion could mistake for a verdict. Stale captures are deleted
 // first for the same reason: no case may read a previous case's output.
-fn runBit(bit: string, verb: string, dir: string, file: string, capDir: string, ms: int): Run! {
-  let outPath = "${capDir}/out.txt"
-  let errPath = "${capDir}/err.txt"
-  let codePath = "${capDir}/code.txt"
+fn runBit(rc: RunCtx, verb: string, file: string): Run! {
+  let outPath = "${rc.capDir}/out.txt"
+  let errPath = "${rc.capDir}/err.txt"
+  let codePath = "${rc.capDir}/code.txt"
   clear(outPath)
   clear(errPath)
   clear(codePath)
   let script = "#!/bin/sh\n" +
-    "cd '${dir}' || exit 0\n" +
-    "'${bit}' ${verb} '${file}' > '${outPath}' 2> '${errPath}'\n" +
+    "cd '${rc.dir}' || exit 0\n" +
+    "'${rc.bit}' ${verb} '${file}' > '${outPath}' 2> '${errPath}'\n" +
     "echo $? > '${codePath}'\n" +
     "exit 0\n"
-  let sh = shell("${capDir}/run.sh", script, ms)?
+  let sh = shell("${rc.capDir}/run.sh", script, rc.ms)?
   if (sh != 0) {
     fail newError("constoverflow: wrapper script exited ${sh}, which it never should")
   }
@@ -237,7 +247,10 @@ fn program(decl: string): string {
 // The rejection set. Each entry is a genuine constant expression whose value
 // leaves i64, so each must draw E0084 and not E0064 — "not a compile-time
 // constant expression" would be a false statement about all of them.
-fn rejects(): []Reject {
+// The ticket's own repros plus the follow-on arithmetic shapes: overflow via
+// each operator (+/-/*//), negation, and propagation through a nested
+// expression, on both a module-level `const` and a module-level `let`.
+fn rejectsArithmetic(): []Reject {
   return [
     // The ticket's first repro: i64 MAX + 1.
     Reject{
@@ -290,11 +303,15 @@ fn rejects(): []Reject {
       src: program("let V: int = 9223372036854775807 + 1"),
       needle: "9223372036854775807 + 1",
     },
-    // #2358: a BARE literal, no operator at all. `parseIntText` wrapped this to
-    // 7766279631452241919 (99999999999999999999 mod 2^64) and nothing downstream
-    // noticed — the wrap happens before the folder ever sees a value to check, so
-    // the overflow-checked arithmetic above never reached it. 67 bits: wider than
-    // any integer type the language has, not merely wider than i64.
+  ]
+}
+
+// #2358/#2488: a BARE literal wider than i64 (67 bits), no operator at all —
+// exercises `parseIntText`/`intTextOverflows` directly rather than the
+// folder — across every site #2488 added coverage for: a module const, a
+// function-local `let`, a call argument, and a `return` operand.
+fn rejectsBareLiteral(): []Reject {
+  return [
     Reject{
       name: "bare-literal",
       src: program("const V: int = 99999999999999999999"),
@@ -329,10 +346,28 @@ fn rejects(): []Reject {
   ]
 }
 
+// Appends every element of `more` to `out`, in order.
+fn extendRejects(out: []Reject, more: []Reject): []Reject {
+  for r of more {
+    out = append(out, r)
+  }
+  return out
+}
+
+fn rejects(): []Reject {
+  let out = []Reject(0)
+  out = extendRejects(out, rejectsArithmetic())
+  out = extendRejects(out, rejectsBareLiteral())
+  return out
+}
+
 // The acceptance set, and the reason this gate cannot pass by rejecting
 // everything. Every entry is a value AT or NEAR the boundary that must still
 // compile and produce exactly the number below.
-fn accepts(): []Accept {
+// The in-range boundary cases: i64/u64 MAX and MIN reached by arithmetic,
+// wrapping through them without escaping, the `1 << 63` sign-bit placement
+// case, and an everyday expression the fix must not disturb.
+fn acceptsBoundary(): []Accept {
   return [
     // i64 MAX itself, reached by arithmetic rather than written out.
     Accept{
@@ -364,16 +399,19 @@ fn accepts(): []Accept {
       name: "ordinary", src: program("const V: int = 2 + 3 * 4"),
       want: "14\n",
     },
-    // #2358's boundary: i64 MAX written as a BARE literal (63 bits), not
-    // reached by arithmetic — exercises `parseIntText`/`intTextOverflows`
-    // directly rather than the +/-/* predicates above.
+  ]
+}
+
+// #2358: bare literals at exactly i64 MAX and u64 MAX, both bare (not
+// reached by arithmetic) — exercises `parseIntText`/`intTextOverflows`
+// directly, and the u64 case is one of the 169 legitimate sites this fix
+// must not touch (SHA-512/Keccak round constants, uuid masks).
+fn acceptsBareLiteral(): []Accept {
+  return [
     Accept{
       name: "bare-i64-max", src: program("const V: int = 9223372036854775807"),
       want: "9223372036854775807\n",
     },
-    // u64 MAX as a bare hex literal (64 bits, high bit set). One of the 169
-    // legitimate sites this fix must not touch — SHA-512/Keccak round
-    // constants and uuid masks are shaped exactly like this.
     Accept{
       name: "bare-u64-max-hex", src: program("const V: u64 = 0xFFFFFFFFFFFFFFFF"),
       want: "18446744073709551615\n",
@@ -389,8 +427,14 @@ fn accepts(): []Accept {
         "\\n\")\n}\n",
       want: "18446744073709551615\n",
     },
-    // #2488: i64 MAX as a call argument — the new `vStmt` arm must not
-    // over-report on an in-range literal at the site it now covers.
+  ]
+}
+
+// #2488: i64/u64 MAX at the two sites that ticket added coverage for — a
+// call argument and a `return` operand — proving the new `vStmt` arm does
+// not over-report on an in-range literal.
+fn acceptsCallReturn(): []Accept {
+  return [
     Accept{
       name: "fn-arg-i64-max",
       src: "fn f(n: int): int { return n }\nfn main() {\n  print(\"" +
@@ -406,6 +450,15 @@ fn accepts(): []Accept {
         "\\n\")\n}\n",
       want: "18446744073709551615\n",
     },
+  ]
+}
+
+// #2487: an UNTYPED bare literal must default to u64 when its value needs
+// the 64th bit (hex and decimal spellings, and bound to an unannotated
+// `let`), and the two controls proving a genuinely signed value is never
+// forced unsigned by the same fix.
+fn acceptsUntypedInterp(): []Accept {
+  return [
     // #2487: a BARE hex literal with no declared type, interpolated directly —
     // no name to carry a `u64` annotation. Before the fix this printed -1: the
     // literal defaulted to i64 and `lowerToString` read bit 63 as the sign.
@@ -448,16 +501,33 @@ fn accepts(): []Accept {
   ]
 }
 
+// Appends every element of `more` to `out`, in order.
+fn extendAccepts(out: []Accept, more: []Accept): []Accept {
+  for a of more {
+    out = append(out, a)
+  }
+  return out
+}
+
+fn accepts(): []Accept {
+  let out = []Accept(0)
+  out = extendAccepts(out, acceptsBoundary())
+  out = extendAccepts(out, acceptsBareLiteral())
+  out = extendAccepts(out, acceptsCallReturn())
+  out = extendAccepts(out, acceptsUntypedInterp())
+  return out
+}
+
 // Every rejection case: non-zero exit, E0084 rather than E0064, and the
 // diagnostic pinned to this expression.
-fn checkRejects(t: Tally, bit: string, dir: string, capDir: string, ms: int): ()! {
+fn checkRejects(t: Tally, rc: RunCtx): ()! {
   let cases = rejects()
   check(t, len(cases) == 12, "reject table has ${len(cases)} entries, want 12")
   let ran = 0
   for c of cases {
     let file = "r_${c.name}.bit"
-    writeFile("${dir}/${file}", c.src)?
-    let r = runBit(bit, "check", dir, file, capDir, ms)?
+    writeFile("${rc.dir}/${file}", c.src)?
+    let r = runBit(rc, "check", file)?
     // Non-empty FIRST: every check below is satisfied by the empty string.
     check(t, len(r.err) > 0, "${c.name}: stderr is empty — the compiler said nothing")
     check(t, r.code != 0, "${c.name}: exit ${r.code}, want non-zero")
@@ -485,14 +555,14 @@ fn checkRejects(t: Tally, bit: string, dir: string, capDir: string, ms: int): ()
 // Every acceptance case: builds AND runs, and the stdout is compared. Running
 // matters — a compiler that accepted the program and then folded it wrongly
 // would pass an exit-code-only check.
-fn checkAccepts(t: Tally, bit: string, dir: string, capDir: string, ms: int): ()! {
+fn checkAccepts(t: Tally, rc: RunCtx): ()! {
   let cases = accepts()
   check(t, len(cases) == 15, "accept table has ${len(cases)} entries, want 15")
   let ran = 0
   for c of cases {
     let file = "a_${c.name}.bit"
-    writeFile("${dir}/${file}", c.src)?
-    let r = runBit(bit, "run", dir, file, capDir, ms)?
+    writeFile("${rc.dir}/${file}", c.src)?
+    let r = runBit(rc, "run", file)?
     check(t, r.code == 0, "${c.name}: exit ${r.code}, want 0 — stderr: ${r.err}")
     check(
       t, r.out == c.want,
@@ -517,10 +587,11 @@ fn runAll(t: Tally, scratch: string, ms: int) {
   let bit = bitBinary(scratch, ms) catch e {
     panic("constoverflow: ${e.message()}")
   }
-  checkRejects(t, bit, dir, capDir, ms) catch e {
+  let rc = RunCtx{ bit: bit, dir: dir, capDir: capDir, ms: ms }
+  checkRejects(t, rc) catch e {
     panic("constoverflow: ${e.message()}")
   }
-  checkAccepts(t, bit, dir, capDir, ms) catch e {
+  checkAccepts(t, rc) catch e {
     panic("constoverflow: ${e.message()}")
   }
 }
