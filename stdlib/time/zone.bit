@@ -1,0 +1,178 @@
+// Bit standard library — time module, the public Zone surface (#4071).
+//
+// Sits on ./zoneif.bit's TZif reader (RFC 8536): `tzifParse`, `ZoneData` and
+// `Transition` are that file's own unexported declarations, same module
+// (SPEC §17.1), used here unqualified with no import and no redeclaration.
+// `readFile` is already imported by ./tzlocal.bit, same module — importing
+// it again here would be `E0042 already declared in this scope`.
+//
+// `DateTime` (#4075) is the public route to the two module-internal lookups
+// at the bottom of this file; neither is exported (constraint), so nothing
+// outside `std/time` can reach a `Zone`'s transition table directly.
+
+// Zone data lives here on both macOS and Linux (docs/stdlib/time.md,
+// "Zones") — no platform branch.
+const zoneInfoDir: string = "/usr/share/zoneinfo/"
+const localtimePath: string = "/etc/localtime"
+
+// An IANA time zone, identified by its canonical name — `Asia/Dubai`,
+// `Europe/London`, `UTC` (docs/stdlib/time.md, "Zones"). A `Zone` is not an
+// offset: the offset is a property of the zone at an instant, computed by
+// the two lookups below, never stored on the zone itself.
+//
+// Immutable and safe to share across green threads with no synchronisation
+// (docs/stdlib/time.md, "Immutability"): both fields are readonly, and
+// `data` is unexported so no caller outside this module can reach it at
+// all, let alone mutate it.
+export class Zone {
+  export readonly name: string,
+  readonly data: ZoneData,
+}
+
+// Whether `c` may appear inside a zone-name path component.
+fn zoneNameCharOk(c: byte): bool {
+  if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+    return true
+  }
+  return c == '_' || c == '+' || c == '-'
+}
+
+// Whether `comp`, one `/`-separated component of a zone name, is safe:
+// non-empty, every character in `[A-Za-z0-9_+-]`, and not `.` or `..` — the
+// character class already excludes `.` on its own, this is defence in
+// depth against exactly the path-traversal case the class is meant to
+// close.
+fn zoneNameComponentOk(comp: string): bool {
+  if (len(comp) == 0 || comp == "." || comp == "..") {
+    return false
+  }
+  let i = 0
+  while (i < len(comp)) {
+    if (!zoneNameCharOk(comp[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Whether `name` is safe to join onto `zoneInfoDir` and hand to the
+// filesystem: a non-empty, non-leading-`/` sequence of safe components
+// (`zoneNameComponentOk`) separated by `/`. `zone("../../etc/passwd")` and
+// `zone("/etc/passwd")` must both fail here, before `readFile` ever sees a
+// path built from `name`.
+fn zoneNameValid(name: string): bool {
+  let n = len(name)
+  if (n == 0 || name[0] == '/') {
+    return false
+  }
+  let compStart = 0
+  let i = 0
+  while (i <= n) {
+    if (i == n || name[i] == '/') {
+      if (!zoneNameComponentOk(name[compStart:i])) {
+        return false
+      }
+      compStart = i + 1
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Loads the zone named `name` from the host's zone database
+// (docs/stdlib/time.md, "`zone(name)`"). Fails when `name` escapes the zone
+// directory, when the host has no such zone, or when the file it finds
+// does not parse as TZif.
+export fn zone(name: string): Zone! {
+  if (!zoneNameValid(name)) {
+    fail newError("zone: invalid zone name '${name}'")
+  }
+  let content = readFile(zoneInfoDir + name) catch _ {
+    fail newError("zone: unknown zone '${name}'")
+  }
+  let parsed = tzifParse([]byte(content)) catch _ {
+    fail newError("zone: malformed zone data for '${name}'")
+  }
+  return Zone{ name: name, data: parsed }
+}
+
+// The UTC zone: no transitions, offset always 0. Never touches the
+// filesystem and never fails (docs/stdlib/time.md, "`utc()`").
+export fn utc(): Zone {
+  return Zone{ name: "UTC", data: ZoneData{ transitions: []Transition(0), fallback: 0 } }
+}
+
+// The host's own zone, read from /etc/localtime. Returns `utc()` on any
+// failure — missing file, dangling symlink, parse error — because a
+// program asking for the local zone has no better fallback than UTC
+// (docs/stdlib/time.md, "`localZone()`"). Never fails.
+export fn localZone(): Zone {
+  let content = readFile(localtimePath) catch _ {
+    return utc()
+  }
+  let parsed = tzifParse([]byte(content)) catch _ {
+    return utc()
+  }
+  return Zone{ name: "Local", data: parsed }
+}
+
+// The offset in effect in `z` at the UTC instant `utcSeconds` (seconds
+// since the Unix epoch): the offset of the last transition at or before
+// `utcSeconds`, or `z.data.fallback` before the first transition. Module-
+// internal; `DateTime` (#4075) is the public route.
+fn zoneOffsetAt(z: Zone, utcSeconds: int): int {
+  let transitions = z.data.transitions
+  let n = len(transitions)
+  let offset = z.data.fallback
+  let i = 0
+  while (i < n && transitions[i].at <= utcSeconds) {
+    offset = transitions[i].offset
+    i = i + 1
+  }
+  return offset
+}
+
+// The offset to resolve the wall-clock reading `wallSeconds` (a naive local
+// time expressed as seconds since the Unix epoch, ignoring any zone) to an
+// instant. Total (docs/stdlib/time.md, "Daylight saving"): every wall
+// reading maps to exactly one offset.
+//
+// Segment `i` (for `i` in `0..len(transitions)` inclusive) is the span
+// between transition `i-1` and transition `i` — segment 0 runs from
+// `-infinity` to the first transition at `z.data.fallback`, the last
+// segment runs from the final transition to `+infinity`. Segment `i`'s
+// WALL range is its UTC range shifted by its own offset. Scanning segments
+// in chronological order and returning the first whose wall range contains
+// `wallSeconds` resolves an autumn overlap for free: the pre-transition
+// segment is always checked first, so its (larger, earlier-occurrence)
+// offset wins over the post-transition segment's. A spring gap falls
+// between two segments' wall ranges and matches neither; the offset of the
+// first segment whose wall range starts after `wallSeconds` — necessarily
+// the segment immediately following the gap — is remembered as the scan
+// passes it, and is what the gap case returns once the scan proves no
+// segment actually matched.
+fn zoneOffsetForWall(z: Zone, wallSeconds: int): int {
+  let transitions = z.data.transitions
+  let n = len(transitions)
+  let afterGap = z.data.fallback
+  let haveAfterGap = false
+  let i = 0
+  while (i <= n) {
+    let offset = z.data.fallback
+    if (i > 0) {
+      offset = transitions[i - 1].offset
+    }
+    let startOk = i == 0 || wallSeconds >= transitions[i - 1].at + offset
+    let endOk = i == n || wallSeconds < transitions[i].at + offset
+    if (startOk && endOk) {
+      return offset
+    }
+    if (!startOk && !haveAfterGap) {
+      afterGap = offset
+      haveAfterGap = true
+    }
+    i = i + 1
+  }
+  return afterGap
+}
