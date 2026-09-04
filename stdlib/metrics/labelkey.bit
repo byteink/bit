@@ -1,0 +1,153 @@
+// Bit standard library — std/metrics: label-value keys and the per-metric
+// series index shared by Counter, Gauge and Histogram (#3966).
+
+import { RWMutex, newRWMutex } from "std/sync"
+
+// The two construction-time settings every metric family shares — its
+// registry's cardinality cap and its registry's shared drop counter.
+// Bundled so newCounter/newGauge/newHistogram each take one argument for
+// both instead of two (E0202's five-parameter limit).
+class familyConfig {
+  capMax: int,
+  dropped: []i64,
+}
+
+// Encodes `values` as a single string that is a bijective function of the
+// slice's contents — length-prefixed, netstring-style ("3:GET4:POST" for
+// two values of length 3 and 4). Reading a decimal length then exactly that
+// many bytes leaves no ambiguity about where one value ends and the next
+// begins, so no separator character embedded in a caller-supplied label
+// value can ever produce a collision between two distinct label sets.
+fn encodeLabelKey(values: []string): string {
+  let out = ""
+  let i = 0
+  while (i < len(values)) {
+    out = out + "${len(values[i])}:" + values[i]
+    i = i + 1
+  }
+  return out
+}
+
+fn requireLabelArity(names: []string, values: []string) {
+  if (len(names) != len(values)) {
+    panic("metrics: got ${len(values)} label value(s), want ${len(names)} (this metric's declared label set)")
+  }
+}
+
+// A fresh copy of `s`. Used to defend against a caller mutating a slice
+// they passed in (labelNames, buckets, a per-call labelValues) after this
+// module has stored a reference to it — Bit's `[]T` is a reference type,
+// so without a copy such a mutation would silently corrupt already
+// -registered state.
+fn copyStrings(s: []string): []string {
+  let out = []string(len(s))
+  let i = 0
+  while (i < len(s)) {
+    out[i] = s[i]
+    i = i + 1
+  }
+  return out
+}
+
+fn copyF64(s: []f64): []f64 {
+  let out = []f64(len(s))
+  let i = 0
+  while (i < len(s)) {
+    out[i] = s[i]
+    i = i + 1
+  }
+  return out
+}
+
+// A thread-safe map from an encoded label-value key (encodeLabelKey above)
+// to a stable slot index, shared by Counter/Gauge/Histogram so the
+// cardinality cap is enforced identically by all three.
+//
+// The numeric value storage itself (a Counter's f64 cells, a Histogram's
+// bucket arrays) is NOT here: each concrete metric type preallocates its
+// own storage to `capMax` at construction (see counter.bit/gauge.bit/
+// histogram.bit), so a slot index this returns is valid to use as a direct
+// array offset with no further synchronization on the read/write of the
+// value itself — the array never grows or reallocates after construction,
+// which is what makes using it lock-free on the hot path.
+class seriesIndex {
+  mu: RWMutex
+  slot: map<string, int>
+  labelVals: [][]string
+  capMax: int
+
+  // Resolves the slot index for `values` (already known to encode to
+  // `key`), creating one if this is the first time these exact label
+  // values have been seen. Returns (index, true) on success; (0, false)
+  // means the cardinality cap was reached and NO slot was created — the
+  // caller must not write through the returned index in that case.
+  resolve(key: string, values: []string): (int, bool) {
+    this.mu.rLock()
+    let (idx, found) = this.slot[key]
+    this.mu.rUnlock()
+    if (found) {
+      return idx, true
+    }
+
+    // Miss: upgrade to the write lock and re-check (double-checked
+    // locking) — another caller may have created this exact key between
+    // the rUnlock above and this lock().
+    this.mu.lock()
+    let (idx2, found2) = this.slot[key]
+    if (found2) {
+      this.mu.unlock()
+      return idx2, true
+    }
+    if (len(this.slot) >= this.capMax) {
+      this.mu.unlock()
+      return 0, false
+    }
+    let newIdx = len(this.slot)
+    this.slot[key] = newIdx
+    this.labelVals = append(this.labelVals, copyStrings(values))
+    this.mu.unlock()
+    return newIdx, true
+  }
+
+  // The number of live series; the valid slot-index range is [0, count()).
+  count(): int {
+    this.mu.rLock()
+    let n = len(this.slot)
+    this.mu.rUnlock()
+    return n
+  }
+
+  // The label values that produced slot `i` (0 <= i < count()).
+  labelsAt(i: int): []string {
+    this.mu.rLock()
+    let v = this.labelVals[i]
+    this.mu.rUnlock()
+    return v
+  }
+}
+
+// A fresh seriesIndex for a metric declaring `labelNames`. A metric with NO
+// declared labels has exactly one possible series (the empty label list),
+// so that series is created here, eagerly — the metric appears in
+// exposition() at its zero value from the moment it is registered, the
+// same as a plain (non-vector) Prometheus counter or gauge. A metric WITH
+// declared labels cannot do this: which label-value combinations will ever
+// be observed is not known at registration, so those series stay lazily
+// created on first record, same as a Prometheus *Vec.
+fn newSeriesIndex(labelNames: []string, capMax: int): seriesIndex {
+  let idx = seriesIndex{
+    mu: newRWMutex(),
+    slot: map<string, int>(),
+    labelVals: [][]string(0),
+    capMax: capMax,
+  }
+  if (len(labelNames) == 0) {
+    let empty: []string = []string(0)
+    let (_, ok) = idx.resolve(encodeLabelKey(empty), empty)
+    assert(
+      ok,
+      "metrics: newSeriesIndex: could not create the sole series of a no-label metric (capMax < 1?)",
+    )
+  }
+  return idx
+}

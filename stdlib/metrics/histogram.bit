@@ -1,0 +1,136 @@
+// Bit standard library — std/metrics: Histogram (#3966).
+//
+// Buckets are explicit and CUMULATIVE in the classic Prometheus sense: a
+// caller passes only the FINITE upper bounds, strictly increasing; the
+// "+Inf" bucket (every observation, by definition) is implicit and always
+// last — never passed explicitly, always rendered.
+//
+// Per-slot storage is "count per own bucket", not "cumulative count":
+// observe() increments exactly one bucket (found by a linear scan of the
+// small, fixed bound list) and exposition() sums the ladder at render time.
+// Maintaining running cumulative counts instead would mean every observe()
+// touching every bucket >= its value — O(buckets) atomics per observation
+// instead of one.
+//
+// Construct via Registry.histogram (registry.bit), never directly.
+
+// The default bucket boundaries, in seconds — suitable for request/RPC
+// latency (the same values as Prometheus's own client_golang DefBuckets).
+export fn defaultBuckets(): []f64 {
+  return [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+}
+
+fn requireValidBuckets(buckets: []f64) {
+  if (len(buckets) == 0) {
+    panic("metrics: histogram: buckets must not be empty")
+  }
+  let i = 0
+  while (i < len(buckets)) {
+    let v = buckets[i]
+    if (v != v) {
+      panic("metrics: histogram: bucket bound at index ${i} is NaN")
+    }
+    if (i > 0 && buckets[i - 1] >= v) {
+      panic("metrics: histogram: bucket bounds must be strictly increasing (bound ${i - 1} = ${buckets[i - 1]}, bound ${i} = ${v})")
+    }
+    i = i + 1
+  }
+}
+
+export class Histogram {
+  name: string
+  help: string
+  labelNames: []string
+  bounds: []f64   // finite upper bounds only, ascending
+  numBuckets: int // len(bounds) + 1 (the +Inf bucket)
+  idx: seriesIndex
+  // Flat, capMax * numBuckets: slot s's bucket b is at s*numBuckets + b.
+  bucketCounts: []i64
+  sumBits: []u64
+  obsCount: []i64
+  dropped: []i64
+
+  // Records one observation of `value` for the series `labelValues`.
+  export observe(value: f64, labelValues: []string) {
+    requireLabelArity(this.labelNames, labelValues)
+    let (slot, ok) = this.idx.resolve(encodeLabelKey(labelValues), labelValues)
+    if (!ok) {
+      atomicAdd(ptrOf(this.dropped), 1)
+      return
+    }
+    let b = this.bucketFor(value)
+    atomicAdd(ptrOf(this.bucketCounts) + slot * this.numBuckets + b, 1)
+    atomicAddF64(ptrOf(this.sumBits) + slot, value)
+    atomicAdd(ptrOf(this.obsCount) + slot, 1)
+  }
+
+  // The bucket `value` falls into: the smallest index whose finite bound is
+  // >= value, or the trailing +Inf bucket (index len(bounds)) if it exceeds
+  // every finite bound. `bounds` is small (a handful to a few dozen entries
+  // for any real latency ladder), so a linear scan costs less than the
+  // atomics that follow it and needs no supporting index.
+  bucketFor(value: f64): int {
+    let i = 0
+    while (i < len(this.bounds)) {
+      if (value <= this.bounds[i]) {
+        return i
+      }
+      i = i + 1
+    }
+    return len(this.bounds)
+  }
+
+  writeExposition(b: Builder) {
+    appendMetricHeader(b, this.name, this.help, "histogram")
+    let n = this.idx.count()
+    let s = 0
+    while (s < n) {
+      let labels = labelSet{ names: this.labelNames, values: this.idx.labelsAt(s) }
+      this.writeSeriesBuckets(b, s, labels)
+      let sum = atomicLoadF64(ptrOf(this.sumBits) + s)
+      let count = atomicLoad(ptrOf(this.obsCount) + s)
+      appendSeriesLine(b, this.name + "_sum", labels, "${sum}")
+      appendSeriesLine(b, this.name + "_count", labels, "${count}")
+      s = s + 1
+    }
+  }
+
+  // Appends the cumulative `_bucket{...,le="..."}` ladder for series `s`.
+  // Split out of writeExposition to keep both under the complexity limit.
+  writeSeriesBuckets(b: Builder, s: int, labels: labelSet) {
+    let base = s * this.numBuckets
+    let cumulative: i64 = 0
+    let bi = 0
+    while (bi < this.numBuckets) {
+      cumulative = cumulative + atomicLoad(ptrOf(this.bucketCounts) + base + bi)
+      let boundText = "+Inf"
+      if (bi < len(this.bounds)) {
+        boundText = "${this.bounds[bi]}"
+      }
+      appendBucketLine(b, this.name + "_bucket", labels, boundText, "${cumulative}")
+      bi = bi + 1
+    }
+  }
+}
+
+fn newHistogram(
+  name: string,
+  help: string,
+  labelNames: []string,
+  buckets: []f64,
+  cfg: familyConfig,
+): Histogram {
+  let numBuckets = len(buckets) + 1
+  return Histogram{
+    name: name,
+    help: help,
+    labelNames: copyStrings(labelNames),
+    bounds: copyF64(buckets),
+    numBuckets: numBuckets,
+    idx: newSeriesIndex(labelNames, cfg.capMax),
+    bucketCounts: []i64(cfg.capMax * numBuckets),
+    sumBits: []u64(cfg.capMax),
+    obsCount: []i64(cfg.capMax),
+    dropped: cfg.dropped,
+  }
+}
