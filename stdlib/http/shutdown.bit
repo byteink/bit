@@ -1,0 +1,242 @@
+// Bit standard library — http module: graceful shutdown for `Server` (#3963).
+//
+// `serve`/`listenAndServe`/`listenAndServeOn` had no way to stop: the only way
+// to end one was to kill the process, severing every response mid-flight.
+// `shutdown` fixes that for the plain HTTP server surface:
+//
+//   1. Close the listener FIRST — a load balancer's next health check fails
+//      and traffic moves away immediately, and a fresh dial gets refused
+//      right away rather than racing whatever happens next.
+//   2. Force-close every connection that has not yet handed a full request to
+//      `handler` — including one that never sent a byte (an idle keep-alive)
+//      and one stalled mid-body. Nothing has been promised to that peer yet,
+//      so there is nothing to protect, and making it wait only slows
+//      shutdown down for no benefit — the peer can simply retry elsewhere.
+//   3. Give every connection that DOES have a request in `handler`'s hands up
+//      to `timeoutMs` to finish writing its response.
+//   4. Force-close whatever is still running once the deadline passes, and
+//      report exactly how many — a silent force-close looks identical to a
+//      clean one, and that difference is what an operator needs to know.
+//
+// Safe to call from a signal handler and safe to call twice (or
+// concurrently): every caller after the first blocks on the same mutex/
+// channel pair the first one uses and then replays its exact outcome, so no
+// side effect (closing the listener, force-closing a connection) ever runs
+// twice.
+//
+// Scope: this governs `Server` — `serve`/`listenAndServe`/`listenAndServeOn`
+// — only. `serveTls`/`serveTlsOn` keep their existing `TlsListener`-based
+// signatures (used across ten call sites in this repo, and Bit has no
+// optional/default parameters — SPEC §10.3 — so there is no backward-
+// compatible way to thread a shared drain tracker into them without a real
+// `Server`/`TlsListener` unification, which is out of this ticket's bounded
+// scope). `serveTlsOn`'s HTTP/1.1-over-TLS connections still get a private,
+// per-call drain tracker so `serveOne`'s signature stays uniform — it is
+// simply never exposed, so nothing external can drain it yet. The `Server`
+// direct-drive API (`Server.accept()`/`Exchange.read()`/`.respond()`) is
+// unaffected too: `shutdown` still stops it accepting (the same listener),
+// it just does not track its in-flight exchanges, since that API has no
+// registration point of its own.
+
+import { Mutex, newMutex } from "std/sync"
+import { after, Millisecond } from "std/time"
+
+// One live connection's shutdown hook, tracked in `drainState.conns` from the
+// moment it is accepted until it finishes. `active` is false while the
+// connection is waiting for bytes — no request has reached `handler` yet, so
+// there is nothing to protect — and becomes true once a full request has been
+// handed off (`drainMarkActive`). `force` wakes whatever green thread is
+// currently blocked on this connection's socket the way `net.Conn.shutdown`
+// documents: a real state transition the parked read observes as an orderly
+// EOF, never a bare `close`, which would leave it parked forever.
+class connEntry {
+  active: bool,
+  force: () => (),
+}
+
+// Coordinates one `Server`'s graceful shutdown: the registry of connections
+// currently open, whether shutdown has started/finished, and the stored
+// outcome of a completed shutdown so a second (or concurrent) call replays it
+// instead of repeating any side effect. Every field's zero value already
+// means "no shutdown in progress, no connections yet", except the two
+// channels, which need an explicit buffered channel — `newDrainState` is the
+// sole constructor.
+class drainState {
+  mu: Mutex,
+  conns: map<int, connEntry>,
+  nextId: int,
+  activeCount: int,
+  started: bool,
+  finished: bool,
+  finishedCh: chan<bool>,
+  drainedCh: chan<bool>,
+  cutMsg: string,
+}
+
+fn newDrainState(): drainState {
+  return drainState{
+    mu: newMutex(),
+    conns: map<int, connEntry>(),
+    nextId: 0,
+    activeCount: 0,
+    started: false,
+    finished: false,
+    finishedCh: chan<bool>(1),
+    drainedCh: chan<bool>(1),
+    cutMsg: "",
+  }
+}
+
+// Register a freshly accepted connection, idle until `drainMarkActive` says
+// otherwise. Returns an id for the later `drainMarkActive`/`drainDeregister`
+// calls, or `-1` if shutdown has already FULLY finished — the narrow race
+// between the listener closing and a connection already accepted just before
+// that reaching this call. A `-1` connection is force-closed on the spot
+// rather than left untracked and unclosed forever.
+fn drainRegister(
+  d: drainState, force: () => (),
+): int {
+  d.mu.lock()
+  if (d.finished) {
+    d.mu.unlock()
+    force()
+    return 0 - 1
+  }
+  let id = d.nextId
+  d.nextId = d.nextId + 1
+  d.conns[id] = connEntry{ active: false, force: force }
+  d.mu.unlock()
+  return id
+}
+
+// Mark connection `id` as actively being handled — its full request has been
+// read and `handler` now owns it. A no-op for an id that is no longer
+// registered (already force-closed while idle) or already active:
+// `drainRegister`/`drainMarkActive`/`drainDeregister` are all serialized by
+// the same mutex, so a connection is force-closed while idle or marked
+// active, never both.
+fn drainMarkActive(d: drainState, id: int) {
+  if (id < 0) {
+    return
+  }
+  d.mu.lock()
+  let (e, ok) = d.conns[id]
+  if (ok && !e.active) {
+    e.active = true
+    d.activeCount = d.activeCount + 1
+  }
+  d.mu.unlock()
+}
+
+// Called exactly once per connection, however it ends (a clean response, a
+// read/write failure, or a forced close), to release its registry slot. When
+// this is the last active connection to finish during a shutdown's drain
+// wait, wakes `shutdown` immediately rather than making it wait out the rest
+// of `timeoutMs`.
+fn drainDeregister(d: drainState, id: int) {
+  if (id < 0) {
+    return
+  }
+  d.mu.lock()
+  let (e, ok) = d.conns[id]
+  if (!ok) {
+    d.mu.unlock()
+    return
+  }
+  delete(d.conns, id)
+  if (e.active) {
+    d.activeCount = d.activeCount - 1
+    if (d.started && d.activeCount == 0) {
+      d.drainedCh <- true
+    }
+  }
+  d.mu.unlock()
+}
+
+// Force-close every connection still idle (waiting for its first byte, or
+// stalled mid-request with no handler running yet) — step 2 of `shutdown`'s
+// sequence above. Active connections are left in the registry; the
+// drain-wait/timeout in `shutdown` itself is what handles those.
+fn drainSweepIdle(d: drainState) {
+  d.mu.lock()
+  let keep = map<int, connEntry>()
+  for (id, e) of d.conns {
+    if (e.active) {
+      keep[id] = e
+    } else {
+      e.force()
+    }
+  }
+  d.conns = keep
+  d.mu.unlock()
+}
+
+// The final step of `shutdown`: force-close everything still registered —
+// either connections still active when `timeoutMs` ran out, or (rarely) one
+// that slipped past `drainRegister`'s race window during the wait — and
+// report how many of them were genuinely active. An idle straggler costs
+// nothing (see `drainSweepIdle`'s doc comment) and is not counted.
+fn drainFinalize(d: drainState): int {
+  d.mu.lock()
+  let cut = 0
+  for (_, e) of d.conns {
+    if (e.active) {
+      cut = cut + 1
+    }
+    e.force()
+  }
+  d.conns = map<int, connEntry>()
+  d.mu.unlock()
+  return cut
+}
+
+// Stop `s` accepting new connections, drain requests already in flight, and
+// return. See this file's header comment for the full sequence and the exact
+// scope (plain `Server` only). A non-nil error names exactly how many
+// in-flight connections were force-closed after `timeoutMs` — never the idle
+// ones, which had nothing to lose.
+export fn shutdown(s: Server, timeoutMs: int): ()! {
+  let d = s.drain
+  d.mu.lock()
+  if (d.started) {
+    let waitCh = d.finishedCh
+    d.mu.unlock()
+    <- waitCh
+    d.mu.lock()
+    let msg = d.cutMsg
+    d.mu.unlock()
+    if (len(msg) > 0) {
+      fail newError(msg)
+    }
+    return
+  }
+  d.started = true
+  let waitNeeded = d.activeCount > 0
+  d.mu.unlock()
+
+  s.listener.close()
+  drainSweepIdle(d)
+
+  if (waitNeeded) {
+    select {
+      case <- d.drainedCh:
+      case <- after(timeoutMs * Millisecond):
+    }
+  }
+
+  let cut = drainFinalize(d)
+  let msg = ""
+  if (cut > 0) {
+    msg = "shutdown: timed out after ${timeoutMs}ms, force-closed ${cut} connection(s)"
+  }
+
+  d.mu.lock()
+  d.cutMsg = msg
+  d.finished = true
+  close(d.finishedCh)
+  d.mu.unlock()
+
+  if (len(msg) > 0) {
+    fail newError(msg)
+  }
+}

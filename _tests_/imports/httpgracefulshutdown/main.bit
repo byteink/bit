@@ -1,0 +1,162 @@
+// std/http graceful shutdown (#3963): `serve`/`listenAndServeOn` used to have
+// no way to stop — the only way to end one was to kill the process, severing
+// every in-flight response. `shutdown(s, timeoutMs)` is a REAL running
+// program here, not reasoning about the design: a live server, a client
+// holding a request open across the shutdown call, and a raw socket proving
+// the listener actually refuses a new connection afterward.
+//
+// Exact elapsed milliseconds are not printed — this repo's dev machines run
+// several concurrent agents, so wall-clock numbers are not reproducible.
+// What is asserted directly is that a shutdown whose only work is closing an
+// idle connection finishes in a small fraction of its timeout budget, the
+// same style `_tests_/imports/httpstall` already uses.
+import { serve, listenAndServeOn, shutdown, get, ok, Request, Response, Server } from "std/http"
+import { dial } from "std/net"
+import { sleep, Millisecond, monotonic, since } from "std/time"
+import { indexOf } from "std/strings"
+
+fn report(tag: string, passed: bool) {
+  if (passed) {
+    println(tag + " PASS")
+    return
+  }
+  println(tag + " FAIL")
+}
+
+// The outcome of a spawned `get()` call, handed back over a channel since the
+// call itself runs on its own green thread (so shutdown can be called on the
+// caller's thread WHILE the request is still in flight).
+class getResult { status: int, body: string, err: string }
+
+fn doGet(port: int, path: string, resultCh: chan<getResult>) {
+  let r = get("http://127.0.0.1:${port}${path}") catch e {
+    resultCh <- getResult{ status: 0, body: "", err: e.message() }
+    return
+  }
+  resultCh <- getResult{ status: r.status, body: r.body, err: "" }
+}
+
+// A handler that signals `startedCh` the instant it is invoked (proof that
+// the request genuinely reached it, not a fixed guess-a-delay), then sleeps
+// `sleepMs` before answering — the in-flight work `shutdown` must either
+// protect (a long enough timeout) or cut short (a short one).
+fn slowHandler(startedCh: chan<bool>, sleepMs: int): (Request) => Response {
+  return (req) => {
+    startedCh <- true
+    sleep(sleepMs * Millisecond)
+    return ok("slow-done")
+  }
+}
+
+fn quietHandler(req: Request): Response {
+  return ok("quiet")
+}
+
+fn runServer(s: Server, handler: (Request) => Response) {
+  listenAndServeOn(s, handler) catch _ {
+    return
+  }
+}
+
+// The result of a `shutdown` call: its error message ("" for none) and how
+// long it took, so a caller can assert both "did it error" and "did it
+// return promptly" without a raw call site repeated at every call.
+class shutdownResult { msg: string, elapsedMs: int }
+
+fn doShutdown(s: Server, timeoutMs: int): shutdownResult {
+  let t0 = monotonic()
+  let msg = ""
+  shutdown(s, timeoutMs) catch e {
+    msg = e.message()
+  }
+  return shutdownResult{ msg: msg, elapsedMs: since(t0) / Millisecond }
+}
+
+// Scenario 1: the handler's sleep is well inside the shutdown timeout. The
+// in-flight request must complete with its real response, `shutdown` must
+// return no error, and calling `shutdown` AGAIN afterward must be a
+// no-op that also reports no error — the idempotency the ticket requires. A
+// fresh dial to the same port, after shutdown has returned, must be refused.
+fn scenarioCompletesInTime(): ()! {
+  let s = serve("127.0.0.1", 0)?
+  let port = s.port()?
+  let startedCh = chan<bool>(1)
+  spawn runServer(s, slowHandler(startedCh, 150))
+  let resultCh = chan<getResult>(1)
+  spawn doGet(port, "/", resultCh)
+  <- startedCh
+
+  let first = doShutdown(s, 5000)
+  report("intime-shutdown-no-error", len(first.msg) == 0)
+
+  let res = <- resultCh
+  report("intime-client-got-full-response", res.status == 200 && res.body == "slow-done")
+
+  let second = doShutdown(s, 5000)
+  report("intime-second-shutdown-no-error", len(second.msg) == 0)
+  report("intime-second-shutdown-fast", second.elapsedMs < 500)
+
+  dial("127.0.0.1", port) catch _ {
+    report("intime-new-connection-refused", true)
+    return
+  }
+  report("intime-new-connection-refused", false)
+}
+
+// Scenario 2: the handler's sleep OUTLASTS the shutdown timeout. `shutdown`
+// must return an error naming exactly one connection cut, and the client's
+// in-flight request must NOT receive a real response — it was cut short.
+fn scenarioTimesOut(): ()! {
+  let s = serve("127.0.0.1", 0)?
+  let startedCh = chan<bool>(1)
+  spawn runServer(s, slowHandler(startedCh, 3000))
+  let resultCh = chan<getResult>(1)
+  spawn doGet(s.port()?, "/", resultCh)
+  <- startedCh
+
+  let out = doShutdown(s, 150)
+  report("timeout-shutdown-errors", len(out.msg) > 0)
+  report("timeout-cuts-exactly-one", indexOf(out.msg, "1 connection") >= 0)
+
+  let res = <- resultCh
+  report("timeout-client-request-cut-short", res.status != 200)
+}
+
+// Scenario 3: a connection that sends nothing at all — idle, nothing to
+// drain — must be force-closed right away, not held for the timeout. Proven
+// two ways: `shutdown` itself returns in a small fraction of a deliberately
+// huge timeout budget, and the client's own raw socket observes the close.
+fn scenarioIdleClosedImmediately(): ()! {
+  let s = serve("127.0.0.1", 0)?
+  let port = s.port()?
+  spawn runServer(s, quietHandler)
+
+  let c = dial("127.0.0.1", port)?
+  // Give the accept loop a moment to register the connection before shutdown
+  // runs, so this tests "idle and already registered", not a race with
+  // accept() itself.
+  sleep(50 * Millisecond)
+
+  let out = doShutdown(s, 60000)
+  report("idle-shutdown-no-error", len(out.msg) == 0)
+  report("idle-shutdown-fast", out.elapsedMs < 5000)
+
+  c.setDeadline(monotonic().ns + 5000 * Millisecond)
+  let readBack = c.readDeadline(16) catch _ {
+    report("idle-conn-force-closed", true)
+    return
+  }
+  report("idle-conn-force-closed", len(readBack) == 0)
+}
+
+fn run(): ()! {
+  scenarioCompletesInTime()?
+  scenarioTimesOut()?
+  scenarioIdleClosedImmediately()?
+}
+
+fn main() {
+  run() catch e {
+    println("failed: ${e.message()}")
+  }
+}
