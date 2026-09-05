@@ -52,6 +52,14 @@ import { Builder } from "std/strings"
 // class of waste.
 const jsonSmallCap = 4
 
+// Slots in a parser's object-key cache (#4358). Direct-mapped and
+// self-evicting: one slot per index, never scanned, never grown, so a document
+// with a million distinct keys costs the same 16 words as one with four. A
+// power of two, so the index is a mask. 16 holds a record shape's key set — a
+// real document repeats the same handful of keys across sibling objects and
+// across nesting depths.
+const jsonKeyCacheSlots = 16
+
 // A cursor over the token stream, plus the original source (decoding a string
 // or number needs to slice raw bytes back out of it).
 // `allowTrailingComma` and `allowComments` are JSONC-only (both false for
@@ -67,7 +75,15 @@ const jsonSmallCap = 4
 // entire parse and therefore re-marked by every collection the parse triggers.
 // Driving `lexNext` directly and reading the current token off `p.lx`'s own
 // `kind`/`start`/`end` fields makes tokenization allocation-free.
-class Parser { src: string, lx: Lexer, allowComments: bool, allowTrailingComma: bool }
+class Parser {
+  src: string,
+  lx: Lexer,
+  allowComments: bool,
+  allowTrailingComma: bool,
+  // `internKey`'s table. Empty until the first escape-free object key, so a
+  // document with no objects — or none with keys — never pays for it.
+  keyCache: []string,
+}
 
 // A parser positioned on `source`'s first token. Priming here rather than
 // lazily keeps every `p.lx.kind` read below unconditional.
@@ -77,6 +93,7 @@ fn newParser(source: string, allowComments: bool, allowTrailingComma: bool): Par
     lx: newLexer(source),
     allowComments: allowComments,
     allowTrailingComma: allowTrailingComma,
+    keyCache: []string(0, 0),
   }
   lexNext(p.lx, allowComments, false)
   return p
@@ -255,7 +272,7 @@ fn parseObject(p: Parser): Json! {
     let keyStart = p.lx.start
     let keyEnd = p.lx.end
     advance(p)
-    let key = decodeStringLiteral(p.src, keyStart, keyEnd)?
+    let key = decodeObjectKey(p, keyStart, keyEnd)?
     if (p.lx.kind != TokenKind.Colon) {
       fail posError(p.src, "json: expected ':' after object key", p.lx.start)
     }
@@ -625,10 +642,12 @@ fn decodeUnicodeEscape(src: string, i: int, end: int, escStart: int, b: Builder)
   return i
 }
 
-fn decodeStringLiteral(src: string, tokStart: int, tokEnd: int): string! {
-  let start = tokStart + 1
-  let end = tokEnd - 1
-  let firstEscape = -1
+// The offset of the first `\` in `src[start:end)`, or -1 when the span holds
+// no escape. Fails on a control byte, which RFC 8259 §7 forbids unescaped in a
+// string body. Split out of `decodeStringLiteral` (#4358) so the object-key
+// path shares one definition of a valid string body instead of a second copy
+// that can drift from it.
+fn scanEscape(src: string, start: int, end: int): int! {
   let j = start
   while (j < end) {
     let cj = src[j]
@@ -636,15 +655,91 @@ fn decodeStringLiteral(src: string, tokStart: int, tokEnd: int): string! {
       fail posError(src, "json: control character in string", j)
     }
     if (cj == '\\') {
-      firstEscape = j
-      j = end
-    } else {
-      j = j + 1
+      return j
     }
+    j = j + 1
   }
+  return -1
+}
+
+// An object key's decoded text: `decodeStringLiteral` with its escape-free
+// branch routed through this parser's key cache (#4358). An escaped key still
+// goes through the Builder — it does not borrow `src`, so there is nothing to
+// share. Interning changes a key's IDENTITY, never its bytes, and nothing here
+// compares keys by identity (`jsonGet` uses `==`), so `"a\u0062"` and `"ab"`
+// stay the same key and `"a\"b"` stays a different one, exactly as before.
+fn decodeObjectKey(p: Parser, tokStart: int, tokEnd: int): string! {
+  let start = tokStart + 1
+  let end = tokEnd - 1
+  let firstEscape = scanEscape(p.src, start, end)?
+  if (firstEscape < 0) {
+    return internKey(p, start, end)
+  }
+  return decodeEscaped(p.src, start, end, firstEscape)?
+}
+
+// A string equal to `src[start:end]`, reusing the one this parser already made
+// for that key when it has seen it before.
+//
+// WHY KEYS AND NOT VALUES: the escape-free path returns `src[start:end]`, a
+// fresh 24-byte header object (#3897) even though it borrows the source bytes
+// rather than copying them. Keys are the one part of a document that repeats —
+// bench/cases/json is 150,000 records over the same four keys, so 600,000
+// headers naming one of four strings — while values do not repeat.
+//
+// The slot mixes the first byte, the last byte and the length, so keys sharing
+// a prefix (`user_id`/`user_name`) land apart. A collision costs a miss, never
+// a wrong answer: the occupant is compared byte for byte against the span
+// before it is reused, and a miss overwrites the slot. An empty slot holds the
+// zero-value string, of length 0, so it can only "match" a zero-length key —
+// and answering `""` for a `""` key is correct.
+fn internKey(p: Parser, start: int, end: int): string {
+  let n = end - start
+  if (n == 0) {
+    return ""
+  }
+  if (len(p.keyCache) == 0) {
+    p.keyCache = []string(jsonKeyCacheSlots, jsonKeyCacheSlots)
+  }
+  let mixed = int(p.src[start]) ^ (int(p.src[end - 1]) << 3) ^ n
+  let slot = mixed & (jsonKeyCacheSlots - 1)
+  let cached = p.keyCache[slot]
+  if (len(cached) == n && spanEqualsKey(p.src, start, cached, n)) {
+    return cached
+  }
+  let fresh = p.src[start:end]
+  p.keyCache[slot] = fresh
+  return fresh
+}
+
+// True when `src`'s `n` bytes from `start` are `key`'s `n` bytes. Reads the
+// span in place — the point of the cache is to answer before materializing the
+// slice, so this cannot be a string `==`. The caller has already checked
+// `len(key) == n`, which bounds both walks.
+fn spanEqualsKey(src: string, start: int, key: string, n: int): bool {
+  let i = 0
+  while (i < n) {
+    if (src[start + i] != key[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn decodeStringLiteral(src: string, tokStart: int, tokEnd: int): string! {
+  let start = tokStart + 1
+  let end = tokEnd - 1
+  let firstEscape = scanEscape(src, start, end)?
   if (firstEscape < 0) {
     return src[start:end]
   }
+  return decodeEscaped(src, start, end, firstEscape)?
+}
+
+// `src[start:end)` with its escapes resolved, `firstEscape` being the offset
+// `scanEscape` returned. Everything before it is copied verbatim in one write.
+fn decodeEscaped(src: string, start: int, end: int, firstEscape: int): string! {
   let i = firstEscape
   let b = newBuilder().write(src[start:firstEscape])
   while (i < end) {
