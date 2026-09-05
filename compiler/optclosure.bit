@@ -1,0 +1,692 @@
+// Closure devirtualisation (#4356): turn `call_value %f(a, b)` into a direct
+// `call @g(env, a, b)` wherever the closure value provably comes from one
+// `make_closure @g`, so the inliner (optinline.bit) can then splice `g`.
+//
+// Why this is worth a pass of its own. `std/sort`'s `sortInPlace(xs, less)`
+// hands `less` down to `mergeRuns`, which calls it once per comparison. Every
+// one of those is `emitCallValue` (arm64call.bit): a nil test, a conditional
+// branch, two loads out of the {code, env} cell, an argument shuffle and a
+// `blr` — around eight instructions plus the callee's own prologue and
+// epilogue, ~2.5M times in bench/cases/sort, for a comparator body of ONE
+// instruction. Nothing downstream can remove it: the inliner only ever sees
+// `Op.Call`, and `blr` through a register is opaque to every later pass.
+//
+// The transform is NOT "specialise a generic instantiation on a lambda". It is
+// the weaker and more general fact that the CODE POINTER is known while the
+// ENVIRONMENT stays whatever the cell holds:
+//
+//     %e = field_get %f[8]        // the cell's env word, per instance
+//     %r = call @g(%e, a, b)
+//
+// so it fires for a capturing lambda exactly as it does for a capture-free one
+// — the env is read from the cell at run time either way. #4356's ticket asked
+// for the capture-free case only ("env is the null word"). That condition is
+// unsatisfiable for the case it was filed about: lowerfuncval.bit's capture set
+// is EVERY enclosing binding, not the lambda's free variables, so
+// `sortInPlace(xs, (a, b) => a < b)` written in a `main` that has locals
+// captures them all and allocates a real env object. Restricting to a nil env
+// would have devirtualised nothing here.
+//
+// What replaces the nil check. `emitCallValue` panics on a nil cell (SPEC
+// §18.4). A direct call has no such test, so the rewrite is only legal where
+// the cell is provably non-nil — which is exactly what "every value reaching
+// this callee slot is a `make_closure` result" already proves, since
+// `make_closure` allocates a fresh cell and never yields null.
+
+// The env pointer's offset inside a {code, env} closure cell. Read off
+// arm64call.bit's `closureCellPtrOffsets` — the cell's one GC field IS the env
+// word — rather than written as an 8 here, so this cannot drift from the
+// backend that builds the cell. x64call.bit's `xClosureCellPtrOffsets` holds an
+// independent copy of the same constant; the two already have to agree for
+// `call_value` to work at all on both backends.
+fn closureEnvOffset(): int {
+  return closureCellPtrOffsets()[0]
+}
+
+// A value's closure ORIGIN, and a function entry parameter's, share one
+// encoding:
+//
+//   >= 0  provably the cell of `make_closure @m.funcs[origin]`
+//   -1    bottom: no contributing edge or call site has been seen yet
+//   -2    unknown / disagreeing — nothing may be concluded
+//
+// -2 is absorbing and a cell only ever moves -1 -> >=0 -> -2, which is what
+// bounds both fixpoints below.
+fn closureBottom(): int {
+  return -1
+}
+
+fn closureUnknown(): int {
+  return -2
+}
+
+// Merge `v` into cell `i` of `cells`. True when the cell moved, which is the
+// only termination signal either fixpoint has.
+fn mergeClosureCell(cells: []int, i: int, v: int): bool {
+  let cur = cells[i]
+  if (cur == closureUnknown() || v == closureBottom()) {
+    return false
+  }
+  if (cur == closureBottom()) {
+    cells[i] = v
+    return true
+  }
+  if (cur == v) {
+    return false
+  }
+  cells[i] = closureUnknown()
+  return true
+}
+
+// The interprocedural half: one cell per function ENTRY parameter, addressed by
+// `base[fi] + p`.
+class ClosureFacts {
+  base: []int,
+  val: []int,
+}
+
+fn entryParamCount(f: IrFunc): int {
+  if (len(f.blocks) == 0) {
+    return 0
+  }
+  return f.blocks[0].paramCount
+}
+
+fn newClosureFacts(m: IrModule): ClosureFacts {
+  let base = []int(0)
+  let total = 0
+  let i = 0
+  while (i < len(m.funcs)) {
+    base = append(base, total)
+    total = total + entryParamCount(m.funcs[i])
+    i = i + 1
+  }
+  let val = []int(0)
+  i = 0
+  while (i < total) {
+    val = append(val, closureBottom())
+    i = i + 1
+  }
+  return ClosureFacts{ base: base, val: val }
+}
+
+// Poisons every entry parameter of `fi`. Returns true if anything moved.
+fn poisonFuncParams(m: IrModule, cf: ClosureFacts, fi: int): bool {
+  if (fi < 0) {
+    return false
+  }
+  let n = entryParamCount(m.funcs[fi])
+  let moved = false
+  let i = 0
+  while (i < n) {
+    if (mergeClosureCell(cf.val, cf.base[fi] + i, closureUnknown())) {
+      moved = true
+    }
+    i = i + 1
+  }
+  return moved
+}
+
+// Every way a function can be entered WITHOUT an `Op.Call` this module can see.
+// Each one is poisoned outright, because the whole analysis rests on having
+// enumerated a callee's call sites.
+//
+//   - an unmangled name (`isPinnedName`, emit.bit): a §11.9 pin, a bit_rt_*
+//     symbol or a §11.7 extern — all callable from another object;
+//   - `Op.MakeClosure` / `Op.FuncAddr`: the address escapes into a value, and
+//     any `call_value`/`call_iface` may then reach it;
+//   - `m.methodTables`: `bit_rt_iface_lookup` resolves a method by DISCRIMINATOR
+//     at run time, and those slots name a function with no IR reference anywhere
+//     — the one entry edge a scan of the instruction stream cannot see.
+//
+// A function left at bottom after this — no observed call site and no escape —
+// is unreachable, so ignoring the calls in its body is sound rather than
+// optimistic.
+fn poisonUnobservable(m: IrModule, cf: ClosureFacts) {
+  let fi = 0
+  while (fi < len(m.funcs)) {
+    let f = m.funcs[fi]
+    if (isPinnedName(f.name)) {
+      let _ = poisonFuncParams(m, cf, fi)
+    }
+    let i = 0
+    while (i < len(f.instrs)) {
+      let op = f.instrs[i].op
+      if (op == Op.MakeClosure || op == Op.FuncAddr) {
+        let _ = poisonFuncParams(m, cf, funcIndexByName(m.funcs, f.instrs[i].name))
+      }
+      i = i + 1
+    }
+    fi = fi + 1
+  }
+  poisonMethodTableTargets(m, cf)
+}
+
+fn poisonMethodTableTargets(m: IrModule, cf: ClosureFacts) {
+  let t = 0
+  while (t < len(m.methodTables)) {
+    let ms = m.methodTables[t].methods
+    let i = 0
+    while (i < len(ms)) {
+      let _ = poisonFuncParams(m, cf, funcIndexByName(m.funcs, ms[i].func))
+      i = i + 1
+    }
+    t = t + 1
+  }
+}
+
+// A closure value is always Func-typed, so a parameter of any other type can
+// never hold one. Poisoning them up front collapses the lattice to the handful
+// of function-typed slots a module actually has, which is what makes the
+// `closureFuncSkipped` fast path below cover ~every function in the module.
+fn poisonNonFuncParams(m: IrModule, cf: ClosureFacts) {
+  let fi = 0
+  while (fi < len(m.funcs)) {
+    let f = m.funcs[fi]
+    let n = entryParamCount(f)
+    let start = 0
+    if (n > 0) {
+      start = f.blocks[0].instsStart
+    }
+    let p = 0
+    while (p < n) {
+      if (m.ctx.types[f.instrs[start + p].ty].kind != TypeKind.Func) {
+        let _ = mergeClosureCell(cf.val, cf.base[fi] + p, closureUnknown())
+      }
+      p = p + 1
+    }
+    fi = fi + 1
+  }
+}
+
+fn funcHasOp(f: IrFunc, op: Op): bool {
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (f.instrs[i].op == op) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// True when NO value in `fi` can ever have a known closure origin: it builds no
+// closure of its own and every entry parameter is already poisoned. Such a
+// function's origin array is uniformly unknown, so it is skipped and its call
+// sites poison their callees outright.
+//
+// The predicate is MONOTONE — a cell only ever ends at unknown and never
+// leaves it, and `Op.MakeClosure` is static — so a function skipped in one
+// round is skipped in every later one. That matters: the fixpoint would be
+// wrong if a function could be treated as carrying nothing in round 1 (thereby
+// poisoning its callees, which is absorbing) and as carrying a closure in round
+// 2. This is the reason the seed maps an as-yet-unknown parameter to BOTTOM
+// rather than to unknown — bottom contributes nothing and leaves the callee
+// free to be pinned down on the next round, which is exactly the
+// main -> sortInPlace -> mergeRuns chain.
+fn closureFuncSkipped(m: IrModule, cf: ClosureFacts, fi: int): bool {
+  let n = entryParamCount(m.funcs[fi])
+  let p = 0
+  while (p < n) {
+    if (cf.val[cf.base[fi] + p] != closureUnknown()) {
+      return false
+    }
+    p = p + 1
+  }
+  return !funcHasOp(m.funcs[fi], Op.MakeClosure)
+}
+
+// The intra-function half: per-VALUE closure origin, in the same encoding.
+// Ordinary instructions start unknown, `make_closure` starts at its target,
+// entry parameters start at whatever the interprocedural half currently knows,
+// and every other block parameter starts at bottom to be met over its incoming
+// edges.
+fn seedOrigins(m: IrModule, cf: ClosureFacts, fi: int): []int {
+  let f = m.funcs[fi]
+  let orig = []int(0)
+  let i = 0
+  while (i < len(f.instrs)) {
+    orig = append(orig, closureUnknown())
+    i = i + 1
+  }
+  let b = 1
+  while (b < len(f.blocks)) {
+    let blk = f.blocks[b]
+    let p = 0
+    while (p < blk.paramCount) {
+      orig[blk.instsStart + p] = closureBottom()
+      p = p + 1
+    }
+    b = b + 1
+  }
+  i = 0
+  while (i < len(f.instrs)) {
+    if (f.instrs[i].op == Op.MakeClosure) {
+      let gi = funcIndexByName(m.funcs, f.instrs[i].name)
+      if (gi >= 0) {
+        orig[i] = gi
+      }
+    }
+    i = i + 1
+  }
+  seedEntryOrigins(m, cf, fi, orig)
+  return orig
+}
+
+fn seedEntryOrigins(m: IrModule, cf: ClosureFacts, fi: int, orig: []int) {
+  let f = m.funcs[fi]
+  let n = entryParamCount(f)
+  if (n == 0) {
+    return
+  }
+  let start = f.blocks[0].instsStart
+  let p = 0
+  while (p < n) {
+    orig[start + p] = cf.val[cf.base[fi] + p]
+    p = p + 1
+  }
+}
+
+// Merges one outgoing edge's arguments into the target block's parameters.
+fn mergeOriginEdge(f: IrFunc, orig: []int, target: int, args: []int): bool {
+  let blk = f.blocks[target]
+  let moved = false
+  let i = 0
+  while (i < len(args) && i < blk.paramCount) {
+    if (mergeClosureCell(orig, blk.instsStart + i, orig[args[i]])) {
+      moved = true
+    }
+    i = i + 1
+  }
+  return moved
+}
+
+fn propagateOriginsRound(f: IrFunc, orig: []int): bool {
+  let moved = false
+  let b = 0
+  while (b < len(f.blocks)) {
+    let blk = f.blocks[b]
+    if (blk.instsLen > 0) {
+      let t = f.instrs[blk.instsStart + blk.instsLen - 1]
+      if (t.op == Op.Jump && mergeOriginEdge(f, orig, t.ival, t.args)) {
+        moved = true
+      }
+      if (t.op == Op.Br) {
+        if (mergeOriginEdge(f, orig, t.ival, t.thenArgs)) {
+          moved = true
+        }
+        if (mergeOriginEdge(f, orig, t.ival2, t.elseArgs)) {
+          moved = true
+        }
+      }
+    }
+    b = b + 1
+  }
+  return moved
+}
+
+// `orig` for `fi` at the current state of `cf`, run to a fixpoint. A loop-
+// carried closure parameter needs this: `mergeRuns`' `less` is threaded round
+// the merge loop as a block parameter whose back edge passes itself, so one
+// forward walk leaves it at bottom.
+//
+// Every cell moves at most twice (bottom -> known -> unknown) and a round that
+// changes nothing ends the loop, so `2 * len(orig) + 1` is a static bound on
+// the rounds that can do work — it is a termination witness, not the expected
+// count, which is the loop nesting depth plus two.
+fn solveOrigins(m: IrModule, cf: ClosureFacts, fi: int): []int {
+  let f = m.funcs[fi]
+  let orig = seedOrigins(m, cf, fi)
+  let bound = 2 * len(orig) + 1
+  let r = 0
+  while (r < bound) {
+    if (!propagateOriginsRound(f, orig)) {
+      return orig
+    }
+    r = r + 1
+  }
+  return orig
+}
+
+// Every call site in a SKIPPED function passes values that are all unknown, so
+// each callee parameter it reaches is poisoned outright. Sound because a
+// skipped function holds no `make_closure` and every entry parameter of its own
+// is already poisoned (`closureFuncSkipped`), so no value in it can be anything
+// but unknown.
+fn poisonCalleeParams(m: IrModule, cf: ClosureFacts, f: IrFunc): bool {
+  let moved = false
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (f.instrs[i].op == Op.Call) {
+      if (poisonFuncParams(m, cf, funcIndexByName(m.funcs, f.instrs[i].name))) {
+        moved = true
+      }
+    }
+    i = i + 1
+  }
+  return moved
+}
+
+// One `Op.Call`'s arguments, merged into the callee's entry-parameter cells.
+// An arity mismatch is unreasonable-about rather than impossible — §14 lets
+// `--dump-ir` lower checker-rejected input, the same case optinline.bit's
+// `inlineEligible` declines — so it poisons the callee outright.
+fn propagateCallSite(
+  m: IrModule, cf: ClosureFacts, orig: []int, ins: IrInstr,
+): bool {
+  let gi = funcIndexByName(m.funcs, ins.name)
+  if (gi < 0) {
+    return false
+  }
+  let np = entryParamCount(m.funcs[gi])
+  if (len(ins.args) != np) {
+    return poisonFuncParams(m, cf, gi)
+  }
+  let moved = false
+  let j = 0
+  while (j < np) {
+    if (mergeClosureCell(cf.val, cf.base[gi] + j, orig[ins.args[j]])) {
+      moved = true
+    }
+    j = j + 1
+  }
+  return moved
+}
+
+fn propagateFuncCalls(m: IrModule, cf: ClosureFacts, fi: int): bool {
+  if (closureFuncSkipped(m, cf, fi)) {
+    return poisonCalleeParams(m, cf, m.funcs[fi])
+  }
+  let f = m.funcs[fi]
+  let orig = solveOrigins(m, cf, fi)
+  let moved = false
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (f.instrs[i].op == Op.Call && propagateCallSite(m, cf, orig, f.instrs[i])) {
+      moved = true
+    }
+    i = i + 1
+  }
+  return moved
+}
+
+fn propagateFactsRound(m: IrModule, cf: ClosureFacts): bool {
+  let moved = false
+  let fi = 0
+  while (fi < len(m.funcs)) {
+    if (propagateFuncCalls(m, cf, fi)) {
+      moved = true
+    }
+    fi = fi + 1
+  }
+  return moved
+}
+
+// The interprocedural fixpoint. Same height-2 argument as `solveOrigins`: every
+// cell moves at most twice and the loop stops on the first round that changes
+// nothing, so the bound is a termination witness rather than an iteration
+// count — the real number is the closure-passing call chain's depth plus two
+// (three for main -> sortInPlace -> mergeRuns).
+fn solveClosureFacts(m: IrModule): ClosureFacts {
+  let cf = newClosureFacts(m)
+  poisonNonFuncParams(m, cf)
+  poisonUnobservable(m, cf)
+  let bound = 2 * len(cf.val) + 1
+  let r = 0
+  while (r < bound) {
+    if (!propagateFactsRound(m, cf)) {
+      return cf
+    }
+    r = r + 1
+  }
+  return cf
+}
+
+// The module index of the function `idx`'s `call_value` provably dispatches to,
+// or -1 when the site must keep its indirect call.
+//
+// The three refusals, none of them a cost heuristic:
+//
+//   - an arity that does not match `g`'s entry block leaves a parameter slot
+//     unbound, the same silent wrongness optinline.bit's `inlineEligible`
+//     declines rather than clamps (#3755);
+//   - a fallible callee threads its error through the thread-local slot, and no
+//     fixture covers substituting a direct call for `call_value` there;
+//   - §17.6: a ROOT function may not name a non-root function it does not
+//     define. A freestanding object emits only root functions, so this direction
+//     — and only this direction — would leave `emit.bit`'s `firstUnpinnedImport`
+//     an `m<id>$f` reference nothing can resolve. The reverse (a root closure
+//     called from a non-root function) is safe because that caller is not
+//     emitted into a freestanding object at all, and it is the direction this
+//     pass actually needs: `std/sort`'s `mergeRuns` calling `main`'s lambda.
+fn devirtTarget(m: IrModule, orig: []int, f: IrFunc, idx: int): int {
+  let ins = f.instrs[idx]
+  if (ins.op != Op.CallValue) {
+    return -1
+  }
+  let gi = orig[ins.lhs]
+  if (gi < 0) {
+    return -1
+  }
+  let g = m.funcs[gi]
+  if (entryParamCount(g) != len(ins.args) + 1 || g.isFallible) {
+    return -1
+  }
+  if (f.inRootModule && !g.inRootModule && !isPinnedName(g.name)) {
+    return -1
+  }
+  return gi
+}
+
+// What one function's rewrite carries. Bundled so the block walk stays under
+// E0202's parameter limit, the same shape `AppendCtx` uses in optappend.bit.
+class DevirtCtx {
+  b: IrBuilder,
+  m: IrModule,
+  f: IrFunc,
+  orig: []int,
+  remap: []int,
+  blockMap: []int,
+  known: []ConstVal,
+}
+
+// True if `g` reads its environment — its entry block's first parameter — at
+// all. Every operand position is enumerated by `instrOperands` (opt.bit), the
+// same one DCE's liveness sweep uses, rather than by a second hand-written list
+// of which ops read `lhs`/`rhs`/`ival` as a value: `index_set` carries a value
+// in `ival`, and a list that missed it would silently call the env dead.
+fn calleeUsesEnv(g: IrFunc): bool {
+  if (len(g.blocks) == 0 || g.blocks[0].paramCount == 0) {
+    return false
+  }
+  let used = []bool(0)
+  let i = 0
+  while (i < len(g.instrs)) {
+    used = append(used, false)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(g.instrs)) {
+    markOperandsLive(g, used, i)
+    i = i + 1
+  }
+  return used[g.blocks[0].instsStart]
+}
+
+// The environment argument for a direct call to `g`: the cell's env word when
+// `g` reads it, and `const_nil` when it does not.
+//
+// Reading it from the cell is what makes this rewrite legal for a CAPTURING
+// lambda as well as a capture-free one — the code pointer is what the analysis
+// pins down, never the environment — and it costs one load where the indirect
+// form already paid two plus a nil test and a `blr`.
+//
+// The `const_nil` arm is not an optimisation of the load, it is a fix for a
+// REGRESSION the load causes. LICM hoists the invariant `field_get` out of the
+// dispatch loop, and a hoisted value is threaded round the loop as a block
+// parameter — which `computeLive` marks live unconditionally, so DCE can never
+// remove it even when the splice leaves it unread. Measured on a merge-sort
+// probe: emitting the load unconditionally took `bb1` from 4 block parameters
+// to 8, one of them dead, i.e. an extra value live across the whole loop for a
+// comparator that names no capture at all.
+fn devirtEnvArg(x: DevirtCtx, ins: IrInstr, g: IrFunc): int {
+  let ty = x.f.instrs[ins.lhs].ty
+  if (!calleeUsesEnv(g)) {
+    let z = mkInstr(Op.ConstNil, ty)
+    z.span = ins.span
+    return builderEmit(x.b, z)
+  }
+  let env = mkInstr(Op.FieldGet, ty)
+  env.lhs = x.remap[ins.lhs]
+  env.ival = closureEnvOffset()
+  env.span = ins.span
+  return builderEmit(x.b, env)
+}
+
+// `call @g(env, args...)` replacing one `call_value`. Both instructions keep the
+// `call_value`'s span (#3282's span-on-rewrite policy).
+fn emitDevirtCall(x: DevirtCtx, idx: int, gi: int): int {
+  let ins = x.f.instrs[idx]
+  let args = [devirtEnvArg(x, ins, x.m.funcs[gi])]
+  let rest = trList(x.remap, ins.args)
+  let i = 0
+  while (i < len(rest)) {
+    args = append(args, rest[i])
+    i = i + 1
+  }
+  let call = mkInstr(Op.Call, ins.ty)
+  call.name = x.m.funcs[gi].name
+  call.args = args
+  call.span = ins.span
+  return builderEmit(x.b, call)
+}
+
+// One block of `f`, rewritten into `x.b`. No CFG surgery: a devirtualised site
+// emits two instructions where one stood, in the same block.
+fn devirtBlock(x: DevirtCtx, bi: int) {
+  let blk = x.f.blocks[bi]
+  builderBeginBlock(x.b, x.blockMap[bi])
+  let idx = blk.instsStart
+  let paramsEnd = blk.instsStart + blk.paramCount
+  while (idx < paramsEnd) {
+    x.remap[idx] = builderAddParam(x.b, x.f.instrs[idx].ty)
+    idx = idx + 1
+  }
+  let end = blk.instsStart + blk.instsLen
+  while (idx < end) {
+    let gi = devirtTarget(x.m, x.orig, x.f, idx)
+    if (gi >= 0) {
+      x.remap[idx] = emitDevirtCall(x, idx, gi)
+    } else {
+      emitTranslated(x.b, x.f, x.known, x.remap, x.blockMap, idx)
+    }
+    idx = idx + 1
+  }
+  builderEndBlock(x.b)
+}
+
+fn hasDevirtSite(m: IrModule, orig: []int, f: IrFunc): bool {
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (devirtTarget(m, orig, f, i) >= 0) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// `f` with every devirtualisable `call_value` rewritten, or `f` itself when
+// there is none — so the pass cannot perturb a function it has no work in.
+fn devirtualizeFunc(m: IrModule, cf: ClosureFacts, fi: int): IrFunc {
+  let f = m.funcs[fi]
+  if (closureFuncSkipped(m, cf, fi) || !funcHasOp(f, Op.CallValue)) {
+    return f
+  }
+  let orig = solveOrigins(m, cf, fi)
+  if (!hasDevirtSite(m, orig, f)) {
+    return f
+  }
+  let n = len(f.blocks)
+  let blockMap = []int(0)
+  let remap = []int(0)
+  let known = []ConstVal(0)
+  let i = 0
+  while (i < n) {
+    blockMap = append(blockMap, 0)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(f.instrs)) {
+    remap = append(remap, 0)
+    // Nothing is folded here; `emitTranslated` needs the array regardless.
+    known = append(known, noConst())
+    i = i + 1
+  }
+  // Emission order, not id order — same reason optappend.bit rebuilds in it:
+  // the next `rebuild` renumbers blocks by ascending `instsStart`, and
+  // `isBackEdge` and the x64 interval numbering assume that schedule.
+  let order = blockEmissionOrder(f)
+  let b = newBuilder()
+  i = 0
+  while (i < n) {
+    blockMap[order[i]] = builderNewBlock(b)
+    i = i + 1
+  }
+  let x = DevirtCtx{
+    b: b, m: m, f: f, orig: orig, remap: remap, blockMap: blockMap, known: known,
+  }
+  i = 0
+  while (i < n) {
+    devirtBlock(x, order[i])
+    i = i + 1
+  }
+  return IrFunc{
+    name: f.name, paramTypes: f.paramTypes, result: f.result,
+    blocks: b.blocks, instrs: b.instrs, isFallible: f.isFallible,
+    isNaked: f.isNaked, isNosplit: f.isNosplit,
+    // §17.6 module tag and §11.9 pin flag ride every rebuild — see `rebuild`'s
+    // own note for what dropping either one costs.
+    inRootModule: f.inRootModule, isPinned: f.isPinned,
+  }
+}
+
+fn moduleHasClosureCall(m: IrModule): bool {
+  let fi = 0
+  while (fi < len(m.funcs)) {
+    if (funcHasOp(m.funcs[fi], Op.CallValue)) {
+      return true
+    }
+    fi = fi + 1
+  }
+  return false
+}
+
+// The pass, run by `optimizeModule` between the first fold/DCE round and the
+// inliner's pre-inlining snapshot. Both halves of that placement are
+// load-bearing: after the fold so the block ids ascend with the linear
+// schedule, and before the snapshot so the inliner sees the `Op.Call` this
+// produces and can splice the comparator.
+//
+// Every rewritten function is collected before ANY of them is written back, so
+// the result cannot depend on the order `m.funcs` happens to be in — the
+// filename-ordering bug #3163 fixed for the inliner, refused here by
+// construction rather than by an argument about which fields a rebuild
+// preserves.
+fn specializeClosureCalls(m: IrModule) {
+  if (!moduleHasClosureCall(m)) {
+    return
+  }
+  let cf = solveClosureFacts(m)
+  let out = []IrFunc(0)
+  let fi = 0
+  while (fi < len(m.funcs)) {
+    out = append(out, devirtualizeFunc(m, cf, fi))
+    fi = fi + 1
+  }
+  fi = 0
+  while (fi < len(m.funcs)) {
+    m.funcs[fi] = out[fi]
+    fi = fi + 1
+  }
+}
