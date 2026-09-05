@@ -1,0 +1,487 @@
+// compiler/optstripemit.bit — #4204: the rewrite half of strip mining.
+// optstrip.bit finds and validates the loops and owns `StripLoop`; this file
+// performs the plan. One module; the plan is the only state they share.
+//
+// The emission order is the whole trick, and it is the same one optloop.bit
+// relies on: `remap[v]` holds exactly the right new id at each point because
+// the blocks that read a header parameter as an OUTER parameter are all
+// emitted BEFORE the header, whose own parameter emission then overwrites
+// `remap` for everything after it. No case analysis, no second map.
+//
+// Block ids are allocated in FINAL EMISSION ORDER, before anything is emitted,
+// so id order is schedule order on the way out. That is what lets this pass run
+// last: nothing renumbers behind it, which is what `isBackEdge` and the x64
+// linear-scan interval numbering assume (build.bit's `writeModuleExe`), and it
+// is what keeps `IrBlock.pollFreeHeader` attached to the block it describes.
+
+// The rewrite state shared across one function's blocks. Bundled so each
+// emitter stays under E0202's max-params, the same shape `AppendCtx` uses.
+class StripCtx {
+  b: IrBuilder,
+  f: IrFunc,
+  ctx: TypeContext,
+  remap: []int,
+  blockMap: []int,
+  known: []ConstVal,
+  loops: []StripLoop,
+}
+
+// `jump target(args)`, carrying `span`.
+fn stripJump(b: IrBuilder, target: int, args: []int, span: Span) {
+  let j = mkInstr(Op.Jump, 0)
+  j.ival = target
+  j.args = args
+  j.span = span
+  builderEmit(b, j)
+}
+
+// `br cond -> thenB(thenA), elseB(elseA)`, carrying `span`.
+fn stripBr(sc: StripCtx, cond: int, tb: int, ta: []int, eb: int, ea: []int, span: Span) {
+  let br = mkInstr(Op.Br, sc.ctx.voidId)
+  br.lhs = cond
+  br.ival = tb
+  br.thenArgs = ta
+  br.ival2 = eb
+  br.elseArgs = ea
+  br.span = span
+  builderEmit(sc.b, br)
+}
+
+fn stripConst(sc: StripCtx, v: int, span: Span): int {
+  let c = mkInstr(Op.ConstInt, primType(sc.ctx, 3))
+  c.ival = v
+  c.span = span
+  return builderEmit(sc.b, c)
+}
+
+fn stripCmp(sc: StripCtx, op: Op, lhs: int, rhs: int, span: Span): int {
+  let c = mkInstr(op, primType(sc.ctx, 10))
+  c.lhs = lhs
+  c.rhs = rhs
+  c.span = span
+  return builderEmit(sc.b, c)
+}
+
+// The span every instruction this pass synthesizes carries: the header's own
+// branch. #3282's policy is that a rewrite keeps the source position of what it
+// rewrites, and the outer loop this builds is that branch, restructured.
+fn stripSpan(sc: StripCtx, lp: StripLoop): Span {
+  return sc.f.instrs[stripCmpIdx(sc.f, lp.header) + 1].span
+}
+
+// The new ids of the header's parameters, as they currently stand in `remap` —
+// `OUTER`'s parameters before the header is emitted, the header's own after.
+fn stripHeaderArgs(sc: StripCtx, lp: StripLoop): []int {
+  let hb = sc.f.blocks[lp.header]
+  let out = []int(0)
+  let i = 0
+  while (i < hb.paramCount) {
+    out = append(out, sc.remap[hb.instsStart + i])
+    i = i + 1
+  }
+  return out
+}
+
+// The loop's limit, as read from wherever `remap` currently points. Either a
+// header parameter (so `OUTER`'s parameter while the outer blocks are being
+// emitted) or a value defined before the loop.
+fn stripLimitOf(sc: StripCtx, lp: StripLoop): int {
+  if (lp.limIdx >= 0) {
+    return sc.remap[sc.f.blocks[lp.header].instsStart + lp.limIdx]
+  }
+  return sc.remap[lp.limVal]
+}
+
+// Re-emits the header's leading constants into whatever block is open, and
+// points `remap` at those copies. `OUTER` needs them because the loop's limit
+// may be one of them; the header emits its own copies afterwards, which
+// overwrite `remap` for everything inside the loop.
+fn stripEmitHeaderConsts(sc: StripCtx, lp: StripLoop) {
+  let hb = sc.f.blocks[lp.header]
+  let k = hb.instsStart + hb.paramCount
+  let end = stripCmpIdx(sc.f, lp.header)
+  while (k < end) {
+    emitTranslated(sc.b, sc.f, sc.known, sc.remap, sc.blockMap, k)
+    k = k + 1
+  }
+}
+
+// OUTER: the loop's new header. Carries the same parameters the original header
+// did, tests the same condition against the same limit, and hands the exit edge
+// on unchanged. Its own back edge — from OLATCH — is the one that polls.
+fn stripEmitOuter(sc: StripCtx, li: int) {
+  let lp = sc.loops[li]
+  let hb = sc.f.blocks[lp.header]
+  let span = stripSpan(sc, lp)
+  builderBeginBlock(sc.b, lp.outer)
+  let i = 0
+  while (i < hb.paramCount) {
+    sc.remap[hb.instsStart + i] = builderAddParam(sc.b, sc.f.instrs[hb.instsStart + i].ty)
+    i = i + 1
+  }
+  stripEmitHeaderConsts(sc, lp)
+  let iv = sc.remap[hb.instsStart + lp.ivIdx]
+  let cond = stripCmp(sc, Op.ICmpSlt, iv, stripLimitOf(sc, lp), span)
+  let br = sc.f.instrs[stripCmpIdx(sc.f, lp.header) + 1]
+  stripBr(sc, cond, lp.guard, []int(0), sc.blockMap[lp.exitBlk],
+    trList(sc.remap, br.elseArgs), span)
+  builderEndBlock(sc.b)
+}
+
+// GUARD: read the attention word, and take a strip of ONE whenever anything is
+// already asking for a safepoint.
+//
+// This is what keeps `BIT_GC=stress` bit-identical — under stress the word is
+// permanently set, so every strip is one iteration and every original back edge
+// still polls — and it is also what stops this pass widening the latency of a
+// request that is ALREADY pending: only a request arriving mid-strip waits.
+//
+// A PLAIN LOAD, deliberately, where the poll guard itself uses `ldar`. The poll
+// consumes this word to decide whether to ACT on a request, and must not read
+// the state it summarises out of order (runtime/ABI.md section 5). This read
+// only chooses a strip size: a stale answer costs at most one wide strip, never
+// a missed stop, because the poll on the outer back edge re-reads it with the
+// acquire it needs. Under stress there is no race at all — `gcConfigure`
+// publishes at boot, before any of this code runs.
+//
+// The call is `bit_rt_port_sched_poll_attention_addr`, the same true leaf both
+// backends already call once per polling function's entry. Module state cannot
+// be pinned across the compiler/runtime object boundary (SPEC section 11.9), so
+// an accessor call is the only spelling available. It costs one call per STRIP,
+// not per lap.
+fn stripEmitGuard(sc: StripCtx, li: int) {
+  let lp = sc.loops[li]
+  let span = stripSpan(sc, lp)
+  builderBeginBlock(sc.b, lp.guard)
+  let call = mkInstr(Op.Call, primType(sc.ctx, 3))
+  call.name = pollAttentionAddrSymbol()
+  call.span = span
+  let addr = builderEmit(sc.b, call)
+  let load = mkInstr(Op.FieldGet, primType(sc.ctx, 3))
+  load.lhs = addr
+  load.ival = 0
+  load.span = span
+  let att = builderEmit(sc.b, load)
+  let quiet = stripCmp(sc, Op.ICmpEq, att, stripConst(sc, 0, span), span)
+  stripBr(sc, quiet, lp.groom, []int(0), lp.narrow, []int(0), span)
+  builderEndBlock(sc.b)
+}
+
+// GROOM: the overflow guard, and the only reason `WIDE`'s `add` cannot trap.
+// `WIDE` computes `o + stripSize()`; it runs only from here, only when the
+// limit is at or below `stripLimitCeiling()`, and `o < limit` already holds, so
+// the sum is bounded well below i64's maximum. A loop bounded above that
+// ceiling takes the narrow arm and keeps its per-lap poll.
+fn stripEmitGroom(sc: StripCtx, li: int) {
+  let lp = sc.loops[li]
+  let span = stripSpan(sc, lp)
+  builderBeginBlock(sc.b, lp.groom)
+  let ceil = stripConst(sc, stripLimitCeiling(), span)
+  let room = stripCmp(sc, Op.ICmpSle, stripLimitOf(sc, lp), ceil, span)
+  stripBr(sc, room, lp.wide, []int(0), lp.narrow, []int(0), span)
+  builderEndBlock(sc.b)
+}
+
+// WIDE: the full strip, `lim = o + stripSize()`, taken only when it stays below
+// the loop's own limit. When it does not — the last partial strip of the loop —
+// it falls into NARROW rather than clamping to the limit, which is correct for
+// the same reason NARROW is correct anywhere (`o < n` gives `o + 1 <= n`) and
+// costs at most `stripSize()` extra outer iterations at the very end of a loop.
+// Clamping would need a fifth block to carry the other argument list.
+fn stripEmitWide(sc: StripCtx, li: int) {
+  let lp = sc.loops[li]
+  let hb = sc.f.blocks[lp.header]
+  let span = stripSpan(sc, lp)
+  builderBeginBlock(sc.b, lp.wide)
+  let lim = stripLimitOf(sc, lp)
+  let add = mkInstr(Op.Add, primType(sc.ctx, 3))
+  add.lhs = sc.remap[hb.instsStart + lp.ivIdx]
+  add.rhs = stripConst(sc, stripSize(), span)
+  add.span = span
+  let cand = builderEmit(sc.b, add)
+  let fits = stripCmp(sc, Op.ICmpSlt, cand, lim, span)
+  let args = stripHeaderArgs(sc, lp)
+  stripBr(sc, fits, lp.newHeader, concatIds(args, [cand]), lp.narrow, []int(0), span)
+  builderEndBlock(sc.b)
+}
+
+// NARROW: a strip of one iteration, `lim = o + 1`. Reached when a safepoint is
+// already pending, when the loop's limit is too large to widen safely, or on
+// the last partial strip. `o < limit` holds on every path in, so `o + 1` can
+// neither overflow nor exceed the limit — the two things that would make the
+// inner loop run an iteration the original did not.
+fn stripEmitNarrow(sc: StripCtx, li: int) {
+  let lp = sc.loops[li]
+  let hb = sc.f.blocks[lp.header]
+  let span = stripSpan(sc, lp)
+  builderBeginBlock(sc.b, lp.narrow)
+  let add = mkInstr(Op.Add, primType(sc.ctx, 3))
+  add.lhs = sc.remap[hb.instsStart + lp.ivIdx]
+  add.rhs = stripConst(sc, 1, span)
+  add.span = span
+  let cand = builderEmit(sc.b, add)
+  stripJump(sc.b, lp.newHeader, concatIds(stripHeaderArgs(sc, lp), [cand]), span)
+  builderEndBlock(sc.b)
+}
+
+// OLATCH: the outer loop's latch, and the block whose back edge carries the
+// poll this whole pass exists to move. Reached from the inner header when the
+// strip is exhausted, and doing nothing but handing the loop-carried values
+// back to OUTER.
+fn stripEmitOlatch(sc: StripCtx, li: int) {
+  let lp = sc.loops[li]
+  let hb = sc.f.blocks[lp.header]
+  let span = stripSpan(sc, lp)
+  builderBeginBlock(sc.b, lp.olatch)
+  let args = []int(0)
+  let i = 0
+  while (i < hb.paramCount) {
+    args = append(args, builderAddParam(sc.b, sc.f.instrs[hb.instsStart + i].ty))
+    i = i + 1
+  }
+  stripJump(sc.b, lp.outer, args, span)
+  builderEndBlock(sc.b)
+}
+
+// The inner header: the original block's parameters plus ONE — the strip limit
+// — then a compare against that limit instead of the loop's, and a branch whose
+// else arm goes to OLATCH instead of out of the loop. The original compare is
+// dropped, not emitted dead: `stripHeaderShapeOk` has already established that
+// nothing but this branch reads it.
+fn stripEmitHeader(sc: StripCtx, li: int) {
+  let lp = sc.loops[li]
+  let hb = sc.f.blocks[lp.header]
+  let span = stripSpan(sc, lp)
+  builderBeginBlock(sc.b, lp.newHeader)
+  let i = 0
+  while (i < hb.paramCount) {
+    sc.remap[hb.instsStart + i] = builderAddParam(sc.b, sc.f.instrs[hb.instsStart + i].ty)
+    i = i + 1
+  }
+  lp.limParamId = builderAddParam(sc.b, primType(sc.ctx, 3))
+  stripEmitHeaderConsts(sc, lp)
+  let cond = stripCmp(sc, Op.ICmpSlt, sc.remap[hb.instsStart + lp.ivIdx], lp.limParamId, span)
+  let br = sc.f.instrs[stripCmpIdx(sc.f, lp.header) + 1]
+  stripBr(sc, cond, sc.blockMap[br.ival], trList(sc.remap, br.thenArgs),
+    lp.olatch, stripHeaderArgs(sc, lp), span)
+  builderEndBlock(sc.b)
+}
+
+// One original block, rewritten. The header and the latch are the two that do
+// not translate straight through: the header is replaced wholesale by
+// `stripEmitHeader`, and the latch's `jump` must reach the INNER header with
+// the strip limit appended, where `blockMap` would send it to OUTER.
+fn stripEmitBlock(sc: StripCtx, bi: int, li: int, latchLi: int) {
+  if (li >= 0) {
+    stripEmitHeader(sc, li)
+    return
+  }
+  let blk = sc.f.blocks[bi]
+  builderBeginBlock(sc.b, sc.blockMap[bi])
+  let idx = blk.instsStart
+  let end = blk.instsStart + blk.instsLen
+  let paramsEnd = blk.instsStart + blk.paramCount
+  while (idx < paramsEnd) {
+    sc.remap[idx] = builderAddParam(sc.b, sc.f.instrs[idx].ty)
+    idx = idx + 1
+  }
+  while (idx < end) {
+    if (latchLi >= 0 && idx == end - 1) {
+      stripEmitLatchJump(sc, latchLi, sc.f.instrs[idx])
+    } else {
+      emitTranslated(sc.b, sc.f, sc.known, sc.remap, sc.blockMap, idx)
+    }
+    idx = idx + 1
+  }
+  builderEndBlock(sc.b)
+}
+
+// The latch's back edge, carrying the strip limit forward unchanged. The limit
+// is the inner header's own parameter, which dominates the latch, so passing it
+// straight back is what keeps it constant for the whole strip.
+fn stripEmitLatchJump(sc: StripCtx, li: int, jump: IrInstr) {
+  let lp = sc.loops[li]
+  stripJump(sc.b, lp.newHeader,
+    concatIds(trList(sc.remap, jump.args), [lp.limParamId]), jump.span)
+}
+
+// Marks every strip-mined header so both backends' `emitBackEdgeSafepointIfNeeded`
+// emits no poll on the edges into it. Rebuilt rather than mutated in place so
+// this does not depend on `IrBlock`'s assignment semantics.
+fn stripMarkHeaders(blocks: []IrBlock, loops: []StripLoop): []IrBlock {
+  let i = 0
+  while (i < len(loops)) {
+    let h = loops[i].newHeader
+    blocks[h] = IrBlock{ instsStart: blocks[h].instsStart,
+      paramCount: blocks[h].paramCount, instsLen: blocks[h].instsLen,
+      pollFreeHeader: true }
+    i = i + 1
+  }
+  return blocks
+}
+
+// Which loop (if any) opens at each emission position, and which closes there.
+// A loop is DROPPED when either slot is already taken: losing the outer latch
+// while keeping the poll-free header would leave an inner loop that never
+// polls at all, so a collision must not be resolved by last-write-wins.
+fn stripPlanSlots(loops: []StripLoop, order: []int, pos: []int): []StripLoop {
+  let pre = []int(0)
+  let post = []int(0)
+  let i = 0
+  while (i < len(order)) {
+    pre = append(pre, -1)
+    post = append(post, -1)
+    i = i + 1
+  }
+  let out = []StripLoop(0)
+  i = 0
+  while (i < len(loops)) {
+    let hp = pos[loops[i].header]
+    if (pre[hp] < 0 && post[loops[i].lastPos] < 0) {
+      pre[hp] = 1
+      post[loops[i].lastPos] = 1
+      out = append(out, loops[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Loop index by original block id, for the two roles a block can play.
+fn stripRoleMap(loops: []StripLoop, n: int, latches: bool): []int {
+  let out = []int(0)
+  let i = 0
+  while (i < n) {
+    out = append(out, -1)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(loops)) {
+    if (latches) {
+      out[loops[i].latch] = i
+    } else {
+      out[loops[i].header] = i
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Allocates every block id in FINAL EMISSION ORDER: the five outer-loop blocks
+// immediately before the header they wrap, and OLATCH immediately after the
+// last block of the loop. Ascending ids therefore mean ascending `instsStart`
+// on the way out, which is what makes OLATCH's edge to OUTER a back edge and
+// the inner latch's edge to the header a back edge, and what lets this pass be
+// the last thing that touches the function.
+fn stripAllocIds(sc: StripCtx, order: []int, headerOf: []int, closeAt: []int) {
+  let i = 0
+  while (i < len(order)) {
+    let li = headerOf[order[i]]
+    if (li >= 0) {
+      sc.loops[li].outer = builderNewBlock(sc.b)
+      sc.loops[li].guard = builderNewBlock(sc.b)
+      sc.loops[li].groom = builderNewBlock(sc.b)
+      sc.loops[li].wide = builderNewBlock(sc.b)
+      sc.loops[li].narrow = builderNewBlock(sc.b)
+      sc.loops[li].newHeader = builderNewBlock(sc.b)
+      sc.blockMap[order[i]] = sc.loops[li].outer
+    } else {
+      sc.blockMap[order[i]] = builderNewBlock(sc.b)
+    }
+    if (closeAt[i] >= 0) {
+      sc.loops[closeAt[i]].olatch = builderNewBlock(sc.b)
+    }
+    i = i + 1
+  }
+}
+
+fn stripEmitAll(sc: StripCtx, order: []int, headerOf: []int, latchOf: []int, closeAt: []int) {
+  let i = 0
+  while (i < len(order)) {
+    let li = headerOf[order[i]]
+    if (li >= 0) {
+      stripEmitOuter(sc, li)
+      stripEmitGuard(sc, li)
+      stripEmitGroom(sc, li)
+      stripEmitWide(sc, li)
+      stripEmitNarrow(sc, li)
+    }
+    stripEmitBlock(sc, order[i], li, latchOf[order[i]])
+    if (closeAt[i] >= 0) {
+      stripEmitOlatch(sc, closeAt[i])
+    }
+    i = i + 1
+  }
+}
+
+// `closeAt[p]` = the loop whose last block sits at emission position `p`.
+fn stripCloseMap(loops: []StripLoop, n: int): []int {
+  let out = []int(0)
+  let i = 0
+  while (i < n) {
+    out = append(out, -1)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(loops)) {
+    out[loops[i].lastPos] = i
+    i = i + 1
+  }
+  return out
+}
+
+// Pass 5 of `optimizeModule`, and the last thing that touches the function.
+// Returns `f` untouched when it has no strip-mineable loop, so the pass cannot
+// perturb a function it has no work in — the same contract `expandAppends` has,
+// and the reason the vast majority of the corpus dumps byte-identically.
+//
+// A `@naked` or `@nosplit` function is refused outright: SPEC section 10.3.1
+// says such a body polls no safepoint and this pass would emit a CALL into it
+// (GUARD's attention read). It also has nothing to gain — it emits no poll to
+// move.
+fn stripMine(ctx: TypeContext, f: IrFunc): IrFunc {
+  if (f.isNaked || f.isNosplit) {
+    return f
+  }
+  let pm = licmPredMap(f)
+  let order = blockEmissionOrder(f)
+  let pos = stripPositions(f, order)
+  let loops = stripPlanSlots(stripFindLoops(f, pm, order, pos), order, pos)
+  if (len(loops) == 0) {
+    return f
+  }
+  let sc = StripCtx{ b: newBuilder(), f: f, ctx: ctx,
+    remap: stripZeros(len(f.instrs)), blockMap: stripZeros(len(f.blocks)),
+    known: stripNoConsts(len(f.instrs)), loops: loops }
+  let headerOf = stripRoleMap(loops, len(f.blocks), false)
+  let latchOf = stripRoleMap(loops, len(f.blocks), true)
+  let closeAt = stripCloseMap(loops, len(order))
+  stripAllocIds(sc, order, headerOf, closeAt)
+  stripEmitAll(sc, order, headerOf, latchOf, closeAt)
+  return IrFunc{
+    name: f.name, paramTypes: f.paramTypes, result: f.result,
+    blocks: stripMarkHeaders(sc.b.blocks, loops), instrs: sc.b.instrs,
+    isFallible: f.isFallible, isNaked: f.isNaked, isNosplit: f.isNosplit,
+    inRootModule: f.inRootModule, isPinned: f.isPinned,
+  }
+}
+
+fn stripZeros(n: int): []int {
+  let out = []int(0)
+  let i = 0
+  while (i < n) {
+    out = append(out, 0)
+    i = i + 1
+  }
+  return out
+}
+
+fn stripNoConsts(n: int): []ConstVal {
+  let out = []ConstVal(0)
+  let i = 0
+  while (i < n) {
+    out = append(out, noConst())
+    i = i + 1
+  }
+  return out
+}
