@@ -1,0 +1,271 @@
+// The four hot `map<K,V>` entry points (SPEC §11.2, §13.5; ABI.md §15), split
+// out of `maps.bit` (#4352). Sibling file, same module — `maps.bit` keeps the
+// hash, the descriptor walks, the shared `mapProbe`, `mapGrow` and the rest of
+// the ABI surface.
+//
+// WHY THEY LIVE HERE. Each of these four used to be two out-of-line calls —
+// `mapHash(m, key)` re-loading `mapKeyDesc` to pick a hash, then
+// `mapProbe(m, key, h)` whose loop called `mapKeyEq(m, k, key)`, which loaded
+// `mapKeyDesc` and branched AGAIN, on every ctrl-tag hit. The key kind is a
+// property of the MAP, not of the probe step: it cannot change between two
+// iterations of one probe, so re-deciding it per step is pure overhead. Each
+// entry point now reads `mapKeyDesc` ONCE and, for the scalar case (`map<int,
+// V>`, `map<f64, V>`, `map<rune, V>`, C-like enums — everything whose identity
+// IS its word), runs the probe inline with `k == key` in place of the call.
+//
+// `string` and composite keys are unchanged: they fall through to the shared
+// `mapHash`/`mapProbe`/`mapKeyEq` path in `maps.bit`, which still dispatches
+// per step. Their per-key work (wyhash over the bytes, or a descriptor walk)
+// dwarfs one predictable branch, so specialising them would buy noise and cost
+// two more copies of this loop.
+//
+// THE FOUR SCALAR LOOPS BELOW ARE ONE ALGORITHM WRITTEN FOUR TIMES, and that is
+// the cost of removing the call: a helper holding it once would be a `bl`
+// again, and it is far past `maxInlineInsts()` (8) for the inliner to fold back.
+// They are in one file, adjacent, for the only mitigation available — a change
+// to probing, tombstones or the load factor has to be made in all five places
+// (these four and `mapProbe`), and `_tests_/cases/run_map_scalar_paths.bit`
+// drives all four through long probe chains, tombstone chains, reinsertion and
+// a resize. Each of the four arms was mutation-proven against it — a hash that
+// disagrees with `mapHash` by one in ANY of the four fails the fixture — so a
+// copy left behind is a red, not a map that silently loses one entry.
+//
+// The loops ARE `mapProbe` with the dispatch removed, not a new algorithm:
+// same `h & mask` start, same `mapCtrlTag` tag filter, same linear step, same
+// `steps < cap` bound, same "first tombstone else the empty slot that stopped
+// the walk" insert position. The three read-only entry points keep no tombstone
+// state at all — it only ever picks an INSERT slot, and they never insert.
+
+// Claims `slot` for a key not already present, and writes the entry. Shared by
+// `rtMapSet`'s two arms so the `used`/`len` accounting has ONE definition:
+// `used` counts slots consumed from EMPTY, so reusing a TOMB leaves it alone —
+// that is what makes tombstones cost capacity until the next grow rather than
+// forever.
+@nosplit fn mapClaimSlot(m: int, slot: int, tag: int, key: int, val: int) {
+  let ctrl = loadWord(m + mapCtrl)
+  if (loadByte(ctrl + slot) == ctrlEmpty) {
+    storeWord(m + mapUsed, loadWord(m + mapUsed) + 1)
+  }
+  storeByte(ctrl + slot, tag)
+  storeWord(m + mapLen, loadWord(m + mapLen) + 1)
+  storeWord(loadWord(m + mapKeys) + slot * 8, key)
+  storeWord(loadWord(m + mapVals) + slot * 8, val)
+}
+
+// The shared `m[key] = val` for a `string` or composite key: hash and probe
+// through `maps.bit`'s descriptor-dispatching path. A separate function, not an
+// arm of `rtMapSet`, so the exported entry point stays inside E0204's limit
+// while its scalar loop is inline; it is also where `rtMapSet`'s unreachable
+// loop exit lands, so that case has one answer rather than a restated copy.
+//
+// The key word is rewritten on a HIT as well as on an insert: two `string`
+// handles can be equal by bytes and distinct by address, and the map keeps the
+// most recently assigned one, which is what iteration then yields.
+@nosplit fn mapSetSlow(m: int, key: int, val: int) {
+  let h = mapHash(m, key)
+  let r = mapProbe(m, key, h)
+  let slot = mapProbeSlot(r)
+  if (mapProbeFound(r)) {
+    storeWord(loadWord(m + mapKeys) + slot * 8, key)
+    storeWord(loadWord(m + mapVals) + slot * 8, val)
+    return
+  }
+  mapClaimSlot(m, slot, mapCtrlTag(h), key, val)
+}
+
+// `bit_rt_map_set`: insert or overwrite `m[key] = val`.
+//
+// THE GROW TEST RUNS BEFORE THE PROBE, and the order
+// is observable: growing first means the slot the probe returns is a slot in the
+// NEW table. Probing first and then growing would insert at a stale index.
+// Reusing a TOMB keeps `used` unchanged — only an EMPTY slot is newly consumed,
+// which is what makes tombstones cost capacity until the next grow rather than
+// forever.
+export @nosplit @symbol("bit_rt_map_set") fn rtMapSet(m: int, key: int, val: int) {
+  if (m == 0) {
+    panicNilMapWrite()
+    return
+  }
+  let used = loadWord(m + mapUsed)
+  let vcap0 = loadWord(m + mapCap)
+  if ((used + 1) * mapLoadDen >= vcap0 * mapLoadNum) {
+    mapGrow(m)
+  }
+  if (loadWord(m + mapKeyDesc) == mapKeyScalar) {
+    let vcap = loadWord(m + mapCap)
+    let mask = vcap - 1
+    let ctrl = loadWord(m + mapCtrl)
+    let keys = loadWord(m + mapKeys)
+    let hs = scalarHash(u64(key))
+    let i = int(hs & u64(mask))
+    let tag = mapCtrlTag(hs)
+    let ins = -1 // the insert position: first TOMB, else the EMPTY that stops us
+    let steps = 0
+    // Bounded by `cap`: the load-factor ceiling guarantees an EMPTY slot exists.
+    while (steps < vcap) {
+      let c = loadByte(ctrl + i)
+      // EMPTY (0) and TOMB (1) are the only ctrl values below `ctrlFullBit`, so
+      // one compare separates "no key here" from "a key to check".
+      if (c < ctrlFullBit) {
+        if (ins < 0) {
+          ins = i
+        }
+        if (c == ctrlEmpty) {
+          mapClaimSlot(m, ins, tag, key, val)
+          return
+        }
+      } else if (c == tag) {
+        if (loadWord(keys + i * 8) == key) {
+          storeWord(loadWord(m + mapVals) + i * 8, val)
+          return
+        }
+      }
+      i = (i + 1) & mask
+      steps = steps + 1
+    }
+    // Unreachable (the load factor guarantees an EMPTY slot): fall through to
+    // the shared path below rather than restate its non-panicking answer here.
+  }
+  mapSetSlow(m, key, val)
+}
+
+// `bit_rt_map_get`: `m[key]`, or the zero word when absent (SPEC §11.2 — an
+// absent key reads as V's zero value). A nil map reads as empty.
+export @nosplit @symbol("bit_rt_map_get") fn rtMapGet(m: int, key: int): int {
+  if (m == 0) {
+    return 0
+  }
+  if (loadWord(m + mapLen) == 0) {
+    return 0
+  }
+  if (loadWord(m + mapKeyDesc) == mapKeyScalar) {
+    let vcap = loadWord(m + mapCap)
+    let mask = vcap - 1
+    let ctrl = loadWord(m + mapCtrl)
+    let keys = loadWord(m + mapKeys)
+    let h = scalarHash(u64(key))
+    let i = int(h & u64(mask))
+    let tag = mapCtrlTag(h)
+    let steps = 0
+    // Bounded by `cap`, as `mapProbe`'s loop is.
+    while (steps < vcap) {
+      let c = loadByte(ctrl + i)
+      if (c == ctrlEmpty) {
+        return 0
+      }
+      if (c == tag) {
+        if (loadWord(keys + i * 8) == key) {
+          return loadWord(loadWord(m + mapVals) + i * 8)
+        }
+      }
+      i = (i + 1) & mask
+      steps = steps + 1
+    }
+    // Unreachable; the shared path below gives the same answer.
+  }
+  let slot = mapProbe(m, key, mapHash(m, key))
+  if (!mapProbeFound(slot)) {
+    return 0
+  }
+  let v = loadWord(loadWord(m + mapVals) + slot * 8)
+  return v
+}
+
+// `bit_rt_map_slot`: the slot `key` occupies, or -1 when it is absent.
+//
+// The two-result read `let (v, ok) = m[k]` (SPEC §12.6) used to lower to
+// `bit_rt_map_get` followed by `bit_rt_map_has`: two exported calls that hashed
+// and probed the SAME key for one source expression, which #4019 measured at
+// 20.0% of `bench/cases/map`. This is the probe half of that read, done once —
+// `ok` is `slot >= 0`, and the value comes from `bit_rt_map_val_at`, which only
+// indexes and never probes.
+export @nosplit @symbol("bit_rt_map_slot") fn rtMapSlot(m: int, key: int): int {
+  if (m == 0) {
+    return -1
+  }
+  if (loadWord(m + mapLen) == 0) {
+    return -1
+  }
+  if (loadWord(m + mapKeyDesc) == mapKeyScalar) {
+    let vcap = loadWord(m + mapCap)
+    let mask = vcap - 1
+    let ctrl = loadWord(m + mapCtrl)
+    let keys = loadWord(m + mapKeys)
+    let h = scalarHash(u64(key))
+    let i = int(h & u64(mask))
+    let tag = mapCtrlTag(h)
+    let steps = 0
+    // Bounded by `cap`, as `mapProbe`'s loop is.
+    while (steps < vcap) {
+      let c = loadByte(ctrl + i)
+      if (c == ctrlEmpty) {
+        return -1
+      }
+      if (c == tag) {
+        if (loadWord(keys + i * 8) == key) {
+          return i
+        }
+      }
+      i = (i + 1) & mask
+      steps = steps + 1
+    }
+    // Unreachable; the shared path below gives the same answer.
+  }
+  let r = mapProbe(m, key, mapHash(m, key))
+  if (!mapProbeFound(r)) {
+    return -1
+  }
+  return r
+}
+
+// `bit_rt_map_delete`: `delete(m, key)` — a no-op if absent.
+//
+// Leaves a TOMBSTONE (reclaimed at the next grow) and DROPS THE SLOT'S KEY AND
+// VALUE WORDS. The drop is not tidiness: those words live in traced ref buffers,
+// so leaving them would keep a removed key or value reachable and unreclaimable
+// for the lifetime of the map.
+export @nosplit @symbol("bit_rt_map_delete") fn rtMapDelete(m: int, key: int) {
+  if (m == 0) {
+    return
+  }
+  if (loadWord(m + mapLen) == 0) {
+    return
+  }
+  if (loadWord(m + mapKeyDesc) == mapKeyScalar) {
+    let vcap = loadWord(m + mapCap)
+    let mask = vcap - 1
+    let ctrl = loadWord(m + mapCtrl)
+    let keys = loadWord(m + mapKeys)
+    let h = scalarHash(u64(key))
+    let i = int(h & u64(mask))
+    let tag = mapCtrlTag(h)
+    let steps = 0
+    // Bounded by `cap`, as `mapProbe`'s loop is.
+    while (steps < vcap) {
+      let c = loadByte(ctrl + i)
+      if (c == ctrlEmpty) {
+        return
+      }
+      if (c == tag) {
+        if (loadWord(keys + i * 8) == key) {
+          storeByte(ctrl + i, ctrlTomb)
+          storeWord(keys + i * 8, 0)
+          storeWord(loadWord(m + mapVals) + i * 8, 0)
+          storeWord(m + mapLen, loadWord(m + mapLen) - 1)
+          return
+        }
+      }
+      i = (i + 1) & mask
+      steps = steps + 1
+    }
+    // Unreachable; the shared path below gives the same answer.
+  }
+  let slot = mapProbe(m, key, mapHash(m, key))
+  if (!mapProbeFound(slot)) {
+    return
+  }
+  storeByte(loadWord(m + mapCtrl) + slot, ctrlTomb)
+  storeWord(loadWord(m + mapKeys) + slot * 8, 0)
+  storeWord(loadWord(m + mapVals) + slot * 8, 0)
+  storeWord(m + mapLen, loadWord(m + mapLen) - 1)
+}
