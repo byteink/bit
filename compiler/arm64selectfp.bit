@@ -1,0 +1,196 @@
+// Self-host Stage 3 (#1342): the AArch64 backend, integer/float comparisons,
+// binary float arithmetic, and constant-materialization selectors (icmpCond
+// through emitConstFloat). Split out of compiler/arm64select.bit at 795 lines
+// against the 800-line limit (#4322) — same module, so nothing here is
+// imported. Mirrors compiler/arm64selectovf.bit's and
+// compiler/arm64selectmem.bit's earlier splits of the same file.
+//
+// Named to sort after compiler/arm64select.bit — module files concatenate in
+// bytewise filename order (compiler/project.bit:7).
+
+fn icmpCond(op: Op): int {
+  if (op == Op.ICmpEq) {
+    return condEq()
+  }
+  if (op == Op.ICmpNe) {
+    return condNe()
+  }
+  if (op == Op.ICmpSlt) {
+    return condLt()
+  }
+  if (op == Op.ICmpSle) {
+    return condLe()
+  }
+  if (op == Op.ICmpSgt) {
+    return condGt()
+  }
+  if (op == Op.ICmpSge) {
+    return condGe()
+  }
+  if (op == Op.ICmpUlt) {
+    return condCc()
+  }
+  if (op == Op.ICmpUle) {
+    return condLs()
+  }
+  if (op == Op.ICmpUgt) {
+    return condHi()
+  }
+  assert(op == Op.ICmpUge)
+  return condCs()
+}
+
+fn emitIcmp(cx: A64Ctx, op: Op, dst: int, lhs: int, rhs: int) {
+  let l = getInt(cx, vregOf(cx, lhs), scratch1())
+  let r = getInt(cx, vregOf(cx, rhs), scratch2())
+  // #3843: the `br` immediately after this one branches on NZCV directly, so
+  // the flags ARE the result — no destination is bound and nothing is spilled.
+  // `cmp` is deliberately the last thing emitted here (arm64branch.bit).
+  if (cx.fuseCmp[dst]) {
+    cmpRR(cx.code, l, r)
+    return
+  }
+  // `cset` reads only NZCV, and the `cmp` that sets them has already consumed
+  // both operands, so writing the destination here cannot clobber a live read.
+  let d = destInt(cx, dst, scratch1())
+  cmpRR(cx.code, l, r)
+  cset(cx.code, d, icmpCond(op))
+  putInt(cx, dst, d)
+}
+
+// AArch64's FCMP sets NZCV such that the *plain* EQ/NE/GT/GE condition codes are
+// already correct for IEEE-754 ordered comparisons (false on any NaN, except NE
+// which is true) — but "less than" and "less than or equal" are NOT LT/LE (those
+// would be true on an unordered NaN compare, an ARM-specific gotcha every AArch64
+// backend must special-case): use MI and LS instead. Same mapping LLVM's AArch64
+// backend uses.
+fn fcmpCond(op: Op): int {
+  if (op == Op.FCmpEq) {
+    return condEq()
+  }
+  if (op == Op.FCmpNe) {
+    return condNe()
+  }
+  if (op == Op.FCmpGt) {
+    return condGt()
+  }
+  if (op == Op.FCmpGe) {
+    return condGe()
+  }
+  if (op == Op.FCmpLt) {
+    return condMi()
+  }
+  assert(op == Op.FCmpLe)
+  return condLs()
+}
+
+fn emitFcmp(cx: A64Ctx, op: Op, dst: int, lhs: int, rhs: int, width: int) {
+  let l = getFloat(cx, vregOf(cx, lhs), fscratch1())
+  let r = getFloat(cx, vregOf(cx, rhs), fscratch2())
+  // #3843, same as emitIcmp: fused, `fcmp` is the whole lowering.
+  if (cx.fuseCmp[dst]) {
+    fcmp(cx.code, l, r, width)
+    return
+  }
+  // Int destination, float operands: no aliasing is even possible across the
+  // two register files, and `fcmp` has consumed both before `cset` writes.
+  let d = destInt(cx, dst, scratch1())
+  fcmp(cx.code, l, r, width)
+  cset(cx.code, d, fcmpCond(op))
+  putInt(cx, dst, d)
+}
+
+fn emitBinaryFloat(cx: A64Ctx, op: FArithOp, dst: int, lhs: int, rhs: int, width: int) {
+  let l = getFloat(cx, vregOf(cx, lhs), fscratch1())
+  let r = getFloat(cx, vregOf(cx, rhs), fscratch2())
+  let d = destFloat(cx, dst, fscratch1())
+  fArithRR(cx.code, fArithOpcode(op), d, l, r, width)
+  putFloat(cx, dst, d)
+}
+
+fn emitFneg(cx: A64Ctx, dst: int, operand: int, width: int) {
+  let v = getFloat(cx, vregOf(cx, operand), fscratch1())
+  let d = destFloat(cx, dst, fscratch1())
+  fnegF(cx.code, d, v, width)
+  putFloat(cx, dst, d)
+}
+
+// `fsqrt(x)` — one instruction, no call.
+fn emitFsqrt(cx: A64Ctx, dst: int, operand: int, width: int) {
+  let v = getFloat(cx, vregOf(cx, operand), fscratch1())
+  let d = destFloat(cx, dst, fscratch1())
+  fsqrtF(cx.code, d, v, width)
+  putFloat(cx, dst, d)
+}
+
+// `ffloor`/`fceil`/`ftrunc`/`fround` — one FRINT each. See `frintF` for why
+// `fround` is FRINTA and not FRINTN.
+fn emitFRound(cx: A64Ctx, dst: int, operand: int, width: int, opcode: int) {
+  let v = getFloat(cx, vregOf(cx, operand), fscratch1())
+  let d = destFloat(cx, dst, fscratch1())
+  frintF(cx.code, opcode, d, v, width)
+  putFloat(cx, dst, d)
+}
+
+// A register-class transfer, not a conversion: FMOV moves the bits verbatim in
+// whichever direction the result type asks for. Float -> int is `floatBits`/
+// `float32Bits`; int -> float is the read half of the container word ABI, which
+// turns the `u64` a runtime primitive hands back in x0 into the `f64`/`f32` the
+// element is. `width` is the FLOAT side's width in both directions. FMOV Wd, Sn
+// writes the 32-bit W view, which zero-extends into X.
+fn emitBitcast(cx: A64Ctx, dst: int, operand: int, width: int, dstIsFloat: bool) {
+  if (dstIsFloat) {
+    let iv = getInt(cx, vregOf(cx, operand), scratch1())
+    let d = destFloat(cx, dst, fscratch1())
+    fmovToFp(cx.code, d, iv, width)
+    putFloat(cx, dst, d)
+    return
+  }
+  let v = getFloat(cx, vregOf(cx, operand), fscratch1())
+  let d = destInt(cx, dst, scratch1())
+  fmovFromFp(cx.code, d, v, width)
+  putInt(cx, dst, d)
+}
+
+// The constant materializers have no operands at all, so the destination is
+// unconditionally safe to write into: `movImm64`'s MOVZ/MOVK chain only ever
+// writes its target.
+fn emitConstInt(cx: A64Ctx, dst: int, val: int) {
+  let d = destInt(cx, dst, scratch1())
+  movImm64(cx.code, d, val)
+  putInt(cx, dst, d)
+}
+
+fn emitConstBool(cx: A64Ctx, dst: int, val: bool) {
+  let v = 0
+  if (val) {
+    v = 1
+  }
+  let d = destInt(cx, dst, scratch1())
+  movImm64(cx.code, d, v)
+  putInt(cx, dst, d)
+}
+
+fn emitConstNil(cx: A64Ctx, dst: int) {
+  let d = destInt(cx, dst, scratch1())
+  movImm64(cx.code, d, 0)
+  putInt(cx, dst, d)
+}
+
+// A float constant has no wide-immediate form: materialize its bit pattern in a
+// GPR and move that across to the FP register file. floatBits/float32Bits are
+// runtime primitives because Bit has no bitcast and its numeric conversions
+// truncate; float32Bits also does the f64 -> f32 rounding, which cannot be
+// derived from the f64 bits by arithmetic.
+fn emitConstFloat(cx: A64Ctx, dst: int, val: f64, width: int) {
+  // The bit pattern stays in the int scratch — `d` is a float register.
+  let d = destFloat(cx, dst, fscratch1())
+  if (width == 8) {
+    movImm64(cx.code, scratch1(), i64(floatBits(val)))
+    fmovToFp(cx.code, d, scratch1(), 8)
+  } else {
+    movImm64(cx.code, scratch1(), i64(u64(float32Bits(f32(val)))))
+    fmovToFp(cx.code, d, scratch1(), 4)
+  }
+  putFloat(cx, dst, d)
+}
