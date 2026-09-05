@@ -62,16 +62,53 @@ const wySecret3: u64 = 0x589965cc75374cc3
   return lo ^ hi
 }
 
-// `n` little-endian bytes at `addr`, zero-extended. `n <= 8`.
-@nosplit fn readLe(addr: int, n: int): u64 {
-  let v: u64 = 0
-  let i = 0
-  while (i < n) {
-    let b = loadByte(addr + i)
-    v = v | (u64(b) << u64(i * 8))
-    i = i + 1
+// The 8 (`loadLe8`) or 4 (`loadLe4`) little-endian bytes at `addr`,
+// zero-extended. One instruction each, and the address needs NO alignment.
+//
+// WHY NOT `loadWord`. `runtime/gc/mem.bit`'s `loadWord` MASKS its argument to an
+// 8-byte boundary — it is `nil + (addr >> 3)` on a `*i64`, so the low three bits
+// are shifted out — and an unaligned call to it silently returns a DIFFERENT
+// eight bytes rather than faulting. A wrong hash is not a crash: it is a map
+// that loses entries. Bit has no unaligned word load at all, because §11.4
+// admits no pointer-to-pointer conversion, so there is no way to spell one in
+// the language. §11.6 `asm` is the construct for that, and it removes the
+// alignment question entirely instead of guarding it: no `(addr & 7) == 0` fast
+// path, no byte-loop fallback, one code path.
+//
+// BOTH TARGETS PERMIT THE UNALIGNED ACCESS. AArch64 allows unaligned loads to
+// Normal memory for non-exclusive, non-atomic instructions when SCTLR_ELx.A is
+// clear, which is how both Darwin and Linux run userspace; x86-64 has always
+// allowed an unaligned `mov`. `ldr`/`mov` are exactly those instructions.
+//
+// BOTH TARGETS ARE LITTLE-ENDIAN, so the loaded word IS the byte loop's value,
+// bit for bit — the supported triples are aarch64-{macos,linux} and
+// x86_64-{linux,windows} and nothing else, and big-endian is not a target
+// (runtime/ABI.md). On a big-endian host these would have to go back to the byte
+// loop; there is no such host to port to.
+//
+// Encodings hand-verified against `clang -c` + `objdump -d`, per §11.6:
+//   arm64   ldr x0, [x1]     f9400020      ldr w0, [x1]    b9400020
+//   x64     mov rax, [rcx]   48 8b 01      mov eax, [rcx]  8b 01
+// `ldr w`/`mov e` zero the upper 32 bits, which is the zero-extension the
+// 4-byte form needs.
+//
+// EVERY CALLER'S BOUND IS CHECKED AT THE CALL SITE, not here — see `wyhash`.
+@nosplit fn loadLe8(addr: int): u64 {
+  return asm {
+    arm64 { 0xf9400020 }
+    x64 { 0x48, 0x8b, 0x01 }
+    result arm64 x0 x64 rax : u64
+    input arm64 x1 x64 rcx = addr
   }
-  return v
+}
+
+@nosplit fn loadLe4(addr: int): u64 {
+  return asm {
+    arm64 { 0xb9400020 }
+    x64 { 0x8b, 0x01 }
+    result arm64 x0 x64 rax : u64
+    input arm64 x1 x64 rcx = addr
+  }
 }
 
 // Wyhash over the `len` bytes at `addr`, seed 0 — the exact call `runtime/root/`'s
@@ -92,8 +129,12 @@ const wySecret3: u64 = 0x589965cc75374cc3
     if (vlen >= 4) {
       let end = vlen - 4
       let quarter = (vlen >> 3) << 2
-      a = (readLe(addr, 4) << 32) | readLe(addr + quarter, 4)
-      b = (readLe(addr + end, 4) << 32) | readLe(addr + end - quarter, 4)
+      // Four 4-byte reads, every one inside [addr, addr+vlen): `quarter` is 0,
+      // 4 or 8 and is 4 only when vlen >= 8 and 8 only when vlen >= 16, so
+      // `quarter + 4 <= vlen`; `end + 4 == vlen`; and `end - quarter >= 0`
+      // because `quarter <= end` on the same case split.
+      a = (loadLe4(addr) << 32) | loadLe4(addr + quarter)
+      b = (loadLe4(addr + end) << 32) | loadLe4(addr + end - quarter)
     } else if (vlen > 0) {
       let c0 = loadByte(addr)
       let c1 = loadByte(addr + (vlen >> 1))
@@ -108,15 +149,17 @@ const wySecret3: u64 = 0x589965cc75374cc3
     let i = 0
     if (vlen >= 48) {
       // round(): three independent lanes per 48-byte block.
+      // `i + 48 < vlen` bounds the whole block: the last read starts at
+      // `i + 40` and ends at `i + 48`, which is inside the input.
       while (i + 48 < vlen) {
-        let r0 = readLe(addr + i + 0, 8)
-        let r1 = readLe(addr + i + 8, 8)
+        let r0 = loadLe8(addr + i + 0)
+        let r1 = loadLe8(addr + i + 8)
         s0 = wyMix(r0 ^ wySecret1, r1 ^ s0)
-        let r2 = readLe(addr + i + 16, 8)
-        let r3 = readLe(addr + i + 24, 8)
+        let r2 = loadLe8(addr + i + 16)
+        let r3 = loadLe8(addr + i + 24)
         s1 = wyMix(r2 ^ wySecret2, r3 ^ s1)
-        let r4 = readLe(addr + i + 32, 8)
-        let r5 = readLe(addr + i + 40, 8)
+        let r4 = loadLe8(addr + i + 32)
+        let r5 = loadLe8(addr + i + 40)
         s2 = wyMix(r4 ^ wySecret3, r5 ^ s2)
         i = i + 48
       }
@@ -125,14 +168,17 @@ const wySecret3: u64 = 0x589965cc75374cc3
     }
     // final1, with `start_pos = i` over the whole input.
     let j = i
+    // `j + 16 < vlen` puts the second read's last byte at `j + 15 < vlen`.
     while (j + 16 < vlen) {
-      let x = readLe(addr + j, 8)
-      let y = readLe(addr + j + 8, 8)
+      let x = loadLe8(addr + j)
+      let y = loadLe8(addr + j + 8)
       s0 = wyMix(x ^ wySecret1, y ^ s0)
       j = j + 16
     }
-    a = readLe(addr + vlen - 16, 8)
-    b = readLe(addr + vlen - 8, 8)
+    // This arm is `vlen > 16`, so both reads start at or after `addr` and the
+    // second ends exactly at `addr + vlen`.
+    a = loadLe8(addr + vlen - 16)
+    b = loadLe8(addr + vlen - 8)
   }
 
   // final2
