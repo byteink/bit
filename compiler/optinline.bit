@@ -60,9 +60,9 @@ fn funcIndexByName(funcs: []IrFunc, name: string): int {
   return -1
 }
 
-// A callee is inlinable when it is straight-line code under budget: exactly one
-// block (no branches to re-target, so splicing needs no CFG surgery), terminated
-// by a plain `ret` (not `unreachable`, so there is always a value to substitute),
+// A callee is inlinable when it is an ACYCLIC body under budget: every block
+// leaves by `jump`, `br` or `ret` and every `jump`/`br` goes forward
+// (calleeShapeOk), with at least one `ret` so there is a value to substitute,
 // not fallible (keeps error propagation out of this pass), and not the caller
 // itself (never inline a self-call). It must also not carry another module's
 // MODULE STATE into this one — see importsForeignState (#1630) — and neither
@@ -90,27 +90,108 @@ fn funcIndexByName(funcs: []IrFunc, name: string): int {
 //
 // @nosplit is deliberately NOT refused. It only suppresses the BACK-EDGE
 // safepoint (codegen.bit's needsNoSafepoints), and an inlinable callee is
-// single-block straight-line code with no back edge — so splicing it neither
-// introduces a poll into nosplit code nor removes one from a caller that keeps
-// its own back edges. Refusing it would also disable inlining across the whole
-// runtime, where §17.6 makes every function @nosplit.
+// ACYCLIC — calleeShapeOk refuses a back edge outright, see calleeExitOk for
+// why that refusal is load-bearing rather than conservative — so splicing it
+// neither introduces a poll into nosplit code nor removes one from a caller
+// that keeps its own back edges. Refusing it would also disable inlining
+// across the whole runtime, where §17.6 makes every function @nosplit.
 //
 // Both functions are read from `snap`, the pre-inlining snapshot (#3163): the
 // budget must be spent against the callee's ORIGINAL body, or eligibility would
 // depend on how much that callee had already absorbed by the time this caller
 // was reached — which is exactly the filename-ordering bug.
-// True if `g`'s own shape is inlinable, independent of the call site: exactly
-// one block (no branches to re-target, so splicing needs no CFG surgery) and
-// terminated by a plain `ret` (not `unreachable`, so there is always a value
-// to substitute), and not fallible (keeps error propagation out of this
-// pass). Split out of inlineEligible to keep it under E0204's complexity
-// ceiling once the #3755 arity check was added.
-fn calleeShapeOk(g: IrFunc): bool {
-  if (len(g.blocks) != 1 || g.isFallible) {
+// True if block `bi` of `g` leaves the block in a way a splice can reproduce:
+// a `ret` (which becomes a jump into the join block), or a `jump`/`br` to a
+// LATER block.
+//
+// "Later" is the acyclicity test, and it is a block-id comparison because a
+// snapshot function's block ids ascend with its linear schedule — `rebuild`
+// (optrebuild.bit) reserves blocks in `blockEmissionOrder` and every callee
+// here comes out of phase 1's fold+DCE, so `target <= bi` is exactly a back
+// edge. Same rule as codegen.bit's `isBackEdge`.
+//
+// #4344: REFUSING A LOOP IS WHAT KEEPS THE @nosplit REASONING BELOW TRUE.
+// §10.3.1 @nosplit suppresses only the BACK-EDGE safepoint poll, so it is a
+// property of the loops a function contains, not of its call sites. Splice a
+// LOOPING callee and that stops composing in both directions: a @nosplit
+// caller swallowing a polling callee's loop silently deletes the poll (the
+// collector then waits on a thread that never reaches a safepoint), and a
+// polling caller swallowing a @nosplit callee's loop silently adds one to code
+// that declared it must not have one. An acyclic callee introduces no back
+// edge at all, so it neither adds nor removes a poll and the attribute keeps
+// meaning what it says — a refusal on the DATA SHAPE rather than a pairwise
+// attribute rule at the call site.
+//
+// `unreachable` is refused with everything else by falling off the end: there
+// is no join edge to build from a block that never leaves.
+fn calleeExitOk(g: IrFunc, bi: int): bool {
+  let blk = g.blocks[bi]
+  // An empty block has no terminator, and `instsStart + instsLen - 1` would
+  // name the instruction BEFORE it — index -1 for block 0 (opt.bit's
+  // `computeReachable` guards the same read for the same reason).
+  if (blk.instsLen == 0) {
     return false
   }
-  let b = g.blocks[0]
-  return g.instrs[b.instsStart + b.instsLen - 1].op == Op.Ret
+  let t = g.instrs[blk.instsStart + blk.instsLen - 1]
+  if (t.op == Op.Ret) {
+    return true
+  }
+  if (t.op == Op.Jump) {
+    return t.ival > bi
+  }
+  if (t.op == Op.Br) {
+    return t.ival > bi && t.ival2 > bi
+  }
+  return false
+}
+
+// True if `g`'s own shape is inlinable, independent of the call site: an
+// ACYCLIC body every one of whose blocks leaves by `ret`, `jump` or `br`
+// (`calleeExitOk`), with at least one `ret` so there is a value to substitute
+// and an edge for the join block to receive, and not fallible (keeps error
+// propagation out of this pass). Split out of inlineEligible to keep it under
+// E0204's complexity ceiling once the #3755 arity check was added.
+//
+// #4344 lifted the old `len(g.blocks) != 1` refusal. One block meant the
+// splice needed no CFG surgery at all, and the cost was that `&&`, `||` and a
+// single early `return` — which lower to two blocks each — put a function
+// permanently out of reach: `runtime/root/root.bit`'s `strSize` (`if (s == 0)
+// { return 0 }; return loadWord(...)`) was 33 `bl`s and `strBytes` 41 in
+// `runtime_root.o` alone, and `stdlib/json/lex.bit`'s `isDigit`
+// (`c >= '0' && c <= '9'`) was a call per character scanned.
+fn calleeShapeOk(g: IrFunc): bool {
+  if (g.isFallible || len(g.blocks) == 0) {
+    return false
+  }
+  let rets = 0
+  let i = 0
+  while (i < len(g.blocks)) {
+    if (!calleeExitOk(g, i)) {
+      return false
+    }
+    let blk = g.blocks[i]
+    if (g.instrs[blk.instsStart + blk.instsLen - 1].op == Op.Ret) {
+      rets = rets + 1
+    }
+    i = i + 1
+  }
+  return rets > 0
+}
+
+// The size a splice of `g` costs, in instructions actually emitted: every
+// block's body, excluding its params (they bind to already-emitted values or
+// become block params of a block that is minted either way) and its terminator
+// (a `ret` becomes a jump, a `jump`/`br` is copied — either way one branch the
+// call it replaces was paying for anyway, plus the `bl`, the prologue and the
+// epilogue this deletes).
+fn calleeInstCount(g: IrFunc): int {
+  let n = 0
+  let i = 0
+  while (i < len(g.blocks)) {
+    n = n + g.blocks[i].instsLen - g.blocks[i].paramCount - 1
+    i = i + 1
+  }
+  return n
 }
 
 fn inlineEligible(
@@ -144,8 +225,7 @@ fn inlineEligible(
   if (importsForeignCall(snap, f, g)) {
     return false
   }
-  let b = g.blocks[0]
-  return b.instsLen - b.paramCount - 1 <= maxInlineInsts()
+  return calleeInstCount(g) <= maxInlineInsts()
 }
 
 // True if splicing `callee` into `caller` would move a reference to a module
@@ -257,28 +337,37 @@ fn importsForeignCall(snap: []IrFunc, caller: IrFunc, callee: IrFunc): bool {
   return false
 }
 
-// Splices `g`'s single block into `b`'s currently open block: `g`'s params bind
-// directly to the already-translated call `args`, its body is emitted in place
-// (no folding, no block retargeting — `g` has exactly one block and its only
-// terminator is the `ret`, which is read separately rather than spliced).
-// Returns the value the call site now yields.
+// What one `inlineCalls` run never changes: the builder every block is emitted
+// into, the module and the pre-inlining snapshot eligibility is judged against,
+// and the ORIGINAL caller's index. `callerIdx` stays the original caller at
+// every nesting level because that is who the instructions end up belonging
+// to: it is the function inlineEligible must test for self-inlining, and whose
+// module identity importsForeignState compares a nested callee's globals
+// against.
+class InlineCtx {
+  b: IrBuilder,
+  m: IrModule,
+  snap: []IrFunc,
+  callerIdx: int,
+}
+
+// The per-function tables a walk translates through: `remap` old value id ->
+// new, `noFold` the neutral constant map emitTranslated needs (this pass folds
+// nothing), `blockMap` old block id -> the builder block minted for it.
 //
-// `depth` is how many callee bodies deep this splice already is (1 for a call
-// written in the caller's own source). A `Call` inside `g` is spliced too, up
-// to maxInlineDepth() (#3163) — without that, the instructions this function
-// emits would never be re-examined by anyone: `inlineCalls` walks the OLD
-// function's instruction list, so a call carried in on a spliced body used to
-// survive to codegen no matter how trivial its callee was.
-//
-// `callerIdx` stays the ORIGINAL caller at every level, because that is who the
-// instructions end up belonging to: it is the function inlineEligible must test
-// for self-inlining and whose module identity importsForeignState must compare
-// a nested callee's globals against.
-fn spliceCallee(
-  b: IrBuilder, m: IrModule, snap: []IrFunc, callerIdx: int,
-  g: IrFunc, args: []int, depth: int,
-): int {
-  let blk = g.blocks[0]
+// `join` is the block every `ret` jumps to, and the block the caller goes on
+// emitting into once the splice is done. It is -1 for the CALLER's own state
+// and for a single-block callee, and `spliceTerm` reads that as "this
+// function's `ret`s are real `ret`s" — one flag instead of two walks.
+class SpliceState {
+  remap: []int,
+  noFold: []ConstVal,
+  blockMap: []int,
+  join: int,
+}
+
+// `remap` and `noFold` sized to `g`, with no block mapped yet.
+fn newSpliceState(g: IrFunc): SpliceState {
   let remap = []int(0)
   let noFold = []ConstVal(0)
   let i = 0
@@ -287,41 +376,197 @@ fn spliceCallee(
     noFold = append(noFold, noConst())
     i = i + 1
   }
-  // Never indexed: inlineEligible guarantees the only terminator is the `ret`
-  // excluded below, so no jump/br inside the spliced range reads this.
-  let dummyBlockMap = [0]
-  let idx = blk.instsStart
-  let paramsEnd = blk.instsStart + blk.paramCount
-  let p = 0
-  while (idx < paramsEnd) {
-    remap[idx] = args[p]
-    p = p + 1
-    idx = idx + 1
+  return SpliceState{
+    remap: remap, noFold: noFold, blockMap: []int(0), join: -1,
   }
+}
+
+// The caller's own state: one fresh builder block per block of `f`, reserved up
+// front and in order, so the caller's ids ascend with its linear schedule and a
+// forward `jump`/`br` target is already mapped when its terminator is emitted.
+fn callerState(ic: InlineCtx, f: IrFunc): SpliceState {
+  let st = newSpliceState(f)
+  let i = 0
+  while (i < len(f.blocks)) {
+    st.blockMap = append(st.blockMap, builderNewBlock(ic.b))
+    i = i + 1
+  }
+  return st
+}
+
+// A callee's state. The ENTRY block is merged into the caller's currently-open
+// block — its params bind straight to the call's arguments and its body
+// continues where the call was — so it gets no block of its own; -1 rather than
+// 0 so a stray read crashes instead of silently branching to the caller's
+// entry. calleeShapeOk refuses any edge back to block 0, so nothing reads it.
+//
+// Every other block gets one, and a multi-block callee gets the join block its
+// `ret`s jump to. These ids do NOT ascend with the linear schedule — they are
+// minted mid-block and land after every caller block — and that is safe for the
+// same reason optappend.bit's are: `optimizeModule` runs `foldConstantsAndPrune`
+// after this pass, and its `rebuild` renumbers blocks into `blockEmissionOrder`,
+// which is the invariant `isBackEdge` and the x64 interval numbering assume.
+// optloop.bit already handles un-renumbered input explicitly (its `lc.pos` is
+// computed from `blockEmissionOrder`, not from the raw ids) and refuses rather
+// than mis-detects. Do not move this pass after that fold.
+fn calleeState(ic: InlineCtx, g: IrFunc): SpliceState {
+  let st = newSpliceState(g)
+  st.blockMap = append(st.blockMap, -1)
+  let i = 1
+  while (i < len(g.blocks)) {
+    st.blockMap = append(st.blockMap, builderNewBlock(ic.b))
+    i = i + 1
+  }
+  if (len(g.blocks) > 1) {
+    st.join = builderNewBlock(ic.b)
+  }
+  return st
+}
+
+// Emits block `bi`'s params as params of the currently open builder block.
+fn spliceBlockParams(ic: InlineCtx, g: IrFunc, st: SpliceState, bi: int) {
+  let blk = g.blocks[bi]
+  let i = 0
+  while (i < blk.paramCount) {
+    let p = blk.instsStart + i
+    st.remap[p] = builderAddParam(ic.b, g.instrs[p].ty)
+    i = i + 1
+  }
+}
+
+// True if instruction `idx` of `g` was an eligible `Call` and was spliced in
+// place of being emitted. `depth` is how many callee bodies deep the splice
+// already is (0 for a call written in the caller's own source), bounded by
+// maxInlineDepth() (#3163) — without that bound the instructions a splice emits
+// would never be re-examined by anyone, since `inlineCalls` walks the OLD
+// function's instruction list and a call carried in on a spliced body would
+// survive to codegen no matter how trivial its callee was.
+fn spliceNested(
+  ic: InlineCtx, g: IrFunc, st: SpliceState, idx: int, depth: int,
+): bool {
+  let ins = g.instrs[idx]
+  if (ins.op != Op.Call || depth >= maxInlineDepth()) {
+    return false
+  }
+  let calleeIdx = funcIndexByName(ic.snap, ins.name)
+  if (!inlineEligible(ic.m, ic.snap, ic.callerIdx, calleeIdx, len(ins.args))) {
+    return false
+  }
+  st.remap[idx] = spliceCallee(
+    ic, ic.snap[calleeIdx], trList(st.remap, ins.args), depth + 1,
+  )
+  return true
+}
+
+// Emits block `bi`'s body — everything after its params and before its
+// terminator — into the currently open builder block, splicing an eligible
+// call rather than emitting it.
+fn spliceBlockBody(
+  ic: InlineCtx, g: IrFunc, st: SpliceState, bi: int, depth: int,
+) {
+  let blk = g.blocks[bi]
+  let idx = blk.instsStart + blk.paramCount
   let last = blk.instsStart + blk.instsLen - 1
   while (idx < last) {
-    let ins = g.instrs[idx]
-    let spliced = false
-    if (ins.op == Op.Call && depth < maxInlineDepth()) {
-      let calleeIdx = funcIndexByName(snap, ins.name)
-      if (inlineEligible(m, snap, callerIdx, calleeIdx, len(ins.args))) {
-        remap[idx] = spliceCallee(
-          b, m, snap, callerIdx, snap[calleeIdx],
-          trList(remap, ins.args), depth + 1,
-        )
-        spliced = true
-      }
-    }
-    if (!spliced) {
-      emitTranslated(b, g, noFold, remap, dummyBlockMap, idx)
+    if (!spliceNested(ic, g, st, idx, depth)) {
+      emitTranslated(ic.b, g, st.noFold, st.remap, st.blockMap, idx)
     }
     idx = idx + 1
   }
-  let ret = g.instrs[last]
-  if (len(ret.args) == 0) {
+}
+
+// Emits block `bi`'s terminator into the currently open builder block.
+//
+// In a spliced callee (`st.join >= 0`) a `ret` is not a `ret` any more: it is
+// the edge that carries the callee's result out to the one block the caller
+// resumes in, so it becomes `jump join(v)` and the value arrives as the join
+// block's param. Every other terminator — and every terminator of the caller
+// itself, which has no join block — is translated like any other instruction,
+// through `st.blockMap`.
+fn spliceTerm(ic: InlineCtx, g: IrFunc, st: SpliceState, bi: int) {
+  let blk = g.blocks[bi]
+  let last = blk.instsStart + blk.instsLen - 1
+  let t = g.instrs[last]
+  if (t.op != Op.Ret || st.join < 0) {
+    emitTranslated(ic.b, g, st.noFold, st.remap, st.blockMap, last)
+    return
+  }
+  let j = mkInstr(Op.Jump, t.ty)
+  j.ival = st.join
+  j.args = trList(st.remap, t.args)
+  // #3282: the jump stands in for this `ret`, so it keeps the `ret`'s span.
+  j.span = t.span
+  builderEmit(ic.b, j)
+}
+
+// The result the join block must carry: the `ret` args of `g`'s first returning
+// block. calleeShapeOk guarantees there is one. Read off the IR rather than
+// from `g.result` so the join param's type is literally the type of a value the
+// callee returns, with no assumption about how a void result is spelled.
+fn calleeRetArgs(g: IrFunc): []int {
+  let i = 0
+  while (i < len(g.blocks)) {
+    let blk = g.blocks[i]
+    let t = g.instrs[blk.instsStart + blk.instsLen - 1]
+    if (t.op == Op.Ret) {
+      return t.args
+    }
+    i = i + 1
+  }
+  return []int(0)
+}
+
+// Splices `g` into the builder's currently open block and returns the value the
+// call site now yields.
+//
+// A SINGLE-BLOCK callee is emitted straight into the open block: its params
+// bind to the already-translated `args`, its body follows the call site's own
+// instructions, and its `ret` is READ rather than emitted — the caller's block
+// is never closed and nothing about the CFG changes. That path is unchanged
+// from before #4344 and is kept separate on purpose: it is the overwhelming
+// majority of splices, and giving it a join block would cost every one of them
+// a block and a jump for a value that is already in hand.
+//
+// A MULTI-BLOCK callee closes the caller's block with the entry block's own
+// terminator, emits the rest of the callee's blocks, then opens the join block
+// and leaves it open — so the caller resumes there and its next instruction
+// lands in the join block, exactly as if the call had returned. Every `ret`
+// becomes an edge into that block (`spliceTerm`) and the result arrives as its
+// block param, which is how a `ret` on two different paths stays one value
+// without any phi construction of our own.
+fn spliceCallee(ic: InlineCtx, g: IrFunc, args: []int, depth: int): int {
+  let st = calleeState(ic, g)
+  let blk = g.blocks[0]
+  let i = 0
+  while (i < blk.paramCount) {
+    st.remap[blk.instsStart + i] = args[i]
+    i = i + 1
+  }
+  spliceBlockBody(ic, g, st, 0, depth)
+  if (st.join < 0) {
+    let ret = g.instrs[blk.instsStart + blk.instsLen - 1]
+    if (len(ret.args) == 0) {
+      return 0 // void callee: the result is never a usable value, never read
+    }
+    return st.remap[ret.args[0]]
+  }
+  spliceTerm(ic, g, st, 0)
+  builderEndBlock(ic.b)
+  let bi = 1
+  while (bi < len(g.blocks)) {
+    builderBeginBlock(ic.b, st.blockMap[bi])
+    spliceBlockParams(ic, g, st, bi)
+    spliceBlockBody(ic, g, st, bi, depth)
+    spliceTerm(ic, g, st, bi)
+    builderEndBlock(ic.b)
+    bi = bi + 1
+  }
+  builderBeginBlock(ic.b, st.join)
+  let retArgs = calleeRetArgs(g)
+  if (len(retArgs) == 0) {
     return 0 // void callee: the result is never a usable value, never read
   }
-  return remap[ret.args[0]]
+  return builderAddParam(ic.b, g.instrs[retArgs[0]].ty)
 }
 
 // Pass 3: simple size-budgeted inlining. Blocks are walked in id order, which is
@@ -338,53 +583,22 @@ fn spliceCallee(
 // which then survived to codegen. Identical source, renamed files, different
 // machine code — 30 un-inlined `wordAt` calls in the collector's mark and sweep
 // paths, purely because `gcmark.bit` sorts before `mem.bit`.
+//
+// The caller is walked with the same three steps a spliced callee's blocks are
+// (`spliceBlockParams`/`spliceBlockBody`/`spliceTerm`) rather than a second
+// copy of them: `st.join < 0` is the whole difference, and a fix applied to one
+// copy does not reach the other.
 fn inlineCalls(m: IrModule, snap: []IrFunc, fidx: int): IrFunc {
   let f = snap[fidx]
-  let n = len(f.blocks)
-  let blockMap = []int(0)
-  let remap = []int(0)
-  let noFold = []ConstVal(0)
-  let i = 0
-  while (i < len(f.instrs)) {
-    remap = append(remap, 0)
-    noFold = append(noFold, noConst())
-    i = i + 1
-  }
   let b = newBuilder()
-  i = 0
-  while (i < n) {
-    blockMap = append(blockMap, builderNewBlock(b))
-    i = i + 1
-  }
+  let ic = InlineCtx{ b: b, m: m, snap: snap, callerIdx: fidx }
+  let st = callerState(ic, f)
   let bi = 0
-  while (bi < n) {
-    let blk = f.blocks[bi]
-    builderBeginBlock(b, blockMap[bi])
-    let idx = blk.instsStart
-    let paramsEnd = blk.instsStart + blk.paramCount
-    while (idx < paramsEnd) {
-      remap[idx] = builderAddParam(b, f.instrs[idx].ty)
-      idx = idx + 1
-    }
-    let end = blk.instsStart + blk.instsLen
-    while (idx < end) {
-      let ins = f.instrs[idx]
-      let handled = false
-      if (ins.op == Op.Call) {
-        let calleeIdx = funcIndexByName(snap, ins.name)
-        if (inlineEligible(m, snap, fidx, calleeIdx, len(ins.args))) {
-          remap[idx] = spliceCallee(
-            b, m, snap, fidx, snap[calleeIdx],
-            trList(remap, ins.args), 1,
-          )
-          handled = true
-        }
-      }
-      if (!handled) {
-        emitTranslated(b, f, noFold, remap, blockMap, idx)
-      }
-      idx = idx + 1
-    }
+  while (bi < len(f.blocks)) {
+    builderBeginBlock(b, st.blockMap[bi])
+    spliceBlockParams(ic, f, st, bi)
+    spliceBlockBody(ic, f, st, bi, 0)
+    spliceTerm(ic, f, st, bi)
     builderEndBlock(b)
     bi = bi + 1
   }
