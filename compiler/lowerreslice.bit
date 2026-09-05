@@ -1,7 +1,10 @@
 // compiler/lowerreslice.bit — split out of loweraccess.bit (#4048) to keep both
-// files under the 800-line lint limit. Reslice lowering only: `a[lo:hi]` on a
-// slice (still `rt_call slice_slice`) and on a string (inline since #4048).
-// Sibling of loweraccess.bit: same module, so this needs no imports and no
+// files under the 800-line lint limit. Two things now: reslice — `a[lo:hi]` on
+// a slice (still `rt_call slice_slice`) and on a string (inline since #4048) —
+// and the inline string INDEX read `s[i]` (#4346), which lives beside it
+// because both read the same `{ptr, len, base}` header words through the same
+// null-safe path, and a change to that layout must land in one file rather than
+// two. Sibling of loweraccess.bit: same module, so this needs no imports and no
 // call-site changes.
 
 // The out-of-line bounds panic both reslice paths would share if the slice side
@@ -165,6 +168,80 @@ fn emitInlineStringSlice(fc: FnCtx, recv: int, lo: int, hi: int, ty: int): int {
   setBase.rhs = recv
   builderEmit(fc.b, setBase)
   return obj
+}
+
+// Whether `s[i]` may be read INLINE (#4346). Two conditions, both fail-closed,
+// asked at the call site rather than inside the emitter for the reason
+// `canInlineSliceStore` (loweraccess.bit) is a predicate: a receiver that fails
+// either one keeps the runtime call, which is today's behaviour byte for byte.
+//
+// THE RESULT must be exactly one byte wide and int-classed. `index_get` scales
+// by the RESULT type's own width, and only a 1-byte result makes that scale the
+// byte stride a string's bytes actually have; SPEC §12.2 types `s[i]` `u8`, so
+// this holds for every program that reaches here today, and a wider result
+// would otherwise address `i * 8` bytes into the backing.
+//
+// THE INDEX must be int-classed, for the reason `lowerIndex`'s slice arm gives:
+// the compare and the address arithmetic read an INTEGER register, and nothing
+// rejects `s[1.5]` today.
+fn canInlineStringByte(fc: FnCtx, ty: int, idx: int): bool {
+  let w = widthOf(fc.c.ctx, ty)
+  return w.bytes == 1 &&
+    w.regClass == RegClass.Int &&
+    regClassOf(fc.c.ctx, fc.b.instrs[idx].ty) == RegClass.Int
+}
+
+// `s[i]` on a string, read INLINE instead of through `rt_call string_byte`
+// (#4346) — the index twin of `emitInlineStringSlice` above, and the same shape
+// `emitInlineSliceGet` (loweraccess.bit) already has for `xs[i]`, minus the view
+// offset a string header does not carry:
+//
+//   n = len(s)                    // slice_len at +8: a NULL header reads as 0
+//   (u64)i >= (u64)n  -> panic "index out of range"
+//   p = ptr(s)                    // field_get at +0: a NULL header reads as 0
+//   b = loadByte(p + i)
+//
+// That is `rtStringByte` (runtime/root/strings.bit) verbatim. Its `strSize` and
+// `strBytes` are the null-safe funnels reproduced here by `emitHeaderWordOrZero`
+// on both backends (`isHeaderBase` already answers true for a string), and its
+// explicit `index < 0 || index >= n` pair is the ONE unsigned compare
+// `emitBoundsCheck` emits: a negative index reads as a huge unsigned and fails
+// it, exactly as it does for a slice. `bit_rt_string_byte` stays exported
+// (ABI.md §2), as #3107 kept `bit_rt_slice_get`.
+//
+// WHY INLINE AT ALL. `rtStringByte` is 50 instructions behind a `bl`, and calls
+// `_strSize`, `_strBytes` and `_bit_rt_port_mem_load_byte` in turn. Every
+// `src[i]` in a lexer is that call once per input byte.
+//
+// THE PANIC IS BYTE-IDENTICAL. `panicBounds(oobIndex)`'s words decode to "index
+// out of range" (runtime/root/slices.bit), which is the text `emitBoundsCheck`
+// hands to `bit_rt_panic` — the same stderr line and the same exit 2. It is the
+// same equality #3107 spent when it replaced `rtSliceGet`'s panic.
+//
+// THE ADDRESS NEVER CROSSES A SAFEPOINT, and for a string that is still the
+// argument rather than a historical one. `ptr` is an INTERIOR pointer (ABI.md
+// §2.3) held in an untraced `i64`, so nothing keeps it valid across a collection
+// but the header — and `licmReadsHeaderWord` (optloopcand.bit) deliberately
+// refuses to hoist a `field_get` at offset 0 on a STRING base, so this read
+// stays inside its loop. From it to the `index_get` is one straight-line block:
+// no call, no allocation, and no back edge (`isBackEdge` is `target <=
+// curBlock`, and both blocks `emitBoundsCheck` mints have ids above the current
+// one). Lifting that refusal would need #4053's four-part argument re-derived
+// for a string, whose traced word is `base` at +16 and not `ptr`; it is not
+// done here, and the cost of leaving it is one never-taken `cbz` and one `ldr`
+// per iteration instead of nothing.
+fn emitInlineStringByte(fc: FnCtx, recv: int, idx: int, ty: int): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let nIns = mkInstr(Op.SliceLen, i64ty)
+  nIns.lhs = recv
+  emitBoundsCheck(fc, idx, builderEmit(fc.b, nIns))
+  let pIns = mkInstr(Op.FieldGet, i64ty)
+  pIns.lhs = recv
+  pIns.ival = 0
+  let ig = mkInstr(Op.IndexGet, ty)
+  ig.lhs = builderEmit(fc.b, pIns)
+  ig.rhs = idx
+  return builderEmit(fc.b, ig)
 }
 
 // `strAllocHeader` (runtime/root/root.bit:218) — the byte size of a `{ptr, len,
