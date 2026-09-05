@@ -2781,17 +2781,24 @@ constant, one byte per body word — and passes it at the comparison site and to
 `map_new`.
 
 ```
-'{' item* '}'   an aggregate; its items describe consecutive 8-byte body words
-'w'             a raw word, compared and hashed BY VALUE
-'s'             a `string` handle, compared and hashed BY ITS BYTES
-'r'             an opaque reference (slice, map, chan, func, interface, payload
-                enum), compared and hashed BY IDENTITY
-'{' ... '}'     a nested class or tuple: dereferenced and walked
+'{' item* '}'    an aggregate; its items describe consecutive 8-byte body words
+'w'              a raw word, compared and hashed BY VALUE
+'s'              a `string` handle, compared and hashed BY ITS BYTES
+'r'              an opaque reference (slice, map, chan, func, interface),
+                 compared and hashed BY IDENTITY
+'e' block* ')'   a boxed payload enum (#4341): `block` is one `"{...}"`
+                 payload program per variant, in declaration order, over the
+                 words past the tag (§1.2). The tag is read directly and
+                 compared/mixed by the dispatcher; which block applies is a
+                 RUNTIME question, so this cannot flatten into a plain '{...}'
+'{' ... '}'      a nested class or tuple: dereferenced and walked
 ```
 
 `class P { x: int, name: string }` is `{ws}`; `class Q { p: P, n: int }` is
-`{{ws}w}`. The producer is `descProgram` in `compiler/lowerprim.bit`; the
-consumers are `descEqAgg` and `descHashAgg` in `runtime/root/maps.bit`.
+`{{ws}w}`; `enum Port { Default, Explicit(int) }` is `e{}{w})`. The producer is
+`descProgram`/`descEnumProgram` in `compiler/lowerdesc.bit`; the consumers are
+`descEqAgg`/`descHashAgg` in `runtime/root/maps.bit` and
+`descEqEnumChild`/`descHashEnumChild` in `runtime/root/mapenumeq.bit`.
 
 - **Equality and hashing are ONE walk.** The two interpreters read the same
   program and take the same cases in the same order, so `eq(a,b)` implies
@@ -2805,10 +2812,12 @@ consumers are `descEqAgg` and `descHashAgg` in `runtime/root/maps.bit`.
   IEEE. This keeps composite equality reflexive — a key not equal to itself
   could never be found or deleted — and matches what a bare `map<f64,int>` key
   already does. `+0.0` and `-0.0` therefore differ in a field.
-- **A field whose type is not comparable** (a slice, a map) gets `'r'`: identity,
-  which is total and consistent with the hash, rather than failing the whole
-  comparison. The checker's `vComparable` is deliberately permissive on structs
-  (`compiler/validateattr.bit`), so such a field does reach lowering.
+- **A field whose type is not comparable at all never reaches lowering** as of
+  #4341: the checker's `vComparable` (`compiler/validateattr.bit`) recurses into
+  a class's fields and a boxed enum's variant payloads and rejects such a type
+  at compile time, naming the offending field or variant. `'r'` remains the
+  depth/budget backstop below for a field that IS comparable but too deep or
+  wide to describe.
 
 ---
 

@@ -38,6 +38,27 @@ const descMaxDepth: int = 6
 // bounded by this number however wide or deep the type is (Power of 10 rule 3).
 const descMaxWords: int = 96
 
+// The nested program for a struct/tuple/boxed-enum body word, or "" when `ty`
+// is none of those, the depth backstop already fired, or the recursive call
+// itself came back empty (budget blown). Split out of `descToken` (#4341) so
+// adding the boxed-enum arm did not push it over the complexity limit.
+fn descNestedToken(fc: FnCtx, t: Type, ty: int, depth: int, budget: int): string {
+  if (depth >= descMaxDepth) {
+    return ""
+  }
+  if (t.kind == TypeKind.Struct || t.kind == TypeKind.Tuple) {
+    return descProgram(fc, ty, depth + 1, budget)
+  }
+  // A boxed enum compares structurally too (#4341's owner ruling): tag, then
+  // payload word-wise, dispatched per the RUNTIME value's own tag — a
+  // different program from a class's, since which words even exist depends on
+  // which variant this particular object is. See `descEnumProgram`.
+  if (t.kind == TypeKind.Enum && t.enumBoxed) {
+    return descEnumProgram(fc, ty, depth + 1, budget)
+  }
+  return ""
+}
+
 // The descriptor token for a value of type `ty` occupying ONE body word.
 // `budget` is the number of further words this token's own subtree may describe.
 fn descToken(fc: FnCtx, ty: int, depth: int, budget: int): string {
@@ -45,18 +66,72 @@ fn descToken(fc: FnCtx, ty: int, depth: int, budget: int): string {
   if (t.kind == TypeKind.Prim && t.prim == 11) {
     return "s"
   }
-  if (depth < descMaxDepth && (t.kind == TypeKind.Struct || t.kind == TypeKind.Tuple)) {
-    let inner = descProgram(fc, ty, depth + 1, budget)
-    if (inner != "") {
-      return inner
-    }
+  let inner = descNestedToken(fc, t, ty, depth, budget)
+  if (inner != "") {
+    return inner
   }
   // Everything else reachable through a traced word — a slice, map, chan,
-  // function, interface, payload enum or bare type parameter — has no value
-  // equality of its own (§14.6), so it keeps the identity comparison it has
-  // today. Blowing the depth or the budget lands here too, which degrades to the
-  // pre-fix answer rather than to a wrong one.
+  // function, interface or bare type parameter — has no value equality of its
+  // own (§14.6), so it keeps the identity comparison it has today. Blowing the
+  // depth or the budget lands here too, which degrades to the pre-fix answer
+  // rather than to a wrong one. `vComparable` (validateattr.bit) rejects any
+  // of these reached through a `==` or a map key before lowering ever sees it,
+  // so this is reached only for a field of a comparable container that is
+  // itself past the depth/budget backstop.
   return "r"
+}
+
+// The "{...}" program for a fixed list of body-word types, budgeted like
+// `descProgram` — shared by a variant's payload, which has no LAYOUT to derive
+// slots from (`lowerVariantConstruction` gives every argument its own whole
+// word, never packing two into one the way a class field can), just the
+// argument types in declaration order. Empty when `budget` will not cover it.
+fn descItemsProgram(fc: FnCtx, items: []int, depth: int, budget: int): string {
+  let n = len(items)
+  if (n > budget) {
+    return ""
+  }
+  let share = 0
+  if (n > 0) {
+    share = (budget - n) / n
+  }
+  let out = "{"
+  let i = 0
+  while (i < n) {
+    out = out + descToken(fc, items[i], depth, share)
+    i = i + 1
+  }
+  return out + "}"
+}
+
+// The descriptor program for boxed enum `ty`: `'e'`, one `"{...}"` payload
+// block per variant IN DECLARATION ORDER (an empty `"{}"` for a no-payload
+// variant), terminated by `')'`. No variant COUNT is encoded — the consumer
+// either walks blocks in order counting down from the runtime tag it just
+// read (`descFindVariantBlock`) or skips them one at a time until it sees the
+// terminator (`descSkipEnum`), so this never needs to emit a byte outside the
+// printable program alphabet. See runtime/root/maps.bit's grammar comment and
+// `descEqEnumChild`/`descHashEnumChild`, this program's only consumer. Empty
+// when the declaration cannot be read here, or when any variant's payload
+// blows the word budget.
+fn descEnumProgram(fc: FnCtx, ty: int, depth: int, budget: int): string {
+  let oc = typeOwner(fc.c, ty)
+  let decl = enumDeclOf(fc.c, ty)
+  if (decl == 0) {
+    return ""
+  }
+  let out = "e"
+  for v of enumVariantNodes(oc, decl) {
+    let vn = getNode(oc.tree, kidsOf(oc.tree, v)[0])
+    let vname = oc.source[vn.span.start:vn.span.end]
+    let payload = variantPayloadLookup(fc.c.ctx, "${ty}.${vname}")
+    let block = descItemsProgram(fc, payload, depth + 1, budget)
+    if (block == "") {
+      return ""
+    }
+    out = out + block
+  }
+  return out + ")"
 }
 
 // The body word slots of aggregate `ty`: `out[i]` is the type of the traced
@@ -155,16 +230,20 @@ fn descProgram(fc: FnCtx, ty: int, depth: int, budget: int): string {
 }
 
 // The descriptor program for a type compared BY VALUE, or "" for a type that
-// keeps its word comparison. Structs and tuples are the two §14.6 admits with a
-// field/element-wise rule and a boxed representation; everything else — scalars,
-// `string`, C-like enums, interfaces (identity today, see #2105's note) — is
-// already handled by `lowerComparison` or has no value equality.
+// keeps its word comparison. Structs, tuples and boxed enums (#4341) are what
+// §14.6 admits with a field/variant-wise rule and a boxed representation;
+// everything else — scalars, `string`, C-like enums, interfaces (identity
+// today, see #2105's note) — is already handled by `lowerComparison` or has
+// no value equality.
 fn descForType(fc: FnCtx, ty: int): string {
-  let k = fc.c.ctx.types[ty].kind
-  if (k != TypeKind.Struct && k != TypeKind.Tuple) {
-    return ""
+  let t = fc.c.ctx.types[ty]
+  if (t.kind == TypeKind.Struct || t.kind == TypeKind.Tuple) {
+    return descProgram(fc, ty, 0, descMaxWords)
   }
-  return descProgram(fc, ty, 0, descMaxWords)
+  if (t.kind == TypeKind.Enum && t.enumBoxed) {
+    return descEnumProgram(fc, ty, 0, descMaxWords)
+  }
+  return ""
 }
 
 // Materializes a descriptor program as a pooled string constant.

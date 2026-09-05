@@ -1,0 +1,141 @@
+// Split out of maps.bit (#4341): a boxed PAYLOAD ENUM's structural comparison
+// and hash, the owner-ruled fix for §14.6 — "a payload-carrying enum is not
+// comparable" was a guard that failed open one level down (a class field of
+// enum type fell through to identity, `runtime/root/maps.bit`'s old 'r' case),
+// so `Config{ port: Port.Default } == Config{ port: Port.Default }` answered
+// `false` and a `map<Config,int>` keyed on two such values grew instead of
+// overwriting. Sibling of maps.bit: same module, no imports, no call-site
+// changes elsewhere — maps.bit's own per-item dispatch (`descEqAgg`/
+// `descHashAgg`) already calls straight into this file's functions.
+//
+// THE GRAMMAR (maps.bit's own grammar comment has the one-line summary):
+//
+//   'e' block* ')'   `block` is one `"{...}"` payload program per variant, IN
+//                    DECLARATION ORDER, over the words starting at the
+//                    object's payload base (`descEnumPayloadBase`, ABI.md
+//                    §1.2) — the tag itself, word 0, is never inside a block.
+//                    No variant COUNT is encoded: the tag names which block to
+//                    read (`descFindVariantBlock`, counting blocks down from
+//                    it) and the terminator `')'` is what lets a walk that
+//                    does not care which variant skip the whole thing
+//                    (`descSkipEnum`) without ever needing a byte outside the
+//                    program's printable alphabet.
+//
+// WHY THIS CANNOT BE A PLAIN `'{' ... '}'`. A class's word layout is the same
+// for every value of the type, so one static program describes it. A boxed
+// enum's is NOT: `Some(int)` and `None` can be different object sizes, and
+// which words even exist is a property of the RUNTIME value (its tag), not of
+// the static type. So comparison has to read the tag first and dispatch —
+// exactly the shape `descEqEnumChild`/`descHashEnumChild` give it, reached
+// from the SAME per-item loop in `descEqAgg`/`descHashAgg` that already
+// dispatches on `'{'`, `'s'` and `'w'`.
+//
+// EQ AND HASH MUST AGREE (maps.bit's own "WHY ONE WALK AND NOT TWO"): a tag
+// mismatch is `false` for eq and simply never reached for hash (hash has no
+// second operand to disagree with), and once tags agree both walk the SAME
+// variant's payload words through the SAME `descEqAgg`/`descHashAgg` — so two
+// values `eq` calls equal always feed `hash` the same tag and the same
+// payload words, in the same order, and land on the same digest.
+
+// Byte offset of a boxed enum's first payload word — matches
+// `compiler/lowerlayout.bit`'s `enumPayloadBase`, this constant's only other
+// producer; the two must always agree (ABI.md §1.2).
+const descEnumPayloadBase: int = 8
+
+const descEnumEnd: int = 41 // ')'
+
+// The index of the `tag`-th variant's `'{'`, given `p` is the `'e'` marker's
+// own index. Walks `tag` blocks (never the terminator) via `descSkipAgg`,
+// which already knows how to skip a balanced `{...}` — a variant's payload
+// block is always exactly one, even `"{}"` for a no-payload variant.
+@nosplit fn descFindVariantBlock(prog: int, plen: int, p: int, tag: int): int {
+  let idx = p + 1
+  let k = 0
+  while (k < tag) {
+    idx = descSkipAgg(prog, plen, idx)
+    k = k + 1
+  }
+  return idx
+}
+
+// The index just past the WHOLE `'e' block* ')'` program starting at `p`
+// (`p` is the `'e'` marker), for a walk that does not care which variant this
+// particular pair or key holds — the enum-typed mirror of `descSkipAgg`.
+@nosplit fn descSkipEnum(prog: int, plen: int, p: int): int {
+  let i = p + 1
+  while (i < plen) {
+    let c = loadByte(prog + i)
+    if (c == descEnumEnd) {
+      return i + 1
+    }
+    i = descSkipAgg(prog, plen, i)
+  }
+  return plen
+}
+
+// The `'e' ... ')'` item at `prog[p]`, whose two words are pointers to boxed
+// enum objects. Returns the index just past the item, or -1 when they differ
+// — the enum-typed mirror of `descEqChild`.
+@nosplit fn descEqEnumChild(wa: int, wb: int, desc: int, p: int, depth: int): int {
+  let prog = strBytes(desc)
+  let plen = strSize(desc)
+  if (wa == wb) {
+    // The same box on each side, or both null: equal without a walk, exactly
+    // as `descEqChild` treats a shared/null nested class pointer.
+    return descSkipEnum(prog, plen, p)
+  }
+  if (wa == 0 || wb == 0) {
+    return -1
+  }
+  let tagA = loadWord(wa + 0)
+  let tagB = loadWord(wb + 0)
+  if (tagA != tagB) {
+    return -1
+  }
+  let blockPos = descFindVariantBlock(prog, plen, p, tagA)
+  // Shift the base pointers to the payload, rather than giving `descEqAgg` a
+  // 6th (`off0`) parameter: `descEqAgg` always reads its first item at offset
+  // 0 from whatever pointer it is handed, so `wa + descEnumPayloadBase` reads
+  // exactly the words `descEqAgg` would read from offset `descEnumPayloadBase`
+  // of `wa` itself.
+  if (descEqAgg(wa + descEnumPayloadBase, wb + descEnumPayloadBase, desc, blockPos, depth + 1) < 0) {
+    return -1
+  }
+  return descSkipEnum(prog, plen, p)
+}
+
+// The hash of the `'e' ... ')'` item at `prog[p]` for the enum object at `w`
+// — the enum-typed mirror of `descHashChild`. A null handle contributes 0,
+// agreeing with `descEqEnumChild`'s "both null" case the same way
+// `descHashChild` already does for a nested class.
+@nosplit fn descHashEnumChild(w: int, desc: int, p: int, depth: int): u64 {
+  if (w == 0) {
+    return 0
+  }
+  let prog = strBytes(desc)
+  let plen = strSize(desc)
+  let tag = loadWord(w + 0)
+  let blockPos = descFindVariantBlock(prog, plen, p, tag)
+  let payloadHash = descHashAgg(w + descEnumPayloadBase, desc, blockPos, depth + 1)
+  return descMixIn(payloadHash, u64(tag))
+}
+
+// The top-level entry for `bit_rt_value_eq` (maps.bit): a bare boxed-enum
+// operand's own program is `'e'`-led (no wrapping `'{...}'`, since there is no
+// outer class to hold it), so the dispatch that is otherwise done per-item
+// inside `descEqAgg` has to be done once, up front, for the whole program.
+@nosplit fn descEqTop(a: int, b: int, desc: int): int {
+  if (loadByte(strBytes(desc)) == descEnumMark) {
+    return descEqEnumChild(a, b, desc, 0, 0)
+  }
+  return descEqAgg(a, b, desc, 0, 0)
+}
+
+// The top-level entry for `mapHash` (maps.bit) — the hash-side mirror of
+// `descEqTop`, for a bare boxed-enum map key.
+@nosplit fn descHashTop(v: int, desc: int): u64 {
+  if (loadByte(strBytes(desc)) == descEnumMark) {
+    return descHashEnumChild(v, desc, 0, 0)
+  }
+  return descHashAgg(v, desc, 0, 0)
+}
