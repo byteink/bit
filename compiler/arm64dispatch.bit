@@ -10,32 +10,18 @@
 // Instruction dispatch
 // ===========================================================================
 
-// Which `const_int` definitions (#1853) an ADD/SUB-immediate fold, a bitmask
-// AND/ORR/EOR-immediate fold (#3495), a power-of-two Mul (#3105) or a
-// power-of-two SDiv/UDiv (#3104) consumes entirely, indexed by instruction id.
+// Which `const_int` definitions (#1853) an immediate fold consumes entirely,
+// indexed by instruction id — an ADD/SUB immediate, a `cmp`/`cmn` immediate
+// (#4349), a bitmask AND/ORR/EOR immediate (#3495), a power-of-two Mul (#3105)
+// or a power-of-two SDiv/UDiv (#3104).
+//
 // `instrOperands` (opt.bit) is the SAME operand map DCE uses, so a constant
 // with any use besides the one fold that reads it as an immediate keeps
 // `false` and still materializes normally — this only marks a def whose sole
-// structural use is that one fold, mirroring the emitters' own operand order
-// so nothing here marks skipped a value an emitter actually reads as a
+// structural use is that one fold. Which operand each family folds is
+// `immFoldConstOperand`'s question, and each of its arms mirrors its own
+// emitter, so nothing here can mark skipped a value an emitter reads as a
 // register.
-//
-// SRem/URem are deliberately excluded from the divide case: `emitDivInt`
-// only takes the shift path for SDiv/UDiv (#3104 — msub still needs the real
-// divisor register to recover a remainder), so skipping the divisor for a Rem
-// would leave the general path reading an unmaterialized register — the
-// `useCount == 1` guard below exists to prevent exactly this class of bug.
-//
-// `debug` (#3080/§13.5) is the same hazard: a debug build's `emitBinaryInt`
-// skips the ADD/SUB-immediate fold (no flag-setting immediate form exists),
-// so this arm must agree or a constant marked skipped here reads an
-// unmaterialized register. Verified live: unguarded, `x + 1` under `--debug`
-// emitted `adds x21, x19, x20` with no prior write to x20. Mul's debug
-// overflow trap (#3084, arm64selectovf.bit) does read `cx.debug` now, but
-// never re-reads the skipped operand: `emitPow2MulInt`'s check only touches
-// the non-constant operand's register and the compile-time-known shift
-// amount `k`, so skipping the power-of-two constant here stays safe in every
-// build mode. Div is still untouched — it reads `cx.debug` nowhere.
 fn computeSkipConstMaterialize(ctx: TypeContext, f: IrFunc, debug: bool): []bool {
   let n = len(f.instrs)
   let useCount = []int(0)
@@ -62,53 +48,133 @@ fn computeSkipConstMaterialize(ctx: TypeContext, f: IrFunc, debug: bool): []bool
   }
   i = 0
   while (i < n) {
-    let ins = f.instrs[i]
-    if ((ins.op == Op.Add || ins.op == Op.Sub) && !debug) {
-      let rc = constIntOf(f, ins.rhs)
-      if (rc.known && resolveAddSubImm(ins.op, rc.ival).fits && useCount[ins.rhs] == 1) {
-        skip[ins.rhs] = true
-      } else if (ins.op == Op.Add) {
-        let lc = constIntOf(f, ins.lhs)
-        if (lc.known && resolveAddSubImm(ins.op, lc.ival).fits && useCount[ins.lhs] == 1) {
-          skip[ins.lhs] = true
-        }
-      }
-    } else if (ins.op == Op.Mul) {
-      let w = widthOf(ctx, ins.ty)
-      let factor = xConstPow2Factor(f, ins.lhs, ins.rhs, w)
-      if (factor.k >= 0) {
-        let constOp = ins.lhs
-        if (factor.value == ins.lhs) {
-          constOp = ins.rhs
-        }
-        if (useCount[constOp] == 1) {
-          skip[constOp] = true
-        }
-      }
-    } else if (ins.op == Op.BAnd || ins.op == Op.BOr || ins.op == Op.BXor) {
-      let s = logicalConstSkip(f, ins.rhs, ins.lhs)
-      if (s >= 0 && useCount[s] == 1) {
-        skip[s] = true
-      }
-    } else if (ins.op == Op.SDiv || ins.op == Op.UDiv) {
-      let w = widthOf(ctx, ins.ty)
-      let pk = xConstPow2Divisor(f, ins.rhs, w)
-      if (pk >= 0 && useCount[ins.rhs] == 1) {
-        skip[ins.rhs] = true
-      }
-    } else if (ins.op == Op.Shl || ins.op == Op.AShr || ins.op == Op.LShr) {
-      // `constShiftAmount` (arm64select.bit) masks any const_int to 0-63,
-      // never returning -1 for one — the only -1 case is "not a const_int at
-      // all" — so this guard fires on exactly the operand `emitShiftInt`'s
-      // own `amt >= 0` branch takes, and the masked value is always a legal
-      // shift-immediate encoding regardless of the IR's result width.
-      if (constShiftAmount(f, ins.rhs) >= 0 && useCount[ins.rhs] == 1) {
-        skip[ins.rhs] = true
-      }
+    let c = immFoldConstOperand(ctx, f, f.instrs[i], debug)
+    if (c >= 0 && useCount[c] == 1) {
+      skip[c] = true
     }
     i = i + 1
   }
   return skip
+}
+
+// Which operand of `ins`, if any, an immediate fold in the emitters consumes
+// ENTIRELY — the one question the whole table above asks, so the
+// `useCount == 1` rule and the `skip` bookkeeping are written once rather than
+// once per op family. Returns that operand's instruction id, or -1.
+//
+// Splitting the question out this way removed a real hazard, not just five
+// copies of a line: the Add arm used to fall through to its LHS whenever the
+// RHS test failed, and one of the ways that test failed was a second USE of an
+// RHS constant the emitter folds regardless of use count. `emitBinaryInt`
+// would then fold the RHS while the LHS sat marked skipped and unmaterialized.
+// Each helper below mirrors its emitter's own operand precedence and nothing
+// else; the use count is not that emitter's business and is applied once, here.
+fn immFoldConstOperand(ctx: TypeContext, f: IrFunc, ins: IrInstr, debug: bool): int {
+  let a = addSubFoldOperand(f, ins, debug)
+  if (a >= 0) {
+    return a
+  }
+  let c = icmpFoldOperand(f, ins)
+  if (c >= 0) {
+    return c
+  }
+  let m = mulDivFoldOperand(ctx, f, ins)
+  if (m >= 0) {
+    return m
+  }
+  return bitwiseShiftFoldOperand(f, ins)
+}
+
+// Whether `v` is a `const_int` that `op`'s add/sub-immediate encoding takes
+// whole — the test `emitBinaryInt` itself applies, in the same order.
+fn addSubImmOperandFits(f: IrFunc, op: Op, v: int): bool {
+  let c = constIntOf(f, v)
+  return c.known && resolveAddSubImm(op, c.ival).fits
+}
+
+// `debug` (#3080/§13.5) is a hard refusal, not a nuance: a debug build's
+// `emitBinaryInt` skips the ADD/SUB-immediate fold entirely (no flag-setting
+// immediate form exists to trap on), so marking a constant skipped here would
+// leave the general path reading an unmaterialized register. Verified live:
+// unguarded, `x + 1` under `--debug` emitted `adds x21, x19, x20` with no
+// prior write to x20.
+fn addSubFoldOperand(f: IrFunc, ins: IrInstr, debug: bool): int {
+  if (debug) {
+    return -1
+  }
+  if (ins.op != Op.Add && ins.op != Op.Sub) {
+    return -1
+  }
+  if (addSubImmOperandFits(f, ins.op, ins.rhs)) {
+    return ins.rhs
+  }
+  // Add is commutative so a leading literal folds too; Sub is not
+  // (`k - x` != `x - k`), so only its rhs is ever offered.
+  if (ins.op != Op.Add) {
+    return -1
+  }
+  if (addSubImmOperandFits(f, ins.op, ins.lhs)) {
+    return ins.lhs
+  }
+  return -1
+}
+
+// #4349: `emitIcmp` folds a constant rhs into `cmp`/`cmn` whenever
+// `icmpConstImm` says it fits, and fetches no register for it on that path.
+// Unlike the ADD/SUB arm this needs no `debug` guard — a comparison traps on
+// nothing, so `compileInst` reaches the same `emitIcmp` in every build mode.
+fn icmpFoldOperand(f: IrFunc, ins: IrInstr): int {
+  if (isIcmp(ins.op) && icmpConstImm(f, ins.rhs).fits) {
+    return ins.rhs
+  }
+  return -1
+}
+
+// SRem/URem are deliberately absent: `emitDivInt` only takes the shift path for
+// SDiv/UDiv (#3104 — msub still needs the real divisor register to recover a
+// remainder), so offering a Rem's divisor would leave the general path reading
+// an unmaterialized register.
+//
+// Mul's debug overflow trap (#3084, arm64selectovf.bit) does read `cx.debug`,
+// but never re-reads the skipped operand: `emitPow2MulInt`'s check only touches
+// the non-constant operand's register and the compile-time-known shift amount
+// `k`, so this stays safe in every build mode. Div reads `cx.debug` nowhere.
+fn mulDivFoldOperand(ctx: TypeContext, f: IrFunc, ins: IrInstr): int {
+  if (ins.op == Op.Mul) {
+    let factor = xConstPow2Factor(f, ins.lhs, ins.rhs, widthOf(ctx, ins.ty))
+    if (factor.k < 0) {
+      return -1
+    }
+    if (factor.value == ins.lhs) {
+      return ins.rhs
+    }
+    return ins.lhs
+  }
+  if (ins.op != Op.SDiv && ins.op != Op.UDiv) {
+    return -1
+  }
+  if (xConstPow2Divisor(f, ins.rhs, widthOf(ctx, ins.ty)) < 0) {
+    return -1
+  }
+  return ins.rhs
+}
+
+// `constShiftAmount` (arm64select.bit) masks any const_int to 0-63, never
+// returning -1 for one — the only -1 case is "not a const_int at all" — so this
+// answers with exactly the operand `emitShiftInt`'s own `amt >= 0` branch
+// takes, and the masked value is always a legal shift-immediate encoding
+// regardless of the IR's result width.
+fn bitwiseShiftFoldOperand(f: IrFunc, ins: IrInstr): int {
+  if (ins.op == Op.BAnd || ins.op == Op.BOr || ins.op == Op.BXor) {
+    return logicalConstSkip(f, ins.rhs, ins.lhs)
+  }
+  if (ins.op != Op.Shl && ins.op != Op.AShr && ins.op != Op.LShr) {
+    return -1
+  }
+  if (constShiftAmount(f, ins.rhs) < 0) {
+    return -1
+  }
+  return ins.rhs
 }
 
 // #3101: does `compileInst` write instruction `i`'s own allocated register?

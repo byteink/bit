@@ -105,23 +105,82 @@ fn fusedElseCond(f: IrFunc, cmpIdx: int): int {
   return condInvert(fcmpCond(op))
 }
 
-// Emits whatever sets NZCV for `br`, and returns the condition the branch must
-// test to take its ELSE edge. `cond` is the boolean operand and `i` the `br`'s
-// own instruction id. Emits NOTHING on the fused path — the compare is the
-// instruction already emitted immediately before, which is the whole point —
-// so the caller's conditional branch is still the next word in the stream
-// either way, and no flag-clobbering instruction can slip between them.
+// ===========================================================================
+// #4349: an UNFUSED condition is tested by CBZ/CBNZ, not by cmp + b.cond
+// ===========================================================================
 //
-// The THEN condition is `condInvert` of what this returns, on both paths:
-// EQ/NE are a condInvert pair, and `fusedElseCond` is itself a `condInvert`,
-// which is an involution. See the NaN reasoning on `fusedElseCond` — it
-// applies unchanged in the other direction.
-fn emitBrCondition(cx: A64Ctx, i: int, cond: int): int {
+// Two thirds of this backend's `br`s fuse. Measured over the 10 bench cases
+// (1964 `br` sites) and the runtime (1599), every single one of the rest is
+// unfusable for a reason no peephole can remove — the condition is not a
+// compare at all (block_param, a call result, a field load: 360 and 279), or it
+// is a compare with more than one consumer (309 and 184). NOT ONE was a
+// single-use compare separated from its `br` by an intervening instruction, so
+// widening the adjacency rule would buy nothing.
+//
+// What every one of those 669 and 463 sites did pay is a `cmp Xn, xzr` whose
+// only purpose is to put "is this bool zero" into NZCV, immediately before a
+// B.EQ that reads it straight back out. CBZ asks the register directly:
+//
+//     cmp   x27, xzr        ->    cbz   x27, <else>
+//     b.eq  <else>
+//
+// It writes no flags, has B.cond's own +-1 MB imm19 reach, and is resolved by
+// the same fixup list, so nothing about branch resolution or block layout
+// changes. There is no NaN question here and no condition to invert: the
+// operand is a materialized 0/1 boolean, whatever produced it.
+
+// How `br` tests its condition: on NZCV that a fused compare has just set, or
+// on a boolean register directly.
+class BrTest {
+  // The boolean's register, or -1 when the test is on flags.
+  reg: int,
+  // The ELSE condition. Meaningful only while `reg` is -1.
+  cond: int,
+}
+
+// Emits whatever the `br` needs before its branch, and says how to test.
+// `cond` is the boolean operand and `i` the `br`'s own instruction id.
+//
+// Emits NOTHING on the fused path — the compare is the instruction already
+// emitted immediately before, which is the whole point — so the caller's
+// conditional branch is still the next word in the stream, and no
+// flag-clobbering instruction can slip between them. On the register path it
+// emits at most the reload of a spilled boolean, which clobbers no flags the
+// branch then reads: CBZ/CBNZ do not read NZCV at all.
+fn emitBrCondition(cx: A64Ctx, i: int, cond: int): BrTest {
   if (cond == i - 1 && cx.fuseCmp[cond]) {
-    return fusedElseCond(cx.f, cond)
+    return BrTest{ reg: -1, cond: fusedElseCond(cx.f, cond) }
   }
-  cmpZero(cx.code, getInt(cx, vregOf(cx, cond), scratch1()))
-  return condEq()
+  return BrTest{ reg: getInt(cx, vregOf(cx, cond), scratch1()), cond: 0 }
+}
+
+// The conditional branch to `target`, taken when the condition is TRUE
+// (`onTrue`) or FALSE. On the flags path the THEN condition is `condInvert` of
+// the else condition: EQ/NE are a condInvert pair and `fusedElseCond` is itself
+// a `condInvert`, which is an involution — see the NaN reasoning on
+// `fusedElseCond`, which applies unchanged in the other direction. On the
+// register path CBNZ is taken when the bool is true and CBZ when it is false,
+// which is the same statement with no flags in it.
+fn emitBrTestJump(cx: A64Ctx, t: BrTest, onTrue: bool, target: int) {
+  if (t.reg >= 0) {
+    emitCbzJumpFixup(cx, onTrue, t.reg, target)
+    return
+  }
+  if (onTrue) {
+    emitCondJumpFixup(cx, condInvert(t.cond), target)
+    return
+  }
+  emitCondJumpFixup(cx, t.cond, target)
+}
+
+// The both-edges-inline shape's forward skip over the THEN edge's code: taken
+// on the ELSE condition, resolved later by `patchLocalCondBranch`, which
+// rewrites imm19 and nothing else and so serves B.cond and CBZ alike.
+fn emitBrTestLocalBranch(cx: A64Ctx, t: BrTest): int {
+  if (t.reg >= 0) {
+    return emitLocalCbz(cx, false, t.reg)
+  }
+  return emitLocalCondBranch(cx, t.cond)
 }
 
 // Does instruction `i` bind a physical register of its own?
@@ -236,7 +295,7 @@ fn brEdgeNeedsInlineCode(
 // Emits the whole of `br`. `i` is its instruction id, which is its block's
 // last, so either edge is a legal fall-through candidate.
 fn emitBr(cx: A64Ctx, curBlock: int, i: int, ins: IrInstr) {
-  let elseCond = emitBrCondition(cx, i, ins.lhs)
+  let test = emitBrCondition(cx, i, ins.lhs)
   let thenMoves = blockArgMoves(cx, ins.ival, ins.thenArgs)
   let elseMoves = blockArgMoves(cx, ins.ival2, ins.elseArgs)
   let thenInline = brEdgeNeedsInlineCode(cx, curBlock, ins.ival, thenMoves)
@@ -245,18 +304,18 @@ fn emitBr(cx: A64Ctx, curBlock: int, i: int, ins: IrInstr) {
   // Preferred over the mirror when ELSE is the next block, because then the
   // tail costs nothing either and the whole `br` is one instruction.
   if (!thenInline && (elseInline || ins.ival2 == curBlock + 1)) {
-    emitCondJumpFixup(cx, condInvert(elseCond), ins.ival)
+    emitBrTestJump(cx, test, true, ins.ival)
     emitBrEdgeTail(cx, curBlock, i, ins.ival2, elseMoves)
     return
   }
   // ELSE needs nothing: branch straight to it and let THEN have the tail.
   if (!elseInline) {
-    emitCondJumpFixup(cx, elseCond, ins.ival2)
+    emitBrTestJump(cx, test, false, ins.ival2)
     emitBrEdgeTail(cx, curBlock, i, ins.ival, thenMoves)
     return
   }
   // Both edges carry code, so one of them has to be jumped over.
-  let elseFixup = emitLocalCondBranch(cx, elseCond)
+  let elseFixup = emitBrTestLocalBranch(cx, test)
   emitBackEdgeSafepointIfNeeded(cx, curBlock, ins.ival)
   sequentializeAndEmit(cx, thenMoves)
   emitJumpFixup(cx, ins.ival)
