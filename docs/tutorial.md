@@ -14,8 +14,9 @@ quietly rot.
 ## Install
 
 ```
-brew install byteink/tap/bit             # macOS
-curl -fsSL bitlang.org/install.sh | sh   # Linux
+brew install byteink/tap/bit           # macOS
+curl -fsSL bitlang.org/install.sh | sh # Linux
+irm bitlang.org/install.ps1 | iex      # Windows
 ```
 
 Check it:

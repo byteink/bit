@@ -26,11 +26,12 @@ Windows target.
 ## Install
 
 ```
-brew install byteink/tap/bit             # macOS
-curl -fsSL bitlang.org/install.sh | sh   # Linux
+brew install byteink/tap/bit           # macOS
+curl -fsSL bitlang.org/install.sh | sh # Linux
+irm bitlang.org/install.ps1 | iex      # Windows
 ```
 
-Either way you get a single static binary with nothing else to install - no
+Any of them gives you a single static binary with nothing else to install - no
 runtime, no VM, no libc dependency. Check it:
 
 ```
