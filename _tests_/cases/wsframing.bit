@@ -1,0 +1,331 @@
+// run
+// #3965: std/websocket frame-level edge cases, driven by a hand-rolled
+// client speaking raw bytes over std/net directly — never through
+// std/websocket's own frame codec — so a bug that masks and unmasks
+// symmetrically (and would therefore still pass a loopback test that only
+// ever talks to itself) is still caught. Pins: a masked client frame
+// decoded correctly and the server's own reply frame NOT masked; a
+// fragmented message correctly reassembled around a ping injected between
+// its fragments, with the pong observed on the wire; an unmasked client
+// frame, a fragmented control frame, and an over-125-byte control frame
+// each closing the connection with 1002 (protocol error); a frame
+// declaring a payload past the configured maximum rejected with 1009
+// before its payload is ever read (proven by a bounded deadline read
+// completing well under the bound, rather than blocking on bytes that
+// were never sent); and invalid UTF-8 in a text frame closing with 1007.
+import { serve, Server } from "std/http"
+import { dial, Conn as NetConn } from "std/net"
+import { upgrade, defaultLimits, MessageText, MessageBinary, MessageClose } from "std/websocket"
+import { newBuilder, Builder, indexOf, repeat } from "std/strings"
+import { monotonic } from "std/time"
+
+const opContinuation = 0
+const opText = 1
+const opBinary = 2
+const opClose = 8
+const opPing = 9
+const opPong = 10
+
+// Every raw read in this test is bounded, so a server that blocked reading
+// bytes it should have rejected up front shows up as a failed read here,
+// never as a hang.
+const testDeadlineNs = 3000000000
+
+fn startServer(): (Server, int)! {
+  let s = serve("127.0.0.1", 0)?
+  let port = s.port()?
+  return (s, port)
+}
+
+fn serverEcho(s: Server, ready: chan<int>): ()! {
+  ready <- 0
+  let ex = s.accept()?
+  let req = ex.read()?
+  let c = upgrade(ex, req, defaultLimits())?
+  while (true) {
+    let msg = c.receive() catch _ {
+      return
+    }
+    if (msg.kind == MessageText) {
+      c.sendText(msg.data) catch _ {
+        return
+      }
+    } else if (msg.kind == MessageBinary) {
+      c.sendBinary([]byte(msg.data)) catch _ {
+        return
+      }
+    } else if (msg.kind == MessageClose) {
+      return
+    }
+  }
+}
+
+// Connects a fake client straight to `port` and completes the RFC 6455 §4.1
+// client handshake by hand — never through std/websocket's `dial` — so this
+// file's frame writes are the only websocket-shaped bytes on the wire.
+fn rawConnect(port: int): NetConn! {
+  let c = dial("127.0.0.1", port)?
+  let req = "GET /raw HTTP/1.1\r\n" +
+    "Host: 127.0.0.1:${port}\r\n" +
+    "Upgrade: websocket\r\n" +
+    "Connection: Upgrade\r\n" +
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+    "Sec-WebSocket-Version: 13\r\n\r\n"
+  c.write(req)?
+  let buf = ""
+  while (indexOf(buf, "\r\n\r\n") < 0) {
+    let chunk = readBounded(c, 4096)?
+    if (len(chunk) == 0) {
+      fail newError("test: handshake failed")
+    }
+    buf = buf + chunk
+  }
+  return c
+}
+
+// Every raw read goes through this, bounded to `testDeadlineNs` — see the
+// module doc comment on why that is itself part of what this file proves.
+fn readBounded(c: NetConn, max: int): string! {
+  c.setDeadline(monotonic().ns + testDeadlineNs)
+  let out = c.readDeadline(max)?
+  c.setDeadline(0)
+  return out
+}
+
+fn readExactRaw(c: NetConn, n: int): string! {
+  let out = ""
+  while (len(out) < n) {
+    let chunk = readBounded(c, n - len(out))?
+    if (len(chunk) == 0) {
+      fail newError("test: connection closed early")
+    }
+    out = out + chunk
+  }
+  return out
+}
+
+// One decoded frame: opcode, whether the mask bit was set, and the payload
+// (left masked if it was — every frame this file expects back from the
+// server is unmasked, so callers checking `masked` catch a regression
+// directly instead of silently reading garbage).
+fn readOneFrame(c: NetConn): (int, bool, string)! {
+  let hdr = readExactRaw(c, 2)?
+  let opcode = int(hdr[0]) & 0x0f
+  let b1 = int(hdr[1])
+  let masked = (b1 & 0x80) != 0
+  let n = readFrameLen(c, b1 & 0x7f)?
+  if (masked) {
+    let _ = readExactRaw(c, 4)?
+  }
+  let payload = readExactRaw(c, n)?
+  return (opcode, masked, payload)
+}
+
+fn readFrameLen(c: NetConn, len7: int): int! {
+  if (len7 <= 125) {
+    return len7
+  }
+  if (len7 == 126) {
+    let e = readExactRaw(c, 2)?
+    return (int(e[0]) << 8) | int(e[1])
+  }
+  let e = readExactRaw(c, 8)?
+  let n = 0
+  let i = 0
+  while (i < 8) {
+    n = (n << 8) | int(e[i])
+    i = i + 1
+  }
+  return n
+}
+
+// Builds one complete frame's wire bytes. An empty `maskKey` builds an
+// unmasked frame — used deliberately in the unmasked-client-frame scenario.
+fn buildFrame(fin: bool, opcode: int, payload: string, maskKey: string): string {
+  let b = newBuilder()
+  b.writeByte(byte((fin ? 0x80 : 0) | opcode))
+  let masked = len(maskKey) > 0
+  writeFrameLen(b, len(payload), masked)
+  if (masked) {
+    writeStr(b, maskKey)
+    let out = newBuilder()
+    let i = 0
+    while (i < len(payload)) {
+      out.writeByte(payload[i] ^ maskKey[i % 4])
+      i = i + 1
+    }
+    writeStr(b, out.toString())
+  } else {
+    writeStr(b, payload)
+  }
+  return b.toString()
+}
+
+fn writeStr(b: Builder, s: string) {
+  let i = 0
+  while (i < len(s)) {
+    b.writeByte(s[i])
+    i = i + 1
+  }
+}
+
+fn writeFrameLen(b: Builder, n: int, masked: bool) {
+  let maskBit = masked ? 0x80 : 0
+  if (n <= 125) {
+    b.writeByte(byte(maskBit | n))
+    return
+  }
+  if (n <= 65535) {
+    b.writeByte(byte(maskBit | 126))
+    b.writeByte(byte(n >> 8))
+    b.writeByte(byte(n))
+    return
+  }
+  b.writeByte(byte(maskBit | 127))
+  let i = 56
+  while (i >= 0) {
+    b.writeByte(byte(n >> i))
+    i = i - 8
+  }
+}
+
+// A masked header declaring `declaredLen` with NO payload bytes following —
+// the server must reject this from the header alone, never by trying to
+// read `declaredLen` bytes that were never sent.
+fn buildOversizedHeader(declaredLen: int): string {
+  let b = newBuilder()
+  b.writeByte(byte(0x80 | opText))
+  b.writeByte(byte(0x80 | 127))
+  let i = 56
+  while (i >= 0) {
+    b.writeByte(byte(declaredLen >> i))
+    i = i - 8
+  }
+  writeStr(b, "MASK")
+  return b.toString()
+}
+
+fn closeCodeOf(payload: string): int {
+  return (int(payload[0]) << 8) | int(payload[1])
+}
+
+// Fragmented text message ("AAA" + "BBB" + "CCC") with a ping injected
+// between the first and second fragments (RFC 6455 §5.4: control frames may
+// interleave a fragmented message; they may not themselves be fragmented).
+// Also the masked-client-frame case: every frame this scenario sends is
+// masked, and the server's replies are checked to NOT be.
+fn scenarioMaskedFragments(): ()! {
+  let (s, port) = startServer()?
+  let ready = chan<int>(1)
+  spawn serverEcho(s, ready)
+  let _ = <- ready
+  let c = rawConnect(port)?
+  let key = "MASK"
+  c.write(buildFrame(false, opText, "AAA", key))?
+  c.write(buildFrame(true, opPing, "PING1", key))?
+  let (pongOp, pongMasked, pongPayload) = readOneFrame(c)?
+  print("maskedPongIsPong=${pongOp == opPong}\n")
+  print("maskedPongUnmasked=${!pongMasked}\n")
+  print("maskedPongPayload=${pongPayload}\n")
+  c.write(buildFrame(false, opContinuation, "BBB", key))?
+  c.write(buildFrame(true, opContinuation, "CCC", key))?
+  let (msgOp, msgMasked, msgPayload) = readOneFrame(c)?
+  print("maskedMsgIsText=${msgOp == opText}\n")
+  print("maskedMsgUnmasked=${!msgMasked}\n")
+  print("maskedMsgPayload=${msgPayload}\n")
+  c.close()
+}
+
+fn scenarioUnmaskedClientFrame(): ()! {
+  let (s, port) = startServer()?
+  let ready = chan<int>(1)
+  spawn serverEcho(s, ready)
+  let _ = <- ready
+  let c = rawConnect(port)?
+  c.write(buildFrame(true, opText, "hi", ""))?
+  let (op, _, payload) = readOneFrame(c)?
+  print("unmaskedClosesWithClose=${op == opClose}\n")
+  print("unmaskedCloseCode=${closeCodeOf(payload)}\n")
+  c.close()
+}
+
+fn scenarioFragmentedControl(): ()! {
+  let (s, port) = startServer()?
+  let ready = chan<int>(1)
+  spawn serverEcho(s, ready)
+  let _ = <- ready
+  let c = rawConnect(port)?
+  c.write(buildFrame(false, opPing, "x", "MASK"))?
+  let (op, _, payload) = readOneFrame(c)?
+  print("fragmentedControlClosesWithClose=${op == opClose}\n")
+  print("fragmentedControlCloseCode=${closeCodeOf(payload)}\n")
+  c.close()
+}
+
+fn scenarioOversizedControl(): ()! {
+  let (s, port) = startServer()?
+  let ready = chan<int>(1)
+  spawn serverEcho(s, ready)
+  let _ = <- ready
+  let c = rawConnect(port)?
+  c.write(buildFrame(true, opPing, repeat("x", 126), "MASK"))?
+  let (op, _, payload) = readOneFrame(c)?
+  print("oversizedControlClosesWithClose=${op == opClose}\n")
+  print("oversizedControlCloseCode=${closeCodeOf(payload)}\n")
+  c.close()
+}
+
+fn scenarioOversizedFrame(): ()! {
+  let (s, port) = startServer()?
+  let ready = chan<int>(1)
+  spawn serverEcho(s, ready)
+  let _ = <- ready
+  let c = rawConnect(port)?
+  let tooBig = defaultLimits().maxFrameBytes + 1
+  c.write(buildOversizedHeader(tooBig))?
+  let start = monotonic().ns
+  let (op, _, payload) = readOneFrame(c)?
+  let elapsedNs = monotonic().ns - start
+  print("oversizedClosesWithClose=${op == opClose}\n")
+  print("oversizedCloseCode=${closeCodeOf(payload)}\n")
+  // Bounded well under the read deadline: proves the server rejected the
+  // header immediately rather than blocking on bytes that were never sent.
+  print("oversizedRejectedFast=${elapsedNs < testDeadlineNs}\n")
+  c.close()
+}
+
+fn scenarioInvalidUtf8(): ()! {
+  let (s, port) = startServer()?
+  let ready = chan<int>(1)
+  spawn serverEcho(s, ready)
+  let _ = <- ready
+  let c = rawConnect(port)?
+  let bad = []byte(1)
+  bad[0] = byte(0x80)
+  c.write(buildFrame(true, opText, string(bad), "MASK"))?
+  let (op, _, payload) = readOneFrame(c)?
+  print("invalidUtf8ClosesWithClose=${op == opClose}\n")
+  print("invalidUtf8CloseCode=${closeCodeOf(payload)}\n")
+  c.close()
+}
+
+fn main() {
+  scenarioMaskedFragments() catch _ {
+    print("scenarioMaskedFragmentsErr\n")
+  }
+  scenarioUnmaskedClientFrame() catch _ {
+    print("scenarioUnmaskedClientFrameErr\n")
+  }
+  scenarioFragmentedControl() catch _ {
+    print("scenarioFragmentedControlErr\n")
+  }
+  scenarioOversizedControl() catch _ {
+    print("scenarioOversizedControlErr\n")
+  }
+  scenarioOversizedFrame() catch _ {
+    print("scenarioOversizedFrameErr\n")
+  }
+  scenarioInvalidUtf8() catch _ {
+    print("scenarioInvalidUtf8Err\n")
+  }
+}
