@@ -1155,6 +1155,51 @@ edge, not within `N` of it. #4200's countdown, its `stress ? 1 : pollThinN()`
 reset and its bounded-latency argument are all deleted, and `pollThinN` with
 them.
 
+**#4204 STRIP MINING WIDENS THAT BOUND FOR ONE LOOP SHAPE, TO AT MOST 256 INNER
+ITERATIONS OF BOUNDED STRAIGHT-LINE WORK.** `stripMine` (`compiler/optstrip.bit`)
+wraps a qualifying counted loop in an outer loop and moves the poll to the outer
+back edge; the inner back edge emits none. `stripSize()` is therefore a LATENCY
+KNOB, not a tuning constant, and raising it raises this bound directly. Four
+things make the widened bound sound, and the first two are what bound it at all:
+
+- **At most `stripSize()` = 256 inner iterations pass between two polls**, by
+  construction: the inner limit is `min(o + 256, n)`, the inner loop exits at
+  `i >= lim`, and the outer back edge polls immediately.
+- **One inner iteration is bounded straight-line work.** The predicate refuses
+  any loop whose body holds a call, an allocation, a closure, inline assembly, a
+  syscall or a nested back edge, so the bound is 256 x (a fixed instruction
+  count) rather than 256 x (something unbounded). A block ending in `unreachable`
+  is exempt — that is the `panic` arm every bounds check lowers to, and a path
+  that does not return cannot delay a poll.
+- **THE INNER LOOP CANNOT ALLOCATE, so it cannot overshoot the heap.** That is
+  the reason the allocation refusal is in the predicate rather than a note here:
+  with no allocation in the body, `heapLive` does not move while a strip runs, so
+  the allocation door cannot cross `gcShouldCollect` and have the crossing sit
+  unnoticed. The collection schedule is unchanged for a thread's own
+  allocations; only a stop requested by ANOTHER thread can be delayed, and only
+  by the first bullet.
+- **THE STRIP COLLAPSES TO ONE ITERATION WHENEVER ANYTHING IS ALREADY ASKING.**
+  The outer loop reads `pollAttention` — the same word the poll reads — once per
+  strip, and takes a strip of one when it is non-zero. So the 256-iteration bound
+  applies only to a request that ARRIVES mid-strip; a request already pending
+  when the strip is chosen is honoured on the very next back edge, exactly as
+  before this pass existed. That read is a plain load, not the poll's `ldar`: it
+  only chooses a strip size, and a stale answer costs at most one wide strip,
+  never a missed stop.
+
+**`BIT_GC=stress` KEEPS ITS EXACT SCHEDULE, by that same read.** Under stress
+`gcShouldCollect` is unconditionally true, so the attention word is set at boot
+and re-set after every poll: every strip is one iteration, every original back
+edge still polls, and every poll still collects. Measured base against branch on
+three probes — a 2000-iteration counted loop, a two-deep nest, and a program
+whose loops the predicate refuses — collections are **4104 = 4104, 521 = 521 and
+634 = 634** on arm64 and **4050 = 4050, 464 = 464, 577/578 = 577/578** on
+x86-64, where that last +/-1 is run-to-run jitter present on the base side too
+(base over five runs: 578 577 577 577 577). Mutation-proven rather than asserted:
+ignoring the attention read and always taking the wide strip drops the
+2000-iteration probe from **4104 to 531**, which is the #4200 shape this
+paragraph exists to prevent.
+
 **Thinning the cheap poll was BUILT AND MEASURED before it was deleted, not
 argued away.** Three configurations, arm64, 21 interleaved rounds under `boxlock
 solo` with the label order rotated per round and a byte-identical copy of the
