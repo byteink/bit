@@ -173,6 +173,21 @@ unaffected, since only the root module's link names are left bare.
 Sizes are fixed on every target for deterministic behavior (this is not Go's
 platform-dependent `int`).
 
+**`append(dst, x...)`** has two admissible operand shapes for each trailing
+value, and the shape is chosen per operand rather than per call:
+
+- the **element** shape — `x` is assignable to `dst`'s element type — which
+  extends `dst` by one element, and
+- the **bytes** shape — `dst` is `[]u8` and `x` is a `string` — which extends
+  `dst` by that string's bytes, in order, and by `len(x)` elements.
+
+A `string` operand is the only one that can denote either shape, so it is the
+only one whose destination is checked: a `string` appended to a `[]u8` takes the
+bytes shape, a `string` appended to a `[]string` is one element, and a `string`
+appended to any other slice is a compile error (**E0130**) naming both shapes.
+Both shapes share `append`'s aliasing rule — the result may share `dst`'s
+backing buffer, so only the returned value is guaranteed to observe the growth.
+
 **`parseFloat(s: string) -> f64`** converts decimal or hexadecimal float text to
 the nearest `f64`. The accepted text is an optional leading `+` or `-` followed
 by either `FLOAT_LIT` (§5.5) or a bare `DIGITS` sequence (§5.5) with no `.` and
