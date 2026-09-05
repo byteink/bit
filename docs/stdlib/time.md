@@ -110,6 +110,15 @@ A `Zone` is not an offset. `Asia/Dubai` is permanently `+04:00`, but
 zone's rules change when a government changes them. The offset is a property of a
 zone **at an instant**, never of the zone alone.
 
+### `DateTime`
+
+A wall-clock reading, a zone, and the offset that zone has at the resulting
+instant, resolved once at construction — "9am on the 1st in Dubai" (see
+[Six types](#six-types-because-a-moment-is-six-different-things)). Immutable:
+every field is readonly and reached only through methods, documented across
+[Converting between types](#converting-between-types),
+[Reading fields](#reading-fields) and [`toString()`](#tostring).
+
 ### `zone(name: string): Zone!`
 
 Loads the zone named `name`. Fails when the name is not a zone the host knows.
@@ -280,15 +289,38 @@ And two that go the other way, dropping information:
 | `DateTime` / `NaiveDateTime` | `Time` | `.time()` |
 | `DateTime` | `NaiveDateTime` | `.naive()` |
 
-**`Date.atTime` and `NaiveDateTime`'s own `.date()`/`.time()` are shipped.**
-`atStartOfDay`, `inZone`, `toTimestamp` and `naive` are not yet — they need a
-`Zone` (#4071), which does not exist yet.
+**All five conversions in the table above are shipped**, along with the three
+that drop information.
 
 ### `Date.atTime(hour: int, minute: int, second: int): NaiveDateTime!`
 
 Combines this date with a time of day: "this date, at this time, somewhere"
 — docs/stdlib/time.md, "Choosing a type". Fails exactly when
 `time(hour, minute, second)` fails; the field bounds are that constructor's.
+
+### `Date.atStartOfDay(z: Zone): DateTime`
+
+This date, at midnight, in `z`. Total: midnight is always `00:00:00`, which
+`time(0, 0, 0)` can never reject, unlike `atTime`.
+
+### `NaiveDateTime.inZone(z: Zone): DateTime`
+
+Reads this wall clock **as** `z`: "this date, at this time, IN `z`". The wall
+clock is kept; the instant is derived from it. Total — the two awkward days
+(see [Daylight saving](#daylight-saving-the-two-awkward-days)) are resolved
+without failing: a wall time in a spring gap pushes forward past the gap, and
+a wall time in an autumn overlap takes the earlier offset.
+
+### `DateTime.toTimestamp(): Timestamp!`
+
+The instant this `DateTime` names, as nanoseconds since the Unix epoch. Fails
+when it falls outside `Timestamp`'s representable range (see
+[Ranges](#ranges)) — never wraps.
+
+### `Timestamp.inZone(z: Zone): DateTime`
+
+This instant, read in `z`. Total — every instant has exactly one offset in any
+zone, so there is nothing to disambiguate.
 
 ### `NaiveDateTime.date(): Date`
 
@@ -298,12 +330,24 @@ The `Date` half.
 
 The `Time` half.
 
+### `DateTime.date(): Date`
+
+The `Date` half of the wall clock.
+
+### `DateTime.time(): Time`
+
+The `Time` half of the wall clock.
+
+### `DateTime.naive(): NaiveDateTime`
+
+The `NaiveDateTime` half — the wall clock, with the zone dropped.
+
 ### `inZone` and `withZone` are different operations
 
 This pair is worth reading twice.
 
-```bit ignore
-import { zone, date } from "std/time"
+```bit
+import { zone, date, DateTime } from "std/time"
 
 fn twoDirections(): DateTime! {
   let dubai = zone("Asia/Dubai")?
@@ -322,6 +366,12 @@ fn twoDirections(): DateTime! {
 `inZone` is on `NaiveDateTime` and on `Timestamp`. `withZone` is on `DateTime`
 only, because only a `DateTime` already has an instant to preserve.
 
+### `DateTime.withZone(z: Zone): DateTime`
+
+Same instant, a different zone's view of it: the instant is kept, the wall
+clock is recomputed for `z`. Total — every instant has exactly one offset in
+any zone.
+
 ---
 
 ## Reading fields
@@ -329,9 +379,10 @@ only, because only a `DateTime` already has an instant to preserve.
 **Shipped on `Date`**: `year()`, `month()`, `day()`, `dayOfWeek()`,
 `dayOfYear()`, `quarter()`, `daysInMonth()` and `weekOfYear()`. **Shipped on
 `Time`**: `hour()`, `minute()`, `second()` and `nanosecond()`. **Shipped on
-`NaiveDateTime`**: all eleven of the above, each forwarding to the matching
-`Date` or `Time` accessor. Everything else below — the `DateTime` fields, and
-the `DateTime`-only and `Timestamp`-only rows — is not yet implemented.
+`NaiveDateTime` and `DateTime`**: all eleven of the above, each forwarding to
+the matching `Date` or `Time` accessor (`DateTime` via its wall clock). The
+`DateTime`-only row below is shipped too; `.ns` (`Timestamp`-only) is a plain
+field, not a method — see [Clocks](#clocks).
 
 ### `Date.year(): int`
 
@@ -416,6 +467,33 @@ Each of the following forwards to the matching accessor on `.date()` or
 
 ### `NaiveDateTime.weekOfYear(): int`
 
+Each of the following forwards to the wall clock — same range, same meaning,
+no field re-derived here.
+
+### `DateTime.year(): int`
+
+### `DateTime.month(): int`
+
+### `DateTime.day(): int`
+
+### `DateTime.hour(): int`
+
+### `DateTime.minute(): int`
+
+### `DateTime.second(): int`
+
+### `DateTime.nanosecond(): int`
+
+### `DateTime.dayOfWeek(): int`
+
+### `DateTime.dayOfYear(): int`
+
+### `DateTime.quarter(): int`
+
+### `DateTime.daysInMonth(): int`
+
+### `DateTime.weekOfYear(): int`
+
 Available on every type that carries the field.
 
 | Method | Returns | On |
@@ -443,6 +521,19 @@ On `DateTime` only:
 | `zone()` | the `Zone` |
 | `offset()` | seconds east of UTC at this instant, `14400` for Dubai |
 | `isDst()` | whether daylight saving is in effect at this instant |
+
+### `DateTime.zone(): Zone`
+
+The zone this instant is being read in.
+
+### `DateTime.offset(): int`
+
+Seconds east of UTC at this instant, `14400` for Dubai.
+
+### `DateTime.isDst(): bool`
+
+Whether daylight saving is in effect at this instant. Not derivable from the
+offset alone: several zones have a non-zero standard offset.
 
 On `Timestamp` only:
 
@@ -543,10 +634,10 @@ fn inDay(t: Timestamp, dayStart: Timestamp, nextDayStart: Timestamp): bool {
 
 ## Comparison
 
-**`isLeapYear()` is shipped, on `Date` and `NaiveDateTime`.** Everything else
-in this section — `isBefore`, `isAfter`, `isSame`, `isBetween`, `compare`,
-`isSameDay`, `isSameMonth`, `isSameYear`, `isWeekend`, `isWeekday`, `isPast`
-and `isFuture` — is not yet implemented.
+**`isLeapYear()` is shipped, on `Date`, `NaiveDateTime` and `DateTime`.**
+Everything else in this section — `isBefore`, `isAfter`, `isSame`,
+`isBetween`, `compare`, `isSameDay`, `isSameMonth`, `isSameYear`, `isWeekend`,
+`isWeekday`, `isPast` and `isFuture` — is not yet implemented.
 
 ### `Date.isLeapYear(): bool`
 
@@ -556,6 +647,10 @@ so 1900 is not a leap year and 2000 is.
 ### `NaiveDateTime.isLeapYear(): bool`
 
 Forwards to `.date().isLeapYear()`.
+
+### `DateTime.isLeapYear(): bool`
+
+Forwards to `.date().isLeapYear()` via the wall clock.
 
 | Method | Meaning |
 |---|---|
@@ -733,11 +828,21 @@ rule.
 joined by an uppercase `"T"`, RFC 3339's date-time separator. With
 nanoseconds: `"2026-09-01T09:00:00.000000500"`.
 
+### `DateTime.toString(): string`
+
+`"2026-09-01T09:00:00+04:00"` — the wall clock's own canonical form
+(`.naive().toString()`) plus a numeric `±HH:MM` offset, never abbreviated to
+`Z` even at a zero offset (that shorthand is `Timestamp.toString`'s alone).
+
+### `Timestamp.toString(): string`
+
+`"2026-09-01T05:00:00Z"` — RFC 3339, always UTC.
+
 ### `toString()`
 
-Each type's canonical form, `Date`, `Time` and `NaiveDateTime` shipped and the
-rest specified below it. Whatever `toString` writes, the matching `parse`
-function reads back to the same value.
+Each type's canonical form. All five rows below are shipped. Whatever
+`toString` writes, the matching `parse` function reads back to the same
+value.
 
 | Type | `toString()` |
 |---|---|

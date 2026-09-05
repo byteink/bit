@@ -278,6 +278,17 @@ rather than pass the failure to a handler. Call this on its own green thread
 
 Writes `res` to the connection and closes it.
 
+### `Exchange.hijack(): Conn`
+
+Takes ownership of the exchange's underlying `std/net` connection for a
+protocol upgrade (e.g. WebSocket, RFC 6455 §4.1 — see `std/websocket`'s
+`upgrade`) that continues past the framing `respond()` assumes: `respond()`
+always writes exactly one HTTP response and closes the connection, which an
+upgraded connection must not do. Call `read()` first, check the request looks
+like the upgrade you expect, then call this instead of `respond()` — never
+both on the same exchange, since the caller now owns the connection's
+lifetime, including closing it.
+
 ### `Server.close()`
 
 Stops listening.
