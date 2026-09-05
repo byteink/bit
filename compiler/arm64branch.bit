@@ -46,10 +46,11 @@
 //
 // Emission-order adjacency then follows from IR adjacency: the fused
 // `emitIcmp`/`emitFcmp` path (arm64select.bit) ends with the flag-setting
-// `cmp`/`fcmp` itself, and `emitCondBranchOnBool` below starts with the
-// conditional branch. Both operand fetches happen before the compare, and
-// neither the destination binding nor the spill store the unfused path ends
-// with is emitted at all.
+// `cmp`/`fcmp` itself, `emitBrCondition` below emits nothing at all on that
+// path, and `emitBr` puts the conditional branch first in every one of its
+// three shapes. Both operand fetches happen before the compare, and neither
+// the destination binding nor the spill store the unfused path ends with is
+// emitted at all.
 
 // Marks each icmp/fcmp whose only consumer is the `br` immediately after it
 // in the same block. Indexed by instruction id, like `skipConst`.
@@ -104,15 +105,23 @@ fn fusedElseCond(f: IrFunc, cmpIdx: int): int {
   return condInvert(fcmpCond(op))
 }
 
-// Emits `br`'s branch to its else edge and returns the fixup to patch once
-// the else code's offset is known. `cond` is the boolean operand and `i` the
-// `br`'s own instruction id.
-fn emitCondBranchOnBool(cx: A64Ctx, i: int, cond: int): int {
+// Emits whatever sets NZCV for `br`, and returns the condition the branch must
+// test to take its ELSE edge. `cond` is the boolean operand and `i` the `br`'s
+// own instruction id. Emits NOTHING on the fused path — the compare is the
+// instruction already emitted immediately before, which is the whole point —
+// so the caller's conditional branch is still the next word in the stream
+// either way, and no flag-clobbering instruction can slip between them.
+//
+// The THEN condition is `condInvert` of what this returns, on both paths:
+// EQ/NE are a condInvert pair, and `fusedElseCond` is itself a `condInvert`,
+// which is an involution. See the NaN reasoning on `fusedElseCond` — it
+// applies unchanged in the other direction.
+fn emitBrCondition(cx: A64Ctx, i: int, cond: int): int {
   if (cond == i - 1 && cx.fuseCmp[cond]) {
-    return emitLocalCondBranch(cx, fusedElseCond(cx.f, cond))
+    return fusedElseCond(cx.f, cond)
   }
   cmpZero(cx.code, getInt(cx, vregOf(cx, cond), scratch1()))
-  return emitLocalCondBranch(cx, condEq())
+  return condEq()
 }
 
 // Does instruction `i` bind a physical register of its own?
@@ -163,15 +172,104 @@ fn arm64DefinesRegister(
 //      block's own last instruction index for the terminator half, and both
 //      call sites place this call last in their arm.
 //
-// Only those two call sites may use this. In particular the THEN edge of `br`
-// must keep its `b` unconditionally: `patchLocalCondBranch` resolves the else
-// fixup to whatever follows it, so dropping the then jump when the else side
-// emits nothing would patch that conditional branch to its own address — an
-// infinite loop, not a slower loop.
+// The restriction this can never lift: an edge whose `b` is elided must be the
+// one the block FALLS INTO, and in `emitBr`'s two-shape below that is decided
+// per shape, not per edge. Under the both-edges-inline shape the THEN edge
+// still keeps its `b` unconditionally — `patchLocalCondBranch` resolves the
+// else fixup to whatever follows it, so dropping the then jump there would
+// patch that conditional branch to its own address, an infinite loop rather
+// than a slower loop. `emitBr` calls this for THEN only in the shape that
+// emits no local fixup at all.
 fn emitJumpOrFallThrough(cx: A64Ctx, curBlock: int, i: int, target: int) {
   let b = cx.f.blocks[curBlock]
   if (target == curBlock + 1 && i == b.instsStart + b.instsLen - 1) {
     return
   }
   emitJumpFixup(cx, target)
+}
+
+// ===========================================================================
+// #4348: one conditional branch, not a b.cond to a trampoline that jumps again
+// ===========================================================================
+//
+// The both-edges-inline shape below is what `br` always emitted. It skips the
+// THEN edge's inline code with a local conditional branch, so when NEITHER
+// edge has any inline code it degenerates to three branches doing one branch's
+// work — 728 of the 851 conditional branches in the `matrix` bench binary:
+//
+//     cmp   x23, x19
+//     b.ge  L        <- 8 bytes down
+//     b     THEN     <- and THEN is the very next block
+//   L: b     ELSE
+//
+// An edge only needs code of its own for two reasons — a back-edge safepoint
+// poll, and the target block's parameter moves — so when one edge needs
+// neither, the conditional branch can name that edge's BLOCK directly and the
+// other edge takes the fall-through. `emitCondJumpFixup` resolves against
+// `blockOffsets` at the end of the function exactly as the unconditional
+// `emitJumpFixup` does.
+//
+// Nothing here moves a safepoint. Both shapes emit the poll for an edge on
+// that edge's own path and nowhere else, and the ORDER in which the two edges'
+// polls are emitted is unchanged — which is what `recordSafepoint`'s
+// `sm.pos == cx.safepointPositions[...]` assert is checking, since the stack
+// maps are consumed in the order `buildIntervals` collected them.
+//
+// Block order is untouched: this decides how to reach a block, never where a
+// block goes.
+
+// Does `br`'s edge to `target` need any code emitted ON the edge? Only two
+// things can live there: a back-edge safepoint poll, and the target block's
+// parameter moves. `moves` is that edge's already-built parallel move, so this
+// is exact rather than a guess from the argument count — an edge whose every
+// argument is already in its parameter's location emits nothing, and 9 of the
+// 20 trampolines left in `matrix`'s `_main` were exactly that case.
+fn brEdgeNeedsInlineCode(
+  cx: A64Ctx, curBlock: int, target: int, moves: []PMove,
+): bool {
+  if (isBackEdge(curBlock, target) && !needsNoSafepoints(cx.f)) {
+    return true
+  }
+  return !pmovesAllIdentity(moves)
+}
+
+// Emits the whole of `br`. `i` is its instruction id, which is its block's
+// last, so either edge is a legal fall-through candidate.
+fn emitBr(cx: A64Ctx, curBlock: int, i: int, ins: IrInstr) {
+  let elseCond = emitBrCondition(cx, i, ins.lhs)
+  let thenMoves = blockArgMoves(cx, ins.ival, ins.thenArgs)
+  let elseMoves = blockArgMoves(cx, ins.ival2, ins.elseArgs)
+  let thenInline = brEdgeNeedsInlineCode(cx, curBlock, ins.ival, thenMoves)
+  let elseInline = brEdgeNeedsInlineCode(cx, curBlock, ins.ival2, elseMoves)
+  // THEN needs nothing: branch straight to it and let ELSE have the tail.
+  // Preferred over the mirror when ELSE is the next block, because then the
+  // tail costs nothing either and the whole `br` is one instruction.
+  if (!thenInline && (elseInline || ins.ival2 == curBlock + 1)) {
+    emitCondJumpFixup(cx, condInvert(elseCond), ins.ival)
+    emitBrEdgeTail(cx, curBlock, i, ins.ival2, elseMoves)
+    return
+  }
+  // ELSE needs nothing: branch straight to it and let THEN have the tail.
+  if (!elseInline) {
+    emitCondJumpFixup(cx, elseCond, ins.ival2)
+    emitBrEdgeTail(cx, curBlock, i, ins.ival, thenMoves)
+    return
+  }
+  // Both edges carry code, so one of them has to be jumped over.
+  let elseFixup = emitLocalCondBranch(cx, elseCond)
+  emitBackEdgeSafepointIfNeeded(cx, curBlock, ins.ival)
+  sequentializeAndEmit(cx, thenMoves)
+  emitJumpFixup(cx, ins.ival)
+  patchLocalCondBranch(cx, elseFixup)
+  emitBrEdgeTail(cx, curBlock, i, ins.ival2, elseMoves)
+}
+
+// The fall-through edge's own code, then its jump — elided when `target` is
+// the next block, which is `emitJumpOrFallThrough`'s whole job.
+fn emitBrEdgeTail(
+  cx: A64Ctx, curBlock: int, i: int, target: int, moves: []PMove,
+) {
+  emitBackEdgeSafepointIfNeeded(cx, curBlock, target)
+  sequentializeAndEmit(cx, moves)
+  emitJumpOrFallThrough(cx, curBlock, i, target)
 }
