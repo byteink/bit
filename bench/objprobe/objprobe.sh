@@ -394,5 +394,14 @@ if [ -n "$BASELINE" ]; then
     printf "objprobe: collections %s -> %s = %.3fx (SAFETY: a rise is the finding, a fall is not a win)\n", bc, nc, (bc > 0 ? nc/bc : 0)
     if (bo != no) print "objprobe: WARNING -- the two runs constructed different object counts, so this is\nobjprobe:   not a controlled comparison. Fix the subject or -n before quoting it."
   }'
+  # The measured NULL of this comparison, so a child knows what a ratio is worth
+  # before quoting one. Same tree, same arm, same n, nothing changed between the
+  # two runs, 25 runs per point under boxlock solo with a foreign 100%-CPU
+  # process on the box (2026-09-05): 149.78 -> 150.24, a ratio of 1.003x. Across
+  # three such runs the headline spanned 149.78-150.60, 0.55%.
+  echo "objprobe: NULL for this comparison, measured: two runs of the SAME tree and the same"
+  echo "objprobe:   arm gave 1.003x, and three gave a 0.55% span. Read any ratio inside about"
+  echo "objprobe:   0.5% as this instrument's noise, not as a result. Widen -r, or take the box"
+  echo "objprobe:   with '.claude/boxlock.sh solo', before claiming anything smaller."
 fi
 notes
