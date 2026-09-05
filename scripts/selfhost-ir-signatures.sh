@@ -71,9 +71,21 @@
 #
 #   delta(slice_len)=N   delta(icmp_ult)=N   delta(br)=N
 #   delta(const_string)=N   delta(rt_call:panic)=N   delta(unreachable)=N
-#   delta(add)=N+Nn   delta(shl)=Nn   delta(const_int)=Nn
+#   delta(add)=N+Nn   delta(shl)=Nn   delta(const_int)=Nn-N
 #   delta(index_get)=N-Nn   Nn>=0   Nf>=0
 #   every OTHER opcode: delta==0 (pre-opt only — see POST-OPT below)
+#
+#   #4370 CORRECTED THE const_int TERM from Nn to Nn-N. #3120 (ABI.md §9,
+#   landed after this signature was first derived) gave `rt_call slice_get`
+#   a THIRD operand, `elem_size`, emitted as its own `const_int` immediately
+#   ahead of every non-inlined call. Inlining removes the whole call AND that
+#   preceding const_int, so each of the N accesses this signature explains
+#   also removes one const_int the un-narrowed identity below never counted —
+#   independent of and additional to the Nn narrow-prim shift-count consts
+#   the formula already had. Verified against a real oracle dump (`bit-oracle
+#   --dump-ir-pre` on `_tests_/cases/run_forof_slice.bit`): each surviving
+#   `rt_call slice_get(%h, %i, %sz)` is preceded by its own `%sz = const_int
+#   i64 8`, absent from the inlined replacement entirely.
 #
 # 145/145 EXPLAINED, 0 UNEXPLAINED at pre-opt, with every coefficient an
 # independent equation — not vacuous. Mutation-tested against a real bug
@@ -133,7 +145,7 @@
 #
 #   delta(slice_len)=delta(icmp_ult)=delta(br)=N
 #   delta(const_string)=delta(rt_call:panic)=delta(unreachable)=N
-#   delta(add)=N+Nn   delta(shl)=Nn   delta(const_int)=Nn
+#   delta(add)=N+Nn   delta(shl)=Nn   delta(const_int)=Nn-N
 #   delta(index_get)=Ng-Nn   delta(index_set)=Ns
 #   every OTHER opcode: delta==0 (pre-opt only)
 #
@@ -141,7 +153,16 @@
 # approximation: #3108 inlines a store only when the element is exactly 8
 # bytes, because `rtSliceSet` writes a whole word and a narrow store does not
 # (it would leave the other seven bytes, which `rtSliceGet` still returns
-# whole). So no store ever takes the shl/const_int arm.
+# whole). So no store ever takes the shl arm, and the const_int term's -N
+# half is the ONLY effect a store contributes to const_int: `rt_call
+# slice_set(%h, %i, %v, %sz)` carries the identical elem_size `const_int`
+# operand `slice_get` does (`compiler/lowerflow.bit`'s `lowerIndexStore`,
+# `compiler/loweraccess.bit`'s `emitInlineSliceSet` emits none), so each
+# inlined store removes exactly one const_int and zero shl, same as a wide
+# read. #4370 folds this into the single `Nn-N` term above rather than
+# forking read/store, verified against a real oracle dump
+# (`bit-oracle --dump-ir-pre` on a narrow-element store: `%3 = const_int i64
+# 8` / `%4 = rt_call slice_set(%0, %1, %2, %3) void`).
 #
 # Setting Ns=0 recovers #3107's identity character for character, which is why
 # a read-only delta still prints `3107-slice-read-inline` and that self-check
@@ -240,7 +261,12 @@ explainMismatch() {
         if (Nn < 0)                       ok = 0
         if (delta["add"] != N + Nn)       ok = 0
         if (delta["shl"] != Nn)           ok = 0
-        if (delta["const_int"] != Nn)     ok = 0
+        # #4370: was `!= Nn` — #3120 (ABI.md §9) gave slice_get/slice_set a
+        # third/fourth `elem_size` operand, its own preceding `const_int`,
+        # which inlining removes along with the call. Each of the N inlined
+        # accesses (read or store) removes one such const_int in addition to
+        # whatever the narrow-prim shl arm adds.
+        if (delta["const_int"] != Nn - N) ok = 0
         # The narrow-prim arm (Nn) is READ-ONLY: #3108 inlines a store only when
         # the element is exactly 8 bytes, because `rtSliceSet` writes a whole
         # word and a narrow store does not. So every inlined store contributes
@@ -443,17 +469,26 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   # `xs[i]` read, plain element type, no float round-trip. Every opcode named
   # in the identity appears with exactly the delta the formula requires and
   # nothing else changes.
-  oracle_explained='%1 = rt_call slice_get(%0, %i)'
-  bit2_explained='%1 = slice_len(%0)
-%2 = icmp_ult %i, %1
-br %2, bb1, bb2
-%3 = const_string "index out of range"
-%4 = rt_call panic(%3)
+  #
+  # Both sides are real dump text (#4370), not hand-tuned to satisfy the
+  # equation: `oracle_explained` is `bit-oracle --dump-ir-pre` on a `[]i64`
+  # slice read (elem_size const_int + 3-operand rt_call slice_get, #3120,
+  # ABI.md §9); `bit2_explained` is `bit-out/bin/bit --dump-ir-pre` on the
+  # identical source, renumbered from real register ids.
+  oracle_explained='%1 = const_int i64 8
+%2 = rt_call slice_get(%0, %i, %1) i64'
+  bit2_explained='%1 = slice_len %0
+%2 = icmp_ult bool %i, %1
+br %2, bb2(), bb1()
+bb1():
+%4 = const_string "index out of range"
+%5 = rt_call panic(%4) void
 unreachable
-%5 = field_get %0, 0
-%6 = field_get %0, 0
-%7 = add %5, %6
-%8 = index_get %0, %i'
+bb2():
+%7 = field_get %0[0] i64
+%8 = field_get %0[16] i64
+%9 = add i64 %8, %i
+%10 = index_get %7[%9] i64'
 
   sig=$(explainMismatch "$oracle_explained" "$bit2_explained" ir)
   rc=$?
@@ -466,17 +501,28 @@ unreachable
   # Nn = 0. Same prologue as the read (the two share `emitInlineSliceElem`),
   # ending in `index_set` instead of `index_get` — and `index_set` is a void op,
   # so this also pins the recognizer line that makes it visible at all.
-  oracle_store='%1 = rt_call slice_set(%0, %i, %v) void'
-  bit2_store='%1 = slice_len(%0)
-%2 = icmp_ult %i, %1
-br %2, bb1, bb2
-%3 = const_string "index out of range"
-%4 = rt_call panic(%3)
+  #
+  # `oracle_store` is real dump text (#4370): `bit-oracle --dump-ir-pre` on a
+  # narrow-element `xs[i] = v` store, which never inlines (`canInlineSliceStore`
+  # requires an 8-byte element) and so still shows the un-narrowed
+  # `elem_size`-carrying call on BOTH oracle and branch — the exact operand
+  # shape an 8-byte store's call took before #3108 inlined it, which is the
+  # transform this fixture models. `bit2_store` is `--dump-ir-pre` on an
+  # actual `[]i64` store, renumbered from real register ids.
+  oracle_store='%1 = const_int i64 8
+%2 = rt_call slice_set(%0, %i, %v, %1) void'
+  bit2_store='%1 = slice_len %0
+%2 = icmp_ult bool %i, %1
+br %2, bb2(), bb1()
+bb1():
+%4 = const_string "index out of range"
+%5 = rt_call panic(%4) void
 unreachable
-%5 = field_get %0, 0
-%6 = field_get %0, 0
-%7 = add %5, %6
-index_set %0[%7] = %v'
+bb2():
+%7 = field_get %0[0] i64
+%8 = field_get %0[16] i64
+%9 = add i64 %8, %i
+index_set %7[%9] = %v'
 
   sigs=$(explainMismatch "$oracle_store" "$bit2_store" ir)
   rcs=$?
