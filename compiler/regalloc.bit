@@ -265,6 +265,80 @@ fn crossesPoint(iv: LiveInterval, p: int): bool {
   return iv.start < p && iv.end >= p
 }
 
+// True iff `iv` is one of the live references the stack map for a safepoint at
+// `p` will name — the SAME predicate the stack-map loop at the bottom of
+// `allocateCoalesced` applies, spelled once here so the two can never disagree.
+//
+// It is deliberately WIDER than `crossesPoint` by exactly one case, `start == p`
+// (a reference DEFINED by the call at `p`, e.g. a gc_alloc result): the stack
+// map names it, `crossesPoint` does not. That one case is why the two questions
+// cannot share a predicate, and why a register file that answers only the
+// clobber question is not safe for references — see `computeRestricted`.
+fn rootedAtPoint(iv: LiveInterval, p: int): bool {
+  return iv.isRef && iv.start <= p && iv.end >= p
+}
+
+// Per interval position, may it NOT hold a caller-saved register?
+//
+// Two independent reasons, and conflating them is a miscompile:
+//
+//  1. CLOBBER (#3171). The interval is live ACROSS a position where the
+//     target's caller-saved registers are destroyed — `crossesPoint` over
+//     `clobbers`. An empty `clobbers` restores the plain Poletto & Sarkar scan
+//     exactly, register for register.
+//
+//  2. ROOTING (#4343). The interval holds a live GC REFERENCE that some
+//     safepoint's stack map will name — `rootedAtPoint` over `safepoints`.
+//     runtime/ABI.md §4 is explicit: the safepoint shim writes the callee-saved
+//     file ONLY and leaves the rest of its snapshot untouched, so "a stack map
+//     can only ever name a register the shim did save". A reference reported in
+//     a caller-saved register is read out of an unwritten slot — a MISSED root
+//     for any frame the walk unwinds into, i.e. a use-after-free, not a slow
+//     program. Until #4343 this held for free: a safepoint-bearing function had
+//     no caller-saved register in its int file at all.
+//
+// Reason 2 is gated on the caller having REPORTED a callee-saved mask, which is
+// the meaning `RegFile.calleeSaved`'s zero default already carries. It is not
+// gated on `clobbers`, deliberately: a backend may legitimately leave a
+// non-returning call out of `clobbers` (nothing can read a register it
+// destroyed) while that same call is still a safepoint that emits a stack map.
+fn computeRestricted(
+  scan: []LiveInterval, safepoints: []int, clobbers: []int, csMask: int,
+): []bool {
+  let out = []bool(0)
+  let i = 0
+  while (i < len(scan)) {
+    out = append(out, intervalRestricted(scan[i], safepoints, clobbers, csMask))
+    i = i + 1
+  }
+  return out
+}
+
+// Bounded by len(clobbers) + len(safepoints), both function-local and finite —
+// the same bound the stack-map loop already carries.
+fn intervalRestricted(
+  iv: LiveInterval, safepoints: []int, clobbers: []int, csMask: int,
+): bool {
+  let ci = 0
+  while (ci < len(clobbers)) {
+    if (crossesPoint(iv, clobbers[ci])) {
+      return true
+    }
+    ci = ci + 1
+  }
+  if (!iv.isRef || csMask == 0) {
+    return false
+  }
+  let si = 0
+  while (si < len(safepoints)) {
+    if (rootedAtPoint(iv, safepoints[si])) {
+      return true
+    }
+    si = si + 1
+  }
+  return false
+}
+
 class SpillEntry {
   idx: int,
   slot: int,
@@ -495,18 +569,27 @@ fn propagateAliasLocations(locations: []RegLoc, scan: []LiveInterval, alias: []b
 // derives a GC stack map for each position in `safepoints`.
 //
 // `clobbers` (#3171) names every position at which the target's caller-saved
-// registers are destroyed. It is a SUPERSET of `safepoints`: a backend may emit
-// a runtime helper call the collector never sees — x64's poll-address prefetch
-// between the entry parameter binding and the first body instruction
-// (compiler/x64controlflow.bit's xEmitPollCachePrefetch) is one — and such a
-// call clobbers registers without producing a stack map. Only `safepoints`
-// yields StackMapEntries, and it does so one per element in the given order, so
-// the two lists must stay separate rather than being merged.
+// registers are destroyed AND a later instruction can still read one. Neither
+// list contains the other, and merging them is wrong in both directions:
+//
+//   - a clobber that is no safepoint: a runtime helper call the collector never
+//     sees, such as the poll-address prefetch between the entry parameter
+//     binding and the first body instruction (xEmitPollCachePrefetch /
+//     emitPollCachePrefetch). It destroys registers and produces no stack map.
+//   - a safepoint that is no clobber: a call that never RETURNS, such as a
+//     bounds check's `bit_rt_panic`. It still emits a stack map, but no later
+//     instruction can read a register it destroyed, so restricting intervals
+//     that merely span it in index order buys nothing and costs registers.
+//
+// Only `safepoints` yields StackMapEntries, and it does so one per element in
+// the given order.
 //
 // An interval live across any clobber position is restricted to the registers
 // `RegFile.calleeSaved` marks; when that subset is empty for its class the
 // interval spills. An empty `clobbers` restores the plain Poletto & Sarkar
-// scan exactly, register for register.
+// scan exactly, register for register — except for the GC-rooting restriction
+// `computeRestricted` documents, which a non-zero `RegFile.calleeSaved` turns
+// on independently.
 fn allocate(
   target: TargetRegs,
   intervals: []LiveInterval,
@@ -586,25 +669,11 @@ fn allocateCoalesced(
   let alias = mergeAliases(scan, posOf, roots)
   let order = rootOrder(orderByStart(scan), alias)
 
-  // #3171: which intervals may not hold a caller-saved register. Indexed by
-  // interval array position (the main loop's `idx`), not by vreg. Bounded by
-  // n * len(clobbers), both function-local and finite — the same bound the
-  // stack-map loop below already carries.
-  let restricted = []bool(0)
-  i = 0
-  while (i < n) {
-    let crosses = false
-    let ci = 0
-    while (ci < len(clobbers)) {
-      if (crossesPoint(scan[i], clobbers[ci])) {
-        crosses = true
-        break
-      }
-      ci = ci + 1
-    }
-    restricted = append(restricted, crosses)
-    i = i + 1
-  }
+  // #3171/#4343: which intervals may not hold a caller-saved register. Indexed
+  // by interval array position (the main loop's `idx`), not by vreg.
+  let restricted = computeRestricted(
+    scan, safepoints, clobbers, target.intRegs.calleeSaved,
+  )
 
   let oi = 0
   while (oi < len(order)) {
@@ -689,7 +758,7 @@ fn allocateCoalesced(
     i = 0
     while (i < n) {
       let iv = scan[i]
-      if (iv.isRef && iv.start <= pos && iv.end >= pos) {
+      if (rootedAtPoint(iv, pos)) {
         let loc = locations[iv.vreg]
         if (loc.isSpill) {
           slots = append(slots, loc.index)

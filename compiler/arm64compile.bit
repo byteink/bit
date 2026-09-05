@@ -89,23 +89,138 @@ fn hasDivZeroGuard(ctx: TypeContext, f: IrFunc): bool {
 // it's the incoming return address, not a vreg location. So frame layout
 // keys off the declared clobber directly rather than the (silently
 // ineffective) exclusion.
-fn hasAsmLrClobber(module: IrModule, f: IrFunc): bool {
+// runtime/ABI.md §4, asserted rather than argued: "a stack map can only ever
+// name a register the shim did save", and the safepoint shim writes the
+// callee-saved file ONLY, leaving the rest of its snapshot untouched. So a
+// live reference reported in a caller-saved register is read out of an
+// unwritten snapshot slot — a MISSED root for any frame the walk unwinds into.
+//
+// Until #4343 this held for free, because a safepoint-bearing function had no
+// caller-saved register in its file at all. It now rests on regalloc's
+// `rootedAtPoint` restriction, which is a different predicate in a different
+// file, so it is checked here at the one point where both the stack maps and
+// the physical register file exist. Bounded by the total number of live
+// references across all safepoints, which the map already enumerates.
+fn arm64TargetRegs(intRegs: []int, floatRegs: []int): TargetRegs {
+  return TargetRegs{
+    intRegs: RegFile{ count: len(intRegs), calleeSaved: calleeSavedIntMask(intRegs) },
+    floatRegs: RegFile{
+      count: len(floatRegs),
+      calleeSaved: calleeSavedFloatMask(floatRegs),
+    },
+  }
+}
+
+fn assertStackMapsCalleeSaved(result: RegAllocResult, intRegs: []int) {
+  let si = 0
+  while (si < len(result.stackMaps)) {
+    let sm = result.stackMaps[si]
+    let ri = 0
+    while (ri < len(sm.regs)) {
+      assert(
+        isCalleeSavedInt(intRegs[sm.regs[ri]]),
+        "stack map names a caller-saved register (runtime/ABI.md §4)",
+      )
+      ri = ri + 1
+    }
+    si = si + 1
+  }
+}
+
+fn asmClobbersLr(module: IrModule, ins: IrInstr): bool {
+  if (ins.op != Op.Asm) {
+    return false
+  }
+  let blk = module.asmBlocks[ins.ival]
+  let j = 0
+  while (j < len(blk.clobArm64)) {
+    if (blk.clobArm64[j] == 30) {
+      return true
+    }
+    j = j + 1
+  }
+  return false
+}
+
+// Every instruction slot holding such a block. #4343: these are REGISTER
+// clobber points as well as a frame-layout signal, and that only became
+// load-bearing when the int file widened past the callee-saved subset — before
+// it, a function containing one always also had safepoints (or ran on the full
+// file with nothing to protect), so the caller-saved registers an asm `bl`
+// destroys held nothing live either way.
+fn asmLrClobberPositions(module: IrModule, f: IrFunc): []int {
+  let out = []int(0)
   let i = 0
   while (i < len(f.instrs)) {
-    let ins = f.instrs[i]
-    if (ins.op == Op.Asm) {
-      let blk = module.asmBlocks[ins.ival]
-      let j = 0
-      while (j < len(blk.clobArm64)) {
-        if (blk.clobArm64[j] == 30) {
-          return true
-        }
-        j = j + 1
-      }
+    if (asmClobbersLr(module, f.instrs[i])) {
+      out = append(out, i)
     }
     i = i + 1
   }
-  return false
+  return out
+}
+
+fn hasAsmLrClobber(module: IrModule, f: IrFunc): bool {
+  return len(asmLrClobberPositions(module, f)) > 0
+}
+
+// Every position at which this function's emitted code destroys the caller-saved
+// registers — compiler/regalloc.bit's `clobbers`, a superset of `safepoints`.
+//
+// The poll-cache prefetch half is taken from `xClobberPoints` rather than
+// re-derived: both backends emit that prefetch under the same predicate
+// (hasBackEdgeSafepoint) at the same point — after the incoming-argument bind,
+// before the entry block's first body instruction — so the position is one
+// expression over IrFunc alone with no register file in it. Spelling it twice
+// is how a change to WHERE the prefetch is emitted updates one backend and
+// silently leaves the other handing out a register that call destroys. The `x`
+// prefix is historical; nothing in it is x86-specific.
+//
+// The panic helpers this backend emits inline (bit_rt_panic_nil_call,
+// bit_rt_panic_nil_iface, bit_rt_panic_div_zero, bit_rt_panic_overflow) are
+// deliberately absent, on the same grounds x64 states: none of them returns, so
+// no later instruction can read a register they destroyed.
+fn arm64ClobberPoints(module: IrModule, f: IrFunc, safepoints: []int): []int {
+  let out = xClobberPoints(f, nonReturningFiltered(f, safepoints))
+  for p of asmLrClobberPositions(module, f) {
+    out = append(out, p)
+  }
+  return out
+}
+
+// True iff the instruction at `pos` is a call whose very next instruction is
+// `Op.Unreachable` — a bounds check's `bit_rt_panic`, a `fail` that cannot be
+// caught, any lowering that ends "call, then unreachable".
+//
+// Such a call is still a SAFEPOINT (it emits a stack map, and `recordSafepoint`
+// stays in lockstep with buildIntervals' scan), but it is not a CLOBBER: the
+// only instruction that can follow it is `Op.Unreachable`, which emits a `udf`
+// and reads no register. That holds whether or not the callee really returns —
+// a returning callee falls into the trap instead of reading anything.
+//
+// It matters because a bounds check's panic block sits in the middle of the
+// enclosing loop's INDEX range while sitting off its control-flow path
+// entirely. `crossesPoint` is a linear index test, so every address temporary
+// computed before the check and used after it counted as live across a call
+// that can never return, and was confined to x19..x28 for that reason alone.
+fn isNonReturningCall(f: IrFunc, pos: int): bool {
+  if (pos + 1 >= len(f.instrs)) {
+    return false
+  }
+  if (!isSafepointOp(f.instrs[pos].op)) {
+    return false // a back-edge poll: recorded at its Jump/Br terminator
+  }
+  return f.instrs[pos + 1].op == Op.Unreachable
+}
+
+fn nonReturningFiltered(f: IrFunc, safepoints: []int): []int {
+  let out = []int(0)
+  for p of safepoints {
+    if (!isNonReturningCall(f, p)) {
+      out = append(out, p)
+    }
+  }
+  return out
 }
 
 // #3915 (revisits #3284): a call this backend emits or admits that
@@ -146,14 +261,15 @@ fn compileFunction(module: IrModule, f: IrFunc, debug: bool): FuncCode {
 
   // Any emitted safepoint is a bl (a real call/rt_call/etc. OR the synthetic
   // bit_rt_safepoint a loop back-edge inserts), and every bl clobbers the
-  // caller-saved GPRs — so a function with ANY safepoint must draw only from the
-  // callee-saved subset. built.safepoints is the exact set of bls buildIntervals
+  // caller-saved GPRs. built.safepoints is the exact set of bls buildIntervals
   // recorded (calls + back-edges), so it is the single source of truth; a bare
   // has-calls op scan missed the back-edge case, leaving a loop-carried value in
   // a caller-saved register that the back-edge safepoint then destroyed (#1236).
+  // Since #4343 it no longer narrows the register file — it only decides frame
+  // shape (below) — because the allocator restricts per interval instead.
   let hasSafepoints = len(built.safepoints) > 0
-  let intRegs = buildIntRegs(hasSafepoints)
-  let floatRegs = buildFloatRegs(hasSafepoints)
+  let intRegs = buildIntRegs()
+  let floatRegs = buildFloatRegs()
 
   // #2925: does `f` close at least one loop back-edge with a real poll (the
   // exact predicate emitBackEdgeSafepointIfNeeded gates on)? Scanned ahead of
@@ -190,34 +306,32 @@ fn compileFunction(module: IrModule, f: IrFunc, debug: bool): FuncCode {
   }
   intRegs = allocRegs
 
-  // No clobber positions, and that is not an omission (#3171). This backend
-  // still uses the WHOLE-FUNCTION approximation above: buildIntRegs and
-  // buildFloatRegs already hand back only the callee-saved subset — x19..x28
-  // and d8..d15 — whenever `hasSafepoints`, so no vreg can be in a
-  // call-clobbered register in the first place and the per-interval rule has
-  // nothing left to restrict. x64 needs the rule because AAPCS64's d8..d15 have
-  // no SysV counterpart: its callee-saved XMM subset is EMPTY, so the same
-  // approximation there means no float register at all.
+  // #4343: the per-interval rule (#3171), which this backend passed up until
+  // now. Both files are the full pool; `calleeSaved` says which of their
+  // members survive a call, and `clobbers` says where the calls are, so an
+  // interval live across one is confined to x19..x28 / d8..d15 and one that is
+  // not may take anything. An over-reported mask is a miscompile, not a missed
+  // optimization — calleeSavedIntMask/calleeSavedFloatMask derive it from the
+  // same isCalleeSavedInt/isCalleeSavedFloat the prologue's save set uses.
   //
-  // `calleeSaved` is left 0 for the same reason: it is read only when clobber
-  // positions are given, and giving none keeps this allocation register-for-
-  // register what it was. Whoever widens either file here must set both — an
-  // over-reported mask is a miscompile, not a missed optimization.
+  // The clobber list is deliberately NOT a superset of `built.safepoints` — see
+  // arm64ClobberPoints. regalloc's GC-rooting restriction (runtime/ABI.md §4: a
+  // stack map may only name a register the safepoint shim saved) reads
+  // `built.safepoints` directly and is gated on the mask above, not on this
+  // list, so narrowing it cannot weaken that guarantee.
   //
   // #3738 passes `built.roots`: a block param every predecessor binds to one
   // value shares that value's location instead of getting its own, which
   // deletes the edge move rather than optimising it. Purely an assignment
   // question, so it is orthogonal to the clobber discussion above.
   let result = allocateCoalesced(
-    TargetRegs{
-      intRegs: RegFile{ count: len(intRegs), calleeSaved: 0 },
-      floatRegs: RegFile{ count: len(floatRegs), calleeSaved: 0 },
-    },
+    arm64TargetRegs(intRegs, floatRegs),
     intervals,
     built.safepoints,
-    []int(0),
+    arm64ClobberPoints(module, f, built.safepoints),
     built.roots,
   )
+  assertStackMapsCalleeSaved(result, intRegs)
 
   let skipConst = computeSkipConstMaterialize(ctx, f, debug)
   let fuseCmp = computeFuseCmpBranch(f)
