@@ -20,7 +20,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."          # repo root
-BIT=./bit-out/bin/bit
+source bench/buildlib.sh         # BIT, CFLAGS, buildBit/buildC/buildGo -- shared with profile.sh
 # Explicit on purpose, NOT a glob over bench/cases/*/ -- that directory holds 13
 # entries and only these 10 have all three of <case>.bit, <case>.go and <case>.c.
 # churn/ and trustcache/ are Bit-only (nothing to compare against) and startup/
@@ -30,7 +30,6 @@ CASES="fib mandelbrot collatz alloc allocflat strings map sort matrix json"
 RUNS=15                          # timed runs per case; see trimmean() for why 15
 CRUNS=3                          # compile-time samples per case; median reported
 STARTUP_ITERS=200                # exec count for startup timing
-CFLAGS="-O2 -ffp-contract=off"   # -ffp-contract=off: match strict IEEE (see README)
 
 command -v go >/dev/null || { echo "go not found on PATH" >&2; exit 1; }
 command -v cc >/dev/null || { echo "cc not found on PATH" >&2; exit 1; }
@@ -97,14 +96,14 @@ for c in $CASES; do
   # --- build (Bit compile time is itself measured) ---
   : > "$WORK/ct"
   i=0; while [ "$i" -lt "$CRUNS" ]; do
-    t0=$(now); "$BIT" build "$d/$c.bit" -o "$WORK/$c.bit" >/dev/null; t1=$(now)
+    t0=$(now); buildBit "$d" "$c" "$WORK/$c.bit" >/dev/null; t1=$(now)
     awk -v a="$t0" -v b="$t1" 'BEGIN{print b-a}' >> "$WORK/ct"
     i=$((i+1))
   done
   cmed=$(median < "$WORK/ct")
   comp_total=$(awk -v s="$comp_total" -v x="$cmed" 'BEGIN{print s+x}'); comp_n=$((comp_n+1))
-  cc $CFLAGS "$d/$c.c" -o "$WORK/$c.c"
-  go build -o "$WORK/$c.go" "$d/$c.go"
+  buildC "$d" "$c" "$WORK/$c.c"
+  buildGo "$d" "$c" "$WORK/$c.go"
 
   # --- correctness gate, doubling as the allocation-count probe ---
   # Both stats env vars write to STDERR only, so stdout stays the answer this
@@ -117,7 +116,7 @@ for c in $CASES; do
   echo "$c go $(tag_allocs "$WORK/ag")" >> "$ALC"
   if grep -q BENCH_ALLOC_STATS "$d/$c.c"; then
     # A counting build, never the timed one: the counter is a malloc macro.
-    cc $CFLAGS -DBENCH_ALLOC_STATS "$d/$c.c" -o "$WORK/$c.cstat"
+    buildC "$d" "$c" "$WORK/$c.cstat" -DBENCH_ALLOC_STATS
     "$WORK/$c.cstat" >/dev/null 2>"$WORK/ac"
     echo "$c c $(tag_allocs "$WORK/ac")" >> "$ALC"
   fi
@@ -147,9 +146,9 @@ for c in $CASES; do
 done
 
 # --- startup: median per-exec ms over a tight loop ---
-"$BIT" build bench/cases/startup/startup.bit -o "$WORK/s.bit" >/dev/null
-cc $CFLAGS bench/cases/startup/startup.c -o "$WORK/s.c"
-go build -o "$WORK/s.go" bench/cases/startup/startup.go
+buildBit bench/cases/startup startup "$WORK/s.bit" >/dev/null
+buildC bench/cases/startup startup "$WORK/s.c"
+buildGo bench/cases/startup startup "$WORK/s.go"
 : > "$WORK/start"
 for l in bit c go; do
   t0=$(now); i=0; while [ "$i" -lt "$STARTUP_ITERS" ]; do "$WORK/s.$l"; i=$((i+1)); done; t1=$(now)
