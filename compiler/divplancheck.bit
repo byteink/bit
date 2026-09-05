@@ -1,0 +1,122 @@
+// In-Bit self-checks for `xDivisorPlan` (x64call.bit) — the single decision
+// both backends' div/rem emitters, arm64's `hasDivZeroGuard` frameless
+// predicate and each backend's skip-the-constant scan share (#4361).
+//
+// Its own file rather than a sibling of either backend's checks: the function
+// is backend-neutral, and `x64selcheck.bit` sits 8 lines under the 800-line
+// limit. Sibling .bit files are the same module, so `selfcheck()` calls these
+// directly.
+//
+// A wrong "yes" here is a SILENT wrong answer, not a slow one: reporting no
+// guard for a divisor that can be zero deletes the panic SPEC §13.5 requires
+// and lets `idiv`/`sdiv` see a zero divisor. That is the reason every arm is
+// pinned individually rather than by sampling.
+
+// One-instruction IrFunc whose instruction 0 is `const_int <v>`.
+fn dpConstFunc(ctx: TypeContext, v: int): IrFunc {
+  let ty = primType(ctx, 3) // i64
+  let c = mkInstr(Op.ConstInt, ty)
+  c.ival = v
+  return IrFunc{
+    name: "c", paramTypes: []int(0), result: ty,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 1 }],
+    instrs: [c], isFallible: false,
+  }
+}
+
+fn dpAssertPlan(p: DivPlan, pow2K: int, guard: bool) {
+  assert(p.pow2K == pow2K)
+  assert(p.guard == guard)
+  // The fourth state is nonsense: a power-of-two path never reads the divisor
+  // register, so a guard in front of it would test an operand nothing uses.
+  assert(!(p.pow2K >= 0 && p.guard))
+}
+
+fn checkDivisorPlan() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  let w64s = mkWidth(8, RegClass.Int, true)
+  let w64u = mkWidth(8, RegClass.Int, false)
+
+  // A positive power of two >= 2: shift path, and no guard because a power of
+  // two is non-zero by construction (the pre-#4361 rule, unchanged).
+  dpAssertPlan(xDivisorPlan(dpConstFunc(ctx, 8), 0, w64s), 3, false)
+  dpAssertPlan(xDivisorPlan(dpConstFunc(ctx, 2), 0, w64s), 1, false)
+
+  // #4361's new arm: a known NON-ZERO literal that is not a power of two keeps
+  // the real divide (pow2K -1) and drops only the guard.
+  dpAssertPlan(xDivisorPlan(dpConstFunc(ctx, 7), 0, w64s), -1, false)
+  dpAssertPlan(xDivisorPlan(dpConstFunc(ctx, 10), 0, w64s), -1, false)
+  dpAssertPlan(xDivisorPlan(dpConstFunc(ctx, 2147483647), 0, w64s), -1, false)
+
+  // Divisor 1 and divisor -1 are non-zero, so the guard goes -- but neither is
+  // a shift. -1 in particular MUST stay a real divide: `INT_MIN / -1` is the
+  // one signed overflow division can produce, and SPEC §13.5 wraps it
+  // two's-complement in a release build, which is exactly what the hardware
+  // `sdiv`/`idiv` already does. Reducing it would change the answer.
+  dpAssertPlan(xDivisorPlan(dpConstFunc(ctx, 1), 0, w64s), -1, false)
+  dpAssertPlan(xDivisorPlan(dpConstFunc(ctx, 0 - 1), 0, w64s), -1, false)
+  dpAssertPlan(xDivisorPlan(dpConstFunc(ctx, 0 - 8), 0, w64s), -1, false)
+
+  // A known ZERO divisor keeps the guard, so the program still panics. It is
+  // never folded into a silent 0 or a silent `lhs`.
+  dpAssertPlan(xDivisorPlan(dpConstFunc(ctx, 0), 0, w64s), -1, true)
+
+  // Not a constant at all: nothing is known, so everything is emitted.
+  let notConst = mkInstr(Op.BlockParam, i64t)
+  let fVar = IrFunc{
+    name: "v", paramTypes: [i64t], result: i64t,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 1, instsLen: 1 }],
+    instrs: [notConst], isFallible: false,
+  }
+  dpAssertPlan(xDivisorPlan(fVar, 0, w64s), -1, true)
+
+  // At an UNSIGNED width, -8 is the huge magnitude 2^64-8: not a power of two,
+  // but still non-zero, so the guard goes and the divide stays.
+  dpAssertPlan(xDivisorPlan(dpConstFunc(ctx, 0 - 8), 0, w64u), -1, false)
+
+  // The guard question is asked of the RAW 64-bit ival, because that is what
+  // `movImm64`/`xEmitConstInt` materialize and what `cmpZero`/`xTestRR` then
+  // compare -- neither truncates to the declared width. 3 * 2^32 in an
+  // i32-typed const masks to ZERO at 32 bits and is still a non-zero register
+  // at run time, which the emitted `sdiv` divides by; folding the check is
+  // therefore correct, and reading the masked value instead would keep a
+  // provably-dead branch. (The whole chain is raw: `xConstPow2Divisor` also
+  // declines it on the raw magnitude, 0x3_00000000, not on the masked 0.)
+  let w32s = mkWidth(4, RegClass.Int, true)
+  dpAssertPlan(xDivisorPlan(dpConstFunc(ctx, 12884901888), 0, w32s), -1, false)
+  // …and the same rawness makes 2^32 at i32 a real power of two, k == 32,
+  // because that is the value the register actually holds.
+  dpAssertPlan(xDivisorPlan(dpConstFunc(ctx, 4294967296), 0, w32s), 32, false)
+
+  // The three named constructors are what the emitters branch on, and no two
+  // of them mean the same thing.
+  dpAssertPlan(runtimeDivPlan(), -1, true)
+  dpAssertPlan(litDivPlan(), -1, false)
+  dpAssertPlan(pow2DivPlan(3), 3, false)
+}
+
+// The emitted-byte half: `litDivPlan()` must drop the zero-check and keep the
+// divide, on BOTH backends. Asserting only "the plan says no guard" would pass
+// against an emitter that ignored the field.
+fn checkDivGuardFold() {
+  let w64 = mkWidth(8, RegClass.Int, true)
+
+  let xGuarded = xTestCtx()
+  xEmitDivInt(xGuarded, XDivOp.SDiv, 0, 0, 0, runtimeDivPlan(), w64)
+  let xFolded = xTestCtx()
+  xEmitDivInt(xFolded, XDivOp.SDiv, 0, 0, 0, litDivPlan(), w64)
+  // The folded form is a strict PREFIX-free suffix match: same cqo+idiv tail,
+  // fewer bytes, and the test/jcc/call is what went.
+  assert(len(xFolded.buf.code) < len(xGuarded.buf.code))
+  assert(xHex(xFolded.buf) == "489948f7f8") // cqo ; idiv %rax -- and nothing else
+  assert(xHex(xGuarded.buf)[len(xHex(xGuarded.buf)) - 10:len(xHex(xGuarded.buf))] == "489948f7f8")
+
+  let aGuarded = selCtx()
+  emitDivInt(aGuarded, Op.SDiv, 0, 1, 2, runtimeDivPlan(), w64)
+  let aFolded = selCtx()
+  emitDivInt(aFolded, Op.SDiv, 0, 1, 2, litDivPlan(), w64)
+  assert(len(aFolded.code.bytes) == 4)                             // one sdiv, nothing else
+  assert(len(aGuarded.code.bytes) == len(aFolded.code.bytes) + 12) // cmp + b.ne + bl
+  assert(len(aFolded.relocs) == 0 && len(aGuarded.relocs) == 1)
+}
