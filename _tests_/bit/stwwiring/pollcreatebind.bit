@@ -1,0 +1,158 @@
+// Split out of stwwiring.bit (#4369): that file was over 800 lines with this
+// check inline. Same module as stwwiring.bit — a directory is its own Bit
+// module (§17.1) — so every name this file reads (Cfg, Obj, eprint,
+// loadObject, tMacos, tLinux) is already imported or declared there.
+// Re-importing any of them here would be E0042 already declared in this scope:
+// an import is per-module, not per-file.
+
+// ---------------------------------------------------------------------------
+// POLL CREATE + BIND, REPAIRED FOR #4344 (#4369)
+// ---------------------------------------------------------------------------
+//
+// The Edge{} checks this replaced looked for a relocation naming
+// `bit_rt_port_sched_poll_create`/`bit_rt_port_sched_set_poll_fd`. #4344's
+// multi-block inliner absorbs both wrapper functions wholesale into `boot`'s
+// own body on both platforms — confirmed by disassembling the emitted object
+// for #4369: `nm` shows neither symbol DEFINED nor referenced anywhere, since
+// a --freestanding object emits only functions still reachable from the root
+// module (see stwwiring.bit's header) and their one caller no longer calls
+// them by name.
+//
+// A first attempt anchored this check on `bootPollFd`, the module `let` that
+// tracks the descriptor for shutdown. That does not work: `objread.bit`'s
+// reader only keeps relocations naming a GLOBAL or UNDEFINED symbol (matching
+// the deleted harness's own `checkEdge`, see stwwiring.bit's header on
+// `RawTarget.global`), and `bootPollFd` is a private, unexported module
+// global — its relocations are LOCAL and never reach `o.relocs` at all, on
+// either platform. Measured, not assumed: the check as written found zero
+// matches on a healthy, unmutated tree.
+//
+// What DOES survive the filter, because both are genuinely external/global
+// symbols the inlined body still calls: on Darwin, `boot` inlines
+// `pollCreate`'s body directly, and its one real syscall dependency is the
+// `extern fn kqueue()` — called from nowhere else in the runtime (grepped),
+// so its mere presence in the freestanding object is non-vacuous proof the
+// inlined create path is reachable. On Linux there is no such unique callee
+// — `syscall(...)` is a compiler builtin lowered straight to `svc`/`syscall`
+// with no symbol at all, and the syscall NUMBER itself gets inlined to a
+// literal. The best available anchor is `bit_rt_port_syscalls_on_x64`, the
+// shared arm64/x64 dispatch helper `sysEpollCreate1` calls before its own
+// inlining — not unique to poll-create on its own (many syscalls use it), so
+// this checks ORDERING instead of bare presence: `boot`'s FIRST call to it
+// must occur before the FIRST call to `bit_rt_port_chan_boot_bind` ("4c.
+// Provision the channel reserve", which source places immediately after both
+// poll-create calls). Measured on the unmutated linux object: the first two
+// `on_x64` relocations are exactly the read- and write-descriptor creates, at
+// offsets before `chan_boot_bind`; every other `on_x64` call in the function
+// comes later. Deleting the poll-create block removes those first two calls
+// entirely, so the new first `on_x64` call — from a later, unrelated syscall
+// — falls after `chan_boot_bind`, and the check goes red (mutation-tested for
+// #4369).
+//
+// NOT INDEPENDENTLY VERIFIED: whether `schedSetPollFd`'s inlined store into
+// the scheduler block (`*(sched + scPollFd) = fd`) survives on its own, as
+// opposed to only the syscall itself running. Both statements are adjacent
+// and unconditional in source on both platforms, and this ticket's
+// disassembly confirms both are present today — but the scheduler-block
+// store is a private struct-field write with no symbol of its own, so a
+// mutation deleting ONLY that one line would not be caught here. The
+// realistic regression this gate exists for (#1673: "nothing called EITHER
+// end") removes both statements together and IS caught.
+const whyPollCreateBind: string = "boot must create the netpoller descriptor and bind it before the channel reserve is provisioned, or scPollFd stays 0 and every socket read that must wait returns an empty string (#1673, #4369)"
+const chanBootBindSym: string = "bit_rt_port_chan_boot_bind"
+
+// The first relocation offset naming exactly `sym` — a real, `@symbol`-pinned
+// or `extern` name (never a mangled module global; see the header above for
+// why that distinction matters here). -1 when nothing matches.
+fn firstRelocOffsetExact(o: Obj, sym: string): int {
+  let best = 0 - 1
+  let i = 0
+  while (i < len(o.relocs)) {
+    if (o.relocs[i].toSym == sym && (best < 0 || o.relocs[i].off < best)) {
+      best = o.relocs[i].off
+    }
+    i = i + 1
+  }
+  return best
+}
+
+// True when `o` shows `markerSym` — the platform's poll-create anchor —
+// referenced BEFORE the channel-reserve bind call. See the header above for
+// why bare presence is not enough on Linux (`markerSym` is shared with other
+// syscalls there) and ordering is what survives inlining on both platforms.
+fn checkPollCreateBindOnObj(path: string, o: Obj, sp: string, markerSym: string): bool {
+  let bindAt = firstRelocOffsetExact(o, "${sp}${chanBootBindSym}")
+  if (bindAt < 0) {
+    eprint(
+        "stwwiring: ${path}: no definition anywhere references " +
+        "'${sp}${chanBootBindSym}' — the anchor this check orders against is " +
+        "gone. This check examined nothing (#4369).\n",
+    )
+    return false
+  }
+  let pollAt = firstRelocOffsetExact(o, "${sp}${markerSym}")
+  if (pollAt < 0) {
+    eprint(
+        "stwwiring: ${path}: 'boot' does not reference '${sp}${markerSym}' " +
+        "at all.\n  ${whyPollCreateBind}.\n",
+    )
+    return false
+  }
+  if (pollAt > bindAt) {
+    eprint(
+        "stwwiring: ${path}: '${sp}${markerSym}' is referenced only AFTER " +
+        "the channel bind — the startup poll-create call is gone.\n" +
+        "  ${whyPollCreateBind}.\n",
+    )
+    return false
+  }
+  return true
+}
+
+// One platform's load parameters, bundled so `checkPollCreateBind` stays
+// under the E0202 parameter-count limit rather than taking each field loose.
+class PollAnchor {
+  path: string,
+  target: string,
+  sp: string,
+  markerSym: string,
+  idx: int,
+}
+
+// Loads `a.path`'s freestanding object and runs `checkPollCreateBindOnObj` on
+// it. A separate load from `runEdges`' shared one in stwwiring.bit — this
+// check's ordering logic does not fit the Edge{} shape, so it cannot share
+// that table's grouping.
+fn checkPollCreateBind(c: Cfg, a: PollAnchor): bool {
+  let o = loadObject(c, a.path, a.target, a.idx)
+  if (!o.ok) {
+    eprint(
+        "stwwiring: could not read the object for ${a.path} (${a.target}); " +
+        "poll-create/bind is UNCHECKED\n",
+    )
+    return false
+  }
+  return checkPollCreateBindOnObj(a.path, o, a.sp, a.markerSym)
+}
+
+// Both platforms, folded into `failed` the same way main()'s other checks
+// are. Pulled out of main() itself (#4369) to keep its own complexity under
+// the E0204 limit — main() was still using `c.script` at the call site, so
+// this must run before `fsRemove(c.script)` there, same as before the split.
+fn checkPollWiring(c: Cfg, failed: int): int {
+  let f = failed
+  let darwinAnchor = PollAnchor{
+    path: "runtime/root/darwin", target: tMacos, sp: "_", markerSym: "kqueue", idx: 201,
+  }
+  let linuxAnchor = PollAnchor{
+    path: "runtime/root/linux", target: tLinux, sp: "",
+    markerSym: "bit_rt_port_syscalls_on_x64", idx: 202,
+  }
+  if (!checkPollCreateBind(c, darwinAnchor)) {
+    f = f + 1
+  }
+  if (!checkPollCreateBind(c, linuxAnchor)) {
+    f = f + 1
+  }
+  return f
+}
