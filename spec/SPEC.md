@@ -2327,9 +2327,17 @@ binder cannot say whether it means the key or the value, and neither guess is
 recoverable once shipped. `for_in` rejects everything that is not a slice,
 array, or map for the same reason in the other direction — there is no index
 or key to give a `string`, a `chan<T>` (a stream, not a container, so it has no
-keys), or anything else. A `(k, v)` pair binder over `for_in` is rejected too,
-and is not even grammatical: Appendix A's `for_in` production takes one
-`IDENT`, unlike `for_of`'s `( IDENT | "(" pat "," pat ")" )`.
+keys), or anything else.
+
+**Pair binder over `for_in` (#4333).** A pair binder is legal over `for_in`
+too, for a slice or array only: `for (i, x) in xs` binds the same two values
+as `for (i, x) of xs` above — `i` the index, `x` the element — and `x` may
+itself be a nested tuple pattern, destructured positionally the same way a
+`let` binding's does (`for (i, (name, n)) in xs` over a slice of 2-tuples). A
+pair binder over `for_in` for a **map** is rejected: `in` already yields the
+map's key alone (`for k in m`), so a pair binder would pair that same key
+with the value a second time, which is redundant rather than meaningful — use
+`for (k, v) of m` to destructure the pair, or `for k in m` for the key alone.
 
 **Field-pattern binder (#4106).** `for_of`'s binder also accepts a `field_pat`
 — `for { a, b, ... } of xs`, legal only when `xs`'s element is a class. Each
@@ -4391,7 +4399,7 @@ while_stmt    = "while" "(" expression ")" block .
 for_stmt      = "for" ( for_c | for_of | for_in | (* empty -> infinite *) ) block .
 for_c         = "(" [ value_decl | assign_stmt ] ";" [ expression ] ";" [ inc_dec_stmt | assign_stmt ] ")" .
 for_of        = ( IDENT | "(" pat "," pat ")" | field_pat ) "of" expression .
-for_in        = IDENT "in" expression .
+for_in        = ( IDENT | "(" pat "," pat ")" ) "in" expression .   (* pair binder: §12.6, #4333 *)
 field_pat     = "{" IDENT { "," IDENT } "}" .   (* for-of field-name binder; §12.6 *)
 switch_stmt   = "switch" [ "(" expression ")" ] "{" { switch_case } "}" .
 switch_case   = "case" expression { "," expression } ":" { statement ";" }
