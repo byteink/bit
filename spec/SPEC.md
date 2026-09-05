@@ -2863,7 +2863,15 @@ See §15.4.
 - Arrays and tuples are comparable if their element types are; classes are
   comparable if all fields are comparable (field-wise).
 - A C-like enum (all variants payload-free) compares with `==`/`!=` by tag, and
-  may be a map key. A payload-carrying enum is not comparable — use `match`.
+  may be a map key. A payload-carrying enum compares STRUCTURALLY (#4341): two
+  values are equal when their tags match and, for that tag, every payload word
+  is equal — the same rule a class gets, applied to a variant's arguments
+  instead of a class's fields. An enum is comparable exactly when every
+  variant's payload is (recursively, by this same rule); a variant carrying a
+  payload type that is not comparable (a slice, a map, a function value, or a
+  class/enum that recursively holds one) makes the WHOLE enum not comparable,
+  and `==`/a map key on it is a compile-time error naming the offending
+  variant and payload type, not a fallback to identity.
 - Maps and functions are **not** comparable except against `nil`. A slice is not
   comparable at all, `nil` included: its zero value is the empty slice (§13.4),
   so there is no `nil` slice to distinguish an empty one from.
@@ -2894,8 +2902,11 @@ let s = Shape.Rect(3.0, 4.0)   // payload variant: construct with arguments
   arguments (`Shape.Rect(3.0, 4.0)`); the argument types and count must match the
   declaration. A no-payload variant is written bare (`Shape.Unit`).
 - Enum values are consumed by `match` (§13.8), which is exhaustive over the
-  variants and binds a variant's payload in its arm. Enums are not ordered and not
-  `==`-comparable in v0.1 — use `match`.
+  variants and binds a variant's payload in its arm. Enums are not ordered.
+  Equality is §14.6: a C-like enum compares by tag, a payload-carrying enum
+  compares structurally when every variant's payload is comparable, and
+  `match` remains the only way to test which variant a non-comparable one
+  holds.
 - An enum may be **generic** (`enum Option<T> { None, Some(T) }`), monomorphized
   per instantiation like a generic class (§14.1, §15). A construction's type
   arguments are usually inferred: from the payload argument (`Option.Some(5)`
