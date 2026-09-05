@@ -1,0 +1,162 @@
+// run
+// #3965: the OTHER masking direction — a server frame must never be masked
+// (RFC 6455 §5.3), checked from the client's side. A hand-rolled fake
+// server (never std/websocket's own `upgrade`) completes a valid handshake
+// and then deliberately sends a MASKED frame, the shape a real server must
+// never produce. A real `dial()`-made client must reject it, and its own
+// reply — a close frame carrying 1002 — is itself masked (client frames
+// always are), which the fake server verifies by decoding it independently.
+import { listen, Listener, Conn as NetConn } from "std/net"
+import { header } from "std/http"
+import { dial, defaultLimits, acceptKey, Message } from "std/websocket"
+import { newBuilder, Builder, indexOf } from "std/strings"
+
+const opText = 1
+const opClose = 8
+
+fn readRequestHeaders(c: NetConn): string! {
+  let buf = ""
+  while (indexOf(buf, "\r\n\r\n") < 0) {
+    let chunk = c.read(4096)
+    if (len(chunk) == 0) {
+      fail newError("test: fake server: connection closed before the request completed")
+    }
+    buf = buf + chunk
+  }
+  return buf
+}
+
+fn writeStr(b: Builder, s: string) {
+  let i = 0
+  while (i < len(s)) {
+    b.writeByte(s[i])
+    i = i + 1
+  }
+}
+
+// A server-to-client frame carrying `payload`, masked — the violation this
+// file exists to check the client rejects.
+fn buildMaskedServerFrame(payload: string): string {
+  let b = newBuilder()
+  b.writeByte(byte(0x80 | opText))
+  let key = "FAKE"
+  b.writeByte(byte(0x80 | len(payload)))
+  writeStr(b, key)
+  let i = 0
+  while (i < len(payload)) {
+    b.writeByte(payload[i] ^ key[i % 4])
+    i = i + 1
+  }
+  return b.toString()
+}
+
+fn readExactRaw(c: NetConn, n: int): string! {
+  let out = ""
+  while (len(out) < n) {
+    let chunk = c.read(n - len(out))
+    if (len(chunk) == 0) {
+      fail newError("test: fake server: connection closed early")
+    }
+    out = out + chunk
+  }
+  return out
+}
+
+// Decodes one frame off `c` WITHOUT assuming it is unmasked — this file
+// expects the client's reply to be masked (every client frame is), unlike
+// wsframing.bit's reader, which only ever reads from a real server.
+fn readOneFrame(c: NetConn): (int, bool, string)! {
+  let hdr = readExactRaw(c, 2)?
+  let opcode = int(hdr[0]) & 0x0f
+  let b1 = int(hdr[1])
+  let masked = (b1 & 0x80) != 0
+  let len7 = b1 & 0x7f
+  let n = len7
+  if (len7 == 126) {
+    let e = readExactRaw(c, 2)?
+    n = (int(e[0]) << 8) | int(e[1])
+  } else if (len7 == 127) {
+    let e = readExactRaw(c, 8)?
+    n = 0
+    let i = 0
+    while (i < 8) {
+      n = (n << 8) | int(e[i])
+      i = i + 1
+    }
+  }
+  let maskKey = ""
+  if (masked) {
+    maskKey = readExactRaw(c, 4)?
+  }
+  let raw = readExactRaw(c, n)?
+  let payload = raw
+  if (masked) {
+    let out = newBuilder()
+    let i = 0
+    while (i < n) {
+      out.writeByte(raw[i] ^ maskKey[i % 4])
+      i = i + 1
+    }
+    payload = out.toString()
+  }
+  return (opcode, masked, payload)
+}
+
+fn closeCodeOf(payload: string): int {
+  return (int(payload[0]) << 8) | int(payload[1])
+}
+
+fn fakeServerBody(c: NetConn): ()! {
+  let reqRaw = readRequestHeaders(c)?
+  let accept = acceptKey(header(reqRaw, "Sec-WebSocket-Key"))
+  let resp = "HTTP/1.1 101 Switching Protocols\r\n" +
+    "Upgrade: websocket\r\n" +
+    "Connection: Upgrade\r\n" +
+    "Sec-WebSocket-Accept: ${accept}\r\n\r\n"
+  c.write(resp)?
+  c.write(buildMaskedServerFrame("should-be-rejected"))?
+  let (op, masked, payload) = readOneFrame(c)?
+  print("fakeServerSeesClose=${op == opClose}\n")
+  print("fakeServerSeesClientFrameMasked=${masked}\n")
+  print("fakeServerSeesCode=${closeCodeOf(payload)}\n")
+  c.close()
+}
+
+fn fakeServer(l: Listener, ready: chan<int>, done: chan<int>) {
+  ready <- 0
+  let c = l.accept() catch _ {
+    done <- 0
+    return
+  }
+  fakeServerBody(c) catch _ {
+    print("fakeServerErr\n")
+  }
+  done <- 0
+}
+
+fn main() {
+  let l = listen("127.0.0.1", 0) catch _ {
+    print("listenFailed\n")
+    return
+  }
+  let port = l.port() catch _ {
+    print("portFailed\n")
+    return
+  }
+  let ready = chan<int>(1)
+  let done = chan<int>(1)
+  spawn fakeServer(l, ready, done)
+  let _ = <- ready
+
+  let recvFailed = false
+  let client = dial("127.0.0.1", port, "/x", defaultLimits()) catch _ {
+    print("dialFailed\n")
+    return
+  }
+  let _ = client.receive() catch _ {
+    recvFailed = true
+    Message{ kind: 0, code: 0, data: "" }
+  }
+  let _ = <- done
+  print("clientRejectedMaskedServerFrame=${recvFailed}\n")
+}

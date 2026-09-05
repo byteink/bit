@@ -1,0 +1,219 @@
+// Bit standard library — websocket module: the RFC 6455 §5 frame codec.
+//
+// Pure wire format: turning a `Conn`'s bytes into a `RawFrame` (header
+// parsed, mask applied, limits enforced) and back. Message-level concerns —
+// fragment reassembly, ping/pong, the close handshake — live in conn.bit;
+// this file only ever sees one frame at a time.
+
+import { randomBytes } from "std/crypto"
+
+// RFC 6455 §5.2 opcodes this implementation recognizes. Anything else is a
+// protocol error (§5.2: "if an unknown opcode is received, the receiving
+// endpoint MUST _Fail the WebSocket Connection_").
+const opContinuation = 0
+const opText = 1
+const opBinary = 2
+const opClose = 8
+const opPing = 9
+const opPong = 10
+
+// True for the three control opcodes (§5.5): at most 125 bytes, never
+// fragmented.
+fn isControlOpcode(opcode: int): bool {
+  return opcode == opClose || opcode == opPing || opcode == opPong
+}
+
+// A decoded frame header, before its payload is read.
+class frameHeader {
+  fin: bool,
+  opcode: int,
+  masked: bool,
+  payloadLen: int,
+  maskKey: string,
+}
+
+// One decoded, already-unmasked frame.
+class RawFrame {
+  fin: bool,
+  opcode: int,
+  payload: string,
+}
+
+// The 7-bit/16-bit/64-bit payload length encoding (§5.2): 0-125 is the
+// length itself, 126 means the next 2 bytes (big-endian) are the length,
+// 127 means the next 8. The 64-bit form's own top bit MUST be 0 per the
+// RFC; a peer setting it is rejected rather than silently truncated.
+fn readPayloadLen(c: Conn, len7: int): int! {
+  if (len7 <= 125) {
+    return len7
+  }
+  if (len7 == 126) {
+    let e = c.readN(2)?
+    return (int(e[0]) << 8) | int(e[1])
+  }
+  let e = c.readN(8)?
+  if ((int(e[0]) & 0x80) != 0) {
+    fail newError("websocket: 64-bit payload length has its top bit set")
+  }
+  let n = 0
+  let i = 0
+  while (i < 8) {
+    n = (n << 8) | int(e[i])
+    i = i + 1
+  }
+  return n
+}
+
+fn readFrameHeader(c: Conn): frameHeader! {
+  let b = c.readN(2)?
+  let b0 = int(b[0])
+  let b1 = int(b[1])
+  if ((b0 & 0x70) != 0) {
+    fail newError("websocket: reserved bits set (no extension negotiated)")
+  }
+  let fin = (b0 & 0x80) != 0
+  let opcode = b0 & 0x0f
+  let masked = (b1 & 0x80) != 0
+  let payloadLen = readPayloadLen(c, b1 & 0x7f)?
+  let maskKey = ""
+  if (masked) {
+    maskKey = c.readN(4)?
+  }
+  return frameHeader{
+    fin: fin,
+    opcode: opcode,
+    masked: masked,
+    payloadLen: payloadLen,
+    maskKey: maskKey,
+  }
+}
+
+// XORs `data` with the 4-byte `key`, repeating it — its own inverse, so the
+// same call masks a frame going out and unmasks one coming in (§5.3).
+fn applyMask(data: string, key: string): string {
+  let n = len(data)
+  let out = []byte(n)
+  let i = 0
+  while (i < n) {
+    out[i] = data[i] ^ key[i % 4]
+    i = i + 1
+  }
+  return string(out)
+}
+
+// Checks the two directional rules a header alone can prove violated: a
+// server MUST see every client frame masked, a client MUST see every server
+// frame unmasked (§5.3) — accepting the wrong one is the cache-poisoning
+// primitive masking exists to close. Control-frame shape (§5.5: unfragmented,
+// at most 125 bytes) is checked here too, since both are header-only checks
+// that must happen before the payload is read.
+fn checkFrameShape(c: Conn, h: frameHeader): ()! {
+  if (c.isServer && !h.masked) {
+    fail c.protoFail(closeProtocolError, "websocket: unmasked client frame")
+  }
+  if (!c.isServer && h.masked) {
+    fail c.protoFail(closeProtocolError, "websocket: masked server frame")
+  }
+  if (isControlOpcode(h.opcode) && !h.fin) {
+    fail c.protoFail(closeProtocolError, "websocket: fragmented control frame")
+  }
+  if (isControlOpcode(h.opcode) && h.payloadLen > 125) {
+    fail c.protoFail(closeProtocolError, "websocket: control frame payload exceeds 125 bytes")
+  }
+}
+
+// Reads one full frame off `c`: header, then payload, unmasking if masked.
+// `maxFrameBytes` is checked against the header's DECLARED length before any
+// payload byte is read, so an attacker-declared huge length never causes an
+// allocation anywhere near its size.
+fn readRawFrame(c: Conn, maxFrameBytes: int): RawFrame! {
+  let h = readFrameHeader(c)?
+  checkFrameShape(c, h)?
+  if (h.payloadLen > maxFrameBytes) {
+    fail c.protoFail(closeMessageTooBig, "websocket: frame payload exceeds the configured maximum")
+  }
+  let raw = c.readN(h.payloadLen)?
+  let payload = raw
+  if (h.masked) {
+    payload = applyMask(raw, h.maskKey)
+  }
+  return RawFrame{ fin: h.fin, opcode: h.opcode, payload: payload }
+}
+
+// Builds the wire bytes for one frame: header (with the correct length
+// encoding), the 4-byte mask key when `masked`, and the payload — masked
+// byte-for-byte when `masked`, verbatim otherwise. Never fragments: `fin` is
+// caller-controlled but this module always calls it `true` (see the module
+// doc comment).
+fn buildFrameBytes(fin: bool, opcode: int, payload: string, masked: bool): string {
+  let b = newBuilder()
+  b.writeByte(byte((fin ? 0x80 : 0) | opcode))
+  writeLenAndMaskBit(b, len(payload), masked)
+  if (masked) {
+    let key = randomBytes(4)
+    writeBytes(b, key)
+    b.write(applyMask(payload, string(key)))
+  } else {
+    b.write(payload)
+  }
+  return b.toString()
+}
+
+fn writeBytes(b: Builder, data: []byte) {
+  let i = 0
+  while (i < len(data)) {
+    b.writeByte(data[i])
+    i = i + 1
+  }
+}
+
+fn writeLenAndMaskBit(b: Builder, n: int, masked: bool) {
+  let maskBit = masked ? 0x80 : 0
+  if (n <= 125) {
+    b.writeByte(byte(maskBit | n))
+    return
+  }
+  if (n <= 65535) {
+    b.writeByte(byte(maskBit | 126))
+    b.writeByte(byte(n >> 8))
+    b.writeByte(byte(n))
+    return
+  }
+  b.writeByte(byte(maskBit | 127))
+  let i = 56
+  while (i >= 0) {
+    b.writeByte(byte(n >> i))
+    i = i - 8
+  }
+}
+
+// A close frame's payload (§7.1.5): a 2-byte big-endian status code
+// followed by an optional UTF-8 reason. Caller already checked `reason` is
+// short enough to keep the whole payload within the 125-byte control-frame
+// limit.
+fn buildClosePayload(code: int, reason: string): string {
+  let b = newBuilder()
+  b.writeByte(byte(code >> 8))
+  b.writeByte(byte(code))
+  b.write(reason)
+  return b.toString()
+}
+
+// Parses a close frame's payload. An empty payload means the peer sent no
+// status code at all (legal — §7.1.5); this reports `closeNoStatus`, which
+// is never itself sent on the wire, only used to signal its absence. Exactly
+// one byte is malformed (a status code cannot be truncated) and fails.
+fn parseClosePayload(payload: string): (int, string)! {
+  if (len(payload) == 0) {
+    return (closeNoStatus, "")
+  }
+  if (len(payload) == 1) {
+    fail newError("websocket: close frame payload has exactly 1 byte")
+  }
+  let code = (int(payload[0]) << 8) | int(payload[1])
+  let reason = payload[2:len(payload)]
+  if (!isValidUtf8(reason)) {
+    fail newError("websocket: close reason is not valid UTF-8")
+  }
+  return (code, reason)
+}
