@@ -1,0 +1,262 @@
+// Bit standard library — websocket module: the live connection.
+//
+// `Conn` is what `upgrade` (server) and `dial` (client) return: `sendText`/
+// `sendBinary`/`ping` write one frame each; `receive` reads the next
+// complete message, reassembling fragments and answering ping/close frames
+// transparently (§5.5.2, §5.5.3) — a caller never sees a ping or an
+// in-progress fragment, only a finished `Message`.
+
+import { Conn as NetConn } from "std/net"
+import { newBuilder, Builder, isValidUtf8 } from "std/strings"
+import { monotonic } from "std/time"
+
+// How long `close()` waits for the peer to answer with its own close frame
+// (RFC 6455 §7.1.1 leaves the exact bound to the implementation) before
+// closing the socket regardless. A close that is never answered is not an
+// error — it ends the connection exactly the same way an answered one does,
+// just later.
+const closeWaitNs = 5000000000
+
+export class Conn {
+  nc: NetConn
+  isServer: bool
+  limits: Limits
+  buf: string
+  closed: bool
+  sentClose: bool
+  useDeadline: bool
+
+  // Pulls exactly `n` bytes, first from anything already buffered (a
+  // handshake can over-read into the first frame), then from the wire.
+  // Never allocates toward `n` beyond what this call actually needs — the
+  // caller (`readRawFrame`) has already checked `n` against the configured
+  // maximum before calling this.
+  readN(n: int): string! {
+    while (len(this.buf) < n) {
+      let chunk = this.streamRead(4096)?
+      if (len(chunk) == 0) {
+        fail newError("websocket: connection closed while reading a frame")
+      }
+      this.buf = this.buf + chunk
+    }
+    let out = this.buf[0:n]
+    this.buf = this.buf[n:len(this.buf)]
+    return out
+  }
+
+  streamRead(max: int): string! {
+    if (this.useDeadline) {
+      return this.nc.readDeadline(max)?
+    }
+    return this.nc.read(max)
+  }
+
+  writeRawFrame(fin: bool, opcode: int, payload: string): ()! {
+    this.nc.write(buildFrameBytes(fin, opcode, payload, !this.isServer))?
+  }
+
+  // Sends `text` as one complete, unfragmented text frame. Fails rather than
+  // sending invalid UTF-8 — the same rule this module enforces on the way
+  // in (§8.1 applies symmetrically to both directions).
+  export sendText(text: string): ()! {
+    if (!isValidUtf8(text)) {
+      fail newError("websocket: sendText: not valid UTF-8")
+    }
+    this.writeRawFrame(true, opText, text)?
+  }
+
+  // Sends `data` as one complete, unfragmented binary frame.
+  export sendBinary(data: []byte): ()! {
+    this.writeRawFrame(true, opBinary, string(data))?
+  }
+
+  // Sends a ping carrying `payload`, answered by the peer with a pong
+  // carrying the same bytes (§5.5.2). `payload` must fit the 125-byte
+  // control-frame limit.
+  export ping(payload: string): ()! {
+    if (len(payload) > 125) {
+      fail newError("websocket: ping payload exceeds 125 bytes")
+    }
+    this.writeRawFrame(true, opPing, payload)?
+  }
+
+  // Reads the next complete message. Pings are answered with a matching
+  // pong and never returned; a peer close frame is answered with this
+  // side's own close frame and returned as `MessageClose`, exactly the same
+  // shape a self-initiated `close()` reaches from the other direction —
+  // the close protocol is a handshake, not a disconnect, and either side may
+  // start it. Fails, and marks the connection closed, on a malformed frame
+  // or a read past the connection's end.
+  export receive(): Message! {
+    if (this.closed) {
+      fail newError("websocket: receive on a closed connection")
+    }
+    let frag = newReassembly()
+    while (true) {
+      let frame = readRawFrame(this, this.limits.maxFrameBytes) catch e {
+        this.closed = true
+        fail e
+      }
+      if (isControlOpcode(frame.opcode)) {
+        let (done, msg) = handleControl(this, frame)?
+        if (done) {
+          return msg
+        }
+      } else {
+        let (done, msg) = assembleData(this, frag, frame)?
+        if (done) {
+          return msg
+        }
+      }
+    }
+  }
+
+  // Sends a close frame carrying `code`/`reason`, then waits up to
+  // `closeWaitNs` for the peer's own close frame before closing the socket
+  // — a close the peer never answers still ends the connection, just once
+  // the wait elapses rather than the instant the reply arrives. A second
+  // call is a no-op: the close frame was already sent.
+  export close(code: int, reason: string): ()! {
+    if (this.closed) {
+      return
+    }
+    if (len(reason) > 123) {
+      fail newError("websocket: close reason exceeds 123 bytes")
+    }
+    if (!isValidUtf8(reason)) {
+      fail newError("websocket: close reason is not valid UTF-8")
+    }
+    this.sendCloseFrame(code, reason)
+    this.waitForPeerClose()
+    this.nc.close()
+    this.closed = true
+  }
+
+  sendCloseFrame(code: int, reason: string) {
+    if (this.sentClose) {
+      return
+    }
+    this.sentClose = true
+    this.writeRawFrame(true, opClose, buildClosePayload(code, reason)) catch _ {}
+  }
+
+  waitForPeerClose() {
+    this.nc.setDeadline(monotonic().ns + closeWaitNs)
+    this.useDeadline = true
+    while (true) {
+      let frame = readRawFrame(this, this.limits.maxFrameBytes) catch _ {
+        break
+      }
+      if (frame.opcode == opClose) {
+        break
+      }
+    }
+    this.nc.setDeadline(0)
+    this.useDeadline = false
+  }
+
+  // Best-effort sends `code` as a close frame (no reason — used to echo a
+  // status back, never to explain one) and tears down the socket.
+  replyCloseAndShutdown(code: int) {
+    this.sendCloseFrame(code, "")
+    this.nc.close()
+    this.closed = true
+  }
+
+  // A protocol violation this connection cannot recover from: closes with
+  // `code` and returns an error for the caller to `fail` — used from
+  // frame.bit, which detects most of these violations from a header alone.
+  protoFail(code: int, msg: string): error {
+    this.replyCloseAndShutdown(code)
+    return newError(msg)
+  }
+}
+
+// One in-progress fragmented (or single-frame) message. `opcode` is `-1`
+// when no message is currently being assembled — the only state
+// `assembleData` needs between calls.
+class reassembly {
+  opcode: int,
+  buf: Builder,
+  total: int,
+  fragments: int,
+}
+
+fn newReassembly(): reassembly {
+  return reassembly{ opcode: 0 - 1, buf: newBuilder(), total: 0, fragments: 0 }
+}
+
+// Handles one control frame during `receive`'s loop. `done` is true only for
+// a close frame, whose `Message` the caller should return; ping and pong are
+// fully handled here (a matching pong sent, or nothing) and never surface.
+fn handleControl(c: Conn, frame: RawFrame): (bool, Message)! {
+  if (frame.opcode == opPing) {
+    c.writeRawFrame(true, opPong, frame.payload) catch _ {}
+    return (false, Message{ kind: 0, code: 0, data: "" })
+  }
+  if (frame.opcode == opPong) {
+    return (false, Message{ kind: 0, code: 0, data: "" })
+  }
+  let (code, reason) = parseClosePayload(frame.payload) catch _ {
+    c.replyCloseAndShutdown(closeProtocolError)
+    return (true, Message{ kind: MessageClose, code: closeProtocolError, data: "" })
+  }
+  c.replyCloseAndShutdown(code)
+  return (true, Message{ kind: MessageClose, code: code, data: reason })
+}
+
+// Folds one data or continuation frame into `frag`. `done` is true once
+// `frame.fin` completes the message, and `msg` is the finished `Message` —
+// text, UTF-8-checked over the whole reassembled payload since a fragment
+// boundary can split a multi-byte sequence.
+fn assembleData(c: Conn, frag: reassembly, frame: RawFrame): (bool, Message)! {
+  startOrContinue(c, frag, frame.opcode)?
+  frag.fragments = frag.fragments + 1
+  if (frag.fragments > c.limits.maxFragments) {
+    fail c.protoFail(closeMessageTooBig, "websocket: message has too many fragments")
+  }
+  frag.total = frag.total + len(frame.payload)
+  if (frag.total > c.limits.maxMessageBytes) {
+    fail c.protoFail(
+      closeMessageTooBig,
+      "websocket: reassembled message exceeds the configured maximum",
+    )
+  }
+  frag.buf.write(frame.payload)
+  if (!frame.fin) {
+    return (false, Message{ kind: 0, code: 0, data: "" })
+  }
+  return finishMessage(c, frag)?
+}
+
+fn startOrContinue(c: Conn, frag: reassembly, opcode: int): ()! {
+  if (opcode == opContinuation) {
+    if (frag.opcode < 0) {
+      fail c.protoFail(
+        closeProtocolError,
+        "websocket: continuation frame with no message in progress",
+      )
+    }
+    return
+  }
+  if (frag.opcode >= 0) {
+    fail c.protoFail(
+      closeProtocolError,
+      "websocket: new message started before the previous one finished",
+    )
+  }
+  frag.opcode = opcode
+}
+
+fn finishMessage(c: Conn, frag: reassembly): (bool, Message)! {
+  let data = frag.buf.toString()
+  let opcode = frag.opcode
+  frag.opcode = 0 - 1
+  if (opcode == opText) {
+    if (!isValidUtf8(data)) {
+      fail c.protoFail(closeInvalidPayload, "websocket: text message is not valid UTF-8")
+    }
+    return (true, Message{ kind: MessageText, code: 0, data: data })
+  }
+  return (true, Message{ kind: MessageBinary, code: 0, data: data })
+}
