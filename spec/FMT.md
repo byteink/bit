@@ -75,20 +75,20 @@ line's leading-space count equals `2 × ` its brace/block nesting depth.
 items collapses to **exactly one** blank output line (`fmtGap`'s `allowBlank`
 branch, `compiler/fmt.bit:292-294, 306-308`); zero blank lines in the source
 stays zero. This applies between top-level declarations and between
-statements inside a block (`fmtPrintSeq`, `compiler/fmt.bit:552-561`), and to a
+statements inside a block (`fmtPrintSeq`, `compiler/fmtprint.bit:203-213`), and to a
 blank line preserved immediately before a block's own closing `}`
 (`fmtPrintBlock`'s trailing `fmtGap(p, n.span.end, true)`,
-`compiler/fmt.bit:561`).
+`compiler/fmtprint.bit:217-229`).
 
 **Two constructions never get a leading blank line, by the printer's own
 design, not as a separate policy:**
 - The first statement inside a block, or the first clause of a `switch`,
   `match`, or `select` body, never has a blank line before it even if the
-  source had one — `fmtPrintNoLeadBlank` (`compiler/fmt.bit:538-548`) passes
+  source had one — `fmtPrintNoLeadBlank` (`compiler/fmtprint.bit:189-199`) passes
   `allowBlank = false` for the first item, `true` after.
 - The very top of a *file* is the one place a leading blank line before the
   first item **is** kept — `Program`'s use of `fmtPrintSeq`
-  (`compiler/fmt.bit:552-556`) gates every item including the first the
+  (`compiler/fmtprint.bit:203-213`) gates every item including the first the
   same way it gates the rest.
 - Inside a bracketed comma list (§5) — params, args, class/field lists,
   generics, composite literals, imports, tuples — no blank line is ever
@@ -216,7 +216,7 @@ twice produces byte-identical output on every comma-list-containing file
 ## 6. Inline vs. stacked bodies — settled, and reversed once (`#1266`)
 
 **Current rule**, two different answers for two different constructs
-(`fmtPrintBodyBlock`, `compiler/fmt.bit:490-505`):
+(`fmtPrintBodyBlock`, `compiler/fmtprint.bit:143-159`):
 
 - **A function body** inlines as `{ stmt }` **if and only if the source wrote
   it that way** — a single simple statement, no comment, no nested block or
@@ -326,9 +326,9 @@ or closing brace.
 **Rule.** `bit fmt` never writes a redundant `;`: a statement or declaration
 gets an explicit trailing `;` in the output **only if** its canonical
 rendering's last token is not itself one that Bit's automatic-semicolon-
-insertion (SPEC §7) already terminates on (`fmtEndsInBlock`,
-`compiler/fmt.bit:413-425`, and `fmtEndsInTerminator`,
-`compiler/fmt.bit:418-435` — anything ending in a block's closing `}`, or
+insertion (SPEC §7) already terminates on (`fmtEndsInBlockTag`,
+`compiler/fmtasm.bit:142-159`, and `fmtEndsInTerminator`,
+`compiler/fmtprint.bit:83-101` — anything ending in a block's closing `}`, or
 whose last real token is already a terminator, gets no `;`).
 
 **Check:** a statement whose canonical form ends in `}` (an `if`, a `for`, a
