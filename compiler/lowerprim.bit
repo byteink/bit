@@ -610,107 +610,6 @@ fn resolveCallTarget(fc: FnCtx, name: string, callNode: int): CallTarget {
     owner: oc, decl: decl }
 }
 
-// ---- the pinned mem.bit byte primitives, intercepted at the call site (#4345)
-
-// A call-site interception result: `hit` says the call was replaced, `slot` is
-// the value it produced (0 for the void store form, which nothing reads).
-class MemPrim {
-  hit: bool,
-  slot: int,
-}
-
-// `runtime/gc/mem.bit`'s two BYTE primitives, by their PINNED symbol (§11.9),
-// or 0 for anything else. 1 = load_byte, 2 = store_byte.
-//
-// Keyed on the emitted symbol and never on the source name, for the same reason
-// `resolveCallTarget` is: `runtime/auxv/auxv.bit:76` declares its own
-// `fn wordAt(addr: int): int` with an unrelated signature, and a name match
-// would rewrite calls to it into a load of the wrong width at the wrong address.
-// A pinned symbol is unforgeable — `callQualifiedRef` only yields one for a
-// `@symbol(...)` declaration — so this cannot fire on a user function.
-fn memBytePrimKind(symbol: string): int {
-  if (symbol == "bit_rt_port_mem_load_byte") {
-    return 1
-  }
-  if (symbol == "bit_rt_port_mem_store_byte") {
-    return 2
-  }
-  return 0
-}
-
-// Emits `loadByte`/`storeByte` INLINE instead of `Op.Call` (#4345).
-//
-// WHY AT ALL. The runtime archive is built one module per object
-// (`--freestanding --emit-obj`), so #3163's whole-module inliner cannot see
-// across the boundary and every caller in `runtime/root/**`, `runtime/alloc/**`
-// and `runtime/gc/**` reaches these two through a cross-object `bl`. Measured on
-// `libbitrt-aarch64-macos.a` at 145077ca, they are the ARCHIVE'S TWO MOST-CALLED
-// SYMBOLS: 112 + 78 = 190 of 2457 `ARM64_RELOC_BRANCH26` relocations, 7.7% of
-// every call the runtime makes. `_copyBytes` — every string concat and every
-// `string(bytes)` — pays TWO calls per byte copied; `_bit_rt_string_eq` pays two
-// per byte compared; `readLe` pays eight to build one word.
-//
-// WHAT IS EMITTED is the callee's own body, minus the call, the frame, and the
-// argument/result moves — not a new approximation of it. `loadByte` is
-// `int(*byteAt(addr))` and `byteAt` is `nil + addr` on a `*u8` (scale 1), so the
-// body IS a `u8` load at offset 0 from `addr` widened to `int`; `storeByte` is
-// the mirror. That equivalence is readable in `runtime/gc/mem.bit:165-178` and
-// is why this needs no alignment or aliasing argument: a byte load has neither.
-//
-// `Op.IndexGet`'s raw `base + i*width` addressing was the other candidate and is
-// deliberately NOT used. Its width comes from `ins.ty` exactly as `FieldGet`'s
-// does, so it buys no narrower load — it only adds a materialized zero base
-// register the offset-0 field form does not need.
-//
-// SAFEPOINTS: `field_get`/`field_set`/`convert` are pure ops, so the sequence
-// contains no call and reaches no safepoint. This strictly REMOVES a call from
-// every `@nosplit` caller rather than admitting one.
-//
-// The exported definitions stay in the archive regardless — `export` emits them
-// whatever the call sites do — so an out-of-tree caller linking against
-// `libbitrt.a` is unaffected.
-fn emitMemBytePrim(fc: FnCtx, t: CallTarget, a: []int): MemPrim {
-  let miss = MemPrim{ hit: false, slot: 0 }
-  let kind = memBytePrimKind(t.symbol)
-  if (kind == 0) {
-    return miss
-  }
-  let u8ty = primType(fc.c.ctx, 4)
-  if (kind == 1) {
-    // Arity is guarded rather than assumed: a malformed argument list must fall
-    // through to the ordinary call, which owns the diagnostic, instead of
-    // indexing past the end of `a` here.
-    if (len(a) != 1) {
-      return miss
-    }
-    let ld = mkInstr(Op.FieldGet, u8ty)
-    ld.lhs = a[0]
-    ld.ival = 0
-    // The widen to `int` is the body's own `int(v)`. `ldrb`/`movzx` already
-    // zero-extend, so the `ubfx` it selects is redundant on both backends — but
-    // it is redundant in the CALLEE today too, and eliding it belongs in the
-    // convert selector (where it would fire for every narrow load in the tree),
-    // not in a special case here.
-    let cv = mkInstr(Op.Convert, t.result)
-    cv.lhs = builderEmit(fc.b, ld)
-    return MemPrim{ hit: true, slot: builderEmit(fc.b, cv) }
-  }
-  if (len(a) != 2) {
-    return miss
-  }
-  // The narrowing is the body's own `u8(v)` and is LOAD-BEARING, not cosmetic:
-  // `arm64dispatch.bit:414` and `x64dispatch.bit` both take `field_set`'s store
-  // width from the VALUE's type, so an `int`-typed value here would emit an
-  // 8-byte `str` where the callee writes one byte.
-  let nv = mkInstr(Op.Convert, u8ty)
-  nv.lhs = a[1]
-  let st = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
-  st.lhs = a[0]
-  st.ival = 0
-  st.rhs = builderEmit(fc.b, nv)
-  return MemPrim{ hit: true, slot: builderEmit(fc.b, st) }
-}
-
 // The `Op.Call` for a resolved direct callee — the tail both of `lowerCall`'s
 // resolved-target paths share (the plain `f(...)` and the namespaced
 // `ns.f(...)`), and the single place a call-site interception can be added
@@ -720,7 +619,7 @@ fn emitMemBytePrim(fc: FnCtx, t: CallTarget, a: []int): MemPrim {
 // complexity 86, and adding the #4345 test at both sites would have taken it to
 // 88 while duplicating the emit. This leaves it SHORTER than before.
 fn emitResolvedCall(fc: FnCtx, t: CallTarget, a: []int): int {
-  let mp = emitMemBytePrim(fc, t, a)
+  let mp = emitMemPrim(fc, t, a)
   if (mp.hit) {
     return mp.slot
   }
