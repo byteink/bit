@@ -134,17 +134,34 @@ for c in $CASES; do
     [ "$ob" = "$oc" ] && [ "$oc" = "$og" ] || { echo "verify failed: $c (bit=$ob c=$oc go=$og)" >&2; exit 1; }
   fi
 
-  # --- timed runs ---
-  for l in bit c go; do
-    : > "$WORK/rs"; : > "$WORK/ms"; : > "$WORK/cy"; : > "$WORK/in"
-    i=0; while [ "$i" -lt "$RUNS" ]; do
+  # --- timed runs (interleaved run-for-run, #4398) ---
+  # #4383 measured two BYTE-IDENTICAL copies of the same binary under the old
+  # shape -- run all RUNS of bit, then all RUNS of c, then all RUNS of go --
+  # and got -15.95%..+4.87% on this Mac, |delta|>=4% in 2/10 pairs. Box speed
+  # drifts on a timescale of minutes, so two consecutive ~2-20s blocks sample
+  # two different box states and the whole drift lands in the ratio. The fix
+  # is to run one iteration of every language, RUNS times, so both sides of
+  # every ratio share the same drift. Interleaved, the same protocol gave
+  # 0/10 pairs above 4%. Rotate the language order each iteration so no
+  # language keeps a fixed position in the triple.
+  for l in bit c go; do : > "$WORK/rs.$l"; : > "$WORK/ms.$l"; : > "$WORK/cy.$l"; : > "$WORK/in.$l"; done
+  i=0
+  while [ "$i" -lt "$RUNS" ]; do
+    case $((i % 3)) in
+      0) order="bit c go" ;;
+      1) order="c go bit" ;;
+      *) order="go bit c" ;;
+    esac
+    for l in $order; do
       set -- $(time_run "$WORK/$c.$l")
-      echo "$1" >> "$WORK/rs"; echo "$2" >> "$WORK/ms"
-      echo "$3" >> "$WORK/cy"; echo "$4" >> "$WORK/in"
-      i=$((i+1))
+      echo "$1" >> "$WORK/rs.$l"; echo "$2" >> "$WORK/ms.$l"
+      echo "$3" >> "$WORK/cy.$l"; echo "$4" >> "$WORK/in.$l"
     done
-    echo "$c $l $(median < "$WORK/rs") $(median < "$WORK/ms") $(size "$WORK/$c.$l")" \
-         "$(trimmean < "$WORK/cy") $(trimmean < "$WORK/in")" >> "$RES"
+    i=$((i+1))
+  done
+  for l in bit c go; do
+    echo "$c $l $(median < "$WORK/rs.$l") $(median < "$WORK/ms.$l") $(size "$WORK/$c.$l")" \
+         "$(trimmean < "$WORK/cy.$l") $(trimmean < "$WORK/in.$l")" >> "$RES"
   done
   echo "  $c ok (= $ob) allocs bit=$(alcmd "$c" bit) go=$(alcmd "$c" go) c=$(alcmd "$c" c)"
 done
