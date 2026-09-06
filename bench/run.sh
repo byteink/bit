@@ -21,12 +21,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."          # repo root
 source bench/buildlib.sh         # BIT, CFLAGS, buildBit/buildC/buildGo -- shared with profile.sh
-# Explicit on purpose, NOT a glob over bench/cases/*/ -- that directory holds 13
-# entries and only these 10 have all three of <case>.bit, <case>.go and <case>.c.
+# Explicit on purpose, NOT a glob over bench/cases/*/ -- that directory holds 14
+# entries and only these 11 have all three of <case>.bit, <case>.go and <case>.c.
 # churn/ and trustcache/ are Bit-only (nothing to compare against) and startup/
 # is the per-language empty-program baseline subtracted below, not a case. A
 # glob here would try to `go build` a .go that does not exist and abort the run.
-CASES="fib mandelbrot collatz alloc allocflat strings map sort matrix json"
+# `strmap` joined in #4376: `map` is map<i64,i64>, which takes the splitmix64
+# scalar hash and the scalar probe path, so nothing published here reached the
+# string path (wyhash + the group probe) and a change there read as "no
+# regression" and "no improvement" identically.
+CASES="fib mandelbrot collatz alloc allocflat strings map strmap sort matrix json"
 RUNS=15                          # timed runs per case; see trimmean() for why 15
 CRUNS=3                          # compile-time samples per case; median reported
 STARTUP_ITERS=200                # exec count for startup timing
