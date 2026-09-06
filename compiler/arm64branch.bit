@@ -126,32 +126,126 @@ fn fusedElseCond(f: IrFunc, cmpIdx: int): int {
 //
 // It writes no flags, has B.cond's own +-1 MB imm19 reach, and is resolved by
 // the same fixup list, so nothing about branch resolution or block layout
-// changes. There is no NaN question here and no condition to invert: the
-// operand is a materialized 0/1 boolean, whatever produced it.
+// changes. There is no NaN question here and no condition to invert on that
+// path: the operand is a materialized 0/1 boolean, whatever produced it.
+
+// ===========================================================================
+// #4384: a FUSED compare against literal 0 is a CBZ/CBNZ too
+// ===========================================================================
+//
+// #4349 above took the unfused sites. A fused `x == 0` / `x != 0` still paid
+// two instructions, because the fusion's whole job was to put the answer in
+// NZCV and B.cond is the only thing that reads NZCV:
+//
+//     cmp   x9, #0          ->    cbz   x9, <else>
+//     b.eq  <else>
+//
+// CBZ tests the same 64 bits of the same register that `cmp Xn, #0` (SUBS XZR,
+// Xn, #0, `cmpImm` with a zero immediate) subtracts from, so the two ask the
+// hardware exactly one question and get one answer. Nothing about narrow
+// integer widths changes either: whatever representation an i32 or a u8 has in
+// its 64-bit home today, both forms read all 64 bits of it.
+//
+// Only EQ and NE qualify. Every other predicate needs the flags a subtraction
+// produces — `x < 0` is a sign test, not a zero test — and CBZ produces none.
+//
+// THE LIVENESS ARGUMENT, which is the one thing this needs that #4349 did not.
+// The unfused path reads the value the `br` itself names as an operand, so the
+// interval builder has already extended that value's live range to the `br`.
+// Here the register read is the COMPARE's operand, whose live range may end at
+// the compare. That is sound, and the reason is stronger than a liveness
+// interval:
+//
+//   * `computeFuseCmpBranch` fuses only a compare at `idx - 1` in the same
+//     block as its `br` — IR adjacency, not merely "somewhere earlier".
+//   * `compileFunction` emits instructions in that order and emits nothing
+//     between two of them (`appendDebugLineIfChanged` records an offset, it
+//     writes no code), and `emitBrCondition` is the FIRST thing `emitBr` calls
+//     in all three of its shapes.
+//   * On this path `emitIcmp` emits nothing at all — the operand fetch moves
+//     here with the compare.
+//
+// So the CBZ's read of that register is emitted at the very byte offset the
+// `cmp` it replaces would have occupied. Not "nothing clobbers it in between":
+// there IS no in between. The read did not move.
+//
+// A safepoint therefore cannot land between them either, which is what makes
+// runtime/ABI.md §4's caller-saved rule irrelevant here rather than merely
+// survivable. A safepoint is emitted at a call, at `gc_alloc`, or on a back
+// edge; a call or an alloc between the two would be an instruction between two
+// adjacent instruction indices, and this `br`'s own back-edge poll is emitted
+// AFTER the branch test in every shape of `emitBr` — downstream of the read,
+// never between it and the compare.
+//
+// The operand is fetched here rather than being handed over from `emitIcmp`
+// because a spilled operand's reload has to be emitted somewhere, and emitting
+// it at the branch keeps this file's "the compare emits nothing" invariant
+// literal. `getInt` puts it in `scratch1()`, which the CBZ then reads
+// immediately, with nothing in between for the same reason.
+//
+// imm19 reach is unchanged: this reuses #4349's `emitCbzJumpFixup` and
+// `emitLocalCbz` verbatim, so a block-naming branch goes through
+// `patchBranchTo`'s #4348 assert and a local skip through the same
+// `patchLocalCondBranch` a B.cond has always used. No new displacement.
+
+// The register a fused compare's CBZ/CBNZ should test, or -1 when the compare
+// is not `== 0` / `!= 0` against a literal zero. Reads `constIntOf` rather than
+// `icmpConstImm`: "the immediate encoding accepts it" is a much weaker property
+// than "it is zero", and only zero makes CBZ the same question.
+fn cbzFusedOperand(f: IrFunc, cmpIdx: int): int {
+  let ins = f.instrs[cmpIdx]
+  if (ins.op != Op.ICmpEq && ins.op != Op.ICmpNe) {
+    return -1
+  }
+  let c = constIntOf(f, ins.rhs)
+  if (!c.known || c.ival != 0) {
+    return -1
+  }
+  return ins.lhs
+}
 
 // How `br` tests its condition: on NZCV that a fused compare has just set, or
-// on a boolean register directly.
+// on a register directly.
 class BrTest {
-  // The boolean's register, or -1 when the test is on flags.
+  // The register to test, or -1 when the test is on flags.
   reg: int,
   // The ELSE condition. Meaningful only while `reg` is -1.
   cond: int,
+  // Does a NONZERO register mean the branch condition is TRUE? Meaningful only
+  // while `reg` is >= 0. True for a materialized boolean and for `x != 0`;
+  // false for `x == 0`, where zero is what the source asked about.
+  nonzeroIsTrue: bool,
+}
+
+// CBZ or CBNZ, given the register's polarity and which edge is wanted. One
+// place, so the jump and local-skip call sites below cannot drift apart.
+fn brTestNonzero(t: BrTest, onTrue: bool): bool {
+  return onTrue == t.nonzeroIsTrue
 }
 
 // Emits whatever the `br` needs before its branch, and says how to test.
 // `cond` is the boolean operand and `i` the `br`'s own instruction id.
 //
-// Emits NOTHING on the fused path — the compare is the instruction already
+// Emits NOTHING on the flags path — the compare is the instruction already
 // emitted immediately before, which is the whole point — so the caller's
 // conditional branch is still the next word in the stream, and no
-// flag-clobbering instruction can slip between them. On the register path it
-// emits at most the reload of a spilled boolean, which clobbers no flags the
+// flag-clobbering instruction can slip between them. On either register path it
+// emits at most the reload of a spilled operand, which clobbers no flags the
 // branch then reads: CBZ/CBNZ do not read NZCV at all.
 fn emitBrCondition(cx: A64Ctx, i: int, cond: int): BrTest {
   if (cond == i - 1 && cx.fuseCmp[cond]) {
-    return BrTest{ reg: -1, cond: fusedElseCond(cx.f, cond) }
+    let z = cbzFusedOperand(cx.f, cond)
+    if (z >= 0) {
+      return BrTest{
+        reg: getInt(cx, vregOf(cx, z), scratch1()), cond: 0,
+        nonzeroIsTrue: cx.f.instrs[cond].op == Op.ICmpNe,
+      }
+    }
+    return BrTest{ reg: -1, cond: fusedElseCond(cx.f, cond), nonzeroIsTrue: false }
   }
-  return BrTest{ reg: getInt(cx, vregOf(cx, cond), scratch1()), cond: 0 }
+  return BrTest{
+    reg: getInt(cx, vregOf(cx, cond), scratch1()), cond: 0, nonzeroIsTrue: true,
+  }
 }
 
 // The conditional branch to `target`, taken when the condition is TRUE
@@ -159,11 +253,12 @@ fn emitBrCondition(cx: A64Ctx, i: int, cond: int): BrTest {
 // the else condition: EQ/NE are a condInvert pair and `fusedElseCond` is itself
 // a `condInvert`, which is an involution — see the NaN reasoning on
 // `fusedElseCond`, which applies unchanged in the other direction. On the
-// register path CBNZ is taken when the bool is true and CBZ when it is false,
-// which is the same statement with no flags in it.
+// register path CBNZ is taken when the tested register being nonzero means
+// true and CBZ when it means false — `brTestNonzero` — which is the same
+// statement with no flags in it.
 fn emitBrTestJump(cx: A64Ctx, t: BrTest, onTrue: bool, target: int) {
   if (t.reg >= 0) {
-    emitCbzJumpFixup(cx, onTrue, t.reg, target)
+    emitCbzJumpFixup(cx, brTestNonzero(t, onTrue), t.reg, target)
     return
   }
   if (onTrue) {
@@ -178,7 +273,7 @@ fn emitBrTestJump(cx: A64Ctx, t: BrTest, onTrue: bool, target: int) {
 // rewrites imm19 and nothing else and so serves B.cond and CBZ alike.
 fn emitBrTestLocalBranch(cx: A64Ctx, t: BrTest): int {
   if (t.reg >= 0) {
-    return emitLocalCbz(cx, false, t.reg)
+    return emitLocalCbz(cx, brTestNonzero(t, false), t.reg)
   }
   return emitLocalCondBranch(cx, t.cond)
 }
