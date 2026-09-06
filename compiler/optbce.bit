@@ -1,0 +1,291 @@
+// Self-host Stage 2: bounds-check elimination for the induction shape
+//
+//     while (i < len(xs)) { ... xs[i] ... }
+//
+// #4354 removed the duplicate test from `for x of xs`; this is the explicit-
+// index half. The lowering emits the header's SIGNED test and then, inside the
+// element load, the UNSIGNED test `emitBoundsCheck` needs — on arm64 they come
+// out as literally the same two registers compared twice, `cmp x28, x22` then
+// `b.ge`, `cmp x28, x22` then `b.lo`.
+//
+// ## The whole missing step
+//
+// `icmp_slt(i, L)` true does NOT imply `icmp_ult(i, L)` true — `i = -1, L = 1`
+// is a counterexample. It does the moment `i >= 0`, because then `0 <= i < L`
+// and both compares read the same bits. So the pass proves exactly one thing:
+// the header param is never negative.
+//
+// ## Why this is an IR pass and not a selector peephole
+//
+// `emitBoundsCheck` SPLITS the block, so for a checked access `len` and
+// `buf`/`off` are never in one block — a peephole at the selector cannot see
+// the dominating test at all. #4354 specified that route and it was found
+// unsound at the very site it cited.
+//
+// ## The proof, and every place it can go wrong
+//
+// Candidate header `h` (never block 0 — its params come from the caller):
+// terminator `br %c, T, F` with `%c = icmp_slt(%i, %L)`, `%i` a param of `h`
+// at index `k`, `T != F`, neither equal to `h`.
+//
+// NON-NEGATIVITY, by induction over the dynamic sequence of entries to `h`.
+// Every predecessor edge must pass, at position `k`, one of:
+//
+//   - a non-negative integer constant  — the base case;
+//   - `%i` itself                      — unchanged, so still non-negative;
+//   - `add(%i, 1)` from a block `p` with `!viaF[p]`  — the step.
+//
+// At least one edge must be the constant form, or there is no base case. The
+// first entry to `h` cannot come through a block `h` dominates, and both other
+// forms read `%i`, so the first entry always takes a constant edge.
+//
+// THE STEP'S OVERFLOW HOLE IS CLOSED BY `!viaF[p]`, and that is the only reason
+// the dominance walk exists. `!viaF[p]` means every path from `h` to `p` runs
+// through `T`, so reaching `p` establishes `%i < %L` for the CURRENT iteration;
+// `%L <= maxInt`, so `%i + 1 <= %L` cannot overflow, and `%i + 1 >= 1 > 0`.
+// Without it, an increment on the `F` side could step `%i` at `maxInt` and wrap
+// it negative, which is precisely the value that makes the unsigned test lie.
+//
+// The add's own block never needs checking. SSA already guarantees it
+// dominates `p`, and a value that dominates `p` is recomputed on every path
+// from `h` to `p`: were there a path from `h` to `p` avoiding the def, the
+// prefix reaching `h` for the FIRST time contains no `h`, hence no def (the def
+// reads `%i`, so `h` dominates it), and prepending it would give a def-free
+// path from entry to `p` — contradicting SSA dominance. So the value on the
+// edge is always the current iteration's `%i + 1`, never a stale one.
+//
+// MARKING. In any block `b != h` with `!viaF[b]`, an `icmp_ult(%i, %L)` on the
+// SAME two value ids is true whenever it executes: it reads `%i`, so `h`
+// dominates `b`, and `!viaF[b]` puts `T` on every path in. `known[b] = true`
+// then makes `emitTranslated` turn the guarding `br` into a `jump` and
+// `computeReachable` drop the panic block — no lowering change at all.
+//
+// `b == h` is excluded and the exclusion is load-bearing: an `icmp_ult` sitting
+// in the header runs BEFORE its own `br` tests anything.
+//
+// EXACT VALUE IDS, not equal expressions. Two `slice_len` reads of the same
+// base are the same value only if nothing between them can move `len`, and
+// `bit_rt_slice_append` mutates a header in place. The first fold round leaves
+// the header's `slice_len` and the load's as distinct ids and this pass simply
+// does not fire; `cseAvailableValues` and optloop.bit's hoist unify them, so it
+// fires on the second round, which is the one before codegen.
+//
+// 64-BIT SIGNED ONLY. The argument is width-generic, but the base case reads a
+// raw `ival` whose narrow-width interpretation is the IR's "store bits,
+// reinterpret per type" convention rather than a number, and every index
+// variable in this tree is `int`. Widening it is a measurement, not a guess.
+
+// The blocks reachable from `from` without passing through `stopA` or `stopB`.
+// Bounded: each block is enqueued at most once.
+fn bceReachAvoiding(f: IrFunc, src: int, stopA: int, stopB: int): []bool {
+  let seen = licmFalses(len(f.blocks))
+  if (src == stopA || src == stopB) {
+    return seen
+  }
+  seen[src] = true
+  let work = [src]
+  let s = 0
+  while (s < len(work)) {
+    let ts = licmTargets(f, work[s])
+    s = s + 1
+    let i = 0
+    while (i < len(ts)) {
+      let t = ts[i]
+      if (!seen[t] && t != stopA && t != stopB) {
+        seen[t] = true
+        work = append(work, t)
+      }
+      i = i + 1
+    }
+  }
+  return seen
+}
+
+// `b`'s terminator, or -1 when the block is empty. DCE can empty a block it
+// keeps, and `instsStart + instsLen - 1` then names the instruction BEFORE the
+// block — index -1 for block 0, which is how #2084 segfaulted.
+fn bceTerminator(f: IrFunc, b: int): int {
+  let blk = f.blocks[b]
+  if (blk.instsLen == 0) {
+    return -1
+  }
+  return blk.instsStart + blk.instsLen - 1
+}
+
+// The index of `v` among `b`'s block params, or -1 when it is not one of them.
+fn bceParamIndex(f: IrFunc, b: int, v: int): int {
+  let blk = f.blocks[b]
+  if (v < blk.instsStart || v >= blk.instsStart + blk.paramCount) {
+    return -1
+  }
+  return v - blk.instsStart
+}
+
+// True iff `a` is `%iv + 1` or `1 + %iv`.
+fn bceIsStepByOne(f: IrFunc, known: []ConstVal, a: int, iv: int): bool {
+  let ins = f.instrs[a]
+  if (ins.op != Op.Add) {
+    return false
+  }
+  if (ins.lhs == iv) {
+    return bceIsOne(known, ins.rhs)
+  }
+  if (ins.rhs == iv) {
+    return bceIsOne(known, ins.lhs)
+  }
+  return false
+}
+
+fn bceIsOne(known: []ConstVal, v: int): bool {
+  let kv = known[v]
+  return kv.known && !kv.isFloat && !kv.isBool && kv.ival == 1
+}
+
+fn bceIsNonNegConst(known: []ConstVal, v: int): bool {
+  let kv = known[v]
+  return kv.known && !kv.isFloat && !kv.isBool && kv.ival >= 0
+}
+
+// One candidate loop, bundled so the walks below stay inside the parameter
+// limit — the same reason `LicmCtx` exists. `viaF` is per-header, so this is
+// built fresh for each one rather than shared.
+class BceLoop {
+  f: IrFunc,
+  known: []ConstVal,
+  viaF: []bool,
+  h: int,
+  k: int,
+  iv: int,
+}
+
+// One predecessor edge into `h`: 0 refuses the header, 1 accepts the edge as a
+// base case, 2 accepts it as a step or an unchanged pass-through.
+fn bceClassifyEdge(lp: BceLoop, p: int): int {
+  let args = licmEdgeArgs(lp.f, p, lp.h)
+  if (len(args) != lp.f.blocks[lp.h].paramCount) {
+    return 0
+  }
+  let a = args[lp.k]
+  if (bceIsNonNegConst(lp.known, a)) {
+    return 1
+  }
+  if (a == lp.iv) {
+    return 2
+  }
+  if (!lp.viaF[p] && bceIsStepByOne(lp.f, lp.known, a, lp.iv)) {
+    return 2
+  }
+  return 0
+}
+
+// True iff `h`'s param `k` is provably non-negative on every entry. Refuses a
+// header with no predecessors at all, and one with no constant base case.
+fn bceIndexNonNegative(lp: BceLoop, pm: PredMap): bool {
+  let sawBase = false
+  let e = pm.start[lp.h]
+  if (e == pm.start[lp.h + 1]) {
+    return false
+  }
+  while (e < pm.start[lp.h + 1]) {
+    let c = bceClassifyEdge(lp, pm.list[e])
+    if (c == 0) {
+      return false
+    }
+    if (c == 1) {
+      sawBase = true
+    }
+    e = e + 1
+  }
+  return sawBase
+}
+
+// Records every `icmp_ult(%iv, %lim)` the header's own signed test has already
+// decided. `viaF` is the refusal: a block the FALSE arm can reach was not
+// tested by that branch at all.
+fn bceMarkProven(lp: BceLoop, lim: int) {
+  let b = 0
+  while (b < len(lp.f.blocks)) {
+    if (b != lp.h && !lp.viaF[b]) {
+      bceMarkBlock(lp, b, lim)
+    }
+    b = b + 1
+  }
+}
+
+fn bceMarkBlock(lp: BceLoop, b: int, lim: int) {
+  let blk = lp.f.blocks[b]
+  let idx = blk.instsStart + blk.paramCount
+  let end = blk.instsStart + blk.instsLen
+  while (idx < end) {
+    let ins = lp.f.instrs[idx]
+    if (ins.op == Op.ICmpUlt && ins.lhs == lp.iv && ins.rhs == lim && !lp.known[idx].known) {
+      lp.known[idx] = boolConst(true)
+    }
+    idx = idx + 1
+  }
+}
+
+// The `icmp_slt` a candidate header branches on, or -1. Rejects block 0 (its
+// params are the caller's), an empty or non-`br` terminator, a `br` whose two
+// arms coincide or name the header, and any operand type that is not 64-bit
+// signed.
+fn bceHeaderTest(ctx: TypeContext, f: IrFunc, h: int): int {
+  if (h == 0) {
+    return -1
+  }
+  let ti = bceTerminator(f, h)
+  if (ti < 0) {
+    return -1
+  }
+  let term = f.instrs[ti]
+  if (term.op != Op.Br || term.ival == term.ival2) {
+    return -1
+  }
+  if (term.ival == h || term.ival2 == h) {
+    return -1
+  }
+  let cmp = f.instrs[term.lhs]
+  if (cmp.op != Op.ICmpSlt) {
+    return -1
+  }
+  let p = primOfType(ctx, f.instrs[cmp.lhs].ty)
+  if (!isSignedPrim(p) || primBits(p) != 64) {
+    return -1
+  }
+  return term.lhs
+}
+
+// One candidate header. Marks nothing unless every refusal above passes.
+fn bceProveHeader(ctx: TypeContext, f: IrFunc, pm: PredMap, known: []ConstVal, h: int) {
+  let ci = bceHeaderTest(ctx, f, h)
+  if (ci < 0) {
+    return
+  }
+  let cmp = f.instrs[ci]
+  let k = bceParamIndex(f, h, cmp.lhs)
+  if (k < 0) {
+    return
+  }
+  let term = f.instrs[bceTerminator(f, h)]
+  let lp = BceLoop{
+    f: f, known: known, h: h, k: k, iv: cmp.lhs,
+    viaF: bceReachAvoiding(f, term.ival2, h, term.ival),
+  }
+  if (!bceIndexNonNegative(lp, pm)) {
+    return
+  }
+  bceMarkProven(lp, cmp.rhs)
+}
+
+// Seeds `known` with every bounds compare a dominating signed loop test has
+// already decided. Runs inside `foldConstantsAndPrune`, AFTER `licmPlanFor` so
+// that pass sees the constant map it always saw, and BEFORE `computeReachable`,
+// which is what drops the panic block.
+fn proveInductionBounds(ctx: TypeContext, f: IrFunc, known: []ConstVal) {
+  let pm = licmPredMap(f)
+  let h = 0
+  while (h < len(f.blocks)) {
+    bceProveHeader(ctx, f, pm, known, h)
+    h = h + 1
+  }
+}
