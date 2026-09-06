@@ -31,18 +31,24 @@
 // The per-word types of a parameter type this compiler passes as more than one
 // word, or an EMPTY list for the one-word convention every other type uses.
 //
-// The shape: a two-element tuple whose members are each exactly one 8-byte
-// field. Width is fixed at two by #4404's scope, and each member must be a
-// full word because a word IS the unit both `marshalArgs` and the stack map
-// deal in — a narrower member would need a packing rule that does not exist.
-// A member may be a GC reference; each word carries its own type, so the
-// traced one gets its own `isRef` interval exactly as a boxed handle does.
+// The shape: a tuple of at least two members, each exactly one 8-byte field.
+// A member must be a full word because a word IS the unit both `marshalArgs`
+// and the stack map deal in — a narrower member would need a packing rule that
+// does not exist. A member may be a GC reference; each word carries its own
+// type, so the traced one gets its own `isRef` interval exactly as a boxed
+// handle does.
+//
+// #4405 widened the width from exactly two to two-or-more. The ARGUMENT side
+// needs no budget: a word past the eighth marshals through the existing
+// outgoing-stack-argument path. The RETURN side has no such path (#4238), so
+// its own budget lives in `retWordsFitRegisters` rather than here — one shape
+// rule, and the one place the two directions genuinely differ is named.
 fn explodedWordTypes(ctx: TypeContext, ty: int): []int {
   if (ty == 0 || ctx.types[ty].kind != TypeKind.Tuple) {
     return []int(0)
   }
   let members = ctx.types[ty].members
-  if (len(members) != 2) {
+  if (len(members) < 2) {
     return []int(0)
   }
   let i = 0
@@ -271,4 +277,126 @@ fn addJoinParams(fc: FnCtx, n: int) {
     }
     i = i + 1
   }
+}
+
+// ===========================================================================
+// #4405: the RETURN side — a result handed back in more than one ABI return
+// register instead of as one handle to a heap box.
+//
+// The backend half already existed and was reached by nothing: `retRegsFor`
+// (arm64.bit), `bindCallResults` and `emitMultiWordRet` (arm64call.bit) are
+// generalized by W. What was missing is a front end that produces W > 1.
+//
+// The decision is derived from the callee's DECLARATION and from nowhere else,
+// exactly as `explodesParams` is, because the callee's `ret` and every one of
+// its call sites are lowered in different functions and must agree.
+// ===========================================================================
+
+// Whether every word of a W-word return has an ABI return register.
+//
+// #4238 decided there is NO spill path for a return word above the budget and
+// that none is to be built: `emitOutgoingStackArg` stores into the CALLER's
+// frame before the `bl`, which is the wrong owner and the wrong direction for
+// a value the CALLEE produces, and the frame layout has no caller-owned return
+// area at all. `retRegsFor` asserts that budget.
+//
+// So the boundary is handled HERE, by refusing the shape: a result too wide to
+// lower keeps today's one-handle convention, which is why no source program
+// can reach that assert. The budget is `maxArgRegs()`, read from the same
+// place `argReg` reads it, so the limit has one owner rather than a copy that
+// can drift from it.
+fn retWordsFitRegisters(ctx: TypeContext, words: []int): bool {
+  let ints = 0
+  let floats = 0
+  let i = 0
+  while (i < len(words)) {
+    if (regClassOf(ctx, words[i]) == RegClass.Int) {
+      ints = ints + 1
+    } else {
+      floats = floats + 1
+    }
+    i = i + 1
+  }
+  return ints <= maxArgRegs() && floats <= maxArgRegs()
+}
+
+// `decl`'s declared result type, or 0 for a void result or a FALLIBLE one.
+//
+// Fallible is excluded whole. A `T!E` body returns through four separate
+// producers — the `return` statement, `fail`'s zero-ok return, the fall-off
+// epilogue and the wrapper `emitFallibleMainWrapper` synthesizes — and each
+// also owes the error slot (§11.6). The ABI needs every one of them to agree
+// on the width; buying that agreement is its own ticket, not a side effect of
+// this one.
+fn declPlainResultType(c: Checker, decl: int): int {
+  let kids = kidsOf(c.tree, decl)
+  if (kids[4] == 0) {
+    return 0
+  }
+  let raw = typeFromNode(c, kids[4])
+  if (raw == 0 || c.ctx.types[raw].kind == TypeKind.Fallible) {
+    return 0
+  }
+  return raw
+}
+
+// The per-word types `decl`'s result is returned in, or an EMPTY list for the
+// one-word convention every other function uses.
+//
+// `on` is the TARGET gate, and it is the reason this decision cannot live in a
+// backend: the return ABI is a property of the target (AAPCS64 pairs x0/x1,
+// SysV pairs rax/rdx, Win64 returns a 16-byte aggregate through memory), while
+// the boxing it replaces is an ALLOCATION in the IR that no backend can
+// remove. This is the first lowering decision in this compiler that depends on
+// the target; see `Lowerer.multiWordRet`.
+fn explodedRetWords(c: Checker, decl: int, on: bool): []int {
+  if (!on || decl == 0 || !explodesParams(c, decl)) {
+    return []int(0)
+  }
+  let words = explodedWordTypes(c.ctx, declPlainResultType(c, decl))
+  if (!retWordsFitRegisters(c.ctx, words)) {
+    return []int(0)
+  }
+  return words
+}
+
+// The W words of `v`, a value of the exploded result type `ty`: one
+// `field_get` per word, emitted adjacent to the `ret` that consumes them.
+//
+// A `return` lowers its expression EXACTLY as it did before and this reads the
+// words back out of the result, rather than each return form growing its own
+// exploded path. `return a, b`, `return t` and `return f()` therefore all go
+// through one place, and the box the first of them builds is removed by
+// store-to-load forwarding plus dead-allocation elimination — the same pair
+// #4404 relies on at an exploded call site. Correctness never rests on that:
+// under `--no-optimize` the box is real and these are genuine loads out of it.
+fn explodedRetValues(fc: FnCtx, v: int, ty: int, words: []int): []int {
+  let out = []int(0)
+  let k = 0
+  while (k < len(words)) {
+    out = append(out, explodedWordGet(fc.c.ctx, fc.b, ty, v, k))
+    k = k + 1
+  }
+  return out
+}
+
+// Emits the `Op.CallWord` run carrying words 1..W-1 of `call`'s result, and
+// returns every word's value id with word 0 (the call itself) first.
+//
+// One instruction per word because the IR is single-assignment and
+// single-result: a call that produces W values needs W slots. The run stays
+// immediately after its call and in ascending word order — nothing may be
+// emitted between the `bl` and the last binding (#4236) — which
+// `callWordEscapesInFunc` (verify.bit) refuses to let drift.
+fn emitCallResultWords(b: IrBuilder, call: int, words: []int): []int {
+  let out = [call]
+  let k = 1
+  while (k < len(words)) {
+    let w = mkInstr(Op.CallWord, words[k])
+    w.args = [call]
+    w.ival = k
+    out = append(out, builderEmit(b, w))
+    k = k + 1
+  }
+  return out
 }

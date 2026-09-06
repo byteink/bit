@@ -364,20 +364,27 @@ class SpliceState {
   noFold: []ConstVal,
   blockMap: []int,
   join: int,
+  // #4405: instruction slots a splice has already consumed and bound — the
+  // `Op.CallWord` run of a spliced call. `spliceBlockBody` walks slots one at a
+  // time, so without this the words would ALSO be emitted as ordinary
+  // instructions, naming a call that the splice replaced.
+  done: []bool,
 }
 
 // `remap` and `noFold` sized to `g`, with no block mapped yet.
 fn newSpliceState(g: IrFunc): SpliceState {
   let remap = []int(0)
   let noFold = []ConstVal(0)
+  let done = []bool(0)
   let i = 0
   while (i < len(g.instrs)) {
     remap = append(remap, 0)
     noFold = append(noFold, noConst())
+    done = append(done, false)
     i = i + 1
   }
   return SpliceState{
-    remap: remap, noFold: noFold, blockMap: []int(0), join: -1,
+    remap: remap, noFold: noFold, blockMap: []int(0), join: -1, done: done,
   }
 }
 
@@ -444,6 +451,11 @@ fn spliceBlockParams(ic: InlineCtx, g: IrFunc, st: SpliceState, bi: int) {
 fn spliceNested(
   ic: InlineCtx, g: IrFunc, st: SpliceState, idx: int, depth: int,
 ): bool {
+  // #4405: a word of a call the splice already replaced. Nothing to emit — its
+  // value was bound with the call's.
+  if (st.done[idx]) {
+    return true
+  }
   let ins = g.instrs[idx]
   if (ins.op != Op.Call || depth >= maxInlineDepth()) {
     return false
@@ -452,10 +464,49 @@ fn spliceNested(
   if (!inlineEligible(ic.m, ic.snap, ic.callerIdx, calleeIdx, len(ins.args))) {
     return false
   }
-  st.remap[idx] = spliceCallee(
-    ic, ic.snap[calleeIdx], trList(st.remap, ins.args), depth + 1,
+  if (!retWidthAgrees(g, idx, ic.snap[calleeIdx])) {
+    return false
+  }
+  bindSplicedResult(
+    st, g, idx,
+    spliceCallee(ic, ic.snap[calleeIdx], trList(st.remap, ins.args), depth + 1),
   )
   return true
+}
+
+// Whether the call at `idx` and the callee it names agree about how many
+// values come back. The two facts are derived independently — the call site's
+// from its `Op.CallWord` run, the callee's from its own `ret` — so a splice is
+// DECLINED rather than trusted when they disagree, the same refusal shape as
+// the parameter-count one in `inlineEligible`. Clamping instead would bind a
+// result word to a value that does not exist.
+//
+// A void callee returns no values against a width-1 call site, and that is the
+// ordinary case rather than a mismatch: the call's result is simply never
+// read. So the widths are compared only once either side is above one.
+fn retWidthAgrees(g: IrFunc, idx: int, callee: IrFunc): bool {
+  let w = callWordRunLen(g, idx)
+  let rets = len(calleeRetArgs(callee))
+  if (w == 1 && rets <= 1) {
+    return true
+  }
+  return w == rets
+}
+
+// Binds a spliced call's result words. A W-word call occupies W instruction
+// slots — the `Op.Call` and its `Op.CallWord` run — and the splice replaces
+// all of them: word k becomes the k-th value the callee's `ret` carried, which
+// `spliceCallee` delivers as the join block's k-th parameter (or, for a
+// single-block callee, as the returned value itself).
+fn bindSplicedResult(st: SpliceState, g: IrFunc, idx: int, vals: []int) {
+  st.remap[idx] = vals[0]
+  let w = callWordRunLen(g, idx)
+  let k = 1
+  while (k < w) {
+    st.remap[idx + k] = vals[k]
+    st.done[idx + k] = true
+    k = k + 1
+  }
 }
 
 // Emits block `bi`'s body — everything after its params and before its
@@ -516,8 +567,10 @@ fn calleeRetArgs(g: IrFunc): []int {
   return []int(0)
 }
 
-// Splices `g` into the builder's currently open block and returns the value the
-// call site now yields.
+// Splices `g` into the builder's currently open block and returns the values
+// the call site now yields — one per value the callee's `ret` carries, so a
+// W-word result (#4405) comes back as W ids and a void callee as the single
+// unusable 0 it always did.
 //
 // A SINGLE-BLOCK callee is emitted straight into the open block: its params
 // bind to the already-translated `args`, its body follows the call site's own
@@ -534,7 +587,7 @@ fn calleeRetArgs(g: IrFunc): []int {
 // becomes an edge into that block (`spliceTerm`) and the result arrives as its
 // block param, which is how a `ret` on two different paths stays one value
 // without any phi construction of our own.
-fn spliceCallee(ic: InlineCtx, g: IrFunc, args: []int, depth: int): int {
+fn spliceCallee(ic: InlineCtx, g: IrFunc, args: []int, depth: int): []int {
   let st = calleeState(ic, g)
   let blk = g.blocks[0]
   let i = 0
@@ -546,9 +599,9 @@ fn spliceCallee(ic: InlineCtx, g: IrFunc, args: []int, depth: int): int {
   if (st.join < 0) {
     let ret = g.instrs[blk.instsStart + blk.instsLen - 1]
     if (len(ret.args) == 0) {
-      return 0 // void callee: the result is never a usable value, never read
+      return [0] // void callee: the result is never a usable value, never read
     }
-    return st.remap[ret.args[0]]
+    return trList(st.remap, ret.args)
   }
   spliceTerm(ic, g, st, 0)
   builderEndBlock(ic.b)
@@ -564,7 +617,7 @@ fn spliceCallee(ic: InlineCtx, g: IrFunc, args: []int, depth: int): int {
   builderBeginBlock(ic.b, st.join)
   let retArgs = calleeRetArgs(g)
   if (len(retArgs) == 0) {
-    return 0 // void callee: the result is never a usable value, never read
+    return [0] // void callee: the result is never a usable value, never read
   }
   // #4400: one join-block param PER ret arg, not just the first. `spliceTerm`
   // passes every one of `t.args` on the `jump join(...)` it builds from each
@@ -576,15 +629,16 @@ fn spliceCallee(ic: InlineCtx, g: IrFunc, args: []int, depth: int): int {
   // whatever instruction slot happens to sit at the right offset. Builder
   // param ids are minted in call order (builderAddParam -> builderEmit
   // appends), so this reproduces exactly the id sequence blockArgMoves
-  // expects: the first param, returned below, is followed immediately by one
-  // more per remaining ret arg.
-  let first = builderAddParam(ic.b, g.instrs[retArgs[0]].ty)
+  // expects: the first param is followed immediately by one more per remaining
+  // ret arg. #4405 returns all of them rather than only the first, because a
+  // multi-word call site has an instruction slot to bind for each.
+  let words = [builderAddParam(ic.b, g.instrs[retArgs[0]].ty)]
   let ri = 1
   while (ri < len(retArgs)) {
-    builderAddParam(ic.b, g.instrs[retArgs[ri]].ty)
+    words = append(words, builderAddParam(ic.b, g.instrs[retArgs[ri]].ty))
     ri = ri + 1
   }
-  return first
+  return words
 }
 
 // Pass 3: simple size-budgeted inlining. Blocks are walked in id order, which is
