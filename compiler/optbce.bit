@@ -121,21 +121,6 @@ fn bceParamIndex(f: IrFunc, b: int, v: int): int {
   return v - blk.instsStart
 }
 
-// True iff `a` is `%iv + 1` or `1 + %iv`.
-fn bceIsStepByOne(f: IrFunc, known: []ConstVal, a: int, iv: int): bool {
-  let ins = f.instrs[a]
-  if (ins.op != Op.Add) {
-    return false
-  }
-  if (ins.lhs == iv) {
-    return bceIsOne(known, ins.rhs)
-  }
-  if (ins.rhs == iv) {
-    return bceIsOne(known, ins.lhs)
-  }
-  return false
-}
-
 fn bceIsOne(known: []ConstVal, v: int): bool {
   let kv = known[v]
   return kv.known && !kv.isFloat && !kv.isBool && kv.ival == 1
@@ -146,12 +131,80 @@ fn bceIsNonNegConst(known: []ConstVal, v: int): bool {
   return kv.known && !kv.isFloat && !kv.isBool && kv.ival >= 0
 }
 
+// The single value every predecessor edge passes to block param `v`, or -1 when
+// `v` is not a param, has no predecessors, or its sources disagree. Same rule
+// as `licmParamSource`, and same reason: it is an EQUALITY, so stopping early
+// is a true answer rather than a wrong one.
+fn bceParamSource(lp: BceLoop, v: int): int {
+  let b = lp.owner[v]
+  let k = bceParamIndex(lp.f, b, v)
+  if (k < 0 || lp.pm.start[b] == lp.pm.start[b + 1]) {
+    return -1
+  }
+  let found = -1
+  let e = lp.pm.start[b]
+  while (e < lp.pm.start[b + 1]) {
+    let args = licmEdgeArgs(lp.f, lp.pm.list[e], b)
+    if (len(args) != lp.f.blocks[b].paramCount) {
+      return -1
+    }
+    if (found >= 0 && args[k] != found) {
+      return -1
+    }
+    found = args[k]
+    e = e + 1
+  }
+  return found
+}
+
+// `v0` with every block param that can only ever hold one value folded away.
+// The step bound is what makes a mutually referring pair of params terminate.
+fn bceResolve(lp: BceLoop, v0: int): int {
+  let v = v0
+  let steps = 0
+  while (steps < 8) {
+    let w = bceParamSource(lp, v)
+    if (w < 0) {
+      return v
+    }
+    v = w
+    steps = steps + 1
+  }
+  return v
+}
+
+// True iff `a` is `%iv + 1` or `1 + %iv`.
+//
+// BOTH SIDES ARE RESOLVED, and without that this pass fires on almost nothing.
+// `lowerWhile` closes a loop through a separate increment block carrying its
+// OWN full parameter list, and a `continue` or a nested `if` adds a join block
+// on top — so the back edge passes `add(%joinParam, 1)`, where `%joinParam` is
+// a param every edge feeds with the header's own `%iv`. Measured before the
+// resolve was added: `appendDuring` in run_while_index_bce.bit kept its bounds
+// test for exactly this reason, with the header, the limit and the index all
+// otherwise matching.
+fn bceIsStepByOne(lp: BceLoop, a: int): bool {
+  let ins = lp.f.instrs[bceResolve(lp, a)]
+  if (ins.op != Op.Add) {
+    return false
+  }
+  if (bceResolve(lp, ins.lhs) == lp.iv) {
+    return bceIsOne(lp.known, ins.rhs)
+  }
+  if (bceResolve(lp, ins.rhs) == lp.iv) {
+    return bceIsOne(lp.known, ins.lhs)
+  }
+  return false
+}
+
 // One candidate loop, bundled so the walks below stay inside the parameter
 // limit — the same reason `LicmCtx` exists. `viaF` is per-header, so this is
 // built fresh for each one rather than shared.
 class BceLoop {
   f: IrFunc,
   known: []ConstVal,
+  pm: PredMap,
+  owner: []int,
   viaF: []bool,
   h: int,
   k: int,
@@ -169,10 +222,10 @@ fn bceClassifyEdge(lp: BceLoop, p: int): int {
   if (bceIsNonNegConst(lp.known, a)) {
     return 1
   }
-  if (a == lp.iv) {
+  if (bceResolve(lp, a) == lp.iv) {
     return 2
   }
-  if (!lp.viaF[p] && bceIsStepByOne(lp.f, lp.known, a, lp.iv)) {
+  if (!lp.viaF[p] && bceIsStepByOne(lp, a)) {
     return 2
   }
   return 0
@@ -180,14 +233,14 @@ fn bceClassifyEdge(lp: BceLoop, p: int): int {
 
 // True iff `h`'s param `k` is provably non-negative on every entry. Refuses a
 // header with no predecessors at all, and one with no constant base case.
-fn bceIndexNonNegative(lp: BceLoop, pm: PredMap): bool {
+fn bceIndexNonNegative(lp: BceLoop): bool {
   let sawBase = false
-  let e = pm.start[lp.h]
-  if (e == pm.start[lp.h + 1]) {
+  let e = lp.pm.start[lp.h]
+  if (e == lp.pm.start[lp.h + 1]) {
     return false
   }
-  while (e < pm.start[lp.h + 1]) {
-    let c = bceClassifyEdge(lp, pm.list[e])
+  while (e < lp.pm.start[lp.h + 1]) {
+    let c = bceClassifyEdge(lp, lp.pm.list[e])
     if (c == 0) {
       return false
     }
@@ -256,7 +309,10 @@ fn bceHeaderTest(ctx: TypeContext, f: IrFunc, h: int): int {
 }
 
 // One candidate header. Marks nothing unless every refusal above passes.
-fn bceProveHeader(ctx: TypeContext, f: IrFunc, pm: PredMap, known: []ConstVal, h: int) {
+fn bceProveHeader(fc: BceFn, h: int) {
+  let ctx = fc.ctx
+  let f = fc.f
+  let known = fc.known
   let ci = bceHeaderTest(ctx, f, h)
   if (ci < 0) {
     return
@@ -268,10 +324,10 @@ fn bceProveHeader(ctx: TypeContext, f: IrFunc, pm: PredMap, known: []ConstVal, h
   }
   let term = f.instrs[bceTerminator(f, h)]
   let lp = BceLoop{
-    f: f, known: known, h: h, k: k, iv: cmp.lhs,
+    f: f, known: known, pm: fc.pm, owner: fc.owner, h: h, k: k, iv: cmp.lhs,
     viaF: bceReachAvoiding(f, term.ival2, h, term.ival),
   }
-  if (!bceIndexNonNegative(lp, pm)) {
+  if (!bceIndexNonNegative(lp)) {
     return
   }
   bceMarkProven(lp, cmp.rhs)
@@ -282,10 +338,38 @@ fn bceProveHeader(ctx: TypeContext, f: IrFunc, pm: PredMap, known: []ConstVal, h
 // that pass sees the constant map it always saw, and BEFORE `computeReachable`,
 // which is what drops the panic block.
 fn proveInductionBounds(ctx: TypeContext, f: IrFunc, known: []ConstVal) {
-  let pm = licmPredMap(f)
+  if (!bceHasCandidate(ctx, f)) {
+    return
+  }
+  let fc = BceFn{
+    ctx: ctx, f: f, known: known,
+    pm: licmPredMap(f), owner: licmOwners(f),
+  }
   let h = 0
   while (h < len(f.blocks)) {
-    bceProveHeader(ctx, f, pm, known, h)
+    bceProveHeader(fc, h)
     h = h + 1
   }
+}
+
+// The per-function analysis state, bundled for the same reason `BceLoop` is.
+class BceFn {
+  ctx: TypeContext,
+  f: IrFunc,
+  known: []ConstVal,
+  pm: PredMap,
+  owner: []int,
+}
+
+// One O(blocks) scan so a function with no loop of this shape pays no
+// predecessor map and no owner array. Most functions in this tree are that.
+fn bceHasCandidate(ctx: TypeContext, f: IrFunc): bool {
+  let h = 0
+  while (h < len(f.blocks)) {
+    if (bceHeaderTest(ctx, f, h) >= 0) {
+      return true
+    }
+    h = h + 1
+  }
+  return false
 }
