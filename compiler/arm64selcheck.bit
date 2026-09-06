@@ -54,6 +54,17 @@ fn selCtx(): A64Ctx {
 // their OWN sequence exactly by prepending this known-fixed prologue to
 // `want` rather than re-deriving codegen's fixup bookkeeping in a test
 // fixture.
+// #4355: `emitCallValue`'s nil check is a single CBNZ over the panic call,
+// not `cmp reg, xzr` + `b.ne`. The emitter changed and this expectation did
+// not, which left `test-selfcheck` failing on `main` — the sibling below is
+// still correct for `emitDivInt`'s zero-divisor guard, which keeps the
+// two-instruction compare-and-branch form because a 64-bit divisor must be
+// tested at full width (`emitCbnz` reads only the low 32 bits).
+fn wantNilCbnzCheck(want: ByteBuf, reg: int) {
+  cbnzX(want, reg, 2)        // cbnz reg, +2 (skip the call)
+  emitWord(want, 0x94000000) // bl <panic symbol>
+}
+
 fn wantNilOrZeroCheck(want: ByteBuf, reg: int) {
   cmpZero(want, reg)
   emitWord(want, 0x54000000 | (2 << 5) | condNe()) // b.ne +2 (skip the call)
@@ -232,7 +243,7 @@ fn checkArm64Selectors() {
   // so the quotient cannot land in a register `l` might still need. Only the
   // final `msub`'s destination is dest-driven now.
   cx = selCtx()
-  emitDivInt(cx, Op.SRem, 0, 1, 2, -1, w64())
+  emitDivInt(cx, Op.SRem, 0, 1, 2, runtimeDivPlan(), w64())
   want = newByteBuf()
   wantNilOrZeroCheck(want, 2)
   sdivRR(want, scratch3(), 1, 2)
@@ -241,7 +252,7 @@ fn checkArm64Selectors() {
 
   // A plain divide has no later use of `l`, so it divides straight into `d`.
   cx = selCtx()
-  emitDivInt(cx, Op.UDiv, 0, 1, 2, -1, w64())
+  emitDivInt(cx, Op.UDiv, 0, 1, 2, runtimeDivPlan(), w64())
   want = newByteBuf()
   wantNilOrZeroCheck(want, 2)
   udivRR(want, 0, 1, 2)
@@ -252,7 +263,7 @@ fn checkArm64Selectors() {
   // the declared width, so the selector must restore the width-canonical
   // invariant like every other width-breaking op.
   cx = selCtx()
-  emitDivInt(cx, Op.SDiv, 0, 1, 2, -1, w8s())
+  emitDivInt(cx, Op.SDiv, 0, 1, 2, runtimeDivPlan(), w8s())
   want = newByteBuf()
   wantNilOrZeroCheck(want, 2)
   sdivRR(want, 0, 1, 2)
@@ -263,7 +274,7 @@ fn checkArm64Selectors() {
   // divide and the zero-divisor guard (dead by construction), so no
   // `wantNilOrZeroCheck` below. Unsigned truncation is a bare logical shift.
   cx = selCtx()
-  emitDivInt(cx, Op.UDiv, 0, 1, 2, 3, w64())
+  emitDivInt(cx, Op.UDiv, 0, 1, 2, pow2DivPlan(3), w64())
   want = newByteBuf()
   lsrImm(want, 0, 1, 3)
   assertSameBytes(cx.code, want)
@@ -275,7 +286,7 @@ fn checkArm64Selectors() {
   // >= 2 shrinks the magnitude, so #2263's INT_MIN/-1 hole (which needs a
   // NEGATIVE divisor, declined by the predicate) cannot arise here.
   cx = selCtx()
-  emitDivInt(cx, Op.SDiv, 0, 1, 2, 3, w8s())
+  emitDivInt(cx, Op.SDiv, 0, 1, 2, pow2DivPlan(3), w8s())
   want = newByteBuf()
   asrImm(want, scratch2(), 1, 63)
   lsrImm(want, scratch2(), scratch2(), 61)
@@ -283,12 +294,48 @@ fn checkArm64Selectors() {
   asrImm(want, 0, scratch2(), 3)
   assertSameBytes(cx.code, want)
 
-  // SRem is deliberately NOT reduced: a power-of-two divisor still takes the
-  // full divide-and-msub path, guard included.
+  // #4361: SRem by a power of two is now reduced too (#3104's exception is
+  // gone). `lhs - ((lhs + bias) & ~(2^k-1))` — the bias is the same 0-or-2^k-1
+  // sign-dependent value the SDiv arm above adds, so the remainder takes the
+  // DIVIDEND's sign as SPEC §13.5 requires; a bare `and` would give
+  // `(-9) % 8 == 7` instead of -1. No guard, no divide, no msub.
   cx = selCtx()
-  emitDivInt(cx, Op.SRem, 0, 1, 2, 3, w64())
+  emitDivInt(cx, Op.SRem, 0, 1, 2, pow2DivPlan(3), w64())
   want = newByteBuf()
-  wantNilOrZeroCheck(want, 2)
+  asrImm(want, scratch2(), 1, 63)
+  lsrImm(want, scratch2(), scratch2(), 61)
+  addRR(want, scratch3(), 1, scratch2())
+  logicalImmediate(want, 0, fitsLogicalImm(64, 0 - 8), scratch3(), scratch3())
+  subRR(want, 0, 1, scratch3())
+  assertSameBytes(cx.code, want)
+
+  // URem by a power of two is a single AND — no bias, since an unsigned
+  // dividend is never negative.
+  cx = selCtx()
+  emitDivInt(cx, Op.URem, 0, 1, 2, pow2DivPlan(3), w64())
+  want = newByteBuf()
+  logicalImmediate(want, 0, fitsLogicalImm(64, 7), 1, 0)
+  assertSameBytes(cx.code, want)
+
+  // #4361: a divisor that is a known NON-ZERO literal but not a power of two
+  // keeps the real divide and drops only the guard — the compare, the branch
+  // and the `bl bit_rt_panic_div_zero` are dead code when the divisor cannot
+  // be zero. `wantNilOrZeroCheck` is deliberately absent below; its presence
+  // in the runtimeDivPlan() cases above is what makes this an observable
+  // difference rather than an untested claim.
+  cx = selCtx()
+  emitDivInt(cx, Op.SDiv, 0, 1, 2, litDivPlan(), w64())
+  want = newByteBuf()
+  sdivRR(want, 0, 1, 2)
+  assertSameBytes(cx.code, want)
+
+  // …and the remainder form still recovers with msub, still reading the
+  // divisor register, so litDivPlan() must NOT let the caller skip
+  // materializing it (arm64dispatch.bit's mulDivFoldOperand keys on pow2K,
+  // never on guard).
+  cx = selCtx()
+  emitDivInt(cx, Op.SRem, 0, 1, 2, litDivPlan(), w64())
+  want = newByteBuf()
   sdivRR(want, scratch3(), 1, 2)
   msubRR(want, 0, scratch3(), 2, 1)
   assertSameBytes(cx.code, want)
@@ -607,12 +654,7 @@ fn checkArm64Calls() {
   cx.safepointPositions = [0]
   emitCallValue(cx, 3, i64t, 0, [2])
   want = newByteBuf()
-  // #4355: CBNZ past the panic call, not `cmp cell, xzr` + `b.ne` -- two
-  // instructions where that was three. Not `wantNilOrZeroCheck`: that helper's
-  // other callers (the divide-by-zero checks above) still emit the cmp/b.ne
-  // shape, which is what their selectors genuinely produce.
-  cbnzX(want, 0, 2)                         // #2018: nil-check the closure cell (x0) first
-  emitWord(want, 0x94000000)                // bl bit_rt_panic_nil_call (placeholder)
+  wantNilCbnzCheck(want, 0)                 // #2018/#4355: nil-check the closure cell (x0) first
   loadImm(want, scratch2(), 0, 8, 8, false) // x10 = env
   loadImm(want, scratch3(), 0, 0, 8, false) // x11 = code
   movRR(want, 1, 2)                         // x1 = arg (NOT x0)
@@ -623,9 +665,9 @@ fn checkArm64Calls() {
   // One reloc: the nil-check's own call to bit_rt_panic_nil_call (blr is a
   // register-indirect call, not a relocation).
   assert(len(cx.relocs) == 1 && len(cx.safepoints) == 1)
-  // The safepoint's return address is the byte AFTER the blr -- 8 bytes later
-  // than before #2018's nil-check prologue, which #4355 cut from three
-  // instructions (cmp/b.ne/bl) to two (cbnz/bl).
+  // The safepoint's return address is the byte AFTER the blr. #4355 cut the
+  // nil-check prologue from three instructions (cmp/b.ne/bl) to two
+  // (cbnz/bl), so this is 28, not #2018's 32.
   assert(cx.safepoints[0].retOffset == 28)
 }
 
