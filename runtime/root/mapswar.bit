@@ -1,0 +1,141 @@
+// The GROUP half of the map probe (#4373): eight ctrl tags tested per 8-byte
+// load, for the chains too long to walk a byte at a time. Sibling of
+// `maps.bit` (hash, descriptor walks, `mapProbe`, `mapGrow`), `mapscalar.bit`
+// (the four hot entry points) and `mapcaps.bit` (sizing and scan policy), same
+// module.
+//
+// WHERE THIS RUNS, AND WHERE IT DOES NOT. `mapProbe` -- the `string` and
+// composite-key path -- walks bytes for `probeInlineSteps` steps and hands a
+// longer chain here, carrying the index it stopped at and the first tombstone
+// it saw. The four SCALAR entry points in mapscalar.bit do NOT: they keep the
+// whole-chain byte loop they have always had. That is measured, not an
+// oversight, and mapcaps.bit records the six spellings that were tried and what
+// each cost.
+//
+// WHAT THE ACCELERATOR IS ALLOWED TO DO. `mapGroupClean` is true only for eight
+// consecutive slots that are all FULL and all carry a tag other than this
+// probe's — exactly the slots the byte loop steps over without reading a key,
+// setting a tombstone or terminating. Stepping over them eight at a time is
+// therefore not a different algorithm, and cannot pick a different slot: the
+// probe order, the tombstone rule and the stopping condition below are
+// `mapProbe`'s, unchanged.
+//
+// ALIGNMENT IS NOT A QUESTION HERE, AND THAT IS #4353'S DOING. `loadWord`
+// (runtime/gc/mem.bit) MASKS its argument to an 8-byte boundary, so an
+// unaligned call to it silently returns a DIFFERENT eight bytes — a wrong tag
+// read, which for a map is lost entries rather than a crash. `loadLe8`
+// (maps.bit) is a §11.6 `asm` `ldr`/`mov` with no alignment requirement at all,
+// hand-verified against `clang -c` + `objdump -d`, and both supported
+// architectures permit the unaligned access to Normal memory. So there is no
+// `(addr & 7) == 0` fast path and no byte-loop fallback: one code path, at any
+// offset. The ctrl array's own alignment is irrelevant and is never asserted --
+// `start` is an arbitrary probe index, so seven group loads in eight are
+// unaligned by construction. Swapping `loadLe8` for `loadWord` here corrupts
+// every one of `_tests_/cases/run_map_swar_scan.bit`'s three key families.
+//
+// TAIL GROUPS DO NOT EXIST, and the bound below is about the BUFFER, not about
+// a partial group. `cap` is a power of two of at least `mapInitCap` = 8
+// (mapcaps.bit: `mapCapForHint` doubles from 8, `mapGrow` doubles), so `cap` is
+// always a multiple of 8 and the array tiles exactly. What the `i + 8 <= vcap`
+// test guards is the WRAPAROUND: a probe near the end of the array would
+// otherwise read up to seven bytes past the ctrl allocation, whose contents are
+// not ctrl bytes and could report a clean group over an EMPTY slot. Those last
+// few slots are walked a byte at a time instead.
+
+// True when the eight ctrl bytes at `w` are all FULL and none of them carries
+// the tag broadcast into `tagRep` — the group a probe may step over whole.
+//
+// THE BOUND IS THE CALLER'S, deliberately: at five IR instructions this fits
+// `maxInlineInsts()` (8) and is spliced at its one call site, where a `bl` per
+// GROUP would otherwise cost more than the byte steps it replaces. Folding the
+// `i + 8 <= vcap` test in here took it over the budget and back out of line.
+//
+// THE TEST. `x = w ^ tagRep` maps each ctrl byte `c` to `c ^ tag`. Since a tag
+// always has bit 7 set (`mapCtrlTag`), for the three slot states:
+//
+//   c == tag (a candidate)   -> byte is 0x00
+//   c EMPTY (0) or TOMB (1)  -> byte is `tag` or `tag^1`, so bit 7 is SET
+//   c FULL, other tag        -> bit 7 is CLEAR and the byte is non-zero
+//
+// so the group is skippable exactly when no byte of `x` has bit 7 set and no
+// byte of `x` is zero. `x & swarHigh` answers the first. For the second, the
+// textbook `(x - swarOnes) & ~x & swarHigh` is not needed: once every byte of
+// `x` is at most 0x7f, `~x`'s high bits are all 1 and the term is redundant, so
+// `(x - swarOnes) & swarHigh` suffices. Both are folded into one mask.
+//
+// EXACT, NOT CONSERVATIVE, IN BOTH DIRECTIONS. If the expression is zero then
+// every byte of `x` has bit 7 clear — so every slot is FULL — and no byte is
+// zero, because a zero byte would borrow to 0xff or 0xfe and set bit 7 of the
+// difference. If instead every slot is FULL with a different tag, every byte of
+// `x` lies in [1, 0x7f], no subtraction borrows anywhere, each difference byte
+// lies in [0, 0x7e], and the expression is zero. The borrow-propagation false
+// positive the plain `haszero` idiom carries cannot reach the answer, because a
+// borrow can only start at a byte that is already zero — a case in which the
+// group is not skippable regardless.
+@nosplit fn mapGroupClean(w: u64, tagRep: u64): bool {
+  let x = w ^ tagRep
+  return ((x | (x - swarOnes)) & swarHigh) == u64(0)
+}
+
+// The long-chain half of `mapProbe`, resuming a probe rather than restarting
+// it: `start` is the index the caller's byte loop stopped at and `tomb0` the
+// first tombstone it saw (-1 for "none", the sentinel `rtMapSet`'s `ins`
+// already uses), so the `probeInlineSteps` steps
+// already taken are not repeated. Returns exactly what `mapProbe` returns —
+// the slot on a hit, `-1 - slot` on a miss, decoded by `mapProbeFound` and
+// `mapProbeSlot`.
+//
+// The byte body below is `mapProbe`'s, line for line. It is a second copy and
+// that is the price of the accelerator; both are driven by
+// `_tests_/cases/run_map_swar_scan.bit`, which walks chains on both sides of
+// `probeInlineSteps` through every entry point, and setting the threshold to 0
+// (group scan from the first step) or to 10^9 (never) reproduces that fixture's
+// expectation byte for byte.
+//
+// BOUNDED, though `steps` now advances by 8 as well as by 1: a group is only
+// skipped when all eight of its slots are FULL, so the EMPTY slot the load
+// factor guarantees can never be skipped over, and the walk stops at it. The
+// `steps < vcap` test is the backstop it always was, and the group stride can
+// overshoot it by at most 7.
+@nosplit fn mapProbeSwar(m: int, key: int, h: u64, start: int, tomb0: int): int {
+  let vcap = loadWord(m + mapCap)
+  let mask = vcap - 1
+  let ctrl = loadWord(m + mapCtrl)
+  let keys = loadWord(m + mapKeys)
+  let i = start
+  let tag = mapCtrlTag(h)
+  let tagRep = u64(tag) * swarOnes
+  let firstTomb = tomb0
+  let steps = 0
+  while (steps < vcap) {
+    // `&&` short-circuits, so the group load never runs past the end of the
+    // ctrl allocation — those last slots are walked a byte at a time.
+    if (i + 8 <= vcap && mapGroupClean(loadLe8(ctrl + i), tagRep)) {
+      i = (i + 8) & mask
+      steps = steps + 8
+      continue
+    }
+    let c = loadByte(ctrl + i)
+    if (c == ctrlEmpty) {
+      if (firstTomb >= 0) {
+        return -1 - firstTomb
+      }
+      return -1 - i
+    }
+    if (c == tag) {
+      if (mapKeyEq(m, loadWord(keys + i * 8), key)) {
+        return i
+      }
+    } else if (c == ctrlTomb) {
+      if (firstTomb < 0) {
+        firstTomb = i
+      }
+    }
+    i = (i + 1) & mask
+    steps = steps + 1
+  }
+  // Unreachable for the same reason `mapProbe`'s tail is: the load factor
+  // guarantees an EMPTY slot. Same non-panicking answer, not a new one.
+  return -1 - (vcap - 1)
+}
+
