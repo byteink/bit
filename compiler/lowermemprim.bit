@@ -9,7 +9,7 @@
 // ceiling, so the next one would hit it. This commit is a PURE MOVE — no
 // declaration is added, removed or edited here.
 
-// ---- the pinned mem.bit byte primitives, intercepted at the call site (#4345)
+// ---- the pinned mem.bit primitives, intercepted at the call site (#4345, #4364)
 
 // A call-site interception result: `hit` says the call was replaced, `slot` is
 // the value it produced (0 for the void store form, which nothing reads).
@@ -18,8 +18,8 @@ class MemPrim {
   slot: int,
 }
 
-// `runtime/gc/mem.bit`'s two BYTE primitives, by their PINNED symbol (§11.9),
-// or 0 for anything else. 1 = load_byte, 2 = store_byte.
+// `runtime/gc/mem.bit`'s address primitives, by their PINNED symbol (§11.9), or
+// 0 for anything else. 1 = load_byte, 2 = store_byte, 3 = word_at.
 //
 // Keyed on the emitted symbol and never on the source name, for the same reason
 // `resolveCallTarget` is: `runtime/auxv/auxv.bit:76` declares its own
@@ -27,17 +27,74 @@ class MemPrim {
 // would rewrite calls to it into a load of the wrong width at the wrong address.
 // A pinned symbol is unforgeable — `callQualifiedRef` only yields one for a
 // `@symbol(...)` declaration — so this cannot fire on a user function.
-fn memBytePrimKind(symbol: string): int {
+fn memPrimKind(symbol: string): int {
   if (symbol == "bit_rt_port_mem_load_byte") {
     return 1
   }
   if (symbol == "bit_rt_port_mem_store_byte") {
     return 2
   }
+  if (symbol == "bit_rt_port_mem_word_at") {
+    return 3
+  }
   return 0
 }
 
-// Emits `loadByte`/`storeByte` INLINE instead of `Op.Call` (#4345).
+// Emits `wordAt` INLINE instead of `Op.Call` (#4364), as the callee's own body
+// verbatim — `nil + (addr >> 3)` on a `*i64`, which `emitScaledOffset`
+// (loweraccess.bit) already reduces at lowering time to
+//
+//   const_nil *i64 / const_int i64 ~7 / band / convert *i64 / add *i64
+//
+// byte-for-byte the sequence #3163's inliner splices for an INTRA-module
+// `wordAt` call today (post-opt: `band`+`convert`+`field_get`, the nil base
+// folded away by `optfold`). Emitting the body rather than a hand-folded
+// equivalent is what makes this provably behaviour-preserving — every
+// downstream pass sees the input it already sees for in-module callers, and it
+// stays the callee's semantics under `--no-optimize` too.
+//
+// THE `& ~7` MASK STAYS. `runtime/gc/mem.bit:122` says `addr` MUST be 8-aligned
+// and the mask is that precondition's residue, not an optimization: it asserts
+// nothing about alignment and truncates a misaligned `addr` exactly as the
+// shift pair did. Nothing here proves every caller is aligned, and a wrong word
+// read in the collector is silent — an unaligned `ldr` does not fault on arm64,
+// it returns a different eight bytes. Dropping it is a separate decision with
+// its own evidence burden.
+//
+// THE RESULT IS `t.result`, CHECKED to be `*i64` rather than fabricated: call
+// sites pass it straight on as an argument (`chanInit(wordAt(h), ...)`), so an
+// `i64` here would pack an address into a slot the callee reads as a pointer. A
+// declaration that ever stopped returning `*i64` falls through to the call.
+//
+// SAFEPOINTS: every op emitted is pure, so the sequence contains no call and
+// reaches no safepoint. As with #4345 this strictly REMOVES a call from every
+// `@nosplit` caller.
+fn emitMemWordAtPrim(fc: FnCtx, t: CallTarget, a: []int): MemPrim {
+  let miss = MemPrim{ hit: false, slot: 0 }
+  if (len(a) != 1) {
+    return miss
+  }
+  let i64ty = primType(fc.c.ctx, 3)
+  if (fc.c.ctx.types[t.result].kind != TypeKind.Ptr ||
+    fc.c.ctx.types[t.result].elem != i64ty) {
+    return miss
+  }
+  let nl = builderEmit(fc.b, mkInstr(Op.ConstNil, t.result))
+  let mk = mkInstr(Op.ConstInt, i64ty)
+  mk.ival = ~7
+  let an = mkInstr(Op.BAnd, i64ty)
+  an.lhs = a[0]
+  an.rhs = builderEmit(fc.b, mk)
+  let cv = mkInstr(Op.Convert, t.result)
+  cv.lhs = builderEmit(fc.b, an)
+  let ad = mkInstr(Op.Add, t.result)
+  ad.lhs = nl
+  ad.rhs = builderEmit(fc.b, cv)
+  return MemPrim{ hit: true, slot: builderEmit(fc.b, ad) }
+}
+
+// Emits `loadByte`/`storeByte`/`wordAt` INLINE instead of `Op.Call` (#4345,
+// #4364).
 //
 // WHY AT ALL. The runtime archive is built one module per object
 // (`--freestanding --emit-obj`), so #3163's whole-module inliner cannot see
@@ -68,11 +125,14 @@ fn memBytePrimKind(symbol: string): int {
 // The exported definitions stay in the archive regardless — `export` emits them
 // whatever the call sites do — so an out-of-tree caller linking against
 // `libbitrt.a` is unaffected.
-fn emitMemBytePrim(fc: FnCtx, t: CallTarget, a: []int): MemPrim {
+fn emitMemPrim(fc: FnCtx, t: CallTarget, a: []int): MemPrim {
   let miss = MemPrim{ hit: false, slot: 0 }
-  let kind = memBytePrimKind(t.symbol)
+  let kind = memPrimKind(t.symbol)
   if (kind == 0) {
     return miss
+  }
+  if (kind == 3) {
+    return emitMemWordAtPrim(fc, t, a)
   }
   let u8ty = primType(fc.c.ctx, 4)
   if (kind == 1) {
