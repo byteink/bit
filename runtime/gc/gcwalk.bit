@@ -16,8 +16,8 @@
 //
 // The list was never the collector's own structure. Every SMALL object was
 // already recorded twice — once on the list, and once as a bit in its span's
-// occupied-slot bitmap (`setSlotBit`/`clearSlotBit`, `./gcalloc.bit`, #3147/
-// #3176), which `gcOwns` has answered from since #3177. Enumerating from the
+// occupied-slot bitmap (`setSlotBit`, `./gcalloc.bit`, #3147/#3176), which
+// `gcOwns` has answered from since #3177. Enumerating from the
 // bitmap instead deletes the second record, not the first, and it frees header
 // word 8 for #4086 to shrink `gcHeapSize` 32 -> 16.
 //
@@ -50,41 +50,30 @@ const gcWalkSweep: int = 0   // free the unmarked, clear the mark on survivors
 const gcWalkFreeAll: int = 1 // free everything (`gcDeinit`)
 const gcWalkRescan: int = 2  // re-scan every marked object (`recoverOverflow`)
 
-// Index of the lowest set bit of `x`, which must be non-zero. An unrolled
-// binary search, in the shape `../alloc/classify.bit`'s `allocMsb` already
-// uses — this subset has no count-trailing-zeros builtin.
+// Masks for a LOGICAL right shift, which this subset spells as an arithmetic
+// shift plus a mask: `>>` sign-extends, so a bitmap word with slot 63 occupied
+// is negative and a bare `w >> 1` would refill the top bit forever.
+const gcShift1Mask: int = 9223372036854775807 // (1 << 63) - 1
+const gcShift8Mask: int = 72057594037927935   // (1 << 56) - 1
+
+// The sweep's survivor test: in sweep mode, clear the mark and say the object
+// lives. False in every other mode, so the walk's other two actions never touch
+// the mark.
 //
-// THE SHIFTS ARE ARITHMETIC AND THAT IS SOUND HERE, not merely tolerable: a
-// shift only happens when the low half tests all-zero, so the lowest set bit is
-// in the half being shifted down and lands below bit 32/16/8/4/2. Sign
-// extension can only set bits ABOVE it, which no later test reads.
-@nosplit fn gcCtz(x: int): int {
-  let v = x
-  let k = 0
-  if ((v & 4294967295) == 0) {
-    v = v >> 32
-    k = k + 32
+// IT IS CALLED FROM `gcVisitSlot` AND NOWHERE ELSE, DELIBERATELY, AND BOTH WAYS
+// OF "IMPROVING" THAT WERE MEASURED AND REJECTED. Hoisting the test into
+// `gcVisitWord`'s loop to save a call frame per survivor skips it for
+// `gcWalkLarge`, the other caller of `gcVisitSlot`: that version FREED EVERY
+// LIVE LARGE OBJECT and segfaulted the compiler on its first build. Hoisting it
+// into BOTH call sites is correct and is SLOWER — `bench/cases/alloc` went
+// -10.9% -> -6.1% against `main` and `json` gained instructions — so the frame
+// it was meant to save is not what either workload is paying. One definition,
+// one call site, and the numbers agree with the safer shape.
+@nosplit fn gcSurvives(h: int, mode: int): bool {
+  if (mode != gcWalkSweep) {
+    return false
   }
-  if ((v & 65535) == 0) {
-    v = v >> 16
-    k = k + 16
-  }
-  if ((v & 255) == 0) {
-    v = v >> 8
-    k = k + 8
-  }
-  if ((v & 15) == 0) {
-    v = v >> 4
-    k = k + 4
-  }
-  if ((v & 3) == 0) {
-    v = v >> 2
-    k = k + 2
-  }
-  if ((v & 1) == 0) {
-    k = k + 1
-  }
-  return k
+  return hdrTakeMark(h)
 }
 
 // Act on one object. Returns 1 if it was freed, 0 otherwise, so the callers can
@@ -93,15 +82,18 @@ const gcWalkRescan: int = 2  // re-scan every marked object (`recoverOverflow`)
 // `gcNumObjectsIdx` is decremented HERE rather than by each caller: it is part
 // of "this object is gone", and splitting it out is how the count and the free
 // drift apart.
+//
+// SWEEP IS TESTED FIRST because it is the arm every real workload takes for
+// nearly every object: `sweep` runs once per collection over the whole heap,
+// and `gcWalkRescan` only after a mark-worklist overflow.
 @nosplit fn gcVisitSlot(g: *i64, h: int, mode: int): int {
+  if (gcSurvives(h, mode)) {
+    return 0
+  }
   if (mode == gcWalkRescan) {
     if (hdrMarked(h)) {
       scanObject(g, h)
     }
-    return 0
-  }
-  if (mode == gcWalkSweep && hdrMarked(h)) {
-    hdrClearMark(h)
     return 0
   }
   *(g + gcNumObjectsIdx) = *(g + gcNumObjectsIdx) - 1
@@ -109,25 +101,78 @@ const gcWalkRescan: int = 2  // re-scan every marked object (`recoverOverflow`)
   return 1
 }
 
-// Every occupied slot of one span, in ascending slot order.
+// Every occupied slot of one bitmap word, in ascending slot order, and the
+// batched write-back of the bits it freed.
 //
-// THE BITMAP WORD IS SNAPSHOTTED INTO `w` BEFORE ANY SLOT IN IT IS FREED, and
-// that is load-bearing: `freeObject` -> `clearSlotBit` writes the live word, so
-// iterating the live word directly would drop the bits behind the cursor and
-// skip every remaining object in it. The snapshot is also why re-reading is
-// never needed — nothing can SET a bit here (the world is stopped and nothing
-// on this path allocates).
+// SCANNED LOW BIT FIRST, SKIPPING EIGHT ZEROS AT A TIME, rather than through a
+// count-trailing-zeros helper. This subset has no `ctz` builtin, so the helper
+// was an unrolled six-branch binary search that the inliner left out of line:
+// measured on `bench/cases/alloc`, `bl` plus the search plus the `mul` that
+// turned its index into an address cost about 30 instructions PER OBJECT. A
+// span's bitmap at sweep time is dense (a span holds ~2040 slots of one class
+// and a collection kills most of them), so a linear walk that strides the
+// address by `cs` instead of multiplying is cheaper on the common shape, and the
+// byte skip bounds the sparse one at ~8 steps per empty byte rather than 64.
+//
+// THE FREED BITS ARE CLEARED ONCE, HERE, NOT PER OBJECT IN `freeObject`. That is
+// where the sweep gets CHEAPER than the list it replaced: `clearSlotBit` had to
+// rediscover the slot index from the address with `allocSlotIndex` — 63
+// instructions plus `allocClassSize`'s 40 — for a bit this loop already has in
+// hand. The window it opens (a slot back on the allocator's free list while its
+// bit is still set, until the word ends) is unobservable: the world is stopped,
+// `gcOwns` is the bitmap's only reader and every root scan that reaches it ran
+// before `sweep` was called, and nothing on this path allocates. Do not move a
+// safepoint poll in here without re-deriving that.
+//
+// `cleared` is built from a running mask rather than from `~*wp` so RESCAN mode,
+// which frees nothing, writes nothing at all.
+@nosplit fn gcVisitWord(g: *i64, wp: *i64, addr: int, cs: int, mode: int): int {
+  let w = *wp
+  let freed = 0
+  let cleared = 0
+  let bit = 1
+  let a = addr
+  let cs8 = cs * 8
+  while (w != 0) { // bounded: 64 single-bit steps, fewer with the byte skip
+    if ((w & 255) == 0) {
+      w = (w >> 8) & gcShift8Mask
+      bit = bit << 8
+      a = a + cs8
+    } else {
+      if ((w & 1) != 0 && gcVisitSlot(g, a, mode) != 0) {
+        cleared = cleared | bit
+        freed = freed + 1
+      }
+      w = (w >> 1) & gcShift1Mask
+      bit = bit << 1
+      a = a + cs
+    }
+  }
+  if (cleared != 0) {
+    *wp = *wp & ~cleared
+  }
+  return freed
+}
+
+// Every occupied slot of one span.
+//
+// EVERY PER-CLASS QUANTITY IS HOISTED OUT OF THE SLOT LOOP, and that is not
+// tidiness — it is the difference between this change being free and costing
+// 23.5% of `bench/cases/alloc`'s cycles. `cs`, the carve start and `nwords` are
+// pure functions of `cls`, which is fixed for the whole span; deriving each slot
+// address through a per-slot call that recomputed `allocClassSize` and
+// `spanSkip` measured **+117 instructions/object** against `main`. Same
+// mis-shaped interface #4044 found in `allocSlotIndex`, in the other direction.
 @nosplit fn gcVisitSpan(g: *i64, spanAddr: int, cls: int, mode: int): int {
   let freed = 0
+  let cs = allocClassSize(cls)
   let nwords = (allocSpanSlots(cls) + 63) / 64
+  let bits = spanAddr + allocSpanHdrWords * 8
+  let addr = allocCarveStart(spanAddr, cls)
   let wi = 0
   while (wi < nwords) { // bounded: nwords iterations
-    let w = allocSpanBitmapWord(spanAddr, wi)
-    while (w != 0) { // bounded: at most 64 set bits
-      let b = gcCtz(w)
-      w = w & ~(1 << b)
-      freed = freed + gcVisitSlot(g, allocSlotAddr(spanAddr, cls, wi * 64 + b), mode)
-    }
+    freed = freed + gcVisitWord(g, wordAt(bits + wi * 8), addr, cs, mode)
+    addr = addr + 64 * cs
     wi = wi + 1
   }
   return freed

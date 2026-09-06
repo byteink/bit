@@ -43,7 +43,7 @@ offset  size  field
 - **The mark bit lives in bit 63 of the size word** (#4083). A single
   allocation's byte count is positive and far below 2^63, so the top bit is free
   by construction. `runtime/gc/gc.bit`'s `hdrSize`/`hdrMarked`/`hdrSetMark`/
-  `hdrClearMark` are the only sanctioned readers; a bare load of the word reads
+  `hdrClearMark`/`hdrTakeMark` are the only sanctioned readers; a bare load of the word reads
   a NEGATIVE value for any marked object.
 - **Bytes 24..31 are reserved and hold nothing.** They are being emptied so the
   header can shrink to 16 bytes in one ABI change rather than three (#4086),
