@@ -25,30 +25,36 @@ Every GC-managed allocation is `header ++ body`:
 ```
 offset  size  field
 0       8     info    *const TypeInfo   type descriptor (§2)
-8       8     next    ?*GcHeader        runtime-private all-objects list
-16      8     size    usize             runtime-private total alloc size in bits
+8       8     size    usize             runtime-private total alloc size in bits
                                         0..62; the mark bit is bit 63
-24      8     (reserved, unused)
-32      ...   body                      the object's fields
+16      ...   body                      the object's fields
 ```
 
-- Header size is **32 bytes**, 8-aligned. The body begins at `base + 32`.
-- **The reference the compiler works with is the body pointer** (`base + 32`),
+- Header size is **16 bytes**, 8-aligned. The body begins at `base + 16`.
+- **The reference the compiler works with is the body pointer** (`base + 16`),
   i.e. the value returned by the allocator. Codegen never sees the header; the
-  runtime reaches it by subtracting 32.
-- `next`, `size` and the mark bit are owned by the runtime. Codegen must not
-  read or write them, and must not assume their meaning — only `info` and the
-  32-byte offset are stable ABI for codegen. The rest may change with the
-  collector.
+  runtime reaches it by subtracting 16.
+- `size` and the mark bit are owned by the runtime. Codegen must not read or
+  write them, and must not assume their meaning — only `info` and the 16-byte
+  offset are stable ABI for codegen. The rest may change with the collector.
 - **The mark bit lives in bit 63 of the size word** (#4083). A single
   allocation's byte count is positive and far below 2^63, so the top bit is free
   by construction. `runtime/gc/gc.bit`'s `hdrSize`/`hdrMarked`/`hdrSetMark`/
   `hdrClearMark`/`hdrTakeMark` are the only sanctioned readers; a bare load of the word reads
   a NEGATIVE value for any marked object.
-- **Bytes 24..31 are reserved and hold nothing.** They are being emptied so the
-  header can shrink to 16 bytes in one ABI change rather than three (#4086),
-  once #4059 has retired the all-objects list and with it the `next` word.
-  Nothing may take them in the meantime.
+- **The header is two words and has no spare one** (#4086). It was 32 bytes
+  until #4083 packed the mark bit into the size word's sign bit and #4059
+  retired the all-objects list link; #4086 deleted both words in a single ABI
+  change. `runtime/alloc/classify.bit` rounds `header + body` to a size class,
+  so a third header word costs one whole class at every body size from 8 to 48
+  bytes. Adding one is a measurable regression on every allocation, not a
+  bookkeeping detail.
+- **Moving this offset is a MINOR release plus a stage0 repin.** The pinned
+  bootstrap compiler emits the displacement into every `call_iface` site it
+  compiles, so a compiler built by it and linked against a runtime with a
+  different header reads the wrong word — a silent wrong answer, not a link
+  error. `tools/build/abiarity.bit` lists `gcHeaderSize` in `abiLayoutConsts`
+  to refuse that build and print the two-pass `BIT_STAGE0_BIN` recipe.
 
 ### Alignment
 
@@ -136,13 +142,17 @@ per-variant reasoning.
 
 **Why offset 8 and not 16 (#4026).** `runtime/alloc/classify.bit` rounds every
 request to a size class, and classes 1..7 are the multiples of 16 up to 112, so
-an odd argc is what crosses a class boundary. With a 32-byte header, at base 16
-an argc=1 object needed 56 bytes and took the 64 class; at base 8 it needs 48 and
-takes the 48 class — 16 bytes, 25%, on every `Option.Some`, `Result.Ok`,
-`Result.Err` and every payload variant of `Json`. argc=3 drops 80 -> 64 the same
-way; the even arities are unmoved. Measured as an RSS slope over a million live
-objects: 64.50 -> 48.50 bytes per object at argc=1, 80.54 -> 64.54 at argc=3,
-64.50 unchanged at argc=2. Nothing in `runtime/**` constructs or matches an enum
+an odd argc is what crosses a class boundary. The figures below were measured
+against the **then-32-byte** header, before #4086 shrank it to 16: at base 16 an
+argc=1 object needed 56 bytes and took the 64 class; at base 8 it needed 48 and
+took the 48 class — 16 bytes, 25%, on every `Option.Some`, `Result.Ok`,
+`Result.Err` and every payload variant of `Json`. argc=3 dropped 80 -> 64 the
+same way; the even arities were unmoved. Measured as an RSS slope over a million
+live objects: 64.50 -> 48.50 bytes per object at argc=1, 80.54 -> 64.54 at
+argc=3, 64.50 unchanged at argc=2. **The conclusion survives the smaller
+header** — at 16 bytes base 8 gives argc=1 a 32-byte total against base 16's 48,
+so the class step is if anything wider — but re-derive the numbers rather than
+quoting these. Nothing in `runtime/**` constructs or matches an enum
 (zero enum declarations in the tree), so this is a codegen shape change that the
 collector follows through `TypeInfo` — not a runtime ABI break, and it needs no
 two-pass `BIT_STAGE0_BIN` landing.
@@ -224,8 +234,8 @@ Method {                         // extern class, 16 bytes, 8-aligned
 Dispatch (`call_iface value.id(args)`): codegen first tests `value` for null
 and panics via `bit_rt_panic_nil_iface` (§12.1, #2240) if so — `value` IS the
 receiver pointer, and a nil interface is a legal, checker-blessed zero value
-(SPEC §13.4) with no `TypeInfo` to load `-32` bytes from. Only once that
-passes does the callee load `info = *(value - 32)` (the header's `info`
+(SPEC §13.4) with no `TypeInfo` to load `-16` bytes from. Only once that
+passes does the callee load `info = *(value - 16)` (the header's `info`
 field, §1), then `fn = bit_rt_iface_lookup(info, id)` (§9), then call
 `fn(value, args...)`. `bit_rt_iface_lookup` linearly scans `info.methods` for
 `id` — types have few methods, so this is a short, allocation-free walk —
@@ -2327,7 +2337,7 @@ reporting a broken invariant.
   this fix), but the same class of broken invariant as a nil function call: an
   interface value *is* its receiver pointer (§2), so a nil receiver has no
   `TypeInfo` to dispatch through. The backend tests the receiver for null
-  immediately before loading `*(recv - 32)` and branches to this call only
+  immediately before loading `*(recv - 16)` and branches to this call only
   when it is null.
 
 All three are `@nosplit`, callable from anywhere a division or an indirect
