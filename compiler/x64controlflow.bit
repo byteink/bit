@@ -9,6 +9,18 @@
 // float move here can share a spill-slot number (#3168) — splitting this into
 // two independently-ordered calls is what let that alias silently.
 fn xEmitParamMoves(cx: XCtx, target: int, args: []int) {
+  xSequentializeAndEmit(cx, xBlockArgMoves(cx, target, args))
+}
+
+// The parallel move an edge to `target` performs, built but NOT emitted. Split
+// out of xEmitParamMoves for #4372, which must know whether an edge emits
+// anything before it commits to a branch shape — and the honest way to know is
+// to build the moves and ask `pmovesAllIdentity`, not to guess from the
+// argument count: on arm64 the `len(args) > 0` form left 9 of `matrix`'s 20
+// sites standing, because an edge whose every argument already sits in its
+// parameter's location emits nothing. Building this twice costs nothing beyond
+// the work: xValueClass and xPlocOf only read.
+fn xBlockArgMoves(cx: XCtx, target: int, args: []int): []PMove {
   let blk = cx.f.blocks[target]
   let moves = []PMove(0)
   let p = 0
@@ -21,7 +33,7 @@ fn xEmitParamMoves(cx: XCtx, target: int, args: []int) {
     )
     p = p + 1
   }
-  xSequentializeAndEmit(cx, moves)
+  return moves
 }
 
 // Binds the incoming argument registers into the entry block's param vregs — the
@@ -185,30 +197,129 @@ fn xEmitPollCachePrefetch(cx: XCtx) {
 }
 
 // A back-edge polls the collector BEFORE the edge moves: the poll is a call, and
-// the moves may leave a param mid-write.
-fn xEmitJump(cx: XCtx, target: int, args: []int) {
+// the moves may leave a param mid-write. `i` is the jump's own instruction id,
+// which xJumpOrFallThrough needs to know it is the block's terminator.
+fn xEmitJump(cx: XCtx, i: int, target: int, args: []int) {
   xEmitBackEdgeSafepointIfNeeded(cx, cx.curBlock, target)
   xEmitParamMoves(cx, target, args)
+  xJumpOrFallThrough(cx, i, target)
+}
+
+// The jump to `target`, elided when control would arrive there anyway: blocks
+// are emitted in index order by xCompileFunction, so block `curBlock + 1`
+// begins at exactly the byte after this block's last instruction. `i` must be
+// that last instruction — a jump anywhere else in a block is jumping over the
+// rest of it, not falling out of it.
+//
+// This is deliberately NOT used for the THEN edge of xEmitBr's both-edges-
+// inline shape. There the else fixup is resolved by xPatchRel32Here to
+// whatever follows the then edge, so dropping the then jump would patch that
+// conditional jump to its own destination — an infinite loop, not a shorter
+// one. xEmitBr calls this only on the tail edge, which nothing skips over.
+//
+// #4348 records the residue this leaves on both backends: `curBlock + 1` is a
+// block INDEX where the property that matters is an ADDRESS one, so a
+// zero-byte intervening block (a jump-only block) still costs one jump. The
+// fix for that is folding jump-only blocks in the optimizer.
+fn xJumpOrFallThrough(cx: XCtx, i: int, target: int) {
+  let b = cx.f.blocks[cx.curBlock]
+  if (target == cx.curBlock + 1 && i == b.instsStart + b.instsLen - 1) {
+    return
+  }
   xJmpRel32(cx, target)
 }
 
-fn xEmitBr(
-  cx: XCtx, cond: int, thenBlk: int, thenArgs: []int, elseBlk: int,
-  elseArgs: []int,
-) {
-  let c = xGetInt(cx, cond, xScratch1())
+// ===========================================================================
+// #4372: one conditional jump, not a jcc to a jmp that jumps again
+// ===========================================================================
+//
+// The both-edges-inline shape below is what `br` always emitted, and x86-64
+// had no fall-through elision at all, so when NEITHER edge carries code it
+// degenerates to three jumps doing one jump's work — 20 of the 56 conditional
+// jumps in the `matrix` bench object's `main`:
+//
+//     testq %rbx, %rbx
+//     je    L        <- 5 bytes down, straight over the jmp below it
+//     jmp   THEN     <- and THEN is very often the very next block
+//   L: jmp   ELSE
+//
+// An edge only needs code of its own for two reasons — a back-edge safepoint
+// poll, and the target block's parameter moves — so when one edge needs
+// neither, the conditional jump can name that edge's BLOCK directly
+// (`xJccRel32`, whose fixup xPatchJumpFixups resolves against blockOffsets
+// exactly as the unconditional `xJmpRel32`'s is) and the other edge takes the
+// fall-through. This is #4348's restructure, mirrored; arm64 already had the
+// fall-through half.
+//
+// Nothing here moves a safepoint. Every shape emits an edge's poll on that
+// edge's own path and nowhere else, and the ORDER in which the two edges'
+// polls are emitted is unchanged — which is what `recordSafepoint`'s
+// `sm.pos == cx.safepointPositions[...]` assert checks, since the stack maps
+// are consumed in the order `buildIntervals` collected them.
+//
+// Block order is untouched: this decides how to REACH a block, never where a
+// block goes. And the reach is untouched too — a conditional jump here is the
+// rel32 form (`xJccRel32`), the same displacement field `xJmpRel32` already
+// aimed at the same blocks, so naming a block conditionally can reach exactly
+// what naming it unconditionally could. That is the one place x86-64 differs
+// from arm64, where the same change narrowed imm26's ±128 MB to imm19's ±1 MB
+// and needed an assert.
+
+// Does this `br`'s edge to `target` need any code emitted ON the edge? Only two
+// things can live there: a back-edge safepoint poll, and the target block's
+// parameter moves. `moves` is that edge's already-built parallel move, so this
+// is exact rather than a guess from the argument count.
+fn xBrEdgeNeedsInlineCode(cx: XCtx, target: int, moves: []PMove): bool {
+  if (isBackEdge(cx.curBlock, target) && !needsNoSafepoints(cx.f)) {
+    return true
+  }
+  return !pmovesAllIdentity(moves)
+}
+
+// Emits the whole of `br`. `i` is its instruction id, which is its block's
+// last, so either edge is a legal fall-through candidate.
+//
+// `test c, c` sets ZF iff the condition is zero, so the ELSE edge is `je` and
+// the THEN edge is `jne` — the same single flag, read in either direction.
+fn xEmitBr(cx: XCtx, i: int, ins: IrInstr) {
+  let c = xGetInt(cx, ins.lhs, xScratch1())
   xTestRR(cx.buf, c, c)
-  // Jump over the then-path when the condition is ZERO. The edge moves must sit
-  // on their own side of this branch — emitting them before it would run the
-  // then-edge's moves on the else path too.
+  let thenMoves = xBlockArgMoves(cx, ins.ival, ins.thenArgs)
+  let elseMoves = xBlockArgMoves(cx, ins.ival2, ins.elseArgs)
+  let thenInline = xBrEdgeNeedsInlineCode(cx, ins.ival, thenMoves)
+  let elseInline = xBrEdgeNeedsInlineCode(cx, ins.ival2, elseMoves)
+  // THEN needs nothing: jump straight to it and let ELSE have the tail.
+  // Preferred over the mirror when ELSE is the next block, because then the
+  // tail costs nothing either and the whole `br` is one jump.
+  if (!thenInline && (elseInline || ins.ival2 == cx.curBlock + 1)) {
+    xJccRel32(cx, ccNe(), ins.ival)
+    xEmitBrEdgeTail(cx, i, ins.ival2, elseMoves)
+    return
+  }
+  // ELSE needs nothing: jump straight to it and let THEN have the tail.
+  if (!elseInline) {
+    xJccRel32(cx, ccE(), ins.ival2)
+    xEmitBrEdgeTail(cx, i, ins.ival, thenMoves)
+    return
+  }
+  // Both edges carry code, so one of them has to be jumped over. Jump over the
+  // then-path when the condition is ZERO. The edge moves must sit on their own
+  // side of this branch — emitting them before it would run the then-edge's
+  // moves on the else path too.
   let skipOff = xJccRel32Placeholder(cx, ccE())
-  xEmitBackEdgeSafepointIfNeeded(cx, cx.curBlock, thenBlk)
-  xEmitParamMoves(cx, thenBlk, thenArgs)
-  xJmpRel32(cx, thenBlk)
+  xEmitBackEdgeSafepointIfNeeded(cx, cx.curBlock, ins.ival)
+  xSequentializeAndEmit(cx, thenMoves)
+  xJmpRel32(cx, ins.ival)
   xPatchRel32Here(cx, skipOff)
-  xEmitBackEdgeSafepointIfNeeded(cx, cx.curBlock, elseBlk)
-  xEmitParamMoves(cx, elseBlk, elseArgs)
-  xJmpRel32(cx, elseBlk)
+  xEmitBrEdgeTail(cx, i, ins.ival2, elseMoves)
+}
+
+// The tail edge's own code, then its jump — elided when `target` is the next
+// block, which is xJumpOrFallThrough's whole job.
+fn xEmitBrEdgeTail(cx: XCtx, i: int, target: int, moves: []PMove) {
+  xEmitBackEdgeSafepointIfNeeded(cx, cx.curBlock, target)
+  xSequentializeAndEmit(cx, moves)
+  xJumpOrFallThrough(cx, i, target)
 }
 
 // A multi-value ret is out of scope — codegen has not settled a packing.
