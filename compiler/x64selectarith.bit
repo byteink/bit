@@ -186,13 +186,102 @@ fn xEmitPow2RemInt(cx: XCtx, dst: int, lhs: int, k: int, signed: bool) {
 // call site rather than looked up here because it needs the ORIGINAL IrFunc,
 // which a unit test's fabricated XCtx does not carry — mirroring
 // xEmitShiftInt's `constAmt`.
+
+// The Granlund-Montgomery quotient into rdx, signed (#4389, divmagic.bit).
+//
+// rax and rdx are free to clobber here: `xScanFuncFlags` sets `needsRaxRdx`
+// for every div op in the function, so no vreg lives in either, and `l` is
+// therefore never one of them.
+//
+// The trailing `mov rax, rdx ; shr rax, 63 ; add rdx, rax` is not a rounding
+// nicety: `sar` rounds toward negative infinity and `/` truncates toward zero
+// (SPEC §13.5), so every negative quotient is one too low without it.
+fn xEmitMagicQuotientSigned(cx: XCtx, l: XReg64, mg: DivMagic) {
+  xMovRI(cx.buf, XReg64.Rax, mg.m)
+  xImulR(cx.buf, l) // rdx:rax = l * m; the quotient estimate is the HIGH half
+  if (mg.addend > 0) {
+    xArithRR(cx.buf, XArith.Add, XReg64.Rdx, l)
+  }
+  if (mg.addend < 0) {
+    xArithRR(cx.buf, XArith.Sub, XReg64.Rdx, l)
+  }
+  if (mg.shift > 0) {
+    xShiftImm(cx.buf, XShift.Sar, XReg64.Rdx, mg.shift)
+  }
+  xMovRR(cx.buf, XReg64.Rax, XReg64.Rdx)
+  xShiftImm(cx.buf, XShift.Shr, XReg64.Rax, 63)
+  xArithRR(cx.buf, XArith.Add, XReg64.Rdx, XReg64.Rax)
+}
+
+// The unsigned twin. No sign correction, but the divisors whose magic does not
+// fit in 64 bits need HD's add indicator, recovered as `((l - q) >>u 1) + q` --
+// that form and not `(q + (l - q)) >>u 1`, which can overflow 64 bits.
+fn xEmitMagicQuotientUnsigned(cx: XCtx, l: XReg64, mg: DivMagic) {
+  xMovRI(cx.buf, XReg64.Rax, mg.m)
+  xMulR(cx.buf, l)
+  if (mg.fixup) {
+    xMovRR(cx.buf, XReg64.Rax, l)
+    xArithRR(cx.buf, XArith.Sub, XReg64.Rax, XReg64.Rdx)
+    xShiftImm(cx.buf, XShift.Shr, XReg64.Rax, 1)
+    xArithRR(cx.buf, XArith.Add, XReg64.Rdx, XReg64.Rax)
+  }
+  if (mg.shift > 0) {
+    xShiftImm(cx.buf, XShift.Shr, XReg64.Rdx, mg.shift)
+  }
+}
+
+// `dst = lhs / const` or `dst = lhs % const` with no `idiv`/`div` at all --
+// the x86-64 twin of arm64's `emitMagicDivInt`, and it must reduce exactly the
+// same plans: `divPlanReadsDivisor` (divplan.bit) tells BOTH backends' skip
+// scans that this operand is not materialized, so a plan reduced on one
+// backend and not the other would leave the other reading a dead register.
+//
+// `%` recovers as `l - q*d` with the TWO-operand imul, which keeps the low 64
+// bits -- the correct half for a remainder, and the signedness-independent one.
+//
+// No `xCanonNarrow`, for the reason arm64's twin gives: -1 is declined, so
+// every divisor here has |d| >= 2 and neither quotient nor remainder can leave
+// a width the dividend was already canonical in.
+//
+// The assert is the load-bearing line: `xDivisorPlan` picked the algorithm
+// from `w.signed` while this emitter divides according to the OP, and applying
+// an unsigned magic to a signed divide is a silent wrong answer.
+fn xEmitMagicDivInt(cx: XCtx, op: XDivOp, dst: int, lhs: int, mg: DivMagic) {
+  let signed = op == XDivOp.SDiv || op == XDivOp.SRem
+  assert(mg.ok && mg.signed == signed)
+  let l = xGetInt(cx, lhs, xScratch1())
+  if (signed) {
+    xEmitMagicQuotientSigned(cx, l, mg)
+  } else {
+    xEmitMagicQuotientUnsigned(cx, l, mg)
+  }
+  if (op == XDivOp.SRem || op == XDivOp.URem) {
+    xMovRI(cx.buf, XReg64.Rax, mg.divisor)
+    xImulRR(cx.buf, XReg64.Rax, XReg64.Rdx) // rax = q*d, low 64 bits
+    xMovRR(cx.buf, XReg64.Rdx, l)
+    xArithRR(cx.buf, XArith.Sub, XReg64.Rdx, XReg64.Rax)
+  }
+  xPutInt(cx, dst, XReg64.Rdx)
+}
+
+// The two shapes that emit no divide, behind the one predicate that decides
+// there is one -- the twin of arm64's `emitReducedDivInt`, and written the
+// same way so the two backends cannot disagree about which plans reduce.
+fn xEmitReducedDivInt(cx: XCtx, op: XDivOp, dst: int, lhs: int, plan: DivPlan) {
+  if (plan.magic.ok) {
+    xEmitMagicDivInt(cx, op, dst, lhs, plan.magic)
+    return
+  }
+  if (op == XDivOp.SDiv || op == XDivOp.UDiv) {
+    xEmitPow2DivInt(cx, dst, lhs, plan.pow2K, op == XDivOp.SDiv)
+  } else {
+    xEmitPow2RemInt(cx, dst, lhs, plan.pow2K, op == XDivOp.SRem)
+  }
+}
+
 fn xEmitDivInt(cx: XCtx, op: XDivOp, dst: int, lhs: int, rhs: int, plan: DivPlan, w: Width) {
-  if (plan.pow2K >= 0) {
-    if (op == XDivOp.SDiv || op == XDivOp.UDiv) {
-      xEmitPow2DivInt(cx, dst, lhs, plan.pow2K, op == XDivOp.SDiv)
-    } else {
-      xEmitPow2RemInt(cx, dst, lhs, plan.pow2K, op == XDivOp.SRem)
-    }
+  if (!divPlanReadsDivisor(plan)) {
+    xEmitReducedDivInt(cx, op, dst, lhs, plan)
     return
   }
   let l = xGetInt(cx, lhs, xScratch1())

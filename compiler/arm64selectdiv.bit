@@ -1,0 +1,290 @@
+// The aarch64 integer divide/remainder selectors: the real `sdiv`/`udiv` and
+// the two shapes that replace it — a power-of-two shift (#1702/#1704/#4361)
+// and a magic-number multiply (#4389).
+//
+// Moved out of `arm64select.bit` verbatim, which #4389 had taken to 792 lines
+// against the 800-line limit. The family is self-contained: `emitDivInt` is
+// its only entry point from `compileInst`, and everything else here is reached
+// from it. Nothing else in the backend calls into this file.
+// `dst = lhs / 2^k` for a divisor `xConstPow2Divisor` has already proven a
+// KNOWN, POSITIVE power of two — so the zero-divisor guard `emitDivInt` opens
+// with is provably dead here and is skipped (ABI.md §12.1), as is the divide.
+//
+// Unsigned truncation is already a logical right shift. Signed truncation
+// rounds toward zero (SPEC §13.5) and a bare `asr` does not: `asr` rounds
+// toward negative infinity, so `(-9) >> 3` is -2 where `(-9) / 8` must be -1.
+// The fix adds a bias of `2^k - 1` before the shift, but only for a negative
+// dividend — recovered branchlessly as `asr #63` (a sign mask of 0 or
+// all-ones) narrowed to k bits by `lsr #(64-k)`. `l + bias` cannot overflow:
+// the bias is non-negative and is only non-zero when `l` is negative.
+//
+// The bias shifts use fixed 64-bit amounts (63, 64-k), never `w`'s width:
+// every integer SSA value lives in a full 64-bit register held
+// width-canonical (module doc comment above), so a narrow signed value
+// sign-extended into the register is numerically identical to its 64-bit
+// counterpart — shifting by the narrower width instead over-sizes the bias
+// and corrupts the quotient by a full unit (#1707, on the x86-64 twin).
+//
+// No `canonNarrow`: unlike the general `sdiv` below, dividing by a positive
+// power of two >= 2 strictly shrinks the magnitude, so the quotient cannot
+// leave the declared width. #2263's INT_MIN/-1 hole needs a NEGATIVE divisor,
+// which `xConstPow2Divisor` declines.
+//
+// scratch2 carries the bias: it is the register the general path would have
+// loaded the divisor into, unused here, and never allocatable — so it is
+// neither `l` (an allocated register, or scratch1 when reloaded from a spill)
+// nor `d`.
+fn emitPow2DivInt(cx: A64Ctx, dst: int, lhs: int, k: int, signed: bool) {
+  let l = getInt(cx, vregOf(cx, lhs), scratch1())
+  let d = destInt(cx, dst, scratch1())
+  if (!signed) {
+    lsrImm(cx.code, d, l, k)
+    putInt(cx, dst, d)
+    return
+  }
+  let bias = scratch2()
+  asrImm(cx.code, bias, l, 63)        // sign mask: 0 or all-ones
+  lsrImm(cx.code, bias, bias, 64 - k) // isolate low k bits: 0 or 2^k-1
+  addRR(cx.code, bias, l, bias)
+  asrImm(cx.code, d, bias, k)
+  putInt(cx, dst, d)
+}
+
+// `dst = lhs % 2^k` for a divisor `xConstPow2Divisor` has already proven a
+// KNOWN, POSITIVE power of two — the remainder sibling of `emitPow2DivInt`,
+// ported from the x86-64 twin `xEmitPow2RemInt` (#1704) that has carried it
+// since long before this backend existed.
+//
+// #3104 declined it here on the grounds that `msub` recovers the remainder
+// cheaply from a divide "AArch64 executes in a handful of cycles". That is
+// true of `msub` and false of the whole sequence: the divide is still a real
+// `sdiv`, and it arrives behind a materialized divisor, a `cmp`, a branch and
+// a provably-dead `bl bit_rt_panic_div_zero` — six instructions, one of them
+// multi-cycle, for what is an `and` (#4361).
+//
+// Unsigned: `lhs % 2^k` is exactly `lhs & (2^k - 1)` — one AND, no bias.
+//
+// Signed (the remainder takes the DIVIDEND's sign, SPEC §13.5): computed as
+// `lhs - ((lhs + bias) & ~(2^k-1))`, where `bias` is the same "0 or 2^k-1"
+// sign-dependent value `emitPow2DivInt` adds to round its quotient toward
+// zero. `(lhs + bias) & ~(2^k-1)` is `lhs` rounded TOWARD ZERO to the nearest
+// multiple of 2^k, so subtracting it from `lhs` leaves the truncated
+// remainder exactly — for every dividend, not only aligned ones. A bare
+// `and` without the bias would round toward negative infinity and give
+// `(-9) % 8 == 7` where the answer is -1.
+//
+// The bias shifts use fixed 64-bit amounts (63, 64-k), never `w`'s width, for
+// the reason `emitPow2DivInt` gives above: every integer SSA value lives in a
+// full 64-bit register held width-canonical, so a narrow signed value is
+// numerically identical to its 64-bit counterpart, and shifting by the
+// narrower width instead over-sizes the bias (#1707).
+//
+// No `canonNarrow`: `|lhs % 2^k| < 2^k <= |lhs|`, and the result carries
+// `lhs`'s sign, so the remainder is always representable in `lhs`'s own
+// declared width.
+//
+// Both masks are contiguous bit runs (`2^k-1` for k in 1..63, and its
+// complement), so `fitsLogicalImm` encodes each as an AND-immediate; the
+// `assert` states that rather than trusting it, since `k` is derived and a
+// non-encodable mask would otherwise emit a zero word.
+//
+// The mask arithmetic is done in `u64` because unsigned arithmetic is
+// modular (SPEC §13.5): at k == 63, `(1 << 63) - 1` in signed `int` is an
+// overflow a `--debug` build traps on (#3076).
+fn emitPow2RemInt(cx: A64Ctx, dst: int, lhs: int, k: int, signed: bool) {
+  let l = getInt(cx, vregOf(cx, lhs), scratch1())
+  let d = destInt(cx, dst, scratch1())
+  let maskLo = (u64(1) << u64(k)) - u64(1)
+  if (!signed) {
+    let keep = fitsLogicalImm(64, int(maskLo))
+    assert(keep.fits)
+    logicalImmediate(cx.code, 0, keep, l, d) // and d, l, #2^k-1
+    putInt(cx, dst, d)
+    return
+  }
+  let bias = scratch2()
+  let rounded = scratch3()
+  asrImm(cx.code, bias, l, 63)        // sign mask: 0 or all-ones
+  lsrImm(cx.code, bias, bias, 64 - k) // isolate low k bits: 0 or 2^k-1
+  addRR(cx.code, rounded, l, bias)
+  let clear = fitsLogicalImm(64, int(~maskLo))
+  assert(clear.fits)
+  logicalImmediate(cx.code, 0, clear, rounded, rounded) // toward zero to a multiple of 2^k
+  subRR(cx.code, d, l, rounded)
+  putInt(cx, dst, d)
+}
+
+// `w` is the RESULT width: signed division is the one narrow op division can
+// push past its type width (INT_MIN / -1 — e.g. i32(-2147483648) / i32(-1)
+// mathematically yields 2147483648, unrepresentable in i32), because operands
+// live sign-extended in full 64-bit registers (module doc comment above) so
+// the 64-bit `sdiv` never itself overflows or traps; it just leaves a result
+// outside the declared width that must be re-narrowed like every other
+// width-breaking op (#2263).
+//
+// `plan` is `xDivisorPlan`'s verdict on `rhs`, precomputed by the caller
+// (`compileInst`) rather than looked up here because it needs the ORIGINAL
+// `IrFunc`, which a unit test's fabricated `A64Ctx` does not carry — exactly
+// as `xEmitDivInt` does it. All four div ops take the power-of-two path when
+// `plan.pow2K >= 0`; #3104's SRem/URem exception is gone (see
+// `emitPow2RemInt`).
+
+// The Granlund-Montgomery quotient, signed (#4389, divmagic.bit).
+//
+//   movImm64 t, m ; smulh q, l, t ; [add|sub q, q, l] ; [asr q, q, shift]
+//   lsr t, q, 63  ; add q, q, t
+//
+// The last two are not optional and are not a rounding nicety: an arithmetic
+// shift rounds toward negative infinity and `/` truncates toward zero
+// (SPEC §13.5), so a negative quotient is one too low without them. Dropping
+// them was one of the six mutations run against the reference, and it broke
+// every negative-quotient case.
+//
+// `t` is scratch2 -- the register the general path would have loaded the
+// divisor into, unused here -- and the multiplier in it is DEAD after the
+// smulh, which is what lets the same register carry the sign mask afterwards.
+// scratch1/2/3 are never allocatable (arm64.bit), so neither `l` nor `q` can
+// collide with it.
+fn emitMagicQuotientSigned(cx: A64Ctx, q: int, l: int, mg: DivMagic) {
+  let t = scratch2()
+  movImm64(cx.code, t, mg.m)
+  smulhRR(cx.code, q, l, t)
+  if (mg.addend > 0) {
+    addRR(cx.code, q, q, l)
+  }
+  if (mg.addend < 0) {
+    subRR(cx.code, q, q, l)
+  }
+  if (mg.shift > 0) {
+    asrImm(cx.code, q, q, mg.shift)
+  }
+  lsrImm(cx.code, t, q, 63)
+  addRR(cx.code, q, q, t)
+}
+
+// The unsigned twin: no sign correction to make (an unsigned quotient never
+// rounds the wrong way), but the divisors whose magic does not fit in 64 bits
+// need HD's add indicator recovered as `((l - q) >>u 1) + q`. That form is
+// used rather than `(q + (l - q)) >>u 1` precisely because it cannot overflow
+// 64 bits, which the naive average can.
+fn emitMagicQuotientUnsigned(cx: A64Ctx, q: int, l: int, mg: DivMagic) {
+  let t = scratch2()
+  movImm64(cx.code, t, mg.m)
+  umulhRR(cx.code, q, l, t)
+  if (mg.fixup) {
+    subRR(cx.code, t, l, q)
+    lsrImm(cx.code, t, t, 1)
+    addRR(cx.code, q, t, q)
+  }
+  if (mg.shift > 0) {
+    lsrImm(cx.code, q, q, mg.shift)
+  }
+}
+
+// `dst = lhs / const` or `dst = lhs % const` with no divide at all.
+//
+// The quotient lands in scratch3 rather than in `d`: `%` recovers its result
+// with `msub d = l - q*divisor`, so it needs `l` alive past the quotient, and
+// `d` aliases scratch1 whenever the destination spilled -- which is exactly
+// where `l` sits when the dividend spilled. That is the same hazard the
+// general path documents, and the same fix.
+//
+// No `canonNarrow`, and not by omission -- for the same reason
+// `emitPow2DivInt` and `emitPow2RemInt` above skip it. The general path needs
+// it for exactly one case, `INT_MIN / -1` (#2263), and -1 is declined here.
+// Every remaining divisor has |d| >= 2, so |n/d| <= |n|/2 and the quotient
+// cannot leave a width `n` was already canonical in; a remainder satisfies
+// |n%d| <= |n| and carries `n`'s sign, so it cannot either. That argument is
+// checked and not merely stated: the differential matrix runs i8/i16/i32/u8/
+// u16/u32 as well as 64-bit, against the same runtime-divisor oracle.
+//
+// The assert is the load-bearing line: `xDivisorPlan` picked signed or
+// unsigned magic from `w.signed` while this emitter divides according to the
+// OP. They agree by construction -- lower.bit derives both from one type's
+// signedness -- but "agree by construction" is a claim, and applying an
+// unsigned magic to a signed divide is a silent wrong answer, not a crash.
+fn emitMagicDivInt(cx: A64Ctx, op: Op, dst: int, lhs: int, mg: DivMagic) {
+  let signed = op == Op.SDiv || op == Op.SRem
+  assert(mg.ok && mg.signed == signed)
+  let l = getInt(cx, vregOf(cx, lhs), scratch1())
+  let q = scratch3()
+  if (signed) {
+    emitMagicQuotientSigned(cx, q, l, mg)
+  } else {
+    emitMagicQuotientUnsigned(cx, q, l, mg)
+  }
+  let d = destInt(cx, dst, scratch1())
+  if (op == Op.SRem || op == Op.URem) {
+    movImm64(cx.code, scratch2(), mg.divisor)
+    msubRR(cx.code, d, q, scratch2(), l)
+  } else {
+    movRR(cx.code, d, q)
+  }
+  putInt(cx, dst, d)
+}
+
+// The two shapes that emit no divide, behind the one predicate that decides
+// there is one. Written as `!divPlanReadsDivisor` rather than as two separate
+// tests so this function and the skip-the-constant scans cannot disagree about
+// which plans reduce -- the disagreement is not a slow program, it is an
+// emitter reading a register nothing materialized.
+fn emitReducedDivInt(cx: A64Ctx, op: Op, dst: int, lhs: int, plan: DivPlan) {
+  if (plan.magic.ok) {
+    emitMagicDivInt(cx, op, dst, lhs, plan.magic)
+    return
+  }
+  if (op == Op.SDiv || op == Op.UDiv) {
+    emitPow2DivInt(cx, dst, lhs, plan.pow2K, op == Op.SDiv)
+  } else {
+    emitPow2RemInt(cx, dst, lhs, plan.pow2K, op == Op.SRem)
+  }
+}
+
+fn emitDivInt(cx: A64Ctx, op: Op, dst: int, lhs: int, rhs: int, plan: DivPlan, w: Width) {
+  if (!divPlanReadsDivisor(plan)) {
+    emitReducedDivInt(cx, op, dst, lhs, plan)
+    return
+  }
+  let l = getInt(cx, vregOf(cx, lhs), scratch1())
+  let r = getInt(cx, vregOf(cx, rhs), scratch2())
+  // #2016: a zero divisor to `/` or `%` panics (SPEC §13.5, §18.4) rather than
+  // silently returning 0/lhs. `plan.guard` is false when `rhs` is a non-zero
+  // literal, which proves the branch is never taken and makes the compare, the
+  // branch and the call dead code (#4361) — the power-of-two fast path above
+  // is one such divisor (ABI.md §12.1), not a separate rule.
+  // `cmpZero`/`emitLocalCondBranch` (not `emitCbnz`, which
+  // tests only the low 32 bits — fine for the STXR status word it exists for,
+  // wrong for a 64-bit divisor) so a divisor like 0x100000000 is never
+  // misread as zero.
+  if (plan.guard) {
+    cmpZero(cx.code, r)
+    let dzFixup = emitLocalCondBranch(cx, condNe()) // divisor != 0 -> skip the panic call
+    emitCallReloc(cx, "bit_rt_panic_div_zero")
+    patchLocalCondBranch(cx, dzFixup)
+  }
+  let signed = op == Op.SDiv || op == Op.SRem
+  let isRem = op == Op.SRem || op == Op.URem
+  // `rem` recovers its result with `msub dst = l - q*r`, so it still needs `l`
+  // (and `r`) after the divide. `l` aliases scratch1 whenever it was spilled and
+  // reloaded there, so writing the quotient to the result register would clobber
+  // `l` before msub reads it (yielding q*(1-r)) — a spilled destination makes
+  // `d` scratch1 too, so the hazard survives destination-driven selection.
+  // Divide into scratch3 — never allocatable, never `d`, and unused on this
+  // path — so `l` survives. A plain divide has no later use of `l`, so it
+  // divides straight into `d`.
+  let d = destInt(cx, dst, scratch1())
+  let q = d
+  if (isRem) {
+    q = scratch3()
+  }
+  if (signed) {
+    sdivRR(cx.code, q, l, r)
+  } else {
+    udivRR(cx.code, q, l, r)
+  }
+  if (isRem) {
+    msubRR(cx.code, d, q, r, l)
+  }
+  canonNarrow(cx.code, d, w)
+  putInt(cx, dst, d)
+}
