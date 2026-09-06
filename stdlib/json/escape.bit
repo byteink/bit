@@ -1,0 +1,185 @@
+// Bit standard library — json module, string-escape and UTF-8 decoding.
+//
+// Split out of parse.bit (#4377, which named the seam #4358 already drew):
+// pure functions over a `(src, start, end)` span, with no `Parser`
+// dependency — `\uXXXX`/surrogate-pair decoding, hex-digit and UTF-8
+// encoding, and the escape scan and byte-copy loop that
+// `decodeStringLiteral`/`decodeObjectKey` (parse.bit) drive. Nothing here
+// reads or mutates a `Parser`; the split is organisational only.
+
+// `newBuilder` is already imported into this module by encode.bit — importing
+// it again here would collide (same module, same declaration).
+import { Builder } from "std/strings"
+
+fn hexDigitVal(src: string, at: int): i64! {
+  let c = src[at]
+  if (c >= '0' && c <= '9') {
+    return i64(c - '0')
+  }
+  if (c >= 'a' && c <= 'f') {
+    return i64(c - 'a') + 10
+  }
+  if (c >= 'A' && c <= 'F') {
+    return i64(c - 'A') + 10
+  }
+  fail posError(src, "json: invalid \\u escape", at)
+}
+
+// The 4-hex-digit codepoint starting at `src[i]`.
+fn decodeHex4(src: string, i: int): i64! {
+  let v = i64(0)
+  let k = 0
+  while (k < 4) {
+    let d = hexDigitVal(src, i + k)?
+    v = v * 16 + d
+    k = k + 1
+  }
+  return v
+}
+
+// Encodes Unicode scalar value `cp` as UTF-8 into `b`. Hand-rolled because a
+// `\uXXXX` escape (and a surrogate pair, for an astral codepoint) is the only
+// place this parser needs to build UTF-8 from a codepoint, and `string(rune)`
+// is not implemented yet (SPEC §12.9, deferred to rune iteration landing).
+fn writeUtf8(b: Builder, cp: i64): Builder {
+  if (cp < 0x80) {
+    return b.writeByte(u8(cp))
+  }
+  if (cp < 0x800) {
+    return b.writeByte(u8(0xC0 | (cp >> 6))).writeByte(u8(0x80 | (cp & 0x3F)))
+  }
+  if (cp < 0x10000) {
+    return b.writeByte(u8(0xE0 | (cp >> 12))).writeByte(u8(0x80 | ((cp >> 6) & 0x3F))).writeByte(
+      u8(0x80 | (cp & 0x3F)),
+    )
+  }
+  return b.writeByte(u8(0xF0 | (cp >> 18))).writeByte(u8(0x80 | ((cp >> 12) & 0x3F))).writeByte(
+    u8(0x80 | ((cp >> 6) & 0x3F)),
+  ).writeByte(u8(0x80 | (cp & 0x3F)))
+}
+
+// The scanner position `i` (still pointing at the `\` of a `\uXXXX` escape)
+// carries a valid low-surrogate continuation `\uXXXX` right after it.
+fn isLowSurrogateMarker(src: string, i: int, end: int): bool {
+  return i + 6 <= end && src[i] == '\\' && src[i + 1] == 'u'
+}
+
+// Decode a `\uXXXX` escape (RFC 8259 §7) starting at `i` (the `\`), folding a
+// UTF-16 surrogate pair into one code point, appending the UTF-8 bytes to `b`
+// and returning the scanner position just past the escape. Split out of
+// `decodeStringLiteral` (#2448).
+//
+// The decoded bytes cross the boundary through `b` rather than through a
+// return value: `Builder` is a class, hence a reference type (§13.3), so
+// `writeUtf8` mutates the caller's builder in place and the `Builder` it
+// returns is that same object. #2448's split returned both through a
+// two-field `UnicodeEscape` result class, and a class is a heap object, so
+// every `\u` escape in every parsed document paid one allocation the
+// pre-split code did not (#3638, measured at +1 per escape). Only the
+// position needs to come back, so an `int!` is the whole result.
+//
+// KEEP THIS RETURN TYPE SCALAR. This function is one `if` away from E0204's
+// complexity ceiling, so the next split of it will be tempted to bundle its
+// results in a class again; that reintroduces the allocation. Return
+// positions as `int` with a sentinel, the way `classifyFraction` does after
+// #3617, and let reference-typed outputs travel through the parameter they
+// already came in on.
+fn decodeUnicodeEscape(src: string, i: int, end: int, escStart: int, b: Builder): int! {
+  if (i + 6 > end) {
+    fail posError(src, "json: invalid \\u escape", escStart)
+  }
+  let cp = decodeHex4(src, i + 2)?
+  i = i + 6
+  if (cp >= 0xD800 && cp <= 0xDBFF) {
+    if (!isLowSurrogateMarker(src, i, end)) {
+      fail posError(src, "json: unpaired surrogate in \\u escape", i)
+    }
+    let lo = decodeHex4(src, i + 2)?
+    if (lo < 0xDC00 || lo > 0xDFFF) {
+      fail posError(src, "json: invalid low surrogate in \\u escape", i)
+    }
+    i = i + 6
+    let combined = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+    b = writeUtf8(b, combined)
+    return i
+  }
+  if (cp >= 0xDC00 && cp <= 0xDFFF) {
+    fail posError(src, "json: unpaired surrogate in \\u escape", escStart)
+  }
+  b = writeUtf8(b, cp)
+  return i
+}
+
+// The offset of the first `\` in `src[start:end)`, or -1 when the span holds
+// no escape. Fails on a control byte, which RFC 8259 §7 forbids unescaped in a
+// string body. Split out of `decodeStringLiteral` (#4358) so the object-key
+// path shares one definition of a valid string body instead of a second copy
+// that can drift from it.
+fn scanEscape(src: string, start: int, end: int): int! {
+  let j = start
+  while (j < end) {
+    let cj = src[j]
+    if (cj < 32) {
+      fail posError(src, "json: control character in string", j)
+    }
+    if (cj == '\\') {
+      return j
+    }
+    j = j + 1
+  }
+  return -1
+}
+
+// `src[start:end)` with its escapes resolved, `firstEscape` being the offset
+// `scanEscape` returned. Everything before it is copied verbatim in one write.
+fn decodeEscaped(src: string, start: int, end: int, firstEscape: int): string! {
+  let i = firstEscape
+  let b = newBuilder().write(src[start:firstEscape])
+  while (i < end) {
+    let c = src[i]
+    if (c < 32) {
+      fail posError(src, "json: control character in string", i)
+    }
+    if (c != '\\') {
+      b = b.writeByte(c)
+      i = i + 1
+      continue
+    }
+    let escStart = i
+    if (i + 1 >= end) {
+      fail posError(src, "json: unterminated escape", escStart)
+    }
+    let e = src[i + 1]
+    switch (e) {
+      case '"':
+        b = b.writeByte('"')
+        i = i + 2
+      case '\\':
+        b = b.writeByte('\\')
+        i = i + 2
+      case '/':
+        b = b.writeByte('/')
+        i = i + 2
+      case 'b':
+        b = b.writeByte(8)
+        i = i + 2
+      case 'f':
+        b = b.writeByte(12)
+        i = i + 2
+      case 'n':
+        b = b.writeByte('\n')
+        i = i + 2
+      case 'r':
+        b = b.writeByte('\r')
+        i = i + 2
+      case 't':
+        b = b.writeByte('\t')
+        i = i + 2
+      case 'u':
+        i = decodeUnicodeEscape(src, i, end, escStart, b)?
+      default:
+        fail posError(src, "json: invalid escape character", escStart)
+    }
+  }
+  return b.toString()
+}
