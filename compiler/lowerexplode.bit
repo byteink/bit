@@ -1,0 +1,274 @@
+// compiler/lowerexplode.bit — #4404: a parameter passed as more than one word.
+//
+// THE DESIGN, and why it costs nothing to build. `runtime/ABI.md` §1.1 costed a
+// register-PAIR calling convention and rejected it: one SSA value occupying two
+// physical locations needs a new `PLoc` kind, a multi-location `LiveInterval`, a
+// per-word `isRef` and a changed stack-map shape. That ruling stands for the
+// design it costed.
+//
+// This is a different design and §1.1 never named it. The aggregate is taken
+// apart in the LOWERER, above the backend, into N independent single-word SSA
+// values — so there is never a multi-location value, and `marshalArgs`,
+// `PLoc`, `LiveInterval`, `StackMapEntry`, the `.bit_gc` wire format and
+// `runtime/gc/stackmap.bit` are all untouched. `marshalArgs` walks an argument
+// LIST and `bindIncomingArgs` walks a parameter LIST; explosion makes both
+// lists longer and neither function changes.
+//
+// SCOPE, deliberately narrow (#4404): exactly two words, ARGUMENTS ONLY, and
+// only for a free non-generic non-extern non-`@symbol` function. Returns are
+// #4405 and are NOT touched here.
+//
+// WHY THE CALLEE HOLDS THE WORDS RATHER THAN RE-BOXING THEM. Rebuilding the
+// aggregate at function entry is correct and was measured to be a
+// pessimization: the box survives every optimization, because a local is
+// threaded through each control-flow join as a block parameter and dead block
+// parameters are not stripped. So an exploded parameter IS its words
+// (`declareExplodedParam`), and `localRead` materializes a box only where
+// something genuinely needs the whole aggregate — adjacent to its use, in the
+// same block, where store-to-load forwarding and dead-allocation elimination
+// remove it.
+
+// The per-word types of a parameter type this compiler passes as more than one
+// word, or an EMPTY list for the one-word convention every other type uses.
+//
+// The shape: a two-element tuple whose members are each exactly one 8-byte
+// field. Width is fixed at two by #4404's scope, and each member must be a
+// full word because a word IS the unit both `marshalArgs` and the stack map
+// deal in — a narrower member would need a packing rule that does not exist.
+// A member may be a GC reference; each word carries its own type, so the
+// traced one gets its own `isRef` interval exactly as a boxed handle does.
+fn explodedWordTypes(ctx: TypeContext, ty: int): []int {
+  if (ty == 0 || ctx.types[ty].kind != TypeKind.Tuple) {
+    return []int(0)
+  }
+  let members = ctx.types[ty].members
+  if (len(members) != 2) {
+    return []int(0)
+  }
+  let i = 0
+  while (i < len(members)) {
+    if (fieldLayoutFor(ctx, members[i]).size != 8) {
+      return []int(0)
+    }
+    i = i + 1
+  }
+  return members
+}
+
+// Whether any of `paramTypes` has the exploded shape. The cheap gate every
+// caller runs first, so a signature with no tuple in it costs one kind test per
+// parameter and allocates nothing.
+fn anyExplodedParam(ctx: TypeContext, paramTypes: []int): bool {
+  let i = 0
+  while (i < len(paramTypes)) {
+    if (len(explodedWordTypes(ctx, paramTypes[i])) != 0) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether `decl`'s parameters are marshalled as words. The answer has to be the
+// SAME at the declaration and at every direct call site, so it is derived from
+// the declaration alone and never from the call.
+//
+// Four exclusions, each because the declaration is not the only contract:
+//
+//   - an `extern fn` binds a foreign symbol whose ABI this compiler does not own;
+//   - a METHOD reaches its callers through vtable dispatch (`Op.CallIface`) as
+//     well as by name, and there the interface's method signature is the
+//     contract — outside the direct-call producers this change can see;
+//   - a GENERIC's call site holds template types where the instance's body
+//     holds substituted ones, so the two sides could classify differently;
+//   - a `@symbol`-pinned name exists precisely so something outside this
+//     compiler can call it.
+//
+// Getting this wrong is loud rather than silent: `callArityEscapesInFunc`
+// (verify.bit) refuses any module whose call arity disagrees with its callee.
+fn explodesParams(c: Checker, decl: int): bool {
+  if (decl == 0 || isExternDecl(c.tree, decl)) {
+    return false
+  }
+  let kids = kidsOf(c.tree, decl)
+  if (kids[0] != 0 || kids[2] != 0) {
+    return false
+  }
+  return funcAttrArg(c, decl, "symbol") == ""
+}
+
+// The IR parameter list for `paramTypes`: an exploded parameter contributes its
+// words in order, every other parameter contributes itself. `on` is
+// `explodesParams`, so an ineligible declaration keeps today's list exactly.
+fn explodeParamTypes(ctx: TypeContext, paramTypes: []int, on: bool): []int {
+  if (!on || !anyExplodedParam(ctx, paramTypes)) {
+    return paramTypes
+  }
+  let out = []int(0)
+  let i = 0
+  while (i < len(paramTypes)) {
+    let words = explodedWordTypes(ctx, paramTypes[i])
+    if (len(words) == 0) {
+      out = append(out, paramTypes[i])
+    } else {
+      let k = 0
+      while (k < len(words)) {
+        out = append(out, words[k])
+        k = k + 1
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// The argument list for a direct call to a function whose declared parameter
+// types are `paramTypes`: an exploded parameter's single aggregate argument
+// becomes its words, read out at the call site. When the argument was built
+// here from its parts, those reads and the build cancel — same block, so
+// store-to-load forwarding and dead-allocation elimination take both.
+//
+// An argument is expanded only when ITS OWN IR type has the same exploded shape
+// as the parameter's. That is not belt-and-braces: a variadic callee's
+// `paramTypes` carries the tail's ELEMENT type while the argument that arrives
+// is the collected `[]T`, and the shape test is what tells those apart without
+// a variadic special case here.
+fn explodeCallArgs(
+  ctx: TypeContext,
+  b: IrBuilder,
+  paramTypes: []int,
+  args: []int,
+  on: bool,
+): []int {
+  if (!on || !anyExplodedParam(ctx, paramTypes)) {
+    return args
+  }
+  let out = []int(0)
+  let i = 0
+  while (i < len(args)) {
+    let words = explodedArgWords(ctx, b, paramTypes, args, i)
+    if (len(words) == 0) {
+      out = append(out, args[i])
+    } else {
+      let k = 0
+      while (k < len(words)) {
+        out = append(out, explodedWordGet(ctx, b, paramTypes[i], args[i], k))
+        k = k + 1
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// The word types argument `i` is expanded into, or an empty list to pass it
+// through unchanged.
+fn explodedArgWords(ctx: TypeContext, b: IrBuilder, paramTypes: []int, args: []int, i: int): []int {
+  if (i >= len(paramTypes)) {
+    return []int(0)
+  }
+  let words = explodedWordTypes(ctx, paramTypes[i])
+  if (len(words) == 0) {
+    return []int(0)
+  }
+  if (len(explodedWordTypes(ctx, b.instrs[args[i]].ty)) != len(words)) {
+    return []int(0)
+  }
+  return words
+}
+
+// Reads word `k` out of the aggregate value `recv` of type `ty`.
+//
+// The offset is `k * 8` rather than a `layoutFields` lookup, and that is exact
+// rather than an assumption: `explodedWordTypes` admits a type only when every
+// member is an 8-byte field, and `layoutFields` aligns each field to its own
+// size — so this shape's offsets are 0 and 8 and nothing else is reachable
+// here. `ival2` carries the READ's own width the same way `tupleElem` leaves
+// codegen to derive it from the instruction type.
+fn explodedWordGet(ctx: TypeContext, b: IrBuilder, ty: int, recv: int, k: int): int {
+  let fg = mkInstr(Op.FieldGet, ctx.types[ty].members[k])
+  fg.lhs = recv
+  fg.ival = k * 8
+  return builderEmit(b, fg)
+}
+
+// Binds `name` to a parameter that arrived as two words. The local IS the two
+// words: nothing is allocated, and the aggregate is materialized on demand by
+// `localRead`.
+//
+// A name the escape rule marked captured-and-assigned (§12.8) has to live in a
+// heap CELL, and a cell holds one word, so such a parameter takes the ordinary
+// boxed representation instead. That is a decision inside the callee with no
+// effect on the ABI, which stays derived from the declaration.
+fn declareExplodedParam(fc: FnCtx, name: string, ty: int, words: []int, ids: []int) {
+  if (stringInList(fc.boxedNames, name)) {
+    declareLocal(fc, name, buildTuple(fc, ty, ids), ty)
+    return
+  }
+  fc.env = append(
+    fc.env,
+    LocalBind{
+      name: name, value: ids[0], ty: ty, boxTy: 0,
+      hiValue: ids[1], loTy: words[0], hiTy: words[1],
+    },
+  )
+}
+
+// ===========================================================================
+// Env-to-block-parameter threading
+//
+// Moved here from lower.bit under #4404, unchanged in behaviour except that
+// "one value per env slot" is no longer a law: an exploded local occupies TWO
+// slots' worth of words. All three walk the env in the same order, so the flat
+// word list `snapshotValues` produces lines up position-for-position with the
+// parameters `addJoinParams` declares and with what `restoreValues` consumes.
+// ===========================================================================
+
+// The current value ids of the first `n` env locals (a control-flow snapshot),
+// flattened by word.
+fn snapshotValues(fc: FnCtx, n: int): []int {
+  let vals = []int(0)
+  let i = 0
+  while (i < n) {
+    vals = append(vals, fc.env[i].value)
+    if (fc.env[i].hiTy != 0) {
+      vals = append(vals, fc.env[i].hiValue)
+    }
+    i = i + 1
+  }
+  return vals
+}
+
+// Restores the locals a snapshot covers from their word list (after a branch
+// that reassigned some of them). Walks env slots consuming words, so a snapshot
+// taken over the first `n` slots restores exactly those `n`.
+fn restoreValues(fc: FnCtx, vals: []int) {
+  let i = 0
+  let k = 0
+  while (k < len(vals)) {
+    fc.env[i].value = vals[k]
+    k = k + 1
+    if (fc.env[i].hiTy != 0) {
+      fc.env[i].hiValue = vals[k]
+      k = k + 1
+    }
+    i = i + 1
+  }
+}
+
+// At a reachable join, gives the current block one parameter per in-scope
+// local's WORD (the first `n` locals) and rebinds each local to its new
+// block-param values — the seed's addLoopParams. Params are added in env order,
+// each exploded local's low word before its high one.
+fn addJoinParams(fc: FnCtx, n: int) {
+  let i = 0
+  while (i < n) {
+    if (fc.env[i].hiTy != 0) {
+      fc.env[i].value = builderAddParam(fc.b, fc.env[i].loTy)
+      fc.env[i].hiValue = builderAddParam(fc.b, fc.env[i].hiTy)
+    } else {
+      fc.env[i].value = builderAddParam(fc.b, bindSlotTy(fc.env[i]))
+    }
+    i = i + 1
+  }
+}
