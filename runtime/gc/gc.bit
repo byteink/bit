@@ -75,7 +75,10 @@ import {
   allocSpanNext,
   allocSpanOf,
   allocSpanHdrWords,
+  allocSpanSlots,
   allocSlotIndex,
+  allocCarveStart,
+  allocClassSize,
   heapTakeSmallLocked,
   heapGiveSmallLocked,
   heapRefillLocked,
@@ -111,9 +114,32 @@ import {
 // bytes for anything in the meantime -- that would put the shrink back.
 export const gcHeaderSize = 32
 
+// Bytes mapped in FRONT of a large object's header to hold its list link
+// (#4059). Large objects are >16384 bytes and come straight from `memMapPages`,
+// so one word is under 0.05% of the smallest of them and the mapping was
+// page-rounded anyway; `allocLargeLen` is given `size + gcLargePrologue` on both
+// the map and the unmap side so the two lengths cannot drift.
+//
+// A PROLOGUE, NOT A HEADER FIELD, AND THAT IS THE WHOLE POINT. The header stays
+// uniform at `gcHeaderSize` for every object, so codegen -- which only ever
+// computes `recv - gcHeaderSize` (`compiler/arm64call.bit`,
+// `compiler/x64call.bit`) -- cannot see this and does not have to. The collector
+// reaches it by already knowing the object is large, which it must anyway:
+// `allocClassify(...) < 0` is what gates `setSlotBit` and `idxInsert` today.
+//
+// 8, so the header stays 8-aligned behind a page-aligned mapping (ABI.md 1:
+// "Object base is 8-aligned", and v1 bodies need at most 8-byte alignment).
+const gcLargePrologue = 8
+
 // Header field offsets, in bytes from the object base.
 export const gcHdrInfo = 0
-export const gcHdrNext = 8
+// BYTES 8..15 ARE DEAD (#4059), like 24..31 (#4083). They held `gcHdrNext`, the
+// all-objects list link, and nothing reads or writes them now: small objects are
+// enumerated from their span's occupied-slot bitmap and large ones from a list
+// whose link sits in a prologue word ahead of the header (`gcLargePrologue`
+// below, `./gcwalk.bit`). Do not reclaim either dead word for anything -- both
+// exist to be DELETED by #4086's `gcHeaderSize` 32 -> 16, and using one puts
+// that shrink back.
 // The total allocation size AND the mark bit share this word (#4083). `size` is
 // one allocation's byte count, so it is positive and far below 2^63: bit 63 is
 // free BY CONSTRUCTION rather than by luck, and `gcAddrMax` below is exactly the
@@ -155,7 +181,13 @@ export const gcAddrMax = 9223372036854775807
 export const gcHeapAddr = 0 // address of the allocator's heap block
 const gcHeapLockAddr = 1    // address of the i32 word guarding that heap block
 const gcLockAddr = 2        // address of the i32 list-lock word
-const gcAll = 3             // head of the all-objects list, 0 = null
+// Head of the LARGE-object list, 0 = null (#4059). Was the head of the
+// all-objects list; large objects are the only population the per-span
+// occupied-slot bitmap cannot reach, so they are the only one that still needs
+// a list. The word is REUSED rather than freed because `gcWords` is boot-pinned
+// (`tools/build/abiarity.bit`) and renumbering it would be a runtime ABI change
+// for no gain.
+const gcLargeAll = 3
 // Exported (#3292): `runtime/stw`'s poll inlines `gcShouldCollect`'s object
 // half the same way it already inlines the byte half, to avoid taking the
 // expensive locked slow path on every back edge while the byte trigger has
@@ -272,6 +304,28 @@ const idxLoadPct = 80 // grow at 80% occupancy, the conventional open-addressing
   storeWord(h + gcHdrSize, loadWord(h + gcHdrSize) & gcAddrMax)
 }
 
+// The sweep's whole per-survivor test: clear the mark if it is set, and say
+// whether it WAS. A fifth accessor rather than a `hdrMarked` + `hdrClearMark`
+// pair at the one call site that does both (#4059), because that pair addresses
+// the word FOUR times and loads it twice — `loadWord`/`storeWord` each
+// recompute `h + gcHdrSize` and re-mask it, and this backend has no CSE across
+// them. It lives here, beside its four siblings, for the reason the block
+// comment above gives: the packing gets exactly one definition, and the sweep
+// does not open-code a mask.
+//
+// THE STORE IS UNCONDITIONAL, which is not a slip: for an object that was not
+// marked, `v & gcAddrMax` IS `v`, so the store writes the value back unchanged.
+// It buys a branchless body of four statements, which is what lets this be
+// inlined into the sweep's inner loop rather than reached by `bl` per object,
+// and it dirties no line the sweep was not already about to touch — an unmarked
+// object is on its way to `heapGiveSmallLocked`, which writes the same slot.
+@nosplit fn hdrTakeMark(h: int): bool {
+  let p = wordAt(h + gcHdrSize)
+  let v = *p
+  *p = v & gcAddrMax
+  return v < 0
+}
+
 @nosplit fn headerFromBody(body: int): int {
   return body - gcHeaderSize
 }
@@ -354,7 +408,7 @@ export @nosplit @symbol("bit_rt_port_gc_init") fn gcInit(
   *(g + gcHeapAddr) = heapAddr
   *(g + gcHeapLockAddr) = heapLockAddr
   *(g + gcLockAddr) = listLockAddr
-  *(g + gcAll) = 0
+  *(g + gcLargeAll) = 0
   *(g + gcNumObjectsIdx) = 0
   *(g + gcStackAddr) = 0
   *(g + gcStackLen) = ncap
@@ -423,236 +477,6 @@ export @nosplit @symbol("bit_rt_port_gc_bind_memory") fn gcBindMemory(
   *(g + gcPageSize) = pageSize
 }
 
-// ---------------------------------------------------------------------------
-// The heap seam — `runtime/gc/`'s three calls into `runtime/alloc/`, composed here
-// ---------------------------------------------------------------------------
-//
-// `runtime/alloc/` exposes `alloc`/`free` directly; the Bit allocator exposes the
-// same policy as `...Locked` primitives plus a caller-supplied span, because it
-// cannot reach the OS itself. Composing them is therefore the CALLER's job, and
-// the collector is the allocator's only caller. The lock discipline is the
-// fixed: one critical section spans classification, the refill and the
-// take, so a span map still happens inside it and two workers cannot both
-// refill the same class.
-
-// The allocator's heap state block, as a `*i64`.
-@nosplit fn heapBlock(g: *i64): *i64 {
-  return wordAt(*(g + gcHeapAddr))
-}
-
-// `>> 2`, not `/ 4` (#3904): same argument as `lockPtr` above -- `addr` is a
-// `ptrOf`-derived lock word address (`gcInit`'s `heapLockAddr` parameter),
-// never negative.
-@nosplit fn heapLock(g: *i64): *i32 {
-  let n: *i32 = nil
-  let addr = *(g + gcHeapLockAddr)
-  return n + (addr >> 2)
-}
-
-// `Heap.alloc(size, alignment)`: the address, or 0 when memory is exhausted.
-//
-// UNDER STRESS THE REFILL PATH ALSO VERIFIES THE SPAN BOOKKEEPING (#2374) —
-// `sum over spans of (total - free)` re-derived for all 37 classes and compared
-// against the live-slot counts the allocator maintains through a different word.
-// `gcCfgStress` is the collector's existing debug flag (`BIT_GC=stress`, which
-// `_tests_/bit/stress/verify.bit`'s `checkProgram`/`runOnce` run the whole stress
-// corpus a second time under), so it is armed across that corpus and costs a
-// release build nothing.
-//
-// PER REFILL, NOT PER ALLOCATION, AND THAT IS MEASURED RATHER THAN GUESSED. The
-// check is O(spans); at every allocation it doubled `_tests_/stress/chanracedarwin`
-// under `BIT_GC=stress` (217.85s -> 427.04s, `/usr/bin/time -l`, this host),
-// which is straight through the harness's 300s wall. Here it is O(spans) per span
-// CREATED — quadratic in a count bounded by 128 KiB of address space each, so a
-// rounding error — and it fires exactly when the structure it checks changes.
-// Do not move it to the top of this function; that is the version that was too
-// slow.
-//
-// PER COLLECTION, WHICH IS WHAT #2374 ASKED FOR, IS NOT THIS. It would belong in
-// `./gccollect.bit`'s `gcCollectFinish`, outside the file set this change was
-// allowed to touch, and under `BIT_GC=stress` a collection is about as frequent
-// as an allocation anyway (`_tests_/stress/gcgrow` collects 1,476,023 times), so
-// it would have cost what the per-allocation form cost. Filed rather than
-// smuggled in.
-//
-// AFTER the refill and inside the heap lock: the span is fully carved and linked
-// by then, and this function already holds the lock.
-//
-// `idx` IS PASSED IN, NOT RECOMPUTED (#4043). It is what `allocClassify` says
-// for this `size` and `alignment`; the caller has it because the same value
-// decides `linkObject`'s bitmap bit one frame later, and deriving it twice from
-// the same constant cost 278 instructions a time before #4042 and still costs
-// 56. Computing it BEFORE the lock rather than after also shortens the critical
-// section — sound because `allocClassify` is pure: it reads no heap word, takes
-// no lock and mutates nothing (`runtime/alloc/classify.bit`).
-@nosplit fn gcHeapAlloc(g: *i64, size: int, alignment: int, idx: int): int {
-  spinAcquire(heapLock(g))
-  if (idx >= 0) {
-    let addr = heapTakeSmallLocked(heapBlock(g), idx, size)
-    if (addr != 0) {
-      spinRelease(heapLock(g))
-      return addr
-    }
-    // Class empty: try the #3045 span cache before the reserve. A reclaimed
-    // span sitting there is address space that is already ours — resident,
-    // owned, and unlinked from every class — so reusing it costs nothing the
-    // reserve would otherwise have to map fresh.
-    let span = heapSpanCacheTakeLocked(heapBlock(g))
-    let owned = true
-    if (span == 0) {
-      // Cache empty: try the span reserve's own free list next (#3868) —
-      // an address `gcHeapFree`'s overflow arm recovered rather than
-      // abandoned when the #3045 cache was already full for it. Cheaper
-      // than `reserveGrow` even though both eventually return mapped
-      // memory: this skips a syscall entirely, `bit_rt_remap_pages` having
-      // already paid it when the span was pushed.
-      span = spanFreeListTake(g + gcSpanFree)
-      if (span == 0) {
-        // Free list empty too: carve a fresh span out of the reserve and
-        // retry, which is `allocSmall`'s `refill` path. `reserveGrow` maps a
-        // fresh chunk when the reserve is spent, so this fails only when the
-        // OS is out — `refill`'s `mapPages(span_bytes) orelse return false`
-        // exactly (#1638).
-        span = reserveGrow(g + gcSpanRes, allocSpanBytes)
-        if (span == 0) {
-          spinRelease(heapLock(g))
-          return 0
-        }
-        // Whether this span may ever be given back to the OS is decided HERE
-        // and recorded on the span, because this is the only place that
-        // knows: a span out of a chunk the reserve mapped is releasable, one
-        // out of the arena the CALLER bound is not (#2375, see
-        // `reserveHeadOwns`).
-        owned = reserveHeadOwns(g + gcSpanRes, span, allocSpanBytes)
-      }
-      // A free-list span is always releasable too, same reasoning as the
-      // cache below: it can only have arrived here via `gcHeapFree`'s
-      // overflow arm, which only ever reaches a span already established as
-      // owned. `owned` stays at its default (true) for it.
-    }
-    // A cached span is always releasable: `heapSpanCachePushLocked` only ever
-    // receives spans `heapReclaimSpansLocked` marked doomed, and that pass
-    // only takes spans with `spanOwned != 0` to begin with.
-    heapRefillLocked(heapBlock(g), idx, span, owned)
-    // #3177: register the span as span-backed BEFORE any slot in it is
-    // handed out, so `gcOwns` can answer every object carved from it via the
-    // #3176 bitmap instead of `idxContains`/`gcOwnsLinear`. Still inside the
-    // heap lock — safe to nest the list lock this takes underneath it, never
-    // the other way (`./gcindex.bit`'s span-presence note: nothing reachable
-    // under the list lock ever acquires the heap lock).
-    idxInsertSpan(g, span)
-    if (*(g + gcCfgStress) != 0) {
-      let _ = heapCheckSpansLocked(heapBlock(g))
-    }
-    let got = heapTakeSmallLocked(heapBlock(g), idx, size)
-    spinRelease(heapLock(g))
-    return got
-  }
-  // Direct-mapped (large) path — `allocLarge` verbatim: round to whole pages
-  // and map them straight from the OS, NOT out of the span reserve (#1638).
-  // Serving these from the reserve was the original defect: every slice
-  // backing over `allocMaxSmall` (16 KiB) came here, so a single 2 MiB slice
-  // took a quarter of the boot arena and gave none of it back.
-  let nbytes = allocLargeLen(size, *(g + gcPageSize))
-  let addr = memMapPages(nbytes)
-  if (addr == 0) {
-    spinRelease(heapLock(g))
-    return 0
-  }
-  heapLargeAllocLocked(heapBlock(g), size, nbytes)
-  spinRelease(heapLock(g))
-  return addr
-}
-
-// `Heap.free(ptr, size, alignment)`. `size` and `alignment` must match the
-// original request — the allocator's contract, and the reason there are no
-// per-object allocator headers: the size lives in the GC header.
-//
-// A large block's pages are UNMAPPED, which is `freeLarge` verbatim (#1641).
-// Until #1638 they were carved out of a bump reserve and giving one back was
-// structurally impossible; now that they come straight from `memMapPages` the
-// whole of the fix is the matching `memUnmapPages`, and without it every
-// slice or string backing above `allocMaxSmall` (16 KiB) leaked its pages for
-// the life of the process.
-//
-// `allocLargeLen` is computed here with the same `size` and page size the
-// allocating side used, so the released length is exactly the mapped one — the
-// contract `runtime/alloc/` relies on too (`free` receives the request's own `size`).
-//
-// UNMAP BEFORE THE ACCOUNTING, INSIDE THE LOCK. The counters must not claim the
-// pages are gone while they still are, and holding the lock across the syscall
-// is the required discipline (one acquire/release spanning all of
-// `free`), so two workers cannot race a map against an unmap of the same range.
-//
-// A SMALL SPAN IS NOW RELEASED THE SAME WAY (#2375), and that is what stops a
-// long-lived process ratcheting its RSS to its all-time peak: before this, the
-// small branch was `heapGiveSmallLocked` and nothing else, `memUnmapPages` had
-// exactly one call site in the runtime — the large branch below — and an idle
-// `bit lsp --stdio` reached 12,577 MB (#2325).
-//
-// The allocator decides WHEN (it owns the policy and the hysteresis) and does the
-// unlinking; this composes the syscall onto it, exactly as the small path's
-// refill composes `reserveGrow` onto `heapRefillLocked`. Still inside the one
-// critical section, so no worker can hold a pointer into a span being unmapped:
-// every slot in it is on the free list, and the list itself is under this lock.
-//
-// `idx` IS PASSED IN, NOT RECOMPUTED (#4043) — same argument as `gcHeapAlloc`
-// above. `freeObject` already holds it: it needs the class to clear the
-// occupied-slot bit before the slot goes back on the free list.
-//
-// PRECONDITION: the caller holds `heapLock(g)`. `gcHeapFree` below is the
-// acquire/call/release form for a caller that does not.
-@nosplit fn gcHeapFreeLocked(g: *i64, addr: int, size: int, alignment: int, idx: int) {
-  if (idx >= 0) {
-    let reclaim = heapGiveSmallLocked(heapBlock(g), addr, idx, size)
-    if (reclaim != 0) {
-      let chain = heapReclaimSpansLocked(heapBlock(g), idx)
-      // Bounded: `heapReclaimSpansLocked` builds the chain in a bounded walk of
-      // one class's span list, and every span on it is off both lists.
-      while (chain != 0) {
-        // Read BEFORE the span is cached or unmapped: caching overwrites the
-        // span's own first word (#3045), and unmapping makes it unreadable.
-        let nxt = allocSpanNext(chain)
-        // #3177: remove the span-presence key BEFORE either disposal below —
-        // once cached or freelisted the span can be refilled for a different
-        // class with a differently-sized bitmap, and `gcOwns` must stop
-        // answering this address from the OLD layout the instant that can
-        // happen, not merely once no live object remains (every slot here is
-        // already free, so the old bitmap already reads all-zero; this is
-        // about correctness after reuse, not about the answer right now).
-        idxRemoveSpan(g, chain)
-        // Try the #3045 cache first; only hand it to the reserve's free list
-        // (#3868) when the cache reports full. Either way the span leaves
-        // `heapMappedBytes`' count here — a cache hit stays resident but is
-        // no longer "mapped" in the accounting sense until a later refill
-        // adds it back; a free-list push actually decommits it (see
-        // `spanFreeListPush`), so its bytes leave the count for the same
-        // reason an unmapped span's did before #3868 — and return only via a
-        // fresh refill either way.
-        if (heapSpanCachePushLocked(heapBlock(g), chain) == 0) {
-          spanFreeListPush(g + gcSpanFree, chain)
-        }
-        heapSpansReleasedLocked(heapBlock(g), allocSpanBytes)
-        chain = nxt
-      }
-    }
-  } else {
-    let nbytes = allocLargeLen(size, *(g + gcPageSize))
-    memUnmapPages(addr, nbytes)
-    heapLargeFreeLocked(heapBlock(g), size, nbytes)
-  }
-}
-
-// The same free with the heap lock taken around it, for a caller that does not
-// already hold it -- `gcDeinit`'s mark-worklist free, the only one left now that
-// every per-object free runs inside one acquire spanning a whole sweep (#4319,
-// `./gcmark.bit`). Kept so the locking contract is a property of the call site.
-@nosplit fn gcHeapFree(g: *i64, addr: int, size: int, alignment: int, idx: int) {
-  spinAcquire(heapLock(g))
-  gcHeapFreeLocked(g, addr, size, alignment, idx)
-  spinRelease(heapLock(g))
-}
-
 // Span-bookkeeping violations the allocator has recorded (#2374). Zero unless
 // something drove `heapCheckSpansLocked`, which under this collector means
 // `BIT_GC=stress` — so a program asserting this is 0 must ALSO have configured
@@ -684,20 +508,18 @@ export @nosplit fn gcSpanViolations(g: *i64): int {
 // all of the collector's footprint.
 export @nosplit fn gcDeinit(g: *i64) {
   idxDisable(g)
-  let o = *(g + gcAll)
-  // ONE acquire for the whole loop (#4319), not one per object. Deinit is
+  // ONE acquire for the whole walk (#4319), not one per object. Deinit is
   // single-threaded by contract, and nothing between here and the release
   // re-acquires `heapLock` -- `./gcmark.bit`'s `sweep` states that argument in
   // full and it is the same one.
+  //
+  // #4059: the walk is `./gcwalk.bit`'s, in free-everything mode -- the same
+  // enumeration `sweep` uses, with the mark test removed rather than a second
+  // copy of the traversal.
   spinAcquire(heapLock(g))
-  // Bounded: at most `num_objects` links.
-  while (o != 0) {
-    let next = loadWord(o + gcHdrNext)
-    freeObject(g, o)
-    o = next
-  }
+  let _ = gcWalkHeap(g, gcWalkFreeAll)
   spinRelease(heapLock(g))
-  *(g + gcAll) = 0
+  *(g + gcLargeAll) = 0
   *(g + gcNumObjectsIdx) = 0
   let stack = *(g + gcStackAddr)
   if (stack != 0) {

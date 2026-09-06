@@ -53,7 +53,8 @@ import { pollRequest } from "../sched"
 //   `linkObject` -> `setSlotBit` (below) runs between `spinAcquire(lockPtr(g))`
 //   and `spinRelease(lockPtr(g))`, so two sets can never overlap.
 //
-//   `freeObject` -> `clearSlotBit` (`./gcmark.bit`) has exactly two callers:
+//   `gcVisitWord`'s batched clear (`./gcwalk.bit`) is reached only through
+//   `sweep`/`gcDeinit`, which have exactly two callers:
 //   `sweep`, reached only from `gcCollectFinish` inside `stwCollect`
 //   (`../stw/stw.bit`) AFTER `worldRendezvous` returned true — every other
 //   mutator parked and acknowledged this epoch, and `linkObject` is `@nosplit`
@@ -90,20 +91,6 @@ import { pollRequest } from "../sched"
   *w = *w | mask
 }
 
-@nosplit fn clearSlotBit(addr: int, idx: int) {
-  if (idx < 0) {
-    return
-  }
-  let n = allocSlotIndex(addr, idx)
-  if (n < 0) {
-    return
-  }
-  // n >= 0 is proven above (the `n < 0` guard returns) -- see setSlotBit.
-  let w = wordAt(allocSpanOf(addr) + allocSpanHdrWords * 8 + (n >> 6) * 8)
-  let mask = 1 << (n & 63)
-  *w = *w & ~mask
-}
-
 // Thread a freshly-allocated header onto the all-objects list and bump the
 // counters and address bounds under the list lock, so concurrent allocators on
 // different workers cannot corrupt the list. Prepends, so the list is
@@ -135,15 +122,25 @@ import { pollRequest } from "../sched"
   let bodyAddr = bodyFromHeader(h)
   spinAcquire(lockPtr(g))
   storeWord(h + gcHdrInfo, infoAddr)
-  storeWord(h + gcHdrNext, *(g + gcAll))
   // `total` is positive, so this one store writes the size AND leaves the mark
   // clear (#4083). The separate mark store is gone, not moved.
   storeWord(h + gcHdrSize, total)
-  *(g + gcAll) = h
   *(g + gcNumObjectsIdx) = *(g + gcNumObjectsIdx) + 1
   *(g + gcStTotalAllocated) = *(g + gcStTotalAllocated) + 1
   noteBody(g, bodyAddr)
+  // #4059: A SMALL OBJECT IS RECORDED ONLY BY `setSlotBit` BELOW. The global
+  // all-objects list is gone; `./gcwalk.bit` enumerates the small population
+  // straight out of the per-span occupied-slot bitmap this already maintains,
+  // which is what frees header word 8 for #4086.
+  //
+  // A LARGE ONE HAS NO SPAN AND SO NO BIT, so it keeps a list -- link word in
+  // the prologue `gcHeapAlloc` mapped in front of the header, NOT in the header
+  // itself (`gcLargePrologue`, `./gc.bit`). Same `idx < 0` gate the hash-index
+  // insert below already uses, so the two records cannot disagree about which
+  // population an object is in.
   if (idx < 0) {
+    storeWord(h - gcLargePrologue, *(g + gcLargeAll))
+    *(g + gcLargeAll) = h
     idxInsert(g, bodyAddr)
   }
   setSlotBit(h, idx)
@@ -406,7 +403,7 @@ export @nosplit @symbol("bit_rt_port_gc_alloc_raw") fn gcAllocRaw(
 // #3177: SPAN-BACKED ADDRESSES ANSWER FROM THE #3176 BITMAP, NEVER FROM
 // `idxContains`/`gcOwnsLinear`. `allocSpanOf`/`allocSlotIndex` work in the
 // allocator's own SLOT-BASE space, which is the HEADER address, not the
-// body — `setSlotBit`/`clearSlotBit` above pass `h` for exactly this reason,
+// body — `setSlotBit` above passes `h` for exactly this reason,
 // and `linkObject`'s `h` is literally the raw address the allocator handed
 // back. So the query is converted the same way BEFORE either is called:
 // `headerFromBody(body)`. `allocSpanOf` is a pure mask (no dereference), so
@@ -452,16 +449,50 @@ export @nosplit @symbol("bit_rt_port_gc_owns") fn gcOwns(g: *i64, body: int): bo
   return gcOwnsLinear(g, body)
 }
 
-// The authoritative O(objects) membership scan the index mirrors. The fallback
-// when the index is unavailable, and the oracle the index is tested against.
+// The authoritative membership scan the index mirrors. The fallback when the
+// index is unavailable, and the oracle the index is tested against.
+//
+// #4059: DERIVED FROM THE HEAP'S OWN STRUCTURE, NOT FROM A SIDE LIST, and the
+// four answers `./gcindex.bit`'s design note pins are unchanged:
+//
+//   - EXACT BASE of a live object: true. Small -- the span is carved, the slot
+//     index is exact and its bit is set. Large -- it is on the large list.
+//   - INTERIOR: false. `allocSlotIndex` returns -1 for any address that is not
+//     an exact slot base (its remainder check, `../alloc/bitmap.bit`), and the
+//     large list holds bases and is compared by equality.
+//   - FREED: false. `freeObject` clears the slot bit before the allocator gets
+//     the slot back, and unlinks the large object before unmapping it.
+//   - FOREIGN: false. Its span is on no class list, and it is on no list.
+//
+// It also keeps the one exclusion the list gave for free: `gcInit`'s mark
+// worklist allocates straight through `gcHeapAlloc` without ever reaching
+// `linkObject`, so no bit is ever set for it and it is on no list -- false,
+// exactly as before.
+//
+// O(spans) rather than O(all objects), so the disabled-index degradation
+// `idxDisable` documents (27x-494x, #3930) gets strictly less bad. It is still
+// the slow path and still not one to rely on.
 export @nosplit fn gcOwnsLinear(g: *i64, body: int): bool {
-  let o = *(g + gcAll)
-  // Bounded: at most `num_objects` links.
+  if ((body & 7) != 0) {
+    return false
+  }
+  let h = headerFromBody(body)
+  let span = allocSpanOf(h)
+  let cls = gcSpanCarvedClass(g, span)
+  if (cls >= 0) {
+    let n = allocSlotIndex(h, cls)
+    if (n < 0) {
+      return false
+    }
+    return (allocSpanBitmapWord(span, n >> 6) & (1 << (n & 63))) != 0
+  }
+  let o = *(g + gcLargeAll)
+  // Bounded: one link per large object.
   while (o != 0) {
     if (bodyFromHeader(o) == body) {
       return true
     }
-    o = loadWord(o + gcHdrNext)
+    o = loadWord(o - gcLargePrologue)
   }
   return false
 }

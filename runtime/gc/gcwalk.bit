@@ -1,0 +1,294 @@
+// Heap enumeration: the collector's authoritative walk over every tracked
+// object. Sibling of `./gc.bit`, same module (SPEC §17.1) — every name it uses
+// is declared in `./gc.bit`, `./gcalloc.bit`, `./gcmark.bit` or `./gcindex.bit`
+// and needs no import; the two `../alloc` primitives it rests on
+// (`allocSpanSlots`, `allocSlotAddr`) are imported once, in `./gc.bit`, because
+// an import is per-MODULE.
+//
+// ---------------------------------------------------------------------------
+// #4059: THIS REPLACES THE ALL-OBJECTS LIST
+// ---------------------------------------------------------------------------
+//
+// Until this landed, every object was prepended onto one global list (`gcAll`)
+// through a link word at header offset 8, and four separate hand-written walks
+// chased it: `sweep`, `recoverOverflow`, `gcOwnsLinear` and `gcDeinit`, with
+// `idxRebuildObjects` a fifth that walked all of it to keep 0.02% of it.
+//
+// The list was never the collector's own structure. Every SMALL object was
+// already recorded twice — once on the list, and once as a bit in its span's
+// occupied-slot bitmap (`setSlotBit`, `./gcalloc.bit`, #3147/#3176), which
+// `gcOwns` has answered from since #3177. Enumerating from the
+// bitmap instead deletes the second record, not the first, and it frees header
+// word 8 for #4086 to shrink `gcHeapSize` 32 -> 16.
+//
+// LARGE OBJECTS ARE THE ONE POPULATION THE BITMAP CANNOT REACH, and they keep a
+// list. They have no span at all (`allocClassify` returns -1 above 16384 bytes,
+// `../alloc/classify.bit`) and `heapLargeAllocLocked`/`heapLargeFreeLocked`
+// carry no per-object metadata — pure byte counters over a direct
+// `memMapPages` region. So their link lives in a PROLOGUE word mapped in front
+// of the header (`gcLargePrologue`, `./gc.bit`), which keeps the header itself
+// uniform at `gcHeaderSize` for every object and invisible to codegen, which
+// only ever computes `recv - gcHeaderSize`. Measured across the bench suite,
+// the population that pays for the list is 2000 of 10,006,006 objects on
+// `bench/cases/alloc` (0.0200%) and 20 of 5,400,062 on `json` (0.00037%).
+//
+// THE COST IS REPLACED, NOT REMOVED, and that is stated here so nobody claims
+// otherwise from the instruction count: the list's per-object chase was 8
+// instructions; a bitmap walk still loads a word, isolates a bit and computes
+// a slot address for every object it yields. What this buys is the header word,
+// which is a FOOTPRINT argument (#4086), not a cycles one.
+//
+// ---------------------------------------------------------------------------
+// ONE TRAVERSAL, THREE ACTIONS
+// ---------------------------------------------------------------------------
+//
+// The three enumerating callers differ only in what they do per object, so the
+// mode is a parameter and the walk is written once. Four copies of a four-deep
+// nested loop is exactly the shape `scripts/selfhost-diff*.sh` cost this repo
+// six times over: a fix applied to a copy does not reach its siblings.
+const gcWalkSweep: int = 0   // free the unmarked, clear the mark on survivors
+const gcWalkFreeAll: int = 1 // free everything (`gcDeinit`)
+const gcWalkRescan: int = 2  // re-scan every marked object (`recoverOverflow`)
+
+// Masks for a LOGICAL right shift, which this subset spells as an arithmetic
+// shift plus a mask: `>>` sign-extends, so a bitmap word with slot 63 occupied
+// is negative and a bare `w >> 1` would refill the top bit forever.
+const gcShift1Mask: int = 9223372036854775807 // (1 << 63) - 1
+const gcShift8Mask: int = 72057594037927935   // (1 << 56) - 1
+
+// The sweep's survivor test: in sweep mode, clear the mark and say the object
+// lives. False in every other mode, so the walk's other two actions never touch
+// the mark.
+//
+// IT IS CALLED FROM `gcVisitSlot` AND NOWHERE ELSE, DELIBERATELY, AND BOTH WAYS
+// OF "IMPROVING" THAT WERE MEASURED AND REJECTED. Hoisting the test into
+// `gcVisitWord`'s loop to save a call frame per survivor skips it for
+// `gcWalkLarge`, the other caller of `gcVisitSlot`: that version FREED EVERY
+// LIVE LARGE OBJECT and segfaulted the compiler on its first build. Hoisting it
+// into BOTH call sites is correct and is SLOWER — `bench/cases/alloc` went
+// -10.9% -> -6.1% against `main` and `json` gained instructions — so the frame
+// it was meant to save is not what either workload is paying. One definition,
+// one call site, and the numbers agree with the safer shape.
+@nosplit fn gcSurvives(h: int, mode: int): bool {
+  if (mode != gcWalkSweep) {
+    return false
+  }
+  return hdrTakeMark(h)
+}
+
+// Act on one object. Returns 1 if it was freed, 0 otherwise, so the callers can
+// count what they swept and decide whether a reclaim pass is worth running.
+//
+// `gcNumObjectsIdx` is decremented HERE rather than by each caller: it is part
+// of "this object is gone", and splitting it out is how the count and the free
+// drift apart.
+//
+// SWEEP IS TESTED FIRST because it is the arm every real workload takes for
+// nearly every object: `sweep` runs once per collection over the whole heap,
+// and `gcWalkRescan` only after a mark-worklist overflow.
+@nosplit fn gcVisitSlot(g: *i64, h: int, mode: int): int {
+  if (gcSurvives(h, mode)) {
+    return 0
+  }
+  if (mode == gcWalkRescan) {
+    if (hdrMarked(h)) {
+      scanObject(g, h)
+    }
+    return 0
+  }
+  *(g + gcNumObjectsIdx) = *(g + gcNumObjectsIdx) - 1
+  freeObject(g, h)
+  return 1
+}
+
+// Every occupied slot of one bitmap word, in ascending slot order, and the
+// batched write-back of the bits it freed.
+//
+// SCANNED LOW BIT FIRST, SKIPPING EIGHT ZEROS AT A TIME, rather than through a
+// count-trailing-zeros helper. This subset has no `ctz` builtin, so the helper
+// was an unrolled six-branch binary search that the inliner left out of line:
+// measured on `bench/cases/alloc`, `bl` plus the search plus the `mul` that
+// turned its index into an address cost about 30 instructions PER OBJECT. A
+// span's bitmap at sweep time is dense (a span holds ~2040 slots of one class
+// and a collection kills most of them), so a linear walk that strides the
+// address by `cs` instead of multiplying is cheaper on the common shape, and the
+// byte skip bounds the sparse one at ~8 steps per empty byte rather than 64.
+//
+// THE FREED BITS ARE CLEARED ONCE, HERE, NOT PER OBJECT IN `freeObject`. That is
+// where the sweep gets CHEAPER than the list it replaced: `clearSlotBit` had to
+// rediscover the slot index from the address with `allocSlotIndex` — 63
+// instructions plus `allocClassSize`'s 40 — for a bit this loop already has in
+// hand. The window it opens (a slot back on the allocator's free list while its
+// bit is still set, until the word ends) is unobservable: the world is stopped,
+// `gcOwns` is the bitmap's only reader and every root scan that reaches it ran
+// before `sweep` was called, and nothing on this path allocates. Do not move a
+// safepoint poll in here without re-deriving that.
+//
+// `cleared` is built from a running mask rather than from `~*wp` so RESCAN mode,
+// which frees nothing, writes nothing at all.
+@nosplit fn gcVisitWord(g: *i64, wp: *i64, addr: int, cs: int, mode: int): int {
+  let w = *wp
+  let freed = 0
+  let cleared = 0
+  let bit = 1
+  let a = addr
+  let cs8 = cs * 8
+  while (w != 0) { // bounded: 64 single-bit steps, fewer with the byte skip
+    if ((w & 255) == 0) {
+      w = (w >> 8) & gcShift8Mask
+      bit = bit << 8
+      a = a + cs8
+    } else {
+      if ((w & 1) != 0 && gcVisitSlot(g, a, mode) != 0) {
+        cleared = cleared | bit
+        freed = freed + 1
+      }
+      w = (w >> 1) & gcShift1Mask
+      bit = bit << 1
+      a = a + cs
+    }
+  }
+  if (cleared != 0) {
+    *wp = *wp & ~cleared
+  }
+  return freed
+}
+
+// Every occupied slot of one span.
+//
+// EVERY PER-CLASS QUANTITY IS HOISTED OUT OF THE SLOT LOOP, and that is not
+// tidiness — it is the difference between this change being free and costing
+// 23.5% of `bench/cases/alloc`'s cycles. `cs`, the carve start and `nwords` are
+// pure functions of `cls`, which is fixed for the whole span; deriving each slot
+// address through a per-slot call that recomputed `allocClassSize` and
+// `spanSkip` measured **+117 instructions/object** against `main`. Same
+// mis-shaped interface #4044 found in `allocSlotIndex`, in the other direction.
+@nosplit fn gcVisitSpan(g: *i64, spanAddr: int, cls: int, mode: int): int {
+  let freed = 0
+  let cs = allocClassSize(cls)
+  let nwords = (allocSpanSlots(cls) + 63) / 64
+  let bits = spanAddr + allocSpanHdrWords * 8
+  let addr = allocCarveStart(spanAddr, cls)
+  let wi = 0
+  while (wi < nwords) { // bounded: nwords iterations
+    freed = freed + gcVisitWord(g, wordAt(bits + wi * 8), addr, cs, mode)
+    addr = addr + 64 * cs
+    wi = wi + 1
+  }
+  return freed
+}
+
+// Every span currently carved onto class `cls`, walked through
+// `heapClassAnchor`/`allocSpanNext` — the same two exported primitives
+// `idxRebuildSpans` (`./gcindex.bit`) already walks, never a second copy of the
+// class-list layout.
+//
+// RECLAMATION IS DEFERRED TO THE END OF THE CLASS. `gcHeapFreeLocked`'s reclaim
+// arm unlinks EVERY entirely-free owned span of the class and then caches or
+// releases it, and the release arm (`spanFreeListPush`, `./mem.bit`) REMAPS the
+// span, zeroing it in place. Freeing the last live slot of a span mid-walk can
+// therefore reach not just the span this loop is standing in but any OTHER
+// entirely-free span of the same class — including the `next` this loop is
+// holding, which a previous collection's hysteresis (`allocSpanKeep`) can
+// legitimately have left empty on the list ahead of the cursor. Reading `next`
+// up front does not help: a zeroed `next` yields an all-zero bitmap and an
+// `allocSpanNext` of 0, which ENDS the class walk early and silently. Objects in
+// the unvisited spans then keep this cycle's mark, so the next mark pass treats
+// them as already traced and their children are swept while live. So
+// `freeObject` reaches `gcHeapFreeNoReclaimLocked` (`./gcheap.bit`) and the
+// reclaim runs once, here, after the list is no longer being traversed.
+//
+// HONEST STATUS: that is argued from `heapReclaimSpansLocked` and
+// `spanFreeListPush`, NOT reproduced. A mutation putting the reclaim back inside
+// the walk passed `./make test-stress-batch` (77/77, 54/54 policy proofs) and two
+// programs written to provoke it — the conjunction it needs (an empty span ahead
+// of the cursor, doomed in the same pass, with the 64-entry span cache already
+// full) did not occur. It is a latent crash, not an observed one, and the
+// deferral costs nothing: the freed set is identical either way and only the
+// moment the pages go back moves, later, within one stop-the-world.
+//
+// The `seen < maxSpans` bound is `idxRebuildSpans`' own, for the same reason:
+// a walk over links something else rewrites must not be able to hang on a cycle.
+@nosplit fn gcWalkClass(g: *i64, cls: int, mode: int): int {
+  let freed = 0
+  let maxSpans = heapMappedBytes(heapBlock(g)) / allocSpanBytes + 1
+  let s = heapClassAnchor(heapBlock(g), cls)
+  let seen = 0
+  while (s != 0 && seen < maxSpans) { // bounded: maxSpans iterations
+    let next = allocSpanNext(s)
+    freed = freed + gcVisitSpan(g, s, cls, mode)
+    s = next
+    seen = seen + 1
+  }
+  if (freed > 0) {
+    gcReclaimClassLocked(g, cls)
+  }
+  return freed
+}
+
+// Every small (span-backed) object on the heap.
+@nosplit fn gcWalkSmall(g: *i64, mode: int): int {
+  let freed = 0
+  let cls = 0
+  while (cls < allocNumClasses) { // bounded: allocNumClasses iterations
+    freed = freed + gcWalkClass(g, cls, mode)
+    cls = cls + 1
+  }
+  return freed
+}
+
+// Every large (direct-mapped) object, unlinking each one freed. `next` is read
+// BEFORE the visit because freeing a large object unmaps the very pages its
+// prologue link sits in.
+@nosplit fn gcWalkLarge(g: *i64, mode: int): int {
+  let freed = 0
+  let prev = 0
+  let h = *(g + gcLargeAll)
+  while (h != 0) { // bounded: one link per large object
+    let next = loadWord(h - gcLargePrologue)
+    if (gcVisitSlot(g, h, mode) == 0) {
+      prev = h
+    } else {
+      freed = freed + 1
+      if (prev == 0) {
+        *(g + gcLargeAll) = next
+      } else {
+        storeWord(prev - gcLargePrologue, next)
+      }
+    }
+    h = next
+  }
+  return freed
+}
+
+// Both populations. THE UNION IS THE WHOLE OBJECT SET: `linkObject`
+// (`./gcalloc.bit`) sets a slot bit for every `idx >= 0` allocation and pushes
+// every `idx < 0` one onto the large list, on the same `idx` the allocator
+// itself classified with, so no object can land in neither and none in both.
+@nosplit fn gcWalkHeap(g: *i64, mode: int): int {
+  return gcWalkSmall(g, mode) + gcWalkLarge(g, mode)
+}
+
+// The size class `spanAddr` is currently carved onto, or -1 if it is not a live
+// span at all. `gcOwnsLinear`'s replacement for the presence key: the index is
+// unavailable exactly when that oracle is wanted, so membership is re-derived
+// from the class lists rather than looked up.
+//
+// O(spans), against the O(all objects) the list scan it replaces cost.
+@nosplit fn gcSpanCarvedClass(g: *i64, spanAddr: int): int {
+  let maxSpans = heapMappedBytes(heapBlock(g)) / allocSpanBytes + 1
+  let cls = 0
+  while (cls < allocNumClasses) { // bounded: allocNumClasses iterations
+    let s = heapClassAnchor(heapBlock(g), cls)
+    let seen = 0
+    while (s != 0 && seen < maxSpans) { // bounded: maxSpans iterations
+      if (s == spanAddr) {
+        return cls
+      }
+      s = allocSpanNext(s)
+      seen = seen + 1
+    }
+    cls = cls + 1
+  }
+  return -1
+}

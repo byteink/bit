@@ -190,14 +190,10 @@ export @nosplit @symbol("bit_rt_port_gc_mark_conservative") fn gcMarkConservativ
   let maxPasses = *(g + gcNumObjectsIdx) + 1
   while (*(g + gcOverflow) == 1 && passes < maxPasses) {
     *(g + gcOverflow) = 0
-    let o = *(g + gcAll)
-    // Bounded: num_objects links.
-    while (o != 0) {
-      if (hdrMarked(o)) {
-        scanObject(g, o)
-      }
-      o = loadWord(o + gcHdrNext)
-    }
+    // #4059: `./gcwalk.bit`'s enumeration, in rescan mode. It frees nothing and
+    // reclaims nothing, so it needs no heap lock -- the same as the `gcAll`
+    // walk it replaces.
+    let _ = gcWalkHeap(g, gcWalkRescan)
     drain(g)
     passes = passes + 1
   }
@@ -207,15 +203,15 @@ export @nosplit @symbol("bit_rt_port_gc_mark_conservative") fn gcMarkConservativ
 // Sweep
 // ---------------------------------------------------------------------------
 
-// PRECONDITION: the caller holds `heapLock(g)` (#4319). Both call sites —
-// `sweep` below and `gcDeinit`'s object loop (`./gc.bit`) — take it once around
-// their whole loop, so this reaches `gcHeapFreeLocked` rather than the
-// acquire/release form. Nothing else here touches that lock: `idxRemove`
+// PRECONDITION: the caller holds `heapLock(g)` (#4319). Both call sites reach
+// this through `./gcwalk.bit`'s walk — `sweep` below and `gcDeinit` (`./gc.bit`)
+// — and each takes the lock once around the whole walk, so this reaches
+// `gcHeapFreeNoReclaimLocked` rather than the acquire/release form. Nothing else here touches that lock: `idxRemove`
 // (`./gcindex.bit`) takes none at all and cannot grow the table, and
-// `clearSlotBit` (`./gcalloc.bit`) is a lone plain read-modify-write on the
-// span's occupied-slot bitmap word (#4320 removed the `atomicAnd`; that word is
-// not the heap lock's, and the world-stop this function already relies on is
-// what serialises it).
+// `./gcwalk.bit`'s batched bitmap clear is a lone plain read-modify-write on
+// the span's occupied-slot bitmap word (#4320 removed the `atomicAnd`; that
+// word is not the heap lock's, and the world-stop this function already relies
+// on is what serialises it).
 @nosplit fn freeObject(g: *i64, h: int) {
   let size = hdrSize(h)
   let idx = allocClassify(size, 8)
@@ -224,12 +220,23 @@ export @nosplit @symbol("bit_rt_port_gc_mark_conservative") fn gcMarkConservativ
   if (idx < 0 && *(g + gcIndexOk) == 1) {
     idxRemove(g, bodyFromHeader(h))
   }
-  // #3147/#3176: clear the occupied-slot bitmap bit BEFORE the allocator gets
-  // the slot back — see `setSlotBit`/`clearSlotBit` in `./gcalloc.bit`.
-  clearSlotBit(h, idx)
+  // #4059: THE OCCUPIED-SLOT BIT IS NOT CLEARED HERE. `./gcwalk.bit`'s
+  // `gcVisitWord` clears every bit it freed in one masked write at the end of
+  // the bitmap word, from the mask it already holds, instead of rediscovering
+  // the slot index from the address per object through `allocSlotIndex`. That
+  // function's own header explains what rediscovering it costs. A large object
+  // has no bit at all, and never did (`setSlotBit` no-ops for `idx < 0`).
   // #4043: `gcHeapFree` used to re-derive `idx` from the same `size`. It is one
   // value; it is computed once, here, and passed down.
-  gcHeapFreeLocked(g, h, size, 8, idx)
+  //
+  // #4059: THE NO-RECLAIM FORM, and the reclaim it drops is not lost -- both
+  // callers reach this from `./gcwalk.bit`'s span walk, which runs
+  // `gcReclaimClassLocked` once per class after the traversal. Reclaiming from
+  // inside the walk can zero a span that walk is about to read;
+  // `gcWalkClass`'s header states the argument, and its limits, in full. The
+  // signal is discarded here rather than propagated because the walk reclaims
+  // on "this class freed something" instead, which is a superset of it.
+  let _ = gcHeapFreeNoReclaimLocked(g, h, size, idx)
 }
 
 // Free every unmarked object and clear the mark on survivors. Returns the
@@ -275,29 +282,8 @@ export @nosplit @symbol("bit_rt_port_gc_mark_conservative") fn gcMarkConservativ
 // reach `reserveGrow`. Every function on the path is `@nosplit`, so no
 // safepoint poll can run with the lock held.
 @nosplit fn sweep(g: *i64): int {
-  let swept = 0
-  let prev = 0
-  let h = *(g + gcAll)
   spinAcquire(heapLock(g))
-  // Bounded: num_objects links.
-  while (h != 0) {
-    let next = loadWord(h + gcHdrNext)
-    if (hdrMarked(h)) {
-      hdrClearMark(h)
-      prev = h
-    } else {
-      // Unlink before freeing.
-      if (prev == 0) {
-        *(g + gcAll) = next
-      } else {
-        storeWord(prev + gcHdrNext, next)
-      }
-      *(g + gcNumObjectsIdx) = *(g + gcNumObjectsIdx) - 1
-      swept = swept + 1
-      freeObject(g, h)
-    }
-    h = next
-  }
+  let swept = gcWalkHeap(g, gcWalkSweep)
   spinRelease(heapLock(g))
   return swept
 }
