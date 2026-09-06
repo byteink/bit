@@ -237,8 +237,10 @@ fn isConstZeroVal(b: IrBuilder, v: int): bool {
 }
 
 // Lowers a `[]E{a, b, ...}` slice literal: allocate via `rt_call slice_new(len,
-// len, is_ref)`, then `slice_set` each element in order. `items` are the element
-// expression nodes (each possibly wrapped in an `arg`).
+// len, is_ref)`, then fill each element in order — `fillSliceLitElems` below
+// for a word-strided (or packed `[]u8`) element, `fillPackedSliceLitElems` for
+// a `stride > 8` class element (#3862). `items` are the element expression
+// nodes (each possibly wrapped in an `arg`).
 fn lowerSliceElems(fc: FnCtx, sliceTy: int, items: []int): int {
   // `[]E{}` — and, through `zeroValue` below, every slice zero value — is the
   // null header rather than two heap objects (#3648). See `emptySliceValue`.
@@ -268,6 +270,56 @@ fn lowerSliceElems(fc: FnCtx, sliceTy: int, items: []int): int {
   if (stride > 8) {
     return fillPackedSliceLitElems(fc, s, elemTy, stride, items)
   }
+  return fillSliceLitElems(fc, s, elemTy, esV, items)
+}
+
+// Fills a freshly-allocated WORD-STRIDED (or packed `[]u8`) slice literal's
+// elements (#4385). An element `canInlineSliceStore` (loweraccess.bit) admits
+// becomes one `index_set` against the buffer pointer instead of `rt_call
+// slice_set` — that call was 5425 of `bit-out/bin/bit`'s 71128 `bl`s, mostly
+// constant tables written as literals (`hpackHuffLen` alone is 257 of them).
+// An element the predicate refuses (a word-strided narrow prim — i8/i16/i32/
+// u16/u32/bool/f32, for the reason its header states) still goes through the
+// call, so the two representations never diverge.
+//
+// NO BOUNDS CHECK, and the argument does not widen to any other call site.
+// `emitInlineSliceSet` pays `emitBoundsCheck` against a runtime `slice_len`
+// because its index is arbitrary; here every input is known at emission.
+// `s` is the value of the `rt_call slice_new(len, len, ...)` emitted a few
+// instructions above in THIS function, with `len` a `const_int` equal to
+// `len(items)` — `rtSliceNew` (runtime/root/slices.bit) stores that as
+// `slcLen` and allocates `c >= want` slots. Every index is a `const_int i`
+// minted below with `0 <= i < len(items)`, so the test would compare two
+// constants and could never fail. And nothing can change the header in
+// between: `s` is a fresh SSA value, not bound to a local, not stored into any
+// object and not passed anywhere, so the only reads of it are the ones this
+// function emits and no element expression can even name it. That third step
+// is a property of a literal's own private header, not of index arithmetic,
+// which is exactly why the elision is authorized here and nowhere else.
+//
+// `slcOff` is 0 on a fresh header (`rtSliceNew` stores it) and nothing here
+// reslices, so `emitSliceElemAddr`'s `buf + (off + i)` is `buf + i` with `off`
+// PROVEN zero rather than a second, drifting copy of that arithmetic.
+//
+// THE BUFFER POINTER IS REUSED ACROSS ELEMENTS ONLY WHILE THAT IS CHECKED.
+// `buf` is a GC-managed pointer held as an `i64`, so no stack map describes it
+// (ABI.md §4). `emitInlineSliceElem`'s GC paragraph keeps such a copy valid
+// across a safepoint because the collector is non-moving AND the owning header
+// is live in the stack map at that poll. THE SECOND HALF DOES NOT HOLD HERE:
+// nothing uses `s` after the buffer word is read, and the literal's value can
+// be discarded by its consumer, so the header may be unreachable at an
+// allocation inside a later element expression — freeing the buffer this is
+// about to write into. So it is not assumed: the cached `buf` is dropped
+// whenever `emittedSafepointIn` (opt.bit) saw anything side-effecting emitted
+// while lowering an element, and is read from `s` again, which also
+// re-establishes the header's liveness there. What survives is a run of
+// elements whose lowering emitted no call, no allocation and no terminator,
+// and across such a run `buf`'s live range holds no safepoint at all — the
+// original, strongest form of the argument. A constant table is that shape.
+fn fillSliceLitElems(fc: FnCtx, s: int, elemTy: int, esV: int, items: []int): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let bufV = -1
+  let scanned = len(fc.b.instrs)
   let i = 0
   while (i < len(items)) {
     let a = items[i]
@@ -278,16 +330,48 @@ fn lowerSliceElems(fc: FnCtx, sliceTy: int, items: []int): int {
     if (fc.failed) {
       return 0
     }
+    if (emittedSafepointIn(fc.b, scanned, len(fc.b.instrs))) {
+      bufV = -1
+    }
     let ci = mkInstr(Op.ConstInt, i64ty)
     ci.ival = i
     let idxV = builderEmit(fc.b, ci)
-    let ss = mkInstr(Op.RtCall, fc.c.ctx.voidId)
-    ss.name = "slice_set"
-    ss.args = [s, idxV, v, esV]
-    emitRtCall(fc, ss)
+    if (canInlineSliceStore(fc, elemTy, idxV, v)) {
+      if (bufV < 0) {
+        bufV = emitSliceLitBuf(fc, s)
+      }
+      let is = mkInstr(Op.IndexSet, fc.c.ctx.voidId)
+      is.lhs = bufV
+      is.rhs = idxV
+      is.ival = v
+      builderEmit(fc.b, is)
+    } else {
+      let ss = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+      ss.name = "slice_set"
+      ss.args = [s, idxV, v, esV]
+      emitRtCall(fc, ss)
+      bufV = -1
+    }
+    // Everything emitted since `scanned` that is this function's own — a
+    // `const_int`, the buffer read, one raw store — cannot reach a safepoint,
+    // and the fallback arm's `rt_call` drops `bufV` on the line above rather
+    // than through the scan. So the next window is exactly the next element
+    // expression's instructions and nothing else.
+    scanned = len(fc.b.instrs)
     i = i + 1
   }
   return s
+}
+
+// The slice header's `buf` word (runtime/ABI.md §2, offset 0), read through the
+// null-safe header path both backends give `field_get` on a slice base
+// (`emitHeaderWordOrZero`, #1564) — the same first half `emitSliceElemAddr`
+// (loweraccess.bit) and `emitAppendFastStore` (optappend.bit) read.
+fn emitSliceLitBuf(fc: FnCtx, recv: int): int {
+  let bufIns = mkInstr(Op.FieldGet, primType(fc.c.ctx, 3))
+  bufIns.lhs = recv
+  bufIns.ival = 0
+  return builderEmit(fc.b, bufIns)
 }
 
 // Fills a freshly-allocated PACKED `[]elemTy` slice literal's elements
