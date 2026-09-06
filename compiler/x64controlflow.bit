@@ -276,14 +276,119 @@ fn xBrEdgeNeedsInlineCode(cx: XCtx, target: int, moves: []PMove): bool {
   return !pmovesAllIdentity(moves)
 }
 
+// ===========================================================================
+// #4393: a compare that feeds a `br` branches on its own flags
+// ===========================================================================
+//
+// Lowering emits every comparison as a value, so `if (a < b)` cost five
+// instructions where two do:
+//
+//     cmpq   %rbx, %rax        <- sets the flags
+//     setl   %r11b             <- materializes the boolean
+//     movzbq %r11b, %r11       <- widens it to a clean 0/1
+//     testq  %r11, %r11        <- puts "is that boolean zero" back in the flags
+//     jne    <then>
+//
+// The middle three are pure round-tripping: `jl` reads exactly the flag state
+// the first `cmp` already set. Fusing them leaves `cmpq %rbx, %rax` + `jl
+// <then>`, which is what `clang -O2` emits. This is the x86-64 sibling of
+// #3843 on arm64, and it reuses that ticket's `computeFuseCmpBranch`
+// (arm64branch.bit) rather than copying it — the analysis is over the IR
+// alone, and a fix applied to a copy does not reach its sibling.
+//
+// TWO conditions make the fusion exact, and both come from that function:
+//
+//   1. The boolean has exactly one use and that use is the branch's condition.
+//      A boolean that is also stored, returned, passed as a call or block
+//      argument, or read by a second branch is a real value and still needs
+//      its `setcc`. Use counts come from `instrOperands` (opt.bit), the same
+//      operand map DCE uses, so a use this backend forgot to think about is
+//      still counted.
+//
+//   2. The flags are still live at the branch. The compare must be the
+//      instruction immediately before the `br` IN THE SAME BLOCK — adjacency
+//      in the instruction array alone is not enough, because a `br` that is
+//      its block's only instruction is adjacent to the previous block's last
+//      one and a different predecessor would reach it with arbitrary flags.
+//
+// EMISSION adjacency then follows from IR adjacency, and the claim is stronger
+// than "nothing clobbers the flags in between": there IS no in between. The
+// fused `xEmitIcmp` (x64selectarith.bit) ends with the flag-setting `cmp` and
+// emits nothing after it — no `setcc`, no `movzx`, and no `xPutInt` spill
+// store; `xEmitBrCondition` below emits nothing at all on that path; and
+// `xEmitBr` puts its conditional jump FIRST in every one of its three shapes,
+// before any edge move, any poll and any `xBlockArgMoves` (which builds and
+// does not emit). xCompileFunction's block loop emits instructions in index
+// order and puts nothing between two of them — `appendDebugLineIfChanged`
+// records an offset and writes no code. So the `jcc` reads the flags at the
+// very byte offset the deleted `test` occupied.
+//
+// A SAFEPOINT cannot land in that gap either, and for the same reason rather
+// than by luck: a safepoint is emitted at a call, at `gc_alloc`, or on a back
+// edge (runtime/ABI.md §4). The first two would be an instruction between two
+// ADJACENT instruction indices, which cannot exist, and this `br`'s own
+// back-edge poll is emitted after the conditional jump in every shape of
+// `xEmitBr` — downstream of the read.
+//
+// FLOAT compares are deliberately NOT fused here, even though
+// `computeFuseCmpBranch` marks them: `ucomis` decides FEq and FNe across two
+// flags (ZF for equal-or-unordered, PF for unordered), which needs two
+// conditional jumps rather than one, and xEmitFcmp still materializes its
+// boolean for all six. `xBrFusesCmp` therefore re-tests `isIcmp` on the marked
+// instruction; without that clause a branch on a fused fcmp would read flags
+// no `test` ever set.
+
+// The x86 condition that is true on exactly the flag states `cc` is false on.
+// Every condition code pairs with its complement in the LOW BIT — E 0x4/NE
+// 0x5, B 0x2/AE 0x3, BE 0x6/A 0x7, L 0xC/GE 0xD, LE 0xE/G 0xF, P 0xA/NP 0xB,
+// O 0x0/NO 0x1 — which is the flag-level complement, not a negation of the
+// source-level predicate. checkX64CcInvert pins every pair.
+fn xCcInvert(cc: int): int {
+  return cc ^ 1
+}
+
+// The fused-compare map for the function being emitted, computed on first
+// demand. `newXCtx` builds a fresh XCtx per function (xCompileFunction) and
+// `cx.f` never changes within one, so this runs exactly once per function —
+// and a function with no compare at all never pays for the walk.
+fn xFuseCmp(cx: XCtx): []bool {
+  if (!cx.fuseCmpReady) {
+    cx.fuseCmp = computeFuseCmpBranch(cx.f)
+    cx.fuseCmpReady = true
+  }
+  return cx.fuseCmp
+}
+
+// Does the `br` at `i` read flags an INTEGER compare at `i - 1` already set?
+// `cond == i - 1` is what ties the marked compare to this branch: a `br` whose
+// condition is some earlier value is not the fused pair even when the
+// instruction before it happens to be a fused compare for a different branch.
+fn xBrFusesCmp(cx: XCtx, i: int, cond: int): bool {
+  return cond == i - 1 && xFuseCmp(cx)[cond] && isIcmp(cx.f.instrs[cond].op)
+}
+
+// Puts the branch's condition into the flags, and returns the condition code
+// its THEN edge is taken on. A fused compare has already set them and emitted
+// nothing else, so this emits nothing and hands back the compare's own code.
+// Otherwise the condition is a materialized 0/1 boolean and `test c, c` sets
+// ZF iff it is zero, so THEN is `jne`.
+fn xEmitBrCondition(cx: XCtx, i: int, cond: int): int {
+  if (xBrFusesCmp(cx, i, cond)) {
+    return xCcForIcmp(cx.f.instrs[cond].op)
+  }
+  let c = xGetInt(cx, cond, xScratch1())
+  xTestRR(cx.buf, c, c)
+  return ccNe()
+}
+
 // Emits the whole of `br`. `i` is its instruction id, which is its block's
 // last, so either edge is a legal fall-through candidate.
 //
-// `test c, c` sets ZF iff the condition is zero, so the ELSE edge is `je` and
-// the THEN edge is `jne` — the same single flag, read in either direction.
+// The ELSE edge is taken on the complement of the THEN condition — the same
+// single flag test, read in either direction.
 fn xEmitBr(cx: XCtx, i: int, ins: IrInstr) {
-  let c = xGetInt(cx, ins.lhs, xScratch1())
-  xTestRR(cx.buf, c, c)
+  let thenCc = xEmitBrCondition(cx, i, ins.lhs)
+  let elseCc = xCcInvert(thenCc)
   let thenMoves = xBlockArgMoves(cx, ins.ival, ins.thenArgs)
   let elseMoves = xBlockArgMoves(cx, ins.ival2, ins.elseArgs)
   let thenInline = xBrEdgeNeedsInlineCode(cx, ins.ival, thenMoves)
@@ -292,13 +397,13 @@ fn xEmitBr(cx: XCtx, i: int, ins: IrInstr) {
   // Preferred over the mirror when ELSE is the next block, because then the
   // tail costs nothing either and the whole `br` is one jump.
   if (!thenInline && (elseInline || ins.ival2 == cx.curBlock + 1)) {
-    xJccRel32(cx, ccNe(), ins.ival)
+    xJccRel32(cx, thenCc, ins.ival)
     xEmitBrEdgeTail(cx, i, ins.ival2, elseMoves)
     return
   }
   // ELSE needs nothing: jump straight to it and let THEN have the tail.
   if (!elseInline) {
-    xJccRel32(cx, ccE(), ins.ival2)
+    xJccRel32(cx, elseCc, ins.ival2)
     xEmitBrEdgeTail(cx, i, ins.ival, thenMoves)
     return
   }
@@ -306,7 +411,7 @@ fn xEmitBr(cx: XCtx, i: int, ins: IrInstr) {
   // then-path when the condition is ZERO. The edge moves must sit on their own
   // side of this branch — emitting them before it would run the then-edge's
   // moves on the else path too.
-  let skipOff = xJccRel32Placeholder(cx, ccE())
+  let skipOff = xJccRel32Placeholder(cx, elseCc)
   xEmitBackEdgeSafepointIfNeeded(cx, cx.curBlock, ins.ival)
   xSequentializeAndEmit(cx, thenMoves)
   xJmpRel32(cx, ins.ival)
