@@ -1,0 +1,604 @@
+// compiler/optstrip.bit — #4204: STRIP-MINING, so the back-edge safepoint poll
+// runs on an OUTER back edge instead of on every lap of the inner loop.
+// Sibling of opt.bit, optloop.bit and optappend.bit in the same module, split
+// out for the same reason each of those was: opt.bit is at its size limit.
+// This file finds and validates the loops; optstripemit.bit performs the
+// rewrite. The two share only `StripLoop` and `StripCtx`.
+//
+// ## What it does
+//
+// A counted loop
+//
+//     H(.., i, ..):  br (i < n) -> BODY, EXIT
+//     BODY: ...; jump H(.., i + 1, ..)          <- this back edge polls
+//
+// becomes
+//
+//     OUTER(.., o, ..): br (o < n) -> GUARD, EXIT
+//     GUARD/GROOM/WIDE/NARROW:  lim = min(o + K, n), or o + 1
+//     H(.., i, .., lim): br (i < lim) -> BODY, OLATCH     <- NO poll on entry
+//     BODY: ...; jump H(.., i + 1, .., lim)     <- this back edge does NOT poll
+//     OLATCH(..): jump OUTER(..)                 <- THIS back edge polls
+//
+// The body is copied verbatim: same instructions, same order, same block
+// params. The only machine-code difference inside the loop is the three
+// instructions #4203's `emitPollGuard` no longer emits there.
+//
+// ## Why it is not a countdown, which was measured and deleted
+//
+// #4200 thinned the poll with a per-lap countdown through a frame slot and
+// #4203 measured that it COST more than the three-instruction poll it skipped
+// (−0.45% against −1.93% for polling every lap) and deleted it. A counter that
+// costs as much as the check it skips is pure complexity. Strip mining pays
+// nothing per lap — the inner loop is emitted with no poll, no counter and no
+// branch — and pays a bounded setup once per K laps, off the hot path.
+//
+// ## THE LATENCY ARGUMENT — this is the load-bearing part, not the speedup
+//
+// The back-edge poll is the ONLY automatic collection trigger in this runtime
+// (runtime/ABI.md section 5). Widening the gap between polls widens the worst
+// case time to acknowledge a stop-the-world, so `stripSize()` is a LATENCY
+// KNOB, not a tuning constant. Three properties bound it:
+//
+//  1. **At most `stripSize()` inner iterations pass between two polls**, by
+//     construction: `lim <= o + K`, the inner loop exits at `i >= lim`, and the
+//     outer back edge polls immediately.
+//  2. **One inner iteration is bounded straight-line work.** `stripCandidate`
+//     refuses any loop whose body contains a call, an allocation, inline
+//     assembly, a syscall or a nested loop, so a body cannot block, cannot
+//     recurse and cannot spin. The bound is therefore K x (a fixed instruction
+//     count), not K x (something unbounded).
+//  3. **THE INNER LOOP CANNOT ALLOCATE, so it cannot overshoot the heap.**
+//     That is the "allocates unboundedly between polls" shape stated as a
+//     hazard on the ticket, and it is refused rather than managed: with no
+//     allocation in the body, `heapLive` does not move while the strip runs, so
+//     a GC trigger cannot be crossed and then missed. The collection SCHEDULE
+//     is therefore unchanged for this thread's own allocations; only a stop
+//     requested by ANOTHER thread can be delayed, and only by (1).
+//
+// On top of that the strip SELF-TIGHTENS: `GUARD` reads the attention word the
+// poll itself reads, and takes a strip of ONE whenever anything is already
+// asking. So the K-iteration bound applies only to a request that arrives
+// mid-strip; a request that is already pending when the strip is chosen is
+// honoured on the very next back edge, exactly as before this pass existed.
+//
+// ## BIT_GC=stress KEEPS ITS EXACT SCHEDULE, by that same read
+//
+// Under stress `gcShouldCollect` is unconditionally true, so `gcConfigure`
+// publishes at boot and `stwSafepoint` re-sets the word after every poll: the
+// attention word is permanently non-zero for the whole run. `GUARD` therefore
+// takes the narrow arm on every strip, `lim` is `o + 1`, the inner loop runs
+// exactly one iteration, and the outer back edge polls — one poll per original
+// iteration, which is the pre-pass schedule instruction for instruction.
+//
+// This is the failure #4200 shipped and #4203 records: a flat countdown reset
+// cut stress collections 303 -> 128 with every behavioural gate green, because
+// `policy proofs 50/50` is a RATIO and both sides thinned equally. The check
+// that sees it is `selfhost-diffsafepoints`' linked-exe half, which compares
+// absolute collection counts against the pinned oracle.
+//
+// ## Interaction with the other passes in this module
+//
+// This pass runs LAST in `optimizeModule`, after the final fold/DCE, and that
+// placement is deliberate on both sides:
+//
+//  - **After the fold**, because `foldConstantsAndPrune`'s `rebuild` renumbers
+//    blocks into ascending-`instsStart` order and would have to be taught to
+//    carry `IrBlock.pollFreeHeader` through the renumber. Running last, nothing
+//    renumbers behind this pass: it allocates every block id in final emission
+//    order itself, so id order IS schedule order on the way out — the invariant
+//    `isBackEdge` and the x64 linear-scan interval numbering both assume.
+//  - **After the inliner and after `expandAppends`**, so a loop is judged on the
+//    body it will actually emit. A callee spliced in later could introduce the
+//    allocation or the nested back edge this pass refused, and `expandAppends`
+//    mints a three-block diamond that WOULD add a call to a body — judged
+//    before it, a loop containing `append` would be admitted wrongly.
+//  - **`optloop.bit` (LICM) has already run** and this pass does not disturb it:
+//    a hoist moves an instruction into the PREHEADER, which this pass never
+//    touches, and adds a header PARAM, which is threaded through `OUTER` and
+//    `OLATCH` like any other. Nothing is hoisted here and nothing is sunk.
+//  - **`optcse.bit` never crosses a back edge**, which is what keeps it away
+//    from the safepoint one carries. This pass adds a back edge (OLATCH ->
+//    OUTER) and removes none, so that property is unchanged.
+//  - **There is no unroller and no loop-fusion pass in this compiler.** The
+//    ticket asks not to break loops a later pass fuses or unrolls; there is no
+//    such later pass to break. If one is ever added it must run BEFORE this
+//    one, for the same reason the inliner does: it changes the body this
+//    pass's predicate judged.
+
+// The maximum number of inner iterations between two polls. See the latency
+// argument above: this is a bound on stop-the-world acknowledgement, not a
+// tuning constant, and raising it directly raises that bound.
+//
+// 256 rather than 1024, and the cost of that choice is MEASURED rather than
+// argued. This comment used to say the setup is "amortised 255/256 = 99.6%
+// either way, so four times the latency buys 0.3% more of the win". It buys
+// 2.7 points: on `bench/cases/matrix` (n = 512, so 1024 means exactly one strip
+// per inner loop instead of two), 41 interleaved rounds with a byte-identical
+// null control at 1.4-2.2% give 256 -> **-16.54%** cycles and 1024 ->
+// **-19.23%**, against a full-ablation ceiling of -20.92%. The setup is not
+// amortised away; it is a per-strip cost worth ~30 cycles, nearly all of it the
+// GUARD's call (see optstripemit.bit's `stripEmitGuard`).
+//
+// 256 is kept anyway. The strip length is a bound on stop-the-world
+// ACKNOWLEDGEMENT, and 2.7 points on one benchmark does not buy a fourfold
+// worse bound. Make the setup cheaper instead.
+fn stripSize(): int {
+  return 256
+}
+
+// The largest loop bound this pass will widen a strip for. `WIDE` computes
+// `o + stripSize()` and must not overflow; it runs only when `n <= this`, and
+// `o < n`, so `o + K <= this + K`, far below i64's maximum. A loop bounded
+// above 2^62 simply takes the narrow arm and keeps its per-lap poll.
+fn stripLimitCeiling(): int {
+  return 4611686018427387904
+}
+
+// One loop this pass will strip-mine. Block ids in the first row are the
+// ORIGINAL function's; the `outer`..`newHeader` row is filled in by
+// optstripemit.bit as it allocates ids in the new function.
+class StripLoop {
+  header: int,
+  latch: int,
+  exitBlk: int,
+  ivIdx: int,
+  limIdx: int,
+  limVal: int,
+  lastPos: int,
+  outer: int,
+  guard: int,
+  groom: int,
+  wide: int,
+  narrow: int,
+  cap: int,
+  olatch: int,
+  newHeader: int,
+  limParamId: int,
+}
+
+fn stripNoLoop(): StripLoop {
+  return StripLoop{
+    header: -1, latch: -1, exitBlk: -1, ivIdx: -1, limIdx: -1,
+    limVal: -1, lastPos: -1, outer: -1, guard: -1, groom: -1, wide: -1,
+    narrow: -1, cap: -1, olatch: -1, newHeader: -1, limParamId: -1,
+  }
+}
+
+// How many times each value id is read as an operand anywhere in `f`. Used for
+// exactly one question — whether the header's compare feeds anything but the
+// header's own branch — which is what lets the rewrite DROP that compare
+// instead of emitting it dead into the hot loop.
+fn stripUseCounts(f: IrFunc): []int {
+  let n = len(f.instrs)
+  let out = []int(0)
+  let i = 0
+  while (i < n) {
+    out = append(out, 0)
+    i = i + 1
+  }
+  i = 0
+  while (i < n) {
+    let ops = instrOperands(f, i)
+    let k = 0
+    while (k < len(ops)) {
+      out[ops[k]] = out[ops[k]] + 1
+      k = k + 1
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Value id -> the block that defines it.
+fn stripOwners(f: IrFunc): []int {
+  let out = []int(0)
+  let i = 0
+  while (i < len(f.instrs)) {
+    out = append(out, -1)
+    i = i + 1
+  }
+  let b = 0
+  while (b < len(f.blocks)) {
+    let blk = f.blocks[b]
+    let k = 0
+    while (k < blk.instsLen) {
+      out[blk.instsStart + k] = b
+      k = k + 1
+    }
+    b = b + 1
+  }
+  return out
+}
+
+// Emission position of each block: the inverse of `blockEmissionOrder`.
+fn stripPositions(f: IrFunc, order: []int): []int {
+  let pos = []int(0)
+  let i = 0
+  while (i < len(f.blocks)) {
+    pos = append(pos, 0)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(order)) {
+    pos[order[i]] = i
+    i = i + 1
+  }
+  return pos
+}
+
+// The one back-edge predecessor of `h`, or -1 unless there is EXACTLY one whose
+// terminator is a plain `jump`. A conditional back edge is refused rather than
+// handled: the rewrite has to append one argument to every edge into the
+// header, and a `br` with only one arm on `h` would need the other arm left
+// alone — a second shape for no measured benefit.
+fn stripSingleLatch(f: IrFunc, pm: PredMap, h: int): int {
+  let found = -1
+  let e = pm.start[h]
+  while (e < pm.start[h + 1]) {
+    let p = pm.list[e]
+    if (isBackEdge(p, h)) {
+      if (found >= 0) {
+        return -1
+      }
+      found = p
+    }
+    e = e + 1
+  }
+  if (found < 0 || f.blocks[found].instsLen == 0) {
+    return -1
+  }
+  let blk = f.blocks[found]
+  if (f.instrs[blk.instsStart + blk.instsLen - 1].op != Op.Jump) {
+    return -1
+  }
+  return found
+}
+
+// True iff `h` is the loop's only entry AND every loop block is emitted after
+// it — `licmSingleEntry`'s property, restated here over a plain `pos` array so
+// this pass needs no `LicmCtx`. Together they make `h` dominate the set without
+// building a dominator tree, and refuse an irreducible region for free.
+fn stripSingleEntry(pm: PredMap, pos: []int, inLoop: []bool, h: int): bool {
+  let b = 0
+  while (b < len(inLoop)) {
+    if (inLoop[b] && b != h) {
+      if (pos[b] <= pos[h] || !licmPredsInside(pm, inLoop, b)) {
+        return false
+      }
+    }
+    b = b + 1
+  }
+  return true
+}
+
+// True iff every instruction in `b` is bounded straight-line work. A call, an
+// allocation, a closure, inline assembly or a syscall is refused, because the
+// latency bound is "K iterations of a FIXED instruction count" and each of
+// those makes one iteration unbounded.
+//
+// THE ONE EXEMPTION is a block whose terminator is `unreachable`: that is the
+// shape every bounds check lowers to (`panic` then `unreachable`), the call
+// never returns, and a path that does not return cannot delay a poll. Without
+// it this pass would refuse every loop that indexes a slice, which is every
+// loop worth mining.
+fn stripBlockBounded(f: IrFunc, b: int): bool {
+  let blk = f.blocks[b]
+  if (blk.instsLen == 0) {
+    return true
+  }
+  if (f.instrs[blk.instsStart + blk.instsLen - 1].op == Op.Unreachable) {
+    return true
+  }
+  let k = blk.paramCount
+  while (k < blk.instsLen) {
+    if (!stripOpBounded(f.instrs[blk.instsStart + k].op)) {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+// The refused ops, listed rather than inferred from `isSideEffecting`: a store
+// is side-effecting and perfectly bounded, while `MakeClosure` is pure by that
+// measure and allocates. The question here is "can one execution of this run
+// for an unbounded time, or move `heapLive`", which is a different question.
+fn stripOpBounded(op: Op): bool {
+  return op != Op.Call &&
+    op != Op.CallValue &&
+    op != Op.CallIface &&
+    op != Op.RtCall &&
+    op != Op.GcAlloc &&
+    op != Op.MakeClosure &&
+    op != Op.Asm &&
+    op != Op.Syscall
+}
+
+// True iff no block in the loop closes a loop of its own — i.e. `h` is an
+// INNERMOST loop. A nested strip would compose its bound multiplicatively
+// (K inner x K outer), and the inner loop is where the laps are anyway.
+fn stripInnermost(f: IrFunc, inLoop: []bool, h: int): bool {
+  let b = 0
+  while (b < len(inLoop)) {
+    if (inLoop[b]) {
+      let ts = licmTargets(f, b)
+      let k = 0
+      while (k < len(ts)) {
+        if (isBackEdge(b, ts[k]) && ts[k] != h) {
+          return false
+        }
+        k = k + 1
+      }
+    }
+    b = b + 1
+  }
+  return true
+}
+
+// Every loop block bounded, and the loop innermost.
+fn stripBodyOk(f: IrFunc, inLoop: []bool, h: int): bool {
+  if (!stripInnermost(f, inLoop, h)) {
+    return false
+  }
+  let b = 0
+  while (b < len(inLoop)) {
+    if (inLoop[b] && !stripBlockBounded(f, b)) {
+      return false
+    }
+    b = b + 1
+  }
+  return true
+}
+
+// The highest emission position among the loop's blocks: where `OLATCH` goes.
+fn stripLastPos(pos: []int, inLoop: []bool): int {
+  let best = -1
+  let b = 0
+  while (b < len(inLoop)) {
+    if (inLoop[b] && pos[b] > best) {
+      best = pos[b]
+    }
+    b = b + 1
+  }
+  return best
+}
+
+// The analysis state one function's candidate search shares.
+class StripAnalysis {
+  f: IrFunc,
+  pm: PredMap,
+  pos: []int,
+  owners: []int,
+  uses: []int,
+  claimed: []bool,
+}
+
+// True iff value `v` is readable from `OUTER`, which sits between the loop's
+// preheader and its header: a parameter of the header (the rewrite gives
+// `OUTER` a parameter for each one, in the same order), one of the header's own
+// leading constants (`OUTER` re-emits a copy of each, in the same order), or a
+// value defined in a block emitted BEFORE the header.
+fn stripReadableAtOuter(sa: StripAnalysis, h: int, v: int): bool {
+  let hb = sa.f.blocks[h]
+  if (v >= hb.instsStart && v < stripCmpIdx(sa.f, h)) {
+    return true
+  }
+  let owner = sa.owners[v]
+  return owner >= 0 && sa.pos[owner] < sa.pos[h]
+}
+
+// `v`'s index among `h`'s parameters, or -1.
+fn stripParamIndex(f: IrFunc, h: int, v: int): int {
+  let hb = f.blocks[h]
+  if (v < hb.instsStart || v >= hb.instsStart + hb.paramCount) {
+    return -1
+  }
+  return v - hb.instsStart
+}
+
+// The index of the header's compare: the instruction before its terminator.
+fn stripCmpIdx(f: IrFunc, h: int): int {
+  let hb = f.blocks[h]
+  return hb.instsStart + hb.instsLen - 2
+}
+
+// The header must be params, then zero or more CONSTANTS, then one `icmp_slt`,
+// then a `br` on it — the shape every `while (i < n)` and `for i in 0..n`
+// lowers to. Anything else is refused rather than analysed.
+//
+// THE CONSTANTS ARE NOT AN EDGE CASE, they are the common case: `while (i < 20)`
+// lowers its bound to a `const_int` inside the header, so a strict
+// `paramCount + 2` shape would refuse every literal-bounded loop in the tree —
+// which is exactly what it did until this was measured on a two-deep nest.
+// They are safe to admit because a constant is pure and has no operands, so
+// `OUTER` re-emits its own copy rather than the rewrite having to move
+// anything; the header keeps its copy for the body to read.
+//
+// The compare itself must feed NOTHING but this branch, which is what lets the
+// rewrite drop it: the header's new compare is against the strip limit, not the
+// loop's, so a second reader would see the wrong answer.
+fn stripHeaderShapeOk(sa: StripAnalysis, h: int): bool {
+  let hb = sa.f.blocks[h]
+  if (hb.paramCount < 1 || hb.instsLen < hb.paramCount + 2) {
+    return false
+  }
+  let cmpId = stripCmpIdx(sa.f, h)
+  let k = hb.instsStart + hb.paramCount
+  while (k < cmpId) {
+    if (!stripPureConst(sa.f.instrs[k].op)) {
+      return false
+    }
+    k = k + 1
+  }
+  if (sa.f.instrs[cmpId].op != Op.ICmpSlt || sa.uses[cmpId] != 1) {
+    return false
+  }
+  return sa.f.instrs[cmpId + 1].op == Op.Br && sa.f.instrs[cmpId + 1].lhs == cmpId
+}
+
+// The ops `OUTER` may re-emit a copy of: no operands, no side effects, same
+// value every time. Nothing else may appear between a header's parameters and
+// its compare.
+fn stripPureConst(op: Op): bool {
+  return op == Op.ConstInt ||
+    op == Op.ConstBool ||
+    op == Op.ConstFloat ||
+    op == Op.ConstString ||
+    op == Op.ConstNil
+}
+
+// The latch must carry the induction variable forward as exactly `i + 1`, and
+// must pass an invariant limit straight through.
+//
+// STEP ONE, NOT A GENERAL POSITIVE STEP, and the restriction is load-bearing
+// twice over. It makes the equivalence argument exact — with step 1 the inner
+// loop exits at `i == lim` precisely, so no iteration is skipped and none is
+// repeated across a strip boundary — and it removes the overflow case
+// `o + step` would otherwise carry on the narrow arm, where there is no room
+// left to test for it (`o < n` gives `o + 1 <= n` for free, and nothing else).
+fn stripLatchOk(sa: StripAnalysis, lp: StripLoop, args: []int): bool {
+  let f = sa.f
+  let hb = f.blocks[lp.header]
+  if (len(args) != hb.paramCount) {
+    return false
+  }
+  let bump = f.instrs[args[lp.ivIdx]]
+  if (bump.op != Op.Add || bump.lhs != hb.instsStart + lp.ivIdx) {
+    return false
+  }
+  if (f.instrs[bump.rhs].op != Op.ConstInt || f.instrs[bump.rhs].ival != 1) {
+    return false
+  }
+  return lp.limIdx < 0 || args[lp.limIdx] == hb.instsStart + lp.limIdx
+}
+
+// Every value the loop's exit edge carries must be readable from `OUTER`, which
+// is where that edge moves to. A value computed INSIDE the loop cannot be, and
+// the loop is refused rather than having the edge left on the header — leaving
+// it there would make the header's exit bypass the outer loop's own test.
+fn stripExitArgsOk(sa: StripAnalysis, h: int, args: []int): bool {
+  let i = 0
+  while (i < len(args)) {
+    if (!stripReadableAtOuter(sa, h, args[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Fills in the induction variable and the limit, or leaves `ivIdx` at -1.
+fn stripBindCounter(sa: StripAnalysis, lp: StripLoop, h: int) {
+  let cmp = sa.f.instrs[stripCmpIdx(sa.f, h)]
+  lp.ivIdx = stripParamIndex(sa.f, h, cmp.lhs)
+  lp.limIdx = stripParamIndex(sa.f, h, cmp.rhs)
+  lp.limVal = cmp.rhs
+  if (lp.limIdx < 0 && !stripReadableAtOuter(sa, h, cmp.rhs)) {
+    lp.ivIdx = -1
+  }
+}
+
+// The structural half: `h` is a reducible, single-entry, single-latch loop with
+// a canonical header. Returns the latch, or -1 for a refusal.
+fn stripEntryOk(sa: StripAnalysis, h: int): int {
+  if (!licmHasBackEdge(sa.pm, h) || !stripHeaderShapeOk(sa, h)) {
+    return -1
+  }
+  let latch = stripSingleLatch(sa.f, sa.pm, h)
+  if (latch < 0 || licmPreheader(sa.pm, h) < 0) {
+    return -1
+  }
+  return latch
+}
+
+// The loop-set half: `h` dominates its own natural loop, that loop is innermost
+// and bounded, and no earlier candidate has already claimed a block of it.
+fn stripLoopSetOk(sa: StripAnalysis, inLoop: []bool, h: int): bool {
+  return stripSingleEntry(sa.pm, sa.pos, inLoop, h) &&
+    stripBodyOk(sa.f, inLoop, h) &&
+    stripFree(sa, inLoop)
+}
+
+// The counter half: the header compares a parameter against something readable
+// from `OUTER`, and the latch advances that parameter by exactly one.
+fn stripCounterOk(sa: StripAnalysis, lp: StripLoop, h: int, latch: int, br: IrInstr): bool {
+  stripBindCounter(sa, lp, h)
+  if (lp.ivIdx < 0 || lp.ivIdx == lp.limIdx) {
+    return false
+  }
+  return stripLatchOk(sa, lp, licmEdgeArgs(sa.f, latch, h)) && stripExitArgsOk(sa, h, br.elseArgs)
+}
+
+// The predicate, in one place. Returns a filled `StripLoop`, or one whose
+// `header` is -1 for every loop this pass refuses — which is most of them, on
+// purpose. See the file header for what each refusal buys.
+fn stripCandidate(sa: StripAnalysis, h: int): StripLoop {
+  let no = stripNoLoop()
+  let latch = stripEntryOk(sa, h)
+  if (latch < 0) {
+    return no
+  }
+  let inLoop = licmLoopBlocks(sa.f, sa.pm, h)
+  if (!stripLoopSetOk(sa, inLoop, h)) {
+    return no
+  }
+  let br = sa.f.instrs[stripCmpIdx(sa.f, h) + 1]
+  if (!inLoop[br.ival] || inLoop[br.ival2]) {
+    return no
+  }
+  let lp = stripNoLoop()
+  lp.header = h
+  lp.latch = latch
+  lp.exitBlk = br.ival2
+  lp.lastPos = stripLastPos(sa.pos, inLoop)
+  if (!stripCounterOk(sa, lp, h, latch, br)) {
+    return no
+  }
+  stripClaim(sa, inLoop)
+  return lp
+}
+
+// True iff no block of this loop already belongs to an accepted one. Two
+// natural loops that share a block are refused by `stripSingleEntry` in every
+// reducible CFG, so this never fires today — it is here because "never fires"
+// is an argument about the CFG shape, and the cost of being wrong is two
+// rewrites of the same block.
+fn stripFree(sa: StripAnalysis, inLoop: []bool): bool {
+  let b = 0
+  while (b < len(inLoop)) {
+    if (inLoop[b] && sa.claimed[b]) {
+      return false
+    }
+    b = b + 1
+  }
+  return true
+}
+
+fn stripClaim(sa: StripAnalysis, inLoop: []bool) {
+  let b = 0
+  while (b < len(inLoop)) {
+    if (inLoop[b]) {
+      sa.claimed[b] = true
+    }
+    b = b + 1
+  }
+}
+
+// Every strip-mineable loop in `f`, in emission order of their headers.
+fn stripFindLoops(f: IrFunc, pm: PredMap, order: []int, pos: []int): []StripLoop {
+  let sa = StripAnalysis{
+    f: f, pm: pm, pos: pos, owners: stripOwners(f),
+    uses: stripUseCounts(f), claimed: licmFalses(len(f.blocks)),
+  }
+  let out = []StripLoop(0)
+  let i = 0
+  while (i < len(order)) {
+    let lp = stripCandidate(sa, order[i])
+    if (lp.header >= 0) {
+      out = append(out, lp)
+    }
+    i = i + 1
+  }
+  return out
+}

@@ -1,0 +1,294 @@
+// compiler/ircheckregalloc.bit — the register allocator's selfcheck arms, and
+// the small `TargetRegs`/`LiveInterval` builders only they use.
+//
+// A sibling of `ircheck.bit` rather than more of it, on the `ircheckret.bit`
+// precedent: #4204's strip miner made two of that file's pinned post-opt IR
+// texts longer and took it to 817 lines, past the 800-line ceiling
+// (spec/LINT.md §4). Moved rather than annotated past. Sibling .bit files are
+// the same module, so `selfcheck()` still calls these directly and no import
+// moves with them — an import in Bit is per MODULE, and re-importing here
+// would be E0042.
+//
+// PURE MOVE: lines 595-817 of ircheck.bit, verbatim, in order. Nothing else in
+// this file.
+
+fn mkIv(vreg: int, regClass: RegClass, start: int, end: int, isRef: bool): LiveInterval {
+  return LiveInterval{ vreg: vreg, regClass: regClass, start: start, end: end, isRef: isRef }
+}
+
+fn mkRegs(intCount: int, floatCount: int): TargetRegs {
+  return TargetRegs{
+    intRegs: RegFile{ count: intCount, calleeSaved: 0, pollSaved: 0 },
+    floatRegs: RegFile{ count: floatCount, calleeSaved: 0, pollSaved: 0 },
+  }
+}
+
+// The same, with explicit callee-saved masks — the only way #3171's
+// clobber-point restriction can be reached. `pollSaved` mirrors `calleeSaved`,
+// which is the "no #4429 widening" configuration every backend but arm64 uses;
+// mkRegsPoll below is the one that separates them.
+fn mkRegsCs(intCount: int, intCs: int, floatCount: int, floatCs: int): TargetRegs {
+  return TargetRegs{
+    intRegs: RegFile{ count: intCount, calleeSaved: intCs, pollSaved: intCs },
+    floatRegs: RegFile{ count: floatCount, calleeSaved: floatCs, pollSaved: floatCs },
+  }
+}
+
+// #4429: an int file whose poll-surviving set is WIDER than its callee-saved
+// set — the arm64 shape, where `bl bit_rt_safepoint` preserves the whole
+// allocatable file and an ordinary `bl` preserves only x19..x28.
+fn mkRegsPoll(intCount: int, intCs: int, intPoll: int): TargetRegs {
+  return TargetRegs{
+    intRegs: RegFile{ count: intCount, calleeSaved: intCs, pollSaved: intPoll },
+    floatRegs: RegFile{ count: 0, calleeSaved: 0, pollSaved: 0 },
+  }
+}
+
+// The allocator's core correctness invariant: no two intervals whose ranges
+// overlap were assigned the same physical register within the same class.
+fn assertNoOverlappingRegs(intervals: []LiveInterval, locations: []RegLoc) {
+  let i = 0
+  while (i < len(intervals)) {
+    let a = intervals[i]
+    let locA = locations[a.vreg]
+    if (locA.isSpill) {
+      i = i + 1
+      continue
+    }
+    let j = i + 1
+    while (j < len(intervals)) {
+      let b = intervals[j]
+      let locB = locations[b.vreg]
+      if (a.regClass == b.regClass && !locB.isSpill && locA.index == locB.index) {
+        assert(!(a.start <= b.end && b.start <= a.end))
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+}
+
+// Stage 3 linear-scan register allocator — ports own tests.
+//
+// Split three ways along the arms' own subject matter, not to hit a number:
+// register assignment and spilling here, spill-slot reuse and class
+// independence next, GC stack maps under pressure last. Each was already an
+// independent arm with its own intervals; the split retires this function's
+// entry in tools/build/complexity-debt.txt rather than moving it, because the
+// complexity was almost entirely the `&&` in one arm's asserts meeting
+// another's.
+fn checkRegalloc() {
+  // Non-overlapping intervals share a register (reused after expiry).
+  let ivs = [mkIv(0, RegClass.Int, 0, 2, false), mkIv(1, RegClass.Int, 3, 5, false)]
+  let r = allocate(mkRegs(2, 0), ivs, []int(0), []int(0))
+  assert(!r.locations[0].isSpill && r.locations[0].index == 0)
+  assert(!r.locations[1].isSpill && r.locations[1].index == 0)
+  assert(r.numSpillSlots == 0)
+  assertNoOverlappingRegs(ivs, r.locations)
+
+  // Out of registers: the interval with the furthest end spills.
+  let ivs2 = [mkIv(0, RegClass.Int, 0, 4, false), mkIv(1, RegClass.Int, 1, 10, false)]
+  let r2 = allocate(mkRegs(1, 0), ivs2, []int(0), []int(0))
+  assert(!r2.locations[0].isSpill && r2.locations[0].index == 0)
+  assert(r2.locations[1].isSpill && r2.locations[1].index == 0)
+  assert(r2.numSpillSlots == 1)
+  assertNoOverlappingRegs(ivs2, r2.locations)
+
+  checkRegallocSpillReuse()
+}
+
+// Spill-slot recycling, and that the int and float register files are
+// independent.
+fn checkRegallocSpillReuse() {
+  // A freed spill slot is recycled: v1's slot frees at 6, so v3 (starting at 9)
+  // reuses it instead of growing the frame.
+  let ivs3 = [
+    mkIv(0, RegClass.Int, 0, 5, false), mkIv(1, RegClass.Int, 1, 6, false),
+    mkIv(2, RegClass.Int, 7, 12, false), mkIv(3, RegClass.Int, 9, 15, false),
+  ]
+  let r3 = allocate(mkRegs(1, 0), ivs3, []int(0), []int(0))
+  assert(!r3.locations[0].isSpill && r3.locations[0].index == 0)
+  assert(r3.locations[1].isSpill && r3.locations[1].index == 0)
+  assert(!r3.locations[2].isSpill && r3.locations[2].index == 0)
+  assert(r3.locations[3].isSpill && r3.locations[3].index == 0)
+  assert(r3.numSpillSlots == 1)
+  assertNoOverlappingRegs(ivs3, r3.locations)
+
+  // Int and float classes are independent register files.
+  let ivs4 = [mkIv(0, RegClass.Int, 0, 10, false), mkIv(1, RegClass.Float, 0, 10, false)]
+  let r4 = allocate(mkRegs(1, 1), ivs4, []int(0), []int(0))
+  assert(!r4.locations[0].isSpill && r4.locations[0].index == 0)
+  assert(!r4.locations[1].isSpill && r4.locations[1].index == 0)
+  assert(r4.numSpillSlots == 0)
+
+  checkRegallocStackMaps()
+}
+
+// GC stack maps: by register, by spill slot, and under forced pressure.
+fn checkRegallocStackMaps() {
+  // A precise GC stack map: only v0 (a live ref spanning the safepoint) is
+  // reported — not v1 (not a ref) or v2 (dead by pos 5).
+  let ivs5 = [
+    mkIv(0, RegClass.Int, 0, 10, true), mkIv(1, RegClass.Int, 0, 10, false),
+    mkIv(2, RegClass.Int, 0, 3, true),
+  ]
+  let r5 = allocate(mkRegs(2, 0), ivs5, [5], []int(0))
+  assert(len(r5.stackMaps) == 1)
+  assert(r5.stackMaps[0].pos == 5)
+  assert(len(r5.stackMaps[0].slots) == 0)
+  assert(len(r5.stackMaps[0].regs) == 1)
+  assert(r5.stackMaps[0].regs[0] == r5.locations[0].index)
+
+  // A spilled reference is reported by slot, not register.
+  let ivs6 = [mkIv(0, RegClass.Int, 0, 5, false), mkIv(1, RegClass.Int, 1, 20, true)]
+  let r6 = allocate(mkRegs(1, 0), ivs6, [10], []int(0))
+  assert(r6.locations[1].isSpill)
+  assert(len(r6.stackMaps[0].regs) == 0)
+  assert(len(r6.stackMaps[0].slots) == 1)
+  assert(r6.stackMaps[0].slots[0] == r6.locations[1].index)
+
+  // Forced register pressure (cap of 4): four long-lived loop-carried values
+  // already saturate the file, with 20 overlapping temporaries layered on top.
+  // Registers must never overlap and spills must happen.
+  let stress = []LiveInterval(0)
+  let v = 0
+  while (v < 4) {
+    stress = append(stress, mkIv(v, RegClass.Int, 0, 200, v == 0))
+    v = v + 1
+  }
+  let t = 0
+  while (t < 20) {
+    stress = append(stress, mkIv(v, RegClass.Int, t * 5, t * 5 + 40, false))
+    v = v + 1
+    t = t + 1
+  }
+  let r7 = allocate(mkRegs(4, 0), stress, [100, 150], []int(0))
+  assertNoOverlappingRegs(stress, r7.locations)
+  assert(r7.numSpillSlots > 0)
+  let k = 0
+  while (k < len(r7.stackMaps)) {
+    assert(len(r7.stackMaps[k].regs) + len(r7.stackMaps[k].slots) <= 1)
+    k = k + 1
+  }
+  checkRegallocClobbers()
+}
+
+// #3171: `clobbers` restricts a live-across interval to the callee-saved subset
+// of its class, per INTERVAL rather than per function.
+fn checkRegallocClobbers() {
+  // The SysV float shape that motivated the ticket: two float registers, NONE
+  // callee-saved, one clobber point at 10. v0 spans it and must still spill —
+  // that is the behaviour a call destroying every xmm requires. v1 lives
+  // entirely after it and must now get a register; before #3171 the answer was
+  // per function and it spilled too.
+  let ivsA = [mkIv(0, RegClass.Float, 0, 20, false), mkIv(1, RegClass.Float, 11, 15, false)]
+  let rA = allocate(mkRegsCs(0, 0, 2, 0), ivsA, []int(0), [10])
+  assert(
+    rA.locations[0].isSpill,
+    "a float spanning a clobber point must spill when nothing is callee-saved",
+  )
+  assert(
+    !rA.locations[1].isSpill,
+    "a float living entirely between clobber points must get a register",
+  )
+
+  // The boundary, and it is what makes a BACK-EDGE safepoint correct: the poll
+  // call is emitted BEFORE the edge's parallel move, so a value whose last read
+  // IS that edge is read after the clobber. So end == p crosses, while
+  // start == p (a call's own result, defined after the clobber) does not.
+  let ivsB = [mkIv(0, RegClass.Float, 0, 10, false), mkIv(1, RegClass.Float, 10, 20, false)]
+  let rB = allocate(mkRegsCs(0, 0, 2, 0), ivsB, []int(0), [10])
+  assert(rB.locations[0].isSpill, "end == clobber pos must count as live across it")
+  assert(!rB.locations[1].isSpill, "start == clobber pos must NOT count as live across it")
+
+  // A partial mask: only register 2 is callee-saved, so the spanning interval
+  // takes it even though registers 0 and 1 are free, and the short one then
+  // takes register 0.
+  let ivsC = [mkIv(0, RegClass.Int, 0, 20, false), mkIv(1, RegClass.Int, 1, 3, false)]
+  let rC = allocate(mkRegsCs(3, 4, 0, 0), ivsC, []int(0), [10])
+  assert(
+    !rC.locations[0].isSpill && rC.locations[0].index == 2,
+    "a spanning interval must take a callee-saved register",
+  )
+  assert(
+    !rC.locations[1].isSpill && rC.locations[1].index == 0,
+    "a non-spanning interval may take any free register",
+  )
+
+  // The same intervals with NO clobber positions must allocate exactly as they
+  // did before #3171 — v0 first, so register 0. This is the pin that the new
+  // parameter is inert when unused; every other backend still passes none.
+  let rD = allocate(mkRegsCs(3, 4, 0, 0), ivsC, []int(0), []int(0))
+  assert(
+    !rD.locations[0].isSpill && rD.locations[0].index == 0,
+    "no clobber positions must leave the plain scan untouched",
+  )
+
+  // Eviction has to go through the mask too. Register 1 is FREE when v2 is
+  // processed (v1 expired at 20) and v2 still may not have it, so v2 evicts the
+  // longer-lived v0 out of register 0 instead. Without the mask v2 would simply
+  // take register 1 and nothing would spill at all, which is what makes this
+  // case worth pinning rather than assuming.
+  let ivsE = [
+    mkIv(0, RegClass.Int, 0, 300, false), mkIv(1, RegClass.Int, 10, 20, false),
+    mkIv(2, RegClass.Int, 30, 100, false),
+  ]
+  let rE = allocate(mkRegsCs(2, 1, 0, 0), ivsE, []int(0), [50])
+  assert(rE.locations[0].isSpill, "the evicted holder of the only allowed register must spill")
+  assert(
+    !rE.locations[1].isSpill && rE.locations[1].index == 1,
+    "an unrestricted interval may take a caller-saved register",
+  )
+  assert(
+    !rE.locations[2].isSpill && rE.locations[2].index == 0,
+    "a spanning interval must evict rather than take a free caller-saved register",
+  )
+  assertNoOverlappingRegs(ivsE, rE.locations)
+  checkRegallocCoalesce()
+}
+
+// #3738: `roots` makes a vreg share its root's location, and widens the root's
+// interval to cover it.
+fn checkRegallocCoalesce() {
+  // v1 aliases v0. They must land on the SAME register — that identity is what
+  // turns the block edge's `v1 := v0` into a self-move the sequencer drops.
+  let ivs = [mkIv(0, RegClass.Int, 0, 5, false), mkIv(1, RegClass.Int, 5, 12, false)]
+  let r = allocateCoalesced(mkRegs(2, 0), ivs, allocPoints([]int(0), []int(0)), [0, 0])
+  assert(!r.locations[0].isSpill && !r.locations[1].isSpill)
+  assert(r.locations[0].index == r.locations[1].index, "an alias must take its root's register")
+
+  // THE SAFETY CASE, and the one that fails if the merge does not widen: v2
+  // starts at 8, AFTER v0's own end of 5, so a scan that expired v0 on its own
+  // interval would hand register 0 straight to v2 while the alias v1 still
+  // reads it. With one register available v2 must spill instead.
+  let ivs2 = [
+    mkIv(0, RegClass.Int, 0, 5, false), mkIv(1, RegClass.Int, 5, 12, false),
+    mkIv(2, RegClass.Int, 8, 20, false),
+  ]
+  let r2 = allocateCoalesced(mkRegs(1, 0), ivs2, allocPoints([]int(0), []int(0)), [0, 0, 2])
+  assert(r2.locations[0].index == r2.locations[1].index && !r2.locations[0].isSpill)
+  assert(
+    r2.locations[2].isSpill,
+    "an interval overlapping an alias must not reuse the shared register",
+  )
+
+  // Coalescing also BUYS a register: the same three intervals without the alias
+  // relation need two registers, and v2 gets one here where it spilled above.
+  let r3 = allocateCoalesced(mkRegs(2, 0), ivs2, allocPoints([]int(0), []int(0)), [0, 0, 2])
+  assert(!r3.locations[2].isSpill && r3.locations[2].index != r3.locations[0].index)
+
+  // A reference reaching a safepoint only through its alias is still reported,
+  // once — the root carries the merged interval and the shared location, so
+  // listing the alias too would name the same register twice.
+  let ivs4 = [mkIv(0, RegClass.Int, 0, 5, false), mkIv(1, RegClass.Int, 5, 12, true)]
+  let r4 = allocateCoalesced(mkRegs(2, 0), ivs4, allocPoints([9], []int(0)), [0, 0])
+  assert(len(r4.stackMaps[0].regs) == 1, "a shared live reference is reported exactly once")
+  assert(r4.stackMaps[0].regs[0] == r4.locations[1].index)
+
+  // Inertness pin: identity roots must allocate exactly as an empty roots array
+  // does, which is exactly as `allocate` did before this parameter existed.
+  let r5 = allocateCoalesced(mkRegs(2, 0), ivs, allocPoints([]int(0), []int(0)), [0, 1])
+  assert(r5.locations[0].index != r5.locations[1].index || r5.locations[1].isSpill)
+  let r6 = allocate(mkRegs(2, 0), ivs, []int(0), []int(0))
+  assert(r5.locations[0].index == r6.locations[0].index && r5.locations[1].index == r6.locations[1].index)
+}
