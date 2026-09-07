@@ -1,0 +1,230 @@
+// pkg/web/ctx.bit — Ctx (#3883): the input side handed to every handler and
+// every middleware. Response helpers are #3884; this owns the request,
+// parsed headers, route params, query and named-route resolution.
+//
+// Header parsing is THIS package's job: stdlib/http/http.bit's `Request`
+// carries `headers` as one raw, unparsed field ("Name: value\r\n" repeated,
+// no CRLF after the LAST line — see `readMessage` in http.bit). `newCtx`
+// parses it once, on construction, into a case-insensitive multi-value
+// lookup (`parseHeaders` below), independent of whatever std/http itself
+// already bounds at the wire level — a `Request` can be built by hand (a
+// test, a future non-HTTP adapter) as easily as by std/http.
+//
+// Route params come from the router (#3881's `Match.params`), passed in by
+// the caller — never re-parsed from the path here.
+//
+// The name registry cannot be module state (`let S = R{...}` at module
+// scope is `E0082`), so `Ctx` holds a reference to the SAME `NameRegistry`
+// `App`/`Group` already share (app.bit) — `c.route()` is `NameRegistry.
+// lookup()` plus positional param substitution against the pattern's own
+// segments, reusing router.bit's `splitSegments`/`isParamSeg`/
+// `isWildcardSeg` rather than re-parsing pattern syntax a second way.
+
+import { Request, splitTarget, parseQuery } from "std/http"
+import { toLower, indexOf, trimSpace } from "std/strings"
+
+// Independent of std/http's own wire-level `maxHeaderBytes` (which bounds
+// bytes read off the socket, not what `Ctx` is willing to parse): a request
+// cannot make this parser allocate without bound, however it was built.
+// 8 KiB / 100 lines is generous for ordinary headers and matches the order
+// of magnitude other servers cap at (nginx: 8 KiB per line; this is a
+// total-block cap, not per-line).
+const maxHeaderBytes = 8192
+const maxHeaderCount = 100
+
+// Parses a raw header block into a case-insensitive, multi-value lookup
+// keyed by lowercased name. Fails outright — never truncates — when either
+// cap is exceeded, since a truncated parse would silently drop a header a
+// handler goes on to trust. A line with no colon, or an empty name (a
+// colon at position 0), is dropped rather than guessed at: it is never
+// recorded as a name with an empty value, so `headers(name)` on a dropped
+// line's text returns an empty slice, not a one-element slice holding "".
+fn parseHeaders(raw: string): map<string, []string>! {
+  if (len(raw) > maxHeaderBytes) {
+    fail newError("web: header block is ${len(raw)} byte(s), exceeds the ${maxHeaderBytes}-byte cap")
+  }
+  let out = map<string, []string>()
+  if (len(raw) == 0) {
+    return out
+  }
+  let lines = split(raw, "\r\n")
+  if (len(lines) > maxHeaderCount) {
+    fail newError("web: request has ${len(lines)} header line(s), exceeds the ${maxHeaderCount}-line cap")
+  }
+  for line of lines {
+    if (len(line) == 0) {
+      continue
+    }
+    let colon = indexOf(line, ":")
+    if (colon <= 0) {
+      // No colon at all (-1), or an empty name (":x" -> colon == 0): dropped.
+      continue
+    }
+    let name = toLower(line[0:colon])
+    let value = trimSpace(line[colon + 1:len(line)])
+    let (existing, ok) = out[name]
+    if (ok) {
+      out[name] = append(existing, value)
+    } else {
+      out[name] = []string{ value }
+    }
+  }
+  return out
+}
+
+export class Ctx {
+  req: Request
+  reqPath: string
+  queryValues: map<string, string>
+  params: map<string, string>
+  registry: NameRegistry
+  headerValues: map<string, []string>
+
+  // A route param by name, or "" if `name` is not one of this route's
+  // params. Never fallible — an absent param is not an error (SPEC-level
+  // decision recorded on #3883: anything that must be present is validated
+  // where its type is bound, #3877/#3880, not by making every accessor
+  // fallible).
+  export param(name: string): string {
+    let (v, ok) = this.params[name]
+    if (ok) {
+      return v
+    }
+    return ""
+  }
+
+  // A decoded query-string value by name, or "" if absent. Percent-decoding
+  // and the last-wins duplicate policy are std/http's own (`parseQuery`,
+  // stdlib/http/query.bit) — reused here, not reimplemented.
+  export query(name: string): string {
+    let (v, ok) = this.queryValues[name]
+    if (ok) {
+      return v
+    }
+    return ""
+  }
+
+  // The first value of header `name` (case-insensitive), or "" if absent.
+  export header(name: string): string {
+    let all = this.headers(name)
+    if (len(all) == 0) {
+      return ""
+    }
+    return all[0]
+  }
+
+  // Every value of header `name` (case-insensitive), in the order they
+  // appeared. A repeated header is never overwritten — this is the only
+  // accessor that can see a repeat; `header()` returns just the first.
+  export headers(name: string): []string {
+    let (v, ok) = this.headerValues[toLower(name)]
+    if (ok) {
+      return v
+    }
+    return []string(0)
+  }
+
+  export method(): string {
+    return this.req.method
+  }
+
+  export path(): string {
+    return this.reqPath
+  }
+
+  // Resolves a registered name (`App`/`Group`'s `.name()`, app.bit) to a
+  // URL with `args` filled positionally into the pattern's own param/
+  // wildcard segments, in registration order, and every group prefix
+  // already applied — the pattern stored against the name IS the
+  // fully-prefixed one (app.bit's `Route.name`). An unknown name fails
+  // naming every currently-registered name; a wrong argument count fails
+  // naming the pattern and the count it expected.
+  //
+  // `args` is `[]string`, not the ticket's original `...args: string` —
+  // a VARIADIC parameter on a class METHOD miscompiles here, filed as
+  // #4439: calling it at two different arities from different call sites
+  // fails IR verification (`bit: IR verification failed ... calls @route
+  // with N argument(s), but @route declares M parameter(s)`), and
+  // spreading a slice into it (`c.route(name, ...xs)`) does not lower at
+  // all (`E0092`). A free FUNCTION's variadic parameter has neither
+  // problem — the bug is method-specific, proven with a standalone
+  // repro on #4439. `[]string` sidesteps both: `c.route("x", []string(0))`,
+  // `c.route("x", []string{ "42" })`.
+  export route(name: string, args: []string): string! {
+    let pattern = this.registry.lookup(name) catch e {
+      fail newError("web: c.route: ${e.message()} (registered: ${registeredNames(this.registry)})")
+    }
+    return fillRoutePattern(name, pattern, args)?
+  }
+}
+
+// Every name currently recorded in `r`, sorted and comma-joined, or
+// "none registered" if there are none — the list an unknown-name failure
+// names. `r.names` is an unexported field of an unexported class
+// (app.bit's `NameRegistry`); both are module-private, not file-private
+// (SPEC §17.3), so reading it here from a sibling file in the same module
+// is legal, the same seam app.test.bit already reaches through.
+fn registeredNames(r: NameRegistry): string {
+  let names = []string(0)
+  for (k, _) of r.names {
+    names = append(names, k)
+  }
+  if (len(names) == 0) {
+    return "none registered"
+  }
+  return join(sorted(names, (a, b) => a < b), ", ")
+}
+
+// Substitutes `args` positionally into `pattern`'s param (`:x`) and
+// wildcard (`*x`) segments, reusing router.bit's own segment splitter and
+// segment-kind predicates rather than re-parsing pattern syntax a second
+// way. `pattern` is always a router-registered, fully-prefixed pattern (it
+// came out of `NameRegistry.lookup`), so its dynamic-segment count is fixed
+// before this ever runs — this only reconciles it against what the caller
+// supplied.
+fn fillRoutePattern(name: string, pattern: string, args: []string): string! {
+  let segs = splitSegments(pattern)
+  let want = 0
+  for seg of segs {
+    if (isParamSeg(seg) || isWildcardSeg(seg)) {
+      want = want + 1
+    }
+  }
+  if (want != len(args)) {
+    fail newError("web: c.route: '${name}' (pattern '${pattern}') takes ${want} argument(s), got ${len(args)}")
+  }
+  let out = []string(0)
+  let ai = 0
+  for seg of segs {
+    if (isParamSeg(seg) || isWildcardSeg(seg)) {
+      out = append(out, args[ai])
+      ai = ai + 1
+    } else {
+      out = append(out, seg)
+    }
+  }
+  if (len(out) == 0) {
+    return "/"
+  }
+  return "/" + join(out, "/")
+}
+
+// Builds a `Ctx` for one request: splits `req.path` into the matched path
+// and the raw query once (std/http's `splitTarget`), decodes the query
+// (`parseQuery`), and parses `req.headers` (`parseHeaders`, above) —
+// failing rather than constructing a `Ctx` on a request whose header block
+// breaks either cap. `params` is the router's own `Match.params` (#3881);
+// `registry` is the App's `NameRegistry` (app.bit) that named this route,
+// if any.
+export fn newCtx(req: Request, params: map<string, string>, registry: NameRegistry): Ctx! {
+  let (path, rawQuery) = splitTarget(req.path)
+  let headerValues = parseHeaders(req.headers)?
+  return Ctx{
+    req: req,
+    reqPath: path,
+    queryValues: parseQuery(rawQuery),
+    params: params,
+    registry: registry,
+    headerValues: headerValues,
+  }
+}
