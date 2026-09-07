@@ -18,16 +18,30 @@
 // written that slot. Three rules, each of which refuses rather than reasons
 // when it cannot prove disjointness.
 //
-// 1. ONE BASE AT A TIME. Every entry in the table belongs to a single SSA base
-//    value, and a store through any other base clears it. So this pass never
+// 1. TWO BASES MAY COEXIST ONLY WHEN THEY ARE TWO DISTINCT `gc_alloc`s.
+//    Every other pair clears: a store through a base that is not an allocation
+//    result drops every entry it does not itself own. So this pass still never
 //    has to answer "can these two SSA values point at the same object" — the
 //    question it would get wrong. Two distinct SSA values genuinely can alias:
 //    `append(s, x)` hands back the caller's own backing array, a `bitcast`
 //    renames a pointer, and any two references to one object are the same
-//    memory. There is no alias analysis here to tell them apart, so there is no
-//    case where this pass needs one.
+//    memory.
 //
-// 2. WITHIN THAT ONE BASE, A DIFFERENT BYTE OFFSET IS A DIFFERENT SLOT. `ival`
+//    The one fact it does use is not an alias analysis, it is the defining
+//    property of the allocator: `gc_alloc` returns an object no other value
+//    denotes, so two DIFFERENT `gc_alloc` instructions return two DIFFERENT
+//    objects. Nothing derived — not a `bitcast` of an allocation, not a value
+//    read back out of one — qualifies; the test is literally "is this value id
+//    the result of a `gc_alloc` instruction" (`storeBaseIsFresh`).
+//
+//    #4413 filed this as "let StoreTable hold several bases, because a store
+//    through base X cannot be ANSWERED by a load through base Y". That argument
+//    is about the lookup side and it is not the one that matters: the hazard is
+//    the KILL side. If X and Y alias, `field_set Y[0]` overwrote `X[0]`, and an
+//    entry for `X[0]` that survives it forwards a stale value. Multi-base
+//    without a distinctness fact is a miscompile, which is why there is one.
+//
+// 2. WITHIN ONE BASE, A DIFFERENT BYTE OFFSET IS A DIFFERENT SLOT. `ival`
 //    is the byte offset `structLayout` assigned (compiler/loweraccess.bit:66),
 //    and one SSA value has one static type, hence one layout, whose fields do
 //    not overlap. So `field_set B[8] = v` leaves an entry for `B[0]` intact,
@@ -41,16 +55,48 @@
 //    an invariant the tree already stakes correctness on. Reusing it means an
 //    op added later is a barrier here the day it lands rather than silently
 //    transparent, and there is no second table to drift out of step with the
-//    first. Exactly two members are excluded, both accounted for: `field_set`,
-//    which rules 1 and 2 invalidate precisely, and `index_get`, a LOAD whose
-//    only effect is a bounds-check panic, and a panic does not return.
+//    first. Exactly three members are excluded, each accounted for:
+//    `field_set`, which rules 1 and 2 invalidate precisely; `index_get`, a LOAD
+//    whose only effect is a bounds-check panic, and a panic does not return;
+//    and `gc_alloc`, which invalidates partially — see below.
 //
-// `gc_alloc` and `make_closure` are therefore barriers. That is stronger than
-// this pass strictly needs today: the collector is non-moving
-// (runtime/ABI.md:865), stops the world at the safepoint, and writes no user
-// field, so a collection cannot change what a slot holds. But that is a
-// RUNTIME property, and a pass that silently depends on it turns into a
-// miscompile the day the collector changes. Refusing costs one reload.
+// `make_closure` is therefore a barrier. `gc_alloc` is the third exception and
+// is a PARTIAL one: it drops every entry whose base is not an allocation this
+// function made, and keeps the rest (`storeTableCollect`).
+//
+// ## Why a `gc_alloc` does not have to drop an entry based on an allocation
+//
+// NOT because the collector is non-moving. That is a runtime property
+// (runtime/ABI.md:865), it is exactly the kind of thing a pass must not
+// silently depend on, and this pass does not: the argument below holds for a
+// relocating collector too.
+//
+// Take an entry `A[o] = v` where `A` is the result of a `gc_alloc` in this
+// function, and a collection at a later `gc_alloc`. For the forwarded program
+// to differ from the un-forwarded one, the collection would have to leave the
+// slot `A[o]` denoting something other than what `v` denotes. It cannot:
+//
+//   - `A` is read after the collection, so it is live there, so it is a root in
+//     the stack map and any relocating collector updates it with the object.
+//   - a scalar field is copied verbatim by any collector, moving or not.
+//   - a POINTER field is at a traced offset (`gc_alloc`'s own `ptrs=[...]`), so
+//     a relocating collector rewrites it — and it rewrites `v` in lockstep,
+//     because forwarding is what makes `v` live across that safepoint and the
+//     stack map is built from the FINAL IR: `optimizeModule` runs to completion
+//     in `buildObjCmd`/`writeModuleExe` before any backend sees the function,
+//     and the maps come from `codegenlive.bit`'s liveness over that.
+//   - a collector that updated one of the two and not the other would already
+//     have broken the UN-forwarded program, whose later `field_get A[o]` and
+//     whose other uses of `v` must agree.
+//
+// So forwarding across an allocation introduces no failure mode the program
+// does not already have. What is dropped instead is every entry whose base this
+// pass did not watch being allocated — a parameter, a field read, anything
+// reached from outside — because for those the first bullet is not available
+// and the blast radius is not worth the reload.
+//
+// `gc_alloc` stays in `isSideEffecting`, so DCE still never deletes one and
+// optalloc.bit still owns the only removal path.
 //
 // ## What it deliberately does not do
 //
@@ -59,35 +105,67 @@
 // - Nothing across blocks. A predecessor's store is available only where it
 //   dominates, which needs a dominator walk this pass does not have.
 
-// The stores available for forwarding at the current point of one block. Every
-// entry belongs to `base`; `off[i]` is a byte offset and `val[i]` the SSA value
-// id last stored there. `base` is -1 when the table is empty — a value id is
-// never negative, so the sentinel cannot collide with a real base.
+// The stores available for forwarding at the current point of one block. Entry
+// `i` is "`base[i]` at byte offset `off[i]` holds SSA value `val[i]`". `n` is
+// how many of the parallel arrays' slots are live: the arrays only grow, so a
+// kill compacts into the prefix and allocates nothing.
 class StoreTable {
-  base: int,
+  n: int,
+  base: []int,
   off: []int,
   val: []int,
 }
 
 fn newStoreTable(): StoreTable {
-  return StoreTable{ base: -1, off: []int(0), val: []int(0) }
+  return StoreTable{ n: 0, base: []int(0), off: []int(0), val: []int(0) }
 }
 
 fn storeTableClear(t: StoreTable) {
-  t.base = -1
-  t.off = []int(0)
-  t.val = []int(0)
+  t.n = 0
+}
+
+// Writes entry `i`, appending when the arrays have not reached that slot yet.
+// Only ever called with `i <= t.n`, so it appends at most once per call.
+fn storeTableSet(t: StoreTable, i: int, base: int, off: int, val: int) {
+  if (i < len(t.base)) {
+    t.base[i] = base
+    t.off[i] = off
+    t.val[i] = val
+    return
+  }
+  t.base = append(t.base, base)
+  t.off = append(t.off, off)
+  t.val = append(t.val, val)
+}
+
+// Rule 1's distinctness fact, and the whole of it: is this value id the direct
+// result of a `gc_alloc`? Nothing derived from one counts — a `bitcast` of an
+// allocation and a pointer read back out of a field are both other value ids
+// with other defining ops, so both answer false and both therefore clear.
+fn storeBaseIsFresh(f: IrFunc, base: int): bool {
+  if (base < 0 || base >= len(f.instrs)) {
+    return false
+  }
+  return f.instrs[base].op == Op.GcAlloc
+}
+
+// Whether a store of `base[off]` leaves the entry `other[otherOff]` intact.
+// Same base: rule 2, a different byte offset is a different slot. Different
+// base: rule 1, which needs the two to denote different objects and has exactly
+// one way to know that.
+fn storeKeepsEntry(f: IrFunc, base: int, off: int, other: int, otherOff: int): bool {
+  if (other == base) {
+    return otherOff != off
+  }
+  return storeBaseIsFresh(f, base) && storeBaseIsFresh(f, other)
 }
 
 // The value id last stored at `base[off]`, or -1 when this pass cannot prove
 // one is still there.
 fn storeTableFind(t: StoreTable, base: int, off: int): int {
-  if (t.base != base) {
-    return -1
-  }
   let i = 0
-  while (i < len(t.off)) {
-    if (t.off[i] == off) {
+  while (i < t.n) {
+    if (t.base[i] == base && t.off[i] == off) {
       return t.val[i]
     }
     i = i + 1
@@ -95,34 +173,47 @@ fn storeTableFind(t: StoreTable, base: int, off: int): int {
   return -1
 }
 
-// Records `base[off] = val` and invalidates exactly what rules 1 and 2 permit:
-// a store through a DIFFERENT base drops every entry, a store through the same
-// base drops only the entry at that same offset. Bounded — the table gains at
-// most one entry per `field_set` in the block, and a block has statically many.
-fn storeTableStore(t: StoreTable, base: int, off: int, val: int) {
-  if (t.base != base) {
-    storeTableClear(t)
-    t.base = base
-  }
+// Records `base[off] = val`, dropping exactly the entries rules 1 and 2 cannot
+// keep. Bounded: every surviving entry was already in the table and one is
+// added, so the table never exceeds the number of `field_set`s seen in the
+// block, and a block has statically many.
+fn storeTableStore(f: IrFunc, t: StoreTable, base: int, off: int, val: int) {
+  let w = 0
   let i = 0
-  while (i < len(t.off)) {
-    if (t.off[i] == off) {
-      t.val[i] = val
-      return
+  while (i < t.n) {
+    if (storeKeepsEntry(f, base, off, t.base[i], t.off[i])) {
+      storeTableSet(t, w, t.base[i], t.off[i], t.val[i])
+      w = w + 1
     }
     i = i + 1
   }
-  t.off = append(t.off, off)
-  t.val = append(t.val, val)
+  storeTableSet(t, w, base, off, val)
+  t.n = w + 1
+}
+
+// A `gc_alloc` may collect. Keeps the entries whose base is an allocation this
+// function made and drops every other — see the header for why that is not the
+// non-moving-collector dependency it looks like.
+fn storeTableCollect(f: IrFunc, t: StoreTable) {
+  let w = 0
+  let i = 0
+  while (i < t.n) {
+    if (storeBaseIsFresh(f, t.base[i])) {
+      storeTableSet(t, w, t.base[i], t.off[i], t.val[i])
+      w = w + 1
+    }
+    i = i + 1
+  }
+  t.n = w
 }
 
 // Rule 3: the ops this pass refuses to look through. `isSideEffecting` minus
-// the two members it can account for exactly — see the header. Deriving it
+// the three members it can account for exactly — see the header. Deriving it
 // rather than listing it is the point: a new op that writes memory must join
 // `isSideEffecting` or DCE would already delete it, and joining it makes it a
 // barrier here for free.
 fn opClobbersFieldSlots(op: Op): bool {
-  return isSideEffecting(op) && op != Op.FieldSet && op != Op.IndexGet
+  return isSideEffecting(op) && op != Op.FieldSet && op != Op.IndexGet && op != Op.GcAlloc
 }
 
 // Answers one `field_get` from the table when a preceding store proves the
@@ -154,7 +245,9 @@ fn forwardBlockStores(f: IrFunc, fwd: []int, bi: int) {
     if (ins.op == Op.FieldGet) {
       forwardOneLoad(f, t, fwd, idx)
     } else if (ins.op == Op.FieldSet) {
-      storeTableStore(t, ins.lhs, ins.ival, ins.rhs)
+      storeTableStore(f, t, ins.lhs, ins.ival, ins.rhs)
+    } else if (ins.op == Op.GcAlloc) {
+      storeTableCollect(f, t)
     } else if (opClobbersFieldSlots(ins.op)) {
       storeTableClear(t)
     }

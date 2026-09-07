@@ -1,0 +1,128 @@
+// In-Bit self-checks for the OPTIMIZER's block-local store-to-load forwarding
+// (optstore.bit). Sibling .bit file, so `selfcheck()` calls these directly and
+// nothing here needs an import.
+//
+// These pin behaviour no differential can see. `selfhost-diffir`/`diffiropt`
+// compare the whole corpus's IR against the pinned stage0, which makes them a
+// REGRESSION detector against a frozen oracle, not a statement about what the
+// pass is supposed to do: the day the oracle is repinned they agree with
+// whatever the tree does. The three arms below assert the rule directly —
+// what must forward, and the two shapes that must NOT.
+
+// How many instructions in `f` carry `op`. The denominator half of every
+// assertion here: a fixture whose aggregates were never built in the first
+// place reports zero surviving allocations for a reason that has nothing to do
+// with this pass, and reads exactly like a fixture the pass fixed.
+fn optCountOp(f: IrFunc, op: Op): int {
+  let n = 0
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (f.instrs[i].op == op) {
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return n
+}
+
+// The module's function called `name`. Asserts rather than returning a
+// sentinel: every caller here names a function its own fixture declares, so a
+// miss is a broken fixture, not a case to handle.
+fn optFuncNamed(m: IrModule, name: string): IrFunc {
+  let i = 0
+  while (i < len(m.funcs)) {
+    if (m.funcs[i].name == name) {
+      return m.funcs[i]
+    }
+    i = i + 1
+  }
+  assert(false)
+  return m.funcs[0]
+}
+
+// #4413. FOUR aggregates built in one block, every one of them exploded back
+// into words at the call site. Before the multi-base store table this left
+// `max(0, N - 2)` live `gc_alloc`s — the table held one base, so a store
+// through the next aggregate cleared the previous one's entries, and only the
+// LAST aggregate forwarded per fold round. `optimizeModule` runs exactly two
+// fold rounds, so N-2 survived, independent of the argument word count.
+//
+// N = 4 and not 3 on purpose: three aggregates survive a table that holds one
+// base plus one extra fold round, four do not.
+fn checkStoreForwardManyAllocations() {
+  let src = "fn sink(a: (i64, i64), b: (i64, i64), c: (i64, i64), d: (i64, i64)): i64 {\n" +
+    "  return a.0 + a.1 + b.0 + b.1 + c.0 + c.1 + d.0 + d.1\n" +
+    "}\n" +
+    "fn drive(n: i64): i64 {\n" +
+    "  return sink((n, n + 1), (n + 2, n + 3), (n + 4, n + 5), (n + 6, n + 7))\n" +
+    "}\n" +
+    "fn main() {\n  let _ = drive(1)\n}\n"
+  let m = lowerSourceModule(src)
+  assert(optCountOp(optFuncNamed(m, "drive"), Op.GcAlloc) == 4)
+  optimizeModule(m, false)
+  let post = optFuncNamed(m, "drive")
+  assert(optCountOp(post, Op.GcAlloc) == 0)
+  assert(optCountOp(post, Op.FieldGet) == 0)
+  assert(optCountOp(post, Op.FieldSet) == 0)
+}
+
+// #4413, the refusal. TWO BASES THIS PASS CANNOT TELL APART. Neither `p` nor
+// `q` is an allocation this function made — they are parameters, and the caller
+// is free to pass one object twice — so `q.n = 2` must drop the entry for
+// `p.n`, exactly as before this change. The read of `p.n` therefore survives as
+// a real `field_get`.
+//
+// This is the arm that fails if `storeBaseIsFresh` is ever widened to "any
+// base", which is the plausible wrong version of this change: it forwards `1`
+// into the return and the function answers 1 for `f(x, x)` where it must
+// answer 2.
+fn checkStoreForwardRefusesUnknownBases() {
+  let src = "class Box {\n  n: i64,\n}\n" +
+    "fn f(p: Box, q: Box): i64 {\n" +
+    "  p.n = 1\n" +
+    "  q.n = 2\n" +
+    "  return p.n\n" +
+    "}\n" +
+    "fn main() {\n  let b = Box{ n: 0 }\n  let _ = f(b, b)\n}\n"
+  let m = lowerSourceModule(src)
+  assert(optCountOp(optFuncNamed(m, "f"), Op.FieldGet) == 1)
+  optimizeModule(m, false)
+  assert(optCountOp(optFuncNamed(m, "f"), Op.FieldGet) == 1)
+}
+
+// #4413, the second refusal. A `gc_alloc` keeps the entries whose base it
+// watched being allocated and drops every other, so a slot in a base reached
+// from OUTSIDE this function does not survive one. `p` is a parameter; the
+// `Box{...}` between the store and the load is the allocation; the read of
+// `p.n` must still be a real `field_get`.
+//
+// `keep` is recursive so the inliner cannot flatten it away, and it never READS
+// `b` — both deliberate. The recursion is what makes `r` escape into a call, so
+// optalloc.bit cannot delete the allocation, and without a surviving allocation
+// there is no barrier between the store and the load and the forward is legal
+// for a reason that has nothing to do with this rule. The first draft of this
+// fixture had exactly that hole: it asserted a refusal that the pre-change
+// compiler also did not perform, so it would have passed against any mutant.
+//
+// This is the arm that fails if `storeTableCollect` is ever weakened to keep
+// everything, i.e. if `gc_alloc` stops invalidating at all.
+fn checkStoreForwardAllocDropsForeignBases() {
+  let src = "class Box {\n  n: i64,\n}\n" +
+    "fn keep(b: Box, k: i64): i64 {\n" +
+    "  if (k <= 0) {\n    return 0\n  }\n" +
+    "  return keep(b, k - 1) + 1\n" +
+    "}\n" +
+    "fn g(p: Box): i64 {\n" +
+    "  p.n = 1\n" +
+    "  let r = Box{ n: 9 }\n" +
+    "  return p.n + keep(r, 1)\n" +
+    "}\n" +
+    "fn main() {\n  let b = Box{ n: 0 }\n  let _ = g(b)\n}\n"
+  let m = lowerSourceModule(src)
+  assert(optCountOp(optFuncNamed(m, "g"), Op.GcAlloc) == 1)
+  assert(optCountOp(optFuncNamed(m, "g"), Op.FieldGet) == 1)
+  optimizeModule(m, false)
+  let post = optFuncNamed(m, "g")
+  assert(optCountOp(post, Op.GcAlloc) == 1)
+  assert(optCountOp(post, Op.FieldGet) == 1)
+}
