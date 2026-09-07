@@ -34,16 +34,17 @@ table (this file's own header explains why: only fields a compiler-emitted
 literal actually writes, or that codegen must agree with the runtime on, are
 a real ABI data contract).
 
-`build_fake_layout_repo` gives each commit a distinct, explicit
-GIT_COMMITTER_DATE/GIT_AUTHOR_DATE (seconds apart) rather than relying on
-wall-clock time between back-to-back `git commit` calls: #4417 is the
-pre-existing bug this sidesteps -- `build_fake_repo` above has no such
-control, so its five commits can land in the same second-resolution
-timestamp, and `derive_base`'s `min(..., key=commit_time)` then breaks the
-tie by dict-iteration order instead of true chronological order
-(`test_derive_base_picks_the_earliest_across_symbols` is flaky on exactly
-this, independently of anything in this ticket).
+#4417: `commit()`/`merge()` below give every commit/merge a distinct,
+explicit GIT_AUTHOR_DATE/GIT_COMMITTER_DATE (a monotonic fake clock,
+`_next_fake_date`) rather than relying on wall-clock time between
+back-to-back `git` calls. On a fast machine `build_fake_repo`'s five commits
+could land in the same second-resolution timestamp, and `derive_base`'s
+`min(..., key=commit_time)` then broke the tie by dict-iteration order
+instead of true chronological order --
+`test_derive_base_picks_the_earliest_across_symbols` reproduced this on 3/3
+runs before the fix.
 """
+import os
 import subprocess
 import sys
 import tempfile
@@ -59,9 +60,48 @@ def run(argv, cwd):
     return subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, check=True)
 
 
+def run_env(argv, cwd, env):
+    return subprocess.run(
+        argv, cwd=str(cwd), capture_output=True, text=True, check=True, env={**os.environ, **env}
+    )
+
+
+# #4417: a monotonically increasing fake clock for every commit/merge this
+# file makes, so two commits made back-to-back never share a
+# second-resolution git timestamp -- see commit()'s own docstring for why
+# that matters.
+_FAKE_CLOCK = [1600000000]
+
+
+def _next_fake_date() -> str:
+    _FAKE_CLOCK[0] += 1
+    return f"{_FAKE_CLOCK[0]} +0000"
+
+
 def commit(repo, msg):
+    """#4417: explicit GIT_AUTHOR_DATE/GIT_COMMITTER_DATE, strictly
+    increasing per call (_next_fake_date), rather than relying on wall-clock
+    time between back-to-back `git commit` calls. On a fast machine all of
+    build_fake_repo's five commits can land in the same second-resolution
+    timestamp; derive_base's `min(..., key=commit_time)` then breaks the tie
+    by dict-iteration order instead of true chronological order, which is
+    exactly why test_derive_base_picks_the_earliest_across_symbols was
+    flaky (reproduced deterministically before this fix: FAIL on 3/3 runs)."""
+    date = _next_fake_date()
     run(["git", "add", "-A"], repo)
-    run(["git", "commit", "-q", "-m", msg], repo)
+    run_env(["git", "commit", "-q", "-m", msg], repo, {"GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date})
+    return run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
+
+
+def merge(repo, msg, branch):
+    """Mirrors commit() -- same dated-clock fix, for the one `git merge`
+    build_fake_repo/build_fake_layout_repo each make."""
+    date = _next_fake_date()
+    run_env(
+        ["git", "merge", "-q", "--no-ff", "-m", msg, branch],
+        repo,
+        {"GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date},
+    )
     return run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
 
 
@@ -99,8 +139,7 @@ def build_fake_repo(tmp):
     other.write_text("// nothing exported here\n")
     commit(repo, "side: touch an unrelated file")
     run(["git", "checkout", "-q", "main"], repo)
-    run(["git", "merge", "-q", "--no-ff", "-m", "F2: merge side (touches neither x.bit nor y.bit)", "side"], repo)
-    f2 = run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
+    f2 = merge(repo, "F2: merge side (touches neither x.bit nor y.bit)", "side")
 
     write_symbol(repo, "root/x.bit", "bit_rt_foo", 3)
     f3 = commit(repo, "F3: bit_rt_foo gains a param (arity 3)")
@@ -116,34 +155,6 @@ def check(desc, cond):
     return True
 
 
-def run_env(argv, cwd, env):
-    import os
-
-    return subprocess.run(
-        argv, cwd=str(cwd), capture_output=True, text=True, check=True, env={**os.environ, **env}
-    )
-
-
-def commit_dated(repo, msg, ts):
-    """Like commit() above, but with an explicit, non-wall-clock
-    GIT_AUTHOR_DATE/GIT_COMMITTER_DATE -- see this file's header on why the
-    layout fixtures need this and the arity ones (above) do not (#4417)."""
-    date = f"{ts} +0000"
-    run(["git", "add", "-A"], repo)
-    run_env(["git", "commit", "-q", "-m", msg], repo, {"GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date})
-    return run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
-
-
-def merge_dated(repo, msg, branch, ts):
-    date = f"{ts} +0000"
-    run_env(
-        ["git", "merge", "-q", "--no-ff", "-m", msg, branch],
-        repo,
-        {"GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date},
-    )
-    return run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
-
-
 def write_layout_const(repo, rel_path, name, value):
     p = repo / "runtime" / rel_path
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -156,38 +167,36 @@ def build_fake_layout_repo(tmp):
     NEITHER gc.bit NOR root.bit) -> F3 (gcHeaderSize 16, parent F2).
 
     Mirrors build_fake_repo's shape exactly (same #4064-shaped merge-commit
-    trap for `find_boundary_commit`) but for named layout constants: the
-    dump driver (`./make dump-layout-consts`) only recognises the FIXED
-    table `tools/build/abilayout.bit`'s `abiLayoutConsts()` declares, not an
-    arbitrary name, so `gcHeaderSize`/`gc/gc.bit` and
-    `slcHeaderSize`/`root/root.bit` (both real entries) stand in for the
-    fake `bit_rt_foo`/`bit_rt_bar` symbols above."""
+    trap for `find_boundary_commit`, same dated-clock fix, #4417) but for
+    named layout constants: the dump driver (`./make dump-layout-consts`)
+    only recognises the FIXED table `tools/build/abilayout.bit`'s
+    `abiLayoutConsts()` declares, not an arbitrary name, so
+    `gcHeaderSize`/`gc/gc.bit` and `slcHeaderSize`/`root/root.bit` (both real
+    entries) stand in for the fake `bit_rt_foo`/`bit_rt_bar` symbols above."""
     repo = Path(tmp) / "repo"
     repo.mkdir()
     run(["git", "init", "-q", "-b", "main"], repo)
     run(["git", "config", "user.email", "test@test"], repo)
     run(["git", "config", "user.name", "test"], repo)
 
-    t = 1700000000
-
     write_layout_const(repo, "root/root.bit", "slcHeaderSize", 40)
-    g0 = commit_dated(repo, "G0: slcHeaderSize = 40", t)
+    g0 = commit(repo, "G0: slcHeaderSize = 40")
 
     write_layout_const(repo, "gc/gc.bit", "gcHeaderSize", 32)
-    f1 = commit_dated(repo, "F1: add gc.bit (gcHeaderSize = 32)", t + 10)
+    f1 = commit(repo, "F1: add gc.bit (gcHeaderSize = 32)")
 
     write_layout_const(repo, "root/root.bit", "slcHeaderSize", 48)
-    g1 = commit_dated(repo, "G1: slcHeaderSize gains a field (40 -> 48)", t + 20)
+    g1 = commit(repo, "G1: slcHeaderSize gains a field (40 -> 48)")
 
     run(["git", "checkout", "-q", "-b", "side"], repo)
     other = repo / "runtime" / "unrelated.bit"
     other.write_text("// nothing exported here\n")
-    commit_dated(repo, "side: touch an unrelated file", t + 30)
+    commit(repo, "side: touch an unrelated file")
     run(["git", "checkout", "-q", "main"], repo)
-    f2 = merge_dated(repo, "F2: merge side (touches neither gc.bit nor root.bit)", "side", t + 40)
+    f2 = merge(repo, "F2: merge side (touches neither gc.bit nor root.bit)", "side")
 
     write_layout_const(repo, "gc/gc.bit", "gcHeaderSize", 16)
-    f3 = commit_dated(repo, "F3: gc header shrinks 32 -> 16", t + 50)
+    f3 = commit(repo, "F3: gc header shrinks 32 -> 16")
 
     return repo, {"g0": g0, "f1": f1, "g1": g1, "f2": f2, "f3": f3}
 
