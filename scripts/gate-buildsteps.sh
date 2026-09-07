@@ -119,7 +119,20 @@ case "${BUCKET}" in
     # compiler/*.bit file on merged `main` with every branch green before this
     # was caught. Same "examines this bucket's content directly" reason as
     # test-lint-filelines/test-selfhostcheck/test-selfcheck above.
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-fmt-strict)
+    #
+    # #4454's env-scope audit found nine more gates in the identical shape,
+    # each with a compiler/** component to its scope: test-lint-self
+    # (_tests_/bit/lintself.bit scans compiler/+stdlib/+runtime/, #4448),
+    # test-lint-complexity and test-lint-sweep (both scan the same
+    # ["runtime","compiler","stdlib","tools","pkg"], #4448/#4449),
+    # test-threadtokenbytes (compiler/arm64call.bit + compiler/x64call.bit +
+    # runtime/gc/*/gcthread.bit cross-tree agreement, #4452), test-version-cli
+    # (compiler/version.bit, #4452), test-fmt-citations (compiler/fmt*.bit
+    # citations in spec/FMT.md, #4453), and test-fmt-roundtrip (compiler/**'s
+    # formatter must round-trip all nine corpus trees, #4451, wired here only
+    # — see that ticket's own comment for why the other eight trees are not
+    # wired the same way).
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did
@@ -155,7 +168,14 @@ case "${BUCKET}" in
     # test-fmt-strict (#4445): same env-declared-scope gap as the selfhost
     # bucket above — BIT_FMTZERO_TREES names `runtime` alongside `compiler`
     # and `tools`, so a runtime/**-only change owes it too.
-    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-fmt-strict)
+    #
+    # test-lint-self and test-lint-complexity (#4448) both scan runtime/
+    # directly (same #4454 audit as test-fmt-strict above); test-lint-sweep
+    # (#4449) too, same shape as test-lint-filelines/test-lint-runtime just
+    # above it; test-threadtokenbytes (#4452) checks runtime/gc/*/gcthread.bit
+    # against compiler/{arm64,x64}call.bit, so a runtime-only edit to the asm
+    # side of that pair owes it exactly as much as a compiler-only edit does.
+    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes)
     ;;
   testcases)
     # test-fuzz mutates the real _tests_/cases corpus (BIT_FUZZ_CASES=
@@ -165,7 +185,11 @@ case "${BUCKET}" in
     # against its own new/changed seeds (#2962). exclusive: true in gates.bit,
     # same as this bucket's existing test-stress-exclusive, so mixing it in
     # here is already a proven shape.
-    BUILD_STEPS=(test-golden test-fuzz)
+    #
+    # test-fmt-cases (#4447) declares BIT_FMTZERO_TREES=cases:_tests_/cases —
+    # this bucket's own tree, by name — so a _tests_/cases/**-only change
+    # owes it the same way it owes test-golden/test-fuzz above.
+    BUILD_STEPS=(test-golden test-fuzz test-fmt-cases)
     ;;
   examples)
     # test-fmt's argv literally includes "${repoRoot()}/examples" alongside
@@ -183,7 +207,11 @@ case "${BUCKET}" in
     # test-packages (#3271) too, same reason as the selfhost/runtime buckets
     # above: stdlib/** can break every package even though no package
     # imports it directly by name — every package still builds against it.
-    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages)
+    #
+    # test-lint-self, test-lint-complexity and test-lint-sweep (#4448/#4449)
+    # all scan stdlib/ directly, same #4454 audit as the selfhost/runtime
+    # buckets above.
+    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages test-lint-self test-lint-complexity test-lint-sweep)
     ;;
   docs)
     # test-stdlib-docs reads docs/stdlib/*.md directly (BIT_DOCS_ROOT — it

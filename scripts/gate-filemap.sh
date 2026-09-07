@@ -226,8 +226,12 @@ gates_for_file() {
       # same reason: `_tests_/stress` has no `runArgs()` entry anywhere in
       # gates.bit, so it never appears in the list that guard probes. (#2977)
       # test-stress-batch deliberately excluded — see the header comment
-      # above `gates_for_file()` (#3319/#3309).
-      printf 'test-stress-exclusive\n'
+      # above `gates_for_file()` (#3319/#3309). test-fmt-stress (#4447) is
+      # this tree's OWN gate too — its scope is BIT_FMTZERO_TREES=
+      # stress:_tests_/stress (tools/build/gatestable2.bit), an env entry
+      # naming this exact directory, so a _tests_/stress/**-only diff owes it
+      # the same way it owes test-stress-exclusive.
+      printf 'test-stress-exclusive\ntest-fmt-stress\n'
       return 0
       ;;
     _tests_/bit/abimembers/*) printf 'test-abimembers\n'; return 0 ;;
@@ -357,6 +361,12 @@ assert_dirgates_current() {
 }
 assert_dirgates_current
 
+# envscoped_gate_trees(), envscope_bucket_for_tree() and
+# assert_envscoped_gates_current() (#4454, the env-entry half of the
+# argv/env rule gate.sh's header states) live in scripts/gate-envscope.sh, a
+# sibling sourced right after scripts/gate-buildsteps.sh — this file had no
+# room left under its own 800-line ceiling for that ~150-line addition.
+
 # Space-joined, de-duplicated union of `gates_for_file` over every path in
 # space-separated `$1`. Prints "" the moment ANY path fails to map to a gate —
 # a partial guess is worse than `full`, so one unmapped file poisons the set.
@@ -388,12 +398,20 @@ testsbit_steps_for() {
   # excluded here — this loop only ever reaches this point once every file in
   # `files` mapped successfully (the empty-return above already covers a
   # partial/unmapped set), so it is safe to unconditionally add.
+  #
+  # test-fmt-testsbit (#4447, BIT_FMTZERO_TREES=testsbit:_tests_/bit) shares
+  # this exact _tests_/bit/* scope, so it is unioned in the SAME loop rather
+  # than a second one over the same file list.
   for f in ${files}; do
     case "${f}" in
       _tests_/bit/*)
         case " ${out} " in
           *" test-filesize "*) ;;
           *) out="${out:+${out} }test-filesize" ;;
+        esac
+        case " ${out} " in
+          *" test-fmt-testsbit "*) ;;
+          *) out="${out:+${out} }test-fmt-testsbit" ;;
         esac
         ;;
     esac
@@ -406,12 +424,20 @@ testsbit_steps_for() {
   # gates_for_file() so assert_dirgates_current() keeps probing the
   # UNMODIFIED per-file mapping, and only after the loop above has already
   # proven every file in `files` mapped successfully.
+  #
+  # test-lint-tests (#4450) sweeps the identical three trees
+  # (_tests_/bit/lintTests.bit's own dirNames), so it is unioned in the SAME
+  # loop too.
   for f in ${files}; do
     case "${f}" in
       _tests_/bit/*|_tests_/imports/*|_tests_/stress/*)
         case " ${out} " in
           *" test-lint-filelines "*) ;;
           *) out="${out:+${out} }test-lint-filelines" ;;
+        esac
+        case " ${out} " in
+          *" test-lint-tests "*) ;;
+          *) out="${out:+${out} }test-lint-tests" ;;
         esac
         ;;
     esac
