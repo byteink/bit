@@ -4,6 +4,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"runtime"
 	"strings"
 )
 
@@ -39,4 +41,18 @@ func main() {
 	joinedLen := int64(len(joined))
 
 	fmt.Printf("%d %d %d\n", total, matches, joinedLen)
+	reportAllocs()
+}
+
+// BENCH_ALLOC_STATS=1 prints this run's heap allocation count on stderr, so
+// bench/run.sh can compare it against the Bit and C sides of the same case
+// (#3934). Off by default and after all timed work, so a measured run pays
+// nothing for it.
+func reportAllocs() {
+	if os.Getenv("BENCH_ALLOC_STATS") == "" {
+		return
+	}
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	fmt.Fprintf(os.Stderr, "[allocs] %d\n", ms.Mallocs)
 }

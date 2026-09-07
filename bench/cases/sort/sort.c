@@ -5,6 +5,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+// See bench/cases/alloc/alloc.c's copy: -DBENCH_ALLOC_STATS builds a
+// counting copy that prints this run's malloc count on stderr for
+// bench/run.sh's cross-language comparison (#3934). The timed binary is
+// built without it and is byte-for-byte the program below.
+#ifdef BENCH_ALLOC_STATS
+static long nmalloc = 0;
+#define malloc(n) (nmalloc++, malloc(n))
+#define REPORT_ALLOCS() fprintf(stderr, "[allocs] %ld\n", nmalloc)
+#else
+#define REPORT_ALLOCS() ((void)0)
+#endif
+
 static long mix(long i) { return ((i + 1) * 2654435761L) % 2147483647L; }
 
 static int cmpI64(const void *a, const void *b) {
@@ -68,6 +80,7 @@ int main(void) {
   }
 
   printf("%ld %s %ld %s\n", checksum1, sortedOk1 ? "true" : "false", checksum2, sortedOk2 ? "true" : "false");
+  REPORT_ALLOCS();
 
   free(xs);
   for (long i = 0; i < m; i++) free(ss[i]);

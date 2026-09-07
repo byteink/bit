@@ -9,6 +9,18 @@
 #include <stdlib.h>
 #include <stdint.h>
 
+// See bench/cases/alloc/alloc.c's copy: -DBENCH_ALLOC_STATS builds a
+// counting copy that prints this run's malloc count on stderr for
+// bench/run.sh's cross-language comparison (#3934). The timed binary is
+// built without it and is byte-for-byte the program below.
+#ifdef BENCH_ALLOC_STATS
+static long nmalloc = 0;
+#define calloc(n, s) (nmalloc++, calloc(n, s))
+#define REPORT_ALLOCS() fprintf(stderr, "[allocs] %ld\n", nmalloc)
+#else
+#define REPORT_ALLOCS() ((void)0)
+#endif
+
 typedef struct { int64_t key, val; int8_t state; } Slot; // 0=empty,1=live,2=tombstone
 
 static Slot *table;
@@ -98,6 +110,7 @@ int main(void) {
   }
 
   printf("%lld %lld %lld %lld\n", (long long)sum1, (long long)remaining, (long long)sum2, (long long)live);
+  REPORT_ALLOCS();
   free(table);
   return 0;
 }

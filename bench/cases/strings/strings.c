@@ -4,6 +4,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+// See bench/cases/alloc/alloc.c's copy: -DBENCH_ALLOC_STATS builds a
+// counting copy that prints this run's malloc count on stderr for
+// bench/run.sh's cross-language comparison (#3934). The timed binary is
+// built without it and is byte-for-byte the program below.
+#ifdef BENCH_ALLOC_STATS
+static long nmalloc = 0;
+#define malloc(n) (nmalloc++, malloc(n))
+#define realloc(p, n) (nmalloc++, realloc(p, n))
+#define REPORT_ALLOCS() fprintf(stderr, "[allocs] %ld\n", nmalloc)
+#else
+#define REPORT_ALLOCS() ((void)0)
+#endif
+
 static long mix(long i) { return ((i + 1) * 2654435761L) % 2147483647L; }
 
 typedef struct { char *buf; size_t len, cap; } Buf;
@@ -49,6 +62,7 @@ int main(void) {
   long joinedLen = (long)strlen(joined);
 
   printf("%ld %ld %ld\n", total, matches, joinedLen);
+  REPORT_ALLOCS();
   free(b.buf);
   free(joined);
   return 0;

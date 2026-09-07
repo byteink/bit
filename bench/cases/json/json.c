@@ -7,6 +7,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+// See bench/cases/alloc/alloc.c's copy: -DBENCH_ALLOC_STATS builds a
+// counting copy that prints this run's malloc count on stderr for
+// bench/run.sh's cross-language comparison (#3934). The timed binary is
+// built without it and is byte-for-byte the program below.
+#ifdef BENCH_ALLOC_STATS
+static long nmalloc = 0;
+#define malloc(n) (nmalloc++, malloc(n))
+#define calloc(n, s) (nmalloc++, calloc(n, s))
+#define realloc(p, n) (nmalloc++, realloc(p, n))
+#define REPORT_ALLOCS() fprintf(stderr, "[allocs] %ld\n", nmalloc)
+#else
+#define REPORT_ALLOCS() ((void)0)
+#endif
+
 typedef enum { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ } JType;
 typedef struct JVal JVal;
 typedef struct { char *key; JVal *val; } JEntry;
@@ -217,6 +231,7 @@ int main(void) {
   }
 
   printf("%ld %ld %ld %ld\n", idSum, tagSum, activeCount, nameLenSum);
+  REPORT_ALLOCS();
   free(buf);
   return 0;
 }
