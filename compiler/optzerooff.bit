@@ -1,0 +1,319 @@
+// compiler/optzerooff.bit — #4428: a slice header whose `off` word is provably
+// zero, and the `field_get %h[16]` loads that fact turns into a constant.
+// Split out of opt.bit the way optparams.bit was (#1503) — same module, so
+// nothing here needs an import.
+//
+// runtime/ABI.md §2 fixes the dynamic-slice header as
+// `{ buf@+0, len@+8, off@+16, cap@+24, is_ref@+32 }` and an element address as
+// `buf[off + index]`, so every indexed access lowers to a load of `off` plus an
+// add (`emitSliceElemAddr`, loweraccess.bit; also `lowerPtrOf` in lowerprim.bit
+// and `emitAppendFastStore` in optappend.bit). Over a slice that was never
+// resliced both are pure overhead: `bench/cases/matrix`'s innermost loop spends
+// 4 of its 28 instructions on two such pairs, and — because the two `off`
+// values are then live across the back-edge safepoint poll — two of the ten
+// callee-saved registers the loop is allocated out of (#4366, #4429).
+//
+// WHY `off == 0` IS A PROPERTY OF THE OBJECT, not merely of one read. `slcOff`
+// is written in exactly four places in the whole runtime tree
+// (`git grep -n 'storeWord(.*slcOff' runtime/`):
+//
+//   slices.bit:306  rtSliceNew        stores 0 unconditionally, on a FRESH header
+//   slices.bit:387  rtSliceAppend     stores 0 when a grow reallocates the buffer
+//   slices.bit:464  rtSliceAppendStr  the same
+//   slices.bit:638  rtSliceSlice      stores `off + lo` into `nh`, a header it
+//                                     has just allocated — the RESLICED source
+//                                     header is never written
+//
+// So the only writes an existing header can ever see set `off` to 0, and a
+// reslice creates a new object rather than mutating the old one. A header that
+// starts at `off == 0` stays there for its whole lifetime, which is what makes
+// this a fact about a VALUE rather than about a program point: no intervening
+// call, allocation, safepoint or aliasing store can invalidate it, so nothing
+// here needs a memory model.
+//
+// A NULL HEADER IS ALSO ZERO, which is why nothing below tests for one.
+// `field_get %h[16]` on a slice goes through codegen's null-safe header path
+// (`emitHeaderWordOrZero`), which answers 0 for a null receiver — the same
+// answer this pass folds to.
+//
+// WHAT THIS PASS MUST NOT DO, and does not: fold `off` into `buf`.
+// runtime/ABI.md:261-264 keeps `buf` a base pointer precisely so that "no
+// interior pointer is ever stored as a GC reference". Replacing a LOAD with the
+// constant 0 stores nothing and moves no pointer; a folded base would be an
+// interior pointer and a collector bug.
+//
+// THE FACT IS STATED ON THE IR VALUE, not derived at lowering (#4428's second
+// design question). Deriving it at lowering can only see a receiver that is
+// syntactically a fresh `[]T(n)`, and matrix's three slices reach their index
+// sites through a `let` binding and three nested loop headers — which lowering
+// spells as block params, whose incoming edges lowering has not emitted yet.
+// Stated here it is a two-line meet over those edges, and it reaches every
+// consumer of the header word rather than one lowering site.
+
+// The `off` word's byte offset in a dynamic-slice header (runtime/ABI.md §2),
+// spelled the same way `emitSliceElemAddr`, `lowerPtrOf` and
+// `emitAppendFastStore` already spell it at their own emission sites.
+const sliceOffWord: int = 16
+
+// Whether `ty` is a dynamic slice. Every rule below is gated on this: offset 16
+// is `off` only in a slice header — in any other class it is simply the third
+// word, and folding THAT to zero would be a miscompile.
+fn zeroOffIsSliceTy(ctx: TypeContext, ty: int): bool {
+  return ctx.types[ty].kind == TypeKind.Slice
+}
+
+// The runtime call that MINTS a zero-offset header. `rtSliceNew` stores 0 into
+// `slcOff` on every path (slices.bit:306), so its result needs no operand of
+// its own to be true — it is the pass's only unconditional source of the fact.
+// `[]T(n)`, `[]T(n, m)` and every slice literal lower to it.
+fn zeroOffIsSliceNew(ins: IrInstr): bool {
+  return ins.op == Op.RtCall && ins.name == "slice_new"
+}
+
+// The runtime calls that FORWARD the fact from their receiver. Both return
+// `appendTarget(h, ...)` — `h` itself, or a fresh `rtSliceNew` when `h` is null
+// — and then either leave `off` exactly as it was or reset it to 0 on a grow.
+// So the result is zero-off whenever `args[0]` is, and `args[0]` is the header
+// in both signatures (`slice_append(h, word, is_ref, elem_size)`,
+// `slice_append_str(h, s)`).
+fn zeroOffIsSliceAppend(ins: IrInstr): bool {
+  return ins.op == Op.RtCall && (ins.name == "slice_append" || ins.name == "slice_append_str")
+}
+
+// Whether `f` can possibly gain anything, asked before either per-instruction
+// array below is allocated. A function that mints no slice header has no source
+// for the fact at all, so every answer would be `false` — and that is the
+// overwhelming majority of functions in any module.
+fn zeroOffHasSource(f: IrFunc): bool {
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (zeroOffIsSliceNew(f.instrs[i])) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// The pass's working state. `zero[i]` is the current answer for value `i`;
+// `opt[i]` marks the values whose answer is a GUESS that the rounds below
+// refine downward. Everything not optimistic is already final — `true` for a
+// `slice_new`, `false` for everything else.
+class ZeroOffState {
+  zero: []bool,
+  opt: []bool,
+}
+
+// How many CFG edges enter each block. A block with none is either the entry
+// (whose params are the FUNCTION's parameters, and a caller may hand in any
+// reslice) or unreachable; neither may be guessed `true`, because "every
+// predecessor agrees" over an empty edge set is vacuously true — the same trap
+// `newParamAgree` (optparams.bit) documents.
+fn zeroOffInEdges(f: IrFunc): []int {
+  let n = []int(0)
+  let b = 0
+  while (b < len(f.blocks)) {
+    n = append(n, 0)
+    b = b + 1
+  }
+  b = 0
+  while (b < len(f.blocks)) {
+    let blk = f.blocks[b]
+    if (blk.instsLen != 0) {
+      let term = f.instrs[blk.instsStart + blk.instsLen - 1]
+      if (term.op == Op.Jump) {
+        n[term.ival] = n[term.ival] + 1
+      } else if (term.op == Op.Br) {
+        n[term.ival] = n[term.ival] + 1
+        n[term.ival2] = n[term.ival2] + 1
+      }
+    }
+    b = b + 1
+  }
+  return n
+}
+
+// Opens block `b`'s slice-typed params up to an optimistic `true`.
+fn zeroOffOpenParams(ctx: TypeContext, f: IrFunc, st: ZeroOffState, b: int) {
+  let blk = f.blocks[b]
+  let j = 0
+  while (j < blk.paramCount) {
+    let p = blk.instsStart + j
+    if (zeroOffIsSliceTy(ctx, f.instrs[p].ty)) {
+      st.opt[p] = true
+      st.zero[p] = true
+    }
+    j = j + 1
+  }
+}
+
+// THE ITERATION IS OPTIMISTIC, and it has to be. A pessimistic start — nothing
+// true until proven, the shape `markConstParams` uses — cannot converge on a
+// loop-carried value: matrix's `a`/`b`/`c` reach their uses through a header
+// param whose back edge passes a value that traces back to that same param, so
+// each waits on the other forever and the fact is never established. Starting
+// every slice-typed block param and every `slice_append` result at `true` and
+// only ever clearing entries makes this the greatest fixpoint instead, which is
+// the correct one for a safety property: the fact holds on the cycle exactly
+// when it holds on every entry into it and every step preserves it.
+fn zeroOffInit(ctx: TypeContext, f: IrFunc): ZeroOffState {
+  let st = ZeroOffState{ zero: []bool(0), opt: []bool(0) }
+  let i = 0
+  while (i < len(f.instrs)) {
+    let ins = f.instrs[i]
+    st.zero = append(st.zero, zeroOffIsSliceNew(ins))
+    st.opt = append(st.opt, false)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(f.instrs)) {
+    if (zeroOffIsSliceAppend(f.instrs[i]) && zeroOffIsSliceTy(ctx, f.instrs[i].ty)) {
+      st.opt[i] = true
+      st.zero[i] = true
+    }
+    i = i + 1
+  }
+  let inEdges = zeroOffInEdges(f)
+  // Block 0 is the entry (lowering opens it first), so it is skipped even when
+  // a back edge re-enters it.
+  let b = 1
+  while (b < len(f.blocks)) {
+    if (inEdges[b] > 0) {
+      zeroOffOpenParams(ctx, f, st, b)
+    }
+    b = b + 1
+  }
+  return st
+}
+
+// Folds one CFG edge — `target` and the argument list that edge passes — into
+// the target block's params, clearing any whose argument is not zero-off.
+// Returns whether anything was cleared. An edge passing fewer arguments than
+// the block declares is malformed IR (verify.bit rejects it); clear rather than
+// read past the end.
+fn zeroOffApplyEdge(f: IrFunc, st: ZeroOffState, target: int, args: []int): bool {
+  let blk = f.blocks[target]
+  let changed = false
+  let j = 0
+  while (j < blk.paramCount) {
+    let p = blk.instsStart + j
+    if (st.opt[p] && st.zero[p]) {
+      if (j >= len(args)) {
+        st.zero[p] = false
+        changed = true
+      } else if (!st.zero[args[j]]) {
+        st.zero[p] = false
+        changed = true
+      }
+    }
+    j = j + 1
+  }
+  return changed
+}
+
+// Feeds block `b`'s outgoing edges into the param states. Reads the terminator
+// exactly the way `computeReachable` and `applyBlockEdges` do, including the
+// empty-block guard: `instsStart + instsLen - 1` names the instruction BEFORE
+// an empty block, which is index -1 for block 0 (#2084).
+//
+// BOTH arms of a `br` are fed even when the condition is already a known
+// constant and one of them is about to be pruned — conservative in the safe
+// direction, since an extra edge can only clear a fact, never establish one.
+fn zeroOffApplyBlockEdges(f: IrFunc, st: ZeroOffState, b: int): bool {
+  let blk = f.blocks[b]
+  if (blk.instsLen == 0) {
+    return false
+  }
+  let term = f.instrs[blk.instsStart + blk.instsLen - 1]
+  if (term.op == Op.Jump) {
+    return zeroOffApplyEdge(f, st, term.ival, term.args)
+  }
+  if (term.op == Op.Br) {
+    let a = zeroOffApplyEdge(f, st, term.ival, term.thenArgs)
+    let c = zeroOffApplyEdge(f, st, term.ival2, term.elseArgs)
+    return a || c
+  }
+  return false
+}
+
+// Clears every `slice_append` result whose receiver has since been cleared.
+fn zeroOffRefineAppends(f: IrFunc, st: ZeroOffState): bool {
+  let changed = false
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (st.opt[i] && st.zero[i] && zeroOffIsSliceAppend(f.instrs[i])) {
+      let args = f.instrs[i].args
+      if (len(args) == 0) {
+        st.zero[i] = false
+        changed = true
+      } else if (!st.zero[args[0]]) {
+        st.zero[i] = false
+        changed = true
+      }
+    }
+    i = i + 1
+  }
+  return changed
+}
+
+// One refinement round over the whole function.
+fn zeroOffRound(f: IrFunc, st: ZeroOffState): bool {
+  let changed = false
+  let b = 0
+  while (b < len(f.blocks)) {
+    if (zeroOffApplyBlockEdges(f, st, b)) {
+      changed = true
+    }
+    b = b + 1
+  }
+  if (zeroOffRefineAppends(f, st)) {
+    changed = true
+  }
+  return changed
+}
+
+// Which values in `f` name a slice header whose `off` word is provably 0.
+//
+// Bounded, not an open-ended fixpoint: `zero` only ever loses entries, every
+// productive round clears at least one, and there are strictly fewer optimistic
+// entries than instructions. `len(f.instrs)` is therefore a statically provable
+// ceiling; in practice the `changed` early exit ends it after two rounds.
+fn zeroOffValues(ctx: TypeContext, f: IrFunc): []bool {
+  let st = zeroOffInit(ctx, f)
+  let rounds = 0
+  while (rounds < len(f.instrs)) {
+    if (!zeroOffRound(f, st)) {
+      return st.zero
+    }
+    rounds = rounds + 1
+  }
+  return st.zero
+}
+
+// Records `off == 0` into `known` for every `field_get %h[16]` whose receiver
+// is a provably zero-offset slice header. Nothing else changes: `foldIdentities`
+// then turns the `add %off, %index` that reads it into a copy of `%index`
+// (and `lowerPtrOf`'s `mul %off, stride` into 0, cascading through its own
+// `add`), and `deadCodeElim` drops the load — so this pass adds no CFG surgery
+// and no new instruction, it only writes one more entry into the SAME map
+// `foldIdentities`, `computeReachable` and `emitTranslated` already consult.
+//
+// An entry already `known` is left alone: a load whose value some earlier rule
+// pinned is that rule's to answer, and overwriting it here would let a
+// disagreement pass silently instead of being impossible.
+fn markZeroOffLoads(ctx: TypeContext, f: IrFunc, known: []ConstVal) {
+  if (!zeroOffHasSource(f)) {
+    return
+  }
+  let zero = zeroOffValues(ctx, f)
+  let i = 0
+  while (i < len(f.instrs)) {
+    let ins = f.instrs[i]
+    if (ins.op == Op.FieldGet && ins.ival == sliceOffWord && !known[i].known) {
+      if (zero[ins.lhs] && zeroOffIsSliceTy(ctx, f.instrs[ins.lhs].ty)) {
+        known[i] = intConst(0)
+      }
+    }
+    i = i + 1
+  }
+}
