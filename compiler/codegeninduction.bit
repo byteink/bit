@@ -1,0 +1,232 @@
+// Self-host: the loop-carried induction copy (#4427). Sibling .bit file of the
+// `compiler` module — see codegenlive.bit for the interval builder that calls
+// `addInductionCopyRoots`, and for `computeCopyRoots`, the #3738 pass this one
+// extends. Kept out of codegenlive.bit only because that file is at its size
+// limit; the two are one subject and are meant to be read together.
+
+// ===========================================================================
+// The loop-carried induction copy (#4427)
+// ===========================================================================
+//
+// `computeCopyRoots` above coalesces a param whose predecessors all pass ONE
+// value. A counted loop's induction variable is the case it cannot reach: the
+// entry edge passes `0` and the back edge passes `j + 1`, so the param and the
+// increment are two distinct vregs, and the back edge's parallel move emits a
+// real `mov`. In `bench/cases/matrix`'s inner loop that copy is one of the
+// nineteen instructions the taken path runs per iteration:
+//
+//     add  x22, x23, #0x1     <- j + 1, in a second register
+//     ...  back-edge poll ...
+//     mov  x23, x22           <- the copy this removes
+//     b    <header>
+//
+// Sharing one register here is NOT #3738's soundness argument, which is why
+// this is a separate pass rather than another refinement round: the two vregs
+// do not hold the same value. What makes it sound is that the increment
+// OVERWRITES the counter at the point the counter is last read, and every path
+// that leaves the loop leaves it from a point where the register still holds
+// the param. Four conditions, all checked below rather than assumed:
+//
+//   1. The increment is `Op.Add`/`Op.Sub` with the PARAM AS ITS LHS. Both
+//      backends fetch both operands before they write the destination
+//      (`emitBinaryInt`'s getInt/getInt/destInt; x64's `xIntAccMov`, whose
+//      `acc == src` branch is exactly this case and encodes nothing), so
+//      `add xd, xd, #1` is well defined. Requiring the LHS is what rules out
+//      x64's destructive `sub dst, rhs` shape, where a destination sharing the
+//      RHS would be read after it had already been written.
+//   2. NOTHING IN THE PARAM'S COPY CLASS IS READ BETWEEN THE INCREMENT AND THE
+//      BACK EDGE (`classReadAfter`). That range is the only place the register
+//      holds the incremented value while the loop is still running, so it is
+//      the only place a reader could get the wrong one — a `break` positioned
+//      after the increment that carries the counter out is exactly this, and is
+//      refused. A read at a LOWER position is safe (the increment has not run
+//      yet), and so is a read after the loop: control can only leave through a
+//      point already covered by this check or by the header's own test, and at
+//      both the register holds the param. The class, not just the param, is
+//      scanned because #3738 may already have merged the loop's exit param onto
+//      it — that alias holds the param's value by construction, so a read of
+//      it inside this range is the same hazard.
+//   3. The increment owns its location outright (its own root, no aliases of
+//      its own), so the merged range is exactly the union `mergeAliases`
+//      already computes for the param's class plus this one interval.
+//   4. Neither vreg is a GC reference, so no stack map gains, loses or moves an
+//      entry on account of the merge: the merged range publishes exactly what
+//      the two ranges published before, which is nothing.
+//
+// The merged range spans the back-edge poll, which `computeRegMasks` answers by
+// restricting it to `RegFile.pollSaved`. That restriction is new for the param
+// — its own range stopped before the poll, because the copy that wrote it ran
+// AFTER the poll — and it is the honest price: the counter now has to live in a
+// register the poll shim preserves. The increment it merges with was already
+// under that same restriction, so the pair costs one such register where it
+// used to cost one plus a second register of its own.
+
+// Everything the candidate predicates read, in one place: the function, its
+// final intervals, the copy roots the pass is extending, and the per-class
+// summary below. Grouped because five of them travel together through every
+// predicate here, and a parameter list that long is an E0202 finding.
+class IndCtx {
+  f: IrFunc,
+  intervals: []LiveInterval,
+  roots: []int,
+  aliases: []int,
+  hasRef: []bool,
+}
+
+// Per copy-class root: how many other vregs resolve to it, and whether any
+// member is a GC reference. Both are wanted for the same candidate, and one
+// pass over the vregs answers both.
+fn newIndCtx(f: IrFunc, intervals: []LiveInterval, roots: []int): IndCtx {
+  let aliases = []int(0)
+  let hasRef = []bool(0)
+  let i = 0
+  while (i < len(roots)) {
+    aliases = append(aliases, 0)
+    hasRef = append(hasRef, false)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(roots)) {
+    let r = roots[i]
+    if (r != i) {
+      aliases[r] = aliases[r] + 1
+    }
+    if (intervals[i].isRef) {
+      hasRef[r] = true
+    }
+    i = i + 1
+  }
+  return IndCtx{ f: f, intervals: intervals, roots: roots, aliases: aliases, hasRef: hasRef }
+}
+
+// The one back edge into `bi`, as its source block, or -1 when there is none or
+// more than one. Two latches would each carry their own increment, and only one
+// of them can have the param's register.
+fn soleBackEdgeSrc(inEdges: []IrEdge, bi: int): int {
+  let found = -1
+  let e = 0
+  while (e < len(inEdges)) {
+    if (isBackEdge(inEdges[e].src, bi)) {
+      if (found >= 0) {
+        return -1
+      }
+      found = inEdges[e].src
+    }
+    e = e + 1
+  }
+  return found
+}
+
+// Slot `k`'s argument on the edge closing the loop, or -1 when the terminator's
+// argument list is too short for the slot.
+fn backEdgeArg(inEdges: []IrEdge, bi: int, k: int): int {
+  let e = 0
+  while (e < len(inEdges)) {
+    let ed = inEdges[e]
+    if (isBackEdge(ed.src, bi)) {
+      if (k >= len(ed.args)) {
+        return -1
+      }
+      return ed.args[k]
+    }
+    e = e + 1
+  }
+  return -1
+}
+
+// Condition 1: `v` is `p + k` or `p - k` with the counter on the side both
+// backends read before they write. Bounds-checks `v` for every later predicate,
+// so it runs first.
+//
+// The LHS is compared against the copy CLASS, not against `p` itself, because a
+// nested loop reads its outer counter through the inner loop's exit param: in
+// `matrix`, `k = k + 1` sits in the j-loop's exit block and its operand is that
+// block's own param, which #3738 has already resolved to `p`. It holds `p`'s
+// value and shares `p`'s register, so `add reg, reg, #1` is the same
+// instruction either way — and requiring the bare param instead silently missed
+// every outer loop in the tree.
+fn inductionIncrement(cx: IndCtx, p: int, v: int): bool {
+  if (v < 0 || v >= len(cx.f.instrs) || v == p) {
+    return false
+  }
+  let ins = cx.f.instrs[v]
+  if (ins.op != Op.Add && ins.op != Op.Sub) {
+    return false
+  }
+  return inductionInClass(cx, ins.lhs, p)
+}
+
+// Is `u` the class root `p` itself, or one of the vregs #3738 resolved onto it?
+fn inductionInClass(cx: IndCtx, u: int, p: int): bool {
+  return u == p || (u >= 0 && u < len(cx.roots) && cx.roots[u] == p)
+}
+
+// Conditions 3 and 4, plus the ordering the merge assumes: same class, no
+// reference anywhere in either class, the increment unaliased, and the param
+// defined before the increment which is itself before the back edge.
+fn inductionMergeable(cx: IndCtx, p: int, v: int, term: int): bool {
+  if (cx.roots[p] != p || cx.roots[v] != v || cx.aliases[v] != 0) {
+    return false
+  }
+  let ip = cx.intervals[p]
+  let iv = cx.intervals[v]
+  if (ip.regClass != iv.regClass || cx.hasRef[p] || cx.hasRef[v]) {
+    return false
+  }
+  return iv.start == v && ip.start < v && v < term
+}
+
+// Condition 2: does anything in `p`'s copy class get read at a position after
+// the increment and at or before the back edge? Bounded by the range, which is
+// inside one loop body.
+fn classReadAfter(cx: IndCtx, p: int, v: int, term: int): bool {
+  let q = v + 1
+  while (q <= term) {
+    let ops = instrOperands(cx.f, q)
+    let i = 0
+    while (i < len(ops)) {
+      if (inductionInClass(cx, ops[i], p)) {
+        return true
+      }
+      i = i + 1
+    }
+    q = q + 1
+  }
+  return false
+}
+
+// Adds every loop-carried induction copy to `roots`. Block 0 is skipped for
+// `refineCopyRoots`' reason: its params are the function's incoming arguments,
+// bound by the prologue out of ABI registers rather than by any edge move.
+fn addInductionCopyRoots(f: IrFunc, intervals: []LiveInterval, roots: []int): []int {
+  let cx = newIndCtx(f, intervals, roots)
+  let byTarget = indexEdges(f, collectEdges(f))
+  let bi = 1
+  while (bi < len(f.blocks)) {
+    let src = soleBackEdgeSrc(byTarget[bi], bi)
+    if (src >= 0) {
+      let term = f.blocks[src].instsStart + f.blocks[src].instsLen - 1
+      addInductionRootsForBlock(cx, byTarget[bi], bi, term)
+    }
+    bi = bi + 1
+  }
+  return roots
+}
+
+// One block's params. Split out of addInductionCopyRoots so neither half
+// carries both loops and the whole predicate chain.
+fn addInductionRootsForBlock(cx: IndCtx, inEdges: []IrEdge, bi: int, term: int) {
+  let b = cx.f.blocks[bi]
+  let k = 0
+  while (k < b.paramCount) {
+    let p = b.instsStart + k
+    let v = backEdgeArg(inEdges, bi, k)
+    if (inductionIncrement(cx, p, v) &&
+      inductionMergeable(cx, p, v, term) &&
+      !classReadAfter(cx, p, v, term)) {
+      cx.roots[v] = p
+      cx.aliases[p] = cx.aliases[p] + 1
+    }
+    k = k + 1
+  }
+}
