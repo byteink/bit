@@ -76,7 +76,11 @@ fn computeFuseCmpBranchForArm64(f: IrFunc, redundantBr: []bool): []bool {
   return computeFuseCmpBranchCore(f, redundantBr)
 }
 
-fn computeFuseCmpBranchCore(f: IrFunc, redundantBr: []bool): []bool {
+// The use count computeFuseCmpBranchCore fuses against: a redundant `br`
+// (below) contributes only its live edge's args, since emitBr never emits a
+// read of its own condition once marked. Split out so the counting loop's
+// own branching does not also count against the marking loop's complexity.
+fn countUsesForFuse(f: IrFunc, redundantBr: []bool): []int {
   let n = len(f.instrs)
   let useCount = []int(n)
   let i = 0
@@ -92,7 +96,12 @@ fn computeFuseCmpBranchCore(f: IrFunc, redundantBr: []bool): []bool {
     }
     i = i + 1
   }
-  let fuse = []bool(n)
+  return useCount
+}
+
+fn computeFuseCmpBranchCore(f: IrFunc, redundantBr: []bool): []bool {
+  let useCount = countUsesForFuse(f, redundantBr)
+  let fuse = []bool(len(f.instrs))
   let bi = 0
   while (bi < len(f.blocks)) {
     let b = f.blocks[bi]
@@ -148,6 +157,18 @@ fn computeFuseCmpBranchCore(f: IrFunc, redundantBr: []bool): []bool {
 // identical, already-branched-on condition value, never on a proof about the
 // index or length themselves.
 
+// Adds `target` to the certified set and the walk queue, but only when its
+// single predecessor is the block that just got certified — the one rule
+// `chainDominates` runs. Split out so the walk's own branching does not also
+// carry this condition's.
+fn certifyIfSinglePred(certified: []bool, predCount: []int, queue: []int, target: int): []int {
+  if (!certified[target] && predCount[target] == 1) {
+    certified[target] = true
+    queue = append(queue, target)
+  }
+  return queue
+}
+
 // Walks forward from `from`, certifying a block only when its single
 // predecessor is already certified, and reports whether `target` is ever
 // certified. Bounded by the block count: `certified` gates every enqueue, so
@@ -175,19 +196,10 @@ fn chainDominates(f: IrFunc, predCount: []int, fromBlock: int, targetBlock: int)
     }
     let term = f.instrs[b.instsStart + b.instsLen - 1]
     if (term.op == Op.Jump) {
-      if (!certified[term.ival] && predCount[term.ival] == 1) {
-        certified[term.ival] = true
-        queue = append(queue, term.ival)
-      }
+      queue = certifyIfSinglePred(certified, predCount, queue, term.ival)
     } else if (term.op == Op.Br) {
-      if (!certified[term.ival] && predCount[term.ival] == 1) {
-        certified[term.ival] = true
-        queue = append(queue, term.ival)
-      }
-      if (!certified[term.ival2] && predCount[term.ival2] == 1) {
-        certified[term.ival2] = true
-        queue = append(queue, term.ival2)
-      }
+      queue = certifyIfSinglePred(certified, predCount, queue, term.ival)
+      queue = certifyIfSinglePred(certified, predCount, queue, term.ival2)
     }
   }
   return false
@@ -232,24 +244,68 @@ fn computeRedundantBoundsBranch(f: IrFunc): []bool {
   let bi = 0
   while (bi < len(f.blocks)) {
     let b = f.blocks[bi]
-    if (b.instsLen > 0) {
-      let termIdx = b.instsStart + b.instsLen - 1
-      let term = f.instrs[termIdx]
-      if (term.op == Op.Br) {
-        let cond = term.lhs
-        if (firstBrOf[cond] == -1) {
-          firstBrOf[cond] = termIdx
-        } else {
-          let trueTarget = f.instrs[firstBrOf[cond]].ival
-          if (chainDominates(f, predCount, trueTarget, bi)) {
-            redundant[termIdx] = true
-          }
-        }
-      }
+    if (b.instsLen == 0) {
+      bi = bi + 1
+      continue
+    }
+    let termIdx = b.instsStart + b.instsLen - 1
+    let term = f.instrs[termIdx]
+    if (term.op != Op.Br) {
+      bi = bi + 1
+      continue
+    }
+    let cond = term.lhs
+    if (firstBrOf[cond] == -1) {
+      firstBrOf[cond] = termIdx
+      bi = bi + 1
+      continue
+    }
+    let trueTarget = f.instrs[firstBrOf[cond]].ival
+    if (chainDominates(f, predCount, trueTarget, bi)) {
+      redundant[termIdx] = true
     }
     bi = bi + 1
   }
   return redundant
+}
+
+// The panic/ELSE block of every `br` `redundantBr` marks — compileFunction's
+// block-emission loop skips these, and emitJumpOrFallThrough walks past them
+// when deciding whether a jump is a fall-through. Split out of
+// compileFunction (arm64compile.bit), which is already over this repo's own
+// complexity ceiling and must not grow further for this ticket's sake.
+fn computeDeadBoundsBlocks(f: IrFunc, redundantBr: []bool): []bool {
+  let deadBlock = []bool(len(f.blocks))
+  let i = 0
+  while (i < len(redundantBr)) {
+    if (redundantBr[i]) {
+      deadBlock[f.instrs[i].ival2] = true
+    }
+    i = i + 1
+  }
+  return deadBlock
+}
+
+// A dead block's instruction bound, narrowed to its own params so
+// compileFunction's inner loop (`idx < instsStart + effInstsLen[bi]`, arm64
+// compile.bit) runs it zero times — no debug row, no compileInst call, same
+// effect as skipping the block outright. Kept as its own array rather than an
+// `if (deadBlock[bi])` inside that loop: compileFunction is already the
+// worst-recorded E0204 debt in this tree (complexity-debt.txt), so a new
+// branch there would raise its baseline, which only a human may do.
+fn computeEffectiveInstsLen(f: IrFunc, deadBlock: []bool): []int {
+  let n = len(f.blocks)
+  let effLen = []int(n)
+  let bi = 0
+  while (bi < n) {
+    let b = f.blocks[bi]
+    effLen[bi] = b.instsLen
+    if (deadBlock[bi]) {
+      effLen[bi] = b.paramCount
+    }
+    bi = bi + 1
+  }
+  return effLen
 }
 
 // The condition `br` must branch on to take its ELSE edge, given the compare
