@@ -1,0 +1,260 @@
+// `./make test-walkbit-empty-scan` (#4433): `walkBit()`
+// (tools/build/artifacts.bit) used to turn ANY directory-scan failure into a
+// silently EMPTY file list — `walk(root) catch _ { return out }` — which
+// `fingerprint()`/`compilerHash()`/`stdlibHash()` then fold straight into a
+// content hash with no count check. A scan that cannot see the tree
+// degenerates the hash to a CONSTANT: "hash of nothing" every time, matching
+// whatever stamp was last written and reporting "up to date" forever
+// regardless of real source changes — the exact "stale compiler reports
+// itself current" danger this project has already paid for three times
+// (#2877, #3244, a reused $TMPDIR verdict).
+//
+// A build-succeeded check cannot see this: BOTH the broken and the working
+// path can print "up to date". So this gate distinguishes WHICH outcome
+// happened — a loud refusal vs a silent pass — never just an exit code.
+//
+// PROVEN as the real failure shape, not assumed: chmod 000 on `tools/build`
+// makes `fsIsDir("tools/build")` false (`readDir`'s own "not a directory:"
+// error, `stdlib/fs/fs.bit:479`), so `walk("tools/build")` throws exactly
+// where `walkBit`'s `catch` sits — the same class the ticket's hypothesis
+// named for `walk("compiler")`. Mutation-controlled on the PRE-#4433 code:
+// with `tools/build` chmod 000, `./make selfhost` proceeded SILENTLY (no
+// complaint, exit 0), wrote a stamp with `tools/build/`'s share of
+// `fingerprint()` missing, and — with `tools/build` still unreadable — a
+// REAL edit to `tools/build/defs.bit` afterward was completely invisible: a
+// second run reported "up to date" against genuinely different content.
+//
+// `tools/build` (not `compiler`/`runtime`/`stdlib`) is the directory this
+// gate breaks because it is the one `walkBit` root neither `stage0 build
+// compiler` nor `g2archive.sh` needs to READ to do their own work — breaking
+// it exercises exactly `fingerprint()`'s `sourceFiles()` path with no other
+// step failing for an unrelated reason first.
+//
+// Deliberately NOT in gateSteps(): chmods a real directory in BIT_REPO,
+// briefly, which would corrupt a concurrent gate's own view of it if this
+// ran inside the default concurrent batch — same reason
+// _tests_/bit/stdlibrebuild.bit and _tests_/bit/stage0override.bit are kept
+// out; not part of `test`, run explicitly.
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile } from "std/fs"
+import { contains, parseInt } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "600")) catch _ {
+    600
+  }
+  if (s <= 0) {
+    return 600000
+  }
+  return s * 1000
+}
+
+// Set unconditionally by this gate's own `Gate{}` entry
+// (tools/build/gates.bit) — see _tests_/bit/coldboot.bit's `repoRoot` for why
+// a "." fallback would be the wrong kind of quiet default here.
+fn repoRoot(): string {
+  let r = env("BIT_REPO")
+  if (len(r) == 0) {
+    panic("walkbitcheck: BIT_REPO is not set — run this through `./make test-walkbit-empty-scan`")
+  }
+  return r
+}
+
+fn targetDir(root: string): string {
+  return "${root}/tools/build"
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s own mechanism channel (ABI.md §19), never a program's
+// exit status — same convention as _tests_/bit/stdlibrebuild.bit's `shell`.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700: owner rwx only
+    fail newError("walkbitcheck: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("walkbitcheck: TIMED OUT after ${ms}ms running a probe — a hang is a failure, not a stall")
+  }
+  if (code == -1) {
+    panic("walkbitcheck: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("walkbitcheck: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+// One `./make selfhost` invocation. Returns its own exit code (read from a
+// file, never inferred from the wrapper's) plus everything it printed —
+// same shape as _tests_/bit/stdlibrebuild.bit's `runSelfhost`.
+fn runSelfhost(scratch: string, root: string, ms: int, tag: string): (int, string) {
+  let outPath = "${scratch}/${tag}.out"
+  let codePath = "${scratch}/${tag}.code"
+  let script = "#!/bin/sh\n" +
+    "cd '${root}' || exit 90\n" +
+    "./make selfhost > '${outPath}' 2>&1\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let wrapperRc = shell("${scratch}/${tag}.sh", script, ms) catch e {
+    panic("walkbitcheck: ${e.message()}")
+  }
+  if (wrapperRc == 90) {
+    panic("walkbitcheck: cannot cd into ${root}")
+  }
+  if (wrapperRc != 0) {
+    panic("walkbitcheck: wrapper script exited ${wrapperRc}, which it never should")
+  }
+  let codeText = trimWs(
+    readFile(codePath) catch e {
+      panic("walkbitcheck: cannot read ${codePath}: ${e.message()}")
+    },
+  )
+  let code = parseInt(codeText) catch _ {
+    panic("walkbitcheck: ${codePath} did not contain a number: '${codeText}'")
+  }
+  let out = readFile(outPath) catch ""
+  return code, out
+}
+
+// chmod is a builtin taking a POSIX octal mode as a decimal int — 0 leaves
+// the target readable/writable/searchable by NOBODY, 0o755 (493) restores
+// owner rwx + group/other rx.
+fn breakDir(dir: string) {
+  if (fsChmod(dir, 0) != 0) {
+    panic("walkbitcheck: cannot chmod 000 ${dir} — cannot set up the probe")
+  }
+}
+
+fn restoreDir(dir: string) {
+  if (fsChmod(dir, 493) != 0) { // 0o755
+    panic("walkbitcheck: cannot restore ${dir} to 0755 — the tree is left broken, fix by hand")
+  }
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let root = repoRoot()
+  let dir = targetDir(root)
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-walkbitcheck-${uuidFormat(uuidV4())}"
+  mkdirScratch(scratch)
+
+  // See _tests_/bit/stdlibrebuild.bit's `main` for why restoration happens
+  // on an unconditional plain-return path rather than `defer` (does not run
+  // while a panic unwinds, #2501) or relying on `exit()` (never runs
+  // `defer` either, #3694): `probe` reports its verdict with a plain
+  // `return`, and `restoreDir` below runs regardless of which branch that
+  // took.
+  let probePassed = probe(scratch, root, dir, ms)
+  restoreDir(dir)
+  let settled = checkSettles(scratch, root, ms)
+  teardown(scratch, ms)
+  if (!probePassed || !settled) {
+    exit(1)
+  }
+  println("walkbitcheck: PASS — a broken tools/build/ scan is refused loudly, and the tree settles back to \"up to date\" once it is readable again")
+}
+
+// Both phases, returning whether they both held. `dir` is left BROKEN
+// (chmod 000) or RESTORED depending on where this returns — `main` restores
+// it unconditionally right after this call returns, by any path, same
+// shape as _tests_/bit/stdlibrebuild.bit's `probe`/`target`.
+fn probe(scratch: string, root: string, dir: string, ms: int): bool {
+  // Baseline: this gate's own deps (`selfhost`, `libbitrt`) just ran, so a
+  // fresh `./make selfhost` must report "up to date" against an untouched
+  // tree — otherwise the broken-scan phase below proves nothing.
+  let (baseCode, baseOut) = runSelfhost(scratch, root, ms, "baseline")
+  if (baseCode != 0) {
+    eprint(baseOut)
+    println("walkbitcheck: FAIL — baseline `./make selfhost` exited ${baseCode}, want 0")
+    return false
+  }
+  if (!contains(baseOut, "make: selfhost\nmake:   up to date\n")) {
+    eprint(baseOut)
+    println("walkbitcheck: FAIL — baseline `./make selfhost` did not report \"up to date\"; run `./make selfhost` once before this gate")
+    return false
+  }
+
+  // Break: tools/build/ becomes unreadable. A build that folds an empty
+  // scan straight into its fingerprint would proceed silently here; the
+  // fixed driver must refuse instead of ever reaching a verdict.
+  breakDir(dir)
+  let (brokenCode, brokenOut) = runSelfhost(scratch, root, ms, "broken")
+  if (brokenCode == 0) {
+    eprint(brokenOut)
+    println("walkbitcheck: FAIL — `./make selfhost` exited 0 with tools/build/ unreadable; an empty directory scan was silently treated as real content")
+    return false
+  }
+  if (contains(brokenOut, "up to date")) {
+    eprint(brokenOut)
+    println("walkbitcheck: FAIL — `./make selfhost` reported \"up to date\" with tools/build/ unreadable; the fingerprint silently hashed nothing")
+    return false
+  }
+  if (!contains(brokenOut, "walkBit:")) {
+    eprint(brokenOut)
+    println("walkbitcheck: FAIL — `./make selfhost` failed with tools/build/ unreadable, but not with walkBit's own refusal; something else broke first")
+    return false
+  }
+
+  return true
+}
+
+// Third phase, run by `main` only after `probe` returns and `dir` has been
+// restored — proves the refusal above left no corrupted stamp behind.
+fn checkSettles(scratch: string, root: string, ms: int): bool {
+  let (code, out) = runSelfhost(scratch, root, ms, "settled")
+  if (code != 0) {
+    eprint(out)
+    println("walkbitcheck: FAIL — `./make selfhost` exited ${code} after restoring tools/build/, want 0")
+    return false
+  }
+  if (!contains(out, "make: selfhost\nmake:   up to date\n")) {
+    eprint(out)
+    println("walkbitcheck: FAIL — `./make selfhost` did not settle back to \"up to date\" after restoring tools/build/; the refusal left a corrupted stamp")
+    return false
+  }
+  return true
+}
+
+fn mkdirScratch(scratch: string) {
+  let script = "#!/bin/sh\nmkdir -p '${scratch}'\n"
+  let rc = shell("${scratch}.sh", script, 5000) catch e {
+    panic("walkbitcheck: cannot create ${scratch}: ${e.message()}")
+  }
+  if (rc != 0) {
+    panic("walkbitcheck: mkdir -p ${scratch} exited ${rc}")
+  }
+}
+
+// std/fs has no recursive remove, so the scratch tree goes the way it
+// came — same reason _tests_/bit/stdlibrebuild.bit's teardown does.
+fn teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ {
+    return
+  }
+}
+
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}
