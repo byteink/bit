@@ -622,19 +622,29 @@ fn checkArm64MemFloat() {
 
 // #4430: computeRedundantBoundsBranch must refuse a second `br` on a shared
 // condition unless the FIRST `br`'s TRUE edge is provably the only way in.
-// Every real occurrence of two `br`s sharing one condition id in this
-// compiler today comes from `emitBoundsCheck` being called twice against the
-// same operands in straight-line code (loweraccess.bit), which is always the
-// true-edge shape checkTrueEdgeIsRedundant below builds. A hand-built
-// false-edge shape is the only way to exercise the negative case at all: no
-// source program can produce it, because every value carried across a block
-// boundary in this front end is renamed to a fresh block-param id (SPEC's
-// block-threaded SSA), and CSE (optcse.bit) unifies only identical operand
-// IDS, never renamed-but-equal ones — so id-sharing across the FALSE edge is
-// unreachable from source, not merely rare. That makes this hand-built IR the
-// only mutation-proof available for `chainDominates`: breaking it (e.g.
-// returning `true` unconditionally) is invisible to every corpus this repo
-// can compile and is caught ONLY here.
+//
+// #4461 REPLACED THE SOUNDNESS ARGUMENT THAT USED TO STAND HERE, because
+// both halves of it were false and it explained why a live miscompile could
+// not happen. It claimed (a) every two `br`s sharing one condition id come
+// from `emitBoundsCheck` being called twice in straight-line code
+// (loweraccess.bit), and (b) no source program can share a condition id
+// across a block boundary at all, since "every value carried across a block
+// boundary is renamed to a fresh block-param id". Neither holds. There are at
+// least three producers, not one: `emitBoundsCheck`'s double call,
+// `emitInlineStringSlice` (lowerreslice.bit), which points BOTH of its bounds
+// `br`s at one shared `oob` block on purpose, and plain `&&` under an
+// enclosing `if` on the same value (lowercond.bit). And ids are plainly NOT
+// all renamed — `if (c) { if (c && x) ... }` lowers to `bb0: br %3, ...` and
+// `bb1: br %3, ...`, the same `%3` read by both, which is exactly what makes
+// the analysis fire on ordinary source.
+//
+// So these checks stand on what they assert directly, not on a reachability
+// argument: they pin `chainDominates`'s contract (fold only across a TRUE
+// edge) and `computeDeadBoundsBlocks`'s (kill only a single-predecessor
+// block). Hand-built IR is used because it is the only way to state a
+// negative case as an assertion instead of hoping a corpus contains one —
+// breaking either predicate (e.g. returning `true` unconditionally) still
+// compiles every program in this repo, and is caught ONLY here.
 fn checkRedundantBoundsBranchFalseEdge() {
   let ctx = newTypeContext()
   // The exact type id is irrelevant here — computeRedundantBoundsBranch reads
@@ -705,4 +715,72 @@ fn checkRedundantBoundsBranchFalseEdge() {
   }
   let redundantT = computeRedundantBoundsBranch(ft)
   assert(redundantT[3], "FALSEEDGE-2: br2 reached only via br1's TRUE edge must fold")
+}
+
+// #4461: folding a redundant `br` is one fact; killing the block on its else
+// edge is a second, stronger one. `redundantBr[i]` licenses only the folded
+// br's OWN edge, so a block with another predecessor still runs, and
+// narrowing it to `paramCount` drops its terminator — after which
+// emitJumpOrFallThrough walks past it and the surviving edge falls through
+// into the next LIVE block. Silent, exit 0.
+//
+// The shape below is `if (c) { if (c && x) ... }` reduced to its skeleton:
+// bb3 is the `&&` short-circuit join, reached BOTH by br1's else edge and by
+// bb2's jump, and its own `br %7` is the real `x` test. Both halves are
+// asserted on purpose — `deadBlock[3] == false` alone is satisfied by a
+// "fix" that simply stops folding anything, which would silently retire the
+// optimization instead of correcting it.
+fn checkDeadBoundsBlockNeedsSinglePred() {
+  let ctx = newTypeContext()
+  let boolt = ctx.voidId
+
+  // bb0: %0 = const_bool, br %0, bb1(), bb6()
+  // bb1: br %0, bb2(), bb3()   <- redundant (reached only via bb0's TRUE edge)
+  // bb2: jump bb3()            <- bb3's SECOND predecessor
+  // bb3(%4): br %4, bb4(), bb5()  <- the join; must NOT be marked dead
+  // bb4/bb5/bb6: ret
+  let cond = mkInstr(Op.ConstBool, boolt)
+  cond.bval = true
+  let br0 = mkInstr(Op.Br, ctx.voidId)
+  br0.lhs = 0
+  br0.ival = 1
+  br0.ival2 = 6
+  let br1 = mkInstr(Op.Br, ctx.voidId)
+  br1.lhs = 0
+  br1.ival = 2
+  br1.ival2 = 3
+  let jump2 = mkInstr(Op.Jump, ctx.voidId)
+  jump2.ival = 3
+  let p7 = mkInstr(Op.BlockParam, boolt)
+  let br3 = mkInstr(Op.Br, ctx.voidId)
+  br3.lhs = 4
+  br3.ival = 4
+  br3.ival2 = 5
+  let ret4 = mkInstr(Op.Ret, ctx.voidId)
+  let ret5 = mkInstr(Op.Ret, ctx.voidId)
+  let ret6 = mkInstr(Op.Ret, ctx.voidId)
+  let f = IrFunc{
+    name: "sharedJoin", paramTypes: []int(0), result: ctx.voidId,
+    blocks: [
+      IrBlock{ instsStart: 0, paramCount: 0, instsLen: 2 }, // bb0
+      IrBlock{ instsStart: 2, paramCount: 0, instsLen: 1 }, // bb1
+      IrBlock{ instsStart: 3, paramCount: 0, instsLen: 1 }, // bb2
+      IrBlock{ instsStart: 4, paramCount: 1, instsLen: 2 }, // bb3, the join
+      IrBlock{ instsStart: 6, paramCount: 0, instsLen: 1 }, // bb4
+      IrBlock{ instsStart: 7, paramCount: 0, instsLen: 1 }, // bb5
+      IrBlock{ instsStart: 8, paramCount: 0, instsLen: 1 }, // bb6
+    ],
+    instrs: [cond, br0, br1, jump2, p7, br3, ret4, ret5, ret6],
+    isFallible: false,
+  }
+  // The premise: bb3 really does have two predecessors in this shape, so a
+  // guard keyed on the predecessor count is being exercised and not skipped.
+  let predCount = computeBlockPredCounts(f)
+  assert(predCount[3] == 2, "SHAREDJOIN-0: bb3 must have two predecessors for this check to test anything")
+
+  let redundant = computeRedundantBoundsBranch(f)
+  assert(redundant[2], "SHAREDJOIN-1: br1 reached only via bb0's TRUE edge must still fold")
+
+  let deadBlock = computeDeadBoundsBlocks(f, redundant)
+  assert(!deadBlock[3], "SHAREDJOIN-2: bb3 has a second predecessor (bb2's jump) and must not be marked dead")
 }
