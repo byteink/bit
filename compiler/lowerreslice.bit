@@ -89,15 +89,30 @@ fn emitStringSliceOob(fc: FnCtx) {
 // #4407 made it a CHECKED invariant rather than only an argued one:
 // `stringViewBaseEscapesInFunc` (verify.bit) runs on the emit path for every
 // function and refuses to emit if the value stored into a string view's `base`
-// is not `isRefType`. It exists because #3901 (#4404 already, #4411 planned)
-// explodes `string` into independent `ptr`/`len`/`base` words, at which point
-// `s` here may stop being one ref-typed value — the exact failure this
-// function's whole design is built to rule out — and nothing else in the
-// suite would notice (#4406's own reasoning: the freed bytes are swept, not
-// necessarily reused, so the symptom is a wrong answer, not a crash). If this
-// function starts taking its receiver as separate exploded words instead of
-// one `recv`, feed whichever of those words is the traced root into `setBase`
-// below — the checker will refuse anything else.
+// is not `isRefType`. It exists because #3901 explodes `string` into
+// independent `ptr`/`len`/`base` words, at which point `s` here may stop being
+// one ref-typed value — the exact failure this function's whole design is
+// built to rule out — and nothing else in the suite would notice (#4406's own
+// reasoning: the freed bytes are swept, not necessarily reused, so the symptom
+// is a wrong answer, not a crash).
+//
+// #4422 IS THAT MOMENT, and the instruction the paragraph above left is what
+// this function now follows: when the receiver arrives as words, `setBase`
+// below is fed `words[2]`, the `base` word, which is the ONE ref-typed word of
+// the three (`stringWordTypes`, lowerexplodestr.bit) and the traced root the
+// interior `ptr` was derived from. `stringViewBaseEscapesInFunc` refuses
+// anything else, so this is a checked claim rather than an argued one.
+//
+// THE INTERIOR POINTER THEN PREDATES THE ALLOCATION, which is the one thing
+// the paragraph above says must not happen — and it is safe for a different
+// reason, not by the same one. `words[0]` was formed where the receiver was
+// bound and is untraced, so nothing but its backing staying alive keeps it
+// valid. `words[2]` is what keeps it alive, and the edge that forces that is
+// recorded rather than argued: `recordWordKeepAlive` (#4406) pairs every
+// untraced word with every traced one of the same aggregate, and
+// `extendKeepAlive` (codegenlive.bit) then holds the base's live interval open
+// to the end of the derived word's. That is exactly the case #4406 was built
+// for and #4425 owns proving with a mutant.
 //
 // NO WRITE BARRIER, for the reason #3108 established for the inline slice store:
 // `runtime/gc/gccollect.bit` is a full stop-the-world mark-sweep, there is no
@@ -113,12 +128,10 @@ fn emitStringSliceOob(fc: FnCtx) {
 // `riString` by ADDRESS: only `riRefArray` is a by-address sentinel
 // (runtime/root/root.bit's `ref_array_info` note), and a string view is never
 // allocated with it.
-fn emitInlineStringSlice(fc: FnCtx, recv: int, lo: int, hi: int, ty: int): int {
+fn emitInlineStringSlice(fc: FnCtx, sr: StringRecv, lo: int, hi: int, ty: int): int {
   let i64ty = primType(fc.c.ctx, 3)
   let boolty = primType(fc.c.ctx, 10)
-  let nIns = mkInstr(Op.SliceLen, i64ty)
-  nIns.lhs = recv
-  let n = builderEmit(fc.b, nIns)
+  let n = strRecvLen(fc, sr)
   // Minted before either is emitted, in the order they are emitted, so every
   // branch below targets a HIGHER id than the block it leaves.
   let chk2 = builderNewBlock(fc.b)
@@ -155,13 +168,8 @@ fn emitInlineStringSlice(fc: FnCtx, recv: int, lo: int, hi: int, ty: int): int {
   ga.ival = strViewHeaderSize()
   ga.offsets = [strViewBaseOffset()]
   let obj = builderEmit(fc.b, ga)
-  // `ptr` at +0, read null-safely (`isHeaderBase`, codegen.bit): a zeroed
-  // class's string field is the null word, and `strBytes` answers 0 for it.
-  let pIns = mkInstr(Op.FieldGet, i64ty)
-  pIns.lhs = recv
-  pIns.ival = 0
   let addIns = mkInstr(Op.Add, i64ty)
-  addIns.lhs = builderEmit(fc.b, pIns)
+  addIns.lhs = strRecvPtr(fc, sr)
   addIns.rhs = lo
   let setPtr = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
   setPtr.lhs = obj
@@ -181,7 +189,7 @@ fn emitInlineStringSlice(fc: FnCtx, recv: int, lo: int, hi: int, ty: int): int {
   let setBase = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
   setBase.lhs = obj
   setBase.ival = strViewBaseOffset()
-  setBase.rhs = recv
+  setBase.rhs = strRecvBase(sr)
   setBase.ival2 = primType(fc.c.ctx, 11)
   builderEmit(fc.b, setBase)
   return obj
@@ -276,6 +284,86 @@ fn strViewBaseOffset(): int {
   return 16
 }
 
+// A string reslice's RECEIVER, in whichever form this body already holds it.
+//
+// `handle` is the one boxed word every receiver has had until now. `words` is
+// non-empty only when the receiver is a plain name bound to an EXPLODED string
+// local (#4422) — `{ptr, len, base}`, in `stringWordTypes` order — and then
+// `handle` is 0 and no box is materialized at all.
+//
+// This is the whole of the producer flip. Without it, `localRead` rebuilds a
+// box for the receiver, `setBase` stores that box into the result's `base`
+// slot, and a stored value is an escape optalloc.bit refuses — so every
+// `s[lo:hi]` on an exploded local would pay an allocation the boxed form did
+// not, turning the flip into a regression rather than a win.
+class StringRecv {
+  handle: int,
+  words: []int,
+}
+
+// The receiver of `k[0]`, taking an exploded string local's words when it has
+// them. Only a plain `Tag.Ident` qualifies: every other expression form has to
+// be lowered to be evaluated at all, and an identifier is the one shape whose
+// evaluation emits nothing, so skipping `lowerExpr` for it cannot skip a side
+// effect. A captured-and-assigned name (§12.8) never reaches here as exploded
+// — `declareLetLocal` excludes it — so the cell's contents cannot be stale.
+fn lowerStringRecv(fc: FnCtx, node: int, isString: bool): StringRecv {
+  if (isString) {
+    let n = getNode(fc.c.tree, node)
+    if (n.tag == Tag.Ident) {
+      let slot = envIndex(fc, fc.c.source[n.span.start:n.span.end])
+      if (slot != -1 && bindIsExploded(fc.env[slot]) &&
+        fc.env[slot].ty == primType(fc.c.ctx, 11)) {
+        return StringRecv{ handle: 0, words: bindWordValues(fc.env[slot]) }
+      }
+    }
+  }
+  return StringRecv{ handle: lowerExpr(fc, node), words: []int(0) }
+}
+
+// `len(s)` for a receiver: the `len` word when there is one, else the same
+// null-safe `slice_len` on the handle that has always been emitted here.
+fn strRecvLen(fc: FnCtx, sr: StringRecv): int {
+  if (len(sr.words) != 0) {
+    return sr.words[1]
+  }
+  let ins = mkInstr(Op.SliceLen, primType(fc.c.ctx, 3))
+  ins.lhs = sr.handle
+  return builderEmit(fc.b, ins)
+}
+
+// `ptr(s)` for a receiver: the `ptr` word when there is one, else `field_get
+// %s[0]` read null-safely (`isHeaderBase`, codegen.bit) — a zeroed class's
+// string field is the null word, and `strBytes` answers 0 for it.
+fn strRecvPtr(fc: FnCtx, sr: StringRecv): int {
+  if (len(sr.words) != 0) {
+    return sr.words[0]
+  }
+  let ins = mkInstr(Op.FieldGet, primType(fc.c.ctx, 3))
+  ins.lhs = sr.handle
+  ins.ival = 0
+  return builderEmit(fc.b, ins)
+}
+
+// The value stored into the result's `base` slot: the receiver's own `base`
+// word when exploded, else the receiver handle itself.
+//
+// THOSE TWO ARE NOT THE SAME OBJECT and the difference is deliberate. The
+// boxed form stores the IMMEDIATE source, so a chain of views holds a chain of
+// headers alive. The exploded form stores what the source itself points at,
+// which roots the same bytes — `strInitOwned` sets an owning string's `base`
+// to ITSELF (runtime/root/root.bit:578) and `strInitView` sets a view's to its
+// source (:600), so following the word one link never leaves the chain — and
+// retains one fewer header per link. A null receiver reads its `base` word as
+// 0 through the same `isHeaderBase` guard the other two words use, which is
+// the state `strBytes`/`strSize` already answer 0 for.
+fn strRecvBase(sr: StringRecv): int {
+  if (len(sr.words) != 0) {
+    return sr.words[2]
+  }
+  return sr.handle
+}
+
 // Lowers a reslice `s[lo:hi]` (SPEC §12.7): `rt_call slice_slice(s, lo, hi)` for a
 // slice, inline for a string (#4048). An omitted `lo` is 0; an omitted `hi` is
 // the receiver's current length. Array reslice is not lowerable (matches seed).
@@ -293,7 +381,8 @@ fn lowerSliceExpr(fc: FnCtx, node: int): int {
     return 0
   }
   let i64ty = primType(fc.c.ctx, 3)
-  let recv = lowerExpr(fc, k[0])
+  let sr = lowerStringRecv(fc, k[0], isString)
+  let recv = sr.handle
   if (fc.failed) {
     return 0
   }
@@ -308,9 +397,7 @@ fn lowerSliceExpr(fc: FnCtx, node: int): int {
   if (k[2] != 0) {
     hi = lowerExprH(fc, k[2], i64ty)
   } else {
-    let sl = mkInstr(Op.SliceLen, i64ty)
-    sl.lhs = recv
-    hi = builderEmit(fc.b, sl)
+    hi = strRecvLen(fc, sr)
   }
   if (fc.failed) {
     return 0
@@ -320,7 +407,7 @@ fn lowerSliceExpr(fc: FnCtx, node: int): int {
   // keeping them ahead of the allocation is what leaves the derived interior
   // pointer's live range safepoint-free.
   if (isString) {
-    return emitInlineStringSlice(fc, recv, lo, hi, nodeType(fc, node))
+    return emitInlineStringSlice(fc, sr, lo, hi, nodeType(fc, node))
   }
   let ins = mkInstr(Op.RtCall, nodeType(fc, node))
   ins.name = "slice_slice"
