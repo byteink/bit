@@ -139,22 +139,30 @@ fn explodeParamTypes(ctx: TypeContext, paramTypes: []int, on: bool): []int {
 // `paramTypes` carries the tail's ELEMENT type while the argument that arrives
 // is the collected `[]T`, and the shape test is what tells those apart without
 // a variadic special case here.
+// `explodeStr` is `Lowerer.explodeStrings` (#4431) — the coercion boundary's
+// own gate, independent of `on`/`anyExplodedParam` above, which is why it is
+// checked even when this function's early return fires: a call with no
+// tuple-shaped parameter at all can still carry a plain `string` argument,
+// and that is exactly the "argument" position #4431 covers. `coerceStringToBoxedRaw`
+// no-ops instantly when `explodeStr` is false, so the early-return path below
+// costs one extra bool read per argument and nothing else when ungated.
 fn explodeCallArgs(
   ctx: TypeContext,
   b: IrBuilder,
   paramTypes: []int,
   args: []int,
   on: bool,
+  explodeStr: bool,
 ): []int {
   if (!on || !anyExplodedParam(ctx, paramTypes)) {
-    return args
+    return coerceStringArgList(ctx, b, paramTypes, args, explodeStr)
   }
   let out = []int(0)
   let i = 0
   while (i < len(args)) {
     let words = explodedArgWords(ctx, b, paramTypes, args, i)
     if (len(words) == 0) {
-      out = append(out, args[i])
+      out = append(out, coerceStringArg(ctx, b, paramTypes, args, i, explodeStr))
     } else {
       let ids = []int(0)
       let k = 0
@@ -568,4 +576,175 @@ fn recordParamKeepAlive(
     }
     i = i + 1
   }
+}
+
+// ===========================================================================
+// #4431: the box/unbox coercion boundary — a SEPARATE mechanism from the
+// tuple explosion above, deliberately not folded into `explodedWordTypes`.
+//
+// WHY SEPARATE. `explodedWordTypes` admits a type by its SHAPE (>= 2 members,
+// each one word) and every consumer that materializes a box for an ineligible
+// use falls back to `buildTuple` — a GENERIC tuple layout. A boxed `string` is
+// not a generic tuple: `runtime/ABI.md` §2.3 fixes its allocation at exactly
+// `strViewHeaderSize()` (24) bytes with `ptr_offsets = [strViewBaseOffset()]`
+// (16), which is what `emitInlineStringSlice` (lowerreslice.bit) already
+// builds and what `stringViewBaseEscapesInFunc` (verify.bit, #4407) already
+// polices. Teaching `explodedWordTypes` to recognize `string` would silently
+// route every existing tuple-explosion fallback through `buildTuple` for a
+// shape `buildTuple` cannot produce correctly. Two independent mechanisms
+// sharing nothing is cheaper and safer than one mechanism with a special case
+// wedged into its shared fallback path.
+//
+// GATED BY `Lowerer.explodeStrings`, which every real build leaves `false`
+// (see `lower.bit`). Nothing below can execute outside
+// `BIT_STRING_EXPLODE_TEST=1`, and every insertion point (`explodeCallArgs`,
+// `emitReturnValue`, `boxErrForSlot`/`unboxErrFromSlot`) checks the gate
+// before calling any of it — so an unset variable leaves every one of those
+// functions emitting the exact IR they emit today, instruction for
+// instruction.
+// ===========================================================================
+
+// The three word types a boxed `string` explodes into: `ptr`/`len` at +0/+8
+// (untraced `i64`, ABI.md §2.3), `base` at +16 typed `string` itself — the
+// same IR type `emitInlineStringSlice`'s own `field_set` gives that offset,
+// so `isRefType` classifies a word read out of `base` exactly as it
+// classifies the boxed string it came from.
+fn stringWordTypes(ctx: TypeContext): []int {
+  let i64ty = primType(ctx, 3)
+  return [i64ty, i64ty, primType(ctx, 11)]
+}
+
+// unbox-on-use: reads a boxed `string` value's three words back out, offsets
+// 0/8/16 exactly as `emitInlineStringSlice` reads its own receiver, and
+// records the keepalive edges pairing `ptr`/`len` (untraced) with `base`
+// (traced) — #4406's mechanism, and this is one more site that owes the call
+// per its own closing note ("the mechanism is in place; it is not
+// automatic"). Without it, a caller that reads only `ptr`/`len` back out and
+// never touches `base` again leaves `base`'s live interval ending here, and a
+// collection between this point and that later read frees the backing the
+// interior `ptr` still points into — #4406's hazard, reproduced for this
+// exact word shape rather than a synthetic tuple.
+fn unboxStringWords(ctx: TypeContext, b: IrBuilder, val: int): []int {
+  let words = stringWordTypes(ctx)
+  let ids = []int(0)
+  let k = 0
+  while (k < len(words)) {
+    let fg = mkInstr(Op.FieldGet, words[k])
+    fg.lhs = val
+    fg.ival = k * 8
+    ids = append(ids, builderEmit(b, fg))
+    k = k + 1
+  }
+  recordWordKeepAlive(ctx, b, words, ids)
+  return ids
+}
+
+// box-on-escape: materializes a boxed `string` from three independent words —
+// the identical allocation shape `emitInlineStringSlice` builds (`gc_alloc`
+// `strViewHeaderSize()` bytes, `ptr_offsets = [strViewBaseOffset()]`, result
+// typed `string`), so `stringViewBaseEscapesInFunc` (verify.bit, #4407)
+// already refuses to emit this if `base` is ever fed a non-ref-typed value —
+// the checker built for `emitInlineStringSlice`'s fingerprint covers this
+// site for free because the fingerprint is identical, not because anything
+// here re-derives the invariant.
+//
+// `base`'s own live interval needs no keepalive registration here: it is
+// consumed by the `field_set` immediately below the `gc_alloc`, so ordinary
+// liveness already covers it across that one safepoint. The hazard this
+// function could introduce is a STALE `ptr`/`len` pair copied from an object
+// that dies before `base` reaches its `field_set` — which cannot happen
+// precisely because `base` (this function's own `base` argument) has a
+// live use right here and needs nothing extra to stay rooted across the
+// allocation that precedes it.
+fn boxStringWords(ctx: TypeContext, b: IrBuilder, ptrv: int, lenv: int, basev: int): int {
+  let strTy = primType(ctx, 11)
+  let i64ty = primType(ctx, 3)
+  let ga = mkInstr(Op.GcAlloc, strTy)
+  ga.ival = strViewHeaderSize()
+  ga.offsets = [strViewBaseOffset()]
+  let obj = builderEmit(b, ga)
+  let setPtr = mkInstr(Op.FieldSet, ctx.voidId)
+  setPtr.lhs = obj
+  setPtr.ival = 0
+  setPtr.rhs = ptrv
+  setPtr.ival2 = i64ty
+  builderEmit(b, setPtr)
+  let setLen = mkInstr(Op.FieldSet, ctx.voidId)
+  setLen.lhs = obj
+  setLen.ival = 8
+  setLen.rhs = lenv
+  setLen.ival2 = i64ty
+  builderEmit(b, setLen)
+  let setBase = mkInstr(Op.FieldSet, ctx.voidId)
+  setBase.lhs = obj
+  setBase.ival = strViewBaseOffset()
+  setBase.rhs = basev
+  setBase.ival2 = strTy
+  builderEmit(b, setBase)
+  return obj
+}
+
+// THE INSERTION POINT every gated position funnels through. `val` is a value
+// already lowered exactly as it is today (a single boxed `string`, since
+// nothing upstream of this call ever produces exploded words outside this
+// file's own test machinery); `ty` is its declared type. When `explodeStr` is
+// false or `ty` is not a plain `string`, this is one bool check and one
+// integer compare, no instruction emitted and no value id consumed — the
+// caller's IR is untouched, byte for byte.
+//
+// When gated and `ty` is `string`, this round-trips `val` through
+// unbox-on-use then box-on-escape: exactly the pair the ticket describes
+// ("when a boxed string reaches a position that has [flipped], it explodes
+// it... when an exploded string reaches a position that has not, the lowerer
+// materialises the box"), composed back to back so a real, running program
+// exercises both halves of the mechanism at once, on a genuine string, with
+// no change to what the program prints — the round trip reconstructs the
+// same ptr/len/base a plain read would have used unchanged.
+//
+// Takes `ctx`/`b`/`explodeStr` rather than `fc: FnCtx` so it can be called
+// from `explodeCallArgs`, which predates `FnCtx` being in scope at its own
+// call sites (`lowerglobal.bit`'s trampoline path builds calls before a
+// `FnCtx` exists for them). `coerceStringToBoxed` below is the `FnCtx`-typed
+// wrapper for the two positions that already have one.
+fn coerceStringToBoxedRaw(ctx: TypeContext, b: IrBuilder, explodeStr: bool, val: int, ty: int): int {
+  if (!explodeStr || ty != primType(ctx, 11)) {
+    return val
+  }
+  let words = unboxStringWords(ctx, b, val)
+  return boxStringWords(ctx, b, words[0], words[1], words[2])
+}
+
+fn coerceStringToBoxed(fc: FnCtx, val: int, ty: int): int {
+  return coerceStringToBoxedRaw(fc.c.ctx, fc.b, fc.lowerer.explodeStrings, val, ty)
+}
+
+// The argument-list form `explodeCallArgs` calls for a position its tuple
+// explosion left untouched (`words` empty at index `i`): coerces exactly
+// that one argument against the callee's declared parameter type. A
+// variadic tail's collected argument has no per-element `paramTypes` entry
+// (`i >= len(paramTypes)`), so it passes through unchanged — the same
+// bounds guard `explodedArgWords` already uses for the same reason.
+fn coerceStringArg(ctx: TypeContext, b: IrBuilder, paramTypes: []int, args: []int, i: int, explodeStr: bool): int {
+  if (i >= len(paramTypes)) {
+    return args[i]
+  }
+  return coerceStringToBoxedRaw(ctx, b, explodeStr, args[i], paramTypes[i])
+}
+
+// The whole-list form for a call `explodeCallArgs` returns from EARLY —
+// `on` false or no tuple-shaped parameter at all — which is every call in
+// every real build, and the majority of calls even under the gate. `explodeStr
+// == false` returns `args` itself, unwalked and unallocated: the identity
+// this function must have for "gate off is bit-identical" to hold.
+fn coerceStringArgList(ctx: TypeContext, b: IrBuilder, paramTypes: []int, args: []int, explodeStr: bool): []int {
+  if (!explodeStr) {
+    return args
+  }
+  let out = []int(0)
+  let i = 0
+  while (i < len(args)) {
+    out = append(out, coerceStringArg(ctx, b, paramTypes, args, i, explodeStr))
+    i = i + 1
+  }
+  return out
 }
