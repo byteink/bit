@@ -64,6 +64,54 @@ class RegFile {
   // miscompile. It is read only when `clobbers` is non-empty, so a backend
   // that passes no clobber positions is unaffected by its value.
   calleeSaved: int,
+  // #4429. Bit i set means register i survives a BACK-EDGE POLL — the synthetic
+  // `bl bit_rt_safepoint` a loop terminator carries — which preserves MORE than
+  // the target's calling convention does, because the shim's whole job is to
+  // dump the register file into a snapshot and put it back.
+  //
+  // A superset of `calleeSaved`. Read only for an interval that meets one of
+  // `AllocPoints.polls`, so a backend that passes no poll positions is
+  // unaffected by its value — the same convention `calleeSaved` carries.
+  //
+  // Over-reporting here is a miscompile in the worst direction: the register is
+  // handed out, the shim does not preserve it, and either the value comes back
+  // wrong or the stack map publishes an unwritten snapshot word as a root.
+  pollSaved: int,
+}
+
+// The positions one allocation must reason about. A class rather than four
+// parallel parameters because they are one description of the function's call
+// structure and are always derived together (LINT.md E0202's own rationale).
+class AllocPoints {
+  // Every safepoint, in emission order. One StackMapEntry is produced per
+  // element, in this order. `calleeSafepoints` and `polls` partition it.
+  safepoints: []int,
+  // The subset of `safepoints` whose stack map is consulted with the register
+  // file RESTORED THROUGH THE FRAME CHAIN — i.e. every ordinary call. The
+  // collector recovers those registers from the prologue save slots of the
+  // frames it unwinds through, and a prologue saves only what the target's
+  // convention makes callee-saved, so a GC reference live at one of these may
+  // occupy only a `calleeSaved` register.
+  calleeSafepoints: []int,
+  // The subset of `safepoints` that is a BACK-EDGE POLL. Its stack map is only
+  // ever consulted as frame 0 of the poll shim's own raw register snapshot
+  // (runtime/gc/stackmap.bit's `gcScanSnapshot`), never after a restore, so a
+  // reference here may occupy anything in `RegFile.pollSaved`. A poll is also a
+  // weak clobber point: it destroys whatever `pollSaved` omits.
+  polls: []int,
+  // Positions at which the target's caller-saved registers are destroyed AND a
+  // later instruction can still read one. `polls` is deliberately NOT included:
+  // a poll clobbers a different, smaller set and is handled separately.
+  clobbers: []int,
+}
+
+// Every safepoint restricted to callee-saved rooting, nothing treated as a poll
+// — what every caller that has not opted into #4429's split gets.
+fn allocPoints(safepoints: []int, clobbers: []int): AllocPoints {
+  return AllocPoints{
+    safepoints: safepoints, calleeSafepoints: safepoints,
+    polls: []int(0), clobbers: clobbers,
+  }
 }
 
 class TargetRegs {
@@ -302,41 +350,75 @@ fn rootedAtPoint(iv: LiveInterval, p: int): bool {
 // gated on `clobbers`, deliberately: a backend may legitimately leave a
 // non-returning call out of `clobbers` (nothing can read a register it
 // destroyed) while that same call is still a safepoint that emits a stack map.
-fn computeRestricted(
-  scan: []LiveInterval, safepoints: []int, clobbers: []int, csMask: int,
-): []bool {
-  let out = []bool(0)
+//
+// #4429 SPLIT EACH REASON IN TWO, by the SURVIVING SET rather than by the
+// reason. A back-edge poll is both a clobber and a safepoint, but the set that
+// survives it is `RegFile.pollSaved`, not `calleeSaved` — so this returns a
+// MASK to intersect with the file rather than a "restricted" flag. With no
+// polls and no clobbers the mask is all-ones and every branch below reduces to
+// the plain Poletto & Sarkar scan, register for register.
+fn computeRegMasks(
+  scan: []LiveInterval, points: AllocPoints, target: TargetRegs,
+): []int {
+  let out = []int(0)
   let i = 0
   while (i < len(scan)) {
-    out = append(out, intervalRestricted(scan[i], safepoints, clobbers, csMask))
+    out = append(out, intervalRegMask(scan[i], points, target))
     i = i + 1
   }
   return out
 }
 
-// Bounded by len(clobbers) + len(safepoints), both function-local and finite —
-// the same bound the stack-map loop already carries.
-fn intervalRestricted(
-  iv: LiveInterval, safepoints: []int, clobbers: []int, csMask: int,
-): bool {
-  let ci = 0
-  while (ci < len(clobbers)) {
-    if (crossesPoint(iv, clobbers[ci])) {
+fn crossesAnyPoint(iv: LiveInterval, ps: []int): bool {
+  let i = 0
+  while (i < len(ps)) {
+    if (crossesPoint(iv, ps[i])) {
       return true
     }
-    ci = ci + 1
-  }
-  if (!iv.isRef || csMask == 0) {
-    return false
-  }
-  let si = 0
-  while (si < len(safepoints)) {
-    if (rootedAtPoint(iv, safepoints[si])) {
-      return true
-    }
-    si = si + 1
+    i = i + 1
   }
   return false
+}
+
+fn rootedAtAnyPoint(iv: LiveInterval, ps: []int): bool {
+  let i = 0
+  while (i < len(ps)) {
+    if (rootedAtPoint(iv, ps[i])) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Bounded by len(clobbers) + len(polls) + len(safepoints), all function-local
+// and finite — the same bound the stack-map loop already carries.
+//
+// The two ANDs compose: a value live across BOTH a real call and a poll gets
+// `calleeSaved & pollSaved`, which is `calleeSaved` since one contains the
+// other. Nothing here needs to know that, and it stays correct if a target ever
+// makes them overlap only partially.
+fn intervalRegMask(
+  iv: LiveInterval, points: AllocPoints, target: TargetRegs,
+): int {
+  let file = regFileFor(target, iv.regClass)
+  let mask = -1
+  if (crossesAnyPoint(iv, points.clobbers)) {
+    mask = mask & file.calleeSaved
+  }
+  if (crossesAnyPoint(iv, points.polls)) {
+    mask = mask & file.pollSaved
+  }
+  if (!iv.isRef || file.calleeSaved == 0) {
+    return mask
+  }
+  if (rootedAtAnyPoint(iv, points.calleeSafepoints)) {
+    mask = mask & file.calleeSaved
+  }
+  if (rootedAtAnyPoint(iv, points.polls)) {
+    mask = mask & file.pollSaved
+  }
+  return mask
 }
 
 class SpillEntry {
@@ -596,7 +678,7 @@ fn allocate(
   safepoints: []int,
   clobbers: []int,
 ): RegAllocResult {
-  return allocateCoalesced(target, intervals, safepoints, clobbers, []int(0))
+  return allocateCoalesced(target, intervals, allocPoints(safepoints, clobbers), []int(0))
 }
 
 // `roots` (#3738) names, per vreg, the vreg whose location it must share —
@@ -615,9 +697,10 @@ fn allocate(
 // An empty `roots` is exactly the plain Poletto & Sarkar behaviour, register for
 // register.
 fn allocateCoalesced(
-  target: TargetRegs, intervals: []LiveInterval, safepoints: []int,
-  clobbers: []int, roots: []int,
+  target: TargetRegs, intervals: []LiveInterval, points: AllocPoints,
+  roots: []int,
 ): RegAllocResult {
+  let safepoints = points.safepoints
   let n = len(intervals)
   // Validate the caller's dense-vreg contract — an internal-caller invariant,
   // asserted rather than surfaced as an error.
@@ -669,11 +752,10 @@ fn allocateCoalesced(
   let alias = mergeAliases(scan, posOf, roots)
   let order = rootOrder(orderByStart(scan), alias)
 
-  // #3171/#4343: which intervals may not hold a caller-saved register. Indexed
-  // by interval array position (the main loop's `idx`), not by vreg.
-  let restricted = computeRestricted(
-    scan, safepoints, clobbers, target.intRegs.calleeSaved,
-  )
+  // #3171/#4343/#4429: the registers each interval may occupy, as a mask over
+  // file positions. Indexed by interval array position (the main loop's `idx`),
+  // not by vreg.
+  let regMasks = computeRegMasks(scan, points, target)
 
   let oi = 0
   while (oi < len(order)) {
@@ -688,14 +770,11 @@ fn allocateCoalesced(
     expireClass(state, scan, iv.start)
     expireSpills(spills, scan, iv.start)
 
-    // #3171: an interval live across a clobber point may only occupy a register
-    // the target preserves across one. With no clobbers (or an all-callee-saved
-    // file) `allowed` is the whole file and every branch below reduces to the
-    // plain Poletto & Sarkar scan.
-    let allowed = fullRegMask(state.regFile.count)
-    if (restricted[idx]) {
-      allowed = allowed & state.regFile.calleeSaved
-    }
+    // #3171/#4429: an interval live across a clobber point may only occupy a
+    // register that survives it. With no clobbers and no polls `regMasks[idx]`
+    // is all-ones, `allowed` is the whole file, and every branch below reduces
+    // to the plain Poletto & Sarkar scan.
+    let allowed = fullRegMask(state.regFile.count) & regMasks[idx]
 
     let reg = firstFreeReg(state, allowed)
     if (reg >= 0) {
