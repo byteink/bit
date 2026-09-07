@@ -563,16 +563,41 @@ RootScanner {
   bare function value is a code address — and both stack maps and object pointer
   maps legitimately carry them; the collector must not decode one as an object.
 
-**Register file.** A function containing any safepoint restricts its allocatable
-registers to the callee-saved subset only (x86-64 `rbx`/`r13`/`r14`/`r15`;
-AArch64 `x19`..`x28`), so any live reference at a safepoint is in one of those
-registers or spilled to a frame slot — never a call-clobbered register. This is
-what makes the walk below tractable: callee-saved values are recoverable by
-unwinding, call-clobbered ones would be lost.
+**Register file.** A live reference at a safepoint is in a register the walk can
+recover, or spilled to a frame slot — never one that is simply lost. Which
+registers those are depends on WHICH KIND of safepoint it is, and the two
+answers differ on AArch64 since #4429:
+
+- **An ordinary call.** Its stack map is consulted only for a frame the walk has
+  already unwound INTO, and the register values it reads have been restored from
+  the prologue save slots of the frames in between. A prologue saves only what
+  the calling convention makes callee-saved, so a reference live at a call
+  safepoint may occupy only the callee-saved subset — x86-64
+  `rbx`/`r13`/`r14`/`r15` (plus `rsi`/`rdi` under Win64), AArch64 `x19`..`x28`.
+- **A back-edge poll.** Its stack map is only ever consulted as frame 0 of the
+  snapshot `bit_rt_safepoint` itself published, with no restore in front of it,
+  so a reference there may occupy any register the shim stores. On x86-64 that
+  is still the callee-saved subset. On AArch64 it is the WHOLE allocatable
+  integer file — `x1`..`x8`, `x12`..`x15`, `x19`..`x28` — because the shim saves
+  and reloads all of them (below). `x0` is excluded: the compiler materializes
+  the shim's own `entryOf` operand into it ahead of the payload, so the caller's
+  value is already gone before the first store.
+
+`compiler/regallocpoints.bit`'s `AllocPoints` carries the split — `polls` versus
+`calleeSafepoints` — and `RegFile.pollSaved` versus `RegFile.calleeSaved` carries
+the two masks. Reporting a register in `pollSaved` that the shim does not store
+publishes an unwritten stack word as a root: a use-after-free, not a slow
+program. The two must move together, in one commit.
+
+FLOAT registers are unaffected: the shim saves none, and its `bl` into
+`stwSafepoint` is an ordinary call, so a float live across a poll is still
+confined to the convention's callee-saved set. Stack maps describe only
+Int-class locations anyway, so this is a clobber question and never a rooting
+one.
 
 **Snapshot.** Collection only ever runs from `bit_rt_safepoint` (below), which is
-a naked shim that records the caller's return address, frame pointer, and
-callee-saved registers *before* any runtime code can overwrite them. The frame is
+a naked shim that records the caller's return address, frame pointer, and saved
+register file *before* any runtime code can overwrite them. The frame is
 built **on the polling thread's own stack** — the shim reserves it below the
 caller's `sp`/`rsp` and passes its address to the poll body as the first C
 argument — so every thread that polls has its own snapshot with no thread-local
@@ -590,12 +615,20 @@ false for every task, no bound would ever lower, and a stopped mutator's live
 stack would go unscanned again with no error and no red gate (#1834).
 
 The snapshot's `regs` array is **not** zeroed (the shim runs at every loop
-back-edge; clearing 32 words per poll is not free). Only the callee-saved file is
-written. That is sound in both directions: the register file restriction above
-means a stack map can only ever name a register the shim *did* save, and every
-word the walk reads is routed through `markRoot`, which marks it only if it is
-exactly a live object base. An unwritten slot can therefore neither be read as a
-root nor be mis-decoded if it were.
+back-edge; clearing 32 words per poll is not free). Only the saved file is
+written — the callee-saved subset on x86-64, the whole allocatable integer file
+on AArch64 (#4429). That is sound in both directions: the register file
+restriction above means a stack map can only ever name a register the shim *did*
+save, and every word the walk reads is routed through `markRoot`, which marks it
+only if it is exactly a live object base. An unwritten slot can therefore
+neither be read as a root nor be mis-decoded if it were.
+
+The AArch64 shim also RELOADS `x1`..`x8`/`x12`..`x15` before returning — the
+callee-saved half needs no reload, since `stwSafepoint` is an ordinary AAPCS64
+callee and preserves it. Those reloads read back exactly the words the saves
+wrote, which is only true because this collector does not move objects. A moving
+collector would have to write the updated addresses back into the snapshot
+first, and this is the paragraph that would have to change.
 
 **Frame chain.** Both backends establish an identical frame record: `*(fp)` is
 the caller's frame pointer and `*(fp+8)` is the return address (`fp` = `rbp` on
