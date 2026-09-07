@@ -211,3 +211,173 @@ fn stepDumpLayoutConsts(): int {
   }
   return 0
 }
+
+// #4435: #4428 folds a slice header's `off` word to the constant 0
+// whenever the header is provably a `bit_rt_slice_new` result. That fold
+// is sound only because every WRITE this runtime makes to `slcOff` inside
+// an EXISTING header stores the literal 0 — a reslice makes a new object
+// instead. Today that was asserted only by a comment in
+// compiler/optzerooff.bit's header:
+//
+//   git grep -c 'storeWord(.*slcOff' -- runtime/   ->  runtime/root/slices.bit:4
+//
+// This makes it checkable: scan `root`'s runtime/** source for every
+// `storeWord(<target> + slcOff, <value>)` write site and assert the
+// enumerated shape still holds. A fifth writer storing a non-zero value
+// into an EXISTING header would make every access the fold fired on read
+// `buf[index]` where it should read `buf[off + index]` — a silent wrong
+// answer, not a crash, visible only through a view.
+class SlcOffWrite {
+  file: string, // relative to `root`
+  line: int, // 1-based
+  target: string,
+  value: string,
+  text: string,
+}
+
+// True for a line containing a `storeWord(` call whose first argument adds
+// `slcOff` — the write-site shape this check enumerates. A plain substring
+// test, not a full expression parser: every write site in this corpus is a
+// single `storeWord(<target> + slcOff, <value>)` call on one line, and a
+// change that splits one across lines or renames the constant must fail
+// this check's shape assertion below rather than silently stop finding the
+// site.
+fn looksLikeSlcOffWrite(line: string): bool {
+  return contains(line, "storeWord(") && contains(line, "slcOff")
+}
+
+// Parses `storeWord(<target> + slcOff, <value>)` out of `line`. `ok` is
+// false when the line matched `looksLikeSlcOffWrite` textually but is not
+// in this exact shape (e.g. `slcOff` only appears in a trailing comment) —
+// the caller must treat that as an unclassifiable write, never drop it
+// silently.
+fn parseStoreWordSlcOff(line: string): (string, string, bool) {
+  let marker = "storeWord("
+  let at = indexOf(line, marker)
+  if (at < 0) {
+    return "", "", false
+  }
+  let afterOpen = at + len(marker)
+  let rest = line[afterOpen:]
+  let plusMarker = " + slcOff,"
+  let plusAt = indexOf(rest, plusMarker)
+  if (plusAt < 0) {
+    return "", "", false
+  }
+  let target = trimSpace(rest[:plusAt])
+  let afterComma = rest[plusAt + len(plusMarker):]
+  let closeAt = indexOf(afterComma, ")")
+  if (closeAt < 0) {
+    return "", "", false
+  }
+  let value = trimSpace(afterComma[:closeAt])
+  return target, value, true
+}
+
+// Every `storeWord(... + slcOff, ...)` write site under `root`'s
+// runtime/** source, in walk order. `root` is `"runtime"` for the real
+// working tree, or a scratch copy for the mutation control this check's
+// own acceptance criterion demands (#4435) — never the real
+// runtime/root/slices.bit, which this check must never write to.
+fn scanSlcOffWrites(root: string): []SlcOffWrite {
+  let out = []SlcOffWrite(0)
+  let prefix = root + "/"
+  for p of walkBit(root) {
+    let relPath = p
+    if (hasPrefix(p, prefix)) {
+      relPath = p[len(prefix):]
+    }
+    let text = readFile(p) catch _ {
+      continue
+    }
+    let lines = split(text, "\n")
+    let i = 0
+    while (i < len(lines)) {
+      let line = lines[i]
+      if (looksLikeSlcOffWrite(line)) {
+        out = append(out, slcOffWriteAt(relPath, i + 1, line))
+      }
+      i = i + 1
+    }
+  }
+  return out
+}
+
+// Split out of `scanSlcOffWrites` to keep it under the complexity-10
+// ceiling (spec/LINT.md:186, E0204) once the unparsed-shape fallback below
+// was added.
+fn slcOffWriteAt(relPath: string, lineNo: int, line: string): SlcOffWrite {
+  let (target, value, ok) = parseStoreWordSlcOff(line)
+  let t = target
+  let v = value
+  if (!ok) {
+    t = "<unparsed>"
+    v = "<unparsed>"
+  }
+  return SlcOffWrite{ file: relPath, line: lineNo, target: t, value: v, text: trimSpace(line) }
+}
+
+// Classifies `writes` — already scanned by `scanSlcOffWrites` — against
+// #4428's own soundness argument: exactly 4 write sites, all in
+// `root/slices.bit`, exactly 3 storing the literal 0, and the 4th storing
+// into `nh` (rtSliceSlice's freshly gcAlloc'ed header, never an existing
+// one). Returns every violation found, empty when the shape holds. Split
+// out of `checkSlcOffWriteSites` to keep both under the complexity-10
+// ceiling (E0204).
+fn slcOffWriteProblems(writes: []SlcOffWrite): []string {
+  let problems = []string(0)
+  if (len(writes) != 4) {
+    problems = append(problems, "expected exactly 4 write site(s), found ${len(writes)}")
+  }
+  let zeroCount = 0
+  let nonZero = []SlcOffWrite(0)
+  for w of writes {
+    if (w.file != "root/slices.bit") {
+      problems = append(problems, "${w.file}:${w.line} writes slcOff outside root/slices.bit: ${w.text}")
+      continue
+    }
+    if (w.value == "0") {
+      zeroCount = zeroCount + 1
+    } else {
+      nonZero = append(nonZero, w)
+    }
+  }
+  if (zeroCount != 3) {
+    problems = append(problems, "expected exactly 3 write(s) storing the literal 0, found ${zeroCount}")
+  }
+  if (len(nonZero) != 1) {
+    problems = append(problems, "expected exactly 1 non-zero write, found ${len(nonZero)}")
+  } else if (nonZero[0].target != "nh") {
+    let w = nonZero[0]
+    problems = append(
+      problems,
+      "${w.file}:${w.line} writes a non-zero, non-'nh' target — expected the reslice's freshly allocated header ('nh'): ${w.text}",
+    )
+  }
+  return problems
+}
+
+// The entry point: scans `root`'s runtime/** for `slcOff` write sites and
+// refuses when #4428's zero-off fold invariant does not hold. Prints the
+// full write-site list on BOTH the pass and the fail path — deliberately: a
+// scan that matched nothing must be distinguishable from one that matched
+// the expected four, the same trap `ARM64_RELOC_BRANCH26` and the
+// `compiler/**/*.bit` glob already caught in this repo (both silently
+// returned 0 and read as a clean tree).
+fn checkSlcOffWriteSites(root: string): bool {
+  let writes = scanSlcOffWrites(root)
+  eprint("make: slcoff-writesites: ${len(writes)} storeWord(... + slcOff, ...) write site(s) found under ${root}/:\n")
+  for w of writes {
+    eprint("make:   ${w.file}:${w.line}: ${w.text}\n")
+  }
+  let problems = slcOffWriteProblems(writes)
+  if (len(problems) == 0) {
+    eprint("make: slcoff-writesites: OK — the shape #4428's zero-off fold relies on holds (3 write(s) of the literal 0, 1 write into a freshly allocated header)\n")
+    return true
+  }
+  eprint("make: slcoff-writesites: refusing — #4428's zero-off fold (compiler/optzerooff.bit) is sound only if every write this runtime makes to an EXISTING slice header's off word is 0. A write that violates this makes every folded access read buf[index] where it should read buf[off + index] — a silent wrong answer, not a crash:\n")
+  for p of problems {
+    eprint("make:   ${p}\n")
+  }
+  return false
+}
