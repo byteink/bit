@@ -1,0 +1,168 @@
+// Register-allocation POINTS and the per-interval register mask they produce —
+// split out of `regalloc.bit` (#4429) when that file crossed the 800-line
+// ceiling. Same module, so nothing here is exported or imported differently;
+// this is a seam, not an interface.
+//
+// The seam is a real one rather than a byte count: everything here answers one
+// question — given where this function's calls, polls and safepoints are, which
+// physical registers may this interval occupy? `regalloc.bit` keeps the scan
+// itself, the interval order, the active list and the spill pools, and consumes
+// `computeRegMasks`'s answer as a single `&`.
+
+// The positions one allocation must reason about. A class rather than four
+// parallel parameters because they are one description of the function's call
+// structure and are always derived together (LINT.md E0202's own rationale).
+class AllocPoints {
+  // Every safepoint, in emission order. One StackMapEntry is produced per
+  // element, in this order. `calleeSafepoints` and `polls` partition it.
+  safepoints: []int,
+  // The subset of `safepoints` whose stack map is consulted with the register
+  // file RESTORED THROUGH THE FRAME CHAIN — i.e. every ordinary call. The
+  // collector recovers those registers from the prologue save slots of the
+  // frames it unwinds through, and a prologue saves only what the target's
+  // convention makes callee-saved, so a GC reference live at one of these may
+  // occupy only a `calleeSaved` register.
+  calleeSafepoints: []int,
+  // The subset of `safepoints` that is a BACK-EDGE POLL. Its stack map is only
+  // ever consulted as frame 0 of the poll shim's own raw register snapshot
+  // (runtime/gc/stackmap.bit's `gcScanSnapshot`), never after a restore, so a
+  // reference here may occupy anything in `RegFile.pollSaved`. A poll is also a
+  // weak clobber point: it destroys whatever `pollSaved` omits.
+  polls: []int,
+  // Positions at which the target's caller-saved registers are destroyed AND a
+  // later instruction can still read one. `polls` is deliberately NOT included:
+  // a poll clobbers a different, smaller set and is handled separately.
+  clobbers: []int,
+}
+
+// Every safepoint restricted to callee-saved rooting, nothing treated as a poll
+// — what every caller that has not opted into #4429's split gets.
+fn allocPoints(safepoints: []int, clobbers: []int): AllocPoints {
+  return AllocPoints{
+    safepoints: safepoints, calleeSafepoints: safepoints,
+    polls: []int(0), clobbers: clobbers,
+  }
+}
+
+// True iff `iv` is live across `p` in the sense that matters to a caller-saved
+// register: it was defined strictly before `p` and is still read at or after
+// it.
+//
+// The `end >= p` half rather than `end > p` is deliberate and is what makes
+// this correct for a BACK-EDGE safepoint, where the clobbering call is emitted
+// BEFORE the edge's parallel move (compiler/x64controlflow.bit's xEmitJump) —
+// so a value whose last read IS that edge is read after the clobber, not
+// before. For a plain call the same test is merely conservative: an argument
+// (end == p) is marshalled before the call and would in fact survive in a
+// register, so one interval per call argument is spilled that need not be.
+fn crossesPoint(iv: LiveInterval, p: int): bool {
+  return iv.start < p && iv.end >= p
+}
+
+// True iff `iv` is one of the live references the stack map for a safepoint at
+// `p` will name — the SAME predicate the stack-map loop at the bottom of
+// `allocateCoalesced` applies, spelled once here so the two can never disagree.
+//
+// It is deliberately WIDER than `crossesPoint` by exactly one case, `start == p`
+// (a reference DEFINED by the call at `p`, e.g. a gc_alloc result): the stack
+// map names it, `crossesPoint` does not. That one case is why the two questions
+// cannot share a predicate, and why a register file that answers only the
+// clobber question is not safe for references — see `computeRestricted`.
+fn rootedAtPoint(iv: LiveInterval, p: int): bool {
+  return iv.isRef && iv.start <= p && iv.end >= p
+}
+
+// Per interval position, may it NOT hold a caller-saved register?
+//
+// Two independent reasons, and conflating them is a miscompile:
+//
+//  1. CLOBBER (#3171). The interval is live ACROSS a position where the
+//     target's caller-saved registers are destroyed — `crossesPoint` over
+//     `clobbers`. An empty `clobbers` restores the plain Poletto & Sarkar scan
+//     exactly, register for register.
+//
+//  2. ROOTING (#4343). The interval holds a live GC REFERENCE that some
+//     safepoint's stack map will name — `rootedAtPoint` over `safepoints`.
+//     runtime/ABI.md §4 is explicit: the safepoint shim writes the callee-saved
+//     file ONLY and leaves the rest of its snapshot untouched, so "a stack map
+//     can only ever name a register the shim did save". A reference reported in
+//     a caller-saved register is read out of an unwritten slot — a MISSED root
+//     for any frame the walk unwinds into, i.e. a use-after-free, not a slow
+//     program. Until #4343 this held for free: a safepoint-bearing function had
+//     no caller-saved register in its int file at all.
+//
+// Reason 2 is gated on the caller having REPORTED a callee-saved mask, which is
+// the meaning `RegFile.calleeSaved`'s zero default already carries. It is not
+// gated on `clobbers`, deliberately: a backend may legitimately leave a
+// non-returning call out of `clobbers` (nothing can read a register it
+// destroyed) while that same call is still a safepoint that emits a stack map.
+//
+// #4429 SPLIT EACH REASON IN TWO, by the SURVIVING SET rather than by the
+// reason. A back-edge poll is both a clobber and a safepoint, but the set that
+// survives it is `RegFile.pollSaved`, not `calleeSaved` — so this returns a
+// MASK to intersect with the file rather than a "restricted" flag. With no
+// polls and no clobbers the mask is all-ones and every branch below reduces to
+// the plain Poletto & Sarkar scan, register for register.
+fn computeRegMasks(
+  scan: []LiveInterval, points: AllocPoints, target: TargetRegs,
+): []int {
+  let out = []int(0)
+  let i = 0
+  while (i < len(scan)) {
+    out = append(out, intervalRegMask(scan[i], points, target))
+    i = i + 1
+  }
+  return out
+}
+
+fn crossesAnyPoint(iv: LiveInterval, ps: []int): bool {
+  let i = 0
+  while (i < len(ps)) {
+    if (crossesPoint(iv, ps[i])) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn rootedAtAnyPoint(iv: LiveInterval, ps: []int): bool {
+  let i = 0
+  while (i < len(ps)) {
+    if (rootedAtPoint(iv, ps[i])) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Bounded by len(clobbers) + len(polls) + len(safepoints), all function-local
+// and finite — the same bound the stack-map loop already carries.
+//
+// The two ANDs compose: a value live across BOTH a real call and a poll gets
+// `calleeSaved & pollSaved`, which is `calleeSaved` since one contains the
+// other. Nothing here needs to know that, and it stays correct if a target ever
+// makes them overlap only partially.
+fn intervalRegMask(
+  iv: LiveInterval, points: AllocPoints, target: TargetRegs,
+): int {
+  let file = regFileFor(target, iv.regClass)
+  let mask = -1
+  if (crossesAnyPoint(iv, points.clobbers)) {
+    mask = mask & file.calleeSaved
+  }
+  if (crossesAnyPoint(iv, points.polls)) {
+    mask = mask & file.pollSaved
+  }
+  if (!iv.isRef || file.calleeSaved == 0) {
+    return mask
+  }
+  if (rootedAtAnyPoint(iv, points.calleeSafepoints)) {
+    mask = mask & file.calleeSaved
+  }
+  if (rootedAtAnyPoint(iv, points.polls)) {
+    mask = mask & file.pollSaved
+  }
+  return mask
+}
