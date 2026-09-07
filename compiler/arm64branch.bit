@@ -54,17 +54,54 @@
 
 // Marks each icmp/fcmp whose only consumer is the `br` immediately after it
 // in the same block. Indexed by instruction id, like `skipConst`.
+//
+// x64controlflow.bit's `xFuseCmp` calls this SAME function directly ("the
+// analysis is over the IR alone, and a fix applied to a copy does not reach
+// its sibling") — this signature is shared and must not change. The #4430
+// redundant-`br` correction below is arm64-only (x64 has no
+// `computeRedundantBoundsBranch`), so it lives in a second entry point that
+// this one forwards to with "nothing is redundant", leaving x64 and every
+// existing arm64 call site byte-for-byte unaffected.
 fn computeFuseCmpBranch(f: IrFunc): []bool {
+  return computeFuseCmpBranchCore(f, []bool(len(f.instrs)))
+}
+
+// arm64compile.bit's entry point once computeRedundantBoundsBranch has run.
+// `redundantBr` excludes a redundant `br`'s own condition read from the use
+// count below: such a `br` never actually reads its condition once emitted
+// (emitBr drops the test for it, below), so counting it here would count a
+// use that no longer exists in emitted code and wrongly keep an
+// otherwise-single-use compare materialized. #4430.
+fn computeFuseCmpBranchForArm64(f: IrFunc, redundantBr: []bool): []bool {
+  return computeFuseCmpBranchCore(f, redundantBr)
+}
+
+// The use count computeFuseCmpBranchCore fuses against: a redundant `br`
+// (below) contributes only its live edge's args, since emitBr never emits a
+// read of its own condition once marked. Split out so the counting loop's
+// own branching does not also count against the marking loop's complexity.
+fn countUsesForFuse(f: IrFunc, redundantBr: []bool): []int {
   let n = len(f.instrs)
   let useCount = []int(n)
   let i = 0
   while (i < n) {
-    for u of instrOperands(f, i) {
-      useCount[u] = useCount[u] + 1
+    if (redundantBr[i]) {
+      for u of f.instrs[i].thenArgs {
+        useCount[u] = useCount[u] + 1
+      }
+    } else {
+      for u of instrOperands(f, i) {
+        useCount[u] = useCount[u] + 1
+      }
     }
     i = i + 1
   }
-  let fuse = []bool(n)
+  return useCount
+}
+
+fn computeFuseCmpBranchCore(f: IrFunc, redundantBr: []bool): []bool {
+  let useCount = countUsesForFuse(f, redundantBr)
+  let fuse = []bool(len(f.instrs))
   let bi = 0
   while (bi < len(f.blocks)) {
     let b = f.blocks[bi]
@@ -82,6 +119,193 @@ fn computeFuseCmpBranch(f: IrFunc): []bool {
     bi = bi + 1
   }
   return fuse
+}
+
+// ===========================================================================
+// #4430: a `br` re-testing an already-proven condition is unconditional
+// ===========================================================================
+//
+// A checked read-then-write of the same slice element (`s[i] = s[i] op x`)
+// lowers to two calls to `emitBoundsCheck` (loweraccess.bit) against the same
+// `idx`/`len` pair — one for the load, one for the store. CSE unifies the two
+// `icmp_ult` values into one, so the SAME condition value ends up as the `lhs`
+// of two separate `br`s: the first genuinely tests it, the second cannot help
+// but agree, because the only way to reach its block at all is through the
+// first `br`'s TRUE edge.
+//
+// `chainDominates` proves that "only way in" property directly from the CFG,
+// without a general dominator tree: starting at the first `br`'s true target,
+// it certifies a block only when it has EXACTLY ONE predecessor — the block
+// just certified — and follows both edges of any `br` along the way (an
+// intermediate check's ELSE/panic edge is certified too, harmlessly; it is
+// simply never where the second `br`'s block turns up). A block certified this
+// way has no path to it that skips the first `br`'s true edge, by induction:
+// the base case (the first `br`'s own true target) is trivial, and each step
+// adds a block whose one and only predecessor is already proven reachable
+// solely through that edge. This is sound but incomplete — a diamond that
+// remerges into a block with two already-certified predecessors is not
+// certified — which only means a rarer shape is left for a future ticket, not
+// that this one is wrong.
+//
+// Two `br`s sharing a condition value where the SECOND is not provably
+// dominated this way (fewer/more than two uses, an intervening redefinition —
+// impossible in SSA for the same value id but the walk does not assume it,
+// a merge the simple certification cannot see) are simply left alone: both
+// keep their own test, exactly as today. This is deliberately narrower than a
+// general bounds-check-elimination pass (see optbce.bit for that one, which
+// reasons about loop induction instead) — it fires only on a `br` reusing an
+// identical, already-branched-on condition value, never on a proof about the
+// index or length themselves.
+
+// Adds `target` to the certified set and the walk queue, but only when its
+// single predecessor is the block that just got certified — the one rule
+// `chainDominates` runs. Split out so the walk's own branching does not also
+// carry this condition's.
+fn certifyIfSinglePred(certified: []bool, predCount: []int, queue: []int, target: int): []int {
+  if (!certified[target] && predCount[target] == 1) {
+    certified[target] = true
+    queue = append(queue, target)
+  }
+  return queue
+}
+
+// Walks forward from `from`, certifying a block only when its single
+// predecessor is already certified, and reports whether `target` is ever
+// certified. Bounded by the block count: `certified` gates every enqueue, so
+// each block is visited at most once.
+fn chainDominates(f: IrFunc, predCount: []int, fromBlock: int, targetBlock: int): bool {
+  if (fromBlock == targetBlock) {
+    return true
+  }
+  if (predCount[fromBlock] != 1) {
+    return false
+  }
+  let certified = []bool(len(f.blocks))
+  certified[fromBlock] = true
+  let queue = [fromBlock]
+  let head = 0
+  while (head < len(queue)) {
+    let cur = queue[head]
+    head = head + 1
+    if (cur == targetBlock) {
+      return true
+    }
+    let b = f.blocks[cur]
+    if (b.instsLen == 0) {
+      continue
+    }
+    let term = f.instrs[b.instsStart + b.instsLen - 1]
+    if (term.op == Op.Jump) {
+      queue = certifyIfSinglePred(certified, predCount, queue, term.ival)
+    } else if (term.op == Op.Br) {
+      queue = certifyIfSinglePred(certified, predCount, queue, term.ival)
+      queue = certifyIfSinglePred(certified, predCount, queue, term.ival2)
+    }
+  }
+  return false
+}
+
+// One pass over every block's terminator, counting how many `jump`/`br` edges
+// land on each block — the input `chainDominates` certifies against.
+fn computeBlockPredCounts(f: IrFunc): []int {
+  let predCount = []int(len(f.blocks))
+  let bi = 0
+  while (bi < len(f.blocks)) {
+    let b = f.blocks[bi]
+    if (b.instsLen > 0) {
+      let term = f.instrs[b.instsStart + b.instsLen - 1]
+      if (term.op == Op.Jump) {
+        predCount[term.ival] = predCount[term.ival] + 1
+      } else if (term.op == Op.Br) {
+        predCount[term.ival] = predCount[term.ival] + 1
+        predCount[term.ival2] = predCount[term.ival2] + 1
+      }
+    }
+    bi = bi + 1
+  }
+  return predCount
+}
+
+// Marks each `br` instruction that re-tests a condition value an earlier `br`
+// (in block order) already tested, where `chainDominates` proves the earlier
+// `br`'s true edge is the only way to reach this one. Indexed by instruction
+// id, like `fuseCmp`. Neither `br` is rewritten here — `emitBr` reads this
+// directly and drops the test only for the marked one, keeping the FIRST
+// occurrence's real check untouched.
+fn computeRedundantBoundsBranch(f: IrFunc): []bool {
+  let predCount = computeBlockPredCounts(f)
+  let redundant = []bool(len(f.instrs))
+  let firstBrOf = []int(len(f.instrs))
+  let k = 0
+  while (k < len(firstBrOf)) {
+    firstBrOf[k] = -1
+    k = k + 1
+  }
+  let bi = 0
+  while (bi < len(f.blocks)) {
+    let b = f.blocks[bi]
+    if (b.instsLen == 0) {
+      bi = bi + 1
+      continue
+    }
+    let termIdx = b.instsStart + b.instsLen - 1
+    let term = f.instrs[termIdx]
+    if (term.op != Op.Br) {
+      bi = bi + 1
+      continue
+    }
+    let cond = term.lhs
+    if (firstBrOf[cond] == -1) {
+      firstBrOf[cond] = termIdx
+      bi = bi + 1
+      continue
+    }
+    let trueTarget = f.instrs[firstBrOf[cond]].ival
+    if (chainDominates(f, predCount, trueTarget, bi)) {
+      redundant[termIdx] = true
+    }
+    bi = bi + 1
+  }
+  return redundant
+}
+
+// The panic/ELSE block of every `br` `redundantBr` marks — compileFunction's
+// block-emission loop skips these, and emitJumpOrFallThrough walks past them
+// when deciding whether a jump is a fall-through. Split out of
+// compileFunction (arm64compile.bit), which is already over this repo's own
+// complexity ceiling and must not grow further for this ticket's sake.
+fn computeDeadBoundsBlocks(f: IrFunc, redundantBr: []bool): []bool {
+  let deadBlock = []bool(len(f.blocks))
+  let i = 0
+  while (i < len(redundantBr)) {
+    if (redundantBr[i]) {
+      deadBlock[f.instrs[i].ival2] = true
+    }
+    i = i + 1
+  }
+  return deadBlock
+}
+
+// A dead block's instruction bound, narrowed to its own params so
+// compileFunction's inner loop (`idx < instsStart + effInstsLen[bi]`, arm64
+// compile.bit) runs it zero times — no debug row, no compileInst call, same
+// effect as skipping the block outright. Kept as its own array rather than an
+// `if (deadBlock[bi])` inside that loop: compileFunction is already the
+// worst-recorded E0204 debt in this tree (complexity-debt.txt), so a new
+// branch there would raise its baseline, which only a human may do.
+fn computeEffectiveInstsLen(f: IrFunc, deadBlock: []bool): []int {
+  let n = len(f.blocks)
+  let effLen = []int(n)
+  let bi = 0
+  while (bi < n) {
+    let b = f.blocks[bi]
+    effLen[bi] = b.instsLen
+    if (deadBlock[bi]) {
+      effLen[bi] = b.paramCount
+    }
+    bi = bi + 1
+  }
+  return effLen
 }
 
 // The condition `br` must branch on to take its ELSE edge, given the compare
@@ -334,9 +558,23 @@ fn arm64DefinesRegister(
 // patch that conditional branch to its own address, an infinite loop rather
 // than a slower loop. `emitBr` calls this for THEN only in the shape that
 // emits no local fixup at all.
+// #4430: `cx.deadBlock` marks the panic block of an eliminated redundant
+// bounds check (compileFunction skips emitting it entirely — see
+// computeRedundantBoundsBranch), so it contributes no bytes and must not
+// count as a block standing between `curBlock` and a fall-through candidate.
+// `next` walks past every dead block index the same way `compileFunction`'s
+// own emission loop does, bounded by the block count.
 fn emitJumpOrFallThrough(cx: A64Ctx, curBlock: int, i: int, target: int) {
   let b = cx.f.blocks[curBlock]
-  if (target == curBlock + 1 && i == b.instsStart + b.instsLen - 1) {
+  if (i != b.instsStart + b.instsLen - 1) {
+    emitJumpFixup(cx, target)
+    return
+  }
+  let next = curBlock + 1
+  while (next < len(cx.deadBlock) && cx.deadBlock[next]) {
+    next = next + 1
+  }
+  if (target == next) {
     return
   }
   emitJumpFixup(cx, target)
@@ -389,7 +627,20 @@ fn brEdgeNeedsInlineCode(
 
 // Emits the whole of `br`. `i` is its instruction id, which is its block's
 // last, so either edge is a legal fall-through candidate.
+//
+// #4430: `cx.redundantBr[i]` means chainDominates already proved this br's
+// condition can only be true here — an earlier br on the identical value
+// dominates this block. No test is emitted at all: this is exactly what a
+// plain `jump` to the TRUE edge does (compileInstControl's Op.Jump arm), down
+// to using `emitBrEdgeTail` for the safepoint/move/fall-through sequencing.
+// The ELSE edge (the now-unreachable panic block) is never referenced here,
+// which is what makes it safe for compileFunction to skip emitting it.
 fn emitBr(cx: A64Ctx, curBlock: int, i: int, ins: IrInstr) {
+  if (cx.redundantBr[i]) {
+    let thenMoves = blockArgMoves(cx, ins.ival, ins.thenArgs)
+    emitBrEdgeTail(cx, curBlock, i, ins.ival, thenMoves)
+    return
+  }
   let test = emitBrCondition(cx, i, ins.lhs)
   let thenMoves = blockArgMoves(cx, ins.ival, ins.thenArgs)
   let elseMoves = blockArgMoves(cx, ins.ival2, ins.elseArgs)
