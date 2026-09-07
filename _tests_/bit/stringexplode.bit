@@ -1,0 +1,426 @@
+// _tests_/bit/stringexplode.bit — the differential gate for #3901's string
+// flip, and the ONLY thing that runs the `BIT_STRING_EXPLODE_TEST=1` path.
+//
+// WHY IT HAD TO EXIST. #4431 landed the box/unbox coercion boundary behind
+// that variable, #4437 wired it into five more container positions, and
+// #4422 turned the producer on — and `git grep BIT_STRING_EXPLODE_TEST --
+// _tests_ tools scripts` returned NOTHING before this file. Every gate in
+// the suite runs with the variable unset, so the whole mechanism was
+// unexecuted by anything: a green suite said only that the OFF path was
+// unchanged, which is the weaker half of what has to be true.
+//
+// THE ORACLE IS THE PROGRAM'S OWN OUTPUT WITH THE GATE OFF, not a captured
+// `.expected`. Explosion is a representation change and must be invisible, so
+// the same source compiled both ways must print the same bytes and exit the
+// same way. That makes the gate self-maintaining: adding a fixture below
+// costs no sidecar, and a fixture whose answer nobody hand-computed is still
+// a real check.
+//
+// A DIFFERENTIAL ALONE WOULD PASS IF THE FLIP STOPPED HAPPENING, which is the
+// direction that reads as an all-clear. So `allocCheck` below also asserts
+// that the slice-in-a-loop fixture allocates STRICTLY FEWER objects with the
+// gate on. That is the arm that fails if `localWordTypes`, `StringRecv` or
+// optstore's `slice_len` forwarding is reverted.
+//
+// WIRED INTO `./make test` as `test-string-explode`.
+
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir } from "std/fs"
+import { parseInt, trimSpace, indexOf } from "std/strings"
+
+const defaultTimeoutS: int = 120
+const maxTimeoutMs: int = 6000000
+
+fn requiredEnv(name: string): string {
+  let v = env(name)
+  if (v == "") {
+    eprint("stringexplode: ${name} is not set — refusing to guess.\n")
+    exit(2)
+  }
+  return v
+}
+
+fn timeoutMs(): int {
+  let raw = trimSpace(envOr("BIT_TEST_TIMEOUT_S", ""))
+  if (raw == "") {
+    return defaultTimeoutS * 1000
+  }
+  let s = parseInt(raw) catch _ {
+    return defaultTimeoutS * 1000
+  }
+  if (s <= 0) {
+    return maxTimeoutMs
+  }
+  if (s * 1000 > maxTimeoutMs) {
+    return maxTimeoutMs
+  }
+  return s * 1000
+}
+
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+class Fixture {
+  name: string,
+  src: string,
+}
+
+// Each fixture is a whole program whose output is a pure function of its
+// source, so the two compilations can be compared directly. They are chosen
+// to cover one position each, because #4412's receipt is that a coercion
+// missed at ONE position prints a wrong answer at exit 0 while every other
+// position still passes.
+// `${` cannot appear inside a fixture's source literal — the harness's own
+// lexer would read it as an interpolation of the harness, and the `\"` inside
+// it as a stray backslash. `IS` supplies the two characters at runtime, so a
+// fixture can still print with interpolation, which is what real Bit source
+// does.
+const IS: string = "$" + "{"
+
+// The producer, the receiver chain and the two inline readers.
+fn fixturesCore(): []Fixture {
+  return [
+    // The producer itself, and `allocCheck`'s probe. BOTH the receiver and
+    // the result are exploded LOCALS, and that is deliberate: with the
+    // receiver a PARAMETER instead, `emitInlineStringSlice` takes the boxed
+    // path and a mutation deleting `lowerStringRecv`'s word arm passes
+    // unnoticed — measured against that mutant, not assumed. The slice
+    // crosses an if-join and a loop back edge and is consumed only by `len`.
+    Fixture{
+      name: "loop_len",
+      src: "fn main() {\n" +
+        "  let s = \"abcdefghijklmnopqrst\"\n  let n = 0\n  let w = 0\n" +
+        "  while (w < len(s) - 8) {\n    let a = s[w:w + 8]\n" +
+        "    if (len(a) == 8) { n = n + 1 }\n    w = w + 1\n  }\n" +
+        "  print(\"" +
+        IS +
+        "n}\\n\")\n}\n",
+    },
+    // A slice of a slice: the receiver arrives as words and the result's
+    // `base` word must still root the bytes.
+    Fixture{
+      name: "chained",
+      src: "fn main() {\n" +
+        "  let s = \"abcdefghij\"\n  let a = s[2:9]\n  let b = a[1:5]\n" +
+        "  print(\"" +
+        IS +
+        "a} " +
+        IS +
+        "b} " +
+        IS +
+        "len(b)} " +
+        IS +
+        "b[0]}\\n\")\n}\n",
+    },
+    // Omitted bounds, both directions, plus a byte index through a sliced
+    // local — the `s[i]` twin of the slice.
+    Fixture{
+      name: "bounds",
+      src: "fn main() {\n" +
+        "  let s = \"0123456789\"\n  let a = s[3:]\n  let b = s[:4]\n" +
+        "  print(\"" +
+        IS +
+        "a} " +
+        IS +
+        "b} " +
+        IS +
+        "a[0]} " +
+        IS +
+        "b[3]} " +
+        IS +
+        "len(a)} " +
+        IS +
+        "len(b)}\\n\")\n}\n",
+    },
+    // Equality: `rt_call string_eq`, which takes ONE boxed word, so an
+    // exploded value has to be boxed back on the way in.
+    Fixture{
+      name: "equality",
+      src: "fn main() {\n" +
+        "  let s = \"abcabcabc\"\n  let a = s[0:3]\n  let b = s[3:6]\n  let c = s[1:4]\n" +
+        "  print(\"" +
+        IS +
+        "a == b} " +
+        IS +
+        "a == c} " +
+        IS +
+        "a != c}\\n\")\n}\n",
+    },
+  ]
+}
+
+// Every position that stays BOXED until #4423/#4424/#4426: a call
+// argument, a return, five container slots, a null header, and a value
+// held live across collections.
+fn fixturesBoundary(): []Fixture {
+  return [
+    // The argument and return positions (#4423/#4424 have not flipped, so
+    // both must still see one boxed word).
+    Fixture{
+      name: "callret",
+      src: "fn mid(s: string): string { return s[1:len(s) - 1] }\n" +
+        "fn wrap(a: string, b: string): string { return a + \"|\" + b }\n" +
+        "fn main() {\n  let s = \"xhellox\"\n  let m = mid(s)\n" +
+        "  print(\"" +
+        IS +
+        "wrap(m, m[1:3])} " +
+        IS +
+        "len(m)}\\n\")\n}\n",
+    },
+    // Container positions, all five #4437 wired: slice element, map key,
+    // map value, class field, closure capture.
+    Fixture{
+      name: "containers",
+      src: "class Box { f: string }\n" +
+        "fn main() {\n  let s = \"alphabetsoup\"\n  let xs = [s[0:5], s[5:8]]\n" +
+        "  let m = map<string, string>{}\n  m[s[0:5]] = s[5:8]\n" +
+        "  let bx = Box{f: s[2:6]}\n  let cap = s[1:4]\n  let f = () => cap + \"!\"\n" +
+        "  print(\"" +
+        IS +
+        "xs[0]} " +
+        IS +
+        "xs[1]} " +
+        IS +
+        "m[s[0:5]]} " +
+        IS +
+        "bx.f} " +
+        IS +
+        "f()}\\n\")\n}\n",
+    },
+    // A zero-valued class's string field is the NULL word, not an empty
+    // header, and every word read goes through the same `isHeaderBase`
+    // guard. Slicing it must stay a 0-length answer rather than a fault.
+    Fixture{
+      name: "nullfield",
+      src: "class Z { f: string, n: int }\n" +
+        "fn main() {\n  let z = Z{}\n  let a = z.f[0:0]\n  let empty = \"\"\n" +
+        "  print(\"" +
+        IS +
+        "len(a)} " +
+        IS +
+        "len(z.f)} " +
+        IS +
+        "a == empty}\\n\")\n}\n",
+    },
+    // A slice kept live across an allocation-heavy loop: the interior `ptr`
+    // word must not outlive the `base` word that roots it (#4406/#4425).
+    Fixture{
+      name: "acrossgc",
+      src: "fn main() {\n" +
+        "  let s = \"the quick brown fox jumps over the lazy dog\"\n" +
+        "  let a = s[4:9]\n  let acc = 0\n  let i = 0\n" +
+        "  while (i < 20000) {\n    let junk = [i, i + 1, i + 2]\n" +
+        "    acc = acc + junk[0] + a[0]\n    i = i + 1\n  }\n" +
+        "  print(\"" +
+        IS +
+        "a} " +
+        IS +
+        "acc}\\n\")\n}\n",
+    },
+  ]
+}
+
+fn fixtures(): []Fixture {
+  let out = fixturesCore()
+  for f of fixturesBoundary() {
+    out = append(out, f)
+  }
+  return out
+}
+
+// Runs `bin build <src> -o <bin>` then the binary, with `extraEnv` lines
+// exported first. Returns (exit code, stdout, stderr).
+fn runOne(dir: string, tag: string, cmd: string, extraEnv: string): (int, string, string) {
+  let shPath = "${dir}/${tag}.sh"
+  let outPath = "${dir}/${tag}.out"
+  let errPath = "${dir}/${tag}.err"
+  let script = "#!/bin/sh\n" +
+    extraEnv +
+    cmd +
+    " > " +
+    shQuote(outPath) +
+    " 2> " +
+    shQuote(errPath) +
+    "\n"
+  writeFile(shPath, script) catch e {
+    eprint("stringexplode: cannot write ${shPath}: ${e.message()}\n")
+    exit(2)
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    eprint("stringexplode: cannot chmod ${shPath}\n")
+    exit(2)
+  }
+  let code = osRunBounded(shPath, timeoutMs())
+  let out = readFile(outPath) catch _ {
+    ""
+  }
+  let err = readFile(errPath) catch _ {
+    ""
+  }
+  return code, out, err
+}
+
+class Env {
+  bin: string,
+  stdlib: string,
+  libbitrt: string,
+  dir: string,
+}
+
+fn baseEnv(e: Env): string {
+  return "BIT_STDLIB=" +
+    shQuote(e.stdlib) +
+    "\nexport BIT_STDLIB\n" +
+    "BIT_LIBBITRT=" +
+    shQuote(e.libbitrt) +
+    "\nexport BIT_LIBBITRT\n"
+}
+
+// Compiles `srcPath` with the gate in state `on`, then runs the result.
+fn buildAndRun(e: Env, srcPath: string, tag: string, on: bool): (int, string, string) {
+  let exe = "${e.dir}/${tag}.bin"
+  let gate = ""
+  if (on) {
+    gate = "BIT_STRING_EXPLODE_TEST=1\nexport BIT_STRING_EXPLODE_TEST\n"
+  }
+  let (bc, bout, berr) = runOne(
+    e.dir, "${tag}.build", shQuote(e.bin) + " build " + shQuote(srcPath) + " -o " + shQuote(exe),
+    baseEnv(e) + gate,
+  )
+  if (bc != 0) {
+    return bc, bout, "build failed: " + berr
+  }
+  return runOne(e.dir, "${tag}.run", shQuote(exe), "")
+}
+
+// swept+live out of a `[bit-gc] ...` stderr line: the object count for the
+// whole run, which is deterministic and load-insensitive.
+fn gcObjects(err: string): int {
+  let sw = indexOf(err, "swept=")
+  let lv = indexOf(err, "live=")
+  if (sw < 0 || lv < 0) {
+    return -1
+  }
+  let a = parseInt(fieldAt(err, sw + 6)) catch _ {
+    return -1
+  }
+  let b = parseInt(fieldAt(err, lv + 5)) catch _ {
+    return -1
+  }
+  return a + b
+}
+
+fn fieldAt(s: string, start: int): string {
+  let i = start
+  while (i < len(s) && s[i] != 32 && s[i] != 10) {
+    i = i + 1
+  }
+  return s[start:i]
+}
+
+// The arm that fails when the flip stops flipping. A differential alone
+// cannot tell "explodes correctly" from "no longer explodes at all".
+fn allocCheck(e: Env, srcPath: string): bool {
+  let (c1, o1, e1) = runGcStats(e, srcPath, "alloc.off", false)
+  let (c2, o2, e2) = runGcStats(e, srcPath, "alloc.on", true)
+  if (c1 != 0 || c2 != 0) {
+    eprint("stringexplode: FAIL — alloc probe exited ${c1}/${c2}\n${e1}\n${e2}\n")
+    return false
+  }
+  if (o1 != o2) {
+    eprint("stringexplode: FAIL — alloc probe printed different output: ${o1} vs ${o2}\n")
+    return false
+  }
+  let n1 = gcObjects(e1)
+  let n2 = gcObjects(e2)
+  if (n1 < 0 || n2 < 0) {
+    eprint("stringexplode: FAIL — no [bit-gc] line; BIT_GC_STATS=1 did not take\n")
+    return false
+  }
+  if (n2 >= n1) {
+    eprint("stringexplode: FAIL — the flip removed no allocation: ${n1} objects off, ${n2} on (want strictly fewer)\n")
+    return false
+  }
+  println("stringexplode: alloc probe — ${n1} objects gate-off, ${n2} gate-on")
+  return true
+}
+
+fn runGcStats(e: Env, srcPath: string, tag: string, on: bool): (int, string, string) {
+  let exe = "${e.dir}/${tag}.bin"
+  let gate = ""
+  if (on) {
+    gate = "BIT_STRING_EXPLODE_TEST=1\nexport BIT_STRING_EXPLODE_TEST\n"
+  }
+  let (bc, _, berr) = runOne(
+    e.dir, "${tag}.build", shQuote(e.bin) + " build " + shQuote(srcPath) + " -o " + shQuote(exe),
+    baseEnv(e) + gate,
+  )
+  if (bc != 0) {
+    return bc, "", berr
+  }
+  return runOne(e.dir, "${tag}.run", shQuote(exe), "BIT_GC_STATS=1\nexport BIT_GC_STATS\n")
+}
+
+fn writeFixture(dir: string, fx: Fixture): string {
+  let srcPath = "${dir}/${fx.name}.bit"
+  writeFile(srcPath, fx.src) catch e {
+    eprint("stringexplode: cannot write ${srcPath}: ${e.message()}\n")
+    exit(2)
+  }
+  return srcPath
+}
+
+fn checkFixture(e: Env, fx: Fixture): bool {
+  let srcPath = writeFixture(e.dir, fx)
+  let (c1, o1, e1) = buildAndRun(e, srcPath, "${fx.name}.off", false)
+  let (c2, o2, e2) = buildAndRun(e, srcPath, "${fx.name}.on", true)
+  if (c1 != c2 || o1 != o2) {
+    eprint("stringexplode: FAIL ${fx.name} — gate off exit ${c1} / gate on exit ${c2}\n")
+    eprint("  off stdout: ${o1}\n  on  stdout: ${o2}\n")
+    eprint("  off stderr: ${e1}\n  on  stderr: ${e2}\n")
+    return false
+  }
+  return true
+}
+
+fn main() {
+  let e = Env{
+    bin: requiredEnv("BIT_BIN"),
+    stdlib: requiredEnv("BIT_STDLIB"),
+    libbitrt: requiredEnv("BIT_LIBBITRT"),
+    dir: envOr("TMPDIR", "/tmp") + "/bit-stringexplode-${timeUnixNs()}",
+  }
+  mkdir(e.dir) catch err {
+    eprint("stringexplode: cannot create ${e.dir}: ${err.message()}\n")
+    exit(2)
+  }
+  let fxs = fixtures()
+  let ok = 0
+  let bad = 0
+  for fx of fxs {
+    if (checkFixture(e, fx)) {
+      ok = ok + 1
+    } else {
+      bad = bad + 1
+    }
+  }
+  if (!allocCheck(e, "${e.dir}/loop_len.bit")) {
+    bad = bad + 1
+  }
+  if (bad != 0) {
+    eprint("stringexplode: FAIL — ${bad} of ${len(fxs) + 1} check(s) failed\n")
+    exit(1)
+  }
+  println("stringexplode: PASS — ${ok}/${len(fxs)} fixtures byte-identical with the explode gate on and off, plus the allocation probe")
+}
