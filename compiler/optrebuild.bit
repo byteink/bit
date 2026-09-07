@@ -160,6 +160,12 @@ class RebuildCtx {
   // block an emitted terminator branches to without re-deciding which arm of a
   // folded `br` survived.
   newToOld: []int,
+  // #4406: which old value ids have a meaningful `remap` entry. `remap` is
+  // zero-filled and 0 is a legal value id, so a keepalive edge naming an
+  // instruction this rebuild dropped would otherwise silently re-point at
+  // whatever landed in slot 0 — a live-range extension on the wrong value,
+  // which is worse than no edge at all.
+  emitted: []bool,
 }
 
 // Block ids in their original emission order (ascending `instsStart`), NOT
@@ -195,6 +201,37 @@ fn canForward(plan: RebuildPlan, idx: int): bool {
   return plan.fwd[idx] >= 0 && plan.keep[plan.fwd[idx]]
 }
 
+// #4406: keepalive pairs translated through a rebuild that emits EVERY
+// instruction (optappend.bit, optclosure.bit, optinline.bit) and so needs no
+// survivor mask. `rebuild`'s own `remapKeepAlive` is the pruning variant.
+fn trKeepAlive(keepAlive: []int, remap: []int): []int {
+  let out = []int(0)
+  let i = 0
+  while (i + 1 < len(keepAlive)) {
+    let d = keepAlive[i]
+    let b = keepAlive[i + 1]
+    if (d >= 0 && d < len(remap) && b >= 0 && b < len(remap) && remap[d] != remap[b]) {
+      out = append(out, remap[d])
+      out = append(out, remap[b])
+    }
+    i = i + 2
+  }
+  return out
+}
+
+// Appends `g`'s keepalive pairs, translated through `remap`, to `b`'s own. The
+// inliner's shape: a spliced callee's edges have to reach the CALLER's list or
+// they are lost, and losing one reopens the interior-pointer hazard in exactly
+// the bodies the inliner flattened.
+fn builderAddKeepAlive(b: IrBuilder, keepAlive: []int, remap: []int) {
+  let tr = trKeepAlive(keepAlive, remap)
+  let i = 0
+  while (i < len(tr)) {
+    b.keepAlive = append(b.keepAlive, tr[i])
+    i = i + 1
+  }
+}
+
 // Emits one kept block: its params first (always, plus any optloop.bit hoisted
 // onto this block as a loop header), then each instruction the plan keeps.
 // A forwarded instruction emits NOTHING and takes its source's new id, which is
@@ -212,6 +249,7 @@ fn rebuildBlock(rc: RebuildCtx, bi: int) {
   let paramsEnd = blk.instsStart + blk.paramCount
   while (idx < paramsEnd) {
     rc.remap[idx] = builderAddParam(rc.b, rc.f.instrs[idx].ty)
+    rc.emitted[idx] = true
     idx = idx + 1
   }
   licmAddParams(rc, bi)
@@ -235,12 +273,67 @@ fn rebuildOne(rc: RebuildCtx, bi: int, idx: int) {
   }
   if (canForward(rc.plan, idx)) {
     rc.remap[idx] = rc.remap[rc.plan.fwd[idx]]
+    // A forwarded load emits nothing and takes its source's id, so an edge
+    // naming it must follow onto that source — which is exactly the value the
+    // interior word now reads.
+    rc.emitted[idx] = rc.emitted[rc.plan.fwd[idx]]
     return
   }
   if (rc.plan.keep[idx]) {
     emitTranslated(rc.b, rc.f, rc.plan.known, rc.remap, rc.blockMap, idx)
     licmExtendEdges(rc)
+    rc.emitted[idx] = true
   }
+}
+
+// #4406: the keepalive pairs, translated into the rebuilt function's value
+// space. A pair whose either endpoint did not survive is DROPPED rather than
+// re-pointed: the derived value being gone means nothing dereferences the
+// interior address any more, and a base that is gone was already proven
+// unreachable by the same sweep that keeps this edge alive (`computeLive`
+// treats a pair as a use).
+fn remapKeepAlive(rc: RebuildCtx): []int {
+  let out = []int(0)
+  let i = 0
+  while (i + 1 < len(rc.f.keepAlive)) {
+    let d = rc.f.keepAlive[i]
+    let b = rc.f.keepAlive[i + 1]
+    if (d >= 0 &&
+      d < len(rc.emitted) &&
+      b >= 0 &&
+      b < len(rc.emitted) &&
+      rc.emitted[d] &&
+      rc.emitted[b] &&
+      rc.remap[d] != rc.remap[b] &&
+      !keepAliveDerivedIsConst(rc, d)) {
+      out = append(out, rc.remap[d])
+      out = append(out, rc.remap[b])
+    }
+    i = i + 2
+  }
+  return out
+}
+
+// A CONSTANT is not derived from a runtime allocation, so an edge out of one
+// pins a base for nothing. The lowerer cannot see this: it records the edge
+// from the aggregate's SHAPE, before anything is folded, and `(3, "x")` has the
+// same shape as `(ptrOf(s) + 1, s)`.
+//
+// Measured, and it is why this exists: over the 1093-file corpus exactly ONE
+// file's `--dump-ir` moved without it — `check_types_tuple_index.bit`, where
+// `pair()` inlines to two constants and the dead `const_string "x"` then
+// survived DCE. Dropping the edge restores byte-identical IR across the whole
+// corpus, so `selfhost-diffir`/`diffiropt` cannot move.
+fn keepAliveDerivedIsConst(rc: RebuildCtx, d: int): bool {
+  if (rc.plan.known[d].known) {
+    return true
+  }
+  let op = rc.f.instrs[d].op
+  return op == Op.ConstInt ||
+    op == Op.ConstFloat ||
+    op == Op.ConstBool ||
+    op == Op.ConstString ||
+    op == Op.ConstNil
 }
 
 // Rebuilds `f`, keeping only blocks marked in `plan.blockReachable` and, within
@@ -269,6 +362,12 @@ fn rebuild(f: IrFunc, plan: RebuildPlan): IrFunc {
     newToOld = append(newToOld, 0)
     i = i + 1
   }
+  let emitted = []bool(0)
+  i = 0
+  while (i < len(f.instrs)) {
+    emitted = append(emitted, false)
+    i = i + 1
+  }
   i = 0
   while (i < n) {
     if (plan.blockReachable[order[i]]) {
@@ -279,7 +378,7 @@ fn rebuild(f: IrFunc, plan: RebuildPlan): IrFunc {
   }
   let rc = RebuildCtx{
     b: b, f: f, plan: plan, remap: remap, blockMap: blockMap,
-    newToOld: newToOld,
+    newToOld: newToOld, emitted: emitted,
   }
   i = 0
   while (i < n) {
@@ -299,5 +398,9 @@ fn rebuild(f: IrFunc, plan: RebuildPlan): IrFunc {
     // §11.9: the pin flag rides the same rebuild and has the same failure mode —
     // losing it makes a runtime entry point LOCAL and fails the link loudly.
     inRootModule: f.inRootModule, isPinned: f.isPinned,
+    // #4406: the GC keepalive edges ride the rebuild for the same reason the
+    // two flags above do — a field left off a literal zero-fills, and losing
+    // an edge here reopens the interior-pointer hazard silently.
+    keepAlive: remapKeepAlive(rc),
   }
 }

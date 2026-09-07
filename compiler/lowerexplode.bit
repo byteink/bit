@@ -156,10 +156,17 @@ fn explodeCallArgs(
     if (len(words) == 0) {
       out = append(out, args[i])
     } else {
+      let ids = []int(0)
       let k = 0
       while (k < len(words)) {
-        out = append(out, explodedWordGet(ctx, b, paramTypes[i], args[i], k))
+        ids = append(ids, explodedWordGet(ctx, b, paramTypes[i], args[i], k))
         k = k + 1
+      }
+      recordWordKeepAlive(ctx, b, words, ids)
+      let j = 0
+      while (j < len(ids)) {
+        out = append(out, ids[j])
+        j = j + 1
       }
     }
     i = i + 1
@@ -270,6 +277,7 @@ fn declareLetLocal(fc: FnCtx, name: string, value: int, ty: int) {
   }
   let lo = explodedWordGet(fc.c.ctx, fc.b, ty, value, 0)
   let hi = explodedWordGet(fc.c.ctx, fc.b, ty, value, 1)
+  recordWordKeepAlive(fc.c.ctx, fc.b, words, [lo, hi])
   fc.env = append(
     fc.env,
     LocalBind{
@@ -447,7 +455,7 @@ fn explodedRetValues(fc: FnCtx, v: int, ty: int, words: []int): []int {
 // immediately after its call and in ascending word order — nothing may be
 // emitted between the `bl` and the last binding (#4236) — which
 // `callWordEscapesInFunc` (verify.bit) refuses to let drift.
-fn emitCallResultWords(b: IrBuilder, call: int, words: []int): []int {
+fn emitCallResultWords(ctx: TypeContext, b: IrBuilder, call: int, words: []int): []int {
   let out = [call]
   let k = 1
   while (k < len(words)) {
@@ -457,5 +465,107 @@ fn emitCallResultWords(b: IrBuilder, call: int, words: []int): []int {
     out = append(out, builderEmit(b, w))
     k = k + 1
   }
+  // #4406: word 0 IS the call, so the run is where a multi-word result stops
+  // being one value. The box `buildTuple` wraps these in dies to store-to-load
+  // forwarding, and after that nothing but these edges couples the words.
+  recordWordKeepAlive(ctx, b, words, out)
   return out
+}
+
+// ===========================================================================
+// Keepalive edges (#4406)
+//
+// THE HAZARD THIS CLOSES, reproduced on `df423d13` before any of it was
+// written. `explodedWordTypes` admits a tuple whose members are each one word,
+// and `*T` (SPEC §11.4) is one word the GC must never follow (`isRefType`,
+// codegen.bit). So `(ptrOf(s) + 1, s)` is an exploded aggregate whose word 0 is
+// an INTERIOR address into `s`'s buffer and whose word 1 is the only thing that
+// roots it. Explosion makes the two independent SSA values with nothing between
+// them, so word 1's live interval ends at its last use — which is nowhere, when
+// the consumer reads only word 0:
+//
+//   %1 = call @mkPair(%0) *i64        word 0, the interior pointer
+//   %2 = call_word %1[1] []i64        word 1, the base, never read again
+//   %3 = call @churn() i64            SAFEPOINT, stack map regs=[]
+//   %4 = field_get %1[0] i64          dereferences the interior pointer
+//
+// Conservative scanning does not save it: `gcOwns` (runtime/gc/gcalloc.bit) is
+// exact base equality, so the interior word roots nothing. Measured: 1234 under
+// the default collector, `0` under `BIT_GC=stress`, exit 0 both times. With the
+// same program built from `ptrOf(s) + 0` — a BASE pointer, everything else
+// identical — stress prints 1234, which is what isolates interior-ness rather
+// than the missing root as the cause.
+//
+// WHERE THE EDGES ARE RECORDED: exactly where the aggregate is taken apart into
+// words, so there is one rule rather than a list of shapes. Every non-traced
+// word is paired with every traced word of the same aggregate. Pairing `len`
+// with `base` as well as `ptr` is deliberate and is the reason there is no
+// "which word is the pointer" test here: the lowerer does not know, and a word
+// that is merely an integer costs the base a slightly longer interval rather
+// than a wrong answer.
+//
+// A `return`'s words are NOT recorded. `explodedRetValues` emits them adjacent
+// to the `ret` that consumes them, so there is no safepoint left in this
+// function for the base to be dead across; the caller's own edges (recorded by
+// `recordCallResultKeepAlive` on the receiving side) carry it from there.
+// ===========================================================================
+
+// Records "value `derived` must not outlive value `base`".
+fn builderKeepAlive(b: IrBuilder, derived: int, base: int) {
+  if (derived == base) {
+    return
+  }
+  b.keepAlive = append(b.keepAlive, derived)
+  b.keepAlive = append(b.keepAlive, base)
+}
+
+// Pairs every non-traced word of one aggregate with every traced word of it.
+// `words` are the per-word TYPES and `ids` the value ids, positionally.
+fn recordWordKeepAlive(ctx: TypeContext, b: IrBuilder, words: []int, ids: []int) {
+  let k = 0
+  while (k < len(words) && k < len(ids)) {
+    if (!isRefType(ctx, words[k])) {
+      let t = 0
+      while (t < len(words) && t < len(ids)) {
+        if (isRefType(ctx, words[t])) {
+          builderKeepAlive(b, ids[k], ids[t])
+        }
+        t = t + 1
+      }
+    }
+    k = k + 1
+  }
+}
+
+// The parameter side: `paramIds` is the FLAT block-0 parameter list
+// `explodeParamTypes` produced, so this walks `paramTypes` with the same cursor
+// that built it and hands each exploded parameter's own run to
+// `recordWordKeepAlive`. `on` is `explodesParams`, so an ineligible declaration
+// records nothing — its single handle is its own root.
+fn recordParamKeepAlive(
+  ctx: TypeContext, b: IrBuilder, paramTypes: []int, paramIds: []int, on: bool,
+) {
+  if (!on || !anyExplodedParam(ctx, paramTypes)) {
+    return
+  }
+  let at = 0
+  let i = 0
+  while (i < len(paramTypes)) {
+    let words = explodedWordTypes(ctx, paramTypes[i])
+    if (len(words) == 0) {
+      at = at + 1
+    } else {
+      let ids = []int(0)
+      let k = 0
+      while (k < len(words)) {
+        if (at + k < len(paramIds)) {
+          ids = append(ids, paramIds[at + k])
+        }
+        k = k + 1
+      }
+      recordWordKeepAlive(ctx, b, words, ids)
+      at = at + len(words)
+    }
+    i = i + 1
+  }
 }
