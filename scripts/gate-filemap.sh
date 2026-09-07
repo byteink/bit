@@ -265,6 +265,12 @@ gates_for_file() {
     # individual checkXxx functions split into a lintcmdchecks.bit sibling,
     # the same shape as _tests_/bit/pmrangegate/* above.
     _tests_/bit/lintcmd/*) printf 'test-lint\n'; return 0 ;;
+    # #4441: split from a single file (_tests_/bit/checkerdiag.bit, 799 lines
+    # with zero headroom on the 800-line ceiling) to a directory module — the
+    # wrapped-process/run machinery split into a checkerdiagrun.bit sibling,
+    # the same shape as _tests_/bit/pmrangegate/* and _tests_/bit/lintcmd/*
+    # above.
+    _tests_/bit/checkerdiag/*) printf 'test-checker-diag\n'; return 0 ;;
     _tests_/bit/pollfree/*) printf 'test-pollfree\n'; return 0 ;;
     # #3822: split from a single file to a directory module (the receiver-form
     # baseline migration needed its own sibling — see receiverform.bit's own
