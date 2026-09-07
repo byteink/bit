@@ -19,6 +19,30 @@ that one path is empty -- exactly `bfda26a0`'s own parent, `01878950`, in
 the real #4064 transition. Reverting find_boundary_commit's `resolve_parent`
 call to instead read the previous entry in the path-filtered `shas` list
 makes this case fail.
+
+#4416 adds the LAYOUT-refusal cases (`test_parse_layout_mismatches`,
+`test_layout_boundary_uses_true_parent_not_filtered_log_adjacency`,
+`test_derive_layout_base_picks_the_earliest_across_constants`,
+`test_verify_layout_base`), mirroring the arity cases above but exercising
+`./make dump-layout-consts` (tools/build/abilayout.bit's own
+`stepDumpLayoutConsts`) instead of `./make dump-abi-symbols`. The fake repo's
+layout constants MUST use names `tools/build/abilayout.bit`'s
+`abiLayoutConsts()` actually lists (e.g. `gcHeaderSize` in `gc/gc.bit`,
+`slcHeaderSize` in `root/root.bit`) -- unlike the arity path, the driver does
+not take an arbitrary symbol name, only the fixed, hand-picked constant
+table (this file's own header explains why: only fields a compiler-emitted
+literal actually writes, or that codegen must agree with the runtime on, are
+a real ABI data contract).
+
+`build_fake_layout_repo` gives each commit a distinct, explicit
+GIT_COMMITTER_DATE/GIT_AUTHOR_DATE (seconds apart) rather than relying on
+wall-clock time between back-to-back `git commit` calls: #4417 is the
+pre-existing bug this sidesteps -- `build_fake_repo` above has no such
+control, so its five commits can land in the same second-resolution
+timestamp, and `derive_base`'s `min(..., key=commit_time)` then breaks the
+tie by dict-iteration order instead of true chronological order
+(`test_derive_base_picks_the_earliest_across_symbols` is flaky on exactly
+this, independently of anything in this ticket).
 """
 import subprocess
 import sys
@@ -92,6 +116,82 @@ def check(desc, cond):
     return True
 
 
+def run_env(argv, cwd, env):
+    import os
+
+    return subprocess.run(
+        argv, cwd=str(cwd), capture_output=True, text=True, check=True, env={**os.environ, **env}
+    )
+
+
+def commit_dated(repo, msg, ts):
+    """Like commit() above, but with an explicit, non-wall-clock
+    GIT_AUTHOR_DATE/GIT_COMMITTER_DATE -- see this file's header on why the
+    layout fixtures need this and the arity ones (above) do not (#4417)."""
+    date = f"{ts} +0000"
+    run(["git", "add", "-A"], repo)
+    run_env(["git", "commit", "-q", "-m", msg], repo, {"GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date})
+    return run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
+
+
+def merge_dated(repo, msg, branch, ts):
+    date = f"{ts} +0000"
+    run_env(
+        ["git", "merge", "-q", "--no-ff", "-m", msg, branch],
+        repo,
+        {"GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date},
+    )
+    return run(["git", "rev-parse", "HEAD"], repo).stdout.strip()
+
+
+def write_layout_const(repo, rel_path, name, value):
+    p = repo / "runtime" / rel_path
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(f"export const {name} = {value}\n")
+
+
+def build_fake_layout_repo(tmp):
+    """G0 (slcHeaderSize 40) -> F1 (adds gc/gc.bit, gcHeaderSize 32) -> G1
+    (slcHeaderSize 48) -> [side branch, unrelated] -> F2 (merge, touches
+    NEITHER gc.bit NOR root.bit) -> F3 (gcHeaderSize 16, parent F2).
+
+    Mirrors build_fake_repo's shape exactly (same #4064-shaped merge-commit
+    trap for `find_boundary_commit`) but for named layout constants: the
+    dump driver (`./make dump-layout-consts`) only recognises the FIXED
+    table `tools/build/abilayout.bit`'s `abiLayoutConsts()` declares, not an
+    arbitrary name, so `gcHeaderSize`/`gc/gc.bit` and
+    `slcHeaderSize`/`root/root.bit` (both real entries) stand in for the
+    fake `bit_rt_foo`/`bit_rt_bar` symbols above."""
+    repo = Path(tmp) / "repo"
+    repo.mkdir()
+    run(["git", "init", "-q", "-b", "main"], repo)
+    run(["git", "config", "user.email", "test@test"], repo)
+    run(["git", "config", "user.name", "test"], repo)
+
+    t = 1700000000
+
+    write_layout_const(repo, "root/root.bit", "slcHeaderSize", 40)
+    g0 = commit_dated(repo, "G0: slcHeaderSize = 40", t)
+
+    write_layout_const(repo, "gc/gc.bit", "gcHeaderSize", 32)
+    f1 = commit_dated(repo, "F1: add gc.bit (gcHeaderSize = 32)", t + 10)
+
+    write_layout_const(repo, "root/root.bit", "slcHeaderSize", 48)
+    g1 = commit_dated(repo, "G1: slcHeaderSize gains a field (40 -> 48)", t + 20)
+
+    run(["git", "checkout", "-q", "-b", "side"], repo)
+    other = repo / "runtime" / "unrelated.bit"
+    other.write_text("// nothing exported here\n")
+    commit_dated(repo, "side: touch an unrelated file", t + 30)
+    run(["git", "checkout", "-q", "main"], repo)
+    f2 = merge_dated(repo, "F2: merge side (touches neither gc.bit nor root.bit)", "side", t + 40)
+
+    write_layout_const(repo, "gc/gc.bit", "gcHeaderSize", 16)
+    f3 = commit_dated(repo, "F3: gc header shrinks 32 -> 16", t + 50)
+
+    return repo, {"g0": g0, "f1": f1, "g1": g1, "f2": f2, "f3": f3}
+
+
 def test_parse_mismatches():
     ok = True
     text = (
@@ -156,14 +256,103 @@ def test_verify_base(tmp):
     return ok
 
 
+# ---- #4416: the LAYOUT refusal path -----------------------------------
+
+
+def test_parse_layout_mismatches():
+    ok = True
+    text = (
+        "make: selfhost: runtime ABI arity scan: parsed=818 dropped=0\n"
+        "make: selfhost: refusing to link — runtime object LAYOUT mismatch against the pinned stage0 (v0.10.0):\n"
+        "make:   gcHeaderSize (runtime/gc/gc.bit): stage0 (v0.10.0) was built expecting 32; this tree's runtime/** now declares 16\n"
+        "make: stage0 is the compiler that EMITS this object's layout...\n"
+    )
+    ms = atp.parse_layout_mismatches(text)
+    ok &= check("parse_layout_mismatches finds exactly one mismatch", len(ms) == 1)
+    ok &= check("parsed name", ms[0].name == "gcHeaderSize")
+    ok &= check("parsed file", ms[0].file == "gc/gc.bit")
+    ok &= check("parsed stage0 value", ms[0].stage0_value == 32)
+    ok &= check("parsed tree value", ms[0].tree_value == 16)
+
+    ok &= check(
+        "no marker -> no layout mismatches",
+        atp.parse_layout_mismatches("make: libbitrt-aarch64-macos failed (1)\n") == [],
+    )
+
+    # An ARITY refusal (the OTHER member of this guard family) must not be
+    # mistaken for a LAYOUT one -- the two markers/regexes are disjoint.
+    arity_text = (
+        "make: selfhost: refusing to link — runtime ABI arity mismatch against the pinned stage0 (v0.7.0):\n"
+        "make:   bit_rt_map_new (root/maps.bit): stage0 (v0.7.0) emits calls for 2 arg(s); "
+        "this tree's runtime/** now declares 3\n"
+    )
+    ok &= check("an ARITY refusal parses to zero layout mismatches", atp.parse_layout_mismatches(arity_text) == [])
+    ok &= check("...and the arity parser still sees it (unaffected)", len(atp.parse_mismatches(arity_text)) == 1)
+    return ok
+
+
+def test_layout_boundary_uses_true_parent_not_filtered_log_adjacency(tmp):
+    repo, sha = build_fake_layout_repo(tmp)
+
+    log = run(["git", "log", "--format=%H", "--", "runtime/gc/gc.bit"], repo).stdout.split()
+    ok = check("path-filtered log for gc.bit omits the merge commit F2", sha["f2"] not in log)
+    ok &= check("path-filtered log for gc.bit includes F1 and F3", sha["f1"] in log and sha["f3"] in log)
+
+    base = atp.find_boundary_commit(
+        repo, DRIVER_ROOT, "gc/gc.bit", "gcHeaderSize", 32, atp.layout_value_at_commit, "value"
+    )
+    ok &= check(f"boundary for gcHeaderSize is F2 ({sha['f2'][:8]}), not F1 ({sha['f1'][:8]})", base == sha["f2"])
+    return ok
+
+
+def test_derive_layout_base_picks_the_earliest_across_constants(tmp):
+    repo, sha = build_fake_layout_repo(tmp)
+    mismatches = [
+        atp.LayoutMismatch("gcHeaderSize", "gc/gc.bit", "v9.9.9", 32, 16),
+        atp.LayoutMismatch("slcHeaderSize", "root/root.bit", "v9.9.9", 40, 48),
+    ]
+    base = atp.derive_layout_base(repo, DRIVER_ROOT, mismatches)
+    return check(f"combined base is F1 ({sha['f1'][:8]}), the earlier of the two boundaries", base == sha["f1"])
+
+
+def test_verify_layout_base(tmp):
+    repo, sha = build_fake_layout_repo(tmp)
+    mismatches = [
+        atp.LayoutMismatch("gcHeaderSize", "gc/gc.bit", "v9.9.9", 32, 16),
+        atp.LayoutMismatch("slcHeaderSize", "root/root.bit", "v9.9.9", 40, 48),
+    ]
+    ok = True
+    try:
+        atp.verify_layout_base(repo, DRIVER_ROOT, sha["f1"], mismatches)
+        ok &= check("verify_layout_base accepts the correct base (F1)", True)
+    except RuntimeError as e:
+        ok &= check(f"verify_layout_base accepts the correct base (F1) -- raised {e!r}", False)
+
+    # Mutation control: F3 has gcHeaderSize at 16, not the stage0 value (32)
+    # the mismatch set demands -- verify_layout_base MUST refuse it.
+    try:
+        atp.verify_layout_base(repo, DRIVER_ROOT, sha["f3"], mismatches)
+        ok &= check("verify_layout_base rejects a wrong base (F3)", False)
+    except RuntimeError:
+        ok &= check("verify_layout_base rejects a wrong base (F3)", True)
+    return ok
+
+
 def main() -> int:
     ok = test_parse_mismatches()
+    ok &= test_parse_layout_mismatches()
     with tempfile.TemporaryDirectory(prefix="abitwopass-test-") as tmp1:
         ok &= test_boundary_uses_true_parent_not_filtered_log_adjacency(tmp1)
+    with tempfile.TemporaryDirectory(prefix="abitwopass-test-") as tmp1b:
+        ok &= test_layout_boundary_uses_true_parent_not_filtered_log_adjacency(tmp1b)
     with tempfile.TemporaryDirectory(prefix="abitwopass-test-") as tmp2:
         ok &= test_derive_base_picks_the_earliest_across_symbols(tmp2)
+    with tempfile.TemporaryDirectory(prefix="abitwopass-test-") as tmp2b:
+        ok &= test_derive_layout_base_picks_the_earliest_across_constants(tmp2b)
     with tempfile.TemporaryDirectory(prefix="abitwopass-test-") as tmp3:
         ok &= test_verify_base(tmp3)
+    with tempfile.TemporaryDirectory(prefix="abitwopass-test-") as tmp3b:
+        ok &= test_verify_layout_base(tmp3b)
 
     if not ok:
         print("dist/abitwopass_test.py: FAILED", file=sys.stderr)
