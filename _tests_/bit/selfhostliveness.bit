@@ -1,0 +1,364 @@
+// `./make test-selfhost-liveness` (#4434): `stepSelfhost`
+// (tools/build/artifactsteps.bit) used to short-circuit to "up to date" on
+// `readStamp(selfhostStamp()) == compilerFp && exists(binPath)` — the only
+// claim made about the ARTIFACT was that the file is present. A corrupt,
+// unsigned, truncated or SIGKILL-on-exec binary still exists(), so the
+// guard was satisfied by a file that cannot run, and `./make` reported
+// success while rebuilding nothing.
+//
+// PROVEN as the real failure shape, not assumed: observed on merged main
+// `b8cedabe`, 2026-09-07 — `bit-out/bin/bit --version` returned rc=137 with
+// empty stdout AND stderr (macOS "Code Signature Invalid"), no make-driver
+// running, memory 93% free, yet `./make` printed "libbitrt — up to date"
+// and "selfhost — up to date" and rebuilt nothing. `rm -f
+// bit-out/make/fp-selfhost.stamp` forced the rebuild and the binary came
+// back rc=0.
+//
+// THIS GATE NEVER TOUCHES BIT_REPO's OWN bit-out/bin/bit — a SCRATCH CLONE
+// of the whole repo instead, and that is load-bearing, not caution for its
+// own sake. Every `_tests_/bit/*.bit` gate is itself run as `exec
+// <BIT_REPO>/bit-out/bin/bit run <this file>` (tools/build/gatesexec.bit's
+// `gateEnvExecScript`), so THIS PROCESS is, for its whole lifetime, a live
+// mapping of that exact binary. Proven directly: with an unrelated
+// long-lived `bit-out/bin/bit` process kept alive (`sleep`), rewriting
+// bit-out/bin/bit and then exec'ing it FROM A TOTALLY SEPARATE SHELL still
+// returned rc=137 with empty output, on ten retries two seconds apart, and
+// cleared immediately (rc=0) the instant the old process was killed — a
+// macOS kernel behaviour (a still-mapped vnode blocks fresh execs of a
+// rewritten file at the same path) that is orthogonal to this ticket's fix
+// and unrelated to binary corruption. A gate that corrupted-then-verified
+// BIT_REPO's own live binary would therefore deadlock against ITSELF on
+// every run, not test the fix. A scratch clone (a distinct vnode from
+// creation, `cp -R`, ~64MB, well under a second) sidesteps this entirely:
+// nothing has ever exec'd that path, so a fresh exec right after its own
+// rebuild is unaffected by this process's continued liveness — confirmed
+// directly, same worst-case stale-mapping setup, scratch exec rc=0.
+//
+// Deliberately NOT in gateSteps(): a full `./make selfhost` rebuild inside
+// the mutation phase costs real minutes — same reason
+// _tests_/bit/walkbitcheck.bit (#4433) is kept out. `./make
+// test-selfhost-liveness` runs it explicitly.
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile } from "std/fs"
+import { contains, parseInt } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "600")) catch _ {
+    600
+  }
+  if (s <= 0) {
+    return 600000
+  }
+  return s * 1000
+}
+
+// Set unconditionally by this gate's own `Gate{}` entry
+// (tools/build/gatestable2.bit) — see _tests_/bit/coldboot.bit's `repoRoot`
+// for why a "." fallback would be the wrong kind of quiet default here.
+// READ-ONLY: this is the source the scratch clone is made FROM; nothing in
+// this file ever writes into it.
+fn repoRoot(): string {
+  let r = env("BIT_REPO")
+  if (len(r) == 0) {
+    panic("selfhostliveness: BIT_REPO is not set — run this through `./make test-selfhost-liveness`")
+  }
+  return r
+}
+
+fn binPath(base: string): string {
+  return "${base}/bit-out/bin/bit"
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s own mechanism channel (ABI.md §19), never a
+// program's exit status — same convention as
+// _tests_/bit/walkbitcheck.bit's `shell`.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700: owner rwx only
+    fail newError("selfhostliveness: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("selfhostliveness: TIMED OUT after ${ms}ms running a probe — a hang is a failure, not a stall")
+  }
+  if (code == -1) {
+    panic("selfhostliveness: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("selfhostliveness: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+// One `./make selfhost` invocation INSIDE THE SCRATCH CLONE. Returns its
+// own exit code (read from a file, never inferred from the wrapper's) plus
+// everything it printed — same shape as
+// _tests_/bit/walkbitcheck.bit's `runSelfhost`.
+fn runSelfhost(scratch: string, scratchRepo: string, ms: int, tag: string): (int, string) {
+  let outPath = "${scratch}/${tag}.out"
+  let codePath = "${scratch}/${tag}.code"
+  let script = "#!/bin/sh\n" +
+    "cd '${scratchRepo}' || exit 90\n" +
+    "./make selfhost > '${outPath}' 2>&1\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let wrapperRc = shell("${scratch}/${tag}.sh", script, ms) catch e {
+    panic("selfhostliveness: ${e.message()}")
+  }
+  if (wrapperRc == 90) {
+    panic("selfhostliveness: cannot cd into ${scratchRepo}")
+  }
+  if (wrapperRc != 0) {
+    panic("selfhostliveness: wrapper script exited ${wrapperRc}, which it never should")
+  }
+  let codeText = trimWs(
+    readFile(codePath) catch e {
+      panic("selfhostliveness: cannot read ${codePath}: ${e.message()}")
+    },
+  )
+  let code = parseInt(codeText) catch _ {
+    panic("selfhostliveness: ${codePath} did not contain a number: '${codeText}'")
+  }
+  let out = readFile(outPath) catch ""
+  return code, out
+}
+
+// Runs `bin --version` directly (not through `./make`) against the SCRATCH
+// binary and returns its exit code and combined output — used to confirm a
+// rebuild the guard triggered actually produced a working binary, not
+// merely a driver that declined to print "up to date".
+fn runVersion(scratch: string, scratchRepo: string, ms: int, tag: string): (int, string) {
+  let outPath = "${scratch}/${tag}.out"
+  let codePath = "${scratch}/${tag}.code"
+  let script = "#!/bin/sh\n" +
+    "'${binPath(scratchRepo)}' --version > '${outPath}' 2>&1\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let wrapperRc = shell("${scratch}/${tag}-run.sh", script, ms) catch e {
+    panic("selfhostliveness: ${e.message()}")
+  }
+  if (wrapperRc != 0) {
+    panic("selfhostliveness: wrapper script exited ${wrapperRc}, which it never should")
+  }
+  let codeText = trimWs(
+    readFile(codePath) catch e {
+      panic("selfhostliveness: cannot read ${codePath}: ${e.message()}")
+    },
+  )
+  let code = parseInt(codeText) catch _ {
+    panic("selfhostliveness: ${codePath} did not contain a number: '${codeText}'")
+  }
+  let out = readFile(outPath) catch ""
+  return code, out
+}
+
+// Averages N execs of `--version` over whole-second `date` reads so the
+// number is portable to BSD `date` (no `%N` on macOS) — this is the "added
+// cost on the fast path" #4434 asks to be measured rather than asserted:
+// the OLD guard paid a bare `stat`, near zero; the new guard pays exactly
+// this, once, on every "up to date" check. Measured against BIT_REPO's
+// OWN live binary — safe, because this function only ever reads/execs it,
+// never rewrites it.
+fn measureLivenessCostMs(scratch: string, root: string, ms: int): int {
+  let n = 200
+  let outPath = "${scratch}/timing.out"
+  let script = "#!/bin/sh\n" +
+    "start=$(date +%s)\n" +
+    "i=0\n" +
+    "while [ $i -lt ${n} ]; do\n" +
+    "  '${binPath(root)}' --version > /dev/null 2>&1\n" +
+    "  i=$((i + 1))\n" +
+    "done\n" +
+    "end=$(date +%s)\n" +
+    "echo $(( (end - start) * 1000 / ${n} )) > '${outPath}'\n"
+  let rc = shell("${scratch}/timing.sh", script, ms) catch e {
+    panic("selfhostliveness: ${e.message()}")
+  }
+  if (rc != 0) {
+    panic("selfhostliveness: timing probe exited ${rc}")
+  }
+  let text = trimWs(
+    readFile(outPath) catch e {
+      panic("selfhostliveness: cannot read ${outPath}: ${e.message()}")
+    },
+  )
+  return parseInt(text) catch _ {
+    panic("selfhostliveness: timing output not a number: '${text}'")
+  }
+}
+
+// `cp -R`, not `cp -c`: `-c` means "clone" (APFS clonefile, free) on BSD
+// `cp` but means "preserve SELinux context" on GNU `cp` — same flag,
+// different meaning, and silently NOT an error on Linux either way. `-R` is
+// the one behaviour every platform this gate runs on agrees on. Measured
+// here: ~0.7s for this repo's ~64MB tree.
+//
+// The driver rebuild is forced (`rm -f .../make-driver`) rather than
+// trusted, on principle: `./make` decides driver staleness with a
+// `find -newer` mtime comparison against tools/build/**
+// (tools/build/artifacts.bit's fingerprint stamps are content-hashed and
+// immune, the driver binary itself is not — memory
+// `two-pass-bootstrap-checkout-reverts-your-work`'s sibling trap, #2950). A
+// bare `cp -R` does not preserve source mtimes so this is not currently
+// exploitable here, but forcing it costs one small rebuild and removes the
+// assumption entirely.
+fn cloneRepo(root: string, scratchRepo: string, ms: int) {
+  let script = "#!/bin/sh\n" +
+    "cp -R '${root}' '${scratchRepo}'\n" +
+    "rm -f '${scratchRepo}/bit-out/make/make-driver'\n"
+  let rc = shell("${scratchRepo}-clone.sh", script, ms) catch e {
+    panic("selfhostliveness: ${e.message()}")
+  }
+  if (rc != 0) {
+    panic("selfhostliveness: cannot clone ${root} to ${scratchRepo} (rc=${rc})")
+  }
+}
+
+// Truncates the SCRATCH clone's binary to zero bytes — an exec of it fails
+// immediately (no valid header) on every platform, the plainest instance
+// of "exists() but cannot run" and the one #4434's ticket names first.
+fn corruptBin(scratchRepo: string, scratch: string, ms: int) {
+  let script = "#!/bin/sh\n: > '${binPath(scratchRepo)}'\n"
+  let rc = shell("${scratch}/corrupt.sh", script, ms) catch e {
+    panic("selfhostliveness: ${e.message()}")
+  }
+  if (rc != 0) {
+    panic("selfhostliveness: cannot truncate ${binPath(scratchRepo)} (rc=${rc})")
+  }
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let root = repoRoot()
+  let scratch = mkScratch()
+  let scratchRepo = "${scratch}/repo"
+
+  let costMs = measureLivenessCostMs(scratch, root, ms)
+  println("selfhostliveness: added liveness-check cost on the fast path: ~${costMs}ms per `./make selfhost` invocation (avg of 200 execs of an already-warm binary)")
+
+  cloneRepo(root, scratchRepo, ms)
+  let ok = probe(scratch, scratchRepo, ms) && checkSettles(scratch, scratchRepo, ms)
+  teardown(scratch, ms)
+  if (!ok) {
+    exit(1)
+  }
+  println("selfhostliveness: PASS — a truncated bit-out/bin/bit is never reported \"up to date\", and a healthy one still short-circuits")
+}
+
+// Baseline, then the mutation. Both run against the SCRATCH clone only.
+fn probe(scratch: string, scratchRepo: string, ms: int): bool {
+  // Baseline: the clone carries BIT_REPO's own already-built bit-out, so a
+  // fresh `./make selfhost` there must report "up to date" untouched —
+  // otherwise the corruption phase below proves nothing.
+  let (baseCode, baseOut) = runSelfhost(scratch, scratchRepo, ms, "baseline")
+  if (baseCode != 0) {
+    eprint(baseOut)
+    println("selfhostliveness: FAIL — baseline `./make selfhost` exited ${baseCode}, want 0")
+    return false
+  }
+  if (!contains(baseOut, "make: selfhost\nmake:   up to date\n")) {
+    eprint(baseOut)
+    println("selfhostliveness: FAIL — baseline `./make selfhost` did not report \"up to date\"; the scratch clone is not a healthy starting point")
+    return false
+  }
+  return probeCorruption(scratch, scratchRepo, ms)
+}
+
+// Split out of `probe` to keep both functions well under the repo's E0204
+// complexity limit of 10 (spec/LINT.md:186).
+fn probeCorruption(scratch: string, scratchRepo: string, ms: int): bool {
+  // Mutation: truncate the scratch binary to zero bytes. `exists()` is
+  // still true — this is precisely the hole #4434 found. THIS IS THE
+  // MUTATION CONTROL: on today's PRE-FIX tree this assertion fails
+  // (`./make selfhost` prints "up to date" and rebuilds nothing); on the
+  // fixed driver it must not.
+  corruptBin(scratchRepo, scratch, ms)
+  let (brokenCode, brokenOut) = runSelfhost(scratch, scratchRepo, ms, "broken")
+  if (contains(brokenOut, "make: selfhost\nmake:   up to date\n")) {
+    eprint(brokenOut)
+    println("selfhostliveness: FAIL — `./make selfhost` reported \"up to date\" with bit-out/bin/bit truncated to zero bytes; exists() is not proof the binary can run")
+    return false
+  }
+  if (brokenCode != 0) {
+    eprint(brokenOut)
+    println("selfhostliveness: FAIL — `./make selfhost` exited ${brokenCode} rebuilding a truncated binary, want 0")
+    return false
+  }
+  let (verCode, verOut) = runVersion(scratch, scratchRepo, ms, "post-rebuild")
+  if (verCode != 0 || len(trimWs(verOut)) == 0) {
+    println("selfhostliveness: FAIL — bit-out/bin/bit --version exited ${verCode} with output '${verOut}' after the rebuild the corruption should have triggered")
+    return false
+  }
+  return true
+}
+
+// The rebuild `probeCorruption` triggered already wrote a matching stamp
+// against a working binary, so a SECOND `./make selfhost` in the same
+// scratch clone must settle straight back to "up to date" with no further
+// rebuild — proves the fix leaves no bad stamp behind.
+fn checkSettles(scratch: string, scratchRepo: string, ms: int): bool {
+  let (code, out) = runSelfhost(scratch, scratchRepo, ms, "settle")
+  if (code != 0) {
+    eprint(out)
+    println("selfhostliveness: FAIL — `./make selfhost` exited ${code} on the settle run, want 0")
+    return false
+  }
+  if (!contains(out, "make: selfhost\nmake:   up to date\n")) {
+    eprint(out)
+    println("selfhostliveness: FAIL — `./make selfhost` did not settle back to \"up to date\" after the rebuild the corruption triggered")
+    return false
+  }
+  return true
+}
+
+fn mkScratch(): string {
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-selfhostliveness-${uuidFormat(uuidV4())}"
+  let script = "#!/bin/sh\nmkdir -p '${scratch}'\n"
+  // 30s, not 5s: a fresh script's first exec pays macOS's provenance tax
+  // (~250-450ms), serialized SYSTEM-WIDE under a fleet of concurrent
+  // agents — a bound this tight fired spuriously under real contention
+  // (memory `macos-provenance-exec-tax`). This is a bound against a
+  // genuine hang, not an expected duration.
+  let rc = shell("${scratch}.sh", script, 30000) catch e {
+    panic("selfhostliveness: cannot create ${scratch}: ${e.message()}")
+  }
+  if (rc != 0) {
+    panic("selfhostliveness: mkdir -p ${scratch} exited ${rc}")
+  }
+  return scratch
+}
+
+// std/fs has no recursive remove, so the scratch tree (repo clone included)
+// goes the way it came — same reason
+// _tests_/bit/walkbitcheck.bit's teardown does.
+fn teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ {
+    return
+  }
+}
+
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}
