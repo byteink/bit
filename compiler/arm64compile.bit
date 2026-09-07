@@ -100,23 +100,53 @@ fn hasDivZeroGuard(ctx: TypeContext, f: IrFunc): bool {
 // references across all safepoints, which the map already enumerates.
 fn arm64TargetRegs(intRegs: []int, floatRegs: []int): TargetRegs {
   return TargetRegs{
-    intRegs: RegFile{ count: len(intRegs), calleeSaved: calleeSavedIntMask(intRegs) },
+    intRegs: RegFile{
+      count: len(intRegs),
+      calleeSaved: calleeSavedIntMask(intRegs),
+      pollSaved: pollSavedIntMask(intRegs),
+    },
     floatRegs: RegFile{
       count: len(floatRegs),
       calleeSaved: calleeSavedFloatMask(floatRegs),
+      pollSaved: pollSavedFloatMask(floatRegs),
     },
   }
 }
 
-fn assertStackMapsCalleeSaved(result: RegAllocResult, intRegs: []int) {
+fn posInList(ps: []int, p: int): bool {
+  let i = 0
+  while (i < len(ps)) {
+    if (ps[i] == p) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// #4429: the check above, now asked per SAFEPOINT KIND rather than once for the
+// whole function, because the two kinds have different answers and conflating
+// them is exactly the miscompile this assert exists to catch.
+//
+//   - an ordinary call's map is read after the collector has restored the
+//     register file through the frames it unwound, and a prologue saves only
+//     AAPCS64 callee-saved registers, so only those may be named;
+//   - a back-edge poll's map is read out of bit_rt_safepoint's own raw
+//     snapshot with no restore in front of it, so anything the shim stores may
+//     be named — isPollSavedInt, which mirrors that payload.
+fn assertStackMapsSnapshotSaved(
+  result: RegAllocResult, intRegs: []int, polls: []int,
+) {
   let si = 0
   while (si < len(result.stackMaps)) {
     let sm = result.stackMaps[si]
+    let atPoll = posInList(polls, sm.pos)
     let ri = 0
     while (ri < len(sm.regs)) {
+      let r = intRegs[sm.regs[ri]]
       assert(
-        isCalleeSavedInt(intRegs[sm.regs[ri]]),
-        "stack map names a caller-saved register (runtime/ABI.md §4)",
+        isCalleeSavedInt(r) || (atPoll && isPollSavedInt(r)),
+        "stack map names a register the safepoint shim does not save (runtime/ABI.md §4)",
       )
       ri = ri + 1
     }
@@ -162,7 +192,10 @@ fn hasAsmLrClobber(module: IrModule, f: IrFunc): bool {
 }
 
 // Every position at which this function's emitted code destroys the caller-saved
-// registers — compiler/regalloc.bit's `clobbers`, a superset of `safepoints`.
+// registers — compiler/regalloc.bit's `AllocPoints.clobbers`. Since #4429 the
+// caller hands this only the CALL safepoints: a back-edge poll destroys a
+// smaller set (RegFile.pollSaved) and is carried in `AllocPoints.polls`
+// instead, so it must not appear here.
 //
 // The poll-cache prefetch half is taken from `xClobberPoints` rather than
 // re-derived: both backends emit that prefetch under the same predicate
@@ -218,6 +251,49 @@ fn nonReturningFiltered(f: IrFunc, safepoints: []int): []int {
     }
   }
   return out
+}
+
+// #4429: split `buildIntervals`' safepoint list by kind. A back-edge poll is
+// recorded at its Jump/Br TERMINATOR (codegenlive.bit), and every other
+// safepoint at an `isSafepointOp` instruction, so the op at the position is the
+// whole discriminator — the same one isNonReturningCall already relies on. An
+// Op.Br whose two edges are both back edges appears twice; both are polls and
+// both belong here.
+fn arm64PollSafepoints(f: IrFunc, safepoints: []int): []int {
+  let out = []int(0)
+  for p of safepoints {
+    if (!isSafepointOp(f.instrs[p].op)) {
+      out = append(out, p)
+    }
+  }
+  return out
+}
+
+fn arm64CallSafepoints(f: IrFunc, safepoints: []int): []int {
+  let out = []int(0)
+  for p of safepoints {
+    if (isSafepointOp(f.instrs[p].op)) {
+      out = append(out, p)
+    }
+  }
+  return out
+}
+
+// #4429: this function's call structure, split by WHAT SURVIVES each position.
+// Only the CALL half is a full clobber, and only the CALL half confines a live
+// reference to x19..x28 — its stack map is read after the collector has
+// restored the register file through the frames it unwound. A back-edge poll
+// goes through bit_rt_safepoint, which preserves the whole allocatable file and
+// republishes it in the snapshot the walk starts from, so a loop-carried value
+// no longer has to be callee-saved just because the loop polls.
+fn arm64AllocPoints(module: IrModule, f: IrFunc, safepoints: []int): AllocPoints {
+  let calls = arm64CallSafepoints(f, safepoints)
+  return AllocPoints{
+    safepoints: safepoints,
+    calleeSafepoints: calls,
+    polls: arm64PollSafepoints(f, safepoints),
+    clobbers: arm64ClobberPoints(module, f, calls),
+  }
 }
 
 // #3915 (revisits #3284): a call this backend emits or admits that
@@ -321,14 +397,16 @@ fn compileFunction(module: IrModule, f: IrFunc, debug: bool): FuncCode {
   // value shares that value's location instead of getting its own, which
   // deletes the edge move rather than optimising it. Purely an assignment
   // question, so it is orthogonal to the clobber discussion above.
+  //
+  // #4429 splits `built.safepoints` by kind — see arm64AllocPoints.
+  let points = arm64AllocPoints(module, f, built.safepoints)
   let result = allocateCoalesced(
     arm64TargetRegs(intRegs, floatRegs),
     intervals,
-    built.safepoints,
-    arm64ClobberPoints(module, f, built.safepoints),
+    points,
     built.roots,
   )
-  assertStackMapsCalleeSaved(result, intRegs)
+  assertStackMapsSnapshotSaved(result, intRegs, points.polls)
 
   let skipConst = computeSkipConstMaterialize(ctx, f, debug)
   // #4430: computed before fuseCmp, which reads it to exclude an eliminated

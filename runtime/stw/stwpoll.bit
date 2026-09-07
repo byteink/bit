@@ -505,9 +505,16 @@ export @nosplit @symbol("bit_rt_port_stw_safepoint") fn stwSafepoint(snap: int) 
 //   +16  regs[32]   regs[n] at +16+8n, physical register n's live value
 // `regs` is deliberately NOT zeroed — this runs at every back edge and clearing
 // 32 words per poll is not free. Sound because ABI.md §4 restricts the registers
-// a stack map may name at a safepoint to exactly the callee-saved file saved
-// here, and because every word the walk reads goes through the validating
-// `gcMarkRoot`.
+// a stack map may name at a safepoint to exactly the file saved here, and
+// because every word the walk reads goes through the validating `gcMarkRoot`.
+//
+// #4429: on AArch64 "the file saved here" is now the whole allocatable set, not
+// the AAPCS64 callee-saved set, and the two halves of that widening MUST move
+// together — `compiler/arm64.bit`'s `isSnapshotSavedInt` is the compiler's copy
+// of the list below and `arm64selcheck.bit` asserts the two agree. Preserving a
+// register the stack map may not name only wastes two instructions on a cold
+// path; naming one this shim does not save publishes an unwritten stack word as
+// a root, which is a use-after-free.
 //
 // The reservation is 8 bytes larger than the 272-byte class on x86-64 and 16
 // larger on AArch64, purely to keep the stack ABI-aligned at the call. A function
@@ -604,10 +611,18 @@ export @nosplit @symbol("bit_rt_port_stw_safepoint") fn stwSafepoint(snap: int) 
 //   duplicate, but its reproduction is recorded here since nothing else in
 //   the tree carries it.
 //
-//   AArch64 (x19..x28 -> +168..+240):
+//   AArch64 (#4429: the WHOLE allocatable file, x0..x8 + x12..x15 + x19..x28,
+//   into regs[n] at +16+8n):
 //     D10483FF   sub  sp, sp, #288
 //     F90003FE   str  x30, [sp, #0]        # x30 = the caller's return address
 //     F90007FD   str  x29, [sp, #8]        # x29 = the caller's frame pointer
+//     A90107E0   stp  x0,  x1,  [sp, #16]  # x0 saved BEFORE it becomes the arg
+//     A9020FE2   stp  x2,  x3,  [sp, #32]
+//     A90317E4   stp  x4,  x5,  [sp, #48]
+//     A9041FE6   stp  x6,  x7,  [sp, #64]
+//     F9002BE8   str  x8,       [sp, #80]
+//     A90737EC   stp  x12, x13, [sp, #112]
+//     A9083FEE   stp  x14, x15, [sp, #128]
 //     A90AD3F3   stp  x19, x20, [sp, #168]
 //     A90BDBF5   stp  x21, x22, [sp, #184]
 //     A90CE3F7   stp  x23, x24, [sp, #200]
@@ -615,14 +630,50 @@ export @nosplit @symbol("bit_rt_port_stw_safepoint") fn stwSafepoint(snap: int) 
 //     A90EF3FB   stp  x27, x28, [sp, #232]
 //     910003E0   mov  x0, sp               # arg 0 = the frame
 //     F81F0FFE   str  x30, [sp, #-16]!
-//     D63F0020   blr  x1
+//     D63F0120   blr  x9
 //     F84107FE   ldr  x30, [sp], #16
+//     A94107E0   ldp  x0,  x1,  [sp, #16]  # restore the caller-saved half
+//     A9420FE2   ldp  x2,  x3,  [sp, #32]
+//     A94317E4   ldp  x4,  x5,  [sp, #48]
+//     A9441FE6   ldp  x6,  x7,  [sp, #64]
+//     F9402BE8   ldr  x8,       [sp, #80]
+//     A94737EC   ldp  x12, x13, [sp, #112]
+//     A9483FEE   ldp  x14, x15, [sp, #128]
 //     910483FF   add  sp, sp, #288
 //     D65F03C0   ret
-//   288 keeps `sp` 16-aligned (the hardware enforces it). `x0`/`x1` are the first
-//   argument and caller-saved scratch, so neither disturbs the saved file. `x30`
-//   is preserved across the call by its own push, NOT by the frame copy, so the
-//   return path does not depend on the callee leaving the frame untouched.
+//   288 keeps `sp` 16-aligned (the hardware enforces it). `x30` is preserved
+//   across the call by its own push, NOT by the frame copy, so the return path
+//   does not depend on the callee leaving the frame untouched. x19..x28 need no
+//   reload: `stwSafepoint` is an ordinary AAPCS64 callee and preserves them
+//   itself. x1..x8/x12..x15 do, and the reloads read back the exact words the
+//   saves wrote — this collector never moves an object.
+//
+//   THE RELOAD ALSO SURVIVES A PARK, which is the non-obvious case. `stwPoll`
+//   can reach `schedMaybeYieldForPreempt` -> `schedYield` -> a context switch,
+//   so this call can return only after the task has been parked and resumed on
+//   its own green stack. A context switch saves and restores the AAPCS64
+//   callee-saved file and treats everything else as dead — which would lose
+//   x1..x8/x12..x15 if the shim did not hold them. It does: they are on the
+//   task's OWN stack, in this frame, which the switch preserves entire, so the
+//   `ldp`s below read them back unchanged. The same fact makes them visible to
+//   `stwScanTasks`' conservative scan of `[ctx.sp, stack_top)` while parked,
+//   since `ctx.sp` is recorded deeper in the call chain than this frame.
+//
+//   #4429: THE ENTRY ADDRESS MOVED FROM x1 TO x9, AND THAT IS LOAD-BEARING.
+//   The `input` below is materialized by the COMPILER, ahead of the payload, so
+//   whichever register carries it has already lost the caller's value by the
+//   time the first `stp` runs — it can never be preserved. x9 is
+//   `compiler/arm64.bit`'s `scratch1()`: reserved codegen scratch, never
+//   allocatable, so no caller can have a live value in it at a back edge. x1 is
+//   in `masterGprs()` and a caller can, which is why it had to move.
+//
+//   WHY THE WHOLE FILE. A value live across a loop back edge crosses this `bl`,
+//   so the register allocator may only give it a register this shim preserves.
+//   Preserving ten of the twenty-three allocatable GPRs confined every
+//   loop-carried value to x19..x28 and spilled the rest (#4418 measured five
+//   reloads per iteration in `bench/cases/matrix`). The saves are on the poll's
+//   COLD arm — the caller's `cbz` skips the `bl` entirely when the attention
+//   word is clear — so the hot path pays nothing for them.
 //
 // `input` materializes `entryOf(stwSafepoint)` into `rax`/`x1` ahead of the
 // payload — the gated live entry, not `stwPoll` itself; see its comment —
@@ -659,6 +710,13 @@ export @nosplit @symbol("bit_rt_port_stw_safepoint") fn stwSafepoint(snap: int) 
       0xD10483FF,
       0xF90003FE,
       0xF90007FD,
+      0xA90107E0,
+      0xA9020FE2,
+      0xA90317E4,
+      0xA9041FE6,
+      0xF9002BE8,
+      0xA90737EC,
+      0xA9083FEE,
       0xA90AD3F3,
       0xA90BDBF5,
       0xA90CE3F7,
@@ -666,16 +724,23 @@ export @nosplit @symbol("bit_rt_port_stw_safepoint") fn stwSafepoint(snap: int) 
       0xA90EF3FB,
       0x910003E0,
       0xF81F0FFE,
-      0xD63F0020,
+      0xD63F0120,
       0xF84107FE,
+      0xA94107E0,
+      0xA9420FE2,
+      0xA94317E4,
+      0xA9441FE6,
+      0xF9402BE8,
+      0xA94737EC,
+      0xA9483FEE,
       0x910483FF,
       0xD65F03C0,
     }
-    input arm64 x1 x64 rax = entryOf(stwSafepoint)
+    input arm64 x9 x64 rax = entryOf(stwSafepoint)
     // rdi is written mid-payload but RESTORED before `ret` (#3592) — its
     // value at function exit equals its value at entry, so it is no longer
     // listed here. rsi is only ever read (into the snapshot), never written.
     clobber x64 { rcx, r8, memory }
-    clobber arm64 { x0, memory }
+    clobber arm64 { x9, memory }
   }
 }

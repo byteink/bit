@@ -64,6 +64,19 @@ class RegFile {
   // miscompile. It is read only when `clobbers` is non-empty, so a backend
   // that passes no clobber positions is unaffected by its value.
   calleeSaved: int,
+  // #4429. Bit i set means register i survives a BACK-EDGE POLL — the synthetic
+  // `bl bit_rt_safepoint` a loop terminator carries — which preserves MORE than
+  // the target's calling convention does, because the shim's whole job is to
+  // dump the register file into a snapshot and put it back.
+  //
+  // A superset of `calleeSaved`. Read only for an interval that meets one of
+  // `AllocPoints.polls`, so a backend that passes no poll positions is
+  // unaffected by its value — the same convention `calleeSaved` carries.
+  //
+  // Over-reporting here is a miscompile in the worst direction: the register is
+  // handed out, the shim does not preserve it, and either the value comes back
+  // wrong or the stack map publishes an unwritten snapshot word as a root.
+  pollSaved: int,
 }
 
 class TargetRegs {
@@ -248,95 +261,6 @@ fn removeActiveAt(s: ClassState, k: int) {
     i = i + 1
   }
   s.len = s.len - 1
-}
-
-// True iff `iv` is live across `p` in the sense that matters to a caller-saved
-// register: it was defined strictly before `p` and is still read at or after
-// it.
-//
-// The `end >= p` half rather than `end > p` is deliberate and is what makes
-// this correct for a BACK-EDGE safepoint, where the clobbering call is emitted
-// BEFORE the edge's parallel move (compiler/x64controlflow.bit's xEmitJump) —
-// so a value whose last read IS that edge is read after the clobber, not
-// before. For a plain call the same test is merely conservative: an argument
-// (end == p) is marshalled before the call and would in fact survive in a
-// register, so one interval per call argument is spilled that need not be.
-fn crossesPoint(iv: LiveInterval, p: int): bool {
-  return iv.start < p && iv.end >= p
-}
-
-// True iff `iv` is one of the live references the stack map for a safepoint at
-// `p` will name — the SAME predicate the stack-map loop at the bottom of
-// `allocateCoalesced` applies, spelled once here so the two can never disagree.
-//
-// It is deliberately WIDER than `crossesPoint` by exactly one case, `start == p`
-// (a reference DEFINED by the call at `p`, e.g. a gc_alloc result): the stack
-// map names it, `crossesPoint` does not. That one case is why the two questions
-// cannot share a predicate, and why a register file that answers only the
-// clobber question is not safe for references — see `computeRestricted`.
-fn rootedAtPoint(iv: LiveInterval, p: int): bool {
-  return iv.isRef && iv.start <= p && iv.end >= p
-}
-
-// Per interval position, may it NOT hold a caller-saved register?
-//
-// Two independent reasons, and conflating them is a miscompile:
-//
-//  1. CLOBBER (#3171). The interval is live ACROSS a position where the
-//     target's caller-saved registers are destroyed — `crossesPoint` over
-//     `clobbers`. An empty `clobbers` restores the plain Poletto & Sarkar scan
-//     exactly, register for register.
-//
-//  2. ROOTING (#4343). The interval holds a live GC REFERENCE that some
-//     safepoint's stack map will name — `rootedAtPoint` over `safepoints`.
-//     runtime/ABI.md §4 is explicit: the safepoint shim writes the callee-saved
-//     file ONLY and leaves the rest of its snapshot untouched, so "a stack map
-//     can only ever name a register the shim did save". A reference reported in
-//     a caller-saved register is read out of an unwritten slot — a MISSED root
-//     for any frame the walk unwinds into, i.e. a use-after-free, not a slow
-//     program. Until #4343 this held for free: a safepoint-bearing function had
-//     no caller-saved register in its int file at all.
-//
-// Reason 2 is gated on the caller having REPORTED a callee-saved mask, which is
-// the meaning `RegFile.calleeSaved`'s zero default already carries. It is not
-// gated on `clobbers`, deliberately: a backend may legitimately leave a
-// non-returning call out of `clobbers` (nothing can read a register it
-// destroyed) while that same call is still a safepoint that emits a stack map.
-fn computeRestricted(
-  scan: []LiveInterval, safepoints: []int, clobbers: []int, csMask: int,
-): []bool {
-  let out = []bool(0)
-  let i = 0
-  while (i < len(scan)) {
-    out = append(out, intervalRestricted(scan[i], safepoints, clobbers, csMask))
-    i = i + 1
-  }
-  return out
-}
-
-// Bounded by len(clobbers) + len(safepoints), both function-local and finite —
-// the same bound the stack-map loop already carries.
-fn intervalRestricted(
-  iv: LiveInterval, safepoints: []int, clobbers: []int, csMask: int,
-): bool {
-  let ci = 0
-  while (ci < len(clobbers)) {
-    if (crossesPoint(iv, clobbers[ci])) {
-      return true
-    }
-    ci = ci + 1
-  }
-  if (!iv.isRef || csMask == 0) {
-    return false
-  }
-  let si = 0
-  while (si < len(safepoints)) {
-    if (rootedAtPoint(iv, safepoints[si])) {
-      return true
-    }
-    si = si + 1
-  }
-  return false
 }
 
 class SpillEntry {
@@ -596,7 +520,7 @@ fn allocate(
   safepoints: []int,
   clobbers: []int,
 ): RegAllocResult {
-  return allocateCoalesced(target, intervals, safepoints, clobbers, []int(0))
+  return allocateCoalesced(target, intervals, allocPoints(safepoints, clobbers), []int(0))
 }
 
 // `roots` (#3738) names, per vreg, the vreg whose location it must share —
@@ -615,9 +539,10 @@ fn allocate(
 // An empty `roots` is exactly the plain Poletto & Sarkar behaviour, register for
 // register.
 fn allocateCoalesced(
-  target: TargetRegs, intervals: []LiveInterval, safepoints: []int,
-  clobbers: []int, roots: []int,
+  target: TargetRegs, intervals: []LiveInterval, points: AllocPoints,
+  roots: []int,
 ): RegAllocResult {
+  let safepoints = points.safepoints
   let n = len(intervals)
   // Validate the caller's dense-vreg contract — an internal-caller invariant,
   // asserted rather than surfaced as an error.
@@ -669,11 +594,10 @@ fn allocateCoalesced(
   let alias = mergeAliases(scan, posOf, roots)
   let order = rootOrder(orderByStart(scan), alias)
 
-  // #3171/#4343: which intervals may not hold a caller-saved register. Indexed
-  // by interval array position (the main loop's `idx`), not by vreg.
-  let restricted = computeRestricted(
-    scan, safepoints, clobbers, target.intRegs.calleeSaved,
-  )
+  // #3171/#4343/#4429: the registers each interval may occupy, as a mask over
+  // file positions. Indexed by interval array position (the main loop's `idx`),
+  // not by vreg.
+  let regMasks = computeRegMasks(scan, points, target)
 
   let oi = 0
   while (oi < len(order)) {
@@ -688,14 +612,11 @@ fn allocateCoalesced(
     expireClass(state, scan, iv.start)
     expireSpills(spills, scan, iv.start)
 
-    // #3171: an interval live across a clobber point may only occupy a register
-    // the target preserves across one. With no clobbers (or an all-callee-saved
-    // file) `allowed` is the whole file and every branch below reduces to the
-    // plain Poletto & Sarkar scan.
-    let allowed = fullRegMask(state.regFile.count)
-    if (restricted[idx]) {
-      allowed = allowed & state.regFile.calleeSaved
-    }
+    // #3171/#4429: an interval live across a clobber point may only occupy a
+    // register that survives it. With no clobbers and no polls `regMasks[idx]`
+    // is all-ones, `allowed` is the whole file, and every branch below reduces
+    // to the plain Poletto & Sarkar scan.
+    let allowed = fullRegMask(state.regFile.count) & regMasks[idx]
 
     let reg = firstFreeReg(state, allowed)
     if (reg >= 0) {
