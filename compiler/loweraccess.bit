@@ -72,10 +72,13 @@ fn lowerFieldAccess(fc: FnCtx, node: int): int {
   if (fc.failed) {
     return 0
   }
-  let ins = mkInstr(Op.FieldGet, fieldAccessType(fc, oc, fields[idx], node))
+  let fty = fieldAccessType(fc, oc, fields[idx], node)
+  let ins = mkInstr(Op.FieldGet, fty)
   ins.lhs = recvV
   ins.ival = layout.offsets[idx]
-  return builderEmit(fc.b, ins)
+  // #4437: unbox-on-use for a class field read — a no-op outside
+  // `BIT_STRING_EXPLODE_TEST=1` (lowerexplode.bit).
+  return coerceStringToBoxed(fc, builderEmit(fc.b, ins), fty)
 }
 
 // The receiver value for a `.` field access or field assignment (#3862).
@@ -134,145 +137,6 @@ fn fieldAccessType(fc: FnCtx, oc: Checker, field: int, node: int): int {
     return checked
   }
   return declTy
-}
-
-// Does `ty`'s zero value (SPEC §13.4) differ from the null word that `map_get`
-// reports a miss with? True for the reference types whose zero is a live object
-// — `string` (`""`), slice (empty), class (zeroed instance), `[N]T` (zeroed
-// block), and (#4182) a BOXED enum, whose real zero is a live `{tag:0,nil}`
-// object (`zeroValue`, lowerslicefill.bit) — `map_get`'s raw miss word is a null
-// REFERENCE there, not that object, so a miss must be routed through the same
-// materialization a class-typed miss already gets. False for
-// map/chan/function/interface, whose zero IS `nil`, for every scalar, whose
-// zero IS the word 0, and for a bare (non-boxed) enum, whose zero IS its
-// first variant's tag with nothing to allocate.
-fn zeroIsObject(fc: FnCtx, ty: int): bool {
-  let td = fc.c.ctx.types[ty]
-  if (td.kind == TypeKind.Prim) {
-    return td.prim == 11
-  }
-  if (td.kind == TypeKind.Enum) {
-    return td.enumBoxed
-  }
-  return td.kind == TypeKind.Slice || td.kind == TypeKind.Array || td.kind == TypeKind.Struct
-}
-
-// `m[k]` (SPEC §12.6): a missing key yields the value type's zero value.
-// `map_get` can only report a miss as the null word, so where V's zero is a live
-// object materialize it on the miss edge — otherwise a miss hands back a null
-// header and the first `len`/field read faults (#1557). The zero is built
-// lazily, inside the miss block, so a hit allocates nothing.
-//
-// WHEN V HAS NO ZERO VALUE AT ALL (a class with a class-typed field, §13.4)
-// the miss edge cannot be satisfied, and what happens then depends on which form
-// the programmer wrote (#1926):
-//
-//   `let v = m[k]`         -> `missPanics`, and the miss edge PANICS naming the
-//                             type. There is no value to hand back and no way
-//                             for the caller to have known, so failing loudly at
-//                             the read beats returning a null that faults later
-//                             somewhere that no longer mentions the map.
-//   `let (v, ok) = m[k]`   -> NOT `missPanics`. The comma-ok form exists to ask
-//                             whether the key is there; making it panic would
-//                             leave such a map unreadable by any means. `v` is
-//                             the raw null and `ok` is false, which is the
-//                             contract that form already carries.
-//
-// That split is the same one C++ draws between `operator[]` (requires a
-// default-constructible value) and `find`, and the same one this compiler
-// already applies to `[]T(n)`: reject or fail loudly on the unchecked form,
-// leave the checked form usable.
-//
-// Every case decidable at compile time is already E0083 from the checker; this
-// is only for a key whose presence is not knowable until it runs.
-// How emitMapGet handles a missing key, bundled into one param (#2189, E0202):
-// `panics` is false only for the comma-ok form, where absence is reported
-// through `ok` instead. `span` is the source span of the index/lvalue this
-// read came from, for the refusal a value type with no zero value forces.
-class MapGetMiss {
-  panics: bool,
-  span: Span,
-}
-
-fn emitMapGet(fc: FnCtx, valTy: int, m: int, key: int, onMiss: MapGetMiss): int {
-  let gv = mkInstr(Op.RtCall, valTy)
-  gv.name = "map_get"
-  gv.args = [m, key]
-  return emitMapMiss(fc, valTy, emitRtCall(fc, gv), onMiss)
-}
-
-// The miss edge of a map read, given the raw word `v` the read produced — null
-// when the key was absent. Shared by `m[k]` above and by `emitMapCommaOk`
-// below, which reaches it with `map_val_at`'s word instead of `map_get`'s: one
-// miss policy, so the two forms cannot drift apart on a value type whose zero
-// is a live object.
-fn emitMapMiss(fc: FnCtx, valTy: int, v: int, onMiss: MapGetMiss): int {
-  if (!zeroIsObject(fc, valTy)) {
-    return v
-  }
-  // Comma-ok over a value type with no zero value: hand back the null and let
-  // `ok` speak. No miss block, so a miss costs nothing.
-  if (!onMiss.panics && typeHasNoZeroValue(fc, valTy)) {
-    return v
-  }
-  let miss = builderNewBlock(fc.b)
-  let join = builderNewBlock(fc.b)
-  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
-  br.lhs = neNil(fc, v, valTy)
-  br.ival = join
-  br.thenArgs = [v]
-  br.ival2 = miss
-  br.elseArgs = []int(0)
-  builderEmit(fc.b, br)
-  builderEndBlock(fc.b)
-  builderBeginBlock(fc.b, miss)
-  if (typeHasNoZeroValue(fc, valTy)) {
-    // Terminates the miss block; `join` is then reached only from the hit edge,
-    // which still carries the parameter below.
-    emitNoZeroValuePanic(fc, valTy, "m[k]")
-  } else {
-    let zero = zeroValue(fc, valTy, onMiss.span)
-    if (fc.failed) {
-      return 0
-    }
-    emitJump(fc, join, [zero])
-  }
-  builderEndBlock(fc.b)
-  builderBeginBlock(fc.b, join)
-  return builderAddParam(fc.b, valTy)
-}
-
-// `let (v, ok) = m[k]` (SPEC §12.6), as ONE probe rather than two.
-//
-// It used to emit `map_get` and then `map_has` — two exported calls that each
-// hashed and walked the same table for one source expression (#4019, 20.0% of
-// `bench/cases/map`). `map_slot` probes once and answers both questions: `ok`
-// is `slot >= 0`, and `map_val_at` turns the slot into the value word by
-// indexing, with no probe at all. A negative slot reads as the zero word
-// (ABI.md §15), which is the same null `map_get` reported a miss with, so the
-// shared miss edge above needs no change.
-//
-// `ok` is emitted BEFORE the miss edge splits the block, so it is defined in a
-// block that dominates the join — the same way `m` and `key` already outlive
-// that split at this call site.
-fn emitMapCommaOk(fc: FnCtx, valTy: int, m: int, key: int, span: Span): []int {
-  let i64ty = primType(fc.c.ctx, 3)
-  let sv = mkInstr(Op.RtCall, i64ty)
-  sv.name = "map_slot"
-  sv.args = [m, key]
-  let slot = emitRtCall(fc, sv)
-  let ge = mkInstr(Op.ICmpSge, primType(fc.c.ctx, 10))
-  ge.lhs = slot
-  ge.rhs = builderEmit(fc.b, mkInstr(Op.ConstInt, i64ty))
-  let ok = builderEmit(fc.b, ge)
-  let vv = mkInstr(Op.RtCall, valTy)
-  vv.name = "map_val_at"
-  vv.args = [m, slot]
-  let v = emitMapMiss(fc, valTy, emitRtCall(fc, vv), MapGetMiss{ panics: false, span: span })
-  if (fc.failed) {
-    return []int(0)
-  }
-  return [v, ok]
 }
 
 // The element address of an inline `xs[i]`, once the bounds test has passed:
@@ -639,8 +503,10 @@ fn lowerIndex(fc: FnCtx, node: int): int {
     // only asks whether the RECEIVER is indexable — so keep that (already
     // meaningless) program on the runtime call rather than emitting a sequence
     // that reads a register the value was never placed in.
+    // #4437: unbox-on-use for a `[]string` element read — a no-op outside
+    // `BIT_STRING_EXPLODE_TEST=1` (lowerexplode.bit).
     if (regClassOf(fc.c.ctx, fc.b.instrs[idx].ty) == RegClass.Int) {
-      return emitInlineSliceGet(fc, recv, idx, ty)
+      return coerceStringToBoxed(fc, emitInlineSliceGet(fc, recv, idx, ty), ty)
     }
     // elem_size (ABI.md §9, #3121/#3226): see `lowerlit.bit`'s
     // `lowerSliceAlloc` for the full rationale; `sliceElemSizeFor` lives in
@@ -651,7 +517,7 @@ fn lowerIndex(fc: FnCtx, node: int): int {
     let ins = mkInstr(Op.RtCall, ty)
     ins.name = "slice_get"
     ins.args = [recv, idx, esV]
-    return emitRtCall(fc, ins)
+    return coerceStringToBoxed(fc, emitRtCall(fc, ins), ty)
   }
   if (rd.kind == TypeKind.Map) {
     return emitMapGet(
