@@ -377,12 +377,14 @@ while IFS= read -r f; do
         spec_list="${f}"
       fi
       ;;
+    # spec/FMT.md IS read by test-fmt-citations (wired into selfhost, #4453).
+    spec/FMT.md) has_selfhost=1 ;;
     # These paths are pure documentation that no gate reads: runtime/**/*.md
     # (the runtime CODE bucket below is for runtime/*.bit etc, not prose),
-    # spec/* other than SPEC.md (LINT.md and any future sibling — checked by
-    # no automated gate), bench/**/*.md (bench/**/*.bit and bench/run.sh still
-    # fall through to `full`, unproven output-irrelevant), and the three
-    # standalone READMEs nothing greps.
+    # spec/* other than SPEC.md and FMT.md (LINT.md and any future sibling —
+    # checked by no automated gate), bench/**/*.md (bench/**/*.bit and
+    # bench/run.sh still fall through to `full`, unproven output-irrelevant),
+    # and the three standalone READMEs nothing greps.
     # Deliberately NOT added to has_other or bucket_count — has_noop and
     # noop_list ARE set below, but mixed with a real bucket the noop path
     # must be silently ignored, never force `full` and never downgrade the
@@ -672,6 +674,10 @@ fi
 # of whichever bucket build_steps_for_bucket already selected.
 # shellcheck source=scripts/gate-buildsteps.sh
 . scripts/gate-buildsteps.sh
+# scripts/gate-envscope.sh (#4454) needs build_steps_for_bucket() above.
+# shellcheck source=scripts/gate-envscope.sh
+. scripts/gate-envscope.sh
+assert_envscoped_gates_current
 
 build_steps_for_bucket
 union_testsbit_steps
