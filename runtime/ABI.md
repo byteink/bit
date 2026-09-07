@@ -1084,6 +1084,20 @@ only to make evaluating it rarer. Measured on `_spin`, a bare counting loop:
 84 emitted instructions to 34, entry prefetch 11 instructions and 3 calls to 2
 and 1, frame 0x60 to 0x50 bytes.
 
+**THE WORD HAS A SECOND, RELAXED READER, AND IT IS NOT A POLL (#4457).**
+`Op.PollAttention` reads the same word through the same cached frame slot —
+`ldr`/`ldr` on arm64, `movq`/`movq` on x86-64, no call and no relocation — and
+exists so a compiler pass can ask "is anything already asking?" from inside a
+loop without a `bl`, whose caller-saved clobber costs an allocated register for
+the whole function. It is a **relaxed** read on purpose, where the poll's own
+load is `ldar`: nothing acts on its answer. Its only consumer (#4204's strip
+miner) uses it to choose how many iterations to run before the next poll, so a
+stale answer costs at most one wide strip, and the poll on the outer back edge
+then re-reads the word with the acquire that decides whether to act. **Do not
+read the acquire below as a property of every read of this word — it is a
+property of the READER THAT ACTS**, which is still exactly the two back-edge
+emission sites named above.
+
 **The word is a SUMMARY, and it is safe because the slow path is
 self-checking.** `stwPollOn` already re-derives every clause and returns without
 acting when none holds, so a spurious nonzero costs one wasted call. A missed
