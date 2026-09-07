@@ -1,0 +1,192 @@
+// ARM64 block layout (#4455), split out of arm64compile.bit and arm64branch.bit
+// so each has room for the reasoning that makes it safe.
+// Sibling .bit file, same module: see arm64.bit for the backend overview.
+//
+// Nothing here is shared with the x86-64 backend on purpose. That backend
+// reorders its blocks into RPO (see codegen.bit's note on debug-line rows), so
+// "which block is emitted next" is already a different question there, and it
+// has no `deadBlock` machinery for this to compose with.
+
+// ===========================================================================
+// #4455: a bounds check's panic block is emitted OUT OF LINE
+// ===========================================================================
+//
+// `compileFunction` emitted blocks in `f.blocks` index order, and
+// `emitBoundsCheck` (loweraccess.bit) mints its panic block BEFORE the
+// in-bounds block. So the panic block was always the branching block's
+// immediate successor in emission order, and `emitBr`'s first shape — "THEN
+// needs no code and ELSE is the next block" — correctly picked "branch to
+// THEN, fall through to ELSE":
+//
+//     cmp   x0, x8
+//     b.lo  0x1000007ac      <- TAKEN on every in-bounds iteration
+//     adrp  x24, ...         <- the panic block, 6 words, never executed
+//     bl    _bit_rt_panic
+//     udf   #0x0
+//     0x1000007ac: ldr d0, [x12, x0, lsl #3]
+//
+// The polarity that costs nothing on the hot path — `b.hs <panic>` not taken,
+// falling straight into the load — is unreachable from any branch peephole,
+// because it is a decision about where the panic BLOCK goes, not about what
+// shape the branch takes. Moving the block is the whole fix: with the panic
+// block no longer the emission successor, `emitBr`'s existing second shape
+// ("ELSE needs no code": branch to ELSE, fall through to THEN) already emits
+// exactly that, unchanged.
+//
+// WHAT THIS BUYS, MEASURED, so nobody re-derives it from the ticket's original
+// prediction — which was refuted. There is no taken-branch throughput ceiling
+// being hit here: a dedicated kernel sustains 1.97-1.99 taken branches per
+// cycle on this core and `bench/cases/matrix` runs at 52-75% of that. Hand-
+// patching the real `matrix` binary into this exact shape (29 words rewritten
+// in place, instructions retired per iteration unchanged at 17.196) over 41
+// fresh processes per arm moved the MINIMUM by +0.12% and the median by
+// -11.98%, p75 by -18.6%, with the run-to-run spread collapsing from 43.5% to
+// 2.4%. A taken branch on this core is an EXPOSURE — its cost depends on where
+// the code lands — not a fixed price. This deletes the exposure, not a stall.
+//
+// The instruction count is identical either way. That is the check that the
+// two forms do the same work, and it is why this is a placement change and not
+// an optimization that could lose one.
+
+// Does `bi` end in `unreachable` — a block with no successors at all?
+//
+// That is the whole cold-block test, and it is a property of the CFG rather
+// than a guess about frequency: `Op.Unreachable` is emitted only after a
+// diverging call (a bounds check's `bit_rt_panic`, a `panic()`/`fail` in
+// source, a slice's out-of-range trap) or on a join a lowering proved
+// unreachable. Every one of those is either never executed or executed once,
+// on the way out of the program. Nothing falls out of such a block, which is
+// what makes moving it free: it cannot be anyone's fall-through source, and it
+// has no edge whose elision could change.
+fn blockEndsUnreachable(f: IrFunc, bi: int): bool {
+  let b = f.blocks[bi]
+  if (b.instsLen == 0) {
+    return false
+  }
+  return f.instrs[b.instsStart + b.instsLen - 1].op == Op.Unreachable
+}
+
+// The order `compileFunction` emits blocks in: every non-terminal block first,
+// in IR index order, then every `unreachable`-terminated one, also in IR index
+// order. A permutation of `0 .. len(f.blocks)`, so `len(layout)` IS the block
+// count and every block is still emitted exactly once — a shared panic block
+// (two `br`s pointing at one `oob`, lowerreslice.bit) keeps its single copy and
+// is simply reached by two branches instead of one branch and one fall-through.
+//
+// Block 0 is never moved. The prologue and `bindIncomingArgs` are emitted
+// before the block loop runs, so the entry block's code must be what follows
+// them; a function whose entry diverges outright stays exactly where it is.
+//
+// Stable within each group on purpose. `isBackEdge` (codegen.bit) reads IR
+// block INDICES, not emission positions, so keeping relative order inside the
+// hot group means no edge changes its back-edge classification and no
+// safepoint poll appears or disappears.
+fn computeBlockLayout(f: IrFunc): []int {
+  let layout = []int(0)
+  let bi = 0
+  while (bi < len(f.blocks)) {
+    if (bi == 0 || !blockEndsUnreachable(f, bi)) {
+      layout = append(layout, bi)
+    }
+    bi = bi + 1
+  }
+  bi = 1
+  while (bi < len(f.blocks)) {
+    if (blockEndsUnreachable(f, bi)) {
+      layout = append(layout, bi)
+    }
+    bi = bi + 1
+  }
+  return layout
+}
+
+// For each block, the block emitted immediately after it that actually emits
+// code — or -1 when nothing does. Indexed by block id, walked backwards so
+// each entry is one assignment.
+//
+// This SUBSUMES the `cx.deadBlock` walk `emitJumpOrFallThrough` used to run
+// (#4430: a dead block emits no bytes, so it must not count as a block
+// standing between `curBlock` and its fall-through candidate). One array now
+// answers both questions — "what falls through to what" and "what emits
+// nothing" — instead of a `curBlock + 1` guess corrected by a loop.
+fn computeLayoutNext(layout: []int, deadBlock: []bool): []int {
+  let next = []int(len(layout))
+  let li = len(layout) - 1
+  let follow = -1
+  while (li >= 0) {
+    let blk = layout[li]
+    next[blk] = follow
+    if (!deadBlock[blk]) {
+      follow = blk
+    }
+    li = li - 1
+  }
+  return next
+}
+
+// Which block each instruction index belongs to. `f.blocks` partitions
+// `f.instrs` by construction, so every index this is asked about is covered.
+fn computeBlockOfInstr(f: IrFunc): []int {
+  let out = []int(len(f.instrs))
+  let bi = 0
+  while (bi < len(f.blocks)) {
+    let b = f.blocks[bi]
+    let idx = b.instsStart
+    while (idx < b.instsStart + b.instsLen) {
+      out[idx] = bi
+      idx = idx + 1
+    }
+    bi = bi + 1
+  }
+  return out
+}
+
+// `points` (IR-index order, as `buildIntervals` collected them) re-sorted into
+// the order EMISSION reaches them under `layout`.
+//
+// THIS IS THE #4456 CONTRACT, AND MOVING A BLOCK IS EXACTLY WHAT BREAKS IT.
+// `recordSafepoint` (arm64call.bit) picks its stack map with a running counter,
+// `result.stackMaps[cx.nextSafepointIdx]`, so the maps must be in emission
+// order. `allocateCoalesced` (regalloc.bit) builds `stackMaps[i]` from
+// `points.safepoints[i]` one-for-one, and each entry is a pure function of its
+// own `pos` — so ordering `points` here orders the maps, with no permutation
+// applied afterwards and no second order to keep in step. Every other consumer
+// of the list (`crossesAnyPoint`, `rootedAtAnyPoint`, the call/poll filters,
+// `xClobberPoints`) asks set questions and cannot see the order at all.
+//
+// A stable counting sort keyed on `layout` itself, NOT on the hot/cold rule
+// above: a filter that re-encoded that rule here would be a second copy of the
+// layout decision, and the two diverging would hand each safepoint from the
+// divergence on another point's root set — missed GC roots, silent, exit 0.
+// That is #4456's failure mode, and it is the one this must not be able to
+// re-create. Stability keeps IR order inside a block, which is emission order
+// inside a block.
+fn computeSafepointEmissionOrder(f: IrFunc, layout: []int, points: []int): []int {
+  let blockOf = computeBlockOfInstr(f)
+  let n = len(layout)
+  let slotOf = []int(n)
+  let li = 0
+  while (li < n) {
+    slotOf[layout[li]] = li
+    li = li + 1
+  }
+  let start = []int(n)
+  for p of points {
+    start[slotOf[blockOf[p]]] = start[slotOf[blockOf[p]]] + 1
+  }
+  let acc = 0
+  li = 0
+  while (li < n) {
+    let c = start[li]
+    start[li] = acc
+    acc = acc + c
+    li = li + 1
+  }
+  let out = []int(len(points))
+  for p of points {
+    let s = slotOf[blockOf[p]]
+    out[start[s]] = p
+    start[s] = start[s] + 1
+  }
+  return out
+}

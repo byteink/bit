@@ -1,0 +1,132 @@
+// In-Bit self-checks for #4455's ARM64 block layout (arm64layout.bit).
+// Sibling .bit file, same module: `selfcheck()` calls these directly.
+//
+// Hand-built IR, for the reason checkRedundantBoundsBranchFalseEdge gives: it
+// is the only way to state a NEGATIVE case as an assertion instead of hoping a
+// corpus contains one. Breaking any of the three predicates below still
+// compiles every program in this repo — the layout one silently gives back the
+// taken branch this ticket removed, and the safepoint-order one hands each
+// safepoint past the divergence another point's root set, which is missed GC
+// roots at exit 0.
+
+// A function whose block 1 ends in `unreachable` (a bounds check's panic
+// block) and whose block 2 is the in-bounds continuation. Shared by all three
+// checks so each one asserts against the same shape.
+//
+//   bb0: %0 = const_bool, br %0, bb2(), bb1()
+//   bb1: rt_call panic, unreachable        <- terminal, must be emitted LAST
+//   bb2: rt_call f, ret                    <- carries a safepoint of its own
+fn layoutCheckFunc(): IrFunc {
+  let ctx = newTypeContext()
+  let cond = mkInstr(Op.ConstBool, ctx.voidId)
+  cond.bval = true
+  let br0 = mkInstr(Op.Br, ctx.voidId)
+  br0.lhs = 0
+  br0.ival = 2
+  br0.ival2 = 1
+  let pn = mkInstr(Op.RtCall, ctx.voidId)
+  pn.name = "panic"
+  let unr = mkInstr(Op.Unreachable, ctx.voidId)
+  let call = mkInstr(Op.RtCall, ctx.voidId)
+  call.name = "f"
+  let ret = mkInstr(Op.Ret, ctx.voidId)
+  return IrFunc{
+    name: "layout", paramTypes: []int(0), result: ctx.voidId,
+    blocks: [
+      IrBlock{ instsStart: 0, paramCount: 0, instsLen: 2 }, // bb0
+      IrBlock{ instsStart: 2, paramCount: 0, instsLen: 2 }, // bb1, terminal
+      IrBlock{ instsStart: 4, paramCount: 0, instsLen: 2 }, // bb2
+    ],
+    instrs: [cond, br0, pn, unr, call, ret],
+    isFallible: false,
+  }
+}
+
+// #4455: an `unreachable`-terminated block is emitted after every block that
+// is not, and block 0 never moves whatever it ends in.
+fn checkBlockLayoutMovesTerminalBlocks() {
+  let f = layoutCheckFunc()
+  // The premise: bb1 really is terminal and bb2 really is not, so the
+  // predicate under test is being exercised rather than agreeing by accident.
+  assert(
+    blockEndsUnreachable(f, 1),
+    "LAYOUT-0: bb1 must end in unreachable for this check to test anything",
+  )
+  assert(!blockEndsUnreachable(f, 2), "LAYOUT-0b: bb2 must not end in unreachable")
+
+  let layout = computeBlockLayout(f)
+  assert(len(layout) == 3, "LAYOUT-1: every block is emitted exactly once")
+  assert(
+    layout[0] == 0 && layout[1] == 2 && layout[2] == 1,
+    "LAYOUT-2: the terminal block is emitted last",
+  )
+
+  // Block 0 stays first even when it is itself terminal — the prologue and
+  // bindIncomingArgs are emitted before the block loop, so its code must be
+  // what follows them.
+  let g = IrFunc{
+    name: "entryDiverges", paramTypes: []int(0), result: f.result,
+    blocks: [
+      IrBlock{ instsStart: 0, paramCount: 0, instsLen: 2 },
+      IrBlock{ instsStart: 2, paramCount: 0, instsLen: 2 },
+    ],
+    instrs: [f.instrs[2], f.instrs[3], f.instrs[4], f.instrs[5]],
+    isFallible: false,
+  }
+  assert(
+    blockEndsUnreachable(g, 0),
+    "LAYOUT-3: bb0 must end in unreachable for this arm to test anything",
+  )
+  let layoutG = computeBlockLayout(g)
+  assert(layoutG[0] == 0 && layoutG[1] == 1, "LAYOUT-4: block 0 is never moved")
+}
+
+// #4455/#4430: `layoutNext` answers "which block does this one fall into",
+// skipping blocks that emit no code at all.
+fn checkLayoutNextSkipsDeadBlocks() {
+  let f = layoutCheckFunc()
+  let layout = computeBlockLayout(f) // [0, 2, 1]
+
+  let live = computeLayoutNext(layout, []bool(3))
+  assert(live[0] == 2, "LAYOUTNEXT-1: bb0 falls into bb2, not bb1")
+  assert(live[2] == 1, "LAYOUTNEXT-2: bb2 falls into the moved terminal block")
+  assert(live[1] == -1, "LAYOUTNEXT-3: the last block emitted falls into nothing")
+
+  // bb2 marked dead (#4430 narrows such a block to zero emitted instructions),
+  // so bb0 must fall past it to bb1 — the walk emitJumpOrFallThrough used to
+  // run inline.
+  let dead = []bool(3)
+  dead[2] = true
+  let skipped = computeLayoutNext(layout, dead)
+  assert(
+    skipped[0] == 1,
+    "LAYOUTNEXT-4: a dead block emits no bytes and is not a fall-through target",
+  )
+}
+
+// #4456's contract under #4455's reordering: `recordSafepoint` consumes
+// `result.stackMaps` with a running counter, and those maps are built from
+// this list one-for-one, so the list must be in EMISSION order.
+fn checkSafepointEmissionOrderFollowsLayout() {
+  let f = layoutCheckFunc()
+  let layout = computeBlockLayout(f)
+  let blockOf = computeBlockOfInstr(f)
+  assert(blockOf[2] == 1 && blockOf[4] == 2, "SPORDER-0: instruction 2 is bb1's and 4 is bb2's")
+
+  // buildIntervals collects in IR-index order: bb1's panic call (2) before
+  // bb2's call (4). Emission reaches bb2 first, so the order must invert —
+  // an identity result here would mean the reordering never ran.
+  let ordered = computeSafepointEmissionOrder(f, layout, [2, 4])
+  assert(len(ordered) == 2, "SPORDER-1: no safepoint is dropped or duplicated")
+  assert(
+    ordered[0] == 4,
+    "SPORDER-2: bb2 is emitted before the moved bb1, so its safepoint comes first",
+  )
+  assert(ordered[1] == 2, "SPORDER-3: the moved block's safepoint is consumed last")
+
+  // Stable inside one block: two safepoints in bb2 keep their IR order, which
+  // is the order compileFunction's inner loop reaches them in.
+  let both = computeSafepointEmissionOrder(f, layout, [2, 4, 5])
+  assert(len(both) == 3, "SPORDER-4: no safepoint is dropped")
+  assert(both[0] == 4 && both[1] == 5 && both[2] == 2, "SPORDER-5: stable within a block")
+}
