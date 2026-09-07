@@ -14,6 +14,47 @@
 // all green with the bug present, because none of them compares a stack
 // map's CONTENT against what is actually live at that instruction.
 //
+// ---------------------------------------------------------------------------
+// #4459: THIS GATE'S FIRST FIVE CHECKS DO NOT COMPARE A STACK MAP EITHER
+// ---------------------------------------------------------------------------
+//
+// The five checks below — build exits 0, plain exits 0, plain stdout, stress
+// exits 0, stress stdout — are exactly the shape the paragraph above says is
+// blind, and #4459's skeptic measured it: with `BIT_SELF_EXE` pointed at a
+// compiler built from `c21d4730` (the merge immediately before the fix) this
+// gate printed `safepointdeadblock: PASS — 5 checks`, rc=0. Its only path to
+// red on unfixed code was `compileFunction`'s end-of-emission assert, which
+// ships IN the fix commit — so the gate tested that the assert was live, not
+// that it detects `c21d4730`. A gate never observed to fail is not known to
+// test anything.
+//
+// The discriminating check is `stackmap:` below, and it runs INSIDE the built
+// program rather than over its object file: `stackMapsBegin`/`stackMapsEnd`
+// (SPEC §11.12) name the linked table's extent, `entryOf` (§11.10) names
+// `work`'s first instruction, and a raw `*u8` off the null pointer (§11.4)
+// reads both the table and the emitted instruction bytes. No objdump, no
+// Mach-O/ELF parsing, no second copy of the wire format's consumer.
+//
+// What it asserts, with both quantities DERIVED from the emitted image rather
+// than pinned:
+//
+//   - the last safepoint of `work`'s entry is the return of the `print` call
+//     — proven structurally, by requiring a `bl` at `ret_off - 4` and a
+//     `mov x0, xN` at `ret_off - 8`, so xN is that call's first argument;
+//   - `N` must appear in that safepoint's live-register list, because that
+//     register holds the interpolated string `print` is being handed.
+//
+// Measured on this fixture, aarch64-macos: `49ed8771` names `[24]` at
+// `ret_off=368` and x24 is the string; `c21d4730` names `[19,20,22]` at the
+// same offset — three registers holding values that are dead there, and not
+// the argument. That is the desync's signature: the map is another
+// safepoint's, shifted by the dead block ahead of it.
+//
+// Every "could not decide" arm — no entry covering `work`, a version stamp
+// that is not 1, a last safepoint that is not a `mov x0, xN` + `bl` — prints
+// FAIL and not PASS, so a decoder that stops observing anything reddens the
+// gate instead of passing it.
+//
 // The fixture is the ticket's own minimised repro: a class held live across
 // a loop containing a redundant bounds check (`xs[i] = 1; xs[i] = xs[i] +
 // 1`), whose ELSE/panic block `computeRedundantBoundsBranch` proves
@@ -27,14 +68,18 @@
 // x86_64 has no `deadBlock`/`redundantBr` mechanism at all
 // (`git grep -l 'deadBlock\|redundantBr' -- 'compiler/x64*.bit'` is empty),
 // so this fixture is a pure pass-through there — it must still build and run
-// correctly, it just exercises nothing arm64-specific off that host.
+// correctly, it just exercises nothing arm64-specific off that host. The
+// `stackmap:` check decodes AArch64 instruction encodings, so it is gated on
+// `uname -m` and reported as OFF rather than silently skipped; the check
+// count printed at the end moves with it (7 on arm64, 5 elsewhere) so a
+// green line cannot hide a check that did not run.
 //
 // Run it from the repository root:
 //     ./bit-out/bin/bit run _tests_/bit/safepointdeadblock.bit
 // `BIT_SELF_EXE` overrides which `bit` is exercised.
 import { env, envOr, exit } from "std/os"
 import { exists, mkdir, readFile, writeFile } from "std/fs"
-import { parseInt } from "std/strings"
+import { hasPrefix, hasSuffix, parseInt } from "std/strings"
 import { uuidV4, format as uuidFormat } from "std/uuid"
 
 fn timeoutMs(): int {
@@ -85,14 +130,40 @@ fn bitBinary(scratch: string, ms: int): string! {
   return candidate
 }
 
-// #4456's own repro, verbatim: `sink(b)` needs the class live across the
-// loop, and the redundant second bounds check on `xs[i]` is what
-// computeRedundantBoundsBranch proves dead. Deterministic output, no
-// imports needed — the fixture must build without BIT_STDLIB.
-fn fixtureSource(): string {
+// `uname -m`, trimmed. The `stackmap:` check decodes AArch64 instruction
+// encodings, so it can only run where those are what got emitted.
+fn hostArch(scratch: string, ms: int): string {
+  let out = "${scratch}/arch.txt"
+  let code = shell("${scratch}/arch.sh", "#!/bin/sh\nuname -m > '${out}'\n", ms) catch _ {
+    return "unknown"
+  }
+  if (code != 0) {
+    return "unknown"
+  }
+  return trimWs(
+    readFile(out) catch _ {
+      "unknown"
+    },
+  )
+}
+
+fn isArm64(arch: string): bool {
+  return arch == "arm64" || arch == "aarch64"
+}
+
+// #4456's own repro, verbatim except that its body moved from `main` into
+// `work` so `entryOf(work)` can name it (`entryOf` takes a named function
+// declaration, SPEC §11.10). `sink(b)` needs the class live across the loop,
+// and the redundant second bounds check on `xs[i]` is what
+// computeRedundantBoundsBranch proves dead. Deterministic output, no imports
+// needed — the fixture must build without BIT_STDLIB. Verified on both
+// compilers: moving the body leaves `work`'s emitted code and its nine
+// safepoint offsets identical, and the last one still diverges 49ed8771
+// `[24]` vs c21d4730 `[19,20,22]`.
+fn fixtureBody(): string {
   return "class Box { v: i64 }\n" +
     "fn sink(b: Box): i64 { return b.v }\n" +
-    "fn main() {\n" +
+    "fn work() {\n" +
     "  let xs = []i64(8)\n" +
     "  let b = Box{ v: 7 }\n" +
     "  let i = 0\n" +
@@ -103,6 +174,150 @@ fn fixtureSource(): string {
     "  }\n" +
     "  print(\"\${sink(b)} \${xs[3]}\\n\")\n" +
     "}\n"
+}
+
+// The three unmanaged-subset builtins this check is built on, plus the
+// byte reader. `stackMapsBegin`/`stackMapsEnd` and `entryOf` are admitted
+// inside `@nosplit` on proof (SPEC §10.3.1): each lowers to one inline
+// address materialization against a link-time constant.
+fn mapReaders(): string {
+  return "@nosplit fn mapsBegin(): int { return int(stackMapsBegin()) }\n" +
+    "@nosplit fn mapsEnd(): int { return int(stackMapsEnd()) }\n" +
+    "@nosplit fn workAt(): int { return int(entryOf(work)) }\n" +
+    "fn u8At(a: int): int {\n" +
+    "  let base: *u8 = nil\n" +
+    "  return int(*(base + a))\n" +
+    "}\n" +
+    "fn u16At(a: int): int { return u8At(a) | (u8At(a + 1) << 8) }\n" +
+    "fn u32At(a: int): int { return u16At(a) | (u16At(a + 2) << 16) }\n" +
+    "fn u64At(a: int): int { return u32At(a) | (u32At(a + 4) << 32) }\n"
+}
+
+// The ABI.md §4 walk: one entry per function, self-delimiting, no count and
+// no terminator, every entry padded out to a multiple of 8. This decodes the
+// same fields runtime/gc/stackmap.bit's `scanFrame` does and stops at the
+// entry whose [code_addr, code_addr + code_size) covers `work`, keeping that
+// entry's LAST safepoint. `guard` bounds the walk (Power of 10 rule 2).
+fn mapWalker(): string {
+  return "let hitCodeAddr = 0\n" +
+    "let hitRetOff = 0\n" +
+    "let hitRegsAt = 0\n" +
+    "let hitNRegs = 0\n" +
+    "let hitFound = 0\n" +
+    "let hitVersion = 0\n" +
+    "fn scanEntries() {\n" +
+    "  let base = mapsBegin()\n" +
+    "  let tblLen = mapsEnd() - base\n" +
+    "  let target = workAt()\n" +
+    "  let off = 0\n" +
+    "  let guard = 0\n" +
+    "  while (off < tblLen && guard < 100000) {\n" +
+    "    guard = guard + 1\n" +
+    "    let codeAddr = u64At(base + off)\n" +
+    "    let version = u16At(base + off + 8)\n" +
+    "    let codeSize = u32At(base + off + 10)\n" +
+    "    let nSaved = u16At(base + off + 14)\n" +
+    "    off = off + 16 + nSaved * 6\n" +
+    "    let nSp = u16At(base + off)\n" +
+    "    off = off + 2\n" +
+    "    let hit = target >= codeAddr && target < codeAddr + codeSize\n" +
+    "    let si = 0\n" +
+    "    while (si < nSp) {\n" +
+    "      let retOff = u32At(base + off)\n" +
+    "      off = off + 4\n" +
+    "      let nSlots = u16At(base + off)\n" +
+    "      off = off + 2 + nSlots * 4\n" +
+    "      let nRegs = u16At(base + off)\n" +
+    "      off = off + 2\n" +
+    "      if (hit && si == nSp - 1) {\n" +
+    "        hitCodeAddr = codeAddr\n" +
+    "        hitRetOff = retOff\n" +
+    "        hitRegsAt = base + off\n" +
+    "        hitNRegs = nRegs\n" +
+    "        hitVersion = version\n" +
+    "        hitFound = 1\n" +
+    "      }\n" +
+    "      off = off + nRegs * 2\n" +
+    "      si = si + 1\n" +
+    "    }\n" +
+    "    let rem = off % 8\n" +
+    "    if (rem != 0) {\n" +
+    "      off = off + 8 - rem\n" +
+    "    }\n" +
+    "    if (hit) {\n" +
+    "      return\n" +
+    "    }\n" +
+    "  }\n" +
+    "}\n"
+}
+
+// `argReg` is the half that makes the assertion self-deriving rather than a
+// pinned register number: AArch64 `bl` is `100101 imm26` (top six bits 37),
+// and `mov x0, xN` is `ORR x0, xzr, xN` = 0xAA0003E0 | (N << 16), so masking
+// with 0xFFE0FFFF (4292935679) and comparing against 0xAA0003E0 (2852127712)
+// identifies a call whose first argument came from register N.
+fn mapDecoders(): string {
+  return "fn hasReg(r: int): bool {\n" +
+    "  let k = 0\n" +
+    "  while (k < hitNRegs) {\n" +
+    "    if (u16At(hitRegsAt + k * 2) == r) { return true }\n" +
+    "    k = k + 1\n" +
+    "  }\n" +
+    "  return false\n" +
+    "}\n" +
+    "fn regList(): string {\n" +
+    "  let s = \"\"\n" +
+    "  let k = 0\n" +
+    "  while (k < hitNRegs) {\n" +
+    "    if (k > 0) { s = s + \",\" }\n" +
+    "    s = s + \"\${u16At(hitRegsAt + k * 2)}\"\n" +
+    "    k = k + 1\n" +
+    "  }\n" +
+    "  return s\n" +
+    "}\n" +
+    "fn argReg(): int {\n" +
+    "  let ret = hitCodeAddr + hitRetOff\n" +
+    "  if ((u32At(ret - 4) >> 26) != 37) { return -1 }\n" +
+    "  let mv = u32At(ret - 8)\n" +
+    "  if ((mv & 4292935679) != 2852127712) { return -1 }\n" +
+    "  return (mv >> 16) & 31\n" +
+    "}\n"
+}
+
+// Every arm prints before it returns, and only the last one prints PASS: a
+// decode that observes nothing reddens the gate rather than passing it.
+fn mapMain(): string {
+  return "fn main() {\n" +
+    "  work()\n" +
+    "  scanEntries()\n" +
+    "  if (hitFound == 0 || hitVersion != 1) {\n" +
+    "    print(\"stackmap: FAIL found=\${hitFound} version=\${hitVersion} — " +
+    "no stack-map entry covers work(); this check observed nothing\\n\")\n" +
+    "    return\n" +
+    "  }\n" +
+    "  let n = argReg()\n" +
+    "  if (n < 19 || n > 28) {\n" +
+    "    print(\"stackmap: FAIL last_ret_off=\${hitRetOff} argreg=\${n} — the last " +
+    "safepoint is not a callee-saved `mov x0, xN` + `bl` call site; this check " +
+    "observed nothing\\n\")\n" +
+    "    return\n" +
+    "  }\n" +
+    "  print(\"stackmap: last_ret_off=\${hitRetOff} argreg=x\${n} " +
+    "map_regs=[\${regList()}]\\n\")\n" +
+    "  if (!hasReg(n)) {\n" +
+    "    print(\"stackmap: FAIL — the map at the print call's return does not name " +
+    "x\${n}, the register holding its string argument (#4456)\\n\")\n" +
+    "    return\n" +
+    "  }\n" +
+    "  print(\"stackmap: PASS\\n\")\n" +
+    "}\n"
+}
+
+fn fixtureSource(mapCheck: bool): string {
+  if (!mapCheck) {
+    return fixtureBody() + "fn main() { work() }\n"
+  }
+  return fixtureBody() + mapReaders() + mapWalker() + mapDecoders() + mapMain()
 }
 
 fn trimWs(s: string): string {
@@ -121,9 +336,10 @@ fn isWs(c: u8): bool {
   return c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }
 
-// The scratch directory and per-run timeout, threaded through every step —
-// grouped so runAndCheck stays under LINT.md's 5-param ceiling (E0202).
-class RunEnv { scratch: string, ms: int }
+// The scratch directory, the per-run timeout and whether the arm64-only
+// `stackmap:` check is in the generated program — grouped so runAndCheck
+// stays under LINT.md's 5-param ceiling (E0202).
+class RunEnv { scratch: string, ms: int, mapCheck: bool }
 
 // Builds the fixture. A non-zero exit here is exactly what the pre-fix
 // compiler produces once `compileFunction`'s end-of-emission assert
@@ -137,7 +353,7 @@ fn buildFixture(t: Tally, re: RunEnv): (string, bool) {
   let prog = "${re.scratch}/deadblock"
   let errPath = "${re.scratch}/build_err.txt"
 
-  writeFile(src, fixtureSource()) catch e {
+  writeFile(src, fixtureSource(re.mapCheck)) catch e {
     panic("safepointdeadblock: cannot write the fixture: ${e.message()}")
   }
   let build = shell(
@@ -153,9 +369,36 @@ fn buildFixture(t: Tally, re: RunEnv): (string, bool) {
   return prog, build == 0 && exists(prog)
 }
 
+// The program prints "7 2" first and, on arm64, the two `stackmap:` lines
+// after it. Both are asserted separately so a green run cannot come from a
+// decode that stopped producing a verdict.
+fn checkOutput(t: Tally, re: RunEnv, out: string, label: string) {
+  if (!re.mapCheck) {
+    check(
+      t, out == "7 2",
+        "${label}: want output exactly \"7 2\" (sink(b)=7, xs[3]=2), got \"${out}\" — " +
+        "a shifted stack map handed this safepoint the wrong live-register " +
+        "set (#4456)",
+    )
+    return
+  }
+  check(
+    t, hasPrefix(out, "7 2"),
+      "${label}: want output starting \"7 2\" (sink(b)=7, xs[3]=2), got \"${out}\" — " +
+      "a shifted stack map handed this safepoint the wrong live-register " +
+      "set (#4456)",
+  )
+  check(
+    t, hasSuffix(out, "stackmap: PASS"),
+      "${label}: the decoded stack map at the print call's return did not name " +
+      "the register holding its string argument, or the decode observed " +
+      "nothing (#4456/#4459). Full program output: \"${out}\"",
+  )
+}
+
 // Runs `prog` plain and under BIT_GC=stress, asserting BOTH exit 0 and the
-// exact expected output "7 2". Stress collects at every safepoint, which is
-// what turns a wrong root set into an observable wrong answer.
+// expected output. Stress collects at every safepoint, which is what turns a
+// wrong root set into an observable wrong answer.
 fn runAndCheck(t: Tally, re: RunEnv, prog: string, stress: bool, label: string) {
   let outPath = "${re.scratch}/${label}_out.txt"
   let gcLine = ""
@@ -172,12 +415,7 @@ fn runAndCheck(t: Tally, re: RunEnv, prog: string, stress: bool, label: string) 
       ""
     },
   )
-  check(
-    t, out == "7 2",
-      "${label}: want output \"7 2\" (sink(b)=7, xs[3]=2), got \"${out}\" — " +
-      "a shifted stack map handed this safepoint the wrong live-register " +
-      "set (#4456)",
-  )
+  checkOutput(t, re, out, label)
 }
 
 fn runAll(t: Tally, re: RunEnv) {
@@ -195,29 +433,49 @@ fn teardown(scratch: string, ms: int) {
   }
 }
 
-fn main() {
-  let re = RunEnv{
-    scratch: "${trimSuffix(envOr("TMPDIR", "/tmp"), "/")}/bit-safepointdeadblock-${uuidFormat(uuidV4())}",
-    ms: timeoutMs(),
+// 5 without the map decode (build, then exit code + exact stdout on each of
+// the two runs), 7 with it (each run then asserts exit code, the "7 2"
+// prefix and the `stackmap: PASS` verdict). Printed alongside the result so
+// a denominator that moved is visible rather than absorbed.
+fn wantChecks(mapCheck: bool): int {
+  if (mapCheck) {
+    return 7
   }
+  return 5
+}
+
+fn main() {
+  let scratch = "${trimSuffix(envOr("TMPDIR", "/tmp"), "/")}/bit-safepointdeadblock-${uuidFormat(uuidV4())}"
+  let ms = timeoutMs()
   let t = Tally{ checks: 0, failures: 0 }
 
-  mkdir(re.scratch) catch e {
-    panic("safepointdeadblock: cannot create ${re.scratch}: ${e.message()}")
+  mkdir(scratch) catch e {
+    panic("safepointdeadblock: cannot create ${scratch}: ${e.message()}")
+  }
+  let arch = hostArch(scratch, ms)
+  let re = RunEnv{ scratch: scratch, ms: ms, mapCheck: isArm64(arch) }
+  if (re.mapCheck) {
+    println("safepointdeadblock: arch=${arch} — stack-map decode check ON")
+  } else {
+    println("safepointdeadblock: arch=${arch} — stack-map decode check OFF (AArch64 encodings only; x86_64 has no dead-block mechanism)")
   }
   runAll(t, re)
 
-  if (t.checks < 5) {
-    eprint("FAIL: only ${t.checks} checks ran, want at least 5\n")
+  // EXACTLY `want`, not "at least": a check that silently vanished and one
+  // that silently doubled are both denominator drift, and `<` sees neither.
+  // #4459 shipped a first draft where the non-arm64 path ran 7 checks
+  // against a `want` of 5 and passed on `<`.
+  let want = wantChecks(re.mapCheck)
+  if (t.checks != want) {
+    eprint("FAIL: ${t.checks} checks ran, want exactly ${want}\n")
     t.failures = t.failures + 1
   }
+  teardown(scratch, ms)
   if (t.failures > 0) {
-    teardown(re.scratch, re.ms)
-    println("safepointdeadblock: FAIL — ${t.failures} of ${t.checks} checks failed")
+    println("safepointdeadblock: FAIL — ${t.failures} of ${t.checks} checks failed (want ${want})")
     exit(1)
   }
-  teardown(re.scratch, re.ms)
-  println("safepointdeadblock: PASS — ${t.checks} checks")
+  println("safepointdeadblock: PASS — ${t.checks} checks (want ${want})")
 }
 
 fn trimSuffix(s: string, suffix: string): string {
