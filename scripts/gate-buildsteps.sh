@@ -111,7 +111,15 @@ case "${BUCKET}" in
     # test-packages (#3271) too: nothing under pkg/ imports compiler/**, but
     # compiler/** can break every package, so a compiler/**-only change owes
     # it the same way `full` above does.
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages)
+    #
+    # test-fmt-strict (#4445) declares its scope in an ENV entry
+    # (BIT_FMTZERO_TREES=compiler:compiler runtime:runtime tools:tools,
+    # tools/build/gatestable2.bit), not in argv, so it was invisible to every
+    # mapping in this file — three separate batches landed an unformatted
+    # compiler/*.bit file on merged `main` with every branch green before this
+    # was caught. Same "examines this bucket's content directly" reason as
+    # test-lint-filelines/test-selfhostcheck/test-selfcheck above.
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-fmt-strict)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did
@@ -143,7 +151,11 @@ case "${BUCKET}" in
     # was never the problem.
     # test-packages (#3271) too, same reason as the selfhost bucket above:
     # runtime/** can break every package even though no package imports it.
-    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages)
+    #
+    # test-fmt-strict (#4445): same env-declared-scope gap as the selfhost
+    # bucket above — BIT_FMTZERO_TREES names `runtime` alongside `compiler`
+    # and `tools`, so a runtime/**-only change owes it too.
+    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-fmt-strict)
     ;;
   testcases)
     # test-fuzz mutates the real _tests_/cases corpus (BIT_FUZZ_CASES=
