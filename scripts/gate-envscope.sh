@@ -106,6 +106,7 @@ envscope_bucket_for_tree() {
 assert_envscoped_gates_current() {
   local pairs pair gate tree bucket probe result denom=0 bad="" seen=""
   local BUCKET BUILD_STEPS
+  assert_envscope_deps
   pairs="$(envscoped_gate_trees)"
   if [ -z "${pairs}" ]; then
     echo "gate: assert_envscoped_gates_current: found ZERO gates declaring a BIT_*_TREES= env entry across both gate tables — almost certainly this function's own extraction breaking (today there are at least 4: test-fmt-strict/-stress/-testsbit/-cases), not a fact about the tree" >&2
@@ -171,4 +172,181 @@ EOF
     exit 2
   fi
   echo "gate: assert_envscoped_gates_current: all ${denom} env-declared-tree gate(s) correctly wired"
+
+  # The argv-scoped half (#4465) runs from here rather than from a second call
+  # site in scripts/gate.sh: that file sits at exactly 800 lines against
+  # _tests_/bit/shellsize.bit's hard-zero ceiling, so it has no room for one
+  # more line. Both halves check the same rule gate.sh's own header states, and
+  # neither is optional, so one entry point is the honest shape anyway.
+  assert_argvscoped_gates_current
+}
+
+# ---------------------------------------------------------------------------
+# THE ARGV-SCOPED HALF (#4465).
+#
+# assert_envscoped_gates_current() above covers a gate whose scanned trees are
+# spelled out in gates.bit's own `env:`. #4465 is the same defect reached by a
+# THIRD route, which that assertion states plainly it cannot see: a gate whose
+# argv names only its own fixture (`runArgs("_tests_/bit/abimembers")`), whose
+# env carries nothing but `std`, and whose real scope is a walk INSIDE the
+# harness source — `bitSources("${repo}/compiler")`. test-abimembers sat in
+# the `runtime` bucket alone while reading every `Op.RtCall` name in
+# compiler/*.bit as an ABI demand, so it was dark for exactly the compiler-only
+# diffs it exists to catch (ae8a2581, symptom fixed at d1534308).
+#
+# WHY DISCOVERY IS A GREP AND NOT A HAND TABLE. A hand table of "gate ->
+# tree" would be a second list to keep in step with the harnesses, and this
+# repo's whole complaint about the manual wiring in gate-buildsteps.sh is that
+# a hand list goes stale silently. So the harness sources ARE the list: the
+# scan-root spellings below are derived from the source every time. What is
+# hand-held is only the FLOOR — a small set of gates known to be in this class
+# — which exists so that a broken pattern (matching nothing) fails loudly
+# instead of passing vacuously, the failure mode CLAUDE.md records for the
+# `compiler/**/*.bit` glob and the ARM64_RELOC_BRANCH26 count.
+#
+# SCOPE, STATED PRECISELY: this covers the `compiler` tree only, which is
+# #4465's acceptance. Widening it to the other eight trees means deciding a
+# bucket for every gate a wider pattern turns up, and each of those decisions
+# is its own finding — filed separately rather than guessed at here.
+
+# Fails loudly if this file was sourced without the modules it probes. Sourced
+# alone, `build_steps_for_bucket` and `testsbit_steps_for` are simply absent,
+# `$(...)` yields empty, and every gate then looks unwired — a plausible
+# WRONG answer naming real gate names, which is worse than a crash (#4454
+# hit exactly this by hand). A missing dependency is a caller bug, not a
+# finding about the tree, and must not be reported as one.
+assert_envscope_deps() {
+  local fn missing=""
+  for fn in build_steps_for_bucket testsbit_steps_for; do
+    command -v "${fn}" >/dev/null 2>&1 || missing="${missing:+${missing} }${fn}"
+  done
+  [ -z "${missing}" ] && return 0
+  echo "gate: scripts/gate-envscope.sh: sourced without its dependencies (${missing} undefined) — source scripts/gate-filemap.sh and scripts/gate-buildsteps.sh first, as scripts/gate.sh does. Refusing to report a verdict: with these absent every gate looks unwired and the failure list would name real gates for a reason that is not true of the tree." >&2
+  exit 2
+}
+
+# Emits "<gate> <argv-path>" for every Gate{} whose argv is a single
+# runArgs("<path>") fixture target. The gates whose argv names a source tree
+# directly (test-fmt, test-selfcheck, test-selfhostcheck, ...) do not match and
+# do not need to: gate-filemap.sh's gates_for_file() already ties those back to
+# their bucket by argv-literal matching, which is the half that has worked
+# since #2903.
+argv_gate_paths() {
+  sed -n 's/.*Gate{name: "\([^"]*\)".*runArgs("\([^"]*\)").*/\1 \2/p' \
+    tools/build/gates.bit tools/build/gatestable2.bit
+}
+
+# The scan-root spellings a harness uses to name the compiler tree, as an
+# extended regex over its own .bit source:
+#   ${repo}/compiler , ${repoRoot()}/compiler   — a walk root
+#   [ "compiler"  or  , "compiler"  or  ^"compiler"  — a dirNames array element
+#   "compiler/<name>.bit"                        — a named compiler source
+# Deliberately NOT a bare `"compiler"` anywhere: _tests_/bit/walkbitcheck.bit
+# mentions `walk("compiler")` in a comment and scans nothing, and a pattern
+# that cannot tell a comment from a scan root produces a candidate list nobody
+# will trust; whole-line `//` comments are stripped before matching for the
+# same reason. Verified against all 103 argv-path gates: 9 candidates, every
+# one of which genuinely reads compiler sources, and it independently
+# re-derives the two gates (test-version-cli, test-threadtokenbytes) that
+# #4454's HAND audit had found by reading — their matches are real
+# `exists("${c}/compiler/codegen.bit")`/`slurp(...)` calls, not prose.
+#
+# WHAT IT CANNOT DO, measured rather than assumed: the `compiler/<name>.bit"`
+# arm matches that spelling anywhere in code, including inside a diagnostic
+# STRING. Renaming both of abimembers.bit's real scan roots
+# (`bitSources("${repo}/compiler")`, `"${repo}/compiler/irrtfns.bit"`) still
+# leaves it discovered, off its own message text at :398. So this discovers
+# membership in the class; it does not prove a gate has LEFT it. That is the
+# over-inclusive direction — at worst it demands a gate be wired that need not
+# be, which fails loudly and is settled by wiring it or naming an exemption.
+# The direction that matters, a gate silently going dark, is the one it
+# catches.
+ARGVSCOPE_COMPILER_PATTERN='\$\{repo(Root\(\))?\}/compiler|(^|[[,])[[:space:]]*"compiler"|compiler/[a-zA-Z0-9_]+\.bit"'
+
+# Prints the gate names whose own harness source scans the compiler tree, one
+# per line, sorted and deduplicated.
+argvscoped_compiler_gates() {
+  local gate path srcs src hits
+  argv_gate_paths | while IFS=' ' read -r gate path; do
+    [ -n "${gate}" ] || continue
+    if [ -d "${path}" ]; then
+      srcs="$(ls "${path}"/*.bit 2>/dev/null || true)"
+    elif [ -f "${path}" ]; then
+      srcs="${path}"
+    else
+      continue
+    fi
+    [ -n "${srcs}" ] || continue
+    for src in ${srcs}; do
+      # -c, not -q: `grep -q` exits on the FIRST match, so the upstream grep
+      # takes SIGPIPE on any file bigger than the pipe buffer and `set -o
+      # pipefail` then reads a real match as a failure — a miss that grows
+      # with file size and passes on every small file you test it with. -c
+      # drains its input. Zero matches is exit 1 with "0" on stdout, hence the
+      # `|| true` and the explicit compare rather than reading the status.
+      hits="$(command grep -vE '^[[:space:]]*//' "${src}" \
+        | command grep -cE "${ARGVSCOPE_COMPILER_PATTERN}" || true)"
+      [ "${hits}" = "0" ] && continue
+      printf '%s\n' "${gate}"
+      break
+    done
+  done | sort -u
+}
+
+# The live-query floor. These four are in this class by inspection and none of
+# them can leave it without the harness being rewritten, so a run that fails to
+# rediscover any one of them has a broken pattern, not a cleaner tree. Named
+# rather than counted on purpose: a count silently absorbs one gate leaving the
+# class while another joins it, exactly the property that retired this repo's
+# fmt ceilings (#3713).
+ARGVSCOPE_COMPILER_FLOOR="test-abimembers test-lint-filelines test-lint-self test-fmt-roundtrip"
+
+# Asserts every gate whose harness scans the compiler tree is in the `selfhost`
+# bucket's BUILD_STEPS. Probes the LIVE build_steps_for_bucket() rather than a
+# second copy of the step list, same as assert_envscoped_gates_current() above,
+# so the only way to pass is to actually wire the gate in.
+#
+# Shadows BUCKET/BUILD_STEPS as locals, so it never disturbs the real diff's
+# own bucket selection running around it in scripts/gate.sh.
+assert_argvscoped_gates_current() {
+  local gates gate want denom=0 wired=0 bad=""
+  local BUCKET BUILD_STEPS
+  assert_envscope_deps
+  gates="$(argvscoped_compiler_gates)"
+  for want in ${ARGVSCOPE_COMPILER_FLOOR}; do
+    case "
+${gates}
+" in
+      *"
+${want}
+"*) ;;
+      *)
+        echo "gate: assert_argvscoped_gates_current: did NOT rediscover \"${want}\", which scans the compiler tree by inspection — ARGVSCOPE_COMPILER_PATTERN (scripts/gate-envscope.sh) has stopped matching, or that harness moved. A pattern matching nothing looks exactly like a correctly wired tree; refusing to report a verdict." >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  BUCKET="selfhost"
+  build_steps_for_bucket
+  while IFS= read -r gate; do
+    [ -n "${gate}" ] || continue
+    denom=$((denom + 1))
+    case " ${BUILD_STEPS[*]} " in
+      *" ${gate} "*) wired=$((wired + 1)) ;;
+      *)
+        bad="${bad:+${bad}
+}gate \"${gate}\"'s own harness scans the compiler tree, but the \"selfhost\" bucket's BUILD_STEPS (scripts/gate-buildsteps.sh) does not include it — a compiler-only diff never runs it. Wire it into that bucket, or, if it is a coreSteps() gate outside \`./make test\` and so outside gate.sh's scoping responsibility, add it here as a NAMED exemption with its reason."
+        ;;
+    esac
+  done <<EOF
+${gates}
+EOF
+
+  if [ -n "${bad}" ]; then
+    echo "gate: assert_argvscoped_gates_current: FAILED — ${wired} of ${denom} argv-scoped compiler gate(s) wired" >&2
+    echo "${bad}" | sed 's/^/gate:   /' >&2
+    exit 2
+  fi
+  echo "gate: assert_argvscoped_gates_current: ${wired} of ${denom} gate(s) whose harness scans compiler/ are in the selfhost bucket"
 }
