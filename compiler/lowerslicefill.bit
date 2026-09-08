@@ -92,6 +92,20 @@ fn typeHasNoZeroValue(fc: FnCtx, ty: int): bool {
 //                          jump header(%s', %n', %i + 1)
 //   exit(%s''):            <- the enclosing expression carries on here
 //
+// #4566: when the element type's zero record is SHAREABLE (`zeroIsShareable`
+// below — a tuple of scalars, whose members SPEC §12.5:2187 makes read-only)
+// the `gc_alloc` moves ABOVE the header and its result is threaded through as
+// a fourth loop parameter, so `[]T(n)` allocates once rather than `n` times:
+//
+//     %z = gc_alloc T                     <- once, whatever `n` is
+//     jump header(%s, %n, 0, %z)
+//   header(%s', %n', %i, %z'):  br %i < %n' -> body, exit(%s')
+//   body:                       slice_set %s'[%i] = %z'
+//                               jump header(%s', %n', %i + 1, %z')
+//
+// The loop and its back-edge poll are unchanged, so the safepoint count is the
+// same either way (#4552).
+//
 // The body takes no parameters: it has the header as its single predecessor, so
 // there is nothing to merge (again as `lowerWhile` does).
 fn fillZeroElems(fc: FnCtx, sliceV: int, elemTy: int, nV: int, span: Span): int {
@@ -103,13 +117,24 @@ fn fillZeroElems(fc: FnCtx, sliceV: int, elemTy: int, nV: int, span: Span): int 
 
   let zero = mkInstr(Op.ConstInt, i64ty)
   zero.ival = 0
-  emitJump(fc, header, [sliceV, nV, builderEmit(fc.b, zero)])
+  // #4566: for a shareable element type ONE record is built HERE, above the
+  // loop, and threaded through the header — threaded rather than read directly
+  // inside the body, for the same reason `hSlice`/`hN` are (see above).
+  let shared = sharedZeroRecord(fc, elemTy, span)
+  if (fc.failed) {
+    return 0
+  }
+  emitJump(fc, header, fillLoopArgs(sliceV, nV, builderEmit(fc.b, zero), shared))
   builderEndBlock(fc.b)
 
   builderBeginBlock(fc.b, header)
   let hSlice = builderAddParam(fc.b, sliceTy)
   let hN = builderAddParam(fc.b, i64ty)
   let hI = builderAddParam(fc.b, i64ty)
+  let hZ = 0
+  if (shared != 0) {
+    hZ = builderAddParam(fc.b, fc.b.instrs[shared].ty)
+  }
   let lt = mkInstr(Op.ICmpSlt, primType(fc.c.ctx, 10))
   lt.lhs = hI
   lt.rhs = hN
@@ -123,47 +148,83 @@ fn fillZeroElems(fc: FnCtx, sliceV: int, elemTy: int, nV: int, span: Span): int 
   builderEndBlock(fc.b)
 
   builderBeginBlock(fc.b, body)
-  // An element type with NO zero value (a class with a class-typed field, or a
-  // boxed enum whose first variant carries a payload, §13.4) cannot be filled.
-  // The checker rejects that outright when `n` folds to a constant above zero,
-  // which is the diagnosable case; a runtime `n` it cannot decide, and `[]S(0)`
-  // is both legal and the idiomatic empty slice. So the body — entered only
-  // when `n > 0` — panics rather than storing a null and handing the caller a
-  // segfault later, at a place that no longer names the slice.
+  if (!emitFillBody(fc, fillLoopArgs(hSlice, hN, hI, hZ), elemTy, header, span)) {
+    return 0
+  }
+  builderBeginBlock(fc.b, exit)
+  return builderAddParam(fc.b, sliceTy)
+}
+
+// The header's parameter list, and the argument list of both jumps that reach
+// it — ONE spelling for all three (#4566), so a shared record threaded into
+// the header cannot fall out of step with what the edges pass. `shared` is 0
+// when the element type has no shareable zero record, and the fourth slot then
+// does not exist at all rather than carrying a placeholder.
+fn fillLoopArgs(sliceV: int, nV: int, iV: int, shared: int): []int {
+  if (shared == 0) {
+    return [sliceV, nV, iV]
+  }
+  return [sliceV, nV, iV, shared]
+}
+
+// The fill loop's body block, which the caller has already opened: store one
+// zero record into `hp[0][hp[2]]` and jump back to `header`. Ends the block on
+// every path it takes; returns false only when lowering has failed, where the
+// caller abandons the whole fill.
+//
+// `hp` is the header's parameters as `fillLoopArgs` laid them out —
+// slice, n, i, and the shared zero record when there is one.
+//
+// An element type with NO zero value (a class with a class-typed field, or a
+// boxed enum whose first variant carries a payload, §13.4) cannot be filled.
+// The checker rejects that outright when `n` folds to a constant above zero,
+// which is the diagnosable case; a runtime `n` it cannot decide, and `[]S(0)`
+// is both legal and the idiomatic empty slice. So the body — entered only
+// when `n > 0` — panics rather than storing a null and handing the caller a
+// segfault later, at a place that no longer names the slice.
+fn emitFillBody(fc: FnCtx, hp: []int, elemTy: int, header: int, span: Span): bool {
   if (typeHasNoZeroValue(fc, elemTy)) {
     emitNoZeroValuePanic(fc, elemTy, "[]" + typeName(fc.c.ctx, elemTy) + "(n)")
     builderEndBlock(fc.b)
-    builderBeginBlock(fc.b, exit)
-    return builderAddParam(fc.b, sliceTy)
+    return true
   }
-  let zv = zeroValue(fc, elemTy, span)
-  if (fc.failed) {
-    return 0
+  // The hoisted record when the header carries one, else a fresh one per
+  // element — which is what `[]T(n)` for a class or a boxed enum still does.
+  // `hZ` and `zv` stay separate: the back edge below must pass the header's
+  // OWN parameter back (or nothing at all), never the per-element record.
+  let hZ = 0
+  if (len(hp) > 3) {
+    hZ = hp[3]
+  }
+  let zv = hZ
+  if (hZ == 0) {
+    zv = zeroValue(fc, elemTy, span)
+    if (fc.failed) {
+      return false
+    }
   }
   // elem_size (ABI.md §9, #3121/#3226): see `lowerlit.bit`'s
   // `lowerSliceAlloc` for the full rationale; `sliceElemSizeFor` lives in
-  // `lowerlayout.bit`. `elemTy` is always a class or a boxed enum here
-  // (`fillZeroElems`'s only caller gates on `TypeKind.Struct` or a boxed
-  // `TypeKind.Enum`), so this is always 8 in
-  // practice — never a packed `[]u8` — but computed rather than hard-coded
-  // to match every other call site and not depend on that invariant holding.
+  // `lowerlayout.bit`. Every element kind that reaches here is a reference —
+  // a class, a boxed enum or (#4500) a tuple — so this is always 8 in
+  // practice, never a packed `[]u8`, but computed rather than hard-coded to
+  // match every other call site and not depend on that invariant holding.
+  let i64ty = primType(fc.c.ctx, 3)
   let esI = mkInstr(Op.ConstInt, i64ty)
   esI.ival = sliceElemSizeFor(fc, elemTy)
   let esV = builderEmit(fc.b, esI)
   let ss = mkInstr(Op.RtCall, fc.c.ctx.voidId)
   ss.name = "slice_set"
-  ss.args = [hSlice, hI, zv, esV]
+  ss.args = [hp[0], hp[2], zv, esV]
   emitRtCall(fc, ss)
   let one = mkInstr(Op.ConstInt, i64ty)
   one.ival = 1
   let next = mkInstr(Op.Add, i64ty)
-  next.lhs = hI
+  next.lhs = hp[2]
   next.rhs = builderEmit(fc.b, one)
-  emitJump(fc, header, [hSlice, hN, builderEmit(fc.b, next)])
+  emitJump(fc, header, fillLoopArgs(hp[0], hp[1], builderEmit(fc.b, next), hZ))
   builderEndBlock(fc.b)
-
-  builderBeginBlock(fc.b, exit)
-  return builderAddParam(fc.b, sliceTy)
+  return true
 }
 // `panic(...)` naming a type §13.4 gives no zero value, followed by
 // `unreachable`. The caller opens whatever block follows; this only terminates
@@ -399,6 +460,77 @@ fn zeroIsLiveRecord(fc: FnCtx, ty: int): bool {
     return true
   }
   return td.kind == TypeKind.Enum && td.enumBoxed
+}
+
+// #4566: is `ty`'s zero record SHAREABLE — may ONE instance stand in for every
+// element of `[]ty(n)`, instead of `n` separately allocated ones?
+//
+// Yes exactly when `ty` is a tuple whose members are, transitively, scalar
+// primitives and other such tuples. Two facts make the substitution
+// unobservable for that set and only that set:
+//
+//   - SPEC 12.5:2187 makes tuple elements READ-ONLY: `t.0` may be read but
+//     never assigned. So no member of a shared record can be written through,
+//     and `n` zero tuples of scalars are indistinguishable from one.
+//   - `==` on a tuple is element-wise (SPEC 14.6, `vTupleComparable`), so
+//     sharing cannot be observed as identity either.
+//
+// A MUTABLE member breaks it outright and is the reason this is a new
+// predicate rather than a widening of `zeroIsLiveRecord`: for
+// `[]((i64,i64), P, E)(2)` with `P` a class, `ds[0].1.a = 5` is legal — the
+// tuple member is read-only, the CLASS it names is not — and a shared record
+// would make that write visible through `ds[1].1.a` too. A slice or map member
+// is the same hazard through `append`/`m[k] =`. So every kind that is not a
+// scalar primitive answers false, and the walk stops there rather than
+// enumerating the mutable kinds: a kind added to the language later is then
+// excluded by default, which is the safe direction.
+//
+// STRING is excluded although a Bit string is immutable, because its zero
+// value is not a record member this pass builds — the win is the `gc_alloc`,
+// and a tuple of strings still allocates one per element for the ConstString
+// members. Including it would widen the predicate for no measured gain.
+//
+// The recursion is bounded rather than argued: a tuple type's members are
+// interned before the tuple itself, so pure tuple nesting is finite and
+// acyclic, but `depth > 32` answers false (do NOT share) so that a type the
+// walk cannot finish declines the optimization instead of deciding it. Every
+// bail-out here is the conservative one.
+fn zeroIsShareable(fc: FnCtx, ty: int, depth: int): bool {
+  if (depth > 32) {
+    return false
+  }
+  let td = fc.c.ctx.types[ty]
+  if (td.kind != TypeKind.Tuple) {
+    return false
+  }
+  for m of td.members {
+    if (!zeroMemberIsScalar(fc, m, depth + 1)) {
+      return false
+    }
+  }
+  return true
+}
+
+// One member of the walk above: a non-string scalar primitive, or a tuple that
+// is itself shareable. `td.prim == 11` is `string` (see `primName`).
+fn zeroMemberIsScalar(fc: FnCtx, ty: int, depth: int): bool {
+  let td = fc.c.ctx.types[ty]
+  if (td.kind == TypeKind.Prim) {
+    return td.prim != 11
+  }
+  return zeroIsShareable(fc, ty, depth)
+}
+
+// The ONE zero record `fillZeroElems` stores into every slot of `[]elemTy(n)`,
+// or 0 for "there is no shareable one — build a fresh record per element".
+// Emitted into whatever block is open, which at its only call site is the
+// block ABOVE the fill loop; 0 is never a real value there because the slice
+// this fills is already an earlier instruction.
+fn sharedZeroRecord(fc: FnCtx, elemTy: int, span: Span): int {
+  if (!zeroIsShareable(fc, elemTy, 0)) {
+    return 0
+  }
+  return zeroValue(fc, elemTy, span)
 }
 
 // The value an OMITTED field of type `fty` must be given, or 0 for "write
