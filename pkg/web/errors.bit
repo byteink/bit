@@ -1,0 +1,285 @@
+// pkg/web/errors.bit — #3876: what the framework sends when a handler
+// FAILED, and the one rule that decides it.
+//
+// THE SECURITY PROPERTY IS THE DEFAULT, AND IT IS THE WHOLE POINT. An error
+// that did not opt in is a 500 with a generic body; its real message is
+// logged and never sent. A raw `stdlib/sql` failure carrying a SQL fragment,
+// a connection string or a file path opts into nothing, so it cannot reach a
+// client by accident — leaking one takes a deliberate, greppable step
+// (`HttpError`, below). Epic #3875's rule 1: the safe thing is the default,
+// the unsafe thing is explicit.
+//
+// The mapping runs at exactly one site — `failureRes` (adapter.bit) — which
+// is the only place in the framework where a failure becomes a response, for
+// a handler and a middleware alike.
+//
+// HOW A TYPE OPTS IN, AND WHY IT IS NOT PURELY STRUCTURAL TODAY. #3876
+// specifies structural satisfaction: any error value that happens to have
+// `message()` and `status()` maps automatically, with no registration. That
+// requires asking a value AT RUNTIME whether it satisfies an interface, and
+// Bit cannot do it: SPEC §14.4 restricts a type assertion's target to a
+// CLASS, and `lowerTypeInfo` (compiler/lowerexpr.bit) refuses anything else
+// with "a type assertion to a target that is not a class" — so `err.
+// (HttpError)`, the whole mechanism, does not compile. Filed as #4512.
+//
+// Until it lands, the interface is still the mechanism and there is still no
+// registry: `asHttpError(e)` takes ANY value satisfying `HttpError` —
+// structurally, checked by the compiler at that call, with no declaration of
+// intent anywhere — and returns the one concrete class the mapping can
+// recognise. So a domain error opts in by adding `status()` AND by saying
+// `fail asHttpError(e)` once, instead of by adding `status()` alone. When
+// #4512 lands, `mapFailure` asserts to `HttpError` directly and this
+// function goes; nothing else here changes.
+//
+// `Json`/`jsonEncode` (escape.bit), `toLower` (escape.bit), `split`/`join`
+// (router.bit) and `trimSpace` (ctx.bit) are already imported module-wide —
+// an import binds per MODULE, not per file (SPEC §17.1) — so re-importing
+// any of them here is E0042.
+//
+// `JsonEntry` IS NOT among them, and importing it under its own name is that
+// same E0042: res.test.bit already imports it, and a test file is part of
+// this module when the package's tests are built. Renaming on import (SPEC
+// §17.2) is the way to bind it here without reaching into another file's
+// import list — `JsonPair` is `std/json`'s `JsonEntry` and nothing else.
+import { JsonEntry as JsonPair } from "std/json"
+
+// The opt-in. A type that has BOTH of these says two things at once: this
+// status is the right answer, and this message is fit for a client to read.
+// The second half is what makes the `status()` method — not a config flag,
+// not a registry entry — the security boundary: writing one is a decision
+// that shows up in a diff.
+export interface HttpError {
+  message(): string,
+  status(): int,
+}
+
+// The concrete type behind every constructor below, and the only type
+// `mapFailure` recognises (see the file header on #4512). Module-private:
+// nothing outside this package should build one directly, and nothing needs
+// to — `httpError(status, msg)` is the general constructor and the six named
+// ones are its aliases.
+class WebError {
+  code: int
+  msg: string
+
+  export message(): string {
+    return this.msg
+  }
+
+  export status(): int {
+    return this.code
+  }
+}
+
+const statusBadRequest = 400
+const statusUnauthorized = 401
+const statusForbidden = 403
+const statusConflict = 409
+const statusUnprocessable = 422
+
+// The general constructor. `checkStatus` (res.bit) panics for a status
+// outside 100..599 HERE, at the call that made it, rather than letting a
+// programming error surface later on the response path with nothing to
+// attribute it to — the same rule, in the same words, that `Res.status()`
+// already applies to a success response.
+export fn httpError(status: int, msg: string): HttpError {
+  return WebError{ code: checkStatus(status), msg: msg }
+}
+
+export fn notFound(msg: string): HttpError {
+  return httpError(statusNotFound, msg)
+}
+
+export fn badRequest(msg: string): HttpError {
+  return httpError(statusBadRequest, msg)
+}
+
+export fn unauthorized(msg: string): HttpError {
+  return httpError(statusUnauthorized, msg)
+}
+
+export fn forbidden(msg: string): HttpError {
+  return httpError(statusForbidden, msg)
+}
+
+export fn conflict(msg: string): HttpError {
+  return httpError(statusConflict, msg)
+}
+
+export fn unprocessable(msg: string): HttpError {
+  return httpError(statusUnprocessable, msg)
+}
+
+// A domain type's own opt-in, and the workaround for #4512 (file header):
+// `fail asHttpError(myErr)` where `myErr` is any value with `message()` and
+// `status()`. The parameter type is the interface, so satisfaction is
+// structural and checked by the compiler at this call — there is no
+// registration and no list of known error types anywhere in this package.
+//
+// It carries `e`'s status and message and not `e` itself: those two are
+// everything the mapping reads, and a wrapper holding the original would
+// invite a later "just log the cause" that walks back into the value this
+// file exists to keep away from the client.
+export fn asHttpError(e: HttpError): error {
+  return WebError{ code: checkStatus(e.status()), msg: e.message() }
+}
+
+// What the mapping decided: the status to send, and the message the client
+// is allowed to see. Carrying both together is what keeps the decision in
+// ONE branch — a second function answering "and what message?" would be a
+// second copy of the rule that owns the whole security property.
+class ErrorMapping {
+  code: int,
+  clientMsg: string,
+}
+
+// The rule. An error that opted in maps to its own status and message; every
+// other error is a 500 carrying `serverErrorBody` (adapter.bit) and nothing
+// of its own. `e.message()` is deliberately unreachable from the second
+// return — the caller logs it, and that is the only place it goes.
+fn mapFailure(e: error): ErrorMapping {
+  let (he, ok) = e.(WebError)
+  if (ok) {
+    return ErrorMapping{ code: he.status(), clientMsg: he.message() }
+  }
+  return ErrorMapping{ code: statusServerError, clientMsg: serverErrorBody }
+}
+
+// The error response itself, negotiated. Nothing here reads the underlying
+// error — `msg` has already been through `mapFailure`, so this function
+// cannot leak what that one redacted.
+fn errorRes(accept: string, code: int, msg: string): Res {
+  if (code == statusNoContent || code == statusNotModified) {
+    return newRes(code, "", "")
+  }
+  if (wantsHtml(accept)) {
+    return newRes(code, htmlContentType, render(errorPage(code)))
+  }
+  return newRes(code, jsonContentType, errorJson(code, msg))
+}
+
+// The built-in error page (#3887's `Node`, so it escapes as it is built):
+// the status and NOTHING else. Not the message — `wantsHtml` being true says
+// a human is looking at it, which changes the content type and no other rule
+// in this file.
+fn errorPage(code: int): Node {
+  return el(
+    "html",
+    el("head", el("title", text("${code}"))),
+    el("body", el("h1", text("${code}"))),
+  )
+}
+
+// `{"status":404,"error":"..."}` — built through `Json`, never by pasting
+// `msg` into a string, so a message carrying a quote or a control byte
+// cannot break out of the value it belongs in.
+fn errorJson(code: int, msg: string): string {
+  return jsonEncode(
+    Json.JsonObject(
+      []JsonPair{
+        JsonPair{ key: "status", value: Json.JsonInt(code) },
+        JsonPair{ key: "error", value: Json.JsonString(msg) },
+      },
+    ),
+  )
+}
+
+const htmlMediaType = "text/html"
+const jsonMediaType = "application/json"
+const anyMediaType = "*/*"
+const anyApplicationMediaType = "application/*"
+
+// A weight of 1, as thousandths — the value RFC 9110 §12.4.2 gives an entry
+// that carries no `q` at all.
+const maxQuality = 1000
+
+// JSON UNLESS THE CLIENT EXPLICITLY ASKED FOR HTML (owner ruling,
+// 2026-08-30): `text/html` must actually appear in `Accept` and must outrank
+// every alternative this framework would answer with JSON. `*/*` — what
+// curl, most HTTP clients and a bare `fetch()` send — is an alternative, not
+// a request for HTML, so it gets JSON.
+//
+// The damage is asymmetric, and that is the whole argument: a JSON blob
+// rendered in a browser is ugly, an HTML error page fed to `JSON.parse` is a
+// crash. A browser NAVIGATING sends `text/html,application/xhtml+xml,*/*;
+// q=0.8` — html at 1.0 beating `*/*` at 0.8, so it gets the page. A
+// `fetch()` from that same browser sends `*/*` and gets JSON. Different
+// requests, correctly different answers.
+//
+// STRICTLY greater, so a tie goes to JSON: `text/html,application/json` with
+// both at the default weight has not said HTML is preferred, it has said
+// either will do, and either-will-do is the case the ruling above resolves
+// in JSON's favour. `application/xhtml+xml` and every other media type this
+// framework does not produce rank nothing — they are not alternatives it
+// could have chosen.
+fn wantsHtml(accept: string): bool {
+  let html = 0
+  let json = 0
+  for part of split(accept, ",") {
+    let (media, q) = acceptEntry(part)
+    if (media == htmlMediaType && q > html) {
+      html = q
+      continue
+    }
+    if (isJsonMediaType(media) && q > json) {
+      json = q
+    }
+  }
+  return html > json
+}
+
+// The media types an error response would be sent AS JSON for. `*/*` and
+// `application/*` are here because this function answers "would JSON have
+// satisfied the client", not "did the client name JSON".
+fn isJsonMediaType(media: string): bool {
+  return media == jsonMediaType || media == anyMediaType || media == anyApplicationMediaType
+}
+
+// One `Accept` entry — `text/html`, `*/*;q=0.8`, `application/json; q=1` —
+// as its lowercased media type and its weight in thousandths. Parameters
+// other than `q` (`;level=1`, `;charset=utf-8`) are skipped rather than
+// rejected: they do not affect ranking and a client is free to send them.
+fn acceptEntry(part: string): (string, int) {
+  let pieces = split(part, ";")
+  let media = toLower(trimSpace(pieces[0]))
+  let i = 1
+  while (i < len(pieces)) {
+    let p = trimSpace(pieces[i])
+    if (len(p) > 2 && toLower(p[0:2]) == "q=") {
+      return (media, parseQuality(p[2:len(p)]))
+    }
+    i = i + 1
+  }
+  return (media, maxQuality)
+}
+
+// A weight as thousandths, so ranking is integer comparison and this file
+// never touches a float: `0` -> 0, `0.8` -> 800, `0.85` -> 850, `0.857` ->
+// 857. RFC 9110 §12.4.2 admits only `0`, `1` and either with at most three
+// decimal places, so anything else is malformed — and malformed is treated
+// as the DEFAULT weight, never as zero: a client that sent a broken `q` has
+// expressed no preference, and a parse failure must not be what decides a
+// content type.
+fn parseQuality(s: string): int {
+  let t = trimSpace(s)
+  if (t == "0") {
+    return 0
+  }
+  if (len(t) < 3 || t[0] != '0' || t[1] != '.') {
+    return maxQuality
+  }
+  let out = 0
+  let i = 2
+  while (i < 5) {
+    out = out * 10
+    if (i < len(t)) {
+      let c = t[i]
+      if (c < '0' || c > '9') {
+        return maxQuality
+      }
+      out = out + int(c - '0')
+    }
+    i = i + 1
+  }
+  return out
+}
