@@ -1,0 +1,343 @@
+// pkg/web/validate.bit — #3880: the VALUE rules that run on a body once it
+// has bound. #3877 checked the body's SHAPE — every field present, every
+// field the right type — and answered 400 when it was wrong. This file
+// answers 422 when the shape is right and the values are not: a name too
+// short, an age out of range, an email that is not one.
+//
+// 400 vs 422 is not decoration. A 400 says "I could not read this"; a 422
+// says "I read it and the values are unacceptable". A client can act on the
+// difference — the first is a bug in what it sent, the second is something to
+// show a user — and a framework that answers 400 for both has thrown that
+// away.
+//
+// --- HOW A TYPE SAYS IT HAS RULES ------------------------------------------
+//
+// Structurally, and there is nothing to register. Two members are looked for
+// on the bound value, in this order:
+//
+//   validateFields(): ()!   synthesized by the compiler for a class with
+//                           field attributes (#3879): `@minLen(3)` on field
+//                           `name` is a call to `minLen(this.name, 3)`.
+//   validate(): ()!         hand-written, and where CROSS-FIELD rules live —
+//                           "confirm must equal password", "B is required
+//                           only when A is set" — which no per-field
+//                           attribute can express.
+//
+// Each is found by a type assertion to a single-method interface below, the
+// same mechanism `HttpError` (errors.bit) and `Routes` (app.bit) use. A type
+// carrying neither binds with no validation and no error: that is a type with
+// no rules, not a mistake.
+//
+// --- THE RULES ARE ORDINARY FUNCTIONS, WHICH IS WHY ANYONE CAN ADD ONE -----
+//
+// A field attribute resolves by ORDINARY NAME LOOKUP (#3879) — there is no
+// registry here, no compiler-known list, and nothing this package could add a
+// rule to that an application could not. An app that exports
+//
+//     fn iban(v: string): ()! {
+//       if (!validIban(v)) { fail unprocessable("must be an IBAN") }
+//     }
+//
+// makes `@iban` work with no change to pkg/web and no change to the compiler.
+// The eight below are the common ones, shipped because everyone writes them,
+// not because they are privileged. README.md shows the `@iban` case for
+// exactly that reason.
+//
+// --- WHAT A FAILING RULE MAY SAY TO A CLIENT -------------------------------
+//
+// The same rule as everywhere else in this framework (errors.bit): a failure
+// that satisfies `HttpError` opted its message in, and one that does not is a
+// 500 with its message logged and never sent. `validationFailure` below
+// applies it BEFORE joining anything — a rule that failed with a raw
+// `stdlib/sql` error does not get its text pasted into a 422 because it
+// happened to be reached through a validator.
+//
+// --- TWO THINGS THIS CANNOT DO YET, AND THEY ARE THE COMPILER'S ------------
+//
+// #3880 asks for every failing field to be reported at once, each naming its
+// field. Neither is reachable from here, and both are one property of
+// #3879's synthesis:
+//
+//   1. `validateFields()` is a chain of `attr(this.field, ...)?`, so the
+//      FIRST failing attribute ends it. Two bad fields produce one message.
+//   2. The call passes the field's VALUE and nothing else, so a rule cannot
+//      name the field it ran on and neither can this file.
+//
+// What this file does own, and does: the failures of `validateFields()` and
+// of `validate()` are ACCUMULATED rather than short-circuited, so a body that
+// fails a field rule and a cross-field rule comes back naming both.
+// Per-attribute accumulation and the field name need the synthesis to change
+// — filed as #4572, which names this function as its one consumer. Nothing
+// here changes when it lands: `boundFailures` already collects a set, and a
+// `validateFields()` that reports every field will simply arrive as a longer
+// message.
+//
+// --- `httpUrl`, BECAUSE `url` IS ALREADY TAKEN -----------------------------
+//
+// #3880 names the rule `url`. `pkg/web` is ONE module and `escape.bit`
+// already exports `fn url(s: string): string!` — the href scheme allowlist
+// (#3887), a different job with a different signature — so a second `url`
+// here is a duplicate declaration and the package does not compile. The rule
+// is `httpUrl`, which is also what it checks: an absolute `http://` or
+// `https://` URL. Renaming the escaping one is an API break in a shipped file
+// this ticket does not own; #4573 carries the choice.
+//
+// --- IMPORTS ---------------------------------------------------------------
+//
+// `pkg/web` is one module, so a name imported anywhere in it is bound
+// everywhere and importing it twice is E0042. `indexOf`, `toLower`,
+// `trimSpace` and `join` (std/strings) and `unprocessable` (errors.bit) are
+// already bound; `schemeSep` ("://") is cors.bit's const. `runeCount` and
+// std/uuid's `parse` are new to the module — `parse` under a name that says
+// what it parses, since a bare `parse` would be bound in every file here.
+
+import { runeCount } from "std/strings"
+import { parse as parseUuid } from "std/uuid"
+
+// --- finding the rules ------------------------------------------------------
+
+// The compiler-synthesized member (#3879). A class with at least one
+// attributed field has it and no other type does — it cannot be hand-written,
+// since declaring it is E0132.
+interface FieldValidated {
+  validateFields(): ()!,
+}
+
+// The hand-written cross-field member. Deliberately a DIFFERENT name from the
+// synthesized one so the two compose instead of colliding: a class may have
+// both, and both run.
+interface Validated {
+  validate(): ()!,
+}
+
+// Runs every rule the bound value has, and fails once with all of them.
+//
+// Called from `bindJson` (body.bit), so `c.body` and `c.bodyWith` both go
+// through it and neither can be the lenient one. `c.bodyJson()` and
+// `c.rawBody()` do not: they bind no type, so there is nothing to ask for
+// rules.
+fn validateBound<T>(v: T): ()! {
+  let fails = boundFailures(v)
+  if (len(fails) == 0) {
+    return
+  }
+  fail validationFailure(fails)
+}
+
+// Every failure the value's rules raised, in the order they ran: the field
+// rules first, then the cross-field ones.
+//
+// BOTH ARE RUN EVEN WHEN THE FIRST FAILED, and that is the whole of what this
+// ticket calls accumulation. A caller that stopped at `validateFields()`
+// would tell a user their name is too short, take the corrected form, and
+// only then tell them the two passwords differ — one round trip per mistake.
+fn boundFailures<T>(v: T): []error {
+  let out = []error(0)
+  let (fv, hasFields) = v.(FieldValidated)
+  if (hasFields) {
+    fv.validateFields() catch e {
+      out = append(out, e)
+    }
+  }
+  let (cv, hasCross) = v.(Validated)
+  if (hasCross) {
+    cv.validate() catch e {
+      out = append(out, e)
+    }
+  }
+  return out
+}
+
+// The one error `validateBound` raises for a non-empty set of failures.
+//
+// A failure that did not opt into `HttpError` is returned ON ITS OWN and
+// nothing is joined onto it: its message is not fit for a client (errors.bit
+// owns that rule), so it becomes a 500 with the message logged, and the
+// messages of the client-safe failures beside it are not worth leaking one to
+// deliver.
+//
+// A SINGLE failure is passed through untouched, keeping the status and
+// message its own constructor chose — every rule below chooses 422, and a
+// rule that deliberately chose something else (a `conflict` from a
+// cross-field uniqueness check) is not overruled by this file. Only a set of
+// two or more is rewritten, because a set has no single status to inherit and
+// 422 is the one this ticket names for a value that failed a rule.
+fn validationFailure(fails: []error): error {
+  let msgs = []string(0)
+  for e of fails {
+    let (he, ok) = e.(HttpError)
+    if (!ok) {
+      return e
+    }
+    msgs = append(msgs, he.message())
+  }
+  if (len(msgs) == 1) {
+    return fails[0]
+  }
+  return unprocessable(join(msgs, "; "))
+}
+
+// --- the rules --------------------------------------------------------------
+//
+// Each is an ordinary exported fallible function taking the field's value
+// first, exactly as an application's own rule would be: nothing below is
+// known to the compiler and nothing registers it.
+//
+// A MESSAGE NAMES THE RULE AND NEVER REPEATS THE VALUE. Echoing the value
+// would put a rejected password in a response body and in whatever logs it,
+// which is a real leak for the one rule most likely to fail. The field name
+// is not available here at all — see the header, and #4572.
+
+const minLenMsg = "must be at least"
+const maxLenMsg = "must be at most"
+const charsMsg = "character(s)"
+
+// At least `n` characters. CHARACTERS, not bytes: `runeCount` counts code
+// points, so a name written in a non-Latin script is measured the way its
+// writer would measure it. A byte length would refuse a 3-character name
+// spelled in 6 bytes under `@maxLen(4)`.
+export fn minLen(v: string, n: int): ()! {
+  if (runeCount(v) < n) {
+    fail unprocessable("${minLenMsg} ${n} ${charsMsg}")
+  }
+}
+
+// At most `n` characters, counted the same way.
+export fn maxLen(v: string, n: int): ()! {
+  if (runeCount(v) > n) {
+    fail unprocessable("${maxLenMsg} ${n} ${charsMsg}")
+  }
+}
+
+// At least `n`. Numbers, not lengths — `minLen` is the string one, and the
+// names are split because Bit has no overloading, so `@min(3)` on a string
+// field is a compile error with an obvious fix rather than a rule that
+// silently measured the wrong thing.
+export fn min(v: i64, n: i64): ()! {
+  if (v < n) {
+    fail unprocessable("${minLenMsg} ${n}")
+  }
+}
+
+// At most `n`.
+export fn max(v: i64, n: i64): ()! {
+  if (v > n) {
+    fail unprocessable("${maxLenMsg} ${n}")
+  }
+}
+
+const emailMsg = "must be an email address"
+
+// An email address, checked the way an address can usefully be checked
+// without delivering to it: exactly one `@` with something before it, a
+// domain carrying a dot that is neither its first nor its last byte, and no
+// whitespace anywhere.
+//
+// IT IS DELIBERATELY NOT RFC 5322. That grammar admits quoted local parts,
+// comments and bracketed address literals, so a full parser rejects almost
+// nothing a form ever submits while adding a page of code; what it cannot do
+// is tell you the address exists. This checks the shape that catches a typo
+// and leaves the rest to a confirmation mail.
+export fn email(v: string): ()! {
+  let at = singleAtIndex(v)
+  if (at <= 0 || at == len(v) - 1 || hasBlank(v)) {
+    fail unprocessable(emailMsg)
+  }
+  let domain = v[at + 1:len(v)]
+  let dot = indexOf(domain, ".")
+  if (dot <= 0 || dot == len(domain) - 1) {
+    fail unprocessable(emailMsg)
+  }
+}
+
+// The index of the ONE `@` in `v`, or -1 when there is none or more than one.
+fn singleAtIndex(v: string): int {
+  let at = -1
+  let i = 0
+  while (i < len(v)) {
+    if (v[i] == '@') {
+      if (at >= 0) {
+        return -1
+      }
+      at = i
+    }
+    i = i + 1
+  }
+  return at
+}
+
+// Whether `v` carries a byte at or below a space — a space, a tab, a newline,
+// a carriage return or any other control byte. None belongs in an address or
+// a URL, and a leading or trailing one is the most common way a pasted value
+// arrives broken.
+fn hasBlank(v: string): bool {
+  let i = 0
+  while (i < len(v)) {
+    if (v[i] <= ' ') {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+const httpUrlMsg = "must be an http:// or https:// URL"
+const httpSchemeName = "http"
+const httpsSchemeName = "https"
+
+// An absolute `http://` or `https://` URL with a host.
+//
+// ONLY THOSE TWO SCHEMES, and the reason is the same one escape.bit's `url()`
+// gives for its allowlist: a value that reaches an `href` may be a
+// `javascript:` URL, and a validator that accepted every scheme would be the
+// step that let it through. A field that must hold a mail link or a relative
+// path wants its own rule, which is one function in the application.
+export fn httpUrl(v: string): ()! {
+  let sep = indexOf(v, schemeSep)
+  if (sep <= 0 || hasBlank(v)) {
+    fail unprocessable(httpUrlMsg)
+  }
+  let scheme = toLower(v[0:sep])
+  if (scheme != httpSchemeName && scheme != httpsSchemeName) {
+    fail unprocessable(httpUrlMsg)
+  }
+  if (len(urlHost(v[sep + len(schemeSep):len(v)])) == 0) {
+    fail unprocessable(httpUrlMsg)
+  }
+}
+
+// The authority of a URL whose scheme has already been stripped: everything
+// up to the first `/`, `?` or `#`.
+fn urlHost(rest: string): string {
+  let i = 0
+  while (i < len(rest)) {
+    let c = rest[i]
+    if (c == '/' || c == '?' || c == '#') {
+      return rest[0:i]
+    }
+    i = i + 1
+  }
+  return rest
+}
+
+// A UUID in the canonical `8-4-4-4-12` hex spelling, case-insensitive.
+//
+// The check is std/uuid's own `parse` — the one that every value this
+// framework hands to that package must pass anyway. Writing a second hex
+// walk here would be a copy that can disagree with it, and a validator that
+// accepts what the parser then refuses is worse than no validator.
+export fn uuid(v: string): ()! {
+  let _ = parseUuid(v) catch _ {
+    fail unprocessable("must be a UUID")
+  }
+}
+
+// Present and not blank. `@minLen(1)` would be the byte-length version of
+// this and would accept a field holding three spaces, which is what a form
+// submits when a user tabs through it — so this trims first, and that is the
+// whole difference between the two rules.
+export fn nonEmpty(v: string): ()! {
+  if (len(trimSpace(v)) == 0) {
+    fail unprocessable("must not be blank")
+  }
+}
