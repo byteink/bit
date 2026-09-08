@@ -1,0 +1,610 @@
+// compiler/classjsondecodecall.bit — how `jsonDecode<T>(j)` becomes a call to
+// the decoder synthesized for `T` (#3977).
+//
+// `jsonDecode<T>` cannot have a body a reader could write: `T` is a different
+// class at every call and the extraction has to name that class's fields. The
+// generic monomorphizer lowers ONE template body per instantiation, so there is
+// no template to write — the specialisation has to be per-`T` source, and this
+// file is where the call finds it.
+//
+//     jsonDecode<User>(j)   ->   __json_dec_User(j, "", 0)
+//
+// It is a REWRITE, not a hook in the monomorphizer, and that is deliberate: the
+// rewrite happens in `resolveProject`, before any Checker exists, so every pass
+// after it — resolve, check, lower, mangle, `bit doc`, the LSP — sees an
+// ordinary call to an ordinary function. The same property `@json`, #3879's
+// field attributes and trait injection all rely on.
+//
+// E0145 (§10.5): `jsonDecode<T>` where `T` is not a class carrying `@json`.
+// Refused here, by name, rather than left to fail: the template's own body
+// type-checks against an unbound `T`, so an unspecialised call would otherwise
+// compile and fail at RUNTIME, which is the one outcome this must not have.
+const ecJsonDecodeType = 145
+
+// The stdlib name being specialised, and the module it must come from. Matched
+// by import rather than by spelling alone: a user's own `jsonDecode` is a
+// different function and must not be rewritten.
+const jsonDecodeFuncName = "jsonDecode"
+const jsonDecodeModulePath = "std/json"
+
+// The empty string literal the rewritten call passes as the root path, and the
+// zero it passes as the starting depth. Both need real source text — a literal
+// node's text is a slice of the module source — so both are synthesized words.
+const jsonDecodeRootPathWord = "\"\""
+const jsonDecodeZeroWord = "0"
+
+// One `jsonDecode<T>(j)` to rewrite: where it is, and which class's decoder it
+// resolves to.
+class JsonDecodeSite {
+  callerMod: int,
+  callNode: int,
+  classMod: int,
+  className: string,
+  path: string,
+}
+
+// One decoder the project needs: a `@json` class, named in the module that
+// declares it. `path` is how the module that NEEDS it imports the class, or ""
+// when the need is module-local.
+class JsonDecodeNeed {
+  needMod: int,
+  classMod: int,
+  className: string,
+  path: string,
+}
+
+// Every rewrite the project needs, and every decoder those rewrites reach.
+class JsonDecodeDemand {
+  sites: []JsonDecodeSite,
+  needs: []JsonDecodeNeed,
+}
+
+// Where a named type is declared, as far as `@json` cares: the module, the name
+// it has THERE (an `as` alias is local to the importer), the path this module
+// reaches it by, and its mark.
+class JsonClassSite {
+  mod: int,
+  name: string,
+  path: string,
+  mark: int,
+  found: bool,
+}
+
+// ---- resolving the type argument -------------------------------------------
+
+// The class `name` names, looked up in this module's own declarations and then
+// through its named imports — the same two-step walk `jsonNestedMark` makes,
+// carrying the module and the import path out with the answer.
+fn jsonClassSiteOf(jx: JsonCtx, mid: int, name: string): JsonClassSite {
+  let (mark, declared) = jx.marks[name]
+  if (declared) {
+    return JsonClassSite{ mod: mid, name: name, path: "", mark: mark, found: true }
+  }
+  return importedClassSite(jx, name)
+}
+
+// The class this module imports under the local name `name`. Only the
+// `{ a, b as c }` form is followed: a namespace import binds `ns`, and a type
+// reached that way is a `QualType`, which this feature refuses by shape.
+fn importedClassSite(jx: JsonCtx, name: string): JsonClassSite {
+  let miss = JsonClassSite{ mod: -1, name: "", path: "", mark: 0, found: false }
+  for d of kidsOf(jx.tree, jx.tree.root) {
+    if (d == 0 || getNode(jx.tree, d).tag != Tag.ImportDecl) {
+      continue
+    }
+    let k = kidsOf(jx.tree, d)
+    if (getNode(jx.tree, k[0]).tag != Tag.ImportGroup) {
+      continue
+    }
+    for item of kidsOf(jx.tree, k[0]) {
+      if (importItemLocalName(jx.tree, jx.source, item) != name) {
+        continue
+      }
+      let path = stringLitText(jx.source, getNode(jx.tree, k[1]).span)
+      let (tid, ok) = jx.mod.imports[path]
+      if (!ok || tid < 0 || tid >= len(jx.proj.mods)) {
+        return miss
+      }
+      let exported = identText(jx.tree, jx.source, kidsOf(jx.tree, item)[0])
+      let (mark, found) = targetClassMark(jx.proj.mods[tid], exported)
+      return JsonClassSite{
+        mod: tid, name: exported, path: path, mark: mark, found: found,
+      }
+    }
+  }
+  return miss
+}
+
+// The local spellings a call may use for std/json's `jsonDecode` in this
+// module: the name bound by a named import (which an `as` alias renames), and
+// every alias a namespace import bound. Matched by IMPORT rather than by
+// spelling alone — a user's own function called `jsonDecode` is a different
+// function and must not be rewritten — and by the EXPORTED name rather than the
+// local one, so `import { jsonDecode as jd }` is still found. Missing that
+// second half is not a cosmetic gap: an unrewritten call binds to the template,
+// whose body compiles and fails at runtime.
+class JsonDecodeNames {
+  bare: string,
+  namespaces: []string,
+}
+
+fn jsonDecodeNamesOf(tree: Tree, source: string): JsonDecodeNames {
+  let out = JsonDecodeNames{ bare: "", namespaces: []string(0) }
+  for d of kidsOf(tree, tree.root) {
+    if (d == 0 || getNode(tree, d).tag != Tag.ImportDecl) {
+      continue
+    }
+    let k = kidsOf(tree, d)
+    if (stringLitText(source, getNode(tree, k[1]).span) != jsonDecodeModulePath) {
+      continue
+    }
+    let tag = getNode(tree, k[0]).tag
+    if (tag == Tag.ImportNs || tag == Tag.ImportStar) {
+      out.namespaces = append(
+        out.namespaces, identText(tree, source, kidsOf(tree, k[0])[0]),
+      )
+      continue
+    }
+    if (tag != Tag.ImportGroup) {
+      continue
+    }
+    for item of kidsOf(tree, k[0]) {
+      if (identText(tree, source, kidsOf(tree, item)[0]) == jsonDecodeFuncName) {
+        out.bare = importItemLocalName(tree, source, item)
+      }
+    }
+  }
+  return out
+}
+
+// True iff this module can name `jsonDecode` at all.
+fn bindsJsonDecode(names: JsonDecodeNames): bool {
+  return names.bare != "" || len(names.namespaces) != 0
+}
+
+// Every local name this module already binds by import. A synthesized import of
+// a name the user imported too would be `E0042 already declared in this scope`,
+// so the injector skips those rather than colliding.
+fn importedLocalNames(tree: Tree, source: string): map<string, bool> {
+  let out = map<string, bool>{}
+  for d of kidsOf(tree, tree.root) {
+    if (d == 0 || getNode(tree, d).tag != Tag.ImportDecl) {
+      continue
+    }
+    let k = kidsOf(tree, d)
+    if (getNode(tree, k[0]).tag != Tag.ImportGroup) {
+      continue
+    }
+    for item of kidsOf(tree, k[0]) {
+      out[importItemLocalName(tree, source, item)] = true
+    }
+  }
+  return out
+}
+
+// ---- finding the calls -----------------------------------------------------
+
+// Every `jsonDecode<...>(...)` call node in the module, by arena index. A
+// whole-arena sweep, the way `collectMethodEntries` (lowerdriver.bit) finds
+// every method: a call can sit anywhere an expression can, and there is no
+// shorter path to all of them.
+fn jsonDecodeCallNodes(tree: Tree, source: string, names: JsonDecodeNames): []int {
+  let out = []int(0)
+  let i = 1
+  while (i < len(tree.nodes)) {
+    if (getNode(tree, i).tag == Tag.Call &&
+      isJsonDecodeCallee(tree, source, kidsOf(tree, i)[0], names)) {
+      out = append(out, i)
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// True iff `callee` names std/json's `jsonDecode` — the bare local name, or
+// `<ns>.jsonDecode` through a namespace import. Both spellings are rewritten;
+// refusing one and rewriting the other would leave a spelling that compiles and
+// fails at runtime.
+fn isJsonDecodeCallee(tree: Tree, source: string, callee: int, names: JsonDecodeNames): bool {
+  if (callee == 0) {
+    return false
+  }
+  let tag = getNode(tree, callee).tag
+  if (tag == Tag.Ident) {
+    return names.bare != "" && identText(tree, source, callee) == names.bare
+  }
+  if (tag != Tag.Member) {
+    return false
+  }
+  let k = kidsOf(tree, callee)
+  if (getNode(tree, k[0]).tag != Tag.Ident || identText(tree, source, k[1]) != jsonDecodeFuncName) {
+    return false
+  }
+  let ns = identText(tree, source, k[0])
+  for a of names.namespaces {
+    if (a == ns) {
+      return true
+    }
+  }
+  return false
+}
+
+// The single type argument written at a `jsonDecode<T>` call, or 0 when the
+// call does not have exactly one. Zero or two is an ordinary generic-arity
+// error on the template and is left to the checker to report.
+fn jsonDecodeTypeArg(tree: Tree, n: int): int {
+  let targs = kidsOf(tree, n)[1]
+  if (targs == 0) {
+    return 0
+  }
+  let list = kidsOf(tree, targs)
+  if (len(list) != 1) {
+    return 0
+  }
+  return list[0]
+}
+
+// The class a `jsonDecode<T>` call decodes into, or a site with `found: false`
+// after reporting why. Every refusal names the type the reader wrote and the
+// reason it cannot be decoded into.
+//
+// ALWAYS reports, and never falls silent on a name it cannot resolve. Silence
+// would leave the call bound to the template, whose body type-checks against an
+// unbound `T` — so the program would COMPILE and fail at runtime, which is the
+// one outcome this feature must not have. A name that is also undefined gets
+// `E0040` beside this; two true diagnostics for one mistake is the right trade
+// against a wrong program.
+fn jsonDecodeTarget(jx: JsonCtx, mid: int, targ: int): JsonClassSite {
+  let miss = JsonClassSite{ mod: -1, name: "", path: "", mark: 0, found: false }
+  if (getNode(jx.tree, targ).tag != Tag.Ident) {
+    reportJsonDecodeType(jx, targ, "is not a named class", false)
+    return miss
+  }
+  let name = jsonNodeText(jx, targ)
+  // A predeclared scalar resolves nowhere in this module's own type table, so
+  // it would otherwise be reported as an unknown name.
+  if (scalarJsonKind(name) != jkNested) {
+    reportJsonDecodeType(jx, targ, "is not a class", false)
+    return miss
+  }
+  let site = jsonClassSiteOf(jx, mid, name)
+  if (!site.found) {
+    reportJsonDecodeType(
+      jx, targ, "is not declared in this module and is not imported from another by name",
+      false,
+    )
+    return miss
+  }
+  if (site.mark != jmJsonClass) {
+    let why = "is not a class"
+    if (site.mark == jmPlainClass) {
+      why = "does not carry '@json'"
+    }
+    reportJsonDecodeType(jx, targ, why, site.mark == jmPlainClass)
+    return miss
+  }
+  return site
+}
+
+// `jsonDecode(j)` with no type argument, or with two. `T` appears only in the
+// RESULT, so nothing can infer it from the argument — an uninstantiated call
+// would bind `T` to void and fail at runtime.
+fn reportJsonDecodeArity(jx: JsonCtx, call: int) {
+  report(
+    jx.diags, ecJsonDecodeType, getNode(jx.tree, call).span,
+    "'jsonDecode' needs exactly one explicit type argument",
+    "write 'jsonDecode<T>(j)' naming the '@json' class to decode into — 'T' appears only in the result, so nothing infers it from the argument",
+  )
+}
+
+fn reportJsonDecodeType(jx: JsonCtx, targ: int, why: string, markable: bool) {
+  let tname = jsonNodeText(jx, targ)
+  let help = "'jsonDecode<T>' decodes only into a class carrying '@json', declared here or imported from another module by name"
+  if (markable) {
+    help = "mark '${tname}' with '@json' — 'jsonDecode<T>' is specialised from the same field list '@json' serializes, and never decodes into a type that did not opt in"
+  }
+  report(
+    jx.diags, ecJsonDecodeType, getNode(jx.tree, targ).span,
+    "'jsonDecode' cannot decode into '${tname}': it ${why}", help,
+  )
+}
+
+// ---- the project-wide demand ----------------------------------------------
+
+// Every `jsonDecode<T>` call in the project, resolved, plus every decoder those
+// calls reach through nested `@json` fields. Runs before any module is
+// modified: a decoder is synthesized only for a class something actually
+// decodes, so a project that only ever ENCODES is byte-identical to before this
+// feature existed.
+fn collectJsonDecodeDemand(p: Project): JsonDecodeDemand {
+  let d = JsonDecodeDemand{ sites: []JsonDecodeSite(0), needs: []JsonDecodeNeed(0) }
+  let i = 0
+  while (i < len(p.mods)) {
+    let before = len(p.diags.list)
+    collectModuleDecodeSites(p, i, d)
+    remapDiags(p.diags, before, p.mods[i].files, p.mods[i].fileStarts)
+    i = i + 1
+  }
+  closeJsonDecodeNeeds(p, d)
+  return d
+}
+
+fn collectModuleDecodeSites(p: Project, mid: int, d: JsonDecodeDemand) {
+  let m = p.mods[mid]
+  let names = jsonDecodeNamesOf(m.tree, m.source)
+  if (!bindsJsonDecode(names)) {
+    return
+  }
+  let jx = newJsonCtx(p, m)
+  for n of jsonDecodeCallNodes(m.tree, m.source, names) {
+    // A wrong ARGUMENT count is an ordinary arity error against the template's
+    // own signature and is left to the checker, which reports it better than
+    // this could.
+    if (len(kidsOf(m.tree, kidsOf(m.tree, n)[2])) != 1) {
+      continue
+    }
+    let targ = jsonDecodeTypeArg(m.tree, n)
+    if (targ == 0) {
+      reportJsonDecodeArity(jx, n)
+      continue
+    }
+    let site = jsonDecodeTarget(jx, mid, targ)
+    if (!site.found) {
+      continue
+    }
+    d.sites = append(
+      d.sites,
+      JsonDecodeSite{
+        callerMod: mid, callNode: n, classMod: site.mod, className: site.name,
+        path: site.path,
+      },
+    )
+    addJsonDecodeNeed(d, mid, site)
+  }
+}
+
+// Records that `needMod` references `site`'s decoder, once — and, when the
+// class lives elsewhere, that its OWN module needs it too. Those are two
+// different obligations and conflating them is how a decoder gets imported from
+// a module that never synthesized it: `needMod == classMod` is what makes a
+// module BUILD the decoder, any other `needMod` only makes it IMPORT one.
+fn addJsonDecodeNeed(d: JsonDecodeDemand, needMod: int, site: JsonClassSite) {
+  if (!hasJsonDecodeNeed(d, needMod, site.mod, site.name)) {
+    d.needs = append(
+      d.needs,
+      JsonDecodeNeed{
+        needMod: needMod, classMod: site.mod, className: site.name,
+        path: site.path,
+      },
+    )
+  }
+  if (needMod == site.mod || hasJsonDecodeNeed(d, site.mod, site.mod, site.name)) {
+    return
+  }
+  d.needs = append(
+    d.needs,
+    JsonDecodeNeed{
+      needMod: site.mod, classMod: site.mod, className: site.name, path: "",
+    },
+  )
+}
+
+fn hasJsonDecodeNeed(d: JsonDecodeDemand, needMod: int, classMod: int, name: string): bool {
+  for n of d.needs {
+    if (n.needMod == needMod && n.classMod == classMod && n.className == name) {
+      return true
+    }
+  }
+  return false
+}
+
+// Adds the decoder of every nested `@json` class a demanded decoder calls,
+// transitively. Bounded by the number of (module, class) pairs in the project,
+// which is what `budget` counts down: a self-referential class asks for its own
+// decoder, which `addJsonDecodeNeed` already has.
+fn closeJsonDecodeNeeds(p: Project, d: JsonDecodeDemand) {
+  let i = 0
+  let budget = len(p.mods) * 4096
+  while (i < len(d.needs) && i < budget) {
+    let need = d.needs[i]
+    if (need.needMod == need.classMod) {
+      addNestedDecodeNeeds(p, need, d)
+    }
+    i = i + 1
+  }
+}
+
+// The nested classes one decoder calls: every `jkNested` field type, and every
+// container element that is one, resolved in the DECLARING module.
+fn addNestedDecodeNeeds(p: Project, need: JsonDecodeNeed, d: JsonDecodeDemand) {
+  let jx = newJsonCtx(p, p.mods[need.classMod])
+  for jc of collectJsonClasses(p, p.mods[need.classMod]) {
+    if (identText(jx.tree, jx.source, jc.className) != need.className) {
+      continue
+    }
+    for f of jc.fields {
+      let name = jsonDecNestedName(jx, f)
+      if (name == "") {
+        continue
+      }
+      let site = jsonClassSiteOf(jx, need.classMod, name)
+      if (site.found && site.mark == jmJsonClass) {
+        addJsonDecodeNeed(d, need.classMod, site)
+      }
+    }
+  }
+}
+
+// The classes THIS module must synthesize a decoder for: the ones demanded of
+// it that it also declares.
+fn moduleDecodeClasses(
+  d: JsonDecodeDemand,
+  mid: int,
+  classes: []JsonClass,
+  jx: JsonCtx,
+): []JsonClass {
+  let out = []JsonClass(0)
+  for jc of classes {
+    let name = identText(jx.tree, jx.source, jc.className)
+    for n of d.needs {
+      if (n.classMod == mid && n.className == name) {
+        out = append(out, jc)
+        break
+      }
+    }
+  }
+  return out
+}
+
+// ---- the words and the imports the rewrite needs ---------------------------
+
+// Every word module `mid` needs for the decode feature ON TOP of the ones its
+// own decoders need: the name of every decoder it CALLS (its own or another
+// module's), and the two literals the rewritten call passes.
+fn jsonDecodeCallWords(d: JsonDecodeDemand, mid: int): []string {
+  let out = []string(0)
+  for n of d.needs {
+    if (n.needMod == mid) {
+      out = append(out, jsonDecName(n.className))
+    }
+  }
+  if (len(out) == 0) {
+    return out
+  }
+  out = append(out, jsonDecodeRootPathWord)
+  out = append(out, jsonDecodeZeroWord)
+  return out
+}
+
+// A cloned copy of the string literal node this module already imports `path`
+// through, or 0 when it imports nothing from there. Cloned rather than shared,
+// for the reason `jbKeyExpr` clones: a node reachable by two paths is a shape
+// no other pass here builds.
+//
+// Only a path the module ALREADY imports can be used, and that is not a
+// limitation in practice: `SrcModule.imports` is built by the LOADER from the
+// parsed import declarations, so a path nothing imported was never loaded and
+// `bindImports` would skip the synthesized declaration silently.
+fn importPathClone(tree: Tree, source: string, path: string): int {
+  for d of kidsOf(tree, tree.root) {
+    if (d == 0 || getNode(tree, d).tag != Tag.ImportDecl) {
+      continue
+    }
+    let node = kidsOf(tree, d)[1]
+    if (stringLitText(source, getNode(tree, node).span) == path) {
+      return addLeaf(tree, getNode(tree, node).tag, getNode(tree, node).span)
+    }
+  }
+  return 0
+}
+
+// `import { a, b } from "<path>"` as a top-level declaration, or 0 when the
+// module imports nothing from `path` or already binds every name.
+fn synthImportDecl(m: SrcModule, st: SynthText, path: string, names: []string): int {
+  let tree = m.tree
+  let pathNode = importPathClone(tree, m.source, path)
+  if (pathNode == 0 || len(names) == 0) {
+    return 0
+  }
+  let span = getNode(tree, pathNode).span
+  let items = []int(0)
+  for n of names {
+    items = append(
+      items,
+      addNode(tree, Tag.ImportItem, span, 0, [synthIdent(tree, st, n), 0]),
+    )
+  }
+  return addNode(
+    tree, Tag.ImportDecl, span, 0,
+    [addNode(tree, Tag.ImportGroup, span, 0, items), pathNode],
+  )
+}
+
+// stdlib/json/decode.bit's runtime half, as one import declaration, minus any
+// name the module already binds — a synthesized import of a name the user
+// imported too would be `E0042 already declared in this scope`.
+fn jsonDecHelperImport(m: SrcModule, st: SynthText, bound: map<string, bool>): int {
+  let helpers = []string(0)
+  for h of jsonDecHelperNames() {
+    let (_, already) = bound[h]
+    if (!already) {
+      helpers = append(helpers, h)
+      bound[h] = true
+    }
+  }
+  return synthImportDecl(m, st, jsonDecodeModulePath, helpers)
+}
+
+// The imports module `mid` needs: stdlib/json/decode.bit's runtime half when it
+// synthesizes any decoder at all, and one decoder name per class it decodes
+// that another module declares.
+fn jsonDecodeImportDecls(
+  m: SrcModule, st: SynthText, mid: int, d: JsonDecodeDemand, hasDecoders: bool,
+): []int {
+  let out = []int(0)
+  let bound = importedLocalNames(m.tree, m.source)
+  if (hasDecoders) {
+    let helperDecl = jsonDecHelperImport(m, st, bound)
+    if (helperDecl != 0) {
+      out = append(out, helperDecl)
+    }
+  }
+  for n of d.needs {
+    let word = jsonDecName(n.className)
+    let (_, already) = bound[word]
+    if (n.needMod != mid || n.classMod == mid || n.path == "" || already) {
+      continue
+    }
+    bound[word] = true
+    let decl = synthImportDecl(m, st, n.path, [word])
+    if (decl != 0) {
+      out = append(out, decl)
+    }
+  }
+  return out
+}
+
+// ---- the rewrite -----------------------------------------------------------
+
+// `jsonDecode<C>(j)` becomes `__json_dec_C(j, "", 0)`, in place.
+//
+// IN PLACE, by overwriting the call's three children rather than building a
+// replacement node: the call sits somewhere inside an expression whose parent
+// this pass does not hold, so a new node would have nothing to attach it to.
+// The child COUNT is unchanged — a call is always `[callee, type_args, args]` —
+// so only the three slots move, and the arena's own invariant (a node's kids
+// are a contiguous run it alone owns) is untouched.
+fn rewriteJsonDecodeCalls(m: SrcModule, st: SynthText, mid: int, d: JsonDecodeDemand) {
+  let tree = m.tree
+  for site of d.sites {
+    if (site.callerMod != mid) {
+      continue
+    }
+    let span = getNode(tree, site.callNode).span
+    let start = getNode(tree, site.callNode).kidsStart
+    let orig = kidsOf(tree, tree.extra[start + 2])[0]
+    let args = addNode(
+      tree, Tag.Args, span, 0,
+      [
+        orig,
+        addNode(
+          tree,
+          Tag.Arg,
+          span,
+          0,
+          [addLeaf(tree, Tag.StringLit, synthSpan(st, jsonDecodeRootPathWord))],
+        ),
+        addNode(
+          tree,
+          Tag.Arg,
+          span,
+          0,
+          [addLeaf(tree, Tag.IntLit, synthSpan(st, jsonDecodeZeroWord))],
+        ),
+      ],
+    )
+    tree.extra[start] = synthIdent(tree, st, jsonDecName(site.className))
+    tree.extra[start + 1] = 0
+    tree.extra[start + 2] = args
+  }
+}

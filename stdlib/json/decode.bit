@@ -1,0 +1,282 @@
+// Bit standard library — json module, typed decoding of a `Json` tree into a
+// `@json` class (#3977, the reading half of #3976).
+//
+//     let u = jsonDecode<User>(jsonParse(body)?)?
+//
+// `jsonDecode<T>` has no body a reader could write: `T` is a different class at
+// every call, and the extraction has to name that class's fields. The compiler
+// therefore SPECIALISES it — `compiler/classjsondecode.bit` synthesises one
+// decoder per decoded `@json` class and rewrites the call to it, exactly the
+// way `@json` synthesises `toJson()`. What that generated decoder is written in
+// terms of is everything below: this file holds the whole runtime half, so the
+// synthesised AST stays a straight-line sequence of calls into named functions
+// a reader can open, rather than a second implementation living in the
+// compiler.
+//
+// WHY THIS EXISTS AT ALL, measured (#4050): `bench/cases/json` parses 150,000
+// records into the generic `Json` DOM and pays 21.0 objects per record, 210 MB
+// live for 3,150,014 objects. A typed decode lands the records in one `[]T` and
+// the DOM objects stop existing.
+//
+// EVERY FAILURE NAMES THE FIELD. An application turns these into HTTP
+// responses, so one "invalid JSON" is useless — the caller cannot act on it.
+// The four causes are distinguished by `JsonDecodeError.cause`, and each error
+// carries the FULL DOTTED PATH (`address.postcode`, `tags[3]`) rather than the
+// leaf name, because a leaf name in a nested document does not say where.
+//
+// UNKNOWN KEYS ARE REPORTED, NOT IGNORED. A dropped field and an accepted field
+// are indistinguishable to whoever sent the document.
+
+// Why the cause is a field on ONE error class rather than four classes. `T!` is
+// `T ! error` (SPEC §18.2), so every error a caller catches arrives as the
+// `error` interface; four classes would force a type assertion per cause before
+// the caller could tell them apart, and the interface gives it `message()` and
+// nothing else. One class with an enum discriminator is what a caller can
+// actually branch on. The four causes are still four distinct errors — distinct
+// tag, distinct fields, distinct message — not one generic "invalid json".
+export enum JsonDecodeCause {
+  // A key a non-`Option` field needs is not in the object.
+  MissingKey,
+  // A value is present and is the wrong JSON kind for the field.
+  TypeMismatch,
+  // The object carries a key no field of the class claims.
+  UnknownKey,
+  // The value nests deeper than `jsonMaxDecodeDepth`.
+  MaxDepth,
+}
+
+// The error every failure of a specialised `jsonDecode<T>` produces.
+//
+// `path` is the full dotted path from the decoded root: `""` for the root value
+// itself, `id` for a top-level field, `address.postcode` two levels down,
+// `tags[3]` for an array element. `expected` and `found` are filled for
+// `TypeMismatch` and empty otherwise.
+export class JsonDecodeError {
+  cause: JsonDecodeCause
+  path: string
+  expected: string
+  found: string
+
+  // Satisfies the predeclared `error` interface (SPEC §10.6, §18.3) — one
+  // sentence per cause, each naming the path, so a caller that only logs still
+  // gets the field.
+  message(): string {
+    let at = "'${this.path}'"
+    if (this.path == "") {
+      at = "the root value"
+    }
+    match (this.cause) {
+      MissingKey => return "json: missing key ${at}"
+      TypeMismatch => return "json: ${at}: expected ${this.expected}, found ${this.found}"
+      UnknownKey => return "json: unknown key ${at}"
+      MaxDepth => return "json: nesting at ${at} exceeds the decode depth limit of ${jsonMaxDecodeDepth}"
+    }
+  }
+}
+
+// How deep a decode may recurse before it fails instead of exhausting the C
+// stack. A `@json` class may be self-referential (`class Node { next:
+// Option<Node> }`), so the depth a decoder recurses to is INPUT-controlled and
+// is not bounded by the class.
+//
+// `jsonParse` bounds its own tree at `jsonMaxDepth` (128, stdlib/json/lex.bit),
+// but that bound is a property of the PARSER, not of a `Json` value: this
+// function takes a `Json`, and one built programmatically — or by any future
+// producer — never went through that lexer. So the walk is bounded here too,
+// independently, and the two are deliberately the same number: past 128 the
+// recursion is a spawned goroutine stack away from dying, measured in lex.bit.
+export const jsonMaxDecodeDepth = 128
+
+// The one constructor. Every failure below routes through it so a new cause
+// cannot be added without a message for it.
+fn jsonDecErr(
+  cause: JsonDecodeCause,
+  path: string,
+  expected: string,
+  found: string,
+): JsonDecodeError {
+  return JsonDecodeError{ cause: cause, path: path, expected: expected, found: found }
+}
+
+// The JSON kind name a diagnostic quotes for a value it rejected. RFC 8259 §3's
+// own vocabulary, so the message reads in the terms of the document rather than
+// of Bit's enum.
+fn jsonKindName(j: Json): string {
+  match (j) {
+    JsonNull => return "null"
+    JsonBool(_) => return "a boolean"
+    JsonInt(_) => return "a number"
+    JsonFloat(_) => return "a number"
+    JsonString(_) => return "a string"
+    JsonArray(_) => return "an array"
+    JsonObject(_) => return "an object"
+  }
+}
+
+// ---- paths -----------------------------------------------------------------
+
+// `path` extended by object key `key`. The root has no name, so its fields are
+// bare (`id`, not `.id`).
+export fn jsonDecPath(path: string, key: string): string {
+  if (path == "") {
+    return key
+  }
+  return "${path}.${key}"
+}
+
+// `path` extended by array index `i` — `tags[3]`, never `tags.3`, so the path
+// reads back as the accessor a caller would write.
+export fn jsonDecIndex(path: string, i: i64): string {
+  return "${path}[${i}]"
+}
+
+// ---- the object at one level ----------------------------------------------
+
+// The entries of the object at `path`, refusing a value that is not an object
+// and a nesting level past the bound. `depth` is the number of levels already
+// entered; a specialised decoder passes its own and adds one for each level it
+// descends.
+export fn jsonDecObject(j: Json, path: string, depth: i64): []JsonEntry! {
+  if (depth >= jsonMaxDecodeDepth) {
+    fail jsonDecErr(JsonDecodeCause.MaxDepth, path, "", "")
+  }
+  let v = jsonAsObject(j)
+  if (!isSome(v)) {
+    fail jsonDecErr(JsonDecodeCause.TypeMismatch, path, "an object", jsonKindName(j))
+  }
+  return unwrap(v)
+}
+
+// Fails on the first key of `entries` that is not in `known`.
+//
+// Reported rather than ignored, and reported HERE rather than left to the
+// caller: the specialised decoder knows the class's whole key set and nothing
+// downstream does. `known` is that set, in declaration order, with `@key`
+// renames already applied — it is the key set actually on the wire, not the
+// field names.
+export fn jsonDecUnknown(entries: []JsonEntry, path: string, known: []string): ()! {
+  for e of entries {
+    let seen = false
+    for k of known {
+      if (k == e.key) {
+        seen = true
+      }
+    }
+    if (!seen) {
+      fail jsonDecErr(JsonDecodeCause.UnknownKey, jsonDecPath(path, e.key), "", "")
+    }
+  }
+}
+
+// The value a non-`Option` field's key must carry. A key that is absent is
+// `MissingKey`; a key explicitly set to `null` is missing too, since a field
+// that is not an `Option` has nowhere to put a null.
+export fn jsonDecMember(entries: []JsonEntry, path: string, key: string): Json! {
+  let v = jsonGetFromObject(entries, key)
+  if (!isSome(v)) {
+    fail jsonDecErr(JsonDecodeCause.MissingKey, jsonDecPath(path, key), "", "")
+  }
+  let j = unwrap(v)
+  if (jsonIsNull(j)) {
+    fail jsonDecErr(JsonDecodeCause.MissingKey, jsonDecPath(path, key), "", "")
+  }
+  return j
+}
+
+// The value an `Option` field's key carries, or `None` when the key is absent
+// OR present as `null`. Those two are deliberately the same answer HERE and
+// deliberately different in the encoder, which always writes an absent
+// `Option` as an explicit `null` (SPEC §10.5): what `@json` emits must decode
+// back, and a producer that omits the key instead is just as well-formed.
+export fn jsonDecOptMember(entries: []JsonEntry, key: string): Option<Json> {
+  let v = jsonGetFromObject(entries, key)
+  if (!isSome(v)) {
+    return Option<Json>.None
+  }
+  if (jsonIsNull(unwrap(v))) {
+    return Option<Json>.None
+  }
+  return v
+}
+
+// ---- one value ------------------------------------------------------------
+
+// Each of these takes the value and the path it was reached by, so the
+// TypeMismatch it raises names the field and not the shape.
+//
+// `jsonDecInt` accepts only `JsonInt`: JSON has one number type, but a field
+// declared as an integer that silently truncated `1.5` would be a wrong answer
+// rather than a rejected document. `jsonDecFloat` accepts BOTH, because `3` and
+// `3.0` are the same document to every producer on the wire — the same
+// asymmetry `jsonAsNumber` (value.bit) already documents.
+export fn jsonDecInt(j: Json, path: string): i64! {
+  let v = jsonAsInt(j)
+  if (!isSome(v)) {
+    fail jsonDecErr(JsonDecodeCause.TypeMismatch, path, "an integer", jsonKindName(j))
+  }
+  return unwrap(v)
+}
+
+export fn jsonDecFloat(j: Json, path: string): f64! {
+  let v = jsonAsNumber(j)
+  if (!isSome(v)) {
+    fail jsonDecErr(JsonDecodeCause.TypeMismatch, path, "a number", jsonKindName(j))
+  }
+  return unwrap(v)
+}
+
+export fn jsonDecBool(j: Json, path: string): bool! {
+  let v = jsonAsBool(j)
+  if (!isSome(v)) {
+    fail jsonDecErr(JsonDecodeCause.TypeMismatch, path, "a boolean", jsonKindName(j))
+  }
+  return unwrap(v)
+}
+
+export fn jsonDecString(j: Json, path: string): string! {
+  let v = jsonAsString(j)
+  if (!isSome(v)) {
+    fail jsonDecErr(JsonDecodeCause.TypeMismatch, path, "a string", jsonKindName(j))
+  }
+  return unwrap(v)
+}
+
+// The items of an array field, with the same depth bound the object walk has:
+// a `[]T` is a level of nesting whether or not `T` is a class.
+export fn jsonDecArray(j: Json, path: string, depth: i64): []Json! {
+  if (depth >= jsonMaxDecodeDepth) {
+    fail jsonDecErr(JsonDecodeCause.MaxDepth, path, "", "")
+  }
+  let v = jsonAsArray(j)
+  if (!isSome(v)) {
+    fail jsonDecErr(JsonDecodeCause.TypeMismatch, path, "an array", jsonKindName(j))
+  }
+  return unwrap(v)
+}
+
+// The entries of a `map<string, T>` field's object. Distinct from
+// `jsonDecObject` only in the caller's intent — a map has no known key set, so
+// nothing checks its keys against one — but named separately so the generated
+// code reads as what it is.
+export fn jsonDecEntries(j: Json, path: string, depth: i64): []JsonEntry! {
+  return jsonDecObject(j, path, depth)?
+}
+
+// ---- the entry point -------------------------------------------------------
+
+// Decodes `j` into `T`, which must be a class carrying `@json`.
+//
+// THIS BODY NEVER RUNS. Every call is rewritten by the compiler into a call to
+// the decoder synthesised for the concrete `T`
+// (compiler/classjsondecodecall.bit), and a `T` that is not a `@json` class is
+// refused at compile time as E0145 naming the type and the mark. The body is
+// here because the declaration has to exist for the name to be importable and
+// for the call to parse and resolve; it fails rather than returning a wrong
+// value so that a specialisation this file has not anticipated is a visible
+// runtime failure rather than a silent zero.
+export fn jsonDecode<T>(j: Json): T! {
+  fail jsonDecErr(
+    JsonDecodeCause.TypeMismatch, "", "a class carrying '@json'",
+    jsonKindName(j),
+  )
+}

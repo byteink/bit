@@ -644,3 +644,150 @@ fn cstToJsonExample(): i64 {
   }
 }
 ```
+
+## Typed decoding
+
+`jsonDecode<T>` turns a `Json` into a class carrying `@json` (SPEC §10.5) --
+the reading half of the `toJson()` that mark synthesises. The compiler
+specialises it per call from the same field list and the same key rules, so
+the two halves agree by construction rather than by review.
+
+The generic `Json` DOM costs one heap object per node. A typed decode lands
+the fields in the class and the DOM objects stop existing, which is the whole
+point of the feature.
+
+```bit
+import { jsonParse, jsonDecode, Json, JsonEntry } from "std/json"
+
+@json class Addr {
+  city: string,
+}
+
+@json class Profile {
+  id: i64
+  tags: []string
+  nick: Option<string>
+  @key("created_at")
+  createdAt: string
+  addr: Addr
+}
+
+fn loadProfile(body: string): Profile! {
+  return jsonDecode<Profile>(jsonParse(body)?)?
+}
+```
+
+### `jsonDecode<T>(j: Json): T!`
+
+Decodes `j` into `T`, which must be a class carrying `@json`. Anything else is
+a compile error (`E0145`) naming the type and the mark, never a runtime
+failure.
+
+Every failure names the field by its **full dotted path** from the decoded
+root -- `addr.city`, `tags[3]`, `meta.k` -- and carries one of four causes: a
+missing key for a field that is not an `Option`, a type mismatch naming what
+was expected and what was found, an **unknown key** present in the input, or
+nesting past `jsonMaxDecodeDepth`.
+
+A key that is absent and a key present as `null` both decode an `Option<T>` to
+`None`, and both are a missing key for a field that is not one. `@json` writes
+an absent `Option` as an explicit `null`, so what it emits decodes back, and a
+producer that omits the key instead is just as well-formed.
+
+### `JsonDecodeCause`
+
+Which of the four things went wrong: `MissingKey`, `TypeMismatch`,
+`UnknownKey` or `MaxDepth`. An enum a caller can branch on, rather than a
+string it has to scrape out of a message.
+
+### `JsonDecodeError`
+
+The error every `jsonDecode<T>` failure produces: `cause`, `path` (`""` for
+the root value itself), and `expected`/`found`, which are filled for
+`TypeMismatch` and empty otherwise. Its `message()` renders one sentence per
+cause, so a caller that only logs still gets the field. Reach the fields with
+a type assertion on the caught `error`: `e.(JsonDecodeError)`.
+
+### `jsonMaxDecodeDepth`
+
+How deep a decode may recurse -- 128 -- before it fails with `MaxDepth`
+instead of exhausting the stack. A `@json` class may be self-referential, so
+the depth a decode reaches is decided by the input, not by the class. This
+bound is on the `Json` **value** and is independent of any limit a parser
+applied to a document: `jsonDecode` takes a value, and one built in code never
+went through a parser. It matters most off the main thread, where a spawned
+stack is far smaller.
+
+## Decoding primitives
+
+The named functions the compiler's synthesised decoder is written in terms of.
+They are exported because the generated code lives in the caller's module and
+calls them by name -- and they are a usable API in their own right for a
+hand-written decoder over a shape `@json` does not cover. Each takes the
+`path` of the value it is looking at, so the error it raises names the field
+rather than the shape.
+
+### `jsonDecPath(path: string, key: string): string`
+
+`path` extended by object key `key`. The root has no name, so its own fields
+are bare: `jsonDecPath("", "id")` is `id`, `jsonDecPath("addr", "city")` is
+`addr.city`.
+
+### `jsonDecIndex(path: string, i: i64): string`
+
+`path` extended by array index `i` -- `tags[3]`, never `tags.3`, so the path
+reads back as the accessor a caller would write.
+
+### `jsonDecObject(j: Json, path: string, depth: i64): []JsonEntry!`
+
+The entries of the object at `path`, failing with `TypeMismatch` when `j` is
+not an object and with `MaxDepth` when `depth` has reached
+`jsonMaxDecodeDepth`. `depth` is the number of levels already entered.
+
+### `jsonDecUnknown(entries: []JsonEntry, path: string, known: []string): ()!`
+
+Fails with `UnknownKey` on the first key of `entries` that is not in `known`.
+`known` is the key set on the wire -- `@key` renames already applied -- not
+the field names.
+
+### `jsonDecMember(entries: []JsonEntry, path: string, key: string): Json!`
+
+The value a non-`Option` field's key must carry, failing with `MissingKey`
+when the key is absent or explicitly `null`.
+
+### `jsonDecOptMember(entries: []JsonEntry, key: string): Option<Json>`
+
+The value an `Option` field's key carries, or `None` when the key is absent
+**or** present as `null`. Cannot fail: both of those are legal input for an
+`Option`.
+
+### `jsonDecInt(j: Json, path: string): i64!`
+
+The integer at `path`. Accepts only `JsonInt`: a field declared as an integer
+that silently truncated `1.5` would be a wrong answer rather than a rejected
+document.
+
+### `jsonDecFloat(j: Json, path: string): f64!`
+
+The number at `path`. Accepts **both** numeric variants, because `3` and `3.0`
+are the same document to every producer on the wire -- the same asymmetry
+`jsonAsNumber` documents.
+
+### `jsonDecBool(j: Json, path: string): bool!`
+
+The boolean at `path`.
+
+### `jsonDecString(j: Json, path: string): string!`
+
+The string at `path`.
+
+### `jsonDecArray(j: Json, path: string, depth: i64): []Json!`
+
+The items of the array at `path`, with the same depth bound the object walk
+has: a `[]T` is a level of nesting whether or not `T` is a class.
+
+### `jsonDecEntries(j: Json, path: string, depth: i64): []JsonEntry!`
+
+The entries of a `map<string, T>` field's object. Distinct from
+`jsonDecObject` only in the caller's intent -- a map has no known key set, so
+nothing checks its keys against one.

@@ -300,6 +300,45 @@ That is strictly better than a custom `toJson` on `Account`, because a
 generated one would ship `pwHash` the day someone added it - and the view
 class says out loud which fields go over the wire.
 
+### Reading it back
+
+`jsonDecode<T>` is the other half. The compiler specialises it per call from the
+same field list `@json` serializes, so the two agree by construction:
+
+```bit
+import { jsonParse, jsonDecode } from "std/json"
+
+fn loadProfile(body: string): Profile! {
+  return jsonDecode<Profile>(jsonParse(body)?)?
+}
+```
+
+`T` has to be a class carrying `@json`; anything else is `E0145` at compile
+time, naming the type and the mark, so an unspecialised call can never reach
+run time.
+
+**Every failure names the field, by its full path from the root** -
+`addr.city`, `tags[3]` - and says which of four things went wrong: a missing
+key for a field that is not an `Option`, a type mismatch naming what was
+expected and what was found, an **unknown key** in the input, or nesting past
+the decode depth bound. The error is a `JsonDecodeError`, whose `cause` is an
+enum a caller can branch on rather than a string it has to scrape.
+
+**An unknown key is reported, not ignored.** A dropped field and an accepted
+field look identical to whoever sent the document, so the caller is told and
+decides.
+
+A key that is absent and a key present as `null` both decode an `Option<T>` to
+`None`, and both are a missing key for a field that is not one. That is what
+makes the round trip hold: `@json` writes an absent `Option` as an explicit
+`null`, and a producer that omits the key instead still decodes.
+
+The walk is **depth-bounded**. A `@json` class may be self-referential, so how
+deep a decode recurses is decided by the input, not by the class - past the
+bound it fails with the depth cause instead of exhausting the stack. The bound
+is on the `Json` value, independent of any limit a parser applied: `jsonDecode`
+takes a value, and one built in code never went through a parser at all.
+
 ## Readonly fields {#readonly-fields}
 
 A field marked `readonly` may be set only in a composite literal, or inside
