@@ -1,0 +1,295 @@
+// compiler/optstriptrip.bit — #4463: the TRIP-COUNT FLOOR, the half of the
+// strip-mining predicate that asks whether the transformation pays.
+//
+// optstrip.bit answers "MAY this loop be strip-mined" — is it counted, is it
+// innermost, can its body block or allocate. This file answers the separate
+// question "SHOULD it be", and a loop that passes every rule in optstrip.bit is
+// still refused here when the compiler cannot prove it runs long enough to earn
+// the preamble back.
+//
+// ## THE BREAK-EVEN, RE-DERIVED ON THIS TREE
+//
+// Strip mining pays a preamble once per strip ENTRY and saves two instructions
+// on every lap. Counted off `bench/cases/matrix`'s arm64 `_main`, wide path,
+// one strip entry of the `sum` loop:
+//
+//     OUTER header   cmp x5, x1 / b.ge                      2
+//     GUARD          ldr slot / ldr / cbnz                  3
+//     GROOM          mov #2^62 / cmp / b.gt                 3
+//     WIDE           add #0x100 / cmp / b.ge                3
+//     phi copies     mov x8,x5 / mov x12,x4 / fmov d10,d9   3
+//     entry jump     b                                      1
+//     outer poll     ldr slot / ldar / cbz                  3
+//     OLATCH         mov x5,x8 / fmov d9,d10 / b            3
+//                                                          --
+//                                                          21
+//
+// and the per-lap saving is the back edge's `ldr` + `ldar` going away while its
+// `cbz` degrades to a `b`: two instructions. So the transformation breaks even
+// at 21 / 2 = **10.5 laps per strip entry**, and `stripBreakEvenTrips()` is the
+// smallest integer above it.
+//
+// That is an independent confirmation of #4204's figure, which solved
+// P = 21.03 from retired-instruction counts at two different `stripSize()`
+// values rather than by counting the disassembly. Two methods, one number.
+//
+// The preamble is not exactly 21 for every loop — the phi-copy row is one `mov`
+// per value the loop carries — so 21 is the cost of a loop carrying three, not
+// a constant. It does not need to be exact: the floor below is a LOWER bound on
+// the trip count, so a loop admitted at the margin is admitted on a guarantee
+// of at least breaking even, and in practice every loop admitted in this
+// corpus clears it by one to five orders of magnitude.
+//
+// ## WHAT #4204 MEASURED, WHICH IS WHY THIS FILE EXISTS
+//
+// The pass fired on 3 of 14 benchmark cases. `matrix`, whose loops run 257 laps
+// per strip, came in at **-20.369% cycles**. `trustcache` at 6.8 laps per strip
+// came in at **+0.527%** and `sort` at 3.12 laps at **+1.162%** — both paying
+// the preamble on nearly every strip and collecting almost none of the saving.
+// That is not a tuning problem: eight of the 21 instructions above are
+// structurally mandatory, and #4204 showed the best rewrite it could name still
+// lands at ~17, which leaves sort at ~+1.1%.
+//
+// ## UNKNOWN IS A REFUSAL
+//
+// The floor is a proof obligation, not an estimate. A loop whose trip count
+// this compiler cannot bound keeps its per-lap poll — the pre-#4204 code,
+// unchanged — because the evidence above says an unbounded loop is a coin flip
+// and two of three landed the wrong way. `while (k < len(s))` is refused for
+// exactly this reason: in `bench/cases/sort` that `len` is 3 to 14 in one loop
+// and 800,000 two loops higher up, and nothing in the IR tells them apart.
+//
+// ## HOW THE BOUND IS PROVED
+//
+// The loop is `for (i = i0; i < n; i = i + 1)` — `stripCounterOk` has already
+// established that the step is exactly one and that `n` is invariant — so the
+// trip count is `n - i0` exactly. Both endpoints are resolved to integer
+// constants by `stripEvalConst`, which is two ideas and no lattice:
+//
+//  1. **A representative map over block params**, `stripRepMap` below: the
+//     value each param provably always equals. Every entry is an EQUALITY, so
+//     stopping early is a less useful answer rather than a wrong one.
+//  2. **Arithmetic folded on top**, through `optfold.bit`'s `foldBinaryArith`,
+//     so width and wrapping are the compiler's own rules rather than a second
+//     set written here.
+//
+// `matrix` needs both: its inner limit is a block param that resolves to
+// `mul %n, %n`, whose `%n` is a param of the enclosing trial loop that resolves
+// to the literal 512.
+//
+// ## WHY A MAP AND NOT THE EXISTING ON-DEMAND RESOLVERS
+//
+// `licmResolve` (optloop.bit) and `bceResolve` (optbce.bit) already follow this
+// same equality on demand, and neither can answer this question. Both skip a
+// predecessor edge that hands the param straight back — the rule that makes a
+// loop-carried invariant resolvable at all — but both test for that edge by
+// IDENTITY, `args[k] != v`. `lowerWhile` closes a loop through a separate
+// increment block carrying its own parameter list, so in a nest the outer
+// header's param comes back through two or three intermediate params and the
+// identity test misses it. matrix bounds ONE of its five loops that way.
+//
+// Making the skip test call the resolver makes the resolver re-entrant, and a
+// first cut did exactly that with a `busy` guard and a step budget. It works
+// and it is quadratic: with the budget at 4096 matrix still bounded only one
+// loop of five, and it took a budget of 10^8 — which is not a budget — to bound
+// all five. The shape was wrong, not the constant. Resolving one value at a
+// time re-derives the same chains once per query; computing the whole map once
+// per function shares them, and the fixpoint below converges in three rounds on
+// every function in this compiler.
+
+// The trip count at which strip mining starts to pay for itself: one more than
+// the 10.5 derived in this file's header. A loop the compiler cannot prove runs
+// at least this many times per entry keeps its per-lap poll.
+fn stripBreakEvenTrips(): int {
+  return 11
+}
+
+// How many rounds the representative fixpoint may take. Each productive round
+// resolves at least one more parameter and there are strictly fewer parameters
+// than instructions, so this is a ceiling and not a policy; measured over
+// `compiler/**`, `stdlib/**` and the benchmark corpus, no function needs more
+// than three.
+fn stripRepRounds(): int {
+  return 16
+}
+
+// How deep `stripEvalConst` recurses through arithmetic. Each level may
+// evaluate two operands, so this also caps the fan-out at 2^8.
+fn stripEvalDepth(): int {
+  return 8
+}
+
+// Both endpoints must sit inside this for `n - i0` to be exact in i64: 2^61, so
+// the difference is at most 2^62 and cannot overflow. A loop bounded above it
+// is refused, which costs nothing — no such loop terminates, and the strip
+// preamble's own `stripLimitCeiling()` guard would take the narrow arm on every
+// strip of it anyway.
+fn stripTripEndpointCeiling(): int {
+  return 2305843009213693952
+}
+
+// `rep` followed to its root, with the head of the path compressed on the way
+// out. The step bound is what makes a cycle terminate; a cycle cannot arise
+// from the construction below, and bounding it costs one comparison.
+fn stripFind(rep: []int, v0: int): int {
+  let v = v0
+  let steps = 0
+  while (steps < 64 && rep[v] != v) {
+    v = rep[v]
+    steps = steps + 1
+  }
+  rep[v0] = v
+  return v
+}
+
+// The single value every predecessor edge passes to block param `v`, or -1 when
+// an edge cannot be read, when the sources disagree, or when the block has no
+// predecessors at all — the entry block, whose params are the FUNCTION's, so a
+// function parameter is never resolved into something that does not exist.
+//
+// AN EDGE THAT PASSES SOMETHING ALREADY PROVEN EQUAL TO `v` IS IGNORED, and
+// that is the rule that makes this useful. A loop-carried param handed back on
+// the back edge only ever holds what the entry edge gave it, so dropping that
+// edge is not an approximation.
+fn stripRepSource(f: IrFunc, pm: PredMap, rep: []int, b: int, v: int): int {
+  let blk = f.blocks[b]
+  let k = v - blk.instsStart
+  let found = -1
+  let e = pm.start[b]
+  while (e < pm.start[b + 1]) {
+    let args = licmEdgeArgs(f, pm.list[e], b)
+    if (len(args) != blk.paramCount) {
+      return -1
+    }
+    if (stripFind(rep, args[k]) != stripFind(rep, v)) {
+      if (found >= 0 && stripFind(rep, found) != stripFind(rep, args[k])) {
+        return -1
+      }
+      found = args[k]
+    }
+    e = e + 1
+  }
+  return found
+}
+
+// One pass over every block param, folding each one that now has a single
+// source into that source. Returns whether anything moved.
+fn stripRepRound(f: IrFunc, pm: PredMap, rep: []int): bool {
+  let changed = false
+  let b = 0
+  while (b < len(f.blocks)) {
+    let blk = f.blocks[b]
+    let k = 0
+    while (k < blk.paramCount) {
+      let v = blk.instsStart + k
+      let s = stripRepSource(f, pm, rep, b, v)
+      if (s >= 0 && stripFind(rep, s) != stripFind(rep, v)) {
+        rep[stripFind(rep, v)] = stripFind(rep, s)
+        changed = true
+      }
+      k = k + 1
+    }
+    b = b + 1
+  }
+  return changed
+}
+
+// For every value, one it provably always equals. Identity for anything this
+// cannot say more about, which is most values.
+//
+// The fixpoint is monotone: an entry is only ever written when a NEW equality
+// has been proven, and an equality once proven is never withdrawn — so each
+// productive round strictly shrinks the number of unresolved params.
+fn stripRepMap(f: IrFunc, pm: PredMap): []int {
+  let rep = []int(0)
+  let i = 0
+  while (i < len(f.instrs)) {
+    rep = append(rep, i)
+    i = i + 1
+  }
+  let rounds = 0
+  while (rounds < stripRepRounds()) {
+    if (!stripRepRound(f, pm, rep)) {
+      return rep
+    }
+    rounds = rounds + 1
+  }
+  return rep
+}
+
+// The map, built on first use. A function with no strip candidate at all never
+// pays for it, which is most functions in this compiler.
+fn stripRepOf(sa: StripAnalysis): []int {
+  if (len(sa.rep) != len(sa.f.instrs)) {
+    sa.rep = stripRepMap(sa.f, sa.pm)
+  }
+  return sa.rep
+}
+
+// `v` as a compile-time integer, or `noConst()`. Resolves block params through
+// the representative map, reads integer literals, and folds arithmetic whose
+// operands both resolve — through the compiler's own folder, so an i32 multiply
+// wraps here exactly as it would at runtime.
+fn stripEvalConst(sa: StripAnalysis, v: int, depth: int): ConstVal {
+  if (depth <= 0) {
+    return noConst()
+  }
+  let ins = sa.f.instrs[stripFind(stripRepOf(sa), v)]
+  if (ins.op == Op.ConstInt) {
+    return intConst(ins.ival)
+  }
+  if (!opIsArith(ins.op)) {
+    return noConst()
+  }
+  let lv = stripEvalConst(sa, ins.lhs, depth - 1)
+  if (!lv.known) {
+    return noConst()
+  }
+  let rv = stripEvalConst(sa, ins.rhs, depth - 1)
+  if (!rv.known) {
+    return noConst()
+  }
+  return foldBinaryArith(sa.ctx, ins.op, ins.ty, lv, rv)
+}
+
+// True iff `c` is an integer small enough to subtract without overflow. A
+// folded bool or float is not a loop bound and is refused rather than
+// reinterpreted.
+fn stripPlainInt(c: ConstVal): bool {
+  return c.known &&
+    !c.isFloat &&
+    !c.isBool &&
+    c.ival >= 0 - stripTripEndpointCeiling() &&
+    c.ival <= stripTripEndpointCeiling()
+}
+
+// A LOWER bound on how many times `lp`'s body runs per entry of the loop, or -1
+// when this compiler cannot prove one.
+//
+// `stripCounterOk` has already established the shape this reads: the header
+// tests `i < n` with `i` a parameter the latch advances by exactly one, and `n`
+// either a header parameter the latch passes straight through or a value
+// defined outside the loop. So the count is `n - i0` exactly, with `i0` the
+// value the preheader edge hands the induction parameter.
+fn stripTripFloor(sa: StripAnalysis, lp: StripLoop, pre: int): int {
+  let hb = sa.f.blocks[lp.header]
+  let args = licmEdgeArgs(sa.f, pre, lp.header)
+  if (len(args) != hb.paramCount) {
+    return -1
+  }
+  let lim = stripEvalConst(sa, lp.limVal, stripEvalDepth())
+  let init = stripEvalConst(sa, args[lp.ivIdx], stripEvalDepth())
+  if (!stripPlainInt(lim) || !stripPlainInt(init)) {
+    return -1
+  }
+  if (lim.ival <= init.ival) {
+    return 0
+  }
+  return lim.ival - init.ival
+}
+
+// The profitability half of the predicate: strip-mine this loop only if it is
+// PROVEN to run at least `stripBreakEvenTrips()` times per entry.
+fn stripWorthMining(sa: StripAnalysis, lp: StripLoop, pre: int): bool {
+  return stripTripFloor(sa, lp, pre) >= stripBreakEvenTrips()
+}
