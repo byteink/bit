@@ -32,8 +32,31 @@ same across all three protocols - only the socket underneath changes.
 
 ### `Request`
 
-A parsed request: `method`, `path`, the raw `headers` block, and `body`. Read a
-named header with `header(req.headers, "...")`.
+A parsed request: `method`, `path`, the raw `headers` block, `body`, and `peer`.
+Read a named header with `header(req.headers, "...")`.
+
+`peer` is the client's IPv4 address in dotted quad - the kernel's own view of who
+connected, read off the socket with `std/net`'s `Conn.peerIp()`, and the only
+address in a request that a client cannot choose. Rate-limit, ban and audit by
+`peer`; `X-Forwarded-For` and its relatives are peer-supplied header text.
+
+`peer` is `""`, never a placeholder address, whenever there is no socket to ask:
+a `Request` you build yourself, one that arrived over HTTP/3 (see
+[HTTP/3](#http3)), and one whose connection died before the address could be
+read. Reading the address never fails a request. Because `""` is the zero value
+of `string`, a literal that omits the field - `Request{ method: "GET", path:
+"/", headers: "", body: "" }` - is legal and means "no peer known".
+
+```bit
+import { Request, Response, ok, respond } from "std/http"
+
+fn route(req: Request): Response {
+  if (len(req.peer) == 0) {
+    return respond(400, "no peer address")
+  }
+  return ok("hello ${req.peer}")
+}
+```
 
 ### `Response`
 
