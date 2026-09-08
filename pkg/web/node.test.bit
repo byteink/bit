@@ -52,6 +52,25 @@ test "an Attr's value is HTML-escaped even without url() or text()" {
 // source into a scratch module alongside a generated `main.bit`, so the
 // measurement exercises the actual implementation, not a stand-in.
 //
+// ONE bounded child, not two, and a SKIP rather than a failure when it
+// overruns (#4484). Timed under the harness on a box carrying eight
+// concurrent agents, the three costs here are nothing like they look:
+// writing the fixture module is 0-1ms, `bit build` on it is 483ms, and the
+// render itself is ~20ms — but the FIRST `execve` of a newly written
+// executable is charged a macOS provenance scan that is serialized
+// system-wide, and under that load it measured 16.2s for a fresh copy of an
+// already-scanned binary and 32.7s for a fresh script plus a fresh binary.
+// This benchmark used to write THREE fresh executables (`build.sh`,
+// `run.sh`, the fixture) and exec each once, so it paid that tax three
+// times inside `bit test`'s 30s per-test bound (`defaultTestTimeoutMs`,
+// compiler/testrun.bit) and reported `FAIL ... (timed out)` on 3 of 4 runs
+// under load. Build and run are one script now — two taxed execs is the
+// floor, since `osRunBounded` takes a path and no argv (runtime/ABI.md §19)
+// so a script is the only way to pass one, and the fixture binary is
+// freshly compiled on purpose. Two can still overrun a loaded box, which is
+// why `benchBudgetMs` fires first and degrades to a skip: the measurement
+// is worth having when the box allows it, and is never worth a red gate.
+//
 // `BIT_BIN`/`BIT_STDLIB`/`BIT_REPO` are exactly the env `test-package-web`'s
 // own Gate sets (tools/build/gates.bit's `packageGates()`), inherited down
 // to this test process because `packagesgate.bit` shells to `bit test <dir>`
@@ -173,26 +192,67 @@ fn digitsAt(s: string, start: int): int {
   return v
 }
 
+// `osRunBounded`'s deadline outcome (runtime/ABI.md §19): the child's whole
+// process group was SIGKILLed at the deadline. Distinct from every exit
+// code, so it is the one result that means "the box was too slow", not "the
+// code under test is wrong".
+const benchTimedOut: int = 0 - 2
+
+// This benchmark's own deadline, deliberately well INSIDE `bit test`'s 30s
+// per-test bound so THIS one always fires first. The old inner bounds (60s
+// for the build, 30s for the run) were both larger than the outer bound and
+// therefore unreachable: the harness killed the process at 30s and reported
+// FAIL, which is the flake this closes. 20s leaves 10s of headroom for the
+// rest of the test process, which measured under 2ms of real work.
+const benchBudgetMs: int = 20000
+
+// Either outcome of one attempt: `objects` when the fixture was measured,
+// or a non-empty `skip` line explaining why it was not. A skip is a pass —
+// same contract as `locateBit()` returning an empty location.
+class BenchResult {
+  objects: int,
+  skip: string,
+}
+
+// Build and run as ONE child: `set -e` makes a failed build the script's
+// exit status, and the marker file written between the two halves is what
+// tells the two phases apart afterwards without a second taxed exec.
+fn benchScript(loc: BitLocation, dir: string, prog: string): string {
+  return "#!/bin/sh\nset -e\nBIT_STDLIB='${loc.stdlib}'\nexport BIT_STDLIB\n" +
+    "'${loc.bin}' build '${dir}' -o '${prog}'\n" +
+    ": > '${dir}/built'\n" +
+    "BIT_GC_STATS=1\nexport BIT_GC_STATS\n" +
+    "exec '${prog}' > '${dir}/out.txt' 2> '${dir}/err.txt'\n"
+}
+
+fn benchPhase(dir: string): string {
+  if (exists("${dir}/built")) {
+    return "running the fixture"
+  }
+  return "compiling the fixture"
+}
+
 // Builds and runs the fixture with `BIT_GC_STATS=1`, returning its
-// `swept+live` object count.
-fn buildAndMeasureAlloc(loc: BitLocation): int {
+// `swept+live` object count — or a skip line when the child did not finish
+// inside `benchBudgetMs`.
+fn buildAndMeasureAlloc(loc: BitLocation): BenchResult {
   let dir = scratchDir("nodebench")
   mkdir(dir) catch e {
     panic("bench: mkdir ${dir}: ${e.message()}")
   }
   writeFixtureModule(loc, dir)
   let prog = "${dir}/fixture"
-  let buildScript = "#!/bin/sh\nset -e\nBIT_STDLIB='${loc.stdlib}'\nexport BIT_STDLIB\n" +
-    "'${loc.bin}' build '${dir}' -o '${prog}'\n"
-  let buildCode = shellRun("${dir}/build.sh", buildScript, 60000)
-  if (buildCode != 0) {
-    panic("bench: building the fixture exited ${buildCode} — see ${dir}")
+  let code = shellRun("${dir}/bench.sh", benchScript(loc, dir, prog), benchBudgetMs)
+  if (code == benchTimedOut) {
+    return BenchResult{
+      objects: 0,
+      skip: "${benchPhase(dir)} did not finish within this " +
+        "benchmark's ${benchBudgetMs}ms budget (a loaded box charges macOS's first-exec " +
+        "provenance scan on the fresh script and the fresh fixture binary) — not measured",
+    }
   }
-  let runScript = "#!/bin/sh\nBIT_GC_STATS=1\nexport BIT_GC_STATS\n" +
-    "exec '${prog}' > '${dir}/out.txt' 2> '${dir}/err.txt'\n"
-  let runCode = shellRun("${dir}/run.sh", runScript, 30000)
-  if (runCode != 0) {
-    panic("bench: running the fixture exited ${runCode} — see ${dir}")
+  if (code != 0) {
+    panic("bench: ${benchPhase(dir)} exited ${code} — see ${dir}")
   }
   let err = readFile("${dir}/err.txt") catch _ {
     ""
@@ -202,7 +262,7 @@ fn buildAndMeasureAlloc(loc: BitLocation): int {
   if (swept < 0 || live < 0) {
     panic("bench: no 'swept=N live=N' summary in ${dir}/err.txt (got: ${err})")
   }
-  return swept + live
+  return BenchResult{ objects: swept + live, skip: "" }
 }
 
 test "rendering a ~200-node tree reports its allocation count" {
@@ -214,14 +274,18 @@ test "rendering a ~200-node tree reports its allocation count" {
     )
     return
   }
-  let objects = buildAndMeasureAlloc(loc)
-  println("pkg/web bench: rendering a 201-node tree allocated ${objects} objects (swept+live)")
-  assert(objects > 0, "pkg/web bench: expected at least one allocation, got ${objects}")
+  let r = buildAndMeasureAlloc(loc)
+  if (len(r.skip) > 0) {
+    println("pkg/web bench: ${r.skip}")
+    return
+  }
+  println("pkg/web bench: rendering a 201-node tree allocated ${r.objects} objects (swept+live)")
+  assert(r.objects > 0, "pkg/web bench: expected at least one allocation, got ${r.objects}")
   // Generous on purpose — a regression tripwire against an accidental
   // per-byte or per-attribute-escape allocation creeping into render()'s
   // hot path, not a tight pin.
   assert(
-    objects < 5000,
-    "pkg/web bench: ${objects} objects for a 201-node tree looks like a regression",
+    r.objects < 5000,
+    "pkg/web bench: ${r.objects} objects for a 201-node tree looks like a regression",
   )
 }
