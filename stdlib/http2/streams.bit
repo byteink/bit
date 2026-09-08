@@ -40,6 +40,36 @@ fn h2connFlushStream(st: h2connState, s: h2connStream) {
   }
 }
 
+// Resume every stream blocked on send credit, after a connection-level
+// WINDOW_UPDATE or a SETTINGS_INITIAL_WINDOW_SIZE increase handed some back.
+//
+// NOT `for (_, s) of st.streams { h2connFlushStream(st, s) }`, which is what
+// this replaced at two call sites: draining a stream's last pending bytes ends
+// it (`h2connLocalEnd`), ending it closes it, and closing it now removes it from
+// `st.streams` (`h2connCloseStream`, #4594) — a mutation in the middle of a
+// walk the runtime's iterator explicitly does not allow (SPEC §12.6;
+// `bit_rt_map_iter_next`, runtime/root/maps.bit, "iteration assumes no
+// mutation"). So collect the ids first — only a stream with `hasPending` can
+// make progress, so the snapshot is normally empty — and flush outside the walk.
+//
+// The re-read is the two-result form because a single-result read of an absent
+// key panics (SPEC §12.6) and only the comma-ok form is total; flushing one
+// stream cannot release another today, and this does not depend on that.
+fn h2connFlushAll(st: h2connState) {
+  let ids = []int(0)
+  for (id, s) of st.streams {
+    if (s.hasPending) {
+      ids = append(ids, id)
+    }
+  }
+  for id of ids {
+    let (s, ok) = st.streams[id]
+    if (ok) {
+      h2connFlushStream(st, s)
+    }
+  }
+}
+
 // --- stream state transitions ------------------------------------------------
 
 // We sent END_STREAM: open -> half-closed(local); half-closed(remote) -> closed.
@@ -63,11 +93,52 @@ fn h2connRecvEndTransition(st: h2connState, s: h2connStream) {
   }
 }
 
+// Move `s` to the closed state (RFC 9113 §5.1) and drop it from the connection's
+// stream table (#4594).
+//
+// Retaining a closed stream's PROTOCOL state is what §5.1 asks for; retaining
+// its `recvBody`, `pendingData` and `recvHeaders` for the life of the connection
+// is not, and until this deleted the entry a server holding one connection open
+// for a browser accumulated every body it ever served on it — at up to
+// `Config.maxBodyBytes` each (#4590), which bounds one stream and not their sum.
+//
+// A released entry is indistinguishable from a never-created one, which is what
+// makes the removal safe rather than merely smaller. Every read of the table is
+// guarded by `st.present[id] == 0`, and each of those guards already answers a
+// PRESENT CLOSED stream exactly as it answers an absent one:
+// `h2connDataStreamOk` reports STREAM_CLOSED either way (events.bit), and
+// `h2connOnRstStream`, `h2connOnWindowUpdate` and `h2connCmdRespond` all return
+// without acting either way — so a late RST_STREAM, WINDOW_UPDATE or PRIORITY on
+// a stream that has just closed is answered without a table entry, which is what
+// §5.1 requires of them. The ordering state a late HEADERS is judged against
+// (`st.lastPeerStreamId`, `st.nextStreamId`) lives on the connection rather than
+// in the table, so it survives the release and a released id stays unreusable.
+//
+// Nothing is owed on a stream by the time it reaches here, on either side:
+//
+//   - client: `h2connFailAll` — the only thing that ever wakes a `roundTrip`
+//     parked on `s.replyCh` after the fact — already SKIPS a closed stream
+//     (`s.state != h2stClosed`, below), so a closed entry was never reachable by
+//     it and keeping one bought nothing. `h2connDeliverResponse` and
+//     `h2connFailStreamMsg` both answer through the `s` they already hold, not
+//     through the table.
+//   - server: `h2connDeliverRequest` hands the `Request` to `serve`'s `acceptCh`
+//     by value, so the handler holds its own reference, and it answers through
+//     `h2connCmdRespond`, which refuses a closed stream already. A server
+//     stream's `replyCh` is `h2connDummyReply()` and nothing receives from it.
+//
+// The one caller that closes a client stream with its `roundTrip` still
+// unanswered is `h2connCmdReset` (`Conn.resetStream`), which stranded that
+// caller before this change too — see #4596, filed separately, and note no
+// public API hands out the stream id it takes.
 fn h2connCloseStream(st: h2connState, s: h2connStream) {
-  if (s.state != h2stClosed) {
-    s.state = h2stClosed
-    st.activeStreams = st.activeStreams - 1
+  if (s.state == h2stClosed) {
+    return
   }
+  s.state = h2stClosed
+  st.activeStreams = st.activeStreams - 1
+  delete(st.streams, s.id)
+  delete(st.present, s.id)
 }
 
 // --- delivering completed messages -------------------------------------------
