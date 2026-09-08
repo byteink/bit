@@ -1,0 +1,137 @@
+// compiler/synthtext.bit — the one place a synthesized member's TEXT comes
+// from, and the one pass that runs every member synthesis (#3879's
+// `validateFields`, #3976's `toJson`).
+//
+// WHY THERE IS A TEXT PROBLEM AT ALL. An identifier's text in this AST is a
+// SLICE of the module source (`identText`), and so is a string literal's
+// (`decodeStringContent`). There is no string table, so a name that appears
+// nowhere in the source cannot be spelled by any node — and every word a
+// synthesized member needs (`toJson`, `this`, `Json`, the JSON key `"name"`)
+// is exactly that. The fix is to append those words to the module's own
+// source, once, and point the synthetic nodes at them.
+//
+// Appending at the TAIL is what makes it safe: every existing span keeps its
+// meaning, the text is added after parsing so no lexer ever sees it, `bit fmt`
+// never runs this pass at all, and the one reader that could be surprised by
+// an offset past the last file — `locate` (diagnostics.bit) — has clamped
+// since the loader started joining a module's files with a separator newline
+// that belongs to no file. No diagnostic ever lands on one of these spans:
+// every node a synthesis builds that a reader could be pointed at is stamped
+// with the REAL span of the class, field or attribute it came from, and the
+// nodes carrying synthetic spans are only names and locals.
+//
+// WHY ONE TABLE AND ONE PASS. #3879 appended two hardcoded words inline and
+// its own report said a second synthesized name is the moment to stop. This is
+// that generalisation, and it is the SMALLER of the two options on the table
+// (the other being a `Tree.synth` string table): `Tree` carries no source
+// today and every text reader in the compiler takes `(tree, source)`, so a
+// table on `Tree` would have to be threaded through `identText`,
+// `decodeStringContent`, the formatter, `bit doc` and the LSP before it spelled
+// its first name. A word list costs one function and changes no reader at all.
+// Each module gets ONE append covering BOTH features, so the number of appends
+// is a property of the module, not of how many features fired in it.
+
+// Where a module's synthesized words live, and what each one's span is.
+// Keyed by the word itself: two features asking for `this` get one copy.
+class SynthText {
+  file: int,
+  spans: map<string, Span>,
+}
+
+// Appends every distinct word in `words` to `m.source`, space-separated, and
+// records where each one landed. Called at most once per module.
+//
+// The words are joined through a `[]byte` accumulator rather than `s = s + w`
+// in the loop: the latter copies the whole accumulation on every word, which
+// is the quadratic shape #2173 removed from the JSON encoder for the same
+// reason.
+fn appendSynthText(m: SrcModule, file: int, words: []string): SynthText {
+  let st = SynthText{ file: file, spans: map<string, Span>{} }
+  let base = len(m.source)
+  let buf = []byte(0)
+  for w of words {
+    let (_, dup) = st.spans[w]
+    if (dup) {
+      continue
+    }
+    let start = base + len(buf)
+    st.spans[w] = Span{ file: file, start: start, end: start + len(w) }
+    buf = append(buf, w)
+    buf = append(buf, " ")
+  }
+  m.source = m.source + string(buf)
+  return st
+}
+
+// The span of one synthesized word. A word the builder asks for that the
+// collector did not declare is a COMPILER bug, not a user error, and the
+// symptom would be a node silently reading the wrong text off the front of the
+// module — so it fails loudly here instead of producing a wrong program.
+fn synthSpan(st: SynthText, word: string): Span {
+  let (sp, ok) = st.spans[word]
+  if (!ok) {
+    panic("synthtext: '${word}' was never appended to this module's source")
+  }
+  return sp
+}
+
+// An `Ident` leaf spelling `word`. The shape every synthesized name takes.
+fn synthIdent(tree: Tree, st: SynthText, word: string): int {
+  return addLeaf(tree, Tag.Ident, synthSpan(st, word))
+}
+
+// Injects every synthesized class member for one module: #3879's
+// `validateFields` and #3976's `toJson`. Both need words in the source, so both
+// go behind ONE `appendSynthText` — a module that needs neither is byte-
+// identical to before, source and tree alike.
+//
+// `@key` misuse is judged unconditionally, ahead of the early return: a `@key`
+// on a class that carries no `@json` synthesizes nothing at all, so there is no
+// later pass that could notice it.
+fn injectSynthMembersInModule(m: SrcModule, diags: Diagnostics) {
+  vStrayKeyAttrs(m.tree, m.source, diags)
+  let attrClasses = collectAttrClasses(m.tree, m.source)
+  let jsonClasses = collectJsonClasses(m.tree, m.source, diags)
+  if (len(attrClasses) == 0 && len(jsonClasses) == 0) {
+    return
+  }
+  let anchor = attrClasses
+  if (len(anchor) == 0) {
+    anchor = jsonClasses
+  }
+  let file = getNode(m.tree, anchor[0].className).span.file
+  let words = []string(0)
+  if (len(attrClasses) != 0) {
+    for w of fieldAttrSynthWords() {
+      words = append(words, w)
+    }
+  }
+  for w of jsonSynthWords(jsonClasses) {
+    words = append(words, w)
+  }
+  let st = appendSynthText(m, file, words)
+  let newDecls = injectFieldValidatorDecls(m, diags, st, attrClasses)
+  for d of injectJsonDecls(m, st, jsonClasses) {
+    newDecls = append(newDecls, d)
+  }
+  attachNewDecls(m.tree, newDecls)
+}
+
+// Entry point, called from resolveProject (checkproject.bit) immediately after
+// `injectTraits` and for the identical reason: every front end (check / build /
+// bit doc / the LSP) reaches the checker through there, and this has to have
+// happened before a Checker captures the module's source. After traits, so each
+// class's member list is final before anything reads it.
+//
+// Spans are MODULE-GLOBAL here, as they are in `injectTraits`, so the same
+// `remapDiags` call has to follow — without it a diagnostic renders against
+// file 0.
+fn injectSynthMembers(p: Project) {
+  let i = 0
+  while (i < len(p.mods)) {
+    let before = len(p.diags.list)
+    injectSynthMembersInModule(p.mods[i], p.diags)
+    remapDiags(p.diags, before, p.mods[i].files, p.mods[i].fileStarts)
+    i = i + 1
+  }
+}
