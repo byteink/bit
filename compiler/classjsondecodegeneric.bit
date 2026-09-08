@@ -1,0 +1,724 @@
+// compiler/classjsondecodegeneric.bit — `jsonDecode<T>` where `T` is the
+// enclosing generic's OWN type parameter (#4563).
+//
+// classjsondecodecall.bit rewrites `jsonDecode<User>(j)` into
+// `__json_dec_User(j, "", 0)` during `resolveProject`, resolving the type
+// argument BY NAME. A type parameter is not a name it can resolve, so every
+// generic wrapper around `jsonDecode` was E0145 and no library could compose
+// it: `pkg/web`'s `c.body<T>()` (#3877) shipped taking the decoder as a
+// parameter for exactly this reason.
+//
+// WHY THE REWRITE IS NOT EXTENDED, AND WHY THE MONOMORPHIZER IS NOT HOOKED —
+// the two shapes the ticket asked to be weighed.
+//
+// A source-level rewrite CANNOT express this case, and that is structural
+// rather than a matter of effort: the wrapper and the decoded class routinely
+// live in different modules and the dependency runs the wrong way. `Ctx.body<T>`
+// is declared in `pkg/web`; `NewUser` is declared in the application, which
+// imports `pkg/web`. Whatever `body`'s body were rewritten to would have to
+// name `__json_dec_NewUser`, and `pkg/web` cannot import the application —
+// `synthImportDecl` only ever uses a path the module ALREADY imports, because a
+// path nothing imported was never loaded and `bindImports` would drop the
+// synthesized declaration silently. Cloning `body` once per `T` into the
+// CALLER's module fails the other way round: the clone's body names what
+// `pkg/web` keeps to itself.
+//
+// Rewriting after substitution inside the monomorphizer fails for a different
+// reason: `lowerInstance` (lowerdriver.bit) lowers ONE SHARED template body per
+// instantiation. There is no per-instantiation AST to rewrite, so a rewrite of
+// that body would apply to every `T` at once.
+//
+// What IS per-instantiation is the ledger ENTRY. So this file changes the
+// ledger and nothing else. At `jsonDecode<NewUser>` the entry keeps its name
+// (every call site still finds it through `instantiationIndex`) and its
+// argument list, and its `decl`/`module` are retargeted at a specialisation
+// synthesized in NewUser's OWN module:
+//
+//     fn __json_dec_inst_NewUser<__json_T>(__json_j: Json): NewUser! {
+//       return __json_dec_NewUser(__json_j, "", 0)?
+//     }
+//
+// Pass A2 emits THAT body under the instance symbol the wrapper's call already
+// names, so no lowering path, no call-site rule and no import changes at all.
+//
+// THE SPECIALISATION IS DECLARED GENERIC, and the unused `__json_T` is
+// load-bearing rather than decoration. `resolveCallTarget` (lowerprim.bit)
+// lowers the call from `jsonDecode`'s OWN declaration — that is where its
+// parameter types and its exploded-return decision come from — and
+// `explodesParams` (lowerexplode.bit) answers false for any declaration
+// carrying generic params. A non-generic specialisation would answer true, so
+// the definition would explode a return the caller does not, across a signature
+// the two sides never compare.
+
+// The type parameter of a synthesized specialisation. It is never mentioned by
+// the body; it exists so the declaration has the same SHAPE as `jsonDecode<T>`
+// (see the header). Spelled with the `__json_` prefix every synthesized name
+// carries, so it cannot collide with a type the module declares.
+const jsonDecInstTypeParam = "__json_T"
+
+// How many propagation rounds `closeJsonDecodeGenerics` may take. A round that
+// adds nothing stops it; this is the hard stop, and running out leaves the set
+// exactly as incomplete as it was, which means a REFUSAL from
+// `validateJsonDecodeGenerics` rather than a wrong program.
+const jsonDecodeGenericRounds = 64
+
+fn jsonDecInstName(name: string): string {
+  return "__json_dec_inst_${name}"
+}
+
+// One generic declaration that decodes into one of its own type parameters,
+// directly or by handing that parameter to another such generic.
+//
+// `tpIndex` is a position in the declaration's MERGED generic list — parserdecl
+// puts a generic RECEIVER's parameters in front of the method's own — because
+// that is the list `bindTypeParams` and `methodTypeArgsRaw` index by. `nrecv`
+// is how many of them the receiver contributed, which is what turns a merged
+// position back into a position in the list a CALL SITE writes.
+class JsonDecodeGeneric {
+  mod: int,
+  decl: int,
+  name: string,
+  tpIndex: int,
+  nrecv: int,
+}
+
+// One "this generic hands its own type parameter to that generic" edge, found
+// syntactically. `calleeIndex` is a position in the list the call site writes,
+// so it compares against a `JsonDecodeGeneric`'s `tpIndex - nrecv`.
+class JsonDecodeGenericEdge {
+  mod: int,
+  decl: int,
+  name: string,
+  tpIndex: int,
+  nrecv: int,
+  callee: string,
+  calleeIndex: int,
+}
+
+// ---- reading declarations syntactically ------------------------------------
+
+// Every generic function or method declaration in the module, by arena index —
+// the same whole-arena sweep `jsonDecodeCallNodes` makes, and for the same
+// reason: an `export` wraps a declaration rather than replacing it, and a
+// method sits inside a class body, so there is no shorter path to all of them.
+fn jsonGenericFuncDecls(tree: Tree): []int {
+  let out = []int(0)
+  let i = 1
+  while (i < len(tree.nodes)) {
+    if (getNode(tree, i).tag == Tag.FuncDecl && kidsOf(tree, i)[2] != 0) {
+      out = append(out, i)
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// The declaration's type-parameter names, in merged order.
+fn jsonDeclTypeParamNames(tree: Tree, source: string, decl: int): []string {
+  let out = []string(0)
+  for tp of kidsOf(tree, kidsOf(tree, decl)[2]) {
+    out = append(out, identText(tree, source, kidsOf(tree, tp)[0]))
+  }
+  return out
+}
+
+// How many of those the RECEIVER contributed. `methodOwnGenericCount`
+// (checklookup.bit) answers this from the checker's type tables, which do not
+// exist yet here; the receiver's own type node carries the same count.
+fn jsonRecvGenericCount(tree: Tree, decl: int): int {
+  let recv = kidsOf(tree, decl)[0]
+  if (recv == 0) {
+    return 0
+  }
+  let rt = kidsOf(tree, recv)[1]
+  if (rt == 0 || getNode(tree, rt).tag != Tag.GenericInst) {
+    return 0
+  }
+  return len(kidsOf(tree, kidsOf(tree, rt)[1]))
+}
+
+// The declared name of a function or method.
+fn jsonDeclName(tree: Tree, source: string, decl: int): string {
+  return identText(tree, source, kidsOf(tree, decl)[1])
+}
+
+// The name a call site spells its callee by: `f(...)` and both dotted forms,
+// `recv.m(...)` and `ns.f(...)`, which are one node shape. "" for anything
+// else — a call through a value has no declaration to match.
+fn jsonCalleeName(tree: Tree, source: string, callee: int): string {
+  if (callee == 0) {
+    return ""
+  }
+  let tag = getNode(tree, callee).tag
+  if (tag == Tag.Ident) {
+    return identText(tree, source, callee)
+  }
+  if (tag != Tag.Member) {
+    return ""
+  }
+  return identText(tree, source, kidsOf(tree, callee)[1])
+}
+
+// The type-argument nodes written at a call, `f<A, B>(x)`.
+fn jsonCallTypeArgs(tree: Tree, call: int): []int {
+  let targs = kidsOf(tree, call)[1]
+  if (targs == 0) {
+    return []int(0)
+  }
+  return kidsOf(tree, targs)
+}
+
+// The index in `tps` of the type parameter this call's `i`th written type
+// argument names, or -1 when it names something else (a real type, a container,
+// a qualified name).
+fn jsonTypeParamArgAt(
+  tree: Tree, source: string, call: int, tps: []string, i: int,
+): int {
+  let targs = jsonCallTypeArgs(tree, call)
+  if (i < 0 || i >= len(targs) || getNode(tree, targs[i]).tag != Tag.Ident) {
+    return -1
+  }
+  let name = identText(tree, source, targs[i])
+  let k = 0
+  while (k < len(tps)) {
+    if (tps[k] == name) {
+      return k
+    }
+    k = k + 1
+  }
+  return -1
+}
+
+// ---- the set of generics that decode into their own type parameter ---------
+
+// Whether this (declaration, type parameter) is already in the set. A predicate
+// rather than an `add` taking the accumulator: a function that appends to a
+// slice PARAMETER aliases the caller's backing array (E0214), and the shape
+// `hasJsonDecodeNeed` already uses in classjsondecodecall.bit avoids the
+// question instead of arguing about it.
+fn hasJsonDecodeGeneric(gens: []JsonDecodeGeneric, g: JsonDecodeGeneric): bool {
+  for x of gens {
+    if (x.mod == g.mod && x.decl == g.decl && x.tpIndex == g.tpIndex) {
+      return true
+    }
+  }
+  return false
+}
+
+// Every generic in the project whose body calls `jsonDecode<P>` with `P` one of
+// its own type parameters, plus every generic that reaches one of those by
+// handing its own type parameter along.
+fn collectJsonDecodeGenerics(p: Project): []JsonDecodeGeneric {
+  let gens = []JsonDecodeGeneric(0)
+  let mid = 0
+  while (mid < len(p.mods)) {
+    gens = moduleJsonDecodeGenerics(p.mods[mid], mid, gens)
+    mid = mid + 1
+  }
+  // The edge sweep walks every generic body in the project, so it is skipped
+  // outright when nothing decodes: the closure SEEDS from the direct set, so
+  // with no seed no edge can ever fire. That is what keeps a project that never
+  // calls `jsonDecode` — the compiler's own build among them — paying only the
+  // per-module `bindsJsonDecode` test above.
+  if (len(gens) == 0) {
+    return gens
+  }
+  let edges = []JsonDecodeGenericEdge(0)
+  let ei = 0
+  while (ei < len(p.mods)) {
+    edges = moduleJsonDecodeEdges(p.mods[ei], ei, edges)
+    ei = ei + 1
+  }
+  return closeJsonDecodeGenerics(gens, edges)
+}
+
+// The direct half: `jsonDecode<P>(j)` standing in a generic body, with `P` one
+// of that declaration's own type parameters. A `P` the RECEIVER declared is
+// deliberately not one of these — see `jsonDecodeTypeParamCalls`.
+fn moduleJsonDecodeGenerics(
+  m: SrcModule, mid: int, gens: []JsonDecodeGeneric,
+): []JsonDecodeGeneric {
+  let names = jsonDecodeNamesOf(m.tree, m.source)
+  if (!bindsJsonDecode(names)) {
+    return gens
+  }
+  for decl of jsonGenericFuncDecls(m.tree) {
+    let tps = jsonDeclTypeParamNames(m.tree, m.source, decl)
+    let nrecv = jsonRecvGenericCount(m.tree, decl)
+    for call of subtreeCallNodes(m.tree, kidsOf(m.tree, decl)[5]) {
+      let k = jsonTypeParamArgAt(m.tree, m.source, call, tps, 0)
+      if (k < nrecv || !isJsonDecodeCallee(m.tree, m.source, kidsOf(m.tree, call)[0], names)) {
+        continue
+      }
+      let g = JsonDecodeGeneric{
+        mod: mid, decl: decl, name: jsonDeclName(m.tree, m.source, decl),
+        tpIndex: k, nrecv: nrecv,
+      }
+      if (!hasJsonDecodeGeneric(gens, g)) {
+        gens = append(gens, g)
+      }
+    }
+  }
+  return gens
+}
+
+// The indirect half, as edges rather than as an answer: every call in a generic
+// body that hands one of that generic's own type parameters to another generic.
+// Which of those edges matter is decided by `closeJsonDecodeGenerics`, once the
+// direct set is known.
+fn moduleJsonDecodeEdges(
+  m: SrcModule, mid: int, edges: []JsonDecodeGenericEdge,
+): []JsonDecodeGenericEdge {
+  for decl of jsonGenericFuncDecls(m.tree) {
+    let tps = jsonDeclTypeParamNames(m.tree, m.source, decl)
+    let nrecv = jsonRecvGenericCount(m.tree, decl)
+    let dname = jsonDeclName(m.tree, m.source, decl)
+    for call of subtreeCallNodes(m.tree, kidsOf(m.tree, decl)[5]) {
+      let callee = jsonCalleeName(m.tree, m.source, kidsOf(m.tree, call)[0])
+      let nargs = len(jsonCallTypeArgs(m.tree, call))
+      let ai = 0
+      while (callee != "" && ai < nargs) {
+        let k = jsonTypeParamArgAt(m.tree, m.source, call, tps, ai)
+        if (k >= nrecv) {
+          edges = append(
+            edges,
+            JsonDecodeGenericEdge{
+              mod: mid, decl: decl, name: dname, tpIndex: k, nrecv: nrecv,
+              callee: callee, calleeIndex: ai,
+            },
+          )
+        }
+        ai = ai + 1
+      }
+    }
+  }
+  return edges
+}
+
+// Propagates "decodes into this type parameter" backwards along the edges until
+// a round adds nothing. Bounded by `jsonDecodeGenericRounds` as well: a cycle of
+// mutually generic calls must terminate, and running out of rounds leaves a
+// refusal rather than a wrong program.
+fn closeJsonDecodeGenerics(
+  gens: []JsonDecodeGeneric, edges: []JsonDecodeGenericEdge,
+): []JsonDecodeGeneric {
+  let round = 0
+  let before = -1
+  while (len(gens) != before && round < jsonDecodeGenericRounds) {
+    before = len(gens)
+    for e of edges {
+      let g = JsonDecodeGeneric{
+        mod: e.mod, decl: e.decl, name: e.name, tpIndex: e.tpIndex,
+        nrecv: e.nrecv,
+      }
+      if (jsonDecodeEdgeFires(gens, e) && !hasJsonDecodeGeneric(gens, g)) {
+        gens = append(gens, g)
+      }
+    }
+    round = round + 1
+  }
+  return gens
+}
+
+// Whether the generic this edge calls is already known to decode into the
+// parameter this edge hands it.
+fn jsonDecodeEdgeFires(gens: []JsonDecodeGeneric, e: JsonDecodeGenericEdge): bool {
+  for g of gens {
+    if (g.name == e.callee && g.tpIndex - g.nrecv == e.calleeIndex) {
+      return true
+    }
+  }
+  return false
+}
+
+// ---- what the pre-check rewrite must leave alone ---------------------------
+
+// Every `jsonDecode<P>` call node in this module whose type argument is a type
+// parameter, and which kind: `jdtpOwn` for one the declaration itself declares
+// (resolved per instantiation by the ledger retarget below), `jdtpRecv` for one
+// a generic RECEIVER declared, which stays a refusal.
+//
+// A method on a generic receiver is not a ledger entry at all — Pass A2 never
+// sees it, `lowerMethodInstances` emits it once per nominal instantiation of
+// the receiver, and nothing records the generic calls in the body it emits
+// (#4569). There is therefore no entry to retarget, so this shape is refused in
+// words rather than accepted and left to fail somewhere later.
+const jdtpOwn = 1
+const jdtpRecv = 2
+
+fn jsonDecodeTypeParamCalls(m: SrcModule): map<int, int> {
+  let out = map<int, int>{}
+  let names = jsonDecodeNamesOf(m.tree, m.source)
+  if (!bindsJsonDecode(names)) {
+    return out
+  }
+  for decl of jsonGenericFuncDecls(m.tree) {
+    let tps = jsonDeclTypeParamNames(m.tree, m.source, decl)
+    let nrecv = jsonRecvGenericCount(m.tree, decl)
+    for call of subtreeCallNodes(m.tree, kidsOf(m.tree, decl)[5]) {
+      let k = jsonTypeParamArgAt(m.tree, m.source, call, tps, 0)
+      if (k < 0 || !isJsonDecodeCallee(m.tree, m.source, kidsOf(m.tree, call)[0], names)) {
+        continue
+      }
+      out[call] = jdtpRecv
+      if (k >= nrecv) {
+        out[call] = jdtpOwn
+      }
+    }
+  }
+  return out
+}
+
+// The refusal that stays a refusal, stated as what it is. #3977's message reads
+// as if the reader misspelled a class name, which is exactly wrong here: the
+// spelling is fine and the shape is unsupported.
+fn reportJsonDecodeRecvTypeParam(jx: JsonCtx, targ: int) {
+  let tname = jsonNodeText(jx, targ)
+  report(
+    jx.diags, ecJsonDecodeType, getNode(jx.tree, targ).span,
+    "'jsonDecode' cannot decode into '${tname}': it is a type parameter of the enclosing CLASS, and a method of a generic class is not monomorphized through the instantiation ledger this specialisation is resolved by",
+    "move the decode into a method or free function that declares '${tname}' itself — `get<${tname}>(j: Json): ${tname}!` is resolved per instantiation (#4563)",
+  )
+}
+
+// ---- the decoders the generic path demands ---------------------------------
+
+// Every `@json` class handed to a decoding generic as a written-out type
+// argument anywhere in the project. Adds the ordinary decode need — so the
+// class's own module synthesizes `__json_dec_C` exactly as a direct call would
+// make it — and records that the same module also owes the specialisation.
+//
+// NEVER REPORTS. A callee is matched by NAME here, which over-approximates: two
+// classes may declare a method with the same name and only one of them decode.
+// An extra decoder is dead code and nothing else, while a false E0145 would
+// refuse a correct program — so the authoritative refusal is
+// `validateJsonDecodeGenerics`, which matches ledger entries by declaration
+// identity and cannot mistake one generic for another.
+fn collectJsonDecodeGenericNeeds(
+  p: Project, gens: []JsonDecodeGeneric, d: JsonDecodeDemand,
+) {
+  if (len(gens) == 0) {
+    return
+  }
+  let mid = 0
+  while (mid < len(p.mods)) {
+    let m = p.mods[mid]
+    let jx = newJsonCtx(p, m)
+    let i = 1
+    while (i < len(m.tree.nodes)) {
+      if (getNode(m.tree, i).tag == Tag.Call) {
+        addJsonDecodeGenericCallNeeds(jx, mid, i, gens, d)
+      }
+      i = i + 1
+    }
+    mid = mid + 1
+  }
+}
+
+fn addJsonDecodeGenericCallNeeds(
+  jx: JsonCtx, mid: int, call: int, gens: []JsonDecodeGeneric, d: JsonDecodeDemand,
+) {
+  let callee = jsonCalleeName(jx.tree, jx.source, kidsOf(jx.tree, call)[0])
+  if (callee == "") {
+    return
+  }
+  let targs = jsonCallTypeArgs(jx.tree, call)
+  for g of gens {
+    let ei = g.tpIndex - g.nrecv
+    if (g.name != callee || ei < 0 || ei >= len(targs)) {
+      continue
+    }
+    if (getNode(jx.tree, targs[ei]).tag != Tag.Ident) {
+      continue
+    }
+    let site = jsonClassSiteOf(jx, mid, identText(jx.tree, jx.source, targs[ei]))
+    if (site.found && site.mark == jmJsonClass && !hasJsonDecodeInstNeed(d, site)) {
+      addJsonDecodeNeed(d, site.mod, site)
+      d.instNeeds = append(
+        d.instNeeds,
+        JsonDecodeNeed{
+          needMod: site.mod, classMod: site.mod, className: site.name, path: "",
+        },
+      )
+    }
+  }
+}
+
+fn hasJsonDecodeInstNeed(d: JsonDecodeDemand, site: JsonClassSite): bool {
+  for n of d.instNeeds {
+    if (n.classMod == site.mod && n.className == site.name) {
+      return true
+    }
+  }
+  return false
+}
+
+// The classes THIS module owes a specialisation for: the ones demanded of it
+// that it also declares. The decode twin of `moduleDecodeClasses`.
+fn moduleDecodeInstClasses(
+  d: JsonDecodeDemand, mid: int, classes: []JsonClass, jx: JsonCtx,
+): []JsonClass {
+  let out = []JsonClass(0)
+  for jc of classes {
+    let name = identText(jx.tree, jx.source, jc.className)
+    for n of d.instNeeds {
+      if (n.classMod == mid && n.className == name) {
+        out = append(out, jc)
+        break
+      }
+    }
+  }
+  return out
+}
+
+// ---- synthesizing the specialisation ---------------------------------------
+
+fn jsonDecInstWords(jx: JsonCtx, classes: []JsonClass): []string {
+  if (len(classes) == 0) {
+    return []string(0)
+  }
+  let out = [
+    jsonDecInstTypeParam, jsonDecParamJ, "Json",
+    jsonDecodeRootPathWord, jsonDecodeZeroWord,
+  ]
+  for jc of classes {
+    let name = identText(jx.tree, jx.source, jc.className)
+    out = append(out, jsonDecInstName(name))
+    out = append(out, jsonDecName(name))
+  }
+  return out
+}
+
+// `fn __json_dec_inst_C<__json_T>(__json_j: Json): C! {
+//    return __json_dec_C(__json_j, "", 0)? }`
+//
+// Never exported: nothing names it in source. The one thing that reaches it is
+// Pass A2, through the retargeted ledger entry, by mangled symbol.
+fn synthJsonDecodeInst(jb: JsonBuild, jx: JsonCtx, jc: JsonClass): int {
+  let tree = jb.tree
+  jb.span = getNode(tree, jc.className).span
+  let name = identText(tree, jx.source, jc.className)
+  let body = jbNode(
+    jb, Tag.Block,
+    [
+      jbNode(
+        jb, Tag.ReturnStmt,
+        [
+          jbTry(
+            jb,
+            jbCall(
+              jb, jbIdent(jb, jsonDecName(name)),
+              [
+                jbIdent(jb, jsonDecParamJ),
+                addLeaf(tree, Tag.StringLit, synthSpan(jb.st, jsonDecodeRootPathWord)),
+                addLeaf(tree, Tag.IntLit, synthSpan(jb.st, jsonDecodeZeroWord)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    ],
+  )
+  return addNode(
+    tree, Tag.FuncDecl, jb.span, 0,
+    [
+      0, synthIdent(tree, jb.st, jsonDecInstName(name)),
+      jbNode(
+        jb, Tag.GenericParams,
+        [jbNode(jb, Tag.GenericParam, [jbIdent(jb, jsonDecInstTypeParam), 0])],
+      ),
+      jbNode(
+        jb, Tag.Params,
+        [jbNode(jb, Tag.Param, [jbIdent(jb, jsonDecParamJ), jbIdent(jb, "Json")])],
+      ),
+      jbNode(
+        jb, Tag.Fallible,
+        [addLeaf(tree, Tag.Ident, getNode(tree, jc.className).span), 0],
+      ),
+      body,
+    ],
+  )
+}
+
+fn injectJsonDecodeInstDecls(
+  jx: JsonCtx, st: SynthText, classes: []JsonClass,
+): []int {
+  let out = []int(0)
+  let jb = JsonBuild{ tree: jx.tree, st: st, span: pointSpan(0, 0) }
+  for jc of classes {
+    out = append(out, synthJsonDecodeInst(jb, jx, jc))
+  }
+  return out
+}
+
+// ---- the refusal, and the retarget -----------------------------------------
+
+// The one authoritative check that a decoding generic's instantiation can be
+// resolved. Runs after every module is checked, so the ledger already holds
+// every instantiation the CHECK pass recorded — `b.get<U>(j)` among them — and
+// matches by (module, decl) identity rather than by name.
+//
+// This is what makes `bit check` and `bit build` agree. The retarget below runs
+// during lowering, which `bit check` never reaches.
+fn validateJsonDecodeGenerics(p: Project, mods: []Checker) {
+  if (len(mods) == 0) {
+    return
+  }
+  let gens = collectJsonDecodeGenerics(p)
+  if (len(gens) == 0) {
+    return
+  }
+  let ctx = mods[0].ctx
+  let i = 0
+  while (i < len(ctx.instantiations)) {
+    let inst = ctx.instantiations[i]
+    for g of gens {
+      if (g.mod == inst.module && g.decl == inst.decl && g.tpIndex < len(inst.args)) {
+        validateJsonDecodeArg(p, mods, inst, inst.args[g.tpIndex])
+      }
+    }
+    i = i + 1
+  }
+}
+
+fn validateJsonDecodeArg(p: Project, mods: []Checker, inst: Instantiation, arg: int) {
+  // Every Checker shares one `ctx` and one `diags` after `resolveProject`
+  // handed them out, so mods[0]'s are the project's.
+  let d = mods[0].diags
+  let ctx = mods[0].ctx
+  if (arg == ctx.voidId) {
+    // `genericTypeArgs` resolves a type param nothing bound to void. `T` here is
+    // in the RESULT alone, so nothing ever infers it from the arguments.
+    reportJsonDecodeGenericArg(d, inst.site, "", jdgUnbound)
+    return
+  }
+  let t = ctx.types[arg]
+  if (t.kind != TypeKind.Struct || !t.hasName || t.declModule < 0 || t.declModule >= len(mods)) {
+    reportJsonDecodeGenericArg(d, inst.site, typeName(ctx, arg), jdgNotJson)
+    return
+  }
+  let (_, ok) = mods[t.declModule].funcDecls[jsonDecInstName(t.name)]
+  if (ok) {
+    return
+  }
+  let cause = jdgNotJson
+  if (jsonClassMarkOf(p, t.declModule, t.name) == jmJsonClass) {
+    cause = jdgUnseen
+  }
+  reportJsonDecodeGenericArg(d, inst.site, t.name, cause)
+}
+
+// The `@json` mark a module records for one of its own class names.
+fn jsonClassMarkOf(p: Project, mid: int, name: string): int {
+  if (mid < 0 || mid >= len(p.mods)) {
+    return 0
+  }
+  let (mark, ok) = newJsonCtx(p, p.mods[mid]).marks[name]
+  if (!ok) {
+    return 0
+  }
+  return mark
+}
+
+// Why one instantiation of a decoding generic cannot be specialised. Three
+// distinct causes, kept distinct: the first is the reader's to fix, the second
+// is a spelling they can change, and the third is this compiler's own limit and
+// says so rather than blaming the type.
+const jdgNotJson = 0
+const jdgUnbound = 1
+const jdgUnseen = 2
+
+// E0145 for the generic path, at the CALL that instantiated the generic — the
+// line the reader can act on, since the `jsonDecode<T>` inside the wrapper may
+// sit in a module they do not own.
+fn reportJsonDecodeGenericArg(d: Diagnostics, site: Span, tname: string, cause: int) {
+  let msg = "'jsonDecode' cannot decode into '${tname}': it does not carry '@json'"
+  let help = "mark '${tname}' with '@json' — a generic that calls 'jsonDecode<T>' decodes only into a class that opted in, exactly as a direct call does"
+  if (cause == jdgUnbound) {
+    msg = "'jsonDecode' cannot decode into an unbound type parameter: this call binds it to nothing"
+    help = "write the type argument out — 'jsonDecode<T>' puts 'T' in the RESULT alone, so nothing infers it from the arguments and neither can a generic wrapping it"
+  }
+  if (cause == jdgUnseen) {
+    msg = "'jsonDecode' cannot decode into '${tname}': no decode specialisation was synthesized for it"
+    help = "write the type argument out at the call site — a decoding generic is specialised from the type argument AS SPELLED, before any type is inferred (#4563)"
+  }
+  report(d, ecJsonDecodeType, site, msg, help)
+}
+
+// Points every `jsonDecode<C>` ledger entry at the specialisation synthesized in
+// `C`'s own module, so Pass A2 emits the decoder under the instance symbol the
+// wrapper's call already names.
+//
+// Runs after Pass A1's closure, which is what CREATES these entries: the check
+// pass only ever sees `jsonDecode<T>` inside the wrapper's template body, which
+// `recordInstantiation` refuses as degenerate (#4499). It is
+// `recordSubtreeInstantiations`, re-walking each instance body under that
+// instance's bindings, that records the concrete one.
+fn retargetJsonDecodeInstances(mods: []Checker, root: int, lo: Lowerer) {
+  let jm = jsonStdModuleId(mods)
+  if (jm < 0) {
+    return
+  }
+  let ctx = mods[root].ctx
+  let g = 0
+  while (g < len(ctx.instantiations)) {
+    let inst = ctx.instantiations[g]
+    if (inst.module == jm && inst.name == jsonDecodeFuncName) {
+      retargetOneJsonDecodeInstance(mods, inst, lo)
+    }
+    g = g + 1
+  }
+}
+
+// The module `std/json` was loaded as, or -1. Read off an importer's own path
+// map rather than matched by name: `SrcModule.imports` is built by the loader,
+// so this is the same identity `isJsonDecodeCallee` matches a call by.
+fn jsonStdModuleId(mods: []Checker): int {
+  let i = 0
+  while (i < len(mods)) {
+    let (id, ok) = mods[i].importPaths[jsonDecodeModulePath]
+    if (ok && id >= 0 && id < len(mods)) {
+      return id
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+fn retargetOneJsonDecodeInstance(mods: []Checker, inst: Instantiation, lo: Lowerer) {
+  let ctx = mods[0].ctx
+  let arg = 0
+  if (len(inst.args) == 1) {
+    arg = inst.args[0]
+  }
+  let t = ctx.types[arg]
+  let cmod = -1
+  if (arg != 0 && t.kind == TypeKind.Struct && t.hasName) {
+    cmod = t.declModule
+  }
+  let decl = 0
+  if (cmod >= 0 && cmod < len(mods)) {
+    let (dn, ok) = mods[cmod].funcDecls[jsonDecInstName(t.name)]
+    if (ok) {
+      decl = dn
+    }
+  }
+  if (decl == 0) {
+    // Unreachable through `bit build`, which checks first — but a stub that
+    // computes nothing is exactly what `jsonDecode`'s own template body is, so
+    // falling through would ship a program that FAILS AT RUN TIME. Refuse.
+    lo.stubbed = append(
+      lo.stubbed,
+      StubbedFn{
+        name: jsonDecodeFuncName, span: inst.site,
+        reason: "a 'jsonDecode<T>' inside a generic body whose type argument has no synthesized decoder",
+      },
+    )
+    return
+  }
+  // `module` is NOT touched: it is half of the (module, name, args) key every
+  // call site looks this entry up by (`instantiationIndexIn`), and half of the
+  // symbol `instanceSymbol` builds. Only where the BODY comes from moves.
+  inst.declModule = cmod
+  inst.decl = decl
+}
