@@ -22,9 +22,9 @@
 // `serializeHeaders` (reqheader.bit, #2290) — "" for none; `extras.config` is
 // not read here, the connection being already dialed (client.bit).
 //
-// `extras.maxBody` (#4585) bounds the HTTP/1.1 leg's response body only. The
-// `h2` leg's body is framed and accumulated by the `std/http2` engine, under
-// that engine's own limits — this budget is not plumbed into it.
+// `extras.maxBody` bounds the response body on BOTH legs (#4590): the HTTP/1.1
+// one through `exchangeOn` (#4585), the `h2` one through `Config.maxBodyBytes`,
+// which the `std/http2` engine enforces as DATA accumulates (`h2glueConfig`).
 fn httpsExchange(
   conn: TlsConn,
   method: string,
@@ -33,10 +33,25 @@ fn httpsExchange(
   extras: RequestExtras,
 ): Response! {
   if (conn.alpnProtocol() == "h2") {
-    return h2clientExchange(conn, method, u, body, extras.block)?
+    return h2clientExchange(conn, method, u, body, extras)?
   }
   let req = buildRequest(method, u, extras.block, body)
   return exchangeOn(tlsStream{ conn: conn }, req, extras.maxBody)?
+}
+
+// The http2 engine configuration this module runs a connection under: the RFC
+// defaults (`h2defaultConfig`) with `maxBody` as the per-stream body budget
+// (#4590).
+//
+// This is the whole of the plumbing that makes one `setMaxBodyBytes` bound both
+// protocols. `std/http2`'s `Config.maxBodyBytes` defaults to the same 32 MiB
+// `defaultMaxBodyBytes` does (stdlib/http2/conn.bit spells out why the constant
+// is duplicated rather than imported), so a caller that sets neither gets the
+// same number either way; a caller that sets one gets it on both.
+fn h2glueConfig(maxBody: int): H2Config {
+  let cfg = h2defaultConfig()
+  cfg.maxBodyBytes = maxBody
+  return cfg
 }
 
 // Adapt a `TlsConn` to the http2 engine's byte `Transport`. The engine's `read`
@@ -105,12 +120,19 @@ fn h2glueWrite(conn: TlsConn, b: []byte) {
 // carries `getTimeout`'s whole-request deadline down into that wait, so a dead
 // peer or one that never sends SETTINGS fails inside the caller's own
 // deadline instead of parking forever.
-fn h2clientExchange(conn: TlsConn, method: string, u: Url, body: string, block: string): Response! {
-  let hc = h2connect(h2glueTransport(conn), h2defaultConfig(), conn.deadlineNs()) catch e {
+fn h2clientExchange(
+  conn: TlsConn,
+  method: string,
+  u: Url,
+  body: string,
+  extras: RequestExtras,
+): Response! {
+  let cfg = h2glueConfig(extras.maxBody)
+  let hc = h2connect(h2glueTransport(conn), cfg, conn.deadlineNs()) catch e {
     conn.close()
     fail e
   }
-  let res = hc.roundTrip(h2glueRequestOf(method, u, body, block)) catch e {
+  let res = hc.roundTrip(h2glueRequestOf(method, u, body, extras.block)) catch e {
     conn.shutdown()
     hc.waitReaderDone()
     hc.waitWriterDone()
@@ -144,7 +166,10 @@ fn h2glueDeadlineRelabel(e: error, conn: TlsConn): error {
 // Serve one h2-negotiated connection: run the http2 server engine and dispatch
 // each stream to the transport-agnostic `handler`, mapping the http2 request and
 // response to this module's types on the way in and out. Each response advertises
-// the HTTP/3 endpoint on `altPort` via an Alt-Svc header. `d` is the owning
+// the HTTP/3 endpoint on `opts.altPort` via an Alt-Svc header, and every stream's
+// body is accumulated under `opts.maxBody` — the same `connOpts` `serveOne` reads
+// an HTTP/1.1 request under (server.bit), so one `setMaxBodyBytes` bounds both
+// protocols (#4590). `d` is the owning
 // server's drain tracker (`shutdown.bit`, #3963/#4314): this connection is
 // registered idle until its first stream starts, then active for the rest of
 // its life — a graceful shutdown force-closes it right away if idle, or sends
@@ -170,11 +195,13 @@ fn h2glueDeadlineRelabel(e: error, conn: TlsConn): error {
 // called it once, is safe — `net.Conn.shutdown` (stdlib/net/net.bit) is a plain
 // idempotent syscall on a still-open fd, not a state transition guarded against
 // re-entry the way `close()` is.
-fn h2glueServe(conn: TlsConn, handler: (Request) => Response, altPort: int, d: drainState) {
+fn h2glueServe(conn: TlsConn, handler: (Request) => Response, opts: connOpts, d: drainState) {
   // No deadline: `serveTls` gives its handler no per-connection timeout
   // budget to thread through today, so this stays unbounded exactly as
   // before (#3019 is about `getTimeout`'s client-side deadline).
-  let hc = h2accept(h2glueTransport(conn), h2defaultConfig(), 0) catch _ {
+  // `opts.maxBody` is the same budget `serveOne` reads an HTTP/1.1 body under,
+  // enforced here by the engine as DATA accumulates (#4590).
+  let hc = h2accept(h2glueTransport(conn), h2glueConfig(opts.maxBody), 0) catch _ {
     conn.close()
     return
   }
@@ -198,7 +225,7 @@ fn h2glueServe(conn: TlsConn, handler: (Request) => Response, altPort: int, d: d
   hc.serve(
     (r) => {
       drainMarkActive(d, id)
-      return h2glueResponseOutAlt(handler(h2glueRequestIn(r, peer)), altPort)
+      return h2glueResponseOutAlt(handler(h2glueRequestIn(r, peer)), opts.altPort)
     },
   ) catch _ {
     conn.shutdown()

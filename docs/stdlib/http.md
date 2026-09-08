@@ -681,10 +681,14 @@ The port the server is bound to.
 
 ### `TlsServer.setMaxBodyBytes(n: int)`
 
-The TLS mirror of `Server.setMaxBodyBytes`, with the same 32 MiB default and
-the same refusal before the bytes are read. It bounds HTTP/1.1-over-TLS only:
-a connection that negotiates `h2` is served by the `std/http2` engine, which
-frames its own bodies and does not go through this read path.
+The TLS mirror of `Server.setMaxBodyBytes`, with the same 32 MiB default. It
+bounds both protocols this listener serves. HTTP/1.1-over-TLS is refused before
+the bytes are read, exactly as `Server.setMaxBodyBytes` refuses it. An HTTP/2
+connection is served by the `std/http2` engine, which frames its own bodies and
+never goes through that read path, so the budget travels into it as
+`Config.maxBodyBytes`: a stream whose DATA passes `n` is reset with
+ENHANCE_YOUR_CALM and no handler runs for it, while the connection's other
+streams carry on.
 
 ### `serveTlsServerOn(ts: TlsServer, handler: (Request) => Response): ()!`
 
@@ -903,10 +907,11 @@ they always read under the 32 MiB default. A caller downloading more than that
 names the size it accepts here and goes through `Client.get`/`post`/`request`/
 `requestTimeout` instead.
 
-Applies to the HTTP/1.1 response path. An `https://` exchange that ALPN
-negotiates to `h2`, and every `https+h3://` exchange, is framed by the
-`std/http2` / `std/http3` engines and bounded by their own limits, not by this
-one.
+Applies to the HTTP/1.1 response path and to an `https://` exchange that ALPN
+negotiates to `h2`: the budget travels into the `std/http2` engine as
+`Config.maxBodyBytes`, which resets the stream once its DATA passes `n` rather
+than refusing a declared length. An `https+h3://` exchange is still framed by
+the `std/http3` engine and bounded by its own limits, not by this one.
 
 There is deliberately no value meaning "unlimited": `0` refuses every body, the
 same way `Server.setMaxBodyBytes` and a zero `Limits` field do.

@@ -1,0 +1,314 @@
+// stdlib/http2/events.test.bit — the per-stream body budget (#4590).
+//
+// `h2connOnData` (events.bit) appends every DATA payload to the stream's
+// `recvBody` and then replenishes both flow-control windows immediately,
+// precisely BECAUSE it buffers the whole body — so the window bounds bytes in
+// flight and, until `Config.maxBodyBytes` existed, nothing bounded bytes
+// resident. These tests are the check that the budget is enforced before the
+// append rather than after it.
+//
+// The first four drive `h2connOnData` directly against a hand-built
+// `h2connState`, with no threads and no transport: that is what makes "the
+// bytes were never appended" mechanically checkable (`len(s.recvBody)`) rather
+// than a claim about a body that came back short. Same flat `std/http2` module,
+// so every helper is in scope and nothing is imported.
+//
+// The last two drive a real client `Conn` against a real server `Conn` over an
+// in-memory pipe, because a budget that is correct in `h2connOnData` and never
+// carried from `Config` into `h2connState` would pass all four of the others.
+
+// --- a loop state with no threads behind it ----------------------------------
+
+// The loop-owned state a `Conn` would have after setup, with `maxBody` as the
+// body budget. Nothing reads `inCh`/`cmdCh` here — the tests call the frame
+// handlers directly — and `writeCh`/`acceptCh` are buffered deep enough that
+// the handful of frames one test queues never blocks the caller.
+fn btState(isClient: bool, maxBody: int): h2connState {
+  return h2connState{
+    isClient: isClient,
+    inCh: chan<h2connEvent>(1),
+    cmdCh: chan<h2connCmd>(1),
+    writeCh: chan<h2connOut>(64),
+    acceptCh: chan<h2connAccept>(8),
+    readyCh: chan<int>(1),
+    readySignaled: true,
+    enc: newEncoderConfig(4096, true),
+    dec: newDecoderConfig(4096),
+    streams: map<int, h2connStream>(),
+    present: map<int, int>(),
+    nextStreamId: h2connFirstId(isClient),
+    lastPeerStreamId: 0,
+    connSendWindow: 65535,
+    connRecvWindow: 1048576,
+    peerInitialWindow: 65535,
+    ourInitialWindow: 1048576,
+    maxBodyBytes: maxBody,
+    peerMaxFrameSize: defaultMaxFrameSize,
+    ourMaxFrameSize: defaultMaxFrameSize,
+    lastStreamId: 0,
+    contStream: 0,
+    contBuf: []byte(0),
+    contEndStream: false,
+    contNewStream: false,
+    goawaySent: false,
+    goawayReceived: false,
+    running: true,
+    activeStreams: 0,
+  }
+}
+
+// Register an open stream `id` on `st`, headers already received, and return it.
+// The receive window is deliberately far wider than any budget these tests use,
+// so a refusal can only be the budget's doing and never flow control's.
+fn btOpenStream(st: h2connState, id: int, replyCh: chan<h2connMsg>): h2connStream {
+  let s = h2connNewStream(id, st.peerInitialWindow, st.ourInitialWindow, replyCh)
+  s.state = h2stOpen
+  s.headersDone = true
+  st.streams[id] = s
+  st.present[id] = 1
+  st.activeStreams = st.activeStreams + 1
+  return s
+}
+
+// A DATA frame carrying `data` on `streamId`, built through the real codec so
+// the handler sees exactly what the wire would hand it.
+fn btDataFrame(streamId: int, data: []byte, endStream: bool): Frame! {
+  let wire = encodeData(
+    DataFrame{ streamId: streamId, data: data, endStream: endStream, padLength: 0 - 1 },
+  )?
+  return readFrame(wire, maxMaxFrameSize)?
+}
+
+// A deterministic byte pattern of length `n`.
+fn btPattern(n: int): []byte {
+  let out = []byte(n)
+  let i = 0
+  while (i < n) {
+    out[i] = byte(33 + i % 90)
+    i = i + 1
+  }
+  return out
+}
+
+// The next frame the loop queued for the writer thread.
+fn btNextWritten(st: h2connState): Frame! {
+  let out = <- st.writeCh
+  return readFrame(out.data, maxMaxFrameSize)?
+}
+
+// --- the budget, checked before the append -----------------------------------
+
+test "a DATA frame over the body budget is refused before it is appended" {
+  let st = btState(false, 64)
+  let s = btOpenStream(st, 1, h2connDummyReply())
+  let f = btDataFrame(1, btPattern(100), false) catch e {
+    assert(false, "building the DATA frame failed: ${e.message()}")
+    return
+  }
+  h2connOnData(st, f)
+  // The whole point: not truncated, not appended and then discarded — never
+  // appended at all, so the 100 bytes are never resident.
+  assert(len(s.recvBody) == 0, "recvBody = ${len(s.recvBody)} bytes, want 0")
+  assert(s.reset, "stream was not reset")
+  assert(
+    s.errorCode == errorEnhanceYourCalm,
+    "error code = ${s.errorCode}, want ${errorEnhanceYourCalm} (ENHANCE_YOUR_CALM)",
+  )
+  // And the peer is told, rather than the stream dying silently on our side.
+  let sent = btNextWritten(st) catch e2 {
+    assert(false, "no frame was queued for the peer: ${e2.message()}")
+    return
+  }
+  let rst = decodeRstStream(sent) catch e3 {
+    assert(false, "the queued frame is not RST_STREAM: ${e3.message()}")
+    return
+  }
+  assert(rst.streamId == 1, "RST_STREAM on stream ${rst.streamId}, want 1")
+  assert(
+    rst.errorCode == errorEnhanceYourCalm,
+    "RST_STREAM code = ${rst.errorCode}, want ${errorEnhanceYourCalm}",
+  )
+}
+
+test "the body budget is a running total, not a per-frame cap" {
+  // Each frame is individually under the budget and only the accumulation
+  // crosses it — the case a per-frame limit like `maxFrameSize` cannot catch,
+  // and the reason the check subtracts what is already resident.
+  let st = btState(false, 64)
+  let s = btOpenStream(st, 1, h2connDummyReply())
+  let first = btDataFrame(1, btPattern(40), false) catch e {
+    assert(false, "building the first DATA frame failed: ${e.message()}")
+    return
+  }
+  h2connOnData(st, first)
+  assert(len(s.recvBody) == 40, "after the first frame recvBody = ${len(s.recvBody)}, want 40")
+  assert(!s.reset, "the first frame, under the budget, must not reset the stream")
+  let second = btDataFrame(1, btPattern(40), false) catch e2 {
+    assert(false, "building the second DATA frame failed: ${e2.message()}")
+    return
+  }
+  h2connOnData(st, second)
+  assert(len(s.recvBody) == 40, "after the refusal recvBody = ${len(s.recvBody)}, want 40")
+  assert(s.reset, "the frame that crossed the budget did not reset the stream")
+  assert(s.errorCode == errorEnhanceYourCalm, "error code = ${s.errorCode}")
+}
+
+test "a body of exactly the budget arrives intact" {
+  // The off-by-one guard: 64 bytes at a 64-byte budget is accepted, delivered,
+  // and byte-for-byte what was sent.
+  let st = btState(false, 64)
+  let s = btOpenStream(st, 1, h2connDummyReply())
+  let f = btDataFrame(1, btPattern(64), true) catch e {
+    assert(false, "building the DATA frame failed: ${e.message()}")
+    return
+  }
+  h2connOnData(st, f)
+  assert(!s.reset, "a body of exactly the budget must not be refused")
+  assert(h2connBytesEqual(s.recvBody, btPattern(64)), "recvBody is not the bytes that were sent")
+  let a = <- st.acceptCh
+  assert(!a.stop, "the request was not delivered")
+  assert(h2connBytesEqual(a.request.body, btPattern(64)), "the delivered body is not intact")
+}
+
+test "an over-budget response body fails a client round trip with the limit named" {
+  // The client half: a hostile server answering an unbounded body must reach
+  // `roundTrip` as an error that says what was exceeded, not as a stream reset
+  // whose only detail is a numeric code.
+  let st = btState(true, 64)
+  let replyCh = chan<h2connMsg>(1)
+  let s = btOpenStream(st, 1, replyCh)
+  let f = btDataFrame(1, btPattern(100), false) catch e {
+    assert(false, "building the DATA frame failed: ${e.message()}")
+    return
+  }
+  h2connOnData(st, f)
+  assert(len(s.recvBody) == 0, "recvBody = ${len(s.recvBody)} bytes, want 0")
+  let msg = <- replyCh
+  assert(!msg.ok, "the round trip was not failed")
+  assert(
+    msg.errMsg == "http2: body exceeds 64 bytes",
+    "error does not name the limit: '${msg.errMsg}'",
+  )
+}
+
+// --- the same budget, carried from `Config` over a real connection -----------
+
+// An in-memory bidirectional pipe, the same shape `_tests_/imports/http2conn`
+// uses: two buffered channels and a leftover slice, so a `Conn` pair runs the
+// whole engine with no socket and no TLS.
+class btChunk { data: []byte, eof: bool }
+
+class btEnd {
+  incoming: chan<btChunk>,
+  outgoing: chan<btChunk>,
+  leftover: []byte,
+  closed: bool,
+}
+
+fn btRead(e: btEnd): (int) => []byte {
+  return (n) => {
+    while (len(e.leftover) == 0 && !e.closed) {
+      let ch = <- e.incoming
+      if (ch.eof) {
+        e.closed = true
+      } else {
+        e.leftover = ch.data
+      }
+    }
+    if (len(e.leftover) == 0) {
+      return []byte(0)
+    }
+    let take = n
+    if (take > len(e.leftover)) {
+      take = len(e.leftover)
+    }
+    let out = e.leftover[0:take]
+    e.leftover = e.leftover[take:len(e.leftover)]
+    return out
+  }
+}
+
+fn btWrite(e: btEnd): ([]byte) => ()! {
+  return (bytes) => {
+    e.outgoing <- btChunk{ data: bytes, eof: false }
+  }
+}
+
+fn btShutdown(e: btEnd): () => () {
+  return () => {
+    e.outgoing <- btChunk{ data: []byte(0), eof: true }
+  }
+}
+
+// Echo the request body back, so a body that survived the budget can be
+// compared byte-for-byte at the client.
+fn btEcho(req: Request): Response {
+  return newResponse(200, req.body)
+}
+
+fn btRunServer(t: Transport, cfg: Config) {
+  let conn = accept(t, cfg, 0) catch _ {
+    return
+  }
+  conn.serve(btEcho) catch _ {
+    return
+  }
+}
+
+// A client `Conn` wired to a server `Conn` running under `serverCfg`.
+fn btLoopback(serverCfg: Config): Conn! {
+  let aToB = chan<btChunk>(1024)
+  let bToA = chan<btChunk>(1024)
+  let clientEnd = btEnd{ incoming: bToA, outgoing: aToB, leftover: []byte(0), closed: false }
+  let serverEnd = btEnd{ incoming: aToB, outgoing: bToA, leftover: []byte(0), closed: false }
+  let ct = newTransport(btRead(clientEnd), btWrite(clientEnd), btShutdown(clientEnd))
+  let stt = newTransport(btRead(serverEnd), btWrite(serverEnd), btShutdown(serverEnd))
+  spawn btRunServer(stt, serverCfg)
+  return connect(ct, defaultConfig(), 0)?
+}
+
+// A POST of `n` pattern bytes over `conn`.
+fn btPost(conn: Conn, n: int): Response! {
+  let req = newRequest("POST", "example.com", "/echo")
+  req.body = btPattern(n)
+  return conn.roundTrip(req)?
+}
+
+test "Config.maxBodyBytes reaches the engine: an over-budget request is refused" {
+  // 20001 bytes at a 20000-byte budget, framed 16384 + 3617: the first frame
+  // fits and the second crosses, so this exercises the running total over the
+  // wire as well as the plumbing from `Config` into the loop state.
+  let cfg = defaultConfig()
+  cfg.maxBodyBytes = 20000
+  let conn = btLoopback(cfg) catch e {
+    assert(false, "loopback setup failed: ${e.message()}")
+    return
+  }
+  btPost(conn, 20001) catch e2 {
+    // What the client can see of a server-side refusal is the RST_STREAM code,
+    // which is the end-to-end proof that the reset carried ENHANCE_YOUR_CALM
+    // (0xb) and not FLOW_CONTROL_ERROR.
+    let m = e2.message()
+    assert(
+      m == "http2: stream reset by peer (code ${errorEnhanceYourCalm})",
+      "unexpected failure: '${m}'",
+    )
+    return
+  }
+  assert(false, "a 20001-byte body was accepted under a 20000-byte budget")
+}
+
+test "Config.maxBodyBytes reaches the engine: a body at the budget is echoed intact" {
+  let cfg = defaultConfig()
+  cfg.maxBodyBytes = 20000
+  let conn = btLoopback(cfg) catch e {
+    assert(false, "loopback setup failed: ${e.message()}")
+    return
+  }
+  let res = btPost(conn, 20000) catch e2 {
+    assert(false, "a body of exactly the budget was refused: ${e2.message()}")
+    return
+  }
+  assert(res.status == 200, "status = ${res.status}, want 200")
+  assert(h2connBytesEqual(res.body, btPattern(20000)), "the echoed body is not the bytes sent")
+}
