@@ -264,6 +264,9 @@ class that itself carries `@json`. Inside those three containers `T` must be
 one of the simple shapes or a nested `@json` class, never another container.
 Anything else is `E0141`, naming the field and its type.
 
+`@json` is refused on a generic class (`E0144`): the compiler decides each
+field's shape from its written type, and a type parameter has none.
+
 **An absent `Option<T>` emits its key with an explicit `null`.** It is not
 omitted: a missing key and an explicit null are different to a client, and
 choosing silently between them is how clients break.

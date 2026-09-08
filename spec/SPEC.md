@@ -976,6 +976,9 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
 - **An absent `Option<T>` emits its key with an explicit `null`. It is never
   omitted.** A missing key and an explicit null are different to a client, and
   choosing silently between them is how clients break.
+- `@json` on a **generic** class is **E0144**. Every judgment the synthesis
+  makes is syntactic — a field's shape is read off its declared type node — and
+  a type parameter has none to read.
 - A class carrying `@json` that also declares `toJson` itself is **E0138**,
   naming both — the same rule, and for the same reason, as `validateFields`
   above. A program wanting different output declares a second class
