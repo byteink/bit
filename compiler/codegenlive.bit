@@ -387,7 +387,7 @@ fn buildIntervals(ctx: TypeContext, f: IrFunc): IntervalBuild {
   }
   extendParamsToPreds(intervals, f)
   forceParamInterference(intervals, f)
-  extendKeepAlive(intervals, f)
+  extendKeepAlive(ctx, intervals, f)
   return IntervalBuild{ intervals: intervals, safepoints: safepoints,
     roots: addInductionCopyRoots(f, intervals, computeCopyRoots(f)) }
 }
@@ -402,28 +402,155 @@ fn buildIntervals(ctx: TypeContext, f: IrFunc): IntervalBuild {
 // grows again. Nothing after this widens an interval, so one pass is the
 // fixpoint.
 //
-// ONE pass is also enough for the edges themselves, and that is a property of
-// how they are built, not an assumption: `recordWordKeepAlive` pairs only
-// NON-traced words with TRACED ones, and traced-ness is fixed per value, so no
-// pair's base is ever another pair's derived value and there are no chains to
-// follow.
+// AN EDGE NAMES ONE VALUE; THE BASE MUST OUTLIVE EVERYTHING DERIVED FROM IT.
+// This paragraph used to say one pass covered the edges too, "because no pair's
+// base is ever another pair's derived value and there are no chains to follow".
+// That was true of the five explosion sites and false the moment #4467 recorded
+// an edge at `ptrOf` itself: `ptrOf(s) + 1` lowers to `convert` then `add`
+// (lowerexpr.bit's §11.4 pointer arithmetic), the edge names the `convert`, and
+// the value live across the later call is the `add`. Extending `s` to the
+// `convert`'s end left it dead at the safepoint, which is the whole of #4467.
+// `derivedReach` below is that closure, computed per VALUE rather than by
+// widening the base to the end of the function.
 //
 // Only the END moves. A derived value cannot be live before its base is
 // defined — the words of one aggregate are minted together, word 0 first —
 // so lowering the base's START would only fabricate interference, and the
 // linear-scan allocator's def-before-use numbering assumes it does not happen.
-fn extendKeepAlive(intervals: []LiveInterval, f: IrFunc) {
+fn extendKeepAlive(ctx: TypeContext, intervals: []LiveInterval, f: IrFunc) {
+  if (len(f.keepAlive) == 0) {
+    return
+  }
+  let reach = derivedReach(ctx, f, intervals)
   let i = 0
   while (i + 1 < len(f.keepAlive)) {
     let d = f.keepAlive[i]
     let b = f.keepAlive[i + 1]
     if (d >= 0 && d < len(intervals) && b >= 0 && b < len(intervals)) {
-      if (intervals[b].end < intervals[d].end) {
-        intervals[b].end = intervals[d].end
+      if (intervals[b].end < reach[d]) {
+        intervals[b].end = reach[d]
       }
     }
     i = i + 2
   }
+}
+
+// A raw pointer `*T` (SPEC §11.4): the one type `isRefType` (codegen.bit) calls
+// untraced while it still names bytes the collector owns.
+fn isRawPtrType(ctx: TypeContext, ty: int): bool {
+  return ty >= 0 && ty < len(ctx.types) && ctx.types[ty].kind == TypeKind.Ptr
+}
+
+// Per value, the last position any raw pointer transitively derived from it is
+// still live. `extendKeepAlive` holds a base open to this rather than to its
+// derived value's own end, so an edge recorded on one link of a chain covers
+// the whole chain.
+//
+// Bounded by the instruction count and stopped by the first round that changes
+// nothing; a function with no keepalive edges never calls it at all. Straight-
+// line chains resolve in one round because `instrOperands`' contract is that an
+// operand's def index is below its use's, so the descending walk sees a user
+// before the value it derives from. A loop-carried pointer needs a second
+// round, which is why this is a fixpoint and not a single pass.
+fn derivedReach(ctx: TypeContext, f: IrFunc, intervals: []LiveInterval): []int {
+  let reach = []int(0)
+  let i = 0
+  while (i < len(intervals)) {
+    reach = append(reach, intervals[i].end)
+    i = i + 1
+  }
+  let round = 0
+  while (round <= len(f.instrs)) {
+    if (!raiseReachRound(ctx, f, reach)) {
+      return reach
+    }
+    round = round + 1
+  }
+  return reach
+}
+
+// One round of the closure. Two rules, one question — which values must stay
+// rooted for a raw pointer to remain valid:
+//   - an instruction whose RESULT is a `*T` is derived from every value it
+//     reads, so its reach flows back to each operand;
+//   - a block parameter of type `*T` is derived from the argument each
+//     predecessor binds to it, so its reach flows back along the edge
+//     (`instrOperands` cannot see that: a terminator's args are operands of the
+//     terminator, and the terminator is not a pointer).
+fn raiseReachRound(ctx: TypeContext, f: IrFunc, reach: []int): bool {
+  let changed = false
+  let i = len(f.instrs)
+  while (i > 0) {
+    i = i - 1
+    if (isRawPtrType(ctx, f.instrs[i].ty)) {
+      if (raiseReachList(reach, instrOperands(f, i), reach[i])) {
+        changed = true
+      }
+    }
+  }
+  if (raiseReachEdges(ctx, f, reach)) {
+    changed = true
+  }
+  return changed
+}
+
+fn raiseReachList(reach: []int, ids: []int, to: int): bool {
+  let changed = false
+  let k = 0
+  while (k < len(ids)) {
+    let o = ids[k]
+    if (o >= 0 && o < len(reach) && reach[o] < to) {
+      reach[o] = to
+      changed = true
+    }
+    k = k + 1
+  }
+  return changed
+}
+
+fn raiseReachEdges(ctx: TypeContext, f: IrFunc, reach: []int): bool {
+  let changed = false
+  let bi = 0
+  while (bi < len(f.blocks)) {
+    let b = f.blocks[bi]
+    // A well-formed block always ends in a terminator; guard anyway so
+    // malformed IR cannot index out of bounds behind our backs.
+    if (b.instsLen > 0) {
+      let t = f.instrs[b.instsStart + b.instsLen - 1]
+      if (t.op == Op.Jump && raiseReachArgs(ctx, f, reach, t.ival, t.args)) {
+        changed = true
+      }
+      if (t.op == Op.Br) {
+        if (raiseReachArgs(ctx, f, reach, t.ival, t.thenArgs)) {
+          changed = true
+        }
+        if (raiseReachArgs(ctx, f, reach, t.ival2, t.elseArgs)) {
+          changed = true
+        }
+      }
+    }
+    bi = bi + 1
+  }
+  return changed
+}
+
+fn raiseReachArgs(ctx: TypeContext, f: IrFunc, reach: []int, target: int, args: []int): bool {
+  if (target < 0 || target >= len(f.blocks)) {
+    return false
+  }
+  let blk = f.blocks[target]
+  let changed = false
+  let k = 0
+  while (k < len(args) && k < blk.paramCount) {
+    let p = blk.instsStart + k
+    if (isRawPtrType(ctx, f.instrs[p].ty)) {
+      if (raiseReachList(reach, [args[k]], reach[p])) {
+        changed = true
+      }
+    }
+    k = k + 1
+  }
+  return changed
 }
 
 // ===========================================================================
