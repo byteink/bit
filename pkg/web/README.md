@@ -273,11 +273,16 @@ it cannot see through a generic wrapper (#4563). When that is fixed the
 parameter goes and the call becomes `c.body<NewUser>()?`; nothing else about
 the behaviour above changes.
 
-### What the size cap does not do
+### What the size cap does and does not do
 
-`Config.maxBody` bounds what this framework will **parse**. It is not a bound
-on what was read: `std/http` reads a `Content-Length` body with no limit of its
-own, so the bytes are already in memory before any `Ctx` exists (#4565).
+`Config.maxBody` bounds what this framework will **parse**. The read itself is
+bounded separately, by `std/http`: a `Content-Length` — or a running total of
+chunk sizes — above the server's own budget is refused before the bytes are
+read, 32 MiB by default and settable with `Server.setMaxBodyBytes` (#4565).
+So a body over the server budget is answered 400 by `std/http` and never
+reaches a `Ctx`, and a body between that budget and `maxBody` is read, then
+refused here with a 413. Set both if you want the refusal to happen before the
+allocation.
 
 ## Validating the body
 
