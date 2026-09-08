@@ -665,13 +665,25 @@ Bundle the three closures into a `Transport`.
 
 The SETTINGS a `Conn` advertises: `initialWindowSize` (the per-stream receive
 window it grants the peer), `maxFrameSize` (the largest frame payload it
-accepts), and `headerTableSize` (its HPACK dynamic-table bound). All three fields
-are exported.
+accepts), and `headerTableSize` (its HPACK dynamic-table bound) - plus
+`maxBodyBytes`, the one local limit that is not a SETTINGS parameter. All four
+fields are exported.
+
+`maxBodyBytes` is the most DATA one stream may accumulate. A frame that would
+take a stream's buffered body past it is refused before those bytes are
+appended, and the stream is reset with `errorEnhanceYourCalm` (RFC 9113 §7); the
+rest of the connection's streams carry on. It has no wire representation on
+purpose: flow control bounds bytes *in flight*, and this engine replenishes both
+windows the instant DATA lands - precisely because it buffers the whole body -
+so only a local budget bounds bytes *resident*. There is deliberately no value
+meaning "unlimited": `0` refuses every body.
 
 ### `defaultConfig(): Config`
 
-The RFC defaults: a 65535-byte initial window, a 16384-byte max frame size, and a
-4096-byte header table.
+The RFC defaults: a 65535-byte initial window, a 16384-byte max frame size, a
+4096-byte header table, and a 32 MiB per-stream body budget - the same number
+`std/http`'s `setMaxBodyBytes` setters default to, so an HTTP/2 exchange and an
+HTTP/1.1 one are bounded alike.
 
 ### `Request`
 
