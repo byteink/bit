@@ -1,0 +1,253 @@
+// pkg/web/csrf.bit — the opt-in CSRF middleware (#3948), layer two of two.
+//
+// Layer one is always on and already shipped: the session cookie carries
+// `SameSite=Lax` (session.bit's `Session.cookie`), which every current
+// browser enforces against a cross-site form POST at no cost to anyone.
+// This file is the part an app asks for, on the groups that serve HTML
+// forms:
+//
+//     let pages = app.group("/")
+//     pages.use(csrf())             // HTML forms
+//     let api = app.group("/api")   // a bearer-token API: untouched
+//
+// ## Why opt-in rather than global with exemptions
+//
+// A global check breaks every JSON client until someone finds the exemption
+// switch, and the switch people actually reach for is the app-level one. A
+// safe default that is routinely disabled wholesale is less safe than a
+// check applied deliberately to the routes that need it. There is therefore
+// no per-route exemption flag here and no global default: a group without
+// the middleware IS the exemption, and that is visible at the `use()` call
+// rather than buried in a config field.
+//
+// ## The token
+//
+// `HMAC-SHA256(Config.secret, session id)`, hex. This is the only use
+// `Config.secret` has anywhere in the framework (config.bit says so).
+//
+// It is bound to the SESSION, so a token minted for one visitor is worthless
+// to another — that is the property `_csrf` must have and a random per-form
+// nonce in a hidden field alone does not. It is derived rather than stored,
+// so it needs no second store, no expiry of its own and no cleanup: the
+// session id already has all three.
+//
+// The comparison goes through `constantTimeEq` below and never `==`. A
+// byte-by-byte early-return compare on a security token is a timing oracle
+// that lets a token be forged one byte at a time.
+//
+// ## Where a token is read from, and where it is NOT
+//
+// The `_csrf` form field, or the `X-CSRF-Token` header. NEVER the query
+// string: a URL lands in browser history, in `Referer`, in every proxy and
+// server access log, and in a screenshot — so a token accepted there is a
+// token routinely disclosed. `Ctx.query` is not called anywhere in this
+// file, which is what makes that a property of the code rather than a
+// promise in a comment.
+//
+// The body is parsed only when the request declares a form content type; a
+// JSON or multipart body is never scanned for a field it cannot contain.
+// A multipart form (a file upload) must therefore send the header — noted in
+// `csrfIsFormBody` and filed as its own ticket, since parsing multipart is a
+// parser this package does not have.
+//
+// ## The refusal
+//
+// `c.status(403)` — the status and NOTHING else: no body, no header, no
+// content type. It is built by the same call for a missing token and for a
+// wrong one, so the two responses are byte-identical and the response
+// cannot be used as an oracle for which check fired. csrf.test.bit asserts
+// that identity field by field on two real `app.handle` responses rather
+// than asserting that a body is absent.
+
+import { hmac, newSha256 } from "std/crypto"
+
+// The hidden form field an HTML form carries the token in. The de-facto
+// name; not configurable, for `sessionCookieName`'s reason — a name is not
+// a security property, and every knob is one an app must have an opinion
+// about.
+const csrfFieldName = "_csrf"
+
+// The header a fetch/XHR caller carries the token in. Matched
+// case-insensitively by `Ctx.header`, as HTTP requires.
+const csrfHeaderName = "X-CSRF-Token"
+
+// The only content type whose body is parsed for `csrfFieldName`.
+const csrfFormContentType = "application/x-www-form-urlencoded"
+
+// The status a refused request gets. One status for BOTH failures — absent
+// and wrong — through one `c.status()` call, so the two responses are the
+// same bytes and the response cannot be used as an oracle for which it was.
+// See `csrf`.
+const csrfForbidden = 403
+
+// The middleware an HTML group installs. A request that passes the check
+// goes on down the chain and this file adds nothing to its response; one
+// that fails is answered with `csrfForbidden` here and `next` is never
+// called, so the handler does not run.
+//
+// A MISCONFIGURED app panics rather than being refused: no session store
+// (`Config.sessions`) and an empty `Config.secret` are both programming
+// errors, and answering them with the same 403 a hostile request gets would
+// turn a deployment mistake into a site that is merely, silently broken.
+// This is the loudest place the failure can surface — nothing static can
+// tell whether a group is ever reached — and it is the same call this
+// package already makes for `use()` after `listen()` (app.bit) and `set()`
+// after `destroy()` (session.bit).
+//
+// A block-bodied arrow bound to an annotated `let` rather than written into
+// the `return`, for cors.bit's reason: an arrow in RETURN position is given
+// no expected type (#4513), which leaves `next` untyped and fails at
+// lowering with E0092 after `bit check` has already exited 0. Delete the
+// local when #4513 lands.
+export fn csrf(): Middleware {
+  let mw: Middleware = (c, next) => {
+    let allowed = csrfAllows(c) catch e {
+      panic("web: csrf(): ${e.message()}")
+    }
+    if (!allowed) {
+      return c.status(csrfForbidden)
+    }
+    let passed = next(c) catch e {
+      return rethrow(e)
+    }
+    return passed
+  }
+  return mw
+}
+
+// Whether this request may proceed. Fails ONLY on misconfiguration, and
+// names the `Config` field to fix — a refusal is `false`, never a failure,
+// so the two can never be confused by a caller.
+//
+// A method not in the exempt set is checked, whatever it is: `PUT`,
+// `DELETE`, `PATCH` and anything a client invents all go through the same
+// path. There is no arm here that names a method to skip.
+fn csrfAllows(c: Ctx): bool! {
+  if (csrfMethodIsExempt(c.method())) {
+    return true
+  }
+  let expected = csrfExpectedToken(c)?
+  // Either carrier is accepted; both are compared over their full length.
+  // A request that gets a match from the form field costs one comparison
+  // and one that does not costs two — a difference in the count of PUBLIC
+  // comparisons, not in where either of them stopped, and the response
+  // itself already says which way the request went.
+  if (constantTimeEq(csrfFormToken(c), expected)) {
+    return true
+  }
+  return constantTimeEq(c.header(csrfHeaderName), expected)
+}
+
+// The methods that carry no check. Exactly the three HTTP defines as safe
+// (RFC 9110 §9.2.1) and that a browser will issue cross-site without a
+// form: they are the ones a handler must not use to change state, so a
+// forged one has nothing to forge.
+//
+// Compared case-SENSITIVELY on purpose. An HTTP method is a case-sensitive
+// token (RFC 9110 §9.1), so `get` is not `GET` — it is an unregistered
+// method, and the safe reading of an unregistered method is that it is not
+// exempt.
+fn csrfMethodIsExempt(method: string): bool {
+  return method == "GET" || method == "HEAD" || method == "OPTIONS"
+}
+
+// The token this request's session must present, or a failure naming the
+// `Config` field that is missing. Never mints anything durable: `session()`
+// on a request with no cookie hands back a fresh, unsaved id whose token
+// the client cannot have known, so an unauthenticated POST is refused
+// without the store being written at all.
+fn csrfExpectedToken(c: Ctx): string! {
+  return csrfTokenOf(c.config, c.session()?)?
+}
+
+// `HMAC-SHA256(secret, session id)`, hex. The one derivation — `Ctx.
+// csrfToken` (ctx.bit) and the check above both come through here, so the
+// value a form is given and the value the check expects cannot drift.
+//
+// Hex rather than base64url so the value needs no escaping in an HTML
+// attribute, a header or a form body, and has no alphabet variant to get
+// wrong. `std/crypto`'s `hmac` is the implementation; this file hashes
+// nothing itself.
+fn csrfTokenOf(config: Config, session: Session): string! {
+  if (len(config.secret) == 0) {
+    fail newError(
+        "web: csrf(): Config.secret is empty — set it to a high-entropy value the " +
+        "app reads from its own environment, for example " +
+        "`Config{ secret: mustEnv(\"APP_SECRET\"), sessions: MemoryStore() }`. " +
+        "A CSRF token signed under an empty key is forgeable by anyone.",
+    )
+  }
+  return encodeHex(hmac(newSha256, []byte(config.secret), []byte(session.id())))
+}
+
+// The `_csrf` field of the request body, or "" when the body is not a form,
+// carries no such field, or the field is empty. Never fails: every one of
+// those is an ordinary refused request, not an error.
+fn csrfFormToken(c: Ctx): string {
+  if (!csrfIsFormBody(c.header("content-type"))) {
+    return ""
+  }
+  let fields = parseQuery(c.req.body)
+  let (v, ok) = fields[csrfFieldName]
+  if (ok) {
+    return v
+  }
+  return ""
+}
+
+// Whether `raw` — a `Content-Type` header value — declares a urlencoded
+// form. Parameters are stripped (`; charset=utf-8`) and the type is folded
+// to lower case, both of which HTTP allows a client to vary.
+//
+// `multipart/form-data` is deliberately NOT accepted: this package has no
+// multipart parser, and pretending to look for a field in a body that is
+// never read would refuse every file-upload form with no way to see why. A
+// multipart form must send `X-CSRF-Token`; parsing multipart bodies is its
+// own ticket.
+fn csrfIsFormBody(raw: string): bool {
+  let ct = toLower(trimSpace(raw))
+  let semi = indexOf(ct, ";")
+  if (semi >= 0) {
+    ct = trimSpace(ct[0:semi])
+  }
+  return ct == csrfFormContentType
+}
+
+// Constant-time string equality: the full length is always scanned, so the
+// time taken does not say WHERE two values first differed. `==` may stop at
+// the first differing byte, and that timing oracle is enough to forge a
+// token one byte at a time.
+//
+// This is `std/crypto`'s `ctEq` over `[]byte`, and csrf.test.bit asserts the
+// two agree. It is written out here rather than delegated for one reason:
+// the every-byte property is not observable from outside a function that
+// returns only a `bool`, so the loop below reports its own comparison count
+// and `constantTimeEq` discards it. That count is `len(a)` whenever the
+// lengths match, whatever the contents — which is exactly the invariant, and
+// exactly what the test asserts.
+fn constantTimeEq(a: string, b: string): bool {
+  let (equal, _) = constantTimeEqCounted(a, b)
+  return equal
+}
+
+// `(equal, bytes compared)`. The count is public information — it is
+// `len(a)` for every equal-length pair and 0 for a length mismatch, and
+// depends on nothing secret.
+//
+// The length check is the one length-dependent branch, and it leaks only a
+// length. A token's length is fixed by the hash, so an attacker learns
+// nothing from it that the algorithm did not already tell them.
+fn constantTimeEqCounted(a: string, b: string): (bool, int) {
+  let x = []byte(a)
+  let y = []byte(b)
+  if (len(x) != len(y)) {
+    return false, 0
+  }
+  let acc: byte = 0
+  let i = 0
+  while (i < len(x)) {
+    acc = acc | (x[i] ^ y[i])
+    i = i + 1
+  }
+  return acc == 0, i
+}
