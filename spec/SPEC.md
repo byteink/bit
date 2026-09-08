@@ -988,6 +988,45 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
 - Output is built as a **value**, never by string concatenation: the member
   appends into one growable `[]JsonEntry` and `jsonEncode` renders it into one
   buffer.
+
+**`jsonDecode<T>` — the reading half.**
+
+- `std/json` declares
+
+  ```
+  jsonDecode<T>(j: Json): T!
+  ```
+
+  and the compiler **specialises it per instantiation**: at `jsonDecode<User>(j)`
+  it knows `User` concretely and generates field-by-field extraction from the
+  same field list and the same key rules `@json` serializes by — names exactly
+  as written, `@key("...")` overriding, and the same accepted field types.
+- It is a **free function, not a member**: `method_decl` requires the `this`
+  receiver (§10.4) and there is no object to call a method on before the value
+  exists.
+- `T` must be a class carrying `@json`. Anything else — a class without the
+  mark, an enum, a predeclared type, a name this cannot resolve, or a call with
+  no explicit type argument — is **E0145**, naming the type and the mark. It is
+  a compile error and never a runtime failure.
+- **Every failure names the field, by its full dotted path from the decoded
+  root**: `address.postcode`, `tags[3]`, not the leaf name. Four distinct
+  causes, each carrying that path: a missing key for a non-`Option` field, a
+  type mismatch naming what was expected and what was found, an **unknown key**
+  present in the input, and nesting past the decode depth bound.
+- **An unknown key is reported, never silently ignored.** A dropped field and an
+  accepted field are indistinguishable to whoever sent the document; the caller
+  decides the policy and cannot decide one it is never told about.
+- A key that is **absent** and a key present as **`null`** both decode an
+  `Option<T>` field to `None`, and both are a missing key for a field that is
+  not an `Option`. The encoder always writes an absent `Option` as an explicit
+  `null`, so what `@json` emits decodes back; a producer that omits the key
+  instead is just as well-formed.
+- **The walk is depth-bounded.** A `@json` class may be self-referential, so
+  the depth a decode recurses to is input-controlled and is not bounded by the
+  class. Past the bound it fails with the depth cause rather than exhausting the
+  stack. The bound is enforced on the `Json` VALUE, independently of any bound
+  the parser applied to a document: `jsonDecode` takes a value, and one built
+  programmatically never went through that parser.
 - Fields are ordered; that order is the memory layout order (subject to the
   compiler's alignment padding). A method interleaved between fields does
   not affect this order or count as a field itself.
