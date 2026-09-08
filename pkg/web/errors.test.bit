@@ -332,3 +332,189 @@ test "a 304 error carries no body, HTML negotiation notwithstanding" {
     "not even the HTML type the Accept header asked for, got '${res.contentType}'",
   )
 }
+
+// --- a group's own error rendering (#3950) --------------------------------
+//
+// Every test below drives `app.handle(req)` for the same reason the mapping
+// tests above do: the renderer is chosen when the ROUTE is composed, at
+// `freeze()` (`wrapRouteErrors`, errors.bit), so calling `mappedRes` directly
+// would pass against a resolution that never runs for a real request. The two
+// registration panics live here too, next to the behaviour they protect,
+// rather than in app.test.bit — one file holds this ticket's whole proof.
+
+// The message a failing route under test raises. Distinctive, so "the group's
+// body carried it" and "the group's body did NOT carry it" are both worth
+// something.
+const onErrorCanary = "canary-order-77"
+
+// What the group's renderer prints — the status AND the message the framework
+// handed it, so a test asserts on both halves of what an error page is
+// allowed to see. One spelling, shared by the renderer and every assertion.
+fn echoBody(code: int, msg: string): string {
+  return "rendered ${code}: ${msg}"
+}
+
+// Installs that renderer on `g`. The arrow is written as an ARGUMENT here and
+// never built by a helper that RETURNS one: a closure that is a function's
+// return value cannot call anything whose callee resolves to one of its own
+// parameters (#4520, static.bit's note), and `c.text(...)` is exactly that
+// call.
+fn installEcho(g: Group) {
+  g.onError((c, e) => c.text(echoBody(e.status(), e.message())))
+}
+
+// The tree the inheritance tests share: `/pages` renders its own errors,
+// `/pages/deep` is nested under it with no renderer of its own, and `/api` is
+// a sibling with none — the three positions the ticket names, in one app, so
+// the only thing differing between the tests is the path they request.
+//
+// The renderer is installed AFTER every route is registered, which is the
+// harder order and the one the design has to survive: resolution happens at
+// `freeze()` from the route's group chain (middleware.bit's `flushPending`),
+// exactly as a late `use()` is picked up, so registration order cannot decide
+// which routes a group's error page covers.
+fn onErrorApp(sink: LogSink): App {
+  let app = adapterApp(sink)
+  let pages = app.group("/pages")
+  let deep = pages.group("/deep")
+  let api = app.group("/api")
+  pages.get("/missing", (c) => rethrow(notFound(onErrorCanary)))
+  deep.get("/missing", (c) => rethrow(notFound(onErrorCanary)))
+  api.get("/missing", (c) => rethrow(notFound(onErrorCanary)))
+  installEcho(pages)
+  freezeOrPanic(app)
+  return app
+}
+
+// Negotiation is off for the whole group, not for some statuses or some
+// headers: the four `Accept` values below are exactly the ones that make
+// `errorRes` produce three different answers (JSON, the HTML page, JSON
+// again), and all four must produce the group's body instead.
+test "a group with onError renders its handler's body whatever Accept asks for" {
+  let app = onErrorApp(newSink())
+  let accepts = []string{
+    "application/json",
+    "text/html",
+    "*/*",
+    "application/json;q=0.2, text/html;q=0.9",
+  }
+  for a of accepts {
+    let res = app.handle(acceptReq("/pages/missing", a))
+    assert(res.status == 404, "Accept '${a}': want 404, got ${res.status}")
+    assert(
+      res.body == echoBody(404, onErrorCanary),
+      "Accept '${a}': want the group's body, got '${res.body}'",
+    )
+    assert(
+      res.contentType == "text/plain; charset=utf-8",
+      "Accept '${a}': negotiation must not run at all, got '${res.contentType}'",
+    )
+  }
+}
+
+test "a nested group with no handler of its own renders with its parent's" {
+  let res = onErrorApp(newSink()).handle(acceptReq("/pages/deep/missing", "text/html"))
+
+  assert(res.status == 404, "want 404, got ${res.status}")
+  assert(
+    res.body == echoBody(404, onErrorCanary),
+    "the nested group must inherit the parent's renderer, got '${res.body}'",
+  )
+}
+
+// The control for both tests above: the renderer reaches the routes under its
+// own group and NOTHING else. A sibling that installed none still negotiates,
+// which is what makes "installing one stops negotiation" a statement about
+// that group rather than about the app.
+test "a sibling group with no handler still gets the negotiated default" {
+  let app = onErrorApp(newSink())
+
+  let json = app.handle(acceptReq("/api/missing", "application/json"))
+  assert(json.status == 404, "want 404, got ${json.status}")
+  assert(
+    json.contentType == "application/json",
+    "the sibling must still negotiate, got '${json.contentType}'",
+  )
+  assert(
+    contains(json.body, onErrorCanary) && !contains(json.body, "rendered"),
+    "want the negotiated JSON body, got '${json.body}'",
+  )
+
+  let html = app.handle(acceptReq("/api/missing", "text/html"))
+  assert(
+    html.contentType == "text/html; charset=utf-8",
+    "and it must still negotiate HTML, got '${html.contentType}'",
+  )
+}
+
+// THE SECURITY PROPERTY, under a renderer the app wrote. The handler fails
+// with an error that opted into nothing, and the renderer prints everything
+// it was given — so if the original message were reachable, this body would
+// carry it.
+test "a non-HttpError failure reaches onError as the generic 500, the original only in the log" {
+  let sink = newSink()
+  let app = adapterApp(sink)
+  let pages = app.group("/pages")
+  installEcho(pages)
+  pages.get("/boom", (c) => rethrow(PlainError{ msg: "postgres://u:p@h/db" }))
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/pages/boom"))
+
+  assert(res.status == 500, "want 500, got ${res.status}")
+  assert(
+    res.body == echoBody(500, "Internal Server Error"),
+    "the renderer must receive the generic substitute, got '${res.body}'",
+  )
+  assert(
+    !contains(res.body, "postgres://"),
+    "the original message must not be reachable from an app's error page: '${res.body}'",
+  )
+  let logged = sinkText(sink)
+  assert(
+    contains(logged, "postgres://u:p@h/db"),
+    "the real message must still be logged: '${logged}'",
+  )
+}
+
+// The positive control for the test above — the renderer CAN see a message,
+// so its absence there is the mapping and not a renderer that prints nothing.
+// It is also the status assertion: `c.text(...)` is a 200 by construction
+// (res.bit gives every `Res` a checked status), and 409 is neither that nor
+// the 500 a swallowed failure would produce.
+test "the framework sets the status on the response the handler returned" {
+  let app = adapterApp(newSink())
+  let pages = app.group("/pages")
+  installEcho(pages)
+  pages.get("/locked", (c) => rethrow(conflict("widget is locked")))
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/pages/locked"))
+
+  assert(res.status == 409, "the framework must set the mapped status, got ${res.status}")
+  assert(
+    res.body == echoBody(409, "widget is locked"),
+    "an opted-in message must reach the renderer, got '${res.body}'",
+  )
+}
+
+// --- registration ---------------------------------------------------------
+
+test "testpanic_a_second_onError_on_one_group" {
+  let app = adapterApp(newSink())
+  let pages = app.group("/pages")
+  installEcho(pages)
+  installEcho(pages)
+  print("unreachable: a second onError() was accepted\n")
+}
+
+// The group is created BEFORE the freeze on purpose: `group()` after
+// `listen()` panics too, so building it here would let this test pass on the
+// wrong panic. After this line `onError` is the only call that can abort.
+test "testpanic_onError_after_freeze" {
+  let app = adapterApp(newSink())
+  let pages = app.group("/pages")
+  freezeOrPanic(app)
+  installEcho(pages)
+  print("unreachable: onError() after freeze() was accepted\n")
+}
