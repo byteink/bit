@@ -1,0 +1,105 @@
+// pkg/web/memorystore.bit — the in-process `SessionStore` (#3947).
+//
+// It ships, and it is never the default. `App(Config{ secret: s })` has no
+// session store at all; an app gets this one only by writing
+// `Config{ secret: s, sessions: MemoryStore() }`, which is the whole design:
+// the store that leaks memory and cannot survive a second process is a
+// deliberate line in the app's own source, not something the framework
+// arranged silently.
+//
+// What it is honestly for: development, tests, and a single-process service
+// that is content to log everyone out on restart. What it is not: anything
+// with two processes in front of a load balancer. There is no sweeper —
+// entries are dropped when the id is read again after expiry, so an id that
+// is never presented again occupies its bytes until the process exits.
+// A store that must bound its own memory is a `SqlStore` or a `RedisStore`,
+// which is exactly why `SessionStore` is an interface.
+
+import { Mutex, newMutex } from "std/sync"
+import { now } from "std/time"
+
+const nsPerSecond: i64 = 1_000_000_000
+
+// One stored session. `expiresAtNs` is absolute (nanoseconds since the
+// epoch, `now().ns`) rather than a ttl plus a write time, so expiry is one
+// comparison and no arithmetic can drift between the two fields.
+class MemoryEntry {
+  data: map<string, string>,
+  expiresAtNs: i64,
+}
+
+export class MemoryStore {
+  entries: map<string, MemoryEntry>
+  // A store is shared by every request, and requests are concurrent. The
+  // map is not safe for concurrent use, so every method takes the lock —
+  // including `read`, which mutates on the expiry path.
+  mu: Mutex
+
+  init() {
+    this.entries = map<string, MemoryEntry>()
+    this.mu = newMutex()
+  }
+
+  export read(sid: string): map<string, string>! {
+    return this.readAt(sid, now().ns)
+  }
+
+  export write(sid: string, data: map<string, string>, ttl: i64): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    // The caller's map is copied, not aliased. A store is a persistence
+    // boundary: a real one serialises here, so an in-memory one that kept
+    // handing back the very map a previous request is still mutating would
+    // make `MemoryStore` behave differently from every other implementation
+    // of the interface — the one thing a dev store must not do.
+    this.entries[sid] = MemoryEntry{
+      data: copyData(data),
+      expiresAtNs: now().ns + ttl * nsPerSecond,
+    }
+  }
+
+  export destroy(sid: string): ()! {
+    this.mu.lock()
+    defer this.mu.unlock()
+    delete(this.entries, sid)
+  }
+
+  // `read` against a caller-supplied clock. Module-private: it exists so a
+  // test can prove a POSITIVE ttl really expires, deterministically, without
+  // sleeping — the only alternatives being a flaky timed test or a ttl the
+  // store was never asked to hold.
+  //
+  // An entry found expired is deleted here rather than merely reported
+  // absent: the id has just been proven dead, and this is the one moment the
+  // store is certain of it.
+  //
+  // Not fallible: an in-memory map cannot fail. `read` is, only because the
+  // interface says so for the stores that do I/O.
+  readAt(sid: string, nowNs: i64): map<string, string> {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (e, ok) = this.entries[sid]
+    if (!ok) {
+      return map<string, string>()
+    }
+    // `<=`, not `<`: a ttl of 0 means the entry is already expired at the
+    // instant it was written. That is the same rule a positive ttl obeys,
+    // one second later, rather than a special case meaning "never expires".
+    if (e.expiresAtNs <= nowNs) {
+      delete(this.entries, sid)
+      return map<string, string>()
+    }
+    return copyData(e.data)
+  }
+}
+
+// An independent copy of `m`. Maps are reference types (SPEC §13.3), so
+// without this both `write` and `read` would hand out an alias into the
+// store's own state.
+fn copyData(m: map<string, string>): map<string, string> {
+  let out = map<string, string>()
+  for (k, v) of m {
+    out[k] = v
+  }
+  return out
+}

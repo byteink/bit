@@ -1,0 +1,141 @@
+// pkg/web/memorystore.test.bit — the store's own contract (#3947), tested
+// directly against `MemoryStore` rather than through a `Ctx`: a miss is an
+// empty map and never a failure, `destroy` really removes, a positive ttl
+// really expires, and neither `write` nor `read` hands out an alias into the
+// store's own state.
+//
+// The expiry tests drive the module-private `readAt(sid, nowNs)` rather than
+// sleeping. A timed test would be both slow and flaky, and a store whose only
+// testable ttl were 0 would leave the arithmetic behind a positive one
+// unexercised — which is where an off-by-a-billion would live.
+
+fn storeData(pairs: []string): map<string, string> {
+  let m = map<string, string>()
+  let i = 0
+  while (i + 1 < len(pairs)) {
+    m[pairs[i]] = pairs[i + 1]
+    i = i + 2
+  }
+  return m
+}
+
+fn mustWrite(s: MemoryStore, sid: string, data: map<string, string>, ttl: i64) {
+  s.write(sid, data, ttl) catch e {
+    panic("write: ${e.message()}")
+  }
+}
+
+fn mustRead(s: MemoryStore, sid: string): map<string, string> {
+  return s.read(sid) catch e {
+    panic("read: ${e.message()}")
+  }
+}
+
+test "write then read round-trips every key" {
+  let s = MemoryStore()
+  mustWrite(s, "abc", storeData([]string{ "userId", "42", "theme", "dark" }), 3600)
+  let got = mustRead(s, "abc")
+  assert(len(got) == 2, "expected 2 key(s), got ${len(got)}")
+  assert(got["userId"] == "42", "userId: got '${got["userId"]}'")
+  assert(got["theme"] == "dark", "theme: got '${got["theme"]}'")
+}
+
+test "an unknown id reads as an empty map, not a failure" {
+  // A miss is the normal case on a public endpoint — a forged, expired or
+  // long-destroyed id — so it must not look like a store outage.
+  let s = MemoryStore()
+  let got = s.read("never-written") catch e {
+    panic("a miss must not fail: ${e.message()}")
+  }
+  assert(len(got) == 0, "a miss must be empty, got ${len(got)} key(s)")
+}
+
+test "destroy removes the entry, and a second destroy is not an error" {
+  let s = MemoryStore()
+  mustWrite(s, "abc", storeData([]string{ "userId", "42" }), 3600)
+  assert(len(mustRead(s, "abc")) == 1, "precondition: the entry must exist first")
+  s.destroy("abc") catch e {
+    panic("destroy: ${e.message()}")
+  }
+  assert(len(mustRead(s, "abc")) == 0, "destroy left the entry readable")
+  s.destroy("abc") catch e {
+    panic("destroying an absent id must be a no-op: ${e.message()}")
+  }
+  s.destroy("never-written") catch e {
+    panic("destroying an unknown id must be a no-op: ${e.message()}")
+  }
+}
+
+test "destroy removes only the id it names" {
+  let s = MemoryStore()
+  mustWrite(s, "a", storeData([]string{ "k", "1" }), 3600)
+  mustWrite(s, "b", storeData([]string{ "k", "2" }), 3600)
+  s.destroy("a") catch e {
+    panic("destroy: ${e.message()}")
+  }
+  assert(len(mustRead(s, "a")) == 0, "'a' should be gone")
+  assert(mustRead(s, "b")["k"] == "2", "'b' must be untouched, got '${mustRead(s, "b")["k"]}'")
+}
+
+test "a positive ttl is honoured: alive inside the window, gone past it" {
+  let s = MemoryStore()
+  let writtenAt = now().ns
+  mustWrite(s, "abc", storeData([]string{ "userId", "42" }), 60)
+
+  // Both sides, so a store that always expired — or never did — fails one.
+  let inside = s.readAt("abc", writtenAt + 59 * nsPerSecond)
+  assert(len(inside) == 1, "the entry must still be readable 59s into a 60s ttl")
+  let past = s.readAt("abc", writtenAt + 61 * nsPerSecond)
+  assert(len(past) == 0, "a 60s ttl must have expired at 61s, got ${len(past)} key(s)")
+}
+
+test "an expired entry is dropped, not merely hidden" {
+  let s = MemoryStore()
+  mustWrite(s, "abc", storeData([]string{ "userId", "42" }), 60)
+  assert(len(s.entries) == 1, "precondition: one entry")
+  s.readAt("abc", now().ns + 61 * nsPerSecond)
+  assert(len(s.entries) == 0, "the expired entry is still held: ${len(s.entries)}")
+}
+
+test "a ttl of zero is already expired when it is written" {
+  // One rule, not a special case: an entry dies at write time + ttl, and a
+  // ttl of 0 makes that instant the write itself. There is no ttl spelling
+  // that means "never".
+  let s = MemoryStore()
+  mustWrite(s, "abc", storeData([]string{ "userId", "42" }), 0)
+  assert(len(mustRead(s, "abc")) == 0, "a ttl of 0 must not be readable")
+}
+
+test "write copies the caller's map instead of aliasing it" {
+  let s = MemoryStore()
+  let data = storeData([]string{ "userId", "42" })
+  mustWrite(s, "abc", data, 3600)
+  // Maps are reference types (SPEC §13.3). A store that kept the caller's
+  // map would let a later mutation rewrite history — and would behave
+  // differently from every store that serialises, which is the one thing a
+  // dev store must not do.
+  data["userId"] = "99"
+  assert(mustRead(s, "abc")["userId"] == "42", "the write aliased the caller's map")
+}
+
+test "read hands back a copy, so a caller cannot mutate the store through it" {
+  let s = MemoryStore()
+  mustWrite(s, "abc", storeData([]string{ "userId", "42" }), 3600)
+  let got = mustRead(s, "abc")
+  got["userId"] = "99"
+  assert(mustRead(s, "abc")["userId"] == "42", "read handed out an alias into the store")
+}
+
+test "a second write to the same id replaces the entry and refreshes the window" {
+  let s = MemoryStore()
+  let t0 = now().ns
+  mustWrite(s, "abc", storeData([]string{ "userId", "42" }), 60)
+  mustWrite(s, "abc", storeData([]string{ "theme", "dark" }), 3600)
+  let got = mustRead(s, "abc")
+  assert(len(got) == 1, "the second write must replace, not merge: ${len(got)} key(s)")
+  assert(got["theme"] == "dark", "theme: got '${got["theme"]}'")
+  assert(
+    len(s.readAt("abc", t0 + 61 * nsPerSecond)) == 1,
+    "the second write must refresh the expiry window",
+  )
+}
