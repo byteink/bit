@@ -32,7 +32,12 @@
 //    denotes, so two DIFFERENT `gc_alloc` instructions return two DIFFERENT
 //    objects. Nothing derived — not a `bitcast` of an allocation, not a value
 //    read back out of one — qualifies; the test is literally "is this value id
-//    the result of a `gc_alloc` instruction" (`storeBaseIsFresh`).
+//    the result of a `gc_alloc` instruction" (`storeBaseIsFresh`). A
+//    `make_closure` result is an equally fresh object and is deliberately still
+//    NOT accepted: no IR anywhere emits a `field_set` through a closure cell —
+//    its two words are written by the backend inside `emitMakeClosure`, never
+//    as an instruction — so the table can never hold an entry based on one, and
+//    widening the test would add a branch that no program reaches.
 //
 //    #4413 filed this as "let StoreTable hold several bases, because a store
 //    through base X cannot be ANSWERED by a load through base Y". That argument
@@ -55,24 +60,30 @@
 //    an invariant the tree already stakes correctness on. Reusing it means an
 //    op added later is a barrier here the day it lands rather than silently
 //    transparent, and there is no second table to drift out of step with the
-//    first. Exactly three members are excluded, each accounted for:
+//    first. Exactly four members are excluded, each accounted for:
 //    `field_set`, which rules 1 and 2 invalidate precisely; `index_get`, a LOAD
 //    whose only effect is a bounds-check panic, and a panic does not return;
-//    and `gc_alloc`, which invalidates partially — see below.
+//    and `gc_alloc` and `make_closure`, which invalidate partially — see below.
 //
-// `make_closure` is therefore a barrier. `gc_alloc` is the third exception and
-// is a PARTIAL one: it drops every entry whose base is not an allocation this
-// function made, and keeps the rest (`storeTableCollect`).
+// Those last two are `opAllocatesFresh`, and both are PARTIAL barriers: each
+// drops every entry whose base is not an allocation this function made, and
+// keeps the rest (`storeTableCollect`).
 //
-// ## Why a `gc_alloc` does not have to drop an entry based on an allocation
+// ## Why an ALLOCATION does not have to drop an entry based on an allocation
 //
 // NOT because the collector is non-moving. That is a runtime property
 // (runtime/ABI.md:865), it is exactly the kind of thing a pass must not
 // silently depend on, and this pass does not: the argument below holds for a
 // relocating collector too.
 //
+// It has two halves, and an op needs both. The first is that the op writes no
+// slot this table can hold an entry for; `opAllocatesFresh` is where that is
+// argued per op, and it is the half `make_closure` was assumed to fail (#4421).
+// The second is the collection, below, which is the same for either op because
+// both are safepoints (`isSafepointOp`, compiler/codegenlive.bit:315).
+//
 // Take an entry `A[o] = v` where `A` is the result of a `gc_alloc` in this
-// function, and a collection at a later `gc_alloc`. For the forwarded program
+// function, and a collection at a later allocation. For the forwarded program
 // to differ from the un-forwarded one, the collection would have to leave the
 // slot `A[o]` denoting something other than what `v` denotes. It cannot:
 //
@@ -89,14 +100,18 @@
 //     have broken the UN-forwarded program, whose later `field_get A[o]` and
 //     whose other uses of `v` must agree.
 //
+// A `make_closure` whose `lhs` IS such an `A` — `let g = p.get`, whose closure
+// environment is the receiver itself (compiler/lowerfuncval.bit:430) — changes
+// nothing here. The cell records the pointer; it does not write through it.
+//
 // So forwarding across an allocation introduces no failure mode the program
 // does not already have. What is dropped instead is every entry whose base this
 // pass did not watch being allocated — a parameter, a field read, anything
 // reached from outside — because for those the first bullet is not available
 // and the blast radius is not worth the reload.
 //
-// `gc_alloc` stays in `isSideEffecting`, so DCE still never deletes one and
-// optalloc.bit still owns the only removal path.
+// `gc_alloc` and `make_closure` both stay in `isSideEffecting`, so DCE still
+// never deletes either and optalloc.bit still owns the only removal path.
 //
 // ## What it deliberately does not do
 //
@@ -207,13 +222,28 @@ fn storeTableCollect(f: IrFunc, t: StoreTable) {
   t.n = w
 }
 
+// The two ops whose entire memory effect lands in an object they themselves
+// allocated at that instruction, so neither can write a slot that any base in
+// this table denotes. `gc_alloc` writes nothing at all. `make_closure`
+// allocates the {code, env} cell and writes its two words — `storeImm(...,
+// cell, 0, 8)` and `storeImm(..., cell, 8, 8)` in `emitMakeClosure`
+// (compiler/arm64call.bit:351, compiler/x64value.bit:245) — and `cell` is the
+// value the instruction DEFINES, which no earlier SSA value can name. Its
+// `lhs` (the env, a receiver, or nil) is read, not written: `instrOperands`
+// (compiler/opt.bit:337) files `Op.MakeClosure` with `field_get` and
+// `slice_len` as a pure `[ins.lhs]` reader. Both therefore invalidate
+// PARTIALLY, via `storeTableCollect` — see the header.
+fn opAllocatesFresh(op: Op): bool {
+  return op == Op.GcAlloc || op == Op.MakeClosure
+}
+
 // Rule 3: the ops this pass refuses to look through. `isSideEffecting` minus
-// the three members it can account for exactly — see the header. Deriving it
+// the four members it can account for exactly — see the header. Deriving it
 // rather than listing it is the point: a new op that writes memory must join
 // `isSideEffecting` or DCE would already delete it, and joining it makes it a
 // barrier here for free.
 fn opClobbersFieldSlots(op: Op): bool {
-  return isSideEffecting(op) && op != Op.FieldSet && op != Op.IndexGet && op != Op.GcAlloc
+  return isSideEffecting(op) && op != Op.FieldSet && op != Op.IndexGet && !opAllocatesFresh(op)
 }
 
 // Answers one `field_get` from the table when a preceding store proves the
@@ -280,7 +310,7 @@ fn forwardBlockStores(f: IrFunc, fwd: []int, bi: int) {
       forwardOneSliceLen(f, t, fwd, idx)
     } else if (ins.op == Op.FieldSet) {
       storeTableStore(f, t, ins.lhs, ins.ival, ins.rhs)
-    } else if (ins.op == Op.GcAlloc) {
+    } else if (opAllocatesFresh(ins.op)) {
       storeTableCollect(f, t)
     } else if (opClobbersFieldSlots(ins.op)) {
       storeTableClear(t)
