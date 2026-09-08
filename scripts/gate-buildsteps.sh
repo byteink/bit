@@ -255,7 +255,19 @@ case "${BUCKET}" in
     # is in the selfhost/runtime/stdlib buckets above — without it here, a
     # pkg/**-only diff that added an 800+-line file would pass this scoped
     # bucket and only fail the full suite.
-    BUILD_STEPS=(test-packages test-lint-sweep)
+    #
+    # test-fmt (#4477) is the second exception, and the same shape: its argv
+    # (tools/build/gatestable2.bit:116-118) literally names
+    # `"${repoRoot()}/pkg"` alongside stdlib and examples, both of whose
+    # buckets already carry it. Without it here, an unformatted file added in
+    # a pkg/**-only diff passed this scoped bucket and failed only in the
+    # integrator's pre-push suite. Nothing mechanical could catch this before
+    # #4477: test-fmt declares its scope as bare argv path literals, which
+    # neither assert_dirgates_current() (greps `runArgs("...")`) nor
+    # assert_envscoped_gates_current() (greps `BIT_*_TREES=`) reads —
+    # assert_argvliteral_gates_current() (scripts/gate-envscope.sh) is the
+    # third assertion, added by that ticket, that does.
+    BUILD_STEPS=(test-packages test-lint-sweep test-fmt)
     ;;
   spec)
     BUILD_STEPS=(test-spec)
