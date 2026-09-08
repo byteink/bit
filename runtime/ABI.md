@@ -3221,6 +3221,19 @@ bit_rt_net_read(fd, max)        -> str   // up to max bytes; parks. "" at end of
 bit_rt_net_write(fd, s)         -> n     // all of s (retried internally). -1 on error
 ```
 
+**THE PEER ADDRESS IS A PORT-LEVEL PRIMITIVE, NOT AN ABI ENTRY POINT (#4525).**
+`bit_rt_port_net_peer_ip(fd: i64) -> i64` — the connected peer's IPv4 address,
+packed first octet in the high byte (127.0.0.1 is `0x7F000001`), or `-1` for
+every "there is no peer": an unconnected or listening socket (ENOTCONN), a
+closed one (EBADF), and a peer whose family is not AF_INET (the four bytes at
+`sin_addr` mean something else in every other family, so it is checked rather
+than assumed). Bound as `getpeername(2)` in all three providers —
+`runtime/net/{darwin,linux,windows}/sock.bit` — rather than captured in the
+accept loop, whose `sockaddr` out-parameter stays NULL: per fd, so
+`bit_rt_net_accept` above is unchanged and a DIALED socket answers too. There
+is no `bit_rt_net_peer_ip` yet and nothing the compiler emits reaches this
+symbol; #4526 adds the ABI wrapper and the `std/net` surface over it.
+
 **UDP** (connectionless). `recv` records the sender in per-OS module state,
 **one `[4]i64` sockaddr and one valid flag PER WORKER** (fixed by #3272) —
 `udpSenderBuf`/`udpSenderValid` (`runtime/net/linux/netabi.bit:407-408`;
