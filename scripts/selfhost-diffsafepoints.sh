@@ -125,6 +125,204 @@ if [ "$st_seed" = "x" ] || [ "$st_self" = "x" ] || [ "$st_seed" -lt 1 ] || [ "$s
 fi
 echo "self-test: plain-loop safepoint count — seed=$st_seed self=$st_self"
 
+# =============================================================================
+# DECLARED-SIGNATURE SCORING FOR AN EXTRA-SAFEPOINT DIVERGENCE (#4552)
+# =============================================================================
+#
+# WHY THIS EXISTS. The oracle is the pinned stage0 -- an EARLIER RELEASE of this
+# same compiler -- so an intentional lowering improvement that lands after the
+# pin reddens this differential by construction until the next repin. #4500 is
+# the first one that reaches SAFEPOINT counts: it made a tuple's SPEC 13.4 zero
+# value a live record at the three sites that still handed back a null, and one
+# of those three is `[]T(n)`, whose fill (`fillZeroElems`,
+# compiler/lowerslicefill.bit) is a LOOP -- and a loop back edge carries a poll
+# (`emitsBackEdgePoll`, compiler/codegen.bit). The pinned 0.12.0 stage0 emits no
+# fill loop for a tuple element at all, so it emits no poll either.
+#
+# Measured on _tests_/cases/run_tuple_zero_field.bit at 9807df02, both objects
+# built by this script's own `sites()` and read with the same `objdump -r`:
+#
+#   ORACLE (0.12.0)  1 site, _sliceForms+0x6bc, immediately after
+#                    _bit_rt_slice_append -- the source-level
+#                    `while (k < 4000) { junk = append(junk, k) }` loop.
+#   BIT2             4 sites, all four in _sliceForms:
+#                      +0x0a4  after slice_new + gc_alloc + slice_set
+#                              -> the fill loop for `let xs = [](i64,i64)(2)`
+#                      +0x508  the same shape -> `let ys = [](i64,i64)(n)`
+#                      +0x6dc  after slice_new + FOUR gc_allocs + slice_set
+#                              -> `let ds = []((i64,i64),P,E)(2)`, whose element
+#                              zero value recurses into the nested tuple, `P`
+#                              and the boxed `E`
+#                      +0x81c  after _bit_rt_slice_append -- the SAME loop the
+#                              oracle's one site is.
+#
+# Three of the four are polls on fill loops #4500 legitimately added; the fourth
+# is the one both compilers emit. `let empty = [](i64,i64)(0)` adds nothing:
+# `isStaticEmptyAlloc` (#3648) elides that allocation entirely, so there is no
+# fourth fill loop -- checked, not assumed (three `slice_new` calls in BIT2's
+# `_sliceForms`, three fill loops, three extra polls).
+#
+# WHY NOT A PER-FILE SKIP LIST. This family had one and #1883 deleted it, "so a
+# known difference could be written down instead of fixed": a filename names a
+# file and then accepts anything it does next. This is the mechanism #3125/#3132
+# put in its place (scripts/selfhost-ir-signatures.sh) -- a DECLARED SIGNATURE,
+# an identity the divergence must satisfy, recomputed from both compilers'
+# output on every run, so a second, unrelated divergence landing on the same
+# file still fails. It lives here rather than in selfhost-ir-signatures.sh
+# because that file scores IR-TEXT deltas for the two IR differentials and is
+# 783 lines against this repo's 800-line ceiling, while this one scores an
+# OBJECT-level count against an IR delta, which neither of its callers asks
+# for. If a second consumer ever appears, move it there.
+#
+# THE IDENTITY, read off the loop `fillZeroElems` actually emits and checked
+# against the POST-opt dump (`--dump-ir`), because post-opt IR is what codegen
+# turns into the object the counts come from:
+#
+#   d = self - seed                        extra polls. Must be > 0: a MISSING
+#                                          safepoint starves the collector
+#                                          (ABI.md 5) and is NEVER explained.
+#   N = delta(rt_call slice_set)           fill loops added -- `fillZeroElems`
+#                                          emits exactly one per loop.
+#   require N == d                         every extra poll is a fill loop's,
+#                                          and every added loop accounts for one
+#   require delta(icmp_slt) == N           one loop-header comparison per loop
+#   require delta(rt_call slice_new) == 0  the loops FILL slices that already
+#                                          existed; none allocates a new one
+#   require delta(tuple-typed gc_alloc) >= N
+#                                          each added loop materializes at least
+#                                          one TUPLE record. This is what makes
+#                                          the signature #4500's rather than
+#                                          "any new fill loop". It is a
+#                                          DIRECTIONAL check, not an equation:
+#                                          the count per loop is element-type
+#                                          dependent (1 for `(i64,i64)`, 2 for
+#                                          `((i64,i64),P,E)`).
+#
+# Measured post-opt deltas on that fixture: d=3, slice_set 0->3, icmp_slt 2->5,
+# slice_new 3->3, tuple gc_alloc 2->20. `br` and `jump` are deliberately NOT in
+# the identity: they move by +7 and +10 on this file because #4500's OTHER two
+# sites (a class's tuple field, a map miss) add control flow of their own that
+# has nothing to do with a back edge.
+#
+# THIS RETIRES ITSELF AT THE NEXT REPIN. Once stage0 is repinned to a release
+# cut from a tree carrying #4500, the oracle emits the same fill loops, the
+# delta goes to zero and this signature stops matching anything. Delete it then,
+# exactly as scripts/selfhost-diffall.absent's header says of its own entries.
+
+# explainSafepointDelta <oracle_ir_text> <bit2_ir_text> <seed_count> <self_count>
+# Prints the name of the registered signature that explains the divergence and
+# returns 0, or prints nothing and returns 1 if none does. Takes TEXT rather
+# than a filename so the self-check below can drive it with real dump excerpts.
+explainSafepointDelta() {
+  awk -v seed="$3" -v self="$4" '
+    function score(arr, line) {
+      if (line ~ /rt_call slice_set\(/) { arr["slice_set"]++; return }
+      if (line ~ /rt_call slice_new\(/) { arr["slice_new"]++; return }
+      if (line ~ /= icmp_slt /)         { arr["icmp_slt"]++;  return }
+      # A gc_alloc renders its result TYPE last: `%13 = gc_alloc size=16 ptrs=[]
+      # (i64, i64)`. A tuple type is the only one that is itself parenthesised,
+      # so a trailing `(...)` after the ptrs list is exactly a tuple-typed
+      # allocation -- `ptrs=[%8] P` and `ptrs=[%8] E` are not.
+      if (line ~ /= gc_alloc .*ptrs=\[[^]]*\] \(.*\)$/) { arr["tuple_alloc"]++ }
+    }
+    BEGIN { split("", a); split("", b) }
+    side == 0 && $0 == "@@@BIT2@@@" { side = 1; next }
+    side == 0 { score(a, $0); next }
+    { score(b, $0) }
+    END {
+      d = self - seed
+      N = b["slice_set"] - a["slice_set"]
+      if (d <= 0)                                  { exit 1 }
+      if (N != d)                                  { exit 1 }
+      if (b["icmp_slt"] - a["icmp_slt"] != N)      { exit 1 }
+      if (b["slice_new"] - a["slice_new"] != 0)    { exit 1 }
+      if (b["tuple_alloc"] - a["tuple_alloc"] < N) { exit 1 }
+      print "4500-tuple-slice-fill"
+      exit 0
+    }
+  ' <(printf '%s\n@@@BIT2@@@\n%s\n' "$1" "$2")
+}
+
+# --- self-test: prove the signature REFUSES, not only accepts -----------------
+# A signature that explained everything would be the mute button #1883 deleted,
+# and a green run under it would be vacuous exactly as a zero-counting objdump
+# makes the self-test above vacuous. Table-driven: the accepting row is real
+# `--dump-ir` text from _tests_/cases/run_tuple_zero_field.bit (registers
+# renumbered, nothing else changed), and every refusing row is that same text
+# with exactly ONE fact changed.
+sig_oracle='%3 = rt_call slice_new(%0, %0, %1, %2) [](i64, i64)'
+sig_bit2='%3 = rt_call slice_new(%0, %0, %1, %2) [](i64, i64)
+  jump bb1(%3, %0, %4)
+bb1(%6: [](i64, i64), %7: i64, %8: i64):
+  %9 = icmp_slt bool %8, %7
+  br %9, bb2(), bb3(%6)
+bb2():
+  %13 = gc_alloc size=16 ptrs=[] (i64, i64)
+  field_set %13[0] = %11
+  %16 = const_int i64 8
+  %17 = rt_call slice_set(%6, %8, %13, %16) void
+  jump bb1(%6, %7, %19)'
+sig_no_header=$(printf '%s\n' "$sig_bit2" | grep -v 'icmp_slt')
+sig_extra_new=$(printf '%s\n%s\n' "$sig_bit2" '  %20 = rt_call slice_new(%0, %0, %1, %2) [](i64, i64)')
+sigfail=0
+# $1=expected signature ("" = must refuse)  $2=name  $3=oracle text
+# $4=bit2 text  $5=seed  $6=self
+sigcheck() {
+  local want=$1 name=$2 got rc
+  got=$(explainSafepointDelta "$3" "$4" "$5" "$6")
+  rc=$?
+  if [ "$got" != "$want" ]; then
+    echo "FATAL: signature self-test '$name': got '$got' (rc=$rc), want '$want'" >&2
+    sigfail=1
+    return
+  fi
+  if [ -z "$want" ] && [ "$rc" -eq 0 ]; then
+    echo "FATAL: signature self-test '$name': refused but returned rc=0" >&2
+    sigfail=1
+  fi
+}
+sigcheck "4500-tuple-slice-fill" "one added fill loop, one extra poll" \
+  "$sig_oracle" "$sig_bit2" 1 2
+sigcheck "" "a MISSING safepoint is never explained" \
+  "$sig_oracle" "$sig_bit2" 2 1
+sigcheck "" "an equal count is not a divergence to explain" \
+  "$sig_oracle" "$sig_bit2" 1 1
+sigcheck "" "two extra polls for one added fill loop" \
+  "$sig_oracle" "$sig_bit2" 1 3
+sigcheck "" "a fill loop with no header comparison" \
+  "$sig_oracle" "$sig_no_header" 1 2
+sigcheck "" "an extra slice_new alongside the fill" \
+  "$sig_oracle" "$sig_extra_new" 1 2
+sigcheck "" "an extra poll with no fill loop at all" \
+  "$sig_oracle" "$sig_oracle" 1 2
+if [ "$sigfail" -ne 0 ]; then
+  echo "FATAL: the declared-signature table is broken; EXPLAINED would be meaningless." >&2
+  exit 2
+fi
+echo "self-test: declared-signature table — 1 accepted, 6 refused"
+
+# safepointSignature <file> <seed_count> <self_count>
+# Dumps both compilers' POST-opt IR for one diverging file and asks the
+# signature table about it. Prints the signature name, or nothing when the
+# divergence is unexplained OR either dump could not be produced -- an
+# undecidable dump must fail the file, never excuse it.
+sig_cap_oracle="$tmp/sig.oracle"
+sig_cap_bit2="$tmp/sig.bit2"
+safepointSignature() {
+  local rc
+  alarmrun_retry_cap ORACLE "" "$sig_cap_oracle" "$ORACLE" --dump-ir "$1"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    return 1
+  fi
+  alarmrun_retry_cap BIT2 "" "$sig_cap_bit2" "$BIT2" --dump-ir "$1"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    return 1
+  fi
+  explainSafepointDelta "$(cat "$sig_cap_oracle")" "$(cat "$sig_cap_bit2")" "$2" "$3"
+}
+
 # --- the differential ---------------------------------------------------------
 # A timeout is not evidence, the same reasoning selfhost-diffdump.sh's header
 # carries for its own ORACLE/BIT2 timeouts: a build killed by the alarm
@@ -149,7 +347,7 @@ echo "self-test: plain-loop safepoint count — seed=$st_seed self=$st_self"
 # exactly the old priority -- only the amount of BIT2 work done on files
 # ORACLE cannot build changes (from zero to one attempt, run in parallel with
 # ORACLE's own failure rather than after it).
-match=0 mismatch=0 skip=0 timeout=0
+match=0 mismatch=0 explained=0 skip=0 timeout=0
 total=$(find stdlib examples _tests_/cases _tests_/stress -name '*.bit' | wc -l | tr -d ' ')
 for f in $(find stdlib examples _tests_/cases _tests_/stress -name '*.bit' | sort); do
   sites "$ORACLE" "$f" "$tmp/a.o" >"$tmp/s.out" &
@@ -171,8 +369,18 @@ for f in $(find stdlib examples _tests_/cases _tests_/stress -name '*.bit' | sor
   if [ "$s" = "$b" ]; then
     match=$((match + 1))
   else
-    mismatch=$((mismatch + 1))
-    echo "SAFEPOINT DIVERGENCE  seed=$s self=$b  $f"
+    # A raw count divergence is not automatically a regression: check it
+    # against the declared-signature table above before scoring it, the same
+    # order selfhost-diffruntime.sh checks its own IR mismatches in. Only an
+    # UNEXPLAINED divergence fails the gate.
+    sig=$(safepointSignature "$f" "$s" "$b")
+    if [ -n "$sig" ]; then
+      explained=$((explained + 1))
+      echo "SAFEPOINT DIVERGENCE EXPLAINED  seed=$s self=$b  $f  (signature '$sig')"
+    else
+      mismatch=$((mismatch + 1))
+      echo "SAFEPOINT DIVERGENCE  seed=$s self=$b  $f"
+    fi
   fi
 done
 
@@ -180,8 +388,8 @@ done
 # explicitly so a TIMEOUT>0 run cannot be misread as full coverage: MATCH=N
 # alone looks identical whether N is the whole corpus or the corpus minus
 # whatever timed out (#3689).
-compared=$((match + mismatch + skip))
-echo "safepoint differential: MATCH=$match MISMATCH=$mismatch SKIP(does not build alone)=$skip TIMEOUT=$timeout  compared=$compared/$total corpus files ($((compared + timeout))/$total accounted for)"
+compared=$((match + mismatch + explained + skip))
+echo "safepoint differential: MATCH=$match MISMATCH=$mismatch EXPLAINED=$explained SKIP(does not build alone)=$skip TIMEOUT=$timeout  compared=$compared/$total corpus files ($((compared + timeout))/$total accounted for)"
 
 # =============================================================================
 # PHASE 2 — the LINKED EXECUTABLE path (#1461)
