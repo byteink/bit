@@ -105,6 +105,115 @@ is a constant expression - see [Fields that are themselves a
 class](#fields-that-are-themselves-a-class) below, whose rule this does not
 change. Trait fields ([Traits](traits.md)) carry no default either.
 
+## Field attributes {#field-attributes}
+
+A field may carry attributes, written above it one per line. **An attribute is
+sugar for a call to an ordinary fallible function**, found by ordinary name
+lookup. The attribute name is the function name, the field's value is the first
+argument, and the attribute's own arguments follow.
+
+```bit
+class lengthError {
+  text: string
+  message(): string { return this.text }
+}
+
+fn min(s: string, n: int): ()! {
+  if (len(s) < n) {
+    fail lengthError{ text: "too short" }
+  }
+}
+
+fn max(s: string, n: int): ()! {
+  if (len(s) > n) {
+    fail lengthError{ text: "too long" }
+  }
+}
+
+class NewUser {
+  @min(3)
+  @max(200)
+  name: string
+}
+```
+
+`@min(3)` on `name` means `min(this.name, 3)?`. Because any class with at least
+one attributed field gets a synthesized member
+
+```bit ignore
+validateFields(): ()!
+```
+
+running those calls in declaration order, checking a value is one call:
+
+```bit
+fn check(u: NewUser): ()! {
+  u.validateFields()?
+}
+```
+
+The calls run fields top to bottom, attributes top to bottom within a field,
+each propagating with `?` - so the first failure is the one you get.
+`validateFields` is an ordinary exported member: callable from another module,
+testable, and listed by `bit doc`.
+
+There is **no registry and no plugin hook**. Any module that exports
+`fn iban(s: string): ()!` makes `@iban` work wherever it is imported, with no
+compiler change, and a misspelled `@emial` is the ordinary "undefined name"
+error.
+
+### The function an attribute names
+
+It must be `fn name(v: T, ...): ()!`:
+
+- **fallible** - an attribute reports by failing (`E0133` otherwise);
+- **yielding unit** - its value is discarded (`E0134` otherwise);
+- its **first parameter** must take the field's type (`E0135` otherwise).
+
+Arguments are constant expressions, the same restriction a
+[default value](#field-defaults) carries.
+
+### `validateFields` is not `validate`
+
+The name is deliberate. Cross-field rules - "B is required only when A is set" -
+cannot be expressed as a per-field attribute, so they go in a hand-written
+`validate()`, and the two are meant to compose:
+
+```bit
+class Signup {
+  @min(3)
+  name: string
+
+  password: string
+  confirm: string
+
+  validate(): ()! {
+    if (this.password != this.confirm) {
+      fail lengthError{ text: "passwords differ" }
+    }
+  }
+}
+
+fn checkSignup(s: Signup): ()! {
+  s.validateFields()?
+  s.validate()?
+}
+```
+
+A class that declares `validateFields` itself is an error naming both (`E0132`)
+- one name, one definition.
+
+### Where attributes are not allowed
+
+Attributes on a class **method** are rejected (`E0131`): a method has no value
+to pass. Trait fields ([Traits](traits.md)) carry none.
+
+Function attributes (`@naked`, `@nosplit`, `@symbol`) are a different feature
+that shares the spelling. Those three are compiler-known, are never resolved
+through name lookup, and any other name on a `fn` is an error - there is no
+function called `naked` anywhere. Field attributes are the exact opposite: the
+compiler knows none of them by name.
+
 ## Readonly fields {#readonly-fields}
 
 A field marked `readonly` may be set only in a composite literal, or inside
