@@ -1,0 +1,347 @@
+// compiler/classfieldattr.bit — field attributes (SPEC §10.5, #3879).
+//
+//     class NewUser {
+//       @min(3)
+//       @max(200)
+//       name: string
+//
+//       @email
+//       email: string
+//     }
+//
+// An attribute on a field is SUGAR FOR A CALL to an ordinary fallible
+// function, resolved by normal name lookup: `@email` on field `email` becomes
+// `email(this.email)?`, `@max(200)` on `name` becomes `max(this.name, 200)?`.
+// There is no registry, no plugin hook and no compiler-known list — any module
+// that exports `fn iban(s: string): ()!` makes `@iban` work, and `@emial` is
+// the ordinary E0040 undefined name.
+//
+// This file does two things:
+//
+//  1. SYNTHESIS (`injectFieldValidators`), a tree mutation run from
+//     resolveProject before any Checker exists, exactly where checktrait.bit's
+//     `use` injection runs and for the same reason: a method spliced in before
+//     resolve is resolved, checked, lowered, mangled and reported on by `bit
+//     doc` as one the class wrote itself, so none of those passes needs to
+//     know this feature exists. It is deliberately named `validateFields`, not
+//     `validate` — a hand-written `validate()` is how cross-field rules are
+//     expressed and the two must COMPOSE, not collide.
+//
+//  2. VALIDATION (`vClassFieldAttrs`), a Checker-time arena walk that says
+//     what is wrong with the named function in the attribute's own terms.
+//     Without it the desugaring's fallout is all a reader gets: "cannot use
+//     '?' on a non-fallible expression" pointing at source nobody wrote.
+//
+// THE SYNTHETIC NAMES. An identifier's text in this AST is a slice of the
+// module source (`identText`), so a name that appears nowhere in the source
+// cannot be spelled by any node — and `validateFields` and `this` are exactly
+// that. `appendSynthNames` therefore appends those two words to the module's
+// own source, once, and points the two synthetic Ident nodes at them. Appending
+// at the TAIL is what makes it safe: every existing span keeps its meaning, the
+// text is added after parsing so no lexer ever sees it, and `bit fmt` never
+// runs this pass at all. No diagnostic can land on either span — the only nodes
+// carrying them are the method's name and the receiver reference, and every
+// other node this file builds (including all of the call arguments) is stamped
+// with the real span of the attribute or field it came from.
+//
+// A CLASS THAT DECLARES `validateFields` ITSELF is an error naming both
+// (E0132), and synthesis is skipped for that class — one declaration, one
+// definition.
+
+// E0132 (§10.5): the class already declares the member synthesis would add.
+const ecValidateFieldsDeclared = 132
+
+// E0133/E0134/E0135 (§10.5): the three ways the function an attribute names can
+// be the wrong SHAPE. An unknown name is not among them — that is the ordinary
+// E0040 the synthesized call already reports, at the attribute's own span,
+// which is the whole point of resolving through normal name lookup.
+const ecFieldAttrNotFallible = 133
+const ecFieldAttrResultNotUnit = 134
+const ecFieldAttrParamMismatch = 135
+
+// The member `validateFields` is synthesized under, and the two words that
+// have to exist in the module source for it to be spellable.
+const synthValidateFieldsName = "validateFields"
+const synthReceiverName = "this"
+
+// ---- shared accessors ------------------------------------------------------
+
+// A field node's attribute list (`Tag.AttrList`), or 0. The 4th kid is always
+// present on a field the parser built (parsertype.bit's `parseField`); the
+// length test covers a `Tag.Field` reached before that kid existed, which is
+// what keeps this total for every one of `structFieldNodes`' readers.
+fn fieldAttrList(t: Tree, field: int): int {
+  let k = kidsOf(t, field)
+  if (len(k) <= 3) {
+    return 0
+  }
+  return k[3]
+}
+
+// One field's attributes in declaration order, empty when it carries none.
+fn fieldAttrs(t: Tree, field: int): []int {
+  let list = fieldAttrList(t, field)
+  if (list == 0) {
+    return []int(0)
+  }
+  return kidsOf(t, list)
+}
+
+// The `Tag.Field` a class member is, seeing through an `export` wrapper, or 0
+// for any other member kind.
+fn memberField(t: Tree, member: int): int {
+  let m = member
+  if (m != 0 && getNode(t, m).tag == Tag.Export) {
+    m = kidsOf(t, m)[0]
+  }
+  if (m != 0 && getNode(t, m).tag == Tag.Field) {
+    return m
+  }
+  return 0
+}
+
+// ---- synthesis -------------------------------------------------------------
+
+// One class that needs a synthesized `validateFields`, plus the two spans its
+// synthetic Ident nodes read their text from.
+class AttrClass {
+  classNode: int,
+  className: int,
+  classGenerics: int,
+}
+
+// Where `appendSynthNames` put the two words, so every node built below can
+// point at them without threading four integers through each helper.
+class SynthNames {
+  file: int,
+  method: Span,
+  receiver: Span,
+}
+
+// Appends `validateFields this` to the module's own source and returns the two
+// spans. Called once per module, and only when a class in it actually carries a
+// field attribute, so a module that uses none is byte-identical to before.
+//
+// Safe because it is a pure TAIL append: no existing offset moves, parsing is
+// already finished so no lexer sees it, and the one reader that could be
+// surprised by an offset past the last file — `locate` (diagnostics.bit) — has
+// clamped since the loader started joining a module's files with a separator
+// newline that belongs to no file.
+fn appendSynthNames(m: SrcModule, file: int): SynthNames {
+  let base = len(m.source)
+  m.source = m.source + synthValidateFieldsName + " " + synthReceiverName
+  let methodEnd = base + len(synthValidateFieldsName)
+  return SynthNames{
+    file: file,
+    method: Span{ file: file, start: base, end: methodEnd },
+    receiver: Span{
+      file: file, start: methodEnd + 1,
+      end: methodEnd + 1 + len(synthReceiverName),
+    },
+  }
+}
+
+// Every class in the module with at least one attributed field, in declaration
+// order. Mirrors checktrait.bit's `collectClassUseSites` — same walk over the
+// program's top-level declarations, same `export` unwrapping.
+fn collectAttrClasses(tree: Tree): []AttrClass {
+  let out = []AttrClass(0)
+  let decls = kidsOf(tree, tree.root)
+  let i = 0
+  while (i < len(decls)) {
+    let d = decls[i]
+    if (d != 0 && getNode(tree, d).tag == Tag.Export) {
+      d = kidsOf(tree, d)[0]
+    }
+    if (d != 0 && getNode(tree, d).tag == Tag.StructDecl) {
+      let k = kidsOf(tree, d)
+      if (len(attributedFields(tree, k[2])) != 0) {
+        out = append(
+          out,
+          AttrClass{ classNode: d, className: k[0], classGenerics: k[1] },
+        )
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// A class body's attributed fields, in declaration order — the order §10.5
+// requires the synthesized calls to run in.
+fn attributedFields(tree: Tree, fieldList: int): []int {
+  let members = kidsOf(tree, fieldList)
+  let out = []int(0)
+  let i = 0
+  while (i < len(members)) {
+    let f = memberField(tree, members[i])
+    if (f != 0 && len(fieldAttrs(tree, f)) != 0) {
+      out = append(out, f)
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// The class's own `validateFields` member, or 0. Reads the LAST match for the
+// same reason classinit.bit's `classInitDecl` does: a duplicate leaves the last
+// declaration as the one every later pass registered.
+fn declaredValidateFields(tree: Tree, source: string, fieldList: int): int {
+  let members = kidsOf(tree, fieldList)
+  let found = 0
+  let i = 0
+  while (i < len(members)) {
+    let m = members[i]
+    if (getNode(tree, m).tag == Tag.Export) {
+      m = kidsOf(tree, m)[0]
+    }
+    if (getNode(tree, m).tag == Tag.FuncDecl) {
+      let nameNode = kidsOf(tree, m)[1]
+      if (identText(tree, source, nameNode) == synthValidateFieldsName) {
+        found = nameNode
+      }
+    }
+    i = i + 1
+  }
+  return found
+}
+
+// `attr(this.field, extraArgs...)?` as one expression statement. Every node
+// carries a REAL span — the attribute's for the call and the `?`, the field's
+// for the receiver access — so a diagnostic the ordinary checker raises on the
+// desugaring still points at the line the reader wrote. The one exception is
+// the `this` reference itself, which has no source to point at.
+fn synthAttrCall(tree: Tree, source: string, ctx: SynthNames, c: SynthCall): int {
+  let attrSpan = getNode(tree, c.attr).span
+  let fieldSpan = getNode(tree, c.fieldName).span
+  let ak = kidsOf(tree, c.attr) // [name, arg...]
+  let recv = addLeaf(tree, Tag.Ident, ctx.receiver)
+  let member = addNode(
+    tree, Tag.Member, fieldSpan, 0,
+    [recv, addLeaf(tree, Tag.Ident, fieldSpan)],
+  )
+  let argNodes = [addNode(tree, Tag.Arg, fieldSpan, 0, [member])]
+  let i = 1
+  while (i < len(ak)) {
+    // Cloned, not shared: the attribute list stays in the tree under the field,
+    // and one node reachable by two paths is a shape no other pass here builds.
+    let cloned = cloneWithSelf(tree, source, ak[i], attrSpan)
+    argNodes = append(argNodes, addNode(tree, Tag.Arg, getNode(tree, ak[i]).span, 0, [cloned]))
+    i = i + 1
+  }
+  let args = addNode(tree, Tag.Args, attrSpan, 0, argNodes)
+  let callee = addLeaf(tree, Tag.Ident, getNode(tree, ak[0]).span)
+  let call = addNode(tree, Tag.Call, attrSpan, 0, [callee, 0, args])
+  let try = addNode(tree, Tag.TryExpr, attrSpan, 0, [call])
+  return addNode(tree, Tag.ExprStmt, attrSpan, 0, [try])
+}
+
+// The (attribute, field name) pair `synthAttrCall` desugars, bundled to keep
+// that function at LINT.md's max-params=5.
+class SynthCall {
+  attr: int,
+  fieldName: int,
+}
+
+// The whole `export fn (this: C) validateFields(): ()! { ... }` declaration for
+// one class, as a top-level `Tag.Export`-wrapped func_decl with a receiver —
+// the identical shape an in-body method (parsertype.bit's parseMethodMember)
+// and an injected trait method (checktrait.bit's cloneTraitMethod) both
+// produce, which is why every pass that discovers a method by walking the arena
+// for func_decl-with-receiver picks this up with no change at all.
+//
+// Always `export`ed: a class carrying validation attributes exists to be
+// validated by whoever constructs it, and a construction site is routinely in
+// another module. `collectMethodExports` (checkbind.bit) reads exactly this
+// wrapper.
+fn synthValidateFields(tree: Tree, source: string, ctx: SynthNames, ac: AttrClass): int {
+  let classSpan = getNode(tree, ac.className).span
+  let fields = attributedFields(tree, kidsOf(tree, ac.classNode)[2])
+  let stmts = []int(0)
+  let i = 0
+  while (i < len(fields)) {
+    let fname = kidsOf(tree, fields[i])[0]
+    let attrs = fieldAttrs(tree, fields[i])
+    let j = 0
+    while (j < len(attrs)) {
+      stmts = append(
+        stmts,
+        synthAttrCall(tree, source, ctx, SynthCall{ attr: attrs[j], fieldName: fname }),
+      )
+      j = j + 1
+    }
+    i = i + 1
+  }
+  let generics = 0
+  if (ac.classGenerics != 0) {
+    generics = dupGenericParamsTree(tree, ac.classGenerics)
+  }
+  let recv = addNode(
+    tree, Tag.Receiver, classSpan, 0,
+    [0, traitClassTypeRef(tree, ac.className, ac.classGenerics)],
+  )
+  let result = addNode(
+    tree, Tag.Fallible, classSpan, 0,
+    [addNode(tree, Tag.VoidType, classSpan, 0, []int(0)), 0],
+  )
+  let decl = addNode(
+    tree, Tag.FuncDecl, classSpan, 0,
+    [
+      recv, addLeaf(tree, Tag.Ident, ctx.method), generics,
+      addNode(tree, Tag.Params, classSpan, 0, []int(0)), result,
+      addNode(tree, Tag.Block, classSpan, 0, stmts),
+    ],
+  )
+  return addNode(tree, Tag.Export, classSpan, 0, [decl])
+}
+
+// Synthesis for one already-parsed module, mutating its tree and its source in
+// place before resolve ever sees either. Runs from `injectFieldValidators`
+// below, itself called from resolveProject right after trait injection — after,
+// so a trait field spliced into this class's field list is already there (it
+// can carry no attributes of its own; §10.7's `trait_field` production has
+// none, so this is about seeing the FINAL member list, not about finding more
+// work).
+fn injectFieldValidatorsInModule(m: SrcModule, diags: Diagnostics) {
+  let classes = collectAttrClasses(m.tree)
+  if (len(classes) == 0) {
+    return
+  }
+  let file = getNode(m.tree, classes[0].className).span.file
+  let ctx = appendSynthNames(m, file)
+  let newDecls = []int(0)
+  let i = 0
+  while (i < len(classes)) {
+    let ac = classes[i]
+    let own = declaredValidateFields(m.tree, m.source, kidsOf(m.tree, ac.classNode)[2])
+    if (own != 0) {
+      let cname = identText(m.tree, m.source, ac.className)
+      report(
+        diags, ecValidateFieldsDeclared, getNode(m.tree, own).span,
+        "class '${cname}' declares 'validateFields', which its attributed fields already synthesize",
+        "rename this method, or drop the field attributes on '${cname}' and call them yourself",
+      )
+    } else {
+      newDecls = append(newDecls, synthValidateFields(m.tree, m.source, ctx, ac))
+    }
+    i = i + 1
+  }
+  attachNewDecls(m.tree, newDecls)
+}
+
+// Entry point, called from resolveProject (checkproject.bit) immediately after
+// `injectTraits` and for the identical reason: every front end (check / build /
+// bit doc / the LSP) reaches the checker through there, and this has to have
+// happened before a Checker captures the module's source.
+//
+// Spans are MODULE-GLOBAL here, as they are in `injectTraits`, so the same
+// `remapDiags` call has to follow — without it E0132 renders against file 0.
+fn injectFieldValidators(p: Project) {
+  let i = 0
+  while (i < len(p.mods)) {
+    let before = len(p.diags.list)
+    injectFieldValidatorsInModule(p.mods[i], p.diags)
+    remapDiags(p.diags, before, p.mods[i].files, p.mods[i].fileStarts)
+    i = i + 1
+  }
+}
