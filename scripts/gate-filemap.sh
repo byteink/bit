@@ -292,6 +292,10 @@ gates_for_file() {
     # test-stress-batch deliberately excluded — see the header comment above
     # gates_for_file() (#3319/#3309).
     _tests_/bit/stress/*) printf 'test-stress-exclusive\n'; return 0 ;;
+    # #4426 split this from a single file (_tests_/bit/stringexplode.bit, 771
+    # lines) to a directory module — the container fixtures needed a sibling,
+    # and a single-file gate target never loads one (#4441).
+    _tests_/bit/stringexplode/*) printf 'test-string-explode\n'; return 0 ;;
     _tests_/bit/stwwiring/*) printf 'test-stwwiring\n'; return 0 ;;
     _tests_/bit/testtimeout/*) printf 'test-timeout\n'; return 0 ;;
     # #3039. Not `runArgs()`-registered — it is a plain data file the
