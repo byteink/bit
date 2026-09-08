@@ -3035,11 +3035,17 @@ type_assert = "." "(" type ")" .
 The two-result form is valid only as the sole right-hand side of a declaration or
 assignment (like the map/channel two-result forms).
 
-- The target must be a **class** type. Only classes carry methods (§10.4), so
-  only a class can be the dynamic type behind an interface value.
-- A target that cannot satisfy the interface is a **compile-time error**: the
-  assertion could never succeed, so it is rejected rather than left to report
-  `false` forever.
+- The target is a **class** type or another **interface** type.
+  - A class target asks whether the dynamic type IS that class — only a class
+    can be the dynamic type behind an interface value (§10.4, §14.3).
+  - An interface target asks whether the dynamic type **satisfies** that
+    interface, by the same structural rule as any other interface conversion
+    (§14.3): `ok` is true when the concrete type's method set carries every
+    method the target declares. An interface declaring no methods is satisfied
+    by every non-nil value.
+- A target that cannot satisfy the receiver's interface is a **compile-time
+  error**: the assertion could never succeed, so it is rejected rather than left
+  to report `false` forever.
 - On a mismatch the two-result form yields `(nil, false)` — `nil`, not the
   un-narrowed receiver. The value is typed as the target, so returning the
   receiver would let a caller that ignores `ok` read one concrete type as
