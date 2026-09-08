@@ -101,9 +101,71 @@ fn digitsAt(s: string, start: int): int {
   return v
 }
 
+// This benchmark's own deadline, deliberately well INSIDE `bit test`'s 30s
+// per-test bound (`defaultTestTimeoutMs`, compiler/testrun.bit) so THIS one
+// always fires first. The old inner bounds (60s for the build, 30s for the
+// run) were both >= the outer bound and therefore unreachable: the harness
+// killed the process at 30s and reported `FAIL ... (timed out)`, which is
+// the flake #4549 closes.
+//
+// WHAT THE BUDGET IS SPENT ON, and why it is not the compile. Measured on
+// this box under #4484: the `bit build` of a fixture this size is ~0.5s and
+// the fixture's own run is milliseconds — but macOS charges a provenance
+// scan on the FIRST `execve` of a newly written executable, serialized
+// system-wide, timed at 16.2s (a `cp` of an already-scanned binary) to
+// 32.7s under fleet load, and at 18-23ms for the same files a second time.
+// This test body writes TWO fresh executables, `bench.sh` and the fixture,
+// so it pays that tax twice. Two is the floor: `osRunBounded` takes a path
+// and no argv (runtime/ABI.md §19), so the script cannot be avoided, and
+// the fixture binary is the thing being measured. The test binary's own
+// third scan is no longer charged here at all — `runModuleTests` pays it
+// before test 0 as of #4557.
+//
+// So a skip is expected on a loaded box and is a PASS, not a failure: the
+// alternative is the outer bound firing and reporting a defect that is not
+// there. 12000 is the same budget `pkg/web/node.test.bit` carries for the
+// same two-exec shape (#4484), and leaves 18s of the outer bound spare.
+const benchBudgetMs: int = 12000
+
+// `osRunBounded`'s deadline outcome (runtime/ABI.md §19): the child's whole
+// process group was SIGKILLed at the deadline. Distinct from every exit
+// code, so it is the one result that means "the box was too slow", not
+// "the code under test is wrong".
+const benchTimedOut: int = 0 - 2
+
+// Either outcome of one attempt: `objects` when the fixture was measured,
+// or a non-empty `skip` line explaining why it was not. A skip is a pass —
+// same contract as `locateBit()` returning an empty location.
+class BenchResult {
+  objects: int,
+  elapsedMs: int,
+  skip: string,
+}
+
+// Build and run as ONE child: `set -e` makes a failed build the script's
+// exit status, and the marker file written between the two halves is what
+// tells the two phases apart afterwards without a second taxed exec.
+fn benchScript(loc: BitLocation, dir: string, prog: string): string {
+  return "#!/bin/sh\nset -e\nBIT_STDLIB='${loc.stdlib}'\nexport BIT_STDLIB\n" +
+    "'${loc.bin}' build '${dir}/fixture.bit' -o '${prog}'\n" +
+    ": > '${dir}/built'\n" +
+    "BIT_GC_STATS=1\nexport BIT_GC_STATS\n" +
+    "exec '${prog}' > '${dir}/out.txt' 2> '${dir}/err.txt'\n"
+}
+
+// Which half the single child was in when it was killed — the marker file
+// `benchScript` writes between them is the only evidence left.
+fn benchPhase(dir: string): string {
+  if (exists("${dir}/built")) {
+    return "running the fixture"
+  }
+  return "compiling the fixture"
+}
+
 // Builds and runs the fixture with `BIT_GC_STATS=1`, returning its
-// `swept+live` object count.
-fn buildAndMeasureAlloc(loc: BitLocation): int {
+// `swept+live` object count — or a skip line when the child did not finish
+// inside `benchBudgetMs`.
+fn buildAndMeasureAlloc(loc: BitLocation): BenchResult {
   let dir = scratchDir("bench")
   mkdir(dir) catch e {
     panic("bench: mkdir ${dir}: ${e.message()}")
@@ -112,17 +174,20 @@ fn buildAndMeasureAlloc(loc: BitLocation): int {
     panic("bench: write fixture.bit: ${e.message()}")
   }
   let prog = "${dir}/fixture"
-  let buildScript = "#!/bin/sh\nset -e\nBIT_STDLIB='${loc.stdlib}'\nexport BIT_STDLIB\n" +
-    "'${loc.bin}' build '${dir}/fixture.bit' -o '${prog}'\n"
-  let buildCode = shellRun("${dir}/build.sh", buildScript, 60000)
-  if (buildCode != 0) {
-    panic("bench: building the fixture exited ${buildCode} — see ${dir}")
+  let started = timeUnixNs()
+  let code = shellRun("${dir}/bench.sh", benchScript(loc, dir, prog), benchBudgetMs)
+  let elapsedMs = (timeUnixNs() - started) / 1000000
+  if (code == benchTimedOut) {
+    return BenchResult{
+      objects: 0,
+      elapsedMs: elapsedMs,
+      skip: "${benchPhase(dir)} did not finish within this benchmark's " +
+        "${benchBudgetMs}ms budget (a loaded box charges macOS's first-exec provenance " +
+        "scan on the fresh script and the fresh fixture binary) — not measured",
+    }
   }
-  let runScript = "#!/bin/sh\nBIT_GC_STATS=1\nexport BIT_GC_STATS\n" +
-    "exec '${prog}' > '${dir}/out.txt' 2> '${dir}/err.txt'\n"
-  let runCode = shellRun("${dir}/run.sh", runScript, 30000)
-  if (runCode != 0) {
-    panic("bench: running the fixture exited ${runCode} — see ${dir}")
+  if (code != 0) {
+    panic("bench: ${benchPhase(dir)} exited ${code} — see ${dir}")
   }
   let err = readFile("${dir}/err.txt") catch _ {
     ""
@@ -132,7 +197,7 @@ fn buildAndMeasureAlloc(loc: BitLocation): int {
   if (swept < 0 || live < 0) {
     panic("bench: no 'swept=N live=N' summary in ${dir}/err.txt (got: ${err})")
   }
-  return swept + live
+  return BenchResult{ objects: swept + live, elapsedMs: elapsedMs, skip: "" }
 }
 
 test "compressing 100KB reports its allocation count" {
@@ -144,15 +209,22 @@ test "compressing 100KB reports its allocation count" {
     )
     return
   }
-  let objects = buildAndMeasureAlloc(loc)
-  println("compress bench: gzip(100KB text, level=6) allocated ${objects} objects (swept+live)")
-  assert(objects > 0, "compress bench: expected at least one allocation, got ${objects}")
+  let r = buildAndMeasureAlloc(loc)
+  if (len(r.skip) > 0) {
+    println("compress bench: ${r.skip} (gave up after ${r.elapsedMs}ms)")
+    return
+  }
+  println(
+      "compress bench: gzip(100KB text, level=6) allocated ${r.objects} objects " +
+      "(swept+live), compiled and run in ${r.elapsedMs}ms of a ${benchBudgetMs}ms budget",
+  )
+  assert(r.objects > 0, "compress bench: expected at least one allocation, got ${r.objects}")
   // Generous on purpose (observed ~75 on 2026-09-04) — this is a
   // regression tripwire against an accidental per-byte or per-token
   // allocation creeping into the hot path, not a tight pin.
   assert(
-    objects < 5000,
-      "compress bench: ${objects} objects for a 100KB input looks like a regression " +
+    r.objects < 5000,
+      "compress bench: ${r.objects} objects for a 100KB input looks like a regression " +
       "(expected roughly constant per block, not per byte or per token)",
   )
 }
