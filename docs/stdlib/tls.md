@@ -1628,6 +1628,19 @@ The peer's certificate chain as raw DER, end-entity first - the server's chain o
 a client connection, empty on a server connection (client certificates are not
 requested).
 
+### `TlsConn.peerIp(): string!`
+
+The peer's IPv4 address in dotted quad, straight off the TCP socket underneath -
+`std/net`'s [`Conn.peerIp`](net.md), forwarded so a caller holding only a
+`TlsConn` can name the client without reaching into this type. Nothing about it
+is TLS-specific: it is the kernel's view of the transport, unrelated to the
+handshake or the certificates above. `std/http`'s HTTPS server uses it to fill
+`Request.peer`.
+
+Fails, rather than returning a placeholder, whenever there is no peer to name - a
+closed connection, a peer that hung up hard, or a peer whose address family is
+not AF_INET. See `Conn.peerIp` for the exact cases.
+
 ```bit
 import { dial, listen, newTlsConfig, newTrustStore, emptyTrustStore } from "std/tls"
 
