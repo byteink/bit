@@ -35,6 +35,66 @@ fn layoutFields(fc: FnCtx, fieldTypes: []int): StructLayout {
   }
 }
 
+// The two halves of a closure's declared result as its own FnCtx carries them:
+// the ok and err types of a `T!E`, or 0 when the result is not fallible.
+//
+// A closure written against `(T) => R!E` IS fallible, and `fail`/`?` inside it
+// lower against ITS pair, not the enclosing function's (#4504). Both were
+// pinned at 0, which was consistent only while the validator refused both
+// operators inside any arrow: `lowerFail` then published through
+// `boxErrForSlot(_, _, 0)` and returned `zeroValue(_, 0, _)`, so the first
+// `fail` in a closure segfaulted in `e.message()` — the #4475 shape one level
+// down. Written as two predicates rather than one tuple-returning call because
+// a multi-value return allocates a box (ABI.md §1.1) on a path every closure
+// takes.
+fn fallibleOkOf(c: Checker, t: int): int {
+  if (t != 0 && c.ctx.types[t].kind == TypeKind.Fallible) {
+    return c.ctx.types[t].result
+  }
+  return 0
+}
+
+fn fallibleErrOf(c: Checker, t: int): int {
+  if (t != 0 && c.ctx.types[t].kind == TypeKind.Fallible) {
+    return c.ctx.types[t].errTy
+  }
+  return 0
+}
+
+// A `=> { … }` closure body that falls off the end. Mirrors lowerFuncNamed's
+// fall-through epilogue: the body owes its own defers the same as an explicit
+// `return` does (lowerStmt's ReturnStmt path already calls this), and a
+// closure has no @naked attribute, so that guard does not apply here.
+//
+// A fall-through carries no value, so it is always the ok path and owes
+// `clearErr` exactly as `()!` does in lowerFuncNamed (§11.6) — no failure can
+// be in flight, since `fail` and the `?` error path both terminate the block
+// themselves (#4504).
+fn closureFallThrough(cfc: FnCtx) {
+  if (cfc.terminated) {
+    return
+  }
+  runDefers(cfc)
+  if (cfc.fallibleErr != 0) {
+    clearErr(cfc)
+  }
+  builderEmit(cfc.b, mkInstr(Op.Ret, cfc.c.ctx.voidId))
+}
+
+// A `=> expr` closure body: the expression IS the return value. The error-slot
+// rule is the block form's `return` rule (`retClearsErr`, lowerfunc.bit) — a
+// non-fallible body is the ok value of a `T!E` arrow and owes the slot a
+// clear, a fallible one is being forwarded and must not (#4504).
+fn closureExprReturn(cfc: FnCtx, body: int, resultTy: int) {
+  let v = lowerExprH(cfc, body, resultTy)
+  if (retClearsErr(cfc, nodeType(cfc, body))) {
+    clearErr(cfc)
+  }
+  let rt = mkInstr(Op.Ret, cfc.c.ctx.voidId)
+  rt.args = [v]
+  builderEmit(cfc.b, rt)
+}
+
 // Synthesizes a closure function `closure$<fid>(env, params) { body }`: the body
 // reads its captures from the env object (word i) and its params from block
 // params. Returns the FuncId (post-order: nested closures get lower ids). Appends
@@ -48,6 +108,8 @@ fn lowerClosureBody(
 ): int {
   let k = kidsOf(fc.c.tree, node)
   let ft = fc.c.ctx.types[closureTy]
+  let fallibleOk = fallibleOkOf(fc.c, ft.result)
+  let fallibleErr = fallibleErrOf(fc.c, ft.result)
   let b = newBuilder()
   let entry = builderNewBlock(b)
   builderBeginBlock(b, entry)
@@ -58,7 +120,7 @@ fn lowerClosureBody(
     c: fc.c, b: b, env: []LocalBind(0), failed: false,
     failSpan: pointSpan(0, 0), failReason: "", terminated: false,
     loops: []LoopFrame(0), moduleConsts: fc.moduleConsts, lowerer: fc.lowerer, defers: []DeferCall(0),
-    fallibleOk: 0, fallibleErr: 0, genEnv: fc.genEnv, resultTy: ft.result,
+    fallibleOk: fallibleOk, fallibleErr: fallibleErr, genEnv: fc.genEnv, resultTy: ft.result,
     boxedNames: fc.boxedNames,
   }
   let envParam = builderAddParam(b, closureTy)
@@ -114,21 +176,9 @@ fn lowerClosureBody(
     // and owns its own defers, replayed at ITS OWN return below.
     deferPreScan(cfc, body)
     lowerStmtList(cfc, body)
-    if (!cfc.terminated) {
-      // Mirror lowerFuncNamed's fall-through epilogue: a closure body that
-      // falls off the end owes its own defers the same as an explicit
-      // `return` does (lowerStmt's ReturnStmt path already calls this). A
-      // closure has no @naked attribute and cfc.fallibleErr is always 0
-      // (see FnCtx construction above), so neither the isNaked guard nor
-      // the clearErr call applies here.
-      runDefers(cfc)
-      builderEmit(b, mkInstr(Op.Ret, fc.c.ctx.voidId))
-    }
+    closureFallThrough(cfc)
   } else {
-    let v = lowerExprH(cfc, body, ft.result)
-    let rt = mkInstr(Op.Ret, fc.c.ctx.voidId)
-    rt.args = [v]
-    builderEmit(b, rt)
+    closureExprReturn(cfc, body, ft.result)
   }
   builderEndBlock(b)
   if (cfc.failed) {
@@ -146,7 +196,13 @@ fn lowerClosureBody(
       blocks: b.blocks,
       instrs: b.instrs,
       keepAlive: b.keepAlive,
-      isFallible: false,
+      // #4504: a closure with a `fail`/`?` in it publishes through the error
+      // slot and returns early, so it must be OPAQUE to the two passes that
+      // read this — `optinline`'s `g.isFallible` bail (optinline.bit:207) and
+      // `optclosure`'s devirtualizer (optclosure.bit:472). Splicing that
+      // control flow into a caller that is not itself fallible is the whole
+      // reason both passes ask.
+      isFallible: cfc.fallibleErr != 0,
       isNaked: false,
       isNosplit: false,
       inRootModule: fc.lowerer.curModule == fc.lowerer.root,
