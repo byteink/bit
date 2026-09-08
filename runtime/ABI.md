@@ -337,6 +337,7 @@ address codegen materializes from the `type_info` IR op (the same
 bit_rt_iface_as(recv: ref, want: usize) -> ref        // recv on match, else null
 bit_rt_iface_as_ok() -> bool                          // ok of the iface_as just before it
 bit_rt_iface_assert(recv: ref, want: usize) -> ref    // panics on mismatch
+bit_rt_iface_has(recv: ref, id: usize) -> ref         // recv if its type has method `id`, else null
 ```
 
 - `want` is a `*const TypeInfo` passed as a plain integer: the descriptor lives
@@ -362,6 +363,18 @@ bit_rt_iface_assert(recv: ref, want: usize) -> ref    // panics on mismatch
   audit and §5's note on what adjacency does and does not buy.
 - `bit_rt_iface_assert` names both types in its panic message; the descriptors
   already carry them.
+- `bit_rt_iface_has` (#4512) is the INTERFACE-target assertion `iface.(I)`,
+  where the question is not descriptor identity but whether the dynamic type's
+  method set satisfies `I` (SPEC §14.3/§14.4). `id` is the `bit_rt_iface_lookup`
+  dispatch id (§2.1) of ONE method of `I`; the answer for the whole set is built
+  by **chaining**: lowering emits one call per method of `I`, feeding each
+  result into the next, so a miss anywhere yields null and every later call
+  misses too. It writes the same per-task `ok` slot `bit_rt_iface_as` writes, so
+  the last call in the chain leaves the conjunction there and `bit_rt_iface_as_ok`
+  reads it under the same adjacency rule. Null on a miss for the reason above,
+  sharpened: the result is typed `I`, so returning the un-narrowed receiver
+  would let a caller that ignores `ok` dispatch a method the object does not
+  have, and `bit_rt_iface_lookup` answers that with 0 — a call to address 0.
 
 ### 2.3 `string` value, and shared-backing views (`s[lo:hi]`)
 

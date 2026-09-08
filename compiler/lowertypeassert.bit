@@ -1,0 +1,169 @@
+// compiler/lowertypeassert.bit — every lowering of `iface.(T)` (SPEC §14.4),
+// moved out of lowerexpr.bit by #4512 and joined there by the INTERFACE-target
+// form that ticket added. Sibling of lowerexpr.bit: same module, so this needs
+// no imports and no call-site changes.
+//
+// Two shapes, two kinds of target:
+//
+//   let x       = iface.(T)   panics on a mismatch   `lowerTypeAssert`
+//   let (x, ok) = iface.(T)   yields (nil, false)    `lowerTypeAssertTwo`
+//
+//   T a CLASS     — one pointer compare against T's `TypeInfo` descriptor,
+//                   `bit_rt_iface_as{,_ok}` / `bit_rt_iface_assert` (ABI.md
+//                   §2.2): descriptor identity IS type identity.
+//   T an INTERFACE — `ok` is "the dynamic type's method set satisfies T", which
+//                   is what a structural interface assertion means (§14.3), so
+//                   there is no single descriptor to compare against. One
+//                   `bit_rt_iface_has` per method of T, chained
+//                   (`lowerIfaceNarrow`). Before #4512 this shape passed the
+//                   checker and then failed to lower at all (E0092).
+
+// The dispatch ids of `iface`'s methods — `methodId`'s ids (lower.bit), the
+// same ones `Op.CallIface` emits, so a hit here is exactly a method the
+// receiver can dispatch. Empty for an interface that declares no methods.
+//
+// The predeclared `error` (§10.6) has no declaration for `vIfaceMethodNames`
+// to walk, so its one method is named here by hand — checkmodule.bit registers
+// `error.message` by hand for the same reason.
+fn ifaceAssertMethodIds(fc: FnCtx, iface: int): []int {
+  let names = vIfaceMethodNames(fc.c, iface)
+  if (len(names) == 0 && iface == fc.c.ctx.errorId) {
+    names = ["message"]
+  }
+  let out = []int(0)
+  for m of names {
+    out = append(out, methodId(fc.lowerer, m))
+  }
+  return out
+}
+
+// `iface.(I)` narrowed to the interface `I`: the receiver, or null when its
+// dynamic type does not satisfy `I`. One `bit_rt_iface_has` per method of `I`,
+// each taking the previous call's result — a miss anywhere nulls the value and
+// every later call misses too, so THE CHAIN IS THE CONJUNCTION and the last
+// call leaves it in the per-task `ok` slot `bit_rt_iface_as_ok` reads (ABI.md
+// §2.2). Nothing may be emitted between that last call and the `ok` read; both
+// callers below honour it.
+//
+// An interface with no methods emits no call at all and the receiver IS the
+// answer: every value carrying a dynamic type satisfies an empty method set.
+fn lowerIfaceNarrow(fc: FnCtx, recv: int, iface: int, ids: []int): int {
+  let v = recv
+  for id of ids {
+    let mi = mkInstr(Op.ConstInt, primType(fc.c.ctx, 3))
+    mi.ival = id
+    let has = mkInstr(Op.RtCall, iface)
+    has.name = "iface_has"
+    has.args = [v, builderEmit(fc.b, mi)]
+    v = emitRtCall(fc, has)
+  }
+  return v
+}
+
+// Lowers the one-result assertion `iface.(T)` (SPEC §14.4): the receiver, then
+// `T`'s TypeInfo descriptor, then `rt_call iface_assert(recv, info) T` — which
+// panics on a mismatch. The two-result form `(v, ok) = iface.(T)` routes through
+// the assign path instead (`lowerTypeAssertTwo`).
+fn lowerTypeAssert(fc: FnCtx, node: int): int {
+  let kids = kidsOf(fc.c.tree, node)
+  let ty = nodeType(fc, node)
+  let recv = lowerExpr(fc, kids[0])
+  if (fc.failed) {
+    return 0
+  }
+  if (fc.c.ctx.types[ty].kind == TypeKind.Interface) {
+    return lowerIfaceAssertOne(fc, recv, ty)
+  }
+  let info = lowerTypeInfo(fc, ty, getNode(fc.c.tree, node).span)
+  if (fc.failed) {
+    return 0
+  }
+  let ins = mkInstr(Op.RtCall, ty)
+  ins.name = "iface_assert"
+  ins.args = [recv, info]
+  return emitRtCall(fc, ins)
+}
+
+// The one-result form with an INTERFACE target: narrow, then panic where the
+// narrowing missed. `bit_rt_iface_assert` cannot serve — it compares against
+// ONE descriptor, and "satisfies `I`" is not one type — so the panic is emitted
+// here instead, reaching the same `bit_rt_panic` (exit 2, §18.4) and opening
+// with the same "type assertion failed:" the runtime's own message does
+// (`ifaceAssertWrite`, runtime/root/{darwin,linux}/io.bit). It cannot name the
+// dynamic type the way that message does: the check is a method-set test, so
+// there is no descriptor in hand to read a name out of.
+fn lowerIfaceAssertOne(fc: FnCtx, recv: int, iface: int): int {
+  let v = lowerIfaceNarrow(fc, recv, iface, ifaceAssertMethodIds(fc, iface))
+  let cond = neNil(fc, v, iface)
+  let bad = builderNewBlock(fc.b)
+  let ok = builderNewBlock(fc.b)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = cond
+  br.ival = ok
+  br.ival2 = bad
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, bad)
+  emitIfaceAssertPanic(fc, iface)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, ok)
+  return v
+}
+
+// The panic block of `lowerIfaceAssertOne`, out of line so that function stays
+// one straight read.
+fn emitIfaceAssertPanic(fc: FnCtx, iface: int) {
+  let msg = mkInstr(Op.ConstString, primType(fc.c.ctx, 11))
+  msg.sval = "type assertion failed: the dynamic type does not satisfy ${typeName(fc.c.ctx, iface)}"
+  msg.ival = internPoolString(fc, msg.sval)
+  let pn = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+  pn.name = "panic"
+  pn.args = [builderEmit(fc.b, msg)]
+  emitRtCall(fc, pn)
+  builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
+}
+
+// The two-result form `(v, ok) = iface.(T)`, dispatched from `lowerTwoResult`
+// (lowerexpr.bit) — which owns the OTHER two-result forms and the rule they
+// share: the `ok` comes from a call reporting the immediately preceding one
+// (ABI.md §2.2/§11), so the pair is emitted back to back.
+fn lowerTypeAssertTwo(fc: FnCtx, node: int, valTy: int): []int {
+  let recv = lowerExpr(fc, kidsOf(fc.c.tree, node)[0])
+  if (fc.failed) {
+    return []int(0)
+  }
+  if (fc.c.ctx.types[valTy].kind == TypeKind.Interface) {
+    return lowerIfaceAssertTwo(fc, recv, valTy)
+  }
+  let info = lowerTypeInfo(fc, valTy, getNode(fc.c.tree, node).span)
+  if (fc.failed) {
+    return []int(0)
+  }
+  let av = mkInstr(Op.RtCall, valTy)
+  av.name = "iface_as"
+  av.args = [recv, info]
+  let v = emitRtCall(fc, av)
+  let okI = mkInstr(Op.RtCall, primType(fc.c.ctx, 10))
+  okI.name = "iface_as_ok"
+  return [v, emitRtCall(fc, okI)]
+}
+
+// The two-result form with an INTERFACE target.
+//
+// With no method to test, `ok` is a NULL TEST rather than a call: every value
+// carrying a dynamic type satisfies an empty method set, an interface value is
+// either nil or a class instance (`vStorableInInterface`, validate.bit), and on
+// `!ok` the value is then already nil — which is exactly the `(nil, false)`
+// §14.4 requires of a mismatch.
+fn lowerIfaceAssertTwo(fc: FnCtx, recv: int, valTy: int): []int {
+  let ids = ifaceAssertMethodIds(fc, valTy)
+  let v = lowerIfaceNarrow(fc, recv, valTy, ids)
+  if (len(ids) == 0) {
+    return [v, neNil(fc, v, valTy)]
+  }
+  let okI = mkInstr(Op.RtCall, primType(fc.c.ctx, 10))
+  okI.name = "iface_as_ok"
+  return [v, emitRtCall(fc, okI)]
+}
