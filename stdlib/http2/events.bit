@@ -243,6 +243,45 @@ fn h2connDataStreamOk(st: h2connState, streamId: int): bool {
   return true
 }
 
+// Whether `n` more body bytes fit stream `s`'s remaining budget, resetting the
+// stream with ENHANCE_YOUR_CALM itself when they do not (#4590).
+//
+// ENHANCE_YOUR_CALM (RFC 9113 §7) and not FLOW_CONTROL_ERROR: the peer has
+// honoured every window we advertised — we replenish them on arrival because we
+// buffer everything — so blaming flow control would be a lie about what it did.
+// It is generating more load than we will process, which is what 0xb says. A
+// stream error and not a connection error: one oversized body is that stream's
+// fault, and the other streams multiplexed over the same connection are not.
+//
+// Written as a subtraction, never `len(s.recvBody) + n > st.maxBodyBytes`:
+// `len(s.recvBody)` is never above `st.maxBodyBytes` (this check is what keeps
+// it there), so the left side cannot overflow, while the addition can for a
+// length near the top of the i64 range and would then compare as negative —
+// i.e. the obvious spelling is the bypass.
+fn h2connBodyBudgetOk(st: h2connState, s: h2connStream, n: int): bool {
+  if (n > st.maxBodyBytes - len(s.recvBody)) {
+    let msg = "http2: body exceeds ${st.maxBodyBytes} bytes"
+    h2connStreamErrorMsg(st, s.id, errorEnhanceYourCalm, msg)
+    return false
+  }
+  return true
+}
+
+// We buffer the whole body, so the bytes are "consumed" the instant they land;
+// replenish both windows and tell the peer with WINDOW_UPDATE so it may send on.
+// Only ever reached for DATA this connection accepted — an over-budget frame is
+// refused before this, so refusing costs the peer its credit as well as its
+// stream.
+fn h2connReplenishWindows(st: h2connState, df: DataFrame, n: int) {
+  if (n == 0) {
+    return
+  }
+  h2connSendWindowUpdate(st, WindowUpdateFrame{ streamId: 0, increment: n })
+  if (!df.endStream) {
+    h2connSendWindowUpdate(st, WindowUpdateFrame{ streamId: df.streamId, increment: n })
+  }
+}
+
 fn h2connOnData(st: h2connState, f: Frame) {
   let df = decodeData(f) catch _ {
     h2connConnError(st, errorProtocolError, "http2: bad DATA")
@@ -257,15 +296,11 @@ fn h2connOnData(st: h2connState, f: Frame) {
     h2connConnError(st, errorFlowControlError, "http2: flow-control window exceeded")
     return
   }
-  s.recvBody = h2connAppendBytes(s.recvBody, df.data)
-  // We buffer the whole body, so the bytes are "consumed" the instant they land;
-  // replenish the windows and tell the peer with WINDOW_UPDATE so it may send on.
-  if (n > 0) {
-    h2connSendWindowUpdate(st, WindowUpdateFrame{ streamId: 0, increment: n })
-    if (!df.endStream) {
-      h2connSendWindowUpdate(st, WindowUpdateFrame{ streamId: df.streamId, increment: n })
-    }
+  if (!h2connBodyBudgetOk(st, s, n)) {
+    return
   }
+  s.recvBody = h2connAppendBytes(s.recvBody, df.data)
+  h2connReplenishWindows(st, df, n)
   if (df.endStream) {
     s.recvEnded = true
     h2connRecvEndTransition(st, s)
