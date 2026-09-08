@@ -830,7 +830,7 @@ let a = Account(500)?
 ```
 class_decl  = "class" IDENT [ generic_params ] "{" [ member { ( ";" | "," ) member } [ ";" | "," ] ] "}" .
 member      = field | method_decl .    (* method_decl, §10.4 *)
-field       = [ "export" ] [ "readonly" ] IDENT ":" type .
+field       = [ "export" ] [ "readonly" ] IDENT ":" type [ "=" const_expr ] .
 ```
 
 - `struct` is not a keyword (§5.2): the compiler rejects it with `E0102`,
@@ -851,6 +851,29 @@ field       = [ "export" ] [ "readonly" ] IDENT ":" type .
   rejected. `readonly` is a contextual keyword, not reserved (§5.2) — it
   parses as an ordinary identifier everywhere outside the `[export]
   readonly IDENT ":"` field position.
+- A field may declare a **default value**. It is used wherever the field is
+  not given one explicitly: an omitted key in a composite literal (§12.2), an
+  element of `[]T(n)` (§12.9), a binding with no initializer (`let p: T`), a
+  map lookup that misses, and the object an `init` (§10.4) is handed before
+  its body runs — so `init` may leave a defaulted field alone. Defaults are
+  therefore part of the type's zero value (§13.4), not a composite-literal
+  convenience, and every construction of the type agrees on them.
+- The initializer is a **constant expression** (§15.4), folded at compile
+  time. It may name a module-level `const`, including an imported one, and is
+  evaluated in the module that declares the field — never in the module that
+  constructs the value. A non-constant initializer is `E0064`; one that folds
+  but does not fit `i64` is `E0084`; one that folds to the wrong type is
+  `E0041`. Because it is a constant there is no allocation, no safepoint and
+  no ordering between fields: each default is independent, and a defaulted
+  field costs the same at the construction site as a spelled one.
+- A **consequence of the constant rule**: a field whose own type is a class
+  or a payload-carrying enum cannot have a default today, because no value of
+  either type is a constant expression. Such a field therefore still has no
+  zero value and still raises `E0083` when omitted (§13.4) — the rule and its
+  message are unchanged by this feature. Should constant expressions ever
+  widen to cover such a value, a default on the field would supply exactly
+  what `E0083` says is missing, and the omission would become legal.
+- Defaults are class-only. `trait_field` (§10.7) carries none.
 - Fields are ordered; that order is the memory layout order (subject to the
   compiler's alignment padding). A method interleaved between fields does
   not affect this order or count as a field itself.
@@ -1907,9 +1930,13 @@ A class literal is **always** prefixed by its type name: `Point{ x: 1.0, y: 2.0 
 This is the rule that removes the block-versus-object-literal ambiguity — a bare
 `{` in statement position is **always** a block (§13.1), never a class or map
 literal. Class literals are keyed; any field omitted from the literal takes its
-zero value (§13.4). A field whose own type is a **class** has no zero value and
-therefore may **not** be omitted — leaving it out is **E0083**. Fields not visible
-to the current module (unexported fields of a foreign class) may not appear.
+**default value** if it declares one (§10.5), and otherwise its zero value
+(§13.4). A field whose own type is a **class** has no zero value and therefore
+may **not** be omitted — leaving it out is **E0083**. Since a default must be a
+constant expression (§15.4) and no class value is one, a class-typed field
+cannot supply itself a default, so `E0083` applies to it exactly as before.
+Fields not visible to the current module (unexported fields of a foreign class)
+may not appear.
 
 A `field_init` with no `: expression` is **shorthand**: `Point{ x, y }` means
 `Point{ x: x, y: y }` — the field name doubles as the name of a binding already
@@ -2455,8 +2482,9 @@ Every declared binding without an initializer is deterministically zero-valued:
 
 - numeric → `0`; `bool` → `false`; `string` → `""`.
 - `[N]T` array → all elements zero-valued; tuple → each element zero-valued.
-- `class` → a live instance with each field zero-valued (classes are references,
-  so `let p: Point` yields a usable zeroed `Point`, not `nil`) — **provided every
+- `class` → a live instance with each field at its **default value** if it
+  declares one (§10.5), and otherwise zero-valued (classes are references, so
+  `let p: Point` yields a usable zeroed `Point`, not `nil`) — **provided every
   field has a zero value**. A class type with a **class-typed field** has no
   zero value at all: see below.
 - `[]T` slice → the **empty slice**: `len` and `cap` are `0`, `append` allocates,
@@ -2479,6 +2507,10 @@ Every declared binding without an initializer is deterministically zero-valued:
 Every context that produces a zero value produces the *same* zero value: a
 declaration without an initializer, a missing map key (§12.6), a receive from a
 closed channel (§16.2), and the ok-value of a failed fallible call (§18.2).
+This is why a field default (§10.5) belongs to the zero value rather than to the
+composite-literal form: `Opts{}` and `[]Opts(1)[0]` name the same value, and a
+default honoured by only one of them would make a field declared once mean two
+different things.
 
 **A class type with a class-typed field has no zero value and cannot be
 default-constructed.** Both forms that would ask for one are **E0083**:
@@ -4368,7 +4400,7 @@ extern_fn_decl = "extern" "fn" IDENT signature .
 
 class_decl    = "class" IDENT [ generic_params ] "{" [ member { fsep member } [ fsep ] ] "}" .
 member        = field | method_decl .
-field         = [ "export" ] [ "readonly" ] IDENT ":" type .
+field         = [ "export" ] [ "readonly" ] IDENT ":" type [ "=" const_expr ] .
 method_decl   = [ "export" ] IDENT [ generic_params ] signature block .
 interface_decl= "interface" IDENT [ generic_params ] "{" [ method_sig { fsep method_sig } [ fsep ] ] "}" .
 method_sig    = IDENT signature .

@@ -221,8 +221,8 @@ Bit compile speed: **565 lines/sec** (669 lines across 11 cases, warm).
 
 ## License
 
-[Apache-2.0](LICENSE). Apache-2.0 grants no trademark rights, so a modified
-compiler gets a different name - see [TRADEMARK.md](TRADEMARK.md) for the naming
-policy, and [CONTRIBUTING.md](CONTRIBUTING.md) before sending a change.
+Bit is licensed under the [Apache License 2.0](LICENSE).
 
-Security reports go through [SECURITY.md](SECURITY.md), never a public issue.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines,
+[SECURITY.md](SECURITY.md) for reporting vulnerabilities, and
+[TRADEMARK.md](TRADEMARK.md) for trademark guidelines.

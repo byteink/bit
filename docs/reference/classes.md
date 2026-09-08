@@ -54,6 +54,57 @@ class User {
 - Fields are ordered; that order is the memory layout order (subject to the
   compiler's alignment padding).
 
+## Default field values {#field-defaults}
+
+A field may declare a default. It is used wherever the field is not given a
+value, so a config class can ship the answer it wants rather than the answer
+zero happens to be.
+
+```bit
+const kb = 1024
+
+class Opts {
+  port: int = 8080,
+  host: string = "127.0.0.1",
+  maxBody: int = 1000 * kb,
+  tls: bool,
+}
+
+fn defaults(): int {
+  let a = Opts{}             // port 8080, host "127.0.0.1", maxBody 1024000
+  let b = Opts{ port: 3000 } // port 3000, the rest still defaulted
+  return a.port + b.port
+}
+```
+
+Every way of building the value agrees on the default, not just the composite
+literal: `[]Opts(n)`, a bare `let p: Opts`, a map lookup that misses, and the
+object an `init` starts from all carry it. A default is part of the type's zero
+value, so a field declared once cannot mean two different things depending on
+how the value was made.
+
+The initializer is a **constant expression**, folded at compile time. It may
+name a module-level `const`, including one imported from another module, and it
+is evaluated where the field is declared - so a class can be declared in one
+module and built with `Opts{}` in another. Because it is constant there is no
+allocation and no ordering between fields, and a defaulted field costs exactly
+what a spelled one costs at the construction site.
+
+An initializer that is not constant is rejected:
+
+```bit ignore
+fn readPort(): int { return 8080 }
+
+class Bad {
+  port: int = readPort(), // E0064 - not a compile-time constant
+}
+```
+
+A field whose own type is a class cannot have a default, because no class value
+is a constant expression - see [Fields that are themselves a
+class](#fields-that-are-themselves-a-class) below, whose rule this does not
+change. Trait fields ([Traits](traits.md)) carry no default either.
+
 ## Readonly fields {#readonly-fields}
 
 A field marked `readonly` may be set only in a composite literal, or inside
@@ -117,7 +168,8 @@ A class literal is **always** prefixed by its type name -
 `Point{ x: 1.0, y: 2.0 }`, never a bare `{ ... }`. This is what removes the
 block-versus-literal ambiguity: a `{` in statement position is always a block,
 never a class literal. Fields are keyed and order-independent; any field left
-out of a literal takes its type's zero value.
+out of a literal takes its [default value](#field-defaults) if it declares one,
+and otherwise its type's zero value.
 
 ```bit
 fn composite() {
