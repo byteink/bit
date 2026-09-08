@@ -225,7 +225,16 @@ case "${BUCKET}" in
     # test-lint-self, test-lint-complexity and test-lint-sweep (#4448/#4449)
     # all scan stdlib/ directly, same #4454 audit as the selfhost/runtime
     # buckets above.
-    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages test-lint-self test-lint-complexity test-lint-sweep)
+    #
+    # test-stdlib-unit (#4478) is the same argv-path-literal shape as test-fmt
+    # above: its argv is literally ["test", "${repoRoot()}/stdlib"]
+    # (tools/build/gates.bit:195), and it is registered in gateSteps()
+    # (tools/build/defs.bit:247), so `./make test` runs it and this bucket owes
+    # it. Without it here a stdlib/**-only diff never ran `bit test stdlib` —
+    # every stdlib `*.test.bit` (#4212) — under scripts/gate.sh. Found by
+    # assert_argvliteral_gates_current() (scripts/gate-envscope.sh, #4477) the
+    # first time it ran.
+    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages test-lint-self test-lint-complexity test-lint-sweep test-stdlib-unit)
     ;;
   docs)
     # test-stdlib-docs reads docs/stdlib/*.md directly (BIT_DOCS_ROOT — it
@@ -255,7 +264,19 @@ case "${BUCKET}" in
     # is in the selfhost/runtime/stdlib buckets above — without it here, a
     # pkg/**-only diff that added an 800+-line file would pass this scoped
     # bucket and only fail the full suite.
-    BUILD_STEPS=(test-packages test-lint-sweep)
+    #
+    # test-fmt (#4477) is the second exception, and the same shape: its argv
+    # (tools/build/gatestable2.bit:116-118) literally names
+    # `"${repoRoot()}/pkg"` alongside stdlib and examples, both of whose
+    # buckets already carry it. Without it here, an unformatted file added in
+    # a pkg/**-only diff passed this scoped bucket and failed only in the
+    # integrator's pre-push suite. Nothing mechanical could catch this before
+    # #4477: test-fmt declares its scope as bare argv path literals, which
+    # neither assert_dirgates_current() (greps `runArgs("...")`) nor
+    # assert_envscoped_gates_current() (greps `BIT_*_TREES=`) reads —
+    # assert_argvliteral_gates_current() (scripts/gate-envscope.sh) is the
+    # third assertion, added by that ticket, that does.
+    BUILD_STEPS=(test-packages test-lint-sweep test-fmt)
     ;;
   spec)
     BUILD_STEPS=(test-spec)

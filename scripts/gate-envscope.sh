@@ -21,6 +21,14 @@
 # nothing checked the env half until #4445 found test-fmt-strict's
 # BIT_FMTZERO_TREES scope silently unwired and #4454 built this to make sure
 # the next one like it cannot happen the same way.
+#
+# There are now THREE assertions here, one per way a gate can declare its
+# scope, and each states its own limits:
+#   assert_envscoped_gates_current   env: BIT_*_TREES=          (#4454)
+#   assert_argvscoped_gates_current  a walk inside the harness  (#4465)
+#   assert_argvliteral_gates_current argv: bare "${repoRoot()}/<dir>" (#4477)
+# The third exists because the first two provably could not see test-fmt, whose
+# argv literally named ${repoRoot()}/pkg while the pkg bucket did not run it.
 
 # Emits "<gate> <tree>" pairs, one per name:relpath entry inside a
 # `"BIT_*_TREES=name:relpath name:relpath ..."` env string, scanning both gate
@@ -179,6 +187,12 @@ EOF
   # more line. Both halves check the same rule gate.sh's own header states, and
   # neither is optional, so one entry point is the honest shape anyway.
   assert_argvscoped_gates_current
+
+  # The argv-path-literal half (#4477), chained from the same entry point and
+  # for the same reason: scripts/gate.sh sits at exactly 800 lines against the
+  # hard-zero shell ceiling and has no room for another call site. All three
+  # halves check the one rule gate.sh's header states, and none is optional.
+  assert_argvliteral_gates_current
 }
 
 # ---------------------------------------------------------------------------
@@ -227,10 +241,18 @@ assert_envscope_deps() {
 
 # Emits "<gate> <argv-path>" for every Gate{} whose argv is a single
 # runArgs("<path>") fixture target. The gates whose argv names a source tree
-# directly (test-fmt, test-selfcheck, test-selfhostcheck, ...) do not match and
-# do not need to: gate-filemap.sh's gates_for_file() already ties those back to
-# their bucket by argv-literal matching, which is the half that has worked
-# since #2903.
+# directly (test-fmt, test-selfhostcheck, test-stdlib-unit) do not match here —
+# assert_argvliteral_gates_current() below covers those.
+#
+# THIS COMMENT USED TO SAY THEY "do not need to: gate-filemap.sh's
+# gates_for_file() already ties those back to their bucket by argv-literal
+# matching, which is the half that has worked since #2903." THAT WAS WRONG, and
+# it is the reasoning that let #4477 through. gates_for_file() resolves a
+# CHANGED FILE to a gate, and only for _tests_/** paths; it never reads a gate's
+# argv and has nothing to say about whether a BUCKET's step list carries one.
+# test-fmt named ${repoRoot()}/pkg in its argv and was absent from the pkg
+# bucket for as long as that bucket existed, with this comment asserting it was
+# covered.
 argv_gate_paths() {
   sed -n 's/.*Gate{name: "\([^"]*\)".*runArgs("\([^"]*\)").*/\1 \2/p' \
     tools/build/gates.bit tools/build/gatestable2.bit
@@ -349,4 +371,224 @@ EOF
     exit 2
   fi
   echo "gate: assert_argvscoped_gates_current: ${wired} of ${denom} gate(s) whose harness scans compiler/ are in the selfhost bucket"
+}
+
+# ---------------------------------------------------------------------------
+# THE ARGV-PATH-LITERAL HALF (#4477).
+#
+# A FOURTH route to the same defect, and the one neither assertion above can
+# see. assert_envscoped_gates_current() reads scope out of `env:`
+# (BIT_*_TREES); assert_argvscoped_gates_current() reads it out of a harness's
+# own source for gates whose argv is a single runArgs() fixture target. A gate
+# whose argv is a list of BARE SOURCE-TREE PATHS — `["fmt", "--check",
+# "${repoRoot()}/stdlib", ..., "${repoRoot()}/pkg", ...]` — is in neither set:
+# argv_gate_paths() above matches only `runArgs("...")` and says so, and
+# gates_for_file() (scripts/gate-filemap.sh) resolves a CHANGED FILE to a gate,
+# which is a different question from whether a BUCKET's step list carries it.
+#
+# test-fmt sat in the `stdlib` and `examples` buckets and not in `pkg`, while
+# its own argv named all three, so a pkg/**-only diff never ran the formatter
+# gate that literally names pkg/ (#4477). Two more of the same shape fell out
+# of this assertion the first time it ran: test-stdlib-unit missing from the
+# `stdlib` bucket (#4478) and test-fmt missing from the `_tests_/imports`
+# per-file mapping (#4479).
+#
+# WHAT IT CANNOT DO, two limits, both real:
+#
+#   1. It reads the gate TABLE, so it only sees scope a gate spells out in its
+#      own argv. A gate that computes a path at runtime, or takes it from an env
+#      var, is invisible here — that is what the other two assertions cover,
+#      each within its own stated limits.
+#   2. It maps an argv path to exactly ONE bucket, and has no notion of a
+#      COMPOSITE bucket that must also carry the gate. `stdlibdocs` (chosen when
+#      a diff touches stdlib/** and docs/stdlib/*.md together) claims in its own
+#      comment to be the union of `stdlib` and `docs`, and is not — measured
+#      2026-09-08, it is missing four of `stdlib`'s steps, so adding a docs edit
+#      to a stdlib diff makes gate.sh run FEWER checks over the stdlib change.
+#      That is #4480, and this assertion is green across it: `stdlib` carries
+#      test-fmt and test-stdlib-unit, which is all it asks.
+
+# Emits "<gate> <relpath>" for every BARE `"${repoRoot()}/<relpath>"` argv
+# string, scanning both gate tables in one pass. Line-based and name-tracking,
+# exactly like envscoped_gate_trees() above, with two extra rules:
+#
+#   * the opening quote must sit immediately before `${repoRoot()}`, which is
+#     what separates an argv path (`"${repoRoot()}/pkg"`) from an env entry
+#     (`"BIT_CASES_DIR=${repoRoot()}/_tests_/cases"`). The env entries are
+#     already assert_envscoped_gates_current()'s business and must not be
+#     double-counted here under a different routing table.
+#   * `[^"$]` after the prefix drops any path with a further `${...}` in it —
+#     `"${repoRoot()}/${src}"` (runArgs()'s own body) and
+#     `"${repoRoot()}/bit-out/lib/${hostTriple()}/libbitrt.a"` are templates,
+#     not literals, and neither names a source tree.
+#
+# `name` is also reset on every line opening a top-level `fn `, so a
+# `${repoRoot()}` literal inside a HELPER can never be attributed to whichever
+# Gate{} happened to be scanned last.
+#
+# STATED HONESTLY: that reset is INERT on today's tree — removing it changes
+# nothing (measured: same 6 gates / 10 paths / 6 routed pairs, rc=0), because
+# every helper holding such a literal (bitBin(), stdlibRoot(), hostArchive(),
+# packageNames()'s `let dir = "${repoRoot()}/pkg"`) sits ABOVE the first Gate{}
+# in tools/build/gates.bit, and runArgs()'s own `"${repoRoot()}/${src}"` is
+# dropped by the `[^"$]` rule regardless. It is kept because that ordering is
+# nobody's invariant. Proven load-bearing rather than assumed: appending
+# `fn synthHelper(): string { return "${repoRoot()}/nosuchtree" }` after the
+# last Gate{} in gatestable2.bit is clean with the reset (rc=0) and, without
+# it, blames test-extern-archive for a path that gate never declared (rc=2,
+# 7 gates / 11 paths) — a false finding that fails loudly at an innocent gate.
+argvliteral_gate_paths() {
+  local file line name m p
+  for file in tools/build/gates.bit tools/build/gatestable2.bit; do
+    name=""
+    while IFS= read -r line; do
+      case "${line}" in
+        'fn '*) name="" ;;
+      esac
+      case "${line}" in
+        *'Gate{name: "'*)
+          name="$(printf '%s' "${line}" | sed -n 's/.*Gate{name: "\([^"]*\)".*/\1/p')"
+          ;;
+      esac
+      [ -n "${name}" ] || continue
+      m="$(printf '%s' "${line}" | command grep -oE '"\$\{repoRoot\(\)\}/[^"$]+"' || true)"
+      [ -n "${m}" ] || continue
+      # No path in either table contains a space, same assumption
+      # envscoped_gate_trees()'s own `for pair in ${m}` already makes.
+      for p in ${m}; do
+        p="${p#\"\$\{repoRoot()\}/}"
+        printf '%s %s\n' "${name}" "${p%\"}"
+      done
+    done <"${file}"
+  done
+}
+
+# Maps a source-tree relpath named in a gate's argv to the gate.sh bucket whose
+# step list must carry that gate. Deliberately a SEPARATE table from
+# envscope_bucket_for_tree() above even though the two overlap: that one routes
+# BIT_*_TREES names, this one routes argv paths, and the two sets of spellings
+# are not the same (this one sees `docs`, `bench`, `editors` and
+# `tools/fuzz/*.bit`, which no BIT_*_TREES entry names).
+#
+# NAMED EXEMPTIONS — print nothing, return 0. Each states its reason; an
+# unknown path is a hard failure in the caller, never a silent skip.
+#
+#   bench, editors — no bucket exists for either (scripts/gate.sh's per-path
+#     case block has no arm for them), so any diff touching one sets
+#     has_other=1 and resolves to bucket `full`, which runs every gate via the
+#     aggregate `test` step. Verified, not assumed: `RANGE=... bash
+#     scripts/gate.sh` on a bench/-only diff prints `bucket: full` and exits 3.
+#   tools, tools/** — the same has_other=1 -> `full` route (the one narrow
+#     exception, a purely-additive Step{}/Gate{} registration, is handled by
+#     is_additive_registration() in scripts/gate-filemap.sh and still runs the
+#     added gate). The three gates reaching this arm today
+#     (test-fuzz-selfcheck/-odiff/-xtarget) are additionally outside gate.sh's
+#     scoping responsibility altogether: all three are registered in
+#     tools/build/defs.bit's coreSteps(), not gateSteps() — their own desc
+#     strings say "not part of `test`" — so no bucket runs them at all.
+argvliteral_bucket_for_dir() {
+  case "$1" in
+    bench | editors | tools | tools/*) return 0 ;;
+    compiler) printf 'selfhost\n' ;;
+    runtime) printf 'runtime\n' ;;
+    stdlib) printf 'stdlib\n' ;;
+    examples) printf 'examples\n' ;;
+    pkg) printf 'pkg\n' ;;
+    docs) printf 'docs\n' ;;
+    spec) printf 'spec\n' ;;
+    _tests_/cases) printf 'testcases\n' ;;
+    _tests_/bit | _tests_/stress | _tests_/imports) printf 'testsbit\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+# The live-query floor, named rather than counted for the same reason
+# ARGVSCOPE_COMPILER_FLOOR is: a count silently absorbs one gate leaving the
+# class while another joins it. These three declare a bare source-tree argv
+# path today and cannot stop doing so without being rewritten, so a run that
+# fails to rediscover one has a broken extraction, not a cleaner tree — the
+# failure mode that reads as an all-clear.
+ARGVLITERAL_FLOOR="test-fmt test-selfhostcheck test-stdlib-unit"
+
+# Asserts every gate naming a bare source-tree path in its argv is in the
+# bucket that path maps to. Probes the LIVE build_steps_for_bucket() /
+# testsbit_steps_for(), never a second copy of the step lists, so the only way
+# to pass is to actually wire the gate in.
+#
+# Shadows BUCKET/BUILD_STEPS as locals, so it never disturbs the real diff's
+# own bucket selection running around it in scripts/gate.sh.
+assert_argvliteral_gates_current() {
+  local pairs pair gate dir bucket probe result want
+  local gates=0 dirs=0 checked=0 seen="" seendir="" bad=""
+  local BUCKET BUILD_STEPS
+  assert_envscope_deps
+  pairs="$(argvliteral_gate_paths)"
+  for want in ${ARGVLITERAL_FLOOR}; do
+    case "
+${pairs}
+" in
+      *"
+${want} "*) ;;
+      *)
+        echo "gate: assert_argvliteral_gates_current: did NOT rediscover \"${want}\", whose argv names a bare \${repoRoot()}/<dir> path by inspection — argvliteral_gate_paths() (scripts/gate-envscope.sh) has stopped matching, or that gate's argv changed. An extraction matching nothing looks exactly like a correctly wired tree; refusing to report a verdict." >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  while IFS= read -r pair; do
+    [ -z "${pair}" ] && continue
+    gate="${pair%% *}"
+    dir="${pair#* }"
+    case " ${seen} " in
+      *" ${gate} "*) ;;
+      *) seen="${seen:+${seen} }${gate}"; gates=$((gates + 1)) ;;
+    esac
+    case " ${seendir} " in
+      *" ${dir} "*) ;;
+      *) seendir="${seendir:+${seendir} }${dir}"; dirs=$((dirs + 1)) ;;
+    esac
+
+    bucket="$(argvliteral_bucket_for_dir "${dir}")" || {
+      bad="${bad:+${bad}
+}gate \"${gate}\" names argv path \"${dir}\" that argvliteral_bucket_for_dir() (scripts/gate-envscope.sh) does not know how to route — add a case arm naming the bucket, or a named exemption with its reason"
+      continue
+    }
+    [ -z "${bucket}" ] && continue
+    checked=$((checked + 1))
+    if [ "${bucket}" = "testsbit" ]; then
+      case "${dir}" in
+        _tests_/bit) probe="_tests_/bit/golden/probe.bit" ;;
+        _tests_/stress) probe="_tests_/stress/probe.bit" ;;
+        _tests_/imports) probe="_tests_/imports/probe.bit" ;;
+      esac
+      result="$(testsbit_steps_for "${probe}")"
+      case " ${result} " in
+        *" ${gate} "*) ;;
+        *)
+          bad="${bad:+${bad}
+}gate \"${gate}\" names argv path \"${dir}\" but testsbit_steps_for() (probed \"${probe}\") does not include it — union it into scripts/gate-filemap.sh's gates_for_file()"
+          ;;
+      esac
+    else
+      BUCKET="${bucket}"
+      build_steps_for_bucket
+      case " ${BUILD_STEPS[*]} " in
+        *" ${gate} "*) ;;
+        *)
+          bad="${bad:+${bad}
+}gate \"${gate}\" names argv path \"${dir}\" but bucket \"${bucket}\"'s BUILD_STEPS (scripts/gate-buildsteps.sh) does not include it — a ${dir}/**-only diff never runs it"
+          ;;
+      esac
+    fi
+  done <<EOF
+${pairs}
+EOF
+
+  if [ -n "${bad}" ]; then
+    echo "gate: assert_argvliteral_gates_current: FAILED — ${gates} gate(s) naming ${dirs} distinct argv path(s), ${checked} (gate,path) pair(s) routed to a bucket:" >&2
+    echo "${bad}" | sed 's/^/gate:   /' >&2
+    exit 2
+  fi
+  echo "gate: assert_argvliteral_gates_current: ${gates} gate(s) naming ${dirs} distinct argv path(s); ${checked} (gate,path) pair(s) routed to a bucket, all wired"
 }

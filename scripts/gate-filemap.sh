@@ -165,7 +165,13 @@ gates_for_file() {
   case "$1" in
     _tests_/bit/checkercases/*) printf 'test-checker-diag\n'; return 0 ;;
     _tests_/bit/parsercases/*) printf 'test-parser\n'; return 0 ;;
-    _tests_/imports/*) printf 'test-imports-bit\n'; return 0 ;;
+    # test-fmt (#4479): its argv (tools/build/gatestable2.bit:116-118) names
+    # `"${repoRoot()}/_tests_/imports"` among its six trees, and this tree has
+    # no static per-bucket BUILD_STEPS list — it routes through here and
+    # testsbit_steps_for() — so this arm is the one place that wiring can live.
+    # Same defect as #4477's pkg/ case via the per-file mapping; found by the
+    # same assertion (assert_argvliteral_gates_current, gate-envscope.sh).
+    _tests_/imports/*) printf 'test-imports-bit\ntest-fmt\n'; return 0 ;;
     _tests_/bit/objread/*)
       # No gate of its own: a shared Mach-O/ELF relocation reader (#2877)
       # reached only by relative `import { ... } from "../objread"` from two
