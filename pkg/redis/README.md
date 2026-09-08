@@ -10,13 +10,13 @@ Bit, over `std/net`. The first first-party Bit package
 ```json
 {
   "dependencies": {
-    "redis": "bitlang.org/pkg/redis@redis/v0.1.0"
+    "redis": "bitlang.org/pkg/redis@v0.1.0"
   }
 }
 ```
 
-See "Versioning and release tags" below for why this pins a literal ref
-rather than a `^0.1.0` range. `bit add` derives the dependency key ("redis")
+Versioning, tags and the release procedure for every first-party package are
+in [`pkg/README.md`](../README.md). `bit add` derives the dependency key ("redis")
 from the vanity name's trailing path segment (`compiler/pmcli.bit`'s
 `pmLastSegment`) — that key is also the import path a consuming module uses,
 below.
@@ -104,7 +104,7 @@ Everything here is what a second package author copies without asking
   machinery** -- `listVersions` (`compiler/pmfetchresolve.bit`) only
   recognizes an unprefixed `MAJOR.MINOR.PATCH` or `vMAJOR.MINOR.PATCH` tag.
   A consumer of this package -- or any later one sharing this repo's tag
-  namespace -- pins the *exact* ref, `"redis": "bitlang.org/pkg/redis@redis/v0.1.0"`,
+  namespace -- pins the *exact* ref, `"redis": "bitlang.org/pkg/redis@v0.1.0"`,
   never a caret/tilde range. Cutting a release is the integrator's job, not
   an engineering ticket's (a tag is a release action); this package
   documents the spelling and creates no tag itself.
