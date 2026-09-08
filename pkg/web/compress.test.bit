@@ -1,0 +1,306 @@
+// pkg/web/compress.test.bit — #3958's acceptance, one named test per rule.
+//
+// Every test drives `app.handle(req)` (adapter.bit), the in-process seam, so
+// what it exercises is the real chain with `compress()` registered on it —
+// not `compressRes` called directly, which would pass just as well against a
+// middleware that never ran.
+//
+// THE ROUND TRIP GOES THROUGH AN EXTERNAL DECODER. `gzip -dc`, as a real
+// subprocess, never this repo's own code: `stdlib/compress` is encode-only
+// and has no decoder, so a self-check would prove the encoder agrees with
+// itself. Same shape stdlib/compress/gzip.test.bit uses.
+//
+// `scratchDir`/`shellRun`/`mkdir`/`readFile`/`writeFile`/`envOr`
+// (node.test.bit), `newSink`/`adapterApp`/`freezeOrPanic` (adapter.test.bit),
+// `repeat` (ctx.test.bit), `gzip` (compress.bit) and the header-name
+// constants are all bound module-wide already — reused, not re-imported or
+// re-declared (E0042).
+
+// ~4.5KB of JSON: comfortably over `compressMinBytes`, and highly repetitive
+// so the compressed form is unmistakably shorter than the original.
+fn jsonFixture(): string {
+  return "{\"items\":[" +
+    repeat("\"the quick brown fox jumps over the lazy dog\",", 100) +
+    "\"end\"]}"
+}
+
+fn compressApp(): App {
+  return App(Config{ secret: "test-secret", logs: newSink() })
+}
+
+fn compressReq(target: string, headers: string): Request {
+  return Request{ method: "GET", path: target, headers: headers, body: "" }
+}
+
+fn gzipReq(target: string): Request {
+  return compressReq(target, "Accept-Encoding: gzip, deflate\r\n")
+}
+
+// `packed` decompressed by the system `gzip`, which also verifies the CRC32
+// and ISIZE trailer the encoder wrote — not just the deflate stream.
+fn gunzip(label: string, packed: string): string {
+  let dir = scratchDir("compress")
+  mkdir(dir) catch e {
+    panic("${label}: mkdir ${dir}: ${e.message()}")
+  }
+  writeFile("${dir}/body.gz", packed) catch e {
+    panic("${label}: write body.gz: ${e.message()}")
+  }
+  let code = shellRun(
+    "${dir}/run.sh",
+    "#!/bin/sh\nset -e\ngzip -dc '${dir}/body.gz' > '${dir}/out.bin'\n",
+    30000,
+  )
+  if (code != 0) {
+    panic("${label}: gzip -dc exited ${code} — see ${dir}")
+  }
+  return readFile("${dir}/out.bin") catch e {
+    panic("${label}: read out.bin: ${e.message()}")
+  }
+}
+
+// --- the compressed path ---------------------------------------------------
+
+test "a 4KB JSON response asked for with gzip comes back gzipped, and gzip -dc restores it" {
+  let body = jsonFixture()
+  let app = compressApp()
+  app.use(compress())
+  app.get(
+    "/data",
+    (c) => {
+      let r = c.text(body).header(contentTypeName, jsonContentType)
+      return r.header(contentLengthName, "${len(body)}")
+    },
+  )
+  freezeOrPanic(app)
+
+  let res = app.handle(gzipReq("/data"))
+
+  assert(len(body) >= 4096, "the fixture is only ${len(body)} bytes, wanted a 4KB body")
+  assert(res.status == 200, "want 200, got ${res.status}")
+  assert(
+    res.getHeader(contentEncodingName) == gzipToken,
+    "want Content-Encoding: gzip, got '${res.getHeader(contentEncodingName)}'",
+  )
+  assert(
+    res.getHeader(varyName) == acceptEncodingName,
+    "want Vary: Accept-Encoding, got '${res.getHeader(varyName)}'",
+  )
+  assert(
+    len(res.body) < len(body),
+    "the gzipped body (${len(res.body)}) is not shorter than ${len(body)}",
+  )
+  // The rule this middleware exists to get right: the declared length is the
+  // COMPRESSED length, not the handler's original.
+  assert(
+    res.getHeader(contentLengthName) == "${len(res.body)}",
+    "Content-Length is '${res.getHeader(contentLengthName)}', want ${len(res.body)} (the compressed byte count)",
+  )
+  assert(gunzip("4KB json", res.body) == body, "gzip -dc did not restore the original body")
+}
+
+// --- every reason not to compress -----------------------------------------
+
+test "without gzip in Accept-Encoding the body comes back uncompressed, still carrying Vary" {
+  let body = jsonFixture()
+  let app = compressApp()
+  app.use(compress())
+  app.get(
+    "/data",
+    (c) => {
+      return c.text(body).header(contentTypeName, jsonContentType)
+    },
+  )
+  freezeOrPanic(app)
+
+  let res = app.handle(compressReq("/data", "Accept-Encoding: br, deflate\r\n"))
+
+  assert(res.body == body, "the body must be untouched when the client did not ask for gzip")
+  assert(
+    len(res.getHeader(contentEncodingName)) == 0,
+    "want no Content-Encoding, got '${res.getHeader(contentEncodingName)}'",
+  )
+  assert(
+    res.getHeader(varyName) == acceptEncodingName,
+    "Vary must be set even when nothing was compressed, got '${res.getHeader(varyName)}'",
+  )
+}
+
+test "a 100-byte response is below the threshold and is not compressed" {
+  let body = repeat("a", 100)
+  let app = compressApp()
+  app.use(compress())
+  app.get(
+    "/small",
+    (c) => {
+      return c.text(body).header(contentTypeName, jsonContentType)
+    },
+  )
+  freezeOrPanic(app)
+
+  let res = app.handle(gzipReq("/small"))
+
+  assert(res.body == body, "a 100-byte body must be sent as-is, got ${len(res.body)} bytes")
+  assert(
+    len(res.getHeader(contentEncodingName)) == 0,
+    "want no Content-Encoding, got '${res.getHeader(contentEncodingName)}'",
+  )
+  assert(
+    res.getHeader(varyName) == acceptEncodingName,
+    "Vary must be set on a body too small to compress, got '${res.getHeader(varyName)}'",
+  )
+}
+
+test "an image/png response is not compressed even when it is large and gzip was asked for" {
+  let body = jsonFixture()
+  let app = compressApp()
+  app.use(compress())
+  app.get(
+    "/logo.png",
+    (c) => {
+      return c.text(body).header(contentTypeName, "image/png")
+    },
+  )
+  freezeOrPanic(app)
+
+  let res = app.handle(gzipReq("/logo.png"))
+
+  assert(res.body == body, "image/png is not on the allowlist and must pass through untouched")
+  assert(
+    len(res.getHeader(contentEncodingName)) == 0,
+    "want no Content-Encoding on an image/png, got '${res.getHeader(contentEncodingName)}'",
+  )
+  assert(
+    res.getHeader(varyName) == acceptEncodingName,
+    "Vary must be set on a type that was not compressed, got '${res.getHeader(varyName)}'",
+  )
+}
+
+test "a body that already carries Content-Encoding is left exactly as the handler sent it" {
+  let plain = jsonFixture()
+  let packed = string(
+    gzip([]byte(plain), 6) catch e {
+      panic("fixture: ${e.message()}")
+    },
+  )
+  let app = compressApp()
+  app.use(compress())
+  app.get(
+    "/pre",
+    (c) => {
+      let r = c.text(packed).header(contentTypeName, jsonContentType)
+      return r.header(contentEncodingName, gzipToken)
+    },
+  )
+  freezeOrPanic(app)
+
+  let res = app.handle(gzipReq("/pre"))
+
+  assert(
+    res.body == packed,
+    "a handler that encoded its own body must not be encoded a second time",
+  )
+  assert(
+    res.getHeader(contentEncodingName) == gzipToken,
+    "want the handler's own Content-Encoding, got '${res.getHeader(contentEncodingName)}'",
+  )
+  assert(
+    res.getHeader(varyName) == acceptEncodingName,
+    "Vary must be set on a pass-through, got '${res.getHeader(varyName)}'",
+  )
+  assert(gunzip("pre-encoded", res.body) == plain, "the handler's own gzip stream did not survive")
+}
+
+test "Accept-Encoding: gzip;q=0 refuses gzip and the body is not compressed" {
+  let body = jsonFixture()
+  let app = compressApp()
+  app.use(compress())
+  app.get(
+    "/data",
+    (c) => {
+      return c.text(body).header(contentTypeName, jsonContentType)
+    },
+  )
+  freezeOrPanic(app)
+
+  let res = app.handle(compressReq("/data", "Accept-Encoding: gzip;q=0, *\r\n"))
+
+  assert(res.body == body, "q=0 means 'not acceptable' — the body must not be gzipped")
+  assert(
+    len(res.getHeader(contentEncodingName)) == 0,
+    "want no Content-Encoding for gzip;q=0, got '${res.getHeader(contentEncodingName)}'",
+  )
+}
+
+// --- the headers ----------------------------------------------------------
+
+test "a strong ETag does not survive compression as strong" {
+  let body = jsonFixture()
+  let app = compressApp()
+  app.use(compress())
+  app.get(
+    "/data",
+    (c) => {
+      let r = c.text(body).header(contentTypeName, jsonContentType)
+      return r.header(etagName, "\"abc123\"")
+    },
+  )
+  freezeOrPanic(app)
+
+  let res = app.handle(gzipReq("/data"))
+  let tag = res.getHeader(etagName)
+
+  assert(res.getHeader(contentEncodingName) == gzipToken, "the fixture must have been compressed")
+  assert(tag == "W/\"abc123\"", "want the weakened tag W/\"abc123\", got '${tag}'")
+  assert(tag[0:1] != "\"", "the ETag is still strong: '${tag}'")
+  // Weak, not dropped: static.bit's `etagMatches` strips `W/` before
+  // comparing, so a client that stores this and sends it back still gets its
+  // 304.
+  assert(etagMatches(tag, "\"abc123\""), "the weakened tag must still match its own resource")
+}
+
+test "Vary: Accept-Encoding is appended to a Vary the handler already set" {
+  let body = jsonFixture()
+  let app = compressApp()
+  app.use(compress())
+  app.get(
+    "/data",
+    (c) => {
+      let r = c.text(body).header(contentTypeName, jsonContentType)
+      return r.header(varyName, "Cookie")
+    },
+  )
+  freezeOrPanic(app)
+
+  let res = app.handle(gzipReq("/data"))
+
+  assert(
+    res.getHeader(varyName) == "Cookie, Accept-Encoding",
+    "want the handler's Vary kept and extended, got '${res.getHeader(varyName)}'",
+  )
+}
+
+// `serializeResponse` (stdlib/http/http.bit) emits `Content-Length` from the
+// body it is about to write, on every response. A second one set here would
+// go on the wire twice, so the middleware only ever CORRECTS a length the
+// handler declared.
+test "compress() does not add a Content-Length the handler did not set" {
+  let body = jsonFixture()
+  let app = compressApp()
+  app.use(compress())
+  app.get(
+    "/data",
+    (c) => {
+      return c.text(body).header(contentTypeName, jsonContentType)
+    },
+  )
+  freezeOrPanic(app)
+
+  let res = app.handle(gzipReq("/data"))
+
+  assert(res.getHeader(contentEncodingName) == gzipToken, "the fixture must have been compressed")
+  assert(
+    len(res.getHeader(contentLengthName)) == 0,
+    "no Content-Length was set by the handler, so none belongs here: '${res.getHeader(contentLengthName)}'",
+  )
+}
