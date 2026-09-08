@@ -79,18 +79,44 @@
 class PendingReq { name: string, spec: string, fromRoot: bool }
 
 // The `Version` a FULL dependency spec string's trailing `@ref` names, or
-// `(_, false)` if that ref is not an exact `vMAJOR.MINOR.PATCH` tag. Unlike
-// `parseVersionTag` (above), which expects an already-bare ref, this takes
-// the full spec a `bit.json` `dependencies` value or a `bit.lock` `requires`
-// entry actually stores (`host/owner/repo@ref` or `vanityPath@ref`) and
-// extracts the ref itself first.
+// `(_, false)` if that ref names no version at all. Unlike `parseVersionTag`
+// (pmz.bit), which expects an already-bare ref, this takes the full spec a
+// `bit.json` `dependencies` value or a `bit.lock` `requires` entry actually
+// stores (`host/owner/repo@ref` or `vanityPath@ref`) and extracts the ref
+// itself first.
 fn pendingVersionTag(spec: string): (Version, bool) {
   let zero = Version{ major: 0, minor: 0, patch: 0 }
   let at = lastIndexByte(spec, '@')
   if (at < 0) {
     return zero, false
   }
-  return parseVersionTag(spec[at + 1:len(spec)])
+  return parseManifestVersionRef(spec[at + 1:len(spec)])
+}
+
+// A ref as a MANIFEST spells it, to the `Version` it names — SPEC §17.7's
+// `MAJOR.MINOR.PATCH` (what `bit add` itself writes, via `formatConstraint`)
+// and the `vMAJOR.MINOR.PATCH` spelling a hand-written manifest may use,
+// both accepted, through `canonicalVersion` (pmversion.bit) rather than a
+// second spelling rule of this file's own. `(_, false)` for SPEC §17.7's
+// other two ref forms — a branch name, a bare commit sha — and for a `^`/`~`
+// range, which names a set rather than a version.
+//
+// This is deliberately WIDER than `parseVersionTag` (pmz.bit), which requires
+// the leading `v` and stays that way: that one is handed an already-RESOLVED
+// git ref (`checkVersionConflict`'s `ref` is the tag `bit add` matched),
+// where "v0.1.0" is a tag name and a bare "0.1.0" would be a different tag
+// name; this one is handed a version REQUIREMENT, where SPEC §17.7 defines
+// both spellings to mean the same version. Before #4481 the walk used the
+// narrow one for both jobs, so the bare spelling SPEC prescribes — and which
+// `bit add` writes — was classified as a branch name: never arbitrated by
+// PubGrub, and handed to git verbatim, which is why a transitive `@0.1.0`
+// could only ever resolve against a repository that tagged bare.
+fn parseManifestVersionRef(ref: string): (Version, bool) {
+  let (canon, ok) = canonicalVersion(ref)
+  if (!ok) {
+    return Version{ major: 0, minor: 0, patch: 0 }, false
+  }
+  return parseVersion(canon)
 }
 
 // Whether `entries` already carries a top-level entry named `name` — the
@@ -126,7 +152,7 @@ fn enqueueRequires(queue: []PendingReq, rs: []LockRequire): []PendingReq {
 // freshly-fetched module's own requirements become for `ReqGraph.modules`,
 // used by `resolveTransitiveDeps` (below) to seed each newly-discovered
 // module's own edges during the real transitive walk. NOT reused by
-// `checkVersionConflict` (below) for the package being added/refreshed's own
+// `checkVersionConflict` (pmz.bit) for the package being added/refreshed's own
 // requirements — #3562 found that doing so fed sub-dependency names into
 // that check's graph with zero candidate versions, so `resolvePubGrub`
 // raised a spurious conflict for every non-leaf package; that narrower check
@@ -149,6 +175,33 @@ fn versionRequirementsOf(rs: []LockRequire): []Requirement {
     i = i + 1
   }
   return out
+}
+
+// The commit `ref` names on `r`, and the git tag that matched it — the one
+// place the transitive walk decides how a requirement's ref becomes a
+// commit (#4481).
+//
+// A version requirement (`parseManifestVersionRef`, above: either of SPEC
+// §17.7's two spellings) resolves through `resolveVersionRefSha`
+// (pmcliaddref.bit) — the SAME `v`-prefixed-then-bare rule, inside the same
+// `r.prefix` tag namespace, that `bit add`/`bit up`/`bit outdated` already
+// use — and reports the tag it matched, so `bit.lock` can record it
+// (#4472's `LockEntry.tag`). Two things follow that were not true before:
+// a repository that tags `v0.1.0` matches a requirement written `@0.1.0`,
+// and a `dir`-resolved package's `<key>/` namespace is searched instead of
+// the bare one that belongs to the host repository's own releases.
+//
+// Anything else — a branch name, a bare commit sha (SPEC §17.7's other two
+// ref forms) — is handed to `resolveDependencyRef` verbatim, unchanged, and
+// reports no tag: there is no version to build a tag name out of, and the
+// ref the manifest wrote IS the git ref.
+fn resolveTransitiveRefSha(r: TagRemote, ref: string): (string, string)! {
+  let (v, isVersion) = parseManifestVersionRef(ref)
+  if (!isVersion) {
+    let sha = resolveDependencyRef(r.gitBin, r.url, ref, r.timeoutMs)?
+    return "", sha
+  }
+  return resolveVersionRefSha(r, v)?
 }
 
 // Resolves one transitive requirement's full spec (a dependency's own
@@ -191,7 +244,22 @@ fn resolveTransitiveSpec(
   if (d.vanity) {
     let doc = resolveVanityUrl(d.vanityName, vanityTimeoutMs)?
     let remote = parseGitRemoteUrl(doc.gitUrl)?
-    let sha = resolveDependencyRef(gitBin, doc.gitUrl, d.ref, timeoutMs)?
+    // A document carrying a `dir` field says the package is a SUBFOLDER of a
+    // repository it shares with other packages and with that repository's own
+    // releases, so its versions are tagged `<key>/vX.Y.Z` and a bare `vX.Y.Z`
+    // there is not a version of this package at all (#4472, `vanityTagPrefix`
+    // in pmcli.bit). `bit add` and `bit up` have applied that namespace since
+    // #4472; this walk did not, so a package required TRANSITIVELY at a
+    // version could not resolve at all.
+    let (tag, sha) = resolveTransitiveRefSha(
+      TagRemote{
+        gitBin: gitBin,
+        url: doc.gitUrl,
+        prefix: vanityTagPrefix(d.vanityName, doc.dir),
+        timeoutMs: timeoutMs,
+      },
+      d.ref,
+    )?
     let fetched = fetchSha(
       gitBin,
       cacheRoot,
@@ -205,6 +273,7 @@ fn resolveTransitiveSpec(
       name: name,
       url: doc.gitUrl,
       commit: sha,
+      tag: tag,
       requires: manifestRequires(depManifest),
       vanity: d.vanityName,
       dir: doc.dir,
@@ -214,7 +283,13 @@ fn resolveTransitiveSpec(
   if (d.scheme == "ssh") {
     url = sshDepUrl(d.sshUser, d.host, d.owner, d.repo)
   }
-  let sha = resolveDependencyRef(gitBin, url, d.ref, timeoutMs)?
+  // No namespace on a direct spec: the repository IS the package, so its
+  // versions are the bare `vX.Y.Z`/`X.Y.Z` tags at the top of its own tag
+  // namespace — the pre-#4472 rule, unchanged.
+  let (tag, sha) = resolveTransitiveRefSha(
+    TagRemote{ gitBin: gitBin, url: url, prefix: "", timeoutMs: timeoutMs },
+    d.ref,
+  )?
   let fetched = fetchSha(
     gitBin, cacheRoot, GitRemoteRepo{ host: d.host, owner: d.owner, repo: d.repo },
     GitFetchTarget{ url: url, sha: sha, pkgDir: "" }, timeoutMs,
@@ -224,6 +299,7 @@ fn resolveTransitiveSpec(
     name: name,
     url: url,
     commit: sha,
+    tag: tag,
     requires: manifestRequires(depManifest),
     vanity: "",
   }
@@ -254,7 +330,7 @@ fn pmResolveOrFail(rootRequires: []RootRequirement, modules: []ModuleReqs): map<
 // Fetches every dependency reachable from `seed` (typically every
 // already-locked entry's own `requires`, flattened — `flattenRequires`,
 // below) that does not already have a top-level `bit.lock` entry, giving
-// each its own entry — the loop this file's own module comment above says
+// each its own entry — the loop pmz.bit's own module comment says
 // `pmresolve.bit` is missing. Discovery never mutates `entries` — it only
 // fetches and records candidates — so `entries` is exactly as it started
 // throughout the walk regardless of queue order; both classes of winner
@@ -358,15 +434,15 @@ export fn resolveTransitiveDeps(
     // `winner` IS the version #2366's PubGrub resolver just matched for
     // `name` — recorded verbatim (#2856), not re-derived from `entry`'s own
     // fetched ref string.
-    // No `tag` (#4472): this walk resolves a transitive requirement through
-    // `resolveTransitiveSpec`, which hands the manifest's ref straight to
-    // `resolveDependencyRef` and never goes through `resolveVersionRefSha`
-    // — so it genuinely does not know which tag spelling matched, and ""
-    // records "unknown" rather than guessing one. #4481 is the ticket that
-    // makes the transitive path namespace-aware; until it lands a
-    // version-tagged TRANSITIVE requirement on a `dir` package does not
-    // resolve at all, and this "" is the honest state, not the cause.
-    entries = upsertLockEntry(entries, lockEntryResolvedAs(entry, versionText(winner), ""))
+    //
+    // `entry.tag` (#4481) is the tag `resolveTransitiveSpec` actually
+    // matched, carried up from `resolveVersionRefSha` rather than guessed
+    // from `winner`: the two spellings `v0.1.0` and `0.1.0` name the same
+    // version and different git tags, and on a `dir` package the tag is
+    // `<key>/v0.1.0` (#4472), so it cannot be rebuilt from the version here.
+    // `entry` is the one fetched for `winKey`, i.e. for `winner` itself, so
+    // its tag is `winner`'s tag and not some other candidate's.
+    entries = upsertLockEntry(entries, lockEntryResolvedAs(entry, versionText(winner), entry.tag))
   }
 
   let ni = 0
