@@ -442,6 +442,19 @@ at its root (a first-party package under `bit/pkg/<name>/`, for example).
 field resolves the package at the repository root and the entry omits the
 key entirely, exactly as before this field existed.
 
+A `dir` package shares its repository with other packages and with that
+repository's own releases, so its versions live in their own **tag
+namespace**: `<key>/vX.Y.Z`, where `<key>` is the vanity name's trailing
+segment (`web` for `bitlang.org/pkg/web`). A consumer never writes the
+prefix - `bit add bitlang.org/pkg/web@v0.1.0`, and `bit.json` keeps the
+plain `0.1.0` - and `^`/`~` ranges search the same namespace. A bare
+`vX.Y.Z` tag on that repository is the repository's own release and is
+never a candidate for the package; `bit add`, `bit up` and `bit outdated`
+all read the namespaced tags only. `bit.lock` records the tag actually
+matched as `tag` (`"web/v0.1.0"`), so the mapping is on disk rather than
+re-derived. A branch name or a bare commit SHA is not a version and is
+never prefixed.
+
 ## Importing a dependency
 
 A bare import name (anything that isn't `std/...` or a relative `./`/`../`

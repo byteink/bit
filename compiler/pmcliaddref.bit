@@ -35,14 +35,12 @@ class AddRefResolution { fetchRef: string, writtenRef: string, resolvedVersion: 
 // through unresolved, exactly as before this ticket: SPEC §17.7's other two
 // ref forms carry nothing for `listVersions`/the resolver to reason about.
 fn resolveAddRef(
-  gitBin: string,
-  url: string,
+  r: TagRemote,
   hasRef: bool,
   rawRef: string,
-  timeoutMs: int,
 ): AddRefResolution! {
   if (!hasRef) {
-    let picked = resolveHighestSatisfying(gitBin, url, versionSetUniverse(), timeoutMs)?
+    let picked = resolveHighestSatisfying(r, versionSetUniverse(), "${r.prefix}v* tag")?
     let caret = Constraint{ op: ConstraintOp.Caret, version: picked.version }
     return AddRefResolution{
       fetchRef: picked.ref,
@@ -54,12 +52,26 @@ fn resolveAddRef(
   if (!isVersion) {
     return AddRefResolution{ fetchRef: rawRef, writtenRef: rawRef, resolvedVersion: "" }
   }
-  let picked = resolveHighestSatisfying(gitBin, url, versionSetFromConstraint(c), timeoutMs)?
+  let picked = resolveHighestSatisfying(r, versionSetFromConstraint(c), constraintWant(r.prefix, c))?
   return AddRefResolution{
     fetchRef: picked.ref,
     writtenRef: formatConstraint(c),
     resolvedVersion: versionText(picked.version),
   }
+}
+
+// What a failed resolution says it was looking for, in the REPOSITORY's own
+// tag spelling rather than the consumer's. An exact constraint names one
+// tag, so it is named: a consumer who wrote `@v0.3.0` against a `dir`
+// package is told `web/v0.3.0` is the tag that is missing, not that
+// "0.3.0" is — the prefix is the whole thing they cannot see from
+// `bit.json` (#4472). A `^`/`~` range names no single tag, so it names the
+// namespace it searched and the range it searched for.
+fn constraintWant(prefix: string, c: Constraint): string {
+  if (c.op == ConstraintOp.Exact) {
+    return "tag ${tagNameFor(prefix, c.version, true)}"
+  }
+  return "${prefix}v* tag matching ${formatConstraint(c)}"
 }
 
 // The version `ref` names, parsed as a `Constraint` (#2364): a leading `v`
@@ -88,25 +100,25 @@ class HighestSatisfying { version: Version, ref: string }
 // (compiler/pmclioutdated.bit) can reuse the identical tag-matching rule to
 // map an ALREADY-locked commit back to the version it came from, rather than
 // only picking a version forward from a constraint.
-fn resolveVersionRefSha(
-  gitBin: string,
-  url: string,
-  v: Version,
-  timeoutMs: int,
-): (string, string)! {
-  let vTag = "v${v.major}.${v.minor}.${v.patch}"
-  let bareTag = "${v.major}.${v.minor}.${v.patch}"
+//
+// Both spellings are built inside `r.prefix`'s namespace (`tagNameFor`,
+// pmfetchtags.bit), so a `dir`-resolved package tries `web/v0.1.0` then
+// `web/0.1.0` and never `v0.1.0` (#4472). With an empty prefix this is the
+// unchanged `v1.2.3`-then-`1.2.3` pair.
+fn resolveVersionRefSha(r: TagRemote, v: Version): (string, string)! {
+  let vTag = tagNameFor(r.prefix, v, true)
+  let bareTag = tagNameFor(r.prefix, v, false)
   // `resolveDependencyRef` returns a non-empty 40-hex sha on success, so an
   // empty fallback here is a safe "the v-prefixed tag was not found"
   // sentinel — never a real result, since `isFullSha` (pmfetch.bit) is
   // never satisfied by "".
-  let vSha = resolveDependencyRef(gitBin, url, vTag, timeoutMs) catch _ {
+  let vSha = resolveDependencyRef(r.gitBin, r.url, vTag, r.timeoutMs) catch _ {
     ""
   }
   if (len(vSha) > 0) {
     return vTag, vSha
   }
-  let bareSha = resolveDependencyRef(gitBin, url, bareTag, timeoutMs)?
+  let bareSha = resolveDependencyRef(r.gitBin, r.url, bareTag, r.timeoutMs)?
   return bareTag, bareSha
 }
 
@@ -114,18 +126,19 @@ fn resolveVersionRefSha(
 // (`highestInSet`, pmresolvesolve.bit's own PubGrub selection rule — reused
 // rather than a second "pick a version" policy), and the git ref it
 // actually resolves to (`resolveVersionRefSha`, above).
-fn resolveHighestSatisfying(
-  gitBin: string,
-  url: string,
-  set: []Range,
-  timeoutMs: int,
-): HighestSatisfying! {
-  let versions = listVersions(gitBin, url, timeoutMs)?
+//
+// `want` is what to SAY when nothing matches, already spelled in the
+// repository's own tag namespace (`constraintWant`, below). It is a
+// parameter rather than derived here because this function is handed a
+// `[]Range` — a set has no single tag name, and the caller still holds the
+// `Constraint` that does (#4472).
+fn resolveHighestSatisfying(r: TagRemote, set: []Range, want: string): HighestSatisfying! {
+  let versions = listVersions(r)?
   let (chosen, found) = highestInSet(versions, set)
   if (!found) {
-    fail newError("pmcli: no available version of ${url} satisfies the requested constraint")
+    fail newError("pmcli: no ${want} in ${r.url}")
   }
-  let (ref, _) = resolveVersionRefSha(gitBin, url, chosen, timeoutMs)?
+  let (ref, _) = resolveVersionRefSha(r, chosen)?
   return HighestSatisfying{ version: chosen, ref: ref }
 }
 
@@ -156,17 +169,7 @@ export fn addLocalDependency(
   // Same bit.lock-first, bit.json-second ordering as `addDependency`. A
   // local dependency has no resolved version (#2856): there is no git tag,
   // only a live directory.
-  let updated = upsertLockEntry(
-    entries,
-    name,
-    entry.url,
-    entry.commit,
-    "",
-    entry.requires,
-    "",
-    entry.localPath,
-    "",
-  )
+  let updated = upsertLockEntry(entries, lockEntryResolvedAs(entry, "", ""))
   let resolved = resolveTransitiveDeps(
     cacheRoot,
     gitBin,
@@ -294,43 +297,24 @@ fn pmAppendGapSlot(gaps: []Option<string>): []Option<string> {
   return out
 }
 
-// `entries` with `name`'s entry replaced (or appended, if absent) by a fresh
-// one built from this run's fetch — bit.lock is fully machine-owned, so the
-// whole entry is regenerated rather than patched field-by-field. `localPath`
-// (#2244) is "" for every git-backed (direct/vanity/ssh) entry; non-empty
-// only for a local filesystem dependency (`addLocalDependency`, below).
-// `version` (#2856) is the caller's already-resolved `MAJOR.MINOR.PATCH` —
-// "" when the ref fetched was a branch, a bare sha, or a local path, exactly
-// as every caller below already computed before calling in.
-fn upsertLockEntry(
-  entries: []LockEntry,
-  name: string,
-  url: string,
-  commit: string,
-  version: string,
-  requires: []LockRequire,
-  vanity: string,
-  localPath: string,
-  dir: string,
-): []LockEntry {
+// `entries` with `e`'s entry replaced (or appended, if absent), keyed on
+// `e.name` — bit.lock is fully machine-owned, so the whole entry is
+// regenerated rather than patched field-by-field.
+//
+// Takes the `LockEntry` itself rather than the eight scalars it is built
+// from (spec/LINT.md's E0202, `max-params` 5). Every caller already holds
+// the entry a resolver just returned and overrides only the fields
+// resolution learned separately — see `lockEntryResolvedAs` below — so the
+// scalar form made each of the six call sites re-list eight arguments
+// positionally, and made this function carry two byte-identical copies of
+// the same eight-field literal.
+fn upsertLockEntry(entries: []LockEntry, e: LockEntry): []LockEntry {
   let out = []LockEntry(0)
   let replaced = false
   let i = 0
   while (i < len(entries)) {
-    if (entries[i].name == name) {
-      out = append(
-        out,
-        LockEntry{
-          name: name,
-          url: url,
-          commit: commit,
-          version: version,
-          requires: requires,
-          vanity: vanity,
-          localPath: localPath,
-          dir: dir,
-        },
-      )
+    if (entries[i].name == e.name) {
+      out = append(out, e)
       replaced = true
     } else {
       out = append(out, entries[i])
@@ -338,19 +322,47 @@ fn upsertLockEntry(
     i = i + 1
   }
   if (!replaced) {
-    out = append(
-      out,
-      LockEntry{
-        name: name,
-        url: url,
-        commit: commit,
-        version: version,
-        requires: requires,
-        vanity: vanity,
-        localPath: localPath,
-        dir: dir,
-      },
-    )
+    out = append(out, e)
   }
   return out
+}
+
+// `e` with the two fields a RESOLVER learns rather than a fetch: `version`
+// (#2856), the `MAJOR.MINOR.PATCH` the ref actually matched, and `tag`
+// (#4472), the git tag it matched it to — both "" when the ref was a
+// branch, a bare sha, or a local path. `resolveDependency` and its siblings
+// (pmz.bit) return everything else already correct — url, commit, requires,
+// vanity, localPath, dir — so this is the whole delta every
+// `upsertLockEntry` call site applies, in one place instead of six.
+fn lockEntryResolvedAs(e: LockEntry, version: string, tag: string): LockEntry {
+  return LockEntry{
+    name: e.name,
+    url: e.url,
+    commit: e.commit,
+    version: version,
+    tag: tag,
+    requires: e.requires,
+    vanity: e.vanity,
+    localPath: e.localPath,
+    dir: e.dir,
+  }
+}
+
+// The tag a resolution matched, for `bit.lock`'s `tag` field. `fetchRef` IS
+// that tag — prefix and all — whenever the resolution matched a version
+// (`resolveAddRef` builds it through `resolveVersionRefSha`); when it did
+// not, `fetchRef` is the raw branch name or bare sha the user pinned and
+// there is no tag to record. `resolvedVersion` is the flag for which case
+// this is, and it is the same flag every caller already uses to decide
+// whether to record a `version` at all.
+//
+// Takes the two fields rather than a resolution object because `bit add`'s
+// `AddRefResolution` and `bit up`'s `UpRefResolution` (pmcliup.bit) carry
+// them under the same names in two different classes, and one rule beats
+// two overloads of it.
+fn resolvedLockTag(fetchRef: string, resolvedVersion: string): string {
+  if (len(resolvedVersion) == 0) {
+    return ""
+  }
+  return fetchRef
 }

@@ -3420,6 +3420,11 @@ both conventions, so resolution tries both rather than requiring one. If a
 repository tags the same version both ways, on different commits,
 `vMAJOR.MINOR.PATCH` takes precedence.
 
+Both spellings are matched inside the dependency's **tag namespace**, which
+is empty for every dependency except one resolved through a `bit-import:`
+document naming a `dir` field — see **Namespaced tags for a `dir` package**,
+below.
+
 **Vanity import resolution.** The leading path of a dependency value
 (everything before the final `@ref`) is either a **direct** git host spec or
 a **vanity** name. The decision is made on the path's first segment — the
@@ -3493,6 +3498,38 @@ bit-import: <name> git <gitURL>
   missing the literal `git` token, has no `<gitURL>`, or names a `dir`
   field whose `<path>` fails the segment rule above, is a resolution
   failure.
+
+**Namespaced tags for a `dir` package.** A document naming a `dir` field
+says the package is a subdirectory of a repository it does not own outright:
+that repository may carry several packages, and it carries its own releases
+in the bare `vMAJOR.MINOR.PATCH` tag namespace. So a `dir`-resolved
+dependency's versions are matched against tags **prefixed by its key**: the
+namespace is the vanity name's trailing `/`-separated segment followed by a
+single `/`, and it is empty for every dependency whose document named no
+`dir`.
+
+For `bitlang.org/pkg/web` the key is `web` and the namespace is `web/`. The
+version constraint `0.1.0` then matches the tag `web/v0.1.0` or `web/0.1.0`
+— both spellings, `v`-prefixed first, exactly as **Git tag matching** above
+already specifies — and matches no other tag on that repository. A bare
+`v0.1.0` on the same repository is **never** a candidate: it is that
+repository's own release, not a version of the package.
+
+That key is the same trailing segment the resolver already derives as the
+dependency's `bit.json`/`bit.lock` key, taken from the vanity **name**
+rather than from the key the consumer happens to have used. There is no
+field in the `bit-import:` document for the prefix: it is determined by the
+name being resolved, and a document cannot claim a namespace other than its
+own.
+
+Nothing about the consumer's spelling changes. `bit.json` records a plain
+`MAJOR.MINOR.PATCH` under `^`, `~` or bare, identical to any other
+dependency; the prefix exists only between the resolver and the remote.
+`bit.lock` records the tag that was actually matched, prefix included, as
+`tag` (see **`bit.lock`**, below).
+
+The other two ref forms are unaffected: a branch name and a bare commit SHA
+are not versions, are never matched against tags, and are never prefixed.
 
 **No subpaths in v1.** A vanity name is matched exactly; there is no prefix
 rule. `bitlang.org/pkg/http` and `bitlang.org/pkg/http/client` are two
@@ -3591,6 +3628,7 @@ Per resolved dependency it records:
     "url": "https://github.com/byteink/quicwire.git",
     "commit": "9f8e7d6c5b4a3928170695e4d3c2b1a0f9e8d7c",
     "version": "1.7.0",
+    "tag": "v1.7.0",
     "requires": {
       "streambuf": "github.com/byteink/streambuf@^0.9.0"
     }
@@ -3609,6 +3647,14 @@ Per resolved dependency it records:
   constraint can resolve to `1.4.7`. Optional: a lock file written before
   this field existed omits the key entirely, reads back as if unresolved, and
   is rewritten unchanged on the next resolution — no error, no forced relock.
+- `tag` — the git tag `version` was matched to, in the repository's own
+  spelling: `v1.7.0` or `1.7.0` for an ordinary dependency, and
+  `web/v0.1.0` for one resolved through a document naming `dir` (see
+  **Namespaced tags for a `dir` package**, above). Present exactly when
+  `version` is, and omitted for the same cases. It is not derivable from
+  `version`: both the `v` and the namespace are choices the remote made, and
+  a repository may tag either way. Optional on read, on the same terms as
+  `version`.
 - `requires` — that dependency's own transitive requirement list, verbatim
   from its `bit.json`, so resolution can re-run from the lockfile alone
   without re-fetching every transitive dependency's manifest.

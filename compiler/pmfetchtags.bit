@@ -1,0 +1,142 @@
+// compiler/pmfetchtags.bit — a remote's VERSION-TAG NAMESPACE: which of its
+// git tags are version candidates, and how a `Version` maps back to the tag
+// name that names it (#4472; the enumeration half split off
+// compiler/pmfetchresolve.bit under the 800-line E0200 limit, spec/LINT.md
+// §4, which that file reached at 787). Sibling of pmfetch.bit /
+// pmfetchresolve.bit in the same module: every name here is visible to them
+// unqualified, and `Version`/`versionLess`/`canonicalVersion`/`parseVersion`
+// come from pmresolve.bit/pmversion.bit the same way.
+//
+// The reason this is a namespace and not just "the tags": a first-party
+// package lives in a SUBFOLDER of a shared repository (SPEC §17.7's `dir`
+// field), so one repository carries several packages' tags PLUS its own
+// releases. `bitlang.org/pkg/web@v0.1.0` must resolve `web/v0.1.0` and must
+// never see the `v0.1.0` that is the host repository's own compiler
+// release. That is `TagRemote.prefix` below, and it is the only thing in
+// this file that is not simply moved code.
+import { sortInPlace } from "std/sort"
+
+// One remote, as the tag resolvers see it: where to look (`gitBin`, `url`,
+// `timeoutMs` — the three that already travelled together through every
+// resolver call) and WHICH tags count (`prefix`).
+//
+// `prefix` is "" for an ordinary dependency, and every `vX.Y.Z`/`X.Y.Z` tag
+// at the top of the remote's namespace is a candidate — behaviour unchanged
+// from before this field existed. It is `<key>/` (e.g. `"web/"`) for a
+// dependency resolved through a vanity document carrying a `dir` field, and
+// then ONLY `<key>/vX.Y.Z`/`<key>/X.Y.Z` tags are candidates: a bare
+// `vX.Y.Z` on that repository belongs to the repository's own releases and
+// is never a version of the package. Branch names and bare commit SHAs are
+// not versions at all and never reach this file.
+//
+// Bundled as a class per spec/LINT.md's E0202 (`max-params` 5) rather than
+// threaded as four positional parameters through five call layers.
+// Allocated once per dependency per CLI invocation — `bit add`/`bit up`/
+// `bit outdated` run at human-interaction frequency, so the object is not a
+// performance concern.
+class TagRemote { gitBin: string, url: string, prefix: string, timeoutMs: int }
+
+// The tag name `v` is spelled under in `r`'s namespace, in each of SPEC
+// §17.7's two accepted spellings: `<prefix>vMAJOR.MINOR.PATCH` and
+// `<prefix>MAJOR.MINOR.PATCH`. With an empty prefix these are exactly the
+// `v1.2.3`/`1.2.3` pair that rule already described.
+fn tagNameFor(prefix: string, v: Version, withV: bool): string {
+  if (withV) {
+    return "${prefix}v${v.major}.${v.minor}.${v.patch}"
+  }
+  return "${prefix}${v.major}.${v.minor}.${v.patch}"
+}
+
+// --- listing available versions from tags (#2365) ------------------------
+
+// Enumerates the version tags `r.url` carries IN `r.prefix`'s namespace:
+// runs `git ls-remote --tags --refs <url>`, keeps only tag names of the form
+// `<prefix><version>` where `<version>` is one `canonicalVersion`
+// (pmversion.bit) accepts — both the bare `1.2.3` and the `v1.2.3`
+// spellings, since a third-party repository may use either — and returns
+// their parsed `Version`s sorted DESCENDING (highest first). A tag that is
+// not a version in either spelling (a release-notes tag, `latest`, a
+// prerelease qualifier this format admits no syntax for, anything else), or
+// one outside `r.prefix`'s namespace, is silently skipped rather than
+// failing the whole call. Resolving a selected version back to a commit sha
+// stays `resolveDependencyRef`'s job; this function only enumerates.
+//
+// With `r.prefix` empty this is exactly the enumeration #2365 shipped. With
+// `r.prefix` set (`"web/"`) a bare `v9.9.9` on the same repository — the
+// host repository's OWN release — is not a candidate at all, which is the
+// whole point of the namespace (#4472).
+//
+// `--tags` alone matches every tag at once (unlike `resolveDependencyRef`'s
+// single named `ref` query), so the ANNOTATED-tag peeling #2064 fixed shows
+// up here in the opposite shape: instead of a peeled line being silently
+// withheld unless asked for by its exact `<ref>^{}` name, a wildcard `--tags`
+// query reports BOTH the tag-object line and a second, peeled `^{}` line for
+// every annotated tag, and a `^{}`-suffixed ref does not parse as a tag name
+// at all. `--refs` suppresses that second line — verified against real git
+// 2.55 rather than assumed, since assuming was exactly what made #2064's
+// first attempted fix a no-op (`checkPmfetchListVersionsRefsSuppressesPeel`,
+// pmfetchresolvecheck.bit, asserts the peeled line is present WITHOUT the
+// flag and absent WITH it, so the flag is proven to do something rather than
+// the assertion merely never firing).
+export fn listVersions(r: TagRemote): []Version! {
+  let run = runGit(r.gitBin, ["ls-remote", "--tags", "--refs", r.url], r.timeoutMs)?
+  if (run.timedOut) {
+    fail newError("pmfetch: git ls-remote --tags timed out after ${r.timeoutMs}ms: ${r.url}")
+  }
+  if (run.exitCode != 0) {
+    fail newError("pmfetch: git ls-remote --tags failed (exit ${run.exitCode}) for ${r.url}: ${pmTrim(run.output)}")
+  }
+
+  let versions = []Version(0)
+  let lines = split(run.output, "\n")
+  let li = 0
+  while (li < len(lines)) {
+    let (v, ok) = versionFromLsRemoteTagLine(lines[li], r.prefix)
+    if (ok) {
+      versions = append(versions, v)
+    }
+    li = li + 1
+  }
+  sortInPlace(versions, versionGreater)
+  return versions
+}
+
+// One `git ls-remote --tags --refs` output line, `<sha>\trefs/tags/<name>`,
+// to its parsed `Version` — or `(_, false)` when the line is blank, not a
+// `refs/tags/` entry (a branch, or a peeled `^{}` line if one ever leaked
+// through), does not sit under `prefix`, or the name left after stripping
+// `prefix` is not a version `canonicalVersion` accepts in either spelling.
+//
+// `prefix` is compared against the tag NAME, not the whole `refs/tags/...`
+// ref, so `"web/"` matches `refs/tags/web/v0.1.0` and rejects
+// `refs/tags/v0.1.0`. An empty `prefix` matches every tag name and strips
+// nothing, which is exactly the pre-#4472 behaviour — a bare `hasPrefix`
+// against "" is always true, so this needs no separate branch for it.
+fn versionFromLsRemoteTagLine(line: string, prefix: string): (Version, bool) {
+  let zero = Version{ major: 0, minor: 0, patch: 0 }
+  let tab = indexOf(line, "\t")
+  if (tab < 0) {
+    return zero, false
+  }
+  let ref = line[tab + 1:len(line)]
+  if (!hasPrefix(ref, "refs/tags/")) {
+    return zero, false
+  }
+  let name = ref[10:len(ref)] // len("refs/tags/")
+  if (!hasPrefix(name, prefix)) {
+    return zero, false
+  }
+  let (canon, ok) = canonicalVersion(name[len(prefix):len(name)])
+  if (!ok) {
+    return zero, false
+  }
+  return parseVersion(canon)
+}
+
+// `versionLess` (pmresolve.bit), flipped — passed to `sortInPlace` (std/sort)
+// this sorts `listVersions`' result highest-first instead of that library's
+// default ascending order. Defines no ordering of its own.
+fn versionGreater(a: Version, b: Version): bool {
+  return versionLess(b, a)
+}
+
