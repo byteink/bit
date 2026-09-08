@@ -18,6 +18,22 @@ Versioning, tags and the release procedure for every first-party package are in
 }
 ```
 
+## The client address
+
+`c.peer()` is the address of the socket the request arrived on, recorded by
+`std/http` when the connection was accepted, and `""` for a `Request` that
+never came off a socket (one built by hand, an in-process `App.handle` call, or
+the HTTP/3 path). It reads no request header and never will: `X-Forwarded-For`,
+`X-Real-IP` and `Forwarded` are client-supplied strings, so keying a rate
+limit, a ban or an audit record on one keys it on whatever the caller chose to
+send. Behind a reverse proxy `c.peer()` is therefore the proxy, which is
+correct rather than a bug — preferring a forwarding header is only sound when
+the proxy is known to overwrite it and the app cannot be reached except through
+that proxy, and both are facts about a deployment that this package cannot
+know. Handling them belongs in an opt-in middleware configured with the
+operator's trusted proxy list; no such middleware ships yet, and until one
+does, `c.peer()` is the only address here that a client cannot forge.
+
 ## Reading the request body
 
 ### Write an input type. That is the protection.
