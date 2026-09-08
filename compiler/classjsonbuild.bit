@@ -1,0 +1,285 @@
+// compiler/classjsonbuild.bit — the nodes `@json` synthesizes (#3976).
+//
+// classjson.bit decides WHAT to emit; this file emits it. What one class turns
+// into, written out, is exactly what a reader would have hand-written:
+//
+//     toJson(): Json {
+//       let __json_entries: []JsonEntry = []
+//       __json_entries = append(__json_entries, JsonEntry{ key: "id", value: Json.JsonInt(i64(this.id)) })
+//       let __json_a1: []Json = []
+//       for __json_v1 of this.tags {
+//         __json_a1 = append(__json_a1, Json.JsonString(__json_v1))
+//       }
+//       __json_entries = append(__json_entries, JsonEntry{ key: "tags", value: Json.JsonArray(__json_a1) })
+//       __json_entries = append(__json_entries, JsonEntry{ key: "nick",
+//         value: isSome(this.nick) ? Json.JsonString(unwrap(this.nick)) : Json.JsonNull })
+//       return Json.JsonObject(__json_entries)
+//     }
+//
+// A method spliced in before resolve is resolved, checked, lowered, mangled and
+// documented as one the class wrote itself, so no later pass needs to know this
+// feature exists — the same property #3879 and trait injection both rely on.
+//
+// THE OUTPUT IS BUILT AS A VALUE, NEVER AS TEXT. `Json` accumulates into one
+// growable `[]JsonEntry` and stdlib/json/encode.bit's `jsonEncode` renders it
+// into one `[]byte`; nothing here concatenates strings, which is the shape
+// #2173 removed from the encoder for being quadratic.
+//
+// SPANS. Every node a diagnostic could land on carries the span of the FIELD it
+// came from, so an error the ordinary checker raises inside this body underlines
+// the line the reader wrote. Only names with no source at all — the method name,
+// `this`, the locals, the constructor names — carry synthetic spans, and no
+// diagnostic is reachable on any of them.
+
+// The tree being mutated, the module's synthesized words, and the span every
+// node built for the CURRENT field is stamped with. One value so each helper
+// below stays well inside LINT.md's max-params=5.
+class JsonBuild {
+  tree: Tree,
+  st: SynthText,
+  span: Span,
+}
+
+fn jbIdent(jb: JsonBuild, word: string): int {
+  return synthIdent(jb.tree, jb.st, word)
+}
+
+fn jbNode(jb: JsonBuild, tag: Tag, kids: []int): int {
+  return addNode(jb.tree, tag, jb.span, 0, kids)
+}
+
+// `recv.name`, where `name` is a synthesized word.
+fn jbMember(jb: JsonBuild, recv: int, word: string): int {
+  return jbNode(jb, Tag.Member, [recv, jbIdent(jb, word)])
+}
+
+// `callee(args...)`. The middle kid is the generic-argument list, always absent.
+fn jbCall(jb: JsonBuild, callee: int, args: []int): int {
+  let argNodes = []int(0)
+  for a of args {
+    argNodes = append(argNodes, jbNode(jb, Tag.Arg, [a]))
+  }
+  return jbNode(jb, Tag.Call, [callee, 0, jbNode(jb, Tag.Args, argNodes)])
+}
+
+// `Json.<variant>(arg)` — one payload-carrying constructor of stdlib/json's
+// `Json` enum.
+fn jbJsonCtor(jb: JsonBuild, variant: string, arg: int): int {
+  return jbCall(jb, jbMember(jb, jbIdent(jb, "Json"), variant), [arg])
+}
+
+// `this.<field>`. The member name is a fresh leaf pointing at the FIELD NAME's
+// own span, so it both spells the right identifier and underlines the field the
+// reader declared. `jb.span` is that same span for every node of this field,
+// which is why no other helper needs the node.
+fn jbThisField(jb: JsonBuild, nameNode: int): int {
+  let recv = jbIdent(jb, synthReceiverName)
+  let name = addLeaf(jb.tree, Tag.Ident, getNode(jb.tree, nameNode).span)
+  return jbNode(jb, Tag.Member, [recv, name])
+}
+
+// The `Json` value for `x`, whose declared shape is `kind`. Integers and floats
+// are converted EXPLICITLY: `Json.JsonInt` takes an `i64` and `Json.JsonFloat`
+// an `f64`, and an unconverted `f32` reaching the second one is silently
+// reinterpreted today (#4487) rather than rejected. An `i64(...)` around an
+// `i64` is an identity conversion and costs nothing, so this does not need to
+// know which integer width the field actually has.
+fn jbValueOf(jb: JsonBuild, x: int, kind: int): int {
+  if (kind == jkInt) {
+    return jbJsonCtor(jb, "JsonInt", jbCall(jb, jbIdent(jb, "i64"), [x]))
+  }
+  if (kind == jkFloat) {
+    return jbJsonCtor(jb, "JsonFloat", jbCall(jb, jbIdent(jb, "f64"), [x]))
+  }
+  if (kind == jkBool) {
+    return jbJsonCtor(jb, "JsonBool", x)
+  }
+  if (kind == jkString) {
+    return jbJsonCtor(jb, "JsonString", x)
+  }
+  // jkNested: the nested class's own synthesized member. A type that does not
+  // have one was already rejected (classjson.bit's `vJsonNestedMark`) unless it
+  // came from another module, where ordinary member resolution reports it at
+  // this same span.
+  return jbCall(jb, jbMember(jb, x, synthToJsonName), []int(0))
+}
+
+// `JsonEntry{ key: <k>, value: <v> }`.
+fn jbEntry(jb: JsonBuild, k: int, v: int): int {
+  let inits = [
+    jbNode(jb, Tag.FieldInit, [jbIdent(jb, "key"), k]),
+    jbNode(jb, Tag.FieldInit, [jbIdent(jb, "value"), v]),
+  ]
+  return jbNode(
+    jb, Tag.CompositeLit,
+    [jbIdent(jb, "JsonEntry"), jbNode(jb, Tag.FieldInits, inits)],
+  )
+}
+
+// `<acc> = append(<acc>, <v>)` as one statement.
+fn jbAppendTo(jb: JsonBuild, accWord: string, v: int): int {
+  let call = jbCall(jb, jbIdent(jb, "append"), [jbIdent(jb, accWord), v])
+  return addNode(
+    jb.tree, Tag.Assign, jb.span, int(Kind.Eq),
+    [
+      jbNode(jb, Tag.LhsList, [jbIdent(jb, accWord)]),
+      jbNode(jb, Tag.ExprList, [call]),
+    ],
+  )
+}
+
+// `let <name>: []<elem> = []`. The empty slice literal carries no element type
+// of its own, which is exactly why the binding is annotated.
+fn jbLetSlice(jb: JsonBuild, nameWord: string, elemWord: string): int {
+  let ty = jbNode(jb, Tag.SliceType, [jbIdent(jb, elemWord)])
+  let binding = jbNode(
+    jb, Tag.Binding,
+    [jbIdent(jb, nameWord), ty, jbNode(jb, Tag.SliceLit, []int(0))],
+  )
+  return jbNode(jb, Tag.LetDecl, [binding])
+}
+
+// ---- one field -------------------------------------------------------------
+
+// The JSON key expression: a clone of the `@key` string literal when the field
+// carries one, else a fresh literal pointing at the quoted copy of the field's
+// own name that `appendSynthText` laid down. Cloned rather than shared — a node
+// reachable by two paths (the field's attribute list still holds the original)
+// is a shape no other pass here builds.
+fn jbKeyExpr(jb: JsonBuild, f: JsonField): int {
+  if (f.keyLit != 0) {
+    let n = getNode(jb.tree, f.keyLit)
+    return addLeaf(jb.tree, n.tag, n.span)
+  }
+  return addLeaf(jb.tree, Tag.StringLit, synthSpan(jb.st, f.keyWord))
+}
+
+// Every statement one field contributes, in order. A scalar, string, bool,
+// nested class or `Option<T>` is one `append`; `[]T` and `map<string, T>` add a
+// local accumulator and a loop ahead of it.
+fn jbFieldStmts(jb: JsonBuild, f: JsonField): []int {
+  jb.span = getNode(jb.tree, f.nameNode).span
+  if (f.kind == jkSlice) {
+    return jbSliceField(jb, f)
+  }
+  if (f.kind == jkMap) {
+    return jbMapField(jb, f)
+  }
+  let key = jbKeyExpr(jb, f)
+  if (f.kind == jkOption) {
+    return [jbAppendTo(jb, jsonLocalEntries, jbEntry(jb, key, jbOptionValue(jb, f)))]
+  }
+  let v = jbValueOf(jb, jbThisField(jb, f.nameNode), f.kind)
+  return [jbAppendTo(jb, jsonLocalEntries, jbEntry(jb, key, v))]
+}
+
+// `isSome(this.f) ? <value of unwrap(this.f)> : Json.JsonNull`.
+//
+// An ABSENT `Option` emits the key with an explicit null; it is never omitted.
+// A missing key and an explicit null are different to a client, and choosing
+// silently between them is how clients break (SPEC §10.5).
+fn jbOptionValue(jb: JsonBuild, f: JsonField): int {
+  let cond = jbCall(jb, jbIdent(jb, "isSome"), [jbThisField(jb, f.nameNode)])
+  let inner = jbCall(jb, jbIdent(jb, "unwrap"), [jbThisField(jb, f.nameNode)])
+  let some = jbValueOf(jb, inner, f.elemKind)
+  let none = jbMember(jb, jbIdent(jb, "Json"), "JsonNull")
+  return jbNode(jb, Tag.CondExpr, [cond, some, none])
+}
+
+// `let a: []Json = []` / `for v of this.f { a = append(a, <value of v>) }` /
+// the entry appending `Json.JsonArray(a)`.
+fn jbSliceField(jb: JsonBuild, f: JsonField): []int {
+  let acc = jsonLocalAcc(f.index)
+  let elem = jsonLocalVal(f.index)
+  let body = jbNode(
+    jb, Tag.Block,
+    [jbAppendTo(jb, acc, jbValueOf(jb, jbIdent(jb, elem), f.elemKind))],
+  )
+  let loop = jbNode(
+    jb, Tag.ForOf,
+    [jbIdent(jb, elem), jbThisField(jb, f.nameNode), body],
+  )
+  let entry = jbEntry(jb, jbKeyExpr(jb, f), jbJsonCtor(jb, "JsonArray", jbIdent(jb, acc)))
+  return [
+    jbLetSlice(jb, acc, "Json"), loop,
+    jbAppendTo(jb, jsonLocalEntries, entry),
+  ]
+}
+
+// The same shape for `map<string, T>`, whose accumulator is `[]JsonEntry` and
+// whose loop binds a `(key, value)` pair. The map's own key is already a
+// `string`, so it needs no conversion. Iteration order is the map's own — JSON
+// objects are unordered (RFC 8259 §4), and nothing here reorders them.
+fn jbMapField(jb: JsonBuild, f: JsonField): []int {
+  let acc = jsonLocalAcc(f.index)
+  let kv = jsonLocalKey(f.index)
+  let vv = jsonLocalVal(f.index)
+  let inner = jbEntry(jb, jbIdent(jb, kv), jbValueOf(jb, jbIdent(jb, vv), f.elemKind))
+  let body = jbNode(jb, Tag.Block, [jbAppendTo(jb, acc, inner)])
+  let binder = jbNode(jb, Tag.TuplePat, [jbIdent(jb, kv), jbIdent(jb, vv)])
+  let loop = jbNode(jb, Tag.ForOf, [binder, jbThisField(jb, f.nameNode), body])
+  let entry = jbEntry(jb, jbKeyExpr(jb, f), jbJsonCtor(jb, "JsonObject", jbIdent(jb, acc)))
+  return [
+    jbLetSlice(jb, acc, "JsonEntry"), loop,
+    jbAppendTo(jb, jsonLocalEntries, entry),
+  ]
+}
+
+// ---- the whole member ------------------------------------------------------
+
+// `[export] fn (this: C) toJson(): Json { ... }` for one class, as a top-level
+// declaration with a receiver — the identical shape an in-body method
+// (parsertype.bit's parseMethodMember) and an injected trait method
+// (checktrait.bit's cloneTraitMethod) both produce, which is why every pass that
+// discovers a method by walking the arena for func_decl-with-receiver picks this
+// up with no change at all.
+//
+// Exported iff the CLASS is: a `@json` class exists to be serialized by whoever
+// holds one, and that is routinely another module — but a class the module keeps
+// to itself cannot be named from outside anyway, so exporting its member would
+// state a visibility nobody can use.
+fn synthToJson(tree: Tree, st: SynthText, jc: JsonClass): int {
+  let classSpan = getNode(tree, jc.className).span
+  let jb = JsonBuild{ tree: tree, st: st, span: classSpan }
+  let stmts = [jbLetSlice(jb, jsonLocalEntries, "JsonEntry")]
+  for f of jc.fields {
+    for s of jbFieldStmts(jb, f) {
+      stmts = append(stmts, s)
+    }
+  }
+  jb.span = classSpan
+  stmts = append(
+    stmts,
+    jbNode(jb, Tag.ReturnStmt, [jbJsonCtor(jb, "JsonObject", jbIdent(jb, jsonLocalEntries))]),
+  )
+  // No generics kid and no generic receiver: `@json` on a generic class is
+  // E0144 (classjson.bit) and never reaches here, which is why `JsonClass`
+  // carries no generics node at all.
+  let recv = addNode(
+    tree, Tag.Receiver, classSpan, 0,
+    [0, traitClassTypeRef(tree, jc.className, 0)],
+  )
+  let decl = addNode(
+    tree, Tag.FuncDecl, classSpan, 0,
+    [
+      recv, synthIdent(tree, st, synthToJsonName), 0,
+      addNode(tree, Tag.Params, classSpan, 0, []int(0)),
+      synthIdent(tree, st, "Json"),
+      addNode(tree, Tag.Block, classSpan, 0, stmts),
+    ],
+  )
+  if (!jc.exported) {
+    return decl
+  }
+  return addNode(tree, Tag.Export, classSpan, 0, [decl])
+}
+
+// Every `@json` class's synthesized member, for the caller to attach in one
+// pass with #3879's.
+fn injectJsonDecls(m: SrcModule, st: SynthText, classes: []JsonClass): []int {
+  let out = []int(0)
+  for jc of classes {
+    out = append(out, synthToJson(m.tree, st, jc))
+  }
+  return out
+}

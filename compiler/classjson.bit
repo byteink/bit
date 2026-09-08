@@ -1,0 +1,437 @@
+// compiler/classjson.bit — `@json` on a class (SPEC §10.3.1, §10.5, #3976).
+//
+//     @json
+//     class User {
+//       id: i64
+//       name: string
+//       @key("created_at") createdAt: string
+//     }
+//
+// synthesizes `toJson(): Json`, which builds the `Json` value
+// stdlib/json/encode.bit's `jsonEncode` renders. The mark is the CONSENT:
+// synthesizing for every class would ship a field the moment someone adds one
+// to a type nobody meant to expose.
+//
+// `@json` and `@key` are COMPILER-KNOWN marks, the way `@naked`/`@nosplit`/
+// `@symbol` are on a function — NOT names resolved by lookup, which is what
+// every OTHER field attribute is (#3879: `@email` on a field is sugar for a
+// call to whatever `fn email(s: string): ()!` is in scope). That asymmetry is
+// deliberate and is stated in SPEC §10.3.1: a class attribute and `@key` name
+// nothing the user could have written, so routing them through name lookup
+// would report `@jsn` as an undefined function nobody meant to call.
+//
+// The KEY is the field name exactly as written — no case conversion, so the
+// class and the payload read the same — unless `@key("...")` overrides it.
+//
+// This file decides WHAT to emit (which classes, which fields, what each field
+// is). classjsonbuild.bit builds the nodes.
+
+// E0138 (§10.5): the class already declares the member synthesis would add.
+const ecToJsonDeclared = 138
+// E0139 (§10.5): `@key` on a field of a class that carries no `@json` — the
+// mark renames a key in output that is never produced.
+const ecKeyOutsideJson = 139
+// E0140 (§10.5): `@key` takes exactly one string constant. #3879's grammar
+// makes an attribute's argument list optional for ALL attributes, so a bare
+// `@key` parses; it is rejected here rather than silently falling back to the
+// field name, which would make a typo'd rename look like it worked.
+const ecKeyArgs = 140
+// E0141 (§10.5): a field whose type `toJson` cannot serialize — including a
+// class that does not itself carry `@json`, since recursing into one would
+// defeat the opt-in.
+const ecJsonFieldType = 141
+// E0144 (§10.5): `@json` on a generic class. Every judgment this pass makes is
+// SYNTACTIC — a field's JSON shape is read off its declared type node — and a
+// type parameter has no declared shape to read. Refused here, by name, rather
+// than left to fail: unrefused it reaches lowering as E0092 "cannot lower a
+// call whose callee does not resolve to a function" pointing at the field, and
+// it fails that way even when the instantiation would have been fine.
+const ecJsonGenericClass = 144
+
+// E0142 (§10.5): the module does not import the two names the synthesized
+// member is written in terms of. Reported INSTEAD of synthesizing, so the user
+// gets one diagnostic naming the import rather than a cascade of undefined-name
+// errors on a method they did not write.
+const ecJsonImportMissing = 142
+
+// The mark on the class, the mark on a field, and the member synthesized.
+const classAttrKey = "key"
+const synthToJsonName = "toJson"
+
+// The `Tag.AttrList` node on a class declaration, or 0. The 4th kid is elided
+// when the class carries no attributes (parsertype.bit's `parseStructDecl`), so
+// the length test is what keeps this total for every reader of a `StructDecl`.
+fn classAttrList(t: Tree, structDecl: int): int {
+  let k = kidsOf(t, structDecl)
+  if (len(k) <= 3) {
+    return 0
+  }
+  return k[3]
+}
+
+// True iff the class declaration carries `@json`. The parser has already
+// rejected every other class attribute (parserdecl.bit's `checkClassAttrs`), so
+// presence of any attribute at all would do — the name test is here so a future
+// second class attribute cannot silently turn `@json` on.
+fn classHasJson(t: Tree, source: string, structDecl: int): bool {
+  let list = classAttrList(t, structDecl)
+  if (list == 0) {
+    return false
+  }
+  for a of kidsOf(t, list) {
+    if (identText(t, source, kidsOf(t, a)[0]) == classAttrJson) {
+      return true
+    }
+  }
+  return false
+}
+
+// The `@key` attribute on a field, or 0. Compiler-known, so it is matched by
+// NAME here and excluded from #3879's desugaring (`validatorFieldAttrs`) — a
+// `@key` that reached that path would desugar to a call to a function called
+// `key` that nobody declared.
+fn fieldKeyAttr(t: Tree, source: string, field: int): int {
+  for a of fieldAttrs(t, field) {
+    if (identText(t, source, kidsOf(t, a)[0]) == classAttrKey) {
+      return a
+    }
+  }
+  return 0
+}
+
+// A field's attributes MINUS the compiler-known `@key` — the ones #3879
+// desugars into `validateFields` calls, which is every attribute that names a
+// function.
+fn validatorFieldAttrs(t: Tree, source: string, field: int): []int {
+  let out = []int(0)
+  for a of fieldAttrs(t, field) {
+    if (identText(t, source, kidsOf(t, a)[0]) != classAttrKey) {
+      out = append(out, a)
+    }
+  }
+  return out
+}
+
+// ---- collection ------------------------------------------------------------
+
+// One class carrying `@json`, plus the nodes its synthesized member needs.
+class JsonClass {
+  classNode: int,
+  className: int,
+  exported: bool,
+  fields: []JsonField,
+}
+
+// One serializable field of a `@json` class. `kind` is the shape its declared
+// TYPE has (jk* below); `elem` is the element/value/payload type node for the
+// three container shapes and 0 otherwise; `keyLit` is the `@key` string literal
+// to clone, or 0 when the key is the field's own name.
+class JsonField {
+  nameNode: int,
+  typeNode: int,
+  keyLit: int,
+  keyWord: string,
+  kind: int,
+  elemKind: int,
+  elem: int,
+  index: int,
+}
+
+const jkBad = 0
+const jkInt = 1
+const jkFloat = 2
+const jkBool = 3
+const jkString = 4
+const jkNested = 5
+const jkSlice = 6
+const jkMap = 7
+const jkOption = 8
+
+// Every class in the module carrying `@json`, in declaration order, already
+// validated: a class that declares `toJson` itself, or has a field this cannot
+// serialize, or sits in a module that does not import `std/json`, is reported
+// and DROPPED here rather than synthesized into a member whose own fallout is
+// all the reader would get.
+fn collectJsonClasses(p: Project, m: SrcModule): []JsonClass {
+  let tree = m.tree
+  let source = m.source
+  let out = []JsonClass(0)
+  let jx = newJsonCtx(p, m)
+  let hasImport = -1
+  for tc of topClassDecls(tree) {
+    let d = tc.decl
+    if (!classHasJson(tree, source, d)) {
+      continue
+    }
+    if (hasImport < 0) {
+      hasImport = 0
+      if (jsonImportBound(tree, source)) {
+        hasImport = 1
+      }
+    }
+    let jc = buildJsonClass(jx, d, tc.exported)
+    if (jc.classNode == 0) {
+      continue
+    }
+    if (hasImport == 0) {
+      reportJsonImportMissing(jx, jc)
+      continue
+    }
+    out = append(out, jc)
+  }
+  return out
+}
+
+fn reportJsonImportMissing(jx: JsonCtx, jc: JsonClass) {
+  let cname = identText(jx.tree, jx.source, jc.className)
+  report(
+    jx.diags, ecJsonImportMissing, getNode(jx.tree, jc.className).span,
+    "class '${cname}' carries '@json', but this module does not import 'Json' and 'JsonEntry'",
+    "add: import { Json, JsonEntry } from \"std/json\"",
+  )
+}
+
+// One top-level class declaration and whether it was `export`ed — the wrapper
+// is unwrapped to reach the declaration, so the flag has to be carried out with
+// it or the synthesized member cannot match the class's own visibility.
+class TopClass {
+  decl: int,
+  exported: bool,
+}
+
+// Every top-level `class` declaration in the module, seeing through an `export`
+// wrapper. Mirrors checktrait.bit's `collectClassUseSites` walk.
+fn topClassDecls(tree: Tree): []TopClass {
+  let out = []TopClass(0)
+  for d0 of kidsOf(tree, tree.root) {
+    let d = d0
+    let exported = d != 0 && getNode(tree, d).tag == Tag.Export
+    if (exported) {
+      d = kidsOf(tree, d)[0]
+    }
+    if (d != 0 && getNode(tree, d).tag == Tag.StructDecl) {
+      out = append(out, TopClass{ decl: d, exported: exported })
+    }
+  }
+  return out
+}
+
+// True iff the module imports both `Json` and `JsonEntry` from "std/json" under
+// those exact names. Purely syntactic and deliberately so: it runs before any
+// Checker exists, and its only job is to decide whether synthesizing would
+// produce a cascade of undefined-name errors on a method the user never wrote.
+// An aliased import (`Json as J`) does not bind `Json`, so it is not enough —
+// the local name is the alias, which is what `importItemLocalName` returns.
+fn jsonImportBound(tree: Tree, source: string): bool {
+  let names = map<string, bool>{}
+  for d of kidsOf(tree, tree.root) {
+    if (d == 0 || getNode(tree, d).tag != Tag.ImportDecl) {
+      continue
+    }
+    let k = kidsOf(tree, d)
+    if (stringLitText(source, getNode(tree, k[1]).span) != "std/json") {
+      continue
+    }
+    if (getNode(tree, k[0]).tag != Tag.ImportGroup) {
+      continue
+    }
+    for item of kidsOf(tree, k[0]) {
+      names[importItemLocalName(tree, source, item)] = true
+    }
+  }
+  let (_, hasJson) = names["Json"]
+  let (_, hasEntry) = names["JsonEntry"]
+  return hasJson && hasEntry
+}
+
+// The name an `ImportItem` binds locally: its alias when it has one, else the
+// exported name (`[name, alias]`, parsertype.bit's `parseImportItem`).
+fn importItemLocalName(tree: Tree, source: string, item: int): string {
+  let k = kidsOf(tree, item)
+  if (k[1] != 0) {
+    return identText(tree, source, k[1])
+  }
+  return identText(tree, source, k[0])
+}
+
+// One `@json` class's fields, or a `JsonClass` with `classNode == 0` when it
+// was rejected. Validation is here rather than in a later Checker pass so that
+// a class this cannot serialize is never synthesized at all — every diagnostic
+// below names the class or the field the reader wrote, and none of them is
+// followed by fallout from a member they did not.
+fn buildJsonClass(jx: JsonCtx, d: int, exported: bool): JsonClass {
+  let tree = jx.tree
+  let source = jx.source
+  let k = kidsOf(tree, d)
+  let bad = JsonClass{
+    classNode: 0, className: 0, exported: false, fields: []JsonField(0),
+  }
+  if (k[1] != 0) {
+    let gname = identText(tree, source, k[0])
+    report(
+      jx.diags, ecJsonGenericClass, getNode(tree, k[0]).span,
+      "'@json' is not supported on generic class '${gname}'",
+      "a type parameter has no declared shape to serialize; mark each concrete class instead",
+    )
+    return bad
+  }
+  let own = declaredMember(tree, source, k[2], synthToJsonName)
+  if (own != 0) {
+    let cname = identText(tree, source, k[0])
+    report(
+      jx.diags, ecToJsonDeclared, getNode(tree, own).span,
+      "class '${cname}' carries '@json' and also declares 'toJson', which '@json' synthesizes",
+      "drop '@json', or rename this method — a hand-written 'toJson' that silently won would make adding '@json' appear to work while changing nothing",
+    )
+    return bad
+  }
+  let (fields, ok) = collectJsonFields(jx, d)
+  if (!ok) {
+    return bad
+  }
+  return JsonClass{
+    classNode: d, className: k[0], exported: exported, fields: fields,
+  }
+}
+
+// The class's own member named `name`, or 0. Reads the LAST match for the same
+// reason classinit.bit's `classInitDecl` does: a duplicate leaves the last
+// declaration as the one every later pass registered.
+fn declaredMember(tree: Tree, source: string, fieldList: int, name: string): int {
+  let found = 0
+  for m0 of kidsOf(tree, fieldList) {
+    let m = m0
+    if (getNode(tree, m).tag == Tag.Export) {
+      m = kidsOf(tree, m)[0]
+    }
+    if (getNode(tree, m).tag == Tag.FuncDecl) {
+      let nameNode = kidsOf(tree, m)[1]
+      if (identText(tree, source, nameNode) == name) {
+        found = nameNode
+      }
+    }
+  }
+  return found
+}
+
+// ---- the `@key` mark -------------------------------------------------------
+
+// The `@key` string literal to clone and the key word to append, for one
+// field. `(0, "\"name\"", true)` is the default: no `@key`, so the key is the
+// field's own name and the builder needs a quoted copy of it in the source.
+// A field name is an identifier, so quoting it cannot need an escape.
+fn jsonKeyOf(jx: JsonCtx, field: int): (int, string, bool) {
+  let attr = fieldKeyAttr(jx.tree, jx.source, field)
+  let fname = identText(jx.tree, jx.source, kidsOf(jx.tree, field)[0])
+  if (attr == 0) {
+    return (0, "\"" + fname + "\"", true)
+  }
+  let k = kidsOf(jx.tree, attr)
+  if (len(k) < 2) {
+    reportKeyArgs(jx, attr, fname, "takes exactly one string, and has none")
+    return (0, "", false)
+  }
+  if (len(k) > 2) {
+    reportKeyArgs(jx, attr, fname, "takes exactly one string, and has ${len(k) - 1}")
+    return (0, "", false)
+  }
+  let argTag = getNode(jx.tree, k[1]).tag
+  if (argTag != Tag.StringLit && argTag != Tag.RawStringLit) {
+    reportKeyArgs(jx, attr, fname, "takes a string constant, and has '${jsonNodeText(jx, k[1])}'")
+    return (0, "", false)
+  }
+  return (k[1], "", true)
+}
+
+fn reportKeyArgs(jx: JsonCtx, attr: int, fname: string, what: string) {
+  report(
+    jx.diags, ecKeyArgs, getNode(jx.tree, attr).span,
+    "'@key' on field '${fname}' ${what}",
+    "write '@key(\"name\")' with the exact key to emit; without one the key is the field name '${fname}'",
+  )
+}
+
+// `@key` on a field of a class carrying no `@json`, reported for its own sake:
+// the mark renames a key in output that is never produced, and nothing else in
+// the pipeline would ever look at it. Runs over every module, unconditionally,
+// because a module in this state synthesizes nothing at all.
+fn vStrayKeyAttrs(tree: Tree, source: string, diags: Diagnostics) {
+  for tc of topClassDecls(tree) {
+    let d = tc.decl
+    if (classHasJson(tree, source, d)) {
+      continue
+    }
+    let cname = identText(tree, source, kidsOf(tree, d)[0])
+    for m of kidsOf(tree, kidsOf(tree, d)[2]) {
+      let f = memberField(tree, m)
+      if (f == 0) {
+        continue
+      }
+      let attr = fieldKeyAttr(tree, source, f)
+      if (attr == 0) {
+        continue
+      }
+      let fname = identText(tree, source, kidsOf(tree, f)[0])
+      report(
+        diags, ecKeyOutsideJson, getNode(tree, attr).span,
+        "'@key' on field '${fname}' has no effect: class '${cname}' does not carry '@json'",
+        "mark '${cname}' with '@json', or drop '@key' — '@key' renames a key only in output '@json' produces",
+      )
+    }
+  }
+}
+
+// ---- the synthesized word list ---------------------------------------------
+
+// Every word `injectJsonDecls` will need in the module source, for
+// `appendSynthText` to lay down in one append. The FIXED half is appended
+// whole whenever any `@json` class exists rather than being narrowed to the
+// kinds actually present: a word list that tracked which constructors are
+// reachable would be a second copy of the builder's dispatch, and the two
+// going out of step is exactly the bug `synthSpan`'s panic exists to catch.
+// Eighteen short words per module is not worth that risk.
+fn jsonSynthWords(classes: []JsonClass): []string {
+  if (len(classes) == 0) {
+    return []string(0)
+  }
+  let out = [
+    synthToJsonName, synthReceiverName, "Json", "JsonEntry", "JsonObject",
+    "JsonArray", "JsonString", "JsonInt", "JsonFloat", "JsonBool", "JsonNull",
+    "key", "value", "append", "isSome", "unwrap", "i64", "f64", jsonLocalEntries,
+  ]
+  for c of classes {
+    for f of c.fields {
+      if (f.keyWord != "") {
+        out = append(out, f.keyWord)
+      }
+      if (f.kind == jkSlice || f.kind == jkMap) {
+        out = append(out, jsonLocalAcc(f.index))
+        out = append(out, jsonLocalVal(f.index))
+      }
+      if (f.kind == jkMap) {
+        out = append(out, jsonLocalKey(f.index))
+      }
+    }
+  }
+  return out
+}
+
+// The synthesized method's locals. The entry accumulator is one per method, so
+// one name serves every class; a container field's accumulator and loop binders
+// are numbered by the field's own index, so two `[]T` fields in one class never
+// declare the same local twice. The `__json_` prefix is not a reservation and
+// does not need to be: these names live in the method's own block scope, which
+// contains nothing else the user wrote.
+const jsonLocalEntries = "__json_entries"
+
+fn jsonLocalAcc(i: int): string {
+  return "__json_a${i}"
+}
+
+fn jsonLocalVal(i: int): string {
+  return "__json_v${i}"
+}
+
+fn jsonLocalKey(i: int): string {
+  return "__json_k${i}"
+}
