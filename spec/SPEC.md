@@ -562,17 +562,19 @@ result_type   = type .            (* may carry the fallible marker, §18 *)
   `[]T`. At a call site the caller passes zero or more `T` arguments, or spreads a
   `[]T` with `...` (§12.4).
 
-#### 10.3.1 Function Attributes
+#### 10.3.1 Function and Class Attributes
 
-An attribute constrains how a function is compiled. Attributes precede
-`fn` and attach to function declarations only:
+An attribute constrains how a declaration is compiled. Attributes precede
+`fn` (a function declaration) and `class` (a class declaration, §10.5):
 
 ```
 attr_list     = attr { attr } .
 attr          = "@" IDENT [ "(" [ const_expr { "," const_expr } ] ")" ] .
 ```
 
-`export` stays outermost: `export @naked fn f() {}`. An attribute list may
+`export` stays outermost: `export @naked fn f() {}`, `export @json class C {}`.
+Writing the attribute first (`@json export class C {}`) is **E0143**, which
+names the fix. An attribute list may
 also sit on its own line above the declaration it modifies; the semicolon
 automatic insertion would place there (§7) is not meaningful, because an
 attribute list is only ever followed by another attribute, by `fn`, or by a
@@ -585,16 +587,27 @@ argument, and that argument must be exactly one string literal — giving one to
 `symbol_attr_invalid`. All three exist for the unmanaged subset the runtime is
 written against — ordinary Bit code should not need them.
 
-**A function attribute and a field attribute are different things that share a
-spelling, and the asymmetry is deliberate.** A function attribute is
-compiler-known: the three names above are the only ones, they are never
-resolved through name lookup, and there is no function anywhere called `naked`.
-A **field** attribute (§10.5) is the opposite — it names an ordinary function,
-found by ordinary name lookup, and the compiler knows no field attributes at
-all. So `@nosplit` on a field is not special and would have to name a function;
-`@min` on a `fn` is `E0076`. The grammar above is shared by both positions,
-which is why the argument list is a general one; what an argument may be is
-decided per position.
+**A function attribute, a class attribute and a field attribute are different
+things that share a spelling, and the asymmetry is deliberate.** A function
+attribute is compiler-known: the three names above are the only ones, they are
+never resolved through name lookup, and there is no function anywhere called
+`naked`. A **field** attribute (§10.5) is the opposite — it names an ordinary
+function, found by ordinary name lookup, and the compiler knows no field
+attributes at all. So `@nosplit` on a field is not special and would have to
+name a function; `@min` on a `fn` is `E0076`. The grammar above is shared by
+every position, which is why the argument list is a general one; what an
+argument may be is decided per position.
+
+A **class** attribute sits on the compiler-known side. `@json` (§10.5) is the
+only one the language defines, and any other name in that position is
+**E0136** — not an undefined-function error, because nothing here is a function
+call. `@json` takes no arguments; giving it any is **E0137**.
+
+**The one compiler-known FIELD attribute is `@key`** (§10.5). It is the single
+exception to the rule that a field attribute names a function: `@key("...")`
+sets the JSON key a `@json` class emits for that field, and there is no
+function called `key`. Everything else in field position still resolves by
+name lookup, so adding `@key` did not make the field position a registry.
 
 **`@naked`** — the function gets no prologue and no epilogue, and returns
 through a bare machine `ret`. It runs on its caller's frame, so it must need no
@@ -841,7 +854,7 @@ let a = Account(500)?
 ### 10.5 Class Declarations
 
 ```
-class_decl  = "class" IDENT [ generic_params ] "{" [ member { ( ";" | "," ) member } [ ";" | "," ] ] "}" .
+class_decl  = [ attr_list ] "class" IDENT [ generic_params ] "{" [ member { ( ";" | "," ) member } [ ";" | "," ] ] "}" .
 member      = field | method_decl .    (* method_decl, §10.4 *)
 field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" const_expr ] .
 ```
@@ -923,6 +936,55 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
 - Attributes are class-field-only. An attribute on a class **method** is
   **E0131** — a method has no value to pass — and `trait_field` (§10.7)
   carries none, so `@` in a trait body is a parse error.
+
+**`@json` — synthesizing `toJson`.**
+
+- A class declaration may carry the attribute `@json` (§10.3.1). It is the only
+  class attribute the language defines; any other name there is **E0136**, and
+  `@json` with an argument is **E0137**.
+- A class carrying `@json` gains a synthesized member
+
+  ```
+  toJson(): Json
+  ```
+
+  building the `Json` value (`std/json`) that `jsonEncode` renders. It is an
+  ordinary member: callable, testable, callable across modules, listed by
+  `bit doc`, and exported exactly when the class is.
+- The module declaring the class must import `Json` and `JsonEntry` from
+  `"std/json"` under those names; the member is written in terms of both.
+  Without them the class is **E0142** and nothing is synthesized.
+- **The mark is opt-in and it is the consent.** A class without `@json` has no
+  `toJson` at all. Synthesizing for every class would expose a field the moment
+  someone adds one to a type nobody meant to serialize.
+- The JSON key is **the field name exactly as written** — `isAdmin` is
+  `"isAdmin"`. There is no case conversion, so the class and the payload read
+  the same. `@key("...")` on a field overrides it for an API that demands
+  otherwise. `@key` is compiler-known and takes exactly one string constant;
+  anything else — none, two, or a non-string — is **E0140**, naming the
+  attribute and the field, never a silent fallback to the field name. `@key` on
+  a field of a class that does not carry `@json` is **E0139**.
+- Entries are emitted in **declaration order**, one per field.
+- A field's type must be a scalar, `string`, `bool`, `[]T`, `map<string, T>`,
+  `Option<T>` or a nested class that itself carries `@json`; in the three
+  container forms `T` must itself be one of the first four shapes or a nested
+  `@json` class, never another container. Anything else is **E0141**, naming
+  the field and the type — including a class that did not opt in, since
+  recursing into one would defeat the mark. One rejected field rejects the
+  whole class: a `toJson` that silently omitted a field would be invisible in
+  the output.
+- **An absent `Option<T>` emits its key with an explicit `null`. It is never
+  omitted.** A missing key and an explicit null are different to a client, and
+  choosing silently between them is how clients break.
+- A class carrying `@json` that also declares `toJson` itself is **E0138**,
+  naming both — the same rule, and for the same reason, as `validateFields`
+  above. A program wanting different output declares a second class
+  (`@json class UserView { ... }`), which is strictly better than a hand-written
+  `toJson` on the first: a generated one would ship a new field the day someone
+  adds it, and a hand-written one would not.
+- Output is built as a **value**, never by string concatenation: the member
+  appends into one growable `[]JsonEntry` and `jsonEncode` renders it into one
+  buffer.
 - Fields are ordered; that order is the memory layout order (subject to the
   compiler's alignment padding). A method interleaved between fields does
   not affect this order or count as a field itself.
@@ -4493,7 +4555,7 @@ params        = param { "," param } [ "," ] .
 param         = [ "..." ] IDENT ":" type .
 extern_fn_decl = "extern" "fn" IDENT signature .
 
-class_decl    = "class" IDENT [ generic_params ] "{" [ member { fsep member } [ fsep ] ] "}" .
+class_decl    = [ attr_list ] "class" IDENT [ generic_params ] "{" [ member { fsep member } [ fsep ] ] "}" .
 member        = field | method_decl .
 field         = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" const_expr ] .
 method_decl   = [ "export" ] IDENT [ generic_params ] signature block .

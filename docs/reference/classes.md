@@ -214,6 +214,89 @@ through name lookup, and any other name on a `fn` is an error - there is no
 function called `naked` anywhere. Field attributes are the exact opposite: the
 compiler knows none of them by name.
 
+`@key` is the one exception on the field side, and it is there because JSON
+keys are data rather than behaviour - see [`@json`](#json) below.
+
+## `@json` - a generated `toJson` {#json}
+
+Mark a class `@json` and the compiler synthesises `toJson(): Json` from its
+fields, so `jsonEncode(u.toJson())` works with no hand-written mapper and
+adding a field updates the output automatically.
+
+```bit
+import { Json, JsonEntry, jsonEncode } from "std/json"
+
+@json class Addr {
+  city: string,
+}
+
+@json class Profile {
+  id: i64
+  name: string
+  active: bool
+  tags: []string
+  nick: Option<string>
+  @key("created_at")
+  createdAt: string
+  addr: Addr
+}
+
+fn encodeProfile(u: Profile): string {
+  return jsonEncode(u.toJson())
+}
+```
+
+The key is **the field name exactly as written** - `isAdmin` is `"isAdmin"`.
+There is no case conversion, so the class and the payload read the same and
+nobody translates between two spellings while debugging. `@key("...")` sets a
+different key for an API that demands one; it takes exactly one string, and
+none, two, or a non-string is an error naming the attribute and the field
+(`E0140`) rather than a silent fallback.
+
+The module has to import `Json` and `JsonEntry` from `"std/json"` - the
+generated member is written in terms of both - and without them the class is
+`E0142`, which names the import to add.
+
+### What a field may be
+
+A scalar, `string`, `bool`, `[]T`, `map<string, T>`, `Option<T>`, or a nested
+class that itself carries `@json`. Inside those three containers `T` must be
+one of the simple shapes or a nested `@json` class, never another container.
+Anything else is `E0141`, naming the field and its type.
+
+**An absent `Option<T>` emits its key with an explicit `null`.** It is not
+omitted: a missing key and an explicit null are different to a client, and
+choosing silently between them is how clients break.
+
+### The mark is the consent
+
+A class without `@json` has no `toJson` at all. That is the point: a generated
+member on every class would expose a field the day someone adds one to an
+internal type.
+
+For the same reason `@json` never recurses into a class that did not opt in -
+a field whose type is an unmarked class is `E0141`, naming both.
+
+And a class carrying `@json` that also declares `toJson` itself is `E0138`,
+naming both. If you want different output, declare a second class:
+
+```bit
+@json class Account {
+  id: i64,
+  email: string,
+  pwHash: string,
+}
+
+@json class AccountView {
+  id: i64,
+  email: string,
+}
+```
+
+That is strictly better than a custom `toJson` on `Account`, because a
+generated one would ship `pwHash` the day someone added it - and the view
+class says out loud which fields go over the wire.
+
 ## Readonly fields {#readonly-fields}
 
 A field marked `readonly` may be set only in a composite literal, or inside
