@@ -132,7 +132,21 @@ case "${BUCKET}" in
     # formatter must round-trip all nine corpus trees, #4451, wired here only
     # — see that ticket's own comment for why the other eight trees are not
     # wired the same way).
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip)
+    #
+    # test-abimembers (#4465) is the same class reached by a THIRD route: its
+    # scope is neither in argv (which names only its own fixture directory,
+    # `_tests_/bit/abimembers`) nor in an env entry — it is baked into
+    # _tests_/bit/abimembers/abimembers.bit's own walk, `bitSources(
+    # "${repo}/compiler")` at :216 plus `"${repo}/compiler/irrtfns.bit"` at
+    # :373, which reads EVERY `Op.RtCall` name in compiler/*.bit as an ABI
+    # demand that runtime/ must provide. It was listed in the `runtime` bucket
+    # only, so a compiler-only diff never ran the gate that exists to catch a
+    # compiler-only defect: ae8a2581 went red on it in the pre-push suite after
+    # #4455's branch ran gate.sh PASS and ~20 gates by hand
+    # (compiler/arm64checklayout.bit's layout fixture had named the invented
+    # rt_call tag "f"; symptom fixed at d1534308). It stays in `runtime` too —
+    # it scans both trees and either half can break it.
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did
