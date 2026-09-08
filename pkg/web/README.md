@@ -158,3 +158,110 @@ the behaviour above changes.
 `Config.maxBody` bounds what this framework will **parse**. It is not a bound
 on what was read: `std/http` reads a `Content-Length` body with no limit of its
 own, so the bytes are already in memory before any `Ctx` exists (#4565).
+
+## Validating the body
+
+Binding checks the **shape** — every field present, every field the right type —
+and answers 400 when it is wrong. Validation checks the **values**, and answers
+422. The two statuses are worth keeping apart: 400 says "I could not read this",
+422 says "I read it and the values are unacceptable", and only the second is
+something to show a user.
+
+### Rules go on the field
+
+```
+@json class Signup {
+  @minLen(3)
+  @maxLen(12)
+  name: string
+
+  @email
+  email: string
+
+  password: string
+  confirm: string
+
+  // Cross-field rules, which no per-field attribute can express.
+  export validate(): ()! {
+    if (this.password != this.confirm) {
+      fail unprocessable("password and confirm must match")
+    }
+  }
+}
+```
+
+An attribute is a call to an ordinary function: `@minLen(3)` on `name` is
+`minLen(this.name, 3)`. The compiler collects them into a `validateFields()` on
+the class, and `c.body` runs it, then `validate()` if the type has one. **Both
+run, and their failures are reported together** — a form is not corrected one
+message per round trip.
+
+```
+POST /signup   {"name":"ab","email":"a@b.co","password":"p","confirm":"q"}
+422            {"status":422,"error":"must be at least 3 character(s); password and confirm must match"}
+```
+
+A type with neither member binds with no validation and no error. That is a type
+with no rules, not a mistake.
+
+### The rules this package ships
+
+| rule | on | passes when |
+|---|---|---|
+| `@minLen(n)` / `@maxLen(n)` | `string` | the value is at least / at most `n` **characters** (not bytes) |
+| `@min(n)` / `@max(n)` | `i64` | the value is at least / at most `n` |
+| `@email` | `string` | one `@`, a domain with an interior dot, no whitespace |
+| `@httpUrl` | `string` | an absolute `http://` or `https://` URL with a host |
+| `@uuid` | `string` | canonical `8-4-4-4-12` hex, either case |
+| `@nonEmpty` | `string` | something is left after trimming whitespace |
+
+Lengths and values are named apart (`minLen` vs `min`) because Bit has no
+overloading, so `@min(3)` on a string is a compile error with an obvious fix
+rather than a rule that measured the wrong thing.
+
+`@httpUrl` and not `@url`: this package already exports `url()`, the href scheme
+allowlist, and one module cannot hold two.
+
+### Anyone can add a rule
+
+There is no registry and no list of known rules. Export a fallible function and
+its name is an attribute:
+
+```
+export fn iban(v: string): ()! {
+  if (!validIban(v)) {
+    fail unprocessable("must be an IBAN")
+  }
+}
+
+@json class Payment {
+  @iban
+  account: string
+}
+```
+
+`@iban` works with no change to this package and no change to the compiler, and
+`@ibna` is an ordinary `E0040 undefined name`. That is the reason the design is
+attributes over a fixed rule set.
+
+### A rule decides what the client may read
+
+The framework's rule for errors applies here unchanged: a failure that satisfies
+`HttpError` — which `unprocessable(...)` and the other constructors return — has
+its message sent. A rule that fails with anything else is a **500 with the
+message logged and never sent**, so a validator that called into a database and
+failed cannot paste a connection string into a 422.
+
+### What this does not do yet
+
+Two limits, both in the compiler's synthesis of `validateFields()` and both
+tracked by #4572:
+
+- **Two failing attributes report one message.** The synthesized method
+  propagates the first failure, so `name` being too short hides a malformed
+  `email` until it is fixed. A field rule and a cross-field rule are still
+  reported together, since those are two separate calls.
+- **A message cannot name its field.** The call passes the field's value and
+  nothing else, so neither the rule nor this package knows which field it ran
+  on. Until that changes, put the field in your own rule's message when it
+  matters.
