@@ -1,0 +1,204 @@
+// stdlib/http/client.test.bit — the response body budget (#4585).
+//
+// The mirror of message.test.bit, on the client side: `readResponse` reads
+// whatever the SERVER declares, so a hostile server exhausts this process's
+// memory exactly as a hostile client used to exhaust a server's (#4565).
+//
+// `readResponse`, `Client`, `newClient`, `serve`, `listenAndServeOn`, `get`,
+// `ok`, `listen`, `Listener`, `indexOf`, `repeat`, `itoa` and `atoi` are all
+// siblings or module-wide imports (SPEC §19), so nothing is imported here —
+// including `newScript`, `scriptedStream` and `chunk`, which message.test.bit
+// already declares in this module.
+//
+// The first four tests drive `readResponse` directly through that scripted
+// stream, with no socket: the double counts its reads and remembers how far it
+// was consumed, which is what makes "refused BEFORE the bytes are read"
+// checkable rather than asserted. The last two prove the budget reaching the
+// wire — one through `Client.setMaxBodyBytes`, one through the package-level
+// `get`'s default — because a budget that is correct in `readResponse` and
+// never plumbed through `requestBlock`/`exchangeOn` would pass all four of
+// the others.
+
+// One HTTP/1.1 response head, terminated: `extra` carries the framing header
+// lines (none at all for the read-to-EOF case).
+fn respHead(extra: string): string {
+  return "HTTP/1.1 200 OK\r\n${extra}\r\n"
+}
+
+test "a response Content-Length above the budget is refused without reading the body" {
+  // 4 GiB declared, and not one byte of it sent — the shape that used to
+  // allocate 4 GiB inside `get` before the caller saw anything.
+  let head = respHead("Content-Length: 4294967296\r\n")
+  let st = newScript(head, 65536)
+  let res = readResponse(st, 1024) catch e {
+    let m = e.message()
+    assert(indexOf(m, "exceeds 1024 bytes") >= 0, "message = '${m}'")
+    assert(indexOf(m, "4294967296") >= 0, "message = '${m}'")
+    // One read: the head. The refusal happened before anything asked the
+    // stream for a body byte — with the budget gone, the Content-Length read
+    // makes at least one more call before giving up.
+    assert(st.reads == 1, "reads = ${itoa(st.reads)}")
+    assert(st.pos == len(head), "consumed ${itoa(st.pos)} of ${itoa(len(head))}")
+    return
+  }
+  assert(false, "readResponse returned a ${itoa(len(res.body))}-byte body instead of failing")
+}
+
+test "a chunked response body is refused on the chunk that crosses the budget" {
+  // Three 256-byte chunks against a 512-byte budget: each one is individually
+  // under the limit, so only a running total can catch this. The 100000-byte
+  // chunk after them is the evidence that the refusal stopped the read rather
+  // than tidying up after it.
+  let head = respHead("Transfer-Encoding: chunked\r\n")
+  let small = chunk("100", repeat("a", 256))
+  let data = head + small + small + small + chunk("186a0", repeat("b", 100000)) + "0\r\n\r\n"
+  let st = newScript(data, 64)
+  let res = readResponse(st, 512) catch e {
+    let m = e.message()
+    assert(indexOf(m, "chunked body exceeds 512 bytes") >= 0, "message = '${m}'")
+    let left = len(data) - st.pos
+    assert(left > 50000, "only ${itoa(left)} of ${itoa(len(data))} bytes were left unread")
+    return
+  }
+  assert(false, "readResponse returned a ${itoa(len(res.body))}-byte body instead of failing")
+}
+
+test "a read-to-EOF response body is refused on the read that crosses the budget" {
+  // No framing header at all: RFC 9112 §6.3's case-7 fallback, the least
+  // bounded of the three — there is no declared length to refuse, so the
+  // budget can only be enforced as the bytes arrive. 100000 bytes streamed 64
+  // at a time against a 512-byte budget.
+  let head = respHead("")
+  let data = head + repeat("c", 100000)
+  let st = newScript(data, 64)
+  let res = readResponse(st, 512) catch e {
+    let m = e.message()
+    assert(indexOf(m, "body exceeds 512 bytes") >= 0, "message = '${m}'")
+    let left = len(data) - st.pos
+    assert(left > 50000, "only ${itoa(left)} of ${itoa(len(data))} bytes were left unread")
+    return
+  }
+  assert(false, "readResponse returned a ${itoa(len(res.body))}-byte body instead of failing")
+}
+
+test "a response body of exactly the budget is returned intact on all three framings" {
+  let body = repeat("a", 64)
+
+  let cl = newScript(respHead("Content-Length: 64\r\n") + body, 64)
+  let clRes = readResponse(cl, 64) catch e {
+    assert(false, "Content-Length at the budget: ${e.message()}")
+    return
+  }
+  assert(clRes.status == 200, "status = ${itoa(clRes.status)}")
+  assert(clRes.body == body, "body was ${itoa(len(clRes.body))} bytes, not 64 intact")
+
+  let chHead = respHead("Transfer-Encoding: chunked\r\n")
+  let ch = newScript(chHead + chunk("40", body) + "0\r\n\r\n", 64)
+  let chRes = readResponse(ch, 64) catch e {
+    assert(false, "chunked at the budget: ${e.message()}")
+    return
+  }
+  assert(chRes.body == body, "chunked body was ${itoa(len(chRes.body))} bytes, not 64 intact")
+
+  let eof = newScript(respHead("") + body, 64)
+  let eofRes = readResponse(eof, 64) catch e {
+    assert(false, "read-to-EOF at the budget: ${e.message()}")
+    return
+  }
+  assert(eofRes.body == body, "read-to-EOF body was ${itoa(len(eofRes.body))} bytes, not 64 intact")
+}
+
+// The whole server under test for the end-to-end cases: answer with a body of
+// exactly the number of bytes the path asks for, so the client's budget is
+// what decides whether the response is accepted.
+fn sizedBody(req: Request): Response {
+  return ok(repeat("a", atoi(req.path[1:len(req.path)])))
+}
+
+// `listenAndServeOn` returns only on an accept error, which is what closing the
+// listener at the end of the test produces; swallowing it is the intended end
+// of this green thread, not an ignored failure.
+fn sizedServe(s: Server) {
+  listenAndServeOn(s, sizedBody) catch _ {
+    return
+  }
+}
+
+test "Client.setMaxBodyBytes reaches the read path over a real connection" {
+  let s = serve("127.0.0.1", 0) catch e {
+    assert(false, "serve: ${e.message()}")
+    return
+  }
+  let port = s.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  spawn sizedServe(s)
+
+  let c = newClient()
+  c.setMaxBodyBytes(64)
+  let atLimit = c.get("http://127.0.0.1:${port}/64") catch e {
+    s.close()
+    assert(false, "get at the limit: ${e.message()}")
+    return
+  }
+  assert(atLimit.status == 200, "at the limit: status ${itoa(atLimit.status)}")
+  assert(len(atLimit.body) == 64, "at the limit: body was ${itoa(len(atLimit.body))} bytes")
+
+  let over = c.get("http://127.0.0.1:${port}/65") catch e {
+    let m = e.message()
+    // The server declares 65 in its Content-Length; the client refuses on that
+    // declared number, naming its own limit.
+    assert(indexOf(m, "65 exceeds 64 bytes") >= 0, "message = '${m}'")
+    s.close()
+    return
+  }
+  s.close()
+  assert(false, "over the limit: got status ${itoa(over.status)} and ${itoa(len(over.body))} bytes")
+}
+
+// A server that is not a server: one connection, one hand-written response
+// declaring 4 GiB it never sends. Nothing in `std/http` can produce this, and
+// that is the point — the defect this fixes is about what a HOSTILE peer
+// declares. The request is read first so the client's write cannot fail
+// against an already-closed socket.
+fn hostileServe(l: Listener) {
+  let c = l.accept() catch _ {
+    return
+  }
+  let req = c.read(4096)
+  if (len(req) == 0) {
+    c.close()
+    return
+  }
+  c.write(respHead("Content-Length: 4294967296\r\n")) catch _ {
+    c.close()
+    return
+  }
+  c.close()
+}
+
+test "the package-level get carries a finite default response budget" {
+  let l = listen("127.0.0.1", 0) catch e {
+    assert(false, "listen: ${e.message()}")
+    return
+  }
+  let port = l.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  spawn hostileServe(l)
+
+  let res = get("http://127.0.0.1:${port}/") catch e {
+    let m = e.message()
+    // 33554432 is `defaultMaxBodyBytes` (32 MiB): the point is that `get`,
+    // which takes no configuration at all, carries a FINITE budget and says
+    // which one. A caller needing more uses `newClient` +
+    // `Client.setMaxBodyBytes`.
+    assert(indexOf(m, "4294967296 exceeds 33554432 bytes") >= 0, "message = '${m}'")
+    l.close()
+    return
+  }
+  l.close()
+  assert(false, "get returned status ${itoa(res.status)} instead of refusing 4 GiB")
+}

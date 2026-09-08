@@ -167,24 +167,24 @@ fn readContentLengthBody(s: byteStream, initial: string, cl: int): string! {
   return body.toString()
 }
 
-// The response-side body budget: none. #4565 bounded the SERVER's request
-// read; the client's response read has never been bounded and is not bounded
-// here, because `get`/`post` and the whole `request*` family carry no
-// configuration a caller could raise a real limit through — a finite number
-// chosen here would silently break every download larger than it. Filed as
-// #4585, which owns that design decision. `decodeChunkedBody` (message.bit)
-// now requires a budget from every caller, so the absence is spelled out at
-// the call site rather than hidden behind a default. 4 EiB, not the top of
-// the range, so the decoder's `maxBodyBytes - total` cannot overflow.
-const clientMaxBodyBytes = 4611686018427387904
-
 // The response body, per RFC 9112 §6.3's framing precedence: chunked
 // Transfer-Encoding, else an exact Content-Length read, else read-to-EOF (the
 // case 7 fallback — sound here because every request this client sends
 // carries `Connection: close`, so the peer closing is the terminator, not an
 // ambiguity). Fails if both framing headers are present. Split out of
 // `readResponse` (#2448).
-fn readResponseBody(s: byteStream, bodyStart: string, headers: string): string! {
+//
+// All three framings are bounded by `maxBodyBytes` (#4585), the mirror of the
+// server's own request budget (#4565): a hostile or broken server is as able
+// to exhaust a client's memory as the other way round, and until this existed
+// `get("http://evil/")` against a response declaring `Content-Length:
+// 4294967296` allocated 4 GiB before `get` returned. Each framing refuses on
+// the declared or accumulated size BEFORE the bytes are read — a Content-
+// Length on the peer's own number, chunked on the running total of chunk
+// sizes (`decodeChunkedBody`, message.bit), read-to-EOF on the read that
+// would cross it (`readAllStream`, http.bit) — so an over-budget response
+// costs nothing rather than being refused once it is already resident.
+fn readResponseBody(s: byteStream, bodyStart: string, headers: string, maxBodyBytes: int): string! {
   let clText = header(headers, "content-length")
   let teText = toLower(header(headers, "transfer-encoding"))
   let hasCl = len(clText) > 0
@@ -196,19 +196,27 @@ fn readResponseBody(s: byteStream, bodyStart: string, headers: string): string! 
     if (teText != "chunked") {
       fail newError("response: unsupported Transfer-Encoding")
     }
-    return decodeChunkedBody(s, bodyStart, clientMaxBodyBytes)?
+    return decodeChunkedBody(s, bodyStart, maxBodyBytes)?
   }
   if (hasCl) {
     let cl = atoi(clText)
     if (cl < 0) {
       fail newError("response: invalid Content-Length")
     }
+    // On the DECLARED length, before `readContentLengthBody` allocates or
+    // reads anything: the server's own number is the whole basis of the read,
+    // so refusing it here is what stops the bytes from ever becoming
+    // resident. Refusing after the read would be a parse limit, not a read
+    // limit.
+    if (cl > maxBodyBytes) {
+      fail newError("readResponse: Content-Length ${cl} exceeds ${maxBodyBytes} bytes")
+    }
     return readContentLengthBody(s, bodyStart, cl)?
   }
-  return bodyStart + readAllStream(s)?
+  return readAllStream(s, bodyStart, maxBodyBytes)?
 }
 
-fn readResponse(s: byteStream): Response! {
+fn readResponse(s: byteStream, maxBodyBytes: int): Response! {
   let (headBlock, bodyStart) = readUntil(s, "", "\r\n\r\n")?
 
   let eol = indexOf(headBlock, "\r\n")
@@ -219,7 +227,7 @@ fn readResponse(s: byteStream): Response! {
     headers = headBlock[eol + 2:len(headBlock)]
   }
   let code = parseStatusCode(statusLine)?
-  let body = readResponseBody(s, bodyStart, headers)?
+  let body = readResponseBody(s, bodyStart, headers, maxBodyBytes)?
   return Response{
     status: code,
     contentType: header(headers, "content-type"),
@@ -275,10 +283,10 @@ fn buildRequest(method: string, u: Url, headerBlock: string, body: string): stri
 // (#2291) makes "the read failed" a routine outcome rather than an edge
 // case: without this, a timed-out `getTimeout`/`requestTimeout` leaked the
 // underlying socket, since the old bare `s.shut()` below the `?` never ran.
-fn exchangeOn(s: byteStream, reqText: string): Response! {
+fn exchangeOn(s: byteStream, reqText: string, maxBodyBytes: int): Response! {
   defer s.shut()
   s.writeStr(reqText)?
-  let res = readResponse(s)?
+  let res = readResponse(s, maxBodyBytes)?
   return res
 }
 
@@ -301,28 +309,58 @@ fn defaultClientConfig(): TlsConfig {
   return cfg
 }
 
+// The per-request shaping every client entry point carries, and the reason
+// none of them takes it as four more parameters (E0202's ceiling is five).
+// It comes from the caller's `Client`, or from `newRequestExtras` when there
+// is no `Client`:
+//
+//   `config`   the TLS config for an https leg still to be dialed — read by
+//              `requestBlock` and `requestTimeoutTls`, not by `httpsExchange`,
+//              which receives an already-dialed connection.
+//   `block`    this request's extra headers, already validated and serialized
+//              by `serializeHeaders` (reqheader.bit, #2290); "" for none.
+//   `h3Ports`  this client's Alt-Svc cache (#3522) — consulted and updated on
+//              the paths that can upgrade to HTTP/3, inert (fresh and empty)
+//              for the package-level calls.
+//   `maxBody`  the byte budget the HTTP/1.1 response body is read under
+//              (#4585), `defaultMaxBodyBytes` unless a `Client` raised or
+//              lowered it with `setMaxBodyBytes`.
+class RequestExtras {
+  config: TlsConfig,
+  block: string,
+  h3Ports: map<string, int>,
+  maxBody: int,
+}
+
+// The extras a call with no `Client` behind it uses: `config` and `block` from
+// the caller, no Alt-Svc cache to consult (a fresh, always-empty map, #3522),
+// and the module's default response budget.
+fn newRequestExtras(config: TlsConfig, block: string): RequestExtras {
+  return RequestExtras{
+    config: config,
+    block: block,
+    h3Ports: map<string, int>(),
+    maxBody: defaultMaxBodyBytes,
+  }
+}
+
 // Shared by `request`, `requestWith`, and (for the h3-or-cleartext leg, where
 // no per-client TLS handling is needed) `Client.requestWith`: run `method
 // url` with `body` over `http://`, `https://`, or `https+h3://`, appending
-// `block` (already validated and serialized by the caller — "" for none) as
-// extra request headers, and using `config` for the https leg's TLS.
-// `request` is exactly this with `block` always "", so a caller carrying no
-// extra headers gets byte-identical wire output to before #2290.
-fn requestBlock(
-  method: string,
-  url: string,
-  block: string,
-  body: string,
-  config: TlsConfig,
-): Response! {
+// `extras.block` as extra request headers, using `extras.config` for the
+// https leg's TLS and `extras.maxBody` as the response body budget.
+// `request` is exactly this with `extras.block` always "", so a caller
+// carrying no extra headers gets byte-identical wire output to before #2290.
+fn requestBlock(method: string, url: string, body: string, extras: RequestExtras): Response! {
   let u = parseUrl(url)?
   if (u.h3) {
-    return h3Exchange(u, method, body, block)?
+    return h3Exchange(u, method, body, extras.block)?
   }
   if (u.https) {
-    return httpsExchange(tlsDial(u.host, u.port, config)?, method, u, body, block)?
+    return httpsExchange(tlsDial(u.host, u.port, extras.config)?, method, u, body, extras)?
   }
-  return exchangeOn(netStream{ conn: dial(u.host, u.port)? }, buildRequest(method, u, block, body))?
+  let req = buildRequest(method, u, extras.block, body)
+  return exchangeOn(netStream{ conn: dial(u.host, u.port)? }, req, extras.maxBody)?
 }
 
 // Send `method url` with an optional body and return the response. An `https://`
@@ -335,8 +373,13 @@ fn requestBlock(
 // For a custom TLS config (pinned roots, a fixed `serverName`,
 // `insecureSkipVerify`), use `requestTls`. To attach request headers, use
 // `requestWith`.
+//
+// The response body is read under `defaultMaxBodyBytes` (32 MiB, message.bit)
+// and a larger one fails rather than being allocated (#4585). A caller that
+// genuinely downloads more names the size it accepts: `newClient()` plus
+// `Client.setMaxBodyBytes(n)`, then `Client.request`/`get`/`post`.
 export fn request(method: string, url: string, body: string): Response! {
-  return requestBlock(method, url, "", body, defaultClientConfig())?
+  return requestBlock(method, url, body, newRequestExtras(defaultClientConfig(), ""))?
 }
 
 // As `request`, but attaches `headers` (#2290) — each validated (a legal RFC
@@ -347,7 +390,7 @@ export fn request(method: string, url: string, body: string): Response! {
 // `Accept-Encoding` is on it).
 export fn requestWith(method: string, url: string, headers: []Header, body: string): Response! {
   let block = serializeHeaders(headers)?
-  return requestBlock(method, url, block, body, defaultClientConfig())?
+  return requestBlock(method, url, body, newRequestExtras(defaultClientConfig(), block))?
 }
 
 // As `request`, but over https with an explicit TLS `config` (custom roots, a
@@ -363,7 +406,8 @@ export fn requestTls(method: string, url: string, body: string, config: TlsConfi
   if (len(cfg.alpn) == 0) {
     cfg.alpn = ["h2", "http/1.1"]
   }
-  return httpsExchange(tlsDial(u.host, u.port, cfg)?, method, u, body, "")?
+  let extras = newRequestExtras(cfg, "")
+  return httpsExchange(tlsDial(u.host, u.port, cfg)?, method, u, body, extras)?
 }
 
 // GET `url` (http or https).
@@ -423,12 +467,8 @@ export fn postTls(url: string, body: string, config: TlsConfig): Response! {
 // `timeoutMs`, and the idle timer resets on any received datagram rather
 // than tracking request progress specifically.
 //
-// The three pieces of `requestTimeoutTls` shaping that come from the
-// caller's `Client` (or its absence): the TLS `config`, an already-validated
-// serialized header `block` ("" for none), and `h3Ports`, this client's
-// Alt-Svc cache (fresh, empty for the package-level call, #3522). Grouped to
-// keep `requestTimeoutTls` at the 5-parameter lint ceiling (E0202).
-class TimeoutRequestExtras { config: TlsConfig, block: string, h3Ports: map<string, int> }
+// `extras` is the same `RequestExtras` the non-timeout path carries — see its
+// declaration above for what each field is and which leg reads it.
 
 // As `requestTimeout`, but over https with an explicit TLS config — the
 // timeout-path twin of `requestTls`. `extras.config.alpn` defaults to `h2`
@@ -448,7 +488,7 @@ fn requestTimeoutTls(
   url: string,
   body: string,
   timeoutMs: int,
-  extras: TimeoutRequestExtras,
+  extras: RequestExtras,
 ): Response! {
   let block = extras.block
   let u = parseUrl(url)?
@@ -468,17 +508,16 @@ fn requestTimeoutTls(
       cfg.alpn = ["h2", "http/1.1"]
     }
     let tlsConn = tlsDialDeadline(u.host, u.port, cfg, deadline)?
-    let res = httpsExchange(tlsConn, method, u, body, block)?
+    let res = httpsExchange(tlsConn, method, u, body, extras)?
     learnAltSvcInto(extras.h3Ports, key, res)
     return res
   }
   let conn = dialDeadline(u.host, u.port, deadline)?
-  return exchangeOn(netStream{ conn: conn }, buildRequest(method, u, block, body))?
+  return exchangeOn(netStream{ conn: conn }, buildRequest(method, u, block, body), extras.maxBody)?
 }
 
 export fn requestTimeout(method: string, url: string, body: string, timeoutMs: int): Response! {
-  let cfg = defaultClientConfig()
-  let extras = TimeoutRequestExtras{ config: cfg, block: "", h3Ports: map<string, int>() }
+  let extras = newRequestExtras(defaultClientConfig(), "")
   return requestTimeoutTls(method, url, body, timeoutMs, extras)?
 }
 
@@ -547,6 +586,29 @@ export class Client {
   tls: TlsConfig
   h3Ports: map<string, int>
   headers: []Header
+  maxBody: int
+
+  // Raise or lower the byte budget this client reads a response body under
+  // (#4585). It defaults to `defaultMaxBodyBytes` (32 MiB, message.bit): a
+  // response whose `Content-Length` declares more, whose chunk sizes add up
+  // to more, or which streams more than that to end-of-stream, fails BEFORE
+  // the bytes are read, so a hostile server cannot exhaust this process's
+  // memory by declaring a size.
+  //
+  // This is the escape hatch the package-level `get`/`post`/`request*` do not
+  // have: a caller that genuinely downloads more than 32 MiB names the size
+  // it accepts here and calls `Client.get`/`post`/`request`/`requestTimeout`
+  // instead. There is deliberately no value meaning "unlimited" — zero means
+  // "refuse every body", the same as `Server.setMaxBodyBytes` and
+  // `multipart.bit`'s `Limits`.
+  //
+  // Applies to the HTTP/1.1 response path. An `https://` exchange that ALPN
+  // negotiates to `h2`, and every `https+h3://` exchange, is framed by the
+  // `std/http2` / `std/http3` engines and bounded by their own limits, not by
+  // this one.
+  export setMaxBodyBytes(n: int) {
+    this.maxBody = n
+  }
   // Sets a per-client default header sent with every `Client.request`/
   // `Client.requestWith`/`Client.requestTimeout`/`getTimeout`/`postTimeout` call
   // this client makes (#3484) — e.g. an `Authorization` token used across a
@@ -568,6 +630,18 @@ export class Client {
       i = i + 1
     }
     this.headers = append(this.headers, h)
+  }
+
+  // This client's shaping for one request carrying `block`: its TLS config,
+  // its live Alt-Svc cache (the map itself, so a response learned on this
+  // request updates the client's own table), and its response body budget.
+  extrasWith(block: string): RequestExtras {
+    return RequestExtras{
+      config: this.tls,
+      block: block,
+      h3Ports: this.h3Ports,
+      maxBody: this.maxBody,
+    }
   }
 
   // Record any `h3=` Alt-Svc advertisement `res` carried for `authority`.
@@ -598,9 +672,10 @@ export class Client {
     body: string,
   ): Response! {
     let block = serializeHeaders(mergeHeaders(this.headers, headers))?
+    let extras = this.extrasWith(block)
     let u = parseUrl(url)?
     if (u.h3 || !u.https) {
-      return requestBlock(method, url, block, body, this.tls)?
+      return requestBlock(method, url, body, extras)?
     }
     let key = h2glueAuthority(u)
     let cached = cachedH3Port(this.h3Ports, key)
@@ -612,7 +687,7 @@ export class Client {
     if (len(cfg.alpn) == 0) {
       cfg.alpn = ["h2", "http/1.1"]
     }
-    let res = httpsExchange(tlsDial(u.host, u.port, cfg)?, method, u, body, block)?
+    let res = httpsExchange(tlsDial(u.host, u.port, cfg)?, method, u, body, extras)?
     this.learnAltSvc(key, res)
     return res
   }
@@ -643,8 +718,7 @@ export class Client {
     timeoutMs: int,
   ): Response! {
     let block = serializeHeaders(this.headers)?
-    let extras = TimeoutRequestExtras{ config: this.tls, block: block, h3Ports: this.h3Ports }
-    return requestTimeoutTls(method, url, body, timeoutMs, extras)?
+    return requestTimeoutTls(method, url, body, timeoutMs, this.extrasWith(block))?
   }
 
   // GET `url` through this client, bounded by a whole-request `timeoutMs`
@@ -663,14 +737,19 @@ export class Client {
 // A `Client` with secure-by-default TLS (verification on, system/bundled roots,
 // ALPN `h2` then `http/1.1`), an empty Alt-Svc cache, and no default headers.
 export fn newClient(): Client {
-  return Client{ tls: defaultClientConfig(), h3Ports: map<string, int>(), headers: []Header(0) }
+  return newClientTls(defaultClientConfig())
 }
 
 // A `Client` with an explicit `std/tls` config for its `https://` leg (pinned
 // roots, a fixed `serverName`, `insecureSkipVerify`), an empty Alt-Svc cache, and
 // no default headers.
 export fn newClientTls(config: TlsConfig): Client {
-  return Client{ tls: config, h3Ports: map<string, int>(), headers: []Header(0) }
+  return Client{
+    tls: config,
+    h3Ports: map<string, int>(),
+    headers: []Header(0),
+    maxBody: defaultMaxBodyBytes,
+  }
 }
 
 // Cached h3 port for `key`, or 0 — read side shared by `requestWith`/`requestTimeoutTls` (#3522).

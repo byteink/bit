@@ -497,6 +497,10 @@ an invalid name or value, or a name this module manages itself (`Host`,
 `Accept-Encoding`, ...), fails the whole call before anything is sent. Covers
 `http://`, `https://`, and `https+h3://`, same as `request`.
 
+The response body is read under a 32 MiB budget: a response declaring, or
+streaming, more than that fails instead of being allocated. Raise or lower it
+with `newClient()` + `Client.setMaxBodyBytes(n)`.
+
 ### `get(url: string): Response!`
 
 GETs `url`.
@@ -885,6 +889,27 @@ A `Client` with secure-by-default TLS (verification on, system/bundled roots, AL
 
 A `Client` with an explicit `std/tls` config for its `https://` leg - pinned roots,
 a fixed `serverName`, or `insecureSkipVerify` - and an empty Alt-Svc cache.
+
+### `Client.setMaxBodyBytes(n: int)`
+
+Raises or lowers the number of bytes this client will read of a response body,
+default 32 MiB. A response whose `Content-Length` declares more than `n`, whose
+chunk sizes add up to more than `n`, or which streams more than `n` bytes to
+end-of-stream, fails before the bytes are read - so a hostile or broken server
+cannot exhaust this process's memory by declaring a size.
+
+This is the escape hatch the package-level `get`/`post`/`request*` do not have:
+they always read under the 32 MiB default. A caller downloading more than that
+names the size it accepts here and goes through `Client.get`/`post`/`request`/
+`requestTimeout` instead.
+
+Applies to the HTTP/1.1 response path. An `https://` exchange that ALPN
+negotiates to `h2`, and every `https+h3://` exchange, is framed by the
+`std/http2` / `std/http3` engines and bounded by their own limits, not by this
+one.
+
+There is deliberately no value meaning "unlimited": `0` refuses every body, the
+same way `Server.setMaxBodyBytes` and a zero `Limits` field do.
 
 ### `Client.setHeader(name: string, value: string): ()!`
 
