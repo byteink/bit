@@ -125,83 +125,64 @@ fn boxStringWords(ctx: TypeContext, b: IrBuilder, ptrv: int, lenv: int, basev: i
   return obj
 }
 
-// THE INSERTION POINT every gated position funnels through. `val` is a value
-// already lowered exactly as it is today (a single boxed `string`, since
-// nothing upstream of this call ever produces exploded words outside this
-// file's own test machinery); `ty` is its declared type. When `explodeStr` is
-// false or `ty` is not a plain `string`, this is one bool check and one
-// integer compare, no instruction emitted and no value id consumed — the
-// caller's IR is untouched, byte for byte.
+// ===========================================================================
+// #4426: THE CONTAINER BOUNDARY NEEDS NO COERCION IN EITHER DIRECTION, and
+// this is where the box/unbox pair that used to sit at 28 call sites was.
 //
-// When gated and `ty` is `string`, this round-trips `val` through
-// unbox-on-use then box-on-escape: exactly the pair the ticket describes
-// ("when a boxed string reaches a position that has [flipped], it explodes
-// it... when an exploded string reaches a position that has not, the lowerer
-// materialises the box"), composed back to back so a real, running program
-// exercises both halves of the mechanism at once, on a genuine string, with
-// no change to what the program prints — the round trip reconstructs the
-// same ptr/len/base a plain read would have used unchanged.
+// #4005 ruled that a `string` inside a container element or a composite field
+// stays BOXED forever, because ABI.md:283-290 requires a buffer whose element
+// type has any reference field to stay word-per-element and an unboxed string
+// is one ref field mixed with two scalars. That ruling stands. What does not
+// stand is the mechanism #4431 built to implement it: a compiler-inserted
+// `unbox(val)` immediately followed by `box(words)` at every store into and
+// load out of a container, a class field, a channel, the `err` slot and every
+// unflipped ABI position.
 //
-// Takes `ctx`/`b`/`explodeStr` rather than `fc: FnCtx` so it can be called
-// from `explodeCallArgs`, which predates `FnCtx` being in scope at its own
-// call sites (`lowerglobal.bit`'s trampoline path builds calls before a
-// `FnCtx` exists for them). `coerceStringToBoxed` below is the `FnCtx`-typed
-// wrapper for the two positions that already have one.
-fn coerceStringToBoxedRaw(
-  ctx: TypeContext,
-  b: IrBuilder,
-  explodeStr: bool,
-  val: int,
-  ty: int,
-): int {
-  if (!explodeStr || ty != primType(ctx, 11)) {
-    return val
-  }
-  let words = unboxStringWords(ctx, b, val)
-  return boxStringWords(ctx, b, words[0], words[1], words[2])
-}
-
-fn coerceStringToBoxed(fc: FnCtx, val: int, ty: int): int {
-  return coerceStringToBoxedRaw(fc.c.ctx, fc.b, fc.lowerer.explodeStrings, val, ty)
-}
-
-// `paramTypes[i]`, or `voidTy` when `i` runs past it — a variadic tail's
-// collected argument has no per-element `paramTypes` entry, the same bounds
-// guard `explodedArgWords` already uses for the same reason. `voidTy` is
-// never `primType(ctx, 11)`, so `coerceStringToBoxedRaw` correctly no-ops on
-// a variadic tail rather than needing its own bounds check too.
-fn paramTypeAt(paramTypes: []int, i: int, voidTy: int): int {
-  if (i >= len(paramTypes)) {
-    return voidTy
-  }
-  return paramTypes[i]
-}
-
-// The whole-list form for a call `explodeCallArgs` returns from EARLY —
-// `gates.tuples` false or no tuple-shaped parameter at all — which is every
-// call in every real build, and the majority of calls even under the gate.
-// `explodeStr == false` returns `args` itself, unwalked and unallocated:
-// the identity this function must have for "gate off is bit-identical" to
-// hold.
-fn coerceStringArgList(
-  ctx: TypeContext,
-  b: IrBuilder,
-  paramTypes: []int,
-  args: []int,
-  explodeStr: bool,
-): []int {
-  if (!explodeStr) {
-    return args
-  }
-  let out = []int(0)
-  let i = 0
-  while (i < len(args)) {
-    let ty = paramTypeAt(paramTypes, i, ctx.voidId)
-    out = append(out, coerceStringToBoxedRaw(ctx, b, explodeStr, args[i], ty))
-    i = i + 1
-  }
-  return out
-}
+// THE VALUE AT EVERY ONE OF THOSE POSITIONS IS ALREADY THE BOX. `lowerExpr`
+// returns ONE SSA value id, so a `string` expression can only ever BE a
+// handle: the exploded words live in exactly three list-shaped places —
+// `LocalBind.hiValues`, a call's argument list and a `ret`'s value list — and
+// each of those rebuilds the box before it can yield a single value
+// (`localRead` -> `materializeExplodedLocal` in lowerclosure.bit,
+// `emitResolvedCall` in lowerprim.bit, `declareExplodedParam` in
+// lowerexplode.bit). So the round trip reconstructed, bit for bit, the object
+// it had just taken apart.
+//
+// IT WAS NOT FREE. The three `field_get`s read a heap object nothing in the
+// block stored, which store-to-load forwarding cannot answer, so
+// dead-allocation elimination could not cancel the `gc_alloc` — one surviving
+// object per gated crossing, measured by #4446 and pinned by #4508's flip
+// table. `bench/cases/strmap` performs 12,450,000 string-keyed map operations
+// and paid 12,450,003 objects on top of its 400,041; `bench/cases/json`'s
+// lexer reads `p.source` out of a class field once per source byte.
+//
+// AND IT WAS WRONG WHERE IT ACTUALLY FIRED. Instrumented over 716
+// `_tests_/cases/*.bit` builds with the gate on, the rebuild arm ran ONCE, on
+// `run_variadic.bit`: `explodeCallArgs` asked `paramTypes[i]` for a variadic
+// tail, got the tail's ELEMENT type `string` while the argument was the
+// collected `[]string`, and rebuilt the slice header's first three words as a
+// 24-byte string box. `cap` and `is_ref` were dropped and the scalar `off`
+// landed in the slot `ptr_offsets = [16]` declares traced. It printed the
+// right answer at exit 0 only because that `off` is 0 and `for p of parts`
+// reads only `buf` and `len` — the #4412 shape exactly.
+//
+// So there is no coercion left to place, and the two directions collapse into
+// one statement: a container slot and a `string` SSA value hold the same
+// thing, one handle to ABI.md §2.3's 24-byte header. The eleven runtime entry
+// points #4005 enumerated (`bit_rt_slice_append`/`_get`/`_set`,
+// `bit_rt_map_set`/`_get`/`_has`/`_slot`/`_delete`/`_key_at`/`_val_at`, and
+// `bit_rt_slice_slice`, which touches no element word at all) take that
+// handle exactly as the lowerer already has it, and so do `chan_send`/
+// `chan_recv` and a `field_set`/`field_get` at a string-typed field.
+//
+// WHAT STILL LIVES IN THIS FILE. `boxStringWords`/`unboxStringWords` are the
+// two halves of the box's LAYOUT and both have real consumers:
+// `materializeExplodedIn` below and `emitInlineStringSlice`
+// (lowerreslice.bit) build boxes; `string_eq`'s word lowering (lowercond.bit,
+// #4443) and `checkStringUnboxKeepAlive` (arm64selcheckgen.bit) take them
+// apart. What is gone is the pair COMPOSED back to back at a position that
+// never had words to begin with.
+// ===========================================================================
 
 // ===========================================================================
 // #4422: the PRODUCER side — a `string` LOCAL is its three words rather than a
