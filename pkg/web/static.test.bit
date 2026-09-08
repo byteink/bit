@@ -1,0 +1,321 @@
+// pkg/web/static.test.bit — #3954's acceptance, one named test per assertion.
+//
+// Everything goes through `app.handle(req)`, the seam #3885 established: the
+// real router, the real composed chain, the real `Ctx` and the real failure
+// mapping, with only the socket left out. Calling the middleware value
+// directly would pass just as well against a mount wired to the wrong prefix.
+//
+// THE FIXTURE IS SHAPED FOR THE SECURITY CLAIM. The served root is
+// `<scratch>/public`, and its PARENT holds `secret.txt`, whose content is
+// `sentinelBody`. Every rejection test asserts both the 404 and that
+// `sentinelBody` is nowhere in the response — so "no filesystem read outside
+// the root" is not asserted by reading the source, it is asserted by the
+// fact that a read outside the root would be visible in the body. That the
+// guard is what prevents it is proved by deleting the guard: with the
+// `safePath` call removed from `staticServe`, `serves-a-traversal` returns
+// 200 carrying `sentinelBody`. The four mutations are recorded on #3954.
+//
+// `contains` (router.test.bit), `mkdir`/`writeFile`/`readFile` (node.test.bit),
+// `scratchDir` (node.test.bit), `freezeOrPanic` (adapter.test.bit) and
+// `Request` (ctx.bit) are already bound module-wide — reused, never
+// re-imported (E0042).
+import { isSymlink } from "std/fs"
+import { run } from "std/os"
+
+const sentinelBody = "SENTINEL-OUTSIDE-THE-ROOT-DO-NOT-SERVE"
+const cssBody = "body { color: red }\n"
+const cssType = "text/css; charset=utf-8"
+const truncationBait = "TRUNCATED-AT-THE-NUL"
+const fallthroughBody = "fell-through"
+const mountPrefix = "/assets"
+
+// RFC 9110 §5.6.7's own example date, and the Unix second it names.
+const sampleHttpDate = "Sun, 06 Nov 1994 08:49:37 GMT"
+const sampleUnixSec: i64 = 784111777
+
+// The scratch parent, the root served below it, and an App with the mount
+// wired the only way it can be wired today (see static.bit's header: `use()`
+// middleware runs only for a request the router already matched, so a mount
+// needs a catch-all route under it).
+class StaticFixture {
+  dir: string,
+  root: string,
+  app: App,
+}
+
+fn mustMkdir(path: string) {
+  mkdir(path) catch e {
+    panic("static.test: mkdir ${path}: ${e.message()}")
+  }
+}
+
+fn writeFixture(path: string, content: string) {
+  writeFile(path, content) catch e {
+    panic("static.test: write ${path}: ${e.message()}")
+  }
+}
+
+// `<scratch>/secret.txt` (the sentinel, OUTSIDE the root), `<scratch>/public`
+// (the root) holding `app.css`, `data.bin`, the bare name `a` and an empty
+// `sub/` directory. `a` is not decoration: it is the file a path truncated at
+// a NUL byte would resolve to, so the NUL test can prove the truncation
+// hazard is real rather than assert an ENOENT that would happen anyway.
+fn newStaticFixture(tag: string): StaticFixture {
+  let dir = scratchDir(tag)
+  mustMkdir(dir)
+  writeFixture("${dir}/secret.txt", sentinelBody)
+  let root = "${dir}/public"
+  mustMkdir(root)
+  writeFixture("${root}/app.css", cssBody)
+  writeFixture("${root}/data.bin", "\x01\x02\x03")
+  writeFixture("${root}/a", truncationBait)
+  mustMkdir("${root}/sub")
+  return StaticFixture{ dir: dir, root: root, app: staticApp(root) }
+}
+
+// The mount plus every route a test needs the router to match. `/assetsx` is
+// the component-boundary case: it shares the mount's bytes and must NOT be
+// served from it. The HEAD route goes through `Group.register` because
+// `App`/`Group` expose get/post/put/delete and nothing else — an app cannot
+// register HEAD today (#4516), so this is the only way to reach the
+// middleware with one.
+fn staticApp(root: string): App {
+  let app = App(Config{ secret: "test-secret" })
+  app.use(static(mountPrefix, root))
+  let _ = app.get("/assets/*path", fallthroughHandler)
+  let _ = app.post("/assets/*path", fallthroughHandler)
+  let _ = app.get("/assetsx/*path", fallthroughHandler)
+  let _ = app.get("/elsewhere", fallthroughHandler)
+  let _ = app.root.register("HEAD", "/assets/*path", fallthroughHandler)
+  freezeOrPanic(app)
+  return app
+}
+
+fn fallthroughHandler(c: Ctx): Res! {
+  return c.text(fallthroughBody)
+}
+
+fn staticReq(method: string, target: string, headers: string): Request {
+  return Request{ method: method, path: target, headers: headers, body: "" }
+}
+
+// Asserts the shape every rejection must have: the adapter's own 404, and
+// nothing anywhere in the body that came from outside the served root.
+fn assertRejected(res: Response, what: string) {
+  assert(res.status == 404, "${what}: want 404, got ${res.status}")
+  assert(
+    !contains(res.body, sentinelBody),
+    "${what}: the response carried content from OUTSIDE the served root",
+  )
+  assert(
+    res.body == "Not Found",
+    "${what}: body must be the framework's own 404, got '${res.body}'",
+  )
+}
+
+// --- serving --------------------------------------------------------------
+
+test "serves a file under the mount with its exact bytes and Content-Type" {
+  let f = newStaticFixture("serve")
+
+  let res = f.app.handle(staticReq("GET", "/assets/app.css", ""))
+
+  assert(res.status == 200, "want 200, got ${res.status}")
+  assert(res.body == cssBody, "want the file's bytes, got '${res.body}'")
+  assert(res.contentType == cssType, "Content-Type: got '${res.contentType}'")
+  assert(len(res.getHeader("ETag")) > 0, "a served file must carry an ETag")
+  assert(len(res.getHeader("Last-Modified")) > 0, "a served file must carry Last-Modified")
+}
+
+test "an unknown extension is application/octet-stream and carries nosniff" {
+  let f = newStaticFixture("mime")
+
+  let res = f.app.handle(staticReq("GET", "/assets/data.bin", ""))
+
+  assert(res.status == 200, "want 200, got ${res.status}")
+  assert(res.contentType == "application/octet-stream", "Content-Type: got '${res.contentType}'")
+  assert(
+    res.getHeader("X-Content-Type-Options") == "nosniff",
+    "nosniff: got '${res.getHeader("X-Content-Type-Options")}'",
+  )
+}
+
+test "HEAD is served with the file's headers and no body" {
+  let f = newStaticFixture("head")
+
+  let res = f.app.handle(staticReq("HEAD", "/assets/app.css", ""))
+
+  assert(res.status == 200, "want 200, got ${res.status}")
+  assert(res.body == "", "HEAD must carry no body, got '${res.body}'")
+  assert(res.contentType == cssType, "Content-Type: got '${res.contentType}'")
+  assert(len(res.getHeader("ETag")) > 0, "HEAD must carry the same ETag a GET would")
+}
+
+// --- traversal ------------------------------------------------------------
+
+test "a traversal below the mount is 404 and never reads the parent's sentinel" {
+  let f = newStaticFixture("traversal")
+
+  let res = f.app.handle(staticReq("GET", "/assets/../../etc/passwd", ""))
+  let up = f.app.handle(staticReq("GET", "/assets/../secret.txt", ""))
+
+  assertRejected(res, "/assets/../../etc/passwd")
+  assertRejected(up, "/assets/../secret.txt")
+  assert(!contains(res.body, "root:"), "the response carried /etc/passwd content")
+}
+
+// The remainder below the mount is itself an absolute path. This is the case
+// `path.join(root, rel)` would get wrong — `join` returns its second argument
+// whole when that argument is absolute (stdlib/path/path.bit:24), discarding
+// the root — which is why static.bit concatenates instead.
+test "an absolute path below the mount is 404" {
+  let f = newStaticFixture("absolute")
+
+  let res = f.app.handle(staticReq("GET", "/assets//etc/passwd", ""))
+
+  assertRejected(res, "/assets//etc/passwd")
+  assert(!contains(res.body, "root:"), "the response carried /etc/passwd content")
+}
+
+// The bait file `<root>/a` exists, so this fails only if the NUL is refused:
+// a path handed to a syscall truncates at the first NUL, and without the
+// check `/assets/a\0b.css` would open `<root>/a` and serve `truncationBait`.
+test "a NUL byte in the path is 404, not a read of the truncated name" {
+  let f = newStaticFixture("nul")
+
+  let res = f.app.handle(staticReq("GET", "/assets/a\x00b.css", ""))
+
+  assert(res.status == 404, "want 404, got ${res.status}")
+  assert(
+    !contains(res.body, truncationBait),
+    "the NUL truncated the path and served '${res.body}'",
+  )
+}
+
+test "a directory below the mount is 404, with no listing" {
+  let f = newStaticFixture("dir")
+
+  let sub = f.app.handle(staticReq("GET", "/assets/sub", ""))
+  let slash = f.app.handle(staticReq("GET", "/assets/", ""))
+
+  assert(sub.status == 404, "/assets/sub: want 404, got ${sub.status}")
+  assert(!contains(sub.body, "app.css"), "/assets/sub: the body listed the directory")
+  assert(slash.status == 404, "/assets/: want 404, got ${slash.status}")
+}
+
+// A symlink is the one traversal `safePath` cannot see, and its own comment
+// says so (stdlib/path/path.bit:300). `/bin/ln` is used rather than a stdlib
+// call because std/fs has no symlink creator; the link's existence is
+// asserted first, so a missing `ln` fails this test loudly instead of
+// turning it into a vacuous pass.
+test "a symlink below the mount is 404 even when its target is readable" {
+  let f = newStaticFixture("symlink")
+  let link = "${f.root}/link.txt"
+  let rc = run("/bin/ln", ["-s", "${f.dir}/secret.txt", link])
+  assert(rc == 0, "/bin/ln exited ${rc} — the fixture could not be built")
+  assert(isSymlink(link), "the fixture did not create a symlink at ${link}")
+
+  let res = f.app.handle(staticReq("GET", "/assets/link.txt", ""))
+
+  assertRejected(res, "/assets/link.txt")
+}
+
+// --- falling through ------------------------------------------------------
+
+test "a POST below the mount falls through to the next handler" {
+  let f = newStaticFixture("post")
+
+  let res = f.app.handle(staticReq("POST", "/assets/app.css", ""))
+
+  assert(res.status == 200, "want 200, got ${res.status}")
+  assert(res.body == fallthroughBody, "want the next handler, got '${res.body}'")
+}
+
+test "a request outside the mount prefix reaches the next handler" {
+  let f = newStaticFixture("outside")
+
+  let res = f.app.handle(staticReq("GET", "/elsewhere", ""))
+
+  assert(res.status == 200, "want 200, got ${res.status}")
+  assert(res.body == fallthroughBody, "want the next handler, got '${res.body}'")
+}
+
+// `/assetsx` starts with the mount's bytes but not with its component, so it
+// is outside the mount and must reach the next handler untouched.
+test "a path that merely starts with the mount's bytes reaches the next handler" {
+  let f = newStaticFixture("boundary")
+
+  let res = f.app.handle(staticReq("GET", "/assetsx/app.css", ""))
+
+  assert(res.status == 200, "want 200, got ${res.status}")
+  assert(res.body == fallthroughBody, "want the next handler, got '${res.body}'")
+}
+
+// --- conditional requests -------------------------------------------------
+
+test "a second request carrying the ETag gets a 304 with no body" {
+  let f = newStaticFixture("etag")
+  let first = f.app.handle(staticReq("GET", "/assets/app.css", ""))
+  let etag = first.getHeader("ETag")
+  assert(len(etag) > 0, "the first response carried no ETag")
+
+  let second = f.app.handle(staticReq("GET", "/assets/app.css", "If-None-Match: ${etag}"))
+
+  assert(second.status == 304, "want 304, got ${second.status}")
+  assert(second.body == "", "a 304 must carry no body, got '${second.body}'")
+  assert(second.getHeader("ETag") == etag, "a 304 must repeat the ETag")
+}
+
+test "a non-matching If-None-Match is served, and ignores If-Modified-Since" {
+  let f = newStaticFixture("etagmiss")
+  let fresh = f.app.handle(staticReq("GET", "/assets/app.css", ""))
+  let lastMod = fresh.getHeader("Last-Modified")
+
+  let headers = "If-None-Match: \"nope\"\r\nIf-Modified-Since: ${lastMod}"
+  let res = f.app.handle(staticReq("GET", "/assets/app.css", headers))
+
+  assert(res.status == 200, "want 200 (If-None-Match wins and misses), got ${res.status}")
+  assert(res.body == cssBody, "want the file's bytes, got '${res.body}'")
+}
+
+test "If-Modified-Since is honoured, and an older date still serves the file" {
+  let f = newStaticFixture("ims")
+  let first = f.app.handle(staticReq("GET", "/assets/app.css", ""))
+  let lastMod = first.getHeader("Last-Modified")
+  assert(len(lastMod) > 0, "the first response carried no Last-Modified")
+
+  let same = f.app.handle(staticReq("GET", "/assets/app.css", "If-Modified-Since: ${lastMod}"))
+  let older = f.app.handle(
+    staticReq("GET", "/assets/app.css", "If-Modified-Since: ${sampleHttpDate}"),
+  )
+
+  assert(same.status == 304, "the file's own Last-Modified must give 304, got ${same.status}")
+  assert(same.body == "", "a 304 must carry no body, got '${same.body}'")
+  assert(older.status == 200, "a 1994 date must serve the file, got ${older.status}")
+  assert(older.body == cssBody, "want the file's bytes, got '${older.body}'")
+}
+
+// --- the date format itself -----------------------------------------------
+
+test "httpDate emits IMF-fixdate and parseHttpDate reads it back" {
+  assert(httpDate(sampleUnixSec) == sampleHttpDate, "httpDate: got '${httpDate(sampleUnixSec)}'")
+
+  let (back, ok) = parseHttpDate(sampleHttpDate)
+
+  assert(ok, "parseHttpDate refused its own output")
+  assert(back == sampleUnixSec, "want ${sampleUnixSec}, got ${back}")
+}
+
+test "parseHttpDate refuses everything that is not an IMF-fixdate" {
+  let (_, empty) = parseHttpDate("")
+  let (_, rfc850) = parseHttpDate("Sunday, 06-Nov-94 08:49:37 GMT")
+  let (_, noZone) = parseHttpDate("Sun, 06 Nov 1994 08:49:37 UTC")
+  let (_, badMonth) = parseHttpDate("Sun, 06 Xxx 1994 08:49:37 GMT")
+  let (_, badDay) = parseHttpDate("Sun, 32 Nov 1994 08:49:37 GMT")
+
+  assert(!empty, "an empty string parsed")
+  assert(!rfc850, "an RFC 850 date parsed")
+  assert(!noZone, "a non-GMT zone parsed")
+  assert(!badMonth, "an unknown month name parsed")
+  assert(!badDay, "day 32 parsed")
+}
