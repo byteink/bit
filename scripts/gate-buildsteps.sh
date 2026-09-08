@@ -225,7 +225,16 @@ case "${BUCKET}" in
     # test-lint-self, test-lint-complexity and test-lint-sweep (#4448/#4449)
     # all scan stdlib/ directly, same #4454 audit as the selfhost/runtime
     # buckets above.
-    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages test-lint-self test-lint-complexity test-lint-sweep)
+    #
+    # test-stdlib-unit (#4478) is the same argv-path-literal shape as test-fmt
+    # above: its argv is literally ["test", "${repoRoot()}/stdlib"]
+    # (tools/build/gates.bit:195), and it is registered in gateSteps()
+    # (tools/build/defs.bit:247), so `./make test` runs it and this bucket owes
+    # it. Without it here a stdlib/**-only diff never ran `bit test stdlib` —
+    # every stdlib `*.test.bit` (#4212) — under scripts/gate.sh. Found by
+    # assert_argvliteral_gates_current() (scripts/gate-envscope.sh, #4477) the
+    # first time it ran.
+    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages test-lint-self test-lint-complexity test-lint-sweep test-stdlib-unit)
     ;;
   docs)
     # test-stdlib-docs reads docs/stdlib/*.md directly (BIT_DOCS_ROOT — it
