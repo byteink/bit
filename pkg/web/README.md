@@ -318,8 +318,19 @@ message per round trip.
 
 ```
 POST /signup   {"name":"ab","email":"a@b.co","password":"p","confirm":"q"}
-422            {"status":422,"error":"must be at least 3 character(s); password and confirm must match"}
+422            {"status":422,"error":"name: must be at least 3 character(s); password and confirm must match"}
 ```
+
+Every attribute runs, so two bad fields come back together, each named:
+
+```
+POST /signup   {"name":"ab","email":"nope","password":"p","confirm":"p"}
+422            {"status":422,"error":"name: must be at least 3 character(s); email: must be an email address"}
+```
+
+The field's name comes from the compiler, which attaches it where the rule is
+called; the rule itself takes the value and never learns the name. A cross-field
+`validate()` failure has no field to name and carries its own message alone.
 
 A type with neither member binds with no validation and no error. That is a type
 with no rules, not a mistake.
@@ -372,16 +383,6 @@ its message sent. A rule that fails with anything else is a **500 with the
 message logged and never sent**, so a validator that called into a database and
 failed cannot paste a connection string into a 422.
 
-### What this does not do yet
-
-Two limits, both in the compiler's synthesis of `validateFields()` and both
-tracked by #4572:
-
-- **Two failing attributes report one message.** The synthesized method
-  propagates the first failure, so `name` being too short hides a malformed
-  `email` until it is fixed. A field rule and a cross-field rule are still
-  reported together, since those are two separate calls.
-- **A message cannot name its field.** The call passes the field's value and
-  nothing else, so neither the rule nor this package knows which field it ran
-  on. Until that changes, put the field in your own rule's message when it
-  matters.
+The rule is applied per failure, not per response: a `validateFields()` whose
+`@minLen` and a database-backed rule both failed is a 500 with nothing sent, and
+the safe message beside it is not delivered on the unsafe one's back.
