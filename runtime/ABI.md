@@ -3221,18 +3221,45 @@ bit_rt_net_read(fd, max)        -> str   // up to max bytes; parks. "" at end of
 bit_rt_net_write(fd, s)         -> n     // all of s (retried internally). -1 on error
 ```
 
-**THE PEER ADDRESS IS A PORT-LEVEL PRIMITIVE, NOT AN ABI ENTRY POINT (#4525).**
-`bit_rt_port_net_peer_ip(fd: i64) -> i64` — the connected peer's IPv4 address,
-packed first octet in the high byte (127.0.0.1 is `0x7F000001`), or `-1` for
-every "there is no peer": an unconnected or listening socket (ENOTCONN), a
+**THE PEER ADDRESS IS PACKED, NOT A DOTTED QUAD (#4525, #4526).**
+`bit_rt_net_peer_ip_w(fd)` returns the connected peer's IPv4 address with the
+FIRST OCTET IN THE HIGH BYTE — 127.0.0.1 is `0x7F000001`, 2130706433 — or `-1`
+for every "there is no peer": an unconnected or listening socket (ENOTCONN), a
 closed one (EBADF), and a peer whose family is not AF_INET (the four bytes at
 `sin_addr` mean something else in every other family, so it is checked rather
-than assumed). Bound as `getpeername(2)` in all three providers —
-`runtime/net/{darwin,linux,windows}/sock.bit` — rather than captured in the
-accept loop, whose `sockaddr` out-parameter stays NULL: per fd, so
-`bit_rt_net_accept` above is unchanged and a DIALED socket answers too. There
-is no `bit_rt_net_peer_ip` yet and nothing the compiler emits reaches this
-symbol; #4526 adds the ABI wrapper and the `std/net` surface over it.
+than assumed). The whole 0..0xFFFFFFFF range is non-negative in a 64-bit `int`,
+so the sentinel cannot collide with a real address; 0.0.0.0 is a legal answer,
+not an error.
+
+It is packed rather than formatted, unlike `bit_rt_net_udp_sender_host` below,
+so that all three wrappers stay `@nosplit`: formatting means allocating a
+managed octet scratch and a string, which costs four entries in
+`_tests_/bit/pollfree`'s REVIEWED exception list (§5's #1656 hazard — a raw GC
+address held across a poll). `std/net`'s `Conn.peerIp()` spells the quad
+instead, where string interpolation is free.
+
+Two layers, both real symbols. `bit_rt_port_net_peer_ip(fd: i64) -> i64` is the
+port-level primitive, bound as `getpeername(2)` in all three providers
+(`runtime/net/{darwin,linux,windows}/sock.bit`) rather than captured in the
+accept loop, whose `sockaddr` out-parameter stays NULL — it is per fd, so
+`bit_rt_net_accept` above is unchanged and a DIALED socket answers too.
+
+```
+bit_rt_net_peer_ip_w(fd)        -> ipv4  // the peer's IPv4, PACKED. -1 when there is no peer
+```
+
+`bit_rt_net_peer_ip_w` is the ABI wrapper over it, one per provider's
+`netabi.bit`. **The `_w` suffix says `std/net` reaches it through a plain
+`extern fn` — the same class as `bit_rt_net_dial_deadline_w` and
+`bit_rt_net_shutdown_sock_w` below, not the class `bit_rt_net_local_port` above
+belongs to, and like those two it is documented here rather than in §9's
+emitted-symbol table.** A compiler-recognized builtin exists for the signatures
+an `extern` cannot express (§11.7 admits no `string` across that boundary; the
+chan-typed timer arm is the other case), and `(i64) -> i64` is not one. A
+builtin could not have been used from `stdlib/**` before the next stage0 repin
+in any case: `make selfhost` compiles the whole stdlib with the PINNED stage0,
+and `compiler/pmfetch.bit` pulls `std/http` -> `std/net` into that build, so a
+freshly added predeclared name is `E0040: undefined name` there.
 
 **UDP** (connectionless). `recv` records the sender in per-OS module state,
 **one `[4]i64` sockaddr and one valid flag PER WORKER** (fixed by #3272) —
