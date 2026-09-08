@@ -1,0 +1,430 @@
+// pkg/web/static.bit — `static(prefix, root)`, the middleware that serves a
+// directory of files (#3954).
+//
+//     app.use(static("/assets", "./public"))
+//
+// The whole reason it ships is path traversal. Every app that serves files
+// hand-rolls the check and gets it wrong, so THIS FILE WRITES NO PATH CHECK
+// OF ITS OWN: `safePath` (stdlib/path/path.bit:298) is the one copy, hoisted
+// there by #3953 from examples/staticserver, and it is the only thing
+// standing between a request path and a filesystem read here.
+//
+// ORDER IS THE SECURITY PROPERTY. `mountRelative` and `safePath` are pure
+// string functions — neither can touch the filesystem — and both run to
+// completion before `staticServe` makes its first syscall. A rejected path
+// therefore causes no `lstat`, no `open`, and no read anywhere, inside the
+// root or outside it. `full` is `base + rel`, a plain concatenation, NOT
+// `path.join(base, rel)`: `join` returns `b` whole when `b` is absolute
+// (stdlib/path/path.bit:24), so joining an attacker-controlled absolute
+// remainder would discard the root entirely. `rel` always begins with `/`
+// (safePath rejects anything that does not) and carries no `..`, no `\`, no
+// NUL/CR/LF and no `%XX`, so the concatenation cannot leave `base`.
+//
+// A rejected path is a 404, never a 403, and it is byte-for-byte the
+// adapter's own 404 (`notFoundBody`, adapter.bit): a 403 tells the client
+// the file exists, and a distinguishable body tells it which check fired.
+// A directory is a 404 too — there is no listing and no `index.html`
+// lookup, at any setting. An app that wants either writes a route.
+//
+// A MOUNT CLAIMS ITS WHOLE SUBTREE, and that is a deliberate choice worth
+// stating because the obvious alternative is also defensible. Once a GET or
+// HEAD is below the prefix, this middleware answers it — with the file, or
+// with a 404 for a missing one — and the rest of the chain does not run. So
+// a route registered under the mount (`app.get("/assets/generated.css", h)`)
+// is shadowed by the mount and never reached. Express's `express.static`
+// does the opposite: it calls `next()` when the file is missing, which makes
+// a mount composable with routes below it. The ticket (#3954) specifies
+// pass-through for exactly two cases — a path outside the prefix, and a
+// method that is not GET or HEAD — and specifies 404 for the rest, so that
+// is what this does. An app that needs a route below the mount mounts at a
+// narrower prefix. Revisit here, not at a call site, if that stops being
+// enough.
+//
+// HOW IT MUST BE MOUNTED, which is not obvious and is not this file's
+// choice. `App.use` middleware is composed around ROUTE HANDLERS at
+// `freeze()` (middleware.bit's `flushPending`), so it runs only for a
+// request the router already matched — a path with no route is a 404 from
+// `missResponse` (adapter.bit) before any middleware is reached. So a mount
+// needs a catch-all route under it for this middleware to ever see a
+// request:
+//
+//     app.use(static("/assets", "./public"))
+//     app.get("/assets/*path", (c) => { return c.status(404) })
+//
+// The wildcard handler is the fall-through: it runs only when static
+// declined (wrong method, unsafe path, missing file). Filed as #4515, with
+// #4516 for the missing HEAD registration — until that lands an app cannot
+// register a HEAD route at all, so HEAD reaches this middleware only
+// through `Group.register` directly.
+//
+// `mimeFor` IS A LOCAL TABLE, and deliberately not hoisted the way
+// `safePath` was. examples/staticserver and the separate bit-website repo
+// each carry their own; that is the same divergence risk, but a MIME table
+// is not a security boundary — the worst a stale entry does is send
+// `application/octet-stream`, which is exactly what an unknown extension
+// already gets. `safePath` was hoisted because a divergence there is a
+// traversal; this one is a download prompt. The table is also why every
+// response carries `X-Content-Type-Options: nosniff`: the ticket's rule is
+// that the type comes from the extension and is never guessed from content,
+// and nosniff is the only way to say that to the browser as well.
+//
+// `toLower` (escape.bit), `split`/`join` (router.bit), `trimSpace`
+// (ctx.bit), `newRes`/`statusOK`/`statusNotModified`/`textContentType`/
+// `htmlContentType`/`jsonContentType` (res.bit) and `statusNotFound`/
+// `notFoundBody` (adapter.bit) are already declared or imported module-wide
+// — an import binds per MODULE (SPEC §17.1), so re-importing any of them
+// here is E0042, and redeclaring a constant is a redeclaration error.
+// `readFile` is imported under an ALIAS, and it has to be. This file must
+// import it itself — a library build of pkg/web compiles no `*.test.bit`,
+// so leaning on the module-wide binding node.test.bit:6 already creates
+// would leave `readFile` undefined the moment the package is consumed
+// without its tests. But importing it under its own name IS that binding
+// twice, which is `E0042: 'readFile' is already declared in this scope`
+// against node.test.bit. The alias is the only spelling that satisfies both.
+import { readFile as staticReadFile, lstat, FileInfo } from "std/fs"
+import { safePath, ext } from "std/path"
+import { civilFromUnix, parseRfc3339 } from "std/time"
+
+const methodGet = "GET"
+const methodHead = "HEAD"
+
+const etagName = "ETag"
+const lastModifiedName = "Last-Modified"
+const ifNoneMatchName = "If-None-Match"
+const ifModifiedSinceName = "If-Modified-Since"
+const noSniffName = "X-Content-Type-Options"
+const noSniffValue = "nosniff"
+
+const octetStreamContentType = "application/octet-stream"
+
+// IMF-fixdate is fixed width by RFC 9110 §5.6.7: `Sun, 06 Nov 1994 08:49:37
+// GMT` is 29 bytes and every field sits at a known offset. That is what
+// makes `parseHttpDate` a set of slices rather than a parser, and what makes
+// a length that is not 29 a rejection before anything else is looked at.
+const imfDateLen = 29
+const imfSuffix = " GMT"
+
+const dayNames = "SunMonTueWedThuFriSat"
+const monthNames = "JanFebMarAprMayJunJulAugSepOctNovDec"
+const nameWidth = 3
+const monthsInYear = 12
+
+// Serves `root` at `prefix`. A request outside `prefix` — or one that is not
+// a GET or a HEAD — passes through to the rest of the chain untouched; one
+// inside it is answered here and the rest of the chain never runs, whether
+// the answer is the file or a 404.
+//
+// Both arguments are the app's own, so a bad one panics AT THE MOUNT rather
+// than failing per request: the same caller-contract call res.bit already
+// makes for a status outside 100..599. An empty `root` is the one that
+// matters — `"" + "/etc/passwd"` is `/etc/passwd`, so an empty root would
+// silently serve the filesystem from `/`.
+export fn static(prefix: string, root: string): Middleware {
+  let mountAt = staticMount(prefix)
+  let base = staticBase(root)
+  let mimes = mimeTable()
+  return (c, next) => {
+    let (rel, mine) = staticClaim(mountAt, c)
+    if (mine) {
+      let served = staticServe(base, mimes, c, rel) catch e {
+        return rethrow(e)
+      }
+      return served
+    }
+    let passed = callNext(next, c) catch e {
+      return rethrow(e)
+    }
+    return passed
+  }
+}
+
+// THE TWO FREE FUNCTIONS BELOW EXIST ONLY TO GET THE ARROW ABOVE TO LOWER,
+// and they should be deleted when #4520 lands. A closure that is a
+// function's RETURN VALUE cannot call anything whose callee resolves to one
+// of its own parameters: `c.path()` and `next(c)` written inline both fail
+// with `error[E0092]: cannot lower a call whose callee does not resolve to a
+// function`, and `bit check` does not see it — it exits 0 and `bit build`
+// then refuses to emit. Routing the same call through a top-level function
+// that takes the parameter as an ARGUMENT lowers and runs correctly. The
+// same arrow passed as an ARGUMENT (every handler in adapter.test.bit) has
+// no such problem, and neither does a CAPTURED callee (middleware.bit's
+// `wrap`), which is why nothing else in this package has hit it.
+
+// Whether this request is the mount's to answer, and its path below the
+// mount. A GET or HEAD below the prefix is claimed; everything else — any
+// other method, and any path outside the prefix — belongs to the rest of
+// the chain. Both reads of `c` happen HERE rather than in the arrow, per
+// the note above.
+fn staticClaim(mountAt: string, c: Ctx): (string, bool) {
+  let (rel, under) = mountRelative(mountAt, c.path())
+  return (rel, under && isReadMethod(c.method()))
+}
+
+// `next(c)`, called from where the callee is an ordinary parameter of a
+// top-level function. Per the note above.
+fn callNext(next: Next, c: Ctx): Res! {
+  return next(c)?
+}
+
+// `prefix` with any single trailing slash removed, so `"/assets/"` and
+// `"/assets"` mount the same place and `"/"` means "every path". Panics on a
+// relative prefix: a mount point is a URL path and there is no request path
+// it could match.
+fn staticMount(prefix: string): string {
+  if (len(prefix) == 0 || prefix[0] != '/') {
+    panic("web: static(): the mount prefix '${prefix}' must start with '/'")
+  }
+  return trimTrailingSlash(prefix)
+}
+
+// `root` with any single trailing slash removed. Panics on an empty root —
+// see `static()`'s comment: an empty root serves `/`.
+fn staticBase(root: string): string {
+  if (len(root) == 0) {
+    panic("web: static(): the served root directory is empty — refusing to serve from the filesystem root")
+  }
+  return trimTrailingSlash(root)
+}
+
+fn isReadMethod(method: string): bool {
+  return method == methodGet || method == methodHead
+}
+
+// `path`'s remainder below `mountAt`, and whether it is below it at all.
+// PURELY LEXICAL: this function makes no filesystem call, and neither does
+// `safePath` after it — see the file header on why that ordering is the
+// security property rather than an implementation detail.
+//
+// The boundary is a whole path COMPONENT, never a byte prefix: with the
+// mount at `/assets`, `/assetsx/a.css` is NOT below it and passes through,
+// even though `/assetsx/a.css` starts with the bytes `/assets`. An empty
+// `mountAt` (from a `"/"` prefix) is below everything.
+fn mountRelative(mountAt: string, path: string): (string, bool) {
+  if (len(mountAt) == 0) {
+    return (path, true)
+  }
+  if (len(path) < len(mountAt) || path[0:len(mountAt)] != mountAt) {
+    return ("", false)
+  }
+  if (len(path) != len(mountAt) && path[len(mountAt)] != '/') {
+    return ("", false)
+  }
+  return (path[len(mountAt):len(path)], true)
+}
+
+// The response for a request already known to be a GET or HEAD below the
+// mount. Fallible only for a read that fails AFTER `lstat` succeeded — a
+// permission change or an unlink between the two calls is a server fault,
+// so it goes to the adapter's single failure site (adapter.bit) to be
+// logged and answered with a generic 500, not reported to the client here.
+fn staticServe(base: string, mimes: map<string, string>, c: Ctx, rel: string): Res! {
+  if (!safePath(rel)) {
+    return staticNotFound()
+  }
+  let full = base + rel
+  let info = lstat(full) catch _ {
+    return staticNotFound()
+  }
+  if (info.isDir) {
+    return staticNotFound()
+  }
+  if (info.isSymlink) {
+    return staticNotFound()
+  }
+  return staticFileRes(full, mimes, c, info)?
+}
+
+// `lstat`, not `stat`, and a symlink is a 404. `safePath` is lexical and
+// says so itself: it "cannot see a symlink planted inside an already-safe
+// path — that is a filesystem-facing check, not this one"
+// (stdlib/path/path.bit:270). This is that check, for the final component:
+// a link dropped into an uploads directory is the one traversal a correct
+// `safePath` cannot stop. A symlinked INTERMEDIATE directory is still not
+// covered — that needs an lstat per component — and is recorded as #4517.
+fn staticFileRes(full: string, mimes: map<string, string>, c: Ctx, info: FileInfo): Res! {
+  let etag = staticEtag(info)
+  if (staticFresh(c, etag, info.mtime)) {
+    return staticHeaders(newRes(statusNotModified, "", ""), etag, info.mtime)
+  }
+  let mime = mimeFor(mimes, full)
+  if (c.method() == methodHead) {
+    return staticHeaders(newRes(statusOK, mime, ""), etag, info.mtime)
+  }
+  let body = staticReadFile(full)?
+  return staticHeaders(newRes(statusOK, mime, body), etag, info.mtime)
+}
+
+fn staticNotFound(): Res {
+  return newRes(statusNotFound, textContentType, notFoundBody)
+}
+
+// `ETag` and `Last-Modified` go on the 304 as well as the 200: RFC 9110
+// §15.4.5 requires a 304 to carry the validators a 200 would have, and a
+// cache that gets a 304 with no `ETag` cannot refresh what it stored.
+// `Res.body()` already forces a 304's body empty whatever was set
+// (res.bit), so nothing here has to remember to.
+fn staticHeaders(r: Res, etag: string, mtime: i64): Res {
+  let stamped = r.header(etagName, etag)
+  stamped = stamped.header(lastModifiedName, httpDate(mtime))
+  return stamped.header(noSniffName, noSniffValue)
+}
+
+// Size and mtime, the construction nginx uses, emitted as a STRONG
+// validator. Its one blind spot, stated rather than left to be discovered:
+// mtime has one-second granularity here (`FileInfo.mtime` is whole seconds),
+// so a file replaced within the same second by content of exactly the same
+// length is indistinguishable from the original. The alternative — a digest
+// of the content — is strong with no such gap, but it costs a full read of
+// the file on every conditional request, which is the read a 304 exists to
+// avoid.
+fn staticEtag(info: FileInfo): string {
+  return "\"${info.size}-${info.mtime}\""
+}
+
+// Whether the client already holds this representation. `If-None-Match`
+// wins outright when present, including when it fails to match: RFC 9110
+// §13.1.3 says a recipient MUST ignore `If-Modified-Since` if the request
+// carries an `If-None-Match`, because the entity tag is the more reliable
+// validator of the two.
+fn staticFresh(c: Ctx, etag: string, mtime: i64): bool {
+  let inm = c.header(ifNoneMatchName)
+  if (len(inm) > 0) {
+    return etagMatches(inm, etag)
+  }
+  let ims = c.header(ifModifiedSinceName)
+  if (len(ims) == 0) {
+    return false
+  }
+  let (since, ok) = parseHttpDate(ims)
+  return ok && mtime <= since
+}
+
+// `If-None-Match` matching, weak comparison (RFC 9110 §13.1.2 — the
+// conditional-request comparison for this header is the weak one, so `W/`
+// is stripped from a candidate before comparing). `*` matches any
+// representation the resource has.
+fn etagMatches(raw: string, etag: string): bool {
+  if (trimSpace(raw) == "*") {
+    return true
+  }
+  for candidate of split(raw, ",") {
+    if (stripWeakMark(trimSpace(candidate)) == etag) {
+      return true
+    }
+  }
+  return false
+}
+
+fn stripWeakMark(s: string): string {
+  if (len(s) > 2 && s[0:2] == "W/") {
+    return s[2:len(s)]
+  }
+  return s
+}
+
+// `unixSec` as an IMF-fixdate, the only format RFC 9110 §5.6.7 allows a
+// sender to produce. Built from `civilFromUnix` (std/time) rather than a
+// calendar computation of its own — the day-of-week is the part that is
+// easy to get wrong, and that module already derives it.
+fn httpDate(unixSec: i64): string {
+  let c = civilFromUnix(unixSec * nsPerSecond)
+  let day = "${nameAt(dayNames, c.weekday)}, ${pad2(c.day)}"
+  let month = "${nameAt(monthNames, c.month - 1)} ${c.year}"
+  let clock = "${pad2(c.hour)}:${pad2(c.minute)}:${pad2(c.second)}"
+  return "${day} ${month} ${clock}${imfSuffix}"
+}
+
+// The `index`-th three-letter name in `table`. `Civil` guarantees `weekday`
+// is 0..6 and `month` is 1..12, so a bad index is a bug in std/time rather
+// than input this could be handed — an out-of-range slice panics, which is
+// the correct outcome for that.
+fn nameAt(table: string, index: int): string {
+  return table[index * nameWidth:index * nameWidth + nameWidth]
+}
+
+fn pad2(n: int): string {
+  if (n < 10) {
+    return "0${n}"
+  }
+  return "${n}"
+}
+
+// An IMF-fixdate as a whole Unix second, and whether it parsed. Fixed
+// offsets into a fixed-width format, then handed to `parseRfc3339` for the
+// digit and range checking — a month of `13` or a day of `32` fails there,
+// so nothing here has to check them twice.
+//
+// The two obsolete formats RFC 9110 §5.6.7 lists (RFC 850 and asctime) are
+// REJECTED rather than accepted. Rejecting one costs a single unnecessary
+// 200 where a 304 would have done; accepting one wrongly serves a stale
+// body, and neither has been emitted by a client this decade.
+fn parseHttpDate(s: string): (i64, bool) {
+  if (len(s) != imfDateLen) {
+    return (0, false)
+  }
+  if (s[imfDateLen - len(imfSuffix):imfDateLen] != imfSuffix) {
+    return (0, false)
+  }
+  let month = monthNumber(s[8:11])
+  if (month == 0) {
+    return (0, false)
+  }
+  let iso = "${s[12:16]}-${pad2(month)}-${s[5:7]}T${s[17:19]}:${s[20:22]}:${s[23:25]}Z"
+  let ns = parseRfc3339(iso) catch _ {
+    return (0, false)
+  }
+  return (ns / nsPerSecond, true)
+}
+
+// The 1-based month number `name` spells, or 0 if it spells none. Case
+// sensitive: IMF-fixdate's month names are fixed tokens, not free text.
+fn monthNumber(name: string): int {
+  let i = 0
+  while (i < monthsInYear) {
+    if (nameAt(monthNames, i) == name) {
+      return i + 1
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// THE table. Small and explicit on purpose: everything not named here is
+// `application/octet-stream`, which is the browser's cue to download rather
+// than render, and is never a guess made from the file's contents. A charset
+// is attached wherever one is meaningful, for the reason res.bit gives — a
+// missing charset on `text/html` is an XSS vector in a browser that falls
+// back to sniffing.
+fn mimeTable(): map<string, string> {
+  let m = map<string, string>()
+  m[".html"] = htmlContentType
+  m[".htm"] = htmlContentType
+  m[".css"] = "text/css; charset=utf-8"
+  m[".js"] = "text/javascript; charset=utf-8"
+  m[".mjs"] = "text/javascript; charset=utf-8"
+  m[".json"] = jsonContentType
+  m[".txt"] = textContentType
+  m[".xml"] = "application/xml"
+  m[".svg"] = "image/svg+xml"
+  m[".png"] = "image/png"
+  m[".jpg"] = "image/jpeg"
+  m[".jpeg"] = "image/jpeg"
+  m[".gif"] = "image/gif"
+  m[".webp"] = "image/webp"
+  m[".ico"] = "image/vnd.microsoft.icon"
+  m[".woff2"] = "font/woff2"
+  m[".wasm"] = "application/wasm"
+  return m
+}
+
+// The type for `path`'s extension, lowercased so `IMAGE.PNG` is served the
+// same as `image.png`. An extensionless name has no entry and gets the
+// default, which is the right answer for a `README` as much as for a
+// `.mystery`.
+fn mimeFor(table: map<string, string>, path: string): string {
+  let (mime, ok) = table[toLower(ext(path))]
+  if (ok) {
+    return mime
+  }
+  return octetStreamContentType
+}
