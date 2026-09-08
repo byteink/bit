@@ -33,15 +33,18 @@ fn seedArrowExpectedBinding(c: Checker, node: int) {
 // `apply((x: f32) => 4.5)` — the matching parameter's declared type is the
 // argument's expected type.
 //
-// Resolution is vCall's, guard for guard: a bare-ident callee that no local
-// shadows, naming a known free function whose arity matches. A METHOD callee
-// (`recv.method(...)`) is resolved by the sibling `seedArrowExpectedMethodCall`
-// below, guard for guard with vMethodCall's — #3029, closing the one shape
-// that stayed unseeded once #2947 fixed the flat-env fallback it left behind.
-// Every OTHER undecidable shape (value call, builtin, variadic, spread)
-// records nothing and leaves the arrow inferred exactly as before, which is
-// what keeps a wrong expectation — the only way either path could manufacture
-// a diagnostic the oracle does not have — out of reach.
+// Three callee shapes, in the order the tree can decide them: a METHOD callee
+// (`recv.method(...)`) goes to `seedArrowExpectedMethodCall`, guard for guard
+// with vMethodCall's (#3029); a bare-ident callee that no local shadows and
+// that names a known free function goes to `seedArrowExpectedNamedCall`, guard
+// for guard with vCall's; anything else — and any ident the named path
+// DECLINES — is a call through a function VALUE, whose parameter types come
+// from the callee expression's own type (`seedArrowExpectedValueCall`, #4544).
+//
+// The value path is a fallback, never a widening: an ident naming a free
+// function is still resolved through `funcRefAt`, and the named path returning
+// `false` is what says "there is no such free function here", not a type
+// lookup racing it.
 //
 // A GENERIC callee is decidable one step later, once its type params are bound
 // from the other arguments: `seedArrowExpectedGeneric` (#2040).
@@ -56,29 +59,39 @@ fn seedArrowExpectedCall(c: Checker, node: int) {
     seedArrowExpectedMethodCall(c, kids[0], args)
     return
   }
-  if (cn.tag != Tag.Ident) {
+  if (cn.tag == Tag.Ident && seedArrowExpectedNamedCall(c, node, kids[0], args)) {
     return
   }
+  seedArrowExpectedValueCall(c, kids[0], args)
+}
+
+// `apply((x) => …)` where `apply` is a bare ident naming a FREE FUNCTION.
+// Returns false when this callee is not one — a local value shadows the name
+// (SPEC §17.5), or no declaration answers to it — which hands the call to the
+// value path above; true when it owns the call, whether or not it seeded
+// anything (an arity mismatch here is a spread or a real arity error, not a
+// value call, so it must not fall through).
+fn seedArrowExpectedNamedCall(c: Checker, node: int, callee: int, args: []int): bool {
+  let cn = getNode(c.tree, callee)
   let name = c.source[cn.span.start:cn.span.end]
-  if (shadowedByValue(c, kids[0], name)) {
-    return // a local value shadows the free function
+  if (shadowedByValue(c, callee, name)) {
+    return false // a local value shadows the free function: it is a value call
   }
-  let fr = funcRefAt(c, kids[0], name)
-  let decl = fr.decl
-  if (decl == 0) {
-    return
+  let fr = funcRefAt(c, callee, name)
+  if (fr.decl == 0) {
+    return false // no free function of that name: the callee is a value
   }
   let owner = fr.owner
-  let plist = declParamListNode(owner, decl)
+  let plist = declParamListNode(owner, fr.decl)
   if (plist < 0) {
     // Generic: the parameter type is written against type params, so the
     // expectation exists only once the other arguments have bound them (#2040).
-    seedArrowExpectedGeneric(c, node, owner, decl, args)
-    return
+    seedArrowExpectedGeneric(c, node, owner, fr.decl, args)
+    return true
   }
   let params = kidsOf(owner.tree, plist)
   if (len(params) != len(args)) {
-    return // variadic, spread, or an arity error: which parameter is undecided
+    return true // variadic, spread, or an arity error: which parameter is undecided
   }
   let i = 0
   while (i < len(args)) {
@@ -91,6 +104,7 @@ fn seedArrowExpectedCall(c: Checker, node: int) {
     }
     i = i + 1
   }
+  return true
 }
 
 // `b.each((x) => x + 1)` — a METHOD call's matching parameter type is the
@@ -110,9 +124,9 @@ fn seedArrowExpectedCall(c: Checker, node: int) {
 // namespace-alias receiver (`checkExprType` returns 0 for both, #3029), no
 // method by that name (a func-typed FIELD called `recv.field(...)` is a value
 // call, not a method — vMethodCall's own class-field fallback is deliberately
-// not mirrored here, matching seedArrowExpectedCall's "value call" exclusion
-// above), a variadic signature, or an arity mismatch (a spread or a real arity
-// error: which parameter is undecided).
+// not mirrored here: that node shape is this function's, and seeding it is
+// #4547), a variadic signature, or an arity mismatch (`seedArrowArgs` rejects
+// it: which parameter is undecided).
 fn seedArrowExpectedMethodCall(c: Checker, callee: int, args: []int) {
   let mk = kidsOf(c.tree, callee) // [receiver, method_name]
   let recvType = checkExprType(c, mk[0])
@@ -125,7 +139,55 @@ fn seedArrowExpectedMethodCall(c: Checker, callee: int, args: []int) {
   if (sig == 0 || c.ctx.types[sig].variadic) {
     return
   }
-  let want = c.ctx.types[sig].members
+  seedArrowArgs(c, c.ctx.types[sig].members, args)
+}
+
+// `g((t) => t.v())`, `fs[0]((t) => …)`, `mk()((t) => …)` — a call whose callee
+// is a function VALUE: a local, a parameter, a slice element, the result of
+// another call. There is no declaration to look up, so the parameter types are
+// read off the callee EXPRESSION's own `TypeKind.Func` type — the same list
+// `seedArrowExpectedMethodCall` reads out of `methodSigLookup`, reached through
+// `checkExprType` instead (#4544). Without it `t` below stayed at type 0, and
+// `t.v()` reached lowering with a callee that resolves to nothing (E0092)
+// while `bit check` exited 0 — the same divergence #4520 closed in `return`
+// position, here in the call-argument position this file already owns.
+//
+// Records nothing for every undecidable shape, mirroring the method path's
+// bail-outs: a callee whose type does not resolve (`checkExprType` answers 0
+// for any expression whose inference has not landed, and for a namespace
+// alias), one that is not function-typed at all (a real E0092 the validator
+// owns), a variadic signature, or an argument count other than its member
+// count (a spread or an arity error: which parameter is undecided). A wrong
+// expectation is the one way this pass can manufacture a diagnostic the oracle
+// does not have, so an undecided callee keeps today's inference exactly.
+//
+// A func-typed FIELD called as `recv.field(...)` is a value call too, but its
+// callee is a `Tag.Member` and goes to the method path above, which owns that
+// node shape; it is left unseeded exactly as before (#4547).
+fn seedArrowExpectedValueCall(c: Checker, callee: int, args: []int) {
+  let fty = checkExprType(c, callee)
+  if (fty == 0 || c.ctx.types[fty].kind != TypeKind.Func) {
+    return
+  }
+  if (c.ctx.types[fty].variadic) {
+    return
+  }
+  seedArrowArgs(c, c.ctx.types[fty].members, args)
+}
+
+// Records `want[i]` on each ArrowFn argument, for a callee whose parameter
+// types are already resolved to type ids — the method and value paths, which
+// both get their `want` from a `Func` type's `members`. The arity check lives
+// HERE rather than in each caller so there is exactly one place that can index
+// `want` out of step with `args`; a mismatch is undecidable and records
+// nothing, never a guess at which parameter a given argument matches.
+//
+// The named path keeps its own loop: its parameter types come from the
+// declaration's type NODES, and `typeFromNode` can mint a type (`Self`,
+// checktype.bit), so resolving every parameter up front to build a `want` list
+// would move type ids for a program that never needed them — and type-id order
+// feeds method-name mangling and the bootstrap fixed point.
+fn seedArrowArgs(c: Checker, want: []int, args: []int) {
   if (len(want) != len(args)) {
     return
   }
