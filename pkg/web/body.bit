@@ -1,0 +1,393 @@
+// pkg/web/body.bit — reading the request body into a type the route declared
+// (#3877). The decoding itself is std/json's `jsonDecode<T>` (#3977); what
+// this file owns is the three refusals around it (413, 415, 400), the
+// unknown-field policy, and turning every decode failure into a client error
+// that NAMES the field rather than a single useless "invalid body".
+//
+// --- THE TRAP THIS CLOSES: MASS ASSIGNMENT ---------------------------------
+//
+// Binding client JSON straight into the type that reaches the database is how
+// a client makes itself an admin. Given `class User { name, email, isAdmin }`,
+// a payload of `{"name":"Ali","isAdmin":true}` sets `isAdmin`, and no line of
+// the handler looks wrong. Laravel invented `$fillable` and Rails invented
+// strong parameters for exactly this.
+//
+// Rejecting unknown fields is the SECOND layer and it is not the real
+// protection. The real protection is a separate input type — `NewUser { name,
+// email }`, with no `id` and no `isAdmin` — mapped across explicitly, so a
+// field the payload must never reach does not EXIST on the bound type. Under
+// either policy a client then cannot reach it. README.md leads with that
+// pattern, and it leads on purpose: a reader who learns only `Reject` will put
+// the database entity in the type parameter and believe it is safe.
+//
+// --- WHY THE CALL TAKES A DECODER, AND NOT JUST A TYPE ----------------------
+//
+// #3877 specifies `c.body<T>(): T!`. That cannot be written today and the
+// reason is a compiler limitation, filed as #4563 with a minimal repro:
+// `jsonDecode<T>` is specialised by a SYNTACTIC rewrite in `resolveProject`
+// (compiler/classjsondecodecall.bit), before any checker exists, so the type
+// argument must name a concrete `@json` class at the call site. Inside a
+// generic wrapper it names a type parameter, and the rewrite refuses it:
+//
+//     error[E0145]: 'jsonDecode' cannot decode into 'T': it is not declared
+//     in this module and is not imported from another by name
+//
+// So the type argument stays at the app's call site, where it resolves, and
+// the framework takes what it produces:
+//
+//     let input = c.body((j) => jsonDecode<NewUser>(j))?
+//
+// `T` is inferred from the arrow — it is never spelled twice — and everything
+// the ticket asked the framework to own still runs here: the size cap, the
+// Content-Type check, the parse, the policy and the error mapping. What is
+// lost is six characters of ceremony. When #4563 lands, the parameter goes and
+// the spelling becomes `c.body<NewUser>()?`; nothing else in this file moves,
+// because nothing in it names `jsonDecode`.
+//
+// --- WHAT IS NOT BOUNDED HERE ----------------------------------------------
+//
+// `Config.maxBody` is a cap on what this framework will PARSE, not on what was
+// read: `stdlib/http/http.bit`'s `readRequestBody` reads a `Content-Length`
+// body with no limit of its own, so the bytes are already resident before any
+// `Ctx` exists. A 413 from here is a real refusal to decode, and it is not a
+// defence against an over-large upload. That gap is std/http's and is filed as
+// #4565.
+//
+// --- IMPORT ALIASES --------------------------------------------------------
+//
+// `pkg/web` is ONE module, so a name imported in any file is bound in every
+// file and importing it twice is E0042. `JsonEntry`, `jsonAsObject`,
+// `jsonAsArray` and `jsonParse` are already imported by `res.test.bit` and
+// `errors.test.bit` — TEST files, which are absent from a non-test build of
+// this package, so this file cannot rely on those bindings and cannot repeat
+// them either. Renaming on import (SPEC §17.2) binds them here independently,
+// the same way `errors.bit` binds `JsonEntry as JsonPair`.
+
+import {
+  JsonDecodeError,
+  JsonEntry as BodyEntry,
+  jsonAsArray as bodyArray,
+  jsonAsObject as bodyObject,
+  jsonDecIndex,
+  jsonDecPath,
+  jsonParse as parseBodyJson,
+} from "std/json"
+
+// The two statuses this file adds to the table in res.bit. 413 is the body
+// over `Config.maxBody`; 415 is a body this route will not try to parse.
+const statusPayloadTooLarge = 413
+const statusUnsupportedMediaType = 415
+
+// How many unknown keys `Unknown.Ignore` drops before it refuses with a 400.
+//
+// THE BOUND IS NOT DECORATION. `Ignore` is implemented by decoding, dropping
+// the one key the failure names, and decoding again (`decodeIgnoringUnknown`),
+// because std/json's decoder has no lenient mode — see that function's own
+// comment, which calls the retry what it is. Each round is O(document), so an
+// unbounded loop would make a body of 5,000 junk keys 5,000 decodes of a
+// 5,000-key document: quadratic work on attacker-chosen input, on the policy
+// that exists to be forgiving. 32 is generous for the case `Ignore` is for —
+// a client sending a handful of fields this version does not know — and a
+// request past it gets a 400 that says so rather than a stalled worker.
+const maxIgnoredKeys = 32
+
+// The RFC 6839 §3.5 structured-syntax suffix: `application/vnd.api+json` and
+// every other `+json` type is JSON.
+const jsonTypeSuffix = "+json"
+
+// How much of a client-controlled string a diagnostic repeats back. The value
+// goes out through `errorJson` (errors.bit), which builds the body through
+// `Json` and never by pasting, so this is a size bound and not an escaping
+// one: a `Content-Type` header can be kilobytes and the 415 that names it
+// should not be.
+const maxEchoBytes = 64
+
+// What to do with a key in the body that no field of the bound type claims.
+//
+// `Reject` is a 400 NAMING THE FIELD, never a silent drop: a dropped field
+// means the client believes it set something it did not, and the two outcomes
+// are indistinguishable to whoever sent it.
+export enum Unknown {
+  Reject,
+  Ignore,
+}
+
+// The per-call override of the app-level default (`Config.rejectUnknownFields`,
+// config.bit):
+//
+//     let loose = c.bodyWith(Bind{ unknown: Unknown.Ignore }, (j) => jsonDecode<Legacy>(j))?
+//
+// `Reject` is declared FIRST so that the zero value of this field is the safe
+// one and `Bind{}` rejects. That ordering is load-bearing rather than
+// cosmetic: an enum variant is not a compile-time constant expression (E0064),
+// so this field cannot carry `= Unknown.Reject` as a default the way
+// `Config.rejectUnknownFields` carries `= true`, and the variant order is the
+// only thing left that decides what an omitted field means.
+export class Bind {
+  unknown: Unknown,
+}
+
+// --- the three refusals -----------------------------------------------------
+
+// The raw request body, refused above `Config.maxBody`.
+//
+// This is the only place the body is read, so nothing in this package can get
+// at it without passing the cap — see the file header for what the cap does
+// and does not bound.
+fn requestBody(c: Ctx): string! {
+  let n = i64(len(c.req.body))
+  if (n > c.config.maxBody) {
+    fail httpError(
+      statusPayloadTooLarge,
+      "web: request body is ${n} byte(s), over the ${c.config.maxBody}-byte cap",
+    )
+  }
+  return c.req.body
+}
+
+// The body as a `Json` tree: over the cap is a 413, a `Content-Type` that is
+// not JSON is a 415, and a body that does not parse is a 400 carrying the
+// parser's own message, which names the offset.
+//
+// The size cap is checked BEFORE the media type: a body too large to decode is
+// refused whatever it claims to be, and the answer does not depend on a header
+// the client also chose.
+fn requestJson(c: Ctx): Json! {
+  let raw = requestBody(c)?
+  let media = mediaTypeOf(c.header(contentTypeName))
+  if (!isJsonContentType(media)) {
+    fail httpError(
+      statusUnsupportedMediaType,
+      "web: Content-Type '${clipEcho(media)}' is not JSON; this route reads ${jsonContentType}",
+    )
+  }
+  return parseBodyJson(raw) catch e {
+    fail badRequest("web: request body is not valid JSON: ${e.message()}")
+  }
+}
+
+// The media type of a `Content-Type` value: everything before the first `;`,
+// trimmed and lowercased, so `application/json; charset=utf-8` is
+// `application/json`. Parameters are dropped rather than parsed — nothing here
+// reads one, and `charset` on JSON is meaningless (RFC 8259 §8.1: JSON is
+// UTF-8).
+fn mediaTypeOf(v: string): string {
+  let semi = indexOf(v, ";")
+  if (semi < 0) {
+    return toLower(trimSpace(v))
+  }
+  return toLower(trimSpace(v[0:semi]))
+}
+
+// Whether `media` is JSON: `application/json`, or any `+json` structured
+// syntax suffix.
+//
+// AN ABSENT `Content-Type` IS NOT JSON and gets the 415. A framework that
+// guessed would parse whatever a client posted with no declared type, which is
+// precisely the request an attacker controls most completely.
+fn isJsonContentType(media: string): bool {
+  if (media == jsonContentType) {
+    return true
+  }
+  let n = len(media)
+  let k = len(jsonTypeSuffix)
+  if (n <= k) {
+    return false
+  }
+  return media[n - k:n] == jsonTypeSuffix
+}
+
+// `s` clipped to `maxEchoBytes`, for a diagnostic that repeats a header the
+// client chose.
+fn clipEcho(s: string): string {
+  if (len(s) <= maxEchoBytes) {
+    return s
+  }
+  return s[0:maxEchoBytes] + "..."
+}
+
+// --- the policy -------------------------------------------------------------
+
+// The app-level default as a policy value.
+fn bodyPolicy(cfg: Config): Unknown {
+  if (cfg.rejectUnknownFields) {
+    return Unknown.Reject
+  }
+  return Unknown.Ignore
+}
+
+fn ignoresUnknown(u: Unknown): bool {
+  match (u) {
+    Reject => return false
+    Ignore => return true
+  }
+}
+
+// --- binding ----------------------------------------------------------------
+
+// Runs `decode` over `j` under policy `u`, mapping whatever it fails with into
+// a client error. `decode` is `(j) => jsonDecode<T>(j)` at the app's call site;
+// see the file header for why the type argument lives there.
+fn bindJson<T>(j: Json, u: Unknown, decode: (Json) => T!): T! {
+  if (!ignoresUnknown(u)) {
+    return decode(j) catch e {
+      fail bodyFailure(e)
+    }
+  }
+  return decodeIgnoringUnknown(j, decode)?
+}
+
+// `Unknown.Ignore`: decode, and on an unknown-key failure drop the one key it
+// names and decode again, up to `maxIgnoredKeys` times.
+//
+// THIS IS A STOP-GAP AND IT IS WRITTEN DOWN AS ONE. The right shape is a
+// lenient mode on std/json's decoder, which knows the class's whole key set
+// and can skip a key in the single pass it already makes; this package cannot
+// know that key set — `T` is a type parameter here and Bit has no reflection —
+// so the only information it has about which keys are unknown is what the
+// STRICT decode reports, one key at a time. #4567 is the stdlib ticket; when
+// it lands this function is deleted and `bindJson` passes the policy down.
+//
+// Every failure that is not an unknown key, and every unknown key whose path
+// is not in the document, comes straight back out through `bodyFailure` — the
+// loop can only ever run one round per key it actually removed, so it cannot
+// spin on a document it is failing to change.
+fn decodeIgnoringUnknown<T>(j: Json, decode: (Json) => T!): T! {
+  let cur = j
+  let dropped = 0
+  while (dropped <= maxIgnoredKeys) {
+    let bound = decode(cur) catch e {
+      cur = withoutUnknownKey(cur, e)?
+      dropped = dropped + 1
+      continue
+    }
+    return bound
+  }
+  fail badRequest(
+      "web: request body carries more than ${maxIgnoredKeys} unknown field(s), " +
+      "which this route will not ignore",
+  )
+}
+
+// `j` without the one key `e` reports as unknown.
+//
+// It FAILS, carrying `e` mapped to a client error, when `e` is not an
+// unknown-key failure at all, and also when the path it names is not in `j` —
+// which cannot happen for a path this decode produced, and is refused rather
+// than retried because a retry that removed nothing is the one way the loop
+// above could fail to terminate.
+fn withoutUnknownKey(j: Json, e: error): Json! {
+  let target = unknownKeyPath(e)
+  if (target == "") {
+    fail bodyFailure(e)
+  }
+  let (out, removed) = withoutPath(j, "", target)
+  if (!removed) {
+    fail bodyFailure(e)
+  }
+  return out
+}
+
+// The full dotted path of the key `e` reports as unknown (`isAdmin`,
+// `addr.zip`, `crumbs[1].zip`), or "" when `e` is any other failure.
+fn unknownKeyPath(e: error): string {
+  let (de, ok) = e.(JsonDecodeError)
+  if (!ok) {
+    return ""
+  }
+  match (de.cause) {
+    UnknownKey => return de.path
+    MissingKey => return ""
+    TypeMismatch => return ""
+    MaxDepth => return ""
+  }
+}
+
+// --- removing one key by its path -------------------------------------------
+//
+// The path is not PARSED back into segments, and that is deliberate: a key may
+// itself contain a `.` or a `[`, so splitting `a.b` cannot tell a nested `b`
+// from a top-level key spelled "a.b". Instead the tree is walked and each
+// entry's path is REBUILT with the very functions the decoder used to report
+// it (`jsonDecPath`, `jsonDecIndex`, stdlib/json/decode.bit), and the first
+// entry whose rebuilt path equals the target is the one removed. Two entries
+// can still collide on a spelling — the walk stops at the first, so exactly
+// one key is ever removed per round, and a document that collides loses a key
+// the decoder then reports as missing, which is a 400 and never a silent
+// acceptance.
+
+// `j` with the entry at `target` removed, and whether one was.
+fn withoutPath(j: Json, base: string, target: string): (Json, bool) {
+  let obj = bodyObject(j)
+  if (isSome(obj)) {
+    return withoutPathInObject(unwrap(obj), base, target)
+  }
+  let arr = bodyArray(j)
+  if (isSome(arr)) {
+    return withoutPathInArray(unwrap(arr), base, target)
+  }
+  return (j, false)
+}
+
+fn withoutPathInObject(entries: []BodyEntry, base: string, target: string): (Json, bool) {
+  let out = []BodyEntry(0)
+  let removed = false
+  for e of entries {
+    if (removed) {
+      out = append(out, e)
+      continue
+    }
+    let path = jsonDecPath(base, e.key)
+    if (path == target) {
+      removed = true
+      continue
+    }
+    let (value, done) = withoutPath(e.value, path, target)
+    removed = done
+    out = append(out, BodyEntry{ key: e.key, value: value })
+  }
+  return (Json.JsonObject(out), removed)
+}
+
+fn withoutPathInArray(items: []Json, base: string, target: string): (Json, bool) {
+  let out = []Json(0)
+  let removed = false
+  let i = 0
+  while (i < len(items)) {
+    if (removed) {
+      out = append(out, items[i])
+    } else {
+      let (value, done) = withoutPath(items[i], jsonDecIndex(base, i64(i)), target)
+      removed = done
+      out = append(out, value)
+    }
+    i = i + 1
+  }
+  return (Json.JsonArray(out), removed)
+}
+
+// --- the error mapping ------------------------------------------------------
+
+// Every failure std/json's typed decode produces is a CLIENT error: the
+// document did not match the type this route declared. Each one already names
+// the field and the full dotted path (`addr.zip`), the expected type and what
+// was found, so the message goes out as-is — a single "invalid body" would
+// leave the caller nothing to act on.
+//
+// It is a 400 for all four causes. A missing field, a wrong type, an unknown
+// key and a document nested past the decode depth bound are all the same fact
+// about the request: it is malformed against this route's contract. 422 is
+// reserved for a document that is well-formed against the TYPE and fails a
+// domain rule, which is #3880's validation and not this file's.
+//
+// Anything that is NOT a decode failure comes back untouched, so an error a
+// handler's own decoder raised keeps whatever mapping it already had — and one
+// that opted into nothing stays a 500 with its message logged and not sent
+// (errors.bit).
+fn bodyFailure(e: error): error {
+  let (de, ok) = e.(JsonDecodeError)
+  if (!ok) {
+    return e
+  }
+  return badRequest(de.message())
+}
