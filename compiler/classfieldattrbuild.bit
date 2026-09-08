@@ -1,0 +1,277 @@
+// compiler/classfieldattrbuild.bit — the nodes a field attribute synthesizes
+// (SPEC §10.5; #3879's shape, #4572's accumulation).
+//
+// classfieldattr.bit decides WHAT to emit; this file emits it. One attributed
+// class turns into exactly what a reader would have hand-written:
+//
+//     class __AttrFailures {
+//       msg: string,
+//       errs: []error,
+//     }
+//
+//     fn (this: __AttrFailures) message(): string {
+//       return this.msg
+//     }
+//
+//     fn (this: __AttrFailures) fieldFailures(): []error {
+//       return this.errs
+//     }
+//
+//     export fn (this: NewUser) validateFields(): ()! {
+//       let __attr_errs: []error = []
+//       let __attr_msg = ""
+//       min(this.name, 3) catch __attr_e {
+//         __attr_errs = append(__attr_errs, __attr_e)
+//         if (__attr_msg != "") {
+//           __attr_msg = __attr_msg + "; "
+//         }
+//         __attr_msg = __attr_msg + "name: " + __attr_e.message()
+//       }
+//       email(this.email) catch __attr_e { ... }
+//       if (__attr_msg != "") {
+//         fail __AttrFailures{ msg: __attr_msg, errs: __attr_errs }
+//       }
+//     }
+//
+// EVERY ATTRIBUTE RUNS AND EVERY FAILURE IS NAMED, which is the whole of
+// #4572. #3879 emitted `min(this.name, 3)?` per attribute, so the first
+// failing one ended the method: a value wrong in two fields was reported one
+// round trip at a time, and the rule — an ordinary function taking the field's
+// VALUE — could not say which field it had run on. Catching instead of
+// propagating fixes the first half; attaching the field name AT THE CATCH,
+// where the call site is the only thing that knows it, fixes the second
+// without changing the signature of any rule (#3879's design, and this
+// ticket's constraint).
+//
+// THE CARRIER IS SYNTHESIZED INTO THE MODULE, NOT IMPORTED. A `_tests_/cases`
+// golden and any `--freestanding` build compile with NO PRELUDE, so a helper
+// in stdlib/core would have made `validateFields` an E0040 in exactly the
+// programs that have no library at all — measured, not assumed: with the
+// prelude version of this change, `bit build run_field_attr.bit` from a
+// scratch directory answered `error[E0040]: undefined name 'failFields'`. The
+// module gets one carrier however many attributed classes it holds.
+//
+// WHY THE ERRORS ARE KEPT AS WELL AS THE MESSAGE. `message()` is what a
+// program that only prints the failure needs. `fieldFailures()` is what a
+// caller with a policy PER failure needs: pkg/web asks each one whether it
+// opted into being shown to a client (`HttpError`) before it sends any of
+// them, and a joined string cannot answer that question. Both are found
+// structurally — a single-method interface for the second, exactly as
+// `HttpError` and `Routes` are found — so nothing registers this type and
+// nothing needs to name it.
+//
+// SPANS. Every node a diagnostic could land on carries the span of the
+// attribute or field it came from, so an error the ordinary checker raises
+// inside this body underlines the line the reader wrote. Only names with no
+// source at all — the method name, `this`, the locals, the carrier's own
+// members — carry synthetic spans, and no diagnostic is reachable on any of
+// them.
+
+// The tree being mutated, the module's synthesized words, and the span every
+// node built for the CURRENT attribute is stamped with. One value so each
+// helper stays well inside LINT.md's max-params=5 — the same shape
+// classjsonbuild.bit's `JsonBuild` takes, for the same reason.
+class AttrBuild {
+  tree: Tree,
+  st: SynthText,
+  span: Span,
+}
+
+fn abIdent(b: AttrBuild, word: string): int {
+  return synthIdent(b.tree, b.st, word)
+}
+
+// A string literal spelling `word`, which must be the QUOTED form: a literal's
+// text is read with its quotes (`decodeStringContent`).
+fn abStr(b: AttrBuild, word: string): int {
+  return addLeaf(b.tree, Tag.StringLit, synthSpan(b.st, word))
+}
+
+fn abNode(b: AttrBuild, tag: Tag, kids: []int): int {
+  return addNode(b.tree, tag, b.span, 0, kids)
+}
+
+// `recv.name`, where `name` is a synthesized word.
+fn abMember(b: AttrBuild, recv: int, word: string): int {
+  return abNode(b, Tag.Member, [recv, abIdent(b, word)])
+}
+
+// `callee(args...)`. The middle kid is the generic-argument list, always absent.
+fn abCall(b: AttrBuild, callee: int, args: []int): int {
+  let argNodes = []int(0)
+  for a of args {
+    argNodes = append(argNodes, abNode(b, Tag.Arg, [a]))
+  }
+  return abNode(b, Tag.Call, [callee, 0, abNode(b, Tag.Args, argNodes)])
+}
+
+// `<local> = <value>` as one statement.
+fn abAssign(b: AttrBuild, local: string, value: int): int {
+  return addNode(
+    b.tree, Tag.Assign, b.span, int(Kind.Eq),
+    [abNode(b, Tag.LhsList, [abIdent(b, local)]), abNode(b, Tag.ExprList, [value])],
+  )
+}
+
+fn abBinary(b: AttrBuild, op: Kind, lhs: int, rhs: int): int {
+  return addNode(b.tree, Tag.Binary, b.span, int(op), [lhs, rhs])
+}
+
+// `let <name>: []<elem> = []`. The empty slice literal carries no element type
+// of its own, which is why the binding is annotated.
+fn abLetSlice(b: AttrBuild, name: string, elem: string): int {
+  let binding = abNode(
+    b, Tag.Binding,
+    [abIdent(b, name), abSliceType(b, elem), abNode(b, Tag.SliceLit, []int(0))],
+  )
+  return abNode(b, Tag.LetDecl, [binding])
+}
+
+// `let <name> = ""`. Unannotated: the initializer says `string`.
+fn abLetEmptyString(b: AttrBuild, name: string): int {
+  let binding = abNode(b, Tag.Binding, [abIdent(b, name), 0, abStr(b, attrEmptyWord)])
+  return abNode(b, Tag.LetDecl, [binding])
+}
+
+fn abSliceType(b: AttrBuild, elem: string): int {
+  return abNode(b, Tag.SliceType, [abIdent(b, elem)])
+}
+
+// `if (__attr_msg != "") { <stmts> }` — the "something failed" test, and the
+// same test twice: the message gains a `field: ` prefix for every failure, so
+// it is non-empty exactly when at least one attribute failed. That is why
+// neither this nor the raise below needs `len()` or an integer literal.
+fn abIfMsgNotEmpty(b: AttrBuild, stmts: []int): int {
+  let cond = abBinary(b, Kind.BangEq, abIdent(b, attrLocalMsg), abStr(b, attrEmptyWord))
+  return abNode(b, Tag.IfStmt, [cond, abNode(b, Tag.Block, stmts), 0])
+}
+
+// ---- the per-module carrier ------------------------------------------------
+
+// The carrier class and its two methods, as three top-level declarations.
+//
+// The methods are declared with an explicit receiver rather than inside the
+// class body for the reason `synthValidateFields` is: a top-level
+// func_decl-with-receiver is the shape an in-body method, an injected trait
+// method and a synthesized member all reduce to, so every pass that discovers
+// a method by walking the arena picks these up with no change at all.
+fn attrCarrierDecls(b: AttrBuild): []int {
+  return [
+    abCarrierClass(b),
+    abCarrierMethod(b, attrMessageFn, abIdent(b, "string"), attrErrMsgField),
+    abCarrierMethod(b, attrFailuresFn, abSliceType(b, "error"), attrErrErrsField),
+  ]
+}
+
+// `class __AttrFailures { msg: string, errs: []error }`. A field's four kids
+// are (name, type, default, attributes), the last two absent here.
+fn abCarrierClass(b: AttrBuild): int {
+  let fields = [
+    abNode(b, Tag.Field, [abIdent(b, attrErrMsgField), abIdent(b, "string"), 0, 0]),
+    abNode(b, Tag.Field, [abIdent(b, attrErrErrsField), abSliceType(b, "error"), 0, 0]),
+  ]
+  return abNode(
+    b, Tag.StructDecl,
+    [abIdent(b, attrErrClassName), 0, abNode(b, Tag.FieldList, fields)],
+  )
+}
+
+// `fn (this: __AttrFailures) <name>(): <result> { return this.<field> }`.
+fn abCarrierMethod(b: AttrBuild, name: string, result: int, field: string): int {
+  let body = abNode(
+    b, Tag.Block,
+    [abNode(b, Tag.ReturnStmt, [abMember(b, abIdent(b, synthReceiverName), field)])],
+  )
+  return abNode(
+    b, Tag.FuncDecl,
+    [
+      abNode(b, Tag.Receiver, [0, abIdent(b, attrErrClassName)]),
+      abIdent(b, name), 0, abNode(b, Tag.Params, []int(0)), result, body,
+    ],
+  )
+}
+
+// `fail __AttrFailures{ msg: __attr_msg, errs: __attr_errs }`, guarded by the
+// non-empty test — the method's last statement, and the one place a failure
+// leaves it.
+fn abRaiseStmt(b: AttrBuild): int {
+  let inits = [
+    abNode(b, Tag.FieldInit, [abIdent(b, attrErrMsgField), abIdent(b, attrLocalMsg)]),
+    abNode(b, Tag.FieldInit, [abIdent(b, attrErrErrsField), abIdent(b, attrLocalErrs)]),
+  ]
+  let lit = abNode(
+    b, Tag.CompositeLit,
+    [abIdent(b, attrErrClassName), abNode(b, Tag.FieldInits, inits)],
+  )
+  return abIfMsgNotEmpty(b, [abNode(b, Tag.FailStmt, [lit])])
+}
+
+// ---- one attribute ---------------------------------------------------------
+
+// `attr(this.field, extraArgs...)` — the call an attribute desugars to. The
+// receiver access carries the FIELD's span and each argument its own, so a
+// type error the ordinary checker raises here underlines the line the reader
+// wrote. The `this` reference is the one node with no source to point at.
+fn abAttrCall(b: AttrBuild, source: string, c: SynthCall): int {
+  let fieldSpan = getNode(b.tree, c.fieldName).span
+  let ak = kidsOf(b.tree, c.attr) // [name, arg...]
+  let member = addNode(
+    b.tree, Tag.Member, fieldSpan, 0,
+    [abIdent(b, synthReceiverName), addLeaf(b.tree, Tag.Ident, fieldSpan)],
+  )
+  let argNodes = [addNode(b.tree, Tag.Arg, fieldSpan, 0, [member])]
+  let i = 1
+  while (i < len(ak)) {
+    // Cloned, not shared: the attribute list stays in the tree under the field,
+    // and one node reachable by two paths is a shape no other pass here builds.
+    let cloned = cloneWithSelf(b.tree, source, ak[i], b.span)
+    argNodes = append(argNodes, addNode(b.tree, Tag.Arg, getNode(b.tree, ak[i]).span, 0, [cloned]))
+    i = i + 1
+  }
+  let callee = addLeaf(b.tree, Tag.Ident, getNode(b.tree, ak[0]).span)
+  return abNode(b, Tag.Call, [callee, 0, abNode(b, Tag.Args, argNodes)])
+}
+
+// One attribute, as the statement §10.5 requires: the call, CAUGHT, with the
+// failure recorded under the field's name. The three statements of the block
+// are the accumulation itself — the error for a caller that judges each one,
+// the separator only between failures, and the `field: message` text.
+fn abAttrStmt(b: AttrBuild, source: string, c: SynthCall): int {
+  b.span = getNode(b.tree, c.attr).span
+  let call = abAttrCall(b, source, c)
+  let err = abIdent(b, attrLocalErr)
+  let text = abBinary(
+    b, Kind.Plus,
+    abBinary(b, Kind.Plus, abIdent(b, attrLocalMsg), abStr(b, c.fieldWord)),
+    abCall(b, abMember(b, abIdent(b, attrLocalErr), attrMessageFn), []int(0)),
+  )
+  let block = abNode(
+    b, Tag.Block,
+    [
+      abAssign(b, attrLocalErrs, abCall(b, abIdent(b, "append"), [abIdent(b, attrLocalErrs), err])),
+      abIfMsgNotEmpty(
+        b,
+        [
+          abAssign(
+            b,
+            attrLocalMsg,
+            abBinary(b, Kind.Plus, abIdent(b, attrLocalMsg), abStr(b, attrSepWord)),
+          ),
+        ],
+      ),
+      abAssign(b, attrLocalMsg, text),
+    ],
+  )
+  return abNode(
+    b, Tag.ExprStmt,
+    [abNode(b, Tag.CatchBind, [call, abIdent(b, attrLocalErr), block])],
+  )
+}
+
+// The (attribute, field name, quoted `field: ` prefix) triple `abAttrStmt`
+// desugars, bundled to keep that function at LINT.md's max-params=5.
+class SynthCall {
+  attr: int,
+  fieldName: int,
+  fieldWord: string,
+}
