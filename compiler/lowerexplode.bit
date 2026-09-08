@@ -14,9 +14,14 @@
 // LIST and `bindIncomingArgs` walks a parameter LIST; explosion makes both
 // lists longer and neither function changes.
 //
-// SCOPE, deliberately narrow (#4404): exactly two words, ARGUMENTS ONLY, and
-// only for a free non-generic non-extern non-`@symbol` function. Returns are
-// #4405 and are NOT touched here.
+// SCOPE, as it stands. #4404 opened with exactly two words, ARGUMENTS ONLY,
+// for a free non-generic non-extern non-`@symbol` function; #4405 widened the
+// width to two-or-more and added the RETURN side; #4423 admits `string` as
+// three words on the argument side (`explodedWordTypes`'s `explodeStr`), behind
+// `Lowerer.explodeStrings`, and excludes VARIADIC declarations whose parameter
+// list does not describe what arrives. The return side keeps the one-handle
+// convention for a `string` until #4424 — `explodedRetWords` is the one call
+// that pins it.
 //
 // WHY THE CALLEE HOLDS THE WORDS RATHER THAN RE-BOXING THEM. Rebuilding the
 // aggregate at function entry is correct and was measured to be a
@@ -43,7 +48,24 @@
 // outgoing-stack-argument path. The RETURN side has no such path (#4238), so
 // its own budget lives in `retWordsFitRegisters` rather than here — one shape
 // rule, and the one place the two directions genuinely differ is named.
-fn explodedWordTypes(ctx: TypeContext, ty: int): []int {
+//
+// `explodeStr` is #4423: a `string` is three words (`{ptr, len, base}`, fixed
+// at 0/8/16 by `runtime/ABI.md` §2.3) rather than one handle. It is a
+// PARAMETER of this function rather than a second predicate beside it, and
+// that is the whole point — #4412 shipped a truncating miscompile because one
+// consumer of the width rule was widened and another was not, so the width
+// rule stays SINGLE and each caller states which ABI direction it is asking
+// about. Today the argument side passes `explodeStrings` and the return side
+// passes `false` (`explodedRetWords`); #4424 flips that one call.
+//
+// A `string` is admitted by NAME, not by the tuple shape above, because it is
+// a prim: `ctx.types[string].kind` is not `Tuple` and it has no members. The
+// two constructors that build and read its box (`boxStringWords`,
+// `stringWordTypes`, lowerexplodestr.bit) are named there for the same reason.
+fn explodedWordTypes(ctx: TypeContext, ty: int, explodeStr: bool): []int {
+  if (explodeStr && ty == primType(ctx, 11)) {
+    return stringWordTypes(ctx)
+  }
   if (ty == 0 || ctx.types[ty].kind != TypeKind.Tuple) {
     return []int(0)
   }
@@ -61,13 +83,13 @@ fn explodedWordTypes(ctx: TypeContext, ty: int): []int {
   return members
 }
 
-// Whether any of `paramTypes` has the exploded shape. The cheap gate every
-// caller runs first, so a signature with no tuple in it costs one kind test per
-// parameter and allocates nothing.
-fn anyExplodedParam(ctx: TypeContext, paramTypes: []int): bool {
+// Whether any of `paramTypes` is passed as words. The cheap gate every caller
+// runs first, so a signature with no tuple and no `string` in it costs one kind
+// test per parameter and allocates nothing.
+fn anyExplodedParam(ctx: TypeContext, paramTypes: []int, explodeStr: bool): bool {
   let i = 0
   while (i < len(paramTypes)) {
-    if (len(explodedWordTypes(ctx, paramTypes[i])) != 0) {
+    if (len(explodedWordTypes(ctx, paramTypes[i], explodeStr)) != 0) {
       return true
     }
     i = i + 1
@@ -79,7 +101,7 @@ fn anyExplodedParam(ctx: TypeContext, paramTypes: []int): bool {
 // SAME at the declaration and at every direct call site, so it is derived from
 // the declaration alone and never from the call.
 //
-// Four exclusions, each because the declaration is not the only contract:
+// Five exclusions, each because the declaration is not the only contract:
 //
 //   - an `extern fn` binds a foreign symbol whose ABI this compiler does not own;
 //   - a METHOD reaches its callers through vtable dispatch (`Op.CallIface`) as
@@ -88,7 +110,20 @@ fn anyExplodedParam(ctx: TypeContext, paramTypes: []int): bool {
 //   - a GENERIC's call site holds template types where the instance's body
 //     holds substituted ones, so the two sides could classify differently;
 //   - a `@symbol`-pinned name exists precisely so something outside this
-//     compiler can call it.
+//     compiler can call it;
+//   - a VARIADIC signature's parameter list does not describe the values that
+//     arrive. `paramsAreVariadic` (checklookup.bit) keeps the tail interned as
+//     its ELEMENT type `T` while the value the callee is handed is the
+//     collected `[]T` — one word. `explodeCallArgs` already tells those apart
+//     at the call site with its shape test, but `explodeParamTypes` on the
+//     CALLEE side has only the declared type to read, so `...parts: string`
+//     would give the callee three block parameters for a one-word slice.
+//
+// That last one is #4423's, and it is a real hole rather than a precaution:
+// `...xs: (i64, i64)` has the same shape and would have mis-lowered since
+// #4404 — there is no such declaration in the tree, which is why nothing
+// caught it. `...parts: string` is `_tests_/cases/run_variadic.bit`, which the
+// golden suite compiles, so the string flip reaches it.
 //
 // Getting this wrong is loud rather than silent: `callArityEscapesInFunc`
 // (verify.bit) refuses any module whose call arity disagrees with its callee.
@@ -97,23 +132,40 @@ fn explodesParams(c: Checker, decl: int): bool {
     return false
   }
   let kids = kidsOf(c.tree, decl)
-  if (kids[0] != 0 || kids[2] != 0) {
+  if (kids[0] != 0 || kids[2] != 0 || paramsAreVariadic(c, kids[3])) {
     return false
   }
   return funcAttrArg(c, decl, "symbol") == ""
 }
 
+// The two independent gates a parameter list can need: #4404's explosion
+// eligibility (`tuples`, decided per DECLARATION by `explodesParams`) and the
+// string gate (`strings`, a per-LOWERER constant — `Lowerer.explodeStrings`).
+// Grouped into one struct so the functions that need both stay under the
+// 5-parameter lint limit rather than growing a bare bool for every future
+// coercion this file adds; a third would need the same treatment, not a
+// seventh parameter.
+//
+// `tuples` names #4404's mechanism and `strings` #4423's, but the pair travels
+// together through `explodeParamTypes`, `recordParamKeepAlive`,
+// `bindParamLocals` and `explodeCallArgs` — the four places that must give the
+// same answer for one signature, on both sides of the call.
+class ArgExplodeGates {
+  tuples: bool,
+  strings: bool,
+}
+
 // The IR parameter list for `paramTypes`: an exploded parameter contributes its
-// words in order, every other parameter contributes itself. `on` is
+// words in order, every other parameter contributes itself. `gates.tuples` is
 // `explodesParams`, so an ineligible declaration keeps today's list exactly.
-fn explodeParamTypes(ctx: TypeContext, paramTypes: []int, on: bool): []int {
-  if (!on || !anyExplodedParam(ctx, paramTypes)) {
+fn explodeParamTypes(ctx: TypeContext, paramTypes: []int, gates: ArgExplodeGates): []int {
+  if (!gates.tuples || !anyExplodedParam(ctx, paramTypes, gates.strings)) {
     return paramTypes
   }
   let out = []int(0)
   let i = 0
   while (i < len(paramTypes)) {
-    let words = explodedWordTypes(ctx, paramTypes[i])
+    let words = explodedWordTypes(ctx, paramTypes[i], gates.strings)
     if (len(words) == 0) {
       out = append(out, paramTypes[i])
     } else {
@@ -126,18 +178,6 @@ fn explodeParamTypes(ctx: TypeContext, paramTypes: []int, on: bool): []int {
     i = i + 1
   }
   return out
-}
-
-// The two independent gates a call's argument list can need: #4404's
-// tuple-explosion eligibility (`tuples`, decided per CALL from the callee's
-// declaration — this is the pre-existing `on`) and #4431's string coercion
-// gate (`strings`, a per-LOWERER constant — `Lowerer.explodeStrings`).
-// Grouped into one struct so `explodeCallArgs` stays under the 5-parameter
-// lint limit rather than growing a bare bool for every future coercion this
-// file adds; a fifth would need the same treatment, not a seventh parameter.
-class ArgExplodeGates {
-  tuples: bool,
-  strings: bool,
 }
 
 // The argument list for a direct call to a function whose declared parameter
@@ -153,12 +193,12 @@ class ArgExplodeGates {
 // a variadic special case here.
 //
 // `gates.strings` is checked even when this function's early return fires —
-// independent of `gates.tuples`/`anyExplodedParam` below — because a call
-// with no tuple-shaped parameter at all can still carry a plain `string`
-// argument, and that is exactly the "argument" position #4431 covers.
-// `coerceStringToBoxedRaw` no-ops instantly when it is false, so the
-// early-return path costs one extra bool read per argument and nothing else
-// when ungated.
+// independent of `gates.tuples`/`anyExplodedParam` below — because a call to an
+// INELIGIBLE callee (an extern, a method, a generic instance, a `@symbol` or a
+// variadic) still passes its `string` arguments as one boxed handle, and that
+// is exactly the position #4431's coercion covers. When the callee IS eligible
+// the argument explodes instead, so the two are alternatives rather than a
+// pair: `coerceStringArgList` is reached only on the path that did not.
 fn explodeCallArgs(
   ctx: TypeContext,
   b: IrBuilder,
@@ -166,24 +206,18 @@ fn explodeCallArgs(
   args: []int,
   gates: ArgExplodeGates,
 ): []int {
-  if (!gates.tuples || !anyExplodedParam(ctx, paramTypes)) {
+  if (!gates.tuples || !anyExplodedParam(ctx, paramTypes, gates.strings)) {
     return coerceStringArgList(ctx, b, paramTypes, args, gates.strings)
   }
   let out = []int(0)
   let i = 0
   while (i < len(args)) {
-    let words = explodedArgWords(ctx, b, paramTypes, args, i)
+    let words = explodedArgWords(ctx, paramTypes, i, b.instrs[args[i]].ty, gates.strings)
     if (len(words) == 0) {
       let ty = paramTypeAt(paramTypes, i, ctx.voidId)
       out = append(out, coerceStringToBoxedRaw(ctx, b, gates.strings, args[i], ty))
     } else {
-      let ids = []int(0)
-      let k = 0
-      while (k < len(words)) {
-        ids = append(ids, explodedWordGet(ctx, b, paramTypes[i], args[i], k))
-        k = k + 1
-      }
-      recordWordKeepAlive(ctx, b, words, ids)
+      let ids = explodeValueWords(ctx, b, args[i], words)
       let j = 0
       while (j < len(ids)) {
         out = append(out, ids[j])
@@ -196,34 +230,29 @@ fn explodeCallArgs(
 }
 
 // The word types argument `i` is expanded into, or an empty list to pass it
-// through unchanged.
-fn explodedArgWords(ctx: TypeContext, b: IrBuilder, paramTypes: []int, args: []int, i: int): []int {
+// through unchanged. `argTy` is the argument's own IR type — passed in rather
+// than read from the builder here, which is what keeps this at five parameters
+// with the string gate added (#4423).
+//
+// The shape test is not belt-and-braces. A variadic callee is excluded whole by
+// `explodesParams`, but a NAMED-argument call and a spread both reorder what
+// arrives, and an argument whose IR type does not have the parameter's word
+// shape must be passed as one value or the call and the callee disagree on
+// arity — which `callArityEscapesInFunc` (verify.bit) then refuses.
+fn explodedArgWords(
+  ctx: TypeContext, paramTypes: []int, i: int, argTy: int, explodeStr: bool,
+): []int {
   if (i >= len(paramTypes)) {
     return []int(0)
   }
-  let words = explodedWordTypes(ctx, paramTypes[i])
+  let words = explodedWordTypes(ctx, paramTypes[i], explodeStr)
   if (len(words) == 0) {
     return []int(0)
   }
-  if (len(explodedWordTypes(ctx, b.instrs[args[i]].ty)) != len(words)) {
+  if (len(explodedWordTypes(ctx, argTy, explodeStr)) != len(words)) {
     return []int(0)
   }
   return words
-}
-
-// Reads word `k` out of the aggregate value `recv` of type `ty`.
-//
-// The offset is `k * 8` rather than a `layoutFields` lookup, and that is exact
-// rather than an assumption: `explodedWordTypes` admits a type only when every
-// member is an 8-byte field, and `layoutFields` aligns each field to its own
-// size — so this shape's offsets are 0 and 8 and nothing else is reachable
-// here. `ival2` carries the READ's own width the same way `tupleElem` leaves
-// codegen to derive it from the instruction type.
-fn explodedWordGet(ctx: TypeContext, b: IrBuilder, ty: int, recv: int, k: int): int {
-  let fg = mkInstr(Op.FieldGet, ctx.types[ty].members[k])
-  fg.lhs = recv
-  fg.ival = k * 8
-  return builderEmit(b, fg)
 }
 
 // Binds `name` to a parameter that arrived as words. At exactly two words the
@@ -250,9 +279,15 @@ fn explodedWordGet(ctx: TypeContext, b: IrBuilder, ty: int, recv: int, k: int): 
 //
 // The exclusion does not touch the ABI, which stays derived from the
 // declaration — the words still arrive in registers either way.
+// #4423 adds the third reason the rebuild path can be taken, and it is why the
+// constructor here is `materializeExplodedLocal` rather than `buildTuple`: a
+// `string` parameter that the escape rule marked captured-and-assigned needs
+// its BOX rebuilt from the three words, and `buildTuple` cannot produce that
+// shape (ABI.md §2.3 fixes it at 24 bytes with `ptr_offsets = [16]`, while a
+// `string` is a prim whose generic layout is one pointer).
 fn declareExplodedParam(fc: FnCtx, name: string, ty: int, words: []int, ids: []int) {
   if (len(words) < 2 || stringInList(fc.boxedNames, name)) {
-    declareLocal(fc, name, buildTuple(fc, ty, ids), ty)
+    declareLocal(fc, name, materializeExplodedLocal(fc, ty, ids), ty)
     return
   }
   bindExplodedWords(fc, name, ty, words, ids)
@@ -489,11 +524,16 @@ fn declPlainResultType(c: Checker, decl: int): int {
 // the boxing it replaces is an ALLOCATION in the IR that no backend can
 // remove. This is the first lowering decision in this compiler that depends on
 // the target; see `Lowerer.multiWordRet`.
+// The `false` is the RETURN half of the string flip, and it is #4424's to
+// change — not an oversight and not a default. The argument side needs no
+// budget (a word past the eighth marshals through `emitOutgoingStackArg`),
+// while the return side has no such path at all (#4238), so flipping this one
+// argument is a separate decision with its own budget check below.
 fn explodedRetWords(c: Checker, decl: int, on: bool): []int {
   if (!on || decl == 0 || !explodesParams(c, decl)) {
     return []int(0)
   }
-  let words = explodedWordTypes(c.ctx, declPlainResultType(c, decl))
+  let words = explodedWordTypes(c.ctx, declPlainResultType(c, decl), false)
   if (!retWordsFitRegisters(c.ctx, words)) {
     return []int(0)
   }
@@ -510,14 +550,8 @@ fn explodedRetWords(c: Checker, decl: int, on: bool): []int {
 // store-to-load forwarding plus dead-allocation elimination — the same pair
 // #4404 relies on at an exploded call site. Correctness never rests on that:
 // under `--no-optimize` the box is real and these are genuine loads out of it.
-fn explodedRetValues(fc: FnCtx, v: int, ty: int, words: []int): []int {
-  let out = []int(0)
-  let k = 0
-  while (k < len(words)) {
-    out = append(out, explodedWordGet(fc.c.ctx, fc.b, ty, v, k))
-    k = k + 1
-  }
-  return out
+fn explodedRetValues(fc: FnCtx, v: int, words: []int): []int {
+  return emitWordReads(fc.c.ctx, fc.b, v, words)
 }
 
 // Emits the `Op.CallWord` run carrying words 1..W-1 of `call`'s result, and
@@ -613,18 +647,26 @@ fn recordWordKeepAlive(ctx: TypeContext, b: IrBuilder, words: []int, ids: []int)
 // The parameter side: `paramIds` is the FLAT block-0 parameter list
 // `explodeParamTypes` produced, so this walks `paramTypes` with the same cursor
 // that built it and hands each exploded parameter's own run to
-// `recordWordKeepAlive`. `on` is `explodesParams`, so an ineligible declaration
-// records nothing — its single handle is its own root.
+// `recordWordKeepAlive`. `gates.tuples` is `explodesParams`, so an ineligible
+// declaration records nothing — its single handle is its own root.
+//
+// #4423 makes this load-bearing where it was free. A tuple's words are all base
+// pointers, so the edges cost nothing; an exploded `string` PARAMETER arrives
+// as `{ptr, len, base}` where `ptr` is an INTERIOR address into the bytes
+// `base` roots, and `gcOwns` (runtime/gc/gcalloc.bit) is exact base equality.
+// Without an edge from `ptr` to `base`, a callee that reads only `ptr` lets
+// `base`'s interval end at block 0 and the next collection sweeps the bytes
+// under it — a wrong answer at exit 0, which is the shape #4406 measured.
 fn recordParamKeepAlive(
-  ctx: TypeContext, b: IrBuilder, paramTypes: []int, paramIds: []int, on: bool,
+  ctx: TypeContext, b: IrBuilder, paramTypes: []int, paramIds: []int, gates: ArgExplodeGates,
 ) {
-  if (!on || !anyExplodedParam(ctx, paramTypes)) {
+  if (!gates.tuples || !anyExplodedParam(ctx, paramTypes, gates.strings)) {
     return
   }
   let at = 0
   let i = 0
   while (i < len(paramTypes)) {
-    let words = explodedWordTypes(ctx, paramTypes[i])
+    let words = explodedWordTypes(ctx, paramTypes[i], gates.strings)
     if (len(words) == 0) {
       at = at + 1
     } else {
@@ -644,20 +686,23 @@ fn recordParamKeepAlive(
 }
 
 // The words of `val`, an aggregate whose per-word types are `words`: one
-// `field_get` at `k * 8` typed as that word, plus the keepalive edges pairing
-// every untraced word with every traced one (#4406).
+// `field_get` at `k * 8` typed as that word. No keepalive edges — see
+// `explodeValueWords` for the form that records them, which is what every
+// caller but the `return` path wants.
 //
 // The offset is `k * 8` rather than a `layoutFields` lookup, and that is exact
 // rather than an assumption for both shapes that reach here: a type
 // `explodedWordTypes` admits has every member an 8-byte field, and a boxed
 // `string` has its `{ptr, len, base}` fixed at 0/8/16 by `runtime/ABI.md` §2.3.
 //
-// ONE decomposer for the tuple and the string sides. They were two identical
-// loops — `explodedWordGet` in a loop, and `unboxStringWords` — differing only
-// in where the word type came from, and this file already carries the receipt
-// for what a second copy costs: #4412 widened one consumer of a shared
-// predicate and not the other, and `take4((1,2,3,4))` printed 1200 at exit 0.
-fn explodeValueWords(ctx: TypeContext, b: IrBuilder, val: int, words: []int): []int {
+// ONE decomposer for the tuple and the string sides, for the argument, return
+// and local positions alike. There used to be two identical loops —
+// `explodedWordGet` called in a loop, and `unboxStringWords` — differing only
+// in where the word type came from, and this file carries the receipt for what
+// a second copy costs: #4412 widened one consumer of a shared predicate and not
+// the other, and `take4((1,2,3,4))` printed 1200 at exit 0. The word TYPE now
+// has exactly one source, the `words` list the caller was given.
+fn emitWordReads(ctx: TypeContext, b: IrBuilder, val: int, words: []int): []int {
   let ids = []int(0)
   let k = 0
   while (k < len(words)) {
@@ -667,6 +712,15 @@ fn explodeValueWords(ctx: TypeContext, b: IrBuilder, val: int, words: []int): []
     ids = append(ids, builderEmit(b, fg))
     k = k + 1
   }
+  return ids
+}
+
+// `emitWordReads` plus the keepalive edges pairing every untraced word with
+// every traced one (#4406) — the form every position takes except a `return`,
+// whose words are consumed by the `ret` in the same block (see the banner
+// above).
+fn explodeValueWords(ctx: TypeContext, b: IrBuilder, val: int, words: []int): []int {
+  let ids = emitWordReads(ctx, b, val, words)
   recordWordKeepAlive(ctx, b, words, ids)
   return ids
 }
