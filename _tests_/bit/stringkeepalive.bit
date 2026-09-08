@@ -1,0 +1,426 @@
+// _tests_/bit/stringkeepalive.bit — #4425. The GC-policy differential for an
+// exploded `string`, and the only gate whose fixtures are chosen to die when
+// #4406's keepalive edge stops holding a string's `base` alive.
+//
+// WHY A SECOND FLIP HARNESS RATHER THAN A FIXTURE IN stringexplode.bit. That
+// file's oracle is "same bytes with the gate on and off", both runs under the
+// DEFAULT collector; this file's oracle is "same bytes under BIT_GC=stress
+// too, and a collection actually ran". They are different claims and the
+// second cannot be expressed in the first. stringexplode.bit is also 771 lines
+// against the repo's 800-line ceiling and is a single-file gate target, so a
+// sibling would not be loaded at all (#4441).
+//
+// THE HAZARD, AND WHY IT GOES LIVE ONLY WHEN `string` EXPLODES.
+// `ABI.md` §2.3 makes a string `{ptr, len, base}` with `ptr_offsets = [16]`:
+// `base` is the object that owns the bytes and the ONLY traced word, and `ptr`
+// is `base + strAllocHeader` — an INTERIOR address, deliberately never listed
+// in `ptr_offsets`. `gcOwns` (runtime/gc/gcalloc.bit) is exact base equality,
+// so an interior pointer sitting in a register roots nothing at all. Before
+// the flip a string is one boxed handle — a base pointer — and the hazard
+// cannot arise; with `BIT_STRING_EXPLODE_TEST=1` the three words are
+// independent SSA values and `base`'s live interval ends at its last use.
+// A callee that reads only `ptr` and `len` therefore leaves `base` dead across
+// an intervening safepoint unless #4406's `keepAlive` edge extends it
+// (`extendKeepAlive`, compiler/codegenlive.bit).
+//
+// THE FAILURE IS A WRONG ANSWER AT EXIT 0, NEVER A CRASH. The backing bytes
+// are swept and handed to the next same-class allocation, which zeroes them,
+// so `retview` prints `0 0` where it should print `97 98`. A fixture that
+// only checks for a non-zero exit code cannot see this.
+//
+// THE FOUR FIXTURES ARE A DISCRIMINATING SET, NOT FOUR SPELLINGS OF ONE TEST.
+// Measured against the mutant that empties `extendKeepAlive`, on `625c0146`:
+//
+//   fixture      what it is                    mutant, default GC   mutant, stress
+//   retview      returned string, base dead    97 98 (PASSES)       0 0  (KILLS)
+//   retviewheavy same, 200k allocations        0 0   (KILLS)        0 0  (KILLS)
+//   basekept     base has a later real use     97 98                97 98
+//   paramview    exploded PARAMETER            97 98                97 98
+//
+// `retview` is the arm that says BIT_GC=stress is load-bearing here: with only
+// 400 allocations the default policy collects zero times, so the wrong answer
+// is invisible to it. `retviewheavy` is the arm that says the defect is not an
+// artifact of the stress policy — seven ordinary collections find it too.
+//
+// `basekept` and `paramview` CANNOT KILL THE MUTANT and are here anyway,
+// which the file states rather than leaving to be discovered. `basekept` is
+// the discriminator: the identical program with one real later use of the
+// whole string (`s == "zzz"`, which reboxes and so reads `base`) prints the
+// right answer with the edge deleted, which is what pins the cause to "base
+// died", not to slicing or to explosion in general. `paramview` records the
+// masking: a callee reading only `ptr` has the same missing root, but its
+// CALLER necessarily still holds the base in a live frame, and root class 8
+// scans the running task's stack CONSERVATIVELY (runtime/stw/stw.bit) — so it
+// is found by accident and the program is right by luck. That is why the
+// killer had to POP the producing frame, i.e. be a multi-word RETURN.
+//
+// NON-VACUITY. If `BIT_STRING_EXPLODE_TEST` ever stops reaching the compiler,
+// every fixture above compiles a boxed string twice and the whole file passes
+// while proving nothing. `allocProbe` is the guard: a slice-in-a-loop consumed
+// only by `len` must allocate STRICTLY FEWER objects with the gate on. That
+// direction cannot go stale as the flip widens — later children remove more
+// boxes, never fewer.
+//
+// The stress run additionally asserts `collections > 0` off `BIT_GC_STATS=1`,
+// because a stress run that never collected is an oracle that never ran.
+//
+// WIRED INTO `./make test` as `test-string-keepalive`.
+
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir } from "std/fs"
+import { parseInt, trimSpace, indexOf } from "std/strings"
+
+const defaultTimeoutS: int = 120
+const maxTimeoutMs: int = 6000000
+
+// `${` cannot appear inside a fixture's source literal — this harness's own
+// lexer would read it as an interpolation of the harness. Same device as
+// stringexplode.bit.
+const IS: string = "$" + "{"
+
+fn requiredEnv(name: string): string {
+  let v = env(name)
+  if (v == "") {
+    eprint("stringkeepalive: ${name} is not set — refusing to guess.\n")
+    exit(2)
+  }
+  return v
+}
+
+fn timeoutMs(): int {
+  let raw = trimSpace(envOr("BIT_TEST_TIMEOUT_S", ""))
+  if (raw == "") {
+    return defaultTimeoutS * 1000
+  }
+  let s = parseInt(raw) catch _ {
+    return defaultTimeoutS * 1000
+  }
+  if (s <= 0 || s * 1000 > maxTimeoutMs) {
+    return maxTimeoutMs
+  }
+  return s * 1000
+}
+
+fn shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+class Fixture {
+  name: string,
+  src: string,
+}
+
+// `build` allocates on the HEAP — string concatenation does, a string literal
+// does not (a literal's bytes are static data with `base = 0`, which the
+// collector never owns, so slicing one could not show this defect at all).
+// `churn`'s `while` back edge is the safepoint the collection happens at.
+fn prelude(): string {
+  return "fn build(n: int): string {\n" +
+    "  let out = \"\"\n  let i = 0\n" +
+    "  while (i < n) {\n    out = out + \"abcdefgh\"\n    i = i + 1\n  }\n" +
+    "  return out\n}\n" +
+    "fn churn(n: int): int {\n  let t = 0\n  let i = 0\n" +
+    "  while (i < n) {\n    let b = []int(8)\n    b[0] = 7\n" +
+    "    t = t + b[0]\n    i = i + 1\n  }\n  return t\n}\n"
+}
+
+// The killer. `view`'s frame is POPPED before the safepoint, so the base is
+// nowhere on the stack for the conservative scan to find; `main` holds the
+// three returned words and reads only `ptr` (`v[0]`, `v[1]`) and `len`.
+// `s[8:16]` makes the offset visible, but any slice would do: `ptr` is
+// `base + 24` even at offset 0 (ABI.md §2.3, Step A), so a string's `ptr` is
+// interior unconditionally — there is no "offset 0" control to be had here,
+// unlike #4406's tuple of raw pointers.
+fn retFixture(name: string, churn: string): Fixture {
+  return Fixture{
+    name: name,
+    src: prelude() +
+      "fn view(n: int): string {\n  let s = build(n)\n  return s[8:16]\n}\n" +
+      "fn main() {\n  let v = view(4)\n  let junk = churn(" +
+      churn +
+      ")\n  print(\"" +
+      IS +
+      "v[0]} " +
+      IS +
+      "v[1]} " +
+      IS +
+      "len(v)} " +
+      IS +
+      "junk}\\n\")\n}\n",
+  }
+}
+
+fn fixtures(): []Fixture {
+  return [
+    retFixture("retview", "400"),
+    retFixture("retviewheavy", "200000"),
+    // Control, not a killer: `s == "zzz"` lowers to `rt_call string_eq`, whose
+    // one-boxed-word ABI reboxes and so reads `base` — a genuine later use, so
+    // the base is live across the safepoint with or without the keepalive edge.
+    Fixture{
+      name: "basekept",
+      src: prelude() +
+        "fn main() {\n  let s = build(4)\n  let v = s[8:16]\n" +
+        "  let junk = churn(200000)\n  let same = 0\n" +
+        "  if (s == \"zzz\") { same = 1 }\n  print(\"" +
+        IS +
+        "v[0]} " +
+        IS +
+        "v[1]} " +
+        IS +
+        "len(v)} " +
+        IS +
+        "junk} " +
+        IS +
+        "same}\\n\")\n}\n",
+    },
+    // Control, not a killer: the exploded-PARAMETER shape. Its safepoint has
+    // the same missing root, and it prints the right answer anyway because
+    // `main`'s live frame still holds the base for the conservative scan.
+    Fixture{
+      name: "paramview",
+      src: prelude() +
+        "fn readPtrOnly(v: string, n: int): string {\n  let junk = churn(n)\n" +
+        "  return \"" +
+        IS +
+        "v[0]} " +
+        IS +
+        "v[1]} " +
+        IS +
+        "len(v)} " +
+        IS +
+        "junk}\"\n}\n" +
+        "fn main() {\n  let s = build(4)\n  print(\"" +
+        IS +
+        "readPtrOnly(s[8:16], 200000)}\\n\")\n}\n",
+    },
+  ]
+}
+
+// The non-vacuity probe: a slice bound to a local and consumed only by `len`.
+// With the gate off it is a heap box per iteration; with the gate on it is
+// three registers.
+fn probeSrc(): string {
+  return "fn main() {\n  let s = \"abcdefghijklmnopqrst\"\n  let n = 0\n  let w = 0\n" +
+    "  while (w < len(s) - 8) {\n    let a = s[w:w + 8]\n" +
+    "    if (len(a) == 8) { n = n + 1 }\n    w = w + 1\n  }\n" +
+    "  print(\"" +
+    IS +
+    "n}\\n\")\n}\n"
+}
+
+class Env {
+  bin: string,
+  stdlib: string,
+  libbitrt: string,
+  dir: string,
+}
+
+class Run {
+  code: int,
+  out: string,
+  err: string,
+}
+
+fn baseEnv(e: Env): string {
+  return "BIT_STDLIB=" +
+    shQuote(e.stdlib) +
+    "\nexport BIT_STDLIB\n" +
+    "BIT_LIBBITRT=" +
+    shQuote(e.libbitrt) +
+    "\nexport BIT_LIBBITRT\n"
+}
+
+fn runOne(dir: string, tag: string, cmd: string, extraEnv: string): Run {
+  let shPath = "${dir}/${tag}.sh"
+  let outPath = "${dir}/${tag}.out"
+  let errPath = "${dir}/${tag}.err"
+  let script = "#!/bin/sh\n" +
+    extraEnv +
+    cmd +
+    " > " +
+    shQuote(outPath) +
+    " 2> " +
+    shQuote(errPath) +
+    "\n"
+  writeFile(shPath, script) catch er {
+    eprint("stringkeepalive: cannot write ${shPath}: ${er.message()}\n")
+    exit(2)
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    eprint("stringkeepalive: cannot chmod ${shPath}\n")
+    exit(2)
+  }
+  let code = osRunBounded(shPath, timeoutMs())
+  let out = readFile(outPath) catch _ {
+    ""
+  }
+  let err = readFile(errPath) catch _ {
+    ""
+  }
+  return Run{ code: code, out: out, err: err }
+}
+
+fn gateEnv(on: bool): string {
+  if (on) {
+    return "BIT_STRING_EXPLODE_TEST=1\nexport BIT_STRING_EXPLODE_TEST\n"
+  }
+  return ""
+}
+
+// Compiles `srcPath` with the flip in state `on`; returns the executable path,
+// or "" after reporting the build failure.
+fn buildWith(e: Env, srcPath: string, tag: string, on: bool): string {
+  let exe = "${e.dir}/${tag}.bin"
+  let r = runOne(
+    e.dir, "${tag}.build", shQuote(e.bin) + " build " + shQuote(srcPath) + " -o " + shQuote(exe),
+    baseEnv(e) + gateEnv(on),
+  )
+  if (r.code != 0) {
+    eprint("stringkeepalive: FAIL ${tag} — build exited ${r.code}\n${r.err}\n")
+    return ""
+  }
+  return exe
+}
+
+// swept+live out of a `[bit-gc]` stderr line: the run's whole object count,
+// deterministic and load-insensitive.
+fn statField(err: string, key: string): int {
+  let at = indexOf(err, key)
+  if (at < 0) {
+    return -1
+  }
+  let start = at + len(key)
+  let i = start
+  while (i < len(err) && err[i] != 32 && err[i] != 10) {
+    i = i + 1
+  }
+  return parseInt(err[start:i]) catch _ {
+    -1
+  }
+}
+
+fn gcObjects(err: string): int {
+  let a = statField(err, "swept=")
+  let b = statField(err, "live=")
+  if (a < 0 || b < 0) {
+    return -1
+  }
+  return a + b
+}
+
+// The three runs one fixture owes: the gate-OFF run is the oracle, the gate-ON
+// run must match it under the default collector, and the gate-ON run under
+// BIT_GC=stress must match it AND show a collection.
+fn checkFixture(e: Env, fx: Fixture): bool {
+  let srcPath = "${e.dir}/${fx.name}.bit"
+  writeFile(srcPath, fx.src) catch er {
+    eprint("stringkeepalive: cannot write ${srcPath}: ${er.message()}\n")
+    exit(2)
+  }
+  let offExe = buildWith(e, srcPath, "${fx.name}.off", false)
+  let onExe = buildWith(e, srcPath, "${fx.name}.on", true)
+  if (offExe == "" || onExe == "") {
+    return false
+  }
+  let want = runOne(e.dir, "${fx.name}.off.run", shQuote(offExe), "")
+  let got = runOne(e.dir, "${fx.name}.on.run", shQuote(onExe), "")
+  if (want.code != got.code || want.out != got.out) {
+    eprint("stringkeepalive: FAIL ${fx.name} [default GC] — flip off exit ${want.code} / on ${got.code}\n")
+    eprint("  off stdout: ${want.out}  on stdout: ${got.out}\n  on stderr: ${got.err}\n")
+    return false
+  }
+  let str = runOne(
+    e.dir, "${fx.name}.on.stress", shQuote(onExe),
+    "BIT_GC=stress\nexport BIT_GC\nBIT_GC_STATS=1\nexport BIT_GC_STATS\n",
+  )
+  let collections = statField(str.err, "collections=")
+  if (collections < 0) {
+    eprint("stringkeepalive: FAIL ${fx.name} — no [bit-gc] line; BIT_GC_STATS=1 did not take\n")
+    return false
+  }
+  if (collections == 0) {
+    eprint("stringkeepalive: FAIL ${fx.name} — BIT_GC=stress collected 0 times; the oracle never ran\n")
+    return false
+  }
+  if (want.code != str.code || want.out != str.out) {
+    eprint("stringkeepalive: FAIL ${fx.name} [BIT_GC=stress] — exit ${want.code} / ${str.code} over ${collections} collection(s)\n")
+    eprint("  want stdout: ${want.out}  got stdout: ${str.out}\n  stderr: ${str.err}\n")
+    return false
+  }
+  println("stringkeepalive: ${fx.name} — identical under flip off, flip on, and flip on + BIT_GC=stress (${collections} collections)")
+  return true
+}
+
+fn allocProbe(e: Env): bool {
+  let srcPath = "${e.dir}/probe.bit"
+  writeFile(srcPath, probeSrc()) catch er {
+    eprint("stringkeepalive: cannot write ${srcPath}: ${er.message()}\n")
+    exit(2)
+  }
+  let stats = "BIT_GC_STATS=1\nexport BIT_GC_STATS\n"
+  let offExe = buildWith(e, srcPath, "probe.off", false)
+  let onExe = buildWith(e, srcPath, "probe.on", true)
+  if (offExe == "" || onExe == "") {
+    return false
+  }
+  let a = runOne(e.dir, "probe.off.run", shQuote(offExe), stats)
+  let b = runOne(e.dir, "probe.on.run", shQuote(onExe), stats)
+  if (a.code != 0 || b.code != 0 || a.out != b.out) {
+    eprint("stringkeepalive: FAIL probe — exit ${a.code}/${b.code}, stdout '${a.out}' vs '${b.out}'\n")
+    return false
+  }
+  let n1 = gcObjects(a.err)
+  let n2 = gcObjects(b.err)
+  if (n1 < 0 || n2 < 0) {
+    eprint("stringkeepalive: FAIL probe — no [bit-gc] line; BIT_GC_STATS=1 did not take\n")
+    return false
+  }
+  if (n2 >= n1) {
+    eprint("stringkeepalive: FAIL probe — the flip removed no allocation: ${n1} objects off, ${n2} on (want strictly fewer). BIT_STRING_EXPLODE_TEST is not reaching the compiler, and every fixture above is then vacuous.\n")
+    return false
+  }
+  println("stringkeepalive: probe — ${n1} objects flip-off, ${n2} flip-on")
+  return true
+}
+
+fn main() {
+  let e = Env{
+    bin: requiredEnv("BIT_BIN"),
+    stdlib: requiredEnv("BIT_STDLIB"),
+    libbitrt: requiredEnv("BIT_LIBBITRT"),
+    dir: envOr("TMPDIR", "/tmp") + "/bit-stringkeepalive-${timeUnixNs()}",
+  }
+  mkdir(e.dir) catch err {
+    eprint("stringkeepalive: cannot create ${e.dir}: ${err.message()}\n")
+    exit(2)
+  }
+  let fxs = fixtures()
+  let ok = 0
+  let bad = 0
+  for fx of fxs {
+    if (checkFixture(e, fx)) {
+      ok = ok + 1
+    } else {
+      bad = bad + 1
+    }
+  }
+  if (!allocProbe(e)) {
+    bad = bad + 1
+  }
+  if (bad != 0) {
+    eprint("stringkeepalive: FAIL — ${bad} of ${len(fxs) + 1} check(s) failed\n")
+    exit(1)
+  }
+  println("stringkeepalive: PASS — ${ok}/${len(fxs)} fixtures identical under the default collector and BIT_GC=stress with the string flip on, plus 1 allocation probe")
+}
