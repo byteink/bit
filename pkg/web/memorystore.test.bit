@@ -1,8 +1,9 @@
 // pkg/web/memorystore.test.bit — the store's own contract (#3947), tested
-// directly against `MemoryStore` rather than through a `Ctx`: a miss is an
-// empty map and never a failure, `destroy` really removes, a positive ttl
-// really expires, and neither `write` nor `read` hands out an alias into the
-// store's own state.
+// directly against `MemoryStore` rather than through a `Ctx`: a miss is
+// `Option.None` and never a failure, a stored session with no keys is a HIT
+// and not a miss (#4483), `destroy` really removes, a positive ttl really
+// expires, and neither `write` nor `read` hands out an alias into the store's
+// own state.
 //
 // The expiry tests drive the module-private `readAt(sid, nowNs)` rather than
 // sleeping. A timed test would be both slow and flaky, and a store whose only
@@ -25,10 +26,28 @@ fn mustWrite(s: MemoryStore, sid: string, data: map<string, string>, ttl: i64) {
   }
 }
 
+// The data behind `sid`, for the tests whose subject is the DATA. A miss
+// panics rather than reading as an empty map: `len(mustRead(...)) == 0` was
+// how a miss used to be asserted, and it would keep passing against a store
+// that had stopped reporting presence at all (#4483). The tests about
+// absence use `readIsMiss`.
 fn mustRead(s: MemoryStore, sid: string): map<string, string> {
-  return s.read(sid) catch e {
+  let got = s.read(sid) catch e {
     panic("read: ${e.message()}")
   }
+  if (!isSome(got)) {
+    panic("read('${sid}'): expected a stored session, got a miss")
+  }
+  return unwrap(got)
+}
+
+// Whether `sid` is absent from the store. `Option.None` is the only spelling
+// of absent; a hit carrying no keys is NOT one.
+fn readIsMiss(s: MemoryStore, sid: string): bool {
+  let got = s.read(sid) catch e {
+    panic("read: ${e.message()}")
+  }
+  return !isSome(got)
 }
 
 test "write then read round-trips every key" {
@@ -40,14 +59,31 @@ test "write then read round-trips every key" {
   assert(got["theme"] == "dark", "theme: got '${got["theme"]}'")
 }
 
-test "an unknown id reads as an empty map, not a failure" {
+test "an unknown id reads as a miss, not a failure" {
   // A miss is the normal case on a public endpoint — a forged, expired or
   // long-destroyed id — so it must not look like a store outage.
   let s = MemoryStore()
   let got = s.read("never-written") catch e {
     panic("a miss must not fail: ${e.message()}")
   }
-  assert(len(got) == 0, "a miss must be empty, got ${len(got)} key(s)")
+  assert(!isSome(got), "a never-written id must read as Option.None")
+}
+
+test "a stored session with no keys reads as present, not as a miss" {
+  // #4483: the store's own half of the fix. `Option.Some(empty)` and
+  // `Option.None` are different answers; an empty map is not an encoding of
+  // absence. The negative control is the test above — a store that reported
+  // `Some` for everything would fail it.
+  let s = MemoryStore()
+  mustWrite(s, "abc", map<string, string>(), 3600)
+  let got = s.read("abc") catch e {
+    panic("read: ${e.message()}")
+  }
+  assert(isSome(got), "a stored session with no keys read as a miss")
+  assert(
+    len(unwrap(got)) == 0,
+    "the stored session must still be empty, got ${len(unwrap(got))} key(s)",
+  )
 }
 
 test "destroy removes the entry, and a second destroy is not an error" {
@@ -57,7 +93,7 @@ test "destroy removes the entry, and a second destroy is not an error" {
   s.destroy("abc") catch e {
     panic("destroy: ${e.message()}")
   }
-  assert(len(mustRead(s, "abc")) == 0, "destroy left the entry readable")
+  assert(readIsMiss(s, "abc"), "destroy left the entry readable")
   s.destroy("abc") catch e {
     panic("destroying an absent id must be a no-op: ${e.message()}")
   }
@@ -73,7 +109,7 @@ test "destroy removes only the id it names" {
   s.destroy("a") catch e {
     panic("destroy: ${e.message()}")
   }
-  assert(len(mustRead(s, "a")) == 0, "'a' should be gone")
+  assert(readIsMiss(s, "a"), "'a' should be gone")
   assert(mustRead(s, "b")["k"] == "2", "'b' must be untouched, got '${mustRead(s, "b")["k"]}'")
 }
 
@@ -84,16 +120,29 @@ test "a positive ttl is honoured: alive inside the window, gone past it" {
 
   // Both sides, so a store that always expired — or never did — fails one.
   let inside = s.readAt("abc", writtenAt + 59 * nsPerSecond)
-  assert(len(inside) == 1, "the entry must still be readable 59s into a 60s ttl")
+  assert(isSome(inside), "the entry must still be readable 59s into a 60s ttl")
+  assert(len(unwrap(inside)) == 1, "expected 1 key inside the window, got ${len(unwrap(inside))}")
   let past = s.readAt("abc", writtenAt + 61 * nsPerSecond)
-  assert(len(past) == 0, "a 60s ttl must have expired at 61s, got ${len(past)} key(s)")
+  assert(!isSome(past), "a 60s ttl must have expired at 61s")
+}
+
+test "an expired entry reads as a miss, not as a present-but-empty session" {
+  // The sharp case for #4483's encoding: the entry that expires holds NO
+  // keys, so under the old one it and a live keyless session gave the same
+  // answer. An expired id is dead and must not be adopted.
+  let s = MemoryStore()
+  let writtenAt = now().ns
+  mustWrite(s, "abc", map<string, string>(), 60)
+  // The control: while it is alive it is a hit, keyless or not.
+  assert(isSome(s.readAt("abc", writtenAt + 59 * nsPerSecond)), "precondition: alive at 59s")
+  assert(!isSome(s.readAt("abc", writtenAt + 61 * nsPerSecond)), "an expired entry must be a miss")
 }
 
 test "an expired entry is dropped, not merely hidden" {
   let s = MemoryStore()
   mustWrite(s, "abc", storeData([]string{ "userId", "42" }), 60)
   assert(len(s.entries) == 1, "precondition: one entry")
-  s.readAt("abc", now().ns + 61 * nsPerSecond)
+  let _ = s.readAt("abc", now().ns + 61 * nsPerSecond)
   assert(len(s.entries) == 0, "the expired entry is still held: ${len(s.entries)}")
 }
 
@@ -103,7 +152,7 @@ test "a ttl of zero is already expired when it is written" {
   // that means "never".
   let s = MemoryStore()
   mustWrite(s, "abc", storeData([]string{ "userId", "42" }), 0)
-  assert(len(mustRead(s, "abc")) == 0, "a ttl of 0 must not be readable")
+  assert(readIsMiss(s, "abc"), "a ttl of 0 must not be readable")
 }
 
 test "write copies the caller's map instead of aliasing it" {
@@ -134,8 +183,10 @@ test "a second write to the same id replaces the entry and refreshes the window"
   let got = mustRead(s, "abc")
   assert(len(got) == 1, "the second write must replace, not merge: ${len(got)} key(s)")
   assert(got["theme"] == "dark", "theme: got '${got["theme"]}'")
+  let refreshed = s.readAt("abc", t0 + 61 * nsPerSecond)
+  assert(isSome(refreshed), "the second write must refresh the expiry window")
   assert(
-    len(s.readAt("abc", t0 + 61 * nsPerSecond)) == 1,
-    "the second write must refresh the expiry window",
+    len(unwrap(refreshed)) == 1,
+    "the refreshed entry must still hold its key, got ${len(unwrap(refreshed))}",
   )
 }
