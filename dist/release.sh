@@ -100,6 +100,57 @@ if [ -n "${BENCH_PREV_TAG}" ] && git merge-base --is-ancestor "${BENCH_COMMIT}" 
 fi
 echo "release.sh: benchmark tables regenerated at ${BENCH_COMMIT:0:8}, after ${BENCH_PREV_TAG:-<no previous release>}"
 
+# --- preflight: the vscode grammar must match its published mirror ---------
+# (#4470). github-linguist submodules a grammar repository's ROOT, so
+# editors/vscode/syntaxes/ is not addressable by it; byteink/bit-tmlanguage
+# exists as a byte-copy publish target. THIS repo is the source of truth and
+# the mirror is a publish target like the brew tap or the ghcr image — the
+# same "change one, change both" shape as examples/staticserver vs
+# bit-website/server/, which has no mechanical check at all, which is why this
+# one exists. A fetch failure refuses too: an unreachable mirror is not
+# evidence of being in sync.
+#
+# The mirror's layout is deliberately NOT this repo's: linguist's grammar
+# compiler accepts a .json grammar only from a directory named grammars/ or
+# syntaxes/ (tools/grammars/compiler/loader.go:125), while
+# language-configuration.json must stay at the mirror ROOT or it is read as a
+# second grammar. So the local->mirror path pairs below are not identities.
+TMLANG_RAW="https://raw.githubusercontent.com/byteink/bit-tmlanguage/main"
+checkGrammarMirror() {
+	local tmp diffs=0 unread=0 pair localPath mirrorPath
+	tmp="$(mktemp -d)"
+	for pair in \
+		"editors/vscode/syntaxes/bit.tmLanguage.json:syntaxes/bit.tmLanguage.json" \
+		"editors/vscode/language-configuration.json:language-configuration.json"; do
+		localPath="${pair%%:*}"
+		mirrorPath="${pair#*:}"
+		if ! curl -fsS -o "${tmp}/mirrored" "${TMLANG_RAW}/${mirrorPath}"; then
+			echo "release.sh: cannot fetch ${TMLANG_RAW}/${mirrorPath}" >&2
+			unread=1
+		elif cmp -s "${tmp}/mirrored" "${ROOT}/${localPath}"; then
+			echo "release.sh: grammar mirror in sync: ${localPath} == bit-tmlanguage:${mirrorPath}"
+		else
+			echo "release.sh: ${ROOT}/${localPath} differs from bit-tmlanguage:${mirrorPath}" >&2
+			diffs=1
+		fi
+	done
+	rm -rf "${tmp}"
+	# An unreachable mirror and a diverged one are opposite conclusions, so
+	# they get opposite remediations — printing the sync recipe for a 404
+	# would send the reader to push bytes that are probably already there.
+	[ "${unread}" -eq 1 ] && echo "release.sh: refusing — the mirror could not be read, which is not evidence of being in sync" >&2
+	if [ "${diffs}" -eq 1 ]; then
+		echo "release.sh: refusing — bit-tmlanguage is out of sync with this tree; publish it, then re-run:" >&2
+		echo "release.sh:   git clone https://github.com/byteink/bit-tmlanguage \"\$TMPDIR/bit-tmlang\"" >&2
+		echo "release.sh:   cp editors/vscode/syntaxes/bit.tmLanguage.json \"\$TMPDIR/bit-tmlang/syntaxes/bit.tmLanguage.json\"" >&2
+		echo "release.sh:   cp editors/vscode/language-configuration.json \"\$TMPDIR/bit-tmlang/\"" >&2
+		echo "release.sh:   git -C \"\$TMPDIR/bit-tmlang\" commit -am \"sync grammar from bit@${BUILT_COMMIT:0:8}\" && git -C \"\$TMPDIR/bit-tmlang\" push" >&2
+	fi
+	[ "${diffs}" -eq 0 ] && [ "${unread}" -eq 0 ] && return 0
+	return 1
+}
+checkGrammarMirror || exit 1
+
 # --resume-notes (#4124): everything down to SHA256SUMS below builds and
 # smoke-tests the artifacts. Skip it and reuse what a PRIOR run of this
 # command already left in ${OUT} — validated right before the changelog.sh
