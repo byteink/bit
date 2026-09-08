@@ -1,0 +1,207 @@
+// pkg/web/adapter.bit — the boundary between pkg/web and stdlib/http (#3885),
+// and the one place in the framework where a request becomes a response.
+//
+// It exists because the two handler types do not match and cannot be made to.
+// `stdlib/http/server.bit:152` declares
+// `listenAndServe(host, port, handler: (Request) => Response): ()!` — the
+// stdlib handler is NOT fallible. Ours is `(Ctx) => Res!` (router.bit). So
+// something has to sit between them, and that something is necessarily the
+// single site where a failure becomes a response.
+//
+// `dispatch` is that seam, and `App.handle` (app.bit) is a one-line forward
+// onto it. `App.listen` serves `App.serveHandler()`, which is
+// `(req) => app.handle(req)` and nothing else — so the path a test exercises
+// in process and the path a socket exercises are the SAME code, not two
+// copies that can drift. That is the load-bearing constraint of this file:
+// `listenAndServe` appears exactly once in this package, in `listen()`, and
+// its handler argument is `this.serveHandler()`.
+//
+// Order of work, all of it here:
+//   1. split the query off the target (std/http's `splitTarget`)
+//   2. match method+path against the frozen trie (router.bit)
+//   3. no match -> 404; matched under another method -> 405 with `Allow`
+//   4. build the `Ctx` (ctx.bit) from the request, params and matched pattern
+//   5. call the composed chain — middleware outermost, handler innermost,
+//      composed ONCE at `freeze()` (middleware.bit), never per request
+//   6. seal the session (#4496), then convert the `Res` to a `Response`
+//   7. any failure at 4 or 5 goes through `failureRes`, the single mapping
+//      site, which logs the real message and sends a generic one
+//
+// `Request`, `splitTarget`, `toLower` and `join` are already imported
+// module-wide by ctx.bit/escape.bit/router.bit (an import binds per MODULE —
+// SPEC §17.1), so re-importing them here is E0042.
+import { Response, respond, listenAndServe } from "std/http"
+
+// Where the framework writes what it refuses to SEND. An interface, so its
+// zero value is `nil` (SPEC §13.4) and `Config.logs` is omittable exactly the
+// way `Config.sessions` is; absent means stderr (`logLine`), never silence.
+//
+// A test sets its own sink and reads the lines back — which is the only way
+// to assert the security property this design turns on: the real message is
+// recorded somewhere, and it is not the response body.
+export interface LogSink {
+  log(line: string),
+}
+
+const statusNotFound = 404
+const statusMethodNotAllowed = 405
+const statusServerError = 500
+
+const allowHeaderName = "Allow"
+const acceptHeaderName = "Accept"
+
+// The bodies the framework sends when it is answering for itself rather than
+// for a handler. They carry a status and nothing else — no error message, no
+// path, no stack — for the reason #3876 is filed under: a message the app
+// author did not mark as client-facing must never reach a client.
+const notFoundBody = "Not Found"
+const methodNotAllowedBody = "Method Not Allowed"
+const serverErrorBody = "Internal Server Error"
+
+const contentTypeLower = "content-type"
+
+// Everything the failure-to-response mapping is allowed to see, as one value
+// rather than four parameters — so #3876 can widen the mapping without
+// touching a single call site here. `accept` is already carried for exactly
+// that reason: content negotiation is #3876's rule, and this is where it will
+// read the header from.
+class Failure {
+  err: error,
+  method: string,
+  path: string,
+  accept: string,
+}
+
+// THE single failure-to-response site. Every `fail` that leaves the
+// middleware chain, and every failure the adapter itself raises building a
+// `Ctx`, becomes a response HERE and nowhere else.
+//
+// **#3876 extends THIS function**, and only this one: it adds the `HttpError`
+// lookup (an error carrying `message()` AND `status()` maps to that status
+// with its message in the body) and the Accept-driven JSON/HTML choice, both
+// of which read `f` and nothing else. What #3876 must NOT change is the
+// default below, because the default IS the security property: an error that
+// did not opt in is a 500 with a generic body, and its real message goes to
+// the log and never to the client. A raw stdlib/sql failure carrying a SQL
+// fragment or a file path has no `status()`, so it cannot reach a client by
+// accident — leaking one requires writing a method, which is greppable.
+fn failureRes(app: App, f: Failure): Res {
+  logLine(app.config.logs, "web: ${f.method} ${f.path}: ${f.err.message()}")
+  return newRes(statusServerError, textContentType, serverErrorBody)
+}
+
+// `line` to the app's sink, or to stderr when it configured none. A write to
+// stderr cannot be checked usefully — there is nobody left to tell that
+// telling somebody failed — and `eprint` is the builtin that does it without
+// a return value to discard (E0215).
+fn logLine(sink: LogSink, line: string) {
+  if (sink == nil) {
+    eprint(line + "\n")
+    return
+  }
+  sink.log(line)
+}
+
+fn requestFailure(req: Request, e: error): Failure {
+  return Failure{ err: e, method: req.method, path: req.path, accept: "" }
+}
+
+fn ctxFailure(c: Ctx, e: error): Failure {
+  return Failure{
+    err: e,
+    method: c.method(),
+    path: c.path(),
+    accept: c.header(acceptHeaderName),
+  }
+}
+
+// The whole request path except the socket: everything `listen()` does per
+// request, minus accepting the connection and writing the bytes. `App.handle`
+// forwards to it, so a test that calls `app.handle(req)` runs the real
+// router, the real chain, the real `Ctx` construction and the real failure
+// mapping — which is what catches a route registered at the wrong path or
+// sitting behind the wrong middleware, and what calling a handler function
+// directly cannot.
+fn dispatch(app: App, req: Request): Response {
+  let (path, _) = splitTarget(req.path)
+  let m = app.root.router.lookup(req.method, path) catch e {
+    return missResponse(app, e)
+  }
+  return matchedResponse(app, req, m)
+}
+
+// Nothing matched. 405 — with the `Allow` header RFC 9110 §15.5.6 makes
+// mandatory, listing every method registered at this exact path — when the
+// path IS registered under other methods (`MethodNotAllowed`, router.bit);
+// 404 otherwise. Never 404 for a path that exists under another method: that
+// hides a route from a client that could have used it correctly, and turns a
+// fixable 405 into a bug report.
+fn missResponse(app: App, e: error): Response {
+  let (na, ok) = e.(MethodNotAllowed)
+  if (!ok) {
+    return frame(app, newRes(statusNotFound, textContentType, notFoundBody))
+  }
+  let r = newRes(statusMethodNotAllowed, textContentType, methodNotAllowedBody)
+  r.set(allowHeaderName, join(na.allowed, ", "))
+  return frame(app, r)
+}
+
+// A matched route. Both the success exit and the failure exit seal the
+// session (#4496) and both go through `frame`, so there is one conversion
+// and one cookie decision however the request ends.
+fn matchedResponse(app: App, req: Request, m: Match): Response {
+  let c = newCtx(req, m.params, app.root.registry, app.config, m.pattern) catch e {
+    return frame(app, failureRes(app, requestFailure(req, e)))
+  }
+  let r = m.handler(c) catch e {
+    return frame(app, c.sealSession(failureRes(app, ctxFailure(c, e))))
+  }
+  return frame(app, c.sealSession(r))
+}
+
+// The one place a `Res` becomes a `Response` (named `frame`, not `render` —
+// node.bit already exports `render(Node)` and a module has one declaration
+// namespace, SPEC §17.1). A `Res` std/http refuses to FRAME becomes a logged
+// 500 carrying no headers at all — not a panic on the response path, and not
+// a header smuggled onto the wire. `Res.set` (res.bit)
+// already refused CR, LF and NUL at the write; this is std's own narrower
+// RFC 9110 token check on top, and the two disagreeing is a framework bug
+// worth a log line rather than a dropped connection.
+fn frame(app: App, r: Res): Response {
+  let out = toResponse(r) catch e {
+    logLine(app.config.logs, "web: refusing to frame a response: ${e.message()}")
+    return respond(statusServerError, serverErrorBody)
+  }
+  return out
+}
+
+// `Res` -> stdlib `Response`. `Content-Type` moves into the dedicated
+// `Response.contentType` field rather than staying among the other headers,
+// because `serializeResponse` (stdlib/http/http.bit) emits that field on
+// every response unconditionally — leaving ours in `headers` would put a
+// second `Content-Type` on the wire. A `Res` that carries none keeps
+// `respond`'s own default, which is the only spelling std/http offers: the
+// field is not omittable.
+//
+// Every other header goes through `addHeader`, not `setHeader`: `Set-Cookie`
+// legitimately repeats, and `Res.set` already collapsed the ones that must
+// not.
+fn toResponse(r: Res): Response! {
+  let out = respond(r.statusCode(), r.body())
+  for h of r.headerList() {
+    if (toLower(h.name) == contentTypeLower) {
+      out.contentType = h.value
+      continue
+    }
+    out.addHeader(h.name, h.value)?
+  }
+  return out
+}
+
+// The handler value `App.listen` hands to `listenAndServe`, built here so
+// that file's `listen()` has nothing in it but a freeze and one call. It
+// forwards to `app.handle` and does nothing else — the served path IS the
+// tested path.
+fn serveHandlerFor(app: App): (Request) => Response {
+  return (req) => app.handle(req)
+}
