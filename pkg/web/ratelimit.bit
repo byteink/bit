@@ -1,0 +1,625 @@
+// pkg/web/ratelimit.bit — `app.use(rateLimit(Limit{ ... }))`: a sliding-window
+// counter in front of a route or a whole app (#3964).
+//
+//   app.use(rateLimit(Limit{
+//     requests: 100,
+//     window: 60,
+//     by: byIp,
+//     store: MemoryCounter(),
+//   }))
+//
+//   login.use(rateLimit(Limit{ requests: 5, window: 300, by: byIp, store: c }))
+//
+// Without one, a login endpoint is a free credential-stuffing target and an
+// expensive handler is a denial-of-service primitive.
+//
+// ## The counter store is the app's, and there is no default
+//
+// `Limit.store` has no default and `rateLimit()` PANICS at registration when
+// it is absent. An in-process counter is correct on one process and silently
+// wrong behind a load balancer, where each of N servers permits the whole
+// quota and a limit of 100 becomes 100N with nothing anywhere to indicate it.
+// That is the same reasoning that gave `Config.sessions` no default (#3947,
+// session.bit) and it is the more important half of this file.
+//
+// The refusal is a PANIC and it is at REGISTRATION, which sessions could not
+// manage: nothing static can tell whether a handler ever reaches
+// `c.session()`, so that one has to wait for the first access. A middleware
+// is different — `rateLimit(l)` is itself the registration, the whole `Limit`
+// is in hand at that moment, and a misconfigured limiter must not become a
+// site that serves every request unlimited and looks fine.
+//
+// ## The window slides; it does not reset
+//
+// A fixed window lets a client send the full quota in the last instant of one
+// window and again in the first instant of the next, so the real burst at the
+// boundary is double the configured limit. This counts two adjacent fixed
+// buckets and weights the older one by how much of it is still inside the
+// trailing window (`rateEstimate`):
+//
+//     used = prev * (window - elapsed) / window + cur
+//
+// which is the standard sliding-window COUNTER: one integer per bucket rather
+// than the timestamp log an exact sliding window needs, so a key costs two
+// integers however much traffic it sends. It is an estimate, and the one way
+// it is wrong is documented on `rateEstimate`.
+//
+// ## Every request counts, including a rejected one
+//
+// `cur` is incremented before the decision, so a client that keeps hammering
+// keeps its own counter up. That is deliberate: the increment is then a single
+// store operation that a real store (`INCR`) performs atomically, so two
+// concurrent requests cannot both read the same count and both be admitted.
+// The cost is that abuse extends its own lockout, which is the safe direction
+// to be wrong in.
+//
+// ## What a store outage does
+//
+// It logs, through the app's own sink (`Config.logs`, adapter.bit — stderr
+// when the app set none), and the request is ALLOWED. A limiter that failed
+// closed would turn a Redis blip into a total outage of the app it is meant to
+// protect, and a rate limit is a mitigation rather than an authentication
+// boundary: whatever is behind it must still be safe for one request. What is
+// NOT acceptable is doing that quietly, so every single store failure writes a
+// line naming the operation and the store's own message.
+//
+// ## Keys are namespaced by the policy, not by the registration
+//
+// A bucket key carries `requests/window` (`rateBucketKey`), so the app-wide
+// `100/60` limiter and the login `5/300` limiter in the example above do not
+// share counters even when they share a store and a key function. Two
+// registrations with the SAME policy and the same store still do share one —
+// see the README; an explicit per-limit namespace is a separate ticket.
+//
+// ## Nothing here reads a client-supplied header, unless the app says so
+//
+// `byIp` keys on `c.peer()` (ctx.bit, #4528) — the address the kernel says
+// the other end of the socket is. `X-Forwarded-For` appears in this file in
+// exactly one place, `byForwardedIp(hops)`, which the app must ask for by
+// name and must tell how many proxies it sits behind, so the hop is taken
+// from the TRUSTED end of the list and everything an attacker prepended is
+// below it. A limiter keyed on a header any client can set is not a limiter.
+//
+// `now`, `nsPerSecond`, `Mutex` and `newMutex` are already bound module-wide
+// by memorystore.bit, and `join`/`split`/`trimSpace` by router.bit/ctx.bit —
+// an import binds per MODULE, not per file (SPEC §17.1), so re-importing any
+// of them here is E0042. This file imports nothing.
+
+// The three response headers, in the IETF draft's spelling
+// (draft-ietf-httpapi-ratelimit-headers) — which is what current client
+// tooling reads. They go on every response this middleware returns, the 429
+// included: a rejection that does not say what the quota was is a rejection
+// the client cannot adapt to.
+const rateLimitHeaderName = "RateLimit-Limit"
+const rateRemainingHeaderName = "RateLimit-Remaining"
+const rateResetHeaderName = "RateLimit-Reset"
+
+// On a rejection only, in seconds (RFC 9110 §10.2.3 allows a delay-seconds
+// form, which is what `rateRetryAfter` computes).
+const retryAfterHeaderName = "Retry-After"
+
+// The status a rejected request gets. 429 and nothing else — a 503 would tell
+// the client the server is broken, and a 403 that it is unwelcome; neither is
+// what happened.
+const statusTooManyRequests = 429
+
+// The header `byForwardedIp` reads. It is named HERE and nowhere else in this
+// package: `byIp` and `bySession` never touch it.
+const forwardedForHeaderName = "X-Forwarded-For"
+
+// Separates the parts of a bucket key. A key produced by `by` may itself
+// contain this byte; that cannot cause a collision, because the window index
+// is always the part after the LAST separator and the policy always the part
+// before the FIRST, so the decomposition of a bucket key is unique.
+const rateKeySep = "|"
+
+// The two key spaces `byIp`, `byForwardedIp` and `bySession` produce. They are
+// kept apart so that a session id can never be equal to an address: without
+// them a store holding both would let one caller's key land in the other's
+// bucket, which is a limit that silently applies to the wrong party.
+const rateAddrPrefix = "ip:"
+const rateSessionPrefix = "sid:"
+
+// What produces the string a limit counts against: an address, a session id,
+// an API key. Fallible because a real one reaches for state that can fail —
+// `bySession` consults the session store — and a key that cannot be computed
+// must not be silently replaced by a constant, which would put every client in
+// one bucket.
+export type RateKey = (Ctx) => string!
+
+// Seconds since the epoch. Module-private, and the ONLY reason it exists is
+// that a sliding window cannot be tested honestly against the wall clock: the
+// boundary-burst case needs the clock to be at a known offset inside a window
+// and then exactly one window later. `rateLimit()` passes `nil`, which is this
+// type's zero value (SPEC §13.4) and means the real clock.
+type RateClock = () => i64
+
+// Where the counters live. Structural (SPEC §14.3): a type satisfies this by
+// having the two methods, with no declaration anywhere — so `MemoryCounter`
+// below, a Redis-backed counter and an app's own all satisfy it the same way.
+//
+// The shape is `INCR` plus `GET`, which is what a plain key-value store can
+// implement without a server-side script: `incr` is one atomic operation that
+// both counts the request and reports the count, so the admission decision is
+// made from a value nothing else can have changed underneath it.
+//
+// Both are fallible, and a failure means the STORE failed — never that the key
+// was absent. An absent key is `0` from `count` and `1` from `incr`; reporting
+// a miss as an error would make an ordinary first request look like an outage.
+export interface RateStore {
+  // Adds one to the counter at `key`, creating it at 1 when it is absent, and
+  // returns the new value. `ttl` is how long the counter must survive, in
+  // seconds, counted from its CREATION — an implementation must not extend the
+  // life of an existing counter, which would keep a hot key alive forever.
+  incr(key: string, ttl: i64): i64!,
+  // The current value at `key`, or 0 when it is absent or expired.
+  count(key: string): i64!,
+}
+
+// One rate limit, as the app writes it down.
+//
+//     Limit{ requests: 5, window: 300, by: byIp, store: myCounter }
+//
+// Every field is required. `requests` and `window` have no defaults because a
+// default rate limit is a number the framework invented for an endpoint it has
+// never seen; `by` and `store` because both are decisions only the app can
+// make. Omitting any of them is caught by `checkLimit` at registration, with a
+// message naming the field — the zero values (0, 0, nil, nil) are all
+// unusable, so there is no omission that quietly does something plausible.
+export class Limit {
+  // How many requests one key may make per `window`. At least 1.
+  export requests: i64,
+  // The width of the trailing window, in seconds. At least 1.
+  export window: i64,
+  // What a request is counted against: `byIp`, `bySession`,
+  // `byForwardedIp(n)`, or the app's own.
+  export by: RateKey,
+  // Where the counters live. NO DEFAULT — see this file's header.
+  export store: RateStore,
+}
+
+// What one request's accounting came to. A single value rather than four
+// out-parameters so the decision and the three numbers the headers report are
+// made in one place and cannot disagree with each other.
+class RateVerdict {
+  allowed: bool,
+  // `RateLimit-Remaining`: how much of the quota is left, never below 0.
+  remaining: i64,
+  // `RateLimit-Reset`: seconds until the current counting window rolls over.
+  reset: i64,
+  // `Retry-After`: seconds until one more request would be admitted. 0 on an
+  // allowed request, where the header is not sent.
+  retryAfter: i64,
+}
+
+// The middleware. Registered like any other (`app.use(rateLimit(l))`), so it
+// wraps everything registered after it on the same scope.
+//
+// A misconfigured `Limit` panics HERE, at the `use()` call, before any request
+// exists — see the file header on why this one can be caught at registration
+// when the session store cannot.
+export fn rateLimit(l: Limit): Middleware {
+  return rateLimitAt(l, nil)
+}
+
+// `rateLimit` against a caller-supplied clock. Module-private: it exists so a
+// test can place a burst exactly at a window boundary, which is the one
+// property distinguishing this from a fixed window and which no wall-clock
+// test can produce deterministically.
+//
+// A block-bodied arrow bound to an annotated `let` rather than written into
+// the `return`, for cors.bit's reason: an arrow in RETURN position is given no
+// expected type (#4513), which leaves `next` untyped and fails at LOWERING
+// with E0092 after `bit check` has already exited 0. `rethrow`
+// (middleware.bit) is how a failure leaves an arrow body until #4504 lands.
+//
+// A FAILURE FROM THE CHAIN CARRIES NO RATE-LIMIT HEADERS. It goes out to
+// `failureRes` (adapter.bit), which builds its own response from the mapping
+// and nothing else; that is the same shape `cors` has, and adding them there
+// would mean reaching around the single failure-to-response site.
+fn rateLimitAt(l: Limit, clock: RateClock): Middleware {
+  checkLimit(l)
+  let mw: Middleware = (c, next) => {
+    let v = rateCheck(l, clock, c) catch e {
+      return rethrow(e)
+    }
+    if (!v.allowed) {
+      return rateRejected(c, l, v)
+    }
+    let r = next(c) catch e {
+      return rethrow(e)
+    }
+    return rateHeaders(r, l, v)
+  }
+  return mw
+}
+
+// The refusal: 429, no body, plus the three quota headers and `Retry-After`.
+// No body on purpose — the framework does not know what the app would like to
+// say, and a body invented here would be the one thing a client parses.
+fn rateRejected(c: Ctx, l: Limit, v: RateVerdict): Res {
+  let r = rateHeaders(c.status(statusTooManyRequests), l, v)
+  return r.header(retryAfterHeaderName, "${v.retryAfter}")
+}
+
+// The three quota headers on `r`. `Res.header` replaces rather than appends
+// (res.bit), so a handler that set one of these itself is overridden by the
+// limiter's own accounting — which is the right way round: the middleware is
+// the only party that knows the counts.
+fn rateHeaders(r: Res, l: Limit, v: RateVerdict): Res {
+  let withLimit = r.header(rateLimitHeaderName, "${l.requests}")
+  let withRemaining = withLimit.header(rateRemainingHeaderName, "${v.remaining}")
+  return withRemaining.header(rateResetHeaderName, "${v.reset}")
+}
+
+// Refuses a `Limit` the framework cannot honour, naming the field to fix. At
+// REGISTRATION — this runs inside `rateLimitAt`, before the middleware value
+// exists, so an app whose limiter is misconfigured never starts rather than
+// serving every request unlimited.
+//
+// A panic and not a failure, for csrf.bit's reason: answering a deployment
+// mistake with the same 429 a hostile client gets would turn it into a site
+// that is merely, silently wrong.
+fn checkLimit(l: Limit) {
+  if (l.store == nil) {
+    panic(
+        "web: rateLimit(): no counter store — set the `store` field on Limit, for " +
+        "example `Limit{ requests: 100, window: 60, by: byIp, store: MemoryCounter() }`. " +
+        "This framework ships no default counter store on purpose: an in-process " +
+        "counter permits the whole quota on every server behind a load balancer.",
+    )
+  }
+  if (l.by == nil) {
+    panic("web: rateLimit(): no key function — set the `by` field on Limit, for example `by: byIp`")
+  }
+  if (l.requests < 1) {
+    panic("web: rateLimit(): `requests` is ${l.requests} — a limit must permit at least one request per window")
+  }
+  if (l.window < 1) {
+    panic("web: rateLimit(): `window` is ${l.window} second(s) — a window must be at least one second")
+  }
+}
+
+// This request's accounting. Fallible for exactly one reason: the app's own
+// key function failed, and a request whose client cannot be identified must
+// not quietly become an unlimited one. That failure leaves the chain and
+// reaches `failureRes` (adapter.bit), the single site that maps a failure onto
+// a response and logs it.
+//
+// A STORE failure is not that case and does not come out of here — see
+// `rateStoreOpen`.
+fn rateCheck(l: Limit, clock: RateClock, c: Ctx): RateVerdict! {
+  let keyFn = l.by
+  let key = keyFn(c)?
+  let nowSec = rateNow(clock)
+  let index = nowSec / l.window
+  let prev = l.store.count(rateBucketKey(l, key, index - 1)) catch e {
+    return rateStoreOpen(l, c, nowSec, "count", e)
+  }
+  let cur = l.store.incr(rateBucketKey(l, key, index), l.window * 2) catch e {
+    return rateStoreOpen(l, c, nowSec, "incr", e)
+  }
+  return rateVerdict(l, nowSec, prev, cur)
+}
+
+// A store failure: logged to the app's sink, and the request is allowed. The
+// headers then report the quota as untouched, because that IS the limiter's
+// state — it is not counting, so it has nothing to subtract. See the file
+// header for why this direction and not the other.
+fn rateStoreOpen(l: Limit, c: Ctx, nowSec: i64, op: string, e: error): RateVerdict {
+  logLine(
+    c.config.logs,
+    "web: rateLimit(): counter store ${op} failed, this request was NOT limited: ${e.message()}",
+  )
+  return RateVerdict{
+    allowed: true,
+    remaining: l.requests,
+    reset: l.window - nowSec % l.window,
+    retryAfter: 0,
+  }
+}
+
+// The bucket a key's counter for window `index` lives at.
+//
+// `requests/window` is part of it so that two limiters sharing a store do not
+// share counters: the app-wide `100/60` and the login `5/300` in this file's
+// header would otherwise increment the same key and enforce neither policy.
+fn rateBucketKey(l: Limit, key: string, index: i64): string {
+  return "${l.requests}/${l.window}" + rateKeySep + key + rateKeySep + "${index}"
+}
+
+// Now, in seconds since the epoch: the app's clock, or a test's.
+fn rateNow(clock: RateClock): i64 {
+  if (clock == nil) {
+    return now().ns / nsPerSecond
+  }
+  return clock()
+}
+
+// The decision and the three numbers, from the two bucket counts.
+//
+// `used` INCLUDES the request being decided — `cur` was already incremented —
+// so the comparison is `<=` and a limit of 3 admits the 1st, 2nd and 3rd
+// request and refuses the 4th.
+fn rateVerdict(l: Limit, nowSec: i64, prev: i64, cur: i64): RateVerdict {
+  let elapsed = nowSec % l.window
+  let used = rateEstimate(prev, cur, elapsed, l.window)
+  let reset = l.window - elapsed
+  if (used <= l.requests) {
+    return RateVerdict{ allowed: true, remaining: l.requests - used, reset: reset, retryAfter: 0 }
+  }
+  return RateVerdict{
+    allowed: false,
+    remaining: 0,
+    reset: reset,
+    retryAfter: rateRetryAfter(l, prev, cur, elapsed),
+  }
+}
+
+// THE SLIDING WINDOW, and the whole of it.
+//
+// `cur` is this window's count. `prev` is the preceding window's, weighted by
+// how much of that window is still inside the trailing `window` seconds: at
+// the instant a window opens the whole of the previous one is still in view
+// and counts in full, and its contribution falls linearly to nothing as the
+// current window fills. Replacing this with `return cur` is a FIXED window and
+// admits a double-size burst across the boundary, which ratelimit.test.bit's
+// boundary case exists to catch.
+//
+// Integer division floors, so the previous window is under-counted by less
+// than one request. That is the direction to be wrong in: it can admit at most
+// one extra request across a boundary, where rounding up would refuse a
+// legitimate one for as long as `prev` is nonzero.
+fn rateEstimate(prev: i64, cur: i64, elapsed: i64, window: i64): i64 {
+  return prev * (window - elapsed) / window + cur
+}
+
+// Seconds until one more request from this key would be admitted.
+//
+// It is a lower bound and never an early one: `rateEarliest` rounds the answer
+// later rather than sooner. It is also computed from the counters AS THEY
+// STAND — a client that keeps sending keeps incrementing `cur`, which pushes
+// the real answer out, so the honest reading of the header is "not before
+// this" rather than "at this".
+fn rateRetryAfter(l: Limit, prev: i64, cur: i64, elapsed: i64): i64 {
+  let budget = l.requests - 1
+  let (e, ok) = rateEarliest(prev, cur, budget, l.window)
+  if (ok) {
+    return rateAtLeastOne(e - elapsed)
+  }
+  // `cur` alone is already at or over the limit, so nothing frees up before
+  // this window rolls over. After it does, `cur` becomes the previous bucket
+  // and decays from full weight; `checkLimit` guarantees `requests >= 1`, so
+  // `budget` is >= 0 and this second call always resolves.
+  let (rolled, _) = rateEarliest(cur, 0, budget, l.window)
+  return rateAtLeastOne(l.window - elapsed + rolled)
+}
+
+// The earliest whole second `e` in `[0, w]` at which
+//
+//     base * (w - e) / w + fixed <= budget
+//
+// holds, and whether any `e` in that range does.
+//
+// The inequality rearranges to `e > w - (budget - fixed + 1) * w / base`, and
+// the division here floors, so the quotient is at most the exact one and `e`
+// is therefore at least the exact answer — the error is always in the "come
+// back later" direction. `e == w` always satisfies it once `budget - fixed` is
+// non-negative, since the weighted term is 0 there; that is what the upper
+// clamp records, and it is why the flooring cannot produce a false `false`.
+fn rateEarliest(base: i64, fixed: i64, budget: i64, w: i64): (i64, bool) {
+  let room = budget - fixed
+  if (room < 0) {
+    return 0, false
+  }
+  if (base == 0) {
+    return 0, true
+  }
+  let e = w - (room + 1) * w / base + 1
+  if (e < 0) {
+    return 0, true
+  }
+  if (e > w) {
+    return w, true
+  }
+  return e, true
+}
+
+// `Retry-After: 0` would tell a client it may retry immediately, which is the
+// one thing a refused request must not be told.
+fn rateAtLeastOne(n: i64): i64 {
+  if (n < 1) {
+    return 1
+  }
+  return n
+}
+
+// --- the key functions ------------------------------------------------------
+
+// Keys on the SOCKET address (`Ctx.peer()`, ctx.bit). This is the default and
+// it reads no request header: every forwarding header is a client-supplied
+// string, so a limiter keyed on one is defeated by sending a different value
+// each time. Behind a reverse proxy this is the proxy's address, which is
+// correct rather than a defect — see `byForwardedIp` for the opt-in that says
+// how deep the proxy chain is.
+//
+// A request that never came off a socket has no peer and `c.peer()` is ""
+// (a hand-built `Request`, an in-process `App.handle` call, or the HTTP/3 path
+// until #4555 lands). Every such request then shares ONE bucket, which is the
+// over-restrictive direction and deliberately so: the alternative — treating
+// an unknown address as its own key — would hand an attacker an unlimited
+// endpoint by choosing a transport.
+export fn byIp(c: Ctx): string! {
+  return rateAddrPrefix + c.peer()
+}
+
+// Keys on the SESSION (#3947) when the request presents one that the store
+// knows, and on the socket address when it does not.
+//
+// The fallback is the load-bearing half. `Session.isNew()` is true both when
+// no cookie arrived and when the cookie that did arrive MISSED the store —
+// unknown, expired, destroyed or forged — so a client that sends a fresh
+// random cookie value on every request does not mint a fresh bucket every
+// time; it is counted on its address like any other anonymous caller. Keying
+// on the raw cookie value would be exactly the forgery hole `byIp` avoids by
+// not reading a header.
+//
+// It FAILS when the app configured no session store, naming the `sessions`
+// field (`Ctx.session()`, ctx.bit). That failure is propagated rather than
+// swallowed: an app that asked to limit by session and has no sessions is
+// misconfigured, and answering it with an unlimited endpoint is the outcome
+// this package exists to refuse.
+export fn bySession(c: Ctx): string! {
+  let s = c.session()?
+  if (s.isNew()) {
+    return rateAddrPrefix + c.peer()
+  }
+  return rateSessionPrefix + s.id()
+}
+
+// Keys on the client address taken from `X-Forwarded-For`, `hops` entries back
+// from the TRUSTED end of the list.
+//
+// `hops` is the number of proxies between the client and this server, and it
+// is a required argument rather than a flag on `byIp` because there is no safe
+// default for it: the header is a list any client may prepend to, and the only
+// part of it that is trustworthy is the tail each trusted proxy appended. With
+// `hops: 2` and a chain `client -> P1 -> P2 -> app`, the list this server sees
+// is `<whatever the client sent>, client, P1` — so the client is at
+// `len - hops`, and everything an attacker wrote sits to the LEFT of it and
+// cannot move it.
+//
+// Counting from the left instead is the classic vulnerability: the leftmost
+// entry is the one the client controls completely.
+//
+// A list SHORTER than `hops` cannot contain a hop the proxies appended, so it
+// did not come through the chain the app described. It falls back to
+// `c.peer()` — the same over-restrictive direction `byIp` takes for an absent
+// peer, and never to an attacker-supplied entry.
+//
+// `hops < 1` panics at registration: 0 hops means no proxy, which is `byIp`.
+export fn byForwardedIp(hops: int): RateKey {
+  if (hops < 1) {
+    panic(
+        "web: byForwardedIp(${hops}): `hops` is the number of proxies between the client " +
+        "and this server and must be at least 1 — with no proxy in front, use byIp",
+    )
+  }
+  let k: RateKey = (c) => rateForwardedKey(c, hops)
+  return k
+}
+
+fn rateForwardedKey(c: Ctx, hops: int): string {
+  let list = rateForwardedList(c)
+  let i = len(list) - hops
+  if (i < 0) {
+    return rateAddrPrefix + c.peer()
+  }
+  return rateAddrPrefix + list[i]
+}
+
+// Every `X-Forwarded-For` entry, in wire order, trimmed, with empty entries
+// dropped. A client may legally split the header across several lines, so all
+// of them are joined in arrival order (`Ctx.headers`) before splitting — using
+// only the first would let a client hide the real tail in a second line.
+//
+// Dropping empties keeps the count from the RIGHT end honest: an attacker
+// padding with `,,,` changes only what is to the left of the entries the
+// proxies appended.
+fn rateForwardedList(c: Ctx): []string {
+  let out = []string(0)
+  for part of split(join(c.headers(forwardedForHeaderName), ","), ",") {
+    let v = trimSpace(part)
+    if (len(v) > 0) {
+      out = append(out, v)
+    }
+  }
+  return out
+}
+
+// --- the in-process counter store -------------------------------------------
+
+// One counter. `expiresAtSec` is absolute rather than a ttl plus a write time,
+// so expiry is one comparison and no arithmetic can drift between two fields.
+class CounterEntry {
+  value: i64,
+  expiresAtSec: i64,
+}
+
+// The in-process `RateStore`. It ships, and it is never the default: an app
+// gets it only by writing `store: MemoryCounter()`, which is the whole design
+// — the counter that is wrong behind a load balancer is a deliberate line in
+// the app's own source.
+//
+// SINGLE PROCESS ONLY. With N servers behind a load balancer each holds its
+// own counters, so a limit of 100 admits up to 100N and nothing reports it.
+// Development, tests, and a single-process service are what it is for. There
+// is no sweeper: a counter is dropped when its key is next touched after
+// expiry, so a key never seen again holds its two integers until the process
+// exits. A store that must bound its own memory is a Redis-backed one, which
+// is exactly why `RateStore` is an interface.
+export class MemoryCounter {
+  entries: map<string, CounterEntry>
+  // A store is shared by every request and requests are concurrent; the map is
+  // not safe for concurrent use, so both methods take the lock — `count`
+  // included, since it deletes on the expiry path.
+  mu: Mutex
+
+  init() {
+    this.entries = map<string, CounterEntry>()
+    this.mu = newMutex()
+  }
+
+  export incr(key: string, ttl: i64): i64! {
+    return this.incrAt(key, ttl, now().ns / nsPerSecond)
+  }
+
+  export count(key: string): i64! {
+    return this.countAt(key, now().ns / nsPerSecond)
+  }
+
+  // `incr` against a caller-supplied clock, for `readAt`'s reason
+  // (memorystore.bit): a test can then prove a positive ttl really expires,
+  // deterministically, without sleeping.
+  //
+  // An existing, live counter is incremented IN PLACE and its expiry is left
+  // alone — classes are reference types (SPEC §13.3), so the value in the map
+  // is the one being changed. Not refreshing the expiry is the contract
+  // `RateStore.incr` states: a bucket must die `ttl` seconds after it was
+  // created, or a key with continuous traffic would keep its first window's
+  // counter alive forever.
+  //
+  // Not fallible: an in-memory map cannot fail. `incr` is, only because the
+  // interface says so for the stores that do I/O.
+  incrAt(key: string, ttl: i64, nowSec: i64): i64 {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (e, ok) = this.entries[key]
+    if (ok && e.expiresAtSec > nowSec) {
+      e.value = e.value + 1
+      return e.value
+    }
+    this.entries[key] = CounterEntry{ value: 1, expiresAtSec: nowSec + ttl }
+    return 1
+  }
+
+  // `count` against a caller-supplied clock. An entry found expired is deleted
+  // here rather than merely reported as 0: the key has just been proven dead,
+  // and this is the one moment the store is certain of it.
+  countAt(key: string, nowSec: i64): i64 {
+    this.mu.lock()
+    defer this.mu.unlock()
+    let (e, ok) = this.entries[key]
+    if (!ok) {
+      return 0
+    }
+    // `<=`, not `<`: a counter written with a ttl of 0 is already expired at
+    // the instant it was created, which is the same rule a positive ttl obeys
+    // one second later rather than a special case meaning "never expires".
+    if (e.expiresAtSec <= nowSec) {
+      delete(this.entries, key)
+      return 0
+    }
+    return e.value
+  }
+}

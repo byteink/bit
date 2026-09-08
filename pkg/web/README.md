@@ -32,7 +32,108 @@ the proxy is known to overwrite it and the app cannot be reached except through
 that proxy, and both are facts about a deployment that this package cannot
 know. Handling them belongs in an opt-in middleware configured with the
 operator's trusted proxy list; no such middleware ships yet, and until one
-does, `c.peer()` is the only address here that a client cannot forge.
+does, `c.peer()` is the only address here that a client cannot forge. The one
+place this package will read a forwarding header is `byForwardedIp(hops)` below,
+which the app asks for by name and tells how deep its proxy chain is; it keys a
+rate limit and does not change what `c.peer()` returns.
+
+## Rate limiting
+
+```
+app.use(rateLimit(Limit{
+  requests: 100,
+  window: 60,
+  by: byIp,
+  store: MemoryCounter(),
+}))
+
+login.use(rateLimit(Limit{ requests: 5, window: 300, by: byIp, store: counter }))
+```
+
+Every request the limiter serves carries `RateLimit-Limit`,
+`RateLimit-Remaining` and `RateLimit-Reset` (the IETF draft names, which is what
+current tooling reads). A refused one is **429** with `Retry-After`, in seconds,
+and no body.
+
+### You supply the counter store. There is no default.
+
+`Limit.store` has no default and `rateLimit()` panics at registration when it is
+absent — the same rule, for the same reason, as `Config.sessions`. An
+in-process counter is correct on one server and silently wrong behind a load
+balancer, where each of N servers permits the whole quota and a limit of 100
+becomes 100N with nothing anywhere to indicate it.
+
+`MemoryCounter()` ships and is **single-process only**. It is for development,
+tests, and a service that really does run as one process; it has no sweeper, so
+a key never seen again holds two integers until the process exits. A store that
+must be shared or must bound its own memory implements `RateStore`:
+
+```
+interface RateStore {
+  incr(key: string, ttl: i64): i64!    // add one, create at 1, return the new value
+  count(key: string): i64!             // the current value, 0 when absent
+}
+```
+
+That is `INCR` plus `GET`, so a plain key-value store implements it with no
+server-side script. `incr` must not extend an existing counter's life: a bucket
+dies `ttl` seconds after it was created, or the window stops sliding.
+
+### The window slides
+
+Two adjacent fixed buckets, with the older weighted by how much of it is still
+inside the trailing window. A fixed window would let a client spend the whole
+quota in the last instant of one window and the whole quota again in the first
+instant of the next — twice the configured burst, at the boundary, every time.
+
+A rejected request still counts. The increment is one atomic store operation, so
+two concurrent requests cannot both read the same count and both be admitted;
+the price is that a client which keeps hammering extends its own lockout.
+
+### Keys
+
+| `by` | keyed on | reads a header |
+|---|---|---|
+| `byIp` | `c.peer()`, the socket address | no |
+| `bySession` | the session id, or `c.peer()` when there is no established session | no |
+| `byForwardedIp(hops)` | `X-Forwarded-For`, `hops` entries from the trusted end | yes, deliberately |
+
+`byIp` is the default choice and reads nothing a client can set. Behind a
+reverse proxy it is the proxy's address, so every client behind that proxy
+shares one bucket — which is why `byForwardedIp(hops)` exists.
+
+`hops` is the number of proxies between the client and this server, and it is
+required rather than a flag on `byIp` because there is no safe default for it.
+With `hops: 2` and a chain `client -> P1 -> P2 -> app`, the list this server
+sees ends `..., client, P1`, so the client is at `len - hops` and everything an
+attacker prepended sits to the left of it and cannot move it. Counting from the
+left instead is the classic vulnerability: the leftmost entry is the one the
+client controls completely. **Set `hops` to the real depth of your proxy
+chain.** A list shorter than `hops` did not come through that chain, and falls
+back to `c.peer()` rather than to anything the header claimed.
+
+`bySession` keys on the session only when the cookie hits the session store. An
+absent, expired, destroyed or forged cookie is anonymous and is counted on the
+socket address — otherwise a client sending a fresh random cookie each time
+would mint a fresh bucket each time. It fails, naming `Config.sessions`, when no
+session store is configured.
+
+### A store outage does not refuse traffic
+
+A failing store is logged through the app's sink (`Config.logs`, stderr when
+none is set) and the request is **served**. Failing closed would turn a counter
+outage into an outage of the app the limiter protects, and a rate limit is a
+mitigation rather than an authentication boundary. What it never does is fail
+open quietly: every store failure writes a line naming the operation and the
+store's own message.
+
+### Two limiters sharing one store
+
+A bucket key carries the policy (`requests/window`), so the app-wide `100/60`
+limiter and the `5/300` login limiter above do not share counters even on one
+store. Two registrations with the **same** policy, the same store and the same
+key function still do share one, and count together. Give them separate stores
+until an explicit per-limit namespace lands.
 
 ## Reading the request body
 

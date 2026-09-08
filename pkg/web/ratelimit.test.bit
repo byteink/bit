@@ -1,0 +1,478 @@
+// pkg/web/ratelimit.test.bit — #3964's acceptance: a quota that admits exactly
+// `requests` and then refuses, per key; the three `RateLimit-*` headers on
+// every response; a 429 carrying `Retry-After`; a burst placed exactly at a
+// window boundary refused, which is what separates a sliding window from a
+// fixed one; a forged `X-Forwarded-For` keyed on the real socket peer; and a
+// missing counter store refused at registration rather than at the first
+// request.
+//
+// Every request goes through `App.handle` (adapter.bit) rather than through
+// the middleware value directly, so what is asserted is the real chain: the
+// router, the composed middleware, the `Ctx`, and the failure mapping.
+//
+// The clock is a test clock (`rateLimitAt`, module-private). The boundary case
+// needs the clock to sit at a known offset inside a window and then exactly
+// one window later; against the wall clock that is either a sleeping test or
+// no test at all.
+//
+// `Request`, `contains`, `join`, `newSink`, `sinkText`, `freezeOrPanic`,
+// `okHandler`, `MemoryStore` and `sessionCookieName` are already bound
+// module-wide by sibling files — reused here, not re-imported or redeclared
+// (E0042). This file imports nothing.
+
+// A clock a test can move. A class, because the arrow below has to keep seeing
+// the current value: classes are reference types (SPEC §13.3), so moving `sec`
+// after the middleware was built is visible to it.
+class RlClock {
+  sec: i64,
+}
+
+fn rlClock(box: RlClock): RateClock {
+  let f: RateClock = () => box.sec
+  return f
+}
+
+// A store that is always down, for the fail-open-but-loudly case. `note` is
+// echoed into the failure so the assertion can prove the STORE's own message
+// reached the log, not merely that some line was written.
+class FailingCounter {
+  note: string
+
+  export incr(key: string, ttl: i64): i64! {
+    fail newError("${this.note}: incr ${key} ttl ${ttl}")
+  }
+
+  export count(key: string): i64! {
+    fail newError("${this.note}: count ${key}")
+  }
+}
+
+fn rlLimit(requests: i64, window: i64, by: RateKey, store: RateStore): Limit {
+  return Limit{ requests: requests, window: window, by: by, store: store }
+}
+
+// One app: the limiter, then one route that answers 200. `rateLimitAt` is the
+// module-private form taking the test clock; `rateLimit(l)` is that with `nil`,
+// which every other assertion in this package's README describes.
+fn rlAppCfg(cfg: Config, l: Limit, clock: RateClock): App {
+  let app = App(cfg)
+  app.use(rateLimitAt(l, clock))
+  app.get("/x", okHandler)
+  freezeOrPanic(app)
+  return app
+}
+
+fn rlApp(l: Limit, clock: RateClock, sink: LogSink): App {
+  return rlAppCfg(Config{ secret: "test-secret", logs: sink }, l, clock)
+}
+
+// A request off a socket at `peer`, carrying `headers` (a raw block, as
+// `Request` holds it). `peer` is what `c.peer()` reports and what `byIp` keys
+// on; a client cannot set it.
+fn rlReq(peer: string, headers: string): Request {
+  return Request{ method: "GET", path: "/x", headers: headers, body: "", peer: peer }
+}
+
+fn rlXff(list: string): string {
+  return "X-Forwarded-For: " + list
+}
+
+// --- the quota ---------------------------------------------------------------
+
+test "requests=3 window=60: three requests from one key pass, the fourth is 429 with Retry-After" {
+  let box = RlClock{ sec: 6000 }
+  let app = rlApp(rlLimit(3, 60, byIp, MemoryCounter()), rlClock(box), newSink())
+  let peer = "198.51.100.7"
+
+  let r1 = app.handle(rlReq(peer, ""))
+  let r2 = app.handle(rlReq(peer, ""))
+  let r3 = app.handle(rlReq(peer, ""))
+  assert(r1.status == 200, "request 1 of 3 must pass, got ${r1.status}")
+  assert(r2.status == 200, "request 2 of 3 must pass, got ${r2.status}")
+  assert(r3.status == 200, "request 3 of 3 must pass, got ${r3.status}")
+
+  let r4 = app.handle(rlReq(peer, ""))
+  assert(r4.status == 429, "the fourth request must be refused with 429, got ${r4.status}")
+
+  // 76 = 60 (this window has to roll over first, since `cur` alone is already
+  // at 4) + 16 (the point in the NEXT window at which a weighted 4 has decayed
+  // to 2, leaving room for one request under a limit of 3). See
+  // `rateRetryAfter`/`rateEarliest`.
+  assert(
+    r4.getHeader("Retry-After") == "76",
+    "Retry-After must say when one more request fits, got '${r4.getHeader("Retry-After")}'",
+  )
+}
+
+test "a second key is unaffected while the first is exhausted" {
+  let box = RlClock{ sec: 6000 }
+  let app = rlApp(rlLimit(3, 60, byIp, MemoryCounter()), rlClock(box), newSink())
+  let busy = "198.51.100.7"
+  let other = "198.51.100.8"
+
+  let a1 = app.handle(rlReq(busy, ""))
+  let a2 = app.handle(rlReq(busy, ""))
+  let a3 = app.handle(rlReq(busy, ""))
+  let a4 = app.handle(rlReq(busy, ""))
+  assert(
+    a1.status == 200 && a2.status == 200 && a3.status == 200,
+    "the first key's quota must be spent normally",
+  )
+  assert(a4.status == 429, "the first key must be exhausted, got ${a4.status}")
+
+  // The whole point of `by`: one client's burst is one client's problem.
+  let b1 = app.handle(rlReq(other, ""))
+  assert(b1.status == 200, "a different key must still be served, got ${b1.status}")
+}
+
+// --- the headers -------------------------------------------------------------
+
+test "every allowed response carries RateLimit-Limit, -Remaining and -Reset, with Remaining decrementing" {
+  // 6000 is a whole multiple of the 60-second window, so `elapsed` is 0 and
+  // `Reset` is the full window — a fixed number this test can name.
+  let box = RlClock{ sec: 6000 }
+  let app = rlApp(rlLimit(3, 60, byIp, MemoryCounter()), rlClock(box), newSink())
+  let peer = "198.51.100.7"
+
+  let r1 = app.handle(rlReq(peer, ""))
+  assert(
+    r1.getHeader("RateLimit-Limit") == "3",
+    "RateLimit-Limit: got '${r1.getHeader("RateLimit-Limit")}'",
+  )
+  assert(
+    r1.getHeader("RateLimit-Remaining") == "2",
+    "after 1 of 3: got '${r1.getHeader("RateLimit-Remaining")}'",
+  )
+  assert(
+    r1.getHeader("RateLimit-Reset") == "60",
+    "RateLimit-Reset: got '${r1.getHeader("RateLimit-Reset")}'",
+  )
+
+  let r2 = app.handle(rlReq(peer, ""))
+  assert(
+    r2.getHeader("RateLimit-Remaining") == "1",
+    "after 2 of 3: got '${r2.getHeader("RateLimit-Remaining")}'",
+  )
+
+  let r3 = app.handle(rlReq(peer, ""))
+  assert(
+    r3.getHeader("RateLimit-Remaining") == "0",
+    "after 3 of 3: got '${r3.getHeader("RateLimit-Remaining")}'",
+  )
+
+  // The refusal reports the quota too: a client that is not told what the
+  // limit was cannot adapt to it.
+  let r4 = app.handle(rlReq(peer, ""))
+  assert(
+    r4.getHeader("RateLimit-Limit") == "3",
+    "the 429 must carry the limit, got '${r4.getHeader("RateLimit-Limit")}'",
+  )
+  assert(
+    r4.getHeader("RateLimit-Remaining") == "0",
+    "the 429 must report 0 remaining, got '${r4.getHeader("RateLimit-Remaining")}'",
+  )
+
+  // Never negative, however far over the limit the client goes.
+  let r5 = app.handle(rlReq(peer, ""))
+  let r6 = app.handle(rlReq(peer, ""))
+  assert(r5.status == 429 && r6.status == 429, "the limiter must keep refusing")
+  assert(
+    r6.getHeader("RateLimit-Remaining") == "0",
+    "Remaining must never go below 0, got '${r6.getHeader("RateLimit-Remaining")}'",
+  )
+}
+
+test "an allowed response carries no Retry-After" {
+  let box = RlClock{ sec: 6000 }
+  let app = rlApp(rlLimit(3, 60, byIp, MemoryCounter()), rlClock(box), newSink())
+  let r1 = app.handle(rlReq("198.51.100.7", ""))
+  assert(r1.status == 200, "control: the first request must pass, got ${r1.status}")
+  assert(
+    r1.getHeader("Retry-After") == "",
+    "Retry-After on a served request would tell the client to back off for no reason, got '${r1.getHeader("Retry-After")}'",
+  )
+}
+
+// --- the window slides -------------------------------------------------------
+
+// THE fixture that separates this from a fixed window, and the one a
+// `rateEstimate` that ignored `prev` would fail. A fixed window resets its
+// counter the instant a new one opens, so a client that spent its whole quota
+// at the end of one window gets the whole quota again immediately — twice the
+// configured burst across the boundary.
+test "a burst placed exactly at a window boundary is refused, so the window slides" {
+  let box = RlClock{ sec: 6000 }
+  let app = rlApp(rlLimit(3, 60, byIp, MemoryCounter()), rlClock(box), newSink())
+  let peer = "198.51.100.7"
+
+  let a1 = app.handle(rlReq(peer, ""))
+  let a2 = app.handle(rlReq(peer, ""))
+  let a3 = app.handle(rlReq(peer, ""))
+  assert(
+    a1.status == 200 && a2.status == 200 && a3.status == 200,
+    "the quota must be spendable inside one window",
+  )
+
+  // Exactly one window later: a new fixed bucket opens, and the previous
+  // one is still entirely inside the trailing 60 seconds.
+  box.sec = 6060
+  let b1 = app.handle(rlReq(peer, ""))
+  assert(
+    b1.status == 429,
+    "a fixed window would serve this and admit 6 requests in 60s under a limit of 3; got ${b1.status}",
+  )
+
+  // ...and it is not merely a permanent lockout: a window later still, the
+  // spent bucket has aged out and only the single refused request is carried
+  // forward, so the client is served again.
+  box.sec = 6120
+  let c1 = app.handle(rlReq(peer, ""))
+  assert(
+    c1.status == 200,
+    "the window must slide FORWARD too — this request must be served, got ${c1.status}",
+  )
+}
+
+// --- byIp reads the socket, never a header -----------------------------------
+
+test "a forged X-Forwarded-For does not mint a new bucket: byIp keys on the socket peer" {
+  let box = RlClock{ sec: 6000 }
+  let app = rlApp(rlLimit(1, 60, byIp, MemoryCounter()), rlClock(box), newSink())
+  let peer = "198.51.100.7"
+
+  let r1 = app.handle(rlReq(peer, rlXff("203.0.113.1")))
+  assert(r1.status == 200, "the first request must be served, got ${r1.status}")
+
+  // Same socket, a DIFFERENT forwarding header. A `byIp` that read the header
+  // would see a new key here and serve it — which is the whole attack: one
+  // client with an unlimited supply of made-up addresses.
+  let r2 = app.handle(rlReq(peer, rlXff("203.0.113.2")))
+  assert(r2.status == 429, "changing X-Forwarded-For must not reset the quota, got ${r2.status}")
+
+  // The control, without which a `byIp` that returned a constant would pass
+  // the assertion above: a genuinely different socket IS a different key.
+  let r3 = app.handle(rlReq("198.51.100.8", rlXff("203.0.113.1")))
+  assert(r3.status == 200, "a different peer must be a different bucket, got ${r3.status}")
+}
+
+test "X-Real-IP and Forwarded are not read either" {
+  let box = RlClock{ sec: 6000 }
+  let app = rlApp(rlLimit(1, 60, byIp, MemoryCounter()), rlClock(box), newSink())
+  let peer = "198.51.100.7"
+
+  let r1 = app.handle(rlReq(peer, "X-Real-IP: 203.0.113.4\r\nForwarded: for=203.0.113.5"))
+  assert(r1.status == 200, "the first request must be served, got ${r1.status}")
+
+  let r2 = app.handle(rlReq(peer, "X-Real-IP: 203.0.113.6\r\nForwarded: for=203.0.113.7"))
+  assert(r2.status == 429, "no forwarding header may reset the quota, got ${r2.status}")
+}
+
+// --- byForwardedIp counts from the trusted end -------------------------------
+
+// The chain is `client -> P1 -> P2 -> app`, so `hops` is 2 and the list this
+// server sees ends `..., client, P1`. Everything to the LEFT of `client` is
+// whatever the client chose to send, and the two requests below differ in
+// exactly that part — including in HOW MANY entries it has, which is what
+// separates counting from the trusted (right) end from counting from the left.
+test "byForwardedIp(2) takes the hop from the trusted end, so a forged prefix cannot mint a bucket" {
+  let box = RlClock{ sec: 6000 }
+  let app = rlApp(rlLimit(1, 60, byForwardedIp(2), MemoryCounter()), rlClock(box), newSink())
+  let proxy = "198.51.100.1"
+
+  let r1 = app.handle(rlReq(proxy, rlXff("9.9.9.9, 203.0.113.5, 198.51.100.1")))
+  assert(r1.status == 200, "the first request must be served, got ${r1.status}")
+
+  // Same client, a longer forged prefix. Counting from the LEFT would land on
+  // "2.2.2.2" here and serve the request; counting from the right lands on the
+  // same client and refuses it.
+  let r2 = app.handle(rlReq(proxy, rlXff("1.1.1.1, 2.2.2.2, 203.0.113.5, 198.51.100.1")))
+  assert(r2.status == 429, "a forged prefix must not reset the quota, got ${r2.status}")
+
+  // The control: a genuinely different client at the same hop is a different
+  // bucket, so the key is really the address and not a constant.
+  let r3 = app.handle(rlReq(proxy, rlXff("9.9.9.9, 203.0.113.6, 198.51.100.1")))
+  assert(r3.status == 200, "a different client at the trusted hop must be served, got ${r3.status}")
+}
+
+test "byForwardedIp falls back to the socket peer when the list is shorter than hops" {
+  let box = RlClock{ sec: 6000 }
+  let app = rlApp(rlLimit(1, 60, byForwardedIp(2), MemoryCounter()), rlClock(box), newSink())
+  let peer = "198.51.100.7"
+
+  // One entry, two hops claimed: this did not come through the chain the app
+  // described, so the only trustworthy address left is the socket's.
+  let r1 = app.handle(rlReq(peer, rlXff("203.0.113.1")))
+  assert(r1.status == 200, "the first request must be served, got ${r1.status}")
+
+  let r2 = app.handle(rlReq(peer, rlXff("203.0.113.2")))
+  assert(
+    r2.status == 429,
+    "a too-short header must fall back to the peer, not to its own contents, got ${r2.status}",
+  )
+
+  let r3 = app.handle(rlReq("198.51.100.8", rlXff("203.0.113.1")))
+  assert(r3.status == 200, "the fallback must still distinguish peers, got ${r3.status}")
+}
+
+// --- bySession ---------------------------------------------------------------
+
+fn rlSessionApp(sessions: SessionStore, clock: RateClock, sink: LogSink): App {
+  let cfg = Config{ secret: "test-secret", logs: sink, sessions: sessions }
+  return rlAppCfg(cfg, rlLimit(1, 60, bySession, MemoryCounter()), clock)
+}
+
+fn rlCookie(sid: string): string {
+  return "Cookie: " + sessionCookieName + "=" + sid
+}
+
+test "bySession counts an established session as one key, whatever address it arrives from" {
+  let sessions = MemoryStore()
+  sessions.write("abc123", map<string, string>(), 3600) catch e {
+    panic("seeding the session store: ${e.message()}")
+  }
+  let box = RlClock{ sec: 6000 }
+  let app = rlSessionApp(sessions, rlClock(box), newSink())
+
+  let r1 = app.handle(rlReq("198.51.100.7", rlCookie("abc123")))
+  assert(r1.status == 200, "the first request of the session must be served, got ${r1.status}")
+
+  // A different socket, the same session: still one key. That is what "by
+  // session" has to mean, or a logged-in client bypasses its own limit by
+  // changing networks.
+  let r2 = app.handle(rlReq("198.51.100.8", rlCookie("abc123")))
+  assert(
+    r2.status == 429,
+    "the same session from another address must share the bucket, got ${r2.status}",
+  )
+}
+
+test "bySession falls back to the peer for a forged cookie, so a random cookie cannot mint buckets" {
+  let sessions = MemoryStore()
+  let box = RlClock{ sec: 6000 }
+  let app = rlSessionApp(sessions, rlClock(box), newSink())
+  let peer = "198.51.100.7"
+
+  // Neither id is in the store, so both requests are anonymous and both are
+  // counted on the socket. Keying on the raw cookie value would give the
+  // second request a fresh bucket — an unlimited endpoint for anyone willing
+  // to send a new random cookie each time.
+  let r1 = app.handle(rlReq(peer, rlCookie("deadbeef")))
+  assert(r1.status == 200, "the first anonymous request must be served, got ${r1.status}")
+
+  let r2 = app.handle(rlReq(peer, rlCookie("feedface")))
+  assert(r2.status == 429, "a forged cookie must not reset the quota, got ${r2.status}")
+
+  let r3 = app.handle(rlReq("198.51.100.8", rlCookie("deadbeef")))
+  assert(
+    r3.status == 200,
+    "an anonymous request from another address is another bucket, got ${r3.status}",
+  )
+}
+
+test "bySession with no session store configured fails the request, it does not serve it unlimited" {
+  let sink = newSink()
+  let box = RlClock{ sec: 6000 }
+  // `sessions` deliberately left out of the Config — the state session.bit
+  // asserts `c.session()` refuses in.
+  let app = rlAppCfg(
+    Config{ secret: "test-secret", logs: sink },
+    rlLimit(1, 60, bySession, MemoryCounter()),
+    rlClock(box),
+  )
+
+  let r1 = app.handle(rlReq("198.51.100.7", ""))
+  assert(
+    r1.status == 500,
+    "a key function that cannot identify the client must not serve, got ${r1.status}",
+  )
+  assert(
+    contains(sinkText(sink), "sessions"),
+    "the log must name the `sessions` field: '${sinkText(sink)}'",
+  )
+}
+
+// --- a store outage ----------------------------------------------------------
+
+test "a counter store failure is logged and the request is served, never dropped silently" {
+  let sink = newSink()
+  let box = RlClock{ sec: 6000 }
+  let app = rlApp(rlLimit(1, 60, byIp, FailingCounter{ note: "counter down" }), rlClock(box), sink)
+  let peer = "198.51.100.7"
+
+  let r1 = app.handle(rlReq(peer, ""))
+  let r2 = app.handle(rlReq(peer, ""))
+  assert(r1.status == 200, "a store outage must not refuse the request, got ${r1.status}")
+  assert(r2.status == 200, "a store outage must not refuse the request, got ${r2.status}")
+
+  let text = sinkText(sink)
+  assert(contains(text, "rateLimit"), "the log line must name the middleware: '${text}'")
+  assert(
+    contains(text, "NOT limited"),
+    "the log line must say the request went unlimited: '${text}'",
+  )
+  // The store's OWN message, so the line says what actually broke rather than
+  // merely that something did.
+  assert(contains(text, "counter down"), "the store's message must reach the log: '${text}'")
+}
+
+// --- misconfiguration is refused at registration -----------------------------
+
+// `testpanic_` inverts the verdict (SPEC §18.4): these pass only if the
+// process really dies. Each one CONSTRUCTS a limiter and serves nothing, so a
+// version that dropped the check and then crashed on the first request would
+// fail them rather than pass them.
+test "testpanic_rateLimit_with_no_counter_store_panics_at_registration" {
+  let _ = rateLimit(Limit{ requests: 5, window: 60, by: byIp })
+  print("unreachable: rateLimit() accepted a Limit with no store\n")
+}
+
+test "testpanic_rateLimit_with_no_key_function_panics_at_registration" {
+  let _ = rateLimit(Limit{ requests: 5, window: 60, store: MemoryCounter() })
+  print("unreachable: rateLimit() accepted a Limit with no key function\n")
+}
+
+test "testpanic_rateLimit_with_a_zero_request_quota_panics_at_registration" {
+  let _ = rateLimit(Limit{ requests: 0, window: 60, by: byIp, store: MemoryCounter() })
+  print("unreachable: rateLimit() accepted a quota of 0 requests\n")
+}
+
+test "testpanic_rateLimit_with_a_zero_window_panics_at_registration" {
+  let _ = rateLimit(Limit{ requests: 5, window: 0, by: byIp, store: MemoryCounter() })
+  print("unreachable: rateLimit() accepted a window of 0 seconds\n")
+}
+
+test "testpanic_byForwardedIp_with_zero_hops_panics" {
+  let _ = byForwardedIp(0)
+  print("unreachable: byForwardedIp accepted 0 hops\n")
+}
+
+// The control for all five: a complete `Limit` registers and serves. Without
+// it a `rateLimit` that panicked unconditionally would pass every test above.
+test "a complete Limit registers without panicking and serves the request" {
+  let box = RlClock{ sec: 6000 }
+  let app = rlApp(rlLimit(5, 60, byIp, MemoryCounter()), rlClock(box), newSink())
+  let r1 = app.handle(rlReq("198.51.100.7", ""))
+  assert(r1.status == 200, "a well-formed Limit must serve, got ${r1.status}")
+}
+
+// --- MemoryCounter -----------------------------------------------------------
+
+test "MemoryCounter counts, expires on its ttl, and does not extend an existing counter's life" {
+  let s = MemoryCounter()
+
+  assert(s.incrAt("k", 10, 1000) == 1, "the first incr must create the counter at 1")
+  assert(s.incrAt("k", 10, 1001) == 2, "the second incr must return 2")
+  assert(
+    s.countAt("k", 1009) == 2,
+    "the counter must still be readable one second before it expires",
+  )
+
+  // Created at 1000 with a ttl of 10, so it dies at 1010 — NOT at 1011, even
+  // though the second incr passed the same ttl one second later. A store that
+  // refreshed the expiry would keep a hot key's first window alive forever and
+  // the sliding window would stop sliding.
+  assert(s.countAt("k", 1010) == 0, "the counter must be gone at its expiry second")
+  assert(s.incrAt("k", 10, 1010) == 1, "a counter read after expiry must start again at 1")
+
+  assert(s.countAt("absent", 1010) == 0, "an absent key must read as 0, not as an error")
+}
