@@ -44,11 +44,31 @@
 // file, which is what makes that a property of the code rather than a
 // promise in a comment.
 //
-// The body is parsed only when the request declares a form content type; a
-// JSON or multipart body is never scanned for a field it cannot contain.
-// A multipart form (a file upload) must therefore send the header — noted in
-// `csrfIsFormBody` and filed as its own ticket, since parsing multipart is a
-// parser this package does not have.
+// The body is parsed only when the request declares one of the two content
+// types an HTML `<form>` can actually send — `application/x-www-form-
+// urlencoded`, and `multipart/form-data` for a form with a file input
+// (#4485). A JSON body, or any other, is never scanned for a field it cannot
+// contain.
+//
+// The multipart parse is `std/http`'s `parseMultipart` (RFC 7578,
+// stdlib/http/multipart.bit). This file has no parser of its own: a second
+// implementation of a format whose failure mode is request smuggling is not
+// something a CSRF check should carry. A body that parser refuses is a
+// request with no token, which is the same 403 a missing token gets and
+// never a 500.
+//
+// ## What `Config.maxBody` bounds here, and what it does NOT
+//
+// The body is read through body.bit's `requestBody`, so the cap that bounds
+// `c.body<T>()` bounds what this file will parse — one cap helper in the
+// package, not a second one — and an over-cap body is a request with no
+// token.
+//
+// That cap is a limit on what is PARSED, not on what was READ. `std/http`'s
+// `readRequestBody` reads a `Content-Length` body with no limit of its own
+// (#4565), so the bytes are already resident before any `Ctx` exists. This
+// file refusing to parse them is not a defence against an over-large upload,
+// and nothing here should be read as claiming one.
 //
 // ## The refusal
 //
@@ -60,6 +80,7 @@
 // than asserting that a body is absent.
 
 import { hmac, newSha256 } from "std/crypto"
+import { defaultLimits, parseMultipart } from "std/http"
 
 // The hidden form field an HTML form carries the token in. The de-facto
 // name; not configurable, for `sessionCookieName`'s reason — a name is not
@@ -71,8 +92,16 @@ const csrfFieldName = "_csrf"
 // case-insensitively by `Ctx.header`, as HTTP requires.
 const csrfHeaderName = "X-CSRF-Token"
 
-// The only content type whose body is parsed for `csrfFieldName`.
-const csrfFormContentType = "application/x-www-form-urlencoded"
+// The two content types whose body is parsed for `csrfFieldName`: exactly
+// the two an HTML `<form>` can send, the second being what a form with a
+// file input uses.
+const csrfUrlencodedContentType = "application/x-www-form-urlencoded"
+const csrfMultipartContentType = "multipart/form-data"
+
+// The `Content-Type` parameter that carries the multipart delimiter
+// (RFC 7578 §4.1, RFC 2046 §5.1.1). Matched case-insensitively, as HTTP
+// requires of a parameter name.
+const csrfBoundaryParam = "boundary"
 
 // The status a refused request gets. One status for BOTH failures — absent
 // and wrong — through one `c.status()` call, so the two responses are the
@@ -171,36 +200,113 @@ fn csrfTokenOf(config: Config, session: Session): string! {
 }
 
 // The `_csrf` field of the request body, or "" when the body is not a form,
-// carries no such field, or the field is empty. Never fails: every one of
-// those is an ordinary refused request, not an error.
+// is over `Config.maxBody`, does not parse, carries no such field, or the
+// field is empty. Never fails: every one of those is an ordinary refused
+// request, not an error — a malformed multipart body included, which is
+// therefore a 403 and never a 500.
 fn csrfFormToken(c: Ctx): string {
-  if (!csrfIsFormBody(c.header("content-type"))) {
+  let raw = c.header(contentTypeName)
+  let media = mediaTypeOf(raw)
+  if (!csrfIsFormBody(media)) {
     return ""
   }
-  let fields = parseQuery(c.req.body)
-  let (v, ok) = fields[csrfFieldName]
+  // body.bit's cap helper rather than a second one, so the body this file
+  // parses is bounded by the same `Config.maxBody` as every other read in
+  // the package. See the file header for what that cap does and does not
+  // bound.
+  let body = requestBody(c) catch _ {
+    return ""
+  }
+  if (media == csrfMultipartContentType) {
+    return csrfMultipartToken(body, raw, c.config.maxBody)
+  }
+  let (v, ok) = parseQuery(body)[csrfFieldName]
   if (ok) {
     return v
   }
   return ""
 }
 
-// Whether `raw` — a `Content-Type` header value — declares a urlencoded
-// form. Parameters are stripped (`; charset=utf-8`) and the type is folded
-// to lower case, both of which HTTP allows a client to vary.
+// Whether `media` — a `Content-Type` media type, already stripped of its
+// parameters and folded to lower case by body.bit's `mediaTypeOf` — is a
+// form body this file reads the token out of.
 //
-// `multipart/form-data` is deliberately NOT accepted: this package has no
-// multipart parser, and pretending to look for a field in a body that is
-// never read would refuse every file-upload form with no way to see why. A
-// multipart form must send `X-CSRF-Token`; parsing multipart bodies is its
-// own ticket.
-fn csrfIsFormBody(raw: string): bool {
-  let ct = toLower(trimSpace(raw))
-  let semi = indexOf(ct, ";")
-  if (semi >= 0) {
-    ct = trimSpace(ct[0:semi])
+// Both of the two an HTML `<form>` can send are accepted. `multipart/form-
+// data` is here because a form with a file input sends nothing else, and
+// refusing it would mean every upload page had to carry `X-CSRF-Token` with
+// no way for the developer to see why (the refusal is deliberately silent).
+// Anything else — a JSON body, a bare upload — is not scanned at all: a
+// field cannot be found in a body that has no field syntax.
+fn csrfIsFormBody(media: string): bool {
+  return media == csrfUrlencodedContentType || media == csrfMultipartContentType
+}
+
+// The `_csrf` text field of a `multipart/form-data` body, or "" when the
+// boundary is missing or malformed, the body does not parse, or no part
+// carries that name.
+//
+// `std/http`'s `parseMultipart` does the parse. It refuses the WHOLE body on
+// the first problem and never returns a partial `Form`, so nothing here has
+// to decide what a half-read body means: it is a request with no token.
+//
+// The limits are std/http's own defaults with both byte ceilings pulled down
+// to `Config.maxBody`. `maxFileBytes` matters as much as `maxBodyBytes`: at
+// its 10 MiB default, an app that raised `maxBody` past that would have its
+// legitimate uploads refused here and get a 403 it did not ask for.
+//
+// WHAT THIS COSTS, said plainly rather than left implied: `parseMultipart`
+// builds the whole `Form`, so a file part IS copied out of the body even
+// though only a text field is wanted. The copy is bounded by
+// `Config.maxBody` and transient, but it is work this check has no use for.
+// Removing it needs a lookup entry point in std/http that shares the same
+// part walk without materialising part bodies — filed as #4581, because the
+// alternative available here is a second multipart parser, which is worse
+// than the copy.
+fn csrfMultipartToken(body: string, contentType: string, maxBody: i64): string {
+  let limits = defaultLimits()
+  limits.maxBodyBytes = maxBody
+  limits.maxFileBytes = maxBody
+  let form = parseMultipart([]byte(body), csrfBoundaryOf(contentType), limits) catch _ {
+    return ""
   }
-  return ct == csrfFormContentType
+  return form.value(csrfFieldName)
+}
+
+// The `boundary` parameter of a `Content-Type` value, or "" when there is
+// none. An empty or malformed result is not special-cased here:
+// `parseMultipart`'s own `validBoundary` refuses it, which is one rejection
+// site rather than two that could disagree.
+//
+// Splitting on `;` is safe because RFC 2046 §5.1.1's boundary alphabet
+// contains no `;`, so a value this splits wrongly is one that gets refused
+// there rather than one that gets accepted here. The FIRST `=` separates the
+// name from the value: `=` IS a legal boundary byte, so `boundary=a=b` must
+// keep its `a=b`.
+fn csrfBoundaryOf(contentType: string): string {
+  let params = split(contentType, ";")
+  // From 1: index 0 is the media type, which carries no parameter.
+  let i = 1
+  while (i < len(params)) {
+    let p = trimSpace(params[i])
+    let eq = indexOf(p, "=")
+    if (eq > 0 && toLower(p[0:eq]) == csrfBoundaryParam) {
+      return csrfUnquote(trimSpace(p[eq + 1:len(p)]))
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+// A parameter value with its surrounding quotes removed, if it has a pair of
+// them. There is no escape to decode: RFC 2046's boundary alphabet contains
+// neither `"` nor `\`, so a quoted boundary is exactly its bytes and a value
+// carrying anything else is refused by `parseMultipart`.
+fn csrfUnquote(v: string): string {
+  let n = len(v)
+  if (n >= 2 && v[0] == '"' && v[n - 1] == '"') {
+    return v[1:n - 1]
+  }
+  return v
 }
 
 // Constant-time string equality: the full length is always scanned, so the
