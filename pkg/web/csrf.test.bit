@@ -1,0 +1,496 @@
+// pkg/web/csrf.test.bit — #3948's acceptance.
+//
+// Every acceptance assertion goes through `app.handle(req)` (#3885's seam,
+// adapter.bit): the real router, the real middleware chain built once at
+// `freeze()`, the real `Ctx`, the real session store and the real `Res` ->
+// `Response` conversion, with only the socket left out. A test that called
+// `csrf()`'s arrow directly would pass just as well against a middleware
+// registered on the wrong group or a refusal that never became a response.
+//
+// A round trip is two `app.handle` calls sharing one `Config` and therefore
+// one store — which is exactly what a served pair is. The token is obtained
+// the way a form page obtains it: a GET whose handler calls `c.csrfToken()`,
+// with the session id read back out of the response's `Set-Cookie` exactly
+// as a browser would.
+//
+// `contains`, `repeat`, `join`, `indexOf` and `Request` are already bound
+// module-wide (router.test.bit, ctx.test.bit, router.bit, ctx.bit) — reused
+// here, not re-imported (E0042). `ctEq` is new to the module and is here for
+// one test: it proves `constantTimeEq` agrees with `std/crypto`'s own
+// implementation, so the copy csrf.bit keeps for its comparison count cannot
+// drift from it.
+
+import { ctEq } from "std/crypto"
+
+fn csrfConfig(): Config {
+  return Config{ secret: "test-secret", sessions: MemoryStore() }
+}
+
+fn csrfReq(method: string, target: string, headers: []string, body: string): Request {
+  let raw = ""
+  if (len(headers) > 0) {
+    raw = join(headers, "\r\n")
+  }
+  return Request{ method: method, path: target, headers: raw, body: body }
+}
+
+fn cookieHeader(sid: string): string {
+  return "Cookie: " + sessionCookieName + "=" + sid
+}
+
+const formHeader = "Content-Type: application/x-www-form-urlencoded"
+
+// An app whose HTML group is `app.group("/")` — the spelling #3948's own
+// body uses, and the one #4482 fixed. `protect` decides whether that group
+// carries `csrf()`, and it is the ONLY difference between a protected and an
+// exempt app: that is what "opt-in" means and why there is no exemption flag
+// to test.
+//
+// Each method's handler answers with a different status, so no assertion can
+// confuse "the handler ran" with "the request was refused". `/form` is the
+// page that issues a token; `/query` echoes a query parameter back, so a
+// test can prove the harness really put one there.
+fn csrfApp(config: Config, protect: bool): App {
+  let app = App(config)
+  let pages = app.group("/")
+  if (protect) {
+    pages.use(csrf())
+  }
+  pages.get(
+    "/form",
+    (c) => {
+      let token = c.csrfToken() catch e {
+        return rethrow(e)
+      }
+      return c.text(token)
+    },
+  )
+  pages.get(
+    "/query",
+    (c) => {
+      return c.text(c.query(csrfFieldName))
+    },
+  )
+  pages.get(
+    "/save",
+    (c) => {
+      return c.status(200)
+    },
+  )
+  pages.post(
+    "/save",
+    (c) => {
+      return c.status(201)
+    },
+  )
+  pages.put(
+    "/save",
+    (c) => {
+      return c.status(202)
+    },
+  )
+  pages.delete(
+    "/save",
+    (c) => {
+      return c.status(204)
+    },
+  )
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+  return app
+}
+
+// The status `app.handle` answered a request with, through a protected or an
+// unprotected app on `config`'s store.
+fn runStatus(config: Config, protect: bool, req: Request): int {
+  return csrfApp(config, protect).handle(req).status
+}
+
+// The session id out of a `Set-Cookie` value, the way a browser reads one:
+// everything between the first `=` and the first `;`. Asserts the cookie is
+// the session cookie rather than assuming it.
+fn sidFromSetCookie(raw: string): string {
+  let eq = indexOf(raw, "=")
+  assert(eq > 0, "no cookie name in Set-Cookie '${raw}'")
+  assert(
+    raw[0:eq] == sessionCookieName,
+    "want the '${sessionCookieName}' cookie, got '${raw[0:eq]}'",
+  )
+  let rest = raw[eq + 1:len(raw)]
+  let semi = indexOf(rest, ";")
+  if (semi < 0) {
+    return rest
+  }
+  return rest[0:semi]
+}
+
+// Issues a token the way a form page does: a GET to `/form`, whose handler
+// calls `c.csrfToken()`. Returns the session id the browser would carry back
+// (out of `Set-Cookie`) and the token the form would carry back (the body).
+fn issueToken(config: Config): (string, string) {
+  let res = csrfApp(config, true).handle(csrfReq("GET", "/form", []string(0), ""))
+  assert(res.status == 200, "issuing a token must be a 200, got ${res.status}")
+  let sid = sidFromSetCookie(res.getHeader(setCookieName))
+  assert(len(sid) > 0, "the form response must issue a session cookie")
+  return sid, res.body
+}
+
+// `csrfAllows`'s failure message, or "" when it did not fail. A misconfigured
+// app is the only thing that failure reports; a refused request is `false`.
+// Built directly rather than through `handle`, because the middleware turns
+// that failure into a panic and a panic carries no value back to a test.
+fn csrfConfigError(config: Config): string {
+  let req = csrfReq("POST", "/save", []string(0), "")
+  let c = newCtx(req, map<string, string>(), newNameRegistry(), config, "/save") catch e {
+    panic("newCtx: ${e.message()}")
+  }
+  let _ = csrfAllows(c) catch e {
+    return e.message()
+  }
+  return ""
+}
+
+// --- the refusals -----------------------------------------------------------
+
+test "a POST with no token to a csrf()-protected group is refused with 403" {
+  let config = csrfConfig()
+  let (sid, _) = issueToken(config)
+  let req = csrfReq("POST", "/save", []string{ cookieHeader(sid), formHeader }, "")
+  let status = runStatus(config, true, req)
+  assert(status == 403, "want 403 for a POST with no token, got ${status}")
+}
+
+test "a POST carrying another session's token is refused with 403" {
+  let config = csrfConfig()
+  let (mine, _) = issueToken(config)
+  let (other, otherToken) = issueToken(config)
+  assert(mine != other, "the two sessions must differ, both were '${mine}'")
+
+  let stolen = csrfReq(
+    "POST",
+    "/save",
+    []string{ cookieHeader(mine), formHeader },
+    csrfFieldName + "=" + otherToken,
+  )
+  assert(runStatus(config, true, stolen) == 403, "another session's token must not be accepted")
+
+  // The control: the SAME request under the session the token belongs to is
+  // accepted, so the 403 above is about the binding and not about the token
+  // being malformed or the harness being broken.
+  let own = csrfReq(
+    "POST",
+    "/save",
+    []string{ cookieHeader(other), formHeader },
+    csrfFieldName + "=" + otherToken,
+  )
+  assert(runStatus(config, true, own) == 201, "the token's own session must be accepted")
+}
+
+test "the refusal is byte-identical whether the token is missing or merely wrong" {
+  let config = csrfConfig()
+  let (sid, token) = issueToken(config)
+  let headers = []string{ cookieHeader(sid), formHeader }
+  let app = csrfApp(config, true)
+
+  let missing = app.handle(csrfReq("POST", "/save", headers, ""))
+  // Same length, one byte different: as close to right as a wrong token gets.
+  let wrong = app.handle(
+    csrfReq("POST", "/save", headers, csrfFieldName + "=" + flipLastHexDigit(token)),
+  )
+
+  assert(missing.status == 403, "a missing token must be 403, got ${missing.status}")
+  assert(wrong.status == 403, "a wrong token must be 403, got ${wrong.status}")
+  // Every field of the response, not merely "there is no body": the two must
+  // be indistinguishable to a client, and a body is only one of four ways
+  // they could differ.
+  assert(
+    missing.status == wrong.status,
+    "the statuses differ: ${missing.status} vs ${wrong.status}",
+  )
+  assert(len(missing.body) == 0, "a refusal must carry no body, got '${missing.body}'")
+  assert(missing.body == wrong.body, "the bodies differ: '${missing.body}' vs '${wrong.body}'")
+  assert(
+    missing.contentType == wrong.contentType,
+    "the content types differ: '${missing.contentType}' vs '${wrong.contentType}'",
+  )
+  assert(
+    missing.headers == wrong.headers,
+    "the headers differ: '${missing.headers}' vs '${wrong.headers}'",
+  )
+}
+
+// --- what is accepted -------------------------------------------------------
+
+test "a POST with the correct token in the _csrf form field reaches the handler" {
+  let config = csrfConfig()
+  let (sid, token) = issueToken(config)
+  let req = csrfReq(
+    "POST",
+    "/save",
+    []string{ cookieHeader(sid), formHeader },
+    "name=ada&" + csrfFieldName + "=" + token,
+  )
+  let status = runStatus(config, true, req)
+  assert(status == 201, "the POST handler's own status must reach the caller, got ${status}")
+}
+
+test "a POST with the correct token in the X-CSRF-Token header reaches the handler" {
+  let config = csrfConfig()
+  let (sid, token) = issueToken(config)
+  let req = csrfReq(
+    "POST",
+    "/save",
+    []string{ cookieHeader(sid), csrfHeaderName + ": " + token },
+    "",
+  )
+  let status = runStatus(config, true, req)
+  assert(status == 201, "a token in ${csrfHeaderName} must be accepted, got ${status}")
+}
+
+test "a GET with no token reaches the handler" {
+  let config = csrfConfig()
+  let (sid, _) = issueToken(config)
+  let req = csrfReq("GET", "/save", []string{ cookieHeader(sid) }, "")
+  let status = runStatus(config, true, req)
+  assert(status == 200, "GET is safe and must not be checked, got ${status}")
+}
+
+test "a POST to a group without csrf() reaches the handler" {
+  let config = csrfConfig()
+  let (sid, _) = issueToken(config)
+  let req = csrfReq("POST", "/save", []string{ cookieHeader(sid), formHeader }, "")
+  let status = runStatus(config, false, req)
+  assert(status == 201, "a group with no csrf() is the exemption, got ${status}")
+}
+
+// --- where a token may NOT come from ---------------------------------------
+
+test "a token in a query string parameter is not accepted" {
+  let config = csrfConfig()
+  let (sid, token) = issueToken(config)
+  let target = "/save?" + csrfFieldName + "=" + token
+  let headers = []string{ cookieHeader(sid), formHeader }
+
+  // The query really did carry the correct token: `/query` echoes it back
+  // through the same router and the same `Ctx`, so without this the test
+  // would pass just as well against a typo in the target string.
+  let echoed = csrfApp(config, true).handle(
+    csrfReq("GET", "/query?" + csrfFieldName + "=" + token, headers, ""),
+  )
+  assert(echoed.body == token, "the harness must actually put the token in the query")
+
+  let status = runStatus(config, true, csrfReq("POST", target, headers, ""))
+  assert(status == 403, "a query-string token must never be accepted, got ${status}")
+}
+
+test "the body is parsed for a form content type and for nothing else" {
+  let config = csrfConfig()
+  let (sid, token) = issueToken(config)
+  let body = csrfFieldName + "=" + token
+
+  let asForm = csrfReq("POST", "/save", []string{ cookieHeader(sid), formHeader }, body)
+  assert(runStatus(config, true, asForm) == 201, "a urlencoded body must be parsed")
+
+  let withParams = csrfReq(
+    "POST",
+    "/save",
+    []string{ cookieHeader(sid), formHeader + "; charset=UTF-8" },
+    body,
+  )
+  assert(runStatus(config, true, withParams) == 201, "a charset parameter must not stop the parse")
+
+  let asJson = csrfReq(
+    "POST",
+    "/save",
+    []string{ cookieHeader(sid), "Content-Type: application/json" },
+    body,
+  )
+  assert(
+    runStatus(config, true, asJson) == 403,
+    "a JSON body must not be scanned for a form field",
+  )
+}
+
+// --- which methods are checked ---------------------------------------------
+
+test "a PUT with no token is refused: only GET, HEAD and OPTIONS are exempt" {
+  let config = csrfConfig()
+  let (sid, token) = issueToken(config)
+  let headers = []string{ cookieHeader(sid), formHeader }
+
+  let bare = csrfReq("PUT", "/save", headers, "")
+  assert(runStatus(config, true, bare) == 403, "PUT must be checked")
+
+  let withToken = csrfReq("PUT", "/save", headers, csrfFieldName + "=" + token)
+  assert(
+    runStatus(config, true, withToken) == 202,
+    "a PUT with the right token must reach the handler",
+  )
+
+  let del = csrfReq("DELETE", "/save", headers, "")
+  assert(runStatus(config, true, del) == 403, "DELETE must be checked")
+}
+
+test "HEAD and OPTIONS are exempt, and method matching is case-sensitive" {
+  assert(csrfMethodIsExempt("GET"), "GET is safe")
+  assert(csrfMethodIsExempt("HEAD"), "HEAD is safe")
+  assert(csrfMethodIsExempt("OPTIONS"), "OPTIONS is safe")
+  assert(!csrfMethodIsExempt("POST"), "POST must be checked")
+  assert(!csrfMethodIsExempt("PUT"), "PUT must be checked")
+  assert(!csrfMethodIsExempt("PATCH"), "PATCH must be checked")
+  assert(!csrfMethodIsExempt("DELETE"), "DELETE must be checked")
+  // An HTTP method is a case-sensitive token: `get` is not `GET`, it is an
+  // unregistered method, and an unregistered method is not exempt.
+  assert(!csrfMethodIsExempt("get"), "a lowercased method must not be exempt")
+}
+
+// --- the comparison ---------------------------------------------------------
+
+test "the comparison examines every byte wherever the first difference falls" {
+  let n = 64
+  let base = repeat("a", n)
+  let differsFirst = "b" + base[1:n]
+  let differsLast = base[0:n - 1] + "b"
+
+  let (eqFirst, seenFirst) = constantTimeEqCounted(differsFirst, base)
+  assert(!eqFirst, "a difference at index 0 must not compare equal")
+  assert(
+    seenFirst == n,
+    "a difference at index 0 must still cost ${n} comparisons, got ${seenFirst}",
+  )
+
+  let (eqLast, seenLast) = constantTimeEqCounted(differsLast, base)
+  assert(!eqLast, "a difference at index ${n - 1} must not compare equal")
+  assert(
+    seenLast == n,
+    "a difference at index ${n - 1} must cost ${n} comparisons, got ${seenLast}",
+  )
+
+  // The property, stated directly: the work does not depend on WHERE the
+  // values diverge. An early-return compare gives 1 and ${n} here.
+  assert(
+    seenFirst == seenLast,
+    "the count must not depend on the position: ${seenFirst} vs ${seenLast}",
+  )
+
+  let (eqSame, seenSame) = constantTimeEqCounted(base, base)
+  assert(eqSame, "identical values must compare equal")
+  assert(seenSame == n, "an equal pair must cost ${n} comparisons, got ${seenSame}")
+}
+
+test "constantTimeEq agrees with std/crypto's ctEq" {
+  let pairs = []string{
+    "",
+    "a",
+    "ab",
+    "abc",
+    "abd",
+    "0123456789abcdef",
+    "0123456789abcdff",
+    repeat("z", 64),
+  }
+  let checked = 0
+  for a of pairs {
+    for b of pairs {
+      let mine = constantTimeEq(a, b)
+      let theirs = ctEq([]byte(a), []byte(b))
+      assert(mine == theirs, "constantTimeEq('${a}','${b}')=${mine} but ctEq=${theirs}")
+      checked = checked + 1
+    }
+  }
+  assert(
+    checked == len(pairs) * len(pairs),
+    "compared ${checked} pairs, expected ${len(pairs) * len(pairs)}",
+  )
+}
+
+test "a length mismatch is rejected without scanning, and a token is not a prefix match" {
+  let (eq, seen) = constantTimeEqCounted("abc", "abcd")
+  assert(!eq, "different lengths cannot be equal")
+  assert(seen == 0, "a length mismatch scans nothing, got ${seen}")
+  let (eqEmpty, _) = constantTimeEqCounted("", "abc")
+  assert(!eqEmpty, "an absent token must never match a real one")
+}
+
+// --- the token --------------------------------------------------------------
+
+test "the token is bound to both the session id and the secret" {
+  let config = csrfConfig()
+  let (sidA, tokenA) = issueToken(config)
+  let (sidB, tokenB) = issueToken(config)
+  assert(sidA != sidB, "two sessions must have different ids")
+  assert(tokenA != tokenB, "two sessions must get different tokens")
+  assert(len(tokenA) == 64, "HMAC-SHA256 hex is 64 characters, got ${len(tokenA)}")
+
+  // Same session id, different secret: the token must move. Without this a
+  // token that ignored `Config.secret` entirely would pass every other test
+  // in this file. The store is shared, so the id really is adopted rather
+  // than re-minted — asserted, because a rotated id would move the token for
+  // the wrong reason.
+  let other = Config{ secret: "a-different-secret", sessions: config.sessions }
+  let res = csrfApp(other, true).handle(
+    csrfReq("GET", "/form", []string{ cookieHeader(sidA) }, ""),
+  )
+  assert(res.status == 200, "the control request must reach the handler, got ${res.status}")
+  assert(
+    len(res.getHeader(setCookieName)) == 0,
+    "the control requires the same session id: a Set-Cookie means it was rotated",
+  )
+  assert(res.body != tokenA, "the token must depend on Config.secret")
+}
+
+// #4483's contract, proven from outside: a session minted during a request
+// and carrying no keys of its own keeps its id, so a token bound to that id
+// is still the expected one when the form comes back. Before #4483 a store
+// miss WAS the empty map, `loadSession` rotated the id, and every token
+// issued to an anonymous visitor failed its own check.
+test "a token issued to a first-time visitor survives to the next request" {
+  let config = csrfConfig()
+  // The whole round trip, exactly as a browser does it: a GET that renders a
+  // form to a client with no cookie at all, then the POST that submits it.
+  let (sid, token) = issueToken(config)
+
+  let post = csrfReq(
+    "POST",
+    "/save",
+    []string{ cookieHeader(sid), formHeader },
+    csrfFieldName + "=" + token,
+  )
+  let status = runStatus(config, true, post)
+  assert(status == 201, "a first-time visitor's own token must be accepted, got ${status}")
+}
+
+// --- misconfiguration is not a refusal --------------------------------------
+
+test "csrf() with no session store fails naming the sessions field" {
+  let message = csrfConfigError(Config{ secret: "test-secret" })
+  assert(contains(message, "sessions"), "the failure must name the `sessions` field: '${message}'")
+}
+
+test "csrf() with an empty secret fails naming the secret field" {
+  let message = csrfConfigError(Config{ secret: "", sessions: MemoryStore() })
+  assert(contains(message, "secret"), "the failure must name the `secret` field: '${message}'")
+}
+
+// A misconfigured app must NOT be answered with the same 403 a hostile
+// request gets — that would turn a deployment mistake into a site that is
+// silently broken with a plausible-looking status. `testpanic_` inverts the
+// verdict (SPEC §18.4): this PASSES only if the process really panics.
+test "testpanic_csrf_middleware_panics_when_no_session_store_is_configured" {
+  let config = Config{ secret: "test-secret" }
+  let req = csrfReq("POST", "/save", []string(0), "")
+  let _ = runStatus(config, true, req)
+}
+
+// The last hex digit of `token`, replaced with a different one: a token of
+// the same length that differs in exactly one byte, at the END — the case a
+// compare that stopped early would be fastest to reject.
+fn flipLastHexDigit(token: string): string {
+  let last = token[len(token) - 1:len(token)]
+  let replacement = "0"
+  if (last == "0") {
+    replacement = "1"
+  }
+  return token[0:len(token) - 1] + replacement
+}
