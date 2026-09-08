@@ -1,10 +1,52 @@
 // Self-host Stage 2 (#1339): the size-budgeted inlining pass. Split out of
 // opt.bit (#1503).
 
-// ponytail: size-budget heuristic — small leaf helpers only; retune once a real
-// corpus shows the right number.
+// The splice budget for a callee that itself CALLS something, in IR
+// instructions of its own body (calleeInstCount).
+//
+// 8 is measured, not a default. #4344 swept it uniformly at 8/16/32/48/64 over
+// the tree-compiled aarch64-macos runtime archive and found the static `bl`
+// count RISES past 8 — br26 in runtime_root.o 789 -> 892 at 16, the archive
+// +8.6% — because a bigger callee brings its own calls to every site it is
+// spliced into, which lengthens the splice CHAIN and pushes the leaves past
+// maxInlineDepth(). Raising THIS number buys calls, it does not remove them.
 fn maxInlineInsts(): int {
   return 8
+}
+
+// The splice budget for a callee that calls NOTHING (calleeIsLeaf).
+// Deliberately larger, and the reason is the one #4344's sweep measured but did
+// not separate: every cost that made a uniform raise lose is a cost of the
+// callee's OWN calls.
+//
+// A leaf carries no call to the site it lands in, so it cannot lengthen a
+// chain, cannot push another callee past maxInlineDepth(), and cannot hand an
+// out-of-object call to a new object. Its whole cost is its own body, once per
+// site, and that is exactly what calleeInstCount already measures. One budget
+// was pricing a leaf at the rate a non-leaf's chain growth deserves.
+//
+// #4420 re-ran #4344's table with this split, same method (a stage0-built
+// compiler per row, then `BIT=<that> scripts/g2archive.sh aarch64-macos`), on
+// a820b711. `br26` counts ARM64_RELOC_BRANCH26 relocations — the static call
+// sites — `_root` in runtime_root.o and `_all` over all 25 objects:
+//
+//   leaf   archive  br26_root  ->_scalarHash  br26_all  insts   json_bytes  json_bl
+//     8    906922       546          8          2092    47473     351731      1371
+//    13    909034       538          0          2032    47701     351540      1332
+//    16    909034       538          0          2032    47701     351540      1332
+//    24    913898       535          0          2009    48133     351540      1317
+//
+// Row 8 reproduces main byte for byte, which is what makes the rest a
+// measurement rather than four builds. Calls now FALL instead of rising: -60
+// static call sites for +0.23% of bytes, against #4344's uniform 16 which
+// bought +103 calls for +8.6%. 13 and 16 are the SAME build — nothing in this
+// corpus is a leaf of 14..16 IR instructions — so 16 costs nothing over the 13
+// `runtime/root/maps.bit`'s `scalarHash` needs (splitmix64's finaliser: one
+// block, no branches, no memory, 13 IR instructions of which 5 are `const_int`,
+// 8 `bl` sites in runtime_root.o) and is not a constant fitted to one function.
+// 24 keeps improving (-83 calls, +0.77% bytes); its own ticket, its own cycles.
+fn maxInlineLeafInsts(): int {
+  return 16
 }
 
 // How many levels of callee body one call site may absorb (#3163). Level 1 is
@@ -37,8 +79,10 @@ fn maxInlineInsts(): int {
 // because an eligible body is under maxInlineInsts() and the leaves are reached
 // at the second level.
 //
-// Growth is bounded by maxInlineInsts() per level, so the worst case a call
-// site can absorb is maxInlineInsts()^maxInlineDepth() instructions.
+// Growth is bounded by the per-callee budget at each level, so the worst case a
+// call site can absorb is maxInlineInsts()^(maxInlineDepth()-1) *
+// maxInlineLeafInsts(): only the LAST level can be a leaf, because a leaf
+// contains no call for the next level to reach.
 fn maxInlineDepth(): int {
   return 2
 }
@@ -194,6 +238,40 @@ fn calleeInstCount(g: IrFunc): int {
   return n
 }
 
+// True if `g` issues no call of any kind, so a splice of it hands the caller
+// nothing for the next level of `spliceNested` to reach.
+//
+// Every op that transfers control to code this function does not contain, and
+// no others: `Op.FuncAddr` and `Op.MakeClosure` only NAME a function, and
+// `Op.CallWord` is a word of the call it follows, already counted by it.
+// `Op.Asm` is in the set because an `asm volatile` body is opaque — a budget
+// that assumed otherwise would be a claim about text this pass never reads.
+fn calleeIsLeaf(g: IrFunc): bool {
+  let i = 0
+  while (i < len(g.instrs)) {
+    let op = g.instrs[i].op
+    if (op == Op.Call ||
+      op == Op.CallValue ||
+      op == Op.CallIface ||
+      op == Op.RtCall ||
+      op == Op.Syscall ||
+      op == Op.Asm) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// The budget `g` is judged against: see maxInlineLeafInsts for why a leaf gets
+// its own, larger one.
+fn inlineBudget(g: IrFunc): int {
+  if (calleeIsLeaf(g)) {
+    return maxInlineLeafInsts()
+  }
+  return maxInlineInsts()
+}
+
 fn inlineEligible(
   m: IrModule, snap: []IrFunc, callerIdx: int, calleeIdx: int,
   argCount: int,
@@ -225,7 +303,7 @@ fn inlineEligible(
   if (importsForeignCall(snap, f, g)) {
     return false
   }
-  return calleeInstCount(g) <= maxInlineInsts()
+  return calleeInstCount(g) <= inlineBudget(g)
 }
 
 // True if splicing `callee` into `caller` would move a reference to a module
