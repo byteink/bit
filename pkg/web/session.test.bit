@@ -1,0 +1,315 @@
+// pkg/web/session.test.bit — #3947's acceptance: a session survives from one
+// request to the next through a store and a cookie, an app that forgot to
+// configure a store is told so, a destroyed session is really gone, the
+// cookie carries all four attributes, and the ids come from a CSPRNG.
+//
+// A "request" here is a `Request` built by hand plus `newCtx` — the same
+// seam ctx.test.bit already uses. That is the whole request path this
+// package has: there is no server yet (#3885) and no response layer (#3884),
+// so the two requests of a round trip are two `Ctx` values sharing one
+// `Config`, which is exactly what a served pair would be.
+//
+// `contains` (router.test.bit) and `Request` (ctx.bit) are already imported
+// module-wide — reused here, not re-imported (E0042). `decodeHex` is new to
+// the module.
+
+import { decodeHex } from "std/crypto"
+
+// A request carrying `cookie` as its `Cookie` header, or none when it is "".
+fn sessReq(cookie: string): Request {
+  if (len(cookie) == 0) {
+    return Request{ method: "GET", path: "/x", headers: "", body: "" }
+  }
+  return Request{ method: "GET", path: "/x", headers: "Cookie: " + cookie, body: "" }
+}
+
+// One simulated request against `cfg`, presenting `cookie`.
+fn sessCtx(cfg: Config, cookie: string): Ctx {
+  return newCtx(sessReq(cookie), map<string, string>(), newNameRegistry(), cfg) catch e {
+    panic("newCtx: ${e.message()}")
+  }
+}
+
+fn memConfig(): Config {
+  return Config{ secret: "test-secret", sessions: MemoryStore() }
+}
+
+// `c.session()`'s error message, or "" when it succeeded. `session()` is
+// fallible with a non-void result, so the `catch` block of a bare-statement
+// call must divert (ctx.test.bit's own note) — `return` is the diversion.
+fn sessionError(c: Ctx): string {
+  c.session() catch e {
+    return e.message()
+  }
+  return ""
+}
+
+fn mustSession(c: Ctx): Session {
+  return c.session() catch e {
+    panic("session: ${e.message()}")
+  }
+}
+
+fn mustSave(s: Session) {
+  s.save() catch e {
+    panic("save: ${e.message()}")
+  }
+}
+
+// --- the round trip ---------------------------------------------------
+
+test "a value set in one request is read back in the next request carrying the same cookie" {
+  let cfg = memConfig()
+
+  // Request 1: no cookie at all, so the framework mints an id.
+  let c1 = sessCtx(cfg, "")
+  let s1 = mustSession(c1)
+  assert(s1.isNew(), "a request with no cookie must start a new session")
+  s1.set("userId", "42")
+  mustSave(s1)
+
+  // Request 2: the browser sends back exactly what the Set-Cookie named.
+  let c2 = sessCtx(cfg, sessionCookieName + "=" + s1.id())
+  let s2 = mustSession(c2)
+  assert(!s2.isNew(), "a cookie that hits the store must not mint a new id")
+  assert(s2.id() == s1.id(), "id changed across the round trip: '${s2.id()}' vs '${s1.id()}'")
+  assert(s2.get("userId") == "42", "round trip lost the value: got '${s2.get("userId")}'")
+  // The negative side, so a store that returned every key for every id would
+  // still fail this: only what was set comes back.
+  assert(s2.get("nothing") == "", "an unset key must read as empty, got '${s2.get("nothing")}'")
+}
+
+test "the cookie carries the id and no session data" {
+  // Both the key and the value are spelled with letters outside the hex
+  // alphabet on purpose: a random hex id contains any given two-hex-digit
+  // string ("42") often enough that such a probe fails ~1 run in 8 whatever
+  // the code does. Caught by this fixture doing exactly that on its first
+  // run — a flaky assertion is a broken assertion.
+  let cfg = memConfig()
+  let s1 = mustSession(sessCtx(cfg, ""))
+  s1.set("userName", "zebra")
+  mustSave(s1)
+  let cookie = s1.cookie()
+  assert(!contains(cookie, "userName"), "a session key leaked into the cookie: '${cookie}'")
+  assert(!contains(cookie, "zebra"), "a session value leaked into the cookie: '${cookie}'")
+}
+
+// --- no store configured ----------------------------------------------
+
+test "an app with no session store refuses the first c.session(), naming the sessions field" {
+  // `testApp()` (app.test.bit) is `Config{ secret: "test-secret" }` — the
+  // literal every other test in this package writes, with `sessions` left
+  // out. That omission compiling at all is half of what this asserts.
+  let app = testApp()
+  let msg = sessionError(sessCtx(app.config, ""))
+  assert(msg != "", "c.session() with no store must fail, it returned a session")
+  assert(contains(msg, "sessions"), "the failure must name the `sessions` field, got: ${msg}")
+}
+
+test "the refusal survives a request that presents a cookie" {
+  // A forged cookie must not route around the missing-store check: the store
+  // is consulted after it, never before.
+  let app = testApp()
+  let msg = sessionError(sessCtx(app.config, sessionCookieName + "=deadbeef"))
+  assert(contains(msg, "sessions"), "expected the `sessions` refusal, got: ${msg}")
+}
+
+test "a configured store makes the very same access succeed" {
+  // The control for the two refusals above: without it, a `session()` that
+  // failed unconditionally would pass both.
+  let msg = sessionError(sessCtx(memConfig(), ""))
+  assert(msg == "", "c.session() with a store configured must succeed, got: ${msg}")
+}
+
+// --- destroy ----------------------------------------------------------
+
+test "destroy() makes a later request with the same cookie miss, and issues a fresh id" {
+  let cfg = memConfig()
+
+  let s1 = mustSession(sessCtx(cfg, ""))
+  s1.set("userId", "42")
+  mustSave(s1)
+  let sid = s1.id()
+
+  // The control: the id works before it is destroyed. Without this, a store
+  // that never wrote anything would "pass" the miss below.
+  let s2 = mustSession(sessCtx(cfg, sessionCookieName + "=" + sid))
+  assert(s2.get("userId") == "42", "precondition: the session must exist before destroy()")
+  s2.destroy() catch e {
+    panic("destroy: ${e.message()}")
+  }
+
+  let s3 = mustSession(sessCtx(cfg, sessionCookieName + "=" + sid))
+  assert(s3.get("userId") == "", "destroy() left the value readable: '${s3.get("userId")}'")
+  assert(s3.id() != sid, "a destroyed id must not be adopted again, got '${s3.id()}'")
+  assert(s3.isNew(), "the request after destroy() must start a new session")
+}
+
+test "destroy() is idempotent and stops a later save() resurrecting the session" {
+  let cfg = memConfig()
+  let s = mustSession(sessCtx(cfg, ""))
+  s.set("userId", "42")
+  mustSave(s)
+  let sid = s.id()
+  s.destroy() catch e {
+    panic("destroy: ${e.message()}")
+  }
+  s.destroy() catch e {
+    panic("second destroy must be a no-op, not a failure: ${e.message()}")
+  }
+  // The framework saves at end of request; that must not undo the handler's
+  // revocation.
+  mustSave(s)
+  let after = mustSession(sessCtx(cfg, sessionCookieName + "=" + sid))
+  assert(after.get("userId") == "", "save() after destroy() resurrected the session")
+}
+
+test "testpanic_set_after_destroy" {
+  // `set()` on a destroyed session would mutate a map that is never written
+  // again — silent data loss. It panics instead, the same policy app.bit
+  // applies to registering a route after listen(). A `testpanic_`-named test
+  // PASSES only when the child process dies by the runtime's own panic exit
+  // status (#2839, compiler/testgen.bit).
+  let s = mustSession(sessCtx(memConfig(), ""))
+  s.destroy() catch e {
+    panic("destroy: ${e.message()}")
+  }
+  s.set("userId", "42")
+}
+
+// --- the cookie -------------------------------------------------------
+
+test "the Set-Cookie value carries HttpOnly, SameSite=Lax, Secure and Path=/" {
+  let s = mustSession(sessCtx(memConfig(), ""))
+  let cookie = s.cookie()
+  assert(contains(cookie, "HttpOnly"), "cookie is missing HttpOnly: '${cookie}'")
+  assert(contains(cookie, "SameSite=Lax"), "cookie is missing SameSite=Lax: '${cookie}'")
+  assert(contains(cookie, "Secure"), "cookie is missing Secure: '${cookie}'")
+  assert(contains(cookie, "Path=/"), "cookie is missing Path=/: '${cookie}'")
+  assert(
+    contains(cookie, sessionCookieName + "=" + s.id()),
+    "cookie must carry this session's id: '${cookie}'",
+  )
+}
+
+// --- the id -----------------------------------------------------------
+
+test "two freshly issued session ids differ and each decodes to at least 16 bytes" {
+  let cfg = memConfig()
+  let a = mustSession(sessCtx(cfg, "")).id()
+  let b = mustSession(sessCtx(cfg, "")).id()
+  assert(a != b, "two fresh ids must differ, both were '${a}'")
+  assert(len(decodeId(a)) >= 16, "id '${a}' decodes to ${len(decodeId(a))} byte(s), want >= 16")
+  assert(len(decodeId(b)) >= 16, "id '${b}' decodes to ${len(decodeId(b))} byte(s), want >= 16")
+}
+
+test "an issued id is not a counter, a timestamp, or a constant" {
+  // 16 ids drawn in a row: every one distinct. A counter, a timestamp with
+  // second resolution, or a constant would collide here; only the CSPRNG
+  // passes. 16 draws of 128 bits collide with probability ~1e-36.
+  let cfg = memConfig()
+  let seen = map<string, bool>()
+  let i = 0
+  while (i < 16) {
+    seen[mustSession(sessCtx(cfg, "")).id()] = true
+    i = i + 1
+  }
+  assert(len(seen) == 16, "16 draws produced ${len(seen)} distinct id(s)")
+}
+
+fn decodeId(id: string): []byte {
+  return decodeHex(id) catch e {
+    panic("session id '${id}' is not decodable: ${e.message()}")
+  }
+}
+
+// --- the cookie header, as clients really send it ---------------------
+
+test "the session cookie is found beside other cookies, and across split Cookie headers" {
+  let cfg = memConfig()
+  let s1 = mustSession(sessCtx(cfg, ""))
+  s1.set("userId", "42")
+  mustSave(s1)
+
+  let beside = sessCtx(cfg, "theme=dark; " + sessionCookieName + "=" + s1.id() + "; lang=en")
+  assert(
+    mustSession(beside).get("userId") == "42",
+    "the session cookie must be found among its neighbours",
+  )
+
+  // A client may legally split its cookies over several `Cookie` lines.
+  let req = Request{
+    method: "GET",
+    path: "/x",
+    headers: "Cookie: theme=dark\r\nCookie: " + sessionCookieName + "=" + s1.id(),
+    body: "",
+  }
+  let split2 = newCtx(req, map<string, string>(), newNameRegistry(), cfg) catch e {
+    panic("newCtx: ${e.message()}")
+  }
+  assert(
+    mustSession(split2).get("userId") == "42",
+    "the session cookie must be found in a second Cookie header",
+  )
+}
+
+test "an unknown or forged id is replaced, never adopted" {
+  // Session fixation: adopting an attacker-chosen id would let them know the
+  // id a victim's login lands on.
+  let forged = "00000000000000000000000000000000"
+  let s = mustSession(sessCtx(memConfig(), sessionCookieName + "=" + forged))
+  assert(s.id() != forged, "a forged id was adopted")
+  assert(s.isNew(), "a forged id must start a new session")
+}
+
+// --- one session per request ------------------------------------------
+
+test "c.session() hands back the same session on every call in one request" {
+  let c = sessCtx(memConfig(), "")
+  let a = mustSession(c)
+  a.set("userId", "42")
+  let b = mustSession(c)
+  assert(b.id() == a.id(), "a second c.session() minted a second id: '${b.id()}'")
+  assert(
+    b.get("userId") == "42",
+    "a value set through the first handle was invisible to the second",
+  )
+}
+
+test "a request that never asks for a session touches neither the store nor the CSPRNG" {
+  // The laziness that makes the refusal tolerable: `newCtx` must not mint an
+  // id or write to the store for a request whose handler never calls
+  // `session()`.
+  let store = MemoryStore()
+  let c = sessCtx(Config{ secret: "x", sessions: store }, "")
+  assert(len(store.entries) == 0, "constructing a Ctx wrote ${len(store.entries)} session(s)")
+  mustSession(c)
+  assert(len(store.entries) == 0, "an unsaved session must not be written")
+}
+
+test "save() writes only when something changed" {
+  let store = MemoryStore()
+  let cfg = Config{ secret: "x", sessions: store }
+  let s = mustSession(sessCtx(cfg, ""))
+  mustSave(s)
+  assert(len(store.entries) == 0, "save() wrote an untouched session")
+  s.set("userId", "42")
+  mustSave(s)
+  assert(len(store.entries) == 1, "save() did not write a changed session")
+}
+
+test "delete() removes a key and the removal survives the round trip" {
+  let cfg = memConfig()
+  let s1 = mustSession(sessCtx(cfg, ""))
+  s1.set("userId", "42")
+  s1.set("theme", "dark")
+  mustSave(s1)
+
+  let s2 = mustSession(sessCtx(cfg, sessionCookieName + "=" + s1.id()))
+  s2.delete("userId")
+  mustSave(s2)
+
+  let s3 = mustSession(sessCtx(cfg, sessionCookieName + "=" + s1.id()))
+  assert(s3.get("userId") == "", "delete() did not survive: '${s3.get("userId")}'")
+  assert(s3.get("theme") == "dark", "delete() took the wrong key: theme is '${s3.get("theme")}'")
+}
