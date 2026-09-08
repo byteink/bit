@@ -1,0 +1,367 @@
+// Bit standard library — http module: reading a request off the wire.
+//
+// The server-side read path, split out of `http.bit` (#4565) so both files
+// stay under the 800-line ceiling: `readMessage` and everything it calls to
+// frame one HTTP/1.1 request — the header block, the `Content-Length` body,
+// the chunked decoder — plus the two byte budgets that bound them. Same
+// module as `http.bit` (SPEC §19), so nothing here is imported: `byteStream`,
+// `Request`, `header`, `hexToInt`, `atoi` and the rest are siblings.
+
+// ---------------------------------------------------------------------------
+// Reading a message off a connection
+// ---------------------------------------------------------------------------
+
+// Reads from `s`, appending to `buf`, until `buf` contains `delim`. Returns the
+// text before the first `delim` and whatever of `buf` came after it (bytes
+// already buffered past the delimiter — e.g. the start of a chunk body or the
+// next header line). Fails if the peer closes before `delim` ever appears.
+// The last `n` bytes of `s`, or all of `s` when it is shorter. `n` is
+// `len(delim) - 1` at both call sites: the widest window a delimiter match
+// can straddle when the next chunk arrives.
+fn lastBytes(s: string, n: int): string {
+  if (len(s) <= n) {
+    return s
+  }
+  return s[len(s) - n:len(s)]
+}
+
+// The index, within an accumulated buffer of `accLen` bytes followed by
+// `chunk`, of the first `delim` — or -1 if there is none. `tail` is that
+// buffer's last `len(delim) - 1` bytes, and the buffer is already known to
+// contain no `delim`, so a match can only start inside `tail`: scanning
+// `tail + chunk` is O(len(chunk)) per read where re-scanning the whole buffer
+// would be O(accLen). That is what lets an accumulate-until-delimiter loop
+// keep its accumulator in a Builder — it never has to be materialised as a
+// string until the delimiter is actually found.
+fn delimIndex(accLen: int, tail: string, chunk: string, delim: string): int {
+  let hit = indexOf(tail + chunk, delim)
+  if (hit < 0) {
+    return -1
+  }
+  return accLen - len(tail) + hit
+}
+
+fn readUntil(s: byteStream, buf: string, delim: string): (string, string)! {
+  let at = indexOf(buf, delim)
+  if (at >= 0) {
+    return buf[0:at], buf[at + len(delim):len(buf)]
+  }
+  let back = len(delim) - 1
+  let acc = newBuilder()
+  acc.write(buf)
+  let n = len(buf)
+  let tail = lastBytes(buf, back)
+  while (true) {
+    let chunk = s.readUp(4096)?
+    if (len(chunk) == 0) {
+      fail newError("readMessage: connection closed mid-message")
+    }
+    let hit = delimIndex(n, tail, chunk, delim)
+    acc.write(chunk)
+    n = n + len(chunk)
+    if (hit >= 0) {
+      let all = acc.toString()
+      return all[0:hit], all[hit + len(delim):len(all)]
+    }
+    tail = lastBytes(tail + chunk, back)
+  }
+}
+
+// Decodes a `Transfer-Encoding: chunked` body (RFC 9112 §7.1) off `s`,
+// `buffered` being whatever body-position bytes already arrived with the
+// headers. Fails on a non-hex chunk-size, a stream that closes mid-chunk, or a
+// chunk stream that never terminates within `maxChunks` — bounded so the loop
+// is provably finite (Power of 10 rule 2), not to cap a legitimately large body.
+// Reads 4096-byte chunks from `s` onto `have` until it holds at least `n`
+// bytes. Split out of `decodeChunkedBody` (#4028) so the chunk-fill
+// accumulates into a Builder without spending a branch from that function's
+// own complexity budget; the loop it replaces there re-copied the whole
+// partially-filled chunk on every read.
+fn fillTo(s: byteStream, have: string, n: int): string! {
+  if (len(have) >= n) {
+    return have
+  }
+  let b = newBuilder()
+  b.write(have)
+  let got = len(have)
+  while (got < n) {
+    let chunk = s.readUp(4096)?
+    if (len(chunk) == 0) {
+      fail newError("readMessage: connection closed mid-chunk")
+    }
+    b.write(chunk)
+    got = got + len(chunk)
+  }
+  return b.toString()
+}
+
+fn decodeChunkedBody(s: byteStream, buffered: string, maxBodyBytes: int): string! {
+  let maxChunks = 1048576
+  let buf = buffered
+  let body = newBuilder()
+  let n = 0
+  // Bytes of decoded body accumulated so far. A chunked body declares no
+  // total length, so `maxBodyBytes` can only be enforced here, as the sizes
+  // add up — the one budget it is easiest to forget.
+  let total = 0
+  while (n < maxChunks) {
+    n = n + 1
+    let (sizeLine, rest) = readUntil(s, buf, "\r\n")?
+    buf = rest
+    let hexPart = sizeLine
+    let semi = indexOf(sizeLine, ";")
+    if (semi >= 0) {
+      hexPart = sizeLine[0:semi]
+    }
+    let size = hexToInt(trimSpace(hexPart))
+    if (size < 0) {
+      fail newError("readMessage: bad chunk size")
+    }
+    // Refused on the DECLARED size, before `fillTo` reads a byte of it: a
+    // single chunk claiming 4 GiB is rejected without allocating 4 GiB, and a
+    // stream of small chunks is rejected on the one that crosses the budget.
+    // Written as a subtraction, not `total + size > maxBodyBytes`: `total` is
+    // never above `maxBodyBytes` (this check is what keeps it there), so the
+    // left side cannot overflow, while the addition could for a chunk size
+    // near the top of the range and would then compare as negative.
+    if (size > maxBodyBytes - total) {
+      fail newError("readMessage: chunked body exceeds ${maxBodyBytes} bytes")
+    }
+    total = total + size
+    if (size == 0) {
+      // The final chunk: consume the (usually empty) trailer section, one
+      // field line at a time, up to and including its terminating blank line.
+      let t = 0
+      while (t < maxChunks) {
+        t = t + 1
+        let (line, rest2) = readUntil(s, buf, "\r\n")?
+        buf = rest2
+        if (len(line) == 0) {
+          return body.toString()
+        }
+      }
+      fail newError("readMessage: too many trailer fields")
+    }
+    buf = fillTo(s, buf, size + 2)?
+    body.write(buf[0:size])
+    buf = buf[size + 2:len(buf)]
+  }
+  fail newError("readMessage: too many chunks")
+}
+
+// Whether `headBlock` (the request line plus header lines, before splitting)
+// carries a bare CR, a bare LF, or a NUL. RFC 9110 §5.5 forbids all three in a
+// field value; letting one survive lets a single header line on the wire
+// masquerade as several once something reflects it — e.g. a bare LF inside a
+// header value is not a line terminator to this parser, so it stays embedded
+// in that header's value, and anything after it (`Set-Cookie: admin=1`, say)
+// rides along as attacker-controlled text inside what the application sees as
+// one ordinary value. Scanning the whole block, not just header values, also
+// catches an attempt to smuggle one through the request line.
+fn hasBareControlChar(headBlock: string): bool {
+  let i = 0
+  while (i < len(headBlock)) {
+    let c = headBlock[i]
+    if (c == '\0') {
+      return true
+    }
+    if (c == '\n' && (i == 0 || headBlock[i - 1] != '\r')) {
+      return true
+    }
+    if (c == '\r' && (i + 1 >= len(headBlock) || headBlock[i + 1] != '\n')) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Header block size cap, checked while `readMessage` is still accumulating
+// the request line and headers; the body has its own budget below.
+// Deny by default: nothing else stops a peer that never sends the
+// terminating blank line from growing `buf` without limit while this loop
+// keeps reading. 64 KiB is generous for any real request (ordinary headers
+// run a few hundred bytes) and is the same order of magnitude other servers
+// use as a hard ceiling (nginx's 8 KiB per line, Node's ~16 KiB total
+// default).
+const maxHeaderBytes = 65536
+
+// The body a server will read off one request, in bytes, before the read is
+// refused (#4565). Every `readMessage` caller passes one; this is the default
+// a `Server`/`TlsServer` starts with, and `setMaxBodyBytes` (server.bit)
+// raises or lowers it.
+//
+// Deny by default, the same way `maxHeaderBytes` does. Until this existed, a
+// request declaring `Content-Length: 4294967296` had those bytes read and
+// resident before any handler — or any framework limit above it, such as
+// `pkg/web`'s `Config.maxBody` — could look at the request at all, so the
+// limit above was a limit on what got PARSED, not on what got read.
+//
+// 32 MiB matches `multipart.bit`'s `defaultLimits().maxBodyBytes`, which is
+// the same bound for the one body shape that already had one. As there, zero
+// means "refuse every body", not "unlimited": there is no unlimited value,
+// which is the point.
+const defaultMaxBodyBytes = 32 * 1024 * 1024
+
+// Reads a full HTTP message off `s`: the request line, headers, and a body
+// framed per RFC 9112 §6 — `Content-Length` bytes read exactly (truncating
+// anything beyond, e.g. a pipelined next request), `Transfer-Encoding: chunked`
+// decoded, and no framing header meaning no body, whatever bytes happened to
+// already be sitting in the read buffer. Fails — the caller answers 400 — on a
+// message declaring both `Content-Length` and `Transfer-Encoding`, an
+// unparsable `Content-Length`, an unsupported transfer coding, a malformed
+// chunk stream, a bare CR/LF/NUL inside the header block (RFC 9110 §5.5 —
+// left unrejected, that is a response-header-injection primitive for any
+// handler that reflects a header value), a header block over
+// `maxHeaderBytes`, or a body over `maxBodyBytes` — the last refused on the
+// declared Content-Length, or on the running total of chunk sizes, before the
+// bytes are read (#4565). An empty method/path/headers/body `Request` (no failure)
+// means the peer closed before a complete header block arrived; the caller's
+// subsequent write will simply fail against the already-closed socket.
+// Reads through the blank line that ends a message's headers and returns the
+// whole accumulated buffer: the header block, its terminating CRLFCRLF, and
+// whatever body bytes already arrived with it. "" means the peer went away
+// before the headers were complete, and nothing else can return it — the loop
+// only exits once a four-byte terminator is already in `buf`. Split out of
+// `readMessage` (#2448); returns that raw buffer rather than a three-field
+// result class so the per-request read path does not allocate one (#3644).
+// The caller slices exactly the two strings the class used to carry, so the
+// object is removed and no copying is added.
+fn readThroughHeaderEnd(s: byteStream): string! {
+  let delim = "\r\n\r\n"
+  let acc = newBuilder()
+  let n = 0
+  let tail = ""
+  // Same cap as before: the loop is left, and the message below raised, once
+  // the accumulated block passes `maxHeaderBytes` with no terminator in it.
+  // A terminator that arrives in the chunk which crosses the cap is still
+  // accepted, exactly as the pre-#4028 `indexOf`-first loop accepted it.
+  while (n <= maxHeaderBytes) {
+    let chunk = s.readUp(4096)?
+    if (len(chunk) == 0) {
+      return ""
+    }
+    let hit = delimIndex(n, tail, chunk, delim)
+    acc.write(chunk)
+    n = n + len(chunk)
+    if (hit >= 0) {
+      return acc.toString()
+    }
+    tail = lastBytes(tail + chunk, len(delim) - 1)
+  }
+  fail newError("readMessage: header block exceeds ${maxHeaderBytes} bytes")
+}
+
+// Reads the remaining `cl - len(initial)` bytes of a Content-Length-framed
+// request body onto `initial`. Unlike the response-side twin
+// (`readContentLengthBody`, client.bit), a peer closing early is tolerated
+// (`break`, not `fail`) — request framing has always been lenient here.
+// Split out of `readMessage` (#2448).
+fn readRequestContentLengthBody(s: byteStream, initial: string, cl: int): string! {
+  if (len(initial) >= cl) {
+    return initial[0:cl]
+  }
+  let body = newBuilder()
+  body.write(initial)
+  let have = len(initial)
+  while (have < cl) {
+    let chunk = s.readUp(4096)?
+    if (len(chunk) == 0) {
+      break
+    }
+    // Truncate the OVERSHOOTING CHUNK rather than the accumulated body, which
+    // is the same `cl` bytes kept and the same excess dropped, without
+    // re-slicing everything read so far on every read.
+    if (have + len(chunk) > cl) {
+      chunk = chunk[0:cl - have]
+    }
+    body.write(chunk)
+    have = have + len(chunk)
+  }
+  return body.toString()
+}
+
+// Frame the body per RFC 9112 §6. Content-Length and Transfer-Encoding
+// together is a request-smuggling-grade ambiguity — reject outright rather
+// than pick one. Chunked is decoded, never handed through as raw framing.
+// Neither header present means no body, regardless of what already arrived.
+// Split out of `readMessage` (#2448).
+fn readRequestBody(s: byteStream, bodyStart: string, headers: string, maxBodyBytes: int): string! {
+  let clText = header(headers, "content-length")
+  let teText = toLower(header(headers, "transfer-encoding"))
+  let hasCl = len(clText) > 0
+  let hasTe = len(teText) > 0
+  if (hasCl && hasTe) {
+    fail newError("readMessage: Content-Length and Transfer-Encoding both present")
+  }
+  if (hasTe) {
+    if (teText != "chunked") {
+      fail newError("readMessage: unsupported Transfer-Encoding")
+    }
+    return decodeChunkedBody(s, bodyStart, maxBodyBytes)?
+  }
+  if (hasCl) {
+    let cl = atoi(clText)
+    if (cl < 0) {
+      fail newError("readMessage: invalid Content-Length")
+    }
+    // On the DECLARED length, before `readRequestContentLengthBody` allocates
+    // or reads anything: the peer's own number is the whole basis of the
+    // read, so refusing it here is what stops the bytes from ever becoming
+    // resident. Refusing after the read would be a parse limit, not a read
+    // limit.
+    if (cl > maxBodyBytes) {
+      fail newError("readMessage: Content-Length ${cl} exceeds ${maxBodyBytes} bytes")
+    }
+    return readRequestContentLengthBody(s, bodyStart, cl)?
+  }
+  return ""
+}
+
+fn readMessage(s: byteStream, maxBodyBytes: int): Request! {
+  // Before the first read, not after it: the address is read off the socket
+  // with `getpeername`, which stops answering once the connection is torn
+  // down, and a request whose peer hangs up the moment it finishes sending is
+  // exactly the one an audit log wants named. One call per connection — this
+  // module is one request per connection (see `Exchange.respond`), so no
+  // request pays a second syscall for it.
+  let peer = s.peer()
+  let raw = readThroughHeaderEnd(s)?
+  if (len(raw) == 0) {
+    // Peer closed mid-headers: return an empty request, the caller stops.
+    return Request{ method: "", path: "", headers: "", body: "", peer: peer }
+  }
+  let sep = indexOf(raw, "\r\n\r\n")
+  let headBlock = raw[0:sep]
+  let bodyStart = raw[sep + 4:len(raw)]
+  if (hasBareControlChar(headBlock)) {
+    fail newError("readMessage: control character in header block")
+  }
+
+  // Split the request line off the top of the header block.
+  let eol = indexOf(headBlock, "\r\n")
+  let requestLine = headBlock
+  let headers = ""
+  if (eol >= 0) {
+    requestLine = headBlock[0:eol]
+    headers = headBlock[eol + 2:len(headBlock)]
+  }
+  // The method and request-target off the request line ("GET /path HTTP/1.1"),
+  // both "" when there is no space to split on. Inlined at this one call site
+  // rather than returned as a two-field class, which cost an object on every
+  // request for a value read once (#3644).
+  let method = ""
+  let path = ""
+  let sp1 = indexOf(requestLine, " ")
+  if (sp1 >= 0) {
+    method = requestLine[0:sp1]
+    let afterMethod = requestLine[sp1 + 1:len(requestLine)]
+    let sp2 = indexOf(afterMethod, " ")
+    path = afterMethod
+    if (sp2 >= 0) {
+      path = afterMethod[0:sp2]
+    }
+  }
+  let body = readRequestBody(s, bodyStart, headers, maxBodyBytes)?
+  return Request{ method: method, path: path, headers: headers, body: body, peer: peer }
+}

@@ -292,8 +292,9 @@ call `Exchange.read()` for that, on its own spawned green thread.
 
 Reads the request (headers and body) off this exchange's connection. Parks
 until the whole request arrives. Fails on a malformed request (bad framing, a
-Content-Length/Transfer-Encoding conflict, a control character in a header, or
-a header block over the 64 KiB cap) — answer 400 and drop the connection
+Content-Length/Transfer-Encoding conflict, a control character in a header, a
+header block over the 64 KiB cap, or a body over the owning server's
+`setMaxBodyBytes` budget) — answer 400 and drop the connection
 rather than pass the failure to a handler. Call this on its own green thread
 (spawned right after `accept()`), never inline in the accept loop.
 
@@ -315,6 +316,23 @@ lifetime, including closing it.
 ### `Server.close()`
 
 Stops listening.
+
+### `Server.setMaxBodyBytes(n: int)`
+
+Raises or lowers the number of bytes this server will read of a request body,
+default 32 MiB. A request whose `Content-Length` declares more than `n`, or
+whose chunk sizes add up to more than `n`, is refused before the bytes are
+read: the connection is answered `400 Bad Request` and closed, and no handler
+runs. That is a limit on what is read, not on what is parsed, so a peer
+declaring a 4 GiB body costs nothing.
+
+Set it before serving starts. Connections already accepted keep the budget
+they were accepted with, and `serveTlsOn` - which takes a bare `TlsListener`
+with no server object to configure - always serves under the default; use
+`tlsServe`/`serveTlsServerOn` to change it for TLS.
+
+There is deliberately no value meaning "unlimited": `0` refuses every body,
+the same way a zero `Limits` field does in `parseMultipart`.
 
 ### `listenAndServe(host: string, port: int, handler: (Request) => Response): ()!`
 
@@ -656,6 +674,13 @@ down gracefully. `port` `0` lets the kernel choose one; read it back with
 ### `TlsServer.port(): int!`
 
 The port the server is bound to.
+
+### `TlsServer.setMaxBodyBytes(n: int)`
+
+The TLS mirror of `Server.setMaxBodyBytes`, with the same 32 MiB default and
+the same refusal before the bytes are read. It bounds HTTP/1.1-over-TLS only:
+a connection that negotiates `h2` is served by the `std/http2` engine, which
+frames its own bodies and does not go through this read path.
 
 ### `serveTlsServerOn(ts: TlsServer, handler: (Request) => Response): ()!`
 
