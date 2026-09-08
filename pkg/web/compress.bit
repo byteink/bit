@@ -1,0 +1,290 @@
+// pkg/web/compress.bit — `app.use(compress())`: gzip the response body when
+// the client asked for it, the body is big enough to be worth it, and the
+// content type is one that compresses (#3958).
+//
+// Everything here is a decision NOT to compress. Four conditions must all
+// hold, and any one of them failing returns the handler's `Res` with its
+// body untouched:
+//
+//   1. the request's `Accept-Encoding` accepts `gzip`
+//   2. the response does not already carry a `Content-Encoding`
+//   3. the body is at least `compressMinBytes` — below that gzip's own
+//      18-byte container plus the deflate block header makes the response
+//      LARGER, so compressing is a straight loss
+//   4. the `Content-Type` is on the allowlist below
+//
+// --- why an allowlist, never a denylist ------------------------------------
+//
+// A JPEG, a PNG, a zip and a font are already compressed; running deflate
+// over them spends CPU to add bytes. A denylist gets that right only for the
+// types someone remembered to write down, and every new binary type that
+// appears is compressed by default until somebody notices. An allowlist is
+// wrong in the safe direction: an unknown type is passed through, which
+// costs a compression that could have happened and never costs a corrupted
+// or inflated one.
+//
+// --- Vary: Accept-Encoding, on every response ------------------------------
+//
+// Including the ones this middleware chose NOT to compress. The header is
+// about the RESOURCE, not about one response: it tells a shared cache that
+// this resource's bytes depend on the request's `Accept-Encoding`. Omit it
+// on the uncompressed response and a cache stores that response under a key
+// that does not mention the encoding, then serves it — or, worse, serves the
+// gzipped one it stored earlier — to a client that cannot decode it.
+//
+// It is APPENDED to whatever `Vary` the handler already set, never replaced:
+// a handler that varies on `Cookie` still varies on `Cookie` after this ran.
+//
+// --- ETag: weakened, not dropped -------------------------------------------
+//
+// THE CHOICE IS `W/`. Compressing changes the bytes, so a strong entity tag
+// — which promises byte-for-byte equality — is a lie the moment the body is
+// replaced. The two honest answers are to drop the header or to mark it
+// weak, and this file marks it weak, for two reasons.
+//
+// First, it keeps conditional requests working. `static()` (static.bit) sets
+// a strong `ETag` and compares `If-None-Match` with RFC 9110 §13.1.2's WEAK
+// comparison, stripping any `W/` from the candidate before comparing
+// (`etagMatches`/`stripWeakMark`) — so a client that stores `W/"12-345"` and
+// sends it back still gets its 304. Dropping the header instead would turn
+// every conditional request for a compressed static asset into a full
+// re-transfer, which is exactly the traffic an `ETag` exists to avoid.
+//
+// Second, `Res` exports no way to REMOVE a header (res.bit: `set` replaces,
+// there is no `unset`), so dropping would have to be built through a seam
+// that does not exist yet. Weakening is a `set`, and it is the better
+// behaviour regardless — see above.
+//
+// --- Content-Length --------------------------------------------------------
+//
+// RECOMPUTED when the response carries one, and NOT INVENTED when it does
+// not. Leaving a handler's original length on a compressed body declares
+// more bytes than are sent, which a client reads as a truncated response and
+// which is the classic bug in a hand-rolled version of this middleware.
+//
+// Adding one where the handler set none would be a different bug:
+// `serializeResponse` (stdlib/http/http.bit:363) already emits
+// `Content-Length: ${len(res.body)}` on every response unconditionally, and
+// `toResponse` (adapter.bit) passes every other `Res` header through with
+// `addHeader`, so a `Content-Length` set here would go on the wire a second
+// time. One header, set by the framing layer that owns it.
+//
+// --- what is already in scope ----------------------------------------------
+//
+// `toLower`, `trimSpace`, `split` (escape.bit, ctx.bit, router.bit),
+// `contentTypeName` (res.bit) and `etagName` (static.bit) are bound
+// module-wide already — an import and a declaration both bind per MODULE
+// (SPEC §17.1), so re-declaring any of them here is E0042. Only `gzip` is
+// new.
+import { gzip } from "std/compress"
+
+const acceptEncodingName = "Accept-Encoding"
+const contentEncodingName = "Content-Encoding"
+const contentLengthName = "Content-Length"
+const varyName = "Vary"
+
+const gzipToken = "gzip"
+// `*` in an `Accept-Encoding` list: any encoding not otherwise named is
+// acceptable (RFC 9110 §12.5.3).
+const anyEncodingToken = "*"
+const weakEtagMark = "W/"
+
+// Below this, gzip's fixed overhead — a 10-byte header, an 8-byte trailer
+// and the deflate block header on top — is a larger response for more CPU.
+const compressMinBytes = 1024
+
+// Level 6, the same default `gzip(1)` itself uses: near the top of the
+// compression curve at a fraction of level 9's cost, and this runs on the
+// response path of every request.
+const compressLevel = 6
+
+// The gzip middleware. Register it OUTERMOST of anything that writes a body
+// — it acts on the way out, so it compresses whatever the rest of the chain
+// finally returned, including a `static()` file and an error page.
+//
+// A block-bodied arrow bound to an annotated `let` and then returned, rather
+// than written into the `return` directly: an arrow in return position is
+// given no expected type (#4513), so its parameters stay untyped and the
+// call below fails at LOWERING with E0092 after `bit check` has already
+// exited 0. `rethrow` (middleware.bit) rather than `next(c)?` because `?`
+// and `fail` are both rejected inside an arrow today (#4504). Both locals go
+// when those land.
+export fn compress(): Middleware {
+  let mw: Middleware = (c, next) => {
+    let r = next(c) catch e {
+      return rethrow(e)
+    }
+    return compressRes(c, r)
+  }
+  return mw
+}
+
+// The whole decision, on the way out. `Vary` first and unconditionally, so
+// every exit from here carries it however the four checks land.
+fn compressRes(c: Ctx, r: Res): Res {
+  addVaryAcceptEncoding(r)
+  if (!shouldCompress(c.header(acceptEncodingName), r)) {
+    return r
+  }
+  let body = r.body()
+  // A compression failure is not a request failure: `gzip` fails only on a
+  // level outside 0..9 and `compressLevel` is a constant inside it, so this
+  // is unreachable — but if it ever fires, the correct answer is the
+  // handler's own uncompressed response, not a 500 for a response that was
+  // already built.
+  let packed = gzip([]byte(body), compressLevel) catch _ {
+    return r
+  }
+  return applyGzip(r, string(packed))
+}
+
+// All four conditions from the file header. Every one of them is a reason to
+// leave the body alone.
+fn shouldCompress(acceptEncoding: string, r: Res): bool {
+  if (!acceptsGzip(acceptEncoding)) {
+    return false
+  }
+  if (len(r.headerValue(contentEncodingName)) > 0) {
+    return false
+  }
+  if (len(r.body()) < compressMinBytes) {
+    return false
+  }
+  return compressibleType(r.headerValue(contentTypeName))
+}
+
+// Replaces the body with its gzip form and fixes up the three headers that
+// describe it. `Res.bodyText` is written directly because `Res` exports no
+// body setter — an unexported field of an exported class is module-private
+// and not file-private (SPEC §17.3), the same seam logger.bit already uses
+// for `Ctx.config`. `set` rather than the chainable `header`, whose `Res`
+// return value would be a discarded result (E0215).
+fn applyGzip(r: Res, packed: string): Res {
+  r.bodyText = packed
+  r.set(contentEncodingName, gzipToken)
+  if (len(r.headerValue(contentLengthName)) > 0) {
+    r.set(contentLengthName, "${len(packed)}")
+  }
+  weakenEtag(r)
+  return r
+}
+
+// A strong `ETag` promises these exact bytes; they are not these exact bytes
+// any more. Marked weak rather than removed — see the file header.
+fn weakenEtag(r: Res) {
+  let tag = r.headerValue(etagName)
+  if (len(tag) == 0) {
+    return
+  }
+  if (len(tag) >= len(weakEtagMark) && tag[0:len(weakEtagMark)] == weakEtagMark) {
+    return
+  }
+  r.set(etagName, weakEtagMark + tag)
+}
+
+// Appends `Accept-Encoding` to this response's `Vary`, keeping whatever was
+// already there. A `Vary` that already lists it — or lists `*`, which means
+// the response varies on everything and must not be reused from a cache at
+// all — is left exactly as it is.
+fn addVaryAcceptEncoding(r: Res) {
+  let current = r.headerValue(varyName)
+  if (len(current) == 0) {
+    r.set(varyName, acceptEncodingName)
+    return
+  }
+  if (varyAlreadyCovers(current)) {
+    return
+  }
+  r.set(varyName, current + ", " + acceptEncodingName)
+}
+
+fn varyAlreadyCovers(current: string): bool {
+  let want = toLower(acceptEncodingName)
+  for field of split(current, ",") {
+    let name = toLower(trimSpace(field))
+    if (name == want || name == anyEncodingToken) {
+      return true
+    }
+  }
+  return false
+}
+
+// Whether `value` — a whole `Accept-Encoding` field — accepts gzip.
+//
+// Tokenized rather than searched for the substring "gzip": `x-gzip` and
+// `gzipfoo` both contain it and neither is a request for this coding, and
+// `gzip;q=0` contains it while explicitly REFUSING it (RFC 9110 §12.5.3: a
+// qvalue of 0 means "not acceptable").
+//
+// A named `gzip` decides outright, whichever way it lands. `*` is the
+// fallback for a list that never names gzip, and only then.
+fn acceptsGzip(value: string): bool {
+  let anyOk = false
+  for field of split(value, ",") {
+    let parts = split(field, ";")
+    let name = toLower(trimSpace(parts[0]))
+    let acceptable = !qualityIsZero(parts)
+    if (name == gzipToken) {
+      return acceptable
+    }
+    if (name == anyEncodingToken) {
+      anyOk = acceptable
+    }
+  }
+  return anyOk
+}
+
+// Whether the parameters of one `Accept-Encoding` element carry `q=0` — the
+// spelling that refuses a coding rather than ranking it. A qvalue is at most
+// three digits after the point (RFC 9110 §12.4.2), so "all zeros and dots"
+// is an exact test for zero and needs no float parsing.
+fn qualityIsZero(parts: []string): bool {
+  let i = 1
+  while (i < len(parts)) {
+    let p = toLower(trimSpace(parts[i]))
+    if (len(p) > 2 && p[0:2] == "q=" && allZeroDigits(p[2:len(p)])) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn allZeroDigits(s: string): bool {
+  if (len(s) == 0) {
+    return false
+  }
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] != '0' && s[i] != '.') {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// The allowlist, matched on the media type alone — a `Content-Type` carries
+// parameters (`text/html; charset=utf-8`) and the type is what decides.
+fn compressibleType(contentType: string): bool {
+  let fields = split(contentType, ";")
+  let media = toLower(trimSpace(fields[0]))
+  if (len(media) >= len(textPrefix) && media[0:len(textPrefix)] == textPrefix) {
+    return true
+  }
+  for t of compressibleTypes() {
+    if (media == t) {
+      return true
+    }
+  }
+  return false
+}
+
+const textPrefix = "text/"
+
+// Everything outside `text/*` that is worth compressing. Structured text in
+// a non-`text/` tree: JSON, JavaScript and SVG are all markup or source, and
+// all three routinely compress by 60-80%.
+fn compressibleTypes(): []string {
+  return ["application/json", "application/javascript", "image/svg+xml"]
+}
