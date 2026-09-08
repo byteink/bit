@@ -146,7 +146,32 @@ case "${BUCKET}" in
     # (compiler/arm64checklayout.bit's layout fixture had named the invented
     # rt_call tag "f"; symptom fixed at d1534308). It stays in `runtime` too —
     # it scans both trees and either half can break it.
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers)
+    #
+    # test-string-explode and test-string-keepalive (#4578) are a FOURTH
+    # route to the same gap. Their scope is not in argv (which names only
+    # their own fixtures, `_tests_/bit/stringexplode` and
+    # `_tests_/bit/stringkeepalive.bit`), not in an env entry, and not in a
+    # harness walk of compiler/ the way test-abimembers' is — each one
+    # COMPILES AND RUNS a fixture twice, once with BIT_STRING_EXPLODE_TEST=1,
+    # and the code under test is the flip itself, which lives entirely in
+    # compiler/lowerexplode*, compiler/lower.bit and compiler/codegenlive.bit.
+    # So `gates_for_file compiler/codegenlive.bit` is empty (correctly — the
+    # changed file is compiler/*.bit, which resolves to this bucket, not to
+    # one gate) and before this line a compiler-only diff ran NEITHER gate
+    # that executes the BIT_STRING_EXPLODE_TEST path at all.
+    #
+    # The gap is narrower than "unguarded", and the narrower statement is the
+    # useful one: test-selfcheck is in this bucket and does fire on the
+    # obvious mutation — emptying `extendKeepAlive` gives `panic: assertion
+    # failed` via checkKeepAliveInterval (measured on #4425). What that arm
+    # cannot see is anything its synthetic IrFunc does not model, which is
+    # #4406's own stated residual: the four recording sites cover the shapes
+    # lowerexplode produces TODAY. A new binding site that forgets
+    # `recordWordKeepAlive` builds a correct-looking IrFunc, passes
+    # checkKeepAliveInterval, and is caught only by RUNNING a flipped
+    # program — which is exactly what these two gates do and no other step in
+    # this bucket does.
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did
