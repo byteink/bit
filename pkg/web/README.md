@@ -133,7 +133,7 @@ c.rawBody(): string!               // the unparsed bytes, capped
 from the arrow — but it is more than `c.body<NewUser>()` would be, which is
 what #3877 specified. The type argument has to sit at the call site because
 `jsonDecode<T>` is specialised by a rewrite that runs before type checking, so
-it cannot see through a generic wrapper (#4547). When that is fixed the
+it cannot see through a generic wrapper (#4563). When that is fixed the
 parameter goes and the call becomes `c.body<NewUser>()?`; nothing else about
 the behaviour above changes.
 
@@ -141,4 +141,4 @@ the behaviour above changes.
 
 `Config.maxBody` bounds what this framework will **parse**. It is not a bound
 on what was read: `std/http` reads a `Content-Length` body with no limit of its
-own, so the bytes are already in memory before any `Ctx` exists (#4548).
+own, so the bytes are already in memory before any `Ctx` exists (#4565).
