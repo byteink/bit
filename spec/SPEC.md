@@ -3503,21 +3503,19 @@ bit-import: <name> git <gitURL>
 says the package is a subdirectory of a repository it does not own outright:
 that repository may carry several packages, and it carries its own releases
 in the bare `vMAJOR.MINOR.PATCH` tag namespace. So a `dir`-resolved
-dependency's versions are matched against tags **prefixed by its key**:
+dependency's versions are matched against tags **prefixed by its key**: the
+namespace is the vanity name's trailing `/`-separated segment followed by a
+single `/`, and it is empty for every dependency whose document named no
+`dir`.
 
-```
-tag_namespace = key '/' .   (* only when the document named `dir` *)
-key           = <the vanity name's trailing '/'-separated segment>
-```
-
-For `bitlang.org/pkg/web`, `key` is `web` and the namespace is `web/`. The
+For `bitlang.org/pkg/web` the key is `web` and the namespace is `web/`. The
 version constraint `0.1.0` then matches the tag `web/v0.1.0` or `web/0.1.0`
 — both spellings, `v`-prefixed first, exactly as **Git tag matching** above
 already specifies — and matches no other tag on that repository. A bare
 `v0.1.0` on the same repository is **never** a candidate: it is that
 repository's own release, not a version of the package.
 
-`key` is the same trailing segment the resolver already derives as the
+That key is the same trailing segment the resolver already derives as the
 dependency's `bit.json`/`bit.lock` key, taken from the vanity **name**
 rather than from the key the consumer happens to have used. There is no
 field in the `bit-import:` document for the prefix: it is determined by the
