@@ -569,19 +569,32 @@ An attribute constrains how a function is compiled. Attributes precede
 
 ```
 attr_list     = attr { attr } .
-attr          = "@" IDENT [ "(" STRING_LIT ")" ] .
+attr          = "@" IDENT [ "(" [ const_expr { "," const_expr } ] ")" ] .
 ```
 
 `export` stays outermost: `export @naked fn f() {}`. An attribute list may
 also sit on its own line above the declaration it modifies; the semicolon
 automatic insertion would place there (§7) is not meaningful, because an
-attribute list is only ever followed by another attribute or `fn`.
+attribute list is only ever followed by another attribute, by `fn`, or by a
+class field's own `[export] [readonly] IDENT ":"` (§10.5).
 
-Three attributes are recognized; any other name is an error (**E0076**
-`unknown_attribute`). Only `@symbol` (§11.9) takes an argument — giving one to
-`@naked` or `@nosplit` is **E0079** `symbol_attr_invalid`. All three exist for
-the unmanaged subset the runtime is written against — ordinary Bit code should
-not need them.
+Three attributes are recognized **in this position**; any other name is an
+error (**E0076** `unknown_attribute`). Only `@symbol` (§11.9) takes an
+argument, and that argument must be exactly one string literal — giving one to
+`@naked` or `@nosplit`, or giving `@symbol` anything else, is **E0079**
+`symbol_attr_invalid`. All three exist for the unmanaged subset the runtime is
+written against — ordinary Bit code should not need them.
+
+**A function attribute and a field attribute are different things that share a
+spelling, and the asymmetry is deliberate.** A function attribute is
+compiler-known: the three names above are the only ones, they are never
+resolved through name lookup, and there is no function anywhere called `naked`.
+A **field** attribute (§10.5) is the opposite — it names an ordinary function,
+found by ordinary name lookup, and the compiler knows no field attributes at
+all. So `@nosplit` on a field is not special and would have to name a function;
+`@min` on a `fn` is `E0076`. The grammar above is shared by both positions,
+which is why the argument list is a general one; what an argument may be is
+decided per position.
 
 **`@naked`** — the function gets no prologue and no epilogue, and returns
 through a bare machine `ret`. It runs on its caller's frame, so it must need no
@@ -830,7 +843,7 @@ let a = Account(500)?
 ```
 class_decl  = "class" IDENT [ generic_params ] "{" [ member { ( ";" | "," ) member } [ ";" | "," ] ] "}" .
 member      = field | method_decl .    (* method_decl, §10.4 *)
-field       = [ "export" ] [ "readonly" ] IDENT ":" type [ "=" const_expr ] .
+field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" const_expr ] .
 ```
 
 - `struct` is not a keyword (§5.2): the compiler rejects it with `E0102`,
@@ -874,6 +887,42 @@ field       = [ "export" ] [ "readonly" ] IDENT ":" type [ "=" const_expr ] .
   widen to cover such a value, a default on the field would supply exactly
   what `E0083` says is missing, and the omission would become legal.
 - Defaults are class-only. `trait_field` (§10.7) carries none.
+- A field may carry **attributes**, written above it, one per line, before any
+  `export` or `readonly`. **An attribute is sugar for a call to an ordinary
+  fallible function**, resolved by ordinary name lookup (§17.5) in the module
+  that declares the field. The attribute name IS the function name; the
+  field's value is the first argument and the attribute's own arguments
+  follow. So `@email` on field `email` means `email(this.email)?`, and
+  `@max(200)` on field `name` means `max(this.name, 200)?`.
+- Attribute arguments are **constant expressions** (§15.4), the same
+  restriction a field default carries.
+- The function an attribute names must be `fn name(v: T, ...): ()!` — fallible,
+  yielding unit, with a first parameter the field's type is assignable to. A
+  function that cannot fail is **E0133**; one yielding a value is **E0134**;
+  one whose first parameter cannot take the field is **E0135**. A name that
+  resolves to nothing is the ordinary **E0040**, because nothing about this
+  lookup is special: there is no registry of attributes and no compiler-known
+  list, so any module that exports `fn iban(s: string): ()!` makes `@iban`
+  work everywhere it is imported.
+- If any field of a class carries an attribute, the compiler synthesizes an
+  exported member
+
+  ```
+  validateFields(): ()!
+  ```
+
+  containing one call per attribute in **declaration order** — fields top to
+  bottom, attributes top to bottom within a field — each propagating with `?`,
+  so the first failure is the one reported. It is an ordinary member:
+  callable, testable, callable across modules, and listed by `bit doc`.
+- It is deliberately **not** named `validate`. A hand-written `validate()` is
+  how cross-field rules are expressed ("B is required only when A is set"),
+  and the two are meant to compose: a caller runs `validateFields()` and then
+  `validate()` if the type has one. A class that declares `validateFields`
+  itself is **E0132**, naming both.
+- Attributes are class-field-only. An attribute on a class **method** is
+  **E0131** — a method has no value to pass — and `trait_field` (§10.7)
+  carries none, so `@` in a trait body is a parse error.
 - Fields are ordered; that order is the memory layout order (subject to the
   compiler's alignment padding). A method interleaved between fields does
   not affect this order or count as a field itself.
@@ -4392,7 +4441,7 @@ type_alias    = "type" IDENT [ generic_params ] "=" type .
 
 func_decl     = [ attr_list ] "fn" IDENT [ generic_params ] signature block .
 attr_list     = attr { attr } .
-attr          = "@" IDENT [ "(" STRING_LIT ")" ] .
+attr          = "@" IDENT [ "(" [ const_expr { "," const_expr } ] ")" ] .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
 params        = param { "," param } [ "," ] .
 param         = [ "..." ] IDENT ":" type .
@@ -4400,7 +4449,7 @@ extern_fn_decl = "extern" "fn" IDENT signature .
 
 class_decl    = "class" IDENT [ generic_params ] "{" [ member { fsep member } [ fsep ] ] "}" .
 member        = field | method_decl .
-field         = [ "export" ] [ "readonly" ] IDENT ":" type [ "=" const_expr ] .
+field         = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" const_expr ] .
 method_decl   = [ "export" ] IDENT [ generic_params ] signature block .
 interface_decl= "interface" IDENT [ generic_params ] "{" [ method_sig { fsep method_sig } [ fsep ] ] "}" .
 method_sig    = IDENT signature .
