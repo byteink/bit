@@ -192,7 +192,7 @@ to set, and map across explicitly:
 }
 
 fn createUser(c: Ctx): Res! {
-  let input = c.body((j) => jsonDecode<NewUser>(j))?
+  let input = c.body<NewUser>()?
   let row = User{
     id: 0,
     name: input.name,
@@ -232,7 +232,7 @@ fashion:
 
 ```
 fn importLegacy(c: Ctx): Res! {
-  let row = c.bodyWith(Bind{ unknown: Unknown.Ignore }, (j) => jsonDecode<Legacy>(j))?
+  let row = c.bodyWith<Legacy>(Bind{ unknown: Unknown.Ignore })?
   return c.json(row)
 }
 ```
@@ -263,8 +263,8 @@ syntax suffix (`application/vnd.api+json`) is JSON.
 ### The rest of the surface
 
 ```
-c.body(decode): T!                 // bind under the app-level policy
-c.bodyWith(bind, decode): T!       // bind under a per-call policy
+c.body<T>(): T!                    // bind under the app-level policy
+c.bodyWith<T>(bind): T!            // bind under a per-call policy
 c.bodyJson(): Json!                // the parsed tree, for a payload that is not a class
 c.rawBody(): string!               // the unparsed bytes, capped
 ```
@@ -272,15 +272,12 @@ c.rawBody(): string!               // the unparsed bytes, capped
 `c.bodyJson()` and `c.rawBody()` carry the same 413, and `bodyJson()` the same
 415 and parse error, so nothing in this package reads a body without them.
 
-### Why the decoder is an argument
+### Write the type argument out
 
-`c.body((j) => jsonDecode<NewUser>(j))` names the type once — `T` is inferred
-from the arrow — but it is more than `c.body<NewUser>()` would be, which is
-what #3877 specified. The type argument has to sit at the call site because
-`jsonDecode<T>` is specialised by a rewrite that runs before type checking, so
-it cannot see through a generic wrapper (#4563). When that is fixed the
-parameter goes and the call becomes `c.body<NewUser>()?`; nothing else about
-the behaviour above changes.
+`c.body<NewUser>()` and `c.bodyWith<Legacy>(bind)` name the type once, and the
+type argument is not optional: `T` appears only in the result, so a bare
+`c.body()` has nothing to infer it from and is a compile error rather than a
+guess.
 
 ### What the size cap does and does not do
 
