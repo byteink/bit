@@ -1,0 +1,252 @@
+// pkg/web/session.bit — server-side sessions (#3947). The cookie carries a
+// 128-bit random id and NOTHING else; every byte of session data lives in a
+// store the app supplies.
+//
+// ## There is no default store, and that is the point
+//
+// `Config.sessions` (config.bit) has no default. An app that touches
+// `c.session()` without one gets a failure naming the `sessions` field
+// rather than a working in-memory session — Express's in-memory default is
+// the most famous footgun in Node ("not designed for a production
+// environment, as it will leak memory, and will not scale past a single
+// process") and everyone ignores it, because it works perfectly on a laptop
+// and randomly logs users out the day a second server appears. `MemoryStore`
+// (memorystore.bit) still ships; it is just written down at the call site.
+//
+// The refusal cannot be a startup check: nothing static can tell whether a
+// handler body ever reaches `c.session()`, and this package has no `listen()`
+// that runs handlers (#3885). So the FIRST access is where it fires, loudly.
+// It is a `fail`, not a `panic`, for one reason: the acceptance is about the
+// MESSAGE, and a message can only be asserted in-process if the caller can
+// catch it. `c.session()` is fallible regardless — a real store does I/O —
+// so the misconfiguration rides a channel that already exists rather than
+// adding a second failure mode to the signature.
+//
+// ## Why an id and not a signed cookie carrying the data
+//
+// A signed cookie needs no infrastructure but cannot be revoked and caps out
+// near 4 KB. With an id plus a store, revocation is `store.destroy(sid)`.
+// `Config.secret` is therefore NOT used here and this file signs nothing: a
+// forged id is simply an id that misses in the store. Signing it would buy
+// nothing and would tie every live session's validity to one value.
+//
+// ## `SessionStore` is an `interface`, not a `trait`
+//
+// #3947 was filed writing `trait SessionStore`. A trait is never a type in
+// Bit (SPEC §10.7) — it supplies method BODIES to a class and cannot be a
+// field's type — so `Config.sessions` could not have been declared with one.
+// A structural `interface` (§14.3) is a value type with dynamic dispatch and
+// needs no `implements` declaration, so `MemoryStore`, a future `SqlStore`
+// and a user's own store all satisfy it by having the methods.
+//
+// That choice also solves the omission problem for free: an interface's zero
+// value is `nil` (§13.4), so `sessions` can be left out of a `Config` literal
+// — every existing test writes `Config{ secret: "x" }` — while a class-typed
+// field could be neither omitted (E0083) nor defaulted (a default must be a
+// constant expression, §15.4, and no class value is one).
+
+import { encodeHex, randomBytes } from "std/crypto"
+
+// 16 bytes = 128 bits, the ticket's floor. Straight from the OS CSPRNG
+// (`randomBytes`, stdlib/crypto/rand.bit, ABI.md §21) — never a counter, a
+// timestamp, a hash of anything about the user, or a userspace PRNG.
+const sessionIdBytes = 16
+
+// The cookie's name. Deliberately not configurable: a name is not a security
+// property, and every knob a framework offers is a knob an app has to have
+// an opinion about.
+const sessionCookieName = "sid"
+
+// How long a written session stays readable, in seconds. A module const
+// rather than a `Config` field, because #3947 adds exactly one field
+// (`sessions`) and a setting for work no ticket has asked for is a promise
+// the framework cannot keep.
+//
+// Expiry is ABSOLUTE, not sliding: `save()` refreshes the window, a plain
+// read does not, so a session dies 24h after the last write whatever the
+// traffic. That is the safer of the two and the simpler one to reason about.
+const sessionTTLSeconds: i64 = 86400
+
+// A store of session data, keyed by session id. Structural (§14.3): a type
+// satisfies this by having the three methods, with no declaration anywhere.
+//
+// `read` returning an EMPTY map is how a miss is reported — an unknown,
+// forged, destroyed or expired id is the normal case on a public endpoint,
+// not an error. The `!` is for the store itself failing (a dropped SQL
+// connection, a Redis timeout); returning that as an empty map would silently
+// log every user out during an outage.
+export interface SessionStore {
+  read(sid: string): map<string, string>!
+  write(sid: string, data: map<string, string>, ttl: i64): ()!
+  destroy(sid: string): ()!
+}
+
+// One request's session. Obtained from `Ctx.session()` (ctx.bit), which
+// builds at most one per request and hands the same object back on every
+// later call — so `set` in a middleware is visible to the handler.
+export class Session {
+  sid: string
+  data: map<string, string>
+  store: SessionStore
+  // True when this id was minted during THIS request: either no cookie
+  // arrived, or the one that did missed in the store. #3884/#3885 use it to
+  // decide whether the response needs a `Set-Cookie` at all.
+  fresh: bool
+  // Set by `set`/`delete`. `save()` writes only when it is true, so a
+  // read-only request costs the store nothing and issues no write.
+  dirty: bool
+  destroyed: bool
+
+  // This session's id — the value in the cookie, and the key in the store.
+  export id(): string {
+    return this.sid
+  }
+
+  // Whether this id was minted during this request (see `fresh`).
+  export isNew(): bool {
+    return this.fresh
+  }
+
+  // The value stored under `key`, or "" when it is absent. Never fallible:
+  // the data is already in memory, and an absent key is not an error.
+  export get(key: string): string {
+    let (v, ok) = this.data[key]
+    if (ok) {
+      return v
+    }
+    return ""
+  }
+
+  // Records `key` = `value` for this session. Takes effect in the store at
+  // `save()`, not here.
+  export set(key: string, value: string) {
+    this.mustBeLive("set")
+    this.data[key] = value
+    this.dirty = true
+  }
+
+  // Forgets `key`. Absent is not an error — the post-condition is the same
+  // either way.
+  export delete(key: string) {
+    this.mustBeLive("delete")
+    delete(this.data, key)
+    this.dirty = true
+  }
+
+  // Persists this session's data, if anything changed. A no-op on a
+  // destroyed session — the framework's end-of-request save must not
+  // resurrect what the handler deliberately revoked.
+  export save(): ()! {
+    if (this.destroyed || !this.dirty) {
+      return
+    }
+    this.store.write(this.sid, this.data, sessionTTLSeconds)?
+    this.dirty = false
+  }
+
+  // Revokes this session: the store forgets the id, the in-memory data is
+  // dropped, and every later `set`/`delete` on this object panics. A
+  // subsequent request presenting the same cookie misses in the store and is
+  // issued a fresh id.
+  export destroy(): ()! {
+    if (this.destroyed) {
+      return
+    }
+    this.store.destroy(this.sid)?
+    this.data = map<string, string>()
+    this.dirty = false
+    this.destroyed = true
+  }
+
+  // The `Set-Cookie` VALUE for this session — what #3884's response layer
+  // puts after `Set-Cookie: `. All four attributes are mandatory and none is
+  // configurable:
+  //
+  //   HttpOnly       script cannot read the id, so an XSS cannot steal it
+  //   SameSite=Lax   blocks cross-site POSTs; the first half of the CSRF story
+  //   Secure         never sent over plaintext HTTP
+  //   Path=/         one session for the whole app, not one per subtree
+  //
+  // The id is hex, so it needs no quoting or percent-encoding to be a legal
+  // cookie value.
+  export cookie(): string {
+    return sessionCookieName + "=" + this.sid +
+      "; HttpOnly; SameSite=Lax; Secure; Path=/"
+  }
+
+  // Panics on use after `destroy()`. A caller-contract violation, handled
+  // exactly the way app.bit handles registration after `listen()`: the
+  // alternative is mutating a map that will never be written, which loses
+  // data in silence.
+  mustBeLive(what: string) {
+    if (this.destroyed) {
+      panic("web: session: ${what}() after destroy()")
+    }
+  }
+}
+
+// A fresh session id: `sessionIdBytes` bytes from the OS CSPRNG, hex-encoded.
+// Hex rather than base64url purely so the value is unambiguous — both are
+// cookie-safe, and hex has no padding or alphabet variants to get wrong. The
+// encoding is reversible on purpose: a test decodes an issued id back to
+// prove the entropy is really there, which a bare string comparison cannot.
+export fn newSessionId(): string {
+  return encodeHex(randomBytes(sessionIdBytes))
+}
+
+// Loads the session `sid` names, or starts a new one.
+//
+// An id that arrives but misses in the store (unknown, expired, destroyed,
+// forged) is REPLACED, never adopted. Adopting one would be session
+// fixation: an attacker who can set a victim's cookie would then know the id
+// the victim's login lands on. A stored session with no keys is
+// indistinguishable from no session — by construction, since a miss IS the
+// empty map — and rotating its id costs nothing, because there is nothing in
+// it to lose.
+fn loadSession(store: SessionStore, sid: string): Session! {
+  if (len(sid) > 0) {
+    let data = store.read(sid)?
+    if (len(data) > 0) {
+      return Session{
+        sid: sid,
+        data: data,
+        store: store,
+        fresh: false,
+        dirty: false,
+        destroyed: false,
+      }
+    }
+  }
+  return Session{
+    sid: newSessionId(),
+    data: map<string, string>(),
+    store: store,
+    fresh: true,
+    dirty: false,
+    destroyed: false,
+  }
+}
+
+// The session id carried by the request's `Cookie` header(s), or "" when
+// there is none. `raws` is every value of the header, in arrival order
+// (`Ctx.headers("cookie")`) — a client may legally split its cookies across
+// several `Cookie` lines, and reading only the first would drop a session at
+// random depending on how the client packed them.
+//
+// A pair whose name does not match is skipped rather than rejected: the
+// header is shared with every other cookie the site has ever set, so a
+// malformed neighbour must not cost the user their session.
+fn sessionIdFromCookies(raws: []string): string {
+  for raw of raws {
+    for pair of split(raw, ";") {
+      let eq = indexOf(pair, "=")
+      if (eq <= 0) {
+        continue
+      }
+      if (trimSpace(pair[0:eq]) == sessionCookieName) {
+        return trimSpace(pair[eq + 1:len(pair)])
+      }
+    }
+  }
+  return ""
+}
