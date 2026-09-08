@@ -13,6 +13,7 @@
 export class Server {
   listener: Listener
   drain: drainState
+  maxBody: int
   // The port the server is bound to.
   export port(): int! {
     return this.listener.port()?
@@ -32,7 +33,21 @@ export class Server {
   // anyone else's accept or read.
   export accept(): Exchange! {
     let c = this.listener.accept()?
-    return Exchange{ conn: c }
+    return Exchange{ conn: c, maxBody: this.maxBody }
+  }
+
+  // Raise or lower the byte budget this server reads a request body under
+  // (#4565). It defaults to `defaultMaxBodyBytes` (32 MiB, message.bit): a
+  // request whose `Content-Length` declares more, or whose chunk sizes add up
+  // to more, is refused BEFORE the bytes are read, and the connection is
+  // answered `400 Bad Request` and closed. Set it before serving starts;
+  // connections already accepted keep the budget they were accepted with.
+  //
+  // There is deliberately no value meaning "unlimited" — zero means "refuse
+  // every body", the same as `multipart.bit`'s `Limits`. A server that
+  // genuinely accepts large uploads names the size it accepts.
+  export setMaxBodyBytes(n: int) {
+    this.maxBody = n
   }
 
   export close() {
@@ -58,6 +73,7 @@ export class Server {
 // on its own spawned green thread — to get the request.
 export class Exchange {
   conn: Conn
+  maxBody: int
   // Reads this exchange's request off the wire: the request line, headers, and
   // body, framed the same way `readMessage` always has (see its own doc
   // comment for the exact failure cases, including the header-size cap). Fails
@@ -68,7 +84,7 @@ export class Exchange {
   // in the accept loop) so a stalled or silent peer can only ever block this
   // one exchange.
   export read(): Request! {
-    return readMessage(netStream{ conn: this.conn })?
+    return readMessage(netStream{ conn: this.conn }, this.maxBody)?
   }
 
   // Write `res` to the exchange's connection and close it (one request per
@@ -98,7 +114,18 @@ export class Exchange {
 // choose one; read it back with `port()`.
 export fn serve(host: string, port: int): Server! {
   let l = listen(host, port)?
-  return Server{ listener: l, drain: newDrainState() }
+  return Server{ listener: l, drain: newDrainState(), maxBody: defaultMaxBodyBytes }
+}
+
+// The per-server policy every accepted connection is served under: the HTTP/3
+// port to advertise in `Alt-Svc` (0 to advertise nothing) and the byte budget
+// `readMessage` reads a request body under. One value built once per serve
+// loop and shared by every connection it accepts — a class rather than two
+// more parameters because `answer` already carries five, which is E0202's
+// ceiling.
+class connOpts {
+  altPort: int,
+  maxBody: int,
 }
 
 // Answers a malformed request with `400 Bad Request` and closes the
@@ -136,9 +163,10 @@ fn answerBadRequest(s: byteStream) {
 // read stalls on its own thread; every other accept and every other read
 // proceeds.
 export fn listenAndServeOn(s: Server, handler: (Request) => Response): ()! {
+  let opts = connOpts{ altPort: 0, maxBody: s.maxBody }
   while (true) {
     let c = s.listener.accept()?
-    spawn serveOne(netStream{ conn: c }, handler, 0, s.drain)
+    spawn serveOne(netStream{ conn: c }, handler, opts, s.drain)
   }
 }
 
@@ -161,7 +189,7 @@ export fn listenAndServe(host: string, port: int, handler: (Request) => Response
 // is registered idle for as long as it waits for its request, then marked
 // active for the rest of its life, so a graceful shutdown knows whether it is
 // safe to force-close right away or must be given a chance to finish.
-fn serveOne(s: byteStream, handler: (Request) => Response, altPort: int, d: drainState) {
+fn serveOne(s: byteStream, handler: (Request) => Response, opts: connOpts, d: drainState) {
   let id = drainRegister(
     d,
     () => {
@@ -170,7 +198,7 @@ fn serveOne(s: byteStream, handler: (Request) => Response, altPort: int, d: drai
     () => {},
   )
   defer drainDeregister(d, id)
-  answer(s, handler, altPort, d, id) catch _ {
+  answer(s, handler, opts, d, id) catch _ {
     return
   }
 }
@@ -178,11 +206,11 @@ fn serveOne(s: byteStream, handler: (Request) => Response, altPort: int, d: drai
 fn answer(
   s: byteStream,
   handler: (Request) => Response,
-  altPort: int,
+  opts: connOpts,
   d: drainState,
   id: int,
 ): ()! {
-  let req = readMessage(s) catch _ {
+  let req = readMessage(s, opts.maxBody) catch _ {
     answerBadRequest(s)
     return
   }
@@ -195,8 +223,8 @@ fn answer(
   // is placed after that branch rather than at the top of the function.
   defer s.shut()
   let res = handler(req)
-  if (altPort > 0) {
-    res.headers = res.headers + altSvcHeader(altPort)
+  if (opts.altPort > 0) {
+    res.headers = res.headers + altSvcHeader(opts.altPort)
   }
   s.writeStr(serializeResponse(res))?
 }
@@ -222,6 +250,10 @@ export fn serveTlsOn(l: TlsListener, handler: (Request) => Response): ()! {
   // plain path. Nothing external can drain it — `shutdown` (shutdown.bit,
   // #3963) is scoped to `Server` only; see that file's header comment for why.
   let d = newDrainState()
+  // `serveTlsOn` takes a bare `TlsListener`, not a server object, so there is
+  // nothing to configure a body budget on: it serves under the default. Use
+  // `tlsServe`/`serveTlsServerOn` (below) to raise or lower it.
+  let opts = connOpts{ altPort: altPort, maxBody: defaultMaxBodyBytes }
   while (true) {
     // A per-connection failure (a bad or rejected TLS handshake — e.g. a client
     // whose ALPN offer shares nothing with ours, which RFC 7301 §3.2 makes us
@@ -233,7 +265,7 @@ export fn serveTlsOn(l: TlsListener, handler: (Request) => Response): ()! {
     let conn = l.accept() catch _ {
       continue
     }
-    spawn serveTlsConn(conn, handler, altPort, d)
+    spawn serveTlsConn(conn, handler, opts, d)
   }
 }
 
@@ -269,12 +301,16 @@ fn altSvcHeader(port: int): string {
 // Dispatch one accepted TLS connection to the HTTP/2 or HTTP/1.1 server path by
 // its negotiated ALPN protocol. Runs on the spawned per-connection green thread.
 // `altPort` is the HTTP/3 port advertised in each response's Alt-Svc header.
-fn serveTlsConn(conn: TlsConn, handler: (Request) => Response, altPort: int, d: drainState) {
+fn serveTlsConn(conn: TlsConn, handler: (Request) => Response, opts: connOpts, d: drainState) {
   if (conn.alpnProtocol() == "h2") {
-    h2glueServe(conn, handler, altPort, d)
+    // The h2 engine frames its own bodies (stdlib/http2) and does not read
+    // through `readMessage`, so `opts.maxBody` does not reach it — an h2 body
+    // is still bounded only by that engine's own limits (#4565 covers the
+    // HTTP/1.1 read path).
+    h2glueServe(conn, handler, opts.altPort, d)
     return
   }
-  serveOne(tlsStream{ conn: conn }, handler, altPort, d)
+  serveOne(tlsStream{ conn: conn }, handler, opts, d)
 }
 
 // ---------------------------------------------------------------------------
@@ -290,9 +326,19 @@ fn serveTlsConn(conn: TlsConn, handler: (Request) => Response, altPort: int, d: 
 export class TlsServer {
   listener: TlsListener
   drain: drainState
+  maxBody: int
   // The port the server is bound to.
   export port(): int! {
     return this.listener.port()?
+  }
+
+  // Raise or lower the byte budget this server reads an HTTP/1.1-over-TLS
+  // request body under — the TLS mirror of `Server.setMaxBodyBytes`, with the
+  // same default and the same refusal. It does NOT bound an HTTP/2 body: an
+  // h2 connection is served by the `std/http2` engine, which frames its own
+  // bodies and never calls `readMessage`.
+  export setMaxBodyBytes(n: int) {
+    this.maxBody = n
   }
 
   // Stop accepting new TLS connections, drain requests already in flight —
@@ -316,7 +362,7 @@ export fn tlsServe(host: string, port: int, certPem: string, keyPem: string): Tl
   cfg.keyPem = keyPem
   cfg.alpn = ["h2", "http/1.1"]
   let l = tlsListen(host, port, cfg)?
-  return TlsServer{ listener: l, drain: newDrainState() }
+  return TlsServer{ listener: l, drain: newDrainState(), maxBody: defaultMaxBodyBytes }
 }
 
 // Serve HTTPS forever on an already-bound `ts` — the shutdown-capable mirror
@@ -329,6 +375,7 @@ export fn tlsServe(host: string, port: int, certPem: string, keyPem: string): Tl
 // there for why an ordinary failure must NOT stop the loop.
 export fn serveTlsServerOn(ts: TlsServer, handler: (Request) => Response): ()! {
   let altPort = ts.listener.port()?
+  let opts = connOpts{ altPort: altPort, maxBody: ts.maxBody }
   while (true) {
     let conn = ts.listener.accept() catch _ {
       if (drainStarted(ts.drain)) {
@@ -336,6 +383,6 @@ export fn serveTlsServerOn(ts: TlsServer, handler: (Request) => Response): ()! {
       }
       continue
     }
-    spawn serveTlsConn(conn, handler, altPort, ts.drain)
+    spawn serveTlsConn(conn, handler, opts, ts.drain)
   }
 }

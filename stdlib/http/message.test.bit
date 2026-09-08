@@ -1,0 +1,178 @@
+// stdlib/http/message.test.bit — the request body budget (#4565).
+//
+// `readMessage`, `Request`, `serve`, `listenAndServeOn`, `post`, `ok`,
+// `indexOf`, `repeat` and `itoa` are all siblings or module-wide imports (SPEC
+// §19), so nothing is imported here — `repeat` in particular already comes
+// into this module through `multipart.test.bit`, and importing it twice is
+// E0042.
+//
+// The first three tests drive `readMessage` directly through a scripted
+// `byteStream`, with no socket: that is what makes "refused BEFORE the bytes
+// are read" mechanically checkable rather than a claim. The double counts its
+// reads and remembers how far it was consumed, so a test can assert the server
+// never asked for the body it refused. The fourth test proves the same budget
+// reaching the wire through `Server.setMaxBodyBytes`, because a limit that is
+// correct in `readMessage` and never plumbed through `serveOne` would pass
+// all three of the others.
+
+// A `byteStream` (http.bit) over a fixed script of bytes. `maxPerRead` caps
+// what one `readUp` hands back regardless of what was asked for, so the reads
+// are incremental the way a socket's are and `pos` is a real measure of how
+// much of the request the server actually consumed. `reads` counts the calls.
+// End of script is an empty read, exactly as a closed peer is.
+class scriptedStream {
+  data: string
+  pos: int
+  reads: int
+  maxPerRead: int
+
+  readUp(n: int): string! {
+    this.reads = this.reads + 1
+    if (this.pos >= len(this.data)) {
+      return ""
+    }
+    let want = n
+    if (want > this.maxPerRead) {
+      want = this.maxPerRead
+    }
+    let end = this.pos + want
+    if (end > len(this.data)) {
+      end = len(this.data)
+    }
+    let out = this.data[this.pos:end]
+    this.pos = end
+    return out
+  }
+
+  writeStr(data: string): ()! {
+    // Nothing here writes a response; a write would be a test bug, not a
+    // condition to tolerate quietly.
+    fail newError("scriptedStream: unexpected write of ${len(data)} bytes")
+  }
+
+  shut() {}
+
+  forceClose() {}
+
+  peer(): string { return "" }
+}
+
+fn newScript(data: string, maxPerRead: int): scriptedStream {
+  return scriptedStream{ data: data, pos: 0, reads: 0, maxPerRead: maxPerRead }
+}
+
+// One chunk of a `Transfer-Encoding: chunked` body: its size in hex, CRLF, the
+// bytes, CRLF. `sizeHex` is spelled by the caller so the test data says on its
+// face what the wire says.
+fn chunk(sizeHex: string, body: string): string {
+  return "${sizeHex}\r\n${body}\r\n"
+}
+
+test "a Content-Length above the budget is refused without reading the body" {
+  // 4 GiB declared, and not one byte of it sent — the shape that used to
+  // allocate 4 GiB before any handler saw the request.
+  let head = "POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 4294967296\r\n\r\n"
+  let st = newScript(head, 65536)
+  let req = readMessage(st, 1024) catch e {
+    let m = e.message()
+    assert(indexOf(m, "exceeds 1024 bytes") >= 0, "message = '${m}'")
+    assert(indexOf(m, "4294967296") >= 0, "message = '${m}'")
+    // One read: the header block. The refusal happened before anything asked
+    // the stream for a body byte — with the budget gone, the
+    // Content-Length read makes at least one more call before giving up.
+    assert(st.reads == 1, "reads = ${itoa(st.reads)}")
+    assert(st.pos == len(head), "consumed ${itoa(st.pos)} of ${itoa(len(head))}")
+    return
+  }
+  assert(false, "readMessage returned a ${itoa(len(req.body))}-byte body instead of failing")
+}
+
+test "a chunked body is refused on the chunk that crosses the budget, mid-stream" {
+  // Three 256-byte chunks against a 512-byte budget: each one is individually
+  // under the limit, so only a running total can catch this. Two fit exactly;
+  // the third is refused. The 100000-byte chunk after it is the evidence that
+  // the refusal stopped the read rather than tidying up after it.
+  let head = "POST /u HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+  let small = chunk("100", repeat("a", 256))
+  let data = head + small + small + small + chunk("186a0", repeat("b", 100000)) + "0\r\n\r\n"
+  let st = newScript(data, 64)
+  let req = readMessage(st, 512) catch e {
+    let m = e.message()
+    assert(indexOf(m, "chunked body exceeds 512 bytes") >= 0, "message = '${m}'")
+    let left = len(data) - st.pos
+    assert(left > 50000, "only ${itoa(left)} of ${itoa(len(data))} bytes were left unread")
+    return
+  }
+  assert(false, "readMessage returned a ${itoa(len(req.body))}-byte body instead of failing")
+}
+
+test "a body of exactly the budget is accepted intact, Content-Length and chunked alike" {
+  let body = repeat("a", 64)
+  let clHead = "POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 64\r\n\r\n"
+  let cl = newScript(clHead + body, 64)
+  let clReq = readMessage(cl, 64) catch e {
+    assert(false, "Content-Length at the budget: ${e.message()}")
+    return
+  }
+  assert(clReq.method == "POST", "method = '${clReq.method}'")
+  assert(clReq.path == "/u", "path = '${clReq.path}'")
+  assert(clReq.body == body, "body was ${itoa(len(clReq.body))} bytes, not 64 intact")
+
+  let chHead = "POST /u HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+  let ch = newScript(chHead + chunk("40", body) + "0\r\n\r\n", 64)
+  let chReq = readMessage(ch, 64) catch e {
+    assert(false, "chunked at the budget: ${e.message()}")
+    return
+  }
+  assert(chReq.body == body, "chunked body was ${itoa(len(chReq.body))} bytes, not 64 intact")
+}
+
+// The whole server under test for the end-to-end case: report the size of the
+// body the server managed to read, so a request that got through is
+// distinguishable from one that was refused.
+fn bodyLenEcho(req: Request): Response {
+  return ok(itoa(len(req.body)))
+}
+
+// `listenAndServeOn` returns only on an accept error, which is what closing
+// the listener at the end of the test produces; swallowing it is the intended
+// end of this green thread, not an ignored failure.
+fn budgetServe(s: Server) {
+  listenAndServeOn(s, bodyLenEcho) catch _ {
+    return
+  }
+}
+
+test "Server.setMaxBodyBytes reaches the read path over a real connection" {
+  let s = serve("127.0.0.1", 0) catch e {
+    assert(false, "serve: ${e.message()}")
+    return
+  }
+  // Before serving starts: `listenAndServeOn` reads the budget once, when the
+  // loop begins.
+  s.setMaxBodyBytes(64)
+  let port = s.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  spawn budgetServe(s)
+
+  let atLimit = post("http://127.0.0.1:${port}/u", repeat("a", 64)) catch e {
+    s.close()
+    assert(false, "post at the limit: ${e.message()}")
+    return
+  }
+  assert(atLimit.status == 200, "at the limit: status ${itoa(atLimit.status)}")
+  assert(atLimit.body == "64", "the handler read a body of '${atLimit.body}' bytes")
+
+  let over = post("http://127.0.0.1:${port}/u", repeat("a", 65)) catch e {
+    s.close()
+    assert(false, "post over the limit: ${e.message()}")
+    return
+  }
+  // 400, not 200: `answer` catches `readMessage`'s failure and answers
+  // `answerBadRequest`. A 200 here would mean the handler ran on a body the
+  // server was configured to refuse.
+  assert(over.status == 400, "over the limit: status ${itoa(over.status)}")
+  s.close()
+}

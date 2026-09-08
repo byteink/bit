@@ -95,11 +95,15 @@ fn fillTo(s: byteStream, have: string, n: int): string! {
   return b.toString()
 }
 
-fn decodeChunkedBody(s: byteStream, buffered: string): string! {
+fn decodeChunkedBody(s: byteStream, buffered: string, maxBodyBytes: int): string! {
   let maxChunks = 1048576
   let buf = buffered
   let body = newBuilder()
   let n = 0
+  // Bytes of decoded body accumulated so far. A chunked body declares no
+  // total length, so `maxBodyBytes` can only be enforced here, as the sizes
+  // add up — the one budget it is easiest to forget.
+  let total = 0
   while (n < maxChunks) {
     n = n + 1
     let (sizeLine, rest) = readUntil(s, buf, "\r\n")?
@@ -113,6 +117,17 @@ fn decodeChunkedBody(s: byteStream, buffered: string): string! {
     if (size < 0) {
       fail newError("readMessage: bad chunk size")
     }
+    // Refused on the DECLARED size, before `fillTo` reads a byte of it: a
+    // single chunk claiming 4 GiB is rejected without allocating 4 GiB, and a
+    // stream of small chunks is rejected on the one that crosses the budget.
+    // Written as a subtraction, not `total + size > maxBodyBytes`: `total` is
+    // never above `maxBodyBytes` (this check is what keeps it there), so the
+    // left side cannot overflow, while the addition could for a chunk size
+    // near the top of the range and would then compare as negative.
+    if (size > maxBodyBytes - total) {
+      fail newError("readMessage: chunked body exceeds ${maxBodyBytes} bytes")
+    }
+    total = total + size
     if (size == 0) {
       // The final chunk: consume the (usually empty) trailer section, one
       // field line at a time, up to and including its terminating blank line.
@@ -162,8 +177,7 @@ fn hasBareControlChar(headBlock: string): bool {
 }
 
 // Header block size cap, checked while `readMessage` is still accumulating
-// the request line and headers (the body is already bounded — by
-// `Content-Length`, or chunk-by-chunk by `decodeChunkedBody`'s `maxChunks`).
+// the request line and headers; the body has its own budget below.
 // Deny by default: nothing else stops a peer that never sends the
 // terminating blank line from growing `buf` without limit while this loop
 // keeps reading. 64 KiB is generous for any real request (ordinary headers
@@ -171,6 +185,23 @@ fn hasBareControlChar(headBlock: string): bool {
 // use as a hard ceiling (nginx's 8 KiB per line, Node's ~16 KiB total
 // default).
 const maxHeaderBytes = 65536
+
+// The body a server will read off one request, in bytes, before the read is
+// refused (#4565). Every `readMessage` caller passes one; this is the default
+// a `Server`/`TlsServer` starts with, and `setMaxBodyBytes` (server.bit)
+// raises or lowers it.
+//
+// Deny by default, the same way `maxHeaderBytes` does. Until this existed, a
+// request declaring `Content-Length: 4294967296` had those bytes read and
+// resident before any handler — or any framework limit above it, such as
+// `pkg/web`'s `Config.maxBody` — could look at the request at all, so the
+// limit above was a limit on what got PARSED, not on what got read.
+//
+// 32 MiB matches `multipart.bit`'s `defaultLimits().maxBodyBytes`, which is
+// the same bound for the one body shape that already had one. As there, zero
+// means "refuse every body", not "unlimited": there is no unlimited value,
+// which is the point.
+const defaultMaxBodyBytes = 32 * 1024 * 1024
 
 // Reads a full HTTP message off `s`: the request line, headers, and a body
 // framed per RFC 9112 §6 — `Content-Length` bytes read exactly (truncating
@@ -181,8 +212,10 @@ const maxHeaderBytes = 65536
 // unparsable `Content-Length`, an unsupported transfer coding, a malformed
 // chunk stream, a bare CR/LF/NUL inside the header block (RFC 9110 §5.5 —
 // left unrejected, that is a response-header-injection primitive for any
-// handler that reflects a header value), or a header block over
-// `maxHeaderBytes`. An empty method/path/headers/body `Request` (no failure)
+// handler that reflects a header value), a header block over
+// `maxHeaderBytes`, or a body over `maxBodyBytes` — the last refused on the
+// declared Content-Length, or on the running total of chunk sizes, before the
+// bytes are read (#4565). An empty method/path/headers/body `Request` (no failure)
 // means the peer closed before a complete header block arrived; the caller's
 // subsequent write will simply fail against the already-closed socket.
 // Reads through the blank line that ends a message's headers and returns the
@@ -253,7 +286,7 @@ fn readRequestContentLengthBody(s: byteStream, initial: string, cl: int): string
 // than pick one. Chunked is decoded, never handed through as raw framing.
 // Neither header present means no body, regardless of what already arrived.
 // Split out of `readMessage` (#2448).
-fn readRequestBody(s: byteStream, bodyStart: string, headers: string): string! {
+fn readRequestBody(s: byteStream, bodyStart: string, headers: string, maxBodyBytes: int): string! {
   let clText = header(headers, "content-length")
   let teText = toLower(header(headers, "transfer-encoding"))
   let hasCl = len(clText) > 0
@@ -265,19 +298,27 @@ fn readRequestBody(s: byteStream, bodyStart: string, headers: string): string! {
     if (teText != "chunked") {
       fail newError("readMessage: unsupported Transfer-Encoding")
     }
-    return decodeChunkedBody(s, bodyStart)?
+    return decodeChunkedBody(s, bodyStart, maxBodyBytes)?
   }
   if (hasCl) {
     let cl = atoi(clText)
     if (cl < 0) {
       fail newError("readMessage: invalid Content-Length")
     }
+    // On the DECLARED length, before `readRequestContentLengthBody` allocates
+    // or reads anything: the peer's own number is the whole basis of the
+    // read, so refusing it here is what stops the bytes from ever becoming
+    // resident. Refusing after the read would be a parse limit, not a read
+    // limit.
+    if (cl > maxBodyBytes) {
+      fail newError("readMessage: Content-Length ${cl} exceeds ${maxBodyBytes} bytes")
+    }
     return readRequestContentLengthBody(s, bodyStart, cl)?
   }
   return ""
 }
 
-fn readMessage(s: byteStream): Request! {
+fn readMessage(s: byteStream, maxBodyBytes: int): Request! {
   // Before the first read, not after it: the address is read off the socket
   // with `getpeername`, which stops answering once the connection is torn
   // down, and a request whose peer hangs up the moment it finishes sending is
@@ -321,6 +362,6 @@ fn readMessage(s: byteStream): Request! {
       path = afterMethod[0:sp2]
     }
   }
-  let body = readRequestBody(s, bodyStart, headers)?
+  let body = readRequestBody(s, bodyStart, headers, maxBodyBytes)?
   return Request{ method: method, path: path, headers: headers, body: body, peer: peer }
 }
