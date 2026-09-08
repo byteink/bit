@@ -1,0 +1,172 @@
+// run
+// #4507: a fallible function's ERROR path returns a bare `const_nil` for a
+// class or tuple ok type instead of allocating a zeroed object. The value is
+// dead by construction, and this pins the four caller shapes that make it so —
+// every one of them places its first read of the handle in the block the
+// `err_get() != nil` branch guards, so a nil is never dereferenced:
+//
+//   1. `?` propagation      the value flows only into `cont`, whose single
+//                           predecessor is the err==nil edge
+//   2. a value `catch`      the err edge carries the HANDLER's value; the
+//                           call's own handle reaches the join only on ok
+//   3. a discarded call     nothing reads the handle at all
+//   4. through a fn value   `fnvalue$trampoline` hands its callee's handle
+//                           straight to its own `ret`, unread
+//
+// A three-member tuple is the widest ok shape (#4405's return-register
+// convention refuses a fallible result outright, so it comes back as one
+// handle); a class ok type is the arm `zeroValue` has allocated on since
+// classes became fallible ok types; a one-word `i64` ok type is the control
+// that still goes through `zeroValue`.
+class Box {
+  n: i64,
+  tag: string,
+}
+
+class myErr {
+  code: i64
+  message(): string { return "e${this.code}" }
+}
+
+fn tri(n: i64): (i64, bool, string)! {
+  if (n < 0) {
+    fail myErr{ code: n }
+  }
+  return (n, true, "ok${n}")
+}
+
+fn boxed(n: i64): Box! {
+  if (n < 0) {
+    fail myErr{ code: n }
+  }
+  return Box{ n: n, tag: "t${n}" }
+}
+
+fn one(n: i64): i64! {
+  if (n < 0) {
+    fail myErr{ code: n }
+  }
+  return n * 2
+}
+
+// The remaining two call opcodes a fallible tuple result can arrive through.
+// `Op.Call` with a receiver (a class method) and `Op.CallIface` (an interface
+// method) are lowered in `lowerCall`'s own arms, each emitting its call and
+// returning it with no post-processing — the same property the free-function
+// arm has, and the one the shortcut rests on.
+interface Src {
+  pull(n: i64): (i64, bool, string)!,
+}
+
+class Impl {
+  k: i64
+  pull(n: i64): (i64, bool, string)! {
+    if (n < 0) {
+      fail myErr{ code: n }
+    }
+    return (n + this.k, true, "p${n}")
+  }
+}
+
+fn viaMethod(i: Impl, n: i64): (i64, bool, string)! {
+  let (a, b, s) = i.pull(n)?
+  return (a, b, s)
+}
+
+fn viaIface(s: Src, n: i64): (i64, bool, string)! {
+  let (a, b, t) = s.pull(n)?
+  return (a, b, t)
+}
+
+// Shape 1, two hops: the err path's nil is returned by `tri`, propagated by
+// `viaTry` and propagated again by `viaTryTwice`, so it crosses three frames
+// before anything tests it for the last time.
+fn viaTry(n: i64): (i64, bool, string)! {
+  let (a, b, s) = tri(n)?
+  return (a + 1, b, s)
+}
+
+fn viaTryTwice(n: i64): (i64, bool, string)! {
+  let (a, b, s) = viaTry(n)?
+  return (a + 1, b, s)
+}
+
+fn viaTryBox(n: i64): Box! {
+  let b = boxed(n)?
+  return Box{ n: b.n + 1, tag: b.tag }
+}
+
+// Shape 4: the callee is reached through `Op.CallValue` and the synthesized
+// `fnvalue$trampoline`, neither of which knows the value can be an error.
+fn callThrough(f: (i64) => (i64, bool, string)!, n: i64): string {
+  let (a, b, s) = f(n) catch (-7, false, "cv")
+  return "${a}/${b}/${s}"
+}
+
+fn callThroughBox(f: (i64) => Box!, n: i64): string {
+  let b = f(n) catch Box{ n: -7, tag: "cv" }
+  return "${b.n}/${b.tag}"
+}
+
+// Split one per shape because a `catch` is a branch and twelve of them in one
+// body is E0204 complexity 13 against the ceiling of 10.
+fn shapeTry() {
+  let (a, b, s) = viaTryTwice(5) catch (-1, false, "c")
+  print("try ok ${a} ${b} ${s}\n")
+  let (p, q, r) = viaTryTwice(-2) catch (-1, false, "c")
+  print("try err ${p} ${q} ${r}\n")
+  let good = viaTryBox(4) catch Box{ n: -1, tag: "c" }
+  print("try box ok ${good.n} ${good.tag}\n")
+  let bad = viaTryBox(-4) catch Box{ n: -1, tag: "c" }
+  print("try box err ${bad.n} ${bad.tag}\n")
+}
+
+fn shapeCatch() {
+  let (u, v, w) = tri(7) catch (-1, false, "c")
+  print("catch ok ${u} ${v} ${w}\n")
+  let (x, y, z) = tri(-7) catch (-1, false, "c")
+  print("catch err ${x} ${y} ${z}\n")
+}
+
+// Shape 3. Spelled `let _ =` rather than as a bare expression statement so it
+// does not trip E0215 — and the binding is the STRONGER form of the shape: a
+// bare statement's call has no users and is simply dropped, while `_` keeps the
+// nil handle live as a block argument across every safepoint below it, so
+// `BIT_GC=stress` walks it as a traced stack root. Neither form reads a word out
+// of it (the local is not exploded). `churn` allocates while both nils are live
+// roots; the error stays in the slot until a later fallible call republishes or
+// clears it, which is what `one(3)` does here.
+fn shapeDiscard() {
+  let _ = tri(-3)
+  let _ = boxed(-3)
+  let churn = "${one(3) catch -1}"
+  print("discarded ${churn}\n")
+}
+
+fn shapeFnValue() {
+  print("fnval ${callThrough(tri, 9)}\n")
+  print("fnval ${callThrough(tri, -9)}\n")
+  print("fnval box ${callThroughBox(boxed, 9)}\n")
+  print("fnval box ${callThroughBox(boxed, -9)}\n")
+}
+
+fn shapeDispatch() {
+  let im = Impl{ k: 10 }
+  let (ma, mb, ms) = viaMethod(im, 3) catch (-1, false, "c")
+  print("method ok ${ma} ${mb} ${ms}\n")
+  let (mp, mq, mr) = viaMethod(im, -3) catch (-1, false, "c")
+  print("method err ${mp} ${mq} ${mr}\n")
+  let (ia, ib, is) = viaIface(im, 4) catch (-1, false, "c")
+  print("iface ok ${ia} ${ib} ${is}\n")
+  let (ip, iq, ir) = viaIface(im, -4) catch (-1, false, "c")
+  print("iface err ${ip} ${iq} ${ir}\n")
+}
+
+fn main() {
+  shapeTry()
+  shapeCatch()
+  shapeDiscard()
+  shapeFnValue()
+  shapeDispatch()
+  print("one ${one(6) catch -1} ${one(-6) catch -1}\n")
+}
