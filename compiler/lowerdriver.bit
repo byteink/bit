@@ -65,30 +65,44 @@ fn recordSubtreeInstantiations(c: Checker, node: int, bareNames: bool, genEnv: T
   let calls = subtreeCallNodes(c.tree, node)
   let i = 0
   while (i < len(calls)) {
-    let callee = kidsOf(c.tree, calls[i])[0]
-    let cn = getNode(c.tree, callee)
-    let name = ""
-    if (cn.tag == Tag.Ident && bareNames) {
-      name = c.source[cn.span.start:cn.span.end]
-    }
-    if (cn.tag == Tag.Member) {
-      let qn = nsQualifiedName(c, callee)
-      if (qn != "" && funcDeclLookup(c, qn) != 0) {
-        name = qn
-      }
-    }
-    if (name != "") {
-      let fr = funcRefAt(c, callee, name)
-      if (funcRefIsGeneric(fr)) {
-        recordInstantiation(
-          c,
-          fr,
-          substTypeList(c, genericTypeArgs(c, name, calls[i]), genEnv),
-          vSpan(c, calls[i]),
-        )
-      }
-    }
+    recordSubtreeCall(c, calls[i], bareNames, genEnv)
     i = i + 1
+  }
+}
+
+// One call of that walk. Split out so the walk itself stays a loop: this is
+// where every callee spelling is classified, and there are now three.
+fn recordSubtreeCall(c: Checker, callNode: int, bareNames: bool, genEnv: TypeEnv) {
+  let callee = kidsOf(c.tree, callNode)[0]
+  let cn = getNode(c.tree, callee)
+  let name = ""
+  if (cn.tag == Tag.Ident && bareNames) {
+    name = c.source[cn.span.start:cn.span.end]
+  }
+  if (cn.tag == Tag.Member) {
+    let qn = nsQualifiedName(c, callee)
+    if (qn != "" && funcDeclLookup(c, qn) != 0) {
+      name = qn
+    }
+  }
+  if (name != "") {
+    let fr = funcRefAt(c, callee, name)
+    if (funcRefIsGeneric(fr)) {
+      recordInstantiation(
+        c,
+        fr,
+        substTypeList(c, genericTypeArgs(c, name, callNode), genEnv),
+        vSpan(c, callNode),
+      )
+    }
+    return
+  }
+  // A generic METHOD call inside an instance body, for the same reason the
+  // bare-name arm above re-resolves a free one: the body was checked once
+  // against the template's unbound parameters, so the entry the check pass
+  // recorded is not the one this instance's call will name (#4495).
+  if (cn.tag == Tag.Member && bareNames) {
+    recordMethodInstantiation(c, callNode, callee, genEnv)
   }
 }
 
@@ -185,6 +199,42 @@ fn closeInstantiations(mods: []Checker, root: int) {
   }
 }
 
+// Pass A3 for one module: its methods, in declaration order. Three shapes, and
+// the instantiation ledger owns one of them outright:
+//
+//   - a plain method on a plain class: one body, emitted here;
+//   - a method that declares its OWN type params (SPEC 10.4's `scaled<T>`,
+//     #4495): monomorphized, so Pass A2 has already emitted one body per ledger
+//     entry and the template itself emits nothing — its `T` slots have no
+//     concrete type to lower against, which is exactly why lowering used to
+//     refuse the whole program with E0092;
+//   - a method on a GENERIC receiver: one body per nominal instantiation, and
+//     an uninstantiated template emits nothing (#1540).
+//
+// The generic-receiver arm is checked SECOND: a method that is generic in both
+// its receiver and itself is a ledger entry, and its receiver arguments are
+// bound in that same entry, so `lowerMethodInstances` must not also emit it
+// once per receiver instantiation under an unsuffixed symbol.
+fn lowerModuleMethods(
+  c: Checker, consts: map<string, int>, lowerer: Lowerer, out: []IrFunc,
+): []IrFunc {
+  let m = 1
+  while (m < len(c.tree.nodes)) {
+    let n = getNode(c.tree, m)
+    if (n.tag == Tag.FuncDecl && kidsOf(c.tree, m)[0] != 0 &&
+      methodOwnGenericCount(c, m) == 0) {
+      let recvName = typeNodeName(c, kidsOf(c.tree, kidsOf(c.tree, m)[0])[1])
+      if (len(declTypeParamIds(c, recvName)) == 0) {
+        out = append(out, lowerFunc(c, m, consts, lowerer))
+      } else {
+        out = lowerMethodInstances(c, m, consts, lowerer, recvName, out)
+      }
+    }
+    m = m + 1
+  }
+  return out
+}
+
 // Lowers method `decl` once per nominal instantiation of its generic receiver
 // `recvName`, appending each to `out` in the checker's instantiation order (the
 // seed's emission order). Returns `out` unchanged when the generic was never
@@ -277,16 +327,30 @@ fn receiverTypeParamNames(c: Checker, decl: int): []string {
   return out
 }
 
+// The link symbol of instantiation `g`: the declaring module's prefix, the
+// ledger name, and the ledger INDEX, which IS the `$n` suffix. One formula,
+// read by the definition (Pass A2) and by both call sites — a plain `f(...)`
+// and a method `recv.m(...)` — so a caller cannot name an instance the emitter
+// did not write.
+fn instanceSymbol(ctx: TypeContext, root: int, g: int): string {
+  let inst = ctx.instantiations[g]
+  return "${modulePrefix(inst.module, root)}${inst.name}\$${g}"
+}
+
 // Lowers generic instantiation `g` of module `c` — the type params bound to the
-// instantiation's concrete args for the duration, then restored.
+// instantiation's concrete args for the duration, then restored. A generic
+// METHOD is one of these too (#4495); its declaration carries a receiver, which
+// `lowerFuncNamed` already lowers as the leading parameter.
 fn lowerInstance(
   c: Checker, consts: map<string, int>, lowerer: Lowerer, g: int,
-  prefix: string,
 ): IrFunc {
   let inst = c.ctx.instantiations[g]
-  // `c` IS the declaring module (lowerProject picks it), so the template's decl
-  // and every type name it mentions resolve in this checker's own tree.
-  let decl = funcDeclLookup(c, inst.name)
+  // The ledger's own decl node, indexing `c`'s tree — `c` IS the declaring
+  // module (lowerProject picks it by `inst.module`). Carried rather than looked
+  // up by name: `funcDeclLookup` answers for free functions only, and a second
+  // way to reach the declaration is a second thing that can disagree with the
+  // entry that was recorded.
+  let decl = inst.decl
   let tps = kidsOf(c.tree, kidsOf(c.tree, decl)[2])
   // Built BEFORE the rebinding below, so it captures the template's own TypeParam
   // ids — what the body's checked types actually mention. Rebinding `userTypes`
@@ -304,7 +368,7 @@ fn lowerInstance(
     }
     j = j + 1
   }
-  let f = lowerFuncNamed(c, decl, consts, lowerer, "${prefix}${inst.name}\$${g}", genEnv)
+  let f = lowerFuncNamed(c, decl, consts, lowerer, instanceSymbol(c.ctx, lowerer.root, g), genEnv)
   j = 0
   while (j < len(tps)) {
     let tpn = getNode(c.tree, kidsOf(c.tree, tps[j])[0])

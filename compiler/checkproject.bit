@@ -425,3 +425,158 @@ fn funcRefIsGeneric(fr: FuncRef): bool {
   let gp = kidsOf(fr.owner.tree, fr.decl)[2]
   return gp != 0 && len(kidsOf(fr.owner.tree, gp)) > 0
 }
+
+// The concrete type arguments a generic METHOD call binds, one per entry of the
+// declaration's merged `generic_params` list, with 0 where nothing bound.
+//
+// The list is merged (parserdecl puts a generic receiver's params in front of
+// the method's own), and the two halves are bound from different places: the
+// receiver's from the RECEIVER TYPE — `Pair<int>` already carries its arguments
+// in the nominal-instantiation ledger — and the method's own from the call's
+// value arguments, through exactly the binder a generic free function uses.
+// That is what keeps `nameOf<T: Named>(v: T)` and `fn freeName<T: Named>(v: T)`
+// one mechanism rather than two.
+fn methodTypeArgsRaw(c: Checker, fr: FuncRef, recvTy: int, callNode: int): []int {
+  let out = []int(0)
+  let oc = fr.owner
+  let dk = kidsOf(oc.tree, fr.decl)
+  let tps = kidsOf(oc.tree, dk[2])
+  let params = kidsOf(oc.tree, dk[3])
+  let nrecv = len(tps) - methodOwnGenericCount(oc, fr.decl)
+  let rargs = nominalArgsOf(c, recvTy)
+  let ti = 0
+  while (ti < len(tps)) {
+    let bound = 0
+    if (ti < nrecv) {
+      if (ti < len(rargs)) {
+        bound = rargs[ti]
+      }
+    } else {
+      let tpn = getNode(oc.tree, kidsOf(oc.tree, tps[ti])[0])
+      bound = bindTypeParamAtCall(
+        oc, c, callNode, params, oc.source[tpn.span.start:tpn.span.end],
+      )
+    }
+    out = append(out, bound)
+    ti = ti + 1
+  }
+  return out
+}
+
+// `methodTypeArgsRaw` as the instantiation LEDGER stores it: a type param no
+// argument bound resolves to void, matching `genericTypeArgs`. The ledger key
+// must be total — a hole would make two different calls share one entry.
+fn methodTypeArgs(c: Checker, fr: FuncRef, recvTy: int, callNode: int): []int {
+  let args = methodTypeArgsRaw(c, fr, recvTy, callNode)
+  let i = 0
+  while (i < len(args)) {
+    if (args[i] == 0) {
+      args[i] = c.ctx.voidId
+    }
+    i = i + 1
+  }
+  return args
+}
+
+// The name-keyed substitution those arguments make inside `decl`'s own type
+// nodes. Unbound positions are LEFT OUT rather than mapped to void: an
+// unresolved param must stay itself, exactly as `genericResultAt` leaves it.
+fn methodTypeSubst(oc: Checker, decl: int, raw: []int): TypeSubst {
+  let sub = noSubst()
+  let tps = kidsOf(oc.tree, kidsOf(oc.tree, decl)[2])
+  let i = 0
+  while (i < len(tps) && i < len(raw)) {
+    if (raw[i] != 0) {
+      let tpn = getNode(oc.tree, kidsOf(oc.tree, tps[i])[0])
+      sub.names = append(sub.names, oc.source[tpn.span.start:tpn.span.end])
+      sub.types = append(sub.types, raw[i])
+    }
+    i = i + 1
+  }
+  return sub
+}
+
+// A method call's result type. For an ordinary method that is the recorded
+// `methodResults` entry, unchanged. For one that declares its OWN type params
+// it is the declared result with THIS call's arguments substituted, which is
+// the method half of `genericResultAt` (#4495): without it `b.idOf(7)` types as
+// the bare `T`, `bit check` accepts the program, and lowering then refuses to
+// interpolate a value "whose type has no show() method".
+//
+// Falls back to the recorded result whenever nothing bound or the substituted
+// node does not resolve — a wrong concrete answer would be worse than the bare
+// param, which at least still reports.
+fn methodCallResult(c: Checker, recvTy: int, mname: string, callNode: int): int {
+  let fr = methodRefAt(c, recvTy, mname)
+  let recorded = methodResultLookup(c, "${recvTy}.${mname}")
+  if (fr.decl == 0 || methodOwnGenericCount(fr.owner, fr.decl) == 0) {
+    return recorded
+  }
+  let dk = kidsOf(fr.owner.tree, fr.decl)
+  if (dk[4] == 0) {
+    return recorded
+  }
+  let sub = methodTypeSubst(
+    fr.owner, fr.decl, methodTypeArgsRaw(c, fr, recvTy, callNode),
+  )
+  if (len(sub.names) == 0) {
+    return recorded
+  }
+  let r = typeFromNodeIn(fr.owner, dk[4], sub)
+  if (r == 0) {
+    return recorded
+  }
+  return r
+}
+
+// Records the instantiation `callNode` asks for, if it asks for one — the check
+// pass's single entry point for both generic shapes, so a free `f(x)` and a
+// method `b.m(x)` cannot drift apart in which ledger entry they name.
+fn recordCallInstantiation(c: Checker, callNode: int) {
+  let cnode = kidsOf(c.tree, callNode)[0]
+  let callee = getNode(c.tree, cnode)
+  if (callee.tag == Tag.Ident) {
+    // Node-keyed, exactly as `resolveCallTarget` is: the ledger records the
+    // instantiation lowering will later look up, so if the two disagreed about
+    // which `f` a call names, lowering would emit a reference to an instance
+    // nothing recorded.
+    let cname = c.source[callee.span.start:callee.span.end]
+    let fr = funcRefAt(c, cnode, cname)
+    if (funcRefIsGeneric(fr)) {
+      recordInstantiation(c, fr, genericTypeArgs(c, cname, callNode), vSpan(c, callNode))
+    }
+    return
+  }
+  if (callee.tag == Tag.Member) {
+    recordMethodInstantiation(c, callNode, cnode, emptyTypeEnv())
+  }
+}
+
+// The method half of `recordCallInstantiation`. A Member callee that is not a
+// method call at all — a namespaced `ns.f(...)`, an `Enum.Variant(...)`
+// construction, an interface method (whose signature has no FuncDecl) — resolves
+// to no method declaration and records nothing.
+//
+// `genEnv` is the enclosing instantiation's (type param -> concrete arg) map,
+// empty during the check pass and non-empty when Pass A1 re-walks an instance
+// body: the body was checked once against unbound parameters, so both the
+// RECEIVER's type and the bound arguments have to be pushed through it, exactly
+// as the free-function arm pushes its `genericTypeArgs`.
+fn recordMethodInstantiation(c: Checker, callNode: int, callee: int, genEnv: TypeEnv) {
+  let mk = kidsOf(c.tree, callee)
+  let rawRecv = checkExprType(c, mk[0])
+  if (rawRecv == 0) {
+    return
+  }
+  let recvTy = methodRecvType(c, substType(c, rawRecv, genEnv, 0))
+  let mn = getNode(c.tree, mk[1])
+  let fr = methodRefAt(c, recvTy, c.source[mn.span.start:mn.span.end])
+  if (fr.decl == 0 || methodOwnGenericCount(fr.owner, fr.decl) == 0) {
+    return
+  }
+  recordInstantiation(
+    c, fr,
+    substTypeList(c, methodTypeArgs(c, fr, recvTy, callNode), genEnv),
+    vSpan(c, callNode),
+  )
+}
