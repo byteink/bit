@@ -1,11 +1,11 @@
 // compiler/lowerslicefill.bit — split out of lowerlit.bit (#1924), which the
 // fill loop below pushed past the 800-line limit; `zeroValue` and
-// `fillOmittedEnumFields` moved here from lowerlit.bit for the same reason
-// (#4182). This is now the module's "§13.4 zero-value machinery" file: what a
+// the omitted-field fill moved here from lowerlit.bit for the same reason
+// (#4182, then merged with the §10.5 default fill by #4469). This is now the module's "§13.4 zero-value machinery" file: what a
 // type's zero value IS (`zeroValue`), whether it HAS one at all
 // (`typeHasNoZeroValue`), and the two lowering sites that must materialize one
-// where a literal's own zeroed allocation is not enough (`fillZeroElems` for
-// `[]T(n)`, `fillOmittedEnumFields` for an omitted composite-literal field).
+// where a zeroed allocation is not enough (`fillZeroElems` for `[]T(n)`'s
+// elements, `fillOmittedFields` for a class's own omitted fields).
 // Sibling of lowerlit.bit: same module, so this needs no imports and no
 // call-site changes.
 //
@@ -196,13 +196,19 @@ fn emitNoZeroValuePanic(fc: FnCtx, ty: int, what: string) {
 
 // The zero value of `ty`, materialized.
 //
-// The Struct arm below emits a bare zeroed `GcAlloc` and writes no field, and
-// that is CORRECT rather than a shortcut, because of an invariant the checker
-// now enforces (E0083, #1914): a class type that has a class-typed field has
-// no zero value at all and never reaches here — `vBindingNoZeroValue` rejects
-// `let o: Outer` before lowering. So every class that does get here has only
-// fields whose zero value IS zero bits (scalars, strings, slices, maps,
-// interfaces, inline arrays), which is exactly what `GcAlloc` hands back.
+// The Struct arm emits a zeroed `GcAlloc` and then fills, via
+// `fillOmittedFields`. It used to write no field at all, on the strength of a
+// comment asserting that was CORRECT rather than a shortcut: the checker's
+// E0083 (#1914) rejects a class with a class-typed field, so "every class that
+// does get here has only fields whose zero value IS zero bits". That claim was
+// false from the day #4182 landed and it cost an s1 miscompile (#4469): a
+// boxed-enum field passes E0083 — `E { A, B(int) }` has a payload-free tag-0
+// variant, so it HAS a zero value — but that zero value is a live `{tag:0}`
+// object, not zero bits. `GcAlloc` left it NULL and the first `match` on it
+// segfaulted with no diagnostic, from `[]T(n)`, from `let p: T`, from a map
+// miss and from the object an `init` starts with, while the literal `T{}`
+// printed the right answer because #4182 wired its fill into that one site.
+// Defaults (§10.5, #3838) reach this arm the same way and for the same reason.
 //
 // The Enum arm is the same invariant reached through variant order instead of
 // field order (#4182): a boxed enum reaches it only when its tag-0 variant
@@ -253,10 +259,13 @@ fn zeroValue(fc: FnCtx, ty: int, span: Span): int {
     ga.ival = layout.size
     ga.offsets = layout.ptrOffsets
     let obj = builderEmit(fc.b, ga)
-    // §10.5 (#3838): a class with defaulted fields has the SAME zero value
-    // however it is constructed — see `fillDefaultFields`. A no-op emitting
-    // nothing at all for a class with no defaults, which is every class today.
-    fillDefaultFields(fc, obj, ty, []int(0))
+    // A class has the SAME zero value however it is constructed — see
+    // `fillOmittedFields`. Emits nothing at all for a class with no defaulted
+    // and no boxed-enum fields, which is most of them.
+    fillOmittedFields(fc, obj, ty, []int(0), span)
+    if (fc.failed) {
+      return 0
+    }
     return obj
   }
   // A slice zero-value is the EMPTY slice (SPEC §13.4), which since #3648 is
@@ -285,59 +294,6 @@ fn zeroValueEnumOrNil(fc: FnCtx, ty: int, td: Type): int {
   return builderEmit(fc.b, nl)
 }
 
-// Fills every field `lowerClassLit` left OMITTED (not named in the literal's
-// initializer list) whose type is a BOXED enum, with that type's real zero
-// value (#4182). `GcAlloc`'s raw zero bytes are already the right zero value
-// for every other omittable field (scalar, string, slice, map, chan,
-// interface, inline array) — only a boxed enum's zero bits are a null
-// REFERENCE rather than its live `{tag:0,nil}` object. Recomputes the
-// declaration/layout `lowerClassLit` already has, trading a little duplicate
-// (compile-time-only) work for staying at E0202's 5-param ceiling — a class
-// bundling `oc`/`fields`/`sub`/`layout` for one caller would be more
-// machinery than the question it answers.
-//
-// The checker (`vMissingStructFields`/`vFieldHasNoZeroValue`,
-// validatezero.bit) has already rejected any field whose enum type has NO
-// zero value (its tag-0 variant carries a payload), so every field reaching
-// here is safe to materialize. Unlike a class-typed field — always rejected
-// outright, per §13.4's cycle-recursion rationale — an enum's tag-0 zero
-// value never itself has a payload to recurse into, so there is no cycle to
-// worry about and no reason to reject the safe case the way a class-typed
-// field is.
-fn fillOmittedEnumFields(fc: FnCtx, obj: int, structTy: int, node: int) {
-  let kids = kidsOf(fc.c.tree, node)
-  let decl = structDeclOf(fc.c, structTy)
-  let oc = typeOwner(fc.c, structTy)
-  let sub = structLitSubst(fc.c, oc, decl, kids[0])
-  let layout = structLayout(fc, oc, decl, sub)
-  let fields = structFieldNodes(oc, decl)
-  let inits = kidsOf(fc.c.tree, kids[1])
-  let span = getNode(fc.c.tree, node).span
-  let i = 0
-  while (i < len(fields)) {
-    let fldNode = getNode(oc.tree, kidsOf(oc.tree, fields[i])[0])
-    let name = oc.source[fldNode.span.start:fldNode.span.end]
-    if (vLitNamesField(fc.c, inits, name)) {
-      i = i + 1
-      continue
-    }
-    let fty = typeFromNodeIn(oc, kidsOf(oc.tree, fields[i])[1], sub)
-    if (fc.c.ctx.types[fty].kind == TypeKind.Enum && fc.c.ctx.types[fty].enumBoxed) {
-      let zv = zeroValue(fc, fty, span)
-      if (fc.failed) {
-        return
-      }
-      let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
-      fs.lhs = obj
-      fs.ival = layout.offsets[i]
-      fs.rhs = zv
-      fs.ival2 = fty
-      builderEmit(fc.b, fs)
-    }
-    i = i + 1
-  }
-}
-
 // Lowers one field DEFAULT (SPEC §10.5, #3838) against the module that DECLARED
 // it. The initializer node indexes the declaring module's arena, so reading it
 // against this module's tree lands on an unrelated node — the whole reason a
@@ -362,24 +318,72 @@ fn lowerFieldDefault(fc: FnCtx, oc: Checker, deflt: int, fty: int): int {
   return v
 }
 
-// Materializes the default value of every field of `structTy` that `named` does
-// not mention (SPEC §10.5, #3838). `named` is a composite literal's initializer
-// list; the ZERO-VALUE constructions pass an empty one.
+// The value an OMITTED field of type `fty` must be given, or 0 for "write
+// nothing — `GcAlloc`'s zero bytes are already correct". `deflt` is the field's
+// default initializer node, 0 when it declares none.
 //
-// Called from BOTH construction sites on purpose. A default honored only by a
-// literal would make `Opts{}` and `[]Opts(1)[0]` disagree about a field the
-// author declared exactly once, and the disagreeing half is always the zero —
-// which for the cases this feature exists for (a TLS mode, a body-size cap, a
-// "reject unknown fields" flag) is the unsafe answer, not merely a surprising
-// one. `zeroValue`'s struct arm covers `[]T(n)`, a bare `let p: T`, a map miss
-// and the object an `init` starts from; §10.4 already allows an `init` to leave
-// a defaulted field alone, and that only holds if the object it is handed
-// carries the defaults.
+// Two cases, in this order, and the order is not arbitrary: a declared default
+// (§10.5, #3838) always wins, and only a field with NO default can need the
+// §13.4 zero-value materialization below it.
 //
-// A field carrying a default can never also be one `fillOmittedEnumFields`
-// fills: a default must fold to a compile-time constant (§15.4), and no enum
-// value folds, so the two loops can never write the same offset.
-fn fillDefaultFields(fc: FnCtx, obj: int, structTy: int, named: []int) {
+// A boxed enum is the one omittable field type whose zero BITS are wrong
+// (#4182): they are a null REFERENCE, where the zero value §13.4 specifies is
+// a live `{tag:0,nil}` object. Every other omittable field — scalar, string,
+// slice, map, chan, interface, inline array — has zero bits as its real zero
+// value, which is exactly what `GcAlloc` hands back, so this returns 0 and no
+// store is emitted.
+//
+// The checker (`vMissingStructFields`/`vFieldHasNoZeroValue`, validatezero.bit)
+// has already rejected any field whose type has NO zero value — a class-typed
+// field outright, per §13.4's cycle-recursion rationale, and an enum whose
+// tag-0 variant carries a payload. So every field reaching here is safe to
+// materialize, and a boxed enum's tag-0 zero value never itself carries a
+// payload, so there is no recursion and no cycle to guard against.
+fn omittedFieldValue(fc: FnCtx, oc: Checker, deflt: int, fty: int, span: Span): int {
+  if (deflt != 0) {
+    return lowerFieldDefault(fc, oc, deflt, fty)
+  }
+  let td = fc.c.ctx.types[fty]
+  if (td.kind == TypeKind.Enum && td.enumBoxed) {
+    return zeroValue(fc, fty, span)
+  }
+  return 0
+}
+
+// Gives every field of `structTy` that `named` does not mention the value the
+// language says it carries: its declared default (§10.5), or its §13.4 zero
+// value where `GcAlloc`'s raw zero bytes are not already that value.
+// `named` is a composite literal's initializer list; every ZERO-VALUE
+// construction passes an empty one.
+//
+// ONE loop for both, and that is the fix for #4469 rather than a tidy-up. These
+// were two functions, `fillDefaultFields` and `fillOmittedEnumFields`, and the
+// second took the literal's AST NODE — so it could be called only from
+// `lowerClassLit` and not from `zeroValue`, which has no node. The result was
+// that `Holder{}` filled a boxed-enum field and `[]Holder(1)`, `let p: Holder`
+// and `H(...)`'s `init` object all left it NULL and segfaulted on the first tag
+// read. A comment asserted the omission was safe; it was a claim, not a check.
+//
+// The two loops were also documented as provably disjoint — "a default must
+// fold to a compile-time constant (§15.4), and no enum value folds, so they can
+// never write the same offset". That was true, and it was another comment
+// asserting soundness. Here it is structural: one pass over the fields, one
+// value per field, so writing an offset twice is not expressible.
+//
+// Called from BOTH construction sites on purpose. A field honored only by a
+// literal would make `Opts{}` and `[]Opts(1)[0]` disagree about something the
+// author declared exactly once, and the disagreeing half is always the raw zero
+// — which for a defaulted field (a TLS mode, a body-size cap) is the unsafe
+// answer, and for a boxed enum is a null pointer. `zeroValue`'s Struct arm
+// covers `[]T(n)`, a bare `let p: T`, a map miss and the object an `init`
+// starts from; §10.4 already allows an `init` to leave a field alone, and that
+// only holds if the object it is handed carries the field's value.
+//
+// Recomputes the declaration/layout `lowerClassLit` already has, trading a
+// little duplicate compile-time work for staying at E0202's 5-param ceiling — a
+// class bundling `oc`/`fields`/`sub`/`layout` for two callers would be more
+// machinery than the question it answers.
+fn fillOmittedFields(fc: FnCtx, obj: int, structTy: int, named: []int, span: Span) {
   let decl = structDeclOf(fc.c, structTy)
   if (decl == 0) {
     return
@@ -392,20 +396,23 @@ fn fillDefaultFields(fc: FnCtx, obj: int, structTy: int, named: []int) {
   while (i < len(fields)) {
     let fk = kidsOf(oc.tree, fields[i])
     let fldNode = getNode(oc.tree, fk[0])
-    if (fk[2] == 0 || vLitNamesField(fc.c, named, oc.source[fldNode.span.start:fldNode.span.end])) {
+    if (vLitNamesField(fc.c, named, oc.source[fldNode.span.start:fldNode.span.end])) {
       i = i + 1
       continue
     }
     let fty = typeFromNodeIn(oc, fk[1], sub)
-    let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
-    fs.lhs = obj
-    fs.ival = layout.offsets[i]
-    fs.rhs = lowerFieldDefault(fc, oc, fk[2], fty)
-    fs.ival2 = fty
+    let val = omittedFieldValue(fc, oc, fk[2], fty, span)
     if (fc.failed) {
       return
     }
-    builderEmit(fc.b, fs)
+    if (val != 0) {
+      let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+      fs.lhs = obj
+      fs.ival = layout.offsets[i]
+      fs.rhs = val
+      fs.ival2 = fty
+      builderEmit(fc.b, fs)
+    }
     i = i + 1
   }
 }
