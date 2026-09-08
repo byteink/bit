@@ -24,6 +24,57 @@ class StripCtx {
   blockMap: []int,
   known: []ConstVal,
   loops: []StripLoop,
+  // #4468: which old instruction indices this pass actually bound to a new id.
+  // `remap` is zero-filled and 0 is a legal value id, so it cannot answer that
+  // on its own — and this pass does NOT emit every instruction
+  // (`stripEmitHeader` drops the original compare), so `trKeepAlive`'s
+  // no-survivor-mask contract does not hold here. Same field, same reason, as
+  // `RebuildCtx.emitted` (compiler/optrebuild.bit).
+  mapped: []bool,
+}
+
+// Binds old instruction index `idx` to `newId` and records that it was bound.
+// The ONE writer of `remap` outside `emitTranslated`, so the `mapped`
+// invariant has a single owner on each path.
+fn stripBind(sc: StripCtx, idx: int, newId: int) {
+  sc.remap[idx] = newId
+  sc.mapped[idx] = true
+}
+
+// `emitTranslated` writes `remap[idx]` itself, so the marking rides alongside.
+fn stripEmitOne(sc: StripCtx, idx: int) {
+  emitTranslated(sc.b, sc.f, sc.known, sc.remap, sc.blockMap, idx)
+  sc.mapped[idx] = true
+}
+
+// #4468: `f.keepAlive` is a list of instruction INDICES, and this pass
+// renumbers every instruction. Left alone it names whatever now sits at the old
+// index — so a GC base goes unrooted at a safepoint (a swept object read
+// through a stale interior pointer, a wrong answer at exit 0) while some
+// unrelated value's interval is held open for nothing. Every other rebuild in
+// the compiler translates this list (`trKeepAlive`/`remapKeepAlive`,
+// compiler/optrebuild.bit); this one did not, from #4204 until #4468.
+//
+// A pair with an unbound endpoint is DROPPED, for the reason `remapKeepAlive`
+// gives: re-pointing it at value id 0 is worse than having no edge at all.
+fn stripKeepAlive(sc: StripCtx): []int {
+  let out = []int(0)
+  let i = 0
+  while (i + 1 < len(sc.f.keepAlive)) {
+    let d = sc.f.keepAlive[i]
+    let b = sc.f.keepAlive[i + 1]
+    if (stripPairMapped(sc, d, b) && sc.remap[d] != sc.remap[b]) {
+      out = append(out, sc.remap[d])
+      out = append(out, sc.remap[b])
+    }
+    i = i + 2
+  }
+  return out
+}
+
+fn stripPairMapped(sc: StripCtx, d: int, b: int): bool {
+  return d >= 0 && d < len(sc.mapped) && b >= 0 && b < len(sc.mapped) &&
+    sc.mapped[d] && sc.mapped[b]
 }
 
 // `jump target(args)`, carrying `span`.
@@ -112,7 +163,7 @@ fn stripEmitHeaderConsts(sc: StripCtx, lp: StripLoop) {
   let k = hb.instsStart + hb.paramCount
   let end = stripCmpIdx(sc.f, lp.header)
   while (k < end) {
-    emitTranslated(sc.b, sc.f, sc.known, sc.remap, sc.blockMap, k)
+    stripEmitOne(sc, k)
     k = k + 1
   }
 }
@@ -127,7 +178,7 @@ fn stripEmitOuter(sc: StripCtx, li: int) {
   builderBeginBlock(sc.b, lp.outer)
   let i = 0
   while (i < hb.paramCount) {
-    sc.remap[hb.instsStart + i] = builderAddParam(sc.b, sc.f.instrs[hb.instsStart + i].ty)
+    stripBind(sc, hb.instsStart + i, builderAddParam(sc.b, sc.f.instrs[hb.instsStart + i].ty))
     i = i + 1
   }
   stripEmitHeaderConsts(sc, lp)
@@ -302,7 +353,7 @@ fn stripEmitHeader(sc: StripCtx, li: int) {
   builderBeginBlock(sc.b, lp.newHeader)
   let i = 0
   while (i < hb.paramCount) {
-    sc.remap[hb.instsStart + i] = builderAddParam(sc.b, sc.f.instrs[hb.instsStart + i].ty)
+    stripBind(sc, hb.instsStart + i, builderAddParam(sc.b, sc.f.instrs[hb.instsStart + i].ty))
     i = i + 1
   }
   lp.limParamId = builderAddParam(sc.b, primType(sc.ctx, 3))
@@ -332,14 +383,14 @@ fn stripEmitBlock(sc: StripCtx, bi: int, li: int, latchLi: int) {
   let end = blk.instsStart + blk.instsLen
   let paramsEnd = blk.instsStart + blk.paramCount
   while (idx < paramsEnd) {
-    sc.remap[idx] = builderAddParam(sc.b, sc.f.instrs[idx].ty)
+    stripBind(sc, idx, builderAddParam(sc.b, sc.f.instrs[idx].ty))
     idx = idx + 1
   }
   while (idx < end) {
     if (latchLi >= 0 && idx == end - 1) {
       stripEmitLatchJump(sc, latchLi, sc.f.instrs[idx])
     } else {
-      emitTranslated(sc.b, sc.f, sc.known, sc.remap, sc.blockMap, idx)
+      stripEmitOne(sc, idx)
     }
     idx = idx + 1
   }
@@ -517,6 +568,7 @@ fn stripMine(ctx: TypeContext, f: IrFunc): IrFunc {
     b: newBuilder(), f: f, ctx: ctx,
     remap: stripZeros(len(f.instrs)), blockMap: stripZeros(len(f.blocks)),
     known: stripNoConsts(len(f.instrs)), loops: loops,
+    mapped: stripFalses(len(f.instrs)),
   }
   let headerOf = stripRoleMap(loops, len(f.blocks), false)
   let latchOf = stripRoleMap(loops, len(f.blocks), true)
@@ -527,11 +579,24 @@ fn stripMine(ctx: TypeContext, f: IrFunc): IrFunc {
   // literal drops every field added to the class afterwards, silently: the
   // first cut of this pass predated `inTestFile`/`testFile`/`isTestDecl`/
   // `testDisplayName` and would have erased all four from any function holding
-  // a strip-mined loop, taking its `.test.bit` discovery with them. Only two
-  // fields change here, so only two are written.
+  // a strip-mined loop, taking its `.test.bit` discovery with them. Only the
+  // fields that change are written — and `keepAlive` is one of them, which is
+  // what #4468 fixes: keeping a field verbatim is right for `testFile` and
+  // wrong for a list of instruction indices when the instructions renumber.
   f.blocks = stripMarkHeaders(sc.b.blocks, loops)
   f.instrs = sc.b.instrs
+  f.keepAlive = stripKeepAlive(sc)
   return f
+}
+
+fn stripFalses(n: int): []bool {
+  let out = []bool(0)
+  let i = 0
+  while (i < n) {
+    out = append(out, false)
+    i = i + 1
+  }
+  return out
 }
 
 fn stripZeros(n: int): []int {
