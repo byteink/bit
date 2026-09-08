@@ -98,6 +98,20 @@ class LiveInterval {
   end: int,
   // True if this vreg holds a live GC reference. Only valid on class == Int.
   isRef: bool,
+  // #4503. How many times this value is READ — one per operand slot, so `x + x`
+  // counts two. Under the single-location model that is exactly the number of
+  // reloads spilling it would cost, and it is what `preferSpill` breaks an
+  // end-point TIE with. A STATIC count, with no execution frequency in it: see
+  // `preferSpill` for the measurement that says why it is trusted only where
+  // the two candidates' register time is equal by construction.
+  //
+  // Zero is the honest default for a caller that does not track uses: the tie
+  // then resolves to `false` and `preferSpill` degenerates, term for term, to
+  // Poletto & Sarkar's furthest-end rule. `codegenlive.bit`'s `extendOne` is
+  // the only writer — it is the single funnel every real read passes through —
+  // plus `mergeAliases` below, which folds an alias's reads into the root they
+  // share a location with.
+  uses: int,
 }
 
 // Where a vreg lives. Bit has no tagged union: `isSpill` selects whether `index`
@@ -223,31 +237,82 @@ fn firstFreeReg(s: ClassState, allowed: int): int {
   return -1
 }
 
-// The active entry with the furthest end whose register is in `allowed`, as an
-// index into active[0..len], or -1 when no active entry holds an allowed
-// register. active is sorted ascending by end, so scanning downward returns the
-// furthest match first — with `allowed` = fullRegMask this is always len-1,
-// which is the entry Poletto & Sarkar's SpillAtInterval considers.
+// #4503. Of two intervals with a register a spill has to come out of, which one
+// goes to the stack.
 //
-// Under the current clobber model the result is len-1 in the restricted case
-// too, whenever the caller goes on to evict, and the argument is worth keeping
-// because it is not obvious: a restricted `iv` crosses some point p with
-// iv.start < p <= iv.end, and any active interval `a` whose end exceeds
-// iv.end started no later than iv did, so a.start <= iv.start < p and
-// a.end > iv.end >= p — which makes `a` restricted as well, hence a holder of
-// an allowed register. So every candidate worth evicting is already in the
-// allowed set. The general scan is kept rather than a bare `len - 1` so that a
-// future clobber model (a per-register clobber, say) cannot quietly turn a
-// wrong answer into a miscompile.
-fn furthestActiveIn(s: ClassState, allowed: int): int {
+// FURTHEST END FIRST, exactly as before — this is Poletto & Sarkar's rule and
+// the general case is untouched. What changes is the case where that rule has
+// NO INFORMATION: two intervals with the SAME end point. It is not a rare
+// corner. `forceParamInterference` (codegenlive.bit) gives every parameter of
+// one block an identical range so they land in distinct registers, and
+// `block_param` is 84.65% of arm64 reload sites and 73.18% of x86-64's. Eleven
+// parameters of one block, all `[31, 115]`, is an ordinary shape in
+// `bench/cases/sort`; the end-point rule cannot tell them apart at all and
+// spills whichever the scan happened to reach.
+//
+// So on a tie, spill the one READ FEWEST TIMES. Under the single-location model
+// `uses` is exactly the number of reloads spilling it costs, and the register
+// time freed is `end - frontier`, which is EQUAL for the two by construction —
+// that is what the tie is. So on this subset, and only on this subset, the use
+// count is the whole of the cost difference.
+//
+// IT DELIBERATELY STOPS THERE. The obvious generalisation — rank every
+// candidate by (1 + uses) / (end - frontier + 1) — was implemented and
+// measured, and it is NOT safe: `uses` is a STATIC count with no execution
+// frequency in it, so it will trade a value carried by an inner loop for one
+// with more textual reads in cold code. Measured on this branch against `main`,
+// interleaved with a byte-identical null control under `boxlock solo`: it cut
+// arm64 reload sites 11117 -> 6201 and still cost `bench/cases/json` +1.30% to
+// +1.41% cycles over three sweeps and `matrix` +0.86% to +1.05%, with x86-64
+// `sort` +3.14% to +4.91% wall clock. `matrix`'s own disassembly names the
+// mechanism: the value it newly spilled is carried by the MIDDLE loop, so its
+// one "store at the definition" is a store per iteration. Weighing a use by
+// loop depth is the missing term, and until it exists the wider rule is a
+// regression wearing a better static number.
+//
+// WITH `uses` UNIFORMLY ZERO THIS IS THE OLD RULE, TERM FOR TERM — the tie
+// resolves to `false` and every caller that does not track uses
+// (ircheckregalloc.bit's `mkIv`) keeps exactly the documented behaviour.
+// Verified, not asserted: with the second clause reduced to `false`, all 28
+// bench objects across both targets are byte-identical to `main`.
+fn preferSpill(a: LiveInterval, b: LiveInterval): bool {
+  if (a.end != b.end) {
+    return a.end > b.end
+  }
+  return a.uses < b.uses
+}
+
+// The active entry to send to the stack among those holding a register
+// `allowed` admits, as an index into active[0..len], or -1 when no active entry
+// holds an allowed register.
+//
+// The scan runs DOWNWARD and only a STRICTLY better candidate displaces the
+// incumbent, which is what keeps `preferSpill`'s degenerate case exact:
+// `active` is sorted ascending by end, so the first allowed entry seen already
+// has the greatest end, and with no use counts nothing after it can win.
+//
+// The scan is general rather than a bare `len - 1` for the reason it always
+// was, restated because it is not obvious: under the current clobber model a
+// restricted `iv` crosses some point p with iv.start < p <= iv.end, and any
+// active interval `a` whose end exceeds iv.end started no later than iv did, so
+// a.start <= iv.start < p and a.end > iv.end >= p — which makes `a` restricted
+// as well, hence a holder of an allowed register. Every candidate worth
+// evicting was already in the allowed set, and keeping the scan general is what
+// stops a future clobber model (a per-register clobber, say) turning that into
+// a miscompile.
+fn cheapestActiveIn(s: ClassState, scan: []LiveInterval, allowed: int): int {
+  let best = -1
   let k = s.len
   while (k > 0) {
     k = k - 1
-    if (((allowed >> s.active[k].reg) & 1) == 1) {
-      return k
+    if (((allowed >> s.active[k].reg) & 1) != 1) {
+      continue
+    }
+    if (best < 0 || preferSpill(scan[s.active[k].idx], scan[s.active[best].idx])) {
+      best = k
     }
   }
-  return -1
+  return best
 }
 
 // Drops active[k], preserving the ascending-by-end order. Bounded by `count`.
@@ -410,7 +475,7 @@ fn copyIntervals(intervals: []LiveInterval): []LiveInterval {
       out,
       LiveInterval{
         vreg: iv.vreg, regClass: iv.regClass, start: iv.start,
-        end: iv.end, isRef: iv.isRef,
+        end: iv.end, isRef: iv.isRef, uses: iv.uses,
       },
     )
     i = i + 1
@@ -449,6 +514,10 @@ fn mergeAliases(scan: []LiveInterval, posOf: []int, roots: []int): []bool {
       if (scan[i].end > scan[rp].end) {
         scan[rp].end = scan[i].end
       }
+      // The reads move with the range: root and alias share ONE location, so
+      // spilling the root reloads at the alias's use sites too. Leaving them
+      // behind would price a coalesced interval below what it costs.
+      scan[rp].uses = scan[rp].uses + scan[i].uses
       // The reference moves to the root along with the range. Clearing it here
       // rather than filtering aliases out of the stack-map walk is what keeps
       // that walk exactly as it was: an alias would otherwise report the shared
@@ -626,20 +695,20 @@ fn allocateCoalesced(
       oi = oi + 1
       continue
     }
-    let victim = furthestActiveIn(state, allowed)
-    if (victim < 0 || scan[state.active[victim].idx].end <= iv.end) {
-      // Nothing active is worth evicting (the allowed subset is empty, or `iv`
-      // itself has the furthest end among its holders) — Poletto & Sarkar's
-      // SpillAtInterval "else" branch. `iv` is the interval being processed, so
-      // its start is the scan frontier and recycling a freed slot is sound.
+    let victim = cheapestActiveIn(state, scan, allowed)
+    if (victim < 0 || !preferSpill(scan[state.active[victim].idx], iv)) {
+      // Nothing active is worth evicting — the allowed subset is empty, or `iv`
+      // is itself the cheapest thing here to put on the stack. SpillAtInterval's
+      // "else" branch, reached through the same predicate that ranked the
+      // candidates, so the two can never disagree. `iv` is the interval being
+      // processed, so its start is the scan frontier and recycling is sound.
       locations[iv.vreg] = RegLoc{ isSpill: true, index: assignSpill(spills, scan, idx, true) }
       oi = oi + 1
       continue
     }
-    // Evict the furthest-ending active interval holding an allowed register and
-    // hand that register to `iv` — SpillAtInterval's "if" branch. The evicted
-    // interval started before the frontier, so it must get a fresh slot, never a
-    // recycled one.
+    // Evict the cheapest-to-spill active interval holding an allowed register
+    // and hand that register to `iv` — SpillAtInterval's "if" branch. The
+    // evicted interval started before the frontier, so it gets a fresh slot.
     let evicted = state.active[victim]
     removeActiveAt(state, victim)
     let slot = assignSpill(spills, scan, evicted.idx, false)
