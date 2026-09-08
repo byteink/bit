@@ -1,0 +1,339 @@
+// pkg/web/cors.bit — `app.use(cors(Cors{ ... }))`: cross-origin responses for
+// an EXPLICIT list of origins, and nothing else (#3955).
+//
+//   app.use(cors(Cors{
+//     origins: []string{ "https://app.example.com" },
+//     methods: []string{ "GET", "POST" },
+//     headers: []string{ "Content-Type", "Authorization" },
+//     credentials: true,
+//     maxAge: 600,
+//   }))
+//
+// Every CORS incident in the wild is the same one: a wildcard that was meant
+// to be temporary. So there is no wildcard here to leave behind — not as a
+// value, not as a default, not as a special case in the matcher. An origin is
+// allowed when it is byte-for-byte one of the strings the app wrote down, and
+// there is no other way to be allowed.
+//
+// --- what the middleware does, in order -----------------------------------
+//
+//   1. reads the request's `Origin`
+//   2. allowed AND a preflight -> answer 204 here; the handler never runs
+//   3. otherwise call the chain, then add `Vary: Origin` to whatever came back
+//   4. allowed -> also echo `Access-Control-Allow-Origin` (and, if the app
+//      asked for it, `Access-Control-Allow-Credentials: true`)
+//
+// A DISALLOWED ORIGIN IS NOT AN ERROR. It reaches the handler and gets an
+// ordinary response carrying no `Access-Control-*` header at all. CORS is
+// enforced in the browser, by the absence of that header; a 403 here would
+// break every non-browser client (curl, a server-to-server call, a health
+// check) for no gain, since those never send an `Origin` and are not subject
+// to CORS in the first place.
+//
+// --- `Vary: Origin`, on every response this middleware touches -------------
+//
+// Including the disallowed one, and including a request that sent no `Origin`
+// at all. The response's headers are a function of the request's `Origin`, so
+// a shared cache in front of the app that does not key on it will hand one
+// origin's `Access-Control-Allow-Origin` to another origin's request — or,
+// just as wrong, hand a cached no-CORS response to an allowed origin. The
+// header is added, never replaced: a handler that already set
+// `Vary: Accept-Encoding` keeps it and gains `, Origin`.
+//
+// --- credentials and the wildcard -----------------------------------------
+//
+// `Access-Control-Allow-Credentials: true` together with a wildcard origin is
+// forbidden by the Fetch standard (§3.2.6: the check fails when the allow-origin
+// value is not a serialized origin). There is no check for that combination in
+// this file, because there is nothing to check: the value written into
+// `Access-Control-Allow-Origin` is always one specific origin taken from the
+// request and matched exactly against the app's list. The illegal combination
+// is not representable, which is a stronger guarantee than a validation that
+// somebody can later add an exemption to.
+//
+// --- what "required" means for `origins`, precisely -----------------------
+//
+// The ticket asked for `origins` to be a compile error when omitted. IT IS
+// NOT, and the reason is a language rule rather than a choice made here: a
+// field with no default takes its type's ZERO VALUE when a literal omits it
+// (SPEC §12.2), and `[]T`'s zero value is a live empty slice (§13.4). Only a
+// CLASS-typed field has no zero value and raises `E0083` — wrapping `[]string`
+// in a class to buy that would put `origins: Origins{ list: ... }` at every
+// call site and still not make an EMPTY list a compile error, which is the
+// case that actually matters.
+//
+// So the enforcement is the panic in `checkCorsConfig`, and it is at
+// REGISTRATION: `cors()` validates before it builds the middleware, so the
+// process dies on the `app.use(...)` line at startup, deterministically, on
+// every run, long before a socket is bound. That is as loud as this can be
+// made without a language change.
+//
+// --- the routing gap a preflight hits today (#4516) -----------------------
+//
+// A middleware only runs for a MATCHED route (`matchedResponse`, adapter.bit),
+// and `App`/`Group` export exactly `get`/`post`/`put`/`delete` (app.bit) — so
+// an app has no way to register the `OPTIONS` route a preflight needs, and an
+// `OPTIONS` request to a `GET` path is a 405 from `missResponse` that never
+// reaches this file. The preflight code below is therefore correct and
+// currently unreachable through the exported API; #4516 (the same gap, found
+// from HEAD) is what opens it. `cors.test.bit` reaches it the way
+// `static.test.bit` reaches HEAD: through the module-private
+// `Group.register`.
+//
+// `join`, `split`, `indexOf`, `trimSpace` and `toLower` are already bound
+// module-wide by router.bit/ctx.bit/escape.bit — an import binds per MODULE
+// (SPEC §17.1), so re-importing any of them here is E0042. This file adds no
+// import of its own.
+
+const originHeaderName = "Origin"
+const varyHeaderName = "Vary"
+const acAllowOrigin = "Access-Control-Allow-Origin"
+const acAllowMethods = "Access-Control-Allow-Methods"
+const acAllowHeaders = "Access-Control-Allow-Headers"
+const acAllowCredentials = "Access-Control-Allow-Credentials"
+const acMaxAge = "Access-Control-Max-Age"
+const acRequestMethod = "Access-Control-Request-Method"
+
+const credentialsTrue = "true"
+const optionsMethod = "OPTIONS"
+
+// The separator RFC 9110 §5.6.1 gives for a comma-separated list, and the one
+// `Vary` is parsed back with below.
+const corsListSep = ", "
+const corsListComma = ","
+const schemeSep = "://"
+const pathSep = "/"
+
+// What an app is willing to expose across origins. Every field except
+// `origins` is restrictive when left out — an omitted list emits no header at
+// all, `credentials` is false, and `maxAge` 0 means "send no
+// `Access-Control-Max-Age`, let the browser use its own short default".
+//
+// The lists are NOT validated against what the router can serve: naming a
+// method here does not register a route, and the browser is what compares its
+// intended request against `Access-Control-Allow-Methods`.
+export class Cors {
+  // The exact origins allowed, each spelled as a browser serializes one:
+  // lowercase scheme and host, an explicit port only when it is not the
+  // scheme's default, and NO trailing slash or path — `https://app.example.com`,
+  // never `https://app.example.com/`. `checkCorsConfig` panics on any other
+  // shape, because an entry the browser can never send is an allowlist row
+  // that silently matches nothing.
+  //
+  // Has no default and must not be empty. See the file header for what the
+  // language does and does not enforce there.
+  export origins: []string,
+  // Sent as `Access-Control-Allow-Methods` on a preflight. Empty sends no
+  // such header, which leaves the browser allowing only the simple methods —
+  // restrictive, and the correct direction to fail in.
+  export methods: []string,
+  // Sent as `Access-Control-Allow-Headers` on a preflight: the REQUEST headers
+  // a cross-origin caller may set. Empty sends no such header.
+  export headers: []string,
+  // Adds `Access-Control-Allow-Credentials: true`, which is what lets a
+  // cross-origin request carry cookies. Only ever sent alongside an echoed
+  // origin — see the file header on why the illegal wildcard pairing cannot
+  // occur.
+  export credentials: bool,
+  // Seconds a browser may cache a preflight result. 0 (the zero value) sends
+  // no header rather than sending `0`, which would mean "never cache" — a
+  // different and slower thing than "unspecified".
+  export maxAge: int,
+}
+
+// The per-request-invariant part of a `Cors`, computed once at registration
+// so the middleware body joins no list and validates nothing per request.
+class CorsPlan {
+  origins: []string,
+  allowMethods: string,
+  allowHeaders: string,
+  credentials: bool,
+  maxAge: int,
+}
+
+// The middleware. Validates `cfg` and PANICS on a bad one before returning —
+// see the file header on why registration is where this is enforced.
+//
+// A block-bodied arrow bound to an annotated `let`, rather than an expression
+// arrow written into the `return`: `?` and `fail` are both rejected inside an
+// arrow today (E0061/E0060, #4504) so the chain call needs `catch` +
+// `rethrow` (middleware.bit), and an arrow in RETURN position is given no
+// expected type (#4513), which leaves `next` untyped and fails at lowering
+// with E0092 after `bit check` has already exited 0. Delete the local when
+// #4513 lands.
+export fn cors(cfg: Cors): Middleware {
+  let p = newCorsPlan(cfg)
+  let mw: Middleware = (c, next) => {
+    let origin = c.header(originHeaderName)
+    let allowed = originAllowed(p.origins, origin)
+    if (allowed && isCorsPreflight(c)) {
+      return corsPreflightRes(p, origin)
+    }
+    let r = next(c) catch e {
+      return rethrow(e)
+    }
+    return applyCorsHeaders(p, r, origin, allowed)
+  }
+  return mw
+}
+
+fn newCorsPlan(cfg: Cors): CorsPlan {
+  checkCorsConfig(cfg)
+  return CorsPlan{
+    origins: cfg.origins,
+    allowMethods: join(cfg.methods, corsListSep),
+    allowHeaders: join(cfg.headers, corsListSep),
+    credentials: cfg.credentials,
+    maxAge: cfg.maxAge,
+  }
+}
+
+// Whether `origin` is on the list, by exact string equality and nothing else.
+// No case folding, no suffix match, no scheme-insensitive compare: every one
+// of those is a way for `evil-app.example.com.attacker.test` to pass, and a
+// browser serializes an origin in exactly one spelling anyway
+// (`checkCorsConfig` enforces that the list uses it too).
+//
+// An absent `Origin` is not on the list. That is what keeps a same-origin or
+// non-browser request from picking up CORS headers it never asked for.
+fn originAllowed(origins: []string, origin: string): bool {
+  if (len(origin) == 0) {
+    return false
+  }
+  for o of origins {
+    if (o == origin) {
+      return true
+    }
+  }
+  return false
+}
+
+// A CORS preflight: `OPTIONS` carrying `Access-Control-Request-Method`. Both
+// halves are required — a bare `OPTIONS` is a legitimate request for a
+// resource's capabilities and must reach the handler, not be answered with a
+// 204 that says nothing about it.
+fn isCorsPreflight(c: Ctx): bool {
+  return c.method() == optionsMethod && len(c.header(acRequestMethod)) > 0
+}
+
+// The answer to a matched preflight: 204, the allow headers, and no body. The
+// handler is never called — that is the point of answering here, and it is
+// what stops a preflight from running a mutation that the real request has
+// not been permitted yet.
+//
+// The requested method and headers are deliberately NOT checked against the
+// configured lists. The browser makes that comparison itself, against exactly
+// the two headers below; duplicating it here would add a branch whose only
+// possible effect is to disagree with the browser.
+fn corsPreflightRes(p: CorsPlan, origin: string): Res {
+  let r = noContentRes()
+  r.set(varyHeaderName, originHeaderName)
+  r.set(acAllowOrigin, origin)
+  if (p.credentials) {
+    r.set(acAllowCredentials, credentialsTrue)
+  }
+  if (len(p.allowMethods) > 0) {
+    r.set(acAllowMethods, p.allowMethods)
+  }
+  if (len(p.allowHeaders) > 0) {
+    r.set(acAllowHeaders, p.allowHeaders)
+  }
+  if (p.maxAge > 0) {
+    r.set(acMaxAge, "${p.maxAge}")
+  }
+  return r
+}
+
+// What the chain's own response picks up on the way out. `Vary` first and
+// unconditionally; the echo only for an origin that matched.
+//
+// `origin` is written into the response only on the `allowed` path, where it
+// is byte-identical to a string the app itself wrote in `Cors.origins` — so
+// what reaches the client is the app's own value, arrived at by an exact
+// match, not client bytes that passed a test.
+fn applyCorsHeaders(p: CorsPlan, r: Res, origin: string, allowed: bool): Res {
+  addVaryOrigin(r)
+  if (!allowed) {
+    return r
+  }
+  r.set(acAllowOrigin, origin)
+  if (p.credentials) {
+    r.set(acAllowCredentials, credentialsTrue)
+  }
+  return r
+}
+
+// Adds `Origin` to whatever `Vary` the response already carries, rather than
+// replacing it: `Res.set` (res.bit) is a replace, and clobbering a handler's
+// `Vary: Accept-Encoding` would break its caching to fix ours.
+fn addVaryOrigin(r: Res) {
+  let existing = r.headerValue(varyHeaderName)
+  if (len(existing) == 0) {
+    r.set(varyHeaderName, originHeaderName)
+    return
+  }
+  if (varyLists(existing, originHeaderName)) {
+    return
+  }
+  r.set(varyHeaderName, existing + corsListSep + originHeaderName)
+}
+
+// Whether the comma-separated `value` already names `token`. Field names are
+// case-insensitive (RFC 9110 §5.1), so `vary: origin` counts.
+fn varyLists(value: string, token: string): bool {
+  let want = toLower(token)
+  for f of split(value, corsListComma) {
+    if (toLower(trimSpace(f)) == want) {
+      return true
+    }
+  }
+  return false
+}
+
+// Everything that makes a `Cors` unusable, checked once, at registration.
+// Panics rather than failing: `app.use(cors(...))` is startup configuration,
+// there is nothing to recover to, and a framework that quietly served a
+// misspelled allowlist would be serving no CORS at all while looking
+// configured.
+fn checkCorsConfig(cfg: Cors) {
+  if (len(cfg.origins) == 0) {
+    panic(
+        "web: cors(): `origins` is empty — list every origin you allow, for " +
+        "example `origins: []string{ \"https://app.example.com\" }`. This " +
+        "framework has no wildcard and no default: an app that allows no " +
+        "origin sends no CORS headers, which is what an empty list means.",
+    )
+  }
+  for o of cfg.origins {
+    checkOrigin(o)
+  }
+  if (cfg.maxAge < 0) {
+    panic("web: cors(): `maxAge` is ${cfg.maxAge} — a preflight cache lifetime cannot be negative")
+  }
+}
+
+// One allowlist entry, in the one spelling a browser sends: `scheme://host`
+// with an optional `:port`, lowercase, and no path — not even a bare trailing
+// slash. Anything else can never equal an `Origin` header, so it is an entry
+// that looks like permission and grants none; this is the check that turns
+// that into a startup panic instead of a support ticket.
+fn checkOrigin(o: string) {
+  let sep = indexOf(o, schemeSep)
+  if (sep <= 0) {
+    panic(
+        "web: cors(): origin '${o}' has no scheme — an entry must be spelled " +
+        "the way a browser sends `Origin`, as in `https://app.example.com`",
+    )
+  }
+  let host = o[sep + len(schemeSep):len(o)]
+  if (len(host) == 0 || indexOf(host, pathSep) >= 0) {
+    panic(
+        "web: cors(): origin '${o}' must be a scheme and host with no path or " +
+        "trailing slash — an `Origin` header never carries one, so this entry " +
+        "would match nothing",
+    )
+  }
+  if (o != toLower(o)) {
+    panic("web: cors(): origin '${o}' must be lowercase — a browser lowercases the scheme and host it sends")
+  }
+}
