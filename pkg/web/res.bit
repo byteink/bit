@@ -1,0 +1,345 @@
+// pkg/web/res.bit — the response side (#3884): `Res`, the value every handler
+// returns, and the free constructors `Ctx`'s helpers delegate to.
+//
+// The HELPERS THEMSELVES ARE ON `Ctx` (ctx.bit), not here, and that is forced
+// rather than chosen: since 0.2.0 a method may only be declared inside its
+// class's body (SPEC §10.4 — the `fn (c: Ctx) name()` receiver form is
+// E0103), so a `Ctx` method cannot live in a sibling file. `Ctx`'s response
+// methods are therefore one-line forwards onto the constructors below, and
+// every rule this ticket owns — the status range, the derived `Location`, the
+// empty 204/304 body, the mandatory `Content-Type` — lives HERE, in one copy,
+// where the forwards cannot drift from it.
+//
+// `header(name, value)` IS ON `Res`, NOT ON `Ctx`, and that is also forced:
+// `Ctx.header(name)` already reads a REQUEST header (#3883), and Bit has no
+// overloading, so a second `Ctx.header` is a redeclaration. It reads better
+// anyway — `c.text("hi").header("X-Trace", id)` is the chain the ticket asks
+// for, and there is no point in the request at which a handler has a header
+// to set but no `Res` to set it on.
+//
+// `Json`, `jsonEncode` and `toLower` are already imported module-wide by
+// escape.bit, and `join` by router.bit (an import binds per MODULE, not per
+// file — SPEC §17.1); re-importing either here is E0042.
+//
+// WHAT PANICS AND WHY. Three things here abort instead of failing: a status
+// outside 100..599, a control byte in a header name or value, and a
+// `Location` that cannot be derived. All three are caller-contract
+// violations with no correct recovery — the same call the framework already
+// makes for registration after `listen()` (app.bit) and use after
+// `destroy()` (session.bit). The alternative for the header bytes is
+// silently stripping them, which is exactly the "a rewrite hides the attack"
+// move escape.bit's own header rejects.
+
+// A value `c.json` can serialize: anything with `toJson(): Json`, which in
+// practice means a class carrying `@json` (#3976, SPEC §10.5) — the mark
+// synthesizes exactly this member, and it is the CONSENT that a type is
+// meant to be exposed.
+//
+// An INTERFACE PARAMETER, not the ticket's `json<T>(v: T)` with a `T:
+// Jsonable` bound, because a generic METHOD with an interface bound does not
+// lower today: `nameOf<T: Named>(v: T): string { return v.label() }` in a
+// class body passes `bit check` and then fails `E0092, cannot lower a `.`
+// field access on a receiver that is not a class or interface`, while the
+// byte-identical free function `fn freeName<T: Named>(v: T)` compiles and
+// runs. Filed as #4494. The observable surface is the same either way —
+// `c.json(u)` at the call site, and a type without `toJson` is refused by
+// the checker naming the missing method (`E0041: 'Plain' has no method
+// 'toJson'; 'Jsonable' needs () => Json`) — so this costs one dynamic
+// dispatch and nothing else.
+export interface Jsonable {
+  toJson(): Json
+}
+
+const contentTypeName = "Content-Type"
+const locationName = "Location"
+const setCookieName = "Set-Cookie"
+
+// Every `Content-Type` this file can set carries a charset where one is
+// meaningful. A missing charset on `text/html` is an XSS vector in browsers
+// that fall back to sniffing, so it is never left to the caller; JSON is
+// always UTF-8 by RFC 8259 §8.1 and takes no charset parameter.
+const jsonContentType = "application/json"
+const textContentType = "text/plain; charset=utf-8"
+const htmlContentType = "text/html; charset=utf-8"
+
+const statusOK = 200
+const statusCreated = 201
+const statusNoContent = 204
+const statusFound = 302
+const statusNotModified = 304
+
+const minStatus = 100
+const maxStatus = 599
+
+// One response header, as written. A LIST rather than a map because header
+// order is preserved on the wire and a map's iteration order is not, and
+// because the name is kept in the caller's own spelling while lookup and
+// replacement are case-insensitive (RFC 9110 §5.1).
+export class Header {
+  export name: string,
+  export value: string,
+}
+
+// What a handler returns. Built only through `Ctx`'s helpers (ctx.bit) or
+// the constructors below, never by literal: every path through them sets a
+// status inside 100..599 and, where there is a body, a `Content-Type`.
+export class Res {
+  code: int
+  bodyText: string
+  pairs: []Header
+
+  // Replaces this response's status. Chainable, so `c.redirect(u).status(301)`
+  // is how a permanent redirect is written. Panics outside 100..599 AT THIS
+  // CALL — the ticket's own rule, and the point of it is that the failure
+  // names the handler that made it rather than surfacing later on the
+  // response path with nothing to attribute it to.
+  export status(n: int): Res {
+    this.code = checkStatus(n)
+    return this
+  }
+
+  // Sets `name` to `value`, replacing any value this response already had
+  // for that name (case-insensitively) and keeping its original position in
+  // the list. Chainable.
+  //
+  // Replace, not append: the one header the framework sets on the caller's
+  // behalf that could legitimately repeat is `Set-Cookie`, and it is added
+  // when the response is BUILT (`Ctx.finish`, ctx.bit), before a handler can
+  // chain anything — so a handler that then sets its own `Set-Cookie` is
+  // making an explicit override, which is the behaviour that reads correctly
+  // at the call site.
+  export header(name: string, value: string): Res {
+    this.set(name, value)
+    return this
+  }
+
+  export statusCode(): int {
+    return this.code
+  }
+
+  // This response's body — EMPTY on 204 and 304 whatever was set, per the
+  // ticket's "enforce it rather than trusting the caller". Enforced here, at
+  // the single read boundary, rather than by clearing `bodyText` in
+  // `status()`: a rule applied at the write would depend on the order a
+  // handler chained its calls (`c.text("x").status(204)` versus
+  // `c.status(204)` then a body), and this cannot.
+  export body(): string {
+    if (this.code == statusNoContent || this.code == statusNotModified) {
+      return ""
+    }
+    return this.bodyText
+  }
+
+  // The value set for `name` (case-insensitive), or "" if there is none.
+  export headerValue(name: string): string {
+    let want = toLower(name)
+    for h of this.pairs {
+      if (toLower(h.name) == want) {
+        return h.value
+      }
+    }
+    return ""
+  }
+
+  // Every header, in the order they were set. The adapter (#3885) writes
+  // these; a test reads them to prove a response carries exactly what it
+  // should and nothing else.
+  export headerList(): []Header {
+    return this.pairs
+  }
+
+  // The one mutation point for `pairs`, so name/value validation cannot be
+  // bypassed by a constructor that sets a header without going through
+  // `header()`. Module-private and void — `header()` is the exported,
+  // chainable face of it.
+  set(name: string, value: string) {
+    checkHeaderName(name)
+    checkHeaderValue(name, value)
+    let want = toLower(name)
+    let out = []Header(0)
+    let replaced = false
+    for h of this.pairs {
+      if (toLower(h.name) != want) {
+        out = append(out, h)
+        continue
+      }
+      if (!replaced) {
+        out = append(out, Header{ name: name, value: value })
+        replaced = true
+      }
+    }
+    if (!replaced) {
+      out = append(out, Header{ name: name, value: value })
+    }
+    this.pairs = out
+  }
+}
+
+// The one `Res` constructor. `contentType` is "" for the statuses that carry
+// no representation (204, 302, a bare `c.status(n)`), and the mandatory type
+// otherwise — there is no path here that produces a body without one.
+fn newRes(code: int, contentType: string, body: string): Res {
+  let r = Res{ code: checkStatus(code), bodyText: body, pairs: []Header(0) }
+  if (len(contentType) > 0) {
+    r.set(contentTypeName, contentType)
+  }
+  return r
+}
+
+fn jsonRes(v: Jsonable): Res {
+  return newRes(statusOK, jsonContentType, jsonEncode(v.toJson()))
+}
+
+fn textRes(s: string): Res {
+  return newRes(statusOK, textContentType, s)
+}
+
+// Takes a `Node`, never a string (#3887): the tree escapes as it is built,
+// so a handler cannot emit unescaped user input by accident. `raw(s)` is the
+// one way a trusted string gets in, and it is the one word a security review
+// greps for.
+fn htmlRes(n: Node): Res {
+  return newRes(statusOK, htmlContentType, render(n))
+}
+
+fn statusRes(n: int): Res {
+  return newRes(n, "", "")
+}
+
+fn noContentRes(): Res {
+  return newRes(statusNoContent, "", "")
+}
+
+// 201 with the `Location` this package derived from the matched route
+// (`routeLocation`). The value is server-built and always relative, so it
+// gets no scheme check — there is no scheme in it.
+fn createdRes(location: string): Res {
+  let r = newRes(statusCreated, "", "")
+  r.set(locationName, location)
+  return r
+}
+
+// The escape hatch: 201 for a resource that does NOT live under the route
+// that created it. `target` comes from the handler, so it goes through
+// escape.bit's `url()` — the same scheme allowlist an `href` gets.
+fn createdUrlRes(target: string): Res {
+  let r = newRes(statusCreated, "", "")
+  r.set(locationName, checkedUrl("c.createdUrl", target))
+  return r
+}
+
+// 302 by default; `redirect(u).status(301)` is how a permanent one is
+// written. `target` gets the same scheme allowlist as `createdUrl` — an
+// unchecked redirect target is how `javascript:` and `data:` reach a
+// browser's address bar.
+fn redirectRes(target: string): Res {
+  let r = newRes(statusFound, "", "")
+  r.set(locationName, checkedUrl("c.redirect", target))
+  return r
+}
+
+// `target` if its scheme is on escape.bit's allowlist (or it is relative,
+// which is the common case), otherwise a panic naming the caller. See the
+// file header on why this aborts rather than failing.
+fn checkedUrl(who: string, target: string): string {
+  if (len(target) == 0) {
+    panic("web: ${who}: the target URL is empty")
+  }
+  return url(target) catch e {
+    panic("web: ${who}: ${e.message()}")
+  }
+}
+
+// The `Location` for a resource just created UNDER the matched route:
+// `pattern` with its own dynamic segments filled from this request's bound
+// params, then `id` appended. Under `app.group("/api/v1")` a route `/users`
+// gives `/api/v1/users/42`, because `pattern` is already fully prefixed
+// (app.bit's `Group.register` folds every prefix in before the router sees
+// it).
+//
+// It is built from the PATTERN and never from `c.path()`, even though the
+// two agree segment for segment on any request that matched: the pattern is
+// the server's own spelling, the request path is the client's, and a
+// `Location` echoed out of client bytes is a redirect the client chose.
+// Param values are still client data — they are the only part of the URL
+// that can be — and they are exactly the values the router bound, which is
+// what makes the result the resource's real address.
+//
+// Reuses router.bit's `splitSegments`/`isParamSeg`/`isWildcardSeg` rather
+// than parsing pattern syntax a second way, the same reuse ctx.bit's
+// `fillRoutePattern` already makes.
+fn routeLocation(pattern: string, params: map<string, string>, id: string): string {
+  if (len(pattern) == 0) {
+    panic(
+      "web: c.created(): this Ctx carries no matched route pattern — created() " +
+      "derives its Location from the route, so it is only callable on a Ctx built " +
+      "for a matched request (use c.createdUrl(url) otherwise)",
+    )
+  }
+  if (len(id) == 0) {
+    panic("web: c.created(): the id is empty — the Location would name the collection, not the new resource")
+  }
+  let out = []string(0)
+  for seg of splitSegments(pattern) {
+    if (isParamSeg(seg) || isWildcardSeg(seg)) {
+      out = append(out, boundParam(params, seg))
+    } else {
+      out = append(out, seg)
+    }
+  }
+  out = append(out, id)
+  return "/" + join(out, "/")
+}
+
+// The value the router bound for the dynamic segment `seg` (`:name` or
+// `*name`). Absent is impossible on a matched request — the router binds
+// every dynamic segment of the pattern it matched — so it is a panic rather
+// than a "" that would silently emit a Location with an empty segment.
+fn boundParam(params: map<string, string>, seg: string): string {
+  let name = seg[1:len(seg)]
+  let (v, ok) = params[name]
+  if (!ok) {
+    panic("web: c.created(): route segment '${seg}' has no bound value in this request's params")
+  }
+  return v
+}
+
+fn checkStatus(n: int): int {
+  if (n < minStatus || n > maxStatus) {
+    panic("web: status ${n} is outside the 100..599 range HTTP defines")
+  }
+  return n
+}
+
+// Refuses a header name that could not survive the wire: empty, or holding
+// a byte outside printable ASCII, a space, or the `:` that separates a name
+// from its value. Narrower than RFC 9110's `token` on purpose — this is the
+// injection-relevant subset, and every byte it rejects is one that would
+// change the shape of the response.
+fn checkHeaderName(name: string) {
+  if (len(name) == 0) {
+    panic("web: header name is empty")
+  }
+  let i = 0
+  while (i < len(name)) {
+    let c = name[i]
+    if (c <= 32 || c >= 127 || c == ':') {
+      panic("web: header name '${name}' contains a byte that is not allowed in a header name")
+    }
+    i = i + 1
+  }
+}
+
+// Refuses CR, LF and NUL in a header value: those three bytes are response
+// splitting — a value carrying one ends the header and starts whatever the
+// attacker wrote next, in the same response.
+fn checkHeaderValue(name: string, value: string) {
+  let i = 0
+  while (i < len(value)) {
+    let c = value[i]
+    if (c == 13 || c == 10 || c == 0) {
+      panic("web: header '${name}' value contains a CR, LF or NUL byte — refusing (response splitting)")
+    }
+    i = i + 1
+  }
+}
