@@ -151,8 +151,17 @@ store's own message.
 A bucket key carries the policy (`requests/window`), so the app-wide `100/60`
 limiter and the `5/300` login limiter above do not share counters even on one
 store. Two registrations with the **same** policy, the same store and the same
-key function still do share one, and count together. Give them separate stores
-until an explicit per-limit namespace lands.
+key function would share one, and count together — set `name` on each to keep
+them apart:
+
+```
+search.use(rateLimit(Limit{ requests: 100, window: 60, by: byIp, store: counters, name: "search" }))
+reports.use(rateLimit(Limit{ requests: 100, window: 60, by: byIp, store: counters, name: "reports" }))
+```
+
+`name` is optional and defaults to `""`. A `Limit` written without one produces
+exactly the bucket keys this package produced before the field existed, so
+upgrading does not orphan the counters already in a shared store.
 
 ## Reading the request body
 
