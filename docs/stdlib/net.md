@@ -83,6 +83,16 @@ byte or failed.
 Reads until the peer closes and returns everything. Only safe against a peer that
 actually closes; a keep-alive protocol needs its own framing layer instead.
 
+### `Conn.peerIp(): string!`
+
+The peer's address as a dotted quad, `"127.0.0.1"`. IPv4 only, like every other
+address in this module.
+
+Fails rather than returning a placeholder when there is no peer to name: a `Conn`
+you have already closed, one whose peer hung up hard, or a peer whose address
+family is not IPv4. Code that logs or rate-limits by address needs to see that
+difference, since a sentinel string would bucket every unknown peer together.
+
 ### `Conn.close()`
 
 Closes this end of the connection.
