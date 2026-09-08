@@ -1,0 +1,481 @@
+// pkg/web/adapter.test.bit — #3885's acceptance, one named test per assertion.
+//
+// Everything here goes through `app.handle(req)`, which is the seam the whole
+// ticket exists to establish: the real router, the real middleware chain, the
+// real `Ctx` construction and the real failure mapping, with only the socket
+// left out. A test that called a handler function directly would pass just as
+// well against a route registered at the wrong path or sitting behind the
+// wrong middleware — `handle()` cannot.
+//
+// `contains` (router.test.bit), `Request` (ctx.bit) and `readFile`/`envOr`
+// (node.test.bit) are already imported module-wide — reused, not re-imported
+// (E0042). `locateBit()` is node.test.bit's own repo locator, reused by the
+// source-level check at the bottom.
+
+// A `LogSink` (adapter.bit) that keeps every line. This is what makes the
+// security property assertable at all: the real message has to be SOMEWHERE,
+// and the test proves it is here and not in the body.
+class RecordingSink {
+  lines: []string,
+  export log(line: string) {
+    this.lines = append(this.lines, line)
+  }
+}
+
+fn newSink(): RecordingSink {
+  return RecordingSink{ lines: []string(0) }
+}
+
+// Every line the sink recorded, joined — the haystack the failure tests
+// search, so an assertion names what it wanted rather than an index.
+fn sinkText(s: RecordingSink): string {
+  return join(s.lines, "\n")
+}
+
+fn adapterApp(sink: LogSink): App {
+  return App(Config{ secret: "test-secret", logs: sink })
+}
+
+fn req(method: string, target: string): Request {
+  return Request{ method: method, path: target, headers: "", body: "" }
+}
+
+fn freezeOrPanic(app: App) {
+  app.freeze() catch e {
+    panic("freeze: ${e.message()}")
+  }
+}
+
+// --- the seam: one route behind one middleware ----------------------------
+
+test "handle() returns the handler's status, and proves the middleware ran" {
+  let mwRan = false
+  let app = adapterApp(newSink())
+  app.use(
+    (c, next) => {
+      mwRan = true
+      return next(c)
+    },
+  )
+  app.get(
+    "/hello",
+    (c) => {
+      return c.text("hi").status(202)
+    },
+  )
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/hello"))
+
+  assert(res.status == 202, "want the handler's 202, got ${res.status}")
+  assert(res.body == "hi", "want the handler's body, got '${res.body}'")
+  assert(mwRan, "the middleware on the route's scope must have run")
+}
+
+// The middleware is on the route's scope, so it must be able to answer
+// INSTEAD of the handler — through `handle()`, not merely when called
+// directly.
+test "a middleware that short-circuits answers through handle(), handler unrun" {
+  let handlerRan = false
+  let app = adapterApp(newSink())
+  let api = app.group("/api")
+  api.use(
+    (c, next) => {
+      return c.status(401)
+    },
+  )
+  api.get(
+    "/secret",
+    (c) => {
+      handlerRan = true
+      return c.text("leaked")
+    },
+  )
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/api/secret"))
+
+  assert(res.status == 401, "want 401, got ${res.status}")
+  assert(!handlerRan, "the handler must not have run")
+  assert(res.body != "leaked", "the handler's body must not reach the client")
+}
+
+// --- 404 and 405 ----------------------------------------------------------
+
+test "an unregistered path is 404" {
+  let app = adapterApp(newSink())
+  app.get("/known", okHandler)
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/unknown"))
+
+  assert(res.status == 404, "want 404, got ${res.status}")
+  assert(len(res.getHeader("Allow")) == 0, "a 404 must carry no Allow header")
+}
+
+test "a GET-only path requested with POST is 405 carrying Allow: GET" {
+  let app = adapterApp(newSink())
+  app.get("/only", okHandler)
+  freezeOrPanic(app)
+
+  let res = app.handle(req("POST", "/only"))
+
+  assert(res.status == 405, "want 405, got ${res.status}")
+  assert(res.getHeader("Allow") == "GET", "Allow: got '${res.getHeader("Allow")}'")
+}
+
+// The distinction is the point: a path registered under ANOTHER method is
+// never 404, and `Allow` names every method that path really has.
+test "Allow lists every method registered at that path, and a sibling path is still 404" {
+  let app = adapterApp(newSink())
+  app.get("/thing", okHandler)
+  app.delete("/thing", okHandler)
+  freezeOrPanic(app)
+
+  let allowed = app.handle(req("POST", "/thing"))
+  assert(allowed.status == 405, "want 405, got ${allowed.status}")
+  assert(
+    allowed.getHeader("Allow") == "DELETE, GET",
+    "Allow: got '${allowed.getHeader("Allow")}'",
+  )
+
+  let missing = app.handle(req("POST", "/thing/nested"))
+  assert(missing.status == 404, "a genuinely absent path is 404, got ${missing.status}")
+}
+
+// --- a failing handler: 500, generic body, real message logged ------------
+
+test "a handler that fails yields 500 with the message logged, not sent" {
+  let sink = newSink()
+  let app = adapterApp(sink)
+  app.get("/boom", (c) => rethrow(newError("connection string: postgres://u:p@h/db")))
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/boom?trace=1"))
+
+  assert(res.status == 500, "want 500, got ${res.status}")
+  assert(
+    !contains(res.body, "postgres://"),
+    "the real message must NOT reach the client, body was '${res.body}'",
+  )
+  let logged = sinkText(sink)
+  assert(contains(logged, "postgres://u:p@h/db"), "the real message must be logged: '${logged}'")
+  assert(contains(logged, "GET"), "the log line must carry the method: '${logged}'")
+  assert(contains(logged, "/boom"), "the log line must carry the path: '${logged}'")
+}
+
+// A failure raised by a MIDDLEWARE reaches the same single site — there is one
+// mapping, not one per layer.
+test "a failure from a middleware maps at the same site as one from a handler" {
+  let sink = newSink()
+  let app = adapterApp(sink)
+  app.use((c, next) => rethrow(newError("middleware refused")))
+  app.get("/x", okHandler)
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/x"))
+
+  assert(res.status == 500, "want 500, got ${res.status}")
+  assert(!contains(res.body, "middleware refused"), "body leaked the message: '${res.body}'")
+  assert(contains(sinkText(sink), "middleware refused"), "logged: '${sinkText(sink)}'")
+}
+
+// The sink is a real seam, not decoration: with none configured the framework
+// still answers 500 rather than dropping the request.
+test "an app with no configured log sink still answers 500 rather than dropping it" {
+  let app = App(Config{ secret: "test-secret" })
+  app.get("/boom", (c) => rethrow(newError("no sink here")))
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/boom"))
+
+  assert(res.status == 500, "want 500, got ${res.status}")
+  assert(!contains(res.body, "no sink here"), "body leaked the message: '${res.body}'")
+}
+
+// A PANIC is a different thing and Bit has no `recover` (SPEC §18.4: "There is
+// no `recover` in v0.1: panics are fatal by design"), so `handle()` cannot
+// turn one into a 500 — no construct exists to try. This is the honest proof
+// of what actually happens: a `testpanic_` verdict-inversion test, which
+// passes ONLY if the process exits with the panic status. The `fail` path
+// above is the one that yields a 500, and it is the path the framework's own
+// error model (#3876) is built on.
+test "testpanic_a_panicking_handler_aborts_rather_than_being_swallowed" {
+  let app = adapterApp(newSink())
+  app.get(
+    "/boom",
+    (c) => {
+      panic("handler exploded")
+    },
+  )
+  freezeOrPanic(app)
+  let _ = app.handle(req("GET", "/boom"))
+}
+
+// --- listen() fails before it can serve -----------------------------------
+
+// If `freeze()` did NOT reject the conflict, `listen()` would bind and serve
+// forever and this test would hang rather than fail — so the test proving
+// listen() returns at all is itself the "before serving" half of the claim.
+test "a conflicting route pattern makes listen() fail before anything is served" {
+  let app = adapterApp(newSink())
+  app.get("/dup", okHandler)
+  app.get("/dup", okHandler)
+
+  let failed = false
+  app.listen() catch e {
+    failed = true
+    let msg = e.message()
+    assert(contains(msg, "/dup"), "the failure must name the pattern: '${msg}'")
+    assert(contains(msg, "duplicate"), "the failure must say why: '${msg}'")
+  }
+  assert(failed, "listen() must fail on a conflicting pattern")
+}
+
+test "a duplicate route NAME also stops listen() before serving" {
+  let app = adapterApp(newSink())
+  app.get("/a", okHandler).name("same")
+  app.get("/b", okHandler).name("same")
+
+  let failed = false
+  app.listen() catch e {
+    failed = true
+    assert(contains(e.message(), "same"), "names the duplicate: '${e.message()}'")
+  }
+  assert(failed, "listen() must fail on a duplicate route name")
+}
+
+// --- the served path IS the tested path -----------------------------------
+
+// `serveHandler()` is the exact value `listen()` hands to `listenAndServe`
+// (app.bit). Running it beside `handle()` on the same requests is the
+// behavioural half of the ticket's "listen() reaches the request path only
+// through handle()" — the source-level half is the grep below.
+test "serveHandler(), the value listen() serves, answers identically to handle()" {
+  let app = adapterApp(newSink())
+  app.get(
+    "/ok",
+    (c) => {
+      return c.text("body")
+    },
+  )
+  app.post(
+    "/ok",
+    (c) => {
+      return c.created("7")
+    },
+  )
+  freezeOrPanic(app)
+
+  let served = app.serveHandler()
+  let targets = []Request{
+    req("GET", "/ok"),
+    req("POST", "/ok"),
+    req("DELETE", "/ok"),
+    req("GET", "/nowhere"),
+  }
+  for r of targets {
+    let viaHandle = app.handle(r)
+    let viaServe = served(r)
+    assert(
+      viaHandle.status == viaServe.status,
+      "${r.method} ${r.path}: status ${viaHandle.status} vs ${viaServe.status}",
+    )
+    assert(
+      viaHandle.body == viaServe.body,
+      "${r.method} ${r.path}: body '${viaHandle.body}' vs '${viaServe.body}'",
+    )
+    assert(
+      viaHandle.headers == viaServe.headers,
+      "${r.method} ${r.path}: headers '${viaHandle.headers}' vs '${viaServe.headers}'",
+    )
+    assert(
+      viaHandle.contentType == viaServe.contentType,
+      "${r.method} ${r.path}: contentType differs",
+    )
+  }
+}
+
+// The grep the ticket asks for, run as a test so it cannot rot: `listen()`
+// must reach the request path only through `handle()`.
+//
+// It asserts on source it actually READ — the byte count is checked first, so
+// a failed or empty read cannot pass as "no violations found". When the repo
+// cannot be located at all (a bare `bit test` from an unrelated cwd) it says
+// so and skips; `./make test-package-web` sets `BIT_REPO`, so the gate always
+// runs it.
+test "source check: listen() reaches the request path only through handle()" {
+  let loc = locateBit()
+  if (len(loc.repo) == 0) {
+    print("adapter source check: repo not locatable (set BIT_REPO) — skipping\n")
+    return
+  }
+  let appSrc = readFile("${loc.repo}/pkg/web/app.bit") catch e {
+    panic("read app.bit: ${e.message()}")
+  }
+  let adapterSrc = readFile("${loc.repo}/pkg/web/adapter.bit") catch e {
+    panic("read adapter.bit: ${e.message()}")
+  }
+  assert(len(appSrc) > 1000, "app.bit read back ${len(appSrc)} byte(s) — the read failed")
+  assert(len(adapterSrc) > 1000, "adapter.bit read back ${len(adapterSrc)} byte(s)")
+
+  assert(
+    countOccurrences(appSrc, "listenAndServe(") == 1,
+    "listenAndServe must appear exactly once in app.bit, found ${countOccurrences(appSrc, "listenAndServe(")}",
+  )
+  assert(
+    contains(appSrc, "listenAndServe(this.config.host, this.config.port, this.serveHandler())"),
+    "listen() must serve this.serveHandler() and nothing else",
+  )
+  assert(
+    contains(adapterSrc, "return (req) => app.handle(req)"),
+    "serveHandlerFor must forward to app.handle and nothing else",
+  )
+  // `dispatch` is the request path. It is DEFINED once and CALLED once, from
+  // App.handle — so nothing can reach it around handle().
+  assert(
+    countOccurrences(adapterSrc, "fn dispatch(") == 1,
+    "dispatch must be defined exactly once",
+  )
+  assert(
+    countOccurrences(appSrc, "dispatch(this, req)") == 1 &&
+      countOccurrences(appSrc, "dispatch(") == 1,
+    "app.bit must call dispatch exactly once, from handle()",
+  )
+}
+
+// Non-overlapping occurrences of `needle` in `hay`. Local to this file: the
+// source check is the only thing that counts anything.
+fn countOccurrences(hay: string, needle: string): int {
+  let n = 0
+  let i = 0
+  while (i + len(needle) <= len(hay)) {
+    if (hay[i:i + len(needle)] == needle) {
+      n = n + 1
+      i = i + len(needle)
+      continue
+    }
+    i = i + 1
+  }
+  return n
+}
+
+// --- Res -> Response conversion -------------------------------------------
+
+test "a Res's Content-Type lands in Response.contentType, not twice in headers" {
+  let app = adapterApp(newSink())
+  app.get(
+    "/j",
+    (c) => {
+      return c.text("hi").header("X-Trace", "abc")
+    },
+  )
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/j"))
+
+  assert(res.contentType == "text/plain; charset=utf-8", "contentType: '${res.contentType}'")
+  assert(
+    !contains(res.headers, "Content-Type"),
+    "Content-Type must not also be in headers: '${res.headers}'",
+  )
+  assert(res.getHeader("X-Trace") == "abc", "X-Trace: '${res.getHeader("X-Trace")}'")
+}
+
+test "a 204 carries no body through the adapter" {
+  let app = adapterApp(newSink())
+  app.get(
+    "/none",
+    (c) => {
+      return c.noContent()
+    },
+  )
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/none"))
+
+  assert(res.status == 204, "want 204, got ${res.status}")
+  assert(len(res.body) == 0, "want an empty body, got '${res.body}'")
+}
+
+test "route params and the query string both survive handle()" {
+  let app = adapterApp(newSink())
+  app.get(
+    "/users/:id",
+    (c) => {
+      return c.text("${c.param("id")}|${c.query("q")}")
+    },
+  )
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/users/42?q=hi"))
+
+  assert(res.body == "42|hi", "want '42|hi', got '${res.body}'")
+}
+
+// --- #4496: a session first touched AFTER the Res is built ----------------
+
+// The handler is a named `fn`, not an arrow, because it needs `?` on
+// `c.session()` and `?` inside an arrow is E0061 today (#4504).
+fn lateSessionHandler(c: Ctx): Res! {
+  let r = c.text("hi")
+  let s = c.session()?
+  s.set("k", "v")
+  s.save()?
+  return r
+}
+
+fn earlySessionHandler(c: Ctx): Res! {
+  let s = c.session()?
+  s.set("k", "v")
+  s.save()?
+  return c.text("hi")
+}
+
+fn sessionApp(): App {
+  return App(Config{ secret: "test-secret", sessions: MemoryStore(), logs: newSink() })
+}
+
+test "a session first touched AFTER the Res is built still gets a Set-Cookie" {
+  let app = sessionApp()
+  app.get("/late", lateSessionHandler)
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/late"))
+
+  assert(res.status == 200, "want 200, got ${res.status}")
+  let cookie = res.getHeader("Set-Cookie")
+  assert(len(cookie) > 0, "the adapter must add the Set-Cookie the Res was built without")
+  assert(contains(cookie, "HttpOnly"), "the cookie must be the session's own: '${cookie}'")
+}
+
+// The control: the ordinary order already worked (`Ctx.finish`), and the
+// adapter must not add a SECOND cookie on top of it.
+test "a session touched BEFORE the Res is built carries exactly one Set-Cookie" {
+  let app = sessionApp()
+  app.get("/early", earlySessionHandler)
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/early"))
+
+  assert(res.status == 200, "want 200, got ${res.status}")
+  assert(
+    countOccurrences(res.headers, "Set-Cookie:") == 1,
+    "want exactly one Set-Cookie, got ${countOccurrences(res.headers, "Set-Cookie:")} in '${res.headers}'",
+  )
+}
+
+test "a request that never touches the session gets no Set-Cookie" {
+  let app = sessionApp()
+  app.get(
+    "/plain",
+    (c) => {
+      return c.text("hi")
+    },
+  )
+  freezeOrPanic(app)
+
+  let res = app.handle(req("GET", "/plain"))
+
+  assert(len(res.getHeader("Set-Cookie")) == 0, "unexpected cookie: '${res.getHeader("Set-Cookie")}'")
+}
