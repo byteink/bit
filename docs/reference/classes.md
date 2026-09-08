@@ -137,8 +137,8 @@ class NewUser {
 }
 ```
 
-`@min(3)` on `name` means `min(this.name, 3)?`. Because any class with at least
-one attributed field gets a synthesized member
+`@min(3)` on `name` means a call to `min(this.name, 3)`. Because any class with
+at least one attributed field gets a synthesized member
 
 ```bit ignore
 validateFields(): ()!
@@ -152,10 +152,51 @@ fn check(u: NewUser): ()! {
 }
 ```
 
-The calls run fields top to bottom, attributes top to bottom within a field,
-each propagating with `?` - so the first failure is the one you get.
+The calls run fields top to bottom, attributes top to bottom within a field.
+**Every attribute runs**, and every failure is reported: one bad field never
+hides the next, so a user is not sent back one mistake at a time.
 `validateFields` is an ordinary exported member: callable from another module,
 testable, and listed by `bit doc`.
+
+### What a failure says
+
+The failures are collected and raised as **one error**, whose message names the
+field each came from:
+
+```
+name: too short; email: not an email
+```
+
+The name is attached by the compiler at the call, which is the only place that
+knows it - a rule is an ordinary function taking the field's *value*, and is
+never told which field it ran on. That is what keeps a rule ordinary.
+
+The same error also answers `fieldFailures(): []error` with the individual
+failures, unjoined, for a caller that has a policy per failure rather than one
+for the joined text. Ask for it by shape, the way you would ask any value
+whether it has a method:
+
+```bit
+interface FieldFailures {
+  message(): string,
+  fieldFailures(): []error,
+}
+
+fn describe(u: NewUser) {
+  u.validateFields() catch e {
+    let (agg, ok) = e.(FieldFailures)
+    if (!ok) {
+      println(e.message())
+      return
+    }
+    for one of agg.fieldFailures() {
+      println(one.message())
+    }
+    return
+  }
+  println("ok")
+}
+```
 
 There is **no registry and no plugin hook**. Any module that exports
 `fn iban(s: string): ()!` makes `@iban` work wherever it is imported, with no
@@ -199,6 +240,10 @@ fn checkSignup(s: Signup): ()! {
   s.validate()?
 }
 ```
+
+`validateFields()` reports every field rule that failed; a caller that wants the
+cross-field failures too runs `validate()` even when the first call failed,
+rather than propagating with `?`.
 
 A class that declares `validateFields` itself is an error naming both (`E0132`)
 - one name, one definition.

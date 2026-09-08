@@ -905,8 +905,8 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   fallible function**, resolved by ordinary name lookup (§17.5) in the module
   that declares the field. The attribute name IS the function name; the
   field's value is the first argument and the attribute's own arguments
-  follow. So `@email` on field `email` means `email(this.email)?`, and
-  `@max(200)` on field `name` means `max(this.name, 200)?`.
+  follow. So `@email` on field `email` calls `email(this.email)`, and
+  `@max(200)` on field `name` calls `max(this.name, 200)`.
 - Attribute arguments are **constant expressions** (§15.4), the same
   restriction a field default carries.
 - The function an attribute names must be `fn name(v: T, ...): ()!` — fallible,
@@ -925,9 +925,19 @@ field       = [ attr_list ] [ "export" ] [ "readonly" ] IDENT ":" type [ "=" con
   ```
 
   containing one call per attribute in **declaration order** — fields top to
-  bottom, attributes top to bottom within a field — each propagating with `?`,
-  so the first failure is the one reported. It is an ordinary member:
+  bottom, attributes top to bottom within a field. It is an ordinary member:
   callable, testable, callable across modules, and listed by `bit doc`.
+- **Every attribute runs.** A failing one does not end the method, so one bad
+  field never hides the next. The failures are collected and the method fails
+  ONCE with a single error carrying all of them.
+- That error's `message()` is the failures joined, each prefixed with the name
+  of the field its rule ran on (`name: too short; email: not an email`). The
+  name is attached by the synthesis, at the call — a rule takes the field's
+  VALUE and is never told which field it ran on, which is what keeps it an
+  ordinary function. The same error answers `fieldFailures(): []error` with
+  the individual failures, unjoined, for a caller with a policy per failure.
+  Both are found structurally; the type itself is not nameable and nothing
+  registers it.
 - It is deliberately **not** named `validate`. A hand-written `validate()` is
   how cross-field rules are expressed ("B is required only when A is set"),
   and the two are meant to compose: a caller runs `validateFields()` and then
