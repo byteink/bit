@@ -48,6 +48,8 @@ of `string`, a literal that omits the field - `Request{ method: "GET", path:
 "/", headers: "", body: "" }` - is legal and means "no peer known".
 
 ```bit
+import { Request, Response, ok, respond } from "std/http"
+
 fn route(req: Request): Response {
   if (len(req.peer) == 0) {
     return respond(400, "no peer address")
