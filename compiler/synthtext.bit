@@ -80,32 +80,56 @@ fn synthIdent(tree: Tree, st: SynthText, word: string): int {
   return addLeaf(tree, Tag.Ident, synthSpan(st, word))
 }
 
-// Injects every synthesized class member for one module: #3879's
-// `validateFields` and #3976's `toJson`. Both need words in the source, so both
-// go behind ONE `appendSynthText` — a module that needs neither is byte-
-// identical to before, source and tree alike.
+// What one module's synthesis pass will do, decided before anything is
+// modified: a module needs its words appended exactly once, and the word list
+// is the union of every feature that fired in it.
+class SynthPlan {
+  attrClasses: []AttrClass,
+  jsonClasses: []JsonClass,
+  decodeClasses: []JsonClass,
+  words: []string,
+  file: int,
+}
+
+// Injects every synthesized declaration for one module: #3879's
+// `validateFields`, #3976's `toJson` and #3977's `jsonDecode<T>`
+// specialisations. All three need words in the source, so all three go behind
+// ONE `appendSynthText` — a module that needs none is byte-identical to before,
+// source and tree alike.
 //
-// `@key` misuse is judged unconditionally, ahead of the early return: a `@key`
-// on a class that carries no `@json` synthesizes nothing at all, so there is no
+// `@key` misuse is judged unconditionally, ahead of the plan: a `@key` on a
+// class that carries no `@json` synthesizes nothing at all, so there is no
 // later pass that could notice it.
-fn injectSynthMembersInModule(p: Project, m: SrcModule) {
-  let diags = p.diags
-  vStrayKeyAttrs(m.tree, m.source, diags)
-  let attrClasses = collectAttrClasses(m.tree, m.source)
-  let jsonClasses = collectJsonClasses(p, m)
-  if (len(attrClasses) == 0 && len(jsonClasses) == 0) {
+fn injectSynthMembersInModule(p: Project, m: SrcModule, mid: int, d: JsonDecodeDemand) {
+  vStrayKeyAttrs(m.tree, m.source, p.diags)
+  let plan = planSynthMembers(p, m, mid, d)
+  if (len(plan.words) == 0) {
     return
   }
-  // The file id every synthesized span is stamped with. Taken from whichever
-  // feature actually fired: spans are module-global at this point, so any
-  // class in this module answers it, and `remapDiags` in the caller is what
-  // turns a module-global span back into a per-file one.
-  let file = 0
-  if (len(attrClasses) != 0) {
-    file = getNode(m.tree, attrClasses[0].className).span.file
-  } else {
-    file = getNode(m.tree, jsonClasses[0].className).span.file
+  let st = appendSynthText(m, plan.file, plan.words)
+  let newDecls = injectFieldValidatorDecls(m, p.diags, st, plan.attrClasses)
+  for x of injectJsonDecls(m, st, plan.jsonClasses) {
+    newDecls = append(newDecls, x)
   }
+  if (len(plan.decodeClasses) != 0) {
+    for x of injectJsonDecodeDecls(newJsonCtx(p, m), st, plan.decodeClasses) {
+      newDecls = append(newDecls, x)
+    }
+  }
+  for x of jsonDecodeImportDecls(m, st, mid, d, len(plan.decodeClasses) != 0) {
+    newDecls = append(newDecls, x)
+  }
+  rewriteJsonDecodeCalls(m, st, mid, d)
+  attachNewDecls(m.tree, newDecls)
+}
+
+// The plan: which classes each feature fired on, every word they need, and the
+// file id every synthesized span is stamped with.
+fn planSynthMembers(p: Project, m: SrcModule, mid: int, d: JsonDecodeDemand): SynthPlan {
+  let jx = newJsonCtx(p, m)
+  let attrClasses = collectAttrClasses(m.tree, m.source)
+  let jsonClasses = collectJsonClasses(p, m)
+  let decodeClasses = moduleDecodeClasses(d, mid, jsonClasses, jx)
   let words = []string(0)
   if (len(attrClasses) != 0) {
     for w of fieldAttrSynthWords() {
@@ -115,12 +139,39 @@ fn injectSynthMembersInModule(p: Project, m: SrcModule) {
   for w of jsonSynthWords(jsonClasses) {
     words = append(words, w)
   }
-  let st = appendSynthText(m, file, words)
-  let newDecls = injectFieldValidatorDecls(m, diags, st, attrClasses)
-  for d of injectJsonDecls(m, st, jsonClasses) {
-    newDecls = append(newDecls, d)
+  for w of jsonDecodeSynthWords(jx, decodeClasses) {
+    words = append(words, w)
   }
-  attachNewDecls(m.tree, newDecls)
+  for w of jsonDecodeCallWords(d, mid) {
+    words = append(words, w)
+  }
+  return SynthPlan{
+    attrClasses: attrClasses, jsonClasses: jsonClasses,
+    decodeClasses: decodeClasses, words: words,
+    file: synthFileId(m, attrClasses, jsonClasses, d, mid),
+  }
+}
+
+// The file id every synthesized span is stamped with. Spans are module-global
+// at this point, so any node in this module answers it, and `remapDiags` in the
+// caller is what turns a module-global span back into a per-file one. Taken
+// from whichever feature actually fired.
+fn synthFileId(
+  m: SrcModule, attrClasses: []AttrClass, jsonClasses: []JsonClass,
+  d: JsonDecodeDemand, mid: int,
+): int {
+  if (len(attrClasses) != 0) {
+    return getNode(m.tree, attrClasses[0].className).span.file
+  }
+  if (len(jsonClasses) != 0) {
+    return getNode(m.tree, jsonClasses[0].className).span.file
+  }
+  for site of d.sites {
+    if (site.callerMod == mid) {
+      return getNode(m.tree, site.callNode).span.file
+    }
+  }
+  return 0
 }
 
 // Entry point, called from resolveProject (checkproject.bit) immediately after
@@ -129,14 +180,20 @@ fn injectSynthMembersInModule(p: Project, m: SrcModule) {
 // happened before a Checker captures the module's source. After traits, so each
 // class's member list is final before anything reads it.
 //
+// The decode demand is collected across the WHOLE project first, because a
+// `jsonDecode<T>` call and `T`'s declaration routinely sit in different
+// modules and the declaring module has to know it was asked before it
+// synthesizes anything.
+//
 // Spans are MODULE-GLOBAL here, as they are in `injectTraits`, so the same
 // `remapDiags` call has to follow — without it a diagnostic renders against
 // file 0.
 fn injectSynthMembers(p: Project) {
+  let demand = collectJsonDecodeDemand(p)
   let i = 0
   while (i < len(p.mods)) {
     let before = len(p.diags.list)
-    injectSynthMembersInModule(p, p.mods[i])
+    injectSynthMembersInModule(p, p.mods[i], i, demand)
     remapDiags(p.diags, before, p.mods[i].files, p.mods[i].fileStarts)
     i = i + 1
   }
