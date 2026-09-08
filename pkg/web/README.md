@@ -37,6 +37,25 @@ place this package will read a forwarding header is `byForwardedIp(hops)` below,
 which the app asks for by name and tells how deep its proxy chain is; it keys a
 rate limit and does not change what `c.peer()` returns.
 
+## Middleware scope
+
+`app.use(m)` runs `m` for **every request the app answers**, including one for
+a path no route matches: the app-root chain is composed around the framework's
+own 404 and 405 as well as around each route's handler. A middleware that calls
+`next(c)` on such a request gets that 404 back and can act on it; one that
+answers without calling `next` replaces it. This is what lets a file mount work
+with nothing registered on the router:
+
+```
+app.use(static("/assets", "./public"))
+
+// GET /assets/app.css -> ./public/app.css, with no route under the mount
+```
+
+`group.use(m)` is narrower on purpose: it runs for the **routes** registered on
+that group and on groups nested under it, and a request that matched no route
+is on no group. Mount on the app when you want the middleware to see misses.
+
 ## Rate limiting
 
 ```

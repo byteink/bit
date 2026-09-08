@@ -22,7 +22,10 @@
 //   3. no match -> 404; matched under another method -> 405 with `Allow`
 //   4. build the `Ctx` (ctx.bit) from the request, params and matched pattern
 //   5. call the composed chain — middleware outermost, handler innermost,
-//      composed ONCE at `freeze()` (middleware.bit), never per request
+//      composed ONCE at `freeze()` (middleware.bit), never per request. On a
+//      MISS the innermost is step 3's own 404/405 and the chain around it is
+//      the app-root one (#4515), so `app.use()` middleware runs for every
+//      request whether or not the router matched anything
 //   6. seal the session (#4496), then convert the `Res` to a `Response`
 //   7. any failure at 4 or 5 goes through `failureRes`, the single mapping
 //      site, which logs the real message and sends a generic one
@@ -160,10 +163,10 @@ fn dispatch(app: App, req: Request): Response {
 // must name the methods this path really has.
 fn unmatched(app: App, req: Request, path: string, e: error): Response {
   if (req.method != methodHead) {
-    return missResponse(app, e)
+    return missResponse(app, req, e)
   }
   let m = app.root.router.lookup(methodGet, path) catch _ {
-    return missResponse(app, e)
+    return missResponse(app, req, e)
   }
   return headResponse(app, req, m)
 }
@@ -194,30 +197,71 @@ fn headResponse(app: App, req: Request, m: Match): Response {
   return out
 }
 
-// Nothing matched. 405 — with the `Allow` header RFC 9110 §15.5.6 makes
-// mandatory, listing every method registered at this exact path — when the
-// path IS registered under other methods (`MethodNotAllowed`, router.bit);
-// 404 otherwise. Never 404 for a path that exists under another method: that
-// hides a route from a client that could have used it correctly, and turns a
-// fixable 405 into a bug report.
-fn missResponse(app: App, e: error): Response {
+// Nothing matched, so the framework answers for itself. 405 — with the
+// `Allow` header RFC 9110 §15.5.6 makes mandatory, listing every method
+// registered at this exact path — when the path IS registered under other
+// methods (`MethodNotAllowed`, router.bit); 404 otherwise. Never 404 for a
+// path that exists under another method: that hides a route from a client
+// that could have used it correctly, and turns a fixable 405 into a bug
+// report.
+//
+// A `Res`, not a `Response`: it is the INNERMOST handler of the app-root
+// middleware chain (below), so it has to be the same kind of value a route's
+// handler returns or the chain could not wrap it.
+fn missRes(e: error): Res {
   let (na, ok) = e.(MethodNotAllowed)
   if (!ok) {
-    return frame(app, newRes(statusNotFound, textContentType, notFoundBody))
+    return newRes(statusNotFound, textContentType, notFoundBody)
   }
   let r = newRes(statusMethodNotAllowed, textContentType, methodNotAllowedBody)
   r.set(allowHeaderName, join(na.allowed, ", "))
-  return frame(app, r)
+  return r
 }
 
-// A matched route. Both the success exit and the failure exit seal the
-// session (#4496) and both go through `frame`, so there is one conversion
-// and one cookie decision however the request ends.
+// The innermost handler of the app-root chain (`missHandlerFor`,
+// middleware.bit), reading the per-request lookup failure `missResponse`
+// recorded on the `Ctx`. A named function rather than a closure so the chain
+// composed at `freeze()` captures nothing per request.
+fn missFinal(c: Ctx): Res! {
+  return missRes(c.routeMiss)
+}
+
+// A request that matched no route. The APP-ROOT middleware chain runs around
+// the framework's own 404/405 exactly as it runs around a matched handler
+// (#4515): `App.use` means "every request reaching this app", so a logger
+// sees the miss, a compressor compresses it, and `static()` can answer a
+// path that has no route at all. Group-scoped `use()` is route-only and
+// stays so — `missHandlerFor` reads the ROOT group's list and nothing else.
+//
+// The chain is `app.missHandler`, composed once at `freeze()`. The only
+// per-request part is `e`, which travels on the `Ctx` (`routeMiss`,
+// ctx.bit) because the composed chain hands its innermost handler nothing
+// else. There are no params and no matched pattern, so both are empty: a
+// miss has no route, and saying it has one would make `c.created()` derive a
+// `Location` from the client's spelling of a path the server does not serve.
+fn missResponse(app: App, req: Request, e: error): Response {
+  let c = newCtx(req, map<string, string>(), app.root.registry, app.config, "") catch ce {
+    return frame(app, failureRes(app, requestFailure(req, ce)))
+  }
+  c.routeMiss = e
+  return chainResponse(app, c, app.missHandler)
+}
+
+// A matched route.
 fn matchedResponse(app: App, req: Request, m: Match): Response {
   let c = newCtx(req, m.params, app.root.registry, app.config, m.pattern) catch e {
     return frame(app, failureRes(app, requestFailure(req, e)))
   }
-  let r = m.handler(c) catch e {
+  return chainResponse(app, c, m.handler)
+}
+
+// Runs one composed chain and converts whatever comes back. Both exits seal
+// the session (#4496) and both go through `frame`, so there is one
+// conversion and one cookie decision however the request ends — and the
+// matched path and the miss path share them rather than carrying two copies
+// that can drift.
+fn chainResponse(app: App, c: Ctx, h: Handler): Response {
+  let r = h(c) catch e {
     return frame(app, c.sealSession(failureRes(app, ctxFailure(c, e))))
   }
   return frame(app, c.sealSession(r))
