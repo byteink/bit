@@ -393,10 +393,20 @@ EOF
 # `stdlib` bucket (#4478) and test-fmt missing from the `_tests_/imports`
 # per-file mapping (#4479).
 #
-# WHAT IT CANNOT DO: it reads the gate TABLE, so it only sees scope a gate
-# spells out in its own argv. A gate that computes a path at runtime, or takes
-# it from an env var, is invisible here — that is what the other two
-# assertions cover, each within its own stated limits.
+# WHAT IT CANNOT DO, two limits, both real:
+#
+#   1. It reads the gate TABLE, so it only sees scope a gate spells out in its
+#      own argv. A gate that computes a path at runtime, or takes it from an env
+#      var, is invisible here — that is what the other two assertions cover,
+#      each within its own stated limits.
+#   2. It maps an argv path to exactly ONE bucket, and has no notion of a
+#      COMPOSITE bucket that must also carry the gate. `stdlibdocs` (chosen when
+#      a diff touches stdlib/** and docs/stdlib/*.md together) claims in its own
+#      comment to be the union of `stdlib` and `docs`, and is not — measured
+#      2026-09-08, it is missing four of `stdlib`'s steps, so adding a docs edit
+#      to a stdlib diff makes gate.sh run FEWER checks over the stdlib change.
+#      That is #4480, and this assertion is green across it: `stdlib` carries
+#      test-fmt and test-stdlib-unit, which is all it asks.
 
 # Emits "<gate> <relpath>" for every BARE `"${repoRoot()}/<relpath>"` argv
 # string, scanning both gate tables in one pass. Line-based and name-tracking,
