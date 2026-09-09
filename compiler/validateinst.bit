@@ -20,6 +20,10 @@
 // Sorts after `validateexpr.bit` (whose `vHasTypeParam`/`vStringConvertible` it
 // reuses) and after `types.bit` and `lowerglobal.bit` (`substType`,
 // `genericEnvOf`), so the inliner has already lowered every callee (#1511).
+// It also reuses `validatemember.bit`'s `vIsUnknownMember`, `vIsTypeNameRef`,
+// `vIsNamespaceRef` and `vDeclRooted`, which sort AFTER this file — the module
+// is one scope, so name resolution does not depend on the order; only
+// diagnostic emission order and inlining depth do.
 
 // The AST is a tree, but a malformed one must not be able to spin this forever;
 // nothing in the corpus nests expressions anywhere near this deep.
@@ -54,7 +58,59 @@ fn vInstOne(c: Checker, inst: Instantiation) {
   if (len(env.params) == 0) {
     return
   }
+  if (vInstBoundsViolated(c, decl, inst.args)) {
+    return
+  }
   vInstWalk(c, decl, env, inst.site, 0)
+}
+
+// Did this instantiation's arguments already fail the type params' declared
+// BOUNDS? Then every rule in this file must stay silent for it.
+//
+// A bound is a promise the template is entitled to rely on: inside
+// `fn max<T: Ord>(a: T, b: T)`, `a.less(b)` is correct code, and when the
+// caller passes a type with no `less` the fault is at the CALL, which E0051
+// (`vGenericBound`, validateexpr.bit) already reports naming the type, the
+// bound and the missing method. Re-judging the substituted body then produces a
+// second diagnostic for the same root cause, at a span inside a template the
+// reader did not write — `_tests_/cases/check_generic_bound_violation.bit` is
+// exactly that pair, and it is what caught this (#4627).
+//
+// This can never turn a rejected program into an accepted one: it only fires
+// where a bound was violated, and the lowerer's own refusal remains the
+// backstop for any instantiation whose bound violation goes unreported.
+fn vInstBoundsViolated(c: Checker, decl: int, args: []int): bool {
+  let tps = kidsOf(c.tree, kidsOf(c.tree, decl)[2])
+  if (len(args) != len(tps)) {
+    return false
+  }
+  let i = 0
+  while (i < len(tps)) {
+    if (vArgViolatesBound(c, tps[i], args[i])) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// One type param node against one argument, judged by exactly the pair
+// `vGenericBound` uses — `vBoundJudgeable` (the safety rule: only a concrete
+// arg against a concrete, non-generic interface bound is testable) and
+// `vSatisfies` — so this predicate agrees with E0051 by construction rather
+// than by resemblance. A type param with no constraint group, or one whose
+// group is empty, promises nothing and so violates nothing.
+fn vArgViolatesBound(c: Checker, tp: int, arg: int): bool {
+  let gk = kidsOf(c.tree, tp) // [name, constraint_group?]
+  if (gk[1] == 0) {
+    return false
+  }
+  let cons = kidsOf(c.tree, gk[1])
+  if (len(cons) == 0) {
+    return false
+  }
+  let boundIface = typeFromNode(c, cons[0])
+  return vBoundJudgeable(c, arg, boundIface) && !vSatisfies(c, arg, boundIface)
 }
 
 // `site` is threaded through unchanged so a diagnostic raised deep in the body
@@ -72,6 +128,9 @@ fn vInstWalk(c: Checker, node: int, env: TypeEnv, site: Span, depth: int) {
   }
   if (getNode(c.tree, node).tag == Tag.Index) {
     vInstIndex(c, node, env)
+  }
+  if (getNode(c.tree, node).tag == Tag.Member) {
+    vInstMember(c, node, env)
   }
   for k of kidsOf(c.tree, node) {
     vInstWalk(c, k, env, site, depth + 1)
@@ -171,27 +230,11 @@ fn vInstInterp(c: Checker, node: int, env: TypeEnv, site: Span) {
 }
 
 // The E0054 not-indexable rule (`vIndex`, validateexpr.bit), re-judged under
-// this instantiation's args. Same shape as `vInstMapKey` above: judge ONLY what
-// the sweep set aside (a receiver whose type still mentions a type param —
-// `vIndex` already decided an already-concrete one), and only when the
-// substitution is fully concrete.
-//
-// The receiver is an expression, not a type annotation, so its type is read the
-// same way `vInstInterp` reads an interpolation operand: the sweep's cache
-// first, a recompute for a bare Ident the sweep never caches — `xs[0]` on a
-// parameter is exactly that.
+// this instantiation's args. The guards are `vInstConcreteType`'s, below.
 fn vInstIndex(c: Checker, node: int, env: TypeEnv) {
   let recv = kidsOf(c.tree, node)[0]
-  let rt = c.nodeTypes[recv]
-  if (rt == 0) {
-    rt = checkExprType(c, recv)
-  }
-  if (rt == 0 || vMentionsInvalid(c, rt, 0) || !vHasTypeParam(c, rt, 0)) {
-    return
-  }
-  let sub = substType(c, rt, env, 0)
-  // Unchanged, still open, or still invalid: undecidable, so silent.
-  if (sub == 0 || sub == rt || vMentionsInvalid(c, sub, 0) || vHasTypeParam(c, sub, 0)) {
+  let sub = vInstConcreteType(c, recv, env)
+  if (sub == 0) {
     return
   }
   if (!vIsIndexable(c, sub)) {
@@ -202,4 +245,95 @@ fn vInstIndex(c: Checker, node: int, env: TypeEnv) {
       "'${typeName(c.ctx, sub)}' cannot be indexed",
     )
   }
+}
+
+// The type of an EXPRESSION the sweep set aside, substituted under this
+// instantiation's arguments — or 0 when nothing decidable comes out of it.
+// This is the guard sequence `vInstMapKey` established, in the one spelling
+// both expression rules need, rather than once per rule: read the type cache
+// first and recompute for a bare Ident the sweep never caches (`xs[0]` and
+// `v.n` on a parameter are both exactly that), judge ONLY what mentioned a
+// type param, and judge only a substitution that is fully concrete.
+fn vInstConcreteType(c: Checker, expr: int, env: TypeEnv): int {
+  let rt = c.nodeTypes[expr]
+  if (rt == 0) {
+    rt = checkExprType(c, expr)
+  }
+  // Already concrete means the sweep decided it; deciding it again would
+  // double-report.
+  if (rt == 0 || vMentionsInvalid(c, rt, 0) || !vHasTypeParam(c, rt, 0)) {
+    return 0
+  }
+  let sub = substType(c, rt, env, 0)
+  // Unchanged, still open, or still invalid: undecidable, so silent.
+  if (sub == 0 || sub == rt || vMentionsInvalid(c, sub, 0) || vHasTypeParam(c, sub, 0)) {
+    return 0
+  }
+  return sub
+}
+
+// Is `recv` a receiver `vInstMember` must not judge as a field/method lookup at
+// all? The same three exclusions `vMember` applies before it looks at a type,
+// and for the same reasons: a bare TYPE name (`Hold.Only` inside a generic
+// body, whose `checkExprType` answers the generic enum's own type and whose
+// "member" is a variant resolved elsewhere), a module namespace, and a
+// receiver whose type came from the flat-env fallback rather than a decl.
+// E0046 for a namespace member is deliberately NOT re-run here — a namespace
+// alias never mentions a type param, so the sweep has already judged it and a
+// second report would duplicate.
+fn vInstMemberSkip(c: Checker, recv: int): bool {
+  return vIsTypeNameRef(c, recv) || vIsNamespaceRef(c, recv) || !vDeclRooted(c, recv, 0)
+}
+
+// The E0057 unknown-member rule (`vMember`, validatemember.bit), re-judged
+// under this instantiation's args — the member-access twin of `vInstIndex`
+// above (#4627, as `vInstIndex` was #2391 for indexing).
+//
+// `vMember` returns at `vRecvTypeUnjudgeable` for a receiver whose type still
+// mentions a type param, and must: judging a rigid `T` by ABSENCE would reject
+// every generic body in the repo, since a template body is checked once against
+// its own type params and no member table is keyed against them. Nothing then
+// revisited it, so `fn get<T>(v: T): int { return v.n }` type-checked at rc=0
+// and was refused only by the lowerer, per instantiation, as E0092 — a
+// check/build divergence (#1430) reporting at the wrong layer.
+//
+// This runs the SAME judgement (`vIsUnknownMember`) on the substituted
+// receiver, so the code, the message and the span are a class receiver's. It
+// widens nothing: `vMemberJudgeableKind` still gates the kind, so a
+// substitution landing on a slice, map, chan, fallible or func receiver — whose
+// members are BUILTIN and unmodelled — stays silent here and stays the
+// lowerer's E0092, which remains the backstop for everything the checker cannot
+// decide.
+fn vInstMember(c: Checker, node: int, env: TypeEnv) {
+  let kids = kidsOf(c.tree, node) // [recv, name]
+  if (vInstMemberSkip(c, kids[0])) {
+    return
+  }
+  let sub = vInstConcreteType(c, kids[0], env)
+  if (sub == 0) {
+    return
+  }
+  let mname = nodeText(c.tree, c.source, kids[1])
+  if (!vIsUnknownMember(c, sub, mname)) {
+    return
+  }
+  // The primary message is `vMember`'s, byte for byte, so the direct and the
+  // instantiated case read identically. The HINT is where they differ and must:
+  // the primary span points inside the generic's own body, where "this type" is
+  // the template's `T` and names nothing the reader can act on — so the hint
+  // carries the substituted type, the way `vInstMapKey` and `vInstInterp`
+  // already do for E0052 and E0073. The edit-distance suggestion is appended
+  // rather than replacing it, since a near-miss name is still worth having.
+  let hint = "this generic is instantiated with '${typeName(c.ctx, sub)}', which has no field or method '${mname}'"
+  let nearest = vClosestMethodName(c, methodRecvType(c, sub), mname)
+  if (nearest != "") {
+    hint = hint + "; did you mean '${nearest}'?"
+  }
+  report(
+    c.diags,
+    ecUnknownMember,
+    vSpan(c, kids[1]),
+    "no field or method '${mname}' on this type",
+    hint,
+  )
 }
