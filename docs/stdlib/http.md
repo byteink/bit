@@ -910,6 +910,21 @@ fn fetchH3(url: string): int! {
 }
 ```
 
+### `serveH3On(sock, certPem, keyPem, handler): ()!`
+
+Serves HTTP/3 on an already-bound UDP socket - the h3 mirror of `listenAndServeOn`
+and `serveTlsOn`, and the only way to learn the port before serving starts, since
+`serveH3` binds and loops in one call. Bind with `std/net`'s `udpBind(host, 0)`,
+read the kernel-chosen port back with `sock.port()`, then serve on it.
+
+That order is what an Alt-Svc pair needs. The TLS server advertises its own port
+as the h3 endpoint, so the UDP and TCP listeners must carry the same number, and
+neither can be a fixed constant if two copies of the program may run at once: bind
+one side on port 0, read the number back, and bind the other side on it - retrying
+the pair if that number is already taken on the other protocol. Everything else is
+exactly `serveH3`: one green thread per accepted QUIC connection, a bounded accept
+loop, and a return when the socket closes.
+
 ### `Client`
 
 An HTTP client that remembers the HTTP/3 endpoints servers advertise via Alt-Svc,
