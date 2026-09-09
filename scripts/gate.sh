@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
 # scripts/gate.sh — diff-scoped test gate (#1795).
 #
-# `./make test` runs all 28 harnesses (~270-450s). Most changes only touch
-# one area of the tree, so most of that time is wasted proving things that
-# could not have broken. This script looks at what actually changed and runs
-# only the steps that area needs — falling back to the `full` bucket whenever
-# the change is ambiguous. It never silently skips a test: any change it
-# cannot confidently scope resolves to `full`.
+# `./make test` runs all 95 gate steps — every Step{} in tools/build/defs.bit's
+# `gateSteps()`, which is exactly what `test` depends on (gateNames()) — and
+# takes 17m26s: measured 2026-09-09 at e869af60, whole run, on an otherwise
+# idle box. That is the ONE figure this file quotes; every other mention of it
+# below repeats it verbatim. Re-derive both numbers here, on the tree you are
+# reading, before quoting either of them anywhere else.
+#
+# Most changes only touch one area of the tree, so most of that time is wasted
+# proving things that could not have broken. This script looks at what actually
+# changed and runs only the steps that area needs — falling back to the `full`
+# bucket whenever the change is ambiguous. It never silently skips a test: any
+# change it cannot confidently scope resolves to `full`.
 #
 # `full` IS A VERDICT, NOT AN ACTION, UNLESS YOU PASS --full (#2872). Without
 # --full, a diff that resolves to `full` prints the bucket and REASON and
-# exits 3 — it runs NOTHING, least of all the 18-18.5 minute `./make test`.
+# exits 3 — it runs NOTHING, least of all the 17m26s `./make test`.
 # See exit code 3 below for how to actually verify a diff that lands here.
 #
 # Usage:
@@ -55,7 +61,7 @@
 #   3  the diff resolved to bucket `full` but --full was NOT passed, so
 #      NOTHING RAN (GATE_RESULT=FULL_REQUIRED). Not a pass, not a fail — the
 #      printed BUCKET/REASON say why. Run `scripts/gate.sh --full` or
-#      `./make test` directly (18-18.5 min) to verify it; this repo's own
+#      `./make test` directly (17m26s) to verify it; this repo's own
 #      contributors normally leave that run batched once per push for
 #      whoever integrates, but that is a convention, not this script's
 #      answer for someone with no integrator to hand it to.
@@ -481,7 +487,7 @@ if [ "${BUCKET}" = "noop" ]; then
 fi
 
 # `full` is a VERDICT by default, not an action (#2872). Resolving to `full`
-# used to execute the 18-18.5 minute `./make test` immediately — the one
+# used to execute the 17m26s `./make test` immediately — the one
 # thing CLAUDE.md's verify-loop rule reserves for the integrator's single run
 # before `git push`. A ticket subagent told to "run scripts/gate.sh" had no
 # way to learn which bucket this diff needs without also triggering that
@@ -502,7 +508,7 @@ fi
 # instruction.
 if [ "${BUCKET}" = "full" ] && [ "${FULL}" -eq 0 ]; then
   echo "gate: bucket: full (${REASON})"
-  echo "gate: nothing ran — this diff is too broad to scope here. To verify it yourself, run 'scripts/gate.sh --full' or './make test' directly (18-18.5 min)."
+  echo "gate: nothing ran — this diff is too broad to scope here. To verify it yourself, run 'scripts/gate.sh --full' or './make test' directly (17m26s)."
   echo "gate: in this repo's own workflow that run is batched once per push by whoever integrates — that is a convention, not a substitute for verifying your own change."
   echo "GATE_RESULT=FULL_REQUIRED"
   exit 3
