@@ -423,12 +423,12 @@ while IFS= read -r f; do
     # anything under pkg/, so a pkg/**-only diff can only ever need this
     # bucket's own steps.
     pkg/*) has_pkg=1 ;;
-    # _tests_/imports/** joins _tests_/bit/** here (#2825), and _tests_/stress/**
-    # joins both (#2977): all three are fixture-only paths whose gate is known
-    # by name, never by path prefix, so they share has_testsbit/testsbit_list
-    # end to end — see gates_for_file() above and the comment ahead of
-    # testsbit_steps below.
-    _tests_/bit/*|_tests_/imports/*|_tests_/stress/*)
+    # _tests_/imports/** joins _tests_/bit/** here (#2825), _tests_/stress/** joins both (#2977), and
+    # tools/build/complexity-debt.txt joins all three (#4556: the E0204 ratchet's DATA file, read only by
+    # test-lint-complexity — every OTHER tools/build/** path still falls to `*)` below and forces full):
+    # each is a path whose gate is known BY NAME, never by path prefix, so they share has_testsbit/
+    # testsbit_list end to end — see gates_for_file() above and the comment ahead of testsbit_steps below.
+    _tests_/bit/*|_tests_/imports/*|_tests_/stress/*|tools/build/complexity-debt.txt)
       # #4230: a DELETED path that was NEVER mapped to a gate needs no gate
       # rerun — there is nothing left on disk for any gate to read, so
       # removing it cannot change any gate's outcome. Existence on disk is
@@ -604,7 +604,7 @@ elif [ "${has_spec}" -eq 1 ]; then
   REASON="only spec/SPEC.md changed"
 elif [ "${has_testsbit}" -eq 1 ]; then
   BUCKET="testsbit"
-  REASON="only _tests_/bit/**, _tests_/imports/**, or _tests_/stress/** changed (gate(s): ${testsbit_steps})"
+  REASON="only name-mapped path(s) changed — _tests_/bit/**, _tests_/imports/**, _tests_/stress/**, or tools/build/complexity-debt.txt (gate(s): ${testsbit_steps})"
 elif [ "${has_noop}" -eq 1 ]; then
   BUCKET="noop"
   # Two kinds of entry land in noop_list: known no-gate prose (see the case
