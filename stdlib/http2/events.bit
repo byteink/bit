@@ -329,30 +329,45 @@ fn h2connBodyBudgetOk(st: h2connState, s: h2connStream, n: int): bool {
   return true
 }
 
-// We buffer the whole body, so the bytes are "consumed" the instant they land;
-// replenish both windows and tell the peer with WINDOW_UPDATE so it may send on.
-// Only ever reached for DATA this connection accepted — an over-budget frame is
-// refused before this, so refusing costs the peer its credit as well as its
-// stream.
+// Hand `n` bytes of connection credit back to the peer: add it to our own window
+// and queue the WINDOW_UPDATE granting it, never one without the other (#4599).
+// A credit without the grant would have us refuse bytes the peer is entitled to
+// send; a grant without the credit would let it send bytes we never advertised.
+// The single place either happens, so every DATA frame `h2connOnData` counts is
+// renewed the same way whether its bytes were kept or dropped (#4621).
 //
-// Each credit is added to our own window on the line that queues the
-// WINDOW_UPDATE granting it (#4599). The two must move together: `h2connOnData`
-// spends the credit for every DATA frame it counts, so a window credited
-// without the frame being sent would let the peer send bytes we never
-// advertised, and a frame sent without the credit would have us refuse bytes we
-// did. The stream window is renewed only when the stream can still receive:
-// END_STREAM is half-close, so a stream WINDOW_UPDATE after it would grant
-// credit nobody can spend. The connection window is always renewed.
-fn h2connReplenishWindows(st: h2connState, df: DataFrame, s: h2connStream, n: int) {
+// `n == 0` grants nothing: a WINDOW_UPDATE with a zero increment is a
+// PROTOCOL_ERROR (RFC 9113 §6.9), and a zero-length DATA frame spent nothing.
+fn h2connRenewConnWindow(st: h2connState, n: int) {
   if (n == 0) {
     return
   }
   st.connRecvWindow = st.connRecvWindow + n
   h2connSendWindowUpdate(st, WindowUpdateFrame{ streamId: 0, increment: n })
-  if (!df.endStream) {
-    s.recvWindow = s.recvWindow + n
-    h2connSendWindowUpdate(st, WindowUpdateFrame{ streamId: df.streamId, increment: n })
+}
+
+// We buffer the whole body, so the bytes are "consumed" the instant they land;
+// replenish both windows and tell the peer with WINDOW_UPDATE so it may send on.
+// Only ever reached for DATA whose bytes this connection kept: the two paths
+// that drop them renew the connection window themselves and must not renew the
+// stream's (#4621).
+//
+// The stream window is renewed only when the stream can still receive:
+// END_STREAM is half-close, so a stream WINDOW_UPDATE after it would grant
+// credit nobody can spend. The connection window is always renewed.
+fn h2connReplenishWindows(st: h2connState, df: DataFrame, s: h2connStream, n: int) {
+  h2connRenewConnWindow(st, n)
+  if (n == 0 || df.endStream) {
+    return
   }
+  s.recvWindow = s.recvWindow + n
+  h2connSendWindowUpdate(st, WindowUpdateFrame{ streamId: df.streamId, increment: n })
+}
+
+// The connection error a receive window overrun is (RFC 9113 §6.9.1), spelled
+// once so the two places that raise it cannot drift apart.
+fn h2connRecvWindowError(st: h2connState) {
+  h2connConnError(st, errorFlowControlError, "http2: flow-control window exceeded")
 }
 
 fn h2connOnData(st: h2connState, f: Frame) {
@@ -360,30 +375,47 @@ fn h2connOnData(st: h2connState, f: Frame) {
     h2connConnError(st, errorProtocolError, "http2: bad DATA")
     return
   }
+  let n = len(df.data)
+  // The peer has now spent this much of the credit we advertised, so spend it
+  // here too (#4599): before this the two windows were set once and compared
+  // for ever, which made the check `n > 65535` — a per-frame cap `maxFrameSize`
+  // already enforces — rather than the account RFC 9113 §6.9.1 requires. Both
+  // windows stay >= 0 because the comparison refuses anything larger first,
+  // which is also what keeps `n > window` overflow-free.
+  //
+  // The connection window is checked and spent BEFORE the stream is looked up
+  // (#4621): §5.1 counts a DATA frame that arrives for a stream we have already
+  // closed against the connection window too, and §6.9.1 makes an overrun a
+  // connection error whatever the stream's state — so a peer overrunning the
+  // credit it holds cannot escape the check by aiming at a dead stream.
+  if (n > st.connRecvWindow) {
+    h2connRecvWindowError(st)
+    return
+  }
+  st.connRecvWindow = st.connRecvWindow - n
   if (!h2connDataStreamOk(st, df.streamId)) {
+    // The bytes are dropped, but the peer spent real credit on them and its own
+    // window stays down until we say otherwise: renew the connection's, and
+    // only the connection's — the stream is closed or gone, so a WINDOW_UPDATE
+    // on it would grant credit nobody can spend (#4621).
+    h2connRenewConnWindow(st, n)
     return
   }
   let s = st.streams[df.streamId]
-  let n = len(df.data)
-  if (n > st.connRecvWindow || n > s.recvWindow) {
-    h2connConnError(st, errorFlowControlError, "http2: flow-control window exceeded")
+  if (n > s.recvWindow) {
+    h2connRecvWindowError(st)
     return
   }
-  // The peer has now spent this much of the credit we advertised, so spend it
-  // here too (#4599): before this the two windows were set once and compared
-  // for ever, which made the check above `n > 65535` — a per-frame cap
-  // `maxFrameSize` already enforces — rather than the running account RFC 9113
-  // §6.9.1 requires. Both stay >= 0 because the comparison above refused
-  // anything larger, which is also what keeps `n > window` overflow-free.
-  //
-  // Deliberately BEFORE the body budget: a frame refused below was still sent
-  // under the credit we granted and the peer has debited its own window for it,
-  // so keeping the debit is what holds the two accounts in step. It is
-  // `h2connReplenishWindows` that grants credit back, and it is not reached
-  // from that path.
-  st.connRecvWindow = st.connRecvWindow - n
   s.recvWindow = s.recvWindow - n
+  // The debit above stays BEFORE the body budget: a frame refused below was
+  // still sent under the credit we granted and the peer has debited its own
+  // window for it, so keeping the debit is what holds the two accounts in step.
+  // The connection credit comes straight back — without it, four over-budget
+  // bodies at the default 16384-byte frame size consume the whole 65535-byte
+  // connection window and every stream on the connection stalls (#4621). The
+  // stream window is not renewed: the stream is being reset.
   if (!h2connBodyBudgetOk(st, s, n)) {
+    h2connRenewConnWindow(st, n)
     return
   }
   s.recvBody = h2connAppendBytes(s.recvBody, df.data)
