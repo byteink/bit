@@ -478,6 +478,16 @@ argvliteral_gate_paths() {
 #     has_other=1 and resolves to bucket `full`, which runs every gate via the
 #     aggregate `test` step. Verified, not assumed: `RANGE=... bash
 #     scripts/gate.sh` on a bench/-only diff prints `bucket: full` and exits 3.
+#   _tests_/freestanding, _tests_/testproj — the same has_other=1 -> `full`
+#     route, and stated as such in scripts/gate-filemap.sh's own header for
+#     testproj: scripts/gate-classify.sh's `case` has no arm for either (they
+#     are siblings of _tests_/bit, _tests_/imports and _tests_/stress, not
+#     those paths), so a diff touching one never sets has_testsbit and falls
+#     to the generic `*)` catch-all. #4681 put both trees in test-fmt's argv
+#     because NO fmt gate named them, which is what brings them here; a bucket
+#     of their own was rejected for testproj by #4153 on two measured grounds
+#     (no line budget in gate.sh, and wiring its only consumer
+#     scripts/selfhost-difftests.sh would fail assert_full_is_superset()).
 #   tools, tools/** — the same has_other=1 -> `full` route (the one narrow
 #     exception, a purely-additive Step{}/Gate{} registration, is handled by
 #     is_additive_registration() in scripts/gate-diffclass.sh and still runs the
@@ -489,6 +499,7 @@ argvliteral_gate_paths() {
 argvliteral_bucket_for_dir() {
   case "$1" in
     bench | editors | tools | tools/*) return 0 ;;
+    _tests_/freestanding | _tests_/testproj) return 0 ;;
     compiler) printf 'selfhost\n' ;;
     runtime) printf 'runtime\n' ;;
     stdlib) printf 'stdlib\n' ;;

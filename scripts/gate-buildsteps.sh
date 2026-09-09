@@ -662,12 +662,12 @@ bit_source_trees() {
 # exactly like a correctly wired tree.
 FMTGATE_TREE_FLOOR="compiler runtime stdlib examples pkg _tests_/cases _tests_/bit"
 
-# NAMED EXEMPTION: trees holding `.bit` sources that NO fmt gate names today, so
-# no bucket can carry one. Measured 2026-09-09 at dec67909 — 4 files, which
-# `./make test` does not format either. Filed as #4681; delete a name here when
-# that lands, or this assertion goes on skipping it. Both match no arm in
-# scripts/gate-classify.sh, so both resolve to has_other=1 -> bucket `full`.
-FMTGATE_UNGATED_TREES="_tests_/freestanding _tests_/testproj"
+# NAMED EXEMPTION: trees holding `.bit` sources that NO fmt gate names, so no
+# bucket can carry one. EMPTY since #4681 put the last two (_tests_/freestanding,
+# _tests_/testproj — 4 files `./make test` never formatted) into test-fmt's argv,
+# so every `.bit` tree on disk is checked below. A name added back needs its
+# ticket: while it sits here this assertion skips that tree, which reads clean.
+FMTGATE_UNGATED_TREES=""
 
 # Fails loudly if this is called before the modules it probes are sourced.
 # Absent, `$(...)` yields empty and every tree looks unwired — a plausible WRONG
