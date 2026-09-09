@@ -163,6 +163,40 @@ reports.use(rateLimit(Limit{ requests: 100, window: 60, by: byIp, store: counter
 exactly the bucket keys this package produced before the field existed, so
 upgrading does not orphan the counters already in a shared store.
 
+## Sessions, CSRF and anonymous visitors
+
+`c.csrfToken()` returns the value a form puts in its hidden `_csrf` field, and
+it is `HMAC(Config.secret, session id)` — so it needs a session, and a session
+the store has never seen is one the next request replaces rather than adopts
+(adopting an unknown id is session fixation). A page that calls it therefore
+**creates a session for every anonymous visitor**, written to `Config.sessions`
+for `sessionTTLSeconds` (24 hours). N requests to a public form page cost N
+store entries, with no authentication in front of them.
+
+That is inherent to binding the token to the session, not a defect in the
+store, so a page calling `c.csrfToken()` wants one of these — ideally both:
+
+```
+let pages = app.group("/")
+pages.use(rateLimit(Limit{ requests: 30, window: 60, by: byIp, store: counters }))
+pages.use(csrf())
+
+// and a store that cannot grow past what this process can hold:
+App(Config{ secret: s, sessions: MemoryStore(10_000) })
+```
+
+`MemoryStore(maxEntries)` has no default cap: the number is the largest number
+of sessions the process will hold, and a write past it **evicts the
+oldest-expiring entry rather than failing**, so a flood costs bounded memory
+instead of an ever-growing map. Expired entries are also swept as writes go
+through, so an id nobody presents again does not sit there until the process
+exits.
+
+Eviction is not a substitute for the rate limit. At the cap a flood evicts real
+sessions — visitors get logged out — which is a better failure than the process
+growing until it is killed, but it is still a failure. The rate limit is what
+stops the flood; the cap is what bounds what happens when one gets through.
+
 ## Reading the request body
 
 ### Write an input type. That is the protection.

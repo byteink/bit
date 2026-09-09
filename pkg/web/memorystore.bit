@@ -2,23 +2,52 @@
 //
 // It ships, and it is never the default. `App(Config{ secret: s })` has no
 // session store at all; an app gets this one only by writing
-// `Config{ secret: s, sessions: MemoryStore() }`, which is the whole design:
-// the store that leaks memory and cannot survive a second process is a
-// deliberate line in the app's own source, not something the framework
-// arranged silently.
+// `Config{ secret: s, sessions: MemoryStore(10_000) }`, which is the whole
+// design: the store that cannot survive a second process is a deliberate
+// line in the app's own source, not something the framework arranged
+// silently.
 //
 // What it is honestly for: development, tests, and a single-process service
 // that is content to log everyone out on restart. What it is not: anything
-// with two processes in front of a load balancer. There is no sweeper —
-// entries are dropped when the id is read again after expiry, so an id that
-// is never presented again occupies its bytes until the process exits.
-// A store that must bound its own memory is a `SqlStore` or a `RedisStore`,
-// which is exactly why `SessionStore` is an interface.
+// with two processes in front of a load balancer.
+//
+// It is BOUNDED (#4541). `maxEntries` has no default and is the hard ceiling
+// on how many sessions this store holds: a write that would cross it evicts
+// the oldest-expiring entry first, so the map never holds more than the cap
+// and a write never fails because the store is full. Expired entries are
+// also swept every `memoryStoreSweepEvery` writes, so an id nobody ever
+// presents again does not hold its bytes until the process exits.
+//
+// The bound matters because `Ctx.csrfToken()` (ctx.bit) writes a session for
+// an ANONYMOUS visitor — a public form page therefore mints one store entry
+// per visitor, with no authentication anywhere in front of it. Unbounded,
+// that is a memory-growth vector reachable by anyone who can request the
+// page. Eviction is not a substitute for a rate limit: at the cap, a flood
+// evicts real sessions, so a form page still wants `rateLimit()` in front of
+// it (README, "Sessions, CSRF and anonymous visitors"). What the cap buys is
+// that the failure is bounded memory and lost sessions rather than the
+// process growing until it is killed.
+//
+// A store that must do better than "evict the oldest-expiring" — LRU, or
+// spilling to disk — is a `SqlStore` or a `RedisStore`, which is exactly why
+// `SessionStore` is an interface.
 
 import { Mutex, newMutex } from "std/sync"
 import { now } from "std/time"
 
 const nsPerSecond: i64 = 1_000_000_000
+
+// How many writes pass between sweeps of expired entries. A sweep is O(n)
+// over the map, so doing one on every write would make a write O(n); doing
+// it every Nth amortises that to O(n/N) per write while bounding how long a
+// dead entry can outlive its ttl to N writes. 64 rather than a round 100
+// only because it is what the tests count to.
+const memoryStoreSweepEvery: int = 64
+
+const memoryStoreCapMessage = "web: MemoryStore(maxEntries): the cap must be " +
+  "at least 1, for example `MemoryStore(10_000)`. It is the largest number " +
+  "of sessions this store will hold; a write past it evicts the " +
+  "oldest-expiring entry rather than failing."
 
 // One stored session. `expiresAtNs` is absolute (nanoseconds since the
 // epoch, `now().ns`) rather than a ttl plus a write time, so expiry is one
@@ -30,13 +59,30 @@ class MemoryEntry {
 
 export class MemoryStore {
   entries: map<string, MemoryEntry>
+  // The ceiling on `len(entries)`, from the constructor. No default: how
+  // much memory a process may spend on sessions is a fact about a
+  // deployment, and a framework that guesses it silently is how a store
+  // grows until the box does something worse than evict.
+  maxEntries: int
+  // Writes since the last sweep of expired entries. Reset by the sweep.
+  writesSinceSweep: int
   // A store is shared by every request, and requests are concurrent. The
   // map is not safe for concurrent use, so every method takes the lock —
   // including `read`, which mutates on the expiry path.
   mu: Mutex
 
-  init() {
+  init(maxEntries: int) {
+    // A panic rather than a fallible `init`, for `App.init`'s reason
+    // (app.bit): a store built with a cap of 0 or a negative one is a
+    // programming error at startup, not a runtime condition the caller
+    // could answer — and a cap below 1 would mean every write evicts the
+    // entry it just wrote, i.e. a store that silently holds nothing.
+    if (maxEntries < 1) {
+      panic(memoryStoreCapMessage)
+    }
     this.entries = map<string, MemoryEntry>()
+    this.maxEntries = maxEntries
+    this.writesSinceSweep = 0
     this.mu = newMutex()
   }
 
@@ -48,8 +94,39 @@ export class MemoryStore {
   }
 
   export write(sid: string, data: map<string, string>, ttl: i64): ()! {
+    this.writeAt(sid, data, ttl, now().ns)
+  }
+
+  export destroy(sid: string): ()! {
     this.mu.lock()
     defer this.mu.unlock()
+    delete(this.entries, sid)
+  }
+
+  // `write` against a caller-supplied clock, module-private for `readAt`'s
+  // reason: it is what lets a test drive the sweep and the eviction order
+  // deterministically instead of racing the wall clock.
+  //
+  // Order is load-bearing. The sweep runs BEFORE the cap is tested, so a
+  // store full of expired entries makes room from the dead rather than
+  // evicting a live session; the cap is then tested only for an id that is
+  // not already present, since replacing an entry cannot grow the map.
+  //
+  // Not fallible, and a write past the cap is not an error: a store that
+  // refused writes when full would turn a full store into a broken app,
+  // and the caller has nothing useful to do with the failure.
+  writeAt(sid: string, data: map<string, string>, ttl: i64, nowNs: i64) {
+    this.mu.lock()
+    defer this.mu.unlock()
+    this.writesSinceSweep = this.writesSinceSweep + 1
+    if (this.writesSinceSweep >= memoryStoreSweepEvery) {
+      this.writesSinceSweep = 0
+      this.sweepExpired(nowNs)
+    }
+    let (_, present) = this.entries[sid]
+    if (!present && len(this.entries) >= this.maxEntries) {
+      this.evictOldestExpiring()
+    }
     // The caller's map is copied, not aliased. A store is a persistence
     // boundary: a real one serialises here, so an in-memory one that kept
     // handing back the very map a previous request is still mutating would
@@ -57,14 +134,52 @@ export class MemoryStore {
     // of the interface — the one thing a dev store must not do.
     this.entries[sid] = MemoryEntry{
       data: copyData(data),
-      expiresAtNs: now().ns + ttl * nsPerSecond,
+      expiresAtNs: nowNs + ttl * nsPerSecond,
     }
   }
 
-  export destroy(sid: string): ()! {
-    this.mu.lock()
-    defer this.mu.unlock()
-    delete(this.entries, sid)
+  // Drops every entry whose ttl has passed at `nowNs`. Ids are collected
+  // first and deleted after: mutating a map while iterating it is not a
+  // thing to rely on.
+  //
+  // The LOCK IS ALREADY HELD by `writeAt`, the only caller. `Mutex` is not
+  // reentrant, so this must not take it.
+  sweepExpired(nowNs: i64) {
+    let dead = []string(0)
+    for (sid, e) of this.entries {
+      if (e.expiresAtNs <= nowNs) {
+        dead = append(dead, sid)
+      }
+    }
+    for sid of dead {
+      delete(this.entries, sid)
+    }
+  }
+
+  // Drops the entry that expires soonest — already-expired entries first,
+  // since an expired one has the smallest `expiresAtNs` of all. That is why
+  // the eviction rule is "oldest-expiring" and not "oldest-written": it
+  // spends the entry with the least life left, and reaches a live session
+  // only when there is no dead one to take.
+  //
+  // O(n) per eviction, which is the honest cost of not keeping a second
+  // index. A store where that matters is a `RedisStore`.
+  //
+  // The LOCK IS ALREADY HELD by `writeAt`, the only caller.
+  evictOldestExpiring() {
+    let victim = ""
+    let victimNs: i64 = 0
+    let found = false
+    for (sid, e) of this.entries {
+      if (!found || e.expiresAtNs < victimNs) {
+        victim = sid
+        victimNs = e.expiresAtNs
+        found = true
+      }
+    }
+    if (found) {
+      delete(this.entries, victim)
+    }
   }
 
   // `read` against a caller-supplied clock. Module-private: it exists so a
