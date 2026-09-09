@@ -203,6 +203,36 @@ fn handleUpload(body: []byte, boundary: string): Form! {
 }
 ```
 
+### `multipartField(body: []byte, boundary: string, name: string, limits: Limits): (string, bool)!`
+
+The value of the first text field named `name`, and whether such a field was
+there at all — `("", true)` for a present-but-empty field, `("", false)` for
+an absent one. A part carrying a `filename` parameter is a file and is never
+returned as a field value, whatever its name.
+
+This is `parseMultipart`'s walk with nothing built: no `Form`, and no part
+body materialised except the one returned, so reading a hidden `_csrf` field
+out of a body that also carries a 5 MiB upload does not copy the upload.
+
+What it does not skip is a check. The whole body is walked even after the
+field is found, and every limit applies to every part, so it fails on exactly
+the bodies `parseMultipart` fails on with the same message — a value is never
+returned out of a body that is malformed further along.
+
+```bit
+import { multipartField, defaultLimits } from "std/http"
+
+fn formToken(body: []byte, boundary: string): string {
+  let (value, found) = multipartField(body, boundary, "_csrf", defaultLimits()) catch _ {
+    return ""
+  }
+  if (!found) {
+    return ""
+  }
+  return value
+}
+```
+
 ## Query strings
 
 `Request.path` is the raw request target straight off the wire —
