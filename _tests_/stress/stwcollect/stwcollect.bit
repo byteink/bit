@@ -183,6 +183,10 @@ fn main() {
   let parkFrame = []i64(FRAME_WORDS)
   let parkSnap = []i64(SNAP_WORDS)
 
+  // The wiring block phases D and J are handed (stwcollectphases.bit). It is
+  // allocated here with every other slice, and holds addresses only.
+  let wire = []i64(WIRE_WORDS)
+
   let metaAddr = int(ptrOf(meta))
   meta[MI_NODE + 0] = 16
   meta[MI_NODE + 1] = 0
@@ -279,6 +283,12 @@ fn main() {
   // that holds no stack map, and it makes the precise walk a no-op here — phase
   // C is where that walk is put under load.
   let snap = int(ptrOf(snapBuf))
+  // The addresses the two split-out phases (stwcollectphases.bit) poll and
+  // allocate through, fixed for the rest of the run.
+  wire[W_SCHED] = int(ptrOf(schedBlock))
+  wire[W_REG] = int(ptrOf(regBlock))
+  wire[W_SNAP] = snap
+  wire[W_NODEINFO] = nodeInfo
   storeWord(snap + 0, 0)
   storeWord(snap + 8, 0)
   stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
@@ -368,58 +378,12 @@ fn main() {
   print("C ran=${gcStatCollections(g) > cC} found=${hitPc != 0} precise=${alive(g, pPrecise, M_PRECISE)} missed=${gcOwns(g, pMissed)} vOK=${!vBad}\n")
 
   // ---- phase D: ROOT CLASS 6, the per-task SCRATCH area (#1679) ------------
-  //
-  // THE CLASS THAT HAD NO CASE, and the reason this file grew (#1683). The
-  // scratch is the `chanScratchWords` words at the BASE of a task's stack, and
-  // a stack grows DOWN from its top, so the whole area sits strictly BELOW
-  // `ctx.sp` — outside class 4's `[sp, top)` range for every task, always, by
-  // construction. No stack map names those words either, so classes 2 and 3
-  // cannot see them and the RUNNING task is as exposed as a parked one.
-  //
-  // The task below makes that separation explicit rather than incidental: its
-  // `arg` is 0 (class 5 covers nothing) and its `sp` is set to the TOP of its
-  // stack, so the class-4 range is EMPTY. The only enumerated class that can
-  // reach these three payloads is the scratch scan.
-  //
-  // Three payloads, not one, and the third is a floor on the SCANNED SET
-  // rather than a repeat: `scrElem` (word 5) is the blocking channel
-  // send/receive slot and `scrErr` (word 7) is the pending-error object — the
-  // two references #1679 actually lost — while `scrIfaceOk` (word 266) is
-  // the LAST word of the area. A scan that walks a prefix, or that enumerates
-  // only the two named words instead of the whole area, keeps the first two
-  // alive and drops the third. #3280 moved this payload here from
-  // `scrFsReadFailed` (word 265) when `chanScratchWords` widened to 267:
-  // leaving it at 265 would have kept passing while proving strictly less — a
-  // 266-of-267-word scan would still find it, so the phase would no longer
-  // prove the full area is scanned, which is the entire point of the third
-  // payload.
-  let pElem = gcAlloc(g, nodeInfo)
-  storeWord(pElem, M_SCR_ELEM)
-  let pErr = gcAlloc(g, nodeInfo)
-  storeWord(pErr, M_SCR_ERR)
-  let pLast = gcAlloc(g, nodeInfo)
-  storeWord(pLast, M_SCR_LAST)
-  let pScrDead = gcAlloc(g, nodeInfo)
-  storeWord(pScrDead, M_SCR_DEAD)
-
-  scratchStack[scrElem] = pElem
-  scratchStack[scrErr] = pErr
-  scratchStack[scrIfaceOk] = pLast
-
-  let t2 = ptrOf(scratchTask)
-  *(t2 + taskArg) = 0
-  *(t2 + taskState) = taskParked
-  *(t2 + taskStackBase) = int(ptrOf(scratchStack))
-  *(t2 + taskStackBytes) = chanScratchWords * 8
-  *(t2 + ctxSp) = int(ptrOf(scratchStack)) + chanScratchWords * 8
-  *(ptrOf(schedBlock) + scRegHead) = int(t2)
-
-  // Back to a snapshot that names nothing, so class 2 cannot carry this phase.
-  storeWord(snap + 0, 0)
-  storeWord(snap + 8, 0)
-  let cD = gcStatCollections(g)
-  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
-  print("D ran=${gcStatCollections(g) > cD} elem=${alive(g, pElem, M_SCR_ELEM)} err=${alive(g, pErr, M_SCR_ERR)} last=${alive(g, pLast, M_SCR_LAST)} dead=${gcOwns(g, pScrDead)} abandoned=${stwAbandonedCount()}\n")
+  // Body in `phaseD` (stwcollectphases.bit): it takes the task and stack it
+  // plants into as parameters, so both stay owned by THIS frame to the last
+  // line below. See that function's header for what the phase proves. It
+  // leaves its task registered as the scheduler's only one, which phase F
+  // then reuses.
+  phaseD(g, wire, worldBlock, scratchStack, scratchTask)
 
   // ---- phase E: ROOT CLASS 3, another stopped OS thread's PARKED FRAME -----
   //
@@ -722,65 +686,10 @@ fn main() {
   worldRelease(wb, slot10)
 
   // ---- phase J: ROOT CLASS 9, a thread parked in a `syscall` region -------
-  //
-  // #1904's state for a thread blocked in the kernel while still holding live
-  // Bit references — a subprocess `waitpid`, `runtime/ABI.md` §5's "syscall"
-  // contract. Neither `blocked` (no live references, by contract) nor
-  // `running` (waited for) fits it, so the collector scans it where it stands
-  // instead: the lowest published `sp` (`stwSyscallLo`) plus the saved
-  // callee-saved register file (`stwScanSyscallRegs`, #1742's gap over this
-  // state). This is #2387 exactly: the class was implemented and wired into
-  // `stwScanTasks` without ever being added to `stw.bit`'s ROOT SET header, so
-  // the declared/covered comparison above agreed with itself while missing it
-  // — no case here could have existed for a class the header did not name.
-  //
-  // Same `worldClaim` technique as phases E and I, but published as
-  // `mSyscall` rather than `mParked`. That needs no epoch/`acked` bookkeeping
-  // at all: `worldStoppedFor` counts a `syscall` slot as stopped
-  // unconditionally (#1904), unlike a `parked` one.
-  //
-  // Geometry mirrors phase I's: `ctxSp` at the stack's own TOP empties class
-  // 4's own contribution, the published `sp` sits at word 300 — above the
-  // 266-word scratch area, so class 6 cannot reach it either — and the stack
-  // payload at word 400 sits strictly between that `sp` and `ctxSp`, so only
-  // class 9's lowering of the scan's low bound brings it into the scanned
-  // range. The register payload is reachable ONLY through
-  // `stwScanSyscallRegs`, which class 9's slot lookup runs whenever the
-  // published `sp` belongs to this task, regardless of where the resulting
-  // low bound ends up.
-  let pSysStack = gcAlloc(g, nodeInfo)
-  storeWord(pSysStack, M_SYSCALL)
-  let pSysReg = gcAlloc(g, nodeInfo)
-  storeWord(pSysReg, M_SYSCALL_REG)
-  let pSysDead = gcAlloc(g, nodeInfo)
-  storeWord(pSysDead, M_SYSCALL_DEAD)
-
-  let syscallBase = int(ptrOf(syscallStack))
-  syscallStack[SYSCALL_PAYLOAD_SLOT] = pSysStack
-
-  let st = ptrOf(syscallTask)
-  *(st + taskArg) = 0
-  *(st + taskState) = taskParked
-  *(st + taskStackBase) = syscallBase
-  *(st + taskStackBytes) = SYSCALL_STACK_WORDS * 8
-  *(st + ctxSp) = syscallBase + SYSCALL_STACK_WORDS * 8
-  *(st + taskRegNext) = 0
-  *(ptrOf(schedBlock) + scRegHead) = int(st)
-
-  let slotJ = worldClaim(wb)
-  worldBlock[slotJ * muWords + MU_SP] = syscallBase + SYSCALL_SP_SLOT * 8
-  worldBlock[slotJ * muWords + MU_STATE] = mSyscall
-  storeWord(worldSyscallRegs(slotJ), pSysReg)
-
-  storeWord(snap + 0, 0)
-  storeWord(snap + 8, 0)
-  let cJ = gcStatCollections(g)
-  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
-  print("J ran=${gcStatCollections(g) > cJ} other=${slotJ > 0} stack=${alive(g, pSysStack, M_SYSCALL)} regs=${alive(g, pSysReg, M_SYSCALL_REG)} missed=${gcOwns(g, pSysDead)} abandoned=${stwAbandonedCount()}\n")
-  // Released for the reason phases E and I's are: leaving the slot `syscall`
-  // would make every later rendezvous conservatively scan a stale sp and
-  // register block that no longer describes a live thread.
-  worldRelease(wb, slotJ)
+  // Body in `phaseJ` (stwcollectphases.bit): it takes the task and stack it
+  // plants into as parameters, so both stay owned by THIS frame to the last
+  // line below. See that function's header for what the phase proves.
+  phaseJ(g, wire, worldBlock, syscallStack, syscallTask)
 
   // Hold every backing slice to the end of `main`, so only raw untraced pointers
   // ever reach the collector under test and the LIVE (libbitrt) collector cannot
