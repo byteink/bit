@@ -5,7 +5,7 @@
 //     requests: 100,
 //     window: 60,
 //     by: byIp,
-//     store: MemoryCounter(),
+//     store: MemoryCounter(10_000),
 //   }))
 //
 //   login.use(rateLimit(Limit{ requests: 5, window: 300, by: byIp, store: c }))
@@ -266,7 +266,7 @@ fn checkLimit(l: Limit) {
   if (l.store == nil) {
     panic(
         "web: rateLimit(): no counter store — set the `store` field on Limit, for " +
-        "example `Limit{ requests: 100, window: 60, by: byIp, store: MemoryCounter() }`. " +
+        "example `Limit{ requests: 100, window: 60, by: byIp, store: MemoryCounter(10_000) }`. " +
         "This framework ships no default counter store on purpose: an in-process " +
         "counter permits the whole quota on every server behind a load balancer.",
     )
@@ -555,6 +555,17 @@ fn rateForwardedList(c: Ctx): []string {
 
 // --- the in-process counter store -------------------------------------------
 
+// How many `incr` calls pass between sweeps of expired windows. A sweep is
+// O(n) over the map, so sweeping on every call would make every request O(n);
+// every Nth amortises that to O(n/N) while bounding how long a dead window can
+// outlive its ttl to N writes.
+const memoryCounterSweepEvery: int = 64
+
+const memoryCounterCapMessage = "web: MemoryCounter(maxKeys): the cap must be " +
+  "at least 1, for example `MemoryCounter(10_000)`. It is the largest number " +
+  "of windows this counter will hold; an incr past it evicts the " +
+  "soonest-expiring window rather than failing."
+
 // One counter. `expiresAtSec` is absolute rather than a ttl plus a write time,
 // so expiry is one comparison and no arithmetic can drift between two fields.
 class CounterEntry {
@@ -563,26 +574,70 @@ class CounterEntry {
 }
 
 // The in-process `RateStore`. It ships, and it is never the default: an app
-// gets it only by writing `store: MemoryCounter()`, which is the whole design
-// — the counter that is wrong behind a load balancer is a deliberate line in
-// the app's own source.
+// gets it only by writing `store: MemoryCounter(10_000)`, which is the whole
+// design — the counter that is wrong behind a load balancer is a deliberate
+// line in the app's own source.
 //
 // SINGLE PROCESS ONLY. With N servers behind a load balancer each holds its
 // own counters, so a limit of 100 admits up to 100N and nothing reports it.
-// Development, tests, and a single-process service are what it is for. There
-// is no sweeper: a counter is dropped when its key is next touched after
-// expiry, so a key never seen again holds its two integers until the process
-// exits. A store that must bound its own memory is a Redis-backed one, which
-// is exactly why `RateStore` is an interface.
+// Development, tests, and a single-process service are what it is for. A
+// counter that must outlive one process is a Redis-backed one, which is
+// exactly why `RateStore` is an interface.
+//
+// ## It is BOUNDED, and the cap is not the limit (#4630)
+//
+// `maxKeys` has no default and is the hard ceiling on how many windows this
+// store holds. An `incr` that would cross it evicts the soonest-expiring
+// window first, so the map never holds more than the cap and an `incr` never
+// fails because the store is full; expired windows are also swept every
+// `memoryCounterSweepEvery` calls, so a key seen once and never again does not
+// hold its two integers until the process exits.
+//
+// The bound matters here more than it does for sessions (memorystore.bit).
+// `byIp` keys on `c.peer()`, so this map grows one entry per distinct client
+// address, and the limiter sits on the path an attacker is by definition
+// already hammering — unbounded, it is a memory-growth vector reachable by
+// anyone who can open a socket, with no rate limit in front of the rate
+// limiter.
+//
+// EVICTION IS OVER-PERMISSIVE, AND THAT IS THE DIRECTION IT HAS TO BE. Losing
+// a window loses a limit decision: the evicted key starts a fresh quota, so a
+// flood from many addresses can push a real client's window out and hand it
+// its full quota again. The cap therefore bounds MEMORY; it is not the limit.
+// A deployment that must keep counting past `maxKeys` distinct keys needs a
+// Redis-backed store, not a bigger number here. The alternative victim rule —
+// evict the LOWEST count, keeping the keys closest to their limit — is more
+// attacker-hostile, but it needs a second rule to spend dead windows before
+// live ones and it makes eviction depend on traffic rather than on time; it is
+// not chosen, and it is what to reach for if the over-permissive direction
+// ever proves to matter more than the simplicity.
 export class MemoryCounter {
   entries: map<string, CounterEntry>
+  // The ceiling on `len(entries)`, from the constructor. No default: how much
+  // memory a process may spend on rate-limit windows is a fact about a
+  // deployment, and a framework that guesses it is how a map grows until the
+  // box does something worse than evict.
+  maxKeys: int
+  // Calls to `incrAt` since the last sweep of expired windows. Reset by it.
+  writesSinceSweep: int
   // A store is shared by every request and requests are concurrent; the map is
   // not safe for concurrent use, so both methods take the lock — `count`
   // included, since it deletes on the expiry path.
   mu: Mutex
 
-  init() {
+  init(maxKeys: int) {
+    // A panic rather than a fallible `init`, for `App.init`'s reason
+    // (app.bit): a counter built with a cap of 0 or a negative one is a
+    // programming error at startup, not a runtime condition the caller could
+    // answer — and a cap below 1 would mean every incr evicts the window it
+    // just created, i.e. a limiter that counts to 1 forever and admits
+    // everything.
+    if (maxKeys < 1) {
+      panic(memoryCounterCapMessage)
+    }
     this.entries = map<string, CounterEntry>()
+    this.maxKeys = maxKeys
+    this.writesSinceSweep = 0
     this.mu = newMutex()
   }
 
@@ -607,16 +662,73 @@ export class MemoryCounter {
   //
   // Not fallible: an in-memory map cannot fail. `incr` is, only because the
   // interface says so for the stores that do I/O.
+  //
+  // Order is load-bearing. The sweep runs BEFORE the map is read, so a store
+  // full of dead windows makes room from the dead and the lookup below sees
+  // the map the sweep left. The cap is then tested only for a key with no
+  // entry at all: incrementing a live window, or overwriting an expired one
+  // under the same key, cannot grow the map.
   incrAt(key: string, ttl: i64, nowSec: i64): i64 {
     this.mu.lock()
     defer this.mu.unlock()
+    this.writesSinceSweep = this.writesSinceSweep + 1
+    if (this.writesSinceSweep >= memoryCounterSweepEvery) {
+      this.writesSinceSweep = 0
+      this.sweepExpired(nowSec)
+    }
     let (e, ok) = this.entries[key]
     if (ok && e.expiresAtSec > nowSec) {
       e.value = e.value + 1
       return e.value
     }
+    if (!ok && len(this.entries) >= this.maxKeys) {
+      this.evictSoonestExpiring()
+    }
     this.entries[key] = CounterEntry{ value: 1, expiresAtSec: nowSec + ttl }
     return 1
+  }
+
+  // Drops every window whose ttl has passed at `nowSec`. Keys are collected
+  // first and deleted after: mutating a map while iterating it is not a thing
+  // to rely on. `<=` is `countAt`'s rule, not a second one.
+  //
+  // The LOCK IS ALREADY HELD by `incrAt`, the only caller. `Mutex` is not
+  // reentrant, so this must not take it.
+  sweepExpired(nowSec: i64) {
+    let dead = []string(0)
+    for (key, e) of this.entries {
+      if (e.expiresAtSec <= nowSec) {
+        dead = append(dead, key)
+      }
+    }
+    for key of dead {
+      delete(this.entries, key)
+    }
+  }
+
+  // Drops the window that expires soonest — already-expired ones first, since
+  // an expired window has the smallest `expiresAtSec` of all. That is one rule
+  // rather than two: it spends the window with the least life left and reaches
+  // a live one only when there is no dead one to take.
+  //
+  // O(n) per eviction, the honest cost of not keeping a second index. A store
+  // where that matters is a Redis-backed one.
+  //
+  // The LOCK IS ALREADY HELD by `incrAt`, the only caller.
+  evictSoonestExpiring() {
+    let victim = ""
+    let victimSec: i64 = 0
+    let found = false
+    for (key, e) of this.entries {
+      if (!found || e.expiresAtSec < victimSec) {
+        victim = key
+        victimSec = e.expiresAtSec
+        found = true
+      }
+    }
+    if (found) {
+      delete(this.entries, victim)
+    }
   }
 
   // `count` against a caller-supplied clock. An entry found expired is deleted

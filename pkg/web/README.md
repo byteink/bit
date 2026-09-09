@@ -63,7 +63,7 @@ app.use(rateLimit(Limit{
   requests: 100,
   window: 60,
   by: byIp,
-  store: MemoryCounter(),
+  store: MemoryCounter(10_000),
 }))
 
 login.use(rateLimit(Limit{ requests: 5, window: 300, by: byIp, store: counter }))
@@ -82,10 +82,9 @@ in-process counter is correct on one server and silently wrong behind a load
 balancer, where each of N servers permits the whole quota and a limit of 100
 becomes 100N with nothing anywhere to indicate it.
 
-`MemoryCounter()` ships and is **single-process only**. It is for development,
-tests, and a service that really does run as one process; it has no sweeper, so
-a key never seen again holds two integers until the process exits. A store that
-must be shared or must bound its own memory implements `RateStore`:
+`MemoryCounter(maxKeys)` ships and is **single-process only**. It is for
+development, tests, and a service that really does run as one process. A store
+that must be shared across processes implements `RateStore`:
 
 ```
 interface RateStore {
@@ -97,6 +96,24 @@ interface RateStore {
 That is `INCR` plus `GET`, so a plain key-value store implements it with no
 server-side script. `incr` must not extend an existing counter's life: a bucket
 dies `ttl` seconds after it was created, or the window stops sliding.
+
+### `maxKeys` bounds the memory. It is not the limit.
+
+`MemoryCounter` takes its cap as a required argument, with no default, because
+`byIp` keys on the client address: the map grows one window per distinct
+address, on the path an attacker is by definition already hammering. Past the
+cap an `incr` **evicts the soonest-expiring window and never fails** — expired
+windows go first, since an expired one expires soonest of all — and expired
+windows are additionally swept every 64th `incr`, so a key seen once and never
+again does not hold its two integers until the process exits.
+
+Evicting a window loses a limit decision: **the evicted key starts a fresh
+quota.** That is the over-permissive direction, and it is deliberate — a
+limiter that refused requests when its own store filled up would turn a full
+map into an outage of the app it protects. So `maxKeys` is a bound on memory,
+not a second limit: size it above the number of distinct clients you expect in
+one window, and if a deployment genuinely counts more keys than it can hold,
+the answer is a Redis-backed `RateStore`, not a bigger number here.
 
 ### The window slides
 
