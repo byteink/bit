@@ -2022,14 +2022,15 @@ fallible surface form), so codegen never checks a return value.
 ### Exported C symbols (all `bit_rt_*`, one process-wide runtime instance)
 
 **This table is a selection, not a census.** Every row below is exported and
-stable, but a name's ABSENCE here says nothing: on `1e254026` plus this
+stable, but a name's ABSENCE here says nothing: on `e869af60` plus this
 change, `git grep -ho '@symbol("bit_rt_[a-z0-9_]*")' -- runtime | sort -u`
-reports 594 pinned names against the 127 rows below. Most of the gap is `bit_rt_port_*` test pins and
-GC/scheduler/provider internals, but not all of it — ordinary §14 entry points
-such as `bit_rt_fs_open`, `bit_rt_fs_write`, `bit_rt_fs_close` and
-`bit_rt_fs_truncate` have no row either. **Each section's own prose is the
-authority for its family**; use this table as an index into them, never as the
-exported-symbol list.
+reports 594 pinned names against the 137 rows below. Most of the gap is
+`bit_rt_port_*` test pins and GC/scheduler/provider internals, but not all of
+it — `bit_rt_chan_recv_ok`, an ordinary §11 entry point generated code calls
+directly, has no row. Every `bit_rt_fs_*` symbol does have one as of #4643,
+which is a fact about §14 today rather than a rule the table follows. **Each
+section's own prose is the authority for its family**; use this table as an
+index into them, never as the exported-symbol list.
 
 **Standing rule for Bit-sourced runtime modules: every runtime function another
 module calls MUST be pinned with `@symbol("...")` (SPEC §11.9).** This is a
@@ -2113,16 +2114,26 @@ defined exactly once).
 | `bit_rt_map_iter_next`| `(m: ?*MapHeader, prev: i64) -> i64` (§15)              |
 | `bit_rt_map_key_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15)               |
 | `bit_rt_map_val_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15; a NEGATIVE slot reads as `0`, so `map_slot`'s miss marker needs no branch at the call site) |
+| `bit_rt_fs_open`      | `(path: *const RtBytes, write: bool) -> i64` (§14, fd, or `-1`; `write=false` opens read-only, `write=true` creates+truncates write-only at mode `0644`. Rejects a DIRECTORY (#2149) — `open(2)` on one succeeds `O_RDONLY`, handing out a `File` nothing can read) |
 | `bit_rt_fs_append`    | `(path: *const RtBytes) -> i64` (§14)                   |
 | `bit_rt_fs_read`      | `(fd: i64, max: i64) -> *const RtBytes` (§14)           |
+| `bit_rt_fs_read_all`  | `(fd: i64) -> *const RtBytes` (§14, the whole file, regular files only — sized by `lseek(SEEK_END)`, then TRIMMED to the bytes actually read, never zero-padded (#2990). An empty result is ambiguous in-band, since `string` has no nil sentinel; `bit_rt_fs_read_all_failed` below carries the distinction) |
+| `bit_rt_fs_read_all_failed` | `() -> bool` (§14, #2994/#3065/#2996, the out-of-band companion flag for the row above: true when `lseek` failed or the allocation for an already-known-non-empty file failed, and NEVER for a genuinely empty file. Per-task state cleared at each `bit_rt_fs_read_all` entry, so it must be read immediately after that call with no yield between) |
+| `bit_rt_fs_write`     | `(fd: i64, s: *const RtBytes) -> i64` (§14, bytes written, or `-1`) |
+| `bit_rt_fs_close`     | `(fd: i64) -> i64` (§14, always `0` — the raw wrapper swallows `EINTR`/`EBADF`, so a caller has no close error to handle) |
 | `bit_rt_fs_exists`    | `(path: *const RtBytes) -> bool` (§14)                  |
 | `bit_rt_fs_is_dir`    | `(path: *const RtBytes) -> bool` (§14)                  |
 | `bit_rt_fs_mkdir`     | `(path: *const RtBytes) -> i64` (§14)                   |
 | `bit_rt_fs_remove`    | `(path: *const RtBytes) -> i64` (§14)                   |
 | `bit_rt_fs_rename`    | `(oldPath: *const RtBytes, newPath: *const RtBytes) -> i64` (§14) |
+| `bit_rt_fs_chmod`     | `(path: *const RtBytes, mode: i64) -> i64` (§14, sets `path`'s permission bits to `mode`; `0`, or `-1` on any error. Darwin calls libc `chmod`, Linux the raw `chmod`/`fchmodat(AT_FDCWD, ...)` syscall. Its contract lives only in the provider comments in `runtime/root/{darwin,linux,windows}/fs.bit` — §14's own prose block omits it) |
 | `bit_rt_fs_list_dir`  | `(path: *const RtBytes) -> *const RtBytes` (§14)        |
 | `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not NUL-terminated, not `RtBytes`; the only `bit_rt_fs_*` entry point shaped this way) |
 | `bit_rt_fs_sync`      | `(fd: i64) -> i64` (§14, `0` on success, `-1` on failure; Darwin uses `F_FULLFSYNC`, falling back to bare `fsync` only on `ENOTSUP` — bare `fsync` alone does not flush the drive's write cache on that platform) |
+| `bit_rt_fs_truncate`  | `(fd: i64, size: i64) -> i64` (§14, #4016, sets `fd`'s length; `0`, or negative on any failure. Never moves the fd's own cursor, matching `bit_rt_fs_pread_w`/`bit_rt_fs_pwrite_w`; growing leaves a HOLE rather than reserving blocks, so a later write can still fail `ENOSPC`, and the new length is not durable until `bit_rt_fs_sync`) |
+| `bit_rt_fs_size`      | `(fd: i64) -> i64` (§14, #4016, `fd`'s length in bytes, or negative on any failure; `fstat` on Darwin/Linux, `GetFileSizeEx` on Windows) |
+| `bit_rt_fs_lock`      | `(fd: i64, exclusive: bool, blocking: bool) -> i64` (§14, #4014, whole-file advisory lock — `flock(2)` on Darwin/Linux, `LockFileEx` over the `MAXDWORD`/`MAXDWORD` range on Windows. A normalized THREE-WAY result, deliberately not the `-errno` of `bit_rt_fs_stat_w`: `0` success; `-1` ONLY when `blocking` is false and the lock is held elsewhere, which is `tryLock`'s expected outcome rather than a failure; `-2` any other error) |
+| `bit_rt_fs_unlock`    | `(fd: i64) -> i64` (§14, #4014, releases the lock above; `0`, or `-2` — `-1` has no meaning here, since releasing a lock has no "would block" outcome. A no-op success on an fd holding no lock, on every platform, so a caller never tracks whether it currently holds one) |
 | `bit_rt_fs_pread_w`   | `(fd: i64, buf: usize, max: i64, off: i64) -> i64` (§14, #3463, positional read: `buf` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not `RtBytes`, not NUL-terminated, same convention `bit_rt_fs_is_symlink_w` uses; byte count transferred, or negative on any I/O error; a short count, including 0 at end of file, is NOT an error) |
 | `bit_rt_fs_pwrite_w`  | `(fd: i64, buf: usize, n: i64, off: i64) -> i64` (§14, #3463, positional write: same `buf` convention as `bit_rt_fs_pread_w`; byte count transferred, or negative on any I/O error; extends the file or leaves a zero-filled hole as POSIX `pwrite(2)` does) |
 | `bit_rt_fs_open_rw_w` | `(words: usize, n: i64) -> i64` (§14, #3533, read-write open: same packed-bytes `words`/`n` convention as `bit_rt_fs_is_symlink_w`; `O_RDWR\|O_CREAT`, deliberately WITHOUT `O_TRUNC` -- creates `path` if absent, never destroys existing content on open; fd, or -1. Darwin/Linux only -- windows deferred, see runtime/root/{darwin,linux}/fsopenrw.bit and fs.bit) |
