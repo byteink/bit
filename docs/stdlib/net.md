@@ -146,6 +146,14 @@ Sets (or, with `0`, clears) the absolute deadline `readDeadline`/`writeDeadline`
 respect on this connection from now on. Does not reach back to bound a
 `dial`/`dialDeadline` connect already completed.
 
+### `Conn.deadline(): int`
+
+The absolute monotonic deadline this connection's reads and writes are bounded
+by, or `0` for none. The `deadlineNs` state itself is private to `std/net`;
+this is the way a layer built on top of a `Conn` (`std/tls`, `std/http`) reads
+the deadline it must thread through its own waits, instead of inventing a
+second one.
+
 ### `Conn.readDeadline(max: int): string!`
 
 Like `read`, but bounded by the connection's deadline. An empty result is a
