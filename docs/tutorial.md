@@ -247,13 +247,14 @@ needed anywhere, and the only shared state is the channel.
 
 ## Testing
 
-A test is any top-level function with no parameters and no return value,
-declared in a file named `<name>.test.bit`. The filename is the only
-discovery marker - no naming convention is required, though `test_...`
-remains a common, readable choice for the function itself.
+A test is a `test "name" { }` declaration in a file named `<name>.test.bit`,
+and that is the only discovery shape. The name is the declaration's string, so
+it may contain spaces and punctuation - it is what the `ok`/`FAIL` lines print
+and what `--run` matches.
 
 Put this in `math.test.bit`:
 
+<!-- doctest: test-file -->
 ```bit
 import { eq, ok } from "std/testing"
 
@@ -261,18 +262,18 @@ fn double(n: int): int {
   return n * 2
 }
 
-fn test_double() {
+test "double" {
   eq<i64>(double(21), 42, "double")
   ok(double(0) == 0, "zero")
 }
 ```
 
-`double` takes a parameter and returns a value, so it is an ordinary helper,
-not a test - it is excluded by its shape, not by its name.
+`double` is an ordinary helper in the same file, not a test: only `test`
+declarations are discovered, whatever a helper happens to be named.
 
 ```
 $ bit test math.test.bit
-ok   test_double
+ok   double
 
 discovered 1 test, ran 1: 1 passed, 0 failed
 ```
