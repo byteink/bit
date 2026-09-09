@@ -40,7 +40,7 @@ bracketed comma list (see §5), a flat unbracketed list — return values,
 assignment sides, `case` expression lists, constraint bounds
 (`fmtPrintFlatList`, `compiler/fmtwrap.bit:14-97`) — and a bare
 binary/logical/string-concat chain (`fmtPrintBinaryChain`,
-`compiler/fmtwrap.bit:410-454`, dispatched from the `Binary`-tag case,
+`compiler/fmtwrap.bit:634-693`, dispatched from the `Binary`-tag case,
 `compiler/fmtexpr.bit:78-81`) each render flat only if that fits; otherwise
 one item/operand per line at one deeper indent. A single-item list stays on
 one line even over budget — wrapping a lone item never shortens anything (§5).
@@ -64,7 +64,7 @@ is left unsettled; there is currently no construct with zero width check.
 
 **Rule.** 2 spaces per nesting level (`fmtIndentWidth`, `compiler/fmt.bit:29`),
 written lazily at the first real content of each line (`fmtRaw`,
-`compiler/fmt.bit:238-255`) as `p.indent * fmtIndentWidth` spaces. No tabs.
+`compiler/fmt.bit:250-267`) as `p.indent * fmtIndentWidth` spaces. No tabs.
 
 **Check:** `fmtIndentWidth` in `compiler/fmt.bit` reads `2`; every output
 line's leading-space count equals `2 × ` its brace/block nesting depth.
@@ -73,7 +73,7 @@ line's leading-space count equals `2 × ` its brace/block nesting depth.
 
 **Rule.** Any run of one or more blank source lines between two adjacent
 items collapses to **exactly one** blank output line (`fmtGap`'s `allowBlank`
-branch, `compiler/fmt.bit:292-294, 306-308`); zero blank lines in the source
+branch, `compiler/fmt.bit:304-306, 318-320`); zero blank lines in the source
 stays zero. This applies between top-level declarations and between
 statements inside a block (`fmtPrintSeq`, `compiler/fmtprint.bit:203-213`), and to a
 blank line preserved immediately before a block's own closing `}`
@@ -94,7 +94,7 @@ design, not as a separate policy:**
   generics, composite literals, imports, tuples — no blank line is ever
   preserved between items or before the closing delimiter, regardless of the
   source (`fmtPrintCommaList`'s per-item and trailing `fmtGap` calls both pass
-  `allowBlank = false`, `compiler/fmtwrap.bit:267, 294`).
+  `allowBlank = false`, `compiler/fmtwrap.bit:269, 296`).
 
 **Check:** for any two adjacent statements/declarations in the same sequence,
 0 source blank lines yields 0 output blank lines and ≥1 yields exactly 1;
@@ -109,7 +109,7 @@ then replayed in strict source order: it either trails the current output
 line (if nothing but whitespace — no newline — separated it from whatever
 precedes it in the source) or starts its own new output line immediately
 before whichever node begins next in source order (`fmtGap`,
-`compiler/fmt.bit:271-308`). **The formatter never reassigns a comment to a
+`compiler/fmt.bit:283-320`). **The formatter never reassigns a comment to a
 different statement, list item, or clause than the one it was adjacent to in
 the source.** Line comments (`//`) force a newline after themselves; block
 comments (`/* */`) do not.
@@ -132,7 +132,7 @@ comparator used, generalized to any node kind.
 
 ## 5. Bracketed comma lists (params, args, class/field/variant lists, generics, composite literals, imports, tuples)
 
-**Rule** (`fmtPrintCommaList`, `compiler/fmtwrap.bit:158-297`, settled by `#2140`
+**Rule** (`fmtPrintCommaList`, `compiler/fmtwrap.bit:158-299`, settled by `#2140`
 and `#2880` together): the list flattens onto one line only if **both** hold —
 
 1. the source did not already break the list at one of the list's own
@@ -201,7 +201,7 @@ comment to agree with this rule.
 
 Otherwise it explodes to one item per line, each with a trailing comma, at
 one deeper indent level, preserving the author's own item grouping (`grouped`,
-`compiler/fmtwrap.bit:255-283`) — two items the source kept on the same line stay
+`compiler/fmtwrap.bit:256-285`) — two items the source kept on the same line stay
 on the same output line when the list is already exploding for some other
 item's sake. `{`/`}` pad with an inner space when the whole thing renders
 flat (`Point{x: 0}` → `Point{ x: 0 }`).
@@ -258,8 +258,8 @@ the AST. The parser discards them and encodes grouping purely as tree shape
 via precedence, so the formatter cannot "keep the parens the author wrote" —
 there is no author-wrote-parens fact left by the time it runs. Instead it
 **re-derives** parens from a style rule and precedence alone
-(`fmtPrintBinarySide`, `compiler/fmtwrap.bit:302-332`, using `fmtPrec`,
-`fmtIsBitOrShift` and `fmtIsBoolConn`, `compiler/fmt.bit:113-152`):
+(`fmtPrintBinarySide`, `compiler/fmtwrap.bit:326-358`, using `fmtPrec`,
+`fmtIsBitOrShift` and `fmtIsBoolConn`, `compiler/fmt.bit:119-158`):
 
 1. **Precedence-required parens** — the ordinary case: a binary operand that
    would silently regroup under the *other* operator's precedence (with
@@ -335,13 +335,13 @@ whose last real token is already a terminator, gets no `;`).
 function declaration, …) is never followed by `;` in the output; a statement
 ending in a bare expression, identifier, or literal is.
 
-## 10. Width budget for bare (non-bracketed) constructs — settled (`#2889`, `#2894`)
+## 10. Width budget for bare (non-bracketed) constructs — settled (`#2889`, `#2894`, `#4367`)
 
 **Rule.** Return values, assignment sides, `case` expression lists,
 constraint bounds (`fmtPrintFlatList`, `compiler/fmtwrap.bit:14-97`, shares
 the flat-then-fits-or-wrap shape §5's bracketed lists use) and bare
 binary/logical/string-concat chains (`fmtPrintBinaryChain`,
-`compiler/fmtwrap.bit:410-454`, dispatched from the `Binary`-tag case,
+`compiler/fmtwrap.bit:634-693`, dispatched from the `Binary`-tag case,
 `compiler/fmtexpr.bit:78-81`) render flat if that fits under the §1 budget
 and holds no comment, else one item/operand per line at one deeper indent —
 the same rule §1 and §5 state, extended by `#2889` to every construct that
@@ -351,6 +351,54 @@ decisions") measures against the indent baseline rather than the real column,
 because the enclosing single-element list was always going to stay flat
 regardless, and measuring for real would only manufacture a wrap that forces
 every enclosing single-element list to explode for no shortening gain.
+
+### Break-point preference for a binary chain (`#4367`)
+
+**Rule.** One operand per line is the chain's LAST resort, not its first.
+When a chain does not fit, the printer first re-renders it with its
+operators inline and a break taken inside a bracketed comma list (§5) nested
+in one of its operands, and keeps that render instead
+(`fmtTryChainNestedWrap`, `compiler/fmtwrap.bit:551-577`) when **all four**
+of these hold:
+
+1. The chain is not a boolean-connective chain. `&&`/`||` keep the
+   trailing-connective wrap above, unconditionally: each operand is a
+   complete clause that reads on a line of its own, and that is the spelling
+   this corpus hand-wraps.
+2. Some operand after the first is a **fragment** — a bare identifier, or a
+   number, rune, bool or `nil` literal (`fmtChainAtomIsFragment`,
+   `compiler/fmtwrap.bit:589-596`). A **string** literal is deliberately not
+   a fragment: a `+` chain of string pieces is a sequence of content and each
+   piece reads on its own line. An operand that is a call, or any other
+   bracketed construct, also stands as its own line, so a chain made only of
+   those keeps the operator wrap.
+3. Exactly **one** nested comma list breaks (`fmtNoteChainListBreak`,
+   `compiler/fmtwrap.bit:307-311`). Needing two means the chain is too long
+   for a bracketed break to rescue, and one operand per line reads better
+   than two calls exploded mid-line.
+4. Every line of the result fits the §1 budget — the first line from the
+   column the chain starts at, the last line including whatever fixed text
+   follows it (`fmtChainNestedFits`, `compiler/fmtwrap.bit:507-522`).
+
+Each operand is handed the exact width of everything that follows it on its
+own line (`fmtChainSuffixWidth`, `compiler/fmtwrap.bit:493-502`) as the §5
+tail hint, so a nested list measures against the whole line rather than
+against a bare `)`. A chain nested inside this trial renders flat and never
+breaks at an operator of its own: the trial asks whether a *bracketed* break
+is enough, and a deeper operator break would answer a different question.
+
+The reported case was a 101-column `if`, where breaking after `<` left
+`0) {` alone on the next line, reading as though the condition had ended on
+the line before:
+
+```bit
+  if (descEqAgg(wa + descEnumPayloadBase, wb + descEnumPayloadBase, desc, blockPos, depth + 1) < 0) {
+```
+
+**Check:** `_tests_/cases/fmt_chain_inner_break.bit` — the line above breaks
+inside `descEqAgg`'s argument list with `) < 0) {` intact; an all-call `-`
+chain, a `&&` chain, a string-piece `+` chain, and a `+` chain needing two
+list breaks all keep one operand per line.
 
 **Check:** `return aVeryLongIdentifier1 + aVeryLongIdentifier2 + ...` (a bare
 `+` chain as a sole return value, over 100 columns) wraps one operand per
@@ -410,7 +458,7 @@ x64   { 0xB8, 0x08, 0x00, 0x00, 0x00 }  // mov eax, 8
 
 `bit fmt` collapses every one of these to a single space before `//` —
 `fmtGap`'s same-line branch emits exactly one space and nothing more
-(`compiler/fmt.bit:265`, `fmtRaw(p, " ")`). There is no column-alignment
+(`compiler/fmt.bit:312`, `fmtRaw(p, " ")`). There is no column-alignment
 logic anywhere in `compiler/fmt.bit`, `compiler/fmtcmd.bit`,
 `compiler/fmtdispatch.bit`, `compiler/fmtexpr.bit` or `compiler/fmtwrap.bit`
 — confirmed by grepping all five for `align`/`column`/`padTo`/`widest`; the

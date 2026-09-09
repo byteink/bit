@@ -247,6 +247,7 @@ fn fmtPrintCommaList(p: Printer, items: []int, open: string, closeStr: string, s
     p.srcPos = srcPosBefore
   }
 
+  fmtNoteChainListBreak(p)
   p.indent = p.indent + 1
   // Preserve the author's grouping: same boundary check as `authorBroke`
   // above, so two items stay on the same output line exactly where the
@@ -295,6 +296,18 @@ fn fmtPrintCommaList(p: Printer, items: []int, open: string, closeStr: string, s
   fmtGap(p, spanEnd, false)
   p.indent = p.indent - 1
   fmtRaw(p, closeStr)
+}
+
+// Records that a bracketed comma list is about to wrap, for
+// `fmtTryChainNestedWrap`'s at-most-one-break rule (#4367). Called
+// unconditionally from `fmtPrintCommaList`'s wrap path so that function's own
+// McCabe complexity is untouched -- the same reason `fmtBinarySideAlwaysWrap`
+// and `fmtUnaryOperandWrap` (fmtexpr.bit) exist. Outside a chain trial
+// (`chainFlatOnly` false) nobody reads the counter and this is a no-op.
+fn fmtNoteChainListBreak(p: Printer) {
+  if (p.chainFlatOnly) {
+    p.chainListBreaks = p.chainListBreaks + 1
+  }
 }
 
 // The tags that ALWAYS need parens as a binary operand, regardless of
@@ -388,6 +401,11 @@ fn fmtChainFlattens(childOp: int, parentOp: int): bool {
 class BinaryChain {
   atoms: []int,
   ops: []int,
+  // Byte offset in the unwrapped render (`fmtPrintChain` with `wrapped`
+  // false, which only ever runs into a scratch buffer that starts empty)
+  // just past each atom, recorded there and read by `fmtChainSuffixWidth`
+  // (#4367). Empty until that render has run.
+  ends: []int,
 }
 
 // The left spine below a node whose operator is `parentOp`: keeps
@@ -402,7 +420,7 @@ fn fmtCollectChainSide(p: Printer, idx: int, parentOp: int): BinaryChain {
     left.ops = append(left.ops, n.main)
     return left
   }
-  return BinaryChain{ atoms: append([]int(0), idx), ops: []int(0) }
+  return BinaryChain{ atoms: append([]int(0), idx), ops: []int(0), ends: []int(0) }
 }
 
 // The chain rooted at `idx`, a known `Binary` node.
@@ -422,8 +440,17 @@ fn fmtCollectBinaryChain(p: Printer, idx: int): BinaryChain {
 // operands is flushed (trailing the line it was adjacent to in the source,
 // per FMT.md §4) rather than left pending, which would otherwise misfire a
 // nested chain's OWN comment check (#2889).
+//
+// The `!wrapped` render records `chain.ends` on the way past each atom
+// (#4367): it always runs into a scratch buffer that starts empty, so
+// `len(p.out)` there IS the offset into the text the caller captures, and
+// `fmtChainSuffixWidth` reads it back to tell a nested comma list how many
+// columns of this chain follow it on its own line.
 fn fmtPrintChain(p: Printer, chain: BinaryChain, wrapped: bool) {
   fmtPrintBinarySide(p, chain.atoms[0], chain.ops[0], false)
+  if (!wrapped) {
+    chain.ends = append(chain.ends, len(p.out))
+  }
   let i = 1
   while (i < len(chain.atoms)) {
     fmtRaw(p, " ")
@@ -434,17 +461,188 @@ fn fmtPrintChain(p: Printer, chain: BinaryChain, wrapped: bool) {
       fmtRaw(p, " ")
     }
     fmtPrintBinarySide(p, chain.atoms[i], chain.ops[i - 1], true)
+    if (!wrapped) {
+      chain.ends = append(chain.ends, len(p.out))
+    }
     i = i + 1
   }
 }
 
+// Everything `fmtTryChainNestedWrap` (and the two helpers below it) needs
+// from `fmtPrintBinaryChain`'s already-computed state, bundled to stay under
+// E0202's 5-parameter limit. `flat` is the unwrapped render that just failed
+// the width check -- kept because `chain.ends` indexes into it -- and
+// `srcPos`/`outLine` are the values to put back if the nested-wrap render is
+// rejected (#4367).
+class ChainWrap {
+  flat: string,
+  tail: int,
+  effectiveCol: int,
+  srcPos: int,
+  outLine: int,
+}
+
+// How many columns of `flat` follow offset `at` on the same output line: up
+// to the next '\n', or to the end of `flat` plus the caller's own `tail`
+// when no newline follows. This is exactly the `p.nextListTail` hint a
+// bracketed comma list inside the atom ending at `at` needs (#4367) -- the
+// existing hint carries only the fixed text a caller knows will follow a
+// list's closing bracket, and a list nested inside a binary chain could
+// never see the rest of its own chain, which is how a call whose arguments
+// fit by one column left `0) {` stranded on a line of its own.
+fn fmtChainSuffixWidth(flat: string, at: int, tail: int): int {
+  let i = at
+  while (i < len(flat)) {
+    if (flat[i] == '\n') {
+      return i - at
+    }
+    i = i + 1
+  }
+  return len(flat) - at + tail
+}
+
+// Whether every line of a candidate multi-line render fits the §1 budget:
+// the first line starts at `w.effectiveCol`, every later line carries its own
+// indent inside `text`, and only the last line pays `w.tail`.
+fn fmtChainNestedFits(text: string, w: ChainWrap): bool {
+  let start = 0
+  let col = w.effectiveCol
+  let i = 0
+  while (i < len(text)) {
+    if (text[i] == '\n') {
+      if (col + i - start > fmtMaxWidth) {
+        return false
+      }
+      start = i + 1
+      col = 0
+    }
+    i = i + 1
+  }
+  return col + len(text) - start + w.tail <= fmtMaxWidth
+}
+
+// The chain rendered with its operators inline -- no operator torn off its
+// right operand -- handing each atom the true width of everything that
+// follows it on the line, so a bracketed comma list nested in an atom makes
+// its own §5 wrap decision against the whole line rather than against a bare
+// `)` (#4367).
+fn fmtPrintChainTailed(p: Printer, chain: BinaryChain, w: ChainWrap) {
+  p.nextListTail = fmtChainSuffixWidth(w.flat, chain.ends[0], w.tail)
+  fmtPrintBinarySide(p, chain.atoms[0], chain.ops[0], false)
+  let i = 1
+  while (i < len(chain.atoms)) {
+    fmtRaw(p, " ")
+    fmtRaw(p, opSymbol(chain.ops[i - 1]))
+    fmtRaw(p, " ")
+    p.nextListTail = fmtChainSuffixWidth(w.flat, chain.ends[i], w.tail)
+    fmtPrintBinarySide(p, chain.atoms[i], chain.ops[i - 1], true)
+    i = i + 1
+  }
+  p.nextListTail = 0
+}
+
+// Tries the nested-comma-list break and emits it if exactly one list broke
+// and every line fits,
+// returning whether it did (#4367). Rejecting puts `p.srcPos` and
+// `p.outLine` back, exactly as the flat trial above does, so the operator
+// wrap that follows re-descends into the same atoms from the same watermark
+// (#2901). A render with no newline in it is the flat form the caller
+// already rejected on width and is never accepted here.
+fn fmtTryChainNestedWrap(p: Printer, chain: BinaryChain, w: ChainWrap): bool {
+  let colBefore = p.col
+  let bolBefore = p.bol
+  let savedOut = p.out
+  p.out = []byte(0)
+  p.bol = false
+  p.col = w.effectiveCol
+  let savedFlatOnly = p.chainFlatOnly
+  let savedBreaks = p.chainListBreaks
+  p.chainFlatOnly = true
+  p.chainListBreaks = 0
+  fmtPrintChainTailed(p, chain, w)
+  let breaks = p.chainListBreaks
+  p.chainFlatOnly = savedFlatOnly
+  p.chainListBreaks = savedBreaks
+  let text = string(p.out)
+  p.out = savedOut
+  p.col = colBefore
+  p.bol = bolBefore
+  if (breaks == 1 && fmtHasNl(text) && fmtChainNestedFits(text, w)) {
+    fmtRaw(p, text)
+    return true
+  }
+  p.srcPos = w.srcPos
+  p.outLine = w.outLine
+  return false
+}
+
+// A chain operand that reads as a FRAGMENT when the operator wrap leaves it
+// alone on a continuation line: a bare name, or a bare number/rune/bool/nil.
+// `isLeafTag` (ast.bit) minus the two STRING literal tags, deliberately: a
+// `+` chain of string pieces is a sequence of content, and each piece reads
+// on a line of its own exactly the way a `&&` chain's clauses do. Formatting
+// the tree with strings counted as fragments explodes a small call's
+// argument list in the middle of three such chains (measured on #4367:
+// _tests_/bit/parsergate.bit's `let src = "fn main() {\n  let x = " +
+// repeatStr("(", nearN) + ...`, _tests_/bit/stressparallel.bit,
+// compiler/lspsymbols.bit) -- strictly worse than one piece per line.
+fn fmtChainAtomIsFragment(t: Tag): bool {
+  return t == Tag.Ident ||
+    t == Tag.IntLit ||
+    t == Tag.FloatLit ||
+    t == Tag.RuneLit ||
+    t == Tag.BoolLit ||
+    t == Tag.NilLit
+}
+
+// Whether the operator wrap would STRAND a bare operand, which is the one
+// case where an inner bracketed-comma-list break is preferred to it (#4367).
+// Two conditions, both necessary:
+//
+//   - Not a chain of boolean connectives. Every `&&`/`||` operand is a
+//     complete clause that reads on a line of its own, the trailing-
+//     connective spelling is what this corpus hand-wraps, and §10 settled it
+//     in #2889. `ops[0]` decides for the whole chain: `fmtChainFlattens` only
+//     links operators of ONE precedence tier, and `&&` (3) and `||` (2) are
+//     tiers of their own.
+//   - Some operand after the first is a FRAGMENT
+//     (`fmtChainAtomIsFragment`). The operator wrap puts each operand after
+//     the first on a continuation line of its own, and a line reading `0) {`
+//     looks like the expression ended on the line before. An operand that is
+//     a call, or any other bracketed construct, stands as its own line
+//     perfectly well, so a chain made only of those keeps the operator wrap
+//     -- shorter, and what this corpus already reads as correct.
+fn fmtChainPrefersInnerBreak(p: Printer, chain: BinaryChain): bool {
+  if (fmtIsBoolConn(chain.ops[0])) {
+    return false
+  }
+  let i = 1
+  while (i < len(chain.atoms)) {
+    if (fmtChainAtomIsFragment(getNode(p.tree, chain.atoms[i]).tag)) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
 // Width-aware print for a `Binary` node (#2889): flattens its chain and
 // joins it on one line if that fits under fmtMaxWidth and holds no comment;
-// otherwise re-renders one operand per line at one deeper indent.
+// else (#4367) breaks inside the innermost bracketed comma list nested in it
+// when that brings every line under budget; else, last resort, one operand
+// per line at one deeper indent.
 fn fmtPrintBinaryChain(p: Printer, idx: int) {
   let tail = p.nextListTail
   p.nextListTail = 0
   let chain = fmtCollectBinaryChain(p, idx)
+  // #4367: an enclosing chain's nested-comma-list trial is asking whether a
+  // BRACKETED break alone brings every line under budget; a chain inside it
+  // answering with an operator break of its own would answer a different
+  // question. Render flat and let that trial's width check decide.
+  if (p.chainFlatOnly) {
+    fmtPrintChain(p, chain, false)
+    return
+  }
   let lastEnd = getNode(p.tree, chain.atoms[len(chain.atoms) - 1]).span.end
   if (!fmtHasCommentBefore(p, lastEnd)) {
     let colBefore = p.col
@@ -481,6 +679,13 @@ fn fmtPrintBinaryChain(p: Printer, idx: int) {
       return
     }
     p.srcPos = srcPosBefore
+    let w = ChainWrap{
+      flat: text, tail: tail, effectiveCol: effectiveCol,
+      srcPos: srcPosBefore, outLine: p.outLine,
+    }
+    if (fmtChainPrefersInnerBreak(p, chain) && fmtTryChainNestedWrap(p, chain, w)) {
+      return
+    }
   }
   p.indent = p.indent + 1
   fmtPrintChain(p, chain, true)
