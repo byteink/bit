@@ -795,6 +795,13 @@ Accept inbound requests and dispatch each to `handler` on its own green thread,
 until the connection closes. A handler that returns a `Response` with status 0
 aborts that stream with RST_STREAM (CANCEL).
 
+Two things end it: the transport dying, and this side raising a *connection
+error* against a misbehaving peer - a malformed frame, an illegal stream id, a
+header block past `maxHeaderListBytes`, and so on. In both cases the engine
+stops its loop and releases this call, so the caller that owns the transport is
+the one that closes it. A connection error queues its GOAWAY before it stops
+the writer, so the peer is always told why (RFC 9113 §5.4.1).
+
 ### `Conn.waitReaderDone()`
 
 Block until the reader green thread spawned by `connect`/`accept` has noticed
@@ -816,8 +823,9 @@ Block until the writer green thread spawned by `connect`/`accept` has stopped
 touching the transport. Unlike the reader, the writer is normally parked on an
 empty command channel rather than a transport read, so closing or shutting
 down the transport does not wake it by itself - only the connection's own
-teardown handling queues the stop message that releases it, once it has
-observed (via `waitReaderDone()`) that the connection is tearing down.
+teardown queues the stop message that releases it, on either of the two paths
+that end a connection: the transport's EOF, or a connection error this side
+raised.
 
 Call this AFTER `waitReaderDone()` and BEFORE reusing anything the transport
 owned, for the identical use-after-close reason `waitReaderDone()` documents -
@@ -829,6 +837,10 @@ call it exactly once per `Conn`, from a single teardown path.
 
 Begin a graceful shutdown by sending GOAWAY: the peer starts no new streams and
 subsequent `roundTrip` calls are refused, while in-flight streams still complete.
+
+Deliberately *not* a teardown: the loop keeps running and the writer keeps
+draining, which is what lets those in-flight streams finish. That is the whole
+difference between this GOAWAY and the one a connection error sends.
 
 ### `Conn.resetStream(streamId: int, errorCode: int)`
 
