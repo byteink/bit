@@ -630,10 +630,19 @@ STREAM_CLOSED, and the identifier is not reusable, because the ordering state a
 new stream is judged against belongs to the connection rather than to the table.
 
 ```bit
-import { connect, accept, Transport, defaultConfig, Request, Response, newRequest, newResponse } from "std/http2"
+import {
+  connect, accept, Transport, defaultConfig, Request, Response, Stream, newRequest, newResponse,
+  errorRefusedStream,
+} from "std/http2"
 
-// Answer every request with its path echoed back in the body.
-fn echo(req: Request): Response {
+// Answer every request with its path echoed back in the body - except one, which
+// is aborted on the stream it arrived on so the client is told it may retry the
+// request elsewhere. The `Response` returned after a reset is discarded.
+fn echo(req: Request, s: Stream): Response {
+  if (req.path == "/elsewhere") {
+    s.reset(errorRefusedStream)
+    return newResponse(0, []byte(0))
+  }
   return newResponse(200, []byte("you asked for " + req.path))
 }
 
@@ -874,11 +883,12 @@ And it fails when this side resets the stream through `Conn.resetStream`, with
 the peer's reset, because no peer acted. That call is how a parked `roundTrip`
 is cancelled: this method has no cancellation of its own.
 
-### `Conn.serve(handler: (Request) => Response): ()!`
+### `Conn.serve(handler: (Request, Stream) => Response): ()!`
 
 Accept inbound requests and dispatch each to `handler` on its own green thread,
-until the connection closes. A handler that returns a `Response` with status 0
-aborts that stream with RST_STREAM (CANCEL).
+until the connection closes. Each call gets the request and the `Stream` it
+arrived on. A handler that returns a `Response` with status 0 aborts that stream
+with RST_STREAM (CANCEL); `Stream.reset` aborts it with any other code.
 
 Two things end it: the transport dying, and this side raising a *connection
 error* against a misbehaving peer - a malformed frame, an illegal stream id, a
@@ -886,6 +896,31 @@ header block past `maxHeaderListBytes`, and so on. In both cases the engine
 stops its loop and releases this call, so the caller that owns the transport is
 the one that closes it. A connection error queues its GOAWAY before it stops
 the writer, so the peer is always told why (RFC 9113 §5.4.1).
+
+### `Stream`
+
+One inbound stream, handed to a `serve` handler as its second argument. Opaque
+and not constructible outside the module: it exists so a handler can abort *the
+stream it is answering*, and no stream identifier ever leaves the engine.
+`Request` carries no identifier for the same reason - it is also what
+`newRequest` builds on the client side, where one would be meaningless.
+
+### `Stream.reset(errorCode: int)`
+
+Abort this stream by sending RST_STREAM with `errorCode` (an `error*` constant):
+REFUSED_STREAM to tell the peer it may safely retry the request elsewhere,
+ENHANCE_YOUR_CALM to say it is asking too often, and so on. The one code a
+handler could already send is CANCEL, by returning a `Response` with status 0 -
+this is every other code.
+
+Call it from inside the handler, which then still returns a `Response`; that
+`Response` is discarded. The reset and the return travel one command channel
+from one green thread in that order, and the reset closes the stream, so the
+peer receives exactly one RST_STREAM and no HEADERS behind it.
+
+Resetting after the handler has returned is legal and does nothing beyond
+sending the RST_STREAM: identifiers are never reused, so it can only name the
+stream this handler served, which has already finished (RFC 9113 §6.4).
 
 ### `Conn.waitReaderDone()`
 
@@ -936,13 +971,13 @@ that never existed, sends the RST_STREAM and changes nothing else (RFC 9113
 §6.4 permits both).
 
 **You must track the stream id yourself.** Nothing in this API hands one out:
-`roundTrip` returns a `Response` and `serve` hands its handler a `Request`,
-neither of which carries the id. So this is usable from exactly one position -
-a client that knows which stream its own request rode. Each accepted
+`roundTrip` returns a `Response` and `serve` hands its handler a `Request` and a
+`Stream`, neither of which carries the id. So this is usable from exactly one
+position - a client that knows which stream its own request rode. Each accepted
 `roundTrip` takes the next client id in order, starting at 1 and stepping by 2
 (a request refused because the connection is closing takes none), so a caller
 that keeps one `roundTrip` in flight per `Conn` knows that request's id and can
 cancel it from another green thread. Callers that run several `roundTrip` calls
 at once on one `Conn` cannot: those race for ids and nothing reports which one
-each got. There is no way to reset a stream from inside a `serve` handler
-today.
+each got. A server handler needs none of this: `Stream.reset` is this call with
+the id already bound to the stream being served.
