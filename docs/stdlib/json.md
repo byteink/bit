@@ -727,6 +727,15 @@ hand-written decoder over a shape `@json` does not cover. Each takes the
 `path` of the value it is looking at, so the error it raises names the field
 rather than the shape.
 
+Each of the four value extractors has **three forms**. `jsonDecString(j,
+path)` takes a path that is already built; `jsonDecStringKey(j, path, key)`
+and `jsonDecStringIndex(j, path, i)` take the CONTAINING value's path plus the
+one step to this one, and join them with `jsonDecPath`/`jsonDecIndex` only
+inside the failure. The join allocates and only an error message reads it, so
+the synthesised decoder calls the two-part forms everywhere and a document
+with no errors builds no path strings at all. Use whichever form matches what
+you are holding; they raise the identical error.
+
 ### `jsonDecPath(path: string, key: string): string`
 
 `path` extended by object key `key`. The root has no name, so its own fields
@@ -767,19 +776,59 @@ The integer at `path`. Accepts only `JsonInt`: a field declared as an integer
 that silently truncated `1.5` would be a wrong answer rather than a rejected
 document.
 
+### `jsonDecIntKey(j: Json, path: string, key: string): i64!`
+
+The same, for the value at `key` of the object at `path`. Builds
+`jsonDecPath(path, key)` only when it fails.
+
+### `jsonDecIntIndex(j: Json, path: string, i: i64): i64!`
+
+The same, for element `i` of the array at `path`. Builds
+`jsonDecIndex(path, i)` only when it fails.
+
 ### `jsonDecFloat(j: Json, path: string): f64!`
 
 The number at `path`. Accepts **both** numeric variants, because `3` and `3.0`
 are the same document to every producer on the wire -- the same asymmetry
 `jsonAsNumber` documents.
 
+### `jsonDecFloatKey(j: Json, path: string, key: string): f64!`
+
+The same, for the value at `key` of the object at `path`. Builds
+`jsonDecPath(path, key)` only when it fails.
+
+### `jsonDecFloatIndex(j: Json, path: string, i: i64): f64!`
+
+The same, for element `i` of the array at `path`. Builds
+`jsonDecIndex(path, i)` only when it fails.
+
 ### `jsonDecBool(j: Json, path: string): bool!`
 
 The boolean at `path`.
 
+### `jsonDecBoolKey(j: Json, path: string, key: string): bool!`
+
+The same, for the value at `key` of the object at `path`. Builds
+`jsonDecPath(path, key)` only when it fails.
+
+### `jsonDecBoolIndex(j: Json, path: string, i: i64): bool!`
+
+The same, for element `i` of the array at `path`. Builds
+`jsonDecIndex(path, i)` only when it fails.
+
 ### `jsonDecString(j: Json, path: string): string!`
 
 The string at `path`.
+
+### `jsonDecStringKey(j: Json, path: string, key: string): string!`
+
+The same, for the value at `key` of the object at `path`. Builds
+`jsonDecPath(path, key)` only when it fails.
+
+### `jsonDecStringIndex(j: Json, path: string, i: i64): string!`
+
+The same, for element `i` of the array at `path`. Builds
+`jsonDecIndex(path, i)` only when it fails.
 
 ### `jsonDecArray(j: Json, path: string, depth: i64): []Json!`
 
