@@ -72,10 +72,12 @@
 // the same `genericTypeArgs` / `methodTypeArgsRaw` resolution, so this cannot
 // judge a call the emitted body does not name.
 //
-// Only the CALL rule descends. The other rules in `validateinst.bit` still see
-// one level, so a bad interpolation two generics deep (E0073) is still the
-// lowerer's to refuse — a real remaining gap, stated rather than implied
-// (#4685).
+// EVERY rule descends, not the call rule alone (#4685): `vInstDescend` runs
+// `vInstWalk` over the callee's body, so a bad interpolation, map key, index or
+// member two generics deep is a check-time diagnostic rather than the lowerer's
+// E0092. What keeps that single-reporting is `vInstSubstArgs`' refusal below —
+// a call binding no type parameter is a ledger entry of its own and is walked
+// from there, so no body is judged twice down one chain.
 // How many generic bodies deep the chain is followed. `outer -> mid -> inner`
 // is two, and no chain in the corpus or in the compiler comes near eight.
 //
@@ -97,13 +99,28 @@ class InstLink {
 }
 
 // What one step of the walk carries: the bindings in force for the body being
-// scanned, the user's own call site every diagnostic is attributed to, and the
-// chain that leads from that site to here. A class rather than three more
-// parameters (E0202, spec/LINT.md §5.2).
+// scanned, the user's own call site every diagnostic is attributed to, the
+// chain that leads from that site to here, and the bodies this walk has already
+// judged. A class rather than four more parameters (E0202, spec/LINT.md §5.2).
 class InstStep {
   env: TypeEnv,
   site: Span,
   notes: []InstLink,
+  walked: InstWalked,
+}
+
+// Every callee body already judged during ONE ledger entry's validation, keyed
+// `<module>:<decl>:<arg type ids>`. Shared by every step of that walk, which is
+// why it is a class: `return deep(v) + deep(v)` is two call nodes naming ONE
+// emitted body, and judging that body twice reported each of its diagnostics
+// twice — one cause, two identical spans, which is precisely what
+// `vInstSubstArgs`' refusal exists to prevent one level up (#4685).
+//
+// Per entry and NOT per pass, deliberately: two DIFFERENT user calls reaching
+// the same bad body are two causes, each fixable on its own line, and each is
+// still reported.
+class InstWalked {
+  keys: []string,
 }
 
 // One call node: judged against the callee's declared bound, then followed into
@@ -247,6 +264,40 @@ fn vInstNoteChain(c: Checker, at: InstCallRef, step: InstStep) {
   vInstCallNote(c, vSpan(c, at.node), at.name, encl)
 }
 
+// The trail under a diagnostic whose primary span is INSIDE a body reached by
+// descent: the user's own call first, then one note per generic body between it
+// and the line reported (#4685).
+//
+// Silent at depth 0, and that is a rule rather than a fixture accommodation: at
+// depth 0 the body being judged IS the body the ledger entry names, so there is
+// no path to describe. E0073 is the one rule that also names `step.site` at
+// depth 0, which it has done since #3827 and still does — this only adds the
+// hops below it.
+//
+// The remaining gap, stated: at depth 0 E0052, E0054 and E0057 still name only a
+// span inside the generic's own body, with no note reaching the instantiation
+// (#4695 tracks it). That is untouched here, not decided here.
+fn vInstNoteTrailIfDeep(c: Checker, step: InstStep) {
+  if (len(step.notes) == 0) {
+    return
+  }
+  note(c.diags, step.site, "this generic function is instantiated from here")
+  vInstNoteHops(c, step)
+}
+
+// The hops alone, without the site note above them — what `vInstInterp` needs,
+// since it has named `step.site` itself since #3827 and emitting it here too
+// printed the identical note twice. A no-op at depth 0.
+fn vInstNoteHops(c: Checker, step: InstStep) {
+  let encl = ""
+  let i = 0
+  while (i < len(step.notes)) {
+    vInstCallNote(c, step.notes[i].span, step.notes[i].name, encl)
+    encl = step.notes[i].name
+    i = i + 1
+  }
+}
+
 // One note of that chain. The first link stands in the body of the very
 // instantiation the primary span names; every link below it stands in the body
 // of the callee the link above named, and saying which one is the only way the
@@ -260,12 +311,19 @@ fn vInstCallNote(c: Checker, span: Span, name: string, encl: string) {
 }
 
 // Follow a judged call into the callee's own body, under the arguments this
-// instantiation binds it with (#4657).
+// instantiation binds it with (#4657), and run EVERY per-monomorphization rule
+// over it rather than the call rule alone (#4685).
 //
-// The walk is Pass A1's: `subtreeCallNodes` over the body (lowerdriver.bit),
-// the same nodes `recordSubtreeInstantiations` records from, with the callee
-// checker in hand so every node, name and span is read from the tree that owns
-// it. What differs from Pass A1 is deliberate: the bindings are applied through
+// The walk is `vInstWalk`'s (validateinst.bit), the same one `vInstOne` runs
+// over a ledger entry's own body — which is the point: a body reached by
+// descent is judged by the same five rules as a body named by the ledger, so
+// E0073, E0052, E0054 and E0057 two generics deep are check-time diagnostics
+// instead of the lowerer's E0092. It replaces a `subtreeCallNodes` loop
+// (lowerdriver.bit) that visited the Call nodes only; both are unfiltered
+// walks of the whole subtree, so the set of calls judged is unchanged and this
+// still cannot judge a call the emitted body does not name.
+//
+// What differs from Pass A1 is deliberate: the bindings are applied through
 // `substType`/`genericEnvOf` rather than by rebinding the flat `userTypes`,
 // because a validation pass must not mutate the checker state the pass after it
 // reads, and every other rule in this file is env-based for the same reason.
@@ -283,6 +341,9 @@ fn vInstDescend(c: Checker, at: InstCallRef, raw: []int, step: InstStep) {
   if (body == 0 || len(args) == 0) {
     return
   }
+  if (!vInstClaimBody(step.walked, at.fr, args)) {
+    return
+  }
   let next = InstStep{
     env: genericEnvOf(at.fr.owner, at.fr.decl, args),
     site: step.site,
@@ -293,10 +354,35 @@ fn vInstDescend(c: Checker, at: InstCallRef, raw: []int, step: InstStep) {
         mod: at.fr.owner.moduleId, decl: at.fr.decl,
       },
     ),
+    walked: step.walked,
   }
-  for n of subtreeCallNodes(at.fr.owner.tree, body) {
-    vInstCallAt(at.fr.owner, n, next)
+  vInstWalk(at.fr.owner, body, next, 0)
+}
+
+// Claims `fr`'s body under `args` for this walk: true the first time, false
+// once it has been judged. `vInstOnChain` above stops a callee RE-ENTERING
+// itself down one chain; this stops two sibling calls in one body — or two
+// chains under one ledger entry — judging the same emitted body twice.
+//
+// The key is the declaration plus the substituted type arguments, which is what
+// names an emitted body: `deep<i64>` and `deep<string>` are two bodies and both
+// are judged.
+fn vInstClaimBody(w: InstWalked, fr: FuncRef, args: []int): bool {
+  let key = "${fr.owner.moduleId}:${fr.decl}"
+  let a = 0
+  while (a < len(args)) {
+    key = key + ":${args[a]}"
+    a = a + 1
   }
+  let i = 0
+  while (i < len(w.keys)) {
+    if (w.keys[i] == key) {
+      return false
+    }
+    i = i + 1
+  }
+  w.keys = append(w.keys, key)
+  return true
 }
 
 // Is this callee already on the chain? A generic that calls itself — directly or
@@ -452,7 +538,10 @@ fn vInstOrigin(c: Checker, idx: int, origin: []int, env: TypeEnv): InstStep {
     at = origin[at]
     hops = hops + 1
   }
-  return InstStep{ env: env, site: c.ctx.instantiations[at].site, notes: notes }
+  return InstStep{
+    env: env, site: c.ctx.instantiations[at].site, notes: notes,
+    walked: InstWalked{ keys: []string(0) },
+  }
 }
 
 // One hop as a chain link: the call that recorded this entry, and the callee it
