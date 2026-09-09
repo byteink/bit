@@ -1,0 +1,92 @@
+// _tests_/bit/trampoline/trampoline.bit — the one exec shape for every harness
+// under `_tests_/bit/` that generates a `/bin/sh` script and runs it.
+//
+// THE DEFECT THIS CLOSES. The obvious way to start a child from a harness is
+//
+//     writeFile(scriptPath, script); fsChmod(scriptPath, 0700)
+//     osRunBounded(scriptPath, ms)
+//
+// which makes every child the FIRST `execve()` of a brand-new file. macOS tags
+// a newly-created file with a `com.apple.provenance` xattr and validates it on
+// first exec, and that validation is serialized SYSTEM-WIDE — so the harness's
+// wall clock tracks the box's exec queue rather than its own work, and the
+// harness is a contributor to every other agent's queue as well as a victim of
+// it.
+//
+// MEASURED, WITH NO BIT INVOLVED, on this box under fleet load 2026-09-09
+// (`#!/bin/sh` + `exit 0` scripts, run from zsh):
+//
+//     30 execs of 30 FRESH scripts            did not finish in 600s
+//     30 re-execs of ONE validated script     0.084s for all 30
+//
+// #3778 cut it out of `test-golden` (18m25s -> 2m29s) and #3789 out of
+// `test-imports-bit`, both by collapsing an `xargs`-driven fan-out onto one
+// driver script. #4691 found a third copy with a different mechanism in
+// `_tests_/bit/releasesurface/` (291 fresh execs per run, 3m31s idle and
+// 43m45s at load 29) and introduced the trampoline below. #4702 censused the
+// remaining harnesses and found three more above ten fresh execs per run;
+// rather than a fourth copy, the trampoline lives here and they import it.
+//
+// THE SHAPE. The generated script is DATA: written, never chmod'd, never an
+// exec target. The only file ever exec'd is `trampoline.sh`, written once per
+// directory and re-exec'd unmodified for every child. Rewriting it would
+// change its size and mtime and invalidate the kernel's cached validation for
+// that inode, bringing the whole tax back — hence the `exists` guard rather
+// than an unconditional write.
+//
+// ONE DIRECTORY PER PROCESS IS THE CALLER'S JOB. The trampoline hard-codes the
+// `cmd.sh` beside it, so two processes sharing a directory would overwrite each
+// other's command between the write and the exec. Every caller passes paths
+// under a scratch directory only that process names (a uuid or a nonce), which
+// is the same rule their scratch files already followed.
+//
+// WHY THE SCRIPT IS WRITTEN TWICE. `osRunBounded` takes a path and nothing else
+// — no argv, no environment, no stdout capture — so the trampoline cannot be
+// told which script to run; it always runs `cmd.sh`. The per-step named copy is
+// kept because reading a harness's scratch directory is how this cost was
+// diagnosed every time it was found.
+
+import { exists, writeFile } from "std/fs"
+
+// 0o700: owner rwx only. The trampoline is the only file that needs it.
+const trampolineMode: int = 448
+
+// The fixed name the trampoline execs, named once so the writer and the caller
+// cannot drift apart.
+const cmdName: string = "cmd.sh"
+
+// Directory holding `scriptPath`. Byte scan rather than a std/strings helper:
+// `split` would allocate a slice per call, on the hot path.
+export fn scriptDir(scriptPath: string): string {
+  for (let i = len(scriptPath) - 1; i >= 0; i = i - 1) {
+    if (scriptPath[i] == '/') {
+      return scriptPath[:i]
+    }
+  }
+  panic("trampoline: script path has no directory: ${scriptPath}")
+}
+
+// Writes the trampoline once per directory and returns its path.
+fn trampolineFor(dir: string): string! {
+  let path = "${dir}/trampoline.sh"
+  if (exists(path)) {
+    return path
+  }
+  writeFile(path, "#!/bin/sh\nexec /bin/sh \"${dir}/${cmdName}\"\n")?
+  if (fsChmod(path, trampolineMode) != 0) {
+    fail newError("trampoline: cannot make ${path} executable")
+  }
+  return path
+}
+
+// Runs `script` under a `ms` deadline and returns `osRunBounded`'s raw code —
+// the caller owns the policy for its mechanism values (ABI.md §19: -1 spawn
+// failed, -2 timed out, <= -100 died on signal). `scriptPath` names the file
+// the script is RECORDED under; it is never exec'd, see this file's header.
+export fn runScript(scriptPath: string, script: string, ms: int): int! {
+  let dir = scriptDir(scriptPath)
+  let tramp = trampolineFor(dir)?
+  writeFile(scriptPath, script)?
+  writeFile("${dir}/${cmdName}", script)?
+  return osRunBounded(tramp, ms)
+}

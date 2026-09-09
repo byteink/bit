@@ -35,7 +35,8 @@
 // must both be directories, at least `minModules` modules must be found, and at
 // least `minSymbols` exported symbols must be seen across them.
 
-import { readDir, isDir, readFile, writeFile } from "std/fs"
+import { readDir, isDir, readFile, mkdir } from "std/fs"
+import { runScript } from "./trampoline"
 import { exit, envOr } from "std/os"
 import { indexOf, hasPrefix, split, parseInt } from "std/strings"
 
@@ -143,14 +144,19 @@ fn checkHasSection(): bool {
 // stdout capture — so the module path, `BIT_STDLIB` and the redirections are
 // baked into a generated `/bin/sh` script. `exec` makes the script's exit status
 // the compiler's own, which is what the caller's `rc` branch reads.
-fn writeRunner(
-  script: string,
+//
+// The script is DATA: `../trampoline` writes it and execs a trampoline that has
+// already been validated, never this file. Before #4702 this function chmod'd
+// the script and handed THAT path to `osRunBounded`, so all 31 children were
+// the first exec of a brand-new file and the gate measured 8m36s at load 2.94
+// against roughly 1.7s of `bit doc` work.
+fn runnerBody(
   cfg: DocWalkConfig,
   mod: string,
   outPath: string,
   errPath: string,
-): bool {
-  let body = "#!/bin/sh\n" +
+): string {
+  return "#!/bin/sh\n" +
     "BIT_STDLIB=" +
     cfg.root +
     "/stdlib\n" +
@@ -166,15 +172,6 @@ fn writeRunner(
     "\" 2>\"" +
     errPath +
     "\"\n"
-  writeFile(script, body) catch e {
-    eprint("cannot write " + script + ": " + e.message() + "\n")
-    return false
-  }
-  if (fsChmod(script, 493) != 0) {
-    eprint("cannot chmod " + script + "\n")
-    return false
-  }
-  return true
 }
 
 // A symbol as `bit doc` prints it in its plain form (#2724). A named type
@@ -415,11 +412,11 @@ class DocWalkConfig {
   root: string,
   docsRoot: string,
   ms: int,
-  nonce: uint,
+  scratch: string,
 }
 
-// A per-process nonce for the `/tmp` scratch paths `walkModule` writes and
-// execs, mirroring `compiler/build.bit`'s `scratchNonce` and
+// A per-process nonce for the `/tmp` scratch DIRECTORY `walkModule` writes
+// into, mirroring `compiler/build.bit`'s `scratchNonce` and
 // `_tests_/bit/version.bit`'s own `nonce`: two concurrent `bit run
 // _tests_/bit/stdlibdocs.bit` processes — this harness itself, invoked from two
 // worktrees under load — must not share a bare `/tmp/bit-stdlibdocs-<mod>.*`
@@ -429,6 +426,11 @@ class DocWalkConfig {
 // script (#3530). A timestamp is not enough: two processes CAN read the same
 // nanosecond, they cannot draw the same 64-bit value from the OS entropy
 // pool.
+//
+// #4702 made the nonce name a directory rather than a filename prefix, because
+// `../trampoline` keeps one already-validated `trampoline.sh` per DIRECTORY and
+// two processes sharing `/tmp` would then share it — the same collision this
+// nonce was added to prevent, one level up.
 fn processNonce(): uint {
   let b = []byte(cryptoRandomBytes(8))
   let x: uint = 0
@@ -442,14 +444,14 @@ fn processNonce(): uint {
 
 // Runs `bit doc` for one module and returns its stdout, or ("", false) after
 // printing why (timeout, non-zero exit, or an unreadable output file).
-fn moduleDocText(
-  mod: string,
-  script: string,
-  outPath: string,
-  errPath: string,
-  ms: int,
-): (string, bool) {
-  let rc = osRunBounded(script, ms)
+fn moduleDocText(cfg: DocWalkConfig, mod: string, prefix: string): (string, bool) {
+  let outPath = prefix + ".out"
+  let errPath = prefix + ".err"
+  let ms = cfg.ms
+  let rc = runScript(prefix + ".sh", runnerBody(cfg, mod, outPath, errPath), ms) catch e {
+    eprint("stdlib/" + mod + ": cannot start bit doc: " + e.message() + "\n")
+    return "", false
+  }
   if (rc == -2) {
     eprint("TIMED OUT: stdlib/" + mod + " after " + itoa(ms) + "ms\n")
     return "", false
@@ -537,25 +539,30 @@ fn removeScratch(script: string, outPath: string, errPath: string) {
   fsRemove(errPath)
 }
 
+// Removes the two files `../trampoline` leaves behind and then the directory
+// itself, once every module has been walked. `fsRemove`'s result is discarded
+// for the same reason `removeScratch` discards it: scratch going stale is not
+// a verdict. `fsRemove` is `unlink` then `rmdir` (runtime/root/*/fs.bit), so
+// the directory goes only when it is already empty — a leftover file is left
+// visible rather than silently taken with it.
+fn removeScratchDir(scratch: string) {
+  fsRemove(scratch + "/trampoline.sh")
+  fsRemove(scratch + "/cmd.sh")
+  fsRemove(scratch)
+}
+
 // One module's whole walk: run `bit doc`, run the pinned checks, then tally
 // its symbols against its docs page. Every early exit updates `t` and
 // returns rather than raising — a bad module must not stop the others.
 fn walkModule(t: DocWalkTally, cfg: DocWalkConfig, mod: string) {
-  let prefix = "/tmp/bit-stdlibdocs-${cfg.nonce}-" + mod
-  let script = prefix + ".sh"
-  let outPath = prefix + ".out"
-  let errPath = prefix + ".err"
-  if (!writeRunner(script, cfg, mod, outPath, errPath)) {
-    removeScratch(script, outPath, errPath)
-    exit(1)
-  }
+  let prefix = cfg.scratch + "/" + mod
 
-  // `moduleDocText` has already read everything it needs from `outPath`/
-  // `errPath` by the time it returns, success or failure — read-then-remove,
+  // `moduleDocText` has already read everything it needs from `<prefix>.out`/
+  // `<prefix>.err` by the time it returns, success or failure — read-then-remove,
   // and unconditional so every downstream exit (broken, skipped, tallied)
   // is covered by this one call instead of one per branch.
-  let (text, ok) = moduleDocText(mod, script, outPath, errPath, cfg.ms)
-  removeScratch(script, outPath, errPath)
+  let (text, ok) = moduleDocText(cfg, mod, prefix)
+  removeScratch(prefix + ".sh", prefix + ".out", prefix + ".err")
   if (!ok) {
     t.broken = t.broken + 1
     return
@@ -671,17 +678,23 @@ fn main() {
     exit(1)
   }
 
+  let scratch = "/tmp/bit-stdlibdocs-${processNonce()}"
+  mkdir(scratch) catch e {
+    eprint("cannot create " + scratch + ": " + e.message() + "\n")
+    exit(1)
+  }
   let cfg = DocWalkConfig{
     bin: bin,
     root: root,
     docsRoot: docsRoot,
     ms: timeoutMs(),
-    nonce: processNonce(),
+    scratch: scratch,
   }
   let t = newTally()
   for (let i = 0; i < len(mods); i = i + 1) {
     walkModule(t, cfg, mods[i])
   }
+  removeScratchDir(scratch)
 
   if (evaluateTally(t)) {
     exit(1)
