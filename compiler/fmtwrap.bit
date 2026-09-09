@@ -6,6 +6,50 @@
 // fmt.bit to keep each file within the size limit; a sibling .bit file is
 // the same module.
 
+// The Printer state a width trial has to be able to put back, in one place
+// so that no trial hand-rolls a partial copy of it (#4689). Two halves with
+// different lifetimes:
+//
+//   `col`/`bol` are the cursor the trial renders FROM. Restored on BOTH
+//   paths -- the caller writes the kept text with `fmtRaw` from that same
+//   cursor, so it must be the pre-trial one either way.
+//
+//   `srcPos`/`outLine` are one-way watermarks the trial advances FOR REAL as
+//   it renders. Correct on the accept path, where the trial's text IS the
+//   output, and stale on the reject path, where the same nodes are about to
+//   be rendered again: `srcPos` would leave the second render's
+//   newlinesBetween/fmtGap calls reading a watermark stuck past positions
+//   inside the very items being re-descended into (#2901), and `outLine`
+//   would count newlines that were thrown away. `outLine` is not decoration
+//   -- `fmtGap` (fmt.bit) stamps it into every `TrailAlign`, and
+//   `fmtComputeAlignCols` (fmtalign.bit) reads that number as the output
+//   line the comment sits on, to tell a RUN of adjacent trailing comments
+//   apart from two that merely happen to be nearby (#3673).
+class FmtTrial {
+  col: int,
+  bol: bool,
+  srcPos: int,
+  outLine: int,
+}
+
+// Captured immediately before a trial swaps `p.out` for its scratch buffer.
+fn fmtTrialBegin(p: Printer): FmtTrial {
+  return FmtTrial{ col: p.col, bol: p.bol, srcPos: p.srcPos, outLine: p.outLine }
+}
+
+// Puts the render cursor back, once the trial's text has been captured and
+// before the accept/reject decision reads it. Both paths.
+fn fmtTrialRestoreCursor(p: Printer, t: FmtTrial) {
+  p.col = t.col
+  p.bol = t.bol
+}
+
+// Puts the one-way watermarks back. Reject path only -- see FmtTrial.
+fn fmtTrialReject(p: Printer, t: FmtTrial) {
+  p.srcPos = t.srcPos
+  p.outLine = t.outLine
+}
+
 // A comma-free, delimiter-free list (return values, assignment sides, `case`
 // expressions, constraint bounds). Width-aware (#2889): joins flat if that
 // fits under fmtMaxWidth and holds no comment, else renders one item per
@@ -24,16 +68,12 @@ fn fmtPrintFlatList(p: Printer, items: []int, sep: string) {
   }
   let spanEnd = getNode(p.tree, items[len(items) - 1]).span.end
   if (!fmtHasCommentBefore(p, spanEnd)) {
-    let colBefore = p.col
-    let bolBefore = p.bol
     // The trial below renders every item for real through fmtPrintNode, which
-    // one-way-ratchets p.srcPos past each item's span (fmt.bit's fmtPrintNode).
-    // On the fits path the trial's text IS the real output, so that advance is
-    // correct and must stand. On the fallthrough path the items are about to
-    // be rendered again for real below, so p.srcPos must be put back or the
-    // second render's newlinesBetween/fmtGap calls see a watermark stuck past
-    // positions inside the very items being re-descended into (#2901).
-    let srcPosBefore = p.srcPos
+    // one-way-ratchets p.srcPos past each item's span (fmt.bit's fmtPrintNode)
+    // and advances p.outLine over every newline it emits. On the fits path the
+    // trial's text IS the real output, so both advances are correct and must
+    // stand; on the fallthrough path both are stale -- see FmtTrial above.
+    let t = fmtTrialBegin(p)
     // A trial that starts at the beginning of a fresh line (bol) must not let
     // its own lazy indent write bake into the captured `text` (fmtRaw fires
     // the same lazy-indent path in a trial as it does for real): forcing bol
@@ -43,8 +83,8 @@ fn fmtPrintFlatList(p: Printer, items: []int, sep: string) {
     // left behind. Using the raw p.col here would both double the indent (the
     // baked-in copy plus the real write fmtRaw(text) triggers below) and
     // under-count the fits check by a full indent's width.
-    let effectiveCol = colBefore
-    if (bolBefore) {
+    let effectiveCol = t.col
+    if (t.bol) {
       effectiveCol = p.indent * fmtIndentWidth
     }
     let savedOut = p.out
@@ -69,13 +109,12 @@ fn fmtPrintFlatList(p: Printer, items: []int, sep: string) {
     p.speculativeFlat = savedSpeculative
     let text = string(p.out)
     p.out = savedOut
-    p.col = colBefore
-    p.bol = bolBefore
+    fmtTrialRestoreCursor(p, t)
     if (!fmtHasNl(text) && effectiveCol + len(text) + tail <= fmtMaxWidth) {
       fmtRaw(p, text)
       return
     }
-    p.srcPos = srcPosBefore
+    fmtTrialReject(p, t)
   }
   let sepTrim = sep
   if (len(sep) > 0 && sep[len(sep) - 1] == ' ') {
@@ -184,32 +223,30 @@ fn fmtPrintCommaList(p: Printer, items: []int, open: string, closeStr: string, s
     fmtAnyItemGapHasNewline(p, items, spanEnd)
 
   if (!authorBroke && !fmtHasCommentBefore(p, spanEnd)) {
-    let colBefore = p.col
     // `fmtRaw(p, open)` above already ran unconditionally, and fmtRaw always
     // resolves a pending bol to false once it writes non-empty text -- so
     // unlike fmtPrintFlatList/fmtPrintBinaryChain's identical-looking trial
     // (see their comment for the double-indent this guards against there),
-    // bol is provably already false by this point for every caller, and a
-    // plain save/restore -- mirroring p.col -- is sufficient here.
-    let bolBefore = p.bol
-    // See fmtPrintFlatList's srcPosBefore comment: the trial below advances
-    // p.srcPos for real via fmtPrintNode, correctly on the fits path (the
-    // trial's text is kept) but stale on the fallthrough path, where the same
-    // items are about to be re-descended into for real (#2901).
-    let srcPosBefore = p.srcPos
+    // bol is provably already false by this point for every caller, and the
+    // plain restore FmtTrial does is sufficient here -- no forced bol.
+    // The trial below advances p.srcPos and p.outLine for real via
+    // fmtPrintNode, correctly on the fits path (the trial's text is kept) and
+    // stale on the fallthrough path, where the same items are about to be
+    // re-descended into for real (#2901, #4689) -- see FmtTrial above.
+    let t = fmtTrialBegin(p)
     let savedOut = p.out
     p.out = []byte(0)
     // A single-item list's own accept/reject decision below never depends on
     // `fits` -- it keeps the item flat regardless of overflow, so a nested
     // width-dependent decision (`fmtPrintBinaryChain`) rendering that sole
     // item is answering a moot question if it measures against the real,
-    // inherited `colBefore`: this list was always going to accept the result
+    // inherited `t.col`: this list was always going to accept the result
     // flat unless the trial text itself holds a newline, and a premature wrap
     // only manufactures that newline, forcing this list -- and every
     // enclosing single-item list in turn -- to explode for no shortening
     // gain (#2894). `speculativeFlat` tells such a nested decision to measure
-    // from the indent baseline instead (the same baseline `bolBefore` already
-    // uses below). A multi-item list's own decision here IS real, so it
+    // from the indent baseline instead (the same baseline `t.bol` already
+    // guards below). A multi-item list's own decision here IS real, so it
     // clears the flag for its own trial.
     let savedSpeculative = p.speculativeFlat
     p.speculativeFlat = len(items) == 1
@@ -224,15 +261,14 @@ fn fmtPrintCommaList(p: Printer, items: []int, open: string, closeStr: string, s
     p.speculativeFlat = savedSpeculative
     let text = string(p.out)
     p.out = savedOut
-    p.col = colBefore
-    p.bol = bolBefore
+    fmtTrialRestoreCursor(p, t)
     let extra = 0
     if (pad) {
       extra = 2
     }
     // A single-element list stays flat even when over-width: wrapping a lone
     // item never shortens the line meaningfully. Multi-element lists still wrap.
-    let fits = colBefore + extra + len(text) + len(closeStr) + tail <= fmtMaxWidth
+    let fits = t.col + extra + len(text) + len(closeStr) + tail <= fmtMaxWidth
     if (!fmtHasNl(text) && (len(items) == 1 || fits)) {
       if (pad) {
         fmtRaw(p, " ")
@@ -244,7 +280,7 @@ fn fmtPrintCommaList(p: Printer, items: []int, open: string, closeStr: string, s
       fmtRaw(p, closeStr)
       return
     }
-    p.srcPos = srcPosBefore
+    fmtTrialReject(p, t)
   }
 
   fmtNoteChainListBreak(p)
@@ -471,15 +507,13 @@ fn fmtPrintChain(p: Printer, chain: BinaryChain, wrapped: bool) {
 // Everything `fmtTryChainNestedWrap` (and the two helpers below it) needs
 // from `fmtPrintBinaryChain`'s already-computed state, bundled to stay under
 // E0202's 5-parameter limit. `flat` is the unwrapped render that just failed
-// the width check -- kept because `chain.ends` indexes into it -- and
-// `srcPos`/`outLine` are the values to put back if the nested-wrap render is
-// rejected (#4367).
+// the width check, kept because `chain.ends` indexes into it (#4367). It
+// carries no restore state: the nested-wrap trial captures its own with
+// `fmtTrialBegin`, like every other trial in this file (#4689).
 class ChainWrap {
   flat: string,
   tail: int,
   effectiveCol: int,
-  srcPos: int,
-  outLine: int,
 }
 
 // How many columns of `flat` follow offset `at` on the same output line: up
@@ -542,15 +576,13 @@ fn fmtPrintChainTailed(p: Printer, chain: BinaryChain, w: ChainWrap) {
 }
 
 // Tries the nested-comma-list break and emits it if exactly one list broke
-// and every line fits,
-// returning whether it did (#4367). Rejecting puts `p.srcPos` and
-// `p.outLine` back, exactly as the flat trial above does, so the operator
-// wrap that follows re-descends into the same atoms from the same watermark
+// and every line fits, returning whether it did (#4367). Rejecting puts the
+// watermarks back, exactly as the flat trial above does, so the operator wrap
+// that follows re-descends into the same atoms from the same watermark
 // (#2901). A render with no newline in it is the flat form the caller
 // already rejected on width and is never accepted here.
 fn fmtTryChainNestedWrap(p: Printer, chain: BinaryChain, w: ChainWrap): bool {
-  let colBefore = p.col
-  let bolBefore = p.bol
+  let t = fmtTrialBegin(p)
   let savedOut = p.out
   p.out = []byte(0)
   p.bol = false
@@ -565,14 +597,12 @@ fn fmtTryChainNestedWrap(p: Printer, chain: BinaryChain, w: ChainWrap): bool {
   p.chainListBreaks = savedBreaks
   let text = string(p.out)
   p.out = savedOut
-  p.col = colBefore
-  p.bol = bolBefore
+  fmtTrialRestoreCursor(p, t)
   if (breaks == 1 && fmtHasNl(text) && fmtChainNestedFits(text, w)) {
     fmtRaw(p, text)
     return true
   }
-  p.srcPos = w.srcPos
-  p.outLine = w.outLine
+  fmtTrialReject(p, t)
   return false
 }
 
@@ -645,25 +675,23 @@ fn fmtPrintBinaryChain(p: Printer, idx: int) {
   }
   let lastEnd = getNode(p.tree, chain.atoms[len(chain.atoms) - 1]).span.end
   if (!fmtHasCommentBefore(p, lastEnd)) {
-    let colBefore = p.col
-    let bolBefore = p.bol
-    // See fmtPrintFlatList's srcPosBefore comment: the trial below advances
-    // p.srcPos for real via fmtPrintChain/fmtPrintNode, correctly on the fits
-    // path but stale on the fallthrough path, which re-renders the same
-    // chain for real (#2901).
-    let srcPosBefore = p.srcPos
+    // The trial below advances p.srcPos and p.outLine for real via
+    // fmtPrintChain/fmtPrintNode, correctly on the fits path but stale on the
+    // fallthrough path, which re-renders the same chain for real (#2901,
+    // #4689) -- see FmtTrial above.
+    let t = fmtTrialBegin(p)
     // See fmtPrintFlatList's identical comment: a trial starting at bol must
     // not bake its own lazy indent into `text`, and the fits check must use
     // the column the indent write will actually land at, not the pre-indent
     // p.col fmtNewline left behind. The same baseline applies whenever this
     // chain is rendering as the sole item of an ancestor single-item list
     // (`p.speculativeFlat`, #2894): that ancestor accepts the result flat
-    // regardless of overflow, so `colBefore`'s real, inherited value answers
+    // regardless of overflow, so `t.col`'s real, inherited value answers
     // a question nobody is asking -- wrapping here only manufactures the
     // newline that forces the ancestor (and everything enclosing it) to
     // explode instead of staying flat as it otherwise always would.
-    let effectiveCol = colBefore
-    if (bolBefore || p.speculativeFlat) {
+    let effectiveCol = t.col
+    if (t.bol || p.speculativeFlat) {
       effectiveCol = p.indent * fmtIndentWidth
     }
     let savedOut = p.out
@@ -672,17 +700,13 @@ fn fmtPrintBinaryChain(p: Printer, idx: int) {
     fmtPrintChain(p, chain, false)
     let text = string(p.out)
     p.out = savedOut
-    p.col = colBefore
-    p.bol = bolBefore
+    fmtTrialRestoreCursor(p, t)
     if (!fmtHasNl(text) && effectiveCol + len(text) + tail <= fmtMaxWidth) {
       fmtRaw(p, text)
       return
     }
-    p.srcPos = srcPosBefore
-    let w = ChainWrap{
-      flat: text, tail: tail, effectiveCol: effectiveCol,
-      srcPos: srcPosBefore, outLine: p.outLine,
-    }
+    fmtTrialReject(p, t)
+    let w = ChainWrap{ flat: text, tail: tail, effectiveCol: effectiveCol }
     if (fmtChainPrefersInnerBreak(p, chain) && fmtTryChainNestedWrap(p, chain, w)) {
       return
     }
