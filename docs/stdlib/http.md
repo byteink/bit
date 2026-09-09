@@ -35,15 +35,18 @@ same across all three protocols - only the socket underneath changes.
 A parsed request: `method`, `path`, the raw `headers` block, `body`, and `peer`.
 Read a named header with `header(req.headers, "...")`.
 
-`peer` is the client's IPv4 address in dotted quad - the kernel's own view of who
-connected, read off the socket with `std/net`'s `Conn.peerIp()`, and the only
-address in a request that a client cannot choose. Rate-limit, ban and audit by
-`peer`; `X-Forwarded-For` and its relatives are peer-supplied header text.
+`peer` is the client's IPv4 address in dotted quad - the transport's own view of
+who connected, and the only address in a request that a client cannot choose.
+Rate-limit, ban and audit by `peer`; `X-Forwarded-For` and its relatives are
+peer-supplied header text. On HTTP/1.1 and HTTP/2 it is read off the socket with
+`std/net`'s `Conn.peerIp()`. HTTP/3 has no connected socket to ask - its UDP
+socket is bound and shared by every client - so there it is `std/quic`'s
+`Conn.peerIp()` instead: the source of the datagram that established that QUIC
+connection, read once per connection (see [HTTP/3](#http3)).
 
-`peer` is `""`, never a placeholder address, whenever there is no socket to ask:
-a `Request` you build yourself, one that arrived over HTTP/3 (see
-[HTTP/3](#http3)), and one whose connection died before the address could be
-read. Reading the address never fails a request. Because `""` is the zero value
+`peer` is `""`, never a placeholder address, whenever there is no address to be
+had: a `Request` you build yourself, and one whose connection died before the
+address could be read. Reading the address never fails a request. Because `""` is the zero value
 of `string`, a literal that omits the field - `Request{ method: "GET", path:
 "/", headers: "", body: "" }` - is legal and means "no peer known".
 
