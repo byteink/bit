@@ -217,6 +217,10 @@ This is `parseMultipart`'s walk with nothing built: no `Form`, and no part
 body materialised except the one returned, so reading a hidden `_csrf` field
 out of a body that also carries a 5 MiB upload does not copy the upload.
 
+The body itself is not copied either — the walk scans the `[]byte` it is
+given. The only bytes copied are the returned value and each part's own
+header block, which `maxPartHeaderBytes` bounds.
+
 What it does not skip is a check. The whole body is walked even after the
 field is found, and every limit applies to every part, so it fails on exactly
 the bodies `parseMultipart` fails on with the same message — a value is never
