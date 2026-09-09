@@ -339,3 +339,201 @@ test "Config.maxHeaderListBytes reaches the engine: an over-budget block is refu
   )
   conn.close()
 }
+
+// --- the peer's limit, on the way out (#4607) --------------------------------
+
+// The receive half above is `Config.maxHeaderListBytes`: what we accumulate.
+// This half is the peer's own SETTINGS_MAX_HEADER_LIST_SIZE: what it will accept
+// from US. `h2connApplySetting` treated it as a no-op, so a peer advertising one
+// was ignored and the block went on the wire to be answered with a reset the
+// caller could not connect to its own headers.
+//
+// The two numbers are independent and are counted differently — ours in encoded
+// octets, the peer's in the uncompressed list of RFC 9113 §6.5.2 — which is what
+// `hlUncompressed` below pins.
+
+// The uncompressed size of a `GET /hdr` request carrying one `x-big` value of
+// `n` bytes, computed here rather than by the code under test: 7+3+32 for
+// `:method GET`, 7+5+32 for `:scheme https`, 10+11+32 for
+// `:authority example.com`, 5+4+32 for `:path /hdr`, and 5+n+32 for `x-big`.
+// Drop the RFC's 32-byte per-field overhead and this is 217 lower, which is what
+// makes the boundary tests below fail loudly rather than shift quietly.
+fn hlUncompressed(n: int): int {
+  return 42 + 44 + 53 + 41 + 37 + n
+}
+
+// The same for a 200 response carrying that `x-big` value: 7+3+32 for
+// `:status 200`, plus 5+n+32.
+fn hlResponseUncompressed(n: int): int {
+  return 42 + 37 + n
+}
+
+// A `GET /hdr` request with one `x-big` header of `n` pattern bytes.
+fn hlBigRequest(n: int): Request {
+  let req = newRequest("GET", "example.com", "/hdr")
+  req.headers = append(
+    req.headers,
+    HeaderField{ name: "x-big", value: string(btPattern(n)), sensitive: false },
+  )
+  return req
+}
+
+// A 200 response with one `x-big` header of `n` pattern bytes.
+fn hlBigResponse(n: int): Response {
+  let res = newResponse(200, []byte(0))
+  res.headers = append(
+    res.headers,
+    HeaderField{ name: "x-big", value: string(btPattern(n)), sensitive: false },
+  )
+  return res
+}
+
+// An `h2cmdOpen` command for `req`, as `Conn.roundTrip` (conn.bit) sends it.
+fn hlOpenCmd(req: Request, replyCh: chan<h2connMsg>): h2connCmd {
+  return h2connCmd{
+    kind: h2cmdOpen,
+    request: req,
+    response: h2connZeroResponse(),
+    streamId: 0,
+    errorCode: 0,
+    replyCh: replyCh,
+  }
+}
+
+// A SETTINGS frame carrying the single parameter `id`=`value`, built through the
+// real codec so the engine sees exactly what the wire would hand it.
+fn hlSettingsFrame(id: int, value: int): Frame! {
+  let list = []Setting(0)
+  list = append(list, Setting{ id: id, value: value })
+  return readFrame(encodeSettings(SettingsFrame{ ack: false, settings: list })?, maxMaxFrameSize)?
+}
+
+test "a peer's SETTINGS_MAX_HEADER_LIST_SIZE is stored and refuses the request locally" {
+  let st = btState(true, 1048576)
+  // Nothing advertised is no limit at all, and it is not 0: 0 is a legal
+  // advertised value and means the peer accepts no header list whatsoever.
+  assert(
+    st.peerMaxHeaderListBytes == h2connNoPeerHeaderListLimit,
+    "peerMaxHeaderListBytes starts at ${st.peerMaxHeaderListBytes}, want no limit",
+  )
+  let sf = hlSettingsFrame(settingsMaxHeaderListSize, 4096) catch e {
+    assert(false, "building the SETTINGS frame failed: ${e.message()}")
+    return
+  }
+  h2connHandleFrame(st, sf)
+  assert(
+    st.peerMaxHeaderListBytes == 4096,
+    "the peer's MAX_HEADER_LIST_SIZE was ignored: ${st.peerMaxHeaderListBytes}",
+  )
+  // Only the SETTINGS ACK is owed for that frame; drained so the queue below is
+  // empty for a reason this test states rather than assumes.
+  let acked = srDrainWrites(st)
+  assert(acked == 1, "the peer's SETTINGS drew ${acked} frames, want 1 (the ACK)")
+
+  let r = chan<h2connMsg>(1)
+  h2connHandleCmd(st, hlOpenCmd(hlBigRequest(4000), r))
+  let msg = <- r
+  assert(!msg.ok, "a request of ${hlUncompressed(4000)} bytes was sent under a 4096-byte limit")
+  assert(
+    msg.errMsg ==
+      "http2: header list is 4217 bytes, over the peer's SETTINGS_MAX_HEADER_LIST_SIZE of 4096",
+    "the failure does not name the size and the limit: '${msg.errMsg}'",
+  )
+  // Refused before anything was spent: no stream, no id consumed — and above
+  // all nothing on the wire, which is the whole point of refusing here.
+  assert(st.activeStreams == 0, "the refused request opened a stream")
+  assert(st.nextStreamId == 1, "the refused request consumed id ${st.nextStreamId - 2}")
+  let queued = srDrainWrites(st)
+  assert(queued == 0, "${queued} frames were queued for a request we refused")
+}
+
+test "the peer's limit is the uncompressed list, not the encoded block" {
+  // The discriminator between the two accountings. 4000 pattern bytes are all
+  // under 0x80, so HPACK Huffman-codes the block well below the list size it
+  // decodes to: a check written against `len(st.enc.encode(fields))` would let
+  // this request through at a limit the peer will reject it at.
+  let st = btState(true, 1048576)
+  let listSize = hlUncompressed(4000)
+  let enc = newEncoderConfig(4096, true)
+  let encoded = len(enc.encode(h2connRequestFields(hlBigRequest(4000))))
+  assert(
+    encoded < listSize,
+    "encoded ${encoded} bytes vs list ${listSize}: this test cannot tell the two apart",
+  )
+  h2connApplySetting(st, settingsMaxHeaderListSize, listSize - 1)
+  let r = chan<h2connMsg>(1)
+  h2connHandleCmd(st, hlOpenCmd(hlBigRequest(4000), r))
+  let msg = <- r
+  assert(!msg.ok, "a ${listSize}-byte list was sent under a ${listSize - 1}-byte limit")
+
+  // And exactly at the limit it goes: the comparison is `>`, so the largest list
+  // the peer said it accepts is accepted, and 32 per field is neither dropped
+  // nor double-counted.
+  let st2 = btState(true, 1048576)
+  h2connApplySetting(st2, settingsMaxHeaderListSize, listSize)
+  let r2 = chan<h2connMsg>(1)
+  h2connHandleCmd(st2, hlOpenCmd(hlBigRequest(4000), r2))
+  assert(st2.activeStreams == 1, "a list exactly at the peer's limit was refused")
+  let queued = srDrainWrites(st2)
+  assert(queued == 1, "${queued} frames queued for the accepted request, want 1 (its HEADERS)")
+}
+
+test "a peer that advertises nothing imposes no header-list limit" {
+  // The sentinel's job: absence of the parameter means unlimited on the wire, so
+  // a header list far past any budget in this module still goes out.
+  let st = btState(true, 1048576)
+  let r = chan<h2connMsg>(1)
+  h2connHandleCmd(st, hlOpenCmd(hlBigRequest(200000), r))
+  assert(st.activeStreams == 1, "the request was refused with no peer limit in force")
+  let queued = srDrainWrites(st)
+  assert(queued > 0, "no frames were queued for a request nothing refused")
+}
+
+test "a response over the peer's limit is reset on its stream, not sent" {
+  // The server half. A handler that answers with more header bytes than the peer
+  // accepts has no `roundTrip` to fail — its `replyCh` is `h2connDummyReply()` —
+  // so the stream carries the failure instead.
+  let st = btState(false, 1048576)
+  // 2048, not the 4096 the client tests use: a 200 response carrying the same
+  // 4000-byte value is 4079 bytes of list — under 4096, so that limit would have
+  // let this response through and the test would have proved nothing.
+  h2connApplySetting(st, settingsMaxHeaderListSize, 2048)
+  let s = btOpenStream(st, 1, h2connDummyReply())
+  h2connCmdRespond(
+    st,
+    h2connCmd{
+      kind: h2cmdRespond,
+      request: h2connZeroRequest(),
+      response: hlBigResponse(4000),
+      streamId: 1,
+      errorCode: 0,
+      replyCh: h2connDummyReply(),
+    },
+  )
+  assert(
+    hlResponseUncompressed(4000) > 2048,
+    "the response list is ${hlResponseUncompressed(4000)} bytes, inside the limit under test",
+  )
+  assert(s.reset, "the stream was not reset")
+  assert(
+    s.errorCode == errorInternalError,
+    "error code = ${s.errorCode}, want ${errorInternalError} (INTERNAL_ERROR)",
+  )
+  let sent = btNextWritten(st) catch e {
+    assert(false, "no frame was queued for the peer: ${e.message()}")
+    return
+  }
+  // RST_STREAM and nothing before it: the response block was never encoded, so
+  // the peer never sees a HEADERS it would have to refuse.
+  let rst = decodeRstStream(sent) catch e2 {
+    assert(false, "the queued frame is not RST_STREAM: ${e2.message()}")
+    return
+  }
+  assert(rst.streamId == 1, "RST_STREAM on stream ${rst.streamId}, want 1")
+  assert(
+    rst.errorCode == errorInternalError,
+    "RST_STREAM code = ${rst.errorCode}, want ${errorInternalError} (INTERNAL_ERROR)",
+  )
+  let queued = srDrainWrites(st)
+  assert(queued == 0, "${queued} frames followed the reset, want 0")
+}
