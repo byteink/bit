@@ -218,15 +218,15 @@ fn isGate(name: string): bool {
 //
 // #2561 gave this function its own wall-clock print because a flush of
 // several gates had no per-gate start/stop visible from here: the batch
-// engine (`gatesexec.bit`) fans a chunk out into one composed shell script
+// engine (`gatesexec.bit`) fans the batch out into one composed shell script
 // and only IT knew when each gate individually started and finished, so
 // reporting a made-up per-gate split would have been exactly the
 // unverified-number problem this driver exists to avoid.
 //
 // #2562 closed that gap: `gateBatchUnit` now captures a real start/stop
 // around each gate's own `exec` inside its backgrounded subshell, and
-// `runGateChunk` prints an honest, individually-measured
-// "make: <name> — <dur>" line for every gate in every chunk it runs —
+// `runGatePool` prints an honest, individually-measured
+// "make: <name> — <dur>" line for every gate in the batch it runs —
 // including a flush of exactly one. That makes this function's own timer
 // redundant in every case (single gate: a second, duplicate line; several
 // gates: a `gate batch (...) — total <dur>` line sitting on top of the real
@@ -255,40 +255,93 @@ fn flushPending(pending: []string, failed: []string): []string {
 // once per failure to learn what is actually broken. Every failure is collected
 // and named at the end instead.
 //
-// A gate takes a THIRD path first (#2434): every non-`exclusive` gate is
-// accumulated into `pending` instead of run immediately, and flushed as one
-// concurrent batch (`runGateBatch`, gatesexec.bit) the moment a non-gate step or
-// an `exclusive` gate needs to run next. `exclusive` gates fall through to the
-// same aggregate policy as before — one `runGate`, alone. This is also why
-// `BIT_MAKE_JOBS=1` reproduces today's order exactly: every flush point then
-// holds exactly one gate, so nothing here actually changes shape for it.
+// A gate takes a THIRD path first (#2434, #4706): every non-`exclusive` gate
+// is accumulated into `pending` instead of run immediately, and the whole
+// accumulation runs as ONE bounded pool (`runGateBatch`, gatesexec.bit) when
+// a non-gate step needs to run next, or at the end of the order.
+//
+// #4706: an `exclusive` gate no longer flushes that pool. It used to, and
+// with fourteen of them scattered through `gateNames()` that split the run
+// into fifteen pools, each paying its own longest member — the barrier this
+// ticket exists to remove, one flush per exclusive gate. They are deferred
+// instead and run one at a time AFTER the pool has drained, which is also
+// the only time the box is quiet enough for the wall-clock and RSS
+// assertions that made them exclusive in the first place. A non-gate step
+// still drains everything before it runs, so nothing crosses an artifact
+// boundary.
+//
+// `BIT_MAKE_JOBS=1` keeps today's order exactly: `serial` turns the deferral
+// off, so an exclusive gate flushes and runs in place, and the pool itself
+// holds one gate at a time in the order given (`poolStartOrder`).
+
+// One step, run in place: the print, the timing line and the verdict shared
+// by every step that does not go through the pool. Returns (failed, stop) —
+// `stop` is true only for a failed ARTIFACT step, never for a gate. The
+// caller owns the failure list and appends the name itself, so nothing here
+// appends to an array it does not own (E0214).
+fn runStepNow(s: string, extras: []string): (bool, bool) {
+  print("make: ${s}\n")
+  let start = monotonic()
+  let (rc, ran) = runStep(s, extras)
+  printStepDone(s, rc, ran, since(start))
+  if (rc == 0) {
+    return false, false
+  }
+  return true, !isGate(s)
+}
+
+// Drains both accumulators in order: the pool first, then the deferred
+// `exclusive` gates one at a time, on the quiet box the drained pool leaves
+// behind.
+fn drainGates(pending: []string, deferred: []string, extras: []string, failed: []string): []string {
+  let next = flushPending(pending, failed)
+  for d of deferred {
+    let (bad, stop) = runStepNow(d, extras)
+    if (bad) {
+      next = append(next, d)
+    }
+    if (stop) {
+      // Unreachable by construction: `deferred` holds gate names only, and
+      // `runStepNow` reports stop only for a non-gate step. Checked rather
+      // than discarded so a future caller cannot silently lose it.
+      return next
+    }
+  }
+  return next
+}
+
 fn runAll(order: []string, extras: []string): []string {
   let failed = []string(0)
   let pending = []string(0)
+  let deferred = []string(0)
+  let serial = makeJobs() <= 1
   let i = 0
   let n = len(order)
   while (i < n) {
     let s = order[i]
-    if (isGate(s) && !isExclusiveGate(s)) {
-      pending = append(pending, s)
-      i = i + 1
-      continue
-    }
-    failed = flushPending(pending, failed)
-    pending = []string(0)
-    print("make: ${s}\n")
-    let start = monotonic()
-    let (rc, ran) = runStep(s, extras)
-    printStepDone(s, rc, ran, since(start))
-    if (rc != 0) {
-      failed = append(failed, s)
-      if (!isGate(s)) {
-        return failed
+    i = i + 1
+    if (isGate(s)) {
+      if (!isExclusiveGate(s)) {
+        pending = append(pending, s)
+        continue
+      }
+      if (!serial) {
+        deferred = append(deferred, s)
+        continue
       }
     }
-    i = i + 1
+    failed = drainGates(pending, deferred, extras, failed)
+    pending = []string(0)
+    deferred = []string(0)
+    let (bad, stop) = runStepNow(s, extras)
+    if (bad) {
+      failed = append(failed, s)
+    }
+    if (stop) {
+      return failed
+    }
   }
-  return flushPending(pending, failed)
+  return drainGates(pending, deferred, extras, failed)
 }
 
 // The line after a non-gate step's body returns. Four cases, not a bare
