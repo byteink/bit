@@ -117,13 +117,33 @@ fn emitAtomicStore(cx: A64Ctx, ptr: int, value: int, ty: int) {
   stlr(cx.code, atomicSize(w.bytes), base, val)
 }
 
-// LL/SC retry loop; returns the pre-op (old) value. scratch1=old,
-// scratch2=computed, scratch3=STLXR status, ascratch1=base, ascratch2=operand.
-fn emitAtomicRmw(cx: A64Ctx, op: Op, dst: int, ptr: int, operand: int, ty: int) {
-  let w = widthOf(cx.module.ctx, ty)
+// `dst`/`ptr`/`operand`/`ty` bundled for the same reason AtomicCasOperands
+// below exists: the RMW selector splits in two on `cx.lse` (#4316) and three
+// functions carrying six positional arguments each is what E0202 is about.
+class AtomicRmwOperands {
+  dst: int,
+  ptr: int,
+  operand: int,
+  ty: int,
+}
+
+// Returns the pre-op (old) value, on either path.
+fn emitAtomicRmw(cx: A64Ctx, op: Op, a: AtomicRmwOperands) {
+  if (cx.lse) {
+    emitAtomicRmwLse(cx, op, a)
+    return
+  }
+  emitAtomicRmwLlsc(cx, op, a)
+}
+
+// LL/SC retry loop, the ARMv8.0-A form every AArch64 core can execute.
+// scratch1=old, scratch2=computed, scratch3=STLXR status, ascratch1=base,
+// ascratch2=operand.
+fn emitAtomicRmwLlsc(cx: A64Ctx, op: Op, a: AtomicRmwOperands) {
+  let w = widthOf(cx.module.ctx, a.ty)
   let size = atomicSize(w.bytes)
-  let base = getInt(cx, vregOf(cx, ptr), ascratch1())
-  let oper = getInt(cx, vregOf(cx, operand), ascratch2())
+  let base = getInt(cx, vregOf(cx, a.ptr), ascratch1())
+  let oper = getInt(cx, vregOf(cx, a.operand), ascratch2())
   let retryOff = codeLen(cx)
   ldaxr(cx.code, size, base, scratch1())
   if (op == Op.AtomicRmwAdd) {
@@ -141,7 +161,51 @@ fn emitAtomicRmw(cx: A64Ctx, op: Op, dst: int, ptr: int, operand: int, ty: int) 
   let cbnzOff = codeLen(cx)
   emitCbnz(cx.code, scratch3(), (retryOff - cbnzOff) / 4)
   canonNarrow(cx.code, scratch1(), w)
-  putInt(cx, dst, scratch1())
+  putInt(cx, a.dst, scratch1())
+}
+
+// The register the LSE instruction reads as its operand: `oper` itself for
+// ADD/OR/XCHG, and a scratch holding the transform SUB and AND need — LSE has
+// no subtract form (it is an add of the negation) and its AND form clears the
+// bits the operand SETS (so an AND of mask M is a CLR of ~M). Those two ops
+// therefore cost one extra ALU instruction and still beat the LL/SC form's
+// four plus an exclusive monitor and a retry edge. Writes scratch2, which this
+// path uses for nothing else.
+fn lseRmwSource(cx: A64Ctx, op: Op, oper: int): int {
+  if (op == Op.AtomicRmwSub) {
+    negR(cx.code, scratch2(), oper)
+    return scratch2()
+  }
+  if (op == Op.AtomicRmwAnd) {
+    mvnR(cx.code, scratch2(), oper)
+    return scratch2()
+  }
+  return oper
+}
+
+// FEAT_LSE: one instruction, no exclusive monitor and no retry loop, with the
+// same acquire-release ordering the LL/SC pair carried. scratch1=old (Rt),
+// ascratch1=base, ascratch2=operand, scratch2=the negated/complemented operand
+// when one is needed. Rt must alias neither Rn nor Rs (CONSTRAINED
+// UNPREDICTABLE otherwise) and cannot: scratch1 is x9, which is never
+// allocatable and is neither fetch's fallback register.
+fn emitAtomicRmwLse(cx: A64Ctx, op: Op, a: AtomicRmwOperands) {
+  let w = widthOf(cx.module.ctx, a.ty)
+  let size = atomicSize(w.bytes)
+  let base = getInt(cx, vregOf(cx, a.ptr), ascratch1())
+  let oper = getInt(cx, vregOf(cx, a.operand), ascratch2())
+  let src = lseRmwSource(cx, op, oper)
+  if (op == Op.AtomicRmwAnd) {
+    ldclral(cx.code, size, src, base, scratch1())
+  } else if (op == Op.AtomicRmwOr) {
+    ldsetal(cx.code, size, src, base, scratch1())
+  } else if (op == Op.AtomicRmwXchg) {
+    swpal(cx.code, size, src, base, scratch1())
+  } else {
+    ldaddal(cx.code, size, src, base, scratch1())
+  }
+  canonNarrow(cx.code, scratch1(), w)
+  putInt(cx, a.dst, scratch1())
 }
 
 // `ptr`/`expected`/`desired`/`ty` bundled so `emitAtomicCmpxchg` stays under
@@ -156,9 +220,18 @@ class AtomicCasOperands {
 }
 
 // Go-style CAS: swaps `desired` in iff [ptr]==expected; result is the bool "did
-// it swap". scratch1=old, scratch2=desired, scratch3=status, ascratch1=base,
-// ascratch2=expected.
+// it swap".
 fn emitAtomicCmpxchg(cx: A64Ctx, dst: int, args: AtomicCasOperands) {
+  if (cx.lse) {
+    emitAtomicCmpxchgLse(cx, dst, args)
+    return
+  }
+  emitAtomicCmpxchgLlsc(cx, dst, args)
+}
+
+// LL/SC retry loop, the ARMv8.0-A form. scratch1=old, scratch2=desired,
+// scratch3=status, ascratch1=base, ascratch2=expected.
+fn emitAtomicCmpxchgLlsc(cx: A64Ctx, dst: int, args: AtomicCasOperands) {
   let w = widthOf(cx.module.ctx, args.ty)
   let size = atomicSize(w.bytes)
   let base = getInt(cx, vregOf(cx, args.ptr), ascratch1())
@@ -174,6 +247,30 @@ fn emitAtomicCmpxchg(cx: A64Ctx, dst: int, args: AtomicCasOperands) {
   emitCbnz(cx.code, scratch3(), (retryOff - cbnzOff) / 4)
   patchLocalCondBranch(cx, bneFixup)  // success fall-through and mismatch converge here
   cset(cx.code, scratch1(), condEq()) // Z from the last CMP: set iff old == expected
+  putInt(cx, dst, scratch1())
+}
+
+// FEAT_LSE: one CASAL, no monitor, no retry edge and no local branch at all —
+// a mismatch is not a control-flow event here, it is just a value that fails
+// the compare afterwards.
+//
+// CASAL's Rs is READ-WRITE: it supplies the compared-against value and comes
+// back holding the pre-op value. So `expected` is COPIED into scratch1 first
+// and the original register is what the CMP reads back — copying into
+// ascratch2 instead would be a bug, because `getInt` returns ascratch2 itself
+// when `expected` is spilled and the compare would then read the CAS result
+// against itself and always report success. scratch1 (x9) is never allocatable
+// and is no fetch's fallback, so it can alias none of base/exp/des.
+fn emitAtomicCmpxchgLse(cx: A64Ctx, dst: int, args: AtomicCasOperands) {
+  let w = widthOf(cx.module.ctx, args.ty)
+  let base = getInt(cx, vregOf(cx, args.ptr), ascratch1())
+  let exp = getInt(cx, vregOf(cx, args.expected), ascratch2())
+  let des = getInt(cx, vregOf(cx, args.desired), scratch2())
+  movRR(cx.code, scratch1(), exp)
+  casal(cx.code, atomicSize(w.bytes), scratch1(), base, des)
+  canonNarrow(cx.code, scratch1(), w) // match `expected`'s canonical form before the compare
+  cmpRR(cx.code, scratch1(), exp)
+  cset(cx.code, scratch1(), condEq()) // Z from the CMP: set iff old == expected
   putInt(cx, dst, scratch1())
 }
 

@@ -1,7 +1,8 @@
-// In-Bit self-checks for #4396: field_set/index_set/atomic_store/
-// atomic_cmpxchg must take their store width from the instruction's OWN
-// recorded type (`ins.ival2`), never from the VALUE operand's defining
-// instruction. Split out as a new sibling of compiler/arm64selcheck.bit,
+// In-Bit self-checks for the ARM64 memory and atomic selectors: #4396's store
+// width (field_set/index_set/atomic_store/atomic_cmpxchg must take it from the
+// instruction's OWN recorded type `ins.ival2`, never from the VALUE operand's
+// defining instruction) and #4316's FEAT_LSE atomic forms, at the end of the
+// file. Split out as a new sibling of compiler/arm64selcheck.bit,
 // which was already at 784 lines against the 800-line limit and had no room
 // left (the same reason compiler/arm64selcheckcvt.bit and
 // compiler/arm64selcheckcmp.bit exist as their own files).
@@ -142,4 +143,158 @@ fn checkArm64AtomicCmpxchgWidthOwnType() {
   ins2.ival2 = i64ty
   assert(compileInstAtomic(cx2, 11, ins2))
   assert(arm64SizeField(cx2.code) == 3)
+}
+
+// ---- #4316: the FEAT_LSE forms --------------------------------------------
+//
+// Two layers, because a check built only out of the compiler's own encoder can
+// prove nothing except that the encoder agrees with itself. Every word constant
+// below is Apple as/objdump's output for the same operands (`clang -c -arch
+// arm64` on the mnemonic, then `objdump -d`), the same independent oracle
+// compiler/arm64check.bit's encoder goldens use. They live in this file rather
+// than that one because arm64check.bit is at 786 lines against E0200's 800.
+
+fn checkArm64LseEncoder() {
+  // ldaddal x1, x0, [x2] == f8e10040, and its three siblings at the same
+  // operands: only the o3/opc field moves.
+  let c = newByteBuf()
+  ldaddal(c, 3, 1, 2, 0)
+  assert(len(c.bytes) == 4 && wordAt(c, 0) == 0xf8e10040)
+  c = newByteBuf()
+  ldclral(c, 3, 1, 2, 0)
+  assert(wordAt(c, 0) == 0xf8e11040)
+  c = newByteBuf()
+  ldsetal(c, 3, 1, 2, 0)
+  assert(wordAt(c, 0) == 0xf8e13040)
+  c = newByteBuf()
+  swpal(c, 3, 1, 2, 0)
+  assert(wordAt(c, 0) == 0xf8e18040)
+  // casal x1, x0, [x2] == c8e1fc40 — a different encoding class (the
+  // load/store-exclusive one, with bit 21 set), not the atomic-memory-op class
+  // above, so it earns its own golden.
+  c = newByteBuf()
+  casal(c, 3, 1, 2, 0)
+  assert(wordAt(c, 0) == 0xc8e1fc40)
+  // The 32-bit forms, which is the width runtime/spinlock.bit's lock word uses:
+  // ldaddal w3, w4, [x5] == b8e300a4, casal w3, w4, [x5] == 88e3fca4.
+  c = newByteBuf()
+  ldaddal(c, 2, 3, 5, 4)
+  assert(wordAt(c, 0) == 0xb8e300a4)
+  c = newByteBuf()
+  casal(c, 2, 3, 5, 4)
+  assert(wordAt(c, 0) == 0x88e3fca4)
+}
+
+// selCtx() puts value N in vreg N in register xN, so ptr=vreg0 is x0, operand
+// =vreg1 is x1 and the destination (instruction 11) is x22.
+fn lseSelCtx(): A64Ctx {
+  let cx = selCtx()
+  cx.lse = true
+  return cx
+}
+
+fn lseRmwCode(cx: A64Ctx, op: Op): ByteBuf {
+  let ins = mkInstr(op, primType(cx.module.ctx, 3))
+  ins.lhs = 0
+  ins.rhs = 1
+  assert(compileInstAtomic(cx, 11, ins))
+  return cx.code
+}
+
+// One instruction where the LL/SC form emits four and a backward branch: the
+// whole point of the ticket. ADD/OR/XCHG pass the operand straight through;
+// SUB and AND buy their missing LSE form with one ALU instruction.
+fn checkArm64LseRmwSelection() {
+  let want = newByteBuf()
+  ldaddal(want, 3, 1, 0, 9)
+  movRR(want, 22, 9)
+  assertSameBytes(lseRmwCode(lseSelCtx(), Op.AtomicRmwAdd), want)
+
+  want = newByteBuf()
+  ldsetal(want, 3, 1, 0, 9)
+  movRR(want, 22, 9)
+  assertSameBytes(lseRmwCode(lseSelCtx(), Op.AtomicRmwOr), want)
+
+  want = newByteBuf()
+  swpal(want, 3, 1, 0, 9)
+  movRR(want, 22, 9)
+  assertSameBytes(lseRmwCode(lseSelCtx(), Op.AtomicRmwXchg), want)
+
+  // sub == add of the negation, and the negation lands in scratch2 (x10), so
+  // the LSE instruction must read x10 and not x1.
+  want = newByteBuf()
+  negR(want, 10, 1)
+  ldaddal(want, 3, 10, 0, 9)
+  movRR(want, 22, 9)
+  assertSameBytes(lseRmwCode(lseSelCtx(), Op.AtomicRmwSub), want)
+
+  // and == clear of the complement: LDCLR clears the bits the operand SETS, so
+  // passing the mask itself unchanged would clear exactly the bits meant to
+  // survive. This case is why the complement is not an optimization detail.
+  want = newByteBuf()
+  mvnR(want, 10, 1)
+  ldclral(want, 3, 10, 0, 9)
+  movRR(want, 22, 9)
+  assertSameBytes(lseRmwCode(lseSelCtx(), Op.AtomicRmwAnd), want)
+}
+
+// The LL/SC arm is what aarch64-linux still emits, so it has to keep working
+// unchanged — and the two arms must not be confusable by accident. A context
+// with `lse` false emits the ldaxr/stlxr/cbnz retry loop, four words plus the
+// move, against LSE's two.
+fn checkArm64LlscRmwStillEmitted() {
+  let cx = selCtx()
+  let code = lseRmwCode(cx, Op.AtomicRmwOr)
+  assert(len(code.bytes) == 20, "llsc or: ${len(code.bytes)} bytes")
+  let want = newByteBuf()
+  ldaxr(want, 3, 0, 9)
+  logicalRR(want, 1, 10, 9, 1)
+  stlxr(want, 3, 11, 0, 10)
+  emitCbnz(want, 11, -3)
+  movRR(want, 22, 9)
+  assertSameBytes(code, want)
+}
+
+// CASAL overwrites its Rs operand with the pre-op value, so `expected` is
+// copied into x9 first and the CMP reads the untouched original back out of
+// x1. A regression that passed x1 straight in as Rs would compare the CAS
+// result against itself and report success on every call — the mutual
+// exclusion runtime/spinlock.bit is built on, silently gone.
+fn checkArm64LseCmpxchgSelection() {
+  let cx = lseSelCtx()
+  let ctx = cx.module.ctx
+  let ins = mkInstr(Op.AtomicCmpxchg, primType(ctx, 10))
+  ins.lhs = 0
+  ins.rhs = 1
+  ins.ival = 2
+  ins.ival2 = primType(ctx, 3)
+  assert(compileInstAtomic(cx, 11, ins))
+  let want = newByteBuf()
+  movRR(want, 9, 1)
+  casal(want, 3, 9, 0, 2)
+  cmpRR(want, 9, 1)
+  cset(want, 9, condEq())
+  movRR(want, 22, 9)
+  assertSameBytes(cx.code, want)
+
+  // #4396 still holds on this arm: the width comes from the store's OWN
+  // recorded type, and it is the CASAL — word 1, after the copy — that carries
+  // it. i32 is the spin lock's width, so canonNarrow adds the sign-extend.
+  let cx2 = lseSelCtx()
+  let ctx2 = cx2.module.ctx
+  let ins2 = mkInstr(Op.AtomicCmpxchg, primType(ctx2, 10))
+  ins2.lhs = 0
+  ins2.rhs = 1
+  ins2.ival = 2
+  ins2.ival2 = primType(ctx2, 2)
+  assert(compileInstAtomic(cx2, 11, ins2))
+  assert(((wordAt(cx2.code, 4) >> 30) & 3) == 2, "casal width: ${wordAt(cx2.code, 4)}")
+  let want2 = newByteBuf()
+  movRR(want2, 9, 1)
+  casal(want2, 2, 9, 0, 2)
+  extendRegA(want2, 9, 9, 4, true)
+  cmpRR(want2, 9, 1)
+  cset(want2, 9, condEq())
+  movRR(want2, 22, 9)
+  assertSameBytes(cx2.code, want2)
 }
