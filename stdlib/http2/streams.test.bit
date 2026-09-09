@@ -343,7 +343,7 @@ test "a body larger than the initial window completes through the resume path" {
   //
   // 200000 bytes is over three times the initial window in each direction, so
   // both the request and the echoed response take this path several times.
-  let conn = btLoopback(defaultConfig()) catch e {
+  let conn = btLoopback(defaultConfig(), btEcho) catch e {
     assert(false, "loopback setup failed: ${e.message()}")
     return
   }
@@ -552,4 +552,81 @@ test "Conn.resetStream releases a round trip parked on that stream" {
   }
   assert(rst.streamId == 1, "RST_STREAM on stream ${rst.streamId}, want 1")
   assert(rst.errorCode == errorCancel, "RST_STREAM code = ${rst.errorCode}, want ${errorCancel}")
+}
+
+// --- a `serve` handler resetting the stream it is answering (#4616) ----------
+//
+// #4598 left `Conn.resetStream` reachable only from a client that tracks its own
+// ids. A server handler's only abort was returning a `Response` with status 0,
+// which `h2connCmdRespond` turns into RST_STREAM CANCEL — one hardcoded code,
+// with no way to say REFUSED_STREAM (the peer may retry elsewhere) or
+// ENHANCE_YOUR_CALM. `serve` now hands each handler the `Stream` it is
+// answering, and `Stream.reset` is `resetStream` scoped to that one id.
+
+// A handler that refuses its stream outright and then returns a perfectly good
+// 200. The `Response` must be discarded: the reset has already closed the stream
+// and dropped it from the table by the time the response command arrives, so the
+// peer sees RST_STREAM and no HEADERS.
+fn srRefuse(req: Request, s: Stream): Response {
+  s.reset(errorRefusedStream)
+  return newResponse(200, req.body)
+}
+
+test "a serve handler resets its own stream with the code it chose" {
+  // The acceptance, end to end over a real server `Conn`: a client `roundTrip`
+  // against a handler that resets fails with THAT code, 0x7, and not with the
+  // 0x8 CANCEL a status-0 `Response` would have sent.
+  let conn = btLoopback(defaultConfig(), srRefuse) catch e {
+    assert(false, "loopback setup failed: ${e.message()}")
+    return
+  }
+  btPost(conn, 64) catch e2 {
+    assert(
+      e2.message() == srPeerWant(errorRefusedStream),
+      "the round trip failed, but not with the handler's code: '${e2.message()}'",
+    )
+    return
+  }
+  assert(false, "a handler that reset its stream answered the request anyway")
+}
+
+test "a reset from a serve handler sends one RST_STREAM and discards the response" {
+  // The same sequence `h2connHandle` (conn.bit) produces, at the frame level:
+  // the handler's `Stream.reset` command first, then the `Response` it returned.
+  // Both are built by the real code — the command by `Stream.reset` itself, so
+  // this also checks that it names its OWN id and carries the caller's code —
+  // and both go through the loop's own `h2connHandleCmd` dispatch.
+  let p = srNewPeer()
+  let req = srServeStart(p, 1, "/refuse") catch e {
+    assert(false, "driving the stream failed: ${e.message()}")
+    return
+  }
+  assert(srDrainWrites(p.st) == 1, "the request's WINDOW_UPDATE was not the only queued frame")
+
+  let cmdCh = chan<h2connCmd>(2)
+  let s = Stream{ cmdCh: cmdCh, id: 1 }
+  s.reset(errorEnhanceYourCalm)
+  let cmd = <- cmdCh
+  assert(cmd.kind == h2cmdReset, "Stream.reset sent command kind ${cmd.kind}, want ${h2cmdReset}")
+  assert(cmd.streamId == 1, "Stream.reset named stream ${cmd.streamId}, want its own, 1")
+  h2connHandleCmd(p.st, cmd)
+  srServeFinish(p, 1, req.body)
+
+  let sent = btNextWritten(p.st) catch e2 {
+    assert(false, "no frame reached the peer: ${e2.message()}")
+    return
+  }
+  let rst = decodeRstStream(sent) catch e3 {
+    assert(false, "the frame the peer got is not RST_STREAM: ${e3.message()}")
+    return
+  }
+  assert(rst.streamId == 1, "RST_STREAM on stream ${rst.streamId}, want 1")
+  assert(
+    rst.errorCode == errorEnhanceYourCalm,
+    "RST_STREAM code = ${rst.errorCode}, want ${errorEnhanceYourCalm}",
+  )
+  // The discarded response: no HEADERS and no second RST_STREAM behind it.
+  let extra = srDrainWrites(p.st)
+  assert(extra == 0, "the reset stream queued ${extra} more frames for the peer, want 0")
+  assert(len(p.st.streams) == 0, "the reset stream is still in the table")
 }
