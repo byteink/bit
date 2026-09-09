@@ -250,6 +250,100 @@ carries no `LC_CODE_SIGNATURE` load command and no embedded filename or
 path — confirmed by building the same module to two different basenames in
 two different directories and finding all four outputs byte-identical.
 
+## Why a third arm compares each module's set of cross-object references (#4365)
+
+Both arms above are structurally blind to a lowering change that only fires on
+a CROSS-MODULE call, and that is not a hypothetical class:
+
+- the per-file IR walk lowers one file standalone, so an imported callee never
+  appears in the dump at all (the 477-empty-bodies measurement above is the
+  same fact from the other side);
+- the atomic-width signature only looks at acquire/release mnemonics, which a
+  non-atomic codegen change never moves.
+
+#4345 lowered `loadByte`/`storeByte` inline instead of as a cross-object call
+and removed **193 of 2483** `ARM64_RELOC_BRANCH26` relocations from
+`libbitrt-aarch64-macos.a` (`_bit_rt_port_mem_load_byte` 115 -> 0,
+`_bit_rt_port_mem_store_byte` 78 -> 0; archive 922226 -> 911930 bytes). This
+differential printed `PASS - 154/155 runtime file(s) lower identically`. It was
+not wrong; it could not see it — and a change that MISCOMPILED all 193 would
+have printed the same PASS. `scripts/gate.sh` routes a `compiler/**`-only diff
+to bucket `selfhost`, whose only codegen differential is this script, so that
+was the whole check standing between such a change and merged `main`.
+
+**What is compared.** Each module object's relocation table — every symbol the
+module's code and data reference but do not define — extracted with
+`objdump -r` and keyed on `(TYPE, SYMBOL)`. Mach-O and ELF both print one
+`OFFSET TYPE VALUE` record per line under `RELOCATION RECORDS FOR [...]`
+banners, so one extraction covers both; the OFFSET column is dropped (it moves
+with every scheduling and register-allocation change — exactly the noise #3103
+narrowed the byte-identity invariant to escape) and an ELF section-relative
+addend (`.text+0x10`) is stripped down to the symbol.
+
+**As a SET, not a multiset**, for #3170's reason one arm up: inlining an
+already-emitted call into a second call site duplicates a record without
+changing which symbols the module references, and a count-sensitive compare
+reddens on that legitimate fold. Set membership moves only when a reference
+appears or disappears entirely, which is what a cross-module lowering change
+does.
+
+**The rejected alternative.** #4365 weighed dumping IR per MODULE instead, so
+imports resolve. That is not a script change: `--dump-ir-pre` reads exactly
+one file (`readDumpSource` in compiler/main.bit calls `readFile` on its
+argument) and a directory still fails outright — re-checked on this tree, not
+quoted: `bit --dump-ir-pre runtime/gc` -> `bit: cannot read runtime/gc`,
+rc=1. The relocation arm needs no compiler feature and costs **0.63-0.68s
+wall** over 50 objects (both sides of all 25 modules, three runs, warm), 1.6%
+of the 41.4s full run — the module objects it reads are the ones the
+atomic-width arm already built.
+
+**Measured when the arm was added**, on `main` at `b23c33c4` against the
+pinned oracle: 19478 relocation sites over 25 modules, and 25/25 modules
+identical at set AND multiset granularity. So unlike object bytes (#3103,
+where 22 of 23 modules legitimately differ) this invariant is not already
+broken by the optimisation work that has landed since the pin. `MIN_RELOC_SITES`
+(12000) is the same "a count is not coverage" floor as `MIN_ATOMIC_SITES`: a
+missing or renamed `objdump` empties the signature on BOTH sides and every
+module then compares equal.
+
+**Why there is a declared-change table** (`RELOC_DECLARED`, empty today). The
+codegen work under #4342 is deliberately in the business of removing
+cross-object calls from the runtime, so this arm WILL go red on a correct
+change, and a gate with no way to record that is #1895's routed-around-red
+hazard. A line names one exact `<module> <-|+> <TYPE> <SYMBOL>` reference, so
+it is a signature and not the per-file allowlist #1883 deleted: a second,
+unrelated reference change inside an already-declared module still fails. It
+is asserted BOTH WAYS — a declared line that is no longer observed fails too,
+which is what empties the table at the next stage0 repin instead of leaving a
+stale entry masking a later regression on that exact symbol.
+
+**Proved live against #4345, not reasoned about.** `7b84b9c9` (the #4345
+commit) built in one scratch worktree, its parent `145077ca` in another, the
+arm run with `BIT_STAGE0_BIN` pointing at the parent's compiler:
+
+```
+  FAIL - 5 of 25 runtime module(s) reference a different set of external
+         symbols than the pinned stage0 (18684 relocation site(s) compared):
+    runtime/gc         - ARM64_RELOC_BRANCH26 _bit_rt_port_mem_load_byte
+    runtime/gc         - ARM64_RELOC_BRANCH26 _byteAt
+    runtime/net        - ARM64_RELOC_BRANCH26 _bit_rt_port_mem_{load,store}_byte
+    runtime/net/darwin - ARM64_RELOC_BRANCH26 _bit_rt_port_mem_{load,store}_byte
+    runtime/root       - ARM64_RELOC_BRANCH26 _bit_rt_port_mem_{load,store}_byte
+    runtime/root/darwin- ARM64_RELOC_BRANCH26 _bit_rt_port_mem_{load,store}_byte
+    runtime/root/darwin+ ARM64_RELOC_BRANCH26 _loadU16LE
+```
+
+(11 delta lines; `{load,store}` is two lines each, contracted here only.) In
+that same run the IR walk and the atomic-width arm both reported nothing —
+they are the two arms this one exists to cover. Both sides at `145077ca`:
+`PASS - 154/155 ... ; 18684 cross-object relocation site(s) compared over 25
+module(s), 0 with a declared reference change`, rc=0. The table mechanism was
+mutated four ways rather than argued: declaring all 11 lines turns the FAIL
+into `DECLARED` + rc=0; the same populated table against the unchanged pair
+fails with 11 stale declarations; deleting ONE line from the populated table
+fails on that one line while its module stays declared for the other; and
+`DIFFRUNTIME_MIN_RELOC_SITES=99999` fails the floor at the real 19478.
+
 ## Why the IR walk above is per-file and not per-module
 
 Not a preference — there is no module-level IR dump. `--dump-ir-pre` reads
