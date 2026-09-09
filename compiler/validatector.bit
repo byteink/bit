@@ -1,0 +1,280 @@
+// Self-host: constructor-call argument validation — moved verbatim out of
+// compiler/validatezero.bit (#4322), which was 790 lines against the hard
+// 800-line E0200 ceiling.
+//
+// The arity and argument-type rules for the four type-node callees
+// `[]T(...)`, `map<K,V>(...)`, `chan<T>(...)` and `[N]T(...)`, i.e. the
+// validators `checkexprcall.bit`'s `TypeNodeCallee` table names. The §13.4
+// zero-value family and the composite-literal slot checks stay in
+// validatezero.bit; read its header first.
+//
+// Same module as validate.bit and its other siblings, so nothing is imported
+// here (a duplicate import is E0042).
+// `[]T(...)` takes ONE length (or a length and a capacity), and anything else is
+// E0050 (#1921).
+//
+// The lowering read argument 0 as the length and never looked at `len(args)`, so
+// `[]u8(127, 69, 76, 70)` took 127 as the length and DISCARDED the other three,
+// producing a 127-byte run of zeroes. That is the dangerous shape rather than a
+// cosmetic one: it reads exactly like a byte-slice literal — the spelling most
+// bracket-style languages use for one — and it yields a plausible non-empty
+// slice instead of failing. It was found in `compiler/archivecheck.bit`, where a
+// magic-number predicate was handed a 127-zero-byte buffer, correctly returned
+// false, and so the assertion meant to prove ELF magic is ACCEPTED proved
+// nothing. A test that cannot fail is worse than no test.
+//
+// Zero arguments is the same defect from the other end: `[]u8()` type-checked
+// clean and only failed later as "cannot lower 1 function(s)", a message that
+// names neither the expression nor the problem.
+//
+// Deliberately NOT made to construct a literal from its arguments. That is a
+// language change needing a SPEC decision, and `[]byte("\x7fELF")` already
+// covers the case — so the diagnostic points there rather than inventing a form.
+fn vSliceAllocArity(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) < 3 || getNode(c.tree, kids[0]).tag != Tag.SliceType) {
+    return
+  }
+  let ty = typeFromNode(c, kids[0])
+  if (ty == 0 || c.ctx.types[ty].kind != TypeKind.Slice) {
+    return
+  }
+  let argKids = kidsOf(c.tree, kids[2])
+  let n = len(argKids)
+  if (n == 1 || n == 2) {
+    vSliceAllocArgType(c, ty, argKids)
+    return
+  }
+  let name = typeName(c.ctx, ty)
+  if (n == 0) {
+    report(
+      c.diags, ecArgCount, vSpan(c, node),
+      "'${name}()' needs a length: '${name}(n)' makes a slice of n zero values",
+      "or convert a string with `[]byte(s)`, or write the elements as `${name}{ ... }` (§12.9)",
+    )
+    return
+  }
+  report(
+    c.diags, ecArgCount, vSpan(c, node),
+    "'${name}(n)' takes one length argument and an optional capacity, got ${n}",
+    "this is the sized constructor, not an element list — write the elements as `${name}{ ... }`, or bytes as `[]byte(\"...\")` (§12.9)",
+  )
+}
+
+// E0111, first free code above E0110: `[]T(n)` / `[]T(n, m)`'s length and
+// (optional) capacity argument must each be an integer.
+const ecInvalidSliceAllocArg = 111
+
+// `[]T(n)` / `[]T(n, m)`'s length and (optional) capacity argument must each be
+// an integer (#4091): `lowerSliceAlloc` (lowerlit.bit) reads `args[0]`/`args[1]`
+// and hands them straight to `slice_new` as a raw i64 length/capacity with no
+// runtime check, so `vSliceAllocArity` above checked only the argument COUNT
+// and never the argument TYPE — a string or bool value there was silently
+// reinterpreted, and `[]i64("x")` / `[]i64(true)` both ran and produced a
+// plausible non-empty slice with no diagnostic anywhere.
+//
+// The one legal non-integer exception is the single-arg §12.9 `[]byte(s)`
+// string-to-bytes conversion, legal ONLY when the slice's element is
+// byte-sized (prim index 4, `byte`/`u8`) — `vSliceAllocIsBytesForm` below is
+// that test, split out to keep this function under E0204's complexity
+// ceiling. Before this fix `isBytesConversion` (lowerlit.bit) checked the
+// argument's type but not the slice's element type, so without this guard
+// `[]i64("hello")` also took that path and was lowered as a 5-element `[]i64`
+// backed by the 5 bytes `bytes_from_string` actually allocated, reading past
+// the allocation for any index beyond 0. Confirmed on `main` before this fix:
+// `[]i64("hello")` ran, `len(x)==5`, `x[4]` read garbage. `isBytesConversion`
+// now independently requires a byte-sized elem too (#4137, for
+// `--dump-ir`/`--dump-ir-pre`, which lower unchecked input) — this checker
+// guard still owns the user-facing E0111 diagnostic that `bit check` gives
+// for `[]i64("hello")`, since a lowering-time `fcFail` produces only a
+// signature-only stub with no rendered diagnostic.
+fn vSliceAllocArgType(c: Checker, ty: int, argKids: []int) {
+  let name = typeName(c.ctx, ty)
+  for k of argKids {
+    let a = k
+    if (getNode(c.tree, a).tag == Tag.Arg) {
+      a = kidsOf(c.tree, a)[0]
+    }
+    let t = checkExprType(c, a)
+    if (t == 0 || vMentionsInvalid(c, t, 0) || vHasTypeParam(c, t, 0)) {
+      continue
+    }
+    if (isIntegerOperand(c, t) || vSliceAllocIsBytesForm(c, ty, len(argKids), t)) {
+      continue
+    }
+    report(
+      c.diags, ecInvalidSliceAllocArg, vSpan(c, a),
+      "'${typeName(c.ctx, t)}' cannot be used as a slice length or capacity",
+      "'${name}(n)' expects an integer, e.g. '${name}(10)' — or convert a string with `[]byte(s)` (§12.9)",
+    )
+  }
+}
+
+// Is the single argument `t` the §12.9 `[]byte(s)` string-to-bytes exception
+// `vSliceAllocArgType` above admits — exactly one argument, and a byte-sized
+// (`byte`/`u8`, prim index 4) element type?
+fn vSliceAllocIsBytesForm(c: Checker, ty: int, argCount: int, t: int): bool {
+  if (argCount != 1) {
+    return false
+  }
+  let elem = c.ctx.types[ty].elem
+  if (elem == 0 || c.ctx.types[elem].kind != TypeKind.Prim || c.ctx.types[elem].prim != 4) {
+    return false
+  }
+  return stringish(c, t)
+}
+
+// `map<K,V>(...)` takes zero arguments (empty map) or one integer capacity
+// HINT `map<K,V>(n)` (§11.2, §12.9, #4064) — the same zero-or-one shape
+// `vChanCtorArgs` below checks for `chan<T>(...)`, not `[]T(n)`'s mandatory
+// length: a map has nothing mandatory to accept, since `n` never changes what
+// the map CONTAINS, only how it is pre-sized. #4065 closed the hole where the
+// checker built the map's TYPE from the generic arguments and never visited
+// the call's own argument list, so any argument list type-checked clean and
+// was silently discarded at lowering; #4064 gives the one-argument form a
+// real meaning (`lowerMapCtor`, compiler/lowermapctor.bit) instead of
+// rejecting it outright, so two or more arguments is still wrong-arity.
+fn vMapCtorArity(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) < 3 || getNode(c.tree, kids[0]).tag != Tag.MapType) {
+    return
+  }
+  let ty = typeFromNode(c, kids[0])
+  if (ty == 0 || c.ctx.types[ty].kind != TypeKind.Map) {
+    return
+  }
+  let argKids = kidsOf(c.tree, kids[2])
+  let n = len(argKids)
+  if (n > 1) {
+    let name = typeName(c.ctx, ty)
+    report(
+      c.diags, ecArgCount, vSpan(c, node),
+      "'${name}()' takes zero arguments or one capacity hint, got ${n}",
+      "'${name}()' is empty, '${name}(n)' pre-sizes for about n entries — build entries with a map literal `${name}{ ... }` instead (§12.3, §12.9)",
+    )
+    return
+  }
+  if (n == 1) {
+    vMapCapArgType(c, ty, argKids[0])
+  }
+}
+
+// E0119, first free code above E0118 -- #3941's `ecCondArmMismatch`
+// (compiler/validatecall.bit) took E0118 on a branch this one could not see;
+// reconciled on merge, per this file's own rule: re-derive the next free
+// code from disk, never trust either branch's own number.
+const ecInvalidMapCtorArg = 119
+
+// The single argument to `map<K,V>(n)`, once `vMapCtorArity` has established
+// there is exactly one, must be an integer — the mirror of
+// `vChanCapArgType`. The VALUE is never checked here: `n` is rarely a literal
+// the checker could fold, and the hint is advisory, so a negative or huge `n`
+// is a runtime clamp (`mapCapForHint`, runtime/root/mapcaps.bit), never a
+// checker error — the hint must never change whether a program compiles.
+fn vMapCapArgType(c: Checker, ty: int, argNode: int) {
+  let a = argNode
+  if (getNode(c.tree, a).tag == Tag.Arg) {
+    a = kidsOf(c.tree, a)[0]
+  }
+  let t = checkExprType(c, a)
+  if (t == 0 || vMentionsInvalid(c, t, 0) || vHasTypeParam(c, t, 0) || isIntegerOperand(c, t)) {
+    return
+  }
+  let name = typeName(c.ctx, ty)
+  report(
+    c.diags, ecInvalidMapCtorArg, vSpan(c, a),
+    "'${typeName(c.ctx, t)}' cannot be used as a map capacity hint",
+    "'${name}(n)' expects an integer, e.g. '${name}(1000)' (§11.2, §12.9)",
+  )
+}
+
+// E0112, first free code above E0111: a `chan<T>(...)` argument list wrong in
+// count or type.
+const ecInvalidChanCtorArg = 112
+
+// `chan<T>(...)` takes zero arguments (unbuffered) or exactly one integer
+// capacity argument (buffered: §12.9/§16.2, `chan<int>(16)`). #4092 — no
+// validator existed at all, the identical gap #4065 closed for `map<K,V>()`:
+// the callee is a `Tag.ChanType` node, `checkExprType` (checkexpr.bit) has no
+// case for a bare type node, and the generic call-argument path bails on that
+// `ft == 0` before ever visiting the argument list. `lowerChanMake`
+// (lowerlit.bit) reads `args[0]` unconditionally as the raw i64 capacity
+// whenever `len(args) >= 1` and never re-checks `len(args)`, so
+// `chan<i64>(1, 2, 3)` ran using 1 as the capacity and discarded the other
+// two, and `chan<i64>("x")` / `chan<i64>(true)` handed a string/bool value
+// straight to the runtime's `chan_make` as if it were an i64 capacity — the
+// same raw-argument type confusion #4091 fixed for `[]T(n)`.
+fn vChanCtorArgs(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) < 3 || getNode(c.tree, kids[0]).tag != Tag.ChanType) {
+    return
+  }
+  let ty = typeFromNode(c, kids[0])
+  if (ty == 0 || c.ctx.types[ty].kind != TypeKind.Chan) {
+    return
+  }
+  let argKids = kidsOf(c.tree, kids[2])
+  if (len(argKids) > 1) {
+    let name = typeName(c.ctx, ty)
+    report(
+      c.diags, ecArgCount, vSpan(c, node),
+      "'${name}(...)' takes zero arguments or one capacity argument, got ${len(argKids)}",
+      "an unbuffered channel is '${name}()', a buffered one is '${name}(capacity)' (§12.9, §16.2)",
+    )
+    return
+  }
+  if (len(argKids) == 1) {
+    vChanCapArgType(c, ty, argKids[0])
+  }
+}
+
+// The single argument to `chan<T>(capacity)`, once `vChanCtorArgs` has
+// established there is exactly one, must be an integer. Split out to keep
+// `vChanCtorArgs` under E0204's complexity ceiling.
+fn vChanCapArgType(c: Checker, ty: int, argNode: int) {
+  let a = argNode
+  if (getNode(c.tree, a).tag == Tag.Arg) {
+    a = kidsOf(c.tree, a)[0]
+  }
+  let t = checkExprType(c, a)
+  if (t == 0 || vMentionsInvalid(c, t, 0) || vHasTypeParam(c, t, 0) || isIntegerOperand(c, t)) {
+    return
+  }
+  let name = typeName(c.ctx, ty)
+  report(
+    c.diags, ecInvalidChanCtorArg, vSpan(c, a),
+    "'${typeName(c.ctx, t)}' cannot be used as a channel capacity",
+    "'${name}(capacity)' expects an integer, e.g. '${name}(16)' (§12.9, §16.2)",
+  )
+}
+
+// E0113, first free code above E0112: `[N]T(...)` has no call constructor.
+const ecArrayCtorInvalid = 113
+
+// `[N]T(...)` is not a legal construction form at all (§12.3): an array value
+// is built ONLY by the type-prefixed literal `[N]T{...}`, or left zero-valued
+// by `let a: [N]T` — unlike `[]T(n)` and `chan<T>(n)` above, there is no
+// call-style constructor to validate arguments against. #4092 — nothing
+// rejected the call form at the checker, so both `[4]i64()` and
+// `[4]i64(1, 2, 3)` reached `lowerCall` (lowercall.bit), which has no
+// `Tag.ArrayType` arm and falls through to the generic "cannot lower a call
+// whose callee does not resolve to a function" backstop (E0092) — a
+// compiler-internal message naming neither the expression nor what the user
+// wrote wrong.
+fn vArrayCtorRejected(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) < 1 || getNode(c.tree, kids[0]).tag != Tag.ArrayType) {
+    return
+  }
+  let ty = typeFromNode(c, kids[0])
+  if (ty == 0 || c.ctx.types[ty].kind != TypeKind.Array) {
+    return
+  }
+  let name = typeName(c.ctx, ty)
+  report(
+    c.diags, ecArrayCtorInvalid, vSpan(c, node),
+    "'${name}' has no call constructor",
+    "build it with the literal '${name}{ ... }', or leave it zero-valued with 'let a: ${name}' (§12.3)",
+  )
+}
+
