@@ -796,6 +796,11 @@ The message names the GOAWAY's error code. Streams at or below `lastStreamId`
 are unaffected - the peer may still answer those - so a graceful shutdown lets
 in-flight requests finish.
 
+And it fails when this side resets the stream through `Conn.resetStream`, with
+`http2: stream reset locally (code N)` - deliberately different wording from
+the peer's reset, because no peer acted. That call is how a parked `roundTrip`
+is cancelled: this method has no cancellation of its own.
+
 ### `Conn.serve(handler: (Request) => Response): ()!`
 
 Accept inbound requests and dispatch each to `handler` on its own green thread,
@@ -852,4 +857,19 @@ difference between this GOAWAY and the one a connection error sends.
 ### `Conn.resetStream(streamId: int, errorCode: int)`
 
 Abort stream `streamId` by sending RST_STREAM with `errorCode` (an `error*`
-constant).
+constant). A `roundTrip` parked on that stream is released with
+`http2: stream reset locally (code N)`; a stream that has already finished, or
+that never existed, sends the RST_STREAM and changes nothing else (RFC 9113
+§6.4 permits both).
+
+**You must track the stream id yourself.** Nothing in this API hands one out:
+`roundTrip` returns a `Response` and `serve` hands its handler a `Request`,
+neither of which carries the id. So this is usable from exactly one position -
+a client that knows which stream its own request rode. Each accepted
+`roundTrip` takes the next client id in order, starting at 1 and stepping by 2
+(a request refused because the connection is closing takes none), so a caller
+that keeps one `roundTrip` in flight per `Conn` knows that request's id and can
+cancel it from another green thread. Callers that run several `roundTrip` calls
+at once on one `Conn` cannot: those race for ids and nothing reports which one
+each got. There is no way to reset a stream from inside a `serve` handler
+today.
