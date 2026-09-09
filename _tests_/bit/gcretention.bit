@@ -28,9 +28,33 @@
 // load-sensitive cannot be pinned at all, and the loaded box is the adversarial
 // case, not a caveat:
 //
-//   1. `swept` and `live` are BYTE-EXACT across repetitions. 7/7 identical on
-//      bench/cases/{alloc,json,sort}, 5/5 on each of this gate's own two
-//      fixtures, 5/5 under BIT_GC=stress. Zero spread, every arm.
+//   1. `swept` and `live` repeat EXACTLY, but not universally, and the
+//      exception is the whole reason this gate has `pacedAttempts`. At N=100
+//      to N=200 runs of one binary:
+//
+//        stress, builder      100/100  swept=60025 live=0
+//        stress, churn        100/100  swept=20126 live=0
+//        paced, builder       200/200  swept=56890 live=3135
+//        paced, alloc         100/100  swept=9980989 live=25017
+//        paced, json          100/100  swept=1200034 live=4200027
+//        paced, sort          100/100  swept=349619 live=250403
+//        paced, churn         195/200  swept=10567 live=9559
+//                               5/200  swept=11070 live=9056   <- 2.5%
+//
+//      THE FIRST FIVE RUNS OF churn WERE IDENTICAL AND THE CLAIM "byte-exact"
+//      WAS WRONG. It took N=200 to see the tail, and it was found only because
+//      one `./make test-gc-retention` reported the minority value after three
+//      direct runs had reported the majority one. A 2.5% tail is invisible at
+//      N=5 (88% chance of missing it) and is exactly the rate that makes a
+//      gate distrusted. Never seed a row from a handful of runs.
+//
+//      The tail is a PACING lottery, not counter noise: the total `swept+live`
+//      is 20126 in both states, and the 503 objects that move are one whole
+//      batch — a stray conservative-scan root delays the second of churn's TWO
+//      collections. It tracks collection count, which is why the fixtures with
+//      133, 19 and 6 collections do not show it and the one with 2 does. An
+//      environment-size sweep (pad lengths 1..32) was run first and is NOT the
+//      cause: the same binary in the same environment gives both values.
 //
 //   2. `collections` is NOT stable and must never be pinned: sort at
 //      BIT_GC_MIN_KB=512 read 4,4,5,5,5 over five runs, and the stress arm read
@@ -49,9 +73,11 @@
 //      silently the day the default moves. (#4402 saw json invariant from 2 to
 //      31 collections; that is json's workload, not a general property.)
 //
-// So: EXACT TWO-SIDED PINS, not a band and not an RSS ratchet. There is no
-// measured jitter for a band to accommodate, and a band wide enough to be safe
-// is wide enough to miss the 22% move this gate exists to catch. An exact pin
+// So: EXACT TWO-SIDED PINS, judged over up to `pacedAttempts` runs of the same
+// binary — not a band and not an RSS ratchet. A band wide enough to cover
+// churn's 4.8% two-state split is wide enough to miss real moves, and it would
+// accept BOTH states forever rather than reporting that a build stopped being
+// able to produce the pinned one. An exact pin
 // cannot go stale unnoticed the way a ratchet can (#3713, #4099): it reds on the
 // commit that moves it, which IS the attribution this ticket asked for. When it
 // reds for a legitimate reason, re-derive the row with the one-line command in
@@ -422,18 +448,24 @@ fn runFixture(ctx: Ctx, row: Row, prog: string, tag: string): Stats! {
   return Stats{ ok: true, exitCode: code, swept: swept, live: live }
 }
 
-// Builds and runs one row, returning its retention counters. `ok` false means
-// the failing checks are already recorded on `ctx.t` and the caller must assert
-// nothing further — a row that could not be measured is a FAIL, never a skip.
-fn measure(ctx: Ctx, row: Row, tag: string): Stats {
+fn unmeasured(): Stats {
+  return Stats{ ok: false, exitCode: 0 - 1, swept: 0 - 1, live: 0 - 1 }
+}
+
+// Writes (for an owned fixture) and builds one row, returning the program path,
+// or "" having already recorded the failing checks on `ctx.t` — a row that
+// could not be built is a FAIL, never a skip. Separate from `runOnce` below
+// because a paced row may be RUN more than once (see `pacedAttempts`) and must
+// not be rebuilt each time: re-measuring the same binary is the point.
+fn prepare(ctx: Ctx, row: Row, tag: string): string {
   let src = sourcePath(ctx, row, tag) catch e {
     check(ctx.t, false, "${tag}: ${e.message()}")
-    return Stats{ ok: false, exitCode: 0 - 1, swept: 0 - 1, live: 0 - 1 }
+    return ""
   }
   let prog = "${ctx.scratch}/${tag}"
   let build = buildFixture(ctx, src, prog, tag) catch e {
     check(ctx.t, false, "${tag}: ${e.message()}")
-    return Stats{ ok: false, exitCode: 0 - 1, swept: 0 - 1, live: 0 - 1 }
+    return ""
   }
   check(
     ctx.t,
@@ -441,11 +473,17 @@ fn measure(ctx: Ctx, row: Row, tag: string): Stats {
     "${tag}: ${src} must compile (bit build exited ${build})",
   )
   if (build != 0 || !exists(prog)) {
-    return Stats{ ok: false, exitCode: 0 - 1, swept: 0 - 1, live: 0 - 1 }
+    return ""
   }
+  return prog
+}
+
+// One measured execution. `ok` false means the failing checks are already
+// recorded and the caller must assert nothing further.
+fn runOnce(ctx: Ctx, row: Row, prog: string, tag: string): Stats {
   let st = runFixture(ctx, row, prog, tag) catch e {
     check(ctx.t, false, "${tag}: ${e.message()}")
-    return Stats{ ok: false, exitCode: 0 - 1, swept: 0 - 1, live: 0 - 1 }
+    return unmeasured()
   }
   check(ctx.t, st.exitCode == 0, "${tag}: must exit 0 (exited ${st.exitCode})")
   check(
@@ -454,9 +492,17 @@ fn measure(ctx: Ctx, row: Row, tag: string): Stats {
     "${tag}: no `[bit-gc] ... swept=N live=N` summary — the run was not measured",
   )
   if (st.exitCode != 0 || !st.ok) {
-    return Stats{ ok: false, exitCode: st.exitCode, swept: st.swept, live: st.live }
+    return unmeasured()
   }
   return st
+}
+
+fn measure(ctx: Ctx, row: Row, tag: string): Stats {
+  let prog = prepare(ctx, row, tag)
+  if (len(prog) == 0) {
+    return unmeasured()
+  }
+  return runOnce(ctx, row, prog, tag)
 }
 
 // BIT_GC=stress arm. `live == 0` is the whole assertion; `swept >= sweptFloor`
@@ -478,25 +524,56 @@ fn evalStressRow(ctx: Ctx, row: Row) {
   )
 }
 
+// Runs of the SAME binary a paced row is allowed before its pin is judged
+// missing. THIS IS NOT "RETRY UNTIL GREEN" — the assertion it implements is
+// "this build can still produce the pinned retention", and every attempt is
+// printed whether it matched or not, so a row that needed one is visible in the
+// log rather than silently forgiven.
+//
+// It exists because the paced split is a pacing LOTTERY on a fixture with few
+// collections, measured rather than assumed: 200 runs of one churn binary at
+// BIT_GC_MIN_KB=512 gave 195 x (10567/9559) and 5 x (11070/9056) — 2.5%, one
+// whole batch of 503 objects moving between the two halves because a stray
+// conservative-scan root delayed the second of its TWO collections. builder was
+// 200/200 and alloc/json/sort 100/100 each, so the lottery tracks collection
+// count, not the counter.
+//
+// A retention change caused by a COMMIT is deterministic — all three #4408
+// mutations reproduced on every run — so three attempts take a 2.5% false red
+// to 1.6e-5 while a real change is still caught with certainty. What this
+// CANNOT catch is a change that makes retention worse only SOMETIMES; that is a
+// nondeterminism bug of a different shape and this gate does not claim it.
+const pacedAttempts: int = 3
+
 // Paced arm. Exact two-sided pins; a -1 pin is an unmeasured platform and the
 // measured value is printed so recording it takes one run.
 fn evalPacedRow(ctx: Ctx, row: Row) {
   let tag = "${row.name}_min${row.minKb}"
-  let st = measure(ctx, row, tag)
-  if (!st.ok) {
+  let prog = prepare(ctx, row, tag)
+  if (len(prog) == 0) {
     return
   }
-  print("gcretention: ${tag}: swept=${st.swept} live=${st.live} (want swept=${row.swept} live=${row.live})\n")
-  if (row.swept < 0 || row.live < 0) {
-    return
+  let seen = ""
+  let attempt = 0
+  while (attempt < pacedAttempts) {
+    let st = runOnce(ctx, row, prog, tag)
+    if (!st.ok) {
+      return
+    }
+    print("gcretention: ${tag}: attempt ${attempt + 1}: swept=${st.swept} live=${st.live} (want swept=${row.swept} live=${row.live})\n")
+    if (row.swept < 0 || row.live < 0) {
+      return
+    }
+    if (st.swept == row.swept && st.live == row.live) {
+      check(ctx.t, true, "${tag}: pinned retention observed")
+      return
+    }
+    seen = "${seen} (swept=${st.swept} live=${st.live})"
+    attempt = attempt + 1
   }
   check(
-    ctx.t, st.swept == row.swept,
-    "${tag}: swept=${st.swept}, pinned ${row.swept} — retention moved; re-derive with BIT_GC_MIN_KB=${row.minKb} BIT_GC_STATS=1 and say in the commit message what moved",
-  )
-  check(
-    ctx.t, st.live == row.live,
-    "${tag}: live=${st.live}, pinned ${row.live} — retention moved; re-derive with BIT_GC_MIN_KB=${row.minKb} BIT_GC_STATS=1 and say in the commit message what moved",
+    ctx.t, false,
+    "${tag}: pinned swept=${row.swept} live=${row.live} was not produced in ${pacedAttempts} runs of the same binary — saw${seen}. Retention moved; re-derive with BIT_GC_MIN_KB=${row.minKb} BIT_GC_STATS=1 and say in the commit message what moved",
   )
 }
 
