@@ -1,0 +1,283 @@
+// stdlib/http2/goaway.test.bit — a GOAWAY releases the streams the peer says it
+// never processed (#4605).
+//
+// RFC 9113 §6.8: a GOAWAY's `lastStreamId` is the highest id its sender might
+// have acted on or might yet act on, so the receiver's streams ABOVE it were
+// not and will not be processed and may be retried on a new connection.
+// `h2connOnGoaway` (events.bit) used to record the flag and the id and fail
+// nothing, so a client `roundTrip` parked on such a stream waited for a
+// response that was never coming — forever at `connect(t, cfg, 0)`, the
+// documented "no bound" spelling.
+//
+// Usually masked: a peer that sends GOAWAY normally closes the transport right
+// after, and the EOF that follows terminates the connection and answers
+// everyone. It is a peer that sends GOAWAY and KEEPS the connection open that
+// exposes it — which is precisely what this engine's own `Conn.close()` does,
+// so a Bit client talking to a Bit server hits it.
+//
+// The first six tests drive `h2connHandleFrame` against a hand-built
+// `h2connState` with no threads behind it, because "the stream below
+// `lastStreamId` was left alone" is only checkable as state: an untouched
+// stream produces nothing to observe on a wire. The last runs a real client
+// `Conn` against a hand-driven peer, because the hang the ticket reports is a
+// property of `roundTrip` and not of the handler.
+//
+// Same flat `std/http2` module, so `btState`/`btOpenStream`/`btChunk`/`btEnd`/
+// `btRead`/`btWrite`/`btShutdown` (events.test.bit) and `hbWire`/`hbNextFrame`
+// (headers.test.bit) are in scope and nothing is imported.
+
+// --- helpers -----------------------------------------------------------------
+
+// A GOAWAY frame as the peer would put it on the wire, built through the real
+// codec so the handler sees exactly what a socket would hand it.
+fn gaGoaway(lastStreamId: int, code: int): Frame! {
+  let wire = encodeGoaway(
+    GoawayFrame{ lastStreamId: lastStreamId, errorCode: code, debugData: []byte(0) },
+  )?
+  return readFrame(wire, maxMaxFrameSize)?
+}
+
+// True when nothing was delivered on `ch`. A `default` arm makes the receive
+// non-blocking, so an untouched stream is an assertion about its reply channel
+// rather than a wait that would hang the test.
+fn gaReplyChEmpty(ch: chan<h2connMsg>): bool {
+  let got = false
+  select {
+    case _ = <- ch:
+      got = true
+    default:
+  }
+  return !got
+}
+
+// The message an abandoned stream's `roundTrip` must be handed.
+fn gaWant(code: int): string {
+  return "http2: stream not processed, peer sent GOAWAY (code ${code})"
+}
+
+// --- the two halves of `lastStreamId` ----------------------------------------
+
+test "a GOAWAY fails a stream above lastStreamId and leaves one below it alone" {
+  // The ticket's own case: two client streams, a GOAWAY naming the lower one.
+  // Stream 1 is one the peer says it HAS acted on, so its response may still
+  // arrive and it must not be disturbed; stream 3 is abandoned.
+  let st = btState(true, 1048576)
+  let low = chan<h2connMsg>(1)
+  let high = chan<h2connMsg>(1)
+  let s1 = btOpenStream(st, 1, low)
+  let s3 = btOpenStream(st, 3, high)
+  let f = gaGoaway(1, errorInternalError) catch e {
+    assert(false, "building the GOAWAY failed: ${e.message()}")
+    return
+  }
+  h2connHandleFrame(st, f)
+
+  let msg = <- high
+  assert(!msg.ok, "the abandoned stream was answered with a response")
+  assert(
+    msg.errMsg == gaWant(errorInternalError),
+    "the abandoned round trip was not told why: '${msg.errMsg}'",
+  )
+  assert(s3.replied, "stream 3 was answered but never marked replied")
+  assert(s3.state == h2stClosed, "stream 3 state = ${s3.state}, want ${h2stClosed} (closed)")
+  assert(st.present[3] == 0, "stream 3 is still in the table after being failed")
+
+  // The other half, and the whole point of `lastStreamId`.
+  assert(gaReplyChEmpty(low), "the stream at lastStreamId was failed too")
+  assert(!s1.replied, "stream 1 was marked replied")
+  assert(s1.state == h2stOpen, "stream 1 state = ${s1.state}, want ${h2stOpen} (open)")
+  assert(st.present[1] == 1, "stream 1 was dropped from the table")
+
+  // And the GOAWAY is still recorded, which is what refuses new streams.
+  assert(st.goawayReceived, "goawayReceived was not set")
+  assert(st.lastStreamId == 1, "lastStreamId = ${st.lastStreamId}, want 1")
+}
+
+test "a GOAWAY leaves the stream at exactly lastStreamId in flight" {
+  // The boundary, on its own: `lastStreamId` names a stream the sender MAY yet
+  // act on, so the comparison has to be strictly-greater and not >=.
+  let st = btState(true, 1048576)
+  let rc = chan<h2connMsg>(1)
+  let s = btOpenStream(st, 3, rc)
+  let f = gaGoaway(3, errorNoError) catch e {
+    assert(false, "building the GOAWAY failed: ${e.message()}")
+    return
+  }
+  h2connHandleFrame(st, f)
+  assert(gaReplyChEmpty(rc), "the stream at exactly lastStreamId was failed")
+  assert(s.state == h2stOpen, "stream 3 state = ${s.state}, want ${h2stOpen} (open)")
+  assert(st.present[3] == 1, "stream 3 was dropped from the table")
+}
+
+test "a graceful GOAWAY still fails the streams the peer never processed" {
+  // NO_ERROR is the shutdown a healthy peer sends, and it is the one that keeps
+  // the connection open — so it is the case where the abandoned streams have
+  // nothing else coming to release them. The code is reported as sent (0), not
+  // translated into an error of our own.
+  let st = btState(true, 1048576)
+  let rc = chan<h2connMsg>(1)
+  btOpenStream(st, 5, rc)
+  let f = gaGoaway(0, errorNoError) catch e {
+    assert(false, "building the GOAWAY failed: ${e.message()}")
+    return
+  }
+  h2connHandleFrame(st, f)
+  let msg = <- rc
+  assert(!msg.ok, "the abandoned stream was answered with a response")
+  assert(
+    msg.errMsg == gaWant(errorNoError),
+    "the message does not name the GOAWAY code: '${msg.errMsg}'",
+  )
+}
+
+test "a GOAWAY fails every abandoned stream, not just one" {
+  // The failure closes each stream, which REMOVES it from `st.streams`
+  // (`h2connCloseStream`, #4594) — a mutation the runtime's map iterator does
+  // not allow mid-walk (SPEC §12.6). Eight streams above `lastStreamId` is the
+  // check that all of them are reached, whatever slot order the walk uses.
+  let st = btState(true, 1048576)
+  let chans = []chan<h2connMsg>(0)
+  let id = 3
+  while (id < 19) {
+    let rc = chan<h2connMsg>(1)
+    chans = append(chans, rc)
+    btOpenStream(st, id, rc)
+    id = id + 2
+  }
+  assert(len(st.streams) == 8, "setup opened ${len(st.streams)} streams, want 8")
+  let f = gaGoaway(1, errorInternalError) catch e {
+    assert(false, "building the GOAWAY failed: ${e.message()}")
+    return
+  }
+  h2connHandleFrame(st, f)
+  assert(len(st.streams) == 0, "${len(st.streams)} streams survived the GOAWAY, want 0")
+  let answered = 0
+  for rc of chans {
+    if (!gaReplyChEmpty(rc)) {
+      answered = answered + 1
+    }
+  }
+  assert(answered == 8, "${answered} of 8 abandoned round trips were answered")
+}
+
+test "a GOAWAY does not answer a stream that has already been replied to" {
+  // A stream whose `Response` is already on its way to the caller must not be
+  // handed a second message — its `replyCh` is capacity 1 and the reply is
+  // sitting in it, so a second send would block the loop thread outright.
+  let st = btState(true, 1048576)
+  let rc = chan<h2connMsg>(1)
+  let s = btOpenStream(st, 3, rc)
+  s.replied = true
+  let f = gaGoaway(1, errorInternalError) catch e {
+    assert(false, "building the GOAWAY failed: ${e.message()}")
+    return
+  }
+  h2connHandleFrame(st, f)
+  assert(gaReplyChEmpty(rc), "an already-replied stream was answered a second time")
+}
+
+test "a server does not fail its peer-initiated streams on a client's GOAWAY" {
+  // Ownership is by id parity (RFC 9113 §5.1.1): a GOAWAY's `lastStreamId`
+  // talks about the streams its RECEIVER opened, and a server's table holds the
+  // requests the CLIENT opened. Reading a client's GOAWAY as "drop everything
+  // above lastStreamId" would abort every request the server is still
+  // answering — a common shutdown carries `lastStreamId: 0`.
+  let st = btState(false, 1048576)
+  let s1 = btOpenStream(st, 1, h2connDummyReply())
+  let s3 = btOpenStream(st, 3, h2connDummyReply())
+  let f = gaGoaway(0, errorNoError) catch e {
+    assert(false, "building the GOAWAY failed: ${e.message()}")
+    return
+  }
+  h2connHandleFrame(st, f)
+  assert(s1.state == h2stOpen, "stream 1 state = ${s1.state}, want ${h2stOpen} (open)")
+  assert(s3.state == h2stOpen, "stream 3 state = ${s3.state}, want ${h2stOpen} (open)")
+  assert(len(st.streams) == 2, "${len(st.streams)} of the 2 served streams survived")
+}
+
+// --- over a real connection ---------------------------------------------------
+
+// A client `Conn` over an in-memory wire whose peer is driven by hand — the
+// peer half cannot be a second `Conn`, because what is under test is a peer
+// that sends GOAWAY and then does NOT close, which no `Conn` does on its own.
+//
+// The transport ends are `events.test.bit`'s, and the peer's opening SETTINGS
+// is pre-loaded into the buffered channel so `connect` completes its handshake
+// without a second thread. The 24-byte preface is drained here so that every
+// later chunk on the wire is exactly one frame, which is what `hbNextFrame`
+// (headers.test.bit) assumes.
+fn gaConnectOn(): (hbWire, Conn)! {
+  let toEngine = chan<btChunk>(64)
+  let fromEngine = chan<btChunk>(64)
+  let clientEnd = btEnd{
+    incoming: toEngine,
+    outgoing: fromEngine,
+    leftover: []byte(0),
+    closed: false,
+  }
+  toEngine <- btChunk{
+    data: encodeSettings(SettingsFrame{ ack: false, settings: []Setting(0) })?,
+    eof: false,
+  }
+  let t = newTransport(btRead(clientEnd), btWrite(clientEnd), btShutdown(clientEnd))
+  let conn = connect(t, defaultConfig(), 0)?
+  let pre = <- fromEngine
+  if (!h2connBytesEqual(pre.data, []byte(h2connPreface))) {
+    fail newError("the client's first write was not the connection preface")
+  }
+  return (hbWire{ toEngine: toEngine, fromEngine: fromEngine }, conn)
+}
+
+// What a `roundTrip` returned, carried off its own green thread.
+class gaResult { ok: bool, msg: string }
+
+fn gaRoundTrip(conn: Conn, out: chan<gaResult>) {
+  conn.roundTrip(newRequest("GET", "example.com", "/goaway")) catch e {
+    out <- gaResult{ ok: false, msg: e.message() }
+    return
+  }
+  out <- gaResult{ ok: true, msg: "" }
+}
+
+test "a GOAWAY from a peer that stays open answers a parked round trip" {
+  // The reported hang, end to end and at `deadlineNs == 0`: before the fix this
+  // `roundTrip` never returned, and the receive below is the last runnable task
+  // in the test, so the runtime's deadlock detector turns the regression into a
+  // named failure rather than a hang.
+  let (w, conn) = gaConnectOn() catch e {
+    assert(false, "connect failed: ${e.message()}")
+    return
+  }
+  let done = chan<gaResult>(1)
+  spawn gaRoundTrip(conn, done)
+
+  // Wait for the request's HEADERS before answering, so the stream provably
+  // exists: a GOAWAY that arrived first would have `h2connCmdOpen` refuse the
+  // stream with "connection is closing", which is a different path.
+  let opened = false
+  let i = 0
+  while (i < 8 && !opened) {
+    let f = hbNextFrame(w) catch e2 {
+      assert(false, "the client stopped writing before its HEADERS: ${e2.message()}")
+      return
+    }
+    if (f.header.ftype == frameHeaders) {
+      opened = true
+    }
+    i = i + 1
+  }
+  assert(opened, "the client never sent its request")
+
+  // `lastStreamId: 0` — the peer processed nothing — and no close after it.
+  let wire = encodeGoaway(
+    GoawayFrame{ lastStreamId: 0, errorCode: errorInternalError, debugData: []byte(0) },
+  ) catch e3 {
+    assert(false, "encoding the GOAWAY failed: ${e3.message()}")
+    return
+  }
+  w.toEngine <- btChunk{ data: wire, eof: false }
+
+  let res = <- done
+  assert(!res.ok, "a round trip on an unprocessed stream returned a response")
+  assert(res.msg == gaWant(errorInternalError), "roundTrip failed with '${res.msg}'")
+}
