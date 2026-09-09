@@ -779,24 +779,24 @@ than a whole-program table allowed, not coarser.
 and this is proven, not assumed.** `slot_fp_off[num_slots]` above is read by
 exactly two root classes, both walking `gcScanSnapshot`
 (`runtime/gc/stackmap.bit`): the collecting thread's own frames
-(`runtime/stw/stw.bit:765`) and every other STOPPED mutator's published
-frame (`runtime/stw/stw.bit:774`). No other root class reads it —
+(`runtime/stw/stw.bit:437`) and every other STOPPED mutator's published
+frame (`runtime/stw/stw.bit:439`). No other root class reads it —
 `grep -rn '\.slots'` outside `compiler/codegen.bit` (the writer) and this
 file's own reader finds nothing else. Both call sites are shadowed by an
 UNCONDITIONAL conservative scan of the identical stack memory that runs on
 every single collection, in production as well as under `BIT_GC=stress`:
 
-- The collecting thread's own live `sp` (`stwReadSp`, `runtime/stw/stw.bit:545`)
+- The collecting thread's own live `sp` (`stwReadSp`, `runtime/stw/stwscan.bit:144`)
   is read strictly deeper in the call chain than the `SafepointFrame` the
   safepoint shim recorded above, so it is always a lower (or equal) address.
-  Root class 8 (`runtime/stw/stw.bit:712-718`, #1832) lowers that task's
+  Root class 8 (`runtime/stw/stwscan.bit:311-317`, #1832) lowers that task's
   conservative scan bound to this `sp` before the unconditional
-  `stwScanStackRange(g, lo, top)` at `runtime/stw/stw.bit:728` — a range that
+  `stwScanStackRange(g, lo, top)` at `runtime/stw/stwscan.bit:327` — a range that
   is therefore always a superset of every address `gcScanSnapshot`'s
   frame-pointer-chain walk can reach on that same stack (frame pointers only
   grow toward higher addresses, `runtime/gc/stackmap.bit:496-498`).
 - A parked mutator's scan bound is lowered the same way by root class 10
-  (`stwParkedLo`, `runtime/stw/stw.bit:648-662`, #1834) to the exact address
+  (`stwParkedLo`, `runtime/stw/stwscan.bit:247-261`, #1834) to the exact address
   of that mutator's own published `SafepointFrame` — the very address
   `gcScanSnapshot`'s unwind starts from — before the same unconditional
   `stwScanStackRange` call.
@@ -815,7 +815,7 @@ fallback happens to make it redundant for correctness right now, and nothing
 in the codebase currently tests that the slot list is itself correct.
 
 **The REGISTER half is a different story: it is genuinely load-bearing
-(#4111), not shadowed.** `runtime/stw/stw.bit:729-737` skips class 7's ctx
+(#4111), not shadowed.** `runtime/stw/stwscan.bit:328-336` skips class 7's ctx
 scan for the running task, so `gcMarkRoot(g, *(regs + rn))` is, for a
 self-collecting task, the only thing marking a live register directly.
 Mutating `compiler/regalloc.bit`'s `regs = append(regs, loc.index)` to a
@@ -3843,7 +3843,7 @@ them, exists in `runtime/**/*.bit` today:
   `@nosplit` rejects a call through a function value (E0075), so root
   scanning was inverted into a cursor the collector drives instead
   (`chanreg.bit:22-24`). A repo-wide search for `scan_ctx`/`ScanCtx` turns up
-  only the unrelated `stwScanCtx` (`runtime/stw/stw.bit:485`, a saved
+  only the unrelated `stwScanCtx` (`runtime/stw/stwscan.bit:84`, a saved
   register-context walk, not a sentinel).
 - `select_seed_counter` was designed but never built: `runtime/chan/
   chanselect.bit`'s own header says the atomic module-state counter "would
