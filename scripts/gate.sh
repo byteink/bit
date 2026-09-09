@@ -313,174 +313,18 @@ else
   echo "  (none)"
 fi
 
-has_selfhost=0
-has_runtime=0
-has_testcases=0
-has_examples=0
-has_stdlib=0
-has_pkg=0
-has_docs=0
-has_spec=0
-has_testsbit=0
-has_other=0
-has_noop=0
-has_windows=0
-other_list=""
-touched_list=""
-testsbit_list=""
-docs_list=""
-spec_list=""
-noop_list=""
-windows_list=""
-# Space-separated (never comma-joined, unlike docs_list/other_list above,
-# which exist only for human-readable REASON text): stdlib_docs_pairing_ok
-# above word-splits these, so a comma in the string would corrupt the match.
-docs_files=""
-stdlib_files=""
-
-# gates_for_file(), assert_dirgates_current(), testsbit_steps_for(),
-# hunk_is_safe(), is_additive_registration() and stdlib_docs_pairing_ok() are
-# all defined in scripts/gate-filemap.sh, already sourced above (moved there
-# by #3257 and #4234 so --mark-green/--resume can use that module's other
-# helpers before this point too, and so this file has headroom under its own
-# 800-line ceiling); see that file's header for what each does.
-
-while IFS= read -r f; do
-  case "${f}" in
-    # PROSE, CLASSIFIED BY FILE TYPE, NOT JUST PATH PREFIX (#2801). Placed
-    # ahead of the five-bucket matches below because e.g. `runtime/*.md` is a
-    # more specific case of `runtime/*` and must win it: a markdown file
-    # cannot change what any gate compiles or runs.
-    #
-    # docs/**/*.md compiles the code fences inside it (_tests_/bit/docs.bit),
-    # so it gets a REAL bucket, same shape as the five below.
-    docs/*.md)
-      has_docs=1
-      if [ -n "${docs_list}" ]; then
-        docs_list="${docs_list}, ${f}"
-      else
-        docs_list="${f}"
-      fi
-      docs_files="${docs_files:+${docs_files} }${f}"
-      ;;
-    # spec/SPEC.md compiles nothing, but _tests_/bit/spec/ (#2758's
-    # test-spec) DOES read it — a grammar-consistency check, not prose with no
-    # gate — so it gets a REAL bucket too (#2962), matched ahead of the
-    # `spec/*` no-gate arm below the same way docs/*.md is matched ahead of
-    # nothing-reads-this prose. spec/LINT.md and every other spec/* path still
-    # fall through to that arm unchanged.
-    spec/SPEC.md)
-      has_spec=1
-      if [ -n "${spec_list}" ]; then
-        spec_list="${spec_list}, ${f}"
-      else
-        spec_list="${f}"
-      fi
-      ;;
-    # spec/FMT.md IS read by test-fmt-citations (wired into selfhost, #4453).
-    spec/FMT.md) has_selfhost=1 ;;
-    # These paths are pure documentation that no gate reads: runtime/**/*.md
-    # (the runtime CODE bucket below is for runtime/*.bit etc, not prose),
-    # spec/* other than SPEC.md and FMT.md (LINT.md and any future sibling —
-    # checked by no automated gate), bench/**/*.md (bench/**/*.bit and
-    # bench/run.sh still fall through to `full`, unproven output-irrelevant),
-    # and the three standalone READMEs nothing greps.
-    # Deliberately NOT added to has_other or bucket_count — has_noop and
-    # noop_list ARE set below, but mixed with a real bucket the noop path
-    # must be silently ignored, never force `full` and never downgrade the
-    # real bucket (constraint in #2801).
-    runtime/*.md|spec/*|bench/*.md|README.md|CONTRIBUTING.md|dist/README.md)
-      has_noop=1
-      if [ -n "${noop_list}" ]; then
-        noop_list="${noop_list}, ${f}"
-      else
-        noop_list="${f}"
-      fi
-      ;;
-    compiler/*) has_selfhost=1 ;;
-    # A runtime/<pair>/windows/*.bit change ALSO sets has_windows, on top of
-    # (never instead of) has_runtime=1 — the compiler can already cross-build
-    # for x86_64-windows with no hardware (scripts/g2archive.sh), and #4294 had
-    # to verify that by hand for lack of a gate here. This does not replace
-    # test-windows-smoke (_tests_/bit/windowssmoke.bit), which needs the
-    # reachable mustafa-desktop-win host and stays a manual
-    # `./make test-windows-smoke` step — this is compile+link only, run below
-    # via has_windows regardless of which bucket the diff resolves to (#4311).
-    runtime/*/windows/*.bit)
-      has_runtime=1
-      has_windows=1
-      windows_list="${windows_list:+${windows_list}, }${f}"
-      ;;
-    runtime/*) has_runtime=1 ;;
-    _tests_/cases/*) has_testcases=1 ;;
-    examples/*) has_examples=1 ;;
-    stdlib/*)
-      has_stdlib=1
-      stdlib_files="${stdlib_files:+${stdlib_files} }${f}"
-      ;;
-    # First-party packages (#3271) — a leaf by design (bitlang-ws/CLAUDE.md,
-    # "First-party packages"): nothing in the other seven areas ever imports
-    # anything under pkg/, so a pkg/**-only diff can only ever need this
-    # bucket's own steps.
-    pkg/*) has_pkg=1 ;;
-    # _tests_/imports/** joins _tests_/bit/** here (#2825), _tests_/stress/** joins both (#2977), and
-    # tools/build/complexity-debt.txt joins all three (#4556: the E0204 ratchet's DATA file, read only by
-    # test-lint-complexity — every OTHER tools/build/** path still falls to `*)` below and forces full):
-    # each is a path whose gate is known BY NAME, never by path prefix, so they share has_testsbit/
-    # testsbit_list end to end — see gates_for_file() above and the comment ahead of testsbit_steps below.
-    _tests_/bit/*|_tests_/imports/*|_tests_/stress/*|tools/build/complexity-debt.txt)
-      # #4230: a DELETED path that was NEVER mapped to a gate needs no gate
-      # rerun — there is nothing left on disk for any gate to read, so
-      # removing it cannot change any gate's outcome. Existence on disk is
-      # the correct test (not any one diff source's own status letter):
-      # this script's own "the working tree is always included, on top of
-      # the range" rule above already makes the working tree the final
-      # word on what changed, and it applies here identically. A DELETED
-      # path that DOES still resolve via gates_for_file() (e.g. one file
-      # removed from a directory-mapped fixture dir, whose mapping is by
-      # directory prefix, not by the individual file) is NOT exempted —
-      # it falls through to the normal testsbit_list path below exactly as
-      # before, so that gate still reruns.
-      if [ ! -e "${f}" ] && [ -z "$(gates_for_file "${f}")" ]; then
-        has_noop=1
-        if [ -n "${noop_list}" ]; then
-          noop_list="${noop_list}, ${f}"
-        else
-          noop_list="${f}"
-        fi
-      else
-        has_testsbit=1
-        if [ -n "${testsbit_list}" ]; then
-          testsbit_list="${testsbit_list} ${f}"
-        else
-          testsbit_list="${f}"
-        fi
-      fi
-      ;;
-    tools/build/defs.bit|tools/build/gates.bit|tools/build/gatestable2.bit)
-      if is_additive_registration "${f}"; then
-        :
-      else
-        has_other=1
-        if [ -n "${other_list}" ]; then
-          other_list="${other_list}, ${f}"
-        else
-          other_list="${f}"
-        fi
-      fi
-      ;;
-    *)
-      has_other=1
-      if [ -n "${other_list}" ]; then
-        other_list="${other_list}, ${f}"
-      else
-        other_list="${f}"
-      fi
-      ;;
-  esac
-done <<EOF
-${CHANGED}
-EOF
+# The per-file diff-classification loop — the has_*/*_list accumulators and the
+# `case` that fills them from ${CHANGED} — is a separate sourced module
+# (#4614), see scripts/gate-classify.sh's own header. It used to be spelled out
+# right here, and moved out because this file hit 800/800 (the hard-zero
+# ceiling in _tests_/bit/shellsize.bit, #4232) with 406 of those lines being
+# comment, so the next `case` arm could only be bought by cutting reasoning.
+# Sourced HERE, at the point that block used to sit, and called immediately, so
+# the globals it sets are in place for the bucket_count arithmetic below in the
+# same order as before. It defines a function and runs nothing at source time.
+# shellcheck source=scripts/gate-classify.sh
+. scripts/gate-classify.sh
+classify_changed_files
 
 if [ "${has_selfhost}" -eq 1 ]; then touched_list="selfhost"; fi
 if [ "${has_runtime}" -eq 1 ]; then
