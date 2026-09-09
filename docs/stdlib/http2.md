@@ -677,6 +677,18 @@ accepts), `headerTableSize` (its HPACK dynamic-table bound), and
 `maxHeaderListBytes` (SETTINGS_MAX_HEADER_LIST_SIZE) - plus `maxBodyBytes`, the
 one local limit that is not a SETTINGS parameter. All five fields are exported.
 
+`initialWindowSize` is the receive window granted to each stream; the
+connection's own window starts at the RFC's fixed 65535 and is not configurable.
+Both are accounted rather than merely advertised: a DATA frame spends the credit
+it uses when the frame is counted, and the credit comes back on the
+WINDOW_UPDATE that renews it, so a peer sending past the credit it holds fails
+the connection with GOAWAY carrying `errorFlowControlError` (RFC 9113 §6.9.1).
+A conforming peer never reaches that ceiling, because the engine buffers the
+whole body and so renews the credit as the DATA lands. The one exception is a
+body refused by `maxBodyBytes` below: nothing is renewed for a frame that was
+not accepted, so those bytes stay spent on the connection window - on our books
+and on the peer's alike.
+
 `maxHeaderListBytes` is the largest header block the connection will accumulate
 across a HEADERS frame and every CONTINUATION continuing it. `maxFrameSize`
 bounds each *frame* and says nothing about their sum, so without this a peer
