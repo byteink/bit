@@ -20,6 +20,21 @@
 // 65535-byte initial connection window, so it can only complete through repeated
 // WINDOW_UPDATEs) and by `events.test.bit`'s 20000-byte one. A fix that spent
 // the window and failed to renew it would hang both.
+//
+// Since #4621 the connection window is renewed for EVERY DATA frame the engine
+// counts, including the two whose bytes it drops (a body over `maxBodyBytes`, a
+// frame for a stream that is closed or gone), so it is back at its full value
+// before the next frame is read. That is what makes the last two tests below
+// possible and what makes a running total across frames impossible: this engine
+// buffers whole bodies and therefore grants the credit back on arrival, so the
+// connection-level check is a per-frame ceiling — the two boundary tests above
+// are its whole reachable surface. A running total needs the WINDOW_UPDATE
+// deferred until the body is handed to the application, which is real
+// backpressure and a different engine (#4624).
+//
+// The queue walks below (`fcGoawayCode`, `fcConnCredit`) TAKE the frames off
+// `writeCh`. At most one may be called per test, and any assertion after it
+// reads an empty queue and passes vacuously.
 
 // --- a state whose windows are small enough to reason about --------------------
 
@@ -151,20 +166,56 @@ test "the DATA that ends a stream spends its window and is not renewed" {
   assert(!a.stop, "the request was not delivered")
 }
 
-// --- the running total across frames -------------------------------------------
+// --- credit for the bytes the engine drops -------------------------------------
 
-// Spend `count` frames of `n` bytes that the body budget refuses, without
-// renewing the connection window for any of them: an over-budget frame is reset
-// before `h2connReplenishWindows` runs (#4590), so the credit the peer spent on
-// it is gone on our books exactly as it is on the peer's. Each frame goes to its
-// own stream because the first one resets the stream it lands on. Returns the
-// ids used so a caller can open the next one.
+// The connection-level WINDOW_UPDATE credit in one queued writer message:
+// increments granted on stream 0, and nothing for anything else — a RST_STREAM,
+// a stream-level WINDOW_UPDATE and a `stop` all carry no connection credit.
+fn fcConnCreditIn(out: h2connOut): int {
+  if (out.stop) {
+    return 0
+  }
+  let f = readFrame(out.data, maxMaxFrameSize) catch _ {
+    return 0
+  }
+  let wu = decodeWindowUpdate(f) catch _ {
+    return 0
+  }
+  if (wu.streamId != 0) {
+    return 0
+  }
+  return wu.increment
+}
+
+// The total connection credit the loop granted the peer, across everything it
+// queued for the writer. Like `fcGoawayCode` the receive is non-blocking, so it
+// is an assertion about the queue and never a wait that would hang a failing
+// test, and the walk is bounded by `writeCh`'s own capacity.
 //
-// This is the only path in the engine that accepts a DATA frame against the
-// window and does NOT hand the credit back, which is what makes a running total
-// observable at all — everything else replenishes on arrival because it buffers
-// the whole body.
-fn fcDrain(st: h2connState, count: int, n: int): ()! {
+// The peer's book is the one that binds: it is our WINDOW_UPDATE, not our own
+// `connRecvWindow`, that lets a peer send again after we discard a frame, so a
+// fix that only kept our number right would pass on `connRecvWindow` alone and
+// still stall the connection.
+fn fcConnCredit(st: h2connState): int {
+  let total = 0
+  let i = 0
+  while (i < 64) {
+    i = i + 1
+    select {
+      case out = <- st.writeCh:
+        total = total + fcConnCreditIn(out)
+      default:
+        return total
+    }
+  }
+  return total
+}
+
+// Send `count` DATA frames of `n` bytes each, every one over the body budget, so
+// every one is refused by `h2connBodyBudgetOk` (#4590) and its bytes dropped.
+// Each goes to a stream of its own because the refusal resets the stream it
+// lands on and the reset releases it from the table (#4594).
+fn fcRefuseBodies(st: h2connState, count: int, n: int): ()! {
   let i = 0
   while (i < count) {
     let id = 1 + 2 * i
@@ -179,50 +230,76 @@ fn fcDrain(st: h2connState, count: int, n: int): ()! {
   }
 }
 
-test "the connection receive window is a running total, not a per-frame cap" {
-  // 350 bytes of connection credit, spent 150 at a time by two bodies the budget
-  // refuses, leaves 50. The 60-byte frame that follows is under the 100-byte body
-  // budget — so the budget cannot be what refuses it — and over the credit that
-  // is left, with no WINDOW_UPDATE in between. Each frame on its own is legal;
-  // only the accumulation crosses the window, which is exactly what a per-frame
-  // cap like `maxFrameSize` cannot see.
-  let st = fcState(350, 1048576, 100)
-  fcDrain(st, 2, 150) catch e {
-    assert(false, "draining the connection window failed: ${e.message()}")
+test "four refused bodies leave the whole connection receive window (#4621)" {
+  // The stall, at the numbers that produce it: the RFC's fixed 65535-byte
+  // connection window and the default 16384-byte frame size, where four refused
+  // frames are 65536 bytes — one more than the window holds. Until the credit
+  // for a discarded frame was handed back, the fourth upload took the window to
+  // zero for good and every stream on the connection stalled: not because of
+  // our own number, but because the peer's send window stays down until a
+  // WINDOW_UPDATE we never sent.
+  assert(
+    4 * defaultMaxFrameSize > 65535,
+    "four frames of ${defaultMaxFrameSize} no longer exceed the 65535-byte connection window",
+  )
+  let st = fcState(65535, 1048576, 100)
+  fcRefuseBodies(st, 4, defaultMaxFrameSize) catch e {
+    assert(false, "refusing four over-budget bodies failed: ${e.message()}")
     return
   }
-  assert(st.connRecvWindow == 50, "connRecvWindow = ${st.connRecvWindow} after the drain, want 50")
-  let s = btOpenStream(st, 5, h2connDummyReply())
-  fcSendData(st, 5, 60, false) catch e2 {
+  assert(st.running, "four refused bodies terminated the connection")
+  assert(
+    st.connRecvWindow == 65535,
+    "connRecvWindow = ${st.connRecvWindow} after four refusals, want 65535",
+  )
+  // Our own number is only half of it: the peer is still holding a send window
+  // short by 65536 bytes unless we granted every one of them back.
+  let credit = fcConnCredit(st)
+  assert(
+    credit == 4 * defaultMaxFrameSize,
+    "the peer was granted ${credit} bytes of connection credit, want ${4 * defaultMaxFrameSize}",
+  )
+  // And the connection still carries traffic: a body of exactly the budget on a
+  // fresh stream, which is refused by nothing.
+  let s = btOpenStream(st, 9, h2connDummyReply())
+  fcSendData(st, 9, 100, false) catch e2 {
     assert(false, "building the DATA frame failed: ${e2.message()}")
     return
   }
-  assert(len(s.recvBody) == 0, "recvBody = ${len(s.recvBody)} bytes, want 0")
+  assert(st.running, "a legal DATA frame after four refusals terminated the connection")
+  assert(!s.reset, "a legal DATA frame after four refusals was reset")
+  assert(len(s.recvBody) == 100, "recvBody = ${len(s.recvBody)} bytes, want 100")
+  assert(fcGoawayCode(st) == 0 - 1, "a GOAWAY was queued for a frame within the window")
   assert(
-    fcGoawayCode(st) == errorFlowControlError,
-    "no GOAWAY carrying ${errorFlowControlError} (FLOW_CONTROL_ERROR) was queued",
+    st.connRecvWindow == 65535,
+    "connRecvWindow = ${st.connRecvWindow} after the accepted frame, want 65535",
   )
-  assert(!st.running, "the connection is still running after a flow-control error")
 }
 
-test "a running total exactly at the connection receive window is accepted" {
-  // The other side of the same boundary and the control on the test above: the
-  // same drain, and a frame of exactly the 50 bytes left. It must be accepted,
-  // so a fix that spent the window twice, or spent it and never renewed it,
-  // fails here rather than passing everything by refusing everything.
-  let st = fcState(350, 1048576, 100)
-  fcDrain(st, 2, 150) catch e {
-    assert(false, "draining the connection window failed: ${e.message()}")
+test "DATA for a stream that is gone is counted and its credit handed back" {
+  // The other discard path. No stream is opened: after #4594 a released stream
+  // and a never-created one are the same thing to `h2connDataStreamOk`, which
+  // reports STREAM_CLOSED for both — so this is exactly the state a stream we
+  // reset a moment ago leaves behind, and DATA still in flight for it lands
+  // here. RFC 9113 §5.1 counts those bytes against the connection window even
+  // though they are dropped, so the frame is spent and renewed in one act:
+  // `connRecvWindow` ends where it started and the peer is granted the credit.
+  //
+  // The stream window is deliberately not renewed on this path and cannot be —
+  // there is no stream to renew, and a WINDOW_UPDATE on a dead id grants credit
+  // nobody can spend.
+  let st = fcState(65535, 1048576, 1048576)
+  assert(st.present[1] == 0, "stream 1 exists before the test has opened one")
+  fcSendData(st, 1, 100, false) catch e {
+    assert(false, "building the DATA frame failed: ${e.message()}")
     return
   }
-  let s = btOpenStream(st, 5, h2connDummyReply())
-  fcSendData(st, 5, 50, false) catch e2 {
-    assert(false, "building the DATA frame failed: ${e2.message()}")
-    return
-  }
-  assert(st.running, "a frame exactly at the remaining window terminated the connection")
-  assert(!s.reset, "a frame exactly at the remaining window reset the stream")
-  assert(len(s.recvBody) == 50, "recvBody = ${len(s.recvBody)} bytes, want 50")
-  assert(fcGoawayCode(st) == 0 - 1, "a GOAWAY was queued for a frame within the window")
-  assert(st.connRecvWindow == 50, "connRecvWindow = ${st.connRecvWindow} after renewal, want 50")
+  assert(st.running, "a DATA frame for a stream that is gone terminated the connection")
+  assert(st.present[1] == 0, "the discarded frame created stream 1")
+  assert(
+    st.connRecvWindow == 65535,
+    "connRecvWindow = ${st.connRecvWindow} after the discard, want 65535 — unchanged",
+  )
+  let credit = fcConnCredit(st)
+  assert(credit == 100, "the peer was granted ${credit} bytes of connection credit, want 100")
 }

@@ -684,10 +684,23 @@ it uses when the frame is counted, and the credit comes back on the
 WINDOW_UPDATE that renews it, so a peer sending past the credit it holds fails
 the connection with GOAWAY carrying `errorFlowControlError` (RFC 9113 §6.9.1).
 A conforming peer never reaches that ceiling, because the engine buffers the
-whole body and so renews the credit as the DATA lands. The one exception is a
-body refused by `maxBodyBytes` below: nothing is renewed for a frame that was
-not accepted, so those bytes stay spent on the connection window - on our books
-and on the peer's alike.
+whole body and so renews the credit as the DATA lands.
+
+The connection window is renewed for every DATA frame the connection counts,
+including the two whose bytes it drops: a body refused by `maxBodyBytes` below,
+and a frame for a stream that is already closed or has been released. Those
+bytes are counted (RFC 9113 §5.1 puts DATA for a closed stream under the
+connection window like any other) and granted straight back, because the peer's
+own send window stays down until our WINDOW_UPDATE arrives - so a discard that
+kept the credit would stall every stream on the connection, four refused bodies
+at the default 16384-byte frame size being enough to consume all 65535 bytes of
+it. Only the connection window: the stream is being reset or is gone, and a
+WINDOW_UPDATE on it would grant credit nobody can spend.
+
+Because the credit for a frame is granted in the same act that spends it, the
+connection window is a per-frame ceiling in practice rather than a running
+total. Bounding what a peer may upload is `maxBodyBytes`' job, not flow
+control's.
 
 `maxHeaderListBytes` is the largest header block the connection will accumulate
 across a HEADERS frame and every CONTINUATION continuing it. `maxFrameSize`
