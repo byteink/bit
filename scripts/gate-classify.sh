@@ -64,8 +64,8 @@ spec_list=""
 noop_list=""
 windows_list=""
 # Space-separated (never comma-joined, unlike docs_list/other_list above,
-# which exist only for human-readable REASON text): stdlib_docs_pairing_ok
-# above word-splits these, so a comma in the string would corrupt the match.
+# which exist only for human-readable REASON text): stdlib_docs_pairing_ok in
+# scripts/gate-diffclass.sh word-splits these, so a comma in the string would corrupt the match.
 docs_files=""
 stdlib_files=""
 
@@ -158,7 +158,8 @@ while IFS= read -r f; do
     # tools/build/complexity-debt.txt joins all three (#4556: the E0204 ratchet's DATA file, read only by
     # test-lint-complexity — every OTHER tools/build/** path still falls to `*)` below and forces full):
     # each is a path whose gate is known BY NAME, never by path prefix, so they share has_testsbit/
-    # testsbit_list end to end — see gates_for_file() above and the comment ahead of testsbit_steps below.
+    # testsbit_list end to end — see gates_for_file() in scripts/gate-filemap.sh and the comment
+    # ahead of testsbit_steps in scripts/gate.sh.
     _tests_/bit/*|_tests_/imports/*|_tests_/stress/*|tools/build/complexity-debt.txt)
       # #4230: a DELETED path that was NEVER mapped to a gate needs no gate
       # rerun — there is nothing left on disk for any gate to read, so
