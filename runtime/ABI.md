@@ -2128,7 +2128,7 @@ defined exactly once).
 | `bit_rt_fs_rename`    | `(oldPath: *const RtBytes, newPath: *const RtBytes) -> i64` (§14) |
 | `bit_rt_fs_chmod`     | `(path: *const RtBytes, mode: i64) -> i64` (§14, sets `path`'s permission bits to `mode`; `0`, or `-1` on any error. Darwin calls libc `chmod`, Linux the raw `chmod`/`fchmodat(AT_FDCWD, ...)` syscall. Its contract lives only in the provider comments in `runtime/root/{darwin,linux,windows}/fs.bit` — §14's own prose block omits it) |
 | `bit_rt_fs_list_dir`  | `(path: *const RtBytes) -> *const RtBytes` (§14)        |
-| `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not NUL-terminated, not `RtBytes`; the only `bit_rt_fs_*` entry point shaped this way) |
+| `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not NUL-terminated, not `RtBytes`; the FIRST entry point shaped this way (#2152) and now the family's convention — seven `bit_rt_fs_*_w` symbols share it, five carrying a path (this, `bit_rt_fs_open_rw_w`, `bit_rt_fs_stat_w`, `bit_rt_fs_lstat_w`, `bit_rt_fs_sync_dir_w`) and two a data buffer (`bit_rt_fs_pread_w`/`bit_rt_fs_pwrite_w`)) |
 | `bit_rt_fs_sync`      | `(fd: i64) -> i64` (§14, `0` on success, `-1` on failure; Darwin uses `F_FULLFSYNC`, falling back to bare `fsync` only on `ENOTSUP` — bare `fsync` alone does not flush the drive's write cache on that platform) |
 | `bit_rt_fs_truncate`  | `(fd: i64, size: i64) -> i64` (§14, #4016, sets `fd`'s length; `0`, or negative on any failure. Never moves the fd's own cursor, matching `bit_rt_fs_pread_w`/`bit_rt_fs_pwrite_w`; growing leaves a HOLE rather than reserving blocks, so a later write can still fail `ENOSPC`, and the new length is not durable until `bit_rt_fs_sync`) |
 | `bit_rt_fs_size`      | `(fd: i64) -> i64` (§14, #4016, `fd`'s length in bytes, or negative on any failure; `fstat` on Darwin/Linux, `GetFileSizeEx` on Windows) |
@@ -2758,9 +2758,10 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   Pass 2 (a `syncDir(path)` function in `stdlib/fs/fs.bit`) is a follow-up
   ticket, gated on a release containing this commit and a stage0 repin to
   it.
-- `fs_cwd` (#3501) is the only `bit_rt_fs_*` entry point that takes NO
-  argument — nothing to encode through `fsPathZ`/`checkedPathW`. Darwin and
-  Linux both call `getcwd` (libc on Darwin, the raw syscall on Linux — kernel
+- `fs_cwd` (#3501) takes NO argument — nothing to encode through
+  `fsPathZ`/`checkedPathW`. It shares that with `fs_read_all_failed` above,
+  the family's only other zero-argument entry point. Darwin and Linux both
+  call `getcwd` (libc on Darwin, the raw syscall on Linux — kernel
   `fs/d_path.c`'s `SYSCALL_DEFINE2(getcwd, ...)` returns the byte count
   INCLUDING the trailing NUL on success, unlike a `read`, so the wrapper trims
   one byte off), sized to `max_path` (4096) and rejected — never truncated —
@@ -2792,18 +2793,19 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   reports present; only `ENOENT`/`ENOTDIR` mean genuinely absent (#2114).
   `is_dir` is the one that actually distinguishes a directory: Darwin's
   `opendir` succeeding, Linux's `getdents64` succeeding on the opened fd.
-- `is_symlink_w` is the only `bit_rt_fs_*` entry point that does not take a Bit
-  `string`. Its caller is `std/fs`, which can reach a runtime symbol only
-  through an `extern function` (SPEC §11.7), and §11.7 admits no `string`
-  across that boundary — so `words` is the raw backing store of a Bit
-  `[]byte` instead, `n` **packed** bytes (§2, #3121/#3226), not NUL-terminated
-  and not an `RtBytes`. The provider copies those bytes into its own
-  NUL-terminated buffer before probing it, applying the same `max_path` and
-  embedded-NUL rejections every other path-taking entry point applies
-  (#2146). It answers with `readlink`, not `lstat` + `S_IFLNK`: `readlink`
-  succeeds only on a symbolic link and needs no POSIX `stat` structure layout, so a
-  dangling link still answers `true` — the link exists whether its target
-  does or not.
+- `is_symlink_w` was the FIRST path-taking `bit_rt_fs_*` entry point to drop
+  the Bit `string` argument (#2152); `open_rw_w`, `stat_w`, `lstat_w` and
+  `sync_dir_w` have since followed it. Its caller is `std/fs`, which can reach
+  a runtime symbol only through an `extern function` (SPEC §11.7), and §11.7
+  admits no `string` across that boundary — so `words` is the raw backing
+  store of a Bit `[]byte` instead, `n` **packed** bytes (§2, #3121/#3226), not
+  NUL-terminated and not an `RtBytes`. The provider copies those bytes into
+  its own NUL-terminated buffer before probing it, applying the same
+  `max_path` and embedded-NUL rejections every other path-taking entry point
+  applies (#2146). It answers with `readlink`, not `lstat` + `S_IFLNK`:
+  `readlink` succeeds only on a symbolic link and needs no POSIX `stat`
+  structure layout, so a dangling link still answers `true` — the link exists
+  whether its target does or not.
 - `stat_w`/`lstat_w` (#2153) share `is_symlink_w`'s `words`/`n` path
   encoding, for the identical reason — a `std/fs` caller can reach them only
   through `extern fn`, which admits no `string` (SPEC §11.7). `out` is a
