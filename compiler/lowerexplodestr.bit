@@ -226,6 +226,36 @@ fn localWordTypes(fc: FnCtx, ty: int): []int {
 // produce for a `string`-typed value because `string` is a prim whose layout is
 // one pointer — so the two constructors are named here, once, rather than each
 // caller asking which shape it holds.
+// #4628 LEAVES THIS ALONE, and the reason is measured rather than assumed —
+// the ticket's own reason for the rule ("a local's word 2 is the owner base,
+// where the test can never match") is wrong once word 2 carries the
+// originating handle, but the rule is right anyway.
+//
+// `localRead` is not a handle escape. It is also how a WORD consumer reads an
+// exploded local: `len(a)` materializes the aggregate and takes `slice_len` of
+// it, and `explodeCallArgs` materializes it and reads the three words straight
+// back out, both in the same block, where store-to-load forwarding answers
+// them from the `field_set`s and dead-allocation elimination takes the box. A
+// reuse diamond hands those consumers a BLOCK PARAMETER instead, which
+// forwarding cannot cross, so the box on the failing arm survives every
+// crossing. Measured on this branch, `BIT_GC_STATS=1` swept+live:
+//
+//   diamond at every exploded local   strings flip-on 37 -> 7,125,035
+//                                     json flip-on 6,000,063 -> 8,550,065
+//   diamond only where word 2 is a    retscan 6 -> 18, and the post-opt IR
+//   call result                       says why: `%33 = slice_len %32`, on the
+//                                     join parameter, not on word 1
+//
+// So the diamond goes only where the aggregate provably escapes as a handle —
+// a `ret` — and `retHandleFor` and `emitTrampolineRet` are the two of those.
+// The shape this leaves unfixed is `let k = f(); obj.field = k`, a genuine
+// handle escape the lowerer reaches through this same shared path.
+// `_tests_/bit/stringexplode`'s `plainretfielddirect` covers it as a
+// DIFFERENTIAL (it is byte-identical in both arms) and it still reads 1017
+// objects gate-off against 2017 gate-on, measured by hand rather than gated,
+// because no honest parity arm can be written for a shape this change does not
+// fix. It wants the rewrite done on a box the optimizer has already declined
+// to delete, which is not a lowering-time decision.
 fn materializeExplodedLocal(fc: FnCtx, ty: int, vals: []int): int {
   return materializeExplodedIn(fc, fc.b, ty, vals)
 }
@@ -301,4 +331,258 @@ fn isFreshBox(b: IrBuilder, v: int): bool {
     return false
   }
   return b.instrs[v].op == Op.GcAlloc
+}
+
+// Whether `v` is a word of a CALL's result (#4405's `Op.CallWord` run).
+//
+// This is the ONE provenance under which word 2 can be the callee's
+// originating handle rather than an owner base: `explodedRetWordValues` puts
+// the handle there, and only a `ret` produces it. Every other exploded
+// aggregate's word 2 — `emitInlineStringSlice`'s box for `s[lo:hi]`, an
+// exploded parameter's incoming base word, a block parameter threaded through
+// a loop — is a base, where the reuse test can never match.
+//
+// Structural and bounds-guarded like `isFreshBox`, and it can only
+// UNDER-report: a false answer keeps today's IR exactly.
+fn isCallResultWord(b: IrBuilder, v: int): bool {
+  if (v < 0 || v >= len(b.instrs)) {
+    return false
+  }
+  if (b.instrs[v].op == Op.CallWord) {
+    return true
+  }
+  // #4586's local explosion reads the words back OUT of the call-site box, so
+  // in a `let k = f()` binding word 2 is `field_get <that box>[16]` at
+  // lowering time and only becomes the `Op.CallWord` once store-to-load
+  // forwarding has run. Reading through the box here is what lets the
+  // predicate answer the same question at both points; without it
+  // `plainretfield` stays at 1017 objects gate-off / 2017 gate-on, measured.
+  if (b.instrs[v].op != Op.FieldGet || b.instrs[v].ival != strViewBaseOffset()) {
+    return false
+  }
+  let ws = freshStringBoxWords(b, b.instrs[v].lhs)
+  if (len(ws) != 3) {
+    return false
+  }
+  return b.instrs[ws[2]].op == Op.CallWord
+}
+
+// ===========================================================================
+// #4628: A CALL RESULT'S WORD 2 IS THE ORIGINATING HANDLE, AND THE REBUILD
+// REUSES IT WHEN ITS OWN `ptr`/`len` MATCH.
+//
+// THE SOUNDNESS ARGUMENT, and it rests on one language property. A `string` is
+// IMMUTABLE (SPEC §5.3): no operation writes through a handle, so the bytes a
+// handle denotes are fixed for its lifetime. A handle `h` whose OWN `ptr` and
+// `len` equal the words `{w0, w1}` therefore denotes exactly the bytes
+// `{w0, w1}` denote — the same address, the same length, and no writer that
+// could make the two disagree later. The aggregate the caller was about to
+// build would have held `{w0, w1, w2}`; `h` IS `{w0, w1, h.base}`. Only `base`
+// can differ, and `base` is not part of the value: it exists solely to keep
+// the backing allocation alive (`strInitView`, runtime/root/root.bit), and
+// `h`'s own `base` roots `h.ptr` by construction because `h` is a live view of
+// it. So the reuse is correct WHATEVER word 2's provenance was, which is why
+// the test is dynamic rather than a claim about where word 2 came from.
+//
+// This is why the test cannot be dropped, measured rather than argued: #4619
+// built the guardless form and it MISCOMPILED. `let a = src[2:6]; b.f = a` has
+// word 2 the OWNER BASE, not a handle denoting those four bytes, and reusing
+// it printed `abcdefghij 30` where the answer is `cdef 12`; `bench/cases/json`
+// produced md5 `cc08f932` against the correct `58d3db22`, and
+// `bench/cases/strings` did not terminate. The `ptr`/`len` test is what
+// separates the two cases, and it separates them by VALUE rather than by
+// provenance.
+//
+// THE NULL ARM IS SEPARATE AND DELIBERATE. `field_get` on a header base reads
+// a null base as 0 (`emitHeaderWordOrZero`, arm64selectmem.bit), so without
+// the `!= nil` test a null word 2 would compare equal to a `{0, 0}` pair and
+// the reuse would hand back a null handle where a real header is expected.
+// Guarding it costs one `cbz` and makes the emitted IR independent of whether
+// a backend null-guards that load at all.
+// ===========================================================================
+
+// The values a `return` hands back for a result of type `ty` occupying
+// `words`, given the whole aggregate `v`.
+//
+// For a `string` this is `{v.ptr, v.len, v}` — word 2 is the RETURNED HANDLE
+// itself rather than `field_get v[16]`. `v` is a legal `base`: `strInitView`
+// (runtime/root/root.bit) stores the IMMEDIATE SOURCE and never `base(src)`,
+// and `emitInlineStringSlice` (lowerreslice.bit) already stores the receiver
+// HANDLE when the receiver is one (`strRecvBase`). So this makes the exploded
+// path's word 2 agree with what the handle path already stores rather than
+// introducing a second convention — and rooting is unchanged in kind and in
+// count, still exactly one traced word: `v` roots itself and `v.base` roots
+// the bytes the interior `ptr` points into, one hop further out.
+//
+// THE FRESH-BOX GUARD IS LOAD BEARING. A box this lowerer has just emitted —
+// `emitInlineStringSlice`'s, for `return s[lo:hi]` — is removable precisely
+// because nothing but its own `field_set`s names it. Putting it in word 2
+// makes it ESCAPE into a return register, so dead-allocation elimination can
+// no longer take it and #4422's win is undone on every function returning a
+// reslice. `isFreshBox` keeps that box dead; the caller's test then fails and
+// the caller allocates exactly as it does today.
+//
+// The type is the authority, not the word list. `explodedWordTypes` gives a
+// tuple `(i64, i64, string)` the SAME three word types a `string` gets, so a
+// rule keyed on `words[2] == string` would put the tuple's own handle in its
+// third word and hand callers a `string` that is really the tuple — #4412's
+// shape. `ty` is what `explodedRetWords` derived the words from.
+fn explodedRetWordValues(fc: FnCtx, ty: int, v: int, words: []int): []int {
+  if (ty != primType(fc.c.ctx, 11) || len(words) != 3 || isFreshBox(fc.b, v)) {
+    return emitWordReads(fc.c.ctx, fc.b, v, words)
+  }
+  let ids = emitWordReads(fc.c.ctx, fc.b, v, [words[0], words[1]])
+  return [ids[0], ids[1], v]
+}
+
+// `field_get handle[off] == word`, as a bool.
+fn emitWordMatches(fc: FnCtx, b: IrBuilder, handle: int, off: int, word: int): int {
+  let fg = mkInstr(Op.FieldGet, primType(fc.c.ctx, 3))
+  fg.lhs = handle
+  fg.ival = off
+  let eq = mkInstr(Op.ICmpEq, primType(fc.c.ctx, 10))
+  eq.lhs = builderEmit(b, fg)
+  eq.rhs = word
+  return builderEmit(b, eq)
+}
+
+// Ends the current block with `br cond -> yes() : no()`; neither edge carries a
+// block argument.
+fn emitWordTestBr(fc: FnCtx, b: IrBuilder, cond: int, yes: int, no: int) {
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = cond
+  br.ival = yes
+  br.thenArgs = []int(0)
+  br.ival2 = no
+  br.elseArgs = []int(0)
+  builderEmit(b, br)
+  builderEndBlock(b)
+}
+
+// Emits the three-test chain and leaves every failing edge at `box`. The last
+// test's success edge is the only one carrying a block argument — the handle
+// itself, which is the whole point — so it is written here rather than through
+// `emitWordTestBr`.
+fn emitHandleReuseChain(fc: FnCtx, b: IrBuilder, vals: []int, box: int, join: int) {
+  let ptrBlk = builderNewBlock(b)
+  let lenBlk = builderNewBlock(b)
+  let nl = mkInstr(Op.ConstNil, primType(fc.c.ctx, 11))
+  let ne = mkInstr(Op.ICmpNe, primType(fc.c.ctx, 10))
+  ne.lhs = vals[2]
+  ne.rhs = builderEmit(b, nl)
+  emitWordTestBr(fc, b, builderEmit(b, ne), ptrBlk, box)
+  builderBeginBlock(b, ptrBlk)
+  emitWordTestBr(fc, b, emitWordMatches(fc, b, vals[2], 0, vals[0]), lenBlk, box)
+  builderBeginBlock(b, lenBlk)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = emitWordMatches(fc, b, vals[2], 8, vals[1])
+  br.ival = join
+  br.thenArgs = [vals[2]]
+  br.ival2 = box
+  br.elseArgs = []int(0)
+  builderEmit(b, br)
+  builderEndBlock(b)
+}
+
+// Materializes the aggregate a use that wants a WHOLE HANDLE needs, reusing
+// word 2 when it already denotes these bytes.
+//
+// THIS IS A DEMAND POINT AND `emitResolvedCall` IS NOT ONE — measured, on
+// `7dd3f6c7`, which wired the diamond where #4628 specified it. A call result
+// is not yet known to need a handle: #4586's `stringLetExplodes` explodes a
+// `string` local only when its initializer is `Op.GcAlloc`, so putting a
+// diamond at the call turns every `let a = f()` into a `BlockParam`, the local
+// stops exploding, and the box on the FAILING arm runs whether or not anything
+// reads the join. `_tests_/bit/stringexplode`'s `retscan` probe went 6 objects
+// gate-on to 18 — #4424's whole win on that shape — while `bench/cases/json`
+// went 6,000,063 to 5,400,067. No widening of the predicate recovers it,
+// because the allocation is conditional on the TEST, not on the USE.
+//
+// So the call site keeps emitting the plain box it always did, which the
+// optimizer still deletes wherever the consumer wants words, and the diamond
+// is emitted only where a handle is actually demanded: reading an exploded
+// local (`materializeExplodedLocal`), the fn-value trampoline's `ret`
+// (`emitTrampolineRet`, lowerglobal.bit) and a one-handle `ret`
+// (`retHandleFor` below). Where the consumer wants words there is no diamond
+// at all, so this cannot cost what it cannot reach.
+fn materializeExplodedHandle(fc: FnCtx, b: IrBuilder, ty: int, vals: []int): int {
+  if (ty != primType(fc.c.ctx, 11) || len(vals) != 3) {
+    return materializeExplodedIn(fc, b, ty, vals)
+  }
+  let box = builderNewBlock(b)
+  let join = builderNewBlock(b)
+  emitHandleReuseChain(fc, b, vals, box, join)
+  builderBeginBlock(b, box)
+  let jmp = mkInstr(Op.Jump, fc.c.ctx.voidId)
+  jmp.ival = join
+  jmp.args = [boxStringWords(fc.c.ctx, b, vals[0], vals[1], vals[2])]
+  builderEmit(b, jmp)
+  builderEndBlock(b)
+  builderBeginBlock(b, join)
+  return builderAddParam(b, ty)
+}
+
+// The three word values a `string` box `boxStringWords` built was given, or an
+// EMPTY list when `v` is not that shape.
+//
+// Read off the box's own `field_set`s rather than re-loaded with `field_get`s,
+// so nothing downstream depends on store-to-load forwarding having run: the
+// caller that uses these leaves the box named by nothing, and ordinary
+// dead-allocation elimination takes it. A structural test on an already-built
+// value, bounds-guarded the way `isFreshBox` is, and it can only UNDER-report —
+// an unrecognised shape keeps today's IR exactly.
+fn freshStringBoxWords(b: IrBuilder, v: int): []int {
+  if (!isFreshBox(b, v) || b.instrs[v].ival != strViewHeaderSize() || v + 3 >= len(b.instrs)) {
+    return []int(0)
+  }
+  let out = []int(0)
+  let k = 1
+  while (k < 4) {
+    let ins = b.instrs[v + k]
+    if (ins.op != Op.FieldSet || ins.lhs != v || ins.ival != (k - 1) * 8) {
+      return []int(0)
+    }
+    out = append(out, ins.rhs)
+    k = k + 1
+  }
+  return out
+}
+
+// The value a ONE-HANDLE `ret` hands back.
+//
+// A box whose word 2 is an `Op.CallWord` is a `return f()` pass-through:
+// `emitResolvedCall` rebuilt the callee's three return registers into an
+// aggregate that now escapes into a return register, so it is a genuine handle
+// demand and it is where `bench/cases/json`'s remaining crossings are.
+// `decodeObjectKey` (stdlib/json/parse.bit) is exactly that shape — `return
+// internKey(p, start, end)` from a `string!` body, whose fallible result keeps
+// the one-handle convention — and it is 600,000 of the 600,002 boxes #4619
+// priced at 759.8 instructions each. The box is dropped, its three words go
+// through the reuse test instead, and the only allocation left is the one on
+// the failing arm.
+//
+// THREE GUARDS, and each one is a measured requirement rather than a
+// precaution. Measured on `7dd3f6c7` + the first placement of this function,
+// `BIT_GC_STATS=1` swept+live:
+//
+//   - `fc.lowerer.explodeStrings`. Without it this fires with the flip OFF,
+//     where `emitInlineStringSlice`'s box for `return s[lo:hi]` is also a
+//     fresh `string` box: `bench/cases/json` flip-OFF moved 5,400,061 ->
+//     5,550,061. Nothing under this gate may change a real build's IR, and a
+//     flip-off reading that moves is the proof that it did.
+//   - word 2 must be an `Op.CallWord`. `emitInlineStringSlice`'s box has an
+//     owner BASE there, which the test can never match, so the diamond would
+//     be pure cost on every reslice returned from a one-handle body.
+//   - the words come from the box's own `field_set`s (`freshStringBoxWords`),
+//     not from `field_get`s on it, so the original box is named by nothing and
+//     dies without depending on store-to-load forwarding having run.
+fn retHandleFor(fc: FnCtx, v: int): int {
+  if (!fc.lowerer.explodeStrings || fc.resultTy != primType(fc.c.ctx, 11)) {
+    return v
+  }
+  let ws = freshStringBoxWords(fc.b, v)
+  if (len(ws) != 3 || !isCallResultWord(fc.b, ws[2])) {
+    return v
+  }
+  return materializeExplodedHandle(fc, fc.b, fc.resultTy, ws)
 }
