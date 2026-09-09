@@ -688,6 +688,12 @@ the connection with GOAWAY carrying `errorFlowControlError` (RFC 9113 §6.9.1).
 A conforming peer never reaches that ceiling, because the engine buffers the
 whole body and so renews the credit as the DATA lands.
 
+What a DATA frame spends is its whole payload - the Pad Length octet and the
+padding included, as RFC 9113 §6.9 defines it - and not the body left after the
+padding is stripped, so a peer that pads its frames is granted back every byte
+of credit it spent. The body budget below is the other number: it counts only
+the body, because padding is discarded and never resident.
+
 The connection window is renewed for every DATA frame the connection counts,
 including the two whose bytes it drops: a body refused by `maxBodyBytes` below,
 and a frame for a stream that is already closed or has been released. Those
