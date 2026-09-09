@@ -4457,10 +4457,28 @@ test "concat" {
 - `bit test <file.bit|dir>` discovers every test in the module a file names,
   or in every module beneath a directory — never in a module reached only by
   importing it from outside that directory. It runs each, prints `ok`/`FAIL`
-  per test (by its string name) plus a summary, and exits `0` iff every test
-  passed, `1` otherwise. `--run <pattern>` narrows the run to tests whose name
-  contains `pattern` as a literal substring; a pattern that matches nothing is
-  an error, not a silent zero-test pass.
+  per test (by its string name) plus a summary, and exits:
+
+  | code | meaning |
+  |---|---|
+  | `0` | every discovered test passed |
+  | `1` | a test failed, the module did not build, or `--run` matched nothing |
+  | `2` | the arguments themselves were wrong |
+  | `3` | the path named on the command line discovered **no tests at all** |
+
+  Code `3` exists so that a caller reading only the status can tell "your
+  tests pass" from "there are no tests here" — the two used to be the same
+  `0`, so naming a path with no `.test.bit` file was a green that checked
+  nothing. The summary line is printed either way and is the machine-readable
+  form of the same verdict: a zero run reads `discovered 0 tests, ran 0: 0
+  passed, 0 failed`. A path under which SOME module has tests and another has
+  none is a pass — the total is what counts. `bit test` with no path at all
+  (the whole-project form) exits `0` on a project that has not written its
+  first test yet; only a path the caller named can produce `3`.
+
+  `--run <pattern>` narrows the run to tests whose name contains `pattern` as
+  a literal substring; a pattern that matches nothing is an error, not a
+  silent zero-test pass.
 - A test fails when it panics — which a failed `assert` (§18.4) does. Each test
   therefore runs in its own process, so one failure neither hides the others nor
   aborts the run.
