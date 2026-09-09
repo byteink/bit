@@ -1,0 +1,440 @@
+// compiler/optstrbox.bit — #4648: a `string` header the optimizer has already
+// DECLINED to delete, whose three words are one call's result run, becomes
+// #4628's reuse diamond instead of an allocation. Sibling of opt.bit in the
+// same module, so nothing here needs an import — `blockEmissionOrder`,
+// `emitTranslated`, `trKeepAlive`, `noConst` and the builder API are all
+// defined elsewhere in this module, and `emitStringHandleReuse` in
+// lowerexplodestr.bit is the diamond emitter this shares with the lowerer.
+//
+// ## The shape, and why no lowering placement reaches it
+//
+// `let k = pick(); Slot{key: k}` under the flip. `pick` hands its result back
+// in three registers (#4424), `emitResolvedCall` re-boxes them, #4586's
+// `stringLetExplodes` explodes that fresh box straight back into words, and
+// then `Slot{key: k}` wants ONE HANDLE — so `localRead` builds a SECOND box
+// with the identical contents. That second box is what this pass removes: 1000
+// of them in `_tests_/bit/stringexplode`'s `plainretfielddirect`, which read
+// 1017 objects gate-off against 2017 gate-on before this pass existed.
+//
+// #4628 measured all three lowering placements and rejected them, which is why
+// this is a pass and not four more lines in lowerexplodestr.bit:
+//
+//   at `emitResolvedCall`         retscan 6 -> 18 objects
+//   at every exploded local read  strings 37 -> 7,125,035 objects
+//   at the RETURN                 landed; does not reach this shape
+//
+// The middle one is the whole difficulty. `localRead` is shared with every
+// WORD consumer of an exploded local — `len(a)` and `explodeCallArgs` both
+// materialize the aggregate and read words straight back out — and a diamond
+// hands them a BLOCK PARAMETER, which store-to-load forwarding cannot cross.
+// The box on the failing arm then runs whether or not anything wanted a handle.
+//
+// RUNNING AFTER THE FOLDS IS WHAT SEPARATES THE TWO CASES, and it does it by
+// construction rather than by a predicate. A box whose consumers wanted words
+// is already GONE by the time this pass looks: `forwardFieldLoads`
+// (optstore.bit) answered each `field_get` from the `field_set` above it and
+// `deadAllocs` (optalloc.bit) took the allocation nothing named. What survives
+// to here is a box some consumer genuinely holds as a handle, so every fold
+// this pass could have cost has already happened.
+//
+// ## What makes the rewrite sound
+//
+// Nothing new. It is #4628's argument verbatim, and it rests on the reuse TEST
+// rather than on where word 2 came from: a `string` is immutable (SPEC §5.3),
+// so a handle whose own `ptr`/`len` equal `{w0, w1}` denotes exactly the bytes
+// `{w0, w1}` denote, and its own `base` roots them. `emitStringHandleReuse`
+// emits that test — `w2 != nil && w2.ptr == w0 && w2.len == w1` — and the
+// failing edge still allocates. #4619 built the guardless form and it
+// miscompiled (`bench/cases/json` md5 `cc08f932` against `58d3db22`);
+// `retbasereuse` in _tests_/bit/stringexplode is the fixture that reddens when
+// the comparison is deleted — through the LOWERER's copy of the diamond, since
+// the callee test below means this pass never reaches a site where the test
+// can fail. The dynamic test is defence in depth HERE and the primary guard
+// THERE, and `directbasereuse` is the fixture that catches losing both.
+//
+// ## What the CALLEE test is for, and why it is not a second safety net
+//
+// Both requirements below — word 2 is a call's third result word, and that
+// call's target returns its OWN handle there — are about PROFIT. Correctness
+// is the dynamic test's job and nothing here weakens it.
+//
+// THE CALLEE TEST EXISTS BECAUSE THE FIRST VERSION OF THIS PASS COST CYCLES
+// WHERE IT COULD NOT PAY. Rewriting every call-result box moved
+// `bench/cases/json` flip-on by +2.77% median cycles (15 interleaved rounds,
+// null control +0.29%) while its object count did not move one allocation:
+// 5,400,067 before and after. Those sites take the FAILING edge every time —
+// their callee returns `s[lo:hi]`, so word 2 is the owner base — and a failing
+// diamond is the allocation it already had plus three comparisons.
+//
+// So the pass asks the callee. `retWordsAreOwnHandle` is the STATIC half of
+// the same invariant the dynamic test checks: a `ret w0, w1, v` whose `w0` and
+// `w1` are `field_get v[0]` and `field_get v[8]` hands back a handle that
+// denotes its own bytes, so the caller's test succeeds — always, except on a
+// null handle, where the `!= nil` arm allocates as it does today.
+// `explodedRetWordValues`'s fresh-box guard is what makes the two shapes
+// distinguishable at all: `return xs[i]` gives `ret field_get %v[0],
+// field_get %v[8], %v` and `return s[lo:hi]` gives `ret add %p, %lo, ...`.
+//
+// ## Gated OFF for every real build
+//
+// `optimizeModule` calls this only when `stringExplodeEnabled()`, so with
+// `BIT_STRING_EXPLODE_TEST` unset not one function is even scanned and the IR
+// is byte-identical instruction for instruction — the same requirement #4628
+// put first among `retHandleFor`'s three guards, and for the same reason: a
+// flip-off reading that moves is the proof that a gate leaked.
+
+// Whether `ins` allocates a `string` header — ABI.md §2.3's 24 bytes with the
+// single traced word at +16, as `boxStringWords` (lowerexplodestr.bit) and
+// `emitInlineStringSlice` (lowerreslice.bit) both build it.
+//
+// THE IR TYPE IS THE AUTHORITY, not the size and not the offsets.
+// `explodedWordTypes` gives a tuple `(i64, i64, string)` the same three word
+// types a `string` gets, and `buildTupleIn` lays that tuple out at the same 24
+// bytes with the same `ptr_offsets` — so a rule keyed on the shape alone would
+// hand a caller of a tuple-returning function the tuple's third member where it
+// expects the tuple, which is #4412's exact failure. `ty` is what
+// `materializeExplodedIn` itself branches on.
+fn isStringHeaderAlloc(ctx: TypeContext, ins: IrInstr): bool {
+  return ins.op == Op.GcAlloc &&
+    ins.ty == primType(ctx, 11) &&
+    ins.ival == strViewHeaderSize() &&
+    len(ins.offsets) == 1 &&
+    ins.offsets[0] == strViewBaseOffset()
+}
+
+// Whether the three instructions after `idx` are that box's own `ptr`/`len`/
+// `base` stores, in `stringWordTypes` order and inside the same block (`end` is
+// the block's exclusive instruction end).
+//
+// Contiguous and immediately after, exactly as `freshStringBoxWords`
+// (lowerexplodestr.bit) requires of the builder: `boxStringWords` emits the
+// four in one run and no pass in `optimizeModule` inserts between them, so the
+// tight test costs nothing real and FAILS CLOSED on any shape it has not seen.
+fn stringBoxWordSets(f: IrFunc, idx: int, end: int): bool {
+  if (idx + 3 >= end) {
+    return false
+  }
+  let k = 1
+  while (k < 4) {
+    let fs = f.instrs[idx + k]
+    if (fs.op != Op.FieldSet || fs.lhs != idx || fs.ival != (k - 1) * 8) {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+// Whether `v` is word `ival` of `call`'s result run (#4405's `Op.CallWord`).
+// `args[0]` is the ownership the run records; `callWordRunLen` (ir.bit) reads
+// the same field rather than trusting adjacency, and so does this.
+fn isCallWordOf(f: IrFunc, v: int, call: int, ival: int): bool {
+  let ins = f.instrs[v]
+  return ins.op == Op.CallWord && ins.ival == ival && len(ins.args) == 1 && ins.args[0] == call
+}
+
+// The call `w0`/`w1`/`w2` are the three result words of, or -1.
+//
+// Word 0 IS the call instruction — `%c = call @pick(...)` then
+// `call_word %c[1]`, `call_word %c[2]` — which is how the arm64 backend binds
+// the run (`emitCallWords`, arm64call.bit) and how the verifier polices it
+// (`callWordEscapesInFunc`, verify.bit).
+fn stringBoxCallOf(f: IrFunc, w0: int, w1: int, w2: int): int {
+  if (!opIsCall(f.instrs[w0].op)) {
+    return -1
+  }
+  if (!isCallWordOf(f, w1, w0, 1) || !isCallWordOf(f, w2, w0, 2)) {
+    return -1
+  }
+  return w0
+}
+
+// `v` is `field_get base[off]`.
+fn loadsFieldOf(g: IrFunc, v: int, base: int, off: int): bool {
+  let ins = g.instrs[v]
+  return ins.op == Op.FieldGet && ins.lhs == base && ins.ival == off
+}
+
+// Whether EVERY `ret` in `g` hands back a `string` whose word 2 is a handle its
+// own words 0 and 1 were read out of — the static half of the reuse invariant,
+// and this pass's profit test.
+//
+// One non-conforming `ret` refuses the whole function: a caller cannot know
+// which one it will reach, and a diamond that fails is the allocation it
+// already had plus three comparisons.
+//
+// A function with no `ret` at all (every path panics) refuses too — `seen`
+// starts false — because there is nothing to have proven.
+fn retWordsAreOwnHandle(ctx: TypeContext, g: IrFunc): bool {
+  if (g.result != primType(ctx, 11)) {
+    return false
+  }
+  let seen = false
+  let i = 0
+  while (i < len(g.instrs)) {
+    let ins = g.instrs[i]
+    if (ins.op == Op.Ret) {
+      if (len(ins.args) != 3 || !loadsFieldOf(g, ins.args[0], ins.args[2], 0)) {
+        return false
+      }
+      if (!loadsFieldOf(g, ins.args[1], ins.args[2], 8)) {
+        return false
+      }
+      seen = true
+    }
+    i = i + 1
+  }
+  return seen
+}
+
+// Whether the call at `c` resolves to a function in `snap` whose returns are
+// all reuse-friendly. An unresolvable target — a `call_value`, an interface
+// dispatch, an `rt_call`, or a name this module does not hold — refuses.
+//
+// `snap` is the module's function list as it stood BEFORE this pass rewrote
+// anything, the same discipline #3163 gave the inliner: a pass that reads
+// callees out of the list it is halfway through mutating gets an answer that
+// depends on function order.
+fn callReturnsOwnHandle(ctx: TypeContext, snap: []IrFunc, f: IrFunc, c: int): bool {
+  if (f.instrs[c].op != Op.Call) {
+    return false
+  }
+  let gi = funcIndexByName(snap, f.instrs[c].name)
+  if (gi < 0) {
+    return false
+  }
+  return retWordsAreOwnHandle(ctx, snap[gi])
+}
+
+// Whether the `gc_alloc` at `idx` is a re-box of one call's three result words,
+// and that call's target puts its own handle in word 2.
+fn reusableStringBox(x: StrBoxScan, f: IrFunc, idx: int, end: int): bool {
+  if (!isStringHeaderAlloc(x.ctx, f.instrs[idx]) || !stringBoxWordSets(f, idx, end)) {
+    return false
+  }
+  let c = stringBoxCallOf(
+    f, f.instrs[idx + 1].rhs, f.instrs[idx + 2].rhs, f.instrs[idx + 3].rhs,
+  )
+  if (c < 0) {
+    return false
+  }
+  return callReturnsOwnHandle(x.ctx, x.snap, f, c)
+}
+
+// The two module-wide facts the scan consults, bundled so the walk stays inside
+// E0202's five-parameter limit. Both are READ-ONLY for the whole pass.
+class StrBoxScan {
+  ctx: TypeContext,
+  snap: []IrFunc,
+}
+
+// Marks every reusable box in block `bi`.
+fn markReusableInBlock(x: StrBoxScan, f: IrFunc, mask: []bool, bi: int) {
+  let blk = f.blocks[bi]
+  let end = blk.instsStart + blk.instsLen
+  let idx = blk.instsStart + blk.paramCount
+  while (idx < end) {
+    if (reusableStringBox(x, f, idx, end)) {
+      mask[idx] = true
+      idx = idx + 4
+    } else {
+      idx = idx + 1
+    }
+  }
+}
+
+// Unmarks any box some OTHER instruction writes into, so the three words this
+// pass reads off the construction run are the whole of what the box holds.
+//
+// A `field_set` at a `string` base cannot occur today — strings are immutable
+// (SPEC §5.3) and `boxStringWords` is the only builder of this shape — so this
+// walk removes nothing on any input this compiler currently produces. It is
+// here because the alternative is a comment asserting that, and a later pass
+// that starts rewriting header words would turn the assertion into a silently
+// wrong answer rather than a refusal.
+fn dropWrittenStringBoxes(f: IrFunc, mask: []bool) {
+  let i = 0
+  while (i < len(f.instrs)) {
+    let ins = f.instrs[i]
+    if (ins.op == Op.FieldSet && mask[ins.lhs] && (i < ins.lhs + 1 || i > ins.lhs + 3)) {
+      mask[ins.lhs] = false
+    }
+    i = i + 1
+  }
+}
+
+// Per instruction, whether it is a `gc_alloc` this pass replaces with the reuse
+// diamond. Two bounded walks: one over the blocks, one over the instructions.
+fn reusableStringBoxes(x: StrBoxScan, f: IrFunc): []bool {
+  let mask = noDeadAllocs(len(f.instrs))
+  let bi = 0
+  while (bi < len(f.blocks)) {
+    markReusableInBlock(x, f, mask, bi)
+    bi = bi + 1
+  }
+  dropWrittenStringBoxes(f, mask)
+  return mask
+}
+
+fn anyMarked(mask: []bool): bool {
+  let i = 0
+  while (i < len(mask)) {
+    if (mask[i]) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// The rewrite state for one function, bundled the way `AppendCtx`
+// (optappend.bit) and `RebuildCtx` (optrebuild.bit) are, so the walk stays
+// inside E0202's five-parameter limit.
+class StrBoxCtx {
+  b: IrBuilder,
+  f: IrFunc,
+  ctx: TypeContext,
+  remap: []int,
+  blockMap: []int,
+  known: []ConstVal,
+  mask: []bool,
+}
+
+// Replaces the box at `idx` with the diamond, and yields the join parameter —
+// the value the box's own id must remap to.
+//
+// The words are read off the box's three `field_set`s and translated through
+// `remap`, never re-loaded with `field_get`s: the old box is then named by
+// nothing at all, which is what lets it not be emitted rather than left for a
+// later pass to prove dead.
+//
+// The span is the ALLOCATION's, #3282's span-on-rewrite policy — the diamond
+// replaces that instruction, and `builderEmit` would otherwise stamp the
+// builder's unset `curSpan` onto every instruction in it.
+fn emitReusedStringBox(x: StrBoxCtx, idx: int): int {
+  let vals = [
+    x.remap[x.f.instrs[idx + 1].rhs],
+    x.remap[x.f.instrs[idx + 2].rhs],
+    x.remap[x.f.instrs[idx + 3].rhs],
+  ]
+  builderSetSpan(x.b, x.f.instrs[idx].span)
+  let v = emitStringHandleReuse(x.ctx, x.b, vals)
+  builderSetSpan(x.b, unknownSpan())
+  return v
+}
+
+// One block of `f`, rewritten into `b`. A rewritten box closes the block being
+// written and opens the diamond's join, and the rest of the block — its
+// terminator included — lands there, exactly as `expandAppendBlock` splits a
+// block around an expanded append.
+fn rewriteStringBoxBlock(x: StrBoxCtx, bi: int) {
+  let blk = x.f.blocks[bi]
+  builderBeginBlock(x.b, x.blockMap[bi])
+  let idx = blk.instsStart
+  let paramsEnd = blk.instsStart + blk.paramCount
+  while (idx < paramsEnd) {
+    x.remap[idx] = builderAddParam(x.b, x.f.instrs[idx].ty)
+    idx = idx + 1
+  }
+  let end = blk.instsStart + blk.instsLen
+  while (idx < end) {
+    if (x.mask[idx]) {
+      x.remap[idx] = emitReusedStringBox(x, idx)
+      // The three `field_set`s are the box; they leave with it. Nothing can
+      // name a `void` store, so their `remap` slots stay unread.
+      idx = idx + 4
+    } else {
+      emitTranslated(x.b, x.f, x.known, x.remap, x.blockMap, idx)
+      idx = idx + 1
+    }
+  }
+  builderEndBlock(x.b)
+}
+
+// The `IrFunc` with every marked box replaced. Block ids are minted for the old
+// blocks in emission order and the diamond's four are minted as they are
+// reached, so they do NOT ascend with the linear schedule — `reuseStringBoxes`
+// runs `deadCodeElim` afterwards for exactly that reason.
+fn rewriteStringBoxes(ctx: TypeContext, f: IrFunc, mask: []bool): IrFunc {
+  let n = len(f.blocks)
+  let blockMap = []int(0)
+  let remap = []int(0)
+  let known = []ConstVal(0)
+  let i = 0
+  while (i < n) {
+    blockMap = append(blockMap, 0)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(f.instrs)) {
+    remap = append(remap, 0)
+    known = append(known, noConst())
+    i = i + 1
+  }
+  let order = blockEmissionOrder(f)
+  let b = newBuilder()
+  i = 0
+  while (i < n) {
+    blockMap[order[i]] = builderNewBlock(b)
+    i = i + 1
+  }
+  let x = StrBoxCtx{
+    b: b, f: f, ctx: ctx, remap: remap, blockMap: blockMap, known: known, mask: mask,
+  }
+  i = 0
+  while (i < n) {
+    rewriteStringBoxBlock(x, order[i])
+    i = i + 1
+  }
+  return IrFunc{
+    name: f.name, paramTypes: f.paramTypes, result: f.result,
+    blocks: b.blocks, instrs: b.instrs, isFallible: f.isFallible,
+    isNaked: f.isNaked, isNosplit: f.isNosplit,
+    // §17.6 module tag, §11.9 pin flag and #4406's keepalive edges ride every
+    // rebuild — see `rebuild`'s own note (optrebuild.bit) for what dropping any
+    // of them costs. A pair naming a rewritten box translates to the join
+    // parameter, which is a `string` handle rooting the same bytes.
+    inRootModule: f.inRootModule, isPinned: f.isPinned,
+    keepAlive: trKeepAlive(f.keepAlive, remap),
+  }
+}
+
+// The pass: `f` with its reusable string headers replaced, or `f` itself when
+// there are none — so a function this has no work in cannot be perturbed.
+//
+// THE `deadCodeElim` IS THE RENUMBER, not a cleanup. `rewriteStringBoxes` mints
+// the diamond's blocks after every old block's id, so the ids no longer ascend
+// with the linear schedule — the invariant `isBackEdge` and the x64 linear-scan
+// allocator's interval numbering both assume (build.bit's `writeModuleExe`).
+// `rebuild` re-assigns them in ascending `instsStart` order (optrebuild.bit's
+// `blockEmissionOrder`), which is the same debt `expandAppends` settles by
+// running before the second fold. This pass cannot run there — it needs the
+// folds' answer — so it settles it itself, on the touched function only.
+fn reuseStringBoxes(x: StrBoxScan, f: IrFunc, debug: bool): IrFunc {
+  let mask = reusableStringBoxes(x, f)
+  if (!anyMarked(mask)) {
+    return f
+  }
+  return deadCodeElim(rewriteStringBoxes(x.ctx, f, mask), debug)
+}
+
+// Pass 6 of `optimizeModule`, and it runs ONLY under the string flip: with
+// `BIT_STRING_EXPLODE_TEST` unset no function is scanned, so a real build's IR
+// is untouched instruction for instruction.
+fn reuseStringBoxesInModule(m: IrModule, debug: bool) {
+  if (!stringExplodeEnabled()) {
+    return
+  }
+  let snap = []IrFunc(0)
+  let i = 0
+  while (i < len(m.funcs)) {
+    snap = append(snap, m.funcs[i])
+    i = i + 1
+  }
+  let x = StrBoxScan{ ctx: m.ctx, snap: snap }
+  i = 0
+  while (i < len(m.funcs)) {
+    m.funcs[i] = reuseStringBoxes(x, m.funcs[i], debug)
+    i = i + 1
+  }
+}
