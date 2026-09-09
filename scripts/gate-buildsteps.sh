@@ -339,7 +339,7 @@ case "${BUCKET}" in
           *) BUILD_STEPS+=("${s}") ;;
         esac
       done
-      REASON="${REASON}; _tests_/bit/**, _tests_/imports/**, or _tests_/stress/** also changed — added gate(s): ${testsbit_steps}"
+      REASON="${REASON}; a name-mapped path (_tests_/bit/**, _tests_/imports/**, _tests_/stress/**, or tools/build/complexity-debt.txt) also changed — added gate(s): ${testsbit_steps}"
     fi
     ;;
 esac
