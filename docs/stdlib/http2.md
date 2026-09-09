@@ -789,6 +789,13 @@ call from many green threads at once - each call rides its own stream, multiplex
 over the one connection. Fails if the stream is reset by the peer or the
 connection is closing.
 
+It also fails when the peer sends GOAWAY naming a `lastStreamId` below this
+stream's id: the peer is stating that the stream was not processed and never
+will be (RFC 9113 §6.8), so the request is safe to retry on a new connection.
+The message names the GOAWAY's error code. Streams at or below `lastStreamId`
+are unaffected - the peer may still answer those - so a graceful shutdown lets
+in-flight requests finish.
+
 ### `Conn.serve(handler: (Request) => Response): ()!`
 
 Accept inbound requests and dispatch each to `handler` on its own green thread,
