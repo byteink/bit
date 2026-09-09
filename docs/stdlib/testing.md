@@ -21,6 +21,7 @@ so make it say which case failed, not which function.
 
 Put this in `math.test.bit`, beside the `math.bit` it tests:
 
+<!-- doctest: test-file -->
 ```bit
 import { eq, ok } from "std/testing"
 
@@ -28,7 +29,7 @@ fn double(n: int): int {
   return n * 2
 }
 
-fn test_double() {
+test "double" {
   eq<i64>(double(21), 42, "double")
   ok(double(0) == 0, "zero doubles to zero")
 }
@@ -36,7 +37,7 @@ fn test_double() {
 
 ```
 $ bit test math.test.bit
-ok   test_double
+ok   double
 
 discovered 1 test, ran 1: 1 passed, 0 failed
 ```
@@ -55,6 +56,7 @@ Fails unless `cond` is false.
 
 Fails immediately. For a branch that should be unreachable.
 
+<!-- doctest: test-file -->
 ```bit
 import { ok, notOk, failNow } from "std/testing"
 import { hasPrefix } from "std/strings"
@@ -69,7 +71,7 @@ fn classify(n: int): string {
   return "zero"
 }
 
-fn test_classify() {
+test "classify" {
   ok(hasPrefix(classify(3), "pos"), "3 is positive")
   notOk(classify(0) == "positive", "0 is not positive")
 
@@ -95,7 +97,7 @@ method and the type:
 ```bit ignore
 class Point { x: int, y: int }
 
-fn test_points() {
+test "points" {
   eq<Point>(Point{ x: 1, y: 2 }, Point{ x: 1, y: 2 }, "same point")
 }
 ```
@@ -107,6 +109,7 @@ error[E0073]: cannot interpolate a value of type 'Point'
 
 Add `show()` to the class and the call compiles:
 
+<!-- doctest: test-file -->
 ```bit
 import { eq } from "std/testing"
 
@@ -119,7 +122,7 @@ class Point {
   }
 }
 
-fn test_points() {
+test "points" {
   eq<Point>(Point{ x: 1, y: 2 }, Point{ x: 1, y: 2 }, "same point")
 }
 ```
@@ -142,22 +145,23 @@ exactly equal; this is the assertion to use for them.
 Fails unless the slices have the same length and equal elements. Reports the
 first index that differs.
 
+<!-- doctest: test-file -->
 ```bit
 import { eq, neq, near, eqSlice } from "std/testing"
 import { sqrt } from "std/math"
 import { mapped } from "std/seq"
 
-fn test_values() {
+test "values" {
   eq<string>("bit", "bit", "same string")
   neq<i64>(1, 2, "one is not two")
 }
 
-fn test_sqrt() {
+test "sqrt" {
   // 1.41421356... is not exactly representable; compare with a tolerance.
   near(sqrt(2.0), 1.4142135, 0.0000001, "sqrt 2")
 }
 
-fn test_mapped() {
+test "mapped" {
   let doubled = mapped([1, 2, 3], (x: int) => x * 2)
   eqSlice<i64>(doubled, [2, 4, 6], "each element doubled")
 }
@@ -171,10 +175,11 @@ not - that key and what `want` held for it, rather than rendering both whole
 maps on one line. As with `eqSlice`, a plain length mismatch is reported
 separately, without naming a key.
 
+<!-- doctest: test-file -->
 ```bit
 import { eqMap } from "std/testing"
 
-fn test_counts() {
+test "counts" {
   let got = map<string, int>{ "a": 1, "b": 2 }
   let want = map<string, int>{ "a": 1, "b": 2 }
   eqMap<string, int>(got, want, "counts")
@@ -213,12 +218,13 @@ together.
 
 Put this in `table.test.bit`:
 
+<!-- doctest: test-file -->
 ```bit
 import { checkEq, checkDone } from "std/testing"
 
 class Case { name: string, got: int, want: int }
 
-fn test_table() {
+test "table" {
   defer checkDone()
   let cases = [
     Case{ name: "a", got: 1, want: 1 },
@@ -236,7 +242,7 @@ $ bit test table.test.bit
 check failed: case b: got 2, want 20
 check failed: case c: got 3, want 30
 panic: one or more checks failed above
-FAIL test_table
+FAIL table
 
 discovered 1 test, ran 1: 0 passed, 1 failed
 ```
@@ -291,6 +297,7 @@ assertion.
 
 Put this in `stack.test.bit`:
 
+<!-- doctest: test-file -->
 ```bit
 class Stack {
   items: []i64
@@ -300,7 +307,7 @@ class Stack {
   }
 }
 
-fn testpanic_pop_on_empty() {
+test "testpanic_pop_on_empty" {
   let s = Stack{}
   s.pop()
 }
@@ -311,10 +318,9 @@ fn testpanic_pop_on_empty() {
 `bit test <file.bit|dir> --run <pattern>` runs only the discovered tests
 whose name contains `<pattern>` as a **literal substring** — not a glob and
 not a regex, so nothing in `<pattern>` needs escaping and no `*`/`?`/`.` is
-special. The match is against whatever the function is actually called, with
-no assumption of a `test_` prefix: `--run al` matches a test named
-`test_alpha` and nothing else. The match is case sensitive: `--run Alpha`
-does not match `test_alpha`.
+special. The match is against the declaration's name string: `--run al`
+matches a test declared `test "alpha" { }` and nothing else. The match is
+case sensitive: `--run Alpha` does not match `alpha`.
 
 The summary line reports the true pre-filter discovered count beside the
 post-filter ran count:
