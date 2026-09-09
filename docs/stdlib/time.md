@@ -88,7 +88,7 @@ under the disambiguation rules below, so there is nothing left to fail on.
 | `Timestamp` | `1677-09-21T00:12:43.145224192Z` to `2262-04-11T23:47:16.854775807Z` | signed 64-bit nanoseconds |
 
 **The `Timestamp` range is narrower than the `Date` range, and that is deliberate.**
-A date of birth in 1890 is a perfectly good `Date` and cannot be a `Timestamp`.
+A date in 1600 is a perfectly good `Date` and cannot be a `Timestamp`; a date of birth in 1890 is inside both ranges.
 Store dates of birth, historical value dates and far-future maturity dates as
 `Date`, not as an instant. `Date.toTimestamp` fails rather than wrapping.
 
@@ -1327,7 +1327,7 @@ single list.
 | `parseTime` on `09:00:00.5` | succeeds, 500000000 ns |
 | `parseTime` on a ten-digit fraction | fails, never truncates |
 | `format` with `Y` or `D` | fails, see Formatting |
-| `Date.toTimestamp` on year 1890 | fails, outside the instant range |
+| `Date.toTimestamp` on year 1600 | fails, outside the instant range |
 | `zone("Asia/Dubai")` with no host zone data | fails |
 | `hijri()` outside 1300–1500 AH | fails, tables do not cover it |
 
