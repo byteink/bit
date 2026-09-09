@@ -11,6 +11,13 @@
 // `dispatch` drops the content of EVERY HEAD response at the adapter's single
 // exit, whether it came from a registered HEAD route or from that fallback.
 
+// The wire test below needs a real listener and a raw client: `serve` and
+// `listenAndServeOn` (the pair `App.listen` cannot be used for, since it binds
+// from `Config` and never surrenders the port it chose) and `dial`. Both are
+// new to this module — `listenAndServe`, adapter.bit's, is a different symbol.
+import { Server, serve, listenAndServeOn } from "std/http"
+import { dial } from "std/net"
+
 // --- HEAD served from the GET route (RFC 9110 §9.3.2) ----------------------
 
 const headBody = "twelve bytes"
@@ -92,9 +99,11 @@ test "a registered HEAD route wins over the GET fallback" {
 // response" — binds a REGISTERED HEAD route exactly as it binds the GET
 // fallback. The strip is at `dispatch`, the adapter's one exit, which is why
 // the handler's own status and headers come back untouched. No
-// `Content-Length` is derived from what was dropped: a handler answering HEAD
-// knows the representation's real length and the adapter does not
-// (static.bit's HEAD branch is the live case).
+// `Content-Length` claim is made from the length that was dropped, which is
+// the only place it can still be made: after this the number is gone, and
+// `serializeResponse` (stdlib/http) honours a single declared field on a HEAD
+// for exactly that reason (#4635). A chain that answered HEAD with an empty
+// body of its own gets no claim — see the two tests below.
 test "a registered HEAD route sends no content, with its status and headers intact" {
   let app = adapterApp(newSink())
   app.route(
@@ -115,8 +124,8 @@ test "a registered HEAD route sends no content, with its status and headers inta
     "want the handler's own header, got '${res.getHeader("X-Marker")}'",
   )
   assert(
-    len(res.getHeader(contentLengthName)) == 0,
-    "no length may be derived from the stripped body, got '${res.getHeader(contentLengthName)}'",
+    res.getHeader(contentLengthName) == "10",
+    "want the dropped body's length 10, got '${res.getHeader(contentLengthName)}'",
   )
 }
 
@@ -163,5 +172,99 @@ test "the fallback makes no Content-Length claim when the chain produced no body
   assert(
     len(res.getHeader("Content-Length")) == 0,
     "want no Content-Length, got '${res.getHeader("Content-Length")}'",
+  )
+}
+
+// --- #4635: the same rule, checked on the wire ----------------------------
+//
+// Every assertion above reads `app.handle`'s return value, which is the
+// in-process seam. It cannot see the framing: `serializeResponse`
+// (stdlib/http) writes the `Content-Length` and withholds a HEAD's content
+// itself, so the value a client actually receives is decided one layer below
+// anything above. This test serves a real app on a loopback socket and reads
+// the octets back.
+
+// `listenAndServeOn` returns only on an accept error, which is what closing
+// the listener produces; swallowing it is the intended end of this green
+// thread, not an ignored failure.
+fn wireServe(s: Server, h: (Request) => Response) {
+  listenAndServeOn(s, h) catch _ {
+    return
+  }
+}
+
+// How many times `needle` occurs in `s`. `contains` cannot answer "exactly
+// one", and exactly one is the whole claim about a framing field: two
+// differing `Content-Length` fields are unrecoverable (RFC 9112 §6.3).
+fn countOf(s: string, needle: string): int {
+  let n = 0
+  let rest = s
+  while (true) {
+    let at = indexOf(rest, needle)
+    if (at < 0) {
+      return n
+    }
+    n = n + 1
+    rest = rest[at + len(needle):len(rest)]
+  }
+}
+
+test "on the wire, a registered HEAD route declares the GET length and sends no content" {
+  let app = adapterApp(newSink())
+  app.route(
+    "HEAD",
+    "/doc",
+    (c) => {
+      return c.text("body bytes").header("X-Marker", "head")
+    },
+  )
+  freezeOrPanic(app)
+
+  let s = serve("127.0.0.1", 0) catch e {
+    assert(false, "serve: ${e.message()}")
+    return
+  }
+  let port = s.port() catch e {
+    assert(false, "port: ${e.message()}")
+    return
+  }
+  spawn wireServe(s, app.serveHandler())
+
+  let conn = dial("127.0.0.1", port) catch e {
+    s.close()
+    assert(false, "dial: ${e.message()}")
+    return
+  }
+  conn.write("HEAD /doc HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") catch e {
+    conn.close()
+    s.close()
+    assert(false, "write: ${e.message()}")
+    return
+  }
+  let wire = conn.readAll()
+  conn.close()
+  s.close()
+
+  // "body bytes" is 10 octets: the length a GET would have sent, which is what
+  // RFC 9110 §9.3.2 asks a HEAD to declare. `Content-Length: 0` here is the
+  // failure this test exists to catch (#4635).
+  assert(
+    contains(wire, "Content-Length: 10\r\n"),
+    "want 'Content-Length: 10' on the wire, got:\n${wire}",
+  )
+  assert(
+    countOf(toLower(wire), "content-length:") == 1,
+    "want exactly one Content-Length field, got ${countOf(toLower(wire), "content-length:")}:\n${wire}",
+  )
+  // ... and not one octet after the blank line.
+  let blank = indexOf(wire, "\r\n\r\n")
+  assert(blank >= 0, "no header terminator on the wire:\n${wire}")
+  assert(
+    len(wire) == blank + 4,
+    "a HEAD carries no content, got ${len(wire) - blank - 4} octet(s) after the head",
+  )
+  assert(
+    contains(wire, "X-Marker: head\r\n"),
+    "the handler's own header must reach the client:\n${wire}",
   )
 }
