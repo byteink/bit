@@ -78,6 +78,28 @@ fn serveCallers() {
 }
 ```
 
+A method takes them the same way, on a class receiver or through an interface
+value - the parameter names come from the declaration the call resolves to.
+
+```bit
+interface Sink {
+  emit(label: string, count: int): string,
+}
+
+class Log {
+  prefix: string
+  emit(label: string, count: int): string {
+    return "${this.prefix}:${label}=${count}"
+  }
+}
+
+fn emitCallers(): string {
+  let log = Log{ prefix: "L" }
+  let sink: Sink = log
+  return log.emit(count = 7, label = "hits") + sink.emit(count = 1, label = "x")
+}
+```
+
 ## First-class functions and arrow functions
 
 Functions are values. Arrow functions are concise anonymous functions; their
