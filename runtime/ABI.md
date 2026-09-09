@@ -2126,7 +2126,7 @@ defined exactly once).
 | `bit_rt_fs_mkdir`     | `(path: *const RtBytes) -> i64` (§14)                   |
 | `bit_rt_fs_remove`    | `(path: *const RtBytes) -> i64` (§14)                   |
 | `bit_rt_fs_rename`    | `(oldPath: *const RtBytes, newPath: *const RtBytes) -> i64` (§14) |
-| `bit_rt_fs_chmod`     | `(path: *const RtBytes, mode: i64) -> i64` (§14, sets `path`'s permission bits to `mode`; `0`, or `-1` on any error. Darwin calls libc `chmod`, Linux the raw `chmod`/`fchmodat(AT_FDCWD, ...)` syscall. Its contract lives only in the provider comments in `runtime/root/{darwin,linux,windows}/fs.bit` — §14's own prose block omits it) |
+| `bit_rt_fs_chmod`     | `(path: *const RtBytes, mode: i64) -> i64` (§14, sets `path`'s permission bits to `mode`; `0`, or `-1` on any error. Darwin calls libc `chmod`, Linux the raw `chmod`/`fchmodat(AT_FDCWD, ...)` syscall. Windows maps ONLY the POSIX owner-write bit (`mode & 0o200`) to `FILE_ATTRIBUTE_READONLY` — see that provider's header scope note, `runtime/root/windows/fs.bit:85`) |
 | `bit_rt_fs_list_dir`  | `(path: *const RtBytes) -> *const RtBytes` (§14)        |
 | `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not NUL-terminated, not `RtBytes`; the FIRST entry point shaped this way (#2152) and now the family's convention — seven `bit_rt_fs_*_w` symbols share it, five carrying a path (this, `bit_rt_fs_open_rw_w`, `bit_rt_fs_stat_w`, `bit_rt_fs_lstat_w`, `bit_rt_fs_sync_dir_w`) and two a data buffer (`bit_rt_fs_pread_w`/`bit_rt_fs_pwrite_w`)) |
 | `bit_rt_fs_sync`      | `(fd: i64) -> i64` (§14, `0` on success, `-1` on failure; Darwin uses `F_FULLFSYNC`, falling back to bare `fsync` only on `ENOTSUP` — bare `fsync` alone does not flush the drive's write cache on that platform) |
@@ -2551,6 +2551,7 @@ bit_rt_fs_is_dir(path)            -> bool
 bit_rt_fs_mkdir(path)             -> i64        // 0, or -1
 bit_rt_fs_remove(path)            -> i64        // file or empty dir; 0, or -1
 bit_rt_fs_rename(oldPath, newPath) -> i64       // 0, or -1
+bit_rt_fs_chmod(path, mode: i64)  -> i64        // permission bits; 0, or -1; windows maps only owner-write
 bit_rt_fs_list_dir(path)          -> string     // NUL-terminated entry names
 bit_rt_fs_is_symlink_w(words, n)  -> bool        // path is a symlink itself (readlink-based)
 bit_rt_fs_stat_w(words, n, out)   -> i64        // fills `out`, follows a trailing symlink; 0 or -errno (#2153)
