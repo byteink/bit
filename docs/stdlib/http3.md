@@ -410,6 +410,20 @@ Answer the request in `sr` with `resp` on its stream: a HEADERS frame carrying t
 `:status` field section, then a DATA frame for the body if any, then FIN. Fails on a
 transport error.
 
+### `H3Conn.peerIp(): string`
+
+The peer's IPv4 address in dotted quad, or `""` when it is not known. Forwards
+`quic.Conn.peerIp` unchanged, including its ruling on a connection that may
+migrate: the source of the datagram that completed the QUIC handshake, frozen
+there (RFC 9000 §9). Never fails and never blocks - a peer address is metadata and
+must not be able to fail a request. On the client side of a connection this names
+the server.
+
+Read it once per connection, not once per request: HTTP/3 multiplexes many requests
+over one connection and the address belongs to the connection. `std/http`'s
+`serveH3` does exactly that, which is how an HTTP/3 handler's `Request.peer` gets
+filled.
+
 ### `H3Conn.close()`
 
 Close the connection: send a GOAWAY on the control stream (best effort), then tear

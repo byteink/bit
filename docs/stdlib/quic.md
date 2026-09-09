@@ -873,6 +873,30 @@ An established QUIC connection. Its methods marshal to the owning loop thread ov
 a channel, so the connection has no directly-shared mutable state. Obtain one from
 `dialQuic` or `acceptQuic`.
 
+### `Conn.peerIp(): string`
+
+The peer's IPv4 address in dotted quad (`"203.0.113.7"`), or `""` when it is not
+known. Never fails and never blocks: a peer address is metadata, so it must not be
+able to fail an operation, and the value is already in hand rather than read back
+from the connection's loop.
+
+Which address, since a QUIC connection is not pinned to one: the source address of
+the datagram that COMPLETED THE HANDSHAKE, captured at that instant and frozen for
+the connection's life. A peer may migrate to a new address mid-connection (RFC 9000
+§9) and this endpoint keeps replying to wherever its latest datagram came from, so
+the reported address can go stale - deliberately. The handshake address is the one
+any authorization or audit decision was implicitly made against, it is stable, and
+a caller reading it twice cannot get two answers. Migrated addresses are not path
+validated here (§9.3), so a later address is not one this endpoint has verified in
+any case.
+
+On the client side of a connection this names the server. `""` means unknown, never
+a placeholder: treat it as "no peer known" - never as an address.
+
+This is what puts a client address on `http.Request.peer` for HTTP/3, where the
+socket cannot supply one: an HTTP/3 server's UDP socket is bound and shared by
+every client, not connected, so `net.Conn.peerIp` has no peer to report on it.
+
 ### `Conn.openStream(): Stream!`
 
 Open a new client-initiated bidirectional stream (RFC 9000 §2.1). Fails with a
