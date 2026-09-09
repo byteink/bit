@@ -1,0 +1,262 @@
+// stdlib/http2/connerror.test.bit — a connection error terminates the
+// connection (#4606).
+//
+// RFC 9113 §5.4.1: an endpoint that raises a connection error sends GOAWAY and
+// then closes the connection. `h2connConnError` (streams.bit) used to send the
+// GOAWAY, fail the streams, and leave `st.running` true — so the loop kept
+// selecting and the engine went on serving a peer it had just declared dead,
+// on every one of its connection-error paths.
+//
+// The first five tests drive a hand-built `h2connState` with no threads behind
+// it, because that is what makes the ORDER checkable: the writer's `stop` has
+// to be queued after the GOAWAY, and reading `st.writeCh` message by message is
+// the only way to see that rather than infer it. The last two run a real
+// `Conn` over an in-memory wire, because the release that matters in practice —
+// a parked `serve()` returning — cannot be seen in the state at all.
+//
+// Same flat `std/http2` module, so `btState`/`btOpenStream`/`btDataFrame`/
+// `btPattern` (events.test.bit) and `hbAcceptOn`/`hbNextFrame` (headers.test.bit)
+// are in scope and nothing is imported.
+
+// --- helpers -----------------------------------------------------------------
+
+// Raise a connection error on `st` through the real dispatch entry point, the
+// same way an inbound frame would: a header block is in progress (`contStream`),
+// so anything other than a CONTINUATION is a connection error (RFC 9113 §6.2,
+// `h2connHandleFrame`). Deliberately the oldest and most stable of this
+// module's nine connection-error paths — the point is the termination they all
+// share, not any one path's own condition.
+fn ceRaise(st: h2connState): ()! {
+  st.contStream = 1
+  h2connHandleFrame(st, btDataFrame(1, btPattern(4), false)?)
+}
+
+// The next message the loop queued for the writer thread, undecoded: `stop`
+// messages carry no frame, so a test that has to tell one from a frame cannot
+// go through `btNextWritten`.
+fn ceNextOut(st: h2connState): h2connOut {
+  return <- st.writeCh
+}
+
+// True when nothing more is queued for the writer. A `default` arm makes the
+// receive non-blocking, so this is an assertion about the queue and not a wait
+// that would hang the test on a failure.
+fn ceWriteChEmpty(st: h2connState): bool {
+  let got = false
+  select {
+    case _ = <- st.writeCh:
+      got = true
+    default:
+  }
+  return !got
+}
+
+// --- the termination ----------------------------------------------------------
+
+test "a connection error stops the loop" {
+  let st = btState(false, 1048576)
+  ceRaise(st) catch e {
+    assert(false, "building the frame failed: ${e.message()}")
+    return
+  }
+  // `h2connLoop` (loop.bit) is `while (st.running)`, so this flag is the whole
+  // of "the connection is terminated" as far as the loop thread is concerned.
+  assert(!st.running, "the connection is still running after a connection error")
+}
+
+test "a connection error queues the writer's stop AFTER the GOAWAY" {
+  // The ordering is the fix. `h2connWriter` (loop.bit) drains `writeCh` in
+  // order and returns on `stop`, so a stop queued before the GOAWAY would mean
+  // the peer is never told why the connection died.
+  let st = btState(false, 1048576)
+  ceRaise(st) catch e {
+    assert(false, "building the frame failed: ${e.message()}")
+    return
+  }
+  let first = ceNextOut(st)
+  assert(!first.stop, "the writer's stop was queued BEFORE the GOAWAY")
+  let f = readFrame(first.data, maxMaxFrameSize) catch e2 {
+    assert(false, "the first queued message is not a frame: ${e2.message()}")
+    return
+  }
+  let g = decodeGoaway(f) catch e3 {
+    assert(false, "the first queued frame is not a GOAWAY: ${e3.message()}")
+    return
+  }
+  assert(
+    g.errorCode == errorProtocolError,
+    "GOAWAY code = ${g.errorCode}, want ${errorProtocolError} (PROTOCOL_ERROR)",
+  )
+  let second = ceNextOut(st)
+  assert(second.stop, "the writer was never told to stop")
+  assert(len(second.data) == 0, "the stop message carries ${len(second.data)} bytes, want 0")
+  assert(ceWriteChEmpty(st), "something was queued after the writer's stop")
+}
+
+test "a connection error releases a server's parked serve()" {
+  // `serve()` (conn.bit) parks on `acceptCh` for the life of the connection and
+  // has no other release, so without this the caller that owns the transport
+  // never learns the connection is over and never closes it.
+  let st = btState(false, 1048576)
+  ceRaise(st) catch e {
+    assert(false, "building the frame failed: ${e.message()}")
+    return
+  }
+  let a = <- st.acceptCh
+  assert(a.stop, "a server's serve() was not released")
+}
+
+test "a connection error answers a client round trip parked on a stream" {
+  // `h2connFailAll` was already called on this path before #4606 and still is —
+  // from inside `h2connTerminate` now rather than from `h2connConnError`. This
+  // is the check that moving it did not drop it.
+  let st = btState(true, 1048576)
+  let rc = chan<h2connMsg>(1)
+  let s = btOpenStream(st, 1, rc)
+  ceRaise(st) catch e {
+    assert(false, "building the frame failed: ${e.message()}")
+    return
+  }
+  let msg = <- rc
+  assert(!msg.ok, "a terminated connection answered the round trip with a response")
+  assert(
+    msg.errMsg == "http2: expected CONTINUATION",
+    "the round trip was not told why: '${msg.errMsg}'",
+  )
+  assert(s.replied, "the stream was answered but never marked replied")
+}
+
+test "a connection error before the peer's SETTINGS releases h2connAwaitReady" {
+  // `readyCh` is what `connect`/`accept` park on during the handshake
+  // (`h2connAwaitReady`, conn.bit, #3019). Once the loop stops, nothing else
+  // will ever signal it — no later `eof` event is processed — so terminating
+  // has to do it here or a peer whose very first frames are illegal parks its
+  // own `accept()` forever.
+  let st = btState(false, 1048576)
+  st.readySignaled = false
+  ceRaise(st) catch e {
+    assert(false, "building the frame failed: ${e.message()}")
+    return
+  }
+  let sig = <- st.readyCh
+  assert(sig == 0, "readyCh delivered ${sig}, want 0 (the failure signal)")
+  assert(st.readySignaled, "readySignaled was not set, so a later send could double up")
+}
+
+// --- the graceful path is untouched ------------------------------------------
+
+test "Conn.close()'s graceful GOAWAY leaves the connection running" {
+  // The contrast that makes the fix a fix rather than "close on any GOAWAY": a
+  // graceful GOAWAY exists so in-flight streams can finish, so the loop must
+  // keep running and the writer must NOT be stopped. Same command
+  // `Conn.close()` sends (conn.bit) — kind `h2cmdGoaway`, `errorNoError` — and
+  // the same handler entry point the loop calls.
+  let st = btState(false, 1048576)
+  h2connHandleCmd(
+    st,
+    h2connCmd{
+      kind: h2cmdGoaway,
+      request: h2connZeroRequest(),
+      response: h2connZeroResponse(),
+      streamId: 0,
+      errorCode: errorNoError,
+      replyCh: h2connDummyReply(),
+    },
+  )
+  assert(st.running, "a graceful GOAWAY tore the connection down")
+  let first = ceNextOut(st)
+  assert(!first.stop, "a graceful GOAWAY stopped the writer")
+  let f = readFrame(first.data, maxMaxFrameSize) catch e {
+    assert(false, "the queued message is not a frame: ${e.message()}")
+    return
+  }
+  let g = decodeGoaway(f) catch e2 {
+    assert(false, "the queued frame is not a GOAWAY: ${e2.message()}")
+    return
+  }
+  assert(g.errorCode == errorNoError, "GOAWAY code = ${g.errorCode}, want ${errorNoError}")
+  assert(ceWriteChEmpty(st), "a graceful GOAWAY queued a stop for the writer")
+}
+
+// --- over a real connection ---------------------------------------------------
+
+// Run `conn.serve` and report on `done` when it returns, so a test can wait for
+// the release instead of sampling for it. A named function because `spawn`
+// takes a call, not a closure.
+fn ceServeUntilStop(conn: Conn, done: chan<int>) {
+  conn.serve(
+    (r) => {
+      return newResponse(200, r.body)
+    },
+  ) catch _ {
+    done <- 0
+    return
+  }
+  done <- 1
+}
+
+// A CONTINUATION on the wire with no header block in progress: `unexpected
+// CONTINUATION`, a connection error (`h2connOnContinuation`, events.bit).
+fn ceStrayContinuation(): []byte! {
+  return encodeContinuation(
+    ContinuationFrame{ streamId: 1, blockFragment: []byte(0), endHeaders: true },
+  )?
+}
+
+test "a connection error over a real connection releases the server's serve()" {
+  // The end-to-end version, and the one that would have hung before the fix:
+  // the engine wrote its GOAWAY and went straight back to selecting, so
+  // `serve()` stayed parked for the life of the process and its caller
+  // (`h2glueServe`, stdlib/http/h2.bit) never reached `conn.close()`.
+  let (w, conn) = hbAcceptOn(defaultConfig()) catch e {
+    assert(false, "accept failed: ${e.message()}")
+    return
+  }
+  let done = chan<int>(1)
+  spawn ceServeUntilStop(conn, done)
+  let stray = ceStrayContinuation() catch e2 {
+    assert(false, "encoding the CONTINUATION failed: ${e2.message()}")
+    return
+  }
+  w.toEngine <- btChunk{ data: stray, eof: false }
+  let how = <- done
+  assert(how == 1, "serve() returned a failure (${how}) rather than a clean stop")
+}
+
+test "Conn.close() over a real connection leaves the engine serving" {
+  // The graceful path end to end. A PING after the `close()` is answered only
+  // if the loop is still selecting, so the ACK arriving is the proof — and if
+  // the connection had been torn down, this receive is the last runnable task
+  // and the runtime's deadlock detector fails the test rather than hanging it.
+  let (w, conn) = hbAcceptOn(defaultConfig()) catch e {
+    assert(false, "accept failed: ${e.message()}")
+    return
+  }
+  conn.close()
+  let payload = btPattern(8)
+  let ping = encodePing(PingFrame{ ack: false, data: payload }) catch e2 {
+    assert(false, "encoding the PING failed: ${e2.message()}")
+    return
+  }
+  w.toEngine <- btChunk{ data: ping, eof: false }
+  // Its opening SETTINGS, the ACK of ours and the graceful GOAWAY come first.
+  let acked = false
+  let i = 0
+  while (i < 8 && !acked) {
+    let f = hbNextFrame(w) catch e3 {
+      assert(false, "the engine stopped writing before the PING ACK: ${e3.message()}")
+      return
+    }
+    if (f.header.ftype == framePing) {
+      let p = decodePing(f) catch e4 {
+        assert(false, "the PING did not decode: ${e4.message()}")
+        return
+      }
+      assert(p.ack, "the engine sent a PING of its own, not an ACK")
+      assert(h2connBytesEqual(p.data, payload), "the PING ACK does not echo the payload")
+      acked = true
+    }
+    i = i + 1
+  }
+  assert(acked, "no PING ACK: a graceful close stopped the loop")
+}
