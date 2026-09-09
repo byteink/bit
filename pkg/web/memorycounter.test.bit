@@ -1,0 +1,199 @@
+// pkg/web/memorycounter.test.bit — `MemoryCounter`'s own contract, tested
+// directly against the store rather than through a `Ctx`: an absent key reads
+// as 0 and never as a failure, a positive ttl really expires, an existing
+// counter's life is never extended — and, since #4630, that the store is
+// BOUNDED. The window count never exceeds `maxKeys`, an incr past the cap
+// evicts the soonest-expiring window rather than failing, and expired windows
+// are swept on a schedule instead of waiting for their own key to be touched
+// again.
+//
+// The class lives in ratelimit.bit (the rate limiter is its only caller); the
+// tests are here so the store's contract reads as one file instead of a
+// section at the end of the middleware's tests.
+//
+// Every test drives the module-private `incrAt`/`countAt`, which take the
+// clock as a second-precision argument. Against the wall clock the expiry,
+// eviction-order and sweep cases are either sleeping tests or no tests at all:
+// two incrs racing a real clock cannot be ordered deterministically.
+//
+// `contains` and `MemoryCounter`'s module-private names are already bound
+// module-wide by sibling files — reused here, not re-imported or redeclared
+// (E0042). This file imports nothing.
+
+test "MemoryCounter counts, expires on its ttl, and does not extend an existing counter's life" {
+  let s = MemoryCounter(1000)
+
+  assert(s.incrAt("k", 10, 1000) == 1, "the first incr must create the counter at 1")
+  assert(s.incrAt("k", 10, 1001) == 2, "the second incr must return 2")
+  assert(
+    s.countAt("k", 1009) == 2,
+    "the counter must still be readable one second before it expires",
+  )
+
+  // Created at 1000 with a ttl of 10, so it dies at 1010 — NOT at 1011, even
+  // though the second incr passed the same ttl one second later. A store that
+  // refreshed the expiry would keep a hot key's first window alive forever and
+  // the sliding window would stop sliding.
+  assert(s.countAt("k", 1010) == 0, "the counter must be gone at its expiry second")
+  assert(s.incrAt("k", 10, 1010) == 1, "a counter read after expiry must start again at 1")
+
+  assert(s.countAt("absent", 1010) == 0, "an absent key must read as 0, not as an error")
+}
+
+// --- the bound (#4630) -------------------------------------------------------
+
+test "an incr past the cap evicts the soonest-expiring window instead of failing" {
+  let s = MemoryCounter(3)
+  // The ttls are deliberately NOT in incr order: "a" is written first and
+  // expires LAST, "b" is written second and expires FIRST. A store evicting
+  // the oldest-WRITTEN window would agree with this test only by accident, so
+  // the ttls pick the victim, not the order.
+  assert(s.incrAt("a", 7200, 1000) == 1, "precondition: a")
+  assert(s.incrAt("b", 60, 1000) == 1, "precondition: b")
+  assert(s.incrAt("c", 3600, 1000) == 1, "precondition: c")
+  assert(len(s.entries) == 3, "precondition: the store must be full, got ${len(s.entries)}")
+
+  assert(s.incrAt("d", 5400, 1000) == 1, "the incr past the cap must still count, from 1")
+
+  assert(len(s.entries) == 3, "the cap was crossed: ${len(s.entries)} windows under a cap of 3")
+  assert(s.countAt("b", 1000) == 0, "the soonest-expiring window must be the one evicted")
+  assert(s.countAt("a", 1000) == 1, "a expires last and must survive")
+  assert(s.countAt("c", 1000) == 1, "c must survive")
+  // The incoming window must have LANDED — a store that "bounded" itself by
+  // dropping the incoming incr would satisfy every line above.
+  assert(s.countAt("d", 1000) == 1, "the window past the cap must still be held")
+}
+
+test "the window count never exceeds the cap, however many distinct keys are incremented" {
+  let s = MemoryCounter(5)
+  let i = 0
+  while (i < 100) {
+    let _ = s.incrAt("ip:198.51.100.${i}", 60, 2000)
+    assert(
+      len(s.entries) <= 5,
+      "the cap was crossed after ${i + 1} incr(s): ${len(s.entries)} windows",
+    )
+    i = i + 1
+  }
+  // The other side: a store that bounded itself by holding nothing would pass
+  // the loop above.
+  assert(len(s.entries) == 5, "a full counter must hold its cap, got ${len(s.entries)}")
+}
+
+test "at the cap, an expired window is spent before a live one" {
+  let s = MemoryCounter(2)
+  let _ = s.incrAt("dead", 10, 1000)
+  let _ = s.incrAt("live", 3600, 1000)
+
+  // 1020 is past "dead"'s expiry and far short of "live"'s. Only two incrs
+  // have happened, so the periodic sweep has not run: the eviction below is
+  // what has to prefer the corpse.
+  let _ = s.incrAt("new", 3600, 1020)
+
+  assert(len(s.entries) == 2, "the cap was crossed: ${len(s.entries)} windows under a cap of 2")
+  assert(s.countAt("live", 1020) == 1, "a live window must not be evicted while a dead one is held")
+  assert(s.countAt("new", 1020) == 1, "the incoming window must be held")
+}
+
+test "an incr on a key already present evicts nothing" {
+  let s = MemoryCounter(2)
+  // "a" outlives "b", so an implementation that evicted before EVERY incr
+  // rather than only before a new key would drop "b" here.
+  let _ = s.incrAt("a", 3600, 1000)
+  let _ = s.incrAt("b", 60, 1000)
+
+  assert(s.incrAt("a", 3600, 1001) == 2, "an existing window must count on, not restart at 1")
+  assert(len(s.entries) == 2, "a repeat incr must not change the window count")
+  assert(s.countAt("b", 1001) == 1, "the other window must survive a repeat incr")
+}
+
+test "expired windows are swept every Nth incr, not held until their key is touched again" {
+  // The complaint this answers: without a sweeper, a key seen once and never
+  // again holds its two integers until the process exits, because expiry was
+  // only ever noticed on a touch of that same key. Nothing touches these three
+  // keys after they die; the sweep is the only thing that can remove them.
+  let s = MemoryCounter(1000)
+  let _ = s.incrAt("dead-a", 60, 1000)
+  let _ = s.incrAt("dead-b", 60, 1000)
+  let _ = s.incrAt("dead-c", 60, 1000)
+
+  let later = 1061
+  let i = 0
+  while (i < memoryCounterSweepEvery - 4) {
+    let _ = s.incrAt("live-${i}", 3600, later)
+    i = i + 1
+  }
+
+  // The control, one incr short of the sweep: the dead windows are still
+  // there, so the assertion below is about the sweep and not about expiry
+  // having quietly removed them somewhere else.
+  assert(
+    len(s.entries) == memoryCounterSweepEvery - 1,
+    "before the sweep the dead windows must still be held, got ${len(s.entries)}",
+  )
+
+  let _ = s.incrAt("live-last", 3600, later)
+
+  assert(
+    len(s.entries) == memoryCounterSweepEvery - 3,
+      "the sweep must have dropped 3 dead windows, leaving " +
+      "${memoryCounterSweepEvery - 3}; got ${len(s.entries)}",
+  )
+}
+
+test "an evicted key starts a fresh quota: the cap bounds memory, it is not the limit" {
+  // This asserts the OVER-PERMISSIVE direction on purpose, because it is the
+  // security-relevant consequence of the bound and it is stated in the class
+  // comment and the README. Evicting a window loses a limit decision: the
+  // evicted key's next request starts at 1 again. A deployment that must keep
+  // counting past `maxKeys` distinct keys needs a Redis-backed store, not a
+  // bigger cap.
+  let s = MemoryCounter(1)
+  let _ = s.incrAt("ip:198.51.100.7", 3600, 1000)
+  assert(s.incrAt("ip:198.51.100.7", 3600, 1001) == 2, "precondition: the key is two deep")
+
+  let _ = s.incrAt("ip:203.0.113.9", 3600, 1002)
+
+  assert(len(s.entries) == 1, "the cap was crossed: ${len(s.entries)} windows under a cap of 1")
+  assert(
+    s.countAt("ip:198.51.100.7", 1002) == 0,
+    "the evicted key must read as absent, not as its old count",
+  )
+  assert(
+    s.incrAt("ip:198.51.100.7", 3600, 1003) == 1,
+    "an evicted key starts a fresh quota — the documented cost of the cap",
+  )
+}
+
+// `testpanic_` inverts the verdict (SPEC §18.4): these pass only if the
+// process really dies.
+test "testpanic_a_MemoryCounter_with_a_cap_of_zero_is_refused" {
+  let _ = MemoryCounter(0)
+  print("unreachable: MemoryCounter accepted a cap of 0\n")
+}
+
+test "testpanic_a_MemoryCounter_with_a_negative_cap_is_refused" {
+  let _ = MemoryCounter(-1)
+  print("unreachable: MemoryCounter accepted a negative cap\n")
+}
+
+// The control for both: without it they would both pass against an `init` that
+// panicked unconditionally.
+test "a cap of one constructs, and the counter then holds exactly one window" {
+  let s = MemoryCounter(1)
+  assert(s.incrAt("only", 3600, 1000) == 1, "a cap of 1 must construct and count")
+  assert(len(s.entries) == 1, "a cap of 1 must hold exactly one window, got ${len(s.entries)}")
+}
+
+// `testpanic_` reads the child's exit status only and cannot see the message,
+// so the text is pinned here against the const the panic uses.
+test "the cap refusal names the argument and shows a usable value" {
+  assert(
+    contains(memoryCounterCapMessage, "maxKeys"),
+    "the refusal must name `maxKeys`: '${memoryCounterCapMessage}'",
+  )
+  assert(
+    contains(memoryCounterCapMessage, "MemoryCounter(10_000)"),
+    "the refusal must show a usable cap: '${memoryCounterCapMessage}'",
+  )
+}
