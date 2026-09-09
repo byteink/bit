@@ -391,7 +391,7 @@ The reported case was a 101-column `if`, where breaking after `<` left
 `0) {` alone on the next line, reading as though the condition had ended on
 the line before:
 
-```bit
+```bit ignore
   if (descEqAgg(wa + descEnumPayloadBase, wb + descEnumPayloadBase, desc, blockPos, depth + 1) < 0) {
 ```
 
