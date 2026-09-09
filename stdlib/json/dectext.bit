@@ -1,0 +1,487 @@
+// Bit standard library — json module, typed decoding straight from TEXT
+// (#4501), with no `Json` tree in between.
+//
+//     let u = jsonDecodeText<User>(body)?
+//
+// WHY A SECOND ENTRY POINT. `jsonDecode<T>` (decode.bit) takes a `Json`, so the
+// DOM it reads is still built — the class objects are added ON TOP of it.
+// Measured on this branch against main `84871190`, 50,000 decodes of
+// `{"id":7,"name":"user7","active":true,"tags":[1,2,3]}` under `BIT_GC_STATS=1`,
+// objects taken as `swept + live` over a probe whose own floor is 6 objects
+// total: `jsonParse` alone is 25.0 per record and `jsonParse` +
+// `jsonDecode<Rec>` is 45.0. Reading a document into a class through the DOM
+// costs MORE than reading it into the DOM, which is the opposite of what a
+// typed decode is for. This file measures 6.0.
+//
+// So it drives lex.bit's token stream straight into the class's fields, handing
+// every span it reads to parse.bit's own decoders. Nothing in between is
+// materialised: no `Json` box, no `[]JsonEntry`, and no key string for a key
+// that carries no escape.
+//
+// `jsonDecode<T>` KEEPS ITS SIGNATURE. Decoding an already-built `Json` is a
+// real use — an editor, a proxy, anything that inspected the document first —
+// and this is a second entry point, not a replacement.
+//
+// THE ERRORS ARE THE SAME ERRORS. Every failure is the `JsonDecodeError` of
+// decode.bit, carrying the same four causes and the same full dotted path
+// (`addr.post_code`, `crumbs[1].post_code`), built with the same
+// `jsonDecPath`/`jsonDecIndex` and joined only inside a `fail` (#4502). A
+// document that is not well-formed JSON fails with parse.bit's own positional
+// error, exactly as `jsonParse` would have reported it.
+//
+// ONE DIFFERENCE FROM THE DOM PATH, AND IT IS INHERENT TO STREAMING. A single
+// forward pass reports the FIRST failure in DOCUMENT order. `jsonDecode` reads
+// a whole object before it decodes anything, so it reports an unknown key ahead
+// of a type error in an earlier field, and a missing key ahead of both. Given a
+// document with two faults in it the two entry points can therefore name
+// different ones. Each names a real fault, with the same message and the same
+// path; neither invents or hides one.
+
+// The forward cursor a synthesized text decoder drives, and the only type the
+// generated code names. Drives lex.bit's `Lexer` directly, and every span it
+// hands out goes to parse.bit's own decoders — `decodeStringLiteral`,
+// `classifyJsonNumber`, `parseJsonIntSpan`, `posError` — so the two entry
+// points cannot drift on what a document MEANS.
+//
+// IT IS NOT A `Parser`. That class carries a key-intern cache and two JSONC
+// flags, and this decoder uses neither: it compares keys against the source
+// bytes in place rather than materialising them, and `jsonDecodeText` is strict
+// RFC 8259. Wrapping one cost two live objects per decode — measured at 7.0
+// objects per record with it and 5.0 without, on 50,000 one-record decodes.
+//
+// `keyStart`/`keyEnd` are the content span (quotes excluded) of the object key
+// under the cursor, and `keyEsc` the offset of its first `\` or -1 when it has
+// none. Holding the SPAN rather than a decoded string is what makes a key free:
+// `jsonTextKeyIs` compares the source bytes in place, so a document of a
+// million records over four keys materialises no key at all. `key` is filled
+// only for the rare escaped key, which has no span to borrow.
+export class JsonReader {
+  src: string,
+  lx: Lexer,
+  steps: int,
+  budget: int,
+  keyStart: int,
+  keyEnd: int,
+  keyEsc: int,
+  key: string,
+}
+
+// A reader positioned on `src`'s first token.
+//
+// `budget` bounds every member and element loop a decoder runs, all of them at
+// once: `jsonTextKey` and `jsonTextItem` each consume at least one token before
+// they answer, and a token consumes at least one source byte, so the number of
+// times they can be called over the whole decode is at most `len(src) + 1`.
+// One counter on the reader is therefore a statically provable bound on loops
+// the generated code does not itself have to carry a guard for.
+export fn jsonTextReader(src: string): JsonReader {
+  let lx = newLexer(src)
+  lexNext(lx, false, false)
+  return JsonReader{
+    src: src,
+    lx: lx,
+    steps: 0,
+    budget: len(src) + 1,
+    keyStart: 0,
+    keyEnd: 0,
+    keyEsc: -1,
+    key: "",
+  }
+}
+
+// Charges one member or element step against the budget above.
+fn jsonTextStep(r: JsonReader): ()! {
+  r.steps = r.steps + 1
+  if (r.steps > r.budget) {
+    fail posError(r.src, "json: value exceeds token bound", r.lx.start)
+  }
+}
+
+// Nothing may follow the decoded value but whitespace. `jsonParse` makes the
+// same check through `parseTopLevel`, and with the same message: a trailing
+// second document is a malformed request, not a value.
+export fn jsonTextFinish(r: JsonReader): ()! {
+  if (r.lx.kind != TokenKind.Eof) {
+    fail posError(r.src, "json: trailing garbage after value", r.lx.start)
+  }
+}
+
+// ---- what the cursor is looking at -----------------------------------------
+
+// True when the token under the cursor can begin a JSON value at all. A token
+// that cannot — a `,`, a `:`, a closer, `Eof` — is a MALFORMED DOCUMENT rather
+// than a value of the wrong type, and must be reported as parse.bit reports it.
+fn jsonTextIsValue(r: JsonReader): bool {
+  let k = r.lx.kind
+  if (k == TokenKind.LBrace || k == TokenKind.LBracket) {
+    return true
+  }
+  if (k == TokenKind.StringTok || k == TokenKind.NumberTok) {
+    return true
+  }
+  return k == TokenKind.TrueTok || k == TokenKind.FalseTok || k == TokenKind.NullTok
+}
+
+// The JSON kind name a diagnostic quotes for the value under the cursor, in
+// `jsonKindName`'s own vocabulary (decode.bit) so the two entry points word a
+// mismatch identically.
+fn jsonTextKindName(r: JsonReader): string {
+  let k = r.lx.kind
+  if (k == TokenKind.LBrace) {
+    return "an object"
+  }
+  if (k == TokenKind.LBracket) {
+    return "an array"
+  }
+  if (k == TokenKind.StringTok) {
+    return "a string"
+  }
+  if (k == TokenKind.NumberTok) {
+    return "a number"
+  }
+  if (k == TokenKind.NullTok) {
+    return "null"
+  }
+  return "a boolean"
+}
+
+// The error for a value that is not what the field needs.
+//
+// Three outcomes, and which one it is depends on the TOKEN, not on the field:
+// an `Invalid` token is one of the four things lex.bit refuses (a depth-cap
+// hit, an unterminated string, an unterminated comment, a stray byte) and is
+// described exactly as `parseValue` describes it; a well-formed token that
+// cannot start a value is a malformed document; anything else is a real type
+// mismatch against the field, and only that one names the field.
+fn jsonTextWrong(r: JsonReader, path: string, expected: string): error {
+  if (r.lx.kind == TokenKind.Invalid) {
+    let why = describeInvalid(r.src, r.lx.start, r.lx.end)
+    return posError(r.src, why, r.lx.start)
+  }
+  if (!jsonTextIsValue(r)) {
+    return posError(r.src, "json: unexpected token, expected a value", r.lx.start)
+  }
+  return jsonDecErr(JsonDecodeCause.TypeMismatch, path, expected, jsonTextKindName(r))
+}
+
+// The path of the value under the cursor, from its container's path plus the
+// ONE step to it. Held apart and joined only here, inside a failure, for the
+// reason #4502 measured: the join allocates and only an error reads it.
+fn jsonTextJoin(path: string, key: string, idx: i64, byIndex: bool): string {
+  if (byIndex) {
+    return jsonDecIndex(path, idx)
+  }
+  return jsonDecPath(path, key)
+}
+
+// ---- entering a container --------------------------------------------------
+
+// Enters the object at `path`, refusing a value that is not an object and a
+// nesting level past `jsonMaxDecodeDepth`. `depth` is the number of levels
+// already entered, exactly as `jsonDecObject` counts them.
+export fn jsonTextObject(r: JsonReader, path: string, depth: i64): ()! {
+  if (depth >= jsonMaxDecodeDepth) {
+    fail jsonDecErr(JsonDecodeCause.MaxDepth, path, "", "")
+  }
+  if (r.lx.kind != TokenKind.LBrace) {
+    fail jsonTextWrong(r, path, "an object")
+  }
+  advanceLexer(r.lx, false)
+}
+
+// The same for an array: a `[]T` is a level of nesting whether or not `T` is a
+// class, which is the rule `jsonDecArray` already applies.
+export fn jsonTextArray(r: JsonReader, path: string, depth: i64): ()! {
+  if (depth >= jsonMaxDecodeDepth) {
+    fail jsonDecErr(JsonDecodeCause.MaxDepth, path, "", "")
+  }
+  if (r.lx.kind != TokenKind.LBracket) {
+    fail jsonTextWrong(r, path, "an array")
+  }
+  advanceLexer(r.lx, false)
+}
+
+// ---- walking a container ---------------------------------------------------
+
+// The `,`/`}` bookkeeping before the `n`th member. A trailing comma is refused
+// the way parse.bit refuses it — after a `,` this returns true and the caller
+// then requires a key — so strict RFC 8259 stays strict.
+fn jsonTextMemberStart(r: JsonReader, n: i64): bool! {
+  if (n != 0) {
+    if (r.lx.kind == TokenKind.RBrace) {
+      advanceLexer(r.lx, false)
+      return false
+    }
+    if (r.lx.kind != TokenKind.Comma) {
+      fail posError(r.src, "json: expected ',' or '}' in object", r.lx.start)
+    }
+    advanceLexer(r.lx, false)
+    return true
+  }
+  if (r.lx.kind == TokenKind.RBrace) {
+    advanceLexer(r.lx, false)
+    return false
+  }
+  return true
+}
+
+// Advances to the `n`th member's VALUE, recording its key on the reader, and
+// answers whether there was one — false when the object closed instead. `n` is
+// the member's ordinal within this object, which is what distinguishes the
+// first member (no separator) from the rest (a `,`).
+export fn jsonTextKey(r: JsonReader, n: i64): bool! {
+  jsonTextStep(r)?
+  if (!jsonTextMemberStart(r, n)?) {
+    return false
+  }
+  if (r.lx.kind != TokenKind.StringTok) {
+    fail posError(r.src, "json: expected string key", r.lx.start)
+  }
+  r.keyStart = r.lx.start + 1
+  r.keyEnd = r.lx.end - 1
+  r.keyEsc = scanEscape(r.src, r.keyStart, r.keyEnd)?
+  r.key = ""
+  if (r.keyEsc >= 0) {
+    r.key = decodeEscaped(r.src, r.keyStart, r.keyEnd, r.keyEsc)?
+  }
+  advanceLexer(r.lx, false)
+  if (r.lx.kind != TokenKind.Colon) {
+    fail posError(r.src, "json: expected ':' after object key", r.lx.start)
+  }
+  advanceLexer(r.lx, false)
+  return true
+}
+
+// The `,`/`]` bookkeeping before the `i`th element, and the array twin of
+// `jsonTextKey`: true when an element follows, false when the array closed.
+export fn jsonTextItem(r: JsonReader, i: i64): bool! {
+  jsonTextStep(r)?
+  if (i != 0) {
+    if (r.lx.kind == TokenKind.RBracket) {
+      advanceLexer(r.lx, false)
+      return false
+    }
+    if (r.lx.kind != TokenKind.Comma) {
+      fail posError(r.src, "json: expected ',' or ']' in array", r.lx.start)
+    }
+    advanceLexer(r.lx, false)
+    return true
+  }
+  if (r.lx.kind == TokenKind.RBracket) {
+    advanceLexer(r.lx, false)
+    return false
+  }
+  return true
+}
+
+// ---- the key under the cursor ----------------------------------------------
+
+// True when the current member's key is `key`.
+//
+// THE COMMON CASE ALLOCATES NOTHING. An escape-free key is compared against the
+// source bytes in place (`spanEqualsKey`, parse.bit), so a decoder that tries
+// each of its fields' keys in turn materialises none of them — which is what
+// makes the whole member walk free of the DOM's per-key string.
+export fn jsonTextKeyIs(r: JsonReader, key: string): bool {
+  if (r.keyEsc >= 0) {
+    return r.key == key
+  }
+  if (len(key) != r.keyEnd - r.keyStart) {
+    return false
+  }
+  return spanEqualsKey(r.src, r.keyStart, key, len(key))
+}
+
+// The current member's key as a string. Materialises it — the one place a key
+// costs anything — so it is called only where the key is DATA (a
+// `map<string, T>`'s key) or where a failure is already being built.
+export fn jsonTextKeyText(r: JsonReader): string {
+  if (r.keyEsc >= 0) {
+    return r.key
+  }
+  return r.src[r.keyStart:r.keyEnd]
+}
+
+// The current member's key claimed by no field of the class.
+//
+// Reported rather than ignored, for the reason `jsonDecUnknown` states: a
+// dropped field and an accepted field are indistinguishable to whoever sent the
+// document.
+export fn jsonTextUnknown(r: JsonReader, path: string): ()! {
+  let at = jsonDecPath(path, jsonTextKeyText(r))
+  fail jsonDecErr(JsonDecodeCause.UnknownKey, at, "", "")
+}
+
+// A key present with an explicit `null`, consumed.
+//
+// A non-`Option` field has nowhere to put a null, so a null leaves the field
+// unset and the missing-key check below reports it — which is exactly what
+// `jsonDecMember` does on the DOM path. An `Option` field left unset is `None`,
+// and so is one whose key never appeared: the two are deliberately the same
+// answer here and deliberately different in the encoder (SPEC §10.5).
+export fn jsonTextNull(r: JsonReader): bool {
+  if (r.lx.kind != TokenKind.NullTok) {
+    return false
+  }
+  advanceLexer(r.lx, false)
+  return true
+}
+
+// The check a non-`Option` field owes after its object has been walked: `seen`
+// is false when the key never appeared, or appeared as `null`.
+export fn jsonTextNeed(seen: bool, path: string, key: string): ()! {
+  if (!seen) {
+    fail jsonDecErr(JsonDecodeCause.MissingKey, jsonDecPath(path, key), "", "")
+  }
+}
+
+// ---- one value -------------------------------------------------------------
+
+// Each shape has one core taking both halves of the path plus which half to
+// use, and a by-key and a by-index wrapper naming the two spellings a decoder
+// actually writes. The wrappers are what the generated code calls, so a reader
+// opening `jsonTextIntKey` sees the same surface `jsonDecIntKey` gives on the
+// DOM side; the core is where the behaviour lives, once.
+//
+// `jsonTextInt*` accepts only an INTEGER literal: JSON has one number type, but
+// a field declared as an integer that silently truncated `1.5` would be a wrong
+// answer rather than a rejected document. `jsonTextFloat*` accepts both, since
+// `3` and `3.0` are the same document to every producer on the wire. Both rules
+// are `jsonDecInt`/`jsonDecFloat`'s, unchanged.
+
+// The mismatch an integer field raises for a number it cannot hold — a
+// fraction, an exponent, or a magnitude past i64. The DOM path reaches the same
+// answer in two steps (`decodeNumber` falls back to `JsonFloat`, `jsonDecInt`
+// then refuses it), so both report `expected an integer, found a number`.
+fn jsonTextNotInt(path: string): error {
+  return jsonDecErr(JsonDecodeCause.TypeMismatch, path, "an integer", "a number")
+}
+
+fn jsonTextIntAt(
+  r: JsonReader, path: string, key: string, idx: i64, byIndex: bool,
+): i64! {
+  if (r.lx.kind != TokenKind.NumberTok) {
+    fail jsonTextWrong(r, jsonTextJoin(path, key, idx, byIndex), "an integer")
+  }
+  let start = r.lx.start
+  let end = r.lx.end
+  let cls = classifyJsonNumber(r.src, start, end)
+  if (cls == 0) {
+    fail posError(r.src, "json: invalid number literal", start)
+  }
+  if (cls != 1) {
+    fail jsonTextNotInt(jsonTextJoin(path, key, idx, byIndex))
+  }
+  let v = parseJsonIntSpan(r.src, start, end) catch _ {
+    fail jsonTextNotInt(jsonTextJoin(path, key, idx, byIndex))
+  }
+  advanceLexer(r.lx, false)
+  return v
+}
+
+export fn jsonTextIntKey(r: JsonReader, path: string, key: string): i64! {
+  return jsonTextIntAt(r, path, key, 0, false)?
+}
+
+export fn jsonTextIntIndex(r: JsonReader, path: string, i: i64): i64! {
+  return jsonTextIntAt(r, path, "", i, true)?
+}
+
+fn jsonTextFloatAt(
+  r: JsonReader, path: string, key: string, idx: i64, byIndex: bool,
+): f64! {
+  if (r.lx.kind != TokenKind.NumberTok) {
+    fail jsonTextWrong(r, jsonTextJoin(path, key, idx, byIndex), "a number")
+  }
+  let start = r.lx.start
+  let end = r.lx.end
+  let cls = classifyJsonNumber(r.src, start, end)
+  if (cls == 0) {
+    fail posError(r.src, "json: invalid number literal", start)
+  }
+  advanceLexer(r.lx, false)
+  return jsonTextSpanFloat(r.src, start, end, cls)
+}
+
+// The f64 an already-validated number span denotes. An integral literal goes
+// through `parseJsonIntSpan` so it converts exactly the way `jsonAsNumber` does
+// off a `JsonInt`; anything else — and an integer too wide for i64 — goes
+// through the runtime's own `parseFloat`, which is the same primitive
+// `decodeNumber` uses, so neither entry point can drift a ULP from the other.
+fn jsonTextSpanFloat(src: string, start: int, end: int, cls: int): f64 {
+  if (cls != 1) {
+    return parseFloat(src[start:end])
+  }
+  let v = parseJsonIntSpan(src, start, end) catch _ {
+    return parseFloat(src[start:end])
+  }
+  return f64(v)
+}
+
+export fn jsonTextFloatKey(r: JsonReader, path: string, key: string): f64! {
+  return jsonTextFloatAt(r, path, key, 0, false)?
+}
+
+export fn jsonTextFloatIndex(r: JsonReader, path: string, i: i64): f64! {
+  return jsonTextFloatAt(r, path, "", i, true)?
+}
+
+fn jsonTextBoolAt(
+  r: JsonReader, path: string, key: string, idx: i64, byIndex: bool,
+): bool! {
+  if (r.lx.kind == TokenKind.TrueTok) {
+    advanceLexer(r.lx, false)
+    return true
+  }
+  if (r.lx.kind == TokenKind.FalseTok) {
+    advanceLexer(r.lx, false)
+    return false
+  }
+  fail jsonTextWrong(r, jsonTextJoin(path, key, idx, byIndex), "a boolean")
+}
+
+export fn jsonTextBoolKey(r: JsonReader, path: string, key: string): bool! {
+  return jsonTextBoolAt(r, path, key, 0, false)?
+}
+
+export fn jsonTextBoolIndex(r: JsonReader, path: string, i: i64): bool! {
+  return jsonTextBoolAt(r, path, "", i, true)?
+}
+
+fn jsonTextStringAt(
+  r: JsonReader, path: string, key: string, idx: i64, byIndex: bool,
+): string! {
+  if (r.lx.kind != TokenKind.StringTok) {
+    fail jsonTextWrong(r, jsonTextJoin(path, key, idx, byIndex), "a string")
+  }
+  let s = decodeStringLiteral(r.src, r.lx.start, r.lx.end)?
+  advanceLexer(r.lx, false)
+  return s
+}
+
+export fn jsonTextStringKey(r: JsonReader, path: string, key: string): string! {
+  return jsonTextStringAt(r, path, key, 0, false)?
+}
+
+export fn jsonTextStringIndex(r: JsonReader, path: string, i: i64): string! {
+  return jsonTextStringAt(r, path, "", i, true)?
+}
+
+// ---- the entry point -------------------------------------------------------
+
+// Decodes the JSON text `src` into `T`, which must be a class carrying `@json`,
+// without building a `Json` tree.
+//
+// THIS BODY NEVER RUNS, for the reason `jsonDecode`'s does not: every call is
+// rewritten by the compiler into a call to the decoder synthesized for the
+// concrete `T` (compiler/classjsondecodetextcall.bit), and a `T` that is not a
+// `@json` class is refused at compile time as E0145 naming the type and the
+// mark. The declaration exists so the name is importable and the call parses
+// and resolves; it fails rather than returning a wrong value, so a
+// specialisation this file has not anticipated is a visible runtime failure
+// rather than a silent zero.
+export fn jsonDecodeText<T>(src: string): T! {
+  fail jsonDecErr(
+    JsonDecodeCause.TypeMismatch, "", "a class carrying '@json'", "raw text",
+  )
+}
