@@ -118,6 +118,9 @@ fn vInstWalk(c: Checker, node: int, env: TypeEnv, site: Span, depth: int) {
   if (getNode(c.tree, node).tag == Tag.Member) {
     vInstMember(c, node, env)
   }
+  if (getNode(c.tree, node).tag == Tag.Call) {
+    vInstCall(c, node, env, site)
+  }
   for k of kidsOf(c.tree, node) {
     vInstWalk(c, k, env, site, depth + 1)
   }
@@ -231,6 +234,135 @@ fn vInstIndex(c: Checker, node: int, env: TypeEnv) {
       "'${typeName(c.ctx, sub)}' cannot be indexed",
     )
   }
+}
+
+// The E0051 bound rule (`vGenericBound`, validategeneric.bit), re-judged for
+// the generic calls this instantiation's body MAKES — the transitive half of
+// the rule, and #4646.
+//
+// A generic body is checked once against its own rigid type params, so
+// `vBoundJudgeable` cannot judge `inner(x)` inside `fn outer<T>(v: T)`: the
+// argument is `T`, and rejecting a rigid `T` would reject every generic that
+// forwards to a bounded one. Nothing then judged it again per instantiation,
+// so `outer(7)` recorded `inner<i64>` and `outer()` — whose empty variadic slot
+// binds `T = ()` (#4597/#4633) — recorded `inner<()>`, neither of which
+// satisfies `inner`'s `T: Named`. `bit check` exited 0 and the LOWERER refused,
+// as E0092 inside `inner`'s own body, noting a call inside `outer`'s body: the
+// #1430 check/build divergence, reported at the wrong layer and at two spans
+// the user did not write.
+//
+// #4633 asked this question of the CALLED generic's own bound. Here the bound
+// is one level down, and the `()` is not the cause — `outer(7)` reproduces it
+// with `i64` — so the empty slot falls out of the general rule rather than
+// needing one of its own.
+//
+// THE SPAN IS THE INSTANTIATION'S OWN CALL SITE (`site`, #3827), not the call
+// inside the template: `outer()` is the line the user wrote and the only one
+// they can change (`outer<Tag>()` is what the diagnostic asks for). The note
+// names the inner call, the way E0073's `vInstInterp` names the outer one.
+//
+// Judged with `genericTypeArgs` + `substType`, which is exactly what
+// `recordSubtreeInstantiations` (lowerdriver.bit) records the entry with, so
+// what is judged here is the entry Pass A2 will emit rather than a second
+// resolution that could disagree with it.
+//
+// This reaches one level. `validateInstantiations` runs before Pass A1's
+// closure (`checkResolved`, checkproject.bit), so the ledger holds only what
+// the check pass recorded; a violation three generics deep is still the
+// lowerer's E0092. That gap is real and is filed, not fixed here.
+fn vInstCall(c: Checker, node: int, env: TypeEnv, site: Span) {
+  let callee = kidsOf(c.tree, node)[0] // [callee, generic_args, arg_list]
+  if (getNode(c.tree, callee).tag != Tag.Ident) {
+    return
+  }
+  let name = nodeText(c.tree, c.source, callee)
+  if (shadowedByValue(c, callee, name) || !isGenericFuncAt(c, callee, name)) {
+    return
+  }
+  let fr = funcRefAt(c, callee, name)
+  let tps = vDeclTypeParams(fr)
+  let raw = genericTypeArgs(c, name, node)
+  // `genericTypeArgs` builds one entry per declared type parameter; a length
+  // mismatch means the pairing is not trustworthy, so nothing is judged rather
+  // than something guessed — `vBoundLoop`'s rule, for the same reason.
+  if (len(raw) != len(tps)) {
+    return
+  }
+  let i = 0
+  while (i < len(tps)) {
+    let sub = vInstBadCallArg(c, fr.owner, tps[i], raw[i], env)
+    if (sub != 0) {
+      let bound = vBoundIfaceOf(fr.owner, tps[i])
+      vInstReportCallBound(c, name, sub, bound, site)
+      note(
+        c.diags, vSpan(c, node),
+        "'${name}' is called here, in the body emitted for this instantiation",
+      )
+    }
+    i = i + 1
+  }
+}
+
+// The substituted argument when it VIOLATES the type parameter's bound, else 0.
+//
+// `oc` declares the callee, so `tp` and its constraint nodes index `oc.tree`
+// (`vBoundIfaceOf`'s rule). The argument-side guards are `vInstConcreteType`'s,
+// applied to a TYPE rather than to an expression: judge only what the sweep set
+// aside (an argument mentioning a type param — an already-concrete one was
+// decided by E0051 on the body and re-deciding it would double-report) and only
+// a substitution that is fully concrete.
+//
+// The bound side is `vBoundIsJudgeable` + `vSatisfies` rather than
+// `vArgViolatesBound`, for #4633's reason: `vBoundJudgeable`'s `arg != voidId`
+// clause exists to stop an inference GAP becoming a false E0051, and the `()`
+// an empty variadic slot produces is not a gap standing in for something else —
+// it is the argument the ledger records and Pass A2 emits against. A gap cannot
+// reach here in its place: an un-inferred argument is `0` or a bare `voidId`,
+// and neither mentions a type param, so both are skipped above.
+fn vInstBadCallArg(c: Checker, oc: Checker, tp: int, rawArg: int, env: TypeEnv): int {
+  let sub = vInstSubstArg(c, rawArg, env)
+  if (sub == 0) {
+    return 0
+  }
+  let bound = vBoundIfaceOf(oc, tp)
+  if (!vBoundIsJudgeable(c, bound) || vSatisfies(c, sub, bound)) {
+    return 0
+  }
+  return sub
+}
+
+// A type argument the sweep set aside, substituted under this instantiation's
+// bindings — or 0 when nothing decidable comes out of it. `vInstConcreteType`'s
+// guard sequence, entered from a TYPE instead of from an expression node.
+fn vInstSubstArg(c: Checker, rawArg: int, env: TypeEnv): int {
+  if (rawArg == 0 || !vHasTypeParam(c, rawArg, 0)) {
+    return 0
+  }
+  let sub = substType(c, rawArg, env, 0)
+  if (sub == 0 || sub == rawArg || vMentionsInvalid(c, sub, 0) || vHasTypeParam(c, sub, 0)) {
+    return 0
+  }
+  return sub
+}
+
+// E0051's text, addressed to the instantiation rather than to a written type
+// argument: the user wrote no `<...>` at `site`, so the message names the
+// generic whose bound broke instead of an argument index they cannot see.
+// `vSatisfyReason` is E0041's own renderer, the same one `vReportBound` uses,
+// so the two spellings of E0051 cannot drift.
+fn vInstReportCallBound(c: Checker, name: string, sub: int, bound: int, site: Span) {
+  let hint = vSatisfyReason(c, sub, bound)
+  if (hint == "") {
+    hint = "check the interface's method set against this type"
+  }
+  report(
+    c.diags, ecMissingMethod, site,
+    "this instantiation calls '${name}' with '${typeName(c.ctx, sub)}', which does not satisfy the bound '${typeName(
+      c.ctx,
+      bound,
+    )}'",
+    hint,
+  )
 }
 
 // The type of an EXPRESSION the sweep set aside, substituted under this
