@@ -1,5 +1,6 @@
 // stdlib/http2/streams.test.bit — a terminal stream is released from the
-// connection's stream table (#4594).
+// connection's stream table (#4594), and a stream THIS side resets answers the
+// `roundTrip` waiting on it (#4598, the last section).
 //
 // #4590 bounded what ONE stream may buffer. Nothing bounded how many streams a
 // connection keeps: `h2connCloseStream` flipped the state and left the entry —
@@ -337,4 +338,202 @@ test "a body larger than the initial window completes through the resume path" {
   assert(res.status == 200, "status = ${res.status}, want 200")
   assert(len(res.body) == 200000, "echoed ${len(res.body)} bytes, want 200000")
   assert(h2connBytesEqual(res.body, btPattern(200000)), "the echoed body is not the bytes sent")
+}
+
+// --- a reset THIS side asked for (#4598) -------------------------------------
+//
+// `Conn.resetStream` reaches the loop as an `h2cmdReset` command, and its
+// handler used to close the stream and send nothing on `s.replyCh`. Nothing
+// else would either: `h2connFailAll` is the only thing that wakes a `roundTrip`
+// after the fact and it skips a closed stream by its own test, so a green
+// thread parked in `roundTrip` on a stream another thread reset never returned
+// at `deadlineNs == 0` — and on a deadline returned `http2: timed out waiting
+// for response`, which named the wrong cause.
+//
+// Driven through `h2connHandleCmd` rather than `h2connCmdReset` directly, so
+// the dispatch the loop actually performs is part of what is under test.
+
+// The command `Conn.resetStream(streamId, errorCode)` puts on `cmdCh`, field
+// for field.
+fn srResetCmd(streamId: int, errorCode: int): h2connCmd {
+  return h2connCmd{
+    kind: h2cmdReset,
+    request: h2connZeroRequest(),
+    response: h2connZeroResponse(),
+    streamId: streamId,
+    errorCode: errorCode,
+    replyCh: h2connDummyReply(),
+  }
+}
+
+// The message a locally reset `roundTrip` must be handed, and the one it must
+// NOT be handed. Spelled out here rather than built from the source's own
+// helpers, so a change to either wording fails a test instead of following it.
+fn srLocalWant(code: int): string {
+  return "http2: stream reset locally (code ${code})"
+}
+
+fn srPeerWant(code: int): string {
+  return "http2: stream reset by peer (code ${code})"
+}
+
+test "a locally reset client stream answers the round trip waiting on it" {
+  // The ticket's acceptance: the reset arrives with the `roundTrip` still
+  // parked, and the receive below is the last runnable task in this test, so
+  // before the fix the runtime's deadlock detector turns the hang into a named
+  // failure rather than a stall.
+  let st = btState(true, 1048576)
+  let replyCh = chan<h2connMsg>(1)
+  let s = btOpenStream(st, 1, replyCh)
+
+  h2connHandleCmd(st, srResetCmd(1, errorCancel))
+
+  let msg = <- replyCh
+  assert(!msg.ok, "the locally reset round trip was answered with a success")
+  assert(msg.errMsg == srLocalWant(errorCancel), "roundTrip was told '${msg.errMsg}'")
+  assert(
+    msg.errMsg != srPeerWant(errorCancel),
+    "a reset this side asked for was reported as the peer's doing",
+  )
+  assert(s.state == h2stClosed, "the stream is in state ${s.state}, want ${h2stClosed} (closed)")
+  assert(s.reset, "the stream was closed without being marked reset")
+  assert(s.errorCode == errorCancel, "stream error code = ${s.errorCode}, want ${errorCancel}")
+  assert(len(st.streams) == 0, "st.streams holds ${len(st.streams)} entries, want 0")
+  assert(len(st.present) == 0, "st.present holds ${len(st.present)} entries, want 0")
+
+  // And the peer is still told, which is the half that already worked.
+  let sent = btNextWritten(st) catch e {
+    assert(false, "no frame was queued for the peer: ${e.message()}")
+    return
+  }
+  let rst = decodeRstStream(sent) catch e2 {
+    assert(false, "the queued frame is not RST_STREAM: ${e2.message()}")
+    return
+  }
+  assert(rst.streamId == 1, "RST_STREAM on stream ${rst.streamId}, want 1")
+  assert(rst.errorCode == errorCancel, "RST_STREAM code = ${rst.errorCode}, want ${errorCancel}")
+}
+
+test "a locally reset stream is answered exactly once" {
+  // The reply is a send on a capacity-1 channel, so a second one would park the
+  // loop thread outright. `h2connFailStreamMsg` sets `s.replied` and the close
+  // drops the entry, so neither a later connection failure nor a second reset
+  // can produce one — checked rather than argued, since both paths walk state
+  // this test can drive.
+  let st = btState(true, 1048576)
+  let replyCh = chan<h2connMsg>(1)
+  btOpenStream(st, 1, replyCh)
+
+  h2connHandleCmd(st, srResetCmd(1, errorCancel))
+  let msg = <- replyCh
+  assert(msg.errMsg == srLocalWant(errorCancel), "roundTrip was told '${msg.errMsg}'")
+
+  h2connHandleCmd(st, srResetCmd(1, errorCancel))
+  h2connFailAll(st, "http2: connection closed")
+  assert(
+    gaReplyChEmpty(replyCh),
+    "an already-answered round trip was answered a second time",
+  )
+}
+
+test "resetting a stream that is already gone tells the peer and nothing else" {
+  // `resetStream` takes an id the caller tracked itself, so it can name a
+  // stream that has already finished — or one that never existed. RFC 9113 §6.4
+  // allows RST_STREAM on a closed stream, and there is nothing on this side
+  // left to fail.
+  let st = btState(true, 1048576)
+  h2connHandleCmd(st, srResetCmd(7, errorCancel))
+  let sent = btNextWritten(st) catch e {
+    assert(false, "no frame was queued for the peer: ${e.message()}")
+    return
+  }
+  let rst = decodeRstStream(sent) catch e2 {
+    assert(false, "the queued frame is not RST_STREAM: ${e2.message()}")
+    return
+  }
+  assert(rst.streamId == 7, "RST_STREAM on stream ${rst.streamId}, want 7")
+  assert(st.running, "resetting an unknown stream stopped the connection")
+  assert(srDrainWrites(st) == 0, "resetting an unknown stream queued more than the RST_STREAM")
+}
+
+test "a server resetting a stream sends RST_STREAM and replies to nobody" {
+  // The server half: `h2connFailStreamMsg`'s reply is behind `st.isClient`, so
+  // a served stream is closed and released with its dummy reply channel left
+  // untouched. A stray send there would be silent (the channel is buffered), so
+  // it is asserted rather than assumed.
+  let st = btState(false, 1048576)
+  let replyCh = h2connDummyReply()
+  let s = btOpenStream(st, 1, replyCh)
+
+  h2connHandleCmd(st, srResetCmd(1, errorInternalError))
+
+  assert(s.state == h2stClosed, "the stream is in state ${s.state}, want ${h2stClosed} (closed)")
+  assert(len(st.streams) == 0, "st.streams holds ${len(st.streams)} entries, want 0")
+  assert(gaReplyChEmpty(replyCh), "a server stream's reply channel was written to")
+  let sent = btNextWritten(st) catch e {
+    assert(false, "no frame was queued for the peer: ${e.message()}")
+    return
+  }
+  let rst = decodeRstStream(sent) catch e2 {
+    assert(false, "the queued frame is not RST_STREAM: ${e2.message()}")
+    return
+  }
+  assert(
+    rst.errorCode == errorInternalError,
+    "RST_STREAM code = ${rst.errorCode}, want ${errorInternalError}",
+  )
+}
+
+test "Conn.resetStream releases a round trip parked on that stream" {
+  // End to end at `deadlineNs == 0`, over a real client `Conn` whose peer never
+  // answers — the hang the ticket reports, and the only way `resetStream` is
+  // reachable today: the caller knows the id because it opened the connection's
+  // first stream and this engine allocates `h2connFirstId(true)` = 1 for it.
+  // That is exactly the usage docs/stdlib/http2.md now documents, so this test
+  // is the check that the documented usage works.
+  //
+  // `gaConnectOn`/`gaResult`/`gaRoundTrip` are goaway.test.bit's, same flat
+  // `std/http2` module; a peer driven by hand is required either way, since a
+  // second `Conn` would answer the request and there would be nothing parked.
+  let (w, conn) = gaConnectOn() catch e {
+    assert(false, "connect failed: ${e.message()}")
+    return
+  }
+  let done = chan<gaResult>(1)
+  spawn gaRoundTrip(conn, done)
+
+  // Wait for the request's HEADERS, so the stream provably exists before the
+  // reset — a reset that raced ahead of it would take the "already gone" path
+  // above and prove nothing about a parked caller.
+  let opened = false
+  let i = 0
+  while (i < 8 && !opened) {
+    let f = hbNextFrame(w) catch e2 {
+      assert(false, "the client stopped writing before its HEADERS: ${e2.message()}")
+      return
+    }
+    if (f.header.ftype == frameHeaders) {
+      opened = true
+    }
+    i = i + 1
+  }
+  assert(opened, "the client never sent its request")
+
+  conn.resetStream(1, errorCancel)
+
+  let res = <- done
+  assert(!res.ok, "a round trip on a locally reset stream returned a response")
+  assert(res.msg == srLocalWant(errorCancel), "roundTrip failed with '${res.msg}'")
+
+  // The peer is told on the wire too, not just this side torn down.
+  let sent = hbNextFrame(w) catch e3 {
+    assert(false, "no frame reached the peer after the reset: ${e3.message()}")
+    return
+  }
+  let rst = decodeRstStream(sent) catch e4 {
+    assert(false, "the frame the peer got is not RST_STREAM: ${e4.message()}")
+    return
+  }
+  assert(rst.streamId == 1, "RST_STREAM on stream ${rst.streamId}, want 1")
+  assert(rst.errorCode == errorCancel, "RST_STREAM code = ${rst.errorCode}, want ${errorCancel}")
 }
