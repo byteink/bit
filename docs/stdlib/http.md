@@ -41,8 +41,8 @@ Rate-limit, ban and audit by `peer`; `X-Forwarded-For` and its relatives are
 peer-supplied header text. On HTTP/1.1 and HTTP/2 it is read off the socket with
 `std/net`'s `Conn.peerIp()`. HTTP/3 has no connected socket to ask - its UDP
 socket is bound and shared by every client - so there it is `std/quic`'s
-`Conn.peerIp()` instead: the source of the datagram that completed that
-connection's QUIC handshake, read once per connection (see [HTTP/3](#http3)).
+`Conn.peerIp()` instead: the source of the datagram that established that QUIC
+connection, read once per connection (see [HTTP/3](#http3)).
 
 `peer` is `""`, never a placeholder address, whenever there is no address to be
 had: a `Request` you build yourself, and one whose connection died before the

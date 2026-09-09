@@ -881,8 +881,11 @@ able to fail an operation, and the value is already in hand rather than read bac
 from the connection's loop.
 
 Which address, since a QUIC connection is not pinned to one: the source address of
-the datagram that COMPLETED THE HANDSHAKE, captured at that instant and frozen for
-the connection's life. A peer may migrate to a new address mid-connection (RFC 9000
+the datagram that ESTABLISHED THIS CONNECTION, captured at that instant and frozen
+for the connection's life. On a server that is the client's Initial carrying the
+ClientHello; on a client it is the server's flight that finished the handshake.
+Either way it is fixed before the connection is handed to the application, so no
+later packet can move it. A peer may migrate to a new address mid-connection (RFC 9000
 §9) and this endpoint keeps replying to wherever its latest datagram came from, so
 the reported address can go stale - deliberately. The handshake address is the one
 any authorization or audit decision was implicitly made against, it is stable, and

@@ -414,7 +414,7 @@ transport error.
 
 The peer's IPv4 address in dotted quad, or `""` when it is not known. Forwards
 `quic.Conn.peerIp` unchanged, including its ruling on a connection that may
-migrate: the source of the datagram that completed the QUIC handshake, frozen
+migrate: the source of the datagram that established the QUIC connection, frozen
 there (RFC 9000 §9). Never fails and never blocks - a peer address is metadata and
 must not be able to fail a request. On the client side of a connection this names
 the server.
