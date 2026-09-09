@@ -673,9 +673,32 @@ Bundle the three closures into a `Transport`.
 
 The SETTINGS a `Conn` advertises: `initialWindowSize` (the per-stream receive
 window it grants the peer), `maxFrameSize` (the largest frame payload it
-accepts), and `headerTableSize` (its HPACK dynamic-table bound) - plus
-`maxBodyBytes`, the one local limit that is not a SETTINGS parameter. All four
-fields are exported.
+accepts), `headerTableSize` (its HPACK dynamic-table bound), and
+`maxHeaderListBytes` (SETTINGS_MAX_HEADER_LIST_SIZE) - plus `maxBodyBytes`, the
+one local limit that is not a SETTINGS parameter. All five fields are exported.
+
+`maxHeaderListBytes` is the largest header block the connection will accumulate
+across a HEADERS frame and every CONTINUATION continuing it. `maxFrameSize`
+bounds each *frame* and says nothing about their sum, so without this a peer
+could send HEADERS without END_HEADERS and then CONTINUATION frames forever. A
+fragment that would take the block past the budget is refused before it is
+accumulated, and the connection fails with GOAWAY carrying
+`errorEnhanceYourCalm` (RFC 9113 §7).
+
+The failure is at the *connection* level, not the stream level, because the
+HPACK decoder's dynamic table is shared by every stream on the connection and is
+only advanced by decoding a block: skipping one desyncs the table for every
+later block, and decoding it is the work being refused. The code is
+ENHANCE_YOUR_CALM rather than PROTOCOL_ERROR because the peer's framing is
+legal - it is generating more load than we will process, which is what that code
+says.
+
+The number is counted in the HPACK-*encoded* octets the connection holds, while
+SETTINGS_MAX_HEADER_LIST_SIZE is defined on the *uncompressed* field list (name
++ value + 32 per field). Huffman coding does not only shrink - an octet above
+`0x7f` costs 20 to 30 bits - so the default carries headroom for that asymmetry
+rather than matching the advertised number exactly. As with `maxBodyBytes` there
+is no value meaning "unlimited": `0` refuses every header block.
 
 `maxBodyBytes` is the most DATA one stream may accumulate. A frame that would
 take a stream's buffered body past it is refused before those bytes are
@@ -696,9 +719,15 @@ than `maxBodyBytes` times every request ever served.
 ### `defaultConfig(): Config`
 
 The RFC defaults: a 65535-byte initial window, a 16384-byte max frame size, a
-4096-byte header table, and a 32 MiB per-stream body budget - the same number
-`std/http`'s `setMaxBodyBytes` setters default to, so an HTTP/2 exchange and an
-HTTP/1.1 one are bounded alike.
+4096-byte header table, a 128 KiB header-block budget, and a 32 MiB per-stream
+body budget - the last the same number `std/http`'s `setMaxBodyBytes` setters
+default to, so an HTTP/2 exchange and an HTTP/1.1 one are bounded alike.
+
+128 KiB is twice `std/http`'s own `maxHeaderBytes` (65536), which bounds a
+decoded HTTP/1.1 block rather than an encoded HPACK one. The headroom is
+measured against the largest header block the test corpus sends: the 60000-byte
+value in `_tests_/imports/http2conn` Huffman-codes to 56920 octets, 56947 for
+the whole block, which is 43% of the budget.
 
 ### `Request`
 
