@@ -3,20 +3,29 @@
 // validatecall.bit/validateiface.bit/lowercall.bit: same module, so this
 // needs no imports and no call-site changes.
 //
-// SCOPE: named arguments are validated and lowered here ONLY for a direct
-// call to a CONCRETE (non-generic) top-level free function or `extern fn` —
-// the shape `vCall` (validatecall.bit) already resolves through `funcRefAt`.
-// Every other call shape a `Tag.Call` node can have — a method, a call
-// through a function VALUE, a builtin (`print`, `append`, `len`, ...), a
-// primitive conversion, a class constructor, a generic function, or a
-// type-node "call" (`chan<T>(...)`, `[]T(...)`) — rejects any `Tag.NamedArg`
-// outright (E0128) rather than attempting to resolve it. The ticket's own
-// restriction text names methods as legal too; that is NOT implemented here
-// (a method's checked signature carries parameter TYPES only, never names —
-// `methodSigLookup`'s `TypeKind.Func`, unlike a free function's `Param` node
-// list — so resolving a name against it needs a second, parallel lookup this
-// pass does not have time to build) and is filed as a follow-up rather than
-// silently claimed.
+// SCOPE (#4323 widened #3839's): named arguments are validated and lowered
+// here for a direct call to a CONCRETE (non-generic) callee whose own
+// parameter LIST is in scope — a top-level free function or `extern fn`
+// (`vCall`, validatecall.bit, resolving through `funcRefAt`, checklookup.bit),
+// and a METHOD reached through `vCallValue`'s Member callee (validatecall.bit)
+// on a class, primitive-alias or interface receiver. Every other call shape a
+// `Tag.Call` node can have — a call through a function VALUE, a func-typed
+// class FIELD, a namespaced `ns.f(...)`, a builtin (`print`, `append`,
+// `len`, ...), a primitive conversion, a class constructor, a generic callee,
+// or a type-node "call" (`chan<T>(...)`, `[]T(...)`) — rejects any
+// `Tag.NamedArg` outright (E0128) rather than attempting to resolve it.
+//
+// #3839 could not reach methods because it looked for the names in the wrong
+// place: a method's checked signature (`methodSigLookup`, checklookup.bit)
+// carries parameter TYPES only. The names are in the DECLARATION, which is
+// exactly where the free path reads them from too — `methodRefAt`
+// (checklookup.bit) hands back the same `FuncRef` shape `funcRefAt` does, and
+// `declParamListNode` (check.bit) reads the same kid off it, so no second
+// table holds method parameter names and the two paths cannot drift apart.
+// `methodParamNodes` below is the whole of that resolution, and BOTH the
+// checker and the lowerer (`lowerArgsForMethod`, lowercall.bit) call it — a
+// name a call site writes therefore resolves against one declaration or
+// against none, never against two different ones.
 
 const ecNamedArgUnknown = 124
 const ecNamedArgDuplicate = 125
@@ -37,6 +46,121 @@ class CallDecl {
   params: []int, want: int, fixed: int, variadic: bool,
 }
 
+// A `CallDecl` for `params` (nodes in `owner`'s tree). The variadic/fixed
+// split is read off the parameter LIST's own shape: a trailing `...xs: T`
+// absorbs every argument past the fixed ones, so only the prefix has an exact
+// arity (§12.4). One derivation, called by `vCall` (validatecall.bit) for a
+// free function and by `vMemberNamedArgs` below for a method, so the two
+// cannot disagree about where a call's fixed prefix ends.
+fn mkCallDecl(owner: Checker, decl: int, name: string, generic: bool, params: []int): CallDecl {
+  let want = len(params)
+  let variadic = want > 0 && getNode(owner.tree, params[want - 1]).tag == Tag.ParamRest
+  let fixed = want
+  if (variadic) {
+    fixed = want - 1
+  }
+  return CallDecl{
+    owner: owner, decl: decl, name: name, generic: generic,
+    params: params, want: want, fixed: fixed, variadic: variadic,
+  }
+}
+
+// The declaring module and the parameter NODE list of the method a member
+// call binds to — the same (owner, params) pair the free path gets from
+// `funcRefAt` + `declParamListNode`, so `paramNameOf` below reads a method's
+// parameter names out of the identical shape. `ok` is false for every member
+// callee SPEC §12.11 leaves positional-only, and the caller then reports
+// E0128; `owner`/`params` are then meaningless and must not be read.
+class MethodParams { owner: Checker, params: []int, ok: bool }
+
+// Resolves `recvType.mname` to its declaration's parameter list.
+//
+// A TypeParam receiver is deliberately refused even though `methodRecvType`
+// (checklookup.bit) would answer its constraint: the CHECKER would then read
+// the interface's parameter names while the LOWERER, running after
+// monomorphization, sees the concrete implementing class and reads ITS names
+// — and an implementation is required to match the interface by TYPE, not by
+// parameter name, so the two lists can legally disagree. Resolving a name
+// against one and placing it by the other is a silent wrong answer, so this
+// resolves only where both passes are guaranteed the same declaration.
+//
+// A generic callee is refused by `declParamListNode`'s own -1: the parameter
+// TYPES there still mention open type params, which `vNamedArgTypeCheck`
+// below would compare an argument against directly.
+fn methodParamNodes(c: Checker, recvType: int, mname: string): MethodParams {
+  let none = MethodParams{ owner: c, params: []int(0), ok: false }
+  if (recvType <= 0 || c.ctx.types[recvType].kind == TypeKind.TypeParam) {
+    return none
+  }
+  let fr = methodRefAt(c, recvType, mname)
+  if (fr.decl == 0) {
+    return ifaceMethodParamNodes(c, recvType, mname)
+  }
+  let plist = declParamListNode(fr.owner, fr.decl)
+  if (plist <= 0) {
+    return none
+  }
+  return MethodParams{ owner: fr.owner, params: kidsOf(fr.owner.tree, plist), ok: true }
+}
+
+// The `fr.decl == 0` half of `methodParamNodes`: an INTERFACE method has no
+// `FuncDecl` at all (`methodDecls`, types.bit, records concrete methods only),
+// so its names live on the `MethodSig` node inside the `InterfaceDecl` — kid
+// 1, the same `parseParams` list a `FuncDecl` carries, which is why
+// `paramNameOf` and `Tag.ParamRest` read it unchanged. Reached through
+// `typeOwner`/`declNodeIn` (lowerlayout.bit) because a node index means
+// nothing outside its own tree.
+//
+// The interface's declaration is the RIGHT list for a call through an
+// interface-typed receiver: dispatch is dynamic, the call site knows only the
+// interface, and `lowerArgsForMethod` (lowercall.bit) lowers such a call with
+// the interface type as its receiver type, so it resolves the same names.
+// A GENERIC interface is refused for `methodParamNodes`'s own reason.
+fn ifaceMethodParamNodes(c: Checker, recvType: int, mname: string): MethodParams {
+  let none = MethodParams{ owner: c, params: []int(0), ok: false }
+  if (c.ctx.types[recvType].kind != TypeKind.Interface) {
+    return none
+  }
+  let oc = typeOwner(c, recvType)
+  let decl = declNodeIn(oc, Tag.InterfaceDecl, c.ctx.types[recvType].name)
+  if (decl == 0 || kidsOf(oc.tree, decl)[1] != 0) {
+    return none
+  }
+  let sigs = kidsOf(oc.tree, kidsOf(oc.tree, decl)[2])
+  let i = 0
+  while (i < len(sigs)) {
+    let sk = kidsOf(oc.tree, sigs[i])
+    let nm = getNode(oc.tree, sk[0])
+    if (oc.source[nm.span.start:nm.span.end] == mname) {
+      return MethodParams{ owner: oc, params: kidsOf(oc.tree, sk[1]), ok: true }
+    }
+    i = i + 1
+  }
+  return none
+}
+
+// The named-argument branch of `vCallValue` (validatecall.bit) — the whole
+// of it, for every callee shape that function handles. A Member callee whose
+// method declaration resolves is validated exactly as a free call is, through
+// `vCallNamedArgs` below; everything else (a function VALUE, a func-typed
+// class field, a namespaced `ns.f(...)` whose base types to 0, an unresolved
+// or generic method) is E0128.
+fn vMemberNamedArgs(c: Checker, node: int, callee: int, args: []int, namedStart: int) {
+  if (getNode(c.tree, callee).tag != Tag.Member) {
+    vRejectNamedArgs(c, args)
+    return
+  }
+  let mk = kidsOf(c.tree, callee)
+  let mn = getNode(c.tree, mk[1])
+  let mname = c.source[mn.span.start:mn.span.end]
+  let mp = methodParamNodes(c, checkExprType(c, mk[0]), mname)
+  if (!mp.ok) {
+    vRejectNamedArgs(c, args)
+    return
+  }
+  vCallNamedArgs(c, node, mkCallDecl(mp.owner, 0, mname, false, mp.params), args, namedStart)
+}
+
 // The index of the first `Tag.NamedArg` in `args`, or `len(args)` if none —
 // the single query every hook point below uses to decide whether a call's
 // argument list needs any of this module's attention at all.
@@ -52,8 +176,9 @@ fn namedArgStart(tree: Tree, args: []int): int {
 }
 
 // Reports E0128 at every `Tag.NamedArg` in `args` — the call this list
-// belongs to is not a direct call to a named, concrete, free function (SPEC
-// §12.11's DIRECT CALLS ONLY restriction).
+// belongs to is not a direct call to a concrete named function or method
+// whose declaration is in scope (SPEC §12.11's DIRECT CALLS ONLY
+// restriction).
 fn vRejectNamedArgs(c: Checker, args: []int) {
   let i = 0
   while (i < len(args)) {
@@ -241,10 +366,12 @@ fn vNamedArgTypeCheck(
   }
 }
 
-// Validates AND type-checks a call to a concrete free function `params`
-// (`owner`'s tree) whose argument list `args` contains at least one
-// `Tag.NamedArg`, starting at `namedStart`. Called from `vCall` in place of
-// its ordinary spread/variadic/arity/type loop — this function is the WHOLE
+// Validates AND type-checks a call whose callee has the concrete parameter
+// list `cd.params` (in `cd.owner`'s tree) — a free function via `vCall`
+// (validatecall.bit), a method via `vMemberNamedArgs` above — and whose
+// argument list `args` contains at least one `Tag.NamedArg`, starting at
+// `namedStart`. Called in place of the caller's ordinary
+// spread/variadic/arity/type loop — this function is the WHOLE
 // of that branch and reports every diagnostic itself, via the four phases
 // above: ordering, name resolution, arity, then argument types — each phase
 // bails the whole call the moment it finds a problem, so `filled`/`slot`

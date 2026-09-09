@@ -2413,8 +2413,18 @@ may not be combined with a named argument in the same call.
 
 **Direct calls only.** A named argument is legal only where the callee is a
 named function or method whose declaration is in scope — resolving `name`
-needs that declaration's own parameter list. A call through a function
-*value* is positional only:
+needs that declaration's own parameter list. A method resolves against the
+declaration the call site can see: the class's own declaration for a call on
+a class value, and the *interface's* method signature for a call through an
+interface value, since dynamic dispatch is all that call site knows.
+
+```
+log.emit(count = 7, label = "hits")   // class receiver
+sink.emit(count = 7, label = "hits")  // interface receiver, resolved
+                                      // against the interface's signature
+```
+
+A call through a function *value* is positional only:
 
 ```
 let f = serve
