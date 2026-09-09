@@ -126,54 +126,38 @@ fn neNil(fc: FnCtx, errv: int, slotTy: int): int {
 // across the call boundary. Same two-kind test `deferZeroValue`
 // (lowerdefer.bit) applies to its own placeholder slot, for the same reason.
 //
-// THE DEADNESS IS STRUCTURAL, not a claim about today's callers. Every shape
-// that consumes the ok value places its first read in the `err_get() == nil`
-// successor, which the branch dominates: `?` gives the value only in `cont`,
-// whose single predecessor is that edge (`lowerTryExpr` below); a value
-// `catch` merges through a join whose err edge carries the HANDLER's value
-// (`lowerCatch`); a discarded call and `spawn`'s thunk
-// (`synthSpawnTrampoline`, lowerfuncval.bit) never read it; and the func-value
-// trampoline (`emitTrampolineRet`, lowerglobal.bit) passes the handle straight
-// to its own `ret`. The precedent is already shipped and load bearing:
-// `zeroValueEnumOrNil` returns this same `ConstNil` for an interface, pointer,
-// func or unboxed-enum ok type, so `fn mk(): Shape!` has handed callers a nil
-// on its error path since fallible results existed.
-//
-// #4601 removed the second half of that argument and it is worth saying which
-// half went. It used to rest on `fc.retWords` being empty for EVERY fallible
-// body, so that the handle reached its caller in one register; under the
-// string flip it no longer is. The dominance argument above is the whole
-// proof now, and it never depended on the width.
+// THE DEADNESS IS STRUCTURAL, not a claim about today's callers. The err path's
+// value reaches a caller in ONE return register: `declPlainResultType`
+// (lowerexplode.bit) excludes a fallible result from #4405's multi-word return
+// whole, so `fc.retWords` is empty for every fallible body and no caller ever
+// sees the ok type's words. Every shape that consumes the handle places its
+// first read in the `err_get() == nil` successor, which the branch dominates:
+// `?` gives the value only in `cont`, whose single predecessor is that edge
+// (`lowerTryExpr` below); a value `catch` merges through a join whose err edge
+// carries the HANDLER's value (`lowerCatch`); a discarded call and `spawn`'s
+// thunk (`synthSpawnTrampoline`, lowerfuncval.bit) never read it; and the
+// func-value trampoline (`emitTrampolineRet`, lowerglobal.bit) passes the
+// handle straight to its own `ret`. The precedent is already shipped and load
+// bearing: `zeroValueEnumOrNil` returns this same `ConstNil` for an interface,
+// pointer, func or unboxed-enum ok type, so `fn mk(): Shape!` has handed
+// callers a nil on its error path since fallible results existed.
 fn emitFallibleZeroRet(fc: FnCtx, span: Span) {
   if (fc.fallibleOk == fc.c.ctx.voidId) {
     builderEmit(fc.b, mkInstr(Op.Ret, fc.c.ctx.voidId))
     fc.terminated = true
     return
   }
-  // ONE producer of a non-void `ret`'s operand list, shared with `return e`
-  // (#4601). The width a fallible body promises is decided in exactly one
-  // place, so the err path and the ok path cannot disagree about it — a
-  // disagreement no gate could see, since each `ret` is individually valid.
-  emitReturnValue(fc, fallibleZeroOk(fc, span), false)
-}
-
-// The ok value an err-path `ret` carries.
-//
-// The `ConstNil` shortcut is #4507's and it is NOT available when the result
-// is exploded: `emitReturnValue` reads W words OUT of this value, and a
-// `field_get` on nil is a fault rather than a value no caller reads. A tuple's
-// zero object is then rebuilt and taken apart again in the same block, where
-// store-to-load forwarding answers each read and dead-allocation elimination
-// deletes the `gc_alloc` — the same pair every exploded `return` relies on,
-// which is why restoring the real zero value costs the err path nothing. A
-// `string` never took the shortcut at all: it is a prim, so `zeroValue`
-// already gave it the interned `""` both before and after this change.
-fn fallibleZeroOk(fc: FnCtx, span: Span): int {
   let k = fc.c.ctx.types[fc.fallibleOk].kind
-  if (len(fc.retWords) == 0 && (k == TypeKind.Struct || k == TypeKind.Tuple)) {
-    return builderEmit(fc.b, mkInstr(Op.ConstNil, fc.fallibleOk))
+  let zv = 0
+  if (k == TypeKind.Struct || k == TypeKind.Tuple) {
+    zv = builderEmit(fc.b, mkInstr(Op.ConstNil, fc.fallibleOk))
+  } else {
+    zv = zeroValue(fc, fc.fallibleOk, span)
   }
-  return zeroValue(fc, fc.fallibleOk, span)
+  let r = mkInstr(Op.Ret, fc.c.ctx.voidId)
+  r.args = [zv]
+  builderEmit(fc.b, r)
+  fc.terminated = true
 }
 
 // `fail e` (§18.3): evaluate the error, run defers, publish it (boxed per
@@ -193,21 +177,11 @@ fn lowerFail(fc: FnCtx, node: int) {
 // return zero ok); on ok the value is the call's ok result.
 fn lowerTryExpr(fc: FnCtx, node: int): int {
   let operand = kidsOf(fc.c.tree, node)[0]
-  let fty = nodeType(fc, operand)
-  let errTy = fc.c.ctx.types[fty].errTy
+  let errTy = fc.c.ctx.types[nodeType(fc, operand)].errTy
   let okv = lowerExpr(fc, operand)
   if (fc.failed) {
     return 0
   }
-  // #4601: the ok value crosses to `cont` as WORDS when the call handed it
-  // back in registers, and both of these are emitted HERE — before `getErr`
-  // below, not beside the `br` that consumes them. `err_get` is an `rt_call`
-  // and `isSideEffecting` clears the store table (optstore.bit), so a word
-  // read placed after it forwards from nothing and the box `emitResolvedCall`
-  // built survives. Adjacency to the `field_set`s is the whole mechanism.
-  let okTy = fc.c.ctx.types[fty].result
-  let words = joinOkWords(fc, okTy, okv)
-  let okArgs = joinOkArgs(fc, okv, words)
   // `errv` is already in slot representation; `setErr` below re-publishes it
   // as-is, no reboxing per `?` hop.
   let errv = getErr(fc, errTy)
@@ -219,7 +193,7 @@ fn lowerTryExpr(fc: FnCtx, node: int): int {
   br.ival = prop
   br.thenArgs = []int(0)
   br.ival2 = cont
-  br.elseArgs = okArgs
+  br.elseArgs = []int(0)
   builderEmit(fc.b, br)
   builderEndBlock(fc.b)
   builderBeginBlock(fc.b, prop)
@@ -230,142 +204,25 @@ fn lowerTryExpr(fc: FnCtx, node: int): int {
   builderEndBlock(fc.b)
   builderBeginBlock(fc.b, cont)
   fc.terminated = false
-  // `cont` has a single predecessor (dominated by the branch), so an unexploded
-  // ok value flows in directly — no block param. An exploded one takes one
-  // parameter per word and is put back together at the top of `cont`, where
-  // whatever binds it reads the words straight back out.
-  if (len(words) == 0) {
-    return okv
-  }
-  return joinOkValue(fc, okTy, words)
+  // `cont` has a single predecessor (dominated by the branch), so the ok value
+  // flows in directly — no block param.
+  return okv
 }
 
-// The block-param args for a catch/match-expr join edge: the live locals, then
-// whatever the merged value contributes — nothing for a void ok type, one
-// handle for an ordinary join, one value per WORD for an exploded one
-// (`catchMergeArgs`). Copies `locals` (append can grow its input in place, and
-// a caller reuses the snapshot for `restoreValues`).
-//
-// The `isVoid` test used to live here, on a single `val`. Moving it into the
-// caller's own list leaves this function with no branch at all and one rule —
-// concatenate — which is what lets an exploded merge cost it nothing.
-fn catchEdgeArgs(locals: []int, vals: []int): []int {
+// The block-param args for a catch/match-expr join edge: the live locals, plus
+// the merged value unless the ok type is void. Copies `locals` (append can grow
+// its input in place, and a caller reuses the snapshot for `restoreValues`).
+fn catchEdgeArgs(fc: FnCtx, locals: []int, val: int, isVoid: bool): []int {
   let out = []int(0)
   let i = 0
   while (i < len(locals)) {
     out = append(out, locals[i])
     i = i + 1
   }
-  let k = 0
-  while (k < len(vals)) {
-    out = append(out, vals[k])
-    k = k + 1
+  if (!isVoid) {
+    out = append(out, val)
   }
   return out
-}
-
-// ===========================================================================
-// #4601: a join that merges an EXPLODED ok value
-//
-// THE TRAP THIS CLOSES. `lowerCatch` merged the ok value through ONE join
-// parameter typed `okTy`, and a block argument is an escape `optalloc` refuses
-// outright (lowerexplodestr.bit's `localWordTypes` banner). So the moment a
-// `string!E` call hands its result back in three registers, the box
-// `emitResolvedCall` rebuilds reaches the join as a block argument, survives
-// every pass, and a consumer that wants words takes it apart again — `f()
-// catch d` GAINS an allocation the one-handle form never had, while `f()?`
-// loses one. `bench/cases/json` uses `?`, so a json-only measurement would
-// have shipped that regression.
-//
-// THE PREDICATE IS #4586's, one position further out: explode only when the ok
-// edge carries a box THIS LOWERER JUST BUILT, because killing that box is the
-// only thing the explosion can buy. It is a structural test on an
-// already-lowered value and can only under-report; an under-report keeps the
-// single-parameter join this compiler has always had.
-//
-// GATE-OFF IR CANNOT CHANGE, by construction. With the string flip off a
-// fallible callee keeps the one-handle convention (`declRetType`,
-// lowerexplode.bit), so `okv` is the `Op.Call`/`Op.CallValue`/`Op.CallIface`
-// itself — the only expression forms that can be fallible — and never a
-// `gc_alloc`. `isFreshBox` therefore answers false for every gate-off program.
-// ===========================================================================
-
-// The per-word types a `?`/`catch` join threads its ok value through, or an
-// empty list for the direct/one-parameter form every other shape keeps.
-fn joinOkWords(fc: FnCtx, okTy: int, okv: int): []int {
-  if (!isFreshBox(fc.b, okv)) {
-    return []int(0)
-  }
-  return localWordTypes(fc, okTy)
-}
-
-// The words an exploded join edge carries for `val`, or an empty list when the
-// join is not exploded. Emit it ADJACENT to the value it takes apart: the
-// forwarding that removes the box is block-local and refuses across any
-// side-effecting instruction (optstore.bit).
-fn joinOkArgs(fc: FnCtx, val: int, words: []int): []int {
-  if (len(words) == 0) {
-    return []int(0)
-  }
-  return explodeValueWords(fc.c.ctx, fc.b, val, words)
-}
-
-// What a `catch` edge contributes for its merged value: its words at an
-// exploded join, one handle at an ordinary one, nothing for a void ok type.
-fn catchMergeArgs(fc: FnCtx, val: int, words: []int, isVoid: bool): []int {
-  if (len(words) != 0) {
-    return joinOkArgs(fc, val, words)
-  }
-  if (isVoid) {
-    return []int(0)
-  }
-  return [val]
-}
-
-// The join's merged value: W block parameters put back together, or the single
-// parameter every other join takes.
-//
-// The materialisation sits at the top of the join block, immediately after its
-// parameters, so whatever binds it (`declareLetLocal`, whose #4586 predicate
-// this fresh box satisfies) reads the words straight back out and
-// store-to-load forwarding answers each read. Where the consumer genuinely
-// wants a handle the box stays, which is exactly today's behaviour.
-fn joinOkValue(fc: FnCtx, okTy: int, words: []int): int {
-  if (len(words) == 0) {
-    return builderAddParam(fc.b, okTy)
-  }
-  let ids = []int(0)
-  let k = 0
-  while (k < len(words)) {
-    ids = append(ids, builderAddParam(fc.b, words[k]))
-    k = k + 1
-  }
-  // #4406: a join MINTS new value ids, so the keepalive edges recorded where
-  // the words were produced name values that do not exist on this side of it.
-  // A `string`'s `ptr` is an interior address and `base` is its only root.
-  recordWordKeepAlive(fc.c.ctx, fc.b, words, ids)
-  return materializeExplodedLocal(fc, okTy, ids)
-}
-
-// The `catch e { … }` arm: bind the error name to the error's own value (not
-// its slot handle) for the block's scope, lower the block, and hand back its
-// value with its own type. `truncateEnv` drops the binder again, so the name
-// is not in scope at the join.
-//
-// Extracted from `lowerCatch` under #4601, which took that function to 84 of
-// E0201's 80 lines. It is a self-contained scope — mark, bind, lower,
-// truncate — and moving it changes no emitted instruction: `unboxErrFromSlot`
-// is still evaluated as `declareLocal`'s argument, in the same position of the
-// same block, and it emits nothing at all for a reference-shaped error type.
-fn lowerCatchBind(fc: FnCtx, k: []int, okTy: int, errv: int, errTy: int): (int, int) {
-  let mark = len(fc.env)
-  let en = getNode(fc.c.tree, k[1])
-  declareLocal(fc, fc.c.source[en.span.start:en.span.end], unboxErrFromSlot(fc, errv, errTy), errTy)
-  rebindCheckerName(fc, k[1], errTy)
-  let handled = lowerCatchBlock(fc, k[2], okTy)
-  let handledTy = catchBlockType(fc, k[2])
-  truncateEnv(fc, mark)
-  return handled, handledTy
 }
 
 // `expr catch d` / `expr catch e { … }` (§18.3): merge the ok value and the
@@ -381,9 +238,6 @@ fn lowerCatch(fc: FnCtx, node: int, bind: bool): int {
   if (fc.failed) {
     return 0
   }
-  // Both emitted BEFORE `getErr` — see `joinOkArgs` for why adjacency decides.
-  let words = joinOkWords(fc, okTy, okv)
-  let okArgs = catchMergeArgs(fc, okv, words, isVoid)
   // `errv` is in slot representation, unboxed below only where needed.
   let errv = getErr(fc, errTy)
   let isErr = neNil(fc, errv, errSlotTy(fc, errTy))
@@ -396,20 +250,24 @@ fn lowerCatch(fc: FnCtx, node: int, bind: bool): int {
   br.ival = errBlk
   br.thenArgs = []int(0)
   br.ival2 = join
-  br.elseArgs = catchEdgeArgs(orig, okArgs)
+  br.elseArgs = catchEdgeArgs(fc, orig, okv, isVoid)
   builderEmit(fc.b, br)
   builderEndBlock(fc.b)
   builderBeginBlock(fc.b, errBlk)
   fc.terminated = false
   clearErr(fc)
-  // The handler's value and its OWN type (for widening a concrete handler value
-  // to an interface ok type at the merge).
   let handled = 0
+  // The handler's own value type (for widening a concrete handler value to an
+  // interface ok type at the merge).
   let handledTy = okTy
   if (bind) {
-    let (hv, hty) = lowerCatchBind(fc, k, okTy, errv, errTy)
-    handled = hv
-    handledTy = hty
+    let mark = len(fc.env)
+    let en = getNode(fc.c.tree, k[1])
+    declareLocal(fc, fc.c.source[en.span.start:en.span.end], unboxErrFromSlot(fc, errv, errTy), errTy)
+    rebindCheckerName(fc, k[1], errTy)
+    handled = lowerCatchBlock(fc, k[2], okTy)
+    handledTy = catchBlockType(fc, k[2])
+    truncateEnv(fc, mark)
   } else {
     handled = lowerExprH(fc, k[1], okTy)
     handledTy = defaultType(fc.c, nodeType(fc, k[1]))
@@ -433,8 +291,8 @@ fn lowerCatch(fc: FnCtx, node: int, bind: bool): int {
     handledTy = okTy
   }
   if (!fc.terminated) {
-    let merged = catchMergeArgs(fc, coerceToIface(fc, handled, handledTy, okTy), words, isVoid)
-    emitJump(fc, join, catchEdgeArgs(snapshotValues(fc, preLen), merged))
+    let merged = coerceToIface(fc, handled, handledTy, okTy)
+    emitJump(fc, join, catchEdgeArgs(fc, snapshotValues(fc, preLen), merged, isVoid))
   }
   builderEndBlock(fc.b)
   restoreValues(fc, orig)
@@ -444,7 +302,7 @@ fn lowerCatch(fc: FnCtx, node: int, bind: bool): int {
   if (isVoid) {
     return okv
   }
-  return joinOkValue(fc, okTy, words)
+  return builderAddParam(fc.b, okTy)
 }
 
 // The body of a `catch e { … }`: a block of statements whose final expression (if
