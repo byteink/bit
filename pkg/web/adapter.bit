@@ -141,11 +141,59 @@ fn ctxFailure(c: Ctx, e: error): Failure {
 // sitting behind the wrong middleware, and what calling a handler function
 // directly cannot.
 fn dispatch(app: App, req: Request): Response {
+  let out = routed(app, req)
+  if (req.method != methodHead) {
+    return out
+  }
+  return withoutContent(app, out)
+}
+
+// Steps 1-7 above. Separated from `dispatch` only so that the HEAD rule has
+// exactly one response to apply itself to, however the request was answered.
+fn routed(app: App, req: Request): Response {
   let (path, _) = splitTarget(req.path)
   let m = app.root.router.lookup(req.method, path) catch e {
     return unmatched(app, req, path, e)
   }
   return matchedResponse(app, req, m)
+}
+
+// RFC 9110 §9.3.2: "The HEAD method is identical to GET except that the server
+// MUST NOT send content in the response." EVERY HEAD passes through here — a
+// registered HEAD route (#4536), the GET fallback below, a 404, a 405, a
+// failure — so no route and no middleware can put content on one, and a
+// handler written for GET and registered for HEAD cannot leak a body.
+//
+// Content only: the status and every header are the handler's and stay its
+// own.
+//
+// The `Content-Length` of what is about to be dropped is declared here, and
+// this is the one site that can do it — after this returns, the number is
+// gone. RFC 9110 §9.3.2 asks for "the same header fields ... as it would have
+// sent if the request method had been GET"; `serializeResponse` (stdlib/http)
+// honours a single well-formed declared field on a HEAD for exactly this
+// reason (#4635) and counts the body on every other method, so this is the
+// only way the real length reaches the wire once the bytes are gone.
+//
+// Claimed ONLY when there was content. A chain that answered the HEAD itself
+// with an empty body (static.bit does) knows the representation's real length
+// and this function does not, so `Content-Length: 0` here would be a wrong
+// answer rather than a missing one.
+//
+// The `setHeader` can only fail on a malformed field name or value; the name
+// is a constant and the value is `${n}`, digits. A framework bug is worth the
+// log line rather than a dropped response — and the failure is recorded, not
+// discarded (E0215).
+fn withoutContent(app: App, out: Response): Response {
+  let n = len(out.body)
+  out.body = ""
+  if (n == 0) {
+    return out
+  }
+  out.setHeader(contentLengthName, "${n}") catch e {
+    logLine(app.config.logs, "web: HEAD: ${e.message()}")
+  }
+  return out
 }
 
 // Nothing is registered for this request's own method. A `HEAD` gets one more
@@ -162,6 +210,14 @@ fn dispatch(app: App, req: Request): Response {
 // `e` — the ORIGINAL failure — is what a failed fallback reports, not the
 // GET lookup's: the client asked for HEAD, and the `Allow` header on a 405
 // must name the methods this path really has.
+//
+// The GET chain runs on the request exactly as it arrived — `c.method()` is
+// still "HEAD", so a middleware that distinguishes the two (`static`,
+// static.bit) keeps doing so — and the response goes back through
+// `matchedResponse` unchanged. Both halves of RFC 9110 §9.3.2, dropping the
+// content and declaring the length it had, are `withoutContent`'s on the way
+// out of `dispatch`: a registered HEAD route needs the identical treatment,
+// and one rule is better than two that can drift.
 fn unmatched(app: App, req: Request, path: string, e: error): Response {
   if (req.method != methodHead) {
     return missResponse(app, req, e)
@@ -169,33 +225,7 @@ fn unmatched(app: App, req: Request, path: string, e: error): Response {
   let m = app.root.router.lookup(methodGet, path) catch _ {
     return missResponse(app, req, e)
   }
-  return headResponse(app, req, m)
-}
-
-// A HEAD answered from the GET route. The chain runs on the request exactly
-// as it arrived — `c.method()` is still "HEAD", so a middleware that already
-// distinguishes the two (`static`, static.bit) keeps doing so — and the body
-// is dropped here afterwards, so a handler that does NOT distinguish them
-// cannot leak content onto a HEAD response either.
-//
-// `Content-Length` is set to the length of the content that was dropped, per
-// RFC 9110 §9.3.2's "the same header fields ... as it would have sent if the
-// request method had been GET". It is set ONLY when there was content to
-// drop: a chain that already answered HEAD with an empty body (static.bit
-// does) knows the real representation length and this function does not, and
-// `Content-Length: 0` on a resource with 1234 bytes is a worse answer than no
-// claim at all.
-fn headResponse(app: App, req: Request, m: Match): Response {
-  let out = matchedResponse(app, req, m)
-  let n = len(out.body)
-  if (n == 0) {
-    return out
-  }
-  out.body = ""
-  out.setHeader(contentLengthName, "${n}") catch e {
-    logLine(app.config.logs, "web: HEAD ${req.path}: ${e.message()}")
-  }
-  return out
+  return matchedResponse(app, req, m)
 }
 
 // Nothing matched, so the framework answers for itself. 405 — with the
@@ -299,9 +329,17 @@ fn frame(app: App, r: Res): Response {
 // length therefore never reaches a client, and carrying it in
 // `Response.headers` would only tell an in-process caller of `app.handle`
 // something about the wire that is not true. The framework's own claim on a
-// fallback HEAD (`headResponse`) is set on the `Response` AFTER this
-// conversion and is not affected: a `Content-Length` in `Response.headers` is
-// the framework's, never the app's.
+// HEAD (`withoutContent`) is set on the `Response` AFTER this conversion and
+// is not affected: a `Content-Length` in `Response.headers` is the
+// framework's, never the app's.
+//
+// `Res.declaredLen` (res.bit) is the other half of that rule and the reason
+// the drop above can be unconditional. A framework middleware that answers a
+// HEAD without reading the representation — `static()` — knows a length no
+// later layer can recover, and writes it to that module-private field rather
+// than to a header app code could also set. It becomes the response's
+// `Content-Length` here, once, after every app header has been through the
+// loop.
 //
 // Every other header goes through `addHeader`, not `setHeader`: `Set-Cookie`
 // legitimately repeats, and `Res.set` already collapsed the ones that must
@@ -318,6 +356,9 @@ fn toResponse(r: Res): Response! {
       continue
     }
     out.addHeader(h.name, h.value)?
+  }
+  if (r.declaredLen > 0) {
+    out.setHeader(contentLengthName, "${r.declaredLen}")?
   }
   return out
 }
