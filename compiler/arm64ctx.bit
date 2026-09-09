@@ -271,7 +271,13 @@ class FrameInfo {
   frameless: bool,
 }
 
+// #4666: the assert is the guard on `RegLoc`'s third state. A rematerialized
+// value owns no stack word and carries slot -1; every reader that has not been
+// taught to recompute it instead arrives here, and without this it would
+// address `outgoingBytes - 8` — a real frame word, belonging to something else,
+// read without a crash. A build failure is the honest answer.
 fn spillOffset(fr: FrameInfo, slot: int): int {
+  assert(slot >= 0)
   return fr.outgoingBytes + slot * 8
 }
 
@@ -344,10 +350,20 @@ fn alignFrame16(raw: int): int {
 // (#3168 partitions the int/float slot-number spaces so their byte offsets
 // can never collide) — that partition is the actual defense; this is what
 // keeps the representation from silently misrepresenting it if it ever did.
+//
+// #4666 adds a THIRD reading of `v` and it is not a location at all: with
+// `isImm` set, `v` is a literal value, the source of a move that reads no
+// storage. It is only ever a SOURCE — a rematerialized constant used as a block
+// argument, a call argument or a returned word — so nothing is ever written to
+// one. `sequentializeAndEmit` keeps it out of both of its phases entirely; see
+// there for why that is a scheduling choice rather than a special case in the
+// cycle finder. Every existing `PLoc{...}` literal omits the field and gets
+// `false` (§12.2), so x86-64, which produces none, is unchanged term for term.
 class PLoc {
   isReg: bool,
   v: int,
   regClass: RegClass,
+  isImm: bool,
 }
 
 fn plocReg(r: int, regClass: RegClass): PLoc {
@@ -358,11 +374,29 @@ fn plocMem(off: int, regClass: RegClass): PLoc {
   return PLoc{ isReg: false, v: off, regClass: regClass }
 }
 
+// #4666. A move source that is a literal rather than a place. `isReg` is false
+// so a reader that only knows the two-state form treats it as memory; `isImm`
+// is what every reader below actually branches on, and `plocEq` refuses it
+// equality with anything, itself included, because two equal literals are not
+// one location.
+fn plocImm(val: int, regClass: RegClass): PLoc {
+  return PLoc{ isReg: false, v: val, regClass: regClass, isImm: true }
+}
+
 // Register identity needs `class` (x5 and d5 share raw number 5 but are
 // different registers); spill identity does not (`v` is already the
 // resolved byte offset, and two spills at the same offset ARE the same
 // location no matter what class either end was tagged with — #3191).
+//
+// #4666: an immediate is a value, not a place. It equals nothing — not a
+// register, not a frame word, and not another immediate of the same value. Two
+// moves sourcing the literal 5 read no shared storage, so calling them equal
+// would make `anyReads` invent a dependency and the identity filter drop a
+// move that must still be emitted.
 fn plocEq(a: PLoc, b: PLoc): bool {
+  if (a.isImm || b.isImm) {
+    return false
+  }
   if (a.isReg != b.isReg) {
     return false
   }
@@ -461,15 +495,66 @@ fn pmovesAllIdentity(ms: []PMove): bool {
   return true
 }
 
-fn sequentializeAndEmit(cx: A64Ctx, movesIn: []PMove) {
-  let moves = []PMove(0)
-  let k = 0
-  while (k < len(movesIn)) {
-    if (!plocEq(movesIn[k].src, movesIn[k].dst)) {
-      moves = append(moves, movesIn[k])
-    }
-    k = k + 1
+// #4666. Materializes one immediate-sourced move: `dst := #imm`. Split out of
+// `emitMove` rather than added as an arm to it because it is not a transfer
+// between two places — it reads nothing, so it has no src/dst class agreement
+// to assert and no mem->mem staging case.
+//
+// The int scratch is free because `sequentializeAndEmit` calls this only after
+// both of its phases have finished, so neither scratch1 (emitMove's mem->mem
+// staging temp) nor scratch2 (the cycle rotation) is still holding anything. An
+// immediate is Int-class by construction (`plocOf` builds one only for an
+// integer constant the allocator refused a slot), which the assert states.
+fn emitImmMove(cx: A64Ctx, src: PLoc, dst: PLoc) {
+  assert(src.regClass == RegClass.Int && dst.regClass == RegClass.Int)
+  if (dst.isReg) {
+    movImm64(cx.code, dst.v, src.v)
+    return
   }
+  movImm64(cx.code, scratch1(), src.v)
+  storeImm(cx.code, scratch1(), regSp(), dst.v, 8)
+}
+
+// #4666. The batch split in two, by the two predicates `sequentializeAndEmit`
+// used to apply inline — kept out of it because that function is over this
+// repo's E0204 ceiling already (spec/LINT.md) and neither question is about
+// sequencing.
+//
+// `wantImm` true selects the immediate-sourced moves, which are held back and
+// emitted AFTER both phases, and that is a scheduling decision, not an
+// exemption. Such a move READS nothing, so no other move can depend on it as a
+// source and it can never close a cycle — but phase 2 chases a cycle by looking
+// for the move that WRITES the current move's source, and an immediate is
+// written by nothing, so letting one reach that walk would trip its
+// `found >= 0` invariant on the way to proving it could not happen. Holding it
+// back is exactly parallel-move semantics: every other move still reads its
+// destination's pre-move value, because the write lands after all of them, and
+// a destination is written exactly once so nothing else is racing for it.
+//
+// `wantImm` false selects the real transfers, minus the ones already in place:
+// a move whose source and destination are the same location emits nothing, and
+// dropping it before either phase is what lets `pmovesAllIdentity` answer
+// without emitting.
+fn selectMoves(ms: []PMove, wantImm: bool): []PMove {
+  let out = []PMove(0)
+  for m of ms {
+    // No DESTINATION is ever an immediate — you cannot write to a literal.
+    // Structural rather than incidental: `plocOf` answers an immediate only for
+    // a vreg whose defining instruction is a constant, and no constant is a
+    // block parameter, a call result or a return slot. Asserted at the one
+    // place every move in every batch passes through, since neither phase below
+    // nor `emitMove` looks at `dst.isImm` and both would read `v` as an address.
+    assert(!m.dst.isImm)
+    if (m.src.isImm == wantImm && (wantImm || !plocEq(m.src, m.dst))) {
+      out = append(out, m)
+    }
+  }
+  return out
+}
+
+fn sequentializeAndEmit(cx: A64Ctx, movesIn: []PMove) {
+  let imms = selectMoves(movesIn, true)
+  let moves = selectMoves(movesIn, false)
 
   // Phase 1: drain every move nothing else depends on, until only cycles are
   // left. Each pass emits at least one move or stops, so the outer loop runs at
@@ -545,5 +630,11 @@ fn sequentializeAndEmit(cx: A64Ctx, movesIn: []PMove) {
       i = i + 1
     }
     emitMove(cx, scratch, cycle[len(cycle) - 1].dst)
+  }
+
+  // #4666: last, once every reader of their destinations has run and both
+  // scratches are dead again.
+  for m of imms {
+    emitImmMove(cx, m.src, m.dst)
   }
 }
