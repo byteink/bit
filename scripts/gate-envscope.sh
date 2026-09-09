@@ -395,21 +395,13 @@ argvscope_floor_for_tree() {
 #   stdlib test-stdlib-rebuild — a coreSteps() Step, "not part of `test`" by its
 #     own desc (tools/build/defs.bit), so no bucket runs it and gate.sh has no
 #     scoping responsibility for it. Same class the failure text below names.
-#   stdlib test-release-surface — ON COST, and this is the one exemption here
-#     that is a real hole rather than a false positive. It IS stdlib-scoped
-#     (`curStdlib: "${repo}/stdlib"`, releasesurface.bit:670 — it `bit doc
-#     --fields`-diffs the working tree against the pinned previous release) and
-#     it IS in gateSteps(), so `full` runs it. It is left out because
-#     `./make test-release-surface` MEASURED 25m42s on 2026-09-09 (rc=0,
-#     "31 module(s) compared ... 0 unallowlisted breaking change(s)"): it
-#     spawns one subprocess per module per side, and wiring it here would make
-#     a one-file stdlib diff cost MORE than the whole `./make test` gate.sh
-#     itself prices at 17m26s — the one thing a scoped bucket must never do.
-#     .claude/kb/gate-speed-history.md still ranks it 2m3s; that figure is
-#     stale by an order of magnitude. So a stdlib-only diff has NO API-surface
-#     check until the integrator's pre-push suite, which is a stop-gap and is
-#     named as one: #4691 is the ticket to make the comparison incremental
-#     (only modules the diff touches) and wire it here once it is affordable.
+#   (test-release-surface WAS exempted here ON COST — 25m42s measured on
+#     2026-09-09 — and is now WIRED into the stdlib bucket by #4691. That cost
+#     was never this gate's own work: it wrote 291 single-use scripts per run
+#     and `execve`'d each one, paying macOS's system-wide `com.apple.provenance`
+#     validation 291 times — #3778's `test-golden` tax again, in a harness that
+#     never got #3778's fix. With the exec removed the same run does ~15s of
+#     real compiler work. See _tests_/bit/releasesurface/shellrun.bit's header.)
 #   pkg test-package-${p} — not a gate name: gates.bit builds one Gate per
 #     package inside a `for p of packageNames()` loop, so the TABLE holds the
 #     unexpanded template. Its expansions are one-package subsets of
@@ -423,7 +415,6 @@ argvscope_exempt_gate() {
   case "$1 $2" in
     'stdlib test-pmimports' | 'stdlib test-pmvanity' | 'stdlib test-pmaddgit') return 0 ;;
     'stdlib test-pmrangegate' | 'stdlib test-stdlib-rebuild') return 0 ;;
-    'stdlib test-release-surface') return 0 ;;
     'pkg test-package-${p}') return 0 ;;
   esac
   return 1

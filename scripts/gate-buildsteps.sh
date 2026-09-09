@@ -335,10 +335,16 @@ case "${BUCKET}" in
     # so a stdlib/** rename or deletion can leave a bare-basename citation in
     # that document unresolvable. 0m29s.
     #
-    # test-release-surface is NOT here, and that is a measurement, not an
-    # oversight — argvscope_exempt_gate() (scripts/gate-envscope.sh) carries
-    # the reason and #4691 owns the fix.
-    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages test-lint-self test-lint-complexity test-lint-sweep test-stdlib-unit test-gc-retention test-fmt-citations)
+    # test-release-surface (#4691) is the ONLY gate that catches an
+    # unallowlisted stdlib API break (`curStdlib: "${repo}/stdlib"`,
+    # _tests_/bit/releasesurface/releasesurface.bit) — without it here a
+    # stdlib-only diff got GATE_RESULT=PASS with no surface check at all until
+    # the integrator's pre-push suite. It was exempted on a 25m42s measurement
+    # that turned out to be macOS's system-wide `com.apple.provenance` execve
+    # tax (#3778's test-golden cause) paid 291 times by the harness's own
+    # single-use scripts, not work: see shellrun.bit's header for the fix and
+    # the before/after numbers.
+    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages test-lint-self test-lint-complexity test-lint-sweep test-stdlib-unit test-gc-retention test-fmt-citations test-release-surface)
     ;;
   docs)
     # test-stdlib-docs reads docs/stdlib/*.md directly (BIT_DOCS_ROOT — it
