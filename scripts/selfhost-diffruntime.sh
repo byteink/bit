@@ -2,14 +2,15 @@
 # Runtime codegen differential (#1859): run every `runtime/**/*.bit` through both
 # compilers' `--dump-ir-pre` and diff the lowered SSA text, then compare
 # whole-module object bytes / atomic-instruction-width signatures (#2741,
-# #3103, #3110).
+# #3103, #3110) and each module's set of cross-object references (#4365).
 #
 # Full design record moved to docs/development/runtime-differential.md
 # (#4264, to stay under the 800-line file-size ceiling): why this differential
 # exists, why IR text alone is not enough, why byte-for-byte identity against
 # the pinned release was narrowed to an atomic-instruction-width signature on
-# aarch64/x86-64, and why the IR walk is per-file rather than per-module.
-# Read it before changing any invariant below.
+# aarch64/x86-64, why the IR walk is per-file rather than per-module, and why
+# the relocation arm asserts a SET of references and carries a declared-change
+# table. Read it before changing any invariant below.
 #
 # Usage: ./make selfhost && bash scripts/selfhost-diffruntime.sh
 set -uo pipefail
@@ -207,6 +208,75 @@ MIN_ATOMIC_SITES_DEFAULT=300
 MIN_ATOMIC_SITES=${DIFFRUNTIME_MIN_ATOMIC_SITES:-$MIN_ATOMIC_SITES_DEFAULT}
 atomic_sites_seen=0
 
+# --- Cross-object reference signature (#4365) ---
+#
+# The two arms above are both blind to a lowering change that only fires on a
+# CROSS-MODULE call. The per-file IR walk lowers one file standalone, so an
+# imported callee never appears in the dump at all; the atomic-width signature
+# only looks at acquire/release mnemonics, which a non-atomic codegen change
+# never moves. #4345 removed 193 of 2483 ARM64_RELOC_BRANCH26 relocations from
+# libbitrt-aarch64-macos.a (`_bit_rt_port_mem_load_byte` 115 -> 0,
+# `_bit_rt_port_mem_store_byte` 78 -> 0) and this differential printed
+# `154/155 lower identically`. It was not wrong; it could not see it — and a
+# change that MISCOMPILED all 193 would have printed the same PASS.
+#
+# What each module's relocation table names is exactly that surface: every
+# symbol this module's code and data reference but do not define. Extracted
+# with `objdump -r` (both Mach-O and ELF print `OFFSET TYPE VALUE`, one record
+# per line, under per-section `RELOCATION RECORDS FOR [...]` banners) and
+# keyed on (TYPE, SYMBOL). The OFFSET column is dropped on purpose: it moves
+# with every scheduling or register-allocation change, which is the noise
+# #3103 narrowed the byte-identity invariant to escape.
+relocSignature() { # <objfile>  -> one "TYPE SYMBOL" line per relocation record
+  objdump -r "$1" 2>/dev/null | awk '
+    $1 ~ /^[0-9a-fA-F]+$/ && NF >= 3 {
+      v = $3
+      # ELF prints a section-relative target as `.text+0x0000000000000010`;
+      # the addend is a layout detail, the symbol is the reference. Mach-O
+      # prints a bare symbol, so this substitution is a no-op there.
+      sub(/[+-]0x[0-9a-fA-F]+$/, "", v)
+      print $2 " " v
+    }'
+}
+
+# Compared as a SET, not a multiset, for #3170's reason one arm down: inlining
+# an already-emitted call into a second call site duplicates a line without
+# changing which symbols the module references, and a count-sensitive compare
+# reddens on that legitimate fold. Set membership moves only when a reference
+# APPEARS or DISAPPEARS entirely, which is what a cross-module lowering change
+# does — #4345 zeroed both of its symbols, so it is caught at set granularity
+# (measured: 5 of 25 modules, see the doc).
+#
+# Measured on this tree against the pinned oracle when the arm was added
+# (#4365): 19478 relocation sites over 25 modules, and 25/25 modules identical
+# at set AND multiset granularity — so unlike object bytes (#3103, 22 of 23
+# modules legitimately differ) this invariant is not already broken by the
+# optimisation work that has landed since the pin. The floor is the same
+# "a count is not coverage" guard as MIN_ATOMIC_SITES: a missing or renamed
+# objdump makes every signature empty on BOTH sides and passes vacuously.
+MIN_RELOC_SITES=${DIFFRUNTIME_MIN_RELOC_SITES:-12000}
+reloc_sites_seen=0
+
+# DECLARED CROSS-OBJECT REFERENCE CHANGES — one per line, EMPTY TODAY:
+#
+#   <module dir> <-|+> <RELOC TYPE> <SYMBOL>
+#
+# `-` = the pinned stage0 references it and this tree does not (a call this
+# tree now lowers inline); `+` = the reverse.
+#
+# This exists because the codegen work under #4342 is deliberately in the
+# business of removing cross-object calls from the runtime, so this arm WILL
+# go red on a correct change, and a gate with no way to record that is the
+# routed-around-red hazard #1895 names. It is a SIGNATURE, not the per-file
+# allowlist #1883 deleted: a line names one exact (module, direction, type,
+# symbol) reference, so a second, unrelated reference change in an
+# already-declared module still fails.
+#
+# It is asserted BOTH WAYS. A declared line that is no longer observed fails
+# too, which is what empties the table at the next stage0 repin instead of
+# leaving a stale entry masking a later regression on that exact symbol.
+RELOC_DECLARED=""
+
 # Same (rel, label) expansion g2archive.sh applies to the same two variables —
 # glue over the extracted data, not a second copy of the data itself.
 MOD_RELS=()
@@ -335,6 +405,8 @@ mkdir -p "$objdev" "$objor"
 
 modmatch=0 modskip=0
 : >"$work/mod_mismatch"
+: >"$work/rel_mismatch"
+: >"$work/rel_observed"
 : >"$work/mod_timeout"
 : >"$work/mod_oracletimeout"
 : >"$work/mod_oraclecrash"
@@ -409,6 +481,22 @@ while [ "$i" -lt "$NMOD" ]; do
     modmatch=$((modmatch + 1))
   else
     echo "$dir" >>"$work/mod_mismatch"
+  fi
+
+  # Cross-object reference arm (#4365). Independent of the atomic/byte verdict
+  # above — it runs on every ISA, since a relocation table is not an ISA
+  # feature — and scored separately below so a reference change is never
+  # reported as an atomic-width one.
+  orrel="$work/rel_or"
+  devrel="$work/rel_dev"
+  relocSignature "$orobj" >"$orrel.raw"
+  reloc_sites_seen=$((reloc_sites_seen + $(wc -l <"$orrel.raw")))
+  LC_ALL=C sort -u "$orrel.raw" >"$orrel"
+  relocSignature "$devobj" | LC_ALL=C sort -u >"$devrel"
+  if ! cmp -s "$orrel" "$devrel"; then
+    echo "$dir" >>"$work/rel_mismatch"
+    LC_ALL=C comm -23 "$orrel" "$devrel" | sed "s|^|$dir - |" >>"$work/rel_observed"
+    LC_ALL=C comm -13 "$orrel" "$devrel" | sed "s|^|$dir + |" >>"$work/rel_observed"
   fi
 done
 
@@ -541,6 +629,52 @@ if [ -s "$work/mod_mismatch.sorted" ]; then
   bad=1
 fi
 
+# --- Cross-object reference checks (#4365) ---
+
+# Same "count is not coverage" floor as MIN_ATOMIC_SITES, for the same failure:
+# an objdump that is missing, renamed, or cannot read these objects yields an
+# empty signature on BOTH sides and every module then compares equal.
+if [ "$reloc_sites_seen" -lt "$MIN_RELOC_SITES" ]; then
+  echo "diffruntime: FAIL — extracted $reloc_sites_seen relocation site(s) from the oracle's $NMOD module object(s), floor is $MIN_RELOC_SITES." >&2
+  echo "  An emptied relocation extraction passes everything; check that objdump is on" >&2
+  echo "  PATH and that 'objdump -r' can read these objects." >&2
+  bad=1
+fi
+
+LC_ALL=C sort -u "$work/rel_observed" >"$work/rel_observed.sorted"
+printf '%s\n' "$RELOC_DECLARED" | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u >"$work/rel_declared.sorted"
+LC_ALL=C comm -23 "$work/rel_observed.sorted" "$work/rel_declared.sorted" >"$work/rel_undeclared"
+LC_ALL=C comm -13 "$work/rel_observed.sorted" "$work/rel_declared.sorted" >"$work/rel_stale"
+LC_ALL=C sort -u "$work/rel_mismatch" >"$work/rel_mismatch.sorted"
+
+if [ -s "$work/rel_undeclared" ]; then
+  echo "diffruntime: FAIL — $(cut -d' ' -f1 <"$work/rel_undeclared" | LC_ALL=C sort -u | wc -l | tr -d ' ') of $NMOD runtime module(s) reference a different set of external symbols than the pinned stage0 ($reloc_sites_seen relocation site(s) compared):" >&2
+  sed 's/^/  /' "$work/rel_undeclared" >&2
+  echo "  '-' is referenced by stage0 only (this tree lowers it inline or dropped it);" >&2
+  echo "  '+' is referenced by this tree only. If the change is intended, add each line" >&2
+  echo "  verbatim to RELOC_DECLARED in this script; if it is not, this is a" >&2
+  echo "  cross-module lowering regression the IR walk above cannot see (#4365)." >&2
+  echo "  List one module's references with:  objdump -r MODULE.o" >&2
+  bad=1
+fi
+
+# The other half of the two-way assertion: a declared line that no longer
+# diverges is stale, and a stale line masks a later regression on that exact
+# symbol. Failing here is what empties the table at the next stage0 repin.
+if [ -s "$work/rel_stale" ]; then
+  echo "diffruntime: FAIL — $(wc -l <"$work/rel_stale" | tr -d ' ') declared cross-object reference change(s) no longer diverge from the pinned stage0:" >&2
+  sed 's/^/  /' "$work/rel_stale" >&2
+  echo "  Delete each line from RELOC_DECLARED in this script — the pin has caught up." >&2
+  bad=1
+fi
+
+# Informational, never fails: every delta in these modules was declared line
+# for line above.
+if [ -s "$work/rel_mismatch.sorted" ] && [ ! -s "$work/rel_undeclared" ]; then
+  echo "diffruntime: DECLARED — $(wc -l <"$work/rel_mismatch.sorted" | tr -d ' ') runtime module(s) reference a different set of external symbols than the pinned stage0, every delta declared (not a regression):"
+  sed 's/^/  /' "$work/rel_mismatch.sorted"
+fi
+
 # $timedout is a 0/1 "did anything time out" flag (four sources feed it above);
 # the actual count named in diffexit's UNDECIDED line is summed separately so
 # the message is accurate when more than one source timed out.
@@ -551,6 +685,7 @@ if [ "$bad" -eq 0 ] && [ "$timedout" -eq 0 ]; then
   modwhat="byte-identical"
   { [ "$ATOMIC_ISA" = aarch64 ] || [ "$ATOMIC_ISA" = x86_64 ]; } && modwhat="atomic-width-signature-identical"
   explained=$(wc -l <"$work/explained.sorted" | tr -d ' ')
-  echo "diffruntime: PASS — $match/$total runtime file(s) lower identically ($skip skipped, $explained explained); $modmatch/$NMOD runtime module(s) $modwhat ($modskip skipped, object)"
+  reldiv=$(wc -l <"$work/rel_mismatch.sorted" | tr -d ' ')
+  echo "diffruntime: PASS — $match/$total runtime file(s) lower identically ($skip skipped, $explained explained); $modmatch/$NMOD runtime module(s) $modwhat ($modskip skipped, object); $reloc_sites_seen cross-object relocation site(s) compared over $NMOD module(s), $reldiv with a declared reference change"
 fi
 diffexit "runtime" -f "$bad" -t "runtime file(s)=$timedoutfiles"
