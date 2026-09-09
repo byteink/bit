@@ -7,7 +7,10 @@
 # it. union_spec_steps() (#4136) and assert_fmt_gate_per_bucket() (#4328) are
 # the two functions here that are NOT a pure move — see their own comments.
 # This file owns the BUCKET-side invariants (what a bucket must run);
-# scripts/gate-envscope.sh owns the GATE-side ones (what a gate declares). Source this after `cd`-ing to the repo root,
+# scripts/gate-envscope.sh owns the GATE-side ones (what a gate declares).
+# IT IS NOW NEAR THE 800-LINE HARD-ZERO CEILING (_tests_/bit/shellsize.bit).
+# The next addition SPLITS the three assert_*() functions and their helpers out
+# rather than buying room from the reasoning — #4454's move, one file further. Source this after `cd`-ing to the repo root,
 # and after BUCKET/REASON/testsbit_steps/has_testsbit/SPEC_PARTNER are
 # already set by gate.sh's own bucket-selection logic — every function here
 # reads those as globals rather than taking parameters, matching gate.sh's
@@ -19,6 +22,7 @@
 #   union_testsbit_steps     # folds testsbit_steps into BUILD_STEPS + REASON
 #   union_spec_steps         # folds test-spec into BUILD_STEPS + REASON (#4136)
 #   assert_full_is_superset  # every bucket's scripts must be gate_scripts+ #2194
+#   assert_composite_is_superset # a composite runs >= each constituent #4480
 #   assert_fmt_gate_per_bucket # every .bit tree's bucket runs a fmt gate #4328
 #   bucket_scripts "${BUCKET}"; PRE_SCRIPTS=...; POST_SCRIPTS=...
 #   validate_build_steps     # STALE check against ./make --list
@@ -87,6 +91,27 @@ bucket_scripts() {
       BUCKET_POST="scripts/selfhost-diffruntime.sh scripts/selfhost-diffexamples.sh"
       ;;
   esac
+}
+
+# THE COMPOSITE BUCKETS AND THEIR CONSTITUENTS — the one place the membership
+# is written down. build_steps_for_bucket()'s `stdlibdocs` arm derives its step
+# list from this, and assert_composite_is_superset() checks the result against
+# it, so the two cannot disagree the way a bucket and its hand-copied union did
+# for the whole life of that arm (#4480). Prints nothing and returns 1 for a
+# bucket that is not composite.
+composite_parents() {
+  case "$1" in
+    stdlibdocs) printf 'stdlib docs\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Prints the composite bucket names, one per line — the iteration order for
+# assert_composite_is_superset(). Kept beside composite_parents() so adding a
+# composite means editing two adjacent lines, and forgetting the second means
+# the new bucket is unchecked rather than wrongly checked.
+composite_buckets() {
+  printf 'stdlibdocs\n'
 }
 
 build_steps_for_bucket() {
@@ -302,12 +327,42 @@ case "${BUCKET}" in
     BUILD_STEPS=(test-docs test-stdlib-docs)
     ;;
   stdlibdocs)
-    # The union of the `stdlib` and `docs` buckets' own steps just above
-    # (#3055) — a stdlib export's page can be wrong in either direction (a
-    # stale heading, or a missing one) and both buckets' own checks are
-    # needed to catch either. Carries `stdlib`'s own test-packages (#3271)
-    # forward for the same reason.
-    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-docs test-packages)
+    # THE UNION OF `stdlib` AND `docs` (#3055) — a stdlib export's page can be
+    # wrong in either direction (a stale heading, or a missing one) and both
+    # buckets' own checks are needed to catch either.
+    #
+    # COMPUTED from those two arms, not copied from them (#4480). This was a
+    # hand-written third list for as long as it existed, and it went stale
+    # twice without a word: #4448/#4449 added test-lint-self,
+    # test-lint-complexity and test-lint-sweep to `stdlib` and #4478 added
+    # test-stdlib-unit, none of them reaching here. So a diff touching
+    # stdlib/** AND its docs page ran FOUR FEWER checks over the stdlib change
+    # than the same diff without the docs edit — the #2084 shape
+    # assert_full_is_superset() below already exists to prevent for `full`,
+    # reached at a composite bucket that check does not cover.
+    #
+    # `local BUCKET` shadows the caller's for the recursion only: the two
+    # probing calls read it, and gate.sh's own BUCKET is untouched on return.
+    # BUILD_STEPS stays global — it is this function's output — and is built by
+    # a loop from `acc` rather than assigned as a literal, the same shape the
+    # `testsbit` arm below already uses, so the header's "never empty" rule is
+    # kept by both parents being non-empty.
+    local parent step acc="" seen=" "
+    local BUCKET
+    for parent in $(composite_parents stdlibdocs); do
+      BUCKET="${parent}"
+      build_steps_for_bucket
+      for step in "${BUILD_STEPS[@]}"; do
+        case "${seen}" in
+          *" ${step} "*) ;;
+          *) acc="${acc}${step} "; seen="${seen}${step} " ;;
+        esac
+      done
+    done
+    BUILD_STEPS=()
+    for step in ${acc}; do
+      BUILD_STEPS+=("${step}")
+    done
     ;;
   pkg)
     # #3271. See the header comment block's "pkg/ IS THE ONE BUCKET..."
@@ -430,6 +485,80 @@ for b in full selfhost runtime testcases examples stdlib pkg docs stdlibdocs spe
 done
 }
 
+assert_composite_is_superset() {
+# A COMPOSITE BUCKET REPLACES ITS CONSTITUENTS, so it must run at least what
+# they do — the same invariant assert_full_is_superset() above enforces for
+# `full`, reached at a bucket that check does not cover. #2084's lesson,
+# recurring: `stdlibdocs` is chosen instead of `stdlib` when a stdlib/** diff
+# also touches its docs/stdlib/*.md page, and for the whole life of that arm it
+# was a hand-copied list that went stale twice — measured 2026-09-08 it ran FOUR
+# FEWER checks (test-lint-self, test-lint-complexity, test-lint-sweep,
+# test-stdlib-unit) than the plain `stdlib` bucket, so ADDING a file to a diff
+# made the gate strictly weaker behind a green GATE_RESULT=PASS (#4480).
+#
+# The arm derives its list from composite_parents() now, so this cannot fail
+# without someone hand-writing the list back. It is checked rather than trusted
+# because the previous arm's own comment claimed the union while not being it,
+# and no comment fails a gate. Probes the LIVE build_steps_for_bucket() for
+# every bucket involved, never a second copy of any step list; shadows
+# BUCKET/BUILD_STEPS as locals so it never disturbs the real diff's own bucket
+# selection running around it in scripts/gate.sh.
+local composite parents parent step composite_steps denom=0 bad=""
+local BUCKET BUILD_STEPS
+composite="$(composite_buckets)"
+if [ -z "${composite}" ]; then
+  echo "gate: assert_composite_is_superset: composite_buckets() named NOTHING — today it names at least stdlibdocs, so that is this file's own table breaking, not a fact about the tree. An empty list checks nothing and prints like a clean run." >&2
+  exit 2
+fi
+while IFS= read -r composite; do
+  [ -n "${composite}" ] || continue
+  denom=$((denom + 1))
+  parents="$(composite_parents "${composite}")" || {
+    echo "gate: assert_composite_is_superset: composite_buckets() names '${composite}' but composite_parents() has no arm for it — the two adjacent tables in scripts/gate-buildsteps.sh have diverged." >&2
+    exit 2
+  }
+  BUCKET="${composite}"
+  BUILD_STEPS=(__no_arm__)
+  build_steps_for_bucket
+  composite_steps=" ${BUILD_STEPS[*]} "
+  case "${composite_steps}" in
+    *" __no_arm__ "*)
+      echo "gate: assert_composite_is_superset: bucket '${composite}' has no arm in build_steps_for_bucket() — it would run nothing." >&2
+      exit 2
+      ;;
+  esac
+  for parent in ${parents}; do
+    BUCKET="${parent}"
+    BUILD_STEPS=(__no_arm__)
+    build_steps_for_bucket
+    case " ${BUILD_STEPS[*]} " in
+      *" __no_arm__ "*)
+        echo "gate: assert_composite_is_superset: composite '${composite}' names constituent '${parent}', which has no arm in build_steps_for_bucket()." >&2
+        exit 2
+        ;;
+    esac
+    for step in "${BUILD_STEPS[@]}"; do
+      case "${composite_steps}" in
+        *" ${step} "*) ;;
+        *)
+          bad="${bad:+${bad}
+}composite bucket '${composite}' is missing '${step}', which its constituent '${parent}' runs — the composite REPLACES that bucket, so a diff touching both areas would run FEWER checks over ${parent}/** than a ${parent}-only diff (#4480/#2084)"
+          ;;
+      esac
+    done
+  done
+done <<EOF
+${composite}
+EOF
+
+if [ -n "${bad}" ]; then
+  echo "gate: assert_composite_is_superset: FAILED —" >&2
+  echo "${bad}" | sed 's/^/gate:   /' >&2
+  exit 2
+fi
+echo "gate: assert_composite_is_superset: ${denom} composite bucket(s); each runs a superset of every constituent's steps"
+}
+
 # ---------------------------------------------------------------------------
 # EVERY .bit TREE'S BUCKET RUNS A FMT GATE (#4328).
 #
@@ -439,22 +568,18 @@ done
 # runtime/root/rootconfig.bit, scripts/gate.sh reported GATE_RESULT=PASS, and
 # merged `main` (ab12ff28) then failed test-fmt-strict on the file it had just
 # edited — the `runtime` bucket ran no formatter at all. #4445 closed that
-# instance by wiring the step in, and assert_envscoped_gates_current() holds it
-# shut. The other end of the same wire is still open: drop `runtime:runtime`
-# from BIT_FMTZERO_TREES and every assertion in that file stays green — the env
-# half has no runtime pair left to check, the bucket still lists the step —
-# while runtime/*.bit is once again formatted by nothing.
+# instance and assert_envscoped_gates_current() holds it shut. The other end of
+# the same wire is still open: drop `runtime:runtime` from BIT_FMTZERO_TREES and
+# all three stay green — the env half has no runtime pair left to check, the
+# bucket still lists the step — while runtime/*.bit is formatted by nothing.
 #
 # So this asks it from the BUCKET's side, which is why it lives here beside
-# assert_full_is_superset() rather than in gate-envscope.sh (which is also at
-# 594 of the 800-line hard-zero ceiling, with no room for 200 lines): every
-# tree holding `.bit` sources must be `fmt --check`ed by some gate, and the
-# bucket that tree resolves to must run one of the gates that checks it.
-#
-# CALLED FROM scripts/gate.sh, right after assert_full_is_superset(), which is
-# after every module is sourced — it probes argvliteral_bucket_for_dir()
-# (gate-envscope.sh) and testsbit_steps_for() (gate-filemap.sh), neither of
-# which exists at this file's own source time.
+# assert_full_is_superset(): every tree holding `.bit` sources must be
+# `fmt --check`ed by some gate, and the bucket that tree resolves to must run
+# one of the gates that checks it. Called from scripts/gate.sh after every
+# module is sourced — it probes argvliteral_bucket_for_dir() (gate-envscope.sh)
+# and testsbit_steps_for() (gate-filemap.sh), neither of which exists at this
+# file's own source time.
 
 # Emits "<gate> <tree>" for every gate that runs `bit fmt --check` over a source
 # tree, from the two live gate tables, by the two spellings that exist:
@@ -473,8 +598,7 @@ done
 # envscoped_gate_trees()/argvliteral_gate_paths(), including the `fn ` reset so
 # a `${repoRoot()}` literal in a helper is never attributed to the last Gate{}
 # scanned. An `env:` line ends an argv scan: test-fmt's argv spans three lines
-# with its env on the fourth, and an env entry's `${repoRoot()}` path is not a
-# formatted tree.
+# with its env on the fourth, and an env path is not a formatted tree.
 fmt_gate_trees() {
   local file line name m pair p inargv=0
   for file in tools/build/gates.bit tools/build/gatestable2.bit; do
@@ -523,9 +647,8 @@ fmt_gate_trees() {
 # is perturbed by any other agent's scratch file in a shared checkout, and a new
 # tree is `git add`ed before it can be committed. `_tests_/` is cut one level
 # deeper because that is the granularity every routing table here and in
-# scripts/gate-classify.sh uses (_tests_/cases and _tests_/bit are different
-# buckets). A `.bit` file at the repo root belongs to no tree and is skipped —
-# there are none, and one would resolve to bucket `full` anyway.
+# scripts/gate-classify.sh uses. A `.bit` file at the repo root belongs to no
+# tree and is skipped — there are none, and one would resolve to `full` anyway.
 bit_source_trees() {
   git ls-files '*.bit' |
     awk -F/ 'NF < 2 { next } { if ($1 == "_tests_") print $1 "/" $2; else print $1 }' |
@@ -548,9 +671,9 @@ FMTGATE_UNGATED_TREES="_tests_/freestanding _tests_/testproj"
 
 # Fails loudly if this is called before the modules it probes are sourced.
 # Absent, `$(...)` yields empty and every tree looks unwired — a plausible WRONG
-# answer naming real trees, which is worse than a crash. Same shape and same
-# reason as gate-envscope.sh's assert_envscope_deps(), which this cannot reuse:
-# it does not check argvliteral_bucket_for_dir(), the one this needs most.
+# answer naming real trees, which is worse than a crash. Same reason as
+# gate-envscope.sh's assert_envscope_deps(), which this cannot reuse: that one
+# does not check argvliteral_bucket_for_dir(), the one this needs most.
 assert_fmtgate_deps() {
   local fn missing=""
   for fn in argvliteral_bucket_for_dir testsbit_steps_for; do
