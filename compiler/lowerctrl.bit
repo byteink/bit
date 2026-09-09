@@ -9,10 +9,11 @@
 // and an exit. break -> exit, continue -> step. A `chan` iterable has no cursor
 // at all and goes to `lowerForOfChan`.
 //
-// The binder is one name over a slice/array (the element) or a `(pat, pat)`
-// pair: `(index, element)` over a slice/array (#2012), `(key, value)` over a
-// map. The checker types both halves of the pair either way, so a shape it
-// accepts and this refused was a build that failed after a clean `bit check`.
+// The binder is one name — the element over a slice/array, the whole
+// `(key, value)` pair over a map (#4334) — or a `(pat, pat)` pair:
+// `(index, element)` over a slice/array (#2012), `(key, value)` over a map.
+// The checker types every half either way, so a shape it accepts and this
+// refused was a build that failed after a clean `bit check`.
 //
 // `value` is the per-iteration element; `bindTy` is what `lowerForOf` must
 // declare its local UNDER (#3862's PACKED case needs both, and is the reason
@@ -185,6 +186,87 @@ fn lowerForOfBindElem(fc: FnCtx, binderNode: Node, k: []int, v: ForOfBindVals) {
   rebindCheckerName(fc, k[0], v.elemTy)
 }
 
+// Refuses a `for … of` binder shape lowering must never reach if `bit check`
+// passed — split out of `lowerForOf` (#4334) so this function's own guards
+// stop feeding that already-oversized function's complexity, the same
+// reasoning `rejectForInBinderShape` (lowerforin.bit) and `lowerForOfBindElem`
+// below already record for their extractions. Real enforcement is
+// `vForOfString`/`vForOfFieldPat` (validateloop.bit); this is the defensive
+// floor, not the enforcement. Returns true when `binderNode` is refused and a
+// diagnostic has already been reported via `fcFail`.
+//
+// A MAP admits a plain name and a `(key, value)` pair, and nothing else: the
+// name binds the whole pair (#4334), the pair destructures it. A field pattern
+// over a map has no class element to name fields on, so it stays refused.
+fn rejectForOfBinderShape(fc: FnCtx, binderNode: Node, k: []int, isMap: bool): bool {
+  if (binderNode.tag != Tag.Ident &&
+    binderNode.tag != Tag.TuplePat &&
+    binderNode.tag != Tag.FieldPat) {
+    fcFail(
+      fc,
+      binderNode.span,
+      "a `for … of` binder that is not a name, a `(name, name)` pair, or a `{ name, ... }` field pattern",
+    )
+    return true
+  }
+  if (isMap && binderNode.tag == Tag.FieldPat) {
+    fcFail(fc, binderNode.span, "a map iteration with a `{ name, ... }` field-pattern binder")
+    return true
+  }
+  // Both pair forms bind exactly two names; the parser's `"(" pat "," pat ")"`
+  // admits no other arity, so this is a guard against indexing what is not there
+  // rather than a diagnosis.
+  if (binderNode.tag == Tag.TuplePat && len(kidsOf(fc.c.tree, k[0])) != 2) {
+    fcFail(fc, binderNode.span, "a `for … of` pair binder with other than two names")
+    return true
+  }
+  return false
+}
+
+// Binds the MAP row's per-iteration key and value into `for … of`'s binder.
+// Split out of `lowerForOf` (#4334) for the same reason
+// `rejectForOfBinderShape` above was: a second binder shape here would
+// otherwise grow that function's complexity again.
+//
+// `for (k, v) of m` declares the two locals directly — byte-for-byte what this
+// arm did before #4334. `for x of m` binds ONE local to the `(K, V)` pair, and
+// materializes that pair per iteration through `buildTuple` (lowerexpr.bit),
+// the identical `gc_alloc` + one store per element a tuple literal emits
+// (ABI.md §1.1) — one representation everywhere a tuple is built, so `x.0` in
+// the body reads it with the same `Op.FieldGet` a `let t = (a, b)` does. The
+// tuple type is `elementType`'s own Map answer (checkmatch.bit), re-derived
+// here from the INSTANCE's `mapKey`/`mapVal` rather than read off the checker,
+// so a monomorphized instance boxes its substituted types, not the bare type
+// params the check pass recorded.
+//
+// `rebindCheckerName` keeps the checker env consistent so the body types the
+// binder (see lowerFunc) — the same reason the pair arm has always needed it.
+fn lowerForOfBindMap(fc: FnCtx, k: []int, iterCur: int, idxVal: int, id: Type) {
+  let kv = mkInstr(Op.RtCall, id.mapKey)
+  kv.name = "map_key_at"
+  kv.args = [iterCur, idxVal]
+  let keyV = emitRtCall(fc, kv)
+  let vv = mkInstr(Op.RtCall, id.mapVal)
+  vv.name = "map_val_at"
+  vv.args = [iterCur, idxVal]
+  let valV = emitRtCall(fc, vv)
+  let binderNode = getNode(fc.c.tree, k[0])
+  if (binderNode.tag != Tag.TuplePat) {
+    let pairTy = mkTuple(fc.c.ctx, [id.mapKey, id.mapVal])
+    let pairV = buildTuple(fc, pairTy, [keyV, valV])
+    declareLocal(fc, fc.c.source[binderNode.span.start:binderNode.span.end], pairV, pairTy)
+    rebindCheckerName(fc, k[0], pairTy)
+    return
+  }
+  let subs = kidsOf(fc.c.tree, k[0])
+  let kn = getNode(fc.c.tree, subs[0])
+  let vn = getNode(fc.c.tree, subs[1])
+  declareLocal(fc, fc.c.source[kn.span.start:kn.span.end], keyV, id.mapKey)
+  declareLocal(fc, fc.c.source[vn.span.start:vn.span.end], valV, id.mapVal)
+  rebindCheckerName(fc, subs[0], id.mapKey)
+  rebindCheckerName(fc, subs[1], id.mapVal)
+}
+
 fn lowerForOf(fc: FnCtx, node: int) {
   let k = kidsOf(fc.c.tree, node)
   let iterTy = defaultType(fc.c, nodeType(fc, k[1]))
@@ -203,25 +285,7 @@ fn lowerForOf(fc: FnCtx, node: int) {
     )
     return
   }
-  if (isMap && binderNode.tag != Tag.TuplePat) {
-    fcFail(fc, binderNode.span, "a map iteration with a binder that is not a `(key, value)` pair")
-    return
-  }
-  if (binderNode.tag != Tag.Ident &&
-    binderNode.tag != Tag.TuplePat &&
-    binderNode.tag != Tag.FieldPat) {
-    fcFail(
-      fc,
-      binderNode.span,
-      "a `for … of` binder that is not a name, a `(name, name)` pair, or a `{ name, ... }` field pattern",
-    )
-    return
-  }
-  // Both pair forms bind exactly two names; the parser's `"(" pat "," pat ")"`
-  // admits no other arity, so this is a guard against indexing what is not there
-  // rather than a diagnosis.
-  if (binderNode.tag == Tag.TuplePat && len(kidsOf(fc.c.tree, k[0])) != 2) {
-    fcFail(fc, binderNode.span, "a `for … of` pair binder with other than two names")
+  if (rejectForOfBinderShape(fc, binderNode, k, isMap)) {
     return
   }
   let elemTy = id.elem
@@ -297,24 +361,7 @@ fn lowerForOf(fc: FnCtx, node: int) {
   fc.terminated = false
   let bodyMark = len(fc.env)
   if (isMap) {
-    let subs = kidsOf(fc.c.tree, k[0])
-    let kv = mkInstr(Op.RtCall, id.mapKey)
-    kv.name = "map_key_at"
-    kv.args = [iterCur, idxVal]
-    let keyV = emitRtCall(fc, kv)
-    let vv = mkInstr(Op.RtCall, id.mapVal)
-    vv.name = "map_val_at"
-    vv.args = [iterCur, idxVal]
-    let valV = emitRtCall(fc, vv)
-    let kn = getNode(fc.c.tree, subs[0])
-    let vn = getNode(fc.c.tree, subs[1])
-    declareLocal(fc, fc.c.source[kn.span.start:kn.span.end], keyV, id.mapKey)
-    declareLocal(fc, fc.c.source[vn.span.start:vn.span.end], valV, id.mapVal)
-    // Keep the checker env consistent so the body types the binders (see
-    // lowerFunc) — matters when a monomorphized instance substitutes an element
-    // type the check pass recorded as a bare type-param.
-    rebindCheckerName(fc, subs[0], id.mapKey)
-    rebindCheckerName(fc, subs[1], id.mapVal)
+    lowerForOfBindMap(fc, k, iterCur, idxVal, id)
   } else {
     let elemV = 0
     // See `lowerForOfSliceElem`'s comment (above this function) for why the
