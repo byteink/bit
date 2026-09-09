@@ -1,0 +1,394 @@
+// In-Bit self-checks for Mach-O executable address assignment, relocation
+// application and the dyld info streams (#1344 part 5c) — moved verbatim out
+// of compiler/machoexeccheck.bit (#4322), which was 790 lines against the
+// hard 800-line E0200 ceiling.
+//
+// The writer's constants, the dyld opcode encoders, the layout helpers and
+// the dead-strip/GOT/undefined-symbol link checks (parts 5a and 5b) stay in
+// machoexeccheck.bit; read its header first.
+//
+// Split out of selfcheck.bit (#1503) originally, so this is the same module:
+// `selfcheck()` still calls these directly and nothing is imported here (a
+// duplicate import is E0042).
+// Stage 3 (#1344 part 5c) address assignment, relocation application, and the
+// dyld info streams.
+
+// `panic` is void, not bottom, so a catch that must yield a MePatched needs a
+// real value beside the assert that actually fails.
+fn meEmptyPatched(): MePatched {
+  return MePatched{ bytes: map<int, []u8>{}, dataBinds: []MeDataBind(0),
+    dataRebases: []int(0) }
+}
+
+fn meAddrs(stubs: int, got: int, dataSeg: int, tlsBase: int): MeAddrs {
+  return MeAddrs{ stubsVaddr: stubs, gotVaddr: got, dataSegVaddr: dataSeg,
+    tlsTemplateBase: tlsBase }
+}
+
+fn checkMachoExecSymtab() {
+  // Every surviving __text atom gets a LOCAL symbol-table entry (for
+  // nm/atos/sample), global or not; an import gets the usual N_UNDF|N_EXT
+  // entry, since dyld still has to bind it.
+  let m = LoModule{ name: "rt", atoms: [
+    meAtom("__start", LoSectionKind.Text, LoBinding.Global, 12, [
+      meRel(0, LoRelocKind.Aarch64Call26, loGlobalRef("_exit")),
+      meRel(4, LoRelocKind.Aarch64AdrGotPage, loGlobalRef("_environ")),
+      meRel(8, LoRelocKind.Aarch64Call26, loLocalRef(1))]),
+    meAtom("helper", LoSectionKind.Text, LoBinding.Local, 4, []LoReloc(0))]}
+  let st = meAnalyze([m])
+  let sym = meBuildSymtab([m], st)
+
+  // strtab: empty string, then "__start"/"helper" (the two __text atoms, in
+  // module/atom order), then each import NUL-terminated. "_exit" is seen first.
+  assert(sym.strtab.bytes[0] == u8(0))
+  assert(string(sym.strtab.bytes[1:8]) == "__start")
+  assert(sym.strtab.bytes[8] == u8(0))
+  assert(string(sym.strtab.bytes[9:15]) == "helper")
+  assert(sym.strtab.bytes[15] == u8(0))
+  assert(string(sym.strtab.bytes[16:21]) == "_exit")
+  assert(sym.strtab.bytes[21] == u8(0))
+  assert(string(sym.strtab.bytes[22:30]) == "_environ")
+  assert(len(sym.strtab.bytes) == 1 + 8 + 7 + 6 + 9)
+
+  // Two local defined entries (__text atoms), then two undefined-import
+  // entries. One 16-byte nlist_64 each.
+  assert(sym.nLocal == 2)
+  assert(len(sym.nlists.bytes) == 4 * 16)
+  assert(leAt(sym.nlists.bytes, 0, 4) == 1)   // n_strx -> "__start"
+  assert(int(sym.nlists.bytes[4]) == 0xe)     // N_SECT, local (no N_EXT)
+  assert(int(sym.nlists.bytes[5]) == 1)       // n_sect: __TEXT,__text ordinal 1
+  assert(leAt(sym.nlists.bytes, 16, 4) == 9)  // n_strx -> "helper"
+  assert(int(sym.nlists.bytes[20]) == 0xe)    // N_SECT, local
+  assert(int(sym.nlists.bytes[21]) == 1)      // n_sect: __text
+  assert(leAt(sym.nlists.bytes, 32, 4) == 16) // n_strx -> "_exit"
+  assert(int(sym.nlists.bytes[36]) == 0x01)   // N_UNDF | N_EXT
+  assert(int(sym.nlists.bytes[37]) == 0)      // NO_SECT
+  assert(leAt(sym.nlists.bytes, 40, 8) == 0)  // n_value
+  assert(leAt(sym.nlists.bytes, 48, 4) == 22) // n_strx -> "_environ"
+
+  // The indirect table is stubs first, then the GOT — the order the section
+  // headers' reserved1 indices assume. Import symbol indices are now offset by
+  // nLocal (the two local __text entries sort first).
+  let ind = meIndirectSymbols(st, sym.symIndex)
+  assert(len(ind) == len(st.stubList) + len(st.gotList))
+  assert(ind[0] == 2) // the one stub: _exit, symbol 2 (after 2 locals)
+  // GOT order is _exit (from the branch) then _environ.
+  assert(ind[1] == 2 && ind[2] == 3)
+}
+
+fn checkMachoExecStreams() {
+  // Rebase offsets are emitted in ASCENDING order regardless of discovery order,
+  // so the output stays deterministic.
+  let ops = meRebaseStream([0x2000, 0x8, 0x100], 2)
+  // SET_TYPE_IMM|POINTER, then (SET_SEG_AND_OFF|2, uleb, DO_REBASE|1) x3, DONE.
+  assert(ops.bytes[0] == u8(0x11))
+  assert(ops.bytes[1] == u8(0x22) && ops.bytes[2] == u8(0x08)) // 0x8 first
+  assert(ops.bytes[3] == u8(0x51))
+  assert(ops.bytes[4] == u8(0x22) && ops.bytes[5] == u8(0x80) && ops.bytes[6] == u8(0x02)) // uleb(0x100)
+  assert(ops.bytes[7] == u8(0x51))
+  assert(ops.bytes[8] == u8(0x22) && ops.bytes[9] == u8(0x80) && ops.bytes[10] == u8(0x40)) // uleb(0x2000)
+  assert(ops.bytes[11] == u8(0x51))
+  assert(ops.bytes[12] == u8(0x00)) // DONE
+  assert(len(ops.bytes) == 13)
+
+  // Nothing to slide: no stream at all, not an empty-but-present one.
+  assert(len(meRebaseStream([]int(0), 2).bytes) == 0)
+
+  // The bind stream names libSystem as dylib #1, then binds each import's GOT
+  // slot, then each absolute data pointer to an import.
+  let m = LoModule{ name: "rt", atoms: [
+    meAtom("__start", LoSectionKind.Text, LoBinding.Global, 8, [
+      meRel(0, LoRelocKind.Aarch64AdrGotPage, loGlobalRef("_environ"))])]}
+  let st = meAnalyze([m])
+  let b = meBindStream(st, [MeDataBind{ segOff: 0x40, name: "_malloc" }],
+    0x100008000, 0x100008000, 2)
+  assert(b.bytes[0] == u8(0x11)) // SET_DYLIB_ORDINAL_IMM | 1
+  // _environ's GOT slot is at offset 0 of __DATA.
+  assert(b.bytes[1] == u8(0x40))
+  assert(string(b.bytes[2:10]) == "_environ")
+  assert(b.bytes[10] == u8(0x00)) // NUL
+  assert(b.bytes[11] == u8(0x51)) // SET_TYPE_IMM | POINTER
+  assert(b.bytes[12] == u8(0x72)) // SET_SEGMENT_AND_OFFSET_ULEB | 2
+  assert(b.bytes[13] == u8(0x00)) // uleb(0)
+  assert(b.bytes[14] == u8(0x90)) // DO_BIND
+  assert(b.bytes[len(b.bytes) - 1] == u8(0x00)) // DONE
+}
+
+fn checkMachoExecApply() {
+  // __start branches to an internal helper and holds an abs64 to it; `ptr` is a
+  // data atom whose abs64 must be rebased.
+  let m = LoModule{ name: "rt", atoms: [
+    meCodeAtom("__start", LoBinding.Global, 0x94000000, [
+      meRel(0, LoRelocKind.Aarch64Call26, loLocalRef(1))]),
+    meAtom("helper", LoSectionKind.Text, LoBinding.Global, 8, []LoReloc(0)),
+    meAtom("ptr", LoSectionKind.Data, LoBinding.Global, 8, [
+      meRel(0, LoRelocKind.Abs64, loLocalRef(1))])]}
+  let g = resolveGlobals([m]) catch _ { map<string, int>{} }
+  // `ptr` is data, unreachable from __start's code, so dead-strip would drop it.
+  // Force it kept to exercise the abs64/rebase path. (Reading a dropped atom out
+  // of pat.bytes returns the zero slice, and using it without checking the
+  // comma-ok flag crashes silently — which is exactly what the flag is for.)
+  let st0 = meDeadStripWithImports([m], g, 0, []string(0)) catch _ {
+    assert(false)
+    meEmptyState()
+  }
+  st0.kept[atomKey(0, 2)] = true
+  let st1 = mePartition([m], st0)
+  let st = meBuildGotAndStubs([m], g, st1) catch _ {
+    assert(false)
+    meEmptyState()
+  }
+
+  // Place text at a known base; put the data atom in __DATA.
+  let addrOf = map<int, int>{}
+  addrOf[atomKey(0, 0)] = 0x100000000
+  addrOf[atomKey(0, 1)] = 0x100000010
+  addrOf[atomKey(0, 2)] = 0x100008000
+  let a = meAddrs(0x100004000, 0x100008100, 0x100008000, 0)
+  let pat = meApplyRelocs([m], g, st, addrOf, a) catch _ {
+    assert(false)
+    meEmptyPatched()
+  }
+
+  // The internal branch resolves direct: bl +16 == the assembler's 0x94000004.
+  let (code, _) = pat.bytes[atomKey(0, 0)]
+  assert(loRdU32(code, 0) == 0x94000004)
+
+  // The data atom's abs64 holds helper's absolute address...
+  let (data, _) = pat.bytes[atomKey(0, 2)]
+  assert(loRdU64(data, 0) == 0x100000010)
+  // ...and is rebased, since __data is writable and dyld slides the image.
+  // The GOT is empty here, so the only rebase is the data pointer's.
+  assert(len(pat.dataRebases) == 1)
+  assert(pat.dataRebases[0] == 0) // 0x100008000 - dataSegVaddr
+  assert(len(pat.dataBinds) == 0)
+
+  // The atom's ORIGINAL bytes are untouched — only the patched copy carries the
+  // relocated value. Two atoms can share a backing slice.
+  assert(loRdU64(m.atoms[2].data, 0) == 0)
+}
+
+fn checkMachoExecApplyImports() {
+  // A branch to an import is retargeted to its STUB, not to the symbol; an
+  // abs64 to an import is left zero for dyld to bind.
+  let m = LoModule{ name: "rt", atoms: [
+    meCodeAtom("__start", LoBinding.Global, 0x94000000, [
+      meRel(0, LoRelocKind.Aarch64Call26, loGlobalRef("_exit"))]),
+    meAtom("fnptr", LoSectionKind.Data, LoBinding.Global, 8, [
+      meRel(0, LoRelocKind.Abs64, loGlobalRef("_malloc"))])]}
+  let g = resolveGlobals([m]) catch _ { map<string, int>{} }
+  let st0 = meDeadStripWithImports([m], g, 0, []string(0)) catch _ { meEmptyState() }
+  // fnptr is not reachable from __start, so force it kept to exercise the path.
+  st0.kept[atomKey(0, 1)] = true
+  let st1 = mePartition([m], st0)
+  let st = meBuildGotAndStubs([m], g, st1) catch _ { meEmptyState() }
+
+  let addrOf = map<int, int>{}
+  addrOf[atomKey(0, 0)] = 0x100000000
+  addrOf[atomKey(0, 1)] = 0x100008000
+  let a = meAddrs(0x100004000, 0x100008100, 0x100008000, 0)
+  let pat = meApplyRelocs([m], g, st, addrOf, a) catch _ {
+    assert(false)
+    meEmptyPatched()
+  }
+
+  // The branch targets stub 0 at 0x100004000, from p = 0x100000000:
+  // disp = 0x4000, imm26 = 0x1000.
+  let (code, _) = pat.bytes[atomKey(0, 0)]
+  assert(loRdU32(code, 0) == 0x94001000)
+
+  // The import pointer stays zero in the file and is recorded as a bind.
+  let (data, _) = pat.bytes[atomKey(0, 1)]
+  assert(loRdU64(data, 0) == 0)
+  assert(len(pat.dataBinds) == 1)
+  assert(pat.dataBinds[0].name == "_malloc" && pat.dataBinds[0].segOff == 0)
+  // The import's GOT slot is NOT rebased — dyld binds it instead.
+  assert(len(pat.dataRebases) == 0)
+}
+
+fn checkMachoExecTlsOffset() {
+  // A tlv_descriptor's data field points at the variable's storage, and must be
+  // stored as its constant OFFSET within the TLV template — not an absolute
+  // address, and never rebased. dyld reads the offset directly.
+  let m = LoModule{ name: "rt", atoms: [
+    meAtom("__start", LoSectionKind.Text, LoBinding.Global, 4, [
+      meRel(0, LoRelocKind.Aarch64AdrPrelPgHi21, loLocalRef(1))]),
+    meAtom("desc", LoSectionKind.TlsVars, LoBinding.Global, 24, [
+      meRel(16, LoRelocKind.Abs64, loLocalRef(2))]),
+    meAtom("x$tlv$init", LoSectionKind.TlsData, LoBinding.Local, 8, []LoReloc(0))]}
+  let g = resolveGlobals([m]) catch _ { map<string, int>{} }
+  let st = meAnalyze([m])
+
+  let addrOf = map<int, int>{}
+  addrOf[atomKey(0, 0)] = 0x100000000
+  addrOf[atomKey(0, 1)] = 0x100008000
+  addrOf[atomKey(0, 2)] = 0x100008040 // the TLV template base
+  let a = meAddrs(0x100004000, 0x100008100, 0x100008000, 0x100008040)
+  let pat = meApplyRelocs([m], g, st, addrOf, a) catch _ {
+    assert(false)
+    meEmptyPatched()
+  }
+
+  // The variable sits at the template's base, so its offset is 0 — NOT
+  // 0x100008040.
+  let (desc, _) = pat.bytes[atomKey(0, 1)]
+  assert(loRdU64(desc, 16) == 0)
+  // A TLS offset is a constant dyld validates; rebasing it would corrupt it.
+  assert(len(pat.dataRebases) == 0)
+}
+
+// Stage 3 (#1344 part 5d) the executable writer's load commands and stubs. The
+// stub's three base words were produced by the system assembler for
+// `adrp x16, _g@PAGE ; ldr x16, [x16, _g@PAGEOFF] ; br x16` — 90000010 f9400210
+// d61f0200.
+
+fn checkMachoExecStub() {
+  // The stub loads the import's GOT slot and jumps through it. dyld never
+  // touches the stub itself; it binds the GOT slot the stub reads.
+  let file = []u8(16)
+  meWriteStub(file, 0, 0x100004000, 0x100008000) catch _ {
+    assert(false)
+  }
+  // adrp x16: (page(got) - page(stub)) >> 12 == 4 -> immlo=0, immhi=1.
+  assert(loRdU32(file, 0) == 0x90000010 | (1 << 5))
+  // ldr x16, [x16, #0]: the GOT slot is page-aligned here, so imm12 == 0.
+  assert(loRdU32(file, 4) == 0xf9400210)
+  assert(loRdU32(file, 8) == 0xd61f0200) // br x16 — untouched
+
+  // A GOT slot at a nonzero page offset lands in the ldr's scaled imm12.
+  let f2 = []u8(16)
+  meWriteStub(f2, 0, 0x100004000, 0x100008040) catch _ {
+    assert(false)
+  }
+  assert(loRdU32(f2, 0) == 0x90000010 | (1 << 5))
+  // (0x40 & 0xfff) >> 3 == 8 -> imm12 field at bits [21:10].
+  assert(loRdU32(f2, 4) == 0xf9400210 | (8 << 10))
+}
+
+fn checkMachoExecCmdSizes() {
+  // Every file offset a load command records is measured from the end of the
+  // commands, so sizeofcmds must match the bytes actually emitted — exactly.
+  // These are the real <mach-o/loader.h> class sizes.
+  assert(mrSizeofSegment() == 72)
+  assert(mrSizeofSection() == 80)
+
+  // A segment command's cmdsize covers its trailing section headers.
+  let lc = newByteBuf()
+  meAppendSeg(lc, "__TEXT", 0x100000000, 0x4000, 0, 0x4000, 5, 5, 2)
+  assert(len(lc.bytes) == 72)
+  assert(leAt(lc.bytes, 0, 4) == 0x19)          // LC_SEGMENT_64
+  assert(leAt(lc.bytes, 4, 4) == 72 + 2 * 80)   // cmdsize includes 2 sections
+  assert(name16At(lc.bytes, 8) == "__TEXT")
+  assert(leAt(lc.bytes, 24, 8) == 0x100000000)  // vmaddr
+  assert(leAt(lc.bytes, 64, 4) == 2)            // nsects
+
+  let sc = newByteBuf()
+  meAppendSect(sc, "__text", "__TEXT", 0x100001000, 0x200, 0x1000, 2, 0x80000400, 0, 0)
+  assert(len(sc.bytes) == 80)
+  assert(name16At(sc.bytes, 0) == "__text")
+  assert(name16At(sc.bytes, 16) == "__TEXT")
+  assert(leAt(sc.bytes, 32, 8) == 0x100001000) // addr
+  assert(leAt(sc.bytes, 48, 4) == 0x1000)      // offset
+  assert(leAt(sc.bytes, 56, 4) == 0)           // reloff: an exec has none
+  assert(leAt(sc.bytes, 60, 4) == 0)           // nreloc
+  assert(leAt(sc.bytes, 64, 4) == 0x80000400)  // flags
+
+  // The dylinker/dylib commands carry a NUL-terminated path padded to 8.
+  let dl = newByteBuf()
+  meAppendDylinker(dl)
+  assert(len(dl.bytes) == meDylinkerCmdsize())
+  assert(len(dl.bytes) % 8 == 0)
+  assert(leAt(dl.bytes, 0, 4) == 0xe) // LC_LOAD_DYLINKER
+  assert(leAt(dl.bytes, 8, 4) == 12)  // name.offset
+  assert(string(dl.bytes[12:12 + 13]) == "/usr/lib/dyld")
+  assert(dl.bytes[12 + 13] == u8(0))
+
+  let dy = newByteBuf()
+  meAppendDylib(dy)
+  assert(len(dy.bytes) == meDylibCmdsize())
+  assert(len(dy.bytes) % 8 == 0)
+  assert(leAt(dy.bytes, 0, 4) == 0xc) // LC_LOAD_DYLIB
+  assert(leAt(dy.bytes, 8, 4) == 24)  // name.offset
+  assert(string(dy.bytes[24:24 + 26]) == "/usr/lib/libSystem.B.dylib")
+
+  let mn = newByteBuf()
+  meAppendMain(mn, 0x1234)
+  assert(len(mn.bytes) == 24)
+  assert(leAt(mn.bytes, 0, 4) == 0x28 | 0x80000000) // LC_MAIN | LC_REQ_DYLD
+  assert(leAt(mn.bytes, 8, 8) == 0x1234)            // entryoff
+  assert(leAt(mn.bytes, 16, 8) == 0)                // stacksize: default
+
+  let ds = newByteBuf()
+  meAppendDysymtab(ds, 4, 3, 0x900, 5)
+  assert(len(ds.bytes) == 80)
+  assert(leAt(ds.bytes, 8, 4) == 0)      // ilocalsym
+  assert(leAt(ds.bytes, 12, 4) == 4)     // nlocalsym
+  assert(leAt(ds.bytes, 16, 4) == 4)     // iextdefsym: right after the locals
+  assert(leAt(ds.bytes, 20, 4) == 0)     // nextdefsym: no exported defined syms
+  assert(leAt(ds.bytes, 24, 4) == 4)     // iundefsym: right after the locals too
+  assert(leAt(ds.bytes, 28, 4) == 3)     // nundefsym
+  assert(leAt(ds.bytes, 56, 4) == 0x900) // indirectsymoff
+  assert(leAt(ds.bytes, 60, 4) == 5)     // nindirectsyms
+
+  let di = newByteBuf()
+  meAppendDyldInfo(di, 0x100, 8, 0x108, 16)
+  assert(len(di.bytes) == 48)
+  let sy = newByteBuf()
+  meAppendSymtab(sy, 0x200, 2, 0x300, 9)
+  assert(len(sy.bytes) == 24)
+  let bv = newByteBuf()
+  meAppendBuildVersion(bv)
+  assert(len(bv.bytes) == 24)
+  let cs = newByteBuf()
+  meAppendCodeSignature(cs, 0x400, 0x100)
+  assert(len(cs.bytes) == 16)
+}
+
+fn checkMachoExecHeaderAndCounts() {
+  // A pure-text image: __text only, no __DATA at all.
+  let m = LoModule{ name: "rt", atoms: [
+    meCodeAtom("__start", LoBinding.Global, 0xd65f03c0, []LoReloc(0))]}
+  let st = meAnalyze([m])
+  assert(meTextNsects(st) == 1 && meDataNsects(st) == 0)
+  assert(!meHasDataSeg(st))
+
+  // sizeofcmds must equal the bytes the emitters actually produce. Assemble the
+  // no-__DATA command set and compare — this is the invariant every recorded
+  // file offset depends on.
+  let want = meSizeofcmds(1, 0, false)
+  let lc = newByteBuf()
+  meAppendSeg(lc, "__PAGEZERO", 0, meBaseVaddr(), 0, 0, 0, 0, 0)
+  meAppendSeg(lc, "__TEXT", meBaseVaddr(), 0x4000, 0, 0x4000, 5, 5, 1)
+  meAppendSect(lc, "__text", "__TEXT", meBaseVaddr(), 4, 0, 2, 0x80000400, 0, 0)
+  meAppendSeg(lc, "__LINKEDIT", meBaseVaddr() + 0x4000, 0x4000, 0x4000, 0x100, 1, 1, 0)
+  meAppendDyldInfo(lc, 0, 0, 0, 0)
+  meAppendSymtab(lc, 0, 0, 0, 1)
+  meAppendDysymtab(lc, 0, 0, 0, 0)
+  meAppendDylinker(lc)
+  meAppendDylib(lc)
+  meAppendBuildVersion(lc)
+  meAppendMain(lc, 0)
+  meAppendCodeSignature(lc, 0, 0)
+  assert(len(lc.bytes) == want)
+
+  // The header: arm64 MH_EXECUTE, PIE, two-level, dyld-linked.
+  let h = newByteBuf()
+  meAppendHeader(h, want, false, false)
+  assert(len(h.bytes) == 32)
+  assert(leAt(h.bytes, 0, 4) == 0xfeedfacf)
+  assert(leAt(h.bytes, 4, 4) == 0x0100000C) // CPU_TYPE_ARM64
+  assert(leAt(h.bytes, 12, 4) == 0x2)       // MH_EXECUTE
+  assert(leAt(h.bytes, 16, 4) == 11)        // ncmds: no __DATA
+  assert(leAt(h.bytes, 20, 4) == want)
+  assert(leAt(h.bytes, 24, 4) == 0x4 | 0x80 | 0x200000) // DYLDLINK|TWOLEVEL|PIE
+  // No TLV descriptors here, so the TLV flag must be OFF — with it set, dyld
+  // would look for descriptors that do not exist.
+  assert(leAt(h.bytes, 24, 4) & 0x800000 == 0)
+
+  // An image WITH tlv_descriptors must set the flag, or dyld skips TLV setup and
+  // the first thread-local access hits _tlv_bootstrap_error.
+  let h2 = newByteBuf()
+  meAppendHeader(h2, want, true, true)
+  assert(leAt(h2.bytes, 24, 4) & 0x800000 == 0x800000)
+  assert(leAt(h2.bytes, 16, 4) == 12) // ncmds: __DATA present
+}

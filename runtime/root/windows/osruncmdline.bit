@@ -1,0 +1,238 @@
+// argv -> Win32 command line for the `bit_rt_os_run*` providers — moved
+// verbatim out of `osrun.bit` (#4322), which was 796 lines against the hard
+// 800-line E0200 ceiling.
+//
+// Everything here is the quoting half of the spawn path: the write-cursor
+// convention, the backslash/quote escaping that inverts
+// `CommandLineToArgvW`, and `winBuildCommandLine`, which is the single entry
+// point `osrun.bit`'s `winSpawnAndWait*` calls. The environment-block half,
+// the Win32 `extern fn` declarations and the four ABI wrappers stay in
+// `osrun.bit`; read its header first.
+//
+// One module with `os.bit`, `osrun.bit` and the rest of
+// `runtime/root/windows/`, so `osrun.bit`'s imports already cover every name
+// used here — re-importing one would be E0042.
+// The small helpers below (`winAppendByte` through `winAppendArgStep`) all
+// speak in the SAME convention: `cur` is an ABSOLUTE write pointer and
+// `remaining` is the budget left at `cur` (so a caller updates
+// `cur += written; remaining -= written` between calls, never re-deriving
+// `cur` from a separate base+offset pair). That is what keeps each of these
+// functions at or under E0202's 5-param ceiling: `winAppendArg` below is the
+// one place that still speaks the (dst, used, budget) convention its own
+// caller expects, converting to/from `cur`/`remaining` at its own boundary.
+// Every function returns the count of bytes written/consumed (>= 0), or
+// `-1` on overflow (rejected, never truncated).
+
+// Append one byte at `cur`. Returns `1`, or `-1` if `remaining < 1`.
+@nosplit fn winAppendByte(cur: int, remaining: int, b: int): int {
+  if (remaining < 1) {
+    return 0 - 1
+  }
+  storeByte(cur, b)
+  return 1
+}
+
+// Append `count` literal backslash bytes at `cur`, bounds-checked once.
+// Returns `count`, or `-1` if it would exceed `remaining`.
+@nosplit fn winAppendBackslashes(cur: int, remaining: int, count: int): int {
+  if (count > remaining) {
+    return 0 - 1
+  }
+  let k = 0
+  while (k < count) {
+    storeByte(cur + k, 92)
+    k = k + 1
+  }
+  return count
+}
+
+// ---------------------------------------------------------------------------
+// argv[] -> ONE quoted Windows command-line string (see header)
+// ---------------------------------------------------------------------------
+
+// True if `src[0..n)` needs quoting: empty (an empty argument must still
+// occupy a token) or containing a space, tab or `"`.
+@nosplit fn winArgNeedsQuote(src: int, n: int): bool {
+  if (n == 0) {
+    return true
+  }
+  let i = 0
+  while (i < n) {
+    let b = loadByte(src + i)
+    if (b == 32 || b == 9 || b == 34) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// The number of consecutive backslash bytes starting at `p`, bounded by
+// `remaining`.
+@nosplit fn winCountBackslashRun(p: int, remaining: int): int {
+  let q = 0
+  while (q < remaining && loadByte(p + q) == 92) {
+    q = q + 1
+  }
+  return q
+}
+
+// Append `total` backslashes (the caller has already multiplied the run's
+// own count by 1 or 2 per Microsoft's quoting rule) and, if `beforeQuote`,
+// one further backslash and the literal `"` that follows it. Returns the
+// total bytes written, or `-1` on overflow.
+@nosplit fn winAppendEscapedBackslashes(cur: int, remaining: int, total: int, beforeQuote: bool): int {
+  let w = winAppendBackslashes(cur, remaining, total)
+  if (w < 0) {
+    return 0 - 1
+  }
+  if (!beforeQuote) {
+    return w
+  }
+  let w2 = winAppendByte(cur + w, remaining - w, 92)
+  if (w2 < 0) {
+    return 0 - 1
+  }
+  let w3 = winAppendByte(cur + w + 1, remaining - w - 1, 34)
+  if (w3 < 0) {
+    return 0 - 1
+  }
+  return w + 2
+}
+
+// Both halves of every packed return stay well under this base:
+// bytes-written <= `winRunCmdArenaBytes` (98304) and bytes-consumed <=
+// `winCstrLen`'s own cap (`winCstrMax`, 8192), so `written * winArgPackBase
+// + consumed` round-trips exactly. Packing avoids a heap-allocating
+// multi-value return in this `@nosplit` code (tuple returns allocate here).
+// `-1` (never a valid packed value, always >= 0) signals overflow.
+const winArgPackBase: int = 100000
+
+// Handle one run of backslash bytes starting at `srcPos` for
+// `winAppendArgStep` below (see `winAppendArg`'s own header for the exact
+// escaping rule): resolve the run's length and what follows it, apply
+// Microsoft's doubling rule, and append. Packed return (bytesWritten,
+// bytesConsumed) -- see `winArgPackBase` above.
+@nosplit fn winAppendArgBackslashRun(cur: int, remaining: int, srcPos: int, srcRemaining: int, quote: bool): int {
+  let bs = winCountBackslashRun(srcPos, srcRemaining)
+  let consumed = bs
+  let atEnd = consumed == srcRemaining
+  let beforeQuote = !atEnd && loadByte(srcPos + consumed) == 34
+  let mult = 1
+  if (beforeQuote || (atEnd && quote)) {
+    mult = 2
+  }
+  let written = winAppendEscapedBackslashes(cur, remaining, bs * mult, beforeQuote)
+  if (written < 0) {
+    return 0 - 1
+  }
+  if (beforeQuote) {
+    consumed = consumed + 1
+  }
+  return written * winArgPackBase + consumed
+}
+
+// One step of `winAppendArg`'s scan: either a single ordinary byte, or (see
+// `winAppendArgBackslashRun`) a full backslash run and its resolution.
+// Packed return (bytesWritten, bytesConsumed), consumed always >= 1.
+@nosplit fn winAppendArgStep(cur: int, remaining: int, srcPos: int, srcRemaining: int, quote: bool): int {
+  let b = loadByte(srcPos)
+  if (b != 92) {
+    let w = winAppendByte(cur, remaining, b)
+    if (w < 0) {
+      return 0 - 1
+    }
+    return w * winArgPackBase + 1
+  }
+  return winAppendArgBackslashRun(cur, remaining, srcPos, srcRemaining, quote)
+}
+
+// Append one argument (`src[0..n)`, UTF-8 bytes) to the command-line arena
+// at `dst`, starting at `used`, quoted and escaped per the header's stated
+// rules, preceded by a separating space if this is not the first argument
+// (`used > 0`). Returns the new `used` offset, or `-1` on overflow.
+//
+// BOUNDED (Power of 10 rule 2): the loop advances `i` by at least 1 every
+// iteration (`winAppendArgStep`'s own `bytesConsumed` is always >= 1) and is
+// capped by `n`.
+@nosplit fn winAppendArg(dst: int, used: int, budget: int, src: int, n: int): int {
+  let cur = dst + used
+  let remaining = budget - used
+  if (used > 0) {
+    let w = winAppendByte(cur, remaining, 32)
+    if (w < 0) {
+      return 0 - 1
+    }
+    cur = cur + w
+    remaining = remaining - w
+  }
+  let quote = winArgNeedsQuote(src, n)
+  if (quote) {
+    let w = winAppendByte(cur, remaining, 34)
+    if (w < 0) {
+      return 0 - 1
+    }
+    cur = cur + w
+    remaining = remaining - w
+  }
+  let i = 0
+  while (i < n) {
+    let packed = winAppendArgStep(cur, remaining, src + i, n - i, quote)
+    if (packed < 0) {
+      return 0 - 1
+    }
+    let written = packed / winArgPackBase
+    cur = cur + written
+    remaining = remaining - written
+    i = i + packed % winArgPackBase
+  }
+  if (quote) {
+    let w = winAppendByte(cur, remaining, 34)
+    if (w < 0) {
+      return 0 - 1
+    }
+    cur = cur + w
+  }
+  return cur - dst
+}
+
+// Walk the NULL-terminated pointer array at `argvPtrs` (`../../root`'s
+// `osBuildRunArgv` own `[path, forwarded..., NULL]` shape, UTF-8
+// NUL-terminated C strings) and join it into one quoted command line at
+// `dst`. Returns the byte count written, or `-1` on overflow.
+//
+// BOUNDED (Power of 10 rule 2): at most `osRunMaxArgv + 2` elements
+// (`osBuildRunArgv`'s own array shape: path + up to 64 forwarded + NULL).
+@nosplit fn winJoinArgv(argvPtrs: int, dst: int, budget: int): int {
+  let used = 0
+  let i = 0
+  while (i < 66) {
+    let p = loadWord(argvPtrs + i * 8)
+    if (p == 0) {
+      return used
+    }
+    used = winAppendArg(dst, used, budget, p, winCstrLen(p))
+    if (used < 0) {
+      return 0 - 1
+    }
+    i = i + 1
+  }
+  return used
+}
+
+// Build the final UTF-16LE `lpCommandLine` for `argvPtrs` in this worker's
+// scratch slot. Returns its address, or `0` on any overflow (spawn failure).
+@nosplit fn winBuildCommandLine(argvPtrs: int): int {
+  let slot = osScratchSlot()
+  let arena = int(ptrOf(winRunCmdArena)) + slot * winRunCmdArenaBytes
+  let used = winJoinArgv(argvPtrs, arena, winRunCmdArenaBytes)
+  if (used < 0) {
+    return 0
+  }
+  let dst = int(ptrOf(winRunCmdUnitsBuf)) + slot * winRunCmdUnitsBytes
+  let units = winUtf8ToUtf16(arena, used, dst, winMaxCmdUnits)
+  if (units < 0) {
+    return 0
+  }
+  return dst
+}

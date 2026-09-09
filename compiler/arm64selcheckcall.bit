@@ -1,0 +1,264 @@
+// In-Bit self-checks for AArch64 calls — moved verbatim out of
+// compiler/arm64selcheck.bit (#4322), which was 796 lines against the hard
+// 800-line E0200 ceiling.
+//
+// AAPCS64 argument marshalling, the ABI boundaries where a foreign
+// convention meets ours, interface dispatch, and safepoint recording. The
+// selector checks, condition-code mappings and overflow traps stay in
+// arm64selcheck.bit; read its header first.
+//
+// Named to sort after compiler/arm64selcheck.bit — module files concatenate
+// in bytewise filename order (compiler/project.bit:7). Same module as
+// selfcheck.bit (#1503), so `selfcheck()` still reaches these and nothing is
+// imported here (a duplicate import is E0042).
+// Stage 3 (#1342 slice 4b) calls: AAPCS64 argument marshalling, the ABI
+// boundaries where a foreign convention meets ours, and safepoint recording.
+fn checkRtSymbols() {
+  assert(rtSymbol("string_concat") == "bit_rt_string_concat")
+  assert(rtSymbol("map_len") == "bit_rt_map_len")
+  // The two runtime exports whose symbol is not the tag prefixed with bit_rt_.
+  assert(rtSymbol("err_set") == "bit_rt_set_err")
+  assert(rtSymbol("err_get") == "bit_rt_get_err")
+  assert(safepointSymbol() == "bit_rt_safepoint")
+
+  // The TypeInfo symbol encodes the shape, so identical layouts share one blob.
+  assert(typeInfoSymbol(7, 16, []int(0)) == "__bittype_7_16")
+  assert(typeInfoSymbol(7, 16, [8]) == "__bittype_7_16_8")
+  assert(typeInfoSymbol(3, 24, [0, 8, 16]) == "__bittype_3_24_0_8_16")
+}
+
+fn checkArm64Marshal() {
+  // AAPCS64 counts int and float arguments INDEPENDENTLY: (i64, f64, i64) lands
+  // in x0, d0, x1 — not x0, d1, x2. Values live in xN/dN for vreg N, so the first
+  // argument is already home and only the other two move.
+  let cx = selCtx()
+  let ctx = cx.module.ctx
+  let i64t = primType(ctx, 3)
+  let f64t = primType(ctx, 9)
+  cx.f.instrs = [
+    mkInstr(Op.BlockParam, i64t), mkInstr(Op.BlockParam, f64t),
+    mkInstr(Op.BlockParam, i64t),
+  ]
+  marshalArgs(cx, [0, 1, 2], 0, 0)
+  let want = newByteBuf()
+  // #3182: both moves now go through ONE sequentializeAndEmit call. Neither
+  // reads the other's destination (d0 is never read by the int move, x1 is
+  // never read by the float move), so Phase 1's drain emits them in the
+  // order they appear in the combined list — the float move (arg index 1)
+  // before the int move (arg index 2), the reverse of the old two-pass
+  // int-then-float order this asserted before #3182.
+  fmovFF(want, 0, 1, 8) // d0 <- d1 (the first FLOAT argument)
+  movRR(want, 1, 2)     // x1 <- x2 (the second INT argument)
+  assertSameBytes(cx.code, want)
+
+  // The closure/interface paths reserve x0, so their first int argument is x1.
+  cx = selCtx()
+  cx.f.instrs = [mkInstr(Op.BlockParam, i64t)]
+  marshalArgs(cx, [0], 1, 0)
+  want = newByteBuf()
+  movRR(want, 1, 0)
+  assertSameBytes(cx.code, want)
+
+  // Past x0..x7 the rest overflow to the outgoing area at the bottom of the
+  // frame, at [sp + 8*k] in argument order. The first eight are already home.
+  cx = selCtx()
+  cx.frame = FrameInfo{
+    savedGpr: []int(0), savedFpr: []int(0), numSpillSlots: 0,
+    outgoingBytes: 16, frameSize: 64,
+  }
+  let instrs = []IrInstr(0)
+  let args = []int(0)
+  let i = 0
+  while (i < 10) {
+    instrs = append(instrs, mkInstr(Op.BlockParam, i64t))
+    args = append(args, i)
+    i = i + 1
+  }
+  cx.f.instrs = instrs
+  marshalArgs(cx, args, 0, 0)
+  want = newByteBuf()
+  storeImm(want, 19, regSp(), 0, 8) // 9th argument -> [sp + 0]
+  storeImm(want, 20, regSp(), 8, 8) // 10th        -> [sp + 8]
+  assertSameBytes(cx.code, want)
+
+  // A spilled overflow argument stages through scratch1 rather than a second
+  // outgoing slot.
+  cx = selCtx()
+  emitOutgoingStackArg(cx, plocMem(24, RegClass.Int), RegClass.Int, 8)
+  want = newByteBuf()
+  loadImm(want, scratch1(), regSp(), 24, 8, false)
+  storeImm(want, scratch1(), regSp(), 8, 8)
+  assertSameBytes(cx.code, want)
+}
+
+fn checkArm64Calls() {
+  let cx = selCtx()
+  let ctx = cx.module.ctx
+  let i64t = primType(ctx, 3)
+  let boolt = primType(ctx, 10)
+
+  // A C callee returns bool in w0 and leaves x0's upper bits unspecified, so an
+  // int-class bool result is normalized with uxtb at this boundary. Without it,
+  // `!b` and the branch tests — which read the whole register — read garbage.
+  cx.f.instrs = [mkInstr(Op.BlockParam, boolt)]
+  emitCall(cx, 1, boolt, "bit_rt_fs_exists", []int(0), false)
+  let want = newByteBuf()
+  emitWord(want, 0x94000000) // bl (placeholder)
+  uxtb(want, 0)
+  movRR(want, 1, 0)
+  assertSameBytes(cx.code, want)
+
+  // A non-bool result needs no normalization.
+  cx = selCtx()
+  cx.f.instrs = [mkInstr(Op.BlockParam, i64t)]
+  emitCall(cx, 1, i64t, "bit_rt_time_mono_ns", []int(0), false)
+  want = newByteBuf()
+  emitWord(want, 0x94000000)
+  movRR(want, 1, 0)
+  assertSameBytes(cx.code, want)
+
+  // A discarded result binds nothing at all.
+  cx = selCtx()
+  emitCall(cx, -1, 0, "bit_rt_safepoint", []int(0), false)
+  assert(len(cx.code.bytes) == 4)
+
+  // call_value: env and code load into scratch regs that argument marshalling
+  // never touches, x0 takes the env, then blr. Not a bl — no relocation. The real
+  // argument must land in x1: it is passed with the int bank already one deep, so
+  // that `x0 = env` does not clobber it. (Hence a genuine argument here — with an
+  // empty list this would pass no matter which bank depth the call used.)
+  cx = selCtx()
+  cx.f.instrs = [
+    mkInstr(Op.BlockParam, i64t), mkInstr(Op.BlockParam, i64t),
+    mkInstr(Op.BlockParam, i64t), mkInstr(Op.BlockParam, i64t),
+  ]
+  cx.result.stackMaps = [StackMapEntry{ pos: 0, regs: []int(0), slots: []int(0) }]
+  cx.safepointPositions = [0]
+  emitCallValue(cx, 3, i64t, 0, [2])
+  want = newByteBuf()
+  wantNilCbnzCheck(want, 0)                 // #2018/#4355: nil-check the closure cell (x0) first
+  loadImm(want, scratch2(), 0, 8, 8, false) // x10 = env
+  loadImm(want, scratch3(), 0, 0, 8, false) // x11 = code
+  movRR(want, 1, 2)                         // x1 = arg (NOT x0)
+  movRR(want, 0, scratch2())                // x0 = env
+  blr(want, scratch3())
+  movRR(want, 3, 0)
+  assertSameBytes(cx.code, want)
+  // One reloc: the nil-check's own call to bit_rt_panic_nil_call (blr is a
+  // register-indirect call, not a relocation).
+  assert(len(cx.relocs) == 1 && len(cx.safepoints) == 1)
+  // The safepoint's return address is the byte AFTER the blr. #4355 cut the
+  // nil-check prologue from three instructions (cmp/b.ne/bl) to two
+  // (cbnz/bl), so this is 28, not #2018's 32.
+  assert(cx.safepoints[0].retOffset == 28)
+}
+
+// call_iface: the same nil check (#2240/#4379, one CBNZ over the panic call),
+// then the receiver header's TypeInfo at recv-16 and the method id into
+// bit_rt_iface_lookup, then blr the address it returns. Nothing pinned this
+// sequence before #4379; without it the polarity of the nil test and the
+// position of the panic call are asserted by behaviour alone. Split out of
+// checkArm64Calls rather than appended to it: that function is already 62
+// lines and E0201's limit is 80.
+fn checkArm64CallIface() {
+  let cx = selCtx()
+  let i64t = primType(cx.module.ctx, 3)
+  cx.f.instrs = [
+    mkInstr(Op.BlockParam, i64t), mkInstr(Op.BlockParam, i64t),
+    mkInstr(Op.BlockParam, i64t), mkInstr(Op.BlockParam, i64t),
+  ]
+  cx.result.stackMaps = [StackMapEntry{ pos: 0, regs: []int(0), slots: []int(0) }]
+  cx.safepointPositions = [0]
+  emitCallIface(cx, 3, i64t, 0, 7, [2])
+  let want = newByteBuf()
+  wantNilCbnzCheck(want, 0)                                               // nil-check the receiver (x0) first
+  addSubImmediate(want, addSubImm(true, 16, false), false, scratch2(), 0) // x10 = recv - 16
+  loadImm(want, scratch2(), scratch2(), 0, 8, false)                      // x10 = info
+  movRR(want, 0, scratch2())                                              // x0 = info
+  movImm64(want, 1, 7)                                                    // x1 = method id
+  emitWord(want, 0x94000000)                                              // bl bit_rt_iface_lookup
+  movRR(want, scratch3(), retRegNum())                                    // x11 = fn, survives marshaling
+  movRR(want, 1, 2)                                                       // x1 = arg (NOT x0)
+  blr(want, scratch3())
+  movRR(want, 3, 0)
+  assertSameBytes(cx.code, want)
+  // Two relocs: the nil-check's panic call and the lookup. The dispatch itself
+  // is a blr, which carries none.
+  assert(len(cx.relocs) == 2 && len(cx.safepoints) == 1)
+  // Return address is the byte after the blr: ten instructions in, where the
+  // pre-#4379 cmp/b.ne form made it eleven.
+  assert(cx.safepoints[0].retOffset == 40)
+}
+
+fn checkArm64Safepoints() {
+  // isBackEdge itself is shared and covered by checkBackEdge; this pins arm64's
+  // use of it — a loop with no call in it must still yield to the collector.
+  let cx = selCtx()
+  cx.result.stackMaps = [StackMapEntry{ pos: 0, regs: []int(0), slots: []int(0) }]
+  cx.safepointPositions = [0]
+  emitBackEdgeSafepointIfNeeded(cx, 2, 5) // forward: nothing
+  assert(len(cx.code.bytes) == 0 && len(cx.safepoints) == 0)
+  // back-edge (#2925/#4203): three instructions and one call. The #2921 guard's
+  // condition is neither called nor inlined any more — the runtime publishes
+  // its answer in one word (runtime/sched/pollreq.bit) and the back edge reads
+  // it. The guard itself records no safepoint — only the real poll does — so
+  // exactly one stack map is still recorded per back edge, matching the count
+  // buildIntervals (compiler/codegen.bit) already produced for this edge.
+  //
+  // PINNED FOR THE SAME REASON THE EIGHTEEN-INSTRUCTION LADDER WAS: this is
+  // what decides whether the collector can ever run. Inverting the branch, or
+  // losing the `ldar` to a plain `ldr`, yields a program that passes every
+  // behavioural gate on this box and misses a stop-the-world on another.
+  emitBackEdgeSafepointIfNeeded(cx, 2, 1)
+  let want = newByteBuf()
+  let r = scratch1()
+  loadImm(want, r, regSp(), pollCacheOffset(cx.frame, 0), 8, false)
+  // LDAR, not LDR: the acquire half of the message-passing pair whose release
+  // half is pollRequest's store. See emitPollGuard's header.
+  ldar(want, 3, r, r)
+  let fxSkip = len(want.bytes)
+  cbz(want, r, 0)            // nobody is asking -> past the call
+  emitWord(want, 0x94000000) // bl bit_rt_safepoint (placeholder)
+  patchImm19At(want, fxSkip, len(want.bytes))
+  assertSameBytes(cx.code, want)
+  // ONE reloc, not three: #3564's preempt clause called schedCurrentWorker and
+  // preemptRequested from the fast path, and #4203 moved both behind the word.
+  assert(len(cx.relocs) == 1)
+  assert(cx.relocs[0].symbol == "bit_rt_safepoint")
+  assert(len(cx.safepoints) == 1)
+
+  // The entry-side half: ONE call, ONE store, into poll-cache slot 0. It was
+  // three calls and four slots (worldAddr, gcAddr, preemptAnyAddr, countdown)
+  // while the back edge re-derived the predicate itself.
+  cx = selCtx()
+  cx.frame = FrameInfo{
+    savedGpr: []int(0), savedFpr: []int(0), numSpillSlots: 0,
+    outgoingBytes: 0, pollCacheSlots: 1, frameSize: 32,
+  }
+  emitPollCachePrefetch(cx)
+  want = newByteBuf()
+  emitWord(want, 0x94000000) // bl bit_rt_port_sched_poll_attention_addr
+  storeImm(want, retRegNum(), regSp(), pollCacheOffset(cx.frame, 0), 8)
+  assertSameBytes(cx.code, want)
+  assert(len(cx.relocs) == 1)
+  assert(cx.relocs[0].symbol == pollAttentionAddrSymbol())
+  assert(len(cx.safepoints) == 0) // a true leaf: never recorded as a safepoint
+
+  // A stack map's slot offsets are normalized to FRAME-POINTER-relative
+  // (x29 = sp + frameSize - 16) so the runtime's walker stays arch-neutral, and
+  // its register indices are resolved to physical register numbers.
+  cx = selCtx()
+  cx.frame = FrameInfo{
+    savedGpr: []int(0), savedFpr: []int(0), numSpillSlots: 2,
+    outgoingBytes: 16, frameSize: 64,
+  }
+  cx.result.stackMaps = [StackMapEntry{ pos: 7, regs: [8], slots: [0, 1] }]
+  cx.safepointPositions = [7]
+  recordSafepoint(cx, 40)
+  assert(len(cx.safepoints) == 1 && cx.nextSafepointIdx == 1)
+  let sp = cx.safepoints[0]
+  assert(sp.retOffset == 40)
+  assert(len(sp.regs) == 1 && sp.regs[0] == 19) // intRegs[8] == x19, not index 8
+  // fpBase == 64-16 == 48; slot 0 sits at sp+16, slot 1 at sp+24.
+  assert(len(sp.slots) == 2 && sp.slots[0] == 0 - 32 && sp.slots[1] == 0 - 24)
+}
