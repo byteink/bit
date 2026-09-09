@@ -1,0 +1,363 @@
+// _tests_/bit/constimmfold.bit — #4667. A constant EVERY use of which folds
+// into an immediate must not be materialized into a register on arm64.
+//
+// THE DEFECT. `computeSkipConstMaterialize` (compiler/arm64dispatch.bit) asks
+// "may this `const_int` be left unmaterialized?" and used to answer it with
+// `immFoldConstOperand(...) >= 0 && useCount[c] == 1`. The use count was a
+// PROXY for the real condition — every use of the constant reads it as an
+// immediate — and the proxy reads false on the commonest shape there is: one
+// literal consumed by two computations. `(n + k) * (m + k)` with `k = 5` is a
+// single `const_int i64 5` with two `add`-immediate uses; both `add`s fold it
+// regardless of use count, and the count-of-one rule then also emitted a
+// `mov xN, #5` that no emitter ever read AND kept xN live across the pair,
+// because `skip` drives `arm64DefinesRegister` (compiler/arm64branch.bit) too.
+// Six instructions where five do. #4667 replaced the proxy with the condition
+// itself: `useCount[i] > 0 && foldCount[i] == useCount[i]`.
+//
+// WHY NOTHING ELSE SEES IT. The extra `mov` is DEAD — it writes a register the
+// program never reads, so every program still computes the right answer.
+// `test-golden`, `test-selfcheck` and the differentials compare behaviour or
+// IR, and this is a property of the emitted machine code alone.
+//
+// WHAT THIS GATE ASSERTS, and why no half of it stands alone. Inside
+// `_twoFolds`'s atom in the emitted `__TEXT,__text`:
+//
+//   - ZERO `movz/movn/movk xD, #5` — the property. On its own this is also
+//     satisfied by a compiler that stopped folding the literal into the `add`s
+//     altogether, or by a fixture that drifted out of the shape, so it is
+//     never asserted on its own.
+//   - EXACTLY TWO `add xD, xN, #5` — the non-vacuity check. Both uses really
+//     are immediate folds of the same literal, so "no mov" means the literal
+//     never needed a register.
+//   - EXACTLY FIVE instructions in the atom — `add`, `add`, `mul`, `mov`,
+//     `ret` — so nothing appeared in the dead `mov`'s place.
+//
+// The fixture is also BUILT AND RUN for the host with its stdout asserted, so
+// a `skip` wrong in the OTHER direction — a value an emitter really does read
+// as a register, marked unmaterialized — reddens this gate instead of silently
+// miscompiling.
+//
+// HOW THE THREE PINNED NUMBERS WERE DERIVED, with objdump at the #4667 commit
+// and never from memory:
+//
+//     bit build fixture.bit --emit-obj --target aarch64-macos -o f.o
+//     objdump -d --macho f.o | sed -n '/^_twoFolds:/,/^_main:/p'
+//     _twoFolds:
+//           88: 03 14 00 91  add x3, x0, #0x5
+//           8c: 20 14 00 91  add x0, x1, #0x5
+//           90: 61 7c 00 9b  mul x1, x3, x0
+//           94: e0 03 01 aa  mov x0, x1
+//           98: c0 03 5f d6  ret
+//     nm -n f.o | grep -E ' (_twoFolds|_main)$'   ->   0x88, 0x9c  (20 bytes)
+//
+// giving 5 instructions, 0 movs of #5, 2 adds of #5 over that range. The mov
+// query is not one that can only answer zero: the same regex over the WHOLE
+// object matches 17 `mov xN, #imm` lines, and reverting the rule to
+// `useCount[c] == 1` drives the in-atom count to 1 and reddens this gate.
+//
+// A number here going stale is a codegen change, not a defect in the pin:
+// re-derive all three with the commands above and say what moved.
+//
+// THE TARGET IS ALWAYS aarch64-macos, cross-emitted with `--target`, so the
+// same decode runs on an x86-64 host rather than being gated on `uname -m` and
+// silently asserting nothing there. Only the run check is host-native.
+//
+// Run it: `bit run _tests_/bit/constimmfold.bit` from the repository root.
+// Configure it by environment, since `bit run` forwards no argv:
+//   BIT                 compiler under test    (default bit-out/bin/bit)
+//   BIT_TEST_TIMEOUT_S  per-child deadline     (default 300, clamped to 3600)
+import { exists, readFile, writeFile } from "std/fs"
+import { envOr, exit } from "std/os"
+import { now } from "std/time"
+import { Obj, atomEnd, badObj, readMacho } from "./objread"
+import { reportChild, runBounded, scriptPath, tMacos, timeoutSeconds } from "./childrun"
+
+const tag: string = "constimmfold"
+
+// The function the pins are about, as Mach-O spells it (leading underscore).
+const fnSym: string = "_twoFolds"
+
+// The literal both `add`s fold. One constant, so the fixture text and every
+// decode below cannot drift apart.
+const foldedImm: int = 5
+
+// Derived by objdump at the #4667 commit — see the header for the commands.
+const wantInsts: int = 5
+const wantAdds: int = 2
+const wantMovs: int = 0
+
+// What the fixture prints: (3 + 5) * (4 + 5).
+const wantStdout: string = "72\n"
+
+// ---------------------------------------------------------------------------
+// AArch64 decode — three encodings, no disassembler
+// ---------------------------------------------------------------------------
+
+// Bits 31:23 identify every form read here. ADD (immediate) 64-bit is
+// `1 0 0 100010`; MOVN/MOVZ/MOVK 64-bit are `1 00/10/11 100101`.
+const opAddImm: int = 0x122
+const opMovn: int = 0x125
+const opMovz: int = 0x1a5
+const opMovk: int = 0x1e5
+
+fn opField(w: int): int {
+  return (w >> 23) & 0x1ff
+}
+
+// The little-endian instruction word at `off`.
+fn wordAt(b: []u8, off: int): int {
+  return int(b[off]) | (int(b[off + 1]) << 8) | (int(b[off + 2]) << 16) | (int(b[off + 3]) << 24)
+}
+
+// `add xD, xN, #imm`, no `lsl #12` (bit 22 is the shift flag).
+fn isAddImm(w: int, imm: int): bool {
+  return opField(w) == opAddImm && ((w >> 22) & 1) == 0 && ((w >> 10) & 0xfff) == imm
+}
+
+// `movz`/`movn`/`movk xD, #imm` into the LOW halfword (hw == 0) — the only
+// forms `movImm64` (compiler/arm64encode.bit) can emit for a value this small.
+// All three are counted rather than `movz` alone, so a materialization that
+// merely changes shape still counts as one.
+fn isMovImm(w: int, imm: int): bool {
+  let op = opField(w)
+  if (op != opMovz && op != opMovn && op != opMovk) {
+    return false
+  }
+  return ((w >> 21) & 3) == 0 && ((w >> 5) & 0xffff) == imm
+}
+
+// ---------------------------------------------------------------------------
+// The fixture
+// ---------------------------------------------------------------------------
+
+// `k` is one `const_int i64 5` with two uses, both folded by `emitBinaryInt`
+// as an `add` immediate — the exact shape the old count-of-one rule read as
+// "not foldable". `main` feeds the call through an array so the optimizer
+// cannot fold it away and leave `twoFolds` unexercised at run time: with
+// literal arguments the whole call folds to `72` and the run check would prove
+// nothing about the emitted code.
+fn fixtureSource(): string {
+  return "fn twoFolds(n: i64, m: i64): i64 {\n" +
+    "  let k = ${foldedImm}\n" +
+    "  return (n + k) * (m + k)\n" +
+    "}\n" +
+    "\n" +
+    "fn main() {\n" +
+    "  let xs = []i64(2)\n" +
+    "  xs[0] = 3\n" +
+    "  xs[1] = 4\n" +
+    "  print(\"\${twoFolds(xs[0], xs[1])}\\n\")\n" +
+    "}\n"
+}
+
+// ---------------------------------------------------------------------------
+// Scaffolding
+// ---------------------------------------------------------------------------
+
+class Cfg {
+  bin: string,
+  base: string,
+  script: string,
+  timeoutMs: int,
+}
+
+class Tally { checks: int, failures: int }
+
+fn check(t: Tally, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    eprint("${tag}: FAIL: ${label}\n")
+  }
+}
+
+// One bounded child, its log removed on success and reported on failure.
+fn child(c: Cfg, what: string, cmd: string): bool {
+  let log = "${c.base}-${what}.log"
+  let rc = runBounded(tag, c.script, log, cmd, c.timeoutMs)
+  if (rc != 0) {
+    reportChild(tag, what, rc, log)
+    return false
+  }
+  fsRemove(log)
+  return true
+}
+
+// ---------------------------------------------------------------------------
+// The emitted-text half
+// ---------------------------------------------------------------------------
+
+// `_twoFolds`'s span in its section: `[start, start + size)`, or `sect < 0`
+// when the symbol is not a definition in this object.
+class Atom { sect: int, start: int, size: int }
+
+fn findAtom(o: Obj, name: string): Atom {
+  for s of o.syms {
+    if (s.name == name && s.sect >= 0) {
+      return Atom{
+        sect: s.sect, start: s.value,
+        size: atomEnd(o, s.sect, s.value) - s.value,
+      }
+    }
+  }
+  return Atom{ sect: 0 - 1, start: 0, size: 0 }
+}
+
+class Counts { insts: int, movs: int, adds: int }
+
+// Decodes every word of the atom. `o.secs[a.sect].off` is the section's file
+// offset, so `base` is where the function's first instruction sits in `b`.
+// The caller has already proved that range lies inside `b` (`atomReadable`).
+fn countAtom(b: []u8, o: Obj, a: Atom): Counts {
+  let c = Counts{ insts: a.size / 4, movs: 0, adds: 0 }
+  let base = o.secs[a.sect].off + a.start
+  let i = 0
+  while (i < c.insts) {
+    let w = wordAt(b, base + i * 4)
+    if (isMovImm(w, foldedImm)) {
+      c.movs = c.movs + 1
+    }
+    if (isAddImm(w, foldedImm)) {
+      c.adds = c.adds + 1
+    }
+    i = i + 1
+  }
+  return c
+}
+
+// The object plus the bytes it was parsed from — `countAtom` needs both, and
+// keeping them together is what stops a caller decoding one object's atom out
+// of another object's buffer.
+class Image { ok: bool, bytes: []u8, obj: Obj }
+
+fn badImage(): Image {
+  return Image{ ok: false, bytes: []u8(0), obj: badObj() }
+}
+
+// A whole number of instructions, wholly inside the buffer. Anything else is a
+// decode this gate must refuse rather than read past the end of.
+fn atomReadable(img: Image, a: Atom): bool {
+  if (a.sect < 0 || a.size <= 0 || a.size % 4 != 0) {
+    return false
+  }
+  let base = img.obj.secs[a.sect].off + a.start
+  return base >= 0 && base + a.size <= len(img.bytes)
+}
+
+// Emits the fixture for aarch64-macos and reads the object back.
+fn loadFixtureObject(c: Cfg, src: string): Image {
+  let obj = "${c.base}.o"
+  let cmd = "exec \"${c.bin}\" build \"${src}\" --emit-obj --target ${tMacos} -o \"${obj}\""
+  if (!child(c, "emitobj", cmd)) {
+    fsRemove(obj)
+    return badImage()
+  }
+  let raw = readFile(obj) catch e {
+    fsRemove(obj)
+    eprint("${tag}: cannot read the emitted object ${obj}: ${e.message()}\n")
+    return badImage()
+  }
+  fsRemove(obj)
+  let bytes = []u8(raw)
+  let o = readMacho(tag, bytes)
+  return Image{ ok: o.ok, bytes: bytes, obj: o }
+}
+
+fn checkText(t: Tally, c: Cfg, src: string) {
+  let img = loadFixtureObject(c, src)
+  check(t, img.ok, "the ${tMacos} object built and parsed")
+  if (!img.ok) {
+    return
+  }
+  let a = findAtom(img.obj, fnSym)
+  let readable = atomReadable(img, a)
+  check(
+    t, readable,
+      "${fnSym} is a defined atom of whole instructions inside the file " +
+      "(sect ${a.sect}, ${a.size} bytes)",
+  )
+  if (!readable) {
+    return
+  }
+  let n = countAtom(img.bytes, img.obj, a)
+  check(
+    t, n.adds == wantAdds,
+    "${fnSym} folds #${foldedImm} into ${wantAdds} add immediates, saw ${n.adds}",
+  )
+  check(
+    t, n.movs == wantMovs,
+    "${fnSym} materializes #${foldedImm} ${wantMovs} times, saw ${n.movs}",
+  )
+  check(
+    t, n.insts == wantInsts,
+    "${fnSym} is ${wantInsts} instructions, saw ${n.insts}",
+  )
+}
+
+// ---------------------------------------------------------------------------
+// The run half
+// ---------------------------------------------------------------------------
+
+fn checkRun(t: Tally, c: Cfg, src: string) {
+  let exe = "${c.base}.exe"
+  let built = child(c, "buildexe", "exec \"${c.bin}\" build \"${src}\" -o \"${exe}\"")
+  check(t, built, "the fixture builds for the host")
+  if (!built) {
+    fsRemove(exe)
+    return
+  }
+  let out = "${c.base}-run.out"
+  let rc = runBounded(tag, c.script, out, "exec \"${exe}\"", c.timeoutMs)
+  fsRemove(exe)
+  check(t, rc == 0, "the fixture exits 0")
+  if (rc != 0) {
+    reportChild(tag, "run", rc, out)
+    return
+  }
+  let text = readFile(out) catch _ {
+    ""
+  }
+  fsRemove(out)
+  check(t, text == wantStdout, "the fixture prints 72, saw ${len(text)} byte(s)")
+}
+
+// ---------------------------------------------------------------------------
+
+fn writeFixture(c: Cfg, src: string): bool {
+  writeFile(src, fixtureSource()) catch e {
+    eprint("${tag}: cannot write the fixture ${src}: ${e.message()}\n")
+    return false
+  }
+  return true
+}
+
+fn main() {
+  let c = Cfg{
+    bin: envOr("BIT", "bit-out/bin/bit"), base: "/tmp/bit-${tag}-${now().ns}",
+    script: scriptPath(tag), timeoutMs: timeoutSeconds(tag) * 1000,
+  }
+  if (!exists(c.bin)) {
+    eprint("${tag}: compiler not found: ${c.bin} (set BIT)\n")
+    exit(1)
+    return
+  }
+  let src = "${c.base}.bit"
+  if (!writeFixture(c, src)) {
+    exit(1)
+    return
+  }
+  let t = Tally{ checks: 0, failures: 0 }
+  checkText(t, c, src)
+  checkRun(t, c, src)
+  fsRemove(src)
+  fsRemove(c.script)
+  if (t.failures > 0) {
+    eprint("${tag}: FAIL — ${t.failures} of ${t.checks} checks\n")
+    exit(1)
+    return
+  }
+  print(
+      "${tag}: PASS — ${t.checks} checks; ${fnSym} is ${wantInsts} instructions " +
+      "with ${wantAdds} add #${foldedImm} and ${wantMovs} mov #${foldedImm}\n",
+  )
+}
