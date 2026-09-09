@@ -726,7 +726,7 @@ default to, so an HTTP/2 exchange and an HTTP/1.1 one are bounded alike.
 128 KiB is twice `std/http`'s own `maxHeaderBytes` (65536), which bounds a
 decoded HTTP/1.1 block rather than an encoded HPACK one. The headroom is
 measured against the largest header block the test corpus sends: the 60000-byte
-value in `_tests_/imports/http2conn` Huffman-codes to 56920 octets, 56976 for
+value in `_tests_/imports/http2conn` Huffman-codes to 56920 octets, 56947 for
 the whole block, which is 43% of the budget.
 
 ### `Request`
