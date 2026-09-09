@@ -31,7 +31,7 @@ import { monotonic, sleep } from "std/time"
 
 // An abstract bidirectional byte stream. `read` returns up to `n` bytes and an
 // empty slice at end-of-stream; `write` delivers every byte of its argument or
-// fails; `close` releases the underlying stream. A `Conn` needs nothing else, so
+// fails; `shutdown` releases the stream. A `Conn` needs nothing else, so
 // the same engine runs over a socket (`std/net`) or an in-memory pipe.
 export class Transport {
   export read: (int) => []byte,
@@ -40,8 +40,17 @@ export class Transport {
 }
 
 // Bundle three closures into a `Transport`. `shutdown` releases the stream (the
-// socket `close`, an EOF signal on a pipe); it is named `shutdown` rather than
-// `close` to avoid shadowing the `close` channel builtin.
+// socket `shutdown`, an EOF signal on a pipe); it is named `shutdown` rather
+// than `close` to avoid shadowing the `close` channel builtin.
+//
+// `shutdown` must end reads on THIS end as well as signalling the peer: a read
+// already in progress returns end-of-stream or fails, and every later one
+// returns end-of-stream. That is not decoration — a green thread parked in
+// `read` cannot be interrupted from outside by anything else in this runtime,
+// so releasing the transport is the ONLY way the engine's reader thread can
+// ever be made to stop, on the live connection's teardown (`waitReaderDone`)
+// and on `connect`/`accept`'s own failure path alike (`h2connAwaitReady`,
+// #4608). `std/net`'s `Conn.shutdown` has exactly this property.
 export fn newTransport(
   read: (int) => []byte,
   write: ([]byte) => ()!,
@@ -298,7 +307,6 @@ fn h2connStart(
     maxBodyBytes: cfg.maxBodyBytes,
     peerMaxFrameSize: defaultMaxFrameSize,
     ourMaxFrameSize: cfg.maxFrameSize,
-    lastStreamId: 0,
     contStream: 0,
     contBuf: []byte(0),
     contEndStream: false,
@@ -317,7 +325,7 @@ fn h2connStart(
   // window and frame-size limits are known before the first request is sent.
   // Bounded by `deadlineNs` and by the teardown path, not a bare receive —
   // see `h2connAwaitReady` (#3019).
-  h2connAwaitReady(readyCh, readerDoneCh, writerDoneCh, deadlineNs)?
+  h2connAwaitReady(t, readyCh, readerDoneCh, writerDoneCh, deadlineNs)?
   return Conn{
     isClient: isClient,
     cmdCh: cmdCh,
@@ -329,33 +337,41 @@ fn h2connStart(
 }
 
 // Block until the loop signals `readyCh` (1 for the peer's opening SETTINGS,
-// 0 for a teardown before that — events.bit's EOF handling) or until
-// `deadlineNs` elapses first (0 = no bound). A channel receive has no timer
-// of its own, unlike a socket read, so one is armed here explicitly for
-// exactly this wait: a green thread that sleeps for the remaining budget
-// then signals `timeoutCh`, raced against `readyCh` with `select`.
+// 0 for a teardown before that — the transport's EOF, or a connection error
+// this side raised, both in events.bit) or until `deadlineNs` elapses first
+// (0 = no bound). A channel receive has no timer of its own, unlike a socket
+// read, so one is armed here explicitly for exactly this wait: a green thread
+// that sleeps for the remaining budget then signals `timeoutCh`, raced against
+// `readyCh` with `select`.
 //
-// On EITHER failure, drains `readerDoneCh` then `writerDoneCh` before failing
-// so the reader and writer green threads `h2connStart` just spawned are
-// provably done touching the transport by the time this returns — required
-// before whoever called `connect`/`accept` can safely close the transport
-// (the same close-before-done fd-reuse hazard #3016 fixed for a live `Conn`'s
-// reader, now guarded here — for both threads — for a `Conn` that never got
-// created). Reader first, writer second: the writer's release is caused by
-// the loop processing the reader's own eof event (`events.bit`), so draining
-// it first is what makes the writer's drain bounded rather than a guess.
-// This is bounded, not a second unbounded wait: a torn-down connection's
-// reader has already hit the failure that triggered the teardown signal, and
-// a timed-out wait's reader is reading over the identical `deadlineNs` (see
-// `connect`'s doc), so either way the reader's own read fails at essentially
-// the same moment, the loop's eof handling follows from that, and both
-// `doneCh`s follow in short order. One case is NOT bounded that way: a
-// connection error raised before the peer's SETTINGS (a peer that sends
-// garbage first) now signals `readyCh` from `h2connTerminate` while the reader
-// is still parked in a read, so this drain waits for the transport to die —
-// with `deadlineNs == 0` that is unbounded (#4608). It was unbounded before
-// #4606 too, parked on `readyCh` instead; the park moved, the bound did not.
+// On EITHER failure this runs the same teardown every other path in this
+// module runs for a live connection (`h2clientExchange`, stdlib/http/h2.bit),
+// minus its last step: `t.shutdown()`, then drain `readerDoneCh`, then
+// `writerDoneCh`. Releasing the transport for good is left out because it
+// belongs to whoever called `connect`/`accept` and is still holding it. What
+// the three steps buy is that both green threads `h2connStart` just spawned
+// are provably done touching the transport by the time this returns, which is
+// what makes that caller's close safe — the close-before-done fd-reuse hazard
+// #3016 fixed for a live `Conn`'s reader, guarded here, for both threads, for
+// a `Conn` that never got created.
+//
+// The shutdown is load-bearing rather than tidiness (#4608). Nothing in this
+// runtime can interrupt a green thread parked in a transport read, so the
+// reader stops only once that read fails, and releasing the transport is the
+// only thing that makes it fail (`Transport`'s doc states that requirement).
+// On the EOF path it has failed already; but a connection error raised before
+// the peer's SETTINGS — a peer that sends garbage first and keeps the socket
+// open (#4606) — terminates the loop while the reader is still parked on a
+// perfectly healthy transport, and draining it without shutting down first
+// parks `connect`/`accept` forever when `deadlineNs == 0`. This thread is
+// also the only one allowed to make that call: the loop and writer threads
+// never touch the transport (#3026), and this one is the caller's own.
+//
+// Reader drained first, writer second: the writer's release is the loop
+// processing the reader's own eof event (`events.bit`), so draining the
+// reader first is what makes the writer's drain bounded rather than a guess.
 fn h2connAwaitReady(
+  t: Transport,
   readyCh: chan<int>,
   readerDoneCh: chan<int>,
   writerDoneCh: chan<int>,
@@ -390,6 +406,7 @@ fn h2connAwaitReady(
   if (outcome == 0) {
     return
   }
+  t.shutdown()
   <- readerDoneCh
   <- writerDoneCh
   if (outcome == 2) {
