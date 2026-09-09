@@ -171,7 +171,17 @@ case "${BUCKET}" in
     # checkKeepAliveInterval, and is caught only by RUNNING a flipped
     # program — which is exactly what these two gates do and no other step in
     # this bucket does.
-    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive)
+    #
+    # test-gc-retention (#4408) is the #4578 shape again — its scope is in
+    # neither argv (which names only its own harness) nor an env entry: it
+    # COMPILES AND RUNS fixtures and pins the `swept=`/`live=` split of their
+    # BIT_GC_STATS=1 summary, and the code that decides that split is compiler/**'s codegen as much as runtime/**'s collector.
+    # #4402's own move came from compiler/lowermemprim.bit making a runtime
+    # leaf leaf-shaped, which stopped runtime/stw/stwscan.bit's conservative
+    # `[sp, top)` scan reading its spilled frame as 941,761 false roots — one
+    # commit in each tree could have caused it and no bucket ran anything that
+    # reads the counters.
+    BUILD_STEPS=(test-imports-bit test-lint-filelines test-selfhostcheck test-selfcheck test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-version-cli test-fmt-citations test-fmt-roundtrip test-abimembers test-string-explode test-string-keepalive test-gc-retention)
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did
@@ -214,7 +224,17 @@ case "${BUCKET}" in
     # above it; test-threadtokenbytes (#4452) checks runtime/gc/*/gcthread.bit
     # against compiler/{arm64,x64}call.bit, so a runtime-only edit to the asm
     # side of that pair owes it exactly as much as a compiler-only edit does.
-    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes)
+    #
+    # test-gc-retention (#4408) is the #4578 shape again — its scope is in
+    # neither argv (which names only its own harness) nor an env entry: it
+    # COMPILES AND RUNS fixtures and pins the `swept=`/`live=` split of their
+    # BIT_GC_STATS=1 summary, and the code that decides that split is runtime/**'s collector and conservative scan as much as compiler/**'s codegen.
+    # #4402's own move came from compiler/lowermemprim.bit making a runtime
+    # leaf leaf-shaped, which stopped runtime/stw/stwscan.bit's conservative
+    # `[sp, top)` scan reading its spilled frame as 941,761 false roots — one
+    # commit in each tree could have caused it and no bucket ran anything that
+    # reads the counters.
+    BUILD_STEPS=(test-stress-exclusive test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree test-lint-filelines test-lint-runtime test-packages test-fmt-strict test-lint-self test-lint-complexity test-lint-sweep test-threadtokenbytes test-gc-retention)
     ;;
   testcases)
     # test-fuzz mutates the real _tests_/cases corpus (BIT_FUZZ_CASES=
@@ -259,7 +279,17 @@ case "${BUCKET}" in
     # every stdlib `*.test.bit` (#4212) — under scripts/gate.sh. Found by
     # assert_argvliteral_gates_current() (scripts/gate-envscope.sh, #4477) the
     # first time it ran.
-    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages test-lint-self test-lint-complexity test-lint-sweep test-stdlib-unit)
+    #
+    # test-gc-retention (#4408) is the #4578 shape again — its scope is in
+    # neither argv (which names only its own harness) nor an env entry: it
+    # COMPILES AND RUNS fixtures and pins the `swept=`/`live=` split of their
+    # BIT_GC_STATS=1 summary, and the code that decides that split is stdlib/** too — three of its five pinned rows run std/strings and std/json.
+    # #4402's own move came from compiler/lowermemprim.bit making a runtime
+    # leaf leaf-shaped, which stopped runtime/stw/stwscan.bit's conservative
+    # `[sp, top)` scan reading its spilled frame as 941,761 false roots — one
+    # commit in each tree could have caused it and no bucket ran anything that
+    # reads the counters.
+    BUILD_STEPS=(test-imports-bit test-stdlib-docs test-fmt test-lint-filelines test-packages test-lint-self test-lint-complexity test-lint-sweep test-stdlib-unit test-gc-retention)
     ;;
   docs)
     # test-stdlib-docs reads docs/stdlib/*.md directly (BIT_DOCS_ROOT — it
