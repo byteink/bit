@@ -112,10 +112,32 @@ class LiveInterval {
   // plus `mergeAliases` below, which folds an alias's reads into the root they
   // share a location with.
   uses: int,
+  // #4666. True when this value's whole definition can be RECOMPUTED at each
+  // use for no more than the one instruction a reload would cost — the backend
+  // names what qualifies (arm64's `isRematConst`: a `const_int`/`const_bool`
+  // `movImm64` materializes in one word). Two consequences, one fact:
+  // `preferSpill` ranks it the CHEAPEST victim of all, because losing the
+  // register costs it no memory traffic at all; and `assignSpill` gives it NO
+  // SLOT (`RegLoc.index` -1), because a slot would be a stack word stored once
+  // and loaded never.
+  //
+  // It must be Int class and must not be `isRef` — asserted in
+  // `allocateCoalesced`, not left to the backend's good manners: a slotless
+  // interval must not reach the float slot-number shift, and a GC stack map
+  // cannot name a slot that was never written.
+  //
+  // False is the honest default (§12.2), so x86-64's backend and
+  // ircheckregalloc.bit's `mkIv`, which mark nothing, keep exactly the
+  // documented behaviour term for term.
+  remat: bool,
 }
 
 // Where a vreg lives. Bit has no tagged union: `isSpill` selects whether `index`
-// names a physical register or a spill slot.
+// names a physical register or a spill slot. A spill `index` of -1 is the third
+// state (#4666): the value is REMATERIALIZED at each use and owns no stack
+// word. `spillOffset` (arm64ctx.bit/x64ctx.bit) asserts a non-negative slot, so
+// a reader that has not been taught about it fails the build rather than
+// addressing a frame word that was never written.
 class RegLoc {
   isSpill: bool,
   index: int,
@@ -275,7 +297,27 @@ fn firstFreeReg(s: ClassState, allowed: int): int {
 // (ircheckregalloc.bit's `mkIv`) keeps exactly the documented behaviour.
 // Verified, not asserted: with the second clause reduced to `false`, all 28
 // bench objects across both targets are byte-identical to `main`.
+//
+// #4666 puts ONE clause ahead of all of it, and it is a different kind of
+// statement from the two below. Those rank two costs against each other; this
+// one says a `remat` interval HAS no cost — evicting it emits no store and no
+// reload, so its register is free to take whatever its end point or read count.
+// Without it a constant with a function-long range is the interval the
+// furthest-end rule protects hardest, which is how `_m10$hpackHuffCode` reached
+// 303 spill/reload sites and a 0x160 frame under #4281's CSE: 662 constants
+// held the register file and the real values went to the stack. With `remat`
+// uniformly false this is the #4503 rule term for term.
+//
+// It is also the one ranking here that needs NO execution frequency, which is
+// what the paragraph above says the wider (1 + uses) / register-time rule
+// lacked. Per USE, a rematerialized read is one `mov` and a reloaded read is
+// one `ldr`; the spill of a real value additionally costs a store. So evicting
+// the constant instead is no worse at every single use site, at every loop
+// depth. There is no weighting that reverses it.
 fn preferSpill(a: LiveInterval, b: LiveInterval): bool {
+  if (a.remat != b.remat) {
+    return a.remat
+  }
   if (a.end != b.end) {
     return a.end > b.end
   }
@@ -382,7 +424,7 @@ fn copyIntervals(intervals: []LiveInterval): []LiveInterval {
       out,
       LiveInterval{
         vreg: iv.vreg, regClass: iv.regClass, start: iv.start,
-        end: iv.end, isRef: iv.isRef, uses: iv.uses,
+        end: iv.end, isRef: iv.isRef, uses: iv.uses, remat: iv.remat,
       },
     )
     i = i + 1
@@ -425,6 +467,14 @@ fn mergeAliases(scan: []LiveInterval, posOf: []int, roots: []int): []bool {
       // spilling the root reloads at the alias's use sites too. Leaving them
       // behind would price a coalesced interval below what it costs.
       scan[rp].uses = scan[rp].uses + scan[i].uses
+      // #4666: and the root loses `remat`. Rematerialization is per-USE and
+      // reads the DEFINITION of the vreg being read — `getInt` asks
+      // `rematSpilledConst(cx, vreg, ...)` about `f.instrs[vreg]`. An alias
+      // reads through its own vreg, whose instruction is a `block_param`, not a
+      // constant; with no slot behind it that read has nothing to recompute and
+      // nothing to load. So a root that acquires an alias is no longer
+      // rematerializable, whatever its own definition is.
+      scan[rp].remat = false
       // The reference moves to the root along with the range. Clearing it here
       // rather than filtering aliases out of the stack-map walk is what keeps
       // that walk exactly as it was: an alias would otherwise report the shared
@@ -514,14 +564,20 @@ fn allocate(
 // between, because the widened interval spans the union and the scan honours it.
 // An empty `roots` is exactly the plain Poletto & Sarkar behaviour, register for
 // register.
-fn allocateCoalesced(
-  target: TargetRegs, intervals: []LiveInterval, points: AllocPoints,
-  roots: []int,
-): RegAllocResult {
-  let safepoints = points.safepoints
+// The caller's contract on the interval array — an internal-caller invariant,
+// asserted rather than surfaced as an error. Its own function since #4666 gave
+// it a fourth clause: `allocateCoalesced` is over this repo's E0204 ceiling
+// already (spec/LINT.md) and every clause here is a branch it does not need to
+// carry.
+//
+// Dense vregs (exactly 0..n, each once) is what lets the result array be
+// indexed by vreg with no lookup table. The last two are about locations that
+// do not exist: an `isRef` float has no stack-map representation at all, and a
+// `remat` interval owns no slot, so it must be Int class — the float
+// slot-number shift would turn its -1 into a real frame address — and must hold
+// no reference, since a stack map cannot name a word that was never written.
+fn assertIntervalContract(intervals: []LiveInterval) {
   let n = len(intervals)
-  // Validate the caller's dense-vreg contract — an internal-caller invariant,
-  // asserted rather than surfaced as an error.
   let seen = []bool(0)
   let i = 0
   while (i < n) {
@@ -536,11 +592,21 @@ fn allocateCoalesced(
     seen[iv.vreg] = true
     assert(iv.start <= iv.end)
     assert(iv.regClass == RegClass.Int || !iv.isRef)
+    assert(!iv.remat || (iv.regClass == RegClass.Int && !iv.isRef))
     i = i + 1
   }
+}
+
+fn allocateCoalesced(
+  target: TargetRegs, intervals: []LiveInterval, points: AllocPoints,
+  roots: []int,
+): RegAllocResult {
+  let safepoints = points.safepoints
+  let n = len(intervals)
+  assertIntervalContract(intervals)
 
   let locations = []RegLoc(0)
-  i = 0
+  let i = 0
   while (i < n) {
     locations = append(locations, RegLoc{ isSpill: false, index: 0 })
     i = i + 1
