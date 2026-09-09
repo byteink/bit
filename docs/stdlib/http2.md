@@ -621,6 +621,14 @@ tables stay in lock-step automatically. `connect` returns once the peer's openin
 SETTINGS is in effect, so the peer's window and frame-size limits are known
 before the first request goes out.
 
+A stream leaves the loop's stream table as soon as it closes. A late
+RST_STREAM, WINDOW_UPDATE or PRIORITY arriving after that - which RFC 9113 §5.1
+allows, since the peer's frames were already in flight when the stream ended -
+is answered without a table entry: it is ignored, exactly as it was when the
+entry was still there. DATA on such a stream is still refused with
+STREAM_CLOSED, and the identifier is not reusable, because the ordering state a
+new stream is judged against belongs to the connection rather than to the table.
+
 ```bit
 import { connect, accept, Transport, defaultConfig, Request, Response, newRequest, newResponse } from "std/http2"
 
@@ -677,6 +685,13 @@ purpose: flow control bounds bytes *in flight*, and this engine replenishes both
 windows the instant DATA lands - precisely because it buffers the whole body -
 so only a local budget bounds bytes *resident*. There is deliberately no value
 meaning "unlimited": `0` refuses every body.
+
+The budget is per stream, and the connection's total is bounded by the stream
+table holding only streams that are still in flight: a stream is dropped from it
+the moment it reaches the closed state, taking its buffered body with it. So a
+connection kept open for hours does not accumulate every body it ever carried,
+and `maxBodyBytes` times the number of concurrent streams is the ceiling rather
+than `maxBodyBytes` times every request ever served.
 
 ### `defaultConfig(): Config`
 

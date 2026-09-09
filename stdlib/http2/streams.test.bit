@@ -1,0 +1,340 @@
+// stdlib/http2/streams.test.bit — a terminal stream is released from the
+// connection's stream table (#4594).
+//
+// #4590 bounded what ONE stream may buffer. Nothing bounded how many streams a
+// connection keeps: `h2connCloseStream` flipped the state and left the entry —
+// with its `recvBody`, `pendingData` and `recvHeaders` attached — in
+// `st.streams` for the life of the connection, so a server holding one
+// connection open for a browser grew by up to `Config.maxBodyBytes` for every
+// request it ever served on it.
+//
+// These drive the frame and command handlers directly against a hand-built
+// `h2connState` (`btState`/`btOpenStream`/`btPattern` from `events.test.bit`,
+// same flat `std/http2` module, so nothing is imported), with no threads and no
+// transport. That is what makes the claim checkable as `len(st.streams)` rather
+// than inferred from a memory measurement.
+
+// --- a server endpoint and the peer talking to it ----------------------------
+
+// A hand-built server-side loop state plus the HPACK encoder a peer would use
+// for its half of the connection.
+//
+// `enc` is deliberately NOT `st.enc`. Two encoder/decoder pairs run over an
+// HTTP/2 connection and each must stay in lockstep on its own: the peer's
+// encoder against `st.dec` for inbound blocks, and `st.enc` against the peer's
+// decoder for outbound ones. Building inbound frames with `st.enc` would insert
+// into a dynamic table `st.dec` never mirrors and desync both pairs after the
+// first response.
+class srPeer { st: h2connState, enc: Encoder }
+
+fn srNewPeer(): srPeer {
+  return srPeer{ st: btState(false, 1048576), enc: newEncoderConfig(4096, true) }
+}
+
+// The pseudo-header set a `POST path` request decodes to.
+fn srRequestFields(path: string): []HeaderField {
+  let fs = []HeaderField(0)
+  fs = append(fs, HeaderField{ name: ":method", value: "POST", sensitive: false })
+  fs = append(fs, HeaderField{ name: ":scheme", value: "https", sensitive: false })
+  fs = append(fs, HeaderField{ name: ":authority", value: "example.com", sensitive: false })
+  fs = append(fs, HeaderField{ name: ":path", value: path, sensitive: false })
+  return fs
+}
+
+// A single-fragment HEADERS frame carrying `fields`, built through the real
+// codec so the handler sees exactly what the wire would hand it.
+fn srHeadersFrame(enc: Encoder, id: int, fields: []HeaderField, endStream: bool): Frame! {
+  let wire = encodeHeaders(
+    HeadersFrame{
+      streamId: id,
+      blockFragment: enc.encode(fields),
+      endStream: endStream,
+      endHeaders: true,
+      padLength: 0 - 1,
+      hasPriority: false,
+      exclusive: false,
+      streamDependency: 0,
+      weight: 0,
+    },
+  )?
+  return readFrame(wire, maxMaxFrameSize)?
+}
+
+// The peer's half of one request on `id`: HEADERS, then a 64-byte body that ends
+// the request. Returns the `Request` `serve` takes off `acceptCh` — so the
+// stream really did carry a body before anything released it. Driven through
+// `h2connHandleFrame`, not the per-frame handlers, so the new-stream decision
+// (`st.present[id] == 0`, which a release changes) is the engine's and not the
+// test's.
+fn srServeStart(p: srPeer, id: int, path: string): Request! {
+  let hf = srHeadersFrame(p.enc, id, srRequestFields(path), false)?
+  h2connHandleFrame(p.st, hf)
+  let df = btDataFrame(id, btPattern(64), true)?
+  h2connHandleFrame(p.st, df)
+  let a = <- p.st.acceptCh
+  return a.request
+}
+
+// The handler's answer, as `h2connHandle` (conn.bit) would deliver it.
+fn srServeFinish(p: srPeer, id: int, body: []byte) {
+  h2connCmdRespond(
+    p.st,
+    h2connCmd{
+      kind: h2cmdRespond,
+      request: h2connZeroRequest(),
+      response: newResponse(200, body),
+      streamId: id,
+      errorCode: 0,
+      replyCh: h2connDummyReply(),
+    },
+  )
+}
+
+// How many frames the loop has queued for the writer, discarding them.
+// `btState`'s `writeCh` holds 64 and a served stream queues three, so a run of
+// streams must drain as it goes; the count is returned rather than dropped so
+// every caller states what it expected to be there.
+fn srDrainWrites(st: h2connState): int {
+  let n = 0
+  while (true) {
+    select {
+      case _ = <- st.writeCh:
+        n = n + 1
+      default:
+        return n
+    }
+  }
+}
+
+// The three frames one complete server stream queues: the connection-level
+// WINDOW_UPDATE replenished when the request body landed, and the response's
+// HEADERS and DATA.
+const srFramesPerStream: int = 3
+
+// A `:status` response header set.
+fn srStatusFields(status: int): []HeaderField {
+  let fs = []HeaderField(0)
+  fs = append(fs, HeaderField{ name: ":status", value: h2connItoa(status), sensitive: false })
+  return fs
+}
+
+// --- the release itself ------------------------------------------------------
+
+test "a completed server stream is released from the connection's stream table" {
+  let p = srNewPeer()
+  let req = srServeStart(p, 1, "/echo") catch e {
+    assert(false, "driving the stream failed: ${e.message()}")
+    return
+  }
+  assert(len(req.body) == 64, "the handler saw a ${len(req.body)}-byte body, want 64")
+  assert(len(p.st.streams) == 1, "the in-flight stream is not in the table")
+  srServeFinish(p, 1, req.body)
+  let queued = srDrainWrites(p.st)
+  assert(queued == srFramesPerStream, "queued ${queued} frames, want ${srFramesPerStream}")
+  assert(len(p.st.streams) == 0, "st.streams holds ${len(p.st.streams)} entries, want 0")
+  assert(len(p.st.present) == 0, "st.present holds ${len(p.st.present)} entries, want 0")
+  assert(p.st.activeStreams == 0, "activeStreams = ${p.st.activeStreams}, want 0")
+}
+
+test "the stream table does not grow with the number of completed streams" {
+  // The bug itself: every one of these 64 streams used to stay in `st.streams`
+  // with its body attached, and a real connection's bodies are bounded at
+  // `Config.maxBodyBytes` (32 MiB by default) each, not at 64 bytes.
+  let p = srNewPeer()
+  let inflightPeak = 0
+  let id = 1
+  while (id <= 127) {
+    let req = srServeStart(p, id, "/echo") catch e {
+      assert(false, "stream ${id} failed: ${e.message()}")
+      return
+    }
+    // The table DOES hold a stream while it is in flight. Without this the
+    // assertion below would pass just as well on an engine that never created
+    // one, which is the shape of a test that cannot fail.
+    if (len(p.st.streams) > inflightPeak) {
+      inflightPeak = len(p.st.streams)
+    }
+    srServeFinish(p, id, req.body)
+    let queued = srDrainWrites(p.st)
+    assert(queued == srFramesPerStream, "stream ${id} queued ${queued} frames")
+    assert(len(p.st.streams) == 0, "after stream ${id} the table holds ${len(p.st.streams)}")
+    id = id + 2
+  }
+  assert(inflightPeak == 1, "the table never held an in-flight stream (peak ${inflightPeak})")
+  assert(len(p.st.streams) == 0, "after 64 streams the table holds ${len(p.st.streams)} entries")
+  assert(len(p.st.present) == 0, "after 64 streams the presence set holds ${len(p.st.present)}")
+  assert(p.st.activeStreams == 0, "activeStreams = ${p.st.activeStreams}, want 0")
+}
+
+test "a client stream is released once its round trip has been answered" {
+  // The client's release point is `s.replied` — the moment `h2connDeliverResponse`
+  // has handed the `Response` to the `roundTrip` parked on `replyCh`.
+  let st = btState(true, 1048576)
+  let replyCh = chan<h2connMsg>(1)
+  let s = btOpenStream(st, 1, replyCh)
+  h2connClientHeaders(st, 1, srStatusFields(200), false)
+  let f = btDataFrame(1, btPattern(64), true) catch e {
+    assert(false, "building the DATA frame failed: ${e.message()}")
+    return
+  }
+  h2connOnData(st, f)
+  let msg = <- replyCh
+  assert(msg.ok, "the round trip failed: ${msg.errMsg}")
+  assert(len(msg.response.body) == 64, "response body ${len(msg.response.body)} bytes, want 64")
+  assert(s.state == h2stClosed, "the stream is in state ${s.state}, want ${h2stClosed}")
+  assert(len(st.streams) == 0, "st.streams holds ${len(st.streams)} entries, want 0")
+  assert(len(st.present) == 0, "st.present holds ${len(st.present)} entries, want 0")
+}
+
+test "a stream still in flight is not released, and a connection error reaches it" {
+  // The control on the release predicate, and the invariant that bounds it: a
+  // stream is dropped when it reaches the CLOSED state and not before, because
+  // `h2connFailAll` walking `st.streams` is the only thing that ever wakes a
+  // `roundTrip` parked on `replyCh` when the connection dies under it.
+  //
+  // (`h2connFailAll` skips a closed stream by its own test, `s.state !=
+  // h2stClosed`, so a closed entry was never reachable by it — which is why the
+  // release needs no second condition. This is the case that IS reachable.)
+  let st = btState(true, 1048576)
+  let replyCh = chan<h2connMsg>(1)
+  let s = btOpenStream(st, 1, replyCh)
+  h2connClientHeaders(st, 1, srStatusFields(200), false)
+  assert(s.state == h2stOpen, "the stream is in state ${s.state}, want ${h2stOpen}")
+  assert(len(st.streams) == 1, "a stream still in flight was released")
+  assert(len(st.present) == 1, "a stream still in flight was released from st.present")
+  h2connFailAll(st, "http2: connection closed")
+  let msg = <- replyCh
+  assert(!msg.ok, "the waiting round trip was answered with a success")
+  assert(msg.errMsg == "http2: connection closed", "unexpected error: '${msg.errMsg}'")
+  let queued = srDrainWrites(st)
+  assert(queued == 0, "failing every stream queued ${queued} frames, want 0")
+}
+
+// --- what a late frame on a released stream gets -----------------------------
+
+test "a late RST_STREAM on a released stream is ignored, not a protocol error" {
+  // RFC 9113 §5.1: a closed stream may still receive RST_STREAM (and
+  // WINDOW_UPDATE, and PRIORITY) for a short while, because the peer's frames
+  // were in flight when we closed. Those are answered WITHOUT a table entry, not
+  // by keeping one.
+  let p = srNewPeer()
+  let req = srServeStart(p, 1, "/echo") catch e {
+    assert(false, "driving the stream failed: ${e.message()}")
+    return
+  }
+  srServeFinish(p, 1, req.body)
+  let queued = srDrainWrites(p.st)
+  assert(queued == srFramesPerStream, "queued ${queued} frames, want ${srFramesPerStream}")
+  assert(len(p.st.streams) == 0, "the stream was not released")
+
+  let wire = encodeRstStream(RstStreamFrame{ streamId: 1, errorCode: errorCancel }) catch e2 {
+    assert(false, "building the RST_STREAM failed: ${e2.message()}")
+    return
+  }
+  let rst = readFrame(wire, maxMaxFrameSize) catch e3 {
+    assert(false, "reading the RST_STREAM back failed: ${e3.message()}")
+    return
+  }
+  h2connHandleFrame(p.st, rst)
+  assert(!p.st.goawaySent, "a late RST_STREAM produced a GOAWAY")
+  assert(p.st.running, "a late RST_STREAM tore the connection down")
+  let after = srDrainWrites(p.st)
+  assert(after == 0, "a late RST_STREAM queued ${after} frames, want 0")
+}
+
+test "a late DATA frame on a released stream is answered with RST_STREAM STREAM_CLOSED" {
+  // The other half: an absent entry must read exactly like a present closed one,
+  // and a present closed one has always been a STREAM_CLOSED stream error.
+  let p = srNewPeer()
+  let req = srServeStart(p, 1, "/echo") catch e {
+    assert(false, "driving the stream failed: ${e.message()}")
+    return
+  }
+  srServeFinish(p, 1, req.body)
+  let queued = srDrainWrites(p.st)
+  assert(queued == srFramesPerStream, "queued ${queued} frames, want ${srFramesPerStream}")
+
+  let late = btDataFrame(1, btPattern(16), false) catch e2 {
+    assert(false, "building the DATA frame failed: ${e2.message()}")
+    return
+  }
+  h2connHandleFrame(p.st, late)
+  assert(!p.st.goawaySent, "a late DATA frame produced a GOAWAY")
+  let sent = btNextWritten(p.st) catch e3 {
+    assert(false, "no frame was queued for the peer: ${e3.message()}")
+    return
+  }
+  let rf = decodeRstStream(sent) catch e4 {
+    assert(false, "the queued frame is not RST_STREAM: ${e4.message()}")
+    return
+  }
+  assert(rf.streamId == 1, "RST_STREAM on stream ${rf.streamId}, want 1")
+  assert(
+    rf.errorCode == errorStreamClosed,
+    "RST_STREAM code = ${rf.errorCode}, want ${errorStreamClosed} (STREAM_CLOSED)",
+  )
+  let after = srDrainWrites(p.st)
+  assert(after == 0, "the late DATA queued ${after} extra frames, want 0")
+}
+
+test "a released stream id is not reusable" {
+  // The ordering state a new stream is judged against (`st.lastPeerStreamId`)
+  // lives on the connection, not in the table, so releasing stream 1 must not
+  // make stream 1 look fresh again. RFC 9113 §5.1.1: reusing an identifier is a
+  // connection error of type PROTOCOL_ERROR.
+  let p = srNewPeer()
+  let req = srServeStart(p, 1, "/echo") catch e {
+    assert(false, "driving the stream failed: ${e.message()}")
+    return
+  }
+  srServeFinish(p, 1, req.body)
+  let queued = srDrainWrites(p.st)
+  assert(queued == srFramesPerStream, "queued ${queued} frames, want ${srFramesPerStream}")
+  assert(len(p.st.streams) == 0, "the stream was not released")
+
+  let again = srHeadersFrame(p.enc, 1, srRequestFields("/again"), true) catch e2 {
+    assert(false, "building the second HEADERS failed: ${e2.message()}")
+    return
+  }
+  h2connHandleFrame(p.st, again)
+  assert(p.st.goawaySent, "reusing a released stream id was accepted")
+  let sent = btNextWritten(p.st) catch e3 {
+    assert(false, "no GOAWAY was queued: ${e3.message()}")
+    return
+  }
+  let ga = decodeGoaway(sent) catch e4 {
+    assert(false, "the queued frame is not GOAWAY: ${e4.message()}")
+    return
+  }
+  assert(
+    ga.errorCode == errorProtocolError,
+    "GOAWAY code = ${ga.errorCode}, want ${errorProtocolError} (PROTOCOL_ERROR)",
+  )
+}
+
+// --- the path that resumes a stalled stream and then ends it -----------------
+
+test "a body larger than the initial window completes through the resume path" {
+  // The one place a stream can reach its close from INSIDE a walk of
+  // `st.streams`: a body bigger than the 65535-byte connection window stalls in
+  // `h2connFlushStream`, and the peer's WINDOW_UPDATE on stream 0 resumes it
+  // through `h2connFlushAll` — which is where draining the last bytes ends the
+  // stream, closes it, and deletes its entry. `h2connFlushAll` snapshots the ids
+  // first for exactly that reason; the obvious
+  // `for (_, s) of st.streams { h2connFlushStream(st, s) }` would be mutating
+  // the map it is walking (SPEC §12.6).
+  //
+  // 200000 bytes is over three times the initial window in each direction, so
+  // both the request and the echoed response take this path several times.
+  let conn = btLoopback(defaultConfig()) catch e {
+    assert(false, "loopback setup failed: ${e.message()}")
+    return
+  }
+  let res = btPost(conn, 200000) catch e2 {
+    assert(false, "a 200000-byte body did not complete: ${e2.message()}")
+    return
+  }
+  assert(res.status == 200, "status = ${res.status}, want 200")
+  assert(len(res.body) == 200000, "echoed ${len(res.body)} bytes, want 200000")
+  assert(h2connBytesEqual(res.body, btPattern(200000)), "the echoed body is not the bytes sent")
+}
