@@ -89,7 +89,7 @@ it is not dispositioned here.
 document, dispositioned separately in #3618 (see below)
 
 **This is not a readability rule and does not belong in this document's risk
-class.** `spec/LINT.md:233` describes it as "the one case E0211 cannot see
+class.** `spec/LINT.md:242` describes it as "the one case E0211 cannot see
 because nothing was ever named" — i.e. it is E0211's sibling in the
 discarded-result family, which already has its own gate
 (`test-lint-runtime`) and its own settled fix pattern (`let _ = ...`,
