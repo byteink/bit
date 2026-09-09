@@ -69,12 +69,12 @@ windows_list=""
 docs_files=""
 stdlib_files=""
 
-# gates_for_file(), assert_dirgates_current(), testsbit_steps_for(),
-# hunk_is_safe(), is_additive_registration() and stdlib_docs_pairing_ok() are
-# all defined in scripts/gate-filemap.sh, already sourced above (moved there
-# by #3257 and #4234 so --mark-green/--resume can use that module's other
-# helpers before this point too, and so this file has headroom under its own
-# 800-line ceiling); see that file's header for what each does.
+# gates_for_file(), assert_dirgates_current() and testsbit_steps_for() are
+# defined in scripts/gate-filemap.sh. hunk_is_safe(),
+# is_additive_registration() and stdlib_docs_pairing_ok() are in
+# scripts/gate-diffclass.sh (#4610). Both are sourced above (moved out of gate.sh
+# by #3257/#4234 so --mark-green/--resume can use those helpers before this point
+# too, and so each file has headroom under its 800-line ceiling); see their headers.
 
 while IFS= read -r f; do
   case "${f}" in

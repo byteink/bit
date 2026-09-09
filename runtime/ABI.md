@@ -2021,6 +2021,16 @@ fallible surface form), so codegen never checks a return value.
 
 ### Exported C symbols (all `bit_rt_*`, one process-wide runtime instance)
 
+**This table is a selection, not a census.** Every row below is exported and
+stable, but a name's ABSENCE here says nothing: on `1e254026` plus this
+change, `git grep -ho '@symbol("bit_rt_[a-z0-9_]*")' -- runtime | sort -u`
+reports 594 pinned names against the 127 rows below. Most of the gap is `bit_rt_port_*` test pins and
+GC/scheduler/provider internals, but not all of it — ordinary §14 entry points
+such as `bit_rt_fs_open`, `bit_rt_fs_write`, `bit_rt_fs_close` and
+`bit_rt_fs_truncate` have no row either. **Each section's own prose is the
+authority for its family**; use this table as an index into them, never as the
+exported-symbol list.
+
 **Standing rule for Bit-sourced runtime modules: every runtime function another
 module calls MUST be pinned with `@symbol("...")` (SPEC §11.9).** This is a
 structural requirement, not a style preference, and it is not optional for
@@ -2116,6 +2126,9 @@ defined exactly once).
 | `bit_rt_fs_pread_w`   | `(fd: i64, buf: usize, max: i64, off: i64) -> i64` (§14, #3463, positional read: `buf` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not `RtBytes`, not NUL-terminated, same convention `bit_rt_fs_is_symlink_w` uses; byte count transferred, or negative on any I/O error; a short count, including 0 at end of file, is NOT an error) |
 | `bit_rt_fs_pwrite_w`  | `(fd: i64, buf: usize, n: i64, off: i64) -> i64` (§14, #3463, positional write: same `buf` convention as `bit_rt_fs_pread_w`; byte count transferred, or negative on any I/O error; extends the file or leaves a zero-filled hole as POSIX `pwrite(2)` does) |
 | `bit_rt_fs_open_rw_w` | `(words: usize, n: i64) -> i64` (§14, #3533, read-write open: same packed-bytes `words`/`n` convention as `bit_rt_fs_is_symlink_w`; `O_RDWR\|O_CREAT`, deliberately WITHOUT `O_TRUNC` -- creates `path` if absent, never destroys existing content on open; fd, or -1. Darwin/Linux only -- windows deferred, see runtime/root/{darwin,linux}/fsopenrw.bit and fs.bit) |
+| `bit_rt_fs_stat_w`    | `(words: usize, n: i64, out: usize) -> i64` (§14, #2153, same packed-bytes `words`/`n` path convention as `bit_rt_fs_is_symlink_w`; fills the caller-owned 5-word `out` buffer in fixed order — `size`, `mtime`, `mode`, `isDir`, `isSymlink` — FOLLOWING a trailing symlink, so `isSymlink` is always 0 here. Not the flat `-1` of the primitives above: 0 on success, `-errno` on failure) |
+| `bit_rt_fs_lstat_w`   | `(words: usize, n: i64, out: usize) -> i64` (§14, #2153, identical to `bit_rt_fs_stat_w` except it does NOT follow a trailing symlink, so `out`'s `isSymlink` word reports whether `words` itself is a link; same 0/`-errno` return) |
+| `bit_rt_fs_sync_dir_w` | `(words: usize, n: i64) -> i64` (§14, #4017, fsyncs the DIRECTORY named by the packed-bytes `words`/`n` path — the durability half `bit_rt_fs_sync` on a file does not cover; `0`, or `-1`; windows always reports 0) |
 | `bit_rt_fs_cwd`       | `() -> *const RtBytes` (§14, the process's current working directory, or the empty string on any failure; #3501) |
 | `bit_rt_test_index`   | `() -> i64` (§16)                                      |
 | `bit_rt_floor`        | `(x: f64) -> f64` (§17)                                |
@@ -2145,10 +2158,15 @@ defined exactly once).
 | `bit_rt_auxv`         | `() -> i64` (§19)                                      |
 | `bit_rt_net_listen`   | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
 | `bit_rt_net_local_port` | `(fd: i64) -> i64` (§20)                             |
+| `bit_rt_net_peer_ip_w` | `(fd: i64) -> i64` (§20, #4526, the connected peer's IPv4 address PACKED into one integer; `-1` when `fd` has no peer. Reached through a plain `extern fn`, the same class as the deadline entries below, not the compiler-recognized builtins the rows around it lower to) |
 | `bit_rt_net_accept`   | `(fd: i64) -> i64` (§20)                               |
 | `bit_rt_net_dial`     | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
+| `bit_rt_net_dial_deadline_w` | `(hostWords: usize, hostLen: i64, port: i64, deadlineNs: i64) -> i64` (§20, #2291, `bit_rt_net_dial` bounded by ONE absolute monotonic `deadlineNs` on `bit_rt_time_mono_ns`'s clock rather than parking forever; `host` crosses as a packed `[]byte`'s backing plus a length (§2, #3121/#3226) because §11.7 admits no `string` across an `extern fn`. fd, `-1` hard failure, `-2` timed out) |
 | `bit_rt_net_read`     | `(fd: i64, max: i64) -> *const RtBytes` (§20)          |
+| `bit_rt_net_read_deadline_w` | `(fd: i64, outWords: usize, cap: i64, deadlineNs: i64) -> i64` (§20, #2291, same deadline shape as `bit_rt_net_dial_deadline_w`; writes into the caller's own packed `outWords` buffer instead of returning a fresh string. Byte count, `0` peer closed, `-1` hard error, `-2` timed out) |
 | `bit_rt_net_write`    | `(fd: i64, s: *const RtBytes) -> i64` (§20)            |
+| `bit_rt_net_write_deadline_w` | `(fd: i64, words: usize, n: i64, deadlineNs: i64) -> i64` (§20, #2291, same deadline shape; the body crosses as packed `words`/`n`. Bytes written, `-1` hard error, `-2` timed out) |
+| `bit_rt_net_shutdown_sock_w` | `(fd: i64) -> bool` (§20, #3016, shuts BOTH directions of `fd` down without releasing it for reuse — see `netShutdownSock` in runtime/net/{darwin,linux,windows}/tcp.bit for why this exists alongside plain close. No buffer, so unlike its `_w` siblings it needs no packed-byte scratch; `true` on success) |
 | `bit_rt_net_udp_bind` | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
 | `bit_rt_net_udp_send` | `(fd: i64, host: *const RtBytes, port: i64, data: *const RtBytes) -> i64` (§20) |
 | `bit_rt_net_udp_recv` | `(fd: i64, max: i64) -> *const RtBytes` (§20)          |
