@@ -1,11 +1,12 @@
 # std/testing
 
-Assertions for `bit test`. A test is any top-level function with no
-parameters and no return value, declared in a file named `<name>.test.bit`;
+Assertions for `bit test`. A test is a `test "name" { }` declaration in a file
+named `<name>.test.bit`, and that is the only discovery shape (SPEC section 19);
 `bit test` finds them, runs each in its own process, and reports what failed.
-Discovery is by filename and shape alone - no naming convention is required.
-The examples below keep the `test_`/`testpanic_` style because it groups
-tests visually and reads well; any name works equally.
+The name is the declaration's string, so it may contain spaces and punctuation,
+and it is what `ok`/`FAIL` lines print and what `--run` matches. A bare
+top-level function with no parameters and no return type inside a `.test.bit`
+file is E0117, not a test.
 
 A failing assertion panics, which is why each test gets its own process - one
 failure cannot take the rest of the run down with it. It also means the first
@@ -278,12 +279,13 @@ rather than panicked.
 
 ## Expected panics
 
-`bit test` discovers a `testpanic_`-named function exactly like any other
-test - by file and shape, not by its name. The `testpanic_` prefix is a
-**verdict modifier**, not a discovery marker: it flips what counts as passing
-for that one already-discovered test. It runs in its own child process the
-same as every other test, but it passes when that process dies by a panic
-(exit code 2) and fails when it returns normally or exits any other way. No
+`bit test` discovers a test whose name begins `testpanic_` exactly like any
+other - by its `test "..." { }` declaration, not by its name. The `testpanic_`
+prefix is a **verdict modifier**, not a discovery marker: it flips what counts
+as passing for that one already-discovered test. It runs in its own child
+process the same as every other test, but it passes when that process dies by
+a panic (exit code 2) and fails when it returns normally or exits any other
+way. No
 `ok`/`notOk`/`failNow` call is needed inside it; the panic itself is the
 assertion.
 

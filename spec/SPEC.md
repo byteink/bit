@@ -4493,9 +4493,9 @@ test "concat" {
   row a failure came from can never go unnamed.
 - Tests are ordinary unreferenced declarations to `bit build`/`bit run`, so the
   linker's dead-strip drops them from a normal program's binary — every
-  test or test-shaped function in a `.test.bit` file, whichever form it uses.
-- Test execution order is the order of declaration, both forms interleaved
-  exactly as written; tests must not depend on it.
+  `test "..." { }` declaration in a `.test.bit` file.
+- Test execution order is the order of declaration, exactly as written; tests
+  must not depend on it.
 
 Richer assertions with value diffs live in `std/testing`, layered on this runner.
 
