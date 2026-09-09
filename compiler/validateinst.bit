@@ -261,42 +261,130 @@ fn vInstIndex(c: Checker, node: int, env: TypeEnv) {
 // they can change (`outer<Tag>()` is what the diagnostic asks for). The note
 // names the inner call, the way E0073's `vInstInterp` names the outer one.
 //
-// Judged with `genericTypeArgs` + `substType`, which is exactly what
-// `recordSubtreeInstantiations` (lowerdriver.bit) records the entry with, so
-// what is judged here is the entry Pass A2 will emit rather than a second
-// resolution that could disagree with it.
+// Both callee shapes are judged, as `vGenericBound` judges both for the
+// direct case: a free `inner(x)` and a generic method `b.mk(x)` (#4656). Each
+// arm resolves the callee the way the pass that RECORDS the entry resolves it
+// -- `genericTypeArgs` for the free shape, `methodRefAt` + `methodTypeArgsRaw`
+// under this instantiation's `env` for the method shape -- so what is judged
+// here is the entry Pass A2 will emit rather than a second resolution that
+// could disagree with it.
 //
 // This reaches one level. `validateInstantiations` runs before Pass A1's
 // closure (`checkResolved`, checkproject.bit), so the ledger holds only what
 // the check pass recorded; a violation three generics deep is still the
 // lowerer's E0092. That gap is real and is filed, not fixed here.
 fn vInstCall(c: Checker, node: int, env: TypeEnv, site: Span) {
-  let callee = kidsOf(c.tree, node)[0] // [callee, generic_args, arg_list]
-  if (getNode(c.tree, callee).tag != Tag.Ident) {
+  let tag = getNode(c.tree, kidsOf(c.tree, node)[0]).tag // [callee, gargs, args]
+  if (tag == Tag.Ident) {
+    vInstCallFree(c, node, env, site)
     return
   }
+  if (tag == Tag.Member) {
+    vInstCallMethod(c, node, env, site)
+  }
+}
+
+// The free-function arm. `genericTypeArgs` is the pair `recordCallInstantiation`
+// (checkproject.bit) records the entry with, so what is judged IS the entry Pass
+// A2 will emit rather than a second resolution that could disagree with it.
+fn vInstCallFree(c: Checker, node: int, env: TypeEnv, site: Span) {
+  let callee = kidsOf(c.tree, node)[0]
   let name = nodeText(c.tree, c.source, callee)
   if (shadowedByValue(c, callee, name) || !isGenericFuncAt(c, callee, name)) {
     return
   }
   let fr = funcRefAt(c, callee, name)
-  let tps = vDeclTypeParams(fr)
-  let raw = genericTypeArgs(c, name, node)
-  // `genericTypeArgs` builds one entry per declared type parameter; a length
-  // mismatch means the pairing is not trustworthy, so nothing is judged rather
-  // than something guessed — `vBoundLoop`'s rule, for the same reason.
+  let at = InstCallRef{ fr: fr, name: name, node: node, site: site, start: 0 }
+  vInstJudgeCall(c, at, genericTypeArgs(c, name, node), env)
+}
+
+// The generic-METHOD arm (#4656) — `vGenericBoundMethod`'s resolution
+// (validategeneric.bit), read under this instantiation's `env`.
+//
+// The free arm above returns at `tag != Tag.Ident`, so `b.mk(v)` with
+// `mk<T: Named>` was judged by nothing and stayed the lowerer's E0092 inside
+// `Box.mk`'s body — exactly the gap #4634 closed for the DIRECT case, one level
+// down and per instantiation.
+//
+// The RECEIVER's type goes through `substType` before the method is resolved:
+// inside `fn outer<T>()`, `let b = Container<T>{}` types `b` as
+// `Container<T>`, and only the substituted `Container<i64>` names a receiver
+// with a method table. That is `recordMethodInstantiation`'s own step
+// (checkproject.bit, its `genEnv` argument), so the receiver this resolves
+// against is the one the ledger resolved against.
+//
+// A `Tag.Member` callee is not necessarily a method call: `ns.f(...)` names an
+// imported free function, `Enum.Variant(...)` constructs, and an interface
+// method has no FuncDecl. `vInstMemberSkip` rejects the first two by receiver
+// shape and `fr.decl == 0` covers the rest.
+//
+// Only the method's OWN type params are judged. The declaration's list is
+// MERGED, the receiver class's parameters in front of its own (parserdecl), and
+// the receiver's half is bound from the receiver TYPE rather than from anything
+// this call wrote — a violation there belongs to whatever built the receiver.
+fn vInstCallMethod(c: Checker, node: int, env: TypeEnv, site: Span) {
+  let mk = kidsOf(c.tree, kidsOf(c.tree, node)[0]) // callee = [recv, name]
+  if (vInstMemberSkip(c, mk[0])) {
+    return
+  }
+  let rawRecv = checkExprType(c, mk[0])
+  if (rawRecv == 0) {
+    return
+  }
+  let subRecv = substType(c, rawRecv, env, 0)
+  if (subRecv == 0) {
+    return // no decidable receiver: nothing to resolve the method against
+  }
+  let recvTy = methodRecvType(c, subRecv)
+  let name = nodeText(c.tree, c.source, mk[1])
+  let fr = methodRefAt(c, recvTy, name)
+  if (fr.decl == 0 || methodOwnGenericCount(fr.owner, fr.decl) == 0) {
+    return // not a method call, or no type params of its own to judge
+  }
+  let start = len(vDeclTypeParams(fr)) - methodOwnGenericCount(fr.owner, fr.decl)
+  let at = InstCallRef{ fr: fr, name: name, node: node, site: site, start: start }
+  vInstJudgeCall(c, at, methodTypeArgsRaw(c, fr, recvTy, node), env)
+}
+
+// One judged call: the resolved callee, what to name it in the message, and the
+// two spans. Bundled rather than passed positionally because the two arms above
+// differ in three of the five and `vInstJudgeCall` would otherwise sit past
+// `max-params` (E0202, spec/LINT.md §5.2).
+//
+// `start` is the first type parameter THIS call is responsible for: 0 for a
+// free function, and for a method the tail of the merged list, exactly as
+// `vBoundLoop`'s own `start` (validategeneric.bit).
+class InstCallRef {
+  fr: FuncRef,
+  name: string,
+  node: int,
+  site: Span,
+  start: int,
+}
+
+// `args[start:]` against `tps[start:]`, reported at the INSTANTIATION's call
+// site — `vBoundLoop`'s loop with `vInstBadCallArg` in place of
+// `vArgViolatesBound`, since here each argument must first be substituted under
+// this instantiation's bindings.
+//
+// `genericTypeArgs` and `methodTypeArgsRaw` both build exactly one entry per
+// declared type parameter, so a length mismatch means the pairing is not
+// trustworthy and nothing is judged rather than something guessed —
+// `vBoundLoop`'s rule, for the same reason.
+fn vInstJudgeCall(c: Checker, at: InstCallRef, raw: []int, env: TypeEnv) {
+  let tps = vDeclTypeParams(at.fr)
   if (len(raw) != len(tps)) {
     return
   }
-  let i = 0
+  let i = at.start
   while (i < len(tps)) {
-    let sub = vInstBadCallArg(c, fr.owner, tps[i], raw[i], env)
+    let sub = vInstBadCallArg(c, at.fr.owner, tps[i], raw[i], env)
     if (sub != 0) {
-      let bound = vBoundIfaceOf(fr.owner, tps[i])
-      vInstReportCallBound(c, name, sub, bound, site)
+      let bound = vBoundIfaceOf(at.fr.owner, tps[i])
+      vInstReportCallBound(c, at.name, sub, bound, at.site)
       note(
-        c.diags, vSpan(c, node),
-        "'${name}' is called here, in the body emitted for this instantiation",
+        c.diags, vSpan(c, at.node),
+        "'${at.name}' is called here, in the body emitted for this instantiation",
       )
     }
     i = i + 1
