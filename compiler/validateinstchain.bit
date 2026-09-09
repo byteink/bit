@@ -1,0 +1,567 @@
+// Self-host: the CHAIN half of the per-monomorphization validation
+// (`validateinst.bit`, #1882/#4657/#4684/#4685).
+//
+// `validateinst.bit` holds the ledger walk and the five judgements that run over
+// ONE instantiated body. This file holds everything that crosses a generic
+// boundary: the E0051 bound rule for the calls a body MAKES, the descent that
+// follows such a call into the callee's own body, and — since #4684 — the walk
+// UP the ledger that finds the user-written call a template-internal entry was
+// recorded beneath.
+//
+// Split out of `validateinst.bit` at 737 lines (E0200's ceiling is 800,
+// spec/LINT.md §5.2) rather than suppressed. The seam is "one body" versus
+// "across bodies", so `vInstWalk` and the five rules stayed and every
+// `InstStep`/`InstLink` consumer moved. The module is one scope, so the split
+// changes no name resolution; per `docs`/#4441 it changes only diagnostic
+// emission order between the two files (there is none — every diagnostic here is
+// raised from the ledger walk, not from file order) and inlining depth.
+
+// The E0051 bound rule (`vGenericBound`, validategeneric.bit), re-judged for
+// the generic calls this instantiation's body MAKES — the transitive half of
+// the rule, and #4646.
+//
+// A generic body is checked once against its own rigid type params, so
+// `vBoundJudgeable` cannot judge `inner(x)` inside `fn outer<T>(v: T)`: the
+// argument is `T`, and rejecting a rigid `T` would reject every generic that
+// forwards to a bounded one. Nothing then judged it again per instantiation,
+// so `outer(7)` recorded `inner<i64>` and `outer()` — whose empty variadic slot
+// binds `T = ()` (#4597/#4633) — recorded `inner<()>`, neither of which
+// satisfies `inner`'s `T: Named`. `bit check` exited 0 and the LOWERER refused,
+// as E0092 inside `inner`'s own body, noting a call inside `outer`'s body: the
+// #1430 check/build divergence, reported at the wrong layer and at two spans
+// the user did not write.
+//
+// #4633 asked this question of the CALLED generic's own bound. Here the bound
+// is one level down, and the `()` is not the cause — `outer(7)` reproduces it
+// with `i64` — so the empty slot falls out of the general rule rather than
+// needing one of its own.
+//
+// THE SPAN IS THE INSTANTIATION'S OWN CALL SITE (`site`, #3827), not the call
+// inside the template: `outer()` is the line the user wrote and the only one
+// they can change (`outer<Tag>()` is what the diagnostic asks for). The note
+// names the inner call, the way E0073's `vInstInterp` names the outer one.
+//
+// Both callee shapes are judged, as `vGenericBound` judges both for the
+// direct case: a free `inner(x)` and a generic method `b.mk(x)` (#4656). Each
+// arm resolves the callee the way the pass that RECORDS the entry resolves it
+// -- `genericTypeArgs` for the free shape, `methodRefAt` + `methodTypeArgsRaw`
+// under this instantiation's `env` for the method shape -- so what is judged
+// here is the entry Pass A2 will emit rather than a second resolution that
+// could disagree with it.
+//
+// AND IT FOLLOWS THE CHAIN (#4657). A judged call whose own bound holds is
+// walked INTO, under the arguments this instantiation binds it with, so
+// `outer -> mid -> inner` is judged at `outer(7)` even though nothing records
+// `mid<i64>` at check time.
+//
+// The ledger cannot answer this question here, and that is measured, not
+// assumed: `validateInstantiations` runs at the end of `checkResolved`
+// (checkproject.bit) while Pass A1's `closeInstantiations` (compiler/lowerdriver.bit)
+// runs from `lowerProject` after it, so the ledger holds only the check pass's
+// own recordings — one level. Moving the closure in front of this pass does
+// produce the E0051, but at the WRONG SPAN and at a real cost: a closure entry
+// carries the span of the call that recorded it (`recordSubtreeCall`,
+// lowerdriver.bit), which for `mid<i64>` is `mid(v)` INSIDE `outer`'s body, so
+// both spans of the diagnostic land in a template the user did not write; and
+// `bit check compiler` went 3.9s -> 9.3s, since every check would then run the
+// whole monomorphization closure. Walking from the instantiation keeps the
+// primary span on the user's own call, which is the only line they can change.
+//
+// What is followed is what Pass A1 follows: `subtreeCallNodes` over the callee
+// body (lowerdriver.bit, the same walk `recordSubtreeInstantiations` uses) with
+// the same `genericTypeArgs` / `methodTypeArgsRaw` resolution, so this cannot
+// judge a call the emitted body does not name.
+//
+// Only the CALL rule descends. The other rules in `validateinst.bit` still see
+// one level, so a bad interpolation two generics deep (E0073) is still the
+// lowerer's to refuse — a real remaining gap, stated rather than implied
+// (#4685).
+// How many generic bodies deep the chain is followed. `outer -> mid -> inner`
+// is two, and no chain in the corpus or in the compiler comes near eight.
+//
+// A cap is required, not merely prudent: polymorphic recursion (`f<T>` calling
+// `f<Box<T>>`) has no finite monomorphization, which is why Pass A1 carries
+// `closureBudget` for the same walk. Running out stops the descent and leaves
+// the lowerer's refusal as the backstop, exactly as before this existed.
+fn vInstMaxChain(): int { return 8 }
+
+// One link of that chain: a generic call standing in the body of the template
+// above it. The span is resolved HERE rather than kept as a node, because the
+// chain can cross modules and `vSpan` reads the owning module's own file table.
+// `mod`/`decl` identify the callee for the cycle guard.
+class InstLink {
+  span: Span,
+  name: string,
+  mod: int,
+  decl: int,
+}
+
+// What one step of the walk carries: the bindings in force for the body being
+// scanned, the user's own call site every diagnostic is attributed to, and the
+// chain that leads from that site to here. A class rather than three more
+// parameters (E0202, spec/LINT.md §5.2).
+class InstStep {
+  env: TypeEnv,
+  site: Span,
+  notes: []InstLink,
+}
+
+// One call node: judged against the callee's declared bound, then followed into
+// the callee's body.
+fn vInstCallAt(c: Checker, node: int, step: InstStep) {
+  let tag = getNode(c.tree, kidsOf(c.tree, node)[0]).tag // [callee, gargs, args]
+  if (tag == Tag.Ident) {
+    vInstCallFree(c, node, step)
+    return
+  }
+  if (tag == Tag.Member) {
+    vInstCallMethod(c, node, step)
+  }
+}
+
+// The free-function arm. `genericTypeArgs` is the pair `recordCallInstantiation`
+// (checkproject.bit) records the entry with, so what is judged IS the entry Pass
+// A2 will emit rather than a second resolution that could disagree with it.
+fn vInstCallFree(c: Checker, node: int, step: InstStep) {
+  let callee = kidsOf(c.tree, node)[0]
+  let name = nodeText(c.tree, c.source, callee)
+  if (shadowedByValue(c, callee, name) || !isGenericFuncAt(c, callee, name)) {
+    return
+  }
+  let fr = funcRefAt(c, callee, name)
+  let at = InstCallRef{ fr: fr, name: name, node: node, start: 0 }
+  vInstJudgeCall(c, at, genericTypeArgs(c, name, node), step)
+}
+
+// The generic-METHOD arm (#4656) — `vGenericBoundMethod`'s resolution
+// (validategeneric.bit), read under this instantiation's `env`.
+//
+// The free arm above returns at `tag != Tag.Ident`, so `b.mk(v)` with
+// `mk<T: Named>` was judged by nothing and stayed the lowerer's E0092 inside
+// `Box.mk`'s body — exactly the gap #4634 closed for the DIRECT case, one level
+// down and per instantiation.
+//
+// The RECEIVER's type goes through `substType` before the method is resolved:
+// inside `fn outer<T>()`, `let b = Container<T>{}` types `b` as
+// `Container<T>`, and only the substituted `Container<i64>` names a receiver
+// with a method table. That is `recordMethodInstantiation`'s own step
+// (checkproject.bit, its `genEnv` argument), so the receiver this resolves
+// against is the one the ledger resolved against.
+//
+// A `Tag.Member` callee is not necessarily a method call: `ns.f(...)` names an
+// imported free function, `Enum.Variant(...)` constructs, and an interface
+// method has no FuncDecl. `vInstMemberSkip` rejects the first two by receiver
+// shape and `fr.decl == 0` covers the rest.
+//
+// Only the method's OWN type params are judged. The declaration's list is
+// MERGED, the receiver class's parameters in front of its own (parserdecl), and
+// the receiver's half is bound from the receiver TYPE rather than from anything
+// this call wrote — a violation there belongs to whatever built the receiver.
+fn vInstCallMethod(c: Checker, node: int, step: InstStep) {
+  let mk = kidsOf(c.tree, kidsOf(c.tree, node)[0]) // callee = [recv, name]
+  if (vInstMemberSkip(c, mk[0])) {
+    return
+  }
+  let rawRecv = checkExprType(c, mk[0])
+  if (rawRecv == 0) {
+    return
+  }
+  let subRecv = substType(c, rawRecv, step.env, 0)
+  if (subRecv == 0) {
+    return // no decidable receiver: nothing to resolve the method against
+  }
+  let recvTy = methodRecvType(c, subRecv)
+  let name = nodeText(c.tree, c.source, mk[1])
+  let fr = methodRefAt(c, recvTy, name)
+  if (fr.decl == 0 || methodOwnGenericCount(fr.owner, fr.decl) == 0) {
+    return // not a method call, or no type params of its own to judge
+  }
+  let start = len(vDeclTypeParams(fr)) - methodOwnGenericCount(fr.owner, fr.decl)
+  let at = InstCallRef{ fr: fr, name: name, node: node, start: start }
+  vInstJudgeCall(c, at, methodTypeArgsRaw(c, fr, recvTy, node), step)
+}
+
+// One judged call: the resolved callee, what to name it in the message, and the
+// node its note points at. Bundled rather than passed positionally because the
+// two arms above differ in three of the four and `vInstJudgeCall` would
+// otherwise sit past `max-params` (E0202, spec/LINT.md §5.2). The instantiation
+// site lives on `InstStep`, since it is the same for every call on a chain.
+//
+// `start` is the first type parameter THIS call is responsible for: 0 for a
+// free function, and for a method the tail of the merged list, exactly as
+// `vBoundLoop`'s own `start` (validategeneric.bit).
+class InstCallRef {
+  fr: FuncRef,
+  name: string,
+  node: int,
+  start: int,
+}
+
+// `args[start:]` against `tps[start:]`, reported at the INSTANTIATION's call
+// site — `vBoundLoop`'s loop with `vInstBadCallArg` in place of
+// `vArgViolatesBound`, since here each argument must first be substituted under
+// this instantiation's bindings.
+//
+// `genericTypeArgs` and `methodTypeArgsRaw` both build exactly one entry per
+// declared type parameter, so a length mismatch means the pairing is not
+// trustworthy and nothing is judged rather than something guessed —
+// `vBoundLoop`'s rule, for the same reason.
+fn vInstJudgeCall(c: Checker, at: InstCallRef, raw: []int, step: InstStep) {
+  let tps = vDeclTypeParams(at.fr)
+  if (len(raw) != len(tps)) {
+    return
+  }
+  let bad = false
+  let i = at.start
+  while (i < len(tps)) {
+    let sub = vInstBadCallArg(c, at.fr.owner, tps[i], raw[i], step.env)
+    if (sub != 0) {
+      let bound = vBoundIfaceOf(at.fr.owner, tps[i])
+      vInstReportCallBound(c, at.name, sub, bound, step.site)
+      vInstNoteChain(c, at, step)
+      bad = true
+    }
+    i = i + 1
+  }
+  // A broken bound stops the descent, for `vInstBoundsViolated`'s reason: the
+  // body below is entitled to rely on the promise this call just broke, so
+  // every judgement made inside it would be a second diagnostic for one cause.
+  if (!bad) {
+    vInstDescend(c, at, raw, step)
+  }
+}
+
+// The chain of notes under the primary span: one per call from the user's own
+// instantiation down to the call that broke the bound.
+//
+// At depth 0 `notes` is empty and this emits exactly the one note #4646 emitted,
+// in the same words — which is what keeps the depth-1 fixtures byte-identical.
+fn vInstNoteChain(c: Checker, at: InstCallRef, step: InstStep) {
+  let encl = ""
+  let i = 0
+  while (i < len(step.notes)) {
+    vInstCallNote(c, step.notes[i].span, step.notes[i].name, encl)
+    encl = step.notes[i].name
+    i = i + 1
+  }
+  vInstCallNote(c, vSpan(c, at.node), at.name, encl)
+}
+
+// One note of that chain. The first link stands in the body of the very
+// instantiation the primary span names; every link below it stands in the body
+// of the callee the link above named, and saying which one is the only way the
+// reader can follow a chain of template bodies they did not write.
+fn vInstCallNote(c: Checker, span: Span, name: string, encl: string) {
+  if (encl == "") {
+    note(c.diags, span, "'${name}' is called here, in the body emitted for this instantiation")
+    return
+  }
+  note(c.diags, span, "'${name}' is called here, in the body emitted for '${encl}'")
+}
+
+// Follow a judged call into the callee's own body, under the arguments this
+// instantiation binds it with (#4657).
+//
+// The walk is Pass A1's: `subtreeCallNodes` over the body (lowerdriver.bit),
+// the same nodes `recordSubtreeInstantiations` records from, with the callee
+// checker in hand so every node, name and span is read from the tree that owns
+// it. What differs from Pass A1 is deliberate: the bindings are applied through
+// `substType`/`genericEnvOf` rather than by rebinding the flat `userTypes`,
+// because a validation pass must not mutate the checker state the pass after it
+// reads, and every other rule in this file is env-based for the same reason.
+//
+// Two hard stops, both of them load-bearing rather than defensive: the chain
+// length (`vInstMaxChain`), and a callee already ON the chain, which is what a
+// recursive or mutually recursive generic is. Either one stops the descent and
+// nothing else — the call itself was already judged above.
+fn vInstDescend(c: Checker, at: InstCallRef, raw: []int, step: InstStep) {
+  if (len(step.notes) >= vInstMaxChain() || vInstOnChain(step.notes, at.fr)) {
+    return
+  }
+  let body = kidsOf(at.fr.owner.tree, at.fr.decl)[5]
+  let args = vInstSubstArgs(c, raw, step.env)
+  if (body == 0 || len(args) == 0) {
+    return
+  }
+  let next = InstStep{
+    env: genericEnvOf(at.fr.owner, at.fr.decl, args),
+    site: step.site,
+    notes: append(
+      step.notes,
+      InstLink{
+        span: vSpan(c, at.node), name: at.name,
+        mod: at.fr.owner.moduleId, decl: at.fr.decl,
+      },
+    ),
+  }
+  for n of subtreeCallNodes(at.fr.owner.tree, body) {
+    vInstCallAt(at.fr.owner, n, next)
+  }
+}
+
+// Is this callee already on the chain? A generic that calls itself — directly or
+// round a cycle — would otherwise be re-entered until the length cap, doing the
+// same work at every level and reporting the same violation once per level.
+// Stopping is not a lost diagnostic: the first visit judged the call.
+fn vInstOnChain(notes: []InstLink, fr: FuncRef): bool {
+  let i = 0
+  while (i < len(notes)) {
+    if (notes[i].mod == fr.owner.moduleId && notes[i].decl == fr.decl) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// EVERY type argument of one call, substituted under the bindings in force — or
+// an EMPTY list, meaning DO NOT DESCEND.
+//
+// All-or-nothing, unlike `vInstSubstArg` above: that one decides whether a
+// single argument can be JUDGED, while this one builds the env the callee's
+// whole body is read under, and a partial env would type that body against a
+// mixture of one instantiation's arguments and another's rigid parameters. An
+// already-concrete argument is kept in the list (it is not re-judged —
+// `vInstBadCallArg` still skips it), because the callee's body needs its
+// binding all the same.
+//
+// A call NONE of whose arguments mentioned a type param is refused, and that is
+// the no-double-report rule one level up, not an optimisation: such a call binds
+// the same arguments in every monomorphization of the body it stands in, so the
+// check pass already recorded it as a ledger entry of its own and
+// `validateInstantiations` judges it — and walks its body — separately.
+// `slotMid()` standing in a generic body, whose empty variadic slot binds `()`
+// whatever the enclosing generic was instantiated with, is exactly that shape:
+// descending into it reported the identical E0051 twice, at two different spans.
+fn vInstSubstArgs(c: Checker, raw: []int, env: TypeEnv): []int {
+  let out = []int(0)
+  let bound = false
+  let i = 0
+  while (i < len(raw)) {
+    let sub = substType(c, raw[i], env, 0)
+    if (raw[i] == 0 || sub == 0 || vMentionsInvalid(c, sub, 0) || vHasTypeParam(c, sub, 0)) {
+      return []int(0)
+    }
+    if (vHasTypeParam(c, raw[i], 0)) {
+      bound = true
+    }
+    out = append(out, sub)
+    i = i + 1
+  }
+  if (!bound) {
+    return []int(0)
+  }
+  return out
+}
+
+// The substituted argument when it VIOLATES the type parameter's bound, else 0.
+//
+// `oc` declares the callee, so `tp` and its constraint nodes index `oc.tree`
+// (`vBoundIfaceOf`'s rule). The argument-side guards are `vInstConcreteType`'s,
+// applied to a TYPE rather than to an expression: judge only what the sweep set
+// aside (an argument mentioning a type param — an already-concrete one was
+// decided by E0051 on the body and re-deciding it would double-report) and only
+// a substitution that is fully concrete.
+//
+// The bound side is `vBoundIsJudgeable` + `vSatisfies` rather than
+// `vArgViolatesBound`, for #4633's reason: `vBoundJudgeable`'s `arg != voidId`
+// clause exists to stop an inference GAP becoming a false E0051, and the `()`
+// an empty variadic slot produces is not a gap standing in for something else —
+// it is the argument the ledger records and Pass A2 emits against. A gap cannot
+// reach here in its place: an un-inferred argument is `0` or a bare `voidId`,
+// and neither mentions a type param, so both are skipped above.
+fn vInstBadCallArg(c: Checker, oc: Checker, tp: int, rawArg: int, env: TypeEnv): int {
+  let sub = vInstSubstArg(c, rawArg, env)
+  if (sub == 0) {
+    return 0
+  }
+  let bound = vBoundIfaceOf(oc, tp)
+  if (!vBoundIsJudgeable(c, bound) || vSatisfies(c, sub, bound)) {
+    return 0
+  }
+  return sub
+}
+
+// A type argument the sweep set aside, substituted under this instantiation's
+// bindings — or 0 when nothing decidable comes out of it. `vInstConcreteType`'s
+// guard sequence, entered from a TYPE instead of from an expression node.
+fn vInstSubstArg(c: Checker, rawArg: int, env: TypeEnv): int {
+  if (rawArg == 0 || !vHasTypeParam(c, rawArg, 0)) {
+    return 0
+  }
+  let sub = substType(c, rawArg, env, 0)
+  if (sub == 0 || sub == rawArg || vMentionsInvalid(c, sub, 0) || vHasTypeParam(c, sub, 0)) {
+    return 0
+  }
+  return sub
+}
+
+// E0051's text, addressed to the instantiation rather than to a written type
+// argument: the user wrote no `<...>` at `site`, so the message names the
+// generic whose bound broke instead of an argument index they cannot see.
+// `vSatisfyReason` is E0041's own renderer, the same one `vReportBound` uses,
+// so the two spellings of E0051 cannot drift.
+fn vInstReportCallBound(c: Checker, name: string, sub: int, bound: int, site: Span) {
+  let hint = vSatisfyReason(c, sub, bound)
+  if (hint == "") {
+    hint = "check the interface's method set against this type"
+  }
+  report(
+    c.diags, ecMissingMethod, site,
+    "this instantiation calls '${name}' with '${typeName(c.ctx, sub)}', which does not satisfy the bound '${typeName(
+      c.ctx,
+      bound,
+    )}'",
+    hint,
+  )
+}
+
+// ---- the user's own call, found by walking UP the ledger (#4684) -----------
+
+// Where a ledger entry's diagnostics belong, and the trail of generic bodies
+// between there and this entry's own body.
+//
+// `Instantiation.site` is the call node that RECORDED the entry, and for a call
+// standing inside a generic body that node is a line in a template. `slotMid()`
+// inside `fn viaSlot<T>(v: T)` binds `T = ()` whatever `viaSlot` is instantiated
+// with (#4597/#4633), so the check pass records `slotMid<()>` as an entry of its
+// own (`recordCallInstantiation`, checkproject.bit) carrying a site the reader
+// cannot edit — and `vInstJudgeCall`'s E0051 then named two spans, both inside
+// templates, and never `viaSlot(7)` (#4684).
+//
+// This is the reverse edge, COMPUTED rather than stored: an entry recorded from
+// inside a generic body has a site lying inside the instantiated BODY of some
+// other ledger entry, and an enclosing entry existing IS the condition under
+// which a user-reaching call exists at all. When the enclosing generic was never
+// instantiated there is no such entry, the walk stops at once, `notes` is empty
+// and the entry keeps its own site — byte for byte the behaviour before this.
+//
+// The hop leaves the same `InstLink` the descent leaves, so `vInstNoteChain`
+// renders one chain however each link was found, and `vInstOnChain` stops the
+// descent from re-entering a body the chain already stands inside.
+//
+// The cap is `vInstMaxChain`, for its own reason: nothing bounds a ledger chain
+// a priori, and stopping early leaves a site further in than the user's call —
+// which is what the pass reported for every entry before this existed.
+fn vInstOrigin(c: Checker, idx: int, origin: []int, env: TypeEnv): InstStep {
+  let notes = []InstLink(0)
+  let at = idx
+  let hops = 0
+  while (hops < vInstMaxChain() && at < len(origin) && origin[at] >= 0) {
+    notes = vInstPushLink(vInstOriginLink(c.ctx.instantiations[at]), notes)
+    at = origin[at]
+    hops = hops + 1
+  }
+  return InstStep{ env: env, site: c.ctx.instantiations[at].site, notes: notes }
+}
+
+// One hop as a chain link: the call that recorded this entry, and the callee it
+// named. `mod`/`decl` are the cycle guard's, and name the callee's declaration
+// exactly as `vInstDescend`'s own links do.
+fn vInstOriginLink(inst: Instantiation): InstLink {
+  return InstLink{
+    span: inst.site, name: vInstPlainName(inst.name),
+    mod: inst.declModule, decl: inst.decl,
+  }
+}
+
+// The ledger name with a generic METHOD's `$t<recvTypeId>` suffix cut
+// (`methodRefAt`, checklookup.bit). A note prints the name the reader wrote; a
+// Bit identifier cannot contain `$`, so the first one starts the suffix and
+// there is nothing else it could be.
+fn vInstPlainName(name: string): string {
+  let i = 0
+  while (i < len(name)) {
+    if (name[i] == '$') {
+      return name[0:i]
+    }
+    i = i + 1
+  }
+  return name
+}
+
+// `link` in front of `rest`. The walk finds the chain innermost-first and
+// `vInstNoteChain` renders it outermost-first; `vInstMaxChain` caps the length
+// at eight, so the copy is bounded.
+fn vInstPushLink(link: InstLink, rest: []InstLink): []InstLink {
+  let out = [link]
+  let i = 0
+  while (i < len(rest)) {
+    out = append(out, rest[i])
+    i = i + 1
+  }
+  return out
+}
+
+// For every ledger entry, the index of the entry whose instantiated BODY its
+// call site stands inside — or -1 for an entry recorded from a call the user
+// wrote. Parallel to `ctx.instantiations`.
+//
+// Built ONCE per pass, not once per entry: each body span costs one `vSpan`, and
+// the quadratic half is then integer comparison that never touches a tree.
+//
+// The FIRST enclosing entry wins. Every instantiation of one enclosing generic
+// holds the same body span, and the entry inside it arises in all of them, so
+// naming one is `Instantiation.site`'s own contract — a representative call
+// site, not an exhaustive list.
+fn vInstOriginTable(c: Checker): []int {
+  let bodies = []Span(0)
+  let i = 0
+  while (i < len(c.ctx.instantiations)) {
+    bodies = append(bodies, vInstBodySpan(c, c.ctx.instantiations[i]))
+    i = i + 1
+  }
+  let out = []int(0)
+  let j = 0
+  while (j < len(bodies)) {
+    out = append(out, vInstEnclosingOf(bodies, c.ctx.instantiations[j].site, j))
+    j = j + 1
+  }
+  return out
+}
+
+// The first body other than `self`'s that holds `site`, or -1.
+fn vInstEnclosingOf(bodies: []Span, site: Span, self: int): int {
+  let i = 0
+  while (i < len(bodies)) {
+    if (i != self && vInstSpanHolds(bodies[i], site)) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// The resolved span of an entry's declared body, or an EMPTY span when the entry
+// names no body reachable from here — `vInstSpanHolds` reads an empty span as
+// holding nothing, so an unreachable declaration simply encloses nothing rather
+// than needing a second return channel.
+//
+// `declModule` and not `module`: those two are the same for every ordinary
+// generic and are NOT for a `jsonDecode<C>` entry retargeted at a synthesized
+// specialisation (#4563, check.bit), and `decl` indexes the former's tree.
+fn vInstBodySpan(c: Checker, inst: Instantiation): Span {
+  if (inst.declModule < 0 || inst.declModule >= len(c.mods)) {
+    return pointSpan(0, 0)
+  }
+  let oc = c.mods[inst.declModule]
+  if (inst.decl <= 0 || inst.decl >= len(oc.tree.nodes)) {
+    return pointSpan(0, 0)
+  }
+  let kids = kidsOf(oc.tree, inst.decl) // [recv, name, generics, params, result, body]
+  if (len(kids) < 6 || kids[5] == 0) {
+    return pointSpan(0, 0)
+  }
+  return vSpan(oc, kids[5])
+}
+
+// Does `at` start inside `outer`? Both are RESOLVED spans — a file id and an
+// offset within that file (`vSpan`) — so this is valid across modules, which the
+// raw tree offsets a checker holds are not: two modules' trees number their
+// bytes from zero independently.
+fn vInstSpanHolds(outer: Span, at: Span): bool {
+  return outer.end > outer.start &&
+    at.file == outer.file &&
+    at.start >= outer.start &&
+    at.start < outer.end
+}
