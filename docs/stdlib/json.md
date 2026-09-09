@@ -652,9 +652,17 @@ the reading half of the `toJson()` that mark synthesises. The compiler
 specialises it per call from the same field list and the same key rules, so
 the two halves agree by construction rather than by review.
 
-The generic `Json` DOM costs one heap object per node. A typed decode lands
-the fields in the class and the DOM objects stop existing, which is the whole
-point of the feature.
+There are two entry points and the difference between them is measured, not
+stylistic. `jsonDecode<T>` takes a `Json`, so the DOM is built and the class
+objects are added on top of it; `jsonDecodeText<T>` takes the TEXT and drives
+the parser's cursor straight into the fields, so no `Json` exists at any
+point. On 50,000 records of `{"id":N,"name":"userN","active":true,"tags":
+[1,2,3]}`, objects allocated per record: `jsonParse` alone 25.0, `jsonParse` +
+`jsonDecode` 45.0, `jsonDecodeText` **6.0**.
+
+Reach for `jsonDecode` when you already hold a `Json` — something inspected or
+routed the document first. Reach for `jsonDecodeText` when you hold the bytes,
+which is what a request handler holds.
 
 ```bit
 import { jsonParse, jsonDecode, Json, JsonEntry } from "std/json"
@@ -693,6 +701,41 @@ A key that is absent and a key present as `null` both decode an `Option<T>` to
 `None`, and both are a missing key for a field that is not one. `@json` writes
 an absent `Option` as an explicit `null`, so what it emits decodes back, and a
 producer that omits the key instead is just as well-formed.
+
+### `jsonDecodeText<T>(src: string): T!`
+
+Decodes the JSON text `src` into `T`, which must be a class carrying `@json`,
+**without building a `Json`**. Specialised per call exactly as `jsonDecode<T>`
+is, from the same field list and the same key rules, and refusing a `T` that
+does not carry `@json` at compile time (`E0145`).
+
+```bit
+import { jsonDecodeText, Json, JsonEntry } from "std/json"
+
+@json class Profile {
+  id: i64,
+  tags: []string,
+}
+
+fn loadProfile(body: string): Profile! {
+  return jsonDecodeText<Profile>(body)?
+}
+```
+
+The errors are the same errors: the same `JsonDecodeError`, the same four
+causes, the same full dotted path. A document that is not well-formed JSON
+fails with the positional parse error `jsonParse` would have produced, and
+anything after the decoded value is `trailing garbage after value`.
+
+**One difference, and it is inherent to reading forward.** A single pass
+reports the first fault in DOCUMENT order. `jsonDecode` reads a whole object
+before it decodes anything, so it reports an unknown key ahead of a type error
+in an earlier field, and a missing key ahead of both. Given a document with two
+faults the two entry points can name different ones — each a real fault, with
+the same message and the same path.
+
+`jsonDecodeText` is strict RFC 8259, like `jsonParse`: no comments and no
+trailing commas. There is no JSONC form of it.
 
 ### `JsonDecodeCause`
 
@@ -840,3 +883,118 @@ has: a `[]T` is a level of nesting whether or not `T` is a class.
 The entries of a `map<string, T>` field's object. Distinct from
 `jsonDecObject` only in the caller's intent -- a map has no known key set, so
 nothing checks its keys against one.
+
+## Text-decoding primitives
+
+The named functions the compiler's synthesised **text** decoder is written in
+terms of, exported for the same reason the DOM ones are: the generated code
+lives in the caller's module and calls them by name. They are also a usable API
+for a hand-written streaming decoder over a shape `@json` does not cover.
+
+They form a protocol with a position in it, and calling them out of order is a
+programming error rather than a document error: enter a container, then step
+through its members or elements, reading exactly one value per step.
+
+### `JsonReader`
+
+The forward cursor over one document. Opaque: it carries the lexer, the
+member-step budget, and the span of the object key under the cursor. Build one
+with `jsonTextReader` and pass it down; nothing else constructs it.
+
+### `jsonTextReader(src: string): JsonReader`
+
+A reader positioned on `src`'s first token.
+
+### `jsonTextFinish(r: JsonReader): ()!`
+
+Refuses anything but whitespace after the decoded value, with `jsonParse`'s own
+`trailing garbage after value`.
+
+### `jsonTextObject(r: JsonReader, path: string, depth: i64): ()!`
+
+Enters the object under the cursor, failing with `TypeMismatch` when the value
+is not an object and with `MaxDepth` when `depth` has reached
+`jsonMaxDecodeDepth`. `depth` is the number of levels already entered.
+
+### `jsonTextArray(r: JsonReader, path: string, depth: i64): ()!`
+
+The same for an array: a `[]T` is a level of nesting whether or not `T` is a
+class.
+
+### `jsonTextKey(r: JsonReader, n: i64): bool!`
+
+Advances to the `n`th member's value, recording its key on the reader, and
+answers whether there was one — false when the object closed instead. `n` is
+the member's ordinal within this object, which is what distinguishes the first
+member from one that must be preceded by a `,`.
+
+### `jsonTextItem(r: JsonReader, i: i64): bool!`
+
+The array twin: true when an element follows, false when the array closed.
+
+### `jsonTextKeyIs(r: JsonReader, key: string): bool`
+
+Whether the current member's key is `key`. Compares the source bytes in place
+for an escape-free key, so trying each of a class's keys in turn allocates
+nothing.
+
+### `jsonTextKeyText(r: JsonReader): string`
+
+The current member's key as a string. This is the one call that materialises a
+key, so use it where the key is data — a `map<string, T>`'s key — or where a
+failure is already being built.
+
+### `jsonTextUnknown(r: JsonReader, path: string): ()!`
+
+Fails with `UnknownKey` naming the current member's key. A dropped field and an
+accepted field are indistinguishable to whoever sent the document, so an
+unclaimed key is reported rather than skipped.
+
+### `jsonTextNull(r: JsonReader): bool`
+
+Consumes an explicit `null` under the cursor and answers whether it did. A
+non-`Option` field left unset by one is a missing key; an `Option` left unset is
+`None` — the same pair `jsonDecMember` and `jsonDecOptMember` fold together.
+
+### `jsonTextNeed(seen: bool, path: string, key: string): ()!`
+
+Fails with `MissingKey` at `path`.`key` when `seen` is false. The check a
+non-`Option` field owes after its object has been walked, since a forward pass
+cannot know a key is absent until the object closes.
+
+### `jsonTextIntKey(r: JsonReader, path: string, key: string): i64!`
+
+The integer under the cursor, consumed. Accepts only an integer literal: a
+field declared as an integer that silently truncated `1.5` would be a wrong
+answer rather than a rejected document. Builds `jsonDecPath(path, key)` only
+when it fails.
+
+### `jsonTextIntIndex(r: JsonReader, path: string, i: i64): i64!`
+
+The same for an array element, reporting `jsonDecIndex(path, i)`.
+
+### `jsonTextFloatKey(r: JsonReader, path: string, key: string): f64!`
+
+The number under the cursor, consumed. Accepts an integer literal too: `3` and
+`3.0` are the same document to every producer on the wire.
+
+### `jsonTextFloatIndex(r: JsonReader, path: string, i: i64): f64!`
+
+The same for an array element.
+
+### `jsonTextBoolKey(r: JsonReader, path: string, key: string): bool!`
+
+The boolean under the cursor, consumed.
+
+### `jsonTextBoolIndex(r: JsonReader, path: string, i: i64): bool!`
+
+The same for an array element.
+
+### `jsonTextStringKey(r: JsonReader, path: string, key: string): string!`
+
+The string under the cursor, consumed, with every RFC 8259 escape decoded. An
+escape-free string is a direct slice of the source rather than a copy.
+
+### `jsonTextStringIndex(r: JsonReader, path: string, i: i64): string!`
+
+The same for an array element.
