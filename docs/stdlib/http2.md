@@ -727,6 +727,23 @@ SETTINGS_MAX_HEADER_LIST_SIZE is defined on the *uncompressed* field list (name
 rather than matching the advertised number exactly. As with `maxBodyBytes` there
 is no value meaning "unlimited": `0` refuses every header block.
 
+This limit too runs in both directions. The peer's own advertised
+SETTINGS_MAX_HEADER_LIST_SIZE bounds the header lists *this* endpoint sends: a
+`roundTrip` whose request exceeds it fails locally, before a stream is opened
+and before anything reaches the wire, with a message naming both the size
+measured and the limit; a `serve` handler whose response exceeds it has no
+caller to fail, so that stream is reset with `errorInternalError` and the block
+is never encoded. Neither refusal drops header fields to fit.
+
+What is compared there is the *uncompressed* list the RFC defines - name + value
++ 32 per field - and not the encoded octets `maxHeaderListBytes` counts, because
+that is the accounting the peer itself applies. The two differ in both
+directions, so they are not interchangeable: Huffman coding can push an encoded
+block above the list it decodes to, and the dynamic table can pull a repeated
+block far below it. A peer that advertises nothing imposes no limit, which is
+what the parameter's absence means on the wire; `0` from a peer is a limit of
+zero, meaning it will accept no header list at all.
+
 `maxBodyBytes` is the most DATA one stream may accumulate. A frame that would
 take a stream's buffered body past it is refused before those bytes are
 appended, and the stream is reset with `errorEnhanceYourCalm` (RFC 9113 §7); the
