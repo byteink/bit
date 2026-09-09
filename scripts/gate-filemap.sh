@@ -288,6 +288,11 @@ gates_for_file() {
     _tests_/bit/releasesurface/*) printf 'test-release-surface\n'; return 0 ;;
     _tests_/bit/rootabi/*) printf 'test-rootabi\n'; return 0 ;;
     _tests_/bit/rootpins/*) printf 'test-rootpins\n'; return 0 ;;
+    # #4623 split this from a single file (_tests_/bit/shebangmode.bit, 796
+    # lines) to a directory module — its self-tests needed a sibling, and a
+    # single-file gate target never loads one (#4441), the same shape as
+    # _tests_/bit/stringexplode/* below.
+    _tests_/bit/shebangmode/*) printf 'test-shebang-mode\n'; return 0 ;;
     _tests_/bit/spec/*) printf 'test-spec\n'; return 0 ;;
     # test-stress-batch deliberately excluded — see the header comment above
     # gates_for_file() (#3319/#3309).
