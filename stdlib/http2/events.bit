@@ -145,12 +145,17 @@ fn h2connApplySetting(st: h2connState, id: int, value: int) {
     st.peerMaxConcurrentStreams = value
     return
   }
-  // ENABLE_PUSH / MAX_HEADER_LIST_SIZE: accepted, no-op. ENABLE_PUSH because
-  // this engine never pushes, so a peer forbidding or permitting push changes
-  // nothing we do; MAX_HEADER_LIST_SIZE because it is advisory (RFC 9113 §6.5.2)
-  // and this engine's own header blocks are bounded by what it encodes.
-  // MAX_CONCURRENT_STREAMS was in this list until #4595 and is not that kind of
-  // parameter: it is a limit on what WE may do, not on what we tolerate.
+  if (id == settingsMaxHeaderListSize) {
+    st.peerMaxHeaderListBytes = value
+    return
+  }
+  // ENABLE_PUSH: accepted, no-op, because this engine never pushes — a peer
+  // forbidding or permitting push changes nothing we do. It is the only
+  // parameter left in that class. MAX_CONCURRENT_STREAMS left it in #4595 and
+  // MAX_HEADER_LIST_SIZE in #4607, both for the same reason: a limit on what WE
+  // may do is not a limit on what we tolerate, and shelving one only moves the
+  // refusal onto the wire, where it arrives as a GOAWAY or an RST_STREAM the
+  // caller cannot connect to its own headers.
 }
 
 fn h2connOnHeaders(st: h2connState, f: Frame) {
@@ -603,6 +608,27 @@ fn h2connCmdOpen(st: h2connState, cmd: h2connCmd) {
     }
     return
   }
+  // RFC 9113 §6.5.2: the peer's SETTINGS_MAX_HEADER_LIST_SIZE is what it will
+  // accept from us, so a request over it is refused here rather than encoded
+  // and sent (#4607). Same position as the concurrency check above and for the
+  // same reason: before an id is spent and before a table entry exists, so a
+  // caller whose own headers are the problem is told that, instead of waiting
+  // out a round trip the peer answers with RST_STREAM or GOAWAY.
+  //
+  // The fields are built once and handed to the encoder below, so the check
+  // costs the walk and not a second `h2connRequestFields`. It always walks:
+  // `peerMaxHeaderListBytes` is 2^32-1 until the peer names a limit, which
+  // keeps this one comparison rather than a branch on whether a limit exists.
+  let fields = h2connRequestFields(cmd.request)
+  let listSize = h2connHeaderListSize(fields)
+  if (listSize > st.peerMaxHeaderListBytes) {
+    cmd.replyCh <- h2connMsg{
+      ok: false,
+      response: h2connZeroResponse(),
+      errMsg: h2connHeaderListMsg(listSize, st.peerMaxHeaderListBytes),
+    }
+    return
+  }
   let id = st.nextStreamId
   st.nextStreamId = st.nextStreamId + 2
   let hasBody = len(cmd.request.body) > 0
@@ -616,7 +642,7 @@ fn h2connCmdOpen(st: h2connState, cmd: h2connCmd) {
   st.present[id] = 1
   st.activeStreams = st.activeStreams + 1
 
-  let block = st.enc.encode(h2connRequestFields(cmd.request))
+  let block = st.enc.encode(fields)
   h2connSendHeaderBlock(st, id, block, !hasBody)
   if (hasBody) {
     s.pendingData = cmd.request.body
@@ -640,8 +666,29 @@ fn h2connCmdRespond(st: h2connState, cmd: h2connCmd) {
     h2connCloseStream(st, s)
     return
   }
+  // The same limit on the other side of the connection (#4607). There is no
+  // caller to fail here — a server stream's `replyCh` is `h2connDummyReply()`
+  // and the handler has already returned — so the stream is reset instead, and
+  // the message reaches whoever reads the reset rather than a `roundTrip`.
+  //
+  // INTERNAL_ERROR, not PROTOCOL_ERROR or REFUSED_STREAM: the peer's framing is
+  // legal and its request was processed. What failed is this endpoint producing
+  // a response the peer told us it will not accept, which is a handler bug and
+  // is what §7's INTERNAL_ERROR says. A stream error rather than a connection
+  // one, because nothing about the connection or any other stream is wrong.
+  let fields = h2connResponseFields(cmd.response)
+  let listSize = h2connHeaderListSize(fields)
+  if (listSize > st.peerMaxHeaderListBytes) {
+    h2connStreamErrorMsg(
+      st,
+      cmd.streamId,
+      errorInternalError,
+      h2connHeaderListMsg(listSize, st.peerMaxHeaderListBytes),
+    )
+    return
+  }
   let hasBody = len(cmd.response.body) > 0
-  let block = st.enc.encode(h2connResponseFields(cmd.response))
+  let block = st.enc.encode(fields)
   h2connSendHeaderBlock(st, cmd.streamId, block, !hasBody)
   if (hasBody) {
     s.pendingData = cmd.response.body
