@@ -62,9 +62,11 @@ fn callers() {
 ## Named arguments
 
 A call may name its arguments instead of relying on position: `name =
-expression`, after any positional arguments. This is only legal for a direct
-call to a named function or method - not through a function value - and each
-parameter may be supplied once, by position or by name. (Spec: §12.11.)
+expression`, after any positional arguments. This is only legal where the
+callee's own declared parameter list is in scope - a free function (bare or
+through a namespace alias), a method, or a class constructor against its
+`init` - and each parameter may be supplied once, by position or by name.
+(Spec: §12.11.)
 
 ```bit
 fn serve(app: string, port: int, tls: bool) {
@@ -97,6 +99,41 @@ fn emitCallers(): string {
   let log = Log{ prefix: "L" }
   let sink: Sink = log
   return log.emit(count = 7, label = "hits") + sink.emit(count = 1, label = "x")
+}
+```
+
+A class constructor takes them against its `init` declaration - the call whose
+bare positional arguments say the least.
+
+```bit
+class Acct {
+  bal: int
+  init(start: int, fee: int) {
+    this.bal = start - fee
+  }
+}
+
+fn openAcct(): int {
+  return Acct(fee = 5, start = 100).bal
+}
+```
+
+A **generic** callee or receiver is positional only, and so is a call through a
+function value, a func-typed field, a builtin, or a type conversion. A generic
+declaration's parameter types still mention its open type parameters, so an
+argument named against one would be checked against `T` itself rather than
+against the type the call instantiates `T` with; for a type-parameter receiver
+the name would also resolve against the constraint interface while the call
+dispatches to the concrete implementation, and an implementation matches an
+interface by type, not by parameter name.
+
+```bit
+fn pick<T>(a: T, b: T): T {
+  return a
+}
+
+fn pickCallers(): int {
+  return pick<i64>(1, 2) // positional; `pick(b = 1, a = 2)` is an error
 }
 ```
 

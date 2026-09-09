@@ -2411,17 +2411,22 @@ the variadic parameter (`...xs: T`, §10.3) is a compile error — it takes zero
 or more arguments, so `xs = v` names no single slot. A `...` spread argument
 may not be combined with a named argument in the same call.
 
-**Direct calls only.** A named argument is legal only where the callee is a
-named function or method whose declaration is in scope — resolving `name`
-needs that declaration's own parameter list. A method resolves against the
-declaration the call site can see: the class's own declaration for a call on
-a class value, and the *interface's* method signature for a call through an
-interface value, since dynamic dispatch is all that call site knows.
+**Direct calls only.** A named argument is legal only where the callee's own
+declared parameter list is in scope for the call site to resolve `name`
+against. That is: a free function or `extern fn` (§11.7), written bare or
+through a namespace alias; a method, on a class receiver, on `this`, or
+through an interface value; and a class constructor (§10.4), which resolves
+against its `init` declaration. A method resolves against the declaration the
+call site can see: the class's own declaration for a call on a class value,
+and the *interface's* method signature for a call through an interface value,
+since dynamic dispatch is all that call site knows.
 
 ```
 log.emit(count = 7, label = "hits")   // class receiver
 sink.emit(count = 7, label = "hits")  // interface receiver, resolved
                                       // against the interface's signature
+geo.label(port = 3000, name = "web")  // namespace alias for a free function
+Acct(fee = 5, start = 100)            // constructor, against 'init'
 ```
 
 A call through a function *value* is positional only:
@@ -2433,6 +2438,30 @@ f(port = 3000)        // error: named arguments need a named callee
 
 `func_type` (§11) is `"(" [ type { "," type } ] ")" "=>" result_type` — types
 only, no parameter names — so there is nothing a name could resolve against.
+The same holds for a func-typed class field, which is a function value reached
+through its owner. A builtin (§5.3) and a type conversion (§12.9) are
+positional only for the same reason: neither declares a parameter list at all.
+
+**Generic callees and receivers are positional only.** A named argument is a
+compile error when the callee is a generic function, when the receiver is a
+generic class or interface, or when the receiver is a type parameter:
+
+```
+pick(b = 1, a = 2)    // error: pick<T> is generic
+box.set(x = 1)        // error: box is a GBox<int>
+shape.area(w = 3)     // error inside fn f<T: Shape>(shape: T)
+```
+
+A generic declaration's parameter *types* still mention its open type
+parameters, so an argument named against one would be checked against `T`
+itself rather than against the type this call instantiates `T` with. A type
+*parameter* receiver has a second reason of its own: the name would resolve
+against the constraint interface's parameter list, while the call is
+dispatched — after the generic is instantiated — to the concrete
+implementation's. An implementation matches an interface by *type*, not by
+parameter name (§14.3), so the two lists may legally disagree, and resolving a
+name against one while placing it by the other would silently fill the wrong
+slot.
 
 **Evaluation order.** Arguments evaluate left to right in the order they are
 *written*, exactly like any other argument list; only their *placement* into
