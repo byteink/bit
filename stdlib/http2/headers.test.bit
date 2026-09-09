@@ -1,0 +1,334 @@
+// stdlib/http2/headers.test.bit — the header-block budget (#4593).
+//
+// #4590 bounded the DATA a stream may accumulate. The header block accumulated
+// on the way to it was still unbounded: `h2connOnHeaders` set `st.contBuf` from
+// the HEADERS fragment and `h2connOnContinuation` appended every CONTINUATION
+// fragment to it with no ceiling, so a peer that sent HEADERS without
+// END_HEADERS and then CONTINUATION forever grew one buffer without limit.
+// `maxFrameSize` bounds each FRAME and says nothing about their sum — the same
+// distinction #4590 had to make between a DATA frame and a body.
+//
+// The first five tests drive the frame handlers directly against a hand-built
+// `h2connState` (`btState`/`btNextWritten` from `events.test.bit`, same flat
+// `std/http2` module, so nothing is imported), with no threads and no
+// transport. That is what makes "the bytes were never accumulated" checkable as
+// `len(st.contBuf)` rather than inferred from a request that did not arrive.
+//
+// The last two run a real `accept()` connection over an in-memory wire, because
+// a budget correct in the handlers and never carried from `Config` into
+// `h2connState` would pass all five of the others — and because the number we
+// advertise as SETTINGS_MAX_HEADER_LIST_SIZE is only checkable on the wire.
+
+// --- frames a peer would send ------------------------------------------------
+
+// A HEADERS frame carrying `block` as its fragment, built through the real codec
+// so the handler sees exactly what the wire would hand it. `endHeaders` false is
+// the case that matters here: it opens a block that CONTINUATION frames extend.
+fn hbHeaders(id: int, block: []byte, endStream: bool, endHeaders: bool): Frame! {
+  return readFrame(hbHeadersWire(id, block, endStream, endHeaders)?, maxMaxFrameSize)?
+}
+
+// The same frame as bytes, for the tests that feed a transport rather than a
+// handler.
+fn hbHeadersWire(id: int, block: []byte, endStream: bool, endHeaders: bool): []byte! {
+  return encodeHeaders(
+    HeadersFrame{
+      streamId: id,
+      blockFragment: block,
+      endStream: endStream,
+      endHeaders: endHeaders,
+      padLength: 0 - 1,
+      hasPriority: false,
+      exclusive: false,
+      streamDependency: 0,
+      weight: 0,
+    },
+  )?
+}
+
+fn hbContinuation(id: int, block: []byte, endHeaders: bool): Frame! {
+  let wire = encodeContinuation(
+    ContinuationFrame{ streamId: id, blockFragment: block, endHeaders: endHeaders },
+  )?
+  return readFrame(wire, maxMaxFrameSize)?
+}
+
+// The pseudo-header set of a `GET /hdr` request plus one `x-big` value of `n`
+// pattern bytes — the shape `_tests_/imports/http2conn`'s `testContinuation`
+// sends, which is what makes the encoded sizes below comparable to the fixture.
+fn hbFields(n: int): []HeaderField {
+  let fs = []HeaderField(0)
+  fs = append(fs, HeaderField{ name: ":method", value: "GET", sensitive: false })
+  fs = append(fs, HeaderField{ name: ":scheme", value: "https", sensitive: false })
+  fs = append(fs, HeaderField{ name: ":authority", value: "example.com", sensitive: false })
+  fs = append(fs, HeaderField{ name: ":path", value: "/hdr", sensitive: false })
+  fs = append(fs, HeaderField{ name: "x-big", value: string(btPattern(n)), sensitive: false })
+  return fs
+}
+
+// `hbFields(n)` as a peer's encoder would put it on the wire. The encoder is
+// deliberately a fresh one and never `st.enc`: the peer's encoder pairs with our
+// `st.dec`, and encoding an inbound block with `st.enc` would insert into a
+// dynamic table `st.dec` never mirrors.
+fn hbBlock(n: int): []byte {
+  let enc = newEncoderConfig(4096, true)
+  return enc.encode(hbFields(n))
+}
+
+// The GOAWAY the loop queued for the peer, or a failure if what it queued was
+// not one.
+fn hbGoaway(st: h2connState): GoawayFrame! {
+  return decodeGoaway(btNextWritten(st)?)?
+}
+
+// --- refused before the append -----------------------------------------------
+
+test "a HEADERS fragment over the header budget is refused before it is stored" {
+  // The initial fragment is bounded only by `maxFrameSize`, which a peer may
+  // negotiate as high as 16777215 — so the first fragment needs the check as
+  // much as the continuations do, and it is checked before `st.contBuf` is
+  // assigned rather than after.
+  let st = btState(false, 1048576)
+  st.maxHeaderListBytes = 4096
+  let f = hbHeaders(1, btPattern(8192), false, false) catch e {
+    assert(false, "building the HEADERS frame failed: ${e.message()}")
+    return
+  }
+  h2connHandleFrame(st, f)
+  assert(len(st.contBuf) == 0, "contBuf = ${len(st.contBuf)} bytes, want 0")
+  assert(st.contStream == 0, "contStream = ${st.contStream}, want 0 (no block opened)")
+  let g = hbGoaway(st) catch e2 {
+    assert(false, "no GOAWAY was queued for the peer: ${e2.message()}")
+    return
+  }
+  assert(
+    g.errorCode == errorEnhanceYourCalm,
+    "GOAWAY code = ${g.errorCode}, want ${errorEnhanceYourCalm} (ENHANCE_YOUR_CALM)",
+  )
+  assert(
+    string(g.debugData) == "http2: header block exceeds 4096 bytes",
+    "GOAWAY does not name the limit: '${string(g.debugData)}'",
+  )
+}
+
+test "the header budget is a running total, not a per-frame cap" {
+  // Two fragments of 3000 bytes at a 4096-byte budget: each is individually
+  // legal and far inside any `maxFrameSize`, so only the accumulation catches
+  // the second. `contBuf` keeps the first 3000 and never grows past the budget.
+  let st = btState(false, 1048576)
+  st.maxHeaderListBytes = 4096
+  let h = hbHeaders(1, btPattern(3000), false, false) catch e {
+    assert(false, "building the HEADERS frame failed: ${e.message()}")
+    return
+  }
+  h2connHandleFrame(st, h)
+  assert(len(st.contBuf) == 3000, "contBuf = ${len(st.contBuf)} bytes, want 3000")
+  let c = hbContinuation(1, btPattern(3000), true) catch e2 {
+    assert(false, "building the CONTINUATION frame failed: ${e2.message()}")
+    return
+  }
+  h2connHandleFrame(st, c)
+  assert(
+    len(st.contBuf) == 3000,
+    "contBuf = ${len(st.contBuf)} bytes, want 3000 — the second fragment was appended",
+  )
+  assert(len(st.contBuf) <= st.maxHeaderListBytes, "contBuf grew past the budget")
+  let g = hbGoaway(st) catch e3 {
+    assert(false, "no GOAWAY was queued for the peer: ${e3.message()}")
+    return
+  }
+  assert(
+    g.errorCode == errorEnhanceYourCalm,
+    "GOAWAY code = ${g.errorCode}, want ${errorEnhanceYourCalm} (ENHANCE_YOUR_CALM)",
+  )
+}
+
+test "a stream of CONTINUATION frames cannot grow the block past the budget" {
+  // The attack itself: HEADERS without END_HEADERS, then CONTINUATION forever.
+  // Twenty 1000-byte fragments at a 4096-byte budget — before the check this
+  // loop grew `contBuf` to 20000 and would have grown it without limit.
+  let st = btState(false, 1048576)
+  st.maxHeaderListBytes = 4096
+  let h = hbHeaders(1, btPattern(1000), false, false) catch e {
+    assert(false, "building the HEADERS frame failed: ${e.message()}")
+    return
+  }
+  h2connHandleFrame(st, h)
+  let i = 0
+  while (i < 19) {
+    let c = hbContinuation(1, btPattern(1000), false) catch e2 {
+      assert(false, "building CONTINUATION ${i} failed: ${e2.message()}")
+      return
+    }
+    h2connHandleFrame(st, c)
+    assert(
+      len(st.contBuf) <= st.maxHeaderListBytes,
+      "contBuf = ${len(st.contBuf)} bytes after ${i} continuations, budget ${st.maxHeaderListBytes}",
+    )
+    i = i + 1
+  }
+  assert(len(st.contBuf) == 4000, "contBuf = ${len(st.contBuf)} bytes, want 4000")
+}
+
+// --- the boundary, from one real block ---------------------------------------
+
+test "a header block of exactly the budget is accumulated and decodes intact" {
+  // One real HPACK block for a 2000-byte header value, split across a HEADERS
+  // and a CONTINUATION, with the budget set to its exact encoded length. The
+  // accepting side of the same comparison the two tests above refuse on.
+  let block = hbBlock(2000)
+  let st = btState(false, 1048576)
+  st.maxHeaderListBytes = len(block)
+  let cut = len(block) / 2
+  let h = hbHeaders(1, block[0:cut], true, false) catch e {
+    assert(false, "building the HEADERS frame failed: ${e.message()}")
+    return
+  }
+  h2connHandleFrame(st, h)
+  let c = hbContinuation(1, block[cut:len(block)], true) catch e2 {
+    assert(false, "building the CONTINUATION frame failed: ${e2.message()}")
+    return
+  }
+  h2connHandleFrame(st, c)
+  let a = <- st.acceptCh
+  assert(!a.stop, "the connection was torn down instead of delivering the request")
+  assert(a.request.path == "/hdr", "path = '${a.request.path}', want '/hdr'")
+  assert(len(a.request.headers) == 1, "headers = ${len(a.request.headers)}, want 1")
+  assert(
+    len(a.request.headers[0].value) == 2000,
+    "x-big is ${len(a.request.headers[0].value)} bytes, want 2000",
+  )
+}
+
+test "a header block one byte over the budget is refused" {
+  // The same block and the same split as the test above, with the budget one
+  // byte lower — so the pair brackets the comparison exactly, and a check that
+  // is off by one on either side fails one of them.
+  let block = hbBlock(2000)
+  let st = btState(false, 1048576)
+  st.maxHeaderListBytes = len(block) - 1
+  let cut = len(block) / 2
+  let h = hbHeaders(1, block[0:cut], true, false) catch e {
+    assert(false, "building the HEADERS frame failed: ${e.message()}")
+    return
+  }
+  h2connHandleFrame(st, h)
+  let c = hbContinuation(1, block[cut:len(block)], true) catch e2 {
+    assert(false, "building the CONTINUATION frame failed: ${e2.message()}")
+    return
+  }
+  h2connHandleFrame(st, c)
+  assert(len(st.contBuf) == cut, "contBuf = ${len(st.contBuf)} bytes, want ${cut}")
+  let g = hbGoaway(st) catch e3 {
+    assert(false, "no GOAWAY was queued for the peer: ${e3.message()}")
+    return
+  }
+  assert(
+    g.errorCode == errorEnhanceYourCalm,
+    "GOAWAY code = ${g.errorCode}, want ${errorEnhanceYourCalm} (ENHANCE_YOUR_CALM)",
+  )
+}
+
+// --- the same budget, carried from `Config` over a real connection -----------
+
+// A live server `Conn` built by `accept()` under `cfg`, plus the wire its peer
+// writes to and reads from. The peer half is driven by hand rather than by a
+// second `Conn`: the refusal here is a CONNECTION error, and a client `Conn`
+// parked in `roundTrip` is not woken by a GOAWAY, so a `Conn` on the far side
+// would be waiting on a reply that this engine never sends.
+//
+// The transport ends are `events.test.bit`'s (`btEnd`/`btRead`/`btWrite`), and
+// the client preface plus an empty SETTINGS are pre-loaded into the buffered
+// channel so `accept` completes its handshake without a second thread.
+class hbWire { toEngine: chan<btChunk>, fromEngine: chan<btChunk> }
+
+fn hbAcceptOn(cfg: Config): (hbWire, Conn)! {
+  let aToB = chan<btChunk>(64)
+  let bToA = chan<btChunk>(64)
+  let serverEnd = btEnd{ incoming: aToB, outgoing: bToA, leftover: []byte(0), closed: false }
+  let hello = h2connAppendBytes(
+    []byte(h2connPreface),
+    encodeSettings(SettingsFrame{ ack: false, settings: []Setting(0) })?,
+  )
+  aToB <- btChunk{ data: hello, eof: false }
+  let t = newTransport(btRead(serverEnd), btWrite(serverEnd), btShutdown(serverEnd))
+  let conn = accept(t, cfg, 0)?
+  return (hbWire{ toEngine: aToB, fromEngine: bToA }, conn)
+}
+
+// The next whole frame the engine wrote. Every `t.write` this engine makes
+// carries exactly one frame (`h2connEnqueue`, streams.bit, and `h2connStart`'s
+// opening SETTINGS), so one chunk is one frame.
+fn hbNextFrame(w: hbWire): Frame! {
+  let c = <- w.fromEngine
+  return readFrame(c.data, maxMaxFrameSize)?
+}
+
+test "Config.maxHeaderListBytes is advertised as SETTINGS_MAX_HEADER_LIST_SIZE" {
+  let cfg = defaultConfig()
+  cfg.maxHeaderListBytes = 4096
+  let (w, conn) = hbAcceptOn(cfg) catch e {
+    assert(false, "accept failed: ${e.message()}")
+    return
+  }
+  let sf = decodeSettings(hbNextFrame(w) catch e2 {
+    assert(false, "the engine wrote no opening frame: ${e2.message()}")
+    return
+  }) catch e3 {
+    assert(false, "the opening frame is not SETTINGS: ${e3.message()}")
+    return
+  }
+  let seen = 0
+  for s of sf.settings {
+    if (s.id == settingsMaxHeaderListSize) {
+      seen = seen + 1
+      assert(s.value == 4096, "MAX_HEADER_LIST_SIZE = ${s.value}, want 4096")
+    }
+  }
+  assert(seen == 1, "MAX_HEADER_LIST_SIZE appears ${seen} times in our SETTINGS, want 1")
+  conn.close()
+}
+
+test "Config.maxHeaderListBytes reaches the engine: an over-budget block is refused" {
+  // The plumbing proof: a budget correct in the handlers but never copied out of
+  // `Config` in `h2connStart` would pass every test above and fail here. Driven
+  // over a real connection, so the GOAWAY read below is the one that would go on
+  // a socket.
+  let cfg = defaultConfig()
+  cfg.maxHeaderListBytes = 4096
+  let (w, conn) = hbAcceptOn(cfg) catch e {
+    assert(false, "accept failed: ${e.message()}")
+    return
+  }
+  let wire = hbHeadersWire(1, btPattern(8192), false, false) catch e2 {
+    assert(false, "encoding the HEADERS frame failed: ${e2.message()}")
+    return
+  }
+  w.toEngine <- btChunk{ data: wire, eof: false }
+  // Scan what the engine wrote until the GOAWAY: its opening SETTINGS and the
+  // ACK of ours come first, and neither is the answer we are checking.
+  let code = 0 - 1
+  let msg = ""
+  let i = 0
+  while (i < 6 && code < 0) {
+    let f = hbNextFrame(w) catch e4 {
+      assert(false, "the engine stopped writing before any GOAWAY: ${e4.message()}")
+      return
+    }
+    if (f.header.ftype == frameGoaway) {
+      let g = decodeGoaway(f) catch e5 {
+        assert(false, "GOAWAY did not decode: ${e5.message()}")
+        return
+      }
+      code = g.errorCode
+      msg = string(g.debugData)
+    }
+    i = i + 1
+  }
+  assert(
+    code == errorEnhanceYourCalm,
+    "GOAWAY code = ${code}, want ${errorEnhanceYourCalm} (ENHANCE_YOUR_CALM)",
+  )
+  assert(msg == "http2: header block exceeds 4096 bytes", "GOAWAY does not name the limit: '${msg}'")
+  conn.close()
+}
