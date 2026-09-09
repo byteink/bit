@@ -105,11 +105,11 @@
 # "_tests_/imports"]` — seven directories, not three; #3128 wired up the fourth
 # bucket, `examples`, plus the three directories that never resolve to a
 # concrete bucket at all: `_tests_/bit/**`, `_tests_/imports/**`, and
-# `_tests_/stress/**` each run it too, added to the `testsbit_steps_for()`
-# special-case block next to test-filesize below rather than to a bucket,
-# since all three route through the shared `testsbit` bucket instead of one
-# of the five concrete areas); `runtime` also runs `test-lint-runtime` (its own
-# comment in gates.bit: "points `bit lint` at `${BIT_REPO}/runtime`");
+# `_tests_/stress/**` each run it too, added to scripts/gate-filemap.sh's
+# `testsbit_steps_for()` special-case block next to test-filesize, not to a
+# bucket, since all three route through the shared `testsbit` bucket instead
+# of one of the five concrete areas); `runtime` also runs `test-lint-runtime`
+# (its own comment in gates.bit: "points `bit lint` at `${BIT_REPO}/runtime`");
 # `selfhost` also runs `test-selfhostcheck` (argv literally
 # `["check", "${repoRoot()}/compiler"]`); `docs` also runs `test-stdlib-docs`
 # (BIT_DOCS_ROOT — it fails on a `docs/stdlib/<mod>.md` missing a heading, same
@@ -172,15 +172,15 @@
 #     instead of adding to it). If _tests_/bit/**/_tests_/imports/**/_tests_/stress/**
 #     is the ONLY thing that changed, the gates whose `Gate.argv` names each
 #     changed file (or, for _tests_/stress/**, the hand-named exception in
-#     `gates_for_file()` below) run — nothing more — or `full` if any changed
-#     file cannot be mapped that way, whether or not one of the five areas
-#     also fired.
+#     scripts/gate-filemap.sh's `gates_for_file()`) run — nothing more — or
+#     `full` if any changed file cannot be mapped that way, whether or not
+#     one of the five areas also fired.
 #   - tools/build/defs.bit, tools/build/gates.bit and tools/build/gatestable2.bit
-#     (gates.bit's Gate{} table, split by #4169) are the same case only for a
-#     PURE new `Step{}`/`Gate{}` registration — no edited entry, no edited
-#     function body (see `is_additive_registration` below). Any other
-#     tools/build/** file, or a non-additive change to these three, still
-#     forces `full` — that code is the driver every step runs under.
+#     (gates.bit's Gate{} table, split by #4169) are the same case only for a PURE
+#     new `Step{}`/`Gate{}` registration — no edited entry, no edited function body
+#     (see `is_additive_registration` in scripts/gate-diffclass.sh). Any other
+#     tools/build/** file, or a non-additive change to these three, still forces
+#     `full` — that code is the driver every step runs under.
 #   - stdlib/** paired ONLY with its own mandatory docs/stdlib/**.md page
 #     (#3055): _tests_/bit/stdlibdocs.bit fails the build on any exported
 #     stdlib symbol whose module lacks a docs/stdlib/<mod>.md heading, so an
@@ -192,12 +192,12 @@
 #     gate at all). Resolves to bucket `stdlibdocs` — the union of the
 #     `stdlib` and `docs` buckets' own steps — only when stdlib and docs are
 #     the ONLY two buckets touched (no selfhost/runtime/testcases/examples/
-#     spec) and every changed docs/**/*.md file is either
-#     docs/stdlib/README.md (carries no gate of its own) or
-#     docs/stdlib/<mod>.md for a <mod> that also has a stdlib/<mod>/** change
-#     in the same diff. See `stdlib_docs_pairing_ok` below for the exact
-#     check. Any docs/*.md outside docs/stdlib/, or a docs/stdlib/<mod>.md
-#     with no matching stdlib/<mod>/** change, still forces `full`.
+#     spec) and every changed docs/**/*.md file is either docs/stdlib/README.md
+#     (carries no gate of its own) or docs/stdlib/<mod>.md for a <mod> that
+#     also has a stdlib/<mod>/** change in the same diff. See
+#     `stdlib_docs_pairing_ok` in scripts/gate-diffclass.sh for the exact
+#     check. Any docs/*.md outside docs/stdlib/, or a docs/stdlib/<mod>.md with
+#     no matching stdlib/<mod>/** change, still forces `full`.
 #   - spec/SPEC.md paired with exactly ONE other bucket (#4136): spec/SPEC.md's
 #     own gate (test-spec, #2758) is a single self-contained grammar check
 #     with no PRE/POST script and no cross-file consistency requirement
@@ -400,8 +400,8 @@ elif [ "${has_other}" -eq 1 ]; then
 elif [ "${bucket_count}" -eq 2 ] && [ "${has_stdlib}" -eq 1 ] && [ "${has_docs}" -eq 1 ] &&
   [ "${testsbit_unmapped}" -eq 0 ] && stdlib_docs_pairing_ok; then
   # THIRD NARROW EXCEPTION (#3055) — see the header comment block above and
-  # stdlib_docs_pairing_ok() for what this requires. Guarded by
-  # testsbit_unmapped here (rather than only in the elif below) so an
+  # scripts/gate-diffclass.sh's stdlib_docs_pairing_ok() for what this requires.
+  # Guarded by testsbit_unmapped here (rather than only in the elif below) so an
   # unmapped _tests_/bit/** file riding alongside stdlib+docs still forces
   # `full` exactly as it did before this exception existed.
   BUCKET="stdlibdocs"
