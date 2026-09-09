@@ -1,5 +1,6 @@
-// _tests_/bit/constimmfold.bit — #4667. A constant EVERY use of which folds
-// into an immediate must not be materialized into a register on arm64.
+// _tests_/bit/constimmfold.bit — #4667 (arm64) and #4674 (x86-64). A constant
+// EVERY use of which folds into an immediate must not be materialized into a
+// register, on EITHER backend.
 //
 // THE DEFECT. `computeSkipConstMaterialize` (compiler/arm64dispatch.bit) asks
 // "may this `const_int` be left unmaterialized?" and used to answer it with
@@ -58,9 +59,52 @@
 // A number here going stale is a codegen change, not a defect in the pin:
 // re-derive all three with the commands above and say what moved.
 //
-// THE TARGET IS ALWAYS aarch64-macos, cross-emitted with `--target`, so the
-// same decode runs on an x86-64 host rather than being gated on `uname -m` and
-// silently asserting nothing there. Only the run check is host-native.
+// THE x86-64 HALF (#4674). `xComputeSkipConstMaterialize`
+// (compiler/x64dispatch.bit) carried the same `useCount == 1` proxy at seven
+// separate sites and #4667 did not touch it. The same fixture, cross-emitted
+// for x86_64-linux and read through `readElf`, pins the same property in the
+// forms x86-64 spells it:
+//
+//     bit build fixture.bit --emit-obj --target x86_64-linux -o f.o
+//     objdump -d f.o | sed -n '/<twoFolds>:/,/^$/p'
+//     000000000000006c <twoFolds>:
+//           6c: 55                    pushq %rbp
+//           6d: 48 89 e5              movq  %rsp, %rbp
+//           70: 53                    pushq %rbx
+//           71: 48 89 f8              movq  %rdi, %rax
+//           74: 48 89 f1              movq  %rsi, %rcx
+//           77: 48 89 c3              movq  %rax, %rbx
+//           7a: 48 81 c3 05 00 00 00  addq  $0x5, %rbx
+//           81: 48 89 c8              movq  %rcx, %rax
+//           84: 48 81 c0 05 00 00 00  addq  $0x5, %rax
+//           8b: 48 89 d9              movq  %rbx, %rcx
+//           8e: 48 0f af c8           imulq %rax, %rcx
+//           92: 48 89 c8              movq  %rcx, %rax
+//           95: 5b                    popq  %rbx
+//           96: 5d                    popq  %rbp
+//           97: c3                    retq
+//     nm -n f.o | grep -E ' (twoFolds|main)$'   ->   0x6c, 0x98  (44 bytes)
+//
+// giving 0 `movq $0x5, %r64`, 2 `addq $0x5, %r64` and a 44-byte atom over that
+// range. Before the fix a dead `48 c7 c2 05 00 00 00  movq $0x5, %rdx` sat at
+// 0x77 and the atom was 51 bytes, so the SIZE is this half's "nothing appeared
+// in its place" pin — the exact analogue of the arm64 instruction count, and
+// finer, since x86-64 instructions are not fixed width.
+//
+// x86-64 is decoded by BYTE PATTERN rather than instruction by instruction: a
+// variable-length decoder able to walk this atom would be a disassembler, and
+// the two forms at issue are both unambiguous 7-byte encodings —
+// `REX.W C7 /0 id` and `REX.W 81 /0 id`, each with `mod == 11` and reg field
+// `000` (MOV-immediate, and group 1's ADD). The scan is therefore over every
+// byte offset, which is why the atom size is pinned beside the counts: a
+// pattern count alone could not tell 2 real `addq`s from 2 bytes that happened
+// to spell one. The materialization query is not one that can only answer
+// zero — the same pattern with ANY immediate matches 9 times in this object's
+// `main`, and that count is asserted non-zero on every run.
+//
+// NEITHER TARGET IS GATED ON `uname -m`: both objects are cross-emitted with
+// `--target`, so the whole decode runs on either host rather than silently
+// asserting nothing on one of them. Only the run check is host-native.
 //
 // Run it: `bit run _tests_/bit/constimmfold.bit` from the repository root.
 // Configure it by environment, since `bit run` forwards no argv:
@@ -69,13 +113,16 @@
 import { exists, readFile, writeFile } from "std/fs"
 import { envOr, exit } from "std/os"
 import { now } from "std/time"
-import { Obj, atomEnd, badObj, readMacho } from "./objread"
-import { reportChild, runBounded, scriptPath, tMacos, timeoutSeconds } from "./childrun"
+import { Obj, atomEnd, badObj, readElf, readMacho } from "./objread"
+import { reportChild, runBounded, scriptPath, tLinux, tMacos, timeoutSeconds } from "./childrun"
 
 const tag: string = "constimmfold"
 
 // The function the pins are about, as Mach-O spells it (leading underscore).
 const fnSym: string = "_twoFolds"
+
+// The same function as ELF spells it — no underscore.
+const fnSymElf: string = "twoFolds"
 
 // The literal both `add`s fold. One constant, so the fixture text and every
 // decode below cannot drift apart.
@@ -85,6 +132,11 @@ const foldedImm: int = 5
 const wantInsts: int = 5
 const wantAdds: int = 2
 const wantMovs: int = 0
+
+// The x86-64 half, derived by objdump at the #4674 commit — same header.
+const wantXBytes: int = 44
+const wantXAdds: int = 2
+const wantXMovs: int = 0
 
 // What the fixture prints: (3 + 5) * (4 + 5).
 const wantStdout: string = "72\n"
@@ -124,6 +176,81 @@ fn isMovImm(w: int, imm: int): bool {
     return false
   }
   return ((w >> 21) & 3) == 0 && ((w >> 5) & 0xffff) == imm
+}
+
+// ---------------------------------------------------------------------------
+// x86-64 decode — two 7-byte encodings, matched by pattern
+// ---------------------------------------------------------------------------
+
+// A REX prefix with W set: 0x48-0x4f. R/X/B vary with which registers the
+// operands reach (`movq $0, %r13` is 0x49), so the low three bits are ignored.
+fn isRexW(b: int): bool {
+  return (b & 0xf8) == 0x48
+}
+
+// ModRM for the register-direct form of a `/0` opcode: `mod == 11` (bits 7:6)
+// and reg field `000` (bits 5:3). For opcode 0xc7 that is MOV r/m64, imm32;
+// for group 1's 0x81 it selects ADD out of ADD/OR/ADC/SBB/AND/SUB/XOR/CMP, so
+// a `subq $5` or an `andq $5` is deliberately NOT counted as a fold here.
+fn isRegDigit0(m: int): bool {
+  return (m & 0xc0) == 0xc0 && (m & 0x38) == 0
+}
+
+// The little-endian imm32 at `off`. Every immediate this gate reads is small
+// and positive, so no sign extension is needed to compare it with `foldedImm`.
+fn imm32At(b: []u8, off: int): int {
+  return int(b[off]) | (int(b[off + 1]) << 8) | (int(b[off + 2]) << 16) | (int(b[off + 3]) << 24)
+}
+
+// `REX.W C7 /0 id` at `off` — `movq $imm32, %r64`, the materialization.
+fn isXMovImm(b: []u8, off: int): bool {
+  return isRexW(int(b[off])) && int(b[off + 1]) == 0xc7 && isRegDigit0(int(b[off + 2]))
+}
+
+// `REX.W 81 /0 id` at `off` — `addq $imm32, %r64`, the fold. This is the exact
+// form `xArithImm32` (compiler/x64arith.bit) emits for the ADD/SUB-immediate
+// fold `xTryAddSubImmFold` takes.
+fn isXAddImm(b: []u8, off: int): bool {
+  return isRexW(int(b[off])) && int(b[off + 1]) == 0x81 && isRegDigit0(int(b[off + 2]))
+}
+
+class XCounts { movs: int, adds: int }
+
+// Both patterns of `foldedImm` over `[start, start + n)`. Every offset is tried:
+// see the header for why a pattern scan is what this is, and why the atom size
+// is pinned beside its result. The 7-byte encodings must fit, hence `n - 7`.
+fn countXPatterns(b: []u8, start: int, n: int): XCounts {
+  let c = XCounts{ movs: 0, adds: 0 }
+  let i = 0
+  while (i + 7 <= n) {
+    let o = start + i
+    if (imm32At(b, o + 3) == foldedImm) {
+      if (isXMovImm(b, o)) {
+        c.movs = c.movs + 1
+      }
+      if (isXAddImm(b, o)) {
+        c.adds = c.adds + 1
+      }
+    }
+    i = i + 1
+  }
+  return c
+}
+
+// How many `movq $imm32, %r64` of ANY immediate the whole section holds — the
+// proof that `countXPatterns`'s zero is a measured zero and not a query that
+// can only answer zero. `main` materializes the array length, the two element
+// values and several zeros, so this is comfortably non-zero.
+fn countXAnyMov(b: []u8, start: int, n: int): int {
+  let hits = 0
+  let i = 0
+  while (i + 7 <= n) {
+    if (isXMovImm(b, start + i)) {
+      hits = hits + 1
+    }
+    i = i + 1
+  }
+  return hits
 }
 
 // ---------------------------------------------------------------------------
@@ -234,21 +361,25 @@ fn badImage(): Image {
   return Image{ ok: false, bytes: []u8(0), obj: badObj() }
 }
 
-// A whole number of instructions, wholly inside the buffer. Anything else is a
-// decode this gate must refuse rather than read past the end of.
-fn atomReadable(img: Image, a: Atom): bool {
-  if (a.sect < 0 || a.size <= 0 || a.size % 4 != 0) {
+// A whole number of `align`-byte units, wholly inside the buffer. Anything
+// else is a decode this gate must refuse rather than read past the end of.
+// `align` is 4 for arm64's fixed-width words and 1 for x86-64, whose atoms
+// have no width to be a multiple of.
+fn atomReadable(img: Image, a: Atom, align: int): bool {
+  if (a.sect < 0 || a.size <= 0 || a.size % align != 0) {
     return false
   }
   let base = img.obj.secs[a.sect].off + a.start
   return base >= 0 && base + a.size <= len(img.bytes)
 }
 
-// Emits the fixture for aarch64-macos and reads the object back.
-fn loadFixtureObject(c: Cfg, src: string): Image {
-  let obj = "${c.base}.o"
-  let cmd = "exec \"${c.bin}\" build \"${src}\" --emit-obj --target ${tMacos} -o \"${obj}\""
-  if (!child(c, "emitobj", cmd)) {
+// Emits the fixture for `target` and reads the object back. `elf` picks the
+// reader: the two formats spell a section table differently and `readMacho`
+// would reject an ELF outright, so this never guesses from the bytes.
+fn loadFixtureObject(c: Cfg, src: string, target: string, elf: bool): Image {
+  let obj = "${c.base}-${target}.o"
+  let cmd = "exec \"${c.bin}\" build \"${src}\" --emit-obj --target ${target} -o \"${obj}\""
+  if (!child(c, "emitobj-${target}", cmd)) {
     fsRemove(obj)
     return badImage()
   }
@@ -259,18 +390,22 @@ fn loadFixtureObject(c: Cfg, src: string): Image {
   }
   fsRemove(obj)
   let bytes = []u8(raw)
+  if (elf) {
+    let e = readElf(tag, bytes)
+    return Image{ ok: e.ok, bytes: bytes, obj: e }
+  }
   let o = readMacho(tag, bytes)
   return Image{ ok: o.ok, bytes: bytes, obj: o }
 }
 
 fn checkText(t: Tally, c: Cfg, src: string) {
-  let img = loadFixtureObject(c, src)
+  let img = loadFixtureObject(c, src, tMacos, false)
   check(t, img.ok, "the ${tMacos} object built and parsed")
   if (!img.ok) {
     return
   }
   let a = findAtom(img.obj, fnSym)
-  let readable = atomReadable(img, a)
+  let readable = atomReadable(img, a, 4)
   check(
     t, readable,
       "${fnSym} is a defined atom of whole instructions inside the file " +
@@ -291,6 +426,45 @@ fn checkText(t: Tally, c: Cfg, src: string) {
   check(
     t, n.insts == wantInsts,
     "${fnSym} is ${wantInsts} instructions, saw ${n.insts}",
+  )
+}
+
+// The x86-64 half of the same property (#4674). Same fixture, same literal,
+// same three questions — with the atom's BYTE SIZE standing in for arm64's
+// instruction count, since x86-64 instructions are not fixed width.
+fn checkTextX64(t: Tally, c: Cfg, src: string) {
+  let img = loadFixtureObject(c, src, tLinux, true)
+  check(t, img.ok, "the ${tLinux} object built and parsed")
+  if (!img.ok) {
+    return
+  }
+  let a = findAtom(img.obj, fnSymElf)
+  let readable = atomReadable(img, a, 1)
+  check(
+    t, readable,
+    "${fnSymElf} is a defined atom inside the file " + "(sect ${a.sect}, ${a.size} bytes)",
+  )
+  if (!readable) {
+    return
+  }
+  let base = img.obj.secs[a.sect].off + a.start
+  let n = countXPatterns(img.bytes, base, a.size)
+  check(
+    t, n.adds == wantXAdds,
+    "${fnSymElf} folds $${foldedImm} into ${wantXAdds} addq immediates, saw ${n.adds}",
+  )
+  check(
+    t, n.movs == wantXMovs,
+    "${fnSymElf} materializes $${foldedImm} ${wantXMovs} times, saw ${n.movs}",
+  )
+  check(
+    t, a.size == wantXBytes,
+    "${fnSymElf} is ${wantXBytes} bytes, saw ${a.size}",
+  )
+  let sec = img.obj.secs[a.sect]
+  check(
+    t, countXAnyMov(img.bytes, sec.off, sec.size) > 0,
+    "the movq-immediate query matches somewhere in the section (it read 0)",
   )
 }
 
@@ -348,6 +522,7 @@ fn main() {
   }
   let t = Tally{ checks: 0, failures: 0 }
   checkText(t, c, src)
+  checkTextX64(t, c, src)
   checkRun(t, c, src)
   fsRemove(src)
   fsRemove(c.script)

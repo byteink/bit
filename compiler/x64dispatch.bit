@@ -227,31 +227,45 @@ fn xDstOrNone(cx: XCtx, i: int, ty: int): int {
 // Which `const_int` definitions (#1853) an ADD/SUB-immediate fold, an
 // AND/OR/XOR-immediate fold (#3495), a power-of-two Mul (#3105) or a
 // power-of-two SDiv/UDiv/SRem/URem (#3104, #1704) consumes entirely, indexed
-// by instruction id. `instrOperands`
-// (opt.bit) is the SAME operand map DCE uses, so a constant with any use
-// besides the one fold that reads it as an immediate keeps `false` and still
-// materializes normally — this only marks a def whose sole structural use is
-// that one fold. Mirrors `xEmitBinaryInt`/`xEmitMulInt`/`xEmitDivInt`'s own
-// operand order exactly, so it never marks a value skipped that the emitter
-// actually reads as a register.
+// by instruction id. `instrOperands` (opt.bit) is the SAME operand map DCE
+// uses, so a constant with any use besides a fold that reads it as an
+// immediate keeps `false` and still materializes normally. Which operand each
+// family folds is `xImmFoldConstOperand`'s question, and each of its arms
+// mirrors its own emitter's operand precedence, so nothing here can mark
+// skipped a value an emitter reads as a register — and every arm names a
+// CONSTANT operand, never the other one.
 //
-// Unlike the arm64 twin, ALL FOUR divide ops qualify here: `xEmitDivInt`
-// (x64selectarith.bit) takes a shift/mask path for SDiv/UDiv AND a mask path for
-// SRem/URem (`xEmitPow2RemInt`) whenever `pow2K >= 0`, so the divisor
-// register is never read on x86-64 for any of the four — arm64's `emitDivInt`
-// only reduces SDiv/UDiv (msub still needs the real divisor to recover a
-// Rem), which is why its own twin excludes Rem. Marking a divisor skipped
-// that the emitter still reads would be a silent miscompile, which is exactly
-// what the `useCount == 1` guard below exists to prevent.
+// The test is EVERY USE IS A FOLD, not "there is exactly one use" (#4674, the
+// x86-64 half of #4667's arm64 fix). The old count-of-one rule was not the
+// safety condition, it was a proxy for it, and it read false on the commonest
+// shape there is: one literal consumed by two different computations.
+// `let k = 5; (n + k) * (m + k)` — a single `const_int i64 5` with two
+// `addq $5` uses — materialized a `movq $0x5, %rdx` that no emitter ever read
+// AND kept a register alive across the pair, because `skip` also drives
+// `arm64WritesResult` (arm64dispatch.bit), which `xUsedIntRegs` (x64call.bit)
+// calls with THIS array.
+//
+// The proxy also had a live fall-through hazard the per-arm rewrite removes:
+// the Add arm dropped to its LHS whenever the RHS test failed, and one of the
+// ways that test failed was a second USE of an RHS constant `xEmitBinaryInt`
+// folds regardless of use count. The emitter would then fold the RHS while the
+// LHS sat marked skipped and unmaterialized. The use count is not an emitter's
+// business and is applied once, below.
+//
+// ALL FOUR divide ops qualify: `xEmitDivInt` (x64selectarith.bit) takes a
+// shift/mask path for SDiv/UDiv AND a mask path for SRem/URem
+// (`xEmitPow2RemInt`) whenever `pow2K >= 0`, so the divisor register is never
+// read on x86-64 for any of the four. Since #4361 arm64's `emitDivInt` does
+// the same, which is why `mulDivFoldOperand` is shared rather than twinned.
+//
+// `useCount > 0` is what keeps this a statement about constants: `foldCount`
+// is only ever incremented for an operand `xImmFoldConstOperand` named, so a
+// zero count on both sides must not read as "all of its uses fold".
 fn xComputeSkipConstMaterialize(ctx: TypeContext, f: IrFunc): []bool {
   let n = len(f.instrs)
-  let useCount = []int(0)
+  let useCount = []int(n)
+  let foldCount = []int(n)
   let i = 0
-  while (i < n) {
-    useCount = append(useCount, 0)
-    i = i + 1
-  }
-  i = 0
   while (i < n) {
     let ops = instrOperands(f, i)
     let k = 0
@@ -259,63 +273,97 @@ fn xComputeSkipConstMaterialize(ctx: TypeContext, f: IrFunc): []bool {
       useCount[ops[k]] = useCount[ops[k]] + 1
       k = k + 1
     }
-    i = i + 1
-  }
-  let skip = []bool(0)
-  i = 0
-  while (i < n) {
-    skip = append(skip, false)
-    i = i + 1
-  }
-  i = 0
-  while (i < n) {
-    let ins = f.instrs[i]
-    if (ins.op == Op.Add || ins.op == Op.Sub) {
-      let rc = xConstIntOf(f, ins.rhs)
-      if (rc.known && fitsXArithImm32(rc.ival) && useCount[ins.rhs] == 1) {
-        skip[ins.rhs] = true
-      } else if (ins.op == Op.Add) {
-        let lc = xConstIntOf(f, ins.lhs)
-        if (lc.known && fitsXArithImm32(lc.ival) && useCount[ins.lhs] == 1) {
-          skip[ins.lhs] = true
-        }
-      }
-    } else if (ins.op == Op.Mul) {
-      let w = widthOf(ctx, ins.ty)
-      let factor = xConstPow2Factor(f, ins.lhs, ins.rhs, w)
-      if (factor.k >= 0) {
-        let constOp = ins.lhs
-        if (factor.value == ins.lhs) {
-          constOp = ins.rhs
-        }
-        if (useCount[constOp] == 1) {
-          skip[constOp] = true
-        }
-      }
-    } else if (ins.op == Op.BAnd || ins.op == Op.BOr || ins.op == Op.BXor) {
-      let s = xLogicalConstSkip(f, ins.rhs, ins.lhs)
-      if (s >= 0 && useCount[s] == 1) {
-        skip[s] = true
-      }
-    } else if (ins.op == Op.SDiv || ins.op == Op.UDiv || ins.op == Op.SRem || ins.op == Op.URem) {
-      let w = widthOf(ctx, ins.ty)
-      let pk = xDivisorPlan(f, ins.rhs, w).pow2K
-      if (pk >= 0 && useCount[ins.rhs] == 1) {
-        skip[ins.rhs] = true
-      }
-    } else if (ins.op == Op.Shl || ins.op == Op.AShr || ins.op == Op.LShr) {
-      // `xConstShiftAmount` (x64call.bit) masks any const_int to 0-63, never
-      // returning -1 for one — the only -1 case is "not a const_int at all"
-      // — so this guard fires on exactly the operand `xEmitShiftInt`'s own
-      // `constAmt >= 0` branch takes, and `xShiftImm` encodes any 0-63 value
-      // in one byte regardless of the IR's result width.
-      if (xConstShiftAmount(f, ins.rhs) >= 0 && useCount[ins.rhs] == 1) {
-        skip[ins.rhs] = true
-      }
+    let c = xImmFoldConstOperand(ctx, f, f.instrs[i])
+    if (c >= 0) {
+      foldCount[c] = foldCount[c] + 1
     }
     i = i + 1
   }
+  let skip = []bool(n)
+  i = 0
+  while (i < n) {
+    skip[i] = useCount[i] > 0 && foldCount[i] == useCount[i]
+    i = i + 1
+  }
   return skip
+}
+
+// Which operand of `ins`, if any, an immediate fold in the x86-64 emitters
+// consumes ENTIRELY — the one question the table above asks, so the
+// every-use-is-a-fold rule and the `skip` bookkeeping are written once rather
+// than once per op family. Returns that operand's instruction id, or -1.
+// The arms are mutually exclusive by `ins.op`, so the order is presentation
+// only.
+//
+// The arm64 twin `immFoldConstOperand` (arm64dispatch.bit) additionally offers
+// an icmp operand: `emitIcmp` there folds a constant rhs into `cmp`/`cmn`
+// (#4349). `xEmitIcmp` (x64selectarith.bit:282) has no such path — it fetches
+// BOTH operands with `xGetInt` before the `cmp` — so naming one here would
+// mark skipped a constant the emitter reads as a register. Under-naming only
+// costs a materialization; over-naming is a silent miscompile.
+//
+// No `debug` parameter, and that asymmetry is real rather than an oversight:
+// arm64's `addSubFoldOperand` must refuse in debug builds because its
+// `emitBinaryInt` skips the ADD/SUB-immediate fold there (no flag-setting
+// shifted-imm12 form to trap on). x86-64's group-1 `81 /digit id` form sets OF
+// exactly like the register form, so `xTryAddSubImmFold` (x64select.bit:248)
+// takes the same path in every build mode.
+fn xImmFoldConstOperand(ctx: TypeContext, f: IrFunc, ins: IrInstr): int {
+  let a = xAddSubFoldOperand(f, ins)
+  if (a >= 0) {
+    return a
+  }
+  let m = mulDivFoldOperand(ctx, f, ins)
+  if (m >= 0) {
+    return m
+  }
+  return xBitwiseShiftFoldOperand(f, ins)
+}
+
+// Whether `v` is an integer constant x86-64's group-1 immediate encoding takes
+// whole — the test `xTryAddSubImmFold` and `xTryLogicalImmFold` both apply.
+fn xArithImmOperandFits(f: IrFunc, v: int): bool {
+  let c = xConstIntOf(f, v)
+  return c.known && fitsXArithImm32(c.ival)
+}
+
+// Mirrors `xTryAddSubImmFold` (x64select.bit) in its own order: rhs first,
+// then — for Add alone, since `k - x` != `x - k` — lhs.
+fn xAddSubFoldOperand(f: IrFunc, ins: IrInstr): int {
+  if (ins.op != Op.Add && ins.op != Op.Sub) {
+    return -1
+  }
+  if (xArithImmOperandFits(f, ins.rhs)) {
+    return ins.rhs
+  }
+  if (ins.op != Op.Add) {
+    return -1
+  }
+  if (xArithImmOperandFits(f, ins.lhs)) {
+    return ins.lhs
+  }
+  return -1
+}
+
+// `xLogicalConstSkip` (x64select.bit) already mirrors `xTryLogicalImmFold`'s
+// rhs-then-lhs precedence for the three commutative bitwise ops.
+//
+// `xConstShiftAmount` (x64call.bit) masks any const_int to 0-63, never
+// returning -1 for one — the only -1 case is "not a const_int at all" — so
+// this answers with exactly the operand `xEmitShiftInt`'s own `constAmt >= 0`
+// branch takes, and `xShiftImm` encodes any 0-63 value in one byte regardless
+// of the IR's result width.
+fn xBitwiseShiftFoldOperand(f: IrFunc, ins: IrInstr): int {
+  if (ins.op == Op.BAnd || ins.op == Op.BOr || ins.op == Op.BXor) {
+    return xLogicalConstSkip(f, ins.rhs, ins.lhs)
+  }
+  if (ins.op != Op.Shl && ins.op != Op.AShr && ins.op != Op.LShr) {
+    return -1
+  }
+  if (xConstShiftAmount(f, ins.rhs) < 0) {
+    return -1
+  }
+  return ins.rhs
 }
 
 // Emits one instruction. Returns false when the construct is unsupported (a
