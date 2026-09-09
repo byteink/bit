@@ -162,8 +162,9 @@
 # paths. Excluding it here, at the source, fixes both the `testsbit`
 # bucket directly and this union path in one change.
 
-# SHARED HARNESS MODULES (#4673) — `_tests_/bit/objread` and
-# `_tests_/bit/childrun` are Bit modules with no main(), no gate of their own
+# SHARED HARNESS MODULES (#4673, #4678) — `_tests_/bit/objread`,
+# `_tests_/bit/childrun` and `_tests_/bit/docsrunner` are Bit modules with
+# no main(), no gate of their own
 # and no `runArgs()` entry in either gate table; they are reached only by a
 # relative `import { ... } from "../<mod>"`. That relationship lives in Bit
 # source, not in gates.bit's text, so assert_dirgates_current() below cannot
@@ -172,10 +173,13 @@
 # (#4262 added _tests_/bit/externarchive/arread.bit) and the childrun arm
 # omitted test-schedmultideadlock, so a diff touching only the shared module
 # never ran the consumer most likely to break. The arms now DERIVE their gate
-# set from the source. This list is the only hand-maintained part left and is
-# read only by assert_sharedmodule_gates_current(): a module missing from it
-# loses its assertion, not its mapping.
-SHARED_HARNESS_MODULES="objread childrun"
+# set from the source. docsrunner was still correct when #4678 converted it
+# (one importer, _tests_/bit/docs.bit) — it is here because a hand list that
+# happens to be right today is the same latent staleness, not because it had
+# drifted. This list is the only hand-maintained part left and is read only by
+# assert_sharedmodule_gates_current(): a module missing from it loses its
+# assertion, not its mapping.
+SHARED_HARNESS_MODULES="objread childrun docsrunner"
 
 # Every file that imports shared harness module `_tests_/bit/$1`. Both
 # spellings are matched and both are ANCHORED at column 1: `import { ... }
@@ -222,38 +226,23 @@ gates_for_file() {
     # Same defect as #4477's pkg/ case via the per-file mapping; found by the
     # same assertion (assert_argvliteral_gates_current, gate-envscope.sh).
     _tests_/imports/*) printf 'test-imports-bit\ntest-fmt\n'; return 0 ;;
-    # DERIVED, NOT LISTED (#4673) — see SHARED_HARNESS_MODULES above
-    # gates_for_file() for why these two modules have no gate of their own.
+    # DERIVED, NOT LISTED (#4673, #4678) — see SHARED_HARNESS_MODULES above
+    # gates_for_file() for why these three modules have no gate of their own.
     # shared_module_gates() greps their importers out of _tests_/bit/ and maps
-    # each through gates_for_file(), so neither arm can be narrower than the
-    # tree again. As derived on e685013b, objread -> test-const-immfold
+    # each through gates_for_file(), so no arm can be narrower than the tree
+    # again. As derived on dec67909, objread -> test-const-immfold
     # (_tests_/bit/constimmfold.bit), test-extern-archive
     # (_tests_/bit/externarchive/arread.bit), test-rootpins
     # (_tests_/bit/rootpins/rootpins.bit), test-stwwiring
     # (_tests_/bit/stwwiring/stwwiring.bit); childrun -> the same four with
     # test-schedmultideadlock (_tests_/bit/schedmultideadlock.bit) in place of
-    # test-extern-archive. Those two sets are illustrations of the derivation,
-    # never an input to it — do not re-sync them by hand.
+    # test-extern-archive; docsrunner -> test-docs (_tests_/bit/docs.bit, the
+    # single importer #2969 left when it split the batch-runner out). Those
+    # sets are illustrations of the derivation, never an input to it — do not
+    # re-sync them by hand.
     _tests_/bit/objread/*) shared_module_gates objread; return 0 ;;
     _tests_/bit/childrun/*) shared_module_gates childrun; return 0 ;;
-    _tests_/bit/docsrunner/*)
-      # Same shape as _tests_/bit/objread/* and _tests_/bit/childrun/* above: no
-      # gate of its own — #2969 split _tests_/bit/docs.bit's batch-runner into a
-      # sibling directory, reached only by relative
-      # `import { ... } from "./docsrunner"` from exactly one harness
-      # (verified: `grep -rln 'from "\./docsrunner"\|from "\.\./docsrunner"'
-      # _tests_/bit/*.bit _tests_/bit/*/*.bit` matches only _tests_/bit/docs.bit).
-      # That relationship lives in a Bit `import` statement, not in gates.bit's
-      # `runArgs()` text, so it cannot be derived and is named here by hand —
-      # and `assert_dirgates_current` below cannot check it either, for the
-      # same reason: `_tests_/bit/docsrunner` has no `runArgs()` entry anywhere
-      # in gates.bit, so it never appears in the list that guard probes.
-      # (#2975, folded into #2962's audit: a split that adds a sibling
-      # directory silently narrows a gate's mapping the same way a bucket
-      # omission silently narrows a bucket's.)
-      printf 'test-docs\n'
-      return 0
-      ;;
+    _tests_/bit/docsrunner/*) shared_module_gates docsrunner; return 0 ;;
     _tests_/stress/*)
       # A different top-level directory from the harness that reads it
       # (_tests_/bit/stress/, matched by the `_tests_/bit/stress/*)` arm just
@@ -262,11 +251,13 @@ gates_for_file() {
       # (root = BIT_STRESSGATE_ROOT, defaulting to ".") — so no
       # `runArgs("_tests_/stress")` entry exists anywhere in gates.bit (only
       # `runArgs("_tests_/bit/stress")`, for the harness), and this relationship
-      # cannot be derived and is named here by hand, same shape as
-      # _tests_/bit/objread/*, _tests_/bit/childrun/*, and _tests_/bit/docsrunner/*
-      # above. `assert_dirgates_current` below cannot check it either, for the
-      # same reason: `_tests_/stress` has no `runArgs()` entry anywhere in
-      # gates.bit, so it never appears in the list that guard probes. (#2977)
+      # cannot be derived and is named here by hand. It has no `runArgs()`
+      # entry, like the three shared-module arms above, but unlike them it is
+      # NOT derivable from Bit source either (#4678): the harness reaches this
+      # tree through a runtime path default, not an `import`, so
+      # shared_module_importers() has nothing to grep for and
+      # `assert_dirgates_current` below cannot see it — `_tests_/stress` never
+      # appears in the list that guard probes. (#2977)
       # test-stress-batch deliberately excluded — see the header comment
       # above `gates_for_file()` (#3319/#3309). test-fmt-stress (#4447) is
       # this tree's OWN gate too — its scope is BIT_FMTZERO_TREES=
@@ -386,12 +377,12 @@ gates_for_file() {
 # gates_for_file() resolve the directory — which is the fix the failure
 # message asks for and the only fix that is possible.
 #
-# _tests_/bit/objread and _tests_/bit/childrun are out of scope for this loop,
-# correctly and by construction: both have zero `runArgs()` entries in either
-# gate-table file (verified on e685013b: `grep -n 'objread\|childrun'
+# The shared harness modules are out of scope for this loop, correctly and by
+# construction: all three have zero `runArgs()` entries in either gate-table
+# file (verified on dec67909: `grep -n 'objread\|childrun\|docsrunner'
 # tools/build/gates.bit tools/build/gatestable2.bit` exits 1 with no output),
-# so neither ever appears in `dirs` below. They are covered by their own
-# guard, assert_sharedmodule_gates_current() right after this one (#4673):
+# so none ever appears in `dirs` below. They are covered by their own guard,
+# assert_sharedmodule_gates_current() right after this one (#4673, #4678):
 # this loop's question is "does gates.bit register a directory this mapper
 # cannot resolve", theirs is "does the mapper still see every importer of a
 # module gates.bit never mentions". Neither can answer the other.
@@ -416,7 +407,7 @@ assert_dirgates_current() {
 assert_dirgates_current
 
 # The shared-harness-module half of the guard above (#4673): fails the run, at
-# source time, when either derived arm in gates_for_file() has stopped
+# source time, when any derived arm in gates_for_file() has stopped
 # describing the tree. Three checks per module, IN THIS ORDER, because check 2
 # is what makes check 3 terminate:
 #
@@ -459,7 +450,7 @@ assert_sharedmodule_importer() {
   for other in ${SHARED_HARNESS_MODULES}; do
     case "$2" in
       _tests_/bit/${other}/*)
-        echo "gate: shared harness module _tests_/bit/${other} imports _tests_/bit/$1 ($2); gates_for_file()'s two derived arms would recurse into each other forever" >&2
+        echo "gate: shared harness module _tests_/bit/${other} imports _tests_/bit/$1 ($2); gates_for_file()'s derived arms would recurse into each other forever" >&2
         echo "gate: break the cycle, or give _tests_/bit/${other} a gate of its own" >&2
         exit 2
         ;;
