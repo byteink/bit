@@ -1,0 +1,276 @@
+// Call checking for the expression checker — moved verbatim out of
+// `checkexpr.bit` (#4322), which was 799 lines against the hard 800-line
+// E0200 ceiling.
+//
+// This is `checkCall` plus the `TypeNodeCallee` table it walks and the
+// conversion/argument helpers only it uses. Unary/binary operand typing,
+// identifier resolution, `checkExprType` itself and the arrow-function
+// arms stay in `checkexpr.bit`; read its header first.
+//
+// One module with `check.bit` and its other siblings, so nothing is
+// imported here — a duplicate import is E0042.
+// #4098: a type-node callee -- `chan<T>(...)`, `[]T(...)`, `map<K,V>(...)`,
+// `[N]T(...)` -- paired with the ONE argument validator (validatezero.bit)
+// that must run for it. `checkCall` below infers a constructed-type result
+// for exactly the tags this table lists; `vStmt`'s `Tag.Call` arm
+// (validatestmt.bit) dispatches argument validation for exactly the same
+// tags, by walking this SAME table. Before this table, those were two
+// independently hand-maintained lists (checkCall's OR-chain here, four
+// separate `if` blocks there) with nothing tying them together — #4065 and
+// #4092 found map/chan validation missing entirely, #4091 found slice
+// argument-type checking half-missing, all three by manual audit. Teaching
+// `checkCall` a fifth type-node tag now REQUIRES adding it here, which
+// requires supplying its validator in the same literal — there is no second
+// list left to fall out of sync. `_tests_/bit/typenodecallee.bit` walks
+// `isTypeNodeCalleeTag` and fails loudly if a tag it accepts has no
+// invalid-argument fixture wired for it.
+class TypeNodeCallee {
+  tag: Tag,
+  validate: (Checker, int) => (),
+}
+
+fn typeNodeCallees(): []TypeNodeCallee {
+  return [
+    TypeNodeCallee{ tag: Tag.ChanType, validate: vChanCtorArgs },
+    TypeNodeCallee{ tag: Tag.SliceType, validate: vSliceAllocArity },
+    TypeNodeCallee{ tag: Tag.MapType, validate: vMapCtorArity },
+    TypeNodeCallee{ tag: Tag.ArrayType, validate: vArrayCtorRejected },
+  ]
+}
+
+fn isTypeNodeCalleeTag(tag: Tag): bool {
+  for e of typeNodeCallees() {
+    if (e.tag == tag) {
+      return true
+    }
+  }
+  return false
+}
+
+// Infers a call expression's result type: a void builtin is `()`; a top-level
+// function call is its declared result; `chan<T>(n)`/`map<K,V>{}`-style
+// constructors are the constructed type. Unknown callees infer to invalid (0).
+fn checkCall(c: Checker, node: int): int {
+  let callee = kidsOf(c.tree, node)[0]
+  let cn = getNode(c.tree, callee)
+  if (cn.tag == Tag.Ident) {
+    let name = c.source[cn.span.start:cn.span.end]
+    // PRECEDENCE: local binding > user declaration > builtin (SPEC 17.5).
+    // Matching the callee's SOURCE TEXT against the predeclared names first put
+    // every one of them ahead of the user's own declarations, so a program
+    // declaring `close`/`osExit`/`print` typed its own call as the builtin's `()`
+    // and failed with a spurious E0073 — while `fsClose`/`timeMonoNs` typed
+    // wrongly but silently. Shadowing a predeclared name is legal (E0048 is a
+    // warning), so these must be consulted BEFORE the cascade below. lowerCall
+    // hoists the same two paths in the same order; the two must agree, or the
+    // checker and the lowerer disagree about which function is being called.
+    // Calling a func-typed value `f(...)` yields the value's result type, keyed
+    // by the callee NODE — the flat env is NAME-keyed module-wide (#4570).
+    let ev = identEnvType(c, callee, name)
+    if (ev != 0 && c.ctx.types[ev].kind == TypeKind.Func) {
+      return c.ctx.types[ev].result
+    }
+    // A generic call `identity(42)` whose result is a bare type parameter binds
+    // that parameter from the matching argument's type.
+    let g = genericResultAt(c, name, node)
+    if (g != -1) {
+      return g
+    }
+    let r = funcResultLookup(c, name)
+    if (r != 0) {
+      return r
+    }
+    if (builtinReturnsVoid(name)) {
+      return c.ctx.voidId
+    }
+    // `len`/`cap` always yield i64 regardless of argument.
+    if (name == "len" || name == "cap") {
+      return primType(c.ctx, 3)
+    }
+    // `append(slice, ...)` yields the slice's type (its first argument's).
+    if (name == "append") {
+      return checkArgType(c, node, 0)
+    }
+    // Atomics (§11.5): the `*T` first argument's element type drives the result.
+    // Load and the rmw family return `T`; `atomicCmpxchg` returns `bool`.
+    if (name == "atomicLoad" || name == "atomicAdd" || name == "atomicSub" ||
+      name == "atomicAnd" || name == "atomicOr" || name == "atomicXchg") {
+      return c.ctx.types[checkArgType(c, node, 0)].elem
+    }
+    if (name == "atomicCmpxchg") {
+      return primType(c.ctx, 10)
+    }
+    // `ptrOf(s: []T): *T` — a raw pointer to the slice's element 0. Module
+    // state (§11.11) is also addressable: its cell has a static address, which
+    // is the addressability the atomic builtins need. A scalar cell yields
+    // `*T`; an array cell yields a pointer to its element 0, like a slice.
+    if (name == "ptrOf") {
+      let at = checkArgType(c, node, 0)
+      if (at != 0 && c.ctx.types[at].kind == TypeKind.Prim) {
+        return mkPtr(c.ctx, at)
+      }
+      return mkPtr(c.ctx, c.ctx.types[at].elem)
+    }
+    // `entryOf(f): *byte` (§11.10) — a named function's code entry address. The
+    // result never depends on the operand: it is one machine address whatever
+    // `f`'s signature is, so unlike `ptrOf` there is no argument to inspect.
+    // validate.bit is what proves the operand may have an address at all.
+    if (name == "entryOf") {
+      return mkPtr(c.ctx, primType(c.ctx, 4))
+    }
+    // `stackMapsBegin()`/`stackMapsEnd(): *byte` (§11.12) — the two bounds of
+    // the stack-map table (ABI.md §4). Zero-arity by construction: there is
+    // exactly one table per link, so there is nothing to select and no argument
+    // to inspect. validate.bit is what rejects a call that passes one.
+    // `debugLinesBegin()`/`debugLinesEnd()` (#3285) join on the identical
+    // proof: one half-open extent per link, for the debug-info table instead.
+    if (name == "stackMapsBegin" || name == "stackMapsEnd" ||
+        name == "debugLinesBegin" || name == "debugLinesEnd") {
+      return mkPtr(c.ctx, primType(c.ctx, 4))
+    }
+    // `syscall(nr, a0..a5): i64` (§11.8) — variable arity, every operand and
+    // the result i64, so the result needs no argument inspection at all.
+    if (name == "syscall") {
+      return primType(c.ctx, 3)
+    }
+    // A runtime-primitive builtin (`cryptoRandomBytes`, `fsReadAll`, ...).
+    let bt = builtinResultType(c, name)
+    if (bt != -1) {
+      return bt
+    }
+    // A primitive name used as a call is a conversion: `f64(x)` -> f64.
+    let p = primIndexByName(name)
+    if (p >= 0) {
+      return primType(c.ctx, p)
+    }
+    // A USER-DECLARED type used as a call is equally a conversion (SPEC §12.9),
+    // and its result is that type: `E(car)`, `MyInt(5)`, `Point(p)`. #1898 —
+    // without this the call fell to the `return 0` below and was left with the
+    // INVALID type id, which no diagnostic reports: `bit check` exited 0 and the
+    // lowerer then refused the whole enclosing function with no span, because a
+    // conversion whose destination type is 0 cannot be emitted.
+    let ut = userTypeLookup(c, name)
+    if (ut != 0) {
+      // A class declaring 'init' (SPEC §10.4, #3371) routes THIS call through
+      // the constructor rather than the plain identity/alias conversion above
+      // — `Account(500)` calls 'init', it does not convert 500 to Account.
+      // classinit.bit is permissive (returns `ut` unchanged) when there is no
+      // 'init', so the two branches agree on every other user type.
+      return classConstructResultType(c, ut, classInitNode(c, ut))
+    }
+    return 0
+  }
+  // `chan<T>(n)` / `[]T(n)` / `map<K,V>()` — the callee is a type node, so the
+  // result is that type.
+  if (isTypeNodeCalleeTag(cn.tag)) {
+    return typeFromNode(c, callee)
+  }
+  if (cn.tag == Tag.Member) {
+    // `ns.fn(...)` — the namespace binds the callee under a dotted key, so it
+    // resolves through the same two lookups the Ident branch uses.
+    let qn = nsQualifiedName(c, callee)
+    if (qn != "") {
+      let qg = genericResultAt(c, qn, node)
+      if (qg != -1) {
+        return qg
+      }
+      return funcResultLookup(c, qn)
+    }
+    let mk = kidsOf(c.tree, callee)
+    // Enum variant constructor `Enum.Variant(...)` / `Enum<T>.Variant(...)`.
+    let et = variantConstructionEnumType(c, node, mk[0])
+    if (et != 0) {
+      return et
+    }
+    // Method call `recv.method(...)` -> the method's declared result. A
+    // constrained type parameter dispatches through its constraint interface.
+    let recvType = checkExprType(c, mk[0])
+    if (recvType != 0) {
+      let mn = getNode(c.tree, mk[1])
+      let mname = c.source[mn.span.start:mn.span.end]
+      let mr = methodCallResult(c, methodRecvType(c, recvType), mname, node)
+      if (mr != 0) {
+        // Concrete whenever `recvType` resolved to a real instantiation: the
+        // receiver's own arguments are substituted by `copyInstMethod` (#1540)
+        // and the method's own by `methodCallResult` (#4495). Only inside the
+        // generic's OWN body — receiver still the bare template — can this stay
+        // a type param, and there is no scrutinee syntax left to recover a
+        // better answer from (#1573).
+        return mr
+      }
+    }
+  }
+  // Calling any other FUNC-TYPED VALUE expression: a func-typed field
+  // `r.read(4096)` (§9.4), a slice element `fs[0](41)`, a returned function
+  // `mk()(41)`. None of the branches above resolve a declaration for these, so
+  // the callee's own type IS the signature and the call yields its result.
+  // Mirrors the seed's tail in `checkCall`, which types the callee and reads
+  // `.func.result` once every declaration-shaped case has been ruled out. The
+  // Ident branch returns on every path and so never reaches here, which keeps
+  // its local>declaration>builtin precedence (SPEC 17.5) intact.
+  let ft = checkExprType(c, callee)
+  if (ft != 0 && c.ctx.types[ft].kind == TypeKind.Func) {
+    return c.ctx.types[ft].result
+  }
+  return 0
+}
+
+// #3474: `name`'s local (non-extern) FuncDecl node when it shadows a
+// PREDECLARED CONVERSION name (`primIndexByName` — f64, i64, int, bool,
+// string, ...), or 0. This is the exact collision `checkCall` above resolves
+// silently: "PRECEDENCE: local binding > user declaration > builtin" means
+// `f64(x)` calls the user's `fn f64()` instead of converting, so a caller
+// expecting the conversion sees a type mismatch with no explanation.
+//
+// Local-only and extern-exempt on purpose, to stay in lockstep with
+// `rCheckShadowsPredeclared`/`rModuleShadowExempt` (resolve.bit), the pass
+// that actually raises E0048 for this shadow: it warns only inside the
+// checked module itself (never for a dependency's declaration, since the
+// project's one shared Diagnostics would replay it at every downstream
+// consumer) and never for an `extern fn` (§11.7 — its bare name IS the
+// linkage). A note that says "(see E0048)" must never point at a
+// declaration E0048 did not, or could not, warn about.
+fn shadowedConversionDecl(c: Checker, name: string): int {
+  if (primIndexByName(name) < 0) {
+    return 0
+  }
+  let (_, isExtern) = c.externFns[name]
+  if (isExtern) {
+    return 0
+  }
+  for (k, v) of c.funcDecls {
+    if (k == name) {
+      return v
+    }
+  }
+  return 0
+}
+
+// `node`'s callee identifier text, or "" when `node` is not a Call with a bare
+// Ident callee (a member call, a func-typed value, a type constructor, ...) —
+// none of those resolve through the module's flat name tables the way a
+// predeclared conversion name would, so the shadow question does not apply.
+fn callIdentName(c: Checker, node: int): string {
+  let callee = calleeNodeOf(c, node)
+  if (callee == 0) {
+    return ""
+  }
+  let cn = getNode(c.tree, callee)
+  if (cn.tag != Tag.Ident) {
+    return ""
+  }
+  return c.source[cn.span.start:cn.span.end]
+}
+
+// The inferred type of a call's `i`-th argument (unwrapping the `arg` node).
+fn checkArgType(c: Checker, callNode: int, i: int): int {
+  let args = kidsOf(c.tree, kidsOf(c.tree, callNode)[2])
+  if (i >= len(args)) {
+    return 0
+  }
+  let a = args[i]
+  if (getNode(c.tree, a).tag == Tag.Arg) {
+    a = kidsOf(c.tree, a)[0]
+  }
+  return checkExprType(c, a)
+}
