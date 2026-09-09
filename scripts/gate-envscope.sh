@@ -480,7 +480,7 @@ argvliteral_gate_paths() {
 #     scripts/gate.sh` on a bench/-only diff prints `bucket: full` and exits 3.
 #   tools, tools/** — the same has_other=1 -> `full` route (the one narrow
 #     exception, a purely-additive Step{}/Gate{} registration, is handled by
-#     is_additive_registration() in scripts/gate-filemap.sh and still runs the
+#     is_additive_registration() in scripts/gate-diffclass.sh and still runs the
 #     added gate). The three gates reaching this arm today
 #     (test-fuzz-selfcheck/-odiff/-xtarget) are additionally outside gate.sh's
 #     scoping responsibility altogether: all three are registered in
