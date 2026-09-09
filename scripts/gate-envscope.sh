@@ -25,7 +25,7 @@
 # There are now THREE assertions here, one per way a gate can declare its
 # scope, and each states its own limits:
 #   assert_envscoped_gates_current   env: BIT_*_TREES=          (#4454)
-#   assert_argvscoped_gates_current  a walk inside the harness  (#4465)
+#   assert_argvscoped_gates_current  a walk inside the harness  (#4465/#4466)
 #   assert_argvliteral_gates_current argv: bare "${repoRoot()}/<dir>" (#4477)
 # The third exists because the first two provably could not see test-fmt, whose
 # argv literally named ${repoRoot()}/pkg while the pkg bucket did not run it.
@@ -196,7 +196,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# THE ARGV-SCOPED HALF (#4465).
+# THE ARGV-SCOPED HALF (#4465, widened to five trees by #4466).
 #
 # assert_envscoped_gates_current() above covers a gate whose scanned trees are
 # spelled out in gates.bit's own `env:`. #4465 is the same defect reached by a
@@ -218,10 +218,15 @@ EOF
 # instead of passing vacuously, the failure mode CLAUDE.md records for the
 # `compiler/**/*.bit` glob and the ARM64_RELOC_BRANCH26 count.
 #
-# SCOPE, STATED PRECISELY: this covers the `compiler` tree only, which is
-# #4465's acceptance. Widening it to the other eight trees means deciding a
-# bucket for every gate a wider pattern turns up, and each of those decisions
-# is its own finding — filed separately rather than guessed at here.
+# SCOPE, STATED PRECISELY: #4465 shipped this for the `compiler` tree ONLY and
+# said so; #4466 widened it to the five trees ARGVSCOPE_TREES names below, and
+# the four trees it still does not cover are listed there with the measurement
+# behind each. Widening was not mechanical — a wider pattern turns up
+# CANDIDATES, not dark gates, and #4466 judged each one: four joined a bucket
+# (test-fmt-citations in runtime and stdlib, test-release-surface in stdlib,
+# test-lint-complexity in pkg) and eight became named exemptions in
+# argvscope_exempt_gate() below, each with its evidence. A candidate list is
+# not a wiring list.
 
 # Fails loudly if this file was sourced without the modules it probes. Sourced
 # alone, `build_steps_for_bucket` and `testsbit_steps_for` are simply absent,
@@ -258,37 +263,45 @@ argv_gate_paths() {
     tools/build/gates.bit tools/build/gatestable2.bit
 }
 
-# The scan-root spellings a harness uses to name the compiler tree, as an
-# extended regex over its own .bit source:
-#   ${repo}/compiler , ${repoRoot()}/compiler   — a walk root
-#   [ "compiler"  or  , "compiler"  or  ^"compiler"  — a dirNames array element
-#   "compiler/<name>.bit"                        — a named compiler source
-# Deliberately NOT a bare `"compiler"` anywhere: _tests_/bit/walkbitcheck.bit
+# The scan-root spellings a harness uses to name the tree "$1", as an extended
+# regex over its own .bit source:
+#   ${repo}/<tree> , ${repoRoot()}/<tree>      — a walk root
+#   [ "<tree>"  or  , "<tree>"  or  ^"<tree>"  — a dirNames array element
+#   "<tree>/<relpath>.bit"                     — a named source inside it
+# Deliberately NOT a bare `"<tree>"` anywhere: _tests_/bit/walkbitcheck.bit
 # mentions `walk("compiler")` in a comment and scans nothing, and a pattern
 # that cannot tell a comment from a scan root produces a candidate list nobody
 # will trust; whole-line `//` comments are stripped before matching for the
-# same reason. Verified against all 103 argv-path gates: 9 candidates, every
-# one of which genuinely reads compiler sources, and it independently
-# re-derives the two gates (test-version-cli, test-threadtokenbytes) that
-# #4454's HAND audit had found by reading — their matches are real
-# `exists("${c}/compiler/codegen.bit")`/`slurp(...)` calls, not prose.
+# same reason.
 #
-# WHAT IT CANNOT DO, measured rather than assumed: the `compiler/<name>.bit"`
-# arm matches that spelling anywhere in code, including inside a diagnostic
-# STRING. Renaming both of abimembers.bit's real scan roots
-# (`bitSources("${repo}/compiler")`, `"${repo}/compiler/irrtfns.bit"`) still
-# leaves it discovered, off its own message text at :398. So this discovers
-# membership in the class; it does not prove a gate has LEFT it. That is the
-# over-inclusive direction — at worst it demands a gate be wired that need not
-# be, which fails loudly and is settled by wiring it or naming an exemption.
-# The direction that matters, a gate silently going dark, is the one it
-# catches.
-ARGVSCOPE_COMPILER_PATTERN='\$\{repo(Root\(\))?\}/compiler|(^|[[,])[[:space:]]*"compiler"|compiler/[a-zA-Z0-9_]+\.bit"'
+# Concatenated, never printf'd: `\$` and `\{` are not printf escapes, and what
+# bash's printf does with an unknown escape is not something to rest a regex on.
+#
+# #4466 WIDENED THE THIRD ARM, `<tree>/[a-zA-Z0-9_]+\.bit"` -> `[a-zA-Z0-9_/]+`,
+# so the leaf may cross `/`. compiler/ is flat, so this changes nothing there
+# (still exactly the 9 gates #4465 measured, re-derived on this tree). runtime/
+# and stdlib/ are not flat, and a literal naming one of their sources is
+# spelled `"${repo}/runtime/root/rootclasses.bit"`: the narrow leaf found 9
+# runtime candidates, the wide one 11. Both extra gates (test-stwwiring,
+# test-threadtokenbytes) are already in the runtime bucket, so the widening
+# cost no new wiring and closed a real blind spot.
+#
+# WHAT IT CANNOT DO, measured on #4465 rather than assumed: the
+# `<tree>/<relpath>.bit"` arm matches that spelling anywhere in the source,
+# including inside a diagnostic STRING — renaming both of abimembers.bit's real
+# scan roots still leaves it discovered, off its own message text. So this
+# proves membership in the class, not that a gate has LEFT it. That is the
+# over-inclusive direction: at worst it demands a gate be wired that need not
+# be, which fails loudly and is settled by wiring it or naming it below.
+argvscope_pattern_for_tree() {
+  printf '%s\n' '\$\{repo(Root\(\))?\}/'"$1"'|(^|[[,])[[:space:]]*"'"$1"'"|'"$1"'/[a-zA-Z0-9_/]+\.bit"'
+}
 
-# Prints the gate names whose own harness source scans the compiler tree, one
-# per line, sorted and deduplicated.
-argvscoped_compiler_gates() {
-  local gate path srcs src hits
+# Prints the gate names whose own harness source scans tree "$1", one per line,
+# sorted and deduplicated.
+argvscoped_gates_for_tree() {
+  local pat gate path srcs src hits
+  pat="$(argvscope_pattern_for_tree "$1")"
   argv_gate_paths | while IFS=' ' read -r gate path; do
     [ -n "${gate}" ] || continue
     if [ -d "${path}" ]; then
@@ -307,7 +320,7 @@ argvscoped_compiler_gates() {
       # drains its input. Zero matches is exit 1 with "0" on stdout, hence the
       # `|| true` and the explicit compare rather than reading the status.
       hits="$(command grep -vE '^[[:space:]]*//' "${src}" \
-        | command grep -cE "${ARGVSCOPE_COMPILER_PATTERN}" || true)"
+        | command grep -cE "${pat}" || true)"
       [ "${hits}" = "0" ] && continue
       printf '%s\n' "${gate}"
       break
@@ -315,62 +328,177 @@ argvscoped_compiler_gates() {
   done | sort -u
 }
 
-# The live-query floor. These four are in this class by inspection and none of
-# them can leave it without the harness being rewritten, so a run that fails to
-# rediscover any one of them has a broken pattern, not a cleaner tree. Named
-# rather than counted on purpose: a count silently absorbs one gate leaving the
-# class while another joins it, exactly the property that retired this repo's
-# fmt ceilings (#3713).
-ARGVSCOPE_COMPILER_FLOOR="test-abimembers test-lint-filelines test-lint-self test-fmt-roundtrip"
-
-# Asserts every gate whose harness scans the compiler tree is in the `selfhost`
-# bucket's BUILD_STEPS. Probes the LIVE build_steps_for_bucket() rather than a
-# second copy of the step list, same as assert_envscoped_gates_current() above,
-# so the only way to pass is to actually wire the gate in.
+# THE TREES THIS ASSERTION COVERS. #4465 shipped `compiler` alone and said so;
+# #4466 added the other four trees that envscope_bucket_for_tree() routes to a
+# STATIC bucket. The four it does not cover, each for a measured reason:
 #
-# Shadows BUCKET/BUILD_STEPS as locals, so it never disturbs the real diff's
-# own bucket selection running around it in scripts/gate.sh.
-assert_argvscoped_gates_current() {
-  local gates gate want denom=0 wired=0 bad=""
-  local BUCKET BUILD_STEPS
-  assert_envscope_deps
-  gates="$(argvscoped_compiler_gates)"
-  for want in ${ARGVSCOPE_COMPILER_FLOOR}; do
+#   tools            — envscope_bucket_for_tree()'s own named exemption: every
+#                      tools/** diff outside a purely-additive registration
+#                      resolves to `full`, which runs every gate. (6 candidates
+#                      here, and no bucket for any of them to be missing from.)
+#   _tests_/cases    — 1 candidate on this tree, test-fuzz
+#                      (`envOr("BIT_FUZZ_CASES", "_tests_/cases")`), and it is
+#                      already in the `testcases` bucket. Measured, not assumed:
+#                      the tree is clean today, so wiring nothing is the honest
+#                      outcome and a loop over it would only add a report line.
+#   _tests_/bit, _tests_/stress, _tests_/imports
+#                    — these route through testsbit_steps_for(<probe file>),
+#                      per changed FILE rather than to one static step list, so
+#                      "the bucket that tree maps to" is not a single list to
+#                      compare against (9 candidates for _tests_/bit). The two
+#                      assertions above that DO handle those trees each carry a
+#                      probe-path table for exactly this reason; adding a third
+#                      is a decision about which probe stands for a whole tree,
+#                      which is its own ticket, not a widening of this one.
+ARGVSCOPE_TREES="compiler runtime stdlib examples pkg"
+
+# The live-query floor, per tree. These gates are in their tree's class by
+# inspection and none can leave it without its harness being rewritten, so a
+# run that fails to rediscover one has a broken pattern, not a cleaner tree.
+# Named rather than counted on purpose: a count silently absorbs one gate
+# leaving the class while another joins it, the property that retired this
+# repo's fmt ceilings (#3713). A tree in ARGVSCOPE_TREES with no floor arm is
+# itself a hard failure in the caller — an empty floor cannot fail.
+argvscope_floor_for_tree() {
+  case "$1" in
+    compiler) printf '%s\n' "test-abimembers test-lint-filelines test-lint-self test-fmt-roundtrip" ;;
+    runtime) printf '%s\n' "test-abimembers test-lint-runtime test-lint-self test-fmt-citations" ;;
+    stdlib) printf '%s\n' "test-lint-self test-lint-sweep test-release-surface" ;;
+    examples) printf '%s\n' "test-examples test-lint-filelines" ;;
+    pkg) printf '%s\n' "test-packages test-lint-sweep test-lint-complexity" ;;
+    *) return 1 ;;
+  esac
+}
+
+# NAMED EXEMPTIONS: (tree, gate) pairs this assertion discovers but must NOT
+# demand a bucket for. Every one is a judgment with its evidence, never a
+# silent skip — #4466's whole point is that the candidate list is not a wiring
+# list. Returns 0 when exempt.
+#
+#   test-fmt-roundtrip, every tree but compiler — #4451 wired it into
+#     `selfhost` ONLY, with its reason stated on that ticket: the regression it
+#     exists for is a formatter bug in compiler/fmt*.bit, which is
+#     compiler-domain and forces `selfhost`; the corpus-content risk for the
+#     other eight trees (a new file hitting an existing formatter edge case) is
+#     covered by test-fmt / test-fmt-strict running `bit fmt --check` over
+#     those trees, which every one of these buckets already runs. It stays
+#     CHECKED for compiler, where it is wired.
+#   stdlib test-pmimports / test-pmvanity / test-pmaddgit / test-pmrangegate —
+#     a FIXTURE PATH, not a scan root. Each harness's hit is
+#     `envOr("BIT_STDLIB_UNDER_TEST", "stdlib")`, and the gate table sets that
+#     var to ${stdlibRoot()}; the value is passed straight through to a child
+#     compiler as `BIT_STDLIB=` under `env -i` (see runBitCli in
+#     _tests_/bit/pmimports.bit) so a scratch project can resolve `std/...`.
+#     The stdlib is a BUILD INPUT there, not the subject of any assertion. If a
+#     build input counted as scope, every gate that compiles a Bit program would
+#     be stdlib-scoped and the `stdlib` bucket would BE the full suite.
+#   stdlib test-stdlib-rebuild — a coreSteps() Step, "not part of `test`" by its
+#     own desc (tools/build/defs.bit), so no bucket runs it and gate.sh has no
+#     scoping responsibility for it. Same class the failure text below names.
+#   stdlib test-release-surface — ON COST, and this is the one exemption here
+#     that is a real hole rather than a false positive. It IS stdlib-scoped
+#     (`curStdlib: "${repo}/stdlib"`, releasesurface.bit:670 — it `bit doc
+#     --fields`-diffs the working tree against the pinned previous release) and
+#     it IS in gateSteps(), so `full` runs it. It is left out because
+#     `./make test-release-surface` MEASURED 25m42s on 2026-09-09 (rc=0,
+#     "31 module(s) compared ... 0 unallowlisted breaking change(s)"): it
+#     spawns one subprocess per module per side, and wiring it here would make
+#     a one-file stdlib diff cost MORE than the whole `./make test` gate.sh
+#     itself prices at 17m26s — the one thing a scoped bucket must never do.
+#     .claude/kb/gate-speed-history.md still ranks it 2m3s; that figure is
+#     stale by an order of magnitude. So a stdlib-only diff has NO API-surface
+#     check until the integrator's pre-push suite, which is a stop-gap and is
+#     named as one: #4691 is the ticket to make the comparison incremental
+#     (only modules the diff touches) and wire it here once it is affordable.
+#   pkg test-package-${p} — not a gate name: gates.bit builds one Gate per
+#     package inside a `for p of packageNames()` loop, so the TABLE holds the
+#     unexpanded template. Its expansions are one-package subsets of
+#     test-packages, which the pkg bucket already runs, and defs.bit marks them
+#     "not part of `test` or `test-packages`".
+argvscope_exempt_gate() {
+  case "$1 $2" in
+    "compiler test-fmt-roundtrip") return 1 ;;
+    *' test-fmt-roundtrip') return 0 ;;
+  esac
+  case "$1 $2" in
+    'stdlib test-pmimports' | 'stdlib test-pmvanity' | 'stdlib test-pmaddgit') return 0 ;;
+    'stdlib test-pmrangegate' | 'stdlib test-stdlib-rebuild') return 0 ;;
+    'stdlib test-release-surface') return 0 ;;
+    'pkg test-package-${p}') return 0 ;;
+  esac
+  return 1
+}
+
+# Refuses unless every floor gate for tree "$1" is in the discovered list "$2".
+argvscope_assert_floor() {
+  local want
+  for want in $(argvscope_floor_for_tree "$1"); do
     case "
-${gates}
+$2
 " in
       *"
 ${want}
 "*) ;;
       *)
-        echo "gate: assert_argvscoped_gates_current: did NOT rediscover \"${want}\", which scans the compiler tree by inspection — ARGVSCOPE_COMPILER_PATTERN (scripts/gate-envscope.sh) has stopped matching, or that harness moved. A pattern matching nothing looks exactly like a correctly wired tree; refusing to report a verdict." >&2
+        echo "gate: assert_argvscoped_gates_current: did NOT rediscover \"${want}\", which scans the ${1} tree by inspection — argvscope_pattern_for_tree() (scripts/gate-envscope.sh) has stopped matching, or that harness moved. A pattern matching nothing looks exactly like a correctly wired tree; refusing to report a verdict." >&2
         exit 2
         ;;
     esac
   done
+}
 
-  BUCKET="selfhost"
+# Checks one tree and prints its own verdict line. Appends to the CALLER's
+# `bad` (bash dynamic scoping, the same mechanism this file already uses to
+# shadow BUCKET/BUILD_STEPS) rather than returning findings through a command
+# substitution, which would run in a subshell and lose them.
+argvscope_check_tree() {
+  local tree="$1" bucket gates gate denom=0 wired=0 exempt=0
+  local BUCKET BUILD_STEPS
+  bucket="$(envscope_bucket_for_tree "${tree}")" || bucket=""
+  if [ -z "${bucket}" ] || [ "${bucket}" = "testsbit" ]; then
+    echo "gate: assert_argvscoped_gates_current: tree \"${tree}\" is in ARGVSCOPE_TREES but envscope_bucket_for_tree() gives it no single static bucket — it is exempt or per-file-routed, and this assertion cannot compare it against one step list. Remove it from ARGVSCOPE_TREES or give it a probe table." >&2
+    exit 2
+  fi
+  gates="$(argvscoped_gates_for_tree "${tree}")"
+  argvscope_assert_floor "${tree}" "${gates}"
+  BUCKET="${bucket}"
   build_steps_for_bucket
   while IFS= read -r gate; do
     [ -n "${gate}" ] || continue
+    if argvscope_exempt_gate "${tree}" "${gate}"; then
+      exempt=$((exempt + 1))
+      continue
+    fi
     denom=$((denom + 1))
     case " ${BUILD_STEPS[*]} " in
       *" ${gate} "*) wired=$((wired + 1)) ;;
       *)
         bad="${bad:+${bad}
-}gate \"${gate}\"'s own harness scans the compiler tree, but the \"selfhost\" bucket's BUILD_STEPS (scripts/gate-buildsteps.sh) does not include it — a compiler-only diff never runs it. Wire it into that bucket, or, if it is a coreSteps() gate outside \`./make test\` and so outside gate.sh's scoping responsibility, add it here as a NAMED exemption with its reason."
+}gate \"${gate}\"'s own harness scans the ${tree} tree, but the \"${bucket}\" bucket's BUILD_STEPS (scripts/gate-buildsteps.sh) does not include it — a diff touching only ${tree} never runs it. Wire it into that bucket, or, if it is a coreSteps() gate outside \`./make test\` and so outside gate.sh's scoping responsibility, or a fixture path rather than a scan root, add it to argvscope_exempt_gate() here with its reason."
         ;;
     esac
   done <<EOF
 ${gates}
 EOF
+  echo "gate: assert_argvscoped_gates_current: ${tree}: ${wired} of ${denom} gate(s) whose harness scans ${tree}/ are in the ${bucket} bucket (${exempt} named exemption(s))"
+}
 
+# Asserts, for every tree in ARGVSCOPE_TREES, that each gate whose harness
+# scans that tree is in the bucket that tree maps to. Probes the LIVE
+# build_steps_for_bucket() rather than a second copy of the step list, same as
+# assert_envscoped_gates_current() above, so the only way to pass is to
+# actually wire the gate in.
+assert_argvscoped_gates_current() {
+  local tree bad=""
+  assert_envscope_deps
+  for tree in ${ARGVSCOPE_TREES}; do
+    argvscope_check_tree "${tree}"
+  done
   if [ -n "${bad}" ]; then
-    echo "gate: assert_argvscoped_gates_current: FAILED — ${wired} of ${denom} argv-scoped compiler gate(s) wired" >&2
+    echo "gate: assert_argvscoped_gates_current: FAILED — argv-scoped gate(s) missing from the bucket their tree maps to:" >&2
     echo "${bad}" | sed 's/^/gate:   /' >&2
     exit 2
   fi
-  echo "gate: assert_argvscoped_gates_current: ${wired} of ${denom} gate(s) whose harness scans compiler/ are in the selfhost bucket"
 }
 
 # ---------------------------------------------------------------------------
@@ -514,7 +642,7 @@ argvliteral_bucket_for_dir() {
 }
 
 # The live-query floor, named rather than counted for the same reason
-# ARGVSCOPE_COMPILER_FLOOR is: a count silently absorbs one gate leaving the
+# argvscope_floor_for_tree() is: a count silently absorbs one gate leaving the
 # class while another joins it. These three declare a bare source-tree argv
 # path today and cannot stop doing so without being rewritten, so a run that
 # fails to rediscover one has a broken extraction, not a cleaner tree — the
