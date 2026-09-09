@@ -2554,7 +2554,7 @@ what the binder receives:
 | iterable      | `for x of it` binds                     | `for x in it` binds | binder type |
 | ------------- | ---------------------------------------- | -------------------- | ----------- |
 | `[]T` / `[N]T`| the element                              | the **index**         | `int`       |
-| `map<K,V>`    | `(k, v)` pair: key and value             | the **key**           | `K`         |
+| `map<K,V>`    | the `(K, V)` pair: key and value         | the **key**           | `K`         |
 | `string`      | out of scope for v0.1 (§21)              | **rejected**          | —           |
 | `chan<T>`     | the received value, until closed (§16.2) | **rejected**          | —           |
 | anything else | **rejected**                             | **rejected**          | —           |
@@ -2566,12 +2566,14 @@ separately (`for x of xs` the element, `for x in xs` the index), joined into
 one binder. This is the `( IDENT | "(" pat "," pat ")" )` alternative in
 `for_of`'s own grammar, the same production a map's `(k, v)` pair binder uses.
 
-A single (non-pair) binder over a map is rejected for `for_of` too (§12.6): one
-binder cannot say whether it means the key or the value, and neither guess is
-recoverable once shipped. `for_in` rejects everything that is not a slice,
-array, or map for the same reason in the other direction — there is no index
-or key to give a `string`, a `chan<T>` (a stream, not a container, so it has no
-keys), or anything else.
+A single (non-pair) binder over a map binds the whole pair: `for x of m` gives
+`x` type `(K, V)`, so `x.0` is the key and `x.1` the value, and
+`for (k, v) of m` is that same value destructured positionally (§12.10). The
+two forms differ only in spelling — `of` yields the value a map holds, which is
+the pair, exactly as it yields the element a slice holds. `for_in` rejects
+everything that is not a slice, array, or map — there is no index or key to
+give a `string`, a `chan<T>` (a stream, not a container, so it has no keys), or
+anything else.
 
 **Pair binder over `for_in` (#4333).** A pair binder is legal over `for_in`
 too, for a slice or array only: `for (i, x) in xs` binds the same two values
