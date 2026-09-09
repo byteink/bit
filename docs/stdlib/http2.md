@@ -673,9 +673,11 @@ Bundle the three closures into a `Transport`.
 
 The SETTINGS a `Conn` advertises: `initialWindowSize` (the per-stream receive
 window it grants the peer), `maxFrameSize` (the largest frame payload it
-accepts), `headerTableSize` (its HPACK dynamic-table bound), and
-`maxHeaderListBytes` (SETTINGS_MAX_HEADER_LIST_SIZE) - plus `maxBodyBytes`, the
-one local limit that is not a SETTINGS parameter. All five fields are exported.
+accepts), `headerTableSize` (its HPACK dynamic-table bound),
+`maxHeaderListBytes` (SETTINGS_MAX_HEADER_LIST_SIZE), and
+`maxConcurrentStreams` (SETTINGS_MAX_CONCURRENT_STREAMS) - plus `maxBodyBytes`,
+the one local limit that is not a SETTINGS parameter. All six fields are
+exported.
 
 `initialWindowSize` is the receive window granted to each stream; the
 connection's own window starts at the RFC's fixed 65535 and is not configurable.
@@ -741,12 +743,35 @@ connection kept open for hours does not accumulate every body it ever carried,
 and `maxBodyBytes` times the number of concurrent streams is the ceiling rather
 than `maxBodyBytes` times every request ever served.
 
+`maxConcurrentStreams` is what bounds that multiplier: the most streams a peer
+may have open at once. It is advertised as SETTINGS_MAX_CONCURRENT_STREAMS, so a
+conforming peer stops on its own side, and it is also enforced - a peer-initiated
+HEADERS that would open one stream too many is answered with RST_STREAM carrying
+`errorRefusedStream` and no stream is created, so the refused request costs no
+stream state, no body buffer and no handler thread. That is a *stream* error, not
+a connection one (RFC 9113 §5.1.2): the peer's framing is legal and the streams
+already running are unaffected. REFUSED_STREAM rather than PROTOCOL_ERROR because
+§8.7 makes it the positive statement that the request was not processed, so the
+peer may safely retry it on another connection.
+
+The limit runs in both directions. The peer's own advertised
+SETTINGS_MAX_CONCURRENT_STREAMS is applied to the streams *this* endpoint opens:
+a `roundTrip` that would exceed it fails locally, with a message naming the
+limit, rather than opening a stream the peer must reject. A peer that advertises
+nothing is treated as having no limit, which is what the parameter's absence
+means on the wire. As with the byte budgets there is no value meaning
+"unlimited": `0` refuses every stream.
+
 ### `defaultConfig(): Config`
 
 The RFC defaults: a 65535-byte initial window, a 16384-byte max frame size, a
-4096-byte header table, a 128 KiB header-block budget, and a 32 MiB per-stream
-body budget - the last the same number `std/http`'s `setMaxBodyBytes` setters
-default to, so an HTTP/2 exchange and an HTTP/1.1 one are bounded alike.
+4096-byte header table, a 128 KiB header-block budget, 250 concurrent streams,
+and a 32 MiB per-stream body budget - the last the same number `std/http`'s
+`setMaxBodyBytes` setters default to, so an HTTP/2 exchange and an HTTP/1.1 one
+are bounded alike.
+
+250 concurrent streams matches what Go's `http2` server allows; RFC 9113 §6.5.2
+asks implementations not to advertise fewer than 100.
 
 128 KiB is twice `std/http`'s own `maxHeaderBytes` (65536), which bounds a
 decoded HTTP/1.1 block rather than an encoded HPACK one. The headroom is

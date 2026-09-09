@@ -1,0 +1,389 @@
+// stdlib/http2/concurrency.test.bit — the concurrent-stream limit (#4595).
+//
+// #4590 bounded the DATA one stream may buffer and #4593 the header block on the
+// way to it. Both bound ONE stream, and nothing bounded how many streams a peer
+// could have open at once: `h2connServerHeaders` opened one for every new odd id,
+// `h2connApplySetting` treated an inbound MAX_CONCURRENT_STREAMS as a no-op, and
+// `h2connOurSettings` never sent one — which on the wire means "no limit". So the
+// two byte budgets multiplied by however many streams the peer cared to open,
+// each also costing an `h2connStream` and, on a server, a green thread.
+//
+// The first three tests drive the handlers directly against a hand-built
+// `h2connState` (`btState`, events.test.bit; `srNewPeer`/`srHeadersFrame`,
+// streams.test.bit — same flat `std/http2` module, so nothing is imported), which
+// is what makes "the refused stream was never created" checkable as
+// `st.present[id]` rather than inferred from a request that did not arrive.
+//
+// The last two run real `accept()`/`connect()` connections over an in-memory
+// wire, because a limit correct in the handlers and never carried out of
+// `Config` — or never advertised — would pass all three of the others, and
+// because what we advertise is only checkable on the wire.
+
+// --- frames a peer would send ------------------------------------------------
+
+// The peer's opening HEADERS for each of `ids`, in the order they will be fed to
+// the engine. Built up front and in that order because one HPACK encoder backs
+// them all: encoding out of the order they are decoded would desync `p.enc` from
+// `st.dec` and fail the test for a reason that is not the limit.
+fn mcRequests(p: srPeer, ids: []int, endStream: bool): []Frame! {
+  let out = []Frame(0)
+  for id of ids {
+    out = append(out, srHeadersFrame(p.enc, id, srRequestFields("/mc"), endStream)?)
+  }
+  return out
+}
+
+// An `h2cmdOpen` command for a GET, as `Conn.roundTrip` (conn.bit) sends it.
+fn mcOpenCmd(replyCh: chan<h2connMsg>): h2connCmd {
+  return h2connCmd{
+    kind: h2cmdOpen,
+    request: newRequest("GET", "example.com", "/mc"),
+    response: h2connZeroResponse(),
+    streamId: 0,
+    errorCode: 0,
+    replyCh: replyCh,
+  }
+}
+
+// --- our limit, enforced on peer-initiated streams ---------------------------
+
+test "a peer-initiated stream past Config.maxConcurrentStreams is refused, not opened" {
+  let p = srNewPeer()
+  p.st.maxConcurrentStreams = 2
+  let fs = mcRequests(p, [1, 3, 5], true) catch e {
+    assert(false, "building the HEADERS frames failed: ${e.message()}")
+    return
+  }
+  h2connHandleFrame(p.st, fs[0])
+  h2connHandleFrame(p.st, fs[1])
+  assert(p.st.activeStreams == 2, "activeStreams = ${p.st.activeStreams} after two streams, want 2")
+  // The two under the limit are served: both reach `serve`'s accept channel,
+  // which is the server's own boundary between the engine and a handler.
+  let a1 = <- p.st.acceptCh
+  let a3 = <- p.st.acceptCh
+  assert(a1.streamId == 1, "first request delivered on stream ${a1.streamId}, want 1")
+  assert(a3.streamId == 3, "second request delivered on stream ${a3.streamId}, want 3")
+
+  h2connHandleFrame(p.st, fs[2])
+  // The whole point: not opened and then torn down — never opened at all, so the
+  // third stream costs no `h2connStream`, no body buffer and no handler thread.
+  assert(p.st.present[5] == 0, "the refused stream was put in the table anyway")
+  assert(p.st.activeStreams == 2, "activeStreams = ${p.st.activeStreams} after the refusal, want 2")
+  // The id is still spent (RFC 9113 §5.1.1): a peer that ignores the limit must
+  // not get to recycle the id its refused stream used.
+  assert(p.st.lastPeerStreamId == 5, "lastPeerStreamId = ${p.st.lastPeerStreamId}, want 5")
+
+  let sent = btNextWritten(p.st) catch e2 {
+    assert(false, "no frame was queued for the peer: ${e2.message()}")
+    return
+  }
+  let rst = decodeRstStream(sent) catch e3 {
+    assert(false, "the queued frame is not RST_STREAM: ${e3.message()}")
+    return
+  }
+  assert(rst.streamId == 5, "RST_STREAM on stream ${rst.streamId}, want 5")
+  // REFUSED_STREAM, not PROTOCOL_ERROR: RFC 9113 §8.7 makes it the statement
+  // that the request was not processed, so the peer may retry it elsewhere.
+  assert(
+    rst.errorCode == errorRefusedStream,
+    "RST_STREAM code = ${rst.errorCode}, want ${errorRefusedStream} (REFUSED_STREAM)",
+  )
+}
+
+test "the concurrency limit is a live count, not a high-water mark" {
+  // A limit compared against a number that only ever grows would refuse every
+  // stream after the first `maxConcurrentStreams` for the life of the
+  // connection. `activeStreams` is the table's size (#4594 made it so), and
+  // closing a stream must genuinely make room for another.
+  let p = srNewPeer()
+  p.st.maxConcurrentStreams = 1
+  let fs = mcRequests(p, [1, 3], true) catch e {
+    assert(false, "building the HEADERS frames failed: ${e.message()}")
+    return
+  }
+  h2connHandleFrame(p.st, fs[0])
+  let a1 = <- p.st.acceptCh
+  assert(a1.streamId == 1, "request delivered on stream ${a1.streamId}, want 1")
+  srServeFinish(p, 1, []byte(0))
+  assert(p.st.activeStreams == 0, "activeStreams = ${p.st.activeStreams} after the answer, want 0")
+  h2connHandleFrame(p.st, fs[1])
+  assert(p.st.present[3] == 1, "the stream after a closed one was refused")
+  let a3 = <- p.st.acceptCh
+  assert(a3.streamId == 3, "request delivered on stream ${a3.streamId}, want 3")
+}
+
+// --- the peer's limit, respected for streams we open -------------------------
+
+test "a client does not open a stream past the peer's advertised limit" {
+  let st = btState(true, 65536)
+  h2connApplySetting(st, settingsMaxConcurrentStreams, 1)
+  assert(
+    st.peerMaxConcurrentStreams == 1,
+    "the peer's MAX_CONCURRENT_STREAMS was ignored: ${st.peerMaxConcurrentStreams}",
+  )
+  let r1 = chan<h2connMsg>(1)
+  h2connHandleCmd(st, mcOpenCmd(r1))
+  assert(st.activeStreams == 1, "the first stream did not open: ${st.activeStreams}")
+  assert(st.nextStreamId == 3, "nextStreamId = ${st.nextStreamId} after one stream, want 3")
+
+  let r2 = chan<h2connMsg>(1)
+  h2connHandleCmd(st, mcOpenCmd(r2))
+  let msg = <- r2
+  assert(!msg.ok, "a second stream was opened over a limit of 1")
+  assert(
+    msg.errMsg == "http2: peer's concurrent stream limit (1) reached",
+    "the failure does not name the limit: '${msg.errMsg}'",
+  )
+  // Refused before anything was spent: no table entry, and the id it would have
+  // used is still the next one to allocate.
+  assert(st.activeStreams == 1, "the refused stream was registered: ${st.activeStreams}")
+  assert(st.nextStreamId == 3, "the refused stream consumed id ${st.nextStreamId - 2}")
+}
+
+// --- the same limits over a real connection ----------------------------------
+
+// `hbAcceptOn` (headers.test.bit) hands back a live server `Conn` with its peer
+// driven by hand; `serve` is what turns a delivered request into a response, and
+// a method call cannot be spawned directly.
+fn mcServe(conn: Conn) {
+  conn.serve(btEcho) catch _ {
+    return
+  }
+}
+
+// The next frame the engine wrote whose type is `a` or `b`, skipping anything
+// else it queued (its SETTINGS, the ACK of ours, WINDOW_UPDATEs). Two types
+// rather than one because "a response, not a reset" is the assertion: scanning
+// for HEADERS alone would step over the RST_STREAM that is the failure.
+fn mcNextOfEither(w: hbWire, a: int, b: int, limit: int): Frame! {
+  let i = 0
+  while (i < limit) {
+    let f = hbNextFrame(w)?
+    if (f.header.ftype == a || f.header.ftype == b) {
+      return f
+    }
+    i = i + 1
+  }
+  fail newError("no frame of type ${a} or ${b} in ${limit} frames")
+}
+
+// The `:status` of a response header block, decoded against `dec` — which must
+// be the one decoder every block from this engine is fed to, in wire order.
+fn mcStatus(dec: Decoder, f: Frame): int! {
+  let hf = decodeHeaders(f)?
+  let fields = dec.decode(hf.blockFragment)?
+  for h of fields {
+    if (h.name == ":status") {
+      return h2connAtoi(h.value)
+    }
+  }
+  fail newError("the response block carries no :status")
+}
+
+// The peer's opening HEADERS for `id` as wire bytes, for the tests that feed a
+// transport rather than a handler (`hbHeadersWire`, headers.test.bit, carries
+// the frame; the block is this peer's own HPACK encoding of a GET).
+fn mcRequestWire(enc: Encoder, id: int, endStream: bool): []byte! {
+  return hbHeadersWire(id, enc.encode(srRequestFields("/mc")), endStream, true)?
+}
+
+// An empty DATA frame that ends the request, so the echo handler answers with a
+// header block and nothing else.
+fn mcEndDataWire(id: int): []byte! {
+  return encodeData(
+    DataFrame{ streamId: id, data: []byte(0), endStream: true, padLength: 0 - 1 },
+  )?
+}
+
+test "a server advertises its limit, refuses the stream past it, and serves the next" {
+  let cfg = defaultConfig()
+  cfg.maxConcurrentStreams = 2
+  let (w, conn) = hbAcceptOn(cfg) catch e {
+    assert(false, "accept failed: ${e.message()}")
+    return
+  }
+  spawn mcServe(conn)
+
+  // 1. What we advertise. Before #4595 this parameter was absent, which is the
+  //    wire's way of saying there is no limit.
+  let first = hbNextFrame(w) catch e2 {
+    assert(false, "the engine wrote no opening frame: ${e2.message()}")
+    return
+  }
+  let sf = decodeSettings(first) catch e3 {
+    assert(false, "the opening frame is not SETTINGS: ${e3.message()}")
+    return
+  }
+  let seen = 0
+  for s of sf.settings {
+    if (s.id == settingsMaxConcurrentStreams) {
+      seen = seen + 1
+      assert(s.value == 2, "MAX_CONCURRENT_STREAMS = ${s.value}, want 2")
+    }
+  }
+  assert(seen == 1, "MAX_CONCURRENT_STREAMS appears ${seen} times in our SETTINGS, want 1")
+
+  // 2. Two streams left open (no END_STREAM, so nothing answers them), then a
+  //    third that is one too many.
+  let enc = newEncoderConfig(4096, true)
+  let dec = newDecoderConfig(4096)
+  let first1 = mcRequestWire(enc, 1, false) catch e4 {
+    assert(false, "building stream 1's HEADERS failed: ${e4.message()}")
+    return
+  }
+  let first3 = mcRequestWire(enc, 3, false) catch e5 {
+    assert(false, "building stream 3's HEADERS failed: ${e5.message()}")
+    return
+  }
+  let extra = mcRequestWire(enc, 5, true) catch e6 {
+    assert(false, "building stream 5's HEADERS failed: ${e6.message()}")
+    return
+  }
+  w.toEngine <- btChunk{ data: first1, eof: false }
+  w.toEngine <- btChunk{ data: first3, eof: false }
+  w.toEngine <- btChunk{ data: extra, eof: false }
+  let answer = mcNextOfEither(w, frameRstStream, frameHeaders, 8) catch e7 {
+    assert(false, "the engine never answered the third stream: ${e7.message()}")
+    return
+  }
+  assert(
+    answer.header.ftype == frameRstStream,
+    "the third concurrent stream was answered with frame type ${answer.header.ftype}, want RST_STREAM",
+  )
+  let rst = decodeRstStream(answer) catch e8 {
+    assert(false, "the RST_STREAM did not decode: ${e8.message()}")
+    return
+  }
+  assert(rst.streamId == 5, "RST_STREAM on stream ${rst.streamId}, want 5")
+  assert(
+    rst.errorCode == errorRefusedStream,
+    "RST_STREAM code = ${rst.errorCode}, want ${errorRefusedStream} (REFUSED_STREAM)",
+  )
+
+  // 3. End stream 1 so the handler answers it and the slot is freed, then open a
+  //    fourth stream: under the limit again, so it is served rather than refused.
+  let ends = mcEndDataWire(1) catch e9 {
+    assert(false, "building the DATA frame failed: ${e9.message()}")
+    return
+  }
+  w.toEngine <- btChunk{ data: ends, eof: false }
+  let res1 = mcNextOfEither(w, frameHeaders, frameRstStream, 8) catch e10 {
+    assert(false, "stream 1 was never answered: ${e10.message()}")
+    return
+  }
+  assert(res1.header.ftype == frameHeaders, "stream 1 was reset instead of answered")
+  let st1 = mcStatus(dec, res1) catch e11 {
+    assert(false, "stream 1's response did not decode: ${e11.message()}")
+    return
+  }
+  assert(st1 == 200, "stream 1 answered ${st1}, want 200")
+
+  let fourth = mcRequestWire(enc, 7, true) catch e12 {
+    assert(false, "building stream 7's HEADERS failed: ${e12.message()}")
+    return
+  }
+  w.toEngine <- btChunk{ data: fourth, eof: false }
+  let res7 = mcNextOfEither(w, frameHeaders, frameRstStream, 8) catch e13 {
+    assert(false, "stream 7 was neither answered nor refused: ${e13.message()}")
+    return
+  }
+  assert(
+    res7.header.ftype == frameHeaders,
+    "stream 7 was refused although a slot had been freed",
+  )
+  let st7 = mcStatus(dec, res7) catch e14 {
+    assert(false, "stream 7's response did not decode: ${e14.message()}")
+    return
+  }
+  assert(st7 == 200, "stream 7 answered ${st7}, want 200")
+  conn.close()
+}
+
+// A client `Conn` whose peer's opening SETTINGS advertises `limit` concurrent
+// streams — `gaConnectOn` (goaway.test.bit) with a parameter in that SETTINGS,
+// which is the whole point here.
+fn mcConnectOn(limit: int): (hbWire, Conn)! {
+  let toEngine = chan<btChunk>(64)
+  let fromEngine = chan<btChunk>(64)
+  let clientEnd = btEnd{
+    incoming: toEngine,
+    outgoing: fromEngine,
+    leftover: []byte(0),
+    closed: false,
+  }
+  let list = []Setting(0)
+  list = append(list, Setting{ id: settingsMaxConcurrentStreams, value: limit })
+  toEngine <- btChunk{
+    data: encodeSettings(SettingsFrame{ ack: false, settings: list })?,
+    eof: false,
+  }
+  let t = newTransport(btRead(clientEnd), btWrite(clientEnd), btShutdown(clientEnd))
+  let conn = connect(t, defaultConfig(), 0)?
+  let pre = <- fromEngine
+  if (!h2connBytesEqual(pre.data, []byte(h2connPreface))) {
+    fail newError("the client's first write was not the connection preface")
+  }
+  return (hbWire{ toEngine: toEngine, fromEngine: fromEngine }, conn)
+}
+
+// One round trip, run on the calling thread, with its outcome as a value.
+fn mcRoundTrip(conn: Conn, path: string): gaResult {
+  conn.roundTrip(newRequest("GET", "example.com", path)) catch e {
+    return gaResult{ ok: false, msg: e.message() }
+  }
+  return gaResult{ ok: true, msg: "" }
+}
+
+fn mcRoundTripOn(conn: Conn, out: chan<gaResult>) {
+  out <- mcRoundTrip(conn, "/first")
+}
+
+test "a client honours the peer's advertised SETTINGS_MAX_CONCURRENT_STREAMS" {
+  // The plumbing proof for the other direction: a peer limit decoded but never
+  // stored, or stored but never compared, would pass every direct test above.
+  let (w, conn) = mcConnectOn(1) catch e {
+    assert(false, "connect failed: ${e.message()}")
+    return
+  }
+  let done = chan<gaResult>(1)
+  spawn mcRoundTripOn(conn, done)
+  // Wait for the first request's HEADERS, so its stream provably occupies the
+  // one slot the peer allows before the second round trip is attempted.
+  let sent = mcNextOfEither(w, frameHeaders, frameRstStream, 8) catch e2 {
+    assert(false, "the client never sent its first request: ${e2.message()}")
+    return
+  }
+  assert(sent.header.streamId == 1, "the first request went on stream ${sent.header.streamId}")
+
+  let second = mcRoundTrip(conn, "/second")
+  assert(!second.ok, "a second concurrent stream was opened over a peer limit of 1")
+  assert(
+    second.msg == "http2: peer's concurrent stream limit (1) reached",
+    "the failure does not name the limit: '${second.msg}'",
+  )
+
+  // Answer the first stream so nothing is left parked on it.
+  let enc = newEncoderConfig(4096, true)
+  let fields = []HeaderField(0)
+  fields = append(fields, HeaderField{ name: ":status", value: "200", sensitive: false })
+  let wire = encodeHeaders(
+    HeadersFrame{
+      streamId: 1,
+      blockFragment: enc.encode(fields),
+      endStream: true,
+      endHeaders: true,
+      padLength: 0 - 1,
+      hasPriority: false,
+      exclusive: false,
+      streamDependency: 0,
+      weight: 0,
+    },
+  ) catch e3 {
+    assert(false, "encoding the response failed: ${e3.message()}")
+    return
+  }
+  w.toEngine <- btChunk{ data: wire, eof: false }
+  let first = <- done
+  assert(first.ok, "the first round trip failed: '${first.msg}'")
+  conn.close()
+}

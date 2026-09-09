@@ -141,7 +141,16 @@ fn h2connApplySetting(st: h2connState, id: int, value: int) {
     st.enc.changeTableSize(value)
     return
   }
-  // ENABLE_PUSH / MAX_CONCURRENT_STREAMS / MAX_HEADER_LIST_SIZE: accepted, no-op.
+  if (id == settingsMaxConcurrentStreams) {
+    st.peerMaxConcurrentStreams = value
+    return
+  }
+  // ENABLE_PUSH / MAX_HEADER_LIST_SIZE: accepted, no-op. ENABLE_PUSH because
+  // this engine never pushes, so a peer forbidding or permitting push changes
+  // nothing we do; MAX_HEADER_LIST_SIZE because it is advisory (RFC 9113 §6.5.2)
+  // and this engine's own header blocks are bounded by what it encodes.
+  // MAX_CONCURRENT_STREAMS was in this list until #4595 and is not that kind of
+  // parameter: it is a limit on what WE may do, not on what we tolerate.
 }
 
 fn h2connOnHeaders(st: h2connState, f: Frame) {
@@ -244,23 +253,7 @@ fn h2connServerHeaders(
   isNew: bool,
 ) {
   if (isNew) {
-    if (streamId <= st.lastPeerStreamId || streamId % 2 == 0) {
-      h2connConnError(st, errorProtocolError, "http2: illegal new stream id")
-      return
-    }
-    st.lastPeerStreamId = streamId
-    let s = h2connNewStream(streamId, st.peerInitialWindow, st.ourInitialWindow, h2connDummyReply())
-    s.state = h2stOpen
-    s.recvHeaders = fields
-    s.headersDone = true
-    st.streams[streamId] = s
-    st.present[streamId] = 1
-    st.activeStreams = st.activeStreams + 1
-    if (endStream) {
-      s.recvEnded = true
-      s.state = h2stHCRemote
-      h2connDeliverRequest(st, s)
-    }
+    h2connOpenPeerStream(st, streamId, fields, endStream)
     return
   }
   if (st.present[streamId] == 0) {
@@ -271,6 +264,60 @@ fn h2connServerHeaders(
   if (endStream) {
     s.recvEnded = true
     h2connRecvEndTransition(st, s)
+    h2connDeliverRequest(st, s)
+  }
+}
+
+// A peer-initiated stream's opening HEADERS: check the id, check we have room
+// for another stream, and open it.
+//
+// The room check is `st.maxConcurrentStreams`, what we advertised as
+// SETTINGS_MAX_CONCURRENT_STREAMS (`h2connOurSettings`, conn.bit), against
+// `st.activeStreams`, which is the streams in the table — open or half-closed,
+// exactly the ones RFC 9113 §5.1.2 says count. Over it is a STREAM error, not a
+// connection error: the peer's framing is legal and every other stream on the
+// connection is unaffected, so killing the connection would punish requests that
+// did nothing wrong. The header block has already been HPACK-decoded by the time
+// we get here (`h2connFinishHeaders`), so the shared dynamic table stays in step
+// with the peer's whether we open the stream or refuse it — which is what makes
+// a stream error sound here and made the header-block budget a connection one.
+//
+// REFUSED_STREAM (0x7) rather than PROTOCOL_ERROR, the two §5.1.2 offers: §8.7
+// makes REFUSED_STREAM the positive statement that the request was NOT
+// PROCESSED, so the peer may safely retry it, automatically, on another
+// connection — and that is exactly true here, since we refuse before delivering
+// anything to a handler. PROTOCOL_ERROR would be a false statement about the
+// peer's framing and would suppress that retry. ENHANCE_YOUR_CALM, which this
+// module uses for the two byte budgets, is not one of the two §5.1.2 names and
+// carries no not-processed guarantee, so it would lose the retry as well.
+//
+// The id is recorded in `lastPeerStreamId` BEFORE the refusal: a refused stream
+// still went idle -> open -> closed, so §5.1.1 forbids the peer reusing it, and
+// leaving it unrecorded would let a peer that ignores our limit also recycle ids.
+fn h2connOpenPeerStream(st: h2connState, streamId: int, fields: []HeaderField, endStream: bool) {
+  if (streamId <= st.lastPeerStreamId || streamId % 2 == 0) {
+    h2connConnError(st, errorProtocolError, "http2: illegal new stream id")
+    return
+  }
+  st.lastPeerStreamId = streamId
+  if (st.activeStreams >= st.maxConcurrentStreams) {
+    // No table entry exists to tear down — this is the one reset path that
+    // never had a stream — so the RST_STREAM is sent directly rather than
+    // through `h2connStreamError`, whose remaining work is a no-op for an
+    // absent id and whose message would describe a peer reset that never was.
+    h2connSendRstStream(st, RstStreamFrame{ streamId: streamId, errorCode: errorRefusedStream })
+    return
+  }
+  let s = h2connNewStream(streamId, st.peerInitialWindow, st.ourInitialWindow, h2connDummyReply())
+  s.state = h2stOpen
+  s.recvHeaders = fields
+  s.headersDone = true
+  st.streams[streamId] = s
+  st.present[streamId] = 1
+  st.activeStreams = st.activeStreams + 1
+  if (endStream) {
+    s.recvEnded = true
+    s.state = h2stHCRemote
     h2connDeliverRequest(st, s)
   }
 }
@@ -523,6 +570,22 @@ fn h2connCmdOpen(st: h2connState, cmd: h2connCmd) {
       ok: false,
       response: h2connZeroResponse(),
       errMsg: "http2: connection is closing",
+    }
+    return
+  }
+  // RFC 9113 §5.1.2: "Endpoints MUST NOT exceed the limit set by their peer."
+  // Refused here rather than on the wire, because the peer's answer to the
+  // stream we must not open is an RST_STREAM at best and a connection error at
+  // worst, and either way the caller waits for a round trip that cannot happen.
+  // `st.activeStreams` counts our own streams on a client — nothing else ever
+  // enters a client's table, `h2connClientHeaders` requiring an existing entry —
+  // and `peerMaxConcurrentStreams` is 2^32-1 until the peer names a limit, so
+  // this costs one comparison on a connection whose peer set no limit.
+  if (st.activeStreams >= st.peerMaxConcurrentStreams) {
+    cmd.replyCh <- h2connMsg{
+      ok: false,
+      response: h2connZeroResponse(),
+      errMsg: "http2: peer's concurrent stream limit (${st.peerMaxConcurrentStreams}) reached",
     }
     return
   }
