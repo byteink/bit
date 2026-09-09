@@ -174,30 +174,49 @@ gates_for_file() {
     _tests_/imports/*) printf 'test-imports-bit\ntest-fmt\n'; return 0 ;;
     _tests_/bit/objread/*)
       # No gate of its own: a shared Mach-O/ELF relocation reader (#2877)
-      # reached only by relative `import { ... } from "../objread"` from two
-      # harnesses. That relationship lives in Bit `import` statements, not in
+      # reached only by relative `import { ... } from "../objread"`. That
+      # relationship lives in Bit `import` statements, not in
       # gates.bit's `runArgs()` text, so it cannot be derived and is named
       # here by hand — and `assert_dirgates_current` below cannot check it
       # either, for the same reason: `_tests_/bit/objread` has no `runArgs()`
       # entry anywhere in gates.bit, so it never appears in the list that
       # guard probes.
-      printf 'test-stwwiring\ntest-rootpins\n'
+      # #4667 added _tests_/bit/constimmfold.bit, which reads a section's own
+      # bytes through `Sec.off` (populated for Mach-O and exported by that
+      # ticket), and named it below.
+      #
+      # THIS LIST IS INCOMPLETE AND #4673 IS THE TICKET. The importers are
+      # `grep -rln 'from "\.\./objread"\|from "\./objread"' _tests_/bit/*.bit
+      # _tests_/bit/*/*.bit`: constimmfold.bit, externarchive/arread.bit,
+      # rootpins/rootpins.bit and stwwiring/stwwiring.bit. `test-extern-archive`
+      # is NOT printed here, so an objread-only diff has never run it. Fixing
+      # that is #4673's scope, not #4667's — it widens what an existing bucket
+      # runs, and this comment is here so the gap is not silent.
+      printf 'test-stwwiring\ntest-rootpins\ntest-const-immfold\n'
       return 0
       ;;
     _tests_/bit/childrun/*)
       # Same shape as _tests_/bit/objread/* just above: a shared bounded-
       # child-process harness (#2902) with no main() and no gate of its own,
       # reached only by relative `import { ... } from "../childrun"` — here
-      # from exactly two harnesses (verified: `grep -rn 'from "\.\./childrun"'
-      # _tests_/bit/` matches only _tests_/bit/rootpins/rootpins.bit:150 and
-      # _tests_/bit/stwwiring/stwwiring.bit:136; _tests_/bit/objread/objread.bit
-      # only mentions "childrun" in prose comments, not an import). That
+      # (_tests_/bit/objread/objread.bit only mentions "childrun" in prose
+      # comments, not an import). #4667 added _tests_/bit/constimmfold.bit,
+      # which spells it `from "./childrun"` — it is a file in _tests_/bit/, not
+      # a directory module beneath it — and named it below.
+      #
+      # THIS LIST IS INCOMPLETE AND #4673 IS THE TICKET, same shape as the
+      # objread arm above. The importers are `grep -rln 'from
+      # "\.\./childrun"\|from "\./childrun"' _tests_/bit/*.bit
+      # _tests_/bit/*/*.bit`: constimmfold.bit, schedmultideadlock.bit,
+      # rootpins/rootpins.bit and stwwiring/stwwiring.bit.
+      # `test-schedmultideadlock` is NOT printed here, so a childrun-only diff
+      # has never run it. That
       # relationship lives in Bit `import` statements, not in gates.bit's
       # `runArgs()` text, so it cannot be derived and is named here by hand —
       # and `assert_dirgates_current` below cannot check it either, for the
       # same reason: `_tests_/bit/childrun` has no `runArgs()` entry anywhere
       # in gates.bit, so it never appears in the list that guard probes.
-      printf 'test-stwwiring\ntest-rootpins\n'
+      printf 'test-stwwiring\ntest-rootpins\ntest-const-immfold\n'
       return 0
       ;;
     _tests_/bit/docsrunner/*)
