@@ -303,3 +303,78 @@ test "DATA for a stream that is gone is counted and its credit handed back" {
   let credit = fcConnCredit(st)
   assert(credit == 100, "the peer was granted ${credit} bytes of connection credit, want 100")
 }
+
+// --- the padding a DATA frame carries (#4622) ----------------------------------
+
+// Feed one padded DATA frame of `n` pattern bytes and `padLength` padding octets
+// to `st` on `streamId`, through the real codec. The payload the peer debits its
+// send window by is `1 + n + padLength`: the Pad Length octet, the body, and the
+// padding (RFC 9113 §6.1).
+fn fcSendPadded(st: h2connState, streamId: int, n: int, padLength: int, endStream: bool): ()! {
+  let wire = encodeData(
+    DataFrame{
+      streamId: streamId,
+      data: btPattern(n),
+      endStream: endStream,
+      padLength: padLength,
+    },
+  )?
+  let f = readFrame(wire, maxMaxFrameSize)?
+  assert(
+    f.header.length == 1 + n + padLength,
+    "the padded frame's payload is ${f.header.length} bytes, want ${1 + n + padLength}",
+  )
+  h2connOnData(st, f)
+}
+
+test "a padded DATA frame is counted, and renewed, at its whole payload length" {
+  // 100 body bytes in a 121-byte payload. Both windows are spent and granted
+  // back at 121, not at 100: the peer's own send window went down by 121, so a
+  // 100-byte grant leaves it 21 bytes short for ever and a peer that pads every
+  // frame stalls. Only `recvBody` sees the stripped 100 — padding is discarded
+  // and never resident, which is why the body budget still counts it at 100.
+  let st = fcState(1000, 1000, 1048576)
+  let s = btOpenStream(st, 1, h2connDummyReply())
+  fcSendPadded(st, 1, 100, 20, false) catch e {
+    assert(false, "building the padded DATA frame failed: ${e.message()}")
+    return
+  }
+  assert(st.running, "a padded frame within the window terminated the connection")
+  assert(len(s.recvBody) == 100, "recvBody = ${len(s.recvBody)} bytes, want 100")
+  let f = btNextWritten(st) catch e2 {
+    assert(false, "no WINDOW_UPDATE was queued for the peer: ${e2.message()}")
+    return
+  }
+  let wu = decodeWindowUpdate(f) catch e3 {
+    assert(false, "the queued frame is not a WINDOW_UPDATE: ${e3.message()}")
+    return
+  }
+  assert(wu.streamId == 0, "the first WINDOW_UPDATE is on stream ${wu.streamId}, want 0")
+  assert(
+    wu.increment == 121,
+    "the connection was granted ${wu.increment} bytes, want 121 (the whole payload)",
+  )
+  assert(
+    st.connRecvWindow == 1000,
+    "connRecvWindow = ${st.connRecvWindow} after the renewal, want 1000",
+  )
+  assert(s.recvWindow == 1000, "recvWindow = ${s.recvWindow} after the renewal, want 1000")
+}
+
+test "a padded DATA frame whose padding crosses the connection window is refused" {
+  // The window has 120 bytes left and the body is 100, so counting the body
+  // alone accepts the frame — but the peer spent 121 bytes of credit it did not
+  // hold, which is the overrun §6.9.1 makes a connection error.
+  let st = fcState(120, 1048576, 1048576)
+  let s = btOpenStream(st, 1, h2connDummyReply())
+  fcSendPadded(st, 1, 100, 20, false) catch e {
+    assert(false, "building the padded DATA frame failed: ${e.message()}")
+    return
+  }
+  assert(len(s.recvBody) == 0, "recvBody = ${len(s.recvBody)} bytes, want 0")
+  assert(
+    fcGoawayCode(st) == errorFlowControlError,
+    "no GOAWAY carrying ${errorFlowControlError} (FLOW_CONTROL_ERROR) was queued",
+  )
+  assert(!st.running, "the connection is still running after a flow-control error")
+}
