@@ -39,7 +39,9 @@ fn copy(src: string, dst: string): ()! {
 
 ### `File`
 
-An open file handle. Close it when done; nothing closes it for you.
+An open file handle. Close it when done; nothing closes it for you. Its `fd`
+field is the raw descriptor, so a buffered stream over the same file is
+`reader(f.fd)` / `writer(f.fd)` (`std/io`).
 
 ### `open(path: string): File!`
 
