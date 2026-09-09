@@ -1,0 +1,240 @@
+// In-Bit self-checks for the Windows half of the x86-64 frame — moved
+// verbatim out of compiler/x64framecheck.bit (#4322), which was 793 lines
+// against the hard 800-line E0200 ceiling.
+//
+// The Win64 stack probe (`__chkstk` carving) and the `.xdata` unwind-info
+// encoding, with the decoder the latter asserts against. The SysV-and-shared
+// stack/float/call/jump/frame/register-file checks stay in
+// x64framecheck.bit; read its header first.
+//
+// Split out of selfcheck.bit (#1503) originally, so this is the same module:
+// `selfcheck()` still calls these directly and nothing is imported here (a
+// duplicate import is E0042).
+// A prologue built with an empty savedGpr/savedXmm, so the only variable part
+// of the emitted bytes is the frame-carving instruction(s) under test — the
+// fixed `push rbp; mov rbp, rsp` prefix ("554889e5") is the same in every case
+// below and is included in each golden rather than stripped, matching
+// checkX64Prologue's own style.
+fn xWinProbePrologue(cc: XCallConv, frameSize: int): string {
+  let cx = newXCtx(cc)
+  cx.frame = XFrame{ savedGpr: []XReg64(0), savedXmm: []XmmReg(0),
+    numSpillSlots: 0, frameSize: frameSize }
+  xEmitPrologue(cx)
+  return xHex(cx.buf)
+}
+
+// #3327: Win64 needs to touch every page of a frame over one page, in
+// descending order, before rsp passes it — Windows has no fault-driven stack
+// growth, so a bare `sub rsp` that skips the guard page is an access
+// violation, not growth. SysV/macOS never probe: the kernel grows the stack
+// on any fault in the mapped region.
+fn checkX64WinStackProbe() {
+  // At or below one page: a bare `sub rsp, N`, byte-identical to what SysV
+  // already emits at every size — the common case pays nothing. Includes the
+  // exact threshold (4096) itself, which must NOT probe.
+  assert(xWinProbePrologue(XCallConv.Win64, 32) == "554889e54881ec20000000")
+  assert(xWinProbePrologue(XCallConv.SysV, 32) == "554889e54881ec20000000")
+  assert(xWinProbePrologue(XCallConv.Win64, 4095) == "554889e54881ecff0f0000")
+  assert(xWinProbePrologue(XCallConv.SysV, 4095) == "554889e54881ecff0f0000")
+  assert(xWinProbePrologue(XCallConv.Win64, 4096) == "554889e54881ec00100000")
+  assert(xWinProbePrologue(XCallConv.SysV, 4096) == "554889e54881ec00100000")
+
+  // Just over one page (4097 = 0x1001): exactly one page must be touched
+  // before the untouched tail (1 byte, safely within one page of the touch).
+  // The sequence, pinned exactly:
+  //   55 48 89 e5              push rbp; mov rbp, rsp
+  //   49 c7 c3 01 10 00 00     mov r11, 4097      (remaining)
+  //   49 c7 c2 00 10 00 00     mov r10, 4096      (page)
+  //   4d 39 d3                 cmp r11, r10
+  //   0f 86 1b 00 00 00        jbe +27            -> the tail sub, below
+  //   48 81 ec 00 10 00 00     sub rsp, 4096       (one full page)
+  //   4c 89 9c 24 00000000     mov [rsp], r11      (the touch)
+  //   49 81 eb 00 10 00 00     sub r11, 4096
+  //   e9 dc ff ff ff           jmp -36             -> back to the cmp
+  //   4c 29 dc                 sub rsp, r11        (the untouched tail)
+  let over1 = "554889e5" + "49c7c301100000" + "49c7c200100000" + "4d39d3" +
+    "0f861b000000" + "4881ec00100000" + "4c899c2400000000" + "4981eb00100000" +
+    "e9dcffffff" + "4c29dc"
+  assert(xWinProbePrologue(XCallConv.Win64, 4097) == over1)
+  // SysV at the same size stays a bare sub — no probe, ever.
+  assert(xWinProbePrologue(XCallConv.SysV, 4097) == "554889e54881ec01100000")
+
+  // Several pages (12788 = 3*4096 + 500): this is a REAL runtime loop, not
+  // unrolled per page, so the emitted CODE is the same shape as the
+  // just-over-one-page case above — only the `remaining` immediate differs.
+  // At runtime the back-edge (the "jmp -36") repeats the touch three times
+  // before falling into the tail; that repetition cannot be observed in the
+  // static bytes, which is exactly why it must be a loop and not unrolled
+  // (Power of 10: a statically bounded loop, not per-frame-size code growth).
+  let over3 = "554889e5" + "49c7c3f4310000" + "49c7c200100000" + "4d39d3" +
+    "0f861b000000" + "4881ec00100000" + "4c899c2400000000" + "4981eb00100000" +
+    "e9dcffffff" + "4c29dc"
+  assert(xWinProbePrologue(XCallConv.Win64, 12788) == over3)
+  assert(xWinProbePrologue(XCallConv.SysV, 12788) == "554889e54881ecf4310000")
+
+  // The two probing goldens differ ONLY in the `remaining` immediate (the
+  // movRI's imm32 at hex chars 14..22, "01100000" vs "f4310000" — 7 hex chars
+  // of "554889e549c7c3" precede it) — same length, same shape, confirming the
+  // loop's code size is independent of frame size.
+  assert(len(over1) == len(over3))
+  assert(over1[0:14] == over3[0:14])   // shared prefix through the opcode
+  assert(over1[14:22] != over3[14:22]) // the differing 4-byte immediate
+  assert(over1[22:len(over1)] == over3[22:len(over3)]) // identical from there on
+
+  // The touch is what makes the check load-bearing: it must be present for a
+  // probing frame and absent below the threshold. Mutation-tested manually —
+  // removing the xMovStore call in xEmitWinStackProbe drops this pattern and
+  // checkX64WinStackProbe fails (#3327).
+  let touch = "4c899c2400000000"
+  assert(hexHasIn(over1, touch))
+  assert(hexHasIn(over3, touch))
+  assert(!hexHasIn(xWinProbePrologue(XCallConv.Win64, 4096), touch))
+}
+
+// ---------------------------------------------------------------------------
+// #3345: Win64 UNWIND_INFO, decoded back and checked on VALUES rather than a
+// hand-computed hex golden — this exercises xPackUnwindInfo's on-disk
+// ordering (compiler/x64unwind.bit) independently of xEmitPrologue's own
+// byte emission, which the goldens above already pin.
+// ---------------------------------------------------------------------------
+
+class XDecodedOp {
+  codeOffset: int,
+  op: int,
+  opInfo: int,
+  operand: int, // 0 when the op has no operand slot
+}
+
+class XDecodedUnwind {
+  version: int,
+  sizeOfProlog: int,
+  countOfCodes: int,
+  frameRegister: int,
+  ops: []XDecodedOp, // ON-DISK order (decreasing CodeOffset) — the real
+                       // packed contract, not re-reversed back to emission
+                       // order, so an assertion on ops[0] is an assertion
+                       // about what an unwinder actually reads first.
+}
+
+fn xDecodeUnwindInfo(b: []u8): XDecodedUnwind {
+  assert(len(b) >= 4)
+  let version = int(b[0]) & 7
+  let sizeOfProlog = int(b[1])
+  let countOfCodes = int(b[2])
+  let frameRegister = int(b[3]) & 15
+  let ops = []XDecodedOp(0)
+  let slot = 0
+  let off = 4
+  while (slot < countOfCodes) {
+    let codeOffset = int(b[off])
+    let packed = int(b[off + 1])
+    let op = packed & 15
+    let opInfo = (packed >> 4) & 15
+    off = off + 2
+    slot = slot + 1
+    let operand = 0
+    if (op == xUwopAllocLarge() && opInfo == 0) {
+      operand = int(b[off]) | (int(b[off + 1]) << 8)
+      off = off + 2
+      slot = slot + 1
+    } else if (op == xUwopAllocLarge() && opInfo == 1) {
+      operand = int(b[off]) | (int(b[off + 1]) << 8) |
+        (int(b[off + 2]) << 16) | (int(b[off + 3]) << 24)
+      off = off + 4
+      slot = slot + 2
+    }
+    ops = append(ops, XDecodedOp{ codeOffset: codeOffset, op: op, opInfo: opInfo, operand: operand })
+  }
+  return XDecodedUnwind{ version: version, sizeOfProlog: sizeOfProlog,
+    countOfCodes: countOfCodes, frameRegister: frameRegister, ops: ops }
+}
+
+fn xUnwindPrologue(cc: XCallConv, savedGpr: []XReg64, frameSize: int): XUnwindInfo {
+  let cx = newXCtx(cc)
+  cx.frame = XFrame{ savedGpr: savedGpr, savedXmm: []XmmReg(0), numSpillSlots: 0,
+    frameSize: frameSize }
+  return xEmitPrologue(cx)
+}
+
+fn checkX64WinUnwindInfo() {
+  // SysV never gets unwind info — .pdata/.xdata do not exist there.
+  let none = xUnwindPrologue(XCallConv.SysV, []XReg64(0), 32)
+  assert(len(none.bytes) == 0)
+  assert(none.prologueSize == 0)
+
+  // No saved GPRs, a small frame: push rbp(1); mov rbp,rsp(3); sub rsp,32(7).
+  // Hand-verified: none of these three instructions ever needs a REX.B
+  // extension byte, so the length is exactly 1+3+7 = 11 in every build.
+  let u1 = xUnwindPrologue(XCallConv.Win64, []XReg64(0), 32)
+  assert(u1.prologueSize == 11)
+  assert(hexOfBytes(u1.bytes) == "010b04050b0104000403" + "0150")
+  let d1 = xDecodeUnwindInfo(u1.bytes)
+  assert(d1.version == 1)
+  assert(d1.sizeOfProlog == 11)
+  assert(d1.frameRegister == xRegNum(XReg64.Rbp))
+  assert(d1.countOfCodes == 4) // ALLOC_LARGE(2 slots) + SET_FPREG(1) + PUSH_NONVOL(1)
+  assert(len(d1.ops) == 3)
+  assert(d1.ops[0].op == xUwopAllocLarge() && d1.ops[0].opInfo == 0 &&
+    d1.ops[0].codeOffset == 11 && d1.ops[0].operand == 4) // 32/8
+  assert(d1.ops[1].op == xUwopSetFpreg() && d1.ops[1].codeOffset == 4)
+  assert(d1.ops[2].op == xUwopPushNonvol() && d1.ops[2].codeOffset == 1 &&
+    d1.ops[2].opInfo == xRegNum(XReg64.Rbp))
+
+  // Two saved GPRs, one of them (r12) needing a REX.B byte its push that
+  // rbp/rbx do not — asserted on VALUES read back from the real buffer
+  // length rather than a hand-counted byte offset, so this stays correct
+  // regardless of that encoding detail.
+  let u2 = xUnwindPrologue(XCallConv.Win64, [XReg64.Rbx, XReg64.R12], 48)
+  let d2 = xDecodeUnwindInfo(u2.bytes)
+  assert(d2.countOfCodes == 6) // ALLOC(2) + SET_FPREG(1) + 3x PUSH_NONVOL(1 each)
+  assert(len(d2.ops) == 5)
+  // On-disk order is decreasing CodeOffset — strictly, the sortedness this
+  // whole ticket is about, at the per-function level.
+  let oi = 1
+  while (oi < len(d2.ops)) {
+    assert(d2.ops[oi - 1].codeOffset > d2.ops[oi].codeOffset)
+    oi = oi + 1
+  }
+  assert(d2.ops[0].op == xUwopAllocLarge() && d2.ops[0].opInfo == 0 &&
+    d2.ops[0].codeOffset == u2.prologueSize)
+  assert(d2.ops[0].operand == 6) // 48/8
+  assert(d2.ops[1].op == xUwopPushNonvol() && d2.ops[1].opInfo == xRegNum(XReg64.R12)) // pushed last
+  assert(d2.ops[2].op == xUwopPushNonvol() && d2.ops[2].opInfo == xRegNum(XReg64.Rbx))
+  assert(d2.ops[3].op == xUwopSetFpreg())
+  assert(d2.ops[4].op == xUwopPushNonvol() && d2.ops[4].opInfo == xRegNum(XReg64.Rbp))
+
+  // #3327's stack probe: a frame over one guard page, and NOT a multiple of
+  // 8 (12788 = 4*4096 + ... ; picked, like checkX64WinStackProbe's own
+  // goldens above, to bracket the threshold rather than be realistic) — so
+  // this also exercises UWOP_ALLOC_LARGE's OpInfo-1 (unscaled 32-bit) form,
+  // the one xAllocLargeOp falls back to when the size does not divide by 8.
+  // UNWIND_INFO describes the AGGREGATE effect (net rsp change ==
+  // frameSize) rather than each touch in the loop — correct for any unwind
+  // query taken after the whole prologue completes (this ticket's own
+  // acceptance: "verified in a backtrace taken inside it", i.e. in the
+  // function body), and SizeOfProlog covers the entire probe sequence so a
+  // query never falls strictly between "in prologue" and "past it".
+  let u3 = xUnwindPrologue(XCallConv.Win64, []XReg64(0), 12788)
+  assert(12788 % 8 != 0)
+  // The probe loop's own code is a fixed ~57 bytes (checkX64WinStackProbe's
+  // "over1"/"over3" goldens), independent of frameSize — asserted here
+  // against that SAME golden helper rather than a second hand-counted
+  // literal, so the two checks cannot silently disagree about the loop's
+  // length. A bare `sub rsp, N` prologue is only 11 bytes (u1 above), so this
+  // is the discriminator that the probe path actually ran.
+  assert(u3.prologueSize == len(xWinProbePrologue(XCallConv.Win64, 12788)) / 2)
+  assert(u3.prologueSize > xUnwindPrologue(XCallConv.Win64, []XReg64(0), 32).prologueSize)
+  let d3 = xDecodeUnwindInfo(u3.bytes)
+  assert(d3.sizeOfProlog == u3.prologueSize)
+  assert(d3.countOfCodes == 5) // ALLOC_LARGE opInfo=1 (3 slots) + SET_FPREG(1) + PUSH_NONVOL(1)
+  assert(d3.ops[0].op == xUwopAllocLarge() && d3.ops[0].opInfo == 1)
+  assert(d3.ops[0].operand == 12788) // unscaled — OpInfo 1 carries the raw byte count
+  assert(d3.ops[0].codeOffset == u3.prologueSize)
+
+  // Mutation-tested manually (#3345): flipping xPackUnwindInfo's array-order
+  // loop from `while (i > 0) { i = i - 1; ... }` (decreasing CodeOffset, the
+  // real on-disk contract) to iterating forward instead desyncs the
+  // ordering assertion on d2.ops above (codeOffset stopped being strictly
+  // decreasing) and this check failed. Reverted; see the task-3345 report
+  // for the exact edit and observed failure.
+}
