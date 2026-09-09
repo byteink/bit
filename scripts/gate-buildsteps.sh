@@ -4,8 +4,10 @@
 # functions: bucket_scripts() is unchanged; build_steps_for_bucket(),
 # union_testsbit_steps(), assert_full_is_superset() and validate_build_steps()
 # each wrap a previously-inline block with no change to the statements inside
-# it. union_spec_steps() (#4136) is the one function here that is NOT a pure
-# move — see its own comment. Source this after `cd`-ing to the repo root,
+# it. union_spec_steps() (#4136) and assert_fmt_gate_per_bucket() (#4328) are
+# the two functions here that are NOT a pure move — see their own comments.
+# This file owns the BUCKET-side invariants (what a bucket must run);
+# scripts/gate-envscope.sh owns the GATE-side ones (what a gate declares). Source this after `cd`-ing to the repo root,
 # and after BUCKET/REASON/testsbit_steps/has_testsbit/SPEC_PARTNER are
 # already set by gate.sh's own bucket-selection logic — every function here
 # reads those as globals rather than taking parameters, matching gate.sh's
@@ -17,6 +19,7 @@
 #   union_testsbit_steps     # folds testsbit_steps into BUILD_STEPS + REASON
 #   union_spec_steps         # folds test-spec into BUILD_STEPS + REASON (#4136)
 #   assert_full_is_superset  # every bucket's scripts must be gate_scripts+ #2194
+#   assert_fmt_gate_per_bucket # every .bit tree's bucket runs a fmt gate #4328
 #   bucket_scripts "${BUCKET}"; PRE_SCRIPTS=...; POST_SCRIPTS=...
 #   validate_build_steps     # STALE check against ./make --list
 
@@ -425,6 +428,221 @@ for b in full selfhost runtime testcases examples stdlib pkg docs stdlibdocs spe
     esac
   done
 done
+}
+
+# ---------------------------------------------------------------------------
+# EVERY .bit TREE'S BUCKET RUNS A FMT GATE (#4328).
+#
+# scripts/gate-envscope.sh's three assertions all ask one question from the
+# GATE's side: gate G declares tree T, so the bucket owning T must list G. That
+# question is vacuous for a tree NO gate declares. #4325 edited
+# runtime/root/rootconfig.bit, scripts/gate.sh reported GATE_RESULT=PASS, and
+# merged `main` (ab12ff28) then failed test-fmt-strict on the file it had just
+# edited — the `runtime` bucket ran no formatter at all. #4445 closed that
+# instance by wiring the step in, and assert_envscoped_gates_current() holds it
+# shut. The other end of the same wire is still open: drop `runtime:runtime`
+# from BIT_FMTZERO_TREES and every assertion in that file stays green — the env
+# half has no runtime pair left to check, the bucket still lists the step —
+# while runtime/*.bit is once again formatted by nothing.
+#
+# So this asks it from the BUCKET's side, which is why it lives here beside
+# assert_full_is_superset() rather than in gate-envscope.sh (which is also at
+# 594 of the 800-line hard-zero ceiling, with no room for 200 lines): every
+# tree holding `.bit` sources must be `fmt --check`ed by some gate, and the
+# bucket that tree resolves to must run one of the gates that checks it.
+#
+# CALLED FROM scripts/gate.sh, right after assert_full_is_superset(), which is
+# after every module is sourced — it probes argvliteral_bucket_for_dir()
+# (gate-envscope.sh) and testsbit_steps_for() (gate-filemap.sh), neither of
+# which exists at this file's own source time.
+
+# Emits "<gate> <tree>" for every gate that runs `bit fmt --check` over a source
+# tree, from the two live gate tables, by the two spellings that exist:
+#
+#   1. `BIT_FMTZERO_TREES=name:relpath ...` — the four zero-tolerance gates on
+#      the shared driver _tests_/bit/fmtzerocheck.bit (#3713). Matched on that
+#      var by name, not on any `_TREES=`: this asks who FORMATS a tree, and a
+#      future BIT_<other>_TREES= gate would be a different claim.
+#   2. a Gate{} whose argv opens `["fmt", "--check"` — its bare
+#      `"${repoRoot()}/<dir>"` argv literals are the trees it formats. Keyed on
+#      the COMMAND the gate runs, not its name, so a fmt gate named something
+#      else is still found and a gate merely NAMED test-fmt-* is not miscounted
+#      (test-fmt-roundtrip and test-fmt-citations neither `--check` a tree).
+#
+# Line-based and name-tracking, exactly like gate-envscope.sh's
+# envscoped_gate_trees()/argvliteral_gate_paths(), including the `fn ` reset so
+# a `${repoRoot()}` literal in a helper is never attributed to the last Gate{}
+# scanned. An `env:` line ends an argv scan: test-fmt's argv spans three lines
+# with its env on the fourth, and an env entry's `${repoRoot()}` path is not a
+# formatted tree.
+fmt_gate_trees() {
+  local file line name m pair p inargv=0
+  for file in tools/build/gates.bit tools/build/gatestable2.bit; do
+    name=""
+    inargv=0
+    while IFS= read -r line; do
+      case "${line}" in
+        'fn '*) name=""; inargv=0 ;;
+      esac
+      case "${line}" in
+        *'Gate{name: "'*)
+          name="$(printf '%s' "${line}" | sed -n 's/.*Gate{name: "\([^"]*\)".*/\1/p')"
+          inargv=0
+          ;;
+      esac
+      [ -n "${name}" ] || continue
+      case "${line}" in
+        *'BIT_FMTZERO_TREES='*)
+          m="$(printf '%s' "${line}" | sed -n 's/.*BIT_FMTZERO_TREES=\([^"]*\)".*/\1/p')"
+          [ -n "${m}" ] || continue
+          for pair in ${m}; do
+            printf '%s %s\n' "${name}" "${pair#*:}"
+          done
+          continue
+          ;;
+      esac
+      case "${line}" in
+        *'"fmt", "--check"'*) inargv=1 ;;
+        *'env:'*) inargv=0 ;;
+      esac
+      [ "${inargv}" -eq 1 ] || continue
+      m="$(printf '%s' "${line}" | command grep -oE '"\$\{repoRoot\(\)\}/[^"$]+"' || true)"
+      [ -n "${m}" ] || continue
+      for p in ${m}; do
+        p="${p#\"\$\{repoRoot()\}/}"
+        printf '%s %s\n' "${name}" "${p%\"}"
+      done
+    done <"${file}"
+  done
+}
+
+# Prints one tree name per `.bit`-holding source tree, sorted and deduplicated.
+# DERIVED FROM DISK, never a hand list — `git ls-files '*.bit'` cut to its tree,
+# where git's pathspec `*` crosses `/` (a shell glob does not) and so one
+# pattern reaches every depth. Tracked or staged files only: a `--others` query
+# is perturbed by any other agent's scratch file in a shared checkout, and a new
+# tree is `git add`ed before it can be committed. `_tests_/` is cut one level
+# deeper because that is the granularity every routing table here and in
+# scripts/gate-classify.sh uses (_tests_/cases and _tests_/bit are different
+# buckets). A `.bit` file at the repo root belongs to no tree and is skipped —
+# there are none, and one would resolve to bucket `full` anyway.
+bit_source_trees() {
+  git ls-files '*.bit' |
+    awk -F/ 'NF < 2 { next } { if ($1 == "_tests_") print $1 "/" $2; else print $1 }' |
+    sort -u
+}
+
+# The live-query floor, named rather than counted for the same reason
+# gate-envscope.sh's ARGVSCOPE_COMPILER_FLOOR and ARGVLITERAL_FLOOR are:
+# bit_source_trees() returning nothing (a pathspec that stopped crossing `/`, a
+# `cd` that never happened) passes this assertion over an empty list, printing
+# exactly like a correctly wired tree.
+FMTGATE_TREE_FLOOR="compiler runtime stdlib examples pkg _tests_/cases _tests_/bit"
+
+# NAMED EXEMPTION: trees holding `.bit` sources that NO fmt gate names today, so
+# no bucket can carry one. Measured 2026-09-09 at dec67909 — 4 files, which
+# `./make test` does not format either. Filed as #4681; delete a name here when
+# that lands, or this assertion goes on skipping it. Both match no arm in
+# scripts/gate-classify.sh, so both resolve to has_other=1 -> bucket `full`.
+FMTGATE_UNGATED_TREES="_tests_/freestanding _tests_/testproj"
+
+# Fails loudly if this is called before the modules it probes are sourced.
+# Absent, `$(...)` yields empty and every tree looks unwired — a plausible WRONG
+# answer naming real trees, which is worse than a crash. Same shape and same
+# reason as gate-envscope.sh's assert_envscope_deps(), which this cannot reuse:
+# it does not check argvliteral_bucket_for_dir(), the one this needs most.
+assert_fmtgate_deps() {
+  local fn missing=""
+  for fn in argvliteral_bucket_for_dir testsbit_steps_for; do
+    command -v "${fn}" >/dev/null 2>&1 || missing="${missing:+${missing} }${fn}"
+  done
+  [ -z "${missing}" ] && return 0
+  echo "gate: assert_fmt_gate_per_bucket: called without its dependencies (${missing} undefined) — source scripts/gate-filemap.sh and scripts/gate-envscope.sh first, as scripts/gate.sh does. Refusing to report a verdict: with these absent every tree looks unwired and the failure list would name real trees for a reason that is not true of the tree." >&2
+  exit 2
+}
+
+# Asserts (1) every `.bit` source tree is formatted by some gate and (2) the
+# bucket that tree resolves to runs one of those gates. Probes the LIVE
+# build_steps_for_bucket()/testsbit_steps_for()/argvliteral_bucket_for_dir(),
+# never a second copy, so the only way to pass is to be wired. Shadows
+# BUCKET/BUILD_STEPS as locals, so it never disturbs the real diff's own bucket
+# selection running around it in scripts/gate.sh.
+assert_fmt_gate_per_bucket() {
+  local pairs trees tree want gate bucket probe result covering
+  local denom=0 routed=0 bad=""
+  local BUCKET BUILD_STEPS
+  assert_fmtgate_deps
+  pairs="$(fmt_gate_trees)"
+  if [ -z "${pairs}" ]; then
+    echo "gate: assert_fmt_gate_per_bucket: found ZERO gates formatting a tree across both gate tables — that is this function's own extraction breaking (today there are at least 5: test-fmt plus test-fmt-strict/-stress/-testsbit/-cases), not a fact about the tree" >&2
+    exit 2
+  fi
+  trees="$(bit_source_trees)"
+  for want in ${FMTGATE_TREE_FLOOR}; do
+    case "
+${trees}
+" in
+      *"
+${want}
+"*) ;;
+      *)
+        echo "gate: assert_fmt_gate_per_bucket: did NOT rediscover \"${want}\", which holds .bit sources by inspection — bit_source_trees() (scripts/gate-buildsteps.sh) has stopped matching. A discovery matching nothing looks exactly like a correctly wired tree; refusing to report a verdict." >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  while IFS= read -r tree; do
+    [ -n "${tree}" ] || continue
+    case " ${FMTGATE_UNGATED_TREES} " in
+      *" ${tree} "*) continue ;;
+    esac
+    denom=$((denom + 1))
+    covering="$(printf '%s\n' "${pairs}" | awk -v t="${tree}" '$2 == t { print $1 }')"
+    if [ -z "${covering}" ]; then
+      bad="${bad:+${bad}
+}tree \"${tree}\" holds .bit sources but NO gate runs \`bit fmt --check\` over it — add it to an existing BIT_FMTZERO_TREES gate or to test-fmt's argv (tools/build/gatestable2.bit), or name it in FMTGATE_UNGATED_TREES here with its ticket"
+      continue
+    fi
+    bucket="$(argvliteral_bucket_for_dir "${tree}")" || {
+      bad="${bad:+${bad}
+}tree \"${tree}\" holds .bit sources and is formatted by \"${covering}\", but argvliteral_bucket_for_dir() (scripts/gate-envscope.sh) does not know how to route it — add a case arm naming its bucket, or a named exemption with its reason"
+      continue
+    }
+    # An empty bucket is that table's own named exemption (tools, bench,
+    # editors): every diff touching one resolves to `full`, which runs every
+    # gate via the aggregate `test` step.
+    [ -n "${bucket}" ] || continue
+    routed=$((routed + 1))
+    if [ "${bucket}" = "testsbit" ]; then
+      case "${tree}" in
+        _tests_/bit) probe="_tests_/bit/golden/probe.bit" ;;
+        _tests_/stress) probe="_tests_/stress/probe.bit" ;;
+        _tests_/imports) probe="_tests_/imports/probe.bit" ;;
+      esac
+      result=" $(testsbit_steps_for "${probe}") "
+    else
+      BUCKET="${bucket}"
+      build_steps_for_bucket
+      result=" ${BUILD_STEPS[*]} "
+    fi
+    for gate in ${covering}; do
+      case "${result}" in
+        *" ${gate} "*) continue 2 ;;
+      esac
+    done
+    bad="${bad:+${bad}
+}tree \"${tree}\" is formatted by \"${covering}\", but bucket \"${bucket}\" runs none of those — a ${tree}/**-only diff reports PASS while unformatted (#4328)"
+  done <<EOF
+${trees}
+EOF
+
+  if [ -n "${bad}" ]; then
+    echo "gate: assert_fmt_gate_per_bucket: FAILED — ${denom} .bit source tree(s) checked, ${routed} routed to a bucket:" >&2
+    echo "${bad}" | sed 's/^/gate:   /' >&2
+    exit 2
+  fi
+  echo "gate: assert_fmt_gate_per_bucket: ${denom} .bit source tree(s), ${routed} routed to a bucket; each is fmt-gated and its bucket runs a gate that formats it"
 }
 
 validate_build_steps() {

@@ -536,6 +536,12 @@ if [ "${RESUME}" -eq 1 ]; then
   gate_resume_inject_new_gates
 fi
 assert_full_is_superset
+# #4328, the bucket-side twin of gate-envscope.sh's gate-side assertions above:
+# every tree holding .bit sources must be fmt-gated, and its bucket must run one
+# of the gates that formats it. Called here rather than chained inside
+# assert_envscoped_gates_current() because it probes argvliteral_bucket_for_dir()
+# from the module sourced after this one.
+assert_fmt_gate_per_bucket
 
 bucket_scripts "${BUCKET}"
 PRE_SCRIPTS="${BUCKET_PRE}"
