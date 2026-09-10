@@ -12,7 +12,7 @@
 #   # on the x86-64 box:
 #   docker build -f docker/linux-gate.Dockerfile -t bit-linux-gate-amd64:latest .
 #
-# The tags carry no version, on purpose: the image installs five Debian packages
+# The tags carry no version, on purpose: the image installs seven Debian packages
 # and nothing that pins a compiler, so there is no version for it to be OF. The
 # thing under test arrives with the tree (`git archive HEAD`) and the bootstrap
 # compiler is downloaded and digest-verified per run by scripts/stage0.sh.
@@ -42,8 +42,15 @@ FROM debian:bookworm
 # guard has never actually run on a Linux gate (#3909). macOS has otool from
 # the host, which is why this went unnoticed until objdump was checked for
 # directly.
+# Python 3: stdlib/compress/deflate.test.bit checks the DEFLATE encoder against a
+# second implementation by shelling out to its zlib
+# (`zlib.decompress(data, -15)`). Without the interpreter that shell script
+# exits 127 and 5 of test-stdlib-unit's 274 tests panic with `exited 127`
+# (#4731). Only the interpreter — no pip, no packages: the oracle imports
+# nothing outside the standard library. macOS borrows the host's, which is why
+# this went unnoticed until the Linux gates ran test-stdlib-unit.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates curl xz-utils procps binutils \
+ && apt-get install -y --no-install-recommends git ca-certificates curl xz-utils procps binutils python3 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
