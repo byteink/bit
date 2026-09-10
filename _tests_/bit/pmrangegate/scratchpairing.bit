@@ -1,0 +1,213 @@
+// _tests_/bit/pmrangegate/scratchpairing.bit — #4493: every pm self-check
+// that takes a scratch directory must give it back.
+//
+// `pmCheckScratchDir()` (compiler/pmfetchresolvecheck.bit:38) hands a check a
+// fresh directory under `$TMPDIR` and says, in its own comment, THE CALLER
+// OWNS IT: the check ends with `removeTree(root, pmCheckTimeoutMs)`. #4476
+// added that line to each of the 60 functions that had not had it, after they
+// left 23449 directories and ~2.3 GB in the one `$TMPDIR` every concurrent
+// agent on this machine shares. Nothing stops the 61st check from omitting it
+// again, and the failure is SILENT — the check passes, the directory simply
+// stays.
+//
+// This is the mechanical guard for that pairing, as a source scan: for every
+// top-level `fn` in `compiler/pm*check*.bit` and `compiler/projectcheck.bit`
+// whose body calls `pmCheckScratchDir()`, the same body must also call
+// `removeTree(`. It is a scan and not a new `Gate{}` deliberately (#4493): a
+// registration under `tools/build/**` would push every future ticket that
+// touches that file into `scripts/gate.sh`'s `full` bucket, which is a real
+// cost for a hygiene guard. It lives in this directory because
+// `test-pmrangegate` already runs `bit run` over it as one module, so it costs
+// no new gate and no new process.
+//
+// ANTI-VACUITY, the same rules the rest of this directory holds itself to:
+//
+//  - BOTH numbers are printed ("N of N scratch-dir checks clean up"), so a
+//    scan that matched nothing cannot read as a pass.
+//  - The denominator is floored (`minScratchChecks`): a scan that found the
+//    files but stopped understanding their shape would otherwise report
+//    "0 of 0" and pass. The floor is deliberately below today's count — it
+//    catches a collapsed scan, not the ordinary arrival of a new check.
+//  - The file list is floored too, and every named file must exist: a
+//    renamed or moved source file is a loud failure here, never a quietly
+//    smaller corpus.
+//  - A failure NAMES each offending function and its file, so the report is
+//    actionable without re-running the scan by hand.
+import { readDir } from "std/fs"
+import { contains, hasPrefix, hasSuffix, split } from "std/strings"
+
+// Power of 10 rule 2: the scan's bounds are stated, not hoped for.
+const maxScanFiles: int = 1024
+const maxScanLines: int = 4096
+
+// The floors that make a shrunken corpus a failure rather than a smaller
+// pass. Today's tree has 13 matching files and 63 scratch-dir checks
+// (`compiler/pm*check*.bit` plus `compiler/projectcheck.bit`); these sit
+// below that on purpose, so adding or splitting a check file is not a gate
+// break while a scan that stopped seeing whole files is.
+const minScratchFiles: int = 10
+const minScratchChecks: int = 55
+
+// The one function that legitimately names `pmCheckScratchDir()` without
+// cleaning anything up: its own definition. Every other mention is a call.
+const scratchDirFnName: string = "pmCheckScratchDir"
+
+class ScratchScan { files: int, checks: int, clean: int, offenders: []string }
+
+fn checkScratchDirCleanupPairing() {
+  let name = "scratch-pairing"
+  let dir = envOr("BIT_REPO", ".") + "/compiler"
+  let names = readDir(dir) catch e {
+    fatal(name, "cannot list ${dir}: " + e.message())
+    []string(0)
+  }
+  if (len(names) > maxScanFiles) {
+    fatal(name, "${dir} has ${len(names)} entries, over the ${maxScanFiles} bound")
+  }
+
+  let scan = scanScratchDirChecks(name, dir, names)
+  if (scan.files < minScratchFiles) {
+    fatal(
+      name,
+      "scanned only ${scan.files} pm check file(s) under ${dir}, want at least ${minScratchFiles} — the scan lost its corpus",
+    )
+  }
+  if (scan.checks < minScratchChecks) {
+    fatal(
+      name,
+      "found only ${scan.checks} function(s) calling ${scratchDirFnName}() across ${scan.files} file(s), want at least ${minScratchChecks} — the scan lost its shape",
+    )
+  }
+  if (len(scan.offenders) > 0) {
+    fatal(
+      name,
+        "${len(scan.offenders)} scratch-dir check(s) never call removeTree(), so their $TMPDIR fixture leaks (#4476): " +
+        joinLines(scan.offenders),
+    )
+  }
+  print("PASS: pmrangegate — ${scan.clean} of ${scan.checks} scratch-dir checks in ${scan.files} pm check file(s) call removeTree() (#4493)\n")
+}
+
+// `compiler/pm*check*.bit` and `compiler/projectcheck.bit` — the two shapes
+// #4493 names. Matched on the filename rather than on a hand-written list so
+// a check file added or split later is scanned without editing this file.
+fn isPmCheckFile(fileName: string): bool {
+  if (!hasSuffix(fileName, ".bit")) {
+    return false
+  }
+  if (fileName == "projectcheck.bit") {
+    return true
+  }
+  return hasPrefix(fileName, "pm") && contains(fileName, "check")
+}
+
+fn scanScratchDirChecks(name: string, dir: string, names: []string): ScratchScan {
+  let files = 0
+  let checks = 0
+  let clean = 0
+  let offenders = []string(0)
+  for fileName of names {
+    if (!isPmCheckFile(fileName)) {
+      continue
+    }
+    files = files + 1
+    let one = scanOneFile(name, dir + "/" + fileName, fileName)
+    checks = checks + one.checks
+    clean = clean + one.clean
+    for o of one.offenders {
+      offenders = append(offenders, o)
+    }
+  }
+  return ScratchScan{ files: files, checks: checks, clean: clean, offenders: offenders }
+}
+
+// The scan's state while it is inside one top-level function: the name, and
+// the two facts being paired.
+class FnScan { name: string, takesScratch: bool, cleansUp: bool }
+
+fn noFnScan(): FnScan {
+  return FnScan{ name: "", takesScratch: false, cleansUp: false }
+}
+
+// One file's top-level functions. A top-level `fn`/`export fn` starts at
+// column 0 and its body ends at the next line that is exactly `}` — the shape
+// `bit fmt` guarantees for every file in `compiler/`, and the same textual
+// heuristic _tests_/bit/lintcomplexity.bit uses for its own independent
+// function count.
+fn scanOneFile(name: string, path: string, fileName: string): ScratchScan {
+  let src = readFileMust(name, path)
+  let lines = split(src, "\n")
+  if (len(lines) > maxScanLines) {
+    fatal(name, "${path} has ${len(lines)} lines, over the ${maxScanLines} bound")
+  }
+  let out = ScratchScan{ files: 1, checks: 0, clean: 0, offenders: []string(0) }
+  let st = noFnScan()
+  for line of lines {
+    if (hasPrefix(line, "fn ") || hasPrefix(line, "export fn ")) {
+      st = FnScan{ name: topLevelFnName(line), takesScratch: false, cleansUp: false }
+    }
+    observeScanLine(st, line)
+    if (line == "}") {
+      closeFnScan(out, st, fileName)
+      st = noFnScan()
+    }
+  }
+  return out
+}
+
+// The two calls being paired, as seen on one line of a function's body. The
+// definition of `pmCheckScratchDir` itself names the call textually and
+// cleans nothing up, so it is the one function excluded by name.
+fn observeScanLine(st: FnScan, line: string) {
+  if (len(st.name) == 0 || st.name == scratchDirFnName) {
+    return
+  }
+  if (contains(line, "${scratchDirFnName}()")) {
+    st.takesScratch = true
+  }
+  if (contains(line, "removeTree(")) {
+    st.cleansUp = true
+  }
+}
+
+// A finished function counted into `out` — one more scratch-dir check, and
+// either one more clean one or one more named offender.
+fn closeFnScan(out: ScratchScan, st: FnScan, fileName: string) {
+  if (!st.takesScratch) {
+    return
+  }
+  out.checks = out.checks + 1
+  if (st.cleansUp) {
+    out.clean = out.clean + 1
+    return
+  }
+  out.offenders = append(out.offenders, "${fileName}: ${st.name}()")
+}
+
+// `fn foo(` / `export fn foo(` -> `foo`. Returns "" for a line this scan
+// cannot read as a named top-level function, which the caller treats as "not
+// inside a function" rather than guessing.
+fn topLevelFnName(line: string): string {
+  let rest = line
+  if (hasPrefix(rest, "export fn ")) {
+    rest = rest[len("export fn "):len(rest)]
+  } else {
+    rest = rest[len("fn "):len(rest)]
+  }
+  let i = 0
+  while (i < len(rest)) {
+    if (rest[i] == '(' || rest[i] == '<' || rest[i] == ' ') {
+      return rest[0:i]
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+fn joinLines(items: []string): string {
+  let out = ""
+  for item of items {
+    out = out + "\n    " + item
+  }
+  return out
+}

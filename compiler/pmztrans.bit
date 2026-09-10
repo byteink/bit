@@ -38,20 +38,37 @@
 // dependency's own dependency can itself be a vanity name, #2068) and
 // giving each surviving module its own top-level `bit.lock` entry.
 //
-// Two disjoint kinds of requirement, per SPEC §17.7 point 2:
-//   - version-tagged (an exact `vMAJOR.MINOR.PATCH` ref): every DISTINCT
-//     (name, version) pair reachable is fetched once to learn ITS OWN
-//     requirements, feeding `resolvePubGrub`'s `ReqGraph` as an Exact
-//     constraint (#2366's pmz.bit adaptation — every constraint this walk
-//     ever builds is Exact, since a version-tagged ref is already a single
-//     pinned commit, never a range); the resolved version per name is then
-//     the one actually locked, reusing the fetch already done during
-//     discovery rather than fetching a second time.
+// Three kinds of requirement, per SPEC §17.7 point 2:
+//   - version-tagged (an exact `MAJOR.MINOR.PATCH`/`vMAJOR.MINOR.PATCH`
+//     ref): every DISTINCT requirement reachable is resolved once to learn
+//     ITS OWN requirements, feeding `resolvePubGrub`'s `ReqGraph` as an
+//     Exact constraint; the resolved version per name is then the one
+//     actually locked, reusing the fetch already done during discovery
+//     rather than fetching a second time.
+//   - RANGE-shaped (`^`/`~`, #4488): the spelling `bit add` itself writes
+//     into `bit.json` (`AddRefResolution.writtenRef` is `formatConstraint`'s
+//     output), so it is the ordinary shape of a published package's own
+//     dependency. It names a SET, not a version, so it is resolved the same
+//     way a direct `bit add` resolves one — `listVersions` on the
+//     requirement's own `TagRemote`, then `highestInSet`
+//     (`resolveHighestSatisfying`, pmcliaddref.bit) — and feeds the graph as
+//     a real `Caret`/`Tilde` constraint rather than being dropped. Before
+//     #4488 it was classified as a branch name and handed to git verbatim,
+//     so `git ls-remote` was asked for a ref called `^0.1.0` and every such
+//     package failed to resolve at all.
 //   - non-version (a branch or bare commit SHA): SPEC's own carve-out — "a
 //     module reachable only through such a ref resolves to exactly that
 //     ref" — there is no ordering to arbitrate, so the first (and, since a
 //     name is fetched at most once here, only) ref discovered for a name is
 //     locked as-is.
+//
+// The CANDIDATE POOL a range is arbitrated against is what discovery
+// actually fetched (`packageVersionsFromModules`): a range contributes its
+// own highest match, plus whatever versions of that name other requirements
+// pulled in. So PubGrub can still step DOWN from a range's highest match
+// onto a lower version another requirement pinned, but it can never invent a
+// candidate nobody's requirement reached. Enumerating a range's full
+// candidate set up front, and fetching lazily per decision, is #2368's job.
 // A version-tagged resolution wins over a non-version one for the same name
 // if a walk somehow discovers both (an exact pinned version is a strictly
 // stronger constraint than an unordered branch/sha) — this resolver's one
@@ -85,12 +102,43 @@ class PendingReq { name: string, spec: string, fromRoot: bool }
 // stores (`host/owner/repo@ref` or `vanityPath@ref`) and extracts the ref
 // itself first.
 fn pendingVersionTag(spec: string): (Version, bool) {
-  let zero = Version{ major: 0, minor: 0, patch: 0 }
+  let (ref, ok) = pendingRef(spec)
+  if (!ok) {
+    return Version{ major: 0, minor: 0, patch: 0 }, false
+  }
+  return parseManifestVersionRef(ref)
+}
+
+// The trailing `@ref` of a full dependency spec, or `(_, false)` when the
+// spec carries none at all. The one place the `@` split is done, so
+// `pendingVersionTag` (above) and `pendingConstraint` (below) cannot drift
+// apart on what counts as the ref.
+fn pendingRef(spec: string): (string, bool) {
   let at = lastIndexByte(spec, '@')
   if (at < 0) {
-    return zero, false
+    return "", false
   }
-  return parseManifestVersionRef(spec[at + 1:len(spec)])
+  return spec[at + 1:len(spec)], true
+}
+
+// The version SET a full dependency spec's trailing `@ref` states — wider
+// than `pendingVersionTag` above by exactly the range forms: `@^0.1.0` and
+// `@~0.1.0` come back as real `Caret`/`Tilde` constraints instead of being
+// dropped (#4488), while both exact spellings still come back as `Exact`.
+// `(_, false)` for SPEC §17.7's other two ref forms, a branch name and a
+// bare commit sha, which name no version set at all.
+//
+// Parsed through `parseAddVersionRef` (pmcliaddref.bit) — the SAME parser
+// `bit add`/`bit up`/`bit outdated` use on a ref the user typed — rather
+// than a second grammar of this file's own: a manifest's requirement and a
+// command line's ref are the same language, and #4488 exists because the
+// walk had its own narrower reading of it.
+fn pendingConstraint(spec: string): (Constraint, bool) {
+  let (ref, ok) = pendingRef(spec)
+  if (!ok) {
+    return zeroConstraint(), false
+  }
+  return parseAddVersionRef(ref)
 }
 
 // A ref as a MANIFEST spells it, to the `Version` it names — SPEC §17.7's
@@ -147,8 +195,11 @@ fn enqueueRequires(queue: []PendingReq, rs: []LockRequire): []PendingReq {
   return out
 }
 
-// `rs` (raw `[]LockRequire`, full-spec-string refs) narrowed to its
-// version-shaped subset, as pmresolve.bit's `[]Requirement` — the data a
+// `rs` (raw `[]LockRequire`, full-spec-string refs) narrowed to the subset
+// that states a version SET — an exact pin or a `^`/`~` range (#4488),
+// carried through as the op it was written with — and dropping SPEC §17.7's
+// branch and bare-sha forms, which state no set to arbitrate. As
+// pmresolve.bit's `[]Requirement`: the data a
 // freshly-fetched module's own requirements become for `ReqGraph.modules`,
 // used by `resolveTransitiveDeps` (below) to seed each newly-discovered
 // module's own edges during the real transitive walk. NOT reused by
@@ -162,15 +213,9 @@ fn versionRequirementsOf(rs: []LockRequire): []Requirement {
   let out = []Requirement(0)
   let i = 0
   while (i < len(rs)) {
-    let (v, ok) = pendingVersionTag(rs[i].ref)
+    let (c, ok) = pendingConstraint(rs[i].ref)
     if (ok) {
-      out = append(
-        out,
-        Requirement{
-          name: rs[i].name,
-          constraint: Constraint{ op: ConstraintOp.Exact, version: v },
-        },
-      )
+      out = append(out, Requirement{ name: rs[i].name, constraint: c })
     }
     i = i + 1
   }
@@ -200,36 +245,68 @@ fn transitiveVanityRemote(gitBin: string, d: DepSpec, doc: VanityDoc, timeoutMs:
   }
 }
 
-// The commit `ref` names on `r`, and the git tag that matched it — the one
-// place the transitive walk decides how a requirement's ref becomes a
-// commit (#4481).
+// One transitive requirement's ref, resolved on `r`: the git tag that
+// matched (`""` for a branch or a bare sha, which match no tag), the commit
+// it names, and — for the two forms that state a version set — the VERSION
+// that was selected out of it. `isVersion` is the flag for whether
+// `version` means anything, and it is the same flag the walk uses to decide
+// whether this requirement is arbitrated by PubGrub at all.
+class TransitiveRef { tag: string, sha: string, version: Version, isVersion: bool }
+
+// The commit `ref` names on `r`, the git tag that matched it, and the
+// version that tag carries — the one place the transitive walk decides how a
+// requirement's ref becomes a commit (#4481, #4488).
 //
-// A version requirement (`parseManifestVersionRef`, above: either of SPEC
-// §17.7's two spellings) resolves through `resolveVersionRefSha`
-// (pmcliaddref.bit) — the SAME `v`-prefixed-then-bare rule, inside the same
-// `r.prefix` tag namespace, that `bit add`/`bit up`/`bit outdated` already
-// use — and reports the tag it matched, so `bit.lock` can record it
-// (#4472's `LockEntry.tag`). Two things follow that were not true before:
-// a repository that tags `v0.1.0` matches a requirement written `@0.1.0`,
-// and a `dir`-resolved package's `<key>/` namespace is searched instead of
-// the bare one that belongs to the host repository's own releases.
+// An EXACT version requirement (either of SPEC §17.7's two spellings)
+// resolves through `resolveVersionRefSha` (pmcliaddref.bit) — the SAME
+// `v`-prefixed-then-bare rule, inside the same `r.prefix` tag namespace,
+// that `bit add`/`bit up`/`bit outdated` already use — and reports the tag
+// it matched, so `bit.lock` can record it (#4472's `LockEntry.tag`). Two
+// things follow that were not true before: a repository that tags `v0.1.0`
+// matches a requirement written `@0.1.0`, and a `dir`-resolved package's
+// `<key>/` namespace is searched instead of the bare one that belongs to the
+// host repository's own releases.
+//
+// A RANGE (`^`/`~`, #4488) names no single tag, so there is nothing to look
+// up by name: it goes through `resolveHighestSatisfying` (pmcliaddref.bit),
+// which enumerates `r`'s tags inside `r.prefix` and picks the highest in the
+// set — `bit add`'s own selection rule, reused rather than reimplemented, so
+// the `<key>/` namespace and SPEC §17.7's 0.x caret boundary apply here
+// exactly as they do on the direct path. `constraintWant` supplies the same
+// "what was looked for" wording a failing direct add already prints.
 //
 // Anything else — a branch name, a bare commit sha (SPEC §17.7's other two
 // ref forms) — is handed to `resolveDependencyRef` verbatim, unchanged, and
-// reports no tag: there is no version to build a tag name out of, and the
-// ref the manifest wrote IS the git ref.
-fn resolveTransitiveRefSha(r: TagRemote, ref: string): (string, string)! {
-  let (v, isVersion) = parseManifestVersionRef(ref)
+// reports no tag and no version: there is no version to build a tag name out
+// of, and the ref the manifest wrote IS the git ref.
+fn resolveTransitiveRefSha(r: TagRemote, ref: string): TransitiveRef! {
+  let (c, isVersion) = parseAddVersionRef(ref)
   if (!isVersion) {
     let sha = resolveDependencyRef(r.gitBin, r.url, ref, r.timeoutMs)?
-    return "", sha
+    return TransitiveRef{
+      tag: "",
+      sha: sha,
+      version: Version{ major: 0, minor: 0, patch: 0 },
+      isVersion: false,
+    }
   }
-  return resolveVersionRefSha(r, v)?
+  if (c.op == ConstraintOp.Exact) {
+    let (tag, sha) = resolveVersionRefSha(r, c.version)?
+    return TransitiveRef{ tag: tag, sha: sha, version: c.version, isVersion: true }
+  }
+  let picked = resolveHighestSatisfying(r, versionSetFromConstraint(c), constraintWant(r.prefix, c))?
+  return TransitiveRef{
+    tag: picked.ref,
+    sha: picked.sha,
+    version: picked.version,
+    isVersion: true,
+  }
 }
 
 // Resolves one transitive requirement's full spec (a dependency's own
 // `bit.json` value, e.g. `"local.invalid/dev/textutil@v0.1.0"`) to a fetched
-// `LockEntry`, routing it through the identical direct-vs-vanity
+// `TransitiveDep` — the `LockEntry` for it plus the version its ref selected
+// (below) — routing it through the identical direct-vs-vanity
 // classification (`parseSpec`/`parseAddSpec`) and fetch machinery
 // (`fetchSha`/`resolveVanityUrl`) a root `bit add` uses — a transitive
 // dependency's own dependency can itself be a vanity name (#2068), so this
@@ -243,7 +320,7 @@ fn resolveTransitiveSpec(
   name: string,
   spec: string,
   timeoutMs: int,
-): LockEntry! {
+): TransitiveDep! {
   let d = parseAddSpec(spec)?
   // SECURITY (#2244): a local filesystem / "file://" dependency is only ever
   // trusted directly from the ROOT project's own bit.json
@@ -265,30 +342,7 @@ fn resolveTransitiveSpec(
     fail newError("pmz: transitive dependency '${name}' requests a local filesystem path (${d.localPath}) — local/file:// dependencies are only allowed directly in a project's own bit.json, never as a requirement of another dependency")
   }
   if (d.vanity) {
-    let doc = resolveVanityUrl(d.vanityName, vanityTimeoutMs)?
-    let remote = parseGitRemoteUrl(doc.gitUrl)?
-    let (tag, sha) = resolveTransitiveRefSha(
-      transitiveVanityRemote(gitBin, d, doc, timeoutMs),
-      d.ref,
-    )?
-    let fetched = fetchSha(
-      gitBin,
-      cacheRoot,
-      remote,
-      GitFetchTarget{ url: doc.gitUrl, sha: sha, pkgDir: doc.dir },
-      timeoutMs,
-    )?
-    let pkgDir = vanityPackageDir(fetched.dir, doc.dir)?
-    let depManifest = readManifest(pkgDir)?
-    return LockEntry{
-      name: name,
-      url: doc.gitUrl,
-      commit: sha,
-      tag: tag,
-      requires: manifestRequires(depManifest),
-      vanity: d.vanityName,
-      dir: doc.dir,
-    }
+    return resolveTransitiveVanitySpec(cacheRoot, gitBin, name, d, timeoutMs)?
   }
   let url = defaultDepUrl(d.host, d.owner, d.repo)
   if (d.scheme == "ssh") {
@@ -297,23 +351,74 @@ fn resolveTransitiveSpec(
   // No namespace on a direct spec: the repository IS the package, so its
   // versions are the bare `vX.Y.Z`/`X.Y.Z` tags at the top of its own tag
   // namespace — the pre-#4472 rule, unchanged.
-  let (tag, sha) = resolveTransitiveRefSha(
+  let rr = resolveTransitiveRefSha(
     TagRemote{ gitBin: gitBin, url: url, prefix: "", timeoutMs: timeoutMs },
     d.ref,
   )?
   let fetched = fetchSha(
     gitBin, cacheRoot, GitRemoteRepo{ host: d.host, owner: d.owner, repo: d.repo },
-    GitFetchTarget{ url: url, sha: sha, pkgDir: "" }, timeoutMs,
+    GitFetchTarget{ url: url, sha: rr.sha, pkgDir: "" }, timeoutMs,
   )?
   let depManifest = readManifest(fetched.dir)?
-  return LockEntry{
-    name: name,
-    url: url,
-    commit: sha,
-    tag: tag,
-    requires: manifestRequires(depManifest),
-    vanity: "",
-  }
+  return resolvedTransitiveDep(
+    LockEntry{
+      name: name,
+      url: url,
+      commit: rr.sha,
+      tag: rr.tag,
+      requires: manifestRequires(depManifest),
+      vanity: "",
+    },
+    rr,
+  )
+}
+
+// `resolveTransitiveSpec`'s vanity arm (#2068): the vanity name is resolved
+// to a `bit-import:` document first, and the fetch is a SUBDIRECTORY of the
+// repository that document names when it carries a `dir` field
+// (`vanityPackageDir`), so the requirement's versions live in that package's
+// own `<key>/` tag namespace rather than the repository's own
+// (`transitiveVanityRemote`, #4472).
+fn resolveTransitiveVanitySpec(
+  cacheRoot: string, gitBin: string, name: string, d: DepSpec, timeoutMs: int,
+): TransitiveDep! {
+  let doc = resolveVanityUrl(d.vanityName, vanityTimeoutMs)?
+  let remote = parseGitRemoteUrl(doc.gitUrl)?
+  let rr = resolveTransitiveRefSha(transitiveVanityRemote(gitBin, d, doc, timeoutMs), d.ref)?
+  let fetched = fetchSha(
+    gitBin,
+    cacheRoot,
+    remote,
+    GitFetchTarget{ url: doc.gitUrl, sha: rr.sha, pkgDir: doc.dir },
+    timeoutMs,
+  )?
+  let pkgDir = vanityPackageDir(fetched.dir, doc.dir)?
+  let depManifest = readManifest(pkgDir)?
+  return resolvedTransitiveDep(
+    LockEntry{
+      name: name,
+      url: doc.gitUrl,
+      commit: rr.sha,
+      tag: rr.tag,
+      requires: manifestRequires(depManifest),
+      vanity: d.vanityName,
+      dir: doc.dir,
+    },
+    rr,
+  )
+}
+
+// One transitive requirement resolved all the way to bytes on disk: the
+// `bit.lock` entry for it, and the version its ref selected. The version
+// travels beside the entry rather than inside it because `LockEntry.version`
+// records the version PubGrub finally chose for the name
+// (`lockEntryResolvedAs`), which is not necessarily the one this particular
+// requirement asked for — a range's highest match can lose to a lower
+// version another requirement pinned.
+class TransitiveDep { entry: LockEntry, version: Version, isVersion: bool }
+
+fn resolvedTransitiveDep(entry: LockEntry, rr: TransitiveRef): TransitiveDep {
+  return TransitiveDep{ entry: entry, version: rr.version, isVersion: rr.isVersion }
 }
 
 // Runs `resolvePubGrub` (#2366) over `rootRequires`/`modules`, converting a
@@ -338,109 +443,162 @@ fn pmResolveOrFail(rootRequires: []RootRequirement, modules: []ModuleReqs): map<
   }
 }
 
-// Fetches every dependency reachable from `seed` (typically every
-// already-locked entry's own `requires`, flattened — `flattenRequires`,
-// below) that does not already have a top-level `bit.lock` entry, giving
-// each its own entry — the loop pmz.bit's own module comment says
-// `pmresolve.bit` is missing. Discovery never mutates `entries` — it only
-// fetches and records candidates — so `entries` is exactly as it started
-// throughout the walk regardless of queue order; both classes of winner
-// (version-tagged and non-version) are written into `entries` only in the
-// two materialization passes at the end.
-//
-// Bounded worklist: `queue` only ever grows from a freshly-fetched
-// dependency's own `requires` list (`enqueueRequires`), and a `(name,
-// version)` or bare `name` pair already visited is never re-enqueued for a
-// fetch (`visitedVersions`/`visitedNonVersion`) — so the total number of
-// fetches this performs is bounded by the number of distinct requirement
-// edges reachable across every `bit.json` this walk actually reads, the same
-// bound `resolvePubGrub`'s own worklist comment gives for its walk, and a
-// cycle or self-dependency cannot loop it forever for the identical reason.
-export fn resolveTransitiveDeps(
-  cacheRoot: string, gitBin: string, entries: []LockEntry, seed: []LockRequire, timeoutMs: int,
-): []LockEntry! {
+// Everything one `resolveTransitiveDeps` walk discovers, in one place so
+// each step below takes it as a single parameter (spec/LINT.md's E0202,
+// `max-params` 5) instead of threading seven collections through every
+// signature. `locked` is the caller's already-locked entries, READ-ONLY for
+// the whole walk: discovery only fetches and records candidates, so the
+// answer never depends on queue order, and both classes of winner are
+// written into the caller's list only in the two materialization passes at
+// the end.
+class TransWalk {
+  cacheRoot: string,
+  gitBin: string,
+  timeoutMs: int,
+  locked: []LockEntry,
+  queue: []PendingReq,
+  visitedSpec: map<string, bool>,
+  rootRequires: []RootRequirement,
+  modules: []ModuleReqs,
+  fetchedByVersion: map<string, LockEntry>,
+  visitedNonVersion: map<string, bool>,
+  nonVersionFetched: map<string, LockEntry>,
+  nonVersionNames: []string,
+}
+
+// A walk seeded with `seed`'s requirements as this resolver's own roots —
+// the only `PendingReq`s carrying `fromRoot: true`, and therefore the only
+// ones fed to `resolvePubGrub` as `RootRequirement`s.
+fn newTransWalk(
+  cacheRoot: string, gitBin: string, locked: []LockEntry, seed: []LockRequire, timeoutMs: int,
+): TransWalk {
   let queue = []PendingReq(0)
   let i = 0
   while (i < len(seed)) {
     queue = append(queue, PendingReq{ name: seed[i].name, spec: seed[i].ref, fromRoot: true })
     i = i + 1
   }
-
-  let rootRequires = []RootRequirement(0)
-  let modules = []ModuleReqs(0)
-  let fetchedByVersion = map<string, LockEntry>{}
-  let visitedVersions = map<string, bool>{}
-  let nonVersionFetched = map<string, LockEntry>{}
-  let visitedNonVersion = map<string, bool>{}
-  let nonVersionNames = []string(0)
-
-  let qi = 0
-  while (qi < len(queue)) {
-    let req = queue[qi]
-    qi = qi + 1
-    if (lockHasEntry(entries, req.name)) {
-      continue
-    }
-
-    let (ver, isVersion) = pendingVersionTag(req.spec)
-    if (!isVersion) {
-      let (_, seenNV) = visitedNonVersion[req.name]
-      if (seenNV) {
-        continue
-      }
-      visitedNonVersion[req.name] = true
-      let entry = resolveTransitiveSpec(cacheRoot, gitBin, req.name, req.spec, timeoutMs)?
-      nonVersionFetched[req.name] = entry
-      nonVersionNames = append(nonVersionNames, req.name)
-      queue = enqueueRequires(queue, entry.requires)
-      continue
-    }
-
-    if (req.fromRoot) {
-      rootRequires = append(
-        rootRequires,
-        RootRequirement{
-          requirer: "root",
-          name: req.name,
-          constraint: Constraint{ op: ConstraintOp.Exact, version: ver },
-        },
-      )
-    }
-
-    let key = "${req.name}@${ver.major}.${ver.minor}.${ver.patch}"
-    let (_, seenV) = visitedVersions[key]
-    if (seenV) {
-      continue
-    }
-    visitedVersions[key] = true
-    let entry = resolveTransitiveSpec(cacheRoot, gitBin, req.name, req.spec, timeoutMs)?
-    fetchedByVersion[key] = entry
-    modules = append(
-      modules,
-      ModuleReqs{ name: req.name, version: ver, requires: versionRequirementsOf(entry.requires) },
-    )
-    queue = enqueueRequires(queue, entry.requires)
+  return TransWalk{
+    cacheRoot: cacheRoot,
+    gitBin: gitBin,
+    timeoutMs: timeoutMs,
+    locked: locked,
+    queue: queue,
+    visitedSpec: map<string, bool>{},
+    rootRequires: []RootRequirement(0),
+    modules: []ModuleReqs(0),
+    fetchedByVersion: map<string, LockEntry>{},
+    visitedNonVersion: map<string, bool>{},
+    nonVersionFetched: map<string, LockEntry>{},
+    nonVersionNames: []string(0),
   }
+}
 
-  let resolved = pmResolveOrFail(rootRequires, modules)?
+// Records one resolved version candidate — keyed on the version that was
+// SELECTED, not on the requirement that selected it, so two requirements
+// landing on the same version (an exact `@0.1.5` and a `^0.1.0` that
+// resolves to it) contribute one `ModuleReqs` entry and one fetch's worth of
+// edges, exactly as two identical exact pins already did.
+fn recordVersionCandidate(w: TransWalk, req: PendingReq, dep: TransitiveDep) {
+  let key = "${req.name}@${versionText(dep.version)}"
+  let (_, seen) = w.fetchedByVersion[key]
+  if (seen) {
+    return
+  }
+  w.fetchedByVersion[key] = dep.entry
+  w.modules = append(
+    w.modules,
+    ModuleReqs{
+      name: req.name,
+      version: dep.version,
+      requires: versionRequirementsOf(dep.entry.requires),
+    },
+  )
+  w.queue = enqueueRequires(w.queue, dep.entry.requires)
+}
 
-  // Version-tagged winners first — the tie-break rule this resolver's own
-  // module comment names.
+// One requirement off the queue: resolved, fetched, and recorded under
+// whichever of the two classes its ref belongs to.
+//
+// The dedup key for a version-set requirement is the requirement STRING, not
+// the version — a range has no version until it has been resolved against
+// the remote, which is a fetch. Two different spellings of the same exact
+// version (`@v1.2.3` and `@1.2.3`) therefore resolve twice where they used
+// to resolve once; `recordVersionCandidate` above still collapses them into
+// one candidate, and the walk still terminates for the same reason it always
+// did — the number of distinct (name, ref) pairs reachable across every
+// `bit.json` it reads is finite, so a cycle or self-dependency cannot loop
+// it forever.
+fn walkRequirement(w: TransWalk, req: PendingReq): ()! {
+  if (lockHasEntry(w.locked, req.name)) {
+    return
+  }
+  let (c, statesVersion) = pendingConstraint(req.spec)
+  if (!statesVersion) {
+    let (_, seenNV) = w.visitedNonVersion[req.name]
+    if (seenNV) {
+      return
+    }
+    w.visitedNonVersion[req.name] = true
+    let dep = resolveTransitiveSpec(w.cacheRoot, w.gitBin, req.name, req.spec, w.timeoutMs)?
+    w.nonVersionFetched[req.name] = dep.entry
+    w.nonVersionNames = append(w.nonVersionNames, req.name)
+    w.queue = enqueueRequires(w.queue, dep.entry.requires)
+    return
+  }
+  if (req.fromRoot) {
+    w.rootRequires = append(
+      w.rootRequires,
+      RootRequirement{ requirer: "root", name: req.name, constraint: c },
+    )
+  }
+  let specKey = "${req.name}@${req.spec}"
+  let (_, seenSpec) = w.visitedSpec[specKey]
+  if (seenSpec) {
+    return
+  }
+  w.visitedSpec[specKey] = true
+  let dep = resolveTransitiveSpec(w.cacheRoot, w.gitBin, req.name, req.spec, w.timeoutMs)?
+  recordVersionCandidate(w, req, dep)
+}
+
+// Bounded worklist: `w.queue` only ever grows from a freshly-fetched
+// dependency's own `requires` list (`enqueueRequires`), and a requirement
+// already resolved is never resolved again (`walkRequirement`'s two visited
+// maps) — so the total number of fetches is bounded by the number of
+// distinct requirement edges reachable across every `bit.json` this walk
+// actually reads, the same bound `resolvePubGrub`'s own worklist comment
+// gives for its walk.
+fn runTransWalk(w: TransWalk): ()! {
+  let qi = 0
+  while (qi < len(w.queue)) {
+    let req = w.queue[qi]
+    qi = qi + 1
+    walkRequirement(w, req)?
+  }
+}
+
+// The version-tagged winners, written into `entries` — the tie-break rule
+// this file's module comment names, applied first so a name discovered both
+// ways keeps its arbitrated version.
+fn materializeVersionWinners(
+  entries: []LockEntry, w: TransWalk, resolved: map<string, Version>,
+): []LockEntry! {
+  let out = entries
   let vi = 0
-  while (vi < len(modules)) {
-    let name = modules[vi].name
+  while (vi < len(w.modules)) {
+    let name = w.modules[vi].name
     vi = vi + 1
-    if (lockHasEntry(entries, name)) {
+    if (lockHasEntry(out, name)) {
       continue
     }
     let (winner, found) = resolved[name]
     if (!found) {
       continue
     }
-    let winKey = "${name}@${winner.major}.${winner.minor}.${winner.patch}"
-    let (entry, hasEntry) = fetchedByVersion[winKey]
+    let (entry, hasEntry) = w.fetchedByVersion["${name}@${versionText(winner)}"]
     if (!hasEntry) {
-      fail newError("pmcli: internal error resolving transitive dependency ${name}: PubGrub chose v${winner.major}.${winner.minor}.${winner.patch}, which this resolver never fetched")
+      fail newError("pmcli: internal error resolving transitive dependency ${name}: PubGrub chose v${versionText(winner)}, which this resolver never fetched")
     }
     // `winner` IS the version #2366's PubGrub resolver just matched for
     // `name` — recorded verbatim (#2856), not re-derived from `entry`'s own
@@ -451,29 +609,49 @@ export fn resolveTransitiveDeps(
     // from `winner`: the two spellings `v0.1.0` and `0.1.0` name the same
     // version and different git tags, and on a `dir` package the tag is
     // `<key>/v0.1.0` (#4472), so it cannot be rebuilt from the version here.
-    // `entry` is the one fetched for `winKey`, i.e. for `winner` itself, so
-    // its tag is `winner`'s tag and not some other candidate's.
-    entries = upsertLockEntry(entries, lockEntryResolvedAs(entry, versionText(winner), entry.tag))
+    // `entry` is the one fetched for that exact version, so its tag is
+    // `winner`'s tag and not some other candidate's.
+    out = upsertLockEntry(out, lockEntryResolvedAs(entry, versionText(winner), entry.tag))
   }
+  return out
+}
 
+// The branch/bare-sha winners, written into `entries` after the version ones
+// so a name discovered both ways keeps the arbitrated version (an exact
+// pinned version is a strictly stronger constraint than an unordered ref).
+fn materializeNonVersionRefs(entries: []LockEntry, w: TransWalk): []LockEntry {
+  let out = entries
   let ni = 0
-  while (ni < len(nonVersionNames)) {
-    let name = nonVersionNames[ni]
+  while (ni < len(w.nonVersionNames)) {
+    let name = w.nonVersionNames[ni]
     ni = ni + 1
-    if (lockHasEntry(entries, name)) {
+    if (lockHasEntry(out, name)) {
       continue
     }
-    let (entry, hasEntry) = nonVersionFetched[name]
+    let (entry, hasEntry) = w.nonVersionFetched[name]
     if (!hasEntry) {
       continue
     }
     // A branch or bare-sha requirement (`nonVersionFetched`'s own
     // definition, above) is never a version (#2856): "" records "unknown",
     // exactly as an entry written before this field existed would read back.
-    entries = upsertLockEntry(entries, lockEntryResolvedAs(entry, "", ""))
+    out = upsertLockEntry(out, lockEntryResolvedAs(entry, "", ""))
   }
+  return out
+}
 
-  return entries
+// Fetches every dependency reachable from `seed` (typically every
+// already-locked entry's own `requires`, flattened — `flattenRequires`,
+// below) that does not already have a top-level `bit.lock` entry, giving
+// each its own entry — the loop pmz.bit's own module comment says
+// `pmresolve.bit` is missing.
+export fn resolveTransitiveDeps(
+  cacheRoot: string, gitBin: string, entries: []LockEntry, seed: []LockRequire, timeoutMs: int,
+): []LockEntry! {
+  let w = newTransWalk(cacheRoot, gitBin, entries, seed, timeoutMs)
+  runTransWalk(w)?
+  let resolved = pmResolveOrFail(w.rootRequires, w.modules)?
+  return materializeNonVersionRefs(materializeVersionWinners(entries, w, resolved)?, w)
 }
 
 // Every entry's own `requires`, flattened into one `[]LockRequire` — the
