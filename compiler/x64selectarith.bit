@@ -39,10 +39,12 @@ fn xEmitPow2MulInt(cx: XCtx, dst: int, value: int, k: int, w: Width) {
 }
 
 // `factor` is xConstPow2Factor's verdict, precomputed by the caller
-// (xEmitInst) exactly as xEmitDivInt's `pow2K` is and for the same reason: it
+// (xEmitInst) exactly as xEmitDivInt's `plan` is and for the same reason: it
 // needs the ORIGINAL IrFunc, which a unit test's fabricated XCtx does not
-// carry.
-fn xEmitMulInt(cx: XCtx, dst: int, lhs: int, rhs: int, factor: Pow2Factor, w: Width) {
+// carry. It carries the result width too (`factor.w`, x64call.bit), so the
+// reduced and unreduced arms cannot be given different widths.
+fn xEmitMulInt(cx: XCtx, dst: int, lhs: int, rhs: int, factor: Pow2Factor) {
+  let w = factor.w
   if (factor.k >= 0) {
     xEmitPow2MulInt(cx, dst, factor.value, factor.k, w)
     return
@@ -177,7 +179,7 @@ fn xEmitPow2RemInt(cx: XCtx, dst: int, lhs: int, k: int, signed: bool) {
 // `plan` is xDivisorPlan's verdict on `rhs` (divplan.bit), precomputed at the
 // call site rather than looked up here because it needs the ORIGINAL IrFunc,
 // which a unit test's fabricated XCtx does not carry — mirroring
-// xEmitShiftInt's `constAmt`.
+// xEmitShiftInt's `XShiftPlan`.
 
 // The ONE shape that emits no divide -- the twin of arm64's
 // `emitReducedDivInt`, and written the same way so the two backends cannot
@@ -302,6 +304,20 @@ enum XFCmp {
   FGe,
 }
 
+// One float instruction described: the comparison, and the width in BYTES (4
+// or 8) of the operands it reads — `ucomiss` vs `ucomisd` is that width and
+// nothing else. Grouped for the reason `DivPlan` groups a divide's op and
+// width (divplan.bit, #4727), with one extra: a float compare's width comes
+// from its OPERANDS, never from its own bool result, and every caller that
+// spelled the two out separately had to re-derive that. `XFArithOp` below is
+// the same pairing for the arithmetic ops; they stay two classes because
+// `XFCmp` and `XFArith` are two enums, and an emitter total over six named
+// comparisons is worth more than one class taking a raw `Op`.
+class XFCmpOp {
+  cc: XFCmp,
+  width: int,
+}
+
 // `dst = lhs <cc> rhs` for floats — IEEE semantics, which is why this is not
 // just an icmp with different condition codes.
 //
@@ -313,7 +329,9 @@ enum XFCmp {
 //   - EQ must be "equal AND ordered": ucomis sets ZF for equal AND for
 //     unordered, so `sete` alone would make NaN == NaN true.
 //   - NE must be "not-equal OR unordered", so NaN != NaN stays true.
-fn xEmitFcmp(cx: XCtx, op: XFCmp, dst: int, lhs: int, rhs: int, width: int) {
+fn xEmitFcmp(cx: XCtx, dst: int, lhs: int, rhs: int, fc: XFCmpOp) {
+  let op = fc.cc
+  let width = fc.width
   let l = xGetFloat(cx, lhs, xFScratch1())
   let r = xGetFloat(cx, rhs, xFScratch2())
   if (op == XFCmp.FGt || op == XFCmp.FGe) {
@@ -379,7 +397,16 @@ fn xFloatAcc(cx: XCtx, vreg: int, scratch: XmmReg): XmmReg {
 // 47 register-to-register `movsd` left in mandelbrot's `main`, in the shape
 // `movsd l,xmm14 / mulsd r,xmm14 / movsd xmm14,dst` where two instructions do,
 // or one when dst and l coincide.
-fn xEmitBinaryFloat(cx: XCtx, op: XFArith, dst: int, lhs: int, rhs: int, width: int) {
+// The arithmetic twin of `XFCmpOp`: which of the four ops, and the operand
+// width in bytes that picks the `ss`/`sd` form.
+class XFArithOp {
+  op: XFArith,
+  width: int,
+}
+
+fn xEmitBinaryFloat(cx: XCtx, dst: int, lhs: int, rhs: int, fa: XFArithOp) {
+  let op = fa.op
+  let width = fa.width
   let l = xGetFloat(cx, lhs, xFScratch1())
   let r = xGetFloat(cx, rhs, xFScratch2())
   let acc = xFloatAcc(cx, dst, xFScratch1())
@@ -467,14 +494,19 @@ fn xMovGX(b: X64Buf, dst: XReg64, src: XmmReg, width: int) {
   xEmitByte(b, xModrmReg(xmmNum(src), xRegNum(dst)))
 }
 
-// `dst = lhs << rhs` / `>> rhs`. `constAmt >= 0` selects the immediate form;
+// `dst = lhs << rhs` / `>> rhs`. `plan.amt >= 0` selects the immediate form;
 // otherwise the count goes through cl, x86-64's only variable shift count —
 // which is why a function with a variable shift excludes rcx from allocation.
-fn xEmitShiftInt(cx: XCtx, op: XShift, dst: int, lhs: int, rhs: int, constAmt: int, w: Width) {
+//
+// `plan` is `xShiftPlanFor`'s verdict (x64call.bit): the amount needs the
+// ORIGINAL IrFunc, and the op and width it was built alongside ride with it,
+// as `DivPlan` does for a divide.
+fn xEmitShiftInt(cx: XCtx, dst: int, lhs: int, rhs: int, plan: XShiftPlan) {
+  let op = plan.op
   let l = xGetInt(cx, lhs, xScratch1())
   let acc = xIntAccMov(cx, dst, l, xScratch1(), xScratch1())
-  if (constAmt >= 0) {
-    xShiftImm(cx.buf, op, acc, constAmt)
+  if (plan.amt >= 0) {
+    xShiftImm(cx.buf, op, acc, plan.amt)
   } else {
     let r = xGetInt(cx, rhs, xScratch2())
     // xIntAccMov's guard, deferred because `rhs` is fetched only on this arm.
@@ -488,7 +520,7 @@ fn xEmitShiftInt(cx: XCtx, op: XShift, dst: int, lhs: int, rhs: int, constAmt: i
   // canonical operand to a canonical result, so they need no re-narrowing —
   // and that is exactly why the canonical invariant is worth maintaining.
   if (op == XShift.Shl) {
-    xCanonNarrow(cx.buf, acc, w)
+    xCanonNarrow(cx.buf, acc, plan.w)
   }
   xPutInt(cx, dst, acc)
 }
