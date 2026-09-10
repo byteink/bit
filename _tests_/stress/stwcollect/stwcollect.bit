@@ -120,15 +120,87 @@ import { gcInit, gcConfigure, gcAlloc, gcOwns, gcNumObjects, gcStatCollections }
 import { smFormatVersion } from "../../../runtime/gc"
 import { gcWords, gcBindMemory, storeWord, loadWord, loadByte, reserveWords } from "../../../runtime/gc"
 import { worldWords, worldClaim, worldRelease, maxMutators, mParked, muWords } from "../../../runtime/gc"
-import { mSyscall, worldSyscallRegs, worldSyscallRegWords } from "../../../runtime/gc"
+import { mSyscall, worldSyscallRegs } from "../../../runtime/gc"
 import { rtChanMake, chanBootBind, chanRegWords } from "../../../runtime/chan"
 import { stwPollOn, stwAbandonedCount, stwBadOffsetsOn } from "../../../runtime/stw"
 import { schedWords, scRegHead, taskWords, taskArg, taskState, taskParked } from "../../../runtime/sched"
 import { schedCurrentTask, taskAt } from "../../../runtime/sched"
-import { taskStackBase, taskStackBytes, ctxSp, ctxWords, taskRegNext } from "../../../runtime/sched"
+import { taskStackBase, taskStackBytes, ctxSp, taskRegNext } from "../../../runtime/sched"
 import { chanScratchWords, scrElem, scrErr, scrIfaceOk } from "../../../runtime/sched"
 
-
+// ---------------------------------------------------------------------------
+// WHAT `main` HOLDS, AND WHY EVERY BLOCK IS DECLARED THERE (#4249)
+// ---------------------------------------------------------------------------
+//
+// Every backing `[]i64`/`[]i32` this program uses is allocated by `main` and
+// stays live until `main`'s last line — the `held` prints at the end are what
+// enforce it — so that only raw untraced pointers ever reach the collector
+// under test and the LIVE (libbitrt) collector cannot move the ground under it
+// when the suite reruns under `BIT_GC=stress`. That is the property under test,
+// so the declarations below never move: the phase BODIES moved out
+// (stwcollectphases.bit) and take what they plant into as parameters, or read
+// its address out of the `wire` block, which holds addresses only.
+//
+// The blocks, in declaration order, and what each is for:
+//
+//   arena, indexArena, heapBlock, heapLock, listLock, state — the collector
+//     under test and the heap it allocates from. `heapLock` and `listLock` are
+//     distinct words on purpose (#3177): see `gcInit`'s own header
+//     (runtime/gc/gc.bit) for why aliasing them now self-deadlocks.
+//   meta — the TypeInfo table `buildMeta` fills: one leaf `Node`, the
+//     `ref_array_info` sentinel, and phase F's malformed one.
+//   worldBlock, schedBlock, chanReserve, reserveDesc, regBlock — the blocks
+//     `boot` normally owns: the World/Mutator registry, a scheduler, and the
+//     channel reserve + registry.
+//   fakeTask, fakeStack — phase A's class-5 task. `fakeStack` stays 64 words on
+//     purpose: it is the block whose short mapping caught the unbounded
+//     265-word scratch read (#1679, back when 265 was the whole area). Phase H
+//     reuses it as a stack range that provably does NOT hold the running `sp`.
+//   longTask, longStack — phase A's class-4 task, on a stack longer than the
+//     scratch area; see LONG_STACK_WORDS for why that placement is the point.
+//   frameBuf, snapBuf — phase C's synthesized frame and this thread's published
+//     `SafepointFrame`.
+//   ctxTask, ctxStack — phase G's task and its deliberately unused stack.
+//   cls8Task — phase H's task. It has NO stack array of its own, and that is
+//     the whole point — see `phaseH`.
+//   parkStackTask, parkedStack — phase I's task and the stack a synthesized
+//     parked mutator claims to be standing in; see PARK_STACK_WORDS for why the
+//     geometry is what it is.
+//   syscallTask, syscallStack — phase J's, likewise, per SYSCALL_STACK_WORDS.
+//   scratchTask, scratchStack — phase D's task, whose stack is exactly
+//     `chanScratchWords` words, so the whole scratch area is mapped and the
+//     scan's `min(chanScratchWords, stackBytes/8)` bound resolves to the full
+//     area — that is what lets the payload at the LAST scratch word
+//     (`scrIfaceOk`, 266 — #3280 moved this off `scrFsReadFailed`, 265, once
+//     `chanScratchWords` widened past it) be a floor on the scanned set rather
+//     than a second copy of the first word's test.
+//   parkFrame, parkSnap — phase E's parked-thread frame and the
+//     `SafepointFrame` that publishes it, both kept apart from phase C's so
+//     that phase C's snapshot is not what phase E ends up proving.
+//   wire — the addresses that are fixed once the collector is built, handed to
+//     every phase. Addresses only; see stwcollectphases.bit.
+//
+// ---------------------------------------------------------------------------
+// THE PHASE CALLS, AND THE ROOT CLASS EACH ONE COVERS
+// ---------------------------------------------------------------------------
+//
+// Every `ROOT CLASS <n>` marker in this program lives HERE, in this file and
+// nowhere else: _tests_/bit/stwwiring reads `stwcollect.bit` by name and scans
+// it for the markers, so a marker that followed its body into
+// stwcollectphases.bit would silently drop out of coverage.
+//
+//   phaseAB — ROOT CLASS 1 (a buffered `is_ref` channel's element), ROOT CLASS 4
+//             (a registered task's stack) and ROOT CLASS 5 (that task's `arg`),
+//             then the same three roots removed and swept.
+//   phaseC  — ROOT CLASS 2, this thread's own published snapshot, walked
+//             precisely against a real emitted stack map.
+//   phaseD  — ROOT CLASS 6, the per-task scratch area (#1679).
+//   phaseE  — ROOT CLASS 3, another stopped OS thread's parked frame (#1683).
+//   phaseF  — the `bad=` counter (#1682); no root class of its own.
+//   phaseG  — ROOT CLASS 7, a parked task's saved callee-saved file (#1742).
+//   phaseH  — ROOT CLASS 8, the RUNNING task's own stack (#1832).
+//   phaseI  — ROOT CLASS 10, another stopped mutator's own stack (#1834).
+//   phaseJ  — ROOT CLASS 9, a thread parked in a `syscall` region (#1904).
 fn main() {
   let arena = []i64(ARENA_WORDS)
   let indexArena = []i64(INDEX_WORDS)
@@ -137,9 +209,6 @@ fn main() {
   let listLock = []i32(1)
   let state = []i64(gcWords)
   let meta = []i64(META_WORDS)
-
-  // Blocks `boot` normally owns: the World/Mutator registry, a scheduler, the
-  // channel reserve + registry, and one registered task.
   let worldBlock = []i64(worldWords)
   let schedBlock = []i64(schedWords)
   let chanReserve = []i64(CHAN_RESERVE_WORDS)
@@ -151,552 +220,60 @@ fn main() {
   let longStack = []i64(LONG_STACK_WORDS)
   let frameBuf = []i64(FRAME_WORDS)
   let snapBuf = []i64(SNAP_WORDS)
-  // Phase G's task and its (deliberately unused) stack — see phase G below.
   let ctxTask = []i64(taskWords)
   let ctxStack = []i64(TASK_STACK_WORDS)
-  // Phase H's task. It has NO stack array of its own, and that is the whole
-  // point — see phase H.
   let cls8Task = []i64(taskWords)
-  // Phase I's task and the stack a synthesized parked mutator claims to be
-  // standing in — see PARK_STACK_WORDS for why the geometry is what it is.
   let parkStackTask = []i64(taskWords)
   let parkedStack = []i64(PARK_STACK_WORDS)
-  // Phase J's task and the stack a synthesized syscall-parked thread claims to
-  // be standing in — see SYSCALL_STACK_WORDS for the geometry.
   let syscallTask = []i64(taskWords)
   let syscallStack = []i64(SYSCALL_STACK_WORDS)
-
-  // Phase D's task. Its stack is exactly `chanScratchWords` words, so the whole
-  // scratch area is mapped and the scan's `min(chanScratchWords, stackBytes/8)`
-  // bound resolves to the full area — that is what lets the payload at the
-  // LAST scratch word (`scrIfaceOk`, 266 — #3280 moved this off
-  // `scrFsReadFailed`, 265, once `chanScratchWords` widened past it) be a floor
-  // on the scanned set rather than a second copy of the first word's test.
-  // `fakeStack` above stays 64 words on purpose: it is the block whose short
-  // mapping caught the unbounded 265-word read (#1679, back when 265 was the
-  // whole area).
   let scratchTask = []i64(taskWords)
   let scratchStack = []i64(chanScratchWords)
-  // Phase E's parked-thread frame and the `SafepointFrame` that publishes it,
-  // both kept apart from phase C's so that phase C's snapshot is not what phase
-  // E ends up proving.
   let parkFrame = []i64(FRAME_WORDS)
   let parkSnap = []i64(SNAP_WORDS)
-
-  // The wiring block phases D and J are handed (stwcollectphases.bit). It is
-  // allocated here with every other slice, and holds addresses only.
   let wire = []i64(WIRE_WORDS)
 
-  let metaAddr = int(ptrOf(meta))
-  meta[MI_NODE + 0] = 16
-  meta[MI_NODE + 1] = 0
-  meta[MI_NODE + 2] = 0
-  meta[MI_BAD + 0] = 16
-  meta[MI_BAD + 1] = metaAddr + MI_BAD_OFFS * 8
-  meta[MI_BAD + 2] = 1
-  meta[MI_BAD_OFFS] = 4
-  let nodeInfo = metaAddr + MI_NODE * 8
-  let refArrInfo = metaAddr + MI_REFARR * 8
-  let badInfo = metaAddr + MI_BAD * 8
-
-  let hp = ptrOf(heapBlock)
-  heapInit(hp)
-  let hlk = ptrOf(heapLock)
-  atomicStore(hlk, spinUnlocked)
-  // #3177: heap lock and list lock must be distinct words -- see gcInit's
-  // own header (runtime/gc/gc.bit) for why aliasing them now self-deadlocks.
-  let llk = ptrOf(listLock)
-  atomicStore(llk, spinUnlocked)
+  buildMeta(meta, wire)
+  wire[W_SCHED] = int(ptrOf(schedBlock))
+  wire[W_REG] = int(ptrOf(regBlock))
+  wire[W_SNAP] = int(ptrOf(snapBuf))
+  wire[W_WORLD] = int(ptrOf(worldBlock))
+  wire[W_FAKESTACK] = int(ptrOf(fakeStack))
+  wire[W_ARENA] = int(ptrOf(arena))
+  wire[W_INDEX] = int(ptrOf(indexArena))
 
   let g = ptrOf(state)
-  gcBindMemory(g, int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
-  if (!gcInit(g, int(hp), int(hlk), int(llk), refArrInfo, MARK_STACK)) {
+  if (!bootHeap(g, wire, heapBlock, heapLock, listLock)) {
     print("gcInit failed\n")
     return
   }
-  // stress: every poll collects, ignoring the byte trigger — the precise-rooting
-  // oracle. A missed root is swept on the very next poll.
-  gcConfigure(g, true, true, MIN_TRIGGER, GROWTH_PCT, false)
-
   // Wire the registry the mutator half uses and the three blocks the collector
   // half enumerates roots from. `stwBind` is all-or-nothing by design: with any
   // one of them 0 the poll refuses to collect rather than collecting with a
   // smaller root set.
-  chanBootBind(int(ptrOf(reserveDesc)), int(ptrOf(chanReserve)), CHAN_RESERVE_WORDS * 8,
-               int(ptrOf(regBlock)), int(ptrOf(schedBlock)))
+  chanBootBind(
+    int(ptrOf(reserveDesc)), int(ptrOf(chanReserve)), CHAN_RESERVE_WORDS * 8,
+    int(ptrOf(regBlock)), int(ptrOf(schedBlock)),
+  )
 
-  // ROOT CLASS 1: a buffered `is_ref` channel, built by the shipped constructor
-  // so the registry entry is the real one.
-  let handle = rtChanMake(CAP, true)
-  if (handle == 0) {
-    print("chan_make returned nil\n")
-    return
-  }
-  let pChan = gcAlloc(g, nodeInfo)
-  storeWord(pChan, M_CHAN)
-  storeWord(loadWord(handle + CH_BUF * 8), pChan)
-  storeWord(handle + CH_COUNT * 8, 1)
-
-  // ROOT CLASS 4 and ROOT CLASS 5: one registered task, parked, whose stack
-  // holds one payload (class 4) and whose `arg` holds another (class 5) —
-  // `stack=` and `arg=` in phase A are one assertion each. The scheduler block
-  // is zeroed, so its registry lock is already `spinUnlocked` and its head is 0
-  // until set here.
-  let pArg = gcAlloc(g, nodeInfo)
-  storeWord(pArg, M_ARG)
-  let pStack = gcAlloc(g, nodeInfo)
-  storeWord(pStack, M_STACK)
-
-  // The class-5 task, on the SHORT stack. Its own stack holds nothing: `arg` is
-  // the only root it contributes, so `arg=` cannot be carried by the stack walk.
-  let t = ptrOf(fakeTask)
-  *(t + taskArg) = pArg
-  *(t + taskState) = taskParked
-  *(t + taskStackBase) = int(ptrOf(fakeStack))
-  *(t + taskStackBytes) = TASK_STACK_WORDS * 8
-  *(t + ctxSp) = int(ptrOf(fakeStack))
-
-  // The class-4 task, on the long stack, with `sp` one word past the scratch
-  // area and `arg` empty — see LONG_STACK_WORDS for why that placement is the
-  // whole point.
-  let lt = ptrOf(longTask)
-  longStack[LONG_STACK_SLOT] = pStack
-  *(lt + taskArg) = 0
-  *(lt + taskState) = taskParked
-  *(lt + taskStackBase) = int(ptrOf(longStack))
-  *(lt + taskStackBytes) = LONG_STACK_WORDS * 8
-  *(lt + ctxSp) = int(ptrOf(longStack)) + chanScratchWords * 8
-
-  // Both on the all-tasks registry, in the intrusive `regNext` list the
-  // collector walks.
-  *(t + taskRegNext) = int(lt)
-  *(lt + taskRegNext) = 0
-  *(ptrOf(schedBlock) + scRegHead) = int(t)
-
-  // Reachable from nothing. Without this the phase would pass on a collector
-  // that simply marks every object it has.
-  let pDead = gcAlloc(g, nodeInfo)
-  storeWord(pDead, M_DEAD)
-
-  // ---- phase A: poll, and read the count out of OUR collector -------------
-  // A snapshot whose `ret` is 0 is exactly what the shim publishes from a door
-  // that holds no stack map, and it makes the precise walk a no-op here — phase
-  // C is where that walk is put under load.
-  let snap = int(ptrOf(snapBuf))
-  // The addresses the two split-out phases (stwcollectphases.bit) poll and
-  // allocate through, fixed for the rest of the run.
-  wire[W_SCHED] = int(ptrOf(schedBlock))
-  wire[W_REG] = int(ptrOf(regBlock))
-  wire[W_SNAP] = snap
-  wire[W_NODEINFO] = nodeInfo
-  storeWord(snap + 0, 0)
-  storeWord(snap + 8, 0)
-  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
-  print("A ran=${gcStatCollections(g) > 0} chan=${alive(g, pChan, M_CHAN)} arg=${alive(g, pArg, M_ARG)} stack=${alive(g, pStack, M_STACK)} dead=${gcOwns(g, pDead)} abandoned=${stwAbandonedCount()}\n")
-
-  // ---- phase B: drop every root, poll again, everything goes --------------
-  storeWord(handle + CH_COUNT * 8, 0)
-  *(t + taskArg) = 0
-  longStack[LONG_STACK_SLOT] = 0
-  let cB = gcStatCollections(g)
-  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
-  print("B ran=${gcStatCollections(g) > cB} chan=${gcOwns(g, pChan)} arg=${gcOwns(g, pArg)} stack=${gcOwns(g, pStack)} live=${gcNumObjects(g)}\n")
-
-  // ---- phase C: ROOT CLASS 2, the precise stack-map walk over THIS thread's
-  // own published snapshot: it marks what a real emitted stack map names ------
-  let base = mapsBegin()
-  let tblLen = mapsEnd() - base
-  let hitPc = 0
-  let hitSlot = 0
-  let off = 0
-  // Set true if any entry's stamped version disagrees with this tree's own
-  // (#3189): this decoder is deliberately independent of
-  // runtime/gc/stackmap.bit's reader (see this file's header), so it must
-  // track the same fixed-header field that reader checks, or a wire-format
-  // desync here reports LESS rather than refusing — exactly the failure mode
-  // #3189 exists to make loud. This is the THIRD hand decoder of this format
-  // (compiler's writer, the runtime reader, this one); #1927 updated the
-  // first two and missed this one.
-  let vBad = false
-  // Bounded by the extent; every entry is self-delimiting.
-  while (off < tblLen) {
-    let codeAddr = u64At(base + off)
-    off = off + 8
-    let version = u16At(base + off)
-    off = off + 2
-    if (version != smFormatVersion) {
-      vBad = true
-    }
-    let codeSize = u32At(base + off)
-    off = off + 4
-    let numSaved = u16At(base + off)
-    off = off + 2 + numSaved * 6
-    let numSps = u16At(base + off)
-    off = off + 2
-    let si = 0
-    // Bounded: this entry's safepoint count.
-    while (si < numSps) {
-      let retOff = u32At(base + off)
-      off = off + 4
-      let numSlots = u16At(base + off)
-      off = off + 2
-      let slotsOff = off
-      off = off + numSlots * 4
-      let numRegs = u16At(base + off)
-      off = off + 2 + numRegs * 2
-      if (hitPc == 0 && numSlots > 0 && usableSlot(i32At(base + slotsOff))) {
-        hitPc = codeAddr + retOff
-        hitSlot = i32At(base + slotsOff)
-      }
-      si = si + 1
-    }
-
-    // Round the cursor up past this entry's trailing pad (#1927, ABI.md §4):
-    // the writer pads every entry to a multiple of 8 bytes so every atom is
-    // 8-aligned, and the walk must round up by the same rule or it lands
-    // inside this entry's padding instead of at the next entry's start. Same
-    // rule as runtime/gc/stackmap.bit's reader.
-    let rem = off % 8
-    if (rem != 0) {
-      off = off + 8 - rem
-    }
-  }
-
-  let pPrecise = gcAlloc(g, nodeInfo)
-  storeWord(pPrecise, M_PRECISE)
-  let pMissed = gcAlloc(g, nodeInfo)
-  storeWord(pMissed, M_MISSED)
-
-  let fp = int(ptrOf(frameBuf)) + FRAME_MID * 8
-  storeWord(fp, 0)                 // saved fp of 0 stops the walk after one frame
-  storeWord(fp + 8, 0)             // and its return address is never followed
-  storeWord(fp + hitSlot, pPrecise)
-  storeWord(snap + 0, hitPc)       // ret: the safepoint this stack map describes
-  storeWord(snap + 8, fp)          // fp: the synthetic frame above
-  let cC = gcStatCollections(g)
-  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
-  print("C ran=${gcStatCollections(g) > cC} found=${hitPc != 0} precise=${alive(g, pPrecise, M_PRECISE)} missed=${gcOwns(g, pMissed)} vOK=${!vBad}\n")
-
-  // ---- phase D: ROOT CLASS 6, the per-task SCRATCH area (#1679) ------------
-  // Body in `phaseD` (stwcollectphases.bit): it takes the task and stack it
-  // plants into as parameters, so both stay owned by THIS frame to the last
-  // line below. See that function's header for what the phase proves. It
-  // leaves its task registered as the scheduler's only one, which phase F
-  // then reuses.
+  phaseAB(g, wire, fakeTask, longTask, longStack)
+  phaseC(g, wire, frameBuf)
   phaseD(g, wire, worldBlock, scratchStack, scratchTask)
-
-  // ---- phase E: ROOT CLASS 3, another stopped OS thread's PARKED FRAME -----
-  //
-  // The collector walks every OTHER registered mutator's published
-  // `SafepointFrame` precisely. Driving that with a real second OS thread would
-  // need one parked at a safepoint for the whole collection; the registry is
-  // plain memory under a stopped world, so a slot is synthesized instead —
-  // claimed through the shipped `worldClaim`, then published as parked with a
-  // frame, in the same three words a real parking thread writes.
-  //
-  // `acked` must carry the epoch of the collection that is ABOUT to run, or
-  // `worldStoppedFor` refuses to count the slot as stopped and the rendezvous
-  // expires instead of collecting. That is why the epoch word is read first and
-  // incremented by one: `worldRendezvous` bumps it exactly once per collection.
-  // A mis-set slot is loud rather than silent — `ran=false abandoned=1`.
-  let pPark = gcAlloc(g, nodeInfo)
-  storeWord(pPark, M_PARKED)
-  let pParkDead = gcAlloc(g, nodeInfo)
-  storeWord(pParkDead, M_PARKED_DEAD)
-
-  let fp2 = int(ptrOf(parkFrame)) + FRAME_MID * 8
-  storeWord(fp2, 0)
-  storeWord(fp2 + 8, 0)
-  storeWord(fp2 + hitSlot, pPark)
-
-  // What a parking thread publishes is its `SafepointFrame` (ABI.md §4), NOT
-  // its frame pointer — `worldPark(world, slot, frame)` is handed the same
-  // `snap` the shim built. Publishing the frame itself instead reads its first
-  // word as `ret`, finds 0 and walks nothing, which passes every structural
-  // check and marks nothing: measured here as `parked=false` before the fix.
-  let parkSnapAddr = int(ptrOf(parkSnap))
-  storeWord(parkSnapAddr + 0, hitPc)
-  storeWord(parkSnapAddr + 8, fp2)
-
-  let wb = ptrOf(worldBlock)
-  let slot = worldClaim(wb)
-  let epoch = worldBlock[maxMutators * muWords + MU_EPOCH_IDX] + 1
-  worldBlock[slot * muWords + MU_FRAME] = parkSnapAddr
-  worldBlock[slot * muWords + MU_ACKED] = epoch
-  worldBlock[slot * muWords + MU_STATE] = mParked
-
-  let cE = gcStatCollections(g)
-  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
-  print("E ran=${gcStatCollections(g) > cE} other=${slot > 0} parked=${alive(g, pPark, M_PARKED)} missed=${gcOwns(g, pParkDead)} abandoned=${stwAbandonedCount()}\n")
-  // RELEASED IMMEDIATELY, and it must be: the slot stays `parked` with a now
-  // stale `acked`, so leaving it registered would make every later rendezvous
-  // spin to its bound and abandon.
-  worldRelease(wb, slot)
-
-  // ---- phase F: the `bad=` counter is real and reachable (#1682) -----------
-  //
-  // `gcStatBadOffsets` counts pointer-map offsets the tracer REFUSED —
-  // misaligned, or running past the body — and skips the field instead of
-  // reading out of bounds. Until #1682 no linked binary could report it, so a
-  // degraded trace (fields skipped, referents unmarked, live objects swept)
-  // read exactly like a healthy one. The `BIT_GC_STATS` line now carries it,
-  // through `stwBadOffsets` — and `stwBadOffsetsOn` read here is that same
-  // accessor over THIS program's collector rather than the process-global one,
-  // so it is still the field's value and not a parallel path. Reading the
-  // global form here silently reported the LIVE runtime's counter instead
-  // (#1836): `bad=` went false while the malformed TypeInfo was traced
-  // correctly in this program's own collector.
-  //
-  // An always-zero field would be worse than none, which is what the two halves
-  // below assert: 0 across five clean collections, and non-zero the moment one
-  // malformed `TypeInfo` is traced.
-  let bad0 = stwBadOffsetsOn(int(g))
-  let pBad = gcAlloc(g, badInfo)
-  storeWord(pBad, M_BADMAP)
-  scratchStack[scrElem] = pBad
-  let cF = gcStatCollections(g)
-  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
-  print("F ran=${gcStatCollections(g) > cF} clean=${bad0} bad=${stwBadOffsetsOn(int(g)) > 0} alive=${alive(g, pBad, M_BADMAP)}\n")
-
-  // ---- phase G: ROOT CLASS 7, a parked task's own saved register file (#1742)
-  //
-  // `stwScanStackRange` (class 4) covers `[ctxSp, stackTop)` — the task's
-  // STACK. `schedSwitch` (`../../../runtime/sched`) does not spill the
-  // callee-saved file there: it writes x19..x28 (arm64) / rbx,r12..r15 (x64)
-  // into the TASK'S OWN CONTROL BLOCK, `t[0..ctxWords)`, a separate
-  // allocation. A value the register allocator keeps live in one of those
-  // registers across a park is therefore outside class 4's range by
-  // construction and needs its own scan (`stwScanCtx`).
-  //
-  // The task below makes the separation explicit exactly as phase D's does
-  // for the scratch area: `arg` is 0 (class 5 covers nothing) and `sp` is set
-  // to the TOP of its own stack, so the class-4 range is EMPTY. `ctxStack` is
-  // mapped only so `taskStackBase`/`taskStackBytes` are non-degenerate — the
-  // payload never touches it, so class 6's scratch scan (which reads the
-  // stack's OWN base, not the control block) cannot carry this phase either.
-  // The only enumerated class that can reach `pCtx` is the ctx scan.
-  let pCtx = gcAlloc(g, nodeInfo)
-  storeWord(pCtx, M_CTX)
-  let pCtxDead = gcAlloc(g, nodeInfo)
-  storeWord(pCtxDead, M_CTX_DEAD)
-
-  let ct = ptrOf(ctxTask)
-  *(ct + taskArg) = 0
-  *(ct + taskState) = taskParked
-  *(ct + taskStackBase) = int(ptrOf(ctxStack))
-  *(ct + taskStackBytes) = TASK_STACK_WORDS * 8
-  *(ct + ctxSp) = int(ptrOf(ctxStack)) + TASK_STACK_WORDS * 8
-  *(ct + taskRegNext) = 0
-  *(ptrOf(schedBlock) + scRegHead) = int(ct)
-  ctxTask[CTX_SLOT] = pCtx
-
-  storeWord(snap + 0, 0)
-  storeWord(snap + 8, 0)
-  let cG = gcStatCollections(g)
-  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
-  print("G ran=${gcStatCollections(g) > cG} ctx=${alive(g, pCtx, M_CTX)} dead=${gcOwns(g, pCtxDead)} abandoned=${stwAbandonedCount()}\n")
-
-  // ---- phase H: ROOT CLASS 8, the RUNNING task's own stack (#1832) ---------
-  //
-  // Every phase above FABRICATES its task: a module-level `[]i64` stands in for
-  // a stack and the phase writes its payload into a known slot of it. THAT
-  // CANNOT WORK HERE. Class 8 fires only for the task holding the REAL stack
-  // pointer (`stwTaskHoldsSp`), and a fabricated stack never does — module data
-  // sits far below the stack in the address space, so no `[stackBase, +bytes)`
-  // range can contain both a module array and `sp`.
-  //
-  // Bit also has no stack-allocated aggregate to plant into: `[]i64(n)` is a
-  // heap slice and a module fixed array is `__DATA`, so there is no way to place
-  // a word at a chosen address on the running stack.
-  //
-  // So this phase does the opposite of fabricate. It COPIES the real stack's
-  // bounds off the live current task, registers them on its own task block, and
-  // lets the COMPILER place the payloads — which is exactly the shape of the
-  // defect: `bit_rt_chan_send` holds the element it is about to store as a bare
-  // `int`, because E0079 forbids a pinned symbol naming a managed type, and a
-  // stack map names only reference-typed slots.
-  //
-  // Why sixteen payloads: a raw `int` held across the `stwPoll` call must live
-  // either in a callee-saved register or in a stack slot. Sixteen simultaneously
-  // live values cannot all be in the callee-saved file (ten on arm64, five on
-  // x64), so any allocator spills at least six to the stack, where class 8 is
-  // the only enumerated class that reaches them. A single payload could have
-  // spent its whole life in a register and proven nothing.
-  //
-  // Every other class is empty for this task BY CONSTRUCTION, so the assertion
-  // cannot be carried by one of them: `arg` is 0 (class 5); `ctxSp` is the TOP
-  // of the stack, so class 4's `[ctxSp, top)` range is empty; `running` is true,
-  // so class 7's ctx scan is skipped; class 6's scratch scan reads the real
-  // stack's lowest 266 words (`chanScratchWords`), thousands of words BELOW
-  // `sp` and below anything a live frame occupies; and `snap` carries `ret = 0`
-  // so class 2 returns before walking. Deleting class 8's `lo = sp` reverts the
-  // range to `[ctxSp, top)` — empty — and must redden THIS phase alone.
-  //
-  // `schedCurrentTask()` is 0 when no green task owns this stack, which is the
-  // case against the deleted native runtime's `libbitrt.a`. Reported rather than skipped
-  // silently, so the phase can never read as green while asserting nothing.
-  let curTask = schedCurrentTask()
-  let onTask = curTask != 0
-  let cls8Alive = 0
-  let cls8Dead = 0
-  if (onTask) {
-    let real = taskAt(curTask)
-    let ht = ptrOf(cls8Task)
-    *(ht + taskArg) = 0
-    *(ht + taskState) = taskParked
-    *(ht + taskStackBase) = *(real + taskStackBase)
-    *(ht + taskStackBytes) = *(real + taskStackBytes)
-    *(ht + ctxSp) = *(real + taskStackBase) + *(real + taskStackBytes)
-    *(ht + taskRegNext) = 0
-    *(ptrOf(schedBlock) + scRegHead) = int(ht)
-
-    // A control object allocated and then dropped, so this phase also shows the
-    // collector still SWEEPS — a class-8 scan that marked the whole stack
-    // indiscriminately would keep this too and the phase would pass for the
-    // wrong reason.
-    let pGone = gcAlloc(g, nodeInfo)
-    storeWord(pGone, M_CLS8 + 1)
-    let gone = pGone
-
-    let p0 = gcAlloc(g, nodeInfo)
-    let p1 = gcAlloc(g, nodeInfo)
-    let p2 = gcAlloc(g, nodeInfo)
-    let p3 = gcAlloc(g, nodeInfo)
-    let p4 = gcAlloc(g, nodeInfo)
-    let p5 = gcAlloc(g, nodeInfo)
-    let p6 = gcAlloc(g, nodeInfo)
-    let p7 = gcAlloc(g, nodeInfo)
-    let p8 = gcAlloc(g, nodeInfo)
-    let p9 = gcAlloc(g, nodeInfo)
-    let p10 = gcAlloc(g, nodeInfo)
-    let p11 = gcAlloc(g, nodeInfo)
-    let p12 = gcAlloc(g, nodeInfo)
-    let p13 = gcAlloc(g, nodeInfo)
-    let p14 = gcAlloc(g, nodeInfo)
-    let p15 = gcAlloc(g, nodeInfo)
-    storeWord(p0, M_CLS8)
-    storeWord(p1, M_CLS8)
-    storeWord(p2, M_CLS8)
-    storeWord(p3, M_CLS8)
-    storeWord(p4, M_CLS8)
-    storeWord(p5, M_CLS8)
-    storeWord(p6, M_CLS8)
-    storeWord(p7, M_CLS8)
-    storeWord(p8, M_CLS8)
-    storeWord(p9, M_CLS8)
-    storeWord(p10, M_CLS8)
-    storeWord(p11, M_CLS8)
-    storeWord(p12, M_CLS8)
-    storeWord(p13, M_CLS8)
-    storeWord(p14, M_CLS8)
-    storeWord(p15, M_CLS8)
-
-    storeWord(snap + 0, 0)
-    storeWord(snap + 8, 0)
-    let cH = gcStatCollections(g)
-    stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
-    let ranH = gcStatCollections(g) > cH
-
-    // Counted, not `&&`-ed: the count is what distinguishes "class 8 reaches the
-    // spilled slots" from "the allocator happened to keep them all in registers".
-    if (alive(g, p0, M_CLS8)) { cls8Alive = cls8Alive + 1 }
-    if (alive(g, p1, M_CLS8)) { cls8Alive = cls8Alive + 1 }
-    if (alive(g, p2, M_CLS8)) { cls8Alive = cls8Alive + 1 }
-    if (alive(g, p3, M_CLS8)) { cls8Alive = cls8Alive + 1 }
-    if (alive(g, p4, M_CLS8)) { cls8Alive = cls8Alive + 1 }
-    if (alive(g, p5, M_CLS8)) { cls8Alive = cls8Alive + 1 }
-    if (alive(g, p6, M_CLS8)) { cls8Alive = cls8Alive + 1 }
-    if (alive(g, p7, M_CLS8)) { cls8Alive = cls8Alive + 1 }
-    if (alive(g, p8, M_CLS8)) { cls8Alive = cls8Alive + 1 }
-    if (alive(g, p9, M_CLS8)) { cls8Alive = cls8Alive + 1 }
-    if (alive(g, p10, M_CLS8)) { cls8Alive = cls8Alive + 1 }
-    if (alive(g, p11, M_CLS8)) { cls8Alive = cls8Alive + 1 }
-    if (alive(g, p12, M_CLS8)) { cls8Alive = cls8Alive + 1 }
-    if (alive(g, p13, M_CLS8)) { cls8Alive = cls8Alive + 1 }
-    if (alive(g, p14, M_CLS8)) { cls8Alive = cls8Alive + 1 }
-    if (alive(g, p15, M_CLS8)) { cls8Alive = cls8Alive + 1 }
-    if (gcOwns(g, gone)) { cls8Dead = 1 }
-    print("H ran=${ranH} onTask=true alive=${cls8Alive}/${CLS8_COUNT} abandoned=${stwAbandonedCount()}\n")
-  }
-  if (!onTask) {
-    print("H ran=false onTask=false alive=0/${CLS8_COUNT} abandoned=${stwAbandonedCount()}\n")
-  }
-
-  // ---- phase I: ROOT CLASS 10, another stopped mutator's OWN STACK (#1834) --
-  //
-  // Class 8 lowers the conservative bound for the stack holding the LIVE `sp`.
-  // There is exactly one live `sp` and it belongs to the collector, so every
-  // OTHER thread stopped at a safepoint keeps class 4's `ctxSp` bound — where
-  // its task last PARKED, above the frames it is actually sitting in. What is
-  // left covering it is class 3's PRECISE walk, and a stack map names only
-  // reference-typed slots, so a GC object held as a bare `int` (which the ABI
-  // boundary FORCES on every pinned symbol, E0079) is invisible to it. Two
-  // threads inside `bit_rt_chan_send` at once is one scanned stack and one
-  // unscanned one.
-  //
-  // Driving that with a real second OS thread would need one parked at a
-  // safepoint for the whole collection, so a slot is synthesized exactly as
-  // phase E does — claimed through the shipped `worldClaim`, published as
-  // `parked` with a frame, acking the epoch the next collection will use.
-  //
-  // WHAT IS DIFFERENT FROM PHASE E is which half of that slot is under test.
-  // Phase E plants its payload INSIDE the published frame, where the precise
-  // walk finds it. This one plants the payload on the STACK, at a word no stack
-  // map names and no other class reaches, and publishes the frame ADDRESS as
-  // the only evidence of where that thread is. The frame's own first word is 0,
-  // so `gcScanSnapshot` walks nothing and cannot carry this phase.
-  //
-  // Registering `parkStackTask` alone also unregisters phase H's task, which is
-  // required: while that one is registered its mapping spans the REAL stack, so
-  // class 8 would conservatively scan main's own frames and keep `pStack10`
-  // alive no matter what class 10 did.
-  let pStack10 = gcAlloc(g, nodeInfo)
-  storeWord(pStack10, M_CLS10)
-  let pStack10Dead = gcAlloc(g, nodeInfo)
-  storeWord(pStack10Dead, M_CLS10_DEAD)
-
-  let parkBase = int(ptrOf(parkedStack))
-  parkedStack[PARK_FRAME_SLOT] = 0            // ret == 0: class 3 walks nothing
-  parkedStack[PARK_FRAME_SLOT + 1] = 0        // fp, never followed
-  parkedStack[PARK_PAYLOAD_SLOT] = pStack10
-
-  let pt = ptrOf(parkStackTask)
-  *(pt + taskArg) = 0
-  *(pt + taskState) = taskParked
-  *(pt + taskStackBase) = parkBase
-  *(pt + taskStackBytes) = PARK_STACK_WORDS * 8
-  *(pt + ctxSp) = parkBase + PARK_STACK_WORDS * 8
-  *(pt + taskRegNext) = 0
-  *(ptrOf(schedBlock) + scRegHead) = int(pt)
-
-  let slot10 = worldClaim(wb)
-  let epoch10 = worldBlock[maxMutators * muWords + MU_EPOCH_IDX] + 1
-  worldBlock[slot10 * muWords + MU_FRAME] = parkBase + PARK_FRAME_SLOT * 8
-  worldBlock[slot10 * muWords + MU_ACKED] = epoch10
-  worldBlock[slot10 * muWords + MU_STATE] = mParked
-
-  storeWord(snap + 0, 0)
-  storeWord(snap + 8, 0)
-  let cI = gcStatCollections(g)
-  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
-  print("I ran=${gcStatCollections(g) > cI} other=${slot10 > 0} stack=${alive(g, pStack10, M_CLS10)} missed=${gcOwns(g, pStack10Dead)} abandoned=${stwAbandonedCount()}\n")
-  // Released for the reason phase E's is: the slot stays `parked` with a now
-  // stale `acked`, so leaving it registered would make every later rendezvous
-  // spin to its bound and abandon.
-  worldRelease(wb, slot10)
-
-  // ---- phase J: ROOT CLASS 9, a thread parked in a `syscall` region -------
-  // Body in `phaseJ` (stwcollectphases.bit): it takes the task and stack it
-  // plants into as parameters, so both stay owned by THIS frame to the last
-  // line below. See that function's header for what the phase proves.
+  phaseE(g, wire, worldBlock, parkFrame, parkSnap)
+  phaseF(g, wire, scratchStack)
+  phaseG(g, wire, ctxTask, ctxStack)
+  phaseH(g, wire, cls8Task)
+  phaseI(g, wire, worldBlock, parkStackTask, parkedStack)
   phaseJ(g, wire, worldBlock, syscallStack, syscallTask)
 
-  // Hold every backing slice to the end of `main`, so only raw untraced pointers
-  // ever reach the collector under test and the LIVE (libbitrt) collector cannot
-  // move the ground under it when the suite reruns under BIT_GC=stress.
-  print("held ${len(arena) + len(indexArena) + len(heapBlock) + len(heapLock) + len(state) + len(meta)}\n")
-  print("held ${len(worldBlock) + len(schedBlock) + len(chanReserve) + len(reserveDesc) + len(regBlock) + len(fakeTask) + len(fakeStack) + len(longTask) + len(longStack) + len(frameBuf) + len(snapBuf)}\n")
-  print("held ${len(scratchTask) + len(scratchStack) + len(parkFrame) + len(parkSnap)}\n")
-  print("held ${len(ctxTask) + len(ctxStack) + len(cls8Task) + len(parkStackTask) + len(parkedStack)}\n")
-  print("held ${len(syscallTask) + len(syscallStack)}\n")
+  // Seven groups, in declaration order, and the grouping carries no
+  // meaning beyond fitting one line each: what matters is that every block
+  // above is named by one of them, so none of them dies before this point.
+  print("held ${len(arena) + len(indexArena) + len(heapBlock) + len(heapLock) + len(listLock)}\n")
+  print("held ${len(state) + len(meta) + len(worldBlock) + len(schedBlock) + len(chanReserve)}\n")
+  print("held ${len(reserveDesc) + len(regBlock) + len(fakeTask) + len(fakeStack) + len(longTask)}\n")
+  print("held ${len(longStack) + len(frameBuf) + len(snapBuf) + len(ctxTask) + len(ctxStack)}\n")
+  print("held ${len(cls8Task) + len(parkStackTask) + len(parkedStack) + len(syscallTask)}\n")
+  print("held ${len(syscallStack) + len(scratchTask) + len(scratchStack) + len(parkFrame)}\n")
+  print("held ${len(parkSnap) + len(wire)}\n")
 }
