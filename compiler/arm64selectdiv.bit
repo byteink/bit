@@ -1,6 +1,9 @@
-// The aarch64 integer divide/remainder selectors: the real `sdiv`/`udiv` and
-// the two shapes that replace it — a power-of-two shift (#1702/#1704/#4361)
-// and a magic-number multiply (#4389).
+// The aarch64 integer divide/remainder selectors: the real `sdiv`/`udiv`, the
+// power-of-two shift that replaces it (#1702/#1704/#4361), and `mulhi`.
+//
+// The magic-number multiply (#4389) is NOT here: #4725 moved the sequence into
+// the IR (optdivmagic.bit) and #4729 deleted the selection-time emitter it had
+// left compiled beside it. This file's share of it is `emitMulHiInt`.
 //
 // Moved out of `arm64select.bit` verbatim, which #4389 had taken to 792 lines
 // against the 800-line limit. The family is self-contained: `emitDivInt` is
@@ -129,115 +132,16 @@ fn emitPow2RemInt(cx: A64Ctx, dst: int, lhs: int, k: int, signed: bool) {
 // `plan.pow2K >= 0`; #3104's SRem/URem exception is gone (see
 // `emitPow2RemInt`).
 
-// The Granlund-Montgomery quotient, signed (#4389, divmagic.bit).
+// The ONE shape that emits no divide, behind the one predicate that decides
+// there is one. Written as `!divPlanReadsDivisor` rather than as its own test
+// so this function and the skip-the-constant scans cannot disagree about which
+// plans reduce -- the disagreement is not a slow program, it is an emitter
+// reading a register nothing materialized.
 //
-//   movImm64 t, m ; smulh q, l, t ; [add|sub q, q, l] ; [asr q, q, shift]
-//   lsr t, q, 63  ; add q, q, t
-//
-// The last two are not optional and are not a rounding nicety: an arithmetic
-// shift rounds toward negative infinity and `/` truncates toward zero
-// (SPEC §13.5), so a negative quotient is one too low without them. Dropping
-// them was one of the six mutations run against the reference, and it broke
-// every negative-quotient case.
-//
-// `t` is scratch2 -- the register the general path would have loaded the
-// divisor into, unused here -- and the multiplier in it is DEAD after the
-// smulh, which is what lets the same register carry the sign mask afterwards.
-// scratch1/2/3 are never allocatable (arm64.bit), so neither `l` nor `q` can
-// collide with it.
-fn emitMagicQuotientSigned(cx: A64Ctx, q: int, l: int, mg: DivMagic) {
-  let t = scratch2()
-  movImm64(cx.code, t, mg.m)
-  smulhRR(cx.code, q, l, t)
-  if (mg.addend > 0) {
-    addRR(cx.code, q, q, l)
-  }
-  if (mg.addend < 0) {
-    subRR(cx.code, q, q, l)
-  }
-  if (mg.shift > 0) {
-    asrImm(cx.code, q, q, mg.shift)
-  }
-  lsrImm(cx.code, t, q, 63)
-  addRR(cx.code, q, q, t)
-}
-
-// The unsigned twin: no sign correction to make (an unsigned quotient never
-// rounds the wrong way), but the divisors whose magic does not fit in 64 bits
-// need HD's add indicator recovered as `((l - q) >>u 1) + q`. That form is
-// used rather than `(q + (l - q)) >>u 1` precisely because it cannot overflow
-// 64 bits, which the naive average can.
-fn emitMagicQuotientUnsigned(cx: A64Ctx, q: int, l: int, mg: DivMagic) {
-  let t = scratch2()
-  movImm64(cx.code, t, mg.m)
-  umulhRR(cx.code, q, l, t)
-  if (mg.fixup) {
-    subRR(cx.code, t, l, q)
-    lsrImm(cx.code, t, t, 1)
-    addRR(cx.code, q, t, q)
-  }
-  if (mg.shift > 0) {
-    lsrImm(cx.code, q, q, mg.shift)
-  }
-}
-
-// `dst = lhs / const` or `dst = lhs % const` with no divide at all.
-//
-// The quotient lands in scratch3 rather than in `d`: `%` recovers its result
-// with `msub d = l - q*divisor`, so it needs `l` alive past the quotient, and
-// `d` aliases scratch1 whenever the destination spilled -- which is exactly
-// where `l` sits when the dividend spilled. That is the same hazard the
-// general path documents, and the same fix.
-//
-// No `canonNarrow`, and not by omission -- for the same reason
-// `emitPow2DivInt` and `emitPow2RemInt` above skip it. The general path needs
-// it for exactly one case, `INT_MIN / -1` (#2263), and -1 is declined here.
-// Every remaining divisor has |d| >= 2, so |n/d| <= |n|/2 and the quotient
-// cannot leave a width `n` was already canonical in; a remainder satisfies
-// |n%d| <= |n| and carries `n`'s sign, so it cannot either. That argument is
-// checked and not merely stated: the differential matrix runs i8/i16/i32/u8/
-// u16/u32 as well as 64-bit, against the same runtime-divisor oracle.
-//
-// The assert is the load-bearing line: `xDivisorPlan` picked signed or
-// unsigned magic from `w.signed` while this emitter divides according to the
-// OP. They agree by construction -- lower.bit derives both from one type's
-// signedness -- but "agree by construction" is a claim, and applying an
-// unsigned magic to a signed divide is a silent wrong answer, not a crash.
-//
-// The `%` arm below is no longer reached from the pipeline: since #4722
-// `xDivisorPlan` hands a magic plan to `/` only (it measured +4.77% on `%`).
-// It stays written and stays pinned by `divmagiccheck.bit`, which calls this
-// emitter directly, so reopening the question is one line in divplan.bit.
-fn emitMagicDivInt(cx: A64Ctx, op: Op, dst: int, lhs: int, mg: DivMagic) {
-  let signed = op == Op.SDiv || op == Op.SRem
-  assert(mg.ok && mg.signed == signed)
-  let l = getInt(cx, vregOf(cx, lhs), scratch1())
-  let q = scratch3()
-  if (signed) {
-    emitMagicQuotientSigned(cx, q, l, mg)
-  } else {
-    emitMagicQuotientUnsigned(cx, q, l, mg)
-  }
-  let d = destInt(cx, dst, scratch1())
-  if (op == Op.SRem || op == Op.URem) {
-    movImm64(cx.code, scratch2(), mg.divisor)
-    msubRR(cx.code, d, q, scratch2(), l)
-  } else {
-    movRR(cx.code, d, q)
-  }
-  putInt(cx, dst, d)
-}
-
-// The two shapes that emit no divide, behind the one predicate that decides
-// there is one. Written as `!divPlanReadsDivisor` rather than as two separate
-// tests so this function and the skip-the-constant scans cannot disagree about
-// which plans reduce -- the disagreement is not a slow program, it is an
-// emitter reading a register nothing materialized.
+// #4729 retired the second shape. The Granlund-Montgomery sequence is emitted
+// in the IR now (optdivmagic.bit), so no magic plan reaches selection and the
+// emitter that assembled one here is gone: one implementation, not two.
 fn emitReducedDivInt(cx: A64Ctx, op: Op, dst: int, lhs: int, plan: DivPlan) {
-  if (plan.magic.ok) {
-    emitMagicDivInt(cx, op, dst, lhs, plan.magic)
-    return
-  }
   if (op == Op.SDiv || op == Op.UDiv) {
     emitPow2DivInt(cx, dst, lhs, plan.pow2K, op == Op.SDiv)
   } else {
@@ -296,13 +200,13 @@ fn emitDivInt(cx: A64Ctx, op: Op, dst: int, lhs: int, rhs: int, plan: DivPlan, w
 
 // `dst = high 64 bits of lhs * rhs` (#4725): one instruction, and the only
 // reason this op exists in the IR is that emitting it here rather than inside
-// `emitMagicQuotientSigned` gives the multiplier an ordinary vreg -- see
-// optdivmagic.bit's header.
+// the retired `emitMagicQuotientSigned` gives the multiplier an ordinary vreg
+// -- see optdivmagic.bit's header, and #4729 for the hoist that vreg bought.
 //
 // Both operands are read before the destination is written (one instruction),
 // so `d` aliasing `l` or `r` through a spilled operand's scratch register is
-// harmless -- unlike the multi-instruction magic sequence above, which is why
-// that one needed scratch3.
+// harmless -- unlike the multi-instruction magic sequence, which is why that
+// one needed scratch3.
 fn emitMulHiInt(cx: A64Ctx, op: Op, dst: int, lhs: int, rhs: int) {
   let l = getInt(cx, vregOf(cx, lhs), scratch1())
   let r = getInt(cx, vregOf(cx, rhs), scratch2())
