@@ -16,6 +16,16 @@ const h2stClosed: int = 4
 // many the peer may still send us. `pendingData`/`pendingEnd`/`hasPending` hold
 // body bytes waiting on flow-control credit. `replyCh` is where a client stream's
 // completed `Response` (or error) is delivered to the waiting `roundTrip`.
+//
+// `recvBody` is the body bytes that have ARRIVED AND NOT YET BEEN TAKEN by the
+// application, not the whole body (#4624): a consumer thread drains it through
+// `h2cmdRead` and the receive-window credit follows what it took, so the window
+// depletes while the application is behind. `recvTotal` is therefore what
+// `Config.maxBodyBytes` is compared against — `len(recvBody)` falls as the
+// application reads and cannot carry a running total. `readCh`/`hasReader` hold
+// the one parked reader; `bodyOpen` says a reader still owes an answer, which is
+// what defers this entry's release past `h2connCloseStream` (streams.bit) so a
+// reset reaches the reader instead of truncating its body in silence.
 class h2connStream {
   id: int,
   state: int,
@@ -24,7 +34,12 @@ class h2connStream {
   recvHeaders: []HeaderField,
   headersDone: bool,
   recvBody: []byte,
+  recvTotal: int,
   recvEnded: bool,
+  readCh: chan<h2connRead>,
+  hasReader: bool,
+  bodyOpen: bool,
+  errMsg: string,
   pendingData: []byte,
   pendingEnd: bool,
   hasPending: bool,
@@ -113,6 +128,9 @@ class h2connState {
   // deletes (`h2connCloseStream`, streams.bit, #4594), which returns early on
   // an already-closed stream so no stream is counted out twice.
   activeStreams: int,
+  // How many streams have a body reader that has not yet taken its `eof` or its
+  // error. Bounds the loop above; see `h2connFinishReader` (streams.bit).
+  openBodies: int,
 }
 
 // The peer's SETTINGS_MAX_CONCURRENT_STREAMS before it has sent one: 2^32-1, the
@@ -146,7 +164,12 @@ fn h2connNewStream(
     recvHeaders: []HeaderField(0),
     headersDone: false,
     recvBody: []byte(0),
+    recvTotal: 0,
     recvEnded: false,
+    readCh: h2connDummyRead(),
+    hasReader: false,
+    bodyOpen: false,
+    errMsg: "",
     pendingData: []byte(0),
     pendingEnd: false,
     hasPending: false,
@@ -173,11 +196,17 @@ const h2cmdOpen: int = 1
 const h2cmdRespond: int = 2
 const h2cmdGoaway: int = 3
 const h2cmdReset: int = 4
+// Take the next of a stream's received body bytes (#4624). Sent by whichever
+// green thread is consuming that stream's body — `h2connHandle`'s drain
+// (conn.bit) today — and answered on the command's own `readCh`.
+const h2cmdRead: int = 5
 
 // A command to the loop: open a client stream, answer a server stream, send a
 // GOAWAY, or reset a stream. Unused fields carry zero values.
 class h2connCmd {
   kind: int,
+  // Where an `h2cmdRead` is answered; `h2connDummyRead()` on every other kind.
+  readCh: chan<h2connRead>,
   request: Request,
   response: Response,
   streamId: int,
@@ -189,8 +218,17 @@ class h2connCmd {
 // failure with `errMsg`.
 class h2connMsg { ok: bool, response: Response, errMsg: string }
 
+// The answer to one `h2cmdRead`: the body bytes taken (possibly none), `eof` once
+// the peer has ended the stream and nothing is left, or `errMsg` when the stream
+// died before the body finished. A reader that receives `eof` or an `errMsg`
+// never reads that stream again, which is what lets the loop release the entry.
+class h2connRead { data: []byte, eof: bool, errMsg: string }
+
 // A fully-received request handed to the `serve` loop; `stop` ends the loop.
-class h2connAccept { stop: bool, streamId: int, request: Request }
+// `hasBody` says DATA is still to come, so `request.body` is empty and the
+// receiver must drain it (`h2connHandle`, conn.bit); false for a request whose
+// HEADERS carried END_STREAM, which owes no read at all.
+class h2connAccept { stop: bool, streamId: int, request: Request, hasBody: bool }
 
 // --- the three threads -------------------------------------------------------
 
@@ -255,8 +293,14 @@ fn h2connWriter(t: Transport, ch: chan<h2connOut>, doneCh: chan<int>) {
 
 // Loop thread: the sole owner of `st`. Serially fold in one inbound frame or one
 // command at a time until the transport closes.
+// A terminated connection keeps answering until every body reader has taken its
+// final answer (#4624): `h2connTerminate` fails the streams, which answers every
+// PARKED reader, but a reader that was between reads when the connection died
+// has an `h2cmdRead` still to send and nothing else can answer it. `openBodies`
+// counts exactly the readers that are owed one, and reaches 0 only once each has
+// received an `errMsg` — after which, by that contract, none of them reads again.
 fn h2connLoop(st: h2connState) {
-  while (st.running) {
+  while (st.running || st.openBodies > 0) {
     select {
       case ev = <- st.inCh:
         h2connHandleEvent(st, ev)

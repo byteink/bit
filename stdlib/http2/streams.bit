@@ -173,7 +173,108 @@ fn h2connCloseStream(st: h2connState, s: h2connStream) {
   }
   s.state = h2stClosed
   st.activeStreams = st.activeStreams - 1
+  // One exception to the release, added with the incremental body read (#4624):
+  // a stream whose body reader has not taken its final answer keeps its entry,
+  // because that answer is the only thing standing between a mid-body reset and
+  // a silently truncated body. `h2connFinishReader` below releases it instead,
+  // and the retention is bounded by that one read rather than by the connection.
+  if (s.bodyOpen) {
+    return
+  }
   delete(st.streams, s.id)
+}
+
+// --- the incremental body read (#4624) ---------------------------------------
+
+// Hand `k` bytes of receive credit back to the peer and say so on the wire: the
+// connection window always, the stream window only while the stream can still
+// receive. `ended` is END_STREAM — half-close, after which a stream
+// WINDOW_UPDATE would grant credit nobody can spend.
+//
+// Called with the padding at arrival (`h2connOnData`, events.bit) and with the
+// body bytes at the moment the application TAKES them (`h2connSendBody` below),
+// which is the whole of what #4624 changed: credit follows consumption, so the
+// window depletes for as long as a body sits unread.
+fn h2connGrantWindows(st: h2connState, streamId: int, s: h2connStream, k: int, ended: bool) {
+  h2connRenewConnWindow(st, k)
+  if (k == 0 || ended) {
+    return
+  }
+  s.recvWindow = s.recvWindow + k
+  h2connSendWindowUpdate(st, WindowUpdateFrame{ streamId: streamId, increment: k })
+}
+
+// The reader of `s`'s body has taken its last answer — `eof` or an error — so it
+// owes no more reads and nothing is waiting on this entry any longer. Releases
+// the entry `h2connCloseStream` held back if the stream is already closed.
+fn h2connFinishReader(st: h2connState, s: h2connStream) {
+  if (!s.bodyOpen) {
+    return
+  }
+  s.bodyOpen = false
+  st.openBodies = st.openBodies - 1
+  if (s.state == h2stClosed) {
+    delete(st.streams, s.id)
+  }
+}
+
+// Answer one read with everything `s` has buffered, and grant that much credit
+// back. Takes the buffer whole: the reader asked for the next bytes, not for a
+// count, so there is no partial take to account for and the held credit stays
+// exactly `len(s.recvBody)`.
+fn h2connSendBody(st: h2connState, s: h2connStream, ch: chan<h2connRead>) {
+  let data = s.recvBody
+  s.recvBody = []byte(0)
+  h2connGrantWindows(st, s.id, s, len(data), s.recvEnded)
+  if (s.recvEnded) {
+    h2connFinishReader(st, s)
+  }
+  ch <- h2connRead{ data: data, eof: s.recvEnded, errMsg: "" }
+}
+
+// Release a parked reader if there is now something to tell it — bytes, or the
+// end of the stream. Called from every site that adds to `recvBody` or sets
+// `recvEnded`; a no-op when no reader is parked or nothing has changed.
+fn h2connAnswerReader(st: h2connState, s: h2connStream) {
+  if (!s.hasReader) {
+    return
+  }
+  if (len(s.recvBody) == 0 && !s.recvEnded) {
+    return
+  }
+  let ch = s.readCh
+  s.hasReader = false
+  s.readCh = h2connDummyRead()
+  h2connSendBody(st, s, ch)
+}
+
+// Tell a parked reader its stream died. The message is the one the failure
+// carried, so a reader and a waiting `roundTrip` are told the same sentence.
+fn h2connFailReader(st: h2connState, s: h2connStream, msg: string) {
+  if (!s.hasReader) {
+    return
+  }
+  let ch = s.readCh
+  s.hasReader = false
+  s.readCh = h2connDummyRead()
+  h2connFinishReader(st, s)
+  ch <- h2connRead{ data: []byte(0), eof: true, errMsg: msg }
+}
+
+// Fail every stream still owing bytes to a body reader, on the way down
+// (`h2connTerminate`, events.bit). Snapshotted before the walk for the reason
+// `h2connFailAbandoned` gives: failing a stream can delete its table entry, and
+// the runtime's map iterator does not allow mutation mid-walk (SPEC §12.6).
+fn h2connFailBodies(st: h2connState, msg: string) {
+  let doomed = []h2connStream(0)
+  for (_, s) of st.streams {
+    if (s.bodyOpen) {
+      doomed = append(doomed, s)
+    }
+  }
+  for s of doomed {
+    h2connFailStreamMsg(st, s, errorInternalError, msg)
+  }
 }
 
 // --- delivering completed messages -------------------------------------------
@@ -188,14 +289,70 @@ fn h2connDeliverResponse(st: h2connState, s: h2connStream) {
   h2connCloseStream(st, s)
 }
 
+// Hand a request to `serve` as soon as its HEADERS are complete, NOT at
+// END_STREAM (#4624). `req.body` is empty and `hasBody` says whether DATA is
+// still to come; the receiving thread drains it through `h2cmdRead`, which is
+// what turns the receive windows into real backpressure — under the old
+// deliver-at-END_STREAM rule nothing downstream existed to wait on, so credit
+// had to be granted the instant DATA landed.
 fn h2connDeliverRequest(st: h2connState, s: h2connStream) {
   if (s.delivered) {
     return
   }
   s.delivered = true
+  if (!s.recvEnded) {
+    s.bodyOpen = true
+    st.openBodies = st.openBodies + 1
+  }
   let req = h2connBuildRequest(s.recvHeaders)
-  req.body = s.recvBody
-  st.acceptCh <- h2connAccept{ stop: false, streamId: s.id, request: req }
+  st.acceptCh <- h2connAccept{
+    stop: false,
+    streamId: s.id,
+    request: req,
+    hasBody: s.bodyOpen,
+  }
+}
+
+// The `readCh` of every command that is not an `h2cmdRead`, and the `readCh` of
+// a stream with no parked reader: a channel field needs a value, and this is one
+// nothing ever sends to. Same role `h2connDummyReply` plays for `replyCh`.
+fn h2connDummyRead(): chan<h2connRead> {
+  return chan<h2connRead>(1)
+}
+
+// Take a served request's body from the loop, a chunk at a time, and return it
+// whole (#4624). THIS thread is the consumer the receive windows now follow: the
+// loop holds the credit for every byte it has buffered and renews it as this
+// drains, so a peer uploading faster than a handler is reached stops at the
+// window. Draining here and handing the handler a complete `req.body` is what
+// keeps every existing handler working unchanged; an incremental surface for the
+// handler itself is one method over this same command.
+//
+// A stream that dies mid-body fails the drain rather than truncating the body:
+// the loop reports it in `errMsg` whether this thread was parked on the read or
+// between two of them.
+fn h2connDrainBody(s: Stream): []byte! {
+  let body = []byte(0)
+  while (true) {
+    let ch = chan<h2connRead>(1)
+    s.cmdCh <- h2connCmd{
+      kind: h2cmdRead,
+      readCh: ch,
+      request: h2connZeroRequest(),
+      response: h2connZeroResponse(),
+      streamId: s.id,
+      errorCode: 0,
+      replyCh: h2connDummyReply(),
+    }
+    let r = <- ch
+    if (r.errMsg != "") {
+      fail newError(r.errMsg)
+    }
+    body = h2connAppendBytes(body, r.data)
+    if (r.eof) {
+      return body
+    }
+  }
 }
 
 // --- error paths -------------------------------------------------------------
@@ -251,6 +408,11 @@ fn h2connFailStreamMsg(st: h2connState, s: h2connStream, code: int, msg: string)
   }
   s.reset = true
   s.errorCode = code
+  // Recorded so a body reader that was BETWEEN reads when this happened is told
+  // the same sentence when it next asks (`h2connCmdRead`, events.bit), rather
+  // than an `eof` that would read as a complete body (#4624).
+  s.errMsg = msg
+  h2connFailReader(st, s, msg)
   h2connCloseStream(st, s)
   if (st.isClient && !s.replied) {
     s.replied = true
