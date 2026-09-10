@@ -404,7 +404,7 @@ with no rules, not a mistake.
 | `@minLen(n)` / `@maxLen(n)` | `string` | the value is at least / at most `n` **characters** (not bytes) |
 | `@min(n)` / `@max(n)` | `i64` | the value is at least / at most `n` |
 | `@email` | `string` | one `@`, a domain with an interior dot, no whitespace |
-| `@httpUrl` | `string` | an absolute `http://` or `https://` URL with a host |
+| `@url` | `string` | an absolute `http://` or `https://` URL with a host |
 | `@uuid` | `string` | canonical `8-4-4-4-12` hex, either case |
 | `@nonEmpty` | `string` | something is left after trimming whitespace |
 
@@ -412,8 +412,8 @@ Lengths and values are named apart (`minLen` vs `min`) because Bit has no
 overloading, so `@min(3)` on a string is a compile error with an obvious fix
 rather than a rule that measured the wrong thing.
 
-`@httpUrl` and not `@url`: this package already exports `url()`, the href scheme
-allowlist, and one module cannot hold two.
+`@url` is the rule; the href scheme allowlist this package also exports is
+`safeUrl()`, because one module cannot hold two `url`s.
 
 ### Anyone can add a rule
 
