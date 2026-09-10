@@ -104,70 +104,37 @@ export class Regex {
   // to right. `limit < 0` means no limit; `limit == 0` returns an empty slice;
   // otherwise at most `limit` matches.
   //
-  // NOT O(len(s)) in total, unlike `matches`/`find` — this restarts a full
-  // unanchored `runPike` scan per match, and for a pattern shaped like
-  // #3832's finding that is O(len(s)^2). See pike.bit's `#3832` comment
-  // (above `class Thread`) for the exact mechanism and the closed-form
-  // arithmetic verifying it. `replaceAll` and `split` (via this function)
-  // share the same cost.
+  // O(len(s) x len(re's program)) for the WHOLE scan, the same bound as
+  // `matches`/`find` — one continuous left-to-right pass (`runPikeAll`,
+  // pikeall.bit), not one restarted search per match. It was the latter
+  // until #3866, which made it O(len(s)^2) for any pattern with a
+  // high-priority branch that stays alive without completing; pike.bit's
+  // `#3832` block holds that measurement. `replaceAll` and `split` are
+  // expressed over this function, so all three share the one pass.
   //
-  // After a match, the next search starts at its end offset — except when the
-  // match is empty AND starts exactly at the position this search began from
-  // (`end == pos`; see `nextSearchPos`), where the next search starts one RUNE
-  // later instead of one byte later, so a multi-byte character is never
-  // split. Without that rule `findAll("a*", "bb")` never terminates; with it,
-  // `a*` over `"bb"` yields three empty matches, at byte offsets 0, 1 and 2.
+  // The two rules that scan obeys are stated where it implements them
+  // (pikeall.bit's `isEmptyEcho` and `forwardThreads`), and are unchanged in
+  // effect: a zero-width match advances by one RUNE rather than one byte, so
+  // a multi-byte character is never split and `findAll("a*", "bb")`
+  // terminates with three empty matches at offsets 0, 1 and 2; and an empty
+  // match sitting exactly where the previous match ended is rejected,
+  // mirroring Go's `regexp.go` (`(*Regexp).matches`, go1.27.0
+  // regexp.go:768), which is what stops `".*"` over `"abcdef"` from
+  // reporting a spurious `[6,6)` right after `[0,6)`.
   //
-  // A SECOND, independent rule sits alongside the advance rule, mirroring
-  // Go's `regexp.go` (`(*Regexp).matches`, go1.27.0 regexp.go:747-800) exactly:
-  // an empty match found at the search origin `pos` is rejected — never
-  // appended to `out` — when it starts right where the immediately preceding
-  // ACCEPTED match ended (`start == prevMatchEnd`, Go's `matches[0] ==
-  // prevMatchEnd` at line 768). That is what stops `".*"` over `"abcdef"`
-  // from reporting a spurious second, empty match `[6,6)` right after
-  // `[0,6)`: Go's own `findTests` never reports that echo. The rune-advance
-  // rule still fires whether or not the match was accepted — REJECTING a
-  // match must not also skip advancing, or the loop can re-find the exact
-  // same rejected match forever.
-  //
-  // The loop below is bounded independently of both rules, at `len(s) + 1`
-  // iterations (`pos` strictly increases every pass, by at least one rune,
-  // whether or not the match found that pass is accepted), so a bug in
-  // either rule can never hang a caller.
-  //
-  // ONE VM scratch for the whole scan (#3659), made here and threaded through
-  // every `searchRegex` below. It is a local of this call — never a field on
-  // `re`, which is shared and immutable — so a concurrent `findAll` on the
-  // same `Regex` gets its own. The `Match`es accumulated in `out` are NOT
-  // views into it: each carries the `snapshotSlots` array its own winning
-  // thread produced (`pike.bit`), so resetting the scratch for the next
-  // search cannot reach back and alter a match already collected.
+  // The `Match`es returned are NOT views into the VM scratch: each carries
+  // the `snapshotSlots` array its own winning thread produced (`pike.bit`),
+  // so the scan reusing its buffers cannot reach back and alter a match
+  // already collected.
   export findAll(s: string, limit: int): []Match {
     let out: []Match = []Match(0)
-    if (limit == 0) {
-      return out
-    }
-    let sc = newPikeScratch(this.prog)
-    let n = len(s)
-    let pos = 0
-    let prevMatchEnd = -1
+    let all = scanRegex(this, s, limit)
     let i = 0
-    while (pos <= n && i <= n) {
-      if (limit > 0 && len(out) >= limit) {
-        return out
-      }
-      let (matched, slots) = searchRegex(this, s, pos, sc)
-      if (!matched) {
-        return out
-      }
-      let start = slots[0]
-      let end = slots[1]
-      let accept = !(end == pos && start == prevMatchEnd)
-      if (accept) {
-        out = append(out, Match{ start: start, end: end, slots: slots, names: this.names })
-      }
-      prevMatchEnd = end
-      pos = nextSearchPos(s, pos, end)
+    // Bounded by `len(all)`, itself bounded by `len(s) + 1` (one match per
+    // input position at most — pikeall.bit's own bound).
+    while (i < len(all)) {
+      let slots = all[i]
+      out = append(out, Match{ start: slots[0], end: slots[1], slots: slots, names: this.names })
       i = i + 1
     }
     return out
@@ -253,37 +220,20 @@ export class Regex {
   // itself, unchanged.
   export replaceAll(s: string, repl: string): string {
     let b = newBuilder()
-    let n = len(s)
-    let pos = 0
+    let ms = this.findAll(s, -1)
     let written = 0
-    let prevMatchEnd = -1
     let i = 0
-    // One scratch for the whole scan, reused every pass (#3659) — `findAll`
-    // does the same, and this loop otherwise mirrors it exactly.
-    let sc = newPikeScratch(this.prog)
-    // Bounded by len(s) + 1 iterations: `pos` strictly increases every pass,
-    // by at least one rune, whether or not the match found that pass is
-    // accepted — identical termination argument to `findAll` (regex.bit),
-    // which this loop otherwise mirrors exactly.
-    while (pos <= n && i <= n) {
-      let (matched, slots) = searchRegex(this, s, pos, sc)
-      if (!matched) {
-        break
-      }
-      let start = slots[0]
-      let end = slots[1]
-      let accept = !(end == pos && start == prevMatchEnd)
-      if (accept) {
-        b = b.write(s[written:start])
-        let m = Match{ start: start, end: end, slots: slots, names: this.names }
-        b = expandTemplate(b, repl, m, s)
-        written = end
-      }
-      prevMatchEnd = end
-      pos = nextSearchPos(s, pos, end)
+    // Bounded by `len(ms)`. The matches are non-overlapping and in
+    // increasing order (pikeall.bit), so `written` never runs past
+    // `m.start` and each slice below is well-formed.
+    while (i < len(ms)) {
+      let m = ms[i]
+      b = b.write(s[written:m.start])
+      b = expandTemplate(b, repl, m, s)
+      written = m.end
       i = i + 1
     }
-    b = b.write(s[written:n])
+    b = b.write(s[written:len(s)])
     return b.toString()
   }
 
@@ -354,6 +304,46 @@ fn searchRegex(re: Regex, s: string, startAt: int, sc: PikeScratch): (bool, []in
     assertPrefilterAgrees(re.source, matched, slots, refMatched, refSlots)
   }
   return matched, slots
+}
+
+// `searchRegex`'s multi-match twin: every non-overlapping match of `re` in
+// `s` in ONE continuous pass (`runPikeAll`, pikeall.bit), which is what
+// `findAll` — and so `split` and `replaceAll` — is built on.
+//
+// The scratch is a local of this call, never a field on `re` (which is
+// shared and immutable), so a concurrent scan on the same `Regex` gets its
+// own; and the reference run under `selfCheck` gets a SECOND one rather than
+// reusing the first, because unlike `searchRegex`'s two single searches
+// these two scans must not share thread lists — the first scan's result is
+// an array of arrays that outlives the scratch, but the scratch itself is
+// still live bookkeeping while the second scan runs.
+//
+// #2052's agreement check is per SCAN here, not per search: the prefilter
+// gates fresh start-thread seeding at every position of the pass, so the
+// property to check is that the whole match sequence is unchanged with it
+// forced off, not just one match at a time.
+fn scanRegex(re: Regex, s: string, limit: int): [][]int {
+  let all = runPikeAll(re.prog, s, re.prefilter, newPikeScratch(re.prog), limit)
+  if (re.selfCheck) {
+    let ref = runPikeAll(re.prog, s, noPrefilter(), newPikeScratch(re.prog), limit)
+    assertScanAgrees(re.source, all, ref)
+  }
+  return all
+}
+
+// A different NUMBER of matches, or any slot disagreeing in any of them, is
+// a correctness bug in `prefilter.bit`'s derivation — see
+// `assertPrefilterAgrees`, of which this is the scan-wide form.
+fn assertScanAgrees(source: string, all: [][]int, ref: [][]int) {
+  if (len(all) != len(ref)) {
+    panic("regex: prefilter disagreement on \"${source}\": ${len(all)} matches, reference ${len(ref)}")
+  }
+  let i = 0
+  // Bounded by `len(all)`, checked equal to `len(ref)` just above.
+  while (i < len(all)) {
+    assertSlotsEqual(source, all[i], ref[i])
+    i = i + 1
+  }
 }
 
 // `matched`/`refMatched` disagreeing, or — when both matched — any slot
@@ -459,32 +449,6 @@ export class Match {
     }
     return Option.None
   }
-}
-
-// Where `findAll`'s next search should start, given the position `pos` this
-// search began from and the match `[start, end)` (start not needed — see
-// below) it found: `end` itself, unless the match is empty exactly at `pos`
-// (`end == pos`, Go's own `matches[1] == pos` check — an unanchored search
-// from `pos` never returns a start earlier than `pos`, so `end == pos`
-// already implies `start == pos` too), in which case one rune past `pos`
-// instead of zero — advancing by a byte would split a multi-byte character,
-// and advancing by zero would loop forever on a pattern like `a*`.
-//
-// Comparing against `pos` rather than `start` matters for a pattern that
-// can only match empty LATER than the search origin, e.g. a bare `$`
-// searched from `pos == 0` on `"ab"`: the match found is empty at `[2,2)`,
-// but `end (2) != pos (0)`, so this returns `end` unchanged (`2`), the same
-// as for any other non-empty-search match — exactly Go's `else { pos =
-// matches[1] }` branch. Using `start == end` here instead (the empty-match
-// test alone, ignoring where the search began) would wrongly take the
-// one-rune-further branch on that same match, overshooting into the next
-// search and potentially skipping content Go's `findAll` does not skip.
-fn nextSearchPos(s: string, pos: int, end: int): int {
-  if (end > pos) {
-    return end
-  }
-  let (_, width) = decodeRuneAt(s, pos)
-  return pos + width
 }
 
 // The number of capturing groups in `ast`, walked once at `compile` time so

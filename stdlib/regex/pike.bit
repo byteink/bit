@@ -67,8 +67,11 @@
 // stack instead of recursion, so a deeply nested pattern still cannot
 // overflow the native stack.
 //
-// #3832: ONE `runPike` CALL IS LINEAR — `findAll`/`replaceAll`/`split`
-// (regex.bit) ARE NOT, AND `numInsts` DOES NOT BOUND THEM. Verified live,
+// #3832/#3866: ONE `runPike` CALL IS LINEAR, AND A RESTARTING CALLER WAS
+// NOT. This is the measurement that produced `runPikeAll` (pikeall.bit),
+// which every multi-match caller now uses instead; it is kept because it is
+// the reason that file exists, and because the number below is the
+// regression pin (`PikeScratch.steps`). Verified live,
 // not assumed: the ticket's own worst offender,
 // `([^a-z0-9]*.*)?\w?(.+?\d+I)+|\w*?[0-9]*?`, compiles to `numInsts == 30` —
 // tiny — against the 3976-byte `block4k` subject (tools/fuzz/regexdifffuzz's
@@ -78,8 +81,8 @@
 // the top of this file holds exactly here — the bug is not in this
 // function.
 //
-// The bug is in the CALLER. `findAll` (and `replaceAll`, and `split` via
-// `findAll`) call `searchRegex` -> `runPike` once per match, restarting the
+// The bug was in the CALLER. `findAll` (and `replaceAll`, and `split` via
+// `findAll`) called `searchRegex` -> `runPike` once per match, restarting the
 // unanchored scan from the match's own end every time. `runPike` cannot
 // stop the instant SOME match is found, because leftmost-first priority
 // means a currently-alive HIGHER-priority thread might still complete into
@@ -93,7 +96,7 @@
 // every position. Every one of the ~n restarted searches independently
 // re-discovers "no I in the remaining suffix" by walking to the end again.
 //
-// The arithmetic is exact, not approximate: `findAll` makes `n+1` calls
+// The arithmetic was exact, not approximate: `findAll` made `n+1` calls
 // here (positions 0..n inclusive, one accepted empty match per byte plus
 // one at `n`), the i-th (0-indexed) of which visits `n-i+1` positions
 // before returning. `sum(i=0..n) of (n-i+1) == (n+1)(n+2)/2`. Measured by
@@ -102,7 +105,7 @@
 // **7,910,253** positions total, against `(n+1)(n+2)/2` for `n=3976` ==
 // `3977 x 3978 / 2 == 7,910,253` — an exact match to the closed form.
 //
-// So the REAL bound on `findAll`/`replaceAll`/`split` is
+// So the REAL bound on a RESTARTING `findAll`/`replaceAll`/`split` is
 // O(len(s)^2 x numInsts), not O(len(s) x numInsts): at most `len(s)+1`
 // restarted searches (`pos` strictly advances every pass — findAll's own
 // doc comment), each individually bounded by this file's own
@@ -116,13 +119,14 @@
 // linear `matches()` call, not a multi-match scan).
 //
 // A lazy DFA (the step epic #2025 names as its next planned move) would
-// NOT fix this: it would shrink the per-position constant of each restarted
-// scan, not the restart count. The actual fix is architectural — make
-// `findAll`/`replaceAll`/`split` share ONE continuous left-to-right pass
-// that commits each match and keeps going, instead of re-seeding a fresh
-// scan per match — and is out of this ticket's scope (it changes thread
-// lifetime, echo-rejection and capture-slot bookkeeping across match
-// boundaries, not a tuning knob). Filed separately.
+// NOT have fixed this: it shrinks the per-position constant of each
+// restarted scan, not the restart count. The fix (#3866) is architectural,
+// and is `runPikeAll` (pikeall.bit): ONE continuous left-to-right pass that
+// records each match and keeps going, with the thread lists — and their
+// leftmost-first priority order — carried across match boundaries instead of
+// re-seeded per match. Same subject and pattern, after: 3977 positions, the
+// `n+1` a single search costs. `runPike` below is unchanged and is now the
+// SINGLE-match entry point only (`matches`, `find`).
 class Thread { pc: int, slots: []int }
 
 // A per-position "already visited" set, keyed by program counter: the
@@ -501,12 +505,21 @@ fn freshSlots(numSlots: int): []int {
 // (`addThreadStep` builds a fresh `Thread` around `snapshotSlots`). So
 // `start.slots` stays all-`-1` for the life of the scratch and needs no
 // reset.
+//
+// `steps` is the input positions the last VM entry visited — one increment
+// per iteration of the position loop, zeroed by `pikeScratchReset`. It is
+// the linear-time promise made READABLE rather than asserted: the bound a
+// caller can check is not "each search is linear" (which #3832 confirmed
+// while `findAll` was quadratic) but the TOTAL positions a whole multi-match
+// scan visits, and the only way to regress that is to reintroduce a restart,
+// which shows up here as a step count above `len(s) + 1`.
 class PikeScratch {
   clist: ThreadList,
   nlist: ThreadList,
   stack: PcStack,
   cur: []int,
   start: Thread,
+  steps: int,
 }
 
 // A scratch sized for `prog` — `numInsts` bounds both thread lists and the
@@ -524,6 +537,7 @@ fn newPikeScratch(prog: Prog): PikeScratch {
     stack: newPcStack(numInsts + 1),
     cur: []int(prog.numSlots),
     start: Thread{ pc: 0, slots: freshSlots(prog.numSlots) },
+    steps: 0,
   }
 }
 
@@ -561,6 +575,7 @@ fn pikeScratchReset(sc: PikeScratch, prog: Prog) {
   )
   threadListClear(sc.clist)
   threadListClear(sc.nlist)
+  sc.steps = 0
   assert(sc.stack.sp == 0, "regex: pike VM closure stack left undrained")
 }
 
@@ -589,10 +604,13 @@ fn pikeScratchReset(sc: PikeScratch, prog: Prog) {
 // while unmatched, an empty `nlist` means nothing YET, not never, since a
 // fresh seed at the next position is still owed.
 //
-// Returns `(matched, slots)`. `matches`/`find` always pass `startAt: 0`;
-// `findAll` (regex.bit) passes the previous match's end (or one rune past
-// it, for an empty match) to find the next non-overlapping one — so this one
-// function is the whole VM entry point all three go through.
+// Returns `(matched, slots)`. `matches`/`find` (regex.bit) are the only
+// callers and always pass `startAt: 0`; the multi-match callers go through
+// `runPikeAll` (pikeall.bit) instead, which is one pass for the whole scan
+// rather than one call of this function per match (#3866). `startAt` stays
+// because the anchoring it implies — a start thread seeded from there on,
+// `runeBeforePos` supplying the real preceding rune — is what makes this
+// function usable for a resumed search at all.
 //
 // `sc` is the caller's scratch (this file's ALLOCATION note) and MUST have
 // been built by `newPikeScratch(prog)` for this same `prog` — every buffer
@@ -623,6 +641,7 @@ fn runPike(prog: Prog, s: string, startAt: int, pf: Prefilter, sc: PikeScratch):
   // (>= 1) every iteration that does not return — at most `n - startAt + 1`
   // positions are ever visited.
   while (pos <= n) {
+    sc.steps = sc.steps + 1
     let (after, width) = stepRune(s, pos)
     if (!matched && isCandidateStart(pf, s, pos)) {
       ctx.pos = pos

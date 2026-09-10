@@ -1,0 +1,370 @@
+// Bit standard library — regex module, the multi-match Pike VM scan.
+//
+// `runPike` (pike.bit) finds ONE leftmost-first match. `findAll`,
+// `replaceAll` and `split` (regex.bit) want every non-overlapping match, and
+// used to get them by calling `runPike` once per match, restarting the
+// unanchored scan from the previous match's end each time — O(len(s)^2 x
+// numInsts) whenever a high-priority thread stays alive without completing,
+// because every restart re-walks the same suffix (#3866, diagnosed in #3832;
+// the exact arithmetic is in pike.bit's `#3832` comment block). This file is
+// that scan done ONCE: one left-to-right pass, the thread lists carried
+// across match boundaries, so the whole multi-match scan is bounded by the
+// same O(len(s) x numInsts) as a single search.
+//
+// WHAT MAKES IT WORK: a fresh start thread is seeded at EVERY position, not
+// only until the first match (`runPike`'s `!matched` gate). The lineage that
+// will produce match k+1 is therefore already running when match k is found,
+// and nothing is ever re-seeded. Both thread lists stay sorted by START
+// OFFSET ascending — a seed is appended last, and forwarding preserves order
+// — which IS leftmost-first order across match boundaries, not just within
+// one match.
+//
+// SO THERE IS NO "PENDING MATCH": the tentative match list itself carries
+// that state (`dropSuperseded`). A candidate `[cs,ce]` drops every tail entry
+// that starts at or after `cs` (they are lower priority: they start later)
+// and appends itself. A greedy extension of an already-recorded match
+// arrives later with the SAME `cs` and rewrites it; a genuinely later match
+// arrives with a bigger `cs` and appends. Total rewrites are bounded by
+// total appends, so the bookkeeping is amortized O(1) per position.
+//
+// AND NO OVERLAP CAN REACH THAT RULE, because of the CUT (`forwardThreads`).
+// `runPike`'s `stepClist` stops at the first `Match` in `clist`: every thread
+// after it is strictly lower priority and can never win. Here those threads
+// fall into two kinds. Ones that started BEFORE this position overlap the
+// match just found (their start is below its end) and are as dead as they
+// were before. Ones that started AT this position — the fresh seed's own —
+// are exactly the candidates for the NEXT match, and must survive; that is
+// the one thing the old early return threw away and the reason it could not
+// be reused here.
+//
+// THE EMPTY-MATCH ECHO, AND THE TRAP IN IT. `findAll`'s rejection rule
+// (regex.bit, mirroring Go's regexp.go) drops an empty match sitting exactly
+// where the previous match ended. Here that is one line in `isEmptyEcho`:
+// reject `[e,e]` when the last recorded match ends at `e`. The trap is
+// finding it at all — when the committed match ends at this position, the
+// seed's OWN empty match is deduped away by `pcSetHas` (a program has one
+// `Match` pc, and the winning thread reached it first), so it is invisible
+// in `clist`, and its lower-priority arms then survive when a fresh search
+// starting here would have cut them at the `Match`. `c|a*?` over `"ca"` is
+// the smallest witness: a restart yields `"c"` then `""`, a scan without
+// this correction yields `"c"` then `"a"`. `probeEmptyMatch` answers the
+// question independently of the dedupe — see its comment.
+
+// The per-position facts the forwarding pass needs on top of `PikeCtx`:
+// where the first `Match` sits in `clist` (`-1` for none), where the fresh
+// seed's own threads begin (`clist.count` when no seed was added at this
+// position, i.e. the prefilter ruled it out), and the three runes framing
+// this position and the next — `before`/`after` for an `Assert` evaluated
+// HERE (the probe), `after`/`nextAfter` for one evaluated at the position a
+// survivor is forwarded INTO (`addThread`), exactly as `runPike` passes
+// them.
+class ScanStep { mi: int, seedStart: int, before: rune, after: rune, nextAfter: rune }
+
+// `probeEmptyMatch`'s two sparse sets, allocated once per scan (never per
+// position — this module's allocation rule, pike.bit's header) and cleared
+// in O(1) at each use. `visited` is the probe's own dedupe set, deliberately
+// SEPARATE from the thread lists' so the probe's answer cannot depend on
+// which pcs an earlier-starting thread already claimed at this position.
+class ProbeSets { visited: PcSet, pre: PcSet }
+
+fn newProbeSets(numInsts: int): ProbeSets {
+  return ProbeSets{ visited: newPcSet(numInsts), pre: newPcSet(numInsts) }
+}
+
+// The index of the first `Match` thread in `clist` — the highest-priority
+// complete match at this position — or `-1` when there is none. `clist` is
+// in priority order, so the FIRST one is the only one that can be this
+// position's candidate: every later one starts at or after it (the list is
+// sorted by start offset) and is lower priority, so it either overlaps the
+// candidate or is the empty echo at this position, which `isEmptyEcho`
+// rejects anyway.
+fn firstMatchIndex(clist: ThreadList, prog: Prog): int {
+  let i = 0
+  // Bounded by `clist.count`, itself bounded by `numInsts` (pike.bit's
+  // per-position dedupe).
+  while (i < clist.count) {
+    if (prog.insts[clist.threads[i].pc].op == Op.Match) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Whether the pattern can match EMPTY at this position: whether the epsilon
+// closure of pc 0 reaches `Match`, walked in priority order with the probe's
+// own visited set. That independence is the whole point — when a match
+// ending here has already been found, its thread claimed the `Match` pc
+// first, so the seed's own path to it is deduped out of `clist` and the echo
+// is invisible there (this file's header). Every BLOCKING pc reached before
+// `Match` is marked into `probe.pre`: those, and only those, are the seed
+// threads a fresh search starting here would keep alive, since its own
+// `stepClist` would cut everything after the `Match` it found.
+//
+// O(numInsts): one entry per pc, dedupe on the way in, and the walk stops
+// dead at `Match`. Allocates nothing — the closure stack is the scratch's,
+// borrowed the same way `addThread` borrows it, and is drained explicitly on
+// the early exit (the abandoned entries are lower-priority arms this walk
+// has just decided are dead, not a broken invariant).
+fn probeEmptyMatch(ctx: PikeCtx, probe: ProbeSets, st: ScanStep): bool {
+  pcSetClear(probe.visited)
+  pcSetClear(probe.pre)
+  assert(ctx.stack.sp == 0, "regex: pike VM closure stack left undrained")
+  stackPush(ctx.stack, 0)
+  // Bounded by `numInsts`: every iteration pops one entry, and only a pc
+  // visited for the first time ever pushes, at most two successors.
+  while (ctx.stack.sp > 0) {
+    ctx.stack.sp = ctx.stack.sp - 1
+    let pc = ctx.stack.pcs[ctx.stack.sp]
+    if (pcSetHas(probe.visited, pc)) {
+      continue
+    }
+    pcSetMark(probe.visited, pc)
+    if (probeStep(ctx, probe, st, pc)) {
+      ctx.stack.sp = 0
+      return true
+    }
+  }
+  return false
+}
+
+// One pc of `probeEmptyMatch`'s walk: pushes the epsilon successors in
+// priority order (`Split` pushes `y` before `x` so `x` pops first, as
+// `addThreadStep` does), records a blocking pc as "reached before `Match`",
+// and reports `true` the instant `Match` itself is reached. `Save` is
+// followed but its slot write is skipped entirely: this walk decides
+// reachability and priority order, never captures.
+fn probeStep(ctx: PikeCtx, probe: ProbeSets, st: ScanStep, pc: int): bool {
+  let inst = ctx.prog.insts[pc]
+  if (inst.op == Op.Jump) {
+    stackPush(ctx.stack, inst.x)
+    return false
+  }
+  if (inst.op == Op.Split) {
+    stackPush(ctx.stack, inst.y)
+    stackPush(ctx.stack, inst.x)
+    return false
+  }
+  if (inst.op == Op.Save) {
+    stackPush(ctx.stack, pc + 1)
+    return false
+  }
+  if (inst.op == Op.Assert) {
+    if (assertHolds(inst.kind, st.before, st.after)) {
+      stackPush(ctx.stack, pc + 1)
+    }
+    return false
+  }
+  if (inst.op == Op.Match) {
+    return true
+  }
+  pcSetMark(probe.pre, pc)
+  return false
+}
+
+// Extends one surviving thread into `nlist` — `stepClist`'s body, minus the
+// match handling `forwardThreads` does itself. A `Match` thread is dropped
+// rather than extended: it has no successor, and `instAccepts` would read it
+// as an `Op.Any`.
+fn forwardOne(nlist: ThreadList, th: Thread, st: ScanStep, ctx: PikeCtx) {
+  let inst = ctx.prog.insts[th.pc]
+  if (inst.op == Op.Match || st.after == noRune) {
+    return
+  }
+  if (!instAccepts(inst, st.after)) {
+    return
+  }
+  addThread(nlist, Thread{ pc: th.pc + 1, slots: th.slots }, st.after, st.nextAfter, ctx)
+}
+
+// Everything strictly higher priority than this position's candidate match
+// (`clist[0:mi]`), or all of `clist` when no match was found here. These are
+// the threads that may still extend into a BETTER match for the same, or an
+// earlier, start offset.
+fn forwardHead(clist: ThreadList, nlist: ThreadList, st: ScanStep, ctx: PikeCtx) {
+  let hi = clist.count
+  if (st.mi >= 0) {
+    hi = st.mi
+  }
+  let i = 0
+  // Bounded by `clist.count`, fixed at entry — filling `nlist` never changes
+  // it.
+  while (i < hi) {
+    forwardOne(nlist, clist.threads[i], st, ctx)
+    i = i + 1
+  }
+}
+
+// The fresh seed's own threads, which start AT this position and so are the
+// candidates for the next, non-overlapping match — the one group the
+// single-match early return could not keep. `probe.pre` cuts them exactly
+// where a fresh search starting here would: at its own first `Match`. The
+// cut is a prefix, because `clist`'s seed region is the probe's walk order
+// with some entries deduped out, so the first pc missing from `pre` ends the
+// run.
+fn forwardSeedTail(
+  clist: ThreadList,
+  nlist: ThreadList,
+  st: ScanStep,
+  ctx: PikeCtx,
+  probe: ProbeSets,
+) {
+  let i = st.seedStart
+  // Bounded by `clist.count`, fixed at entry.
+  while (i < clist.count) {
+    let th = clist.threads[i]
+    if (!pcSetHas(probe.pre, th.pc)) {
+      return
+    }
+    forwardOne(nlist, th, st, ctx)
+    i = i + 1
+  }
+}
+
+// This position's survivors, into `nlist`. Three cases, and the middle one
+// is the whole difference from `runPike`:
+//   - no match here (`mi < 0`): every thread survives, exactly as before.
+//   - a match from an EARLIER start (`mi < seedStart`): threads before it
+//     survive, threads between it and the seed both lose on priority and
+//     overlap the match, and the seed's own threads survive under the probe
+//     cut.
+//   - a match from the seed itself (`mi >= seedStart`, so an empty match at
+//     this position): nothing after it survives, which is `stepClist`'s
+//     early return unchanged.
+fn forwardThreads(
+  clist: ThreadList,
+  nlist: ThreadList,
+  st: ScanStep,
+  ctx: PikeCtx,
+  probe: ProbeSets,
+) {
+  forwardHead(clist, nlist, st, ctx)
+  if (st.mi < 0 || st.mi >= st.seedStart || st.seedStart >= clist.count) {
+    return
+  }
+  // `probe.pre` is the output that matters here; whether the pattern can
+  // match empty at this position is only how the walk decided where to stop.
+  let _ = probeEmptyMatch(ctx, probe, st)
+  forwardSeedTail(clist, nlist, st, ctx, probe)
+}
+
+// The tentative match list with every entry starting at or after `start`
+// dropped: a candidate match beginning at `start` is either an extension of
+// one of them (same start, found later, therefore from a higher-priority
+// thread) or begins before them, and under leftmost-first it beats every
+// one either way.
+//
+// Amortized O(1) across the scan: each iteration removes an entry some
+// earlier position appended, so total work is bounded by total appends.
+fn dropSuperseded(out: [][]int, start: int): [][]int {
+  let kept = out
+  // Bounded by `len(out)`: every iteration drops one entry.
+  while (len(kept) > 0 && kept[len(kept) - 1][0] >= start) {
+    kept = kept[0:len(kept) - 1]
+  }
+  return kept
+}
+
+// The empty-match echo rule, all of it: a zero-width match sitting exactly
+// where the previous one ended is not a match. This is Go's `matches[0] ==
+// prevMatchEnd` (regexp.go), the same rejection `findAll` used to make
+// against its own `prevMatchEnd` before the scan carried that state itself
+// — `out`'s last entry IS `prevMatchEnd` here, which is why rejecting is
+// simply not appending, with nothing else to unwind.
+fn isEmptyEcho(out: [][]int, slots: []int): bool {
+  if (len(out) == 0 || slots[0] != slots[1]) {
+    return false
+  }
+  return slots[0] == out[len(out) - 1][1]
+}
+
+// Whether the first `limit` matches are settled — nothing alive can still
+// rewrite them. `nlist` is sorted by start offset, so one comparison against
+// its highest-priority thread answers it: no surviving thread starts at or
+// before the last wanted match's start, therefore none can supersede it (see
+// `recordMatch`).
+fn matchesSettled(nlist: ThreadList, out: [][]int, limit: int): bool {
+  if (limit <= 0 || len(out) < limit) {
+    return false
+  }
+  return nlist.count == 0 || nlist.threads[0].slots[0] > out[limit - 1][0]
+}
+
+fn trimMatches(out: [][]int, limit: int): [][]int {
+  if (limit > 0 && len(out) > limit) {
+    return out[0:limit]
+  }
+  return out
+}
+
+// Every non-overlapping leftmost-first match of `prog` in `s`, left to
+// right, as the winning threads' capture-slot arrays — `limit < 0` for all
+// of them, `limit == 0` for none, otherwise at most `limit`. One continuous
+// pass (this file's header): O(len(s) x numInsts) for the WHOLE scan, not
+// per match.
+//
+// `sc` is the caller's scratch, reset here and never reallocated, exactly as
+// `runPike` treats it; the arrays returned are the winning threads' own
+// `snapshotSlots`, so they outlive any later reuse of `sc`. `pf` still gates
+// only whether a fresh start thread is seeded at a position, and now does so
+// at every position rather than only until the first match — which is what
+// the restarting caller effectively did too, one search at a time.
+fn runPikeAll(prog: Prog, s: string, pf: Prefilter, sc: PikeScratch, limit: int): [][]int {
+  let out = [][]int(0)
+  if (limit == 0) {
+    return out
+  }
+  pikeScratchReset(sc, prog)
+  let numInsts = len(prog.insts)
+  let n = len(s)
+  let clist = sc.clist
+  let nlist = sc.nlist
+  let ctx = PikeCtx{ prog: prog, stack: sc.stack, pos: 0, cur: sc.cur }
+  let probe = newProbeSets(numInsts)
+  let pos = 0
+  let before = noRune
+  // Bounded: `pos` strictly increases by the decoded rune's byte width
+  // (>= 1) every iteration that does not return — at most `n + 1` positions
+  // are ever visited, for the whole scan, however many matches it collects.
+  // That bound IS this ticket's fix; `sc.steps` counts it (pike.bit).
+  while (pos <= n) {
+    sc.steps = sc.steps + 1
+    let (after, width) = stepRune(s, pos)
+    let seedStart = clist.count
+    if (isCandidateStart(pf, s, pos)) {
+      ctx.pos = pos
+      addThread(clist, sc.start, before, after, ctx)
+    }
+    // The linearity invariant, once per input position — see `runPike`.
+    assert(clist.count <= numInsts, "regex: pike VM thread count exceeded program size")
+    let mi = firstMatchIndex(clist, prog)
+    if (mi >= 0) {
+      let slots = clist.threads[mi].slots
+      out = dropSuperseded(out, slots[0])
+      if (!isEmptyEcho(out, slots)) {
+        out = append(out, slots)
+      }
+    }
+    let nextPos = pos + width
+    let (nextAfter, _) = stepRune(s, nextPos)
+    ctx.pos = nextPos
+    let st = ScanStep{
+      mi: mi,
+      seedStart: seedStart,
+      before: before,
+      after: after,
+      nextAfter: nextAfter,
+    }
+    forwardThreads(clist, nlist, st, ctx, probe)
+    if (after == noRune || matchesSettled(nlist, out, limit)) {
+      return trimMatches(out, limit)
+    }
+    threadListClear(clist)
+    let tmp = clist
+    clist = nlist
+    nlist = tmp
+    before = after
+    pos = nextPos
+  }
+  return trimMatches(out, limit)
+}
