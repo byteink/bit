@@ -1,0 +1,564 @@
+// #4149. THE TREES NO LINT GATE COULD FAIL ON.
+//
+// `bit lint` emits thirteen rule codes (spec/LINT.md: E0200-E0205,
+// E0210-E0216) and, when this gate was written, every gate that could fail a
+// build over any of them was scoped to a tree that is NOT one of these three:
+//
+//   test-lint-sweep       E0200, production only (runtime/ compiler/ stdlib/ tools/ pkg/)
+//   test-lint-filelines   E0200, compiler/ runtime/ stdlib/ _tests_/{stress,bit,imports}/ + examples/
+//   test-lint-complexity  E0201/E0202/E0204, production only, per-function named debt
+//   test-lint-tests       E0201/E0202/E0204, the three _tests_/ trees, named-file debt
+//   test-lint-runtime     E0211 at zero, runtime/ only
+//   test-lint-self        E0214 at zero + a COUNT ratchet, compiler/ stdlib/ runtime/ only
+//
+// So `examples/`, `bench/` and `editors/` had exactly one rule enforced
+// between them (E0200 over examples/, via test-lint-filelines) and twelve
+// that nothing checked. Measured on merged main @ 51844c96: 38 findings
+// across 16 files -- examples/ 28 (2 E0204, 3 E0210, 21 E0211, 2 E0212),
+// bench/ 7 (2 E0201, 1 E0203, 3 E0204, 1 E0211), editors/ 4 (3 E0211, 1
+// E0098). None of them could turn any gate red.
+//
+// THIS GATE IS EVERY LINT CODE, ZERO, over those three trees -- with a
+// NAMED-FILE debt list (BIT_LINTAUX_DEBT, space-separated repo-relative
+// paths) for what was already there, never a count. A count silently absorbs
+// an unrelated new violation whenever someone else fixes one, and is broken
+// by ADDING a file rather than editing one; the two-way named list cannot:
+//   - a live finding in a file NOT on the list is a hard failure, whatever
+//     the totals do;
+//   - a list entry with NO live finding is ALSO a hard failure (the file was
+//     fixed and nobody removed its entry), the self-cleaning half of the
+//     contract _tests_/bit/fmtzerocheck.bit already enforces for
+//     BIT_FMTZERO_DEBT and _tests_/bit/linttests.bit for BIT_LINTTESTS_DEBT.
+//
+// IDENTITY IS THE FILE, deliberately -- the same choice linttests.bit made
+// and for the same reason: E0201/E0202 land on anonymous arrow functions,
+// which have no name a per-function key could use.
+//
+// WHAT IS AND IS NOT PROVEN ABOUT THE DENOMINATOR. This gate hands `bit lint`
+// the three DIRECTORIES (module semantics: a directory of `.bit` files is
+// loaded the way the compiler loads it, which a hand-rolled file list would
+// break for `examples/<name>/`), and counts `.bit` files itself with an
+// independent walk. That walk is what the printed denominator reports; it is
+// NOT `bit lint`'s own file count, which the tool does not publish. Two
+// cross-checks stand behind it instead: every file `bit lint` reports a
+// finding in must be one this walk found (a walk that missed a subtree is
+// caught the moment that subtree has a finding), and the number of lint-code
+// diagnostics parsed out of `--json` must equal the count in `bit lint`'s own
+// `lint: N findings, M overrides active` summary line on stderr.
+//
+// THAT CROSS-CHECK IS NOT A TAUTOLOGY: the two outputs genuinely disagree in
+// one direction and this gate depends on knowing where. `--json` also carries
+// diagnostics that are NOT lint findings -- `editors/vscode/sample.bit` emits
+// `E0098` ('${' in a raw string), which appears in the JSON array and is NOT
+// counted by the summary line. So the parsed set is filtered to the thirteen
+// codes spec/LINT.md defines, and a diagnostic whose code starts with `E02`
+// but is not one of those thirteen is a hard panic: spec/LINT.md gained a
+// rule and this gate must be told about it rather than silently ignoring it.
+//
+// THE OVERRIDE COUNT IS PRINTED for the same reason the denominator is: these
+// three trees carry 0 `bit:lint allow` directives today, and a rising number
+// is how this gate would be defeated without ever going red.
+//
+// Run it from the repository root:
+//     ./bit-out/bin/bit run _tests_/bit/lintaux.bit
+// BIT_SELF_EXE and BIT_REPO are required -- a missing one is a hard stop, not
+// a silently different (and silently green) scope. BIT_LINTAUX_DEBT is
+// optional; absent or empty means a true hard zero, no exceptions at all.
+import { env, envOr, exit } from "std/os"
+import { exists, isDir, mkdir, readDir, readFile, writeFile } from "std/fs"
+import { hasPrefix, hasSuffix, parseInt, split, trimSpace } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+import { Json, jsonAsArray, jsonAsInt, jsonAsString, jsonGet, jsonParse } from "std/json"
+
+// Power of 10 rule 2: every walk below has a statically bounded depth and a
+// bounded per-directory fan-out, not merely a hope of termination.
+const maxEntries: int = 4096
+const maxScanDepth: int = 16
+const defaultTimeoutS: int = 300
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "${defaultTimeoutS}")) catch _ {
+    defaultTimeoutS
+  }
+  if (s <= 0) {
+    return defaultTimeoutS * 1000
+  }
+  return s * 1000
+}
+
+// The thirteen rule codes spec/LINT.md defines. An `E02` diagnostic outside
+// this list means the spec grew a rule; see `assertKnownCode`.
+fn lintCodes(): []string {
+  return [
+    "E0200", "E0201", "E0202", "E0203", "E0204", "E0205",
+    "E0210", "E0211", "E0212", "E0213", "E0214", "E0215", "E0216",
+  ]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s mechanism channel, never a program exit status, so
+// each one is a named panic rather than a value any assertion could consume.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("lintaux: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("lintaux: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("lintaux: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("lintaux: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+fn requiredEnv(name: string): string! {
+  let v = env(name)
+  if (len(v) == 0) {
+    fail newError("lintaux: ${name} is required and was not set")
+  }
+  return v
+}
+
+fn containsStr(xs: []string, s: string): bool {
+  for x of xs {
+    if (x == s) {
+      return true
+    }
+  }
+  return false
+}
+
+fn parseDebtList(raw: string): []string {
+  let out = []string(0)
+  for tok of split(raw, " ") {
+    let t = trimSpace(tok)
+    if (len(t) > 0) {
+      out = append(out, t)
+    }
+  }
+  return out
+}
+
+class Config { bit: string, repo: string, debt: []string }
+
+fn loadConfig(): Config! {
+  let bit = requiredEnv("BIT_SELF_EXE")?
+  let repo = requiredEnv("BIT_REPO")?
+  return Config{ bit: bit, repo: repo, debt: parseDebtList(envOr("BIT_LINTAUX_DEBT", "")) }
+}
+
+// ---- the independent `.bit` walk ----------------------------------------
+
+// `bit-out` is a build directory and a dot-directory is never source (#4154
+// fixed `bit lint <dir>` walking into both); this walk skips exactly what the
+// compiler's own directory expansion skips, so the denominator it prints
+// describes the same population `bit lint` was handed.
+fn skipDir(name: string): bool {
+  return hasPrefix(name, ".") || name == "bit-out"
+}
+
+fn collectBitFiles(dir: string, depth: int): []string {
+  if (depth <= 0) {
+    panic("lintaux: ${dir} nesting exceeds ${maxScanDepth} levels")
+  }
+  let names = readDir(dir) catch e {
+    panic("lintaux: cannot list ${dir}: ${e.message()}")
+  }
+  if (len(names) > maxEntries) {
+    panic("lintaux: ${dir} has ${len(names)} entries, over the ${maxEntries} bound")
+  }
+  let out = []string(0)
+  for name of names {
+    let path = "${dir}/${name}"
+    if (isDir(path)) {
+      if (!skipDir(name)) {
+        for f of collectBitFiles(path, depth - 1) {
+          out = append(out, f)
+        }
+      }
+    } else if (hasSuffix(name, ".bit")) {
+      out = append(out, path)
+    }
+  }
+  return out
+}
+
+// ---- `bit lint --json <dirs...>` ----------------------------------------
+
+class Run { code: int, out: string, err: string }
+
+fn quotedPaths(paths: []string): string {
+  let out = ""
+  for p of paths {
+    out = out + " '${p}'"
+  }
+  return out
+}
+
+fn runLintJson(bit: string, absDirs: []string, capDir: string, ms: int): Run! {
+  let outPath = "${capDir}/out.json"
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  let script = "#!/bin/sh\n" +
+    "'${bit}' lint --json" +
+    quotedPaths(absDirs) +
+    " > '${outPath}' 2> '${errPath}'\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/lint.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("lintaux: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("lintaux: no exit code was recorded -- the run never happened")
+  }
+  return Run{
+    code: parseInt(trimWs(readFile(codePath)?))?,
+    out: readFile(outPath)?,
+    err: readFile(errPath)?,
+  }
+}
+
+// `r` is a usable observation of a real run, not silence mistaken for a clean
+// sheet. `bit lint` always prints a summary to stderr, clean or not. Exit 2
+// is SPEC's own "could not be trusted" verdict -- one malformed file blanks
+// every finding for every OTHER file in the same invocation (#3543), so it is
+// a panic, never a pass.
+fn assertTrustworthy(r: Run, label: string) {
+  if (len(r.err) == 0) {
+    panic("lintaux: stderr is empty -- `bit lint` produced no summary for ${label}")
+  }
+  if (r.code == 2) {
+    panic("lintaux: `bit lint` exited 2 (untrusted run) over ${label}:\n${r.err}")
+  }
+  if (r.code != 0 && r.code != 1) {
+    panic("lintaux: `bit lint` exited ${r.code} over ${label}, want 0 or 1")
+  }
+}
+
+// `bit lint`'s own last word: `lint: N findings, M overrides active`.
+class Summary { findings: int, overrides: int }
+
+fn parseSummary(err: string): Summary! {
+  for line of split(err, "\n") {
+    let t = trimWs(line)
+    if (!hasPrefix(t, "lint: ")) {
+      continue
+    }
+    let fields = split(t, " ")
+    if (len(fields) < 4) {
+      fail newError("lintaux: unparsable summary line: '${t}'")
+    }
+    return Summary{ findings: parseInt(fields[1])?, overrides: parseInt(fields[3])? }
+  }
+  fail newError("lintaux: `bit lint` printed no `lint: N findings` summary line")
+}
+
+// ---- findings ------------------------------------------------------------
+
+class Finding { file: string, code: string, line: int }
+
+fn jsonField(o: Json, key: string): string {
+  let f = jsonGet(o, key)
+  if (isNone(f)) {
+    return "<missing>"
+  }
+  return unwrapOr(jsonAsString(unwrap(f)), "<not-a-string>")
+}
+
+fn jsonInt(o: Json, key: string): int {
+  let f = jsonGet(o, key)
+  if (isNone(f)) {
+    return -1
+  }
+  return unwrapOr(jsonAsInt(unwrap(f)), -1)
+}
+
+fn stripRepoPrefix(file: string, repo: string): string! {
+  let prefix = "${repo}/"
+  if (!hasPrefix(file, prefix)) {
+    fail newError("lintaux: finding path outside ${repo}: ${file}")
+  }
+  return file[len(prefix):]
+}
+
+// A diagnostic whose code is in the `E02` block but not one spec/LINT.md
+// defines means a rule was added and this gate's list was not updated -- it
+// would otherwise be dropped by `isLintCode` and never enforced anywhere.
+fn assertKnownCode(code: string) {
+  if (hasPrefix(code, "E02") && !containsStr(lintCodes(), code)) {
+    panic("lintaux: `bit lint` emitted ${code}, which spec/LINT.md's rule list in lintCodes() does not name -- add it here and seed its debt")
+  }
+}
+
+fn findingFromJson(d: Json, repo: string): Finding! {
+  let rawFile = jsonField(d, "file")
+  let range = jsonGet(d, "range")
+  if (isNone(range)) {
+    fail newError("lintaux: finding in ${rawFile} has no range")
+  }
+  let start = jsonGet(unwrap(range), "start")
+  if (isNone(start)) {
+    fail newError("lintaux: finding in ${rawFile} has no range.start")
+  }
+  let line = jsonInt(unwrap(start), "line")
+  if (line < 0) {
+    fail newError("lintaux: finding in ${rawFile} has an invalid range.start.line")
+  }
+  return Finding{
+    file: stripRepoPrefix(rawFile, repo)?,
+    code: jsonField(d, "code"),
+    line: line + 1,
+  }
+}
+
+fn extractFindings(out: string, repo: string): []Finding! {
+  let arr = unwrapOr(jsonAsArray(jsonParse(trimSpace(out))?), []Json(0))
+  let result = []Finding(0)
+  for d of arr {
+    let code = jsonField(d, "code")
+    assertKnownCode(code)
+    if (!containsStr(lintCodes(), code)) {
+      continue
+    }
+    result = append(result, findingFromJson(d, repo)?)
+  }
+  return result
+}
+
+fn countCode(findings: []Finding, code: string): int {
+  let n = 0
+  for f of findings {
+    if (f.code == code) {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+// "21 E0211, 2 E0212" -- only the codes actually present, so a clean tree
+// says so instead of printing thirteen zeros.
+fn codeSummary(findings: []Finding): string {
+  let parts = ""
+  for c of lintCodes() {
+    let n = countCode(findings, c)
+    if (n > 0) {
+      if (len(parts) > 0) {
+        parts = parts + ", "
+      }
+      parts = parts + "${n} ${c}"
+    }
+  }
+  if (len(parts) == 0) {
+    return "none"
+  }
+  return parts
+}
+
+fn findingsUnder(findings: []Finding, tree: string): []Finding {
+  let out = []Finding(0)
+  for f of findings {
+    if (hasPrefix(f.file, "${tree}/")) {
+      out = append(out, f)
+    }
+  }
+  return out
+}
+
+fn distinctFiles(findings: []Finding): []string {
+  let out = []string(0)
+  for f of findings {
+    if (!containsStr(out, f.file)) {
+      out = append(out, f.file)
+    }
+  }
+  return out
+}
+
+fn partitionDebt(files: []string, debt: []string): ([]string, []string) {
+  let real = []string(0)
+  let matched = []string(0)
+  for f of files {
+    if (containsStr(debt, f)) {
+      matched = append(matched, f)
+    } else {
+      real = append(real, f)
+    }
+  }
+  return real, matched
+}
+
+fn printFindingsFor(findings: []Finding, file: string) {
+  for f of findings {
+    if (f.file == file) {
+      eprint("    ${f.file}:${f.line} [${f.code}]\n")
+    }
+  }
+}
+
+// ---- per-tree verdict ----------------------------------------------------
+
+class TreeResult { dir: string, filesTotal: int, findings: []Finding }
+
+// The verdict for one tree. Returns true when this tree FAILS the gate.
+fn reportTree(tr: TreeResult, debt: []string): bool {
+  let (real, matched) = partitionDebt(distinctFiles(tr.findings), debt)
+  let denom = "${tr.filesTotal} .bit file(s) walked"
+  let counts = "${len(tr.findings)} finding(s) (${codeSummary(tr.findings)})"
+  if (len(real) > 0) {
+    eprint("lint-aux: FAIL -- ${tr.dir}/: ${denom}, ${counts}; ${len(real)} file(s) not on the known-debt list:\n")
+    for f of real {
+      printFindingsFor(tr.findings, f)
+    }
+    return true
+  }
+  println("lint-aux: ${tr.dir}/: ${denom}, ${counts}, ${len(matched)} file(s) known debt -- PASS.")
+  return false
+}
+
+// Every debt entry must actually be violating somewhere in this run, or the
+// list has gone stale (the file was fixed and nobody removed its entry).
+fn checkDebtFreshness(debt: []string, allViolating: []string): bool {
+  let stale = false
+  for d of debt {
+    if (!containsStr(allViolating, d)) {
+      eprint("lint-aux: FAIL -- ${d} is on the known-debt list but has no live lint finding; remove it.\n")
+      stale = true
+    }
+  }
+  return stale
+}
+
+// Every file `bit lint` reported must be one the walk above found. A subtree
+// the walk missed is invisible in the denominator until something in it goes
+// wrong -- this is what makes it visible then.
+fn assertWalkCoversFindings(findings: []Finding, walked: []string, repo: string) {
+  for f of findings {
+    if (!containsStr(walked, "${repo}/${f.file}")) {
+      panic("lintaux: `bit lint` reported ${f.file}, which this gate's own walk never found -- the denominator is wrong")
+    }
+  }
+}
+
+fn newCapDir(): string {
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  return "${tmp}/bit-lintaux-${uuidFormat(uuidV4())}"
+}
+
+fn teardown(dir: string, ms: int) {
+  shell("${dir}/rm.sh", "#!/bin/sh\nrm -rf '${dir}'\n", ms) catch _ {
+    return
+  }
+}
+
+class Scan { dirs: []string, walked: []string, counts: []int }
+
+// Absolute directory paths to hand `bit lint`, every `.bit` file beneath
+// them, and the per-tree file counts, in `trees` order.
+fn scanTrees(repo: string, trees: []string): Scan {
+  let dirs = []string(0)
+  let walked = []string(0)
+  let counts = []int(0)
+  for t of trees {
+    let full = "${repo}/${t}"
+    if (!exists(full)) {
+      panic("lintaux: no such directory: ${full}")
+    }
+    let files = collectBitFiles(full, maxScanDepth)
+    if (len(files) == 0) {
+      panic("lintaux: ${full} contains zero .bit files -- refusing a vacuous scan")
+    }
+    for f of files {
+      walked = append(walked, f)
+    }
+    dirs = append(dirs, full)
+    counts = append(counts, len(files))
+  }
+  return Scan{ dirs: dirs, walked: walked, counts: counts }
+}
+
+fn lintAll(cfg: Config, scan: Scan, capDir: string, ms: int): []Finding {
+  let r = runLintJson(cfg.bit, scan.dirs, capDir, ms) catch e {
+    panic("lintaux: ${e.message()}")
+  }
+  assertTrustworthy(r, "examples/ + bench/ + editors/")
+  let findings = extractFindings(r.out, cfg.repo) catch e {
+    panic("lintaux: ${e.message()}")
+  }
+  let summary = parseSummary(r.err) catch e {
+    panic("lintaux: ${e.message()}")
+  }
+  if (summary.findings != len(findings)) {
+    panic("lintaux: `bit lint` summarised ${summary.findings} finding(s) but --json carried ${len(findings)} lint-code diagnostic(s) -- refusing to trust either")
+  }
+  println("lint-aux: ${len(scan.walked)} .bit file(s) walked, ${summary.findings} finding(s), ${summary.overrides} `bit:lint` override(s) active")
+  return findings
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let cfg = loadConfig() catch e {
+    panic("lintaux: ${e.message()}")
+  }
+  let trees = ["examples", "bench", "editors"]
+  let scan = scanTrees(cfg.repo, trees)
+
+  let capDir = newCapDir()
+  mkdir(capDir) catch e {
+    panic("lintaux: cannot create ${capDir}: ${e.message()}")
+  }
+  let findings = lintAll(cfg, scan, capDir, ms)
+  assertWalkCoversFindings(findings, scan.walked, cfg.repo)
+
+  let anyFail = false
+  let allViolating = []string(0)
+  let i = 0
+  while (i < len(trees)) {
+    let tf = findingsUnder(findings, trees[i])
+    for f of distinctFiles(tf) {
+      allViolating = append(allViolating, f)
+    }
+    if (reportTree(TreeResult{ dir: trees[i], filesTotal: scan.counts[i], findings: tf }, cfg.debt)) {
+      anyFail = true
+    }
+    i = i + 1
+  }
+  if (checkDebtFreshness(cfg.debt, allViolating)) {
+    anyFail = true
+  }
+
+  teardown(capDir, ms)
+  if (anyFail) {
+    eprint("lint-aux: fix the finding, or add the file to BIT_LINTAUX_DEBT in tools/build/gates.bit WITH a ticket -- the list only ever shrinks.\n")
+    exit(1)
+  }
+  println("lint-aux: PASS -- every spec/LINT.md rule code, zero outside the named debt list, over examples/ + bench/ + editors/")
+}

@@ -295,7 +295,10 @@ case "${BUCKET}" in
     # stdlib — missing here was the same bug this ticket exists to fix (#2962).
     # test-lint-filelines scans examples/ too (_tests_/bit/lintfilelines.bit's own
     # dirs list includes it) and was missing here the same way (#3128).
-    BUILD_STEPS=(test-examples test-fmt test-lint-filelines)
+    # test-lint-aux (#4149) declares examples/ as one of its three trees in its
+    # own harness (_tests_/bit/lintaux.bit's `trees` list), the same shape: a
+    # gate whose scope is inside the harness, not in this bucket's name.
+    BUILD_STEPS=(test-examples test-fmt test-lint-filelines test-lint-aux)
     ;;
   stdlib)
     # test-fmt's argv literally includes "${repoRoot()}/stdlib" (#2962, the
