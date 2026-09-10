@@ -2550,43 +2550,66 @@ defer_stmt    = "defer" postfix .                (* postfix must be a call *)
   Its arity must match: a two-result form binds exactly two names, and a
   tuple-typed rhs binds exactly the tuple's arity. `_` discards an element.
 
-**Iteration (`for_of` / `for_in`).** The two forms share one set of legal
-iterables — slice, array, map, and (`for_of` only) `chan<T>` — and differ in
-what the binder receives:
+**Iteration (`for_of` / `for_in`).** The two keywords have one job each, fixed
+for every iterable: **`of` yields the value, `in` yields the position.** A
+binder pattern then takes apart whatever its keyword handed it — an `IDENT`
+takes it whole, a `tuple_pat` splits it positionally (recursively, §10.1), a
+`field_pat` splits it by field name. What a keyword means never depends on the
+type it is applied to, so no single spelling has two readings.
 
-| iterable      | `for x of it` binds                     | `for x in it` binds | binder type |
-| ------------- | ---------------------------------------- | -------------------- | ----------- |
-| `[]T` / `[N]T`| the element                              | the **index**         | `int`       |
-| `map<K,V>`    | the `(K, V)` pair: key and value         | the **key**           | `K`         |
-| `string`      | out of scope for v0.1 (§21)              | **rejected**          | —           |
-| `chan<T>`     | the received value, until closed (§16.2) | **rejected**          | —           |
-| anything else | **rejected**                             | **rejected**          | —           |
+| iterable       | `of` yields                              | `in` yields                       |
+| -------------- | ---------------------------------------- | --------------------------------- |
+| `[]T` / `[N]T` | the element (`T`)                        | the **index** (`int`)             |
+| `map<K,V>`     | the `(K, V)` pair                        | the **key** (`K`)                 |
+| `string`       | out of scope for v0.1 (§21)              | **rejected**                      |
+| `chan<T>`      | the received value, until closed (§16.2) | **rejected** — a stream has no position |
+| anything else  | **rejected**                             | **rejected**                      |
 
-A pair binder over `for_of`'s slice/array row is legal too, not only over a
-map: `for (i, x) of xs` binds `i` to the **index** (`int`) and `x` to the
-**element** (`T`) — the same two values the row's two single-binder forms give
-separately (`for x of xs` the element, `for x in xs` the index), joined into
-one binder. This is the `( IDENT | "(" pat "," pat ")" )` alternative in
-`for_of`'s own grammar, the same production a map's `(k, v)` pair binder uses.
+A `tuple_pat` binder over `for_of` destructures the value above, and nothing
+else: its arity is the **value's** arity, not a fixed two, and the value must
+be a tuple to have parts at all. A map's `for (k, v) of m` is therefore not a
+rule of its own — the pair is what `of` yields there, and `(k, v)` splits it
+positionally (§12.10), the same operation `for (name, n) of xs` performs on a
+slice of 2-tuples. Splitting a value that is not a tuple, or naming a number of
+parts the value's tuple does not have, is a compile error.
 
-A single (non-pair) binder over a map binds the whole pair: `for x of m` gives
-`x` type `(K, V)`, so `x.0` is the key and `x.1` the value, and
-`for (k, v) of m` is that same value destructured positionally (§12.10). The
-two forms differ only in spelling — `of` yields the value a map holds, which is
-the pair, exactly as it yields the element a slice holds. `for_in` rejects
-everything that is not a slice, array, or map — there is no index or key to
-give a `string`, a `chan<T>` (a stream, not a container, so it has no keys), or
-anything else.
-
-**Pair binder over `for_in` (#4333).** A pair binder is legal over `for_in`
-too, for a slice or array only: `for (i, x) in xs` binds the same two values
-as `for (i, x) of xs` above — `i` the index, `x` the element — and `x` may
-itself be a nested tuple pattern, destructured positionally the same way a
-`let` binding's does (`for (i, (name, n)) in xs` over a slice of 2-tuples). A
-pair binder over `for_in` for a **map** is rejected: `in` already yields the
-map's key alone (`for k in m`), so a pair binder would pair that same key
-with the value a second time, which is redundant rather than meaningful — use
+`for_in` has one binder shape of its own: `for (i, x) in it`, legal for a slice
+or array only, which binds the position **and** the value — the position is
+what `in` yields, and `x` is the same value `of` would have yielded, so `x` may
+itself be a `tuple_pat` and be split further. A pair binder over `for_in` for a
+**map** is rejected: `in` already yields the map's key alone (`for k in m`), so
+pairing that key with the value again is redundant rather than meaningful — use
 `for (k, v) of m` to destructure the pair, or `for k in m` for the key alone.
+
+Worked cases, one per legal combination:
+
+```bit
+xs: []int
+  for x of xs           // x = the element
+  for i in xs           // i = the index
+  for (i, x) in xs      // index and element
+  for (a, b) of xs      // ERROR - an int has no parts to split
+
+xs: [](string, int)
+  for x of xs               // x = ("a", 1)
+  for (name, n) of xs       // name = "a", n = 1
+  for (i, x) in xs          // i = 0, x = ("a", 1)
+  for (i, (name, n)) in xs  // both, nested
+
+m: map<string, int>
+  for (k, v) of m       // k = key, v = value
+  for k in m            // k = key
+  for x of m            // x = (key, value)
+  for (k, v) in m       // ERROR - the key is already inside the value
+
+c: chan<T>
+  for x of c            // received value until closed
+  for x in c            // ERROR - a stream has no position
+```
+
+`for (i, x) of xs` bound the index and the element in releases before this one.
+It does not any more: that is a position, so it is spelled `for (i, x) in xs`,
+and the `of` spelling now splits the element instead.
 
 **Field-pattern binder (#4106).** `for_of`'s binder also accepts a `field_pat`
 — `for { a, b, ... } of xs`, legal only when `xs`'s element is a class. Each
@@ -4733,7 +4756,7 @@ if_stmt       = "if" "(" expression ")" block [ "else" ( if_stmt | block ) ] .
 while_stmt    = "while" "(" expression ")" block .
 for_stmt      = "for" ( for_c | for_of | for_in | (* empty -> infinite *) ) block .
 for_c         = "(" [ value_decl | assign_stmt ] ";" [ expression ] ";" [ inc_dec_stmt | assign_stmt ] ")" .
-for_of        = ( IDENT | "(" pat "," pat ")" | field_pat ) "of" expression .
+for_of        = ( IDENT | tuple_pat | field_pat ) "of" expression .   (* the pattern splits the VALUE; §12.6 *)
 for_in        = ( IDENT | "(" pat "," pat ")" ) "in" expression .   (* pair binder: §12.6, #4333 *)
 field_pat     = "{" IDENT { "," IDENT } "}" .   (* for-of field-name binder; §12.6 *)
 switch_stmt   = "switch" [ "(" expression ")" ] "{" { switch_case } "}" .
