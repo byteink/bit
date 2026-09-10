@@ -44,6 +44,10 @@ import {
   btBacktraceEnabled, btPrintTrace,
 } from "../../root"
 import { loadWord, gcTiNamePtr, gcTiNameLen } from "../../gc"
+import {
+  wordAt, worldBlockAddr, worldFindOwner, worldSlotState, mSyscall, gcThreadToken,
+} from "../../gc"
+import { boundaryTake } from "../../sched"
 // `taskAt`/`wkId` are already imported into this module by ./boot.bit — an
 // import is per-MODULE, not per-file, so a second one here is E0042.
 // `schedCurrentWorker`/`schedMaxWorkers` are no longer imported anywhere in
@@ -339,6 +343,56 @@ export @nosplit @symbol("bit_rt_os_exit") fn rootExit(code: int) {
   _exit(i32(code & 255))
 }
 
+// ---------------------------------------------------------------------------
+// THE RECOVER BOUNDARY (#4739, ABI.md §12)
+// ---------------------------------------------------------------------------
+//
+// Every door below asks `boundaryTake` (`../../sched/boundary.bit`) whether the
+// current task armed a boundary before it writes a byte or exits. When one is
+// armed the call never returns here: it restores the arming frame and resumes
+// there with a nonzero result, so the `!= 0` arm is unreachable in practice and
+// exists only because the unmanaged subset has no `noreturn`. When none is
+// armed it returns 0 and the door runs exactly as it did before this existed —
+// which is what keeps the unrecovered output, backtrace and exit code 2 byte
+// for byte what the `// panic` and `// panic-debug` golden modes already pin.
+//
+// A PANIC RAISED WHILE THIS THREAD IS PARKED IN A SYSCALL IS FATAL, never
+// recoverable. `worldBeginSyscall` (`../../gc/gcworldstop.bit`) publishes a
+// stack bound and a saved register file that a collector reads as describing a
+// thread frozen in the kernel; resuming past that publication — i.e. out of the
+// middle of a `gcSyscallBegin`/`gcSyscallEnd` bracket — leaves the slot in
+// `mSyscall` with a bound that no longer describes anything, and the next
+// stop-the-world waits on it forever. The refusal cannot live in
+// `runtime/sched` (`runtime/gc` imports `runtime/sched`, so reading `mSyscall`
+// from there is an import cycle — #4742), so it lives here, in the door: this
+// module already imports `../../gc`.
+@nosplit fn panicInSyscall(): bool {
+  let waddr = worldBlockAddr()
+  if (waddr == 0) {
+    return false
+  }
+  let token = gcThreadToken()
+  if (token == 0) {
+    return false
+  }
+  let world = wordAt(waddr)
+  let slot = worldFindOwner(world, token)
+  if (slot < 0) {
+    return false
+  }
+  return worldSlotState(world, slot) == mSyscall
+}
+
+// The one line every door leads with. Answers 0 — stay fatal — for a thread in
+// a syscall, and otherwise hands `code`/`msg` to the boundary, which either
+// answers 0 (nothing armed) or does not return at all.
+@nosplit fn panicBoundaryTake(code: int, msg: int): int {
+  if (panicInSyscall()) {
+    return 0
+  }
+  return boundaryTake(code, msg)
+}
+
 // `bit_rt_panic` (ABI.md §12): prints `panic: <msg>` and exits 2 (SPEC §18.4).
 // Backs the `panic` builtin and every implicit panic source — index and slice
 // range, divide by zero, nil-channel misuse, a failed `assert`.
@@ -357,7 +411,32 @@ export @nosplit @symbol("bit_rt_os_exit") fn rootExit(code: int) {
 // chain"). `btPrintTrace` reads no further registers of its own; everything
 // past this one read is ordinary pointer-chasing over already-captured
 // values.
+// Reason code 0 to `bit_rt_panic_boundary_take` (ABI.md §12): an explicit
+// `panic`/`assert`, the one door that carries a message object.
 export @nosplit @symbol("bit_rt_panic") fn rootPanic(s: int) {
+  if (panicBoundaryTake(0, s) != 0) {
+    return
+  }
+  panicWrite(stderrFd, s)
+  if (btBacktraceEnabled()) {
+    let ownFp = asm {
+      arm64 { 0xAA1D03E0 }     // mov x0, x29
+      x64 { 0x48, 0x89, 0xE8 } // mov rax, rbp
+      result arm64 x0 x64 rax : int
+    }
+    btPrintTrace(stderrFd, ownFp)
+  }
+  rootExit(2)
+}
+
+// `bit_rt_fatal` (ABI.md §12): the always-fatal door — `rootPanic`'s body with
+// no recover consult at all, so an armed boundary does not catch it. The body
+// is repeated rather than shared because the `x29` read has to name THIS
+// function's own frame record: routing either door through a common helper
+// would make frame 0 of every trace the helper instead of the panicking
+// function. Same reason the panic line's shape is repeated across the three
+// provider files rather than shared (see this file's header).
+export @nosplit @symbol("bit_rt_fatal") fn rootFatal(s: int) {
   panicWrite(stderrFd, s)
   if (btBacktraceEnabled()) {
     let ownFp = asm {
@@ -440,7 +519,11 @@ export @nosplit @symbol("bit_rt_gc_mark_stack_overflow") fn rootGcMarkStackOverf
 // exactly like `bit_rt_oom` above and for the same reason: allocating a
 // message to report a broken invariant is itself something that must not be
 // able to fail on this path.
+// Reason code 1 to `bit_rt_panic_boundary_take` (ABI.md §12): a zero divisor.
 export @nosplit @symbol("bit_rt_panic_div_zero") fn rootPanicDivZero() {
+  if (panicBoundaryTake(1, 0) != 0) {
+    return
+  }
   writeConstLine(stderrFd, divZeroWord0, divZeroWord1, divZeroWord2, 0, 0, 24)
   rootExit(2)
 }
@@ -452,14 +535,24 @@ export @nosplit @symbol("bit_rt_panic_div_zero") fn rootPanicDivZero() {
 // operation trapped, matching how `bit_rt_panic_div_zero` already covers both
 // `/` and `%`. Called from the debug-mode codegen path: the backend emits a
 // call to this at every signed add/sub/mul/neg that could overflow (#3076).
+// Reason code 2 to `bit_rt_panic_boundary_take` (ABI.md §12): a signed
+// add/sub/mul/neg that overflowed.
 export @nosplit @symbol("bit_rt_panic_overflow") fn rootPanicOverflow() {
+  if (panicBoundaryTake(2, 0) != 0) {
+    return
+  }
   writeConstLine(stderrFd, overflowWord0, overflowWord1, 0, 0, 0, 16)
   rootExit(2)
 }
 
 // `bit_rt_panic_nil_call` (ABI.md §12.1, #2018): the sibling check for an
 // indirect call through a nil function value, same alloc-free shape.
+// Reason code 3 to `bit_rt_panic_boundary_take` (ABI.md §12): an indirect
+// call through a nil function value.
 export @nosplit @symbol("bit_rt_panic_nil_call") fn rootPanicNilCall() {
+  if (panicBoundaryTake(3, 0) != 0) {
+    return
+  }
   writeConstLine(stderrFd, nilCallWord0, nilCallWord1, nilCallWord2, 0, 0, 22)
   rootExit(2)
 }
@@ -467,7 +560,12 @@ export @nosplit @symbol("bit_rt_panic_nil_call") fn rootPanicNilCall() {
 // `bit_rt_panic_nil_iface` (ABI.md §12.1, #2240): the sibling check for a
 // method call dispatched through a nil interface value, same alloc-free
 // shape.
+// Reason code 4 to `bit_rt_panic_boundary_take` (ABI.md §12): a method call
+// through a nil interface value.
 export @nosplit @symbol("bit_rt_panic_nil_iface") fn rootPanicNilIface() {
+  if (panicBoundaryTake(4, 0) != 0) {
+    return
+  }
   writeConstLine(
     stderrFd,
     nilIfaceWord0,
