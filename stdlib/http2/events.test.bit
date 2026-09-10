@@ -13,7 +13,7 @@
 // than a claim about a body that came back short. Same flat `std/http2` module,
 // so every helper is in scope and nothing is imported.
 //
-// The last two drive a real client `Conn` against a real server `Conn` over an
+// The loopback tests drive a real client `Conn` against a real server `Conn` over an
 // in-memory pipe, because a budget that is correct in `h2connOnData` and never
 // carried from `Config` into `h2connState` would pass all four of the others.
 
@@ -274,8 +274,20 @@ fn btRunServer(t: Transport, cfg: Config, handler: (Request, Stream) => Response
   }
 }
 
-// A client `Conn` wired to a server `Conn` serving `handler` under `serverCfg`.
+// A client `Conn` wired to a server `Conn` serving `handler` under `serverCfg`,
+// the client itself under `defaultConfig()`.
 fn btLoopback(serverCfg: Config, handler: (Request, Stream) => Response): Conn! {
+  return btLoopbackCfg(defaultConfig(), serverCfg, handler)?
+}
+
+// The same, with the CLIENT's configuration named too: `Config.streamBodies` is
+// a client setting as well since #4728, and the loopback is where its effect on
+// a whole round trip is visible.
+fn btLoopbackCfg(
+  clientCfg: Config,
+  serverCfg: Config,
+  handler: (Request, Stream) => Response,
+): Conn! {
   let aToB = chan<btChunk>(1024)
   let bToA = chan<btChunk>(1024)
   let clientEnd = btEnd{ incoming: bToA, outgoing: aToB, leftover: []byte(0), closed: false }
@@ -283,7 +295,7 @@ fn btLoopback(serverCfg: Config, handler: (Request, Stream) => Response): Conn! 
   let ct = newTransport(btRead(clientEnd), btWrite(clientEnd), btShutdown(clientEnd))
   let stt = newTransport(btRead(serverEnd), btWrite(serverEnd), btShutdown(serverEnd))
   spawn btRunServer(stt, serverCfg, handler)
-  return connect(ct, defaultConfig(), 0)?
+  return connect(ct, clientCfg, 0)?
 }
 
 // A POST of `n` pattern bytes over `conn`.
@@ -393,4 +405,100 @@ test "a streamBodies handler takes a body past the connection window as it lands
   }
   assert(res.status == 200, "status = ${res.status}, want 200")
   assert(string(res.body) == "ok", "the handler reported: ${string(res.body)}")
+}
+
+// --- a client taking a response body as it lands (#4728) ---------------------
+
+// A handler that answers with a 200000-byte body and reads nothing: three times
+// the client's 65535-byte connection receive window, so the server can only
+// finish sending it if the client's takes renew that window mid-body.
+fn btBigBody(_req: Request, _s: Stream): Response {
+  return newResponse(200, btPattern(200000))
+}
+
+// The verdict the test asserts on, the client mirror of `btTakeVerdict`: "ok"
+// only when `roundTripStream` handed back no body bytes, the caller took all of
+// them, and more than the connection window arrived BEFORE the take carrying
+// `eof`. Any other outcome carries its own numbers.
+fn btClientVerdict(handed: int, early: int, total: int): string {
+  if (handed != 0) {
+    return "roundTripStream handed back ${handed} body bytes, want 0"
+  }
+  if (total != 200000) {
+    return "the caller took ${total} bytes, want 200000"
+  }
+  if (early <= 65535) {
+    return "${early} bytes arrived before the eof chunk, want over the 65535-byte window"
+  }
+  return "ok"
+}
+
+// Take a response body to its end through `Stream.read`, counting what arrived
+// before the chunk carrying `eof`. Bounded: a take answers with at least one
+// byte or with the end of the body, so 4096 of them cover this body and the loop
+// cannot run away.
+fn btClientTake(s: Stream, handed: int): string {
+  let early = 0
+  let total = 0
+  let takes = 0
+  while (takes < 4096) {
+    takes = takes + 1
+    let c = s.read() catch e {
+      return "read failed after ${total} bytes: ${e.message()}"
+    }
+    total = total + len(c.data)
+    if (c.eof) {
+      return btClientVerdict(handed, early, total)
+    }
+    early = early + len(c.data)
+  }
+  return "the body did not end in 4096 takes"
+}
+
+// One streaming round trip, verdict and all, so the test needs a single `catch`.
+fn btStreamedGet(conn: Conn): string! {
+  let (res, s) = conn.roundTripStream(newRequest("GET", "example.com", "/big"))?
+  if (res.status != 200) {
+    return "status = ${res.status}, want 200"
+  }
+  return btClientTake(s, len(res.body))
+}
+
+test "a streamBodies client takes a response body past the connection window as it lands" {
+  // The client half of #4624's take: `roundTripStream` returns at end-of-HEADERS
+  // and THIS thread is the consumer the receive windows follow. At most one
+  // 65535-byte window can be buffered before the first take, so the remaining
+  // 134465 bytes can only have been sent because the takes renewed the window —
+  // observed as bytes taken before the chunk that carries `eof`.
+  let cfg = defaultConfig()
+  cfg.streamBodies = true
+  let conn = btLoopbackCfg(cfg, defaultConfig(), btBigBody) catch e {
+    assert(false, "loopback setup failed: ${e.message()}")
+    return
+  }
+  let verdict = btStreamedGet(conn) catch e2 {
+    assert(false, "the streaming round trip failed: ${e2.message()}")
+    return
+  }
+  assert(verdict == "ok", "the client reported: ${verdict}")
+}
+
+test "roundTrip refuses to buffer a body under Config.streamBodies" {
+  // The gate: a client that declared it takes bodies itself is told to call
+  // `roundTripStream`, rather than having a whole body buffered behind the
+  // setting's back.
+  let cfg = defaultConfig()
+  cfg.streamBodies = true
+  let conn = btLoopbackCfg(cfg, defaultConfig(), btBigBody) catch e {
+    assert(false, "loopback setup failed: ${e.message()}")
+    return
+  }
+  let res = conn.roundTrip(newRequest("GET", "example.com", "/big")) catch e2 {
+    assert(
+      e2.message() == "http2: Config.streamBodies is set — call roundTripStream instead",
+      "roundTrip failed with: ${e2.message()}",
+    )
+    return
+  }
+  assert(false, "roundTrip returned ${len(res.body)} body bytes under streamBodies")
 }
