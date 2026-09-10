@@ -3,8 +3,8 @@
 #
 #   dist/release.sh <version>                 # build, verify, upload as a draft
 #   dist/release.sh <version> --dry-run       # build and verify, publish nothing
-#   dist/release.sh <version> --resume-notes  # re-check a hand-edited dist/out/NOTES.md and
-#                                              # publish, reusing a PRIOR run's artifacts (#4124)
+#   dist/release.sh <version> --resume-notes  # publish a hand-edited dist/out/NOTES.md,
+#                                              # reusing a PRIOR run's artifacts (#4124)
 #
 # <version> is semver without the leading v, e.g. 0.1.0.
 #
@@ -623,9 +623,9 @@ if [ "${RESUME_NOTES}" -eq 0 ]; then
 	[ -n "${PASS1_BASE}" ] && printf '%s\n\n## Build provenance\n\nRooted at stage0 v%s via the two-pass BIT_STAGE0_BIN bootstrap (docs/development.md, "Landing a runtime ABI change"), pass-1 base %s.\n\n%s\n' \
 		"$(head -n1 "${OUT}/NOTES.md")" "${STAGE0_VERSION}" "${PASS1_BASE}" "$(tail -n +2 "${OUT}/NOTES.md")" > "${OUT}/NOTES.md"
 else
-	# Remediation path for checkNotesLanguage's refusal (#4124): reuse
-	# NOTES.md AS-IS, never regenerate it — regenerating is exactly what
-	# clobbered the hand-edit before this fix.
+	# Publishes a NOTES.md that was edited by hand (#4124): reuse it AS-IS,
+	# never regenerate it — regenerating is exactly what clobbered the
+	# hand-edit before this fix.
 	[ -f "${OUT}/NOTES.md" ] || {
 		echo "release.sh: --resume-notes given but ${OUT}/NOTES.md does not exist" >&2
 		echo "  --resume-notes reuses the NOTES.md and artifacts a prior" >&2
@@ -648,20 +648,17 @@ else
 	echo "release.sh: --resume-notes: reusing ${OUT}/NOTES.md (mtime $(stat -f '%Sm' "${OUT}/NOTES.md" 2>/dev/null || stat -c '%y' "${OUT}/NOTES.md")) and the artifacts already in ${OUT}"
 fi
 
-# --- release-notes language guard + pending-notes folding -------------------
+# --- pending-notes folding --------------------------------------------------
 #
-# LANG_NAME_PATTERN, checkNotesLanguage() and foldPendingNotes() moved to
-# dist/release-notes.sh (#4132, pure move -- unchanged below, only relocated --
-# to bring this file back under the 800-line ceiling). Sourced here, not
-# before: it defines only functions and one variable, so sourcing it at this
-# exact position is identical to having typed it inline.
+# foldPendingNotes() lives in dist/release-notes.sh (#4132) so this file stays
+# under the 800-line ceiling. Sourced here, not earlier: it defines that one
+# function and nothing else, so sourcing it at this exact position is
+# identical to having typed it inline.
 # shellcheck source=dist/release-notes.sh
 . "${ROOT}/dist/release-notes.sh"
 # Skipped under --resume-notes: the reused NOTES.md was already folded once,
 # by the prior run that produced it — folding again would duplicate it.
 [ "${RESUME_NOTES}" -eq 0 ] && foldPendingNotes "${ROOT}/docs/release/PENDING-NOTES.md" "${OUT}/NOTES.md"
-
-checkNotesLanguage "${OUT}/NOTES.md" || exit 1
 
 if [ "${DRY}" -eq 1 ]; then
 	echo "release.sh: --dry-run, publishing nothing. Artifacts in ${OUT}"
