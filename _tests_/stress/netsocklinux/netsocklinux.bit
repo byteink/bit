@@ -315,16 +315,35 @@ fn peerProperty(lfd: int, cfd: int, afd: int): bool {
     netSockPeerIp(lfd) < 0
 }
 
-fn main() {
-  let hostLen = writeLoopback(hostBytes())
-  let badLen = writeHostname(badHostBytes())
-  fillPayload(sendBytes())
+class TcpResult {
+  bound: bool,
+  paired: bool,
+  peerOk: bool,
+  clean: bool,
+  delivered: bool,
+  roundTrip: bool,
+  eof: int,
+  // The listener's ephemeral port, kept past the close so `refusedDial` can
+  // aim at a port that provably had a listener on it a moment ago.
+  port: int,
+}
 
-  // --- Address layout -------------------------------------------------------
-  //
-  // Built and read back through this platform's own `sockaddr_in`, so a port
-  // stored at the wrong offset or in the wrong byte order fails here rather
-  // than three syscalls later as "the connection went to port 0".
+class TcpTransfer {
+  delivered: bool,
+  roundTrip: bool,
+}
+
+class UdpResult {
+  bound: bool,
+  datagram: bool,
+}
+
+// --- Address layout ---------------------------------------------------------
+//
+// Built and read back through this platform's own `sockaddr_in`, so a port
+// stored at the wrong offset or in the wrong byte order fails here rather
+// than three syscalls later as "the connection went to port 0".
+fn addrLayoutProps(): bool {
   netFillSockAddr(saBytes(), ipBytes(), 0)
   putByte(ipBytes(), 0, 10)
   putByte(ipBytes(), 1, 1)
@@ -333,19 +352,43 @@ fn main() {
   netFillSockAddr(saBytes(), ipBytes(), 40404)
   clear(octBytes(), 4)
   netSockAddrOctets(saBytes(), octBytes())
-  let addrOk = netSockAddrPort(saBytes()) == 40404 &&
+  return netSockAddrPort(saBytes()) == 40404 &&
     getByte(octBytes(), 0) == 10 &&
     getByte(octBytes(), 1) == 1 &&
     getByte(octBytes(), 2) == 2 &&
     getByte(octBytes(), 3) == 3 &&
     netSockAddrLen() == 16
+}
 
-  // --- A hostname must be refused, not guessed at ---------------------------
-  let refused = netListenTcp(badHostBytes(), badLen, 0, 16) < 0 &&
+// --- A hostname must be refused, not guessed at -----------------------------
+fn refusedProps(badLen: int): bool {
+  return netListenTcp(badHostBytes(), badLen, 0, 16) < 0 &&
     netBindUdp(badHostBytes(), badLen, 0) < 0 &&
     netDialTcp(badHostBytes(), badLen, 1) < 0
+}
 
-  // --- TCP ------------------------------------------------------------------
+// Both directions of the same pair, byte for byte. The echo reads back what
+// `delivered` just received, so a transfer that dropped or reordered a byte
+// fails here whichever way it travelled.
+fn transferProps(cfd: int, afd: int): TcpTransfer {
+  let sent = netWriteSock(cfd, sendBytes(), payloadLen)
+  clear(recvBytes(), payloadLen)
+  let got = netReadSock(afd, recvBytes(), payloadLen)
+  let delivered = sent == payloadLen &&
+    got == payloadLen &&
+    sameBytes(sendBytes(), recvBytes(), payloadLen)
+
+  let back = netWriteSock(afd, recvBytes(), payloadLen)
+  clear(echoBytes(), payloadLen)
+  let echoed = netReadSock(cfd, echoBytes(), payloadLen)
+  let roundTrip = back == payloadLen &&
+    echoed == payloadLen &&
+    sameBytes(sendBytes(), echoBytes(), payloadLen)
+  return TcpTransfer{ delivered: delivered, roundTrip: roundTrip }
+}
+
+// --- TCP --------------------------------------------------------------------
+fn tcpSection(hostLen: int): TcpResult {
   let lfd = netListenTcp(hostBytes(), hostLen, 0, 16)
   let port = netSockLocalPort(lfd)
   // Port 0 asked the kernel to choose, so a real ephemeral port coming back is
@@ -364,21 +407,7 @@ fn main() {
   // `netDialTcp` makes on the EINPROGRESS path and the one whose omission is the
   // classic non-blocking-connect bug.
   let clean = netSocketError(cfd) == 0
-
-  let sent = netWriteSock(cfd, sendBytes(), payloadLen)
-  clear(recvBytes(), payloadLen)
-  let got = netReadSock(afd, recvBytes(), payloadLen)
-  let delivered = sent == payloadLen &&
-    got == payloadLen &&
-    sameBytes(sendBytes(), recvBytes(), payloadLen)
-
-  // Echo the other way, so both directions of the same pair are exercised.
-  let back = netWriteSock(afd, recvBytes(), payloadLen)
-  clear(echoBytes(), payloadLen)
-  let echoed = netReadSock(cfd, echoBytes(), payloadLen)
-  let roundTrip = back == payloadLen &&
-    echoed == payloadLen &&
-    sameBytes(sendBytes(), echoBytes(), payloadLen)
+  let t = transferProps(cfd, afd)
 
   // A closed peer is an ORDERLY END OF STREAM: 0, not an error. A caller's read
   // loop terminates on that, and reporting -1 instead would turn every clean
@@ -387,77 +416,91 @@ fn main() {
   let eof = netReadSock(afd, recvBytes(), payloadLen)
   netClose(afd)
   netClose(lfd)
+  return TcpResult{
+    bound: bound,
+    paired: paired,
+    peerOk: peerOk,
+    clean: clean,
+    delivered: t.delivered,
+    roundTrip: t.roundTrip,
+    eof: eof,
+    port: port,
+  }
+}
 
-  // --- A refused connection must be reported, not deferred ------------------
-  //
-  // The listener is gone, so nothing is accepting on `port`. A non-blocking
-  // connect reports success immediately and fails in the background, so this
-  // fails ONLY IF SO_ERROR is read back — which is the one property that would
-  // otherwise surface as a mysterious `write` error much later.
-  let refusedDial = netDialTcp(hostBytes(), hostLen, port) < 0
-
-  // --- UDP ------------------------------------------------------------------
-  let rfd = netBindUdp(hostBytes(), hostLen, 0)
-  let sfd = netBindUdp(hostBytes(), hostLen, 0)
-  let rport = netSockLocalPort(rfd)
-  let sport = netSockLocalPort(sfd)
-  let udpBound = rfd >= 0 && sfd >= 0 && rport > 0 && sport > 0 && rport != sport
-
+// THE SENDER'S ADDRESS IS ASSERTED, not just the payload. `recvfrom`'s
+// `socklen_t` is in/out; a provider that failed to re-arm it, or that parsed
+// the returned `sockaddr_in` with the other platform's offsets, would still
+// deliver the right bytes and report the wrong sender — which is exactly the
+// shape of bug that a payload-only check cannot see.
+fn datagramProps(rfd: int, sfd: int, hostLen: int, rport: int, sport: int): bool {
   let dsent = netSendTo(sfd, hostBytes(), hostLen, rport, sendBytes(), payloadLen)
   clear(recvBytes(), payloadLen)
   clear(peerBytes(), netSockAddrLen())
   let dgot = netRecvFrom(rfd, recvBytes(), payloadLen, peerBytes())
-  // THE SENDER'S ADDRESS IS ASSERTED, not just the payload. `recvfrom`'s
-  // `socklen_t` is in/out; a provider that failed to re-arm it, or that parsed
-  // the returned `sockaddr_in` with the other platform's offsets, would still
-  // deliver the right bytes and report the wrong sender — which is exactly the
-  // shape of bug that a payload-only check cannot see.
   clear(octBytes(), 4)
   netSockAddrOctets(peerBytes(), octBytes())
-  let datagram = dsent == payloadLen &&
+  return dsent == payloadLen &&
     dgot == payloadLen &&
     sameBytes(sendBytes(), recvBytes(), payloadLen) &&
     netSockAddrPort(peerBytes()) == sport &&
     getByte(octBytes(), 0) == 127 &&
     getByte(octBytes(), 3) == 1
+}
 
+// --- UDP --------------------------------------------------------------------
+fn udpSection(hostLen: int): UdpResult {
+  let rfd = netBindUdp(hostBytes(), hostLen, 0)
+  let sfd = netBindUdp(hostBytes(), hostLen, 0)
+  let rport = netSockLocalPort(rfd)
+  let sport = netSockLocalPort(sfd)
+  let bound = rfd >= 0 && sfd >= 0 && rport > 0 && sport > 0 && rport != sport
+  let datagram = datagramProps(rfd, sfd, hostLen, rport, sport)
   netClose(rfd)
   netClose(sfd)
+  return UdpResult{ bound: bound, datagram: datagram }
+}
 
-  // --- DNS: the socket, and the layout its timeout depends on ---------------
-  //
-  // The receive timeout is read BACK rather than waited on. `class timeval`
-  // differs between the two platforms (`tv_usec` is 32 bits here, 64 on Linux)
-  // and the only behavioural symptom of getting it wrong is that a lost DNS
-  // query HANGS instead of timing out — a failure mode that wedges the suite
-  // instead of reporting. See `netRcvTimeoMs`.
+// --- DNS: the socket, and the layout its timeout depends on -----------------
+//
+// The receive timeout is read BACK rather than waited on. `class timeval`
+// differs between the two platforms (`tv_usec` is 32 bits here, 64 on Linux)
+// and the only behavioural symptom of getting it wrong is that a lost DNS
+// query HANGS instead of timing out — a failure mode that wedges the suite
+// instead of reporting. See `netRcvTimeoMs`.
+fn dnsProps(): bool {
   let dfd = netDnsSocket()
   let timeo = netRcvTimeoMs(dfd)
   let dns = dfd >= 0 && timeo == netDnsTimeoutMs
   netClose(dfd)
+  return dns
+}
 
-  // A dotted quad resolves to itself WITHOUT touching the network — the
-  // pass-through that makes `netResolveHost` safe to call on an address.
+// A dotted quad resolves to itself WITHOUT touching the network — the
+// pass-through that makes `netResolveHost` safe to call on an address.
+fn literalProps(hostLen: int): bool {
   clear(ipBytes(), 4)
-  let literal = netResolveHost(hostBytes(), hostLen, ipBytes(), ipBytes()) &&
+  return netResolveHost(hostBytes(), hostLen, ipBytes(), ipBytes()) &&
     getByte(ipBytes(), 0) == 127 &&
     getByte(ipBytes(), 1) == 0 &&
     getByte(ipBytes(), 2) == 0 &&
     getByte(ipBytes(), 3) == 1
+}
 
-  // --- A read that really does block, and then does not ---------------------
-  //
-  // See `responderEntry`. This is the only place the EAGAIN branch of a retry
-  // loop is reached, so it is the only guard on this platform's `eAgain`.
-  //
-  // LAST, ON ITS OWN SOCKET PAIR, AND THAT PLACEMENT IS LOAD-BEARING. A thread
-  // this program starts and then releases leaves collections abandoning for the
-  // REST OF THE RUN — measured here as 3891 `stop-the-world rendezvous expired`
-  // against 274 completed when the property sat in the middle of the program.
-  // That is a runtime property of a released `runtime/thread` worker, not
-  // anything this port does, and ../chanracelinux does not show it only because
-  // its threads live until the last line. Running this property last gives the
-  // same shape, so the collections that matter all happen before it.
+// --- A read that really does block, and then does not -----------------------
+//
+// See `responderEntry`. This is the only place the EAGAIN branch of a retry
+// loop is reached, so it is the only guard on this platform's `eAgain`.
+//
+// LAST, ON ITS OWN SOCKET PAIR, AND THAT PLACEMENT IS LOAD-BEARING. A thread
+// this program starts and then releases leaves collections abandoning for the
+// REST OF THE RUN — measured here as 3891 `stop-the-world rendezvous expired`
+// against 274 completed when the property sat in the middle of the program.
+// That is a runtime property of a released `runtime/thread` worker, not
+// anything this port does, and ../chanracelinux does not show it only because
+// its threads live until the last line. Running this property last gives the
+// same shape, so the collections that matter all happen before it.
+fn blockedProps(hostLen: int): bool {
   let blfd = netListenTcp(hostBytes(), hostLen, 0, 16)
   let blport = netSockLocalPort(blfd)
   let bcfd = netDialTcp(hostBytes(), hostLen, blport)
@@ -485,12 +528,36 @@ fn main() {
   netClose(bcfd)
   netClose(bafd)
   netClose(blfd)
+  return blocked
+}
+
+fn main() {
+  let hostLen = writeLoopback(hostBytes())
+  let badLen = writeHostname(badHostBytes())
+  fillPayload(sendBytes())
+
+  let addrOk = addrLayoutProps()
+  let refused = refusedProps(badLen)
+  let tcp = tcpSection(hostLen)
+
+  // --- A refused connection must be reported, not deferred ------------------
+  //
+  // The listener is gone, so nothing is accepting on `tcp.port`. A non-blocking
+  // connect reports success immediately and fails in the background, so this
+  // fails ONLY IF SO_ERROR is read back — which is the one property that would
+  // otherwise surface as a mysterious `write` error much later.
+  let refusedDial = netDialTcp(hostBytes(), hostLen, tcp.port) < 0
+
+  let udp = udpSection(hostLen)
+  let dns = dnsProps()
+  let literal = literalProps(hostLen)
+  let blocked = blockedProps(hostLen)
 
   println("addr ${addrOk} refused ${refused}")
-  println("tcp ${bound} ${paired} ${clean} ${delivered} ${roundTrip} eof ${eof}")
-  println("peer ${peerOk}")
+  println("tcp ${tcp.bound} ${tcp.paired} ${tcp.clean} ${tcp.delivered} ${tcp.roundTrip} eof ${tcp.eof}")
+  println("peer ${tcp.peerOk}")
   println("block ${blocked}")
   println("dial ${refusedDial}")
-  println("udp ${udpBound} ${datagram}")
+  println("udp ${udp.bound} ${udp.datagram}")
   println("dns ${dns} ${literal}")
 }

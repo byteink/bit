@@ -98,7 +98,7 @@
 
 import {
   allocNumClasses, allocMaxSmall, allocSpanBytes, heapWords,
-  allocClassSize, allocAlignUp, allocNonZero, allocClassify, allocLargeLen,
+  allocClassSize, allocAlignUp, allocClassify, allocLargeLen,
   allocSpanHdrWords, allocSpanOf, allocSpanSlots, allocSpanKeep, allocSlotIndex,
   allocSpanClass, allocSpanTotal, allocSpanFree, allocSpanNext, allocSpanOwned,
   heapInit, heapLiveBytes, heapMappedBytes,
@@ -233,15 +233,52 @@ fn heapFree(h: *i64, lk: *i32, addr: int, size: int, alignment: int) {
     // The result is the allocator asking for a reclaim pass. Ignored here on
     // purpose: these spans are not releasable, so acting on it would be the one
     // thing #2375 must never do. Property (k) drives the pass deliberately.
-    let reclaim = heapGiveSmallLocked(h, addr, idx, size)
+    let _ = heapGiveSmallLocked(h, addr, idx, size)
   }
   spinRelease(lk)
 }
 
-fn main() {
-  // ---- (a) size-class table: a position-weighted checksum -------------------
-  // Weighting by (i+1) makes the checksum sensitive to ORDER, so two
-  // transposed classes change it; a plain sum would not.
+class TableSums {
+  sum: int,
+  weighted: int,
+}
+
+class CarveResult {
+  ok: int,
+  got: int,
+}
+
+class ChurnResult {
+  ok: int,
+  intact: int,
+  checked: int,
+}
+
+class SlotCheck {
+  intact: int,
+  checked: int,
+}
+
+// The churn ring: one entry per slot, split across three parallel slices
+// exactly as it was when it lived in `main`. It is a class only so that
+// `drainSlot` can take the whole ring as one parameter.
+class Ring {
+  addr: []i64,
+  size: []i64,
+  tag: []i64,
+}
+
+// The heap's byte counters before a property runs, so the property can assert
+// it gave every byte back.
+class HeapBase {
+  live: int,
+  mapped: int,
+}
+
+// ---- (a) size-class table: a position-weighted checksum ---------------------
+// Weighting by (i+1) makes the checksum sensitive to ORDER, so two
+// transposed classes change it; a plain sum would not.
+fn tableChecksum(): TableSums {
   let tsum = 0
   let twsum = 0
   let i = 0
@@ -251,9 +288,12 @@ fn main() {
     twsum = twsum + cs * (i + 1)
     i = i + 1
   }
+  return TableSums{ sum: tsum, weighted: twsum }
+}
 
-  // ---- (b) table invariants -------------------------------------------------
-  // Strictly increasing, first is 8, last is allocMaxSmall.
+// ---- (b) table invariants ---------------------------------------------------
+// Strictly increasing, first is 8, last is allocMaxSmall.
+fn tableInvariants(): int {
   let mono = 1
   let j = 1
   while (j < allocNumClasses) {
@@ -268,9 +308,12 @@ fn main() {
   if (allocClassSize(allocNumClasses - 1) != allocMaxSmall) {
     mono = 0
   }
+  return mono
+}
 
-  // Every power of two in [8, allocMaxSmall] is itself a class — the invariant
-  // the alignment guarantee rests on.
+// Every power of two in [8, allocMaxSmall] is itself a class — the invariant
+// the alignment guarantee rests on.
+fn powersAreClasses(): int {
   let powsOk = 1
   let p = 8
   while (p <= allocMaxSmall) {
@@ -287,96 +330,99 @@ fn main() {
     }
     p = p * 2
   }
+  return powsOk
+}
 
-  // ---- (c) classify contract: smallest class that fits AND divides ----------
+// Is there ANY class that fits `needed` bytes at alignment `al`? Only when
+// there is none may `allocClassify` refuse the request.
+fn anyClassFits(needed: int, al: int): bool {
+  let k = 0
+  let any = false
+  while (k < allocNumClasses) {
+    let cs = allocClassSize(k)
+    if (cs >= needed && cs % al == 0) {
+      any = true
+    }
+    k = k + 1
+  }
+  return any
+}
+
+// No class BELOW `idx` may also satisfy the request — the "smallest that fits"
+// half of the contract.
+fn noSmallerFits(idx: int, needed: int, al: int): bool {
+  let k = 0
+  let none = true
+  while (k < idx) {
+    let cs = allocClassSize(k)
+    if (cs >= needed && cs % al == 0) {
+      none = false
+    }
+    k = k + 1
+  }
+  return none
+}
+
+fn classifyOneOk(sz: int, al: int): bool {
+  let idx = allocClassify(sz, al)
+  let needed = allocAlignUp(sz, al)
+  if (idx < 0) {
+    // Only legitimate when no class can satisfy it at all.
+    return !anyClassFits(needed, al)
+  }
+  let cs = allocClassSize(idx)
+  return cs >= needed && cs % al == 0 && noSmallerFits(idx, needed, al)
+}
+
+// ---- (c) classify contract: smallest class that fits AND divides ------------
+fn classifyContract(): int {
   let classifyOk = 1
   let alignIdx = 0
   while (alignIdx < 10) {
     let al = 8 << alignIdx // 8 .. 4096
     let sz = 1
     while (sz <= allocMaxSmall) {
-      let idx = allocClassify(sz, al)
-      let needed = allocAlignUp(sz, al)
-      if (idx < 0) {
-        // Only legitimate when no class can satisfy it at all.
-        let any = 0
-        let k2 = 0
-        while (k2 < allocNumClasses) {
-          let cs2 = allocClassSize(k2)
-          if (cs2 >= needed && cs2 % al == 0) {
-            any = 1
-          }
-          k2 = k2 + 1
-        }
-        if (any == 1) {
-          classifyOk = 0
-        }
-      } else {
-        let cs = allocClassSize(idx)
-        if (cs < needed) {
-          classifyOk = 0
-        }
-        if (cs % al != 0) {
-          classifyOk = 0
-        }
-        // No smaller class may also satisfy it.
-        let k3 = 0
-        while (k3 < idx) {
-          let cs3 = allocClassSize(k3)
-          if (cs3 >= needed && cs3 % al == 0) {
-            classifyOk = 0
-          }
-          k3 = k3 + 1
-        }
+      if (!classifyOneOk(sz, al)) {
+        classifyOk = 0
       }
       sz = sz * 3 + 1 // straddles class boundaries
     }
     alignIdx = alignIdx + 1
   }
+  return classifyOk
+}
 
-  // ---- heap + arena ---------------------------------------------------------
-  let hbuf = []i64(heapWords)
-  let h = ptrOf(hbuf)
-  let lbuf = []i32(1)
-  let lk = ptrOf(lbuf)
-  atomicStore(lk, spinUnlocked)
-  heapInit(h)
-
-  let arena = []i64(ARENA_WORDS)
-  let abase = int(ptrOf(arena))
-  let a = []i64(3)
-  a[A_NEXT] = allocAlignUp(abase, allocSpanBytes)
-  a[A_LIMIT] = abase + ARENA_WORDS * 8
-  a[A_SPANS] = 0
-
-  let initOk = 0
-  if (heapLiveBytes(h) == 0 && heapMappedBytes(h) == 0) {
-    initOk = 1
+// The six request sizes property (d) drives at every alignment.
+fn alignSize(si: int): int {
+  if (si == 1) {
+    return 7
   }
+  if (si == 2) {
+    return 8
+  }
+  if (si == 3) {
+    return 17
+  }
+  if (si == 4) {
+    return 100
+  }
+  if (si == 5) {
+    return 1000
+  }
+  return 1
+}
 
-  // ---- (d) alignment across powers of two -----------------------------------
+// ---- (d) alignment across powers of two -------------------------------------
+// `a` is main's local and only its header travels here, so the arena's backing
+// store stays in main's frame and stays rooted for the whole run.
+fn alignProps(h: *i64, lk: *i32, a: []i64): int {
   let alignOk = 1
   let ai = 0
   while (ai < 10) {
     let al = 8 << ai // 8 .. 4096
     let si = 0
     while (si < 6) {
-      let sz = 1
-      if (si == 1) {
-        sz = 7
-      }
-      if (si == 2) {
-        sz = 8
-      }
-      if (si == 3) {
-        sz = 17
-      }
-      if (si == 4) {
-        sz = 100
-      }
-      if (si == 5) {
-        sz = 1000
-      }
+      let sz = alignSize(si)
       let addr = heapAlloc(h, lk, a, sz, al)
       if (addr == 0) {
         alignOk = 0 // arena exhausted: never deref
@@ -390,9 +436,11 @@ fn main() {
     }
     ai = ai + 1
   }
-  let liveAfterAlign = heapLiveBytes(h)
+  return alignOk
+}
 
-  // ---- (e) reuse: free then re-alloc returns the same address ---------------
+// ---- (e) reuse: free then re-alloc returns the same address -----------------
+fn reuseProps(h: *i64, lk: *i32, a: []i64): int {
   let reuseOk = 1
   let ri = 0
   while (ri < allocNumClasses) {
@@ -416,9 +464,26 @@ fn main() {
     }
     ri = ri + 1
   }
+  return reuseOk
+}
 
-  // ---- (f) carve: one span yields exactly spanBytes/classSize distinct slots -
-  // A fresh heap and a fresh span, so the count is unambiguous.
+// One popped slot: inside the span, clear of the header at its base, and
+// exactly one class size below the previous one.
+fn carveSlotOk(s: int, span: int, cs4: int, got: int, prev: int): bool {
+  if (s < span + allocSpanHdrWords * 8) {
+    return false
+  }
+  if (s + cs4 > span + allocSpanBytes) {
+    return false
+  }
+  return got == 0 || prev - s == cs4 // descending, class-size apart
+}
+
+// ---- (f) carve: one span yields exactly spanBytes/classSize distinct slots --
+// A fresh heap and a fresh span, so the count is unambiguous. `h2buf`/`l2buf`
+// are locals of THIS frame for the whole life of the second heap: nothing
+// outside this property ever touches it.
+fn carveProps(a: []i64): CarveResult {
   let h2buf = []i64(heapWords)
   let h2 = ptrOf(h2buf)
   let l2buf = []i32(1)
@@ -457,16 +522,9 @@ fn main() {
     if (s == 0) {
       drained = 1
     } else {
-      // Inside the span, and clear of the header at its base.
-      if (s < span + allocSpanHdrWords * 8) {
+      if (!carveSlotOk(s, span, cs4, got, prev)) {
         carveOk = 0
       }
-      if (s + cs4 > span + allocSpanBytes) {
-        carveOk = 0
-      }
-      if (got > 0 && prev - s != cs4) {
-        carveOk = 0
-      } // descending, class-size apart
       prev = s
       got = got + 1
     }
@@ -478,90 +536,103 @@ fn main() {
   if (got != want) {
     carveOk = 0
   }
+  return CarveResult{ ok: carveOk, got: got }
+}
 
-  // ---- (j)+(k) per-span occupancy and span reclamation, `./spanaccounting.bit`
-  let (occOk, occN) = occRun(a)
-  let (recOk, recGot) = recRun(a)
+// The three request sizes property (i) drives, all above allocMaxSmall.
+fn largeSize(li: int): int {
+  if (li == 1) {
+    return 100000
+  }
+  if (li == 2) {
+    return 1048576
+  }
+  return allocMaxSmall + 1
+}
 
-  // ---- (i) the direct-mapped (large) path ----------------------------------
-  // Requests above allocMaxSmall bypass the size classes entirely: they are
-  // mapped straight from the OS, rounded up to a page, and accounted through
-  // `heapLargeAllocLocked`/`heapLargeFreeLocked`. Nothing above reaches that
-  // path — every size so far is <= allocMaxSmall and so classifies as SMALL —
-  // and the deleted native runtime had a dedicated unit test for it ("large
-  // direct-mapped allocations are page aligned and unmapped on free"), so it
-  // is mirrored here rather than left to the differential, which only covers
-  // the `allocLargeLen` arithmetic and not its composition with the counters.
+// One direct-mapped request: page aligned, both counters moved by exactly the
+// documented amounts, the whole rounded-up length writable, and every byte of
+// it given back on free.
+fn largeOneOk(h: *i64, lk: *i32, a: []i64, lsz: int, base: HeapBase): bool {
+  if (allocClassify(lsz, 16) >= 0) {
+    return false // must NOT be a size class
+  }
+  let want = allocLargeLen(lsz, PAGE)
+  let addr = heapAlloc(h, lk, a, lsz, 16)
+  if (addr == 0) {
+    return false
+  }
+  // direct maps are page aligned
+  let takenOk = addr % PAGE == 0 &&
+    heapLiveBytes(h) == base.live + lsz &&
+    heapMappedBytes(h) == base.mapped + want
+  // The whole rounded-up length is real, writable memory.
+  let w = wordAt(addr)
+  *w = 424242
+  let wEnd = wordAt(addr + want - 8)
+  *wEnd = 515151
+  let back = *w
+  heapFree(h, lk, addr, lsz, 16)
+  // mapping returned
+  return takenOk &&
+    back == 424242 &&
+    heapLiveBytes(h) == base.live &&
+    heapMappedBytes(h) == base.mapped
+}
+
+// ---- (i) the direct-mapped (large) path -------------------------------------
+// Requests above allocMaxSmall bypass the size classes entirely: they are
+// mapped straight from the OS, rounded up to a page, and accounted through
+// `heapLargeAllocLocked`/`heapLargeFreeLocked`. Nothing above reaches that
+// path — every size so far is <= allocMaxSmall and so classifies as SMALL —
+// and the deleted native runtime had a dedicated unit test for it ("large
+// direct-mapped allocations are page aligned and unmapped on free"), so it
+// is mirrored here rather than left to the differential, which only covers
+// the `allocLargeLen` arithmetic and not its composition with the counters.
+fn largeProps(h: *i64, lk: *i32, a: []i64): int {
+  let base = HeapBase{ live: heapLiveBytes(h), mapped: heapMappedBytes(h) }
   let largeOk = 1
-  let liveBefore = heapLiveBytes(h)
-  let mappedBefore = heapMappedBytes(h)
   let li = 0
   while (li < 3) {
-    let lsz = allocMaxSmall + 1
-    if (li == 1) {
-      lsz = 100000
-    }
-    if (li == 2) {
-      lsz = 1048576
-    }
-    if (allocClassify(lsz, 16) >= 0) {
+    if (!largeOneOk(h, lk, a, largeSize(li), base)) {
       largeOk = 0
-    } // must NOT be a size class
-    let want = allocLargeLen(lsz, PAGE)
-    let addr = heapAlloc(h, lk, a, lsz, 16)
-    if (addr == 0) {
-      largeOk = 0
-    } else {
-      if (addr % PAGE != 0) {
-        largeOk = 0
-      } // direct maps are page aligned
-      if (heapLiveBytes(h) != liveBefore + lsz) {
-        largeOk = 0
-      }
-      if (heapMappedBytes(h) != mappedBefore + want) {
-        largeOk = 0
-      }
-      // The whole rounded-up length is real, writable memory.
-      let w = wordAt(addr)
-      *w = 424242
-      let wEnd = wordAt(addr + want - 8)
-      *wEnd = 515151
-      let back = *w
-      if (back != 424242) {
-        largeOk = 0
-      }
-      heapFree(h, lk, addr, lsz, 16)
-      if (heapLiveBytes(h) != liveBefore) {
-        largeOk = 0
-      }
-      if (heapMappedBytes(h) != mappedBefore) {
-        largeOk = 0
-      } // mapping returned
     }
     li = li + 1
   }
+  return largeOk
+}
 
-  // ---- (g)+(h) churn with sentinels ----------------------------------------
-  let ringAddr = []i64(RING)
-  let ringSize = []i64(RING)
-  let ringTag = []i64(RING)
+// Check one ring slot's sentinel and give the block back. An empty slot is
+// neither checked nor intact, which is what the churn loop's first `RING`
+// rounds see.
+fn drainSlot(h: *i64, lk: *i32, r: Ring, slot: int): SlotCheck {
+  let old = r.addr[slot]
+  if (old == 0) {
+    return SlotCheck{ intact: 0, checked: 0 }
+  }
+  let w = wordAt(old)
+  let seen = *w
+  let intact = 0
+  if (seen == r.tag[slot]) {
+    intact = 1
+  }
+  heapFree(h, lk, old, r.size[slot], 8)
+  r.addr[slot] = 0
+  return SlotCheck{ intact: intact, checked: 1 }
+}
+
+// ---- (g)+(h) churn with sentinels -------------------------------------------
+fn churnProps(h: *i64, lk: *i32, a: []i64): ChurnResult {
+  let r = Ring{ addr: []i64(RING), size: []i64(RING), tag: []i64(RING) }
   let intact = 0
   let checked = 0
   let churnOk = 1
   let n = 0
   while (n < CHURN) {
     let slot = n % RING
-    let old = ringAddr[slot]
-    if (old != 0) {
-      let w = wordAt(old)
-      let seen = *w
-      checked = checked + 1
-      if (seen == ringTag[slot]) {
-        intact = intact + 1
-      }
-      heapFree(h, lk, old, ringSize[slot], 8)
-      ringAddr[slot] = 0
-    }
+    let c = drainSlot(h, lk, r, slot)
+    intact = intact + c.intact
+    checked = checked + c.checked
     // Deterministic sizes spanning many classes, staying inside the arena.
     let sz = 1 + n * 37 % 3000
     let addr = heapAlloc(h, lk, a, sz, 8)
@@ -574,28 +645,63 @@ fn main() {
       let tag = n * 2654435761 + 1
       let w2 = wordAt(addr)
       *w2 = tag // sentinel in the first word
-      ringAddr[slot] = addr
-      ringSize[slot] = sz
-      ringTag[slot] = tag
+      r.addr[slot] = addr
+      r.size[slot] = sz
+      r.tag[slot] = tag
     }
     n = n + 1
   }
   // Drain survivors.
   let d = 0
   while (d < RING) {
-    let old = ringAddr[d]
-    if (old != 0) {
-      let w = wordAt(old)
-      let seen = *w
-      checked = checked + 1
-      if (seen == ringTag[d]) {
-        intact = intact + 1
-      }
-      heapFree(h, lk, old, ringSize[d], 8)
-      ringAddr[d] = 0
-    }
+    let c = drainSlot(h, lk, r, d)
+    intact = intact + c.intact
+    checked = checked + c.checked
     d = d + 1
   }
+  return ChurnResult{ ok: churnOk, intact: intact, checked: checked }
+}
+
+fn main() {
+  let tbl = tableChecksum()
+  let mono = tableInvariants()
+  let powsOk = powersAreClasses()
+  let classifyOk = classifyContract()
+
+  // ---- heap + arena ---------------------------------------------------------
+  // `hbuf`, `lbuf` and `arena` are locals of THIS frame for the whole run: the
+  // raw `*i64`/`*i32` every property below works through point into them, and
+  // only `arena`'s HEADER (`a`) travels into a callee.
+  let hbuf = []i64(heapWords)
+  let h = ptrOf(hbuf)
+  let lbuf = []i32(1)
+  let lk = ptrOf(lbuf)
+  atomicStore(lk, spinUnlocked)
+  heapInit(h)
+
+  let arena = []i64(ARENA_WORDS)
+  let abase = int(ptrOf(arena))
+  let a = []i64(3)
+  a[A_NEXT] = allocAlignUp(abase, allocSpanBytes)
+  a[A_LIMIT] = abase + ARENA_WORDS * 8
+  a[A_SPANS] = 0
+
+  let initOk = 0
+  if (heapLiveBytes(h) == 0 && heapMappedBytes(h) == 0) {
+    initOk = 1
+  }
+
+  let alignOk = alignProps(h, lk, a)
+  let liveAfterAlign = heapLiveBytes(h)
+  let reuseOk = reuseProps(h, lk, a)
+  let carve = carveProps(a)
+
+  // ---- (j)+(k) per-span occupancy and span reclamation, `./spanaccounting.bit`
+  let (occOk, occN) = occRun(a)
+  let (recOk, recGot) = recRun(a)
+
+  let largeOk = largeProps(h, lk, a)
+  let churn = churnProps(h, lk, a)
   let liveAtEnd = heapLiveBytes(h)
   let mappedAtEnd = heapMappedBytes(h)
   let spansUsed = a[A_SPANS]
@@ -612,7 +718,7 @@ fn main() {
     arenaRooted = 1
   }
 
-  print("tbl=${tsum}/${twsum} mono=${mono} pows=${powsOk} cls=${classifyOk} init=${initOk} align=${alignOk}/${liveAfterAlign} reuse=${reuseOk} carve=${carveOk}/${got} occ=${occOk}/${occN} rec=${recOk}/${recGot} large=${largeOk} churn=${churnOk} sent=${intact}/${checked} live=${liveAtEnd} mapped=${mappedAtEnd}/${spansUsed} chk=${mainBad} root=${arenaRooted}\n")
+  print("tbl=${tbl.sum}/${tbl.weighted} mono=${mono} pows=${powsOk} cls=${classifyOk} init=${initOk} align=${alignOk}/${liveAfterAlign} reuse=${reuseOk} carve=${carve.ok}/${carve.got} occ=${occOk}/${occN} rec=${recOk}/${recGot} large=${largeOk} churn=${churn.ok} sent=${churn.intact}/${churn.checked} live=${liveAtEnd} mapped=${mappedAtEnd}/${spansUsed} chk=${mainBad} root=${arenaRooted}\n")
 
   // ---- (l) span cache (#3045), `./spancache.bit` -----------------------------
   spancacheRun()
