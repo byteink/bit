@@ -694,8 +694,9 @@ a complete `req.body`. Set it and the handler is called as soon as the request
 headers are in, with `req.body` empty, and takes the bytes itself through
 `Stream.read` as they land - see that method below. Nothing else changes: the
 same handler signature, and a body the handler leaves unread is released when it
-answers. It has no effect on a client, where `roundTrip` returns a whole
-`Response` and takes the body for you.
+answers. On a client it says the same thing about response bodies: `roundTrip`,
+which can only return a whole `Response`, refuses to run under it, and
+`Conn.roundTripStream` is what such a client calls.
 
 `initialWindowSize` is the receive window granted to each stream; the
 connection's own window starts at the RFC's fixed 65535 and is not configurable.
@@ -897,6 +898,50 @@ And it fails when this side resets the stream through `Conn.resetStream`, with
 the peer's reset, because no peer acted. That call is how a parked `roundTrip`
 is cancelled: this method has no cancellation of its own.
 
+Under `Config.streamBodies` it fails immediately, with `http2: Config.streamBodies
+is set - call roundTripStream instead`, before a stream is opened. That setting
+says the application takes bodies itself, and this method cannot hand the stream
+over: honouring it here would mean either returning a truncated body or buffering
+up to `maxBodyBytes` behind the setting's back.
+
+### `Conn.roundTripStream(req: Request): (Response, Stream)!`
+
+Send `req` on a fresh stream and come back as soon as its response HEADERS
+arrive, with `res.body` empty and the returned `Stream` holding the body still to
+come: read it a chunk at a time with `Stream.read`, exactly as a `streamBodies`
+handler reads a request body. Fails for everything `roundTrip` fails for.
+
+That read is the backpressure. The engine holds the receive credit for every byte
+it has buffered and renews it as this caller takes it, so a server sending faster
+than this caller reads stops at the connection window instead of filling
+`maxBodyBytes` of buffer here.
+
+The caller owns the body from there: read to the chunk carrying `eof`, or abandon
+the stream with `Conn.resetStream`. A response body left unread holds its credit
+and keeps the connection's loop alive for a read that never comes. A response
+that carried no body at all is not a special case - the first read answers `eof`
+with no bytes.
+
+```bit
+import { Conn, newRequest } from "std/http2"
+
+// Measure a large response without ever holding it.
+fn responseSize(conn: Conn, path: string): int! {
+  let (res, s) = conn.roundTripStream(newRequest("GET", "example.com", path))?
+  if (res.status != 200) {
+    fail newError("status ${res.status}")
+  }
+  let total = 0
+  while (true) {
+    let c = s.read()?
+    total = total + len(c.data)
+    if (c.eof) {
+      return total
+    }
+  }
+}
+```
+
 ### `Conn.serve(handler: (Request, Stream) => Response): ()!`
 
 Accept inbound requests and dispatch each to `handler` on its own green thread,
@@ -947,7 +992,8 @@ peer to end the stream. It blocks until at least one byte has arrived or the bod
 has ended, and returns everything that had arrived and had not been taken yet.
 There are bytes to take only under `Config.streamBodies`, which is what stops
 `serve` from taking the body itself; under the default this returns an empty
-final chunk.
+final chunk. It reads a RESPONSE body the same way, on the `Stream`
+`Conn.roundTripStream` hands back.
 
 The take is what renews the receive windows, so a handler reading this way *is*
 the backpressure: the connection window holds the credit for every buffered byte
