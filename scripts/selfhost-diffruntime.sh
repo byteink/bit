@@ -275,7 +275,22 @@ reloc_sites_seen=0
 # It is asserted BOTH WAYS. A declared line that is no longer observed fails
 # too, which is what empties the table at the next stage0 repin instead of
 # leaving a stale entry masking a later regression on that exact symbol.
-RELOC_DECLARED=""
+# 2026-09-10, #4281 (5178c6f4, constants in optcse's availability table): CSE
+# now runs before the inliner snapshots a callee, so seven leaves that used to
+# carry duplicate constant materialisations fit maxInlineLeafInsts() and are
+# lowered inline; _mapKeyEq then inlines rtValueEq/descEqTop and gains their
+# _strBytes call. Bisected on #4559: c85984a0 PASS, 5178c6f4 FAIL, objdump
+# shows each former callee's body at the former call site. Empties at the
+# next repin.
+RELOC_DECLARED="
+runtime/gc - ARM64_RELOC_BRANCH26 _idxDisable
+runtime/gc - ARM64_RELOC_BRANCH26 _noteBody
+runtime/root + ARM64_RELOC_BRANCH26 _strBytes
+runtime/root - ARM64_RELOC_BRANCH26 _bit_rt_port_root_gc_env_min_trigger
+runtime/root - ARM64_RELOC_BRANCH26 _bit_rt_value_eq
+runtime/root - ARM64_RELOC_BRANCH26 _packLowBytes
+runtime/root - ARM64_RELOC_BRANCH26 _powIsOddInteger
+"
 
 # Same (rel, label) expansion g2archive.sh applies to the same two variables —
 # glue over the extracted data, not a second copy of the data itself.
