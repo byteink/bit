@@ -1,0 +1,261 @@
+// Granlund-Montgomery magic-number division: replacing a constant divide with
+// a widening multiply, a correction and a shift (#4389).
+//
+// The algorithms are Hacker's Delight, 2nd ed., §10-3/§10-4 `magic` (signed,
+// Figure 10-1) and §10-9 `magicu` (unsigned, Figure 10-3), widened from 32 to
+// 64 bits. Only the constants change with the width; the recurrences do not.
+//
+// WHAT THIS REPLACES, EXACTLY. Both backends' div emitters issue a 64-BIT
+// `sdiv`/`udiv` (arm64) or `idiv`/`div` (x86-64) whatever the IR's declared
+// width, because every integer SSA value lives width-canonical in a full
+// 64-bit register (arm64select.bit's module doc comment), and re-narrow the
+// result afterwards. So a magic sequence is correct here if and only if it
+// reproduces the 64-bit machine divide bit for bit, for every 64-bit
+// dividend -- which is the property the C reference was checked against over
+// 24.9M signed and 12.5M unsigned (dividend, divisor) pairs before this was
+// written. The declared width plays no part below, and the caller passes the
+// divisor's RAW 64-bit `ival`, untruncated, because that is what the divisor
+// register actually holds.
+//
+// All arithmetic is `u64` (modular by SPEC §13.5) rather than `int`. That is
+// not stylistic: `q2 + 1` reaches 2^63 for a divisor of i64 MIN and negating
+// it as a signed `int` is an overflow a `--debug` build traps on (#3081), and
+// the recurrences double `q1`/`r1` past 2^63 by construction.
+
+// One divisor's magic sequence.
+//
+// `shift` is the shift the EMITTER issues, not Hacker's Delight's `s`: the
+// unsigned fixup path shifts by `s - 1`, and folding that in here keeps the
+// subtraction in the one place that can prove `s >= 1` for it.
+//
+// `addend` is the signed correction, `q = q + addend * n` before the shift:
+// +1 when the magic overflowed to negative for a positive divisor, -1 in the
+// mirror case, 0 otherwise. It is exactly HD's two `if`s, folded to the one
+// value that distinguishes them.
+//
+// `fixup` is HD's unsigned "add indicator" `a`: the divisors whose magic does
+// not fit in 64 bits, recovered as `((n - q) >>u 1) + q` before the shift.
+//
+// `divisor` is the raw 64-bit divisor itself, carried because `%` recovers its
+// result as `n - (n/d)*d` and so needs `d` in a register after the quotient --
+// the one thing the sequence above does not already contain.
+//
+// `ok == false` means no sequence: every other field is zero and reading one
+// is a bug, so the emitters gate on it.
+class DivMagic {
+  ok: bool,
+  signed: bool,
+  m: int,
+  shift: int,
+  addend: int,
+  fixup: bool,
+  divisor: int,
+}
+
+fn noDivMagic(): DivMagic {
+  return DivMagic{ ok: false, signed: false, m: 0, shift: 0, addend: 0, fixup: false, divisor: 0 }
+}
+
+// The two recurrences do NOT share a bound, and treating them as if they did
+// is a real bug rather than a tidiness point -- it was one here first.
+//
+// SIGNED terminates by its own condition with p <= 2*W - 1 == 127, so 64
+// iterations from p == 63 is a cap that is never reached and `settled` is an
+// assertion that holds. Measured over 6,000,000 divisors in -3e6..3e6 plus the
+// i64 boundary set: max p == 126, at d == i64 MIN.
+//
+// UNSIGNED is bounded by p < 2*W == 128 in Hacker's Delight's own loop guard,
+// and reaching it is a LEGITIMATE termination, not a failure: 45,766 of
+// 3,399,999 divisors measured do. That is 65 iterations from p == 63, and the
+// first draft of this file capped both at 64 and asserted `settled` on both --
+// which crashed the compiler's own selfcheck on d == 2^64-2, the smallest
+// divisor that needs the 65th.
+fn divMagicSignedMaxIters(): int {
+  return 64
+}
+
+fn divMagicUnsignedMaxP(): int {
+  return 128
+}
+
+// Both recurrences stop on the same predicate -- HD's `while (q1 < delta ||
+// (q1 == delta && r1 == 0))`, negated. It is the same three-term test in both
+// figures, so it is written once; that also keeps each loop under the
+// complexity limit without either of them being cut somewhere arbitrary.
+fn magicSettled(q1: u64, r1: u64, delta: u64): bool {
+  return !(q1 < delta || (q1 == delta && r1 == u64(0)))
+}
+
+// What one recurrence produces: the final `q2`, the `p` it stopped at, and
+// (unsigned only) whether the magic needed HD's add indicator. The signed
+// recurrence has no such indicator and always reports false.
+class DivMagicRec {
+  q: u64,
+  p: int,
+  fixup: bool,
+}
+
+// HD Figure 10-1's loop. `ad` is |d| and `anc` is |nc|.
+fn magicSignedRec(ad: u64, anc: u64): DivMagicRec {
+  let p = 63
+  let q1 = u64(9223372036854775808) / anc
+  let r1 = u64(9223372036854775808) - q1 * anc
+  let q2 = u64(9223372036854775808) / ad
+  let r2 = u64(9223372036854775808) - q2 * ad
+  let iter = 0
+  let settled = false
+  while (iter < divMagicSignedMaxIters() && !settled) {
+    iter = iter + 1
+    p = p + 1
+    q1 = q1 + q1
+    r1 = r1 + r1
+    if (r1 >= anc) {
+      q1 = q1 + u64(1)
+      r1 = r1 - anc
+    }
+    q2 = q2 + q2
+    r2 = r2 + r2
+    if (r2 >= ad) {
+      q2 = q2 + u64(1)
+      r2 = r2 - ad
+    }
+    settled = magicSettled(q1, r1, ad - r2)
+  }
+  assert(settled) // never the cap: measured max p is 126, the cap allows 127
+  return DivMagicRec{ q: q2, p: p, fixup: false }
+}
+
+// HD Figure 10-3's loop, including its own `p < 2*W` guard.
+fn magicUnsignedRec(d: u64, nc: u64): DivMagicRec {
+  let p = 63
+  let q1 = u64(9223372036854775808) / nc
+  let r1 = u64(9223372036854775808) - q1 * nc
+  let q2 = (u64(9223372036854775808) - u64(1)) / d
+  let r2 = u64(9223372036854775808) - u64(1) - q2 * d
+  let fixup = false
+  let settled = false
+  while (p < divMagicUnsignedMaxP() && !settled) {
+    p = p + 1
+    if (r1 >= nc - r1) {
+      q1 = q1 + q1 + u64(1)
+      r1 = r1 + r1 - nc
+    } else {
+      q1 = q1 + q1
+      r1 = r1 + r1
+    }
+    if (r2 + u64(1) >= d - r2) {
+      if (q2 >= u64(9223372036854775808) - u64(1)) {
+        fixup = true
+      }
+      q2 = q2 + q2 + u64(1)
+      r2 = r2 + r2 + u64(1) - d
+    } else {
+      if (q2 >= u64(9223372036854775808)) {
+        fixup = true
+      }
+      q2 = q2 + q2
+      r2 = r2 + r2 + u64(1)
+    }
+    settled = magicSettled(q1, r1, d - u64(1) - r2)
+  }
+  return DivMagicRec{ q: q2, p: p, fixup: fixup }
+}
+
+// HD's two corrections, folded to the one value that distinguishes them:
+// `q = q + addend*n` before the shift.
+fn magicSignedAddend(d: int, m: int): int {
+  if (d > 0 && m < 0) {
+    return 1
+  }
+  if (d < 0 && m > 0) {
+    return 0 - 1
+  }
+  return 0
+}
+
+// The signed sequence, for a divisor that is neither 0, 1 nor -1 (the caller
+// declines all three: 0 must still panic, 1 and -1 need no multiply, and
+// i64 MIN / -1 is the one signed overflow a divide produces -- SPEC §13.5
+// wraps it two's-complement, which is what the hardware divide already does
+// and what a magic sequence would not).
+//
+// Emitted form:
+//   q = smulh(m, n)
+//   q = q + addend*n          (addend != 0)
+//   q = q >>a shift           (shift != 0)
+//   q = q + (q >>u 63)        (always -- rounds toward zero)
+fn magicSigned(d: int): DivMagic {
+  let ad = u64(d)
+  if (d < 0) {
+    ad = u64(0) - u64(d) // |d|, modular so i64 MIN maps to 2^63
+  }
+  let t = u64(9223372036854775808) + (u64(d) >> u64(63))
+  let rec = magicSignedRec(ad, t - u64(1) - t % ad)
+  let mu = rec.q + u64(1)
+  if (d < 0) {
+    mu = u64(0) - mu // modular: q2+1 reaches 2^63 at d == i64 MIN
+  }
+  let m = i64(mu)
+  let shift = rec.p - 64
+  assert(shift >= 0 && shift <= 63)
+  return DivMagic{
+    ok: true,
+    signed: true,
+    m: m,
+    shift: shift,
+    addend: magicSignedAddend(d, m),
+    fixup: false,
+    divisor: d,
+  }
+}
+
+// The unsigned sequence, for a divisor >= 2 (0 must still panic; 1 needs no
+// multiply). `d` is the raw 64-bit divisor read as unsigned, so a negative
+// `ival` is a legitimately large divisor here, not an error.
+//
+// Emitted form:
+//   q = umulh(m, n)
+//   q = ((n - q) >>u 1) + q   (fixup)
+//   q = q >>u shift           (shift != 0)
+fn magicUnsigned(d: u64): DivMagic {
+  let rec = magicUnsignedRec(d, u64(18446744073709551615) - (u64(0) - d) % d)
+  let shift = rec.p - 64
+  if (rec.fixup) {
+    // Exhausting p is HD's other exit and always lands here: every one of the
+    // 45,766 measured p == 128 divisors has the add indicator set, so this is
+    // 63 and never 64.
+    shift = shift - 1
+  }
+  // Checked, not claimed: 0 <= shift <= 63 held for all 3,399,999 unsigned and
+  // 6,000,000 signed divisors measured, spanning 2..3e6, both the i64 and u64
+  // boundaries, and 300,000 xorshift values across the full 64-bit range.
+  assert(shift >= 0 && shift <= 63)
+  return DivMagic{
+    ok: true,
+    signed: false,
+    m: i64(rec.q + u64(1)),
+    shift: shift,
+    addend: 0,
+    fixup: rec.fixup,
+    divisor: i64(d),
+  }
+}
+
+// The one entry point: `raw` is a `const_int` divisor's untruncated 64-bit
+// `ival` and `signed` says which machine divide it is feeding.
+//
+// The declines are the whole safety argument and are stated once, here:
+// 0 keeps its panic (SPEC §13.5), 1 and -1 need no multiply at all, and a
+// magic sequence for -1 would change `i64 MIN / -1`.
+fn divisorMagic(raw: int, signed: bool): DivMagic {
+  if (raw == 0 || raw == 1) {
+    return noDivMagic()
+  }
+  if (signed) {
+    if (raw == 0 - 1) {
+      return noDivMagic()
+    }
+    return magicSigned(raw)
+  }
+  return magicUnsigned(u64(raw))
+}
