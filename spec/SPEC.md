@@ -4070,10 +4070,11 @@ it. `error` is a type name, so the constructor cannot itself be named `error`
 
 ### 18.4 Panics
 
-A **panic** is an immediate, unrecoverable abort of the program with a message and
-a stack trace to stderr (§18.6), and a non-zero exit code. Panics are for
-programmer errors and broken invariants, never for expected failures. Sources of
-panic:
+A **panic** aborts the **task** it was raised on, not always the program: unless
+that task has installed a panic boundary (below), it is an immediate abort of the
+whole program with a message and a stack trace to stderr (§18.6), and a non-zero
+exit code. Panics are for programmer errors and broken invariants, never for
+expected failures. Sources of panic:
 
 - index/slice out of range; integer divide-by-zero; signed overflow in debug
   builds (§13.5);
@@ -4083,19 +4084,37 @@ panic:
 - explicit `panic(msg)` builtin;
 - a failed `assert(cond)` / `assert(cond, msg)` builtin.
 
-There is **no `recover`** in v0.1: panics are fatal by design, keeping control flow
-free of hidden unwinding. Recoverable conditions must use the Result model.
+A task may install a **panic boundary** around a call with `std/runtime`'s
+`runRecovering(f)`; a panic raised in `f`, or in anything `f` calls on the same
+task, discards the frames between the panic site and the boundary and returns
+`(true, message)` from `runRecovering`. This section names the call;
+`std/runtime` documents its surface. With no boundary on the current task, a
+panic remains an immediate abort of the program with a message and a stack trace
+to stderr (§18.6) and exit code 2, which is the default.
 
-A test may still assert that a panic happens, without `recover`. `bit test` (§19)
-treats a discovered test named with the `testpanic_` prefix as expected to
-panic — a VERDICT modifier on an already-discovered test, not a second
-discovery mechanism, so it applies exactly like any other name to any
+Recovery is per task. A boundary installed on one task never catches a panic on
+another. Boundaries nest; the innermost one on the current task wins. Deferred
+calls (§18.5) do **not** run while a boundary is being reached: there is no
+unwinding, so anything a panic path must release — a lock, a temp file — has to be
+released explicitly. A `std/sync` mutex held at the panic site stays held.
+
+Four classes stay fatal regardless of any boundary: a runtime-internal invariant
+failure, out of memory, a panic raised while the task is blocked in a syscall, and
+a panic raised on a thread that is not running a task. Panics remain for
+programmer errors and broken invariants; recoverable conditions must still use the
+Result model.
+
+A test may assert that a panic happens without installing a boundary.
+`bit test` (§19) treats a discovered test named with the `testpanic_` prefix
+as expected to panic — a VERDICT modifier on an already-discovered test, not
+a second discovery mechanism, so it applies exactly like any other name to any
 function `bit test` finds in a `.test.bit` file. It runs a `testpanic_`
 function in its own child process the same way as any other test, passes it
 when that process exits with the panic status (2), and fails it when the
 process returns normally or exits with any other status. This is a
 convention owned by the test runner, not a language feature — `panic` itself
-is unchanged and `recover` remains absent from the language.
+is unchanged, and the runner installs no boundary: it reads the child
+process's exit status.
 
 ### 18.5 Deferred Cleanup
 
@@ -4104,12 +4123,15 @@ defer close(f)
 defer conn.release()
 ```
 
-`defer call` schedules a call to run when the enclosing **function** returns, by any
-path (normal `return`, `fail`, or propagation `?`), in **last-in-first-out** order.
-Deferred calls do **not** run on a panic path: a panic (§18.4) aborts the process
-immediately, with no unwinding of any kind, deferred or otherwise. Cleanup that
-must happen before the process can die — releasing a lock, deleting a temp file —
-has to run explicitly, before the call that may panic. Deferred call arguments are
+`defer call` schedules a call to run when the enclosing **function** returns, by
+any path (normal `return`, `fail`, or propagation `?`), in **last-in-first-out**
+order. Deferred calls do **not** run on a panic path: a panic (§18.4) aborts
+immediately, with no unwinding of any kind, deferred or otherwise. That holds on
+both panic paths — an unrecovered panic ends the program, and a panic caught by
+a panic boundary (§18.4) discards the frames between the panic site and the
+boundary without running their deferred calls. Cleanup that must happen before
+those frames go away — releasing a lock, deleting a temp file — has to run
+explicitly, before the call that may panic. Deferred call arguments are
 evaluated at the `defer` statement, not at execution time. `defer` gives
 deterministic resource release without finalizers on every path that returns.
 
@@ -4130,13 +4152,14 @@ decision, verbatim:
 has made no frame-pointer-chain promise this runtime could walk, and there is
 no debug-info format yet to symbolize one if it did."* Both halves of that
 sentence are now deliberately becoming false: codegen will make that promise,
-and a debug-info format will exist to symbolize a walk with. `runtime/ABI.md`
-itself is not edited here — this ticket's own constraints keep it out of
-`runtime/` — so that document read as it did until #3286 updated it (§12 now
-describes the opt-in `BIT_BACKTRACE=1` walk, #3285/#3820); this entry is what
-authorized that update. §18.4 above already claims "a message and a stack
-trace to stderr" for every panic; until this decision, that clause named no
-reachable implementation and flatly contradicted `runtime/ABI.md`'s own text
+and a debug-info format will exist to symbolize a walk with. (Its `recover`
+clause is stale as well: §18.4 above now specifies a per-task panic boundary.)
+`runtime/ABI.md` itself is not edited here — this ticket's own constraints keep
+it out of `runtime/` — so that document read as it did until #3286 updated it
+(§12 now describes the opt-in `BIT_BACKTRACE=1` walk, #3285/#3820); this entry
+is what authorized that update. §18.4 above already claims "a message and a
+stack trace to stderr" for every panic; until this decision, that clause named
+no reachable implementation and flatly contradicted `runtime/ABI.md`'s own text
 at the time. This is what committed to making it true.
 
 **What this costs**, stated up front because choosing this shape over the
@@ -4645,7 +4668,8 @@ Intentionally **not** in v0.1, to keep the surface minimal:
   pointer type `*T` and its dereference `*p` *are* specified — see §11.4 — for the
   unmanaged subset; only taking the address of a value with `&` remains reserved.)
 - Operator overloading; user-defined implicit conversions.
-- `recover`; catchable panics.
+- A `recover` builtin or keyword, and any catch syntax for panics: a panic
+  boundary is a plain `std/runtime` call, not language surface (§18.4).
 - Weaker memory orderings on the raw `*T` unmanaged-subset atomics (§11.5) — a
   seq-cst-only surface ships there; `std/sync`'s `Atomic<T>` (§13.7.1) is
   where `Relaxed`/`Release`/`Acquire` live instead. `std/sync` itself
