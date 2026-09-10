@@ -161,6 +161,10 @@ run_suite() {
   # which is exactly how it was being swallowed before this fix.
   pipe_rc=$?
   elapsed=$(( $(date +%s) - start_ts ))
+  # The subshell is asleep inside `sleep`; killing only the subshell leaves
+  # that `sleep` orphaned (ppid 1, cwd = this worktree) for the whole
+  # DEADLINE, which blocked `git worktree remove` seven times on 2026-09-10.
+  pkill -P "${watchdog}" 2>/dev/null || true
   kill "${watchdog}" 2>/dev/null || true
   wait "${watchdog}" 2>/dev/null || true
   docker rm -f "${name}" >/dev/null 2>&1 || true
