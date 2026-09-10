@@ -2128,7 +2128,7 @@ defined exactly once).
 | `bit_rt_fs_rename`    | `(oldPath: *const RtBytes, newPath: *const RtBytes) -> i64` (§14) |
 | `bit_rt_fs_chmod`     | `(path: *const RtBytes, mode: i64) -> i64` (§14, sets `path`'s permission bits to `mode`; `0`, or `-1` on any error. Darwin calls libc `chmod`, Linux the raw `chmod`/`fchmodat(AT_FDCWD, ...)` syscall. Windows maps ONLY the POSIX owner-write bit (`mode & 0o200`) to `FILE_ATTRIBUTE_READONLY` — see that provider's header scope note, `runtime/root/windows/fs.bit:85`) |
 | `bit_rt_fs_list_dir`  | `(path: *const RtBytes) -> *const RtBytes` (§14)        |
-| `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not NUL-terminated, not `RtBytes`; the FIRST entry point shaped this way (#2152) and now the family's convention — seven `bit_rt_fs_*_w` symbols share it, five carrying a path (this, `bit_rt_fs_open_rw_w`, `bit_rt_fs_stat_w`, `bit_rt_fs_lstat_w`, `bit_rt_fs_sync_dir_w`) and two a data buffer (`bit_rt_fs_pread_w`/`bit_rt_fs_pwrite_w`)) |
+| `bit_rt_fs_is_symlink_w` | `(words: usize, n: i64) -> bool` (§14, `words` is a `[]byte`'s backing, packed one byte per element (§2, #3121/#3226) — not NUL-terminated, not `RtBytes`; the FIRST entry point shaped this way (#2152) and now the family's convention — eight `bit_rt_fs_*_w` symbols share it, six carrying a path (this, `bit_rt_fs_open_rw_w`, `bit_rt_fs_open_nofollow_w`, `bit_rt_fs_stat_w`, `bit_rt_fs_lstat_w`, `bit_rt_fs_sync_dir_w`) and two a data buffer (`bit_rt_fs_pread_w`/`bit_rt_fs_pwrite_w`)) |
 | `bit_rt_fs_sync`      | `(fd: i64) -> i64` (§14, `0` on success, `-1` on failure; Darwin uses `F_FULLFSYNC`, falling back to bare `fsync` only on `ENOTSUP` — bare `fsync` alone does not flush the drive's write cache on that platform) |
 | `bit_rt_fs_truncate`  | `(fd: i64, size: i64) -> i64` (§14, #4016, sets `fd`'s length; `0`, or negative on any failure. Never moves the fd's own cursor, matching `bit_rt_fs_pread_w`/`bit_rt_fs_pwrite_w`; growing leaves a HOLE rather than reserving blocks, so a later write can still fail `ENOSPC`, and the new length is not durable until `bit_rt_fs_sync`) |
 | `bit_rt_fs_size`      | `(fd: i64) -> i64` (§14, #4016, `fd`'s length in bytes, or negative on any failure; `fstat` on Darwin/Linux, `GetFileSizeEx` on Windows) |
@@ -2139,6 +2139,7 @@ defined exactly once).
 | `bit_rt_fs_open_rw_w` | `(words: usize, n: i64) -> i64` (§14, #3533, read-write open: same packed-bytes `words`/`n` convention as `bit_rt_fs_is_symlink_w`; `O_RDWR\|O_CREAT`, deliberately WITHOUT `O_TRUNC` -- creates `path` if absent, never destroys existing content on open; fd, or -1. Darwin/Linux only -- windows deferred, see runtime/root/{darwin,linux}/fsopenrw.bit and fs.bit) |
 | `bit_rt_fs_stat_w`    | `(words: usize, n: i64, out: usize) -> i64` (§14, #2153, same packed-bytes `words`/`n` path convention as `bit_rt_fs_is_symlink_w`; fills the caller-owned 5-word `out` buffer in fixed order — `size`, `mtime`, `mode`, `isDir`, `isSymlink` — FOLLOWING a trailing symlink, so `isSymlink` is always 0 here. Not the flat `-1` of the primitives above: 0 on success, `-errno` on failure) |
 | `bit_rt_fs_lstat_w`   | `(words: usize, n: i64, out: usize) -> i64` (§14, #2153, identical to `bit_rt_fs_stat_w` except it does NOT follow a trailing symlink, so `out`'s `isSymlink` word reports whether `words` itself is a link; same 0/`-errno` return) |
+| `bit_rt_fs_open_nofollow_w` | `(words: usize, n: i64) -> i64` (§14, #4720, read-only open that REFUSES a symlinked final path component instead of following it: same packed-bytes `words`/`n` convention as `bit_rt_fs_is_symlink_w`; `O_RDONLY|O_NOFOLLOW` on darwin/linux, `CreateFileW` with `FILE_FLAG_OPEN_REPARSE_POINT` plus a `GetFileInformationByHandle` reparse-point refusal on windows; a directory is refused too; fd/handle, or -1) |
 | `bit_rt_fs_sync_dir_w` | `(words: usize, n: i64) -> i64` (§14, #4017, fsyncs the DIRECTORY named by the packed-bytes `words`/`n` path — the durability half `bit_rt_fs_sync` on a file does not cover; `0`, or `-1`; windows always reports 0) |
 | `bit_rt_fs_cwd`       | `() -> *const RtBytes` (§14, the process's current working directory, or the empty string on any failure; #3501) |
 | `bit_rt_test_index`   | `() -> i64` (§16)                                      |
@@ -2538,6 +2539,7 @@ bit_rt_fs_write(fd, s)            -> i64        // bytes written, or -1
 bit_rt_fs_pread_w(fd, buf, max, off) -> i64     // positional read; count, or negative (#3463)
 bit_rt_fs_pwrite_w(fd, buf, n, off)  -> i64     // positional write; count, or negative (#3463)
 bit_rt_fs_open_rw_w(words, n)     -> i64        // O_RDWR|O_CREAT, no O_TRUNC; fd, or -1 (#3533)
+bit_rt_fs_open_nofollow_w(words, n) -> i64      // read-only, refuses a symlinked final component; fd, or -1 (#4720)
 bit_rt_fs_sync(fd)                -> i64        // 0, or -1 (#3462)
 bit_rt_fs_truncate(fd, size: i64) -> i64        // set fd's length; 0, or -1 (#4016)
 bit_rt_fs_size(fd)                -> i64        // fd's length in bytes, or -1 (#4016)
@@ -2724,6 +2726,35 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   no consumer. Pass 2 (`File.lock()`/`tryLock()`/`lockShared()`/
   `tryLockShared()`/`unlock()` in `stdlib/fs/fs.bit`, #4296) is a follow-up
   ticket, gated on a release containing this commit and a stage0 repin to it.
+- `fs_open_nofollow_w` (#4720) opens the `n` path bytes at `words` read-only
+  and REFUSES the open when the FINAL path component is a symlink, instead of
+  following it. It exists because no composition of the existing primitives
+  can do this: `fs_is_symlink_w` answers about a PATH, so a caller that probes
+  first and calls `fs_open` second loses to whoever can replace that name in
+  between, which is exactly the window #4554's owner ruling ("O_NOFOLLOW on
+  the final open plus fstat") closes. Packed-bytes `(words, n)`, like
+  `fs_open_rw_w`/`fs_is_symlink_w`/`fs_stat_w`/`fs_lstat_w` above, for the
+  same §11.7 reason. Only the FINAL component is protected: an intermediate
+  directory component that is a symlink is still traversed, exactly as
+  `open(2)`'s own `O_NOFOLLOW` specifies. A DIRECTORY is refused on all three
+  platforms, matching `fs_open`'s #2149 guard — `O_RDONLY` on a directory
+  succeeds on darwin and linux and would hand back a `File` no read can fill.
+  Darwin and Linux pass `O_NOFOLLOW` (0x100 and 0o400000 respectively) on the
+  read-only open and let the kernel fail it with `ELOOP`. **Windows inverts
+  the shape and REFUSES a reparse point rather than following it**: it has no
+  `O_NOFOLLOW`, so `CreateFileW` is given `FILE_FLAG_OPEN_REPARSE_POINT`,
+  which SUCCEEDS on the link itself, and the provider then reads
+  `GetFileInformationByHandle`'s `dwFileAttributes` on the handle it just
+  opened and returns -1 when `FILE_ATTRIBUTE_REPARSE_POINT` is set, closing
+  the handle. Asking the HANDLE rather than the path is what makes that a
+  refusal rather than a second check-then-open race. A successful open of a
+  reparse point is not this primitive's contract on any platform. The return
+  is a flat fd/handle or -1 — a malformed path, a directory, a symlink and an
+  ordinary open failure are indistinguishable to the caller. **No `stdlib/`
+  caller exists yet**: this landing is pass 1 of 2 (the #3065 pattern), the
+  runtime primitive only, for the same `tools/build` bootstrap cycle the
+  `fs_sync_dir_w` bullet below describes — pass 2 is #4554's `std/fs` half,
+  gated on a stage0 repin past this commit.
 - `fs_sync_dir_w` (#4017) fsyncs the DIRECTORY named by the `n` path bytes at
   `words`, not a file inside it — durability for the directory ENTRY a
   newly created file needs, not for that file's contents. `fs_sync`ing a
