@@ -21,9 +21,11 @@
 // shape rather than by code.
 
 import { serve, get, respond, Server, Exchange, Request, Response } from "std/http"
-import { readFile, writeFile, mkdir, remove, exists, isDir, isSymlink } from "std/fs"
+import { readFile, writeFile, mkdir, remove, isDir, isSymlink } from "std/fs"
+import { envOr } from "std/os"
 import { hasSuffix, contains, indexOf } from "std/strings"
 import { safePath } from "std/path"
+import { monotonic } from "std/time"
 
 // How many requests the demo serves before shutting down. A real deployment
 // calls the accept loop forever; an example must terminate, and the examples
@@ -39,11 +41,56 @@ class Site { root: string }
 // --- #2397 regression fixture -----------------------------------------------
 //
 // A directory OUTSIDE `Site.root`, holding one file the server must never
-// serve, and a symbolic link INSIDE `Site.root` pointing at it. Fixed paths
-// alongside `Site.root`'s own, for the same reason: this is a regression
-// test for one specific escape, not a general-purpose fixture.
-const escapeOutsideDir = "/tmp/bit-staticserver-outside"
+// serve, and a symbolic link INSIDE `Site.root` pointing at it. Its path is
+// claimed per process alongside `Site.root`'s (see `claimScratch`), and the
+// two stay SIBLINGS: the link has to leave the root for #2397 to be tested at
+// all.
 const escapeMarker = "OUTSIDE THE SITE ROOT\n"
+
+// The two scratch directories one run of this example owns.
+class Paths { root: string, outside: string }
+
+// How many names `claimScratch` tries before giving up. A bound, so the loop
+// is provably finite when `$TMPDIR` is the problem rather than the name.
+const scratchAttempts = 16
+
+// Claims a `Site.root` no other process is using, and names its sibling for
+// the fixture above. Both carry a nanosecond stamp: these paths were once
+// fixed names directly under `/tmp`, which is what a regression fixture
+// wants right up until two processes run the example at the same moment -
+// `./make test-prepush` runs the `test-examples` gate beside
+// `scripts/selfhost-diffexamples.sh`, and the second one to arrive printed
+// `mkdir ...: cannot create directory`, which the examples differential reads
+// as a miscompile (#4792). A fixed NAME was the point; a shared LOCATION
+// never was.
+//
+// `mkdir` IS the claim, not a check before one: it fails when the name exists,
+// so a stamp two processes happened to share costs one more clock reading
+// instead of a shared directory. `root` exists on return, and an empty
+// `Paths.root` means every attempt failed.
+fn claimScratch(): Paths {
+  let tmp = envOr("TMPDIR", "/tmp")
+  if (hasSuffix(tmp, "/")) {
+    tmp = tmp[0:len(tmp) - 1]
+  }
+  let i = 0
+  while (i < scratchAttempts) {
+    let stamp = monotonic().ns
+    let p = Paths{
+      root: "${tmp}/bit-staticserver-${stamp}",
+      outside: "${tmp}/bit-staticserver-outside-${stamp}",
+    }
+    let taken = false
+    mkdir(p.root) catch _ {
+      taken = true
+    }
+    if (!taken) {
+      return p
+    }
+    i = i + 1
+  }
+  return Paths{ root: "", outside: "" }
+}
 
 // --- the actual server ------------------------------------------------------
 
@@ -215,20 +262,31 @@ fn serveFiles(s: Server, site: Site, n: int, ready: chan<int>) {
 // examples harness, not just print. Returning normally would exit 0 and a broken
 // traversal guard would pass CI silently.
 fn main(): int {
-  let site = Site{ root: "/tmp/bit-staticserver-demo" }
+  let paths = claimScratch()
+  if (len(paths.root) == 0) {
+    print("setup: could not claim a scratch directory\n")
+    return 1
+  }
+  let site = Site{ root: paths.root }
   setupSite(site)
-  if (!makeEscapeLink(site.root)) {
+  if (!makeEscapeLink(paths)) {
     print("setup: could not create the #2397 symlink fixture\n")
     cleanupSite(site)
     return 1
   }
 
+  // Every early return from here on tears the fixtures down: the paths are
+  // unique per run, so anything left behind is left behind forever.
   let s = serve("127.0.0.1", 0) catch e {
     print("serve: ${e.message()}\n")
+    cleanupEscapeLink(paths)
+    cleanupSite(site)
     return 1
   }
   let port = s.port() catch e {
     print("port: ${e.message()}\n")
+    cleanupEscapeLink(paths)
+    cleanupSite(site)
     return 1
   }
 
@@ -257,7 +315,7 @@ fn main(): int {
   // guard rather than the request-string half.
   failures = failures + expectBlocked(base, "/escape/secret.txt")
 
-  cleanupEscapeLink(site.root)
+  cleanupEscapeLink(paths)
   cleanupSite(site)
 
   if (failures > 0) {
@@ -316,11 +374,10 @@ fn expectBlocked(base: string, path: string): int {
 }
 
 // A tiny site on disk: a home page, a stylesheet, and a subdirectory with its own
-// index, which is what exercises the directory-to-index rule.
+// index, which is what exercises the directory-to-index rule. `site.root`
+// itself already exists - `claimScratch` created it, because creating it is
+// how the name was claimed.
 fn setupSite(site: Site) {
-  mkdir(site.root) catch e {
-    print("setup: mkdir ${site.root}: ${e.message()}\n")
-  }
   mkdir("${site.root}/docs") catch e {
     print("setup: mkdir docs: ${e.message()}\n")
   }
@@ -340,19 +397,15 @@ fn setupSite(site: Site) {
 // `symlink` (and a link cannot be committed to the repo as a plain file), so
 // - exactly as `_tests_/cases/fs_walk_symlink.bit` does for the same reason -
 // the link comes from a shell script run with `osRun`.
-fn makeEscapeLink(root: string): bool {
-  if (!exists(escapeOutsideDir)) {
-    mkdir(escapeOutsideDir) catch _ {
-      return false
-    }
-  }
-  writeFile("${escapeOutsideDir}/secret.txt", escapeMarker) catch _ {
+fn makeEscapeLink(paths: Paths): bool {
+  mkdir(paths.outside) catch _ {
     return false
   }
-  let script = "${escapeOutsideDir}/link.sh"
-  // `-f`: idempotent against a symlink left by a prior run that crashed
-  // before `cleanupEscapeLink` ran, same as `site.root`'s own fixed path.
-  let body = "#!/bin/sh\nln -sf '${escapeOutsideDir}' '${root}/escape' || exit 1\n"
+  writeFile("${paths.outside}/secret.txt", escapeMarker) catch _ {
+    return false
+  }
+  let script = "${paths.outside}/link.sh"
+  let body = "#!/bin/sh\nln -s '${paths.outside}' '${paths.root}/escape' || exit 1\n"
   writeFile(script, body) catch _ {
     return false
   }
@@ -375,12 +428,12 @@ fn cleanupSite(site: Site) {
 
 // Tears down the #2397 fixture. `rm` on `escape` unlinks the LINK, never the
 // directory behind it (the same contract `std/fs.remove` gives `fs.walk`'s
-// own symlink test), so `escapeOutsideDir` survives to be removed on its own.
-fn cleanupEscapeLink(root: string) {
-  rm("${root}/escape")
-  rm("${escapeOutsideDir}/link.sh")
-  rm("${escapeOutsideDir}/secret.txt")
-  rm(escapeOutsideDir)
+// own symlink test), so `paths.outside` survives to be removed on its own.
+fn cleanupEscapeLink(paths: Paths) {
+  rm("${paths.root}/escape")
+  rm("${paths.outside}/link.sh")
+  rm("${paths.outside}/secret.txt")
+  rm(paths.outside)
 }
 
 fn rm(path: string) {
