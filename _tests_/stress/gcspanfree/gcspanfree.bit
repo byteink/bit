@@ -58,7 +58,7 @@
 //       left nothing on them that was gone.
 
 import { spinUnlocked } from "../../../runtime"
-import { heapInit, heapWords, heapMappedBytes, allocSpanBytes } from "../../../runtime/alloc"
+import { heapInit, heapWords, heapMappedBytes } from "../../../runtime/alloc"
 import {
   gcInit, gcConfigure, gcBindMemory, gcAlloc, gcCollectRoots, gcOwns,
   gcLiveBytes, gcDeinit, gcWords, gcSpanViolations,
@@ -79,6 +79,90 @@ const OBJS: int = 20000
 // forces the retained anchor to run dry and the class to map again.
 const REUSE: int = 4000
 
+// The object descriptor: a 128-byte leaf body, so this is pure allocator traffic
+// on the small/span path. `meta` stays a local of `main` — only its contents are
+// written here.
+fn fillMeta(meta: []i64) {
+  meta[0] = 128 // body size: a small-path object, well under allocMaxSmall
+  meta[1] = 0   // no pointer fields: a leaf, so this is pure allocator traffic
+  meta[2] = 0
+  meta[3] = 0
+  meta[4] = 0
+  meta[5] = 0
+  meta[6] = 0
+}
+
+// The burst, held live SIMULTANEOUSLY. That is the whole point and it is easy
+// to get wrong: allocating and dropping one object at a time keeps the
+// concurrent live set at one, the free list serves every request, one span
+// suffices and nothing is ever reclaimable (recorded on #2325 as a measurement
+// that produced a confident wrong answer). `roots` is main's local; only its
+// header travels here, so the backing store stays rooted in main's frame.
+fn fillBurst(g: *i64, metaAddr: int, roots: []i64): int {
+  let allocOk = 1
+  let i = 0
+  while (i < OBJS) { // bounded: OBJS iterations
+    let p = gcAlloc(g, metaAddr)
+    if (p == 0) {
+      allocOk = 0
+    }
+    roots[i] = p
+    i = i + 1
+  }
+  return allocOk
+}
+
+// Drop every reference. After the sweep that follows, every span the burst
+// filled is entirely free, which is exactly the state the LSP's heap reaches
+// thousands of times over and could never act on.
+fn dropBurst(roots: []i64) {
+  let d = 0
+  while (d < OBJS) { // bounded: OBJS iterations
+    roots[d] = 0
+    d = d + 1
+  }
+}
+
+// (c) the heap still serves the same class after the reclaim, and every address
+// it hands back is one it owns.
+fn reuseClass(g: *i64, metaAddr: int, roots: []i64): int {
+  let serves = 1
+  let r = 0
+  while (r < REUSE) { // bounded: REUSE iterations
+    let p = gcAlloc(g, metaAddr)
+    if (p == 0 || !gcOwns(g, p)) {
+      serves = 0
+    }
+    roots[r] = p
+    r = r + 1
+  }
+  return serves
+}
+
+// ...and still owns them after the collection that follows the reuse.
+fn ownsReused(g: *i64, roots: []i64): int {
+  let ownsAll = 1
+  let q = 0
+  while (q < REUSE) { // bounded: REUSE iterations
+    if (roots[q] == 0 || !gcOwns(g, roots[q])) {
+      ownsAll = 0
+    }
+    q = q + 1
+  }
+  return ownsAll
+}
+
+// (b) at least 80% of the mapped bytes the burst added must go back, and the
+// burst must have added some in the first place.
+fn returnedEnough(baseMapped: int, peakMapped: int, quietMapped: int): int {
+  let rise = peakMapped - baseMapped
+  let drop = peakMapped - quietMapped
+  if (rise > 0 && drop * 100 >= rise * 80) {
+    return 1
+  }
+  return 0
+}
+
 fn main() {
   let arena = []i64(ARENA_WORDS)
   let indexArena = []i64(INDEX_WORDS)
@@ -90,13 +174,7 @@ fn main() {
   let roots = []i64(OBJS)
 
   let metaAddr = int(ptrOf(meta))
-  meta[0] = 128 // body size: a small-path object, well under allocMaxSmall
-  meta[1] = 0   // no pointer fields: a leaf, so this is pure allocator traffic
-  meta[2] = 0
-  meta[3] = 0
-  meta[4] = 0
-  meta[5] = 0
-  meta[6] = 0
+  fillMeta(meta)
 
   let hp = ptrOf(heapBlock)
   heapInit(hp)
@@ -117,21 +195,7 @@ fn main() {
 
   let baseMapped = heapMappedBytes(hp)
 
-  // The burst, held live SIMULTANEOUSLY. That is the whole point and it is easy
-  // to get wrong: allocating and dropping one object at a time keeps the
-  // concurrent live set at one, the free list serves every request, one span
-  // suffices and nothing is ever reclaimable (recorded on #2325 as a measurement
-  // that produced a confident wrong answer).
-  let allocOk = 1
-  let i = 0
-  while (i < OBJS) { // bounded: OBJS iterations
-    let p = gcAlloc(g, metaAddr)
-    if (p == 0) {
-      allocOk = 0
-    }
-    roots[i] = p
-    i = i + 1
-  }
+  let allocOk = fillBurst(g, metaAddr, roots)
   gcCollectRoots(g, rootsAddr, OBJS) // every root live: nothing is swept
   let peakMapped = heapMappedBytes(hp)
   let grew = 0
@@ -139,44 +203,15 @@ fn main() {
     grew = 1
   }
 
-  // Drop every reference and sweep. Now every span the burst filled is entirely
-  // free, which is exactly the state the LSP's heap reaches thousands of times
-  // over and could never act on.
-  let d = 0
-  while (d < OBJS) { // bounded: OBJS iterations
-    roots[d] = 0
-    d = d + 1
-  }
+  // Drop every reference and sweep.
+  dropBurst(roots)
   gcCollectRoots(g, rootsAddr, OBJS)
   let quietMapped = heapMappedBytes(hp)
+  let returned = returnedEnough(baseMapped, peakMapped, quietMapped)
 
-  let rise = peakMapped - baseMapped
-  let drop = peakMapped - quietMapped
-  let returned = 0
-  if (rise > 0 && drop * 100 >= rise * 80) {
-    returned = 1
-  }
-
-  // (c) the heap still serves the same class, and every address is one it owns.
-  let serves = 1
-  let r = 0
-  while (r < REUSE) { // bounded: REUSE iterations
-    let p = gcAlloc(g, metaAddr)
-    if (p == 0 || !gcOwns(g, p)) {
-      serves = 0
-    }
-    roots[r] = p
-    r = r + 1
-  }
+  let serves = reuseClass(g, metaAddr, roots)
   gcCollectRoots(g, rootsAddr, OBJS)
-  let ownsAll = 1
-  let q = 0
-  while (q < REUSE) { // bounded: REUSE iterations
-    if (roots[q] == 0 || !gcOwns(g, roots[q])) {
-      ownsAll = 0
-    }
-    q = q + 1
-  }
+  let ownsAll = ownsReused(g, roots)
 
   // Read BEFORE `gcDeinit`: teardown frees every object, and a heap with no
   // spans left has nowhere to keep the count.
