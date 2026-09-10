@@ -92,161 +92,201 @@ fn isPow2(n: int): bool {
 // mapped.
 const SPAN_MAP_BYTES = 262144 // allocSpanBytes * 2
 
-fn spanTake(mapFn: (int) => int, spans: []i64, count: []i64): int {
-  if (count[0] >= MAX_SPANS) {
+// The heap under test and everything the composed entry points below need to
+// reach it: the heap words, its lock, the page provider, the page size and the
+// span bookkeeping. ONE VALUE RATHER THAN THE EIGHT PARAMETERS `heapAlloc` grew
+// to (#4249). It holds only the raw `h`/`lk` and the two bookkeeping slices;
+// `hbuf`/`lbuf` themselves stay locals of `pageProps` for the whole run, which
+// is what keeps those raw pointers backed.
+class PageHeap {
+  h: *i64,
+  lk: *i32,
+  mapFn: (int) => int,
+  ps: int,
+  spans: []i64,
+  count: []i64,
+}
+
+// P1..P3's verdict plus the result of the two probe unmaps they owe, which is
+// P6's to fold in.
+class PagePhase {
+  mask: int,
+  probeOk: bool,
+}
+
+// One live allocation per slot: its address, the size it was asked for and the
+// sentinel written into its first word.
+class Ring {
+  addr: []i64,
+  size: []i64,
+  tag: []i64,
+}
+
+class SlotCheck {
+  intact: int,
+  checked: int,
+}
+
+class ChurnResult {
+  ok: int,
+  intact: int,
+  checked: int,
+}
+
+fn spanTake(hp: PageHeap): int {
+  if (hp.count[0] >= MAX_SPANS) {
     return 0
   }
-  let raw = mapFn(SPAN_MAP_BYTES)
+  let raw = hp.mapFn(SPAN_MAP_BYTES)
   if (raw == 0) {
     return 0
   }
-  spans[count[0]] = raw
-  count[0] = count[0] + 1
+  hp.spans[hp.count[0]] = raw
+  hp.count[0] = hp.count[0] + 1
   return allocAlignUp(raw, allocSpanBytes)
 }
 
 // The composed allocator entry point over real kernel pages. The lock is held
 // across the whole operation including the page map, exactly as the deleted
 // native runtime held it across its refill mmap.
-fn heapAlloc(
-  h: *i64, lk: *i32, mapFn: (int) => int, ps: int,
-  spans: []i64, count: []i64, size: int, alignment: int,
-): int {
-  spinAcquire(lk)
+fn heapAlloc(hp: PageHeap, size: int, alignment: int): int {
+  spinAcquire(hp.lk)
   let addr = 0
   let idx = allocClassify(size, alignment)
   if (idx < 0) {
-    let m = mapFn(allocLargeLen(size, ps))
+    let m = hp.mapFn(allocLargeLen(size, hp.ps))
     if (m != 0) {
-      heapLargeAllocLocked(h, size, allocLargeLen(size, ps))
+      heapLargeAllocLocked(hp.h, size, allocLargeLen(size, hp.ps))
       addr = m
     }
   } else {
-    addr = heapTakeSmallLocked(h, idx, size)
+    addr = heapTakeSmallLocked(hp.h, idx, size)
     if (addr == 0) {
-      let span = spanTake(mapFn, spans, count)
+      let span = spanTake(hp)
       if (span != 0) {
         // `owned` is false: these spans come from real kernel pages this file
         // mapped and still owns, and nothing here releases one, so telling the
         // allocator it may unmap them would be a lie (#2375).
-        heapRefillLocked(h, idx, span, false)
-        addr = heapTakeSmallLocked(h, idx, size)
+        heapRefillLocked(hp.h, idx, span, false)
+        addr = heapTakeSmallLocked(hp.h, idx, size)
       }
     }
   }
-  spinRelease(lk)
+  spinRelease(hp.lk)
   return addr
 }
 
-fn heapFree(h: *i64, lk: *i32, ps: int, addr: int, size: int, alignment: int) {
-  spinAcquire(lk)
+fn heapFree(hp: PageHeap, addr: int, size: int, alignment: int) {
+  spinAcquire(hp.lk)
   let idx = allocClassify(size, alignment)
   if (idx < 0) {
-    heapLargeFreeLocked(h, size, allocLargeLen(size, ps))
+    heapLargeFreeLocked(hp.h, size, allocLargeLen(size, hp.ps))
   } else {
-    let reclaim = heapGiveSmallLocked(h, addr, idx, size)
+    // The result is a REQUEST FOR A RECLAIM PASS, and it cannot fire here:
+    // `heapGiveSmallLocked` counts an emptied span only when it is `owned`, and
+    // every span `heapAlloc` refills above is `owned: false`, so the answer is
+    // always 0. Discarded deliberately rather than checked, because a check
+    // would assert the allocator's hysteresis, which `../alloc.bit` owns.
+    let _ = heapGiveSmallLocked(hp.h, addr, idx, size)
   }
-  spinRelease(lk)
+  spinRelease(hp.lk)
 }
 
-// Runs every property against the supplied page provider; returns the number
-// that passed as a bitmask (compare against `pageTotal()`).
-export fn pageProps(
-  mapFn: (int) => int, unmapFn: (int, int) => bool,
-  pagesize: () => int,
-): int {
-  let mask = 0
+// ---- P2: a mapping is real, aligned and writable ----------------------------
+// Leaves `off + 12345` in every 4096th word, and P3 reads the first one back.
+fn spanWritable(one: int, ps: int): bool {
+  if (one == 0 || one % ps != 0) {
+    return false
+  }
+  // Touch every 4096th byte across the span and read it back.
+  let off = 0
+  while (off < allocSpanBytes) { // bounded: allocSpanBytes/4096 steps
+    let w = wordAt(one + off)
+    *w = off + 12345
+    off = off + 4096
+  }
+  let ok = true
+  off = 0
+  while (off < allocSpanBytes) { // bounded: allocSpanBytes/4096 steps
+    let w = wordAt(one + off)
+    let got = *w
+    if (got != off + 12345) {
+      ok = false
+    }
+    off = off + 4096
+  }
+  return ok
+}
 
-  // ---- P1: page size ------------------------------------------------------
-  let ps = pagesize()
+// ---- P3: two mappings are disjoint ------------------------------------------
+fn spansDisjoint(one: int, two: int): bool {
+  if (two == 0 || one == 0) {
+    return false
+  }
+  let disjoint = two + allocSpanBytes <= one || one + allocSpanBytes <= two
+  // The first span's pattern must survive mapping and writing the second.
+  let w2 = wordAt(two)
+  *w2 = 999
+  let w1 = wordAt(one)
+  let still = *w1
+  return disjoint && still == 12345
+}
+
+// ---- P1+P2+P3: the pages themselves, before any allocator runs ---------------
+fn mappingProps(
+  mapFn: (int) => int, unmapFn: (int, int) => bool, ps: int,
+): PagePhase {
+  let mask = 0
+  // ---- P1: page size --------------------------------------------------------
   if (ps >= 4096 && isPow2(ps)) {
     mask = mask | 1
   }
-
-  // ---- P2: a mapping is real, aligned and writable -------------------------
   let one = mapFn(allocSpanBytes)
-  let p2 = 0
-  if (one != 0 && one % ps == 0) {
-    // Touch every 4096th byte across the span and read it back.
-    let ok = 1
-    let off = 0
-    while (off < allocSpanBytes) { // bounded: allocSpanBytes/4096 steps
-      let w = wordAt(one + off)
-      *w = off + 12345
-      off = off + 4096
-    }
-    off = 0
-    while (off < allocSpanBytes) {
-      let w = wordAt(one + off)
-      let got = *w
-      if (got != off + 12345) {
-        ok = 0
-      }
-      off = off + 4096
-    }
-    p2 = ok
-  }
-  if (p2 == 1) {
+  if (spanWritable(one, ps)) {
     mask = mask | 2
   }
-
-  // ---- P3: two mappings are disjoint --------------------------------------
   let two = mapFn(allocSpanBytes)
-  let p3 = 0
-  if (two != 0 && one != 0) {
-    let disjoint = 0
-    if (two + allocSpanBytes <= one || one + allocSpanBytes <= two) {
-      disjoint = 1
-    }
-    // The first span's pattern must survive mapping and writing the second.
-    let w2 = wordAt(two)
-    *w2 = 999
-    let w1 = wordAt(one)
-    let still = *w1
-    if (disjoint == 1 && still == 12345) {
-      p3 = 1
-    }
-  }
-  if (p3 == 1) {
+  if (spansDisjoint(one, two)) {
     mask = mask | 4
   }
-  let probeOk = unmapFn(one, allocSpanBytes) && unmapFn(two, allocSpanBytes)
+  return PagePhase{
+    mask: mask,
+    probeOk: unmapFn(one, allocSpanBytes) && unmapFn(two, allocSpanBytes),
+  }
+}
 
-  // ---- P4/P5: the real allocator over real pages ---------------------------
-  let hbuf = []i64(heapWords)
-  let h = ptrOf(hbuf)
-  let lbuf = []i32(1)
-  let lk = ptrOf(lbuf)
-  atomicStore(lk, spinUnlocked)
-  heapInit(h)
+// The check-and-free the churn loop and the survivor drain share verbatim: a
+// live slot's sentinel must still be intact when it goes back.
+fn drainSlot(hp: PageHeap, r: Ring, slot: int): SlotCheck {
+  let old = r.addr[slot]
+  if (old == 0) {
+    return SlotCheck{ intact: 0, checked: 0 }
+  }
+  let w = wordAt(old)
+  let seen = *w
+  let intact = 0
+  if (seen == r.tag[slot]) {
+    intact = 1
+  }
+  heapFree(hp, old, r.size[slot], 8)
+  r.addr[slot] = 0
+  return SlotCheck{ intact: intact, checked: 1 }
+}
 
-  let spans = []i64(MAX_SPANS)
-  let count = []i64(1)
-  count[0] = 0
-
-  let ringAddr = []i64(RING)
-  let ringSize = []i64(RING)
-  let ringTag = []i64(RING)
+// ---- P4: allocate/write/verify/free against kernel pages ---------------------
+fn churnProps(hp: PageHeap): ChurnResult {
+  let r = Ring{ addr: []i64(RING), size: []i64(RING), tag: []i64(RING) }
   let intact = 0
   let checked = 0
   let churnOk = 1
-
   let n = 0
   while (n < CHURN) { // bounded: CHURN iterations
     let slot = n % RING
-    let old = ringAddr[slot]
-    if (old != 0) {
-      let w = wordAt(old)
-      let seen = *w
-      checked = checked + 1
-      if (seen == ringTag[slot]) {
-        intact = intact + 1
-      }
-      heapFree(h, lk, ps, old, ringSize[slot], 8)
-      ringAddr[slot] = 0
-    }
+    let c = drainSlot(hp, r, slot)
+    intact = intact + c.intact
+    checked = checked + c.checked
     let sz = 1 + n * 37 % 1500
-    let addr = heapAlloc(h, lk, mapFn, ps, spans, count, sz, 8)
+    let addr = heapAlloc(hp, sz, 8)
     if (addr == 0) {
       churnOk = 0 // exhausted: never deref
     } else {
@@ -256,50 +296,79 @@ export fn pageProps(
       let tag = n * 2654435761 + 7
       let w2 = wordAt(addr)
       *w2 = tag
-      ringAddr[slot] = addr
-      ringSize[slot] = sz
-      ringTag[slot] = tag
+      r.addr[slot] = addr
+      r.size[slot] = sz
+      r.tag[slot] = tag
     }
     n = n + 1
   }
+  // Drain survivors.
   let d = 0
   while (d < RING) { // bounded: RING iterations
-    let old = ringAddr[d]
-    if (old != 0) {
-      let w = wordAt(old)
-      let seen = *w
-      checked = checked + 1
-      if (seen == ringTag[d]) {
-        intact = intact + 1
-      }
-      heapFree(h, lk, ps, old, ringSize[d], 8)
-      ringAddr[d] = 0
-    }
+    let c = drainSlot(hp, r, d)
+    intact = intact + c.intact
+    checked = checked + c.checked
     d = d + 1
   }
+  return ChurnResult{ ok: churnOk, intact: intact, checked: checked }
+}
 
-  if (churnOk == 1 && checked == CHURN && intact == CHURN) {
-    mask = mask | 8
-  }
-  if (heapLiveBytes(h) == 0 && heapMappedBytes(h) == count[0] * allocSpanBytes) {
-    mask = mask | 16
-  }
-
-  // ---- P6: every span goes back, and a null request is refused -------------
-  let unmapOk = 1
+// ---- P6: every span goes back, and a null request is refused -----------------
+fn spansReturned(hp: PageHeap, unmapFn: (int, int) => bool): bool {
+  let ok = true
   let u = 0
-  while (u < count[0]) { // bounded: MAX_SPANS iterations
-    if (!unmapFn(spans[u], SPAN_MAP_BYTES)) {
-      unmapOk = 0
+  while (u < hp.count[0]) { // bounded: MAX_SPANS iterations
+    if (!unmapFn(hp.spans[u], SPAN_MAP_BYTES)) {
+      ok = false
     }
     u = u + 1
   }
   if (unmapFn(0, allocSpanBytes)) {
-    unmapOk = 0
-  } // null must be refused
-  if (unmapOk == 1 && probeOk) {
+    ok = false // null must be refused
+  }
+  return ok
+}
+
+// ---- P4/P5/P6: the real allocator over real pages ----------------------------
+fn heapProps(hp: PageHeap, unmapFn: (int, int) => bool, probeOk: bool): int {
+  let mask = 0
+  let churn = churnProps(hp)
+  if (churn.ok == 1 && churn.checked == CHURN && churn.intact == CHURN) {
+    mask = mask | 8
+  }
+  if (heapLiveBytes(hp.h) == 0 && heapMappedBytes(hp.h) == hp.count[0] * allocSpanBytes) {
+    mask = mask | 16
+  }
+  if (spansReturned(hp, unmapFn) && probeOk) {
     mask = mask | 32
   }
-
   return mask
+}
+
+// Runs every property against the supplied page provider; returns the number
+// that passed as a bitmask (compare against `pageTotal()`).
+export fn pageProps(
+  mapFn: (int) => int, unmapFn: (int, int) => bool,
+  pagesize: () => int,
+): int {
+  let ps = pagesize()
+  let phase = mappingProps(mapFn, unmapFn, ps)
+
+  // `hbuf` and `lbuf` are locals of THIS frame for the whole run: `hp.h` and
+  // `hp.lk` are raw pointers into them, and nothing else keeps them alive.
+  let hbuf = []i64(heapWords)
+  let lbuf = []i32(1)
+  let hp = PageHeap{
+    h: ptrOf(hbuf),
+    lk: ptrOf(lbuf),
+    mapFn: mapFn,
+    ps: ps,
+    spans: []i64(MAX_SPANS),
+    count: []i64(1),
+  }
+  atomicStore(hp.lk, spinUnlocked)
+  hp.count[0] = 0
+  heapInit(hp.h)
+
+  return phase.mask | heapProps(hp, unmapFn, phase.probeOk)
 }
