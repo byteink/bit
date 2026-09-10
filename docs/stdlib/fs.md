@@ -274,6 +274,19 @@ failure. Fails if `oldPath` does not exist.
 
 The names directly inside `path`, without `.` or `..`, in no guaranteed order.
 
+### `syncDir(path: string): ()!`
+
+Flushes `path`'s **directory entries** to stable storage. `File.sync()`
+persists a file's contents; this persists the fact that the file exists under
+its name. The two are separate on every POSIX filesystem: after writing a
+temporary file, syncing it, and renaming it into place, only `syncDir` on the
+containing directory makes the new name survive a power failure.
+
+A failed `syncDir` must not be retried, for the same reason `File.sync()` must
+not be — see that section.
+
+Fails if `path` is not a directory, naming it.
+
 ### `walk(root: string): []string!`
 
 Every file below `root`, recursively, as paths joined onto `root`. Directories

@@ -2753,12 +2753,11 @@ is NOT libc-free. Neither platform has a separate `fileSize` helper;
   file — a regular-file path opens and fsyncs successfully like any other
   fd, which is why that check belongs to the `stdlib/` caller (mirroring
   `readDir`'s own `is_dir` guard before it lists), not to this primitive.
-  **No `stdlib/` caller exists yet**, the same `tools/build/` bootstrap
-  cycle the `fs_truncate`/`fs_size` bullet above describes: this landing is
-  pass 1 of 2 (the #3065 pattern), the runtime primitives only, no consumer.
-  Pass 2 (a `syncDir(path)` function in `stdlib/fs/fs.bit`) is a follow-up
-  ticket, gated on a release containing this commit and a stage0 repin to
-  it.
+  The caller is `std/fs`'s `syncDir` (#4312, pass 2 of the #3065 pattern),
+  which landed once the 0.13.0 pin carried this symbol in its own
+  `libbitrt.a` — until then declaring the `extern` in `stdlib/fs/fs.bit`
+  broke `tools/build`'s cold bootstrap with E0078, the same cycle the
+  `fs_truncate`/`fs_size` bullet above describes.
 - `fs_cwd` (#3501) takes NO argument — nothing to encode through
   `fsPathZ`/`checkedPathW`. It shares that with `fs_read_all_failed` above,
   the family's only other zero-argument entry point. Darwin and Linux both
