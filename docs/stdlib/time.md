@@ -762,6 +762,19 @@ panic, so the empty week is rejected at construction instead. Repeated numbers
 are accepted and mean nothing extra, and an empty slice is a seven-day working
 week.
 
+### `weekendSatSun(): Weekend`
+
+Saturday and Sunday off.
+
+### `weekendFriSat(): Weekend`
+
+Friday and Saturday off.
+
+### `weekendOn(days: []int): Weekend!`
+
+The given day numbers off, `1` Monday through `7` Sunday. Fails on a number
+outside 1..7 and on a set covering all seven days.
+
 ### `Calendar`
 
 A `Weekend` plus a set of holiday `Date` values.
@@ -769,6 +782,10 @@ A `Weekend` plus a set of holiday `Date` values.
 | Function | Returns |
 |---|---|
 | `calendar(w: Weekend, holidays: []Date): Calendar` | a business calendar |
+
+### `calendar(w: Weekend, holidays: []Date): Calendar`
+
+A business calendar over `w` with the given holidays.
 
 Holidays are supplied by the caller. This module ships no holiday data for any
 country: public holidays are set by governments, change annually, and several in
