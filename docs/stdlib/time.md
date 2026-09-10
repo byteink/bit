@@ -641,10 +641,10 @@ fn inDay(t: Timestamp, dayStart: Timestamp, nextDayStart: Timestamp): bool {
 
 ## Comparison
 
-**`isLeapYear()` is shipped, on `Date`, `NaiveDateTime` and `DateTime`.**
-Everything else in this section — `isBefore`, `isAfter`, `isSame`,
-`isBetween`, `compare`, `isSameDay`, `isSameMonth`, `isSameYear`, `isWeekend`,
-`isWeekday`, `isPast` and `isFuture` — is not yet implemented.
+**Shipped**, on the types named in the tables below: `isLeapYear`, `isBefore`,
+`isAfter`, `isSame`, `isBetween`, `compare`, `isSameDay`, `isSameMonth`,
+`isSameYear`, `isPast` and `isFuture`. `isWeekend` and `isWeekday` are not yet
+implemented — they need a `Weekend`, see [Business days](#business-days).
 
 ### `Date.isLeapYear(): bool`
 
@@ -666,6 +666,10 @@ Forwards to `.date().isLeapYear()` via the wall clock.
 | `isSame(other)` | equal |
 | `isBetween(lo, hi)` | `lo <= this && this <= hi`, inclusive |
 | `compare(other)` | `-1`, `0` or `1`, for sorting |
+
+All five value types have them: `Date`, `Time`, `NaiveDateTime`, `DateTime` and
+`Timestamp`. None of them fails. A `lo` later than `hi` names an empty range, so
+`isBetween` is false for every receiver rather than failing.
 
 Comparison is only defined between two values of the **same type**. Comparing a
 `DateTime` in Dubai with a `DateTime` in London compares the two **instants**, not
@@ -703,7 +707,21 @@ receiver to the argument.
 | `differenceInNanoseconds` | `Timestamp` |
 
 Truncation means partial units are dropped, which is what an age calculation
-wants: someone born 2000-06-15 is 25 on 2026-06-14 and 26 on 2026-06-15.
+wants: someone born 2000-06-15 is 25 on 2026-06-14 and 26 on 2026-06-15. It
+applies in both directions — toward zero, never away from it — so
+`a.differenceInDays(b)` is always exactly `-b.differenceInDays(a)`.
+
+A month is complete when `addMonths` has reached it, so `differenceInMonths`
+inherits the clamp from [Month arithmetic clamps](#month-arithmetic-clamps)
+rather than adding a second end-of-month rule: 2026-01-31 to 2026-02-28 is
+**one** complete month, because 2026-01-31 plus one month is 2026-02-28.
+`differenceInYears` is that month count divided by 12, so the two can never
+disagree.
+
+On a `DateTime`, **date units read the wall clock and time units read the
+instant** — the same split the rest of the module already makes, where `addDays`
+moves the wall clock and `Timestamp.add` moves the instant. Across an autumn
+transition `differenceInDays` is 1 while `differenceInHours` is 25.
 
 `differenceInDays` on a `DateTime` counts **calendar days**, so it returns 1 across
 a daylight saving transition even though 25 hours of real time elapsed. Subtract
@@ -1327,6 +1345,10 @@ single list.
 | `inZone` on a wall time in the autumn overlap | the first occurrence |
 | `Time` `23:30` `addMinutes(60)` | `00:30`, wraps, no date carry |
 | `differenceInDays` across a transition | 1, calendar days |
+| `differenceInHours` on `DateTime` across a transition | 23 or 25, real time |
+| 2026-01-31 `differenceInMonths` 2026-02-28 | 1, the `addMonths` clamp reached it |
+| 2026-01-31 `differenceInMonths` 2026-02-27 | 0, not a complete month |
+| `isBetween` with `lo` after `hi` | false, an empty range |
 | `Timestamp` subtraction across a transition | 23 or 25 hours, real time |
 | comparing two `DateTime` in different zones | compares instants |
 | `parseDateTime` on `2026-09-01t09:00:00z` | fails, lowercase |
