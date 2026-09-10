@@ -1,0 +1,210 @@
+// Bit standard library — http2 module, the commands the public API sends the
+// loop: open a stream, read body bytes, respond, GOAWAY, reset.
+// Split out of `events.bit`; same flat `std/http2` module and namespace.
+
+fn h2connHandleCmd(st: h2connState, cmd: h2connCmd) {
+  if (cmd.kind == h2cmdOpen) {
+    h2connCmdOpen(st, cmd)
+    return
+  }
+  if (cmd.kind == h2cmdRespond) {
+    h2connCmdRespond(st, cmd)
+    return
+  }
+  if (cmd.kind == h2cmdGoaway) {
+    h2connCmdGoaway(st, cmd)
+    return
+  }
+  if (cmd.kind == h2cmdReset) {
+    h2connCmdReset(st, cmd)
+    return
+  }
+  if (cmd.kind == h2cmdRead) {
+    h2connCmdRead(st, cmd)
+    return
+  }
+}
+
+// Take the next of a stream's body for the thread consuming it (#4624), which is
+// also what renews the receive windows — see `h2connSendBody` (streams.bit).
+//
+// Answers at once when there is something to say and parks the reply channel on
+// the stream when there is not; `h2connAnswerReader` (streams.bit) then answers
+// it from the next DATA frame or from END_STREAM. At most one reader per stream:
+// the body has exactly one consumer, the thread `serve` spawned for it.
+//
+// An absent stream is `eof` and not an error. A stream is released the moment it
+// closes with nothing owed, so absence is what a body read AFTER its own eof
+// looks like — while a stream that DIED mid-body is still in the table precisely
+// so this can report it (`h2connCloseStream`, streams.bit).
+fn h2connCmdRead(st: h2connState, cmd: h2connCmd) {
+  let (s, ok) = st.streams[cmd.streamId]
+  if (!ok) {
+    cmd.readCh <- h2connRead{ data: []byte(0), eof: true, errMsg: "" }
+    return
+  }
+  if (s.reset) {
+    h2connFinishReader(st, s)
+    cmd.readCh <- h2connRead{ data: []byte(0), eof: true, errMsg: s.errMsg }
+    return
+  }
+  if (len(s.recvBody) > 0 || s.recvEnded) {
+    h2connSendBody(st, s, cmd.readCh)
+    return
+  }
+  s.readCh = cmd.readCh
+  s.hasReader = true
+}
+
+// Open a client stream for `cmd.request`: allocate the next odd id, send its
+// header block, and queue any body for flow-controlled delivery.
+fn h2connCmdOpen(st: h2connState, cmd: h2connCmd) {
+  if (st.goawaySent || st.goawayReceived || !st.running) {
+    cmd.replyCh <- h2connMsg{
+      ok: false,
+      response: h2connZeroResponse(),
+      errMsg: "http2: connection is closing",
+    }
+    return
+  }
+  // RFC 9113 §5.1.2: "Endpoints MUST NOT exceed the limit set by their peer."
+  // Refused here rather than on the wire, because the peer's answer to the
+  // stream we must not open is an RST_STREAM at best and a connection error at
+  // worst, and either way the caller waits for a round trip that cannot happen.
+  // `st.activeStreams` counts our own streams on a client — nothing else ever
+  // enters a client's table, `h2connClientHeaders` requiring an existing entry —
+  // and `peerMaxConcurrentStreams` is 2^32-1 until the peer names a limit, so
+  // this costs one comparison on a connection whose peer set no limit.
+  if (st.activeStreams >= st.peerMaxConcurrentStreams) {
+    cmd.replyCh <- h2connMsg{
+      ok: false,
+      response: h2connZeroResponse(),
+      errMsg: "http2: peer's concurrent stream limit (${st.peerMaxConcurrentStreams}) reached",
+    }
+    return
+  }
+  // RFC 9113 §6.5.2: the peer's SETTINGS_MAX_HEADER_LIST_SIZE is what it will
+  // accept from us, so a request over it is refused here rather than encoded
+  // and sent (#4607). Same position as the concurrency check above and for the
+  // same reason: before an id is spent and before a table entry exists, so a
+  // caller whose own headers are the problem is told that, instead of waiting
+  // out a round trip the peer answers with RST_STREAM or GOAWAY.
+  //
+  // The fields are built once and handed to the encoder below, so the check
+  // costs the walk and not a second `h2connRequestFields`. It always walks:
+  // `peerMaxHeaderListBytes` is 2^32-1 until the peer names a limit, which
+  // keeps this one comparison rather than a branch on whether a limit exists.
+  let fields = h2connRequestFields(cmd.request)
+  let listSize = h2connHeaderListSize(fields)
+  if (listSize > st.peerMaxHeaderListBytes) {
+    cmd.replyCh <- h2connMsg{
+      ok: false,
+      response: h2connZeroResponse(),
+      errMsg: h2connHeaderListMsg(listSize, st.peerMaxHeaderListBytes),
+    }
+    return
+  }
+  let id = st.nextStreamId
+  st.nextStreamId = st.nextStreamId + 2
+  let hasBody = len(cmd.request.body) > 0
+  let s = h2connNewStream(id, st.peerInitialWindow, st.ourInitialWindow, cmd.replyCh)
+  if (hasBody) {
+    s.state = h2stOpen
+  } else {
+    s.state = h2stHCLocal
+  }
+  st.streams[id] = s
+  st.activeStreams = st.activeStreams + 1
+
+  let block = st.enc.encode(fields)
+  h2connSendHeaderBlock(st, id, block, !hasBody)
+  if (hasBody) {
+    s.pendingData = cmd.request.body
+    s.pendingEnd = true
+    s.hasPending = true
+    h2connFlushStream(st, s)
+  }
+}
+
+// Answer a server stream. A zero status is the handler's request to abort.
+fn h2connCmdRespond(st: h2connState, cmd: h2connCmd) {
+  let (s, ok) = st.streams[cmd.streamId]
+  if (!ok) {
+    return
+  }
+  if (s.state == h2stClosed || s.reset) {
+    return
+  }
+  if (cmd.response.status == 0) {
+    h2connSendRstStream(st, RstStreamFrame{ streamId: cmd.streamId, errorCode: errorCancel })
+    h2connCloseStream(st, s)
+    return
+  }
+  // The same limit on the other side of the connection (#4607). There is no
+  // caller to fail here — a server stream's `replyCh` is `h2connDummyReply()`
+  // and the handler has already returned — so the stream is reset instead, and
+  // the message reaches whoever reads the reset rather than a `roundTrip`.
+  //
+  // INTERNAL_ERROR, not PROTOCOL_ERROR or REFUSED_STREAM: the peer's framing is
+  // legal and its request was processed. What failed is this endpoint producing
+  // a response the peer told us it will not accept, which is a handler bug and
+  // is what §7's INTERNAL_ERROR says. A stream error rather than a connection
+  // one, because nothing about the connection or any other stream is wrong.
+  let fields = h2connResponseFields(cmd.response)
+  let listSize = h2connHeaderListSize(fields)
+  if (listSize > st.peerMaxHeaderListBytes) {
+    h2connStreamErrorMsg(
+      st,
+      cmd.streamId,
+      errorInternalError,
+      h2connHeaderListMsg(listSize, st.peerMaxHeaderListBytes),
+    )
+    return
+  }
+  let hasBody = len(cmd.response.body) > 0
+  let block = st.enc.encode(fields)
+  h2connSendHeaderBlock(st, cmd.streamId, block, !hasBody)
+  if (hasBody) {
+    s.pendingData = cmd.response.body
+    s.pendingEnd = true
+    s.hasPending = true
+    h2connFlushStream(st, s)
+    return
+  }
+  h2connLocalEnd(st, s)
+}
+
+fn h2connCmdGoaway(st: h2connState, cmd: h2connCmd) {
+  if (st.goawaySent) {
+    return
+  }
+  st.goawaySent = true
+  h2connSendGoaway(
+    st,
+    GoawayFrame{
+      lastStreamId: st.lastPeerStreamId,
+      errorCode: cmd.errorCode,
+      debugData: []byte(0),
+    },
+  )
+}
+
+// Abort a stream the application asked to abort (`Conn.resetStream`): tell the
+// peer with RST_STREAM and fail our side.
+//
+// Through `h2connStreamErrorMsg` (streams.bit), which is the whole of it —
+// sending the RST_STREAM, finding the stream and failing it are exactly what
+// that helper does for every other reset this side decides on. This used to
+// call `h2connCloseStream` directly instead, and closing answers nobody:
+// `h2connFailAll` is the only thing that ever wakes a `roundTrip` parked on
+// `s.replyCh` after the fact and it skips a closed stream by its own test
+// (`s.state != h2stClosed`), so a client whose stream another green thread
+// reset was never released — forever at `deadlineNs == 0`, and otherwise only
+// on its deadline with a timeout message that named the wrong cause (#4598).
+//
+// The message names a LOCAL reset: `h2connStreamError`'s peer wording would be
+// a lie on this path, since the peer has not acted at all.
+fn h2connCmdReset(st: h2connState, cmd: h2connCmd) {
+  h2connStreamErrorMsg(st, cmd.streamId, cmd.errorCode, h2connLocalResetMsg(cmd.errorCode))
+}
+
