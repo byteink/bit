@@ -24,6 +24,16 @@
 # the index entirely, so uncommitted edits are NOT tested. This has surprised
 # people; commit first, then gate.
 #
+# ARM64GATE_GIT=1 ships a shallow single-commit `.git` with the tree instead of
+# a bare `git archive HEAD`. Off by default, because `git archive HEAD` being
+# the default is what keeps the normal gate honest about testing only committed
+# work. Needed to gate any commit before #3485 landed (first-parent
+# `15ba2382`..`6e9a8ef2`): `currentGateStamp` (tools/build/gatesexec.bit) there
+# aborts the whole batch with `cannot resolve HEAD sha for gate-batch stamping`
+# in a tree with no `.git`, so the step runs NO gate and prints no reading —
+# 72 of the 194 runtime-touching first-parent commits in `8db6e7be..cf681e7f`
+# (#4736). The archived tree is identical either way; only `.git` is added.
+#
 # A cold run takes over an hour on a loaded machine and prints nothing until it
 # finishes (the container buffers into /tmp/o). To watch progress, find the
 # container with `docker ps --filter name=arm64gate` and
@@ -89,7 +99,41 @@ GATE_HEAD_SHA=$(git rev-parse HEAD)
 # `tar x`: GNU tar stops at the first archive's end-of-archive blocks unless
 # told to read past them.
 baseline_archive() { git archive --prefix="${ABI_BASELINE_DIR}/" "${STAGE0_TAG}" -- runtime; }
-gate_stream() { git archive HEAD; baseline_archive; }
+
+# The ARM64GATE_GIT tree: HEAD checked out in a throwaway shallow single-commit
+# clone, tarred from the filesystem so the `.git` travels too. Fetching the sha
+# (not a branch) keeps this correct from a detached worktree, which is what a
+# bisect runs from.
+#
+# COPYFILE_DISABLE=1 and --no-xattrs are load-bearing here for exactly the
+# reason `mutant_stream` documents below: this tar comes from the local
+# filesystem, not from git objects, so without them bsdtar emits an AppleDouble
+# `._*` MEMBER per xattr, and the build driver globs `*.bit` — `._core.bit`
+# matches and gets compiled (#1890).
+shallow_archive() {
+  local t
+  t=$(mktemp -d)
+  git init -q "${t}/r"
+  git -C "${t}/r" fetch -q --depth 1 "$(git rev-parse --show-toplevel)" "$(git rev-parse HEAD)"
+  git -C "${t}/r" checkout -q --detach FETCH_HEAD
+  COPYFILE_DISABLE=1 tar c --no-xattrs -C "${t}/r" .
+  rm -rf "${t}"
+}
+
+gate_stream() {
+  if [ -n "${ARM64GATE_GIT:-}" ]; then shallow_archive; else git archive HEAD; fi
+  baseline_archive
+}
+
+# git refuses to read a repository owned by another uid — `fatal: detected
+# dubious ownership in repository at '/work'` — and `git rev-parse HEAD` fails
+# again, so ARM64GATE_GIT also has to mark the unpacked tree safe in the
+# container. Empty unless ARM64GATE_GIT is set: the default run's container
+# command must stay exactly what it is today.
+SAFE_DIR_PREFIX=""
+if [ -n "${ARM64GATE_GIT:-}" ]; then
+  SAFE_DIR_PREFIX=" git config --global --add safe.directory /work &&"
+fi
 
 command -v docker >/dev/null || { echo "arm64gate: docker not found" >&2; exit 127; }
 docker image inspect "${IMAGE}" >/dev/null 2>&1 || {
@@ -179,7 +223,7 @@ run_suite() {
 
   start_ts=$(date +%s)
   code=$(docker run --rm -i --name "${name}" ${cache_args} "${IMAGE}" bash -c '
-      mkdir -p /work && cd /work && tar xi &&
+      mkdir -p /work && cd /work && tar xi &&'"${SAFE_DIR_PREFIX}"'
       BIT_STAGE0_CACHE='"${cache_env}"'/stage0 BIT_ABI_BASELINE_DIR='"${ABI_BASELINE_DIR}"'/runtime BIT_GATE_HEAD_SHA='"${GATE_HEAD_SHA}"' ./make '"${STEP}"' > /tmp/o 2>&1
       e=$?
       if [ $e -eq 0 ]; then
