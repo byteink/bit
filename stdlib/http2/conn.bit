@@ -117,6 +117,10 @@ export fn getHeader(headers: []HeaderField, name: string): string {
 // received (0 = no bound), kept here so `roundTrip` can bound its own wait
 // on `replyCh` the same way `h2connAwaitReady` bounds the SETTINGS wait
 // (#3036).
+//
+// `streamBodies` is `Config.streamBodies` as `connect`/`accept` received it, kept
+// here because `serve` is where it is read: it decides whether each handler is
+// spawned with its body already taken or takes it itself (#4624).
 export class Conn {
   isClient: bool
   cmdCh: chan<h2connCmd>
@@ -124,6 +128,7 @@ export class Conn {
   readerDone: chan<int>
   writerDone: chan<int>
   deadlineNs: int
+  streamBodies: bool
 
   // Send `req` on a fresh stream and block until its full response arrives. Safe to
   // call from many green threads at once — each request rides its own stream,
@@ -159,6 +164,11 @@ export class Conn {
   // until the connection closes. A handler that returns a `Response` with status 0
   // aborts that stream with RST_STREAM (CANCEL); `Stream.reset` aborts it with any
   // code the handler chooses (#4616).
+  //
+  // `req.body` is complete before the handler runs, unless `Config.streamBodies`
+  // is set: then the body is left for the handler to take through `Stream.read`
+  // as it lands, which is what makes the receive window real backpressure
+  // (#4624). Whatever such a handler does not read is released when it answers.
   export serve(handler: (Request, Stream) => Response): ()! {
     while (true) {
       let a = <- this.acceptCh
@@ -168,7 +178,7 @@ export class Conn {
       spawn h2connHandle(
         Stream{ cmdCh: this.cmdCh, id: a.streamId },
         a.request,
-        a.hasBody,
+        a.hasBody && !this.streamBodies,
         handler,
       )
     }
@@ -235,54 +245,6 @@ export class Conn {
   // is answering, whose `reset` is this call scoped to that one id (#4616).
   export resetStream(streamId: int, errorCode: int) {
     h2connSendReset(this.cmdCh, streamId, errorCode)
-  }
-}
-
-// One inbound stream, handed to a `serve` handler as the second argument so it
-// can abort the stream it is answering with a code of its own choosing.
-//
-// Neither field is exported and nothing outside this module can build one, so
-// the capability is scoped: a handler can reset ITS stream and no other, and no
-// stream id ever leaves the engine. `Request` deliberately gains no id field —
-// it is also what `newRequest` builds on the client side, where an id would be
-// meaningless (#4616).
-export class Stream {
-  cmdCh: chan<h2connCmd>
-  id: int
-
-  // Abort this stream with RST_STREAM carrying `errorCode` (an `error*`
-  // constant): REFUSED_STREAM to tell the peer it may safely retry elsewhere,
-  // ENHANCE_YOUR_CALM to say it is asking too often, and so on. The one code a
-  // handler could already send is CANCEL, by returning a `Response` with status
-  // 0 — this is every other code.
-  //
-  // Callable from inside the handler, which then still returns a `Response`;
-  // that `Response` is discarded. Both this and the return travel the one
-  // command channel from the one green thread, in that order, and the reset
-  // closes the stream and drops it from the loop's table — so the response
-  // command finds no stream and emits nothing (`h2connCmdRespond`, events.bit).
-  // Nothing extra reaches the peer: exactly one RST_STREAM, no HEADERS.
-  //
-  // Resetting after the handler has returned is legal and does nothing beyond
-  // sending the RST_STREAM: ids are never reused, so the id can only name the
-  // stream this handler served, already finished (RFC 9113 §6.4).
-  export reset(errorCode: int) {
-    h2connSendReset(this.cmdCh, this.id, errorCode)
-  }
-}
-
-// The `h2cmdReset` command both `Conn.resetStream` and `Stream.reset` put on the
-// loop's command channel — one place builds it, so the two entry points cannot
-// drift apart. `h2connCmdReset` (events.bit) is the whole of what happens next.
-fn h2connSendReset(cmdCh: chan<h2connCmd>, streamId: int, errorCode: int) {
-  cmdCh <- h2connCmd{
-    kind: h2cmdReset,
-    readCh: h2connDummyRead(),
-    request: h2connZeroRequest(),
-    response: h2connZeroResponse(),
-    streamId: streamId,
-    errorCode: errorCode,
-    replyCh: h2connDummyReply(),
   }
 }
 
@@ -391,6 +353,7 @@ fn h2connStart(
     readerDone: readerDoneCh,
     writerDone: writerDoneCh,
     deadlineNs: deadlineNs,
+    streamBodies: cfg.streamBodies,
   }
 }
 
@@ -757,33 +720,5 @@ fn h2connAtoi(s: string): int {
     i = i + 1
   }
   return v
-}
-
-// --- public connection API ---------------------------------------------------
-
-// One served request, on its own green thread: run the handler, then send its
-// answer to the loop. `s` is the handler's handle on this stream, and is also
-// where this function's own `cmdCh` and stream id live — one object, so the
-// reset the handler may send and the response sent here provably name the same
-// stream and travel the same channel in that order (`Stream.reset`).
-fn h2connHandle(s: Stream, req: Request, hasBody: bool, handler: (Request, Stream) => Response) {
-  let full = req
-  if (hasBody) {
-    // The stream is already gone, and answering it is neither possible nor owed:
-    // the loop reset it and told whoever needed telling.
-    full.body = h2connDrainBody(s) catch _ {
-      return
-    }
-  }
-  let res = handler(full, s)
-  s.cmdCh <- h2connCmd{
-    kind: h2cmdRespond,
-    readCh: h2connDummyRead(),
-    request: h2connZeroRequest(),
-    response: res,
-    streamId: s.id,
-    errorCode: 0,
-    replyCh: h2connDummyReply(),
-  }
 }
 

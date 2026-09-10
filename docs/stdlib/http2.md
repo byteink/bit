@@ -685,8 +685,17 @@ window it grants the peer), `maxFrameSize` (the largest frame payload it
 accepts), `headerTableSize` (its HPACK dynamic-table bound),
 `maxHeaderListBytes` (SETTINGS_MAX_HEADER_LIST_SIZE), and
 `maxConcurrentStreams` (SETTINGS_MAX_CONCURRENT_STREAMS) - plus `maxBodyBytes`,
-the one local limit that is not a SETTINGS parameter. All six fields are
-exported.
+the one local limit that is not a SETTINGS parameter, and `streamBodies`, which
+is not a limit at all. All seven fields are exported.
+
+`streamBodies` says how a `serve` handler is given its request body. Under the
+default, `false`, the engine takes the whole body first and the handler runs with
+a complete `req.body`. Set it and the handler is called as soon as the request
+headers are in, with `req.body` empty, and takes the bytes itself through
+`Stream.read` as they land - see that method below. Nothing else changes: the
+same handler signature, and a body the handler leaves unread is released when it
+answers. It has no effect on a client, where `roundTrip` returns a whole
+`Response` and takes the body for you.
 
 `initialWindowSize` is the receive window granted to each stream; the
 connection's own window starts at the RFC's fixed 65535 and is not configurable.
@@ -895,6 +904,10 @@ until the connection closes. Each call gets the request and the `Stream` it
 arrived on. A handler that returns a `Response` with status 0 aborts that stream
 with RST_STREAM (CANCEL); `Stream.reset` aborts it with any other code.
 
+`req.body` is complete before the handler runs, unless `Config.streamBodies` is
+set: then the handler is called at the end of the request headers and takes the
+body itself through `Stream.read`.
+
 Two things end it: the transport dying, and this side raising a *connection
 error* against a misbehaving peer - a malformed frame, an illegal stream id, a
 header block past `maxHeaderListBytes`, and so on. In both cases the engine
@@ -926,6 +939,63 @@ peer receives exactly one RST_STREAM and no HEADERS behind it.
 Resetting after the handler has returned is legal and does nothing beyond
 sending the RST_STREAM: identifiers are never reused, so it can only name the
 stream this handler served, which has already finished (RFC 9113 §6.4).
+
+### `Stream.read(): BodyChunk!`
+
+Take the next of this stream's request body as it lands, without waiting for the
+peer to end the stream. It blocks until at least one byte has arrived or the body
+has ended, and returns everything that had arrived and had not been taken yet.
+There are bytes to take only under `Config.streamBodies`, which is what stops
+`serve` from taking the body itself; under the default this returns an empty
+final chunk.
+
+The take is what renews the receive windows, so a handler reading this way *is*
+the backpressure: the connection window holds the credit for every buffered byte
+until this call hands it over, and the WINDOW_UPDATE granting it back goes out
+with the take. A peer uploading faster than the handler reads runs the window
+down and stops at it, instead of filling the engine's buffer up to
+`maxBodyBytes`.
+
+It fails when the stream dies mid-body - a peer reset, a connection error, the
+transport going - carrying the same sentence a `roundTrip` on that stream would
+be given, so a truncated body is never returned as a complete one. Exactly one
+thread reads one stream, the handler's own, and it must not call this again after
+a chunk with `eof` set or after a failure. A handler is free to stop reading and
+answer: what it did not take is released and its credit returned to the peer.
+
+### `BodyChunk`
+
+One take from a stream's body: `data` is every byte that had arrived and had not
+been taken yet, and `eof` says the peer ended the stream so nothing more will
+come. Both fields are exported. A chunk carries both when the last DATA frame is
+also the one that ends the body, so `eof` is checked after the bytes are used,
+not instead of using them.
+
+```bit
+import { Config, defaultConfig, Request, Response, Stream, newResponse } from "std/http2"
+
+// Count a request body without ever holding it. Under `streamBodies` the handler
+// runs as soon as the headers are in, and each take renews the receive window by
+// exactly what it took.
+fn count(_req: Request, s: Stream): Response {
+  let n = 0
+  while (true) {
+    let c = s.read() catch e {
+      return newResponse(500, []byte(e.message()))
+    }
+    n = n + len(c.data)
+    if (c.eof) {
+      return newResponse(200, []byte("${n} bytes"))
+    }
+  }
+}
+
+fn streamingConfig(): Config {
+  let cfg = defaultConfig()
+  cfg.streamBodies = true
+  return cfg
+}
+```
 
 ### `Conn.waitReaderDone()`
 
