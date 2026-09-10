@@ -1,0 +1,243 @@
+// compiler/classjsondecodegenericretarget.bit — the second half of #4563's
+// generic path: the one refusal that keeps `bit check` and `bit build`
+// agreeing, and the ledger retarget itself.
+//
+// Split out of `classjsondecodegeneric.bit` at 828 lines against E0200's 800
+// (spec/LINT.md §5.2) when #4567 gave that path a second entry point and a
+// second wrapper per class. The seam is the one the file already marked:
+// everything above builds the SET of generics that decode into their own type
+// parameter and synthesizes their wrappers; everything here reads that set
+// back, at check time to refuse and at lower time to retarget.
+//
+// A PURE MOVE, and the filename is the reason it is safe. A module is its files
+// concatenated in bytewise filename order (compiler/project.bit), and
+// `classjsondecodegenericretarget.bit` sorts immediately after
+// `classjsondecodegeneric.bit` and before `classjsondecodeimports.bit`, so
+// every declaration in the module keeps the position it had — which matters
+// because SPEC §14.8 makes diagnostic order normative and `optimizeModule`
+// reads declaration order for inlining depth. The module is one scope, so no
+// name resolution changes and re-importing anything would be E0042.
+// ---- the refusal, and the retarget -----------------------------------------
+
+// The one authoritative check that a decoding generic's instantiation can be
+// resolved. Runs after every module is checked, so the ledger already holds
+// every instantiation the CHECK pass recorded — `b.get<U>(j)` among them — and
+// matches by (module, decl) identity rather than by name.
+//
+// This is what makes `bit check` and `bit build` agree. The retarget below runs
+// during lowering, which `bit check` never reaches.
+fn validateJsonDecodeGenerics(p: Project, mods: []Checker) {
+  if (len(mods) == 0) {
+    return
+  }
+  let gens = collectJsonDecodeGenerics(p)
+  if (len(gens) == 0) {
+    return
+  }
+  let ctx = mods[0].ctx
+  let i = 0
+  while (i < len(ctx.instantiations)) {
+    let inst = ctx.instantiations[i]
+    for g of gens {
+      if (g.mod == inst.module && g.decl == inst.decl && g.tpIndex < len(inst.args)) {
+        validateJsonDecodeArg(p, mods, inst, inst.args[g.tpIndex])
+      }
+    }
+    i = i + 1
+  }
+}
+
+fn validateJsonDecodeArg(p: Project, mods: []Checker, inst: Instantiation, arg: int) {
+  // Every Checker shares one `ctx` and one `diags` after `resolveProject`
+  // handed them out, so mods[0]'s are the project's.
+  let d = mods[0].diags
+  let ctx = mods[0].ctx
+  if (arg == ctx.voidId) {
+    // `genericTypeArgs` resolves a type param nothing bound to void. `T` here is
+    // in the RESULT alone, so nothing ever infers it from the arguments.
+    //
+    // ONE CAUSE, ONE DIAGNOSTIC (#4592). Since #4560 the general rule of SPEC
+    // §15.3 reports E0068 at this same call for ANY generic whose inference left
+    // a gap, so a free-function wrapper was refused twice for one mistake. The
+    // general rule owns every call it can see; this pass hands it the JSON
+    // reason and says nothing more. Where E0068 is absent this is still the only
+    // refusal and must stay one — `vCallGenericEnv` is never reached for a
+    // METHOD call, and it stands down when an argument has no type at all.
+    if (adoptCannotInferHint(d, inst.site)) {
+      return
+    }
+    reportJsonDecodeGenericArg(d, inst.site, "", jdgUnbound)
+    return
+  }
+  let t = ctx.types[arg]
+  if (t.kind != TypeKind.Struct || !t.hasName || t.declModule < 0 || t.declModule >= len(mods)) {
+    reportJsonDecodeGenericArg(d, inst.site, typeName(ctx, arg), jdgNotJson)
+    return
+  }
+  let (_, ok) = mods[t.declModule].funcDecls[jsonDecInstName(t.name)]
+  if (ok) {
+    return
+  }
+  let cause = jdgNotJson
+  if (jsonClassMarkOf(p, t.declModule, t.name) == jmJsonClass) {
+    cause = jdgUnseen
+  }
+  reportJsonDecodeGenericArg(d, inst.site, t.name, cause)
+}
+
+// The `@json` mark a module records for one of its own class names.
+fn jsonClassMarkOf(p: Project, mid: int, name: string): int {
+  if (mid < 0 || mid >= len(p.mods)) {
+    return 0
+  }
+  let (mark, ok) = newJsonCtx(p, p.mods[mid]).marks[name]
+  if (!ok) {
+    return 0
+  }
+  return mark
+}
+
+// Why one instantiation of a decoding generic cannot be specialised. Three
+// distinct causes, kept distinct: the first is the reader's to fix, the second
+// is a spelling they can change, and the third is this compiler's own limit and
+// says so rather than blaming the type.
+const jdgNotJson = 0
+const jdgUnbound = 1
+const jdgUnseen = 2
+
+// The unbound-`T` reason, worded once: E0145 renders it below, and E0068 borrows
+// it when the general rule got to the call first.
+const jdgUnboundHint = "write the type argument out — 'jsonDecode<T>' puts 'T' in the RESULT alone, so nothing infers it from the arguments and neither can a generic wrapping it"
+
+// Hands `jdgUnboundHint` to an E0068 already recorded at this exact call, and
+// answers whether one was there. Spans are compared field-wise because the call
+// this pass names is the same node `vGenericGap` reported — the ledger's
+// `inst.site` and validate's `vSpan` are both the Call node's own span, so an
+// equal triple is identity, not a coincidence of position.
+//
+// Nothing is overwritten: `vGenericGap` raises E0068 through `reportNoHint`, so
+// the diagnostic this finds has no hint of its own.
+fn adoptCannotInferHint(d: Diagnostics, site: Span): bool {
+  let i = 0
+  while (i < len(d.list)) {
+    let g = d.list[i]
+    if (g.hasCode &&
+      g.code == ecCannotInfer &&
+      g.span.file == site.file &&
+      g.span.start == site.start &&
+      g.span.end == site.end) {
+      g.hint = jdgUnboundHint
+      g.hasHint = true
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// E0145 for the generic path, at the CALL that instantiated the generic — the
+// line the reader can act on, since the `jsonDecode<T>` inside the wrapper may
+// sit in a module they do not own.
+fn reportJsonDecodeGenericArg(d: Diagnostics, site: Span, tname: string, cause: int) {
+  let msg = "'jsonDecode' cannot decode into '${tname}': it does not carry '@json'"
+  let help = "mark '${tname}' with '@json' — a generic that calls 'jsonDecode<T>' decodes only into a class that opted in, exactly as a direct call does"
+  if (cause == jdgUnbound) {
+    msg = "'jsonDecode' cannot decode into an unbound type parameter: this call binds it to nothing"
+    help = jdgUnboundHint
+  }
+  if (cause == jdgUnseen) {
+    msg = "'jsonDecode' cannot decode into '${tname}': no decode specialisation was synthesized for it"
+    help = "write the type argument out at the call site — a decoding generic is specialised from the type argument AS SPELLED, before any type is inferred (#4563)"
+  }
+  report(d, ecJsonDecodeType, site, msg, help)
+}
+
+// Points every `jsonDecode<C>` ledger entry at the specialisation synthesized in
+// `C`'s own module, so Pass A2 emits the decoder under the instance symbol the
+// wrapper's call already names.
+//
+// Runs after Pass A1's closure, which is what CREATES these entries: the check
+// pass only ever sees `jsonDecode<T>` inside the wrapper's template body, which
+// `recordInstantiation` refuses as degenerate (#4499). It is
+// `recordSubtreeInstantiations`, re-walking each instance body under that
+// instance's bindings, that records the concrete one.
+fn retargetJsonDecodeInstances(mods: []Checker, root: int, lo: Lowerer) {
+  let jm = jsonStdModuleId(mods)
+  if (jm < 0) {
+    return
+  }
+  let ctx = mods[root].ctx
+  let g = 0
+  while (g < len(ctx.instantiations)) {
+    let inst = ctx.instantiations[g]
+    if (inst.module == jm && isJsonDecodeEntryName(inst.name)) {
+      retargetOneJsonDecodeInstance(mods, inst, lo)
+    }
+    g = g + 1
+  }
+}
+
+// The module `std/json` was loaded as, or -1. Read off an importer's own path
+// map rather than matched by name: `SrcModule.imports` is built by the loader,
+// so this is the same identity `isJsonDecodeCallee` matches a call by.
+fn jsonStdModuleId(mods: []Checker): int {
+  let i = 0
+  while (i < len(mods)) {
+    let (id, ok) = mods[i].importPaths[jsonDecodeModulePath]
+    if (ok && id >= 0 && id < len(mods)) {
+      return id
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Is this ledger entry one of the templates a generic body decodes through?
+// The name is what says which policy the call asked for (#4567).
+fn isJsonDecodeEntryName(name: string): bool {
+  for e of jsonDecodeGenericEntries() {
+    if (name == e) {
+      return true
+    }
+  }
+  return false
+}
+
+fn retargetOneJsonDecodeInstance(mods: []Checker, inst: Instantiation, lo: Lowerer) {
+  let ctx = mods[0].ctx
+  let arg = 0
+  if (len(inst.args) == 1) {
+    arg = inst.args[0]
+  }
+  let t = ctx.types[arg]
+  let cmod = -1
+  if (arg != 0 && t.kind == TypeKind.Struct && t.hasName) {
+    cmod = t.declModule
+  }
+  let decl = 0
+  if (cmod >= 0 && cmod < len(mods)) {
+    let (dn, ok) = mods[cmod].funcDecls[jsonDecInstNameFor(inst.name, t.name)]
+    if (ok) {
+      decl = dn
+    }
+  }
+  if (decl == 0) {
+    // Unreachable through `bit build`, which checks first — but a stub that
+    // computes nothing is exactly what `jsonDecode`'s own template body is, so
+    // falling through would ship a program that FAILS AT RUN TIME. Refuse.
+    lo.stubbed = append(
+      lo.stubbed,
+      StubbedFn{
+        name: inst.name, span: inst.site,
+        reason: "a 'jsonDecode<T>' inside a generic body whose type argument has no synthesized decoder",
+        note: "", noteSite: pointSpan(0, 0),
+      },
+    )
+    return
+  }
+  // `module` is NOT touched: it is half of the (module, name, args) key every
+  // call site looks this entry up by (`instantiationIndexIn`), and half of the
+  // symbol `instanceSymbol` builds. Only where the BODY comes from moves.
+  inst.declModule = cmod
+  inst.decl = decl
+}

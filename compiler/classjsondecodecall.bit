@@ -25,6 +25,11 @@ const ecJsonDecodeType = 145
 // by import rather than by spelling alone: a user's own `jsonDecode` is a
 // different function and must not be rewritten.
 const jsonDecodeFuncName = "jsonDecode"
+// The lenient entry point (#4567). A separate NAME rather than an argument on
+// `jsonDecode`, because the policy has to be known where the call is rewritten:
+// the decoder's key set exists only inside the synthesized function, so what a
+// caller writes here is the only place the choice can be read from.
+const jsonDecodeLenientFuncName = "jsonDecodeLenient"
 const jsonDecodeModulePath = "std/json"
 
 // The empty string literal the rewritten call passes as the root path, and the
@@ -46,6 +51,10 @@ class JsonDecodeSite {
   // different argument lists, and a class can be demanded both ways in one
   // program, so this is carried per SITE rather than decided per class.
   text: bool,
+  // `jsonDecodeLenient<C>(j)` (#4567). Same decoder as `jsonDecode<C>(j)` and
+  // the same rewrite; only the unknown-key argument differs, which is why this
+  // is a flag on the site and not a third need list.
+  lenient: bool,
 }
 
 // One decoder the project needs: a `@json` class, named in the module that
@@ -374,21 +383,32 @@ class JsonDecodeScan {
   d: JsonDecodeDemand,
   names: JsonDecodeNames,
   text: bool,
+  lenient: bool,
 }
 
 fn collectModuleDecodeSites(p: Project, mid: int, d: JsonDecodeDemand) {
   let m = p.mods[mid]
   let dom = jsonDecodeNamesOf(m.tree, m.source, jsonDecodeFuncName)
+  let lenient = jsonDecodeNamesOf(m.tree, m.source, jsonDecodeLenientFuncName)
   let text = jsonDecodeNamesOf(m.tree, m.source, jsonDecodeTextFuncName)
-  if (!bindsJsonDecode(dom) && !bindsJsonDecode(text)) {
+  if (!bindsJsonDecode(dom) && !bindsJsonDecode(lenient) && !bindsJsonDecode(text)) {
     return
   }
   let jx = newJsonCtx(p, m)
   if (bindsJsonDecode(dom)) {
-    collectDecodeSitesFor(p, mid, jx, JsonDecodeScan{ d: d, names: dom, text: false })
+    collectDecodeSitesFor(
+      p, mid, jx, JsonDecodeScan{ d: d, names: dom, text: false, lenient: false },
+    )
+  }
+  if (bindsJsonDecode(lenient)) {
+    collectDecodeSitesFor(
+      p, mid, jx, JsonDecodeScan{ d: d, names: lenient, text: false, lenient: true },
+    )
   }
   if (bindsJsonDecode(text)) {
-    collectDecodeSitesFor(p, mid, jx, JsonDecodeScan{ d: d, names: text, text: true })
+    collectDecodeSitesFor(
+      p, mid, jx, JsonDecodeScan{ d: d, names: text, text: true, lenient: false },
+    )
   }
 }
 
@@ -414,7 +434,7 @@ fn collectDecodeSitesFor(p: Project, mid: int, jx: JsonCtx, sc: JsonDecodeScan) 
     }
     let (tp, isTp) = tpCalls[n]
     if (isTp) {
-      reportJsonDecodeTypeParam(jx, targ, tp, sc.text)
+      reportJsonDecodeTypeParam(jx, targ, tp, sc)
       continue
     }
     let site = jsonDecodeTarget(jx, mid, targ, sc.names.exported)
@@ -427,14 +447,16 @@ fn collectDecodeSitesFor(p: Project, mid: int, jx: JsonCtx, sc: JsonDecodeScan) 
 // A type argument that is a type parameter, judged per entry point: the DOM
 // path accepts the enclosing declaration's OWN parameter (#4563 retargets its
 // ledger entry) and refuses a generic RECEIVER's; the text path has no ledger
-// entry to retarget and refuses both.
-fn reportJsonDecodeTypeParam(jx: JsonCtx, targ: int, tp: int, text: bool) {
-  if (text) {
+// entry to retarget and refuses both. `jsonDecodeLenient` follows the DOM
+// path — it retargets to a wrapper of its own (#4567) — so it is not tested
+// here at all.
+fn reportJsonDecodeTypeParam(jx: JsonCtx, targ: int, tp: int, sc: JsonDecodeScan) {
+  if (sc.text) {
     reportJsonDecodeTextTypeParam(jx, targ)
     return
   }
   if (tp == jdtpRecv) {
-    reportJsonDecodeRecvTypeParam(jx, targ)
+    reportJsonDecodeRecvTypeParam(jx, targ, sc.names.exported)
   }
 }
 
@@ -447,7 +469,7 @@ fn recordJsonDecodeSite(sc: JsonDecodeScan, mid: int, call: int, site: JsonClass
     sc.d.sites,
     JsonDecodeSite{
       callerMod: mid, callNode: call, classMod: site.mod, className: site.name,
-      path: site.path, text: sc.text,
+      path: site.path, text: sc.text, lenient: sc.lenient,
     },
   )
   if (sc.text) {
@@ -567,12 +589,15 @@ fn jsonDecodeCallWords(d: JsonDecodeDemand, mid: int): []string {
   }
   out = append(out, jsonDecodeRootPathWord)
   out = append(out, jsonDecodeZeroWord)
+  out = append(out, jsonDecStrictWord)
+  out = append(out, jsonDecLenientWord)
   return out
 }
 
 // ---- the rewrite -----------------------------------------------------------
 
-// `jsonDecode<C>(j)` becomes `__json_dec_C(j, "", 0)`, in place.
+// `jsonDecode<C>(j)` becomes `__json_dec_C(j, "", 0, true)`, and
+// `jsonDecodeLenient<C>(j)` the same call with `false` (#4567), in place.
 //
 // IN PLACE, by overwriting the call's three children rather than building a
 // replacement node: the call sits somewhere inside an expression whose parent
@@ -611,10 +636,28 @@ fn rewriteJsonDecodeCalls(m: SrcModule, st: SynthText, mid: int, d: JsonDecodeDe
           0,
           [addLeaf(tree, Tag.IntLit, synthSpan(st, jsonDecodeZeroWord))],
         ),
+        addNode(
+          tree,
+          Tag.Arg,
+          span,
+          0,
+          [addLeaf(tree, Tag.BoolLit, synthSpan(st, jsonDecodePolicyWord(site)))],
+        ),
       ],
     )
     tree.extra[start] = synthIdent(tree, st, jsonDecName(site.className))
     tree.extra[start + 1] = 0
     tree.extra[start + 2] = args
   }
+}
+
+// The unknown-key policy this site asks for, as the literal the rewritten call
+// passes: `false` for `jsonDecodeLenient<C>`, `true` for everything else, so
+// every call that existed before this passes exactly what the decoder used to
+// do unconditionally.
+fn jsonDecodePolicyWord(site: JsonDecodeSite): string {
+  if (site.lenient) {
+    return jsonDecLenientWord
+  }
+  return jsonDecStrictWord
 }

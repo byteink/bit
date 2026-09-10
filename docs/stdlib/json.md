@@ -702,6 +702,37 @@ A key that is absent and a key present as `null` both decode an `Option<T>` to
 an absent `Option` as an explicit `null`, so what it emits decodes back, and a
 producer that omits the key instead is just as well-formed.
 
+### `jsonDecodeLenient<T>(j: Json): T!`
+
+The same decode, ignoring keys no field of `T` claims -- at every level of the
+document, in the single pass `jsonDecode` already makes. Nothing else changes:
+a missing key, a value of the wrong kind and a document past
+`jsonMaxDecodeDepth` all still fail, with the same message and the same path.
+The only cause it cannot produce is `UnknownKey`.
+
+```bit
+import { jsonDecodeLenient, Json, JsonEntry } from "std/json"
+
+@json class Settings {
+  theme: string,
+}
+
+// `{"theme":"dark","futureOption":true}` binds; the extra key is dropped.
+fn loadSettings(j: Json): Settings! {
+  return jsonDecodeLenient<Settings>(j)?
+}
+```
+
+Reach for it when the sender is not under your control and a field added by a
+newer client must not become a 400 -- a public API accepting a document written
+against a later version of itself. **Do not make it the default.** A dropped
+field and an accepted one are indistinguishable to whoever sent the document,
+which is why `jsonDecode` is the one you get by writing the shorter name.
+
+It is one decode, not a retry: the key set lives inside the specialised
+decoder, so skipping a key costs a branch rather than a second pass over the
+document. `pkg/web`'s `Unknown.Ignore` policy routes through it.
+
 ### `jsonDecodeText<T>(src: string): T!`
 
 Decodes the JSON text `src` into `T`, which must be a class carrying `@json`,
