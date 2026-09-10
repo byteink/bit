@@ -483,7 +483,9 @@ accepts in §2 and is not new here.
 the opposite of what the superseded decision required.** `@nosplit` forbids
 allocation (E0075), so several panic-message constructors and one deadlock
 constructor assemble a `{ptr, len}` header **by hand** in module-static
-scalar arrays and pass its address straight to `bit_rt_panic`:
+scalar arrays and pass its address straight to `bit_rt_panic` — or, for the
+two runtime-internal ones (`panicDeadlock` and `runtime/gc/stackmap.bit`'s
+pair), to the always-fatal `bit_rt_fatal` instead (§12, #4744):
 
 | File | Function | Static array |
 |---|---|---|
