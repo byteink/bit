@@ -40,7 +40,7 @@ import {
   threadJoin, threadJoinDone, threadJoinTimedOut, threadRunning,
   threadStackBytes, threadMaxWorkers,
 } from "../../../../runtime/thread"
-import { parkWaitReady, parkWaitTimedOut } from "../../../../runtime/park"
+import { parkWaitReady } from "../../../../runtime/park"
 
 // All six properties passed: P1|P2|P3|P4|P5|P6 = 1|2|4|8|16|32.
 // A bitmask rather than a count so a failure names the property that broke.
@@ -157,36 +157,23 @@ export fn workChildEntry(): *byte {
   return entryOf(workChild)
 }
 
-// Run the whole property set against one platform's provider.
-//
-// `wakerEntry` is the one child body this module cannot supply: P4's child must
-// call the PLATFORM's `parkWake`, and a child receives only a `*byte` argument,
-// so it cannot be handed a function value. Each platform program therefore
-// declares its own waker and passes its entry address in. The requirements on
-// that body are stated at P4.
-export fn threadProps(
-  startFn: (*byte, *byte, *i32) => int,
-  releaseFn: (int) => bool,
-  waitFn: (*i32, i32, int) => int,
-  sleepFn: (int) => (),
-  monoFn: () => int,
-  wakerEntry: *byte,
-): int {
-  let mask = 0
+// The five provider entry points one platform supplies, bundled so the phase
+// functions below can each take the whole provider in one parameter. P4's
+// `wakerEntry` is deliberately NOT a field: it is an entry address, not a
+// callable value, and it is needed by exactly one phase.
+export class ThreadProvider {
+  export startFn: (*byte, *byte, *i32) => int,
+  export releaseFn: (int) => bool,
+  export waitFn: (*i32, i32, int) => int,
+  export sleepFn: (int) => (),
+  export monoFn: () => int,
+}
 
-  // Every atomic word the children touch lives in one of these two slices, so
-  // one live local per slice keeps all of them reachable. Holding only raw
-  // addresses would not: a raw pointer is untraced (§11.4), so the collector
-  // could reclaim a word a running child still writes to.
-  let dones = []i32(NT)
-  let cells = []i32(NT)
-  // Two words per thread: [address of its done word, address of its cell].
-  let regions = []i64(2 * NT)
-
+// Zero every word the children will touch and fill each thread's two-word
+// region with the ADDRESSES of its done word and its cell.
+fn setupRegions(dones: []i32, cells: []i32, regions: []i64) {
   let donesBase = int(ptrOf(dones))
   let cellsBase = int(ptrOf(cells))
-  let regionsBase = int(ptrOf(regions))
-
   let t = 0
   while (t < NT) {
     dones[t] = i32(0)
@@ -195,46 +182,64 @@ export fn threadProps(
     regions[2 * t + 1] = i64(elemAddr(cellsBase, t))
     t = t + 1
   }
+}
 
-  // ---- P1: one thread starts, runs, and is joined -------------------------
-  //
-  // The seed is what makes "it ran" distinguishable from "the cell happened to
-  // hold the right number": the child returns seed + WORK_SUM, so a cell still
-  // holding the seed means no child ran, and a zero means it never even got
-  // its argument.
+// ---- P1: one thread starts, runs, and is joined ---------------------------
+// ---- P2: the handle releases ----------------------------------------------
+//
+// The seed is what makes "it ran" distinguishable from "the cell happened to
+// hold the right number": the child returns seed + WORK_SUM, so a cell still
+// holding the seed means no child ran, and a zero means it never even got
+// its argument.
+//
+// P2 is only meaningful after P1's join reported done -- releasing a running
+// thread's stack is exactly the use-after-free this ordering exists to
+// prevent, which is why `threadRelease` is documented as join-then-release.
+// The two share one function because P2 cannot be stated without P1's handle
+// and join result.
+fn startJoinReleaseProps(
+  p: ThreadProvider, cells: []i32, donesBase: int, regionsBase: int,
+): int {
+  let mask = 0
   let seed1 = 77
   cells[0] = i32(seed1)
   let done0 = i32At(elemAddr(donesBase, 0))
-  let h1 = startFn(workChildEntry(), byteAt(regionsBase), done0)
+  let h1 = p.startFn(workChildEntry(), byteAt(regionsBase), done0)
   let joined1 = threadJoinTimedOut
   if (h1 != 0) {
-    joined1 = threadJoin(done0, JOIN_NS, sleepFn, monoFn)
+    joined1 = threadJoin(done0, JOIN_NS, p.sleepFn, p.monoFn)
   }
   if (h1 != 0 && joined1 == threadJoinDone && int(cells[0]) == seed1 + WORK_SUM) {
     mask = mask | 1
   }
-
-  // ---- P2: the handle releases -------------------------------------------
-  //
-  // Only meaningful after P1's join reported done — releasing a running
-  // thread's stack is exactly the use-after-free this ordering exists to
-  // prevent, which is why `threadRelease` is documented as join-then-release.
-  if (h1 != 0 && joined1 == threadJoinDone && releaseFn(h1)) {
+  if (h1 != 0 && joined1 == threadJoinDone && p.releaseFn(h1)) {
     mask = mask | 2
   }
+  return mask
+}
 
-  // ---- P3: NT threads run at once, each with its own stack and done word --
-  //
-  // All are started before any is joined, so they are genuinely concurrent
-  // rather than a sequence of one-at-a-time spawns. Distinct seeds mean a
-  // provider that handed two children the same argument region — or the same
-  // stack — produces a wrong sum rather than a plausible one.
-  let handles = []int(NT)
+// ---- P3: NT threads run at once, each with its own stack and done word ----
+//
+// All are started before any is joined, so they are genuinely concurrent
+// rather than a sequence of one-at-a-time spawns. Distinct seeds mean a
+// provider that handed two children the same argument region -- or the same
+// stack -- produces a wrong sum rather than a plausible one.
+// Counts from the join pass, so the verdict below reads as one comparison.
+class JoinCounts {
+  joined: int,
+  correct: int,
+  released: int,
+}
+
+// Start every child before joining any, so they are genuinely concurrent.
+fn startAll(
+  p: ThreadProvider, cells: []i32, donesBase: int, regionsBase: int, handles: []int,
+): int {
   let started = 0
   let k = 0
   while (k < NT) {
     cells[k] = i32(100 + k)
-    handles[k] = startFn(
+    handles[k] = p.startFn(
       workChildEntry(),
       byteAt(elemAddr(regionsBase, 2 * k)),
       i32At(elemAddr(donesBase, k)),
@@ -244,48 +249,73 @@ export fn threadProps(
     }
     k = k + 1
   }
+  return started
+}
 
-  let joinedAll = 0
+fn joinAll(p: ThreadProvider, cells: []i32, donesBase: int, handles: []int): JoinCounts {
+  let joined = 0
   let correct = 0
   let released = 0
   let j = 0
   while (j < NT) {
     if (handles[j] != 0) {
-      if (threadJoin(i32At(elemAddr(donesBase, j)), JOIN_NS, sleepFn, monoFn) == threadJoinDone) {
-        joinedAll = joinedAll + 1
+      if (threadJoin(
+        i32At(elemAddr(donesBase, j)),
+        JOIN_NS,
+        p.sleepFn,
+        p.monoFn,
+      ) == threadJoinDone) {
+        joined = joined + 1
         if (int(cells[j]) == 100 + j + WORK_SUM) {
           correct = correct + 1
         }
-        if (releaseFn(handles[j])) {
+        if (p.releaseFn(handles[j])) {
           released = released + 1
         }
       }
     }
     j = j + 1
   }
-  if (started == NT && joinedAll == NT && correct == NT && released == NT) {
-    mask = mask | 4
-  }
+  return JoinCounts{ joined: joined, correct: correct, released: released }
+}
 
-  // ---- P4: parkWake WAKES A REAL WAITER -----------------------------------
-  //
-  // The whole reason this task had to exist before #1364 could trust the
-  // parking pair. The parent blocks in `parkWait` on a word holding 42,
-  // expecting 42, with a 5s bound. The child sleeps 100ms — long enough that
-  // the parent is already blocked — and then calls the platform's `parkWake`
-  // on that same word WITHOUT CHANGING IT.
-  //
-  // Leaving the word alone is what makes the outcomes discriminate. The wait
-  // can only end early by being woken, so:
-  //
-  //   wake works   -> returns ~100ms with parkWaitReady
-  //   wake is lost -> returns at the 5s deadline with parkWaitTimedOut
-  //   never blocks -> returns immediately, under the 40ms floor
-  //
-  // All three are distinguishable, and the two failures are 50x and 25x away
-  // from the pass window rather than adjacent to it. A spurious wake cannot
-  // manufacture a pass either, because the floor requires that it really did
-  // block for at least 40ms first.
+fn concurrentProps(
+  p: ThreadProvider, cells: []i32, donesBase: int, regionsBase: int,
+): int {
+  let handles = []int(NT)
+  let started = startAll(p, cells, donesBase, regionsBase, handles)
+  let c = joinAll(p, cells, donesBase, handles)
+  if (started == NT && c.joined == NT && c.correct == NT && c.released == NT) {
+    return 4
+  }
+  return 0
+}
+
+// ---- P4: parkWake WAKES A REAL WAITER -------------------------------------
+//
+// The whole reason this task had to exist before #1364 could trust the
+// parking pair. The parent blocks in `parkWait` on a word holding 42,
+// expecting 42, with a 5s bound. The child sleeps 100ms -- long enough that
+// the parent is already blocked -- and then calls the platform's `parkWake`
+// on that same word WITHOUT CHANGING IT.
+//
+// Leaving the word alone is what makes the outcomes discriminate. The wait
+// can only end early by being woken, so:
+//
+//   wake works   -> returns ~100ms with parkWaitReady
+//   wake is lost -> returns at the 5s deadline with parkWaitTimedOut
+//   never blocks -> returns immediately, under the 40ms floor
+//
+// All three are distinguishable, and the two failures are 50x and 25x away
+// from the pass window rather than adjacent to it. A spurious wake cannot
+// manufacture a pass either, because the floor requires that it really did
+// block for at least 40ms first.
+//
+// The three words the waker child touches are locals of THIS frame and the
+// child is started, joined and released inside it, so they are rooted for the
+// whole of the child's life.
+fn wakeProps(p: ThreadProvider, wakerEntry: *byte): int {
+  let mask = 0
   let wakeWord = []i32(1)
   let wakeDone = []i32(1)
   let wakeRegion = []i64(2)
@@ -294,52 +324,58 @@ export fn threadProps(
   wakeRegion[0] = i64(int(ptrOf(wakeDone)))
   wakeRegion[1] = i64(int(ptrOf(wakeWord)))
 
-  let wakeHandle = startFn(wakerEntry, byteAt(int(ptrOf(wakeRegion))), ptrOf(wakeDone))
+  let wakeHandle = p.startFn(wakerEntry, byteAt(int(ptrOf(wakeRegion))), ptrOf(wakeDone))
   if (wakeHandle != 0) {
-    let w0 = monoFn()
-    let rc = waitFn(ptrOf(wakeWord), i32(42), WAKE_WAIT_NS)
-    let elapsed = monoFn() - w0
+    let w0 = p.monoFn()
+    let rc = p.waitFn(ptrOf(wakeWord), i32(42), WAKE_WAIT_NS)
+    let elapsed = p.monoFn() - w0
     if (rc == parkWaitReady && elapsed >= WAKE_FLOOR_NS && elapsed < WAKE_CEIL_NS) {
       mask = mask | 8
     }
     // Reap regardless of the outcome, so a failed P4 cannot leak a thread into
     // the rest of the run.
-    let wj = threadJoin(ptrOf(wakeDone), JOIN_NS, sleepFn, monoFn)
+    let wj = threadJoin(ptrOf(wakeDone), JOIN_NS, p.sleepFn, p.monoFn)
     if (wj == threadJoinDone) {
-      let rel = releaseFn(wakeHandle)
+      let _ = p.releaseFn(wakeHandle)
     }
   }
+  return mask
+}
 
-  // ---- P5: the join's timeout really fires, and really waited -------------
-  //
-  // No thread is involved: the word simply never becomes 0, which is precisely
-  // what a wedged worker looks like. This is the guard that keeps every join
-  // finite, so it is checked directly rather than trusted — a join that
-  // returned `threadJoinDone` here would report a stuck thread as finished, and
-  // a join that returned instantly would not have waited at all.
+// ---- P5: the join's timeout really fires, and really waited ---------------
+//
+// No thread is involved: the word simply never becomes 0, which is precisely
+// what a wedged worker looks like. This is the guard that keeps every join
+// finite, so it is checked directly rather than trusted -- a join that
+// returned `threadJoinDone` here would report a stuck thread as finished, and
+// a join that returned instantly would not have waited at all.
+fn joinTimeoutProps(p: ThreadProvider): int {
   let stuck = []i32(1)
   atomicStore(ptrOf(stuck), i32(threadRunning))
-  let s0 = monoFn()
-  let rc5 = threadJoin(ptrOf(stuck), TIMEOUT_NS, sleepFn, monoFn)
-  let waited = monoFn() - s0
+  let s0 = p.monoFn()
+  let rc5 = threadJoin(ptrOf(stuck), TIMEOUT_NS, p.sleepFn, p.monoFn)
+  let waited = p.monoFn() - s0
   if (rc5 == threadJoinTimedOut && waited >= TIMEOUT_FLOOR_NS && waited < TIMEOUT_CEIL_NS) {
-    mask = mask | 16
+    return 16
   }
+  return 0
+}
 
-  // ---- P6: the boundaries, and the slice-layout assumption ----------------
-  //
-  // Three unrelated small facts that would each silently break something:
-  //
-  //   - an already-cleared word joins immediately rather than waiting out a
-  //     deadline (an idempotent second join);
-  //   - `threadRelease` refuses a zero handle instead of unmapping address 0;
-  //   - `elemAddr`'s ONE-8-BYTE-WORD-PER-ELEMENT assumption really holds. This
-  //     is written through the slice and read back through the raw pointer, so
-  //     if a `[]i32` were ever a packed 4-byte array, every address this file
-  //     computes would be wrong and this is what would say so.
+// ---- P6: the boundaries, and the slice-layout assumption ------------------
+//
+// Three unrelated small facts that would each silently break something:
+//
+//   - an already-cleared word joins immediately rather than waiting out a
+//     deadline (an idempotent second join);
+//   - `threadRelease` refuses a zero handle instead of unmapping address 0;
+//   - `elemAddr`'s ONE-8-BYTE-WORD-PER-ELEMENT assumption really holds. This
+//     is written through the slice and read back through the raw pointer, so
+//     if a `[]i32` were ever a packed 4-byte array, every address this file
+//     computes would be wrong and this is what would say so.
+fn boundaryProps(p: ThreadProvider): int {
   let cleared = []i32(1)
   atomicStore(ptrOf(cleared), i32(0))
-  let rc6 = threadJoin(ptrOf(cleared), TIMEOUT_NS, sleepFn, monoFn)
+  let rc6 = threadJoin(ptrOf(cleared), TIMEOUT_NS, p.sleepFn, p.monoFn)
 
   let probe = []i32(3)
   probe[0] = i32(0)
@@ -354,11 +390,41 @@ export fn threadProps(
   // will size.
   let constantsOk = threadStackBytes > 0 && threadMaxWorkers == 1024
 
-  if (rc6 == threadJoinDone && !releaseFn(0) && layoutOk && constantsOk) {
-    mask = mask | 32
+  if (rc6 == threadJoinDone && !p.releaseFn(0) && layoutOk && constantsOk) {
+    return 32
   }
+  return 0
+}
 
-  return mask
+// Run the whole property set against one platform's provider.
+//
+// `wakerEntry` is the one child body this module cannot supply: P4's child must
+// call the PLATFORM's `parkWake`, and a child receives only a `*byte` argument,
+// so it cannot be handed a function value. Each platform program therefore
+// declares its own waker and passes its entry address in. The requirements on
+// that body are stated at P4.
+//
+// Every atomic word the P1/P3 children touch lives in one of the two slices
+// below, so one live local per slice keeps all of them reachable. Holding only
+// raw addresses would not: a raw pointer is untraced (§11.4), so the collector
+// could reclaim a word a running child still writes to. They stay locals of
+// THIS frame -- the phase functions receive the headers and the bases, and a
+// caller frame's slots are traced for the whole of a callee's run.
+export fn threadProps(p: ThreadProvider, wakerEntry: *byte): int {
+  let dones = []i32(NT)
+  let cells = []i32(NT)
+  // Two words per thread: [address of its done word, address of its cell].
+  let regions = []i64(2 * NT)
+  setupRegions(dones, cells, regions)
+
+  let donesBase = int(ptrOf(dones))
+  let regionsBase = int(ptrOf(regions))
+
+  return startJoinReleaseProps(p, cells, donesBase, regionsBase) |
+    concurrentProps(p, cells, donesBase, regionsBase) |
+    wakeProps(p, wakerEntry) |
+    joinTimeoutProps(p) |
+    boundaryProps(p)
 }
 
 // An address as a `*byte`, for the opaque argument a child receives.
