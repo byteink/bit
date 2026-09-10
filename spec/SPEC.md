@@ -2232,10 +2232,13 @@ while being represented as a shared box.
   `len` — is unaffected, since none of them needs a zero value.
 - `s[lo:hi]` slices; `lo` defaults to `0`, `hi` to `len(s)`. Violation panics.
   On a `[]T` the result is a view sharing the backing buffer (`0 <= lo <= hi <=
-  cap(s)`). On a `string` the result is a fresh string copying bytes `[lo, hi)`
-  (`0 <= lo <= hi <= len(s)`) — string headers hold interior pointers, so a
-  shared view could not keep the backing alive. Re-slicing a `[N]T` array is not
-  yet supported (§21).
+  cap(s)`). On a `string` the result is also a view, sharing the backing bytes
+  `[lo, hi)` (`0 <= lo <= hi <= len(s)`: a string carries no spare capacity, so
+  the bound is `len`, not `cap`); the string header's `base` field keeps that
+  backing alive. Sharing is unobservable because `string` is deeply immutable
+  (§13.3), so there is no aliasing hazard; the accepted cost is retention — a
+  small long-lived view keeps its whole backing alive, exactly as `[]T`
+  reslicing already does. Re-slicing a `[N]T` array is not yet supported (§21).
 
 ### 12.7 Generic Call Disambiguation (`<`)
 
