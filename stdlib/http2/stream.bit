@@ -4,6 +4,16 @@
 // file over the 800-line ceiling; same flat `std/http2` module and namespace, so
 // nothing here is imported anywhere.
 
+// One take from a stream's body (`Stream.read`): `data` is every byte that had
+// arrived and had not been taken yet, `eof` says the peer ended the stream so
+// nothing more will come. A chunk carries both when the last DATA frame is also
+// the one that ends the body; only a body already read to its end yields an
+// empty one.
+export class BodyChunk {
+  export data: []byte,
+  export eof: bool,
+}
+
 // One inbound stream, handed to a `serve` handler as the second argument so it
 // can abort the stream it is answering with a code of its own choosing.
 //
@@ -35,6 +45,41 @@ export class Stream {
   export reset(errorCode: int) {
     h2connSendReset(this.cmdCh, this.id, errorCode)
   }
+
+  // Take the next of this stream's request body as it lands, without waiting for
+  // the peer to end the stream (#4624). Blocks until at least one byte has
+  // arrived or the body has ended, and hands back everything that had arrived
+  // and had not been taken yet. Fails when the stream dies mid-body, so a
+  // truncated body is never returned as a complete one.
+  //
+  // The take is what renews the receive windows (`h2connSendBody`, streams.bit),
+  // so a handler reading this way IS the backpressure: the peer stops at the
+  // connection window for as long as the handler is behind it, rather than
+  // uploading up to `Config.maxBodyBytes` into the engine's buffer.
+  //
+  // Bytes are there to take only under `Config.streamBodies`, which is what stops
+  // `serve` from draining the body itself; under the default the handler is
+  // handed a complete `req.body` and this returns an empty final chunk. Exactly
+  // one thread reads one stream — the handler's own — and it must not read again
+  // after a chunk with `eof` set or after a failure: the loop stops answering a
+  // reader that owes it nothing.
+  export read(): BodyChunk! {
+    let ch = chan<h2connRead>(1)
+    this.cmdCh <- h2connCmd{
+      kind: h2cmdRead,
+      readCh: ch,
+      request: h2connZeroRequest(),
+      response: h2connZeroResponse(),
+      streamId: this.id,
+      errorCode: 0,
+      replyCh: h2connDummyReply(),
+    }
+    let r = <- ch
+    if (r.errMsg != "") {
+      fail newError(r.errMsg)
+    }
+    return BodyChunk{ data: r.data, eof: r.eof }
+  }
 }
 
 // The `h2cmdReset` command both `Conn.resetStream` and `Stream.reset` put on the
@@ -53,13 +98,17 @@ fn h2connSendReset(cmdCh: chan<h2connCmd>, streamId: int, errorCode: int) {
 }
 
 // One served request, on its own green thread: run the handler, then send its
-// answer to the loop. `s` is the handler's handle on this stream, and is also
+// answer to the loop. `drain` is `serve`'s answer to whether this handler wants
+// its body whole — the stream has one and `Config.streamBodies` is not set — in
+// which case the body is taken here and `req.body` is complete before the
+// handler runs; otherwise the handler takes it through `Stream.read` or leaves
+// it, and `h2connCmdRespond` (commands.bit) releases whatever is left unread. `s` is the handler's handle on this stream, and is also
 // where this function's own `cmdCh` and stream id live — one object, so the
 // reset the handler may send and the response sent here provably name the same
 // stream and travel the same channel in that order (`Stream.reset`).
-fn h2connHandle(s: Stream, req: Request, hasBody: bool, handler: (Request, Stream) => Response) {
+fn h2connHandle(s: Stream, req: Request, drain: bool, handler: (Request, Stream) => Response) {
   let full = req
-  if (hasBody) {
+  if (drain) {
     // The stream is already gone, and answering it is neither possible nor owed:
     // the loop reset it and told whoever needed telling.
     full.body = h2connDrainBody(s) catch _ {
