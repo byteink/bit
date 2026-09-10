@@ -388,6 +388,14 @@ exactly that kind of waiver in one direction.
 
 ## Gate extension — not done here, and blocked on #3616
 
+**Superseded, and kept as the record of what was decided when.** `runtime/`
+did get into that gate's scope (#3620), and `tools/build/lint-ceiling.txt`
+no longer exists: #4149 replaced its counts with the named `<CODE>
+<repo-relative-path>` debt list in `tools/build/lint-debt.txt`, on the
+owner's 2026-09-10 ruling that a debt list is a paydown queue to zero and
+never a count. Read the two paragraphs below as history, not as the current
+mechanism — `_tests_/bit/lintself.bit`'s own header states that.
+
 The original ticket's step 2 ("extend the settled count into a gate") is
 explicitly deferred, for two reasons stated in this ticket's own dispatch:
 first, this ticket's deliverable is the decision, not the mechanical
