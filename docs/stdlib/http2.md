@@ -694,8 +694,11 @@ Both are accounted rather than merely advertised: a DATA frame spends the credit
 it uses when the frame is counted, and the credit comes back on the
 WINDOW_UPDATE that renews it, so a peer sending past the credit it holds fails
 the connection with GOAWAY carrying `errorFlowControlError` (RFC 9113 §6.9.1).
-A conforming peer never reaches that ceiling, because the engine buffers the
-whole body and so renews the credit as the DATA lands.
+The credit for a body follows the application: it is held from the moment the
+DATA lands until the thread reading that body takes those bytes, and the
+WINDOW_UPDATE goes out with the take. A peer sending faster than its body is
+read therefore runs the window down and stops at it, which is what makes flow
+control backpressure rather than bookkeeping.
 
 What a DATA frame spends is its whole payload - the Pad Length octet and the
 padding included, as RFC 9113 §6.9 defines it - and not the body left after the
@@ -714,10 +717,12 @@ at the default 16384-byte frame size being enough to consume all 65535 bytes of
 it. Only the connection window: the stream is being reset or is gone, and a
 WINDOW_UPDATE on it would grant credit nobody can spend.
 
-Because the credit for a frame is granted in the same act that spends it, the
-connection window is a per-frame ceiling in practice rather than a running
-total. Bounding what a peer may upload is `maxBodyBytes`' job, not flow
-control's.
+Those two paths are the exception rather than the rule: their bytes are never
+resident and no read is coming for them, so there is no take to hang the
+renewal on. Everywhere else the connection window is a running total across
+frames, and a peer whose unread bodies pass it fails the connection.
+`maxBodyBytes` bounds a single body; flow control bounds what may be in flight
+unread.
 
 `maxHeaderListBytes` is the largest header block the connection will accumulate
 across a HEADERS frame and every CONTINUATION continuing it. `maxFrameSize`
@@ -763,9 +768,9 @@ zero, meaning it will accept no header list at all.
 take a stream's buffered body past it is refused before those bytes are
 appended, and the stream is reset with `errorEnhanceYourCalm` (RFC 9113 §7); the
 rest of the connection's streams carry on. It has no wire representation on
-purpose: flow control bounds bytes *in flight*, and this engine replenishes both
-windows the instant DATA lands - precisely because it buffers the whole body -
-so only a local budget bounds bytes *resident*. There is deliberately no value
+purpose: flow control bounds bytes *in flight*, and the two windows bound only
+what has arrived unread, so a body the reader is keeping up with can grow past
+either of them and only a local budget bounds bytes *resident*. There is deliberately no value
 meaning "unlimited": `0` refuses every body.
 
 The budget is per stream, and the connection's total is bounded by the stream

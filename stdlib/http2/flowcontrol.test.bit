@@ -21,16 +21,14 @@
 // WINDOW_UPDATEs) and by `events.test.bit`'s 20000-byte one. A fix that spent
 // the window and failed to renew it would hang both.
 //
-// Since #4621 the connection window is renewed for EVERY DATA frame the engine
-// counts, including the two whose bytes it drops (a body over `maxBodyBytes`, a
-// frame for a stream that is closed or gone), so it is back at its full value
-// before the next frame is read. That is what makes the last two tests below
-// possible and what makes a running total across frames impossible: this engine
-// buffers whole bodies and therefore grants the credit back on arrival, so the
-// connection-level check is a per-frame ceiling — the two boundary tests above
-// are its whole reachable surface. A running total needs the WINDOW_UPDATE
-// deferred until the body is handed to the application, which is real
-// backpressure and a different engine (#4624).
+// Since #4621 the connection window is renewed for every DATA frame whose bytes
+// the engine DROPS (a body over `maxBodyBytes`, a frame for a stream that is
+// closed or gone), so those never deplete it — which is what makes the two
+// discard tests below possible and what #4621 fixed. A frame whose bytes are
+// KEPT no longer renews them on arrival: since #4624 the credit is held until
+// the thread consuming that body takes them, so the connection-level check is a
+// running account across frames and not the per-frame ceiling this file was
+// written against. The `#4624` section below is that account.
 //
 // The queue walks below (`fcGoawayCode`, `fcConnCredit`) TAKE the frames off
 // `writeCh`. At most one may be called per test, and any assertion after it
@@ -93,6 +91,121 @@ fn fcGoawayCode(st: h2connState): int {
 // real codec so the handler sees exactly what the wire would hand it.
 fn fcSendData(st: h2connState, streamId: int, n: int, endStream: bool): ()! {
   h2connOnData(st, btDataFrame(streamId, btPattern(n), endStream)?)
+}
+
+// --- the running total, once the credit is HELD (#4624) -----------------------
+//
+// The header above says a running total across frames is impossible in this
+// engine and that the connection-level check is a per-frame ceiling. That was
+// true while every DATA frame renewed its own credit the instant it landed;
+// #4624 holds the credit for a body somebody is going to take, so the two tests
+// below are the running account itself — the acceptance this ticket owes.
+
+// `fcState`'s narrowed windows on a CLIENT, which is the half of the engine
+// where a whole response body is taken by one thread (`roundTrip`, conn.bit).
+fn fcClientState(connWindow: int, streamWindow: int, maxBody: int): h2connState {
+  let st = btState(true, maxBody)
+  st.connRecvWindow = connWindow
+  st.ourInitialWindow = streamWindow
+  return st
+}
+
+// A client stream whose response HEADERS have arrived, so the `roundTrip` has
+// been answered and owes the loop a body read: `bodyOpen` is set and every DATA
+// byte on it is credit the loop holds until that read takes it. `replyCh` holds
+// one message, which is exactly what the delivery sends.
+fn fcAwaitingBody(st: h2connState, id: int): h2connStream {
+  let s = btOpenStream(st, id, chan<h2connMsg>(1))
+  s.state = h2stHCLocal
+  h2connClientHeaders(st, id, srStatusFields(200), false)
+  return s
+}
+
+test "held credit accumulates across DATA frames until the window is spent" {
+  // Three 40-byte frames against a 100-byte connection window, with nothing
+  // draining the body: the first two are accepted and renew NOTHING, the
+  // running total reaches 120, and the third is the FLOW_CONTROL_ERROR RFC 9113
+  // §6.9.1 requires. Before #4624 each frame renewed its own 40 bytes on
+  // arrival and this program ran forever.
+  let st = fcClientState(100, 1048576, 1048576)
+  let s = fcAwaitingBody(st, 1)
+  assert(s.bodyOpen, "the response was delivered with no body reader owed an answer")
+  fcSendData(st, 1, 40, false) catch e {
+    assert(false, "building the first DATA frame failed: ${e.message()}")
+    return
+  }
+  fcSendData(st, 1, 40, false) catch e2 {
+    assert(false, "building the second DATA frame failed: ${e2.message()}")
+    return
+  }
+  assert(st.running, "two frames inside the window terminated the connection")
+  assert(
+    st.connRecvWindow == 20,
+    "connRecvWindow = ${st.connRecvWindow} after 80 held bytes, want 20",
+  )
+  assert(len(s.recvBody) == 80, "recvBody = ${len(s.recvBody)} bytes, want 80")
+  fcSendData(st, 1, 40, false) catch e3 {
+    assert(false, "building the third DATA frame failed: ${e3.message()}")
+    return
+  }
+  assert(!st.running, "a running total of 120 past a 100-byte window was accepted")
+  assert(
+    fcGoawayCode(st) == errorFlowControlError,
+    "no GOAWAY carrying ${errorFlowControlError} (FLOW_CONTROL_ERROR) was queued",
+  )
+}
+
+// One take of everything `id` has buffered, as `h2connDrainBody` (streams.bit)
+// issues it from the thread consuming the body. Returns the bytes taken.
+// Answered on the spot rather than parked, because every caller below takes
+// bytes that have already arrived.
+fn fcTakeBody(st: h2connState, id: int): int {
+  let ch = chan<h2connRead>(1)
+  h2connCmdRead(
+    st,
+    h2connCmd{
+      kind: h2cmdRead,
+      readCh: ch,
+      request: h2connZeroRequest(),
+      response: h2connZeroResponse(),
+      streamId: id,
+      errorCode: 0,
+      replyCh: h2connDummyReply(),
+    },
+  )
+  let r = <- ch
+  return len(r.data)
+}
+
+test "a taken body renews the connection window and the peer is told" {
+  // The control on the test above: the same 80 held bytes, taken by the reader
+  // this time. The window returns to its full 100, the peer is granted every
+  // byte of it, and a second 80-byte frame — which the running total above
+  // refused — is accepted.
+  let st = fcClientState(100, 1048576, 1048576)
+  let s = fcAwaitingBody(st, 1)
+  fcSendData(st, 1, 80, false) catch e {
+    assert(false, "building the first DATA frame failed: ${e.message()}")
+    return
+  }
+  assert(
+    st.connRecvWindow == 20,
+    "connRecvWindow = ${st.connRecvWindow} while the body is unread, want 20",
+  )
+  let took = fcTakeBody(st, 1)
+  assert(took == 80, "the reader took ${took} bytes, want 80")
+  assert(len(s.recvBody) == 0, "recvBody holds ${len(s.recvBody)} bytes after the take, want 0")
+  assert(
+    st.connRecvWindow == 100,
+    "connRecvWindow = ${st.connRecvWindow} after the take, want 100",
+  )
+  fcSendData(st, 1, 80, false) catch e2 {
+    assert(false, "building the second DATA frame failed: ${e2.message()}")
+    return
+  }
+  assert(st.running, "the frame the renewed window makes room for was refused")
+  let granted = fcConnCredit(st)
+  assert(granted == 80, "the peer was granted ${granted} connection bytes, want 80")
 }
 
 // --- a single frame against the advertised window -----------------------------
