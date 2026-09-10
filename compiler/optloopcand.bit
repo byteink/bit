@@ -260,11 +260,19 @@ fn licmPureOp(op: Op): bool {
 // a call really can change `len` or `off` underneath the hoist. A pure
 // computation needs nothing of the kind, which is why `sc.clobbered` is a
 // per-candidate question here and not a reason to refuse the whole loop.
+//
+// A KNOWN value is refused except for #4729's one shape. Constants are
+// deliberately re-materialized rather than kept live, which is right for the
+// single `movz` most of them cost; `licmWideConst` names the ones it is wrong
+// for.
 fn licmHoistable(lc: LicmCtx, sc: LicmScan, idx: int): bool {
-  if (sc.known[idx].known || sc.fwd[idx] >= 0) {
+  if (sc.fwd[idx] >= 0) {
     return false
   }
   let ins = lc.f.instrs[idx]
+  if (sc.known[idx].known) {
+    return licmWideConst(ins, sc.known[idx])
+  }
   if (licmReadsHeaderWord(lc, ins)) {
     return !sc.clobbered
   }
@@ -272,6 +280,34 @@ fn licmHoistable(lc: LicmCtx, sc: LicmScan, idx: int): bool {
     return false
   }
   return licmPureOp(ins.op)
+}
+
+// #4729: a `const_int` the loop body cannot materialize in ONE instruction, so
+// threading it round the loop as a block parameter costs one register and saves
+// the rest of its `movz`/`movk` chain on every iteration.
+//
+// `movImm64Words` is ASKED, never restated — the same discipline `isRematConst`
+// (arm64remat.bit) follows, and its one-word bar is untouched: this is a second
+// question about a WIDER constant, not a lowering of that bar. #4723 measured
+// that the bar is not what holds a multi-word constant in a loop body.
+//
+// The Granlund-Montgomery multiplier is the shape that motivated it: four words
+// on arm64, minted by optdivmagic.bit inside whatever loop the divide sat in,
+// and #4725 measured both other placements refused by an existing invariant.
+//
+// `Op.ConstInt` rather than "any value the fold proved constant", and the
+// reason is `licmDupOf`: its key is `op`/`ival`/`ty`, and `ival` IS the value
+// only for a `const_int`. A folded `add` carries whatever `ival` it was built
+// with — 0 — however large the constant it computes, so admitting one would let
+// two different constants answer each other.
+//
+// A float or bool constant answers false for the reason `licmConstFolds` gives:
+// neither is materialized by `movImm64` at all.
+fn licmWideConst(ins: IrInstr, kv: ConstVal): bool {
+  if (ins.op != Op.ConstInt || kv.isFloat || kv.isBool) {
+    return false
+  }
+  return movImm64Words(kv.ival) > 1
 }
 
 // The header parameter slot `v` occupies in `sc`'s loop, or -1 when `v` is not
@@ -504,8 +540,27 @@ fn licmOperandsPay(sc: LicmScan, ins: IrInstr, sl: int, sr: int): bool {
   return !licmConstFolds(ins.op, sc.known[ins.rhs], true)
 }
 
+// The `pre` entry a hoisted CONSTANT carries (#4729). A constant has no
+// operands, so it names no preheader source, and `licmPreSource` never yields a
+// negative one for an instruction that does — an edge argument and a constant
+// operand are both real value ids, and a `-1` there makes `licmRecord` return
+// instead of recording. So a negative entry is unambiguous, and
+// `licmBindOperands` (optloopemit.bit) reads it as "nothing to bind".
+//
+// A fixed value rather than `idx`, so `licmDupOf`'s key still collapses two
+// hoists of the same constant out of the same loop into ONE header parameter:
+// `forceParamInterference` (codegenlive.bit) makes a spare one cost a register
+// across the whole loop.
+fn licmConstPre(): int {
+  return -2
+}
+
 fn licmRecord(lc: LicmCtx, sc: LicmScan, idx: int) {
   if (!licmHoistable(lc, sc, idx)) {
+    return
+  }
+  if (sc.known[idx].known) {
+    licmAddHoist(lc, sc, idx, licmConstPre(), -1)
     return
   }
   let ins = lc.f.instrs[idx]
@@ -529,6 +584,12 @@ fn licmRecord(lc: LicmCtx, sc: LicmScan, idx: int) {
   if (!licmOperandsPay(sc, ins, sl, sr)) {
     return
   }
+  licmAddHoist(lc, sc, idx, pre, preRhs)
+}
+
+// Records the decided hoist. Both arms of `licmRecord` land here so neither can
+// grow a plan entry the other does not.
+fn licmAddHoist(lc: LicmCtx, sc: LicmScan, idx: int, pre: int, preRhs: int) {
   // `licmDupOf` FIRST: it scans `plan.ids`, so appending before asking makes
   // every hoist match itself, which hands the rebuild `remap[idx] = remap[idx]`
   // -- an unwritten slot, read as value id 0. That miscompiles silently and
