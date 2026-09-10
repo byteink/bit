@@ -1914,26 +1914,40 @@ against the source with the greps shown, not against ticket text or a
 comment's stated intent.
 
 **The state module (`runtime/sched/preempt.bit`, #2576, landed).** No
-function in this file makes an OS call; every function takes its clock
-reading as a parameter instead of reading one itself
-(`runtime/sched/preempt.bit:16-18`). It defines:
+function in this file makes an OS call, and since #4736 none of them reads a
+clock at all: the budget is counted in SYSMON TICKS. `sysmonTick` bumps the
+module's own `sysmonEpoch` counter once per call, `preemptTickNow()` reads it,
+and both the dispatch stamp and the over-budget comparison use that one value.
+It defines:
 
 - `preemptBudgetNs: i64 = 10000000` (10 ms) — a task that has held its
-  worker longer than this is eligible for a preempt request
-  (`runtime/sched/preempt.bit:28`).
-- Two fixed-size, worker-indexed globals, `startNs` and `requested`, each
+  worker longer than this is eligible for a preempt request.
+- `sysmonPeriodNs: i64 = 2000000` (2 ms) — the monitor thread's sleep between
+  ticks. Both monitor threads import it rather than repeating the literal.
+- `preemptBudgetTicks: i64 = preemptBudgetNs / sysmonPeriodNs + 1` (6) — the
+  threshold actually tested. The `+ 1` is tick granularity: the first tick
+  after a dispatch can land arbitrarily soon, so `k` observed ticks prove only
+  `(k - 1) * sysmonPeriodNs` of elapsed time, and 6 preserves #2578's promise
+  that a worker is never flagged before a real 10 ms of holding its task.
+- `preemptTickNow(): i64` — `sysmonEpoch + 1`, so never 0. The value a
+  dispatch stamps and the value `sysmonTick` measures ages against; one epoch,
+  one accessor, so the two sides cannot disagree about which clock they read.
+- Two fixed-size, worker-indexed globals, `startTick` and `requested`, each
   `[32]i64` (`runtime/sched/preempt.bit:58-59`), whose scan bound is this
   file's own `preemptSlots: int = 32` (`runtime/sched/preempt.bit:51`) —
   deliberately a separate constant from the scheduler's own worker-count
   constant, which this file treats as advisory only, not as the real bound
   on these arrays.
-- `preemptStamp(worker: i64, nowNs: i64)`, which sets `startNs[worker] =
-  nowNs` and clears `requested[worker]` (`runtime/sched/preempt.bit:74-77`).
-- `sysmonTick(nowNs: i64): i64`, which scans every worker slot — bounded by
-  both the scheduler's worker-count constant and `preemptSlots`
-  (`runtime/sched/preempt.bit:97`) — and sets `requested[w] = 1` for any
-  worker whose `startNs` is more than `preemptBudgetNs` in the past,
-  returning the count set this call (`runtime/sched/preempt.bit:94-106`).
+- `preemptStamp(worker: i64, startedTick: i64)`, which sets
+  `startTick[worker] = startedTick` and clears `requested[worker]`. The tick
+  is a parameter rather than read inside, which is what lets
+  `_tests_/bit/pollguardpreempt.bit` backdate one worker deterministically.
+- `sysmonTick(): i64`, which advances `sysmonEpoch` by one and then scans
+  every worker slot — bounded by both the scheduler's worker-count constant
+  and `preemptSlots` — setting `requested[w] = 1` for any worker whose
+  `preemptTickNow() - startTick[w]` has reached `preemptBudgetTicks`, and
+  returning the count set this call. It takes no argument and reads no clock
+  (#4736).
 - `preemptRequested(worker: i64): bool`, which reads the flag without
   clearing it (`runtime/sched/preempt.bit:109-111`).
 - `maybePreempt(worker: i64): bool`, which reports a pending request and
@@ -1961,11 +1975,22 @@ reading as a parameter instead of reading one itself
   NOTE: the `runtime/sched/preempt.bit:NN` line citations in this section
   predate #3560/#3563/#3564/#3746 and have drifted. Resolve by NAME.
 
-**Wired: the stamp on dispatch (#2578, landed).** `schedWorkerStep` calls
-`preemptStamp(*(w + wkId), monoNs())` once per task dispatch, immediately
-before `schedSwitch` hands control to the task
-(`runtime/sched/workerrun.bit:143`) — the only call site for `preemptStamp`
-in the tree (`git grep -n preemptStamp -- '*.bit'`).
+**Wired: the stamp on dispatch (#2578, landed; #4736 changed what it
+stamps).** `schedWorkerStep` calls `preemptStamp(*(w + wkId),
+preemptTickNow())` once per task dispatch, immediately before `schedSwitch`
+hands control to the task (`runtime/sched/workerrun.bit`) — the only call site
+for `preemptStamp` in the tree (`git grep -n preemptStamp -- '*.bit'`).
+
+**#4736: THE DISPATCH PATH READS NO CLOCK.** #2578 stamped `monoNs()` here.
+On Linux that pins `parkMonoNs` (`runtime/park/linux/wait.bit`), a raw
+`clock_gettime` `svc` rather than a vDSO call, so every green-task dispatch —
+once per context switch — took a kernel trap: +147 ns/switch, 285 -> 423
+ns/switch on the arm64-linux `test-schedbench` gate. The stamp is now
+`preemptTickNow()`, one atomic load of a word `preempt.bit` owns. The monitor
+thread lost its clock read in the same change; its `nanosleep` period is the
+only remaining tie between ticks and real time, which is why
+`preemptBudgetTicks` is derived from `sysmonPeriodNs` and both monitor threads
+import that constant.
 
 **Wired: the monitor ticks the flag (#2579 darwin, #2580 linux, both
 landed).** `sysmonRun` is a `nanosleep`-then-`sysmonTick` loop, sleeping
@@ -3870,7 +3895,7 @@ per-worker storage, not a single shared word (§5.1):**
   by the calling task's own worker id (`wkId`, `runtime/sched/worker.bit`)
   via `udpSenderSlot()`, double-bounded against `schedMaxWorkers` and the
   array's own literal capacity (the same shape `runtime/sched/preempt.bit`
-  uses for `startNs`/`requested`). It belongs in this category **now**, post-fix,
+  uses for `startTick`/`requested`). It belongs in this category **now**, post-fix,
   because there are genuinely `schedMaxWorkers` separate words, not one.
 
   `udp_recv` contains a real park (`netRecvFrom`, on the same engine

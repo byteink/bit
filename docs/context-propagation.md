@@ -125,7 +125,7 @@ for the duration of the test:
 
 - `runtime/sched/protoctx.bit` (new, throwaway): a bounded, fixed-size,
   open-addressed table keyed by task address — the same shape as
-  `runtime/sched/preempt.bit`'s `requested[]`/`startNs[]` arrays (Power-of-10
+  `runtime/sched/preempt.bit`'s `requested[]`/`startTick[]` arrays (Power-of-10
   bounded probe, no allocation, `@nosplit` throughout). Two accessors,
   `bit_rt_proto_ctx_set`/`bit_rt_proto_ctx_get`, and one copy function,
   `protoCtxCopyOnSpawn(parentTask, childTask)`.
