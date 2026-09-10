@@ -383,6 +383,28 @@ fn maybePrintFileHeader(printedFiles: []string, file: string, grouped: bool): []
 // prints a summary line and never decides an exit code — `testModule` and
 // `testProject` need DIFFERENT summaries from the same per-test detail, so
 // both call this and finish it themselves.
+// Pay any first-exec cost of `exe` HERE, outside every test's bound (#4557).
+// macOS charges a provenance scan on the first `execve` of a newly CREATED
+// inode, serialized system-wide; #4484 measured 16222ms for it and 18ms for the
+// second exec of the SAME bytes (a `cp`, so the cost is inode freshness, not
+// anything in the binary). A pooled slot (compiler/runslots.bit) is normally an
+// inode an earlier run already validated, which is what #4714 bought — but the
+// first use after `$TMPDIR` is wiped, and every fall back to a nonce path,
+// still creates one, and without this warm-up that scan lands inside the
+// deadline of whichever test is at index 0, which then reports `(timed out)`
+// with no defect in it — and `--run <one test>` makes the test you are
+// debugging the one that pays.
+//
+// `count` is the number of tests, so it is deliberately OUT OF RANGE as an
+// index: the synthetic `main`'s dispatch chain falls through every equality
+// check and returns cleanly (testgen.bit; testgencheck asserts exactly that for
+// index 99), so this execs the binary and runs no test body. The result is
+// discarded on purpose — it is not a test verdict, and a binary too broken to
+// reach `main` fails again in the run loop, where it is reported against a name.
+fn warmTestExe(exe: string, count: int) {
+  let _ = osRunTestBounded(exe, count, warmTestExeMs)
+}
+
 fn runModuleTests(src: string, runPattern: string, timeoutMs: int): ModuleTestReport {
   let noRun = ModuleTestReport{ passed: 0, failed: 0, ranAny: false, buildFailed: true }
   // Always the host target: a cross-compiled test binary could not be run here.
@@ -416,35 +438,24 @@ fn runModuleTests(src: string, runPattern: string, timeoutMs: int): ModuleTestRe
   if (len(names) == 0) {
     return ModuleTestReport{ passed: 0, failed: 0, ranAny: false, buildFailed: false }
   }
-  // Disambiguated for the same reason as `runCmd`'s path (#1459/#1463).
-  // Scratch dir shared with `runCmd`'s `runScratchDir()` (#4173): honors
-  // `$TMPDIR` on POSIX, `%TEMP%`/`%TMP%` on Windows.
-  let tmp = "${runScratchDir()}/bit-test-${pathStem(src)}-${scratchNonce()}"
-  if (!writeModuleExe(module, src, tmp, hostBuildTarget(), rt, false, false)) {
+  // The same pooled scratch slot `bit run` builds into (compiler/runslots.bit):
+  // one long-lived executable, claimed under an exclusive `flock` for the whole
+  // build-and-exec window, so the fixed name cannot race the way #1459/#1463
+  // records. Rooted in `runCmd`'s `runScratchDir()` (#4173): honors `$TMPDIR`
+  // on POSIX, `%TEMP%`/`%TMP%` on Windows.
+  let slot = claimRunSlot("test", pathStem(src))
+  let exe = slot.exe
+  if (!writeModuleExe(module, src, exe, hostBuildTarget(), rt, false, false)) {
+    releaseRunSlot(slot)
     return ModuleTestReport{ passed: 0, failed: 0, ranAny: true, buildFailed: true }
   }
-  // Pay the first-exec cost of `tmp` HERE, outside every test's bound (#4557).
-  // macOS charges a provenance scan on the first `execve` of a newly written
-  // executable, serialized system-wide; #4484 measured 16222ms for it and 18ms
-  // for the second exec of the SAME bytes (a `cp`, so the cost is file
-  // freshness, not anything in the binary). `tmp` is written fresh on every
-  // invocation, so without this the scan lands inside the deadline of whichever
-  // test is at index 0 and that test reports `(timed out)` with no defect in it
-  // — and `--run <one test>` makes the test you are debugging the one that pays.
-  //
-  // `len(names)` is out of range: the synthetic `main`'s dispatch chain falls
-  // through every equality check and returns cleanly (testgen.bit; testgencheck
-  // asserts exactly that for index 99), so this execs the binary and runs no
-  // test body. The result is discarded on purpose — it is not a test verdict,
-  // and a binary too broken to reach `main` fails again in the loop below,
-  // where it is reported against a name.
-  let _ = osRunTestBounded(tmp, len(names), warmTestExeMs)
+  warmTestExe(exe, len(names))
   let grouped = !allSameFile(td.files)
   let printedFiles = []string(0)
   let passed = 0
   let i = 0
   while (i < len(names)) {
-    let code = osRunTestBounded(tmp, i, timeoutMs)
+    let code = osRunTestBounded(exe, i, timeoutMs)
     let ok = testVerdictPassed(names[i], code)
     if (ok) {
       passed = passed + 1
@@ -453,7 +464,7 @@ fn runModuleTests(src: string, runPattern: string, timeoutMs: int): ModuleTestRe
     printTestVerdict(names[i], ok, testFailNote(code), grouped)
     i = i + 1
   }
-  fsRemove(tmp)
+  releaseRunSlot(slot)
   return ModuleTestReport{
     passed: passed, failed: len(names) - passed,
     discovered: len(td.discovered), ranAny: true, buildFailed: false,
