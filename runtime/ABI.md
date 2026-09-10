@@ -2417,7 +2417,9 @@ RtBytes { ptr: *const u8, len: usize }   // extern class — a transient,
   walked from `bit_rt_panic`'s own frame pointer (§4, "Frame chain") and
   symbolized against the `.bit_dbg` debug-info table (§4.2) — then exit
   immediately with code 2 (SPEC.md §18.4: "a non-zero exit code"). There is
-  no `recover` (SPEC.md §18.4). The trace is opt-in, not default: the `//
+  no `recover` keyword (SPEC.md §18.4); a task that wants to survive a panic
+  installs a panic boundary (below), which is consulted *before* any of this
+  runs. The trace is opt-in, not default: the `//
   panic` golden mode (`_tests_/cases/*.bit`) compares stderr byte-for-byte, so
   an always-on trace would need every `.expected` file updated in the same
   change. See `runtime/root/backtrace.bit` (#3285, #3820) for the walker and
@@ -2430,6 +2432,69 @@ RtBytes { ptr: *const u8, len: usize }   // extern class — a transient,
   time a panic reaches `bit_rt_panic`, every `defer` between the panic site
   and the abort must already have run. The runtime only terminates the
   process; it does not itself walk or run deferred calls.
+
+**The panic boundary (#4739, epic).** Six further symbols, specified here and
+provided by `runtime/sched/boundary.bit` and the three `runtime/root/<os>/io.bit`
+providers (not yet in the tree — this section is the contract they are written
+against):
+
+```
+bit_rt_panic_boundary_arm(rec: int)             -> int
+bit_rt_panic_boundary_disarm()                  -> void
+bit_rt_panic_boundary_take(code: int, msg: int) -> int
+bit_rt_panic_boundary_code()                    -> int
+bit_rt_panic_boundary_msg()                     -> int
+bit_rt_fatal(msg: *const RtBytes)               -> noreturn
+```
+
+- `bit_rt_panic_boundary_arm` saves `sp`, a resume address, `fp`/`lr` and BOTH
+  callee-saved register files — the integer file and the FP file (`d8`..`d15`
+  on arm64, `xmm6`..`xmm15` on x64) — into the caller-provided record `rec`,
+  pushes `rec` on the current task's boundary head, and returns 0. The same
+  call site returns **1** when it is reached by a resume rather than by the
+  call, which is how the caller tells the two arrivals apart. The record lives
+  on the arming function's own frame, which sits above every frame a later
+  panic can be raised in. Saving the FP file is the difference from
+  `gcSaveCalleeRegs` (`runtime/gc/gcworldsync.bit`), which only saves: this one
+  restores.
+- `bit_rt_panic_boundary_disarm` pops the head on the normal path — the arming
+  function returning without a panic.
+- `bit_rt_panic_boundary_take` is consulted by every recoverable panic door
+  **before it writes anything**. It returns 0 when the current task has no
+  boundary, and the caller then runs today's write-`panic:`-line, optional
+  backtrace, exit-2 path unchanged, byte for byte. Otherwise it pops the head
+  first (so a panic raised inside the boundary's own handler reaches the next
+  outer boundary, or is fatal), records the `{code, msg}` pair in the record,
+  and resumes in the armed frame — it does not return to its caller on that
+  path. `msg` is the `*const RtBytes` the door was given, as an integer, or 0
+  for an argument-free door; `code` is the reason code of §12.1.
+- `bit_rt_panic_boundary_code` / `bit_rt_panic_boundary_msg` read the pair the
+  last `take` recorded. They are meaningful only in the armed frame after a
+  resume, and the message bytes must be copied out immediately: a runtime
+  panic's message is a module-static buffer that the next panic of the same
+  kind overwrites.
+- `bit_rt_fatal` is the always-fatal door — today's `rootPanic` body verbatim
+  (the `panic: <msg>\n` line, the opt-in backtrace, exit 2) with **no boundary
+  consult**, for a failure no program may catch: a runtime-internal invariant
+  breaking. `bit_rt_oom` (§6) and `bit_rt_gc_mark_stack_overflow` are already
+  separate always-fatal doors and are unaffected.
+
+None of the six is emitted by a backend. They are called from inside the
+runtime (`bit_rt_panic` and the §12.1 doors call `take`; the boundary itself
+calls `arm`/`disarm`), never from generated code, so they are not part of the
+directly-emitted class of §12.1 and `directEmissionSymbols`
+(`tools/build/abiarity.bit`) does not grow for them. What does grow is the
+`@symbol` pin population `_tests_/bit/abimembers/` counts, which reads the
+providing half from the pins under `runtime/**` and the demanding half from the
+compiler's own tables — it never reads this document, so a symbol specified
+here and not yet provided cannot redden `test-abimembers`.
+
+Consulting `take` is a per-door edit, and the doors are not the same set on
+every OS: **windows has three argument-free panic siblings, not four** — there
+is no `bit_rt_panic_overflow` in `runtime/root/windows/io.bit`, where darwin
+and linux have one. That is existing state, recorded here so the per-OS work
+is not read as three-quarters finished; adding a fourth windows door is a
+separate decision, not part of wiring the boundary.
 
 ### 12.1 Backend-injected, argument-free panics (#2016, #2018, #2240, #3078)
 
@@ -2481,6 +2546,24 @@ call can appear (including inside another `@nosplit` function, exactly as
 `bit_rt_panic` itself must be), and never return — control does not resume in
 the caller on the branch that reaches them, so nothing after the call site
 needs to treat their argument-free signature as clobbering anything live.
+
+**The reason code (#4739).** These four doors cannot build a string and must
+not allocate, so what they hand `bit_rt_panic_boundary_take` (§12) is a small
+integer naming the reason instead of a message:
+
+| `code` | Reason                                                     |
+|--------|------------------------------------------------------------|
+| `0`    | message-carrying — `msg` is a `*const RtBytes` (`bit_rt_panic`) |
+| `1`    | `bit_rt_panic_div_zero`                                     |
+| `2`    | `bit_rt_panic_overflow`                                     |
+| `3`    | `bit_rt_panic_nil_call`                                     |
+| `4`    | `bit_rt_panic_nil_iface`                                    |
+
+A door passing a non-zero code passes `msg` as 0; the recovering side maps the
+code to a fixed literal of its own, which is the only place a string for one of
+these panics may be built. Codes are append-only — a new argument-free door
+takes the next integer and never reuses one, because a recovering program may
+have the mapping compiled into it.
 
 ## 13. Fallible results — the error channel (SPEC.md §18)
 
