@@ -37,6 +37,8 @@
 set -eu
 # shellcheck source=scripts/alarmrun.sh
 . "$(dirname -- "$0")/alarmrun.sh"
+# shellcheck source=scripts/diffexit.sh
+. "$(dirname -- "$0")/diffexit.sh"
 
 # stage() is a FULL self-build (`bit build compiler -o ...`), not a
 # single-file dump or a corpus pass, so the family's 20s/300s conventions
@@ -55,7 +57,7 @@ WORK="$(pwd)/.fixpoint-work"
 rm -rf "$WORK"
 mkdir -p "$WORK/b" "$WORK/c" "$WORK/d"
 
-[ -x "$STAGEA" ] || { echo "fixpoint: missing $STAGEA — run: ./make selfhost" >&2; exit 2; }
+diffrequire fixpoint "$STAGEA"
 [ -d compiler ] || { echo "fixpoint: no compiler/ directory — run from the repo root" >&2; exit 2; }
 
 # A BUILD FAILURE IS NOT A FIXPOINT BREAK, and this script used to make them

@@ -321,9 +321,7 @@ NMOD=${#MOD_RELS[@]}
 # citing 22.
 MIN_MODULES=${DIFFRUNTIME_MIN_MODULES:-20}
 
-for bin in "$ORACLE" "$BIT2"; do
-  [ -x "$bin" ] || { echo "diffruntime: missing $bin — run: ./make selfhost" >&2; exit 2; }
-done
+diffrequire diffruntime "$ORACLE" "$BIT2"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

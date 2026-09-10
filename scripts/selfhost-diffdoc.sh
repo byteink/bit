@@ -67,9 +67,7 @@ BIT2=${DIFFDOC_BIT:-bit-out/bin/bit}
 # slower host does not read a scheduling delay as a hang.
 TIMEOUT=${DIFFDOC_TIMEOUT:-20}
 
-for bin in "$ORACLE" "$BIT2"; do
-  [ -x "$bin" ] || { echo "diffdoc: missing $bin — run: ./make selfhost" >&2; exit 2; }
-done
+diffrequire diffdoc "$ORACLE" "$BIT2"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

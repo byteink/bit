@@ -28,6 +28,12 @@ set -u
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=${BIT2:-bit-out/bin/bit}
 
+# Refuse before counting anything (#4505): with bit2 absent every invocation
+# fails to exec, the empty result is scored as an ordinary verdict, and this
+# prints a full-looking count line at exit 0. diffrequire is in
+# scripts/diffexit.sh, next to the exit-2 contract it belongs to.
+diffrequire diffexamples-x64 "$ORACLE" "$BIT2"
+
 # 60s matches selfhost-diffexamples.sh's own build+run budget for this same
 # corpus; DIFFEXAMPLESX64_TIMEOUT overrides for a slower host. Do not go below
 # ~12s on a shared box: #2863's mutation run at a 3s bound produced 11 false

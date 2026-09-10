@@ -45,6 +45,12 @@ set -u
 # docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=${BIT2:-bit-out/bin/bit}
+
+# Refuse before counting anything (#4505): with bit2 absent every invocation
+# fails to exec, the empty result is scored as an ordinary verdict, and this
+# prints a full-looking count line at exit 0. diffrequire is in
+# scripts/diffexit.sh, next to the exit-2 contract it belongs to.
+diffrequire difftests "$ORACLE" "$BIT2"
 PROJ=${1:-_tests_/testproj}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
