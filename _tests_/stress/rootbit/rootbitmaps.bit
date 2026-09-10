@@ -1,0 +1,291 @@
+// M — maps: the scripted port-vs-native map differential (#1367).
+//
+// A sibling of `rootbit.bit`, same directory and therefore the same module, so
+// `mine`, `sameStr`, `nextRand` and every `rt*` import there are already bound
+// here — an import is per-MODULE, and re-importing any of them is E0042. It
+// sorts AFTER `rootbit.bit` (and after `rootbitalign.bit`), which is the order
+// #1511 requires: the helpers this file calls must already be lowered for the
+// inliner to reach them.
+//
+// It is a separate file only because `rootbit.bit` was 785 lines, 15 from the
+// 800-line E0200 ceiling, and phase M's four properties could not be split into
+// named steps inside it without crossing that ceiling. Nothing else changed in
+// the move: same phase, same constants, same call from `main`.
+
+// Map script length. Sized by measurement, not feel: the map starts at 8 slots
+// and grows at 7/8 load, so 400 distinct keys forces SIX growth events
+// (8->16->32->64->128->256->512) and therefore six full rehashes. A shorter
+// script that never grows would let `mapGrow` be deleted entirely — verified by
+// mutation, see the task report.
+const MAP_STEPS = 400
+
+// Tombstone-flood sizes. See the phase's comment for the derivation; these are
+// set against the 7/8 load factor so that a missing `used = len` reset ends at
+// a DIFFERENT capacity, which the iteration-order assertion then catches.
+const FLOOD_A = 250
+const FLOOD_KEEP = 4
+const FLOOD_B = 900
+
+// ---------------------------------------------------------------------------
+// M — maps
+// ---------------------------------------------------------------------------
+
+// The three lockstep agreements `runMapScript` records as it drives the stream.
+// One value rather than three, because the loop that fills them is its own
+// function now and a Bit `return` carries one.
+class ScriptAgree {
+  lenAgree: int,
+  getAgree: int,
+  hasAgree: int,
+}
+
+// Drives the scripted insert/lookup/delete/overwrite stream against the port
+// map `m` and the native map `nat` in lockstep, recording each place they
+// disagree. The comparisons live here; `phaseM` scores them.
+fn runMapScript(m: int, nat: map<string, int>, rng: []u64): ScriptAgree {
+  let ag = ScriptAgree{ lenAgree: 1, getAgree: 1, hasAgree: 1 }
+  let step = 0
+  // Bounded: exactly MAP_STEPS iterations.
+  while (step < MAP_STEPS) {
+    let a = nextRand(rng)
+    let b = nextRand(rng)
+    let op = a % 10
+    // Keys drawn from a space smaller than the step count, so overwrites and
+    // deletes of live keys both happen for real rather than by luck.
+    let k = "k${b % 250}"
+    let km = mine(k)
+    // EVERY STORED VALUE IS NON-ZERO. That is what makes the native map a
+    // presence oracle: an absent key reads as V's zero value (SPEC §11.2), so
+    // `nat[k] != 0` is exactly "k is live" — which `delete` then makes false.
+    // Without this, `has` could only be compared against the port's own answer,
+    // which is no test at all.
+    let val = b % 1000000 + 1
+
+    if (op < 6) {
+      rtMapSet(m, km, val)
+      nat[k] = val
+    } else if (op < 8) {
+      if (rtMapGet(m, km) != nat[k]) {
+        ag.getAgree = 0
+      }
+      if (rtMapHas(m, km) != (nat[k] != 0)) {
+        ag.hasAgree = 0
+      }
+    } else if (op < 9) {
+      rtMapDelete(m, km)
+      delete(nat, k)
+    } else {
+      if (rtMapLen(m) != len(nat)) {
+        ag.lenAgree = 0
+      }
+    }
+    step = step + 1
+  }
+  return ag
+}
+
+// THE STRONG ASSERTION: both maps must iterate in the same slot order, with
+// the same keys and the same values. This is what pins the hash, the probe
+// sequence, the tombstone policy and the grow schedule simultaneously.
+fn mapOrderProps(m: int, nat: map<string, int>): int {
+  let orderAgree = 1
+  let seen = 0
+  let slot = rtMapIterInit(m)
+  for (nk, nv) of nat {
+    if (slot < 0) {
+      orderAgree = 0
+    } else {
+      if (!sameStr(rtMapKeyAt(m, slot), nk)) {
+        orderAgree = 0
+      }
+      if (rtMapValAt(m, slot) != nv) {
+        orderAgree = 0
+      }
+      slot = rtMapIterNext(m, slot)
+      seen = seen + 1
+    }
+  }
+  // Both must be exhausted together: a port that stops early would otherwise
+  // agree on every element it did produce.
+  if (slot != -1) {
+    orderAgree = 0
+  }
+  if (orderAgree == 1 && seen == len(nat)) {
+    return 1
+  }
+  return 0
+}
+
+// A deleted key must read as absent and as the zero value, and must not
+// resurrect after the tombstone is reclaimed by a later grow.
+fn deletedKeyProps(m: int): int {
+  let gone = mine("k0")
+  rtMapDelete(m, gone)
+  if (!rtMapHas(m, gone) && rtMapGet(m, gone) == 0) {
+    return 1
+  }
+  return 0
+}
+
+// Fills `cm`/`cnat` with the flood script: build every key once, insert
+// FLOOD_A, sweep all but FLOOD_KEEP of them away, then insert the disjoint
+// FLOOD_B range. `ckeys` is the caller's traced key buffer (see `floodProps`).
+fn floodFill(cm: int, cnat: map<string, int>, ckeys: int) {
+  let ktexts: []string = []string(0)
+  // Key strings are built ONCE. `mine()` allocates a slice, a buffer and a
+  // string per call and nothing collects the port's heap in this program, so
+  // building keys inside the loops exhausted the arena and faulted on the
+  // resulting null. Hoisting them also sharpens the phase: what is under test
+  // is the grow schedule, not allocation volume.
+  let b0 = 0
+  while (b0 < FLOOD_A + FLOOD_B) {
+    let kt = "f${b0}"
+    ktexts = append(ktexts, kt)
+    rtSliceSet(ckeys, b0, mine(kt), 8)
+    b0 = b0 + 1
+  }
+
+  let j = 0
+  while (j < FLOOD_A) {
+    rtMapSet(cm, rtSliceGet(ckeys, j, 8), j + 1)
+    cnat[ktexts[j]] = j + 1
+    j = j + 1
+  }
+  // Sweep almost everything away, leaving a table that is nearly all tombstones.
+  j = 0
+  while (j < FLOOD_A - FLOOD_KEEP) {
+    rtMapDelete(cm, rtSliceGet(ckeys, j, 8))
+    delete(cnat, ktexts[j])
+    j = j + 1
+  }
+  // Now insert a fresh, disjoint key range. These consume EMPTY slots, so
+  // `used` climbs from whatever the grow left it at.
+  j = FLOOD_A
+  while (j < FLOOD_A + FLOOD_B) {
+    rtMapSet(cm, rtSliceGet(ckeys, j, 8), j + 1)
+    cnat[ktexts[j]] = j + 1
+    j = j + 1
+  }
+}
+
+// TOMBSTONE FLOOD — the one shape that makes `mapGrow`'s `used = len` reset
+// (tombstones reclaimed) observable.
+//
+// A cycle of delete-then-reinsert does NOT do it, and that is the whole
+// lesson: reusing a TOMB slot leaves `used` unchanged, so `used` plateaus and
+// no further grow ever fires — the reset line is simply never reached again.
+// Deleting the reset changed nothing under that script (measured: mutation M7
+// survived a 12-round churn of 60 keys).
+//
+// What is required is a grow that happens WHILE the table is mostly
+// tombstones, followed by enough NEW keys that the inflated `used` crosses
+// the next threshold and the correct `used` does not. Then the two
+// implementations end at different capacities, and the iteration order — the
+// assertion below — diverges. Sizes are chosen against the 7/8 load factor,
+// not by feel: FLOOD_A fills to a grow, FLOOD_KEEP survives the sweep, and
+// FLOOD_B is sized to sit between the correct and inflated thresholds.
+fn floodProps(): int {
+  let cm = rtMapNew(1, 0, 0)
+  let cnat = map<string, int>()
+  // `ckeys` holds `mine()`'s return values — real port-heap string addresses,
+  // not plain integers — across the whole flood: every one is read back up to
+  // 1396 events after it was written, well past several forced collections
+  // under `BIT_GC=stress`. A `[]i64` cannot hold that safely: `i64` is never a
+  // pointer (`compiler/lowerlit.bit:66-70`), so `[]i64` always lowers with
+  // `is_ref=0`, and a buffer without `ref_array_info` is never traced
+  // (`runtime/gc/gcmark.bit:77`) — correctly so, since scanning a genuine
+  // scalar buffer as pointers is exactly what that check exists to prevent.
+  // An untraced `ckeys` let the collector reclaim and reissue the very blocks
+  // it still meant to read (#1835/#3246, measured: the same address handed to
+  // `mine()` at `j=999` was read back out of `ckeys[999]` corrupted 1396 ring
+  // events later).
+  //
+  // The fix is to build the holder as a REF-typed buffer directly, the same
+  // primitive `runtime/root/maps.bit:513`/`:557` uses for its own keys buffer
+  // (`allocBuf(newcap, keyDesc != mapKeyScalar, 8)`): `rtSliceNew(..., isRef:
+  // 1, 8)` gives the buffer `ref_array_info`, so `gcmark.bit:77` traces every
+  // slot as a live reference and the addresses survive. This keeps the
+  // zero-allocation shape the flood exists to exercise — no extra `mine()`
+  // calls, same 1396-event window — unlike rebuilding each key at the point of
+  // use, which fixes the crash too but adds 1396 allocations and changes what
+  // the phase measures. `rtSliceNew`/`rtSliceGet`/`rtSliceSet` are this file's
+  // own vocabulary (see `mine()` and `phaseL` above), not a reach into
+  // internals: there is no idiomatic Bit-language container for "an array of
+  // raw addresses the collector must trace" — a `[]T` for a pointer-typed `T`
+  // traces the language's own reference layout, and a class field never
+  // traces through a plain `int`, so this primitive is the only thing that
+  // expresses the intent.
+  let ckeys = rtSliceNew(FLOOD_A + FLOOD_B, FLOOD_A + FLOOD_B, 1, 8)
+  floodFill(cm, cnat, ckeys)
+
+  let cAgree = 1
+  let cslot = rtMapIterInit(cm)
+  for (ck2, cv2) of cnat {
+    if (cslot < 0 || !sameStr(rtMapKeyAt(cm, cslot), ck2) || rtMapValAt(cm, cslot) != cv2) {
+      cAgree = 0
+    } else {
+      cslot = rtMapIterNext(cm, cslot)
+    }
+  }
+  if (cAgree == 1 && cslot == -1 && rtMapLen(cm) == len(cnat)) {
+    return 1
+  }
+  return 0
+}
+
+// Scalar-keyed maps take the splitmix64 path instead of Wyhash.
+fn scalarKeyProps(): int {
+  let sm = rtMapNew(0, 0, 0)
+  let snat = map<int, int>()
+  let i = 0
+  while (i < 200) {
+    rtMapSet(sm, i * 7, i)
+    snat[i * 7] = i
+    i = i + 1
+  }
+  let sAgree = 1
+  let sslot = rtMapIterInit(sm)
+  for (sk, sv) of snat {
+    if (sslot < 0 || rtMapKeyAt(sm, sslot) != sk || rtMapValAt(sm, sslot) != sv) {
+      sAgree = 0
+    } else {
+      sslot = rtMapIterNext(sm, sslot)
+    }
+  }
+  if (sAgree == 1 && sslot == -1 && rtMapLen(sm) == len(snat)) {
+    return 1
+  }
+  return 0
+}
+
+// Runs the same scripted stream against a port map and a native map, then
+// compares them. Returns the number of properties satisfied.
+fn phaseM(rng: []u64): int {
+  let ok = 0
+  let m = rtMapNew(1, 0, 0) // string keys, scalar values
+  let nat = map<string, int>()
+
+  let ag = runMapScript(m, nat, rng)
+  if (ag.lenAgree == 1) {
+    ok = ok + 1
+  }
+  if (ag.getAgree == 1) {
+    ok = ok + 1
+  }
+  // `hasAgree` was computed and never asserted on the first write of this file
+  // — a guard that runs, records a failure, and is then thrown away. Found by
+  // reading the property count back against the printed denominator, which is
+  // why the denominator is derived from the source rather than written by hand.
+  if (ag.hasAgree == 1) {
+    ok = ok + 1
+  }
+  if (rtMapLen(m) == len(nat)) {
+    ok = ok + 1
+  }
+
+  ok = ok + mapOrderProps(m, nat)
+  ok = ok + deletedKeyProps(m)
+  ok = ok + floodProps()
+  ok = ok + scalarKeyProps()
+  return ok
+}
