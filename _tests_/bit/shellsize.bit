@@ -60,11 +60,36 @@
 // gate's own mutation self-test to point the scan at a scratch tree instead
 // of the real one.
 //
+// SECOND CHECK, SAME WALK (#4724): every shell file that CALLS `diffexit` or
+// `diffrequire` must source `scripts/diffexit.sh`. Both are sourced-only
+// functions, so a caller missing the `. "$(dirname -- "$0")/diffexit.sh"` line
+// does not fail — bash prints `diffrequire: command not found` on stderr and
+// CARRIES ON, which is how selfhost-fuzzdiff.sh scored a whole corpus with no
+// compiler on disk mid-#4505 (`MATCH=8563 MISMATCH=10520`, rc=1, the exit-2
+// refusal evaporated). All 12 callers are correct today; nothing enforced it,
+// and the next differential is one paste away from the same false green.
+// It rides this harness rather than a new file because scripts/ does not grow
+// (`.claude/kb/scripts-policy.md`) and this walk already reads every
+// scripts/**/*.sh byte — the check costs one extra pass over bytes already in
+// memory. `test-shellsize` is not renamed: the name is cross-referenced from
+// nine scripts and from tools/build/defs.bit.
+//
+// NO DEFENCE IN DEPTH IS SHIPPED, AND THE REASON IS THE HAZARD ITSELF. The
+// three candidates were checked, not assumed: (a) `command_not_found_handle`
+// defined in diffexit.sh only reaches scripts that already SOURCED
+// diffexit.sh — exactly the ones not at risk; (b) `set -e` in each caller
+// would make a missing function fatal, but the family runs commands whose
+// nonzero status is data (`$? -ne 0` arms, `cmd || fail=1` tails, alarm-killed
+// oracles) and the ticket's own constraint forbids touching verdict logic;
+// (c) a `BASH_ENV` handler set by the build would apply to every non-interactive
+// bash this repo spawns, far outside this family. So the enforcement is static,
+// at the gate, where a missing source line is a red before anything runs.
+//
 // Run from the repository root: bit-out/bin/bit run _tests_/bit/shellsize.bit
 
 import { readDir, readFile, isDir } from "std/fs"
 import { env } from "std/os"
-import { hasSuffix } from "std/strings"
+import { hasPrefix, hasSuffix, contains, split, trimSpace } from "std/strings"
 
 // Bounds — Power of 10 rule 2: every walk below is over a small, fixed pair
 // of directories, but each is still capped explicitly.
@@ -77,7 +102,17 @@ const maxScanDepth: int = 8
 // checker front end, so a bug in `bit lint` cannot silently disable it.
 const maxFileLines: int = 800
 
-class ScanResult { failures: int, filesScanned: int }
+// `diffCallers`/`diffSourced` are the #4724 denominator — printed on every
+// run, pass or fail, for the same reason `filesScanned` is: a detector that
+// silently matched nothing reports the identical clean verdict as a healthy
+// tree. `definerSeen` is the guard on that denominator (see checkDenominator).
+class ScanResult {
+  failures: int,
+  filesScanned: int,
+  diffCallers: int,
+  diffSourced: int,
+  definerSeen: bool,
+}
 
 fn die(msg: string) {
   eprint("shellsize: SETUP FAILED: ${msg}\n")
@@ -197,15 +232,175 @@ fn scanDir(sc: ScanResult, dir: string, depth: int) {
       die("${path} is ${len(src)} bytes, over the ${maxFileBytes} bound")
     }
     checkFile(sc, path, lineCount(src))
+    checkHelperSourcing(sc, path, src)
   }
 }
 
+// ---------------------------------------------------------------------------
+// #4724: the sourced-helper check.
+// ---------------------------------------------------------------------------
+
+// What a shell file says about the two sourced helpers, decided in one pass.
+class ShellFacts { calls: bool, defines: bool, sourced: bool }
+
+fn isBlankByte(c: u8): bool {
+  return c == ' ' || c == '\t'
+}
+
+// Where a command may START in a shell line: line beginning, or right after
+// one of these. `$(...)`, backticks and `{ ...; }` are included so
+// `x=$(diffexit ...)` reads as the call it is; `#` deliberately is NOT, so a
+// trailing comment mentioning a helper stays a mention.
+fn isCommandBreak(c: u8): bool {
+  return c == ';' ||
+    c == '&' ||
+    c == '|' ||
+    c == '(' ||
+    c == ')' ||
+    c == '{' ||
+    c == '}' ||
+    c == '`'
+}
+
+// `name` occurs at byte `i` AND ends at a word boundary. The trailing check is
+// what keeps `. "$(dirname -- "$0")/diffexit.sh"` from reading as a call to
+// `diffexit`: the next byte is `.`, not whitespace.
+fn wordAt(line: string, i: int, name: string): bool {
+  if (i + len(name) > len(line)) {
+    return false
+  }
+  let k = 0
+  while (k < len(name)) {
+    if (line[i + k] != name[k]) {
+      return false
+    }
+    k = k + 1
+  }
+  let j = i + len(name)
+  if (j >= len(line)) {
+    return true
+  }
+  return isBlankByte(line[j])
+}
+
+// True when `name` is INVOKED on this line — at a command position, not as an
+// argument, a path component or a word inside a string. A plain substring
+// search cannot make that distinction: every correct caller also carries
+// `scripts/diffexit.sh` in its source line and, in seven of them, the helper's
+// name inside an explanatory comment.
+fn lineInvokes(line: string, name: string): bool {
+  let atStart = true
+  let i = 0
+  while (i < len(line)) {
+    let c = line[i]
+    if (isCommandBreak(c)) {
+      atStart = true
+    } else if (!isBlankByte(c)) {
+      if (atStart && wordAt(line, i, name)) {
+        return true
+      }
+      atStart = false
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn isShellComment(line: string): bool {
+  let t = trimSpace(line)
+  return len(t) == 0 || t[0] == '#'
+}
+
+fn invokesHelper(line: string): bool {
+  return lineInvokes(line, "diffexit") || lineInvokes(line, "diffrequire")
+}
+
+// The file that DEFINES a helper owes no source line — scripts/diffexit.sh
+// itself calls both in its own self-check block. Keyed on the definition, not
+// on the path, so the exemption follows the code if the file is ever renamed.
+fn definesHelper(line: string): bool {
+  let t = trimSpace(line)
+  return hasPrefix(t, "diffexit()") || hasPrefix(t, "diffrequire()")
+}
+
+// A `.`/`source` command naming the helper file, in ANY spelling the family
+// uses: `. "$(dirname -- "$0")/diffexit.sh"` (11 callers) and
+// `. "\${ROOT}/scripts/diffexit.sh"` (selfhost-diffdump.sh). Anchored to the
+// command word so `# shellcheck source=scripts/diffexit.sh` — the comment
+// directly above every one of those lines — is not mistaken for the real one.
+fn sourcesHelperFile(line: string): bool {
+  let t = trimSpace(line)
+  if (!hasPrefix(t, ". ") && !hasPrefix(t, "source ")) {
+    return false
+  }
+  return contains(t, "diffexit.sh")
+}
+
+// One pass over the file's lines. Bounded by the file's byte count, itself
+// bounded by `maxFileBytes` in scanDir.
+fn shellFacts(src: string): ShellFacts {
+  let f = ShellFacts{ calls: false, defines: false, sourced: false }
+  for line of split(src, "\n") {
+    if (isShellComment(line)) {
+      continue
+    }
+    if (definesHelper(line)) {
+      f.defines = true
+    }
+    if (invokesHelper(line)) {
+      f.calls = true
+    }
+    if (sourcesHelperFile(line)) {
+      f.sourced = true
+    }
+  }
+  return f
+}
+
+fn checkHelperSourcing(sc: ScanResult, path: string, src: string) {
+  let f = shellFacts(src)
+  if (f.defines) {
+    sc.definerSeen = true
+    return
+  }
+  if (!f.calls) {
+    return
+  }
+  sc.diffCallers = sc.diffCallers + 1
+  if (f.sourced) {
+    sc.diffSourced = sc.diffSourced + 1
+    return
+  }
+  report(
+    sc,
+    "${path} calls diffexit/diffrequire but never sources scripts/diffexit.sh — bash prints 'command not found' and CARRIES ON, scoring a verdict with the guard gone (#4724). Add: . \"$(dirname -- \"$0\")/diffexit.sh\"",
+  )
+}
+
+// The denominator's own guard. `0 of 0 callers source it` is what a broken
+// `lineInvokes` prints on a perfectly healthy tree, and it reads as a pass —
+// the exact failure shape #4232 added `filesScanned` for one check up. If the
+// definitions are in the tree, callers are too: 12 of them today.
+fn checkDenominator(sc: ScanResult) {
+  if (sc.definerSeen && sc.diffCallers == 0) {
+    report(
+      sc,
+      "the helper definitions were found but 0 caller(s) — the call detector is broken, not the tree",
+    )
+  }
+}
+
+fn helperTally(sc: ScanResult): string {
+  return "${sc.diffSourced} of ${sc.diffCallers} diffexit/diffrequire caller(s) source scripts/diffexit.sh"
+}
+
 fn reportResult(sc: ScanResult) {
+  checkDenominator(sc)
   if (sc.failures > 0) {
-    eprint("shellsize: FAILED — ${sc.failures} finding(s) over ${sc.filesScanned} shell file(s) scanned\n")
+    eprint("shellsize: FAILED — ${sc.failures} finding(s) over ${sc.filesScanned} shell file(s) scanned; ${helperTally(sc)}\n")
     osExit(1)
   }
-  print("shellsize: ok — ${sc.filesScanned} shell file(s) scanned, 0 over the ${maxFileLines}-line limit\n")
+  print("shellsize: ok — ${sc.filesScanned} shell file(s) scanned, 0 over the ${maxFileLines}-line limit; ${helperTally(sc)}\n")
 }
 
 fn selfCheck(cond: bool, label: string): int {
@@ -278,8 +473,135 @@ fn selfTestScanDirSkipsChild(): int {
   return failed
 }
 
+// #4724. Every line below is copied from a real file in scripts/: the source
+// spellings from selfhost-diffcheck.sh and selfhost-diffdump.sh, the call
+// sites from selfhost-fuzzdiff.sh and selfhost-diffdump.sh, and the two
+// mention-only shapes (a `# shellcheck source=` directive, and the header
+// comment the six diffdump shims carry) that a substring search would have
+// scored as calls.
+fn selfTestInvokes(): int {
+  let failed = 0
+  failed = failed +
+    selfCheck(
+      lineInvokes("diffrequire fuzzdiff \"$ORACLE\" \"$BIT2\"", "diffrequire"),
+      "lineInvokes missed a call at the start of a line",
+    )
+  failed = failed +
+    selfCheck(
+      lineInvokes("  diffexit \"$LABEL\" -f \"$mismatch\"", "diffexit"),
+      "lineInvokes missed an indented call inside a function",
+    )
+  failed = failed +
+    selfCheck(
+      lineInvokes("[ -n \"$x\" ] && diffexit t -f 0", "diffexit"),
+      "lineInvokes missed a call after a && command break",
+    )
+  failed = failed +
+    selfCheck(
+      lineInvokes("out=$(diffexit t -f 0)", "diffexit"),
+      "lineInvokes missed a call inside a command substitution",
+    )
+  failed = failed +
+    selfCheck(
+      !lineInvokes(". \"$(dirname -- \"$0\")/diffexit.sh\"", "diffexit"),
+      "lineInvokes read the source line itself as a call to diffexit",
+    )
+  failed = failed +
+    selfCheck(
+      !lineInvokes("echo \"diffrequire is in scripts/diffexit.sh\"", "diffrequire"),
+      "lineInvokes read a helper named inside a string as a call",
+    )
+  failed = failed +
+    selfCheck(
+      !lineInvokes("diffexitlater t", "diffexit"),
+      "lineInvokes matched a longer word starting with the helper name",
+    )
+  failed = failed +
+    selfCheck(lineInvokes("diffexit", "diffexit"), "lineInvokes missed a bare call at end of line")
+  return failed
+}
+
+fn selfTestSourcing(): int {
+  let failed = 0
+  failed = failed +
+    selfCheck(
+      sourcesHelperFile(". \"$(dirname -- \"$0\")/diffexit.sh\""),
+      "sourcesHelperFile missed the family's dirname spelling (11 callers)",
+    )
+  failed = failed +
+    selfCheck(
+      sourcesHelperFile(". \"\${ROOT}/scripts/diffexit.sh\""),
+      "sourcesHelperFile missed selfhost-diffdump.sh's ROOT spelling",
+    )
+  failed = failed +
+    selfCheck(
+      sourcesHelperFile("source scripts/diffexit.sh"),
+      "sourcesHelperFile rejected the `source` keyword spelling",
+    )
+  failed = failed +
+    selfCheck(
+      !sourcesHelperFile("# shellcheck source=scripts/diffexit.sh"),
+      "sourcesHelperFile accepted the shellcheck directive above the real line",
+    )
+  failed = failed +
+    selfCheck(
+      !sourcesHelperFile(". \"$(dirname -- \"$0\")/other.sh\""),
+      "sourcesHelperFile accepted a source of an unrelated file",
+    )
+  failed = failed +
+    selfCheck(definesHelper("diffexit() {"), "definesHelper missed diffexit's definition")
+  failed = failed +
+    selfCheck(definesHelper("diffrequire() {"), "definesHelper missed diffrequire's definition")
+  failed = failed +
+    selfCheck(
+      !definesHelper("diffexit \"check\" -f 0"),
+      "definesHelper read a call as a definition",
+    )
+  failed = failed +
+    selfCheck(
+      isShellComment("  # diffrequire is in scripts/diffexit.sh"),
+      "isShellComment missed an indented comment",
+    )
+  failed = failed + selfCheck(isShellComment(""), "isShellComment missed a blank line")
+  failed = failed +
+    selfCheck(
+      !isShellComment("diffrequire diffcheck \"$ORACLE\""),
+      "isShellComment swallowed a real command",
+    )
+  return failed
+}
+
+// The whole-file decision, on the three shapes that exist in scripts/ today:
+// a correct caller, the definer (exempt, and it calls both helpers in its own
+// self-check), and a mention-only shim.
+fn selfTestFacts(): int {
+  let failed = 0
+  let caller = shellFacts(". \"$(dirname -- \"$0\")/diffexit.sh\"\ndiffrequire t \"$ORACLE\"\n")
+  failed = failed +
+    selfCheck(
+      caller.calls && caller.sourced && !caller.defines,
+      "shellFacts misread a correct caller",
+    )
+  let definer = shellFacts("diffexit() {\n  exit 0\n}\ncheck 0 x diffexit t -f 0\n")
+  failed = failed + selfCheck(definer.defines, "shellFacts did not recognise the definer")
+  let mention = shellFacts("# scripts/diffexit.sh helper (#3382) -- no exit logic here.\necho hi\n")
+  failed = failed + selfCheck(!mention.calls, "shellFacts scored a comment mention as a call")
+  let broken = shellFacts("diffrequire t \"$ORACLE\"\n")
+  failed = failed +
+    selfCheck(
+      broken.calls && !broken.sourced,
+      "shellFacts did not flag a caller with no source line",
+    )
+  return failed
+}
+
 fn selfTest(): int {
-  return selfTestLineCount() + selfTestExceedsLimit() + selfTestScanDirSkipsChild()
+  return selfTestLineCount() +
+    selfTestExceedsLimit() +
+    selfTestScanDirSkipsChild() +
+    selfTestInvokes() +
+    selfTestSourcing() +
+    selfTestFacts()
 }
 
 fn main() {
@@ -290,7 +612,10 @@ fn main() {
   }
 
   let root = repoRoot()
-  let sc = ScanResult{ failures: 0, filesScanned: 0 }
+  let sc = ScanResult{
+    failures: 0, filesScanned: 0, diffCallers: 0, diffSourced: 0,
+    definerSeen: false,
+  }
   scanDir(sc, "${root}/scripts", maxScanDepth)
   scanDir(sc, "${root}/dist", maxScanDepth)
   reportResult(sc)
