@@ -341,8 +341,8 @@ gates_for_file() {
     _tests_/bit/testloc.expected) printf 'test-testloc\n'; return 0 ;;
     # #4556: same shape as the two arms above — the E0204 ratchet's data file, read at runtime by _tests_/bit/lintcomplexity.bit (never a `runArgs()` path), not build-driver code. gate.sh's classification arm routes it here; every OTHER tools/build/** path still falls to that case's `*)` and forces full.
     tools/build/complexity-debt.txt) printf 'test-lint-complexity\n'; return 0 ;;
-    # #2453: same shape as the complexity-debt.txt arm above — the lint-self ratchet's data file (per-scope totals plus the per-rule E0201/E0202 ceilings the owner ruled in on 2026-09-10), read at runtime by _tests_/bit/lintself.bit, never a `runArgs()` path.
-    tools/build/lint-ceiling.txt) printf 'test-lint-self\n'; return 0 ;;
+    # #2453/#4149: same shape as the complexity-debt.txt arm above — the lint-self gate's data file (one `<CODE> <repo-relative-path>` line per live finding pair, which replaced the lint-ceiling.txt counts), read at runtime by _tests_/bit/lintself.bit, never a `runArgs()` path.
+    tools/build/lint-debt.txt) printf 'test-lint-self\n'; return 0 ;;
   esac
   # Excludes any extracted name containing a literal `${` — that is a
   # per-instance template (e.g. tools/build/gates.bit's `packageGates()`
