@@ -1,0 +1,203 @@
+// pkg/postgres/conn.bit — the `std/sql.Conn` an authenticated session becomes.
+//
+// SCOPE: ONE STATEMENT SHAPE, DELIBERATELY. This ticket (#3987) gets a
+// connected, authenticated session; the query layer — the extended protocol,
+// parameter binding, typed result decoding and the statement cache — is #3988.
+// What is here is the simple-query protocol with no parameters, which is
+// exactly what a `select 1` liveness check needs and nothing more. `exec`,
+// `prepare` and `begin` FAIL naming #3988 rather than half-working: a
+// parameter path that silently interpolated would be an injection hole, and
+// the one thing `std/sql` guarantees structurally is that it cannot exist.
+//
+// Values come back in the protocol's TEXT format, so every non-NULL column is
+// `Value.Text` whatever its column type. Binary format and per-type decoding
+// are #3988's, not a gap to be papered over here.
+
+// The column length a DataRow uses for SQL NULL: -1, read out of an unsigned
+// four-byte field.
+const nullColumn: int = 4294967295
+
+// One physical connection, idle at `ReadyForQuery`.
+class pgConn {
+  r: pgReader
+  s: pgStream
+  closed: bool
+  // The simple-query protocol: one `Query` message, then everything the server
+  // sends back until `ReadyForQuery`.
+  //
+  // A failure below this point has left the connection's message stream at an
+  // unknown offset, so every one of them is a `transportError` — `std/sql`'s
+  // marker for "do not hand this connection out again" (stdlib/sql/config.bit).
+  query(sqlText: string, params: []Value): Rows! {
+    if (len(params) != 0) {
+      fail newError("postgres: parameter binding is not implemented yet " +
+        "(#3988); this connection runs parameterless statements only")
+    }
+    if (this.closed) {
+      fail transportError("query on a closed connection")
+    }
+    writeMessage(this.s, "Q", cstr(sqlText)) catch e {
+      fail transportError(e.message())
+    }
+    return this.collect()?
+  }
+
+  // Read the whole response. Bounded by `queryMessageBudget`.
+  collect(): Rows! {
+    let out = pgRows{ cols: []string(0), rows: [][]Value(0), at: 0 - 1 }
+    let failure = ""
+    let seen = 0
+    while (seen < queryMessageBudget) {
+      seen = seen + 1
+      let m = this.r.next() catch e {
+        fail transportError(e.message())
+      }
+      if (m.tag == "Z") {
+        return this.done(out, failure)?
+      }
+      failure = absorb(out, m, failure)?
+    }
+    fail transportError("the server sent ${queryMessageBudget} messages " +
+      "without reaching ReadyForQuery")
+  }
+
+  // `ReadyForQuery` arrived, so the connection is usable again whichever way
+  // this ends — an `ErrorResponse` for a bad statement is NOT a transport
+  // failure and must leave the connection in the pool.
+  done(out: pgRows, failure: string): Rows! {
+    if (failure != "") {
+      fail newError(failure)
+    }
+    return out
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    fail newError("postgres: exec is not implemented yet (#3988)")
+  }
+
+  prepare(sqlText: string): Stmt! {
+    fail newError("postgres: prepare is not implemented yet (#3988)")
+  }
+
+  begin(): Tx! {
+    fail newError("postgres: begin is not implemented yet (#3988)")
+  }
+
+  // Best effort: tell the server we are going (`Terminate`), then drop the
+  // socket. A write failure here is ignored — the socket is being closed
+  // either way and `Conn.close` cannot report anything.
+  close() {
+    if (this.closed) {
+      return
+    }
+    this.closed = true
+    writeMessage(this.s, "X", "") catch e {
+      this.s.shut()
+      return
+    }
+    this.s.shut()
+  }
+}
+
+// Fold one response message into `out`, returning the failure text so far.
+// `T` describes the columns, `D` is a row, `E` is a statement error that is
+// reported only after `ReadyForQuery` (the server keeps sending until then);
+// `C`, `I`, `N`, `S` and `K` carry nothing this driver reads.
+fn absorb(out: pgRows, m: pgMessage, failure: string): string! {
+  if (m.tag == "T") {
+    out.cols = describeColumns(m.body)?
+    return failure
+  }
+  if (m.tag == "D") {
+    out.rows = append(out.rows, decodeRow(m.body)?)
+    return failure
+  }
+  if (m.tag == "E" && failure == "") {
+    return errorText(m.body)
+  }
+  return failure
+}
+
+// `RowDescription`: a two-byte field count, then per field a `\0`-terminated
+// name and eighteen bytes of type information this driver does not read.
+fn describeColumns(body: string): []string! {
+  let count = readBe16(body, 0)?
+  let out = []string(0)
+  let off = 2
+  let i = 0
+  while (i < count) {
+    let (name, next) = readCstr(body, off)?
+    out = append(out, name)
+    off = next + 18
+    i = i + 1
+  }
+  return out
+}
+
+// `DataRow`: a two-byte column count, then per column a four-byte length and
+// that many bytes. A length of -1 is SQL NULL and carries no bytes at all —
+// the distinction `Value.Null` exists to keep, and the one an empty string
+// would erase.
+fn decodeRow(body: string): []Value! {
+  let count = readBe16(body, 0)?
+  let out = []Value(0)
+  let off = 2
+  let i = 0
+  while (i < count) {
+    let size = readBe32(body, off)?
+    off = off + 4
+    if (size == nullColumn) {
+      out = append(out, Value.Null)
+      i = i + 1
+      continue
+    }
+    if (off + size > len(body)) {
+      fail newError("postgres: DataRow column ${i} runs past the message")
+    }
+    out = append(out, Value.Text(body[off:off + size]))
+    off = off + size
+    i = i + 1
+  }
+  return out
+}
+
+// A two-byte big-endian integer. Only unsigned counts are read with it.
+fn readBe16(s: string, off: int): int! {
+  if (off + 2 > len(s)) {
+    fail newError("postgres: truncated message: wanted 2 bytes at ${off}, " +
+      "have ${len(s)}")
+  }
+  let b = []byte(s)
+  return int(b[off]) * 256 + int(b[off + 1])
+}
+
+// A materialized result set. The whole response is already in memory by the
+// time `query` returns — the simple-query protocol has no cursor — so `next`
+// is a walk over rows already read, and `close` has nothing to release.
+class pgRows {
+  cols: []string
+  rows: [][]Value
+  at: int
+  next(): bool! {
+    this.at = this.at + 1
+    return this.at < len(this.rows)
+  }
+
+  columns(): []string {
+    return this.cols
+  }
+
+  value(col: int): Value {
+    if (this.at < 0 || this.at >= len(this.rows)) {
+      return Value.Null
+    }
+    let row = this.rows[this.at]
+    if (col < 0 || col >= len(row)) {
+      return Value.Null
+    }
+    return row[col]
+  }
+
+  close() {
+  }
+}

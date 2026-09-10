@@ -1,0 +1,193 @@
+// pkg/postgres/scram.bit — SCRAM-SHA-256 (RFC 5802, RFC 7677) as the client.
+//
+// The point of SCRAM is that the password never crosses the wire and the
+// server's stored value is not password-equivalent: the client proves it knows
+// `SaltedPassword` by XOR-ing `ClientKey` with an HMAC over a transcript both
+// sides built independently, and the SERVER then proves the same thing back
+// with `ServerSignature`. Skipping that second check is the classic
+// implementation bug — it makes the exchange one-way and lets anything that
+// can answer the port collect a proof.
+//
+// EVERY COMPARISON HERE GOES THROUGH `crypto/subtle`. `verifyServerFinal` is
+// the one that matters: comparing signatures with `==` would stop at the first
+// differing byte, which is a timing oracle on a value the peer chooses.
+//
+// SASLPrep (RFC 4013) IS NOT APPLIED. The password's bytes are sent as given.
+// For an ASCII password — every password this driver has been run against —
+// SASLPrep is the identity function, so this is exact; a password whose
+// normalization differs from its raw form would derive a different salted key
+// here than libpq derives. See the README's Limitations section.
+
+import { encodeBase64, decodeBase64, ctEq, randomBytes } from "std/crypto"
+import { hmac, newSha256, digest, pbkdf2 } from "std/crypto"
+
+// The mechanism name, as it appears in AuthenticationSASL's list and in the
+// SASLInitialResponse this client sends back.
+const scramSha256: string = "SCRAM-SHA-256"
+
+// The GS2 header for "no channel binding, no authorization identity", and its
+// base64 (`biws`), which is the `c=` attribute of every client-final message
+// this client sends. Channel binding (`SCRAM-SHA-256-PLUS`) is not offered.
+const gs2Header: string = "n,,"
+const gs2HeaderB64: string = "biws"
+
+// How many random bytes the client nonce is built from. 18 encodes to 24
+// base64 characters with no padding and no comma, which the attribute framing
+// requires.
+const nonceBytes: int = 18
+
+// One SCRAM exchange. A fresh value per connection: the nonce, the transcript
+// and the expected server signature are all specific to one handshake, and
+// reusing any of them across two connections is what a replay needs.
+class scramClient {
+  password: string
+  clientNonce: string
+  firstBare: string
+  serverSignature: []byte
+  verified: bool
+}
+
+// Start an exchange. The nonce comes from the CSPRNG, never from a counter or
+// a clock: it is the client's half of the replay defence.
+fn newScram(password: string): scramClient {
+  let nonce = encodeBase64(randomBytes(nonceBytes))
+  return scramClient{
+    password: password,
+    clientNonce: nonce,
+    firstBare: "n=,r=${nonce}",
+    serverSignature: []byte(0),
+    verified: false,
+  }
+}
+
+// The client-first message: the GS2 header plus the bare part the transcript
+// is built from. The `n=` username is deliberately empty — Postgres takes the
+// user from the StartupMessage and RFC 5802 §5.1 says the SCRAM one is then
+// ignored, so sending it twice only creates a way for the two to disagree.
+fn scramClientFirst(c: scramClient): string {
+  return gs2Header + c.firstBare
+}
+
+// Consume the server-first message and produce the client-final one, deriving
+// the proof on the way and remembering the signature the server now owes us.
+fn scramClientFinal(c: scramClient, serverFirst: string): string! {
+  let (serverNonce, salt, iters) = parseServerFirst(c, serverFirst)?
+  let salted = pbkdf2(newSha256, []byte(c.password), salt, iters, 32)
+  let clientKey = hmac(newSha256, salted, []byte("Client Key"))
+  let storedKey = digest(newSha256(), clientKey)
+  let withoutProof = "c=${gs2HeaderB64},r=${serverNonce}"
+  let authMessage = []byte("${c.firstBare},${serverFirst},${withoutProof}")
+  let clientSignature = hmac(newSha256, storedKey, authMessage)
+  c.serverSignature = hmac(newSha256, hmac(newSha256, salted, []byte("Server Key")),
+    authMessage)
+  return "${withoutProof},p=${encodeBase64(xorBytes(clientKey, clientSignature))}"
+}
+
+// Check the server's own proof. This is the half of SCRAM that authenticates
+// the SERVER, so a mismatch is a failed connection, never a warning: it means
+// whatever answered the port does not hold the stored key for this role.
+fn scramVerify(c: scramClient, serverFinal: string): ()! {
+  if (hasPrefix(serverFinal, "e=")) {
+    fail newError("postgres: SCRAM authentication failed: " +
+      serverFinal[2:len(serverFinal)])
+  }
+  if (!hasPrefix(serverFinal, "v=")) {
+    fail newError("postgres: SCRAM server-final message has no v= attribute")
+  }
+  let got = decodeBase64(serverFinal[2:len(serverFinal)]) catch e {
+    fail newError("postgres: SCRAM server signature is not valid base64")
+  }
+  if (!ctEq(got, c.serverSignature)) {
+    fail newError("postgres: SCRAM server signature mismatch — the server " +
+      "did not prove it holds this role's stored key; the connection is not " +
+      "authenticated and has been abandoned")
+  }
+  c.verified = true
+}
+
+// `r=<nonce>,s=<salt>,i=<iterations>`, in that order, with any unknown
+// non-mandatory attribute ignored per RFC 5802 §7.
+fn parseServerFirst(c: scramClient, serverFirst: string): (string, []byte, int)! {
+  let attrs = split(serverFirst, ",")
+  let nonce = ""
+  let salt = []byte(0)
+  let iters = 0
+  let i = 0
+  while (i < len(attrs)) {
+    let a = attrs[i]
+    i = i + 1
+    if (hasPrefix(a, "m=")) {
+      fail newError("postgres: SCRAM server requires an unsupported " +
+        "mandatory extension: ${a}")
+    }
+    if (hasPrefix(a, "r=")) { nonce = a[2:len(a)] }
+    if (hasPrefix(a, "s=")) { salt = decodeSalt(a[2:len(a)])? }
+    if (hasPrefix(a, "i=")) { iters = decodeIters(a[2:len(a)])? }
+  }
+  checkServerFirst(c, nonce, salt, iters)?
+  return (nonce, salt, iters)
+}
+
+// The three attributes must all be present and the server nonce must EXTEND
+// the client's own (RFC 5802 §5.1): a server that returns a nonce of its own
+// choosing is replaying, and accepting it would make the client's contribution
+// to the transcript worthless.
+fn checkServerFirst(c: scramClient, nonce: string, salt: []byte, iters: int): ()! {
+  if (nonce == "" || len(salt) == 0 || iters == 0) {
+    fail newError("postgres: SCRAM server-first message is missing r=, s= or i=")
+  }
+  if (!hasPrefix(nonce, c.clientNonce)) {
+    fail newError("postgres: SCRAM server nonce does not extend the client " +
+      "nonce; this exchange is a replay and has been abandoned")
+  }
+}
+
+// The salt, base64 in the message.
+fn decodeSalt(s: string): []byte! {
+  let salt = decodeBase64(s) catch e {
+    fail newError("postgres: SCRAM salt is not valid base64")
+  }
+  return salt
+}
+
+// The iteration count. RFC 7677 §4 sets the floor at 4096; a server naming
+// fewer has weakened the KDF, and accepting it would let a downgrade pass
+// unnoticed.
+fn decodeIters(s: string): int! {
+  let n = parseInt(s) catch e {
+    fail newError("postgres: SCRAM iteration count is not a number: ${s}")
+  }
+  if (n < 4096) {
+    fail newError("postgres: SCRAM iteration count ${n} is below RFC 7677's " +
+      "floor of 4096")
+  }
+  return n
+}
+
+// `ClientProof = ClientKey XOR ClientSignature`. Both are one hash length by
+// construction; the assert states that rather than trusting it.
+fn xorBytes(a: []byte, b: []byte): []byte {
+  assert(len(a) == len(b), "postgres: SCRAM xor length mismatch")
+  let out = []byte(len(a))
+  let i = 0
+  while (i < len(a)) {
+    out[i] = a[i] ^ b[i]
+    i = i + 1
+  }
+  return out
+}
+
+// True when `mechanisms` (the `\0`-terminated list an AuthenticationSASL
+// message carries) offers SCRAM-SHA-256. `SCRAM-SHA-256-PLUS` is a different
+// mechanism — channel binding — and matching it here would send a client-first
+// message the server cannot read.
+fn offersScram(mechanisms: []string): bool {
+  let i = 0
+  while (i < len(mechanisms)) {
+    if (mechanisms[i] == scramSha256) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}

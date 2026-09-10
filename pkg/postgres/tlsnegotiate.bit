@@ -1,0 +1,178 @@
+// pkg/postgres/tlsnegotiate.bit — getting from a bare TCP socket to a stream
+// the startup packet can be written to.
+//
+// POSTGRES DOES NOT NEGOTIATE TLS THE WAY HTTPS DOES. There is no TLS port and
+// no ALPN: the client opens a cleartext socket, sends an eight-byte
+// `SSLRequest` packet, and the server answers with ONE bare byte — `S` (go
+// ahead, handshake now, on this same socket) or `N` (this server has no TLS;
+// carry on in the clear). That is why `std/tls.dial` cannot be used and
+// `std/tls.upgrade` exists.
+//
+// THE LADDER, AND WHY A PIN IS DIFFERENT. With no `sslmode` the driver takes
+// the strongest rung that works — verify-full, then verify-ca, then require,
+// then plaintext — so a stock local server with no TLS configured connects,
+// which is the behaviour the owner ruled for on 2026-08-30. With an explicit
+// `sslmode` it does exactly that one thing and FAILS otherwise: a production
+// URI carrying `sslmode=verify-full` is a guarantee, and a guarantee that
+// downgrades under pressure is not one.
+//
+// A SERVER THAT OFFERS TLS AND THEN FAILS THE HANDSHAKE IS NOT DOWNGRADED TO
+// PLAINTEXT. The plaintext rung is reached only by a server that answered `N`
+// — it does not do TLS at all. A server that answered `S` and then broke is
+// either misconfigured or being interfered with, and quietly sending the
+// password in the clear to it is precisely the strip attack the ladder must
+// not perform.
+
+import { dial as pgTcpDial, resolve as pgResolve } from "std/net"
+// `TrustStore` is std/tls's own (stdlib/tls/clientstate.bit), NOT std/crypto's
+// same-named class: `TlsConfig.roots` is typed by the former. Both hold the
+// same parsed `Certificate` values, so `x509VerifyChain` takes `.roots`
+// straight across with no re-parse.
+import { TlsConfig, TrustStore, upgrade } from "std/tls"
+import { Certificate, x509Parse, x509VerifyChain } from "std/crypto"
+import { now as clockNow } from "std/time"
+
+// Open a stream to `t` and report the mode it was reached at, warning once per
+// pool for anything below verify-full.
+fn openStream(t: target, w: warnOnce, roots: TrustStore): (pgStream, SslMode)! {
+  if (t.pinned) {
+    return openPinned(t, w, roots)?
+  }
+  return openNegotiate(t, w, roots)?
+}
+
+// An explicit `sslmode`: this mode or nothing. Every failure names the pin, so
+// the message says both what was asked for and what the server offered.
+fn openPinned(t: target, w: warnOnce, roots: TrustStore): (pgStream, SslMode)! {
+  if (t.mode == SslMode.Disable) {
+    warnSslMode(w, SslMode.Disable)
+    return (plainStream{ c: dialFresh(t)? }, SslMode.Disable)
+  }
+  let conn = dialFresh(t)?
+  if (!requestSsl(conn)?) {
+    conn.close()
+    fail newError("postgres: the URI pins sslmode=${sslModeName(t.mode)}, but " +
+      "${t.host}:${t.port} answered the SSLRequest with N — that server has no " +
+      "TLS configured, so this connection failed rather than downgrading to " +
+      "sslmode=disable")
+  }
+  let s = handshake(conn, t, t.mode, roots)?
+  warnSslMode(w, t.mode)
+  return (s, t.mode)
+}
+
+// No `sslmode`: the strongest rung that works. Each TLS rung needs its own
+// socket — a failed handshake has already written bytes the server will not
+// read past — so a rung that fails verification is retried on a fresh connect.
+//
+// Bounded by the rung list, which is a literal.
+fn openNegotiate(t: target, w: warnOnce, roots: TrustStore): (pgStream, SslMode)! {
+  let rungs = [SslMode.VerifyFull, SslMode.VerifyCa, SslMode.Require]
+  let detail = "the server offered no TLS rung"
+  let i = 0
+  while (i < len(rungs)) {
+    let conn = dialFresh(t)?
+    if (!requestSsl(conn)?) {
+      warnSslMode(w, SslMode.Disable)
+      return (plainStream{ c: conn }, SslMode.Disable)
+    }
+    let s = handshake(conn, t, rungs[i], roots) catch e {
+      detail = e.message()
+      i = i + 1
+      continue
+    }
+    warnSslMode(w, rungs[i])
+    return (s, rungs[i])
+  }
+  fail newError("postgres: ${t.host}:${t.port} accepted the SSLRequest but no " +
+    "TLS mode completed a handshake, and a server that offers TLS is never " +
+    "downgraded to cleartext: ${detail}")
+}
+
+// A fresh TCP connection to the target. `std/net` speaks dotted quads only, so
+// the name is resolved first — the same two steps `std/tls.dial` takes.
+fn dialFresh(t: target): NetConn! {
+  let ip = pgResolve(t.host)?
+  return pgTcpDial(ip, t.port)?
+}
+
+// Send `SSLRequest` and read the one-byte answer. True means `S`: the very
+// next byte on this socket is the start of the server's TLS records.
+fn requestSsl(conn: NetConn): bool! {
+  conn.write(sslRequestMessage())?
+  let answer = conn.read(1)
+  if (answer == "S") {
+    return true
+  }
+  if (answer == "N") {
+    return false
+  }
+  if (answer == "E") {
+    fail newError("postgres: the server rejected the SSLRequest with an error " +
+      "response; it is too old for the v3 protocol")
+  }
+  fail newError("postgres: the server answered the SSLRequest with " +
+    "'${answer}', which is neither S nor N")
+}
+
+// Run the handshake for one rung on an already-connected socket.
+//
+// `require` sets `insecureSkipVerify` because that is exactly what it means:
+// encrypted, unauthenticated. `verify-ca` does the same and then verifies the
+// chain itself against `roots`, which is the only way to get a chain check
+// without a hostname check — `TlsConfig.insecureSkipVerify` covers both.
+fn handshake(conn: NetConn, t: target, mode: SslMode, roots: TrustStore): pgStream! {
+  let cfg = TlsConfig{
+    roots: roots,
+    insecureSkipVerify: mode != SslMode.VerifyFull,
+    alpn: []string(0),
+    serverName: t.host,
+    minVersion: 0,
+    nowUnix: 0,
+    certPem: "",
+    keyPem: "",
+  }
+  let tc = upgrade(conn, t.host, cfg)?
+  if (mode == SslMode.VerifyCa) {
+    verifyChainOnly(tc, roots) catch e {
+      tc.close()
+      fail e
+    }
+  }
+  return tlsStream{ c: tc }
+}
+
+// verify-ca: the chain must reach a trust anchor, but the name on it need not
+// be the name we dialled — that difference is the whole distinction from
+// verify-full, and it is what lets a certificate issued for an internal name
+// be used through a load balancer.
+//
+// `x509VerifyChain` takes the hostname as a required argument, so the name
+// checked is the leaf's OWN first SubjectAltName. That makes the hostname test
+// vacuous BY CONSTRUCTION rather than by omission: there is no code path here
+// where a name check silently stops happening.
+fn verifyChainOnly(tc: TlsConn, roots: TrustStore): ()! {
+  let der = tc.peerCertificates()
+  if (len(der) == 0) {
+    fail newError("postgres: sslmode=verify-ca, but the server sent no " +
+      "certificate chain")
+  }
+  let leaf = x509Parse(der[0])?
+  if (len(leaf.dnsNames) == 0) {
+    fail newError("postgres: sslmode=verify-ca, but the server's certificate " +
+      "carries no SubjectAltName, so there is no name to build a chain for")
+  }
+  x509VerifyChain(leaf, parseRest(der)?, roots.roots, leaf.dnsNames[0],
+    clockNow().ns / 1000000000)?
+}
+
+// The chain after the leaf, as intermediates.
+fn parseRest(der: [][]byte): []Certificate! {
+  let out = []Certificate(0)
+  let i = 1
+  while (i < len(der)) {
+    out = append(out, x509Parse(der[i])?)
+    i = i + 1
+  }
+  return out
+}

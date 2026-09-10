@@ -1,0 +1,208 @@
+// pkg/postgres/wire.bit — the Postgres v3 frontend/backend protocol framing.
+//
+// Two message shapes exist on this wire. Every message the *backend* sends,
+// and every one the frontend sends after the connection is up, is a one-byte
+// tag followed by a four-byte big-endian length THAT COUNTS ITSELF but not
+// the tag. The two messages sent before the connection exists — StartupMessage
+// and SSLRequest — have no tag at all, because at that point the backend has
+// not yet decided which protocol it is speaking.
+//
+// EVERYTHING IS BEHIND `pgStream`. A connection is a plain socket before the
+// SSLRequest answer and a TLS connection after it, and the auth exchange is
+// identical either way; a test drives the same code over a scripted transcript
+// with no socket at all. That is one interface, not three copies of the framing.
+
+import { Conn as NetConn } from "std/net"
+import { TlsConn } from "std/tls"
+
+// The v3 protocol version, 3.0 as a packed major/minor pair: 3 * 65536.
+const protocolVersion: int = 196608
+
+// The SSLRequest "version" — a reserved code point in the same field, which is
+// how a v3 server tells the request apart from a startup packet.
+const sslRequestCode: int = 80877103
+
+// A byte source and sink. `readUp` returns at most `n` bytes and an empty
+// string at end of stream (never a failure — a closed peer is a condition, not
+// an error, exactly as `std/net.Conn.read` reports it); `writeAll` writes
+// every byte or fails.
+interface pgStream {
+  readUp(n: int): string!,
+  writeAll(s: string): ()!,
+  shut(),
+}
+
+// `pgStream` over a cleartext socket.
+class plainStream {
+  c: NetConn
+  readUp(n: int): string! {
+    return this.c.read(n)
+  }
+
+  writeAll(s: string): ()! {
+    this.c.write(s)?
+  }
+
+  shut() {
+    this.c.close()
+  }
+}
+
+// `pgStream` over a TLS connection, after `SSLRequest` was answered `S` and
+// `std/tls.upgrade` ran the handshake on the same socket.
+class tlsStream {
+  c: TlsConn
+  readUp(n: int): string! {
+    return string(this.c.read(n)?)
+  }
+
+  writeAll(s: string): ()! {
+    this.c.write([]byte(s))?
+  }
+
+  shut() {
+    this.c.close()
+  }
+}
+
+// One backend message: its tag and its body, the body being everything after
+// the four length bytes.
+class pgMessage {
+  tag: string
+  body: string
+}
+
+// A framing reader over a `pgStream`. `buf` holds bytes pulled off the stream
+// that the current message did not need — a single `read` can return any
+// mixture of whole and partial messages, so the leftover has to live somewhere
+// that outlives one call.
+class pgReader {
+  s: pgStream
+  buf: string
+  // Exactly `n` bytes. Fails if the peer closes first: the length prefix
+  // promised them, so a short read is a truncated message, not an end of
+  // stream.
+  //
+  // Bounded: every iteration either returns or adds at least one byte, so at
+  // most `n` iterations.
+  take(n: int): string! {
+    let guard = 0
+    while (len(this.buf) < n && guard <= n) {
+      guard = guard + 1
+      let chunk = this.s.readUp(n - len(this.buf))?
+      if (len(chunk) == 0) {
+        fail newError("postgres: server closed the connection mid-message")
+      }
+      this.buf = this.buf + chunk
+    }
+    let out = this.buf[0:n]
+    this.buf = this.buf[n:len(this.buf)]
+    return out
+  }
+
+  // The next tagged message. A length below 4 does not even cover its own
+  // field and is refused rather than used to size a slice.
+  next(): pgMessage! {
+    let tag = this.take(1)?
+    let size = readBe32(this.take(4)?, 0)?
+    if (size < 4) {
+      fail newError("postgres: message '${tag}' declares a length of ${size}")
+    }
+    return pgMessage{ tag: tag, body: this.take(size - 4)? }
+  }
+}
+
+// A four-byte big-endian integer.
+fn be32(n: int): string {
+  let b = []byte(4)
+  b[0] = byte(n / 16777216 % 256)
+  b[1] = byte(n / 65536 % 256)
+  b[2] = byte(n / 256 % 256)
+  b[3] = byte(n % 256)
+  return string(b)
+}
+
+// The four-byte big-endian integer at `off`. Signed values do not occur in the
+// fields this driver reads (lengths, auth codes, column counts), so the result
+// is the plain unsigned value.
+fn readBe32(s: string, off: int): int! {
+  if (off + 4 > len(s)) {
+    fail newError("postgres: truncated message: wanted 4 bytes at ${off}, " +
+      "have ${len(s)}")
+  }
+  let b = []byte(s)
+  return int(b[off]) * 16777216 + int(b[off + 1]) * 65536 +
+    int(b[off + 2]) * 256 + int(b[off + 3])
+}
+
+// A NUL-terminated string, the protocol's only string framing. `[]byte(1)` is
+// a one-element zero-filled slice, which is the NUL — Bit string literals
+// carry no `\0` escape.
+fn cstr(s: string): string {
+  return s + string([]byte(1))
+}
+
+// The `\0`-terminated string starting at `off`, and the offset just past its
+// terminator. An unterminated string fails rather than running to the end of
+// the buffer.
+fn readCstr(s: string, off: int): (string, int)! {
+  let b = []byte(s)
+  let i = off
+  while (i < len(b)) {
+    if (b[i] == 0) {
+      return (s[off:i], i + 1)
+    }
+    i = i + 1
+  }
+  fail newError("postgres: unterminated string in a server message")
+}
+
+// Send a tagged frontend message: tag, then the length counting itself.
+fn writeMessage(s: pgStream, tag: string, body: string): ()! {
+  s.writeAll(tag + be32(len(body) + 4) + body)?
+}
+
+// The StartupMessage: no tag, the protocol version, then `\0`-terminated
+// key/value pairs closed by one more `\0`.
+//
+// `database` is omitted when empty, which makes the server default it to the
+// user name — libpq's own rule, and what a URI with no path means.
+fn startupMessage(user: string, database: string): string {
+  let body = be32(protocolVersion) + cstr("user") + cstr(user)
+  if (database != "") {
+    body = body + cstr("database") + cstr(database)
+  }
+  body = body + string([]byte(1))
+  return be32(len(body) + 4) + body
+}
+
+// The SSLRequest packet: a length of exactly 8 and the reserved code point.
+// Sent before anything else on a fresh socket; the server answers with one
+// bare byte, `S` (proceed with the handshake) or `N` (no TLS here).
+fn sslRequestMessage(): string {
+  return be32(8) + be32(sslRequestCode)
+}
+
+// An ErrorResponse/NoticeResponse body: `\0`-terminated fields, each a
+// one-byte type code followed by its value, closed by a bare `\0`. Only `S`
+// (severity), `C` (SQLSTATE) and `M` (message) are rendered — the rest are
+// file/line/routine details of the *server's* source, which say nothing to
+// the caller.
+fn errorText(body: string): string {
+  let severity = ""
+  let code = ""
+  let message = ""
+  let b = []byte(body)
+  let off = 0
+  while (off < len(b) && b[off] != 0) {
+    let kind = body[off:off + 1]
+    let (value, next) = readCstr(body, off + 1) catch e {
+      return "postgres: malformed error response from the server"
+    }
+    if (kind == "S") { severity = value }
+    if (kind == "C") { code = value }
+    if (kind == "M") { message = value }
+    off = next
+  }
+  return "postgres: ${severity} ${code}: ${message}"
+}
