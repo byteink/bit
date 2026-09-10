@@ -223,6 +223,20 @@ fn sizeRoundTrip(g: *i64, leafInfo: int, rootsAddr: int, roots: []i64, tally: []
   return bad
 }
 
+// The scripted collector's handles, bundled so each phase below takes one
+// parameter rather than five or six. `g` and `rootsAddr` are RAW pointers into
+// `main`'s `state` and `roots` locals: this class does NOT root them, and is
+// not what keeps them alive — the `alive` read at the bottom of `main` is, and
+// both slices stay locals of that frame for exactly that reason (#4097).
+class Script {
+  g: *i64,
+  rootsAddr: int,
+  roots: []i64,
+  nodeInfo: int,
+  wideInfo: int,
+  refArrInfo: int,
+}
+
 // REFERENCE-BUFFER TRACING (#4083), the silent-wrongness arm.
 //
 // `scanObject`'s reference-buffer path derives its word count from the size
@@ -234,69 +248,199 @@ fn sizeRoundTrip(g: *i64, leafInfo: int, rootsAddr: int, roots: []i64, tally: []
 // fabricated leaf header once shipped, and it is a wrong answer rather than a
 // crash. So: root ONLY the array, collect, and require every referent to still
 // be a live object afterwards.
-//
 // Returns the number of referents that did NOT survive, and writes the number
 // of referents it ACTUALLY checked into `tally[1]`, for the same reason
 // `sizeRoundTrip` writes `tally[0]`. Bounded: `REFARR_MAX` lengths, each with
 // at most `REFARR_MAX` elements.
-fn refArrayTrace(
-  g: *i64,
-  arrInfo: int,
-  nodeInfo: int,
-  rootsAddr: int,
-  roots: []i64,
-  tally: []i64,
-): int {
+fn refArrayTrace(s: Script, tally: []i64): int {
   let lost = 0
   tally[1] = 0
   let n = 1
   while (n <= REFARR_MAX) {
-    let arr = gcAllocRaw(g, n * 8, arrInfo)
-    roots[0] = arr
+    let arr = gcAllocRaw(s.g, n * 8, s.refArrInfo)
+    s.roots[0] = arr
     let i = 1
     while (i < ROOTS) {
-      roots[i] = 0
+      s.roots[i] = 0
       i = i + 1
     }
     let f = 0
     while (f < n) {
-      storeWord(arr + f * 8, gcAlloc(g, nodeInfo))
+      storeWord(arr + f * 8, gcAlloc(s.g, s.nodeInfo))
       f = f + 1
     }
-    gcCollectRoots(g, rootsAddr, ROOTS)
+    gcCollectRoots(s.g, s.rootsAddr, ROOTS)
     let c = 0
     while (c < n) {
       tally[1] = tally[1] + 1
-      if (!gcOwns(g, loadWord(arr + c * 8))) {
+      if (!gcOwns(s.g, loadWord(arr + c * 8))) {
         lost = lost + 1
       }
       c = c + 1
     }
-    roots[0] = 0
-    gcCollectRoots(g, rootsAddr, ROOTS)
+    s.roots[0] = 0
+    gcCollectRoots(s.g, s.rootsAddr, ROOTS)
     n = n + 1
   }
   return lost
 }
 
-fn main() {
-  // #4097: these bindings do NOT by themselves keep the backing slices
-  // alive. `gcBindMemory` below takes their raw ADDRESSES, and once a
-  // binding's last READ is behind the program counter it is not a root for
-  // the stack map — only raw, untraced pointers into these slices reach the
-  // collector from that point on. What actually keeps them alive under
-  // BIT_GC=stress is the explicit read of their lengths into `alive`, printed
-  // on the final line of `main` — see that comment for the measured proof.
-  let arena = []i64(ARENA_WORDS)
-  let indexArena = []i64(INDEX_WORDS)
-  let heapBlock = []i64(heapWords)
-  let heapLock = []i32(1)
-  let state = []i64(gcWords)
-  let roots = []i64(ROOTS)
-  let meta = []i64(META_WORDS)
-  let lock = []i32(1)
-  let rng = []u64(1)
+// One step's four random draws, taken in the order the generator produces them
+// so the script stays byte-for-byte the sequence the golden was recorded from.
+class Draw {
+  op: int,
+  slot: int,
+  slot2: int,
+  field: int,
+}
 
+// The one step the draw selects: allocate a `Node`, allocate a `Wide`, build an
+// edge, drop a root, or collect.
+fn applyDraw(s: Script, d: Draw) {
+  if (d.op < 8) {
+    s.roots[d.slot] = gcAlloc(s.g, s.nodeInfo)
+  } else if (d.op < 10) {
+    s.roots[d.slot] = gcAlloc(s.g, s.wideInfo)
+  } else if (d.op < 12) {
+    // Build an edge between two live roots. Offsets 0 and 8 are valid
+    // reference fields of BOTH shapes, so this never needs to know which.
+    if (s.roots[d.slot] != 0 && s.roots[d.slot2] != 0) {
+      storeWord(s.roots[d.slot] + d.field, s.roots[d.slot2])
+    }
+  } else if (d.op == 12) {
+    s.roots[d.slot] = 0
+  } else if (d.op == 13) {
+    gcCollectRoots(s.g, s.rootsAddr, ROOTS)
+  }
+}
+
+// The scripted workload, and the table the golden compares.
+//
+// Returns `indexAgree`, the strong invariant: the fast index must agree with
+// the expected large-object count at every record, which is what proves the
+// index never drifts from the authoritative all-objects list. #3178: that
+// expectation is 0, not `gcNumObjects(g)` — `Node`/`Wide` are both span-backed,
+// so this script never puts an object in the hash index at all (see the header
+// comment's #3178 note).
+fn runScript(s: Script, rng: []u64): int {
+  let indexAgree = 1
+  let step = 0
+  // Bounded: exactly STEPS iterations.
+  while (step < STEPS) {
+    gcSafepointRoots(s.g, s.rootsAddr, ROOTS)
+
+    let a = nextRand(rng)
+    let b = nextRand(rng)
+    let c = nextRand(rng)
+    let d = nextRand(rng)
+    applyDraw(s, Draw{ op: a % 16, slot: b % ROOTS, slot2: c % ROOTS, field: d % 2 * 8 })
+
+    step = step + 1
+
+    if (step % RECORD_EVERY == 0) {
+      let n = gcNumObjects(s.g)
+      // #3178: neither `Node` nor `Wide` is ever large, so the hash index
+      // must hold exactly 0 entries at every record — not `n`.
+      if (gcIndexEntries(s.g) != 0) {
+        indexAgree = 0
+      }
+      print("${step} ${n} ${gcLiveBytes(s.g)} ${gcStatCollections(s.g)} ${gcStatTotalSwept(s.g)} ${gcStatSurvivorsLast(s.g)} ${gcIndexEntries(s.g)}\n")
+    }
+  }
+  return indexAgree
+}
+
+// The index and the authoritative linear scan must give the same answer for
+// every root, for an interior pointer, and for a foreign address — the
+// membership contract of ABI.md §3. This is the property the fast path exists
+// to preserve, so it is checked against the oracle rather than assumed.
+fn ownsProps(s: Script): int {
+  let ownsAgree = 1
+  let i = 0
+  while (i < ROOTS) {
+    let r = s.roots[i]
+    if (r != 0) {
+      if (gcOwns(s.g, r) != gcOwnsLinear(s.g, r) || !gcOwns(s.g, r)) {
+        ownsAgree = 0
+      }
+      // An interior pointer is not an object base and must be rejected by both.
+      if (gcOwns(s.g, r + 8) != gcOwnsLinear(s.g, r + 8)) {
+        ownsAgree = 0
+      }
+    }
+    i = i + 1
+  }
+  if (gcOwns(s.g, 4096) || gcOwnsLinear(s.g, 4096)) {
+    ownsAgree = 0
+  }
+  return ownsAgree
+}
+
+// CONSERVATIVE ROOT PROBING (ABI.md §5) — and the reason `gcMarkRoot`
+// validates at all.
+//
+// A conservative stack scan hands the collector raw machine words, and the
+// type system additionally calls several single-word values "references" that
+// are NOT GC objects: a `chan` handle is page-allocated and process-lifetime,
+// a bare function value is a code address. Both the stack maps (§4) and object
+// pointer maps (§2) legitimately list them. A blind mark would decode
+// `word - 32` as a `GcHeader` and corrupt the heap.
+//
+// So this collection seeds NO real roots — only words that are inside the
+// collector's address window but are not object bases: the interior of every
+// live object, and every live object's HEADER address. Every one must be
+// rejected, so the outcome is identical to a collection with an empty root
+// set: the entire heap goes. That is what makes the `owns` check in
+// `gcMarkRoot` load-bearing rather than decorative — without it these words
+// mark garbage and the table diverges.
+fn conservativeProbe(s: Script) {
+  gcMarkBegin(s.g)
+  let c = 0
+  while (c < ROOTS) {
+    let r = s.roots[c]
+    if (r != 0) {
+      gcMarkConservative(s.g, r + 8)            // interior pointer
+      gcMarkConservative(s.g, r - gcHeaderSize) // the header, not the body
+    }
+    c = c + 1
+  }
+  gcCollectFinish(s.g)
+}
+
+// The three raw pointers the collector's heap side is built from, all of them
+// into `main`'s locals.
+class HeapSide {
+  hp: *i64,
+  hlk: *i32,
+  lp: *i32,
+}
+
+// Stand the scripted collector up on `main`'s slices.
+//
+// The REAL allocator (runtime/alloc, #1362) is the collector's heap. Its
+// pages would normally come from mmap; a stress program is not a place to
+// bind a platform module, and the collector takes memory rather than a
+// mapping callback anyway (see runtime/gc/mem.bit), so the reserve is an
+// ordinary slice held live in `main`. Every slice here stays a local of THAT
+// frame — a caller frame's slots are traced for the whole of a callee's run,
+// and `main`'s `alive` read is what extends them past every later safepoint.
+fn bootCollector(
+  g: *i64, arena: []i64, indexArena: []i64, heap: HeapSide, refArrInfo: int,
+): bool {
+  heapInit(heap.hp)
+  atomicStore(heap.hlk, spinUnlocked)
+  atomicStore(heap.lp, spinUnlocked)
+  gcBindMemory(g, int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
+  if (!gcInit(g, int(heap.hp), int(heap.hlk), int(heap.lp), refArrInfo, MARK_STACK)) {
+    return false
+  }
+  gcConfigure(g, true, false, MIN_TRIGGER, GROWTH_PCT, false)
+  return true
+}
+
+// Fill the metadata block with the four descriptors the script allocates
+// against, and return its base address.
+fn writeMeta(meta: []i64): int {
   let metaAddr = int(ptrOf(meta))
   meta[MI_NODE_OFFS + 0] = 0
   meta[MI_NODE_OFFS + 1] = 8
@@ -314,141 +458,53 @@ fn main() {
   // Leaf: no reference fields. Same field VALUES as the sentinel above and a
   // different address, which is the whole point (#4083).
   writeInfo(meta, MI_LEAF, 0, 0, 0)
+  return metaAddr
+}
 
-  let nodeInfo = metaAddr + MI_NODE * 8
-  let wideInfo = metaAddr + MI_WIDE * 8
-  let refArrInfo = metaAddr + MI_REFARR * 8
+fn main() {
+  // #4097: these bindings do NOT by themselves keep the backing slices
+  // alive. `gcBindMemory` below takes their raw ADDRESSES, and once a
+  // binding's last READ is behind the program counter it is not a root for
+  // the stack map — only raw, untraced pointers into these slices reach the
+  // collector from that point on. What actually keeps them alive under
+  // BIT_GC=stress is the explicit read of their lengths into `alive`, printed
+  // on the final line of `main` — see that comment for the measured proof.
+  // Every phase below is handed raw pointers into these slices; a callee frame
+  // roots none of them, which is why they are all locals of THIS frame.
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let heapBlock = []i64(heapWords)
+  let heapLock = []i32(1)
+  let state = []i64(gcWords)
+  let roots = []i64(ROOTS)
+  let meta = []i64(META_WORDS)
+  let lock = []i32(1)
+  let rng = []u64(1)
 
-  // The REAL allocator (runtime/alloc, #1362) is the collector's heap. Its
-  // pages would normally come from mmap; a stress program is not a place to
-  // bind a platform module, and the collector takes memory rather than a
-  // mapping callback anyway (see runtime/gc/mem.bit), so the reserve is an
-  // ordinary slice held live in `main`.
-  let hp = ptrOf(heapBlock)
-  heapInit(hp)
-  let hlk = ptrOf(heapLock)
-  atomicStore(hlk, spinUnlocked)
-
-  let lp = ptrOf(lock)
-  atomicStore(lp, spinUnlocked)
-
+  let metaAddr = writeMeta(meta)
   let g = ptrOf(state)
-  let rootsAddr = int(ptrOf(roots))
-  gcBindMemory(g, int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
-  if (!gcInit(g, int(hp), int(hlk), int(lp), refArrInfo, MARK_STACK)) {
+  let heap = HeapSide{ hp: ptrOf(heapBlock), hlk: ptrOf(heapLock), lp: ptrOf(lock) }
+  if (!bootCollector(g, arena, indexArena, heap, metaAddr + MI_REFARR * 8)) {
     print("gcInit failed\n")
     return
   }
-  gcConfigure(g, true, false, MIN_TRIGGER, GROWTH_PCT, false)
+
+  let s = Script{
+    g: g,
+    rootsAddr: int(ptrOf(roots)),
+    roots: roots,
+    nodeInfo: metaAddr + MI_NODE * 8,
+    wideInfo: metaAddr + MI_WIDE * 8,
+    refArrInfo: metaAddr + MI_REFARR * 8,
+  }
 
   rng[0] = u64(88172645463325252)
 
-  // Invariants accumulated across the whole run, reported on the final line.
-  // `indexAgree` is the strong one: the fast index must agree with the
-  // expected large-object count at every record, which is what proves the
-  // index never drifts from the authoritative all-objects list. #3178: that
-  // expectation is 0, not `gcNumObjects(g)` — `Node`/`Wide` are both
-  // span-backed, so this script never puts an object in the hash index at
-  // all (see the header comment's #3178 note).
-  let indexAgree = 1
-  let ownsAgree = 1
-
-  let step = 0
-  // Bounded: exactly STEPS iterations.
-  while (step < STEPS) {
-    gcSafepointRoots(g, rootsAddr, ROOTS)
-
-    let a = nextRand(rng)
-    let b = nextRand(rng)
-    let c = nextRand(rng)
-    let d = nextRand(rng)
-    let op = a % 16
-    let slot = b % ROOTS
-    let slot2 = c % ROOTS
-    let field = d % 2 * 8
-
-    if (op < 8) {
-      roots[slot] = gcAlloc(g, nodeInfo)
-    } else if (op < 10) {
-      roots[slot] = gcAlloc(g, wideInfo)
-    } else if (op < 12) {
-      // Build an edge between two live roots. Offsets 0 and 8 are valid
-      // reference fields of BOTH shapes, so this never needs to know which.
-      if (roots[slot] != 0 && roots[slot2] != 0) {
-        storeWord(roots[slot] + field, roots[slot2])
-      }
-    } else if (op == 12) {
-      roots[slot] = 0
-    } else if (op == 13) {
-      gcCollectRoots(g, rootsAddr, ROOTS)
-    }
-
-    step = step + 1
-
-    if (step % RECORD_EVERY == 0) {
-      let n = gcNumObjects(g)
-      // #3178: neither `Node` nor `Wide` is ever large, so the hash index
-      // must hold exactly 0 entries at every record — not `n`.
-      if (gcIndexEntries(g) != 0) {
-        indexAgree = 0
-      }
-      print("${step} ${n} ${gcLiveBytes(g)} ${gcStatCollections(g)} ${gcStatTotalSwept(g)} ${gcStatSurvivorsLast(g)} ${gcIndexEntries(g)}\n")
-    }
-  }
-
-  // The index and the authoritative linear scan must give the same answer for
-  // every root, for an interior pointer, and for a foreign address — the
-  // membership contract of ABI.md §3. This is the property the fast path exists
-  // to preserve, so it is checked against the oracle rather than assumed.
-  let i = 0
-  while (i < ROOTS) {
-    let r = roots[i]
-    if (r != 0) {
-      if (gcOwns(g, r) != gcOwnsLinear(g, r)) {
-        ownsAgree = 0
-      }
-      if (!gcOwns(g, r)) {
-        ownsAgree = 0
-      }
-      // An interior pointer is not an object base and must be rejected by both.
-      if (gcOwns(g, r + 8) != gcOwnsLinear(g, r + 8)) {
-        ownsAgree = 0
-      }
-    }
-    i = i + 1
-  }
-  if (gcOwns(g, 4096) || gcOwnsLinear(g, 4096)) {
-    ownsAgree = 0
-  }
-
-  // CONSERVATIVE ROOT PROBING (ABI.md §5) — and the reason `gcMarkRoot`
-  // validates at all.
-  //
-  // A conservative stack scan hands the collector raw machine words, and the
-  // type system additionally calls several single-word values "references" that
-  // are NOT GC objects: a `chan` handle is page-allocated and process-lifetime,
-  // a bare function value is a code address. Both the stack maps (§4) and object
-  // pointer maps (§2) legitimately list them. A blind mark would decode
-  // `word - 32` as a `GcHeader` and corrupt the heap.
-  //
-  // So this collection seeds NO real roots — only words that are inside the
-  // collector's address window but are not object bases: the interior of every
-  // live object, and every live object's HEADER address. Every one must be
-  // rejected, so the outcome is identical to a collection with an empty root
-  // set: the entire heap goes. That is what makes the `owns` check in
-  // `gcMarkRoot` load-bearing rather than decorative — without it these words
-  // mark garbage and the table diverges.
-  gcMarkBegin(g)
-  let c = 0
-  while (c < ROOTS) {
-    let r = roots[c]
-    if (r != 0) {
-      gcMarkConservative(g, r + 8)            // interior pointer
-      gcMarkConservative(g, r - gcHeaderSize) // the header, not the body
-    }
-    c = c + 1
-  }
-  gcCollectFinish(g)
+  // The two invariants accumulated across the whole run, reported on the final
+  // line: see `runScript` and `ownsProps` for what each one is worth.
+  let indexAgree = runScript(s, rng)
+  let ownsAgree = ownsProps(s)
+  conservativeProbe(s)
 
   let idxOk = 0
   if (gcIndexEnabled(g)) {
@@ -459,8 +515,8 @@ fn main() {
   // #4083's two arms. Both denominators are printed so a run that silently
   // examined nothing cannot read as a pass.
   let tally = []i64(2)
-  let sizesBad = sizeRoundTrip(g, metaAddr + MI_LEAF * 8, rootsAddr, roots, tally)
-  let lost = refArrayTrace(g, refArrInfo, nodeInfo, rootsAddr, roots, tally)
+  let sizesBad = sizeRoundTrip(g, metaAddr + MI_LEAF * 8, s.rootsAddr, roots, tally)
+  let lost = refArrayTrace(s, tally)
 
   // `alive` IS LOAD-BEARING AND IS IN THE GOLDEN LINE ON PURPOSE. The file
   // header above says the backing slices stay alive under BIT_GC=stress because
