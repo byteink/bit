@@ -69,15 +69,19 @@ fn enumZeroVariantName(c: Checker, enumTy: int): string {
   return oc.source[vn.span.start:vn.span.end]
 }
 
-// Whether a value of type `fty` has no zero value at all: a class type (any
-// class-typed field disqualifies its OWN container, so the field itself needs
-// no recursive check — being class-kind is sufficient), or a boxed enum whose
-// tag-0 variant carries a payload (`enumZeroVariantName` above). Shared by the
+// Whether a FIELD of type `fty` leaves its container without a zero value: a
+// class type (any class-typed field disqualifies its OWN container, so the
+// field itself needs no recursive check — being class-kind is sufficient), a
+// boxed enum whose tag-0 variant carries a payload (`enumZeroVariantName`
+// above), or (#4533) a tuple carrying a member with no zero value. Shared by the
 // checker (this file) and by lowering's own runtime-panic guard
 // (`lowerslicefill.bit`'s `typeHasNoZeroValue`), which cannot reuse
 // `vMissingStructFields` because it runs off an `FnCtx`, before this file's
 // `Checker` is in scope.
-fn vFieldHasNoZeroValue(c: Checker, fty: int): bool {
+fn vFieldHasNoZeroValue(c: Checker, fty: int, depth: int): bool {
+  if (depth > 32) {
+    return false
+  }
   let fk = c.ctx.types[fty].kind
   if (fk == TypeKind.Struct) {
     return true
@@ -85,7 +89,63 @@ fn vFieldHasNoZeroValue(c: Checker, fty: int): bool {
   if (fk == TypeKind.Enum) {
     return enumZeroVariantName(c, fty) != ""
   }
+  if (fk == TypeKind.Tuple) {
+    return vTupleNoZeroMember(c, fty, depth) >= 0
+  }
   return false
+}
+
+// The index of tuple `ty`'s FIRST member with no zero value, in member order,
+// or -1 when every member has one (#4533). `let p: P` was E0083 while
+// `let w: (i64, P)` was accepted and quietly handed a zeroed `P` — one verdict
+// for a type, another for the same type reached through a tuple. Owner ruling
+// 2026-09-10: the checker recurses, so both spellings refuse.
+//
+// A tuple MEMBER is judged by `vMemberHasNoZeroValue`, NOT by the field rule
+// above: #4414/#4500 settled that a tuple's class-typed member is materialized
+// as a live zeroed instance (`zeroIsLiveRecord`, lowerslicefill.bit), so
+// `let cl: (i64, P)` for a `P` that has a zero value is legal and stays legal.
+// Only a member whose own type has NO zero value has nothing to be given.
+//
+// `depth` is the shared bound of the whole family: the walk descends through
+// tuple members into class fields and back, and a class may name a tuple that
+// names it (`class A { t: (i64, B) }` with `class B { t: (i64, A) }`). E0047
+// rejects that cycle, but this validator still walks the types it built, so
+// the recursion is bounded rather than trusting another diagnostic to have
+// fired first. Over the bound it reports nothing, matching `vComparable`
+// (validateattr.bit) and this file's standing permissive rule.
+fn vTupleNoZeroMember(c: Checker, ty: int, depth: int): int {
+  let ms = c.ctx.types[ty].members
+  let i = 0
+  while (i < len(ms)) {
+    if (vMemberHasNoZeroValue(c, ms[i], depth + 1)) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Whether the TYPE `ty` has no zero value of its own — the tuple-member half
+// of `vFieldHasNoZeroValue` above, which asks the different question "does a
+// field of this type disqualify its container". A class qualifies only when it
+// has a field with no zero value; an enum and a nested tuple ask the same
+// questions they ask anywhere.
+fn vMemberHasNoZeroValue(c: Checker, ty: int, depth: int): bool {
+  if (depth > 32) {
+    return false
+  }
+  let k = c.ctx.types[ty].kind
+  if (k == TypeKind.Enum) {
+    return enumZeroVariantName(c, ty) != ""
+  }
+  if (k == TypeKind.Tuple) {
+    return vTupleNoZeroMember(c, ty, depth) >= 0
+  }
+  if (k != TypeKind.Struct) {
+    return false
+  }
+  return vMissingStructFields(c, ty, []int(0), depth + 1) != ""
 }
 
 // The names of `structTy`'s fields with no zero value (a class-typed field, or
@@ -93,7 +153,7 @@ fn vFieldHasNoZeroValue(c: Checker, fty: int): bool {
 // declaration order, joined as `'a', 'b'` for a message. `named` is the
 // literal's initializer list; a field it names is not missing. Pass an empty
 // list to get every such field, which is what the initializer-less form needs.
-fn vMissingStructFields(c: Checker, structTy: int, named: []int): string {
+fn vMissingStructFields(c: Checker, structTy: int, named: []int, depth: int): string {
   let decl = structDeclOf(c, structTy)
   if (decl == 0) {
     return ""
@@ -108,7 +168,7 @@ fn vMissingStructFields(c: Checker, structTy: int, named: []int): string {
     // is keyed on the instantiated type id, so it already carries the
     // substitution `typeFromNodeIn` would have to redo.
     let fty = structFieldLookup(c, "${structTy}." + name)
-    if (fty == 0 || !vFieldHasNoZeroValue(c, fty)) {
+    if (fty == 0 || !vFieldHasNoZeroValue(c, fty, depth)) {
       continue
     }
     if (vLitNamesField(c, named, name)) {
@@ -215,7 +275,7 @@ fn vCompositeNoOmitted(c: Checker, node: int) {
   if (target == 0 || c.ctx.types[target].kind != TypeKind.Struct) {
     return
   }
-  let missing = vMissingStructFields(c, target, kidsOf(c.tree, kids[1]))
+  let missing = vMissingStructFields(c, target, kidsOf(c.tree, kids[1]), 0)
   if (missing == "") {
     return
   }
@@ -275,11 +335,47 @@ fn vBindingNoZeroValue(c: Checker, node: int) {
   if (ty == 0) {
     return
   }
-  if (c.ctx.types[ty].kind == TypeKind.Enum) {
+  vBindingTypeNoZeroValue(c, node, ty)
+}
+
+// Surface (2)'s dispatch on the annotation's kind, split out of
+// `vBindingNoZeroValue` above to keep it under E0204's complexity ceiling:
+// each kind has no zero value for its own reason and names it its own way.
+fn vBindingTypeNoZeroValue(c: Checker, node: int, ty: int) {
+  let k = c.ctx.types[ty].kind
+  if (k == TypeKind.Enum) {
     vBindingEnumNoZeroValue(c, node, ty)
     return
   }
+  if (k == TypeKind.Tuple) {
+    vBindingTupleNoZeroValue(c, node, ty)
+    return
+  }
   vBindingStructNoZeroValue(c, node, ty)
+}
+
+// Surface (2) for a TUPLE binding — `let w: (i64, P)` with no initializer
+// (#4533). §13.4 default-constructs a tuple member by member, so a member
+// whose type has no zero value has nothing to be given, exactly as `let p: P`
+// has nothing to give the class-typed field that makes `P` refuse. Before
+// this, the two spellings disagreed: `let p: P` was E0083 while the tuple form
+// was accepted and lowered to a zeroed `P` whose own class-typed field stayed
+// null. The diagnostic names the MEMBER INDEX, which is the only name a
+// tuple's members have (§11.3's `.0`/`.1` access).
+fn vBindingTupleNoZeroValue(c: Checker, node: int, ty: int) {
+  let i = vTupleNoZeroMember(c, ty, 0)
+  if (i < 0) {
+    return
+  }
+  let mty = c.ctx.types[ty].members[i]
+  report(
+    c.diags, ecNoZeroValue, vSpan(c, node),
+    "'${typeName(c.ctx, ty)}' cannot be default-constructed: member .${i} has type '${typeName(
+      c.ctx,
+      mty,
+    )}', which has no zero value",
+    "give the binding an initializer naming every member, e.g. `= (...)` (§13.4)",
+  )
 }
 
 // The Struct half of surface (2), split from `vBindingNoZeroValue` above to
@@ -288,7 +384,7 @@ fn vBindingStructNoZeroValue(c: Checker, node: int, ty: int) {
   if (c.ctx.types[ty].kind != TypeKind.Struct) {
     return
   }
-  let missing = vMissingStructFields(c, ty, []int(0))
+  let missing = vMissingStructFields(c, ty, []int(0), 0)
   if (missing == "") {
     return
   }
@@ -404,7 +500,7 @@ fn vSliceAllocReportNoZero(c: Checker, node: int, ty: int, elem: int, n: int) {
     )
     return
   }
-  let missing = vMissingStructFields(c, elem, []int(0))
+  let missing = vMissingStructFields(c, elem, []int(0), 0)
   if (missing == "") {
     return
   }
