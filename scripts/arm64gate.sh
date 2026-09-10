@@ -54,6 +54,43 @@ DEADLINE="${ARM64GATE_DEADLINE:-10800}"
 # `--help` for a green-path control that proves a zero exit really reports green.
 STEP="${ARM64GATE_STEP:-test}"
 
+# The pinned stage0's `runtime/**` has to travel WITH the tree (#4732). This
+# gate ships `git archive HEAD`, so the container has no `.git`, and the
+# runtime ABI arity check (`stage0RuntimeBaseline`, tools/build/abiarity.bit)
+# could not `git archive <tag>` there: it skipped itself on every Linux gate
+# run, leaving the check that caught 164 invisible symbols (#4189) running on
+# the Mac alone. `gate_stream` appends a second archive of `<tag>:runtime/`,
+# and BIT_ABI_BASELINE_DIR (below, on the container's `./make`) names where it
+# lands. Under `bit-out/` because that is where the Mac's own extraction
+# already lives, so no source walk in the suite can pick the snapshot up.
+#
+# The tag is read from the ARCHIVED tree's dist/stage0/SHA256SUMS exactly as
+# `stage0Version` reads it: the first non-comment line naming a
+# `bit-<version>-<triple>` asset wins. awk, not sed: BSD sed has no `\|`.
+ABI_BASELINE_DIR="bit-out/make/abiarity-gate-baseline"
+STAGE0_VERSION=$(git show HEAD:dist/stage0/SHA256SUMS | awk '
+  /^[[:space:]]*#/ { next }
+  { for (i = 1; i <= NF; i++)
+      if ($i ~ /^bit-.+-(linux-aarch64|linux-x86_64|macos-aarch64)\.tar\.xz$/) {
+        v = $i
+        sub(/^bit-/, "", v)
+        sub(/-(linux-aarch64|linux-x86_64|macos-aarch64)\.tar\.xz$/, "", v)
+        print v
+        exit
+      } }')
+[ -n "${STAGE0_VERSION}" ] || {
+  echo "arm64gate: cannot read the pinned stage0 version from HEAD:dist/stage0/SHA256SUMS" >&2; exit 127; }
+STAGE0_TAG="v${STAGE0_VERSION}"
+git rev-parse --verify --quiet "${STAGE0_TAG}^{commit}" >/dev/null || {
+  echo "arm64gate: tag ${STAGE0_TAG} (the pinned stage0) is missing locally: \`git fetch --tags\`. Without it the container cannot run the runtime ABI arity check." >&2; exit 127; }
+GATE_HEAD_SHA=$(git rev-parse HEAD)
+
+# The two archives the container unpacks, in one stream. `tar xi` there, not
+# `tar x`: GNU tar stops at the first archive's end-of-archive blocks unless
+# told to read past them.
+baseline_archive() { git archive --prefix="${ABI_BASELINE_DIR}/" "${STAGE0_TAG}" -- runtime; }
+gate_stream() { git archive HEAD; baseline_archive; }
+
 command -v docker >/dev/null || { echo "arm64gate: docker not found" >&2; exit 127; }
 docker image inspect "${IMAGE}" >/dev/null 2>&1 || {
   echo "arm64gate: image ${IMAGE} missing — build it: docker build -f docker/linux-gate.Dockerfile -t ${IMAGE} ." >&2; exit 127; }
@@ -142,8 +179,8 @@ run_suite() {
 
   start_ts=$(date +%s)
   code=$(docker run --rm -i --name "${name}" ${cache_args} "${IMAGE}" bash -c '
-      mkdir -p /work && cd /work && tar x &&
-      BIT_STAGE0_CACHE='"${cache_env}"'/stage0 ./make '"${STEP}"' > /tmp/o 2>&1
+      mkdir -p /work && cd /work && tar xi &&
+      BIT_STAGE0_CACHE='"${cache_env}"'/stage0 BIT_ABI_BASELINE_DIR='"${ABI_BASELINE_DIR}"'/runtime BIT_GATE_HEAD_SHA='"${GATE_HEAD_SHA}"' ./make '"${STEP}"' > /tmp/o 2>&1
       e=$?
       if [ $e -eq 0 ]; then
         echo ===TAIL===
@@ -233,6 +270,9 @@ mutant_stream() {
   # --exclude '._*' does NOT work and was measured: still 2119. The members are
   # synthesized at write time and never exist as paths for a filter to match.
   COPYFILE_DISABLE=1 tar c --no-xattrs -C "${tmp}" .
+  # The mutated tree needs the pinned baseline too, or the mutant run diverges
+  # from the control by more than the one deliberate breakage (#4732).
+  baseline_archive
   rm -rf "${tmp}"
 }
 
@@ -277,7 +317,7 @@ if [ "${MODE}" = "selftest" ]; then
   # 1. Control: the unmodified committed tree MUST pass. If this is red the
   #    selftest proves nothing, so stop rather than report a meaningless red.
   echo "===SELFTEST CONTROL (no-op, must be GREEN)==="
-  if git archive HEAD | run_suite; then
+  if gate_stream | run_suite; then
     echo "SELFTEST_CONTROL=pass"
   else
     echo "SELFTEST_CONTROL=fail  — HEAD is already red; fix that before trusting a mutation result" >&2
@@ -299,7 +339,7 @@ fi
 fails=0
 for i in $(seq 1 "${RUNS}"); do
   [ "${RUNS}" -gt 1 ] && echo "===RUN ${i}/${RUNS}==="
-  git archive HEAD | run_suite || fails=$((fails + 1))
+  gate_stream | run_suite || fails=$((fails + 1))
 done
 
 if [ "${RUNS}" -gt 1 ]; then
