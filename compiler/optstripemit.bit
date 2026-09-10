@@ -31,6 +31,11 @@ class StripCtx {
   // no-survivor-mask contract does not hold here. Same field, same reason, as
   // `RebuildCtx.emitted` (compiler/optrebuild.bit).
   mapped: []bool,
+  // #4723. How many times each ORIGINAL value id is read as an operand, from
+  // `stripUseCounts` — the same count `stripHeaderShapeOk` asks about the
+  // header's compare, computed once more here because the analysis that built
+  // it does not outlive `stripFindLoops`. Read by `stripHeaderConstLive` only.
+  uses: []int,
 }
 
 // Binds old instruction index `idx` to `newId` and records that it was bound.
@@ -158,16 +163,56 @@ fn stripLimitOf(sc: StripCtx, lp: StripLoop): int {
   return sc.remap[lp.limVal]
 }
 
+// #4723. Whether the INNER header's copy of header constant `k` has a reader.
+//
+// The rewrite drops the header's own compare — the inner one tests the strip
+// LIMIT parameter, not the loop's limit — so every read that compare made of a
+// header constant dies with it. A bound like `while (i < 40000000)` is read by
+// nothing else, and its copy inside the strip loop is then a dead
+// `movz`/`movk` pair executed once per ITERATION, in the hottest block of the
+// function: measured at 2 of the 9.45 instructions per iteration of a
+// `s += i / 12` probe on 54e78b20, and present in every literal-bounded loop
+// whose bound does not fit an immediate.
+//
+// Skipping it is safe whatever this answers, which is why the predicate may be
+// approximate and must never be side-effecting: `OUTER` has already emitted
+// its own copy and bound `remap` to it, `OUTER` dominates every block of the
+// strip-mined loop, and a constant is pure — so a body read that this function
+// wrongly refuses resolves to the outer copy instead, one live value rather
+// than one re-materialization. What it must NOT do is skip an instruction with
+// an effect; `stripHeaderShapeOk` (optstrip.bit) admits only `stripPureConst`
+// ops into this range, and this is the second half of that guarantee.
+fn stripHeaderConstLive(sc: StripCtx, lp: StripLoop, k: int): bool {
+  let cmp = stripCmpIdx(sc.f, lp.header)
+  let ops = instrOperands(sc.f, cmp)
+  let reads = sc.uses[k]
+  let i = 0
+  while (i < len(ops)) {
+    if (ops[i] == k) {
+      reads = reads - 1
+    }
+    i = i + 1
+  }
+  return reads > 0
+}
+
 // Re-emits the header's leading constants into whatever block is open, and
 // points `remap` at those copies. `OUTER` needs them because the loop's limit
 // may be one of them; the header emits its own copies afterwards, which
 // overwrite `remap` for everything inside the loop.
-fn stripEmitHeaderConsts(sc: StripCtx, lp: StripLoop) {
+//
+// `keepDead` is true for `OUTER` and false for the inner header (#4723): OUTER
+// rebuilds a compare that reads the limit, so its copy has a reader by
+// construction, while the inner header's compare reads the strip limit
+// parameter instead — see `stripHeaderConstLive`.
+fn stripEmitHeaderConsts(sc: StripCtx, lp: StripLoop, keepDead: bool) {
   let hb = sc.f.blocks[lp.header]
   let k = hb.instsStart + hb.paramCount
   let end = stripCmpIdx(sc.f, lp.header)
   while (k < end) {
-    stripEmitOne(sc, k)
+    if (keepDead || stripHeaderConstLive(sc, lp, k)) {
+      stripEmitOne(sc, k)
+    }
     k = k + 1
   }
 }
@@ -185,7 +230,7 @@ fn stripEmitOuter(sc: StripCtx, li: int) {
     stripBind(sc, hb.instsStart + i, builderAddParam(sc.b, sc.f.instrs[hb.instsStart + i].ty))
     i = i + 1
   }
-  stripEmitHeaderConsts(sc, lp)
+  stripEmitHeaderConsts(sc, lp, true)
   let iv = sc.remap[hb.instsStart + lp.ivIdx]
   let cond = stripCmp(sc, Op.ICmpSlt, iv, stripLimitOf(sc, lp), span)
   let br = sc.f.instrs[stripCmpIdx(sc.f, lp.header) + 1]
@@ -361,7 +406,7 @@ fn stripEmitHeader(sc: StripCtx, li: int) {
     i = i + 1
   }
   lp.limParamId = builderAddParam(sc.b, primType(sc.ctx, 3))
-  stripEmitHeaderConsts(sc, lp)
+  stripEmitHeaderConsts(sc, lp, false)
   let cond = stripCmp(sc, Op.ICmpSlt, sc.remap[hb.instsStart + lp.ivIdx], lp.limParamId, span)
   let br = sc.f.instrs[stripCmpIdx(sc.f, lp.header) + 1]
   stripBr(
@@ -572,7 +617,7 @@ fn stripMine(ctx: TypeContext, f: IrFunc): IrFunc {
     b: newBuilder(), f: f, ctx: ctx,
     remap: stripZeros(len(f.instrs)), blockMap: stripZeros(len(f.blocks)),
     known: stripNoConsts(len(f.instrs)), loops: loops,
-    mapped: stripFalses(len(f.instrs)),
+    mapped: stripFalses(len(f.instrs)), uses: stripUseCounts(f),
   }
   let headerOf = stripRoleMap(loops, len(f.blocks), false)
   let latchOf = stripRoleMap(loops, len(f.blocks), true)
