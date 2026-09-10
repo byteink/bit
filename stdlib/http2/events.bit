@@ -45,6 +45,12 @@ fn h2connTerminate(st: h2connState, msg: string) {
     st.readyCh <- 0
   }
   h2connFailAll(st, msg)
+  // Every stream still owing bytes to a body reader is failed here, so a parked
+  // reader is answered instead of being left waiting on a loop that has stopped
+  // reading frames (#4624). A reader that was between reads is answered by
+  // `h2connCmdRead` off the `errMsg` this records; `h2connLoop` keeps serving
+  // commands until both kinds have taken their answer.
+  h2connFailBodies(st, msg)
   // A server's `serve()` (conn.bit) parks on `acceptCh` for the life of the
   // connection with no other release; only this teardown ever ends it, so it
   // must be signalled here (#3020). Guarded to the server: a client never calls
@@ -52,7 +58,12 @@ fn h2connTerminate(st: h2connState, msg: string) {
   // buffered (cap 256, `h2connStart`) so that unclaimed send would not even
   // block, but it would be a message to nobody.
   if (!st.isClient) {
-    st.acceptCh <- h2connAccept{ stop: true, streamId: 0, request: h2connZeroRequest() }
+    st.acceptCh <- h2connAccept{
+      stop: true,
+      streamId: 0,
+      request: h2connZeroRequest(),
+      hasBody: false,
+    }
   }
   // The writer thread (`loop.bit`) parks on `writeCh` once it has drained
   // whatever the loop last queued — an empty-channel receive, not a
@@ -270,8 +281,9 @@ fn h2connServerHeaders(
   if (endStream) {
     s.recvEnded = true
     h2connRecvEndTransition(st, s)
-    h2connDeliverRequest(st, s)
   }
+  h2connDeliverRequest(st, s)
+  h2connAnswerReader(st, s)
 }
 
 // A peer-initiated stream's opening HEADERS: check the id, check we have room
@@ -323,8 +335,10 @@ fn h2connOpenPeerStream(st: h2connState, streamId: int, fields: []HeaderField, e
   if (endStream) {
     s.recvEnded = true
     s.state = h2stHCRemote
-    h2connDeliverRequest(st, s)
   }
+  // Delivered here, with the headers, rather than at END_STREAM: the body is
+  // read incrementally from this point on (#4624).
+  h2connDeliverRequest(st, s)
 }
 
 fn h2connClientHeaders(st: h2connState, streamId: int, fields: []HeaderField, endStream: bool) {
@@ -367,13 +381,18 @@ fn h2connDataStreamOk(st: h2connState, streamId: int): bool {
 // stream error and not a connection error: one oversized body is that stream's
 // fault, and the other streams multiplexed over the same connection are not.
 //
-// Written as a subtraction, never `len(s.recvBody) + n > st.maxBodyBytes`:
-// `len(s.recvBody)` is never above `st.maxBodyBytes` (this check is what keeps
-// it there), so the left side cannot overflow, while the addition can for a
+// Against `s.recvTotal`, the bytes ever accepted on the stream, and NOT against
+// `len(s.recvBody)`, which since #4624 is only the bytes not yet taken by the
+// application and falls back to 0 every time it reads — a budget read off that
+// would let a peer upload without limit so long as the application kept up.
+//
+// Written as a subtraction, never `s.recvTotal + n > st.maxBodyBytes`:
+// `s.recvTotal` is never above `st.maxBodyBytes` (this check is what keeps it
+// there), so the left side cannot overflow, while the addition can for a
 // length near the top of the i64 range and would then compare as negative —
 // i.e. the obvious spelling is the bypass.
 fn h2connBodyBudgetOk(st: h2connState, s: h2connStream, n: int): bool {
-  if (n > st.maxBodyBytes - len(s.recvBody)) {
+  if (n > st.maxBodyBytes - s.recvTotal) {
     let msg = "http2: body exceeds ${st.maxBodyBytes} bytes"
     h2connStreamErrorMsg(st, s.id, errorEnhanceYourCalm, msg)
     return false
@@ -398,22 +417,23 @@ fn h2connRenewConnWindow(st: h2connState, n: int) {
   h2connSendWindowUpdate(st, WindowUpdateFrame{ streamId: 0, increment: n })
 }
 
-// We buffer the whole body, so the bytes are "consumed" the instant they land;
-// replenish both windows and tell the peer with WINDOW_UPDATE so it may send on.
+// Credit an accepted DATA frame. Only the bytes NOBODY WILL TAKE are renewed
+// here (#4624): the padding, which `decodeData` discarded and which is therefore
+// never resident, plus the body itself on a stream with no body reader, where
+// there is no later take to hang the renewal on. Everything else is held until
+// `h2connSendBody` (streams.bit) hands it to the application, and it is the
+// holding that makes the receive window a running account rather than the
+// per-frame ceiling #4624 found it to be.
+//
 // Only ever reached for DATA whose bytes this connection kept: the two paths
 // that drop them renew the connection window themselves and must not renew the
 // stream's (#4621).
-//
-// The stream window is renewed only when the stream can still receive:
-// END_STREAM is half-close, so a stream WINDOW_UPDATE after it would grant
-// credit nobody can spend. The connection window is always renewed.
-fn h2connReplenishWindows(st: h2connState, df: DataFrame, s: h2connStream, n: int) {
-  h2connRenewConnWindow(st, n)
-  if (n == 0 || df.endStream) {
-    return
+fn h2connCreditData(st: h2connState, df: DataFrame, s: h2connStream, n: int) {
+  let held = 0
+  if (s.bodyOpen) {
+    held = len(df.data)
   }
-  s.recvWindow = s.recvWindow + n
-  h2connSendWindowUpdate(st, WindowUpdateFrame{ streamId: df.streamId, increment: n })
+  h2connGrantWindows(st, df.streamId, s, n - held, df.endStream)
 }
 
 // The connection error a receive window overrun is (RFC 9113 §6.9.1), spelled
@@ -485,16 +505,21 @@ fn h2connOnData(st: h2connState, f: Frame) {
     return
   }
   s.recvBody = h2connAppendBytes(s.recvBody, df.data)
-  h2connReplenishWindows(st, df, s, n)
-  if (df.endStream) {
-    s.recvEnded = true
-    h2connRecvEndTransition(st, s)
-    if (st.isClient) {
-      h2connDeliverResponse(st, s)
-      return
-    }
-    h2connDeliverRequest(st, s)
+  s.recvTotal = s.recvTotal + len(df.data)
+  h2connCreditData(st, df, s, n)
+  if (!df.endStream) {
+    h2connAnswerReader(st, s)
+    return
   }
+  s.recvEnded = true
+  h2connRecvEndTransition(st, s)
+  if (st.isClient) {
+    h2connDeliverResponse(st, s)
+    return
+  }
+  // The request itself went to `serve` at END_HEADERS (`h2connDeliverRequest`);
+  // what END_STREAM adds is the `eof` its body reader is waiting for.
+  h2connAnswerReader(st, s)
 }
 
 fn h2connOnWindowUpdate(st: h2connState, f: Frame) {
@@ -583,6 +608,41 @@ fn h2connHandleCmd(st: h2connState, cmd: h2connCmd) {
     h2connCmdReset(st, cmd)
     return
   }
+  if (cmd.kind == h2cmdRead) {
+    h2connCmdRead(st, cmd)
+    return
+  }
+}
+
+// Take the next of a stream's body for the thread consuming it (#4624), which is
+// also what renews the receive windows — see `h2connSendBody` (streams.bit).
+//
+// Answers at once when there is something to say and parks the reply channel on
+// the stream when there is not; `h2connAnswerReader` (streams.bit) then answers
+// it from the next DATA frame or from END_STREAM. At most one reader per stream:
+// the body has exactly one consumer, the thread `serve` spawned for it.
+//
+// An absent stream is `eof` and not an error. A stream is released the moment it
+// closes with nothing owed, so absence is what a body read AFTER its own eof
+// looks like — while a stream that DIED mid-body is still in the table precisely
+// so this can report it (`h2connCloseStream`, streams.bit).
+fn h2connCmdRead(st: h2connState, cmd: h2connCmd) {
+  let (s, ok) = st.streams[cmd.streamId]
+  if (!ok) {
+    cmd.readCh <- h2connRead{ data: []byte(0), eof: true, errMsg: "" }
+    return
+  }
+  if (s.reset) {
+    h2connFinishReader(st, s)
+    cmd.readCh <- h2connRead{ data: []byte(0), eof: true, errMsg: s.errMsg }
+    return
+  }
+  if (len(s.recvBody) > 0 || s.recvEnded) {
+    h2connSendBody(st, s, cmd.readCh)
+    return
+  }
+  s.readCh = cmd.readCh
+  s.hasReader = true
 }
 
 // Open a client stream for `cmd.request`: allocate the next odd id, send its
