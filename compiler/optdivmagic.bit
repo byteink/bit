@@ -1,0 +1,261 @@
+// #4725: lower a constant divide to its Granlund-Montgomery sequence IN THE
+// IR, before instruction selection, instead of assembling it inside the two
+// backends' div emitters.
+//
+// WHY IT MOVED. `emitMagicQuotientSigned` (arm64selectdiv.bit) wrote the
+// multiplier with `movImm64(cx.code, scratch2(), mg.m)`. `scratch2` is never
+// allocatable (arm64.bit), so `mg.m` had no vreg, no `LiveInterval` and no
+// `RegLoc`: the register allocator's rematerialization policy could not see it
+// and neither could LICM, because `xDivisorPlan` computes `mg.m` during
+// SELECTION and it is therefore not an IR `const_int` at all. The four-word
+// `movz`/`movk` chain was re-emitted on every iteration of every loop that
+// divides -- #4723 measured that and proved no allocator or IR-level policy
+// change could reach it. Emitted here it is an ordinary `const_int` with a
+// vreg, a live interval and a use the optimizer can see, which is the
+// substrate any hoist needs.
+//
+// WHAT THIS DOES NOT YET DO, MEASURED RATHER THAN ASSUMED (#4725). The
+// multiplier is still minted next to its `smulhi`, so the backend still
+// materializes its four-word `movz`/`movk` chain inside the loop body. Both
+// obvious placements were tried on the 40M `s += i / 12` probe and both are
+// refused by an existing invariant:
+//
+//   * LICM does not hoist it. `licmHoistable` (optloopcand.bit) returns false
+//     for any value with `sc.known[idx].known` set, and a `const_int` is
+//     always known -- constants are deliberately re-materialized rather than
+//     kept live, which is right for a one-word constant and wrong for this
+//     one. #4725's ticket body predicted "LICM's existing rule then hoists
+//     const_int m"; it does not, and the disassembly after the first draft of
+//     this pass still carried `movz/movk/movk/movk` in the inner loop.
+//   * Defining it in the ENTRY block instead is rejected by the IR's
+//     loop-closed SSA check: "%28 (smulhi) reads %0, which is defined outside
+//     the loop closed by the back edge in bb8 -- pass it in as a block
+//     parameter". A value that crosses a back edge must be threaded as a block
+//     parameter, which is exactly the machinery LICM owns.
+//
+// So the remaining work is one predicate plus its rebuild interaction in LICM,
+// not anything in this file.
+//
+// WHAT IS LOWERED. Exactly the set `xDivisorPlan` admits: `SDiv`/`UDiv` whose
+// divisor is a non-zero `const_int` that is NOT a positive power of two (that
+// shape is a shift, strictly cheaper, and stays in the backend) and for which
+// `divisorMagic` produces a sequence (it declines 0, 1 and -1). `%` is not
+// lowered -- #4722 measured the same sequence at +4.77% on `SRem`, because the
+// `msub` recovering the remainder then waits on the multiply chain instead of
+// overlapping with the divider.
+//
+// WIDTH. Every value the sequence mints is typed i64/u64 whatever the divide's
+// declared type, because a magic sequence reproduces the 64-BIT machine divide
+// both backends would otherwise issue (divmagic.bit's header) and the high half
+// of a narrower multiply is not what it needs. The quotient therefore replaces
+// a possibly-narrow value with a 64-bit-typed one, which is sound for the same
+// reason both emitters skip `canonNarrow`: every divisor here has |d| >= 2, so
+// |n/d| <= |n|/2 and the quotient is width-canonical in whatever type `n`
+// already was.
+
+// The magic sequence for instruction `idx`, or `noDivMagic()` when this pass
+// leaves it to the backend. One predicate, asked by the rewrite and by
+// `hasLowerableDiv` alike, so the "does this function need rebuilding" scan and
+// the rewrite itself cannot disagree about a single instruction.
+fn divMagicForInstr(ctx: TypeContext, f: IrFunc, idx: int): DivMagic {
+  let ins = f.instrs[idx]
+  if (ins.op != Op.SDiv && ins.op != Op.UDiv) {
+    return noDivMagic()
+  }
+  let w = widthOf(ctx, ins.ty)
+  // The op's signedness and the type's must agree: `divisorMagic` picks the
+  // algorithm from one and the emitted shifts from the other, and applying an
+  // unsigned magic to a signed divide is a silent wrong answer. lower.bit
+  // derives both from one type, so a disagreement means something upstream is
+  // unusual -- decline and let the backend divide for real.
+  if (ins.op == Op.SDiv != w.signed) {
+    return noDivMagic()
+  }
+  if (f.instrs[ins.rhs].op != Op.ConstInt || f.instrs[ins.rhs].ival == 0) {
+    return noDivMagic()
+  }
+  if (xConstPow2Divisor(f, ins.rhs, w) >= 0) {
+    return noDivMagic() // a shift beats a multiply; `emitPow2DivInt` keeps it
+  }
+  return divisorMagic(f.instrs[ins.rhs].ival, w.signed)
+}
+
+// One expansion's fixed operands: the builder, the 64-bit type every value in
+// the sequence carries, and the span of the divide being replaced (#3282: a
+// rewrite keeps the span of the instruction it replaces, never a fresh one).
+// A class rather than three more parameters -- E0202 caps a function at five.
+class DmEmit {
+  b: IrBuilder,
+  ty: int,
+  span: Span,
+}
+
+// Emits `const_int v` and returns its new value id.
+fn dmConst(e: DmEmit, v: int): int {
+  let ins = mkInstr(Op.ConstInt, e.ty)
+  ins.ival = v
+  ins.span = e.span
+  return builderEmit(e.b, ins)
+}
+
+// Emits a binary op over two already-translated value ids.
+fn dmBin(e: DmEmit, op: Op, lhs: int, rhs: int): int {
+  let ins = mkInstr(op, e.ty)
+  ins.lhs = lhs
+  ins.rhs = rhs
+  ins.span = e.span
+  return builderEmit(e.b, ins)
+}
+
+// The signed quotient (divmagic.bit's `magicSigned` emitted form):
+//
+//   q = smulhi(n, m) ; q = q +/- n (addend) ; q = q >>a shift ; q = q + (q >>u 63)
+//
+// The last term is not a rounding nicety: `ashr` rounds toward negative
+// infinity and `/` truncates toward zero (SPEC §13.5), so a negative quotient
+// is one too low without it.
+fn dmEmitSigned(e: DmEmit, n: int, m: int, mg: DivMagic): int {
+  let q = dmBin(e, Op.SMulHi, n, m)
+  if (mg.addend > 0) {
+    q = dmBin(e, Op.Add, q, n)
+  }
+  if (mg.addend < 0) {
+    q = dmBin(e, Op.Sub, q, n)
+  }
+  if (mg.shift > 0) {
+    q = dmBin(e, Op.AShr, q, dmConst(e, mg.shift))
+  }
+  return dmBin(e, Op.Add, q, dmBin(e, Op.LShr, q, dmConst(e, 63)))
+}
+
+// The unsigned twin: no sign correction, but the divisors whose magic does not
+// fit in 64 bits need Hacker's Delight's add indicator recovered as
+// `((n - q) >>u 1) + q` -- that form and not `(q + (n - q)) >>u 1`, which
+// overflows 64 bits.
+fn dmEmitUnsigned(e: DmEmit, n: int, m: int, mg: DivMagic): int {
+  let q = dmBin(e, Op.UMulHi, n, m)
+  if (mg.fixup) {
+    let d = dmBin(e, Op.Sub, n, q)
+    q = dmBin(e, Op.Add, dmBin(e, Op.LShr, d, dmConst(e, 1)), q)
+  }
+  if (mg.shift > 0) {
+    q = dmBin(e, Op.LShr, q, dmConst(e, mg.shift))
+  }
+  return q
+}
+
+// The whole sequence for one divide. `n` is the DIVIDEND's already-translated
+// id; the divisor's `const_int` is simply not read, and dies with the divide.
+fn dmEmitQuotient(x: DivMagicCtx, n: int, mg: DivMagic, span: Span): int {
+  let ty = primType(x.ctx, 7)
+  if (mg.signed) {
+    ty = primType(x.ctx, 3)
+  }
+  let e = DmEmit{ b: x.b, ty: ty, span: span }
+  let m = dmConst(e, mg.m)
+  if (mg.signed) {
+    return dmEmitSigned(e, n, m, mg)
+  }
+  return dmEmitUnsigned(e, n, m, mg)
+}
+
+// The rewrite state for one function -- the shape `AppendCtx` (optappend.bit)
+// and `RebuildCtx` (optrebuild.bit) use, and for the same reason: it keeps the
+// per-block walk under E0202's max-params.
+class DivMagicCtx {
+  b: IrBuilder,
+  f: IrFunc,
+  ctx: TypeContext,
+  remap: []int,
+  blockMap: []int,
+  known: []ConstVal,
+}
+
+fn dmBlock(x: DivMagicCtx, bi: int) {
+  let blk = x.f.blocks[bi]
+  builderBeginBlock(x.b, x.blockMap[bi])
+  let idx = blk.instsStart
+  let paramsEnd = blk.instsStart + blk.paramCount
+  while (idx < paramsEnd) {
+    x.remap[idx] = builderAddParam(x.b, x.f.instrs[idx].ty)
+    idx = idx + 1
+  }
+  let end = blk.instsStart + blk.instsLen
+  while (idx < end) {
+    let mg = divMagicForInstr(x.ctx, x.f, idx)
+    if (mg.ok) {
+      x.remap[idx] = dmEmitQuotient(
+        x, x.remap[x.f.instrs[idx].lhs], mg, x.f.instrs[idx].span,
+      )
+    } else {
+      emitTranslated(x.b, x.f, x.known, x.remap, x.blockMap, idx)
+    }
+    idx = idx + 1
+  }
+  builderEndBlock(x.b)
+}
+
+// Whether `f` contains a divide this pass would rewrite. Asked first so a
+// function with none is returned untouched and the pass cannot perturb it.
+fn hasLowerableDiv(ctx: TypeContext, f: IrFunc): bool {
+  let i = 0
+  while (i < len(f.instrs)) {
+    if (divMagicForInstr(ctx, f, i).ok) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Replace every lowerable constant divide in `f` with its magic sequence.
+//
+// Runs BEFORE the second `foldConstantsAndPrune`/`deadCodeElim` pair in
+// `optimizeModule`, which is what makes the multiplier hoistable: that pair
+// carries LICM, and it also deletes the now-unread divisor `const_int`. It is
+// before strip mining for the reason optstrip.bit's header gives -- strip
+// mining allocates block ids in final emission order and nothing may renumber
+// behind it.
+fn lowerMagicDivides(ctx: TypeContext, f: IrFunc): IrFunc {
+  if (!hasLowerableDiv(ctx, f)) {
+    return f
+  }
+  let n = len(f.blocks)
+  let blockMap = []int(0)
+  let remap = []int(0)
+  let known = []ConstVal(0)
+  let i = 0
+  while (i < n) {
+    blockMap = append(blockMap, 0)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(f.instrs)) {
+    remap = append(remap, 0)
+    known = append(known, noConst()) // nothing is folded here; emitTranslated needs it
+    i = i + 1
+  }
+  // Emission order, not id order -- see `expandAppends`, same invariant.
+  let order = blockEmissionOrder(f)
+  let b = newBuilder()
+  i = 0
+  while (i < n) {
+    blockMap[order[i]] = builderNewBlock(b)
+    i = i + 1
+  }
+  let x = DivMagicCtx{
+    b: b, f: f, ctx: ctx, remap: remap, blockMap: blockMap, known: known,
+  }
+  i = 0
+  while (i < n) {
+    dmBlock(x, order[i])
+    i = i + 1
+  }
+  return IrFunc{
+    name: f.name, paramTypes: f.paramTypes, result: f.result,
+    blocks: b.blocks, instrs: b.instrs, isFallible: f.isFallible,
+    isNaked: f.isNaked, isNosplit: f.isNosplit,
+    inRootModule: f.inRootModule, isPinned: f.isPinned,
+    keepAlive: trKeepAlive(f.keepAlive, remap),
+  }
+}
