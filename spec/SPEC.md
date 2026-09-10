@@ -530,7 +530,10 @@ pat        = IDENT | "_" | tuple_pat .
 - If both `:` type and `=` initializer are present, the initializer must be
   assignable (§14.5) to the type. If only `=` is present, the binding's type is
   **inferred** from the initializer (§15).
-- `tuple_pat` destructures a tuple-typed initializer positionally.
+- `tuple_pat` destructures a tuple-typed initializer positionally. The
+  initializer must be a tuple, and of exactly the pattern's arity — anything
+  else is **E0041**, reported by the checker (a nested pattern is judged the
+  same way against its own element).
 
 ### 10.2 Type Aliases
 
