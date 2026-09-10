@@ -1,0 +1,410 @@
+// The per-task PANIC BOUNDARY core (#4742, epic #4739): the save/resume pair a
+// task installs so a panic discards the frames between the panic site and the
+// boundary instead of aborting the process. `runtime/ABI.md` §12 is the
+// contract; SPEC §18.4 is the language-level statement of what it buys.
+//
+// Same module as ./scratch.bit and ./sched.bit — the head lives in a per-task
+// scratch word (`scrPanicBoundary`) and the register file is the one
+// `schedSwitch` already saves, so hosting this anywhere else would either
+// duplicate the context format or add a module edge. Nothing here imports.
+//
+// ---------------------------------------------------------------------------
+// WHERE THE RESUME POINT COMES FROM, AND WHY IT IS NOT A HAND-COUNTED
+// DISPLACEMENT
+// ---------------------------------------------------------------------------
+//
+// `schedSwitch` resumes at a hand-computed `adr`/`lea` displacement into its own
+// `asm` block, and its header warns that the number is position-dependent on the
+// instruction count with no block-local labels to protect it (SPEC §11.6). This
+// file needs no such displacement, and the reason is structural rather than
+// clever: `schedSwitch` resumes a PARKED task, whose frames are all still
+// intact, while a boundary resumes into a frame whose callees have already
+// returned. `boundaryArm`'s own frame is therefore GONE by the time a panic
+// arrives — the calls made after it was armed reuse exactly that memory — so
+// resuming into this file's own code would land on a destroyed frame and read a
+// clobbered frame record on the way out.
+//
+// So the context saved here is the ARMING CALLER's, taken from the frame chain
+// `runtime/ABI.md` §4 already fixes and both the collector (`gcScanSnapshot`,
+// ../gc/stackmap.bit) and the backtracer (../root/backtrace.bit) already walk:
+// with `FP` the frame pointer of `boundaryArm` itself,
+//
+//   *(FP)      the arming caller's frame pointer
+//   *(FP + 8)  the return address INTO the arming caller
+//   FP + 16    the arming caller's `sp` as of that call's return
+//
+// The last line holds on both architectures for the same reason and is the one
+// worth re-deriving if a backend's frame layout ever moves. arm64
+// (compiler/arm64ctx.bit "Frame layout", `emitPrologue` in
+// compiler/arm64compile.bit): the frame record sits at `[frameSize-16,
+// frameSize)` and `x29 = sp + frameSize - 16`, and a call pushes nothing, so
+// entry `sp` = `x29 + 16`. x64 (`xEmitPrologue`, compiler/x64call.bit): `push
+// rbp; mov rbp, rsp`, so `[rbp]` is the saved rbp, `[rbp+8]` the return address
+// the `call` pushed, and the caller's post-`ret` `rsp` = `rbp + 16`.
+//
+// Resuming is then a plain "return 1 from `boundaryArm`, twice-returning
+// setjmp-style": restore `sp`/`fp` and the two callee-saved files, put 1 in the
+// integer result register and branch to the saved return address. `boundaryArm`'s
+// own epilogue is never executed on that path, which is what makes the destroyed
+// frame harmless.
+//
+// TWO PROPERTIES THIS RESTS ON, both checkable rather than assumed:
+//
+//   1. `boundaryArm` HAS A FRAME. It calls `schedCurrentScratch`, so it must
+//      spill a return address, and neither backend can make it frameless
+//      (arm64's frameless case, `FrameInfo.frameless`, requires no calls at
+//      all). Deleting that call would silently invalidate every offset above.
+//   2. THE CALLEE-SAVED FILE STILL HOLDS THE CALLER'S VALUES at the `asm` block.
+//      That is what the `clobber` list is for here: SPEC §11.6 EXCLUDES a named
+//      register from the allocator for the whole enclosing function, so naming
+//      x19..x28 / rbx,rsi,rdi,r12..r15 means `boundaryArm` never allocates one,
+//      its prologue never saves one, and the values in them at the block are
+//      still the arming caller's. This is the same property ./sched.bit's
+//      header derives at length; it is load-bearing in the opposite direction
+//      here, since this file RESTORES what it saved.
+//
+// The FP file (d8..d15 / xmm6..xmm15) is saved and restored, unlike
+// `gcSaveCalleeRegs` (../gc/gcworldsync.bit) which only snapshots: that one
+// never resumes. §11.6 admits no FP register in a `clobber` list, so property 2
+// cannot be spelled for it — it holds because neither function below has a
+// single float value for the allocator to place there, exactly as `schedSwitch`
+// relies on today.
+//
+// The encodings below were assembled by `clang -c` (arm64-apple-macos and
+// x86_64-unknown-linux-gnu) and read back, this file's neighbours' standard.
+//
+// ---------------------------------------------------------------------------
+// GC: NOTHING TO UNREGISTER
+// ---------------------------------------------------------------------------
+//
+// The stack scan is conservative over `[sp, stackTop]` (`stwScanOwnStack`,
+// ../stw/stwscan.bit). A stack grows down, so the discarded frames sit BELOW the
+// boundary frame; moving `sp` back up on a resume drops them from the scanned
+// range on its own. No live root is lost and no dead one is retained, so no
+// stack map and no unregistration is involved. The whole take/resume path is
+// `@nosplit`, so no safepoint can fire mid-restore — `schedSwitch`'s argument
+// verbatim.
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS FILE DELIBERATELY DOES NOT DECIDE
+// ---------------------------------------------------------------------------
+//
+// A panic raised while the thread is inside a `gcSyscallBegin`/`gcBlockingBegin`
+// bracket must stay FATAL (resuming past it leaves the world believing the
+// thread is blocked and deadlocks the next stop-the-world). That refusal cannot
+// live here: the state word is `muState` in ../gc/gcworld.bit and `runtime/gc`
+// IMPORTS `runtime/sched` (../gc/gcmark.bit takes `schedStackHeadroom`), so the
+// edge this would need is a cycle. It belongs in the DOOR — `runtime/root/<os>/
+// io.bit`, which already imports `runtime/gc` — where #4743 adds the consult.
+// `boundaryTake` refuses on the one condition it can see for itself: a caller
+// that is not running a task at all.
+
+// ---------------------------------------------------------------------------
+// The record
+// ---------------------------------------------------------------------------
+//
+// Words 0..`ctxWords`-1 are `schedSwitch`'s context format unchanged (./sched.bit,
+// "Saved register context"), so there is one context layout in this runtime and
+// not two. The three words after it are this file's own:
+//
+//   0..21   saved context: sp, resume address, fp, lr/rbx, the integer file,
+//           the FP file — `ctxSp`/`ctxPc` name the first two
+//   22      prev: the next boundary out on this task, or 0
+//   23      code: the reason code the last `take` recorded (§12.1)
+//   24      msg:  the `*const RtBytes` the last `take` recorded, as an integer
+//
+// The caller owns the memory and must keep it alive across the guarded call:
+// the arming function's own frame is the natural home (it sits above every
+// frame a later panic can be raised in), which is what ABI.md §12 states.
+export const bndPrev: int = 22
+export const bndCode: int = 23
+export const bndMsg: int = 24
+
+// Words in a boundary record — what a caller of `bit_rt_panic_boundary_arm`
+// must reserve.
+export const bndWords: int = 25
+
+// ---------------------------------------------------------------------------
+// The head word, and the one tag bit in it
+// ---------------------------------------------------------------------------
+//
+// `scrPanicBoundary` (./scratch.bit, word 267) holds the innermost boundary of
+// the CURRENT task, and the records chain outward through `bndPrev`. Per task by
+// construction, so a boundary survives task migration and two tasks cannot see
+// each other's.
+//
+// A record is either ARMED (the head word holds its address, bit 0 clear) or
+// TAKEN (bit 0 set) — taken meaning a panic has already resumed into its frame
+// and that frame's handler is still running. Records are word-aligned, so bit 0
+// is free; one word carries both facts, which is why this needed one scratch
+// word rather than two.
+//
+// The tag is what lets `bit_rt_panic_boundary_code`/`_msg` find the record after
+// a resume with no argument to point them at it, and it gives the nesting rule
+// ABI.md §12 states for free: `boundaryInnermost` SKIPS tagged entries, so a
+// panic raised inside a handler reaches the next boundary OUT (or none, and
+// stays fatal) rather than resuming into a frame that is already unwound.
+const bndTag: int = 1
+
+// A tagged chain cannot outlive the frames that made it, so this is a guard on
+// a corrupt word rather than a real depth — Power of 10 rule 2 wants the walk
+// bounded by a constant, and every real chain is a handful deep.
+const bndMaxDepth: int = 64
+
+// This task's scratch area as a raw address, or 0 when the caller is not
+// running a task at all — a worker's own OS-thread stack, the bootstrap thread,
+// or a thread the runtime never registered. `schedCurrentScratch` cannot answer
+// that question (off a task it returns `taskAt(0)` and faults on use), and it is
+// exactly the question every entry point below must ask first, because a panic
+// on such a thread stays fatal.
+//
+// Otherwise the same two mechanisms `schedCurrentScratch` uses, in the same
+// order: mask `sp` to the granule for an ordinary task, fall back to the
+// oversized-stack registry (`main`) when the tag says no task is based there.
+@nosplit fn boundaryScratch(): int {
+  let sp = readSp()
+  let base = sp & ~(schedStackBytes - 1)
+  if (schedTaskOnStack(base) != 0) {
+    return base
+  }
+  let t = schedTaskOnBigStack(sp)
+  if (t == 0) {
+    return 0
+  }
+  let s = scratchOf(t)
+  return int(s)
+}
+
+// The innermost ARMED record on the chain starting at `head`, or 0 when the
+// task has none. Tagged entries are skipped — see `bndTag`.
+@nosplit fn boundaryInnermost(head: int): int {
+  let h = head
+  let i = 0
+  while (i < bndMaxDepth) {
+    if (h == 0) {
+      return 0
+    }
+    if ((h & bndTag) == 0) {
+      return h
+    }
+    let r = taskAt(h & ~bndTag)
+    h = *(r + bndPrev)
+    i = i + 1
+  }
+  return 0
+}
+
+// ---------------------------------------------------------------------------
+// The five ABI entry points (runtime/ABI.md §12)
+// ---------------------------------------------------------------------------
+
+// Install a boundary: save the ARMING CALLER's context into the caller-provided
+// record at `rec`, push `rec` on this task's chain, and return 0. The same call
+// site returns 1 when a `bit_rt_panic_boundary_take` resumes through it, which
+// is how the caller tells an arm from a recovery.
+//
+// Returns 0 without arming when the caller is not on a task: a panic there stays
+// fatal, so a boundary would be a promise this file cannot keep.
+//
+// The `asm` block MUST stay in this function's own body — see the header: it
+// reads THIS function's frame record to reconstruct its caller's resume state,
+// and moving it into a helper would reconstruct the helper's caller (this
+// function), whose frame is destroyed by the time a panic arrives. The call to
+// `schedCurrentScratch` above it is what forces the frame that record lives in.
+export @nosplit @symbol("bit_rt_panic_boundary_arm") fn boundaryArm(rec: int): int {
+  let scr = boundaryScratch()
+  if (scr == 0) {
+    return 0
+  }
+  let s = taskAt(scr)
+  let r = taskAt(rec)
+  *(r + bndPrev) = *(s + scrPanicBoundary)
+  *(r + bndCode) = 0
+  *(r + bndMsg) = 0
+  *(s + scrPanicBoundary) = rec
+  return asm {
+    arm64 {
+      0xF94003A2,                                     // ldr x2, [x29, #0]   caller fp
+      0xF94007A3,                                     // ldr x3, [x29, #8]   return addr
+      0x910043A4,                                     // add x4, x29, #16    caller sp
+      0xF9000024,                                     // str x4, [x1, #0]
+      0xF9000423,                                     // str x3, [x1, #8]
+      0xF9000822,                                     // str x2, [x1, #16]
+      0xF9000C23,                                     // str x3, [x1, #24]
+      0xF9001033, 0xF9001434, 0xF9001835, 0xF9001C36, // str x19..x22
+      0xF9002037, 0xF9002438, 0xF9002839, 0xF9002C3A, // str x23..x26
+      0xF900303B, 0xF900343C,                         // str x27, x28
+      0xFD003828, 0xFD003C29, 0xFD00402A, 0xFD00442B, // str d8..d11
+      0xFD00482C, 0xFD004C2D, 0xFD00502E, 0xFD00542F, // str d12..d15
+      0xD2800000,                                     // mov x0, #0
+    }
+    x64 {
+      0x48, 0x8B, 0x45, 0x00,                               // mov rax, [rbp+0]   caller rbp
+      0x4C, 0x8B, 0x5D, 0x08,                               // mov r11, [rbp+8]   return addr
+      0x4C, 0x89, 0x5A, 0x08,                               // mov [rdx+8], r11
+      0x48, 0x89, 0x42, 0x10,                               // mov [rdx+16], rax
+      0x48, 0x8D, 0x45, 0x10,                               // lea rax, [rbp+16]  caller rsp
+      0x48, 0x89, 0x02,                                     // mov [rdx+0], rax
+      0x48, 0x89, 0x5A, 0x18,                               // mov [rdx+24], rbx
+      0x4C, 0x89, 0x62, 0x20,                               // mov [rdx+32], r12
+      0x4C, 0x89, 0x6A, 0x28,                               // mov [rdx+40], r13
+      0x4C, 0x89, 0x72, 0x30,                               // mov [rdx+48], r14
+      0x4C, 0x89, 0x7A, 0x38,                               // mov [rdx+56], r15
+      0x48, 0x89, 0x72, 0x40,                               // mov [rdx+64], rsi
+      0x48, 0x89, 0x7A, 0x48,                               // mov [rdx+72], rdi
+      0xF2, 0x0F, 0x11, 0x72, 0x50,                         // movsd [rdx+80], xmm6
+      0xF2, 0x0F, 0x11, 0x7A, 0x58,                         // movsd [rdx+88], xmm7
+      0xF2, 0x44, 0x0F, 0x11, 0x42, 0x60,                   // movsd [rdx+96], xmm8
+      0xF2, 0x44, 0x0F, 0x11, 0x4A, 0x68,                   // movsd [rdx+104], xmm9
+      0xF2, 0x44, 0x0F, 0x11, 0x52, 0x70,                   // movsd [rdx+112], xmm10
+      0xF2, 0x44, 0x0F, 0x11, 0x5A, 0x78,                   // movsd [rdx+120], xmm11
+      0xF2, 0x44, 0x0F, 0x11, 0xA2, 0x80, 0x00, 0x00, 0x00, // movsd [rdx+128], xmm12
+      0xF2, 0x44, 0x0F, 0x11, 0xAA, 0x88, 0x00, 0x00, 0x00, // movsd [rdx+136], xmm13
+      0xF2, 0x44, 0x0F, 0x11, 0xB2, 0x90, 0x00, 0x00, 0x00, // movsd [rdx+144], xmm14
+      0xF2, 0x44, 0x0F, 0x11, 0xBA, 0x98, 0x00, 0x00, 0x00, // movsd [rdx+152], xmm15
+      0x31, 0xC0,                                           // xor eax, eax
+    }
+    input arm64 x1 x64 rdx = rec
+    clobber arm64 { x2, x3, x4, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, memory }
+    clobber x64 { rbx, rsi, rdi, r11, r12, r13, r14, r15, memory }
+    result arm64 x0 x64 rax : int
+  }
+}
+
+// Pop the head on the normal path — the arming function returning without a
+// panic. Correct for a taken record too (the tag is masked off), which is what
+// a boundary whose handler has finished calls.
+export @nosplit @symbol("bit_rt_panic_boundary_disarm") fn boundaryDisarm() {
+  let scr = boundaryScratch()
+  if (scr == 0) {
+    return
+  }
+  let s = taskAt(scr)
+  let head = *(s + scrPanicBoundary)
+  if (head == 0) {
+    return
+  }
+  let r = taskAt(head & ~bndTag)
+  *(s + scrPanicBoundary) = *(r + bndPrev)
+}
+
+// Restore the context in the record at `rec` and resume in the arming frame,
+// with that frame's `bit_rt_panic_boundary_arm` call yielding 1. NEVER RETURNS.
+//
+// Unlike the save half this may live in its own function: every value it needs
+// comes out of the record, and it reads nothing from its own frame.
+@nosplit fn boundaryResume(rec: int) {
+  asm {
+    arm64 {
+      0xF9400022,                                     // ldr x2, [x1, #0]   sp
+      0xF9400423,                                     // ldr x3, [x1, #8]   pc
+      0xF940083D, 0xF9400C3E,                         // ldr x29, x30
+      0xF9401033, 0xF9401434, 0xF9401835, 0xF9401C36, // ldr x19..x22
+      0xF9402037, 0xF9402438, 0xF9402839, 0xF9402C3A, // ldr x23..x26
+      0xF940303B, 0xF940343C,                         // ldr x27, x28
+      0xFD403828, 0xFD403C29, 0xFD40402A, 0xFD40442B, // ldr d8..d11
+      0xFD40482C, 0xFD404C2D, 0xFD40502E, 0xFD40542F, // ldr d12..d15
+      0x9100005F,                                     // mov sp, x2
+      0xD2800020,                                     // mov x0, #1
+      0xD61F0060,                                     // br x3
+    }
+    x64 {
+      0x4C, 0x8B, 0x5A, 0x08,                               // mov r11, [rdx+8]   pc
+      0x48, 0x8B, 0x6A, 0x10,                               // mov rbp, [rdx+16]
+      0x48, 0x8B, 0x5A, 0x18,                               // mov rbx, [rdx+24]
+      0x4C, 0x8B, 0x62, 0x20,                               // mov r12, [rdx+32]
+      0x4C, 0x8B, 0x6A, 0x28,                               // mov r13, [rdx+40]
+      0x4C, 0x8B, 0x72, 0x30,                               // mov r14, [rdx+48]
+      0x4C, 0x8B, 0x7A, 0x38,                               // mov r15, [rdx+56]
+      0x48, 0x8B, 0x72, 0x40,                               // mov rsi, [rdx+64]
+      0x48, 0x8B, 0x7A, 0x48,                               // mov rdi, [rdx+72]
+      0xF2, 0x0F, 0x10, 0x72, 0x50,                         // movsd xmm6, [rdx+80]
+      0xF2, 0x0F, 0x10, 0x7A, 0x58,                         // movsd xmm7, [rdx+88]
+      0xF2, 0x44, 0x0F, 0x10, 0x42, 0x60,                   // movsd xmm8, [rdx+96]
+      0xF2, 0x44, 0x0F, 0x10, 0x4A, 0x68,                   // movsd xmm9, [rdx+104]
+      0xF2, 0x44, 0x0F, 0x10, 0x52, 0x70,                   // movsd xmm10, [rdx+112]
+      0xF2, 0x44, 0x0F, 0x10, 0x5A, 0x78,                   // movsd xmm11, [rdx+120]
+      0xF2, 0x44, 0x0F, 0x10, 0xA2, 0x80, 0x00, 0x00, 0x00, // movsd xmm12, [rdx+128]
+      0xF2, 0x44, 0x0F, 0x10, 0xAA, 0x88, 0x00, 0x00, 0x00, // movsd xmm13, [rdx+136]
+      0xF2, 0x44, 0x0F, 0x10, 0xB2, 0x90, 0x00, 0x00, 0x00, // movsd xmm14, [rdx+144]
+      0xF2, 0x44, 0x0F, 0x10, 0xBA, 0x98, 0x00, 0x00, 0x00, // movsd xmm15, [rdx+152]
+      0x48, 0x8B, 0x22,                                     // mov rsp, [rdx+0]
+      0xB8, 0x01, 0x00, 0x00, 0x00,                         // mov eax, 1
+      0x41, 0xFF, 0xE3,                                     // jmp r11
+    }
+    input arm64 x1 x64 rdx = rec
+    clobber arm64 { x0, x2, x3, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x30, memory }
+    clobber x64 { rax, rbx, rsi, rdi, r11, r12, r13, r14, r15, memory }
+  }
+}
+
+// The consult every recoverable panic door makes BEFORE it writes anything.
+// Returns 0 when this task has no armed boundary, and the door then runs today's
+// write-the-line, optional-backtrace, exit-2 path byte for byte. Otherwise it
+// records `{code, msg}`, marks the record taken and resumes in the arming frame
+// — it does not return on that path.
+//
+// `scrErr` (word 7) is cleared before the resume: a half-completed fallible call
+// can have left a pending error there that the next `?` in the resumed frame
+// would read as its own.
+export @nosplit @symbol("bit_rt_panic_boundary_take") fn boundaryTake(code: int, msg: int): int {
+  let scr = boundaryScratch()
+  if (scr == 0) {
+    return 0
+  }
+  let s = taskAt(scr)
+  let head = *(s + scrPanicBoundary)
+  let rec = boundaryInnermost(head)
+  if (rec == 0) {
+    return 0
+  }
+  let r = taskAt(rec)
+  *(r + bndCode) = code
+  *(r + bndMsg) = msg
+  *(s + scrPanicBoundary) = rec | bndTag
+  *(s + scrErr) = 0
+  boundaryResume(rec)
+  return 0
+}
+
+// The record the last `take` on this task resumed into, or 0 outside that
+// window — the pair below is meaningful only in the arming frame after a resume,
+// and answers 0 rather than reading an armed record's zeroed slots.
+@nosplit fn boundaryTaken(): int {
+  let scr = boundaryScratch()
+  if (scr == 0) {
+    return 0
+  }
+  let s = taskAt(scr)
+  let head = *(s + scrPanicBoundary)
+  if ((head & bndTag) == 0) {
+    return 0
+  }
+  return head & ~bndTag
+}
+
+// The reason code of the panic the last `take` recorded (§12.1: 0 for a
+// message-carrying panic, 1 div-zero, 2 overflow, 3 nil call, 4 nil iface).
+export @nosplit @symbol("bit_rt_panic_boundary_code") fn boundaryCode(): int {
+  let rec = boundaryTaken()
+  if (rec == 0) {
+    return 0
+  }
+  let r = taskAt(rec)
+  let v = *(r + bndCode)
+  return v
+}
+
+// The `*const RtBytes` of the panic the last `take` recorded, as an integer, or
+// 0 for an argument-free door. The BYTES must be copied out immediately: a
+// runtime panic's message is a module-static buffer the next panic of the same
+// kind overwrites.
+export @nosplit @symbol("bit_rt_panic_boundary_msg") fn boundaryMsg(): int {
+  let rec = boundaryTaken()
+  if (rec == 0) {
+    return 0
+  }
+  let r = taskAt(rec)
+  let v = *(r + bndMsg)
+  return v
+}
