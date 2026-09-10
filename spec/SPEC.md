@@ -2581,9 +2581,9 @@ itself be a `tuple_pat` and be split further. A pair binder over `for_in` for a
 pairing that key with the value again is redundant rather than meaningful — use
 `for (k, v) of m` to destructure the pair, or `for k in m` for the key alone.
 
-Worked cases, one per legal combination:
+Worked cases, one per legal combination (a table, not a program):
 
-```bit
+```text
 xs: []int
   for x of xs           // x = the element
   for i in xs           // i = the index
