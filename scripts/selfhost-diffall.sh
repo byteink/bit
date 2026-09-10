@@ -145,9 +145,7 @@ BIT2=bit-out/bin/bit
 # every constituent bail at once, and a wall of exit 2 is not a differential
 # result (#1514).
 if [ "${DIFFALL_DIR:-}" = "" ]; then
-  for bin in "$ORACLE" "$BIT2"; do
-    [ -x "$bin" ] || { echo "diffall: missing $bin — run: ./make selfhost" >&2; exit 2; }
-  done
+  diffrequire diffall "$ORACLE" "$BIT2"
 fi
 [ -f "$ABSENT_SET" ] || { echo "diffall: missing expected-absent set $ABSENT_SET" >&2; exit 2; }
 

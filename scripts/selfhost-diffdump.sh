@@ -60,9 +60,7 @@ BIT2="${ROOT}/bit-out/bin/bit"
 # [diags' version of the same point:] This gate is the worst of the family
 # without it: both sides render empty, and since it skips nothing every file
 # scores MATCH — a full green board from no compiler.
-for bin in "$ORACLE" "$BIT2"; do
-  [ -x "$bin" ] || { echo "${PREFIX}: missing $bin — run: ./make selfhost" >&2; exit 2; }
-done
+diffrequire "$PREFIX" "$ORACLE" "$BIT2"
 
 # Why a child died, for the report. 128+N is death by signal N; 14 is the alarm
 # this script set, so that alone is a timeout and every other signal is a crash.

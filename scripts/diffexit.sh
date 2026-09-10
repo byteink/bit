@@ -99,6 +99,41 @@ diffexit() {
   exit 0
 }
 
+# ## Preconditions: refuse before counting anything (#4505)
+#
+# The other half of the same contract. Exit 2 is "could not decide", and a
+# differential whose COMPILER IS ABSENT has decided nothing -- yet the natural
+# spelling scores it: a failed exec yields empty output on both sides, equal
+# empties compare as agreement, and the script prints a full-looking verdict
+# line and exits 0. Measured on selfhost-diffcheck.sh in a worktree with no
+# bit-out (#4505): `check differential: MATCH=808 MISSING=324 FALSEPOS=0 DIFF=0
+# TIMEOUT=0`, exit 0, with FALSEPOS=0 being its own pass condition. #1514 is
+# the same shape one gate over (fuzzdiff scored 6642 MATCH with no compiler on
+# disk).
+#
+# Seven scripts had already hand-rolled this guard, each with its own copy of
+# the loop, and four (diffcheck, diffexamples, diffexamples-x64, difftests) had
+# none at all -- the "a fix reaches some callers and misses others" shape
+# #2743/#2866 already cost this repo once. One sourced function so a ninth copy
+# has nowhere to be written.
+#
+#   diffrequire "<label>" "$ORACLE" "$BIT2" [more...]
+#
+# Call it BEFORE the corpus loop, after the compiler paths are resolved. It
+# does not build anything: a missing compiler is the caller's problem to fix
+# with `./make selfhost`, never this family's to paper over.
+diffrequire() {
+  local label=$1
+  shift
+  local bin
+  for bin in "$@"; do
+    [ -x "$bin" ] || {
+      echo "$label: missing $bin — run: ./make selfhost" >&2
+      exit 2
+    }
+  done
+}
+
 # Self-check: run directly (not sourced) to assert diffexit's branch table.
 # `bash scripts/diffexit.sh`. diffexit() itself calls `exit`, so every case
 # below runs it in a subshell to capture the code without killing the
@@ -108,11 +143,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   fail=0
 
   # $1=want rc  $2=name  $3=required substring (or "")  $4=forbidden substring
-  # (or "")  $5..=the diffexit call (label + flags).
+  # (or "")  $5..=the call under test (diffexit or diffrequire, plus its args).
+  # Both are run in a subshell: each `exit`s, which would otherwise kill this
+  # self-check instead of being scored by it.
   check() {
     local want=$1 name=$2 needle=$3 anti=$4 out rc
     shift 4
-    out=$( (diffexit "$@") 2>&1 )
+    out=$( ("$@") 2>&1 )
     rc=$?
     [ "$rc" -ne "$want" ] && { echo "FAIL: $name: rc=$rc want=$want ($out)"; fail=1; }
     [ -n "$needle" ] && case "$out" in
@@ -124,15 +161,31 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     esac
   }
 
-  check 0 "all clear"                       "" ""              t -f 0 -t "x=0"
-  check 1 "single failure counter"          "" ""              t -f 1 -t "x=0"
+  check 0 "all clear"                       "" ""              diffexit t -f 0 -t "x=0"
+  check 1 "single failure counter"          "" ""              diffexit t -f 1 -t "x=0"
   check 2 "single timeout counter" \
-    "UNDECIDED: t: 3 file(s) timed out and were NOT compared." "" t -f 0 -t "file(s)=3"
-  check 1 "failure wins over a concurrent timeout" "" ""       t -f 0 2 -t "file(s)=6"
+    "UNDECIDED: t: 3 file(s) timed out and were NOT compared." "" \
+    diffexit t -f 0 -t "file(s)=3"
+  check 1 "failure wins over a concurrent timeout" "" ""       diffexit t -f 0 2 -t "file(s)=6"
   check 2 "multi-timeout, only nonzero counters named" \
     "2 oracle and 1 runtime timed out" "0 bit2" \
-    t -f 0 -t "oracle=2" "bit2=0" "runtime=1"
-  check 0 "no -t given at all"              "" ""              t -f 0
+    diffexit t -f 0 -t "oracle=2" "bit2=0" "runtime=1"
+  check 0 "no -t given at all"              "" ""              diffexit t -f 0
+
+  # diffrequire. "$0" is this file, which is executable and exists; the missing
+  # path is a name under $TMPDIR that is never created.
+  absent="${TMPDIR:-/tmp}/diffexit-selfcheck-absent-$$"
+  rm -f "$absent"
+  check 0 "diffrequire: every path present"  "" ""             diffrequire t "$0"
+  check 2 "diffrequire: absent path refuses" \
+    "t: missing $absent — run: ./make selfhost" "" \
+    diffrequire t "$0" "$absent"
+  check 2 "diffrequire: refuses on the FIRST absent path" \
+    "missing $absent" "" \
+    diffrequire t "$absent" "$0"
+  check 2 "diffrequire: a path under a regular file refuses" \
+    "missing scripts/diffexit.sh/nope" "" \
+    diffrequire t scripts/diffexit.sh/nope
 
   [ "$fail" -eq 0 ] && echo "diffexit.sh: self-check passed"
   exit "$fail"

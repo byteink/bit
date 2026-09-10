@@ -65,9 +65,9 @@ BIT2=bit-out/bin/bit
 VERBOSE=0
 [ "${1:-}" = "-v" ] && VERBOSE=1
 
-for b in "$ORACLE" "$BIT2"; do
-  [ -x "$b" ] || { echo "missing $b — run: ./make" >&2; exit 1; }
-done
+# exit 2, not the exit 1 this used to give (#4505): a missing compiler is
+# could-not-decide, and selfhost-diffall.sh scores exit 1 as a real divergence.
+diffrequire diffverdict "$ORACLE" "$BIT2"
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/bitverdict.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT

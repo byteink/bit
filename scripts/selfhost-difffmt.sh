@@ -75,9 +75,7 @@ BIT2=${DIFFFMT_BIT:-bit-out/bin/bit}
 # margin above that measured worst case.
 TIMEOUT=${DIFFFMT_TIMEOUT:-45}
 
-for bin in "$ORACLE" "$BIT2"; do
-  [ -x "$bin" ] || { echo "difffmt: missing $bin — run: ./make selfhost" >&2; exit 2; }
-done
+diffrequire difffmt "$ORACLE" "$BIT2"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

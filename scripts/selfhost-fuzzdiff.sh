@@ -20,6 +20,8 @@
 set -u
 # shellcheck source=scripts/alarmrun.sh
 . "$(dirname -- "$0")/alarmrun.sh"
+# shellcheck source=scripts/diffexit.sh
+. "$(dirname -- "$0")/diffexit.sh"
 
 # The oracle is the PINNED STAGE0: the previous release, i.e. an EARLIER VERSION
 # OF THIS SAME COMPILER — which is exactly what limits the claim below.
@@ -34,9 +36,7 @@ BIT2=bit-out/bin/bit
 # through perl, and a FAILED exec still exits 0 — so an absent compiler yields
 # rc=0 with seed == b2 == "", and every truncation scores MATCH. Measured: 6642
 # MATCH, exit 0, no compiler on disk. Exit 2 to stay distinct from a divergence.
-for bin in "$ORACLE" "$BIT2"; do
-  [ -x "$bin" ] || { echo "fuzzdiff: missing $bin — run: ./make selfhost" >&2; exit 2; }
-done
+diffrequire fuzzdiff "$ORACLE" "$BIT2"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

@@ -75,6 +75,12 @@ set -u
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
 
+# Refuse before counting anything (#4505): with bit2 absent every invocation
+# fails to exec, the empty result is scored as an ordinary verdict, and this
+# prints a full-looking count line at exit 0. diffrequire is in
+# scripts/diffexit.sh, next to the exit-2 contract it belongs to.
+diffrequire diffcheck "$ORACLE" "$BIT2"
+
 # BOTH SIDES must reach the working tree's stdlib THROUGH THE SAME PATH STRING,
 # not merely reach the same files (#1920). stage0.sh's wrapper already pins
 # BIT_STDLIB for the oracle; BIT2 ran bare, and `stdRootPath` (compiler/main.bit)
