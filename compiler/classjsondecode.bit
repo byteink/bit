@@ -5,9 +5,13 @@
 // What one class turns into, written out, is exactly what a reader would have
 // hand-written against stdlib/json/decode.bit's named helpers:
 //
-//     fn __json_dec_User(__json_j: Json, __json_p: string, __json_d: i64): User! {
+//     fn __json_dec_User(
+//       __json_j: Json, __json_p: string, __json_d: i64, __json_u: bool,
+//     ): User! {
 //       let __json_o = jsonDecObject(__json_j, __json_p, __json_d)?
-//       jsonDecUnknown(__json_o, __json_p, ["id", "tags", "addr"])?
+//       if (__json_u) {
+//         jsonDecUnknown(__json_o, __json_p, ["id", "tags", "addr"])?
+//       }
 //       let __json_x0 = i64(jsonDecIntKey(
 //         jsonDecMember(__json_o, __json_p, "id")?, __json_p, "id")?)
 //       let __json_dp1 = jsonDecPath(__json_p, "tags")
@@ -19,7 +23,8 @@
 //         __json_di1 = __json_di1 + 1
 //       }
 //       let __json_x2 = __json_dec_Addr(
-//         jsonDecMember(__json_o, __json_p, "addr")?, jsonDecPath(__json_p, "addr"), __json_d + 1)?
+//         jsonDecMember(__json_o, __json_p, "addr")?, jsonDecPath(__json_p, "addr"),
+//         __json_d + 1, __json_u)?
 //       return User{ id: __json_x0, tags: __json_x1, addr: __json_x2 }
 //     }
 //
@@ -55,6 +60,30 @@ const jsonDecParamJ = "__json_j"
 const jsonDecParamP = "__json_p"
 const jsonDecParamD = "__json_d"
 const jsonDecEntriesLocal = "__json_o"
+
+// THE UNKNOWN-KEY POLICY, THREADED LIKE THE DEPTH (#4567). True is the strict
+// decode `jsonDecode<T>` asks for — an object carrying a key no field claims
+// fails naming it — and false is `jsonDecodeLenient<T>`'s, which skips the
+// check and binds what it recognises.
+//
+// A PARAMETER and not a second decoder: the two differ in one branch, and a
+// lenient variant per class would put a near-copy of every decoder in the
+// binary. It is threaded into each nested class's decoder so a policy chosen at
+// the call applies to the whole document, which is the only thing a caller can
+// mean by it, and it costs one register and one taken branch per object level.
+//
+// Deciding it per CALL is the whole point of the ticket: `pkg/web` implemented
+// the lenient policy by decoding, reading the `UnknownKey` failure, rebuilding
+// the document without that one key and decoding again — a whole decode and a
+// whole tree rebuild per unknown key, bounded at 32 because otherwise a body of
+// 5,000 junk keys is 5,000 decodes of a 5,000-key document.
+const jsonDecParamU = "__json_u"
+
+// The two literals a caller passes for it, as the words the synthesized source
+// needs. `true` is what every existing entry point passes, so the strict decode
+// is byte-for-byte the one that shipped.
+const jsonDecStrictWord = "true"
+const jsonDecLenientWord = "false"
 
 // The names of stdlib/json/decode.bit's runtime half. Listed once, here,
 // because they are simultaneously the words the module source needs and the
@@ -120,9 +149,10 @@ fn jsonDecodeSynthWords(jx: JsonCtx, classes: []JsonClass): []string {
     return []string(0)
   }
   let out = [
-    jsonDecParamJ, jsonDecParamP, jsonDecParamD, jsonDecEntriesLocal,
-    "Json", "JsonEntry", "string", "i64", "append", "isSome", "unwrap", "len",
-    "key", "value", "Some", "None", "0", "1",
+    jsonDecParamJ, jsonDecParamP, jsonDecParamD, jsonDecParamU,
+    jsonDecEntriesLocal, "Json", "JsonEntry", "string", "i64", "bool",
+    "append", "isSome", "unwrap", "len", "key", "value", "Some", "None",
+    "0", "1", jsonDecStrictWord, jsonDecLenientWord,
   ]
   for h of jsonDecHelperNames() {
     out = append(out, h)
@@ -364,7 +394,7 @@ fn jdValueOf(db: JsonDecBuild, el: JsonDecElem, jsonExpr: int, pr: JsonDecPathRe
       db.jb,
       jbCall(
         db.jb, jdLocal(db, jsonDecName(el.nested)),
-        [jsonExpr, jdJoinPath(db, pr), jdDeeper(db)],
+        [jsonExpr, jdJoinPath(db, pr), jdDeeper(db), jdLocal(db, jsonDecParamU)],
       ),
     )
   }
@@ -606,7 +636,7 @@ fn jdClassRef(db: JsonDecBuild, jc: JsonClass): int {
   return addLeaf(db.jb.tree, Tag.Ident, getNode(db.jb.tree, jc.className).span)
 }
 
-// `(__json_j: Json, __json_p: string, __json_d: i64)`.
+// `(__json_j: Json, __json_p: string, __json_d: i64, __json_u: bool)`.
 fn jdParams(db: JsonDecBuild): int {
   return jbNode(
     db.jb, Tag.Params,
@@ -614,6 +644,32 @@ fn jdParams(db: JsonDecBuild): int {
       jbNode(db.jb, Tag.Param, [jbIdent(db.jb, jsonDecParamJ), jbIdent(db.jb, "Json")]),
       jbNode(db.jb, Tag.Param, [jbIdent(db.jb, jsonDecParamP), jbIdent(db.jb, "string")]),
       jbNode(db.jb, Tag.Param, [jbIdent(db.jb, jsonDecParamD), jbIdent(db.jb, "i64")]),
+      jbNode(db.jb, Tag.Param, [jbIdent(db.jb, jsonDecParamU), jbIdent(db.jb, "bool")]),
+    ],
+  )
+}
+
+// `if (__json_u) { jsonDecUnknown(__json_o, __json_p, [...])? }` (#4567).
+//
+// `jsonDecUnknown` keeps the signature and the behaviour it shipped with — it
+// is exported, documented and callable from a hand-written decoder — so the
+// policy is applied HERE, at the one caller that knows the class's key set.
+// Under the strict policy this emits the same call that was emitted
+// unconditionally before, one taken branch in front of it.
+fn jdUnknownCheck(db: JsonDecBuild, jc: JsonClass): int {
+  let call = jbTry(
+    db.jb,
+    jbCall(
+      db.jb, jdLocal(db, "jsonDecUnknown"),
+      [jdLocal(db, jsonDecEntriesLocal), jdLocal(db, jsonDecParamP), jdKnownKeys(db, jc)],
+    ),
+  )
+  return jbNode(
+    db.jb, Tag.IfStmt,
+    [
+      jdLocal(db, jsonDecParamU),
+      jbNode(db.jb, Tag.Block, [jbNode(db.jb, Tag.ExprStmt, [call])]),
+      0,
     ],
   )
 }
@@ -637,16 +693,9 @@ fn synthJsonDecoder(db: JsonDecBuild, jc: JsonClass): int {
       ],
     ),
   )
-  let unknown = jbTry(
-    db.jb,
-    jbCall(
-      db.jb, jdLocal(db, "jsonDecUnknown"),
-      [jdLocal(db, jsonDecEntriesLocal), jdLocal(db, jsonDecParamP), jdKnownKeys(db, jc)],
-    ),
-  )
   let stmts = [
     jbLet(db.jb, jsonDecEntriesLocal, 0, entries),
-    jbNode(db.jb, Tag.ExprStmt, [unknown]),
+    jdUnknownCheck(db, jc),
   ]
   for f of jc.fields {
     for s of jdFieldStmts(db, f) {

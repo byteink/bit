@@ -69,12 +69,8 @@
 
 import {
   JsonDecodeError,
-  JsonEntry as BodyEntry,
-  jsonAsArray as bodyArray,
-  jsonAsObject as bodyObject,
-  jsonDecIndex,
-  jsonDecPath,
   jsonDecode,
+  jsonDecodeLenient,
   jsonParse as parseBodyJson,
 } from "std/json"
 
@@ -82,19 +78,6 @@ import {
 // over `Config.maxBody`; 415 is a body this route will not try to parse.
 const statusPayloadTooLarge = 413
 const statusUnsupportedMediaType = 415
-
-// How many unknown keys `Unknown.Ignore` drops before it refuses with a 400.
-//
-// THE BOUND IS NOT DECORATION. `Ignore` is implemented by decoding, dropping
-// the one key the failure names, and decoding again (`decodeIgnoringUnknown`),
-// because `jsonDecode` has no lenient mode — see that function's own comment,
-// which calls the retry what it is. Each round is O(document), so an
-// unbounded loop would make a body of 5,000 junk keys 5,000 decodes of a
-// 5,000-key document: quadratic work on attacker-chosen input, on the policy
-// that exists to be forgiving. 32 is generous for the case `Ignore` is for —
-// a client sending a handful of fields this version does not know — and a
-// request past it gets a 400 that says so rather than a stalled worker.
-const maxIgnoredKeys = 32
 
 // The RFC 6839 §3.5 structured-syntax suffix: `application/vnd.api+json` and
 // every other `+json` type is JSON.
@@ -249,142 +232,29 @@ fn bindJson<T>(j: Json, u: Unknown): T! {
 
 // Decodes `j` into `T` under policy `u`, mapping whatever std/json fails with
 // into a client error.
+//
+// ONE DECODE EITHER WAY (#4567). `Ignore` used to be a retry loop — decode,
+// read the `UnknownKey` failure, rebuild the document without the one key its
+// path named, decode again — because `jsonDecode` had no lenient mode and this
+// package cannot know the bound type's key set: `T` is a type parameter here
+// and Bit has no reflection. That cost a whole decode and a whole tree rebuild
+// per unknown key, which is quadratic on attacker-chosen input, so it was
+// bounded at 32 keys and answered 400 past it — refusing a legitimate client
+// that sent 33 fields this version does not know.
+//
+// `jsonDecodeLenient<T>` skips the check inside the decoder, which is the one
+// place the key set exists, so there is no bound left to exceed and nothing to
+// rebuild. `withoutUnknownKey`, `withoutPath`, `unknownKeyPath` and
+// `maxIgnoredKeys` are gone with it.
 fn decodeUnder<T>(j: Json, u: Unknown): T! {
-  if (!ignoresUnknown(u)) {
-    return jsonDecode<T>(j) catch e {
+  if (ignoresUnknown(u)) {
+    return jsonDecodeLenient<T>(j) catch e {
       fail bodyFailure(e)
     }
   }
-  return decodeIgnoringUnknown<T>(j)?
-}
-
-// `Unknown.Ignore`: decode, and on an unknown-key failure drop the one key it
-// names and decode again, up to `maxIgnoredKeys` times.
-//
-// THIS IS A STOP-GAP AND IT IS WRITTEN DOWN AS ONE. The right shape is a
-// lenient mode on `jsonDecode`, which knows the class's whole key set
-// and can skip a key in the single pass it already makes; this package cannot
-// know that key set — `T` is a type parameter here and Bit has no reflection —
-// so the only information it has about which keys are unknown is what the
-// STRICT decode reports, one key at a time. #4567 is the stdlib ticket; when
-// it lands this function is deleted and `bindJson` passes the policy down.
-//
-// Every failure that is not an unknown key, and every unknown key whose path
-// is not in the document, comes straight back out through `bodyFailure` — the
-// loop can only ever run one round per key it actually removed, so it cannot
-// spin on a document it is failing to change.
-fn decodeIgnoringUnknown<T>(j: Json): T! {
-  let cur = j
-  let dropped = 0
-  while (dropped <= maxIgnoredKeys) {
-    let bound = jsonDecode<T>(cur) catch e {
-      cur = withoutUnknownKey(cur, e)?
-      dropped = dropped + 1
-      continue
-    }
-    return bound
-  }
-  fail badRequest(
-      "web: request body carries more than ${maxIgnoredKeys} unknown field(s), " +
-      "which this route will not ignore",
-  )
-}
-
-// `j` without the one key `e` reports as unknown.
-//
-// It FAILS, carrying `e` mapped to a client error, when `e` is not an
-// unknown-key failure at all, and also when the path it names is not in `j` —
-// which cannot happen for a path this decode produced, and is refused rather
-// than retried because a retry that removed nothing is the one way the loop
-// above could fail to terminate.
-fn withoutUnknownKey(j: Json, e: error): Json! {
-  let target = unknownKeyPath(e)
-  if (target == "") {
+  return jsonDecode<T>(j) catch e {
     fail bodyFailure(e)
   }
-  let (out, removed) = withoutPath(j, "", target)
-  if (!removed) {
-    fail bodyFailure(e)
-  }
-  return out
-}
-
-// The full dotted path of the key `e` reports as unknown (`isAdmin`,
-// `addr.zip`, `crumbs[1].zip`), or "" when `e` is any other failure.
-fn unknownKeyPath(e: error): string {
-  let (de, ok) = e.(JsonDecodeError)
-  if (!ok) {
-    return ""
-  }
-  match (de.cause) {
-    UnknownKey => return de.path
-    MissingKey => return ""
-    TypeMismatch => return ""
-    MaxDepth => return ""
-  }
-}
-
-// --- removing one key by its path -------------------------------------------
-//
-// The path is not PARSED back into segments, and that is deliberate: a key may
-// itself contain a `.` or a `[`, so splitting `a.b` cannot tell a nested `b`
-// from a top-level key spelled "a.b". Instead the tree is walked and each
-// entry's path is REBUILT with the very functions std/json used to report
-// it (`jsonDecPath`, `jsonDecIndex`, stdlib/json/decode.bit), and the first
-// entry whose rebuilt path equals the target is the one removed. Two entries
-// can still collide on a spelling — the walk stops at the first, so exactly
-// one key is ever removed per round, and a document that collides loses a key
-// `jsonDecode` then reports as missing, which is a 400 and never a silent
-// acceptance.
-
-// `j` with the entry at `target` removed, and whether one was.
-fn withoutPath(j: Json, base: string, target: string): (Json, bool) {
-  let obj = bodyObject(j)
-  if (isSome(obj)) {
-    return withoutPathInObject(unwrap(obj), base, target)
-  }
-  let arr = bodyArray(j)
-  if (isSome(arr)) {
-    return withoutPathInArray(unwrap(arr), base, target)
-  }
-  return (j, false)
-}
-
-fn withoutPathInObject(entries: []BodyEntry, base: string, target: string): (Json, bool) {
-  let out = []BodyEntry(0)
-  let removed = false
-  for e of entries {
-    if (removed) {
-      out = append(out, e)
-      continue
-    }
-    let path = jsonDecPath(base, e.key)
-    if (path == target) {
-      removed = true
-      continue
-    }
-    let (value, done) = withoutPath(e.value, path, target)
-    removed = done
-    out = append(out, BodyEntry{ key: e.key, value: value })
-  }
-  return (Json.JsonObject(out), removed)
-}
-
-fn withoutPathInArray(items: []Json, base: string, target: string): (Json, bool) {
-  let out = []Json(0)
-  let removed = false
-  let i = 0
-  while (i < len(items)) {
-    if (removed) {
-      out = append(out, items[i])
-    } else {
-      let (value, done) = withoutPath(items[i], jsonDecIndex(base, i64(i)), target)
-      removed = done
-      out = append(out, value)
-    }
-    i = i + 1
-  }
-  return (Json.JsonArray(out), removed)
 }
 
 // --- the error mapping ------------------------------------------------------
