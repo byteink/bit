@@ -2427,11 +2427,12 @@ RtBytes { ptr: *const u8, len: usize }   // extern class — a transient,
   `format_version` mismatch untrusts the whole table for that process, and a
   missing or corrupt `name_hdr_ptr` omits just the name and keeps
   `file:line` — none of which ever calls `bit_rt_panic` recursively.
-- `defer` unwinding (SPEC.md §18.5: deferred calls run while a panic unwinds
-  to the program's top) is codegen's obligation, not the runtime's: by the
-  time a panic reaches `bit_rt_panic`, every `defer` between the panic site
-  and the abort must already have run. The runtime only terminates the
-  process; it does not itself walk or run deferred calls.
+- `defer` and a panic never meet: SPEC.md §18.5 says deferred calls do **not**
+  run on a panic path, "with no unwinding of any kind, deferred or
+  otherwise". Nothing walks or runs a deferred call between the panic site
+  and the abort — not codegen, and not the runtime, which only terminates
+  the process. The panic boundary below does not change this: it discards
+  the intervening frames without running anything in them.
 
 **The panic boundary (#4739, epic).** Six further symbols, specified here and
 provided by `runtime/sched/boundary.bit` and the three `runtime/root/<os>/io.bit`
@@ -2541,7 +2542,7 @@ reporting a broken invariant.
   immediately before loading `*(recv - 16)` and branches to this call only
   when it is null.
 
-All three are `@nosplit`, callable from anywhere a division or an indirect
+All four are `@nosplit`, callable from anywhere a division or an indirect
 call can appear (including inside another `@nosplit` function, exactly as
 `bit_rt_panic` itself must be), and never return — control does not resume in
 the caller on the branch that reaches them, so nothing after the call site
