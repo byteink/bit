@@ -614,12 +614,19 @@ Each returns the first or last representable instant of the named period.
 | `startOfQuarter()` / `endOfQuarter()` | 2026-07-01 / 2026-09-30 |
 | `startOfYear()` / `endOfYear()` | 2026-01-01 / 2026-12-31 |
 
-The week starts on **Monday**, matching ISO 8601. `startOfWeek(day)` takes an
-explicit first day when a different convention is needed — many organisations in
-the Gulf and the United States start the week on Sunday.
+The week starts on **Monday**, matching ISO 8601. `startOfWeekOn(day)` and
+`endOfWeekOn(day)` take an explicit first day when a different convention is
+needed — many organisations in the Gulf and the United States start the week on
+Sunday. `day` is 1 for Monday through 7 for Sunday, `dayOfWeek()`'s own
+numbering, and is clamped to that range. They are separate names rather than an
+extra argument to `startOfWeek` because Bit has no function overloading.
 
 On a `Date` these return a `Date`. On a `NaiveDateTime` or `DateTime` they set the
-time of day as well.
+time of day as well. `startOfDay` and `endOfDay` on a `Date` are the identity —
+a `Date` has no time of day to floor.
+
+None of them fails, and no month length is written down: `endOfMonth` is 28, 29,
+30 or 31 as the month and the year require.
 
 `endOfDay` on a `DateTime` is the last representable nanosecond, not the next
 midnight. A range check on a whole day should prefer a half-open interval:
