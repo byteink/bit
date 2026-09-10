@@ -1,0 +1,460 @@
+// Bit standard library — time module, LDML formatting (#4080).
+//
+// `format(pattern)` on `Date`, `Time`, `NaiveDateTime` and `DateTime`,
+// rendering with Unicode LDML date field symbols — Unicode Technical
+// Standard #35's Date Field Symbol Table, the pattern language Java, .NET,
+// ICU and date-fns all use (docs/stdlib/time.md, "Formatting", which holds
+// the normative token table).
+//
+// Delivered by trait injection (SPEC §10.7), the same mechanism
+// ./calarith.bit (#4076), ./bounds.bit (#4077), ./compare.bit (#4078) and
+// ./business.bit (#4079) already use, and for the same reason: Bit has no
+// extension-method syntax (SPEC §10.4), a method exists only inside the
+// body of the class that declares it, and a second `export class Date
+// { ... }` in this module is `E0042`. Each trait below is `use`d by one
+// added line in its target class's own body.
+//
+// Sibling of ./civil.bit, ./date.bit, ./timeofday.bit, ./naive.bit,
+// ./zoned.bit and ./fmt.bit, same module (SPEC §17.1): `Date`, `Time`,
+// `NaiveDateTime`, `Zone`, `newError`, ./fmt.bit's `fmtPad` and
+// ./zoned.bit's `zonedFormatOffset` are used here unqualified, no import,
+// no redeclaration — there is one zero-pad helper and one `±HH:MM` offset
+// renderer in this module, not a second pair written here.
+//
+// THE TOKEN TABLE IS WRITTEN ONCE, FOR BOTH DIRECTIONS. Parsing is a
+// separate child (#4082) and shares this table. `ldmlNextToken` below
+// splits a pattern into literal runs and (symbol, width) fields, and
+// `ldmlIsDateSym`/`ldmlIsTimeSym`/`ldmlIsZoneSym` classify a symbol; all
+// four are module-private, so the parsing child calls them directly from a
+// sibling file rather than writing a second scanner. Rendering a field is
+// the only part below that is output-only.
+//
+// `Y` AND `D` ARE REJECTED, NOT IMPLEMENTED. In LDML `Y` is the
+// week-based year and `D` is the day of the year. Both are one shift key
+// from `y` and `d`, and both are silently wrong rather than visibly wrong:
+// `YYYY-MM-dd` gives the wrong year for a few days around every New Year,
+// in production, once a year. A pattern containing either fails, naming
+// the symbol and the alternative (docs/stdlib/time.md, "Formatting").
+//
+// MONTH AND DAY NAMES ARE ENGLISH. Localised names are out of scope for
+// this module and belong with the rest of internationalisation.
+//
+// A TOKEN THE RECEIVER DOES NOT CARRY IS AN ERROR, never an empty string
+// or a zero: `H` on a `Date` fails, `d` on a `Time` fails, `Z` on either
+// fails. `format` is fallible only because a pattern can be invalid this
+// way; a valid pattern applied to a type that carries every field in it
+// never fails.
+
+// Everything the renderer can read, plus which of the three groups the
+// receiver actually carries. `d` and `t` are unread placeholders when
+// their flag is false — every read of them goes through `ldmlDateField`
+// or `ldmlTimeField`, which fail on a false flag before touching either.
+class LdmlFields {
+  readonly hasDate: bool,
+  readonly hasTime: bool,
+  readonly hasZone: bool,
+  readonly d: Date,
+  readonly t: Time,
+  readonly offset: int,
+  readonly zoneName: string,
+}
+
+// One step of the pattern scan: either a literal run to copy through
+// (`isField` false, `text` the run) or a field (`isField` true, `text` the
+// one-character symbol, `width` how many times it repeats). `next` is the
+// index in the pattern just past this token, always greater than the index
+// the token started at, which is what bounds the scan loop.
+class LdmlToken {
+  readonly isField: bool,
+  readonly text: string,
+  readonly width: int,
+  readonly next: int,
+}
+
+// The month names, January first, and the day names, Monday first (ISO
+// 8601's `dayOfWeek()` numbering, ./date.bit). English, deliberately (file
+// header). The three-letter abbreviations LDML's `MMM`/`E` want are the
+// first three letters of each of these in English, so they are sliced
+// rather than listed a second time.
+fn ldmlMonthNames(): []string {
+  return []string{
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+  }
+}
+
+fn ldmlDayNames(): []string {
+  return []string{
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+  }
+}
+
+// `'`, the LDML quoting character, as a byte. Written as a code point
+// because a single quote inside a character literal would need escaping.
+fn ldmlQuoteByte(): u8 {
+  return u8(39)
+}
+
+// True for an ASCII letter, which is exactly LDML's set of pattern
+// symbols: everything else in a pattern is punctuation and is copied
+// through unchanged.
+fn ldmlIsLetter(c: u8): bool {
+  if (c >= 'a' && c <= 'z') {
+    return true
+  }
+  return c >= 'A' && c <= 'Z'
+}
+
+// The three symbol families, by which group of fields a symbol reads.
+// Shared with the parsing child (file header), which needs the same
+// classification to know what a token means.
+fn ldmlIsDateSym(sym: string): bool {
+  return sym == "y" || sym == "M" || sym == "d" || sym == "E" || sym == "Q"
+}
+
+fn ldmlIsTimeSym(sym: string): bool {
+  return sym == "H" || sym == "h" || sym == "m" || sym == "s" || sym == "S" || sym == "a"
+}
+
+fn ldmlIsZoneSym(sym: string): bool {
+  return sym == "Z" || sym == "X" || sym == "V"
+}
+
+// The token starting at `i`. Fails only on an unterminated quoted
+// literal — the one way a pattern can be malformed before any symbol is
+// looked at. Shared with the parsing child (file header).
+fn ldmlNextToken(pattern: string, i: int): LdmlToken! {
+  let c = pattern[i]
+  if (c == ldmlQuoteByte()) {
+    return ldmlQuotedToken(pattern, i)?
+  }
+  if (!ldmlIsLetter(c)) {
+    return LdmlToken{ isField: false, text: pattern[i:i + 1], width: 0, next: i + 1 }
+  }
+  let j = i
+  while (j < len(pattern) && pattern[j] == c) {
+    j = j + 1
+  }
+  return LdmlToken{ isField: true, text: pattern[i:i + 1], width: j - i, next: j }
+}
+
+// The literal run of a quoted section, `i` pointing at its opening quote.
+// `''` renders one `'`, both on its own and inside a quoted run, which is
+// why the closing quote is only closing when the character after it is not
+// another quote. An unterminated run fails rather than being treated as
+// running to the end: a lost closing quote silently swallows the rest of
+// the pattern, which is exactly the kind of quiet wrong output this module
+// rejects elsewhere.
+fn ldmlQuotedToken(pattern: string, i: int): LdmlToken! {
+  if (i + 1 < len(pattern) && pattern[i + 1] == ldmlQuoteByte()) {
+    return LdmlToken{ isField: false, text: pattern[i:i + 1], width: 0, next: i + 2 }
+  }
+  let out = ""
+  let j = i + 1
+  while (j < len(pattern)) {
+    if (pattern[j] != ldmlQuoteByte()) {
+      out = out + pattern[j:j + 1]
+      j = j + 1
+      continue
+    }
+    if (j + 1 < len(pattern) && pattern[j + 1] == ldmlQuoteByte()) {
+      out = out + pattern[j:j + 1]
+      j = j + 2
+      continue
+    }
+    return LdmlToken{ isField: false, text: out, width: 0, next: j + 1 }
+  }
+  fail newError("format: unterminated quoted literal in pattern")
+}
+
+// `pattern` rendered against `f`. The scan is bounded: every token's
+// `next` is strictly greater than the index it started at, so `i` reaches
+// `len(pattern)` in at most that many steps.
+fn ldmlRender(f: LdmlFields, pattern: string): string! {
+  let out = ""
+  let i = 0
+  while (i < len(pattern)) {
+    let tok = ldmlNextToken(pattern, i)?
+    if (tok.isField) {
+      out = out + ldmlField(f, tok.text, tok.width)?
+    } else {
+      out = out + tok.text
+    }
+    i = tok.next
+  }
+  return out
+}
+
+// One field, `sym` repeated `width` times. An unknown pattern LETTER
+// fails; it is never copied through, because a letter a caller believes is
+// a field and this module silently emits verbatim is a wrong rendering
+// that looks deliberate.
+fn ldmlField(f: LdmlFields, sym: string, width: int): string! {
+  if (sym == "Y" || sym == "D") {
+    fail newError(ldmlRejectMessage(sym))
+  }
+  if (ldmlIsDateSym(sym)) {
+    return ldmlDateField(f, sym, width)?
+  }
+  if (ldmlIsTimeSym(sym)) {
+    return ldmlTimeField(f, sym, width)?
+  }
+  if (ldmlIsZoneSym(sym)) {
+    return ldmlZoneField(f, sym, width)?
+  }
+  fail newError("format: '" + sym + "' is not an LDML pattern symbol this module implements")
+}
+
+// Why `Y` and `D` fail, and what to write instead (file header). The
+// highest-value error message in this module: both symbols produce a
+// plausible-looking wrong answer for a handful of days a year, so the
+// message names the symbol, what it actually means, and both the pattern
+// symbol and the method that give what the caller almost certainly wants.
+fn ldmlRejectMessage(sym: string): string {
+  if (sym == "Y") {
+    return "format: 'Y' is the WEEK-BASED year, wrong for a few days around every New Year; " +
+      "use 'y' for the calendar year, or weekOfYear() for the week number it belongs with"
+  }
+  return "format: 'D' is the day of the YEAR, not the day of the month; " +
+    "use 'd' for the day of the month, or dayOfYear() for the day of the year"
+}
+
+// `y`, `M`, `d`, `E` and `Q`, against the receiver's date.
+fn ldmlDateField(f: LdmlFields, sym: string, width: int): string! {
+  if (!f.hasDate) {
+    fail newError("format: '" + sym + "' is a date field and this value has no date")
+  }
+  if (sym == "y") {
+    return ldmlYear(f.d.year(), width)
+  }
+  if (sym == "M") {
+    return ldmlMonth(f.d.month(), width)?
+  }
+  if (sym == "d") {
+    return fmtPad(f.d.day(), width)
+  }
+  if (sym == "E") {
+    return ldmlWeekday(f.d.dayOfWeek(), width)?
+  }
+  return fmtPad(f.d.quarter(), width)
+}
+
+// `H`, `h`, `m`, `s`, `S` and `a`, against the receiver's time of day.
+fn ldmlTimeField(f: LdmlFields, sym: string, width: int): string! {
+  if (!f.hasTime) {
+    fail newError("format: '" + sym + "' is a time field and this value has no time of day")
+  }
+  if (sym == "H") {
+    return fmtPad(f.t.hour(), width)
+  }
+  if (sym == "h") {
+    return fmtPad(ldmlHour12(f.t.hour()), width)
+  }
+  if (sym == "m") {
+    return fmtPad(f.t.minute(), width)
+  }
+  if (sym == "s") {
+    return fmtPad(f.t.second(), width)
+  }
+  if (sym == "S") {
+    return ldmlFraction(f.t.nanosecond(), width)?
+  }
+  return ldmlMeridiem(f.t.hour())
+}
+
+// `Z`, `X` and `V`, against the receiver's zone and offset. None of the
+// three widens: LDML gives `ZZZZ` and `XXX` their own meanings, and a
+// module that accepted the spelling while rendering the single-letter form
+// would be quietly wrong, so a repeat fails.
+fn ldmlZoneField(f: LdmlFields, sym: string, width: int): string! {
+  if (!f.hasZone) {
+    fail newError("format: '" + sym + "' is a zone field and this value has no zone")
+  }
+  if (width > 1) {
+    fail newError("format: '" + sym + "' takes no repeat in this module; write it once")
+  }
+  if (sym == "Z") {
+    return ldmlOffsetBasic(f.offset)
+  }
+  if (sym == "X") {
+    return ldmlOffsetExtended(f.offset)
+  }
+  return f.zoneName
+}
+
+// `y` is the year as written, `yy` its last two digits, and `yyy` and
+// wider zero-pad to that many digits — so `yyyy` on 2026 is `2026` and on
+// year 7 is `0007`.
+fn ldmlYear(y: int, width: int): string {
+  if (width == 2) {
+    return fmtPad(y % 100, 2)
+  }
+  return fmtPad(y, width)
+}
+
+// `M`/`MM` numeric, `MMM` the three-letter English abbreviation, `MMMM`
+// the full English name. `MMMMM`, LDML's narrow form, is a single
+// ambiguous letter (three months share `J`) and is not implemented.
+fn ldmlMonth(m: int, width: int): string! {
+  if (width <= 2) {
+    return fmtPad(m, width)
+  }
+  if (width == 3) {
+    return ldmlMonthNames()[m - 1][0:3]
+  }
+  if (width == 4) {
+    return ldmlMonthNames()[m - 1]
+  }
+  fail newError("format: 'MMMMM' and wider are not implemented; use M, MM, MMM or MMMM")
+}
+
+// `E`, `EE` and `EEE` the three-letter English abbreviation, `EEEE` the
+// full English name. `EEEEE` is the narrow form, not implemented for the
+// same reason `MMMMM` is not.
+fn ldmlWeekday(dow: int, width: int): string! {
+  if (width <= 3) {
+    return ldmlDayNames()[dow - 1][0:3]
+  }
+  if (width == 4) {
+    return ldmlDayNames()[dow - 1]
+  }
+  fail newError("format: 'EEEEE' and wider are not implemented; use E, EEE or EEEE")
+}
+
+// The hour on a 12-hour clock, 1..12: midnight and noon are both 12, the
+// convention `a` is read with.
+fn ldmlHour12(hour: int): int {
+  let h = hour % 12
+  if (h == 0) {
+    return 12
+  }
+  return h
+}
+
+// `AM` before noon, `PM` from noon. English and uppercase, like the month
+// and day names (file header).
+fn ldmlMeridiem(hour: int): string {
+  if (hour < 12) {
+    return "AM"
+  }
+  return "PM"
+}
+
+// The first `width` digits of the nanosecond field, which is the
+// fractional second truncated to that many places: `S` on 123456789ns is
+// `1` (a tenth), `SSS` is `123` (milliseconds), `SSSSSSSSS` the lot. Never
+// rounds — a rounded `S` could read one tenth of a second later than the
+// value actually is.
+fn ldmlFraction(nanos: int, width: int): string! {
+  if (width > 9) {
+    fail newError("format: 'S' repeats at most nine times, one digit per nanosecond place")
+  }
+  return fmtPad(nanos, 9)[0:width]
+}
+
+// `Z`: the offset as `±HHMM`, no colon and never abbreviated to `Z` at a
+// zero offset — that is `X`'s rule, below. Written here rather than
+// through ./zoned.bit's `zonedFormatOffset` because that one is the
+// colon-bearing extended form.
+fn ldmlOffsetBasic(off: int): string {
+  let sign = "+"
+  let mag = off
+  if (off < 0) {
+    sign = "-"
+    mag = -off
+  }
+  return sign + fmtPad(mag / 3600, 2) + fmtPad(mag / 60 % 60, 2)
+}
+
+// `X`: the offset as ISO 8601 writes it — `±HH:MM`, and the literal `Z`
+// at a zero offset. The non-zero form is ./zoned.bit's `zonedFormatOffset`,
+// the same renderer `DateTime.toString` uses, not a second one.
+fn ldmlOffsetExtended(off: int): string {
+  if (off == 0) {
+    return "Z"
+  }
+  return zonedFormatOffset(off)
+}
+
+// --- Date --------------------------------------------------------------------
+
+trait DateLdmlFormat {
+  // This date, rendered with LDML date field symbols
+  // (docs/stdlib/time.md, "Formatting"). Fails on a pattern containing
+  // `Y` or `D`, on an unknown pattern letter, on an unterminated quoted
+  // literal, and on any time or zone symbol — a `Date` has neither.
+  format(pattern: string): string! {
+    let f = LdmlFields{
+      hasDate: true,
+      hasTime: false,
+      hasZone: false,
+      d: Date{ y: this.y, m: this.m, d: this.d },
+      t: Time{ h: 0, min: 0, s: 0, nanos: 0 },
+      offset: 0,
+      zoneName: "",
+    }
+    return ldmlRender(f, pattern)?
+  }
+}
+
+// --- Time --------------------------------------------------------------------
+
+trait TimeLdmlFormat {
+  // This time of day, rendered with LDML date field symbols. Fails on any
+  // date or zone symbol — a `Time` carries neither — as well as on the
+  // pattern errors every receiver rejects.
+  format(pattern: string): string! {
+    let f = LdmlFields{
+      hasDate: false,
+      hasTime: true,
+      hasZone: false,
+      d: Date{ y: 1, m: 1, d: 1 },
+      t: Time{ h: this.h, min: this.min, s: this.s, nanos: this.nanos },
+      offset: 0,
+      zoneName: "",
+    }
+    return ldmlRender(f, pattern)?
+  }
+}
+
+// --- NaiveDateTime -----------------------------------------------------------
+
+trait NaiveDateTimeLdmlFormat {
+  // This wall clock, rendered with LDML date field symbols. Date and time
+  // symbols both resolve; a zone symbol fails, because a `NaiveDateTime`
+  // has no zone and no offset to render.
+  format(pattern: string): string! {
+    let f = LdmlFields{
+      hasDate: true,
+      hasTime: true,
+      hasZone: false,
+      d: this.dt,
+      t: this.tm,
+      offset: 0,
+      zoneName: "",
+    }
+    return ldmlRender(f, pattern)?
+  }
+}
+
+// --- DateTime ----------------------------------------------------------------
+
+trait DateTimeLdmlFormat {
+  // This zoned value, rendered with LDML date field symbols. Every symbol
+  // this module implements resolves. Date and time symbols read the WALL
+  // CLOCK, not the instant, so they answer in this value's own zone; `Z`
+  // and `X` render the offset resolved at construction, and `V` the zone
+  // identifier.
+  format(pattern: string): string! {
+    let f = LdmlFields{
+      hasDate: true,
+      hasTime: true,
+      hasZone: true,
+      d: this.wall.date(),
+      t: this.wall.time(),
+      offset: this.off,
+      zoneName: this.z.name,
+    }
+    return ldmlRender(f, pattern)?
+  }
+}

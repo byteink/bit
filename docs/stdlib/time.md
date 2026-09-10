@@ -854,10 +854,19 @@ fn paymentDue(invoiced: Date, holidays: []Date): Date {
 
 ## Formatting
 
-### `format(pattern: string): string`
+**Shipped**, on `Date`, `Time`, `NaiveDateTime` and `DateTime`. Parsing, the
+other direction, is not yet implemented.
+
+### `format(pattern: string): string!`
 
 Renders using **Unicode LDML** date field symbols, the pattern language defined by
 Unicode Technical Standard #35 and used by Java, .NET, ICU and date-fns.
+
+Fallible only because a pattern can be invalid: it fails on `Y` or `D` (below), on
+a pattern letter this module does not implement, on an unterminated quoted
+literal, and on a symbol the receiver does not carry — `H` on a `Date`, `d` on a
+`Time`, `Z` on either. A valid pattern applied to a type carrying every field in
+it never fails.
 
 Repeating a symbol widens the field.
 
@@ -942,9 +951,11 @@ value.
 These are RFC 3339 forms. The RFC number does not appear in any function name;
 `toString` and `parseDateTime` are that format.
 
-```bit ignore
-fn render(t: DateTime): string {
-  return t.format("EEEE, d MMMM yyyy 'at' HH:mm")
+```bit
+import { DateTime } from "std/time"
+
+fn render(t: DateTime): string! {
+  return t.format("EEEE, d MMMM yyyy 'at' HH:mm")?
   // "Tuesday, 1 September 2026 at 09:00"
 }
 ```
