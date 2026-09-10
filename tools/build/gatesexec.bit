@@ -1,11 +1,13 @@
-// How a `Gate{}` (gates.bit) actually runs: the single-gate path, the
-// concurrent batch engine (#2434), and `./make fuzz`. Split out of gates.bit
-// by #3442 once that file crossed the repo's 800-line E0200 limit
+// How a `Gate{}` (gates.bit) actually runs: the single-gate path and the
+// concurrent batch engine (#2434, #4706). Split out of gates.bit by #3442
+// once that file crossed the repo's 800-line E0200 limit
 // (spec/LINT.md:186) — pure move, no symbol below changed. Named
 // `gatesexec.bit` rather than `gaterun.bit` so it sorts AFTER `gates.bit`
 // (whose `Gate` class and `findGate` it calls) and still before `main.bit`
-// (which calls `runGate`/`runGateBatch`/`stepFuzz` here), so the inliner
-// sees each callee already lowered (#1511).
+// (which calls `runGate`/`runGateBatch` here), so the inliner
+// sees each callee already lowered (#1511). The two open-ended fuzz steps
+// moved on to `gatesfuzz.bit` (#4706) for the same 800-line reason; that
+// file sorts after this one and keeps the same callee-first rule.
 //
 // `scripts/gate-filemap.sh`'s `gates_for_file()` and `scripts/gate-diffclass.sh`'s
 // `is_additive_registration()` grep `tools/build/gates.bit` BY NAME for
@@ -185,20 +187,22 @@ fn reportGate(name: string, rc: int, requestedMs: int): int {
 // time, exactly like today, just with extra machinery. See #2434's ticket for
 // why `spawn` and a new runtime primitive were both ruled out.
 //
-// One composed script launches every gate in the chunk backgrounded with its
-// own private killer, each redirected to its own file under `batchDir()`, and
-// `wait`s for all of them. Reporting happens back here, from those files, in
-// the same `order` position the caller passed them in — never through a pipe,
-// and never while two gates could still be racing to write the same fd.
+// One composed script launches every gate backgrounded with its own private
+// killer, each redirected to its own file under `batchDir()`, and `wait`s for
+// all of them. How many run at once is bounded by the token FIFO
+// (`poolPrologue`, #4706), not by cutting the list into chunks. Reporting
+// happens back here, from those files, in the same `order` position the
+// caller passed them in — never through a pipe, and never while two gates
+// could still be racing to write the same fd.
 
 fn isExclusiveGate(name: string): bool {
   let (g, ok) = findGate(name)
   return ok && g.exclusive
 }
 
-// Reused across every chunk in one `./make` run: redirection truncates each
-// gate's own file at launch, and no two gates in a chunk share a name, so
-// there is nothing to clean between chunks. Lives under the driver's existing
+// Reused by every gate in one `./make` run: redirection truncates each
+// gate's own file at launch, and no two gates in a batch share a name, so
+// there is nothing to clean between them. Lives under the driver's existing
 // scratch area (bit-out/make already holds the fp stamps and run-<name>.sh
 // wrappers), not a fresh `mktemp -d` — that path would only be known inside
 // the child shell, and the Bit code on this side of `runShell` is what has to
@@ -210,7 +214,7 @@ fn batchDir(): string { return "bit-out/make/gatebatch" }
 // the next run cannot tell it apart from its own by looking at the path
 // alone — the orphan is also NEWER than any earlier good write, so mtime
 // cannot help either. `runGateBatch` calls this ONCE per invocation and
-// threads the result through every chunk it runs, so every rc file this
+// threads the result through every gate it runs, so every rc file this
 // process writes carries the same identity: the tree's HEAD sha (an orphan
 // from a different commit is instantly recognisable) plus a fresh
 // `fpRunId()` nonce (an orphan from an earlier run AT THE SAME sha —
@@ -219,7 +223,7 @@ fn batchDir(): string { return "bit-out/make/gatebatch" }
 // monotonic clocks at the moment of the call and cannot repeat across two
 // separate invocations; #3538 replaced the original `std/crypto` random bytes
 // with this dependency-free clock-mixed id — see tools/build/fphash.bit).
-// `runGateChunk` refuses to trust any rc file whose stamp does not match
+// `reportPoolVerdict` refuses to trust any rc file whose stamp does not match
 // both fields exactly, including a pre-#3256 rc file with no stamp at all.
 //
 // #3485: the sha half is a nice-to-have, not a requirement — the nonce alone
@@ -287,17 +291,35 @@ fn numCPUs(): int {
   return n
 }
 
-// Cores minus 2 (headroom for the OS and this driver itself), floor 1.
-// BIT_MAKE_JOBS overrides directly; =1 is the escape hatch back to today's
-// strict serial order and this ticket's own A/B control.
+// MEASURED, not derived from the core count alone (#4706). `cores - 2` is the
+// right cap for a pool of single-core jobs, and a gate is not one: three
+// whole-suite runs on this 18-core Mac, each `./make test` under
+// `boxlock.sh solo` with no other make-driver alive, on b2375a18 and this
+// branch —
+//
+//   chunked, 16 at a time (before)  18m06s  green  2.6 gates in flight (avg)
+//   pool, 16 at a time              16m39s  RED    12.3 in flight, load ~20
+//   pool, 6 at a time               16m18s  green  5.2 in flight, load ~19
+//
+// — where "in flight" is the sum of the per-gate `— <dur>` lines divided by
+// the run's own wall clock. Six slots already saturate the box (load 19 of
+// 18 cores); the ten above it bought 21 seconds and reddened three gates
+// whose verdict is a hardcoded wall clock: test-osenv (20000ms), test-fsblock
+// (an 8s block on a fifo against a CPU-time check) and test-pmaddgit (a 60s
+// warm-cache budget, observed 61495ms). None of the three carries
+// `exclusive: true` — see #4711.
+//
+// `cores / 3`, floor 2, is that measurement expressed as a formula rather
+// than the constant 6: it is what this box wants and it degrades sanely on a
+// smaller host. UNVERIFIED off this Mac — the two Linux gate images have
+// fewer cores and would go from 6 (cores-2 on an 8-core host) to 2, which
+// this ticket had no way to measure. `BIT_MAKE_JOBS` overrides it directly,
+// and =1 is the escape hatch back to the strict serial order (no pooling, no
+// start-order hint, no exclusive deferral — see `runAll` in main.bit).
 fn makeJobs(): int {
   let s = envOr("BIT_MAKE_JOBS", "")
   if (s == "") {
-    let n = numCPUs() - 2
-    if (n < 1) {
-      return 1
-    }
-    return n
+    return defaultJobs(numCPUs())
   }
   let n = parseIntOr(s, 1)
   if (n < 1) {
@@ -306,13 +328,35 @@ fn makeJobs(): int {
   return n
 }
 
-// `gateTimeoutMs()` bounds one `osRunBounded` call today; in a batch that call
-// wraps the WHOLE chunk, so it would silently bound every gate in it by the
-// slowest one's budget shared across all of them. Each gate instead gets its
-// own killer inside the script (macOS ships no `timeout(1)`, hence
-// `sleep`+`kill -9`), and this outer bound becomes a backstop only: generous
-// slack over the same per-gate budget, since the gates run concurrently, not
-// stacked end to end.
+// A single-core host runs one gate at a time; anything larger runs at least
+// two, so a host too small for `cores / 3` to reach 2 still overlaps a
+// compile with a link rather than going fully serial.
+fn defaultJobs(cores: int): int {
+  if (cores <= 2) {
+    return 1
+  }
+  let n = cores / 3
+  if (n < 2) {
+    return 2
+  }
+  return n
+}
+
+// `gateTimeoutMs()` bounds one `osRunBounded` call on the single-gate path;
+// in a batch that call wraps the WHOLE script, so it would silently bound
+// every gate in it by the slowest one's budget shared across all of them.
+// Each gate instead gets its own killer inside the script (macOS ships no
+// `timeout(1)`, hence `sleep`+`kill -9`), and this outer bound is a backstop
+// only: it exists so a wedged SCRIPT — a lost pool token, a watchdog that
+// never fires — fails loudly instead of hanging the driver.
+//
+// #4706 made it one backstop for the whole pooled batch rather than one per
+// chunk of `makeJobs()`, so it is now the ceiling on the batch's total wall
+// clock, not on one wave of it. That is 90 minutes by default against a
+// measured whole-suite batch of ~5 minutes at 16 slots and ~40 at
+// `BIT_MAKE_JOBS=1`; `BIT_MAKE_GATE_TIMEOUT_S` widens both this and every
+// gate's own killer together, which is the documented knob for a host slow
+// enough to need it.
 fn batchOuterTimeoutMs(): int { return gateTimeoutMs() + 60000 }
 
 // One gate's slot inside the batch: backgrounded so N of these overlap, each
@@ -320,7 +364,7 @@ fn batchOuterTimeoutMs(): int { return gateTimeoutMs() + 60000 }
 // BEFORE it sends `kill -9`, strictly before `wait "$GPID"` in the same slot
 // can observe the death — so reading it back afterward can never race, and it
 // is what lets a per-gate timeout still read as "TIMED OUT" instead of
-// "CRASHED — killed by signal 9" (`runGateChunk` below).
+// "CRASHED — killed by signal 9" (`reportPoolVerdict` below).
 //
 // The killer subshell (`</dev/null >/dev/null 2>&1`) never inherits this
 // slot's own stdio (#2514): without it, a caller piping `./make <gate>` puts
@@ -398,7 +442,12 @@ fn gateBatchUnit(g: Gate, dir: string, timeoutS: string, sha: string, runId: str
     gateEnvExecScript(g) +
     ") > " +
     outFile +
-    " 2>&1 &\n" +
+    // `9<&-`: fd 9 is the pool's token FIFO (`poolPrologue`), owned by this
+    // script and its unit subshells. The gate itself is arbitrary code that
+    // has no business holding it — closing it here keeps a leaked
+    // descendant of the harness out of the pool's own plumbing entirely,
+    // the same reasoning #2514 applied to the killer subshell's stdio.
+    " 2>&1 9<&- &\n" +
     "GPID=$!\n" +
     "( n=0; while kill -0 \"$GPID\" 2>/dev/null; do if [ \"$n\" -ge " +
     timeoutS +
@@ -410,7 +459,7 @@ fn gateBatchUnit(g: Gate, dir: string, timeoutS: string, sha: string, runId: str
     toFile +
     "; killtree \"$GPID\"; break; fi; " +
     wdPath +
-    " 1 || sleep 1; n=$((n + 1)); done ) </dev/null >/dev/null 2>&1 &\n" +
+    " 1 || sleep 1; n=$((n + 1)); done ) </dev/null >/dev/null 2>&1 9<&- &\n" +
     "KPID=$!\n" +
     "wait \"$GPID\"\n" +
     "RC=$?\n" +
@@ -424,7 +473,7 @@ fn gateBatchUnit(g: Gate, dir: string, timeoutS: string, sha: string, runId: str
     // ordering the `.rc`/`.timedout` marker files already use. Not stamped
     // with sha/runId like those two: this file and `rcFile` are written
     // back-to-back, in order, by this one gate unit's own subshell, so
-    // `.rc` reading back as fresh for THIS run (`reportChunkVerdict`'s
+    // `.rc` reading back as fresh for THIS run (`reportPoolVerdict`'s
     // stamp check) already proves `.dur` was written by this same
     // invocation, moments earlier.
     "echo \"$((END - START))\" > " +
@@ -437,6 +486,18 @@ fn gateBatchUnit(g: Gate, dir: string, timeoutS: string, sha: string, runId: str
     "\" > " +
     rcFile +
     "\n" +
+    // #4706: hand the slot back, LAST — strictly after this gate's `.rc` is
+    // on disk, so the token means "this gate is fully reported", never
+    // "this gate is nearly done". The dispatcher below blocks on a token
+    // before it starts the next gate, so this single line is what bounds
+    // the whole batch to `makeJobs()` gates at a time.
+    //
+    // A unit that is itself SIGKILLed never reaches here and its slot is
+    // lost for the rest of the batch (the pool narrows; it cannot
+    // deadlock unless every slot is lost, and `batchOuterTimeoutMs()` is
+    // the backstop for that). The per-gate watchdog kills the GATE, not
+    // this subshell, so a timing-out gate still releases normally.
+    "echo t >&9\n" +
     ") &\n"
 }
 
@@ -450,7 +511,7 @@ fn watchdogPath(dir: string): string { return dir + "/bit-gate-watchdog" }
 // to create their own. Written once, before any unit's `&`-backgrounded
 // subshell starts, so this line always finishes first — `batchScript` builds
 // one literal top-to-bottom script, not concurrent text. `dir` already
-// exists by the time this runs (`runGateChunk` calls `ensureDir(dir)` before
+// exists by the time this runs (`runGatePool` calls `ensureDir(dir)` before
 // `runShell` executes this script). The `2>/dev/null` only swallows the
 // vanishingly unlikely case where `sleep` itself is missing from `$PATH`;
 // `gateBatchUnit`'s own `|| sleep 1` fallback keeps the poll correct (just
@@ -466,7 +527,7 @@ fn watchdogSetupScript(dir: string): string {
 // (#3230 was exactly this, on the linux gate image before it gained
 // `procps`). A per-call check inside that BFS loop is the wrong shape — it
 // is the hot path, run once per level of every gate's kill path, and must
-// stay simple. This checks ONCE per chunk script, before any gate unit
+// stay simple. This checks ONCE per batch script, before any gate unit
 // starts — same placement and granularity as `watchdogSetupScript` above.
 // `pgrepPreflightScript` (imported below, `../killtree`) is shared verbatim
 // with `_tests_/bit/importsrun/importsrun.bit`'s own preflight (#3238); this call site's
@@ -474,31 +535,73 @@ fn watchdogSetupScript(dir: string): string {
 // differs from that file's `"case"`/`"the outer run bound"`. The message
 // goes to this script's own stderr, not any gate's redirected `.out` file,
 // so it reaches the terminal immediately instead of waiting for that gate's
-// turn in `runGateChunk`'s report loop — and it fires once per chunk, not
+// turn in `runGatePool`'s report loop — and it fires once per batch, not
 // deduped away, so it cannot scroll off during a long batch.
 
-// One `osRunBounded`, N backgrounded gates, one `wait` — the whole chunk.
+// #4706: the pool's semaphore. `runGateBatch` used to cut the names into
+// consecutive chunks of `makeJobs()` and run one chunk after another, which
+// made every chunk boundary a BARRIER: 94 gates summing 2555s of work took
+// 16m50s on 16 slots, because a chunk holding the 280s `test-golden` left
+// its other 15 slots idle for most of that. This is the same bounded pool
+// `scripts/selfhost-diffall.sh` runs in bash (#3769), written for the
+// `/bin/sh` this script actually gets: no arrays, no `wait -n` (bash 4.3+,
+// and this Mac's /bin/sh is bash 3.2 while Debian's is dash).
+//
+// A FIFO holds one token per free slot. The dispatcher `read`s one — which
+// BLOCKS until some running gate hands its slot back — immediately before
+// starting the next gate, so a slot is refilled the moment any gate
+// finishes rather than when the slowest of sixteen does. Opened read-write
+// (`9<>`) so the pre-loading writes below cannot block on a missing reader,
+// then unlinked at once: the open fd keeps it alive, and nothing is left on
+// disk for the next run to inherit (the fixed-path staleness #3256 had to
+// defend against for the rc files). The name still carries `runId` so two
+// concurrent `./make` invocations in one worktree cannot collide in the
+// window before the unlink.
+fn poolPrologue(dir: string, runId: string, jobs: int): string {
+  let fifo = shQuote(dir + "/pool." + runId + ".fifo")
+  return "POOLFIFO=" +
+    fifo +
+    "\n" +
+    "rm -f \"$POOLFIFO\"\n" +
+    "mkfifo \"$POOLFIFO\" || { echo \"make: cannot create the gate pool FIFO $POOLFIFO\" >&2; exit 1; }\n" +
+    "exec 9<>\"$POOLFIFO\"\n" +
+    "rm -f \"$POOLFIFO\"\n" +
+    "POOLN=0\n" +
+    "while [ \"$POOLN\" -lt ${jobs} ]; do echo t >&9; POOLN=$((POOLN + 1)); done\n"
+}
+
+// One `osRunBounded`, one bounded pool, one `wait` — the whole batch.
 // `killTreeFnDef`, the pgrep preflight and the watchdog symlink are written
 // once; every gate unit's subshell inherits the function (a POSIX subshell
 // inherits its parent's function definitions) and reads the same symlink
 // path.
-fn batchScript(chunk: []Gate, dir: string, sha: string, runId: string): string {
+//
+// `order` is the START order (longest-hinted first, `poolStartOrder`), which
+// is deliberately NOT the report order: `runGatePool` reports in the
+// caller's own order, so what the terminal shows does not depend on which
+// gate happened to finish first.
+fn batchScript(order: []Gate, dir: string, sha: string, runId: string, jobs: int): string {
   let timeoutS = "${gateTimeoutMs() / 1000}"
   let script = killTreeFnDef() +
     pgrepPreflightScript("gate", "the outer batch timeout") +
-    watchdogSetupScript(dir)
-  for g of chunk {
-    script = script + gateBatchUnit(g, dir, timeoutS, sha, runId)
+    watchdogSetupScript(dir) +
+    poolPrologue(dir, runId, jobs)
+  for g of order {
+    // Blocks here, in the dispatcher, when every slot is busy. Straight-line
+    // `read`/unit pairs rather than a loop over a name list: `/bin/sh` has no
+    // arrays, and the emitted order is then exactly the order this Bit code
+    // decided, visible in `bit-out/make/run-gatebatch.sh` as written.
+    script = script + "read POOLTOK <&9\n" + gateBatchUnit(g, dir, timeoutS, sha, runId)
   }
-  return script + "wait\n"
+  return script + "wait\nexec 9>&-\n"
 }
 
-// The two "could not even start the chunk" paths below both fail every gate
-// in `chunk` by name, with no per-gate detail to add — pulled out so
-// `runGateChunk` states each precondition once instead of repeating the loop.
-fn namesOf(chunk: []Gate): []string {
+// The two "could not even start the batch" paths below both fail every gate
+// in `gates` by name, with no per-gate detail to add — pulled out so
+// `runGatePool` states each precondition once instead of repeating the loop.
+fn namesOf(gates: []Gate): []string {
   let names = []string(0)
-  for g of chunk {
+  for g of gates {
     names = append(names, g.name)
   }
   return names
@@ -529,7 +632,7 @@ fn reportMissingRc(name: string, outerRc: int, boundMs: int): bool {
 // only when it too carries THIS run's exact stamp; a missing or foreign
 // stamp means "not this run's timeout" and the already-verified rc is the
 // real verdict. Returns true when the gate counts as failed.
-fn reportChunkVerdict(g: Gate, dir: string, sha: string, runId: string, rcPath: string): bool {
+fn reportPoolVerdict(g: Gate, dir: string, sha: string, runId: string, rcPath: string): bool {
   let fields = split(trimNewline(readFile(rcPath) catch ""), " ")
   if (len(fields) != 3 || fields[1] != sha || fields[2] != runId) {
     eprint("make: ${g.name} rc is STALE — its stamp does not match this run (a killed or earlier run's leftover at the fixed path ${rcPath}); refusing to count it as a pass. Re-run: ./make ${g.name}\n")
@@ -553,7 +656,7 @@ fn reportChunkVerdict(g: Gate, dir: string, sha: string, runId: string, rcPath: 
 // consumer parses one shape regardless of which path produced it. Missing
 // or unparsable is silent here, not an error: a gate that never reached
 // that line in its own script already gets its failure named by
-// `reportMissingRc`/`reportChunkVerdict` above, and this must not print a
+// `reportMissingRc`/`reportPoolVerdict` above, and this must not print a
 // second, contradictory report for the same gate.
 fn printGateDuration(name: string, durPath: string) {
   if (!exists(durPath)) {
@@ -566,30 +669,34 @@ fn printGateDuration(name: string, durPath: string) {
   print("make: ${name} — ${formatDuration(secs * Second)}\n")
 }
 
-// Runs one concurrent chunk (at most `makeJobs()` gates, none `exclusive`) and
-// reports every one of them in `chunk` position, so output never interleaves
-// and a run's `make: FAILED:` line is deterministic regardless of which gate
-// actually finished first.
-fn runGateChunk(chunk: []Gate, sha: string, runId: string): []string {
+// Runs every gate in `gates` (none `exclusive`) through one bounded pool of
+// `jobs` slots, and reports every one of them in `gates` position — so
+// output never interleaves and a run's `make: FAILED:` line is deterministic
+// regardless of which gate actually finished first. The START order is
+// `poolStartOrder`'s, which is a different list on purpose.
+fn runGatePool(gates: []Gate, sha: string, runId: string, jobs: int): []string {
   let failed = []string(0)
-  if (len(chunk) == 0) {
+  if (len(gates) == 0) {
     return failed
   }
   if (!gatePrereqsReady()) {
-    return namesOf(chunk)
+    return namesOf(gates)
   }
   let dir = batchDir()
   if (!ensureDir(dir)) {
     eprint("make: cannot create ${dir}\n")
-    return namesOf(chunk)
+    return namesOf(gates)
   }
-  warnIfTimeoutReduced("gate batch (${len(chunk)} gate(s))", batchOuterTimeoutMs())
+  warnIfTimeoutReduced(
+    "gate batch (${len(gates)} gate(s), ${jobs} at a time)",
+    batchOuterTimeoutMs(),
+  )
   let outerRc = runShell(
     "gatebatch",
-    batchScript(chunk, dir, sha, runId),
+    batchScript(poolStartOrder(gates, jobs), dir, sha, runId, jobs),
     effectiveTimeoutMs(batchOuterTimeoutMs()),
   )
-  for g of chunk {
+  for g of gates {
     print("make: ${g.name}\n")
     let rcPath = "${dir}/${g.name}.rc"
     print(readFile("${dir}/${g.name}.${runId}.out") catch "")
@@ -597,7 +704,7 @@ fn runGateChunk(chunk: []Gate, sha: string, runId: string): []string {
     if (!exists(rcPath)) {
       isFailed = reportMissingRc(g.name, outerRc, batchOuterTimeoutMs())
     } else {
-      isFailed = reportChunkVerdict(g, dir, sha, runId, rcPath)
+      isFailed = reportPoolVerdict(g, dir, sha, runId, rcPath)
     }
     printGateDuration(g.name, "${dir}/${g.name}.dur")
     if (isFailed) {
@@ -607,121 +714,34 @@ fn runGateChunk(chunk: []Gate, sha: string, runId: string): []string {
   return failed
 }
 
-// Splits `names` (all gates, none `exclusive`) into consecutive chunks of at
-// most `makeJobs()` and runs them one chunk after another. At `BIT_MAKE_JOBS=1`
-// every chunk holds exactly one gate, which is today's serial order exactly —
-// the A/B control #2434 asks for.
+// Runs `names` (all gates, none `exclusive`) as ONE pool, `makeJobs()` at a
+// time. Before #4706 this cut them into consecutive chunks of `makeJobs()`
+// and ran chunk after chunk, so every chunk waited for its slowest member
+// before the next one started.
 fn runGateBatch(names: []string): []string {
   let failed = []string(0)
   if (len(names) == 0) {
     return failed
   }
-  // One stamp for the whole flush: every chunk below writes rc files that
+  // One stamp for the whole flush: every gate below writes rc files that
   // read back as belonging to THIS invocation (#3256). Always usable now
   // (#3485) — see `currentGateStamp`'s own comment for why a tree with no
   // resolvable HEAD no longer aborts the whole batch before a gate runs.
   let (sha, runId) = currentGateStamp()
-  let jobs = makeJobs()
-  let i = 0
-  while (i < len(names)) {
-    let end = i + jobs
-    if (end > len(names)) {
-      end = len(names)
+  let gates = []Gate(0)
+  for n of names {
+    let (g, ok) = findGate(n)
+    if (!ok) {
+      eprint("make: step '${n}' is not implemented yet\n")
+      failed = append(failed, n)
+      continue
     }
-    let chunk = []Gate(0)
-    let j = i
-    while (j < end) {
-      let (g, ok) = findGate(names[j])
-      if (!ok) {
-        eprint("make: step '${names[j]}' is not implemented yet\n")
-        failed = append(failed, names[j])
-      } else {
-        chunk = append(chunk, g)
-      }
-      j = j + 1
-    }
-    for f of runGateChunk(chunk, sha, runId) {
-      failed = append(failed, f)
-    }
-    i = end
+    gates = append(gates, g)
+  }
+  for f of runGatePool(gates, sha, runId, makeJobs()) {
+    failed = append(failed, f)
   }
   return failed
-}
-
-// `./make fuzz [-- <seconds> [seed]]` — the open-ended run, as opposed to the
-// `test-fuzz` gate's fixed 5s replay. The extra arguments are forwarded to
-// `scripts/fuzz.sh` and only BIT_FUZZ_BIN is set, so the script stays the
-// single definition of what fuzzing does.
-fn stepFuzz(extras: []string): int {
-  if (!gatePrereqsReady()) {
-    return 1
-  }
-  // `bash`, not `sh`: fuzz.sh is `#!/usr/bin/env bash` and uses `[[ ]]` and
-  // `pipefail`. Same call shape scripts/g2archive.sh gets in artifacts.bit.
-  let script = "set -e\nBIT_FUZZ_BIN=" +
-    shQuote(bitBin()) +
-    "\nexport BIT_FUZZ_BIN\n" +
-    "exec bash " +
-    shQuote("${repoRoot()}/scripts/fuzz.sh")
-  for a of extras {
-    script = script + " " + shQuote(a)
-  }
-  script = script + "\n"
-  warnIfTimeoutReduced("fuzz", gateTimeoutMs())
-  return reportGate(
-    "fuzz",
-    runShell("fuzz", script, effectiveTimeoutMs(gateTimeoutMs())),
-    gateTimeoutMs(),
-  )
-}
-
-// `./make fuzz-regex [-- <seconds> [seed]]` — the open-ended std/regex
-// campaign, as opposed to the `test-fuzz-regex` gate's fixed 5s replay. Same
-// shape as `stepFuzz` above, but built inline rather than delegated to a
-// `scripts/*.sh` wrapper: unlike `scripts/fuzz.sh`, nothing here needs `[[ ]]`
-// or `pipefail`, so there is nothing a plain `/bin/sh` script (`runShell`'s
-// own interpreter, `artifacts.bit`) cannot do, and this repo's standing rule
-// against growing `scripts/` (bitlang-ws/CLAUDE.md) applies to a wrapper this
-// thin.
-fn stepFuzzRegex(extras: []string): int {
-  if (!gatePrereqsReady()) {
-    return 1
-  }
-  let seconds = "60"
-  if (len(extras) >= 1) {
-    seconds = extras[0]
-  }
-  let script = "set -e\n" +
-    "export BIT_REGEXFUZZ_BIN=" +
-    shQuote(bitBin()) +
-    "\n" +
-    "export BIT_REGEXFUZZ_CASE=" +
-    shQuote("${repoRoot()}/_tests_/bit/regexfuzzcase.bit") +
-    "\n" +
-    "export BIT_REGEXFUZZ_CASES=" +
-    shQuote("${repoRoot()}/_tests_/fuzz/regexcases") +
-    "\n" +
-    "export BIT_REGEXFUZZ_CRASHES=" +
-    shQuote("${repoRoot()}/_tests_/fuzz/regexcrashes") +
-    "\n" +
-    "export BIT_REGEXFUZZ_SECONDS=" +
-    shQuote(seconds) +
-    "\n"
-  if (len(extras) >= 2) {
-    script = script + "export BIT_REGEXFUZZ_SEED=" + shQuote(extras[1]) + "\n"
-  }
-  script = script +
-    "exec " +
-    shQuote(bitBin()) +
-    " run " +
-    shQuote("${repoRoot()}/_tests_/bit/regexfuzz.bit") +
-    "\n"
-  warnIfTimeoutReduced("fuzz-regex", gateTimeoutMs())
-  return reportGate(
-    "fuzz-regex",
-    runShell("fuzz-regex", script, effectiveTimeoutMs(gateTimeoutMs())),
-    gateTimeoutMs(),
-  )
 }
 
 fn indexOfByte(s: string, c: byte): int {
