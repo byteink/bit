@@ -1,0 +1,253 @@
+// `./make test-prepush` (#3255): the pre-push gate as ONE step — the suite's
+// gate pool and the whole self-host differential family running CONCURRENTLY,
+// with every wall-clock-sensitive gate held OUT of that overlap and run
+// alone afterwards.
+//
+// Before this the pre-push gate was two serial commands. MEASURED at
+// f9850d60 on this 18-core Mac under `boxlock.sh solo`, one drained run of
+// each with no other worktree's make-driver alive (load 3.06 at the first
+// start, 2.72 at the third):
+//
+//   `./make test`                869s  rc=0  (14m29s; 852s at c673710d, #4712)
+//   `./make test-differentials`  468s  rc=1  (7m48s; the standing red is
+//                                  selfhost-difffmt + selfhost-diffcheck
+//                                  against the pinned oracle, not this step)
+//   serial sum                    1337s        (22m17s)
+//   `./make test-prepush`       1037s  rc=1  (17m17s) — 300s, 22.4%, less
+//
+// with the SAME verdicts on both sides: 96 of 96 gates green in each run,
+// and the same differential red. The two are independent gate sets — `test`
+// runs `gateNames()`, the differentials run `_tests_/bit/selfhostdiff.bit` —
+// and neither consumes the other's output, so the serial sum was a barrier
+// that bought nothing.
+//
+// The differentials are the long pole INSIDE the overlap (905s of the 1037s
+// wall clock, against 468s run alone), so the suite hides almost entirely
+// inside them and the remaining 132s is the held gates running afterwards.
+//
+// WHY THIS IS NOT JUST "RUN BOTH AND WAIT". Two things had to be settled
+// first, and both are conditions this file enforces rather than assumes:
+//
+// 1. A gate whose verdict IS a duration cannot run beside the differentials.
+//    `prepushHeldOut` holds back every `exclusive: true` gate (gates.bit,
+//    gatestable2.bit — each record carries its own reason since #4706) plus
+//    the three #4711 names that are not flagged but adjudicate on a
+//    hardcoded wall clock: test-osenv (20000ms), test-fsblock (an 8s fifo
+//    block against a CPU-time check) and test-pmaddgit (a 60s warm-cache
+//    budget, observed 61495ms at 16 slots). They run ONE AT A TIME, after
+//    `runGatePool` below has returned — and that call returns only once
+//    every member of the pool, the differentials included, has finished, so
+//    "after the differentials" is a property of the control flow here and
+//    not of any timing assumption. Measured, not only argued: in the run
+//    above every one of the twelve came in at or under the duration it had
+//    inside the serial suite, and the three #4711 names came in far under
+//    (test-pmaddgit 125s -> 18s, test-fsblock 25s -> 14s, test-osenv
+//    5s -> 1s) — because `test` runs those three INSIDE its pool and this
+//    step does not.
+//
+// 2. The two sides must not write one path under `bit-out`. Two writers to
+//    one `bit-out` is the rc=137 "Code Signature Invalid" hazard that has
+//    killed builds in this repo. Audited by grep at #3255 and confirmed by
+//    an mtime listing across both runs: every `scripts/selfhost-*.sh`
+//    constituent only READS `bit-out/bin/bit` and `bit-out/lib/<triple>/
+//    libbitrt.a`, each does its own scratch work under a private
+//    `mktemp -d` or `$TMPDIR/selfhost-*`, and the one shared path —
+//    stage0's `bit-out/stage0/bit-oracle` wrapper — is resolved once,
+//    serially, before any constituent starts and is only ever rewritten
+//    byte-identically through a per-PID temp name and an atomic `mv -f`
+//    (selfhost-diffall.sh's own header). The gate pool writes only
+//    `bit-out/make/**` (run wrappers, `gatebatch/<gate>.{rc,out,dur}`), which
+//    no differential names at all.
+//
+// THE SLOT SPLIT. The pool gets `makeJobs() + 1` slots, not `makeJobs()`:
+// the differentials occupy one of its own, so the suite keeps the full
+// `makeJobs()` that #4706 measured as this box's optimum instead of losing
+// a sixth of it. The differentials' own internal fan-out is narrowed to
+// match, via `DIFFALL_JOBS` (documented in selfhost-diffall.sh's usage) —
+// its default of cores-2 was chosen for a box it had to itself and would
+// otherwise oversubscribe by a factor of two beside a live pool.
+
+// The gates #4711 named: not `exclusive: true` today, but each adjudicates
+// on a hardcoded wall clock that `BIT_TEST_TIMEOUT_S` cannot widen, and all
+// three reddened at 16 pool slots on #4706's own measurement. Held out here
+// for that measured reason; the day they read the knob, delete the row.
+// Kept as a list rather than folded into `exclusive` because that field
+// means "this gate's own assertion is load-sensitive", which is a claim
+// about the harness, and #4711 is the ticket that owes those three the fix.
+fn prepushHeldExtraNames(): []string {
+  return ["test-osenv", "test-fsblock", "test-pmaddgit"]
+}
+
+fn prepushDifferentialsName(): string { return "test-differentials" }
+
+fn hasName(names: []string, want: string): bool {
+  for n of names {
+    if (n == want) {
+      return true
+    }
+  }
+  return false
+}
+
+fn withoutName(names: []string, drop: string): []string {
+  let out = []string(0)
+  for n of names {
+    if (n != drop) {
+      out = append(out, n)
+    }
+  }
+  return out
+}
+
+fn concatNames(a: []string, b: []string): []string {
+  let out = []string(0)
+  for x of a {
+    out = append(out, x)
+  }
+  for x of b {
+    out = append(out, x)
+  }
+  return out
+}
+
+// True when `name` must not run inside the overlap. Asked of the `Gate{}`
+// record (`isExclusiveGate`) rather than a second hand-maintained list, so a
+// gate that gains `exclusive: true` tomorrow is held out here without
+// anyone remembering this file exists.
+fn prepushHeldOut(name: string): bool {
+  return isExclusiveGate(name) || hasName(prepushHeldExtraNames(), name)
+}
+
+// `gateNames()` split into (overlap, held), in `gateNames()` order on both
+// sides so the report order stays a deterministic function of the registry.
+fn prepushSplit(): ([]string, []string) {
+  let overlap = []string(0)
+  let held = []string(0)
+  for n of gateNames() {
+    if (prepushHeldOut(n)) {
+      held = append(held, n)
+      continue
+    }
+    overlap = append(overlap, n)
+  }
+  return overlap, held
+}
+
+// How many constituents `scripts/selfhost-diffall.sh` may run at once while
+// `jobs` suite gates run beside it. `cores - jobs - 1` leaves the pool its
+// measured slot count and one core for the driver itself; floor 1, because a
+// host too small for the arithmetic still has to run the family rather than
+// deadlock on zero slots.
+fn prepushDiffallJobs(jobs: int): int {
+  let n = numCPUs() - jobs - 1
+  if (n < 1) {
+    return 1
+  }
+  return n
+}
+
+// The differentials as one member of the pool, carrying the `DIFFALL_JOBS`
+// bound above. The env array is COPIED rather than appended to in place: the
+// `Gate` came out of `gateTable()`, this function does not own its arrays,
+// and growing one in place is how a caller's data silently changes under it.
+fn prepushDiffGate(jobs: int): (Gate, bool) {
+  let (g, ok) = findGate(prepushDifferentialsName())
+  if (!ok) {
+    eprint("make: no Gate{} record for '${prepushDifferentialsName()}' — cannot run the pre-push overlap\n")
+    return g, false
+  }
+  let env = []string(0)
+  for e of g.env {
+    env = append(env, e)
+  }
+  env = append(env, "DIFFALL_JOBS=${prepushDiffallJobs(jobs)}")
+  return Gate{ name: g.name, argv: g.argv, env: env, exclusive: g.exclusive }, true
+}
+
+// The pool's membership: the differentials FIRST, so its verdict heads the
+// report, and `poolStartOrder`'s hint for it (gatesbatchorder.bit) puts it
+// first into a slot as well.
+//
+// A name with no `Gate{}` record REFUSES the whole step instead of being
+// counted as one failure among many: this is the pre-push gate, and a
+// registry that cannot name what it is about to run is a driver bug, not a
+// red harness.
+fn prepushOverlapGates(names: []string, jobs: int): ([]Gate, bool) {
+  let out = []Gate(0)
+  let (d, ok) = prepushDiffGate(jobs)
+  if (!ok) {
+    return out, false
+  }
+  out = append(out, d)
+  for n of names {
+    let (g, gok) = findGate(n)
+    if (!gok) {
+      eprint("make: step '${n}' is not implemented yet — refusing to run the pre-push gate\n")
+      return out, false
+    }
+    out = append(out, g)
+  }
+  return out, true
+}
+
+// One held gate, run alone once the pool has drained. Deliberately not
+// `runStepNow` (main.bit): that function also owns the artifact/gate stop
+// policy and the `up to date` short-circuit, neither of which applies to a
+// name this file has already proved is a gate. The printed shape is the
+// same, so a downstream consumer parses one format either way.
+fn runHeldGate(name: string): bool {
+  print("make: ${name}\n")
+  let start = monotonic()
+  let rc = runGate(name)
+  print("make: ${name} — ${formatDuration(since(start))}\n")
+  return rc != 0
+}
+
+fn prepushSuiteReport(total: int, failed: []string) {
+  if (len(failed) == 0) {
+    print("make: test-prepush suite: ${total} gate(s), 0 failed\n")
+    return
+  }
+  print("make: test-prepush suite: ${total} gate(s), ${len(failed)} FAILED: ${join(failed, " ")}\n")
+}
+
+fn prepushDiffReport(failed: bool) {
+  if (failed) {
+    print("make: test-prepush differentials: FAILED — ${prepushDifferentialsName()}\n")
+    return
+  }
+  print("make: test-prepush differentials: 1 gate, 0 failed\n")
+}
+
+// Runs the held gates one at a time and names the ones that failed.
+fn runHeldGates(names: []string): []string {
+  let failed = []string(0)
+  for h of names {
+    if (runHeldGate(h)) {
+      failed = append(failed, h)
+    }
+  }
+  return failed
+}
+
+fn stepPrepush(): int {
+  let (overlapNames, heldNames) = prepushSplit()
+  let jobs = makeJobs()
+  let (gates, ok) = prepushOverlapGates(overlapNames, jobs)
+  if (!ok) {
+    return 1
+  }
+  print("make: test-prepush — ${len(overlapNames)} suite gate(s) at ${jobs} at a time, beside ${prepushDifferentialsName()} at DIFFALL_JOBS=${prepushDiffallJobs(jobs)}; ${len(heldNames)} wall-clock-sensitive gate(s) held out, run one at a time afterwards\n")
+  let (sha, runId) = currentGateStamp()
+  let poolFailed = runGatePool(gates, sha, runId, jobs + 1)
+  let diffFailed = hasName(poolFailed, prepushDifferentialsName())
+  let suiteFailed = withoutName(poolFailed, prepushDifferentialsName())
+  let heldFailed = runHeldGates(heldNames)
+  let allSuite = concatNames(suiteFailed, heldFailed)
+  prepushSuiteReport(len(overlapNames) + len(heldNames), allSuite)
+  prepushDiffReport(diffFailed)
+  if (diffFailed || len(allSuite) != 0) {
+    return 1
+  }
+  return 0
+}
