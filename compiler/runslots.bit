@@ -1,0 +1,167 @@
+// bit — the scratch executable pool behind `bit run` and `bit test` (#4714).
+//
+// macOS charges a provenance scan on the first `execve` of a newly CREATED
+// inode, and serializes that charge system-wide. #4712 measured it on this
+// box with no Bit involved, N=30, idle:
+//
+//     30 fresh Mach-O files, exec'd once each               13.407 s
+//     30 re-execs of ONE validated Mach-O                    0.057 s
+//     30 in-place rewrites of ONE validated inode, exec'd    0.107 s
+//
+// The third row is the one that matters: rewriting a validated inode with
+// DIFFERENT bytes and exec'ing it again pays nothing. What the kernel keys on
+// is the inode reaching `execve` for the first time, not the content, not the
+// path and not the CDHash — `cp` of an already-validated binary pays in full,
+// and `xattr -c`, `/tmp` instead of `$TMPDIR` and an ad-hoc `codesign -f -s -`
+// were all measured and changed nothing.
+//
+// `bit run` and `bit test` used to build to `${runScratchDir()}/bit-run-<stem>-
+// <nonce>`, exec it, and remove it: one fresh inode per invocation, so every
+// developer iteration and every harness that shells out to `bit run` bought a
+// scan, and under fleet load the box sustains only ~2 of them per second in
+// total. They now write OVER one of a small pool of long-lived slot inodes and
+// exec that.
+//
+// THE RACE, and why it cannot bite. Two `bit run`s in parallel (this repo
+// drives them through `xargs -P`) must never write a slot another process is
+// about to exec. A slot is claimed by taking an EXCLUSIVE `flock` on its own
+// separate lock file, held across build → exec → release, so at most one
+// process ever writes or execs a given slot, and it holds the lock for the
+// whole window in which that slot's bytes are neither complete nor validated.
+// A half-written slot is therefore unreachable: the only process that could
+// exec it is the one still writing it.
+//
+// The lock lives in its OWN file rather than on the slot itself because `flock`
+// is keyed on the open file description — releasing it means closing the fd —
+// while a slot's fd MUST be closed before the exec: an executable held open for
+// writing fails `execve` with ETXTBSY. A lock file is never exec'd, so paying to
+// create it costs nothing here. A crashed holder releases automatically; the
+// kernel drops a dead process's `flock`.
+//
+// Nothing is ever renamed into place. A rename produces a new directory entry
+// for a new inode and pays the scan again, which is the whole cost being
+// removed; the slot is truncated and rewritten in place instead.
+//
+// When every slot is busy, or the pool directory cannot be made ours, the
+// caller falls back to the old unique nonce path — correct, just paying the
+// scan, and never blocked behind another process's program.
+//
+// WHY THE POOL IS A POOL AND NOT ONE INODE (#4716). Rewriting a validated
+// inode and exec'ing it again is free of the tax but not free of consequence:
+// macOS applies a provenance sandbox at exec, that step can fail for a
+// rewritten inode, and when it does the kernel SIGKILLs the process before its
+// first instruction — exit 137, empty stdout, `AppleSystemPolicy: ASP: Unable
+// to apply provenance sandbox` in the system log. `_tests_/bit/mainexit.bit`
+// lost 7 of 13 execs to it inside a loaded `./make test` while reusing ONE
+// inode; #4713's pool has never seen it across 528 + 160 + 53 pooled execs per
+// suite run. The working theory there is that ROTATION buys the slack, so slot
+// count is a correctness input here rather than a tuning knob, and the claim
+// scan below starts at a random slot rather than always at slot 0 — with a
+// whole compile between one run and the next, eight slots put seconds between
+// two rewrites of the same inode instead of milliseconds.
+
+import { File, openReadWrite } from "std/fs"
+
+// How many programs can be in flight before a `bit run` falls back to a fresh
+// inode. Eight covers this repo's real parallelism (`./make test` runs six
+// gates at a time) with headroom, while keeping the pool small enough that the
+// slots stay resident and validated. Raising it costs one 0644 lock file and
+// one binary-sized slot file each.
+const runSlotCount: int = 8
+
+// 0o700 on the pool directory, and 0o755 on a slot (`buildCmd` sets that
+// itself). Bit has no octal literal.
+const runSlotDirMode: int = 448
+
+// A claimed scratch executable: the path to build into and exec, and — when it
+// came from the pool — the lock file whose exclusive `flock` makes that path
+// this process's alone until `releaseRunSlot`.
+class RunSlot {
+  exe: string,
+  lock: File,
+  pooled: bool,
+}
+
+// The `File` a non-pooled slot carries. Never opened, never closed: `pooled` is
+// the only thing that decides whether the lock is touched.
+fn runSlotNoFile(): File {
+  return File{ fd: i64(0) - i64(1) }
+}
+
+fn runSlotPoolDir(): string {
+  return "${runScratchDir()}/bit-run-slots"
+}
+
+// Whether the pool directory exists AND belongs to us with mode 0700.
+//
+// The ownership check is `fsChmod`'s own result, and it is load-bearing rather
+// than tidiness: a slot's name is FIXED, so unlike the nonce path it is
+// guessable, and on a shared `/tmp` (POSIX without `$TMPDIR`) another user
+// could pre-create `slot-0` as a symlink and have this process write a binary
+// through it. `chmod` on a directory we do not own fails, so a pool we cannot
+// secure is reported as unusable and the caller keeps its unpredictable path.
+// Re-asserted on every claim rather than at creation: this trusts the mode the
+// directory has NOW, not the one some earlier run gave it.
+fn runSlotPoolReady(dir: string): bool {
+  if (!fsIsDir(dir)) {
+    if (fsMkdir(dir) < 0) {
+      // Losing the create race to a sibling `bit run` is the expected outcome
+      // under `xargs -P`, not a failure — what matters is that it is a
+      // directory afterwards.
+      if (!fsIsDir(dir)) {
+        return false
+      }
+    }
+  }
+  return fsChmod(dir, runSlotDirMode) == 0
+}
+
+// Claim a scratch executable path for `kind` ("run"/"test") built from `stem`.
+//
+// Never fails and never blocks: an exhausted or unusable pool yields a
+// nonce-named path with `pooled: false`, which is exactly what this code did
+// before the pool existed. Every return value must reach `releaseRunSlot`.
+fn claimRunSlot(kind: string, stem: string): RunSlot {
+  let dir = runSlotPoolDir()
+  if (runSlotPoolReady(dir)) {
+    // A random start, not 0: scanning from 0 would hand a sequential caller the
+    // same inode every time, which is exactly the single-inode shape #4716
+    // records SIGKILLs against. There is no shared counter to rotate — separate
+    // processes — and a nonce needs no coordination to spread the load.
+    let start = int(scratchNonce() % uint(runSlotCount))
+    let n = 0
+    while (n < runSlotCount) {
+      let i = (start + n) % runSlotCount
+      // `openReadWrite` is O_RDWR|O_CREAT with no O_TRUNC: the lock file's
+      // content is never read, so there is nothing to truncate and nothing a
+      // concurrent holder can see change under it.
+      let f = openReadWrite("${dir}/lock-${i}") catch runSlotNoFile()
+      if (f.fd >= 0) {
+        let taken = f.tryLock() catch false
+        if (taken) {
+          return RunSlot{ exe: "${dir}/slot-${i}", lock: f, pooled: true }
+        }
+        f.close()
+      }
+      n = n + 1
+    }
+  }
+  return RunSlot{
+    exe: "${runScratchDir()}/bit-${kind}-${stem}-${scratchNonce()}",
+    lock: runSlotNoFile(),
+    pooled: false,
+  }
+}
+
+// Release a claim. A pooled slot's BINARY is deliberately left on disk — that
+// inode staying validated is the entire point — and only the lock is dropped,
+// which `File.close` does (it unlocks explicitly first, for Windows, where
+// `LockFileEx` makes no promise about close). A non-pooled path is removed as
+// before; a leftover temp binary is harmless, so the failure is ignored.
+fn releaseRunSlot(s: RunSlot) {
+  if (s.pooled) {
+    s.lock.close()
+    return
+  }
+  let _ = fsRemove(s.exe)
+}
