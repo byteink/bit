@@ -1,0 +1,180 @@
+// Bit standard library — sql module: the datasource a pool connects with.
+//
+// ONE class, not two. `Datasource` carries both what to connect to (uri, or
+// host/user/password/database/sslmode) and how many such connections to keep
+// (maxOpen, maxIdle, maxLifetime, maxIdleTime, acquireTimeout). Splitting
+// connection settings from pool settings would put a nested value and a
+// second `?` at every call site; node-postgres, Npgsql and TypeORM all take
+// one options object, and Spring, TypeORM and Quarkus already call that
+// object a datasource.
+//
+// IT LIVES HERE, NOT IN A DRIVER PACKAGE. If each driver declared its own
+// config class, swapping drivers would change its type and the one-line swap
+// std/sql exists to promise would be false. What each driver does own is
+// *reading* the fields: Postgres spells the TLS setting `sslmode=verify-full`
+// in a URI, MySQL spells it `ssl-mode=VERIFY_IDENTITY`, so parsing `uri` is
+// `Adapter.connect`'s job and there is deliberately no `parseUrl` exported
+// from this module.
+//
+// `uri` AND THE INDIVIDUAL FIELDS ARE MUTUALLY EXCLUSIVE. Setting both is an
+// error naming both, not one silently winning — see `Datasource.validate`.
+// The field is spelled `uri` because Postgres's own documentation heads that
+// section "Connection URIs".
+//
+// Note for the freeze record (#3996): `host`/`port`/`sslmode` bake a *network
+// database* assumption into the generic layer. SQLite has no host and no port
+// and would leave all three at their defaults.
+
+// How the driver should negotiate TLS with the server. The names are Bit's;
+// each adapter renders them into whatever its own wire protocol spells.
+//
+// `Negotiate` IS VARIANT 0 DELIBERATELY. A class field whose type is an enum
+// takes that enum's first declared variant as its zero value, and a field of
+// enum type cannot carry an explicit default (a variant is not a constant
+// expression, SPEC §10.5 — the compiler answers E0064). Ordering the
+// connect-to-anything mode first is therefore the only way the default
+// survives, and reordering this enum silently changes what an omitted
+// `sslmode` means.
+export enum SslMode { Negotiate, VerifyFull, VerifyCa, Require, Disable }
+
+// Everything `pool` needs: one database to reach, and the shape of the pool
+// that reaches it. Every field has a default, so `Datasource{ uri: ... }` is
+// a complete configuration.
+//
+// `maxOpen` IS 10, ARGUED NOT GUESSED. Postgres ships `max_connections =
+// 100`, so a single instance defaulting to 100 would take the server's whole
+// budget and the second container — or the operator's `psql` — could not
+// connect at all. A large pool is also *slower*: past a small pool,
+// throughput drops as the database thrashes between processes competing for
+// the same cores and disks (HikariCP's benchmarks are the citation). 10 is
+// HikariCP's default and node-postgres's. The rough optimum is
+// `cores * 2 + spindles` on the *database* box, never a count taken from the
+// application host.
+//
+// `acquireTimeout` IS NEVER ZERO. Zero would mean wait forever, so a
+// database outage would park every worker with no error and no log line;
+// `validate` rejects it.
+//
+// Every duration here is milliseconds.
+export class Datasource {
+  // "postgres://app:pw@host:5432/db?sslmode=verify-full" — the whole target
+  // in one string, as a `DATABASE_URL` environment variable supplies it.
+  // Exclusive with the individual fields below.
+  export uri: string = ""
+  // The individual form. `host` is the one field that says "this form is in
+  // use", so a Datasource with only `user` set and no `host` is still the
+  // nothing-to-connect-to case.
+  export host: string = ""
+  // 0 means the adapter's own default (5432 for Postgres, 3306 for MySQL);
+  // std/sql knows no port numbers.
+  export port: i64 = 0
+  export user: string = ""
+  export password: string = ""
+  export database: string = ""
+  // No `= SslMode.Negotiate`: see the enum's own comment. Omitting the field
+  // already yields `Negotiate`.
+  export sslmode: SslMode
+  // How long one connect attempt may take, in milliseconds. Applied by the
+  // adapter, which owns the socket.
+  export connectTimeout: i64 = 10_000
+  // The ceiling on physical connections, in use plus idle.
+  export maxOpen: i64 = 10
+  // How many may sit idle rather than being closed. Above this, a returned
+  // connection is closed instead of parked.
+  export maxIdle: i64 = 10
+  // Retire a connection this many milliseconds after it was opened, however
+  // healthy it looks — a load balancer or a failover moves the far end and a
+  // long-lived connection keeps talking to the old one. 0 or less: no limit.
+  export maxLifetime: i64 = 1800_000
+  // Retire a connection that has sat idle this long. 0 or less: no limit.
+  export maxIdleTime: i64 = 600_000
+  // How long a caller waits for a connection before failing. Never 0.
+  export acquireTimeout: i64 = 5_000
+  // Server-side prepared statements to keep per connection. 0 is off; see
+  // #3988 for the cache itself.
+  export statementCache: i64 = 0
+
+  // Rejects a Datasource that cannot describe a pool, before anything opens
+  // a socket. This is the cross-field check SPEC §10.5 reserves the name
+  // `validate` for; `pool` calls it first, so an unset `DATABASE_URL`
+  // surfaces here rather than as a DNS or parse failure from inside a
+  // driver.
+  export validate(): ()! {
+    this.checkTarget()?
+    this.checkLimits()?
+  }
+
+  // Exactly one of the two ways of naming a database must be in use.
+  checkTarget(): ()! {
+    let byUri = this.uri != ""
+    let byFields = this.host != ""
+    if (byUri && byFields) {
+      fail newError("sql: Datasource sets both uri and host; they are " +
+        "mutually exclusive — set uri alone, or host/user/database alone")
+    }
+    if (!byUri && !byFields) {
+      fail newError("sql: Datasource sets neither uri nor host, so there " +
+        "is nothing to connect to — set uri (from DATABASE_URL, say) or " +
+        "set host/user/database")
+    }
+  }
+
+  // The pool's own numbers. Each of these zero values is the dangerous
+  // answer, which is why the class defaults them and this rejects them.
+  checkLimits(): ()! {
+    if (this.maxOpen < 1) {
+      fail newError("sql: Datasource maxOpen is ${this.maxOpen}; a pool " +
+        "must be allowed at least one connection")
+    }
+    if (this.maxIdle < 0) {
+      fail newError("sql: Datasource maxIdle is ${this.maxIdle}")
+    }
+    if (this.acquireTimeout < 1) {
+      fail newError("sql: Datasource acquireTimeout is " +
+        "${this.acquireTimeout}ms; 0 would park every caller forever on an " +
+        "outage, with no error and no log line")
+    }
+  }
+}
+
+// What turns a `Datasource` into a live connection: the one thing a driver
+// package implements for `pool` (its `Driver`/`Conn` implementation is what
+// it implements for everything else). `connect` reads whichever form of
+// `cfg` the caller filled in — `uri`, or the individual fields — applies its
+// own default port when `cfg.port` is 0, and renders `cfg.sslmode` into its
+// own protocol's spelling.
+//
+// `pool` calls `cfg.validate()` before it ever calls `connect`, so an
+// adapter never sees a Datasource with both forms set or with neither.
+export interface Adapter { connect(cfg: Datasource): Conn! }
+
+// The marker a driver failure carries when the failure has poisoned the
+// *connection* rather than merely failing the statement: a closed socket, a
+// short read, a protocol desync. The pool never hands such a connection out
+// again.
+//
+// It is a marker interface rather than an error code because a driver's
+// errors are the driver's own type; implementing one extra method is all
+// this asks of it. A failure that does NOT implement `FatalError` — a
+// constraint violation, a syntax error — leaves the connection usable, which
+// is the common case and needs no cooperation at all.
+export interface FatalError { message(): string, transportFatal(): bool }
+
+// A ready-made `FatalError` for a driver with no error type of its own to
+// extend. `pool` treats a failure carrying this as connection-fatal.
+export fn transportError(detail: string): error {
+  return transportFail{ detail: detail }
+}
+
+// The concrete type behind `transportError`. Module-private: a caller tests
+// for the *behaviour* (`FatalError`), never for this class.
+class transportFail {
+  detail: string
+  message(): string {
+    return "sql: transport error: ${this.detail}"
+  }
+
+  transportFatal(): bool {
+    return true
+  }
+}

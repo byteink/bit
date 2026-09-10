@@ -200,3 +200,223 @@ fn firstName(conn: Conn, id: string): string! {
   return asText(rows.value(0))?
 }
 ```
+
+## The connection pool
+
+A server has two wrong ways to reach a database and one right one. Open a
+connection per request and every request pays a TCP handshake plus
+authentication, and a burst exhausts the database's own connection limit.
+Share one connection between requests and the application serialises on it —
+and a transaction started by one request becomes visible to every other
+request using that connection. `pool` is the third way: a bounded set of
+physical connections, handed out one at a time, returned when the caller is
+done, and closed when they are too old or have gone bad.
+
+Four rules hold, and the tests in `stdlib/sql/pool.test.bit` assert each one
+against a fake driver that counts every connection ever opened:
+
+1. **A transaction pins its connection** for its whole life, returned on
+   `commit` or `rollback`. The `Tx` holds the driver's own transaction, made
+   on one connection, and has no way to reach another.
+2. **A connection handed back with an open transaction is closed**, never
+   reused — including after a `commit` that failed, since the pool cannot
+   know what the server did with it.
+3. **A connection a driver reported a transport failure on is discarded**
+   (see `FatalError` below).
+4. **Waiters are served in arrival order.** LIFO would starve a request
+   under sustained load, so a caller that arrives while anyone is queued
+   joins the queue rather than taking an idle connection out from under it.
+
+### `pool(a: Adapter, cfg: Datasource): Pool!`
+
+A pool of connections to the database `cfg` names, opened through `a`.
+Nothing connects here: `cfg` is checked (`Datasource.validate`) and
+connections are opened on demand, up to `cfg.maxOpen`. This fails only on a
+configuration that cannot describe a pool — an unset `DATABASE_URL` surfaces
+here, not as a DNS error from inside a driver later.
+
+```bit
+import { Adapter, Datasource, Pool, pool, SslMode } from "std/sql"
+
+// The whole target in one string, as DATABASE_URL supplies it.
+fn fromUrl(a: Adapter, url: string): Pool! {
+  return pool(a, Datasource{ uri: url })?
+}
+
+// Or field by field, with a bigger pool.
+fn fromFields(a: Adapter, password: string): Pool! {
+  return pool(
+    a,
+    Datasource{
+      host: "db.internal", user: "app", password: password,
+      database: "erp", sslmode: SslMode.VerifyFull, maxOpen: 20,
+    },
+  )?
+}
+```
+
+### `Datasource`
+
+Everything a pool needs: one database to reach, and the shape of the pool
+that reaches it. One class, not two — splitting connection settings from
+pool settings puts a nested value and a second `?` at every call site.
+
+| field | default | meaning |
+| ----- | ------- | ------- |
+| `uri` | `""` | the whole target in one string, `postgres://app:pw@host:5432/db?sslmode=...` |
+| `host` | `""` | the individual form; exclusive with `uri` |
+| `port` | `0` | 0 means the adapter's own default (5432, 3306) |
+| `user` | `""` | |
+| `password` | `""` | |
+| `database` | `""` | |
+| `sslmode` | `SslMode.Negotiate` | |
+| `connectTimeout` | `10_000` | ms for one connect attempt, applied by the adapter |
+| `maxOpen` | `10` | ceiling on physical connections, in use plus idle |
+| `maxIdle` | `10` | how many may sit idle rather than being closed |
+| `maxLifetime` | `1800_000` | ms after opening before a connection is retired; 0 or less, never |
+| `maxIdleTime` | `600_000` | ms a connection may sit idle before it is retired; 0 or less, never |
+| `acquireTimeout` | `5_000` | ms a caller waits for a connection before failing |
+| `statementCache` | `0` | prepared statements kept per connection; 0 is off |
+
+**`uri` and the individual fields are mutually exclusive.** Setting both is
+an error naming both, not one silently winning. Parsing `uri` is the
+adapter's job, not this module's: Postgres spells the TLS setting
+`sslmode=verify-full` and MySQL spells it `ssl-mode=VERIFY_IDENTITY`, so
+there is deliberately no `parseUrl` here.
+
+**`maxOpen` is 10, argued not guessed.** Postgres ships
+`max_connections = 100`, so one instance defaulting to 100 takes the
+server's whole budget and the second container — or the operator's `psql` —
+cannot connect at all. A large pool is also slower: past a small pool,
+throughput drops as the database thrashes between processes competing for
+the same cores and disks (HikariCP's benchmarks are the citation; 10 is its
+default and node-postgres's). The rough optimum is `cores * 2 + spindles` on
+the *database* box, never a count taken from the application host.
+
+**`acquireTimeout` is never 0.** Zero would mean wait forever, so a database
+outage would park every worker with no error and no log line; `validate`
+rejects it, as it rejects a `maxOpen` below 1.
+
+### `Datasource.validate(): ()!`
+
+Rejects a `Datasource` that cannot describe a pool, before anything opens a
+socket: neither `uri` nor `host` set (nothing to connect to — the unset
+`DATABASE_URL` case, which must not surface as a DNS or parse failure), both
+set (mutually exclusive), a `maxOpen` below 1, a negative `maxIdle`, or an
+`acquireTimeout` below 1. `pool` calls it, so a program that builds its pool
+through `pool` never has to.
+
+### `SslMode`
+
+```
+enum SslMode { Negotiate, VerifyFull, VerifyCa, Require, Disable }
+```
+
+How the driver should negotiate TLS. The names are Bit's; each adapter
+renders them into whatever its own wire protocol spells.
+
+`Negotiate` is the first variant deliberately. A class field of enum type
+cannot carry an explicit default — a variant is not a constant expression
+(SPEC §10.5, `E0064`) — so an omitted `sslmode` takes the enum's *first
+declared variant*. Ordering the connect-to-anything mode first is the only
+way that default survives, and reordering this enum silently changes what an
+omitted `sslmode` means.
+
+### `Adapter`
+
+```
+connect(cfg: Datasource): Conn!
+```
+
+What turns a `Datasource` into a live connection: the one thing a driver
+package implements for `pool`, as `Driver`/`Conn` is what it implements for
+everything else. `connect` reads whichever form of `cfg` the caller filled
+in, applies its own default port when `cfg.port` is 0, and renders
+`cfg.sslmode` into its own protocol's spelling. `pool` calls
+`cfg.validate()` before it ever calls `connect`, so an adapter never sees a
+`Datasource` with both forms set or with neither.
+
+### `Pool`
+
+A bounded set of connections to one database, safe to share across green
+threads. Built by `pool`; closed by `Pool.close`.
+
+### `Pool.query(sqlText: string, params: []Value): Rows!`
+
+Runs `sqlText` and returns its rows. **The connection stays checked out
+until the returned `Rows` is closed** — a cursor lives on the connection
+that produced it — so a caller that never closes its `Rows` leaks a
+connection exactly as one that never closes a file leaks a descriptor.
+
+```bit
+import { Pool, Value, asText } from "std/sql"
+
+fn firstName(db: Pool, id: string): string! {
+  let rows = db.query("SELECT name FROM users WHERE id = ?", [Value.Text(id)])?
+  defer rows.close()
+  let has = rows.next()?
+  if (!has) {
+    fail newError("no such user: ${id}")
+  }
+  return asText(rows.value(0))?
+}
+```
+
+### `Pool.exec(sqlText: string, params: []Value): int!`
+
+Runs `sqlText` for its effect and returns the number of rows it changed. The
+connection is back in the pool before this returns.
+
+### `Pool.begin(): Tx!`
+
+Starts a transaction on one connection and keeps that connection until
+`commit` or `rollback` ends it. Every statement issued through the returned
+`Tx` runs on that one connection — rule 1, held by the object graph rather
+than by a check.
+
+```bit
+import { Pool, Value } from "std/sql"
+
+fn transfer(db: Pool, payer: string, payee: string, cents: int): ()! {
+  let tx = db.begin()?
+  tx.exec(
+    "UPDATE accounts SET balance = balance - ? WHERE id = ?",
+    [Value.Int(cents), Value.Text(payer)],
+  ) catch e {
+    tx.rollback()?
+    fail e
+  }
+  tx.exec(
+    "UPDATE accounts SET balance = balance + ? WHERE id = ?",
+    [Value.Int(cents), Value.Text(payee)],
+  ) catch e {
+    tx.rollback()?
+    fail e
+  }
+  tx.commit()?
+}
+```
+
+### `Pool.close()`
+
+Closes every idle connection and fails every parked caller. Connections
+still checked out are closed as they are returned. Idempotent.
+
+### `FatalError`
+
+```
+message(): string
+transportFatal(): bool
+```
+
+The marker a driver failure carries when the failure has poisoned the
+*connection* rather than merely failing the statement: a closed socket, a
+short read, a protocol desync. The pool never hands such a connection out
+again (rule 3). A failure that does not implement `FatalError` — a
+constraint violation, a syntax error — leaves the connection usable, which
+is the common case and needs no cooperation from the driver at all.
+
+### `transportError(detail: string): error`
+
+A ready-made `FatalError`, for a driver with no error type of its own to
+extend.

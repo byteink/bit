@@ -1,0 +1,544 @@
+// stdlib/sql/pool.test.bit — the pool's four rules, under real concurrency
+// (#3962).
+//
+// `pool`, `Pool`, `Datasource`, `Adapter`, `transportError` and the
+// module-private `slot`/`Claim` are all siblings in this same module
+// (SPEC §17.1), so nothing of std/sql is imported.
+//
+// EVERYTHING RUNS AGAINST `stubAdapter`, reached only through the public
+// `Adapter`/`Conn`/`Tx` interfaces exactly as a driver package would be. It
+// counts every physical connection ever opened and every one closed, and
+// logs each statement tagged with the connection that ran it — which is what
+// makes "no more than maxOpen connections", "closed rather than reused" and
+// "one connection for the whole transaction" assertions about observed
+// behaviour rather than about the pool's own accounting. The connect path is
+// also where the uri form and the host/user/database form are asserted to
+// reach the same server: one `stubAdapter`, two pools, one connection each.
+//
+// NO TEST ASSERTS AN UPPER BOUND ON WALL-CLOCK TIME. Up to four agents share
+// this machine, so every timing assertion here is an ordering or a count,
+// and every wait is a bounded poll that exits as soon as the condition
+// holds. `awaitWaiters` is the sync point: it reads the pool's own queue
+// rather than sleeping a guessed interval.
+
+import { sleep } from "std/time"
+import { contains } from "std/strings"
+
+// The fake driver. `mu` guards every field below it, because the workers a
+// concurrency test spawns all reach this one object.
+class stubAdapter {
+  mu: Mutex
+  connects: i64 = 0
+  closes: i64 = 0
+  // "uri" or "fields", one per connect, in order.
+  forms: []string
+  // One entry per statement, "<sql>@<connection id>", in the order the
+  // connections ran them.
+  log: []string
+  // exec fails with a transport error (rule 3).
+  poison: bool = false
+  // commit fails, leaving the transaction open (rule 2).
+  failCommit: bool = false
+
+  connect(cfg: Datasource): Conn! {
+    this.mu.lock()
+    this.connects = this.connects + 1
+    let id = this.connects
+    let form = "fields"
+    if (cfg.uri != "") {
+      form = "uri"
+    }
+    this.forms = append(this.forms, form)
+    this.mu.unlock()
+    return stubConn{ a: this, id: id }
+  }
+
+  record(entry: string) {
+    this.mu.lock()
+    this.log = append(this.log, entry)
+    this.mu.unlock()
+  }
+
+  noteClose() {
+    this.mu.lock()
+    this.closes = this.closes + 1
+    this.mu.unlock()
+  }
+
+  connectCount(): i64 {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.connects
+  }
+
+  closeCount(): i64 {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.closes
+  }
+
+  statements(): []string {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.log
+  }
+
+  connectForms(): []string {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.forms
+  }
+
+  poisoned(): bool {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.poison
+  }
+
+  setPoison(on: bool) {
+    this.mu.lock()
+    this.poison = on
+    this.mu.unlock()
+  }
+
+  commitFails(): bool {
+    this.mu.lock()
+    defer this.mu.unlock()
+    return this.failCommit
+  }
+
+  setFailCommit(on: bool) {
+    this.mu.lock()
+    this.failCommit = on
+    this.mu.unlock()
+  }
+}
+
+// One physical connection. `id` is what every statement in the log is tagged
+// with, and what a test compares to say "the same connection".
+class stubConn {
+  a: stubAdapter
+  id: i64
+  query(sqlText: string, params: []Value): Rows! {
+    this.a.record("${sqlText}@${this.id}")
+    return stubRows{ pos: -1 }
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    this.a.record("${sqlText}@${this.id}")
+    if (this.a.poisoned()) {
+      fail transportError("stub: connection ${this.id} lost the socket")
+    }
+    return 1
+  }
+
+  prepare(sqlText: string): Stmt! {
+    fail newError("stub: prepare is not part of this test")
+  }
+
+  begin(): Tx! {
+    this.a.record("begin@${this.id}")
+    return stubTx{ a: this.a, id: this.id }
+  }
+
+  close() {
+    this.a.noteClose()
+  }
+}
+
+// A one-row, one-column cursor: enough for a `Rows` to be closed, which is
+// what returns the connection.
+class stubRows {
+  pos: i64
+  next(): bool! {
+    this.pos = this.pos + 1
+    return this.pos < 1
+  }
+
+  columns(): []string {
+    return ["n"]
+  }
+
+  value(col: int): Value {
+    return Value.Int(1)
+  }
+
+  close() {}
+}
+
+// A transaction on connection `id`. Every statement it runs is logged with
+// that id, which is how "a transaction pins its connection" is asserted.
+class stubTx {
+  a: stubAdapter
+  id: i64
+  query(sqlText: string, params: []Value): Rows! {
+    this.a.record("${sqlText}@${this.id}")
+    return stubRows{ pos: -1 }
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    this.a.record("${sqlText}@${this.id}")
+    return 1
+  }
+
+  commit(): ()! {
+    if (this.a.commitFails()) {
+      fail transportError("stub: commit never answered")
+    }
+    this.a.record("commit@${this.id}")
+  }
+
+  rollback(): ()! {
+    this.a.record("rollback@${this.id}")
+  }
+}
+
+fn newStub(): stubAdapter {
+  return stubAdapter{ mu: newMutex(), forms: []string(0), log: []string(0) }
+}
+
+// The connection id a log entry was tagged with: "insert@3" -> "3".
+fn taggedConn(entry: string): string {
+  let i = len(entry) - 1
+  while (i >= 0) {
+    if (entry[i] == u8(64)) {
+      return entry[i + 1:]
+    }
+    i = i - 1
+  }
+  return ""
+}
+
+// Whether `entry` is `sqlText` run on some connection.
+fn ranStatement(entry: string, sqlText: string): bool {
+  return entry == "${sqlText}@${taggedConn(entry)}"
+}
+
+// Blocks until `p` has at least `n` callers queued, or gives up. Reading the
+// pool's own queue is the only sync point that says "the waiter is in the
+// queue" — a sleep would only say "some time passed". Bounded at ~2s of
+// polling, and returns the instant the condition holds, so a loaded machine
+// makes it slower, never wrong.
+fn awaitWaiters(p: Pool, n: i64): bool {
+  let spins = 0
+  while (spins < 2000) {
+    spins = spins + 1
+    p.mu.lock()
+    let queued = len(p.waiters)
+    p.mu.unlock()
+    if (queued >= n) {
+      return true
+    }
+    sleep(1000000)
+  }
+  return false
+}
+
+// One green thread's whole job: one statement through the pool, then say
+// whether it worked. The label makes the statement identifiable in the log.
+fn stubWorker(p: Pool, label: string, done: chan<bool>) {
+  let n = p.exec(label, []Value(0)) catch _ {
+    done <- false
+    return
+  }
+  done <- n == 1
+}
+
+test "a Datasource naming a uri and one naming host/user/database both connect" {
+  let a = newStub()
+  let byUri = pool(a, Datasource{ uri: "stub://app@stub/erp" }) catch e {
+    assert(false, "pool by uri: ${e.message()}")
+    return
+  }
+  let byFields = pool(a, Datasource{
+    host: "stub", user: "app", database: "erp",
+  }) catch e {
+    assert(false, "pool by fields: ${e.message()}")
+    return
+  }
+  let n1 = byUri.exec("select 1", []Value(0)) catch e {
+    assert(false, "uri exec: ${e.message()}")
+    return
+  }
+  let n2 = byFields.exec("select 1", []Value(0)) catch e {
+    assert(false, "fields exec: ${e.message()}")
+    return
+  }
+  assert(n1 == 1 && n2 == 1, "exec returned ${n1} and ${n2}")
+  let forms = a.connectForms()
+  assert(len(forms) == 2, "connects: ${len(forms)}")
+  assert(forms[0] == "uri", "first connect form: ${forms[0]}")
+  assert(forms[1] == "fields", "second connect form: ${forms[1]}")
+  byUri.close()
+  byFields.close()
+}
+
+test "maxOpen caps the connections a burst of concurrent queries opens" {
+  let a = newStub()
+  let p = pool(a, Datasource{
+    uri: "stub://db", maxOpen: 2, acquireTimeout: 30_000,
+  }) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let done = chan<bool>(10)
+  let i = 0
+  while (i < 10) {
+    i = i + 1
+    spawn stubWorker(p, "q${i}", done)
+  }
+  let finished = 0
+  let got = 0
+  while (got < 10) {
+    got = got + 1
+    let ok = <- done
+    if (ok) {
+      finished = finished + 1
+    }
+  }
+  assert(finished == 10, "${finished} of 10 queries completed")
+  assert(a.connectCount() <= 2, "opened ${a.connectCount()} connections for maxOpen 2")
+  assert(len(a.statements()) == 10, "${len(a.statements())} statements ran")
+  p.close()
+}
+
+test "waiters are served in arrival order" {
+  let a = newStub()
+  let p = pool(a, Datasource{
+    host: "stub", maxOpen: 1, acquireTimeout: 30_000,
+  }) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let held = p.acquire() catch e {
+    assert(false, "acquire: ${e.message()}")
+    return
+  }
+  let done = chan<bool>(3)
+  spawn stubWorker(p, "first", done)
+  assert(awaitWaiters(p, 1), "first never reached the queue")
+  spawn stubWorker(p, "second", done)
+  assert(awaitWaiters(p, 2), "second never reached the queue")
+  spawn stubWorker(p, "third", done)
+  assert(awaitWaiters(p, 3), "third never reached the queue")
+  p.release(held)
+  let got = 0
+  while (got < 3) {
+    got = got + 1
+    let _ = <- done
+  }
+  let log = a.statements()
+  assert(len(log) == 3, "${len(log)} statements ran")
+  assert(ranStatement(log[0], "first"), "served first: ${log[0]}")
+  assert(ranStatement(log[1], "second"), "served second: ${log[1]}")
+  assert(ranStatement(log[2], "third"), "served third: ${log[2]}")
+  assert(a.connectCount() == 1, "opened ${a.connectCount()} connections")
+  p.close()
+}
+
+test "a query with every connection held fails after acquireTimeout" {
+  let a = newStub()
+  let p = pool(a, Datasource{
+    host: "stub", maxOpen: 1, acquireTimeout: 50,
+  }) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let held = p.acquire() catch e {
+    assert(false, "acquire: ${e.message()}")
+    return
+  }
+  let n = p.exec("select 1", []Value(0)) catch e {
+    assert(contains(e.message(), "no connection available"),
+      "timeout message: ${e.message()}")
+    p.release(held)
+    p.close()
+    return
+  }
+  assert(false, "the second query got a connection anyway (${n})")
+  p.close()
+}
+
+test "a transaction issues every statement on one connection" {
+  let a = newStub()
+  let p = pool(a, Datasource{ host: "stub", maxOpen: 4 }) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  // A second connection, parked idle: a transaction that could migrate has
+  // somewhere to migrate to.
+  let other = p.acquire() catch e {
+    assert(false, "acquire: ${e.message()}")
+    return
+  }
+  let tx = p.begin() catch e {
+    assert(false, "begin: ${e.message()}")
+    return
+  }
+  p.release(other)
+  let ok = runTxStatements(tx)
+  assert(ok, "the transaction's own statements failed")
+  // begin, the two updates, commit — the acquire above runs no statement.
+  let log = a.statements()
+  assert(len(log) == 4, "${len(log)} log entries")
+  let on = taggedConn(log[0])
+  let i = 0
+  while (i < len(log)) {
+    assert(taggedConn(log[i]) == on, "entry ${i} ran on ${taggedConn(log[i])}, not ${on}")
+    i = i + 1
+  }
+  assert(a.connectCount() == 2, "opened ${a.connectCount()} connections")
+  p.close()
+}
+
+// begin/exec/exec/commit, all through the pool's `Tx`.
+fn runTxStatements(tx: Tx): bool {
+  let a = tx.exec("update one", []Value(0)) catch _ {
+    return false
+  }
+  let b = tx.exec("update two", []Value(0)) catch _ {
+    return false
+  }
+  tx.commit() catch _ {
+    return false
+  }
+  return a == 1 && b == 1
+}
+
+test "a connection whose commit failed is closed, not reused" {
+  let a = newStub()
+  let p = pool(a, Datasource{ host: "stub", maxOpen: 4 }) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  a.setFailCommit(true)
+  let tx = p.begin() catch e {
+    assert(false, "begin: ${e.message()}")
+    return
+  }
+  tx.commit() catch _ {
+    assert(a.closeCount() == 1, "closed ${a.closeCount()} connections after the failed commit")
+    a.setFailCommit(false)
+    assertFreshConnection(p, a, 2)
+    p.close()
+    return
+  }
+  assert(false, "the stub's commit was supposed to fail")
+  p.close()
+}
+
+test "a connection handed back with an open transaction is closed" {
+  let a = newStub()
+  let p = pool(a, Datasource{ host: "stub", maxOpen: 4 }) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let s = p.acquire() catch e {
+    assert(false, "acquire: ${e.message()}")
+    return
+  }
+  // What a caller that began a transaction and handed the connection back
+  // without ending it leaves behind.
+  s.txOpen = true
+  p.release(s)
+  assert(a.closeCount() == 1, "closed ${a.closeCount()} connections")
+  assertFreshConnection(p, a, 2)
+  p.close()
+}
+
+test "a connection that hit a transport error is never handed out again" {
+  let a = newStub()
+  let p = pool(a, Datasource{ host: "stub", maxOpen: 4 }) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  a.setPoison(true)
+  let n = p.exec("select 1", []Value(0)) catch e {
+    assert(contains(e.message(), "transport error"), "error was: ${e.message()}")
+    assert(a.closeCount() == 1, "closed ${a.closeCount()} connections")
+    a.setPoison(false)
+    assertFreshConnection(p, a, 2)
+    p.close()
+    return
+  }
+  assert(false, "the poisoned exec returned ${n}")
+  p.close()
+}
+
+test "a connection older than maxLifetime is retired" {
+  let a = newStub()
+  let p = pool(a, Datasource{
+    host: "stub", maxOpen: 4, maxLifetime: 1,
+  }) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let n = p.exec("select 1", []Value(0)) catch e {
+    assert(false, "first exec: ${e.message()}")
+    return
+  }
+  assert(n == 1 && a.connectCount() == 1, "first exec opened ${a.connectCount()}")
+  // Older than a 1ms lifetime by any clock, on any load.
+  sleep(20000000)
+  assertFreshConnection(p, a, 2)
+  assert(a.closeCount() == 1, "closed ${a.closeCount()} connections")
+  p.close()
+}
+
+// The next statement must open connection number `want` — i.e. the previous
+// connection was retired rather than parked for reuse.
+fn assertFreshConnection(p: Pool, a: stubAdapter, want: i64) {
+  let n = p.exec("select 1", []Value(0)) catch e {
+    assert(false, "follow-up exec: ${e.message()}")
+    return
+  }
+  assert(n == 1, "follow-up exec returned ${n}")
+  assert(a.connectCount() == want,
+    "the pool has opened ${a.connectCount()} connections, expected ${want}")
+}
+
+test "a Rows returned by the pool holds its connection until it is closed" {
+  let a = newStub()
+  let p = pool(a, Datasource{ host: "stub", maxOpen: 1, acquireTimeout: 50 }) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let rows = p.query("select 1", []Value(0)) catch e {
+    assert(false, "query: ${e.message()}")
+    return
+  }
+  let blocked = p.exec("select 2", []Value(0)) catch _ {
+    // The one connection is checked out to `rows`, so this must time out.
+    rows.close()
+    let after = p.exec("select 3", []Value(0)) catch e2 {
+      assert(false, "after rows.close: ${e2.message()}")
+      return
+    }
+    assert(after == 1, "exec after rows.close returned ${after}")
+    assert(a.connectCount() == 1, "opened ${a.connectCount()} connections")
+    p.close()
+    return
+  }
+  assert(false, "a second statement ran while the Rows was open (${blocked})")
+  p.close()
+}
+
+test "a closed pool refuses new work and closes its idle connections" {
+  let a = newStub()
+  let p = pool(a, Datasource{ host: "stub", maxOpen: 2 }) catch e {
+    assert(false, "pool: ${e.message()}")
+    return
+  }
+  let n = p.exec("select 1", []Value(0)) catch e {
+    assert(false, "exec: ${e.message()}")
+    return
+  }
+  assert(n == 1, "exec returned ${n}")
+  p.close()
+  assert(a.closeCount() == 1, "closed ${a.closeCount()} connections")
+  let after = p.exec("select 2", []Value(0)) catch e {
+    assert(contains(e.message(), "closed"), "message after close: ${e.message()}")
+    return
+  }
+  assert(false, "a closed pool ran a statement (${after})")
+}

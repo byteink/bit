@@ -1,0 +1,489 @@
+// Bit standard library — sql module: the connection pool.
+//
+// Without this there are two ways to run a server, and both are wrong. Open
+// a connection per request and every request pays a TCP handshake plus
+// authentication, and a burst exhausts the database's own connection limit.
+// Share one connection between requests and the application serialises on it
+// — and, worse, a transaction started by one request is visible to every
+// other request using that connection.
+//
+// `pool` is the third way: a bounded set of physical connections, handed out
+// one at a time, returned when the caller is done, and closed when they are
+// too old or have gone bad.
+//
+// THE FOUR RULES THIS FILE EXISTS TO KEEP:
+//
+//   1. A transaction pins its connection for its whole life. `borrowedTx`
+//      holds the driver's own `Tx`, made on one `slot`, and has no way to
+//      reach another — the rule is the object graph, not a check.
+//   2. A connection handed back with an open transaction is CLOSED, never
+//      reused: whatever that transaction was holding must not become the
+//      next caller's problem.
+//   3. A connection a driver reported a transport failure on (`FatalError`,
+//      ./config.bit) is discarded rather than handed out again.
+//   4. Waiters are served strictly first-in. LIFO would starve a request
+//      under sustained load, and "queue behind whoever is already queued"
+//      (see `claimLocked`) is what stops a newly-arrived caller from taking
+//      a connection out from under a parked one.
+//
+// WHY IDENTITY IS AN EXPLICIT `id`. Two class values with equal fields
+// compare equal in Bit (SPEC §14.6) — `==` is not reference identity — so a
+// waiter is found in the queue by its `id`, never by comparing the objects.
+//
+// ./sql.bit's `pooledConn` is a different, smaller thing with a similar
+// name: it serialises concurrent callers onto ONE physical connection so a
+// driver's socket never sees two calls at once. It pools nothing. This file
+// is the pool.
+
+import { Mono, monotonic, since, after, Millisecond } from "std/time"
+
+// One physical connection plus the bookkeeping the pool keeps about it.
+// Every field but `inner` exists to answer "may this be handed out again?".
+class slot {
+  inner: Conn
+  // Unique and stable for the life of the connection. Tests and error
+  // messages use it to talk about "the same connection".
+  id: i64
+  // When the connection was opened — `maxLifetime` is measured from here.
+  born: Mono
+  // When it was last parked in the idle list — `maxIdleTime` from here.
+  idleAt: Mono
+  // A transaction is open on it. Rule 2: such a connection is closed, not
+  // reused, when it comes back.
+  txOpen: bool = false
+  // A driver reported a transport failure on it. Rule 3.
+  broken: bool = false
+}
+
+// A caller parked waiting for a connection. `ch` has capacity 1 and exactly
+// one sender — whoever removes this waiter from the queue, while holding the
+// pool's mutex — so granting never blocks the pool.
+class waiter {
+  id: i64
+  ch: chan<Claim>
+}
+
+// What an attempt to get a connection resolved to.
+//
+//   Conn   here is one, checked out to you
+//   Dial   no connection, but the reservation in `numOpen` is yours: open one
+//   Wait   neither; you are in the queue, park on this waiter
+//   Closed the pool is closed
+//
+// `Dial` is a reservation rather than a connection because opening one talks
+// to the network, which must not happen under the pool's mutex. Passing the
+// reservation to the head waiter — instead of decrementing `numOpen` and
+// letting it race for the slot — is what keeps the queue first-in.
+enum Claim { Conn(slot), Dial, Wait(waiter), Closed }
+
+// A bounded set of connections to one database, safe to share across green
+// threads. Built by `pool`.
+export class Pool {
+  adapter: Adapter
+  cfg: Datasource
+  mu: Mutex
+  // Connections parked and ready. Guarded by `mu`.
+  idle: []slot
+  // Callers parked, longest-waiting first. Guarded by `mu`.
+  waiters: []waiter
+  // Connections taken out of service, waiting to be closed by `reap` with
+  // the mutex NOT held. Guarded by `mu`.
+  dead: []slot
+  // Physical connections in existence: checked out, idle, or reserved by a
+  // caller that holds a `Dial` claim. Guarded by `mu`.
+  numOpen: i64
+  // The id source for both slots and waiters. Guarded by `mu`.
+  seq: i64
+  closed: bool
+
+  // Runs `sqlText` and returns its rows. THE CONNECTION STAYS CHECKED OUT
+  // UNTIL THE RETURNED `Rows` IS CLOSED — a cursor lives on the connection
+  // that produced it, so a caller that never closes its `Rows` leaks a
+  // connection exactly as one that never closes a file leaks a descriptor.
+  export query(sqlText: string, params: []Value): Rows! {
+    let s = this.acquire()?
+    let rows = s.inner.query(sqlText, params) catch e {
+      this.failed(s, e)
+      fail e
+    }
+    return borrowedRows{ p: this, s: s, inner: rows }
+  }
+
+  // Runs `sqlText` for its effect and returns the number of rows it changed.
+  // The connection is back in the pool before this returns.
+  export exec(sqlText: string, params: []Value): int! {
+    let s = this.acquire()?
+    let n = s.inner.exec(sqlText, params) catch e {
+      this.failed(s, e)
+      fail e
+    }
+    this.release(s)
+    return n
+  }
+
+  // Starts a transaction on one connection and keeps that connection until
+  // `commit` or `rollback` ends it. Every statement issued through the
+  // returned `Tx` runs on that one connection (rule 1).
+  export begin(): Tx! {
+    let s = this.acquire()?
+    let tx = s.inner.begin() catch e {
+      this.failed(s, e)
+      fail e
+    }
+    s.txOpen = true
+    return borrowedTx{ p: this, s: s, inner: tx }
+  }
+
+  // Closes every idle connection and fails every parked caller. Connections
+  // still checked out are closed as they are returned. Idempotent.
+  export close() {
+    this.mu.lock()
+    this.closed = true
+    let gone = this.idle
+    this.idle = []slot(0)
+    this.numOpen = this.numOpen - len(gone)
+    let parked = this.waiters
+    this.waiters = []waiter(0)
+    this.mu.unlock()
+    for w of parked {
+      w.ch <- Claim.Closed
+    }
+    for s of gone {
+      s.inner.close()
+    }
+    this.reap()
+  }
+
+  // Checks a connection out, opening one or waiting for one as the
+  // configuration allows. Fails after `acquireTimeout` milliseconds rather
+  // than parking the caller forever.
+  acquire(): slot! {
+    let deadline = monotonic().ns + this.cfg.acquireTimeout * Millisecond
+    this.mu.lock()
+    let first = this.claimLocked()
+    this.mu.unlock()
+    let c = first
+    match (first) {
+      Wait(w) => c = this.park(w, deadline)?
+      _ => c = first
+    }
+    match (c) {
+      Conn(s) => return s
+      Dial => return this.dial()?
+      Closed => fail newError("sql: pool: the pool is closed")
+      Wait(_) => fail newError("sql: pool: park returned a second Wait")
+    }
+  }
+
+  // Decides what the caller gets, with `mu` held. A caller that arrives
+  // while anyone is queued joins the queue instead of taking an idle
+  // connection: barging would let a busy process starve a parked one and
+  // makes rule 4 unenforceable.
+  claimLocked(): Claim {
+    if (this.closed) {
+      return Claim.Closed
+    }
+    if (len(this.waiters) > 0) {
+      return Claim.Wait(this.enqueueLocked())
+    }
+    while (len(this.idle) > 0) {
+      let s = this.popIdleLocked()
+      if (usable(s, this.cfg)) {
+        return Claim.Conn(s)
+      }
+      this.retireLocked(s)
+    }
+    if (this.numOpen < this.cfg.maxOpen) {
+      this.numOpen = this.numOpen + 1
+      return Claim.Dial
+    }
+    return Claim.Wait(this.enqueueLocked())
+  }
+
+  // Parks until the queue grants something or the deadline passes. Returns
+  // `Conn`, `Dial` or `Closed` — never `Wait`.
+  park(w: waiter, deadline: i64): Claim! {
+    let remaining = deadline - monotonic().ns
+    if (remaining < 0) {
+      remaining = 0
+    }
+    select {
+      case c = <- w.ch: return c
+      case <- after(remaining): return this.timedOut(w)?
+    }
+  }
+
+  // The deadline passed. Either this waiter is still queued, and the acquire
+  // fails, or a grant beat the timer — in which case the value is already in
+  // the channel (sent under `mu`, into a capacity-1 channel, by the one
+  // sender that removed this waiter) and taking it cannot block.
+  timedOut(w: waiter): Claim! {
+    this.mu.lock()
+    let stillQueued = this.dropWaiterLocked(w)
+    this.mu.unlock()
+    if (!stillQueued) {
+      let c = <- w.ch
+      return c
+    }
+    fail newError("sql: pool: no connection available after " +
+      "${this.cfg.acquireTimeout}ms (maxOpen ${this.cfg.maxOpen})")
+  }
+
+  // Opens one physical connection. The caller holds a reservation in
+  // `numOpen`; on failure that reservation goes to the next waiter rather
+  // than being lost, so a database that is refusing connections does not
+  // shrink the pool one failed caller at a time.
+  dial(): slot! {
+    this.mu.lock()
+    this.seq = this.seq + 1
+    let id = this.seq
+    let shut = this.closed
+    if (shut) {
+      this.dropReservationLocked()
+    }
+    this.mu.unlock()
+    if (shut) {
+      fail newError("sql: pool: the pool is closed")
+    }
+    let inner = this.adapter.connect(this.cfg) catch e {
+      this.mu.lock()
+      this.dropReservationLocked()
+      this.mu.unlock()
+      fail e
+    }
+    let t = monotonic()
+    return slot{ inner: inner, id: id, born: t, idleAt: t }
+  }
+
+  // Hands `s` back. Rules 2 and 3 are enforced here, together with
+  // `maxLifetime`, `maxIdle` and the closed check: any of them means the
+  // connection is retired instead of reused.
+  release(s: slot) {
+    this.mu.lock()
+    if (s.txOpen || s.broken || this.closed || !usable(s, this.cfg)) {
+      this.retireLocked(s)
+    } else {
+      this.parkLocked(s)
+    }
+    this.mu.unlock()
+    this.reap()
+  }
+
+  // A healthy connection: to the longest-waiting caller if there is one,
+  // else onto the idle list, else — the list being full — retired.
+  parkLocked(s: slot) {
+    if (len(this.waiters) > 0) {
+      this.grantLocked(Claim.Conn(s))
+      return
+    }
+    if (len(this.idle) >= this.cfg.maxIdle) {
+      this.retireLocked(s)
+      return
+    }
+    s.idleAt = monotonic()
+    this.idle = append(this.idle, s)
+  }
+
+  // Takes `s` out of service: queued for closing outside the mutex, and its
+  // place in `numOpen` passed on.
+  retireLocked(s: slot) {
+    this.dead = append(this.dead, s)
+    this.dropReservationLocked()
+  }
+
+  // Gives up one place in `numOpen`, handing it to the head waiter when
+  // there is one so the queue keeps its order.
+  dropReservationLocked() {
+    if (len(this.waiters) > 0) {
+      this.grantLocked(Claim.Dial)
+      return
+    }
+    this.numOpen = this.numOpen - 1
+  }
+
+  // Grants `c` to the longest-waiting caller and removes it from the queue.
+  // The caller must have checked that the queue is not empty.
+  grantLocked(c: Claim) {
+    let w = this.waiters[0]
+    this.waiters = this.waiters[1:]
+    w.ch <- c
+  }
+
+  // Adds a waiter at the back of the queue and returns it.
+  enqueueLocked(): waiter {
+    this.seq = this.seq + 1
+    let w = waiter{ id: this.seq, ch: chan<Claim>(1) }
+    this.waiters = append(this.waiters, w)
+    return w
+  }
+
+  // Removes `w` from the queue. False means a grant already removed it.
+  dropWaiterLocked(w: waiter): bool {
+    let kept = []waiter(0)
+    let found = false
+    for q of this.waiters {
+      if (q.id == w.id) {
+        found = true
+      } else {
+        kept = append(kept, q)
+      }
+    }
+    this.waiters = kept
+    return found
+  }
+
+  // The most recently parked connection first: a hot connection stays hot
+  // and a surplus one ages out under `maxIdleTime` instead of being kept
+  // alive by round-robin use. This is the IDLE list — the WAITER queue is
+  // strictly first-in, which is a different question (rule 4). The caller
+  // must have checked that the list is not empty.
+  popIdleLocked(): slot {
+    let s = this.idle[len(this.idle) - 1]
+    this.idle = this.idle[0:len(this.idle) - 1]
+    return s
+  }
+
+  // Closes everything retired since the last call, with `mu` NOT held: a
+  // driver's `close` writes to a socket and may block, and no acquirer
+  // should wait behind that.
+  reap() {
+    this.mu.lock()
+    let gone = this.dead
+    this.dead = []slot(0)
+    this.mu.unlock()
+    for s of gone {
+      s.inner.close()
+    }
+  }
+
+  // A statement failed: record whether it killed the connection, then hand
+  // the connection back.
+  failed(s: slot, e: error) {
+    this.mark(s, e)
+    this.release(s)
+  }
+
+  // Rule 3, in one place: only a failure the driver marked `FatalError`
+  // takes the connection out of service. A constraint violation or a syntax
+  // error leaves it perfectly usable.
+  mark(s: slot, e: error) {
+    let (fe, isFatal) = e.(FatalError)
+    if (isFatal && fe.transportFatal()) {
+      s.broken = true
+    }
+  }
+}
+
+// Whether `s` may still be handed out, by age alone.
+fn usable(s: slot, cfg: Datasource): bool {
+  if (expired(s.born, cfg.maxLifetime)) {
+    return false
+  }
+  return !expired(s.idleAt, cfg.maxIdleTime)
+}
+
+// True once `limitMs` milliseconds have passed since `start`. A limit of 0
+// or less is no limit, so nothing expires under it.
+fn expired(start: Mono, limitMs: i64): bool {
+  if (limitMs <= 0) {
+    return false
+  }
+  return since(start) > limitMs * Millisecond
+}
+
+// A pool of connections to the database `cfg` names, opened through `a`.
+// Nothing is connected here: `cfg` is checked (`Datasource.validate`) and
+// connections are opened on demand, up to `cfg.maxOpen`. Fails only on a
+// configuration that cannot describe a pool — an unset `DATABASE_URL`
+// surfaces here, not as a DNS error later.
+export fn pool(a: Adapter, cfg: Datasource): Pool! {
+  cfg.validate()?
+  return Pool{
+    adapter: a, cfg: cfg, mu: newMutex(),
+    idle: []slot(0), waiters: []waiter(0), dead: []slot(0),
+    numOpen: 0, seq: 0, closed: false,
+  }
+}
+
+// The `Rows` a pooled `query` returns: the driver's own cursor, plus the
+// connection it is reading from. `close` is what returns that connection to
+// the pool, and it is safe to call twice — returning one connection twice
+// would corrupt the pool's accounting, which is what `done` prevents.
+class borrowedRows {
+  p: Pool
+  s: slot
+  inner: Rows
+  done: bool = false
+  next(): bool! {
+    let more = this.inner.next() catch e {
+      this.p.mark(this.s, e)
+      fail e
+    }
+    return more
+  }
+
+  columns(): []string {
+    return this.inner.columns()
+  }
+
+  value(col: int): Value {
+    return this.inner.value(col)
+  }
+
+  close() {
+    if (this.done) {
+      return
+    }
+    this.done = true
+    this.inner.close()
+    this.p.release(this.s)
+  }
+}
+
+// The `Tx` a pooled `begin` returns. Rule 1 holds structurally: `inner` was
+// made by `s.inner.begin()`, and nothing in this class can reach another
+// connection, so every statement lands on the one connection the
+// transaction started on. `commit`/`rollback` clear `slot.txOpen` and return
+// the connection; a commit that FAILS leaves `txOpen` set, so the connection
+// is closed rather than reused (rule 2) — the pool cannot know what the
+// server did with a transaction whose commit did not answer.
+class borrowedTx {
+  p: Pool
+  s: slot
+  inner: Tx
+  query(sqlText: string, params: []Value): Rows! {
+    let rows = this.inner.query(sqlText, params) catch e {
+      this.p.mark(this.s, e)
+      fail e
+    }
+    return rows
+  }
+
+  exec(sqlText: string, params: []Value): int! {
+    let n = this.inner.exec(sqlText, params) catch e {
+      this.p.mark(this.s, e)
+      fail e
+    }
+    return n
+  }
+
+  commit(): ()! {
+    this.inner.commit() catch e {
+      this.p.mark(this.s, e)
+      this.p.release(this.s)
+      fail e
+    }
+    this.s.txOpen = false
+    this.p.release(this.s)
+  }
+
+  rollback(): ()! {
+    this.inner.rollback() catch e {
+      this.p.mark(this.s, e)
+      this.p.release(this.s)
+      fail e
+    }
+    this.s.txOpen = false
+    this.p.release(this.s)
+  }
+}
