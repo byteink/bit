@@ -13,11 +13,19 @@
 // source, the safepoint wiring and the dispatch wiring can each be reviewed
 // and landed against a state module that is already fixed.
 //
-// NO OS CALLS HERE. `sysmonTick` takes `nowNs` as a parameter rather than
-// reading a clock itself, so this file makes no kernel trap and declares
-// nothing foreign.
+// NO OS CALLS HERE, AND SINCE #4736 NO CLOCK AT ALL. The budget is counted in
+// SYSMON TICKS rather than nanoseconds: `sysmonTick` bumps this file's own
+// `sysmonEpoch` counter once per call, and every stamp records that counter's
+// value, so neither the dispatch path nor the monitor thread reads a clock to
+// keep preemption working. #2578 stamped `monoNs()` at every dispatch, which
+// on Linux is a raw `clock_gettime` trap (`../park/linux/wait.bit`, no vDSO)
+// and cost +147 ns on every context switch -- 285 -> 423 ns/switch on the
+// arm64-linux `test-schedbench` gate (#4736). A single atomic load of a word
+// this file owns replaces it. `sysmonTick` still takes no clock reading as a
+// parameter either, so this file makes no kernel trap and declares nothing
+// foreign.
 //
-// Base-pointer arithmetic and deref rather than `startNs[worker]`: indexing
+// Base-pointer arithmetic and deref rather than `startTick[worker]`: indexing
 // is forbidden in a `@nosplit` body (E0075 -- see `queue.bit`'s comment on
 // the same trade), and every function here is `@nosplit` so a `@nosplit`
 // safepoint check can call `maybePreempt` directly once #2577 wires it in --
@@ -27,8 +35,29 @@
 // preempt request the next time `sysmonTick` runs. 10ms.
 export const preemptBudgetNs: i64 = 10000000
 
+// The monitor thread's sleep between two `sysmonTick` calls, and therefore the
+// unit the budget above is actually enforced in. BOTH monitor threads
+// (`../root/linux/sysmon.bit`, `../root/darwin/boot.bit`) import this constant
+// and sleep exactly this long, rather than each repeating the literal they
+// used to: `preemptBudgetTicks` below is only meaningful if the period the
+// ticks really arrive at is the period it was derived from.
+export const sysmonPeriodNs: i64 = 2000000
+
+// `preemptBudgetNs` expressed in sysmon ticks -- the over-budget test's actual
+// threshold -- with one tick added for the granularity of the tick itself.
+// A worker stamped while the epoch reads `e` is first seen at age `k` by the
+// tick that raises the epoch to `e + k`, and that FIRST tick can land
+// arbitrarily soon after the dispatch, so `k` ticks prove only
+// `(k - 1) * sysmonPeriodNs` of elapsed real time. Requiring
+// `preemptBudgetNs / sysmonPeriodNs + 1` is what preserves the promise
+// #2578's `nowNs - started > preemptBudgetNs` made: a worker is never flagged
+// before it has genuinely held its task for `preemptBudgetNs`. 6 ticks at
+// 2ms = flagged between 10ms and 12ms after dispatch, the same window the
+// nanosecond comparison produced.
+export const preemptBudgetTicks: i64 = preemptBudgetNs / sysmonPeriodNs + 1
+
 // This file's own array capacity -- the number this file actually trusts for
-// its own scan bound. MUST equal the literal length of `startNs`/`requested`
+// its own scan bound. MUST equal the literal length of `startTick`/`requested`
 // below, and cannot instead size those arrays directly (`let a: [N]i64`
 // requires `N` to be a literal, not a name -- E0021, the same constraint
 // `runtime/root/root.bit`'s `gcState`/`heapBlock` document for `gcWords` and
@@ -50,13 +79,29 @@ export const preemptBudgetNs: i64 = 10000000
 // real size is the actual hazard, and this is what closes it.
 const preemptSlots: int = 32
 
-// `startNs[w]` is the `nowNs` value `preemptStamp` last recorded for worker
-// `w`, or 0 if `w` has no task in flight -- either it was never stamped, or a
-// later stamp cleared it. `requested[w]` is nonzero once `sysmonTick` has
-// observed `w` over budget, and stays set until `maybePreempt` clears it.
-// Fixed globals; nothing here is allocated at run time.
-let startNs: [32]i64
+// `startTick[w]` is the sysmon-tick epoch (`preemptTickNow`) `preemptStamp`
+// last recorded for worker `w`, or 0 if `w` has no task in flight -- either it
+// was never stamped, or a later clear zeroed it. `preemptTickNow` never
+// returns 0, so 0 keeps that meaning unambiguously even for a worker
+// dispatched before the monitor thread's very first tick. `requested[w]` is
+// nonzero once `sysmonTick` has observed `w` over budget, and stays set until
+// `maybePreempt` clears it. Fixed globals; nothing here is allocated at run
+// time.
+let startTick: [32]i64
 let requested: [32]i64
+
+// The tick epoch: how many `sysmonTick` calls have completed their increment.
+// This is the ONLY clock preemption has (#4736). `sysmonTick` is its only
+// writer and there is exactly one monitor thread per process, so the
+// load-add-store below needs no CAS -- and even a lost update (a second caller
+// driving `sysmonTick` by hand, which `_tests_/bit/pollguardpreempt.bit` does)
+// can only leave the counter LOWER, i.e. make every age look smaller, which
+// delays a preempt request by a tick and can never publish one early.
+//
+// A `[1]i64` rather than a bare `let epoch: i64` for the reason every other
+// global here is an array: `ptrOf` is how a `@nosplit` body addresses module
+// state without indexing (E0075).
+let sysmonEpoch: [1]i64
 
 // #3746: the SUMMARY of `requested` -- nonzero while any slot may be set, 0
 // only when a scan has just observed every slot clear. It exists so the
@@ -125,6 +170,22 @@ let anyRequested: [1]i64
   return base + worker
 }
 
+// The value a dispatch stamps, and the value `sysmonTick` measures ages
+// against: one past the number of completed ticks, so it is >= 1 always and 0
+// keeps its meaning of "no task in flight" (`startTick`'s own comment).
+//
+// BOTH SIDES OF THE OVER-BUDGET SUBTRACTION GO THROUGH THIS ONE FUNCTION, and
+// that is what makes the subtraction meaningful. The hazard both monitor
+// threads' headers warn about -- a stamp taken on one clock compared against a
+// reading of another, silently subtracting two unrelated epochs -- cannot be
+// expressed once there is exactly one epoch and exactly one accessor for it.
+//
+// One atomic load and an add. That is the entire cost that replaced the
+// `clock_gettime` trap #2578 put on every task dispatch (#4736).
+export @nosplit fn preemptTickNow(): i64 {
+  return atomicLoad(slotAddr(ptrOf(sysmonEpoch), 0)) + 1
+}
+
 // Recompute `anyRequested` after a clear. Writes 0 FIRST, then re-scans -- see
 // `anyRequested`'s own header for why that order and not the obvious
 // scan-then-store-if-empty, which loses a request to a setter that lands
@@ -163,12 +224,17 @@ export @nosplit @symbol("bit_rt_port_sched_preempt_any_addr") fn preemptAnyAddr(
   return int(ptrOf(anyRequested))
 }
 
-// Record that `worker` just picked up a new task at `nowNs`, and drop any
-// preempt request left over from whatever ran on `worker` before it -- a
-// freshly dispatched task must not inherit a stale flag from its
-// predecessor.
-export @nosplit fn preemptStamp(worker: i64, nowNs: i64) {
-  atomicStore(slotAddr(ptrOf(startNs), worker), nowNs)
+// Record that `worker` just picked up a new task at sysmon tick `startedTick`
+// (`preemptTickNow`), and drop any preempt request left over from whatever ran
+// on `worker` before it -- a freshly dispatched task must not inherit a stale
+// flag from its predecessor.
+//
+// The tick is still a PARAMETER, not read here, for the reason this file's
+// header gives: keeping the reading out of the state module is what lets
+// `_tests_/bit/pollguardpreempt.bit` backdate one worker deterministically
+// instead of waiting out a real budget.
+export @nosplit fn preemptStamp(worker: i64, startedTick: i64) {
+  atomicStore(slotAddr(ptrOf(startTick), worker), startedTick)
   // The clear stays UNCONDITIONAL -- reading first and skipping the store when
   // the slot is already 0 would let a request `sysmonTick` sets between the
   // read and the store survive into the freshly dispatched task, which is the
@@ -190,7 +256,7 @@ export @nosplit fn preemptStamp(worker: i64, nowNs: i64) {
 // `worker.bit:23`, "0 between tasks", which names exactly the transition
 // this call marks), whether the task parked, finished, or is merely being
 // requeued for a later turn. Mirrors `preemptStamp`'s unconditional clear of
-// `requested` for the identical reason: `startNs` going back to 0 is the
+// `requested` for the identical reason: `startTick` going back to 0 is the
 // value `sysmonTick`'s own comment below already promises means "no task is
 // currently dispatched on that worker", and before this call existed
 // NOTHING made that true for a worker that goes idle, parks a task, or
@@ -208,7 +274,7 @@ export @nosplit fn preemptStamp(worker: i64, nowNs: i64) {
 // very next `preemptStamp` call; a momentary 0 in between is exactly true
 // for that instant.
 export @nosplit fn preemptClear(worker: i64) {
-  atomicStore(slotAddr(ptrOf(startNs), worker), 0)
+  atomicStore(slotAddr(ptrOf(startTick), worker), 0)
   let had = atomicLoad(slotAddr(ptrOf(requested), worker))
   atomicStore(slotAddr(ptrOf(requested), worker), 0)
   if (had != 0) {
@@ -216,18 +282,21 @@ export @nosplit fn preemptClear(worker: i64) {
   }
 }
 
-// Scan every worker slot and flag any that has held its task past
-// `preemptBudgetNs`. Bounded by `schedMaxWorkers` AND `preemptSlots` --
+// Advance the tick epoch by one, then scan every worker slot and flag any that
+// has held its task for `preemptBudgetTicks` ticks or more (#4736: the epoch
+// IS the clock -- this function takes no time reading and makes no OS call, so
+// the monitor thread's whole tick is a load, a store and this scan).
+// Bounded by `schedMaxWorkers` AND `preemptSlots` --
 // `preemptSlots` is the one that actually matters for safety here: it is
 // this file's own array capacity, so the scan can never run past
-// `startNs`/`requested` even if `schedMaxWorkers` (advisory only from this
+// `startTick`/`requested` even if `schedMaxWorkers` (advisory only from this
 // file's point of view; see `preemptSlots`'s comment) drifts ahead of it.
 // Both are compile-time constants, so the loop's limit is provable from its
 // own body (Power of 10) regardless of either changing independently.
 //
-// A slot at 0 is skipped rather than read as "started at time zero" --
-// `preemptStamp` is the only writer of a nonzero value, so 0 means no task
-// is currently dispatched on that worker.
+// A slot at 0 is skipped rather than read as "dispatched at tick zero" --
+// `preemptStamp` is the only writer of a nonzero value (and `preemptTickNow`
+// never yields 0), so 0 means no task is currently dispatched on that worker.
 //
 // Returns the number of workers that met the over-budget condition this
 // call, whether or not their flag was already set from an earlier tick.
@@ -241,14 +310,20 @@ export @nosplit fn preemptClear(worker: i64) {
 // across that boundary before #2579/#2580, so nothing forced this pin until
 // now; the name matches the `bit_rt_port_sched_*` convention those siblings
 // use. Purely an ABI/linkage annotation — no change to the logic below.
-export @nosplit @symbol("bit_rt_port_sched_sysmon_tick") fn sysmonTick(nowNs: i64): i64 {
+export @nosplit @symbol("bit_rt_port_sched_sysmon_tick") fn sysmonTick(): i64 {
+  // The epoch advance. Load-add-store rather than a CAS: see `sysmonEpoch`'s
+  // own comment for why a lost update here is a delayed preempt request and
+  // never an early one.
+  let epoch = slotAddr(ptrOf(sysmonEpoch), 0)
+  atomicStore(epoch, atomicLoad(epoch) + 1)
+  let now = preemptTickNow()
   let count: i64 = 0
   let w: i64 = 0
   while (w < schedMaxWorkers && w < preemptSlots) {
-    let started = atomicLoad(slotAddr(ptrOf(startNs), w))
+    let started = atomicLoad(slotAddr(ptrOf(startTick), w))
     if (started != 0 &&
-      nowNs - started > preemptBudgetNs &&
-      atomicLoad(slotAddr(ptrOf(startNs), w)) == started) {
+      now - started >= preemptBudgetTicks &&
+      atomicLoad(slotAddr(ptrOf(startTick), w)) == started) {
       // Re-validated against a second load, immediately before publishing:
       // `preemptClear` can run on `w`'s own thread between the first load
       // above and here, if the task that was over budget finishes or parks

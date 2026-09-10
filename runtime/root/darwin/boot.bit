@@ -109,7 +109,7 @@ import {
   schedFindWork,
   wkId, wkSleepReq,
   wkLastDone, taskStackBase, taskStackBytes,
-  sysmonTick,
+  sysmonTick, sysmonPeriodNs,
   schedGrowArm, schedGrowCommit, schedFinalWorkerCount,
 } from "../../sched"
 // The netpoller provider (#1673). `runtime/sched` may not import it — kqueue
@@ -148,10 +148,6 @@ import { stwSpanChunks, stwSpanChunkBytes } from "../../stw"
 import { stwIdxChunks, stwIdxChunkBytes } from "../../stw"
 import { stwIdxOk } from "../../stw"
 import { stwLiveBytes, stwMappedBytes, stwPeakMappedBytes, stwAllocBytes } from "../../stw"
-
-// `parkMonoNs` (../../park/darwin) is already imported by sibling ./time.bit;
-// siblings share one module scope, so it is used here directly — re-importing it
-// is E0042.
 
 // The per-program entry the compiled user object defines (ABI.md §10). Reachable
 // as an `extern function` since #1614 whitelisted `bit_main`; it resolves to
@@ -310,8 +306,9 @@ export @nosplit @symbol("bit_rt_remap_pages") fn rtRemapPages(addr: int, nbytes:
 // sysmon — the preemption monitor thread (#2579, #1768's remaining half)
 // ---------------------------------------------------------------------------
 //
-// An independent OS thread that drives `../../sched`'s `sysmonTick` off the
-// wall clock, so a green thread that never reaches a safepoint still gets
+// An independent OS thread that drives `../../sched`'s `sysmonTick` off a
+// fixed-period sleep (`sysmonPeriodNs`, #4736 — it used to pass that thread's
+// own clock reading in), so a green thread that never reaches a safepoint gets
 // flagged as over budget (`preempt.bit`'s own header names #2577/#2578 as the
 // two callers that act on the flag this sets; this ticket adds the producer).
 // Started once, in `boot()` step 6b, next to the worker bring-up above it.
@@ -326,9 +323,8 @@ export @nosplit @symbol("bit_rt_remap_pages") fn rtRemapPages(addr: int, nbytes:
 // be visible to a rendezvous for as long as it can touch the heap, where
 // sysmon never touches the heap at all, on any path, ever. So:
 //
-//   - `@nosplit`, END TO END, including every callee (`sysmonTick`, sibling
-//     ./time.bit's `parkMonoNs` import, the bare `nanosleep` extern `os.bit`
-//     already declares). Codegen emits `bl bit_rt_safepoint` ONLY at a loop's
+//   - `@nosplit`, END TO END, including every callee (`sysmonTick` and the
+//     bare `nanosleep` extern `os.bit` already declares). Codegen emits `bl bit_rt_safepoint` ONLY at a loop's
 //     back edge, and `@nosplit` is what suppresses exactly that call — so
 //     this loop never reaches a safepoint and never registers itself.
 //   - **THE SLOT IS NOW CLAIMED FOR IT ANYWAY, AND THE ANSWER IS `blocked`
@@ -347,7 +343,7 @@ export @nosplit @symbol("bit_rt_remap_pages") fn rtRemapPages(addr: int, nbytes:
 //   - The STW rendezvous is therefore neither weakened nor bypassed: sysmon
 //     is simply never a party to it, the same way a thread this runtime never
 //     started would be. `sysmonTick` itself touches only its own `@nosplit`
-//     atomic words (`preemptStamp`'s `startNs`/`requested`, per that file's
+//     atomic words (`preemptStamp`'s `startTick`/`requested`, per that file's
 //     own header — "NO OS CALLS HERE"), never the GC heap, so there is no
 //     live reference this thread could ever hold across the sleep for a
 //     bracket to protect in the first place.
@@ -356,17 +352,23 @@ export @nosplit @symbol("bit_rt_remap_pages") fn rtRemapPages(addr: int, nbytes:
 // already declares and `./fs.bit` already defines — sibling files, one
 // module, no import (see ./bootworker.bit's header for the same rule). Not
 // `osPollSleep` itself: it brackets with `gcSyscallBegin`, which registers.
-// THE CLOCK MUST BE `parkMonoNs`, NOT `./os.bit`'s `osMonoNs` — found by the
-// #2582 oracle going from "peer starved, rounds=1" to "rounds=2" under
-// `BIT_GC=stress` (which forces every poll live) rather than to "ok", which
-// pointed straight at the comparison itself. `../../sched`'s `preemptStamp`
-// (called at every dispatch, `workerrun.bit`) stamps with `monoNs()`, which
-// PINS `parkMonoNs` (mach_absolute_time, scaled) — see ./time.bit's own
-// `rtTimeMonoNs`. `osMonoNs` is a DIFFERENT clock (`clock_gettime`
-// `CLOCK_MONOTONIC`); `sysmonTick`'s `nowNs - started > preemptBudgetNs`
-// silently compares two unrelated epochs if the two sides disagree on which
-// one they read. `parkMonoNs` is already imported by sibling ./time.bit (see
-// the module-state comment above), so no new import is needed here either.
+// THERE IS NO CLOCK IN THIS LOOP ANY MORE (#4736). This header used to argue
+// that the reading handed to `sysmonTick` had to be `parkMonoNs`
+// (mach_absolute_time, scaled) and never `./os.bit`'s `osMonoNs`
+// (`clock_gettime CLOCK_MONOTONIC`), because `../../sched`'s `preemptStamp`
+// stamped `monoNs()` at every dispatch and two disagreeing clocks silently
+// subtract two unrelated epochs — found by the #2582 oracle going from "peer
+// starved, rounds=1" to "rounds=2" under `BIT_GC=stress` (which forces every
+// poll live) rather than to "ok", pointing straight at the comparison itself.
+// That whole class is gone: preemption is counted in SYSMON TICKS,
+// `sysmonTick` bumps its own epoch and takes no argument, and the dispatch
+// path stamps that epoch — one counter, one accessor, no clock on either side.
+//
+// WHAT REPLACES IT AS THIS LOOP'S OBLIGATION: the SLEEP below is now the only
+// thing tying ticks to real time, so it must be exactly `sysmonPeriodNs`.
+// `../../sched`'s `preemptBudgetTicks` is derived from that constant, so a
+// period that drifts from it silently rescales the 10ms budget — which is why
+// it is imported rather than repeated as a literal.
 @nosplit fn sysmonRun(arg: *byte): *byte {
   // PERMANENTLY `blocked`, NOT UNREGISTERED (#4060). The provider now claims
   // this thread's mutator slot at its entry (`../../thread/<os>`'s child entry
@@ -402,9 +404,9 @@ export @nosplit @symbol("bit_rt_remap_pages") fn rtRemapPages(addr: int, nbytes:
   let n = 0
   while (n < WORKER_MAX_STEPS) {
     storeWord(req, 0)
-    storeWord(req + 8, 2000000) // 2ms: sysmonTick's 10ms budget / 5
+    storeWord(req + 8, int(sysmonPeriodNs)) // 2ms; preemptBudgetTicks is derived from it
     nanosleep(u8At(req), u8At(0))
-    let _ = sysmonTick(i64(parkMonoNs()))
+    let _ = sysmonTick()
     n = n + 1
   }
   return nil
