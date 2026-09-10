@@ -1,0 +1,209 @@
+// Bit standard library — smtp module: the message a client sends (#3967).
+//
+// A `Message` is built, then rendered once by `render()`. Nothing is validated
+// at the setters and everything is validated at `render()`, on purpose: a
+// caller that assembles a message from several places gets ONE failure point
+// with the whole message in view, and `Client.send` calls `render()` before it
+// opens the envelope, so a rejected value costs zero transmitted bytes.
+//
+// Body structure follows what the message actually carries, with no empty
+// wrappers:
+//
+//   text only                      text/plain
+//   text + html                    multipart/alternative
+//   text (+ html) + attachments    multipart/mixed [ alternative | text ] ...
+//
+// Every part's transfer encoding is chosen by `partEncoding` (mime.bit) from
+// its own bytes, so a 1200-octet line or a non-ASCII byte turns that part into
+// base64 rather than putting an illegal line on the wire.
+
+// A mailbox: an optional display name and the addr-spec the envelope uses.
+// `email` is what `MAIL FROM`/`RCPT TO` carry and is validated by
+// `checkAddress`; `name` is a header value and is rejected for CR/LF like any
+// other.
+export class Address {
+  export name: string,
+  export email: string,
+}
+
+// A file to attach. `data` is the raw bytes — never text that has already been
+// encoded; this module owns the base64. `contentType` defaults to
+// `application/octet-stream` when empty.
+export class Attachment {
+  export filename: string,
+  export contentType: string,
+  export data: []byte,
+}
+
+// An attachment of `data` named `filename`, typed `contentType` (empty means
+// `application/octet-stream`).
+export fn newAttachment(filename: string, contentType: string, data: []byte): Attachment {
+  return Attachment{ filename: filename, contentType: contentType, data: data }
+}
+
+// One outgoing mail. Build it with `newMessage` and the setters below; nothing
+// here reaches the network until `Client.send`.
+export class Message {
+  sender: Address
+  to: []Address
+  cc: []Address
+  subject: string
+  text: string
+  html: string
+  files: []Attachment
+  boundary: string
+
+  // Add a `To:` recipient. Also an envelope recipient: this module has no
+  // concept of a header recipient that is not delivered to.
+  export addTo(a: Address) {
+    this.to = append(this.to, a)
+  }
+
+  // Add a `Cc:` recipient, delivered to like a `To:`.
+  export addCc(a: Address) {
+    this.cc = append(this.cc, a)
+  }
+
+  // Set the `Subject:` header. Rejected at `render()` if it carries a CR or LF.
+  export setSubject(s: string) {
+    this.subject = s
+  }
+
+  // Set the plain-text body. Always present in the rendered message: a mail
+  // with only an HTML part is unreadable to a text-only client.
+  export setText(s: string) {
+    this.text = s
+  }
+
+  // Set the HTML alternative. Sent alongside the text part inside a
+  // `multipart/alternative`, never instead of it.
+  export setHtml(s: string) {
+    this.html = s
+  }
+
+  // Attach `a`. The message becomes `multipart/mixed` at render time.
+  export attach(a: Attachment) {
+    this.files = append(this.files, a)
+  }
+
+  // Override the MIME boundary. Exists so a test can assert an exact body; a
+  // caller has no reason to set one, and an empty string restores the default.
+  // Rejected at `render()` unless it is a legal boundary (`isBoundary`).
+  export setBoundary(b: string) {
+    this.boundary = b
+  }
+
+  // Every address this message is delivered to, `To:` then `Cc:`, in the order
+  // added — the envelope `RCPT TO` list.
+  export recipients(): []Address {
+    let out = []Address(0)
+    let i = 0
+    while (i < len(this.to)) {
+      out = append(out, this.to[i])
+      i = i + 1
+    }
+    let j = 0
+    while (j < len(this.cc)) {
+      out = append(out, this.cc[j])
+      j = j + 1
+    }
+    return out
+  }
+
+  // The complete RFC 5322 message: headers, a blank line, and the body, with
+  // CRLF line endings throughout. Fails on a header value carrying a CR, LF or
+  // NUL, on a malformed envelope address, on a bad explicit boundary, or if any
+  // produced line would exceed 998 octets — before the caller has sent
+  // anything.
+  export render(): string! {
+    if (len(this.boundary) == 0) {
+      this.boundary = defaultBoundary()
+    }
+    if (!isBoundary(this.boundary)) {
+      fail newError("smtp: '${this.boundary}' is not a legal MIME boundary")
+    }
+    let head = this.headerBlock()?
+    let body = bodyBlockOf(this)?
+    let msg = head + "\r\n" + body
+    checkLines(msg)?
+    return msg
+  }
+
+  // The header block, `Content-*` fields included, without the terminating
+  // blank line.
+  headerBlock(): string! {
+    checkAddress("from", this.sender.email)?
+    let out = renderHeader("From", formatAddress(this.sender))?
+    out = out + this.recipientHeader("To", this.to)?
+    out = out + this.recipientHeader("Cc", this.cc)?
+    out = out + renderHeader("Subject", this.subject)?
+    out = out + "MIME-Version: 1.0\r\n"
+    return out + contentHeaderOf(this)
+  }
+
+  // One address-list header, or "" when the list is empty. Every address is
+  // validated here, so a malformed `Cc` fails the render rather than being
+  // discovered by the server mid-envelope.
+  recipientHeader(name: string, list: []Address): string! {
+    if (len(list) == 0) {
+      return ""
+    }
+    let joined = ""
+    let i = 0
+    while (i < len(list)) {
+      checkAddress(name, list[i].email)?
+      if (i > 0) {
+        joined = joined + ", "
+      }
+      joined = joined + formatAddress(list[i])
+      i = i + 1
+    }
+    return renderHeader(name, joined)?
+  }
+}
+
+// A fresh message from `sender`, with no recipients, subject or body.
+export fn newMessage(sender: Address): Message {
+  return Message{
+    sender: sender,
+    to: []Address(0),
+    cc: []Address(0),
+    subject: "",
+    text: "",
+    html: "",
+    files: []Attachment(0),
+    boundary: "",
+  }
+}
+
+// `name <email>`, or the bare addr-spec when there is no display name. The
+// display name is quoted only when it is printable ASCII; anything else goes
+// through `encodedWords` inside `renderHeader`, which cannot produce a quote to
+// unbalance. A `"` or `\` in a name is dropped from the QUOTED form by using
+// the unquoted encoded-word form instead — never by rewriting the name.
+fn formatAddress(a: Address): string {
+  if (len(a.name) == 0) {
+    return "<${a.email}>"
+  }
+  if (needsEncodedName(a.name)) {
+    return "${encodedWords(a.name)} <${a.email}>"
+  }
+  return "\"${a.name}\" <${a.email}>"
+}
+
+// Whether a display name must be sent as an encoded word rather than a quoted
+// string: any non-ASCII byte, or a `"` or `\` that would otherwise have to be
+// escaped inside the quotes.
+fn needsEncodedName(name: string): bool {
+  if (!isPrintableAscii(name)) {
+    return true
+  }
+  let i = 0
+  while (i < len(name)) {
+    if (name[i] == u8(34) || name[i] == u8(92)) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}

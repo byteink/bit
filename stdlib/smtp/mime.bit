@@ -1,0 +1,269 @@
+// Bit standard library — smtp module: MIME body construction (#3967).
+//
+// One rule decides every transfer encoding here: a part is sent as `7bit` only
+// when its own bytes prove it can be, and base64 otherwise. "Prove" means every
+// byte is printable ASCII (tab, CR and LF excepted) AND no line reaches the
+// 998-octet ceiling with room for the DATA dot-stuffing byte. That is why a
+// 1200-character body line comes out base64-wrapped at 76 columns instead of
+// being sent whole and refused by the server — and why it is a property of the
+// data rather than a flag a caller can get wrong.
+//
+// `checkLines` is the backstop: `Message.render` runs it over the finished
+// message, so a line over the limit fails the render whatever produced it.
+
+import { newBuilder } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// The body shapes, chosen by `shapeOf` from what the message carries. No empty
+// wrappers: a text-only mail is a bare `text/plain`, not a `multipart/mixed`
+// holding one part.
+const shapeText: int = 0
+const shapeAlternative: int = 1
+const shapeMixed: int = 2
+
+// Base64 line width for a MIME part. RFC 2045 §6.8's ceiling is 76.
+const base64Width: int = 76
+
+// The longest body line that may be sent as-is. One octet under
+// `maxLineOctets`, because DATA dot-stuffing (wire.bit) prepends a `.` to a
+// line that already starts with one; at exactly 998 that byte would push the
+// transmitted line over.
+const maxBodyLineOctets: int = 997
+
+// Which of the three shapes `m` renders as.
+fn shapeOf(m: Message): int {
+  if (len(m.files) > 0) {
+    return shapeMixed
+  }
+  if (len(m.html) > 0) {
+    return shapeAlternative
+  }
+  return shapeText
+}
+
+// A fresh MIME boundary. Random (UUIDv4), not derived from the content: a
+// boundary computed from the parts is one an attacker who controls a part can
+// reproduce and embed, which splits the message where the sender did not.
+fn defaultBoundary(): string {
+  return "=_bit_${uuidFormat(uuidV4())}"
+}
+
+// Whether `b` is a legal boundary: 1..70 characters of the RFC 2046 §5.1.1
+// `bchars` set, not ending in a space. Checked because `setBoundary` is public.
+fn isBoundary(b: string): bool {
+  if (len(b) == 0 || len(b) > 70 || b[len(b) - 1] == u8(32)) {
+    return false
+  }
+  let i = 0
+  while (i < len(b)) {
+    if (!isBoundaryChar(b[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// One `bchars` character: alphanumerics and `'()+_,-./:=? ` (RFC 2046 §5.1.1).
+fn isBoundaryChar(c: u8): bool {
+  if (c >= u8(48) && c <= u8(57)) {
+    return true
+  }
+  if (c >= u8(65) && c <= u8(90)) {
+    return true
+  }
+  if (c >= u8(97) && c <= u8(122)) {
+    return true
+  }
+  let punct = "'()+_,-./:=? "
+  let i = 0
+  while (i < len(punct)) {
+    if (punct[i] == c) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// `s` with every line ending normalised to CRLF: a bare LF and a bare CR both
+// become one CRLF, an existing CRLF is left alone. A body reaching DATA with a
+// bare LF is not a message the server sees the same way the sender wrote it.
+fn toCrlf(s: string): string {
+  let b = newBuilder()
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == u8(13)) {
+      let _ = b.write("\r\n")
+      if (i + 1 < len(s) && s[i + 1] == u8(10)) {
+        i = i + 1
+      }
+    } else if (s[i] == u8(10)) {
+      let _ = b.write("\r\n")
+    } else {
+      let _ = b.writeByte(s[i])
+    }
+    i = i + 1
+  }
+  return b.toString()
+}
+
+// Whether `s` can be transmitted as `7bit`: printable ASCII (tab/CR/LF
+// allowed) with every line inside `maxBodyLineOctets`. Anything else is base64.
+fn is7bit(s: string): bool {
+  let run = 0
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == u8(10) || c == u8(13)) {
+      run = 0
+    } else {
+      run = run + 1
+    }
+    if (run > maxBodyLineOctets) {
+      return false
+    }
+    if (c >= u8(127) || (c < u8(32) && c != u8(9) && c != u8(10) && c != u8(13))) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// `b` as base64 broken into `base64Width`-character CRLF-terminated lines, so
+// no line of an encoded part can approach the 998-octet ceiling.
+fn wrapBase64(b: []byte): string {
+  let enc = encodeBase64(b)
+  let out = ""
+  let i = 0
+  while (i < len(enc)) {
+    let end = i + base64Width
+    if (end > len(enc)) {
+      end = len(enc)
+    }
+    out = out + enc[i:end] + "\r\n"
+    i = end
+  }
+  return out
+}
+
+// One body part: its `Content-Type`/`Content-Transfer-Encoding` headers, a
+// blank line, and the encoded content. `extra` carries a part's own extra
+// header lines (an attachment's `Content-Disposition`), already CRLF-terminated.
+fn renderPart(contentType: string, extra: string, content: string): string {
+  if (is7bit(content)) {
+    let text = toCrlf(content)
+    return "Content-Type: ${contentType}\r\n" +
+      "Content-Transfer-Encoding: 7bit\r\n${extra}\r\n${text}"
+  }
+  return "Content-Type: ${contentType}\r\n" +
+    "Content-Transfer-Encoding: base64\r\n${extra}\r\n" +
+    wrapBase64([]byte(content))
+}
+
+// An attachment part: base64 always — an attachment is opaque bytes, and
+// choosing an encoding from a sample of them is how a binary file arrives
+// corrupted.
+fn renderAttachment(a: Attachment): string! {
+  checkHeaderValue("Content-Disposition filename", a.filename)?
+  let ct = a.contentType
+  if (len(ct) == 0) {
+    ct = "application/octet-stream"
+  }
+  checkHeaderValue("Content-Type", ct)?
+  let name = renderHeader("Content-Disposition", "attachment; filename=\"${a.filename}\"")?
+  return "Content-Type: ${ct}\r\nContent-Transfer-Encoding: base64\r\n" +
+    name +
+    "\r\n" +
+    wrapBase64(a.data)
+}
+
+// The `Content-Type` header for the message as a whole, matching `shapeOf`.
+fn contentHeaderOf(m: Message): string {
+  let shape = shapeOf(m)
+  if (shape == shapeMixed) {
+    return "Content-Type: multipart/mixed; boundary=\"${m.boundary}\"\r\n"
+  }
+  if (shape == shapeAlternative) {
+    return "Content-Type: multipart/alternative; boundary=\"${m.boundary}\"\r\n"
+  }
+  if (is7bit(m.text)) {
+    return "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n"
+  }
+  return "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n"
+}
+
+// The `text/plain` (+ `text/html`) content of a message, without the outer
+// `multipart/mixed` wrapper. `inner` is the boundary the alternative uses,
+// which is the mixed boundary with a suffix so the two never collide.
+fn textualBody(m: Message, inner: string): string {
+  if (len(m.html) == 0) {
+    return bareText(m)
+  }
+  return "--${inner}\r\n" +
+    renderPart("text/plain; charset=utf-8", "", m.text) +
+    "\r\n--${inner}\r\n" +
+    renderPart("text/html; charset=utf-8", "", m.html) +
+    "\r\n--${inner}--\r\n"
+}
+
+// The text part with no MIME framing at all — the `shapeText` body.
+fn bareText(m: Message): string {
+  if (is7bit(m.text)) {
+    return toCrlf(m.text)
+  }
+  return wrapBase64([]byte(m.text))
+}
+
+// The whole body: the part after the header block's blank line.
+fn bodyBlockOf(m: Message): string! {
+  let shape = shapeOf(m)
+  if (shape == shapeText) {
+    return bareText(m)
+  }
+  let inner = m.boundary + "_alt"
+  if (shape == shapeAlternative) {
+    return textualBody(m, m.boundary)
+  }
+  return mixedBody(m, inner)?
+}
+
+// The `multipart/mixed` body: the textual part (itself a `multipart/
+// alternative` when there is HTML) followed by one part per attachment.
+fn mixedBody(m: Message, inner: string): string! {
+  let out = "--${m.boundary}\r\n"
+  if (len(m.html) == 0) {
+    out = out + renderPart("text/plain; charset=utf-8", "", m.text)
+  } else {
+    out = out +
+      "Content-Type: multipart/alternative; boundary=\"${inner}\"\r\n\r\n" +
+      textualBody(m, inner)
+  }
+  let i = 0
+  while (i < len(m.files)) {
+    out = out + "\r\n--${m.boundary}\r\n" + renderAttachment(m.files[i])?
+    i = i + 1
+  }
+  return out + "\r\n--${m.boundary}--\r\n"
+}
+
+// Refuse a message carrying a line at or over `maxLineOctets`. The backstop
+// behind every encoding decision above: whatever produced the line — a header
+// folder that did not fold, a caller-supplied boundary, a future part type —
+// the message fails here rather than on the wire.
+fn checkLines(msg: string): ()! {
+  let run = 0
+  let i = 0
+  while (i < len(msg)) {
+    if (msg[i] == u8(10) || msg[i] == u8(13)) {
+      run = 0
+    } else {
+      run = run + 1
+    }
+    if (run > maxBodyLineOctets) {
+      fail newError("smtp: message has a line over ${maxBodyLineOctets} octets")
+    }
+    i = i + 1
+  }
+}
