@@ -74,12 +74,11 @@ bootstrap with no digest check.
 ## 2. What happens when no release exists for the host triple
 
 `dist/release.sh` ships **four** targets: x86_64-linux, aarch64-linux,
-aarch64-macos and x86_64-windows (#3342). Stage0 covers only the first
-three — a stage0 entry can only name a **published** release for that triple
-(`dist/stage0/SHA256SUMS`), and no Windows release existed before #3342
-shipped one, so there is no Windows stage0 yet. Repinning it is a separate
-ticket, now that a Windows release can exist to name. There is also no
-32-bit or big-endian target, and ARM64 Windows is out of scope for the
+aarch64-macos and x86_64-windows (#3342). `dist/stage0/SHA256SUMS` pins all
+four since 0.13.0 (#3344), one digest per triple. `dist/stage0-verify.sh`
+resolves the host triple from `uname` and so serves the first three; the
+Windows bootstrap path itself belongs to the Windows port (#3322). There is
+also no 32-bit or big-endian target, and ARM64 Windows is out of scope for the
 Windows port.
 
 On a host outside those three stage0-pinned triples there is no stage0 and
