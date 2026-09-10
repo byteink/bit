@@ -756,6 +756,12 @@ There is no correct global default. Every business-day method takes a `Weekend`
 explicitly rather than reading one from the host, because the right answer is a
 property of the organisation, not of the machine the code runs on.
 
+`weekendOn` **fails** on a day number outside 1..7, and on a set covering all
+seven days — with no weekday left, every search below would run to its cap and
+panic, so the empty week is rejected at construction instead. Repeated numbers
+are accepted and mean nothing extra, and an empty slice is a seven-day working
+week.
+
 ### `Calendar`
 
 A `Weekend` plus a set of holiday `Date` values.
@@ -778,6 +784,45 @@ would be silently wrong.
 | `previousBusinessDay(c)` | the previous one strictly before |
 | `addBusinessDays(c, n)` | skips weekends and holidays; negative `n` goes back |
 | `differenceInBusinessDays(c, other)` | complete business days between |
+
+All five are on `Date`, `NaiveDateTime` and `DateTime`. On the latter two they
+read the **wall-clock date** and return a `Date`: a business day is a property of
+the calendar day, so the time of day and the offset carry no information here and
+the answer is the same across a daylight saving transition.
+
+`nextBusinessDay` and `previousBusinessDay` are **strict** — the receiver is never
+their own answer, even when it is a business day.
+
+`addBusinessDays(c, 0)` returns the receiver's date **unchanged**, even when that
+date is a weekend day or a holiday. Zero business days of movement is no movement;
+rounding forward here would make it the same call as `nextBusinessDay` on a
+Saturday.
+
+`differenceInBusinessDays` counts the business days in the span **excluding the
+earlier of the two dates and including the later one**, negative when `other` is
+the earlier date. Excluding the earlier end rather than the receiver is what keeps
+it antisymmetric like the rest of the difference family:
+`a.differenceInBusinessDays(c, b)` is always `-b.differenceInBusinessDays(c, a)`.
+
+Going forward it is `addBusinessDays`' inverse from any date, weekend days
+included: `d.addBusinessDays(c, k)` is `k` business days from `d` for every
+`k >= 0`. Going back from a date that is **not itself a business day** the two
+differ by one — Saturday minus one business day is the Friday, but the count from
+that Saturday to that Friday is 0, because the Friday is the excluded earlier end.
+No half-open span can be both antisymmetric and count a non-business receiver as a
+step; the antisymmetry is the one kept.
+
+A holiday that falls on a weekend day changes nothing: it is already not a business
+day and it is not carried to the next working day. Whether a country observes a
+holiday in lieu is a policy the caller expresses by putting the observed date in
+the list.
+
+These three methods step one day at a time, and every one of those loops is
+**bounded**: a search that passes 3660 days (ten years) with no business day among
+them **panics**, naming the calendar's weekend and its holiday count. A ten-year
+holiday run is a caller error, not a runtime condition, so it is not reported as a
+failure. The cap is on the consecutive non-business-day run, not on the whole call:
+`addBusinessDays(c, 5000)` is fine.
 
 ```bit ignore
 import { date, calendar, weekendSatSun } from "std/time"
