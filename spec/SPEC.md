@@ -354,6 +354,13 @@ Notes on overloaded glyphs, disambiguated by grammar position:
   `>` and leaves the remainder (`>>` leaves `>`, `>>=` leaves `>=`, `>=` leaves
   `=`) as the next token. Splitting repeats, so `Opt<Opt<i64>>= v` parses. Nothing
   is split where a `>` is not required, so `a >> b` and `a >= b` are unaffected.
+- `<` is comparison, the opening of a generic argument list, or the opening of a
+  **JSX element** (§12.12). The third reading is taken only at the start of an
+  expression and only when the next token is an identifier or `>`, which no
+  comparison and no generic argument list can be; everything else about `<`,
+  including the splitting rule above, is unchanged. A generic call written
+  inside a JSX child (`<ul>{ pick<i64>(3) }</ul>`) therefore still splits its
+  `>` exactly as it does anywhere else.
 
 ---
 
@@ -2503,6 +2510,66 @@ parameter slots follows declared order. `f(b = g(), a = h())` runs `g()`
 before `h()` (written order), then binds `a = h()`'s result and `b = g()`'s
 result to their respective parameters (declared order) — writing the call
 does not reorder the side effects the two argument expressions produce.
+
+### 12.12 JSX Elements and Fragments
+
+```text
+jsx_elem     = "<" IDENT { jsx_attr } ( "/>" | ">" { jsx_child } "</" IDENT ">" ) .
+jsx_fragment = "<>" { jsx_child } "</>" .
+jsx_attr     = IDENT [ "=" ( STRING_LIT | "{" expression "}" ) ] .
+jsx_child    = jsx_text | jsx_elem | jsx_fragment | "{" expression "}" .
+jsx_text     = { any source character except "<" and "{" } .
+```
+
+An attribute written without `=` has the value `true`, so `<input disabled />`
+and `<input disabled={true} />` mean the same thing.
+
+**When `<` opens an element.** Only at the start of an expression, and only
+when the token after `<` is an identifier or `>`. Nowhere else does `<` change
+meaning:
+
+| Written            | Read as                                             |
+| ------------------ | --------------------------------------------------- |
+| `a < b`            | comparison — `a` is already parsed, so this `<` is infix |
+| `map<string, i64>` | a type (§14)                                          |
+| `Opt<Opt<i64>>= v` | two generic closes and an `=` (§6's splitting rule)    |
+| `f<T>(x)`          | a generic call (§12.7)                                |
+| `<- ch`            | a channel receive — `<-` is one token (§6)            |
+| `let x = <div/>`   | a JSX element                                         |
+
+One token of lookahead settles it because Bit spells a type assertion `x.(T)`
+(§14.4) rather than `<T>expr`; no separate file extension or dialect exists,
+and the rule is the same in every `.bit` file.
+
+**Closing tags.** `</name>` must name the element it closes. `<div>x</span>` is
+a compile error (E0023) that names both tags and points at the closing one. The
+missing tag is never inferred and no child is re-parented: an unbalanced tree
+that renders silently is worse than a refusal.
+
+**Whitespace in text children.** Every implementation of JSX gets this subtly
+different, so Bit's rule is stated exactly. A text child is the run of source
+between two delimiters, with:
+
+1. a **leading** whitespace run removed if it contains a line break;
+2. a **trailing** whitespace run removed if it contains a line break;
+3. everything between kept **byte for byte** — interior spaces, tabs and line
+   breaks are the author's.
+
+A run left empty by (1) and (2) is not a child at all. The same rule applies to
+the whitespace between two adjacent children that are not text (`<a/> <b/>`),
+so:
+
+```text
+<ul>
+  <li>one</li>
+  <li>two</li>
+</ul>
+```
+
+has exactly two children — the indentation around them contains line breaks and
+disappears — while `<b>bold</b> <i>italic</i>` on one line has three, the middle
+one being the single space, and `<p> hi </p>` has one child whose text is
+` hi ` with both spaces intact.
 
 ---
 
